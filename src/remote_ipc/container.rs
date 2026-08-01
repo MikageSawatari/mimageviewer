@@ -54,6 +54,12 @@ struct ValidatedPageContext {
     bookmark_supported: bool,
 }
 
+struct RecomputedFolderListing {
+    items: Vec<crate::grid_item::GridItem>,
+    image_only: bool,
+    compiled: bool,
+}
+
 impl ContainerEngine {
     pub(super) fn new(settings: crate::settings::Settings) -> Self {
         let spread_db_path = crate::data_dir::get().join("spread.db");
@@ -115,13 +121,15 @@ impl ContainerEngine {
                 let resolved = self
                     .resolve(address)
                     .map_err(remote_write_error_from_media)?;
-                let is_file = std::fs::metadata(&resolved.canonical)
-                    .map(|metadata| metadata.is_file())
-                    .unwrap_or(false);
+                let metadata = std::fs::metadata(&resolved.canonical).ok();
+                let is_file = metadata.as_ref().is_some_and(|value| value.is_file());
+                let is_directory = metadata.as_ref().is_some_and(|value| value.is_dir());
                 let supported = match address.subresource {
                     RemoteSubresource::File => {
-                        is_file
-                            && (is_zip_path(&resolved.logical) || is_pdf_path(&resolved.logical))
+                        is_directory
+                            || is_file
+                                && (is_zip_path(&resolved.logical)
+                                    || is_pdf_path(&resolved.logical))
                     }
                     RemoteSubresource::ZipDirectory { .. } => {
                         is_file && is_zip_path(&resolved.logical)
@@ -305,16 +313,56 @@ impl ContainerEngine {
                 "画像が閲覧フォルダの直下にありません",
             ));
         }
-        let scan =
-            crate::app::folder_scan::scan_directory_with_settings(&context.logical, &self.settings)
-                .map_err(|_| {
-                    RemoteWriteError::new(
-                        RemoteWriteErrorCode::PersistenceFailed,
-                        "画像フォルダを走査できませんでした",
-                    )
-                })?;
+        let listing = self.recompute_folder_listing(&context.logical)?;
+        let items = listing.items;
+        let image_only = listing.image_only;
+        let compiled = listing.compiled;
+        let index = items
+            .iter()
+            .position(|item| {
+                matches!(
+                    item,
+                    crate::grid_item::GridItem::Image(path)
+                        if crate::path_key::eq_keep_drive(path, &page.logical)
+                )
+            })
+            .ok_or_else(|| {
+                RemoteWriteError::new(
+                    RemoteWriteErrorCode::NotFound,
+                    "画像フォルダ内のページが見つかりません",
+                )
+            })?;
+        let page_number = items[..=index]
+            .iter()
+            .filter(|item| item.has_page_data())
+            .count();
+        let page_count = items.iter().filter(|item| item.has_page_data()).count();
+        validated_context(
+            index,
+            page_count,
+            image_only,
+            true,
+            compiled || (image_only && self.settings.auto_fullscreen_image_folders_enabled()),
+        )
+        .map(|mut context| {
+            context.page_number = u32::try_from(page_number).unwrap_or(u32::MAX);
+            context
+        })
+    }
+
+    fn recompute_folder_listing(
+        &self,
+        folder: &Path,
+    ) -> Result<RecomputedFolderListing, RemoteWriteError> {
+        let scan = crate::app::folder_scan::scan_directory_with_settings(folder, &self.settings)
+            .map_err(|_| {
+                RemoteWriteError::new(
+                    RemoteWriteErrorCode::PersistenceFailed,
+                    "画像フォルダを走査できませんでした",
+                )
+            })?;
         let compiled =
-            crate::books::is_direct_book_folder(&self.settings.books_root_path(), &context.logical);
+            crate::books::is_direct_book_folder(&self.settings.books_root_path(), folder);
         let image_only = if compiled {
             scan.all_media
                 .iter()
@@ -405,36 +453,10 @@ impl ContainerEngine {
             &self.settings.grid_display_order,
             Some(media_sort),
         );
-        let index = items
-            .iter()
-            .position(|item| {
-                matches!(
-                    item,
-                    crate::grid_item::GridItem::Image(path)
-                        if crate::path_key::eq_keep_drive(path, &page.logical)
-                )
-            })
-            .ok_or_else(|| {
-                RemoteWriteError::new(
-                    RemoteWriteErrorCode::NotFound,
-                    "画像フォルダ内のページが見つかりません",
-                )
-            })?;
-        let page_number = items[..=index]
-            .iter()
-            .filter(|item| item.has_page_data())
-            .count();
-        let page_count = items.iter().filter(|item| item.has_page_data()).count();
-        validated_context(
-            index,
-            page_count,
+        Ok(RecomputedFolderListing {
+            items,
             image_only,
-            true,
-            compiled || (image_only && self.settings.auto_fullscreen_image_folders_enabled()),
-        )
-        .map(|mut context| {
-            context.page_number = u32::try_from(page_number).unwrap_or(u32::MAX);
-            context
+            compiled,
         })
     }
 
@@ -677,10 +699,13 @@ impl ContainerEngine {
     ) -> Result<ContainerPayload, MediaError> {
         let metadata = std::fs::metadata(&resolved.canonical)
             .map_err(|_| media_error(MediaErrorCode::NotFound, "コンテナが見つかりません"))?;
+        if metadata.is_dir() {
+            return self.enumerate_folder(request, resolved);
+        }
         if !metadata.is_file() {
             return Err(media_error(
                 MediaErrorCode::Unsupported,
-                "対象は ZIP/PDF ファイルではありません",
+                "対象はフォルダまたは ZIP/PDF ファイルではありません",
             ));
         }
         if is_zip_path(&resolved.logical) {
@@ -693,6 +718,58 @@ impl ContainerEngine {
                 "このコンテナ形式には対応していません",
             ))
         }
+    }
+
+    fn enumerate_folder(
+        &self,
+        request: &ContainerRequest,
+        resolved: &ResolvedFavoritePath,
+    ) -> Result<ContainerPayload, MediaError> {
+        if !matches!(request.address.subresource, RemoteSubresource::File) {
+            return Err(media_error(
+                MediaErrorCode::BadRequest,
+                "画像フォルダの一覧アドレスが不正です",
+            ));
+        }
+        let listing = self
+            .recompute_folder_listing(&resolved.logical)
+            .map_err(media_error_from_remote_write)?;
+        let total = listing
+            .items
+            .iter()
+            .filter(|item| matches!(item, crate::grid_item::GridItem::Image(_)))
+            .count();
+        let items = listing
+            .items
+            .into_iter()
+            .filter(|item| matches!(item, crate::grid_item::GridItem::Image(_)))
+            .take(CONTAINER_ENTRY_LIMIT)
+            .collect::<Vec<_>>();
+        let entries = items
+            .iter()
+            .filter_map(|item| {
+                Some(ContainerEntry {
+                    address: grid_item_address(&request.address, item)?,
+                    name: item.name().into_owned(),
+                    kind: ContainerEntryKind::Image,
+                    page_count: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        let spread = self.spread_payload(request, resolved, &items, None);
+        Ok(ContainerPayload {
+            title: container_title(&resolved.logical),
+            kind: ContainerKind::Folder,
+            effective_address: request.address.clone(),
+            entries,
+            configured_spread_mode: spread.configured,
+            effective_spread_mode: spread.effective,
+            reading_direction: spread.reading_direction,
+            spread_page_gap_px: self.settings.spread_page_gap_px,
+            page_groups: spread.groups,
+            entry_limit: CONTAINER_ENTRY_LIMIT,
+            truncated: total > CONTAINER_ENTRY_LIMIT,
+        })
     }
 
     fn enumerate_zip(
@@ -875,13 +952,13 @@ impl ContainerEngine {
         items: &[crate::grid_item::GridItem],
         zip_context: Option<(&[String], &Path)>,
     ) -> SpreadPayload {
-        let (key, fallback) = if let Some((segments, root)) = zip_context {
-            let key = crate::spread_db::container_key_with_fallback(root, segments);
-            (key.exact, key.fallback)
+        let key = if let Some((segments, root)) = zip_context {
+            crate::spread_db::container_key_with_fallback(root, segments)
         } else {
-            (resolved.logical.clone(), None)
+            crate::spread_db::container_key_with_fallback(&resolved.logical, &[])
         };
-        let (stored_mode, stored_direction) = self.stored_spread_state(&key, fallback.as_deref());
+        let (stored_mode, stored_direction) =
+            self.stored_spread_state(&key.exact, key.fallback.as_deref());
         let (configured, effective, reading_direction) = resolve_spread_state(
             request.spread_mode,
             request.reading_direction,
@@ -956,6 +1033,10 @@ impl ContainerEngine {
             .iter()
             .map(|item| {
                 let key = match item {
+                    crate::grid_item::GridItem::Image(path) => path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_owned),
                     crate::grid_item::GridItem::ZipImage { entry_name, .. } => {
                         Some(entry_name.clone())
                     }
@@ -1049,10 +1130,15 @@ impl ContainerEngine {
                 request.pdf_password = self.pdf_passwords.get(&resolved.logical);
                 &resolved.logical
             }
+            RemoteSubresource::File if is_image_path(&resolved.logical) => {
+                resolved.logical.parent().ok_or_else(|| {
+                    media_error(MediaErrorCode::PathRejected, "親フォルダを解決できません")
+                })?
+            }
             RemoteSubresource::File => {
                 return Err(media_error(
                     MediaErrorCode::Unsupported,
-                    "対象は ZIP/PDF ではありません",
+                    "対象は画像または ZIP/PDF ではありません",
                 ));
             }
             _ => {
@@ -1310,6 +1396,19 @@ fn grid_item_address(
     item: &crate::grid_item::GridItem,
 ) -> Option<RemoteAddress> {
     match item {
+        crate::grid_item::GridItem::Image(path) => {
+            let name = path.file_name()?.to_str()?;
+            let parent = container.relative_path.trim_end_matches('/');
+            let relative_path = if parent.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{parent}/{name}")
+            };
+            Some(RemoteAddress::file(
+                container.favorite_id.clone(),
+                relative_path,
+            ))
+        }
         crate::grid_item::GridItem::ZipImage { entry_name, .. } => {
             Some(zip_entry_address(container, entry_name))
         }
@@ -1444,6 +1543,14 @@ fn is_pdf_path(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
 }
 
+fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            crate::folder_tree::is_recognized_image_ext(&extension.to_ascii_lowercase())
+        })
+}
+
 fn media_source_kind(address: &RemoteAddress) -> &'static str {
     match address.subresource {
         RemoteSubresource::ZipDirectory { .. } | RemoteSubresource::ZipEntry { .. } => "zip",
@@ -1506,6 +1613,21 @@ fn remote_write_error_from_media(error: MediaError) -> RemoteWriteError {
         | MediaErrorCode::Internal => RemoteWriteErrorCode::Internal,
     };
     RemoteWriteError::new(code, error.message)
+}
+
+fn media_error_from_remote_write(error: RemoteWriteError) -> MediaError {
+    let code = match error.code {
+        RemoteWriteErrorCode::BadRequest => MediaErrorCode::BadRequest,
+        RemoteWriteErrorCode::FavoriteNotFound => MediaErrorCode::FavoriteNotFound,
+        RemoteWriteErrorCode::PathRejected => MediaErrorCode::PathRejected,
+        RemoteWriteErrorCode::NotFound => MediaErrorCode::NotFound,
+        RemoteWriteErrorCode::Unsupported => MediaErrorCode::Unsupported,
+        RemoteWriteErrorCode::Busy => MediaErrorCode::Busy,
+        RemoteWriteErrorCode::UiTimeout
+        | RemoteWriteErrorCode::PersistenceFailed
+        | RemoteWriteErrorCode::Internal => MediaErrorCode::Internal,
+    };
+    MediaError::new(code, error.message)
 }
 
 fn media_error(code: MediaErrorCode, message: impl Into<String>) -> MediaError {
@@ -1715,6 +1837,198 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn assert_local_remote_folder_listing_match(
+        engine: &ContainerEngine,
+        favorite: &FavoriteEntry,
+        relative_folder: &str,
+    ) {
+        fn identity(item: &crate::grid_item::GridItem) -> String {
+            let (kind, path) = match item {
+                crate::grid_item::GridItem::Folder(path) => ("folder", path),
+                crate::grid_item::GridItem::Image(path) => ("image", path),
+                crate::grid_item::GridItem::Video(path) => ("video", path),
+                crate::grid_item::GridItem::Audio(path) => ("audio", path),
+                crate::grid_item::GridItem::ZipFile(path) => ("zip", path),
+                crate::grid_item::GridItem::PdfFile(path) => ("pdf", path),
+                crate::grid_item::GridItem::ConvertibleArchive { path, .. } => {
+                    ("convertible", path)
+                }
+                _ => panic!("physical folder listing produced a virtual item"),
+            };
+            format!("{kind}:{}", crate::path_key::normalize_keep_drive(path))
+        }
+
+        let folder = favorite.path.join(relative_folder);
+        let scan = crate::app::folder_scan::scan_directory_with_settings(&folder, &engine.settings)
+            .unwrap();
+        let local = crate::app::materialize_local_folder_listing(&folder, scan, &engine.settings);
+        let remote = engine.recompute_folder_listing(&folder).unwrap();
+        assert_eq!(
+            remote.items.iter().map(identity).collect::<Vec<_>>(),
+            local.items.iter().map(identity).collect::<Vec<_>>(),
+            "local and remote folder assembly drifted for {relative_folder}"
+        );
+
+        let page_count = local
+            .items
+            .iter()
+            .filter(|item| item.has_page_data())
+            .count();
+        let context = RemoteAddress::file(favorite.id.to_string(), relative_folder);
+        for (expected_index, item) in local.items.iter().enumerate() {
+            let crate::grid_item::GridItem::Image(path) = item else {
+                continue;
+            };
+            let name = path.file_name().unwrap().to_string_lossy();
+            let page =
+                RemoteAddress::file(favorite.id.to_string(), format!("{relative_folder}/{name}"));
+            let validated = engine.validate_folder_page(&page, &context).unwrap();
+            assert_eq!(validated.page_index as usize, expected_index);
+            assert_eq!(validated.page_count as usize, page_count);
+            assert_eq!(
+                validated.page_number as usize,
+                local.items[..=expected_index]
+                    .iter()
+                    .filter(|candidate| candidate.has_page_data())
+                    .count()
+            );
+        }
+    }
+
+    #[test]
+    fn folder_recomputation_matches_local_listing_for_required_materials() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        let image_only = root.join("image-only");
+        let mixed = root.join("mixed");
+        let duplicate_ext = root.join("duplicate-ext");
+        let virtual_duplicate = root.join("virtual-duplicate");
+        for folder in [&image_only, &mixed, &duplicate_ext, &virtual_duplicate] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+
+        std::fs::write(image_only.join("10.jpg"), b"ten").unwrap();
+        std::fs::write(image_only.join("2.jpg"), b"two").unwrap();
+
+        std::fs::write(mixed.join("page.jpg"), b"page").unwrap();
+        std::fs::write(mixed.join("clip.mp4"), b"video").unwrap();
+
+        std::fs::write(duplicate_ext.join("same.jpg"), b"jpeg").unwrap();
+        std::fs::write(duplicate_ext.join("same.png"), b"png").unwrap();
+        std::fs::write(duplicate_ext.join("other.jpg"), b"other").unwrap();
+
+        std::fs::create_dir_all(virtual_duplicate.join("volume")).unwrap();
+        std::fs::write(virtual_duplicate.join("volume.zip"), b"zip").unwrap();
+        std::fs::write(virtual_duplicate.join("page.jpg"), b"page").unwrap();
+
+        let favorite = FavoriteEntry::new("test".to_owned(), root);
+        let settings = crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            skip_duplicate_images: true,
+            skip_zip_if_folder_exists: true,
+            ..Default::default()
+        };
+        let engine = ContainerEngine::new(settings);
+
+        for relative in ["image-only", "mixed", "duplicate-ext", "virtual-duplicate"] {
+            assert_local_remote_folder_listing_match(&engine, &favorite, relative);
+        }
+    }
+
+    #[test]
+    fn folder_spread_groups_share_cover_landscape_rtl_and_portrait_rules() {
+        let items = (0..5)
+            .map(|index| {
+                crate::grid_item::GridItem::Image(std::path::PathBuf::from(format!(
+                    "page-{index}.jpg"
+                )))
+            })
+            .collect::<Vec<_>>();
+        let portrait = vec![false; items.len()];
+
+        assert_eq!(
+            crate::ui_fullscreen::build_remote_spread_page_groups(
+                &items,
+                crate::settings::SpreadMode::LtrCover,
+                &portrait,
+            ),
+            vec![vec![0], vec![1, 2], vec![3, 4]]
+        );
+
+        let mut with_landscape = portrait.clone();
+        with_landscape[2] = true;
+        assert_eq!(
+            crate::ui_fullscreen::build_remote_spread_page_groups(
+                &items,
+                crate::settings::SpreadMode::Ltr,
+                &with_landscape,
+            ),
+            vec![vec![0, 1], vec![2], vec![3, 4]]
+        );
+        assert_eq!(
+            crate::ui_fullscreen::build_remote_spread_page_groups(
+                &items,
+                crate::settings::SpreadMode::Rtl,
+                &portrait,
+            ),
+            vec![vec![1, 0], vec![3, 2], vec![4]]
+        );
+
+        let (_, effective, _) = resolve_spread_state(
+            Some(RemoteSpreadMode::RtlCover),
+            Some(RemoteReadingDirection::Rtl),
+            None,
+            None,
+            crate::settings::SpreadMode::Single,
+            crate::settings::ReadingDirection::Ltr,
+            true,
+        );
+        assert_eq!(
+            crate::ui_fullscreen::build_remote_spread_page_groups(
+                &items,
+                core_spread_mode(effective),
+                &portrait,
+            ),
+            vec![vec![0], vec![1], vec![2], vec![3], vec![4]]
+        );
+    }
+
+    #[test]
+    fn folder_container_uses_page_groups_and_accepts_spread_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        let album = root.join("album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("001.jpg"), b"one").unwrap();
+        std::fs::write(album.join("002.jpg"), b"two").unwrap();
+        let favorite = FavoriteEntry::new("test".to_owned(), root);
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            ..Default::default()
+        });
+        let address = RemoteAddress::file(favorite.id.to_string(), "album");
+        let response = engine.container(ContainerRequest {
+            address: address.clone(),
+            spread_mode: Some(RemoteSpreadMode::Ltr),
+            reading_direction: Some(RemoteReadingDirection::Ltr),
+            force_single_page: false,
+        });
+        let ContainerResponse::Success(payload) = response else {
+            panic!("folder container enumeration failed");
+        };
+        assert_eq!(payload.kind, ContainerKind::Folder);
+        assert_eq!(payload.entries.len(), 2);
+        assert_eq!(payload.page_groups.len(), 1);
+        assert_eq!(payload.page_groups[0].pages.len(), 2);
+
+        let mut write = RemoteWriteRequest::SetSpread {
+            address,
+            spread_mode: RemoteSpreadMode::RtlCover,
+            reading_direction: RemoteReadingDirection::Rtl,
+        };
+        engine.validate_write_request(&mut write).unwrap();
     }
 
     #[test]

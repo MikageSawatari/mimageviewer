@@ -132,8 +132,8 @@ use folder_scan::is_miv_upscaled_derivative;
 #[cfg(test)]
 pub(crate) use folder_scan::scan_directory;
 pub(crate) use folder_scan::{
-    ScannedDir, scan_directory_with_convertible_archives, scan_directory_with_settings,
-    signature_from_scan,
+    ScannedDir, materialize_local_folder_listing, scan_directory_with_convertible_archives,
+    scan_directory_with_settings, signature_from_scan,
 };
 #[cfg(test)]
 pub(crate) use grid_paint::cell_has_lower_left_container_badge;
@@ -16783,23 +16783,8 @@ impl App {
         // フォーカス復帰時の差分判定用シグネチャ。scan を消費する前に計算しておき、
         // `start_loading_items` に引数として渡す。
         let folder_signature = signature_from_scan(&scan);
-        let (mut folders, mut folder_metas): (Vec<GridItem>, Vec<Option<(i64, i64)>>) =
-            scan.folders.into_iter().unzip();
-        let mut all_media = scan.all_media;
-        let is_book_page_folder =
-            crate::books::is_direct_book_folder(&self.book_root_path(), &path);
-        if is_book_page_folder {
-            // 本の中は「番号付き画像だけ」が正本。ユーザーが手動で ZIP/PDF/フォルダ/動画/音声を
-            // 混ぜてもページとして扱わず、通常フォルダ閲覧のコンテナブロックも出さない。
-            folders.clear();
-            folder_metas.clear();
-            all_media
-                .retain(|(_, kind, _, _)| *kind == crate::app::folder_scan::ScanMediaKind::Image);
-        }
-
         let scan_ms = scan_t0.elapsed().as_secs_f64() * 1000.0;
-        let scan_folders = folders.len();
-        let scan_media = all_media.len();
+        let materialized = materialize_local_folder_listing(&path, scan, &self.settings);
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -16808,55 +16793,21 @@ impl App {
                 lf_seq,
                 &[
                     ("ms", serde_json::Value::from(scan_ms)),
-                    ("folders", serde_json::Value::from(scan_folders)),
-                    ("media", serde_json::Value::from(scan_media)),
+                    (
+                        "folders",
+                        serde_json::Value::from(materialized.folder_count),
+                    ),
+                    ("media", serde_json::Value::from(materialized.media_count)),
                     ("pre_scanned", serde_json::Value::from(pre_scanned)),
                 ],
             );
-        }
-
-        let sort_t0 = std::time::Instant::now();
-        let folder_sort = self.book_sort_order_for_path(&path);
-        let media_sort = folder_media_sort_order(
-            folder_sort,
-            is_book_page_folder,
-            folders.is_empty(),
-            all_media
-                .iter()
-                .all(|(_, kind, _, _)| *kind == crate::app::folder_scan::ScanMediaKind::Image),
-            self.settings.auto_fullscreen_image_folders_enabled(),
-        );
-        // folders (Folder / ZipFile / PdfFile / ConvertibleArchive) も sort_order に
-        // 従って並べる (Explorer / Finder と同じ慣習で 2 段構成は維持)。
-        crate::grid_item::sort_folder_block(&mut folders, &mut folder_metas, folder_sort);
-        let mut keyed_media: Vec<_> = all_media
-            .into_iter()
-            .map(|entry| {
-                let name = entry.0.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let key = media_sort.name_key(name);
-                (entry, key)
-            })
-            .collect();
-        keyed_media.sort_by(|(a, ak), (b, bk)| media_sort.compare_name_keys(ak, a.2, bk, b.2));
-        all_media = keyed_media.into_iter().map(|(entry, _)| entry).collect();
-        if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
                 "lf_sort",
                 None,
                 lf_seq,
-                &[(
-                    "ms",
-                    serde_json::Value::from(sort_t0.elapsed().as_secs_f64() * 1000.0),
-                )],
+                &[("ms", serde_json::Value::from(materialized.sort_ms))],
             );
-        }
-
-        // ── 同名ファイルフィルタ ─────────────────────────────────────
-        let dup_t0 = std::time::Instant::now();
-        self.video_thumb_overrides.clear();
-        self.apply_duplicate_filters(&mut folders, &mut folder_metas, &mut all_media);
-        if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
                 "lf_dup_filter",
@@ -16864,39 +16815,18 @@ impl App {
                 lf_seq,
                 &[(
                     "ms",
-                    serde_json::Value::from(dup_t0.elapsed().as_secs_f64() * 1000.0),
+                    serde_json::Value::from(materialized.duplicate_filter_ms),
                 )],
             );
         }
 
-        // items を一度全カテゴリへ materialize し、共通 helper で設定された表示行へ配置する。
-        let mut items: Vec<GridItem> = folders;
-        let mut image_metas: Vec<Option<(i64, i64)>> = folder_metas;
-
-        for (p, media_kind, mtime, file_size) in &all_media {
-            match media_kind {
-                crate::app::folder_scan::ScanMediaKind::Video => {
-                    items.push(GridItem::Video(p.clone()));
-                    image_metas.push(Some((*mtime, *file_size)));
-                }
-                crate::app::folder_scan::ScanMediaKind::Audio => {
-                    // 音声はフルスクリーンで音楽ビューを開く。サムネは固定の音楽アイコン
-                    // (波形サムネは生成しないので video_items のようなサムネ要求は不要)。
-                    items.push(GridItem::Audio(p.clone()));
-                    image_metas.push(Some((*mtime, *file_size)));
-                }
-                crate::app::folder_scan::ScanMediaKind::Image => {
-                    items.push(GridItem::Image(p.clone()));
-                    image_metas.push(Some((*mtime, *file_size)));
-                }
-            }
+        let folder_sort = materialized.folder_sort;
+        self.video_thumb_overrides.clear();
+        for (video, image) in materialized.video_thumb_overrides {
+            self.video_thumb_overrides.insert(stem_lower(&video), image);
         }
-        crate::grid_item::arrange_grid_items(
-            &mut items,
-            &mut image_metas,
-            &self.settings.grid_display_order,
-            Some(media_sort),
-        );
+        let items = materialized.items;
+        let image_metas = materialized.metas;
         let video_items = crate::filename_stack_ui::stack_video_items(&items, &image_metas);
         let auto_open_image_folder = if std::mem::take(&mut self.pending_auto_fs_open) {
             self.settings.auto_fullscreen_image_folders_enabled() && scanned_folder_is_image_book
@@ -42160,36 +42090,13 @@ impl App {
         }
     }
 
-    /// 同名ファイルフィルタを適用する。
-    fn apply_duplicate_filters(
-        &mut self,
-        folders: &mut Vec<GridItem>,
-        folder_metas: &mut Vec<Option<(i64, i64)>>,
-        all_media: &mut Vec<(PathBuf, crate::app::folder_scan::ScanMediaKind, i64, i64)>,
-    ) {
-        if self.settings.skip_zip_if_folder_exists {
-            Self::filter_virtual_folder_duplicates(folders, folder_metas);
-        }
-        if self.settings.skip_archive_if_zip_exists {
-            Self::filter_convertible_archive_duplicates(folders, folder_metas);
-        }
-        if self.settings.skip_image_if_video_exists {
-            self.filter_video_image_duplicates(all_media);
-        }
-        if self.settings.skip_duplicate_images {
-            crate::app::folder_scan::filter_image_ext_duplicates(
-                all_media,
-                &self.settings.image_ext_priority,
-            );
-        }
-    }
-
     /// ZIP/PDF + フォルダの重複: 同名フォルダがあれば ZIP/PDF エントリをスキップ。
     /// folders と folder_metas は同じ順序で対応しているため、同期して削除する。
     ///
     /// 仮想フォルダ (ZIP/PDF) 判定は [`folder_tree::sorted_subdirs`] の Ctrl+↑↓ 用
     /// フィルタと揃える必要がある。片側だけ PDF を除外すると、グリッドに表示されている
     /// PDF が folder tree 側では sibling 扱いされず Ctrl+↑↓ の位置検索が失敗する。
+    #[cfg(test)]
     fn filter_virtual_folder_duplicates(
         folders: &mut Vec<GridItem>,
         folder_metas: &mut Vec<Option<(i64, i64)>>,
@@ -42198,30 +42105,12 @@ impl App {
     }
 
     /// Prefer native ZIP/CBZ over a same-stem RAR/7z/LZH archive.
+    #[cfg(test)]
     fn filter_convertible_archive_duplicates(
         folders: &mut Vec<GridItem>,
         folder_metas: &mut Vec<Option<(i64, i64)>>,
     ) {
         crate::app::folder_scan::filter_convertible_archive_duplicates(folders, folder_metas);
-    }
-
-    /// 動画 + 画像の重複: 同名の動画があれば画像をスキップし、
-    /// 画像ファイルを動画のサムネイルソースとして記録する。
-    ///
-    /// Phase 5.3: `Settings.video_thumb_use_sidecar_image` で有効/無効を切替可能に。
-    /// OFF のときは override を記録しない (= グリッドではシェル既定サムネのみ採用)
-    /// が、画像ファイルの listing からの除外は維持する (= 同名画像が動画と並んで二重
-    /// 表示されるのは望ましくないため)。
-    fn filter_video_image_duplicates(
-        &mut self,
-        all_media: &mut Vec<(PathBuf, crate::app::folder_scan::ScanMediaKind, i64, i64)>,
-    ) {
-        let use_sidecar = self.settings.video_thumb_use_sidecar_image;
-        for (video, image) in
-            crate::app::folder_scan::filter_video_image_duplicates(all_media, use_sidecar)
-        {
-            self.video_thumb_overrides.insert(stem_lower(&video), image);
-        }
     }
 
     /// `search_filter` とレーティングフィルタに基づいて `visible_indices` を再計算する。

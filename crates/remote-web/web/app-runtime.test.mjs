@@ -59,7 +59,22 @@ globalThis.fetch = async () => new Response(new Blob([new Uint8Array([1, 2, 3])]
   },
 });
 
-const { ImageViewer } = await import("./app.js");
+const { ImageViewer, parentContainerAddress } = await import("./app.js");
+
+test("plain image media routes resolve their containing folder", () => {
+  assert.deepEqual(
+    parentContainerAddress({
+      favorite_id: "favorite",
+      relative_path: "books/volume/page-002.jpg",
+      subresource: { kind: "file" },
+    }),
+    {
+      favorite_id: "favorite",
+      relative_path: "books/volume",
+      subresource: { kind: "file" },
+    }
+  );
+});
 
 test("viewer load executes fetch, decode, layout and atomic replacement", async () => {
   const stage = new FakeElement("div");

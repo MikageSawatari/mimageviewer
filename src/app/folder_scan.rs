@@ -28,6 +28,120 @@ pub(crate) struct ScannedDir {
     pub all_media: Vec<(PathBuf, ScanMediaKind, i64, i64)>,
 }
 
+/// App::load_folder が走査結果から実際の一覧を組み立てた結果。
+///
+/// remote IPC の読書位置再計算とは低レベルの sort / 重複除外関数を共有する一方、
+/// オーケストレーションは独立している。その差分を production のローカル出力と直接
+/// 比較できるよう、ローカル側の組み立て全体をこの pure helper に集約する。
+pub(crate) struct MaterializedFolderListing {
+    pub(crate) items: Vec<GridItem>,
+    pub(crate) metas: Vec<Option<(i64, i64)>>,
+    pub(crate) video_thumb_overrides: Vec<(PathBuf, PathBuf)>,
+    pub(crate) folder_count: usize,
+    pub(crate) media_count: usize,
+    pub(crate) folder_sort: crate::settings::SortOrder,
+    pub(crate) sort_ms: f64,
+    pub(crate) duplicate_filter_ms: f64,
+}
+
+pub(crate) fn materialize_local_folder_listing(
+    path: &std::path::Path,
+    scan: ScannedDir,
+    settings: &crate::settings::Settings,
+) -> MaterializedFolderListing {
+    let (mut folders, mut metas): (Vec<_>, Vec<_>) = scan.folders.into_iter().unzip();
+    let mut all_media = scan.all_media;
+    let compiled = crate::books::is_direct_book_folder(&settings.books_root_path(), path);
+    if compiled {
+        folders.clear();
+        metas.clear();
+        all_media.retain(|(_, kind, _, _)| *kind == ScanMediaKind::Image);
+    }
+    let folder_count = folders.len();
+    let media_count = all_media.len();
+
+    let sort_started = std::time::Instant::now();
+    let folder_sort = if compiled {
+        crate::settings::SortOrder::Numeric
+    } else {
+        settings.sort_order
+    };
+    let media_sort = super::folder_media_sort_order(
+        folder_sort,
+        compiled,
+        folders.is_empty(),
+        all_media
+            .iter()
+            .all(|(_, kind, _, _)| *kind == ScanMediaKind::Image),
+        settings.auto_fullscreen_image_folders_enabled(),
+    );
+    crate::grid_item::sort_folder_block(&mut folders, &mut metas, folder_sort);
+    let mut keyed_media = all_media
+        .into_iter()
+        .map(|entry| {
+            let name = entry
+                .0
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("");
+            let key = media_sort.name_key(name);
+            (entry, key)
+        })
+        .collect::<Vec<_>>();
+    keyed_media.sort_by(|(left, left_key), (right, right_key)| {
+        media_sort.compare_name_keys(left_key, left.2, right_key, right.2)
+    });
+    let mut all_media = keyed_media
+        .into_iter()
+        .map(|(entry, _)| entry)
+        .collect::<Vec<_>>();
+    let sort_ms = sort_started.elapsed().as_secs_f64() * 1000.0;
+
+    let duplicate_started = std::time::Instant::now();
+    if settings.skip_zip_if_folder_exists {
+        filter_virtual_folder_duplicates(&mut folders, &mut metas);
+    }
+    if settings.skip_archive_if_zip_exists {
+        filter_convertible_archive_duplicates(&mut folders, &mut metas);
+    }
+    let video_thumb_overrides = if settings.skip_image_if_video_exists {
+        filter_video_image_duplicates(&mut all_media, settings.video_thumb_use_sidecar_image)
+    } else {
+        Vec::new()
+    };
+    if settings.skip_duplicate_images {
+        filter_image_ext_duplicates(&mut all_media, &settings.image_ext_priority);
+    }
+    let duplicate_filter_ms = duplicate_started.elapsed().as_secs_f64() * 1000.0;
+
+    let mut items = folders;
+    for (path, kind, mtime, file_size) in all_media {
+        items.push(match kind {
+            ScanMediaKind::Image => GridItem::Image(path),
+            ScanMediaKind::Video => GridItem::Video(path),
+            ScanMediaKind::Audio => GridItem::Audio(path),
+        });
+        metas.push(Some((mtime, file_size)));
+    }
+    crate::grid_item::arrange_grid_items(
+        &mut items,
+        &mut metas,
+        &settings.grid_display_order,
+        Some(media_sort),
+    );
+
+    MaterializedFolderListing {
+        items,
+        metas,
+        video_thumb_overrides,
+        folder_count,
+        media_count,
+        folder_sort,
+        sort_ms,
+        duplicate_filter_ms,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ImageFolderPageCountOptions {
     pub(crate) include_convertible_archives: bool,

@@ -832,7 +832,7 @@ foreground との優先度を持っていなかった。
 中断する。ready Blob は foreground が直接使い、network / IPC 待ちなしで decode と原子的差替えへ
 進む。
 
-現行 protocol v12 の `PageRequest.priority` は `Foreground` / `Prefetch` を共有型で表す。remote-web は
+現行 protocol v13 の `PageRequest.priority` は `Foreground` / `Prefetch` を共有型で表す。remote-web は
 prefetch admission を1件に制限し、all / heavy の最終1枠を使用させない。本体も全接続合計の
 prefetch queued + active を1件に制限し、remote heavy worker が1本しかない設定では prefetch を
 `Busy` で拒否する。2 worker 時も heavy queue / active が空の時だけ先読みを開始し、最大1本なので
@@ -1031,6 +1031,44 @@ viewer の ☰ を開くたびに `GetItemState` で `rating_db` と `book_bookm
 不明として操作を無効化するため、要求値を正本のように残さない。session 解放後は既存
 `reload_after_remote_session_release` が reading history / rating / bookmarks / smart folder / 通常一覧を
 再読込するので、ローカルが操作を取り戻した時点で remote の変更が反映される。
+
+### 12.11 通常フォルダの見開き表示 (protocol v13, 2026-08-01)
+
+protocol v13 は `ContainerKind::Folder` を追加し、通常フォルダも ZIP / PDF と同じ
+`GET /api/container` / `ContainerPayload` / `page_groups` 経路へ載せる。本体
+`ContainerEngine` は favorite 境界内の実ディレクトリを走査し、ローカル一覧と同じ sort、
+カテゴリ配置、動画 sidecar、画像拡張子、実フォルダ対仮想コンテナの重複除外を適用する。
+remote-web の `/api/list` はサブフォルダと ZIP / PDF を含むグリッド情報の取得に残すが、
+画像行は本体の folder container `entries` へ置換する。したがって画像を開いた後は ZIP / PDF と
+同じ `loadContainer`、`setContainerPageGroups`、`ImageViewer.loadGroup`、seek、端メッセージ、
+先読み cache を通り、フォルダ専用の viewer payload や描画分岐は持たない。
+
+通常画像の `RemoteSubresource::File` は `/api/page` でも受け付け、本体
+`thumb_loader::process_load_request` へ渡す。ページ address から親フォルダの container address を
+復元できるため、hash history でページを進めても同じフォルダの `page_groups` を再取得できる。
+フォルダの見開きキーも `spread_db::container_key_with_fallback(folder, [])` と
+`get_state_with_fallback` を使い、Web の `SetSpread` 書き込みと読み取りを同じ規則にした。
+端末ローカルの縦持ち設定は ZIP / PDF と同じ `force_single_page` だけを変え、保存済み
+`configured_spread_mode` は変更しない。
+
+グループ列は引き続き本体
+`build_image_reading_indices` → `build_spread_display_units_with_predicates` →
+`SpreadDisplayUnit::spread_pair` を通す。通常 `GridItem::Image` でも表紙位相、catalog
+`source_dims` による横長単独、RTL の画面左右順が ZIP / PDF と同じになる。純粋関数テストは
+LtrCover、横長境界、RTL、縦持ち Single を通常画像 item で固定する。
+
+読書位置の再計算 drift は、ローカル production の一覧組み立て全体を
+`materialize_local_folder_listing` に抽出し、独立した
+`ContainerEngine::recompute_folder_listing` の出力と直接比較する regression test で固定する。
+テスト素材は画像のみ、画像 + 動画、同 stem の複数画像拡張子、同名 ZIP + 実フォルダを含み、
+全 item の種別 / path / 順序に加えて各画像の raw item index、page position、page count を比較する。
+期待一覧のベタ書きではないため、ローカルまたはリモートの組み立て順だけを変えると失敗する。
+
+一覧へ戻る前の読書位置 flush は上限を短縮しない。現行は 30 秒 batch の最終値を生成して直列 write
+tail の完了を待つため、遷移後も書き込みを継続する方式へ変えると session ownership の返却や
+ページ context の切替と競合し、最終位置を失う可能性がある。UI claim 前の異常系には既存 2 秒
+`UiTimeout` があり、通常は App 所有 writer への短い enqueue で完了するので、最大待ちより位置保存を
+優先する判断を維持する。
 
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 

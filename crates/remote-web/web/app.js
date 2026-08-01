@@ -650,8 +650,21 @@ async function dispatchRoute() {
     if (route.kind === "image") {
       const separator = route.path.lastIndexOf("/");
       const folderPath = separator >= 0 ? route.path.slice(0, separator) : "";
-      await loadFolder(route.favoriteId, folderPath);
-      const index = state.images.findIndex((entry) => entry.path === route.path);
+      const address = {
+        favorite_id: route.favoriteId,
+        relative_path: folderPath,
+        subresource: { kind: "file" },
+      };
+      await loadContainer(address);
+      const pageAddress = {
+        favorite_id: route.favoriteId,
+        relative_path: route.path,
+        subresource: { kind: "file" },
+      };
+      const index = state.images.findIndex(
+        (entry) =>
+          addressIdentity(entryAddress(entry)) === addressIdentity(pageAddress)
+      );
       if (index < 0) {
         throw new Error("画像が見つかりませんでした。");
       }
@@ -1397,7 +1410,10 @@ async function loadContainer(address, options = {}) {
   state.forceSinglePage = forceSinglePage;
   setContainerPageGroups(data.page_groups ?? []);
   state.gridIndex = 0;
-  state.gridHash = containerHash(effectiveAddress);
+  state.gridHash =
+    data.kind === "folder"
+      ? folderHash(effectiveAddress.favorite_id, effectiveAddress.relative_path)
+      : containerHash(effectiveAddress);
   state.gridReturnHash = containerParentHash(address);
   return true;
 }
@@ -1782,11 +1798,19 @@ async function loadFolder(favoriteId, path, interactionStartedAt = performance.n
   state.requestController?.abort();
   const controller = new AbortController();
   state.requestController = controller;
-  const data = await apiJson(
-    "/api/list",
-    { fav: favoriteId, path },
-    controller.signal
-  );
+  const folderAddress = {
+    favorite_id: favoriteId,
+    relative_path: requestedPath,
+    subresource: { kind: "file" },
+  };
+  const [data, folderContainer] = await Promise.all([
+    apiJson("/api/list", { fav: favoriteId, path }, controller.signal),
+    apiJson(
+      "/api/container",
+      addressQueryParams(folderAddress),
+      controller.signal
+    ),
+  ]);
   if (controller.signal.aborted) {
     return null;
   }
@@ -1804,13 +1828,33 @@ async function loadFolder(favoriteId, path, interactionStartedAt = performance.n
     Number(data.thumb_aspect_height_ratio) > 0
       ? Number(data.thumb_aspect_height_ratio)
       : 1;
-  state.entries = (data.entries ?? []).filter(
+  const listedEntries = (data.entries ?? []).filter(
     (entry) =>
       entry.kind === "dir" ||
       entry.kind === "image" ||
       entry.kind === "zip" ||
       entry.kind === "pdf"
   );
+  const folderImages = (folderContainer.entries ?? []).filter(
+    (entry) => entry.kind === "image"
+  );
+  const firstListedImage = listedEntries.findIndex(
+    (entry) => entry.kind === "image"
+  );
+  const nonImageEntries = listedEntries.filter(
+    (entry) => entry.kind !== "image"
+  );
+  const insertionIndex =
+    firstListedImage < 0
+      ? nonImageEntries.length
+      : listedEntries
+          .slice(0, firstListedImage)
+          .filter((entry) => entry.kind !== "image").length;
+  state.entries = [
+    ...nonImageEntries.slice(0, insertionIndex),
+    ...folderImages,
+    ...nonImageEntries.slice(insertionIndex),
+  ];
   state.images = state.entries.filter((entry) => entry.kind === "image");
   setSinglePageGroups();
   state.gridIndex = sameFolder
@@ -1931,7 +1975,7 @@ function buildBreadcrumbs() {
     breadcrumbs.append(textElement("h1", state.collection.title));
     return breadcrumbs;
   }
-  if (state.container) {
+  if (state.container && state.container.kind !== "folder") {
     const relativeSegments = state.container.address.relative_path
       .split("/")
       .filter(Boolean);
@@ -2187,7 +2231,16 @@ function addressQueryParams(address, extra = {}) {
   return params;
 }
 
-function parentContainerAddress(address) {
+export function parentContainerAddress(address) {
+  if (address.subresource.kind === "file") {
+    const separator = address.relative_path.lastIndexOf("/");
+    return {
+      favorite_id: address.favorite_id,
+      relative_path:
+        separator >= 0 ? address.relative_path.slice(0, separator) : "",
+      subresource: { kind: "file" },
+    };
+  }
   if (address.subresource.kind === "pdf_page") {
     return {
       favorite_id: address.favorite_id,
