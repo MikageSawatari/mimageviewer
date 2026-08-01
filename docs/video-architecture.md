@@ -123,9 +123,18 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
   TextEdit を含む overlay ダイアログ表示中は、mIV が foreground に戻っているのに pump observation の
   thread focus が外れている場合も、render tick が rate-limit 付き focus intent を返し、`NativeWindowHost` が
   `claim_foreground(presenter_hwnd)` を実行して Alt+Tab 復帰後の文字入力 / Ctrl+V を回復する。
+  presenter の egui Context にも App と同じ IME input plugin を登録し、composition state を
+  viewport 単位で所有する。native event queue が次の egui pass を待つ間は、plugin snapshot に
+  `pending_events` を read-only 投影して Ctrl+V/C/X と Enter/Esc の gate を決め、presenter-local な
+  composition bool / timestamp は持たない。変換中 Esc press の除去と空 preedit 補完は
+  plugin の RawInput 境界へ一本化する。
   Backspace / Space / Enter / 矢印 / F1〜F6 / W / J/K/L/M/B/P/S などの fullscreen ショートカットは、
   overlay 内のボタン focus が残っていても App 側へ転送する。ブックマーク名編集などの文字入力中だけは
   overlay 側がキーを保持し、Space を文字として入力できるようにする。
+  ゲームパッドはこの HWND 入力経路を通らず App が gilrs を直接 poll するため、
+  `NativeOverlayInputRouting::wants_keyboard_input` を既存の presenter→`NativeVideoOutput` event bus の
+  latest-value snapshot として publish する。App のゲームパッド gate は root viewport、対象 viewer
+  viewport、この snapshot を union し、3 面のどこかで文字入力中なら dispatch しない。
   コンテキストヘルプは presenter 内で開く。App 側で共有した `HelpShowContextShortcuts` の
   effective chord を KeyDown で判定し、既定 `?` は `Shift+VK_OEM_2` として扱う。
   `WM_CHAR` / Text はヘルプ開閉には使わず、文字入力用の egui `Event::Text` としてだけ渡す。

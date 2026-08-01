@@ -87,6 +87,13 @@ focus 方向を最初の focusable widget 登録前に `FocusDirection::None` �
 する。no-repeat の <kbd>Tab</kbd> は repeat event も発火させず除去する。
 `wants_keyboard_input()` の gate はこの消費より先に維持し、TextEdit / IME やフォーカス中 UI が
 キーボードを所有している間は KeySlot と egui event の双方を残す。
+ただし IME composition 中の <kbd>Esc</kbd> press だけは、各 egui Context の input plugin が
+`Memory::begin_pass` より前に RawInput から除去する。これは変換キャンセルを egui の focus
+navigation に見せず未確定文字の選択を保つためで、release は残す。続く `Disabled` に
+`Commit` が無い場合だけ、同じ plugin が空の `Preedit("")` を直前へ 1 回補う。
+非 composing 時と 300ms grace 中だけの Esc は除去せず、通常のパネル / モーダル操作へ渡す。
+composition state は viewport ごとに独立し、main / fullscreen / detached を共有する App Context と
+native presenter Context の両方へ同じ plugin を登録する。
 IME 中は Windows の Alt+文字を含むキー処理で TextEdit の focus が一時的に外れる場合があるため、
 `ime_focus` が直前 pass の helper-managed field を 1 pass の `FocusRecovery` owner として保持する。
 この owner は TextEdit の再描画前から keymap を抑止し、同じ pass で field の focus を復帰する。
@@ -99,9 +106,12 @@ pointer 等で focus が正当に移れば次 pass の通常 hover 判定へ戻�
 
 診断は通常 logger の `[text-input-key]` として恒久的に残す。helper field が focused または直前 pass で
 focused だった各 key press について、前後の widget id / egui focus、id 変化、resolved keyboard owner / phase、
-同 pass で左 side panel を閉じた call site を記録する。無修飾の文字 key と physical key は `Char` に
-マスクし、入力内容を復元できない形にする。通常 record は process あたり 1 MiB で抑止し、id / focus /
-owner / close の異常 record は上限後も記録する。helper focus contract がない pass は key event を走査しない。
+同 pass で左 side panel を閉じた call site を記録する。通常 record は process あたり 1 MiB で
+抑止し、id / focus / owner / close の異常 record は上限後も記録する。文字 key と physical key は修飾キーの有無に
+かかわらず `Char` にマスクする。パスワード等の機密 helper field は focus contract 自体が
+diagnostic policy を所有し、`key` / `physical_key` / `modifiers` をすべて `Redacted` として、
+field id / focus / owner / phase / close site と押下件数だけを残す。helper focus contract がない
+pass は key event を走査しない。
 
 開発者向けメモ: 新しいキーボード操作を追加・変更するときは、ユーザーから明示されて
 いなくても keymap 対応要否を確認する。通常ショートカットは `KeyAction` に追加し、
@@ -293,6 +303,12 @@ detached viewer とメイングリッドが同時に表示される場合、ゲ�
 誤って適用されないようにする。<kbd>X</kbd> の値ピッカーも発火面だけに表示する。中ボタンの
 短クリック判定は開始面を保持し、同時表示中の別面に入力がないフレームで取り消さない。
 これらは `KeyAction` ではなく固定入力レイヤーの責務である。
+
+gilrs のゲームパッド入力は HWND / viewport へ配送されないグローバル入力なので、mIV 内の
+文字入力面を排他的に選ばない。root viewport、操作対象 viewer viewport、独自 egui Context を持つ
+native video / music overlay の `wants_keyboard_input` のいずれかが active なら、固定ゲームパッド
+操作全体を止める。native overlay の状態は presenter から既存 output event bus の latest-value
+snapshot として一方向 publish し、App から presenter Context を直接参照しない。
 
 | 入力 | 動作 |
 |---|---|

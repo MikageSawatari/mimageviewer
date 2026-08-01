@@ -996,7 +996,7 @@ impl App {
                                 .color(ui.visuals().weak_text_color()),
                         );
                         ui.add_space(4.0);
-                        let resp = crate::ime_focus::add_singleline(
+                        let resp = crate::ime_focus::add_singleline_sensitive(
                             ui,
                             &mut state.password_input,
                             None,

@@ -401,14 +401,6 @@ struct NativeEguiOverlay {
     bookmark_title_edit: Option<NativeBookmarkTitleEdit>,
     bulk_bookmark_dialog: Option<NativeBulkBookmarkDialog>,
     shortcut_help_open: bool,
-    /// IME (日本語等の入力メソッド) 変換中フラグ。Preedit(非空) で true、
-    /// Commit / Disabled / Preedit("") で false。Ctrl+V/C/X 等のショートカットを
-    /// **composition 中のみ** 抑止するために参照する (commit 直後はすぐ通す方が
-    /// UX 上自然、Codex P3 2026-05-24)。
-    ime_composing: bool,
-    /// Enter/Escape の IME 確定・キャンセルハイジャックを防ぐため、Ime event 直後は
-    /// 短時間ダイアログ確定扱いにしない。Ctrl+V/C/X には使わない。
-    ime_last_event_at: Option<Instant>,
     tag_picker_open: bool,
     tag_picker_input: String,
     tag_picker_focus_request: bool,
@@ -994,7 +986,7 @@ impl Drop for KeyedMutexReadGuard {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NativeOverlayInputRouting {
     pub wants_pointer_input: bool,
     pub wants_keyboard_input: bool,
@@ -3845,6 +3837,7 @@ impl NativeEguiOverlay {
         let renderer =
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let egui_ctx = egui::Context::default();
+        crate::ime_focus::install_ime_input_policy(&egui_ctx);
         crate::egui_focus_policy::install_tab_shortcut_focus_policy(&egui_ctx);
         egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
         configure_overlay_fonts(&egui_ctx, &ui_font);
@@ -3947,8 +3940,6 @@ impl NativeEguiOverlay {
             bookmark_title_edit: None,
             bulk_bookmark_dialog: None,
             shortcut_help_open: false,
-            ime_composing: false,
-            ime_last_event_at: None,
             tag_picker_open: false,
             tag_picker_input: String::new(),
             tag_picker_focus_request: false,
@@ -4248,12 +4239,13 @@ impl NativeEguiOverlay {
                 // - KeyDown / KeyUp の **両方** を suppress する。egui-winit と同様に
                 //   Ctrl+V の raw Key event を egui に流さない (Down だけ抑えて Up を流すと
                 //   release-without-press 状態になる)。
-                // - IME 変換中 (`ime_composing`) は intercept しない: 変換中に Ctrl+V を
+                // - IME 変換中 (`ime_composing()`) は intercept しない: 変換中に Ctrl+V を
                 //   押した場合 Windows IME がそのキーを処理する余地を残す。
                 //   commit 直後は通常通り Ctrl+V を取り込む (Codex P3)。
                 // - クリップボードが空 / 非テキスト形式でも intercept は **成立とみなす**
                 //   (= 'V' 文字を typing 扱いで挿入してしまうのを防ぐ)。
-                // IME 関連の判定は **composition 中のみ** (= `ime_composing` 直接参照) で
+                // IME 関連の判定は **composition 中のみ** (= plugin state に pending
+                // event を投影する `ime_composing()`) で
                 // 行う。`ime_input_active()` の 300ms grace は Enter/Escape (確定キー
                 // ハイジャック) 対策のもので、Ctrl+V/C/X に適用すると IME 確定直後の
                 // 素早いペーストが落ちる (Codex P3 2026-05-24: composition 中だけ抑止し、
@@ -4261,7 +4253,7 @@ impl NativeEguiOverlay {
                 let is_clipboard_shortcut = key.ctrl
                     && !key.alt
                     && self.text_input_active()
-                    && !self.ime_composing
+                    && !self.ime_composing()
                     && matches!(key.virtual_key, 0x43 | 0x56 | 0x58); // C/V/X
                 if is_clipboard_shortcut {
                     if matches!(event, NativeEvent::KeyDown(_)) {
@@ -4322,18 +4314,6 @@ impl NativeEguiOverlay {
                 self.dirty = true;
             }
             NativeEvent::Ime(ime) => {
-                // IME composition state を追跡: Ctrl+V/C/X 等のクリップボードショートカットを
-                // **変換中だけ** 抑止するため (Codex P3: commit 直後の Ctrl+V を落とさない)。
-                self.ime_last_event_at = Some(Instant::now());
-                match &ime {
-                    NativeVideoImeEvent::Enabled => {}
-                    NativeVideoImeEvent::Preedit(text) => {
-                        self.ime_composing = !text.is_empty();
-                    }
-                    NativeVideoImeEvent::Commit(_) | NativeVideoImeEvent::Disabled => {
-                        self.ime_composing = false;
-                    }
-                }
                 let ime = match ime {
                     NativeVideoImeEvent::Enabled => egui::ImeEvent::Enabled,
                     NativeVideoImeEvent::Preedit(text) => egui::ImeEvent::Preedit(text),
@@ -5690,12 +5670,19 @@ impl NativeEguiOverlay {
     }
 
     fn ime_input_active(&self) -> bool {
-        if self.ime_composing {
-            return true;
-        }
-        self.ime_last_event_at
-            .map(|at| at.elapsed() < Duration::from_millis(300))
-            .unwrap_or(false)
+        crate::ime_focus::ime_input_active_with_pending_events(
+            &self.egui_ctx,
+            egui::ViewportId::ROOT,
+            &self.pending_events,
+        )
+    }
+
+    fn ime_composing(&self) -> bool {
+        crate::ime_focus::ime_composing_with_pending_events(
+            &self.egui_ctx,
+            egui::ViewportId::ROOT,
+            &self.pending_events,
+        )
     }
 
     fn maybe_claim_text_input_focus(&mut self) -> Option<NativeWindowIntent> {

@@ -3216,6 +3216,9 @@ impl App {
             }
         }
         match event {
+            crate::video::NativeVideoOutputEvent::OverlayInputRouting(_) => {
+                debug_assert!(false, "routing snapshots are consumed by NativeVideoOutput");
+            }
             crate::video::NativeVideoOutputEvent::Window(event) => {
                 self.handle_native_video_window_event(ctx, fs_idx, event);
             }

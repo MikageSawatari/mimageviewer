@@ -1071,6 +1071,7 @@ pub fn run() -> eframe::Result {
             // creator closure: wgpu/winit 初期化後に 1 回だけ呼ばれる。
             // この closure の先頭までの所要時間 = eframe 自体のセットアップ時間。
             emit_startup("creator_enter", None);
+            ime_focus::install_ime_input_policy(&cc.egui_ctx);
             egui_focus_policy::install_tab_shortcut_focus_policy(&cc.egui_ctx);
             let t = Instant::now();
             ui_fonts::configure_fonts_with_settings(&cc.egui_ctx, &saved.ui_font);

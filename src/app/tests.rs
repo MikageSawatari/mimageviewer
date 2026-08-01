@@ -21,6 +21,7 @@ fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHand
 fn native_video_bookmark_commands_ignore_app_viewport_ime_state() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
+    crate::ime_focus::install_ime_input_policy(&ctx);
     let fs_idx = 0;
     app.fullscreen_idx = Some(fs_idx);
 
@@ -23513,6 +23514,33 @@ mod pipeline_cache_refactor_tests {
     }
 
     #[test]
+    fn paged_prefetch_starts_current_needs_load_after_cancelling_siblings() {
+        let mut app = setup_app();
+        let current = push_image(&mut app, r"C:\missing\current.png");
+        let sibling = push_image(&mut app, r"C:\missing\sibling.png");
+        app.visible_indices = vec![current, sibling];
+        app.details_order = vec![current, sibling];
+        app.fullscreen_idx = Some(current);
+        assert_eq!(app.fs_page_load_state(current), FsPageLoadState::NeedsLoad);
+
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let sibling_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let input_seq = app.input_seq;
+        app.fs_pending
+            .insert(sibling, (Arc::clone(&sibling_cancel), rx, input_seq));
+
+        app.update_prefetch_window(current);
+
+        assert!(sibling_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.fs_pending.contains_key(&current));
+        assert_eq!(
+            app.fs_page_load_state(current),
+            FsPageLoadState::LoadPending,
+            "the paged twin must re-assert the current producer before returning",
+        );
+    }
+
+    #[test]
     fn pdf_spread_reaches_both_pages_without_user_input() {
         let ctx = egui::Context::default();
         let mut app = setup_app();
@@ -45543,7 +45571,9 @@ fn setup_fullscreen_fixed_key_test() -> (phase_c_support::AppTestEnv, usize, egu
     ]);
     let idx = app.items.len() - 2;
     app.fullscreen_idx = Some(idx);
-    (app, idx, egui::Context::default())
+    let ctx = egui::Context::default();
+    crate::ime_focus::install_ime_input_policy(&ctx);
+    (app, idx, ctx)
 }
 
 #[track_caller]
@@ -45824,6 +45854,7 @@ fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() 
     app.fullscreen_idx = Some(idx);
     app.adjustment_mode = true;
     let ctx = egui::Context::default();
+    crate::ime_focus::install_ime_input_policy(&ctx);
     let field_id = egui::Id::new("ime-bookmark-title-focus-contract");
     let mut title = String::new();
     let mut request_focus = true;
