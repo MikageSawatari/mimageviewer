@@ -1039,9 +1039,21 @@ protocol v13 は `ContainerKind::Folder` を追加し、通常フォルダも ZI
 `ContainerEngine` は favorite 境界内の実ディレクトリを走査し、ローカル一覧と同じ sort、
 カテゴリ配置、動画 sidecar、画像拡張子、実フォルダ対仮想コンテナの重複除外を適用する。
 remote-web の `/api/list` はサブフォルダと ZIP / PDF を含むグリッド情報の取得に残すが、
-画像行は本体の folder container `entries` へ置換する。したがって画像を開いた後は ZIP / PDF と
-同じ `loadContainer`、`setContainerPageGroups`、`ImageViewer.loadGroup`、seek、端メッセージ、
-先読み cache を通り、フォルダ専用の viewer payload や描画分岐は持たない。
+一覧描画は `/api/list` の応答だけで確定する。`/api/list` と `/api/container` は同じ
+`AbortController` の所有下で並行開始するものの、`loadFolder` が待つのは前者だけであり、遅い
+本体 IPC / 2 回目の走査を一覧の first paint へ持ち込まない。
+
+folder container の promise は現在フォルダの文脈に保持する。応答済みなら画像タップ時に即座に、
+未完ならその既存 promise だけを待って `entries` / `page_groups` / spread mode / reading direction を
+viewer state へ install する。したがって viewer のページ順の正本は引き続き `/api/container` であり、
+ZIP / PDF と同じ `setContainerPageGroups`、`ImageViewer.loadGroup`、seek、端メッセージ、先読み cache
+を通る。一覧を container 応答で再描画して順序を途中で入れ替えることはしない。
+
+別フォルダ / ホーム / collection への遷移は既存 `requestController` を abort し、container install
+直前にも controller、folder identity、現在の load owner がすべて一致することを確認する。古い
+container 応答は fetch 実装が abort を無視して完了しても現在フォルダへ適用できない。画像を開く
+直前に端末の向きが変わり `force_single_page` が背景要求と異なる場合だけ、古い要求を破棄して現在の
+向きで `/api/container` を再要求する。
 
 通常画像の `RemoteSubresource::File` は `/api/page` でも受け付け、本体
 `thumb_loader::process_load_request` へ渡す。ページ address から親フォルダの container address を
@@ -1069,6 +1081,34 @@ tail の完了を待つため、遷移後も書き込みを継続する方式へ
 ページ context の切替と競合し、最終位置を失う可能性がある。UI claim 前の異常系には既存 2 秒
 `UiTimeout` があり、通常は App 所有 writer への短い enqueue で完了するので、最大待ちより位置保存を
 優先する判断を維持する。
+
+### 12.12 PWA / standalone 起動 (2026-08-01)
+
+`manifest.webmanifest` は配信位置からの相対 `start_url: "./"` / `scope: "./"`、
+`display: "standalone"`、暗色 shell と同じ `#111318` の background / theme color を持つ。
+通常アイコン 192 / 512 と maskable 192 / 512 を manifest へ登録し、iOS は 180 の
+`apple-touch-icon`、`apple-mobile-web-app-capable=yes`、暗色に合わせた
+`black-translucent` status bar を使う。認証後の hash router は従来どおり同一 origin の現在 URL 上で
+動き、空 hash での起動は既存 boot が `#home/places` へ置き換える。
+
+manifest とアイコンは index / JS / CSS と同じ認証外の static shell とする。ホーム画面への追加と
+PIN 入力画面の構築に必要で、内容は固定の名称・色・画像だけでライブラリ情報や credential を含まない。
+`/api/*` は従来どおり認証内である。全 static PWA route は既存 `Cache-Control: no-cache` を使い、
+未認証 / Cookie 認証の両方で同じ bytes / MIME を返す route test を持つ。
+
+`viewport-fit=cover` に加えて、PIN 画面、通常 top bar、home content、grid 左右余白 / notice、loading /
+error、session status、viewer 上下 bar / seek / edge message、下 sheet と desktop side menu に
+`env(safe-area-inset-top/right/bottom/left)` を適用する。縦持ちの status bar / home indicator だけでなく、
+横持ちの左右ノッチ側にも操作要素や grid tile が入らない。
+
+standalone ではブラウザ chrome が無いため、☰ の「再読み込み」は remote session acquire を必要としない
+local command とし、現在 hash を保った `location.reload()` を行う。session acquire / ping が 401 を
+受けた場合も PIN 画面へ戻すため、期限切れ後に standalone 内だけで再認証できる。現時点の shell は
+外部リンクを提供していないため外部サイトへ出る導線の閉じ込めは存在しない。追加時は同一 scope の
+内部 route と区別して OS browser へ渡す。
+
+Service Worker は登録しない。コンテンツの正本は母艦 PC にあり offline shell だけを残す意味がなく、
+更新後の JS / CSS を古い cache が保持する故障モードを増やすためである。
 
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 
@@ -1143,12 +1183,10 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 ### 13.6 残タスク (2026-08-01 時点)
 
-1. **通常フォルダの見開き対応** — 現在は ZIP / PDF の `/api/container` のみ
-2. **動画・音声のストリーミング** — 正本は
+1. **動画・音声のストリーミング** — 正本は
    [web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md)
-3. **PWA** — アイコンと全画面起動
-4. **検索** (Ctrl+S / F / G 相当)、タグ
-5. 配布 (exe 埋め込み、接続診断ウィザード)
+2. **検索** (Ctrl+S / F / G 相当)、タグ
+3. 配布 (exe 埋め込み、接続診断ウィザード)
 
 ### 13.7 未消化の宿題
 

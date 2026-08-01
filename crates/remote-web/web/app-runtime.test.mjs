@@ -36,20 +36,28 @@ globalThis.document = {
     return new FakeElement(tag);
   },
 };
+let reloadCalls = 0;
+const testLocation = {
+  origin: "http://127.0.0.1:8787",
+  hash: "",
+  href: "http://127.0.0.1:8787/",
+  reload() { reloadCalls += 1; },
+};
 globalThis.window = {
   innerWidth: 430,
   innerHeight: 800,
   devicePixelRatio: 2,
+  location: testLocation,
   addEventListener() {},
   removeEventListener() {},
 };
-globalThis.location = { origin: "http://127.0.0.1:8787" };
+globalThis.location = testLocation;
 globalThis.requestAnimationFrame = (callback) => {
   callback(performance.now());
   return 1;
 };
 globalThis.cancelAnimationFrame = () => {};
-globalThis.fetch = async () => new Response(new Blob([new Uint8Array([1, 2, 3])]), {
+const imageFetch = async () => new Response(new Blob([new Uint8Array([1, 2, 3])]), {
   status: 200,
   headers: {
     "Content-Type": "image/webp",
@@ -58,8 +66,15 @@ globalThis.fetch = async () => new Response(new Blob([new Uint8Array([1, 2, 3])]
     "X-mIV-Image-Height": "1800",
   },
 });
+globalThis.fetch = imageFetch;
 
-const { ImageViewer, parentContainerAddress } = await import("./app.js");
+const {
+  ImageViewer,
+  activateFolderContainerForImage,
+  loadFolder,
+  parentContainerAddress,
+  reloadApplication,
+} = await import("./app.js");
 
 test("plain image media routes resolve their containing folder", () => {
   assert.deepEqual(
@@ -198,4 +213,165 @@ test("spread waits for both pages and atomically replaces the page layer", async
   viewer.hideBoundaryMessage();
   assert.equal(viewer.boundaryMessage.hidden, true);
   viewer.destroy();
+});
+
+test("folder list becomes renderable before spread metadata and open waits for it", async () => {
+  let resolveContainer;
+  let containerRequested = false;
+  globalThis.fetch = async (input) => {
+    const url = new URL(input, testLocation.origin);
+    if (url.pathname === "/api/list") {
+      return Response.json({
+        path: "book",
+        thumb_aspect_height_ratio: 1,
+        entries: [
+          { kind: "dir", name: "child", path: "book/child" },
+          { kind: "image", name: "001.jpg", path: "book/001.jpg" },
+          { kind: "image", name: "002.jpg", path: "book/002.jpg" },
+        ],
+      });
+    }
+    if (url.pathname === "/api/container") {
+      containerRequested = true;
+      return new Promise((resolve) => { resolveContainer = resolve; });
+    }
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+
+  try {
+    const loaded = await loadFolder("favorite", "book", performance.now());
+    assert.equal(containerRequested, true);
+    assert.equal(loaded.metrics.entryCount, 3);
+    assert.equal(loaded.metrics.containerCount, 0);
+
+    const pageAddress = {
+      favorite_id: "favorite",
+      relative_path: "book/002.jpg",
+      subresource: { kind: "file" },
+    };
+    let viewerPreparationSettled = false;
+    const viewerPreparation = activateFolderContainerForImage(pageAddress, 2)
+      .then((value) => {
+        viewerPreparationSettled = true;
+        return value;
+      });
+    await Promise.resolve();
+    assert.equal(viewerPreparationSettled, false);
+
+    const folderAddress = parentContainerAddress(pageAddress);
+    const page = (name) => ({
+      kind: "image",
+      name,
+      address: {
+        favorite_id: "favorite",
+        relative_path: `book/${name}`,
+        subresource: { kind: "file" },
+      },
+    });
+    resolveContainer(Response.json({
+      kind: "folder",
+      title: "book",
+      effective_address: folderAddress,
+      entries: [page("002.jpg"), page("001.jpg")],
+      configured_spread_mode: "rtl",
+      effective_spread_mode: "rtl",
+      reading_direction: "rtl",
+      spread_page_gap_px: 8,
+      page_groups: [
+        {
+          anchor: page("002.jpg").address,
+          pages: [page("001.jpg").address, page("002.jpg").address],
+        },
+      ],
+      entry_limit: 1000,
+      truncated: false,
+    }));
+    assert.equal(await viewerPreparation, 0);
+  } finally {
+    globalThis.fetch = imageFetch;
+  }
+});
+
+test("a previous folder container result cannot satisfy the current folder", async () => {
+  const containerResolvers = new Map();
+  globalThis.fetch = async (input) => {
+    const url = new URL(input, testLocation.origin);
+    const path = url.searchParams.get("path");
+    if (url.pathname === "/api/list") {
+      return Response.json({
+        path,
+        thumb_aspect_height_ratio: 1,
+        entries: [
+          { kind: "image", name: "001.jpg", path: `${path}/001.jpg` },
+        ],
+      });
+    }
+    if (url.pathname === "/api/container") {
+      return new Promise((resolve) => { containerResolvers.set(path, resolve); });
+    }
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+
+  const containerResponse = (path) => {
+    const address = {
+      favorite_id: "favorite",
+      relative_path: path,
+      subresource: { kind: "file" },
+    };
+    const pageAddress = {
+      favorite_id: "favorite",
+      relative_path: `${path}/001.jpg`,
+      subresource: { kind: "file" },
+    };
+    return {
+      pageAddress,
+      response: Response.json({
+        kind: "folder",
+        title: path,
+        effective_address: address,
+        entries: [{ kind: "image", name: "001.jpg", address: pageAddress }],
+        configured_spread_mode: "single",
+        effective_spread_mode: "single",
+        reading_direction: "ltr",
+        spread_page_gap_px: 0,
+        page_groups: [{ anchor: pageAddress, pages: [pageAddress] }],
+        entry_limit: 1000,
+        truncated: false,
+      }),
+    };
+  };
+
+  try {
+    const oldFolder = await loadFolder("favorite", "old");
+    const currentFolder = await loadFolder("favorite", "current");
+    assert.equal(oldFolder.requestController.signal.aborted, true);
+
+    const current = containerResponse("current");
+    let currentPreparationSettled = false;
+    const currentPreparation = activateFolderContainerForImage(
+      current.pageAddress,
+      0
+    ).then((value) => {
+      currentPreparationSettled = true;
+      return value;
+    });
+    containerResolvers.get("old")(containerResponse("old").response);
+    await oldFolder.containerLoad.promise;
+    await Promise.resolve();
+    assert.equal(currentPreparationSettled, false);
+
+    containerResolvers.get("current")(current.response);
+    assert.equal(await currentPreparation, 0);
+    assert.equal(currentFolder.requestController.signal.aborted, false);
+  } finally {
+    globalThis.fetch = imageFetch;
+  }
+});
+
+test("standalone reload is local and preserves the current hash", () => {
+  const before = reloadCalls;
+  testLocation.hash = "#image/favorite/book%2F002.jpg";
+  reloadApplication();
+  assert.equal(reloadCalls, before + 1);
+  assert.equal(testLocation.hash, "#image/favorite/book%2F002.jpg");
 });

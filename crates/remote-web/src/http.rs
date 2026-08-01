@@ -369,6 +369,26 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             "text/javascript; charset=utf-8",
         ),
         (Method::Get, "/styles.css") => static_file(state, "styles.css", "text/css; charset=utf-8"),
+        (Method::Get, "/manifest.webmanifest") => static_file(
+            state,
+            "manifest.webmanifest",
+            "application/manifest+json; charset=utf-8",
+        ),
+        (Method::Get, "/icons/icon-180.png") => {
+            static_file(state, "icons/icon-180.png", "image/png")
+        }
+        (Method::Get, "/icons/icon-192.png") => {
+            static_file(state, "icons/icon-192.png", "image/png")
+        }
+        (Method::Get, "/icons/icon-512.png") => {
+            static_file(state, "icons/icon-512.png", "image/png")
+        }
+        (Method::Get, "/icons/maskable-192.png") => {
+            static_file(state, "icons/maskable-192.png", "image/png")
+        }
+        (Method::Get, "/icons/maskable-512.png") => {
+            static_file(state, "icons/maskable-512.png", "image/png")
+        }
         (Method::Get, "/favicon.ico") => HttpResponse::bytes(204, "image/x-icon", Vec::new()),
         (Method::Get, "/api/auth/status") => api_auth_status(state, auth),
         (Method::Post, "/api/auth/pin") => api_auth_pin(request, state),
@@ -1987,6 +2007,80 @@ mod tests {
         let response = route(&mut request, &state);
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"export {};");
+    }
+
+    #[test]
+    fn pwa_shell_assets_are_public_before_and_after_authentication() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        std::fs::create_dir_all(temp.path().join("icons")).unwrap();
+        let assets = [
+            (
+                "/manifest.webmanifest",
+                "manifest.webmanifest",
+                "application/manifest+json; charset=utf-8",
+                b"{\"name\":\"mIV Remote\"}".as_slice(),
+            ),
+            (
+                "/icons/icon-180.png",
+                "icons/icon-180.png",
+                "image/png",
+                b"png-180".as_slice(),
+            ),
+            (
+                "/icons/icon-192.png",
+                "icons/icon-192.png",
+                "image/png",
+                b"png-192".as_slice(),
+            ),
+            (
+                "/icons/icon-512.png",
+                "icons/icon-512.png",
+                "image/png",
+                b"png-512".as_slice(),
+            ),
+            (
+                "/icons/maskable-192.png",
+                "icons/maskable-192.png",
+                "image/png",
+                b"maskable-192".as_slice(),
+            ),
+            (
+                "/icons/maskable-512.png",
+                "icons/maskable-512.png",
+                "image/png",
+                b"maskable-512".as_slice(),
+            ),
+        ];
+        for (_, file, _, body) in assets {
+            std::fs::write(temp.path().join(file), body).unwrap();
+        }
+
+        for authenticated in [false, true] {
+            for (path, _, expected_content_type, expected_body) in assets {
+                let mut request = TestRequest::new().with_method(Method::Get).with_path(path);
+                if authenticated {
+                    request = request.with_header(cookie_header(&state));
+                }
+                let mut request: Request = request.into();
+                let response = route(&mut request, &state);
+                assert_eq!(response.status, 200, "{path} authenticated={authenticated}");
+                assert_eq!(response.content_type, expected_content_type);
+                assert_eq!(response.body, expected_body);
+                assert!(
+                    response
+                        .headers
+                        .iter()
+                        .any(|(name, value)| { *name == "Cache-Control" && value == "no-cache" })
+                );
+            }
+        }
+
+        let mut protected_request: Request = TestRequest::new()
+            .with_method(Method::Get)
+            .with_path("/api/favorites")
+            .into();
+        assert_eq!(route(&mut protected_request, &state).status, 401);
     }
 
     #[test]

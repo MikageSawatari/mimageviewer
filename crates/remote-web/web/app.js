@@ -304,6 +304,7 @@ const state = {
   containerImageInfoHints: new Map(),
   pageDirection: 1,
   requestController: null,
+  folderContainerLoad: null,
   virtualGrid: null,
   thumbnailTracker: null,
   viewer: null,
@@ -411,6 +412,10 @@ async function acquireRemoteSession(reason = "operation") {
         credentials: "same-origin",
         headers: remoteHeaders({ Accept: "application/json" }),
       });
+      if (response.status === 401) {
+        renderPinLogin(0);
+        throw new AuthenticationRequiredError("PIN 認証が必要です。");
+      }
       const result = await response.json().catch(() => ({}));
       if (!response.ok || result.status !== "active") {
         throw new Error(result.message || `操作権を取得できません (HTTP ${response.status})。`);
@@ -420,6 +425,7 @@ async function acquireRemoteSession(reason = "operation") {
       enqueueTelemetry({ type: "remote_session", action: "acquire", reason });
       return true;
     } catch (error) {
+      if (error instanceof AuthenticationRequiredError) throw error;
       setRemoteSessionStatus(
         "unavailable",
         error instanceof Error ? error.message : "操作権を取得できません。"
@@ -458,6 +464,10 @@ async function pingRemoteSession() {
     headers: remoteHeaders({ "Content-Type": "application/json", Accept: "application/json" }),
     body: JSON.stringify({ user_active: userActive, media_playing: mediaPlaying }),
   });
+  if (response.status === 401) {
+    renderPinLogin(0);
+    return;
+  }
   const result = await response.json().catch(() => ({}));
   if (!response.ok || result.status !== "active") {
     setRemoteSessionStatus(
@@ -781,13 +791,16 @@ function dispatchCommand(requested, meta = {}) {
   const source = meta.source ?? "mouse";
   if (
     requested.name === CommandName.OPEN_LOCAL_SETTINGS ||
-    requested.name === CommandName.OPEN_GESTURE_HELP
+    requested.name === CommandName.OPEN_GESTURE_HELP ||
+    requested.name === CommandName.RELOAD_APP
   ) {
     state.commandMenu?.close(false);
     if (requested.name === CommandName.OPEN_LOCAL_SETTINGS) {
       openLocalSettingsDialog();
-    } else {
+    } else if (requested.name === CommandName.OPEN_GESTURE_HELP) {
       openGestureHelpDialog();
+    } else {
+      reloadApplication();
     }
     if (meta.telemetry !== false) {
       enqueueTelemetry({
@@ -857,11 +870,6 @@ function dispatchCommand(requested, meta = {}) {
     handled = openGridEntry(state.gridIndex, meta);
   } else if (requested.name === CommandName.TOGGLE_FULLSCREEN) {
     toggleBrowserFullscreen();
-    handled = true;
-  } else if (requested.name === CommandName.RELOAD_APP) {
-    // ホーム画面から起動した iOS の単独ウィンドウにはブラウザの再読み込みが無い。
-    // 現在の hash を保ったまま読み直すので、開いているページへ戻ってくる。
-    window.location.reload();
     handled = true;
   } else if (requested.name === CommandName.GRID_SELECT) {
     const index = Number(requested.payload.index);
@@ -948,6 +956,14 @@ function executeOpenCommand(payload, meta) {
     navigate(containerHash(payload.address));
     return true;
   }
+  if (
+    (payload.kind === "image" || payload.kind === "media") &&
+    !state.collection &&
+    !state.container &&
+    state.folderContainerLoad
+  ) {
+    return openFolderImageFromGrid(payload, meta);
+  }
   if (payload.kind === "media" && payload.address) {
     const imageIndex = state.images.findIndex(
       (entry) => addressIdentity(entryAddress(entry)) === addressIdentity(payload.address)
@@ -1003,6 +1019,79 @@ function executeOpenCommand(payload, meta) {
   );
   renderImageViewer(payload.imageIndex, meta.at ?? performance.now());
   return true;
+}
+
+function openFolderImageFromGrid(payload, meta) {
+  const pageAddress = payload.address ?? {
+    favorite_id: payload.favoriteId ?? state.favoriteId,
+    relative_path: payload.path,
+    subresource: { kind: "file" },
+  };
+  if (!pageAddress.favorite_id || !pageAddress.relative_path) return false;
+  if (Number.isInteger(payload.entryIndex)) state.gridIndex = payload.entryIndex;
+
+  const folderLoad = state.folderContainerLoad;
+  const returnHash = folderHash(state.favoriteId, state.folderPath);
+  tryEnterBrowserFullscreen();
+  history.pushState(
+    {
+      mivRoute: true,
+      navigatedInApp: true,
+      viewerFromGrid: true,
+      viewerDepth: 1,
+      returnHash,
+    },
+    "",
+    pageAddress.subresource.kind === "file"
+      ? imageHash(pageAddress.favorite_id, pageAddress.relative_path)
+      : mediaHash(pageAddress)
+  );
+  renderLoading("ビューアを準備しています", folderLoad.controller);
+  activateFolderContainerForImage(pageAddress, payload.entryIndex)
+    .then((imageIndex) => {
+      if (imageIndex < 0) {
+        throw new Error("画像が見つかりませんでした。");
+      }
+      renderImageViewer(imageIndex, meta.at ?? performance.now());
+    })
+    .catch(renderError);
+  return true;
+}
+
+export async function activateFolderContainerForImage(pageAddress, gridIndex) {
+  const folderAddress = parentContainerAddress(pageAddress);
+  const identity = addressIdentity(folderAddress);
+  const forceSinglePage = containerForceSinglePage();
+  const folderLoad = state.folderContainerLoad;
+
+  if (
+    !folderLoad ||
+    folderLoad.identity !== identity ||
+    folderLoad.forceSinglePage !== forceSinglePage
+  ) {
+    const loaded = await loadContainer(folderAddress, {
+      forceSinglePage,
+      gridIndex,
+    });
+    if (!loaded) return -1;
+  } else {
+    const data = await folderLoad.promise;
+    if (
+      folderLoad.controller.signal.aborted ||
+      state.folderContainerLoad !== folderLoad ||
+      state.requestController !== folderLoad.controller
+    ) {
+      throw abortError();
+    }
+    applyContainerData(folderAddress, data, forceSinglePage, { gridIndex });
+    state.folderContainerLoad = null;
+    state.requestController = null;
+  }
+
+  return state.images.findIndex(
+    (entry) =>
+      addressIdentity(entryAddress(entry)) === addressIdentity(pageAddress)
+  );
 }
 
 function openGridEntry(index, meta) {
@@ -1127,11 +1216,21 @@ function menuCommand(event, name, payload = {}) {
   });
 }
 
-function cleanupScreen() {
+function cleanupScreen(preserveRequestController = null) {
   clearInterval(state.authCountdownTimer);
   state.authCountdownTimer = 0;
-  state.requestController?.abort();
-  state.requestController = null;
+  if (
+    state.requestController &&
+    state.requestController !== preserveRequestController
+  ) {
+    state.requestController.abort();
+    state.requestController = null;
+  }
+  if (
+    state.folderContainerLoad?.controller !== preserveRequestController
+  ) {
+    state.folderContainerLoad = null;
+  }
   state.virtualGrid?.destroy();
   state.virtualGrid = null;
   state.thumbnailTracker?.destroy();
@@ -1351,8 +1450,9 @@ function collectionRequestParams(route) {
 async function showFolder(favoriteId, path) {
   const startedAt = performance.now();
   renderLoading("フォルダを読み込んでいます");
-  const metrics = await loadFolder(favoriteId, path, startedAt);
-  renderFolder(metrics);
+  const loaded = await loadFolder(favoriteId, path, startedAt);
+  if (!loaded) return;
+  renderFolder(loaded.metrics, loaded.requestController);
 }
 
 async function showContainer(address) {
@@ -1362,15 +1462,9 @@ async function showContainer(address) {
 }
 
 async function loadContainer(address, options = {}) {
-  const spreadIntent = planSpreadIntent({
-    currentDirection: state.readingDirection,
-    portraitSinglePage: state.localSettings.portraitSinglePage,
-    viewportWidth: window.innerWidth,
-    viewportHeight: window.innerHeight,
-  });
-  const forceSinglePage = options.forceSinglePage ??
-    spreadIntent.forceSinglePage;
+  const forceSinglePage = containerForceSinglePage(options);
   state.requestController?.abort();
+  state.folderContainerLoad = null;
   const controller = new AbortController();
   state.requestController = controller;
   const data = await apiJson(
@@ -1380,8 +1474,30 @@ async function loadContainer(address, options = {}) {
     }),
     controller.signal
   );
-  if (controller.signal.aborted) return false;
+  if (
+    controller.signal.aborted ||
+    state.requestController !== controller
+  ) {
+    return false;
+  }
   state.requestController = null;
+  applyContainerData(address, data, forceSinglePage, options);
+  return true;
+}
+
+function containerForceSinglePage(options = {}) {
+  if (options.forceSinglePage !== undefined) {
+    return Boolean(options.forceSinglePage);
+  }
+  return planSpreadIntent({
+    currentDirection: state.readingDirection,
+    portraitSinglePage: state.localSettings.portraitSinglePage,
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+  }).forceSinglePage;
+}
+
+function applyContainerData(address, data, forceSinglePage, options = {}) {
   const effectiveAddress = data.effective_address ?? address;
   state.collection = null;
   state.container = {
@@ -1409,13 +1525,14 @@ async function loadContainer(address, options = {}) {
   state.spreadPageGapPx = Math.max(0, Number(data.spread_page_gap_px) || 0);
   state.forceSinglePage = forceSinglePage;
   setContainerPageGroups(data.page_groups ?? []);
-  state.gridIndex = 0;
+  state.gridIndex = Number.isInteger(options.gridIndex)
+    ? clamp(options.gridIndex, 0, Math.max(0, state.entries.length - 1))
+    : 0;
   state.gridHash =
     data.kind === "folder"
       ? folderHash(effectiveAddress.favorite_id, effectiveAddress.relative_path)
       : containerHash(effectiveAddress);
   state.gridReturnHash = containerParentHash(address);
-  return true;
 }
 
 function setSinglePageGroups() {
@@ -1790,12 +1907,17 @@ async function refreshContainerSpread(
   if (imageIndex >= 0) renderImageViewer(imageIndex, performance.now());
 }
 
-async function loadFolder(favoriteId, path, interactionStartedAt = performance.now()) {
+export async function loadFolder(
+  favoriteId,
+  path,
+  interactionStartedAt = performance.now()
+) {
   const fetchStartedAt = performance.now();
   const requestedPath = path ?? "";
   const sameFolder =
     state.favoriteId === favoriteId && state.folderPath === requestedPath;
   state.requestController?.abort();
+  state.folderContainerLoad = null;
   const controller = new AbortController();
   state.requestController = controller;
   const folderAddress = {
@@ -1803,18 +1925,39 @@ async function loadFolder(favoriteId, path, interactionStartedAt = performance.n
     relative_path: requestedPath,
     subresource: { kind: "file" },
   };
-  const [data, folderContainer] = await Promise.all([
-    apiJson("/api/list", { fav: favoriteId, path }, controller.signal),
-    apiJson(
-      "/api/container",
-      addressQueryParams(folderAddress),
-      controller.signal
-    ),
-  ]);
-  if (controller.signal.aborted) {
+  const forceSinglePage = containerForceSinglePage();
+  const listPromise = apiJson(
+    "/api/list",
+    { fav: favoriteId, path: requestedPath },
+    controller.signal
+  );
+  const containerLoad = {
+    address: folderAddress,
+    identity: addressIdentity(folderAddress),
+    forceSinglePage,
+    controller,
+    promise: null,
+  };
+  containerLoad.promise = apiJson(
+    "/api/container",
+    addressQueryParams(folderAddress, {
+      single: forceSinglePage ? 1 : 0,
+    }),
+    controller.signal
+  );
+  // The list is useful without spread metadata. Observe background failures here;
+  // opening an image awaits the same promise and reports its error if necessary.
+  containerLoad.promise.catch(() => {});
+  state.folderContainerLoad = containerLoad;
+
+  const data = await listPromise;
+  if (
+    controller.signal.aborted ||
+    state.requestController !== controller ||
+    state.folderContainerLoad !== containerLoad
+  ) {
     return null;
   }
-  state.requestController = null;
   state.collection = null;
   state.container = null;
   state.gridReturnHash = homeHash("favorites");
@@ -1828,51 +1971,35 @@ async function loadFolder(favoriteId, path, interactionStartedAt = performance.n
     Number(data.thumb_aspect_height_ratio) > 0
       ? Number(data.thumb_aspect_height_ratio)
       : 1;
-  const listedEntries = (data.entries ?? []).filter(
+  state.entries = (data.entries ?? []).filter(
     (entry) =>
       entry.kind === "dir" ||
       entry.kind === "image" ||
       entry.kind === "zip" ||
       entry.kind === "pdf"
   );
-  const folderImages = (folderContainer.entries ?? []).filter(
-    (entry) => entry.kind === "image"
-  );
-  const firstListedImage = listedEntries.findIndex(
-    (entry) => entry.kind === "image"
-  );
-  const nonImageEntries = listedEntries.filter(
-    (entry) => entry.kind !== "image"
-  );
-  const insertionIndex =
-    firstListedImage < 0
-      ? nonImageEntries.length
-      : listedEntries
-          .slice(0, firstListedImage)
-          .filter((entry) => entry.kind !== "image").length;
-  state.entries = [
-    ...nonImageEntries.slice(0, insertionIndex),
-    ...folderImages,
-    ...nonImageEntries.slice(insertionIndex),
-  ];
   state.images = state.entries.filter((entry) => entry.kind === "image");
   setSinglePageGroups();
   state.gridIndex = sameFolder
     ? clamp(state.gridIndex, 0, Math.max(0, state.entries.length - 1))
     : 0;
   return {
-    interactionStartedAt,
-    fetchMs: performance.now() - fetchStartedAt,
-    entryCount: state.entries.length,
-    containerCount: state.entries.filter((entry) =>
-      ["zip", "pdf"].includes(entry.kind)
-    ).length,
+    metrics: {
+      interactionStartedAt,
+      fetchMs: performance.now() - fetchStartedAt,
+      entryCount: state.entries.length,
+      containerCount: state.entries.filter((entry) =>
+        ["zip", "pdf"].includes(entry.kind)
+      ).length,
+    },
+    requestController: controller,
+    containerLoad,
   };
 }
 
-function renderFolder(listMetrics = null) {
+function renderFolder(listMetrics = null, preserveRequestController = null) {
   const renderStartedAt = performance.now();
-  cleanupScreen();
+  cleanupScreen(preserveRequestController);
   state.screenContext = "grid";
   exitBrowserFullscreen();
   document.title =
@@ -4457,8 +4584,8 @@ function apiUrl(path, params = {}) {
   return `${url.pathname}${url.search}`;
 }
 
-function renderLoading(message) {
-  cleanupScreen();
+function renderLoading(message, preserveRequestController = null) {
+  cleanupScreen(preserveRequestController);
   state.screenContext = "loading";
   const status = element("div", "center-status");
   status.append(element("div", "spinner"), textElement("div", message));
@@ -4532,6 +4659,12 @@ function toggleBrowserFullscreen() {
   } else {
     tryEnterBrowserFullscreen();
   }
+}
+
+// Standalone windows do not expose browser chrome. Reload is intentionally local:
+// it must work even after the server-side session or authentication cookie expires.
+export function reloadApplication() {
+  window.location.reload();
 }
 
 function installTelemetry() {
