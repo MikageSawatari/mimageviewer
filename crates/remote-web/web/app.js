@@ -8,7 +8,9 @@ import {
   commandFromKey,
   containerPageTargetPx,
   createReadingProgressBatch,
+  gridColumnOverrideFieldForViewport,
   gridColumnOverrideForViewport,
+  gridColumnsAfterPinch,
   gridLabelHeightForEntries,
   gridLayoutForWidth,
   gridScrollExtent,
@@ -3212,22 +3214,30 @@ class VirtualGrid {
     this.lastRange = "";
     this.frame = 0;
     this.snapTimer = 0;
-    this.pointerActive = false;
+    this.activePointers = new Map();
+    this.pinch = null;
+    this.blockClickUntil = 0;
+    this.wheelPinchScale = 1;
+    this.wheelPinchTimer = 0;
     this.onScroll = () => {
       this.schedule();
       this.scheduleRowSnap();
     };
     this.onScrollEnd = () => this.snapToRow();
     this.onWheel = (event) => this.handleWheel(event);
-    this.onPointerDown = () => {
-      this.pointerActive = true;
-      clearTimeout(this.snapTimer);
-      this.snapTimer = 0;
+    this.onPointerDown = (event) => this.handlePointerDown(event);
+    this.onPointerMove = (event) => this.handlePointerMove(event);
+    this.onPointerEnd = (event) => this.handlePointerEnd(event);
+    this.onTouchMove = (event) => {
+      if (event.touches.length < 2) return;
+      event.preventDefault();
     };
-    this.onPointerEnd = () => {
-      this.pointerActive = false;
-      this.scheduleRowSnap();
+    this.onClickCapture = (event) => {
+      if (performance.now() >= this.blockClickUntil) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
     };
+    this.onNativeGesture = (event) => event.preventDefault();
     this.resizeObserver = new ResizeObserver(() => this.layout());
     this.scroller.addEventListener("scroll", this.onScroll, { passive: true });
     this.scroller.addEventListener("scrollend", this.onScrollEnd, {
@@ -3235,7 +3245,10 @@ class VirtualGrid {
     });
     this.scroller.addEventListener("wheel", this.onWheel, { passive: false });
     this.scroller.addEventListener("pointerdown", this.onPointerDown, {
-      passive: true,
+      passive: false,
+    });
+    this.scroller.addEventListener("pointermove", this.onPointerMove, {
+      passive: false,
     });
     this.scroller.addEventListener("pointerup", this.onPointerEnd, {
       passive: true,
@@ -3243,8 +3256,92 @@ class VirtualGrid {
     this.scroller.addEventListener("pointercancel", this.onPointerEnd, {
       passive: true,
     });
+    this.scroller.addEventListener("touchmove", this.onTouchMove, {
+      passive: false,
+    });
+    this.scroller.addEventListener("click", this.onClickCapture, {
+      capture: true,
+    });
+    this.scroller.addEventListener("gesturestart", this.onNativeGesture, {
+      passive: false,
+    });
+    this.scroller.addEventListener("gesturechange", this.onNativeGesture, {
+      passive: false,
+    });
     this.resizeObserver.observe(this.scroller);
     this.layout();
+  }
+
+  handlePointerDown(event) {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    this.activePointers.set(event.pointerId, {
+      pointerType: event.pointerType,
+      x: event.clientX,
+      y: event.clientY,
+    });
+    clearTimeout(this.snapTimer);
+    this.snapTimer = 0;
+    const touches = [...this.activePointers.entries()].filter(
+      ([, pointer]) => pointer.pointerType === "touch"
+    );
+    if (touches.length !== 2) return;
+    const [[firstId, first], [secondId, second]] = touches;
+    this.pinch = {
+      pointerIds: [firstId, secondId],
+      distance: Math.max(1, distance(first, second)),
+    };
+    event.preventDefault();
+  }
+
+  handlePointerMove(event) {
+    const previous = this.activePointers.get(event.pointerId);
+    if (!previous) return;
+    this.activePointers.set(event.pointerId, {
+      ...previous,
+      x: event.clientX,
+      y: event.clientY,
+    });
+    if (!this.pinch) return;
+    const [firstId, secondId] = this.pinch.pointerIds;
+    const first = this.activePointers.get(firstId);
+    const second = this.activePointers.get(secondId);
+    if (!first || !second) return;
+
+    event.preventDefault();
+    const currentDistance = Math.max(1, distance(first, second));
+    const nextColumns = gridColumnsAfterPinch(
+      this.columns,
+      currentDistance / this.pinch.distance
+    );
+    if (this.applyColumnOverride(nextColumns)) {
+      this.pinch.distance = currentDistance;
+    }
+  }
+
+  handlePointerEnd(event) {
+    if (!this.activePointers.has(event.pointerId)) return;
+    this.activePointers.delete(event.pointerId);
+    if (this.pinch?.pointerIds.includes(event.pointerId)) {
+      this.blockClickUntil = performance.now() + 300;
+      this.pinch = null;
+    }
+    if (this.activePointers.size === 0) this.scheduleRowSnap();
+  }
+
+  applyColumnOverride(nextColumns) {
+    if (nextColumns === this.columns) return false;
+    const field = gridColumnOverrideFieldForViewport(
+      this.scroller.clientWidth,
+      this.scroller.clientHeight
+    );
+    const saved = saveLocalSettings({
+      ...state.localSettings,
+      [field]: nextColumns,
+    });
+    state.localSettings = saved.settings;
+    state.localSettingsStorageAvailable = saved.saved;
+    this.layout();
+    return true;
   }
 
   layout() {
@@ -3314,12 +3411,24 @@ class VirtualGrid {
   }
 
   handleWheel(event) {
-    if (
-      event.ctrlKey ||
-      event.metaKey ||
-      !Number.isFinite(event.deltaY) ||
-      event.deltaY === 0
-    ) {
+    if (event.ctrlKey || event.metaKey) {
+      event.preventDefault();
+      if (!Number.isFinite(event.deltaY) || event.deltaY === 0) return;
+      clearTimeout(this.wheelPinchTimer);
+      const delta = Math.max(-50, Math.min(50, event.deltaY));
+      this.wheelPinchScale *= Math.exp(-delta * 0.01);
+      const nextColumns = gridColumnsAfterPinch(
+        this.columns,
+        this.wheelPinchScale
+      );
+      if (this.applyColumnOverride(nextColumns)) this.wheelPinchScale = 1;
+      this.wheelPinchTimer = window.setTimeout(() => {
+        this.wheelPinchScale = 1;
+        this.wheelPinchTimer = 0;
+      }, 180);
+      return;
+    }
+    if (!Number.isFinite(event.deltaY) || event.deltaY === 0) {
       return;
     }
     event.preventDefault();
@@ -3339,13 +3448,13 @@ class VirtualGrid {
   }
 
   scheduleRowSnap() {
-    if (this.pointerActive) return;
+    if (this.activePointers.size > 0) return;
     clearTimeout(this.snapTimer);
     this.snapTimer = window.setTimeout(() => this.snapToRow(), 140);
   }
 
   snapToRow() {
-    if (this.pointerActive) return;
+    if (this.activePointers.size > 0) return;
     clearTimeout(this.snapTimer);
     this.snapTimer = 0;
     const snapped = snappedGridOffset(
@@ -3466,13 +3575,21 @@ class VirtualGrid {
   destroy() {
     cancelAnimationFrame(this.frame);
     clearTimeout(this.snapTimer);
+    clearTimeout(this.wheelPinchTimer);
     this.scroller.removeEventListener("scroll", this.onScroll);
     this.scroller.removeEventListener("scrollend", this.onScrollEnd);
     this.scroller.removeEventListener("wheel", this.onWheel);
     this.scroller.removeEventListener("pointerdown", this.onPointerDown);
+    this.scroller.removeEventListener("pointermove", this.onPointerMove);
     this.scroller.removeEventListener("pointerup", this.onPointerEnd);
     this.scroller.removeEventListener("pointercancel", this.onPointerEnd);
+    this.scroller.removeEventListener("touchmove", this.onTouchMove);
+    this.scroller.removeEventListener("click", this.onClickCapture, true);
+    this.scroller.removeEventListener("gesturestart", this.onNativeGesture);
+    this.scroller.removeEventListener("gesturechange", this.onNativeGesture);
     this.resizeObserver.disconnect();
+    this.activePointers.clear();
+    this.pinch = null;
     for (const cell of this.cells.values()) disposeGridTile(cell);
     this.cells.clear();
   }
@@ -3990,58 +4107,6 @@ class LocalSettingsDialog {
     );
     option.append(checkbox, copy);
 
-    const columnOption = (field, title, description) => {
-      const row = element(
-        "label",
-        "local-settings-option local-settings-column-option"
-      );
-      const rowCopy = element("span", "local-settings-copy");
-      rowCopy.append(
-        textElement("strong", title),
-        textElement("small", description)
-      );
-      const select = element("select", "local-settings-select");
-      select.setAttribute("aria-label", title);
-      for (const [value, label] of [
-        [0, "自動"],
-        [2, "2 列"],
-        [3, "3 列"],
-        [4, "4 列"],
-        [5, "5 列"],
-        [6, "6 列"],
-        [7, "7 列"],
-        [8, "8 列"],
-      ]) {
-        const choice = textElement("option", label);
-        choice.value = String(value);
-        select.append(choice);
-      }
-      select.value = String(state.localSettings[field]);
-      select.addEventListener("change", () => {
-        const saved = saveLocalSettings({
-          ...state.localSettings,
-          [field]: Number(select.value),
-        });
-        state.localSettings = saved.settings;
-        state.localSettingsStorageAvailable = saved.saved;
-        select.value = String(state.localSettings[field]);
-        this.updateStorageStatus();
-        state.virtualGrid?.layout();
-      });
-      row.append(rowCopy, select);
-      return row;
-    };
-    const portraitColumns = columnOption(
-      "gridColumnsPortrait",
-      "縦持ちの列数",
-      "自動では画面幅に合わせて列数を決めます。"
-    );
-    const landscapeColumns = columnOption(
-      "gridColumnsLandscape",
-      "横持ちの列数",
-      "横持ちの実測サイズに切り替わったときだけ使います。"
-    );
-
     this.status = textElement("p", "", "local-settings-status");
     this.updateStorageStatus();
     checkbox.addEventListener("change", () => {
@@ -4062,13 +4127,7 @@ class LocalSettingsDialog {
       }
     });
 
-    panel.append(
-      header,
-      option,
-      portraitColumns,
-      landscapeColumns,
-      this.status
-    );
+    panel.append(header, option, this.status);
     this.root.append(scrim, panel);
     this.root.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {

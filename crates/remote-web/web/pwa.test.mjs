@@ -73,6 +73,18 @@ test("safe areas protect portrait bars and landscape side controls", async () =>
 test("image tiles preserve portrait and landscape shape below a separate label row", async () => {
   const css = await readFile(new URL("styles.css", here), "utf8");
   const app = await readFile(new URL("app.js", here), "utf8");
+  // A percentage height in the preview's implicit auto grid row resolves to auto,
+  // so the image must be taken out of that row and pinned to the preview box.
+  assert.match(
+    css,
+    /\.tile-preview img\s*\{[^}]*position:\s*absolute;[^}]*inset:\s*0;[^}]*width:\s*100%;[^}]*height:\s*100%;/
+  );
+  assert.match(
+    css,
+    /\.folder-glyph,\s*\.file-glyph\s*\{[^}]*position:\s*absolute;[^}]*inset:\s*0;/
+  );
+  assert.match(css, /\.tile-preview img\s*\{[^}]*object-fit:\s*contain/);
+  assert.doesNotMatch(css, /\.tile-preview img\s*\{[^}]*object-fit:\s*cover/);
   assert.match(css, /\.grid-tile\.image-tile \.tile-preview img\s*\{[^}]*object-fit:\s*contain/);
   assert.match(css, /\.grid-tile\s*\{[^}]*grid-template-rows:\s*var\(--grid-preview-height\) var\(--grid-label-height\)/);
   assert.match(css, /\.grid-cursor-visible \.grid-tile\.grid-active::after\s*\{[^}]*inset 0 0 0 3px var\(--accent\)/);
@@ -80,6 +92,25 @@ test("image tiles preserve portrait and landscape shape below a separate label r
   assert.match(app, /tile\.append\(preview, label\)/);
   assert.match(app, /label\.append\([\s\S]*entry-detail-badge/);
   assert.doesNotMatch(css, /\.entry-detail-badge\s*\{[^}]*position:\s*absolute/);
+});
+
+test("the grid owns pinch scaling while one-finger vertical scroll stays native", async () => {
+  const css = await readFile(new URL("styles.css", here), "utf8");
+  const app = await readFile(new URL("app.js", here), "utf8");
+  assert.match(css, /\.grid-scroll\s*\{[^}]*touch-action:\s*pan-y/);
+  assert.match(
+    app,
+    /this\.onTouchMove = \(event\) => \{\s*if \(event\.touches\.length < 2\) return;\s*event\.preventDefault\(\);\s*\}/
+  );
+  assert.match(
+    app,
+    /addEventListener\("touchmove", this\.onTouchMove, \{\s*passive: false,?\s*\}\)/
+  );
+  assert.match(
+    app,
+    /removeEventListener\("touchmove", this\.onTouchMove\)/
+  );
+  assert.doesNotMatch(app, /縦持ちの列数|横持ちの列数/);
 });
 
 async function pngDimensions(relativePath) {

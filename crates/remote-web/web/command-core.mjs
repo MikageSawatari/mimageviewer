@@ -585,19 +585,46 @@ export function clampGridColumnOverride(value) {
   return Math.min(8, Math.max(2, requested));
 }
 
-export function gridColumnOverrideForViewport(
+export function gridColumnsAfterPinch(currentColumns, scale) {
+  const columns = Math.max(1, Math.round(Number(currentColumns) || 1));
+  const ratio = Number(scale);
+  if (!Number.isFinite(ratio) || ratio <= 0) return columns;
+
+  // Use reciprocal limits so pinch-in and pinch-out need the same proportional
+  // travel. After a change the gesture owner rebases its starting distance.
+  const step = 1.12;
+  if (ratio >= step) {
+    if (columns <= 2) return columns;
+    return Math.max(2, Math.min(8, columns - 1));
+  }
+  if (ratio <= 1 / step) {
+    if (columns >= 8) return columns;
+    return Math.max(2, Math.min(8, columns + 1));
+  }
+  return columns;
+}
+
+export function gridColumnOverrideFieldForViewport(
   viewportWidth,
-  viewportHeight,
-  {
-    gridColumnsPortrait = 0,
-    gridColumnsLandscape = 0,
-  } = {}
+  viewportHeight
 ) {
   const width = Math.max(0, Number(viewportWidth) || 0);
   const height = Math.max(0, Number(viewportHeight) || 0);
-  return clampGridColumnOverride(
-    width >= height ? gridColumnsLandscape : gridColumnsPortrait
+  return width >= height
+    ? "gridColumnsLandscape"
+    : "gridColumnsPortrait";
+}
+
+export function gridColumnOverrideForViewport(
+  viewportWidth,
+  viewportHeight,
+  settings = {}
+) {
+  const field = gridColumnOverrideFieldForViewport(
+    viewportWidth,
+    viewportHeight
   );
+  return clampGridColumnOverride(settings[field]);
 }
 
 export function gridLabelHeightForEntries(entries) {

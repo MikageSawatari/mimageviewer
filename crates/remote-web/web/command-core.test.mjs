@@ -11,7 +11,9 @@ import {
   commandFromKey,
   containerPageTargetPx,
   createReadingProgressBatch,
+  gridColumnOverrideFieldForViewport,
   gridColumnOverrideForViewport,
+  gridColumnsAfterPinch,
   gridLabelHeightForEntries,
   gridLayoutForWidth,
   gridScrollExtent,
@@ -677,6 +679,33 @@ test("grid column override clamps, returns to auto, and selects by measured size
   assert.equal(gridColumnOverrideForViewport(440, 900, settings), 3);
   assert.equal(gridColumnOverrideForViewport(956, 440, settings), 7);
   assert.equal(gridColumnOverrideForViewport(440, 440, settings), 7);
+});
+
+test("grid column override field selects by measured viewport size", () => {
+  assert.equal(
+    gridColumnOverrideFieldForViewport(440, 900),
+    "gridColumnsPortrait"
+  );
+  assert.equal(
+    gridColumnOverrideFieldForViewport(956, 440),
+    "gridColumnsLandscape"
+  );
+  assert.equal(
+    gridColumnOverrideFieldForViewport(440, 440),
+    "gridColumnsLandscape"
+  );
+});
+
+test("grid pinch changes one column only after a symmetric scale threshold", () => {
+  assert.equal(gridColumnsAfterPinch(4, 1.11), 4);
+  assert.equal(gridColumnsAfterPinch(4, 0.9), 4);
+  assert.equal(gridColumnsAfterPinch(4, 1.12), 3);
+  assert.equal(gridColumnsAfterPinch(4, 1 / 1.12), 5);
+  assert.equal(gridColumnsAfterPinch(2, 1.5), 2);
+  assert.equal(gridColumnsAfterPinch(8, 0.5), 8);
+  assert.equal(gridColumnsAfterPinch(9, 1.5), 8);
+  assert.equal(gridColumnsAfterPinch(9, 0.5), 9);
+  assert.equal(gridColumnsAfterPinch(4, Number.NaN), 4);
 });
 
 test("grid scroll extent and snapping stay on whole row boundaries", () => {

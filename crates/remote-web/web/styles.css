@@ -488,6 +488,7 @@ button {
   flex: 1;
   background: #111318;
   overscroll-behavior: contain;
+  touch-action: pan-y;
   -webkit-overflow-scrolling: touch;
 }
 
@@ -571,9 +572,11 @@ button {
 }
 
 .tile-preview img {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
   background: #10141b;
   opacity: 0;
   animation: none;
@@ -620,6 +623,10 @@ button {
 
 .folder-glyph,
 .file-glyph {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
   color: #f6c75d;
   font-size: clamp(2.5rem, 10vw, 4.5rem);
   filter: drop-shadow(0 5px 12px rgb(0 0 0 / 28%));
@@ -1125,22 +1132,6 @@ button {
   height: 22px;
   margin: 1px 0 0;
   accent-color: var(--accent);
-}
-
-.local-settings-column-option {
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-}
-
-.local-settings-select {
-  min-width: 92px;
-  min-height: 44px;
-  padding: 0 32px 0 12px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--surface);
-  color: inherit;
-  font: inherit;
 }
 
 .local-settings-copy {
