@@ -2,6 +2,7 @@ mod collections;
 mod container;
 mod path_guard;
 mod thumbnail;
+mod video_stream;
 
 #[cfg(windows)]
 mod pipe;

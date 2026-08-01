@@ -5,7 +5,7 @@ v3.0.0 の目玉として、外出先のスマートフォン / タブレット 
 
 - ブランチ: `web-remote` (worktree: `C:\home\mimageviewer-web`)
 - 実装: Codex Sol (xhigh) / レビュー・統合: ClaudeCode / 実機検証: ユーザー
-- 現在のフェーズ: **PoC (§4)**
+- 現在のフェーズ: **動画ストリーミング増分 6/7 (サーバ側完了、フロント実装待ち)**
 
 ---
 
@@ -740,6 +740,10 @@ remote-web は IPC 前に favorite UUID、実コンテナの canonical containme
 悪性 ZIP entry、範囲外 PDF page は本体境界で再度拒否される。絶対 path は IPC 応答にも
 HTTP / hash route にも含めない。
 
+動画ストリーミングの実ファイルも同じ `RemoteAddress::File` と二重検証を通す。remote-web と
+本体はそれぞれ favorite allowlist、canonical containment、実ファイル種別を検証し、本体 IPC
+境界では remote-web の判定を信頼しない。
+
 ### 12.2 本体既存経路の再利用
 
 コンテナ列挙とページ生成は新規 `src/remote_ipc/container.rs` から次へ接続する。
@@ -1258,11 +1262,12 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
+動画ストリーミング IPC / HTTP を追加した 2026-08-02 時点の現行版は **v15**。
 
 ### 13.6 残タスク (2026-08-01 時点)
 
-1. **動画・音声のストリーミング** — 正本は
-   [web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md)
+1. **動画・音声ストリーミングのフロント (増分 7)** — server / IPC は増分 6 で完了。
+   正本は [web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md)
 2. **検索** (Ctrl+S / F / G 相当)、タグ
 3. 配布 (exe 埋め込み、接続診断ウィザード)
 

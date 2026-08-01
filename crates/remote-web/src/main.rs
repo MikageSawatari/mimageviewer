@@ -21,7 +21,7 @@ use connection_url::choose_connection_url;
 use diagnostics::DiagnosticsLogger;
 use http::{
     AppState, HTTP_WORKER_COUNT, IpcAdmission, MAX_CONCURRENT_HEAVY_IPC, MAX_CONCURRENT_IPC,
-    SessionActivityNotifier, TelemetryLimiter,
+    MAX_CONCURRENT_STREAM_IPC, SessionActivityNotifier, TelemetryLimiter,
 };
 use ipc_client::ThumbnailClient;
 use mimageviewer_ipc::RemoteWebConnectionInfo;
@@ -105,7 +105,7 @@ fn run() -> Result<(), String> {
     });
     let workers = HTTP_WORKER_COUNT;
     println!(
-        "HTTP workers: {workers} (IPC max: {MAX_CONCURRENT_IPC}, heavy IPC max: {MAX_CONCURRENT_HEAVY_IPC})"
+        "HTTP workers: {workers} (IPC max: {MAX_CONCURRENT_IPC}, heavy IPC max: {MAX_CONCURRENT_HEAVY_IPC}, stream IPC max: {MAX_CONCURRENT_STREAM_IPC})"
     );
 
     let mut threads = Vec::with_capacity(workers);

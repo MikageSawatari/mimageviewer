@@ -9,7 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mimageviewer_ipc::{
     CollectionErrorCode, CollectionKind, MediaErrorCode, PagePriority, RemoteAddress,
     RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource, RemoteWriteErrorCode,
-    RemoteWriteRequest, SessionResponse, SessionStatus,
+    RemoteWriteRequest, SessionResponse, SessionStatus, VideoStreamControlAction,
+    VideoStreamErrorCode, VideoStreamPlaylistKind, VideoStreamQuality, VideoStreamSegmentIndex,
+    VideoStreamSegmentPayload,
 };
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
@@ -25,6 +27,7 @@ use crate::store::{Library, StoreError};
 const MAX_TELEMETRY_BODY_BYTES: usize = 64 * 1024;
 const MAX_PIN_BODY_BYTES: usize = 4 * 1024;
 const MAX_WRITE_BODY_BYTES: usize = 16 * 1024;
+const MAX_VIDEO_BODY_BYTES: usize = 16 * 1024;
 const MAX_TELEMETRY_EVENTS: usize = 128;
 const TELEMETRY_REQUESTS_PER_WINDOW: usize = 30;
 const TELEMETRY_WINDOW: Duration = Duration::from_secs(60);
@@ -32,6 +35,7 @@ pub const HTTP_WORKER_COUNT: usize = 12;
 pub const MAX_CONCURRENT_IPC: usize = 6;
 pub const MAX_CONCURRENT_HEAVY_IPC: usize = 4;
 pub const MAX_CONCURRENT_PAGE_PREFETCH: usize = 1;
+pub const MAX_CONCURRENT_STREAM_IPC: usize = 4;
 const IPC_RETRY_AFTER_SECONDS: u64 = 1;
 
 pub struct AppState {
@@ -76,6 +80,7 @@ pub struct IpcAdmission {
     all: TrySemaphore,
     heavy: TrySemaphore,
     prefetch: TrySemaphore,
+    stream: TrySemaphore,
 }
 
 #[derive(Clone, Copy)]
@@ -83,6 +88,7 @@ enum IpcClass {
     Home,
     Heavy,
     Prefetch,
+    Stream,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -93,6 +99,8 @@ struct AdmissionBusy {
     heavy_limit: usize,
     prefetch_in_flight: usize,
     prefetch_limit: usize,
+    stream_in_flight: usize,
+    stream_limit: usize,
 }
 
 struct TrySemaphore {
@@ -105,23 +113,38 @@ struct TryPermit<'a> {
 }
 
 struct IpcPermit<'a> {
-    _all: TryPermit<'a>,
+    _all: Option<TryPermit<'a>>,
     _heavy: Option<TryPermit<'a>>,
     _prefetch: Option<TryPermit<'a>>,
+    _stream: Option<TryPermit<'a>>,
 }
 
 impl IpcAdmission {
     pub fn new() -> Self {
         assert!(MAX_CONCURRENT_HEAVY_IPC < MAX_CONCURRENT_IPC);
         assert!(MAX_CONCURRENT_IPC < HTTP_WORKER_COUNT);
+        assert!(MAX_CONCURRENT_IPC + MAX_CONCURRENT_STREAM_IPC < HTTP_WORKER_COUNT);
         Self {
             all: TrySemaphore::new(MAX_CONCURRENT_IPC),
             heavy: TrySemaphore::new(MAX_CONCURRENT_HEAVY_IPC),
             prefetch: TrySemaphore::new(MAX_CONCURRENT_PAGE_PREFETCH),
+            stream: TrySemaphore::new(MAX_CONCURRENT_STREAM_IPC),
         }
     }
 
     fn try_enter(&self, class: IpcClass) -> Result<IpcPermit<'_>, AdmissionBusy> {
+        if matches!(class, IpcClass::Stream) {
+            return self
+                .stream
+                .try_acquire()
+                .map(|stream| IpcPermit {
+                    _all: None,
+                    _heavy: None,
+                    _prefetch: None,
+                    _stream: Some(stream),
+                })
+                .ok_or_else(|| self.busy());
+        }
         let prefetch = if matches!(class, IpcClass::Prefetch) {
             Some(self.prefetch.try_acquire().ok_or_else(|| self.busy())?)
         } else {
@@ -159,9 +182,10 @@ impl IpcAdmission {
             None
         };
         Ok(IpcPermit {
-            _all: all,
+            _all: Some(all),
             _heavy: heavy,
             _prefetch: prefetch,
+            _stream: None,
         })
     }
 
@@ -178,6 +202,8 @@ impl IpcAdmission {
             heavy_limit: self.heavy.limit,
             prefetch_in_flight: self.prefetch.in_flight(),
             prefetch_limit: self.prefetch.limit,
+            stream_in_flight: self.stream.in_flight(),
+            stream_limit: self.stream.limit,
         }
     }
 }
@@ -399,6 +425,16 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             HttpResponse::text(405, "Method Not Allowed").with_header("Cache-Control", "no-store")
         }
         _ if auth == AuthDecision::Unauthorized => unauthorized(),
+        (Method::Post, "/api/video/start") => api_video_start(request, state, &remote_client_id),
+        (Method::Post, "/api/video/control") => {
+            api_video_control(request, state, &remote_client_id)
+        }
+        (Method::Post, "/api/video/seek") => api_video_seek(request, state, &remote_client_id),
+        (Method::Get, "/api/video/state") => api_video_state(state, &query, &remote_client_id),
+        (Method::Post, "/api/video/stop") => api_video_stop(request, state, &remote_client_id),
+        (Method::Get, path) if path.starts_with("/stream/") => {
+            stream_resource(state, path, &remote_client_id)
+        }
         (Method::Post, "/api/session/acquire") => {
             api_session_acquire(request, state, &remote_client_id)
         }
@@ -423,11 +459,22 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
         (Method::Get, "/api/page") => api_page(state, &query, &remote_client_id),
         (Method::Post, "/api/telemetry") => api_telemetry(request, state),
         (Method::Get, _) => HttpResponse::text(404, "Not Found"),
-        (_, "/api/telemetry" | "/api/session/acquire" | "/api/session/ping" | "/api/write") => {
-            HttpResponse::text(405, "Method Not Allowed")
-                .with_header("Allow", "POST")
-                .with_header("Cache-Control", "no-store")
-        }
+        (_, path) if path.starts_with("/stream/") => HttpResponse::text(405, "Method Not Allowed")
+            .with_header("Allow", "GET")
+            .with_header("Cache-Control", "no-store"),
+        (
+            _,
+            "/api/telemetry"
+            | "/api/session/acquire"
+            | "/api/session/ping"
+            | "/api/write"
+            | "/api/video/start"
+            | "/api/video/control"
+            | "/api/video/seek"
+            | "/api/video/stop",
+        ) => HttpResponse::text(405, "Method Not Allowed")
+            .with_header("Allow", "POST")
+            .with_header("Cache-Control", "no-store"),
         _ => HttpResponse::text(405, "Method Not Allowed")
             .with_header("Allow", "GET")
             .with_header("Cache-Control", "no-store"),
@@ -444,6 +491,381 @@ struct SessionPingBody {
     user_active: bool,
     #[serde(default)]
     media_playing: bool,
+}
+
+#[derive(Deserialize)]
+struct VideoStartBody {
+    fav: String,
+    path: String,
+    quality: VideoStreamQuality,
+}
+
+#[derive(Deserialize)]
+struct VideoControlBody {
+    session: u64,
+    #[serde(flatten)]
+    action: VideoStreamControlAction,
+}
+
+#[derive(Deserialize)]
+struct VideoSeekBody {
+    session: u64,
+    position_secs: f64,
+}
+
+#[derive(Deserialize)]
+struct VideoStopBody {
+    session: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamRouteResource {
+    Playlist(VideoStreamPlaylistKind),
+    Segment(VideoStreamSegmentIndex),
+}
+
+fn api_video_start(request: &mut Request, state: &AppState, client_id: &str) -> HttpResponse {
+    let body: VideoStartBody = match read_video_json(request) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let address = RemoteAddress::file(body.fav, body.path);
+    if let Err(error) = state.library.validate_remote_file_video(&address) {
+        return store_error_response(error).with_header("Cache-Control", "no-store");
+    }
+    state.session_activity.note(client_id);
+    let result = match state.ipc_admission.run(IpcClass::Stream, || {
+        state
+            .thumbnail_client
+            .video_stream_start(client_id, address, body.quality)
+    }) {
+        Ok(result) => result,
+        Err(busy) => return video_admission_busy_response(busy),
+    };
+    match result {
+        Ok(success) => {
+            let payload = success.value;
+            HttpResponse::json(&json!({
+                "session": payload.session,
+                "generation": payload.generation,
+                "playlist": video_playlist_url(payload.session, payload.generation),
+                "duration_secs": payload.duration_secs,
+                "codec": payload.codecs,
+                "encoder": payload.encoder,
+                "video_size": payload.video_size,
+            }))
+            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+            .with_header("Cache-Control", "no-store")
+        }
+        Err(failure) => video_ipc_error_response(failure),
+    }
+}
+
+fn api_video_control(request: &mut Request, state: &AppState, client_id: &str) -> HttpResponse {
+    let body: VideoControlBody = match read_video_json(request) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    state.session_activity.note(client_id);
+    let result = match state.ipc_admission.run(IpcClass::Stream, || {
+        state
+            .thumbnail_client
+            .video_stream_control(client_id, body.session, body.action)
+    }) {
+        Ok(result) => result,
+        Err(busy) => return video_admission_busy_response(busy),
+    };
+    match result {
+        Ok(success) => session_response_http(success.value),
+        Err(failure) => video_ipc_error_response(failure),
+    }
+}
+
+fn api_video_seek(request: &mut Request, state: &AppState, client_id: &str) -> HttpResponse {
+    let body: VideoSeekBody = match read_video_json(request) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    if !body.position_secs.is_finite() || body.position_secs < 0.0 {
+        return HttpResponse::text(400, "Bad Request").with_header("Cache-Control", "no-store");
+    }
+    state.session_activity.note(client_id);
+    let result = match state.ipc_admission.run(IpcClass::Stream, || {
+        state
+            .thumbnail_client
+            .video_stream_seek(client_id, body.session, body.position_secs)
+    }) {
+        Ok(result) => result,
+        Err(busy) => return video_admission_busy_response(busy),
+    };
+    match result {
+        Ok(success) => HttpResponse::json(&json!({
+            "generation": success.value.generation,
+            "playlist": video_playlist_url(body.session, success.value.generation),
+        }))
+        .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+        .with_header("Cache-Control", "no-store"),
+        Err(failure) => video_ipc_error_response(failure),
+    }
+}
+
+fn api_video_state(state: &AppState, query: &[(String, String)], client_id: &str) -> HttpResponse {
+    let session = match required_query_value(query, "session")
+        .and_then(|value| value.parse::<u64>().map_err(|_| ()))
+    {
+        Ok(session) => session,
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
+    state.session_activity.note(client_id);
+    let result = match state.ipc_admission.run(IpcClass::Stream, || {
+        state
+            .thumbnail_client
+            .video_stream_state(client_id, session)
+    }) {
+        Ok(result) => result,
+        Err(busy) => return video_admission_busy_response(busy),
+    };
+    match result {
+        Ok(success) => HttpResponse::json(&success.value)
+            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+            .with_header("Cache-Control", "no-store"),
+        Err(failure) => video_ipc_error_response(failure),
+    }
+}
+
+fn api_video_stop(request: &mut Request, state: &AppState, client_id: &str) -> HttpResponse {
+    let body: VideoStopBody = match read_video_json(request) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    state.session_activity.note(client_id);
+    let result = match state.ipc_admission.run(IpcClass::Stream, || {
+        state
+            .thumbnail_client
+            .video_stream_stop(client_id, body.session)
+    }) {
+        Ok(result) => result,
+        Err(busy) => return video_admission_busy_response(busy),
+    };
+    match result {
+        Ok(_) => HttpResponse::json(&json!({"stopped": true}))
+            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+            .with_header("Cache-Control", "no-store"),
+        Err(failure) => video_ipc_error_response(failure),
+    }
+}
+
+fn stream_resource(state: &AppState, path: &str, client_id: &str) -> HttpResponse {
+    let (session, generation, resource) = match parse_stream_path(path) {
+        Ok(parsed) => parsed,
+        Err(()) => return HttpResponse::text(404, "Not Found"),
+    };
+    state.session_activity.note(client_id);
+    match resource {
+        StreamRouteResource::Playlist(kind) => {
+            let result = match state.ipc_admission.run(IpcClass::Stream, || {
+                state
+                    .thumbnail_client
+                    .video_stream_playlist(client_id, session, generation, kind)
+            }) {
+                Ok(result) => result,
+                Err(busy) => return video_admission_busy_response(busy),
+            };
+            match result {
+                Ok(success) => playlist_http_response(success.value.body),
+                Err(failure) => video_ipc_error_response(failure),
+            }
+        }
+        StreamRouteResource::Segment(index) => {
+            let result = match state.ipc_admission.run(IpcClass::Stream, || {
+                state
+                    .thumbnail_client
+                    .video_stream_segment(client_id, session, generation, index)
+            }) {
+                Ok(result) => result,
+                Err(busy) => return video_admission_busy_response(busy),
+            };
+            match result {
+                Ok(success) => segment_http_response(index, success.value),
+                Err(failure) => video_ipc_error_response(failure),
+            }
+        }
+    }
+}
+
+fn read_video_json<T: serde::de::DeserializeOwned>(
+    request: &mut Request,
+) -> Result<T, HttpResponse> {
+    let body = match read_body_limited(request, MAX_VIDEO_BODY_BYTES) {
+        Ok(body) => body,
+        Err(BodyReadError::TooLarge) => return Err(HttpResponse::text(413, "Payload Too Large")),
+        Err(BodyReadError::Read) => return Err(HttpResponse::text(400, "Bad Request")),
+    };
+    serde_json::from_slice(&body).map_err(|_| HttpResponse::text(400, "Bad Request"))
+}
+
+fn parse_stream_path(path: &str) -> Result<(u64, u64, StreamRouteResource), ()> {
+    let mut parts = path.strip_prefix("/stream/").ok_or(())?.split('/');
+    let session = parts.next().ok_or(())?.parse::<u64>().map_err(|_| ())?;
+    let generation = parts.next().ok_or(())?.parse::<u64>().map_err(|_| ())?;
+    let name = parts.next().ok_or(())?;
+    if parts.next().is_some() {
+        return Err(());
+    }
+    let resource = match name {
+        "index.m3u8" => StreamRouteResource::Playlist(VideoStreamPlaylistKind::Master),
+        "media.m3u8" => StreamRouteResource::Playlist(VideoStreamPlaylistKind::Media),
+        "init.mp4" => StreamRouteResource::Segment(VideoStreamSegmentIndex::Init),
+        _ => {
+            let sequence = name
+                .strip_suffix(".m4s")
+                .ok_or(())?
+                .parse::<u64>()
+                .map_err(|_| ())?;
+            StreamRouteResource::Segment(VideoStreamSegmentIndex::Media { sequence })
+        }
+    };
+    Ok((session, generation, resource))
+}
+
+fn playlist_http_response(body: String) -> HttpResponse {
+    if body.is_empty() {
+        video_not_ready_response("playlist is not ready")
+    } else {
+        HttpResponse::bytes(200, "application/vnd.apple.mpegurl", body.into_bytes())
+            .with_header("Cache-Control", "no-store")
+    }
+}
+
+fn segment_http_response(
+    index: VideoStreamSegmentIndex,
+    payload: VideoStreamSegmentPayload,
+) -> HttpResponse {
+    match payload {
+        VideoStreamSegmentPayload::Found(bytes) if !bytes.is_empty() => {
+            let (content_type, cache_control) = match index {
+                VideoStreamSegmentIndex::Init => {
+                    ("video/mp4", "private, max-age=31536000, immutable")
+                }
+                VideoStreamSegmentIndex::Media { .. } => ("video/iso.segment", "no-store"),
+            };
+            HttpResponse::bytes(200, content_type, bytes)
+                .with_header("Cache-Control", cache_control)
+        }
+        VideoStreamSegmentPayload::Found(_) => video_not_ready_response("segment is not ready"),
+        VideoStreamSegmentPayload::NotFound => {
+            HttpResponse::text(404, "Not Found").with_header("Cache-Control", "no-store")
+        }
+        VideoStreamSegmentPayload::Gone => {
+            HttpResponse::text(410, "Gone").with_header("Cache-Control", "no-store")
+        }
+    }
+}
+
+fn video_playlist_url(session: u64, generation: u64) -> String {
+    format!("/stream/{session}/{generation}/index.m3u8")
+}
+
+fn video_admission_busy_response(busy: AdmissionBusy) -> HttpResponse {
+    HttpResponse::bytes(
+        503,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&json!({
+            "error": "ipc_busy",
+            "message": "ストリーミング要求が混み合っています。再試行してください。",
+        }))
+        .unwrap_or_default(),
+    )
+    .with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string())
+    .with_header("Cache-Control", "no-store")
+    .with_log_details(json!({
+        "video_stream": {
+            "ipc_status": "admission_busy",
+            "ipc_stream_in_flight": busy.stream_in_flight,
+            "ipc_stream_limit": busy.stream_limit,
+        }
+    }))
+}
+
+fn video_not_ready_response(message: &str) -> HttpResponse {
+    HttpResponse::bytes(
+        503,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&json!({"error": "stream_not_ready", "message": message}))
+            .unwrap_or_default(),
+    )
+    .with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string())
+    .with_header("Cache-Control", "no-store")
+}
+
+fn video_ipc_error_response(failure: crate::ipc_client::ClientFailure) -> HttpResponse {
+    let (status, code, message, retryable) = match failure.error {
+        IpcClientError::Unavailable(_) => (
+            503,
+            "miv_not_running",
+            "mIV 本体が起動していません。".to_owned(),
+            true,
+        ),
+        IpcClientError::VersionMismatch { client, server } => (
+            503,
+            "protocol_version_mismatch",
+            format!("IPC 版が一致しません (remote-web={client}, mIV={server})。"),
+            false,
+        ),
+        IpcClientError::Protocol(detail) if detail.kind == "timeout" => (
+            503,
+            "ipc_timeout",
+            "mIV 本体の応答が時間内に完了しませんでした。".to_owned(),
+            true,
+        ),
+        IpcClientError::Protocol(_) => (
+            502,
+            "ipc_protocol_error",
+            "mIV 本体との通信に失敗しました。".to_owned(),
+            false,
+        ),
+        IpcClientError::VideoStreamRemote(error) => {
+            let (status, retryable) = match error.code {
+                VideoStreamErrorCode::BadRequest => (400, false),
+                VideoStreamErrorCode::FavoriteNotFound
+                | VideoStreamErrorCode::PathRejected
+                | VideoStreamErrorCode::NotFound => (404, false),
+                VideoStreamErrorCode::Unsupported => (415, false),
+                VideoStreamErrorCode::SessionMismatch
+                | VideoStreamErrorCode::GenerationMismatch => (409, false),
+                VideoStreamErrorCode::NotReady | VideoStreamErrorCode::Busy => (503, true),
+                VideoStreamErrorCode::UiTimeout => (504, false),
+                VideoStreamErrorCode::Failed => (422, false),
+                VideoStreamErrorCode::Internal => (500, false),
+            };
+            (status, "miv_video_stream_error", error.message, retryable)
+        }
+        IpcClientError::SessionRemote(response) => (
+            session_http_status(response.status),
+            "session_required",
+            response.message,
+            false,
+        ),
+        IpcClientError::Remote(_)
+        | IpcClientError::CollectionRemote(_)
+        | IpcClientError::MediaRemote(_)
+        | IpcClientError::WriteRemote(_) => (
+            502,
+            "ipc_response_type_mismatch",
+            "mIV 本体から予期しない応答を受信しました。".to_owned(),
+            false,
+        ),
+    };
+    let mut response = HttpResponse::bytes(
+        status,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&json!({"error": code, "message": message})).unwrap_or_default(),
+    )
+    .with_header("Cache-Control", "no-store");
+    if retryable {
+        response = response.with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string());
+    }
+    response
 }
 
 fn api_session_acquire(request: &Request, state: &AppState, client_id: &str) -> HttpResponse {
@@ -542,7 +964,8 @@ fn session_failure_response(failure: crate::ipc_client::ClientFailure) -> HttpRe
         IpcClientError::Remote(_)
         | IpcClientError::CollectionRemote(_)
         | IpcClientError::MediaRemote(_)
-        | IpcClientError::WriteRemote(_) => HttpResponse::text(502, "Bad Gateway"),
+        | IpcClientError::WriteRemote(_)
+        | IpcClientError::VideoStreamRemote(_) => HttpResponse::text(502, "Bad Gateway"),
     }
     .with_header("Cache-Control", "no-store")
 }
@@ -844,6 +1267,7 @@ fn collection_ipc_error_response(
         IpcClientError::MediaRemote(error) => (500, "miv_collection_error", error.message),
         IpcClientError::Remote(error) => (500, "miv_collection_error", error.message),
         IpcClientError::WriteRemote(error) => (500, "miv_collection_error", error.message),
+        IpcClientError::VideoStreamRemote(error) => (500, "miv_collection_error", error.message),
         IpcClientError::SessionRemote(response) => (
             session_http_status(response.status),
             "session_required",
@@ -1255,7 +1679,8 @@ fn write_ipc_error_response(
         ),
         IpcClientError::Remote(_)
         | IpcClientError::CollectionRemote(_)
-        | IpcClientError::MediaRemote(_) => (
+        | IpcClientError::MediaRemote(_)
+        | IpcClientError::VideoStreamRemote(_) => (
             500,
             "miv_write_error",
             "書き込みに失敗しました。".to_owned(),
@@ -1339,6 +1764,7 @@ fn media_ipc_error_response(
         IpcClientError::Remote(error) => (500, "miv_media_error", error.message),
         IpcClientError::CollectionRemote(error) => (500, "miv_media_error", error.message),
         IpcClientError::WriteRemote(error) => (500, "miv_media_error", error.message),
+        IpcClientError::VideoStreamRemote(error) => (500, "miv_media_error", error.message),
         IpcClientError::SessionRemote(response) => (
             session_http_status(response.status),
             "session_required",
@@ -1472,6 +1898,7 @@ fn ipc_error_response(
         IpcClientError::CollectionRemote(remote) => (500, "miv_thumbnail_error", remote.message),
         IpcClientError::MediaRemote(remote) => (500, "miv_thumbnail_error", remote.message),
         IpcClientError::WriteRemote(remote) => (500, "miv_thumbnail_error", remote.message),
+        IpcClientError::VideoStreamRemote(remote) => (500, "miv_thumbnail_error", remote.message),
         IpcClientError::SessionRemote(response) => (
             session_http_status(response.status),
             "session_required",
@@ -2176,6 +2603,31 @@ mod tests {
     }
 
     #[test]
+    fn video_entry_guard_accepts_only_contained_video_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let favorite_id = Uuid::from_u128(0x1234567890abcdef1234567890abcdef);
+        std::fs::write(temp.path().join("movie.mp4"), b"fixture").unwrap();
+        std::fs::write(temp.path().join("page.jpg"), b"fixture").unwrap();
+        std::fs::create_dir(temp.path().join("folder.mp4")).unwrap();
+        let library = Library::with_favorite_for_test(favorite_id, temp.path().to_owned());
+        let favorite_id = favorite_id.to_string();
+
+        assert!(
+            library
+                .validate_remote_file_video(&RemoteAddress::file(favorite_id.clone(), "movie.mp4",))
+                .is_ok()
+        );
+        for path in ["page.jpg", "folder.mp4", "../movie.mp4"] {
+            assert!(
+                library
+                    .validate_remote_file_video(&RemoteAddress::file(favorite_id.clone(), path,))
+                    .is_err(),
+                "{path}",
+            );
+        }
+    }
+
+    #[test]
     fn write_ui_timeout_is_an_explicit_gateway_timeout_without_retry() {
         let response = write_ipc_error_response(
             crate::ipc_client::ClientFailure {
@@ -2213,6 +2665,176 @@ mod tests {
         let response = route(&mut request, &state);
         assert_eq!(response.status, 401);
         assert_eq!(response.body, b"Unauthorized");
+    }
+
+    #[test]
+    fn every_video_and_stream_route_is_below_the_fail_closed_auth_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let requests = [
+            (
+                Method::Post,
+                "/api/video/start",
+                r#"{"fav":"00000000-0000-0000-0000-000000000000","path":"movie.mp4","quality":"standard"}"#,
+            ),
+            (
+                Method::Post,
+                "/api/video/control",
+                r#"{"session":1,"action":"play"}"#,
+            ),
+            (
+                Method::Post,
+                "/api/video/seek",
+                r#"{"session":1,"position_secs":12.5}"#,
+            ),
+            (Method::Get, "/api/video/state?session=1", ""),
+            (Method::Post, "/api/video/stop", r#"{"session":1}"#),
+            (Method::Get, "/stream/1/1/index.m3u8", ""),
+            (Method::Get, "/stream/1/1/media.m3u8", ""),
+            (Method::Get, "/stream/1/1/init.mp4", ""),
+            (Method::Get, "/stream/1/1/0.m4s", ""),
+        ];
+
+        for (method, path, body) in requests {
+            let mut request: Request = TestRequest::new()
+                .with_method(method)
+                .with_path(path)
+                .with_body(body)
+                .into();
+            let response = route(&mut request, &state);
+            assert_eq!(response.status, 401, "{path}");
+            assert_eq!(response.body, b"Unauthorized", "{path}");
+        }
+    }
+
+    #[test]
+    fn video_stream_http_statuses_keep_not_found_gone_conflict_and_unavailable_distinct() {
+        assert_eq!(
+            segment_http_response(
+                VideoStreamSegmentIndex::Media { sequence: 8 },
+                VideoStreamSegmentPayload::NotFound,
+            )
+            .status,
+            404
+        );
+        assert_eq!(
+            segment_http_response(
+                VideoStreamSegmentIndex::Media { sequence: 8 },
+                VideoStreamSegmentPayload::Gone,
+            )
+            .status,
+            410
+        );
+
+        for code in [
+            VideoStreamErrorCode::SessionMismatch,
+            VideoStreamErrorCode::GenerationMismatch,
+        ] {
+            let mismatch = video_ipc_error_response(crate::ipc_client::ClientFailure {
+                error: IpcClientError::VideoStreamRemote(mimageviewer_ipc::VideoStreamError::new(
+                    code, "mismatch",
+                )),
+                retry_count: 0,
+                retry_statuses: Vec::new(),
+            });
+            assert_eq!(mismatch.status, 409);
+        }
+
+        let unavailable = video_ipc_error_response(crate::ipc_client::ClientFailure {
+            error: IpcClientError::Unavailable(crate::ipc_client::ProtocolFailure::new(
+                "connect",
+                "not_found",
+                Some(2),
+                "not found",
+            )),
+            retry_count: 0,
+            retry_statuses: Vec::new(),
+        });
+        assert_eq!(unavailable.status, 503);
+        let body: Value = serde_json::from_slice(&unavailable.body).unwrap();
+        assert_eq!(body["error"], "miv_not_running");
+
+        let not_ready = video_ipc_error_response(crate::ipc_client::ClientFailure {
+            error: IpcClientError::VideoStreamRemote(mimageviewer_ipc::VideoStreamError::new(
+                VideoStreamErrorCode::NotReady,
+                "playlist not ready",
+            )),
+            retry_count: 0,
+            retry_statuses: Vec::new(),
+        });
+        assert_eq!(not_ready.status, 503);
+        assert!(
+            not_ready
+                .headers
+                .iter()
+                .any(|(name, value)| { *name == "Retry-After" && value == "1" })
+        );
+    }
+
+    #[test]
+    fn video_stream_success_responses_can_never_have_an_empty_body() {
+        for response in [
+            playlist_http_response(String::new()),
+            segment_http_response(
+                VideoStreamSegmentIndex::Init,
+                VideoStreamSegmentPayload::Found(Vec::new()),
+            ),
+            segment_http_response(
+                VideoStreamSegmentIndex::Media { sequence: 1 },
+                VideoStreamSegmentPayload::Found(Vec::new()),
+            ),
+        ] {
+            assert_eq!(response.status, 503);
+            assert!(!response.body.is_empty());
+        }
+
+        let init = segment_http_response(
+            VideoStreamSegmentIndex::Init,
+            VideoStreamSegmentPayload::Found(vec![1, 2, 3]),
+        );
+        assert_eq!(init.status, 200);
+        assert!(!init.body.is_empty());
+        assert!(
+            init.headers
+                .iter()
+                .any(|(name, value)| { *name == "Cache-Control" && value.contains("immutable") })
+        );
+        let media = segment_http_response(
+            VideoStreamSegmentIndex::Media { sequence: 1 },
+            VideoStreamSegmentPayload::Found(vec![4, 5, 6]),
+        );
+        assert_eq!(media.status, 200);
+        assert!(
+            media
+                .headers
+                .iter()
+                .any(|(name, value)| { *name == "Cache-Control" && value == "no-store" })
+        );
+    }
+
+    #[test]
+    fn saturated_streaming_leaves_thumbnail_and_list_capacity_available() {
+        let admission = IpcAdmission::new();
+        let stream_permits = (0..MAX_CONCURRENT_STREAM_IPC)
+            .map(|_| admission.try_enter(IpcClass::Stream).unwrap())
+            .collect::<Vec<_>>();
+        assert!(admission.try_enter(IpcClass::Heavy).is_ok());
+
+        let temp = tempfile::tempdir().unwrap();
+        let favorite_id = Uuid::from_u128(0xfeedfacefeedfacefeedfacefeedface);
+        std::fs::write(temp.path().join("page.jpg"), b"fixture").unwrap();
+        let mut state = test_state(&temp);
+        state.library = Library::with_favorite_for_test(favorite_id, temp.path().to_owned());
+        let mut request: Request = TestRequest::new()
+            .with_method(Method::Get)
+            .with_path(&format!("/api/list?fav={favorite_id}&path="))
+            .with_header(cookie_header(&state))
+            .into();
+        let started = Instant::now();
+        let response = route(&mut request, &state);
+        assert_eq!(response.status, 200);
+        assert!(started.elapsed() < Duration::from_millis(50));
+        drop(stream_permits);
     }
 
     #[test]

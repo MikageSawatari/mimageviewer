@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -638,7 +638,125 @@ impl SessionResponse {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoStreamQuality {
+    Minimum,
+    Low,
+    Standard,
+    High,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum VideoStreamControlAction {
+    Play,
+    Pause,
+    Volume { volume: f64 },
+    Quality { quality: VideoStreamQuality },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoStreamPlaylistKind {
+    Master,
+    Media,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VideoStreamSegmentIndex {
+    Init,
+    Media { sequence: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct VideoStreamSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct VideoStreamStartPayload {
+    pub session: u64,
+    pub generation: u64,
+    pub duration_secs: f64,
+    pub encoder: String,
+    pub video_size: VideoStreamSize,
+    pub codecs: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct VideoStreamSeekPayload {
+    pub generation: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct VideoStreamPlaylistPayload {
+    pub body: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum VideoStreamSegmentPayload {
+    Found(Vec<u8>),
+    NotFound,
+    Gone,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct VideoStreamStatePayload {
+    pub session: u64,
+    pub generation: u64,
+    pub position_secs: f64,
+    pub duration_secs: f64,
+    pub buffered_secs: f64,
+    pub effective_bitrate_bps: u64,
+    pub encoder: String,
+    pub video_size: VideoStreamSize,
+    pub codecs: String,
+    pub playing: bool,
+    pub volume: f64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoStreamErrorCode {
+    BadRequest,
+    FavoriteNotFound,
+    PathRejected,
+    NotFound,
+    Unsupported,
+    SessionMismatch,
+    GenerationMismatch,
+    NotReady,
+    Busy,
+    UiTimeout,
+    Failed,
+    Internal,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct VideoStreamError {
+    pub code: VideoStreamErrorCode,
+    pub message: String,
+}
+
+impl VideoStreamError {
+    pub fn new(code: VideoStreamErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum VideoStreamResult<T> {
+    Success(T),
+    Error(VideoStreamError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     RemoteWebConnectionInfo {
@@ -687,6 +805,48 @@ pub enum ClientMessage {
         client_id: String,
         request: RemoteWriteRequest,
     },
+    VideoStreamStart {
+        id: RequestId,
+        client_id: String,
+        address: RemoteAddress,
+        quality: VideoStreamQuality,
+    },
+    VideoStreamControl {
+        id: RequestId,
+        client_id: String,
+        session: u64,
+        action: VideoStreamControlAction,
+    },
+    VideoStreamSeek {
+        id: RequestId,
+        client_id: String,
+        session: u64,
+        position_secs: f64,
+    },
+    VideoStreamPlaylist {
+        id: RequestId,
+        client_id: String,
+        session: u64,
+        generation: u64,
+        kind: VideoStreamPlaylistKind,
+    },
+    VideoStreamSegment {
+        id: RequestId,
+        client_id: String,
+        session: u64,
+        generation: u64,
+        index: VideoStreamSegmentIndex,
+    },
+    VideoStreamState {
+        id: RequestId,
+        client_id: String,
+        session: u64,
+    },
+    VideoStreamStop {
+        id: RequestId,
+        client_id: String,
+        session: u64,
+    },
 }
 
 impl ClientMessage {
@@ -701,7 +861,14 @@ impl ClientMessage {
             | Self::Collection { id, .. }
             | Self::Container { id, .. }
             | Self::Page { id, .. }
-            | Self::Write { id, .. } => *id,
+            | Self::Write { id, .. }
+            | Self::VideoStreamStart { id, .. }
+            | Self::VideoStreamControl { id, .. }
+            | Self::VideoStreamSeek { id, .. }
+            | Self::VideoStreamPlaylist { id, .. }
+            | Self::VideoStreamSegment { id, .. }
+            | Self::VideoStreamState { id, .. }
+            | Self::VideoStreamStop { id, .. } => *id,
         }
     }
 }
@@ -742,6 +909,34 @@ pub enum ServerMessage {
         id: RequestId,
         response: RemoteWriteResponse,
     },
+    VideoStreamStart {
+        id: RequestId,
+        response: VideoStreamResult<VideoStreamStartPayload>,
+    },
+    VideoStreamControl {
+        id: RequestId,
+        response: VideoStreamResult<SessionResponse>,
+    },
+    VideoStreamSeek {
+        id: RequestId,
+        response: VideoStreamResult<VideoStreamSeekPayload>,
+    },
+    VideoStreamPlaylist {
+        id: RequestId,
+        response: VideoStreamResult<VideoStreamPlaylistPayload>,
+    },
+    VideoStreamSegment {
+        id: RequestId,
+        response: VideoStreamResult<VideoStreamSegmentPayload>,
+    },
+    VideoStreamState {
+        id: RequestId,
+        response: VideoStreamResult<VideoStreamStatePayload>,
+    },
+    VideoStreamStop {
+        id: RequestId,
+        response: VideoStreamResult<()>,
+    },
 }
 
 impl ServerMessage {
@@ -754,7 +949,14 @@ impl ServerMessage {
             | Self::Collection { id, .. }
             | Self::Container { id, .. }
             | Self::Page { id, .. }
-            | Self::Write { id, .. } => *id,
+            | Self::Write { id, .. }
+            | Self::VideoStreamStart { id, .. }
+            | Self::VideoStreamControl { id, .. }
+            | Self::VideoStreamSeek { id, .. }
+            | Self::VideoStreamPlaylist { id, .. }
+            | Self::VideoStreamSegment { id, .. }
+            | Self::VideoStreamState { id, .. }
+            | Self::VideoStreamStop { id, .. } => *id,
         }
     }
 }
@@ -948,6 +1150,63 @@ mod tests {
         let actual: ClientMessage =
             read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn protocol_v15_video_pull_messages_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 15);
+        let requests = [
+            ClientMessage::VideoStreamStart {
+                id: 50,
+                client_id: "test-client".to_owned(),
+                address: RemoteAddress::file(
+                    "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+                    "movies/sample.mp4",
+                ),
+                quality: VideoStreamQuality::Standard,
+            },
+            ClientMessage::VideoStreamPlaylist {
+                id: 51,
+                client_id: "test-client".to_owned(),
+                session: 7,
+                generation: 9,
+                kind: VideoStreamPlaylistKind::Media,
+            },
+            ClientMessage::VideoStreamSegment {
+                id: 52,
+                client_id: "test-client".to_owned(),
+                session: 7,
+                generation: 9,
+                index: VideoStreamSegmentIndex::Media { sequence: 12 },
+            },
+        ];
+        for expected in requests {
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &expected).unwrap();
+            let actual: ClientMessage =
+                read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
+            assert_eq!(actual, expected);
+        }
+
+        for expected in [
+            ServerMessage::VideoStreamSegment {
+                id: 52,
+                response: VideoStreamResult::Success(VideoStreamSegmentPayload::Gone),
+            },
+            ServerMessage::VideoStreamPlaylist {
+                id: 51,
+                response: VideoStreamResult::Error(VideoStreamError::new(
+                    VideoStreamErrorCode::GenerationMismatch,
+                    "old generation",
+                )),
+            },
+        ] {
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &expected).unwrap();
+            let actual: ServerMessage =
+                read_frame(&mut bytes.as_slice(), MAX_RESPONSE_FRAME_BYTES).unwrap();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

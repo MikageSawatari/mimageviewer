@@ -5751,6 +5751,16 @@ impl VideoPlayer {
         ));
     }
 
+    /// mIV Remote の seek request は応答した generation と実際の decoder seek を
+    /// 1 対 1 に対応させる。通常 UI の連打 coalescing を通すと、進行中 seek の後で
+    /// serial が遅れて進み、HTTP に返した generation が即 stale になり得るため使わない。
+    pub(crate) fn seek_for_remote_streaming(&self, target_secs: f64) {
+        self.clear_frame_step_target();
+        let clamped = self.clamp_seek_target(target_secs);
+        let mut state = self.user_seek_coalesce.lock().unwrap();
+        self.issue_user_seek_locked(&mut state, clamped);
+    }
+
     /// 相対シーク (←→ ホットキー)。
     /// 絶対シークと同じ precise seek を使う。target 前の keyframe preview は表示せず、
     /// 現在フレームを保ったまま target 到達 frame を待つ。
@@ -7939,5 +7949,18 @@ mod tests {
         };
         assert!(super::user_seek_ready_to_issue(&state, true, 8, now));
         assert!(super::user_seek_ready_to_issue(&state, true, 7, now));
+    }
+
+    #[test]
+    fn remote_streaming_seek_never_defers_the_seek_serial() {
+        let player =
+            super::VideoPlayer::disconnected_for_test(std::path::PathBuf::from("fixture.mp4"), 0.0);
+        let initial = player.current_seek_serial();
+        player.seek_for_remote_streaming(10.0);
+        let first = player.current_seek_serial();
+        player.seek_for_remote_streaming(20.0);
+        let second = player.current_seek_serial();
+        assert!(first > initial);
+        assert!(second > first);
     }
 }

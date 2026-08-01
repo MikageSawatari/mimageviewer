@@ -1,7 +1,8 @@
 use mimageviewer_ipc::{
     RemoteItemState, RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource,
     RemoteWebFeatureStatus, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest,
-    RemoteWriteResponse, RemoteWriteResult, SessionConnectionKind, SessionStatus,
+    RemoteWriteResponse, RemoteWriteResult, SessionConnectionKind, SessionResponse, SessionStatus,
+    VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode,
 };
 use qrcode::{Color, QrCode};
 
@@ -12,8 +13,9 @@ use crate::video::stream::session::{
 
 use super::path_guard::logical_favorite_path;
 use super::session::{
-    ActiveSessionSnapshot, ClaimedRemoteUiRequest, ClaimedRemoteWrite, SessionHandle,
-    UiWriteOutcome,
+    ActiveSessionSnapshot, ClaimedRemoteUiRequest, ClaimedRemoteWrite, ClaimedVideoStreamUiRequest,
+    PublishedVideoStream, SessionHandle, UiWriteOutcome, VideoStreamPlaybackState,
+    VideoStreamUiOutcome, VideoStreamUiRequest,
 };
 
 #[derive(Default)]
@@ -31,6 +33,7 @@ pub(crate) struct RemoteSessionUiState {
 struct AppRemoteVideoStreaming {
     fs_idx: usize,
     session: RemoteVideoStreamingSession,
+    playback: std::sync::Arc<VideoStreamPlaybackState>,
 }
 
 struct PendingRemoteBookmarkWrite {
@@ -56,6 +59,17 @@ enum ReloadedView {
     Bookmarks,
     SmartFolder(uuid::Uuid),
     Other,
+}
+
+fn video_stream_ui_failure(message: String) -> VideoStreamUiOutcome {
+    VideoStreamUiOutcome::Error(VideoStreamError::new(VideoStreamErrorCode::Failed, message))
+}
+
+fn video_stream_session_mismatch() -> VideoStreamUiOutcome {
+    VideoStreamUiOutcome::Error(VideoStreamError::new(
+        VideoStreamErrorCode::SessionMismatch,
+        "動画ストリーミングセッションが一致しません",
+    ))
 }
 
 impl crate::app::App {
@@ -151,19 +165,12 @@ impl crate::app::App {
         }
     }
 
-    /// Increment 6 will call this after IPC validation. Keeping construction here makes the UI
-    /// boundary explicit while all heavyweight encoder work remains in the spawned worker.
-    #[allow(dead_code)]
     pub(crate) fn start_remote_video_streaming(
         &mut self,
         client_id: &str,
-    ) -> Result<
-        (
-            crate::video::stream::session::StreamingSessionId,
-            crate::video::stream::session::StreamingGeneration,
-        ),
-        String,
-    > {
+        requested_path: &std::path::Path,
+        quality: crate::video::stream::quality::QualityPreset,
+    ) -> Result<PublishedVideoStream, String> {
         if !self.settings.remote_video_streaming_enabled {
             return Err("remote video streaming is disabled".to_owned());
         }
@@ -178,13 +185,15 @@ impl crate::app::App {
             .fullscreen_idx
             .ok_or_else(|| "no fullscreen media is open".to_owned())?;
         let encoder = self.settings.remote_video_encoder.into();
-        let quality = self.settings.remote_video_quality_default.into();
         let segment_capacity = self.settings.remote_video_segment_window;
         let mute_local_output = self.settings.remote_video_mute_local_output;
         let player = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => player,
             _ => return Err("the fullscreen item is not playable media".to_owned()),
         };
+        if !crate::folder_tree::path_eq(player.path(), requested_path) {
+            return Err("the requested video is not the current fullscreen media".to_owned());
+        }
         let previous_speed = player.playback_speed();
         let speed_changed = (previous_speed - 1.0).abs() > 1.0e-6;
         if speed_changed {
@@ -207,9 +216,26 @@ impl crate::app::App {
             }
         };
         player.set_playing(true);
-        let result = (session.id(), session.generation());
-        self.remote_session_ui.video_streaming = Some(AppRemoteVideoStreaming { fs_idx, session });
-        Ok(result)
+        let playback = std::sync::Arc::new(VideoStreamPlaybackState::new(
+            player.position_secs(),
+            player.duration(),
+            player.volume(),
+            player.intent_playing(),
+        ));
+        let published = PublishedVideoStream {
+            session: session.id(),
+            generation: session.access(),
+            playback: std::sync::Arc::clone(&playback),
+        };
+        if let Some(handle) = self.remote_session_ui.handle.as_ref() {
+            handle.publish_video_stream(published.clone());
+        }
+        self.remote_session_ui.video_streaming = Some(AppRemoteVideoStreaming {
+            fs_idx,
+            session,
+            playback,
+        });
+        Ok(published)
     }
 
     fn poll_remote_video_streaming(&mut self) {
@@ -217,7 +243,15 @@ impl crate::app::App {
             return;
         };
         let outcome = match self.fs_cache.get(&streaming.fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => streaming.session.reconcile(player),
+            Some(FsCacheEntry::Video { player, .. }) => {
+                streaming.playback.update(
+                    player.position_secs(),
+                    player.duration(),
+                    player.volume(),
+                    player.intent_playing(),
+                );
+                streaming.session.reconcile(player)
+            }
             _ => StreamReconcile::Stop("streaming media player was closed".to_owned()),
         };
         match outcome {
@@ -228,6 +262,13 @@ impl crate::app::App {
                 crate::logger::log(format!(
                     "remote-stream generation changed after seek: {generation:?}"
                 ));
+                if let Some(handle) = self.remote_session_ui.handle.as_ref() {
+                    handle.publish_video_stream(PublishedVideoStream {
+                        session: streaming.session.id(),
+                        generation: streaming.session.access(),
+                        playback: std::sync::Arc::clone(&streaming.playback),
+                    });
+                }
                 self.remote_session_ui.video_streaming = Some(streaming);
             }
             StreamReconcile::Stop(reason) => {
@@ -235,6 +276,9 @@ impl crate::app::App {
                     self.fs_cache.get(&streaming.fs_idx)
                 {
                     player.set_playing(false);
+                }
+                if let Some(handle) = self.remote_session_ui.handle.as_ref() {
+                    handle.clear_video_stream(Some(streaming.session.id().0));
                 }
                 crate::logger::log(format!("remote-stream session stopped: {reason}"));
             }
@@ -291,8 +335,155 @@ impl crate::app::App {
                     });
                     pending.complete(page);
                 }
+                ClaimedRemoteUiRequest::VideoStream(pending) => {
+                    self.apply_remote_video_stream_request(pending);
+                }
             }
         }
+    }
+
+    fn apply_remote_video_stream_request(&mut self, pending: ClaimedVideoStreamUiRequest) {
+        if pending.ownership_response().status != SessionStatus::Active {
+            pending.complete(VideoStreamUiOutcome::Error(VideoStreamError::new(
+                VideoStreamErrorCode::SessionMismatch,
+                "リモートセッションの操作権が移動しました",
+            )));
+            return;
+        }
+        let request = pending.request().clone();
+        let outcome = match request {
+            VideoStreamUiRequest::Start {
+                client_id,
+                path,
+                quality,
+            } => self
+                .start_remote_video_streaming(&client_id, &path, quality.into())
+                .map(VideoStreamUiOutcome::Started)
+                .unwrap_or_else(video_stream_ui_failure),
+            VideoStreamUiRequest::Control { session, action } => {
+                self.apply_remote_video_control(session, action)
+            }
+            VideoStreamUiRequest::Seek {
+                session,
+                position_secs,
+            } => self.apply_remote_video_seek(session, position_secs),
+            VideoStreamUiRequest::Stop { session } => self.apply_remote_video_stop(session),
+        };
+        pending.complete(outcome);
+    }
+
+    fn apply_remote_video_control(
+        &mut self,
+        session: u64,
+        action: VideoStreamControlAction,
+    ) -> VideoStreamUiOutcome {
+        let Some(mut streaming) = self.remote_session_ui.video_streaming.take() else {
+            return video_stream_session_mismatch();
+        };
+        if streaming.session.id().0 != session {
+            self.remote_session_ui.video_streaming = Some(streaming);
+            return video_stream_session_mismatch();
+        }
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&streaming.fs_idx) else {
+            if let Some(handle) = self.remote_session_ui.handle.as_ref() {
+                handle.clear_video_stream(Some(session));
+            }
+            return video_stream_ui_failure("streaming media player was closed".to_owned());
+        };
+        let result = match action {
+            VideoStreamControlAction::Play => {
+                player.set_playing(true);
+                Ok(())
+            }
+            VideoStreamControlAction::Pause => {
+                player.set_playing(false);
+                Ok(())
+            }
+            VideoStreamControlAction::Volume { volume }
+                if volume.is_finite() && (0.0..=1.0).contains(&volume) =>
+            {
+                player.set_volume(volume);
+                Ok(())
+            }
+            VideoStreamControlAction::Volume { .. } => {
+                Err("volume must be finite and between 0 and 1".to_owned())
+            }
+            VideoStreamControlAction::Quality { quality } => streaming
+                .session
+                .change_quality(player, quality.into())
+                .map(|_| ()),
+        };
+        streaming.playback.update(
+            player.position_secs(),
+            player.duration(),
+            player.volume(),
+            player.intent_playing(),
+        );
+        if result.is_ok()
+            && let Some(handle) = self.remote_session_ui.handle.as_ref()
+        {
+            handle.publish_video_stream(PublishedVideoStream {
+                session: streaming.session.id(),
+                generation: streaming.session.access(),
+                playback: std::sync::Arc::clone(&streaming.playback),
+            });
+        }
+        self.remote_session_ui.video_streaming = Some(streaming);
+        match result {
+            Ok(()) => VideoStreamUiOutcome::Controlled(SessionResponse::active()),
+            Err(error) => video_stream_ui_failure(error),
+        }
+    }
+
+    fn apply_remote_video_seek(
+        &mut self,
+        session: u64,
+        position_secs: f64,
+    ) -> VideoStreamUiOutcome {
+        let Some(mut streaming) = self.remote_session_ui.video_streaming.take() else {
+            return video_stream_session_mismatch();
+        };
+        if streaming.session.id().0 != session {
+            self.remote_session_ui.video_streaming = Some(streaming);
+            return video_stream_session_mismatch();
+        }
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&streaming.fs_idx) else {
+            if let Some(handle) = self.remote_session_ui.handle.as_ref() {
+                handle.clear_video_stream(Some(session));
+            }
+            return video_stream_ui_failure("streaming media player was closed".to_owned());
+        };
+        let result = streaming.session.seek(player, position_secs);
+        if result.is_ok()
+            && let Some(handle) = self.remote_session_ui.handle.as_ref()
+        {
+            handle.publish_video_stream(PublishedVideoStream {
+                session: streaming.session.id(),
+                generation: streaming.session.access(),
+                playback: std::sync::Arc::clone(&streaming.playback),
+            });
+        }
+        self.remote_session_ui.video_streaming = Some(streaming);
+        result
+            .map(VideoStreamUiOutcome::Seeked)
+            .unwrap_or_else(video_stream_ui_failure)
+    }
+
+    fn apply_remote_video_stop(&mut self, session: u64) -> VideoStreamUiOutcome {
+        let Some(streaming) = self.remote_session_ui.video_streaming.take() else {
+            return video_stream_session_mismatch();
+        };
+        if streaming.session.id().0 != session {
+            self.remote_session_ui.video_streaming = Some(streaming);
+            return video_stream_session_mismatch();
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&streaming.fs_idx) {
+            player.set_playing(false);
+        }
+        if let Some(handle) = self.remote_session_ui.handle.as_ref() {
+            handle.clear_video_stream(Some(session));
+        }
+        VideoStreamUiOutcome::Stopped
     }
 
     fn apply_pending_remote_write(&mut self, pending: ClaimedRemoteWrite) {

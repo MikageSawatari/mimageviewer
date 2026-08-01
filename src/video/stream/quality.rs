@@ -22,6 +22,18 @@ impl From<crate::settings::RemoteVideoQuality> for QualityPreset {
     }
 }
 
+impl From<mimageviewer_ipc::VideoStreamQuality> for QualityPreset {
+    fn from(value: mimageviewer_ipc::VideoStreamQuality) -> Self {
+        use mimageviewer_ipc::VideoStreamQuality;
+        match value {
+            VideoStreamQuality::Minimum => Self::Minimum,
+            VideoStreamQuality::Low => Self::Low,
+            VideoStreamQuality::Standard => Self::Standard,
+            VideoStreamQuality::High => Self::High,
+        }
+    }
+}
+
 impl QualityPreset {
     #[cfg(test)]
     pub(crate) const ALL: [Self; 4] = [Self::Minimum, Self::Low, Self::Standard, Self::High];

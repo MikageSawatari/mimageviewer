@@ -91,6 +91,26 @@ impl SegmentRing {
             .map_or(SegmentLookup::NotFound, SegmentLookup::Found)
     }
 
+    pub(crate) fn buffered_duration_secs(&self) -> f64 {
+        self.segments
+            .iter()
+            .map(|segment| segment.duration_secs)
+            .sum()
+    }
+
+    pub(crate) fn effective_bitrate_bps(&self) -> u64 {
+        let duration_secs = self.buffered_duration_secs();
+        if duration_secs <= 0.0 {
+            return 0;
+        }
+        let bytes = self
+            .segments
+            .iter()
+            .map(|segment| segment.bytes.len() as u64)
+            .sum::<u64>();
+        ((bytes as f64 * 8.0) / duration_secs).round() as u64
+    }
+
     /// CMAF media playlist。live playlist なので PLAYLIST-TYPE / ENDLIST は出さない。
     pub(crate) fn media_playlist(&self) -> String {
         let target_duration = self
@@ -162,6 +182,15 @@ mod tests {
         ));
         assert_eq!(ring.get(5), SegmentLookup::NotFound);
         assert_eq!(ring.get(u64::MAX), SegmentLookup::NotFound);
+    }
+
+    #[test]
+    fn ring_reports_observed_buffer_and_bitrate() {
+        let mut ring = SegmentRing::new(2).unwrap();
+        ring.push(2.0, vec![0; 100]).unwrap();
+        ring.push(3.0, vec![0; 200]).unwrap();
+        assert!((ring.buffered_duration_secs() - 5.0).abs() < f64::EPSILON);
+        assert_eq!(ring.effective_bitrate_bps(), 480);
     }
 
     #[test]

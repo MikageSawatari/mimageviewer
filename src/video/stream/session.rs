@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use ffmpeg_the_third as ffmpeg;
@@ -56,12 +56,12 @@ pub(crate) enum StreamGenerationStatus {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // Increment 6 constructs these variants from its typed IPC resource request.
 pub(crate) enum StreamResourceKind {
     MasterPlaylist,
     MediaPlaylist,
     InitSegment,
     MediaSegment(u64),
+    State,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,11 +71,18 @@ pub(crate) enum StreamSegmentBytes {
     NotFound,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum StreamResource {
     Playlist(Option<String>),
     InitSegment(Option<Vec<u8>>),
     MediaSegment(StreamSegmentBytes),
+    State(StreamGenerationMetrics),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct StreamGenerationMetrics {
+    pub(crate) buffered_secs: f64,
+    pub(crate) effective_bitrate_bps: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,6 +111,8 @@ struct WorkerCommand {
     reply: Sender<StreamResource>,
 }
 
+type SharedGenerationStatus = Arc<(Mutex<StreamGenerationStatus>, Condvar)>;
+
 struct GenerationConfig {
     encoder: EncoderPreference,
     quality: QualityPreset,
@@ -123,10 +132,18 @@ struct GenerationResources {
     _local_mute: Option<crate::video::clock::RemoteLocalOutputMuteLease>,
 }
 
+#[derive(Clone)]
+pub(crate) struct StreamingGenerationAccess {
+    generation: StreamingGeneration,
+    status: SharedGenerationStatus,
+    command_tx: Sender<WorkerCommand>,
+    activity: RemoteStreamingActivity,
+}
+
 pub(crate) struct StreamingGenerationHandle {
     generation: StreamingGeneration,
     expected_seek_serial: u64,
-    status: Arc<Mutex<StreamGenerationStatus>>,
+    status: SharedGenerationStatus,
     command_tx: Sender<WorkerCommand>,
     activity: RemoteStreamingActivity,
     cancel: Arc<AtomicBool>,
@@ -185,7 +202,7 @@ impl StreamingGenerationHandle {
             segment_capacity,
         };
         let (command_tx, command_rx) = bounded(WORKER_COMMAND_CAPACITY);
-        let status = Arc::new(Mutex::new(StreamGenerationStatus::Opening));
+        let status = Arc::new((Mutex::new(StreamGenerationStatus::Opening), Condvar::new()));
         let worker_status = Arc::clone(&status);
         let worker_cancel = Arc::clone(&cancel);
         let worker = std::thread::Builder::new()
@@ -213,9 +230,7 @@ impl StreamingGenerationHandle {
                         }
                     }
                 };
-                *worker_status
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()) = final_status;
+                set_generation_status(&worker_status, final_status);
             })
             .map_err(|error| format!("failed to spawn streaming worker: {error}"))?;
         Ok(Self {
@@ -229,26 +244,61 @@ impl StreamingGenerationHandle {
         })
     }
 
-    pub(crate) fn generation(&self) -> StreamingGeneration {
-        self.generation
-    }
-
     pub(crate) fn expected_seek_serial(&self) -> u64 {
         self.expected_seek_serial
     }
 
     pub(crate) fn status(&self) -> StreamGenerationStatus {
-        self.status
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone()
+        generation_status(&self.status)
     }
 
     pub(crate) fn set_playing(&self, playing: bool) -> bool {
         self.activity.set_playing(playing)
     }
 
-    #[allow(dead_code)] // Increment 6 calls this from its dedicated non-UI segment lane.
+    pub(crate) fn access(&self) -> StreamingGenerationAccess {
+        StreamingGenerationAccess {
+            generation: self.generation,
+            status: Arc::clone(&self.status),
+            command_tx: self.command_tx.clone(),
+            activity: self.activity.clone(),
+        }
+    }
+
+    pub(crate) fn stop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
+
+impl StreamingGenerationAccess {
+    pub(crate) fn generation(&self) -> StreamingGeneration {
+        self.generation
+    }
+
+    pub(crate) fn status(&self) -> StreamGenerationStatus {
+        generation_status(&self.status)
+    }
+
+    pub(crate) fn wait_ready(&self, timeout: Duration) -> StreamGenerationStatus {
+        let deadline = Instant::now() + timeout;
+        let (status, ready) = &*self.status;
+        let mut status = status.lock().unwrap_or_else(|error| error.into_inner());
+        while matches!(*status, StreamGenerationStatus::Opening) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (next, wait) = ready
+                .wait_timeout(status, remaining)
+                .unwrap_or_else(|error| error.into_inner());
+            status = next;
+            if wait.timed_out() {
+                break;
+            }
+        }
+        status.clone()
+    }
+
     pub(crate) fn resource(
         &self,
         generation: StreamingGeneration,
@@ -277,10 +327,19 @@ impl StreamingGenerationHandle {
             .recv_timeout(RESOURCE_TIMEOUT)
             .map_err(|_| StreamResourceError::Timeout)
     }
+}
 
-    pub(crate) fn stop(&mut self) {
-        self.cancel.store(true, Ordering::Release);
-    }
+fn generation_status(status: &SharedGenerationStatus) -> StreamGenerationStatus {
+    status
+        .0
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
+fn set_generation_status(status: &SharedGenerationStatus, next: StreamGenerationStatus) {
+    *status.0.lock().unwrap_or_else(|error| error.into_inner()) = next;
+    status.1.notify_all();
 }
 
 fn validate_resource_generation(
@@ -368,21 +427,12 @@ impl RemoteVideoStreamingSession {
         self.id
     }
 
-    pub(crate) fn generation(&self) -> StreamingGeneration {
-        self.current.generation()
-    }
-
     pub(crate) fn status(&self) -> StreamGenerationStatus {
         self.current.status()
     }
 
-    #[allow(dead_code)] // Increment 6 calls this from its dedicated non-UI segment lane.
-    pub(crate) fn resource(
-        &self,
-        generation: StreamingGeneration,
-        kind: StreamResourceKind,
-    ) -> Result<StreamResource, StreamResourceError> {
-        self.current.resource(generation, kind)
+    pub(crate) fn access(&self) -> StreamingGenerationAccess {
+        self.current.access()
     }
 
     pub(crate) fn set_playing(&self, playing: bool) -> bool {
@@ -403,6 +453,18 @@ impl RemoteVideoStreamingSession {
                 Err(error)
             }
         }
+    }
+
+    pub(crate) fn seek(
+        &mut self,
+        player: &crate::video::VideoPlayer,
+        position_secs: f64,
+    ) -> Result<StreamingGeneration, String> {
+        if !position_secs.is_finite() || position_secs < 0.0 {
+            return Err("stream seek position must be finite and non-negative".to_owned());
+        }
+        player.seek_for_remote_streaming(position_secs);
+        self.start_new_generation(player)
     }
 
     fn start_new_generation(
@@ -596,7 +658,7 @@ fn run_generation_worker(
     video_rx: Receiver<super::video_tap::TappedVideoFrame>,
     audio_rx: Receiver<crate::video::audio::ProcessedChunk>,
     command_rx: Receiver<WorkerCommand>,
-    status: Arc<Mutex<StreamGenerationStatus>>,
+    status: SharedGenerationStatus,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let _resources = resources;
@@ -637,7 +699,7 @@ fn run_generation_worker(
         audio_bitrate_bps: audio.effective_bitrate_bps(),
         codecs: segmenter.codecs().to_owned(),
     });
-    *status.lock().unwrap_or_else(|error| error.into_inner()) = ready;
+    set_generation_status(&status, ready);
     let mut mux = MuxCoordinator::default();
 
     loop {
@@ -681,6 +743,10 @@ fn reply_with_resource(command: WorkerCommand, segmenter: &Fmp4Segmenter) {
                 SegmentLookup::NotFound => StreamSegmentBytes::NotFound,
             })
         }
+        StreamResourceKind::State => StreamResource::State(StreamGenerationMetrics {
+            buffered_secs: segmenter.buffered_duration_secs(),
+            effective_bitrate_bps: segmenter.effective_bitrate_bps(),
+        }),
     };
     let _ = command.reply.send(resource);
 }

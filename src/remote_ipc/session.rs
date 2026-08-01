@@ -1,12 +1,18 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimageviewer_ipc::{
     RemoteWebConnectionInfo, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest,
     RemoteWriteResponse, SessionAcquireRequest, SessionPeerInfo, SessionPingRequest,
-    SessionResponse, SessionStatus,
+    SessionResponse, SessionStatus, VideoStreamControlAction, VideoStreamError,
+    VideoStreamErrorCode, VideoStreamQuality,
+};
+
+use crate::video::stream::session::{
+    StreamingGeneration, StreamingGenerationAccess, StreamingSessionId,
 };
 
 pub(crate) const LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
@@ -459,6 +465,97 @@ pub(crate) enum UiWriteOutcome {
     Session(SessionResponse),
 }
 
+pub(crate) struct VideoStreamPlaybackState {
+    position_secs: AtomicU64,
+    duration_secs: AtomicU64,
+    volume: AtomicU64,
+    playing: AtomicBool,
+}
+
+impl VideoStreamPlaybackState {
+    pub(crate) fn new(position_secs: f64, duration_secs: f64, volume: f64, playing: bool) -> Self {
+        Self {
+            position_secs: AtomicU64::new(position_secs.to_bits()),
+            duration_secs: AtomicU64::new(duration_secs.to_bits()),
+            volume: AtomicU64::new(volume.to_bits()),
+            playing: AtomicBool::new(playing),
+        }
+    }
+
+    pub(crate) fn update(
+        &self,
+        position_secs: f64,
+        duration_secs: f64,
+        volume: f64,
+        playing: bool,
+    ) {
+        self.position_secs
+            .store(position_secs.to_bits(), Ordering::Release);
+        self.duration_secs
+            .store(duration_secs.to_bits(), Ordering::Release);
+        self.volume.store(volume.to_bits(), Ordering::Release);
+        self.playing.store(playing, Ordering::Release);
+    }
+
+    pub(crate) fn snapshot(&self) -> VideoStreamPlaybackSnapshot {
+        VideoStreamPlaybackSnapshot {
+            position_secs: f64::from_bits(self.position_secs.load(Ordering::Acquire)),
+            duration_secs: f64::from_bits(self.duration_secs.load(Ordering::Acquire)),
+            volume: f64::from_bits(self.volume.load(Ordering::Acquire)),
+            playing: self.playing.load(Ordering::Acquire),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VideoStreamPlaybackSnapshot {
+    pub(crate) position_secs: f64,
+    pub(crate) duration_secs: f64,
+    pub(crate) volume: f64,
+    pub(crate) playing: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct PublishedVideoStream {
+    pub(crate) session: StreamingSessionId,
+    pub(crate) generation: StreamingGenerationAccess,
+    pub(crate) playback: Arc<VideoStreamPlaybackState>,
+}
+
+impl PublishedVideoStream {
+    pub(crate) fn generation_id(&self) -> StreamingGeneration {
+        self.generation.generation()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum VideoStreamUiRequest {
+    Start {
+        client_id: String,
+        path: PathBuf,
+        quality: VideoStreamQuality,
+    },
+    Control {
+        session: u64,
+        action: VideoStreamControlAction,
+    },
+    Seek {
+        session: u64,
+        position_secs: f64,
+    },
+    Stop {
+        session: u64,
+    },
+}
+
+pub(crate) enum VideoStreamUiOutcome {
+    Started(PublishedVideoStream),
+    Controlled(SessionResponse),
+    Seeked(StreamingGeneration),
+    Stopped,
+    Error(VideoStreamError),
+}
+
 struct UiRequestDispatch {
     state: AtomicU8,
 }
@@ -476,9 +573,17 @@ struct QueuedBookResumeRead {
     dispatch: Arc<UiRequestDispatch>,
 }
 
+struct QueuedVideoStreamUiRequest {
+    request: VideoStreamUiRequest,
+    operation: SessionOperation,
+    reply: mpsc::SyncSender<VideoStreamUiOutcome>,
+    dispatch: Arc<UiRequestDispatch>,
+}
+
 enum QueuedRemoteUiRequest {
     Write(QueuedRemoteWrite),
     BookResumeRead(QueuedBookResumeRead),
+    VideoStream(QueuedVideoStreamUiRequest),
 }
 
 pub(crate) struct ClaimedRemoteWrite {
@@ -492,9 +597,16 @@ pub(crate) struct ClaimedBookResumeRead {
     reply: mpsc::SyncSender<Option<usize>>,
 }
 
+pub(crate) struct ClaimedVideoStreamUiRequest {
+    request: VideoStreamUiRequest,
+    operation: SessionOperation,
+    reply: mpsc::SyncSender<VideoStreamUiOutcome>,
+}
+
 pub(crate) enum ClaimedRemoteUiRequest {
     Write(ClaimedRemoteWrite),
     BookResumeRead(ClaimedBookResumeRead),
+    VideoStream(ClaimedVideoStreamUiRequest),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -512,6 +624,7 @@ pub(crate) struct SessionHandle {
     remote_web_connections: Arc<Mutex<BTreeMap<u64, Option<RemoteWebConnectionInfo>>>>,
     ui_request_tx: mpsc::SyncSender<QueuedRemoteUiRequest>,
     ui_request_rx: Arc<Mutex<mpsc::Receiver<QueuedRemoteUiRequest>>>,
+    published_video_stream: Arc<Mutex<Option<PublishedVideoStream>>>,
 }
 
 impl UiRequestDispatch {
@@ -573,6 +686,22 @@ impl ClaimedBookResumeRead {
     }
 }
 
+impl ClaimedVideoStreamUiRequest {
+    pub(crate) fn request(&self) -> &VideoStreamUiRequest {
+        &self.request
+    }
+
+    pub(crate) fn ownership_response(&self) -> SessionResponse {
+        self.operation.ownership_response()
+    }
+
+    pub(crate) fn complete(self, outcome: VideoStreamUiOutcome) {
+        let success = !matches!(outcome, VideoStreamUiOutcome::Error(_));
+        self.operation.finish(success);
+        let _ = self.reply.send(outcome);
+    }
+}
+
 impl SessionHandle {
     pub(crate) fn new() -> Self {
         let (ui_request_tx, ui_request_rx) = mpsc::sync_channel(UI_REQUEST_QUEUE_CAPACITY);
@@ -583,6 +712,7 @@ impl SessionHandle {
             remote_web_connections: Arc::new(Mutex::new(BTreeMap::new())),
             ui_request_tx,
             ui_request_rx: Arc::new(Mutex::new(ui_request_rx)),
+            published_video_stream: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -609,11 +739,15 @@ impl SessionHandle {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
-        let response = self
-            .inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .acquire(self.now(), connected_unix_ms, request);
+        let (response, owner_changed) = {
+            let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let generation = state.generation;
+            let response = state.acquire(self.now(), connected_unix_ms, request);
+            (response, state.generation != generation)
+        };
+        if owner_changed {
+            self.clear_video_stream(None);
+        }
         crate::logger::log(format!(
             "remote_ipc: session_acquired connection_kind={peer_kind:?} peer={peer_name}"
         ));
@@ -732,6 +866,7 @@ impl SessionHandle {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .local_disconnect();
+        self.clear_video_stream(None);
         crate::logger::log("remote_ipc: session_released reason=local".to_owned());
         self.notify_ui();
     }
@@ -814,6 +949,94 @@ impl SessionHandle {
         }
     }
 
+    pub(crate) fn submit_video_stream(
+        &self,
+        request: VideoStreamUiRequest,
+        operation: SessionOperation,
+    ) -> VideoStreamUiOutcome {
+        let dispatch = Arc::new(UiRequestDispatch::pending());
+        let (reply, receiver) = mpsc::sync_channel(1);
+        let queued = QueuedRemoteUiRequest::VideoStream(QueuedVideoStreamUiRequest {
+            request,
+            operation,
+            reply,
+            dispatch: Arc::clone(&dispatch),
+        });
+        match self.ui_request_tx.try_send(queued) {
+            Ok(()) => self.notify_ui(),
+            Err(mpsc::TrySendError::Full(_)) => {
+                return video_stream_ui_error(
+                    VideoStreamErrorCode::Busy,
+                    "本体 UI の動画操作 queue が混み合っています",
+                );
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return video_stream_ui_error(
+                    VideoStreamErrorCode::Internal,
+                    "本体 UI の動画操作受付が停止しています",
+                );
+            }
+        }
+        match receiver.recv_timeout(UI_REQUEST_ACCEPT_TIMEOUT) {
+            Ok(outcome) => outcome,
+            Err(mpsc::RecvTimeoutError::Disconnected) => video_stream_ui_error(
+                VideoStreamErrorCode::Internal,
+                "本体 UI の動画操作受付が停止しています",
+            ),
+            Err(mpsc::RecvTimeoutError::Timeout) if dispatch.cancel_pending() => {
+                video_stream_ui_error(
+                    VideoStreamErrorCode::UiTimeout,
+                    "本体 UI が 2 秒以内に動画操作要求を受理しませんでした",
+                )
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => receiver.recv().unwrap_or_else(|_| {
+                video_stream_ui_error(
+                    VideoStreamErrorCode::Internal,
+                    "本体 UI の動画操作応答が停止しています",
+                )
+            }),
+        }
+    }
+
+    pub(crate) fn publish_video_stream(&self, stream: PublishedVideoStream) {
+        *self
+            .published_video_stream
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(stream);
+    }
+
+    pub(crate) fn clear_video_stream(&self, session: Option<u64>) {
+        let mut published = self
+            .published_video_stream
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if session.is_none_or(|expected| {
+            published
+                .as_ref()
+                .is_some_and(|stream| stream.session.0 == expected)
+        }) {
+            *published = None;
+        }
+    }
+
+    pub(crate) fn video_stream(
+        &self,
+        session: u64,
+    ) -> Result<PublishedVideoStream, VideoStreamError> {
+        self.published_video_stream
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .filter(|stream| stream.session.0 == session)
+            .cloned()
+            .ok_or_else(|| {
+                VideoStreamError::new(
+                    VideoStreamErrorCode::SessionMismatch,
+                    "動画ストリーミングセッションが一致しません",
+                )
+            })
+    }
+
     pub(crate) fn take_pending_ui_requests(&self) -> Vec<ClaimedRemoteUiRequest> {
         let receiver = self
             .ui_request_rx
@@ -838,7 +1061,19 @@ impl SessionHandle {
                         },
                     ));
                 }
-                QueuedRemoteUiRequest::Write(_) | QueuedRemoteUiRequest::BookResumeRead(_) => {}
+                QueuedRemoteUiRequest::VideoStream(queued) if queued.dispatch.try_claim() => {
+                    queued.operation.started();
+                    claimed.push(ClaimedRemoteUiRequest::VideoStream(
+                        ClaimedVideoStreamUiRequest {
+                            request: queued.request,
+                            operation: queued.operation,
+                            reply: queued.reply,
+                        },
+                    ));
+                }
+                QueuedRemoteUiRequest::Write(_)
+                | QueuedRemoteUiRequest::BookResumeRead(_)
+                | QueuedRemoteUiRequest::VideoStream(_) => {}
             }
         }
         claimed
@@ -852,6 +1087,9 @@ impl SessionHandle {
                 ClaimedRemoteUiRequest::Write(write) => write,
                 ClaimedRemoteUiRequest::BookResumeRead(_) => {
                     panic!("book resume read reached a write-only test")
+                }
+                ClaimedRemoteUiRequest::VideoStream(_) => {
+                    panic!("video stream request reached a write-only test")
                 }
             })
             .collect()
@@ -876,10 +1114,15 @@ impl SessionHandle {
     }
 
     fn expire(&self) -> Option<ReleaseReason> {
-        self.inner
+        let reason = self
+            .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .expire(self.now())
+            .expire(self.now());
+        if reason.is_some() {
+            self.clear_video_stream(None);
+        }
+        reason
     }
 }
 
@@ -1025,6 +1268,13 @@ fn write_stopped_outcome() -> UiWriteOutcome {
         RemoteWriteErrorCode::Internal,
         "本体 UI の書き込み受付が停止しています",
     )
+}
+
+fn video_stream_ui_error(
+    code: VideoStreamErrorCode,
+    message: &'static str,
+) -> VideoStreamUiOutcome {
+    VideoStreamUiOutcome::Error(VideoStreamError::new(code, message))
 }
 
 pub(crate) struct SessionOperation {

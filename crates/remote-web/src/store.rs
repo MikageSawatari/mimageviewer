@@ -323,6 +323,29 @@ impl Library {
         }
     }
 
+    /// HTTP 層でも favorite allowlist と canonical containment を検証する。
+    /// 本体 IPC は同じ不変条件を独立に再検証するため、これは多重防御の外側である。
+    pub(crate) fn validate_remote_file_video(
+        &self,
+        address: &RemoteAddress,
+    ) -> Result<(), StoreError> {
+        if !matches!(
+            address.subresource,
+            mimageviewer_ipc::RemoteSubresource::File
+        ) {
+            return Err(StoreError::BadRequest);
+        }
+        let id = Uuid::parse_str(&address.favorite_id).map_err(|_| StoreError::BadRequest)?;
+        let favorite = self.favorite(id)?;
+        let path = resolve_existing(&favorite.path, &address.relative_path)?;
+        let metadata = std::fs::metadata(&path)?;
+        if metadata.is_file() && classify_path(&path) == EntryKind::Video {
+            Ok(())
+        } else {
+            Err(StoreError::BadRequest)
+        }
+    }
+
     pub fn retain_allowed_container_entries(&self, entries: &mut Vec<ContainerEntry>) {
         entries.retain(|entry| self.validate_remote_address(&entry.address).is_ok());
     }

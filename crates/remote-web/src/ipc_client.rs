@@ -14,7 +14,10 @@ use mimageviewer_ipc::{
     RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse,
     RemoteWriteResult, RequestId, ServerMessage, SessionAcquireRequest, SessionPeerInfo,
     SessionPingRequest, SessionResponse, SessionStatus, ThumbnailError, ThumbnailErrorCode,
-    ThumbnailRequest, ThumbnailResponse, read_frame, write_frame,
+    ThumbnailRequest, ThumbnailResponse, VideoStreamControlAction, VideoStreamError,
+    VideoStreamErrorCode, VideoStreamPlaylistKind, VideoStreamPlaylistPayload, VideoStreamQuality,
+    VideoStreamResult, VideoStreamSeekPayload, VideoStreamSegmentIndex, VideoStreamSegmentPayload,
+    VideoStreamStartPayload, VideoStreamStatePayload, read_frame, write_frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -103,6 +106,7 @@ pub enum ClientError {
     MediaRemote(MediaError),
     WriteRemote(RemoteWriteError),
     SessionRemote(SessionResponse),
+    VideoStreamRemote(VideoStreamError),
 }
 
 impl ClientError {
@@ -117,6 +121,7 @@ impl ClientError {
             || matches!(self, Self::CollectionRemote(error) if error.code == CollectionErrorCode::Busy)
             || matches!(self, Self::MediaRemote(error) if error.code == MediaErrorCode::Busy)
             || matches!(self, Self::WriteRemote(error) if error.code == RemoteWriteErrorCode::Busy)
+            || matches!(self, Self::VideoStreamRemote(error) if error.code == VideoStreamErrorCode::Busy)
     }
 
     pub fn ipc_status(&self) -> String {
@@ -162,6 +167,7 @@ impl ClientError {
                 CollectionErrorCode::Internal => "miv_collection_internal",
             }
             .to_owned(),
+            Self::VideoStreamRemote(error) => format!("miv_video_{:?}", error.code).to_lowercase(),
         }
     }
 
@@ -205,6 +211,9 @@ impl fmt::Display for ClientError {
                 write!(f, "mIV 本体が書き込み要求を拒否しました: {}", error.message)
             }
             Self::SessionRemote(response) => write!(f, "{}", response.message),
+            Self::VideoStreamRemote(error) => {
+                write!(f, "mIV 本体が動画要求を拒否しました: {}", error.message)
+            }
         }
     }
 }
@@ -567,6 +576,180 @@ impl ThumbnailClient {
                 retry_count: success.retry_count,
                 retry_statuses: success.retry_statuses,
             }),
+        })
+    }
+
+    pub fn video_stream_start(
+        &self,
+        client_id: &str,
+        address: RemoteAddress,
+        quality: VideoStreamQuality,
+    ) -> Result<IpcSuccess<VideoStreamStartPayload>, ClientFailure> {
+        self.video_request(
+            |id| ClientMessage::VideoStreamStart {
+                id,
+                client_id: client_id.to_owned(),
+                address: address.clone(),
+                quality,
+            },
+            |message| match message {
+                ServerMessage::VideoStreamStart { response, .. } => Some(response),
+                _ => return None,
+            },
+        )
+    }
+
+    pub fn video_stream_control(
+        &self,
+        client_id: &str,
+        session: u64,
+        action: VideoStreamControlAction,
+    ) -> Result<IpcSuccess<SessionResponse>, ClientFailure> {
+        self.video_request(
+            |id| ClientMessage::VideoStreamControl {
+                id,
+                client_id: client_id.to_owned(),
+                session,
+                action: action.clone(),
+            },
+            |message| match message {
+                ServerMessage::VideoStreamControl { response, .. } => Some(response),
+                _ => return None,
+            },
+        )
+    }
+
+    pub fn video_stream_seek(
+        &self,
+        client_id: &str,
+        session: u64,
+        position_secs: f64,
+    ) -> Result<IpcSuccess<VideoStreamSeekPayload>, ClientFailure> {
+        self.video_request(
+            |id| ClientMessage::VideoStreamSeek {
+                id,
+                client_id: client_id.to_owned(),
+                session,
+                position_secs,
+            },
+            |message| match message {
+                ServerMessage::VideoStreamSeek { response, .. } => Some(response),
+                _ => return None,
+            },
+        )
+    }
+
+    pub fn video_stream_playlist(
+        &self,
+        client_id: &str,
+        session: u64,
+        generation: u64,
+        kind: VideoStreamPlaylistKind,
+    ) -> Result<IpcSuccess<VideoStreamPlaylistPayload>, ClientFailure> {
+        self.video_request(
+            |id| ClientMessage::VideoStreamPlaylist {
+                id,
+                client_id: client_id.to_owned(),
+                session,
+                generation,
+                kind,
+            },
+            |message| match message {
+                ServerMessage::VideoStreamPlaylist { response, .. } => Some(response),
+                _ => return None,
+            },
+        )
+    }
+
+    pub fn video_stream_segment(
+        &self,
+        client_id: &str,
+        session: u64,
+        generation: u64,
+        index: VideoStreamSegmentIndex,
+    ) -> Result<IpcSuccess<VideoStreamSegmentPayload>, ClientFailure> {
+        self.video_request(
+            |id| ClientMessage::VideoStreamSegment {
+                id,
+                client_id: client_id.to_owned(),
+                session,
+                generation,
+                index,
+            },
+            |message| match message {
+                ServerMessage::VideoStreamSegment { response, .. } => Some(response),
+                _ => return None,
+            },
+        )
+    }
+
+    pub fn video_stream_state(
+        &self,
+        client_id: &str,
+        session: u64,
+    ) -> Result<IpcSuccess<VideoStreamStatePayload>, ClientFailure> {
+        self.video_request(
+            |id| ClientMessage::VideoStreamState {
+                id,
+                client_id: client_id.to_owned(),
+                session,
+            },
+            |message| match message {
+                ServerMessage::VideoStreamState { response, .. } => Some(response),
+                _ => return None,
+            },
+        )
+    }
+
+    pub fn video_stream_stop(
+        &self,
+        client_id: &str,
+        session: u64,
+    ) -> Result<IpcSuccess<()>, ClientFailure> {
+        self.video_request(
+            |id| ClientMessage::VideoStreamStop {
+                id,
+                client_id: client_id.to_owned(),
+                session,
+            },
+            |message| match message {
+                ServerMessage::VideoStreamStop { response, .. } => Some(response),
+                _ => return None,
+            },
+        )
+    }
+
+    fn video_request<T>(
+        &self,
+        request: impl Fn(RequestId) -> ClientMessage,
+        response: impl Fn(ServerMessage) -> Option<VideoStreamResult<T>>,
+    ) -> Result<IpcSuccess<T>, ClientFailure> {
+        self.collection_request(request).and_then(|success| {
+            let Some(routed) = response(success.value) else {
+                return Err(ClientFailure {
+                    error: ClientError::Protocol(protocol_failure(
+                        "response_route",
+                        "response_type_mismatch",
+                        None,
+                        "video stream request received another response type",
+                    )),
+                    retry_count: success.retry_count,
+                    retry_statuses: success.retry_statuses,
+                });
+            };
+            match routed {
+                VideoStreamResult::Success(value) => Ok(IpcSuccess {
+                    value,
+                    retry_count: success.retry_count,
+                    retry_statuses: success.retry_statuses,
+                    connection_id: success.connection_id,
+                }),
+                VideoStreamResult::Error(error) => Err(ClientFailure {
+                    error: ClientError::VideoStreamRemote(error),
+                    retry_count: success.retry_count,
+                    retry_statuses: success.retry_statuses,
+                }),
+            }
         })
     }
 

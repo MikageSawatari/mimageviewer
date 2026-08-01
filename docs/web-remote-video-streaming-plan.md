@@ -5,10 +5,11 @@
 
 - 親計画: [web-remote-plan.md](web-remote-plan.md) (リモート閲覧機能全体の正本)
 - ブランチ: `web-remote` (worktree: `C:\home\mimageviewer-web`)
-- 現在のフェーズ: **第 1 段 増分 5/7 実装済み** (encoder 抽象 / fallback / 画質
+- 現在のフェーズ: **第 1 段 増分 6/7 実装済み** (encoder 抽象 / fallback / 画質
   preset + 映像・音声 fMP4 segmenter / ring / m3u8 + audio tap / AAC + decoder-output
   video tap / HW download / scale / H.264 input + streaming session / remote owner 連携 /
-  generation / 設定、2026-08-01)
+  generation / 設定 + protocol v15 IPC / HTTP・HLS ルート、2026-08-02)。残りはフロント
+  (増分 7)
 
 ---
 
@@ -120,9 +121,8 @@ vendor の 6 DLL だけを配置した状態で 5 段すべての open を実測
   `libopenh264` の encoder は Constrained Baseline しか出さないため、最終段まで
   落ちたときに宣言と中身がずれる。互換性の向きとしては安全側 (Baseline の方が広く
   再生できる) だが、宣言が実体と違うと iOS のネイティブ経路で弾かれ得る
-- `src/video/stream/mod.rs` の `#![allow(dead_code)]` は、増分 5〜6 で
-  セッションから接続した時点で**外す**。それまでの間、このモジュール内の本当の
-  dead code は検出されない
+- `src/video/stream/mod.rs` の暫定 `#![allow(dead_code)]` は、増分 6 で IPC から
+  セッションへ接続した時点で外した
 
 x264 は使わない (GPLv2。mIV は MIT なので持ち込めない)。OBS が x264 を同梱できるのは
 OBS 自身が GPLv2 だからであり、**OBS のコードも設定値の写経以上の流用はしない** (§9)。
@@ -419,7 +419,7 @@ HLS のライブウィンドウ (直近 60 秒) 内は `<video>` 上で完結す
   segmenter の typed `None` を保持して HTTP 503 または上限付き wait へ写像し、200 では
   必ず非空の init、または init と最初の media segment を参照できる playlist を返す
 
-### 6.2 IPC (protocol v11)
+### 6.2 IPC (protocol v15)
 
 既存の長寿命 duplex 多重化接続 ([web-remote-plan.md](web-remote-plan.md) §9.5-9.6) に
 `ClientMessage` / `ServerMessage` の variant を追加する。**セグメントは pull 型**とし、
@@ -440,6 +440,26 @@ remote-web が HTTP 要求を受けた時に取りに行く。push 型の非同�
 返すだけで CPU をほぼ使わないため、サムネイル生成やページレンダリングと同じ枠で待たせると
 再生が途切れる。`address` は既存の `RemoteAddress` をそのまま使い、本体側で favorite
 allowlist と canonical containment を再検証する ([web-remote-plan.md](web-remote-plan.md) §12.1)。
+
+#### 増分 6 実装記録 (IPC + HTTP、2026-08-02)
+
+- `PROTOCOL_VERSION` は 14 から **15** へ更新した。動画操作、playlist、segment、state、
+  stop は既存の request/response 多重化へ追加し、segment を含め push 通知は追加していない
+- 本体は容量 32 / 4 worker の `stream` queue、remote-web は 4 枠の stream admission を持つ。
+  既存の IPC 合計 6 / heavy 4 には数えず、HTTP worker 12 のうち常に 2 枠以上を IPC 外要求へ
+  残す。stream 飽和中も heavy (thumbnail) と Home、および remote-web の `/api/list` が
+  進む回帰テストで固定する
+- `/api/video/*` と `/stream/*` は PWA shell asset の後にある fail-closed 認証 guard の
+  **下**へ配置した。全新規 route の未認証要求が path/body/IPC 処理より先に 401 となる
+  route-level test を置いた
+- generation 開始直後の playlist/init `None` は HTTP **503** + `Retry-After: 1` とする。
+  playlist/init/segment は空の成功 body を防御的にも拒否する。start の encoder readiness
+  待機だけは 7 秒上限とし、上限時は同じく 503 とする
+- remote-web と本体の両方で `RemoteAddress` の favorite allowlist、実ファイル、
+  canonical containment、対応動画拡張子を独立に検証する。seek / 画質変更後の旧 generation
+  は新しい resource を返さず 409 とする
+- API seek は通常 UI の連打 coalescing を通さず decoder seek serial を即時に進めてから
+  generation を発行する。これにより応答した generation と実際の seek を 1 対 1 に保つ
 
 ### 6.3 セッションと既存ロックの関係
 
@@ -590,7 +610,7 @@ allowlist と canonical containment を再検証する ([web-remote-plan.md](web
 | 映像 tap (decoder 分岐 + HW download + scale/NV12) | 300〜400 行 |
 | 音声 tap (pump 分岐 + resample + AAC 供給) | 200〜300 行 |
 | ストリーミングセッション管理 (本体側、既存 session lock 連携) | 300〜400 行 |
-| IPC protocol v11 拡張 + remote-web 側の中継と HTTP ルート | 400〜500 行 |
+| IPC protocol v15 拡張 + remote-web 側の中継と HTTP ルート | 400〜500 行 |
 | フロント (video 要素 + hls.js 分岐 + 自前コントロール + 画質 UI) | 400〜600 行 |
 | 合計 | **2,500〜3,500 行** |
 

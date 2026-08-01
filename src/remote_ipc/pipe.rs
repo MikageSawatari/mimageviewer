@@ -8,8 +8,8 @@ use mimageviewer_ipc::{
     ContainerResponse, HomeResponse, MAX_CONTROL_FRAME_BYTES, MediaError, MediaErrorCode,
     PIPE_NAME, PROTOCOL_VERSION, PagePriority, PageResponse, RemoteWriteError,
     RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, ServerMessage, SessionResponse,
-    SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse, negotiate, read_frame,
-    write_frame,
+    SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse, VideoStreamError,
+    VideoStreamErrorCode, VideoStreamResult, negotiate, read_frame, write_frame,
 };
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
@@ -29,8 +29,12 @@ use windows::core::PCWSTR;
 
 use super::collections::CollectionEngine;
 use super::container::ContainerEngine;
-use super::session::{SessionHandle, SessionOperation, SessionRuntime, UiWriteOutcome};
+use super::session::{
+    SessionHandle, SessionOperation, SessionRuntime, UiWriteOutcome, VideoStreamUiOutcome,
+    VideoStreamUiRequest,
+};
 use super::thumbnail::{ThumbnailEngine, WorkerContext};
+use super::video_stream::VideoStreamEngine;
 
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 const PIPE_MAX_INSTANCES: u32 = 16;
@@ -39,6 +43,8 @@ const ACCEPTOR_COUNT: usize = 4;
 const HEAVY_WORK_QUEUE_CAPACITY: usize = 16;
 const HOME_WORK_QUEUE_CAPACITY: usize = 8;
 const WRITE_WORK_QUEUE_CAPACITY: usize = 16;
+const STREAM_WORK_QUEUE_CAPACITY: usize = 32;
+const STREAM_WORKER_COUNT: usize = 4;
 
 enum Work {
     Request {
@@ -49,6 +55,14 @@ enum Work {
         session_operation: SessionOperation,
     },
     Stop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkLane {
+    Heavy,
+    Home,
+    Write,
+    Stream,
 }
 
 struct PrefetchPermit {
@@ -122,11 +136,13 @@ pub(super) struct ServerGuard {
     stop: Arc<AtomicBool>,
     listeners: Vec<std::thread::JoinHandle<()>>,
     workers: Vec<std::thread::JoinHandle<()>>,
+    stream_workers: Vec<std::thread::JoinHandle<()>>,
     home_worker: Option<std::thread::JoinHandle<()>>,
     write_worker: Option<std::thread::JoinHandle<()>>,
     heavy_work_tx: mpsc::SyncSender<Work>,
     home_work_tx: mpsc::SyncSender<Work>,
     write_work_tx: mpsc::SyncSender<Work>,
+    stream_work_tx: mpsc::SyncSender<Work>,
     session_runtime: SessionRuntime,
 }
 
@@ -157,14 +173,19 @@ impl ServerGuard {
             settings.clone(),
             session_handle.clone(),
         ));
+        let video_stream_engine = Arc::new(VideoStreamEngine::new(settings.clone()));
         let collection_engine = Arc::new(CollectionEngine::new(settings));
         let (heavy_work_tx, heavy_work_rx) = mpsc::sync_channel::<Work>(HEAVY_WORK_QUEUE_CAPACITY);
         let heavy_work_rx = Arc::new(Mutex::new(heavy_work_rx));
         let (home_work_tx, home_work_rx) = mpsc::sync_channel::<Work>(HOME_WORK_QUEUE_CAPACITY);
         let (write_work_tx, write_work_rx) = mpsc::sync_channel::<Work>(WRITE_WORK_QUEUE_CAPACITY);
+        let (stream_work_tx, stream_work_rx) =
+            mpsc::sync_channel::<Work>(STREAM_WORK_QUEUE_CAPACITY);
+        let stream_work_rx = Arc::new(Mutex::new(stream_work_rx));
         let heavy_metrics = Arc::new(QueueMetrics::new("heavy"));
         let home_metrics = Arc::new(QueueMetrics::new("home"));
         let write_metrics = Arc::new(QueueMetrics::new("write"));
+        let stream_metrics = Arc::new(QueueMetrics::new("stream"));
         let prefetch_in_flight = Arc::new(AtomicUsize::new(0));
         let home_collection_engine = Arc::clone(&collection_engine);
         let home_worker_metrics = Arc::clone(&home_metrics);
@@ -211,6 +232,23 @@ impl ServerGuard {
                     .map_err(|error| format!("remote IPC worker を開始できません: {error}"))?,
             );
         }
+        let mut stream_workers = Vec::with_capacity(STREAM_WORKER_COUNT);
+        for index in 0..STREAM_WORKER_COUNT {
+            let work_rx = Arc::clone(&stream_work_rx);
+            let engine = Arc::clone(&video_stream_engine);
+            let session = session_handle.clone();
+            let worker_metrics = Arc::clone(&stream_metrics);
+            stream_workers.push(
+                std::thread::Builder::new()
+                    .name(format!("remote-stream-ipc-{index}"))
+                    .spawn(move || {
+                        stream_worker_loop(&work_rx, &engine, &session, &worker_metrics, index)
+                    })
+                    .map_err(|error| {
+                        format!("remote IPC stream worker を開始できません: {error}")
+                    })?,
+            );
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
         let next_connection_id = Arc::new(AtomicU64::new(1));
@@ -220,9 +258,11 @@ impl ServerGuard {
             let listener_heavy_tx = heavy_work_tx.clone();
             let listener_home_tx = home_work_tx.clone();
             let listener_write_tx = write_work_tx.clone();
+            let listener_stream_tx = stream_work_tx.clone();
             let listener_heavy_metrics = Arc::clone(&heavy_metrics);
             let listener_home_metrics = Arc::clone(&home_metrics);
             let listener_write_metrics = Arc::clone(&write_metrics);
+            let listener_stream_metrics = Arc::clone(&stream_metrics);
             let listener_next_connection_id = Arc::clone(&next_connection_id);
             let listener_prefetch_in_flight = Arc::clone(&prefetch_in_flight);
             let listener_session = session_handle.clone();
@@ -234,9 +274,11 @@ impl ServerGuard {
                         listener_heavy_tx,
                         listener_home_tx,
                         listener_write_tx,
+                        listener_stream_tx,
                         listener_heavy_metrics,
                         listener_home_metrics,
                         listener_write_metrics,
+                        listener_stream_metrics,
                         listener_next_connection_id,
                         listener_prefetch_in_flight,
                         worker_count,
@@ -259,29 +301,37 @@ impl ServerGuard {
                     }
                     let _ = home_work_tx.send(Work::Stop);
                     let _ = write_work_tx.send(Work::Stop);
+                    for _ in 0..STREAM_WORKER_COUNT {
+                        let _ = stream_work_tx.send(Work::Stop);
+                    }
                     for worker in workers {
                         let _ = worker.join();
                     }
                     let _ = home_worker.join();
                     let _ = write_worker.join();
+                    for worker in stream_workers {
+                        let _ = worker.join();
+                    }
                     return Err(format!("remote IPC listener を開始できません: {error}"));
                 }
             }
         }
 
         crate::logger::log(format!(
-            "remote_ipc: listening pipe={PIPE_NAME} protocol={PROTOCOL_VERSION} heavy_workers={worker_count} configured_workers={configured_worker_count} home_workers=1 write_workers=1 prefetch_limit={} acceptors={ACCEPTOR_COUNT} multiplexed=true",
+            "remote_ipc: listening pipe={PIPE_NAME} protocol={PROTOCOL_VERSION} heavy_workers={worker_count} configured_workers={configured_worker_count} home_workers=1 write_workers=1 stream_workers={STREAM_WORKER_COUNT} prefetch_limit={} acceptors={ACCEPTOR_COUNT} multiplexed=true",
             usize::from(worker_count >= 2)
         ));
         Ok(Self {
             stop,
             listeners,
             workers,
+            stream_workers,
             home_worker: Some(home_worker),
             write_worker: Some(write_worker),
             heavy_work_tx,
             home_work_tx,
             write_work_tx,
+            stream_work_tx,
             session_runtime,
         })
     }
@@ -305,6 +355,9 @@ impl Drop for ServerGuard {
         }
         let _ = self.home_work_tx.send(Work::Stop);
         let _ = self.write_work_tx.send(Work::Stop);
+        for _ in 0..self.stream_workers.len() {
+            let _ = self.stream_work_tx.send(Work::Stop);
+        }
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
@@ -312,6 +365,9 @@ impl Drop for ServerGuard {
             let _ = worker.join();
         }
         if let Some(worker) = self.write_worker.take() {
+            let _ = worker.join();
+        }
+        for worker in self.stream_workers.drain(..) {
             let _ = worker.join();
         }
         crate::logger::log("remote_ipc: stopped".to_owned());
@@ -400,6 +456,13 @@ fn worker_loop(
                             "session control request was routed to a worker",
                         ),
                     },
+                    other @ (ClientMessage::VideoStreamStart { .. }
+                    | ClientMessage::VideoStreamControl { .. }
+                    | ClientMessage::VideoStreamSeek { .. }
+                    | ClientMessage::VideoStreamPlaylist { .. }
+                    | ClientMessage::VideoStreamSegment { .. }
+                    | ClientMessage::VideoStreamState { .. }
+                    | ClientMessage::VideoStreamStop { .. }) => service_stopped_response(&other),
                 },
             ),
             Ok(Work::Stop) | Err(_) => break,
@@ -508,6 +571,243 @@ fn write_worker_loop(
     crate::logger::log("remote_ipc: worker_stopped queue=write worker=write-0".to_owned());
 }
 
+fn stream_worker_loop(
+    work_rx: &Mutex<mpsc::Receiver<Work>>,
+    engine: &VideoStreamEngine,
+    session: &SessionHandle,
+    metrics: &QueueMetrics,
+    worker_index: usize,
+) {
+    crate::logger::log(format!(
+        "remote_ipc: worker_started queue=stream worker=stream-{worker_index}"
+    ));
+    loop {
+        let work = {
+            let receiver = work_rx.lock().unwrap_or_else(|error| error.into_inner());
+            receiver.recv()
+        };
+        let Ok(Work::Request {
+            message,
+            reply,
+            enqueued_at,
+            session_operation,
+            ..
+        }) = work
+        else {
+            break;
+        };
+        let request_id = message.id();
+        let kind = request_kind(&message);
+        let (queued, active) = metrics.started();
+        crate::logger::log(format!(
+            "remote_ipc: worker_start request_id={request_id} kind={kind} queue=stream worker=stream-{worker_index} queue_wait_ms={:.1} queued={queued} active={active}",
+            enqueued_at.elapsed().as_secs_f64() * 1000.0
+        ));
+        let started_at = Instant::now();
+        session_operation.started();
+        let response = execute_video_stream_request(message, engine, session, session_operation);
+        let outcome = response_outcome(&response);
+        let reply_ok = reply.send(response).is_ok();
+        let (queued, active) = metrics.finished();
+        crate::logger::log(format!(
+            "remote_ipc: worker_finish request_id={request_id} kind={kind} queue=stream worker=stream-{worker_index} outcome={outcome} duration_ms={:.1} reply_ok={reply_ok} queued={queued} active={active}",
+            started_at.elapsed().as_secs_f64() * 1000.0
+        ));
+    }
+    crate::logger::log(format!(
+        "remote_ipc: worker_stopped queue=stream worker=stream-{worker_index}"
+    ));
+}
+
+fn execute_video_stream_request(
+    message: ClientMessage,
+    engine: &VideoStreamEngine,
+    session: &SessionHandle,
+    operation: SessionOperation,
+) -> ServerMessage {
+    match message {
+        ClientMessage::VideoStreamStart {
+            id,
+            client_id,
+            address,
+            quality,
+        } => match engine.resolve_start_address(&address) {
+            Ok(path) => match session.submit_video_stream(
+                VideoStreamUiRequest::Start {
+                    client_id,
+                    path,
+                    quality,
+                },
+                operation,
+            ) {
+                VideoStreamUiOutcome::Started(stream) => ServerMessage::VideoStreamStart {
+                    id,
+                    response: engine.complete_start(stream),
+                },
+                VideoStreamUiOutcome::Error(error) => ServerMessage::VideoStreamStart {
+                    id,
+                    response: VideoStreamResult::Error(error),
+                },
+                _ => ServerMessage::VideoStreamStart {
+                    id,
+                    response: unexpected_video_outcome("start"),
+                },
+            },
+            Err(error) => {
+                operation.finish(false);
+                ServerMessage::VideoStreamStart {
+                    id,
+                    response: VideoStreamResult::Error(error),
+                }
+            }
+        },
+        ClientMessage::VideoStreamControl {
+            id,
+            session: stream_session,
+            action,
+            ..
+        } => match session.submit_video_stream(
+            VideoStreamUiRequest::Control {
+                session: stream_session,
+                action,
+            },
+            operation,
+        ) {
+            VideoStreamUiOutcome::Controlled(response) => ServerMessage::VideoStreamControl {
+                id,
+                response: VideoStreamResult::Success(response),
+            },
+            VideoStreamUiOutcome::Error(error) => ServerMessage::VideoStreamControl {
+                id,
+                response: VideoStreamResult::Error(error),
+            },
+            _ => ServerMessage::VideoStreamControl {
+                id,
+                response: unexpected_video_outcome("control"),
+            },
+        },
+        ClientMessage::VideoStreamSeek {
+            id,
+            session: stream_session,
+            position_secs,
+            ..
+        } => match session.submit_video_stream(
+            VideoStreamUiRequest::Seek {
+                session: stream_session,
+                position_secs,
+            },
+            operation,
+        ) {
+            VideoStreamUiOutcome::Seeked(generation) => ServerMessage::VideoStreamSeek {
+                id,
+                response: VideoStreamResult::Success(mimageviewer_ipc::VideoStreamSeekPayload {
+                    generation: generation.0,
+                }),
+            },
+            VideoStreamUiOutcome::Error(error) => ServerMessage::VideoStreamSeek {
+                id,
+                response: VideoStreamResult::Error(error),
+            },
+            _ => ServerMessage::VideoStreamSeek {
+                id,
+                response: unexpected_video_outcome("seek"),
+            },
+        },
+        ClientMessage::VideoStreamStop {
+            id,
+            session: stream_session,
+            ..
+        } => match session.submit_video_stream(
+            VideoStreamUiRequest::Stop {
+                session: stream_session,
+            },
+            operation,
+        ) {
+            VideoStreamUiOutcome::Stopped => ServerMessage::VideoStreamStop {
+                id,
+                response: VideoStreamResult::Success(()),
+            },
+            VideoStreamUiOutcome::Error(error) => ServerMessage::VideoStreamStop {
+                id,
+                response: VideoStreamResult::Error(error),
+            },
+            _ => ServerMessage::VideoStreamStop {
+                id,
+                response: unexpected_video_outcome("stop"),
+            },
+        },
+        ClientMessage::VideoStreamPlaylist {
+            id,
+            session: stream_session,
+            generation,
+            kind,
+            ..
+        } => finish_direct_video_request(
+            id,
+            operation,
+            ServerMessage::VideoStreamPlaylist {
+                id,
+                response: engine.playlist(session, stream_session, generation, kind),
+            },
+        ),
+        ClientMessage::VideoStreamSegment {
+            id,
+            session: stream_session,
+            generation,
+            index,
+            ..
+        } => finish_direct_video_request(
+            id,
+            operation,
+            ServerMessage::VideoStreamSegment {
+                id,
+                response: engine.segment(session, stream_session, generation, index),
+            },
+        ),
+        ClientMessage::VideoStreamState {
+            id,
+            session: stream_session,
+            ..
+        } => finish_direct_video_request(
+            id,
+            operation,
+            ServerMessage::VideoStreamState {
+                id,
+                response: engine.state(session, stream_session),
+            },
+        ),
+        other => {
+            operation.finish(false);
+            service_stopped_response(&other)
+        }
+    }
+}
+
+fn finish_direct_video_request(
+    id: mimageviewer_ipc::RequestId,
+    operation: SessionOperation,
+    response: ServerMessage,
+) -> ServerMessage {
+    let ownership = operation.ownership_response();
+    let response = if ownership.status == SessionStatus::Active {
+        response
+    } else {
+        ServerMessage::Session {
+            id,
+            response: ownership,
+        }
+    };
+    operation.finish(response_outcome(&response) == "ok");
+    response
+}
+
+fn unexpected_video_outcome<T>(operation: &str) -> VideoStreamResult<T> {
+    VideoStreamResult::Error(VideoStreamError::new(
+        VideoStreamErrorCode::Internal,
+        format!("動画 {operation} 応答の型が一致しません"),
+    ))
+}
+
 fn execute_work(
     message: ClientMessage,
     reply: mpsc::Sender<ServerMessage>,
@@ -563,6 +863,28 @@ fn request_kind(message: &ClientMessage) -> &'static str {
             PagePriority::Prefetch => "page_prefetch",
         },
         ClientMessage::Write { .. } => "write",
+        ClientMessage::VideoStreamStart { .. } => "video_stream_start",
+        ClientMessage::VideoStreamControl { .. } => "video_stream_control",
+        ClientMessage::VideoStreamSeek { .. } => "video_stream_seek",
+        ClientMessage::VideoStreamPlaylist { .. } => "video_stream_playlist",
+        ClientMessage::VideoStreamSegment { .. } => "video_stream_segment",
+        ClientMessage::VideoStreamState { .. } => "video_stream_state",
+        ClientMessage::VideoStreamStop { .. } => "video_stream_stop",
+    }
+}
+
+fn work_lane(message: &ClientMessage) -> WorkLane {
+    match message {
+        ClientMessage::Home { .. } => WorkLane::Home,
+        ClientMessage::Write { .. } => WorkLane::Write,
+        ClientMessage::VideoStreamStart { .. }
+        | ClientMessage::VideoStreamControl { .. }
+        | ClientMessage::VideoStreamSeek { .. }
+        | ClientMessage::VideoStreamPlaylist { .. }
+        | ClientMessage::VideoStreamSegment { .. }
+        | ClientMessage::VideoStreamState { .. }
+        | ClientMessage::VideoStreamStop { .. } => WorkLane::Stream,
+        _ => WorkLane::Heavy,
     }
 }
 
@@ -575,6 +897,13 @@ fn message_client_id(message: &ClientMessage) -> Option<&str> {
         | ClientMessage::Container { client_id, .. }
         | ClientMessage::Page { client_id, .. }
         | ClientMessage::Write { client_id, .. }
+        | ClientMessage::VideoStreamStart { client_id, .. }
+        | ClientMessage::VideoStreamControl { client_id, .. }
+        | ClientMessage::VideoStreamSeek { client_id, .. }
+        | ClientMessage::VideoStreamPlaylist { client_id, .. }
+        | ClientMessage::VideoStreamSegment { client_id, .. }
+        | ClientMessage::VideoStreamState { client_id, .. }
+        | ClientMessage::VideoStreamStop { client_id, .. }
         | ClientMessage::SessionActivity { client_id, .. } => Some(client_id),
         ClientMessage::SessionAcquire { request, .. } => Some(&request.client_id),
         ClientMessage::SessionPing { request, .. } => Some(&request.client_id),
@@ -613,6 +942,13 @@ fn operation_description(message: &ClientMessage) -> String {
             RemoteWriteRequest::GetItemState { .. } => "ページ情報を確認中",
         }
         .to_owned(),
+        ClientMessage::VideoStreamStart { .. } => "動画ストリーミングを開始中".to_owned(),
+        ClientMessage::VideoStreamControl { .. } => "動画ストリーミングを操作中".to_owned(),
+        ClientMessage::VideoStreamSeek { .. } => "動画ストリーミングをシーク中".to_owned(),
+        ClientMessage::VideoStreamPlaylist { .. } => "動画プレイリストを取得中".to_owned(),
+        ClientMessage::VideoStreamSegment { .. } => "動画セグメントを取得中".to_owned(),
+        ClientMessage::VideoStreamState { .. } => "動画ストリーミング状態を取得中".to_owned(),
+        ClientMessage::VideoStreamStop { .. } => "動画ストリーミングを停止中".to_owned(),
         ClientMessage::SessionAcquire { .. }
         | ClientMessage::SessionPing { .. }
         | ClientMessage::SessionActivity { .. } => "接続を確認中".to_owned(),
@@ -660,6 +996,34 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
         | ServerMessage::Write {
             response: RemoteWriteResponse::Success(_),
             ..
+        }
+        | ServerMessage::VideoStreamStart {
+            response: VideoStreamResult::Success(_),
+            ..
+        }
+        | ServerMessage::VideoStreamControl {
+            response: VideoStreamResult::Success(_),
+            ..
+        }
+        | ServerMessage::VideoStreamSeek {
+            response: VideoStreamResult::Success(_),
+            ..
+        }
+        | ServerMessage::VideoStreamPlaylist {
+            response: VideoStreamResult::Success(_),
+            ..
+        }
+        | ServerMessage::VideoStreamSegment {
+            response: VideoStreamResult::Success(_),
+            ..
+        }
+        | ServerMessage::VideoStreamState {
+            response: VideoStreamResult::Success(_),
+            ..
+        }
+        | ServerMessage::VideoStreamStop {
+            response: VideoStreamResult::Success(_),
+            ..
         } => "ok",
         ServerMessage::RemoteWebConnectionInfo { .. }
         | ServerMessage::Session { .. }
@@ -686,6 +1050,34 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
         | ServerMessage::Write {
             response: RemoteWriteResponse::Error(_),
             ..
+        }
+        | ServerMessage::VideoStreamStart {
+            response: VideoStreamResult::Error(_),
+            ..
+        }
+        | ServerMessage::VideoStreamControl {
+            response: VideoStreamResult::Error(_),
+            ..
+        }
+        | ServerMessage::VideoStreamSeek {
+            response: VideoStreamResult::Error(_),
+            ..
+        }
+        | ServerMessage::VideoStreamPlaylist {
+            response: VideoStreamResult::Error(_),
+            ..
+        }
+        | ServerMessage::VideoStreamSegment {
+            response: VideoStreamResult::Error(_),
+            ..
+        }
+        | ServerMessage::VideoStreamState {
+            response: VideoStreamResult::Error(_),
+            ..
+        }
+        | ServerMessage::VideoStreamStop {
+            response: VideoStreamResult::Error(_),
+            ..
         } => "error",
     }
 }
@@ -695,9 +1087,11 @@ fn acceptor_loop(
     heavy_work_tx: mpsc::SyncSender<Work>,
     home_work_tx: mpsc::SyncSender<Work>,
     write_work_tx: mpsc::SyncSender<Work>,
+    stream_work_tx: mpsc::SyncSender<Work>,
     heavy_metrics: Arc<QueueMetrics>,
     home_metrics: Arc<QueueMetrics>,
     write_metrics: Arc<QueueMetrics>,
+    stream_metrics: Arc<QueueMetrics>,
     next_connection_id: Arc<AtomicU64>,
     prefetch_in_flight: Arc<AtomicUsize>,
     heavy_worker_count: usize,
@@ -745,9 +1139,11 @@ fn acceptor_loop(
         let heavy_work_tx = heavy_work_tx.clone();
         let home_work_tx = home_work_tx.clone();
         let write_work_tx = write_work_tx.clone();
+        let stream_work_tx = stream_work_tx.clone();
         let heavy_metrics = Arc::clone(&heavy_metrics);
         let home_metrics = Arc::clone(&home_metrics);
         let write_metrics = Arc::clone(&write_metrics);
+        let stream_metrics = Arc::clone(&stream_metrics);
         let prefetch_in_flight = Arc::clone(&prefetch_in_flight);
         let session = session.clone();
         if let Err(error) = std::thread::Builder::new()
@@ -759,9 +1155,11 @@ fn acceptor_loop(
                     heavy_work_tx,
                     home_work_tx,
                     write_work_tx,
+                    stream_work_tx,
                     heavy_metrics,
                     home_metrics,
                     write_metrics,
+                    stream_metrics,
                     prefetch_in_flight,
                     heavy_worker_count,
                     session,
@@ -784,9 +1182,11 @@ fn handle_connection(
     heavy_work_tx: mpsc::SyncSender<Work>,
     home_work_tx: mpsc::SyncSender<Work>,
     write_work_tx: mpsc::SyncSender<Work>,
+    stream_work_tx: mpsc::SyncSender<Work>,
     heavy_metrics: Arc<QueueMetrics>,
     home_metrics: Arc<QueueMetrics>,
     write_metrics: Arc<QueueMetrics>,
+    stream_metrics: Arc<QueueMetrics>,
     prefetch_in_flight: Arc<AtomicUsize>,
     heavy_worker_count: usize,
     session: SessionHandle,
@@ -961,12 +1361,11 @@ fn handle_connection(
         };
         // Home は専用 worker へ分離する。重い queue が満杯でも connection reader を
         // 塞がず、後続 Home を読めるよう Busy を明示応答する。
-        let (work_tx, metrics) = if matches!(message, ClientMessage::Home { .. }) {
-            (&home_work_tx, &home_metrics)
-        } else if matches!(message, ClientMessage::Write { .. }) {
-            (&write_work_tx, &write_metrics)
-        } else {
-            (&heavy_work_tx, &heavy_metrics)
+        let (work_tx, metrics) = match work_lane(&message) {
+            WorkLane::Home => (&home_work_tx, &home_metrics),
+            WorkLane::Write => (&write_work_tx, &write_metrics),
+            WorkLane::Stream => (&stream_work_tx, &stream_metrics),
+            WorkLane::Heavy => (&heavy_work_tx, &heavy_metrics),
         };
         match enqueue_work(
             work_tx,
@@ -1110,6 +1509,34 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
                 "mIV 本体の書き込みワーカーが停止しています",
             )),
         },
+        ClientMessage::VideoStreamStart { id, .. } => ServerMessage::VideoStreamStart {
+            id: *id,
+            response: stopped_video_response(),
+        },
+        ClientMessage::VideoStreamControl { id, .. } => ServerMessage::VideoStreamControl {
+            id: *id,
+            response: stopped_video_response(),
+        },
+        ClientMessage::VideoStreamSeek { id, .. } => ServerMessage::VideoStreamSeek {
+            id: *id,
+            response: stopped_video_response(),
+        },
+        ClientMessage::VideoStreamPlaylist { id, .. } => ServerMessage::VideoStreamPlaylist {
+            id: *id,
+            response: stopped_video_response(),
+        },
+        ClientMessage::VideoStreamSegment { id, .. } => ServerMessage::VideoStreamSegment {
+            id: *id,
+            response: stopped_video_response(),
+        },
+        ClientMessage::VideoStreamState { id, .. } => ServerMessage::VideoStreamState {
+            id: *id,
+            response: stopped_video_response(),
+        },
+        ClientMessage::VideoStreamStop { id, .. } => ServerMessage::VideoStreamStop {
+            id: *id,
+            response: stopped_video_response(),
+        },
     }
 }
 
@@ -1173,7 +1600,49 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
                 "mIV 本体のリモート書き込み queue が混み合っています",
             )),
         },
+        ClientMessage::VideoStreamStart { id, .. } => ServerMessage::VideoStreamStart {
+            id: *id,
+            response: busy_video_response(),
+        },
+        ClientMessage::VideoStreamControl { id, .. } => ServerMessage::VideoStreamControl {
+            id: *id,
+            response: busy_video_response(),
+        },
+        ClientMessage::VideoStreamSeek { id, .. } => ServerMessage::VideoStreamSeek {
+            id: *id,
+            response: busy_video_response(),
+        },
+        ClientMessage::VideoStreamPlaylist { id, .. } => ServerMessage::VideoStreamPlaylist {
+            id: *id,
+            response: busy_video_response(),
+        },
+        ClientMessage::VideoStreamSegment { id, .. } => ServerMessage::VideoStreamSegment {
+            id: *id,
+            response: busy_video_response(),
+        },
+        ClientMessage::VideoStreamState { id, .. } => ServerMessage::VideoStreamState {
+            id: *id,
+            response: busy_video_response(),
+        },
+        ClientMessage::VideoStreamStop { id, .. } => ServerMessage::VideoStreamStop {
+            id: *id,
+            response: busy_video_response(),
+        },
     }
+}
+
+fn stopped_video_response<T>() -> VideoStreamResult<T> {
+    VideoStreamResult::Error(VideoStreamError::new(
+        VideoStreamErrorCode::Internal,
+        "mIV 本体の動画ストリーミングワーカーが停止しています",
+    ))
+}
+
+fn busy_video_response<T>() -> VideoStreamResult<T> {
+    VideoStreamResult::Error(VideoStreamError::new(
+        VideoStreamErrorCode::Busy,
+        "mIV 本体の動画ストリーミング queue が混み合っています",
+    ))
 }
 
 fn frame_error_kind(error: &mimageviewer_ipc::FrameError) -> &'static str {
@@ -1482,6 +1951,49 @@ mod tests {
 
         let (home_tx, home_rx) = mpsc::sync_channel(1);
         home_tx.try_send(Work::Stop).unwrap();
+        assert!(matches!(home_rx.try_recv(), Ok(Work::Stop)));
+    }
+
+    #[test]
+    fn full_stream_queue_does_not_consume_thumbnail_or_list_lanes() {
+        let segment = ClientMessage::VideoStreamSegment {
+            id: 80,
+            client_id: "test-client".to_owned(),
+            session: 1,
+            generation: 2,
+            index: mimageviewer_ipc::VideoStreamSegmentIndex::Media { sequence: 3 },
+        };
+        let thumbnail = ClientMessage::Thumbnail {
+            id: 81,
+            client_id: "test-client".to_owned(),
+            request: mimageviewer_ipc::ThumbnailRequest {
+                address: mimageviewer_ipc::RemoteAddress::file(
+                    "00000000-0000-0000-0000-000000000000",
+                    "page.jpg",
+                ),
+                target_px: 256,
+            },
+        };
+        let home = ClientMessage::Home {
+            id: 82,
+            client_id: "test-client".to_owned(),
+            request: mimageviewer_ipc::HomeRequest,
+        };
+        assert_eq!(work_lane(&segment), WorkLane::Stream);
+        assert_eq!(work_lane(&thumbnail), WorkLane::Heavy);
+        assert_eq!(work_lane(&home), WorkLane::Home);
+
+        let (stream_tx, _stream_rx) = mpsc::sync_channel(1);
+        stream_tx.try_send(Work::Stop).unwrap();
+        assert!(matches!(
+            stream_tx.try_send(Work::Stop),
+            Err(mpsc::TrySendError::Full(Work::Stop))
+        ));
+        let (heavy_tx, heavy_rx) = mpsc::sync_channel(1);
+        let (home_tx, home_rx) = mpsc::sync_channel(1);
+        heavy_tx.try_send(Work::Stop).unwrap();
+        home_tx.try_send(Work::Stop).unwrap();
+        assert!(matches!(heavy_rx.try_recv(), Ok(Work::Stop)));
         assert!(matches!(home_rx.try_recv(), Ok(Work::Stop)));
     }
 

@@ -655,6 +655,14 @@ impl Fmp4Segmenter {
         self.ring.get(sequence)
     }
 
+    pub(crate) fn buffered_duration_secs(&self) -> f64 {
+        self.ring.buffered_duration_secs()
+    }
+
+    pub(crate) fn effective_bitrate_bps(&self) -> u64 {
+        self.ring.effective_bitrate_bps()
+    }
+
     #[cfg(test)]
     pub(crate) fn media_sequence(&self) -> u64 {
         self.ring.media_sequence()
