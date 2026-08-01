@@ -222,13 +222,18 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 
 1. **縦串** — IPC・セッションロック・認証の本実装、ZIP / PDF、本読み (見開き)、
    補正反映 (既存ヘッドレス合成の利用)、ブックマーク・読書履歴の読み書き
-2. **仕上げ** — 動画 (直接再生 + fMP4 remux + 非対応時の音声フォールバック)、音声再生と
-   音量ノーマライズ (WebAudio GainNode。`volume` 属性だけでは減衰しかできない)、検索
-   (Ctrl+S / F / G 相当)、タグ・レーティング、AI アップスケール・カラー化のヘッドレス化、
+2. **仕上げ** — 動画・音声のストリーミング配信、検索 (Ctrl+S / F / G 相当)、
+   タグ・レーティング、AI アップスケール・カラー化のヘッドレス化、
    接続診断ウィザード、exe 埋め込みと配布
 
-**動画のトランスコードは実装しない。** コンテナ非対応 (MKV 等) は remux で救い、
-コーデック非対応 (HEVC / AV1 / WMV) は音声フォールバックに逃がす。
+**動画は PC 側で H.264 + AAC へ再エンコードし、HLS で配信する (2026-08-01 に方針変更)。**
+正本は [web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md)。
+
+当初は「トランスコードは実装しない。コンテナ非対応 (MKV 等) は remux で救い、コーデック
+非対応 (HEVC / AV1 / WMV) は音声フォールバックに逃がす」としていたが、この方針では
+**コーデック非対応**と**回線帯域不足**という 2 つのリスクが構造的に残るため撤回した。
+remux と音声フォールバックはトランスコードの下位互換なので、どちらも実装しない。
+音量ノーマライズもサーバ側で処理済みの PCM を送るため、Web 側の WebAudio GainNode は不要になる。
 
 ## 6. 運用ルール
 
@@ -499,8 +504,9 @@ Windows Home では RDP のサーバ側を使えないが、この層も次の�
 - **重要度が上がる項目** (スマートフォンが唯一のターゲットになったため):
   PWA / ホーム画面登録、通信断からの復帰、iOS のバックグラウンド復帰時の状態保持、
   片手での到達性、従量課金回線への配慮 (画質を落とすトグル / 通信量表示)
-- fMP4 remux は維持する。スマートフォンのライブラリに MKV は普通に存在し、
-  300〜600 行で「再生できる / できない」が変わるため費用対効果が高い
+- 動画は PC 側トランスコード + HLS 配信に一本化する (2026-08-01)。当初維持するとしていた
+  fMP4 remux は、コンテナ非対応しか救えず帯域も元ファイルのままなので採らない。
+  正本は [web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md)
 - ユーザー向けマニュアルには「ノート PC からはリモートデスクトップやネットワークドライブ
   という選択肢がある」と正直に書く。信頼とサポート負荷削減の双方に効く
 
@@ -894,3 +900,21 @@ RTL の横方向入力は画面上の方向を反転し、左 swipe / 左 tap zo
 逆方向1ページ、同時1件、LRU 12件 / 32 MiB、foreground 優先と abort 条件は維持する。
 次の対象が2ページ組なら同じグループ寸法で各ページの要求幅を計算するため、先読み cache key と
 foreground 要求が一致する。
+
+実機で見開き全体が viewport へ収まらない事象を確認した。縮尺の純粋関数は2ページ合計を使って
+いたが、DOM の `.viewer-pages` は計算済みの塊寸法を受け取らず `width: max-content` に依存して
+いた。WebKit の flex intrinsic sizing では decode 後画像の intrinsic size が塊幅へ使われ得るため、
+画像ごとの inline width と実際の flex container 幅が一致しなかった。塊の CSS width / height を
+layout 結果に含め、page layer と各 flex item の width / height を明示する。
+
+左右の高さが異なる場合は本体と同様、`H=max(left.height,right.height)` を共通の基準高とし、各幅を
+`Wi=page.width*H/page.height` へ正規化する。全体 fit は
+`scale=min((viewport.width-gap)/(Wleft+Wright), viewport.height/H)`、幅 fit は第1項だけ、原寸は
+`scale=1` とする。塊幅は `Wleft*scale + gap + Wright*scale`、塊高は `H*scale`。各 `/api/page`
+要求幅もこの最終 page width × DPR から決める。単ページ・横長単独・縦持ち Single は従来の
+`viewerImageLayout` を通し、gap を0へ戻す。
+
+前後移動が範囲外になる操作は無反応にせず、画面下部の半透明 status overlay を2.4秒表示する。
+LTR は「先頭ページです」「最終ページです」。RTL はそれぞれ
+「先頭ページです（右→左綴じ：次は左をタップ）」、
+「最終ページです（右→左綴じ：前は右をタップ）」とし、overlay は pointer input を遮らない。
