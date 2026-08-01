@@ -6,7 +6,16 @@ export function defaultLocalSettings() {
     version: LOCAL_SETTINGS_VERSION,
     portraitSinglePage: true,
     gestureHelpDismissed: false,
+    gridColumnsPortrait: 0,
+    gridColumnsLandscape: 0,
   };
+}
+
+function normalizeGridColumns(value, fallback) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  const columns = Math.round(value);
+  if (columns === 0) return 0;
+  return Math.min(8, Math.max(2, columns));
 }
 
 export function normalizeLocalSettings(value) {
@@ -24,6 +33,14 @@ export function normalizeLocalSettings(value) {
       typeof value.gestureHelpDismissed === "boolean"
         ? value.gestureHelpDismissed
         : defaults.gestureHelpDismissed,
+    gridColumnsPortrait: normalizeGridColumns(
+      value.gridColumnsPortrait,
+      defaults.gridColumnsPortrait
+    ),
+    gridColumnsLandscape: normalizeGridColumns(
+      value.gridColumnsLandscape,
+      defaults.gridColumnsLandscape
+    ),
   };
 }
 

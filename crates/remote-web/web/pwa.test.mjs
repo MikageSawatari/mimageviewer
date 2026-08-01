@@ -75,8 +75,11 @@ test("image tiles preserve portrait and landscape shape below a separate label r
   const app = await readFile(new URL("app.js", here), "utf8");
   assert.match(css, /\.grid-tile\.image-tile \.tile-preview img\s*\{[^}]*object-fit:\s*contain/);
   assert.match(css, /\.grid-tile\s*\{[^}]*grid-template-rows:\s*var\(--grid-preview-height\) var\(--grid-label-height\)/);
-  assert.match(css, /\.grid-tile\.grid-active::after\s*\{[^}]*inset 0 0 0 3px var\(--accent\)/);
+  assert.match(css, /\.grid-cursor-visible \.grid-tile\.grid-active::after\s*\{[^}]*inset 0 0 0 3px var\(--accent\)/);
+  assert.match(css, /\.grid-tile:focus-visible::after\s*\{[^}]*inset 0 0 0 3px var\(--accent\)/);
   assert.match(app, /tile\.append\(preview, label\)/);
+  assert.match(app, /label\.append\([\s\S]*entry-detail-badge/);
+  assert.doesNotMatch(css, /\.entry-detail-badge\s*\{[^}]*position:\s*absolute/);
 });
 
 async function pngDimensions(relativePath) {

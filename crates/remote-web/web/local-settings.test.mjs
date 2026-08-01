@@ -15,6 +15,8 @@ test("local settings use the current defaults when no value exists", () => {
     version: 1,
     portraitSinglePage: true,
     gestureHelpDismissed: false,
+    gridColumnsPortrait: 0,
+    gridColumnsLandscape: 0,
   });
 });
 
@@ -35,6 +37,8 @@ test("local settings serialize and restore as one versioned value", () => {
     version: 1,
     portraitSinglePage: false,
     gestureHelpDismissed: true,
+    gridColumnsPortrait: 3,
+    gridColumnsLandscape: 7,
   };
   assert.deepEqual(parseLocalSettings(serializeLocalSettings(settings)), settings);
 });
@@ -52,11 +56,15 @@ test("storage failures use in-memory defaults and never escape", () => {
     version: 1,
     portraitSinglePage: false,
     gestureHelpDismissed: true,
+    gridColumnsPortrait: 4,
+    gridColumnsLandscape: 6,
   }, unavailable), {
     settings: {
       version: 1,
       portraitSinglePage: false,
       gestureHelpDismissed: true,
+      gridColumnsPortrait: 4,
+      gridColumnsLandscape: 6,
     },
     saved: false,
   });
@@ -72,6 +80,8 @@ test("storage helpers use one aggregate key", () => {
     version: 1,
     portraitSinglePage: false,
     gestureHelpDismissed: true,
+    gridColumnsPortrait: 2,
+    gridColumnsLandscape: 8,
   }, storage);
   assert.equal(saved.saved, true);
   assert.equal(values.size, 1);
@@ -86,6 +96,43 @@ test("older version-one values add the gesture help default", () => {
       version: 1,
       portraitSinglePage: false,
       gestureHelpDismissed: false,
+      gridColumnsPortrait: 0,
+      gridColumnsLandscape: 0,
+    }
+  );
+});
+
+test("grid column settings clamp per field without replacing existing values", () => {
+  assert.deepEqual(
+    parseLocalSettings(JSON.stringify({
+      version: 1,
+      portraitSinglePage: false,
+      gestureHelpDismissed: true,
+      gridColumnsPortrait: 1,
+      gridColumnsLandscape: 99,
+    })),
+    {
+      version: 1,
+      portraitSinglePage: false,
+      gestureHelpDismissed: true,
+      gridColumnsPortrait: 2,
+      gridColumnsLandscape: 8,
+    }
+  );
+  assert.deepEqual(
+    parseLocalSettings(JSON.stringify({
+      version: 1,
+      portraitSinglePage: false,
+      gestureHelpDismissed: true,
+      gridColumnsPortrait: 0,
+      gridColumnsLandscape: "6",
+    })),
+    {
+      version: 1,
+      portraitSinglePage: false,
+      gestureHelpDismissed: true,
+      gridColumnsPortrait: 0,
+      gridColumnsLandscape: 0,
     }
   );
 });

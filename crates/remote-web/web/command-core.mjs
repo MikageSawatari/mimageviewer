@@ -525,6 +525,10 @@ export function shouldShowKeyboardShortcuts({
   return !coarsePointer || Boolean(keyboardUsed);
 }
 
+export function shouldShowGridCursor({ keyboardAvailable = false } = {}) {
+  return Boolean(keyboardAvailable);
+}
+
 export function viewerWheelCommand(deltaY, zoomModifier) {
   if (!Number.isFinite(deltaY) || deltaY === 0) return null;
   if (zoomModifier) {
@@ -536,7 +540,8 @@ export function viewerWheelCommand(deltaY, zoomModifier) {
 export function gridLayoutForWidth(
   containerWidth,
   aspectHeightRatio,
-  labelHeight = 38
+  labelHeight = 38,
+  columnOverride = 0
 ) {
   const width = Math.max(1, Number(containerWidth) || 1);
   const inset = width >= 900 ? 20 : 10;
@@ -544,7 +549,8 @@ export function gridLayoutForWidth(
   const compact = availableWidth < 600;
   const gap = compact ? 8 : 12;
   const targetCellWidth = compact ? 132 : availableWidth < 1000 ? 180 : 210;
-  const columns = Math.max(
+  const resolvedColumnOverride = clampGridColumnOverride(columnOverride);
+  const columns = resolvedColumnOverride || Math.max(
     1,
     Math.ceil((availableWidth + gap) / (targetCellWidth + gap))
   );
@@ -571,6 +577,34 @@ export function gridLayoutForWidth(
     inset,
     targetCellWidth,
   };
+}
+
+export function clampGridColumnOverride(value) {
+  const requested = Math.round(Number(value));
+  if (!Number.isFinite(requested) || requested === 0) return 0;
+  return Math.min(8, Math.max(2, requested));
+}
+
+export function gridColumnOverrideForViewport(
+  viewportWidth,
+  viewportHeight,
+  {
+    gridColumnsPortrait = 0,
+    gridColumnsLandscape = 0,
+  } = {}
+) {
+  const width = Math.max(0, Number(viewportWidth) || 0);
+  const height = Math.max(0, Number(viewportHeight) || 0);
+  return clampGridColumnOverride(
+    width >= height ? gridColumnsLandscape : gridColumnsPortrait
+  );
+}
+
+export function gridLabelHeightForEntries(entries) {
+  const hasDetail = Array.isArray(entries) && entries.some(
+    (entry) => Boolean(entry?.detail) || Boolean(entry?.rating)
+  );
+  return hasDetail ? 56 : 38;
 }
 
 export function gridScrollExtent(rowCount, rowPitch, viewportHeight) {

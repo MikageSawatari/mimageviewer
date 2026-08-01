@@ -8,6 +8,8 @@ import {
   commandFromKey,
   containerPageTargetPx,
   createReadingProgressBatch,
+  gridColumnOverrideForViewport,
+  gridLabelHeightForEntries,
   gridLayoutForWidth,
   gridScrollExtent,
   gridIndexForCommand,
@@ -24,6 +26,7 @@ import {
   thumbnailRequestConcurrency,
   thumbnailRequestStartCount,
   thumbnailRetryDecision,
+  shouldShowGridCursor,
   shouldShowLoadingIndicator,
   shouldShowKeyboardShortcuts,
   viewerGestureDecision,
@@ -331,6 +334,7 @@ const state = {
 
 let recentPointerSource = { source: "mouse", at: 0 };
 if (!RUNTIME_TEST_MODE) {
+  updateKeyboardAvailability();
   window.addEventListener("popstate", () => {
     acquireRemoteSession("browser_history")
       .then(() => dispatchRoute())
@@ -1165,12 +1169,7 @@ function onGlobalKeyDown(event) {
   state.remoteSessionUserActive = true;
   if (!state.keyboardInputSeen) {
     state.keyboardInputSeen = true;
-    state.commandMenu?.setKeyboardAvailable(
-      shouldShowKeyboardShortcuts({
-        coarsePointer: state.coarsePointer,
-        keyboardUsed: true,
-      })
-    );
+    updateKeyboardAvailability();
   }
   if (!state.authenticated || event.isComposing) return;
   if (
@@ -1197,6 +1196,18 @@ function onGlobalKeyDown(event) {
   if (!requested) return;
   event.preventDefault();
   dispatchCommand(requested, { source: "keyboard", detail: event.key });
+}
+
+function updateKeyboardAvailability() {
+  const keyboardAvailable = shouldShowKeyboardShortcuts({
+    coarsePointer: state.coarsePointer,
+    keyboardUsed: state.keyboardInputSeen,
+  });
+  state.commandMenu?.setKeyboardAvailable(keyboardAvailable);
+  app.classList.toggle(
+    "grid-cursor-visible",
+    shouldShowGridCursor({ keyboardAvailable })
+  );
 }
 
 function isShortcutBlockedTarget(target) {
@@ -2158,6 +2169,7 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
   const imageIndexes = new Map(
     state.images.map((entry, index) => [entryIdentity(entry), index])
   );
+  const labelHeight = gridLabelHeightForEntries(state.entries);
   state.virtualGrid = new VirtualGrid(
     scroll,
     space,
@@ -2166,7 +2178,8 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
     (entry, index, cellWidth) =>
       createGridTile(entry, index, imageIndexes, state.thumbnailTracker, cellWidth),
     (initialItems) => state.thumbnailTracker?.begin(initialItems),
-    state.thumbAspectHeightRatio
+    state.thumbAspectHeightRatio,
+    labelHeight
   );
   state.virtualGrid.focusIndex(state.gridIndex, false);
   if (listMetrics) {
@@ -2388,13 +2401,15 @@ function createGridTile(
       });
     }
   }
-  if (entry.detail || entry.rating) {
-    preview.append(
-      textElement("span", entry.detail ?? `★${entry.rating}`, "entry-detail-badge")
+  const label = element("span", "tile-label");
+  label.append(textElement("span", entry.name, "tile-name"));
+  const detail = entry.detail || (entry.rating ? "★" + entry.rating : "");
+  if (detail) {
+    label.append(
+      textElement("span", detail, "entry-detail-badge")
     );
   }
-  const label = textElement("span", entry.name, "tile-label");
-  if (entry.detail) label.title = `${entry.name} — ${entry.detail}`;
+  if (detail) label.title = entry.name + " — " + detail;
   tile.append(preview, label);
   tile._thumbnailBinding = { image, entry, tracker: thumbnailTracker, cellWidth };
   return tile;
@@ -3173,7 +3188,8 @@ class VirtualGrid {
     items,
     renderCell,
     onInitialItems,
-    aspectHeightRatio
+    aspectHeightRatio,
+    labelHeight
   ) {
     this.scroller = scroller;
     this.space = space;
@@ -3182,6 +3198,7 @@ class VirtualGrid {
     this.renderCell = renderCell;
     this.onInitialItems = onInitialItems;
     this.aspectHeightRatio = aspectHeightRatio;
+    this.requestedLabelHeight = labelHeight;
     this.initialItemsReported = false;
     this.cells = new Map();
     this.columns = 1;
@@ -3239,7 +3256,13 @@ class VirtualGrid {
         : 0;
     const layout = gridLayoutForWidth(
       this.scroller.clientWidth,
-      this.aspectHeightRatio
+      this.aspectHeightRatio,
+      this.requestedLabelHeight,
+      gridColumnOverrideForViewport(
+        this.scroller.clientWidth,
+        this.scroller.clientHeight,
+        state.localSettings
+      )
     );
     if (
       layout.columns !== this.columns ||
@@ -3967,6 +3990,58 @@ class LocalSettingsDialog {
     );
     option.append(checkbox, copy);
 
+    const columnOption = (field, title, description) => {
+      const row = element(
+        "label",
+        "local-settings-option local-settings-column-option"
+      );
+      const rowCopy = element("span", "local-settings-copy");
+      rowCopy.append(
+        textElement("strong", title),
+        textElement("small", description)
+      );
+      const select = element("select", "local-settings-select");
+      select.setAttribute("aria-label", title);
+      for (const [value, label] of [
+        [0, "自動"],
+        [2, "2 列"],
+        [3, "3 列"],
+        [4, "4 列"],
+        [5, "5 列"],
+        [6, "6 列"],
+        [7, "7 列"],
+        [8, "8 列"],
+      ]) {
+        const choice = textElement("option", label);
+        choice.value = String(value);
+        select.append(choice);
+      }
+      select.value = String(state.localSettings[field]);
+      select.addEventListener("change", () => {
+        const saved = saveLocalSettings({
+          ...state.localSettings,
+          [field]: Number(select.value),
+        });
+        state.localSettings = saved.settings;
+        state.localSettingsStorageAvailable = saved.saved;
+        select.value = String(state.localSettings[field]);
+        this.updateStorageStatus();
+        state.virtualGrid?.layout();
+      });
+      row.append(rowCopy, select);
+      return row;
+    };
+    const portraitColumns = columnOption(
+      "gridColumnsPortrait",
+      "縦持ちの列数",
+      "自動では画面幅に合わせて列数を決めます。"
+    );
+    const landscapeColumns = columnOption(
+      "gridColumnsLandscape",
+      "横持ちの列数",
+      "横持ちの実測サイズに切り替わったときだけ使います。"
+    );
+
     this.status = textElement("p", "", "local-settings-status");
     this.updateStorageStatus();
     checkbox.addEventListener("change", () => {
@@ -3987,7 +4062,13 @@ class LocalSettingsDialog {
       }
     });
 
-    panel.append(header, option, this.status);
+    panel.append(
+      header,
+      option,
+      portraitColumns,
+      landscapeColumns,
+      this.status
+    );
     this.root.append(scrim, panel);
     this.root.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {

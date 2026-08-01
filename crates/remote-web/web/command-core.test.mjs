@@ -7,9 +7,12 @@ import {
   ReadingDirection,
   SpreadMode,
   ViewerGesture,
+  clampGridColumnOverride,
   commandFromKey,
   containerPageTargetPx,
   createReadingProgressBatch,
+  gridColumnOverrideForViewport,
+  gridLabelHeightForEntries,
   gridLayoutForWidth,
   gridScrollExtent,
   gridIndexForCommand,
@@ -29,6 +32,7 @@ import {
   thumbnailRequestConcurrency,
   thumbnailRequestStartCount,
   thumbnailRetryDecision,
+  shouldShowGridCursor,
   shouldShowLoadingIndicator,
   shouldShowKeyboardShortcuts,
   sessionOwnerBadge,
@@ -568,6 +572,20 @@ test("keyboard help defaults to pointer capability and remembers real key input"
   );
 });
 
+test("grid cursor uses the same keyboard-availability signal as shortcut hints", () => {
+  for (const input of [
+    { coarsePointer: false, keyboardUsed: false },
+    { coarsePointer: true, keyboardUsed: false },
+    { coarsePointer: true, keyboardUsed: true },
+  ]) {
+    const keyboardAvailable = shouldShowKeyboardShortcuts(input);
+    assert.equal(
+      shouldShowGridCursor({ keyboardAvailable }),
+      keyboardAvailable
+    );
+  }
+});
+
 test("grid navigation uses columns, page rows and clamps to valid entries", () => {
   const base = { current: 5, count: 20, columns: 4, pageRows: 3 };
   assert.equal(gridIndexForCommand({ ...base, name: CommandName.GRID_DOWN }), 9);
@@ -601,6 +619,64 @@ test("grid layout derives columns from target width and applies the tile aspect"
   assert.equal(gridLayoutForWidth(1280, 1).columns, 6);
   assert.equal(gridLayoutForWidth(1920, 1).columns, 9);
   assert.equal(gridLayoutForWidth(390, Number.NaN).previewHeight, 118);
+});
+
+test("grid label height is chosen once from collection metadata", () => {
+  const plainContainerEntries = [
+    { kind: "image", name: "1.jpg" },
+    { kind: "image", name: "2.jpg" },
+  ];
+  assert.equal(gridLabelHeightForEntries(plainContainerEntries), 38);
+  assert.equal(
+    gridLabelHeightForEntries([
+      plainContainerEntries[0],
+      { kind: "pdf", name: "book.pdf", detail: "20 ページ" },
+      plainContainerEntries[1],
+    ]),
+    56
+  );
+  assert.equal(
+    gridLabelHeightForEntries([
+      plainContainerEntries[0],
+      { kind: "image", name: "rated.jpg", rating: 4 },
+    ]),
+    56
+  );
+  const sharedHeight = gridLabelHeightForEntries([
+    { name: "plain" },
+    { name: "progress", detail: "3 / 20 ページ" },
+  ]);
+  const tileHeights = [1, 2].map(
+    () => gridLayoutForWidth(440, 1, sharedHeight).tileHeight
+  );
+  assert.equal(new Set(tileHeights).size, 1);
+  assert.equal(tileHeights[0], 155);
+});
+
+test("grid column override clamps, returns to auto, and selects by measured size", () => {
+  assert.equal(clampGridColumnOverride(0), 0);
+  assert.equal(clampGridColumnOverride(1), 2);
+  assert.equal(clampGridColumnOverride(-5), 2);
+  assert.equal(clampGridColumnOverride(20), 8);
+  assert.equal(gridLayoutForWidth(440, 1, 38, 2).columns, 2);
+  assert.equal(gridLayoutForWidth(440, 1, 38, 8).columns, 8);
+  const overridden = gridLayoutForWidth(440, 1.5, 56, 8);
+  assert.equal(overridden.cellWidth, 45.5);
+  assert.equal(overridden.previewHeight, 68);
+  assert.equal(overridden.tileHeight, 124);
+  assert.equal(overridden.rowPitch, 132);
+  assert.equal(
+    gridLayoutForWidth(440, 1, 38, 0).columns,
+    gridLayoutForWidth(440, 1).columns
+  );
+
+  const settings = {
+    gridColumnsPortrait: 3,
+    gridColumnsLandscape: 7,
+  };
+  assert.equal(gridColumnOverrideForViewport(440, 900, settings), 3);
+  assert.equal(gridColumnOverrideForViewport(956, 440, settings), 7);
+  assert.equal(gridColumnOverrideForViewport(440, 440, settings), 7);
 });
 
 test("grid scroll extent and snapping stay on whole row boundaries", () => {
