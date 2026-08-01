@@ -249,13 +249,16 @@
   登録しないまま return する**。したがって cache にも pending にも入らず、ガードが毎フレーム
   通り、`start_fs_load` が延々と呼ばれ続ける。**「retained にあるから描画不要」と
   「ロードが完了した」を同じ経路で表現できていない**のが構造的な誤り。
-- **未確定 (idx=20 側、着手時に確定させること)**: 通常経路へ落ちるはずの idx=20 が、なぜ毎フレーム
-  `fs_pending` から消えて再入するのか。候補は 2 つ:
-  1. `pdf_target_changed` → `update_prefetch_window` 経路が pending を落としている。
-  2. retained store が `entries=10 / max_entries=10` で**満杯**であり、一方のページの store が
-     もう一方の entry を evict する相互 evict スラッシュになっている
-     (同セッションに `Retained page evict` が 21 行ある)。見開きは 2 ページが同時に同じ store を
-     奪い合うので、片側だけで再現しない可能性がある。
+- **確定した再入経路 (idx=20 側)**: 原因は
+  `pdf_target_changed` → `update_prefetch_window(fs_idx=19)`。`update_prefetch_window` は
+  `!fs_cache.contains_key(current_idx)` だけで現在ページをロード中と判定し、その間は current 以外の
+  `fs_pending` を全て remove + cancel する。idx=19 は retained final-AI から表示できる一方で
+  `fs_cache` には入らないため、各描画 pass で idx=20 の pending が落ち、次の見開きロードガードが
+  idx=20 を再投入していた。実ログの `211.018s` (idx=19 open) から `257.744s` (補正変更) まで
+  46.726 秒を再集計すると、idx=20 の `resolution_mismatch` は 7,576 回、Page 21 の cancel は
+  7,516 回、同区間の `Retained page evict` / idx=20 store / Page 21 render 完了はすべて **0 回**。
+  よって候補 2 の満杯 store による相互 evict は当該再入の原因ではない。source inspection でも、
+  current の完了が無い同区間に別 idx の pending を反復除去できる call site はこの経路だけである。
 - **症状パッチにしないこと**: 解像度一致判定 (`0.9..=1.1`) の閾値を緩める、キャンセルを止める、
   再入を時間で抑制する、はいずれも根本原因に対応しない。producer (retained store / render 完了) と
   consumer (表示・再入ガード) が「このページは表示可能か」について**同じ 1 つの状態**を見る形に

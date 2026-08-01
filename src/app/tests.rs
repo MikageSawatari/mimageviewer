@@ -23461,6 +23461,227 @@ mod pipeline_cache_refactor_tests {
             .expect("AI-enabled PDF test params should produce a final key")
     }
 
+    fn store_matching_pdf_final_ai(
+        app: &mut App,
+        idx: usize,
+        edit_size: [usize; 2],
+        pixels: Arc<egui::ColorImage>,
+    ) -> FinalAiKey {
+        let key = pdf_final_ai_key(app, idx, edit_size);
+        let retained_key = app
+            .retained_final_ai_key_for(idx, key, edit_size)
+            .expect("PDF retained final key");
+        assert!(app.insert_retained_pdf_final_ai(idx, retained_key, pixels));
+        key
+    }
+
+    #[test]
+    fn fs_page_load_state_prevents_same_idx_same_params_reentry() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_pdf_page(&mut app, r"C:\books\pending.pdf", 0);
+        app.visible_indices = vec![idx];
+        app.fullscreen_idx = Some(idx);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let input_seq = app.input_seq;
+        app.fs_pending
+            .insert(idx, (Arc::clone(&cancel), rx, input_seq));
+
+        for _ in 0..120 {
+            assert_eq!(app.ensure_fs_page_load(idx), FsPageLoadState::LoadPending);
+            let active_cancel = &app.fs_pending.get(&idx).expect("same pending request").0;
+            assert!(
+                Arc::ptr_eq(active_cancel, &cancel),
+                "the per-frame guard must not replace an equivalent in-flight request"
+            );
+        }
+
+        tx.send(FsLoadResult::StaticCached {
+            pixels: Arc::new(egui::ColorImage::new([2, 2], vec![egui::Color32::WHITE; 4])),
+            source_dims: [2, 2],
+        })
+        .unwrap();
+        app.poll_prefetch(&ctx);
+
+        assert_eq!(
+            app.fs_page_load_state(idx),
+            FsPageLoadState::DisplayReady(FsPageDisplaySource::LiveCache)
+        );
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn pdf_spread_reaches_both_pages_without_user_input() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        enable_pdf_final_ai_params(&mut app);
+        let left = push_pdf_page(&mut app, r"C:\books\spread.pdf", 19);
+        let right = push_pdf_page(&mut app, r"C:\books\spread.pdf", 20);
+        app.visible_indices = vec![left, right];
+        app.details_order = vec![left, right];
+        app.fullscreen_idx = Some(left);
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        assert_eq!(
+            app.resolve_spread_pair(left),
+            SpreadPair::Double { left, right }
+        );
+
+        store_matching_pdf_final_ai(
+            &mut app,
+            left,
+            [4, 4],
+            Arc::new(egui::ColorImage::new(
+                [8, 8],
+                vec![egui::Color32::from_rgb(40, 50, 60); 64],
+            )),
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let right_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let input_seq = app.input_seq;
+        app.fs_pending
+            .insert(right, (Arc::clone(&right_cancel), rx, input_seq));
+
+        // Repeated display-target reconciliation must not classify the retained left page as
+        // loading and cancel the right page on every frame.
+        for _ in 0..120 {
+            app.update_prefetch_window(left);
+            assert!(app.fs_pending.contains_key(&right));
+            assert!(!right_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        }
+
+        tx.send(FsLoadResult::StaticCached {
+            pixels: Arc::new(egui::ColorImage::new(
+                [4, 4],
+                vec![egui::Color32::LIGHT_BLUE; 16],
+            )),
+            source_dims: [4, 4],
+        })
+        .unwrap();
+        app.poll_prefetch(&ctx);
+
+        assert!(
+            app.ensure_final_composite_texture(&ctx, left).is_some(),
+            "retained left page should materialize a display texture"
+        );
+        assert!(
+            app.resolve_fs_display_tex(right, true).is_some(),
+            "right page render should finish without any user operation"
+        );
+        assert!(app.fs_page_load_state(left).is_display_ready());
+        assert!(app.fs_page_load_state(right).is_display_ready());
+    }
+
+    #[test]
+    fn full_retained_store_keeps_both_spread_page_slots_stable() {
+        let mut app = setup_app();
+        app.settings.retained_final_ai_cache_max_entries = 10;
+        app.settings.retained_final_ai_cache_max_mib = 64;
+
+        for ordinal in 0..8 {
+            let idx = push_image(&mut app, &format!(r"C:\imgs\{ordinal:02}.png"));
+            let key = FinalAiKey {
+                edit_key: dummy_edit_key(&app, idx),
+                color_ai_hash: ordinal as u64 + 1,
+                bg: 0,
+            };
+            assert!(app.insert_retained_final_ai(
+                idx,
+                key,
+                [1, 1],
+                Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK],)),
+            ));
+        }
+
+        enable_pdf_final_ai_params(&mut app);
+        let left = push_pdf_page(&mut app, r"C:\books\full-spread.pdf", 19);
+        let right = push_pdf_page(&mut app, r"C:\books\full-spread.pdf", 20);
+        app.visible_indices = vec![left, right];
+        app.fullscreen_idx = Some(left);
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        for idx in [left, right] {
+            assert!(app.insert_retained_pdf_page_raster(
+                idx,
+                [4, 4],
+                Arc::new(egui::ColorImage::new([4, 4], vec![egui::Color32::GRAY; 16],)),
+            ));
+        }
+        assert_eq!(app.retained_cross_session_cache_entries(), 10);
+
+        for idx in [left, right, left, right] {
+            store_matching_pdf_final_ai(
+                &mut app,
+                idx,
+                [4, 4],
+                Arc::new(egui::ColorImage::new(
+                    [8, 8],
+                    vec![egui::Color32::WHITE; 64],
+                )),
+            );
+        }
+
+        let left_key = app.retained_pdf_page_key_for(left).unwrap();
+        let right_key = app.retained_pdf_page_key_for(right).unwrap();
+        for key in [&left_key, &right_key] {
+            assert!(matches!(
+                app.retained_pdf_page_cache
+                    .get(key)
+                    .map(|entry| &entry.kind),
+                Some(RetainedPdfPageCacheKind::FinalAi { .. })
+            ));
+        }
+        assert_eq!(
+            app.retained_cross_session_cache_entries(),
+            10,
+            "promoting either side must replace its page slot, not evict the other side"
+        );
+    }
+
+    #[test]
+    fn single_pdf_page_does_not_reenter_after_retained_early_completion() {
+        let mut app = setup_app();
+        enable_pdf_final_ai_params(&mut app);
+        let idx = push_pdf_page(&mut app, r"C:\books\single.pdf", 0);
+        app.visible_indices = vec![idx];
+        app.details_order = vec![idx];
+        app.fullscreen_idx = Some(idx);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        store_matching_pdf_final_ai(
+            &mut app,
+            idx,
+            [4, 4],
+            Arc::new(egui::ColorImage::new(
+                [8, 8],
+                vec![egui::Color32::WHITE; 64],
+            )),
+        );
+
+        let targets = [
+            crate::pdf_loader::PdfDisplayTarget {
+                width_px: 1920,
+                height_px: 1080,
+                fit_mode: crate::pdf_loader::PdfDisplayFitMode::Page,
+            },
+            crate::pdf_loader::PdfDisplayTarget {
+                width_px: 1921,
+                height_px: 1080,
+                fit_mode: crate::pdf_loader::PdfDisplayFitMode::Page,
+            },
+        ];
+        for frame in 0..120 {
+            app.fs_pdf_display_target = Some(targets[frame % targets.len()]);
+            assert_eq!(
+                app.ensure_fs_page_load(idx),
+                FsPageLoadState::DisplayReady(FsPageDisplaySource::RetainedPdfFinalAi)
+            );
+            app.update_prefetch_window(idx);
+            assert!(app.fs_pending.is_empty());
+            assert!(app.fs_upload_backlog.is_empty());
+        }
+    }
+
     #[test]
     fn pdf_retained_page_cache_promotes_raster_to_final_ai_without_duplicate_store() {
         let mut app = setup_app();
@@ -23540,10 +23761,16 @@ mod pipeline_cache_refactor_tests {
         ));
         assert!(app.insert_retained_pdf_final_ai(idx, retained_key, Arc::clone(&final_pixels),));
 
-        app.start_fs_load(idx);
+        for _ in 0..8 {
+            assert_eq!(
+                app.ensure_fs_page_load(idx),
+                FsPageLoadState::DisplayReady(FsPageDisplaySource::RetainedPdfFinalAi),
+                "caller guard must treat matching retained FinalAi as display-ready"
+            );
+        }
         assert!(
             app.fs_pending.is_empty() && app.fs_upload_backlog.is_empty(),
-            "matching retained FinalAi should avoid starting PDF render"
+            "matching retained FinalAi should avoid entering the PDF render producer"
         );
 
         let tex = app.restore_retained_pdf_final_ai_composite(&ctx, idx);

@@ -7769,9 +7769,7 @@ impl App {
         if let SpreadPair::Double { left, right } = spread_pair {
             let partner = if left == fs_idx { right } else { left };
             self.advance_animation(ctx, partner);
-            if !self.fs_cache.contains_key(&partner) && !self.fs_pending.contains_key(&partner) {
-                self.start_fs_load(partner);
-            }
+            self.ensure_fs_page_load(partner);
         }
         // in-window モード中は静止画を専用 viewport ではなくメインウィンドウの
         // egui ctx に直接描画する (embedded)。本関数冒頭で動画は early-return
@@ -8292,20 +8290,12 @@ impl App {
                             .and_then(|idx| self.pdf_content_bbox_for_display_idx(idx));
 
                         if current_is_pdf {
-                            if !self.fs_cache.contains_key(&fs_idx)
-                                && !self.fs_pending.contains_key(&fs_idx)
-                            {
-                                self.start_fs_load(fs_idx);
-                            }
+                            self.ensure_fs_page_load(fs_idx);
                             self.ensure_pdf_display_resolution(fs_idx, pdf_current_bbox);
                         }
                         if let Some(partner) = pdf_partner {
                             if matches!(self.items.get(partner), Some(GridItem::PdfPage { .. })) {
-                                if !self.fs_cache.contains_key(&partner)
-                                    && !self.fs_pending.contains_key(&partner)
-                                {
-                                    self.start_fs_load(partner);
-                                }
+                                self.ensure_fs_page_load(partner);
                                 self.ensure_pdf_display_resolution(partner, pdf_partner_bbox);
                             }
                         }
@@ -10104,7 +10094,8 @@ impl App {
             .image_metas
             .get(fs_idx)
             .and_then(|m| m.map(|(_, sz)| sz.max(0) as u64));
-        let is_loading = !is_video && !fs_load_failed && !self.fs_cache.contains_key(&fs_idx);
+        let is_loading =
+            !is_video && !fs_load_failed && self.fs_page_load_state(fs_idx).waiting_for_display();
         #[cfg(windows)]
         let vst3_waiting_for_video = is_video
             && self.vst3_deferred_media_open == Some(fs_idx)
@@ -15257,8 +15248,7 @@ impl App {
         let image_loading = !is_video
             && self
                 .fullscreen_idx
-                .map(|i| !self.fs_cache.contains_key(&i))
-                .unwrap_or(false);
+                .is_some_and(|i| self.fs_page_load_state(i).waiting_for_display());
         let pdf_rerendering = self.fs_pending.contains_key(&fs_idx);
         if image_loading || pdf_rerendering {
             ctx.request_repaint();
@@ -16801,8 +16791,8 @@ impl App {
             .retain(|k, v| keep_set.contains(k) || matches!(v, FsCacheEntry::Video { .. }));
 
         let current_idx = self.fullscreen_idx.unwrap_or(units[current_pos].anchor_idx);
-        let current_loading =
-            keep_set.contains(&current_idx) && !self.fs_cache.contains_key(&current_idx);
+        let current_loading = keep_set.contains(&current_idx)
+            && self.fs_page_load_state(current_idx).waiting_for_display();
         let to_cancel = self
             .fs_pending
             .keys()
@@ -16821,9 +16811,7 @@ impl App {
             self.fs_early_dims.remove(&idx);
         }
         if current_loading {
-            if !self.fs_pending.contains_key(&current_idx) {
-                self.start_fs_load(current_idx);
-            }
+            self.ensure_fs_page_load(current_idx);
             return;
         }
 
@@ -16846,11 +16834,8 @@ impl App {
             })
         });
         for (_, idx) in targets {
-            if keep_set.contains(&idx)
-                && !self.fs_cache.contains_key(&idx)
-                && !self.fs_pending.contains_key(&idx)
-            {
-                self.start_fs_load(idx);
+            if keep_set.contains(&idx) {
+                self.ensure_fs_page_load(idx);
             }
         }
     }

@@ -5414,6 +5414,44 @@ pub(crate) struct RetainedPdfPageEntry {
     pub(crate) last_used: u64,
 }
 
+/// フルスクリーン 1 ページのロード／表示可否を表す単一の判定結果。
+///
+/// `fs_cache` / `fs_pending` / retained PDF page store を呼び出し側が個別に
+/// 組み合わせると、retained final-AI だけで表示できるページを「未ロード」と誤認する。
+/// 物理的な所有先はそれぞれのまま維持し、表示・再入ガード・prefetch の判断だけを
+/// この typed projection に集約する。`UploadPending` も再投入不可の中継状態として扱う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsPageLoadState {
+    NeedsLoad,
+    LoadPending,
+    UploadPending,
+    DisplayReady(FsPageDisplaySource),
+    LoadFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsPageDisplaySource {
+    LiveCache,
+    RetainedPdfFinalAi,
+}
+
+impl FsPageLoadState {
+    fn needs_load_request(self) -> bool {
+        matches!(self, Self::NeedsLoad)
+    }
+
+    pub(crate) fn waiting_for_display(self) -> bool {
+        matches!(
+            self,
+            Self::NeedsLoad | Self::LoadPending | Self::UploadPending
+        )
+    }
+
+    pub(crate) fn is_display_ready(self) -> bool {
+        matches!(self, Self::DisplayReady(_))
+    }
+}
+
 /// 表示セッションから外れた PDF final AI を、保持 LRU へ入れる目的で完走させる上限。
 ///
 /// final AI worker は単一なので、ここを大きくすると「今見ているページ」の AI が
@@ -40532,10 +40570,9 @@ impl App {
             Some(GridItem::Image(_))
             | Some(GridItem::ZipImage { .. })
             | Some(GridItem::PdfPage { .. }) => {
-                if self.fs_cache.contains_key(&idx) {
+                let load_state = self.ensure_fs_page_load(idx);
+                if load_state.is_display_ready() {
                     crate::logger::log(format!("  cache hit idx={idx} → instant display"));
-                } else if !self.fs_pending.contains_key(&idx) {
-                    self.start_fs_load(idx);
                 }
                 if self.reading_flow.is_paged() {
                     self.update_prefetch_window(idx);
@@ -47676,12 +47713,13 @@ impl App {
         self.fs_margin_bbox_cache
             .retain(|k, _| keep_set.contains(k));
 
-        // 現在表示中の画像がまだデコード中 (fs_cache に入っていない) なら、
+        // 現在表示中の画像がまだ表示可能な状態へ到達していないなら、
         // その画像に CPU を独占させるため他の pending をすべてキャンセルする。
         // 現在画像が完了したあと poll_prefetch から再度 update_prefetch_window が
         // 呼ばれ、そこで先読みが開始される。これにより 1→2 遷移 (サムネ → フル解像度) が
-        // 先読みスレッドに待たされなくなる。
-        let current_loading = !self.fs_cache.contains_key(&current_idx);
+        // 先読みスレッドに待たされなくなる。retained PDF final-AI は raw fs_cache が無くても
+        // 表示可能なので、typed state では loading に分類しない。
+        let current_loading = self.fs_page_load_state(current_idx).waiting_for_display();
 
         let to_cancel: Vec<usize> = self
             .fs_pending
@@ -47709,12 +47747,9 @@ impl App {
 
         // まだキャッシュにも pending にもない先読み対象を読み込み開始
         for idx in prefetch_targets {
-            if !self.fs_cache.contains_key(&idx)
-                && !self.fs_pending.contains_key(&idx)
-                && !self.fs_upload_backlog_contains(idx)
-            {
+            if self.fs_page_load_state(idx).needs_load_request() {
                 crate::logger::log(format!("  prefetch start idx={idx}"));
-                self.start_fs_load(idx);
+                self.ensure_fs_page_load(idx);
             }
         }
     }
@@ -52792,6 +52827,41 @@ impl App {
         self.fs_upload_backlog.iter().any(|(key, _, _)| *key == idx)
     }
 
+    /// フルスクリーン表示側が参照するページロード状態の正本。
+    ///
+    /// retained PDF final-AI は raw `fs_cache` が無くても同期的に表示 texture へ
+    /// 復元できるため、live cache より先に `DisplayReady` として解決する。
+    pub(crate) fn fs_page_load_state(&self, idx: usize) -> FsPageLoadState {
+        if self.has_retained_pdf_final_ai_for_current_params(idx) {
+            return FsPageLoadState::DisplayReady(FsPageDisplaySource::RetainedPdfFinalAi);
+        }
+        match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Failed) => return FsPageLoadState::LoadFailed,
+            Some(_) => {
+                return FsPageLoadState::DisplayReady(FsPageDisplaySource::LiveCache);
+            }
+            None => {}
+        }
+        if self.fs_upload_backlog_contains(idx) {
+            FsPageLoadState::UploadPending
+        } else if self.fs_pending.contains_key(&idx) {
+            FsPageLoadState::LoadPending
+        } else {
+            FsPageLoadState::NeedsLoad
+        }
+    }
+
+    /// 同じ typed state を入口ガードにも使い、必要なときだけ producer を起動する。
+    pub(crate) fn ensure_fs_page_load(&mut self, idx: usize) -> FsPageLoadState {
+        let state = self.fs_page_load_state(idx);
+        if state.needs_load_request() {
+            self.start_fs_load(idx);
+            self.fs_page_load_state(idx)
+        } else {
+            state
+        }
+    }
+
     #[cfg(test)]
     fn insert_retained_final_ai(
         &mut self,
@@ -53907,7 +53977,11 @@ impl App {
         // 計時は perf-log 有効時のみ (cache hit 経路は毎フレーム走るので clock 読みを足さない)。
         let perf_on = crate::perf::is_enabled();
         let fc_build_start = perf_on.then(std::time::Instant::now);
-        if let Some(texture) = self.restore_retained_pdf_final_ai_composite(ctx, idx) {
+        if matches!(
+            self.fs_page_load_state(idx),
+            FsPageLoadState::DisplayReady(FsPageDisplaySource::RetainedPdfFinalAi)
+        ) && let Some(texture) = self.restore_retained_pdf_final_ai_composite(ctx, idx)
+        {
             return Some(texture);
         }
         let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
