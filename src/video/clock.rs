@@ -161,6 +161,10 @@ pub struct AvClock {
     volume_bits: AtomicU64,
     /// ミュート。
     muted: AtomicBool,
+    /// Remote streaming 中だけローカル出力を 0 にする lease owner。0 は未接続。
+    /// 通常の user mute と分離し、session 終了時に元の UI 状態を復元不要で維持する。
+    remote_local_mute_owner: AtomicU64,
+    next_remote_local_mute_owner: AtomicU64,
     /// safety limiter が最終出力 ceiling 超過を検出した回数。
     /// audio-pump thread が増やし、UI thread / native overlay が差分を一時表示する。
     limiter_ceiling_hit_seq: AtomicU64,
@@ -256,6 +260,8 @@ impl AvClock {
                 crate::settings::clamp_video_volume(initial_volume).to_bits(),
             ),
             muted: AtomicBool::new(false),
+            remote_local_mute_owner: AtomicU64::new(0),
+            next_remote_local_mute_owner: AtomicU64::new(1),
             limiter_ceiling_hit_seq: AtomicU64::new(0),
             normalize_gain_bits: AtomicU64::new(1.0_f64.to_bits()),
         }
@@ -899,9 +905,24 @@ impl AvClock {
         self.muted.store(m, Ordering::Release);
     }
 
+    /// Remote streaming session 単位のローカル出力 mute lease を取得する。
+    /// 新 owner が取得済みなら古い lease の Drop は新 owner を解除しない。
+    pub(crate) fn acquire_remote_local_output_mute(self: &Arc<Self>) -> RemoteLocalOutputMuteLease {
+        let owner_id = self
+            .next_remote_local_mute_owner
+            .fetch_add(1, Ordering::Relaxed)
+            .max(1);
+        self.remote_local_mute_owner
+            .store(owner_id, Ordering::Release);
+        RemoteLocalOutputMuteLease {
+            clock: Arc::clone(self),
+            owner_id,
+        }
+    }
+
     /// RT 出力コールバックで掛ける音量 (mute 中は 0、0dB 超 boost はここでは掛けない)。
     pub fn output_volume(&self) -> f32 {
-        if self.is_muted() {
+        if self.is_muted() || self.remote_local_mute_owner.load(Ordering::Acquire) != 0 {
             0.0
         } else {
             self.volume().min(1.0) as f32
@@ -940,6 +961,23 @@ impl AvClock {
     pub fn set_audio_preroll_suspended(&self, suspended: bool) {
         self.audio_preroll_suspended
             .store(suspended, Ordering::Release);
+    }
+}
+
+/// Remote streaming が所有するローカル出力 mute。audio device と PCM queue は止めない。
+pub(crate) struct RemoteLocalOutputMuteLease {
+    clock: Arc<AvClock>,
+    owner_id: u64,
+}
+
+impl Drop for RemoteLocalOutputMuteLease {
+    fn drop(&mut self) {
+        let _ = self.clock.remote_local_mute_owner.compare_exchange(
+            self.owner_id,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 }
 
@@ -1015,6 +1053,24 @@ mod tests {
         assert!(
             (clock.pre_limiter_gain() - crate::settings::VIDEO_VOLUME_MAX as f32).abs() < 1.0e-6
         );
+    }
+
+    #[test]
+    fn remote_output_mute_lease_restores_output_and_old_drop_cannot_clear_new_owner() {
+        let clock = Arc::new(AvClock::new(0.75, Arc::new(AtomicU64::new(0))));
+        assert!((clock.output_volume() - 0.75).abs() < 1.0e-6);
+
+        let old = clock.acquire_remote_local_output_mute();
+        assert_eq!(clock.output_volume(), 0.0);
+        let current = clock.acquire_remote_local_output_mute();
+        drop(old);
+        assert_eq!(
+            clock.output_volume(),
+            0.0,
+            "stale lease cleared current mute"
+        );
+        drop(current);
+        assert!((clock.output_volume() - 0.75).abs() < 1.0e-6);
     }
 
     #[test]

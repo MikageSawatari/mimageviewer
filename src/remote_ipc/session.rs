@@ -50,10 +50,26 @@ struct ActiveSession {
     last_ping: Duration,
     last_activity: Duration,
     media_playing: bool,
+    streaming: Option<StreamingRegistration>,
     request_count: u64,
     completed_count: u64,
     failed_count: u64,
     operations: BTreeMap<u64, OperationState>,
+}
+
+#[derive(Clone, Debug)]
+struct StreamingRegistration {
+    id: u64,
+    playing: bool,
+    cancel: Arc<AtomicBool>,
+}
+
+impl ActiveSession {
+    fn cancel_streaming(&mut self) {
+        if let Some(streaming) = self.streaming.take() {
+            streaming.cancel.store(true, Ordering::Release);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -63,6 +79,7 @@ struct SessionStateMachine {
     last_release_reason: Option<ReleaseReason>,
     generation: u64,
     next_operation: u64,
+    next_streaming_registration: u64,
     acquisition_sequence: u64,
     control_return_sequence: u64,
 }
@@ -75,6 +92,7 @@ impl Default for SessionStateMachine {
             last_release_reason: None,
             generation: 0,
             next_operation: 1,
+            next_streaming_registration: 1,
             acquisition_sequence: 0,
             control_return_sequence: 0,
         }
@@ -97,7 +115,8 @@ impl SessionStateMachine {
             return SessionResponse::active();
         }
 
-        if let Some(previous) = self.active.take() {
+        if let Some(mut previous) = self.active.take() {
+            previous.cancel_streaming();
             self.last_owner = Some(previous.client_id);
             self.last_release_reason = Some(ReleaseReason::Superseded);
         }
@@ -113,6 +132,7 @@ impl SessionStateMachine {
             last_ping: now,
             last_activity: now,
             media_playing: false,
+            streaming: None,
             request_count: 0,
             completed_count: 0,
             failed_count: 0,
@@ -171,6 +191,107 @@ impl SessionStateMachine {
         Ok((self.generation, token))
     }
 
+    fn streaming_owner(&mut self, now: Duration, client_id: &str) -> Result<u64, SessionResponse> {
+        self.expire(now);
+        let Some(active) = self.active.as_mut() else {
+            return Err(self.inactive_response(client_id));
+        };
+        if active.client_id != client_id {
+            return Err(status_response(
+                SessionStatus::Superseded,
+                "別の端末で使用中です。操作すると操作権を取得します。",
+            ));
+        }
+        active.last_ping = now;
+        active.last_activity = now;
+        Ok(self.generation)
+    }
+
+    fn register_streaming(
+        &mut self,
+        now: Duration,
+        generation: u64,
+        client_id: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<u64, SessionResponse> {
+        self.expire(now);
+        let Some(active) = self.active.as_mut() else {
+            return Err(self.inactive_response(client_id));
+        };
+        if self.generation != generation || active.client_id != client_id {
+            return Err(status_response(
+                SessionStatus::Superseded,
+                "別のリモート接続が操作権を取得しました。",
+            ));
+        }
+        active.cancel_streaming();
+        let id = self.next_streaming_registration;
+        self.next_streaming_registration = self.next_streaming_registration.wrapping_add(1).max(1);
+        active.streaming = Some(StreamingRegistration {
+            id,
+            playing: true,
+            cancel,
+        });
+        active.last_ping = now;
+        active.last_activity = now;
+        Ok(id)
+    }
+
+    fn set_streaming_playing(
+        &mut self,
+        generation: u64,
+        registration_id: u64,
+        playing: bool,
+    ) -> bool {
+        let Some(streaming) = self
+            .active
+            .as_mut()
+            .filter(|_| self.generation == generation)
+            .and_then(|active| active.streaming.as_mut())
+            .filter(|streaming| streaming.id == registration_id)
+        else {
+            return false;
+        };
+        streaming.playing = playing;
+        true
+    }
+
+    fn note_segment_fetch(&mut self, now: Duration, generation: u64, registration_id: u64) -> bool {
+        let Some(active) = self
+            .active
+            .as_mut()
+            .filter(|_| self.generation == generation)
+        else {
+            return false;
+        };
+        if !active
+            .streaming
+            .as_ref()
+            .is_some_and(|streaming| streaming.id == registration_id)
+        {
+            return false;
+        }
+        active.last_ping = now;
+        true
+    }
+
+    fn unregister_streaming(&mut self, generation: u64, registration_id: u64) {
+        let Some(active) = self
+            .active
+            .as_mut()
+            .filter(|_| self.generation == generation)
+        else {
+            return;
+        };
+        if active
+            .streaming
+            .as_ref()
+            .is_some_and(|streaming| streaming.id == registration_id)
+        {
+            active.streaming = None;
+        }
+    }
+
     fn start_operation(&mut self, generation: u64, token: u64) {
         if generation == self.generation
             && let Some(operation) = self
@@ -208,6 +329,10 @@ impl SessionStateMachine {
             if now.saturating_sub(active.last_ping) >= LIVENESS_TIMEOUT {
                 Some(ReleaseReason::LivenessTimeout)
             } else if !active.media_playing
+                && !active
+                    .streaming
+                    .as_ref()
+                    .is_some_and(|streaming| streaming.playing)
                 && now.saturating_sub(active.last_activity) >= IDLE_TIMEOUT
             {
                 Some(ReleaseReason::IdleTimeout)
@@ -222,9 +347,10 @@ impl SessionStateMachine {
     }
 
     fn release(&mut self, reason: ReleaseReason) {
-        let Some(active) = self.active.take() else {
+        let Some(mut active) = self.active.take() else {
             return;
         };
+        active.cancel_streaming();
         self.last_owner = Some(active.client_id);
         self.last_release_reason = Some(reason);
         self.generation = self.generation.wrapping_add(1);
@@ -270,6 +396,11 @@ impl SessionStateMachine {
                 .find(|(_, operation)| operation.started)
                 .or_else(|| active.operations.iter().rev().next())
                 .map(|(_, operation)| operation.description.clone()),
+            streaming: active.streaming.is_some(),
+            streaming_playing: active
+                .streaming
+                .as_ref()
+                .is_some_and(|streaming| streaming.playing),
         });
         SessionSnapshot {
             active,
@@ -308,6 +439,10 @@ pub(crate) struct ActiveSessionSnapshot {
     pub(crate) queued_count: usize,
     pub(crate) running_count: usize,
     pub(crate) current_operation: Option<String>,
+    #[allow(dead_code)] // Increment 6 VideoStreamState exposes these remote-owner facts.
+    pub(crate) streaming: bool,
+    #[allow(dead_code)] // Increment 6 VideoStreamState exposes these remote-owner facts.
+    pub(crate) streaming_playing: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -509,6 +644,24 @@ impl SessionHandle {
             token,
             client_id: client_id.to_owned(),
             finished: false,
+        })
+    }
+
+    /// 長寿命の streaming session を現在の remote owner に結び付ける token を返す。
+    /// IPC の start 要求は通常の client_id 検証後、この token だけを UI へ渡す。
+    pub(crate) fn streaming_owner(
+        &self,
+        client_id: &str,
+    ) -> Result<RemoteSessionOwner, SessionResponse> {
+        let generation = self
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .streaming_owner(self.now(), client_id)?;
+        Ok(RemoteSessionOwner {
+            handle: self.clone(),
+            generation,
+            client_id: client_id.to_owned(),
         })
     }
 
@@ -727,6 +880,106 @@ impl SessionHandle {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .expire(self.now())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RemoteSessionOwner {
+    handle: SessionHandle,
+    generation: u64,
+    client_id: String,
+}
+
+impl RemoteSessionOwner {
+    pub(crate) fn is_current(&self) -> bool {
+        let state = self
+            .handle
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.generation == self.generation
+            && state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.client_id == self.client_id)
+    }
+
+    pub(crate) fn register_streaming(
+        &self,
+    ) -> Result<RemoteStreamingRegistration, SessionResponse> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let registration_id = self
+            .handle
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .register_streaming(
+                self.handle.now(),
+                self.generation,
+                &self.client_id,
+                Arc::clone(&cancel),
+            )?;
+        Ok(RemoteStreamingRegistration {
+            activity: RemoteStreamingActivity {
+                handle: self.handle.clone(),
+                generation: self.generation,
+                registration_id,
+            },
+            cancel,
+        })
+    }
+}
+
+pub(crate) struct RemoteStreamingRegistration {
+    activity: RemoteStreamingActivity,
+    cancel: Arc<AtomicBool>,
+}
+
+impl RemoteStreamingRegistration {
+    pub(crate) fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
+
+    pub(crate) fn activity(&self) -> RemoteStreamingActivity {
+        self.activity.clone()
+    }
+}
+
+impl Drop for RemoteStreamingRegistration {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.activity
+            .handle
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .unregister_streaming(self.activity.generation, self.activity.registration_id);
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RemoteStreamingActivity {
+    handle: SessionHandle,
+    generation: u64,
+    registration_id: u64,
+}
+
+impl RemoteStreamingActivity {
+    pub(crate) fn set_playing(&self, playing: bool) -> bool {
+        self.handle
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .set_streaming_playing(self.generation, self.registration_id, playing)
+    }
+
+    #[allow(dead_code)] // Increment 6's dedicated segment lane reports successful fetch attempts.
+    pub(crate) fn note_segment_fetch(&self) -> bool {
+        self.handle
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .note_segment_fetch(self.handle.now(), self.generation, self.registration_id)
     }
 }
 
@@ -1032,6 +1285,93 @@ mod tests {
             },
         );
         assert_eq!(state.expire(now), Some(ReleaseReason::IdleTimeout));
+    }
+
+    fn register_test_stream(
+        state: &mut SessionStateMachine,
+        now: Duration,
+    ) -> (u64, u64, Arc<AtomicBool>) {
+        let generation = state.streaming_owner(now, "client").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let registration = state
+            .register_streaming(now, generation, "client", Arc::clone(&cancel))
+            .unwrap();
+        (generation, registration, cancel)
+    }
+
+    #[test]
+    fn ownership_loss_cancels_registered_streaming() {
+        let mut state = SessionStateMachine::default();
+        acquire(&mut state, Duration::ZERO);
+        let (_, _, cancel) = register_test_stream(&mut state, Duration::ZERO);
+
+        state.acquire(
+            Duration::from_secs(1),
+            2,
+            SessionAcquireRequest {
+                client_id: "other-client".to_owned(),
+                peer: peer(),
+            },
+        );
+
+        assert!(cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn local_control_return_cancels_registered_streaming() {
+        let mut state = SessionStateMachine::default();
+        acquire(&mut state, Duration::ZERO);
+        let (_, _, cancel) = register_test_stream(&mut state, Duration::ZERO);
+
+        state.local_disconnect();
+
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(state.active.is_none());
+        assert_eq!(state.last_release_reason, Some(ReleaseReason::Local));
+    }
+
+    #[test]
+    fn liveness_timeout_cancels_registered_streaming() {
+        let mut state = SessionStateMachine::default();
+        acquire(&mut state, Duration::ZERO);
+        let (_, _, cancel) = register_test_stream(&mut state, Duration::ZERO);
+
+        assert_eq!(
+            state.expire(LIVENESS_TIMEOUT),
+            Some(ReleaseReason::LivenessTimeout)
+        );
+        assert!(cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn paused_streaming_idle_timeout_cancels_even_when_segment_fetches_keep_liveness() {
+        let mut state = SessionStateMachine::default();
+        acquire(&mut state, Duration::ZERO);
+        let (generation, registration, cancel) = register_test_stream(&mut state, Duration::ZERO);
+        assert!(state.set_streaming_playing(generation, registration, false));
+
+        let mut now = Duration::from_secs(30);
+        while now < IDLE_TIMEOUT {
+            assert!(state.note_segment_fetch(now, generation, registration));
+            now += Duration::from_secs(30);
+        }
+        assert_eq!(state.expire(IDLE_TIMEOUT), Some(ReleaseReason::IdleTimeout));
+        assert!(cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn playing_streaming_suppresses_idle_and_segment_fetch_counts_for_liveness() {
+        let mut state = SessionStateMachine::default();
+        acquire(&mut state, Duration::ZERO);
+        let (generation, registration, cancel) = register_test_stream(&mut state, Duration::ZERO);
+
+        let mut now = Duration::from_secs(30);
+        while now <= IDLE_TIMEOUT + Duration::from_secs(30) {
+            assert!(state.note_segment_fetch(now, generation, registration));
+            assert_eq!(state.expire(now), None);
+            now += Duration::from_secs(30);
+        }
+        assert!(!cancel.load(Ordering::Acquire));
     }
 
     #[test]

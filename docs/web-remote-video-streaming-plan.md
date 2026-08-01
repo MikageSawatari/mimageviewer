@@ -5,9 +5,10 @@
 
 - 親計画: [web-remote-plan.md](web-remote-plan.md) (リモート閲覧機能全体の正本)
 - ブランチ: `web-remote` (worktree: `C:\home\mimageviewer-web`)
-- 現在のフェーズ: **第 1 段 増分 4/7 実装済み** (encoder 抽象 / fallback / 画質
+- 現在のフェーズ: **第 1 段 増分 5/7 実装済み** (encoder 抽象 / fallback / 画質
   preset + 映像・音声 fMP4 segmenter / ring / m3u8 + audio tap / AAC + decoder-output
-  video tap / HW download / scale / H.264 input、2026-08-01)
+  video tap / HW download / scale / H.264 input + streaming session / remote owner 連携 /
+  generation / 設定、2026-08-01)
 
 ---
 
@@ -326,13 +327,11 @@ HW デコード時 (`AV_PIX_FMT_D3D11`) は既存の `av_hwframe_transfer_data`
   init+各 media segment として読み返し、全 AAC packet の個数と PTS 列が入力と一致する
   ことを固定した
 
-##### 後続増分への申し送り
+##### 増分 5 で解消済みの申し送り
 
-- **作りかけの fragment には上限が無い。** 完成済みセグメントは ring が 30 本に
-  抑えるが、IDR を待っている最中の fragment はメモリ上で伸び続ける。GOP は固定なので
-  通常は 2 秒で IDR が来るが、encoder が過負荷で IDR を続けて落とした場合に歯止めが
-  無い。**増分 5 のセッション管理で、延長の上限 (時間かバイト数) と、超えたときの
-  扱い (セッションを畳む / 世代を切り替える) を決めること**
+- 作りかけ fragment と未 mux interleave queue は source-timeline **6.0 秒**を上限とした。
+  超過時は generation の自動再試行ではなく streaming session を停止する。詳細は
+  §6.4 の増分 5 実装記録を参照
 - `CfrTimelineFrameIndex` は「落ちた frame も欠番として残す CFR source timeline 上の
   位置」である。**増分 4 の映像 tap は、投入できた frame で番号を詰め直してはいけない**
   (詰め直すと forced-IDR の位置が encoder の負荷次第でずれる)
@@ -465,6 +464,35 @@ allowlist と canonical containment を再検証する ([web-remote-plan.md](web
 - 画質変更はシークと同じく generation を切り替える (エンコーダ再初期化が要るため)
 - 通信量の目安を Web の画質選択 UI に表示する
   ([web-remote-plan.md](web-remote-plan.md) §6.5.6 の「従量課金回線への配慮」)
+
+#### 増分 5 実装記録 (session + settings、2026-08-01)
+
+- `src/video/stream/session.rs` の generation worker が audio/video tap lease と receiver、
+  H.264/AAC encoder、fMP4 segmenter/ring を一括所有する。H.264/AAC の open は worker 内で
+  のみ行い、`App::poll_remote_session` は owner、再生 intent、`seek_serial`、worker status の
+  照合だけを行う。generation の drop 時の FFmpeg teardown/join も別 join thread へ逃がす
+- streaming registration は既存 remote owner generation に従属する。別端末の acquire、
+  local disconnect、60 秒 liveness、停止中の 10 分 idle で cancel flag を立てる。
+  streaming playing は idle 抑止へ含め、media segment 取得だけを liveness の `last_ping` へ
+  数える (idle の user activity 時刻は更新しない)
+- seek は tap payload の `seek_serial` 変化を `App` polling で検出し、encoder/segmenter を持つ
+  worker を交換して新 streaming generation を発行する。各 encoder も generation 開始時の
+  `expected_seek_serial` と違う旧 payload を捨てる。画質変更も同じ worker 交換を使い、resource
+  accessor は requested generation が current と違えば worker/ring を読む前に拒否する
+- 作りかけ fragment と encoder interleave queue の source-timeline 長は **6.0 秒**を上限とする。
+  2 秒 GOP の 3 倍まで IDR 遅延を許し、超過時は再生成ループにせず session を停止する。
+  映像 tap の software queue は **3 frames** (30fps で 100ms、60fps で 50ms、4K YUV420 の
+  目安で約 36MiB)。HW surface は従来どおり queue 内 0 のまま
+- playlist/init/media は同じ worker の segmenter から直列に snapshot する。segmenter の
+  readiness gate を迂回しないため、playlist が `Some` なら init と最初の media segment が
+  同時に取得可能という不変条件を維持する
+- ローカル mute は audio device や PCM queue を止めず、owner-scoped lease が cpal callback の
+  `output_volume` だけを 0 にする。post-DSP tap はその前 (processed queue push 前) なので、
+  リモート PCM は mute の影響を受けない
+- 設定の enum は runtime の nested `EncoderPreference` 等を直接永続化せず、単純な scalar variant
+  名を持つ `RemoteVideoEncoder` / `RemoteVideoQuality` として分離した。未知 variant は既存の
+  forward-incompatible 判定に入り、`Corrupted` quarantine / backup 自動復旧を行わない。
+  本機能は未リリースのため既存値の migration は不要
 
 ---
 

@@ -183,8 +183,7 @@ pub struct VideoPlayer {
     ui_dropped_past_count: AtomicU64,
     cancel: Arc<AtomicBool>,
     decode: DecodeHandles,
-    /// 保持目的のフィールド (Drop で cpal Stream が停止する)。読み取りはしない。
-    #[allow(dead_code)]
+    /// 保持目的に加え、Remote streaming session が audio tap controller を取得する。
     audio: Option<audio::AudioOutput>,
     info: Option<VideoInfo>,
     /// open 失敗 / DLL ロード失敗のメッセージ。Some なら UI は赤字エラー表示する。
@@ -5622,12 +5621,26 @@ impl VideoPlayer {
         ));
     }
 
-    /// Decoder-output video tap attachment point for the future streaming session owner.
-    #[allow(dead_code)] // Increment 5 connects the session; increment 4 intentionally has none.
+    /// Decoder-output video tap attachment point for the streaming session owner.
     pub(crate) fn video_tap_controller(
         &self,
     ) -> crate::video::stream::video_tap::VideoTapController {
         self.decode.video_tap.clone()
+    }
+
+    /// post-DSP audio tap と実 output sample rate。音声出力が無ければ stream 非対応。
+    pub(crate) fn audio_tap_source(
+        &self,
+    ) -> Option<(crate::video::audio::AudioTapController, u32)> {
+        self.audio
+            .as_ref()
+            .map(|audio| (audio.audio_tap_controller(), audio.sample_rate))
+    }
+
+    pub(crate) fn acquire_remote_local_output_mute(
+        &self,
+    ) -> crate::video::clock::RemoteLocalOutputMuteLease {
+        self.clock.acquire_remote_local_output_mute()
     }
 
     pub(crate) fn clear_audio_output_buffer(&self) {

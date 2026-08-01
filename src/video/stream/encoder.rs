@@ -56,6 +56,20 @@ pub(crate) enum EncoderPreference {
     Encoder(H264EncoderKind),
 }
 
+impl From<crate::settings::RemoteVideoEncoder> for EncoderPreference {
+    fn from(value: crate::settings::RemoteVideoEncoder) -> Self {
+        use crate::settings::RemoteVideoEncoder;
+        match value {
+            RemoteVideoEncoder::Auto => Self::Auto,
+            RemoteVideoEncoder::Nvenc => Self::Encoder(H264EncoderKind::Nvenc),
+            RemoteVideoEncoder::Qsv => Self::Encoder(H264EncoderKind::Qsv),
+            RemoteVideoEncoder::Amf => Self::Encoder(H264EncoderKind::Amf),
+            RemoteVideoEncoder::MediaFoundation => Self::Encoder(H264EncoderKind::MediaFoundation),
+            RemoteVideoEncoder::OpenH264 => Self::Encoder(H264EncoderKind::OpenH264),
+        }
+    }
+}
+
 impl FromStr for EncoderPreference {
     type Err = EncoderPreferenceParseError;
 
@@ -143,6 +157,7 @@ pub(crate) struct EncoderAttemptFailure {
     pub(crate) kind: EncoderAttemptFailureKind,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum H264EncoderOpenErrorCode {
     BackendInitializationFailed,
@@ -173,6 +188,7 @@ pub(crate) enum H264EncoderOpenError {
 }
 
 impl H264EncoderOpenError {
+    #[cfg(test)]
     pub(crate) const fn code(&self) -> H264EncoderOpenErrorCode {
         match self {
             Self::BackendInitializationFailed { .. } => {
@@ -310,7 +326,6 @@ pub(crate) struct OpenedH264Encoder {
     pub(crate) encoder: ffmpeg::codec::encoder::video::Encoder,
     pub(crate) input_format: H264InputFormat,
     pub(crate) effective_video_bitrate_bps: u64,
-    pub(crate) keyint_frames: u32,
 }
 
 pub(crate) fn open_h264_encoder(
@@ -368,7 +383,6 @@ pub(crate) fn open_h264_encoder(
         encoder: selected.value,
         input_format: selected.input_format,
         effective_video_bitrate_bps: selected.effective_video_bitrate_bps,
-        keyint_frames,
     })
 }
 

@@ -4370,7 +4370,7 @@ mod tests {
     }
 
     #[test]
-    fn boot_preserves_main_and_backups_when_settings_are_from_newer_build() {
+    fn boot_preserves_main_and_backups_for_unknown_remote_video_encoder() {
         let guard = DataDirOverrideGuard::new();
         let dir = guard.path();
         {
@@ -4381,8 +4381,8 @@ mod tests {
         let conn = rusqlite::Connection::open(dir.join("settings.db")).unwrap();
         conn.execute(
             "UPDATE settings_kv
-             SET value = '[\"Preview\",\"FutureColumn\"]'
-             WHERE key = 'details_column_order'",
+             SET value = '\"FutureEncoder\"'
+             WHERE key = 'remote_video_encoder'",
             [],
         )
         .unwrap();
@@ -4411,12 +4411,56 @@ mod tests {
         let conn = rusqlite::Connection::open(dir.join("settings.db")).unwrap();
         let stored: String = conn
             .query_row(
-                "SELECT value FROM settings_kv WHERE key = 'details_column_order'",
+                "SELECT value FROM settings_kv WHERE key = 'remote_video_encoder'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(stored.contains("FutureColumn"), "main DB was replaced");
+        assert!(stored.contains("FutureEncoder"), "main DB was replaced");
+    }
+
+    #[test]
+    fn unknown_remote_video_encoder_is_incompatible_not_corrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        let future = serde_json::to_string("FutureEncoder").unwrap();
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "UPDATE settings_kv SET value = ?1 WHERE key = ?2",
+                params![future, "remote_video_encoder"],
+            )
+            .unwrap();
+        let error = match db.load_into_settings() {
+            Ok(_) => panic!("future remote video encoder must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SettingsDbError::Incompatible(_)));
+    }
+
+    #[test]
+    fn unknown_remote_video_quality_is_incompatible_not_corrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        let future = serde_json::to_string("FutureQuality").unwrap();
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "UPDATE settings_kv SET value = ?1 WHERE key = ?2",
+                params![future, "remote_video_quality_default"],
+            )
+            .unwrap();
+        let error = match db.load_into_settings() {
+            Ok(_) => panic!("future remote video quality must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SettingsDbError::Incompatible(_)));
     }
 
     #[test]

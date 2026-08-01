@@ -5,6 +5,11 @@ use mimageviewer_ipc::{
 };
 use qrcode::{Color, QrCode};
 
+use crate::fs_animation::FsCacheEntry;
+use crate::video::stream::session::{
+    RemoteVideoStreamingSession, StreamGenerationStatus, StreamReconcile, StreamingGeneration,
+};
+
 use super::path_guard::logical_favorite_path;
 use super::session::{
     ActiveSessionSnapshot, ClaimedRemoteUiRequest, ClaimedRemoteWrite, SessionHandle,
@@ -20,6 +25,12 @@ pub(crate) struct RemoteSessionUiState {
     paused_animation_restore_key: Option<String>,
     pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
     show_connection_dialog: bool,
+    video_streaming: Option<AppRemoteVideoStreaming>,
+}
+
+struct AppRemoteVideoStreaming {
+    fs_idx: usize,
+    session: RemoteVideoStreamingSession,
 }
 
 struct PendingRemoteBookmarkWrite {
@@ -105,8 +116,20 @@ impl crate::app::App {
         let active = snapshot
             .as_ref()
             .is_some_and(|value| value.active.is_some());
+        let acquisition_changed = snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.acquisition_sequence != self.remote_session_ui.last_acquisition_sequence
+        });
+        let control_returned = snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.control_return_sequence != self.remote_session_ui.last_control_return_sequence
+        });
+        // The remote owner is the resource boundary. Tear down its taps and worker before the
+        // existing acquire/release path pauses or reloads media; that path remains the one source
+        // of truth for playback state transitions.
+        if acquisition_changed || control_returned {
+            self.remote_session_ui.video_streaming.take();
+        }
         if let Some(snapshot) = snapshot.as_ref()
-            && snapshot.acquisition_sequence != self.remote_session_ui.last_acquisition_sequence
+            && acquisition_changed
         {
             self.remote_session_ui.last_acquisition_sequence = snapshot.acquisition_sequence;
             let (media, slideshow, animations, continuous) =
@@ -116,16 +139,139 @@ impl crate::app::App {
             ));
         }
         if let Some(snapshot) = snapshot
-            && snapshot.control_return_sequence
-                != self.remote_session_ui.last_control_return_sequence
+            && control_returned
         {
             self.remote_session_ui.last_control_return_sequence = snapshot.control_return_sequence;
             self.reload_after_remote_session_release();
         }
+        self.poll_remote_video_streaming();
         self.poll_remote_fullscreen_restore();
         if active || self.remote_session_ui.pending_fullscreen_restore.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
+    }
+
+    /// Increment 6 will call this after IPC validation. Keeping construction here makes the UI
+    /// boundary explicit while all heavyweight encoder work remains in the spawned worker.
+    #[allow(dead_code)]
+    pub(crate) fn start_remote_video_streaming(
+        &mut self,
+        client_id: &str,
+    ) -> Result<
+        (
+            crate::video::stream::session::StreamingSessionId,
+            crate::video::stream::session::StreamingGeneration,
+        ),
+        String,
+    > {
+        if !self.settings.remote_video_streaming_enabled {
+            return Err("remote video streaming is disabled".to_owned());
+        }
+        let owner = self
+            .remote_session_ui
+            .handle
+            .as_ref()
+            .ok_or_else(|| "remote session service is unavailable".to_owned())?
+            .streaming_owner(client_id)
+            .map_err(|response| response.message)?;
+        let fs_idx = self
+            .fullscreen_idx
+            .ok_or_else(|| "no fullscreen media is open".to_owned())?;
+        let encoder = self.settings.remote_video_encoder.into();
+        let quality = self.settings.remote_video_quality_default.into();
+        let segment_capacity = self.settings.remote_video_segment_window;
+        let mute_local_output = self.settings.remote_video_mute_local_output;
+        let player = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player,
+            _ => return Err("the fullscreen item is not playable media".to_owned()),
+        };
+        let previous_speed = player.playback_speed();
+        let speed_changed = (previous_speed - 1.0).abs() > 1.0e-6;
+        if speed_changed {
+            player.set_playback_speed(1.0);
+        }
+        let session = match RemoteVideoStreamingSession::start(
+            owner,
+            player,
+            encoder,
+            quality,
+            segment_capacity,
+            mute_local_output,
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                if speed_changed {
+                    player.set_playback_speed(previous_speed);
+                }
+                return Err(error);
+            }
+        };
+        player.set_playing(true);
+        let result = (session.id(), session.generation());
+        self.remote_session_ui.video_streaming = Some(AppRemoteVideoStreaming { fs_idx, session });
+        Ok(result)
+    }
+
+    fn poll_remote_video_streaming(&mut self) {
+        let Some(mut streaming) = self.remote_session_ui.video_streaming.take() else {
+            return;
+        };
+        let outcome = match self.fs_cache.get(&streaming.fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => streaming.session.reconcile(player),
+            _ => StreamReconcile::Stop("streaming media player was closed".to_owned()),
+        };
+        match outcome {
+            StreamReconcile::Active => {
+                self.remote_session_ui.video_streaming = Some(streaming);
+            }
+            StreamReconcile::GenerationChanged(generation) => {
+                crate::logger::log(format!(
+                    "remote-stream generation changed after seek: {generation:?}"
+                ));
+                self.remote_session_ui.video_streaming = Some(streaming);
+            }
+            StreamReconcile::Stop(reason) => {
+                if let Some(FsCacheEntry::Video { player, .. }) =
+                    self.fs_cache.get(&streaming.fs_idx)
+                {
+                    player.set_playing(false);
+                }
+                crate::logger::log(format!("remote-stream session stopped: {reason}"));
+            }
+        }
+    }
+
+    #[allow(dead_code)] // Increment 6 IPC state response consumes this snapshot.
+    pub(crate) fn remote_video_streaming_status(&self) -> Option<StreamGenerationStatus> {
+        self.remote_session_ui
+            .video_streaming
+            .as_ref()
+            .map(|streaming| streaming.session.status())
+    }
+
+    #[allow(dead_code)] // Increment 6 routes the existing media play/pause command here.
+    pub(crate) fn set_remote_video_streaming_playing(&self, playing: bool) -> bool {
+        self.remote_session_ui
+            .video_streaming
+            .as_ref()
+            .is_some_and(|streaming| streaming.session.set_playing(playing))
+    }
+
+    #[allow(dead_code)] // Increment 6 exposes quality selection and returns the new generation.
+    pub(crate) fn change_remote_video_streaming_quality(
+        &mut self,
+        quality: crate::video::stream::quality::QualityPreset,
+    ) -> Result<StreamingGeneration, String> {
+        let streaming = self
+            .remote_session_ui
+            .video_streaming
+            .as_mut()
+            .ok_or_else(|| "remote video streaming is not active".to_owned())?;
+        let player = match self.fs_cache.get(&streaming.fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player,
+            _ => return Err("streaming media player was closed".to_owned()),
+        };
+        streaming.session.change_quality(player, quality)
     }
 
     fn apply_pending_remote_ui_requests(&mut self, handle: &SessionHandle) {

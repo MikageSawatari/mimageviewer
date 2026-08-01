@@ -10,7 +10,20 @@ pub(crate) enum QualityPreset {
     High,
 }
 
+impl From<crate::settings::RemoteVideoQuality> for QualityPreset {
+    fn from(value: crate::settings::RemoteVideoQuality) -> Self {
+        use crate::settings::RemoteVideoQuality;
+        match value {
+            RemoteVideoQuality::Minimum => Self::Minimum,
+            RemoteVideoQuality::Low => Self::Low,
+            RemoteVideoQuality::Standard => Self::Standard,
+            RemoteVideoQuality::High => Self::High,
+        }
+    }
+}
+
 impl QualityPreset {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 4] = [Self::Minimum, Self::Low, Self::Standard, Self::High];
 
     pub(crate) const fn parameters(self) -> QualityPresetParameters {

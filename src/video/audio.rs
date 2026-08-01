@@ -232,7 +232,6 @@ pub(crate) struct ProcessedChunk {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)] // 増分 5 で session owner が使用する。
 pub(crate) struct AudioTapController {
     command_tx: Sender<AudioTapCommand>,
     next_owner_id: Arc<AtomicU64>,
@@ -240,14 +239,13 @@ pub(crate) struct AudioTapController {
 
 /// streaming session が所有する audio tap attachment。
 /// owner id により、古い session の Drop が新しい session の tap を外すことはない。
-#[allow(dead_code)] // 増分 5 で session owner が使用する。
 pub(crate) struct AudioTapLease {
     owner_id: u64,
     command_tx: Sender<AudioTapCommand>,
+    #[allow(dead_code)] // Increment 6 VideoStreamState will expose tap backpressure telemetry.
     dropped: Arc<AtomicU64>,
 }
 
-#[allow(dead_code)] // Attach/Detach producer は増分 5 で接続する。
 enum AudioTapCommand {
     Attach(ActiveAudioTap),
     Detach(u64),
@@ -260,7 +258,6 @@ struct ActiveAudioTap {
 }
 
 impl AudioTapController {
-    #[allow(dead_code)] // 増分 5 で streaming session から呼ぶ。
     pub(crate) fn attach(
         &self,
         capacity: usize,
@@ -290,7 +287,7 @@ impl AudioTapController {
 }
 
 impl AudioTapLease {
-    #[allow(dead_code)] // 増分 5 の session stats から読む。
+    #[allow(dead_code)] // Increment 6 VideoStreamState will expose tap backpressure telemetry.
     pub(crate) fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -2272,6 +2269,51 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected_bits
         );
+    }
+
+    #[test]
+    fn remote_local_mute_does_not_change_post_dsp_tap_payload() {
+        let clock = make_clock();
+        let _mute = clock.acquire_remote_local_output_mute();
+        assert_eq!(clock.output_volume(), 0.0);
+
+        let expected = vec![0.25, -0.5, 0.75, -1.0];
+        let chunk = make_chunk(expected.clone(), 2.0, 96_000.0);
+        let (payload_tx, payload_rx) = bounded(1);
+        let mut active = Some(ActiveAudioTap {
+            owner_id: 1,
+            payload_tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+        });
+        let prepared = prepare_audio_tap_chunk(&active, &chunk);
+        publish_prepared_audio_tap_chunk(&mut active, prepared);
+
+        assert_eq!(payload_rx.recv().unwrap().samples, expected);
+        assert_eq!(chunk.samples, vec![0.25, -0.5, 0.75, -1.0]);
+    }
+
+    #[test]
+    fn dropping_audio_tap_lease_detaches_and_restores_allocation_free_playback_path() {
+        let (command_tx, command_rx) = unbounded();
+        let controller = AudioTapController {
+            command_tx,
+            next_owner_id: Arc::new(AtomicU64::new(1)),
+        };
+        let (lease, payload_rx) = controller.attach(1).unwrap();
+        let mut active = None;
+        refresh_audio_tap(&command_rx, &mut active);
+        drop(lease);
+        refresh_audio_tap(&command_rx, &mut active);
+
+        let chunk = make_chunk(vec![0.25, -0.25], 0.0, 96_000.0);
+        assert!(matches!(
+            prepare_audio_tap_chunk(&active, &chunk),
+            PreparedAudioTapChunk::NotConnected
+        ));
+        assert!(matches!(
+            payload_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ));
     }
 
     #[test]

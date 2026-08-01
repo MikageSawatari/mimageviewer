@@ -1547,6 +1547,10 @@ pub struct VideoInfo {
     pub description: Option<String>,
     /// 平均フレームレート (Phase 5.4 の右パネル表示用)。
     pub avg_fps: f64,
+    /// streaming encoder の CFR time base に使う、decoder が選択した正確な rate。
+    /// audio-only では 0/0。
+    pub fps_num: u32,
+    pub fps_den: u32,
     /// 平均ビットレート (bps、Phase 6 の上ホバーバー表示用)。0 のときは未知。
     /// `AVFormatContext.bit_rate` をそのまま流す。
     pub bit_rate_bps: i64,
@@ -2274,6 +2278,8 @@ fn run_decoder(
         vi_d3d11va_config,
         vi_hw_active,
         vi_avg_fps,
+        vi_fps_num,
+        vi_fps_den,
         vi_sar_num,
         vi_sar_den,
         vi_stream_interlaced,
@@ -2287,6 +2293,8 @@ fn run_decoder(
             v.hw_probe.d3d11va_config.clone(),
             v.hw_active_initially,
             v.avg_fps,
+            v.fps_num,
+            v.fps_den,
             v.sar_num,
             v.sar_den,
             v.stream_interlaced,
@@ -2300,6 +2308,8 @@ fn run_decoder(
             String::new(),
             false,
             0.0,
+            0,
+            0,
             1,
             1,
             false,
@@ -2396,6 +2406,8 @@ fn run_decoder(
         original_url,
         description,
         avg_fps: vi_avg_fps,
+        fps_num: vi_fps_num,
+        fps_den: vi_fps_den,
         bit_rate_bps,
         chapters,
         sar_num: vi_sar_num,

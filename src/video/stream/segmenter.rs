@@ -5,7 +5,7 @@ use ffmpeg::codec::packet::Mut as _;
 use ffmpeg_the_third as ffmpeg;
 
 use super::encoder::FrameRate;
-use super::playlist::{DEFAULT_SEGMENT_CAPACITY, SegmentLookup, SegmentRing, master_playlist};
+use super::playlist::{SegmentLookup, SegmentRing, master_playlist};
 
 const AVIO_BUFFER_SIZE: usize = 32 * 1024;
 const AVERROR_ENOMEM: i32 = -12;
@@ -429,6 +429,8 @@ pub(crate) struct Fmp4SegmenterStats {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SegmenterLifecycle {
     Active,
+    #[allow(dead_code)]
+    // Only finite encoder fixtures finalize; live sessions stop by cancellation.
     Finished,
     Failed,
 }
@@ -469,19 +471,6 @@ pub(crate) struct Fmp4Segmenter {
 unsafe impl Send for Fmp4Segmenter {}
 
 impl Fmp4Segmenter {
-    pub(crate) fn new(
-        video_encoder: &ffmpeg::codec::encoder::video::Encoder,
-        audio_encoder: &ffmpeg::codec::encoder::audio::Encoder,
-        frame_rate: FrameRate,
-    ) -> Result<Self, Fmp4SegmenterError> {
-        Self::with_capacity(
-            video_encoder,
-            audio_encoder,
-            frame_rate,
-            DEFAULT_SEGMENT_CAPACITY,
-        )
-    }
-
     pub(crate) fn with_capacity(
         video_encoder: &ffmpeg::codec::encoder::video::Encoder,
         audio_encoder: &ffmpeg::codec::encoder::audio::Encoder,
@@ -666,16 +655,44 @@ impl Fmp4Segmenter {
         self.ring.get(sequence)
     }
 
+    #[cfg(test)]
     pub(crate) fn media_sequence(&self) -> u64 {
         self.ring.media_sequence()
     }
 
+    #[cfg(test)]
     pub(crate) fn next_sequence(&self) -> u64 {
         self.ring.next_sequence()
     }
 
+    #[cfg(test)]
     pub(crate) fn stats(&self) -> Fmp4SegmenterStats {
         self.stats
+    }
+
+    /// まだ ring へ確定していない fragment の source-timeline 長。
+    /// video の末尾に加え、muxer へ渡した audio が先行していればその末尾まで含める。
+    pub(crate) fn pending_fragment_duration_secs(&self) -> f64 {
+        let (start_dts, video_end_dts) = match self.fragment {
+            FragmentState::Empty => return 0.0,
+            FragmentState::Writing { start_dts, end_dts }
+            | FragmentState::AwaitingIdr {
+                start_dts, end_dts, ..
+            } => (start_dts, end_dts),
+        };
+        let audio_end_in_video_ticks = self.last_audio_end_dts.map(|audio_end| unsafe {
+            ffmpeg::ffi::av_rescale_q(
+                audio_end,
+                self.audio_source_time_base,
+                self.video_source_time_base,
+            )
+        });
+        let end_dts = audio_end_in_video_ticks
+            .map_or(video_end_dts, |audio_end| video_end_dts.max(audio_end));
+        (end_dts.saturating_sub(start_dts).max(0) as f64
+            * f64::from(self.video_source_time_base.num)
+            / f64::from(self.video_source_time_base.den))
+        .max(0.0)
     }
 
     /// CFR source timeline 上の 2 秒境界だけを I frame 指定する。encoder 側の
@@ -1000,6 +1017,7 @@ impl Fmp4Segmenter {
     }
 
     /// session stop/test 終了時だけ、2 秒未満の末尾 fragment も確定して trailer を閉じる。
+    #[cfg(test)]
     pub(crate) fn finish(&mut self) -> Result<Option<u64>, Fmp4SegmenterError> {
         match self.lifecycle {
             SegmenterLifecycle::Finished => return Ok(None),
@@ -1310,21 +1328,6 @@ mod tests {
         completed: &mut Vec<(u64, Vec<u8>)>,
     ) {
         drain_encoder_filter(encoder, segmenter, completed, &mut |_| false);
-    }
-
-    fn collect_video_packets(
-        encoder: &mut ffmpeg::codec::encoder::video::Encoder,
-        packets: &mut Vec<ffmpeg::Packet>,
-    ) {
-        loop {
-            let mut packet = ffmpeg::Packet::empty();
-            match encoder.receive_packet(&mut packet) {
-                Ok(()) => packets.push(packet),
-                Err(ffmpeg::Error::Other { errno }) if errno == FFMPEG_EAGAIN => break,
-                Err(ffmpeg::Error::Eof) => break,
-                Err(error) => panic!("receive_packet failed: {error}"),
-            }
-        }
     }
 
     #[test]

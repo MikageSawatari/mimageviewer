@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use super::encoder::SEGMENT_DURATION_SECS;
 
 /// 正本 §4.4 の既定 live window: 2 秒 x 30 本 = 60 秒。
+#[cfg(test)]
 pub(crate) const DEFAULT_SEGMENT_CAPACITY: usize = 30;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -68,10 +69,12 @@ impl SegmentRing {
             .map_or(self.next_sequence, |segment| segment.sequence)
     }
 
+    #[cfg(test)]
     pub(crate) fn next_sequence(&self) -> u64 {
         self.next_sequence
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.segments.len()
     }

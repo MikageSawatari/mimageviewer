@@ -3748,6 +3748,23 @@ pub struct Settings {
     #[serde(default)]
     pub perf_log_enabled: bool,
 
+    // ── mIV Remote 動画ストリーミング ─────────────────────────────
+    /// リモート動画・音声ストリーミング機能そのものを許可する。
+    #[serde(default = "default_true")]
+    pub remote_video_streaming_enabled: bool,
+    /// H.264 encoder の選択。Auto のみ既定の fallback 階段を降りる。
+    #[serde(default)]
+    pub remote_video_encoder: RemoteVideoEncoder,
+    /// 新しい streaming session が使う §6.4 の既定画質。
+    #[serde(default)]
+    pub remote_video_quality_default: RemoteVideoQuality,
+    /// メモリ上に保持する 2 秒 media segment の本数。
+    #[serde(default = "default_remote_video_segment_window")]
+    pub remote_video_segment_window: usize,
+    /// streaming 中も audio device を動かしたまま、ローカル出力だけを 0 にする。
+    #[serde(default = "default_true")]
+    pub remote_video_mute_local_output: bool,
+
     // ── 動画インライン再生 ────────────────────────────────────────
     /// 動画再生時の既定音量 (線形ゲイン 0.0..+18dB 相当)。1.0 を超える値は
     /// 音声ポンプ側で pre-limiter boost として扱う。
@@ -4165,6 +4182,35 @@ pub enum VideoAutoplayMode {
     OnlyFromGrid,
     /// 常に自動再生 (= 旧 video_autoplay=true 相当)。
     Always,
+}
+
+/// mIV Remote の H.264 encoder 設定。
+///
+/// 永続表現を runtime の `EncoderPreference::Encoder(H264EncoderKind)` から分離し、
+/// settings.db には常に `Auto` / `Nvenc` などの単純な variant 名を保存する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RemoteVideoEncoder {
+    #[default]
+    Auto,
+    Nvenc,
+    Qsv,
+    Amf,
+    MediaFoundation,
+    OpenH264,
+}
+
+/// mIV Remote の既定画質。正本 §6.4 の 4 段階を永続化する設定側の型。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RemoteVideoQuality {
+    Minimum,
+    Low,
+    #[default]
+    Standard,
+    High,
+}
+
+fn default_remote_video_segment_window() -> usize {
+    30
 }
 
 impl VideoAutoplayMode {
@@ -4901,6 +4947,11 @@ impl Default for Settings {
             update_check_enabled: true,
             update_check_dismissed_version: None,
             perf_log_enabled: false,
+            remote_video_streaming_enabled: true,
+            remote_video_encoder: RemoteVideoEncoder::Auto,
+            remote_video_quality_default: RemoteVideoQuality::Standard,
+            remote_video_segment_window: default_remote_video_segment_window(),
+            remote_video_mute_local_output: true,
             video_volume: default_video_volume(),
             video_playback_speed: default_video_playback_speed(),
             video_autoplay: false,
@@ -6131,6 +6182,9 @@ impl Settings {
         // 区別できない)。ここでは mode を source of truth として bool を導出する片方向のみ。
         self.video_loop = !matches!(self.video_loop_mode, VideoLoopMode::Off);
         self.video_volume = clamp_video_volume(self.video_volume);
+        // 0 は SegmentRing が表現できず、極端な直接編集値はメモリを際限なく予約し得る。
+        // 2 秒 x 300 本 (= 10 分) を設定値として許す上限にする。
+        self.remote_video_segment_window = self.remote_video_segment_window.clamp(1, 300);
         self.video_playback_speed =
             crate::video::clock::clamp_playback_speed(self.video_playback_speed);
         self.video_adjustments.sanitize();
@@ -6746,6 +6800,27 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_video_streaming_defaults_and_enum_storage_are_stable() {
+        let settings = Settings::default();
+        assert!(settings.remote_video_streaming_enabled);
+        assert_eq!(settings.remote_video_encoder, RemoteVideoEncoder::Auto);
+        assert_eq!(
+            settings.remote_video_quality_default,
+            RemoteVideoQuality::Standard
+        );
+        assert_eq!(settings.remote_video_segment_window, 30);
+        assert!(settings.remote_video_mute_local_output);
+        assert_eq!(
+            serde_json::to_value(RemoteVideoEncoder::Nvenc).unwrap(),
+            serde_json::Value::String("Nvenc".to_owned())
+        );
+        assert_eq!(
+            serde_json::to_value(RemoteVideoQuality::High).unwrap(),
+            serde_json::Value::String("High".to_owned())
+        );
+    }
 
     fn assert_f32_close(actual: f32, expected: f32) {
         assert!(

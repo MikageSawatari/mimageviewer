@@ -9,8 +9,8 @@ use ffmpeg::util::frame::video::Video;
 use ffmpeg_the_third as ffmpeg;
 
 use super::encoder::{
-    EncoderPreference, FrameRate, H264EncoderOpenError, H264InputFormat, OpenedH264Encoder,
-    open_h264_encoder,
+    EncoderPreference, FrameRate, H264EncoderKind, H264EncoderOpenError, H264InputFormat,
+    OpenedH264Encoder, open_h264_encoder,
 };
 use super::quality::{
     OutputDimensions, OutputDimensionsError, QualityPreset, StreamOutputParameters,
@@ -24,10 +24,12 @@ const FFMPEG_EAGAIN: i32 = 11;
 ///
 /// This is a hard contract for increment 5's session/queue sizing: `attach` capacity applies only
 /// to already-downloaded software frames, so increasing it cannot retain D3D11 decoder surfaces.
+#[cfg(test)]
 pub(crate) const VIDEO_TAP_MAX_QUEUED_DECODER_HW_SURFACES: usize = 0;
 
 /// Decoder HW surfaces involved in one tap producer call. This is the source frame already owned by
 /// `run_video_decode`; the tap never clones its AVHWFramesContext reference.
+#[cfg(test)]
 pub(crate) const VIDEO_TAP_MAX_SYNCHRONOUS_DECODER_HW_SURFACES: usize = 1;
 
 /// A queue-safe software frame. Keeping this wrapper private makes it impossible to construct a
@@ -61,6 +63,7 @@ pub(crate) struct TappedVideoFrame {
 }
 
 impl TappedVideoFrame {
+    #[cfg(test)]
     pub(crate) fn from_owned_software_frame(
         frame: Video,
         source_pts_secs: f64,
@@ -84,6 +87,7 @@ pub(crate) struct VideoTapController {
 pub(crate) struct VideoTapLease {
     owner_id: u64,
     command_tx: Sender<VideoTapCommand>,
+    #[allow(dead_code)] // Increment 6 VideoStreamState will expose tap backpressure telemetry.
     dropped: Arc<AtomicU64>,
 }
 
@@ -155,6 +159,7 @@ impl VideoTapController {
 }
 
 impl VideoTapLease {
+    #[allow(dead_code)] // Increment 6 VideoStreamState will expose tap backpressure telemetry.
     pub(crate) fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -433,10 +438,15 @@ pub(crate) fn open_video_stream_encoder(
 }
 
 impl VideoStreamEncoder {
+    pub(crate) fn encoder_kind(&self) -> H264EncoderKind {
+        self.opened.kind
+    }
+
     pub(crate) fn encoder(&self) -> &ffmpeg::codec::encoder::video::Encoder {
         &self.opened.encoder
     }
 
+    #[cfg(test)]
     pub(crate) fn input_format(&self) -> H264InputFormat {
         self.opened.input_format
     }
@@ -445,6 +455,11 @@ impl VideoStreamEncoder {
         self.output
     }
 
+    pub(crate) fn effective_video_bitrate_bps(&self) -> u64 {
+        self.opened.effective_video_bitrate_bps
+    }
+
+    #[cfg(test)]
     pub(crate) fn stats(&self) -> VideoStreamEncoderStats {
         self.stats
     }
@@ -498,6 +513,7 @@ impl VideoStreamEncoder {
         Ok(packets)
     }
 
+    #[cfg(test)]
     pub(crate) fn finish(&mut self) -> Result<Vec<ffmpeg::Packet>, VideoStreamEncoderError> {
         if self.finished {
             return Ok(Vec::new());
@@ -629,6 +645,22 @@ mod tests {
         drop(old_lease);
         producer.try_publish_with(1.0 / 30.0, 0, || Ok(software_tap_frame()));
         assert_eq!(new_rx.len(), 1);
+    }
+
+    #[test]
+    fn dropping_video_tap_lease_restores_disconnected_decoder_path() {
+        let (controller, mut producer) = video_tap_channel();
+        let (lease, rx) = controller.attach(1).unwrap();
+        producer.try_publish_with(0.0, 0, || Ok(software_tap_frame()));
+        assert_eq!(rx.len(), 1);
+        drop(lease);
+
+        let expensive_work_calls = Cell::new(0_u32);
+        producer.try_publish_with(1.0 / 30.0, 0, || {
+            expensive_work_calls.set(expensive_work_calls.get() + 1);
+            Ok(software_tap_frame())
+        });
+        assert_eq!(expensive_work_calls.get(), 0);
     }
 
     #[test]
