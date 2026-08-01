@@ -4,6 +4,82 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHandle) -> FsHoldover {
+    FsHoldover::FolderNavigation(FsDisplayUnitHoldover {
+        pages: vec![FsDisplayUnitHoldoverPage {
+            idx: page_idx,
+            texture,
+            rotation: crate::rotation_db::Rotation::None,
+            source_size: None,
+            content_bbox: None,
+        }],
+    })
+}
+
+#[test]
+#[cfg(windows)]
+fn native_video_bookmark_commands_ignore_app_viewport_ime_state() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let fs_idx = 0;
+    app.fullscreen_idx = Some(fs_idx);
+
+    // Reproduce a composition flag left in the winit/App context. The native video HWND has
+    // its own IME state and `NativeOverlayInputRouting` has already filtered text-field keys,
+    // so this unrelated flag must not discard native pointer or semantic command traffic.
+    ctx.begin_pass(egui::RawInput {
+        events: vec![egui::Event::Ime(egui::ImeEvent::Enabled)],
+        ..Default::default()
+    });
+    app.update_ime_state(&ctx);
+    assert!(app.ime_input_active(&ctx));
+    let _ = ctx.end_pass();
+    app.native_video_last_move_client = None;
+    app.handle_native_video_window_event(
+        &ctx,
+        fs_idx,
+        crate::video::native_window::NativeVideoWindowEvent::MouseMove(
+            crate::video::native_window::NativeVideoMouseEvent {
+                x: 640,
+                y: 360,
+                shift: false,
+                ctrl: false,
+            },
+        ),
+    );
+    assert_eq!(app.native_video_last_move_client, Some((640, 360)));
+
+    app.cursor_last_activity = None;
+    app.handle_native_video_add_bookmark_command(&ctx, fs_idx, 12.5);
+    assert!(
+        app.cursor_last_activity.is_some(),
+        "AddBookmarkAt must reach the App command handler even if another viewport has IME state"
+    );
+
+    let path = app.tmp.path().join("native-bookmark-command.mp4");
+    let bookmark_id = app
+        .video_bookmark_db
+        .as_ref()
+        .expect("video bookmark db")
+        .add(&path, 12.5, Some("before"), &[])
+        .expect("seed bookmark");
+    app.handle_native_video_set_bookmark_title_command(
+        &ctx,
+        fs_idx,
+        bookmark_id,
+        "日本語タイトル".to_owned(),
+    );
+    let bookmark = app
+        .video_bookmark_db
+        .as_ref()
+        .expect("video bookmark db")
+        .list(&path)
+        .into_iter()
+        .find(|bookmark| bookmark.id == bookmark_id)
+        .expect("updated bookmark");
+    assert_eq!(bookmark.title.as_deref(), Some("日本語タイトル"));
+}
+
 #[cfg(windows)]
 fn paused_test_window(
     ctx: &egui::Context,
@@ -1272,96 +1348,6 @@ fn auto_fullscreen_image_folder_ignores_mixed_folder_after_load() {
         !app.pending_auto_fs_open,
         "non-matching folder still consumes stale request"
     );
-}
-
-// ── cell_has_lower_left_container_badge ───────────────────────────────────
-//
-// レーティング ★ バッジを左下に出す際、コンテナバッジ (folder 名 / "ZIP" / "PDF" /
-// "7z" / "LZH") と重ねないために使う純関数。ユーザー報告「フォルダ名と ★ が重なる」
-// 退行ガード。
-
-#[test]
-fn lower_left_container_badge_yes_for_folder_when_loaded() {
-    use crate::grid_item::GridItem;
-    let dummy_tex = {
-        let ctx = egui::Context::default();
-        ctx.load_texture(
-            "dummy",
-            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
-            Default::default(),
-        )
-    };
-    let folder = GridItem::Folder(PathBuf::from("c:/x"));
-    let loaded = ThumbnailState::Loaded {
-        tex: dummy_tex,
-        from_cache: false,
-        from_edit_preview: false,
-        rendered_at_px: 128,
-        source_dims: None,
-    };
-    assert!(cell_has_lower_left_container_badge(&folder, &loaded));
-}
-
-#[test]
-fn lower_left_container_badge_no_for_folder_when_pending() {
-    use crate::grid_item::GridItem;
-    let folder = GridItem::Folder(PathBuf::from("c:/x"));
-    assert!(!cell_has_lower_left_container_badge(
-        &folder,
-        &ThumbnailState::Pending
-    ));
-    assert!(!cell_has_lower_left_container_badge(
-        &folder,
-        &ThumbnailState::Evicted
-    ));
-    assert!(!cell_has_lower_left_container_badge(
-        &folder,
-        &ThumbnailState::Failed
-    ));
-}
-
-#[test]
-fn lower_left_container_badge_always_yes_for_archive_types() {
-    use crate::grid_item::GridItem;
-    let zip = GridItem::ZipFile(PathBuf::from("c:/x.zip"));
-    let pdf = GridItem::PdfFile(PathBuf::from("c:/x.pdf"));
-    let arch = GridItem::ConvertibleArchive {
-        path: PathBuf::from("c:/x.7z"),
-        format: crate::archive_converter::ArchiveFormat::SevenZ,
-    };
-    // どの thumb 状態でも常に true (= 描画パスは Loaded/Pending/Evicted/Failed すべて
-    // 最後に badge_fn を呼ぶ)
-    for thumb in [
-        ThumbnailState::Pending,
-        ThumbnailState::Evicted,
-        ThumbnailState::Failed,
-    ] {
-        assert!(cell_has_lower_left_container_badge(&zip, &thumb));
-        assert!(cell_has_lower_left_container_badge(&pdf, &thumb));
-        assert!(cell_has_lower_left_container_badge(&arch, &thumb));
-    }
-}
-
-#[test]
-fn lower_left_container_badge_no_for_image_like_items() {
-    use crate::grid_item::GridItem;
-    let image = GridItem::Image(PathBuf::from("c:/x.jpg"));
-    let zip_image = GridItem::ZipImage {
-        zip_path: PathBuf::from("c:/x.zip"),
-        entry_name: "p1.jpg".to_string(),
-    };
-    let pdf_page = GridItem::PdfPage {
-        pdf_path: PathBuf::from("c:/x.pdf"),
-        page_num: 0,
-        content_type: None,
-    };
-    let video = GridItem::Video(PathBuf::from("c:/x.mp4"));
-    for item in [&image, &zip_image, &pdf_page, &video] {
-        assert!(!cell_has_lower_left_container_badge(
-            item,
-            &ThumbnailState::Pending
-        ));
-    }
 }
 
 #[test]
@@ -16027,14 +16013,14 @@ mod favorite_adjustment_defaults_tests {
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             egui::TextureOptions::LINEAR,
         );
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(holdover));
+        app.fs_holdover_tex = Some(single_folder_navigation_holdover(idx, holdover));
         // capture 時点の generation を lock。その後フォルダ移動で items_generation が進む。
         app.fs_nav_locked_gen = Some(app.items_generation);
         app.items_generation = app.items_generation.wrapping_add(1);
 
         // 新 idx の full もサムネもまだ無い → holdover overlay で黒を防ぐ。
         assert!(
-            app.fs_nav_holdover_tex_for_draw().is_some(),
+            app.fs_nav_holdover_for_draw().is_some(),
             "new content not ready yet -> keep showing the previous frame (no black flicker)"
         );
 
@@ -16057,9 +16043,165 @@ mod favorite_adjustment_defaults_tests {
             },
         );
         assert!(
-            app.fs_nav_holdover_tex_for_draw().is_none(),
+            app.fs_nav_holdover_for_draw().is_none(),
             "once new content is ready the holdover must stop so no stale image lingers"
         );
+    }
+
+    #[test]
+    fn capture_fs_nav_holdover_keeps_single_page_as_one_display_unit() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\single.jpg");
+        let texture = ctx.load_texture(
+            "folder_nav_single_unit",
+            egui::ColorImage::filled([2, 3], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let texture_id = texture.id();
+        app.thumbnails[idx] = ThumbnailState::Loaded {
+            tex: texture,
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 64,
+            source_dims: Some((2, 3)),
+        };
+        app.visible_indices = vec![idx];
+        app.spread_mode = crate::settings::SpreadMode::Single;
+
+        app.capture_fs_nav_holdover(idx);
+
+        let FsHoldover::FolderNavigation(unit) =
+            app.fs_holdover_tex.as_ref().expect("holdover captured")
+        else {
+            panic!("folder navigation must own its own release state");
+        };
+        assert_eq!(unit.pages.len(), 1);
+        assert_eq!(unit.pages[0].idx, idx);
+        assert_eq!(unit.pages[0].texture.id(), texture_id);
+    }
+
+    #[test]
+    fn folder_nav_holdover_geometry_survives_index_reuse_after_items_advance() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\old.jpg");
+        let texture = ctx.load_texture(
+            "folder_nav_geometry_old",
+            egui::ColorImage::filled([4, 7], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: texture,
+                pixels: std::sync::Arc::new(egui::ColorImage::filled([4, 7], egui::Color32::WHITE)),
+                source_dims: Some([400, 700]),
+                load_seq: 0,
+            },
+        );
+        app.rotation_cache
+            .insert(idx, crate::rotation_db::Rotation::Cw90);
+        app.fullscreen_idx = Some(idx);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+
+        app.capture_fs_nav_holdover(idx);
+
+        // Folder replacement reuses idx=0 for a different identity. The new item has a
+        // different rotation and no display texture yet, so the old unit must keep drawing.
+        app.items[idx] = crate::grid_item::GridItem::Image(PathBuf::from(r"C:\pics\new.jpg"));
+        app.fs_cache.clear();
+        app.thumbnails[idx] = ThumbnailState::Pending;
+        app.rotation_cache.clear();
+        app.rotation_cache
+            .insert(idx, crate::rotation_db::Rotation::Cw270);
+        app.items_generation = app.items_generation.wrapping_add(1);
+
+        assert_eq!(
+            app.get_rotation(idx),
+            crate::rotation_db::Rotation::Cw270,
+            "the reused index must now resolve geometry for the new item"
+        );
+        let held = app
+            .fs_nav_holdover_for_draw()
+            .expect("old display unit remains until the new texture is ready");
+        assert_eq!(held.pages.len(), 1);
+        assert_eq!(
+            held.pages[0].rotation,
+            crate::rotation_db::Rotation::Cw90,
+            "holdover geometry must be the capture-time old-item geometry"
+        );
+        assert_eq!(held.pages[0].source_size, Some(egui::vec2(400.0, 700.0)));
+    }
+
+    #[test]
+    fn capture_fs_nav_holdover_keeps_ltr_and_rtl_physical_spread_order() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let first = push_image(&mut app, "C:/pics/001.jpg");
+        let second = push_image(&mut app, "C:/pics/002.jpg");
+        let first_texture = ctx.load_texture(
+            "folder_nav_spread_first",
+            egui::ColorImage::filled([2, 3], egui::Color32::RED),
+            egui::TextureOptions::LINEAR,
+        );
+        let second_texture = ctx.load_texture(
+            "folder_nav_spread_second",
+            egui::ColorImage::filled([2, 3], egui::Color32::BLUE),
+            egui::TextureOptions::LINEAR,
+        );
+        let first_texture_id = first_texture.id();
+        let second_texture_id = second_texture.id();
+        app.thumbnails[first] = ThumbnailState::Loaded {
+            tex: first_texture,
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 64,
+            source_dims: Some((2, 3)),
+        };
+        app.thumbnails[second] = ThumbnailState::Loaded {
+            tex: second_texture,
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 64,
+            source_dims: Some((2, 3)),
+        };
+        app.visible_indices = vec![first, second];
+        app.cached_nav_indices = None;
+
+        for (mode, expected_indices, expected_textures) in [
+            (
+                crate::settings::SpreadMode::Ltr,
+                vec![first, second],
+                vec![first_texture_id, second_texture_id],
+            ),
+            (
+                crate::settings::SpreadMode::Rtl,
+                vec![second, first],
+                vec![second_texture_id, first_texture_id],
+            ),
+        ] {
+            app.spread_mode = mode;
+            app.capture_fs_nav_holdover(first);
+            let FsHoldover::FolderNavigation(unit) = app
+                .fs_holdover_tex
+                .as_ref()
+                .expect("spread holdover captured")
+            else {
+                panic!("folder navigation must retain a display unit");
+            };
+            assert_eq!(
+                unit.pages.iter().map(|page| page.idx).collect::<Vec<_>>(),
+                expected_indices,
+            );
+            assert_eq!(
+                unit.pages
+                    .iter()
+                    .map(|page| page.texture.id())
+                    .collect::<Vec<_>>(),
+                expected_textures,
+            );
+        }
     }
 
     #[test]
@@ -17363,10 +17505,10 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = Some(0);
         let locked_gen = app.items_generation;
         app.fs_nav_locked_gen = Some(locked_gen);
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(old_tex));
+        app.fs_holdover_tex = Some(single_folder_navigation_holdover(0, old_tex));
 
         assert!(
-            app.fs_nav_holdover_tex_for_draw().is_some(),
+            app.fs_nav_holdover_for_draw().is_some(),
             "新 target がまだ入る前は旧ページ holdover を使ってよい"
         );
 
@@ -17389,7 +17531,7 @@ mod favorite_adjustment_defaults_tests {
         // ここで None にすると新画像デコード完了までの数フレームが黒になり、装飾付き
         // detached window で「次のファイルへ移るたびにちらつく」症状になる。
         assert!(
-            app.fs_nav_holdover_tex_for_draw().is_some(),
+            app.fs_nav_holdover_for_draw().is_some(),
             "新 target の表示物が未準備の間は holdover で黒を防ぐ (滑らかに繋ぐ)"
         );
 
@@ -17408,7 +17550,7 @@ mod favorite_adjustment_defaults_tests {
             source_dims: None,
         }];
         assert!(
-            app.fs_nav_holdover_tex_for_draw().is_none(),
+            app.fs_nav_holdover_for_draw().is_none(),
             "新 target の表示物が用意できたら holdover を停止して stale 旧画像を残さない"
         );
         assert!(
@@ -17423,11 +17565,14 @@ mod favorite_adjustment_defaults_tests {
         // Reproduce the transient empty display resolution during an AI-final swap.
         // Once the new page has been selected, the old-folder holdover must not return.
         app.thumbnails = vec![ThumbnailState::Pending];
-        let resurfaced = app.fs_nav_holdover_tex_for_draw();
+        let resurfaced = app.fs_nav_holdover_for_draw();
         assert!(
             resurfaced.is_none(),
             "old holdover resurfaced after the new page was shown: old_tex_id={old_tex_id:?}, selected={:?}",
-            resurfaced.as_ref().map(egui::TextureHandle::id)
+            resurfaced
+                .as_ref()
+                .and_then(|unit| unit.pages.first())
+                .map(|page| page.texture.id())
         );
     }
 
@@ -17445,7 +17590,7 @@ mod favorite_adjustment_defaults_tests {
 
         let locked_gen = app.items_generation;
         app.fs_nav_locked_gen = Some(locked_gen);
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(old_tex));
+        app.fs_holdover_tex = Some(single_folder_navigation_holdover(0, old_tex));
         app.fullscreen_idx = None;
         app.items_generation = locked_gen + 1;
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
@@ -17457,7 +17602,7 @@ mod favorite_adjustment_defaults_tests {
         });
 
         assert!(
-            app.fs_nav_holdover_tex_for_draw().is_some(),
+            app.fs_nav_holdover_for_draw().is_some(),
             "deferred enumerate 中は旧ページ holdover で待機画面を維持する"
         );
     }
@@ -18178,7 +18323,7 @@ mod favorite_adjustment_defaults_tests {
             egui::TextureOptions::LINEAR,
         );
         let holdover_id = holdover.id();
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(holdover));
+        app.fs_holdover_tex = Some(single_folder_navigation_holdover(0, holdover));
 
         app.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
 
@@ -18265,7 +18410,7 @@ mod favorite_adjustment_defaults_tests {
         // items_generation は変えない (= 0)、ロック発火時の gen は 0 を記録する想定
         let lock_gen = app.items_generation;
         app.fs_nav_locked_gen = Some(lock_gen);
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(dummy_tex.clone()));
+        app.fs_holdover_tex = Some(single_folder_navigation_holdover(0, dummy_tex.clone()));
 
         // ① items_generation が進んでいない (= まだナビが完了していない) →
         //    現ページが Loaded でもロック解除されない (主要バグの回帰防止)。
@@ -18284,7 +18429,7 @@ mod favorite_adjustment_defaults_tests {
         // ③ フルスクリーン抜け (fs_idx None) でも、items_generation 進行が必要。
         //    そうしないとナビ最中の close_fullscreen 経路で誤解除される。
         app.fs_nav_locked_gen = Some(app.items_generation);
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(dummy_tex.clone()));
+        app.fs_holdover_tex = Some(single_folder_navigation_holdover(0, dummy_tex.clone()));
         app.fullscreen_idx = None;
         app.poll_fs_nav_lock(&ctx);
         assert!(
@@ -18321,7 +18466,7 @@ mod favorite_adjustment_defaults_tests {
         // ナビ発火時に lock + holdover を確保した状態を再現。
         let lock_gen = app.items_generation;
         app.fs_nav_locked_gen = Some(lock_gen);
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(dummy_tex.clone()));
+        app.fs_holdover_tex = Some(single_folder_navigation_holdover(0, dummy_tex.clone()));
         // close_fullscreen → load_pdf_as_folder → placeholder install と進んで、
         // fullscreen_idx は None、items_generation は進んだが、async enumerate は
         // まだ pending という状態。
@@ -19490,8 +19635,12 @@ mod pipeline_cache_refactor_tests {
                 pages: vec![FsDisplayUnitHoldoverPage {
                     idx: page_idx,
                     texture,
+                    rotation: crate::rotation_db::Rotation::None,
+                    source_size: None,
+                    content_bbox: None,
                 }],
             },
+            started_at: std::time::Instant::now(),
         })
     }
 
@@ -21015,11 +21164,14 @@ mod pipeline_cache_refactor_tests {
                 load_seq: 1,
             },
         );
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(ctx.load_texture(
-            format!("{label}_holdover"),
-            egui::ColorImage::filled([1, 1], egui::Color32::BLACK),
-            egui::TextureOptions::LINEAR,
-        )));
+        app.fs_holdover_tex = Some(single_folder_navigation_holdover(
+            idx,
+            ctx.load_texture(
+                format!("{label}_holdover"),
+                egui::ColorImage::filled([1, 1], egui::Color32::BLACK),
+                egui::TextureOptions::LINEAR,
+            ),
+        ));
     }
 
     fn install_colorize_summary_edit_result(
@@ -23309,6 +23461,227 @@ mod pipeline_cache_refactor_tests {
             .expect("AI-enabled PDF test params should produce a final key")
     }
 
+    fn store_matching_pdf_final_ai(
+        app: &mut App,
+        idx: usize,
+        edit_size: [usize; 2],
+        pixels: Arc<egui::ColorImage>,
+    ) -> FinalAiKey {
+        let key = pdf_final_ai_key(app, idx, edit_size);
+        let retained_key = app
+            .retained_final_ai_key_for(idx, key, edit_size)
+            .expect("PDF retained final key");
+        assert!(app.insert_retained_pdf_final_ai(idx, retained_key, pixels));
+        key
+    }
+
+    #[test]
+    fn fs_page_load_state_prevents_same_idx_same_params_reentry() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_pdf_page(&mut app, r"C:\books\pending.pdf", 0);
+        app.visible_indices = vec![idx];
+        app.fullscreen_idx = Some(idx);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let input_seq = app.input_seq;
+        app.fs_pending
+            .insert(idx, (Arc::clone(&cancel), rx, input_seq));
+
+        for _ in 0..120 {
+            assert_eq!(app.ensure_fs_page_load(idx), FsPageLoadState::LoadPending);
+            let active_cancel = &app.fs_pending.get(&idx).expect("same pending request").0;
+            assert!(
+                Arc::ptr_eq(active_cancel, &cancel),
+                "the per-frame guard must not replace an equivalent in-flight request"
+            );
+        }
+
+        tx.send(FsLoadResult::StaticCached {
+            pixels: Arc::new(egui::ColorImage::new([2, 2], vec![egui::Color32::WHITE; 4])),
+            source_dims: [2, 2],
+        })
+        .unwrap();
+        app.poll_prefetch(&ctx);
+
+        assert_eq!(
+            app.fs_page_load_state(idx),
+            FsPageLoadState::DisplayReady(FsPageDisplaySource::LiveCache)
+        );
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn pdf_spread_reaches_both_pages_without_user_input() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        enable_pdf_final_ai_params(&mut app);
+        let left = push_pdf_page(&mut app, r"C:\books\spread.pdf", 19);
+        let right = push_pdf_page(&mut app, r"C:\books\spread.pdf", 20);
+        app.visible_indices = vec![left, right];
+        app.details_order = vec![left, right];
+        app.fullscreen_idx = Some(left);
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        assert_eq!(
+            app.resolve_spread_pair(left),
+            SpreadPair::Double { left, right }
+        );
+
+        store_matching_pdf_final_ai(
+            &mut app,
+            left,
+            [4, 4],
+            Arc::new(egui::ColorImage::new(
+                [8, 8],
+                vec![egui::Color32::from_rgb(40, 50, 60); 64],
+            )),
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let right_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let input_seq = app.input_seq;
+        app.fs_pending
+            .insert(right, (Arc::clone(&right_cancel), rx, input_seq));
+
+        // Repeated display-target reconciliation must not classify the retained left page as
+        // loading and cancel the right page on every frame.
+        for _ in 0..120 {
+            app.update_prefetch_window(left);
+            assert!(app.fs_pending.contains_key(&right));
+            assert!(!right_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        }
+
+        tx.send(FsLoadResult::StaticCached {
+            pixels: Arc::new(egui::ColorImage::new(
+                [4, 4],
+                vec![egui::Color32::LIGHT_BLUE; 16],
+            )),
+            source_dims: [4, 4],
+        })
+        .unwrap();
+        app.poll_prefetch(&ctx);
+
+        assert!(
+            app.ensure_final_composite_texture(&ctx, left).is_some(),
+            "retained left page should materialize a display texture"
+        );
+        assert!(
+            app.resolve_fs_display_tex(right, true).is_some(),
+            "right page render should finish without any user operation"
+        );
+        assert!(app.fs_page_load_state(left).is_display_ready());
+        assert!(app.fs_page_load_state(right).is_display_ready());
+    }
+
+    #[test]
+    fn full_retained_store_keeps_both_spread_page_slots_stable() {
+        let mut app = setup_app();
+        app.settings.retained_final_ai_cache_max_entries = 10;
+        app.settings.retained_final_ai_cache_max_mib = 64;
+
+        for ordinal in 0..8 {
+            let idx = push_image(&mut app, &format!(r"C:\imgs\{ordinal:02}.png"));
+            let key = FinalAiKey {
+                edit_key: dummy_edit_key(&app, idx),
+                color_ai_hash: ordinal as u64 + 1,
+                bg: 0,
+            };
+            assert!(app.insert_retained_final_ai(
+                idx,
+                key,
+                [1, 1],
+                Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK],)),
+            ));
+        }
+
+        enable_pdf_final_ai_params(&mut app);
+        let left = push_pdf_page(&mut app, r"C:\books\full-spread.pdf", 19);
+        let right = push_pdf_page(&mut app, r"C:\books\full-spread.pdf", 20);
+        app.visible_indices = vec![left, right];
+        app.fullscreen_idx = Some(left);
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        for idx in [left, right] {
+            assert!(app.insert_retained_pdf_page_raster(
+                idx,
+                [4, 4],
+                Arc::new(egui::ColorImage::new([4, 4], vec![egui::Color32::GRAY; 16],)),
+            ));
+        }
+        assert_eq!(app.retained_cross_session_cache_entries(), 10);
+
+        for idx in [left, right, left, right] {
+            store_matching_pdf_final_ai(
+                &mut app,
+                idx,
+                [4, 4],
+                Arc::new(egui::ColorImage::new(
+                    [8, 8],
+                    vec![egui::Color32::WHITE; 64],
+                )),
+            );
+        }
+
+        let left_key = app.retained_pdf_page_key_for(left).unwrap();
+        let right_key = app.retained_pdf_page_key_for(right).unwrap();
+        for key in [&left_key, &right_key] {
+            assert!(matches!(
+                app.retained_pdf_page_cache
+                    .get(key)
+                    .map(|entry| &entry.kind),
+                Some(RetainedPdfPageCacheKind::FinalAi { .. })
+            ));
+        }
+        assert_eq!(
+            app.retained_cross_session_cache_entries(),
+            10,
+            "promoting either side must replace its page slot, not evict the other side"
+        );
+    }
+
+    #[test]
+    fn single_pdf_page_does_not_reenter_after_retained_early_completion() {
+        let mut app = setup_app();
+        enable_pdf_final_ai_params(&mut app);
+        let idx = push_pdf_page(&mut app, r"C:\books\single.pdf", 0);
+        app.visible_indices = vec![idx];
+        app.details_order = vec![idx];
+        app.fullscreen_idx = Some(idx);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        store_matching_pdf_final_ai(
+            &mut app,
+            idx,
+            [4, 4],
+            Arc::new(egui::ColorImage::new(
+                [8, 8],
+                vec![egui::Color32::WHITE; 64],
+            )),
+        );
+
+        let targets = [
+            crate::pdf_loader::PdfDisplayTarget {
+                width_px: 1920,
+                height_px: 1080,
+                fit_mode: crate::pdf_loader::PdfDisplayFitMode::Page,
+            },
+            crate::pdf_loader::PdfDisplayTarget {
+                width_px: 1921,
+                height_px: 1080,
+                fit_mode: crate::pdf_loader::PdfDisplayFitMode::Page,
+            },
+        ];
+        for frame in 0..120 {
+            app.fs_pdf_display_target = Some(targets[frame % targets.len()]);
+            assert_eq!(
+                app.ensure_fs_page_load(idx),
+                FsPageLoadState::DisplayReady(FsPageDisplaySource::RetainedPdfFinalAi)
+            );
+            app.update_prefetch_window(idx);
+            assert!(app.fs_pending.is_empty());
+            assert!(app.fs_upload_backlog.is_empty());
+        }
+    }
+
     #[test]
     fn pdf_retained_page_cache_promotes_raster_to_final_ai_without_duplicate_store() {
         let mut app = setup_app();
@@ -23388,10 +23761,16 @@ mod pipeline_cache_refactor_tests {
         ));
         assert!(app.insert_retained_pdf_final_ai(idx, retained_key, Arc::clone(&final_pixels),));
 
-        app.start_fs_load(idx);
+        for _ in 0..8 {
+            assert_eq!(
+                app.ensure_fs_page_load(idx),
+                FsPageLoadState::DisplayReady(FsPageDisplaySource::RetainedPdfFinalAi),
+                "caller guard must treat matching retained FinalAi as display-ready"
+            );
+        }
         assert!(
             app.fs_pending.is_empty() && app.fs_upload_backlog.is_empty(),
-            "matching retained FinalAi should avoid starting PDF render"
+            "matching retained FinalAi should avoid entering the PDF render producer"
         );
 
         let tex = app.restore_retained_pdf_final_ai_composite(&ctx, idx);
@@ -24066,6 +24445,26 @@ mod pipeline_cache_refactor_tests {
             app.ensure_final_composite_pixels_with_key(&ctx, idx)
                 .is_some(),
             "copy/export path must recover after AI failure"
+        );
+    }
+
+    #[test]
+    fn pending_same_key_final_effect_skips_the_repeated_cpu_build() {
+        assert!(
+            should_return_cached_final_composite(false, true, false, true),
+            "AI ready + same-key final-effect pending must reuse the incomplete texture"
+        );
+        assert!(
+            !should_return_cached_final_composite(false, true, false, false),
+            "a missing or different-key job must continue into the CPU build path"
+        );
+        assert!(
+            !should_return_cached_final_composite(false, false, true, true),
+            "AI failure must still reach the complete=true promotion path"
+        );
+        assert!(
+            should_return_cached_final_composite(false, false, false, false),
+            "the existing AI-wait provisional cache behavior remains unchanged"
         );
     }
 
@@ -25922,7 +26321,7 @@ mod still_window_mode_key_tests {
 
     fn assert_test_media_paused_at(app: &App, idx: usize, position_secs: f64) {
         let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&idx) else {
-            panic!("test media player was dropped");
+            unreachable!();
         };
         assert!(!player.intent_playing());
         assert_eq!(player.position(), position_secs);
@@ -26351,7 +26750,7 @@ mod still_window_mode_key_tests {
             });
             bundle.items_generation = 5;
             bundle.fs_nav_locked_gen = Some(4);
-            bundle.fs_holdover_tex = Some(FsHoldover::FolderNavigation(holdover));
+            bundle.fs_holdover_tex = Some(single_folder_navigation_holdover(0, holdover));
         });
 
         run_active_detached_frame_for_test(&mut app, &ctx);
@@ -30732,7 +31131,108 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn tray_hide_pauses_mounted_video_presentations_and_resumes_from_same_position() {
+    #[cfg(windows)]
+    fn tray_resident_continuous_eof_advances_parked_audio() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let current_path = app.tmp.path().join("resident-current.flac");
+        let next_path = app.tmp.path().join("resident-next.flac");
+        let current = push_audio(&mut app, current_path.to_str().unwrap());
+        let next = push_audio(&mut app, next_path.to_str().unwrap());
+        app.fullscreen_idx = Some(current);
+        app.selected = Some(current);
+        app.window_visible = false;
+        app.video_continuous_mode = crate::video::VideoContinuousMode::Continuous;
+        app.native_video_parked_live_input_window_id = Some(82);
+        install_playing_test_media(&mut app, current, current_path, 30.0);
+        app.fs_cache.insert(
+            next,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    next_path, 0.0,
+                )),
+                load_seq: 0,
+            },
+        );
+
+        let (request_tx, request_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        app.media_navigation_resolver = Some(MediaNavigationResolver {
+            request_tx,
+            result_rx,
+            next_request_id: 0,
+        });
+        let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&current) else {
+            unreachable!();
+        };
+        player.mark_eof_for_test(30.0);
+        assert!(
+            app.tray_resident_media_updates_needed(),
+            "an unhandled continuous EOF must keep the hidden loop alive until poll_video owns it"
+        );
+
+        app.poll_video(&ctx);
+
+        let request = request_rx
+            .recv()
+            .expect("resident EOF must start next-item resolution");
+        assert!(
+            app.tray_resident_media_updates_needed(),
+            "the hidden loop must stay awake while the EOF handoff owns a pending decision"
+        );
+        result_tx
+            .send(MediaNavigationResolverResponse {
+                request_id: request.request_id,
+                result: MediaNavigationResolveResult {
+                    target_idx: Some(next),
+                    missing: Vec::new(),
+                },
+            })
+            .unwrap();
+
+        app.poll_media_navigation_pending(&ctx);
+
+        assert_eq!(app.fullscreen_idx, Some(next));
+        let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&next) else {
+            unreachable!();
+        };
+        assert!(player.intent_playing(), "the next track must start playing");
+        assert!(app.tray_resident_media_updates_needed());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn tray_resident_wake_excludes_paused_media_and_non_media() {
+        let mut app = setup_app();
+        app.window_visible = false;
+        assert!(
+            !app.tray_resident_media_updates_needed(),
+            "tray residency without media must remain fully idle"
+        );
+
+        let paused_path = app.tmp.path().join("resident-paused.mp4");
+        let paused = push_video(&mut app, paused_path.to_str().unwrap());
+        app.fullscreen_idx = Some(paused);
+        app.fs_cache.insert(
+            paused,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    paused_path,
+                    12.0,
+                )),
+                load_seq: 0,
+            },
+        );
+
+        assert!(
+            !app.tray_resident_media_updates_needed(),
+            "a paused resident player must not enable the hidden-window wake"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn tray_residency_preserves_mounted_video_transport_and_session() {
         for (case, presentation) in [
             ("fullscreen", ViewerPresentation::Fullscreen),
             ("in_window", ViewerPresentation::MainWindow),
@@ -30749,8 +31249,7 @@ mod still_window_mode_key_tests {
             }
             install_playing_test_media(&mut app, video, path.clone(), 30.0);
 
-            assert!(app.pause_media_playback_for_tray());
-            assert_test_media_paused_at(&app, video, 30.0);
+            assert_eq!(app.prepare_media_session_for_tray_residency(), 1);
             assert_eq!(app.fullscreen_idx, Some(video));
             assert_eq!(app.viewer_presentation, presentation);
             assert_eq!(
@@ -30763,9 +31262,23 @@ mod still_window_mode_key_tests {
             let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&video) else {
                 unreachable!();
             };
-            player.set_playing(true);
-            assert!(player.intent_playing());
-            assert_eq!(player.position(), 30.0, "{case} must resume in place");
+            assert!(
+                player.intent_playing(),
+                "{case} transport must keep running"
+            );
+            assert_eq!(player.position(), 30.0, "{case} must remain in place");
+
+            let ctx = egui::Context::default();
+            app.window_visible = false;
+            app.sync_after_restore(&ctx);
+            let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&video) else {
+                unreachable!();
+            };
+            assert!(
+                player.intent_playing(),
+                "{case} restore must not synthesize pause/play"
+            );
+            assert_eq!(app.fullscreen_idx, Some(video));
         }
     }
 
@@ -30819,7 +31332,106 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn tray_hide_pauses_video_audio_mode_and_standalone_music() {
+    #[cfg(windows)]
+    fn remote_session_acquire_pauses_mounted_active_and_parked_live_media_at_position() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let mounted_path = PathBuf::from(r"C:\clips\remote-mounted.mp4");
+        let active_path = PathBuf::from(r"C:\clips\remote-active.mp4");
+        let parked_path = PathBuf::from(r"C:\clips\remote-parked.mp4");
+
+        let mounted = push_video(&mut app, mounted_path.to_str().unwrap());
+        app.fullscreen_idx = Some(mounted);
+        install_playing_test_media(&mut app, mounted, mounted_path.clone(), 17.5);
+
+        let mut active = ViewerContextBundle::empty();
+        active.items.push(GridItem::Video(active_path.clone()));
+        active.fullscreen_idx = Some(0);
+        let active_player =
+            crate::video::VideoPlayer::disconnected_for_test(active_path.clone(), 51.0);
+        active_player.set_playing(true);
+        active.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(active_player),
+                load_seq: 0,
+            },
+        );
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: active });
+        app.begin_active_detached_session(200, DetachedSource::Video);
+
+        let mut parked = ViewerContextBundle::empty();
+        parked.items.push(GridItem::Video(parked_path.clone()));
+        parked.fullscreen_idx = Some(0);
+        let parked_player =
+            crate::video::VideoPlayer::disconnected_for_test(parked_path.clone(), 63.0);
+        parked_player.set_playing(true);
+        parked.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(parked_player),
+                load_seq: 0,
+            },
+        );
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 201, parked));
+        app.transition_detached_window_state(
+            201,
+            DetachedWindowState::ParkedLive,
+            "test_remote_session_pause",
+        );
+
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".to_owned(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: Some("phone".to_owned()),
+            },
+        });
+        app.poll_remote_session(&ctx);
+
+        assert_test_media_paused_at(&app, mounted, 17.5);
+        let active = &app.active_detached_viewer_context.as_ref().unwrap().bundle;
+        let Some(FsCacheEntry::Video { player, .. }) = active.fs_cache.get(&0) else {
+            unreachable!();
+        };
+        assert!(!player.intent_playing());
+        assert_eq!(player.position(), 51.0);
+        let parked = app.detached_image_windows[0]
+            .paused_bundle
+            .as_deref()
+            .unwrap();
+        let Some(FsCacheEntry::Video { player, .. }) = parked.fs_cache.get(&0) else {
+            unreachable!();
+        };
+        assert!(!player.intent_playing());
+        assert_eq!(player.position(), 63.0);
+
+        for (path, position) in [
+            (&mounted_path, 17.5),
+            (&active_path, 51.0),
+            (&parked_path, 63.0),
+        ] {
+            assert_eq!(
+                app.settings
+                    .video_resume_positions
+                    .get(&crate::adjustment_db::normalize_path(path)),
+                Some(&position)
+            );
+        }
+        assert!(app.active_detached_viewer_context.is_some());
+        assert!(app.detached_image_windows[0].paused_bundle.is_some());
+        assert_eq!(
+            app.detached_window_state(201),
+            Some(DetachedWindowState::ParkedLive)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn tray_residency_preserves_video_audio_mode_and_standalone_music_transport() {
         for (case, standalone_audio) in [("video_audio_mode", false), ("music", true)] {
             let mut app = setup_app();
             let extension = if standalone_audio { "flac" } else { "mp4" };
@@ -30837,12 +31449,11 @@ mod still_window_mode_key_tests {
             }
             install_playing_test_media(&mut app, media, path.clone(), 42.0);
 
-            assert!(app.pause_media_playback_for_tray());
-            assert_test_media_paused_at(&app, media, 42.0);
+            assert_eq!(app.prepare_media_session_for_tray_residency(), 1);
             assert_eq!(
                 app.video_audio_mode,
                 (!standalone_audio).then_some(media),
-                "{case} mode must remain intact while paused"
+                "{case} mode must remain intact during tray residency"
             );
             assert_eq!(
                 app.settings
@@ -30854,15 +31465,14 @@ mod still_window_mode_key_tests {
             let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&media) else {
                 unreachable!();
             };
-            player.set_playing(true);
             assert!(player.intent_playing());
-            assert_eq!(player.position(), 42.0, "{case} must resume in place");
+            assert_eq!(player.position(), 42.0, "{case} must remain in place");
         }
     }
 
     #[test]
     #[cfg(windows)]
-    fn tray_hide_pauses_active_and_parked_detached_media_contexts() {
+    fn tray_residency_preserves_active_and_parked_detached_media_contexts() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let active_path = PathBuf::from(r"C:\clips\tray-active.mp4");
@@ -30899,15 +31509,12 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(parked_bundle_snapshot(&ctx, 201, parked));
 
-        assert!(
-            !app.pause_media_playback_for_tray(),
-            "the return value describes the mounted context only"
-        );
+        assert_eq!(app.prepare_media_session_for_tray_residency(), 2);
         let active = &app.active_detached_viewer_context.as_ref().unwrap().bundle;
         let Some(FsCacheEntry::Video { player, .. }) = active.fs_cache.get(&0) else {
             unreachable!();
         };
-        assert!(!player.intent_playing());
+        assert!(player.intent_playing());
         assert_eq!(player.position(), 51.0);
         let parked = app.detached_image_windows[0]
             .paused_bundle
@@ -30916,7 +31523,7 @@ mod still_window_mode_key_tests {
         let Some(FsCacheEntry::Video { player, .. }) = parked.fs_cache.get(&0) else {
             unreachable!();
         };
-        assert!(!player.intent_playing());
+        assert!(player.intent_playing());
         assert_eq!(player.position(), 63.0);
         assert_eq!(
             app.settings
@@ -30933,7 +31540,7 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn tray_restore_main_focus_does_not_close_media_paused_on_hide() {
+    fn tray_restore_main_focus_does_not_close_running_media() {
         for (case, standalone_audio, audio_mode) in [
             ("video", false, false),
             ("video_audio_mode", false, true),
@@ -30959,7 +31566,7 @@ mod still_window_mode_key_tests {
             app.fs_focus_grace_elapsed = true;
             install_playing_test_media(&mut app, media, path, 75.0);
 
-            assert!(app.pause_media_playback_for_tray());
+            assert_eq!(app.prepare_media_session_for_tray_residency(), 1);
             app.window_visible = false;
             app.sync_after_restore(&ctx);
             app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
@@ -30969,7 +31576,14 @@ mod still_window_mode_key_tests {
                 Some(media),
                 "{case} must not be closed on the restore frame"
             );
-            assert_test_media_paused_at(&app, media, 75.0);
+            let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&media) else {
+                unreachable!();
+            };
+            assert!(
+                player.intent_playing(),
+                "{case} transport must survive restore"
+            );
+            assert_eq!(player.position(), 75.0);
         }
     }
 
@@ -32215,6 +32829,42 @@ mod still_window_mode_key_tests {
                 .any(|k| k.starts_with(&format!("{old_k}/"))),
             "旧キーは残らない"
         );
+    }
+
+    #[test]
+    fn rename_migration_completion_reloads_only_matching_edit_preview_thumbnails() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let old = std::path::Path::new(r"D:\Comics\old.zip");
+        let new = std::path::Path::new(r"D:\Comics\new.zip");
+        let new_k = crate::adjustment_db::normalize_path(new);
+        let target = push_image(&mut app, "D:/Comics/target.jpg");
+        let unrelated = push_image(&mut app, "D:/Comics/unrelated.jpg");
+        let loaded = |name: &str| ThumbnailState::Loaded {
+            tex: ctx.load_texture(
+                name,
+                egui::ColorImage::filled([1, 1], egui::Color32::GRAY),
+                egui::TextureOptions::LINEAR,
+            ),
+            from_cache: true,
+            from_edit_preview: false,
+            rendered_at_px: 1,
+            source_dims: Some((1, 1)),
+        };
+        app.thumbnails[target] = loaded("rename_preview_target");
+        app.thumbnails[unrelated] = loaded("rename_preview_unrelated");
+        app.thumb_edit_preview_keys
+            .insert(target, format!("{new_k}::pages/p1.jpg"));
+        app.thumb_edit_preview_keys
+            .insert(unrelated, "d:/comics/new.zip2::pages/p1.jpg".to_string());
+
+        app.refresh_edit_preview_thumbnails_after_rename(old, new);
+
+        assert!(matches!(app.thumbnails[target], ThumbnailState::Evicted));
+        assert!(matches!(
+            app.thumbnails[unrelated],
+            ThumbnailState::Loaded { .. }
+        ));
     }
 
     #[test]
@@ -42745,6 +43395,41 @@ mod smart_folder_transition_tests {
         assert!(!app.is_snapshot_active(), "Snapshot Lock must be released");
     }
 
+    fn selected_real_path(app: &App) -> Option<&Path> {
+        app.selected
+            .and_then(|index| app.items.get(index))
+            .and_then(GridItem::drag_source_path)
+    }
+
+    fn select_real_path(app: &mut App, path: &Path) -> usize {
+        let index = app
+            .items
+            .iter()
+            .position(|item| {
+                item.drag_source_path()
+                    .is_some_and(|candidate| crate::folder_tree::path_eq(candidate, path))
+            })
+            .expect("root entry must be materialized");
+        app.selected = Some(index);
+        index
+    }
+
+    fn drain_smart_folder_nav(app: &mut App, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.folder_nav_pending.is_some() {
+            if let Some(result) = app.poll_folder_nav() {
+                app.apply_folder_nav_result(ctx, result);
+            } else {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "smart-folder navigation did not finish before the deadline"
+                );
+                std::thread::yield_now();
+            }
+        }
+        assert_eq!(app.pending_folder_nav_steps, 0);
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum SyntheticSearchOrigin {
         DriveList,
@@ -42798,15 +43483,13 @@ mod smart_folder_transition_tests {
         let definition = definition("Smart Scope", source);
         let id = definition.id;
         app.settings.smart_folders = vec![definition];
-
-        let state = super::top_level_grid_view::SmartFolderViewState::root(id, vec![entry.clone()]);
-        app.top_level_grid_view
-            .replace_surface(super::top_level_grid_view::TopLevelGridSurface::SmartFolder(state));
-        app.items_are_smart_folder_view = true;
-        app.current_smart_folder_id = Some(id);
-        app.current_folder = Some(crate::app::smart_folder::smart_folder_synthetic_path(id));
+        app.current_folder = Some(normal.clone());
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
         assert!(app.begin_smart_folder_drill(&entry));
         app.load_folder(entry.clone());
+        assert!(app.begin_smart_folder_drill(&child));
         app.load_folder(child.clone());
         assert_eq!(
             app.top_level_grid_view
@@ -42830,6 +43513,7 @@ mod smart_folder_transition_tests {
                 if crate::folder_tree::path_eq(&path, &synthetic)
         ));
 
+        assert!(app.begin_smart_folder_drill(&child));
         app.load_folder(child.clone());
         app.open_global_search();
         app.close_global_search();
@@ -42879,15 +43563,479 @@ mod smart_folder_transition_tests {
             .expect("history forward");
         assert_eq!(
             app.dispatch_synthetic_folder_history_target(&forward),
-            super::SyntheticFolderHistoryDispatch::Restored
+            super::SyntheticFolderHistoryDispatch::NotSynthetic
         );
-        assert_eq!(
+        app.load_folder(forward);
+        assert!(app.top_level_grid_view.smart_folder_session().is_none());
+        assert!(app.top_level_grid_view.smart_folder().is_none());
+    }
+
+    #[test]
+    fn smart_folder_plain_open_and_return_selects_the_opened_root_entry() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-return-plain-origin");
+        let source = app.tmp.path().join("smart-return-plain-source");
+        let entry = source.join("entry-a");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("page.jpg"), []).unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Return Plain", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        select_real_path(&mut app, &entry);
+        app.scroll_offset_y = 234.0;
+        app.scroll_to_selected = false;
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry.clone());
+
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+        assert!(
+            selected_real_path(&app)
+                .is_some_and(|selected| crate::folder_tree::path_eq(selected, &entry))
+        );
+        assert_eq!(app.scroll_offset_y, 234.0);
+        assert!(
+            !app.scroll_to_selected,
+            "returning to the already-selected visible entry must preserve the exact offset"
+        );
+        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_prepare_pending.is_none());
+    }
+
+    #[test]
+    fn smart_folder_ctrl_down_from_entry_a_to_c_returns_cursor_to_c() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-return-nav-origin");
+        let source = app.tmp.path().join("smart-return-nav-source");
+        let entries = ["entry-a", "entry-b", "entry-c"].map(|name| source.join(name));
+        std::fs::create_dir_all(&origin).unwrap();
+        for entry in &entries {
+            std::fs::create_dir_all(entry).unwrap();
+            std::fs::write(entry.join("page.jpg"), []).unwrap();
+        }
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Return Nav", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        select_real_path(&mut app, &entries[0]);
+        app.scroll_to_selected = false;
+        assert!(app.begin_smart_folder_drill(&entries[0]));
+        app.load_folder(entries[0].clone());
+        assert!(app.start_smart_folder_scope_nav(true, false));
+        assert!(app.start_smart_folder_scope_nav(true, false));
+        drain_smart_folder_nav(&mut app, &ctx);
+        assert!(
             app.top_level_grid_view
                 .smart_folder()
-                .and_then(|state| state.scoped_current()),
-            Some(child.as_path()),
-            "history forward must restore the entire smart-folder scope"
+                .and_then(|state| state.scoped_current())
+                .is_some_and(|current| crate::folder_tree::path_eq(current, &entries[2]))
         );
+
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+        assert!(
+            selected_real_path(&app)
+                .is_some_and(|selected| crate::folder_tree::path_eq(selected, &entries[2]))
+        );
+        assert!(
+            app.scroll_to_selected,
+            "the shared parent-return path must ensure the newly selected entry is visible"
+        );
+        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_prepare_pending.is_none());
+    }
+
+    #[test]
+    fn smart_folder_nested_child_return_selects_its_containing_root_entry() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-return-nested-origin");
+        let source = app.tmp.path().join("smart-return-nested-source");
+        let entry = source.join("entry-a");
+        let child = entry.join("child");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("page.jpg"), []).unwrap();
+        app.current_folder = Some(origin);
+        let mut definition = definition("Smart Return Nested", source);
+        definition.rules[0].filter.name_contains = "entry-a".into();
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        select_real_path(&mut app, &entry);
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry.clone());
+        assert!(app.start_smart_folder_scope_nav(true, false));
+        drain_smart_folder_nav(&mut app, &ctx);
+        assert!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current())
+                .is_some_and(|current| crate::folder_tree::path_eq(current, &child))
+        );
+
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+        assert!(
+            selected_real_path(&app)
+                .is_some_and(|selected| crate::folder_tree::path_eq(selected, &entry))
+        );
+        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_prepare_pending.is_none());
+    }
+
+    #[test]
+    fn smart_folder_missing_return_entry_keeps_the_prepared_root_selection() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-return-missing-origin");
+        let source = app.tmp.path().join("smart-return-missing-source");
+        let entry_a = source.join("entry-a");
+        let entry_c = source.join("entry-c");
+        std::fs::create_dir_all(&origin).unwrap();
+        for entry in [&entry_a, &entry_c] {
+            std::fs::create_dir_all(entry).unwrap();
+            std::fs::write(entry.join("page.jpg"), []).unwrap();
+        }
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Return Missing", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        select_real_path(&mut app, &entry_a);
+        assert!(app.begin_smart_folder_drill(&entry_c));
+        app.load_folder(entry_c.clone());
+        std::fs::remove_dir_all(&entry_c).unwrap();
+        app.remove_paths_from_smart_folder_snapshots(std::slice::from_ref(&entry_c));
+
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+        assert!(
+            selected_real_path(&app)
+                .is_some_and(|selected| crate::folder_tree::path_eq(selected, &entry_a))
+        );
+        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_prepare_pending.is_none());
+    }
+
+    #[test]
+    fn smart_folder_session_return_restores_offset_with_its_auto_aspect_without_prepare() {
+        use crate::settings::ThumbAspect;
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-session-origin");
+        let source = app.tmp.path().join("smart-session-source");
+        let entry = source.join("entry");
+        let page = entry.join("page.jpg");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(&page, []).unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Session", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        let selected = app
+            .items
+            .iter()
+            .position(|item| item.drag_source_path() == Some(entry.as_path()))
+            .expect("opened root entry");
+        app.settings.thumb_aspect_auto = true;
+        let saved_aspect = ThumbAspect::Portrait2x3;
+        let saved_offset = 900.0;
+        let saved_switch_at = std::time::Instant::now();
+        app.auto_aspect.items_generation = app.items_generation;
+        app.auto_aspect
+            .samples
+            .insert(selected, saved_aspect.height_ratio());
+        app.auto_aspect.current = Some(saved_aspect);
+        app.auto_aspect.cached_sample_gate = Some(7);
+        app.auto_aspect.switches_done = 1;
+        app.auto_aspect.last_switch_at = Some(saved_switch_at);
+        app.auto_aspect.streak = Some((saved_aspect, saved_switch_at, 1));
+        app.selected = Some(selected);
+        app.scroll_offset_y = saved_offset;
+        app.scroll_to_selected = false;
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry);
+        assert!(
+            app.top_level_grid_view
+                .smart_folder_session()
+                .is_some_and(|session| session.has_prepared_grid())
+        );
+        assert_eq!(
+            app.effective_thumb_aspect(),
+            ThumbAspect::Square,
+            "the child owns a separate auto-aspect state"
+        );
+
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_prepare_pending.is_none());
+        assert_eq!(app.selected, Some(selected));
+        assert!(
+            !app.scroll_to_selected,
+            "an unchanged layout must keep the exact saved offset without an ensure-visible pass"
+        );
+        assert_eq!(
+            (app.scroll_offset_y, app.effective_thumb_aspect()),
+            (saved_offset, saved_aspect),
+            "the offset and the row-height dependency it was measured against must travel together"
+        );
+        assert_eq!(app.auto_aspect.items_generation, app.items_generation);
+        assert_eq!(
+            app.auto_aspect.samples.get(&selected).copied(),
+            Some(saved_aspect.height_ratio())
+        );
+        assert_eq!(app.auto_aspect.cached_sample_gate, Some(7));
+        assert_eq!(app.auto_aspect.switches_done, 1);
+        assert_eq!(app.auto_aspect.last_switch_at, Some(saved_switch_at));
+        assert_eq!(
+            app.auto_aspect.streak,
+            Some((saved_aspect, saved_switch_at, 1))
+        );
+        assert!(
+            app.items
+                .iter()
+                .any(|item| item.drag_source_path() == Some(page.as_path()))
+        );
+    }
+
+    #[test]
+    fn smart_folder_session_return_keeps_selected_visible_when_columns_change_without_prepare() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-session-layout-origin");
+        let source = app.tmp.path().join("smart-session-layout-source");
+        std::fs::create_dir_all(&origin).unwrap();
+        let entries = (0..30)
+            .map(|index| {
+                let entry = source.join(format!("entry-{index:02}"));
+                std::fs::create_dir_all(&entry).unwrap();
+                std::fs::write(entry.join("page.jpg"), []).unwrap();
+                entry
+            })
+            .collect::<Vec<_>>();
+        let entry = entries.last().expect("last root entry").clone();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Session Layout", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        let saved_cols = 6;
+        let changed_cols = 2;
+        let cell_h = 100.0;
+        let viewport_h = 300.0;
+        app.settings.grid_cols = saved_cols;
+        let selected = app
+            .items
+            .iter()
+            .position(|item| item.drag_source_path() == Some(entry.as_path()))
+            .expect("opened root entry");
+        let selected_position = app
+            .current_grid_order()
+            .iter()
+            .position(|&index| index == selected)
+            .unwrap();
+        assert!(selected_position >= 12, "test needs a multi-row grid");
+        let saved_offset = (selected_position / saved_cols) as f32 * cell_h;
+        app.selected = Some(selected);
+        app.scroll_offset_y = saved_offset;
+        app.scroll_to_selected = false;
+
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry);
+        app.settings.grid_cols = changed_cols;
+
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_prepare_pending.is_none());
+        assert_eq!(app.settings.grid_cols, changed_cols);
+        assert_eq!(app.selected, Some(selected));
+        assert_eq!(
+            app.scroll_offset_y, saved_offset,
+            "restore installs the saved snapshot before the shared ensure-visible pass"
+        );
+        assert!(
+            app.scroll_to_selected,
+            "changed layout must reuse ordinary folder navigation's ensure-visible path"
+        );
+
+        app.last_viewport_h = viewport_h;
+        app.apply_scroll_to_selected(changed_cols, cell_h);
+        let selected_position = app
+            .current_grid_order()
+            .iter()
+            .position(|&index| index == selected)
+            .unwrap();
+        let selected_row_top = (selected_position / changed_cols) as f32 * cell_h;
+        let selected_row_bottom = selected_row_top + cell_h;
+        assert_ne!(app.scroll_offset_y, saved_offset);
+        assert!(selected_row_top >= app.scroll_offset_y);
+        assert!(selected_row_bottom <= app.scroll_offset_y + viewport_h);
+    }
+
+    #[test]
+    fn leaving_smart_folder_session_discards_result_and_synthetic_return_rescans() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-leave-origin");
+        let source = app.tmp.path().join("smart-leave-source");
+        let entry = source.join("entry");
+        let outside = app.tmp.path().join("smart-leave-outside");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(entry.join("page.jpg"), []).unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Leave", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry);
+        app.load_folder(outside);
+        assert!(app.top_level_grid_view.smart_folder_session().is_none());
+
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+        assert!(app.smart_folder_pending.is_some());
+        assert!(app.smart_folder_prepare_pending.is_none());
+    }
+
+    #[test]
+    fn explicit_smart_folder_reopen_discards_session_and_rescans() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-reopen-origin");
+        let source = app.tmp.path().join("smart-reopen-source");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("page.jpg"), []).unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Reopen", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        assert!(app.top_level_grid_view.smart_folder_session().is_some());
+
+        app.open_smart_folder(id, true);
+        assert!(app.top_level_grid_view.smart_folder_session().is_none());
+        assert!(app.smart_folder_pending.is_some());
+        assert!(app.smart_folder_prepare_pending.is_none());
+    }
+
+    #[test]
+    fn deleted_item_does_not_survive_resident_smart_folder_return() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-delete-origin");
+        let source = app.tmp.path().join("smart-delete-source");
+        let entry = source.join("entry");
+        let deleted = entry.join("deleted.jpg");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(&deleted, []).unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Delete", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        assert!(
+            app.items
+                .iter()
+                .any(|item| item.drag_source_path() == Some(deleted.as_path()))
+        );
+
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry);
+        std::fs::remove_file(&deleted).unwrap();
+        app.remove_paths_from_smart_folder_snapshots(std::slice::from_ref(&deleted));
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+        assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+
+        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_prepare_pending.is_none());
+        assert!(
+            !app.items
+                .iter()
+                .any(|item| item.drag_source_path() == Some(deleted.as_path()))
+        );
+    }
+
+    #[test]
+    fn smart_folder_grouping_and_definition_edits_rebuild_resident_session() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-edit-origin");
+        let source = app.tmp.path().join("smart-edit-source");
+        let entry = source.join("entry");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("page.jpg"), []).unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Edit", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition.clone()];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry);
+
+        let mut grouped = definition;
+        grouped.grouping = crate::settings::SubfolderExpansionOrder::FolderGrouped;
+        app.settings.smart_folders[0] = grouped.clone();
+        app.update_smart_folder_presentation(grouped);
+        assert!(app.smart_folder_prepare_pending.is_some());
+        assert!(app.smart_folder_pending.is_none());
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        assert!(app.items_are_smart_folder_view);
+        assert!(matches!(
+            app.top_level_grid_view
+                .smart_folder()
+                .map(|state| &state.position),
+            Some(super::top_level_grid_view::SmartFolderPosition::Root)
+        ));
+
+        app.settings.smart_folders[0].rules[0].include_descendants = false;
+        app.invalidate_smart_folder_definition(id);
+        assert!(app.top_level_grid_view.smart_folder_session().is_none());
+        assert!(app.smart_folder_pending.is_some());
     }
 
     #[test]
@@ -42957,12 +44105,12 @@ mod smart_folder_transition_tests {
         let id = definition.id;
         app.settings.smart_folders = vec![definition];
         let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
-        let state = super::top_level_grid_view::SmartFolderViewState::root(id, vec![entry.clone()]);
-        app.top_level_grid_view
-            .replace_surface(super::top_level_grid_view::TopLevelGridSurface::SmartFolder(state));
-        app.items_are_smart_folder_view = true;
-        app.current_smart_folder_id = Some(id);
-        app.current_folder = Some(synthetic.clone());
+        let origin = app.tmp.path().join("smart-history-origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        app.current_folder = Some(origin);
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
 
         assert!(app.begin_smart_folder_drill(&entry));
         app.load_folder(entry.clone());
@@ -43372,9 +44520,10 @@ mod smart_folder_transition_tests {
         app.open_favsearch();
         app.current_folder = Some(super::search_results_synthetic_path());
         app.open_local_metadata_search();
-        assert!(app.smart_folder_prepare_pending.is_some());
+        assert!(app.smart_folder_pending.is_some());
         app.open_global_search();
 
+        assert!(app.smart_folder_pending.is_none());
         assert!(app.smart_folder_prepare_pending.is_none());
         assert_eq!(app.global_search.saved_folder.as_ref(), Some(&smart_path));
     }
@@ -43765,7 +44914,7 @@ mod smart_folder_transition_tests {
     }
 
     #[test]
-    fn smart_folder_metadata_writes_invalidate_resort_generation() {
+    fn smart_folder_metadata_writes_keep_resident_session_frozen() {
         use crate::app::smart_folder::{
             SmartFolderDiag, SmartFolderEntry, SmartFolderEntryKind, SmartFolderSnapshot,
         };
@@ -43800,91 +44949,28 @@ mod smart_folder_transition_tests {
         app.smart_folder_generation = app.smart_folder_generation.wrapping_add(1);
         app.start_smart_folder_prepare(snapshot, false);
         wait_for_smart_folder_idle(&mut app, &ctx, id);
-        assert!(app.smart_folder_resort_metadata.contains_key(&id));
+        assert!(
+            app.top_level_grid_view
+                .smart_folder_session()
+                .is_some_and(|session| session.has_reused_metadata())
+        );
 
         let revision = app.smart_folder_metadata_revision;
         app.set_rating(0, 4);
-        assert!(app.smart_folder_metadata_revision > revision);
-        assert!(app.smart_folder_resort_metadata.is_empty());
-        app.reprepare_current_smart_folder_for_sort();
-        wait_for_smart_folder_idle(&mut app, &ctx, id);
-        assert_eq!(app.rating_cache.get(&0), Some(&4));
-
+        assert_eq!(app.smart_folder_metadata_revision, revision);
+        assert!(
+            app.top_level_grid_view
+                .smart_folder_session()
+                .is_some_and(|session| session.has_reused_metadata())
+        );
         app.schedule_current_smart_folder_metadata_refresh(
-            crate::app::smart_folder::SmartFolderMetadataDependency::Tags,
+            crate::app::smart_folder::SmartFolderMetadataDependency::Rating,
         );
-        assert!(app.smart_folder_resort_metadata.is_empty());
-        app.reprepare_current_smart_folder_for_sort();
-        wait_for_smart_folder_idle(&mut app, &ctx, id);
-
-        let mut params = crate::adjustment::AdjustParams::default();
-        params.brightness = 12.0;
-        app.set_page_params(0, params.clone());
-        assert!(app.smart_folder_resort_metadata.is_empty());
-        app.reprepare_current_smart_folder_for_sort();
-        wait_for_smart_folder_idle(&mut app, &ctx, id);
-        assert_eq!(app.adjustment_page_params.get(&0), Some(&params));
-
-        let crop = crate::export_crop::CropSettings {
-            rect: crate::export_crop::CropRect {
-                min_x: 10.0,
-                min_y: 10.0,
-                max_x: 90.0,
-                max_y: 90.0,
-            },
-            aspect_mode: crate::export_crop::CropAspectMode::Free,
-        };
-        app.set_export_crop_for_idx(0, Some(crop), [100, 100]);
-        assert!(app.smart_folder_resort_metadata.is_empty());
-        app.reprepare_current_smart_folder_for_sort();
-        wait_for_smart_folder_idle(&mut app, &ctx, id);
-        assert_eq!(app.export_crop_page_settings.get(&0), Some(&crop));
-
-        let trim = crate::view_trim::ViewTrimPageOverride::from_margins(
-            crate::view_trim::ViewTrimMargins {
-                left: 0.1,
-                top: 0.1,
-                right: 0.1,
-                bottom: 0.1,
-            },
-        );
-        app.view_trim_page_overrides.insert(0, trim);
-        app.persist_view_trim_page_override(0, trim);
-        assert!(app.smart_folder_resort_metadata.is_empty());
-        app.reprepare_current_smart_folder_for_sort();
-        wait_for_smart_folder_idle(&mut app, &ctx, id);
-        assert_eq!(app.view_trim_page_overrides.get(&0), Some(&trim));
-
-        let revision = app.smart_folder_metadata_revision;
-        app.apply_tag_legacy_seed_result(crate::tag_legacy_seed_worker::LegacySeedResult {
-            report: Default::default(),
-            cache_updates: vec![(source.join("page.jpg"), vec!["legacy".into()])],
-        });
-        assert!(app.smart_folder_metadata_revision > revision);
-        assert!(app.smart_folder_resort_metadata.is_empty());
-
-        app.reprepare_current_smart_folder_for_sort();
-        wait_for_smart_folder_idle(&mut app, &ctx, id);
-        app.items_are_smart_folder_view = false;
-        app.current_smart_folder_id = None;
-        app.current_folder = Some(source.clone());
-        let revision = app.smart_folder_metadata_revision;
-        assert!(app.set_current_folder_rating(3).unwrap());
-        assert!(app.smart_folder_metadata_revision > revision);
-        assert!(app.smart_folder_resort_metadata.is_empty());
-
-        app.items_are_smart_folder_view = true;
-        app.current_smart_folder_id = Some(id);
-        app.reprepare_current_smart_folder_for_sort();
-        wait_for_smart_folder_idle(&mut app, &ctx, id);
-        let xmp_path = source.join("xmp-only.jpg");
-        app.items.push(GridItem::Image(xmp_path.clone()));
-        let revision = app.smart_folder_metadata_revision;
-        let rating_generation =
-            app.rating_session_generation_for_key(&crate::adjustment_db::normalize_path(&xmp_path));
-        app.hydrate_ratings_from_xmp(vec![(xmp_path, 2, rating_generation)]);
-        assert!(app.smart_folder_metadata_revision > revision);
-        assert!(app.smart_folder_resort_metadata.is_empty());
+        assert!(app.smart_folder_metadata_refresh_due.is_none());
+        app.smart_folder_metadata_refresh_due = Some(std::time::Instant::now());
+        app.poll_smart_folder_metadata_refresh(&ctx);
+        assert!(app.smart_folder_metadata_refresh_due.is_none());
+        assert!(app.smart_folder_prepare_pending.is_none());
     }
 
     #[test]
@@ -44547,6 +45633,433 @@ fn fullscreen_i_key_toggles_side_panel_mode() {
         app.settings.fullscreen_side_panel_mode,
         crate::settings::FsSidePanelMode::ClickToShow
     );
+}
+
+#[test]
+fn plain_a_has_no_bookmark_panel_fullscreen_action() {
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items
+        .push(GridItem::Image(PathBuf::from("C:/photos/panel-a.jpg")));
+    app.fullscreen_idx = Some(idx);
+    app.adjustment_mode = true;
+    app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+    let ctx = egui::Context::default();
+    ctx.begin_pass(egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        ..Default::default()
+    });
+
+    let action = app.handle_fs_key_input(&ctx, idx, false);
+    let _ = ctx.end_pass();
+
+    assert!(action.page_nav.is_none());
+    assert!(!action.close);
+    assert!(!action.close_to_page_list);
+    assert!(app.adjustment_mode);
+    assert!(!app.local_adjust_mode);
+    assert_eq!(
+        app.settings.fullscreen_side_panel_mode,
+        crate::settings::FsSidePanelMode::Hover
+    );
+}
+
+fn fullscreen_fixed_key_event(key: egui::Key) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+fn fullscreen_fixed_key_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    let guard = crate::key_input::TEST_INPUT_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .expect("fullscreen fixed-key test lock poisoned");
+    crate::key_input::clear_test_frame();
+    guard
+}
+
+fn setup_fullscreen_fixed_key_test() -> (phase_c_support::AppTestEnv, usize, egui::Context) {
+    let mut app = phase_c_support::setup_app();
+    app.items.extend([
+        GridItem::Image(PathBuf::from("C:/photos/permit-prev.jpg")),
+        GridItem::Image(PathBuf::from("C:/photos/permit-current.jpg")),
+        GridItem::Image(PathBuf::from("C:/photos/permit-next.jpg")),
+    ]);
+    let idx = app.items.len() - 2;
+    app.fullscreen_idx = Some(idx);
+    (app, idx, egui::Context::default())
+}
+
+#[track_caller]
+fn assert_no_fullscreen_fixed_key_action(action: crate::ui_fullscreen::FsKeyAction) {
+    assert!(!action.close);
+    assert!(!action.close_to_page_list);
+    assert!(action.page_nav.is_none());
+    assert_eq!(action.ctrl_nav, None);
+    assert_eq!(action.sibling_nav, None);
+    assert_eq!(action.jump_to, None);
+}
+
+fn start_bookmark_title_edit_after_handler(app: &mut App, ctx: &egui::Context, fs_idx: usize) {
+    ctx.begin_pass(Default::default());
+    let action = app.handle_fs_key_input(ctx, fs_idx, false);
+    assert_no_fullscreen_fixed_key_action(action);
+
+    let bookmark_id = 42;
+    app.claim_pending_text_input_focus(
+        ctx.viewport_id(),
+        crate::ui_adjustment_panel::book_bookmark_title_edit_widget_id(bookmark_id),
+        ctx.cumulative_pass_nr(),
+    );
+    app.book_bookmark_title_edit = Some(BookBookmarkTitleEdit {
+        id: bookmark_id,
+        title: String::from("editing"),
+        request_focus: true,
+    });
+    let _ = ctx.end_pass();
+}
+
+fn draw_bookmark_title_editor(app: &mut App, ctx: &egui::Context) {
+    egui::CentralPanel::default().show(ctx, |ui| {
+        let edit = app
+            .book_bookmark_title_edit
+            .as_mut()
+            .expect("bookmark title editor must be active");
+        let _ = crate::ui_adjustment_panel::draw_bookmark_title_edit_for_test(
+            ui,
+            edit.id,
+            &mut edit.title,
+            &mut edit.request_focus,
+        );
+    });
+}
+
+fn focus_bookmark_title_editor(app: &mut App, ctx: &egui::Context, fs_idx: usize) {
+    ctx.begin_pass(Default::default());
+    let owner = app.keyboard_owner_for_pass(ctx);
+    assert!(
+        matches!(
+            owner,
+            crate::keyboard_input::KeyboardOwner::TextInput {
+                phase: crate::keyboard_input::TextInputPhase::PendingFocus,
+                ..
+            }
+        ),
+        "first editor draw must be pending-focus owned, got {owner:?}"
+    );
+    let action = app.handle_fs_key_input(ctx, fs_idx, false);
+    assert_no_fullscreen_fixed_key_action(action);
+    draw_bookmark_title_editor(app, ctx);
+    let _ = ctx.end_pass();
+    assert!(
+        app.pending_text_input_focus.get().is_some(),
+        "pending focus claim must survive until the handler observes focused TextEdit"
+    );
+
+    let edit = app
+        .book_bookmark_title_edit
+        .as_ref()
+        .expect("bookmark title editor must remain active");
+    let field_id = crate::ui_adjustment_panel::book_bookmark_title_edit_widget_id(edit.id);
+    assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
+}
+
+fn run_bookmark_title_key_pass(
+    app: &mut App,
+    ctx: &egui::Context,
+    fs_idx: usize,
+    key: egui::Key,
+) -> crate::ui_fullscreen::FsKeyAction {
+    ctx.begin_pass(egui::RawInput {
+        events: vec![fullscreen_fixed_key_event(key)],
+        ..Default::default()
+    });
+    let pending_before_owner = app.pending_text_input_focus.get();
+    let focused_before_owner = ctx.memory(|memory| memory.focused());
+    let pass_before_owner = ctx.cumulative_pass_nr();
+    let owner = app.keyboard_owner_for_pass(ctx);
+    assert!(
+        matches!(
+            owner,
+            crate::keyboard_input::KeyboardOwner::TextInput { .. }
+        ),
+        "bookmark editor key pass must be text-owned, got {owner:?}; pending={pending_before_owner:?} focused={focused_before_owner:?} pass={pass_before_owner}"
+    );
+    let action = app.handle_fs_key_input(ctx, fs_idx, false);
+    draw_bookmark_title_editor(app, ctx);
+    let _ = ctx.end_pass();
+    action
+}
+
+#[test]
+fn focused_bookmark_title_escape_does_not_close_fullscreen() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    start_bookmark_title_edit_after_handler(&mut app, &ctx, fs_idx);
+    focus_bookmark_title_editor(&mut app, &ctx, fs_idx);
+
+    let action = run_bookmark_title_key_pass(&mut app, &ctx, fs_idx, egui::Key::Escape);
+
+    assert_no_fullscreen_fixed_key_action(action);
+}
+
+#[test]
+fn focused_bookmark_title_arrows_do_not_navigate_fullscreen() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    start_bookmark_title_edit_after_handler(&mut app, &ctx, fs_idx);
+    focus_bookmark_title_editor(&mut app, &ctx, fs_idx);
+
+    for key in [
+        egui::Key::ArrowLeft,
+        egui::Key::ArrowRight,
+        egui::Key::ArrowUp,
+        egui::Key::ArrowDown,
+    ] {
+        let action = run_bookmark_title_key_pass(&mut app, &ctx, fs_idx, key);
+
+        assert_no_fullscreen_fixed_key_action(action);
+    }
+}
+
+#[test]
+fn pending_bookmark_title_focus_blocks_escape_and_arrows_before_request_focus_lands() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    for key in [
+        egui::Key::Escape,
+        egui::Key::ArrowLeft,
+        egui::Key::ArrowRight,
+        egui::Key::ArrowUp,
+        egui::Key::ArrowDown,
+    ] {
+        let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+        start_bookmark_title_edit_after_handler(&mut app, &ctx, fs_idx);
+
+        let action = run_bookmark_title_key_pass(&mut app, &ctx, fs_idx, key);
+
+        assert_no_fullscreen_fixed_key_action(action);
+    }
+}
+
+#[test]
+fn focused_slider_still_allows_fullscreen_arrow_navigation() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    let mut value = 0.5_f32;
+    ctx.begin_pass(Default::default());
+    egui::CentralPanel::default().show(&ctx, |ui| {
+        ui.add(egui::Slider::new(&mut value, 0.0..=1.0))
+            .request_focus();
+    });
+    let _ = ctx.end_pass();
+    assert!(ctx.wants_keyboard_input());
+
+    ctx.begin_pass(egui::RawInput {
+        events: vec![fullscreen_fixed_key_event(egui::Key::ArrowRight)],
+        ..Default::default()
+    });
+    let owner = app.keyboard_owner_for_pass(&ctx);
+    assert!(matches!(
+        owner,
+        crate::keyboard_input::KeyboardOwner::FocusedUi { .. }
+    ));
+    let action = app.handle_fs_key_input(&ctx, fs_idx, false);
+    let _ = ctx.end_pass();
+
+    assert!(!action.page_nav.is_none());
+}
+
+#[test]
+fn bookmark_title_draft_without_focus_or_ime_allows_fullscreen_arrows() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    app.book_bookmark_title_edit = Some(BookBookmarkTitleEdit {
+        id: 42,
+        title: String::from("draft only"),
+        request_focus: false,
+    });
+    ctx.begin_pass(egui::RawInput {
+        events: vec![fullscreen_fixed_key_event(egui::Key::ArrowRight)],
+        ..Default::default()
+    });
+
+    let action = app.handle_fs_key_input(&ctx, fs_idx, false);
+    let _ = ctx.end_pass();
+
+    assert!(!action.page_nav.is_none());
+}
+
+fn viewport_raw_input(viewport: egui::ViewportId, events: Vec<egui::Event>) -> egui::RawInput {
+    let mut input = egui::RawInput {
+        viewport_id: viewport,
+        events,
+        ..Default::default()
+    };
+    input.viewports.insert(
+        viewport,
+        egui::ViewportInfo {
+            parent: Some(egui::ViewportId::ROOT),
+            focused: Some(true),
+            ..Default::default()
+        },
+    );
+    input
+}
+
+#[test]
+fn destroyed_ime_viewport_does_not_block_sibling_fullscreen_shortcuts() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    let viewport_a = egui::ViewportId::from_hash_of("ime-owner-a");
+    let viewport_b = egui::ViewportId::from_hash_of("ime-owner-b");
+
+    ctx.begin_pass(viewport_raw_input(
+        viewport_a,
+        vec![egui::Event::Ime(egui::ImeEvent::Enabled)],
+    ));
+    app.update_ime_state(&ctx);
+    assert!(app.ime_input_active(&ctx));
+    let _ = ctx.end_pass();
+
+    ctx.begin_pass(viewport_raw_input(
+        viewport_b,
+        vec![fullscreen_fixed_key_event(egui::Key::ArrowRight)],
+    ));
+    let action = app.handle_fs_key_input(&ctx, fs_idx, false);
+    let _ = ctx.end_pass();
+
+    assert!(!action.page_nav.is_none());
+}
+
+#[test]
+fn ime_activity_recovers_when_enabled_viewport_disappears_without_terminal_event() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, _fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    let viewport_a = egui::ViewportId::from_hash_of("ime-recovery-a");
+    let viewport_b = egui::ViewportId::from_hash_of("ime-recovery-b");
+
+    ctx.begin_pass(viewport_raw_input(
+        viewport_a,
+        vec![egui::Event::Ime(egui::ImeEvent::Enabled)],
+    ));
+    app.update_ime_state(&ctx);
+    assert!(app.ime_input_active(&ctx));
+    let _ = ctx.end_pass();
+
+    ctx.begin_pass(viewport_raw_input(viewport_b, Vec::new()));
+    app.update_ime_state(&ctx);
+    assert!(!app.ime_input_active(&ctx));
+    let _ = ctx.end_pass();
+}
+
+#[test]
+fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() {
+    let _input_guard = crate::key_input::TEST_INPUT_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .expect("IME focus regression test lock poisoned");
+    crate::key_input::clear_test_frame();
+
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items.push(GridItem::Image(PathBuf::from(
+        "C:/photos/ime-bookmark-panel.jpg",
+    )));
+    app.fullscreen_idx = Some(idx);
+    app.adjustment_mode = true;
+    let ctx = egui::Context::default();
+    let field_id = egui::Id::new("ime-bookmark-title-focus-contract");
+    let mut title = String::new();
+    let mut request_focus = true;
+    let draw_field = |ctx: &egui::Context, title: &mut String, request_focus: &mut bool| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = crate::ime_focus::add_singleline(ui, title, Some(request_focus), |edit| {
+                edit.id(field_id)
+            });
+        });
+    };
+
+    ctx.begin_pass(Default::default());
+    draw_field(&ctx, &mut title, &mut request_focus);
+    let _ = ctx.end_pass();
+    assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
+
+    ctx.begin_pass(egui::RawInput {
+        events: vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+        ],
+        ..Default::default()
+    });
+    draw_field(&ctx, &mut title, &mut request_focus);
+    let _ = ctx.end_pass();
+
+    let alt = egui::Modifiers {
+        alt: true,
+        ..Default::default()
+    };
+    ctx.begin_pass(egui::RawInput {
+        modifiers: alt,
+        events: vec![
+            egui::Event::Ime(egui::ImeEvent::Disabled),
+            egui::Event::Key {
+                key: egui::Key::J,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: alt,
+            },
+        ],
+        ..Default::default()
+    });
+    // Windows Alt/IME processing can remove egui's focused widget before the
+    // App samples the pass owner. Model that platform transition directly.
+    ctx.memory_mut(|memory| memory.surrender_focus(field_id));
+    assert_eq!(
+        app.keyboard_owner_for_pass(&ctx),
+        crate::keyboard_input::KeyboardOwner::TextInput {
+            viewport: egui::ViewportId::ROOT,
+            widget_id: field_id,
+            phase: crate::keyboard_input::TextInputPhase::FocusRecovery,
+        }
+    );
+    draw_field(&ctx, &mut title, &mut request_focus);
+    let _ = ctx.end_pass();
+    assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
+
+    ctx.begin_pass(egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::I,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        ..Default::default()
+    });
+    let _ = app.handle_fs_key_input(&ctx, idx, false);
+    let _ = ctx.end_pass();
+
+    assert!(
+        app.adjustment_mode,
+        "the default FsToggleMetadata key must remain owned by the bookmark TextEdit"
+    );
+    assert_eq!(
+        app.settings.fullscreen_side_panel_mode,
+        crate::settings::FsSidePanelMode::Hover
+    );
+    crate::key_input::clear_test_frame();
 }
 
 #[test]

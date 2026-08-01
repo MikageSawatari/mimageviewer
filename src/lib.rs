@@ -89,6 +89,7 @@ pub mod global_search;
 mod global_search_ui;
 pub mod gpu_info;
 pub mod grid_item;
+mod ime_focus;
 pub mod indexer_manager;
 pub mod indexer_progress;
 pub mod indexer_supervisor;
@@ -114,6 +115,7 @@ pub mod monitor;
 pub mod name_bulk_indexer;
 pub mod name_index_supervisor;
 pub mod native_context_menu;
+mod native_name_dialog;
 pub mod open_with;
 pub mod os_theme;
 pub mod panorama;
@@ -166,6 +168,7 @@ mod tag_view;
 pub mod tag_write_worker;
 pub mod tags_db;
 pub mod thumb_loader;
+pub mod thumb_overlay_layout;
 pub mod tray;
 mod tray_integration;
 mod ui_adjustment_panel;
@@ -390,6 +393,11 @@ fn install_ui_heartbeat_watchdog() {
         .spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_secs(1));
+                #[cfg(windows)]
+                for message in crate::video::native_window_health::poll_native_window_watchdogs() {
+                    crate::logger::log(message.clone());
+                    append_panic_log_entry(&message);
+                }
                 let now_ms = state.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 if state.suspended.load(Ordering::Acquire) {
                     state.last_report_ms.store(now_ms, Ordering::Release);
@@ -439,9 +447,15 @@ fn install_ui_heartbeat_watchdog() {
                     .lock()
                     .map(|s| s.clone())
                     .unwrap_or_else(|_| "<heartbeat detail mutex poisoned>".to_owned());
+                #[cfg(windows)]
+                let native_window_health =
+                    crate::video::native_window_health::ui_hang_native_window_context();
+                #[cfg(not(windows))]
+                let native_window_health = "native_window_health=unsupported".to_string();
                 append_panic_log_entry(&format!(
                     "UI THREAD HANG suspected: no App::update heartbeat for {age_ms}ms \
-                 (last_ms={last_ms}, now_ms={now_ms}); last_detail={detail}"
+                 (last_ms={last_ms}, now_ms={now_ms}); last_detail={detail}; \
+                 {native_window_health}"
                 ));
             }
         });

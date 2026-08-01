@@ -11,8 +11,24 @@ pub enum TextInputPhase {
     PendingFocus,
     /// The text widget has keyboard focus.
     Focused,
+    /// A helper-managed field owned focus in the previous pass and begin-pass
+    /// key processing caused a transient keyboard-driven focus loss here.
+    FocusRecovery,
     /// The existing 300 ms IME event grace is active.
     ImeGrace,
+}
+
+/// The single text-input claim considered by the pass owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextInputClaim {
+    pub widget_id: egui::Id,
+    pub phase: TextInputPhase,
+}
+
+impl TextInputClaim {
+    pub const fn new(widget_id: egui::Id, phase: TextInputPhase) -> Self {
+        Self { widget_id, phase }
+    }
 }
 
 /// The application surface whose shortcuts are eligible in this viewport pass.
@@ -70,11 +86,41 @@ impl ShortcutPermit {
     }
 }
 
+/// Proof that the fullscreen fixed-key router may consume a raw egui key.
+///
+/// This is intentionally separate from [`ShortcutPermit`]. A focused non-text
+/// widget must keep allowing fixed fullscreen navigation (for example, an
+/// adjustment slider must not steal page arrows), while every text-input phase
+/// must retain the raw event for the editor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FullscreenRawKeyPermit {
+    viewport: egui::ViewportId,
+}
+
 impl KeyboardOwner {
     pub const fn shortcut_permit(self) -> Option<ShortcutPermit> {
         match self {
             Self::ApplicationShortcut { scope } => Some(ShortcutPermit { scope }),
             Self::Modal | Self::TextInput { .. } | Self::FocusedUi { .. } | Self::Unclaimed => None,
+        }
+    }
+
+    pub(crate) const fn fullscreen_raw_key_permit(self) -> Option<FullscreenRawKeyPermit> {
+        match self {
+            Self::ApplicationShortcut { scope }
+                if matches!(scope.surface, ShortcutSurface::Fullscreen) =>
+            {
+                Some(FullscreenRawKeyPermit {
+                    viewport: scope.viewport,
+                })
+            }
+            // Fixed Esc/arrows deliberately pass through non-text widget focus:
+            // sliders and similar controls must not take fullscreen navigation.
+            Self::FocusedUi { viewport, .. } => Some(FullscreenRawKeyPermit { viewport }),
+            Self::Modal
+            | Self::TextInput { .. }
+            | Self::ApplicationShortcut { .. }
+            | Self::Unclaimed => None,
         }
     }
 
@@ -86,7 +132,8 @@ impl KeyboardOwner {
         match self {
             Self::Modal => true,
             Self::TextInput {
-                phase: TextInputPhase::Focused | TextInputPhase::ImeGrace,
+                phase:
+                    TextInputPhase::Focused | TextInputPhase::FocusRecovery | TextInputPhase::ImeGrace,
                 ..
             } => true,
             Self::ApplicationShortcut { scope } => {
@@ -112,11 +159,26 @@ impl KeyboardOwner {
         matches!(
             self,
             Self::TextInput {
-                phase: TextInputPhase::Focused | TextInputPhase::ImeGrace,
+                phase: TextInputPhase::Focused
+                    | TextInputPhase::FocusRecovery
+                    | TextInputPhase::ImeGrace,
                 ..
             } | Self::FocusedUi { .. }
         )
     }
+}
+
+/// Consume a fixed fullscreen key only after the pass owner issued a permit.
+pub(crate) fn consume_fullscreen_raw_key(
+    ctx: &egui::Context,
+    permit: FullscreenRawKeyPermit,
+    modifiers: egui::Modifiers,
+    key: egui::Key,
+) -> bool {
+    if permit.viewport != ctx.viewport_id() {
+        return false;
+    }
+    ctx.input_mut(|input| input.consume_key(modifiers, key))
 }
 
 /// Pure inputs used to decide a viewport pass's keyboard owner.
@@ -129,9 +191,7 @@ pub struct KeyboardOwnershipSnapshot {
     pub viewport: egui::ViewportId,
     pub viewport_focused: bool,
     pub modal: bool,
-    pub focused_text_input: Option<egui::Id>,
-    pub pending_text_input: Option<egui::Id>,
-    pub ime_grace: bool,
+    pub text_input: Option<TextInputClaim>,
     pub focused_ui: Option<egui::Id>,
     pub shortcut_scope: Option<ShortcutScope>,
 }
@@ -142,28 +202,11 @@ pub const fn decide_keyboard_owner(snapshot: KeyboardOwnershipSnapshot) -> Keybo
     if snapshot.modal {
         return KeyboardOwner::Modal;
     }
-    if let Some(widget_id) = snapshot.focused_text_input {
+    if let Some(claim) = snapshot.text_input {
         return KeyboardOwner::TextInput {
             viewport: snapshot.viewport,
-            widget_id,
-            phase: TextInputPhase::Focused,
-        };
-    }
-    if snapshot.ime_grace {
-        return KeyboardOwner::TextInput {
-            viewport: snapshot.viewport,
-            widget_id: match snapshot.focused_ui {
-                Some(widget_id) => widget_id,
-                None => egui::Id::NULL,
-            },
-            phase: TextInputPhase::ImeGrace,
-        };
-    }
-    if let Some(widget_id) = snapshot.pending_text_input {
-        return KeyboardOwner::TextInput {
-            viewport: snapshot.viewport,
-            widget_id,
-            phase: TextInputPhase::PendingFocus,
+            widget_id: claim.widget_id,
+            phase: claim.phase,
         };
     }
     if let Some(widget_id) = snapshot.focused_ui {
@@ -333,9 +376,7 @@ mod tests {
             viewport: egui::ViewportId::ROOT,
             viewport_focused: true,
             modal: false,
-            focused_text_input: None,
-            pending_text_input: None,
-            ime_grace: false,
+            text_input: None,
             focused_ui: None,
             shortcut_scope: Some(scope(ShortcutSurface::Main)),
         }
@@ -347,7 +388,7 @@ mod tests {
         let ui_id = egui::Id::new("focused-ui");
 
         let mut input = snapshot();
-        input.focused_text_input = Some(text_id);
+        input.text_input = Some(TextInputClaim::new(text_id, TextInputPhase::Focused));
         assert_eq!(
             decide_keyboard_owner(input),
             KeyboardOwner::TextInput {
@@ -358,7 +399,7 @@ mod tests {
         );
 
         let mut input = snapshot();
-        input.pending_text_input = Some(text_id);
+        input.text_input = Some(TextInputClaim::new(text_id, TextInputPhase::PendingFocus));
         assert_eq!(
             decide_keyboard_owner(input),
             KeyboardOwner::TextInput {
@@ -369,7 +410,10 @@ mod tests {
         );
 
         let mut input = snapshot();
-        input.ime_grace = true;
+        input.text_input = Some(TextInputClaim::new(
+            egui::Id::NULL,
+            TextInputPhase::ImeGrace,
+        ));
         assert_eq!(
             decide_keyboard_owner(input),
             KeyboardOwner::TextInput {
@@ -406,9 +450,10 @@ mod tests {
         let mut input = snapshot();
         input.modal = true;
         input.viewport_focused = false;
-        input.focused_text_input = Some(egui::Id::new("text"));
-        input.pending_text_input = Some(egui::Id::new("pending"));
-        input.ime_grace = true;
+        input.text_input = Some(TextInputClaim::new(
+            egui::Id::new("text"),
+            TextInputPhase::Focused,
+        ));
         input.focused_ui = Some(egui::Id::new("ui"));
         input.shortcut_scope = Some(scope(ShortcutSurface::Fullscreen));
         assert_eq!(decide_keyboard_owner(input), KeyboardOwner::Modal);
@@ -417,7 +462,10 @@ mod tests {
     #[test]
     fn ime_grace_is_text_input_even_with_generic_focused_ui() {
         let mut input = snapshot();
-        input.ime_grace = true;
+        input.text_input = Some(TextInputClaim::new(
+            egui::Id::new("ime-widget"),
+            TextInputPhase::ImeGrace,
+        ));
         input.focused_ui = Some(egui::Id::new("ime-widget"));
         assert!(matches!(
             decide_keyboard_owner(input),
@@ -580,6 +628,46 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_raw_key_permit_blocks_text_phases_but_allows_focused_ui() {
+        for phase in [
+            TextInputPhase::PendingFocus,
+            TextInputPhase::Focused,
+            TextInputPhase::FocusRecovery,
+            TextInputPhase::ImeGrace,
+        ] {
+            let owner = KeyboardOwner::TextInput {
+                viewport: egui::ViewportId::ROOT,
+                widget_id: egui::Id::new("text"),
+                phase,
+            };
+            assert_eq!(owner.fullscreen_raw_key_permit(), None, "{phase:?}");
+        }
+
+        assert!(
+            KeyboardOwner::FocusedUi {
+                viewport: egui::ViewportId::ROOT,
+                widget_id: egui::Id::new("slider"),
+            }
+            .fullscreen_raw_key_permit()
+            .is_some()
+        );
+        assert!(
+            KeyboardOwner::ApplicationShortcut {
+                scope: scope(ShortcutSurface::Fullscreen),
+            }
+            .fullscreen_raw_key_permit()
+            .is_some()
+        );
+        assert_eq!(
+            KeyboardOwner::ApplicationShortcut {
+                scope: scope(ShortcutSurface::Main),
+            }
+            .fullscreen_raw_key_permit(),
+            None
+        );
+    }
+
+    #[test]
     fn legacy_main_shortcut_projection_matches_previous_inputs() {
         for viewport_focused in [false, true] {
             for modal in [false, true] {
@@ -590,9 +678,21 @@ mod tests {
                             let mut input = snapshot();
                             input.viewport_focused = viewport_focused;
                             input.modal = modal;
-                            input.focused_text_input =
-                                tracked_text_focus.then(|| egui::Id::new("tracked-text"));
-                            input.ime_grace = ime_grace;
+                            input.text_input = tracked_text_focus
+                                .then(|| {
+                                    TextInputClaim::new(
+                                        egui::Id::new("tracked-text"),
+                                        TextInputPhase::Focused,
+                                    )
+                                })
+                                .or_else(|| {
+                                    ime_grace.then(|| {
+                                        TextInputClaim::new(
+                                            egui::Id::new("ime-text"),
+                                            TextInputPhase::ImeGrace,
+                                        )
+                                    })
+                                });
                             input.focused_ui =
                                 wants_keyboard_input.then(|| egui::Id::new("egui-owner"));
                             input.shortcut_scope =
@@ -632,16 +732,14 @@ mod tests {
             }
         }
 
-        for phase in [TextInputPhase::Focused, TextInputPhase::ImeGrace] {
+        for phase in [
+            TextInputPhase::Focused,
+            TextInputPhase::FocusRecovery,
+            TextInputPhase::ImeGrace,
+        ] {
             let mut input = snapshot();
             input.focused_ui = Some(egui::Id::new("egui-text-owner"));
-            match phase {
-                TextInputPhase::Focused => {
-                    input.focused_text_input = Some(egui::Id::new("tracked-text"));
-                }
-                TextInputPhase::ImeGrace => input.ime_grace = true,
-                TextInputPhase::PendingFocus => unreachable!(),
-            }
+            input.text_input = Some(TextInputClaim::new(egui::Id::new("tracked-text"), phase));
             assert!(
                 decide_keyboard_owner(input).blocks_legacy_keymap_shortcuts(),
                 "{phase:?} must preserve the prior wants_keyboard_input=true answer"
@@ -649,7 +747,10 @@ mod tests {
         }
 
         let mut pending = snapshot();
-        pending.pending_text_input = Some(egui::Id::new("pending"));
+        pending.text_input = Some(TextInputClaim::new(
+            egui::Id::new("pending"),
+            TextInputPhase::PendingFocus,
+        ));
         assert!(
             !decide_keyboard_owner(pending).blocks_legacy_keymap_shortcuts(),
             "S3 must not activate PendingFocus as a new keymap block"

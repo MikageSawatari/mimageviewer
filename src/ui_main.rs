@@ -5440,7 +5440,12 @@ impl App {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("新しい本");
-                    ui.text_edit_singleline(&mut self.book_manager_new_name);
+                    crate::ime_focus::add_singleline(
+                        ui,
+                        &mut self.book_manager_new_name,
+                        None,
+                        |edit| edit,
+                    );
                     let name = crate::books::normalize_book_name(&self.book_manager_new_name);
                     let can_create = !name.trim().is_empty() && self.book_op_pending.is_none();
                     if ui
@@ -5491,8 +5496,11 @@ impl App {
                                             .book_manager_rename_inputs
                                             .entry(row.name.clone())
                                             .or_insert_with(|| row.name.clone());
-                                        ui.add(
-                                            egui::TextEdit::singleline(input).desired_width(220.0),
+                                        crate::ime_focus::add_singleline(
+                                            ui,
+                                            input,
+                                            None,
+                                            |edit| edit.desired_width(220.0),
                                         );
                                         let new_name = crate::books::normalize_book_name(input);
                                         let can_rename = !new_name.is_empty()
@@ -9398,12 +9406,16 @@ impl App {
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.label("検索:");
-                        let mut output =
-                            egui::TextEdit::singleline(&mut self.facet_tag_search_query)
-                                .hint_text("#タグ")
-                                .desired_width(150.0)
-                                .min_size(egui::vec2(150.0, 20.0))
-                                .show(ui);
+                        let mut output = crate::ime_focus::show_singleline(
+                            ui,
+                            &mut self.facet_tag_search_query,
+                            None,
+                            |edit| {
+                                edit.hint_text("#タグ")
+                                    .desired_width(150.0)
+                                    .min_size(egui::vec2(150.0, 20.0))
+                            },
+                        );
                         let _ = crate::ui_helpers::singleline_text_edit_context_menu(
                             ui,
                             &mut output,
@@ -10963,9 +10975,12 @@ impl App {
                                         .desired_width(f32::INFINITY),
                                 )
                             } else {
-                                let mut output = egui::TextEdit::singleline(&mut self.address)
-                                    .desired_width(f32::INFINITY)
-                                    .show(ui);
+                                let mut output = crate::ime_focus::show_singleline(
+                                    ui,
+                                    &mut self.address,
+                                    None,
+                                    |edit| edit.desired_width(f32::INFINITY),
+                                );
                                 crate::ui_helpers::singleline_text_edit_context_menu(
                                     ui,
                                     &mut output,
@@ -11087,13 +11102,8 @@ impl App {
         // §4.1.2: ZIP 表示中は検索対象をファイル名フィルタに固定する。
         let zip_view = self.grid_is_zip_entries();
 
-        // Enter は **raw** で読む。`dialog_enter_pressed` は IME 変換直後 300ms の
-        // グレース中も false を返すため、日本語で「おはよう[Enter]」と確定兼送信した
-        // ケースで検索が走らず、代わりにグリッドの Enter ショートカット (フルスクリーン)
-        // が走ってしまう。ここでは `response.lost_focus()` が Tab / クリック外しでも
-        // true になる性質を raw Enter との AND で打ち消し、"Enter でフォーカスを失った"
-        // ときだけ execute_search を呼ぶ。search_query は IME Commit で既に確定済み。
-        let raw_enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        // IME 変換確定の Enter は送信に使わず、確定後の通常 Enter だけを検索実行に使う。
+        let enter_pressed = self.dialog_enter_pressed(ctx);
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let local_search_label = self
             .keymap
@@ -11105,11 +11115,18 @@ impl App {
                     "{local_search_label}: 今開いているフォルダ / ZIP の表示中\n\
                      アイテムを名前やメタ情報で絞り込みます (索引不要・再帰なし)。"
                 ));
-                let mut output = egui::TextEdit::singleline(&mut self.search_query)
-                    .hint_text(r#"現在地のアイテムを名前やメタ情報で絞り込み (AND / -除外 / "…")"#)
-                    .desired_width(320.0)
-                    .min_size(egui::vec2(320.0, 20.0))
-                    .show(ui);
+                let mut output = crate::ime_focus::show_singleline(
+                    ui,
+                    &mut self.search_query,
+                    Some(&mut self.search_focus_request),
+                    |edit| {
+                        edit.hint_text(
+                            r#"現在地のアイテムを名前やメタ情報で絞り込み (AND / -除外 / "…")"#,
+                        )
+                        .desired_width(320.0)
+                        .min_size(egui::vec2(320.0, 20.0))
+                    },
+                );
                 let _menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,
@@ -11117,17 +11134,11 @@ impl App {
                 );
                 let response = output.response;
 
-                // フォーカスリクエスト
-                if self.search_focus_request {
-                    self.search_focus_request = false;
-                    response.request_focus();
-                }
-
                 // フォーカス状態を追跡
                 self.search_has_focus = response.has_focus();
 
-                // Enter で検索実行 (IME 変換確定の Enter も同じ扱い)
-                if response.lost_focus() && raw_enter_pressed {
+                // Enter で検索実行 (IME 変換確定の Enter は除外)
+                if response.lost_focus() && enter_pressed {
                     self.execute_search(ctx);
                     // フォーカスを外してカーソルキーでグリッド操作できるようにする
                     response.surrender_focus();
@@ -11274,9 +11285,7 @@ impl App {
         if !self.favsearch.active {
             return;
         }
-        // Ctrl+F 側と同じく raw Enter で判定する (IME 変換確定の Enter も送信扱い)。
-        // `response.lost_focus()` と AND することで Tab / クリック外しの誤発火は弾ける。
-        let raw_enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let enter_pressed = self.dialog_enter_pressed(ctx);
         let escape_pressed = self.dialog_escape_pressed(ctx);
 
         let mut close_requested = false;
@@ -11286,11 +11295,18 @@ impl App {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("コンテナ検索:");
-                let mut output = egui::TextEdit::singleline(&mut self.favsearch.query)
-                    .hint_text(r#"フォルダ・ZIP・PDF をコンテナ名で探す (AND / -除外 / "…")"#)
-                    .desired_width(320.0)
-                    .min_size(egui::vec2(320.0, 20.0))
-                    .show(ui);
+                let mut output = crate::ime_focus::show_singleline(
+                    ui,
+                    &mut self.favsearch.query,
+                    Some(&mut self.favsearch.focus_request),
+                    |edit| {
+                        edit.hint_text(
+                            r#"フォルダ・ZIP・PDF をコンテナ名で探す (AND / -除外 / "…")"#,
+                        )
+                        .desired_width(320.0)
+                        .min_size(egui::vec2(320.0, 20.0))
+                    },
+                );
                 let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,
@@ -11298,18 +11314,14 @@ impl App {
                 );
                 let response = output.response;
 
-                if self.favsearch.focus_request {
-                    self.favsearch.focus_request = false;
-                    response.request_focus();
-                }
                 self.favsearch.has_focus = response.has_focus();
 
                 // 入力が変わるたびに即座に検索を再実行 (小規模 DB 前提)
                 if response.changed() || menu_changed {
                     query_changed = true;
                 }
-                // Enter で確定的に再実行 (IME 変換確定の Enter も同じ扱い)
-                if response.lost_focus() && raw_enter_pressed {
+                // Enter で確定的に再実行 (IME 変換確定の Enter は除外)
+                if response.lost_focus() && enter_pressed {
                     query_changed = true;
                 }
 
@@ -11526,7 +11538,6 @@ impl App {
             return;
         }
 
-        let raw_enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let escape_pressed = self.dialog_escape_pressed(ctx);
 
         let mut close_requested = false;
@@ -11538,11 +11549,16 @@ impl App {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label("タグビュー:");
-                let mut output = egui::TextEdit::singleline(&mut self.tag_view.query)
-                    .hint_text("#タグ")
-                    .desired_width(260.0)
-                    .min_size(egui::vec2(260.0, 20.0))
-                    .show(ui);
+                let mut output = crate::ime_focus::show_singleline(
+                    ui,
+                    &mut self.tag_view.query,
+                    Some(&mut self.tag_view.focus_request),
+                    |edit| {
+                        edit.hint_text("#タグ")
+                            .desired_width(260.0)
+                            .min_size(egui::vec2(260.0, 20.0))
+                    },
+                );
                 let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,
@@ -11550,21 +11566,11 @@ impl App {
                 );
                 let response = output.response;
 
-                if self.tag_view.focus_request {
-                    self.tag_view.focus_request = false;
-                    response.request_focus();
-                }
                 self.tag_view.has_focus = response.has_focus();
 
                 if response.changed() || menu_changed {
                     query_changed = true;
                 }
-                if response.lost_focus() && raw_enter_pressed {
-                    response.request_focus();
-                    self.tag_view.focus_request = true;
-                    self.tag_view.has_focus = true;
-                }
-
                 let (pinned, recent, popular) = self.tag_view_menu_sections();
                 ui.menu_button("一覧▼", |ui| {
                     ui.set_min_width(260.0);
@@ -11665,6 +11671,7 @@ impl App {
         ctx: &egui::Context,
         cell_rect: egui::Rect,
         idx: usize,
+        overlay_layout: &crate::thumb_overlay_layout::ThumbnailOverlayLayout,
     ) -> Option<PathBuf> {
         // click_and_drag: clicked() / double_clicked() / secondary_clicked() は従来通り
         // 発火しつつ、drag_started_by(Primary) で native ファイル D&D を開始できる。
@@ -11716,7 +11723,7 @@ impl App {
         if response.clicked() || response.double_clicked() || response.secondary_clicked() {
             self.folder_pane.set_focus_grid();
         }
-        let tag_badge_target = self.grid_tag_badge_target(ui, cell_rect, idx);
+        let tag_badge_target = self.grid_tag_badge_target(idx, overlay_layout);
         if let Some((tag_name, badge_rect)) = tag_badge_target.as_ref() {
             if response.hovered()
                 && ctx
@@ -11817,6 +11824,7 @@ impl App {
                     self.maybe_suppress_rating_filter_for_opened_container(idx);
                     self.maybe_suppress_facet_filter_for_opened_container(idx);
                     self.record_rating_view_nav_open(&p);
+                    self.begin_smart_folder_drill(&p);
                     // 環境設定 ON なら、ページ一覧を経由せず 1 ページ目を即フルスクリーンで開く。
                     if auto_fs {
                         self.pending_auto_fs_open = true;
@@ -11857,6 +11865,7 @@ impl App {
                 }
                 Some(GridItem::ConvertibleArchive { path, .. }) => {
                     let pf = path.clone();
+                    self.begin_smart_folder_drill(&pf);
                     let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                     let search_rollback = if self.favsearch.active
                         || self.tag_view.active
@@ -11977,27 +11986,15 @@ impl App {
 
     fn grid_tag_badge_target(
         &self,
-        ui: &egui::Ui,
-        cell_rect: egui::Rect,
         idx: usize,
+        overlay_layout: &crate::thumb_overlay_layout::ThumbnailOverlayLayout,
     ) -> Option<(String, egui::Rect)> {
         if self.items_are_drive_list {
             return None;
         }
         let tags = self.cell_tag_list(idx);
         let tag_name = crate::app::primary_grid_tag_for_badge(tags)?.to_owned();
-        let badges = self.grid_edit_badges(idx);
-        let badge_rect = crate::app::grid_tag_badge_hit_rect(
-            ui,
-            cell_rect,
-            badges.page_override,
-            badges.local_adjust,
-            badges.mask,
-            badges.conceal,
-            badges.comic,
-            self.cell_has_pin_badge(idx),
-            tags,
-        )?;
+        let badge_rect = crate::app::grid_tag_badge_hit_rect(overlay_layout)?;
         Some((tag_name, badge_rect))
     }
 
@@ -12304,7 +12301,15 @@ impl App {
 
                             primary_click_hit_cell |=
                                 primary_click_pos.is_some_and(|pos| row_rect.contains(pos));
-                            if let Some(n) = self.handle_cell_interaction(ui, ctx, row_rect, idx) {
+                            let no_thumbnail_overlays =
+                                crate::thumb_overlay_layout::ThumbnailOverlayLayout::default();
+                            if let Some(n) = self.handle_cell_interaction(
+                                ui,
+                                ctx,
+                                row_rect,
+                                idx,
+                                &no_thumbnail_overlays,
+                            ) {
                                 nav = Some(n);
                             }
                             if idx >= self.items.len() {
@@ -12641,37 +12646,23 @@ impl App {
         });
     }
 
-    fn draw_bookmark_view_overlay(&self, ui: &mut egui::Ui, rect: egui::Rect, idx: usize) {
+    fn draw_bookmark_view_overlay(
+        &self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        idx: usize,
+        overlay_layout: &crate::thumb_overlay_layout::ThumbnailOverlayLayout,
+    ) {
         let Some(row) = self.bookmark_view_row(idx) else {
             return;
         };
-        let badge = if row.missing {
-            format!("! {}", row.badge_label())
-        } else {
-            row.badge_label()
-        };
-        let font = egui::FontId::proportional(11.0);
-        let text_size = ui
-            .painter()
-            .layout_no_wrap(badge.clone(), font.clone(), egui::Color32::WHITE)
-            .size();
-        let badge_rect = egui::Rect::from_min_size(
-            rect.left_top() + egui::vec2(5.0, 5.0),
-            text_size + egui::vec2(10.0, 5.0),
-        );
-        let fill = if row.missing {
-            egui::Color32::from_rgb(180, 70, 50)
-        } else {
-            egui::Color32::from_black_alpha(190)
-        };
-        ui.painter().rect_filled(badge_rect, 4.0, fill);
-        ui.painter().text(
-            badge_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            badge,
-            font,
-            egui::Color32::WHITE,
-        );
+        if let Some(placement) = overlay_layout.top_left.bookmark_time.as_ref() {
+            crate::ui_helpers::draw_overlay_bookmark_time_badge(
+                ui.painter(),
+                placement,
+                row.missing,
+            );
+        }
         if let Some(title) = row.title() {
             let font = crate::ui_fonts::user_text_font(13.0);
             let max_text_width = (rect.width() - 28.0).max(0.0);
@@ -12698,17 +12689,28 @@ impl App {
                     }
                 }
                 if galley.size().x <= max_text_width {
-                    let plate_rect = egui::Rect::from_center_size(
+                    let centered_rect = egui::Rect::from_center_size(
                         rect.center(),
                         galley.size() + egui::vec2(14.0, 8.0),
                     );
-                    ui.painter()
-                        .rect_filled(plate_rect, 4.0, egui::Color32::from_black_alpha(190));
-                    ui.painter().galley(
-                        plate_rect.center() - galley.size() * 0.5,
-                        galley,
-                        egui::Color32::WHITE,
-                    );
+                    let lane_bottom = overlay_layout.top_left.lane_bottom().unwrap_or(rect.min.y);
+                    let min_title_y = lane_bottom + 4.0;
+                    let plate_rect = centered_rect.translate(egui::vec2(
+                        0.0,
+                        (min_title_y - centered_rect.min.y).max(0.0),
+                    ));
+                    if plate_rect.max.y <= rect.max.y - 4.0 {
+                        ui.painter().rect_filled(
+                            plate_rect,
+                            4.0,
+                            egui::Color32::from_black_alpha(190),
+                        );
+                        ui.painter().galley(
+                            plate_rect.center() - galley.size() * 0.5,
+                            galley,
+                            egui::Color32::WHITE,
+                        );
+                    }
                 }
             }
         }
@@ -14137,11 +14139,49 @@ impl App {
                                     egui::vec2(cell_w, cell_h),
                                 );
 
+                                let badges = self.grid_edit_badges(idx);
+                                let rating = if self.items_are_drive_list {
+                                    0
+                                } else {
+                                    self.get_rating(idx)
+                                };
+                                let tags = self.cell_tag_list(idx).to_vec();
+                                let has_pin = self.cell_has_pin_badge(idx);
+                                let bookmark_time = self.bookmark_view_row(idx).map(|row| {
+                                    if row.missing {
+                                        format!("! {}", row.badge_label())
+                                    } else {
+                                        row.badge_label()
+                                    }
+                                });
+                                let overlay_layout = crate::app::layout_cell_overlays(
+                                    ui.painter(),
+                                    cell_rect,
+                                    crate::thumb_overlay_layout::EditBadgeFlags {
+                                        page_override: badges.page_override,
+                                        local_adjust: badges.local_adjust,
+                                        mask: badges.mask,
+                                        conceal: badges.conceal,
+                                        comic: badges.comic,
+                                        pin: has_pin,
+                                    },
+                                    rating,
+                                    &self.items[idx],
+                                    &self.thumbnails[idx],
+                                    &tags,
+                                    bookmark_time.as_deref(),
+                                    self.items_are_drive_list,
+                                );
+
                                 primary_click_hit_cell |=
                                     primary_click_pos.is_some_and(|pos| cell_rect.contains(pos));
-                                if let Some(n) =
-                                    self.handle_cell_interaction(ui, ctx, cell_rect, idx)
-                                {
+                                if let Some(n) = self.handle_cell_interaction(
+                                    ui,
+                                    ctx,
+                                    cell_rect,
+                                    idx,
+                                    &overlay_layout,
+                                ) {
                                     nav = Some(n);
                                 }
                                 // handle_cell_interaction 内で同期的に items が差し替わる
@@ -14157,12 +14197,6 @@ impl App {
                                 }
 
                                 let rot = self.get_rotation(idx);
-                                let badges = self.grid_edit_badges(idx);
-                                let rating = if self.items_are_drive_list {
-                                    0
-                                } else {
-                                    self.get_rating(idx)
-                                };
                                 // 可視セルは同期適用 (~3ms/枚)。先読み分は背後の
                                 // process_thumb_adjust_budget が逐次処理する。
                                 // ドラッグ中は両経路ともスキップして生サムネ表示に戻す
@@ -14175,7 +14209,6 @@ impl App {
                                 } else {
                                     self.thumb_adjust_tex.get(&idx)
                                 };
-                                let tags = self.cell_tag_list(idx).to_vec();
                                 let filter_match = if self.items_are_drive_list {
                                     None
                                 } else {
@@ -14193,26 +14226,18 @@ impl App {
                                 // で対応させる)。
                                 // ネスト ZIP では本ごとピン (Model B): book キー + ZipEntry source
                                 // (ルート = zip_path / 本の中 = 実効 prefix)。
-                                let has_pin = self.cell_has_pin_badge(idx);
                                 crate::app::draw_cell(
                                     ui,
                                     cell_rect,
                                     self.selected == Some(idx),
                                     self.checked.contains(&idx),
                                     spread_pair_cursor_idx == Some(idx),
-                                    badges.page_override,
-                                    badges.local_adjust,
-                                    badges.mask,
-                                    badges.conceal,
-                                    badges.comic,
-                                    rating,
+                                    &overlay_layout,
                                     &self.items[idx],
                                     &self.thumbnails[idx],
                                     rot,
                                     adjusted_tex,
-                                    &tags,
                                     filter_match_count,
-                                    has_pin,
                                     self.items_are_drive_list,
                                 );
                                 // 小さい右下バッジに限らずセル全体をホバー領域にして
@@ -14241,7 +14266,12 @@ impl App {
                                 }
 
                                 self.draw_reading_history_tooltip(ui, cell_rect, idx);
-                                self.draw_bookmark_view_overlay(ui, cell_rect, idx);
+                                self.draw_bookmark_view_overlay(
+                                    ui,
+                                    cell_rect,
+                                    idx,
+                                    &overlay_layout,
+                                );
 
                                 // 選択中セルの矩形を記録 (オーバーレイ配置用)
                                 if self.selected == Some(idx) {

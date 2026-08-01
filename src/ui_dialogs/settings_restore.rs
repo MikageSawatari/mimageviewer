@@ -790,7 +790,9 @@ impl App {
                     .show(ctx, |ui| {
                         ui.label(format!("書き出し元: {source_label}"));
                         ui.label("共有用の名前 (省略可):");
-                        ui.add(egui::TextEdit::singleline(label).hint_text("例: ブラウザー風"));
+                        crate::ime_focus::add_singleline(ui, label, None, |edit| {
+                            edit.hint_text("例: ブラウザー風")
+                        });
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if ui.button("保存...").clicked() || enter_pressed {

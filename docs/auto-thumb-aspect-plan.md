@@ -350,6 +350,13 @@ pub struct Settings {
 
 ### 5.2 ランタイム状態
 
+`AutoAspectState` belongs to the displayed items context. In addition to detached
+`ViewerContextBundle`, parking a resident smart-folder root moves the complete state into the
+prepared-grid layout snapshot beside `scroll_offset_y`. `current` is not sufficient: samples are
+index-keyed, while the cache gate, streak, and switch history describe the same root's decision.
+When restoring into a new App items generation, rebind only `AutoAspectState::items_generation`
+while preserving the samples and decision state.
+
 ```rust
 // src/app.rs の App 構造体に追加
 pub struct AutoAspectState {

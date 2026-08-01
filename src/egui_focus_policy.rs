@@ -1,18 +1,21 @@
 //! Application-level egui keyboard focus policy.
 //!
 //! egui resolves `Tab` into a focus direction during `Context::begin_pass`,
-//! before application shortcut code runs. mimageviewer also uses `Tab` as a
-//! configurable shortcut, so non-text passes must cancel that already-decided
-//! traversal before the first focusable widget is registered.
+//! before application shortcut code runs. mimageviewer disables that traversal
+//! application-wide by choice: `Tab` never moves keyboard focus, including
+//! between text fields. This policy only cancels the focus direction; it leaves
+//! the key event available to the focused widget, IME, and configurable keymap.
+//!
+//! This began as a fix for a systemic shortcut failure: `Tab` could move egui
+//! focus onto a non-text widget, `wants_keyboard_input()` would remain true, and
+//! every application shortcut would stop working. Selectively allowing traversal
+//! while editing text then produced a disorienting one-hop move out of a field
+//! before traversal stopped. IME candidate selection with `Tab` is a separate,
+//! field-level focus lock and recovery mechanism in `crate::ime_focus`.
 
 use std::sync::Arc;
 
 const INSTALLATION_ID: &str = "miv_tab_shortcut_focus_policy_installed";
-const TEXT_EDIT_ACTIVE_ID: &str = "miv_tab_shortcut_text_edit_active";
-
-fn text_edit_active_id(viewport_id: egui::ViewportId) -> egui::Id {
-    egui::Id::new((TEXT_EDIT_ACTIVE_ID, viewport_id))
-}
 
 fn tab_pressed(ctx: &egui::Context) -> bool {
     ctx.input(|input| {
@@ -29,26 +32,17 @@ fn tab_pressed(ctx: &egui::Context) -> bool {
     })
 }
 
-fn focused_widget_is_text_edit(ctx: &egui::Context) -> bool {
-    let focused_id = ctx.memory(|memory| memory.focused());
-    focused_id.is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some())
-}
-
-/// Cancel focus traversal that egui already derived from a claimed `Tab`.
+/// Cancel focus traversal that egui already derived from `Tab`.
 pub(crate) fn cancel_tab_focus_traversal(ctx: &egui::Context) {
     ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
 }
 
 /// Install mimageviewer's `Tab` shortcut policy on an egui context.
 ///
-/// `PlatformOutput::ime` is egui's public, widget-specific signal that it sets
-/// iff a mutable `TextEdit` is currently being edited. We sample it at the end
-/// of each viewport pass and use that viewport-local previous-pass value at the
-/// next begin-pass callback. `TextEdit::load_state` covers the one-pass boundary
-/// where `request_focus` ran after the widget was drawn and `ime` is not set
-/// yet. Together they distinguish real text editing from focus on buttons,
-/// sliders, or full-screen click surfaces without weakening the keymap's
-/// general `wants_keyboard_input()` gate.
+/// The callback runs before the first focusable widget is registered, resets the
+/// focus direction for every `Tab` press, and deliberately does not consume the
+/// event. The focused UI or the later keymap ownership boundary still receives
+/// the same press.
 pub fn install_tab_shortcut_focus_policy(ctx: &egui::Context) {
     let installation_id = egui::Id::new(INSTALLATION_ID);
     let already_installed = ctx.data_mut(|data| {
@@ -69,25 +63,7 @@ pub fn install_tab_shortcut_focus_policy(ctx: &egui::Context) {
             if !tab_pressed(ctx) {
                 return;
             }
-            let viewport_id = ctx.viewport_id();
-            let text_edit_was_active = ctx.data_mut(|data| {
-                data.get_temp::<bool>(text_edit_active_id(viewport_id))
-                    .unwrap_or(false)
-            }) || focused_widget_is_text_edit(ctx);
-            if !text_edit_was_active {
-                cancel_tab_focus_traversal(ctx);
-            }
-        }),
-    );
-
-    ctx.on_end_pass(
-        "miv_tab_shortcut_text_edit_sample",
-        Arc::new(|ctx| {
-            let text_edit_active = ctx.output(|output| output.ime.is_some());
-            let viewport_id = ctx.viewport_id();
-            ctx.data_mut(|data| {
-                data.insert_temp(text_edit_active_id(viewport_id), text_edit_active);
-            });
+            cancel_tab_focus_traversal(ctx);
         }),
     );
 }
@@ -197,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_text_edit_keeps_tab_traversal_text_and_ime_input() {
+    fn focused_text_edit_keeps_focus_and_accepts_text_and_ime_input_after_tab() {
         let ctx = egui::Context::default();
         install_tab_shortcut_focus_policy(&ctx);
         let first_id = egui::Id::new("tab_policy_first_text");
@@ -229,7 +205,7 @@ mod tests {
                 draw_text_fields(ctx, first_id, second_id, &mut first, &mut second, false);
             },
         );
-        assert_eq!(ctx.memory(|memory| memory.focused()), Some(second_id));
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
 
         let _ = ctx.run(
             raw_input(
@@ -246,7 +222,36 @@ mod tests {
                 draw_text_fields(ctx, first_id, second_id, &mut first, &mut second, false);
             },
         );
-        assert_eq!(second, "xあ");
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
+        assert_eq!(first, "xあ");
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn tab_does_not_move_focus_between_two_text_fields() {
+        let ctx = egui::Context::default();
+        install_tab_shortcut_focus_policy(&ctx);
+        let first_id = egui::Id::new("tab_policy_no_hop_first");
+        let second_id = egui::Id::new("tab_policy_no_hop_second");
+        let mut first = String::new();
+        let mut second = String::new();
+
+        let _ = ctx.run(Default::default(), |ctx| {
+            draw_text_fields(ctx, first_id, second_id, &mut first, &mut second, true);
+        });
+        let _ = ctx.run(
+            raw_input(
+                egui::ViewportId::ROOT,
+                None,
+                vec![tab_event(false, egui::Modifiers::NONE)],
+            ),
+            |ctx| {
+                draw_text_fields(ctx, first_id, second_id, &mut first, &mut second, false);
+            },
+        );
+
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
+        assert!(!ctx.memory(|memory| memory.has_focus(second_id)));
     }
 
     #[test]
@@ -286,6 +291,6 @@ mod tests {
                 draw_text_fields(ctx, first_id, second_id, &mut first, &mut second, false);
             },
         );
-        assert_eq!(ctx.memory(|memory| memory.focused()), Some(second_id));
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
     }
 }

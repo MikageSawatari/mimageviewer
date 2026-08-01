@@ -470,11 +470,12 @@ impl App {
                                         );
 
                                         // 表示名 (編集可能) — 変更を検出したら即 save
-                                        let name_resp = ui.add_sized(
-                                            [100.0, 20.0],
-                                            egui::TextEdit::singleline(
-                                                &mut self.settings.favorites[i].name,
-                                            ),
+                                        let name_resp = crate::ime_focus::add_sized_singleline(
+                                            ui,
+                                            egui::vec2(100.0, 20.0),
+                                            &mut self.settings.favorites[i].name,
+                                            None,
+                                            |edit| edit,
                                         );
                                         if name_resp.changed() {
                                             any_setting_dirty = true;

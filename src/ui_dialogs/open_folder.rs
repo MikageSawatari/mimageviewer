@@ -41,10 +41,15 @@ impl App {
                 ui.label("開きたいフォルダのパスを入力してください:");
                 ui.add_space(4.0);
 
-                let mut output = egui::TextEdit::singleline(&mut self.open_folder_input)
-                    .desired_width(f32::INFINITY)
-                    .hint_text(r"例: C:\Users\you\Pictures")
-                    .show(ui);
+                let mut output = crate::ime_focus::show_singleline(
+                    ui,
+                    &mut self.open_folder_input,
+                    None,
+                    |edit| {
+                        edit.desired_width(f32::INFINITY)
+                            .hint_text(r"例: C:\Users\you\Pictures")
+                    },
+                );
                 crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,

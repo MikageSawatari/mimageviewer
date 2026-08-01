@@ -2212,7 +2212,7 @@ impl App {
         if !self.global_search.active {
             return;
         }
-        let raw_enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let enter_pressed = self.dialog_enter_pressed(ctx);
         let escape_pressed = self.dialog_escape_pressed(ctx);
 
         let mut close_requested = false;
@@ -2251,26 +2251,29 @@ impl App {
                      アイテム索引が作成されていないお気に入りは対象になりません。\n\
                      お気に入り編集で「アイテムを索引化する」を有効にしてください。",
                 );
-                let mut output = egui::TextEdit::singleline(&mut self.global_search.query)
-                    .hint_text(r#"画像・PDF・動画をファイル名やメタ情報で検索 (AND / -除外 / "…")"#)
-                    .desired_width(320.0)
-                    .min_size(egui::vec2(320.0, 20.0))
-                    .show(ui);
+                let mut output = crate::ime_focus::show_singleline(
+                    ui,
+                    &mut self.global_search.query,
+                    Some(&mut self.global_search.focus_request),
+                    |edit| {
+                        edit.hint_text(
+                            r#"画像・PDF・動画をファイル名やメタ情報で検索 (AND / -除外 / "…")"#,
+                        )
+                        .desired_width(320.0)
+                        .min_size(egui::vec2(320.0, 20.0))
+                    },
+                );
                 let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,
                     &mut self.global_search.query,
                 );
                 let response = output.response;
-                if self.global_search.focus_request {
-                    self.global_search.focus_request = false;
-                    response.request_focus();
-                }
                 self.global_search.has_focus = response.has_focus();
                 if response.changed() || menu_changed {
                     query_changed = true;
                 }
-                if response.lost_focus() && raw_enter {
+                if response.lost_focus() && enter_pressed {
                     query_changed = true;
                 }
                 if ui.small_button("×").on_hover_text("検索を閉じる").clicked() {

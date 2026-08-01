@@ -395,9 +395,19 @@ TextEdit を含むダイアログで Enter / Escape を拾うときは **必ず�
 
 - **確定用**: `self.dialog_enter_pressed(ctx)` — IME 変換中は常に false
 - **キャンセル用**: `self.dialog_escape_pressed(ctx)` — IME 変換中は常に false
-- **判定ロジック**: `App::ime_input_active()` は `ime_composing` フラグ (Ime イベントで更新) と
-  直近 300ms 以内の Ime イベント有無の OR で判定。300ms グレースは Windows IME で
-  `Ime::Disabled` と `Key::Escape` が別フレームに届くケースを吸収するため。
+- **判定ロジック**: `App::ime_input_active(ctx)` は `ime_focus` が `ViewportId` ごとの
+  `ctx.data_temp` に保持する composition 状態と、同じ viewport で直近 300ms 以内に届いた
+  Ime イベント有無の OR で判定。300ms グレースは Windows IME で `Ime::Disabled` と
+  `Key::Escape` が別フレームに届くケースを吸収するため。App-global な IME bool は持たない。
+
+上記はアプリ操作を抑止する責務で、TextEdit の focus 復帰とは別。日本語を入力できる新しい
+single-line TextEdit は `crate::ime_focus` の helper 経由で描画すること。同 helper が IME の
+キー処理由来の一時的な focus loss の復帰と IME 候補選択中の Tab traversal 抑止を所有する。
+helper-managed field が直前の pass で持っていた focus は 1 pass の typed recovery claim として
+keyboard owner にも渡し、TextEdit の復帰前に同じキーがアプリ shortcut へ漏れるのを防ぐ。
+pointer 入力を伴う正当な focus 移動は復帰しない。
+raw TextEdit は理由付き allowlist を検査する unit test で禁止している。TSF を採用しない理由、
+IMM32 の 2 経路と未対応範囲の正本は [src/ime_focus.rs](src/ime_focus.rs) の helper doc comment を参照。
 
 **ビューポート別のイベントキュー**:
 egui の `show_viewport_immediate` は独立したイベントキューを持つ。メインビューポートと
@@ -1469,7 +1479,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    操作・既定の変更が無いリリースでは追記不要。追記したら
    `cargo test --lib version_highlights::` でテーブルがパースできることを確認。
 6. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
-   - マニュアル左サイドバーを持つ通常ページ 26 ページでリンク一覧が揃っているか
+   - マニュアル左サイドバーを持つ通常ページ 27 ページでリンク一覧が揃っているか
      `htdocs/mimageviewer/manual/` 配下で一括確認:
      ```bash
      cd htdocs/mimageviewer/manual && for f in *.html; do
@@ -1479,11 +1489,18 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
          | grep -E 'href="[a-z-]+\.html"' | wc -l
      done
      ```
-     各ページが 26 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
+     各ページが 27 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
      `tut-*.html` など `sidebar-section` を持たないチュートリアルページは別レイアウトなので対象外。
      新規の通常ページを追加した際はサイドバーを持つ全ページを更新すること
      (`changelog.html` のサイドバーは `gen-changelog-html.py` が `getting-started.html` から
      コピーするので、他の通常ページを更新してから再生成すれば自動で揃う)。
+6.5. **既知の問題ページの棚卸し** — [htdocs/mimageviewer/manual/known-issues.html](htdocs/mimageviewer/manual/known-issues.html)
+   から、**この版で直した項目を削除する**。残す項目の記述が現行版で正しいかも見る
+   (回避方法が変わっていないか)。**掲載が 0 件になったら「現時点で把握している不具合はありません。」
+   と明記する** (見出しごと消さない。ページが空だと「更新が止まった」と読まれるため)。
+   - 載せる基準: ①通常の操作で遭遇し得る ②不具合だと思う見た目をしている ③回避策があるか
+     「環境のせいではない」と言える ④次の版で直らない。backlog の大半は設計上の負債なので載せない。
+   - **このステップを飛ばすとページが腐る**。以前ページを置いたときに放置されて消えた経緯がある。
 
 ### Phase 2: 依存物の確認 + 性能回帰チェック
 
@@ -1529,8 +1546,18 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    ```
    - `--perf-log` 付きで mImageViewer を起動 → 手動で起動・Ctrl+↓ 連打・Ctrl+G 検索を実行
      → スクリプトが `analyze_perf.py hitches` で 16ms 超のフレーム間隔を集計。
-   - 「ヒッチ: 0 件」または既知の長時間 nav (PDF cold open ~700ms 等) のみなら OK。
-     nav イベント無しのヒッチは UI スレッド同期 I/O 退行の疑い (docs/ui-responsiveness.md §4)。
+   - **`hitches` の件数をそのまま合否にしない**。mIV は静止時に意図的に就寝するので、
+     操作の合間の sleep がすべて「ヒッチ」として数えられる (実測: 通常操作 55 秒で 108 件、
+     最大 16 秒)。判定は**大きいギャップ 1 件ずつ、直前の `ui.tail_repaint.action`** を見る:
+     - `none` = repaint を要求していない (= 入力待ちで就寝) → **正常**
+     - `request_repaint_after_idle_upgrade` 等の遅延 wake → **正常** (予定どおりの起床)
+     - 上記以外で 100ms を超える → UI スレッド同期 I/O 退行の疑い
+       (docs/ui-responsiveness.md §4)
+   - 全体の目安は「16ms 未満のギャップが 97% 以上」。v2.9.1 実測は 4723 フレーム中
+     97.7%、100ms 超の 24 件はすべて就寝または遅延 wake 由来だった。
+   - bash が PATH に無い環境では `"C:\Program Files\Git\bin\bash.exe" scripts/perf_smoke.sh`。
+     スクリプトの実体は「FFmpeg DLL を target/release へコピー → perf log を退避 →
+     core を起動 → 終了後に解析」なので、手で分けて実行してもよい。
 
 9.7. **idle health smoke** (毎リリース必須。静止中の高速 repaint / 再投入ループを検出):
    ```powershell

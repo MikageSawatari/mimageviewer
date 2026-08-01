@@ -104,7 +104,6 @@ impl App {
         let mut remove_tag: Option<String> = None;
         let enter_pressed = self.dialog_enter_pressed(ctx);
         let escape_pressed = self.dialog_escape_pressed(ctx);
-        let ime_active = self.ime_input_active();
         let dialog_pos = ctx.content_rect().min + egui::vec2(70.0, 60.0);
 
         egui::Window::new("タグを付ける/外す")
@@ -126,18 +125,17 @@ impl App {
 
                 ui.horizontal(|ui| {
                     ui.label("タグ:");
-                    let input_resp = ui.add_sized(
-                        [280.0, 22.0],
-                        egui::TextEdit::singleline(&mut self.tag_apply_input)
-                            .hint_text("作品名・作者名など"),
+                    let input_resp = crate::ime_focus::add_sized_singleline(
+                        ui,
+                        egui::vec2(280.0, 22.0),
+                        &mut self.tag_apply_input,
+                        None,
+                        |edit| edit.hint_text("作品名・作者名など"),
                     );
                     if !input_resp.has_focus()
                         && ctx.input(|i| i.focused)
                         && !ui.memory(|m| m.focused().is_some())
                     {
-                        input_resp.request_focus();
-                    }
-                    if ime_active && input_resp.lost_focus() {
                         input_resp.request_focus();
                     }
                     let normalized_input =

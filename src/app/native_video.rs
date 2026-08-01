@@ -2702,7 +2702,7 @@ impl App {
         } else {
             if let Some(fs_idx) = self.fullscreen_idx {
                 self.fs_holdover_tex = self
-                    .current_fs_tex_for_holdover(fs_idx)
+                    .capture_fs_display_unit(fs_idx)
                     .map(crate::app::FsHoldover::FolderNavigation);
             }
             self.still_fullscreen_viewport_enter_suppress_until =
@@ -3067,6 +3067,11 @@ impl App {
         source_epoch: u64,
         event: crate::video::NativeVideoOutputEvent,
     ) {
+        // native video window は winit 管理外の独立 HWND / egui Context である。
+        // raw key の text-input 抑止と IME 判定は `NativeOverlayInputRouting` が command / event
+        // 発行前に所有する。ここから先で App viewport の `ime_input_active()` を再適用すると、
+        // 別 viewport の composition が native の明示クリック・bookmark command・pointer event を
+        // 無関係に破棄するため、target/epoch だけを検証する。
         if self.fullscreen_idx != Some(fs_idx) {
             crate::logger::log(format!(
                 "[native-video] stale overlay event ignored: event_idx={fs_idx} current={:?}",
@@ -3513,9 +3518,6 @@ impl App {
                 }
                 self.handle_fullscreen_close_request_immediate();
             }
-            event if self.ime_input_active() => {
-                let _ = event;
-            }
             crate::video::native_window::NativeVideoWindowEvent::KeyDown(key) => {
                 self.handle_native_video_key_event(ctx, fs_idx, key);
             }
@@ -3606,7 +3608,7 @@ impl App {
         fs_idx: usize,
         target_secs: f64,
     ) {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         let did_seek = if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
@@ -3632,7 +3634,7 @@ impl App {
         fs_idx: usize,
         target_secs: f64,
     ) {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         let did_seek = if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
@@ -3696,7 +3698,7 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         let did_seek = if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
@@ -3725,7 +3727,7 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         let will_request_play = match self.fs_cache.get(&fs_idx) {
@@ -3773,7 +3775,7 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         if self.toggle_video_session_mute_for_fs_idx(fs_idx) {
@@ -3787,7 +3789,7 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         self.cycle_native_video_loop_common(ctx, fs_idx);
@@ -4648,7 +4650,7 @@ impl App {
         volume: f64,
         persist: bool,
     ) {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         let volume = if volume.is_finite() {
@@ -4673,7 +4675,7 @@ impl App {
         fs_idx: usize,
         speed: f64,
     ) {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         let speed = crate::video::clock::clamp_playback_speed(speed);
@@ -4694,7 +4696,7 @@ impl App {
         fs_idx: usize,
         target_secs: f64,
     ) {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         let path = match self.fs_cache.get(&fs_idx) {
@@ -5943,7 +5945,7 @@ impl App {
         fs_idx: usize,
         target_secs: f64,
     ) {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         self.add_native_video_bookmark(fs_idx, Some(target_secs));
@@ -5957,7 +5959,7 @@ impl App {
         fs_idx: usize,
         target_secs: f64,
     ) {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         self.set_native_video_pin(fs_idx, target_secs);
@@ -5970,7 +5972,7 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> bool {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return false;
         }
         let Some((target_secs, webp)) = self.selected_native_video_tile_pin_payload(fs_idx) else {
@@ -6014,7 +6016,7 @@ impl App {
         fs_idx: usize,
         id: i64,
     ) {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         if let Some(db) = self.video_bookmark_db.as_ref() {
@@ -6037,7 +6039,7 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         let path = match self.fs_cache.get(&fs_idx) {
@@ -6248,7 +6250,7 @@ impl App {
         id: i64,
         title: String,
     ) {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         if let Some(db) = self.video_bookmark_db.as_ref() {
@@ -7209,6 +7211,7 @@ impl App {
             rect,
             placement,
             true, // activate_on_show (fullscreen)
+            self.window_visible,
             file_name,
             self.video_perf_overlay_visible,
             false, // initial_tile_overlay: 音声は preparing タイルを出さない
@@ -7724,6 +7727,7 @@ impl App {
                 rect,
                 placement,
                 true,
+                self.window_visible,
                 file_name,
                 self.video_perf_overlay_visible,
                 false,
@@ -8239,7 +8243,7 @@ impl App {
         if self.video_tile_swap_pending.is_some() || self.native_video_fast_swap_pending.is_some() {
             return;
         }
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() || delta == 0 {
+        if self.fullscreen_idx != Some(fs_idx) || delta == 0 {
             return;
         }
         let candidates = crate::settings::VIDEO_TILE_COLUMN_CANDIDATES;

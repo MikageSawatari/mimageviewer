@@ -9,7 +9,7 @@
 //! [`EditPreviewCacheService`] へ command を送るだけでブロックしない。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use rayon::prelude::*;
@@ -997,6 +997,8 @@ pub struct EditPreviewCacheService {
     db: Arc<EditPreviewCacheDb>,
     tx: mpsc::Sender<EditPreviewCommand>,
     event_rx: mpsc::Receiver<EditPreviewEvent>,
+    /// rename migration が旧 key 宛の save/delete を追い越さないための FIFO 未完了数。
+    pending_commands: Arc<AtomicUsize>,
 }
 
 impl EditPreviewCacheService {
@@ -1005,6 +1007,8 @@ impl EditPreviewCacheService {
         let (tx, rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
         let worker_db = Arc::clone(&db);
+        let pending_commands = Arc::new(AtomicUsize::new(0));
+        let worker_pending_commands = Arc::clone(&pending_commands);
         std::thread::Builder::new()
             .name("edit-preview-cache".to_string())
             .spawn(move || {
@@ -1079,14 +1083,36 @@ impl EditPreviewCacheService {
                             }
                         }
                     }
+                    worker_pending_commands.fetch_sub(1, Ordering::Release);
                 }
             })
             .map_err(|e| e.to_string())?;
-        Ok(Self { db, tx, event_rx })
+        Ok(Self {
+            db,
+            tx,
+            event_rx,
+            pending_commands,
+        })
     }
 
     pub fn db(&self) -> Arc<EditPreviewCacheDb> {
         Arc::clone(&self.db)
+    }
+
+    fn send_command(
+        &self,
+        command: EditPreviewCommand,
+    ) -> Result<(), mpsc::SendError<EditPreviewCommand>> {
+        self.pending_commands.fetch_add(1, Ordering::AcqRel);
+        self.tx.send(command).map_err(|error| {
+            self.pending_commands.fetch_sub(1, Ordering::AcqRel);
+            error
+        })
+    }
+
+    /// 既に enqueue 済みの preview save/delete/prune/clear が DB へ着地していないか。
+    pub fn has_pending_commands(&self) -> bool {
+        self.pending_commands.load(Ordering::Acquire) != 0
     }
 
     pub fn save(
@@ -1101,7 +1127,7 @@ impl EditPreviewCacheService {
         max_bytes: u64,
         repaint_ctx: Option<egui::Context>,
     ) {
-        let _ = self.tx.send(EditPreviewCommand::Save {
+        let _ = self.send_command(EditPreviewCommand::Save {
             item_key,
             source_mtime,
             source_size,
@@ -1115,7 +1141,7 @@ impl EditPreviewCacheService {
     }
 
     pub fn delete(&self, item_key: String) {
-        let _ = self.tx.send(EditPreviewCommand::Delete {
+        let _ = self.send_command(EditPreviewCommand::Delete {
             item_key,
             notify_if_missing: true,
         });
@@ -1124,29 +1150,28 @@ impl EditPreviewCacheService {
     /// Removes a stale preview at a viewer-close boundary without invalidating an unchanged raw
     /// thumbnail when no preview row existed.
     pub fn delete_if_present(&self, item_key: String) {
-        let _ = self.tx.send(EditPreviewCommand::Delete {
+        let _ = self.send_command(EditPreviewCommand::Delete {
             item_key,
             notify_if_missing: false,
         });
     }
 
     pub fn prune(&self, max_bytes: u64) {
-        let _ = self.tx.send(EditPreviewCommand::Prune { max_bytes });
+        let _ = self.send_command(EditPreviewCommand::Prune { max_bytes });
     }
 
     pub fn clear(&self) {
-        let _ = self.tx.send(EditPreviewCommand::Clear { completed: None });
+        let _ = self.send_command(EditPreviewCommand::Clear { completed: None });
     }
 
     /// importのterminal refreshが旧previewを再利用しないよう、worker queue上で
     /// それ以前のsaveを着地させた後にclear完了を通知する。
     pub fn clear_with_completion(&self) -> Result<mpsc::Receiver<()>, String> {
         let (completed_tx, completed_rx) = mpsc::sync_channel(1);
-        self.tx
-            .send(EditPreviewCommand::Clear {
-                completed: Some(completed_tx),
-            })
-            .map_err(|_| "編集プレビューキャッシュの消去workerが終了しています".to_string())?;
+        self.send_command(EditPreviewCommand::Clear {
+            completed: Some(completed_tx),
+        })
+        .map_err(|_| "編集プレビューキャッシュの消去workerが終了しています".to_string())?;
         Ok(completed_rx)
     }
 

@@ -7260,9 +7260,7 @@ mod tests {
                 viewport: ctx.viewport_id(),
                 viewport_focused: true,
                 modal: false,
-                focused_text_input: None,
-                pending_text_input: None,
-                ime_grace: false,
+                text_input: None,
                 focused_ui: ctx
                     .wants_keyboard_input()
                     .then_some(focused_widget.unwrap_or(egui::Id::NULL)),
@@ -9218,7 +9216,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn tab_reassigned_to_another_action_still_cancels_focus_traversal() {
+    fn tab_reassigned_to_another_action_survives_focus_traversal_policy() {
         let _serial = native_video_shortcut_test_guard();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::from_ini_str(
@@ -9228,9 +9226,11 @@ mod tests {
             "#,
         );
         let ctx = egui::Context::default();
+        crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
         begin_key_pass(&ctx, egui::Key::Tab, egui::Modifiers::NONE);
         crate::key_input::set_test_frame(vec![tab_edge(false)]);
 
+        assert_eq!(ctx.input(|input| input.events.len()), 1);
         assert!(keymap.consume_action(&ctx, KeyAction::FsSlideshow));
         draw_test_focusable(&ctx, "reassigned_tab_surface");
         let _ = ctx.end_pass();
@@ -9239,7 +9239,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn focused_text_edit_keeps_tab_from_keymap_and_moves_to_next_field() {
+    fn focused_text_edit_keeps_tab_from_keymap_and_focus_on_current_field() {
         let _serial = native_video_shortcut_test_guard();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
@@ -9274,7 +9274,7 @@ mod tests {
             let _ = ui.add(egui::TextEdit::singleline(&mut second).id(second_id));
         });
         let _ = ctx.end_pass();
-        assert_eq!(ctx.memory(|memory| memory.focused()), Some(second_id));
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
     }
 
     #[cfg(windows)]

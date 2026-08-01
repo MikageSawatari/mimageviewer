@@ -412,17 +412,34 @@ fn cell_filename_mixed_glyphs_dark() {
         "cell_filename_mixed_glyphs_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
         |ui| {
-            let (_resp, painter) =
+            let (response, painter) =
                 ui.allocate_painter(egui::vec2(220.0, 160.0), egui::Sense::hover());
-            let inner = painter.clip_rect();
+            let cell = response.rect;
+            let inner = cell.shrink(4.0);
             painter.rect_filled(inner, 2.0, egui::Color32::from_gray(60));
+            let empty_tags = Vec::new();
+            let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
+                mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
+                    cell,
+                    inner,
+                    bookmark_time: None,
+                    upscaled_video: false,
+                    edit_badges: Default::default(),
+                    tags: &empty_tags,
+                    bottom_container: None,
+                    rating_text: None,
+                    filename: Some("001 - お返事まだカナ💎𝓈𝒸𝓇𝑒𝒶𝓂おじ"),
+                },
+                |text, style| {
+                    mimageviewer::ui_helpers::measure_thumbnail_badge_text(&painter, text, style)
+                },
+            );
+            let placement = layout.bottom_left.filename.as_ref().expect("filename");
             mimageviewer::ui_helpers::draw_cell_filename(
                 &painter,
-                inner,
-                "001 - お返事まだカナ💎𝓈𝒸𝓇𝑒𝒶𝓂おじ",
+                placement,
                 egui::Color32::WHITE,
                 true,
-                0.0,
             );
         },
     );
@@ -437,40 +454,217 @@ fn compact_file_format_badges_light() {
         mimageviewer::os_theme::ResolvedTheme::Light,
         |ui| {
             ui.set_width(440.0);
-            ui.horizontal(|ui| {
-                for (icon, name, kind) in [
-                    ("📦", "comic.zip", "ZIP"),
-                    ("📄", "document.pdf", "PDF"),
-                    ("🗜", "archive.rar", "RAR"),
-                ] {
-                    let (response, painter) =
-                        ui.allocate_painter(egui::vec2(138.0, 180.0), egui::Sense::hover());
-                    let inner = response.rect.shrink(4.0);
-                    painter.rect_filled(inner, 3.0, egui::Color32::from_gray(228));
-                    painter.text(
-                        inner.center() - egui::vec2(0.0, 10.0),
-                        egui::Align2::CENTER_CENTER,
-                        icon,
-                        egui::FontId::proportional(32.0),
-                        egui::Color32::from_gray(70),
-                    );
-                    mimageviewer::ui_helpers::draw_cell_filename(
-                        &painter,
+            let draw_cell = |ui: &mut egui::Ui,
+                             icon: &str,
+                             name: &str,
+                             label: &str,
+                             kind: mimageviewer::thumb_overlay_layout::BottomContainerKind,
+                             rating: Option<&str>| {
+                let (response, painter) =
+                    ui.allocate_painter(egui::vec2(210.0, 145.0), egui::Sense::hover());
+                let cell = response.rect;
+                let inner = cell.shrink(4.0);
+                painter.rect_filled(inner, 3.0, egui::Color32::from_gray(228));
+                painter.text(
+                    inner.center() - egui::vec2(0.0, 10.0),
+                    egui::Align2::CENTER_CENTER,
+                    icon,
+                    egui::FontId::proportional(32.0),
+                    egui::Color32::from_gray(70),
+                );
+                let empty_tags = Vec::new();
+                let filename = matches!(
+                    kind,
+                    mimageviewer::thumb_overlay_layout::BottomContainerKind::Format
+                )
+                .then_some(name);
+                let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
+                    mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
+                        cell,
                         inner,
-                        name,
-                        egui::Color32::from_gray(35),
-                        false,
-                        mimageviewer::ui_helpers::estimated_file_badge_width(inner),
-                    );
-                    match kind {
-                        "ZIP" => mimageviewer::ui_helpers::draw_zip_badge(&painter, inner),
-                        "PDF" => mimageviewer::ui_helpers::draw_pdf_badge(&painter, inner),
-                        _ => {
-                            mimageviewer::ui_helpers::draw_archive_badge(&painter, inner, kind);
-                        }
+                        bookmark_time: None,
+                        upscaled_video: false,
+                        edit_badges: Default::default(),
+                        tags: &empty_tags,
+                        bottom_container: Some(
+                            mimageviewer::thumb_overlay_layout::BottomContainerInput {
+                                kind,
+                                label,
+                            },
+                        ),
+                        rating_text: rating,
+                        filename,
+                    },
+                    |text, style| {
+                        mimageviewer::ui_helpers::measure_thumbnail_badge_text(
+                            &painter, text, style,
+                        )
+                    },
+                );
+                let container = layout.bottom_left.container.as_ref().expect("container");
+                match kind {
+                    mimageviewer::thumb_overlay_layout::BottomContainerKind::Folder => {
+                        mimageviewer::ui_helpers::draw_overlay_folder_badge(&painter, container);
+                    }
+                    mimageviewer::thumb_overlay_layout::BottomContainerKind::Format => {
+                        mimageviewer::ui_helpers::draw_overlay_format_badge(&painter, container);
                     }
                 }
+                if let Some(filename) = layout.bottom_left.filename.as_ref() {
+                    mimageviewer::ui_helpers::draw_cell_filename(
+                        &painter,
+                        filename,
+                        egui::Color32::from_gray(35),
+                        false,
+                    );
+                }
+                if let Some(rating) = layout.bottom_left.rating.as_ref() {
+                    mimageviewer::ui_helpers::draw_overlay_rating_badge(&painter, rating, true);
+                }
+            };
+            ui.horizontal(|ui| {
+                draw_cell(
+                    ui,
+                    "📁",
+                    "とても長い日本語フォルダー名",
+                    "とても長い日本語フォルダー名",
+                    mimageviewer::thumb_overlay_layout::BottomContainerKind::Folder,
+                    Some("📁★★★★★"),
+                );
+                draw_cell(
+                    ui,
+                    "📦",
+                    "comic-book-long-name.zip",
+                    "ZIP",
+                    mimageviewer::thumb_overlay_layout::BottomContainerKind::Format,
+                    None,
+                );
             });
+            ui.horizontal(|ui| {
+                draw_cell(
+                    ui,
+                    "📄",
+                    "document-long-name.pdf",
+                    "PDF",
+                    mimageviewer::thumb_overlay_layout::BottomContainerKind::Format,
+                    Some("📁★★★★"),
+                );
+                draw_cell(
+                    ui,
+                    "🗜",
+                    "archive-long-name.rar",
+                    "RAR",
+                    mimageviewer::thumb_overlay_layout::BottomContainerKind::Format,
+                    None,
+                );
+            });
+        },
+    );
+}
+
+/// 動画セルはコンテナバッジを持たず、ファイル名プレートは中央寄せなので、評価は左下の角に
+/// 残る。無条件に 1 段上げると星が絵の中に浮いて見える (2026-07-31 の実機報告)。
+#[test]
+fn rating_shares_the_bottom_row_with_a_centred_filename_dark() {
+    snapshot_with_theme(
+        "rating_with_centred_filename_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            let (response, painter) =
+                ui.allocate_painter(egui::vec2(300.0, 170.0), egui::Sense::hover());
+            let cell = response.rect;
+            let inner = cell.shrink(4.0);
+            painter.rect_filled(inner, 3.0, egui::Color32::from_gray(58));
+            let empty_tags = Vec::new();
+            let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
+                mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
+                    cell,
+                    inner,
+                    bookmark_time: Some("0:25"),
+                    upscaled_video: false,
+                    edit_badges: Default::default(),
+                    tags: &empty_tags,
+                    bottom_container: None,
+                    rating_text: Some("★★★"),
+                    filename: Some("「名探偵」エンディング.mp4"),
+                },
+                |text, style| {
+                    mimageviewer::ui_helpers::measure_thumbnail_badge_text(&painter, text, style)
+                },
+            );
+            if let Some(time) = layout.top_left.bookmark_time.as_ref() {
+                mimageviewer::ui_helpers::draw_overlay_bookmark_time_badge(&painter, time, false);
+            }
+            if let Some(filename) = layout.bottom_left.filename.as_ref() {
+                mimageviewer::ui_helpers::draw_cell_filename(
+                    &painter,
+                    filename,
+                    egui::Color32::from_gray(230),
+                    true,
+                );
+            }
+            if let Some(rating) = layout.bottom_left.rating.as_ref() {
+                mimageviewer::ui_helpers::draw_overlay_rating_badge(&painter, rating, false);
+            }
+        },
+    );
+}
+
+#[test]
+fn bookmark_time_and_tag_badges_dark() {
+    snapshot_with_theme(
+        "bookmark_time_and_tag_badges_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            let (response, painter) =
+                ui.allocate_painter(egui::vec2(420.0, 180.0), egui::Sense::hover());
+            let cell = response.rect;
+            let inner = cell.shrink(4.0);
+            painter.rect_filled(inner, 3.0, egui::Color32::from_gray(55));
+            painter.text(
+                inner.center(),
+                egui::Align2::CENTER_CENTER,
+                "ブックマークタイトル",
+                mimageviewer::ui_fonts::user_text_font(13.0),
+                egui::Color32::WHITE,
+            );
+            let tags = vec!["#長い日本語タグ".to_owned(), "旅行".to_owned()];
+            let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
+                mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
+                    cell,
+                    inner,
+                    bookmark_time: Some("12:34"),
+                    upscaled_video: false,
+                    edit_badges: mimageviewer::thumb_overlay_layout::EditBadgeFlags {
+                        page_override: true,
+                        pin: true,
+                        ..Default::default()
+                    },
+                    tags: &tags,
+                    bottom_container: None,
+                    rating_text: None,
+                    filename: None,
+                },
+                |text, style| {
+                    mimageviewer::ui_helpers::measure_thumbnail_badge_text(&painter, text, style)
+                },
+            );
+            mimageviewer::ui_helpers::draw_overlay_bookmark_time_badge(
+                &painter,
+                layout.top_left.bookmark_time.as_ref().expect("time"),
+                false,
+            );
+            for placement in &layout.top_left.edit_badges {
+                let mimageviewer::thumb_overlay_layout::BadgeKind::Edit(kind) = placement.kind
+                else {
+                    continue;
+                };
+                mimageviewer::ui_helpers::draw_overlay_edit_badge(&painter, placement, kind);
+            }
+            mimageviewer::ui_helpers::draw_overlay_tag_badge(
+                &painter,
+                layout.top_left.tag.as_ref().expect("tag"),
+            );
         },
     );
 }

@@ -414,11 +414,9 @@ impl App {
             .default_pos(ctx.content_rect().min + egui::vec2(90.0, 70.0))
             .show(ctx, |ui| {
                 ui.label("名前:");
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut name)
-                        .desired_width(360.0)
-                        .hint_text("スマートフォルダ名"),
-                );
+                let response = crate::ime_focus::add_singleline(ui, &mut name, None, |edit| {
+                    edit.desired_width(360.0).hint_text("スマートフォルダ名")
+                });
                 if duplicate && !trimmed.is_empty() {
                     ui.colored_label(ui.visuals().error_fg_color, "同じ名前が既にあります");
                 }
@@ -500,9 +498,11 @@ impl App {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("名前に含む:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut draft.filter.name_contains)
-                            .desired_width(320.0),
+                    crate::ime_focus::add_singleline(
+                        ui,
+                        &mut draft.filter.name_contains,
+                        None,
+                        |edit| edit.desired_width(320.0),
                     );
                     ui.label(egui::RichText::new("（任意）").weak());
                 });
@@ -707,9 +707,13 @@ impl App {
                         if let Some(definition) = draft.as_mut() {
                             ui.horizontal(|ui| {
                                 ui.label("名前:");
-                                if ui
-                                    .text_edit_singleline(&mut definition.name)
-                                    .lost_focus()
+                                if crate::ime_focus::add_singleline(
+                                    ui,
+                                    &mut definition.name,
+                                    None,
+                                    |edit| edit,
+                                )
+                                .lost_focus()
                                 {
                                     normalize_definition_text = true;
                                 }
@@ -803,13 +807,12 @@ impl App {
                                             );
                                             ui.horizontal(|ui| {
                                                 ui.label("名前に含む:");
-                                                if ui
-                                                    .add(
-                                                    egui::TextEdit::singleline(
-                                                        &mut rule.filter.name_contains,
-                                                    )
-                                                    .desired_width(240.0),
-                                                    )
+                                                if crate::ime_focus::add_singleline(
+                                                    ui,
+                                                    &mut rule.filter.name_contains,
+                                                    None,
+                                                    |edit| edit.desired_width(240.0),
+                                                )
                                                     .lost_focus()
                                                 {
                                                     normalize_definition_text = true;

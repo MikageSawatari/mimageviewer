@@ -48,9 +48,11 @@ impl App {
                     ui.label("表示名 (ツールバーやメニューに表示される名前):");
                     ui.add_space(2.0);
 
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.fav_add_name_input)
-                            .desired_width(f32::INFINITY),
+                    let resp = crate::ime_focus::add_singleline(
+                        ui,
+                        &mut self.fav_add_name_input,
+                        None,
+                        |edit| edit.desired_width(f32::INFINITY),
                     );
                     // 初回フォーカス
                     if !resp.has_focus()

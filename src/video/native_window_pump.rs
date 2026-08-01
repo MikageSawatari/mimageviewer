@@ -90,6 +90,22 @@ enum PumpCommand {
     },
 }
 
+impl PumpCommand {
+    fn request_id(&self) -> Option<u64> {
+        match self {
+            Self::Open(request) | Self::Switch(request) => Some(request.request),
+            Self::TargetReady { request, .. }
+            | Self::TargetFailed { request, .. }
+            | Self::RenderFault { request, .. }
+            | Self::Shutdown { request } => Some(*request),
+            Self::Visibility { .. }
+            | Self::Resize { .. }
+            | Self::RaisePresenter { .. }
+            | Self::RaiseHud { .. } => None,
+        }
+    }
+}
+
 pub(crate) enum PumpLifecycleEvent {
     Attach {
         request: u64,
@@ -270,6 +286,7 @@ pub(crate) struct NativeWindowPumpSpawn {
     pub(crate) ui_event_tx: NativeOutputEventSender,
     pub(crate) init_error: Arc<Mutex<Option<String>>>,
     pub(crate) channel_fault: Arc<AtomicBool>,
+    pub(crate) health: Arc<super::native_window_health::NativeWindowHealth>,
 }
 
 pub(crate) fn spawn_native_window_pump(
@@ -326,6 +343,7 @@ struct PumpRuntime {
     ui_event_tx: NativeOutputEventSender,
     init_error: Arc<Mutex<Option<String>>>,
     channel_fault: Arc<AtomicBool>,
+    health: Arc<super::native_window_health::NativeWindowHealth>,
     command_rx: Receiver<PumpCommand>,
     lifecycle_tx: Sender<PumpLifecycleEvent>,
     latest: Arc<LatestPumpValues>,
@@ -353,6 +371,9 @@ impl PumpRuntime {
         render_route: NativeWindowEventRoute,
         pump_events: NativeWindowEventReceiver,
     ) -> Self {
+        spawn
+            .health
+            .record_pump_thread(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() });
         Self {
             config: spawn.config,
             cancel: spawn.cancel,
@@ -364,6 +385,7 @@ impl PumpRuntime {
             ui_event_tx: spawn.ui_event_tx,
             init_error: spawn.init_error,
             channel_fault: spawn.channel_fault,
+            health: spawn.health,
             command_rx,
             lifecycle_tx,
             latest,
@@ -397,7 +419,7 @@ impl PumpRuntime {
             if self.quitting {
                 break;
             }
-            if crate::video::native_window::pump_thread_messages() {
+            if crate::video::native_window::pump_thread_messages_with_health(&self.health) {
                 return Err("native window pump received an unexpected WM_QUIT".to_string());
             }
             self.drain_window_events()?;
@@ -416,7 +438,17 @@ impl PumpRuntime {
     fn drain_commands(&mut self) -> Result<(), String> {
         loop {
             match self.command_rx.try_recv() {
-                Ok(command) => self.handle_command(command)?,
+                Ok(command) => {
+                    let request = command.request_id();
+                    if let Some(request) = request {
+                        self.health.record_command_received(request);
+                    }
+                    let result = self.handle_command(command);
+                    if let Some(request) = request {
+                        self.health.record_command_completed(request);
+                    }
+                    result?;
+                }
                 Err(TryRecvError::Empty) => return Ok(()),
                 Err(TryRecvError::Disconnected) => {
                     self.begin_shutdown(self.shutdown_request.saturating_add(1));
@@ -633,6 +665,12 @@ impl PumpRuntime {
             },
         };
         let windows = window.contract_windows();
+        self.health.record_window_handles(
+            epoch.0,
+            window.hwnd().0 as usize as u64,
+            window.hud_hwnd(),
+            false,
+        );
         self.hosts.insert(epoch, window);
         self.parent_sizes.insert(epoch, (width, height));
         self.dispatch(WindowHostInput::Event(WindowHostEvent::WindowCreated {
@@ -720,6 +758,17 @@ impl PumpRuntime {
             .store(window.hwnd().0 as usize as u64, Ordering::Release);
         self.hud_hwnd_out
             .store(window.hud_hwnd(), Ordering::Release);
+        self.health.record_window_published(
+            host.epoch.0,
+            window.hwnd().0 as usize as u64,
+            window.hud_hwnd(),
+            placement.placement,
+            visibility == WindowVisibility::Visible,
+        );
+        self.validate_published_window_owner(window.hwnd().0 as usize as u64);
+        if window.hud_hwnd() != 0 {
+            self.validate_published_window_owner(window.hud_hwnd());
+        }
         self.send_lifecycle(PumpLifecycleEvent::Published {
             request: host.request.0,
             epoch: host.epoch.0,
@@ -768,6 +817,8 @@ impl PumpRuntime {
         // an idempotent request that performs no native show/hide operation.
         self.presenter_visibility
             .publish_hidden(visibility == WindowVisibility::Hidden);
+        self.health
+            .record_visibility(host.epoch.0, visibility == WindowVisibility::Visible);
         self.send_lifecycle(PumpLifecycleEvent::VisibilityApplied {
             epoch: host.epoch.0,
             visible: visibility == WindowVisibility::Visible,
@@ -781,9 +832,12 @@ impl PumpRuntime {
         }
         self.requests.remove(&host.epoch);
         self.parent_sizes.remove(&host.epoch);
-        self.dispatch(WindowHostInput::Event(WindowHostEvent::WindowDestroyed {
+        self.health.clear_window_handles_if_epoch(host.epoch.0);
+        let result = self.dispatch(WindowHostInput::Event(WindowHostEvent::WindowDestroyed {
             lease: host.lease(),
-        }))
+        }));
+        self.refresh_window_health();
+        result
     }
 
     fn remove_lost_host(&mut self, host: HostedWindow) {
@@ -791,6 +845,8 @@ impl PumpRuntime {
         self.hosts.remove(&host.epoch);
         self.requests.remove(&host.epoch);
         self.parent_sizes.remove(&host.epoch);
+        self.health.clear_window_handles_if_epoch(host.epoch.0);
+        self.refresh_window_health();
     }
 
     fn clear_published_if_matches(&self, epoch: WindowEpoch) {
@@ -806,6 +862,42 @@ impl PumpRuntime {
             let _ = self
                 .hud_hwnd_out
                 .compare_exchange(hud, 0, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+
+    fn refresh_window_health(&self) {
+        let (host, visible) = match self.state {
+            WindowHostState::Visible { host, .. } => (host, true),
+            WindowHostState::Hidden { host, .. } => (host, false),
+            _ => return,
+        };
+        let Some(window) = self.hosts.get(&host.epoch) else {
+            return;
+        };
+        self.health.record_window_handles(
+            host.epoch.0,
+            window.hwnd().0 as usize as u64,
+            window.hud_hwnd(),
+            visible,
+        );
+    }
+
+    fn validate_published_window_owner(&self, hwnd_raw: u64) {
+        let expected = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+        let actual = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                windows::Win32::Foundation::HWND(hwnd_raw as usize as *mut _),
+                None,
+            )
+        };
+        #[cfg(any(debug_assertions, test))]
+        assert_eq!(
+            actual, expected,
+            "published native video HWND must belong to its pump thread"
+        );
+        if actual != expected {
+            self.health
+                .record_owner_mismatch(expected, actual, hwnd_raw);
         }
     }
 
@@ -835,6 +927,7 @@ impl PumpRuntime {
         }
         self.hwnd_out.store(0, Ordering::Release);
         self.hud_hwnd_out.store(0, Ordering::Release);
+        self.health.clear_window_handles();
         self.presenter_visibility.publish_hidden(false);
         self.closed.store(true, Ordering::Release);
         let _ = self.send_lifecycle(PumpLifecycleEvent::Shutdown);
@@ -1093,6 +1186,7 @@ fn active_epoch(state: WindowHostState) -> Option<WindowEpoch> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::NativeVideoInitialVisibility;
     use super::*;
     use std::process::Command;
     use std::sync::mpsc;
@@ -1161,10 +1255,12 @@ mod tests {
         let hwnd_out = Arc::new(AtomicU64::new(0));
         let hud_out = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));
-        let presenter_visibility = NativePresenterVisibility::new_visible();
+        let presenter_visibility =
+            NativePresenterVisibility::new(NativeVideoInitialVisibility::Visible);
         let source_epoch = Arc::new(AtomicU64::new(0));
         let init_error = Arc::new(Mutex::new(None));
         let channel_fault = Arc::new(AtomicBool::new(false));
+        let health = super::super::native_window_health::NativeWindowHealth::new_registered();
         let (ui_tx, _ui_rx) = super::super::native_output_event_bus(32, Arc::clone(&channel_fault));
         let config = NativeVideoOutputConfig {
             rect: windows::Win32::Foundation::RECT {
@@ -1190,6 +1286,7 @@ mod tests {
             hud_overlay_enabled: false,
             placement: NativeVideoPlacement::MainWindowChild,
             activate_on_show: false,
+            initial_visibility: NativeVideoInitialVisibility::Visible,
             in_main_window: true,
             audio_only: false,
         };
@@ -1204,6 +1301,7 @@ mod tests {
             ui_event_tx: ui_tx,
             init_error: Arc::clone(&init_error),
             channel_fault,
+            health: Arc::clone(&health),
         })
         .expect("spawn production window pump");
         let NativeWindowPumpThread {
@@ -1229,6 +1327,7 @@ mod tests {
 
         let (stalled_tx, stalled_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let render_health = Arc::clone(&health);
         let render_join = thread::Builder::new()
             .name("native-video-render-stall-test".into())
             .spawn(move || {
@@ -1272,6 +1371,8 @@ mod tests {
                             ui_scale: 1.0,
                             text_contrast: crate::settings::TextContrast::Standard,
                             ui_font: crate::settings::UiFontSettings::default(),
+                            health: render_health,
+                            window_epoch: 1,
                         },
                     )
                     .expect("production render attach");

@@ -41,6 +41,17 @@ def session(pid: int) -> dict:
     return {"t": 0.0, "cat": "session", "kind": "start", "pid": pid}
 
 
+def thumb(t: float, kind: str, key: str) -> dict:
+    return {
+        "t": t,
+        "cat": "thumb",
+        "kind": kind,
+        "key": key,
+        "idx": 7,
+        "items_gen": 2,
+    }
+
+
 class IdleHealthTests(unittest.TestCase):
     def test_powershell_harness_is_ascii_for_windows_powershell_51(self) -> None:
         # Windows PowerShell 5.1 treats UTF-8 without BOM as an ANSI code page. A multibyte
@@ -77,37 +88,110 @@ class IdleHealthTests(unittest.TestCase):
         self.assertEqual(report["status"], "fail")
         self.assertTrue(any("PID" in item for item in report["failures"]))
 
-    def test_video_pin_scenario_requires_ineligible_evidence(self) -> None:
-        events = [session(42), frame(1.0, 1), tail(1.0, 1)]
-        report = analyze_idle_health(
-            events,
-            1.0,
-            10.0,
-            expected_pid=42,
-            evidence_start_t=0.5,
-            require_idle_upgrade_ineligible=True,
-        )
-        self.assertEqual(report["status"], "fail")
+    def test_video_pin_scenario_matches_target_work_case_insensitively(self) -> None:
+        events = [
+            session(42),
+            frame(1.0, 1),
+            tail(1.0, 1),
+            thumb(0.75, "idle_upgrade_enqueue", "dir::c:/BOOKS/Video-Pin"),
+        ]
 
-        events.append(
-            {
-                "t": 0.75,
-                "cat": "thumb",
-                "kind": "idle_upgrade_ineligible",
-                "key": "C:/books/video-pin",
-                "idx": 7,
-                "items_gen": 2,
-            }
-        )
         report = analyze_idle_health(
             events,
             1.0,
             10.0,
             expected_pid=42,
             evidence_start_t=0.5,
-            require_idle_upgrade_ineligible=True,
+            require_work_key="C:/books/video-pin",
         )
+
         self.assertEqual(report["status"], "pass")
+        self.assertGreater(report["setup_evidence"]["matched_events"], 0)
+        self.assertEqual(
+            report["setup_evidence"]["matched_kinds"],
+            {"idle_upgrade_enqueue": 1},
+        )
+        self.assertEqual(report["setup_evidence"]["first_match_t"], 0.75)
+        self.assertEqual(report["setup_evidence"]["last_match_t"], 0.75)
+        self.assertEqual(report["warnings"], [])
+
+    def test_video_pin_scenario_rejects_other_or_out_of_window_work(self) -> None:
+        events = [
+            session(42),
+            frame(1.0, 1),
+            tail(1.0, 1),
+            thumb(0.25, "idle_upgrade_ineligible", "dir::c:/books/video-pin"),
+            thumb(0.75, "idle_upgrade_enqueue", "dir::c:/books/other"),
+        ]
+
+        report = analyze_idle_health(
+            events,
+            1.0,
+            10.0,
+            expected_pid=42,
+            evidence_start_t=0.5,
+            require_work_key="C:/books/video-pin",
+        )
+
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(report["setup_evidence"]["matched_events"], 0)
+        self.assertTrue(
+            any("C:/books/video-pin" in item for item in report["failures"])
+        )
+
+    def test_video_pin_scenario_warns_when_idle_upgrade_did_not_evaluate_tile(
+        self,
+    ) -> None:
+        events = [
+            session(42),
+            frame(1.0, 1),
+            tail(1.0, 1),
+            thumb(0.75, "enqueue", "dir::c:/books/video-pin"),
+        ]
+
+        report = analyze_idle_health(
+            events,
+            1.0,
+            10.0,
+            expected_pid=42,
+            evidence_start_t=0.5,
+            require_work_key="C:/books/video-pin",
+        )
+
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["setup_evidence"]["matched_events"], 1)
+        self.assertEqual(len(report["warnings"]), 1)
+        self.assertIn("from_cache=false", report["warnings"][0])
+
+    def test_video_pin_work_key_gate_is_disabled_by_default(self) -> None:
+        events = [session(42), frame(1.0, 1), tail(1.0, 1)]
+
+        report = analyze_idle_health(
+            events,
+            1.0,
+            10.0,
+            expected_pid=42,
+            evidence_start_t=0.5,
+            require_work_key=None,
+        )
+
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["thresholds"]["require_work_key"], None)
+        self.assertEqual(report["setup_evidence"]["matched_events"], 0)
+
+    def test_blank_work_key_is_rejected_instead_of_matching_everything(self) -> None:
+        # "" は全 key に部分一致するのでゲートが常に通ってしまう。無効化は None で表す。
+        events = [session(42), frame(1.0, 1), tail(1.0, 1)]
+
+        for blank in ("", "   "):
+            with self.assertRaises(ValueError):
+                analyze_idle_health(
+                    events,
+                    1.0,
+                    10.0,
+                    expected_pid=42,
+                    require_work_key=blank,
+                )
 
     def test_fast_repaint_and_repeated_idle_work_fail(self) -> None:
         events: list[dict] = []

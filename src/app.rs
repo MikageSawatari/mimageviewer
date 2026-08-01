@@ -135,11 +135,9 @@ pub(crate) use folder_scan::{
     ScannedDir, materialize_local_folder_listing, scan_directory_with_convertible_archives,
     scan_directory_with_settings, signature_from_scan,
 };
-#[cfg(test)]
-pub(crate) use grid_paint::cell_has_lower_left_container_badge;
 pub(crate) use grid_paint::{
-    draw_cell, draw_spread_pair_cursor, grid_tag_badge_hit_rect, primary_grid_tag_for_badge,
-    tq_draw_preview,
+    draw_cell, draw_spread_pair_cursor, grid_tag_badge_hit_rect, layout_cell_overlays,
+    primary_grid_tag_for_badge, tq_draw_preview,
 };
 pub(crate) use metadata_ops::FacetField;
 use metadata_ops::{
@@ -5416,6 +5414,44 @@ pub(crate) struct RetainedPdfPageEntry {
     pub(crate) last_used: u64,
 }
 
+/// フルスクリーン 1 ページのロード／表示可否を表す単一の判定結果。
+///
+/// `fs_cache` / `fs_pending` / retained PDF page store を呼び出し側が個別に
+/// 組み合わせると、retained final-AI だけで表示できるページを「未ロード」と誤認する。
+/// 物理的な所有先はそれぞれのまま維持し、表示・再入ガード・prefetch の判断だけを
+/// この typed projection に集約する。`UploadPending` も再投入不可の中継状態として扱う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsPageLoadState {
+    NeedsLoad,
+    LoadPending,
+    UploadPending,
+    DisplayReady(FsPageDisplaySource),
+    LoadFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsPageDisplaySource {
+    LiveCache,
+    RetainedPdfFinalAi,
+}
+
+impl FsPageLoadState {
+    fn needs_load_request(self) -> bool {
+        matches!(self, Self::NeedsLoad)
+    }
+
+    pub(crate) fn waiting_for_display(self) -> bool {
+        matches!(
+            self,
+            Self::NeedsLoad | Self::LoadPending | Self::UploadPending
+        )
+    }
+
+    pub(crate) fn is_display_ready(self) -> bool {
+        matches!(self, Self::DisplayReady(_))
+    }
+}
+
 /// 表示セッションから外れた PDF final AI を、保持 LRU へ入れる目的で完走させる上限。
 ///
 /// final AI worker は単一なので、ここを大きくすると「今見ているページ」の AI が
@@ -5854,6 +5890,20 @@ pub(crate) struct FinalCompositeEntry {
     pub(crate) complete: bool,
 }
 
+/// 既存 final composite を返して、このフレームの同期 CPU 合成を省略できるか。
+///
+/// final-effect worker 待ちは AI 結果到着後だけを対象にする。AI 失敗時や AI 未起動時まで
+/// pending を理由に抜けると、complete 昇格・PDF rerender・`maybe_start_final_ai` の各経路を
+/// 遅延させるため、それらは従来どおり呼び出し側の state transition へ流す。
+fn should_return_cached_final_composite(
+    entry_complete: bool,
+    ai_ready: bool,
+    ai_failed: bool,
+    same_key_final_effect_pending: bool,
+) -> bool {
+    entry_complete || (!ai_ready && !ai_failed) || (ai_ready && same_key_final_effect_pending)
+}
+
 /// 連結読みで表示済みのページを、同ページの新しい final composite が完成するまで
 /// 保持する表示専用状態。idx と texture だけを別々に持つと一覧差し替え後の同じ idx に
 /// 誤適用できるため、所有する items 世代と一体で管理する。
@@ -5864,27 +5914,39 @@ pub(crate) struct ContinuousPageTransition {
 
 /// フルスクリーンの一時表示を 1 フィールドで所有する typed state。
 ///
-/// フォルダ横断は従来どおり旧ビューの単一 texture を overlay として保持する。
-/// 同一 viewer 内のカラー化待ちは、旧ページを個別 slot に分けず、画面上の
-/// 1 表示ユニット（単ページまたは見開き）を一体で保持する。
+/// フォルダ横断と同一 viewer 内のカラー化待ちは、どちらも旧ページを個別 slot に
+/// 分けず、画面上の 1 表示ユニット（単ページまたは見開き）を一体で保持する。
+/// variant は保持する理由と解放条件を分離するために維持する。
 #[derive(Clone)]
 pub(crate) enum FsHoldover {
-    FolderNavigation(egui::TextureHandle),
+    FolderNavigation(FsDisplayUnitHoldover),
     ColorizeDisplayUnit(ColorizeDisplayUnitHoldover),
 }
 
 impl FsHoldover {
-    pub(crate) fn folder_navigation_texture(&self) -> Option<&egui::TextureHandle> {
+    pub(crate) fn folder_navigation_display_unit(&self) -> Option<&FsDisplayUnitHoldover> {
         match self {
-            Self::FolderNavigation(texture) => Some(texture),
+            Self::FolderNavigation(unit) => Some(unit),
             Self::ColorizeDisplayUnit(_) => None,
+        }
+    }
+
+    pub(crate) fn colorize_wait_started_at(&self) -> Option<std::time::Instant> {
+        match self {
+            Self::FolderNavigation(_) => None,
+            Self::ColorizeDisplayUnit(holdover) => Some(holdover.started_at),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn primary_texture_id(&self) -> egui::TextureId {
         match self {
-            Self::FolderNavigation(texture) => texture.id(),
+            Self::FolderNavigation(unit) => unit
+                .pages
+                .first()
+                .expect("folder navigation display unit must contain at least one page")
+                .texture
+                .id(),
             Self::ColorizeDisplayUnit(holdover) => holdover
                 .previous
                 .pages
@@ -5901,6 +5963,8 @@ pub(crate) struct ColorizeDisplayUnitHoldover {
     /// `open_fullscreen` 後にこの idx が current である間だけ previous を公開する。
     pub(crate) target_idx: usize,
     pub(crate) previous: FsDisplayUnitHoldover,
+    /// The UX delay belongs to the typed colorize wait state, not to a separate flag.
+    pub(crate) started_at: std::time::Instant,
 }
 
 #[derive(Clone)]
@@ -5911,8 +5975,14 @@ pub(crate) struct FsDisplayUnitHoldover {
 
 #[derive(Clone)]
 pub(crate) struct FsDisplayUnitHoldoverPage {
+    /// Capture-time index retained for tracing and `fullscreen_page_layout` identity only.
+    /// Geometry must never be re-derived from it because folder navigation can replace items
+    /// while the holdover remains visible.
     pub(crate) idx: usize,
     pub(crate) texture: egui::TextureHandle,
+    pub(crate) rotation: crate::rotation_db::Rotation,
+    pub(crate) source_size: Option<egui::Vec2>,
+    pub(crate) content_bbox: Option<egui::Rect>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -7602,18 +7672,81 @@ fn viewer_context_media_teardown_plan(
 }
 
 #[cfg(windows)]
-fn pause_viewer_context_bundle_media_for_tray(bundle: &ViewerContextBundle) -> usize {
-    let mut paused = 0;
-    for entry in bundle.fs_cache.values() {
+fn sync_viewer_context_bundle_presenters_for_tray(
+    bundle: &ViewerContextBundle,
+    app_visible: bool,
+) -> usize {
+    let mut routed = 0;
+    let music_consumer = viewer_context_bundle_is_music_consumer(bundle);
+    for (idx, entry) in &bundle.fs_cache {
         let FsCacheEntry::Video { player, .. } = entry else {
             continue;
         };
-        if player.intent_playing() {
-            player.set_playing(false);
-            paused += 1;
-        }
+        let presenter_visible =
+            app_visible && bundle.fullscreen_idx == Some(*idx) && !music_consumer;
+        player.set_native_window_visible(presenter_visible);
+        routed += 1;
     }
-    paused
+    routed
+}
+
+#[cfg(windows)]
+fn player_needs_resident_media_updates(
+    player: &crate::video::VideoPlayer,
+    fs_idx: usize,
+    continuous_mode: crate::video::VideoContinuousMode,
+    continuous_last_eof: Option<(usize, u64)>,
+) -> bool {
+    if player.error().is_some() || !player.intent_playing() {
+        return false;
+    }
+    if !player.is_at_eof() {
+        return true;
+    }
+
+    continuous_mode.is_enabled()
+        && continuous_last_eof != Some((fs_idx, player.current_seek_serial()))
+}
+
+#[cfg(windows)]
+fn viewer_context_bundle_needs_resident_media_updates(
+    bundle: &ViewerContextBundle,
+    continuous_mode: crate::video::VideoContinuousMode,
+    continuous_last_eof: Option<(usize, u64)>,
+) -> bool {
+    bundle
+        .fullscreen_idx
+        .and_then(|idx| bundle.fs_cache.get(&idx).map(|entry| (idx, entry)))
+        .is_some_and(|(idx, entry)| {
+            matches!(entry, FsCacheEntry::Video { player, .. }
+            if player_needs_resident_media_updates(
+                player,
+                idx,
+                continuous_mode,
+                continuous_last_eof,
+            ))
+        })
+}
+
+fn pause_current_media_player_for_remote_session(
+    fullscreen_idx: Option<usize>,
+    fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
+) -> bool {
+    let Some(FsCacheEntry::Video { player, .. }) =
+        fullscreen_idx.and_then(|idx| fs_cache.get(&idx))
+    else {
+        return false;
+    };
+    if !player.intent_playing() {
+        return false;
+    }
+    player.set_playing(false);
+    true
+}
+
+#[cfg(windows)]
+fn pause_viewer_context_bundle_media_for_remote_session(bundle: &ViewerContextBundle) -> bool {
+    pause_current_media_player_for_remote_session(bundle.fullscreen_idx, &bundle.fs_cache)
 }
 
 #[cfg(windows)]
@@ -8482,22 +8615,14 @@ pub struct App {
     // ── 新規フォルダ作成ダイアログ ───────────────────────────────
     pub(crate) show_new_folder_dialog: bool,
     pub(crate) new_folder_parent: Option<PathBuf>,
-    pub(crate) new_folder_input: String,
-    pub(crate) new_folder_error: Option<String>,
     pub(crate) new_folder_pending: Option<crate::ui_dialogs::new_folder::NewFolderReceiver>,
 
     // ── 実ファイル/実フォルダの名前変更ダイアログ ───────────────
     pub(crate) show_rename_dialog: bool,
     pub(crate) rename_target: Option<PathBuf>,
-    pub(crate) rename_input: String,
-    pub(crate) rename_error: Option<String>,
     pub(crate) rename_pending: Option<crate::ui_dialogs::rename_item::RenameReceiver>,
-    /// ダイアログを開いた時点で対象が実ファイルだったか。毎フレームの stat を避ける。
+    /// ダイアログ要求時点で対象が実ファイルだったか。
     pub(crate) rename_target_is_file: bool,
-    /// TextEdit の初回フォーカス時に Explorer 風の選択範囲を設定する one-shot。
-    pub(crate) rename_initial_selection_pending: bool,
-    /// ファイルの拡張子変更を実行する前の確認画面を表示中か。
-    pub(crate) rename_extension_confirm: bool,
     /// リネーム移行 (`rename_key_migration`) のジョブキュー (FIFO)。連続リネーム
     /// A→B→C を並列 worker にすると逆順実行で中間 path にデータが取り残されるため、
     /// 必ず 1 本ずつ直列実行する (Sol rename-mig P1。根拠テスト =
@@ -9764,12 +9889,6 @@ pub struct App {
     // ── スマートフォルダ snapshot view ───────────────────────────
     pub(crate) current_smart_folder_id: Option<uuid::Uuid>,
     pub(crate) smart_folder_saved_folder: Option<PathBuf>,
-    pub(crate) smart_folder_snapshots:
-        std::collections::HashMap<uuid::Uuid, smart_folder::SmartFolderSnapshot>,
-    /// Completed generation metadata keyed by real item path. Sort-only rebuilds clone only the
-    /// Arc and remap on the prepare worker; the UI thread never reconstructs this O(N) state.
-    pub(crate) smart_folder_resort_metadata:
-        std::collections::HashMap<uuid::Uuid, Arc<smart_folder::ReusedSmartFolderMetadata>>,
     /// A thread-spawn failure must not make invalidation synchronously destroy a million-item
     /// result on the UI thread. Such rare handoff failures are retained here and retried at the
     /// next retirement boundary (or dropped during application shutdown).
@@ -10159,13 +10278,6 @@ pub struct App {
     pub(crate) slot_save_dialog: Option<(usize, String, crate::adjustment::AdjustParams)>,
     /// お気に入り専用の標準を解除すると表示が変わる場合の確認ダイアログ。
     pub(crate) favorite_default_clear_confirm: Option<FavoriteDefaultClearConfirm>,
-    /// IME 変換中フラグ。Ime イベントで更新される持続状態。
-    /// Enabled/Preedit(非空) で true、Preedit("")/Commit/Disabled で false。
-    pub(crate) ime_composing: bool,
-    /// 直近の Ime イベント受信時刻 (時間ベースのガードに使う)。
-    /// Windows IME のキャンセル Escape では Ime::Disabled と Key::Escape が別フレームに
-    /// 分かれて届くことがあるため、Ime イベント後 300ms は IME 入力中として扱う。
-    pub(crate) ime_last_event_at: Option<std::time::Instant>,
     /// 右上フィードバック表示: (テキスト, 表示開始時刻, 表示秒数)。
     /// フルスクリーン / グリッド共通。命名の `fs_` プレフィックスはフルスクリーン
     /// 専用だった頃の名残。表示秒数はトーストごとに指定でき、短い確認系は既定
@@ -10799,8 +10911,8 @@ pub struct App {
     /// ロックを即解除してしまい、items 入れ替えの瞬間に holdover が失われて
     /// 「ファイル名のみ表示」が出る不具合になる。
     pub(crate) fs_nav_locked_gen: Option<u64>,
-    /// 旧表示を保持する単一 typed state。`FolderNavigation` は従来どおり旧ビューの
-    /// 1 texture、`ColorizeDisplayUnit` は単ページ / 見開き全体を 1 unit として持つ。
+    /// 旧表示を保持する単一 typed state。`FolderNavigation` / `ColorizeDisplayUnit` とも
+    /// 単ページ / 見開き全体を 1 unit として持ち、variant ごとに解放条件を分離する。
     /// legacy 名は context bundle の機械的な差分を抑えるため維持している。
     pub(crate) fs_holdover_tex: Option<FsHoldover>,
 
@@ -11748,17 +11860,11 @@ impl App {
             open_folder_error: None,
             show_new_folder_dialog: false,
             new_folder_parent: None,
-            new_folder_input: String::new(),
-            new_folder_error: None,
             new_folder_pending: None,
             show_rename_dialog: false,
             rename_target: None,
-            rename_input: String::new(),
-            rename_error: None,
             rename_pending: None,
             rename_target_is_file: false,
-            rename_initial_selection_pending: false,
-            rename_extension_confirm: false,
             rename_migration_queue: std::collections::VecDeque::new(),
             rename_migration_in_flight: None,
             rename_migration_boot_retry: Vec::new(),
@@ -12224,8 +12330,6 @@ impl App {
             subfolder_expansion_diag: None,
             current_smart_folder_id: None,
             smart_folder_saved_folder: None,
-            smart_folder_snapshots: std::collections::HashMap::new(),
-            smart_folder_resort_metadata: std::collections::HashMap::new(),
             smart_folder_retired_payloads: Vec::new(),
             smart_folder_metadata_revision: 0,
             smart_folder_open_origin: None,
@@ -12365,8 +12469,6 @@ impl App {
             export_crop_db,
             slot_save_dialog: None,
             favorite_default_clear_confirm: None,
-            ime_composing: false,
-            ime_last_event_at: None,
             fs_feedback_toast: None,
             fs_feedback_toast_reveal_path: None,
             fs_feedback_toast_surface: None,
@@ -13411,58 +13513,30 @@ impl App {
         self.bump_input_seq(kind, key.as_deref())
     }
 
-    /// IME 変換状態を更新する (毎フレーム先頭で呼ぶ)。
-    /// `ime_input_active_this_frame` に「今フレームを IME 入力として扱うか」を設定する。
-    ///
-    /// 判定は以下の 3 条件の OR:
-    /// 1. 前フレーム末で composition 状態だった (`was_composing`)
-    /// 2. 今フレームに Ime イベントが来ている (`had_ime_event`)
-    /// 3. 直近 300ms 以内に Ime イベントがあった (時間ベースの余韻)
-    ///
-    /// 3 が必要な理由: Windows の一部環境では、IME キャンセル時 (Escape) に
-    /// Ime イベントが先行フレームで発行されて `ime_composing = false` になり、
-    /// Key::Escape 自体は 1〜数フレーム遅れで届くことがある。
-    /// その隙間を埋めるためのガード。
-    /// 現在のビューポートの Ime イベントを処理して `ime_composing` / `ime_last_event_at` を更新する。
+    /// 現在の viewport の IME 変換状態をイベント処理前に取り込む。
     ///
     /// **重要**: egui の各ビューポートは独立したイベントキューを持つ。
     /// `show_viewport_immediate` で別ビューポートを出している場合は、その closure の
     /// 先頭でも呼ばないと、そのビューポート内の IME を取り逃がす。
     pub(crate) fn update_ime_state(&mut self, ctx: &egui::Context) {
-        ctx.input(|i| {
-            for event in &i.events {
-                if let egui::Event::Ime(ime) = event {
-                    self.ime_last_event_at = Some(std::time::Instant::now());
-                    match ime {
-                        egui::ImeEvent::Enabled => self.ime_composing = true,
-                        egui::ImeEvent::Preedit(s) => self.ime_composing = !s.is_empty(),
-                        egui::ImeEvent::Commit(_) => self.ime_composing = false,
-                        egui::ImeEvent::Disabled => self.ime_composing = false,
-                    }
-                }
-            }
-        });
+        let _ = crate::ime_focus::ime_input_active(ctx);
     }
 
     /// IME 変換中か (または直近 300ms 以内に Ime イベントがあったか)。
     /// true の間は Enter / Escape をショートカット・ダイアログ確定/キャンセルとして拾ってはいけない。
     /// 300ms グレースは Windows IME で `Ime::Disabled` と `Key::Escape` が別フレームに
     /// 届くケースを吸収するため。
-    pub(crate) fn ime_input_active(&self) -> bool {
-        if self.ime_composing {
-            return true;
-        }
-        self.ime_last_event_at
-            .map(|t| t.elapsed() < std::time::Duration::from_millis(300))
-            .unwrap_or(false)
+    pub(crate) fn ime_input_active(&self, ctx: &egui::Context) -> bool {
+        crate::ime_focus::ime_input_active(ctx)
     }
 
     /// Gather every App/egui input needed by the pass owner in one place.
     ///
     /// This is the only impure ownership entry: the decision function itself
     /// receives copied bool/id values only. `book_bookmark_title_edit` is
-    /// deliberately not read; only the explicit one-pass focus claim below can
-    /// represent an editor before focus lands. Native presenter text input is
+    /// deliberately not read; the explicit pending-focus claim represents an
+    /// editor before focus lands, and the helper focus contract represents the
+    /// TextEdit after it is drawn. Native presenter text input is
     /// claimed upstream on its own egui context, so no key from that owner is
     /// forwarded into this App viewport snapshot.
     fn keyboard_ownership_snapshot(
@@ -13470,7 +13544,7 @@ impl App {
         ctx: &egui::Context,
     ) -> crate::keyboard_input::KeyboardOwnershipSnapshot {
         use crate::keyboard_input::{
-            PendingFocusEvent, ShortcutScope, ShortcutSurface, TextInputPhase,
+            PendingFocusEvent, ShortcutScope, ShortcutSurface, TextInputClaim, TextInputPhase,
             transition_pending_focus_claim,
         };
 
@@ -13509,11 +13583,31 @@ impl App {
                 || self.global_search.has_focus
                 || self.tag_view.has_focus
                 || self.color_filter.input_has_focus);
-        let focused_text_input = tracked_text_input_focused
-            .then_some(focused_widget.unwrap_or(egui::Id::NULL))
+        let focused_text_input = crate::ime_focus::focused_text_input(ctx)
+            .or_else(|| {
+                tracked_text_input_focused.then_some(focused_widget.unwrap_or(egui::Id::NULL))
+            })
             .or(claimed_focused_text_input);
         let wants_keyboard_input = ctx.wants_keyboard_input();
         let focused_ui = wants_keyboard_input.then_some(focused_widget.unwrap_or(egui::Id::NULL));
+        let text_input = focused_text_input
+            .map(|widget_id| TextInputClaim::new(widget_id, TextInputPhase::Focused))
+            .or_else(|| {
+                crate::ime_focus::recovering_text_input(ctx)
+                    .map(|widget_id| TextInputClaim::new(widget_id, TextInputPhase::FocusRecovery))
+            })
+            .or_else(|| {
+                self.ime_input_active(ctx).then(|| {
+                    TextInputClaim::new(
+                        focused_ui.unwrap_or(egui::Id::NULL),
+                        TextInputPhase::ImeGrace,
+                    )
+                })
+            })
+            .or_else(|| {
+                pending_text_input
+                    .map(|widget_id| TextInputClaim::new(widget_id, TextInputPhase::PendingFocus))
+            });
 
         let fullscreen_surface = !is_root
             || self.viewer_session_blocks_main_window()
@@ -13536,9 +13630,7 @@ impl App {
             viewport,
             viewport_focused,
             modal,
-            focused_text_input,
-            pending_text_input,
-            ime_grace: self.ime_input_active(),
+            text_input,
             focused_ui,
             shortcut_scope,
         }
@@ -13551,11 +13643,13 @@ impl App {
         ctx: &egui::Context,
     ) -> crate::keyboard_input::KeyboardOwner {
         if let Some(owner) = crate::keyboard_input::cached_keyboard_owner(ctx) {
+            crate::ime_focus::record_keyboard_owner(ctx, owner);
             return owner;
         }
         let owner =
             crate::keyboard_input::decide_keyboard_owner(self.keyboard_ownership_snapshot(ctx));
         crate::keyboard_input::cache_keyboard_owner(ctx, owner);
+        crate::ime_focus::record_keyboard_owner(ctx, owner);
         owner
     }
 
@@ -13589,12 +13683,12 @@ impl App {
 
     /// ダイアログ確定用の Enter が押されたか。IME 変換中は常に false を返す。
     pub(crate) fn dialog_enter_pressed(&self, ctx: &egui::Context) -> bool {
-        !self.ime_input_active() && ctx.input(|i| i.key_pressed(egui::Key::Enter))
+        !self.ime_input_active(ctx) && ctx.input(|i| i.key_pressed(egui::Key::Enter))
     }
 
     /// ダイアログキャンセル用の Escape が押されたか。IME 変換中は常に false を返す。
     pub(crate) fn dialog_escape_pressed(&self, ctx: &egui::Context) -> bool {
-        !self.ime_input_active() && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        !self.ime_input_active(ctx) && ctx.input(|i| i.key_pressed(egui::Key::Escape))
     }
 
     /// いずれかのモーダルダイアログが開いているか。
@@ -13629,10 +13723,12 @@ impl App {
             || self.fullscreen_tag_picker_open
             || self.show_fav_add_dialog
             || self.show_open_folder_dialog
+            // Native name dialogs stop App::update while their OS modal loop is
+            // active. Keep only the queued-launch flags here so the triggering
+            // frame cannot leak input to the grid. Their async workers are not
+            // visible dialogs and therefore do not belong in this predicate.
             || self.show_new_folder_dialog
-            || self.new_folder_pending.is_some()
             || self.show_rename_dialog
-            || self.rename_pending.is_some()
             || self.show_book_manager
             || self.book_reorder.is_some()
             || self.show_preferences
@@ -14592,6 +14688,7 @@ impl App {
             if let crate::ui_main::AddressBarNav::Direct(path) = &nav
                 && !smart_folder::is_smart_folder_synthetic_path(path)
             {
+                self.authorize_smart_folder_session_open(path);
                 self.select_after_load = self
                     .effective_folder()
                     .and_then(|current| current.file_name().map(|name| name.to_os_string()))
@@ -14657,6 +14754,11 @@ impl App {
             return Some(nav);
         }
         if let Some(nav) = self.smart_folder_parent_nav_target() {
+            if let crate::ui_main::AddressBarNav::Direct(path) = &nav
+                && !smart_folder::is_smart_folder_synthetic_path(path)
+            {
+                self.authorize_smart_folder_session_open(path);
+            }
             return Some(nav);
         }
         if self.items_are_smart_folder_view {
@@ -16578,6 +16680,21 @@ impl App {
         owner: OpenRequestOwner,
     ) {
         let detached_physical = self.navigation_scope.is_detached_physical();
+        if !detached_physical && !smart_folder::is_smart_folder_synthetic_path(&path) {
+            let preserve_smart_folder_session = self.preserve_smart_folder_session_for_load(&path);
+            if self.smart_folder_pending.is_some()
+                || self.smart_folder_prepare_pending.is_some()
+                || self.smart_folder_confirm_pending.is_some()
+            {
+                self.cancel_smart_folder_pending();
+            }
+            if !preserve_smart_folder_session
+                && (self.items_are_smart_folder_view
+                    || self.top_level_grid_view.smart_folder().is_some())
+            {
+                self.clear_smart_folder_view_state();
+            }
+        }
         // 別経路の load が走ったら、この bundle の in-flight folder open scan は stale なので
         // 破棄する。poll_folder_pane_open は pending を take してから適用するため、自分自身の
         // 完了結果を pre-scan 付きで load する場合は no-op。
@@ -21108,6 +21225,9 @@ impl App {
         mut prepared_subfolder: Option<subfolder_expansion::PreparedSubfolderMetadata>,
     ) {
         let detached_physical = self.navigation_scope.is_detached_physical();
+        let preserve_smart_folder_session = !detached_physical
+            && !smart_folder::is_smart_folder_synthetic_path(&source_path)
+            && self.preserve_smart_folder_session_for_load(&source_path);
         self.cancel_media_navigation_pending_for_current_context("start_loading_items");
         if !detached_physical {
             self.clear_color_filter_for_new_items();
@@ -21152,8 +21272,16 @@ impl App {
             self.clear_subfolder_expansion_view_state();
         }
         if !detached_physical && !smart_folder::is_smart_folder_synthetic_path(&source_path) {
-            self.cancel_smart_folder_pending();
-            if self.items_are_smart_folder_view {
+            if self.smart_folder_pending.is_some()
+                || self.smart_folder_prepare_pending.is_some()
+                || self.smart_folder_confirm_pending.is_some()
+            {
+                self.cancel_smart_folder_pending();
+            }
+            if !preserve_smart_folder_session
+                && (self.items_are_smart_folder_view
+                    || self.top_level_grid_view.smart_folder().is_some())
+            {
                 self.clear_smart_folder_view_state();
             }
         }
@@ -23292,13 +23420,8 @@ impl App {
                 self.start_subfolder_expansion_scan_roots(root, roots);
             }
         } else if self.items_are_smart_folder_view {
-            if let Some(snapshot) = self
-                .current_smart_folder_id
-                .and_then(|id| self.smart_folder_snapshots.get(&id))
-                .cloned()
-            {
-                self.start_smart_folder_prepare(snapshot, false);
-            }
+            // A resident smart-folder result is frozen for the session. The explicit toolbar /
+            // menu / gamepad reopen is the refresh gesture for path-keyed metadata and pins.
         } else if let Some(cur) = self.current_folder.clone()
             && !is_synthetic_view_path(&cur)
         {
@@ -25388,7 +25511,9 @@ impl App {
     /// (Sol rename-mig P2)。worker が空になるまで移行開始を遅らせれば、残ジョブが先に
     /// 旧キーへ着地し、その後の移行がまとめて新キーへ運ぶので順序が正しくなる。
     ///
-    /// タグ側は `is_busy()` ではなく **`has_unconsumed_batch()`** を使う: is_busy は
+    /// 編集 preview も save/delete worker の FIFO が空になるまで待ち、移行後に旧 key 行が
+    /// 復活しないようにする。タグ側は `is_busy()` ではなく
+    /// **`has_unconsumed_batch()`** を使う: is_busy は
     /// worker の DB 書込完了で false になるが、UI 側の結果消費 (`poll_tag_write_results` の
     /// sidecar ミラー書込) はさらに後のフレーム後半に走るため、is_busy だけだと移行開始後に
     /// 旧 path のサイドカーが書き直される (Sol rename-mig R2 P2)。
@@ -25405,7 +25530,14 @@ impl App {
             .rating_write_handle
             .as_ref()
             .is_some_and(|h| h.is_busy());
-        tag_busy || rating_busy || !self.book_bookmark_pending_requests.is_empty()
+        let edit_preview_busy = self
+            .edit_preview_cache
+            .as_ref()
+            .is_some_and(|cache| cache.has_pending_commands());
+        tag_busy
+            || rating_busy
+            || edit_preview_busy
+            || !self.book_bookmark_pending_requests.is_empty()
     }
 
     /// キュー先頭のリネーム移行 worker を起動する (直列 = in-flight が無いときだけ)。
@@ -25537,6 +25669,11 @@ impl App {
                     self.rating_cache.clear();
                     self.invalidate_rating_counts_cache();
                     self.clear_tags_cache();
+                    // rename 直後の folder reload が DB migration より先に完了すると、
+                    // 新 key で preview miss した raw thumbnail が Loaded のまま残る。
+                    // 移行対象の preview identity を持つセルだけ Evicted に戻し、移行済み
+                    // edit_previews 行を通常 worker 経路で読み直す。
+                    self.refresh_edit_preview_thumbnails_after_rename(&job.old_path, &job.new_path);
                     // idx キーのページ編集 state は「リネームに関係する文脈」だけ再構築する。
                     // 旧実装の全文脈 clear_page_edit_state は、無関係な画像の編集中ドラッグ値
                     // まで消し、離した瞬間に既存の保存済み補正を削除する実害があった
@@ -25674,6 +25811,28 @@ impl App {
         self.rating_cache.clear();
         self.current_folder_rating_cache = None;
         self.clear_tags_cache();
+    }
+
+    /// rename DB migration より先に raw thumbnail が着地した場合の対象限定 refresh。
+    ///
+    /// `thumb_edit_preview_keys` は直接ページだけでなく、編集 preview を継承する手動 pin
+    /// 親セルの canonical page key も保持する。exact / folder prefix / archive entry の
+    /// 3 面で旧・新どちらかに属するセルだけを再要求し、通常 catalog 行は触らない。
+    fn refresh_edit_preview_thumbnails_after_rename(
+        &mut self,
+        old_path: &std::path::Path,
+        new_path: &std::path::Path,
+    ) {
+        let matches_key =
+            removed_path_key_matcher(&[old_path.to_path_buf(), new_path.to_path_buf()]);
+        let affected = self
+            .thumb_edit_preview_keys
+            .iter()
+            .filter_map(|(&idx, key)| matches_key(key).then_some(idx))
+            .collect::<Vec<_>>();
+        for idx in affected {
+            self.evict_thumbnail_for_edit_preview_refresh(idx);
+        }
     }
 
     /// リネームに合わせて、編集済みバッジ用の presence set (起動時に全 DB キーを読み込む
@@ -30746,7 +30905,7 @@ impl App {
             || self.favsearch.active
             || self.global_search.active
             || self.tag_view.active)
-            && self.ime_input_active()
+            && self.ime_input_active(ctx)
         {
             return None;
         }
@@ -30799,7 +30958,7 @@ impl App {
             return None;
         }
 
-        if !self.ime_input_active() && self.consume_context_shortcuts_help_key(ctx) {
+        if !self.ime_input_active(ctx) && self.consume_context_shortcuts_help_key(ctx) {
             self.show_context_shortcuts_help = true;
             return None;
         }
@@ -31288,6 +31447,7 @@ impl App {
                         }
                         Some(GridItem::ConvertibleArchive { path, .. }) => {
                             let pf = path.clone();
+                            self.begin_smart_folder_drill(&pf);
                             self.maybe_suppress_rating_filter_for_opened_container(idx);
                             self.maybe_suppress_facet_filter_for_opened_container(idx);
                             let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
@@ -32310,9 +32470,11 @@ impl App {
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
                 self.maybe_suppress_facet_filter_for_opened_container(idx);
                 self.record_rating_view_nav_open(&p);
+                self.begin_smart_folder_drill(&p);
                 Some(crate::ui_main::AddressBarNav::Direct(p))
             }
             GridItem::ConvertibleArchive { path, .. } => {
+                self.begin_smart_folder_drill(&path);
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
                 self.maybe_suppress_facet_filter_for_opened_container(idx);
                 let search_rollback = if self.favsearch.active
@@ -33688,7 +33850,7 @@ impl App {
 
     /// トレイ復帰イベントで、保持中の通常 fullscreen media surface を再び前面化する。
     /// tray 専用の状態は持たず、現在 mount されている media owner だけを見る。
-    /// 再生 transport には触れないため、格納時に pause した intent と位置はそのまま残る。
+    /// 再生 transport には触れないため、running / paused / EOF の intent と位置はそのまま残る。
     pub(crate) fn restore_media_surface_after_tray(&mut self, ctx: &egui::Context) {
         if self.current_viewer_session_is_detached_or_switching()
             || !matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
@@ -35698,28 +35860,158 @@ impl App {
         }
     }
 
-    /// トレイ格納時に mount 外の active detached / ParkedLive media transport も止める。
-    /// bundle が所有する既存 VideoPlayer だけを対象にし、detached runtime は変更しない。
+    /// Tray hide/restore の presenter visibility を全 viewer context へ同じ ownership で配る。
+    /// Transport は変更せず、native output の typed visibility queue だけを遷移させる。
     #[cfg(windows)]
-    pub(crate) fn pause_detached_media_playback_for_tray(&self) -> usize {
+    pub(crate) fn sync_media_presenter_visibility_for_tray(&self, app_visible: bool) -> usize {
+        let mounted_music_consumer = self.fullscreen_idx.is_some_and(|idx| {
+            let standalone_audio_without_vst =
+                matches!(self.items.get(idx), Some(GridItem::Audio(_)))
+                    && !self
+                        .music_vst_shell
+                        .as_ref()
+                        .is_some_and(|shell| shell.fs_idx == idx);
+            let video_audio_mode_without_vst = self.video_audio_mode == Some(idx)
+                && !self
+                    .video_audio_vst
+                    .as_ref()
+                    .is_some_and(|state| state.fs_idx == idx);
+            standalone_audio_without_vst || video_audio_mode_without_vst
+        });
+        let mut routed = 0;
+        for (idx, entry) in &self.fs_cache {
+            let FsCacheEntry::Video { player, .. } = entry else {
+                continue;
+            };
+            let presenter_visible =
+                app_visible && self.fullscreen_idx == Some(*idx) && !mounted_music_consumer;
+            player.set_native_window_visible(presenter_visible);
+            routed += 1;
+        }
         let active = self
             .active_detached_viewer_context
             .as_ref()
-            .map(|active| pause_viewer_context_bundle_media_for_tray(&active.bundle))
+            .map(|active| {
+                sync_viewer_context_bundle_presenters_for_tray(&active.bundle, app_visible)
+            })
             .unwrap_or(0);
         let parked = self
             .detached_image_windows
             .iter()
             .filter_map(|window| window.paused_bundle.as_deref())
-            .map(pause_viewer_context_bundle_media_for_tray)
+            .map(|bundle| sync_viewer_context_bundle_presenters_for_tray(bundle, app_visible))
             .sum::<usize>();
-        active + parked
+        routed += active + parked;
+        if let Some(pending) = self.native_video_source_swap_pending.as_ref() {
+            pending
+                .native_output
+                .set_window_visible(app_visible && !pending.audio_mode_after_swap);
+            routed += 1;
+        }
+        routed
+    }
+
+    /// Project the existing media owners into the tray thread's hidden-window wake gate.
+    ///
+    /// `VideoPlayer::tick` and the continuous EOF navigation decision are UI-owned, while
+    /// Windows does not deliver the normal repaint WM_PAINT to a hidden root HWND. Keep the
+    /// bridge active only for a current player with live play intent, an unhandled continuous
+    /// EOF, an EOF candidate resolver, or the typed media handoff started by that EOF.
+    /// Paused/handled-terminal players, cached but non-current players, still images, and tray
+    /// residency by itself do not qualify.
+    #[cfg(windows)]
+    pub(crate) fn tray_resident_media_updates_needed(&self) -> bool {
+        if self.window_visible {
+            return false;
+        }
+
+        let mounted = self
+            .fullscreen_idx
+            .and_then(|idx| self.fs_cache.get(&idx).map(|entry| (idx, entry)))
+            .is_some_and(|(idx, entry)| {
+                matches!(entry, FsCacheEntry::Video { player, .. }
+                if player_needs_resident_media_updates(
+                    player,
+                    idx,
+                    self.video_continuous_mode,
+                    self.video_continuous_last_eof,
+                ))
+            });
+        let active_detached = self
+            .active_detached_viewer_context
+            .as_ref()
+            .is_some_and(|active| {
+                viewer_context_bundle_needs_resident_media_updates(
+                    &active.bundle,
+                    self.video_continuous_mode,
+                    self.video_continuous_last_eof,
+                )
+            });
+        let parked = self
+            .detached_image_windows
+            .iter()
+            .filter_map(|window| window.paused_bundle.as_deref())
+            .any(|bundle| {
+                viewer_context_bundle_needs_resident_media_updates(
+                    bundle,
+                    self.video_continuous_mode,
+                    self.video_continuous_last_eof,
+                )
+            });
+        let eof_resolution = self
+            .media_navigation_pending
+            .as_ref()
+            .is_some_and(|pending| Self::media_navigation_eof_key(&pending.action).is_some());
+        let eof_handoff = self.video_continuous_last_eof.is_some()
+            && (self.native_video_open_pending.is_some()
+                || self.native_video_source_swap_pending.is_some()
+                || self.native_video_fast_swap_pending.is_some()
+                || self.video_tile_swap_pending.is_some());
+
+        mounted || active_detached || parked || eof_resolution || eof_handoff
+    }
+
+    /// Non-Windows builds have no tray residency and no hidden-root wake bridge, so nothing
+    /// can be owed an update. The platform difference lives here rather than at each caller:
+    /// `hide_to_tray` reads this outside any `cfg` block, and gating it there instead would
+    /// leave the next caller to rediscover the same break.
+    #[cfg(not(windows))]
+    pub(crate) fn tray_resident_media_updates_needed(&self) -> bool {
+        false
     }
 
     /// リモートが操作権を取得した瞬間に、ローカル側で時間とともに進む状態を停止する。
-    /// 既存の media/slideshow pause 入口を使い、viewer context や表示位置は破棄しない。
+    /// tray の transport-preserving lifecycle とは分離し、mounted / active detached /
+    /// ParkedLive の current player だけを位置と viewer context を保ったまま pause する。
     pub(crate) fn pause_local_progress_for_remote_session(&mut self) -> (bool, bool, usize, bool) {
-        let media_paused = self.pause_media_playback_for_tray();
+        let mut media_paused_count = usize::from(pause_current_media_player_for_remote_session(
+            self.fullscreen_idx,
+            &self.fs_cache,
+        ));
+        #[cfg(windows)]
+        {
+            media_paused_count += self
+                .active_detached_viewer_context
+                .as_ref()
+                .map(|active| {
+                    usize::from(pause_viewer_context_bundle_media_for_remote_session(
+                        &active.bundle,
+                    ))
+                })
+                .unwrap_or(0);
+            media_paused_count += self
+                .detached_image_windows
+                .iter()
+                .filter_map(|window| window.paused_bundle.as_deref())
+                .map(|bundle| {
+                    usize::from(pause_viewer_context_bundle_media_for_remote_session(bundle))
+                })
+                .sum::<usize>();
+        }
+        self.save_all_video_resume_positions();
+        #[cfg(windows)]
+        self.save_detached_video_resume_positions_for_exit();
+        let media_paused = media_paused_count > 0;
         let slideshow_paused = self.stop_slideshow_playback();
         let mut animations_paused = self
             .fs_cache
@@ -40327,10 +40619,9 @@ impl App {
             Some(GridItem::Image(_))
             | Some(GridItem::ZipImage { .. })
             | Some(GridItem::PdfPage { .. }) => {
-                if self.fs_cache.contains_key(&idx) {
+                let load_state = self.ensure_fs_page_load(idx);
+                if load_state.is_display_ready() {
                     crate::logger::log(format!("  cache hit idx={idx} → instant display"));
-                } else if !self.fs_pending.contains_key(&idx) {
-                    self.start_fs_load(idx);
                 }
                 if self.reading_flow.is_paged() {
                     self.update_prefetch_window(idx);
@@ -43459,6 +43750,15 @@ impl App {
         v
     }
 
+    /// 親復帰で解決済みの item を選択し、通常の ensure-visible 経路へ渡す。
+    /// 名前ヒントと smart-folder の exact root-entry 解決が同じ適用規則を共有する。
+    fn select_item_after_load(&mut self, idx: usize) {
+        debug_assert!(idx < self.items.len());
+        self.selected = Some(idx);
+        self.scroll_to_selected = true;
+        self.redirect_selected_to_visible();
+    }
+
     /// `select_after_load` のヒントで items 内をケース無視で検索し、見つかれば
     /// selected を更新して true を返す。フィルタで隠れていれば直近の可視 idx に逃がす
     /// (`redirect_selected_to_visible` と同じ WYSIWYG 不変条件)。
@@ -43474,9 +43774,7 @@ impl App {
         else {
             return false;
         };
-        self.selected = Some(idx);
-        self.scroll_to_selected = true;
-        self.redirect_selected_to_visible();
+        self.select_item_after_load(idx);
         true
     }
 
@@ -46407,6 +46705,7 @@ impl App {
                             rect,
                             placement,
                             activate_on_show,
+                            self.window_visible,
                             vp.file_name()
                                 .and_then(|name| name.to_str())
                                 .unwrap_or("video")
@@ -47427,12 +47726,13 @@ impl App {
         self.fs_margin_bbox_cache
             .retain(|k, _| keep_set.contains(k));
 
-        // 現在表示中の画像がまだデコード中 (fs_cache に入っていない) なら、
+        // 現在表示中の画像がまだ表示可能な状態へ到達していないなら、
         // その画像に CPU を独占させるため他の pending をすべてキャンセルする。
         // 現在画像が完了したあと poll_prefetch から再度 update_prefetch_window が
         // 呼ばれ、そこで先読みが開始される。これにより 1→2 遷移 (サムネ → フル解像度) が
-        // 先読みスレッドに待たされなくなる。
-        let current_loading = !self.fs_cache.contains_key(&current_idx);
+        // 先読みスレッドに待たされなくなる。retained PDF final-AI は raw fs_cache が無くても
+        // 表示可能なので、typed state では loading に分類しない。
+        let current_loading = self.fs_page_load_state(current_idx).waiting_for_display();
 
         let to_cancel: Vec<usize> = self
             .fs_pending
@@ -47460,12 +47760,9 @@ impl App {
 
         // まだキャッシュにも pending にもない先読み対象を読み込み開始
         for idx in prefetch_targets {
-            if !self.fs_cache.contains_key(&idx)
-                && !self.fs_pending.contains_key(&idx)
-                && !self.fs_upload_backlog_contains(idx)
-            {
+            if self.fs_page_load_state(idx).needs_load_request() {
                 crate::logger::log(format!("  prefetch start idx={idx}"));
-                self.start_fs_load(idx);
+                self.ensure_fs_page_load(idx);
             }
         }
     }
@@ -47981,7 +48278,7 @@ impl App {
         //   中の黒画面抑止や連続入力抑止が効かなくなるため、`poll_fs_nav_lock` 側で
         //   新ページの tex 準備、またはフルスクリーンが本当に閉じたことを確認してから
         //   解除する。実ページ描画で旧 holdover を使うかどうかは
-        //   `fs_nav_holdover_tex_for_draw` が別途判定する。
+        //   `fs_nav_holdover_for_draw` が別途判定する。
         // PDF pool の Critical 予約は v1.0.0 から常時 ON 方針なので、ここで切替えない。
         // フルスクリーン中の Undo スタックはここで破棄。グリッドに戻ったら新しい操作を積む。
         self.clear_meta_undo();
@@ -51408,6 +51705,7 @@ impl App {
                     ColorizeDisplayUnitHoldover {
                         target_idx: fs_idx,
                         previous,
+                        started_at: std::time::Instant::now(),
                     },
                 ));
             }
@@ -52542,6 +52840,41 @@ impl App {
         self.fs_upload_backlog.iter().any(|(key, _, _)| *key == idx)
     }
 
+    /// フルスクリーン表示側が参照するページロード状態の正本。
+    ///
+    /// retained PDF final-AI は raw `fs_cache` が無くても同期的に表示 texture へ
+    /// 復元できるため、live cache より先に `DisplayReady` として解決する。
+    pub(crate) fn fs_page_load_state(&self, idx: usize) -> FsPageLoadState {
+        if self.has_retained_pdf_final_ai_for_current_params(idx) {
+            return FsPageLoadState::DisplayReady(FsPageDisplaySource::RetainedPdfFinalAi);
+        }
+        match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Failed) => return FsPageLoadState::LoadFailed,
+            Some(_) => {
+                return FsPageLoadState::DisplayReady(FsPageDisplaySource::LiveCache);
+            }
+            None => {}
+        }
+        if self.fs_upload_backlog_contains(idx) {
+            FsPageLoadState::UploadPending
+        } else if self.fs_pending.contains_key(&idx) {
+            FsPageLoadState::LoadPending
+        } else {
+            FsPageLoadState::NeedsLoad
+        }
+    }
+
+    /// 同じ typed state を入口ガードにも使い、必要なときだけ producer を起動する。
+    pub(crate) fn ensure_fs_page_load(&mut self, idx: usize) -> FsPageLoadState {
+        let state = self.fs_page_load_state(idx);
+        if state.needs_load_request() {
+            self.start_fs_load(idx);
+            self.fs_page_load_state(idx)
+        } else {
+            state
+        }
+    }
+
     #[cfg(test)]
     fn insert_retained_final_ai(
         &mut self,
@@ -53657,7 +53990,11 @@ impl App {
         // 計時は perf-log 有効時のみ (cache hit 経路は毎フレーム走るので clock 読みを足さない)。
         let perf_on = crate::perf::is_enabled();
         let fc_build_start = perf_on.then(std::time::Instant::now);
-        if let Some(texture) = self.restore_retained_pdf_final_ai_composite(ctx, idx) {
+        if matches!(
+            self.fs_page_load_state(idx),
+            FsPageLoadState::DisplayReady(FsPageDisplaySource::RetainedPdfFinalAi)
+        ) && let Some(texture) = self.restore_retained_pdf_final_ai_composite(ctx, idx)
+        {
             return Some(texture);
         }
         let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
@@ -53686,7 +54023,13 @@ impl App {
         // に流す。
         let ai_failed = ai_key.is_some_and(|key| self.final_ai_failed.contains(&key));
         if let Some(entry) = self.final_composite_cache.get(&final_key) {
-            if entry.complete || (ai_ready.is_none() && !ai_failed) {
+            let same_key_final_effect_pending = self.final_effect_pending.contains_key(&final_key);
+            if should_return_cached_final_composite(
+                entry.complete,
+                ai_ready.is_some(),
+                ai_failed,
+                same_key_final_effect_pending,
+            ) {
                 return Some(entry.texture.clone());
             }
         }
@@ -59411,13 +59754,17 @@ impl App {
         self.set_video_continuous_mode_common(ctx, fs_idx, mode);
     }
 
+    /// 入口は native overlay の `ToggleContinuous` とゲームパッドで、どちらも自分の入力を
+    /// 所有する。App viewport の `ime_input_active()` はここでは見ない
+    /// (`native_video.rs` の dispatch 先頭コメントと同じ理由: 別 viewport の composition が
+    /// 張り付くと、この窓の明示操作まで無関係に捨てられる)。target 検証だけを行う。
     pub(crate) fn set_video_continuous_mode_common(
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
         mode: crate::video::VideoContinuousMode,
     ) {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         self.video_continuous_mode = mode;
@@ -59803,9 +60150,13 @@ impl App {
     /// 音楽ビューのループモード切替 (L キー / HUD ループボタン)。共有 `video_loop_mode` を
     /// Off → Full → Bookmark → Off で循環 (音声はチャプター無しなので Chapter を自動スキップ)。
     /// 連続再生中は映像同様 no-op + トースト。
+    /// 入口は L キー / HUD ボタン / ゲームパッド。キー経路は呼び出し側
+    /// (`ui_fullscreen.rs` の `VideoLoop` consume) が `ime_input_active()` と
+    /// `wants_keyboard_input()` を見てから来るので、ここでは target 検証だけを行う
+    /// (二重チェックにすると HUD クリックとパッドが別 viewport の composition で死ぬ)。
     pub(crate) fn cycle_music_loop_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
         let _ = ctx;
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         if self.video_continuous_mode.is_enabled() {
@@ -59829,6 +60180,7 @@ impl App {
     }
 
     /// 映像 `set_video_continuous_mode_common` の音声版 (native overlay トースト無し)。
+    /// 入口は HUD の連続再生ボタンで、入力所有はその窓にある。target 検証だけを行う。
     pub(crate) fn set_music_continuous_mode(
         &mut self,
         ctx: &egui::Context,
@@ -59836,7 +60188,7 @@ impl App {
         mode: crate::video::VideoContinuousMode,
     ) {
         let _ = ctx;
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         self.video_continuous_mode = mode;
@@ -60605,10 +60957,16 @@ impl eframe::App for App {
             // 設定変更反映 + メニューイベントをポーリング + 閉じるボタンの乗っ取り。
             self.sync_tray_with_settings(ctx);
             self.poll_tray_events(ctx);
-            if self.maybe_intercept_close(ctx) {
-                return;
-            }
+            // A tray-intercepted CloseRequested must finish this frame. Immediate/deferred
+            // viewports are registered below; returning here omits them from egui's frame and
+            // destroys their host HWNDs (and any WS_CHILD native presenter). hide_to_tray has
+            // already made each retained viewport explicit Hidden, so normal registration is safe.
+            let _tray_hide_started = self.maybe_intercept_close(ctx);
         }
+        // request_repaint cannot wake a hidden Win32 root window. Publish the current media
+        // ownership projection near the top of every pass so the tray thread can continue (or
+        // stop) its 50ms WM_PAINT bridge even when later update paths return early.
+        self.sync_tray_resident_media_wake();
 
         // フォーカス復帰検出 (Alt+Tab で他アプリから mIV に戻った等) で、
         // 外部 (ComfyUI 等) による current_folder のファイル追加を自動反映する。
@@ -64589,6 +64947,7 @@ fn native_video_presenter_config(
     rect: windows::Win32::Foundation::RECT,
     placement: crate::video::NativeVideoPlacement,
     activate_on_show: bool,
+    initially_visible: bool,
     fallback_file_name: String,
     perf_overlay_visible: bool,
     initial_tile_overlay: bool,
@@ -64639,6 +64998,11 @@ fn native_video_presenter_config(
         hud_overlay_enabled: placement.is_fullscreen_borderless(),
         placement,
         activate_on_show,
+        initial_visibility: if initially_visible {
+            crate::video::NativeVideoInitialVisibility::Visible
+        } else {
+            crate::video::NativeVideoInitialVisibility::Hidden
+        },
         in_main_window,
         audio_only,
     })

@@ -74,10 +74,10 @@ PDF / ZIP / 画像フォルダを別ウィンドウで開いてもメイン本�
 - メイン一覧のカーソル同期だけでは、最小化中の別ウィンドウを勝手に復元したり、他アプリの手前へ出したりしない。
 - 最小化・最大化・サイズ変更・移動・`×` は通常の Windows 操作として使えるようにする。
 - メインウィンドウの最小化とは連動しない。動画だけ残して再生する用途を許容する。
-- アプリ終了時は別ウィンドウも終了する。ただし「閉じるとタスクトレイへ入る」設定で実際にはアプリ終了しない場合は、別ウィンドウの session と再生位置を保持し、再生 transport は格納前に pause する。復帰後は自動再生せず、Play で同じ位置から再開する。
+- アプリ終了時は別ウィンドウも終了する。ただし「閉じるとタスクトレイへ入る」設定で実際にはアプリ終了しない場合は、別ウィンドウの session / viewport host / native presenter と再生位置を保持する。格納中は host/presenter だけ hidden にし、running / paused / EOF transport state は変えない。復帰時はメイン窓と別ウィンドウを同じ identity のまま再表示する。
 - 位置・サイズは保存する。復元時は現在のモニター構成に対して画面外へ出ないよう補正する。
 
-注意: close-to-tray の既存経路は `pause_media_playback_for_tray()` / `release_media_session_for_tray()` / `release_gpu_resources()` / UI heartbeat suspend が load-bearing である。通常の最小化と close-to-tray は別扱いにし、通常最小化では detached window の既存動作を変えない。close-to-tray では mounted / active detached / ParkedLive の media transport を同じ経路で pause する。detached session は既存 owner と event pump を維持し、再生中だった mounted session も pause 済み `VideoPlayer` を保持する。格納前から非再生だった通常 session の close は従来どおり。
+注意: close-to-tray の既存経路は `prepare_media_session_for_tray_residency()` / `release_media_session_for_tray()` / `release_gpu_resources()` / UI heartbeat suspend が load-bearing である。通常の最小化と close-to-tray は別扱いにし、通常最小化では detached window の既存動作を変えない。close-to-tray を横取りした update frame は早期 return せず、mounted / active detached / ParkedLive の viewport を登録して明示 hidden にする。native output は既存 typed visibility queue で hidden/visible を遷移し、transport は変更しない。detached session、host、event pump、player は既存 owner に保持する。
 
 ## 3. 状態モデル
 
@@ -588,7 +588,7 @@ enum NativeVideoPlacement {
 - 静止画 detached viewport の `ViewportBuilder` が placement を再 seed する場合は、保存済み settings
   ではなく window_id の runtime placement を優先する。F12 の旧来単一窓経路でも、ページ遷移や表示先
   切り替えで egui の既定 800x600 相当が一瞬通知された場合は runtime placement を潰さない。
-- close-to-tray 中に detached session が開いている場合は、`release_media_session_for_tray` で `close_fullscreen()` を呼ばず、UI heartbeat と active viewer cache を維持する。通常 fullscreen / 通常動画は従来通り tray hide 時に閉じる。
+- close-to-tray 中は media / pending / detached session で `close_fullscreen()` を呼ばず、active viewer cache と viewport/native host を hidden のまま維持する。通常 fullscreen / in-window 動画も同じ native visibility lifecycle で保持し、plain still fullscreen だけは従来どおり閉じる。
 - 静止画/PDF detached と fullscreen の egui viewport を閉じる/作り直す経路では、メイン viewport の font atlas resync を one-shot 予約する。複数 viewport 後に日本語 glyph の部分更新だけが古い高さ 32 の renderer texture へ届くと wgpu validation panic になるため、メイン UI 描画前に 1 フレーム送って `configure_fonts_for_texture_resync` で font atlas full upload を強制する。
 
 ### Phase 3: 動画 detached

@@ -1581,30 +1581,57 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
 - **VideoPlayer.shutdown() の用途**: 動画切替時に Drop より早く audio を切るため (= 残音を防ぐ)
 - **GpuVideoDevice の Drop**: D3D11 リソース全解放、fence の NT shared handle を `CloseHandle`
 - **GpuVideoDevice::release_idle_pools()**: タスクトレイ格納時の residency 削減用。process-wide
-  D3D11 device 自体は残しつつ、`hw_frames_pool`、`in_use=false` の `shared_output_pool` slot、
-  `processor_cache` を解放する。次回動画再生時は通常の acquire 経路で lazy に再作成される。
-  VST3 bridge / plugin chain は停止しない。
-- **タスクトレイ格納時の media pause**: `hide_to_tray()` は Win32 `SW_HIDE` より前に、mounted
-  context、active detached context、全 ParkedLive bundle が所有する既存 `FsCacheEntry::Video` を走査する。
-  再生 intent がある `VideoPlayer` へ `set_playing(false)` を送り、engine transport、音声出力、clock を
-  一緒に pause する。動画、動画→音声モード、単体音楽ファイルは同じ owner / pause 経路を通る。
-  live player の clock / 最終表示 PTS を保持したまま `video_resume_positions` にも保存するため、復帰後の
-  Play は同じ位置から始まる。tray 専用 bool は持たず、自動再生もしない。
-- **tray residency 中の session / cache ownership**: mounted context で再生中だった session は pause 済みの
-  `VideoPlayer` / native output として保持し、それ以外の画像 texture cache は解放する。格納前から再生して
-  いなかった通常 fullscreen / in-window session の close は従来どおり。detached / switching context は
-  既存 lifecycle predicate どおり active / ParkedLive owner に残すが、再生継続ではなく pause 済みである。
-  process-wide D3D11 device と VST3 bridge / plugin chain は残し、idle GPU pool は
-  `GpuVideoDevice::release_idle_pools()` で解放する。
-- **トレイ復帰フレームの close 経路**: `sync_after_restore(ctx)` は Play を送らない。mounted fullscreen media
-  が残っている場合は既存の focus grace / `restore_fullscreen_focus_from_main()` で surface の focus / raise
-  だけを再要求し、同じフレームの main-focus guard が `close_fullscreen()` を実行する競合を避ける。
+  D3D11 device 自体は残しつつ、cache 所有の `hw_frames_pool` ref、`in_use=false` の
+  `shared_output_pool` slot、`processor_cache` を解放する。稼働中 decoder / presenter が持つ lease と
+  frame は解放せず、必要な cache は通常の acquire 経路で lazy に再作成される。VST3 bridge /
+  plugin chain は停止しない。
+- **タスクトレイ格納時の hidden lifecycle**: `hide_to_tray()` は transport を変更しない。mounted
+  context、active detached context、全 ParkedLive bundle と source-swap pending が所有する native output へ
+  `SetWindowVisible(false)` を FIFO で送り、既存 `WindowHostState::Hidden` へ遷移させる。動画→音声モードと
+  tray residency は同じ typed visibility owner を使う。動画は pacing queue / decoder channel を drain し続け、
+  最新 frame 1 枚を hold する。単体音楽には presenter が無いので transport だけがそのまま走る。格納前から
+  pause / EOF ならその状態も変更しない。resume 位置は hide 時点にも保存するが、再生制御には使わない。
+- **tray residency 中の App cadence / EOF advance**: Win32 `SW_HIDE` 後は通常の eframe repaint が
+  hidden HWND へ `WM_PAINT` を配送できないため、追加の入力がなければ `App::update` は 0 Hz になる。
+  decoder / audio / native render thread は継続し、demux EOF も clock までは届くが、audio drain 後の
+  `EngineState::Eof` 確定 (`VideoPlayer::tick`) と次 item 選択 (`poll_video`) は UI owner に残る。そこで既存
+  `mimv-tray` thread の 50ms pump は、mounted / active detached / ParkedLive の current player が error / EOF
+  でなく play intent を持つ間、未処理の continuous EOF、またはその candidate resolver / typed source
+  handoff 中だけ hidden main HWND へ `WM_PAINT` を post し、winit の `RedrawRequested` を最大 20 Hz で起こす。
+  paused player、処理済み terminal EOF、still、current でない cache、tray residency 自体は gate を立てない。
+  可視性は毎回 `IsWindowVisible` でも確認するため、restore race 用の App flag / delay / retry はない。音声
+  ファイルと動画→音声モードも同じ `FsCacheEntry::Video` transport owner / continuous EOF action を通るため、
+  別 wake 経路を持たない。
+- **tray residency 中の host / session ownership**: `maybe_intercept_close()` が close を tray hide に変換した
+  フレームも `App::update` を最後まで進め、active fullscreen/F12 と passive/ParkedLive の immediate/deferred
+  viewport を同じ ID で登録する。各 viewport には `Visible(false)` を明示し、tray 中の internal recreate も
+  hidden で開始する。従来の early return はこの登録を省略して egui host HWND を teardown し、その WS_CHILD
+  presenter も `WM_DESTROY` にしていた。`native window visibility cancelled` はその terminal teardown が output
+  cancel を立てた後、visibility ack 待ちが返す結果であり、資源節約ポリシーの producer ではない。
+  media/pending/detached session は play intent に関係なく同じ owner に残し、plain still fullscreen だけは閉じる。
+- **tray residency の資源コスト**: decoder、audio clock、native window pump/render thread、presenter HWND、
+  DComp/swap chain、in-use D3D11VA/shared texture と最新 frame 1 枚を保持し、decode は full rate で継続する。
+  したがって不可視中も動画 decode の CPU/GPU/電力コストを負う。代わりに EOF と audio clock を通常経路で
+  進め、復帰時の seek/reopen を不要にする。mounted context の非 media texture と未使用 pool/cache は解放するが、
+  detached session は既存 keepalive policy どおり active viewer cache も保持する。decode 停止・低レート化は audio clock
+  追従と EOF semantics を別 state にするため本変更には含めず、必要なら §1.9 の resource policy として扱う。
+- **このコストは承知のうえで受け入れる (ユーザー裁定 2026-07-31)**。動画 decode が負担になる PC は
+  想定ターゲットではない。**処理の流れを変えず、画面に出さないだけ**にするのが方針で、理由は資源より
+  安定性にある。decode を止めれば復帰時に reopen/seek が要り、途切れない再生という目的そのものを失う。
+  presenter / swap chain を解放して復帰時に作り直す案も、**viewport の再生成は BA-5 (early return や
+  discard pass で egui が保持中の窓を破棄する系統) の火元**であり、2026-07-31 時点で 5 回実害を出している。
+  したがって「不可視中も生かしたままにする」ことが、この領域では最も安全な選択になる。
+  後から資源最適化を検討する場合は、この判断を覆す根拠 (実測された実害) を先に示すこと。
+- **トレイ復帰フレームの close 経路**: `sync_after_restore(ctx)` は retained viewport へ `Visible(true)`、
+  visual media presenter へ `SetWindowVisible(true)` を送り、hidden 中に hold した最新 frame を一度 present してから
+  既存の focus grace / `restore_fullscreen_focus_from_main()` で surface の focus / raise だけを再要求する。Play / seek /
+  recreate は送らないため、running / paused / EOF の transport state はそのままである。
   復帰時の `check_external_folder_changes()` が items を再構築する場合は、
   `start_loading_items()` の main-context change 境界が既存の
   `viewer_session_is_detached_or_switching()` から detached media context への promotion を決定する。
   main-focus consumer も `current_viewer_session_is_detached_or_switching()` を使うため、host 待ち / placement
-  switch 中の paused session と typed request を閉じない。これらは前 2 件の lifecycle 述語統一を保つための
-  context ownership であり、トレイ中の再生維持を意味しない。`poll_video()` の close は明示 close event または
+  switch 中の session と typed request を閉じない。これらは前 2 件の lifecycle 述語統一をそのまま維持する。
+  `poll_video()` の close は明示 close event または
   native output の genuine terminal close に限り、tray restore 自体は terminal producer にならない。
   `cleanup_visible_false` の `host=hwnd=0` は、ログ出力前に runtime を除去した後の値であり、host-loss 判定には
   使用しない。

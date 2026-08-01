@@ -46,11 +46,43 @@ use crate::ui_helpers::{HoverTipExt, open_external_player};
 
 const COMPARE_INDICATOR_MAX_WIDTH: u32 = 72;
 const COMPARE_INDICATOR_MAX_HEIGHT: u32 = 54;
+// Tuned on real hardware to avoid a brief status flash on normal page turns.
+const COLORIZE_WAIT_INDICATOR_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 
 enum FsNavHoldoverDecision {
     Unavailable,
     TargetReady,
-    Draw(egui::TextureHandle),
+    Draw(FsDisplayUnitHoldover),
+}
+
+fn colorize_wait_indicator_visible(holdover: Option<&FsHoldover>, now: std::time::Instant) -> bool {
+    holdover
+        .and_then(FsHoldover::colorize_wait_started_at)
+        .is_some_and(|started_at| {
+            now.saturating_duration_since(started_at) >= COLORIZE_WAIT_INDICATOR_DELAY
+        })
+}
+
+fn paint_centered_dark_status_overlay(ui: &egui::Ui, full_rect: egui::Rect, text: &str) {
+    let font = egui::FontId::proportional(20.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE);
+    let padding = egui::vec2(28.0, 18.0);
+    let box_size = galley.size() + padding * 2.0;
+    let rect = egui::Rect::from_center_size(full_rect.center(), box_size);
+    ui.painter().rect_filled(
+        rect,
+        10.0,
+        egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230),
+    );
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        font,
+        egui::Color32::WHITE,
+    );
 }
 
 fn compare_indicator_size(width: u32, height: u32) -> Option<(u32, u32)> {
@@ -573,6 +605,20 @@ fn adjustment_panel_hover_active_at(
     pointer_pos.is_some_and(|pos| {
         activation_rect.contains(pos) || (was_active && sustain_rect.contains(pos))
     })
+}
+
+fn adjustment_panel_should_auto_close(
+    mode: crate::settings::FsSidePanelMode,
+    panel_open: bool,
+    dragging: bool,
+    hover_active: bool,
+    bookmark_title_focused: bool,
+) -> bool {
+    mode.normalized() == crate::settings::FsSidePanelMode::Hover
+        && panel_open
+        && !dragging
+        && !hover_active
+        && !bookmark_title_focused
 }
 
 fn should_handle_fullscreen_wheel(
@@ -1544,27 +1590,6 @@ fn fit_display_size_in_rect(rect: egui::Rect, display_size: egui::Vec2) -> egui:
     egui::Rect::from_center_size(rect.center(), display_size * fit_scale)
 }
 
-fn fs_nav_holdover_overlay_rect(rect: egui::Rect, texture_size: egui::Vec2) -> Option<egui::Rect> {
-    (rect.width() > 0.0 && rect.height() > 0.0 && texture_size.x > 0.0 && texture_size.y > 0.0)
-        .then(|| fit_display_size_in_rect(rect, texture_size))
-}
-
-fn paint_fs_nav_holdover_overlay(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    texture: &egui::TextureHandle,
-) {
-    let Some(image_rect) = fs_nav_holdover_overlay_rect(rect, texture.size_vec2()) else {
-        return;
-    };
-    painter.with_clip_rect(rect).image(
-        texture.id(),
-        image_rect,
-        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-        egui::Color32::WHITE,
-    );
-}
-
 fn normalized_sub_rect(rect: egui::Rect, uv: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_max(
         egui::pos2(
@@ -2045,7 +2070,7 @@ impl App {
     /// 優先順: Animated 現フレーム → final composite cache → edit cache → fs_cache (Static)
     /// → サムネ (`include_thumb=true` のときのみ)。
     ///
-    /// `prepare_fullscreen_state` の高解像度 tex 解決と `current_fs_tex_for_holdover`
+    /// `prepare_fullscreen_state` の高解像度 tex 解決と `capture_fs_display_unit`
     /// が同じチェーンを 2 回書いていた重複を集約する。ここでは既存 cache の lookup
     /// だけを行い、MI-GAN や隠蔽合成の新規生成は走らせない。生成を伴う通常描画は
     /// `resolve_fs_processed_texture` を使う。
@@ -2270,16 +2295,71 @@ impl App {
     }
 
     pub(crate) fn capture_fs_display_unit(&mut self, idx: usize) -> Option<FsDisplayUnitHoldover> {
-        let page_indices = self.fs_display_unit_page_indices(idx);
-        let mut pages = Vec::with_capacity(page_indices.len());
-        for page_idx in page_indices {
-            let texture = self.resolve_fs_display_tex(page_idx, true)?;
-            pages.push(FsDisplayUnitHoldoverPage {
-                idx: page_idx,
-                texture,
-            });
+        match self.resolve_spread_pair(idx) {
+            SpreadPair::Single => {
+                let rotation = self.get_rotation(idx);
+                let content_bbox = if rotation.is_none() {
+                    self.view_trim_single_content_bbox(idx)
+                } else {
+                    None
+                };
+                let page = self.capture_fs_display_unit_page(idx, rotation, content_bbox)?;
+                Some(FsDisplayUnitHoldover { pages: vec![page] })
+            }
+            SpreadPair::Double { left, right } => {
+                let left_rotation = self.get_rotation(left);
+                let right_rotation = self.get_rotation(right);
+                let (left_content_bbox, right_content_bbox) =
+                    if left_rotation.is_none() && right_rotation.is_none() {
+                        self.view_trim_spread_content_bboxes(left, right)
+                    } else {
+                        (
+                            if left_rotation.is_none() {
+                                self.view_trim_spread_content_bbox(
+                                    left,
+                                    crate::view_trim::ViewTrimSpreadSide::Left,
+                                )
+                            } else {
+                                None
+                            },
+                            if right_rotation.is_none() {
+                                self.view_trim_spread_content_bbox(
+                                    right,
+                                    crate::view_trim::ViewTrimSpreadSide::Right,
+                                )
+                            } else {
+                                None
+                            },
+                        )
+                    };
+                let left_page =
+                    self.capture_fs_display_unit_page(left, left_rotation, left_content_bbox)?;
+                let right_page =
+                    self.capture_fs_display_unit_page(right, right_rotation, right_content_bbox)?;
+                Some(FsDisplayUnitHoldover {
+                    pages: vec![left_page, right_page],
+                })
+            }
         }
-        Some(FsDisplayUnitHoldover { pages })
+    }
+
+    fn capture_fs_display_unit_page(
+        &self,
+        idx: usize,
+        rotation: crate::rotation_db::Rotation,
+        content_bbox: Option<egui::Rect>,
+    ) -> Option<FsDisplayUnitHoldoverPage> {
+        let texture = self.resolve_fs_display_tex(idx, true)?;
+        let source_size = self
+            .source_dims_for_idx(idx)
+            .map(|(width, height)| egui::vec2(width, height));
+        Some(FsDisplayUnitHoldoverPage {
+            idx,
+            texture,
+            rotation,
+            source_size,
+            content_bbox,
+        })
     }
 
     fn clear_colorize_display_unit_holdover(&mut self) {
@@ -2316,8 +2396,10 @@ impl App {
             return;
         }
 
-        let existing_previous = match self.fs_holdover_tex.as_ref() {
-            Some(FsHoldover::ColorizeDisplayUnit(holdover)) => Some(holdover.previous.clone()),
+        let existing_holdover = match self.fs_holdover_tex.as_ref() {
+            Some(FsHoldover::ColorizeDisplayUnit(holdover)) => {
+                Some((holdover.previous.clone(), holdover.started_at))
+            }
             _ => None,
         };
         let current_previous = match self.fullscreen_idx {
@@ -2326,11 +2408,18 @@ impl App {
             }
             _ => None,
         };
-        if let Some(previous) = current_previous.or(existing_previous) {
+        if let Some(previous) = current_previous.or_else(|| {
+            existing_holdover
+                .as_ref()
+                .map(|(previous, _)| previous.clone())
+        }) {
             self.fs_holdover_tex = Some(FsHoldover::ColorizeDisplayUnit(
                 ColorizeDisplayUnitHoldover {
                     target_idx,
                     previous,
+                    started_at: existing_holdover
+                        .map(|(_, started_at)| started_at)
+                        .unwrap_or_else(std::time::Instant::now),
                 },
             ));
         }
@@ -2607,12 +2696,6 @@ impl App {
         self.resolve_fs_pre_overlay_texture(idx)
     }
 
-    /// Ctrl+↑↓ ナビ発火直前に `fs_holdover_tex` を仕込むためのヘルパ。
-    /// `resolve_fs_display_tex` を `include_thumb=true` で呼んで「最良の表示物」を取る。
-    pub(crate) fn current_fs_tex_for_holdover(&self, fs_idx: usize) -> Option<egui::TextureHandle> {
-        self.resolve_fs_display_tex(fs_idx, true)
-    }
-
     /// `fs_nav_locked_gen.is_some()` の薄いラッパー。
     /// 入力ハンドラ・描画パスから「現在 nav ロック中か」を簡潔に問い合わせるため。
     pub(crate) fn fs_nav_is_locked(&self) -> bool {
@@ -2627,8 +2710,8 @@ impl App {
     /// 描画側で使ってよい Ctrl+↑↓ nav holdover を返す。
     ///
     /// `fs_holdover_tex` は旧ページの見た目を一時的に残すビュー単位の状態。
-    /// ページ枠の fallback には渡さず、描画側が `image_rect` 全体へ 1 枚だけ
-    /// contain オーバーレイする。
+    /// ページ枠の fallback には渡さず、描画側が `image_rect` 全体へ旧単ページ、または
+    /// 画面順の旧見開き 2 ページを 1 unit としてオーバーレイする。
     fn fs_nav_holdover_decision(&self) -> FsNavHoldoverDecision {
         let Some(locked_gen) = self.fs_nav_locked_gen else {
             return FsNavHoldoverDecision::Unavailable;
@@ -2645,7 +2728,7 @@ impl App {
             //
             // 新 idx の表示物が用意できた / デコード失敗が確定した時点で
             // ビュー単位の holdover overlay を止める。それまでは旧ビューを
-            // 1 枚だけ維持して黒を挟まず滑らかに繋ぐ。
+            // 1 display unit として維持して黒を挟まず滑らかに繋ぐ。
             let new_content_ready = self.resolve_fs_display_tex(idx, true).is_some();
             let new_content_failed = matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Failed));
             if new_content_ready || new_content_failed {
@@ -2654,16 +2737,16 @@ impl App {
         }
         self.fs_holdover_tex
             .as_ref()
-            .and_then(FsHoldover::folder_navigation_texture)
+            .and_then(FsHoldover::folder_navigation_display_unit)
             .cloned()
             .map(FsNavHoldoverDecision::Draw)
             .unwrap_or(FsNavHoldoverDecision::Unavailable)
     }
 
     /// 描画直前の呼び出しでは `TargetReady` を一方向ラッチへ変換する。
-    /// readiness probe は `fs_nav_holdover_tex_without_latching` を使い、実描画前に
-    /// handle を破棄しない。
-    pub(crate) fn fs_nav_holdover_tex_for_draw(&mut self) -> Option<egui::TextureHandle> {
+    /// readiness probe は `fs_nav_holdover_without_latching` を使い、実描画前に
+    /// unit が所有する handle を破棄しない。
+    pub(crate) fn fs_nav_holdover_for_draw(&mut self) -> Option<FsDisplayUnitHoldover> {
         match self.fs_nav_holdover_decision() {
             FsNavHoldoverDecision::TargetReady => {
                 // 一方向ラッチ: 新 generation の表示物を選べた描画フレームで旧フォルダの
@@ -2672,14 +2755,14 @@ impl App {
                 self.fs_holdover_tex = None;
                 None
             }
-            FsNavHoldoverDecision::Draw(texture) => Some(texture),
+            FsNavHoldoverDecision::Draw(unit) => Some(unit),
             FsNavHoldoverDecision::Unavailable => None,
         }
     }
 
-    fn fs_nav_holdover_tex_without_latching(&self) -> Option<egui::TextureHandle> {
+    fn fs_nav_holdover_without_latching(&self) -> Option<FsDisplayUnitHoldover> {
         match self.fs_nav_holdover_decision() {
-            FsNavHoldoverDecision::Draw(texture) => Some(texture),
+            FsNavHoldoverDecision::Draw(unit) => Some(unit),
             FsNavHoldoverDecision::Unavailable | FsNavHoldoverDecision::TargetReady => None,
         }
     }
@@ -2706,7 +2789,7 @@ impl App {
     /// 「items が入れ替わる前にロックを解除しない」判定に使う。
     pub(crate) fn capture_fs_nav_holdover(&mut self, fs_idx: usize) {
         self.fs_holdover_tex = self
-            .current_fs_tex_for_holdover(fs_idx)
+            .capture_fs_display_unit(fs_idx)
             .map(FsHoldover::FolderNavigation);
         self.fs_nav_locked_gen = Some(self.items_generation);
     }
@@ -6319,7 +6402,8 @@ impl App {
                 window_placement,
                 apply_initial_placement,
                 self.settings.ui_scale_factor,
-            );
+            )
+            .with_visible(self.window_visible);
             let view = crate::app::DeferredDetachedImageWindowView::from_snapshot(
                 window,
                 window_placement,
@@ -6432,7 +6516,8 @@ impl App {
                 window_placement,
                 apply_initial_placement,
                 self.settings.ui_scale_factor,
-            );
+            )
+            .with_visible(self.window_visible);
             let mut viewport_close_requested = false;
             let mut bar_close_requested = false;
             let mut placement_update = None;
@@ -6916,6 +7001,12 @@ impl App {
 
     fn seek_to_continuous_page(&mut self, ctx: &egui::Context, target_idx: usize) {
         if self.fullscreen_idx != Some(target_idx) {
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::seek_to_continuous_page:file_change",
+                );
+            }
             self.reset_fs_side_panel_runtime_for_file_change();
         }
         self.fullscreen_idx = Some(target_idx);
@@ -7244,7 +7335,7 @@ impl App {
         // Ctrl+↑↓ の deferred reopen、または active detached の PDF/ZIP 列挙・scan・password
         // 待ちでは fullscreen_idx が None のまま内部遷移の完了を待つ。この間ビューポートを
         // 隠すとその下のグリッドが見えてちらつくので維持しつつ、ナビロックの holdover
-        // (= 直前ページのテクスチャ) があればそれを表示して「黒画面で待たされる」
+        // (= 直前の単ページ / 見開き unit) があればそれを表示して「黒画面で待たされる」
         // 体感を緩和する。terminal intent は finalize と同じ唯一の述語
         // detached_active_window_alive_wanted() で判断し、main context では従来の
         // deferred reopen だけを対象にする。
@@ -7257,15 +7348,17 @@ impl App {
             #[cfg(not(windows))]
             let fs_builder = self.build_fullscreen_viewport_builder();
             let mut cancel = false;
-            // holdover を中央フィットで描画する用のテクスチャ参照をクロージャ前に外出し。
-            let holdover = self.fs_nav_holdover_tex_for_draw();
-            if let Some(handle) = holdover.as_ref() {
-                self.trace_fs_texture_choice(
-                    "deferred_keep_alive",
-                    "nav_holdover",
-                    self.fullscreen_idx,
-                    handle,
-                );
+            // holdover unit を旧レイアウトで描くため、クロージャ前に clone する。
+            let holdover = self.fs_nav_holdover_for_draw();
+            if let Some(unit) = holdover.as_ref() {
+                for page in &unit.pages {
+                    self.trace_fs_texture_choice(
+                        "deferred_keep_alive",
+                        "nav_holdover",
+                        Some(page.idx),
+                        &page.texture,
+                    );
+                }
             }
             #[cfg(windows)]
             let keep_alive_window_id = self.active_detached_hwnd_window_id();
@@ -7289,8 +7382,9 @@ impl App {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                     .show(ctx, |ui| {
-                        if let Some(handle) = holdover.as_ref() {
-                            paint_fs_nav_holdover_overlay(ui.painter(), ui.max_rect(), handle);
+                        if let Some(unit) = holdover.as_ref() {
+                            let image_rect = ui.max_rect();
+                            self.draw_fs_display_unit_holdover(ui, ctx, image_rect, unit);
                         }
                     });
             });
@@ -7434,56 +7528,66 @@ impl App {
         } else {
             None
         };
-        let builder = self.build_detached_viewer_viewport_builder(
-            title_idx,
-            None,
-            apply_placement,
-            builder_placement,
-            "keepalive_backstop",
-        );
+        let builder = self
+            .build_detached_viewer_viewport_builder(
+                title_idx,
+                None,
+                apply_placement,
+                builder_placement,
+                "keepalive_backstop",
+            )
+            .with_visible(self.window_visible);
         // 表示物: live があれば live、無ければ holdover (前フレーム)。ギャップ中は holdover。
         let live_tex = self
             .fullscreen_idx
             .and_then(|idx| self.resolve_fs_display_tex(idx, true));
         // live が選べたフレームでも draw gate を必ず評価し、旧 holdover の
         // 一方向ラッチを backstop 経路にも適用する。
-        let holdover = self.fs_nav_holdover_tex_for_draw();
-        let (tex, texture_source) = if let Some(live_tex) = live_tex {
-            let source = if crate::perf::is_enabled() {
+        let holdover = self.fs_nav_holdover_for_draw();
+        let texture_source = if let Some(live_tex) = live_tex.as_ref() {
+            if crate::perf::is_enabled() {
                 self.fullscreen_idx.map_or("processed_other", |idx| {
-                    self.fs_texture_source_for_trace(idx, &live_tex)
+                    self.fs_texture_source_for_trace(idx, live_tex)
                 })
             } else {
                 "live_display"
-            };
-            (Some(live_tex), source)
+            }
         } else {
-            (holdover, "nav_holdover")
+            "nav_holdover"
         };
         // 保険 (Codex #3): live ページも holdover も無い (fullscreen_idx=None && tex=None) なら、
         // 描くべき中身が無い = もはや生かす意味のない空ウィンドウ。session close 漏れなどで
         // ここに来ても、空の小窓を描き続けない (= 閉じられない症状の二重防止)。正規の
         // 列挙待ち gap では holdover が在るのでこの早期 return には入らない。
-        if self.fullscreen_idx.is_none() && tex.is_none() {
+        if self.fullscreen_idx.is_none() && live_tex.is_none() && holdover.is_none() {
             self.log_detached_image_window_debug(
                 "keepalive_backstop skip: no content (fs_idx=None, no holdover)".to_string(),
             );
             return;
         }
         self.log_detached_image_window_debug(format!(
-            "keepalive_backstop window_id={:?} fs_idx={:?} has_tex={} host={}",
+            "keepalive_backstop window_id={:?} fs_idx={:?} has_content={} host={}",
             self.active_detached_session.map(|s| s.window_id),
             self.fullscreen_idx,
-            tex.is_some(),
+            live_tex.is_some() || holdover.is_some(),
             self.detached_viewer_host_debug_state()
         ));
-        if let Some(handle) = tex.as_ref() {
+        if let Some(handle) = live_tex.as_ref() {
             self.trace_fs_texture_choice(
                 "detached_backstop",
                 texture_source,
                 self.fullscreen_idx,
                 handle,
             );
+        } else if let Some(unit) = holdover.as_ref() {
+            for page in &unit.pages {
+                self.trace_fs_texture_choice(
+                    "detached_backstop",
+                    texture_source,
+                    Some(page.idx),
+                    &page.texture,
+                );
+            }
         }
         let backstop_window_id = self.active_detached_session.map(|s| s.window_id);
         let hwnd_before = backstop_window_id.and_then(|window_id| {
@@ -7497,7 +7601,7 @@ impl App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                 .show(vp_ctx, |ui| {
-                    if let Some(handle) = tex.as_ref() {
+                    if let Some(handle) = live_tex.as_ref() {
                         let avail = ui.available_size();
                         let tex_size = handle.size_vec2();
                         if tex_size.x > 0.0 && tex_size.y > 0.0 && avail.x > 0.0 && avail.y > 0.0 {
@@ -7516,6 +7620,9 @@ impl App {
                                 egui::Color32::WHITE,
                             );
                         }
+                    } else if let Some(unit) = holdover.as_ref() {
+                        let image_rect = ui.max_rect();
+                        self.draw_fs_display_unit_holdover(ui, vp_ctx, image_rect, unit);
                     }
                 });
         });
@@ -7546,25 +7653,28 @@ impl App {
     /// (viewport モードの defer 分岐と同じ挙動)。
     #[cfg(windows)]
     fn render_embedded_fs_nav_holdover(&mut self, ctx: &egui::Context) {
-        let holdover = self.fs_nav_holdover_tex_for_draw();
-        if let Some(handle) = holdover.as_ref() {
-            self.trace_fs_texture_choice(
-                "embedded_deferred",
-                "nav_holdover",
-                self.fullscreen_idx,
-                handle,
-            );
+        let holdover = self.fs_nav_holdover_for_draw();
+        if let Some(unit) = holdover.as_ref() {
+            for page in &unit.pages {
+                self.trace_fs_texture_choice(
+                    "embedded_deferred",
+                    "nav_holdover",
+                    Some(page.idx),
+                    &page.texture,
+                );
+            }
         }
         let close_requested = ctx.input(|i| i.viewport().close_requested());
-        let escape_pressed = !self.ime_input_active()
+        let escape_pressed = !self.ime_input_active(ctx)
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let cancel = close_requested || escape_pressed;
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
-                if let Some(handle) = holdover.as_ref() {
-                    paint_fs_nav_holdover_overlay(ui.painter(), ui.max_rect(), handle);
+                if let Some(unit) = holdover.as_ref() {
+                    let image_rect = ui.max_rect();
+                    self.draw_fs_display_unit_holdover(ui, ctx, image_rect, unit);
                 }
             });
 
@@ -7612,20 +7722,23 @@ impl App {
     /// 背面のグリッドが見えないようにする。
     #[cfg(windows)]
     pub(crate) fn render_still_fullscreen_viewport_enter_holdover(&mut self, ctx: &egui::Context) {
-        let holdover = self.fs_nav_holdover_tex_without_latching();
-        if let Some(handle) = holdover.as_ref() {
-            self.trace_fs_texture_choice(
-                "viewport_enter",
-                "nav_holdover",
-                self.fullscreen_idx,
-                handle,
-            );
+        let holdover = self.fs_nav_holdover_without_latching();
+        if let Some(unit) = holdover.as_ref() {
+            for page in &unit.pages {
+                self.trace_fs_texture_choice(
+                    "viewport_enter",
+                    "nav_holdover",
+                    Some(page.idx),
+                    &page.texture,
+                );
+            }
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
-                if let Some(handle) = holdover.as_ref() {
-                    paint_fs_nav_holdover_overlay(ui.painter(), ui.max_rect(), handle);
+                if let Some(unit) = holdover.as_ref() {
+                    let image_rect = ui.max_rect();
+                    self.draw_fs_display_unit_holdover(ui, ctx, image_rect, unit);
                 }
             });
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -7689,9 +7802,7 @@ impl App {
         if let SpreadPair::Double { left, right } = spread_pair {
             let partner = if left == fs_idx { right } else { left };
             self.advance_animation(ctx, partner);
-            if !self.fs_cache.contains_key(&partner) && !self.fs_pending.contains_key(&partner) {
-                self.start_fs_load(partner);
-            }
+            self.ensure_fs_page_load(partner);
         }
         // in-window モード中は静止画を専用 viewport ではなくメインウィンドウの
         // egui ctx に直接描画する (embedded)。本関数冒頭で動画は early-return
@@ -7857,7 +7968,7 @@ impl App {
                 cache_state,
                 thumb_ready,
                 self.fs_pending.contains_key(&fs_idx),
-                self.fs_nav_holdover_tex_without_latching().is_some(),
+                self.fs_nav_holdover_without_latching().is_some(),
             )
         } else {
             (false, "not-detached", false, false, false)
@@ -7892,8 +8003,9 @@ impl App {
             // builder に寄せる (taskbar 属性を音声ファイルと揃える、Codex 7d 検証)。
             self.build_still_fullscreen_viewport_builder()
         };
-        if need_show && !embedded {
-            // 新規 viewport は hidden で作り、DWM transition 抑止属性を当ててから
+        if !embedded && (need_show || !self.window_visible) {
+            // 新規 viewport と tray residency 中の内部 recreate は hidden で作り、
+            // DWM transition 抑止属性を当ててから
             // Visible(true) にする。初期 white client、最大化アニメーション、detached
             // window の表示フェード露出を動画 backdrop と同じ手順で避ける。
             fs_builder = fs_builder.with_visible(false);
@@ -8051,7 +8163,7 @@ impl App {
                 // IME がアクティブ (変換中 or 直近 300ms に Ime イベント = Windows の別フレーム
                 // 配信吸収) の間は raw な Key::Enter を除去する。非変換時の Enter は通るので
                 // 意図的な改行は可能。テキスト注釈モードの本文編集中のみに限定する。
-                if self.text_mode && self.ime_input_active() {
+                if self.text_mode && self.ime_input_active(ctx) {
                     ctx.input_mut(|i| {
                         i.events.retain(|e| {
                             !matches!(
@@ -8091,7 +8203,7 @@ impl App {
                     }
                 }
                 #[cfg(windows)]
-                if detached_focus_existing {
+                if detached_focus_existing && self.window_visible {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -8211,20 +8323,12 @@ impl App {
                             .and_then(|idx| self.pdf_content_bbox_for_display_idx(idx));
 
                         if current_is_pdf {
-                            if !self.fs_cache.contains_key(&fs_idx)
-                                && !self.fs_pending.contains_key(&fs_idx)
-                            {
-                                self.start_fs_load(fs_idx);
-                            }
+                            self.ensure_fs_page_load(fs_idx);
                             self.ensure_pdf_display_resolution(fs_idx, pdf_current_bbox);
                         }
                         if let Some(partner) = pdf_partner {
                             if matches!(self.items.get(partner), Some(GridItem::PdfPage { .. })) {
-                                if !self.fs_cache.contains_key(&partner)
-                                    && !self.fs_pending.contains_key(&partner)
-                                {
-                                    self.start_fs_load(partner);
-                                }
+                                self.ensure_fs_page_load(partner);
                                 self.ensure_pdf_display_resolution(partner, pdf_partner_bbox);
                             }
                         }
@@ -8947,7 +9051,7 @@ impl App {
                                     &page.texture,
                                 );
                             }
-                            self.draw_colorize_display_unit_holdover(
+                            self.draw_fs_display_unit_holdover(
                                 ui,
                                 ctx,
                                 image_rect,
@@ -8957,14 +9061,21 @@ impl App {
 
                         // ページ単位の編集オーバーレイより後に描く。holdover はビュー単位の状態なので、
                         // 移動先ページの矩形を旧ビューの上に重ねない。
-                        if let Some(holdover) = self.fs_nav_holdover_tex_for_draw() {
-                            self.trace_fs_texture_choice(
-                                "fullscreen_overlay",
-                                "nav_holdover",
-                                Some(fs_idx),
-                                &holdover,
+                        if let Some(unit) = self.fs_nav_holdover_for_draw() {
+                            for page in &unit.pages {
+                                self.trace_fs_texture_choice(
+                                    "fullscreen_overlay",
+                                    "nav_holdover",
+                                    Some(page.idx),
+                                    &page.texture,
+                                );
+                            }
+                            self.draw_fs_display_unit_holdover(
+                                ui,
+                                ctx,
+                                image_rect,
+                                &unit,
                             );
-                            paint_fs_nav_holdover_overlay(ui.painter(), image_rect, &holdover);
                         }
 
                         // ── 透過背景インジケータ (Shift+B 変更直後のみフェード表示) ──
@@ -9365,6 +9476,12 @@ impl App {
                                 ctx.request_repaint();
                             }
                             if side_panel_mode_pressed {
+                                if self.adjustment_mode {
+                                    crate::ime_focus::record_side_panel_close(
+                                        ctx,
+                                        "ui_fullscreen::draw_fs_hover_bar:side_panel_mode_button",
+                                    );
+                                }
                                 self.cycle_fs_side_panel_mode();
                             }
                             if copy_capture_pressed {
@@ -9503,6 +9620,8 @@ impl App {
                             crate::app::ActionSurface::Viewer,
                         );
 
+                        self.draw_colorize_wait_overlay(ui, full_rect, ctx);
+
                         // ── スタンプ埋め込み worker の進行表示 (中央「読み込み中」) ──
                         self.draw_stamp_embed_overlay(ui, full_rect, ctx);
 
@@ -9565,7 +9684,7 @@ impl App {
                 fs_central_ms = central_t0.elapsed().as_secs_f64() * 1000.0;
 
                 #[cfg(windows)]
-                if need_show && !embedded {
+                if need_show && !embedded && self.window_visible {
                     // The viewport was created hidden above. Release visibility only after
                     // this frame has painted either real content (full/thumb/holdover) or the
                     // dark loading surface. This keeps DWM from ever presenting the unpainted
@@ -10014,7 +10133,8 @@ impl App {
             .image_metas
             .get(fs_idx)
             .and_then(|m| m.map(|(_, sz)| sz.max(0) as u64));
-        let is_loading = !is_video && !fs_load_failed && !self.fs_cache.contains_key(&fs_idx);
+        let is_loading =
+            !is_video && !fs_load_failed && self.fs_page_load_state(fs_idx).waiting_for_display();
         #[cfg(windows)]
         let vst3_waiting_for_video = is_video
             && self.vst3_deferred_media_open == Some(fs_idx)
@@ -10374,7 +10494,7 @@ impl App {
         let fs_id = self.fullscreen_viewport_id();
         let need_show = !self.fs_viewport_shown;
         let fs_builder = self.build_fullscreen_viewport_builder_with_transparency(false);
-        let fs_builder = if need_show {
+        let fs_builder = if need_show || !self.window_visible {
             // Create the fullscreen backdrop HWND hidden first. The DWM
             // transition flag can only be applied after the HWND exists, so a
             // visible initial create can animate before the attribute lands.
@@ -10388,7 +10508,7 @@ impl App {
             // Visible な fullscreen viewport なので、native 動画の黒 backdrop 中も
             // IME 状態だけは通常 viewport と同じ入口で更新する。
             self.update_ime_state(ctx);
-            if need_show {
+            if need_show && self.window_visible {
                 crate::dwm_transitions::disable_transitions_for_thread_windows();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -10410,7 +10530,7 @@ impl App {
             // この呼び出し前後でスキャン状態の変化 (= ESC で cancel された) を検出して
             // close 判定をスキップする。
             let normalize_active_before = self.normalize_state.is_some();
-            if !self.ime_input_active() {
+            if !self.ime_input_active(ctx) {
                 for key in native_video_key_events_from_ctx(ctx) {
                     self.handle_native_video_key_event(ctx, fs_idx, key);
                 }
@@ -10418,7 +10538,7 @@ impl App {
             let normalize_cancelled_this_frame =
                 normalize_active_before && self.normalize_state.is_none();
             let close_requested = ctx.input(|i| i.viewport().close_requested());
-            let escape_pressed = !self.ime_input_active()
+            let escape_pressed = !self.ime_input_active(ctx)
                 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
             if (close_requested || escape_pressed) && !normalize_cancelled_this_frame {
                 close_fs = true;
@@ -10926,7 +11046,7 @@ impl App {
         if self.any_modal_dialog_open_for_fullscreen_keys() {
             return true;
         }
-        if !self.ime_input_active()
+        if !self.ime_input_active(ctx)
             && !self.is_overlay_edit_mode_active()
             && !matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
             && self.consume_context_shortcuts_help_key(ctx)
@@ -11130,7 +11250,8 @@ impl App {
         // drain** する。フォーカス無し / モーダル表示中で早期 return すると pending が
         // 次フレームに持ち越されて誤発火するため (Codex P2)。ブロック中は count を捨てる。
         let (browser_back_count, browser_forward_count) = crate::take_pending_mouse_nav();
-        let _owner = self.keyboard_owner_for_pass(ctx);
+        let owner = self.keyboard_owner_for_pass(ctx);
+        let fullscreen_raw_key_permit = owner.fullscreen_raw_key_permit();
 
         let has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         let mut action = FsKeyAction {
@@ -11174,7 +11295,7 @@ impl App {
             return action;
         }
 
-        if !self.ime_input_active()
+        if !self.ime_input_active(ctx)
             && !self.is_overlay_edit_mode_active()
             && self
                 .keymap
@@ -11205,7 +11326,7 @@ impl App {
         }
 
         if self.local_adjust_mode {
-            if !self.ime_input_active()
+            if !self.ime_input_active(ctx)
                 && !ctx.wants_keyboard_input()
                 && self.consume_context_shortcuts_help_key(ctx)
             {
@@ -11452,13 +11573,13 @@ impl App {
         // フルスクリーンショートカット (閉じる/再生トグル) も塞いでモーダル操作へ集中させる。
         if fs_music_view_active
             && (ctx.wants_keyboard_input()
-                || self.ime_input_active()
+                || self.ime_input_active(ctx)
                 || self.music_bookmark_modal_open()
                 || self.music_normalize_modal_active(fs_idx))
         {
             return action;
         }
-        if !self.ime_input_active()
+        if !self.ime_input_active(ctx)
             && self.fs_context_menu_idx.is_none()
             && self.consume_context_shortcuts_help_key(ctx)
         {
@@ -11497,7 +11618,7 @@ impl App {
         // 割り当てた場合、動画同様「閉じて一覧へ戻る」が勝つ)。既定は未割り当てなので通常は no-op。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             && self
@@ -11516,7 +11637,7 @@ impl App {
         // フォーカス中は消費しない (VideoCloseFullscreen と同じガード)。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             // no_repeat: native enter 側も !key.repeat。Z を押しっぱなしで enter した直後、
@@ -11539,7 +11660,7 @@ impl App {
         // 消費しない。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             && self.keymap.consume_action(ctx, KeyAction::VideoPlayPause)
@@ -11553,7 +11674,7 @@ impl App {
         let animated_playback_active = self.fs_entry_is_animated(fs_idx);
         if animated_playback_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && self.keymap.consume_action(ctx, KeyAction::VideoPlayPause)
             && let Some(entry) = self.fs_cache.get_mut(&fs_idx)
@@ -11567,7 +11688,7 @@ impl App {
         // メニュー表示中は無効 (B の文字入力を奪わない)。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && self.keymap.consume_action(ctx, KeyAction::VideoBookmark)
         {
@@ -11579,7 +11700,7 @@ impl App {
         // no-op + トースト。モーダル / IME / TextEdit フォーカス中は消費しない。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             && self.keymap.consume_action(ctx, KeyAction::VideoLoop)
@@ -11592,7 +11713,7 @@ impl App {
         // フォーカス中は消費しない。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             && self.keymap.consume_action(ctx, KeyAction::VideoSeekStart)
@@ -11605,7 +11726,7 @@ impl App {
         // モーダル / IME / TextEdit フォーカス中は消費しない。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
         {
@@ -11624,7 +11745,7 @@ impl App {
         // 音量スライダーと挙動を揃える。モーダル / IME / TextEdit フォーカス中は消費しない。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
         {
@@ -11654,7 +11775,7 @@ impl App {
         // TextEdit フォーカス中は消費しない。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             && self.keymap.consume_action(ctx, KeyAction::VideoMute)
@@ -11698,7 +11819,7 @@ impl App {
         // シークにする。前後ファイル移動は ↑↓ = VideoPrevFile/NextFile が担う)。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
         {
@@ -11750,7 +11871,14 @@ impl App {
 
         // ナビゲーションキーは input_mut で消費して、パネル内ウィジェット（スライダー等）に
         // 奪われないようにする
-        let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let esc = fullscreen_raw_key_permit.is_some_and(|permit| {
+            crate::keyboard_input::consume_fullscreen_raw_key(
+                ctx,
+                permit,
+                egui::Modifiers::NONE,
+                egui::Key::Escape,
+            )
+        });
         // 静止画フルスクリーンでは FsClose (既定: Enter) も Esc と同等に
         // 「フルスクリーン解除」トリガー。
         // グリッドで Enter (Double click 相当) → 開く、フルスクリーンで Enter → 戻る、
@@ -11771,7 +11899,7 @@ impl App {
             || animated_playback_active;
         let enter_consume_ok = should_close_fullscreen_on_enter(
             is_media_item,
-            self.ime_input_active(),
+            self.ime_input_active(ctx),
             self.fs_context_menu_idx.is_some(),
             self.fs_suppress_enter_close_until_release,
         );
@@ -11866,16 +11994,34 @@ impl App {
         // 音声は ←→ を上のシークブロックで消費済み (「映像なし動画」パリティ)。ここでは file-nav へ
         // 流さないよう明示的に除外する (残留 ←→ が前後ファイル移動を誤発火するのを防ぐ)。
         let arrow_right = !fs_music_view_active
-            && ctx.input_mut(|i| {
-                !video_horizontal_arrow_key
-                    && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
-                        || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight))
+            && !video_horizontal_arrow_key
+            && fullscreen_raw_key_permit.is_some_and(|permit| {
+                crate::keyboard_input::consume_fullscreen_raw_key(
+                    ctx,
+                    permit,
+                    egui::Modifiers::NONE,
+                    egui::Key::ArrowRight,
+                ) || crate::keyboard_input::consume_fullscreen_raw_key(
+                    ctx,
+                    permit,
+                    egui::Modifiers::SHIFT,
+                    egui::Key::ArrowRight,
+                )
             });
         let arrow_left = !fs_music_view_active
-            && ctx.input_mut(|i| {
-                !video_horizontal_arrow_key
-                    && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
-                        || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft))
+            && !video_horizontal_arrow_key
+            && fullscreen_raw_key_permit.is_some_and(|permit| {
+                crate::keyboard_input::consume_fullscreen_raw_key(
+                    ctx,
+                    permit,
+                    egui::Modifiers::NONE,
+                    egui::Key::ArrowLeft,
+                ) || crate::keyboard_input::consume_fullscreen_raw_key(
+                    ctx,
+                    permit,
+                    egui::Modifiers::SHIFT,
+                    egui::Key::ArrowLeft,
+                )
             });
         // ファイル名スタックのフラット読書中 (v2.0.0) は Shift+↓↑ を「次/前のスタックへ
         // ジャンプ」に割り当てる。動画再生中は Video* action (音量 / 前後ファイル) が優先。
@@ -11909,21 +12055,39 @@ impl App {
         let arrow_down = video_file_nav == Some(KeyAction::VideoNextFile)
             || (!is_video_fs
                 && !fs_music_view_active
-                && ctx.input_mut(|i| {
+                && fullscreen_raw_key_permit.is_some_and(|permit| {
                     // egui イベントは常に drain する (残すと後段ハンドラが拾う恐れ)。ただし
                     // flat 読書中の Shift+↓ (= スタックジャンプ) はページ送りとしては扱わない。
-                    let consumed = i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
-                        || (!stack_flat_nav
-                            && i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown));
+                    let consumed = crate::keyboard_input::consume_fullscreen_raw_key(
+                        ctx,
+                        permit,
+                        egui::Modifiers::NONE,
+                        egui::Key::ArrowDown,
+                    ) || (!stack_flat_nav
+                        && crate::keyboard_input::consume_fullscreen_raw_key(
+                            ctx,
+                            permit,
+                            egui::Modifiers::SHIFT,
+                            egui::Key::ArrowDown,
+                        ));
                     consumed && !stack_shift_arrow
                 }));
         let arrow_up = video_file_nav == Some(KeyAction::VideoPrevFile)
             || (!is_video_fs
                 && !fs_music_view_active
-                && ctx.input_mut(|i| {
-                    let consumed = i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
-                        || (!stack_flat_nav
-                            && i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp));
+                && fullscreen_raw_key_permit.is_some_and(|permit| {
+                    let consumed = crate::keyboard_input::consume_fullscreen_raw_key(
+                        ctx,
+                        permit,
+                        egui::Modifiers::NONE,
+                        egui::Key::ArrowUp,
+                    ) || (!stack_flat_nav
+                        && crate::keyboard_input::consume_fullscreen_raw_key(
+                            ctx,
+                            permit,
+                            egui::Modifiers::SHIFT,
+                            egui::Key::ArrowUp,
+                        ));
                     consumed && !stack_shift_arrow
                 }));
         let key_home = self.keymap.consume_action(ctx, KeyAction::FsJumpFirst);
@@ -12598,6 +12762,7 @@ impl App {
             self.toggle_compare_diff_mode(ctx, fs_idx);
         }
 
+        let adjustment_open_before_escape = self.adjustment_mode;
         if esc && self.compare_view_mode.is_overlay() {
             self.compare_view_mode = crate::app::CompareViewMode::Off;
             self.clear_compare_gpu_pair();
@@ -12605,6 +12770,12 @@ impl App {
             self.show_feedback_toast("[比較: Normal]".to_string());
         } else if esc && !pano_active_now && self.close_click_side_panels() {
             // ClickToShow の明示オープンは Esc で先に閉じる。
+            if adjustment_open_before_escape {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_key_input:close_click_side_panels",
+                );
+            }
         } else if esc {
             action.close = true;
         }
@@ -12627,6 +12798,12 @@ impl App {
         }
         // I / Tab は左右パネルの呼び出しモードを切り替える。
         if key_i {
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_key_input:FsToggleMetadata",
+                );
+            }
             self.cycle_fs_side_panel_mode();
         }
         // V: 360 度パノラマビューモード トグル。
@@ -12636,6 +12813,12 @@ impl App {
             self.toggle_panorama_mode(fs_idx);
         }
         if key_z && !is_spread_double {
+            if !self.analysis_mode && self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_key_input:FsImageAnalysis",
+                );
+            }
             self.toggle_analysis_mode();
         }
         if self.analysis_mode && !is_spread_double {
@@ -13333,25 +13516,53 @@ impl App {
         // 強制的に落とす。
         if compare_wipe_active {
             if self.adjustment_mode && !self.adjustment_dragging {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_wheel_and_click:compare_wipe",
+                );
                 self.persist_pending_view_trim_state();
                 self.adjustment_mode = false;
             }
         } else if self.is_overlay_edit_mode_active() {
             // 消しゴム / 補正レイヤー / 隠蔽加工モード中は補正パネルを強制 OFF
             // (編集中に色補正バーが画面端ホバーで開かないように)。
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_wheel_and_click:overlay_edit",
+                );
+            }
             self.persist_pending_view_trim_state();
             self.adjustment_mode = false;
         } else if self.view_trim_mode {
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_wheel_and_click:view_trim",
+                );
+            }
             self.persist_pending_view_trim_state();
             self.adjustment_mode = false;
         } else if self
             .fullscreen_idx
             .is_some_and(|idx| self.fs_entry_is_animated(idx))
         {
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_wheel_and_click:animated_item",
+                );
+            }
             self.persist_pending_view_trim_state();
             self.adjustment_mode = false;
         } else if self.fs_zoom_mode_engaged() {
             // ZipPla ズーム中 (照準含む) は左端ホバーで補正パネルを開かない (パン操作の邪魔をしない)。
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_wheel_and_click:zoom_mode",
+                );
+            }
             self.adjustment_mode = false;
         } else if self
             .fullscreen_idx
@@ -13360,9 +13571,23 @@ impl App {
             // 音楽ビュー: 画面端ホバーで画像用の補正パネルを開かない。パネル描画自体は
             // 抑制済みだが、adjustment_mode フラグを立てると画像に戻った瞬間まで残るので
             // ここで OFF に固定する (Inc 3 パネル漏れ修正)。
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_wheel_and_click:music_view",
+                );
+            }
             self.adjustment_mode = false;
         } else {
             let mode = self.settings.fullscreen_side_panel_mode.normalized();
+            let bookmark_title_focused =
+                self.book_bookmark_title_edit.as_ref().is_some_and(|edit| {
+                    ctx.memory(|memory| {
+                        memory.has_focus(
+                            crate::ui_adjustment_panel::book_bookmark_title_edit_widget_id(edit.id),
+                        )
+                    })
+                });
             let left_panel_hover_active = passive_hover_enabled
                 && crate::ui_helpers::edge_summons_adjustment(
                     mode,
@@ -13375,13 +13600,19 @@ impl App {
                     ctx.input(|input| input.pointer.hover_pos()),
                     self.adjustment_mode,
                 );
-            if left_panel_hover_active {
+            if left_panel_hover_active || bookmark_title_focused {
                 self.adjustment_mode = true;
-            } else if !left_panel_hover_active
-                && self.adjustment_mode
-                && !self.adjustment_dragging
-                && mode == crate::settings::FsSidePanelMode::Hover
-            {
+            } else if adjustment_panel_should_auto_close(
+                mode,
+                self.adjustment_mode,
+                self.adjustment_dragging,
+                left_panel_hover_active,
+                bookmark_title_focused,
+            ) {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_wheel_and_click:hover_auto_dismiss",
+                );
                 self.persist_pending_view_trim_state();
                 self.adjustment_mode = false;
             }
@@ -14400,6 +14631,12 @@ impl App {
             }
             // source-swap を開始できない稀ケースのみ通常 open にフォールバック (音声モードは抜ける)。
             let cursor_state = self.fullscreen_cursor_state();
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
+                );
+            }
             self.open_fullscreen(idx);
             self.restore_fullscreen_cursor_state(ctx, cursor_state);
             return;
@@ -14426,6 +14663,12 @@ impl App {
         }
 
         let cursor_state = self.fullscreen_cursor_state();
+        if self.adjustment_mode {
+            crate::ime_focus::record_side_panel_close(
+                ctx,
+                "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
+            );
+        }
         self.open_fullscreen(idx);
         // `open_fullscreen` resets cursor idleness for a new fullscreen entry.
         // Fullscreen-internal navigation should keep the mouse cursor state continuous;
@@ -14892,6 +15135,12 @@ impl App {
         fs_idx: usize,
     ) {
         if close_fs {
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_navigation:close_fullscreen",
+                );
+            }
             let detached = self.viewer_session_is_detached();
             self.handle_fullscreen_close_request();
             if !detached {
@@ -14904,6 +15153,12 @@ impl App {
         } else if close_to_page_list {
             // BS: 階層を 1 段戻す = コンテナのページ一覧 (L2) へ。close_fullscreen は
             // current_folder=ZIP/PDF のまま閉じるので L2 が出る (設定で分岐しない)。
+            if self.adjustment_mode {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_navigation:close_to_page_list",
+                );
+            }
             self.close_fullscreen();
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             ctx.request_repaint();
@@ -15052,8 +15307,7 @@ impl App {
         let image_loading = !is_video
             && self
                 .fullscreen_idx
-                .map(|i| !self.fs_cache.contains_key(&i))
-                .unwrap_or(false);
+                .is_some_and(|i| self.fs_page_load_state(i).waiting_for_display());
         let pdf_rerendering = self.fs_pending.contains_key(&fs_idx);
         if image_loading || pdf_rerendering {
             ctx.request_repaint();
@@ -16600,8 +16854,8 @@ impl App {
             .retain(|k, v| keep_set.contains(k) || matches!(v, FsCacheEntry::Video { .. }));
 
         let current_idx = self.fullscreen_idx.unwrap_or(units[current_pos].anchor_idx);
-        let current_loading =
-            keep_set.contains(&current_idx) && !self.fs_cache.contains_key(&current_idx);
+        let current_loading = keep_set.contains(&current_idx)
+            && self.fs_page_load_state(current_idx).waiting_for_display();
         let to_cancel = self
             .fs_pending
             .keys()
@@ -16620,9 +16874,7 @@ impl App {
             self.fs_early_dims.remove(&idx);
         }
         if current_loading {
-            if !self.fs_pending.contains_key(&current_idx) {
-                self.start_fs_load(current_idx);
-            }
+            self.ensure_fs_page_load(current_idx);
             return;
         }
 
@@ -16645,11 +16897,8 @@ impl App {
             })
         });
         for (_, idx) in targets {
-            if keep_set.contains(&idx)
-                && !self.fs_cache.contains_key(&idx)
-                && !self.fs_pending.contains_key(&idx)
-            {
-                self.start_fs_load(idx);
+            if keep_set.contains(&idx) {
+                self.ensure_fs_page_load(idx);
             }
         }
     }
@@ -18576,7 +18825,7 @@ impl App {
         }
     }
 
-    fn draw_colorize_display_unit_holdover(
+    fn draw_fs_display_unit_holdover(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
@@ -18587,19 +18836,10 @@ impl App {
             .rect_filled(image_rect, 0.0, egui::Color32::BLACK);
         match unit.pages.as_slice() {
             [page] => {
-                let rotation = self.get_rotation(page.idx);
-                let source_size = self
-                    .source_dims_for_idx(page.idx)
-                    .map(|(w, h)| egui::vec2(w, h));
                 let zoom_pan = self.fs_zoom_pan();
                 let free_rotation = self.fs_free_rotation;
                 let fit_mode = self.effective_fullscreen_fit_mode();
                 let fit_scale_limits = self.fullscreen_fit_scale_limits();
-                let content_bbox = if rotation.is_none() {
-                    self.view_trim_single_content_bbox(page.idx)
-                } else {
-                    None
-                };
                 self.fullscreen_page_layout
                     .begin(FullscreenPageLayoutKind::Single);
                 let transform = {
@@ -18608,14 +18848,14 @@ impl App {
                         ui,
                         image_rect,
                         page.idx,
-                        source_size,
+                        page.source_size,
                         None,
                         Some(&page.texture),
                         None,
                         false,
                         false,
                         false,
-                        rotation,
+                        page.rotation,
                         zoom_pan,
                         free_rotation,
                         &bg_style,
@@ -18623,7 +18863,7 @@ impl App {
                         false,
                         fit_mode,
                         fit_scale_limits,
-                        content_bbox,
+                        page.content_bbox,
                     )
                 };
                 if let Some(transform) = transform {
@@ -18637,7 +18877,7 @@ impl App {
                 left.idx,
                 right.idx,
                 false,
-                Some((&left.texture, &right.texture)),
+                Some((left, right)),
             ),
             _ => debug_assert!(false, "display unit must contain one or two pages"),
         }
@@ -18653,20 +18893,24 @@ impl App {
         left_idx: usize,
         right_idx: usize,
         original_preview_active: bool,
-        display_override: Option<(&egui::TextureHandle, &egui::TextureHandle)>,
+        display_override: Option<(&FsDisplayUnitHoldoverPage, &FsDisplayUnitHoldoverPage)>,
     ) {
         self.fullscreen_page_layout.clear();
         let zoom_pan = self.fs_zoom_pan();
         let fit_mode = self.effective_fullscreen_fit_mode();
         let fit_scale_limits = self.fullscreen_fit_scale_limits();
-        let left_rot = self.get_rotation(left_idx);
-        let right_rot = self.get_rotation(right_idx);
+        let (left_rot, right_rot) = match display_override {
+            Some((left, right)) => (left.rotation, right.rotation),
+            None => (self.get_rotation(left_idx), self.get_rotation(right_idx)),
+        };
         // 表示トリム / 自動余白カット (見開き): 各ページの content bbox を取得し、
         // 後で左右セットをフィットさせる。回転ページは対象外 (single 同様)。
-        let (content_left, content_right) = if left_rot.is_none() && right_rot.is_none() {
-            self.view_trim_spread_content_bboxes(left_idx, right_idx)
-        } else {
-            (
+        let (content_left, content_right) = match display_override {
+            Some((left, right)) => (left.content_bbox, right.content_bbox),
+            None if left_rot.is_none() && right_rot.is_none() => {
+                self.view_trim_spread_content_bboxes(left_idx, right_idx)
+            }
+            None => (
                 if left_rot.is_none() {
                     self.view_trim_spread_content_bbox(
                         left_idx,
@@ -18683,17 +18927,23 @@ impl App {
                 } else {
                     None
                 },
-            )
+            ),
         };
         // ZipPla ズーム中もトリムを維持する。ズームのパン/clamp を「トリム後合成ページ」
         // (fit_w × fit_h) 座標で行い (下記)、layout_spread_page_rects のトリム配置と座標系を
         // 一致させることで、トリム後コンテンツだけを拡大表示する (= 余白を見せない)。
         // 各ページが読込中ブランチに落ちたときに出すパス。steady state では空文字列になり
         // `draw_centered_elided_label` が描画をスキップするので無駄な String 化を避ける。
-        let left_location = self.location_display_for_loading(left_idx);
-        let right_location = self.location_display_for_loading(right_idx);
+        let (left_location, right_location) = if display_override.is_some() {
+            (String::new(), String::new())
+        } else {
+            (
+                self.location_display_for_loading(left_idx),
+                self.location_display_for_loading(right_idx),
+            )
+        };
         let (left_display_tex, right_display_tex) = match display_override {
-            Some((left, right)) => (Some(left.clone()), Some(right.clone())),
+            Some((left, right)) => (Some(left.texture.clone()), Some(right.texture.clone())),
             None => (
                 self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active),
                 self.resolve_fs_processed_texture(ctx, right_idx, original_preview_active),
@@ -18748,6 +18998,19 @@ impl App {
             ui.painter().with_clip_rect(image_rect)
         } else {
             ui.painter().clone()
+        };
+        let left_allow_thumbnail = display_override.is_none()
+            && (original_preview_active || !self.colorize_display_requires_final_effect(left_idx));
+        let right_allow_thumbnail = display_override.is_none()
+            && (original_preview_active || !self.colorize_display_requires_final_effect(right_idx));
+        let (left_source_size, right_source_size) = match display_override {
+            Some((left, right)) => (left.source_size, right.source_size),
+            None => (
+                self.source_dims_for_idx(left_idx)
+                    .map(|(w, h)| egui::vec2(w, h)),
+                self.source_dims_for_idx(right_idx)
+                    .map(|(w, h)| egui::vec2(w, h)),
+            ),
         };
 
         if let (Some(ls), Some(rs)) = (left_size, right_size) {
@@ -18886,16 +19149,22 @@ impl App {
                 content_active,
             );
 
-            let left_allow_thumbnail =
-                original_preview_active || !self.colorize_display_requires_final_effect(left_idx);
-            let right_allow_thumbnail =
-                original_preview_active || !self.colorize_display_requires_final_effect(right_idx);
             self.fullscreen_page_layout
                 .begin(FullscreenPageLayoutKind::Spread);
-            for (rect, idx, rot, location, display_tex, allow_thumbnail, content_bbox) in [
+            for (
+                rect,
+                idx,
+                source_size,
+                rot,
+                location,
+                display_tex,
+                allow_thumbnail,
+                content_bbox,
+            ) in [
                 (
                     spread_rects.left_rect,
                     left_idx,
+                    left_source_size,
                     left_rot,
                     &left_location,
                     left_display_tex.as_ref(),
@@ -18905,6 +19174,7 @@ impl App {
                 (
                     spread_rects.right_rect,
                     right_idx,
+                    right_source_size,
                     right_rot,
                     &right_location,
                     right_display_tex.as_ref(),
@@ -18912,7 +19182,6 @@ impl App {
                     content_right,
                 ),
             ] {
-                let source_size = self.source_dims_for_idx(idx).map(|(w, h)| egui::vec2(w, h));
                 if let Some(transform) = Self::draw_fs_spread_page(
                     &painter,
                     image_rect,
@@ -18956,14 +19225,20 @@ impl App {
                 egui::pos2(image_rect.min.x + half_w + spread_gap, image_rect.min.y),
                 egui::vec2(half_w, image_rect.height()),
             );
-            let left_allow_thumbnail =
-                original_preview_active || !self.colorize_display_requires_final_effect(left_idx);
-            let right_allow_thumbnail =
-                original_preview_active || !self.colorize_display_requires_final_effect(right_idx);
-            for (rect, idx, rot, location, display_tex, allow_thumbnail, content_bbox) in [
+            for (
+                rect,
+                idx,
+                source_size,
+                rot,
+                location,
+                display_tex,
+                allow_thumbnail,
+                content_bbox,
+            ) in [
                 (
                     left_rect,
                     left_idx,
+                    left_source_size,
                     left_rot,
                     &left_location,
                     left_display_tex.as_ref(),
@@ -18973,6 +19248,7 @@ impl App {
                 (
                     right_rect,
                     right_idx,
+                    right_source_size,
                     right_rot,
                     &right_location,
                     right_display_tex.as_ref(),
@@ -18980,7 +19256,6 @@ impl App {
                     content_right,
                 ),
             ] {
-                let source_size = self.source_dims_for_idx(idx).map(|(w, h)| egui::vec2(w, h));
                 Self::draw_fs_spread_page(
                     &painter,
                     image_rect,
@@ -20611,6 +20886,30 @@ impl App {
 }
 
 impl App {
+    fn draw_colorize_wait_overlay(
+        &self,
+        ui: &egui::Ui,
+        full_rect: egui::Rect,
+        ctx: &egui::Context,
+    ) {
+        let Some(started_at) = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::colorize_wait_started_at)
+        else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if !colorize_wait_indicator_visible(self.fs_holdover_tex.as_ref(), now) {
+            ctx.request_repaint_after(
+                COLORIZE_WAIT_INDICATOR_DELAY
+                    .saturating_sub(now.saturating_duration_since(started_at)),
+            );
+            return;
+        }
+        paint_centered_dark_status_overlay(ui, full_rect, "カラー化中…");
+    }
+
     /// スタンプ埋め込み worker (R2-6) の進行を画面中央に表示する。worker が完了していれば
     /// `poll_stamp_embed` がここで適用し、まだ処理中なら中央に「スタンプ読み込み中…」を出して
     /// 再描画を要求する (UI は固まらない)。
@@ -20624,26 +20923,7 @@ impl App {
         if !self.poll_stamp_embed() {
             return;
         }
-        let text = "スタンプ読み込み中…";
-        let font = egui::FontId::proportional(20.0);
-        let galley =
-            ui.painter()
-                .layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE);
-        let padding = egui::vec2(28.0, 18.0);
-        let box_size = galley.size() + padding * 2.0;
-        let rect = egui::Rect::from_center_size(full_rect.center(), box_size);
-        ui.painter().rect_filled(
-            rect,
-            10.0,
-            egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230),
-        );
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            text,
-            font,
-            egui::Color32::WHITE,
-        );
+        paint_centered_dark_status_overlay(ui, full_rect, "スタンプ読み込み中…");
         // worker 完了を取りこぼさないよう毎フレーム再描画。
         ctx.request_repaint();
     }
@@ -22705,10 +22985,11 @@ impl App {
                 ui.label(&state.source_label);
                 ui.add_space(6.0);
                 ui.label("ファイル名");
-                let mut basename_output = egui::TextEdit::singleline(&mut state.basename)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("出力ファイル名")
-                    .show(ui);
+                let mut basename_output =
+                    crate::ime_focus::show_singleline(ui, &mut state.basename, None, |edit| {
+                        edit.desired_width(f32::INFINITY)
+                            .hint_text("出力ファイル名")
+                    });
                 crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut basename_output,
@@ -22727,11 +23008,12 @@ impl App {
                 ui.horizontal(|ui| {
                     let buttons_width = 144.0;
                     let edit_width = (ui.available_width() - buttons_width).max(180.0);
-                    let mut output_dir_output =
-                        egui::TextEdit::singleline(&mut state.output_dir_text)
-                            .desired_width(edit_width)
-                            .hint_text("保存先フォルダ")
-                            .show(ui);
+                    let mut output_dir_output = crate::ime_focus::show_singleline(
+                        ui,
+                        &mut state.output_dir_text,
+                        None,
+                        |edit| edit.desired_width(edit_width).hint_text("保存先フォルダ"),
+                    );
                     crate::ui_helpers::singleline_text_edit_context_menu(
                         ui,
                         &mut output_dir_output,
@@ -23421,7 +23703,7 @@ impl App {
         video_path: Option<&std::path::Path>,
     ) {
         // IME 変換中はショートカットを発火させない
-        if self.ime_input_active() {
+        if self.ime_input_active(ctx) {
             return;
         }
 
@@ -24576,6 +24858,57 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn colorize_wait_indicator_requires_colorize_state_and_full_delay() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "colorize_wait_indicator",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let started_at = std::time::Instant::now();
+        let colorize = FsHoldover::ColorizeDisplayUnit(ColorizeDisplayUnitHoldover {
+            target_idx: 0,
+            previous: FsDisplayUnitHoldover {
+                pages: vec![FsDisplayUnitHoldoverPage {
+                    idx: 0,
+                    texture: texture.clone(),
+                    rotation: crate::rotation_db::Rotation::None,
+                    source_size: None,
+                    content_bbox: None,
+                }],
+            },
+            started_at,
+        });
+
+        assert!(!colorize_wait_indicator_visible(
+            Some(&colorize),
+            started_at + COLORIZE_WAIT_INDICATOR_DELAY - std::time::Duration::from_millis(1),
+        ));
+        assert!(colorize_wait_indicator_visible(
+            Some(&colorize),
+            started_at + COLORIZE_WAIT_INDICATOR_DELAY,
+        ));
+
+        let folder_navigation = FsHoldover::FolderNavigation(FsDisplayUnitHoldover {
+            pages: vec![FsDisplayUnitHoldoverPage {
+                idx: 0,
+                texture,
+                rotation: crate::rotation_db::Rotation::None,
+                source_size: None,
+                content_bbox: None,
+            }],
+        });
+        assert!(!colorize_wait_indicator_visible(
+            Some(&folder_navigation),
+            started_at + COLORIZE_WAIT_INDICATOR_DELAY * 10,
+        ));
+        assert!(!colorize_wait_indicator_visible(
+            None,
+            started_at + COLORIZE_WAIT_INDICATOR_DELAY,
+        ));
+    }
+
+    #[test]
     fn continuous_reading_drag_splits_scroll_and_cross_axis_pan() {
         let pointer_delta = egui::vec2(7.0, -11.0);
 
@@ -24803,24 +25136,6 @@ mod tests {
         assert_eq!(compare_indicator_size(4096, 8192), Some((27, 54)));
         assert_eq!(compare_indicator_size(32, 24), Some((32, 24)));
         assert_eq!(compare_indicator_size(0, 24), None);
-    }
-
-    #[test]
-    fn fs_nav_holdover_overlay_rect_centers_portrait_landscape_and_square() {
-        let viewport = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(300.0, 200.0));
-
-        for texture_size in [
-            egui::vec2(100.0, 200.0),
-            egui::vec2(300.0, 100.0),
-            egui::vec2(100.0, 100.0),
-        ] {
-            let fitted = fs_nav_holdover_overlay_rect(viewport, texture_size).unwrap();
-            assert_eq!(fitted.center(), viewport.center());
-            assert!(fitted.left() >= viewport.left());
-            assert!(fitted.right() <= viewport.right());
-            assert!(fitted.top() >= viewport.top());
-            assert!(fitted.bottom() <= viewport.bottom());
-        }
     }
 
     #[test]
@@ -25524,6 +25839,28 @@ mod tests {
             true,
         ));
         assert!(!adjustment_panel_hover_active_at(viewport, None, true));
+    }
+
+    #[test]
+    fn focused_bookmark_title_owns_hover_panel_lifetime() {
+        let mode = crate::settings::FsSidePanelMode::Hover;
+        assert!(adjustment_panel_should_auto_close(
+            mode, true, false, false, false,
+        ));
+        assert!(
+            !adjustment_panel_should_auto_close(mode, true, false, false, true),
+            "a focused bookmark title must keep its containing hover panel registered"
+        );
+        assert!(!adjustment_panel_should_auto_close(
+            mode, true, false, true, false,
+        ));
+        assert!(!adjustment_panel_should_auto_close(
+            crate::settings::FsSidePanelMode::ClickToShow,
+            true,
+            false,
+            false,
+            false,
+        ));
     }
 
     #[test]

@@ -43,7 +43,8 @@ PID との整合性と計測窓の有効性を確認するもので、独立し�
 
 ```powershell
 .\scripts\check-idle-health.ps1 -NoLaunch -Scenario static-background
-.\scripts\check-idle-health.ps1 -NoLaunch -Scenario video-pin-background
+.\scripts\check-idle-health.ps1 -NoLaunch -Scenario video-pin-background `
+    -TargetKey 'D:\media\video-pin-folder'
 ```
 
 既存の対象プロセスを明示する場合は `-ProcessId <PID>` を使う。そのプロセスが
@@ -66,14 +67,27 @@ PID との整合性と計測窓の有効性を確認するもので、独立し�
 3. 動画を代表画像に固定したフォルダを keep 範囲内へ置き、背面で静止
    (`video-pin-background`)
 
-`video-pin-background` はスクリプトを起動してから対象フォルダを開く／再読み込みする。
-準備開始から測定終了までに `thumb.idle_upgrade_ineligible` が 1 件も無ければ、動画ピンが
-keep 範囲へ入った証拠がないため FAIL になる。既に memo 済みの画面を動かさず測るだけでは
-シナリオ成立とみなさない。
+`video-pin-background` では、動画を代表画像に固定したフォルダのパスを `-TargetKey` で渡す。
+この値は perf log の thumbnail event の `key` に対して、大文字小文字を無視した部分一致で
+照合する (フォルダタイルの `key` は `dir::<path>` 形式)。スクリプトを起動してから対象
+フォルダを開く／再読み込みし、そのタイルを keep 範囲へ入れる。準備開始から測定終了までに
+対象 `key` の thumbnail work が 1 件も無ければ、keep 範囲へ入った証拠がないため FAIL になる。
+対象タイルの work はあっても `idle_upgrade_enqueue` / `idle_upgrade_ineligible` が無い場合は、
+アイドル高画質化パスがそのタイルを評価していないことを warning で知らせる。
+
+**ピン作成直後はこのシナリオは成立しない。** 作りたてのサムネイルは `from_cache=false` の
+ためアイドル高画質化の候補にならない。このシナリオが意味を持つのは、アプリ再起動後など、
+対象フォルダのサムネイルがキャッシュから読み直される状態である。上記 warning が出た場合は
+その状態を作ってから測り直す。
 
 ZIP / PDF / スマートフォルダ、AI、動画・音楽などの非同期経路を変更したリリースでは、対象の
 ロード・解析が完了した状態も追加する。動画再生中、スライドショー中、索引・解析中は継続
 処理が正当なので、静止シナリオへ混ぜない。
+
+タスクトレイ常駐中の active media は continuous EOF を進めるため最大 20 Hz の UI tick を明示的に
+維持するが、これは再生中シナリオであり本チェックの静止上限とは分ける。paused media / still の
+tray residency は wake gate 対象外で、完全 sleep が期待値。`video-pin-background` は動画サムネイルの
+pin / keep-range を測るシナリオで `VideoPlayer` を生成しないため、この active-media 例外には入らない。
 
 ## 4. 判定値
 
@@ -102,7 +116,10 @@ ZIP / PDF / スマートフォルダ、AI、動画・音楽などの非同期経
 - `thumb.idle_upgrade_ineligible`: 完成済み派生キャッシュのため対象外
 
 どちらも `key`、`idx`、`items_gen` を持つ。同じ identity が入力・items 世代変更なしに
-繰り返されると `idle-health` が失敗する。解析ロジックの回帰テストは次で実行する。
+繰り返されると `idle-health` が失敗する。ただし `idle_upgrade_ineligible` は memo により
+`(idx, items 世代)` ごとに最大 1 回しか emit されず、ピン作成直後には発生しないこともある。
+このため、単独の必須イベントとしてシナリオ成立判定へ使わない。解析ロジックの回帰テストは
+次で実行する。
 
 ```powershell
 python scripts\test_analyze_perf.py

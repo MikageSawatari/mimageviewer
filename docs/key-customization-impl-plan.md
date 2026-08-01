@@ -520,10 +520,18 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   左右パネル表示モードトグル。3 面共通操作になったため Action context は FsCommon とし、
   native 動画の転送と競合検出も同じ effective chord に追従する。egui 0.33 は `begin_pass` で
   event consume より先に Tab traversal を決めるため、全 egui Context の `on_begin_pass` で
-  viewport ごとの直前 pass の `PlatformOutput::ime` を確認し、TextEdit 編集中でない Tab の
-  focus 方向を最初の focusable widget 登録前に `None` へ戻す。event は後段の Keymap まで残し、
-  KeySlot と egui event queue の同一押下をそこで一緒に consume する。no-repeat の Tab repeat
-  も発火させず除去する。TextEdit / IME の `wants_keyboard_input()` gate は先に維持する。
+  TextEdit / IME の状態にかかわらず Tab の focus 方向を最初の focusable widget 登録前に
+  `None` へ戻す。Tab traversal はアプリ全体で無効だが event は後段の Keymap まで残すため、
+  Tab chord は引き続き任意の KeyAction へ割り当て可能。KeySlot と egui event queue の同一押下は
+  Keymap ownership 境界で一緒に consume する。no-repeat の Tab repeat も発火させず除去する。
+  TextEdit / IME の keyboard owner gate は先に維持し、IME 中の field-level focus lock / 復帰と
+  直前 pass の helper-managed field に対する `FocusRecovery` claim は `ime_focus` が別に所有する。
+  Hover side panel 内の helper field が実 focus を持つ間は panel lifetime も維持し、widget を描かなかった
+  ことによる egui end-pass の dead-man focus clear を起こさない。これは非 IME の focus recovery ではなく、
+  focus が別 widget へ移れば解除される。`[text-input-key]` の通常ログには helper field の id 継続、focus 前後、
+  owner / phase、side-panel close call site を恒久的に残す。無修飾の文字 key / physical key は
+  `Char` へマスクして入力内容を残さない。通常 record は process あたり 1 MiB で抑止し、id / focus /
+  owner / close の異常 record は上限後も残す。helper focus contract がない pass は event list を走査しない。
 - FsNextImage `→` / FsPrevImage `←` / FsNextImageV `↓`,`Shift+↓` /
   FsPrevImageV `↑`,`Shift+↑` (P)(矢印 = 予約候補) / FsFixedJumpNext/Prev `Shift+→/←` /
   FsHome/End (予約候補)

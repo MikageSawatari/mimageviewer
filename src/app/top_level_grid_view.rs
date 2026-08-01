@@ -65,11 +65,8 @@ impl SmartFolderViewState {
         }
     }
 
-    /// `path` 自体が root entry、またはその子孫なら、その entry の scoped drill を開始する。
-    /// 親子の entry が両方 root にある場合は exact match、次に最も深い祖先を優先する。
-    pub(crate) fn enter_containing_path(&mut self, path: &Path) -> bool {
-        let entry_index = self
-            .folder_entries
+    fn containing_entry_index(&self, path: &Path) -> Option<usize> {
+        self.folder_entries
             .iter()
             .position(|entry| crate::folder_tree::path_eq(entry, path))
             .or_else(|| {
@@ -79,8 +76,21 @@ impl SmartFolderViewState {
                     .filter(|(_, entry)| crate::search_index_db::is_under(path, entry))
                     .max_by_key(|(_, entry)| entry.components().count())
                     .map(|(index, _)| index)
-            });
-        let Some(entry_index) = entry_index else {
+            })
+    }
+
+    /// synthetic root から見た直下の entry を返す。scoped current がさらに深い子孫でも、
+    /// 通常フォルダの親復帰でいう「戻り先直下の子」に相当する entry root を解決する。
+    pub(crate) fn containing_entry(&self, path: &Path) -> Option<&Path> {
+        self.containing_entry_index(path)
+            .and_then(|index| self.folder_entries.get(index))
+            .map(PathBuf::as_path)
+    }
+
+    /// `path` 自体が root entry、またはその子孫なら、その entry の scoped drill を開始する。
+    /// 親子の entry が両方 root にある場合は exact match、次に最も深い祖先を優先する。
+    pub(crate) fn enter_containing_path(&mut self, path: &Path) -> bool {
+        let Some(entry_index) = self.containing_entry_index(path) else {
             return false;
         };
         let entry_root = self.folder_entries[entry_index].clone();
@@ -312,11 +322,43 @@ pub(crate) enum TopLevelGridSurface {
     Rating { stars: u8 },
 }
 
-#[derive(Clone, Debug)]
 pub(crate) struct TopLevelGridView {
     surface: TopLevelGridSurface,
     return_to: Option<TopLevelGridRestore>,
     generation: u64,
+    /// The completed smart-folder result has exactly the same lifetime as this surface plus
+    /// descendants opened from it. `begin` is an explicit top-level transition and always drops
+    /// the old session; `replace_surface` preserves it only while the same smart-folder surface
+    /// owns the navigation scope.
+    smart_folder_session: Option<super::smart_folder::SmartFolderSession>,
+}
+
+impl Clone for TopLevelGridView {
+    fn clone(&self) -> Self {
+        Self {
+            surface: self.surface.clone(),
+            return_to: self.return_to.clone(),
+            generation: self.generation,
+            // Context duplication may copy the visible grid identity for an independent viewer,
+            // but the main smart-folder result remains owned by the main top-level surface.
+            smart_folder_session: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for TopLevelGridView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TopLevelGridView")
+            .field("surface", &self.surface)
+            .field("return_to", &self.return_to)
+            .field("generation", &self.generation)
+            .field(
+                "has_smart_folder_session",
+                &self.smart_folder_session.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl Default for TopLevelGridView {
@@ -325,6 +367,7 @@ impl Default for TopLevelGridView {
             surface: TopLevelGridSurface::Folder,
             return_to: None,
             generation: 0,
+            smart_folder_session: None,
         }
     }
 }
@@ -340,17 +383,32 @@ impl TopLevelGridView {
         return_to: Option<TopLevelGridRestore>,
     ) -> u64 {
         self.generation = self.generation.wrapping_add(1);
+        self.smart_folder_session = None;
         self.surface = surface;
         self.return_to = return_to;
         self.generation
     }
 
     pub(crate) fn replace_surface(&mut self, surface: TopLevelGridSurface) -> u64 {
-        self.begin(surface, None)
+        let keeps_smart_folder_session = matches!(
+            (self.smart_folder_session.as_ref(), &surface),
+            (
+                Some(session),
+                TopLevelGridSurface::SmartFolder(state),
+            ) if session.definition_id() == state.definition_id
+        );
+        self.generation = self.generation.wrapping_add(1);
+        if !keeps_smart_folder_session {
+            self.smart_folder_session = None;
+        }
+        self.surface = surface;
+        self.return_to = None;
+        self.generation
     }
 
     pub(crate) fn take_return_to(&mut self) -> Option<TopLevelGridRestore> {
         self.generation = self.generation.wrapping_add(1);
+        self.smart_folder_session = None;
         self.surface = TopLevelGridSurface::Folder;
         self.return_to.take()
     }
@@ -370,6 +428,44 @@ impl TopLevelGridView {
         match &mut self.surface {
             TopLevelGridSurface::SmartFolder(state) => Some(state),
             _ => None,
+        }
+    }
+
+    pub(crate) fn smart_folder_session(&self) -> Option<&super::smart_folder::SmartFolderSession> {
+        self.smart_folder_session.as_ref()
+    }
+
+    pub(crate) fn smart_folder_session_mut(
+        &mut self,
+    ) -> Option<&mut super::smart_folder::SmartFolderSession> {
+        self.smart_folder_session.as_mut()
+    }
+
+    pub(crate) fn install_smart_folder_session(
+        &mut self,
+        session: super::smart_folder::SmartFolderSession,
+    ) {
+        debug_assert!(matches!(
+            &self.surface,
+            TopLevelGridSurface::SmartFolder(state)
+                if state.definition_id == session.definition_id()
+        ));
+        self.smart_folder_session = Some(session);
+    }
+
+    pub(crate) fn take_smart_folder_session(
+        &mut self,
+    ) -> Option<super::smart_folder::SmartFolderSession> {
+        self.smart_folder_session.take()
+    }
+
+    pub(crate) fn discard_smart_folder_session(&mut self, definition_id: uuid::Uuid) {
+        if self
+            .smart_folder_session
+            .as_ref()
+            .is_some_and(|session| session.definition_id() == definition_id)
+        {
+            self.smart_folder_session = None;
         }
     }
 }

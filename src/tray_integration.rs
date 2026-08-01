@@ -14,30 +14,38 @@ fn should_close_fullscreen_for_tray(
     fs_cache_has_video: bool,
     native_video_pending: bool,
     detached_viewer_session: bool,
-    current_media_was_playing: bool,
 ) -> bool {
-    !detached_viewer_session
-        && !current_media_was_playing
-        && (fullscreen_open || fs_cache_has_video || native_video_pending)
-}
-
-fn pause_video_players_for_tray<'a>(
-    entries: impl Iterator<Item = &'a crate::fs_animation::FsCacheEntry>,
-) -> usize {
-    let mut paused = 0;
-    for entry in entries {
-        let crate::fs_animation::FsCacheEntry::Video { player, .. } = entry else {
-            continue;
-        };
-        if player.intent_playing() {
-            player.set_playing(false);
-            paused += 1;
-        }
-    }
-    paused
+    !detached_viewer_session && fullscreen_open && !fs_cache_has_video && !native_video_pending
 }
 
 impl App {
+    /// Keep every already-owned egui host registered while changing only OS visibility.
+    /// The fullscreen id covers the active F12 host; detached snapshots cover passive and
+    /// ParkedLive hosts. Duplicate ids are collapsed before commands are queued.
+    fn sync_retained_viewport_visibility_for_tray(
+        &self,
+        ctx: &egui::Context,
+        visible: bool,
+    ) -> usize {
+        let mut viewport_ids = Vec::new();
+        if self.fs_viewport_shown {
+            viewport_ids.push(self.fullscreen_viewport_id());
+        }
+        #[cfg(windows)]
+        {
+            for window in &self.detached_image_windows {
+                let viewport_id = Self::detached_image_window_viewport_id(window.id);
+                if !viewport_ids.contains(&viewport_id) {
+                    viewport_ids.push(viewport_id);
+                }
+            }
+        }
+        for viewport_id in &viewport_ids {
+            ctx.send_viewport_cmd_to(*viewport_id, egui::ViewportCommand::Visible(visible));
+        }
+        viewport_ids.len()
+    }
+
     /// Request the same root viewport close as the main window's [x] button.
     /// The next update lets `maybe_intercept_close` apply tray residency rules.
     pub(crate) fn request_main_window_close(&self, ctx: &egui::Context) {
@@ -109,6 +117,33 @@ impl App {
         }
     }
 
+    /// Publish the latest media-owner projection to the existing tray thread.
+    /// No App-side wake state is stored: visible/hidden, player transport, EOF navigation,
+    /// and source-swap ownership remain the sources of truth.
+    pub(crate) fn sync_tray_resident_media_wake(&self) {
+        let Some(controller) = self.tray_controller.as_ref() else {
+            return;
+        };
+        #[cfg(windows)]
+        {
+            let enabled = self.tray_resident_media_updates_needed();
+            if controller.set_resident_media_wake_enabled(enabled) {
+                crate::set_ui_heartbeat_suspended(
+                    !self.window_visible && !enabled,
+                    if enabled {
+                        "App::update heartbeat resumed for active tray media".to_string()
+                    } else if self.window_visible {
+                        "App::update heartbeat follows visible window".to_string()
+                    } else {
+                        "App::update heartbeat suspended for idle tray residency".to_string()
+                    },
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = controller.set_resident_media_wake_enabled(false);
+    }
+
     /// 閉じるボタン [×] が押されたか検出し、設定 ON + トレイ起動中なら hide に差し替える。
     /// 返り値は「hide に差し替えた (= アプリを終了させない)」かどうか。
     pub(crate) fn maybe_intercept_close(&mut self, ctx: &egui::Context) -> bool {
@@ -137,9 +172,10 @@ impl App {
 
     /// ウィンドウを非表示にしてタスクトレイ状態へ遷移する。
     ///
-    /// **重要**: `ViewportCommand::Visible(false)` は使わない。それを使うと eframe/winit が
-    /// `App::update` を呼ばなくなり、トレイメニューから復帰できなくなる (request_repaint が
-    /// 効かない)。代わりに Win32 `ShowWindow(hwnd, SW_HIDE)` を直接呼ぶ。
+    /// **重要**: `ViewportCommand::Visible(false)` は使わない。どちらの hide でも通常の
+    /// `App::update` は止まるが、Win32 `ShowWindow(hwnd, SW_HIDE)` を直接使えばトレイスレッドが
+    /// App を経由せず復帰できる。active media だけは同スレッドの bounded WM_PAINT bridge が
+    /// UI-owned EOF state machine を進める。
     ///
     /// サイズ保存について: hide の直前に `GetWindowPlacement` で rect を丸ごと捕獲しておき、
     /// 復帰時に `SetWindowPlacement` で完全復元する。eframe/winit の DPI 丸めを完全に
@@ -148,19 +184,20 @@ impl App {
         if !self.window_visible {
             return;
         }
-        // Win32 が main / owned windows を隠すより先に transport を止める。VideoPlayer の
-        // Pause は playback transport / audio / clock を同じ状態機械で止め、現在位置を保持する。
-        // 動画→音声モードと音楽ファイルも同じ FsCacheEntry::Video を所有するため、
-        // 表示形態ごとの分岐や tray 専用フラグは要らない。
-        let current_media_was_playing = self.pause_media_playback_for_tray();
+        // Preserve the media session and transport. Native presenters enter their existing
+        // consume-and-hold state; egui hosts remain registered but become explicitly hidden.
+        let routed_presenters = self.prepare_media_session_for_tray_residency();
+        let retained_viewports = self.sync_retained_viewport_visibility_for_tray(ctx, false);
         let keep_detached_viewer_alive = self.viewer_session_is_detached_or_switching();
         self.window_visible = false;
+        self.sync_tray_resident_media_wake();
+        let keep_resident_media_awake = self.tray_resident_media_updates_needed();
         crate::set_ui_heartbeat_suspended(
-            !keep_detached_viewer_alive,
-            if keep_detached_viewer_alive {
-                "App::update heartbeat kept alive for detached viewer while hidden to tray"
+            !keep_resident_media_awake,
+            if keep_resident_media_awake {
+                "App::update heartbeat kept alive for active media while hidden to tray"
             } else {
-                "App::update heartbeat suspended while hidden to tray"
+                "App::update heartbeat suspended for idle tray residency"
             }
             .to_string(),
         );
@@ -180,10 +217,6 @@ impl App {
                 let _ = ShowWindow(HWND(hwnd_raw as *mut _), SW_HIDE);
             }
         }
-
-        // 再生中だった media session は pause 済みの player / presenter を維持する。
-        // 非 media または再生中でなかった通常 fullscreen は従来どおり close する。
-        self.release_media_session_for_tray(current_media_was_playing);
 
         // I/O throttle: 他アプリへの帯域影響を抑える
         if let Some(mgr) = self.indexer_manager.as_ref() {
@@ -207,7 +240,10 @@ impl App {
 
         // トレイの表示を更新
         self.update_tray_tooltip();
-        crate::logger::log("tray: window hidden to tray (Win32 SW_HIDE, placement saved)");
+        crate::logger::log(format!(
+            "tray: window hidden to tray (Win32 SW_HIDE, placement saved); \
+             retained_viewports={retained_viewports} routed_presenters={routed_presenters}"
+        ));
     }
 
     /// タスクトレイから復帰した後の **App 側事後処理**。
@@ -218,6 +254,8 @@ impl App {
             return;
         }
         self.window_visible = true;
+        self.sync_tray_resident_media_wake();
+        let restored_viewports = self.sync_retained_viewport_visibility_for_tray(ctx, true);
         crate::set_ui_heartbeat_suspended(
             false,
             "App::update heartbeat resumed after tray restore".to_string(),
@@ -231,34 +269,37 @@ impl App {
         // 外部 (ComfyUI 等) がトレイ常駐中に current_folder へファイルを追加していたら
         // 自動で反映する。stat 1 回の軽量チェックで、変化が無ければ no-op。
         self.check_external_folder_changes();
-        // tray hide が保持した fullscreen media は pause のまま surface だけ復帰させる。
-        // Play は送らず、main-focus guard が復帰フレームで close する競合だけを既存の
-        // focus grace / focus restore 経路で避ける。
+        #[cfg(windows)]
+        let restored_presenters = self.sync_media_presenter_visibility_for_tray(true);
+        #[cfg(not(windows))]
+        let restored_presenters = 0;
+        // Transport state was never changed. Restore the retained surface and let the existing
+        // focus path bring it forward without synthesizing Play or recreating the session.
         self.restore_media_surface_after_tray(ctx);
-        crate::logger::log("tray: App state synced after restore");
+        crate::logger::log(format!(
+            "tray: App state synced after restore; \
+             restored_viewports={restored_viewports} routed_presenters={restored_presenters}"
+        ));
     }
 
-    /// トレイ格納時に、全 viewer context の再生 transport を明示的に一時停止する。
-    /// `VideoPlayer::set_playing(false)` は engine clock の現在位置を保持する。
-    pub(crate) fn pause_media_playback_for_tray(&mut self) -> bool {
-        let current_paused = pause_video_players_for_tray(self.fs_cache.values());
+    /// Apply the media half of the tray transition without changing playback transport.
+    /// Tests call this ownership boundary directly to pin session identity and play intent.
+    pub(crate) fn prepare_media_session_for_tray_residency(&mut self) -> usize {
         #[cfg(windows)]
-        let detached_paused = self.pause_detached_media_playback_for_tray();
+        let routed_presenters = self.sync_media_presenter_visibility_for_tray(false);
         #[cfg(not(windows))]
-        let detached_paused = 0;
+        let routed_presenters = 0;
         self.save_all_video_resume_positions();
         #[cfg(windows)]
         self.save_detached_video_resume_positions_for_exit();
-        if current_paused + detached_paused > 0 {
-            crate::logger::log(format!(
-                "tray: paused media before residency; current={current_paused} detached={detached_paused}"
-            ));
-        }
-        current_paused > 0
+        // Media and pending-open sessions survive regardless of play/pause state. A plain
+        // still fullscreen has no background work to preserve and follows the existing close path.
+        self.release_media_session_for_tray();
+        routed_presenters
     }
 
-    /// pause 後に、保持対象ではない従来の fullscreen session だけを閉じる。
-    fn release_media_session_for_tray(&mut self, current_media_was_playing: bool) {
+    /// Keep media/pending/detached ownership intact and close only a plain still fullscreen.
+    fn release_media_session_for_tray(&mut self) {
         let fs_cache_has_video = self
             .fs_cache
             .values()
@@ -276,7 +317,6 @@ impl App {
             fs_cache_has_video,
             native_video_pending,
             self.viewer_session_is_detached_or_switching(),
-            current_media_was_playing,
         ) {
             crate::logger::log(format!(
                 "tray: closing fullscreen/media session before residency \
@@ -284,15 +324,12 @@ impl App {
                 self.fullscreen_idx, fs_cache_has_video, native_video_pending
             ));
             self.close_fullscreen();
-        } else if current_media_was_playing {
+        } else if fs_cache_has_video
+            || native_video_pending
+            || self.viewer_session_is_detached_or_switching()
+        {
             crate::logger::log(format!(
-                "tray: keeping paused media session for resume after residency \
-                 fullscreen={:?} fs_video={} native_pending={}",
-                self.fullscreen_idx, fs_cache_has_video, native_video_pending
-            ));
-        } else if self.viewer_session_is_detached_or_switching() {
-            crate::logger::log(format!(
-                "tray: keeping existing detached viewer session during residency \
+                "tray: keeping media/detached session during residency \
                  fullscreen={:?} fs_video={} native_pending={}",
                 self.fullscreen_idx, fs_cache_has_video, native_video_pending
             ));
@@ -319,6 +356,12 @@ impl App {
                 *state = crate::grid_item::ThumbnailState::Evicted;
             }
         }
+        // The decoder/presenter keeps its own leases. Reclaim only process-wide pool entries
+        // that are not currently leased, including when the active session is detached.
+        #[cfg(windows)]
+        if let Some(device) = self.gpu_video_device.as_ref() {
+            device.release_idle_pools();
+        }
         if keep_detached_viewer_alive {
             crate::logger::log(
                 "tray: skipped active viewer GPU/cache release for detached viewer session",
@@ -326,26 +369,22 @@ impl App {
             return;
         }
         // フルスクリーン画像キャッシュ (最大サイズ源、20MP RGBA ≈ 80MB/枚)。
-        // 再生中に tray へ入った media session は pause 済みの VideoPlayer を保持し、
+        // tray へ入った media session は稼働中の VideoPlayer を保持し、
         // それ以外の texture entry は従来どおり解放する。
-        let paused_media_entries = self
+        let active_media_entries = self
             .fs_cache
             .values()
             .filter(|entry| matches!(entry, crate::fs_animation::FsCacheEntry::Video { .. }))
             .count();
-        if paused_media_entries == 0 {
+        if active_media_entries == 0 {
             self.fs_cache.clear();
         } else {
             self.fs_cache.retain(|_, entry| {
                 matches!(entry, crate::fs_animation::FsCacheEntry::Video { .. })
             });
             crate::logger::log(format!(
-                "tray: retained {paused_media_entries} paused media player(s) while releasing GPU caches"
+                "tray: retained {active_media_entries} active media player(s) while releasing GPU caches"
             ));
-        }
-        #[cfg(windows)]
-        if let Some(device) = self.gpu_video_device.as_ref() {
-            device.release_idle_pools();
         }
         self.ai_upscale_cache.clear();
         self.adjustment_cache.clear();
@@ -490,49 +529,29 @@ mod tests {
     use super::should_close_fullscreen_for_tray;
 
     #[test]
-    fn tray_residency_closes_fullscreen_sessions() {
-        assert!(should_close_fullscreen_for_tray(
-            true, false, false, false, false
-        ));
+    fn tray_residency_closes_plain_still_fullscreen_sessions() {
+        assert!(should_close_fullscreen_for_tray(true, false, false, false));
     }
 
     #[test]
-    fn tray_residency_closes_video_resources_without_fullscreen_flag() {
-        assert!(should_close_fullscreen_for_tray(
-            false, true, false, false, false
-        ));
-        assert!(should_close_fullscreen_for_tray(
-            false, false, true, false, false
-        ));
+    fn tray_residency_keeps_media_resources_without_fullscreen_flag() {
+        assert!(!should_close_fullscreen_for_tray(false, true, false, false));
+        assert!(!should_close_fullscreen_for_tray(false, false, true, false));
+        assert!(!should_close_fullscreen_for_tray(true, true, false, false));
+        assert!(!should_close_fullscreen_for_tray(true, false, true, false));
     }
 
     #[test]
     fn tray_residency_leaves_plain_grid_sessions_open() {
         assert!(!should_close_fullscreen_for_tray(
-            false, false, false, false, false
+            false, false, false, false
         ));
     }
 
     #[test]
     fn tray_residency_keeps_detached_viewer_sessions_open() {
-        assert!(!should_close_fullscreen_for_tray(
-            true, false, false, true, false
-        ));
-        assert!(!should_close_fullscreen_for_tray(
-            false, true, false, true, false
-        ));
-        assert!(!should_close_fullscreen_for_tray(
-            false, false, true, true, false
-        ));
-    }
-
-    #[test]
-    fn tray_residency_keeps_playing_media_session_after_pause() {
-        assert!(!should_close_fullscreen_for_tray(
-            true, true, false, false, true
-        ));
-        assert!(!should_close_fullscreen_for_tray(
-            false, true, false, false, true
-        ));
+        assert!(!should_close_fullscreen_for_tray(true, false, false, true));
+        assert!(!should_close_fullscreen_for_tray(false, true, false, true));
+        assert!(!should_close_fullscreen_for_tray(false, false, true, true));
     }
 }

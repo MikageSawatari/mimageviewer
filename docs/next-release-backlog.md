@@ -156,6 +156,18 @@
 - 影響範囲: Windows native 入力、egui viewport、detached / native presenter。HWND 再生成や
   viewport lifecycle への対応が要る。detached リワークとの調整も必要
   ([detached-rework-plan.md](detached-rework-plan.md) §2 / §11)。
+- **実機で確認した症状 (2026-08-01)**: F12 別ウィンドウで動画のブックマーク名を編集中に、
+  メインウィンドウをクリックしてそちらを操作しても、**キーが別ウィンドウのテキストエリアへ
+  行き続ける** (矢印キーがそちらの caret を動かす)。上の「root ctx はキーボード不要、child ctx は
+  TextEdit 編集中、物理キーキューはどちら由来か不明」がそのまま出た形。**v2.9.0 から同じ挙動**。
+- **利用者体験の観点** (優先度を再判断するときはこれも見ること): 編集中の別ウィンドウが
+  **視界に入っていないと、アプリ全体が壊れたと誤解する**。「入力欄を閉じれば直る」と気づく
+  手がかりが画面上に無い。技術的な影響範囲が狭くても、体感的な深刻度はこの分だけ高い。
+- 前提の進捗: 案A は v2.9.1 の `56db11bc` で pass 単位の所有者決定と生キーの permit 化まで入った。
+  IME 状態も viewport ごとへ分離済み。**本項は「どの viewport の所有権か」を正しくするだけに
+  縮んでいる**はず。
+- 併せて直す: [§1.32](#132-ime-変換中の-esc-が期待どおりに働かない-2-件) の IME 2 件。同じ領域なので
+  一括で設計する。
 - 規模 / 優先度: Large / P2 candidate。
 ### 1.27 presenter スレッドが UI スレッドの窓の子 HWND を所有したままブロックする
 
@@ -189,73 +201,219 @@
   (`docs/video-architecture.md` の `FramePresentationState` 節参照)。
 - 規模 / 優先度: Medium〜Large / **P1** (ハード ハングのため)。
 
-### 1.28 トレイ格納をまたいで再生を継続し、復帰で動画を再開する
+### 1.28 presenter の上に別の窓が乗るとカーソル auto-hide が解除されない
 
-- 出典: 2026-07-30 のユーザー実機検証。**v2.9.0 では「格納時に一時停止」で出荷した**
-  (復帰の瞬間に止まる不自然さを消すことを優先)。将来ここへ再挑戦したい、というユーザー要望。
-- ほしい挙動: トレイ常駐中も再生を続け (少なくとも音声)、復帰したら動画表示も再開する。
-  複数ウィンドウで画像を見ているときは各ウィンドウが復元されるので、動画も同様に戻るのが望ましい。
+- 出典: v2.9.1 リリース前の §7.2 実機確認 (2026-08-01)、シナリオ 5 (VST GUI) の最中。
+- 症状: フルスクリーンで動画を**再生中**に VST エディタを開こうとしたところ、マウスカーソルが
+  非表示のまま戻らなくなった。**mIV の動画ウィンドウの上でだけ**継続し、別モニタへ移すと
+  正常。動画ウィンドウ上へ戻すとまた消える。**クリックしても復帰しない** (ホイールは未試行)。
+  動画を閉じて再生し直すと解消した。
+- 壊れている前提: [native_window_host.rs](../src/video/native_window_host.rs) の
+  `observe()` が作る `cursor_within_client` は `GetCursorPos` → `ScreenToClient(presenter)` →
+  `GetClientRect` の **純粋な幾何判定**である。ところが
+  [render_core.rs](../src/video/native_presenter/render_core.rs) の
+  `cursor_within_focus_window()` はこれを「カーソルの入力を実際に受けている窓が presenter か」
+  という**所有権の判定として**使い、true の間だけ `SetCursor` intent を出す。
+  presenter の client 矩形の内側に別の top-level 窓 (VST エディタ) が乗ると、この 2 つの問いの
+  答えがずれる。
+- 成立する環:
+  1. エディタ窓は presenter の client 矩形の内側 → `cursor_within_client = true`。
+  2. 再生中なのでフレームが出続け、presenter は毎フレーム `SetCursor(Hidden)` を適用する。
+  3. mouse move / button はエディタ窓へ行き、`push_native_event` に届かない →
+     `cursor_last_activity` が更新されず `cursor_should_hide` が true に固定される。
+  4. `WM_SETCURSOR` は `LRESULT(1)` を返すだけで復帰させない (2026-06-06 に zero-delta move
+     での誤復帰を潰すため意図的に外した経路)。`restore_cursor_for_mouse_activity` は HUD の
+     wheel / button ハンドラからしか呼ばれないので、エディタ上のクリックでは発火しない。
+  → 3 つある復帰経路がすべて同時に閉じる。実機の「クリックでも戻らない」がこれを裏付ける。
+- 症状パッチにしないこと: `WM_SETCURSOR` での復帰と、タイマーによる強制復帰はどちらも
+  根本原因に対応せず、前者は 2026-06-06 の修正を再発させる。auto-hide 状態は現在
+  **producer が 3 つ (presenter frame intent / HUD wndproc / `push_native_event`) あって
+  所有者がいない**。reducer が単一の owner となり、placement / VST owner 切替の遷移で
+  明示的にリセットされる形へ集約する。`cursor_within_client` は幾何ではなく
+  「presenter または HUD が実際にそのカーソルの入力先か」を答える述語に置き換える
+  (判定不能時のフォールバックが現在 `_ => true` = 隠す側に倒れている点も含めて直す)。
+- 関連: [native-video-window-thread-plan.md](native-video-window-thread-plan.md) の Stage 5
+  (VST owner handoff と focus 境界) と Stage 6 (placement 切替の lifecycle hardening)。
+  VST 固有ではなく、presenter の上に別の窓が乗る全ケースで成立する。
+- 観測の欠落: 発生時点のログ (`mimageviewer.log` / perf log) に**カーソル関連の計装が無く**、
+  今回の発生は事後確認できなかった。§7.3 の health detection に `cursor_hidden` /
+  `cursor_within_client` / `cursor_last_activity` / 直近の placement 遷移を含める。
+- 規模 / 優先度: Medium / **P2**。データ喪失は無いが、再生を止めるまで操作感が壊れる。
 
-#### 2026-07-30 に判明していること (ゼロから調べ直さないこと)
+### 1.29 見開き PDF の片ページが「読み込み中」のまま完走しない (再入ループ)
 
-- **トレイ格納中、native presenter は実際に破棄されている。** ログの
-  `presenter stopped: native window visibility cancelled` がそれ。音声だけは別系統で
-  鳴り続けるため「再生が続いている」ように見えていた。
-- 復帰時に `poll_video` の `native_presenter_closed()` 終端処理が `close_fullscreen()` を
-  呼ぶ。これは破棄済みという**実態に即した**動作であって、単体では誤りではない。
-- 同じ症状で先に 2 本の経路を潰してある。**再挑戦時に元へ戻さないこと**:
-  - `5f2e37b5` `check_external_folder_changes` → items 再読み込み → detached context
-    promotion 失敗 → close
-  - `43dec1a2` `ShowWindow` による main focus → focus guard が
-    「detached host 登録待ちの `viewer_presentation` が旧 `Fullscreen` のまま」を
-    通常 fullscreen と誤認 → close
+- 出典: v2.9.1 リリース前の実機確認 (2026-08-01)。利用者報告 =「見開きの片ページが 10 秒以上
+  読み込み中のまま。スライダーを動かしたら表示された」。ログで再現痕跡を確認済み。
+- **リリース済み v2.9.0 の挙動**である (`git show v2.9.0:src/app.rs` に同じ早期 return がある)。
+  導入は `7c3a9363` "Unify PDF retained page cache"。
+- ログ証跡 (`open_fullscreen: idx=19` 直後から約 50 秒、合計 23,000 行弱):
+  - idx=19 (見開きの片方、final-AI が retained にある側) — **15,240 回**
+    `[PDF] Retained page final-ai available idx=19 reason=start_fs_load_skip_pdf_render`
+  - idx=20 (もう片方、実際に止まって見えた側) — **7,576 回**
+    `Retained page miss idx=20 ... target_px=2376 entries=10 reason=start_fs_load/resolution_mismatch`
+    と、その都度の `fs pdf render cancelled/interrupted Page 21` (スレッド番号が毎回加算)。
+  - 同区間で `[SLOW FRAME]` 39 回。
+- **確定している壊れた前提 (idx=19 側)**: 呼び出し側の再入ガードは
+  [ui_fullscreen.rs](../src/ui_fullscreen.rs) の
+  `if !self.fs_cache.contains_key(&idx) && !self.fs_pending.contains_key(&idx)` である。
+  ところが [app.rs](../src/app.rs) の `start_fs_load` にある
+  `has_retained_pdf_final_ai_for_current_params(idx)` の早期 return は、**`fs_pending` へ
+  登録しないまま return する**。したがって cache にも pending にも入らず、ガードが毎フレーム
+  通り、`start_fs_load` が延々と呼ばれ続ける。**「retained にあるから描画不要」と
+  「ロードが完了した」を同じ経路で表現できていない**のが構造的な誤り。
+- **確定した再入経路 (idx=20 側)**: 原因は
+  `pdf_target_changed` → `update_prefetch_window(fs_idx=19)`。`update_prefetch_window` は
+  `!fs_cache.contains_key(current_idx)` だけで現在ページをロード中と判定し、その間は current 以外の
+  `fs_pending` を全て remove + cancel する。idx=19 は retained final-AI から表示できる一方で
+  `fs_cache` には入らないため、各描画 pass で idx=20 の pending が落ち、次の見開きロードガードが
+  idx=20 を再投入していた。実ログの `211.018s` (idx=19 open) から `257.744s` (補正変更) まで
+  46.726 秒を再集計すると、idx=20 の `resolution_mismatch` は 7,576 回、Page 21 の cancel は
+  7,516 回、同区間の `Retained page evict` / idx=20 store / Page 21 render 完了はすべて **0 回**。
+  よって候補 2 の満杯 store による相互 evict は当該再入の原因ではない。source inspection でも、
+  current の完了が無い同区間に別 idx の pending を反復除去できる call site はこの経路だけである。
+- **症状パッチにしないこと**: 解像度一致判定 (`0.9..=1.1`) の閾値を緩める、キャンセルを止める、
+  再入を時間で抑制する、はいずれも根本原因に対応しない。producer (retained store / render 完了) と
+  consumer (表示・再入ガード) が「このページは表示可能か」について**同じ 1 つの状態**を見る形に
+  集約する。`fs_cache` / `fs_pending` / retained store の 3 つが別々に答えている現状が原因。
+- 関連: [final-composite-budget-thrash-plan.md](final-composite-budget-thrash-plan.md) と同じ
+  「再計算 → 破棄 → 再計算」の系統。ストアは別 (あちらは連結読みの texel 予算、こちらは PDF
+  retained page) だが、対策の考え方は流用できる可能性がある。
+- 完了条件 / 回帰テスト:
+  - 見開き表示で、両ページとも操作なしで表示に到達する (待つだけで完走する)。
+  - `start_fs_load` が同一 idx / 同一パラメータで毎フレーム再入しない状態遷移テスト。
+  - retained store が満杯のとき、見開きの 2 ページが相互に evict し合わない。
+  - 早期 return 経路でも、呼び出し側の再入ガードが「もう呼ばなくてよい」と判定できる。
+- 規模 / 優先度: Medium / **P1**。ページが表示されず、待っても直らない (操作して初めて解ける)。
+  副次的に毎フレームのスレッド生成と PDF レンダ投棄で CPU を焼く。
 
-#### 有望な方向
+### 1.30 native video Stage 5 の再投入条件 (revert 済み、原因未確定)
 
-**トレイ格納を「破棄」ではなく「hidden presenter」として扱う。**
+- 出典: 2026-08-01。Stage 5 (`726f838d`) を入れたところ UI が完全停止する P1 が再現し、
+  `737c5234` で **revert 済み**。v2.9.1 は Stage 5 を含めずに出す。§1.28 のカーソル問題は
+  既知の問題として残る。
+- 症状: 動画をフルスクリーン再生中に VST エディタを開閉すると UI が完全に固まる。**動画・音声の
+  再生は継続し、EOF で次の動画へも進む。UI だけが死ぬ。**終了も右クリックも不能。2 回再現
+  (t=178s / t=18s)。
+- 停止点 (cdb `-pv` で採取): main スレッドが `SendMessageW` 経由の wndproc の中で
+  `eframe run_ui_and_paint` → `egui_wgpu paint_and_update_textures` →
+  `wgpu_hal::dx12::Surface::acquire_texture` → `WaitForSingleObjectEx`。
+  他スレッドは全て健全 (`vst-owner-dispatch` は recv で idle、pump は sleep、render / demux /
+  decode は稼働)。
+- **原因は未確定。候補 2 つとも潰れていない**:
+  1. **VST owner handoff**: owner / z-order / visibility の変更が同期メッセージを撃つ。
+     ただし hidden anchor は published fullscreen host の破棄時のみ通り、C++ は
+     `old_owner == new_owner` で早期 return し、owner 付け替え自体は Stage 5 以前から存在する。
+  2. **カーソル所有**: 新実装は pump から **8ms ごとに `WindowFromPoint`** を呼ぶ。同 API は
+     hit-test のため対象の wndproc へ **`WM_NCHITTEST` を同期送信**し、相手は UI スレッドの窓や
+     **別プロセスの VST エディタ**になり得る。pump からの無制限な cross-thread / cross-process
+     同期呼び出しであり、**Stage 4 の「pump は時間上限を保証できない処理を持たない」原則に抵触する**。
+     「窓を作らないから同期メッセージを撃たない」は成立しない。
+- 次回に取るべき証拠 (今回取れていない):
+  - `acquire_texture` の wait が**本当に無限か**。wgpu-core 27.0.3 は **1000ms timeout** を渡し、
+    wgpu-hal は `WAIT_TIMEOUT` を `Ok(false)` にして先へ進む。スタック 1 枚では
+    「デッドロック」と「1 秒待ちを繰り返す飢餓」を区別できない。**wait の `dwMilliseconds` が
+    `0x3e8` か `0xffffffff` かを読み、1.2 秒以上あけて複数回 break する**。
+  - 停止直前に main が実際に受けた `msg` (どの同期メッセージが再入描画を起こしたか)。
+    スタックにある `in_window_resize_subclass_proc` は全メッセージを通る常設 subclass なので、
+    **resize が起きた証拠にはならない**。
+  - `old_owner != new_owner` / anchor handoff / presenter retirement が実際に発生したかのログ。
+- 再投入の条件: **同一 release profile** で 4 分割 A/B を通すこと。
+  (a) Stage 4 baseline / (b) cursor のみ / (c) owner のみ / (d) Stage 5 全体。
+  今回の A/B は `dev-runtime` 対 `release` で、出荷判断には十分だが**原因帰属としては profile 差が
+  残る**。(b) が VST 開閉 soak を通ることを出荷条件にする。
+- 診断用の回避策 (`MIV_WGPU_FRAME_LATENCY=2`、`WGPU_DX12_USE_FRAME_LATENCY_WAITABLE_OBJECT=DontWait`)
+  は**出荷修正にしない**。症状が消えても wndproc 内 GPU wait と Win32 同期依存は残る。
+- VST 側の長期案: editor を transient な presenter HWND へ付け替えるのではなく、**editor lifetime
+  全体で安定した専用 owner proxy** を使い、topmost / focus / visibility を別の ordered transaction
+  として扱う。owner request の dedupe と一括適用も要る。
+- 規模 / 優先度: Large / **P2**。カーソル (§1.28) の修正はこれが片付くまで入らない。
 
-`d3545b0c` で hidden presenter は pacing queue と decoder channel を drain し、最新 1 枚を
-`Hidden { frame }` に保持するようになった。したがって hidden のままならパイプラインは
-健全に回り、EOF も通常どおり流れる。復帰は「音声モード → 動画表示へ戻す」と同じ経路に
-なり、その仕組みは既にある (placement 切替も `primed=true` で presenter を作り直せている)。
+### 1.31 wndproc の内側で GPU 待ちのある描画をする構造
 
-確認が要る点:
+- 出典: §1.30 の解析 (2026-08-01、Codex Sol の独立レビュー)。**v2.9.1 の範囲外**。
+- 何が問題か: winit は `WM_PAINT` 内で `RedrawRequested` を**同期 dispatch** し、eframe はそこで
+  `run_ui_and_paint` を直接呼ぶ。さらに Windows の resize では flicker 防止のため意図的に同期 paint
+  する。結果として **wndproc の内側で swapchain acquire と Present を行う**。Microsoft も
+  `Present` が message-pump thread を待ち得ると明記している。
+  main surface は `AutoVsync` / maximum frame latency **1** なので、前フレームが retire しない限り
+  次の acquire が待たされる。
+- 効果: 窓の owner / z-order / visibility を動かす操作、DWM 合成の切替 (Independent Flip / MPO)、
+  device-loss 周辺のいずれかが絡むと、**同期メッセージ 1 通で UI が任意時間停止し得る**。
+  §1.27 が「presenter スレッドが窓を持ったままブロックする」だったのに対し、こちらは
+  「UI スレッドが自分の窓のメッセージ処理中に GPU で止まる」。**同じ上位の破綻の別の面**。
+- 方向 (Codex 案):
+  - wndproc は damage / resize / redraw 要求を記録して**即 return** する。
+  - 実描画は外側の event-loop 境界へ post して coalesce する。
+  - `Idle / Painting / Pending` の単一 typed render state を置き、**再入 acquire を禁止**する。
+  - surface acquire は短時間・nonblocking にし、間に合わなければその frame を捨てる。
+  - msg / paint depth / wait handle / timeout / Present 前後 / cloak / visibility を 1 つの trace に残す。
+  - 同期 `SendMessage` 中に presentation availability を故意に止め、**wndproc が有限時間で返る**
+    Windows 回帰テストを追加する。
+  - 必要なら eframe / winit / wgpu を vendor patch し、upstream へ最小再現を出す。
+- 併せて直す観測の穴: 今回 `ui-heartbeat-watchdog` は生きていたのに `panic.log` へ何も書かれ
+  なかった。**active native fullscreen 中は main HWND が隠れていても watchdog を suspend しない**
+  ようにする (危険な操作の最中こそ黙る、という現状は逆)。
+- 規模 / 優先度: Large / **P1 candidate (基盤)**。次版で Web 配信とコンテナ詰め替えを載せる前に
+  方針を決めておく。
 
-- 親 (detached host / メイン窓) を `SW_HIDE` した状態で、子の presenter 窓を生かしたまま
-  にできるか。`native window visibility cancelled` を出している箇所が、意図的な資源節約
-  なのか副作用なのかを先に特定する
-- 格納中の GPU / VRAM 保持コストが許容できるか (§1.9 の parked 窓の資源制御と関係する)
-- 復帰時に音声クロックへ映像を同期し直す必要があるか
+### 1.32 IME 変換中の ESC が期待どおりに働かない 2 件
 
-#### 注意
+- 出典: v2.9.1 リリース前の実機確認 (2026-08-01)。**どちらも v2.9.0 から同じ挙動**で、v2.9.1 の
+  退行ではない。`829ba729` で入れた IME helper は単一行欄を揃えたもので、下記 2 件は範囲外だった。
+- **(A) 複数行の注釈本文で、変換中 ESC を押すとテキストエリアの focus まで外れる**。
+  ブックマーク名などの単一行欄では focus が残るので挙動が非対称。
+  - 原因: 吹き出し本文 ([ui_text.rs](../src/ui_text.rs) の `TextEdit::multiline(&mut t.text)`) は
+    [ime_focus.rs](../src/ime_focus.rs) の raw TextEdit allowlist に「Enter 改行と caret 操作を
+    所有する注釈本文の複数行 editor」として**意図的に登録**されており、helper の focus 復帰
+    (IME キー由来の一時的な focus loss を戻す処理) が効かない。
+  - 直し方: helper に複数行版を用意する。exemption の理由どおり **helper の Enter/submit 意味論が
+    複数行と噛み合わない**ので、focus 復帰だけを切り出せる形にする必要がある。
+- **(B) 変換中 ESC を押しても未確定文字がテキストに残る** (「あああ」+ ESC で「あああ」が残る)。
+  期待は未確定分が消えること。
+  - 原因: egui の `TextEdit` は preedit を**バッファへ直接書き込み**、消去は空の `Preedit("")` を
+    受け取ったときだけ行う (egui 0.33.3 `widgets/text_edit/builder.rs` の
+    「Empty prediction can be produced when user press backspace or escape during IME, so we clear
+    current text」というコメントがその前提を明示)。`ImeEvent::Disabled` のハンドラは
+    `ime_enabled = false` にするだけで**テキストを消さない**。この環境の ESC では
+    `Preedit("")` が来ず `Disabled` だけが届くため残る。
+  - 直し方: `ime_focus` は既に viewport ごとに composition 状態を持っているので、
+    **composing 中に `Commit` を伴わない `Disabled` を観測したら、その直前に空の `Preedit("")` を
+    挿入する**。egui が本来想定している経路に戻すだけで、症状パッチではない。
+  - ⚠️ **注意**: `Preedit("")` は `delete_selected()` を呼ぶので、composition が無いときに撃つと
+    **ユーザーの選択範囲を消す**。自前の composing 判定で厳密にゲートし、unit test で固定すること
+    (`ime_focus.rs` に合成 Ime イベントを流すテストの前例がある)。
+- **§1.22 と一緒に設計すること**。3 件とも「IME と入力所有権」という同じ領域で、§1.22 を直すときに
+  viewport ごとの IME 状態と focus の扱いを触る。バラバラに直すより一括のほうが筋が良い、と
+  2026-08-01 に判断してこの版では見送った。
+- 規模 / 優先度: (A) Medium / (B) Small / どちらも P2。データ喪失はなく、利用者は手で消せる。
 
-- **実機確認が必須の領域**。通常フルスクリーン / in-window / F12 別窓 / 複数ウィンドウ /
-  音声モードの組み合わせで確認する。2026-07-30 はこの領域で 3 回続けて原因を外している
-  (推測で 1 経路ずつ塞ぐと当たらない。**close へ至る道を先に列挙**すること)
-- 出荷済みの「格納時に一時停止」を変えることになるので、挙動変更としてユーザー判断を取る
-- 規模 / 優先度: Medium / P2 candidate。
+### 1.33 本として扱わないフォルダでも既定の見開き設定が適用される
 
-### 1.29 F12 別ウィンドウがトレイ復帰で戻ってこない
-
-- 出典: 2026-07-30 のユーザー実機検証 (v2.9.0 出荷判定時)。**致命的ではないと判断して
-  v2.9.0 はこのまま出荷**、次版以降で直す、というユーザー合意。
-- 症状: F12 で動画を別ウィンドウへ切り離した状態でメインウィンドウをトレイへ格納し、
-  再表示すると **メインウィンドウは戻るが別ウィンドウは出てこない**。
-  メインウィンドウで再生している (切り離していない) 場合は正常に戻る。
-- §1.28 の「格納時に一時停止」(`2ee2807f`) はメイン窓側の presenter を対象にした変更で、
-  detached 側の窓そのものを復元する経路は別にある。**§1.28 とは別の欠陥として扱う**
-  (向こうは「再生が続くか」、こちらは「窓が戻るか」)。
-- 着手時の確認事項:
-  - 格納時に detached セッションがどの終端経路を通ったか。`d2d17a0c` で
-    `finish_active_detached_session_close` が runtime 撤去まで所有するようになったので、
-    「セッションは閉じたが窓を作り直す側が居ない」のか「窓は残っているが `SW_HIDE` から
-    戻していない」のかをまず切り分ける
-  - 復帰時に復元されるのは何か。画像の複数ウィンドウは復元されるので、その復元経路と
-    動画 detached の差分を並べる
-- **CLAUDE.md の detached 凍結ルール対象**。症状パッチ (復帰後に窓を作り直す retry 等) を
-  入れず、[detached-rework-plan.md](detached-rework-plan.md) §2 の BA 番号へ対応付けてから
-  着手する。
-- 規模 / 優先度: Small〜Medium / P2 candidate。
+- 出典: v2.9.1 リリース前の実機確認 (2026-08-01)。**v2.9.0 から同じ挙動**で、v2.9.1 の退行ではない。
+- 症状: 「画像のみのフォルダを本として扱う」が**オフ**のとき、および**オンでも画像以外の
+  ファイルがあるフォルダ**で、画像を開くと既定の見開き設定が適用されてしまう。
+  本として扱わないフォルダで見開きになるのは意図した動作ではない。
+- 使うべき述語は既にある: [app.rs](../src/app.rs) の `page_order_locked_for_current_view()` が
+  上記 2 条件をそのまま覆う (`auto_fullscreen_image_folders_enabled()` と
+  `items.iter().all(GridItem::Image)` の両方を見る)。
+- **⚠️ 素直にゲートすると本が壊れる**: 見開き設定の復元は `apply_spread_for_key` 経由で
+  **`start_loading_items` の中、items を読み込む前**に走る。その時点で `self.items` は空なので
+  述語の `!self.items.is_empty()` に引っかかって **false を返し、本物の本 (画像のみフォルダ)
+  でも見開きが効かなくなる**。直そうとしたバグより悪い結果になる。
+- 直し方 (どちらか):
+  1. **フォルダ走査から本判定を引き継ぐ**。`folder_scan` は既に `is_image_only_book_contents` を
+     計算しているので、その結果を spread 復元まで渡す。
+  2. **items 読み込み完了後に見開きを再適用する**。復元のタイミング自体を動かす。
+  どちらも読み込みシーケンスの構造変更になる。1 のほうが判定の出どころが 1 つで済む。
+- **未決の仕様判断**: 非本フォルダに**明示的に保存された**見開き設定は尊重するか。既定値の
+  フォールバックだけを止めるのか、保存値も無視するのか。着手前に決めること。
+- 完了条件 / 回帰テスト:
+  - 本として扱うフォルダ (設定オン + 画像のみ)、ZIP / PDF / 変換アーカイブ、製本した本では
+    従来どおり見開きが効く。
+  - 設定オフのフォルダ、画像以外を含むフォルダでは既定の見開きが適用されない。
+  - `start_loading_items` の時点で判定が確定していること (items 未読込に依存しない) を
+    状態遷移テストで固定する。
+- 規模 / 優先度: Medium / P2。v2.9.1 では見送り (読み込み経路の構造変更になるため)。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
@@ -288,18 +446,37 @@
     この仕組みに含めない。
 - 実装案:
   1. セルの `inner` と表示対象を受け、`TopLeft` / `TopRight` / `BottomLeft` /
-     `BottomRight` の各レーンに実測済み `BadgePlacement` (矩形、galley、優先度) を返す
+     `BottomRight` の各レーンに実測済み `BadgePlacement` (矩形、文字 / style、優先度) を返す
      `ThumbnailOverlayLayout` 相当の純粋なレイアウト層を設ける。
-  2. 第1段階は左上を移行し、ブックマーク時刻 → 編集状態 / pin → タグの順に幅を予約する。
+  2. **v2.9.1 完了**: 第1段階は左上を移行し、ブックマーク時刻 → 編集状態 / pin → タグの順に幅を予約する。
      `UP` も同じレーンへ入れ、残り幅が不足する場合だけタグを実測で省略または非表示にする。
      描画と hover / click 判定は同じ `BadgePlacement` の矩形を使い、再計算をなくす。
-  3. 第2段階は左下を移行し、フォルダ名 / ZIP / PDF / 変換アーカイブ、評価、ファイル名
+  3. **v2.9.1 完了**: 第2段階は左下を移行し、フォルダ名 / ZIP / PDF / 変換アーカイブ、評価、ファイル名
      プレートの予約幅・縦積みを同じレイアウト結果から決める。フォルダ名バッジは形式
      バッジと機械的に同じ 70% へ揃えず、長い名前の可読性を残したコンパクトな専用
      スタイルをスナップショット比較で決める。
-  4. 第3段階で右上 / 右下も同じ所有境界へ移し、チェックとスタック枚数の排他条件、
+  4. **未着手**: 第3段階で右上 / 右下も同じ所有境界へ移し、チェックとスタック枚数の排他条件、
      絞り込み件数の配置を明示する。各段階を独立コミット可能にし、全経路を一度に
      書き換えない。
+- v2.9.1 実装記録 (2026-07-31):
+  - `src/thumb_overlay_layout.rs` に painter 非依存の純粋レイアウトを新設。セルごとに 1 回だけ
+    構築した左上 / 左下の配置結果を、通常描画、タグ hit-test、`UP`、ブックマーク時刻へ渡す。
+  - 左下は形式 / フォルダ名とファイル名プレートの実測矩形を下段へ置き、その行の上へ評価を
+    4px gap で積む。旧 `lower_left_container_badge_height` の高さ推定は撤去した。
+  - フォルダ名は旧フォントの 85%、8.5pt 下限・13.5pt 上限、横 padding 0.30em・縦
+    padding 0.12em の専用 style とした。長い CJK 名の可読性を残しつつ、70% 形式バッジとの
+    面積差を抑える値を snapshot で確認した。
+  - 純関数 unit test 5 件と、フォルダ / ZIP / PDF / RAR、ブックマーク時刻 + タグの snapshot を
+    追加・更新して目視確認済み。第3段階の右上 / 右下は未着手のまま残す。
+  - 左下の item 種別 → コンテナバッジ / ファイル名プレートの対応は `bottom_left_content`
+    として painter 非依存に切り出した。旧 `cell_has_lower_left_container_badge` の
+    unit test 4 件 (フォルダは Loaded まではファイル名、アーカイブは常に形式バッジ) を
+    同じ規則の検証として移設してある。ここは「フォルダ名と ★ が重なる」報告の退行ガード。
+- **第3段階と一緒に片付ける残件 (v2.9.1 では未対応)**: 左上レーンは cursor を右へ送るだけで、
+  **セル幅でクランプしていない**。時刻 + `UP` + 編集バッジ 6 個が同時に立つ狭いセルでは
+  レーンが右へはみ出す (タグだけは実測で省略される)。第2段階以前からある挙動だが、
+  時刻を同じレーンへ入れたぶん到達しやすくなった。直すには「溢れたときどのバッジを落とすか」の
+  方針が要るので、右上 / 右下を同じ所有境界へ移す第3段階と合わせて決める。
 - 完了条件 / 回帰テスト:
   - ブックマーク時刻と `#` から始まるタグが重ならず、表示矩形とクリック矩形が一致する。
   - `UP` + 編集状態 / pin + タグ、狭いセル、長い CJK タグでもバッジ同士が重ならない。
@@ -333,47 +510,6 @@
 - 方針: 具体的な再現手順が出るまではコード修正しない。再報告時は、変更したパラメータが色調補正 /
   AI ON/OFF / デノイズ / post-filter / スマートシャープのどれかを最初に切り分ける。
 - 優先度: P3 monitor / 再現待ち。
-
-### 3.3 final-effect worker 待ちの間、色調補正とシャープを毎フレーム作り直している
-
-- 背景: `ensure_final_composite_texture` は、AI 到着後の再合成待ちの間だけ早期 return 条件
-  (`entry.complete || (ai_ready.is_none() && !ai_failed)`) を外れる。その間は毎フレーム
-  `apply_adjustments_fast` と `apply_final_smart_sharpen` を UI スレッドで走らせ直している。
-  結果は捨てられ、実際に使うのは worker の出力。
-- 影響: 色調補正なし・シャープ 0 の既定では `Arc::clone` だけなのでほぼ無害。色調補正か
-  スマートシャープを使っているユーザーは、AI 切り替え待ちの数秒間フルサイズの CPU パスを
-  毎フレーム払う。大判ページほど重い。
-- 方針: 同一 key の final-effect job が既に pending なら、CPU パスへ入る前に既存 texture を
-  返して抜ける。2026-07-29 の「AI 切替時の黒フレーム」修正で incomplete entry を保持する
-  ようになったため、返すべき texture が常に手元にある。
-- 優先度: P2 (体感ヒッチだが既定設定では出ない)。perf-log で
-  `fs` / `final_composite_build` の連続発火として観測できるはず。
-
-### 3.4 カラー化待ちの間、画面が「止まっている」ようにしか見えない
-
-- 出典: 2026-07-30 のユーザー実機検証 (v2.9.0 出荷判定時)。**この版はこのまま出荷**、
-  次版の頭で入れる合意。
-- 症状: カラー化 ON でホイールを数ページ送ると、合成が終わるまで前のページが出たままで、
-  何も起きていないように見える。しばらくしてカラー化済みのページが現れる。
-- **待つこと自体は仕様**。白黒とカラーの切り替わりを見せないのは確定要件なので、
-  暫定表示で埋める方向の解決はしない。足りないのは「作業中である」という手掛かりだけ。
-- 退行ではない: 待ちの構造は v2.8.0 のカラー化出荷時から同じで、v2.9.0 は
-  §1 の VRAM 予算一本化 (`32494ef6`) で先読み成功率を 11% → 64% へ上げており、
-  待ち時間はむしろ短くなっている。
-- 実装の当て所は既にある。**新しいフラグを足す必要はない**:
-  - トリガ = `App::fs_holdover_tex` が `FsHoldover::ColorizeDisplayUnit(_)`
-    ([src/app.rs](../src/app.rs) の `enum FsHoldover`)。これが立っている間が厳密に
-    「カラー化待ちで前の表示ユニットを保持している」状態
-  - 描画 = `draw_stamp_embed_overlay` ([src/ui_fullscreen.rs](../src/ui_fullscreen.rs)) と
-    同じ中央の暗いラウンド矩形 + テキストで足りる
-- 決める必要があるのは 2 点。どちらも実機で回さないと決まらない:
-  - **表示までの遅延**。即時に出すとページ送りのたびにチラついて逆効果になる。
-    300〜500ms 程度から始めて実機で詰める
-  - **連結読みの扱い**。連結読みはこの holdover 経路を通らないので、同じ手掛かりを
-    どこに出すかは別途決める。見開きは holdover が表示ユニット単位なのでそのまま乗る
-- 関連: [final-composite-budget-thrash-plan.md](final-composite-budget-thrash-plan.md)
-  (待ち時間そのものを縮める側の作業)。
-- 規模 / 優先度: Small / P2 candidate (体感の問題だが、動いていないと誤解させる)。
 
 ## 4. 入力カスタマイズ / マウス / ゲームパッド
 
@@ -426,16 +562,17 @@
   リリース処理の完了後、同じコミットを競合プロセスなしで再実行すると正式ゲートは
   `[test-full] PASS` で完走したため、製品テストの並列不具合ではなくリリースツール間の
   干渉と判定。v2.8.0 の出荷は止めず、次版でツールを堅牢化する。
-- **P2: `build-release.ps1` の停止対象が広すぎる**:
-  - 現状はリポジトリ配下のプロセス名 `mimageviewer*` を列挙して
-    `Stop-Process -Force` する。Cargo のテストハーネスも
-    `target\debug\deps\mimageviewer-<hash>.exe` なので、別セッションのテストまで
-    強制終了し得る。
-  - 対応案 = 停止対象を launcher / core / helper の正確な実行ファイル名と想定配置へ
-    allowlist 化する。必要なら test / release の同時実行を検知するリポジトリ単位の
-    mutex またはロックも追加し、黙って相手を終了せず明示的に待機または失敗させる。
-  - 完了条件 = 実行中のダミー `mimageviewer-<hash>.exe` を停止せず、repo の launcher /
-    core と APPDATA に展開された対象 helper だけを従来どおり停止できること。
+- **P2: `build-release.ps1` の停止対象が広すぎる (v2.9.1 対応済み)**:
+  - 原因はプロセス名の前方一致 `mimageviewer*`。Cargo のテストハーネスは
+    `target\debug\deps\mimageviewer-<hash>.exe` で、**リポジトリ配下にあるため path 判定も
+    通過**し、別セッションの `cargo test` ごと `Stop-Process -Force` していた。
+  - 停止対象を `mimageviewer` / `mimageviewer-core` / `mimageviewer-vst3-host` /
+    `mimageviewer-susie32` の完全名 allowlist に変更した。`build-portable.ps1` も同じ
+    欠陥を持っていたので揃えた (`build-dev.ps1` は元から完全名指定で影響なし)。
+  - path を読めないプロセス (昇格 / 保護) は従来どおり停止するが、allowlist を通った
+    ものだけになったのでテストハーネスは対象外。
+  - リポジトリ単位の test / release 相互排他ロックは**入れていない**。名前の取り違えが
+    原因だったので、まず allowlist だけで様子を見る。再発したらロックを検討する。
 - **P2: クリーン環境の正式テストゲートが release core に依存する**:
   - `scripts/test-full.ps1` の workspace test には launcher が含まれるが、launcher の
     build script は既存の `target\release\mimageviewer-core.exe` を要求する。このため
@@ -448,33 +585,39 @@
 - 規模 / 優先度: Small〜Medium / P2。いずれも製品 runtime の品質問題ではなく、
   同一 worktree で複数セッションを使うリリース運用とクリーン再現性の改善。
 
-### 5.4 idle health の video-pin シナリオが手順どおりでも成立しない
+### 5.4 idle health の video-pin evidence 窓が狭い
 
-- 出典: v2.9.0 リリース前確認 (2026-07-30)。`static-foreground` / `static-background` は
-  PASS したが、`video-pin-background` は 3 回続けて
-  「動画ピン由来の `thumb.idle_upgrade_ineligible` が準備・測定区間に無く、シナリオ成立を
-  確認できません」で FAIL。**製品側の異常ではないと判断してリリースした**。
-- 判断の根拠 (次に見るときのために残す):
-  - 3 回とも測定区間は「完全 sleep・perf event 0 件・CPU one-core ratio 0.004〜0.006」。
-    このシナリオが探している「静止中に 1 コアを使い続けるループ」は起きていない
-  - 同じセッションの perf ログには `idle_upgrade_ineligible` が **2 件実在**した
-    (最後は t=531.7)。失敗した測定窓 (t=330..345 / t=406..421) の外で発生している
-  - 同セッションの `idle_upgrade_enqueue` は 52 件。大半のタイルは upgrade 対象で、
-    `ineligible` になるのは稀 = ゲートは出にくい方のイベントを必須にしている
-- 疑わしい点 (未確認、着手時に切り分ける):
-  - アイドル高画質化のパスが走るまでの遅延と、evidence 窓 (Enter 前の準備開始〜測定終了) が
-    噛み合っていない。準備中に開き直しても、判定が下りるのが窓の後になる可能性
-  - `ineligible` は「完成済み派生キャッシュがある」ときにしか出ない。ピンを作った直後は
-    その場で生成された新しいサムネイルなので `from_cache` が立たず、そもそも候補にならない
-    ことがある。キャッシュから読み直される状態 (再起動後など) を要求する必要があるかも
-  - ゲートのメッセージが「動画ピン由来の」と言い切るのに、実際の判定は cat/kind だけで
-    ピン由来かを見ていない ([analyze_perf.py](../scripts/analyze_perf.py) の
-    `require_idle_upgrade_ineligible`)。成立条件と検査条件がずれている
-- 直す方向: セットアップ成立の判定を、出にくい 1 イベントの有無ではなく「対象 key の
-  タイルが keep 範囲に入ったこと」で取る。あわせて手順書 ([idle-health-check.md](idle-health-check.md))
-  に、ピン作成直後では成立しない条件を書く。
-- 規模 / 優先度: Small / P2。検査ハーネスの問題で製品挙動ではないが、毎リリース必須の
-  チェックが「必ず落ちる」状態だと、本物の退行を見落とす。
+- 出典: v2.9.1 リリース前確認 (2026-08-01)。`-TargetKey` 方式に変えた直後の実測で FAIL。
+  原因は**ゲートの窓**で、製品側でもセットアップ手順の誤りでもない。
+- 何が起きたか: 対象キーのサムネイル処理は **t≈177-182 に 519 件**あり、そのままアプリが
+  就寝して測定区間へ入った。ところが evidence 窓は「Enter プロンプト表示〜測定終了」
+  (t≈199.7-219.8) なので、**20 秒前に完了していた keep 範囲入りが窓の外**になり
+  `matched=0` で FAIL した。`-NoLaunch` で 3 シナリオを連続実行すると必ずこうなる。
+- ずれている前提: ゲートは「evidence 窓の**中で** keep 範囲へ入ったこと」を要求するが、
+  シナリオが必要とするのは「測定中にタイルが keep 範囲に**ある**こと」。先に入って
+  居残っているタイルも等しく正しいセットアップ。
+- 直す方向 (どちらか):
+  1. 窓をセッション全体へ広げ、**最後の `nav.load_folder_begin` より後**に対象キーの
+     work があることを条件にする (= 今表示している場所のタイルだと言える)。
+  2. 窓は現状のまま、「セッション内に対象キーの work はあるが evidence 窓の外」を
+     FAIL ではなく warning にし、手順書で「連続実行時は開き直す」を明示する。
+- 1 のほうが構造的 (操作者の手順に依存しない)。着手時は
+  [idle-health-check.md](idle-health-check.md) の §3 も揃えること。
+- 規模 / 優先度: Small / P2。**毎リリース必須のチェックが手順どおりでも落ちる**状態なので、
+  次版で片付ける。
+- v2.9.1 の waiver 根拠 (2026-08-01 更新)。`static-foreground` / `static-background` の PASS に加え、
+  この版の変更が `video-pin-background` が見ている経路 (アイドル高画質化 / 動画ピンのタイル保持)
+  に触れていないこと。対象の変更は次のとおり:
+  - バッジレイアウト、rename 移行、ネイティブ名前ダイアログ
+  - **トレイ常駐中の再生継続** — hidden 中の `App::update` を 50ms で起こす経路を新設した。
+    アイドル高画質化とは別の wake 源だが、**静止時の消費は未実測**。次版で
+    `tray-resident` シナリオを足すこと (今回は前 2 シナリオが常駐なしの静止を見ている)。
+  - **スマートフォルダ セッション** — parked grid が keep 範囲分のサムネイルを保持する。
+  - **見開きの表示可否判定 (`FsPageLoadState`)** — 再入ループを止めた側なので、アイドル時の
+    work はむしろ減る。§1.29 参照。
+  - **入力所有権 (raw key permit / IME の viewport 分離)** と **native window health** —
+    後者は native video window が生きている間だけ 1 秒に 1 回 pump へ ping を送る。
+    無再生時は送らないが、**動画を開いたまま放置したときのアイドル影響は未実測**。
 
 ---
 

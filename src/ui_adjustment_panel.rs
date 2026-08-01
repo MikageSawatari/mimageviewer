@@ -9003,7 +9003,7 @@ mod creative_lut_ui_tests {
     }
 }
 
-fn book_bookmark_title_edit_widget_id(bookmark_id: i64) -> egui::Id {
+pub(crate) fn book_bookmark_title_edit_widget_id(bookmark_id: i64) -> egui::Id {
     egui::Id::new("book_bookmark_title_edit").with(bookmark_id)
 }
 
@@ -9013,39 +9013,26 @@ fn draw_bookmark_title_edit(
     title: &mut String,
     request_focus: &mut bool,
     enter_pressed: bool,
-    ime_active: bool,
 ) -> (egui::Response, bool) {
-    let response = ui.add(
-        egui::TextEdit::singleline(title)
-            .id(book_bookmark_title_edit_widget_id(bookmark_id))
-            .desired_width(ui.available_width())
+    let available_width = ui.available_width();
+    let response = crate::ime_focus::add_singleline(ui, title, Some(request_focus), |edit| {
+        edit.id(book_bookmark_title_edit_widget_id(bookmark_id))
+            .desired_width(available_width)
             .hint_text("未設定")
-            .return_key(None::<egui::KeyboardShortcut>),
-    );
-    let restore_focus_for_ime_key = ime_active
-        && response.lost_focus()
-        && ui.input(|input| {
-            input.events.iter().any(|event| {
-                matches!(
-                    event,
-                    egui::Event::Key {
-                        key: egui::Key::Enter | egui::Key::Escape,
-                        pressed: true,
-                        ..
-                    }
-                )
-            })
-        });
-    if *request_focus {
-        response.request_focus();
-        *request_focus = false;
-    } else if restore_focus_for_ime_key {
-        response.request_focus();
-        *request_focus = true;
-        ui.ctx().request_repaint();
-    }
+            .return_key(None::<egui::KeyboardShortcut>)
+    });
     let submit = response.has_focus() && enter_pressed;
     (response, submit)
+}
+
+#[cfg(test)]
+pub(crate) fn draw_bookmark_title_edit_for_test(
+    ui: &mut egui::Ui,
+    bookmark_id: i64,
+    title: &mut String,
+    request_focus: &mut bool,
+) -> (egui::Response, bool) {
+    draw_bookmark_title_edit(ui, bookmark_id, title, request_focus, false)
 }
 
 fn bookmark_row_should_jump(
@@ -9074,12 +9061,16 @@ mod bookmark_title_edit_tests {
     use super::draw_bookmark_title_edit;
 
     fn key_event(key: egui::Key) -> egui::Event {
+        key_event_with_modifiers(key, egui::Modifiers::NONE)
+    }
+
+    fn key_event_with_modifiers(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
         egui::Event::Key {
             key,
             physical_key: None,
             pressed: true,
             repeat: false,
-            modifiers: egui::Modifiers::NONE,
+            modifiers,
         }
     }
 
@@ -9088,12 +9079,11 @@ mod bookmark_title_edit_tests {
         title: &mut String,
         request_focus: &mut bool,
         enter_pressed: bool,
-        ime_active: bool,
     ) -> (egui::Id, bool) {
         let mut output = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             let (response, submit) =
-                draw_bookmark_title_edit(ui, 42, title, request_focus, enter_pressed, ime_active);
+                draw_bookmark_title_edit(ui, 42, title, request_focus, enter_pressed);
             output = Some((response.id, submit));
         });
         output.expect("bookmark title editor response")
@@ -9117,12 +9107,12 @@ mod bookmark_title_edit_tests {
         let mut title = String::new();
         let mut request_focus = true;
         let _ = ctx.run(Default::default(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false, false);
+            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
         });
 
         let mut editor_id = None;
         let _ = ctx.run(ime_commit_and_enter_input(), |ctx| {
-            editor_id = Some(draw_editor(ctx, &mut title, &mut request_focus, false, true).0);
+            editor_id = Some(draw_editor(ctx, &mut title, &mut request_focus, false).0);
         });
 
         assert_eq!(title, "\u{3042}");
@@ -9135,10 +9125,10 @@ mod bookmark_title_edit_tests {
         let mut title = String::new();
         let mut request_focus = true;
         let _ = ctx.run(Default::default(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false, false);
+            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
         });
         let _ = ctx.run(ime_commit_and_enter_input(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false, true);
+            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
         });
         let _ = ctx.run(
             egui::RawInput {
@@ -9146,7 +9136,7 @@ mod bookmark_title_edit_tests {
                 ..Default::default()
             },
             |ctx| {
-                let _ = draw_editor(ctx, &mut title, &mut request_focus, false, false);
+                let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
             },
         );
 
@@ -9160,7 +9150,7 @@ mod bookmark_title_edit_tests {
         let mut request_focus = true;
         let mut submit_count = 0;
         let _ = ctx.run(Default::default(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false, false);
+            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
         });
         let _ = ctx.run(
             egui::RawInput {
@@ -9168,18 +9158,69 @@ mod bookmark_title_edit_tests {
                 ..Default::default()
             },
             |ctx| {
-                if draw_editor(ctx, &mut title, &mut request_focus, true, false).1 {
+                if draw_editor(ctx, &mut title, &mut request_focus, true).1 {
                     submit_count += 1;
                 }
             },
         );
         let _ = ctx.run(Default::default(), |ctx| {
-            if draw_editor(ctx, &mut title, &mut request_focus, false, false).1 {
+            if draw_editor(ctx, &mut title, &mut request_focus, false).1 {
                 submit_count += 1;
             }
         });
 
         assert_eq!(submit_count, 1);
+    }
+
+    #[test]
+    fn clearing_title_keeps_the_same_widget_and_focus_before_plain_text() {
+        let ctx = egui::Context::default();
+        let mut title = String::from("bookmark");
+        let mut request_focus = true;
+        let mut ids = Vec::new();
+        let _ = ctx.run(Default::default(), |ctx| {
+            ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+        });
+
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                events: vec![key_event_with_modifiers(
+                    egui::Key::A,
+                    egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                )],
+                ..Default::default()
+            },
+            |ctx| {
+                ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+            },
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key_event(egui::Key::Backspace)],
+                ..Default::default()
+            },
+            |ctx| {
+                ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+            },
+        );
+
+        assert!(title.is_empty());
+        assert_eq!(ctx.memory(|memory| memory.focused()), ids.last().copied());
+
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key_event(egui::Key::A), egui::Event::Text("a".to_owned())],
+                ..Default::default()
+            },
+            |ctx| {
+                ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+            },
+        );
+
+        assert_eq!(title, "a");
+        assert!(ids.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(ctx.memory(|memory| memory.focused()), ids.last().copied());
     }
 
     fn editor_id_for_row_order(order: &[i64], target: i64) -> egui::Id {
@@ -9197,7 +9238,6 @@ mod bookmark_title_edit_tests {
                                 *row_id,
                                 &mut title,
                                 &mut request_focus,
-                                false,
                                 false,
                             )
                             .0
@@ -12402,11 +12442,12 @@ impl App {
                 .show(ctx, |ui| {
                     crate::os_theme::apply_dark_ui(ui);
                     ui.horizontal(|ui| {
-                        ui.add_sized(
+                        crate::ime_focus::add_sized_singleline(
+                            ui,
                             egui::vec2((ui.available_width() - 32.0).max(120.0), 24.0),
-                            egui::TextEdit::singleline(effect_query)
-                                .hint_text("効果名で検索")
-                                .desired_width(f32::INFINITY),
+                            effect_query,
+                            None,
+                            |edit| edit.hint_text("効果名で検索").desired_width(f32::INFINITY),
                         );
                         if ui
                             .add_enabled(!effect_query.is_empty(), egui::Button::new("×"))
@@ -13009,7 +13050,6 @@ impl App {
         }
 
         let enter_pressed = self.dialog_enter_pressed(ctx);
-        let ime_active = self.ime_input_active();
         let mut remove_id = None;
         let mut jump_to = None;
         let mut title_edit = self.book_bookmark_title_edit.take();
@@ -13084,7 +13124,6 @@ impl App {
                                         &mut edit.title,
                                         &mut edit.request_focus,
                                         enter_pressed,
-                                        ime_active,
                                     );
                                     if submit_title {
                                         save_title = Some((bookmark.id, edit.title.clone()));
@@ -13479,6 +13518,10 @@ impl App {
             child.ctx().request_repaint();
         }
         if close_clicked {
+            crate::ime_focus::record_side_panel_close(
+                child.ctx(),
+                "ui_adjustment_panel::draw_adjustment_panel:close_button",
+            );
             self.persist_pending_view_trim_state();
             self.adjustment_mode = false;
             child.ctx().request_repaint();
@@ -13638,30 +13681,54 @@ impl App {
             // と整合させるためにも必要)。`enter_*_mode` 自身が必要なキャッシュ初期化と
             // post_filter バイパスを行うので、ここでは flag を倒すだけで十分。
             if activate_local_adjust {
+                crate::ime_focus::record_side_panel_close(
+                    child.ctx(),
+                    "ui_adjustment_panel::draw_adjustment_panel:enter_local_adjust",
+                );
                 self.enter_local_adjust_mode();
                 return;
             }
             if activate_erase {
+                crate::ime_focus::record_side_panel_close(
+                    child.ctx(),
+                    "ui_adjustment_panel::draw_adjustment_panel:enter_erase",
+                );
                 self.adjustment_mode = false;
                 self.enter_erase_mode(fs_root_idx);
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
             if activate_conceal {
+                crate::ime_focus::record_side_panel_close(
+                    child.ctx(),
+                    "ui_adjustment_panel::draw_adjustment_panel:enter_conceal",
+                );
                 self.adjustment_mode = false;
                 self.enter_conceal_mode(fs_root_idx);
                 return;
             }
             if activate_crop {
+                crate::ime_focus::record_side_panel_close(
+                    child.ctx(),
+                    "ui_adjustment_panel::draw_adjustment_panel:enter_crop",
+                );
                 self.adjustment_mode = false;
                 self.enter_export_crop_mode(fs_root_idx);
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
             if activate_text {
+                crate::ime_focus::record_side_panel_close(
+                    child.ctx(),
+                    "ui_adjustment_panel::draw_adjustment_panel:enter_text",
+                );
                 self.adjustment_mode = false;
                 self.enter_text_mode(fs_root_idx);
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
             if activate_export {
+                crate::ime_focus::record_side_panel_close(
+                    child.ctx(),
+                    "ui_adjustment_panel::draw_adjustment_panel:open_export",
+                );
                 self.adjustment_mode = false;
                 let ctx = child.ctx().clone();
                 self.open_export_dialog_for_current(&ctx, fs_idx);
@@ -14299,11 +14366,10 @@ impl App {
                 let key_label = crate::adjustment::slot_key_label(slot_idx);
                 ui.label(format!("スロット {} に保存する名前を入力:", key_label));
                 ui.add_space(4.0);
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut name_input)
-                        .desired_width(240.0)
-                        .hint_text("例: 漫画モノクロ / スキャン補正"),
-                );
+                let resp = crate::ime_focus::add_singleline(ui, &mut name_input, None, |edit| {
+                    edit.desired_width(240.0)
+                        .hint_text("例: 漫画モノクロ / スキャン補正")
+                });
                 if !resp.has_focus() && !resp.lost_focus() {
                     resp.request_focus();
                 }

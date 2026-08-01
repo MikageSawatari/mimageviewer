@@ -1934,7 +1934,7 @@ impl App {
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
-        let ime_active = self.ime_input_active();
+        let ime_active = self.ime_input_active(ctx);
         let content_rect = ctx.content_rect();
         let safe_rect = content_rect.shrink2(egui::vec2(24.0, 32.0));
         let safe_size = safe_rect.size().max(egui::vec2(360.0, 300.0));

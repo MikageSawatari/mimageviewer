@@ -110,6 +110,16 @@ $appDataProcessNames = @(
     'mimageviewer-vst3-host',
     'mimageviewer-susie32'
 )
+# Executables this build actually produces or locks. Everything else keeps running.
+# A prefix match on "mimageviewer*" also catches Cargo's test harnesses, which are named
+# target\debug\deps\mimageviewer-<hash>.exe and live under the repo root - stopping those
+# killed another session's `cargo test` during the v2.8.0 release (backlog 5.3).
+$stoppableProcessNames = @(
+    'mimageviewer',
+    'mimageviewer-core',
+    'mimageviewer-vst3-host',
+    'mimageviewer-susie32'
+)
 $appDataVst3Bridge = Join-Path -Path $appDataRoot -ChildPath 'vst3\mimageviewer-vst3-host.exe'
 
 function Ensure-VendorVst3BridgeFromCache {
@@ -135,9 +145,10 @@ function Ensure-VendorVst3BridgeFromCache {
     return $true
 }
 
-# Match all "mimageviewer*" prefix processes (Get-Process -Name does not accept
-# wildcards, hence the Where-Object filter).
-$candidates = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'mimageviewer*' })
+# Only the exact executables this build produces. A "mimageviewer*" prefix match would
+# also select Cargo test harnesses (backlog 5.3); an unnamed allowlist is the one thing
+# that keeps a concurrent `cargo test` alive.
+$candidates = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $stoppableProcessNames -contains $_.Name })
 
 $toKill = @()
 foreach ($p in $candidates) {
@@ -146,6 +157,9 @@ foreach ($p in $candidates) {
     $included = $false
     $pathLabel = '(path unknown)'
     if (-not $path) {
+        # Elevated or protected process. The name is already on the allowlist, so this is
+        # one of ours rather than a test harness; stop it, since a build output it holds
+        # open would fail the link with LNK1104 and the location cannot be checked.
         $included = $true
     } else {
         $pathLabel = $path

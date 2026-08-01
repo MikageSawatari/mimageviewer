@@ -43,6 +43,8 @@ pub mod native_presenter;
 #[cfg(windows)]
 pub mod native_window;
 #[cfg(windows)]
+pub(crate) mod native_window_health;
+#[cfg(windows)]
 pub(crate) mod native_window_host;
 #[cfg(windows)]
 mod native_window_pump;
@@ -349,6 +351,11 @@ pub struct NativeVideoOutputConfig {
     pub hud_overlay_enabled: bool,
     pub placement: NativeVideoPlacement,
     pub activate_on_show: bool,
+    /// The presenter starts in the same visibility state as its owning app surface.
+    /// Tray residency can create or reattach an output while the root window is hidden;
+    /// creating that HWND visible would briefly escape the tray lifecycle before the App
+    /// can enqueue a follow-up command.
+    pub initial_visibility: NativeVideoInitialVisibility,
     /// Phase 0 spike: `true` のとき presenter HWND を `owner_hwnd` の子
     /// (`WS_CHILD`) として生成し、owner のクライアント領域に重ねて in-window
     /// 再生する。`false` のとき従来どおりモニタ全面の borderless popup。
@@ -363,6 +370,20 @@ pub struct NativeVideoOutputConfig {
     ///   tick に十分な間隔にして無駄なスピンを避ける。
     /// `false` のとき従来の動画経路と**バイト等価**。
     pub audio_only: bool,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeVideoInitialVisibility {
+    Visible,
+    Hidden,
+}
+
+#[cfg(any(windows, test))]
+impl NativeVideoInitialVisibility {
+    fn is_visible(self) -> bool {
+        matches!(self, Self::Visible)
+    }
 }
 
 #[cfg(windows)]
@@ -804,7 +825,8 @@ enum NativeVideoOutputCommand {
     /// `SetWindowPos` / `SetForegroundWindow` すると DWM / HWND owner 待ちで
     /// 固まるリスクがあるため、command 経由で HWND 所有スレッドに再アサートさせる。
     RaisePresenterToFront,
-    /// Inc 7 hidden presenter (動画→音声モード): presenter ウィンドウと HUD overlay を
+    /// Hidden presenter lifecycle (動画→音声モード / tray residency): presenter
+    /// ウィンドウと HUD overlay を
     /// 表示 / 非表示にする。`visible=false` = presenter ループが「consume-and-hold」モードに
     /// 入り、present() を呼ばず drain + frame selection + present 成功時 bookkeeping だけを
     /// 続けて最新フレームを hold する (音声は無改変 = 無中断)。`visible=true` = hold して
@@ -846,9 +868,9 @@ struct NativePresenterVisibility {
 
 #[cfg(any(windows, test))]
 impl NativePresenterVisibility {
-    fn new_visible() -> Self {
+    fn new(initial_visibility: NativeVideoInitialVisibility) -> Self {
         Self {
-            hidden: Arc::new(AtomicBool::new(false)),
+            hidden: Arc::new(AtomicBool::new(!initial_visibility.is_visible())),
         }
     }
 
@@ -1191,7 +1213,9 @@ impl NativeVideoOutput {
             hud_hwnd: Arc::new(AtomicU64::new(0)),
             first_presented: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
-            presenter_visibility: NativePresenterVisibility::new_visible(),
+            presenter_visibility: NativePresenterVisibility::new(
+                NativeVideoInitialVisibility::Visible,
+            ),
             perf_overlay_visible: Arc::new(AtomicBool::new(false)),
             source_epoch: Arc::new(AtomicU64::new(0)),
             committed_generation: AtomicU64::new(0),
@@ -1227,7 +1251,7 @@ impl NativeVideoOutput {
         let hud_hwnd = Arc::new(AtomicU64::new(0));
         let first_presented = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(AtomicBool::new(false));
-        let presenter_visibility = NativePresenterVisibility::new_visible();
+        let presenter_visibility = NativePresenterVisibility::new(config.initial_visibility);
         let perf_overlay_visible = Arc::new(AtomicBool::new(config.perf_overlay_visible));
         let source_epoch = Arc::new(AtomicU64::new(0));
         let initial_vst3_available = config.vst3_available;
@@ -1235,6 +1259,7 @@ impl NativeVideoOutput {
         let initial_text_contrast_strong =
             matches!(config.text_contrast, crate::settings::TextContrast::Strong);
         let channel_fault = Arc::new(AtomicBool::new(false));
+        let health = native_window_health::NativeWindowHealth::new_registered();
         let (event_tx, event_rx) = native_output_event_bus(512, Arc::clone(&channel_fault));
         let (command_tx, command_rx) = native_command_bus(512, Arc::clone(&channel_fault));
         let init_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -1243,6 +1268,7 @@ impl NativeVideoOutput {
         let thread_perf_overlay_visible = Arc::clone(&perf_overlay_visible);
         let thread_init_error = Arc::clone(&init_error);
         let thread_presenter_visibility = presenter_visibility.clone();
+        let thread_health = Arc::clone(&health);
         let pump = match native_window_pump::spawn_native_window_pump(
             native_window_pump::NativeWindowPumpSpawn {
                 config: config.clone(),
@@ -1255,6 +1281,7 @@ impl NativeVideoOutput {
                 ui_event_tx: event_tx.clone(),
                 init_error: Arc::clone(&init_error),
                 channel_fault: Arc::clone(&channel_fault),
+                health: Arc::clone(&health),
             },
         ) {
             Ok(pump) => pump,
@@ -1289,6 +1316,7 @@ impl NativeVideoOutput {
                         dynamic,
                         audio_diagnostics,
                         &pump_render,
+                        thread_health,
                     )
                 }));
                 let error = match result {
@@ -1358,7 +1386,7 @@ impl NativeVideoOutput {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// Inc 7 hidden presenter: presenter ウィンドウ (+ HUD overlay) の表示 / 非表示を
+    /// Hidden presenter lifecycle: presenter ウィンドウ (+ HUD overlay) の表示 / 非表示を
     /// 要求する。App は `is_presenter_hidden` で pump の typed visibility ack 反映完了
     /// (= show 済み) をポーリングする。
     /// App (bin 専属) からのみ呼ばれる。lib build では app が stub のため dead に見える。
@@ -2525,6 +2553,7 @@ fn run_native_video_output(
     dynamic: Arc<crate::video::decoder::VideoDynamicState>,
     audio_diagnostics: Arc<crate::video::audio_diagnostics::AudioDiagnostics>,
     window_pump: &native_window_pump::NativeWindowPumpRenderClient,
+    health: Arc<native_window_health::NativeWindowHealth>,
 ) -> Result<(), String> {
     use std::time::{Duration, Instant};
 
@@ -2541,7 +2570,7 @@ fn run_native_video_output(
         owner_hwnd: config.owner_hwnd,
         rect: config.rect,
         activate_on_show: config.activate_on_show,
-        initially_visible: true,
+        initially_visible: config.initial_visibility.is_visible(),
     })?;
     let initial_attach =
         wait_for_native_window_attach(&window_pump, cur_window_request, cur_generation, &cancel)?;
@@ -2559,12 +2588,15 @@ fn run_native_video_output(
                 ui_scale: config.ui_scale,
                 text_contrast: config.text_contrast,
                 ui_font: config.ui_font.clone(),
+                health: Arc::clone(&health),
+                window_epoch: cur_generation,
             },
         )?;
     let mut presenter = new_presenter;
     if cancel.load(Ordering::Acquire) {
         first_presented_out.store(false, Ordering::Release);
         window_pump.shutdown(cur_window_request.saturating_add(1));
+        presenter.detach();
         return Ok(());
     }
     crate::logger::log(format!(
@@ -2703,6 +2735,7 @@ fn run_native_video_output(
         fallback_file_name: cur_fallback_file_name.clone(),
         show_preparing_overlay: config.initial_tile_overlay,
     });
+    health.record_source_generation(source.source_epoch);
     let mut last_summary_log = Instant::now();
     let mut last_present_log = Instant::now();
     let mut last_overlay_tick = Instant::now();
@@ -2778,9 +2811,13 @@ fn run_native_video_output(
                 Ok(native_window_pump::PumpLifecycleEvent::Detached { epoch })
                     if epoch == cur_generation =>
                 {
+                    presenter.detach();
                     return Ok(());
                 }
-                Ok(native_window_pump::PumpLifecycleEvent::Shutdown) => return Ok(()),
+                Ok(native_window_pump::PumpLifecycleEvent::Shutdown) => {
+                    presenter.detach();
+                    return Ok(());
+                }
                 Ok(_) => {}
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -3076,7 +3113,7 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::SetWindowVisible { visible } => {
                     if visible {
-                        // Inc 7 hidden presenter show (音声モード→動画): hold していた最新
+                        // Hidden presenter show (音声モード→動画 / tray restore): hold していた最新
                         // フレームを 1 回 present してから再表示する。これで音声モード中に
                         // seek していても正しい位置の映像で復帰し、hide 前の古いフレームが
                         // 一瞬見える flash を防ぐ。present は通常経路と同じ retire 管理を通す。
@@ -3118,10 +3155,12 @@ fn run_native_video_output(
                             &cancel,
                         )?;
                         crate::logger::log(
-                            "[native-video] presenter show requested (audio-mode exit)".to_string(),
+                            "[native-video] presenter show requested (visibility transition)"
+                                .to_string(),
                         );
                     } else {
-                        // Inc 7 hidden presenter hide (動画→音声モード): presenter ウィンドウと
+                        // Hidden presenter hide (動画→音声モード / tray residency):
+                        // presenter ウィンドウと
                         // HUD overlay を隠す。以降の present ループは consume-and-hold に入り、
                         // present() を呼ばず最新フレームだけ hold する (音声は無中断)。
                         window_pump.set_visibility(cur_generation, false)?;
@@ -3133,7 +3172,7 @@ fn run_native_video_output(
                         )?;
                         frame_output.hide();
                         crate::logger::log(
-                            "[native-video] presenter hidden (audio-mode enter)".to_string(),
+                            "[native-video] presenter hidden (visibility transition)".to_string(),
                         );
                     }
                 }
@@ -3171,6 +3210,7 @@ fn run_native_video_output(
                     let show_preparing_overlay = payload.show_preparing_overlay;
                     cur_fallback_file_name = payload.fallback_file_name.clone();
                     source = PresenterSourceState::new(*payload);
+                    health.record_source_generation(source.source_epoch);
                     emit_native_vram_trace(
                         "switch_source_attached",
                         "after_new_source_attached",
@@ -3333,7 +3373,7 @@ fn run_native_video_output(
                         owner_hwnd,
                         rect: new_rect,
                         activate_on_show,
-                        initially_visible: true,
+                        initially_visible: !presenter_visibility.is_hidden(),
                     })?;
                     let attach = wait_for_native_window_attach(
                         &window_pump,
@@ -3359,6 +3399,8 @@ fn run_native_video_output(
                                 ui_scale: cur_ui_scale,
                                 text_contrast: cur_text_contrast,
                                 ui_font: config.ui_font.clone(),
+                                health: Arc::clone(&health),
+                                window_epoch: candidate_epoch,
                             },
                         );
                     let (mut new_presenter, topology, startup_window_intents) =
@@ -3473,7 +3515,7 @@ fn run_native_video_output(
                         &cancel,
                     )?;
                     let old_presenter = std::mem::replace(&mut presenter, new_presenter);
-                    drop(old_presenter);
+                    old_presenter.detach();
                     frame_output.invalidate_retire_fence_prefix(old_retire_len);
                     cur_generation = candidate_epoch;
                     cur_placement = placement;
@@ -4740,6 +4782,7 @@ fn run_native_video_output(
         frame_output.retire_len(),
     );
     window_pump.shutdown(cur_window_request.saturating_add(1));
+    presenter.detach();
     crate::logger::log("[native-video] fullscreen presenter stopped".to_string());
     Ok(())
 }
@@ -7458,6 +7501,16 @@ fn dummy_audio_rx() -> crossbeam_channel::Receiver<decoder::AudioFrame> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_presenter_visibility_honors_hidden_startup_state() {
+        let hidden =
+            super::NativePresenterVisibility::new(super::NativeVideoInitialVisibility::Hidden);
+        let visible =
+            super::NativePresenterVisibility::new(super::NativeVideoInitialVisibility::Visible);
+        assert!(hidden.is_hidden());
+        assert!(!visible.is_hidden());
+    }
+
     #[test]
     fn video_grade_render_change_ignores_overlay_only_snapshot_fields() {
         let previous = crate::creative_lut::VideoGradeSnapshot::default();

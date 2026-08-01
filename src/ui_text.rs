@@ -2212,7 +2212,7 @@ impl App {
     pub(crate) fn handle_text_keys(&mut self, ctx: &egui::Context, _fs_idx: usize) -> FsKeyAction {
         let action = FsKeyAction::default();
 
-        if !self.ime_input_active()
+        if !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && self.consume_context_shortcuts_help_key(ctx)
         {
@@ -4148,20 +4148,22 @@ impl App {
                 crate::os_theme::apply_dark_ui(ui);
                 ui.horizontal(|ui| {
                     ui.label("見本");
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.text_font_dialog_sample)
-                                .desired_width(180.0),
-                        )
-                        .changed()
+                    if crate::ime_focus::add_singleline(
+                        ui,
+                        &mut self.text_font_dialog_sample,
+                        None,
+                        |edit| edit.desired_width(180.0),
+                    )
+                    .changed()
                     {
                         self.font_sample_cache.clear();
                     }
                     ui.label("絞り込み");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.text_font_dialog_filter)
-                            .desired_width(140.0)
-                            .hint_text("フォント名"),
+                    crate::ime_focus::add_singleline(
+                        ui,
+                        &mut self.text_font_dialog_filter,
+                        None,
+                        |edit| edit.desired_width(140.0).hint_text("フォント名"),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("ファイルから追加…").clicked() {
@@ -4684,10 +4686,11 @@ impl App {
                     }
                     ui.separator();
                     ui.label("検索");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut filter_local)
-                            .hint_text("名前 / コード")
-                            .desired_width(160.0),
+                    crate::ime_focus::add_singleline(
+                        ui,
+                        &mut filter_local,
+                        None,
+                        |edit| edit.hint_text("名前 / コード").desired_width(160.0),
                     );
                 });
 
@@ -7317,12 +7320,10 @@ fn window_name_header_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed
         }
     });
     if w.name_plate.mode != NamePlateMode::None {
-        *changed |= ui
-            .add(
-                egui::TextEdit::singleline(&mut w.name_plate.name.text)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("話者名"),
-            )
+        *changed |=
+            crate::ime_focus::add_singleline(ui, &mut w.name_plate.name.text, None, |edit| {
+                edit.desired_width(f32::INFINITY).hint_text("話者名")
+            })
             .changed();
     }
 }
@@ -7460,11 +7461,9 @@ fn preset_buttons_ui(
         }
     });
     ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(name_input)
-                .hint_text("プリセット名")
-                .desired_width(110.0),
-        );
+        crate::ime_focus::add_singleline(ui, name_input, None, |edit| {
+            edit.hint_text("プリセット名").desired_width(110.0)
+        });
         if ui.button("現在を保存").clicked() {
             reqs.save = Some(target);
         }

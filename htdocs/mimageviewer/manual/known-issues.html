@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>既知の問題 — mImageViewer マニュアル</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="mImageViewer で現在把握している不具合と、その回避方法をまとめています。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/known-issues.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/known-issues.html">
+  <meta property="og:title" content="既知の問題｜mImageViewer">
+  <meta property="og:description" content="mImageViewer で現在把握している不具合と、その回避方法をまとめています。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="既知の問題｜mImageViewer">
+  <meta name="twitter:description" content="mImageViewer で現在把握している不具合と、その回避方法をまとめています。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>既知の問題</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="tutorial.html">チュートリアル</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="stack.html">スタック表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="music.html">音楽再生</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="annotation.html">テキスト注釈</a>
+        <a href="export.html">エクスポート</a>
+        <a href="metadata-transfer.html">メタ情報の移行</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="books.html">製本・本棚</a>
+        <a href="search.html">検索機能</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="gamepad.html">ゲームパッド操作</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+        <a href="known-issues.html" class="active">既知の問題</a>
+        <a href="changelog.html">更新履歴</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">既知の問題</h1>
+    <p class="page-desc">現時点で把握している不具合と、その回避方法です。</p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        以下は把握済みのため、ご報告は不要です。修正に向けて作業を進めています。
+        <strong>このページに無い症状は、ぜひお知らせください。</strong>
+        報告のしかたは<a href="troubleshooting.html">トラブルシューティング</a>の
+        「不具合を報告するとき」をご覧ください。
+      </div>
+    </div>
+
+    <h2>入力・キー操作</h2>
+
+    <h3>日本語入力の変換中に Esc を押すと、確定していない文字が残る</h3>
+    <p>変換中の文字は本来 <kbd>Esc</kbd> で取り消されますが、入力欄に残ってしまいます。
+    残った文字は手動で削除してください。</p>
+    <p>テキスト注釈の本文欄では、あわせて入力欄の選択も外れます。もう一度入力欄をクリックすると
+    続きから入力できます。</p>
+
+    <h3>別ウィンドウで入力中は、メインウィンドウをクリックしてもキー操作が別ウィンドウに届く</h3>
+    <p>別ウィンドウ（<kbd>F12</kbd>）でブックマーク名などを入力している間は、メインウィンドウを
+    クリックして操作しても、矢印キーなどが入力欄側に届きます。入力を確定するか、別ウィンドウを
+    閉じると元に戻ります。</p>
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        入力中の別ウィンドウが画面外にあると、アプリ全体が反応しなくなったように見えます。
+        キー操作が効かないときは、別ウィンドウで入力欄が開いたままになっていないかご確認ください。
+      </div>
+    </div>
+
+    <h2>表示</h2>
+
+    <h3>本として扱わないフォルダでも見開き表示になる</h3>
+    <p>「画像のみのフォルダを本として扱う」がオフのとき、およびオンでも画像以外のファイルが
+    含まれるフォルダで、画像を開くと見開き設定が適用されます。フルスクリーン表示中に表示方法を
+    単ページへ切り替えると、そのフォルダには以後その設定が使われます。</p>
+
+    <h2>動画</h2>
+
+    <h3>全画面で動画を再生中に VST プラグインの画面を開くと、マウスカーソルが消えたままになる</h3>
+    <p>動画ウィンドウの上でだけカーソルが表示されなくなります。別のモニターへカーソルを移すか、
+    動画を閉じて開き直すと元に戻ります。</p>
+
+    <h3>一部の MPEG ファイルでシークバーによる移動ができない</h3>
+    <p>ファイルに再生時間の情報が正しく入っていない場合に起こります。再生自体は可能です。</p>
+
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>
