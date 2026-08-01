@@ -6539,7 +6539,8 @@ impl App {
     /// 進捗バーオーバーレイ（左下フローティング）を描画する。
     pub(crate) fn render_progress_overlay(&self, ctx: &egui::Context) {
         let ((cur_normal, peak_normal), (cur_upgrade, peak_upgrade)) = self.progress_snapshot();
-        if peak_normal == 0 && peak_upgrade == 0 {
+        let rename_pending = self.rename_pending.is_some();
+        if peak_normal == 0 && peak_upgrade == 0 && !rename_pending {
             return;
         }
 
@@ -6595,6 +6596,12 @@ impl App {
                                             .color(egui::Color32::BLACK),
                                         ),
                                 );
+                            });
+                        }
+                        if rename_pending {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("変更中...");
                             });
                         }
                     });

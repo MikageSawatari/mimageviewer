@@ -13490,11 +13490,12 @@ impl App {
         self.bump_input_seq(kind, key.as_deref())
     }
 
-    /// 現在の viewport の IME 変換状態をイベント処理前に取り込む。
+    /// 現在の viewport の IME 変換状態をイベント処理前に参照し、診断を開始する。
     ///
     /// **重要**: egui の各ビューポートは独立したイベントキューを持つ。
-    /// `show_viewport_immediate` で別ビューポートを出している場合は、その closure の
-    /// 先頭でも呼ばないと、そのビューポート内の IME を取り逃がす。
+    /// pass 前 plugin が各 RawInput を viewport ごとに追跡する。App 側は
+    /// `show_viewport_immediate` の closure 先頭でもこの read-only 入口を呼び、
+    /// helper-field 診断をその viewport の処理前に開始する。
     pub(crate) fn update_ime_state(&mut self, ctx: &egui::Context) {
         let _ = crate::ime_focus::ime_input_active(ctx);
     }
@@ -47742,6 +47743,10 @@ impl App {
         }
 
         if current_loading {
+            // Paged and continuous-reading prefetch must both re-assert the
+            // current producer: `NeedsLoad` may cancel siblings but must not
+            // leave the display target without an in-flight request.
+            self.ensure_fs_page_load(current_idx);
             return;
         }
 
