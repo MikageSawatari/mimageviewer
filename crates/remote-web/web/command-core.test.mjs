@@ -20,6 +20,7 @@ import {
   viewerTapCommand,
   nextFitMode,
   pagePrefetchPlan,
+  planSpreadIntent,
   snappedGridOffset,
   thumbnailBindingMatches,
   thumbnailRetryDecision,
@@ -96,6 +97,40 @@ test("spread cycle, RTL predicate and portrait fallback match the viewer contrac
   assert.equal(isPortraitViewport(430, 932), true);
   assert.equal(isPortraitViewport(932, 430), false);
   assert.equal(isPortraitViewport(800, 800), false);
+});
+
+test("opening a container in portrait plans no persistent spread write", () => {
+  const plan = planSpreadIntent({
+    currentDirection: ReadingDirection.RTL,
+    portraitSinglePage: true,
+    viewportWidth: 430,
+    viewportHeight: 932,
+  });
+  assert.equal(plan.forceSinglePage, true);
+  assert.equal(plan.writeRequest, null);
+});
+
+test("an explicit portrait selection writes the selected mode, not effective Single", () => {
+  const address = {
+    favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+    relative_path: "books/book.pdf",
+    subresource: { kind: "file" },
+  };
+  const plan = planSpreadIntent({
+    address,
+    selectedMode: SpreadMode.RTL_COVER,
+    currentDirection: ReadingDirection.LTR,
+    portraitSinglePage: true,
+    viewportWidth: 430,
+    viewportHeight: 932,
+  });
+  assert.equal(plan.forceSinglePage, true);
+  assert.deepEqual(plan.writeRequest, {
+    kind: "set_spread",
+    address,
+    spread_mode: SpreadMode.RTL_COVER,
+    reading_direction: ReadingDirection.RTL,
+  });
 });
 
 test("fit mode cycle and request width use the actual rendered image width", () => {

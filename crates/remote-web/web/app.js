@@ -9,12 +9,11 @@ import {
   gridLayoutForWidth,
   gridScrollExtent,
   gridIndexForCommand,
-  isPortraitViewport,
   isRtlReadingDirection,
   nextFitMode,
   nextSpreadMode,
   pagePrefetchPlan,
-  readingDirectionForSpreadMode,
+  planSpreadIntent,
   reduceViewerTransform,
   sessionOwnerBadge,
   snappedGridOffset,
@@ -27,6 +26,10 @@ import {
   viewerSpreadLayout,
   viewerWheelCommand,
 } from "./command-core.mjs";
+import {
+  loadLocalSettings,
+  saveLocalSettings,
+} from "./local-settings.mjs";
 
 const app = document.querySelector("#app");
 const hudElement = document.querySelector("#telemetry-hud");
@@ -47,6 +50,7 @@ const PAGE_RESOURCE_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const SESSION_PING_INTERVAL_MS = 30_000;
 const RUNTIME_TEST_MODE = globalThis.__MIV_RUNTIME_TEST_MODE__ === true;
 const REMOTE_CLIENT_ID = loadRemoteClientId();
+const LOCAL_SETTINGS_LOAD = loadLocalSettings();
 
 class AuthenticationRequiredError extends Error {}
 
@@ -278,7 +282,9 @@ const state = {
   readingDirection: ReadingDirection.LTR,
   spreadPageGapPx: 0,
   forceSinglePage: false,
-  spreadOverrides: new Map(),
+  localSettings: LOCAL_SETTINGS_LOAD.settings,
+  localSettingsStorageAvailable: LOCAL_SETTINGS_LOAD.storageAvailable,
+  localSettingsDialog: null,
   fitMode: FitMode.PAGE,
   imageInfoCache: new Map(),
   containerImageInfoHints: new Map(),
@@ -737,6 +743,20 @@ function navigate(hash, routeState = {}) {
 function dispatchCommand(requested, meta = {}) {
   if (!requested?.name || !state.authenticated) return false;
   const source = meta.source ?? "mouse";
+  if (requested.name === CommandName.OPEN_LOCAL_SETTINGS) {
+    state.commandMenu?.close(false);
+    openLocalSettingsDialog();
+    if (meta.telemetry !== false) {
+      enqueueTelemetry({
+        type: "command",
+        command: requested.name,
+        input_source: source,
+        input_detail: meta.detail ? limitText(meta.detail, 80) : undefined,
+        context: state.screenContext,
+      });
+    }
+    return true;
+  }
   state.remoteSessionUserActive = true;
   if (meta.sessionRetry !== true) {
     acquireRemoteSession("command")
@@ -1060,6 +1080,8 @@ function cleanupScreen() {
   state.thumbnailNotice = null;
   state.commandMenu?.destroy();
   state.commandMenu = null;
+  state.localSettingsDialog?.destroy();
+  state.localSettingsDialog = null;
   state.viewer?.destroy();
   state.viewer = null;
   state.screenContext = "loading";
@@ -1279,20 +1301,20 @@ async function showContainer(address) {
 }
 
 async function loadContainer(address, options = {}) {
-  const override = state.spreadOverrides.get(addressIdentity(address)) ?? null;
-  const spreadMode = options.spreadMode ?? override?.mode ?? null;
-  const readingDirection =
-    options.readingDirection ?? override?.readingDirection ?? null;
+  const spreadIntent = planSpreadIntent({
+    currentDirection: state.readingDirection,
+    portraitSinglePage: state.localSettings.portraitSinglePage,
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+  });
   const forceSinglePage = options.forceSinglePage ??
-    isPortraitViewport(window.innerWidth, window.innerHeight);
+    spreadIntent.forceSinglePage;
   state.requestController?.abort();
   const controller = new AbortController();
   state.requestController = controller;
   const data = await apiJson(
     "/api/container",
     addressQueryParams(address, {
-      ...(spreadMode ? { spread: spreadMode } : {}),
-      ...(readingDirection ? { direction: readingDirection } : {}),
       single: forceSinglePage ? 1 : 0,
     }),
     controller.signal
@@ -1313,14 +1335,6 @@ async function loadContainer(address, options = {}) {
     readingDirection: data.reading_direction ?? ReadingDirection.LTR,
     forceSinglePage,
   };
-  if (spreadMode) {
-    const resolvedOverride = {
-      mode: spreadMode,
-      readingDirection: state.container.readingDirection,
-    };
-    state.spreadOverrides.set(addressIdentity(address), resolvedOverride);
-    state.spreadOverrides.set(addressIdentity(effectiveAddress), resolvedOverride);
-  }
   state.favoriteId = effectiveAddress.favorite_id;
   state.favoriteName =
     state.favorites.find((favorite) => favorite.id === state.favoriteId)?.name ??
@@ -1384,17 +1398,62 @@ function currentPageGroup() {
   return state.pageGroups[state.pageGroupIndex] ?? null;
 }
 
+let spreadWriteTail = Promise.resolve();
+let spreadWriteSequence = 0;
+
+function shouldForceSinglePageForViewport() {
+  return planSpreadIntent({
+    currentDirection: state.readingDirection,
+    portraitSinglePage: state.localSettings.portraitSinglePage,
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+  }).forceSinglePage;
+}
+
 function requestSpreadMode(mode) {
   if (!state.container || !Object.values(SpreadMode).includes(mode)) return false;
-  const readingDirection = readingDirectionForSpreadMode(mode, state.readingDirection);
-  refreshContainerSpread(mode, undefined, readingDirection).catch(renderError);
+  const address = state.container.requestedAddress;
+  const spreadIntent = planSpreadIntent({
+    address,
+    selectedMode: mode,
+    currentDirection: state.readingDirection,
+    portraitSinglePage: state.localSettings.portraitSinglePage,
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+  });
+  const writeRequest = spreadIntent.writeRequest;
+  if (!writeRequest) return false;
+  const readingDirection = writeRequest.reading_direction;
+  const identity = addressIdentity(address);
+  const sequence = ++spreadWriteSequence;
+  state.spreadMode = mode;
+  state.readingDirection = readingDirection;
+  spreadWriteTail = spreadWriteTail.then(async () => {
+    await apiPostJson("/api/write", writeRequest);
+    if (
+      sequence === spreadWriteSequence &&
+      state.container &&
+      addressIdentity(state.container.requestedAddress) === identity
+    ) {
+      await refreshContainerSpread();
+    }
+  }).catch(async (error) => {
+    if (
+      sequence === spreadWriteSequence &&
+      state.container &&
+      addressIdentity(state.container.requestedAddress) === identity
+    ) {
+      await refreshContainerSpread().catch(() => {});
+      state.viewer?.showBoundaryMessage(
+        error instanceof Error ? error.message : "見開き設定を保存できませんでした。"
+      );
+    }
+  });
   return true;
 }
 
 async function refreshContainerSpread(
-  mode = state.spreadMode,
-  forceSinglePage = isPortraitViewport(window.innerWidth, window.innerHeight),
-  readingDirection = state.readingDirection
+  forceSinglePage = shouldForceSinglePageForViewport()
 ) {
   if (!state.container) return;
   const viewer = state.viewer;
@@ -1402,8 +1461,6 @@ async function refreshContainerSpread(
   const currentIdentity = current ? entryIdentity(current) : "";
   const address = state.container.requestedAddress;
   const loaded = await loadContainer(address, {
-    spreadMode: mode,
-    readingDirection,
     forceSinglePage,
   });
   if (!loaded) return;
@@ -2810,6 +2867,7 @@ function menuDefinition(context) {
         [CommandName.FIRST_PAGE, "先頭の画像", "Home"],
         [CommandName.LAST_PAGE, "最後の画像", "End"],
         [CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"],
+        [CommandName.OPEN_LOCAL_SETTINGS, "端末の設定", "メニュー"],
         [CommandName.BACK, "一覧へ戻る", "Backspace / Enter / Esc"],
         [CommandName.RELOAD_APP, "再読み込み", "メニュー"],
       ],
@@ -2835,6 +2893,7 @@ function menuDefinition(context) {
         [CommandName.GRID_FIRST, "先頭へ", "Home"],
         [CommandName.GRID_LAST, "末尾へ", "End"],
         [CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"],
+        [CommandName.OPEN_LOCAL_SETTINGS, "端末の設定", "メニュー"],
         [CommandName.RELOAD_APP, "再読み込み", "メニュー"],
       ],
       shortcuts: [
@@ -2853,6 +2912,7 @@ function menuDefinition(context) {
     title: "操作",
     actions: [
       [CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"],
+      [CommandName.OPEN_LOCAL_SETTINGS, "端末の設定", "メニュー"],
       [CommandName.RELOAD_APP, "再読み込み", "メニュー"],
     ],
     shortcuts: [
@@ -2947,6 +3007,102 @@ class CommandMenu {
   }
 }
 
+function openLocalSettingsDialog() {
+  state.localSettingsDialog?.destroy();
+  state.localSettingsDialog = new LocalSettingsDialog(app);
+}
+
+class LocalSettingsDialog {
+  constructor(host) {
+    this.previousFocus = document.activeElement;
+    this.root = element("div", "command-menu-layer local-settings-layer");
+
+    const scrim = element("button", "command-menu-scrim");
+    scrim.type = "button";
+    scrim.setAttribute("aria-label", "端末の設定を閉じる");
+    scrim.addEventListener("click", () => this.close());
+
+    const panel = element("section", "command-menu local-settings-dialog");
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-modal", "true");
+    panel.setAttribute("aria-label", "端末の設定");
+
+    const header = element("header", "command-menu-header");
+    const close = textElement("button", "×", "command-menu-close");
+    close.type = "button";
+    close.setAttribute("aria-label", "端末の設定を閉じる");
+    close.addEventListener("click", () => this.close());
+    header.append(textElement("h2", "端末の設定"), close);
+
+    const option = element("label", "local-settings-option");
+    const checkbox = element("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = state.localSettings.portraitSinglePage;
+    const copy = element("span", "local-settings-copy");
+    copy.append(
+      textElement("strong", "縦長画面では見開きを解除する"),
+      textElement(
+        "small",
+        "この端末だけに保存します。OFF では縦持ちでも見開きを維持します。"
+      )
+    );
+    option.append(checkbox, copy);
+
+    this.status = textElement("p", "", "local-settings-status");
+    this.updateStorageStatus();
+    checkbox.addEventListener("change", () => {
+      const saved = saveLocalSettings({
+        ...state.localSettings,
+        portraitSinglePage: checkbox.checked,
+      });
+      state.localSettings = saved.settings;
+      state.localSettingsStorageAvailable = saved.saved;
+      this.updateStorageStatus();
+      const forceSinglePage = shouldForceSinglePageForViewport();
+      if (state.container && forceSinglePage !== state.forceSinglePage) {
+        refreshContainerSpread(forceSinglePage).catch((error) => {
+          state.viewer?.showBoundaryMessage(
+            error instanceof Error ? error.message : "表示を更新できませんでした。"
+          );
+        });
+      }
+    });
+
+    panel.append(header, option, this.status);
+    this.root.append(scrim, panel);
+    this.root.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        this.close();
+      }
+    });
+    host.append(this.root);
+    requestAnimationFrame(() => checkbox.focus());
+  }
+
+  updateStorageStatus() {
+    this.status.textContent = state.localSettingsStorageAvailable
+      ? "設定はこの端末のブラウザに保存されます。"
+      : "この環境では保存できません。このタブを閉じるまで設定を使用します。";
+    this.status.classList.toggle(
+      "is-warning",
+      !state.localSettingsStorageAvailable
+    );
+  }
+
+  close(restoreFocus = true) {
+    this.root.remove();
+    if (state.localSettingsDialog === this) state.localSettingsDialog = null;
+    if (restoreFocus && this.previousFocus instanceof HTMLElement) {
+      this.previousFocus.focus({ preventScroll: true });
+    }
+  }
+
+  destroy() {
+    this.close(false);
+  }
+}
+
 export class ImageViewer {
   constructor({
     root,
@@ -3011,13 +3167,9 @@ export class ImageViewer {
     this.resize = () => {
       clearTimeout(this.resizeTimer);
       this.resizeTimer = setTimeout(() => {
-        const forceSinglePage = isPortraitViewport(window.innerWidth, window.innerHeight);
+        const forceSinglePage = shouldForceSinglePageForViewport();
         if (state.container && forceSinglePage !== state.forceSinglePage) {
-          refreshContainerSpread(
-            state.spreadMode,
-            forceSinglePage,
-            state.readingDirection
-          ).catch(renderError);
+          refreshContainerSpread(forceSinglePage).catch(renderError);
           return;
         }
         updateViewerImage(performance.now()).catch(renderError);
@@ -3621,6 +3773,35 @@ async function apiJson(path, params = {}, signal) {
     throw new Error(
       detail.message || `読み込みに失敗しました (HTTP ${response.status})。`
     );
+  }
+  return response.json();
+}
+
+async function apiPostJson(path, body, signal) {
+  const response = await observedFetch(path, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (response.status === 401) {
+    state.authenticated = false;
+    telemetryState.authenticated = false;
+    renderPinLogin(0);
+    throw new AuthenticationRequiredError("PIN 認証が必要です。");
+  }
+  if (!response.ok) {
+    const detail = await response.clone().json().catch(() => ({}));
+    const error = new Error(
+      detail.message || `保存に失敗しました (HTTP ${response.status})。`
+    );
+    error.status = response.status;
+    error.code = detail.error;
+    throw error;
   }
   return response.json();
 }

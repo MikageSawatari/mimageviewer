@@ -1053,7 +1053,8 @@ pub fn run() -> eframe::Result {
     };
 
     // 縦串フェーズの thumbnail IPC は明示指定時だけ有効。受信・生成はすべて
-    // remote_ipc 配下の専用スレッドで行い、通常起動の App / UI thread には触れない。
+    // 読み取りと検証は remote_ipc 配下の専用スレッドで行う。永続書き込みだけは
+    // App 所有ハンドルを使うため、型付き queue と repaint wakeup 経由で UI thread に渡す。
     // guard は run_native が戻るまで保持し、Drop で listener と worker を閉じる。
     let _remote_ipc_server = if has_arg("--remote-ipc") {
         match remote_ipc::RemoteIpcServer::start(saved.clone()) {

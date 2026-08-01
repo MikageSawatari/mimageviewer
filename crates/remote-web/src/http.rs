@@ -8,7 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimageviewer_ipc::{
     CollectionErrorCode, CollectionKind, MediaErrorCode, PagePriority, RemoteAddress,
-    RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource, SessionResponse, SessionStatus,
+    RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource, RemoteWriteErrorCode,
+    RemoteWriteRequest, SessionResponse, SessionStatus,
 };
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
@@ -23,6 +24,7 @@ use crate::store::{Library, StoreError};
 
 const MAX_TELEMETRY_BODY_BYTES: usize = 64 * 1024;
 const MAX_PIN_BODY_BYTES: usize = 4 * 1024;
+const MAX_WRITE_BODY_BYTES: usize = 16 * 1024;
 const MAX_TELEMETRY_EVENTS: usize = 128;
 const TELEMETRY_REQUESTS_PER_WINDOW: usize = 30;
 const TELEMETRY_WINDOW: Duration = Duration::from_secs(60);
@@ -361,6 +363,11 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
         (Method::Get, "/command-core.mjs") => {
             static_file(state, "command-core.mjs", "text/javascript; charset=utf-8")
         }
+        (Method::Get, "/local-settings.mjs") => static_file(
+            state,
+            "local-settings.mjs",
+            "text/javascript; charset=utf-8",
+        ),
         (Method::Get, "/styles.css") => static_file(state, "styles.css", "text/css; charset=utf-8"),
         (Method::Get, "/favicon.ico") => HttpResponse::bytes(204, "image/x-icon", Vec::new()),
         (Method::Get, "/api/auth/status") => api_auth_status(state, auth),
@@ -382,6 +389,7 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             with_session_activity(state, &remote_client_id, || api_list(state, &query))
         }
         (Method::Get, "/api/container") => api_container(state, &query, &remote_client_id),
+        (Method::Post, "/api/write") => api_write(request, state, &remote_client_id),
         (Method::Get, "/api/thumb") => api_thumb(state, &query, &remote_client_id),
         (Method::Get, "/api/image-info") => {
             with_session_activity(state, &remote_client_id, || api_image_info(state, &query))
@@ -392,7 +400,7 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
         (Method::Get, "/api/page") => api_page(state, &query, &remote_client_id),
         (Method::Post, "/api/telemetry") => api_telemetry(request, state),
         (Method::Get, _) => HttpResponse::text(404, "Not Found"),
-        (_, "/api/telemetry" | "/api/session/acquire" | "/api/session/ping") => {
+        (_, "/api/telemetry" | "/api/session/acquire" | "/api/session/ping" | "/api/write") => {
             HttpResponse::text(405, "Method Not Allowed")
                 .with_header("Allow", "POST")
                 .with_header("Cache-Control", "no-store")
@@ -510,7 +518,8 @@ fn session_failure_response(failure: crate::ipc_client::ClientFailure) -> HttpRe
         }
         IpcClientError::Remote(_)
         | IpcClientError::CollectionRemote(_)
-        | IpcClientError::MediaRemote(_) => HttpResponse::text(502, "Bad Gateway"),
+        | IpcClientError::MediaRemote(_)
+        | IpcClientError::WriteRemote(_) => HttpResponse::text(502, "Bad Gateway"),
     }
     .with_header("Cache-Control", "no-store")
 }
@@ -811,6 +820,7 @@ fn collection_ipc_error_response(
         }
         IpcClientError::MediaRemote(error) => (500, "miv_collection_error", error.message),
         IpcClientError::Remote(error) => (500, "miv_collection_error", error.message),
+        IpcClientError::WriteRemote(error) => (500, "miv_collection_error", error.message),
         IpcClientError::SessionRemote(response) => (
             session_http_status(response.status),
             "session_required",
@@ -947,6 +957,46 @@ fn api_container(state: &AppState, query: &[(String, String)], client_id: &str) 
     }
 }
 
+fn api_write(request: &mut Request, state: &AppState, client_id: &str) -> HttpResponse {
+    let body = match read_body_limited(request, MAX_WRITE_BODY_BYTES) {
+        Ok(body) => body,
+        Err(BodyReadError::TooLarge) => return HttpResponse::text(413, "Payload Too Large"),
+        Err(BodyReadError::Read) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let write_request: RemoteWriteRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => return HttpResponse::text(400, "Bad Request"),
+    };
+    if let Err(error) = state
+        .library
+        .validate_remote_address(write_request.address())
+    {
+        return store_error_response(error);
+    }
+    let write_kind = write_request.kind_name();
+    let started = Instant::now();
+    let result = match state.ipc_admission.run(IpcClass::Home, || {
+        state.thumbnail_client.write(client_id, write_request)
+    }) {
+        Ok(result) => result,
+        Err(busy) => return write_admission_busy_response(busy, write_kind),
+    };
+    match result {
+        Ok(result) => HttpResponse::json(&json!({"applied": true}))
+            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+            .with_header("Cache-Control", "no-store")
+            .with_log_details(json!({
+                "write": {
+                    "kind": write_kind,
+                    "ipc_status": "ok",
+                    "ipc_ms": crate::diagnostics::duration_ms(started.elapsed()),
+                    "ipc_connection_id": result.connection_id,
+                }
+            })),
+        Err(failure) => write_ipc_error_response(failure, started.elapsed(), write_kind),
+    }
+}
+
 fn api_thumb(state: &AppState, query: &[(String, String)], client_id: &str) -> HttpResponse {
     let address = match remote_address_from_query(query) {
         Ok(address) => address,
@@ -1072,6 +1122,29 @@ fn api_page(state: &AppState, query: &[(String, String)], client_id: &str) -> Ht
     }
 }
 
+fn write_admission_busy_response(busy: AdmissionBusy, write_kind: &str) -> HttpResponse {
+    HttpResponse::bytes(
+        503,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&json!({
+            "error": "ipc_busy",
+            "message": "mIV 本体への書き込み要求が混み合っています。再試行してください。",
+        }))
+        .unwrap_or_default(),
+    )
+    .with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string())
+    .with_header("Cache-Control", "no-store")
+    .with_log_details(json!({
+        "write": {
+            "kind": write_kind,
+            "ipc_status": "admission_busy",
+            "ipc_ms": 0,
+            "ipc_all_in_flight": busy.all_in_flight,
+            "ipc_all_limit": busy.all_limit,
+        }
+    }))
+}
+
 fn media_admission_busy_response(busy: AdmissionBusy, operation: &str) -> HttpResponse {
     HttpResponse::bytes(
         503,
@@ -1095,6 +1168,74 @@ fn media_admission_busy_response(busy: AdmissionBusy, operation: &str) -> HttpRe
             "ipc_heavy_limit": busy.heavy_limit,
             "ipc_prefetch_in_flight": busy.prefetch_in_flight,
             "ipc_prefetch_limit": busy.prefetch_limit,
+        }
+    }))
+}
+
+fn write_ipc_error_response(
+    failure: crate::ipc_client::ClientFailure,
+    elapsed: Duration,
+    write_kind: &str,
+) -> HttpResponse {
+    let ipc_status = failure.error.ipc_status();
+    let (status, code, message) = match failure.error {
+        IpcClientError::Unavailable(_) => (
+            503,
+            "miv_not_running",
+            "mIV 本体が起動していません。".to_owned(),
+        ),
+        IpcClientError::VersionMismatch { client, server } => (
+            503,
+            "protocol_version_mismatch",
+            format!("IPC 版が一致しません (remote-web={client}, mIV={server})。"),
+        ),
+        IpcClientError::Protocol(detail) if detail.kind == "timeout" => (
+            504,
+            "ipc_timeout",
+            "書き込み結果を時間内に確認できませんでした。".to_owned(),
+        ),
+        IpcClientError::Protocol(_) => (
+            502,
+            "ipc_protocol_error",
+            "mIV 本体との通信に失敗しました。".to_owned(),
+        ),
+        IpcClientError::WriteRemote(error) => {
+            let status = match error.code {
+                RemoteWriteErrorCode::BadRequest => 400,
+                RemoteWriteErrorCode::FavoriteNotFound
+                | RemoteWriteErrorCode::PathRejected
+                | RemoteWriteErrorCode::NotFound => 404,
+                RemoteWriteErrorCode::Unsupported => 415,
+                RemoteWriteErrorCode::Busy => 503,
+                RemoteWriteErrorCode::UiTimeout => 504,
+                RemoteWriteErrorCode::PersistenceFailed | RemoteWriteErrorCode::Internal => 500,
+            };
+            (status, "miv_write_error", error.message)
+        }
+        IpcClientError::SessionRemote(response) => (
+            session_http_status(response.status),
+            "session_required",
+            response.message,
+        ),
+        IpcClientError::Remote(_)
+        | IpcClientError::CollectionRemote(_)
+        | IpcClientError::MediaRemote(_) => (
+            500,
+            "miv_write_error",
+            "書き込みに失敗しました。".to_owned(),
+        ),
+    };
+    HttpResponse::bytes(
+        status,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&json!({"error": code, "message": message})).unwrap_or_default(),
+    )
+    .with_header("Cache-Control", "no-store")
+    .with_log_details(json!({
+        "write": {
+            "kind": write_kind,
+            "ipc_status": ipc_status,
+            "ipc_ms": crate::diagnostics::duration_ms(elapsed),
         }
     }))
 }
@@ -1161,6 +1302,7 @@ fn media_ipc_error_response(
         }
         IpcClientError::Remote(error) => (500, "miv_media_error", error.message),
         IpcClientError::CollectionRemote(error) => (500, "miv_media_error", error.message),
+        IpcClientError::WriteRemote(error) => (500, "miv_media_error", error.message),
         IpcClientError::SessionRemote(response) => (
             session_http_status(response.status),
             "session_required",
@@ -1293,6 +1435,7 @@ fn ipc_error_response(
         }
         IpcClientError::CollectionRemote(remote) => (500, "miv_thumbnail_error", remote.message),
         IpcClientError::MediaRemote(remote) => (500, "miv_thumbnail_error", remote.message),
+        IpcClientError::WriteRemote(remote) => (500, "miv_thumbnail_error", remote.message),
         IpcClientError::SessionRemote(response) => (
             session_http_status(response.status),
             "session_required",
@@ -1822,6 +1965,46 @@ mod tests {
         let response = route(&mut request, &state);
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"export {};");
+    }
+
+    #[test]
+    fn local_settings_module_is_public_for_the_app_bootstrap() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        std::fs::write(temp.path().join("local-settings.mjs"), b"export {};").unwrap();
+        let mut request: Request = TestRequest::new()
+            .with_method(Method::Get)
+            .with_path("/local-settings.mjs")
+            .into();
+        let response = route(&mut request, &state);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"export {};");
+    }
+
+    #[test]
+    fn write_ui_timeout_is_an_explicit_gateway_timeout_without_retry() {
+        let response = write_ipc_error_response(
+            crate::ipc_client::ClientFailure {
+                error: IpcClientError::WriteRemote(mimageviewer_ipc::RemoteWriteError::new(
+                    RemoteWriteErrorCode::UiTimeout,
+                    "本体 UI が応答しませんでした",
+                )),
+                retry_count: 0,
+                retry_statuses: Vec::new(),
+            },
+            Duration::from_secs(2),
+            "set_spread",
+        );
+        assert_eq!(response.status, 504);
+        assert!(
+            !response
+                .headers
+                .iter()
+                .any(|(name, _)| *name == "Retry-After")
+        );
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"], "miv_write_error");
+        assert!(body["message"].as_str().unwrap().contains("UI"));
     }
 
     #[test]

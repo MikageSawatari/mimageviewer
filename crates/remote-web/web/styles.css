@@ -957,6 +957,51 @@ button {
   margin: 0;
 }
 
+.local-settings-dialog {
+  gap: 18px;
+}
+
+.local-settings-option {
+  display: grid;
+  min-height: 72px;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 14px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface-raised);
+  cursor: pointer;
+}
+
+.local-settings-option input {
+  width: 22px;
+  height: 22px;
+  margin: 1px 0 0;
+  accent-color: var(--accent);
+}
+
+.local-settings-copy {
+  display: grid;
+  gap: 6px;
+}
+
+.local-settings-copy small,
+.local-settings-status {
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
+.local-settings-status {
+  min-height: 1.55em;
+  margin: 0;
+}
+
+.local-settings-status.is-warning {
+  color: #ffcf87;
+}
+
 .command-shortcuts dt {
   color: #dce2ec;
 }

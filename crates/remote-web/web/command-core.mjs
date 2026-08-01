@@ -19,6 +19,7 @@ export const CommandName = Object.freeze({
   SET_TRANSFORM: "set_transform",
   PAN_BY: "pan_by",
   TOGGLE_MENU: "toggle_menu",
+  OPEN_LOCAL_SETTINGS: "open_local_settings",
   BACK: "back",
   FORWARD: "forward",
   PARENT_FOLDER: "parent_folder",
@@ -175,6 +176,29 @@ export function readingDirectionForSpreadMode(mode, currentDirection) {
 /// 正方形は横持ち側に倒し、縦が横を 1px でも上回ると表示限定 Single にする。
 export function isPortraitViewport(width, height) {
   return Math.max(0, Number(height) || 0) > Math.max(0, Number(width) || 0);
+}
+
+/// 画面向きによる描画限定 Single と、利用者が明示した永続書き込みを分離する。
+export function planSpreadIntent({
+  address = null,
+  selectedMode = null,
+  currentDirection = ReadingDirection.LTR,
+  portraitSinglePage = true,
+  viewportWidth = 0,
+  viewportHeight = 0,
+} = {}) {
+  const forceSinglePage = Boolean(portraitSinglePage) &&
+    isPortraitViewport(viewportWidth, viewportHeight);
+  const validModes = Object.values(SpreadMode);
+  const writeRequest = selectedMode !== null && validModes.includes(selectedMode)
+    ? {
+        kind: "set_spread",
+        address,
+        spread_mode: selectedMode,
+        reading_direction: readingDirectionForSpreadMode(selectedMode, currentDirection),
+      }
+    : null;
+  return { forceSinglePage, writeRequest };
 }
 
 export function viewerImageLayout({

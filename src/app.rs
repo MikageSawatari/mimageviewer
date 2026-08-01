@@ -15974,11 +15974,10 @@ impl App {
     /// `current_folder`。
     pub(crate) fn spread_container_key(&self) -> Option<PathBuf> {
         if let Some(nav) = self.zip_nav.as_ref() {
-            let mut p = nav.tree.zip_path.clone();
-            for seg in nav.current() {
-                p.push(seg);
-            }
-            Some(p)
+            Some(
+                crate::spread_db::container_key_with_fallback(&nav.tree.zip_path, nav.current())
+                    .exact,
+            )
         } else {
             self.current_folder.clone()
         }
@@ -16040,17 +16039,13 @@ impl App {
         fallback: Option<&std::path::Path>,
     ) {
         let db = self.spread_db.as_ref();
-        let stored_spread = db
-            .and_then(|db| db.get(key))
-            .or_else(|| fallback.and_then(|fb| db.and_then(|db| db.get(fb))))
-            .unwrap_or(self.settings.default_spread_mode);
-        self.reading_flow = db
-            .and_then(|db| db.get_flow(key))
-            .or_else(|| fallback.and_then(|fb| db.and_then(|db| db.get_flow(fb))))
-            .unwrap_or(self.settings.default_reading_flow);
-        self.reading_direction = db
-            .and_then(|db| db.get_direction(key))
-            .or_else(|| fallback.and_then(|fb| db.and_then(|db| db.get_direction(fb))))
+        let stored = db
+            .map(|db| db.get_state_with_fallback(key, fallback))
+            .unwrap_or_default();
+        let stored_spread = stored.mode.unwrap_or(self.settings.default_spread_mode);
+        self.reading_flow = stored.flow.unwrap_or(self.settings.default_reading_flow);
+        self.reading_direction = stored
+            .direction
             .unwrap_or(self.settings.default_reading_direction);
         if stored_spread == crate::settings::SpreadMode::Vertical {
             self.spread_mode = crate::settings::SpreadMode::Single;

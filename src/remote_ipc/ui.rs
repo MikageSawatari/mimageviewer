@@ -1,7 +1,12 @@
-use mimageviewer_ipc::{RemoteWebFeatureStatus, SessionConnectionKind};
+use mimageviewer_ipc::{
+    RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource, RemoteWebFeatureStatus,
+    RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse,
+    SessionConnectionKind, SessionStatus,
+};
 use qrcode::{Color, QrCode};
 
-use super::session::{ActiveSessionSnapshot, SessionHandle};
+use super::path_guard::logical_favorite_path;
+use super::session::{ActiveSessionSnapshot, SessionHandle, UiWriteOutcome};
 
 #[derive(Default)]
 pub(crate) struct RemoteSessionUiState {
@@ -74,8 +79,9 @@ impl crate::app::App {
     }
 
     pub(crate) fn poll_remote_session(&mut self, ctx: &egui::Context) {
-        if let Some(handle) = self.remote_session_ui.handle.as_ref() {
+        if let Some(handle) = self.remote_session_ui.handle.clone() {
             handle.install_repaint_context(ctx);
+            self.apply_pending_remote_writes(&handle);
         }
         let snapshot = self
             .remote_session_ui
@@ -105,6 +111,79 @@ impl crate::app::App {
         self.poll_remote_fullscreen_restore();
         if active || self.remote_session_ui.pending_fullscreen_restore.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+    }
+
+    fn apply_pending_remote_writes(&mut self, handle: &SessionHandle) {
+        for pending in handle.take_pending_writes() {
+            let ownership = pending.ownership_response();
+            if ownership.status != SessionStatus::Active {
+                pending.complete(UiWriteOutcome::Session(ownership));
+                continue;
+            }
+            let response = self.apply_remote_write(pending.request());
+            pending.complete(UiWriteOutcome::Write(response));
+        }
+    }
+
+    fn apply_remote_write(&mut self, request: &RemoteWriteRequest) -> RemoteWriteResponse {
+        match request {
+            RemoteWriteRequest::SetSpread {
+                address,
+                spread_mode,
+                reading_direction,
+            } => self.persist_remote_spread(address, *spread_mode, *reading_direction),
+        }
+    }
+
+    fn persist_remote_spread(
+        &mut self,
+        address: &mimageviewer_ipc::RemoteAddress,
+        spread_mode: RemoteSpreadMode,
+        reading_direction: RemoteReadingDirection,
+    ) -> RemoteWriteResponse {
+        let key = match remote_spread_key(&self.settings, address) {
+            Ok(key) => key,
+            Err(error) => return RemoteWriteResponse::Error(error),
+        };
+        let mode = core_spread_mode(spread_mode);
+        let direction = core_reading_direction(mode, reading_direction);
+        let defaults = (
+            self.settings.default_spread_mode,
+            self.settings.default_reading_flow,
+            self.settings.default_reading_direction,
+        );
+        let Some(db) = self.spread_db.as_mut() else {
+            return write_error(
+                RemoteWriteErrorCode::PersistenceFailed,
+                "spread.db を開けなかったため保存できません",
+            );
+        };
+        let started = std::time::Instant::now();
+        match db.set_mode_and_direction(
+            &key.exact,
+            key.fallback.as_deref(),
+            mode,
+            direction,
+            defaults,
+        ) {
+            Ok(()) => {
+                crate::logger::log(format!(
+                    "remote_ipc: UI write applied kind=set_spread duration_ms={:.1}",
+                    started.elapsed().as_secs_f64() * 1000.0
+                ));
+                RemoteWriteResponse::Success
+            }
+            Err(error) => {
+                crate::logger::log(format!(
+                    "remote_ipc: UI write failed kind=set_spread duration_ms={:.1} error={error}",
+                    started.elapsed().as_secs_f64() * 1000.0
+                ));
+                write_error(
+                    RemoteWriteErrorCode::PersistenceFailed,
+                    "spread.db への保存に失敗しました",
+                )
+            }
         }
     }
 
@@ -320,6 +399,81 @@ impl crate::app::App {
     }
 }
 
+fn remote_spread_key(
+    settings: &crate::settings::Settings,
+    address: &mimageviewer_ipc::RemoteAddress,
+) -> Result<crate::spread_db::SpreadContainerKey, RemoteWriteError> {
+    address.validate_syntax().map_err(|_| {
+        RemoteWriteError::new(
+            RemoteWriteErrorCode::BadRequest,
+            "コンテンツアドレスが不正です",
+        )
+    })?;
+    let favorite_id = uuid::Uuid::parse_str(&address.favorite_id).map_err(|_| {
+        RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, "favorite_id が不正です")
+    })?;
+    let favorite = settings
+        .favorites
+        .iter()
+        .find(|favorite| favorite.id == favorite_id)
+        .ok_or_else(|| {
+            RemoteWriteError::new(
+                RemoteWriteErrorCode::FavoriteNotFound,
+                "お気に入りが登録されていません",
+            )
+        })?;
+    let root = logical_favorite_path(&favorite.path, &address.relative_path);
+    let segments = match &address.subresource {
+        RemoteSubresource::File => Vec::new(),
+        RemoteSubresource::ZipDirectory { prefix } => prefix
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        RemoteSubresource::ZipEntry { .. } | RemoteSubresource::PdfPage { .. } => {
+            return Err(RemoteWriteError::new(
+                RemoteWriteErrorCode::Unsupported,
+                "ページ単体には見開き設定を保存できません",
+            ));
+        }
+    };
+    Ok(crate::spread_db::container_key_with_fallback(
+        &root, &segments,
+    ))
+}
+
+fn core_spread_mode(mode: RemoteSpreadMode) -> crate::settings::SpreadMode {
+    match mode {
+        RemoteSpreadMode::Single => crate::settings::SpreadMode::Single,
+        RemoteSpreadMode::Ltr => crate::settings::SpreadMode::Ltr,
+        RemoteSpreadMode::LtrCover => crate::settings::SpreadMode::LtrCover,
+        RemoteSpreadMode::Rtl => crate::settings::SpreadMode::Rtl,
+        RemoteSpreadMode::RtlCover => crate::settings::SpreadMode::RtlCover,
+    }
+}
+
+fn core_reading_direction(
+    mode: crate::settings::SpreadMode,
+    requested: RemoteReadingDirection,
+) -> crate::settings::ReadingDirection {
+    if mode.is_rtl() {
+        crate::settings::ReadingDirection::Rtl
+    } else if matches!(
+        mode,
+        crate::settings::SpreadMode::Ltr | crate::settings::SpreadMode::LtrCover
+    ) {
+        crate::settings::ReadingDirection::Ltr
+    } else if requested.is_rtl() {
+        crate::settings::ReadingDirection::Rtl
+    } else {
+        crate::settings::ReadingDirection::Ltr
+    }
+}
+
+fn write_error(code: RemoteWriteErrorCode, message: &'static str) -> RemoteWriteResponse {
+    RemoteWriteResponse::Error(RemoteWriteError::new(code, message))
+}
+
 fn remote_feature_status_label(status: RemoteWebFeatureStatus) -> &'static str {
     match status {
         RemoteWebFeatureStatus::Configured => "設定済み",
@@ -388,6 +542,35 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
         format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
         format!("{minutes}:{seconds:02}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_spread_key_matches_worker_logical_favorite_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        std::fs::create_dir_all(root.join("album")).unwrap();
+        std::fs::write(root.join("album/book.zip"), b"zip").unwrap();
+        let favorite = crate::settings::FavoriteEntry::new("test".to_owned(), root);
+        let favorite_id = favorite.id.to_string();
+        let mut settings = crate::settings::Settings::default();
+        settings.favorites = vec![favorite.clone()];
+
+        for relative in ["", "album/book.zip"] {
+            let address = mimageviewer_ipc::RemoteAddress::file(&favorite_id, relative);
+            let worker = crate::remote_ipc::path_guard::resolve_existing(
+                std::slice::from_ref(&favorite),
+                &favorite_id,
+                relative,
+            )
+            .unwrap();
+            let ui_key = remote_spread_key(&settings, &address).unwrap();
+            assert_eq!(ui_key.exact, worker.logical, "relative={relative:?}");
+        }
     }
 }
 

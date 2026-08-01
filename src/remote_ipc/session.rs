@@ -1,15 +1,21 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimageviewer_ipc::{
-    RemoteWebConnectionInfo, SessionAcquireRequest, SessionPeerInfo, SessionPingRequest,
+    RemoteWebConnectionInfo, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest,
+    RemoteWriteResponse, SessionAcquireRequest, SessionPeerInfo, SessionPingRequest,
     SessionResponse, SessionStatus,
 };
 
 pub(crate) const LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+pub(crate) const UI_WRITE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
+const UI_WRITE_QUEUE_CAPACITY: usize = 16;
+const WRITE_PENDING: u8 = 0;
+const WRITE_CLAIMED: u8 = 1;
+const WRITE_CANCELLED: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReleaseReason {
@@ -313,21 +319,94 @@ pub(crate) struct SessionSnapshot {
     pub(crate) remote_web: Option<RemoteWebConnectionInfo>,
 }
 
+pub(crate) enum UiWriteOutcome {
+    Write(RemoteWriteResponse),
+    Session(SessionResponse),
+}
+
+struct WriteDispatch {
+    state: AtomicU8,
+}
+
+struct QueuedRemoteWrite {
+    request: RemoteWriteRequest,
+    operation: SessionOperation,
+    reply: mpsc::SyncSender<UiWriteOutcome>,
+    dispatch: Arc<WriteDispatch>,
+}
+
+pub(crate) struct ClaimedRemoteWrite {
+    request: RemoteWriteRequest,
+    operation: SessionOperation,
+    reply: mpsc::SyncSender<UiWriteOutcome>,
+}
+
 #[derive(Clone)]
 pub(crate) struct SessionHandle {
     inner: Arc<Mutex<SessionStateMachine>>,
     origin: Instant,
     repaint: Arc<Mutex<Option<egui::Context>>>,
     remote_web_connections: Arc<Mutex<BTreeMap<u64, Option<RemoteWebConnectionInfo>>>>,
+    write_tx: mpsc::SyncSender<QueuedRemoteWrite>,
+    write_rx: Arc<Mutex<mpsc::Receiver<QueuedRemoteWrite>>>,
+}
+
+impl WriteDispatch {
+    fn pending() -> Self {
+        Self {
+            state: AtomicU8::new(WRITE_PENDING),
+        }
+    }
+
+    fn try_claim(&self) -> bool {
+        self.state
+            .compare_exchange(
+                WRITE_PENDING,
+                WRITE_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn cancel_pending(&self) -> bool {
+        self.state
+            .compare_exchange(
+                WRITE_PENDING,
+                WRITE_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+impl ClaimedRemoteWrite {
+    pub(crate) fn request(&self) -> &RemoteWriteRequest {
+        &self.request
+    }
+
+    pub(crate) fn ownership_response(&self) -> SessionResponse {
+        self.operation.ownership_response()
+    }
+
+    pub(crate) fn complete(self, outcome: UiWriteOutcome) {
+        let success = matches!(outcome, UiWriteOutcome::Write(RemoteWriteResponse::Success));
+        self.operation.finish(success);
+        let _ = self.reply.send(outcome);
+    }
 }
 
 impl SessionHandle {
     pub(crate) fn new() -> Self {
+        let (write_tx, write_rx) = mpsc::sync_channel(UI_WRITE_QUEUE_CAPACITY);
         Self {
             inner: Arc::new(Mutex::new(SessionStateMachine::default())),
             origin: Instant::now(),
             repaint: Arc::new(Mutex::new(None)),
             remote_web_connections: Arc::new(Mutex::new(BTreeMap::new())),
+            write_tx,
+            write_rx: Arc::new(Mutex::new(write_rx)),
         }
     }
 
@@ -463,6 +542,65 @@ impl SessionHandle {
         self.notify_ui();
     }
 
+    pub(crate) fn submit_write(
+        &self,
+        request: RemoteWriteRequest,
+        operation: SessionOperation,
+    ) -> UiWriteOutcome {
+        self.submit_write_with_timeout(request, operation, UI_WRITE_ACCEPT_TIMEOUT)
+    }
+
+    fn submit_write_with_timeout(
+        &self,
+        request: RemoteWriteRequest,
+        operation: SessionOperation,
+        timeout: Duration,
+    ) -> UiWriteOutcome {
+        let dispatch = Arc::new(WriteDispatch::pending());
+        let (reply, receiver) = mpsc::sync_channel(1);
+        let queued = QueuedRemoteWrite {
+            request,
+            operation,
+            reply,
+            dispatch: Arc::clone(&dispatch),
+        };
+        match self.write_tx.try_send(queued) {
+            Ok(()) => self.notify_ui(),
+            Err(mpsc::TrySendError::Full(_)) => return write_busy_outcome(),
+            Err(mpsc::TrySendError::Disconnected(_)) => return write_stopped_outcome(),
+        }
+        match receiver.recv_timeout(timeout) {
+            Ok(outcome) => outcome,
+            Err(mpsc::RecvTimeoutError::Disconnected) => write_stopped_outcome(),
+            Err(mpsc::RecvTimeoutError::Timeout) if dispatch.cancel_pending() => {
+                write_timeout_outcome()
+            }
+            // UI が期限内に claim 済みなら、同じ App-owned DB 操作の確定結果を返す。
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                receiver.recv().unwrap_or_else(|_| write_stopped_outcome())
+            }
+        }
+    }
+
+    pub(crate) fn take_pending_writes(&self) -> Vec<ClaimedRemoteWrite> {
+        let receiver = self
+            .write_rx
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut claimed = Vec::new();
+        while let Ok(queued) = receiver.try_recv() {
+            if queued.dispatch.try_claim() {
+                queued.operation.started();
+                claimed.push(ClaimedRemoteWrite {
+                    request: queued.request,
+                    operation: queued.operation,
+                    reply: queued.reply,
+                });
+            }
+        }
+        claimed
+    }
+
     pub(crate) fn install_repaint_context(&self, ctx: &egui::Context) {
         *self
             .repaint
@@ -504,6 +642,33 @@ fn validate_remote_web_connection_info(info: &RemoteWebConnectionInfo) -> bool {
         && !authority.contains('@')
         && !url.contains(['?', '#'])
         && !url.chars().any(char::is_control)
+}
+
+fn write_error_outcome(code: RemoteWriteErrorCode, message: &'static str) -> UiWriteOutcome {
+    UiWriteOutcome::Write(RemoteWriteResponse::Error(RemoteWriteError::new(
+        code, message,
+    )))
+}
+
+fn write_busy_outcome() -> UiWriteOutcome {
+    write_error_outcome(
+        RemoteWriteErrorCode::Busy,
+        "本体 UI への書き込み queue が混み合っています",
+    )
+}
+
+fn write_timeout_outcome() -> UiWriteOutcome {
+    write_error_outcome(
+        RemoteWriteErrorCode::UiTimeout,
+        "本体 UI が 2 秒以内に書き込み要求を受理しませんでした",
+    )
+}
+
+fn write_stopped_outcome() -> UiWriteOutcome {
+    write_error_outcome(
+        RemoteWriteErrorCode::Internal,
+        "本体 UI の書き込み受付が停止しています",
+    )
 }
 
 pub(crate) struct SessionOperation {
@@ -653,6 +818,17 @@ fn set_sleep_prevention(_active: bool) {}
 mod tests {
     use super::*;
 
+    fn write_request() -> RemoteWriteRequest {
+        RemoteWriteRequest::SetSpread {
+            address: mimageviewer_ipc::RemoteAddress::file(
+                "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+                "books/book.pdf",
+            ),
+            spread_mode: mimageviewer_ipc::RemoteSpreadMode::RtlCover,
+            reading_direction: mimageviewer_ipc::RemoteReadingDirection::Rtl,
+        }
+    }
+
     fn peer() -> SessionPeerInfo {
         SessionPeerInfo {
             connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
@@ -762,6 +938,70 @@ mod tests {
                 .begin_operation(Duration::from_secs(3), "client", "test".to_owned())
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn write_without_session_is_rejected_before_ui_queue() {
+        let handle = SessionHandle::new();
+        let response = match handle.begin_operation("client", "見開き設定を書き込み中".to_owned())
+        {
+            Ok(_) => panic!("write unexpectedly acquired a missing session"),
+            Err(response) => response,
+        };
+        assert_eq!(response.status, SessionStatus::NotAcquired);
+        assert!(handle.take_pending_writes().is_empty());
+    }
+
+    #[test]
+    fn ui_claimed_write_returns_its_application_result() {
+        let handle = SessionHandle::new();
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        let worker_handle = handle.clone();
+        let worker = std::thread::spawn(move || {
+            let operation = worker_handle
+                .begin_operation("client", "見開き設定を書き込み中".to_owned())
+                .unwrap();
+            worker_handle.submit_write(write_request(), operation)
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let claimed = loop {
+            if let Some(claimed) = handle.take_pending_writes().pop() {
+                break claimed;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        assert_eq!(claimed.ownership_response().status, SessionStatus::Active);
+        claimed.complete(UiWriteOutcome::Write(RemoteWriteResponse::Success));
+        assert!(matches!(
+            worker.join().unwrap(),
+            UiWriteOutcome::Write(RemoteWriteResponse::Success)
+        ));
+    }
+
+    #[test]
+    fn ui_write_timeout_cancels_before_late_drain() {
+        let handle = SessionHandle::new();
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        let operation = handle
+            .begin_operation("client", "見開き設定を書き込み中".to_owned())
+            .unwrap();
+        let outcome =
+            handle.submit_write_with_timeout(write_request(), operation, Duration::from_millis(10));
+        assert!(matches!(
+            outcome,
+            UiWriteOutcome::Write(RemoteWriteResponse::Error(RemoteWriteError {
+                code: RemoteWriteErrorCode::UiTimeout,
+                ..
+            }))
+        ));
+        assert!(handle.take_pending_writes().is_empty());
     }
 
     #[test]

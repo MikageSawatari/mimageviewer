@@ -37,7 +37,9 @@ v3.0.0 の目玉として、外出先のスマートフォン / タブレット 
 | 書き込み (読書履歴・ブックマーク・見開き・トリム・タグ・レーティング) | **必ず IPC → 本体** | 全永続ストアの writer を本体 1 つに固定する |
 | 重い生成 (PDF レンダ・AI アップスケール・カラー化・補正合成) | **IPC → 本体** | PDFium プール・ONNX セッション・GPU をステートフルに保持しているのは本体 |
 
-SQLite は WAL なので「本体が唯一の writer / remote-web は reader」は安全に成立する。
+SQLite は DB ごとに journal 設定が異なる。特に `spread.db` は WAL / `busy_timeout` を設定せず、
+`App` が起動時に開いた接続を保持するため、IPC worker の第2接続からは書かない。
+「本体が唯一の writer / remote-web は reader」を維持し、書き込みは App 所有ハンドルへ渡す。
 **この境界を崩す変更を入れないこと。**
 
 remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去した。settings / catalog の writer は
@@ -627,7 +629,8 @@ IPC 応答期限は 10 秒とする。実測の最も遅い単発 RAW decode 1.7
 
 本体 IPC は Home を専用 queue + 1 worker に分離した。サムネイルと集約評価は別の heavy queue で
 処理し、利用者設定 worker 数の半分かつ最大 2 worker (`clamp(configured/2, 1, 2)`) に制限する。
-remote IPC は UI thread を使わず、ローカル表示用 worker とも別である。CPU / disk の物理競合は
+remote IPC の読み取り・生成は UI thread を使わず、ローカル表示用 worker とも別である。
+§12.8 の短い App-owned 永続書き込みだけは UI thread で行う。CPU / disk の物理競合は
 残るが、remote 由来の decode を最大 2 本に抑え、1 クライアントが利用者設定上限の全 worker を
 追加消費しない。heavy queue 満杯時は pipe connection を切断も block もせず、プロトコル上の
 `Busy` を返す。
@@ -829,7 +832,7 @@ foreground との優先度を持っていなかった。
 中断する。ready Blob は foreground が直接使い、network / IPC 待ちなしで decode と原子的差替えへ
 進む。
 
-現行 protocol v10 の `PageRequest.priority` は `Foreground` / `Prefetch` を共有型で表す。remote-web は
+現行 protocol v11 の `PageRequest.priority` は `Foreground` / `Prefetch` を共有型で表す。remote-web は
 prefetch admission を1件に制限し、all / heavy の最終1枠を使用させない。本体も全接続合計の
 prefetch queued + active を1件に制限し、remote heavy worker が1本しかない設定では prefetch を
 `Busy` で拒否する。2 worker 時も heavy queue / active が空の時だけ先読みを開始し、最大1本なので
@@ -853,13 +856,12 @@ layout → atomic replace を実行する。bundler、TypeScript、追加 packag
 
 ### 12.7 見開き表示 (2026-08-01)
 
-見開きのページ組みは remote-web に複製しない。protocol v10 の `ContainerRequest` は、Web
-セッション中だけの `spread_mode` / `reading_direction` 上書きと、縦持ち表示用の
-`force_single_page` を本体へ渡す。
+見開きのページ組みは remote-web に複製しない。protocol v11 の `ContainerRequest` は
+縦持ち表示用の `force_single_page` を本体へ渡す。`spread_mode` / `reading_direction` の
+一時上書き欄は互換用に残すが、Web の明示操作は §12.8 の書き込み要求を使う。
 本体は `spread.db` を read-only で参照し、コンテナ合成 key と root fallback を
 `App::spread_container_key` / `App::apply_spread_for_key_with_fallback` と同じ規則で解決する。
-初期値はコンテナ行、行が無ければ `Settings::default_spread_mode` とし、Web からの変更は DB へ
-保存しない。
+初期値はコンテナ行、行が無ければ `Settings::default_spread_mode` とする。
 
 本体のグループ列生成は `ui_fullscreen::build_image_reading_indices`、
 `build_spread_display_units_with_predicates`、`is_spread_pairable_item`、
@@ -883,7 +885,8 @@ remote-web は受信した各 address を favorite allowlist で再検証し、�
 メニューの巡回順も `SpreadMode::next_in_spread_cycle` と同じ
 Single → Ltr → LtrCover → Rtl → RtlCover とする。`spread_page_gap_px` は本体 settings から応答し、
 CSS page gap へ反映する。viewport は `height > width` を縦持ちとし（正方形は横持ち側）、本体へ
-`force_single_page=1` を再要求する。応答は保存由来の `configured_spread_mode` と描画に使う
+端末ローカル設定が ON の時だけ `force_single_page=1` を再要求する。応答は保存由来の
+`configured_spread_mode` と描画に使う
 `effective_spread_mode=Single` を分けるため、向き変更で保存設定は変わらない。resize / orientation
 change は 180 ms debounce 後にこの判定を再実行する。
 
@@ -918,6 +921,41 @@ layout 結果に含め、page layer と各 flex item の width / height を明�
 LTR は「先頭ページです」「最終ページです」。RTL はそれぞれ
 「先頭ページです（右→左綴じ：次は左をタップ）」、
 「最終ページです（右→左綴じ：前は右をタップ）」とし、overlay は pointer input を遮らない。
+
+### 12.8 App 所有ハンドル経由の見開き書き込みと端末設定 (2026-08-01)
+
+protocol v11 は書き込み種別を共有 `RemoteWriteRequest` enum へ集約し、最初の variant を
+`SetSpread { address, spread_mode, reading_direction }` とする。種別ごとの bool / `Option` /
+pending field は作らない。認証済み `POST /api/write` は remote-web の専用 bounded FIFO worker へ
+渡り、本体側でも favorite allowlist、canonical containment、コンテナ種別を再検証する。worker は
+DB を開かず、`SessionHandle` の bounded queue へ要求と one-shot 応答 channel を投入する。
+既存 repaint context を起こし、UI thread の `App::poll_remote_session` が drain して
+`App.spread_db` から mode / direction を1 transactionで保存し、成功または型付き失敗理由を
+同じ経路で HTTP client まで返す。
+
+UI が2秒以内に要求を claim しなければ pending→cancelled の原子的遷移を行い、以後 drain されても
+適用せず `UiTimeout` (HTTP 504) を返す。期限内に UI が claim 済みなら曖昧な timeout 応答にはせず、
+短い DB transaction の確定結果を待つ。session owner は IPC worker の投入前と UI drain 時の
+両方で照合し、未取得 client は `NotAcquired`、別 client は `Superseded` として拒否する。
+書き込みは畳み込まず単一 worker の FIFO で全要求へ個別応答する。Web は重複適用を避けるため
+write の transport retry も行わない。連打時は全書き込みを順番に適用し、表示再取得だけを最後の
+要求へまとめる。
+
+キーは `spread_db::container_key_with_fallback` と `get_state_with_fallback` に集約し、App と remote
+の両方が exact key (`zip_path + effective prefix`) と旧 root fallback を共有する。remote 書き込みも
+同じ exact keyへ保存する。exact 行がまだ無い場合の reading flow は fallback 行から継承し、
+fallback がある本で既定 mode を明示した場合も継承を上書きする exact 行を残す。
+縦長画面の `force_single_page` は `effective_spread_mode` だけを Single にし、書き込み API を呼ばず
+`configured_spread_mode` と DB 行を変更しない。操作権返却時は既存
+`reload_after_remote_session_release` が現在 view を再読込するため、remote 保存値が本体表示へ反映される。
+
+端末ごとの設定は server へ送らず、localStorage の単一 key
+`miv-remote-local-settings` に JSON `{"version":1,"portraitSinglePage":boolean}` として保存する。
+既定は `portraitSinglePage=true`。☰ の「端末の設定」で OFF にすると縦持ちでも保存済み見開きを
+維持する。parse / normalize / serialize は純粋関数とし、未知 version、壊れた JSON、型不正は
+安全な既定値へ戻す。localStorage の取得・保存例外は wrapper で捕捉し、そのタブ内のメモリ値で
+動作を継続する。項目追加時は version 方針を決め、`defaultLocalSettings`、
+`normalizeLocalSettings`、設定画面、round-trip / 不正値テストを同じ aggregate objectへ追加する。
 
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 
@@ -992,9 +1030,8 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 ### 13.6 残タスク (2026-08-01 時点)
 
-1. **端末ローカル設定 + 書き込み系** — 見開きモード / 綴じ方向 (`spread.db` への書き込み)、
-   読書履歴、レーティング、ブックマーク。あわせて端末ローカル設定の置き場 (`localStorage`) を
-   新設し、「縦長画面では見開きを解除する」を入れる (既定 ON)
+1. **次の書き込み種別** — 読書履歴、レーティング、ブックマークを §12.8 の
+   `RemoteWriteRequest` へ variant として追加する
 2. **通常フォルダの見開き対応** — 現在は ZIP / PDF の `/api/container` のみ
 3. **動画・音声のストリーミング** — 正本は
    [web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md)

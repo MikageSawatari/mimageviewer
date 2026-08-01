@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use mimageviewer_ipc::{
     ClientHello, ClientMessage, CollectionError, CollectionErrorCode, CollectionResponse,
     ContainerResponse, HomeResponse, MAX_CONTROL_FRAME_BYTES, MediaError, MediaErrorCode,
-    PIPE_NAME, PROTOCOL_VERSION, PagePriority, PageResponse, ServerMessage, SessionResponse,
-    SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse, negotiate, read_frame,
-    write_frame,
+    PIPE_NAME, PROTOCOL_VERSION, PagePriority, PageResponse, RemoteWriteError,
+    RemoteWriteErrorCode, RemoteWriteResponse, ServerMessage, SessionResponse, SessionStatus,
+    ThumbnailError, ThumbnailErrorCode, ThumbnailResponse, negotiate, read_frame, write_frame,
 };
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
@@ -28,7 +28,7 @@ use windows::core::PCWSTR;
 
 use super::collections::CollectionEngine;
 use super::container::ContainerEngine;
-use super::session::{SessionHandle, SessionOperation, SessionRuntime};
+use super::session::{SessionHandle, SessionOperation, SessionRuntime, UiWriteOutcome};
 use super::thumbnail::{ThumbnailEngine, WorkerContext};
 
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
@@ -37,6 +37,7 @@ const PIPE_MAX_INSTANCES: u32 = 16;
 const ACCEPTOR_COUNT: usize = 4;
 const HEAVY_WORK_QUEUE_CAPACITY: usize = 16;
 const HOME_WORK_QUEUE_CAPACITY: usize = 8;
+const WRITE_WORK_QUEUE_CAPACITY: usize = 16;
 
 enum Work {
     Request {
@@ -121,8 +122,10 @@ pub(super) struct ServerGuard {
     listeners: Vec<std::thread::JoinHandle<()>>,
     workers: Vec<std::thread::JoinHandle<()>>,
     home_worker: Option<std::thread::JoinHandle<()>>,
+    write_worker: Option<std::thread::JoinHandle<()>>,
     heavy_work_tx: mpsc::SyncSender<Work>,
     home_work_tx: mpsc::SyncSender<Work>,
+    write_work_tx: mpsc::SyncSender<Work>,
     session_runtime: SessionRuntime,
 }
 
@@ -154,8 +157,10 @@ impl ServerGuard {
         let (heavy_work_tx, heavy_work_rx) = mpsc::sync_channel::<Work>(HEAVY_WORK_QUEUE_CAPACITY);
         let heavy_work_rx = Arc::new(Mutex::new(heavy_work_rx));
         let (home_work_tx, home_work_rx) = mpsc::sync_channel::<Work>(HOME_WORK_QUEUE_CAPACITY);
+        let (write_work_tx, write_work_rx) = mpsc::sync_channel::<Work>(WRITE_WORK_QUEUE_CAPACITY);
         let heavy_metrics = Arc::new(QueueMetrics::new("heavy"));
         let home_metrics = Arc::new(QueueMetrics::new("home"));
+        let write_metrics = Arc::new(QueueMetrics::new("write"));
         let prefetch_in_flight = Arc::new(AtomicUsize::new(0));
         let home_collection_engine = Arc::clone(&collection_engine);
         let home_worker_metrics = Arc::clone(&home_metrics);
@@ -165,6 +170,20 @@ impl ServerGuard {
                 home_worker_loop(home_work_rx, &home_collection_engine, &home_worker_metrics)
             })
             .map_err(|error| format!("remote IPC home worker を開始できません: {error}"))?;
+        let write_container_engine = Arc::clone(&container_engine);
+        let write_session = session_handle.clone();
+        let write_worker_metrics = Arc::clone(&write_metrics);
+        let write_worker = std::thread::Builder::new()
+            .name("remote-write".to_owned())
+            .spawn(move || {
+                write_worker_loop(
+                    write_work_rx,
+                    &write_container_engine,
+                    &write_session,
+                    &write_worker_metrics,
+                )
+            })
+            .map_err(|error| format!("remote IPC write worker を開始できません: {error}"))?;
         let mut workers = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
             let work_rx = Arc::clone(&heavy_work_rx);
@@ -196,8 +215,10 @@ impl ServerGuard {
             let listener_stop = Arc::clone(&stop);
             let listener_heavy_tx = heavy_work_tx.clone();
             let listener_home_tx = home_work_tx.clone();
+            let listener_write_tx = write_work_tx.clone();
             let listener_heavy_metrics = Arc::clone(&heavy_metrics);
             let listener_home_metrics = Arc::clone(&home_metrics);
+            let listener_write_metrics = Arc::clone(&write_metrics);
             let listener_next_connection_id = Arc::clone(&next_connection_id);
             let listener_prefetch_in_flight = Arc::clone(&prefetch_in_flight);
             let listener_session = session_handle.clone();
@@ -208,8 +229,10 @@ impl ServerGuard {
                         listener_stop,
                         listener_heavy_tx,
                         listener_home_tx,
+                        listener_write_tx,
                         listener_heavy_metrics,
                         listener_home_metrics,
+                        listener_write_metrics,
                         listener_next_connection_id,
                         listener_prefetch_in_flight,
                         worker_count,
@@ -231,17 +254,19 @@ impl ServerGuard {
                         let _ = heavy_work_tx.send(Work::Stop);
                     }
                     let _ = home_work_tx.send(Work::Stop);
+                    let _ = write_work_tx.send(Work::Stop);
                     for worker in workers {
                         let _ = worker.join();
                     }
                     let _ = home_worker.join();
+                    let _ = write_worker.join();
                     return Err(format!("remote IPC listener を開始できません: {error}"));
                 }
             }
         }
 
         crate::logger::log(format!(
-            "remote_ipc: listening pipe={PIPE_NAME} protocol={PROTOCOL_VERSION} heavy_workers={worker_count} configured_workers={configured_worker_count} home_workers=1 prefetch_limit={} acceptors={ACCEPTOR_COUNT} multiplexed=true",
+            "remote_ipc: listening pipe={PIPE_NAME} protocol={PROTOCOL_VERSION} heavy_workers={worker_count} configured_workers={configured_worker_count} home_workers=1 write_workers=1 prefetch_limit={} acceptors={ACCEPTOR_COUNT} multiplexed=true",
             usize::from(worker_count >= 2)
         ));
         Ok(Self {
@@ -249,8 +274,10 @@ impl ServerGuard {
             listeners,
             workers,
             home_worker: Some(home_worker),
+            write_worker: Some(write_worker),
             heavy_work_tx,
             home_work_tx,
+            write_work_tx,
             session_runtime,
         })
     }
@@ -273,10 +300,14 @@ impl Drop for ServerGuard {
             let _ = self.heavy_work_tx.send(Work::Stop);
         }
         let _ = self.home_work_tx.send(Work::Stop);
+        let _ = self.write_work_tx.send(Work::Stop);
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
         if let Some(worker) = self.home_worker.take() {
+            let _ = worker.join();
+        }
+        if let Some(worker) = self.write_worker.take() {
             let _ = worker.join();
         }
         crate::logger::log("remote_ipc: stopped".to_owned());
@@ -342,6 +373,13 @@ fn worker_loop(
                         id,
                         response: container_engine.page(request, &context),
                     },
+                    ClientMessage::Write { id, .. } => ServerMessage::Write {
+                        id,
+                        response: RemoteWriteResponse::Error(RemoteWriteError::new(
+                            RemoteWriteErrorCode::Internal,
+                            "write request was routed to a heavy worker",
+                        )),
+                    },
                     ClientMessage::RemoteWebConnectionInfo { id, .. } => {
                         ServerMessage::RemoteWebConnectionInfo {
                             id,
@@ -404,6 +442,66 @@ fn home_worker_loop(
     crate::logger::log("remote_ipc: worker_stopped queue=home worker=home-0".to_owned());
 }
 
+fn write_worker_loop(
+    work_rx: mpsc::Receiver<Work>,
+    container_engine: &ContainerEngine,
+    session: &SessionHandle,
+    metrics: &QueueMetrics,
+) {
+    crate::logger::log("remote_ipc: worker_started queue=write worker=write-0".to_owned());
+    while let Ok(work) = work_rx.recv() {
+        let Work::Request {
+            message,
+            reply,
+            enqueued_at,
+            session_operation,
+            ..
+        } = work
+        else {
+            break;
+        };
+        let request_id = message.id();
+        let (queued, active) = metrics.started();
+        crate::logger::log(format!(
+            "remote_ipc: worker_start request_id={request_id} kind=write queue=write worker=write-0 queue_wait_ms={:.1} queued={queued} active={active}",
+            enqueued_at.elapsed().as_secs_f64() * 1000.0
+        ));
+        let started_at = Instant::now();
+        let response = match message {
+            ClientMessage::Write { id, request, .. } => {
+                if let Err(error) = container_engine.validate_write_request(&request) {
+                    session_operation.started();
+                    session_operation.finish(false);
+                    ServerMessage::Write {
+                        id,
+                        response: RemoteWriteResponse::Error(error),
+                    }
+                } else {
+                    match session.submit_write(request, session_operation) {
+                        UiWriteOutcome::Write(response) => ServerMessage::Write { id, response },
+                        UiWriteOutcome::Session(response) => {
+                            ServerMessage::Session { id, response }
+                        }
+                    }
+                }
+            }
+            other => {
+                session_operation.started();
+                session_operation.finish(false);
+                service_stopped_response(&other)
+            }
+        };
+        let outcome = response_outcome(&response);
+        let reply_ok = reply.send(response).is_ok();
+        let (queued, active) = metrics.finished();
+        crate::logger::log(format!(
+            "remote_ipc: worker_finish request_id={request_id} kind=write queue=write worker=write-0 outcome={outcome} duration_ms={:.1} reply_ok={reply_ok} queued={queued} active={active}",
+            started_at.elapsed().as_secs_f64() * 1000.0
+        ));
+    }
+    crate::logger::log("remote_ipc: worker_stopped queue=write worker=write-0".to_owned());
+}
+
 fn execute_work(
     message: ClientMessage,
     reply: mpsc::Sender<ServerMessage>,
@@ -458,6 +556,7 @@ fn request_kind(message: &ClientMessage) -> &'static str {
             PagePriority::Foreground => "page_foreground",
             PagePriority::Prefetch => "page_prefetch",
         },
+        ClientMessage::Write { .. } => "write",
     }
 }
 
@@ -469,6 +568,7 @@ fn message_client_id(message: &ClientMessage) -> Option<&str> {
         | ClientMessage::Collection { client_id, .. }
         | ClientMessage::Container { client_id, .. }
         | ClientMessage::Page { client_id, .. }
+        | ClientMessage::Write { client_id, .. }
         | ClientMessage::SessionActivity { client_id, .. } => Some(client_id),
         ClientMessage::SessionAcquire { request, .. } => Some(&request.client_id),
         ClientMessage::SessionPing { request, .. } => Some(&request.client_id),
@@ -499,6 +599,7 @@ fn operation_description(message: &ClientMessage) -> String {
             }
             _ => "ページをレンダリング中".to_owned(),
         },
+        ClientMessage::Write { .. } => "見開き設定を書き込み中".to_owned(),
         ClientMessage::SessionAcquire { .. }
         | ClientMessage::SessionPing { .. }
         | ClientMessage::SessionActivity { .. } => "接続を確認中".to_owned(),
@@ -542,6 +643,10 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
         | ServerMessage::Page {
             response: PageResponse::Success(_),
             ..
+        }
+        | ServerMessage::Write {
+            response: RemoteWriteResponse::Success,
+            ..
         } => "ok",
         ServerMessage::RemoteWebConnectionInfo { .. }
         | ServerMessage::Session { .. }
@@ -564,6 +669,10 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
         | ServerMessage::Page {
             response: PageResponse::Error(_),
             ..
+        }
+        | ServerMessage::Write {
+            response: RemoteWriteResponse::Error(_),
+            ..
         } => "error",
     }
 }
@@ -572,8 +681,10 @@ fn acceptor_loop(
     stop: Arc<AtomicBool>,
     heavy_work_tx: mpsc::SyncSender<Work>,
     home_work_tx: mpsc::SyncSender<Work>,
+    write_work_tx: mpsc::SyncSender<Work>,
     heavy_metrics: Arc<QueueMetrics>,
     home_metrics: Arc<QueueMetrics>,
+    write_metrics: Arc<QueueMetrics>,
     next_connection_id: Arc<AtomicU64>,
     prefetch_in_flight: Arc<AtomicUsize>,
     heavy_worker_count: usize,
@@ -620,8 +731,10 @@ fn acceptor_loop(
         ));
         let heavy_work_tx = heavy_work_tx.clone();
         let home_work_tx = home_work_tx.clone();
+        let write_work_tx = write_work_tx.clone();
         let heavy_metrics = Arc::clone(&heavy_metrics);
         let home_metrics = Arc::clone(&home_metrics);
+        let write_metrics = Arc::clone(&write_metrics);
         let prefetch_in_flight = Arc::clone(&prefetch_in_flight);
         let session = session.clone();
         if let Err(error) = std::thread::Builder::new()
@@ -632,8 +745,10 @@ fn acceptor_loop(
                     pipe,
                     heavy_work_tx,
                     home_work_tx,
+                    write_work_tx,
                     heavy_metrics,
                     home_metrics,
+                    write_metrics,
                     prefetch_in_flight,
                     heavy_worker_count,
                     session,
@@ -655,8 +770,10 @@ fn handle_connection(
     mut pipe: PipeStream,
     heavy_work_tx: mpsc::SyncSender<Work>,
     home_work_tx: mpsc::SyncSender<Work>,
+    write_work_tx: mpsc::SyncSender<Work>,
     heavy_metrics: Arc<QueueMetrics>,
     home_metrics: Arc<QueueMetrics>,
+    write_metrics: Arc<QueueMetrics>,
     prefetch_in_flight: Arc<AtomicUsize>,
     heavy_worker_count: usize,
     session: SessionHandle,
@@ -833,6 +950,8 @@ fn handle_connection(
         // 塞がず、後続 Home を読めるよう Busy を明示応答する。
         let (work_tx, metrics) = if matches!(message, ClientMessage::Home { .. }) {
             (&home_work_tx, &home_metrics)
+        } else if matches!(message, ClientMessage::Write { .. }) {
+            (&write_work_tx, &write_metrics)
         } else {
             (&heavy_work_tx, &heavy_metrics)
         };
@@ -971,6 +1090,13 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
                 "mIV 本体のページワーカーが停止しています",
             )),
         },
+        ClientMessage::Write { id, .. } => ServerMessage::Write {
+            id: *id,
+            response: RemoteWriteResponse::Error(RemoteWriteError::new(
+                RemoteWriteErrorCode::Internal,
+                "mIV 本体の書き込みワーカーが停止しています",
+            )),
+        },
     }
 }
 
@@ -1025,6 +1151,13 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
             response: PageResponse::Error(MediaError::new(
                 MediaErrorCode::Busy,
                 "mIV 本体のリモートページ queue が混み合っています",
+            )),
+        },
+        ClientMessage::Write { id, .. } => ServerMessage::Write {
+            id: *id,
+            response: RemoteWriteResponse::Error(RemoteWriteError::new(
+                RemoteWriteErrorCode::Busy,
+                "mIV 本体のリモート書き込み queue が混み合っています",
             )),
         },
     }

@@ -8,7 +8,8 @@ use mimageviewer_ipc::{
     ContainerEntry, ContainerEntryKind, ContainerKind, ContainerPayload, ContainerRequest,
     ContainerResponse, MediaError, MediaErrorCode, PageGroup, PagePayload, PagePriority,
     PageRequest, PageResponse, RemoteAddress, RemoteReadingDirection, RemoteSpreadMode,
-    RemoteSubresource, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse,
+    RemoteSubresource, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, ThumbnailError,
+    ThumbnailErrorCode, ThumbnailResponse,
 };
 
 use super::path_guard::{ResolveError, ResolvedFavoritePath, resolve_existing};
@@ -94,6 +95,32 @@ impl ContainerEngine {
             started.elapsed().as_secs_f64() * 1000.0
         ));
         response
+    }
+
+    pub(super) fn validate_write_request(
+        &self,
+        request: &RemoteWriteRequest,
+    ) -> Result<(), RemoteWriteError> {
+        let address = request.address();
+        let resolved = self
+            .resolve(address)
+            .map_err(remote_write_error_from_media)?;
+        let is_file = std::fs::metadata(&resolved.canonical)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false);
+        let supported = match address.subresource {
+            RemoteSubresource::File => {
+                is_file && (is_zip_path(&resolved.logical) || is_pdf_path(&resolved.logical))
+            }
+            RemoteSubresource::ZipDirectory { .. } => is_file && is_zip_path(&resolved.logical),
+            RemoteSubresource::ZipEntry { .. } | RemoteSubresource::PdfPage { .. } => false,
+        };
+        supported.then_some(()).ok_or_else(|| {
+            RemoteWriteError::new(
+                RemoteWriteErrorCode::Unsupported,
+                "見開き設定を書き込めるコンテナではありません",
+            )
+        })
     }
 
     pub(super) fn thumbnail(
@@ -414,16 +441,12 @@ impl ContainerEngine {
         zip_context: Option<(&[String], &Path)>,
     ) -> SpreadPayload {
         let (key, fallback) = if let Some((segments, root)) = zip_context {
-            let mut key = root.to_path_buf();
-            for segment in segments {
-                key.push(segment);
-            }
-            let fallback = (!segments.is_empty()).then_some(root);
-            (key, fallback)
+            let key = crate::spread_db::container_key_with_fallback(root, segments);
+            (key.exact, key.fallback)
         } else {
             (resolved.logical.clone(), None)
         };
-        let (stored_mode, stored_direction) = self.stored_spread_state(&key, fallback);
+        let (stored_mode, stored_direction) = self.stored_spread_state(&key, fallback.as_deref());
         let (configured, effective, reading_direction) = resolve_spread_state(
             request.spread_mode,
             request.reading_direction,
@@ -474,17 +497,11 @@ impl ContainerEngine {
             .spread_db
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let mode = db
+        let stored = db
             .as_ref()
-            .and_then(|db| db.get(key))
-            .or_else(|| fallback.and_then(|path| db.as_ref().and_then(|db| db.get(path))));
-        let direction = db
-            .as_ref()
-            .and_then(|db| db.get_direction(key))
-            .or_else(|| {
-                fallback.and_then(|path| db.as_ref().and_then(|db| db.get_direction(path)))
-            });
-        (mode, direction)
+            .map(|db| db.get_state_with_fallback(key, fallback))
+            .unwrap_or_default();
+        (stored.mode, stored.direction)
     }
 
     fn cached_landscape_flags(
@@ -1011,6 +1028,22 @@ fn resolve_media_error(error: ResolveError) -> MediaError {
     }
 }
 
+fn remote_write_error_from_media(error: MediaError) -> RemoteWriteError {
+    let code = match error.code {
+        MediaErrorCode::BadRequest => RemoteWriteErrorCode::BadRequest,
+        MediaErrorCode::FavoriteNotFound => RemoteWriteErrorCode::FavoriteNotFound,
+        MediaErrorCode::PathRejected => RemoteWriteErrorCode::PathRejected,
+        MediaErrorCode::NotFound => RemoteWriteErrorCode::NotFound,
+        MediaErrorCode::Unsupported => RemoteWriteErrorCode::Unsupported,
+        MediaErrorCode::Busy => RemoteWriteErrorCode::Busy,
+        MediaErrorCode::PasswordRequired
+        | MediaErrorCode::PageOutOfRange
+        | MediaErrorCode::RenderFailed
+        | MediaErrorCode::Internal => RemoteWriteErrorCode::Internal,
+    };
+    RemoteWriteError::new(code, error.message)
+}
+
 fn media_error(code: MediaErrorCode, message: impl Into<String>) -> MediaError {
     MediaError::new(code, message)
 }
@@ -1220,6 +1253,27 @@ mod tests {
         assert_eq!(
             read_only.get_direction(&book),
             Some(crate::settings::ReadingDirection::Rtl)
+        );
+        assert_eq!(
+            resolve_spread_state(
+                None,
+                None,
+                read_only.get(&book),
+                read_only.get_direction(&book),
+                crate::settings::SpreadMode::Single,
+                crate::settings::ReadingDirection::Ltr,
+                true,
+            ),
+            (
+                RemoteSpreadMode::Rtl,
+                RemoteSpreadMode::Single,
+                RemoteReadingDirection::Rtl,
+            )
+        );
+        assert_eq!(
+            read_only.get(&book),
+            Some(crate::settings::SpreadMode::Rtl),
+            "portrait-only effective Single must not overwrite the configured value"
         );
         assert_eq!(
             resolve_spread_state(

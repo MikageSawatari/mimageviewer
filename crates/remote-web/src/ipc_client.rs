@@ -10,7 +10,8 @@ use mimageviewer_ipc::{
     CollectionPayload, CollectionRequest, CollectionResponse, ContainerPayload, ContainerRequest,
     ContainerResponse, FrameError, HomePayload, HomeRequest, HomeResponse, MAX_CONTROL_FRAME_BYTES,
     MAX_RESPONSE_FRAME_BYTES, MediaError, MediaErrorCode, PIPE_NAME, PROTOCOL_VERSION, PagePayload,
-    PagePriority, PageRequest, PageResponse, RemoteAddress, RemoteWebConnectionInfo, RequestId,
+    PagePriority, PageRequest, PageResponse, RemoteAddress, RemoteWebConnectionInfo,
+    RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, RequestId,
     ServerMessage, SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionResponse,
     SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse,
     read_frame, write_frame,
@@ -100,6 +101,7 @@ pub enum ClientError {
     Remote(ThumbnailError),
     CollectionRemote(CollectionError),
     MediaRemote(MediaError),
+    WriteRemote(RemoteWriteError),
     SessionRemote(SessionResponse),
 }
 
@@ -114,6 +116,7 @@ impl ClientError {
             || matches!(self, Self::Remote(error) if error.code == ThumbnailErrorCode::Busy)
             || matches!(self, Self::CollectionRemote(error) if error.code == CollectionErrorCode::Busy)
             || matches!(self, Self::MediaRemote(error) if error.code == MediaErrorCode::Busy)
+            || matches!(self, Self::WriteRemote(error) if error.code == RemoteWriteErrorCode::Busy)
     }
 
     pub fn ipc_status(&self) -> String {
@@ -151,6 +154,7 @@ impl ClientError {
                 MediaErrorCode::Internal => "miv_media_internal",
             }
             .to_owned(),
+            Self::WriteRemote(error) => format!("miv_write_{:?}", error.code).to_lowercase(),
             Self::CollectionRemote(error) => match error.code {
                 CollectionErrorCode::BadRequest => "miv_collection_bad_request",
                 CollectionErrorCode::NotFound => "miv_collection_not_found",
@@ -196,6 +200,9 @@ impl fmt::Display for ClientError {
             }
             Self::MediaRemote(error) => {
                 write!(f, "mIV 本体がコンテナ要求を拒否しました: {}", error.message)
+            }
+            Self::WriteRemote(error) => {
+                write!(f, "mIV 本体が書き込み要求を拒否しました: {}", error.message)
             }
             Self::SessionRemote(response) => write!(f, "{}", response.message),
         }
@@ -561,6 +568,62 @@ impl ThumbnailClient {
                 retry_statuses: success.retry_statuses,
             }),
         })
+    }
+
+    /// 書き込みは適用済み応答を失った場合の重複実行を避けるため自動 retry しない。
+    pub fn write(
+        &self,
+        client_id: &str,
+        request: RemoteWriteRequest,
+    ) -> Result<IpcSuccess<()>, ClientFailure> {
+        let result = (|| {
+            let connection = self.get_connection()?;
+            let connection_id = connection.id;
+            let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+            let response = connection.request(
+                id,
+                ClientMessage::Write {
+                    id,
+                    client_id: client_id.to_owned(),
+                    request,
+                },
+            );
+            match response {
+                Ok(ServerMessage::Write {
+                    response: RemoteWriteResponse::Success,
+                    ..
+                }) => Ok(((), connection_id)),
+                Ok(ServerMessage::Write {
+                    response: RemoteWriteResponse::Error(error),
+                    ..
+                }) => Err(ClientError::WriteRemote(error)),
+                Ok(ServerMessage::Session { response, .. }) => {
+                    Err(ClientError::SessionRemote(response))
+                }
+                Ok(_) => Err(ClientError::Protocol(protocol_failure(
+                    "response_route",
+                    "response_type_mismatch",
+                    None,
+                    "write request received another response type",
+                ))),
+                Err(error) => {
+                    self.invalidate_connection(connection_id);
+                    Err(ClientError::Protocol(error))
+                }
+            }
+        })();
+        result
+            .map(|(value, connection_id)| IpcSuccess {
+                value,
+                retry_count: 0,
+                retry_statuses: Vec::new(),
+                connection_id,
+            })
+            .map_err(|error| ClientFailure {
+                error,
+                retry_count: 0,
+                retry_statuses: Vec::new(),
+            })
     }
 
     fn collection_request(

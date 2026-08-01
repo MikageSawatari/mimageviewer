@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -170,6 +170,68 @@ impl RemoteReadingDirection {
     pub fn is_rtl(self) -> bool {
         matches!(self, Self::Rtl)
     }
+}
+
+/// 本体 UI thread が所有する永続ハンドルで適用する書き込み要求。
+///
+/// 書き込み種別はこの enum だけへ追加し、IPC / UI 間に種別ごとの pending field を作らない。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RemoteWriteRequest {
+    SetSpread {
+        address: RemoteAddress,
+        spread_mode: RemoteSpreadMode,
+        reading_direction: RemoteReadingDirection,
+    },
+}
+
+impl RemoteWriteRequest {
+    pub fn address(&self) -> &RemoteAddress {
+        match self {
+            Self::SetSpread { address, .. } => address,
+        }
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::SetSpread { .. } => "set_spread",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum RemoteWriteResponse {
+    Success,
+    Error(RemoteWriteError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteWriteError {
+    pub code: RemoteWriteErrorCode,
+    pub message: String,
+}
+
+impl RemoteWriteError {
+    pub fn new(code: RemoteWriteErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteWriteErrorCode {
+    BadRequest,
+    FavoriteNotFound,
+    PathRejected,
+    NotFound,
+    Unsupported,
+    Busy,
+    UiTimeout,
+    PersistenceFailed,
+    Internal,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -522,6 +584,11 @@ pub enum ClientMessage {
         client_id: String,
         request: PageRequest,
     },
+    Write {
+        id: RequestId,
+        client_id: String,
+        request: RemoteWriteRequest,
+    },
 }
 
 impl ClientMessage {
@@ -535,7 +602,8 @@ impl ClientMessage {
             | Self::Home { id, .. }
             | Self::Collection { id, .. }
             | Self::Container { id, .. }
-            | Self::Page { id, .. } => *id,
+            | Self::Page { id, .. }
+            | Self::Write { id, .. } => *id,
         }
     }
 }
@@ -572,6 +640,10 @@ pub enum ServerMessage {
         id: RequestId,
         response: PageResponse,
     },
+    Write {
+        id: RequestId,
+        response: RemoteWriteResponse,
+    },
 }
 
 impl ServerMessage {
@@ -583,7 +655,8 @@ impl ServerMessage {
             | Self::Home { id, .. }
             | Self::Collection { id, .. }
             | Self::Container { id, .. }
-            | Self::Page { id, .. } => *id,
+            | Self::Page { id, .. }
+            | Self::Write { id, .. } => *id,
         }
     }
 }
@@ -822,6 +895,31 @@ mod tests {
         assert!(encoded.contains("\"spread_mode\":\"ltr\""));
         assert!(encoded.contains("\"reading_direction\":\"ltr\""));
         assert!(encoded.contains("\"force_single_page\":true"));
+    }
+
+    #[test]
+    fn typed_write_request_round_trips() {
+        let expected = ClientMessage::Write {
+            id: 45,
+            client_id: "test-client".to_owned(),
+            request: RemoteWriteRequest::SetSpread {
+                address: RemoteAddress::file(
+                    "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+                    "books/book.pdf",
+                ),
+                spread_mode: RemoteSpreadMode::RtlCover,
+                reading_direction: RemoteReadingDirection::Rtl,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &expected).unwrap();
+        let actual: ClientMessage =
+            read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
+        assert_eq!(actual, expected);
+        let ClientMessage::Write { request, .. } = actual else {
+            unreachable!();
+        };
+        assert_eq!(request.kind_name(), "set_spread");
     }
 
     #[test]

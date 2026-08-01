@@ -104,17 +104,23 @@ pub(super) fn resolve_existing(
 
     let canonical_root =
         std::fs::canonicalize(&favorite.path).map_err(|_| ResolveError::Unavailable)?;
-    let logical = if relative.is_empty() {
-        favorite.path.clone()
-    } else {
-        favorite.path.join(relative)
-    };
+    let logical = logical_favorite_path(&favorite.path, relative);
     let canonical = canonicalize_within(&canonical_root, &logical)?;
     Ok(ResolvedFavoritePath {
         canonical_root,
         canonical,
         logical,
     })
+}
+
+/// favorite root と検証済み相対 path の論理キーを組み立てる。
+/// ファイルシステムへ触れないため UI thread の永続キー導出でも共有できる。
+pub(super) fn logical_favorite_path(favorite_root: &Path, relative: &str) -> PathBuf {
+    if relative.is_empty() {
+        favorite_root.to_path_buf()
+    } else {
+        favorite_root.join(relative)
+    }
 }
 
 pub(super) fn canonicalize_within(
