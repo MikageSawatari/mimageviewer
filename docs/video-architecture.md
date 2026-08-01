@@ -414,6 +414,32 @@ NativeRenderCore::present (CPU 経路ブランチ)
 (= FFmpeg D3D11VA hw_device_ctx 共有) は残っており、decoder と native presenter の
 共通基盤として機能する。
 
+### mIV Remote decoder-output video tap (増分 4)
+
+`run_video_decode` は decoded PTS、seek serial、preroll / frame-step の選別後、上記 GPU 経路と
+CPU 経路へ分かれる直前の生 AVFrame を唯一の tap 点とする。この位置は次の全 producer 経路の
+共通祖先であり、`VideoFrameData::Gpu` 側と `VideoFrameData::Cpu` 側の 2 箇所の
+`video_tx.try_send` を個別に変更しない。
+
+- D3D11VA frame + `GpuVideoDevice` + GPU blit 成功 → 共有 texture の `Gpu`
+- D3D11VA frame + deinterlace 要求、または通常 GPU blit failure → HW download / bwdif /
+  RGBA の `Cpu` (resource pressure failure は PC 表示側だけ drop)
+- SW decoder、HW format refusal 後の SW reopen、HW decoder が SW frame を返す場合 → RGBA の `Cpu`
+
+tap producer は bounded queue が空いている場合だけ payload を作る。D3D11 frame は decoder thread
+上で `prepare_frame_for_swscale` により即時 SW download し、SW frame は `av_frame_clone` で buffer
+ref を 1 個増やす。queue は private `SoftwareTapFrame` しか保持できず、D3D11 / `Pixel::None` は
+構築時に拒否する。したがって worker が停止して queue が満杯でも decoder pool の HW surface を
+queue が保持する数は 0、同期 download 中の現 source を含めても 1 枚である。この契約は
+`VIDEO_TAP_MAX_QUEUED_DECODER_HW_SURFACES = 0` / `VIDEO_TAP_MAX_SYNCHRONOUS_DECODER_HW_SURFACES = 1`
+として session 層へ公開し、`attach` の引数名も `software_frame_capacity` とする。
+
+満杯なら readback / ref 作成前に drop counter を増やす。未接続時は inactive 判定だけで戻り、
+既存の readback / bwdif / GPU blit / RGBA scale / pacing / `video_tx` の順序と allocation は変わらない。
+将来の streaming session worker は `VideoStreamEncoder` を所有し、queue の SW frame を preset 寸法へ
+swscale → 選択 encoder 固有の NV12 / YUV420P input → H.264 encode する。増分 4 では session を
+接続しないため、この worker はまだ起動しない。
+
 ## モジュール構成 (現行責務)
 
 行数は変動が大きく、恒久仕様と同じ表では管理しない。2026-07-26 監査時点の規模 snapshot は
@@ -503,7 +529,7 @@ BLOB 読み出しと WebP→RGBA decode は `video-marker-thumbs` worker で行�
 | thread 名 | 責務 | 入力 | 出力 |
 |---|---|---|---|
 | `video-demux` (= `run_decoder`) | `Input::packets()` ループ、seek 調停、EOF idle wait、`engine_event_tx` への SeekCompleted 発火。スレッド本体は `catch_unwind` で囲み、panic は `info_tx(Err)` + `DecoderEvent::Failed` に変換して engine/UI に伝える (無言ハング防止) | `Arc<AvClock>` (seek_request) / 動画ファイル | `video_pkt_tx` (bounded=32) / `audio_pkt_tx` (bounded=64) / `video_ctl_tx` / `audio_ctl_tx` |
-| `video-decode` (= `run_video_decode`) | HW (`D3D11VA`) → GPU blit / SW + swscale、PACE_LEAD=0.30 の pacing、`new_seek_pending` generation race check | `video_pkt_rx` (`VideoPacketMsg::{Packet, Eof}`、bounded=32) + `video_ctl_rx` (`VideoControlMsg::Flush`、bounded=8) | `video_tx` (bounded=8、`VideoFrame`) |
+| `video-decode` (= `run_video_decode`) | HW (`D3D11VA`) → GPU blit / SW + swscale、PACE_LEAD=0.30 の pacing、`new_seek_pending` generation race check。GPU/CPU 分岐前の raw AVFrame を mIV Remote tap へ分岐し、HW だけ同期 SW download 後に non-blocking 送信 | `video_pkt_rx` (`VideoPacketMsg::{Packet, Eof}`、bounded=32) + `video_ctl_rx` (`VideoControlMsg::Flush`、bounded=8) | `video_tx` (bounded=8、`VideoFrame`) + 任意の bounded SW-only `TappedVideoFrame` |
 | `video-audio-decode` (= `run_audio_decode`) | avcodec decode + swresample、post-seek packet/sample trim、PAUSED/EOF park、EOF drain | `audio_pkt_rx` (`AudioPacketMsg::{Packet, Eof}`、bounded=64) + `audio_ctl_rx` (`AudioControlMsg::Flush`、bounded=8) | `audio_tx` (bounded=32、`AudioFrame`) |
 
 **seek 調停**: `clock.take_seek_request()` を pull するのは demux thread のみ

@@ -411,6 +411,10 @@ impl CfrTimelineFrameIndex {
         Self(index)
     }
 
+    pub(crate) fn value(self) -> u64 {
+        self.0
+    }
+
     fn is_segment_boundary(self, keyint_frames: u32) -> bool {
         self.0 % u64::from(keyint_frames) == 0
     }
@@ -1040,8 +1044,9 @@ mod tests {
     use crate::video::stream::encoder::{
         AUDIO_PROFILE_ID, EncoderPreference, H264EncoderKind, H264InputFormat, open_h264_encoder,
     };
-    use crate::video::stream::quality::{OutputDimensions, StreamOutputParameters};
+    use crate::video::stream::quality::{OutputDimensions, QualityPreset, StreamOutputParameters};
     use crate::video::stream::timeline::StreamTimeline;
+    use crate::video::stream::video_tap::{TappedVideoFrame, open_video_stream_encoder};
 
     const AVERROR_EOF: i32 = -0x2046_4f45;
     const FFMPEG_EAGAIN: i32 = 11;
@@ -1510,42 +1515,49 @@ mod tests {
     }
 
     #[test]
-    fn openh264_and_aac_fmp4_round_trip_keeps_every_audio_packet_at_flush() {
+    fn tapped_video_and_audio_round_trip_in_process_through_the_same_ffmpeg() {
         let frame_rate = FrameRate::new(30, 1).unwrap();
-        let output = StreamOutputParameters {
-            dimensions: OutputDimensions {
-                width: 320,
-                height: 180,
-            },
-            video_bitrate_bps: 400_000,
-            audio_bitrate_bps: 96_000,
-        };
-        let mut video = open_h264_encoder(
+        let timeline = StreamTimeline::new(0.0).unwrap();
+        let mut video = open_video_stream_encoder(
             EncoderPreference::Encoder(H264EncoderKind::OpenH264),
-            output,
+            QualityPreset::Minimum,
+            960,
+            540,
             frame_rate,
+            0,
+            timeline,
         )
         .unwrap();
-        let mut audio = open_test_audio(output.audio_bitrate_bps);
+        let output = video.output_parameters();
+        assert_eq!(video.input_format(), H264InputFormat::Yuv420p);
+        assert_eq!(output.dimensions.width, 640);
+        assert_eq!(output.dimensions.height, 360);
+        let mut audio = open_aac_encoder(48_000, output.audio_bitrate_bps, 0, timeline).unwrap();
         let mut segmenter =
-            Fmp4Segmenter::with_capacity(&video.encoder, &audio.encoder, frame_rate, 4).unwrap();
+            Fmp4Segmenter::with_capacity(video.encoder(), &audio.encoder, frame_rate, 4).unwrap();
 
         let mut video_packets = Vec::new();
         let frame_count = frame_rate.keyint_frames() * 2;
         for index in 0..frame_count {
-            let mut frame = ffmpeg::util::frame::video::Video::new(
-                ffmpeg::format::Pixel::YUV420P,
-                output.dimensions.width,
-                output.dimensions.height,
-            );
+            let mut frame =
+                ffmpeg::util::frame::video::Video::new(ffmpeg::format::Pixel::YUV420P, 960, 540);
             fill_yuv420p(&mut frame, index as u8);
-            frame.set_pts(Some(i64::from(index)));
-            segmenter.prepare_video_frame(CfrTimelineFrameIndex::new(u64::from(index)), &mut frame);
-            video.encoder.send_frame(&frame).unwrap();
-            collect_video_packets(&mut video.encoder, &mut video_packets);
+            video_packets.extend(
+                video
+                    .encode_frame(
+                        TappedVideoFrame::from_owned_software_frame(
+                            frame,
+                            f64::from(index) / 30.0,
+                            0,
+                        )
+                        .unwrap(),
+                        &segmenter,
+                    )
+                    .unwrap(),
+            );
         }
-        video.encoder.send_eof().unwrap();
-        collect_video_packets(&mut video.encoder, &mut video_packets);
+        video_packets.extend(video.finish().unwrap());
+        assert_eq!(video.stats().submitted_frames, u64::from(frame_count));
 
         let audio_sample_rate = audio.input_sample_rate();
         let total_audio_samples = 4 * audio_sample_rate as usize;

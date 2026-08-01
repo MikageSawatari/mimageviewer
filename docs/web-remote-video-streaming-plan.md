@@ -5,8 +5,9 @@
 
 - 親計画: [web-remote-plan.md](web-remote-plan.md) (リモート閲覧機能全体の正本)
 - ブランチ: `web-remote` (worktree: `C:\home\mimageviewer-web`)
-- 現在のフェーズ: **第 1 段 増分 3/7 実装済み** (encoder 抽象 / fallback / 画質
-  preset + 映像・音声 fMP4 segmenter / ring / m3u8 + audio tap / AAC、2026-08-01)
+- 現在のフェーズ: **第 1 段 増分 4/7 実装済み** (encoder 抽象 / fallback / 画質
+  preset + 映像・音声 fMP4 segmenter / ring / m3u8 + audio tap / AAC + decoder-output
+  video tap / HW download / scale / H.264 input、2026-08-01)
 
 ---
 
@@ -204,6 +205,33 @@ HW デコード時 (`AV_PIX_FMT_D3D11`) は既存の `av_hwframe_transfer_data`
 これらは presenter の D3D11 パス
 ([src/video/native_presenter/grade_pipeline.rs](../src/video/native_presenter/grade_pipeline.rs))
 にあり、リモート用に別レンダーターゲットを回す実装が必要になる。§11 の第 2 段で扱う。
+
+#### 増分 4 実装記録 (映像 tap、2026-08-01)
+
+- tap 点は `run_video_decode` が decoded PTS / seek serial / preroll を確定した後、D3D11
+  GPU blit と CPU readback の分岐へ入る直前の 1 箇所。ここは (1) D3D11VA + GPU blit の
+  `VideoFrameData::Gpu`、(2) D3D11VA + deinterlace / 通常 GPU blit 失敗による CPU fallback
+  の `VideoFrameData::Cpu`、(3) HW format 拒否後を含む SW decode の
+  `VideoFrameData::Cpu` の共通祖先であり、2 箇所の `video_tx.try_send` を両方覆う
+- decoder thread は bounded tap queue の空きを先に確認する。D3D11 frame は空きがある時だけ
+  producer 呼び出し中に `prepare_frame_for_swscale` で即時 readback し、独立した SW frame を
+  `try_send` する。SW frame だけは `av_frame_clone` の浅い参照を送る。満杯なら readback / clone
+  とも行わず `dropped` を加算し、未接続時も AVFrame clone / HW readback / swscale / encoder
+  処理を一切行わない
+- queue payload は private な `SoftwareTapFrame` を必須とし、D3D11 / `Pixel::None` を構築時に
+  拒否する。したがって `attach(software_frame_capacity)` の容量や worker の遅延にかかわらず、
+  queue が保持する decoder-pool HW surface は 0 枚。同期 readback 中の現 source 1 枚だけが上限で、
+  `VIDEO_TAP_MAX_QUEUED_DECODER_HW_SURFACES = 0` と
+  `VIDEO_TAP_MAX_SYNCHRONOUS_DECODER_HW_SURFACES = 1` を増分 5 の呼び出し側へ公開する
+- `VideoStreamEncoder` は将来の streaming session worker が所有する受信側部品。
+  queue から受けた SW frame を `QualityPreset::output_parameters` の非拡大・比率維持・偶数寸法へ
+  scale する。出力 pixel format は選択済み encoder の `input_format` (NV12 / YUV420P) を使う
+- 映像 PTS も音声と同じ `StreamTimeline` で session 相対時刻へ写す。VFR は
+  `round(relative_source_secs * fps_num / fps_den)` で最寄り CFR slot を選ぶ。同じ slot に
+  入る複数 frame は後着を coalesce し、tap drop や source gap の後続 frame は slot を
+  詰め直さない。これにより forced-IDR の CFR source timeline 上の位置を負荷と独立に保つ
+- 増分 4 では controller / owner-id 付き lease / receiver と worker 側変換・encoder 部品までを
+  用意し、実 session はまだ attach しない。packet の A/V 順序付けと session lifecycle は増分 5
 
 ### 4.3 A/V 同期
 
@@ -595,10 +623,15 @@ Android 実機を保有していないため、**検証できる範囲と委ね�
   `Gone` になること
 - 音声 tap: tap 未接続時に pump の出力が現行と 1 サンプルも変わらないこと。
   tap 側が詰まったとき pump がブロックせず `dropped` を計上すること
+- 映像 tap: tap 未接続時に decoder が AVFrame ref / readback / swscale を行わず現行の
+  GPU / CPU presenter 経路を維持すること。tap が満杯なら clone せず即 drop を計上すること。
+  worker を停止したまま SW queue を満杯にしても decoder HW surface の保持が同期中 1 枚・queue
+  内 0 枚を超えないこと。source PTS から CFR slot を導き、欠落 frame 後も index を詰め直さないこと
 - AAC: 1024 samples と一致しない chunk 列でも欠落・重複がなく、必要な sample rate 変換の
   EOF delay まで回収し、異なる `seek_serial` と 1.0x 以外を assembler 前で拒否すること
-- A/V mux: libopenh264 + AAC の同一 fMP4 を同じ FFmpeg で in-process に読み返し、両 codec、
-  全 audio packet の個数・PTS、各 video IDR 境界での audio coverage が一致すること
+- A/V mux: raw YUV video tap → preset scale → libopenh264 と AAC の同一 fMP4 を同じ FFmpeg で
+  in-process に読み返し、両 codec、全 audio packet の個数・PTS、各 video IDR 境界での
+  audio coverage が一致すること
 - A/V 同期: 既知の pts 列に対してセグメントのタイムスタンプが単調増加し、
   音声 `audible_pts_secs` と映像 pts のずれが 1 フレーム以内であること
 - セッション: 操作権喪失 / 生存タイムアウト / 放置タイムアウトでストリーミングが停止すること

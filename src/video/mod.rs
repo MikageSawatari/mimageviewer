@@ -5147,6 +5147,7 @@ impl VideoPlayer {
             audio_rx,
             info_rx,
             prep_progress,
+            video_tap,
         } = decode;
         #[cfg(windows)]
         let native_video_rx = video_rx.clone();
@@ -5261,6 +5262,7 @@ impl VideoPlayer {
                 audio_rx: dummy_audio_rx(),
                 info_rx,
                 prep_progress,
+                video_tap,
             },
             audio,
             info: None,
@@ -5618,6 +5620,14 @@ impl VideoPlayer {
             self.intent_playing(),
             self.clock.current_seek_serial()
         ));
+    }
+
+    /// Decoder-output video tap attachment point for the future streaming session owner.
+    #[allow(dead_code)] // Increment 5 connects the session; increment 4 intentionally has none.
+    pub(crate) fn video_tap_controller(
+        &self,
+    ) -> crate::video::stream::video_tap::VideoTapController {
+        self.decode.video_tap.clone()
     }
 
     pub(crate) fn clear_audio_output_buffer(&self) {
@@ -7492,6 +7502,7 @@ fn dummy_decode_handles() -> DecodeHandles {
         audio_rx,
         info_rx,
         prep_progress: crate::video::avio_progress::PreparingProgress::new(),
+        video_tap: crate::video::stream::video_tap::VideoTapController::disconnected(),
     }
 }
 

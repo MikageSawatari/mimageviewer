@@ -116,14 +116,14 @@ pub(crate) enum H264InputFormat {
 }
 
 impl H264InputFormat {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Nv12 => "nv12",
             Self::Yuv420p => "yuv420p",
         }
     }
 
-    const fn ffmpeg_pixel(self) -> ffmpeg::format::Pixel {
+    pub(crate) const fn ffmpeg_pixel(self) -> ffmpeg::format::Pixel {
         match self {
             Self::Nv12 => ffmpeg::format::Pixel::NV12,
             Self::Yuv420p => ffmpeg::format::Pixel::YUV420P,

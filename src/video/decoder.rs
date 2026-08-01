@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender, TryRecvError, bounded};
 
 use super::clock::AvClock;
+use super::stream::video_tap::{VideoTapController, VideoTapProducer, video_tap_channel};
 
 /// 同時に走っている **video decode thread** (= `run_video_decode`) の数。
 ///
@@ -1648,6 +1649,8 @@ pub struct DecodeHandles {
     /// `tick` で読んで HUD に「メタデータ読込中... N MB / Y MB」を表示する。
     /// 共有 Arc なので VideoPlayer が clone を保持して使う。
     pub prep_progress: Arc<crate::video::avio_progress::PreparingProgress>,
+    /// mIV Remote streaming session が decoder-output tap を着脱する制御口。
+    pub(crate) video_tap: VideoTapController,
 }
 
 /// デコーダワーカーを起動する。ファイルオープン (`avformat_open_input`) も worker
@@ -1699,6 +1702,7 @@ pub fn spawn(
     let (video_tx, video_rx) = bounded::<VideoFrame>(8);
     let (audio_tx, audio_rx) = bounded::<AudioFrame>(32);
     let (info_tx, info_rx) = bounded::<Result<VideoInfo, String>>(1);
+    let (video_tap, video_tap_producer) = video_tap_channel();
 
     // 動画 open 進捗 atomic 群。worker spawn 前に Arc を作っておき、worker thread に
     // clone を渡しつつ DecodeHandles 経由で UI にも一本同じ Arc を返す (Codex の指摘
@@ -1732,6 +1736,7 @@ pub fn spawn(
                     engine_state,
                     engine_event_tx,
                     video_tx,
+                    video_tap_producer,
                     audio_tx,
                     info_tx,
                     skipped_frame_count,
@@ -1767,6 +1772,7 @@ pub fn spawn(
         audio_rx,
         info_rx,
         prep_progress,
+        video_tap,
     }
 }
 
@@ -1882,6 +1888,7 @@ fn run_decoder(
     engine_state: Arc<std::sync::atomic::AtomicU8>,
     engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
     video_tx: Sender<VideoFrame>,
+    video_tap: VideoTapProducer,
     audio_tx: Sender<AudioFrame>,
     info_tx: Sender<Result<VideoInfo, String>>,
     skipped_frame_count: Arc<std::sync::atomic::AtomicU64>,
@@ -2658,6 +2665,7 @@ fn run_decoder(
         // video_tx の所有を video decode thread に move。run_decoder (= demux) 側は
         // 以降 video_tx を直接触らない (video_pkt_tx 経由で間接的に流す)。
         let video_tx_for_thread = video_tx;
+        let video_tap_for_thread = video_tap;
         // gpu_video_device は cfg(windows) のみ存在する Option<Arc<...>>。
         // Arc は move で thread 跨ぎ OK。
         #[cfg(windows)]
@@ -2682,6 +2690,7 @@ fn run_decoder(
                         video_pkt_rx,
                         video_ctl_rx,
                         video_tx_for_thread,
+                        video_tap_for_thread,
                         clock_v,
                         cancel_v,
                         engine_state_v,
@@ -2711,6 +2720,7 @@ fn run_decoder(
         drop(video_pkt_rx);
         drop(video_ctl_rx);
         drop(video_tx);
+        drop(video_tap);
         None
     };
     // この時点で run_decoder = demux thread として再構成される。video_decoder /
@@ -3339,6 +3349,7 @@ fn run_video_decode(
     video_pkt_rx: Receiver<VideoPacketMsg>,
     video_ctl_rx: Receiver<VideoControlMsg>,
     video_tx: Sender<VideoFrame>,
+    mut video_tap: VideoTapProducer,
     clock: Arc<AvClock>,
     cancel: Arc<AtomicBool>,
     engine_state: Arc<std::sync::atomic::AtomicU8>,
@@ -4089,6 +4100,14 @@ fn run_video_decode(
                     // 通過し、通常 frame として readiness に使われる。
                 }
             }
+
+            // mIV Remote video tap: this is the one point after decoded PTS / seek / preroll
+            // selection and before the D3D11 GPU-vs-CPU presentation split. A D3D11 frame is
+            // downloaded synchronously here so the queue never retains a decoder-pool surface;
+            // SW frames use a shallow AVFrame ref. Stream-resolution swscale and encoding remain
+            // in `stream::video_tap::VideoStreamEncoder`. With no active tap this returns before
+            // cloning, readback, or allocation and the existing presentation path is intact.
+            video_tap.try_publish(&frame, pts_secs, current_seek_serial);
 
             // ── GPU 経路 (HW デコード + 共有 D3D11 device) ──
             // frame.format() == AV_PIX_FMT_D3D11 かつ mIV 側で GpuVideoDevice が

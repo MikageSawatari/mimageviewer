@@ -13,9 +13,9 @@
 //! 程度で、HW decode 自体の速度はそのまま活かせる。
 //!
 //! 本 module はこの download パスを 1 箇所にまとめる: `thumbnail.rs` /
-//! `tile_thumbnails.rs` / `screenshot.rs` の 3 経路で共有する。`decoder.rs`
-//! (= フルスクリーン再生経路) は固有の `scaler_key` ロジックがあるので独自実装の
-//! まま (同等の処理 = [src/video/decoder.rs:3176-3193](../decoder.rs) 参照)。
+//! `tile_thumbnails.rs` / `screenshot.rs` と mIV Remote の decoder-side
+//! `stream/video_tap.rs` で共有する。`decoder.rs` の PC 表示用 CPU fallback は固有の
+//! deinterlace / `scaler_key` lifecycle があるため独自実装のまま。
 
 use ffmpeg::format::Pixel;
 use ffmpeg::util::frame::video::Video;
