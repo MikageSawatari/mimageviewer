@@ -228,6 +228,49 @@
   `cursor_within_client` / `cursor_last_activity` / 直近の placement 遷移を含める。
 - 規模 / 優先度: Medium / **P2**。データ喪失は無いが、再生を止めるまで操作感が壊れる。
 
+### 1.29 見開き PDF の片ページが「読み込み中」のまま完走しない (再入ループ)
+
+- 出典: v2.9.1 リリース前の実機確認 (2026-08-01)。利用者報告 =「見開きの片ページが 10 秒以上
+  読み込み中のまま。スライダーを動かしたら表示された」。ログで再現痕跡を確認済み。
+- **リリース済み v2.9.0 の挙動**である (`git show v2.9.0:src/app.rs` に同じ早期 return がある)。
+  導入は `7c3a9363` "Unify PDF retained page cache"。
+- ログ証跡 (`open_fullscreen: idx=19` 直後から約 50 秒、合計 23,000 行弱):
+  - idx=19 (見開きの片方、final-AI が retained にある側) — **15,240 回**
+    `[PDF] Retained page final-ai available idx=19 reason=start_fs_load_skip_pdf_render`
+  - idx=20 (もう片方、実際に止まって見えた側) — **7,576 回**
+    `Retained page miss idx=20 ... target_px=2376 entries=10 reason=start_fs_load/resolution_mismatch`
+    と、その都度の `fs pdf render cancelled/interrupted Page 21` (スレッド番号が毎回加算)。
+  - 同区間で `[SLOW FRAME]` 39 回。
+- **確定している壊れた前提 (idx=19 側)**: 呼び出し側の再入ガードは
+  [ui_fullscreen.rs](../src/ui_fullscreen.rs) の
+  `if !self.fs_cache.contains_key(&idx) && !self.fs_pending.contains_key(&idx)` である。
+  ところが [app.rs](../src/app.rs) の `start_fs_load` にある
+  `has_retained_pdf_final_ai_for_current_params(idx)` の早期 return は、**`fs_pending` へ
+  登録しないまま return する**。したがって cache にも pending にも入らず、ガードが毎フレーム
+  通り、`start_fs_load` が延々と呼ばれ続ける。**「retained にあるから描画不要」と
+  「ロードが完了した」を同じ経路で表現できていない**のが構造的な誤り。
+- **未確定 (idx=20 側、着手時に確定させること)**: 通常経路へ落ちるはずの idx=20 が、なぜ毎フレーム
+  `fs_pending` から消えて再入するのか。候補は 2 つ:
+  1. `pdf_target_changed` → `update_prefetch_window` 経路が pending を落としている。
+  2. retained store が `entries=10 / max_entries=10` で**満杯**であり、一方のページの store が
+     もう一方の entry を evict する相互 evict スラッシュになっている
+     (同セッションに `Retained page evict` が 21 行ある)。見開きは 2 ページが同時に同じ store を
+     奪い合うので、片側だけで再現しない可能性がある。
+- **症状パッチにしないこと**: 解像度一致判定 (`0.9..=1.1`) の閾値を緩める、キャンセルを止める、
+  再入を時間で抑制する、はいずれも根本原因に対応しない。producer (retained store / render 完了) と
+  consumer (表示・再入ガード) が「このページは表示可能か」について**同じ 1 つの状態**を見る形に
+  集約する。`fs_cache` / `fs_pending` / retained store の 3 つが別々に答えている現状が原因。
+- 関連: [final-composite-budget-thrash-plan.md](final-composite-budget-thrash-plan.md) と同じ
+  「再計算 → 破棄 → 再計算」の系統。ストアは別 (あちらは連結読みの texel 予算、こちらは PDF
+  retained page) だが、対策の考え方は流用できる可能性がある。
+- 完了条件 / 回帰テスト:
+  - 見開き表示で、両ページとも操作なしで表示に到達する (待つだけで完走する)。
+  - `start_fs_load` が同一 idx / 同一パラメータで毎フレーム再入しない状態遷移テスト。
+  - retained store が満杯のとき、見開きの 2 ページが相互に evict し合わない。
+  - 早期 return 経路でも、呼び出し側の再入ガードが「もう呼ばなくてよい」と判定できる。
+- 規模 / 優先度: Medium / **P1**。ページが表示されず、待っても直らない (操作して初めて解ける)。
+  副次的に毎フレームのスレッド生成と PDF レンダ投棄で CPU を焼く。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
