@@ -274,6 +274,76 @@
 - 規模 / 優先度: Medium / **P1**。ページが表示されず、待っても直らない (操作して初めて解ける)。
   副次的に毎フレームのスレッド生成と PDF レンダ投棄で CPU を焼く。
 
+### 1.30 native video Stage 5 の再投入条件 (revert 済み、原因未確定)
+
+- 出典: 2026-08-01。Stage 5 (`726f838d`) を入れたところ UI が完全停止する P1 が再現し、
+  `737c5234` で **revert 済み**。v2.9.1 は Stage 5 を含めずに出す。§1.28 のカーソル問題は
+  既知の問題として残る。
+- 症状: 動画をフルスクリーン再生中に VST エディタを開閉すると UI が完全に固まる。**動画・音声の
+  再生は継続し、EOF で次の動画へも進む。UI だけが死ぬ。**終了も右クリックも不能。2 回再現
+  (t=178s / t=18s)。
+- 停止点 (cdb `-pv` で採取): main スレッドが `SendMessageW` 経由の wndproc の中で
+  `eframe run_ui_and_paint` → `egui_wgpu paint_and_update_textures` →
+  `wgpu_hal::dx12::Surface::acquire_texture` → `WaitForSingleObjectEx`。
+  他スレッドは全て健全 (`vst-owner-dispatch` は recv で idle、pump は sleep、render / demux /
+  decode は稼働)。
+- **原因は未確定。候補 2 つとも潰れていない**:
+  1. **VST owner handoff**: owner / z-order / visibility の変更が同期メッセージを撃つ。
+     ただし hidden anchor は published fullscreen host の破棄時のみ通り、C++ は
+     `old_owner == new_owner` で早期 return し、owner 付け替え自体は Stage 5 以前から存在する。
+  2. **カーソル所有**: 新実装は pump から **8ms ごとに `WindowFromPoint`** を呼ぶ。同 API は
+     hit-test のため対象の wndproc へ **`WM_NCHITTEST` を同期送信**し、相手は UI スレッドの窓や
+     **別プロセスの VST エディタ**になり得る。pump からの無制限な cross-thread / cross-process
+     同期呼び出しであり、**Stage 4 の「pump は時間上限を保証できない処理を持たない」原則に抵触する**。
+     「窓を作らないから同期メッセージを撃たない」は成立しない。
+- 次回に取るべき証拠 (今回取れていない):
+  - `acquire_texture` の wait が**本当に無限か**。wgpu-core 27.0.3 は **1000ms timeout** を渡し、
+    wgpu-hal は `WAIT_TIMEOUT` を `Ok(false)` にして先へ進む。スタック 1 枚では
+    「デッドロック」と「1 秒待ちを繰り返す飢餓」を区別できない。**wait の `dwMilliseconds` が
+    `0x3e8` か `0xffffffff` かを読み、1.2 秒以上あけて複数回 break する**。
+  - 停止直前に main が実際に受けた `msg` (どの同期メッセージが再入描画を起こしたか)。
+    スタックにある `in_window_resize_subclass_proc` は全メッセージを通る常設 subclass なので、
+    **resize が起きた証拠にはならない**。
+  - `old_owner != new_owner` / anchor handoff / presenter retirement が実際に発生したかのログ。
+- 再投入の条件: **同一 release profile** で 4 分割 A/B を通すこと。
+  (a) Stage 4 baseline / (b) cursor のみ / (c) owner のみ / (d) Stage 5 全体。
+  今回の A/B は `dev-runtime` 対 `release` で、出荷判断には十分だが**原因帰属としては profile 差が
+  残る**。(b) が VST 開閉 soak を通ることを出荷条件にする。
+- 診断用の回避策 (`MIV_WGPU_FRAME_LATENCY=2`、`WGPU_DX12_USE_FRAME_LATENCY_WAITABLE_OBJECT=DontWait`)
+  は**出荷修正にしない**。症状が消えても wndproc 内 GPU wait と Win32 同期依存は残る。
+- VST 側の長期案: editor を transient な presenter HWND へ付け替えるのではなく、**editor lifetime
+  全体で安定した専用 owner proxy** を使い、topmost / focus / visibility を別の ordered transaction
+  として扱う。owner request の dedupe と一括適用も要る。
+- 規模 / 優先度: Large / **P2**。カーソル (§1.28) の修正はこれが片付くまで入らない。
+
+### 1.31 wndproc の内側で GPU 待ちのある描画をする構造
+
+- 出典: §1.30 の解析 (2026-08-01、Codex Sol の独立レビュー)。**v2.9.1 の範囲外**。
+- 何が問題か: winit は `WM_PAINT` 内で `RedrawRequested` を**同期 dispatch** し、eframe はそこで
+  `run_ui_and_paint` を直接呼ぶ。さらに Windows の resize では flicker 防止のため意図的に同期 paint
+  する。結果として **wndproc の内側で swapchain acquire と Present を行う**。Microsoft も
+  `Present` が message-pump thread を待ち得ると明記している。
+  main surface は `AutoVsync` / maximum frame latency **1** なので、前フレームが retire しない限り
+  次の acquire が待たされる。
+- 効果: 窓の owner / z-order / visibility を動かす操作、DWM 合成の切替 (Independent Flip / MPO)、
+  device-loss 周辺のいずれかが絡むと、**同期メッセージ 1 通で UI が任意時間停止し得る**。
+  §1.27 が「presenter スレッドが窓を持ったままブロックする」だったのに対し、こちらは
+  「UI スレッドが自分の窓のメッセージ処理中に GPU で止まる」。**同じ上位の破綻の別の面**。
+- 方向 (Codex 案):
+  - wndproc は damage / resize / redraw 要求を記録して**即 return** する。
+  - 実描画は外側の event-loop 境界へ post して coalesce する。
+  - `Idle / Painting / Pending` の単一 typed render state を置き、**再入 acquire を禁止**する。
+  - surface acquire は短時間・nonblocking にし、間に合わなければその frame を捨てる。
+  - msg / paint depth / wait handle / timeout / Present 前後 / cloak / visibility を 1 つの trace に残す。
+  - 同期 `SendMessage` 中に presentation availability を故意に止め、**wndproc が有限時間で返る**
+    Windows 回帰テストを追加する。
+  - 必要なら eframe / winit / wgpu を vendor patch し、upstream へ最小再現を出す。
+- 併せて直す観測の穴: 今回 `ui-heartbeat-watchdog` は生きていたのに `panic.log` へ何も書かれ
+  なかった。**active native fullscreen 中は main HWND が隠れていても watchdog を suspend しない**
+  ようにする (危険な操作の最中こそ黙る、という現状は逆)。
+- 規模 / 優先度: Large / **P1 candidate (基盤)**。次版で Web 配信とコンテナ詰め替えを載せる前に
+  方針を決めておく。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
