@@ -1105,6 +1105,15 @@ enabled 行も、新仕様では該当ページを表示した時点で自動適
 
 Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread_pair` で左右の idx と配置
 (LTR/RTL/Cover) を決め、両ページを「1 枚の合成画像」とみなしてレイアウトする。
+
+フォルダ / 仮想ビューの読み込み時は、`page_order_locked_for_items` が install 前の
+`source_path` と確定済み `items`、対象ビュー種別から「この読み込みは本か」を一度だけ判定する。
+`spread.db` に明示値があれば本 / 非本のどちらでもその値を優先する。未保存の場合だけ、製本フォルダ、
+読書履歴、ZIP / CBZ / PDF / 直接閲覧・変換アーカイブ、設定 ON の画像のみフォルダには Settings の
+見開き・連結方式・読み方向の既定値を使い、それ以外の通常フォルダと合成ビューには
+単ページ + ページ単位 + 左→右を使う。ネスト ZIP の本キーから root ZIP キーへの fallback と、
+旧 `SpreadMode::Vertical` の読み替えは従来どおりである。
+
 `resolve_spread_pair` は先に表示ユニット列を組み、表紙、横長ページ、末尾端数を単独ユニットにして、
 横長ページの次の縦長ページから通常の見開きペアリングを再開する。
 2 ページのペア化対象は `GridItem::Image` / `ZipImage` / `PdfPage` だけである。

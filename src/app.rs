@@ -6521,6 +6521,48 @@ pub(crate) fn is_synthetic_view_path(path: &Path) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageOrderViewKind {
+    Physical,
+    ReadingHistory,
+    Synthetic,
+}
+
+impl PageOrderViewKind {
+    fn for_loading_source(source_path: &Path) -> Self {
+        if crate::folder_tree::path_eq(source_path, &reading_history_synthetic_path()) {
+            Self::ReadingHistory
+        } else if is_synthetic_view_path(source_path) {
+            Self::Synthetic
+        } else {
+            Self::Physical
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SpreadRestoreDefaults {
+    spread_mode: crate::settings::SpreadMode,
+    reading_flow: crate::settings::ReadingFlow,
+    reading_direction: crate::settings::ReadingDirection,
+}
+
+impl SpreadRestoreDefaults {
+    const NON_BOOK: Self = Self {
+        spread_mode: crate::settings::SpreadMode::Single,
+        reading_flow: crate::settings::ReadingFlow::Paged,
+        reading_direction: crate::settings::ReadingDirection::Ltr,
+    };
+
+    fn for_book(settings: &crate::settings::Settings) -> Self {
+        Self {
+            spread_mode: settings.default_spread_mode,
+            reading_flow: settings.default_reading_flow,
+            reading_direction: settings.default_reading_direction,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SyntheticFolderHistoryDispatch {
     NotSynthetic,
     Restored,
@@ -16098,12 +16140,17 @@ impl App {
 
     /// 指定キーの見開きモード / 連結方式 / 綴じ方向を `spread_db` から読み込んで
     /// `self.spread_mode` / `reading_flow` / `reading_direction` に適用する。
-    /// 未登録なら settings の既定値。旧 `SpreadMode::Vertical` は「単ページ + 縦連結」に読み替え。
+    /// 未登録なら呼び出し元が型で指定した既定値。旧 `SpreadMode::Vertical` は
+    /// 「単ページ + 縦連結」に読み替え。
     ///
     /// `start_loading_items` (フォルダ / 初回 ZIP open) と、ネスト ZIP の階層切替
     /// (`zip_nav_show_current_level` / finalize 後) の両方から呼び、本ごとに設定を復元する。
-    pub(crate) fn apply_spread_for_key(&mut self, key: &std::path::Path) {
-        self.apply_spread_for_key_with_fallback(key, None);
+    pub(crate) fn apply_spread_for_key(
+        &mut self,
+        key: &std::path::Path,
+        defaults: SpreadRestoreDefaults,
+    ) {
+        self.apply_spread_for_key_with_fallback(key, None, defaults);
     }
 
     /// `apply_spread_for_key` の fallback キー付き版。`key` に保存が無い項目を
@@ -16116,20 +16163,21 @@ impl App {
         &mut self,
         key: &std::path::Path,
         fallback: Option<&std::path::Path>,
+        defaults: SpreadRestoreDefaults,
     ) {
         let db = self.spread_db.as_ref();
         let stored_spread = db
             .and_then(|db| db.get(key))
             .or_else(|| fallback.and_then(|fb| db.and_then(|db| db.get(fb))))
-            .unwrap_or(self.settings.default_spread_mode);
+            .unwrap_or(defaults.spread_mode);
         self.reading_flow = db
             .and_then(|db| db.get_flow(key))
             .or_else(|| fallback.and_then(|fb| db.and_then(|db| db.get_flow(fb))))
-            .unwrap_or(self.settings.default_reading_flow);
+            .unwrap_or(defaults.reading_flow);
         self.reading_direction = db
             .and_then(|db| db.get_direction(key))
             .or_else(|| fallback.and_then(|fb| db.and_then(|db| db.get_direction(fb))))
-            .unwrap_or(self.settings.default_reading_direction);
+            .unwrap_or(defaults.reading_direction);
         if stored_spread == crate::settings::SpreadMode::Vertical {
             self.spread_mode = crate::settings::SpreadMode::Single;
             self.reading_flow = crate::settings::ReadingFlow::Vertical;
@@ -19781,7 +19829,8 @@ impl App {
         // 本キーに未保存の項目は zip_path キーへフォールバック (v1.2.x 保存分の互換)。
         if let Some(key) = self.spread_container_key() {
             let fb = self.zip_nav.as_ref().map(|nav| nav.tree.zip_path.clone());
-            self.apply_spread_for_key_with_fallback(&key, fb.as_deref());
+            let defaults = SpreadRestoreDefaults::for_book(&self.settings);
+            self.apply_spread_for_key_with_fallback(&key, fb.as_deref(), defaults);
             self.apply_view_trim_for_key_with_fallback(&key, fb.as_deref());
         }
         self.enter_pending_rating_view_zipdir_after_open(&zip_path);
@@ -20037,7 +20086,8 @@ impl App {
         // キーへフォールバック (v1.2.x 保存分の互換 + ZIP 全体設定の継承)。
         if let Some(key) = self.spread_container_key() {
             let fb = self.zip_nav.as_ref().map(|nav| nav.tree.zip_path.clone());
-            self.apply_spread_for_key_with_fallback(&key, fb.as_deref());
+            let defaults = SpreadRestoreDefaults::for_book(&self.settings);
+            self.apply_spread_for_key_with_fallback(&key, fb.as_deref(), defaults);
             self.apply_view_trim_for_key_with_fallback(&key, fb.as_deref());
         }
         // ★付きの本を開いて一時解除したフィルタを、本より上の階層へ戻ったら復元する
@@ -21542,6 +21592,15 @@ impl App {
         self.pending_grid_scroll = None;
         self.scroll_hint.store(0, Ordering::Relaxed);
 
+        // `install_new_items_inner` は view flags と `self.items` を差し替えるため、今回の
+        // 読み込みが本かどうかは、確定済みの target source/items から先に決める。
+        let page_order_view_kind = PageOrderViewKind::for_loading_source(&source_path);
+        let spread_restore_defaults =
+            if self.page_order_locked_for_items(&source_path, &items, page_order_view_kind) {
+                SpreadRestoreDefaults::for_book(&self.settings)
+            } else {
+                SpreadRestoreDefaults::NON_BOOK
+            };
         let has_prepared_aggregate = prepared_subfolder
             .as_ref()
             .is_some_and(|metadata| metadata.aggregate.is_some());
@@ -21705,11 +21764,12 @@ impl App {
                 ],
             );
         }
-        // 表示モード: DB から読み込み、なければデフォルト値 (本体は apply_spread_for_key)。
+        // 表示モード: DB から読み込み、なければ読み込み対象が本のときだけ settings の既定値。
+        // 本でないビューは単ページ + ページ単位 + 左→右へ戻す。明示保存値はどちらでも優先する。
         // 旧実装の SpreadMode::Vertical は「単ページ + 縦連結」として解釈する。
         // ZIP の場合はここで一旦 zip_path キーで読むが、finalize_zip_enumerate が zip_nav
         // 設定後に「ルート本のキー (zip_path + 実効 prefix)」で読み直す (本ごと独立記憶)。
-        self.apply_spread_for_key(&source_path);
+        self.apply_spread_for_key(&source_path, spread_restore_defaults);
         self.apply_view_trim_for_key(&source_path);
         self.spread_popup_open = false;
         self.fit_popup_open = false;
@@ -26589,33 +26649,51 @@ impl App {
         crate::books::is_direct_book_folder(&self.book_root_path(), folder)
     }
 
-    /// 現在のビューがページ順を固定する「本」文脈か (= 一覧ソートが効かない)。
+    /// 指定した読み込み対象がページ順を固定する「本」文脈か (= 一覧ソートが効かない)。
     /// 製本した本 / 読書履歴 / ZIP・PDF・直接閲覧RAR・変換キャッシュを開いている /
     /// 画像のみフォルダを本扱いしている場合に true。
-    pub(crate) fn page_order_locked_for_current_view(&self) -> bool {
-        if self.current_folder_is_book_folder() || self.items_are_reading_history_view {
+    fn page_order_locked_for_items(
+        &self,
+        source_path: &Path,
+        items: &[GridItem],
+        view_kind: PageOrderViewKind,
+    ) -> bool {
+        if crate::books::is_direct_book_folder(&self.book_root_path(), source_path)
+            || view_kind == PageOrderViewKind::ReadingHistory
+        {
             return true;
         }
-
-        let Some(current_folder) = self.current_folder.as_deref() else {
-            return false;
-        };
-        if crate::folder_tree::is_open_as_container(current_folder) {
+        if crate::folder_tree::is_open_as_container(source_path) {
             return true;
         }
 
         self.settings.auto_fullscreen_image_folders_enabled()
-            && !self.items_are_rating_view
-            && !self.items_are_bookmark_view
-            && !self.items_are_global_search_view
-            && !self.items_are_tag_view
-            && !self.items_are_subfolder_expansion_view
-            && !self.items_are_smart_folder_view
-            && !self.items.is_empty()
-            && self
-                .items
-                .iter()
-                .all(|item| matches!(item, GridItem::Image(_)))
+            && view_kind == PageOrderViewKind::Physical
+            && Self::grid_items_are_image_only_folder_pages(items)
+    }
+
+    /// 現在のビュー用ラッパー。判定本体は読み込み前にも使える items 引数付き述語へ集約する。
+    pub(crate) fn page_order_locked_for_current_view(&self) -> bool {
+        if self.items_are_reading_history_view && self.current_folder.is_none() {
+            return true;
+        }
+        let Some(current_folder) = self.current_folder.as_deref() else {
+            return false;
+        };
+        let view_kind = if self.items_are_reading_history_view {
+            PageOrderViewKind::ReadingHistory
+        } else if self.items_are_rating_view
+            || self.items_are_bookmark_view
+            || self.items_are_global_search_view
+            || self.items_are_tag_view
+            || self.items_are_subfolder_expansion_view
+            || self.items_are_smart_folder_view
+        {
+            PageOrderViewKind::Synthetic
+        } else {
+            PageOrderViewKind::for_loading_source(current_folder)
+        };
+        self.page_order_locked_for_items(current_folder, &self.items, view_kind)
     }
 
     fn book_bookmark_view_is_synthetic(&self) -> bool {

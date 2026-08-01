@@ -13035,6 +13035,292 @@ mod favorite_adjustment_defaults_tests {
         app.settings.auto_fullscreen_image_folders = true;
     }
 
+    fn set_non_single_spread_defaults(app: &mut App) {
+        app.settings.default_spread_mode = crate::settings::SpreadMode::RtlCover;
+        app.settings.default_reading_flow = crate::settings::ReadingFlow::Horizontal;
+        app.settings.default_reading_direction = crate::settings::ReadingDirection::Rtl;
+    }
+
+    fn assert_non_book_spread_state(app: &App) {
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Paged);
+        assert_eq!(
+            app.reading_direction,
+            crate::settings::ReadingDirection::Ltr
+        );
+    }
+
+    fn assert_book_default_spread_state(app: &App) {
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::RtlCover);
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Horizontal);
+        assert_eq!(
+            app.reading_direction,
+            crate::settings::ReadingDirection::Rtl
+        );
+    }
+
+    fn store_spread_for_test(
+        app: &App,
+        path: &Path,
+        spread_mode: crate::settings::SpreadMode,
+        reading_flow: crate::settings::ReadingFlow,
+        reading_direction: crate::settings::ReadingDirection,
+    ) {
+        let db = app.spread_db.as_ref().unwrap();
+        db.set(
+            path,
+            spread_mode,
+            app.settings.default_spread_mode,
+            app.settings.default_reading_flow,
+            app.settings.default_reading_direction,
+        )
+        .unwrap();
+        db.set_flow(
+            path,
+            reading_flow,
+            reading_direction,
+            app.settings.default_spread_mode,
+            app.settings.default_reading_flow,
+            app.settings.default_reading_direction,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn start_loading_items_classifies_incoming_pages_before_install() {
+        let mut app = setup_app();
+        enable_auto_image_folder_book(&mut app);
+        set_non_single_spread_defaults(&mut app);
+        let folder = app.tmp.path().join("incoming-image-book");
+        std::fs::create_dir_all(&folder).unwrap();
+        let page = folder.join("p001.jpg");
+
+        assert!(app.items.is_empty(), "pre-install self.items must be empty");
+        app.start_loading_items(
+            folder,
+            vec![GridItem::Image(page)],
+            vec![None],
+            std::collections::HashSet::new(),
+            Vec::new(),
+            None,
+        );
+
+        assert_book_default_spread_state(&app);
+    }
+
+    #[test]
+    fn start_loading_items_uses_non_book_defaults_for_disabled_or_mixed_folders() {
+        let mut app = setup_app();
+        set_non_single_spread_defaults(&mut app);
+        let disabled = app.tmp.path().join("disabled-image-book");
+        std::fs::create_dir_all(&disabled).unwrap();
+        app.start_loading_items(
+            disabled.clone(),
+            vec![GridItem::Image(disabled.join("p001.jpg"))],
+            vec![None],
+            std::collections::HashSet::new(),
+            Vec::new(),
+            None,
+        );
+        assert_non_book_spread_state(&app);
+
+        enable_auto_image_folder_book(&mut app);
+        let mixed = app.tmp.path().join("mixed-image-folder");
+        std::fs::create_dir_all(&mixed).unwrap();
+        app.start_loading_items(
+            mixed.clone(),
+            vec![
+                GridItem::Image(mixed.join("p001.jpg")),
+                GridItem::Folder(mixed.join("chapter")),
+            ],
+            vec![None, None],
+            std::collections::HashSet::new(),
+            Vec::new(),
+            None,
+        );
+        assert_non_book_spread_state(&app);
+    }
+
+    #[test]
+    fn start_loading_items_applies_non_book_defaults_before_view_flags_are_set() {
+        let mut app = setup_app();
+        enable_auto_image_folder_book(&mut app);
+        set_non_single_spread_defaults(&mut app);
+        let sources = [
+            search_results_synthetic_path(),
+            bookmark_view_synthetic_path(),
+            rating_view_synthetic_path(),
+            subfolder_expansion_synthetic_path(),
+            smart_folder::smart_folder_synthetic_path(uuid::Uuid::new_v4()),
+        ];
+
+        for source in sources {
+            app.start_loading_items(
+                source,
+                vec![GridItem::Image(PathBuf::from(r"C:\test\p001.jpg"))],
+                vec![None],
+                std::collections::HashSet::new(),
+                Vec::new(),
+                None,
+            );
+            assert_non_book_spread_state(&app);
+        }
+    }
+
+    #[test]
+    fn stored_spread_values_override_defaults_for_book_and_non_book() {
+        let mut app = setup_app();
+        enable_auto_image_folder_book(&mut app);
+        set_non_single_spread_defaults(&mut app);
+
+        let non_book = app.tmp.path().join("stored-non-book");
+        std::fs::create_dir_all(&non_book).unwrap();
+        store_spread_for_test(
+            &app,
+            &non_book,
+            crate::settings::SpreadMode::Ltr,
+            crate::settings::ReadingFlow::Vertical,
+            crate::settings::ReadingDirection::Ltr,
+        );
+        app.start_loading_items(
+            non_book.clone(),
+            vec![
+                GridItem::Image(non_book.join("p001.jpg")),
+                GridItem::Folder(non_book.join("chapter")),
+            ],
+            vec![None, None],
+            std::collections::HashSet::new(),
+            Vec::new(),
+            None,
+        );
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Ltr);
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
+        assert_eq!(
+            app.reading_direction,
+            crate::settings::ReadingDirection::Ltr
+        );
+
+        let book = app.tmp.path().join("stored-book.pdf");
+        store_spread_for_test(
+            &app,
+            &book,
+            crate::settings::SpreadMode::Single,
+            crate::settings::ReadingFlow::Vertical,
+            crate::settings::ReadingDirection::Ltr,
+        );
+        app.start_loading_items(
+            book.clone(),
+            vec![GridItem::PdfPage {
+                pdf_path: book,
+                page_num: 0,
+                content_type: None,
+            }],
+            vec![None],
+            std::collections::HashSet::new(),
+            Vec::new(),
+            None,
+        );
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
+        assert_eq!(
+            app.reading_direction,
+            crate::settings::ReadingDirection::Ltr
+        );
+    }
+
+    #[test]
+    fn nested_zip_spread_fallback_key_still_overrides_book_defaults() {
+        let mut app = setup_app();
+        set_non_single_spread_defaults(&mut app);
+        let root = PathBuf::from(r"C:\test\book.zip");
+        let nested = root.join("volume-1");
+        store_spread_for_test(
+            &app,
+            &root,
+            crate::settings::SpreadMode::LtrCover,
+            crate::settings::ReadingFlow::Vertical,
+            crate::settings::ReadingDirection::Ltr,
+        );
+
+        let defaults = SpreadRestoreDefaults::for_book(&app.settings);
+        app.apply_spread_for_key_with_fallback(&nested, Some(&root), defaults);
+
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::LtrCover);
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
+        assert_eq!(
+            app.reading_direction,
+            crate::settings::ReadingDirection::Ltr
+        );
+    }
+
+    #[test]
+    fn page_order_lock_classifies_all_book_loading_sources() {
+        let mut app = setup_app();
+        enable_auto_image_folder_book(&mut app);
+        let image_folder = app.tmp.path().join("image-book");
+        let image_pages = vec![GridItem::Image(image_folder.join("p001.jpg"))];
+        let mixed_items = vec![
+            GridItem::Image(image_folder.join("p001.jpg")),
+            GridItem::Folder(image_folder.join("chapter")),
+        ];
+
+        assert!(app.page_order_locked_for_items(
+            &image_folder,
+            &image_pages,
+            PageOrderViewKind::for_loading_source(&image_folder),
+        ));
+        assert!(!app.page_order_locked_for_items(
+            &image_folder,
+            &mixed_items,
+            PageOrderViewKind::for_loading_source(&image_folder),
+        ));
+        for container in ["book.zip", "book.cbz", "book.pdf", "converted-cache.zip"] {
+            let path = app.tmp.path().join(container);
+            assert!(app.page_order_locked_for_items(
+                &path,
+                &[],
+                PageOrderViewKind::for_loading_source(&path),
+            ));
+        }
+
+        let book_root = app.tmp.path().join("books");
+        let compiled_book = book_root.join("compiled");
+        app.settings.book_root = Some(book_root);
+        assert!(app.page_order_locked_for_items(
+            &compiled_book,
+            &mixed_items,
+            PageOrderViewKind::for_loading_source(&compiled_book),
+        ));
+        let history = reading_history_synthetic_path();
+        assert!(app.page_order_locked_for_items(
+            &history,
+            &mixed_items,
+            PageOrderViewKind::for_loading_source(&history),
+        ));
+    }
+
+    #[test]
+    fn page_order_lock_rejects_all_non_book_synthetic_loading_sources() {
+        let mut app = setup_app();
+        enable_auto_image_folder_book(&mut app);
+        let image_pages = vec![GridItem::Image(PathBuf::from(r"C:\test\p001.jpg"))];
+        let synthetic_sources = [
+            search_results_synthetic_path(),
+            bookmark_view_synthetic_path(),
+            rating_view_synthetic_path(),
+            subfolder_expansion_synthetic_path(),
+            smart_folder::smart_folder_synthetic_path(uuid::Uuid::new_v4()),
+        ];
+
+        for source in synthetic_sources {
+            assert!(!app.page_order_locked_for_items(
+                &source,
+                &image_pages,
+                PageOrderViewKind::for_loading_source(&source),
+            ));
+        }
+    }
+
     #[test]
     fn page_order_lock_detects_open_zip_container() {
         let mut app = setup_app();
@@ -13319,7 +13605,19 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.page_order_locked_for_current_view());
         app.items_are_tag_view = false;
 
+        app.items_are_rating_view = true;
+        assert!(!app.page_order_locked_for_current_view());
+        app.items_are_rating_view = false;
+
+        app.items_are_bookmark_view = true;
+        assert!(!app.page_order_locked_for_current_view());
+        app.items_are_bookmark_view = false;
+
         app.items_are_subfolder_expansion_view = true;
+        assert!(!app.page_order_locked_for_current_view());
+        app.items_are_subfolder_expansion_view = false;
+
+        app.items_are_smart_folder_view = true;
         assert!(!app.page_order_locked_for_current_view());
     }
 
