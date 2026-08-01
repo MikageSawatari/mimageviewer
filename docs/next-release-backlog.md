@@ -156,6 +156,18 @@
 - 影響範囲: Windows native 入力、egui viewport、detached / native presenter。HWND 再生成や
   viewport lifecycle への対応が要る。detached リワークとの調整も必要
   ([detached-rework-plan.md](detached-rework-plan.md) §2 / §11)。
+- **実機で確認した症状 (2026-08-01)**: F12 別ウィンドウで動画のブックマーク名を編集中に、
+  メインウィンドウをクリックしてそちらを操作しても、**キーが別ウィンドウのテキストエリアへ
+  行き続ける** (矢印キーがそちらの caret を動かす)。上の「root ctx はキーボード不要、child ctx は
+  TextEdit 編集中、物理キーキューはどちら由来か不明」がそのまま出た形。**v2.9.0 から同じ挙動**。
+- **利用者体験の観点** (優先度を再判断するときはこれも見ること): 編集中の別ウィンドウが
+  **視界に入っていないと、アプリ全体が壊れたと誤解する**。「入力欄を閉じれば直る」と気づく
+  手がかりが画面上に無い。技術的な影響範囲が狭くても、体感的な深刻度はこの分だけ高い。
+- 前提の進捗: 案A は v2.9.1 の `56db11bc` で pass 単位の所有者決定と生キーの permit 化まで入った。
+  IME 状態も viewport ごとへ分離済み。**本項は「どの viewport の所有権か」を正しくするだけに
+  縮んでいる**はず。
+- 併せて直す: [§1.32](#132-ime-変換中の-esc-が期待どおりに働かない-2-件) の IME 2 件。同じ領域なので
+  一括で設計する。
 - 規模 / 優先度: Large / P2 candidate。
 ### 1.27 presenter スレッドが UI スレッドの窓の子 HWND を所有したままブロックする
 
@@ -343,6 +355,37 @@
   ようにする (危険な操作の最中こそ黙る、という現状は逆)。
 - 規模 / 優先度: Large / **P1 candidate (基盤)**。次版で Web 配信とコンテナ詰め替えを載せる前に
   方針を決めておく。
+
+### 1.32 IME 変換中の ESC が期待どおりに働かない 2 件
+
+- 出典: v2.9.1 リリース前の実機確認 (2026-08-01)。**どちらも v2.9.0 から同じ挙動**で、v2.9.1 の
+  退行ではない。`829ba729` で入れた IME helper は単一行欄を揃えたもので、下記 2 件は範囲外だった。
+- **(A) 複数行の注釈本文で、変換中 ESC を押すとテキストエリアの focus まで外れる**。
+  ブックマーク名などの単一行欄では focus が残るので挙動が非対称。
+  - 原因: 吹き出し本文 ([ui_text.rs](../src/ui_text.rs) の `TextEdit::multiline(&mut t.text)`) は
+    [ime_focus.rs](../src/ime_focus.rs) の raw TextEdit allowlist に「Enter 改行と caret 操作を
+    所有する注釈本文の複数行 editor」として**意図的に登録**されており、helper の focus 復帰
+    (IME キー由来の一時的な focus loss を戻す処理) が効かない。
+  - 直し方: helper に複数行版を用意する。exemption の理由どおり **helper の Enter/submit 意味論が
+    複数行と噛み合わない**ので、focus 復帰だけを切り出せる形にする必要がある。
+- **(B) 変換中 ESC を押しても未確定文字がテキストに残る** (「あああ」+ ESC で「あああ」が残る)。
+  期待は未確定分が消えること。
+  - 原因: egui の `TextEdit` は preedit を**バッファへ直接書き込み**、消去は空の `Preedit("")` を
+    受け取ったときだけ行う (egui 0.33.3 `widgets/text_edit/builder.rs` の
+    「Empty prediction can be produced when user press backspace or escape during IME, so we clear
+    current text」というコメントがその前提を明示)。`ImeEvent::Disabled` のハンドラは
+    `ime_enabled = false` にするだけで**テキストを消さない**。この環境の ESC では
+    `Preedit("")` が来ず `Disabled` だけが届くため残る。
+  - 直し方: `ime_focus` は既に viewport ごとに composition 状態を持っているので、
+    **composing 中に `Commit` を伴わない `Disabled` を観測したら、その直前に空の `Preedit("")` を
+    挿入する**。egui が本来想定している経路に戻すだけで、症状パッチではない。
+  - ⚠️ **注意**: `Preedit("")` は `delete_selected()` を呼ぶので、composition が無いときに撃つと
+    **ユーザーの選択範囲を消す**。自前の composing 判定で厳密にゲートし、unit test で固定すること
+    (`ime_focus.rs` に合成 Ime イベントを流すテストの前例がある)。
+- **§1.22 と一緒に設計すること**。3 件とも「IME と入力所有権」という同じ領域で、§1.22 を直すときに
+  viewport ごとの IME 状態と focus の扱いを触る。バラバラに直すより一括のほうが筋が良い、と
+  2026-08-01 に判断してこの版では見送った。
+- 規模 / 優先度: (A) Medium / (B) Small / どちらも P2。データ喪失はなく、利用者は手で消せる。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
