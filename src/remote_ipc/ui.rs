@@ -1,12 +1,12 @@
 use mimageviewer_ipc::{
-    RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource, RemoteWebFeatureStatus,
-    RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse,
-    SessionConnectionKind, SessionStatus,
+    RemoteItemState, RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource,
+    RemoteWebFeatureStatus, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest,
+    RemoteWriteResponse, RemoteWriteResult, SessionConnectionKind, SessionStatus,
 };
 use qrcode::{Color, QrCode};
 
 use super::path_guard::logical_favorite_path;
-use super::session::{ActiveSessionSnapshot, SessionHandle, UiWriteOutcome};
+use super::session::{ActiveSessionSnapshot, ClaimedRemoteWrite, SessionHandle, UiWriteOutcome};
 
 #[derive(Default)]
 pub(crate) struct RemoteSessionUiState {
@@ -15,7 +15,18 @@ pub(crate) struct RemoteSessionUiState {
     last_control_return_sequence: u64,
     pending_fullscreen_restore: Option<PendingFullscreenRestore>,
     paused_animation_restore_key: Option<String>,
+    pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
     show_connection_dialog: bool,
+}
+
+struct PendingRemoteBookmarkWrite {
+    claimed: ClaimedRemoteWrite,
+    kind: PendingRemoteBookmarkWriteKind,
+}
+
+enum PendingRemoteBookmarkWriteKind {
+    ReadState { rating: u8 },
+    SetPresence,
 }
 
 struct PendingFullscreenRestore {
@@ -121,6 +132,13 @@ impl crate::app::App {
                 pending.complete(UiWriteOutcome::Session(ownership));
                 continue;
             }
+            if matches!(
+                pending.request(),
+                RemoteWriteRequest::SetBookmark { .. } | RemoteWriteRequest::GetItemState { .. }
+            ) {
+                self.begin_remote_bookmark_write(pending);
+                continue;
+            }
             let response = self.apply_remote_write(pending.request());
             pending.complete(UiWriteOutcome::Write(response));
         }
@@ -133,7 +151,115 @@ impl crate::app::App {
                 spread_mode,
                 reading_direction,
             } => self.persist_remote_spread(address, *spread_mode, *reading_direction),
+            RemoteWriteRequest::RecordReadingProgress {
+                address,
+                context_address,
+                page_index,
+                page_number,
+                page_count,
+                record_resume,
+                record_history,
+            } => self.persist_remote_reading_progress(
+                address,
+                context_address,
+                *page_index,
+                *page_number,
+                *page_count,
+                *record_resume,
+                *record_history,
+            ),
+            RemoteWriteRequest::SetRating { address, stars } => {
+                self.persist_remote_rating(address, *stars)
+            }
+            RemoteWriteRequest::SetBookmark { .. } | RemoteWriteRequest::GetItemState { .. } => {
+                write_error(
+                    RemoteWriteErrorCode::Internal,
+                    "ブックマーク要求の非同期経路が使われませんでした",
+                )
+            }
         }
+    }
+
+    fn begin_remote_bookmark_write(&mut self, pending: ClaimedRemoteWrite) {
+        let request = pending.request().clone();
+        let (address, context_address, page_index, requested_presence, supported) = match request {
+            RemoteWriteRequest::SetBookmark {
+                address,
+                context_address,
+                page_index,
+                bookmarked,
+            } => (address, context_address, page_index, Some(bookmarked), true),
+            RemoteWriteRequest::GetItemState {
+                address,
+                context_address,
+                page_index,
+                bookmark_supported,
+            } => (
+                address,
+                context_address,
+                page_index,
+                None,
+                bookmark_supported,
+            ),
+            _ => unreachable!("only bookmark-backed requests are deferred"),
+        };
+        let rating = match remote_rating_target(&self.settings, &address) {
+            Ok(target) => {
+                let Some(db) = self.rating_db.as_ref() else {
+                    pending.complete(UiWriteOutcome::Write(write_error(
+                        RemoteWriteErrorCode::PersistenceFailed,
+                        "レーティング DB を利用できません",
+                    )));
+                    return;
+                };
+                db.get(&target.key)
+            }
+            Err(error) => {
+                pending.complete(UiWriteOutcome::Write(RemoteWriteResponse::Error(error)));
+                return;
+            }
+        };
+        if requested_presence.is_none() && !supported {
+            pending.complete(UiWriteOutcome::Write(RemoteWriteResponse::Success(
+                RemoteWriteResult::item_state(RemoteItemState {
+                    rating,
+                    bookmark_supported: false,
+                    bookmarked: false,
+                }),
+            )));
+            return;
+        }
+        let draft =
+            match remote_bookmark_draft(&self.settings, &address, &context_address, page_index) {
+                Ok(draft) => draft,
+                Err(error) => {
+                    pending.complete(UiWriteOutcome::Write(RemoteWriteResponse::Error(error)));
+                    return;
+                }
+            };
+        let request_id = self.next_book_bookmark_request_id();
+        let Some(service) = self.book_bookmark_service.as_ref() else {
+            pending.complete(UiWriteOutcome::Write(write_error(
+                RemoteWriteErrorCode::PersistenceFailed,
+                "ブックマーク DB を利用できません",
+            )));
+            return;
+        };
+        let kind = if let Some(present) = requested_presence {
+            service.set_page_presence(request_id, draft, present);
+            PendingRemoteBookmarkWriteKind::SetPresence
+        } else {
+            service.get_page_presence(request_id, draft);
+            PendingRemoteBookmarkWriteKind::ReadState { rating }
+        };
+        self.book_bookmark_pending_requests.insert(request_id);
+        self.remote_session_ui.pending_bookmark_writes.insert(
+            request_id,
+            PendingRemoteBookmarkWrite {
+                claimed: pending,
+                kind,
+            },
+        );
     }
 
     fn persist_remote_spread(
@@ -172,7 +298,7 @@ impl crate::app::App {
                     "remote_ipc: UI write applied kind=set_spread duration_ms={:.1}",
                     started.elapsed().as_secs_f64() * 1000.0
                 ));
-                RemoteWriteResponse::Success
+                RemoteWriteResponse::Success(RemoteWriteResult::applied())
             }
             Err(error) => {
                 crate::logger::log(format!(
@@ -184,6 +310,172 @@ impl crate::app::App {
                     "spread.db への保存に失敗しました",
                 )
             }
+        }
+    }
+
+    fn persist_remote_reading_progress(
+        &mut self,
+        address: &mimageviewer_ipc::RemoteAddress,
+        context_address: &mimageviewer_ipc::RemoteAddress,
+        page_index: u32,
+        page_number: u32,
+        page_count: u32,
+        record_resume: bool,
+        record_history: bool,
+    ) -> RemoteWriteResponse {
+        let target = match remote_reading_target(&self.settings, address, context_address) {
+            Ok(target) => target,
+            Err(error) => return RemoteWriteResponse::Error(error),
+        };
+        if record_resume && (self.book_resume_db.is_none() || self.book_resume_writer.is_none()) {
+            return write_error(
+                RemoteWriteErrorCode::PersistenceFailed,
+                "読書位置 DB を利用できません",
+            );
+        }
+        let page_index = page_index as usize;
+        if record_resume {
+            if let Some(writer) = self.book_resume_writer.as_ref() {
+                writer.record(&target.container_path, page_index);
+            }
+            self.last_book_resume = Some((target.container_path.clone(), page_index));
+        }
+
+        if self.settings.reading_history_enabled
+            && record_history
+            && self.reading_history_db.is_some()
+            && self.reading_history_writer.is_some()
+        {
+            let key = crate::path_key::normalize_keep_drive(&target.container_path);
+            let now = std::time::Instant::now();
+            let throttled =
+                self.last_reading_history_touch
+                    .as_ref()
+                    .is_some_and(|(last_key, at)| {
+                        last_key == &key
+                            && now.duration_since(*at)
+                                < crate::reading_history_db::READING_HISTORY_TOUCH_THROTTLE
+                    });
+            if !throttled {
+                let title = target
+                    .container_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| target.container_path.to_string_lossy().into_owned());
+                let entry = crate::reading_history_db::ReadingHistoryEntry::new(
+                    target.container_path,
+                    target.history_kind,
+                    None,
+                    title,
+                    record_resume.then_some(i64::from(page_number)),
+                    record_resume.then_some(i64::from(page_count)),
+                );
+                if let Some(writer) = self.reading_history_writer.as_ref() {
+                    writer.record(entry, self.settings.reading_history_limit);
+                }
+                self.last_reading_history_touch = Some((key, now));
+            }
+        }
+        RemoteWriteResponse::Success(RemoteWriteResult::applied())
+    }
+
+    fn persist_remote_rating(
+        &mut self,
+        address: &mimageviewer_ipc::RemoteAddress,
+        stars: u8,
+    ) -> RemoteWriteResponse {
+        let target = match remote_rating_target(&self.settings, address) {
+            Ok(target) => target,
+            Err(error) => return RemoteWriteResponse::Error(error),
+        };
+        if let Err(error) = self.write_user_rating_shared(&target.key, stars, Some(&target.meta)) {
+            crate::logger::log(format!("remote_ipc: rating write failed: {error}"));
+            return write_error(
+                RemoteWriteErrorCode::PersistenceFailed,
+                "rating.db への保存に失敗しました",
+            );
+        }
+        self.invalidate_rating_counts_cache();
+        self.schedule_current_smart_folder_metadata_refresh(
+            crate::app::smart_folder::SmartFolderMetadataDependency::Rating,
+        );
+        if self.settings.write_rating_to_xmp
+            && let Some(path) = target.xmp_target
+        {
+            self.ensure_rating_write_handle();
+            if let Some(handle) = self.rating_write_handle.as_ref() {
+                handle.submit(crate::rating_write_worker::RatingWriteJob {
+                    path,
+                    rating: (stars != 0).then_some(stars),
+                });
+            }
+        }
+        RemoteWriteResponse::Success(RemoteWriteResult::applied())
+    }
+
+    pub(crate) fn finish_remote_bookmark_event(
+        &mut self,
+        event: &crate::book_bookmarks::BookBookmarkEvent,
+    ) -> bool {
+        let (request_id, result, is_read) = match event {
+            crate::book_bookmarks::BookBookmarkEvent::PagePresenceRead {
+                request_id,
+                result,
+                ..
+            } => (*request_id, result, true),
+            crate::book_bookmarks::BookBookmarkEvent::PagePresenceSet {
+                request_id,
+                result,
+                ..
+            } => (*request_id, result, false),
+            _ => return false,
+        };
+        let Some(pending) = self
+            .remote_session_ui
+            .pending_bookmark_writes
+            .remove(&request_id)
+        else {
+            return true;
+        };
+        self.book_bookmark_pending_requests.remove(&request_id);
+        let response = match (&pending.kind, result, is_read) {
+            (PendingRemoteBookmarkWriteKind::ReadState { rating }, Ok(bookmarked), true) => {
+                RemoteWriteResponse::Success(RemoteWriteResult::item_state(RemoteItemState {
+                    rating: *rating,
+                    bookmark_supported: true,
+                    bookmarked: *bookmarked,
+                }))
+            }
+            (PendingRemoteBookmarkWriteKind::SetPresence, Ok(_), false) => {
+                self.notify_bookmarks_changed();
+                RemoteWriteResponse::Success(RemoteWriteResult::applied())
+            }
+            (_, Err(error), _) => {
+                crate::logger::log(format!(
+                    "remote_ipc: bookmark service request failed request_id={request_id} error={error}"
+                ));
+                write_error(
+                    RemoteWriteErrorCode::PersistenceFailed,
+                    "ブックマーク DB の操作に失敗しました",
+                )
+            }
+            _ => write_error(
+                RemoteWriteErrorCode::Internal,
+                "ブックマーク応答の種別が一致しません",
+            ),
+        };
+        pending.claimed.complete(UiWriteOutcome::Write(response));
+        true
+    }
+
+    pub(crate) fn fail_remote_bookmark_writes(&mut self) {
+        for (_, pending) in self.remote_session_ui.pending_bookmark_writes.drain() {
+            pending.claimed.complete(UiWriteOutcome::Write(write_error(
+                RemoteWriteErrorCode::PersistenceFailed,
+                "ブックマーク service が停止しました",
+            )));
         }
     }
 
@@ -442,6 +734,191 @@ fn remote_spread_key(
     ))
 }
 
+struct RemoteRatingTarget {
+    key: String,
+    meta: crate::rating_db::RatingMeta,
+    xmp_target: Option<std::path::PathBuf>,
+}
+
+fn remote_rating_target(
+    settings: &crate::settings::Settings,
+    address: &mimageviewer_ipc::RemoteAddress,
+) -> Result<RemoteRatingTarget, RemoteWriteError> {
+    use crate::rating_db::{RatingItemKind, RatingMeta};
+
+    let root = remote_logical_path(settings, address)?;
+    let (key, meta, xmp_target) = match &address.subresource {
+        RemoteSubresource::File => {
+            let meta = RatingMeta::new(RatingItemKind::Image).with_source_path(&root);
+            let compiled = root.parent().is_some_and(|parent| {
+                crate::books::is_direct_book_folder(&settings.books_root_path(), parent)
+            });
+            let xmp_target =
+                (!compiled && crate::xmp_writer::is_writable_format(&root)).then(|| root.clone());
+            (
+                crate::adjustment_db::normalize_path(&root),
+                meta,
+                xmp_target,
+            )
+        }
+        RemoteSubresource::ZipEntry { entry_name } => {
+            let mut meta = RatingMeta::new(RatingItemKind::ZipImage).with_source_path(&root);
+            meta.entry_name = Some(entry_name.clone());
+            (
+                crate::adjustment_db::zip_entry_key(&root, entry_name),
+                meta,
+                None,
+            )
+        }
+        RemoteSubresource::PdfPage { page_number } => {
+            let mut meta = RatingMeta::new(RatingItemKind::PdfPage).with_source_path(&root);
+            meta.page_num = Some(*page_number);
+            (
+                crate::adjustment_db::zip_entry_key(&root, &format!("page_{page_number}")),
+                meta,
+                None,
+            )
+        }
+        RemoteSubresource::ZipDirectory { .. } => {
+            return Err(RemoteWriteError::new(
+                RemoteWriteErrorCode::Unsupported,
+                "コンテナ自体にはページレーティングを付けられません",
+            ));
+        }
+    };
+    Ok(RemoteRatingTarget {
+        key,
+        meta,
+        xmp_target,
+    })
+}
+
+struct RemoteReadingTarget {
+    container_path: std::path::PathBuf,
+    history_kind: crate::reading_history_db::ReadingHistoryKind,
+}
+
+fn remote_reading_target(
+    settings: &crate::settings::Settings,
+    address: &mimageviewer_ipc::RemoteAddress,
+    context_address: &mimageviewer_ipc::RemoteAddress,
+) -> Result<RemoteReadingTarget, RemoteWriteError> {
+    let container_path = remote_logical_path(settings, context_address)?;
+    let history_kind = match (&address.subresource, &context_address.subresource) {
+        (RemoteSubresource::File, RemoteSubresource::File) => {
+            crate::reading_history_db::ReadingHistoryKind::Folder
+        }
+        (
+            RemoteSubresource::ZipEntry { .. },
+            RemoteSubresource::File | RemoteSubresource::ZipDirectory { .. },
+        ) => crate::reading_history_db::ReadingHistoryKind::Zip,
+        (RemoteSubresource::PdfPage { .. }, RemoteSubresource::File) => {
+            crate::reading_history_db::ReadingHistoryKind::Pdf
+        }
+        _ => {
+            return Err(RemoteWriteError::new(
+                RemoteWriteErrorCode::BadRequest,
+                "ページと閲覧コンテキストが一致しません",
+            ));
+        }
+    };
+    Ok(RemoteReadingTarget {
+        container_path,
+        history_kind,
+    })
+}
+
+fn remote_bookmark_draft(
+    settings: &crate::settings::Settings,
+    address: &mimageviewer_ipc::RemoteAddress,
+    context_address: &mimageviewer_ipc::RemoteAddress,
+    page_index: u32,
+) -> Result<crate::book_bookmarks::NewBookBookmark, RemoteWriteError> {
+    use crate::book_bookmarks::{BookContainerKind, NewBookBookmark, PageIdentity};
+
+    let container_path = remote_logical_path(settings, context_address)?;
+    let (container_kind, page_identity) = match &address.subresource {
+        RemoteSubresource::File => {
+            let page_path = remote_logical_path(settings, address)?;
+            let relative = page_path
+                .strip_prefix(&container_path)
+                .ok()
+                .filter(|value| !value.as_os_str().is_empty())
+                .and_then(|value| value.to_str())
+                .map(str::to_owned)
+                .or_else(|| {
+                    page_path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .map(str::to_owned)
+                })
+                .ok_or_else(|| {
+                    RemoteWriteError::new(
+                        RemoteWriteErrorCode::BadRequest,
+                        "画像のページ identity を作れません",
+                    )
+                })?;
+            let kind = if crate::books::is_direct_book_folder(
+                &settings.books_root_path(),
+                &container_path,
+            ) {
+                BookContainerKind::CompiledBook
+            } else {
+                BookContainerKind::ImageFolder
+            };
+            (kind, PageIdentity::RelativePath(relative))
+        }
+        RemoteSubresource::ZipEntry { entry_name } => (
+            BookContainerKind::Zip,
+            PageIdentity::ArchiveEntry(entry_name.clone()),
+        ),
+        RemoteSubresource::PdfPage { page_number } => {
+            (BookContainerKind::Pdf, PageIdentity::PdfPage(*page_number))
+        }
+        RemoteSubresource::ZipDirectory { .. } => {
+            return Err(RemoteWriteError::new(
+                RemoteWriteErrorCode::Unsupported,
+                "コンテナ自体はブックマークできません",
+            ));
+        }
+    };
+    Ok(NewBookBookmark {
+        container_path,
+        container_kind,
+        page_identity,
+        page_index_hint: page_index as usize,
+    })
+}
+
+fn remote_logical_path(
+    settings: &crate::settings::Settings,
+    address: &mimageviewer_ipc::RemoteAddress,
+) -> Result<std::path::PathBuf, RemoteWriteError> {
+    address.validate_syntax().map_err(|_| {
+        RemoteWriteError::new(
+            RemoteWriteErrorCode::BadRequest,
+            "コンテンツアドレスが不正です",
+        )
+    })?;
+    let favorite_id = uuid::Uuid::parse_str(&address.favorite_id).map_err(|_| {
+        RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, "favorite_id が不正です")
+    })?;
+    let favorite = settings
+        .favorites
+        .iter()
+        .find(|favorite| favorite.id == favorite_id)
+        .ok_or_else(|| {
+            RemoteWriteError::new(
+                RemoteWriteErrorCode::FavoriteNotFound,
+                "お気に入りが登録されていません",
+            )
+        })?;
+    Ok(logical_favorite_path(
+        &favorite.path,
+        &address.relative_path,
+    ))
+}
+
 fn core_spread_mode(mode: RemoteSpreadMode) -> crate::settings::SpreadMode {
     match mode {
         RemoteSpreadMode::Single => crate::settings::SpreadMode::Single,
@@ -571,6 +1048,51 @@ mod tests {
             let ui_key = remote_spread_key(&settings, &address).unwrap();
             assert_eq!(ui_key.exact, worker.logical, "relative={relative:?}");
         }
+    }
+
+    #[test]
+    fn remote_page_keys_match_local_rating_history_and_bookmark_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        let favorite = crate::settings::FavoriteEntry::new("test".to_owned(), root.clone());
+        let favorite_id = favorite.id.to_string();
+        let settings = crate::settings::Settings {
+            favorites: vec![favorite],
+            ..Default::default()
+        };
+
+        let folder = mimageviewer_ipc::RemoteAddress::file(&favorite_id, "album");
+        let image = mimageviewer_ipc::RemoteAddress::file(&favorite_id, "album/page.jpg");
+        let image_target = remote_rating_target(&settings, &image).unwrap();
+        assert_eq!(
+            image_target.key,
+            crate::adjustment_db::normalize_path(&root.join("album/page.jpg"))
+        );
+        let reading = remote_reading_target(&settings, &image, &folder).unwrap();
+        assert_eq!(reading.container_path, root.join("album"));
+        assert_eq!(
+            reading.history_kind,
+            crate::reading_history_db::ReadingHistoryKind::Folder
+        );
+        let bookmark = remote_bookmark_draft(&settings, &image, &folder, 4).unwrap();
+        assert_eq!(
+            bookmark.page_identity,
+            crate::book_bookmarks::PageIdentity::RelativePath("page.jpg".to_owned())
+        );
+        assert_eq!(bookmark.page_index_hint, 4);
+
+        let zip_page = mimageviewer_ipc::RemoteAddress {
+            favorite_id,
+            relative_path: "books/book.cbz".to_owned(),
+            subresource: RemoteSubresource::ZipEntry {
+                entry_name: "chapter/001.png".to_owned(),
+            },
+        };
+        let zip_target = remote_rating_target(&settings, &zip_page).unwrap();
+        assert_eq!(
+            zip_target.key,
+            crate::adjustment_db::zip_entry_key(&root.join("books/book.cbz"), "chapter/001.png",)
+        );
     }
 }
 

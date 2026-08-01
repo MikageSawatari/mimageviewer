@@ -7,6 +7,7 @@ import {
   command,
   commandFromKey,
   containerPageTargetPx,
+  createReadingProgressBatch,
   gridLayoutForWidth,
   gridScrollExtent,
   gridIndexForCommand,
@@ -16,6 +17,7 @@ import {
   pagePrefetchPlan,
   planSpreadIntent,
   reduceViewerTransform,
+  readingProgressBatchTransition,
   sessionOwnerBadge,
   snappedGridOffset,
   thumbnailBindingMatches,
@@ -23,6 +25,7 @@ import {
   shouldShowLoadingIndicator,
   shouldShowKeyboardShortcuts,
   viewerGestureDecision,
+  viewerVerticalScrollDecision,
   viewerTapCommand,
   viewerImageLayout,
   viewerBoundaryMessage,
@@ -53,6 +56,7 @@ const PAGE_PREFETCH_BEHIND = 1;
 const PAGE_RESOURCE_CACHE_LIMIT = 12;
 const PAGE_RESOURCE_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const SESSION_PING_INTERVAL_MS = 30_000;
+const READING_PROGRESS_INTERVAL_MS = 30_000;
 const RUNTIME_TEST_MODE = globalThis.__MIV_RUNTIME_TEST_MODE__ === true;
 const REMOTE_CLIENT_ID = loadRemoteClientId();
 const LOCAL_SETTINGS_LOAD = loadLocalSettings();
@@ -314,6 +318,8 @@ const state = {
   remoteSessionAcquirePromise: null,
   remoteSessionUserActive: false,
   remoteSessionTimer: 0,
+  viewerItemState: null,
+  viewerItemStateSequence: 0,
 };
 
 let recentPointerSource = { source: "mouse", at: 0 };
@@ -605,6 +611,13 @@ function renderPinLogin(initialRemainingSeconds = 0) {
 async function dispatchRoute() {
   if (!state.authenticated) return;
   const route = parseRoute(location.hash);
+  if (
+    state.screenContext === "viewer" &&
+    route.kind !== "media" &&
+    route.kind !== "image"
+  ) {
+    await flushReadingProgress();
+  }
   if (route.kind !== "media") pageResourceCache.clear();
   try {
     if (route.kind === "home") {
@@ -792,17 +805,7 @@ function dispatchCommand(requested, meta = {}) {
       handled = true;
     } else if (state.screenContext === "viewer") {
       exitBrowserFullscreen();
-      const viewerDepth = Number(history.state?.viewerDepth) || 0;
-      if (history.state?.viewerFromGrid && viewerDepth > 0) {
-        history.go(-viewerDepth);
-      } else {
-        history.replaceState(
-          { mivRoute: true },
-          "",
-          state.gridHash
-        );
-        dispatchRoute();
-      }
+      leaveViewerForGrid().catch(() => {});
       handled = true;
     } else if (state.screenContext === "grid") {
       if (history.state?.navigatedInApp) {
@@ -872,6 +875,15 @@ function dispatchCommand(requested, meta = {}) {
       handled = changeImageTo(state.pageGroups.length - 1);
     } else if (requested.name === CommandName.SPREAD_CYCLE) {
       handled = requestSpreadMode(nextSpreadMode(state.spreadMode));
+    } else if (requested.name === CommandName.SET_RATING) {
+      const stars = Number(requested.payload.stars);
+      if (Number.isInteger(stars) && stars >= 0 && stars <= 5) {
+        setViewerRating(stars).catch(() => {});
+        handled = true;
+      }
+    } else if (requested.name === CommandName.TOGGLE_BOOKMARK) {
+      toggleViewerBookmark().catch(() => {});
+      handled = true;
     } else if (requested.name.startsWith("spread_")) {
       const spreadModes = {
         [CommandName.SPREAD_SINGLE]: SpreadMode.SINGLE,
@@ -1454,6 +1466,243 @@ function viewerSeekSnapshot(groupIndex = state.pageGroupIndex) {
 
 let spreadWriteTail = Promise.resolve();
 let spreadWriteSequence = 0;
+let readingProgressBatch = createReadingProgressBatch();
+let readingProgressContextIdentity = "";
+let readingProgressTimer = 0;
+let readingProgressWriteTail = Promise.resolve();
+
+function currentRemotePageTarget() {
+  const group = currentPageGroup();
+  const entry = group?.anchor;
+  if (!entry) return null;
+  const address = entryAddress(entry);
+  const contextAddress = state.container?.address ?? {
+    favorite_id: state.favoriteId,
+    relative_path: state.folderPath,
+    subresource: { kind: "file" },
+  };
+  const pageIndex = state.entries.findIndex(
+    (candidate) => entryIdentity(candidate) === entryIdentity(entry)
+  );
+  if (!address?.favorite_id || !contextAddress?.favorite_id || pageIndex < 0) return null;
+  return { address, contextAddress, pageIndex };
+}
+
+function readingProgressValue() {
+  const target = currentRemotePageTarget();
+  if (!target) return null;
+  const imageIndex = state.images.findIndex(
+    (entry) => addressIdentity(entryAddress(entry)) === addressIdentity(target.address)
+  );
+  const contextIdentity = addressIdentity(target.contextAddress);
+  return {
+    contextIdentity,
+    identity: `${contextIdentity}\n${addressIdentity(target.address)}`,
+    request: {
+      kind: "record_reading_progress",
+      address: target.address,
+      context_address: target.contextAddress,
+      page_index: target.pageIndex,
+      page_number: Math.max(1, imageIndex + 1),
+      page_count: state.images.length,
+      record_resume: true,
+      record_history: true,
+    },
+  };
+}
+
+function enqueueReadingProgress(effect) {
+  if (!effect?.request) return readingProgressWriteTail;
+  readingProgressWriteTail = readingProgressWriteTail
+    .catch(() => {})
+    .then(() => apiPostJson("/api/write", effect.request))
+    .catch((error) => {
+      recordClientError("reading_progress_write_error", error, {
+        page: limitText(effect.identity, 240),
+      });
+    });
+  return readingProgressWriteTail;
+}
+
+function scheduleReadingProgressTick() {
+  clearTimeout(readingProgressTimer);
+  readingProgressTimer = 0;
+  if (
+    !readingProgressBatch.latest ||
+    readingProgressBatch.latest.identity === readingProgressBatch.lastEmittedIdentity
+  ) {
+    return;
+  }
+  const delay = Math.max(0, readingProgressBatch.nextDueAt - performance.now());
+  readingProgressTimer = setTimeout(() => {
+    const transition = readingProgressBatchTransition(
+      readingProgressBatch,
+      { type: "tick", now: performance.now() },
+      READING_PROGRESS_INTERVAL_MS
+    );
+    readingProgressBatch = transition.state;
+    enqueueReadingProgress(transition.effect);
+    scheduleReadingProgressTick();
+  }, delay);
+}
+
+function observeReadingProgress() {
+  const value = readingProgressValue();
+  if (!value) return;
+  if (
+    readingProgressContextIdentity &&
+    readingProgressContextIdentity !== value.contextIdentity
+  ) {
+    const final = readingProgressBatchTransition(
+      readingProgressBatch,
+      { type: "flush", now: performance.now() },
+      READING_PROGRESS_INTERVAL_MS
+    );
+    enqueueReadingProgress(final.effect);
+    readingProgressBatch = createReadingProgressBatch();
+  }
+  readingProgressContextIdentity = value.contextIdentity;
+  const transition = readingProgressBatchTransition(
+    readingProgressBatch,
+    { type: "observe", value, now: performance.now() },
+    READING_PROGRESS_INTERVAL_MS
+  );
+  readingProgressBatch = transition.state;
+  enqueueReadingProgress(transition.effect);
+  scheduleReadingProgressTick();
+}
+
+async function refreshViewerItemState() {
+  const target = currentRemotePageTarget();
+  const menu = state.commandMenu;
+  if (!target || state.screenContext !== "viewer") {
+    state.viewerItemState = null;
+    menu?.setItemState(null, false);
+    return null;
+  }
+  const identity = addressIdentity(target.address);
+  const sequence = ++state.viewerItemStateSequence;
+  state.viewerItemState = null;
+  menu?.setItemState(null, true);
+  try {
+    const response = await apiPostJson("/api/write", {
+      kind: "get_item_state",
+      address: target.address,
+      context_address: target.contextAddress,
+      page_index: target.pageIndex,
+      bookmark_supported: false,
+    });
+    if (
+      sequence !== state.viewerItemStateSequence ||
+      state.screenContext !== "viewer" ||
+      addressIdentity(currentRemotePageTarget()?.address) !== identity
+    ) {
+      return null;
+    }
+    const current = response.item_state;
+    if (!current || !Number.isInteger(Number(current.rating))) {
+      throw new Error("現在のレーティングとブックマークを取得できませんでした。");
+    }
+    state.viewerItemState = {
+      identity,
+      rating: clamp(Number(current.rating), 0, 5),
+      bookmarkSupported: Boolean(current.bookmark_supported),
+      bookmarked: Boolean(current.bookmarked),
+    };
+    state.commandMenu?.setItemState(state.viewerItemState, false);
+    return state.viewerItemState;
+  } catch (error) {
+    if (sequence === state.viewerItemStateSequence) {
+      state.viewerItemState = null;
+      state.commandMenu?.setItemState(null, false);
+    }
+    throw error;
+  }
+}
+
+async function setViewerRating(stars) {
+  const target = currentRemotePageTarget();
+  if (!target) return;
+  state.commandMenu?.setItemState(null, true);
+  let failure = null;
+  try {
+    await apiPostJson("/api/write", {
+      kind: "set_rating",
+      address: target.address,
+      stars,
+    });
+  } catch (error) {
+    failure = error;
+  }
+  try {
+    await refreshViewerItemState();
+  } catch (error) {
+    failure ??= error;
+  }
+  if (failure) {
+    state.viewer?.showBoundaryMessage(
+      failure instanceof Error ? failure.message : "レーティングを保存できませんでした。"
+    );
+  }
+}
+
+async function toggleViewerBookmark() {
+  const target = currentRemotePageTarget();
+  const current = state.viewerItemState;
+  const identity = addressIdentity(target?.address);
+  if (!target || !current?.bookmarkSupported || current.identity !== identity) return;
+  state.commandMenu?.setItemState(null, true);
+  let failure = null;
+  try {
+    await apiPostJson("/api/write", {
+      kind: "set_bookmark",
+      address: target.address,
+      context_address: target.contextAddress,
+      page_index: target.pageIndex,
+      bookmarked: !current.bookmarked,
+    });
+  } catch (error) {
+    failure = error;
+  }
+  try {
+    await refreshViewerItemState();
+  } catch (error) {
+    failure ??= error;
+  }
+  if (failure) {
+    state.viewer?.showBoundaryMessage(
+      failure instanceof Error ? failure.message : "ブックマークを変更できませんでした。"
+    );
+  }
+}
+
+async function flushReadingProgress(reset = true) {
+  clearTimeout(readingProgressTimer);
+  readingProgressTimer = 0;
+  const transition = readingProgressBatchTransition(
+    readingProgressBatch,
+    { type: "flush", now: performance.now() },
+    READING_PROGRESS_INTERVAL_MS
+  );
+  readingProgressBatch = transition.state;
+  enqueueReadingProgress(transition.effect);
+  await readingProgressWriteTail;
+  if (reset) {
+    readingProgressBatch = createReadingProgressBatch();
+    readingProgressContextIdentity = "";
+  }
+}
+
+async function leaveViewerForGrid() {
+  await flushReadingProgress();
+  const viewerDepth = Number(history.state?.viewerDepth) || 0;
+  if (history.state?.viewerFromGrid && viewerDepth > 0) {
+    history.go(-viewerDepth);
+  } else {
+    history.replaceState({ mivRoute: true }, "", state.gridHash);
+    await dispatchRoute();
+  }
+}
 
 function shouldForceSinglePageForViewport() {
   return planSpreadIntent({
@@ -2001,6 +2250,8 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   if (!requestedEntry || groupIndex < 0) return;
   cleanupScreen();
   state.screenContext = "viewer";
+  state.viewerItemState = null;
+  state.viewerItemStateSequence += 1;
   if (previousIndex >= 0 && previousIndex !== index) {
     state.pageDirection = index > previousIndex ? 1 : -1;
   }
@@ -2213,6 +2464,7 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
     interactionStartedAt,
   });
   if (!displayed || state.viewer !== viewer) return;
+  observeReadingProgress();
   if (group.entries.every((entry) => entry.address)) {
     schedulePagePrefetch(viewer).catch(() => {});
     return;
@@ -2964,6 +3216,13 @@ function menuDefinition(context) {
         [CommandName.FIT_ORIGINAL, "原寸 (100%)", "0 で切替"],
         [CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"],
         ...spreadActions,
+        ...[0, 1, 2, 3, 4, 5].map((stars) => [
+          CommandName.SET_RATING,
+          stars === 0 ? "★0 レーティング解除" : `★${stars} レーティング`,
+          stars === 0 ? "0 = 解除" : `★${stars}`,
+          { stars },
+        ]),
+        [CommandName.TOGGLE_BOOKMARK, "ブックマークを読み込み中…", "現在のページ"],
         [CommandName.FIRST_PAGE, "先頭の画像", "Home"],
         [CommandName.LAST_PAGE, "最後の画像", "End"],
         [CommandName.BACK, "一覧へ戻る", "Backspace / Enter / Esc"],
@@ -3024,10 +3283,13 @@ function menuDefinition(context) {
 
 class CommandMenu {
   constructor(host, context, owner = host) {
+    this.context = context;
     this.owner = owner;
     this.opened = false;
     this.previousFocus = null;
     this.actionLabels = new Map();
+    this.ratingActions = new Map();
+    this.bookmarkAction = null;
     this.keyboardElements = [];
     const definition = menuDefinition(context);
     this.root = element("div", "command-menu-layer");
@@ -3052,18 +3314,25 @@ class CommandMenu {
 
     const actions = element("div", "command-menu-actions");
     actions.setAttribute("role", "menu");
-    for (const [name, label, keys] of definition.actions) {
+    for (const [name, label, keys, payload = {}] of definition.actions) {
       const button = element("button", "command-menu-action");
       button.type = "button";
       button.setAttribute("role", "menuitem");
       const actionLabel = textElement("span", label);
       const keyHint = textElement("kbd", keys);
       this.actionLabels.set(name, actionLabel);
+      if (name === CommandName.SET_RATING) {
+        this.ratingActions.set(Number(payload.stars), { button, label: actionLabel });
+        button.disabled = true;
+      } else if (name === CommandName.TOGGLE_BOOKMARK) {
+        this.bookmarkAction = { button, label: actionLabel };
+        button.disabled = true;
+      }
       this.keyboardElements.push(keyHint);
       button.append(actionLabel, keyHint);
       button.addEventListener("click", (event) => {
         this.close(false);
-        menuCommand(event, name);
+        menuCommand(event, name, payload);
       });
       actions.append(button);
     }
@@ -3104,12 +3373,39 @@ class CommandMenu {
     }
   }
 
+  setItemState(itemState, loading = false) {
+    for (const [stars, action] of this.ratingActions) {
+      action.button.disabled = loading || !itemState;
+      const base = stars === 0 ? "★0 レーティング解除" : `★${stars} レーティング`;
+      action.label.textContent = itemState?.rating === stars ? `${base}（現在）` : base;
+    }
+    if (!this.bookmarkAction) return;
+    this.bookmarkAction.button.disabled =
+      loading || !itemState || !itemState.bookmarkSupported;
+    this.bookmarkAction.label.textContent = loading
+      ? "ブックマークを読み込み中…"
+      : !itemState
+        ? "ブックマーク状態を取得できません"
+        : !itemState.bookmarkSupported
+          ? "このページはブックマーク対象外"
+          : itemState.bookmarked
+            ? "ブックマークを削除（登録済み）"
+            : "ブックマークを追加（未登録）";
+  }
+
   open() {
     if (this.opened) return;
     this.opened = true;
     this.previousFocus = document.activeElement;
     this.root.hidden = false;
     this.owner.classList.add("menu-open");
+    if (this.context === "viewer") {
+      refreshViewerItemState().catch((error) => {
+        state.viewer?.showBoundaryMessage(
+          error instanceof Error ? error.message : "現在値を取得できませんでした。"
+        );
+      });
+    }
     requestAnimationFrame(() => this.closeButton.focus());
   }
 
@@ -3817,6 +4113,7 @@ export class ImageViewer {
         startedAt: performance.now(),
         edgeGuarded: event.clientX <= 32,
         moved: false,
+        contentScrolled: false,
       };
       this.pinched = false;
     } else if (this.pointers.size === 2) {
@@ -3872,10 +4169,21 @@ export class ImageViewer {
       this.single.lastY = event.clientY;
       this.single.moved = true;
     } else if (this.fitMode === FitMode.WIDTH && this.single && previous) {
-      this.stage.scrollTop -= event.clientY - previous.y;
+      const dragDeltaY = event.clientY - previous.y;
+      const scroll = viewerVerticalScrollDecision({
+        scrollTop: this.stage.scrollTop,
+        scrollHeight: this.stage.scrollHeight,
+        clientHeight: this.stage.clientHeight,
+        dragDeltaY,
+      });
+      const before = this.stage.scrollTop;
+      if (scroll.canConsume) this.stage.scrollTop -= dragDeltaY;
       this.single.lastX = event.clientX;
       this.single.lastY = event.clientY;
-      this.single.moved = true;
+      if (Math.abs(this.stage.scrollTop - before) > 0.5) {
+        this.single.moved = true;
+        this.single.contentScrolled = true;
+      }
     }
   }
 
@@ -3897,6 +4205,7 @@ export class ImageViewer {
         startedAt: performance.now(),
         edgeGuarded: false,
         moved: false,
+        contentScrolled: false,
       };
       this.pinch = null;
       return;
@@ -3914,7 +4223,7 @@ export class ImageViewer {
         elapsedMs: elapsed,
         moved: single.moved,
         zoomed: this.scale > 1.01,
-        contentScrolled: this.fitMode === FitMode.WIDTH && single.moved,
+        contentScrolled: single.contentScrolled,
         edgeGuarded: single.edgeGuarded,
         cancelled,
       });

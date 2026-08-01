@@ -45,6 +45,15 @@ struct SpreadPayload {
     groups: Vec<PageGroup>,
 }
 
+struct ValidatedPageContext {
+    page_index: u32,
+    page_number: u32,
+    page_count: u32,
+    record_history: bool,
+    record_resume: bool,
+    bookmark_supported: bool,
+}
+
 impl ContainerEngine {
     pub(super) fn new(settings: crate::settings::Settings) -> Self {
         let spread_db_path = crate::data_dir::get().join("spread.db");
@@ -99,28 +108,454 @@ impl ContainerEngine {
 
     pub(super) fn validate_write_request(
         &self,
-        request: &RemoteWriteRequest,
+        request: &mut RemoteWriteRequest,
     ) -> Result<(), RemoteWriteError> {
-        let address = request.address();
+        match request {
+            RemoteWriteRequest::SetSpread { address, .. } => {
+                let resolved = self
+                    .resolve(address)
+                    .map_err(remote_write_error_from_media)?;
+                let is_file = std::fs::metadata(&resolved.canonical)
+                    .map(|metadata| metadata.is_file())
+                    .unwrap_or(false);
+                let supported = match address.subresource {
+                    RemoteSubresource::File => {
+                        is_file
+                            && (is_zip_path(&resolved.logical) || is_pdf_path(&resolved.logical))
+                    }
+                    RemoteSubresource::ZipDirectory { .. } => {
+                        is_file && is_zip_path(&resolved.logical)
+                    }
+                    RemoteSubresource::ZipEntry { .. } | RemoteSubresource::PdfPage { .. } => false,
+                };
+                supported.then_some(()).ok_or_else(|| {
+                    RemoteWriteError::new(
+                        RemoteWriteErrorCode::Unsupported,
+                        "見開き設定を書き込めるコンテナではありません",
+                    )
+                })
+            }
+            RemoteWriteRequest::RecordReadingProgress {
+                address,
+                context_address,
+                page_index,
+                page_number,
+                page_count,
+                record_resume,
+                record_history,
+            } => {
+                let validated = self.validate_page_context(address, context_address)?;
+                if !validated.record_resume && !validated.record_history {
+                    return Err(RemoteWriteError::new(
+                        RemoteWriteErrorCode::Unsupported,
+                        "この一覧は読書位置の記録対象ではありません",
+                    ));
+                }
+                *page_index = validated.page_index;
+                *page_number = validated.page_number;
+                *page_count = validated.page_count;
+                *record_resume = validated.record_resume;
+                *record_history = validated.record_history;
+                Ok(())
+            }
+            RemoteWriteRequest::SetRating { address, stars } => {
+                if *stars > 5 {
+                    return Err(RemoteWriteError::new(
+                        RemoteWriteErrorCode::BadRequest,
+                        "レーティングは 0〜5 で指定してください",
+                    ));
+                }
+                self.validate_rating_page(address)
+            }
+            RemoteWriteRequest::SetBookmark {
+                address,
+                context_address,
+                page_index,
+                ..
+            } => {
+                let validated = self.validate_page_context(address, context_address)?;
+                if !validated.bookmark_supported {
+                    return Err(RemoteWriteError::new(
+                        RemoteWriteErrorCode::Unsupported,
+                        "このページは本のブックマーク対象ではありません",
+                    ));
+                }
+                *page_index = validated.page_index;
+                Ok(())
+            }
+            RemoteWriteRequest::GetItemState {
+                address,
+                context_address,
+                page_index,
+                bookmark_supported,
+            } => {
+                self.validate_rating_page(address)?;
+                let validated = self.validate_page_context(address, context_address)?;
+                *page_index = validated.page_index;
+                *bookmark_supported = validated.bookmark_supported;
+                Ok(())
+            }
+        }
+    }
+
+    fn validate_rating_page(&self, address: &RemoteAddress) -> Result<(), RemoteWriteError> {
         let resolved = self
             .resolve(address)
             .map_err(remote_write_error_from_media)?;
-        let is_file = std::fs::metadata(&resolved.canonical)
-            .map(|metadata| metadata.is_file())
-            .unwrap_or(false);
-        let supported = match address.subresource {
+        let metadata = std::fs::metadata(&resolved.canonical).map_err(|_| {
+            RemoteWriteError::new(RemoteWriteErrorCode::NotFound, "ページが見つかりません")
+        })?;
+        match &address.subresource {
             RemoteSubresource::File => {
-                is_file && (is_zip_path(&resolved.logical) || is_pdf_path(&resolved.logical))
+                let extension = resolved
+                    .logical
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .unwrap_or_default();
+                if metadata.is_file() && crate::folder_tree::is_recognized_image_ext(&extension) {
+                    Ok(())
+                } else {
+                    Err(RemoteWriteError::new(
+                        RemoteWriteErrorCode::Unsupported,
+                        "このファイルにはレーティングを付けられません",
+                    ))
+                }
             }
-            RemoteSubresource::ZipDirectory { .. } => is_file && is_zip_path(&resolved.logical),
-            RemoteSubresource::ZipEntry { .. } | RemoteSubresource::PdfPage { .. } => false,
-        };
-        supported.then_some(()).ok_or_else(|| {
-            RemoteWriteError::new(
+            RemoteSubresource::ZipEntry { entry_name } if is_zip_path(&resolved.logical) => {
+                let enumeration =
+                    crate::zip_loader::enumerate_image_entries_detailed(&resolved.logical)
+                        .map_err(|_| {
+                            RemoteWriteError::new(
+                                RemoteWriteErrorCode::PersistenceFailed,
+                                "ZIP を列挙できませんでした",
+                            )
+                        })?;
+                enumeration
+                    .entries
+                    .iter()
+                    .any(|entry| entry.entry_name == *entry_name)
+                    .then_some(())
+                    .ok_or_else(|| {
+                        RemoteWriteError::new(
+                            RemoteWriteErrorCode::NotFound,
+                            "ZIP 内のページが見つかりません",
+                        )
+                    })
+            }
+            RemoteSubresource::PdfPage { page_number } if is_pdf_path(&resolved.logical) => self
+                .ensure_pdf_page_in_range(&resolved, &metadata, *page_number)
+                .map_err(remote_write_error_from_media),
+            _ => Err(RemoteWriteError::new(
                 RemoteWriteErrorCode::Unsupported,
-                "見開き設定を書き込めるコンテナではありません",
+                "このページにはレーティングを付けられません",
+            )),
+        }
+    }
+
+    fn validate_page_context(
+        &self,
+        address: &RemoteAddress,
+        context_address: &RemoteAddress,
+    ) -> Result<ValidatedPageContext, RemoteWriteError> {
+        if address.favorite_id != context_address.favorite_id {
+            return Err(RemoteWriteError::new(
+                RemoteWriteErrorCode::BadRequest,
+                "ページと閲覧コンテキストが一致しません",
+            ));
+        }
+        match &address.subresource {
+            RemoteSubresource::File => self.validate_folder_page(address, context_address),
+            RemoteSubresource::ZipEntry { entry_name } => {
+                self.validate_zip_page(address, context_address, entry_name)
+            }
+            RemoteSubresource::PdfPage { page_number } => {
+                self.validate_pdf_page(address, context_address, *page_number)
+            }
+            RemoteSubresource::ZipDirectory { .. } => Err(RemoteWriteError::new(
+                RemoteWriteErrorCode::Unsupported,
+                "コンテナ自体はページではありません",
+            )),
+        }
+    }
+
+    fn validate_folder_page(
+        &self,
+        address: &RemoteAddress,
+        context_address: &RemoteAddress,
+    ) -> Result<ValidatedPageContext, RemoteWriteError> {
+        if !matches!(context_address.subresource, RemoteSubresource::File) {
+            return Err(RemoteWriteError::new(
+                RemoteWriteErrorCode::BadRequest,
+                "画像フォルダのコンテキストが不正です",
+            ));
+        }
+        let page = self
+            .resolve(address)
+            .map_err(remote_write_error_from_media)?;
+        let context = self
+            .resolve(context_address)
+            .map_err(remote_write_error_from_media)?;
+        if !std::fs::metadata(&page.canonical).is_ok_and(|metadata| metadata.is_file())
+            || !std::fs::metadata(&context.canonical).is_ok_and(|metadata| metadata.is_dir())
+            || page.canonical.parent() != Some(context.canonical.as_path())
+        {
+            return Err(RemoteWriteError::new(
+                RemoteWriteErrorCode::PathRejected,
+                "画像が閲覧フォルダの直下にありません",
+            ));
+        }
+        let scan =
+            crate::app::folder_scan::scan_directory_with_settings(&context.logical, &self.settings)
+                .map_err(|_| {
+                    RemoteWriteError::new(
+                        RemoteWriteErrorCode::PersistenceFailed,
+                        "画像フォルダを走査できませんでした",
+                    )
+                })?;
+        let compiled =
+            crate::books::is_direct_book_folder(&self.settings.books_root_path(), &context.logical);
+        let image_only = if compiled {
+            scan.all_media
+                .iter()
+                .any(|(_, kind, _, _)| *kind == crate::app::folder_scan::ScanMediaKind::Image)
+        } else {
+            crate::app::folder_scan::is_image_only_book_contents(
+                !scan.folders.is_empty(),
+                &scan.all_media,
             )
+        };
+        let (mut folders, mut metas): (Vec<_>, Vec<_>) = scan.folders.into_iter().unzip();
+        let mut all_media = scan.all_media;
+        if compiled {
+            folders.clear();
+            metas.clear();
+            all_media
+                .retain(|(_, kind, _, _)| *kind == crate::app::folder_scan::ScanMediaKind::Image);
+        }
+        let folder_sort = if compiled {
+            crate::settings::SortOrder::Numeric
+        } else {
+            self.settings.sort_order
+        };
+        let media_sort = crate::app::folder_media_sort_order(
+            folder_sort,
+            compiled,
+            folders.is_empty(),
+            all_media
+                .iter()
+                .all(|(_, kind, _, _)| *kind == crate::app::folder_scan::ScanMediaKind::Image),
+            self.settings.auto_fullscreen_image_folders_enabled(),
+        );
+        crate::grid_item::sort_folder_block(&mut folders, &mut metas, folder_sort);
+        all_media.sort_by(|left, right| {
+            let left_name = left
+                .0
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            let right_name = right
+                .0
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            let left_key = media_sort.name_key(left_name);
+            let right_key = media_sort.name_key(right_name);
+            media_sort.compare_name_keys(&left_key, left.2, &right_key, right.2)
+        });
+        if self.settings.skip_zip_if_folder_exists {
+            crate::app::folder_scan::filter_virtual_folder_duplicates(&mut folders, &mut metas);
+        }
+        if self.settings.skip_archive_if_zip_exists {
+            crate::app::folder_scan::filter_convertible_archive_duplicates(
+                &mut folders,
+                &mut metas,
+            );
+        }
+        if self.settings.skip_image_if_video_exists {
+            let _ = crate::app::folder_scan::filter_video_image_duplicates(
+                &mut all_media,
+                self.settings.video_thumb_use_sidecar_image,
+            );
+        }
+        if self.settings.skip_duplicate_images {
+            crate::app::folder_scan::filter_image_ext_duplicates(
+                &mut all_media,
+                &self.settings.image_ext_priority,
+            );
+        }
+        let mut items = folders;
+        for (path, kind, mtime, file_size) in all_media {
+            items.push(match kind {
+                crate::app::folder_scan::ScanMediaKind::Image => {
+                    crate::grid_item::GridItem::Image(path)
+                }
+                crate::app::folder_scan::ScanMediaKind::Video => {
+                    crate::grid_item::GridItem::Video(path)
+                }
+                crate::app::folder_scan::ScanMediaKind::Audio => {
+                    crate::grid_item::GridItem::Audio(path)
+                }
+            });
+            metas.push(Some((mtime, file_size)));
+        }
+        crate::grid_item::arrange_grid_items(
+            &mut items,
+            &mut metas,
+            &self.settings.grid_display_order,
+            Some(media_sort),
+        );
+        let index = items
+            .iter()
+            .position(|item| {
+                matches!(
+                    item,
+                    crate::grid_item::GridItem::Image(path)
+                        if crate::path_key::eq_keep_drive(path, &page.logical)
+                )
+            })
+            .ok_or_else(|| {
+                RemoteWriteError::new(
+                    RemoteWriteErrorCode::NotFound,
+                    "画像フォルダ内のページが見つかりません",
+                )
+            })?;
+        let page_number = items[..=index]
+            .iter()
+            .filter(|item| item.has_page_data())
+            .count();
+        let page_count = items.iter().filter(|item| item.has_page_data()).count();
+        validated_context(
+            index,
+            page_count,
+            image_only,
+            true,
+            compiled || (image_only && self.settings.auto_fullscreen_image_folders_enabled()),
+        )
+        .map(|mut context| {
+            context.page_number = u32::try_from(page_number).unwrap_or(u32::MAX);
+            context
         })
+    }
+
+    fn validate_zip_page(
+        &self,
+        address: &RemoteAddress,
+        context_address: &RemoteAddress,
+        entry_name: &str,
+    ) -> Result<ValidatedPageContext, RemoteWriteError> {
+        if address.relative_path != context_address.relative_path {
+            return Err(RemoteWriteError::new(
+                RemoteWriteErrorCode::BadRequest,
+                "ZIP ページとコンテキストが一致しません",
+            ));
+        }
+        let resolved = self
+            .resolve(address)
+            .map_err(remote_write_error_from_media)?;
+        if !is_zip_path(&resolved.logical) {
+            return Err(RemoteWriteError::new(
+                RemoteWriteErrorCode::Unsupported,
+                "ZIP ページではありません",
+            ));
+        }
+        let requested_prefix = match &context_address.subresource {
+            RemoteSubresource::File => String::new(),
+            RemoteSubresource::ZipDirectory { prefix } => prefix.clone(),
+            _ => {
+                return Err(RemoteWriteError::new(
+                    RemoteWriteErrorCode::BadRequest,
+                    "ZIP の閲覧コンテキストが不正です",
+                ));
+            }
+        };
+        let enumeration = crate::zip_loader::enumerate_image_entries_detailed(&resolved.logical)
+            .map_err(|_| {
+                RemoteWriteError::new(
+                    RemoteWriteErrorCode::PersistenceFailed,
+                    "ZIP を列挙できませんでした",
+                )
+            })?;
+        let tree = crate::zip_tree::ZipTree::build(resolved.logical, enumeration.entries);
+        let requested_segments = zip_prefix_segments(&requested_prefix);
+        if tree.node_at(&requested_segments).is_none() {
+            return Err(RemoteWriteError::new(
+                RemoteWriteErrorCode::NotFound,
+                "ZIP 内の場所が見つかりません",
+            ));
+        }
+        let effective_segments = tree.collapse_redundant(&requested_segments);
+        let root_segments = tree.collapse_redundant(&[]);
+        let (mut items, mut metas) =
+            tree.materialize_level(&effective_segments, crate::app::BOOK_READING_PAGE_ORDER);
+        crate::grid_item::arrange_grid_items(
+            &mut items,
+            &mut metas,
+            &self.settings.grid_display_order,
+            Some(crate::app::BOOK_READING_PAGE_ORDER),
+        );
+        let index = items
+            .iter()
+            .position(|item| {
+                matches!(
+                    item,
+                    crate::grid_item::GridItem::ZipImage {
+                        entry_name: candidate,
+                        ..
+                    } if candidate == entry_name
+                )
+            })
+            .ok_or_else(|| {
+                RemoteWriteError::new(
+                    RemoteWriteErrorCode::NotFound,
+                    "ZIP 内のページが見つかりません",
+                )
+            })?;
+        let image_position = items[..=index]
+            .iter()
+            .filter(|item| item.has_page_data())
+            .count()
+            .saturating_sub(1);
+        let image_count = items.iter().filter(|item| item.has_page_data()).count();
+        validated_context(
+            index,
+            image_count,
+            items.iter().all(|item| item.has_page_data()),
+            effective_segments == root_segments,
+            true,
+        )
+        .map(|mut context| {
+            context.page_number =
+                u32::try_from(image_position.saturating_add(1)).unwrap_or(u32::MAX);
+            context
+        })
+    }
+
+    fn validate_pdf_page(
+        &self,
+        address: &RemoteAddress,
+        context_address: &RemoteAddress,
+        page_number: u32,
+    ) -> Result<ValidatedPageContext, RemoteWriteError> {
+        if address.relative_path != context_address.relative_path
+            || !matches!(context_address.subresource, RemoteSubresource::File)
+        {
+            return Err(RemoteWriteError::new(
+                RemoteWriteErrorCode::BadRequest,
+                "PDF ページとコンテキストが一致しません",
+            ));
+        }
+        let resolved = self
+            .resolve(address)
+            .map_err(remote_write_error_from_media)?;
+        let metadata = std::fs::metadata(&resolved.canonical).map_err(|_| {
+            RemoteWriteError::new(RemoteWriteErrorCode::NotFound, "PDF が見つかりません")
+        })?;
+        let page_count = self
+            .pdf_page_count(&resolved, &metadata)
+            .map_err(remote_write_error_from_media)?;
+        validate_page_number(page_number, page_count).map_err(remote_write_error_from_media)?;
+        validated_context(page_number as usize, page_count as usize, true, true, true)
     }
 
     pub(super) fn thumbnail(
@@ -809,6 +1244,35 @@ impl ContainerEngine {
     }
 }
 
+fn validated_context(
+    page_index: usize,
+    page_count: usize,
+    record_history: bool,
+    record_resume: bool,
+    bookmark_supported: bool,
+) -> Result<ValidatedPageContext, RemoteWriteError> {
+    let page_index = u32::try_from(page_index).map_err(|_| {
+        RemoteWriteError::new(
+            RemoteWriteErrorCode::Unsupported,
+            "ページ index が上限を超えています",
+        )
+    })?;
+    let page_count = u32::try_from(page_count).map_err(|_| {
+        RemoteWriteError::new(
+            RemoteWriteErrorCode::Unsupported,
+            "ページ数が上限を超えています",
+        )
+    })?;
+    Ok(ValidatedPageContext {
+        page_index,
+        page_number: page_index.saturating_add(1),
+        page_count,
+        record_history,
+        record_resume,
+        bookmark_supported,
+    })
+}
+
 fn open_parent_catalog(path: &Path) -> Option<crate::catalog::CatalogDb> {
     let parent = path.parent()?;
     crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), parent)
@@ -1158,6 +1622,99 @@ mod tests {
             .map(|item| item.name().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(names, ["2.jpg", "10.jpg"]);
+    }
+
+    #[test]
+    fn folder_progress_validation_recomputes_local_index_count_and_bookmark_support() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        let album = root.join("album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("001.jpg"), b"one").unwrap();
+        std::fs::write(album.join("002.jpg"), b"two").unwrap();
+        let favorite = FavoriteEntry::new("test".to_owned(), root);
+        let mut settings = crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            ..Default::default()
+        };
+        settings.auto_fullscreen_zip_pdf = true;
+        settings.auto_fullscreen_image_folders = true;
+        let engine = ContainerEngine::new(settings);
+        let context = RemoteAddress::file(favorite.id.to_string(), "album");
+        let page = RemoteAddress::file(favorite.id.to_string(), "album/002.jpg");
+        let mut request = RemoteWriteRequest::RecordReadingProgress {
+            address: page.clone(),
+            context_address: context.clone(),
+            page_index: 999,
+            page_number: 999,
+            page_count: 999,
+            record_resume: false,
+            record_history: false,
+        };
+        engine.validate_write_request(&mut request).unwrap();
+        assert!(matches!(
+            request,
+            RemoteWriteRequest::RecordReadingProgress {
+                page_index: 1,
+                page_number: 2,
+                page_count: 2,
+                record_resume: true,
+                record_history: true,
+                ..
+            }
+        ));
+
+        let mut query = RemoteWriteRequest::GetItemState {
+            address: page,
+            context_address: context,
+            page_index: 999,
+            bookmark_supported: false,
+        };
+        engine.validate_write_request(&mut query).unwrap();
+        assert!(matches!(
+            query,
+            RemoteWriteRequest::GetItemState {
+                page_index: 1,
+                bookmark_supported: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mixed_folder_publishes_resume_index_but_not_history_or_bookmark_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        let album = root.join("album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("001.jpg"), b"one").unwrap();
+        std::fs::write(album.join("clip.mp4"), b"video").unwrap();
+        let favorite = FavoriteEntry::new("test".to_owned(), root);
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            ..Default::default()
+        });
+        let mut request = RemoteWriteRequest::RecordReadingProgress {
+            address: RemoteAddress::file(favorite.id.to_string(), "album/001.jpg"),
+            context_address: RemoteAddress::file(favorite.id.to_string(), "album"),
+            page_index: 0,
+            page_number: 1,
+            page_count: 1,
+            record_resume: false,
+            record_history: true,
+        };
+        engine.validate_write_request(&mut request).unwrap();
+        assert!(matches!(
+            request,
+            RemoteWriteRequest::RecordReadingProgress {
+                page_index: 0,
+                page_number: 1,
+                page_count: 1,
+                record_resume: true,
+                record_history: false,
+                ..
+            }
+        ));
     }
 
     #[test]

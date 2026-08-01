@@ -391,7 +391,10 @@ impl ClaimedRemoteWrite {
     }
 
     pub(crate) fn complete(self, outcome: UiWriteOutcome) {
-        let success = matches!(outcome, UiWriteOutcome::Write(RemoteWriteResponse::Success));
+        let success = matches!(
+            outcome,
+            UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
+        );
         self.operation.finish(success);
         let _ = self.reply.send(outcome);
     }
@@ -829,6 +832,44 @@ mod tests {
         }
     }
 
+    fn write_requests() -> Vec<RemoteWriteRequest> {
+        let favorite = "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2";
+        let container = mimageviewer_ipc::RemoteAddress::file(favorite, "books/book.pdf");
+        let page = mimageviewer_ipc::RemoteAddress {
+            favorite_id: favorite.to_owned(),
+            relative_path: "books/book.pdf".to_owned(),
+            subresource: mimageviewer_ipc::RemoteSubresource::PdfPage { page_number: 3 },
+        };
+        vec![
+            write_request(),
+            RemoteWriteRequest::RecordReadingProgress {
+                address: page.clone(),
+                context_address: container.clone(),
+                page_index: 3,
+                page_number: 4,
+                page_count: 10,
+                record_resume: true,
+                record_history: true,
+            },
+            RemoteWriteRequest::SetRating {
+                address: page.clone(),
+                stars: 4,
+            },
+            RemoteWriteRequest::SetBookmark {
+                address: page.clone(),
+                context_address: container.clone(),
+                page_index: 3,
+                bookmarked: true,
+            },
+            RemoteWriteRequest::GetItemState {
+                address: page,
+                context_address: container,
+                page_index: 3,
+                bookmark_supported: true,
+            },
+        ]
+    }
+
     fn peer() -> SessionPeerInfo {
         SessionPeerInfo {
             connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
@@ -942,14 +983,99 @@ mod tests {
 
     #[test]
     fn write_without_session_is_rejected_before_ui_queue() {
-        let handle = SessionHandle::new();
-        let response = match handle.begin_operation("client", "見開き設定を書き込み中".to_owned())
-        {
-            Ok(_) => panic!("write unexpectedly acquired a missing session"),
-            Err(response) => response,
-        };
-        assert_eq!(response.status, SessionStatus::NotAcquired);
-        assert!(handle.take_pending_writes().is_empty());
+        for request in write_requests() {
+            let handle = SessionHandle::new();
+            let response = match handle
+                .begin_operation("client", format!("{} を適用中", request.kind_name()))
+            {
+                Ok(_) => panic!(
+                    "{} unexpectedly acquired a missing session",
+                    request.kind_name()
+                ),
+                Err(response) => response,
+            };
+            assert_eq!(
+                response.status,
+                SessionStatus::NotAcquired,
+                "{}",
+                request.kind_name()
+            );
+            assert!(handle.take_pending_writes().is_empty());
+        }
+    }
+
+    #[test]
+    fn every_write_kind_reaches_ui_and_returns_its_application_result() {
+        for request in write_requests() {
+            let kind = request.kind_name();
+            let handle = SessionHandle::new();
+            handle.acquire(SessionAcquireRequest {
+                client_id: "client".to_owned(),
+                peer: peer(),
+            });
+            let worker_handle = handle.clone();
+            let worker = std::thread::spawn(move || {
+                let operation = worker_handle
+                    .begin_operation("client", format!("{kind} を適用中"))
+                    .unwrap();
+                worker_handle.submit_write(request, operation)
+            });
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let claimed = loop {
+                if let Some(claimed) = handle.take_pending_writes().pop() {
+                    break claimed;
+                }
+                assert!(Instant::now() < deadline, "{kind}");
+                std::thread::yield_now();
+            };
+            assert_eq!(claimed.request().kind_name(), kind);
+            assert_eq!(claimed.ownership_response().status, SessionStatus::Active);
+            claimed.complete(UiWriteOutcome::Write(RemoteWriteResponse::Success(
+                mimageviewer_ipc::RemoteWriteResult::applied(),
+            )));
+            assert!(matches!(
+                worker.join().unwrap(),
+                UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn every_write_kind_is_rejected_if_ownership_is_lost_before_ui_apply() {
+        for request in write_requests() {
+            let kind = request.kind_name();
+            let handle = SessionHandle::new();
+            handle.acquire(SessionAcquireRequest {
+                client_id: "client".to_owned(),
+                peer: peer(),
+            });
+            let worker_handle = handle.clone();
+            let worker = std::thread::spawn(move || {
+                let operation = worker_handle
+                    .begin_operation("client", format!("{kind} を適用中"))
+                    .unwrap();
+                worker_handle.submit_write(request, operation)
+            });
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let claimed = loop {
+                if let Some(claimed) = handle.take_pending_writes().pop() {
+                    break claimed;
+                }
+                assert!(Instant::now() < deadline, "{kind}");
+                std::thread::yield_now();
+            };
+            handle.local_disconnect();
+            let ownership = claimed.ownership_response();
+            assert_eq!(ownership.status, SessionStatus::LocalInUse, "{kind}");
+            claimed.complete(UiWriteOutcome::Session(ownership));
+            assert!(matches!(
+                worker.join().unwrap(),
+                UiWriteOutcome::Session(SessionResponse {
+                    status: SessionStatus::LocalInUse,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
@@ -975,10 +1101,12 @@ mod tests {
             std::thread::yield_now();
         };
         assert_eq!(claimed.ownership_response().status, SessionStatus::Active);
-        claimed.complete(UiWriteOutcome::Write(RemoteWriteResponse::Success));
+        claimed.complete(UiWriteOutcome::Write(RemoteWriteResponse::Success(
+            mimageviewer_ipc::RemoteWriteResult::applied(),
+        )));
         assert!(matches!(
             worker.join().unwrap(),
-            UiWriteOutcome::Write(RemoteWriteResponse::Success)
+            UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
         ));
     }
 

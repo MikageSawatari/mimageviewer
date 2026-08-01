@@ -11,10 +11,10 @@ use mimageviewer_ipc::{
     ContainerResponse, FrameError, HomePayload, HomeRequest, HomeResponse, MAX_CONTROL_FRAME_BYTES,
     MAX_RESPONSE_FRAME_BYTES, MediaError, MediaErrorCode, PIPE_NAME, PROTOCOL_VERSION, PagePayload,
     PagePriority, PageRequest, PageResponse, RemoteAddress, RemoteWebConnectionInfo,
-    RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, RequestId,
-    ServerMessage, SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionResponse,
-    SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse,
-    read_frame, write_frame,
+    RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse,
+    RemoteWriteResult, RequestId, ServerMessage, SessionAcquireRequest, SessionPeerInfo,
+    SessionPingRequest, SessionResponse, SessionStatus, ThumbnailError, ThumbnailErrorCode,
+    ThumbnailRequest, ThumbnailResponse, read_frame, write_frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -575,7 +575,7 @@ impl ThumbnailClient {
         &self,
         client_id: &str,
         request: RemoteWriteRequest,
-    ) -> Result<IpcSuccess<()>, ClientFailure> {
+    ) -> Result<IpcSuccess<RemoteWriteResult>, ClientFailure> {
         let result = (|| {
             let connection = self.get_connection()?;
             let connection_id = connection.id;
@@ -590,9 +590,9 @@ impl ThumbnailClient {
             );
             match response {
                 Ok(ServerMessage::Write {
-                    response: RemoteWriteResponse::Success,
+                    response: RemoteWriteResponse::Success(result),
                     ..
-                }) => Ok(((), connection_id)),
+                }) => Ok((result, connection_id)),
                 Ok(ServerMessage::Write {
                     response: RemoteWriteResponse::Error(error),
                     ..

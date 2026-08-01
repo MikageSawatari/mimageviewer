@@ -9,6 +9,7 @@ import {
   ViewerGesture,
   commandFromKey,
   containerPageTargetPx,
+  createReadingProgressBatch,
   gridLayoutForWidth,
   gridScrollExtent,
   gridIndexForCommand,
@@ -17,6 +18,7 @@ import {
   isRtlSpread,
   nextSpreadMode,
   readingDirectionForSpreadMode,
+  readingProgressBatchTransition,
   reduceViewerTransform,
   viewerTapCommand,
   nextFitMode,
@@ -31,6 +33,7 @@ import {
   viewerImageLayout,
   viewerBoundaryMessage,
   viewerGestureDecision,
+  viewerVerticalScrollDecision,
   viewerSeekGroupIndex,
   viewerSeekState,
   viewerSpreadLayout,
@@ -464,6 +467,92 @@ test("viewer gesture rejects sub-threshold motion and prioritizes pan", () => {
       contentScrolled: true,
     }),
     ViewerGesture.PAN
+  );
+});
+
+test("width-fit vertical pan requires real direction-specific scroll room", () => {
+  assert.deepEqual(
+    viewerVerticalScrollDecision({
+      scrollTop: 0,
+      scrollHeight: 800,
+      clientHeight: 800,
+      dragDeltaY: -80,
+    }),
+    { scrollable: false, canConsume: false, atStart: true, atEnd: true, maximum: 0 }
+  );
+  assert.equal(viewerVerticalScrollDecision({
+    scrollTop: 200,
+    scrollHeight: 1600,
+    clientHeight: 800,
+    dragDeltaY: -80,
+  }).canConsume, true);
+  assert.equal(viewerVerticalScrollDecision({
+    scrollTop: 0,
+    scrollHeight: 1600,
+    clientHeight: 800,
+    dragDeltaY: 80,
+  }).canConsume, false);
+  assert.equal(viewerVerticalScrollDecision({
+    scrollTop: 0,
+    scrollHeight: 1600,
+    clientHeight: 800,
+    dragDeltaY: -80,
+  }).canConsume, true);
+  assert.equal(viewerVerticalScrollDecision({
+    scrollTop: 800,
+    scrollHeight: 1600,
+    clientHeight: 800,
+    dragDeltaY: -80,
+  }).canConsume, false);
+  assert.equal(viewerVerticalScrollDecision({
+    scrollTop: 800,
+    scrollHeight: 1600,
+    clientHeight: 800,
+    dragDeltaY: 80,
+  }).canConsume, true);
+});
+
+test("reading progress batching emits latest only and force-flushes the final position", () => {
+  let batch = createReadingProgressBatch();
+  let transition = readingProgressBatchTransition(batch, {
+    type: "observe",
+    now: 1_000,
+    value: { identity: "page-1", page: 1 },
+  });
+  batch = transition.state;
+  assert.equal(transition.effect.page, 1);
+
+  transition = readingProgressBatchTransition(batch, {
+    type: "observe",
+    now: 2_000,
+    value: { identity: "page-2", page: 2 },
+  });
+  batch = transition.state;
+  assert.equal(transition.effect, null);
+  transition = readingProgressBatchTransition(batch, {
+    type: "observe",
+    now: 3_000,
+    value: { identity: "page-3", page: 3 },
+  });
+  batch = transition.state;
+  assert.equal(transition.effect, null);
+
+  transition = readingProgressBatchTransition(batch, { type: "tick", now: 31_000 });
+  batch = transition.state;
+  assert.equal(transition.effect.page, 3);
+
+  transition = readingProgressBatchTransition(batch, {
+    type: "observe",
+    now: 32_000,
+    value: { identity: "page-4", page: 4 },
+  });
+  batch = transition.state;
+  assert.equal(transition.effect, null);
+  transition = readingProgressBatchTransition(batch, { type: "flush", now: 33_000 });
+  assert.equal(transition.effect.page, 4);
+  assert.equal(
+    readingProgressBatchTransition(transition.state, { type: "flush", now: 34_000 }).effect,
+    null
   );
 });
 

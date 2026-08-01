@@ -30,7 +30,7 @@ fn settings_boot_problem_source(
     .then_some(source)
 }
 
-fn folder_media_sort_order(
+pub(crate) fn folder_media_sort_order(
     fallback: crate::settings::SortOrder,
     is_compiled_book: bool,
     folders_empty: bool,
@@ -95,7 +95,7 @@ mod cache_ops;
 mod color_filter;
 #[cfg(windows)]
 mod detached_window_manager;
-mod folder_scan;
+pub(crate) mod folder_scan;
 mod gamepad_input;
 mod grid_paint;
 pub(crate) mod metadata_import_refresh;
@@ -26564,7 +26564,7 @@ impl App {
         })
     }
 
-    fn next_book_bookmark_request_id(&mut self) -> u64 {
+    pub(crate) fn next_book_bookmark_request_id(&mut self) -> u64 {
         self.book_bookmark_request_seq = self.book_bookmark_request_seq.wrapping_add(1).max(1);
         self.book_bookmark_request_seq
     }
@@ -26640,6 +26640,7 @@ impl App {
                 Some(Ok(event)) => event,
                 Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => break,
                 Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    self.fail_remote_bookmark_writes();
                     self.book_bookmark_service = None;
                     self.book_bookmark_pending_requests.clear();
                     self.current_book_bookmarks_request = None;
@@ -26648,6 +26649,9 @@ impl App {
                     break;
                 }
             };
+            if self.finish_remote_bookmark_event(&event) {
+                continue;
+            }
             match event {
                 crate::book_bookmarks::BookBookmarkEvent::Added { request_id, result } => {
                     self.book_bookmark_pending_requests.remove(&request_id);
@@ -26769,6 +26773,10 @@ impl App {
                             );
                         }
                     }
+                }
+                crate::book_bookmarks::BookBookmarkEvent::PagePresenceRead { .. }
+                | crate::book_bookmarks::BookBookmarkEvent::PagePresenceSet { .. } => {
+                    unreachable!("remote bookmark events are consumed before local dispatch")
                 }
             }
         }
@@ -33501,13 +33509,14 @@ impl App {
             return;
         };
         let key = crate::path_key::normalize_keep_drive(&path);
-        const TOUCH_THROTTLE: std::time::Duration = std::time::Duration::from_secs(30);
         let now = std::time::Instant::now();
         if self
             .last_reading_history_touch
             .as_ref()
             .is_some_and(|(last_key, at)| {
-                last_key == &key && now.duration_since(*at) < TOUCH_THROTTLE
+                last_key == &key
+                    && now.duration_since(*at)
+                        < crate::reading_history_db::READING_HISTORY_TOUCH_THROTTLE
             })
         {
             return;

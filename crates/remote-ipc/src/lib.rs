@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -183,26 +183,105 @@ pub enum RemoteWriteRequest {
         spread_mode: RemoteSpreadMode,
         reading_direction: RemoteReadingDirection,
     },
+    /// 表示完了済みのページ位置。page fields と record_history は remote-web の
+    /// 観測値として受けるが、本体 write worker がローカルと同じ列挙規則で検証・
+    /// 正規化してから UI thread へ渡す。
+    RecordReadingProgress {
+        address: RemoteAddress,
+        context_address: RemoteAddress,
+        page_index: u32,
+        page_number: u32,
+        page_count: u32,
+        /// write worker がローカルの resume 対象規則から上書きする。
+        record_resume: bool,
+        record_history: bool,
+    },
+    SetRating {
+        address: RemoteAddress,
+        stars: u8,
+    },
+    SetBookmark {
+        address: RemoteAddress,
+        context_address: RemoteAddress,
+        page_index: u32,
+        bookmarked: bool,
+    },
+    /// App 所有 DB / service からメニューの正本値を再取得する。読み取りだけの
+    /// variant も同じ bounded FIFO と UI ownership check を通し、別 queue を持たない。
+    GetItemState {
+        address: RemoteAddress,
+        context_address: RemoteAddress,
+        page_index: u32,
+        /// write worker がローカルのブックマーク対象条件から上書きする。
+        bookmark_supported: bool,
+    },
 }
 
 impl RemoteWriteRequest {
     pub fn address(&self) -> &RemoteAddress {
         match self {
-            Self::SetSpread { address, .. } => address,
+            Self::SetSpread { address, .. }
+            | Self::RecordReadingProgress { address, .. }
+            | Self::SetRating { address, .. }
+            | Self::SetBookmark { address, .. }
+            | Self::GetItemState { address, .. } => address,
+        }
+    }
+
+    pub fn context_address(&self) -> Option<&RemoteAddress> {
+        match self {
+            Self::RecordReadingProgress {
+                context_address, ..
+            }
+            | Self::SetBookmark {
+                context_address, ..
+            }
+            | Self::GetItemState {
+                context_address, ..
+            } => Some(context_address),
+            Self::SetSpread { .. } | Self::SetRating { .. } => None,
         }
     }
 
     pub fn kind_name(&self) -> &'static str {
         match self {
             Self::SetSpread { .. } => "set_spread",
+            Self::RecordReadingProgress { .. } => "record_reading_progress",
+            Self::SetRating { .. } => "set_rating",
+            Self::SetBookmark { .. } => "set_bookmark",
+            Self::GetItemState { .. } => "get_item_state",
         }
     }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum RemoteWriteResponse {
-    Success,
+    Success(RemoteWriteResult),
     Error(RemoteWriteError),
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteWriteResult {
+    pub item_state: Option<RemoteItemState>,
+}
+
+impl RemoteWriteResult {
+    pub fn applied() -> Self {
+        Self::default()
+    }
+
+    pub fn item_state(item_state: RemoteItemState) -> Self {
+        Self {
+            item_state: Some(item_state),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteItemState {
+    pub rating: u8,
+    pub bookmark_supported: bool,
+    pub bookmarked: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -920,6 +999,58 @@ mod tests {
             unreachable!();
         };
         assert_eq!(request.kind_name(), "set_spread");
+    }
+
+    #[test]
+    fn every_write_variant_and_item_state_round_trip() {
+        let container = RemoteAddress::file("favorite", "books/book.pdf");
+        let page = RemoteAddress {
+            favorite_id: "favorite".to_owned(),
+            relative_path: "books/book.pdf".to_owned(),
+            subresource: RemoteSubresource::PdfPage { page_number: 2 },
+        };
+        let requests = [
+            RemoteWriteRequest::RecordReadingProgress {
+                address: page.clone(),
+                context_address: container.clone(),
+                page_index: 2,
+                page_number: 3,
+                page_count: 12,
+                record_resume: true,
+                record_history: true,
+            },
+            RemoteWriteRequest::SetRating {
+                address: page.clone(),
+                stars: 5,
+            },
+            RemoteWriteRequest::SetBookmark {
+                address: page.clone(),
+                context_address: container.clone(),
+                page_index: 2,
+                bookmarked: true,
+            },
+            RemoteWriteRequest::GetItemState {
+                address: page,
+                context_address: container,
+                page_index: 2,
+                bookmark_supported: true,
+            },
+        ];
+        for request in requests {
+            let encoded = serde_json::to_vec(&request).unwrap();
+            let decoded: RemoteWriteRequest = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, request);
+        }
+
+        let response =
+            RemoteWriteResponse::Success(RemoteWriteResult::item_state(RemoteItemState {
+                rating: 4,
+                bookmark_supported: true,
+                bookmarked: true,
+            }));
+        let encoded = serde_json::to_vec(&response).unwrap();
+        let decoded: RemoteWriteResponse = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, response);
     }
 
     #[test]

@@ -973,6 +973,11 @@ fn api_write(request: &mut Request, state: &AppState, client_id: &str) -> HttpRe
     {
         return store_error_response(error);
     }
+    if let Some(context_address) = write_request.context_address()
+        && let Err(error) = state.library.validate_remote_address(context_address)
+    {
+        return store_error_response(error);
+    }
     let write_kind = write_request.kind_name();
     let started = Instant::now();
     let result = match state.ipc_admission.run(IpcClass::Home, || {
@@ -982,17 +987,20 @@ fn api_write(request: &mut Request, state: &AppState, client_id: &str) -> HttpRe
         Err(busy) => return write_admission_busy_response(busy, write_kind),
     };
     match result {
-        Ok(result) => HttpResponse::json(&json!({"applied": true}))
-            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
-            .with_header("Cache-Control", "no-store")
-            .with_log_details(json!({
-                "write": {
-                    "kind": write_kind,
-                    "ipc_status": "ok",
-                    "ipc_ms": crate::diagnostics::duration_ms(started.elapsed()),
-                    "ipc_connection_id": result.connection_id,
-                }
-            })),
+        Ok(result) => HttpResponse::json(&json!({
+            "applied": true,
+            "item_state": result.value.item_state,
+        }))
+        .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+        .with_header("Cache-Control", "no-store")
+        .with_log_details(json!({
+            "write": {
+                "kind": write_kind,
+                "ipc_status": "ok",
+                "ipc_ms": crate::diagnostics::duration_ms(started.elapsed()),
+                "ipc_connection_id": result.connection_id,
+            }
+        })),
         Err(failure) => write_ipc_error_response(failure, started.elapsed(), write_kind),
     }
 }

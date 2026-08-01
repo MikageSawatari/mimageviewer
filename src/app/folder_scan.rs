@@ -114,7 +114,7 @@ pub(crate) fn image_folder_page_count(
 /// 通常一覧のページ数判定とサブフォルダ展開の集約判定が同じ境界を使うために分離する。
 /// `has_container` は実サブフォルダ、ZIP/PDF、設定上有効な変換アーカイブのいずれかが
 /// 1 件でもあれば true。テキスト等の非対応ファイルは従来どおり判定に影響しない。
-pub(super) fn is_image_only_book_contents(
+pub(crate) fn is_image_only_book_contents(
     has_container: bool,
     all_media: &[(PathBuf, ScanMediaKind, i64, i64)],
 ) -> bool {
@@ -288,7 +288,7 @@ pub(super) fn filter_upscaled_video_pairs_fast(
 /// `media` は必ず 1 フォルダ分だけを渡す。フラットビュー全体を渡すと、別フォルダの
 /// 同名ファイルまで衝突する。`use_sidecar` が有効なら、除外画像を動画サムネイルへ
 /// 引き継ぐため `(video_path, image_path)` を返す。画像の除外自体は設定に関係なく行う。
-pub(super) fn filter_video_image_duplicates(
+pub(crate) fn filter_video_image_duplicates(
     media: &mut Vec<(PathBuf, ScanMediaKind, i64, i64)>,
     use_sidecar: bool,
 ) -> Vec<(PathBuf, PathBuf)> {
@@ -325,7 +325,7 @@ pub(super) fn filter_video_image_duplicates(
 }
 
 /// ZIP/PDF/対応アーカイブと同名の実フォルダがあれば、実フォルダを一覧の正本にする。
-pub(super) fn filter_virtual_folder_duplicates(
+pub(crate) fn filter_virtual_folder_duplicates(
     folders: &mut Vec<GridItem>,
     folder_metas: &mut Vec<Option<(i64, i64)>>,
 ) {
@@ -357,7 +357,7 @@ pub(super) fn filter_virtual_folder_duplicates(
 }
 
 /// 同名の ZIP/CBZ があれば、変換元になる RAR/7z/LZH 等を一覧から除外する。
-pub(super) fn filter_convertible_archive_duplicates(
+pub(crate) fn filter_convertible_archive_duplicates(
     folders: &mut Vec<GridItem>,
     folder_metas: &mut Vec<Option<(i64, i64)>>,
 ) {
@@ -387,7 +387,7 @@ pub(super) fn filter_convertible_archive_duplicates(
 }
 
 /// 同名ステムの画像を拡張子優先順で 1 件へ絞る。一覧と画像フォルダのページ数で共有する。
-pub(super) fn filter_image_ext_duplicates(
+pub(crate) fn filter_image_ext_duplicates(
     all_media: &mut Vec<(PathBuf, ScanMediaKind, i64, i64)>,
     priority: &[String],
 ) {

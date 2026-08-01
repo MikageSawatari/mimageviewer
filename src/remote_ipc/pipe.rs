@@ -7,8 +7,9 @@ use mimageviewer_ipc::{
     ClientHello, ClientMessage, CollectionError, CollectionErrorCode, CollectionResponse,
     ContainerResponse, HomeResponse, MAX_CONTROL_FRAME_BYTES, MediaError, MediaErrorCode,
     PIPE_NAME, PROTOCOL_VERSION, PagePriority, PageResponse, RemoteWriteError,
-    RemoteWriteErrorCode, RemoteWriteResponse, ServerMessage, SessionResponse, SessionStatus,
-    ThumbnailError, ThumbnailErrorCode, ThumbnailResponse, negotiate, read_frame, write_frame,
+    RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, ServerMessage, SessionResponse,
+    SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse, negotiate, read_frame,
+    write_frame,
 };
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
@@ -468,8 +469,10 @@ fn write_worker_loop(
         ));
         let started_at = Instant::now();
         let response = match message {
-            ClientMessage::Write { id, request, .. } => {
-                if let Err(error) = container_engine.validate_write_request(&request) {
+            ClientMessage::Write {
+                id, mut request, ..
+            } => {
+                if let Err(error) = container_engine.validate_write_request(&mut request) {
                     session_operation.started();
                     session_operation.finish(false);
                     ServerMessage::Write {
@@ -599,7 +602,14 @@ fn operation_description(message: &ClientMessage) -> String {
             }
             _ => "ページをレンダリング中".to_owned(),
         },
-        ClientMessage::Write { .. } => "見開き設定を書き込み中".to_owned(),
+        ClientMessage::Write { request, .. } => match request {
+            RemoteWriteRequest::SetSpread { .. } => "見開き設定を書き込み中",
+            RemoteWriteRequest::RecordReadingProgress { .. } => "読書位置を記録中",
+            RemoteWriteRequest::SetRating { .. } => "レーティングを書き込み中",
+            RemoteWriteRequest::SetBookmark { .. } => "ブックマークを書き込み中",
+            RemoteWriteRequest::GetItemState { .. } => "ページ情報を確認中",
+        }
+        .to_owned(),
         ClientMessage::SessionAcquire { .. }
         | ClientMessage::SessionPing { .. }
         | ClientMessage::SessionActivity { .. } => "接続を確認中".to_owned(),
@@ -645,7 +655,7 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
             ..
         }
         | ServerMessage::Write {
-            response: RemoteWriteResponse::Success,
+            response: RemoteWriteResponse::Success(_),
             ..
         } => "ok",
         ServerMessage::RemoteWebConnectionInfo { .. }

@@ -18,6 +18,9 @@ pub const READING_HISTORY_LIMIT_MAX: usize = 1000;
 /// 読書履歴の保存件数デフォルト。
 pub const READING_HISTORY_LIMIT_DEFAULT: usize = 1000;
 
+/// 同じ本を読み続けている間の MRU touch 間隔。ローカル表示と remote 表示で共有する。
+pub const READING_HISTORY_TOUCH_THROTTLE: Duration = Duration::from_secs(30);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadingHistoryKind {
     Folder,

@@ -832,7 +832,7 @@ foreground との優先度を持っていなかった。
 中断する。ready Blob は foreground が直接使い、network / IPC 待ちなしで decode と原子的差替えへ
 進む。
 
-現行 protocol v11 の `PageRequest.priority` は `Foreground` / `Prefetch` を共有型で表す。remote-web は
+現行 protocol v12 の `PageRequest.priority` は `Foreground` / `Prefetch` を共有型で表す。remote-web は
 prefetch admission を1件に制限し、all / heavy の最終1枠を使用させない。本体も全接続合計の
 prefetch queued + active を1件に制限し、remote heavy worker が1本しかない設定では prefetch を
 `Busy` で拒否する。2 worker 時も heavy queue / active が空の時だけ先読みを開始し、最大1本なので
@@ -977,8 +977,11 @@ range だけを隠し、`1 / 1` の位置表示は維持する。位置、実ペ
 上下左右 swipe は同じ純粋判定を使う。開始点から主軸が **52 CSS px を超え**、かつ直交軸の
 **1.25倍を超えた**場合だけ成立する。左端32pxの browser edge gesture guard も従来どおり適用する。
 上 swipe はメニュー、下 swipe は一覧、左右 swipe は綴じ方向に従う前後ページへ送る。
-`scale > 1.01` では1本指移動を常に pan とし、swipe を発火しない。幅フィットの縦 drag も
-scroll を優先する。一方、幅フィット中の明確な横 swipe は従来のページ送りを維持する。
+`scale > 1.01` では1本指移動を常に pan とし、swipe を発火しない。幅フィットの縦 drag は、
+`scrollHeight > clientHeight` かつ指の移動方向へ `scrollTop` を実際に変えられる場合だけ scroll を
+優先する。内容が収まる場合、上端から下へ引く場合、下端から上へ引く場合は pan 扱いにせず、
+縦 swipe の一覧 / メニュー操作へ渡す。drag 中に一度でも実スクロールした場合は同じ gesture の
+残りを pan とする。一方、幅フィット中の明確な横 swipe は従来のページ送りを維持する。
 
 初回ヘルプは最初の画像表示完了後に modal で出し、左右 tap、中央 tap、上下 swipe と拡大中 pan を
 示す。閉じた時点で aggregate local setting の `gestureHelpDismissed=true` を保存する。この field は
@@ -989,6 +992,45 @@ scroll を優先する。一方、幅フィット中の明確な横 swipe は従
 再読み込みを下に置く。キー表記は `shouldShowKeyboardShortcuts` で決める。`pointer: fine` は既定表示、
 `pointer: coarse` は既定非表示とし、そのセッションで実際の `keydown` を1回観測した後は action 内の
 キー hint と「有効なキー」一覧をともに表示する。
+
+### 12.10 読書位置・レーティング・ブックマーク書き込み (protocol v12, 2026-08-01)
+
+protocol v12 は §12.8 の単一 `RemoteWriteRequest` に
+`RecordReadingProgress`、`SetRating`、`SetBookmark`、`GetItemState` を加える。別 IPC route、別 UI
+queue、種別別 pending field は作らず、全要求が同じ bounded FIFO worker、session owner の投入前
+確認、UI drain 時の再確認を通る。`GetItemState` はメニュー表示の正本値を App 所有ハンドルから
+読むための request だが、順序と ownership を変えないため同じ enum / queue に置く。
+
+`RecordReadingProgress` の page index / page number / page count と、履歴・resume の適用可否は
+browser の申告を信用せず、本体 worker がローカル一覧と同じ走査、sort、カテゴリ配置、重複除外で
+再計算する。通常フォルダの resume は `App::record_book_resume` と同じ全 items 上の 0-origin index、
+ZIP / PDF も materialize 後の 0-origin index を `book_resume_writer` へ渡す。ネスト ZIP 内はローカルと
+同じく resume を書かない。読書履歴は `App::record_reading_history` と同じく、表示順の全要素が
+page data の場合だけ 1-origin position / count を持ち、ネスト ZIP では本自体の履歴だけを progress
+無しで残す。履歴 key は `path_key::normalize_keep_drive`、resume key は既存 writer / DB 内の
+`path_key::normalize` 規則をそのまま使い、`last_reading_history_touch` の同一本30秒間引きも共有する。
+App の `reading_history_db` / `reading_history_writer` / `book_resume_db` / `book_resume_writer` 以外の
+接続は開かない。
+
+Web は画像の decode・表示完了を観測点にし、先頭位置を即時送信した後は30秒窓で最新位置だけを
+保持する。窓満了時に最新1件を送り、ページ送りごとの request は作らない。送信は直列化し、一覧へ
+戻る前には pure reducer の `flush` で未送信の最終位置を必ず1回生成し、その request の完了を待って
+から route を変える。browser history で同じ本のページ間を移動するだけなら flush しない。
+
+ページレーティング key / metadata はローカル `page_path_key` / `rating_meta_for_idx` と同じで、通常
+画像は `adjustment_db::normalize_path`、ZIP entry と PDF page は
+`adjustment_db::zip_entry_key` (`page_N`) を使う。0は解除、1〜5は設定で、App の `rating_db` を
+`write_user_rating_shared` 経由で更新する。本ブックマークはローカル
+`current_book_bookmark_draft` と同じ container key (`normalize_keep_drive`) と
+`RelativePath` / `ArchiveEntry` / `PdfPage` identity を作り、App の既存
+`book_bookmark_service` request/event へ渡す。UI thread は service 完了を待ってブロックせず、既存の
+request id で元の FIFO 応答を完了する。
+
+viewer の ☰ を開くたびに `GetItemState` で `rating_db` と `book_bookmark_service` から現在値を読む。
+レーティング / ブックマーク変更後も成功・失敗を問わず同じ取得を再実行し、取得できなければ現在値を
+不明として操作を無効化するため、要求値を正本のように残さない。session 解放後は既存
+`reload_after_remote_session_release` が reading history / rating / bookmarks / smart folder / 通常一覧を
+再読込するので、ローカルが操作を取り戻した時点で remote の変更が反映される。
 
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 
@@ -1063,14 +1105,12 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 ### 13.6 残タスク (2026-08-01 時点)
 
-1. **次の書き込み種別** — 読書履歴、レーティング、ブックマークを §12.8 の
-   `RemoteWriteRequest` へ variant として追加する
-2. **通常フォルダの見開き対応** — 現在は ZIP / PDF の `/api/container` のみ
-3. **動画・音声のストリーミング** — 正本は
+1. **通常フォルダの見開き対応** — 現在は ZIP / PDF の `/api/container` のみ
+2. **動画・音声のストリーミング** — 正本は
    [web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md)
-4. **PWA** — アイコンと全画面起動
-5. **検索** (Ctrl+S / F / G 相当)、タグ
-6. 配布 (exe 埋め込み、接続診断ウィザード)
+3. **PWA** — アイコンと全画面起動
+4. **検索** (Ctrl+S / F / G 相当)、タグ
+5. 配布 (exe 埋め込み、接続診断ウィザード)
 
 ### 13.7 未消化の宿題
 

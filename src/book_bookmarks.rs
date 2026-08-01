@@ -184,6 +184,16 @@ pub enum BookBookmarkEvent {
         request_id: u64,
         result: Result<usize, String>,
     },
+    PagePresenceRead {
+        request_id: u64,
+        entry: NewBookBookmark,
+        result: Result<bool, String>,
+    },
+    PagePresenceSet {
+        request_id: u64,
+        entry: NewBookBookmark,
+        result: Result<bool, String>,
+    },
 }
 
 enum BookBookmarkRequest {
@@ -193,6 +203,8 @@ enum BookBookmarkRequest {
     ListContainer(u64, PathBuf),
     ListAll(u64),
     MigratePaths(u64, Vec<(PathBuf, PathBuf)>, Option<String>),
+    GetPagePresence(u64, NewBookBookmark),
+    SetPagePresence(u64, NewBookBookmark, bool),
 }
 
 /// SQLite を専用スレッドに閉じ込める本ブックマークサービス。
@@ -255,6 +267,20 @@ impl BookBookmarkService {
                                         result: Err(message.clone()),
                                     }
                                 }
+                                BookBookmarkRequest::GetPagePresence(request_id, entry) => {
+                                    BookBookmarkEvent::PagePresenceRead {
+                                        request_id,
+                                        entry,
+                                        result: Err(message.clone()),
+                                    }
+                                }
+                                BookBookmarkRequest::SetPagePresence(request_id, entry, _) => {
+                                    BookBookmarkEvent::PagePresenceSet {
+                                        request_id,
+                                        entry,
+                                        result: Err(message.clone()),
+                                    }
+                                }
                             };
                             if event_tx.send(event).is_err() {
                                 break;
@@ -301,6 +327,25 @@ impl BookBookmarkService {
                                 result: db
                                     .migrate_paths_with_journal(&mappings, journal_id.as_deref())
                                     .map_err(|err| err.to_string()),
+                            }
+                        }
+                        BookBookmarkRequest::GetPagePresence(request_id, entry) => {
+                            let result =
+                                db.page_is_bookmarked(&entry).map_err(|err| err.to_string());
+                            BookBookmarkEvent::PagePresenceRead {
+                                request_id,
+                                entry,
+                                result,
+                            }
+                        }
+                        BookBookmarkRequest::SetPagePresence(request_id, entry, present) => {
+                            let result = db
+                                .set_page_presence(&entry, present)
+                                .map_err(|err| err.to_string());
+                            BookBookmarkEvent::PagePresenceSet {
+                                request_id,
+                                entry,
+                                result,
                             }
                         }
                     };
@@ -360,6 +405,20 @@ impl BookBookmarkService {
         if let Some(tx) = &self.tx {
             let _ = tx.send(BookBookmarkRequest::MigratePaths(
                 request_id, mappings, journal_id,
+            ));
+        }
+    }
+
+    pub fn get_page_presence(&self, request_id: u64, entry: NewBookBookmark) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(BookBookmarkRequest::GetPagePresence(request_id, entry));
+        }
+    }
+
+    pub fn set_page_presence(&self, request_id: u64, entry: NewBookBookmark, present: bool) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(BookBookmarkRequest::SetPagePresence(
+                request_id, entry, present,
             ));
         }
     }
@@ -499,6 +558,38 @@ impl BookBookmarkDb {
         self.conn
             .execute("DELETE FROM book_bookmarks WHERE id = ?1", [id])?;
         Ok(())
+    }
+
+    fn page_is_bookmarked(&self, entry: &NewBookBookmark) -> Result<bool, rusqlite::Error> {
+        let key = container_key(&entry.container_path);
+        let (page_kind, _, page_key) = entry.page_identity.storage_parts();
+        self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM book_bookmarks
+                 WHERE container_key = ?1 AND page_kind = ?2 AND page_key = ?3
+            )",
+            rusqlite::params![key, page_kind, page_key],
+            |row| row.get(0),
+        )
+    }
+
+    fn set_page_presence(
+        &self,
+        entry: &NewBookBookmark,
+        present: bool,
+    ) -> Result<bool, rusqlite::Error> {
+        if present {
+            self.add(entry)?;
+            return Ok(true);
+        }
+        let key = container_key(&entry.container_path);
+        let (page_kind, _, page_key) = entry.page_identity.storage_parts();
+        self.conn.execute(
+            "DELETE FROM book_bookmarks
+              WHERE container_key = ?1 AND page_kind = ?2 AND page_key = ?3",
+            rusqlite::params![key, page_kind, page_key],
+        )?;
+        Ok(false)
     }
 
     fn set_title(&self, id: i64, title: Option<&str>) -> Result<Option<String>, rusqlite::Error> {
@@ -1797,6 +1888,24 @@ mod tests {
         let (saved, _) = db.add(&entry).unwrap();
         db.remove(saved.id).unwrap();
         assert!(db.list_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn page_presence_reads_and_sets_the_same_unique_identity_as_add_remove() {
+        let db = open_in_memory();
+        let entry = NewBookBookmark {
+            container_path: PathBuf::from("C:/Books/a.pdf"),
+            container_kind: BookContainerKind::Pdf,
+            page_identity: PageIdentity::PdfPage(7),
+            page_index_hint: 7,
+        };
+        assert!(!db.page_is_bookmarked(&entry).unwrap());
+        assert!(db.set_page_presence(&entry, true).unwrap());
+        assert!(db.page_is_bookmarked(&entry).unwrap());
+        assert!(db.set_page_presence(&entry, true).unwrap());
+        assert_eq!(db.list_all().unwrap().len(), 1);
+        assert!(!db.set_page_presence(&entry, false).unwrap());
+        assert!(!db.page_is_bookmarked(&entry).unwrap());
     }
 
     #[test]

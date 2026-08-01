@@ -22,6 +22,8 @@ export const CommandName = Object.freeze({
   TOGGLE_VIEWER_BARS: "toggle_viewer_bars",
   OPEN_GESTURE_HELP: "open_gesture_help",
   OPEN_LOCAL_SETTINGS: "open_local_settings",
+  SET_RATING: "set_rating",
+  TOGGLE_BOOKMARK: "toggle_bookmark",
   BACK: "back",
   FORWARD: "forward",
   PARENT_FOLDER: "parent_folder",
@@ -446,6 +448,73 @@ export function viewerGestureDecision({
     return ViewerGesture.TAP;
   }
   return moved ? ViewerGesture.PAN : null;
+}
+
+/// 指の移動方向に対して、実際の scrollTop が変化できるかを判定する。
+/// 上端で下へ、下端で上へ引く操作は pan にせず viewer swipe へ渡す。
+export function viewerVerticalScrollDecision({
+  scrollTop,
+  scrollHeight,
+  clientHeight,
+  dragDeltaY,
+  epsilon = 0.5,
+}) {
+  const tolerance = Math.max(0, Number(epsilon) || 0);
+  const maximum = Math.max(
+    0,
+    (Number(scrollHeight) || 0) - (Number(clientHeight) || 0)
+  );
+  const top = Math.max(0, Math.min(maximum, Number(scrollTop) || 0));
+  const delta = Number(dragDeltaY) || 0;
+  const scrollable = maximum > tolerance;
+  const atStart = top <= tolerance;
+  const atEnd = top >= maximum - tolerance;
+  const canConsume = scrollable && (
+    (delta < 0 && !atEnd) ||
+    (delta > 0 && !atStart)
+  );
+  return { scrollable, canConsume, atStart, atEnd, maximum };
+}
+
+export function createReadingProgressBatch() {
+  return {
+    latest: null,
+    lastEmittedIdentity: "",
+    nextDueAt: 0,
+  };
+}
+
+/// 読書位置の latest-only batching。effect が非 null のときだけ 1 request 送る。
+export function readingProgressBatchTransition(
+  current,
+  event,
+  intervalMs = 30_000
+) {
+  const interval = Math.max(1, Number(intervalMs) || 1);
+  const state = {
+    latest: current?.latest ?? null,
+    lastEmittedIdentity: String(current?.lastEmittedIdentity ?? ""),
+    nextDueAt: Math.max(0, Number(current?.nextDueAt) || 0),
+  };
+  const now = Math.max(0, Number(event?.now) || 0);
+  if (event?.type === "observe") {
+    state.latest = event.value ?? null;
+  }
+  if (event?.type === "reset") {
+    return { state: createReadingProgressBatch(), effect: null };
+  }
+  const identity = String(state.latest?.identity ?? "");
+  const forced = event?.type === "flush";
+  const due = event?.type === "observe" || event?.type === "tick"
+    ? state.nextDueAt === 0 || now >= state.nextDueAt
+    : false;
+  if (identity && identity !== state.lastEmittedIdentity && (forced || due)) {
+    const effect = state.latest;
+    state.lastEmittedIdentity = identity;
+    state.nextDueAt = now + interval;
+    return { state, effect };
+  }
+  return { state, effect: null };
 }
 
 export function shouldShowKeyboardShortcuts({
