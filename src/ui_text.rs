@@ -2212,7 +2212,7 @@ impl App {
     pub(crate) fn handle_text_keys(&mut self, ctx: &egui::Context, _fs_idx: usize) -> FsKeyAction {
         let action = FsKeyAction::default();
 
-        if !self.ime_input_active()
+        if !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && self.consume_context_shortcuts_help_key(ctx)
         {

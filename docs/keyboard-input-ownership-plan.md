@@ -53,11 +53,14 @@ KeyboardOwner =
   | ApplicationShortcut { scope }
   | Unclaimed
 
-TextInputPhase = PendingFocus | Focused | ImeGrace
+TextInputPhase = PendingFocus | Focused | FocusRecovery | ImeGrace
 ```
 
 - `PendingFocus` は「編集を開始したが最初の `request_focus` がまだ効いていない」1 pass ぶんの
   一時所有。**編集 state 全体を所有権にしない**ための区別 (穴 3 の再発防止)
+- `FocusRecovery` は helper 管理欄が直前 pass で持っていた focus を、IME / egui の
+  begin-pass key 処理が handler より先に一時解除した pass の所有。pointer による移動や別 widget の
+  focus は優先し、編集 draft の有無は根拠にしない
 - `ImeGrace` は既存の 300ms グレース相当。変換確定直後の取りこぼしを吸収する
 - `Modal` は既存のモーダル述語を集約する
 
@@ -98,7 +101,7 @@ Win32 `KeyEdge` 経路と egui event fallback の **双方**で同じ ownership 
 | S2 | ブックマークタイトル `TextEdit` をタグ入力と同構造へ (穴 4 の個別対応) | **完了** `6d4aa372`。明示 widget ID / `return_key(None)` / 非 IME Enter の明示 submit / focus 復元 |
 | S3 | `KeyboardOwner` / `TextInputPhase` / `ShortcutPermit` の型と、pass 単位の決定関数を追加 | **完了**。純粋な状態遷移、App の単一 snapshot 収集入口、既存 2 系統の互換投影を導入 |
 | S4 | `Keymap` の全 consume 系を permit 必須へ | 呼び出し側を一斉に移行 |
-| S5 | 生 `consume_key` の呼び出しを permit 経由へ移行 + **ソース監査テスト**で router 外の生 consume を禁止 | 列挙漏れの機械的な再発防止 |
+| S5 | 生 `consume_key` の呼び出しを permit 経由へ移行 + **ソース監査テスト**で router 外の生 consume を禁止 | **一部完了**。静止画 FS の Esc / 矢印は permit 経由化済み。全サイト移行とソース監査は後続 |
 | S6 | 単行入力の共通部品を作り、各ダイアログ / パネルの `TextEdit` を移行 | 潜在バグの一括解消 |
 | S7 | ドキュメント更新 | `docs/keymap-spec.md`、`CLAUDE.md` の IME 節、本計画書 |
 
@@ -122,6 +125,24 @@ Win32 `KeyEdge` 経路と egui event fallback の **双方**で同じ ownership 
   `wants_keyboard_input` 境界を、pass 所有者から各々の既存 blocker 集合へ投影する形へ移行した。
   App と Keymap の blocker 集合は意図的に別のままである。`PendingFocus` を実際の消費禁止へ反映するのは
   S4 とし、S3 では既存の答えを変えていない。
+
+### FS 生キー permit / viewport 別 IME 実装記録 (2026-08-01)
+
+- 静止画 FS の固定 Esc / 矢印には `FullscreenRawKeyPermit` を追加し、raw `consume_key` helper が
+  permit を型として要求するようにした。通常の `ShortcutPermit` とは述語を分け、
+  `TextInput` の `PendingFocus` / `Focused` / `FocusRecovery` / `ImeGrace` はすべて拒否する一方、
+  `FocusedUi` と fullscreen の `ApplicationShortcut` は許可する。補正スライダー等の非テキスト
+  widget が focus を持っても従来どおりページ送りを優先するためであり、ブランケットな
+  `ctx.wants_keyboard_input()` gate や `blocks_legacy_keymap_shortcuts` は使わない。
+- helper 管理 TextEdit が実描画で記録する直前 pass の focus contract を ownership snapshot へ接続した。
+  egui は Escape を begin-pass で処理して handler より先に focus を一時解除し得るため、その場合も
+  `FocusRecovery` が所有する。pointer 入力または別 widget の focus がある場合は recovery しない。
+  `BookBookmarkTitleEdit` の draft 自体は引き続き snapshot から読まない。
+- `App::ime_composing` / `ime_last_event_at` は撤去し、`ime_focus.rs` の
+  `ctx.data_temp` にある `ViewportId` 単位の `ImeFocusState` を App gate と TextEdit helper の単一正本にした。
+  既存の 300ms は各 viewport 内の Disabled / Escape 配信差を吸収する grace のまま維持する。
+  timeout で stuck bool を clear する方式は採らない。消えた viewport の state は sibling から参照されず、
+  temporary data の GC 対象にもなるため、未完了の `Ime::Enabled` が別 viewport の shortcut を止めない。
 
 ## 4. テストで縛る不変条件
 

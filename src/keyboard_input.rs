@@ -11,8 +11,8 @@ pub enum TextInputPhase {
     PendingFocus,
     /// The text widget has keyboard focus.
     Focused,
-    /// A helper-managed field owned focus in the previous pass and an IME key
-    /// caused a transient keyboard-driven focus loss in this pass.
+    /// A helper-managed field owned focus in the previous pass and begin-pass
+    /// key processing caused a transient keyboard-driven focus loss here.
     FocusRecovery,
     /// The existing 300 ms IME event grace is active.
     ImeGrace,
@@ -86,11 +86,41 @@ impl ShortcutPermit {
     }
 }
 
+/// Proof that the fullscreen fixed-key router may consume a raw egui key.
+///
+/// This is intentionally separate from [`ShortcutPermit`]. A focused non-text
+/// widget must keep allowing fixed fullscreen navigation (for example, an
+/// adjustment slider must not steal page arrows), while every text-input phase
+/// must retain the raw event for the editor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FullscreenRawKeyPermit {
+    viewport: egui::ViewportId,
+}
+
 impl KeyboardOwner {
     pub const fn shortcut_permit(self) -> Option<ShortcutPermit> {
         match self {
             Self::ApplicationShortcut { scope } => Some(ShortcutPermit { scope }),
             Self::Modal | Self::TextInput { .. } | Self::FocusedUi { .. } | Self::Unclaimed => None,
+        }
+    }
+
+    pub(crate) const fn fullscreen_raw_key_permit(self) -> Option<FullscreenRawKeyPermit> {
+        match self {
+            Self::ApplicationShortcut { scope }
+                if matches!(scope.surface, ShortcutSurface::Fullscreen) =>
+            {
+                Some(FullscreenRawKeyPermit {
+                    viewport: scope.viewport,
+                })
+            }
+            // Fixed Esc/arrows deliberately pass through non-text widget focus:
+            // sliders and similar controls must not take fullscreen navigation.
+            Self::FocusedUi { viewport, .. } => Some(FullscreenRawKeyPermit { viewport }),
+            Self::Modal
+            | Self::TextInput { .. }
+            | Self::ApplicationShortcut { .. }
+            | Self::Unclaimed => None,
         }
     }
 
@@ -136,6 +166,19 @@ impl KeyboardOwner {
             } | Self::FocusedUi { .. }
         )
     }
+}
+
+/// Consume a fixed fullscreen key only after the pass owner issued a permit.
+pub(crate) fn consume_fullscreen_raw_key(
+    ctx: &egui::Context,
+    permit: FullscreenRawKeyPermit,
+    modifiers: egui::Modifiers,
+    key: egui::Key,
+) -> bool {
+    if permit.viewport != ctx.viewport_id() {
+        return false;
+    }
+    ctx.input_mut(|input| input.consume_key(modifiers, key))
 }
 
 /// Pure inputs used to decide a viewport pass's keyboard owner.
@@ -582,6 +625,46 @@ mod tests {
         ] {
             assert_eq!(owner.shortcut_permit(), None, "{owner:?}");
         }
+    }
+
+    #[test]
+    fn fullscreen_raw_key_permit_blocks_text_phases_but_allows_focused_ui() {
+        for phase in [
+            TextInputPhase::PendingFocus,
+            TextInputPhase::Focused,
+            TextInputPhase::FocusRecovery,
+            TextInputPhase::ImeGrace,
+        ] {
+            let owner = KeyboardOwner::TextInput {
+                viewport: egui::ViewportId::ROOT,
+                widget_id: egui::Id::new("text"),
+                phase,
+            };
+            assert_eq!(owner.fullscreen_raw_key_permit(), None, "{phase:?}");
+        }
+
+        assert!(
+            KeyboardOwner::FocusedUi {
+                viewport: egui::ViewportId::ROOT,
+                widget_id: egui::Id::new("slider"),
+            }
+            .fullscreen_raw_key_permit()
+            .is_some()
+        );
+        assert!(
+            KeyboardOwner::ApplicationShortcut {
+                scope: scope(ShortcutSurface::Fullscreen),
+            }
+            .fullscreen_raw_key_permit()
+            .is_some()
+        );
+        assert_eq!(
+            KeyboardOwner::ApplicationShortcut {
+                scope: scope(ShortcutSurface::Main),
+            }
+            .fullscreen_raw_key_permit(),
+            None
+        );
     }
 
     #[test]

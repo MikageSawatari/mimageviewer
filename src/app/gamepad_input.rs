@@ -1793,7 +1793,7 @@ impl App {
         if foreground_app_hwnd().is_none() {
             return false;
         }
-        if self.ime_input_active() {
+        if self.ime_input_active(ctx) {
             return false;
         }
         if self.gamepad_targets_viewer() {

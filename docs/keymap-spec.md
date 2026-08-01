@@ -146,7 +146,7 @@ edge の寿命は 1 フレームのままにする。Action が消費しなか�
 | keyboard focus 移動 | <kbd>Tab</kbd> traversal | 非テキスト widget へ focus が移って `wants_keyboard_input()` が true のまま残り、全 shortcut が停止した履歴と、TextEdit から 1 hop だけ移動する不統一を避けるため、アプリ全体で常に無効。Tab chord 自体は `KeyAction` へ割り当て可能 |
 | フォーカスローカル UI | テキスト入力、IME 変換、コンボボックス、リスト、フォルダツリー、製本並べ替えダイアログ内の矢印 / Enter / Esc / PageUp / PageDown / Home / End など | その UI 部品の中だけで意味を持ち、グローバルショートカットとして外へ漏らさない |
 | モーダル削除確認 | <kbd>Y</kbd> = 削除、<kbd>N</kbd> / <kbd>Esc</kbd> = キャンセル、<kbd>Enter</kbd> = 無効 | 誤操作防止のため keymap 対象外の固定入力。ダイアログ表示中に Y / N / Esc を消費し、背面の KeyAction へ漏らさない。IME 変換中は Y / N / Esc の確認操作を行わない |
-| 最低限の脱出 / 閲覧ナビ | <kbd>Esc</kbd>、修飾なし矢印キー | モード脱出とページ / 一覧移動の最後の手段として残す。Enter / Backspace / Home / End / PageUp / PageDown などは文脈ごとの `KeyAction` 化対象 |
+| 最低限の脱出 / 閲覧ナビ | <kbd>Esc</kbd>、修飾なし矢印キー | モード脱出とページ / 一覧移動の最後の手段として残す。静止画 FS では raw-key permit を要求し、TextInput の全 phase では editor に残す一方、非テキスト `FocusedUi` はスライダー等にページ矢印を奪われないよう通す。Enter / Backspace / Home / End / PageUp / PageDown などは文脈ごとの `KeyAction` 化対象 |
 | 画像連結読みのドラッグ | 左ドラッグ = 連結方向スクロール、<kbd>Ctrl</kbd>+左ドラッグ = 軸固定を解除して直交方向にもパン | 連結レイアウト中だけの連続ポインター操作。離散コマンドではなく、ドラッグ中の各フレームの修飾状態で拘束を切り替えるため keymap 対象外。ダブルクリックの表示変形リセットも固定入力として扱う |
 | UI 表示倍率 | egui 既定の <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd> | `Settings.ui_scale_factor` と main Context の `zoom_factor` を単一の正本にするため、main / native presenter の両 egui Context で `zoom_with_keyboard=false`。表示倍率は設定メニュー「スケーリング」だけから変更し、KeyAction 対象外とする |
 | サムネイル一覧の範囲選択 | <kbd>Shift</kbd>+矢印キー | グリッド選択カーソルの移動とチェック追加が一体になった固定操作。Grid 文脈で同じキーを割り当てた場合は予約キー警告を出す |

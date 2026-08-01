@@ -7632,7 +7632,7 @@ impl App {
             }
         }
         let close_requested = ctx.input(|i| i.viewport().close_requested());
-        let escape_pressed = !self.ime_input_active()
+        let escape_pressed = !self.ime_input_active(ctx)
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let cancel = close_requested || escape_pressed;
 
@@ -8132,7 +8132,7 @@ impl App {
                 // IME がアクティブ (変換中 or 直近 300ms に Ime イベント = Windows の別フレーム
                 // 配信吸収) の間は raw な Key::Enter を除去する。非変換時の Enter は通るので
                 // 意図的な改行は可能。テキスト注釈モードの本文編集中のみに限定する。
-                if self.text_mode && self.ime_input_active() {
+                if self.text_mode && self.ime_input_active(ctx) {
                     ctx.input_mut(|i| {
                         i.events.retain(|e| {
                             !matches!(
@@ -10500,7 +10500,7 @@ impl App {
             // この呼び出し前後でスキャン状態の変化 (= ESC で cancel された) を検出して
             // close 判定をスキップする。
             let normalize_active_before = self.normalize_state.is_some();
-            if !self.ime_input_active() {
+            if !self.ime_input_active(ctx) {
                 for key in native_video_key_events_from_ctx(ctx) {
                     self.handle_native_video_key_event(ctx, fs_idx, key);
                 }
@@ -10508,7 +10508,7 @@ impl App {
             let normalize_cancelled_this_frame =
                 normalize_active_before && self.normalize_state.is_none();
             let close_requested = ctx.input(|i| i.viewport().close_requested());
-            let escape_pressed = !self.ime_input_active()
+            let escape_pressed = !self.ime_input_active(ctx)
                 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
             if (close_requested || escape_pressed) && !normalize_cancelled_this_frame {
                 close_fs = true;
@@ -11016,7 +11016,7 @@ impl App {
         if self.any_modal_dialog_open_for_fullscreen_keys() {
             return true;
         }
-        if !self.ime_input_active()
+        if !self.ime_input_active(ctx)
             && !self.is_overlay_edit_mode_active()
             && !matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
             && self.consume_context_shortcuts_help_key(ctx)
@@ -11220,7 +11220,8 @@ impl App {
         // drain** する。フォーカス無し / モーダル表示中で早期 return すると pending が
         // 次フレームに持ち越されて誤発火するため (Codex P2)。ブロック中は count を捨てる。
         let (browser_back_count, browser_forward_count) = crate::take_pending_mouse_nav();
-        let _owner = self.keyboard_owner_for_pass(ctx);
+        let owner = self.keyboard_owner_for_pass(ctx);
+        let fullscreen_raw_key_permit = owner.fullscreen_raw_key_permit();
 
         let has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         let mut action = FsKeyAction {
@@ -11264,7 +11265,7 @@ impl App {
             return action;
         }
 
-        if !self.ime_input_active()
+        if !self.ime_input_active(ctx)
             && !self.is_overlay_edit_mode_active()
             && self
                 .keymap
@@ -11295,7 +11296,7 @@ impl App {
         }
 
         if self.local_adjust_mode {
-            if !self.ime_input_active()
+            if !self.ime_input_active(ctx)
                 && !ctx.wants_keyboard_input()
                 && self.consume_context_shortcuts_help_key(ctx)
             {
@@ -11542,13 +11543,13 @@ impl App {
         // フルスクリーンショートカット (閉じる/再生トグル) も塞いでモーダル操作へ集中させる。
         if fs_music_view_active
             && (ctx.wants_keyboard_input()
-                || self.ime_input_active()
+                || self.ime_input_active(ctx)
                 || self.music_bookmark_modal_open()
                 || self.music_normalize_modal_active(fs_idx))
         {
             return action;
         }
-        if !self.ime_input_active()
+        if !self.ime_input_active(ctx)
             && self.fs_context_menu_idx.is_none()
             && self.consume_context_shortcuts_help_key(ctx)
         {
@@ -11587,7 +11588,7 @@ impl App {
         // 割り当てた場合、動画同様「閉じて一覧へ戻る」が勝つ)。既定は未割り当てなので通常は no-op。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             && self
@@ -11606,7 +11607,7 @@ impl App {
         // フォーカス中は消費しない (VideoCloseFullscreen と同じガード)。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             // no_repeat: native enter 側も !key.repeat。Z を押しっぱなしで enter した直後、
@@ -11629,7 +11630,7 @@ impl App {
         // 消費しない。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             && self.keymap.consume_action(ctx, KeyAction::VideoPlayPause)
@@ -11644,7 +11645,7 @@ impl App {
         // メニュー表示中は無効 (B の文字入力を奪わない)。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && self.keymap.consume_action(ctx, KeyAction::VideoBookmark)
         {
@@ -11656,7 +11657,7 @@ impl App {
         // no-op + トースト。モーダル / IME / TextEdit フォーカス中は消費しない。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             && self.keymap.consume_action(ctx, KeyAction::VideoLoop)
@@ -11669,7 +11670,7 @@ impl App {
         // フォーカス中は消費しない。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             && self.keymap.consume_action(ctx, KeyAction::VideoSeekStart)
@@ -11682,7 +11683,7 @@ impl App {
         // モーダル / IME / TextEdit フォーカス中は消費しない。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
         {
@@ -11701,7 +11702,7 @@ impl App {
         // 音量スライダーと挙動を揃える。モーダル / IME / TextEdit フォーカス中は消費しない。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
         {
@@ -11731,7 +11732,7 @@ impl App {
         // TextEdit フォーカス中は消費しない。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             && self.keymap.consume_action(ctx, KeyAction::VideoMute)
@@ -11775,7 +11776,7 @@ impl App {
         // シークにする。前後ファイル移動は ↑↓ = VideoPrevFile/NextFile が担う)。
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.ime_input_active()
+            && !self.ime_input_active(ctx)
             && !ctx.wants_keyboard_input()
             && !self.music_bookmark_modal_open()
         {
@@ -11827,7 +11828,14 @@ impl App {
 
         // ナビゲーションキーは input_mut で消費して、パネル内ウィジェット（スライダー等）に
         // 奪われないようにする
-        let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let esc = fullscreen_raw_key_permit.is_some_and(|permit| {
+            crate::keyboard_input::consume_fullscreen_raw_key(
+                ctx,
+                permit,
+                egui::Modifiers::NONE,
+                egui::Key::Escape,
+            )
+        });
         // 静止画フルスクリーンでは FsClose (既定: Enter) も Esc と同等に
         // 「フルスクリーン解除」トリガー。
         // グリッドで Enter (Double click 相当) → 開く、フルスクリーンで Enter → 戻る、
@@ -11847,7 +11855,7 @@ impl App {
             matches!(self.items.get(fs_idx), Some(GridItem::Video(_))) || current_item_is_audio;
         let enter_consume_ok = should_close_fullscreen_on_enter(
             is_media_item,
-            self.ime_input_active(),
+            self.ime_input_active(ctx),
             self.fs_context_menu_idx.is_some(),
             self.fs_suppress_enter_close_until_release,
         );
@@ -11942,16 +11950,34 @@ impl App {
         // 音声は ←→ を上のシークブロックで消費済み (「映像なし動画」パリティ)。ここでは file-nav へ
         // 流さないよう明示的に除外する (残留 ←→ が前後ファイル移動を誤発火するのを防ぐ)。
         let arrow_right = !fs_music_view_active
-            && ctx.input_mut(|i| {
-                !video_horizontal_arrow_key
-                    && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
-                        || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight))
+            && !video_horizontal_arrow_key
+            && fullscreen_raw_key_permit.is_some_and(|permit| {
+                crate::keyboard_input::consume_fullscreen_raw_key(
+                    ctx,
+                    permit,
+                    egui::Modifiers::NONE,
+                    egui::Key::ArrowRight,
+                ) || crate::keyboard_input::consume_fullscreen_raw_key(
+                    ctx,
+                    permit,
+                    egui::Modifiers::SHIFT,
+                    egui::Key::ArrowRight,
+                )
             });
         let arrow_left = !fs_music_view_active
-            && ctx.input_mut(|i| {
-                !video_horizontal_arrow_key
-                    && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
-                        || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft))
+            && !video_horizontal_arrow_key
+            && fullscreen_raw_key_permit.is_some_and(|permit| {
+                crate::keyboard_input::consume_fullscreen_raw_key(
+                    ctx,
+                    permit,
+                    egui::Modifiers::NONE,
+                    egui::Key::ArrowLeft,
+                ) || crate::keyboard_input::consume_fullscreen_raw_key(
+                    ctx,
+                    permit,
+                    egui::Modifiers::SHIFT,
+                    egui::Key::ArrowLeft,
+                )
             });
         // ファイル名スタックのフラット読書中 (v2.0.0) は Shift+↓↑ を「次/前のスタックへ
         // ジャンプ」に割り当てる。動画再生中は Video* action (音量 / 前後ファイル) が優先。
@@ -11985,21 +12011,39 @@ impl App {
         let arrow_down = video_file_nav == Some(KeyAction::VideoNextFile)
             || (!is_video_fs
                 && !fs_music_view_active
-                && ctx.input_mut(|i| {
+                && fullscreen_raw_key_permit.is_some_and(|permit| {
                     // egui イベントは常に drain する (残すと後段ハンドラが拾う恐れ)。ただし
                     // flat 読書中の Shift+↓ (= スタックジャンプ) はページ送りとしては扱わない。
-                    let consumed = i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
-                        || (!stack_flat_nav
-                            && i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown));
+                    let consumed = crate::keyboard_input::consume_fullscreen_raw_key(
+                        ctx,
+                        permit,
+                        egui::Modifiers::NONE,
+                        egui::Key::ArrowDown,
+                    ) || (!stack_flat_nav
+                        && crate::keyboard_input::consume_fullscreen_raw_key(
+                            ctx,
+                            permit,
+                            egui::Modifiers::SHIFT,
+                            egui::Key::ArrowDown,
+                        ));
                     consumed && !stack_shift_arrow
                 }));
         let arrow_up = video_file_nav == Some(KeyAction::VideoPrevFile)
             || (!is_video_fs
                 && !fs_music_view_active
-                && ctx.input_mut(|i| {
-                    let consumed = i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
-                        || (!stack_flat_nav
-                            && i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp));
+                && fullscreen_raw_key_permit.is_some_and(|permit| {
+                    let consumed = crate::keyboard_input::consume_fullscreen_raw_key(
+                        ctx,
+                        permit,
+                        egui::Modifiers::NONE,
+                        egui::Key::ArrowUp,
+                    ) || (!stack_flat_nav
+                        && crate::keyboard_input::consume_fullscreen_raw_key(
+                            ctx,
+                            permit,
+                            egui::Modifiers::SHIFT,
+                            egui::Key::ArrowUp,
+                        ));
                     consumed && !stack_shift_arrow
                 }));
         let key_home = self.keymap.consume_action(ctx, KeyAction::FsJumpFirst);
@@ -23611,7 +23655,7 @@ impl App {
         video_path: Option<&std::path::Path>,
     ) {
         // IME 変換中はショートカットを発火させない
-        if self.ime_input_active() {
+        if self.ime_input_active(ctx) {
             return;
         }
 

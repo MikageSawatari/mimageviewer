@@ -10218,13 +10218,6 @@ pub struct App {
     pub(crate) slot_save_dialog: Option<(usize, String, crate::adjustment::AdjustParams)>,
     /// お気に入り専用の標準を解除すると表示が変わる場合の確認ダイアログ。
     pub(crate) favorite_default_clear_confirm: Option<FavoriteDefaultClearConfirm>,
-    /// IME 変換中フラグ。Ime イベントで更新される持続状態。
-    /// Enabled/Preedit(非空) で true、Preedit("")/Commit/Disabled で false。
-    pub(crate) ime_composing: bool,
-    /// 直近の Ime イベント受信時刻 (時間ベースのガードに使う)。
-    /// Windows IME のキャンセル Escape では Ime::Disabled と Key::Escape が別フレームに
-    /// 分かれて届くことがあるため、Ime イベント後 300ms は IME 入力中として扱う。
-    pub(crate) ime_last_event_at: Option<std::time::Instant>,
     /// 右上フィードバック表示: (テキスト, 表示開始時刻, 表示秒数)。
     /// フルスクリーン / グリッド共通。命名の `fs_` プレフィックスはフルスクリーン
     /// 専用だった頃の名残。表示秒数はトーストごとに指定でき、短い確認系は既定
@@ -12416,8 +12409,6 @@ impl App {
             export_crop_db,
             slot_save_dialog: None,
             favorite_default_clear_confirm: None,
-            ime_composing: false,
-            ime_last_event_at: None,
             fs_feedback_toast: None,
             fs_feedback_toast_reveal_path: None,
             fs_feedback_toast_surface: None,
@@ -13461,59 +13452,30 @@ impl App {
         self.bump_input_seq(kind, key.as_deref())
     }
 
-    /// IME 変換状態を更新する (毎フレーム先頭で呼ぶ)。
-    /// `ime_input_active_this_frame` に「今フレームを IME 入力として扱うか」を設定する。
-    ///
-    /// 判定は以下の 3 条件の OR:
-    /// 1. 前フレーム末で composition 状態だった (`was_composing`)
-    /// 2. 今フレームに Ime イベントが来ている (`had_ime_event`)
-    /// 3. 直近 300ms 以内に Ime イベントがあった (時間ベースの余韻)
-    ///
-    /// 3 が必要な理由: Windows の一部環境では、IME キャンセル時 (Escape) に
-    /// Ime イベントが先行フレームで発行されて `ime_composing = false` になり、
-    /// Key::Escape 自体は 1〜数フレーム遅れで届くことがある。
-    /// その隙間を埋めるためのガード。
-    /// 現在のビューポートの Ime イベントを処理して `ime_composing` / `ime_last_event_at` を更新する。
+    /// 現在の viewport の IME 変換状態をイベント処理前に取り込む。
     ///
     /// **重要**: egui の各ビューポートは独立したイベントキューを持つ。
     /// `show_viewport_immediate` で別ビューポートを出している場合は、その closure の
     /// 先頭でも呼ばないと、そのビューポート内の IME を取り逃がす。
     pub(crate) fn update_ime_state(&mut self, ctx: &egui::Context) {
-        crate::ime_focus::begin_pass_diagnostics(ctx);
-        ctx.input(|i| {
-            for event in &i.events {
-                if let egui::Event::Ime(ime) = event {
-                    self.ime_last_event_at = Some(std::time::Instant::now());
-                    match ime {
-                        egui::ImeEvent::Enabled => self.ime_composing = true,
-                        egui::ImeEvent::Preedit(s) => self.ime_composing = !s.is_empty(),
-                        egui::ImeEvent::Commit(_) => self.ime_composing = false,
-                        egui::ImeEvent::Disabled => self.ime_composing = false,
-                    }
-                }
-            }
-        });
+        let _ = crate::ime_focus::ime_input_active(ctx);
     }
 
     /// IME 変換中か (または直近 300ms 以内に Ime イベントがあったか)。
     /// true の間は Enter / Escape をショートカット・ダイアログ確定/キャンセルとして拾ってはいけない。
     /// 300ms グレースは Windows IME で `Ime::Disabled` と `Key::Escape` が別フレームに
     /// 届くケースを吸収するため。
-    pub(crate) fn ime_input_active(&self) -> bool {
-        if self.ime_composing {
-            return true;
-        }
-        self.ime_last_event_at
-            .map(|t| t.elapsed() < std::time::Duration::from_millis(300))
-            .unwrap_or(false)
+    pub(crate) fn ime_input_active(&self, ctx: &egui::Context) -> bool {
+        crate::ime_focus::ime_input_active(ctx)
     }
 
     /// Gather every App/egui input needed by the pass owner in one place.
     ///
     /// This is the only impure ownership entry: the decision function itself
     /// receives copied bool/id values only. `book_bookmark_title_edit` is
-    /// deliberately not read; only the explicit one-pass focus claim below can
-    /// represent an editor before focus lands. Native presenter text input is
+    /// deliberately not read; the explicit pending-focus claim represents an
+    /// editor before focus lands, and the helper focus contract represents the
+    /// TextEdit after it is drawn. Native presenter text input is
     /// claimed upstream on its own egui context, so no key from that owner is
     /// forwarded into this App viewport snapshot.
     fn keyboard_ownership_snapshot(
@@ -13560,8 +13522,10 @@ impl App {
                 || self.global_search.has_focus
                 || self.tag_view.has_focus
                 || self.color_filter.input_has_focus);
-        let focused_text_input = tracked_text_input_focused
-            .then_some(focused_widget.unwrap_or(egui::Id::NULL))
+        let focused_text_input = crate::ime_focus::focused_text_input(ctx)
+            .or_else(|| {
+                tracked_text_input_focused.then_some(focused_widget.unwrap_or(egui::Id::NULL))
+            })
             .or(claimed_focused_text_input);
         let wants_keyboard_input = ctx.wants_keyboard_input();
         let focused_ui = wants_keyboard_input.then_some(focused_widget.unwrap_or(egui::Id::NULL));
@@ -13572,7 +13536,7 @@ impl App {
                     .map(|widget_id| TextInputClaim::new(widget_id, TextInputPhase::FocusRecovery))
             })
             .or_else(|| {
-                self.ime_input_active().then(|| {
+                self.ime_input_active(ctx).then(|| {
                     TextInputClaim::new(
                         focused_ui.unwrap_or(egui::Id::NULL),
                         TextInputPhase::ImeGrace,
@@ -13658,12 +13622,12 @@ impl App {
 
     /// ダイアログ確定用の Enter が押されたか。IME 変換中は常に false を返す。
     pub(crate) fn dialog_enter_pressed(&self, ctx: &egui::Context) -> bool {
-        !self.ime_input_active() && ctx.input(|i| i.key_pressed(egui::Key::Enter))
+        !self.ime_input_active(ctx) && ctx.input(|i| i.key_pressed(egui::Key::Enter))
     }
 
     /// ダイアログキャンセル用の Escape が押されたか。IME 変換中は常に false を返す。
     pub(crate) fn dialog_escape_pressed(&self, ctx: &egui::Context) -> bool {
-        !self.ime_input_active() && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        !self.ime_input_active(ctx) && ctx.input(|i| i.key_pressed(egui::Key::Escape))
     }
 
     /// いずれかのモーダルダイアログが開いているか。
@@ -30945,7 +30909,7 @@ impl App {
             || self.favsearch.active
             || self.global_search.active
             || self.tag_view.active)
-            && self.ime_input_active()
+            && self.ime_input_active(ctx)
         {
             return None;
         }
@@ -30998,7 +30962,7 @@ impl App {
             return None;
         }
 
-        if !self.ime_input_active() && self.consume_context_shortcuts_help_key(ctx) {
+        if !self.ime_input_active(ctx) && self.consume_context_shortcuts_help_key(ctx) {
             self.show_context_shortcuts_help = true;
             return None;
         }

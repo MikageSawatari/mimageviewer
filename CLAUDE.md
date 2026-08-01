@@ -395,9 +395,10 @@ TextEdit を含むダイアログで Enter / Escape を拾うときは **必ず�
 
 - **確定用**: `self.dialog_enter_pressed(ctx)` — IME 変換中は常に false
 - **キャンセル用**: `self.dialog_escape_pressed(ctx)` — IME 変換中は常に false
-- **判定ロジック**: `App::ime_input_active()` は `ime_composing` フラグ (Ime イベントで更新) と
-  直近 300ms 以内の Ime イベント有無の OR で判定。300ms グレースは Windows IME で
-  `Ime::Disabled` と `Key::Escape` が別フレームに届くケースを吸収するため。
+- **判定ロジック**: `App::ime_input_active(ctx)` は `ime_focus` が `ViewportId` ごとの
+  `ctx.data_temp` に保持する composition 状態と、同じ viewport で直近 300ms 以内に届いた
+  Ime イベント有無の OR で判定。300ms グレースは Windows IME で `Ime::Disabled` と
+  `Key::Escape` が別フレームに届くケースを吸収するため。App-global な IME bool は持たない。
 
 上記はアプリ操作を抑止する責務で、TextEdit の focus 復帰とは別。日本語を入力できる新しい
 single-line TextEdit は `crate::ime_focus` の helper 経由で描画すること。同 helper が IME の

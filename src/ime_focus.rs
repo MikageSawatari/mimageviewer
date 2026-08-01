@@ -451,7 +451,12 @@ pub(crate) fn record_side_panel_close(ctx: &egui::Context, call_site: &'static s
     });
 }
 
-fn ime_input_active(ctx: &egui::Context) -> bool {
+/// Sample and return IME activity for the current viewport.
+///
+/// State lives in egui temporary data keyed by viewport, so a viewport that
+/// disappears cannot leave another viewport permanently composing. This is the
+/// single IME state owner shared by App shortcut gates and TextEdit helpers.
+pub(crate) fn ime_input_active(ctx: &egui::Context) -> bool {
     begin_pass_diagnostics(ctx);
     let ime_events: Vec<egui::ImeEvent> = ctx.input(|input| {
         input
@@ -483,6 +488,25 @@ fn ime_input_active(ctx: &egui::Context) -> bool {
             || state
                 .last_event_at
                 .is_some_and(|at| now.saturating_duration_since(at) < IME_EVENT_GRACE)
+    })
+}
+
+/// Return the helper-managed TextEdit that currently owns egui focus.
+///
+/// The contract is recorded while the widget is actually drawn. Reading it in
+/// the next pass lets input handlers that run before panel drawing distinguish
+/// a TextEdit from a focused slider without inspecting feature-specific draft
+/// state.
+pub(crate) fn focused_text_input(ctx: &egui::Context) -> Option<egui::Id> {
+    let focused = ctx.memory(|memory| memory.focused())?;
+    let pass = ctx.cumulative_pass_nr();
+    let id = text_focus_contract_id(ctx.viewport_id());
+    ctx.data(|data| {
+        data.get_temp::<ImeTextFocusContract>(id)
+            .filter(|contract| {
+                contract.widget_id == focused && pass.saturating_sub(contract.focused_pass) <= 1
+            })
+            .map(|contract| contract.widget_id)
     })
 }
 
@@ -523,14 +547,15 @@ fn forget_text_focus(ctx: &egui::Context, widget_id: egui::Id) {
     });
 }
 
-/// Return the helper-managed field whose keyboard-driven IME focus loss is
-/// recoverable in this pass.
+/// Return the helper-managed field whose keyboard-driven focus loss must retain
+/// text-input ownership in this pass.
 ///
 /// Ownership is deliberately limited to the pass immediately after the field
-/// was observed focused. Pointer input wins, so clicks remain legitimate focus
-/// changes.
+/// was observed focused. This covers both IME processing and egui's begin-pass
+/// Escape handling, which can clear focus before the fullscreen handler runs.
+/// Pointer input and focus already moved to another widget both win.
 pub(crate) fn recovering_text_input(ctx: &egui::Context) -> Option<egui::Id> {
-    if !keyboard_focus_recovery_input(ctx) || !ime_input_active(ctx) {
+    if !keyboard_focus_recovery_input(ctx) || ctx.memory(|memory| memory.focused()).is_some() {
         return None;
     }
     let pass = ctx.cumulative_pass_nr();

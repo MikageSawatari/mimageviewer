@@ -2041,7 +2041,7 @@ impl crate::app::App {
         let label = self.delete_confirm_label.clone().unwrap_or_default();
 
         // CLAUDE.md の IME 定型どおり Modal closure の前で capture する。
-        let ime_active = self.ime_input_active();
+        let ime_active = self.ime_input_active(ctx);
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let key_action = consume_delete_confirm_action(ctx, ime_active, escape_pressed);
         let modal_response = show_delete_confirm_modal(ctx, &label);

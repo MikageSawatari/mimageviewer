@@ -27,7 +27,13 @@ fn native_video_bookmark_commands_ignore_app_viewport_ime_state() {
     // Reproduce a composition flag left in the winit/App context. The native video HWND has
     // its own IME state and `NativeOverlayInputRouting` has already filtered text-field keys,
     // so this unrelated flag must not discard native pointer or semantic command traffic.
-    app.ime_composing = true;
+    ctx.begin_pass(egui::RawInput {
+        events: vec![egui::Event::Ime(egui::ImeEvent::Enabled)],
+        ..Default::default()
+    });
+    app.update_ime_state(&ctx);
+    assert!(app.ime_input_active(&ctx));
+    let _ = ctx.end_pass();
     app.native_video_last_move_client = None;
     app.handle_native_video_window_event(
         &ctx,
@@ -45280,6 +45286,299 @@ fn plain_a_has_no_bookmark_panel_fullscreen_action() {
         app.settings.fullscreen_side_panel_mode,
         crate::settings::FsSidePanelMode::Hover
     );
+}
+
+fn fullscreen_fixed_key_event(key: egui::Key) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+fn fullscreen_fixed_key_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    let guard = crate::key_input::TEST_INPUT_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .expect("fullscreen fixed-key test lock poisoned");
+    crate::key_input::clear_test_frame();
+    guard
+}
+
+fn setup_fullscreen_fixed_key_test() -> (phase_c_support::AppTestEnv, usize, egui::Context) {
+    let mut app = phase_c_support::setup_app();
+    app.items.extend([
+        GridItem::Image(PathBuf::from("C:/photos/permit-prev.jpg")),
+        GridItem::Image(PathBuf::from("C:/photos/permit-current.jpg")),
+        GridItem::Image(PathBuf::from("C:/photos/permit-next.jpg")),
+    ]);
+    let idx = app.items.len() - 2;
+    app.fullscreen_idx = Some(idx);
+    (app, idx, egui::Context::default())
+}
+
+#[track_caller]
+fn assert_no_fullscreen_fixed_key_action(action: crate::ui_fullscreen::FsKeyAction) {
+    assert!(!action.close);
+    assert!(!action.close_to_page_list);
+    assert!(action.page_nav.is_none());
+    assert_eq!(action.ctrl_nav, None);
+    assert_eq!(action.sibling_nav, None);
+    assert_eq!(action.jump_to, None);
+}
+
+fn start_bookmark_title_edit_after_handler(app: &mut App, ctx: &egui::Context, fs_idx: usize) {
+    ctx.begin_pass(Default::default());
+    let action = app.handle_fs_key_input(ctx, fs_idx, false);
+    assert_no_fullscreen_fixed_key_action(action);
+
+    let bookmark_id = 42;
+    app.claim_pending_text_input_focus(
+        ctx.viewport_id(),
+        crate::ui_adjustment_panel::book_bookmark_title_edit_widget_id(bookmark_id),
+        ctx.cumulative_pass_nr(),
+    );
+    app.book_bookmark_title_edit = Some(BookBookmarkTitleEdit {
+        id: bookmark_id,
+        title: String::from("editing"),
+        request_focus: true,
+    });
+    let _ = ctx.end_pass();
+}
+
+fn draw_bookmark_title_editor(app: &mut App, ctx: &egui::Context) {
+    egui::CentralPanel::default().show(ctx, |ui| {
+        let edit = app
+            .book_bookmark_title_edit
+            .as_mut()
+            .expect("bookmark title editor must be active");
+        let _ = crate::ui_adjustment_panel::draw_bookmark_title_edit_for_test(
+            ui,
+            edit.id,
+            &mut edit.title,
+            &mut edit.request_focus,
+        );
+    });
+}
+
+fn focus_bookmark_title_editor(app: &mut App, ctx: &egui::Context, fs_idx: usize) {
+    ctx.begin_pass(Default::default());
+    let owner = app.keyboard_owner_for_pass(ctx);
+    assert!(
+        matches!(
+            owner,
+            crate::keyboard_input::KeyboardOwner::TextInput {
+                phase: crate::keyboard_input::TextInputPhase::PendingFocus,
+                ..
+            }
+        ),
+        "first editor draw must be pending-focus owned, got {owner:?}"
+    );
+    let action = app.handle_fs_key_input(ctx, fs_idx, false);
+    assert_no_fullscreen_fixed_key_action(action);
+    draw_bookmark_title_editor(app, ctx);
+    let _ = ctx.end_pass();
+    assert!(
+        app.pending_text_input_focus.get().is_some(),
+        "pending focus claim must survive until the handler observes focused TextEdit"
+    );
+
+    let edit = app
+        .book_bookmark_title_edit
+        .as_ref()
+        .expect("bookmark title editor must remain active");
+    let field_id = crate::ui_adjustment_panel::book_bookmark_title_edit_widget_id(edit.id);
+    assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
+}
+
+fn run_bookmark_title_key_pass(
+    app: &mut App,
+    ctx: &egui::Context,
+    fs_idx: usize,
+    key: egui::Key,
+) -> crate::ui_fullscreen::FsKeyAction {
+    ctx.begin_pass(egui::RawInput {
+        events: vec![fullscreen_fixed_key_event(key)],
+        ..Default::default()
+    });
+    let pending_before_owner = app.pending_text_input_focus.get();
+    let focused_before_owner = ctx.memory(|memory| memory.focused());
+    let pass_before_owner = ctx.cumulative_pass_nr();
+    let owner = app.keyboard_owner_for_pass(ctx);
+    assert!(
+        matches!(
+            owner,
+            crate::keyboard_input::KeyboardOwner::TextInput { .. }
+        ),
+        "bookmark editor key pass must be text-owned, got {owner:?}; pending={pending_before_owner:?} focused={focused_before_owner:?} pass={pass_before_owner}"
+    );
+    let action = app.handle_fs_key_input(ctx, fs_idx, false);
+    draw_bookmark_title_editor(app, ctx);
+    let _ = ctx.end_pass();
+    action
+}
+
+#[test]
+fn focused_bookmark_title_escape_does_not_close_fullscreen() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    start_bookmark_title_edit_after_handler(&mut app, &ctx, fs_idx);
+    focus_bookmark_title_editor(&mut app, &ctx, fs_idx);
+
+    let action = run_bookmark_title_key_pass(&mut app, &ctx, fs_idx, egui::Key::Escape);
+
+    assert_no_fullscreen_fixed_key_action(action);
+}
+
+#[test]
+fn focused_bookmark_title_arrows_do_not_navigate_fullscreen() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    start_bookmark_title_edit_after_handler(&mut app, &ctx, fs_idx);
+    focus_bookmark_title_editor(&mut app, &ctx, fs_idx);
+
+    for key in [
+        egui::Key::ArrowLeft,
+        egui::Key::ArrowRight,
+        egui::Key::ArrowUp,
+        egui::Key::ArrowDown,
+    ] {
+        let action = run_bookmark_title_key_pass(&mut app, &ctx, fs_idx, key);
+
+        assert_no_fullscreen_fixed_key_action(action);
+    }
+}
+
+#[test]
+fn pending_bookmark_title_focus_blocks_escape_and_arrows_before_request_focus_lands() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    for key in [
+        egui::Key::Escape,
+        egui::Key::ArrowLeft,
+        egui::Key::ArrowRight,
+        egui::Key::ArrowUp,
+        egui::Key::ArrowDown,
+    ] {
+        let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+        start_bookmark_title_edit_after_handler(&mut app, &ctx, fs_idx);
+
+        let action = run_bookmark_title_key_pass(&mut app, &ctx, fs_idx, key);
+
+        assert_no_fullscreen_fixed_key_action(action);
+    }
+}
+
+#[test]
+fn focused_slider_still_allows_fullscreen_arrow_navigation() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    let mut value = 0.5_f32;
+    ctx.begin_pass(Default::default());
+    egui::CentralPanel::default().show(&ctx, |ui| {
+        ui.add(egui::Slider::new(&mut value, 0.0..=1.0))
+            .request_focus();
+    });
+    let _ = ctx.end_pass();
+    assert!(ctx.wants_keyboard_input());
+
+    ctx.begin_pass(egui::RawInput {
+        events: vec![fullscreen_fixed_key_event(egui::Key::ArrowRight)],
+        ..Default::default()
+    });
+    let owner = app.keyboard_owner_for_pass(&ctx);
+    assert!(matches!(
+        owner,
+        crate::keyboard_input::KeyboardOwner::FocusedUi { .. }
+    ));
+    let action = app.handle_fs_key_input(&ctx, fs_idx, false);
+    let _ = ctx.end_pass();
+
+    assert!(!action.page_nav.is_none());
+}
+
+#[test]
+fn bookmark_title_draft_without_focus_or_ime_allows_fullscreen_arrows() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    app.book_bookmark_title_edit = Some(BookBookmarkTitleEdit {
+        id: 42,
+        title: String::from("draft only"),
+        request_focus: false,
+    });
+    ctx.begin_pass(egui::RawInput {
+        events: vec![fullscreen_fixed_key_event(egui::Key::ArrowRight)],
+        ..Default::default()
+    });
+
+    let action = app.handle_fs_key_input(&ctx, fs_idx, false);
+    let _ = ctx.end_pass();
+
+    assert!(!action.page_nav.is_none());
+}
+
+fn viewport_raw_input(viewport: egui::ViewportId, events: Vec<egui::Event>) -> egui::RawInput {
+    let mut input = egui::RawInput {
+        viewport_id: viewport,
+        events,
+        ..Default::default()
+    };
+    input.viewports.insert(
+        viewport,
+        egui::ViewportInfo {
+            parent: Some(egui::ViewportId::ROOT),
+            focused: Some(true),
+            ..Default::default()
+        },
+    );
+    input
+}
+
+#[test]
+fn destroyed_ime_viewport_does_not_block_sibling_fullscreen_shortcuts() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    let viewport_a = egui::ViewportId::from_hash_of("ime-owner-a");
+    let viewport_b = egui::ViewportId::from_hash_of("ime-owner-b");
+
+    ctx.begin_pass(viewport_raw_input(
+        viewport_a,
+        vec![egui::Event::Ime(egui::ImeEvent::Enabled)],
+    ));
+    app.update_ime_state(&ctx);
+    assert!(app.ime_input_active(&ctx));
+    let _ = ctx.end_pass();
+
+    ctx.begin_pass(viewport_raw_input(
+        viewport_b,
+        vec![fullscreen_fixed_key_event(egui::Key::ArrowRight)],
+    ));
+    let action = app.handle_fs_key_input(&ctx, fs_idx, false);
+    let _ = ctx.end_pass();
+
+    assert!(!action.page_nav.is_none());
+}
+
+#[test]
+fn ime_activity_recovers_when_enabled_viewport_disappears_without_terminal_event() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, _fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    let viewport_a = egui::ViewportId::from_hash_of("ime-recovery-a");
+    let viewport_b = egui::ViewportId::from_hash_of("ime-recovery-b");
+
+    ctx.begin_pass(viewport_raw_input(
+        viewport_a,
+        vec![egui::Event::Ime(egui::ImeEvent::Enabled)],
+    ));
+    app.update_ime_state(&ctx);
+    assert!(app.ime_input_active(&ctx));
+    let _ = ctx.end_pass();
+
+    ctx.begin_pass(viewport_raw_input(viewport_b, Vec::new()));
+    app.update_ime_state(&ctx);
+    assert!(!app.ime_input_active(&ctx));
+    let _ = ctx.end_pass();
 }
 
 #[test]

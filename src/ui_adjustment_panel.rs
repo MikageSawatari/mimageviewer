@@ -9025,6 +9025,16 @@ fn draw_bookmark_title_edit(
     (response, submit)
 }
 
+#[cfg(test)]
+pub(crate) fn draw_bookmark_title_edit_for_test(
+    ui: &mut egui::Ui,
+    bookmark_id: i64,
+    title: &mut String,
+    request_focus: &mut bool,
+) -> (egui::Response, bool) {
+    draw_bookmark_title_edit(ui, bookmark_id, title, request_focus, false)
+}
+
 fn bookmark_row_should_jump(
     row_contains_pointer: bool,
     primary_clicked: bool,
