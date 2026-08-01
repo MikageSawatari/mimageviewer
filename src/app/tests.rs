@@ -45872,6 +45872,7 @@ mod rating_write_failure_tests {
     fn compiled_book_page_rating_undo_redo_never_starts_xmp_writer() {
         let mut app = setup_app();
         app.settings.write_rating_to_xmp = true;
+        app.settings.book_root = Some(app.tmp.path().join("books"));
         let book_folder = crate::books::book_folder(&app.book_root_path(), "XmpUndoBook");
         std::fs::create_dir_all(&book_folder).unwrap();
         let page = book_folder.join("page.jpg");
