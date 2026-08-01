@@ -353,7 +353,7 @@ fn candidate_from_grid_item(
     })
 }
 
-fn aggregate_thumb_aspect_height_ratio(settings: &Settings) -> f64 {
+pub(super) fn aggregate_thumb_aspect_height_ratio(settings: &Settings) -> f64 {
     if settings.thumb_aspect_auto {
         1.0
     } else {

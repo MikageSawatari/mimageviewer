@@ -56,12 +56,23 @@ test("the online-only remote shell does not register a service worker", async ()
 
 test("safe areas protect portrait bars and landscape side controls", async () => {
   const css = await readFile(new URL("styles.css", here), "utf8");
+  const app = await readFile(new URL("app.js", here), "utf8");
+  assert.match(css, /\.topbar[\s\S]*safe-area-inset-top[\s\S]*safe-area-inset-right[\s\S]*safe-area-inset-left/);
+  assert.match(css, /\.page-content[\s\S]*safe-area-inset-top[\s\S]*safe-area-inset-right[\s\S]*safe-area-inset-bottom[\s\S]*safe-area-inset-left/);
   assert.match(css, /\.viewer-ui[\s\S]*safe-area-inset-right[\s\S]*safe-area-inset-left/);
   assert.match(css, /\.viewer-ui\.top[\s\S]*safe-area-inset-top/);
   assert.match(css, /\.viewer-ui\.bottom[\s\S]*safe-area-inset-bottom/);
   assert.match(css, /\.viewer-seek[\s\S]*safe-area-inset-left[\s\S]*safe-area-inset-right/);
   assert.match(css, /\.command-menu[\s\S]*safe-area-inset-right[\s\S]*safe-area-inset-bottom[\s\S]*safe-area-inset-left/);
   assert.match(css, /\.virtual-window[\s\S]*safe-area-inset-right[\s\S]*safe-area-inset-left/);
+  assert.match(app, /--grid-inline-inset/);
+  assert.doesNotMatch(app, /windowElement\.style\.(?:left|right)\s*=/);
+  assert.doesNotMatch(css, /\.screen > \.topbar > :not\(\.menu-trigger\)/);
+});
+
+test("container page tiles preserve the whole page shape", async () => {
+  const css = await readFile(new URL("styles.css", here), "utf8");
+  assert.match(css, /\.grid-tile\.page-tile \.tile-preview img\s*\{[^}]*object-fit:\s*contain/);
 });
 
 async function pngDimensions(relativePath) {

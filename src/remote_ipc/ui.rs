@@ -6,7 +6,10 @@ use mimageviewer_ipc::{
 use qrcode::{Color, QrCode};
 
 use super::path_guard::logical_favorite_path;
-use super::session::{ActiveSessionSnapshot, ClaimedRemoteWrite, SessionHandle, UiWriteOutcome};
+use super::session::{
+    ActiveSessionSnapshot, ClaimedRemoteUiRequest, ClaimedRemoteWrite, SessionHandle,
+    UiWriteOutcome,
+};
 
 #[derive(Default)]
 pub(crate) struct RemoteSessionUiState {
@@ -92,7 +95,7 @@ impl crate::app::App {
     pub(crate) fn poll_remote_session(&mut self, ctx: &egui::Context) {
         if let Some(handle) = self.remote_session_ui.handle.clone() {
             handle.install_repaint_context(ctx);
-            self.apply_pending_remote_writes(&handle);
+            self.apply_pending_remote_ui_requests(&handle);
         }
         let snapshot = self
             .remote_session_ui
@@ -125,23 +128,42 @@ impl crate::app::App {
         }
     }
 
-    fn apply_pending_remote_writes(&mut self, handle: &SessionHandle) {
-        for pending in handle.take_pending_writes() {
-            let ownership = pending.ownership_response();
-            if ownership.status != SessionStatus::Active {
-                pending.complete(UiWriteOutcome::Session(ownership));
-                continue;
+    fn apply_pending_remote_ui_requests(&mut self, handle: &SessionHandle) {
+        for pending in handle.take_pending_ui_requests() {
+            match pending {
+                ClaimedRemoteUiRequest::Write(pending) => self.apply_pending_remote_write(pending),
+                ClaimedRemoteUiRequest::BookResumeRead(pending) => {
+                    let latest = self.last_book_resume.as_ref().and_then(|(path, page)| {
+                        (crate::path_key::normalize(path)
+                            == crate::path_key::normalize(pending.path()))
+                        .then_some(*page)
+                    });
+                    let page = latest.or_else(|| {
+                        self.book_resume_db
+                            .as_ref()
+                            .and_then(|db| db.get(pending.path()))
+                    });
+                    pending.complete(page);
+                }
             }
-            if matches!(
-                pending.request(),
-                RemoteWriteRequest::SetBookmark { .. } | RemoteWriteRequest::GetItemState { .. }
-            ) {
-                self.begin_remote_bookmark_write(pending);
-                continue;
-            }
-            let response = self.apply_remote_write(pending.request());
-            pending.complete(UiWriteOutcome::Write(response));
         }
+    }
+
+    fn apply_pending_remote_write(&mut self, pending: ClaimedRemoteWrite) {
+        let ownership = pending.ownership_response();
+        if ownership.status != SessionStatus::Active {
+            pending.complete(UiWriteOutcome::Session(ownership));
+            return;
+        }
+        if matches!(
+            pending.request(),
+            RemoteWriteRequest::SetBookmark { .. } | RemoteWriteRequest::GetItemState { .. }
+        ) {
+            self.begin_remote_bookmark_write(pending);
+            return;
+        }
+        let response = self.apply_remote_write(pending.request());
+        pending.complete(UiWriteOutcome::Write(response));
     }
 
     fn apply_remote_write(&mut self, request: &RemoteWriteRequest) -> RemoteWriteResponse {

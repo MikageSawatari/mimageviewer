@@ -861,6 +861,17 @@ function dispatchCommand(requested, meta = {}) {
         : homeHash("favorites");
     navigate(target);
     handled = true;
+  } else if (
+    requested.name === CommandName.OPEN_HOME &&
+    state.screenContext === "grid"
+  ) {
+    const tab = state.collection?.kind === "smart"
+      ? "smart"
+      : state.favoriteId
+        ? "favorites"
+        : "places";
+    navigate(homeHash(tab));
+    handled = true;
   } else if (requested.name === CommandName.OPEN) {
     handled = executeOpenCommand(requested.payload, meta);
   } else if (
@@ -1457,8 +1468,44 @@ async function showFolder(favoriteId, path) {
 
 async function showContainer(address) {
   renderLoading("コンテナを読み込んでいます");
-  await loadContainer(address);
-  renderFolder();
+  const loaded = await loadContainer(address);
+  if (!loaded) return;
+  const initialImageIndex = containerInitialImageIndex({
+    openMode: state.container?.openMode,
+    resumePage: state.container?.resumePage,
+    images: state.images,
+  });
+  const gridAlreadyShown =
+    history.state?.containerGridReady === state.gridHash;
+  if (initialImageIndex < 0 || gridAlreadyShown) {
+    renderFolder();
+    return;
+  }
+
+  const entry = state.images[initialImageIndex];
+  history.replaceState(
+    {
+      ...(history.state ?? {}),
+      mivRoute: true,
+      containerGridReady: state.gridHash,
+    },
+    "",
+    location.hash
+  );
+  tryEnterBrowserFullscreen();
+  history.pushState(
+    {
+      mivRoute: true,
+      navigatedInApp: true,
+      viewerFromGrid: true,
+      viewerDepth: 1,
+      returnHash: state.gridHash,
+      autoOpenedContainer: true,
+    },
+    "",
+    mediaHash(entryAddress(entry))
+  );
+  renderImageViewer(initialImageIndex, performance.now());
 }
 
 async function loadContainer(address, options = {}) {
@@ -1511,6 +1558,8 @@ function applyContainerData(address, data, forceSinglePage, options = {}) {
     effectiveSpreadMode: data.effective_spread_mode ?? SpreadMode.SINGLE,
     readingDirection: data.reading_direction ?? ReadingDirection.LTR,
     forceSinglePage,
+    resumePage: data.resume_page ?? null,
+    openMode: data.open_mode ?? "grid",
   };
   state.favoriteId = effectiveAddress.favorite_id;
   state.favoriteName =
@@ -1519,20 +1568,44 @@ function applyContainerData(address, data, forceSinglePage, options = {}) {
   state.folderPath = effectiveAddress.relative_path;
   state.entries = data.entries ?? [];
   state.images = state.entries.filter((entry) => entry.kind === "image");
+  state.thumbAspectHeightRatio =
+    Number.isFinite(Number(data.thumb_aspect_height_ratio)) &&
+    Number(data.thumb_aspect_height_ratio) > 0
+      ? Number(data.thumb_aspect_height_ratio)
+      : 1;
   state.spreadMode = state.container.configuredSpreadMode;
   state.effectiveSpreadMode = state.container.effectiveSpreadMode;
   state.readingDirection = state.container.readingDirection;
   state.spreadPageGapPx = Math.max(0, Number(data.spread_page_gap_px) || 0);
   state.forceSinglePage = forceSinglePage;
   setContainerPageGroups(data.page_groups ?? []);
+  const resumeEntryIndex = state.container.resumePage
+    ? state.entries.findIndex(
+        (entry) =>
+          addressIdentity(entryAddress(entry)) ===
+          addressIdentity(state.container.resumePage)
+      )
+    : -1;
   state.gridIndex = Number.isInteger(options.gridIndex)
     ? clamp(options.gridIndex, 0, Math.max(0, state.entries.length - 1))
-    : 0;
+    : Math.max(0, resumeEntryIndex);
   state.gridHash =
     data.kind === "folder"
       ? folderHash(effectiveAddress.favorite_id, effectiveAddress.relative_path)
       : containerHash(effectiveAddress);
   state.gridReturnHash = containerParentHash(address);
+}
+
+export function containerInitialImageIndex({ openMode, resumePage, images }) {
+  if (openMode === "grid" || !images.length) return -1;
+  if (openMode === "resume_page" && resumePage) {
+    const resumeIndex = images.findIndex(
+      (entry) =>
+        addressIdentity(entryAddress(entry)) === addressIdentity(resumePage)
+    );
+    if (resumeIndex >= 0) return resumeIndex;
+  }
+  return 0;
 }
 
 function setSinglePageGroups() {
@@ -2008,16 +2081,25 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
 
   const screen = element("section", "screen");
   const topbar = element("header", "topbar");
-  const back = textElement("button", "‹", "icon-button");
-  back.type = "button";
-  back.setAttribute("aria-label", "戻る");
-  back.addEventListener("click", (event) => {
-    dispatchCommand(command(state.collection ? CommandName.BACK : CommandName.PARENT_FOLDER), {
+  const parent = textElement("button", "↑", "icon-button");
+  parent.type = "button";
+  parent.setAttribute("aria-label", "親フォルダへ");
+  parent.addEventListener("click", (event) => {
+    dispatchCommand(command(CommandName.PARENT_FOLDER), {
       source: inputSourceFromEvent(event),
       detail: "toolbar",
     });
   });
-  topbar.append(back, buildBreadcrumbs(), createMenuButton("操作メニュー"));
+  const home = textElement("button", "⌂", "icon-button");
+  home.type = "button";
+  home.setAttribute("aria-label", "ホームへ");
+  home.addEventListener("click", (event) => {
+    dispatchCommand(command(CommandName.OPEN_HOME), {
+      source: inputSourceFromEvent(event),
+      detail: "toolbar",
+    });
+  });
+  topbar.append(parent, home, buildBreadcrumbs(), createMenuButton("操作メニュー"));
 
   const scroll = element("div", "grid-scroll");
   const thumbnailNotice = textElement("p", "", "thumbnail-service-notice");
@@ -2078,6 +2160,7 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
     (initialItems) => state.thumbnailTracker?.begin(initialItems),
     state.thumbAspectHeightRatio
   );
+  state.virtualGrid.focusIndex(state.gridIndex, false);
   if (listMetrics) {
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
@@ -2216,6 +2299,7 @@ function createGridTile(
   tile.type = "button";
   tile.title = entry.name;
   tile.dataset.entryIndex = String(entryIndex);
+  tile.classList.toggle("page-tile", Boolean(state.container) && entry.kind === "image");
   tile.classList.toggle("grid-active", entryIndex === state.gridIndex);
   tile.addEventListener("focus", () => {
     dispatchCommand(command(CommandName.GRID_SELECT, { index: entryIndex }), {
@@ -3138,8 +3222,10 @@ class VirtualGrid {
     );
     this.maxScrollOffset = extent.maxOffset;
     this.space.style.height = `${extent.totalHeight}px`;
-    this.windowElement.style.left = `${layout.inset}px`;
-    this.windowElement.style.right = `${layout.inset}px`;
+    this.windowElement.style.setProperty(
+      "--grid-inline-inset",
+      `${layout.inset}px`
+    );
     this.windowElement.style.gap = `${layout.gap}px`;
     this.windowElement.style.setProperty(
       "--grid-preview-height",
@@ -3366,61 +3452,105 @@ function createMenuButton(label, extraClass = "icon-button") {
   return button;
 }
 
-function menuDefinition(context) {
-  if (context === "viewer") {
-    const spreadActions = state.container
-      ? [
-          [CommandName.SPREAD_CYCLE, "見開きモードを切替", "メニュー"],
-          [CommandName.SPREAD_SINGLE, "1ページ表示", "1"],
-          [CommandName.SPREAD_LTR, "見開き 左→右", "2"],
-          [CommandName.SPREAD_LTR_COVER, "見開き 左→右 (表紙あり)", "3"],
-          [CommandName.SPREAD_RTL, "見開き 右→左", "4"],
-          [CommandName.SPREAD_RTL_COVER, "見開き 右→左 (表紙あり)", "5"],
-        ]
-      : [];
-    return {
+const MenuPageAction = Object.freeze({
+  BACK: "menu_page_back",
+  RATING: "menu_page_rating",
+  DISPLAY: "menu_page_display",
+  SPREAD: "menu_page_spread",
+  POSITION: "menu_page_position",
+});
+
+export const VIEWER_MENU_MAX_ACTIONS = 11;
+
+export function viewerMenuDefinitions({ hasContainer, barsVisible }) {
+  const back = [MenuPageAction.BACK, "操作メニューへ戻る", "戻る"];
+  const mainActions = [
+    [CommandName.TOGGLE_BOOKMARK, "ブックマークを読み込み中…", "現在のページ"],
+    [MenuPageAction.RATING, "レーティング", "★を選択", { menuPage: "rating" }],
+    [MenuPageAction.DISPLAY, "表示サイズ", "フィット / 原寸", { menuPage: "display" }],
+    ...(hasContainer
+      ? [[MenuPageAction.SPREAD, "見開き設定", "1〜5", { menuPage: "spread" }]]
+      : []),
+    [
+      CommandName.TOGGLE_VIEWER_BARS,
+      barsVisible ? "上下バーを隠す" : "上下バーを表示",
+      "中央タップ",
+    ],
+    [CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"],
+    [MenuPageAction.POSITION, "ページ位置", "先頭 / 最後", { menuPage: "position" }],
+    [CommandName.BACK, "一覧へ戻る", "Backspace / Enter / Esc"],
+    [CommandName.OPEN_LOCAL_SETTINGS, "端末の設定", "メニュー"],
+    [CommandName.OPEN_GESTURE_HELP, "操作方法を見る", "メニュー"],
+    [CommandName.RELOAD_APP, "再読み込み", "メニュー"],
+  ];
+  return {
+    main: {
       title: "画像の操作",
-      actions: [
-        [CommandName.PREV_PAGE, "前の画像", "← / ↑ / PageUp"],
-        [CommandName.NEXT_PAGE, "次の画像", "→ / ↓ / PageDown"],
-        [CommandName.ZOOM_IN, "拡大", "+"],
-        [CommandName.ZOOM_OUT, "縮小", "−"],
-        [CommandName.ZOOM_RESET, "ズームを戻す", "メニュー"],
-        [
-          CommandName.TOGGLE_VIEWER_BARS,
-          state.viewerBarsVisible ? "上下バーを隠す" : "上下バーを表示",
-          "中央タップ",
-        ],
-        [CommandName.FIT_PAGE, "全体フィット", "0 で切替"],
-        [CommandName.FIT_WIDTH, "幅フィット", "0 で切替"],
-        [CommandName.FIT_ORIGINAL, "原寸 (100%)", "0 で切替"],
-        [CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"],
-        ...spreadActions,
-        ...[0, 1, 2, 3, 4, 5].map((stars) => [
-          CommandName.SET_RATING,
-          stars === 0 ? "★0 レーティング解除" : `★${stars} レーティング`,
-          stars === 0 ? "0 = 解除" : `★${stars}`,
-          { stars },
-        ]),
-        [CommandName.TOGGLE_BOOKMARK, "ブックマークを読み込み中…", "現在のページ"],
-        [CommandName.FIRST_PAGE, "先頭の画像", "Home"],
-        [CommandName.LAST_PAGE, "最後の画像", "End"],
-        [CommandName.BACK, "一覧へ戻る", "Backspace / Enter / Esc"],
-        [CommandName.OPEN_LOCAL_SETTINGS, "端末の設定", "メニュー"],
-        [CommandName.OPEN_GESTURE_HELP, "操作方法を見る", "メニュー"],
-        [CommandName.RELOAD_APP, "再読み込み", "メニュー"],
-      ],
+      actions: mainActions,
       shortcuts: [
         ["前 / 次", "← ↑ PageUp / → ↓ PageDown"],
         ["ズーム", "+ / −"],
         ["表示モード", "0 (全体 → 幅 → 原寸)"],
-        ...(state.container ? [["見開き", "1〜5 (単 / LTR / LTR表紙 / RTL / RTL表紙)"]] : []),
+        ...(hasContainer
+          ? [["見開き", "1〜5 (単 / LTR / LTR表紙 / RTL / RTL表紙)"]]
+          : []),
         ["操作メニュー", "?"],
         ["先頭 / 最後", "Home / End"],
         ["一覧へ戻る", "Backspace / Enter / Esc"],
         ["全画面", "F11"],
       ],
-    };
+    },
+    rating: {
+      title: "レーティング",
+      actions: [
+        back,
+        ...[0, 1, 2, 3, 4, 5].map((stars) => [
+          CommandName.SET_RATING,
+          stars === 0 ? "レーティングを解除" : `★${stars}`,
+          stars === 0 ? "0" : `★${stars}`,
+          { stars },
+        ]),
+      ],
+    },
+    display: {
+      title: "表示サイズ",
+      actions: [
+        back,
+        [CommandName.ZOOM_RESET, "ズームを戻す", "メニュー"],
+        [CommandName.FIT_PAGE, "全体フィット", "0 で切替"],
+        [CommandName.FIT_WIDTH, "幅フィット", "0 で切替"],
+        [CommandName.FIT_ORIGINAL, "原寸 (100%)", "0 で切替"],
+      ],
+    },
+    spread: {
+      title: "見開き設定",
+      actions: [
+        back,
+        [CommandName.SPREAD_SINGLE, "1ページ表示", "1"],
+        [CommandName.SPREAD_LTR, "見開き 左→右", "2"],
+        [CommandName.SPREAD_LTR_COVER, "見開き 左→右 (表紙あり)", "3"],
+        [CommandName.SPREAD_RTL, "見開き 右→左", "4"],
+        [CommandName.SPREAD_RTL_COVER, "見開き 右→左 (表紙あり)", "5"],
+      ],
+    },
+    position: {
+      title: "ページ位置",
+      actions: [
+        back,
+        [CommandName.FIRST_PAGE, "先頭の画像", "Home"],
+        [CommandName.LAST_PAGE, "最後の画像", "End"],
+      ],
+    },
+  };
+}
+
+function menuDefinition(context, page = "main") {
+  if (context === "viewer") {
+    const definitions = viewerMenuDefinitions({
+      hasContainer: Boolean(state.container),
+      barsVisible: state.viewerBarsVisible,
+    });
+    return definitions[page] ?? definitions.main;
   }
   if (context === "grid") {
     return {
@@ -3470,8 +3600,9 @@ class CommandMenu {
     this.actionLabels = new Map();
     this.ratingActions = new Map();
     this.bookmarkAction = null;
+    this.ratingSummaryAction = null;
     this.keyboardElements = [];
-    const definition = menuDefinition(context);
+    const definition = menuDefinition(context, "main");
     this.root = element("div", "command-menu-layer");
     this.root.hidden = true;
 
@@ -3483,17 +3614,44 @@ class CommandMenu {
     const panel = element("section", "command-menu");
     panel.setAttribute("role", "dialog");
     panel.setAttribute("aria-modal", "true");
-    panel.setAttribute("aria-label", definition.title);
+    this.panel = panel;
     const header = element("header", "command-menu-header");
     const close = textElement("button", "×", "command-menu-close");
     close.type = "button";
     close.setAttribute("aria-label", "操作メニューを閉じる");
     close.addEventListener("click", (event) => menuCommand(event, CommandName.TOGGLE_MENU));
-    header.append(textElement("h2", definition.title), close);
+    const title = textElement("h2", definition.title);
+    header.append(title, close);
+    this.title = title;
     this.closeButton = close;
 
     const actions = element("div", "command-menu-actions");
     actions.setAttribute("role", "menu");
+    this.actions = actions;
+
+    const shortcutTitle = textElement("h3", "有効なキー", "command-shortcut-title");
+    const shortcuts = element("dl", "command-shortcuts");
+    for (const [label, keys] of definition.shortcuts ?? []) {
+      shortcuts.append(textElement("dt", label), textElement("dd", keys));
+    }
+    this.shortcutElements = [shortcutTitle, shortcuts];
+    panel.append(header, actions, shortcutTitle, shortcuts);
+    this.root.append(scrim, panel);
+    host.append(this.root);
+    this.showPage("main");
+  }
+
+  showPage(page) {
+    const definition = menuDefinition(this.context, page);
+    this.currentPage = page;
+    this.title.textContent = definition.title;
+    this.panel.setAttribute("aria-label", definition.title);
+    this.actionLabels.clear();
+    this.ratingActions.clear();
+    this.bookmarkAction = null;
+    this.ratingSummaryAction = null;
+    this.keyboardElements = [...this.shortcutElements];
+    const buttons = [];
     for (const [name, label, keys, payload = {}] of definition.actions) {
       const button = element("button", "command-menu-action");
       button.type = "button";
@@ -3507,29 +3665,33 @@ class CommandMenu {
       } else if (name === CommandName.TOGGLE_BOOKMARK) {
         this.bookmarkAction = { button, label: actionLabel };
         button.disabled = true;
+      } else if (name === MenuPageAction.RATING) {
+        this.ratingSummaryAction = { button, label: actionLabel };
       }
       this.keyboardElements.push(keyHint);
       button.append(actionLabel, keyHint);
       button.addEventListener("click", (event) => {
+        if (payload.menuPage) {
+          this.showPage(payload.menuPage);
+          return;
+        }
+        if (name === MenuPageAction.BACK) {
+          this.showPage("main");
+          return;
+        }
         this.close(false);
         menuCommand(event, name, payload);
       });
-      actions.append(button);
+      buttons.push(button);
     }
-
-    const shortcutTitle = textElement("h3", "有効なキー", "command-shortcut-title");
-    const shortcuts = element("dl", "command-shortcuts");
-    for (const [label, keys] of definition.shortcuts) {
-      shortcuts.append(textElement("dt", label), textElement("dd", keys));
-    }
-    this.keyboardElements.push(shortcutTitle, shortcuts);
+    this.actions.replaceChildren(...buttons);
     this.setKeyboardAvailable(shouldShowKeyboardShortcuts({
       coarsePointer: state.coarsePointer,
       keyboardUsed: state.keyboardInputSeen,
     }));
-    panel.append(header, actions, shortcutTitle, shortcuts);
-    this.root.append(scrim, panel);
-    host.append(this.root);
+    if (this.context === "viewer") {
+      this.setItemState(state.viewerItemState, state.viewerItemState === null);
+    }
   }
 
   isOpen() {
@@ -3556,8 +3718,17 @@ class CommandMenu {
   setItemState(itemState, loading = false) {
     for (const [stars, action] of this.ratingActions) {
       action.button.disabled = loading || !itemState;
-      const base = stars === 0 ? "★0 レーティング解除" : `★${stars} レーティング`;
+      const base = stars === 0 ? "レーティングを解除" : `★${stars}`;
       action.label.textContent = itemState?.rating === stars ? `${base}（現在）` : base;
+    }
+    if (this.ratingSummaryAction) {
+      this.ratingSummaryAction.label.textContent = loading
+        ? "レーティング（読み込み中…）"
+        : !itemState
+          ? "レーティング"
+          : itemState.rating > 0
+            ? `レーティング（★${itemState.rating}）`
+            : "レーティング（なし）";
     }
     if (!this.bookmarkAction) return;
     this.bookmarkAction.button.disabled =
@@ -3575,6 +3746,7 @@ class CommandMenu {
 
   open() {
     if (this.opened) return;
+    this.showPage("main");
     this.opened = true;
     this.previousFocus = document.activeElement;
     this.root.hidden = false;

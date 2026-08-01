@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -328,6 +328,18 @@ pub enum ContainerEntryKind {
     Image,
 }
 
+/// ローカルの明示的なコンテナ open と同じ初期遷移。
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerOpenMode {
+    /// ページ一覧を表示し、保存済み位置があれば選択だけを復元する。
+    Grid,
+    /// ビューアを先頭ページから開く。
+    FirstPage,
+    /// ビューアを保存済み位置から開く。無効・未登録なら先頭へフォールバックする。
+    ResumePage,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ContainerEntry {
     pub address: RemoteAddress,
@@ -344,13 +356,19 @@ pub struct PageGroup {
     pub pages: Vec<RemoteAddress>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ContainerPayload {
     pub title: String,
     pub kind: ContainerKind,
     /// ZIP の単一ラッパー自動降下後など、実際に表示している位置。
     pub effective_address: RemoteAddress,
     pub entries: Vec<ContainerEntry>,
+    /// ローカル一覧のサムネイルセルに使う高さ / 幅比。
+    pub thumb_aspect_height_ratio: f64,
+    /// `book_resume.db` の index を現在の列挙結果で検証し、ページ address に解決した値。
+    pub resume_page: Option<RemoteAddress>,
+    /// ローカルの auto-fullscreen と `book_open_resume` から解決した初期遷移。
+    pub open_mode: ContainerOpenMode,
     /// spread.db または session override から解決したモード。縦持ちでも保持する。
     pub configured_spread_mode: RemoteSpreadMode,
     /// 実際に `page_groups` を構成したモード。縦持ちは `Single`。
@@ -363,7 +381,7 @@ pub struct ContainerPayload {
     pub truncated: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum ContainerResponse {
     Success(ContainerPayload),
     Error(MediaError),
@@ -947,6 +965,9 @@ mod tests {
                 kind: ContainerKind::Pdf,
                 effective_address: container,
                 entries: Vec::new(),
+                thumb_aspect_height_ratio: 1.5,
+                resume_page: Some(page(1)),
+                open_mode: ContainerOpenMode::ResumePage,
                 configured_spread_mode: RemoteSpreadMode::RtlCover,
                 effective_spread_mode: RemoteSpreadMode::RtlCover,
                 reading_direction: RemoteReadingDirection::Rtl,

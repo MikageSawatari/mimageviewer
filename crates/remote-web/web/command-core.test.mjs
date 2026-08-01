@@ -65,6 +65,7 @@ test("viewer keys map to the shared page and menu commands", () => {
   assert.equal(commandFromKey(key("F11"), "viewer").name, CommandName.TOGGLE_FULLSCREEN);
   assert.equal(commandFromKey(key("i"), "viewer"), null);
   assert.equal(commandFromKey(key("+"), "viewer").name, CommandName.ZOOM_IN);
+  assert.equal(commandFromKey(key("-"), "viewer").name, CommandName.ZOOM_OUT);
   assert.equal(commandFromKey(key("0"), "viewer").name, CommandName.FIT_CYCLE);
   assert.equal(commandFromKey(key("1"), "viewer").name, CommandName.SPREAD_SINGLE);
   assert.equal(commandFromKey(key("5"), "viewer").name, CommandName.SPREAD_RTL_COVER);

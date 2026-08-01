@@ -27,6 +27,7 @@ export const CommandName = Object.freeze({
   BACK: "back",
   FORWARD: "forward",
   PARENT_FOLDER: "parent_folder",
+  OPEN_HOME: "open_home",
   OPEN: "open",
   OPEN_SELECTED: "open_selected",
   TOGGLE_FULLSCREEN: "toggle_fullscreen",

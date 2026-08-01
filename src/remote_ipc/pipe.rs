@@ -153,7 +153,10 @@ impl ServerGuard {
         let configured_worker_count = settings.parallelism.thread_count();
         let worker_count = remote_heavy_worker_count(configured_worker_count);
         let thumbnail_engine = Arc::new(ThumbnailEngine::new(settings.clone()));
-        let container_engine = Arc::new(ContainerEngine::new(settings.clone()));
+        let container_engine = Arc::new(ContainerEngine::new_with_session(
+            settings.clone(),
+            session_handle.clone(),
+        ));
         let collection_engine = Arc::new(CollectionEngine::new(settings));
         let (heavy_work_tx, heavy_work_rx) = mpsc::sync_channel::<Work>(HEAVY_WORK_QUEUE_CAPACITY);
         let heavy_work_rx = Arc::new(Mutex::new(heavy_work_rx));

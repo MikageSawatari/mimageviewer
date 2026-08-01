@@ -11,11 +11,11 @@ use mimageviewer_ipc::{
 
 pub(crate) const LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-pub(crate) const UI_WRITE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
-const UI_WRITE_QUEUE_CAPACITY: usize = 16;
-const WRITE_PENDING: u8 = 0;
-const WRITE_CLAIMED: u8 = 1;
-const WRITE_CANCELLED: u8 = 2;
+pub(crate) const UI_REQUEST_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
+const UI_REQUEST_QUEUE_CAPACITY: usize = 16;
+const UI_REQUEST_PENDING: u8 = 0;
+const UI_REQUEST_CLAIMED: u8 = 1;
+const UI_REQUEST_CANCELLED: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReleaseReason {
@@ -324,7 +324,7 @@ pub(crate) enum UiWriteOutcome {
     Session(SessionResponse),
 }
 
-struct WriteDispatch {
+struct UiRequestDispatch {
     state: AtomicU8,
 }
 
@@ -332,7 +332,18 @@ struct QueuedRemoteWrite {
     request: RemoteWriteRequest,
     operation: SessionOperation,
     reply: mpsc::SyncSender<UiWriteOutcome>,
-    dispatch: Arc<WriteDispatch>,
+    dispatch: Arc<UiRequestDispatch>,
+}
+
+struct QueuedBookResumeRead {
+    path: std::path::PathBuf,
+    reply: mpsc::SyncSender<Option<usize>>,
+    dispatch: Arc<UiRequestDispatch>,
+}
+
+enum QueuedRemoteUiRequest {
+    Write(QueuedRemoteWrite),
+    BookResumeRead(QueuedBookResumeRead),
 }
 
 pub(crate) struct ClaimedRemoteWrite {
@@ -341,28 +352,45 @@ pub(crate) struct ClaimedRemoteWrite {
     reply: mpsc::SyncSender<UiWriteOutcome>,
 }
 
+pub(crate) struct ClaimedBookResumeRead {
+    path: std::path::PathBuf,
+    reply: mpsc::SyncSender<Option<usize>>,
+}
+
+pub(crate) enum ClaimedRemoteUiRequest {
+    Write(ClaimedRemoteWrite),
+    BookResumeRead(ClaimedBookResumeRead),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UiReadError {
+    Busy,
+    Timeout,
+    Stopped,
+}
+
 #[derive(Clone)]
 pub(crate) struct SessionHandle {
     inner: Arc<Mutex<SessionStateMachine>>,
     origin: Instant,
     repaint: Arc<Mutex<Option<egui::Context>>>,
     remote_web_connections: Arc<Mutex<BTreeMap<u64, Option<RemoteWebConnectionInfo>>>>,
-    write_tx: mpsc::SyncSender<QueuedRemoteWrite>,
-    write_rx: Arc<Mutex<mpsc::Receiver<QueuedRemoteWrite>>>,
+    ui_request_tx: mpsc::SyncSender<QueuedRemoteUiRequest>,
+    ui_request_rx: Arc<Mutex<mpsc::Receiver<QueuedRemoteUiRequest>>>,
 }
 
-impl WriteDispatch {
+impl UiRequestDispatch {
     fn pending() -> Self {
         Self {
-            state: AtomicU8::new(WRITE_PENDING),
+            state: AtomicU8::new(UI_REQUEST_PENDING),
         }
     }
 
     fn try_claim(&self) -> bool {
         self.state
             .compare_exchange(
-                WRITE_PENDING,
-                WRITE_CLAIMED,
+                UI_REQUEST_PENDING,
+                UI_REQUEST_CLAIMED,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -372,8 +400,8 @@ impl WriteDispatch {
     fn cancel_pending(&self) -> bool {
         self.state
             .compare_exchange(
-                WRITE_PENDING,
-                WRITE_CANCELLED,
+                UI_REQUEST_PENDING,
+                UI_REQUEST_CANCELLED,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -400,16 +428,26 @@ impl ClaimedRemoteWrite {
     }
 }
 
+impl ClaimedBookResumeRead {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub(crate) fn complete(self, page: Option<usize>) {
+        let _ = self.reply.send(page);
+    }
+}
+
 impl SessionHandle {
     pub(crate) fn new() -> Self {
-        let (write_tx, write_rx) = mpsc::sync_channel(UI_WRITE_QUEUE_CAPACITY);
+        let (ui_request_tx, ui_request_rx) = mpsc::sync_channel(UI_REQUEST_QUEUE_CAPACITY);
         Self {
             inner: Arc::new(Mutex::new(SessionStateMachine::default())),
             origin: Instant::now(),
             repaint: Arc::new(Mutex::new(None)),
             remote_web_connections: Arc::new(Mutex::new(BTreeMap::new())),
-            write_tx,
-            write_rx: Arc::new(Mutex::new(write_rx)),
+            ui_request_tx,
+            ui_request_rx: Arc::new(Mutex::new(ui_request_rx)),
         }
     }
 
@@ -550,7 +588,7 @@ impl SessionHandle {
         request: RemoteWriteRequest,
         operation: SessionOperation,
     ) -> UiWriteOutcome {
-        self.submit_write_with_timeout(request, operation, UI_WRITE_ACCEPT_TIMEOUT)
+        self.submit_write_with_timeout(request, operation, UI_REQUEST_ACCEPT_TIMEOUT)
     }
 
     fn submit_write_with_timeout(
@@ -559,15 +597,15 @@ impl SessionHandle {
         operation: SessionOperation,
         timeout: Duration,
     ) -> UiWriteOutcome {
-        let dispatch = Arc::new(WriteDispatch::pending());
+        let dispatch = Arc::new(UiRequestDispatch::pending());
         let (reply, receiver) = mpsc::sync_channel(1);
-        let queued = QueuedRemoteWrite {
+        let queued = QueuedRemoteUiRequest::Write(QueuedRemoteWrite {
             request,
             operation,
             reply,
             dispatch: Arc::clone(&dispatch),
-        };
-        match self.write_tx.try_send(queued) {
+        });
+        match self.ui_request_tx.try_send(queued) {
             Ok(()) => self.notify_ui(),
             Err(mpsc::TrySendError::Full(_)) => return write_busy_outcome(),
             Err(mpsc::TrySendError::Disconnected(_)) => return write_stopped_outcome(),
@@ -585,23 +623,85 @@ impl SessionHandle {
         }
     }
 
-    pub(crate) fn take_pending_writes(&self) -> Vec<ClaimedRemoteWrite> {
+    /// App 所有の `book_resume_db` へ 1 件だけ問い合わせる。container worker は
+    /// DB 接続を開かず、この UI request と現在の外側 session operation を使う。
+    pub(crate) fn read_book_resume(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Option<usize>, UiReadError> {
+        self.read_book_resume_with_timeout(path, UI_REQUEST_ACCEPT_TIMEOUT)
+    }
+
+    fn read_book_resume_with_timeout(
+        &self,
+        path: &std::path::Path,
+        timeout: Duration,
+    ) -> Result<Option<usize>, UiReadError> {
+        let dispatch = Arc::new(UiRequestDispatch::pending());
+        let (reply, receiver) = mpsc::sync_channel(1);
+        let queued = QueuedRemoteUiRequest::BookResumeRead(QueuedBookResumeRead {
+            path: path.to_path_buf(),
+            reply,
+            dispatch: Arc::clone(&dispatch),
+        });
+        match self.ui_request_tx.try_send(queued) {
+            Ok(()) => self.notify_ui(),
+            Err(mpsc::TrySendError::Full(_)) => return Err(UiReadError::Busy),
+            Err(mpsc::TrySendError::Disconnected(_)) => return Err(UiReadError::Stopped),
+        }
+        match receiver.recv_timeout(timeout) {
+            Ok(page) => Ok(page),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(UiReadError::Stopped),
+            Err(mpsc::RecvTimeoutError::Timeout) if dispatch.cancel_pending() => {
+                Err(UiReadError::Timeout)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                receiver.recv().map_err(|_| UiReadError::Stopped)
+            }
+        }
+    }
+
+    pub(crate) fn take_pending_ui_requests(&self) -> Vec<ClaimedRemoteUiRequest> {
         let receiver = self
-            .write_rx
+            .ui_request_rx
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let mut claimed = Vec::new();
         while let Ok(queued) = receiver.try_recv() {
-            if queued.dispatch.try_claim() {
-                queued.operation.started();
-                claimed.push(ClaimedRemoteWrite {
-                    request: queued.request,
-                    operation: queued.operation,
-                    reply: queued.reply,
-                });
+            match queued {
+                QueuedRemoteUiRequest::Write(queued) if queued.dispatch.try_claim() => {
+                    queued.operation.started();
+                    claimed.push(ClaimedRemoteUiRequest::Write(ClaimedRemoteWrite {
+                        request: queued.request,
+                        operation: queued.operation,
+                        reply: queued.reply,
+                    }));
+                }
+                QueuedRemoteUiRequest::BookResumeRead(queued) if queued.dispatch.try_claim() => {
+                    claimed.push(ClaimedRemoteUiRequest::BookResumeRead(
+                        ClaimedBookResumeRead {
+                            path: queued.path,
+                            reply: queued.reply,
+                        },
+                    ));
+                }
+                QueuedRemoteUiRequest::Write(_) | QueuedRemoteUiRequest::BookResumeRead(_) => {}
             }
         }
         claimed
+    }
+
+    #[cfg(test)]
+    fn take_pending_writes(&self) -> Vec<ClaimedRemoteWrite> {
+        self.take_pending_ui_requests()
+            .into_iter()
+            .map(|request| match request {
+                ClaimedRemoteUiRequest::Write(write) => write,
+                ClaimedRemoteUiRequest::BookResumeRead(_) => {
+                    panic!("book resume read reached a write-only test")
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn install_repaint_context(&self, ctx: &egui::Context) {
@@ -1038,6 +1138,32 @@ mod tests {
                 UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
             ));
         }
+    }
+
+    #[test]
+    fn book_resume_read_reaches_the_same_bounded_ui_queue() {
+        let handle = SessionHandle::new();
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        let worker_handle = handle.clone();
+        let worker = std::thread::spawn(move || {
+            worker_handle.read_book_resume(std::path::Path::new("C:/books/book.zip"))
+        });
+
+        let claimed = loop {
+            if let Some(request) = handle.take_pending_ui_requests().pop() {
+                break request;
+            }
+            std::thread::yield_now();
+        };
+        let ClaimedRemoteUiRequest::BookResumeRead(read) = claimed else {
+            panic!("book resume read was routed as a write")
+        };
+        assert_eq!(read.path(), std::path::Path::new("C:/books/book.zip"));
+        read.complete(Some(7));
+        assert_eq!(worker.join().unwrap(), Ok(Some(7)));
     }
 
     #[test]

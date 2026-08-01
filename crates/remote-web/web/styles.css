@@ -283,7 +283,8 @@ button {
   overflow: auto;
   min-height: 0;
   flex: 1;
-  padding: 18px max(14px, env(safe-area-inset-right))
+  padding: max(18px, env(safe-area-inset-top))
+    max(14px, env(safe-area-inset-right))
     calc(24px + env(safe-area-inset-bottom))
     max(14px, env(safe-area-inset-left));
   overscroll-behavior: contain;
@@ -505,9 +506,10 @@ button {
 .virtual-window {
   --grid-preview-height: 132px;
   --grid-label-height: 38px;
+  --grid-inline-inset: 10px;
   position: absolute;
-  right: max(10px, env(safe-area-inset-right));
-  left: max(10px, env(safe-area-inset-left));
+  right: calc(var(--grid-inline-inset) + env(safe-area-inset-right));
+  left: calc(var(--grid-inline-inset) + env(safe-area-inset-left));
   display: grid;
   gap: 12px;
   contain: layout paint style;
@@ -533,9 +535,7 @@ button {
 }
 
 .grid-tile.grid-active {
-  box-shadow: inset 0 0 0 2px var(--accent), 0 5px 18px rgb(0 0 0 / 18%);
-  outline: 3px solid rgb(124 196 255 / 28%);
-  outline-offset: 1px;
+  box-shadow: inset 0 0 0 3px var(--accent), 0 5px 18px rgb(0 0 0 / 18%);
 }
 
 .tile-preview {
@@ -562,6 +562,10 @@ button {
   opacity: 0;
   animation: none;
   transition: none;
+}
+
+.grid-tile.page-tile .tile-preview img {
+  object-fit: contain;
 }
 
 .tile-preview img.thumb-ready {
@@ -1129,9 +1133,14 @@ button {
   color: #dce2ec;
 }
 
-:is(button, .grid-tile):focus-visible {
+button:not(.grid-tile):focus-visible {
   outline: 3px solid var(--accent);
   outline-offset: 2px;
+}
+
+.grid-tile:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 3px var(--accent), 0 5px 18px rgb(0 0 0 / 18%);
 }
 
 @media (hover: hover) {
@@ -1145,26 +1154,25 @@ button {
 
 @media (max-width: 767px), (pointer: coarse) {
   .screen > .topbar {
-    position: fixed;
-    z-index: 10;
-    top: 0;
-    right: 0;
-    display: block;
-    min-height: 0;
-    padding: max(10px, env(safe-area-inset-top))
-      max(10px, env(safe-area-inset-right)) 0 0;
-    border: 0;
-    background: transparent;
-    pointer-events: none;
-    backdrop-filter: none;
+    gap: 6px;
+    padding-right: max(8px, env(safe-area-inset-right));
+    padding-left: max(8px, env(safe-area-inset-left));
   }
 
-  .screen > .topbar > :not(.menu-trigger) {
-    display: none;
+  .screen > .topbar .icon-button {
+    min-width: 40px;
+    min-height: 40px;
   }
 
-  .screen > .topbar > .menu-trigger {
-    pointer-events: auto;
+  .command-menu-actions {
+    gap: 6px;
+  }
+
+  .command-menu-action {
+    min-height: 46px;
+    gap: 3px;
+    padding: 7px 10px;
+    font-size: 0.9rem;
   }
 
   .gesture-help-grid {
@@ -1186,6 +1194,12 @@ button {
     border-width: 0 0 0 1px;
     border-radius: 0;
     box-shadow: -20px 0 70px rgb(0 0 0 / 38%);
+  }
+}
+
+@media (orientation: landscape) and (pointer: coarse) {
+  .command-menu-actions {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
 

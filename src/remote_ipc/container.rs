@@ -5,11 +5,11 @@ use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::Instant;
 
 use mimageviewer_ipc::{
-    ContainerEntry, ContainerEntryKind, ContainerKind, ContainerPayload, ContainerRequest,
-    ContainerResponse, MediaError, MediaErrorCode, PageGroup, PagePayload, PagePriority,
-    PageRequest, PageResponse, RemoteAddress, RemoteReadingDirection, RemoteSpreadMode,
-    RemoteSubresource, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, ThumbnailError,
-    ThumbnailErrorCode, ThumbnailResponse,
+    ContainerEntry, ContainerEntryKind, ContainerKind, ContainerOpenMode, ContainerPayload,
+    ContainerRequest, ContainerResponse, MediaError, MediaErrorCode, PageGroup, PagePayload,
+    PagePriority, PageRequest, PageResponse, RemoteAddress, RemoteReadingDirection,
+    RemoteSpreadMode, RemoteSubresource, RemoteWriteError, RemoteWriteErrorCode,
+    RemoteWriteRequest, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse,
 };
 
 use super::path_guard::{ResolveError, ResolvedFavoritePath, resolve_existing};
@@ -25,6 +25,23 @@ pub(super) struct ContainerEngine {
     pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
     pdf_page_counts: Mutex<HashMap<PdfIdentity, u32>>,
     spread_db: Mutex<Option<crate::spread_db::SpreadDb>>,
+    resume_reader: Option<ResumeReader>,
+}
+
+enum ResumeReader {
+    Session(super::session::SessionHandle),
+    #[cfg(test)]
+    Error(super::session::UiReadError),
+}
+
+impl ResumeReader {
+    fn read_book_resume(&self, path: &Path) -> Result<Option<usize>, super::session::UiReadError> {
+        match self {
+            Self::Session(session) => session.read_book_resume(path),
+            #[cfg(test)]
+            Self::Error(error) => Err(*error),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -61,7 +78,27 @@ struct RecomputedFolderListing {
 }
 
 impl ContainerEngine {
+    #[cfg(test)]
     pub(super) fn new(settings: crate::settings::Settings) -> Self {
+        Self::new_inner(settings, None)
+    }
+
+    pub(super) fn new_with_session(
+        settings: crate::settings::Settings,
+        session: super::session::SessionHandle,
+    ) -> Self {
+        Self::new_inner(settings, Some(ResumeReader::Session(session)))
+    }
+
+    #[cfg(test)]
+    fn new_with_resume_error(
+        settings: crate::settings::Settings,
+        error: super::session::UiReadError,
+    ) -> Self {
+        Self::new_inner(settings, Some(ResumeReader::Error(error)))
+    }
+
+    fn new_inner(settings: crate::settings::Settings, resume_reader: Option<ResumeReader>) -> Self {
         let spread_db_path = crate::data_dir::get().join("spread.db");
         let spread_db =
             match crate::spread_db::SpreadDb::open_existing_read_only_at(&spread_db_path) {
@@ -79,6 +116,7 @@ impl ContainerEngine {
             pdf_passwords: crate::pdf_passwords::PdfPasswordStore::load(),
             pdf_page_counts: Mutex::new(HashMap::new()),
             spread_db: Mutex::new(spread_db),
+            resume_reader,
         }
     }
 
@@ -720,6 +758,51 @@ impl ContainerEngine {
         }
     }
 
+    fn resume_page_for_items(
+        &self,
+        container: &RemoteAddress,
+        container_path: &Path,
+        items: &[crate::grid_item::GridItem],
+        resume_supported: bool,
+    ) -> Option<RemoteAddress> {
+        if !resume_supported {
+            return None;
+        }
+        let Some(reader) = self.resume_reader.as_ref() else {
+            return None;
+        };
+        let saved = match reader.read_book_resume(container_path) {
+            Ok(saved) => saved,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "remote_ipc: book resume read failed; falling back to first page error={error:?}"
+                ));
+                return None;
+            }
+        };
+        let Some(saved) = saved else {
+            return None;
+        };
+        let resolved = resolve_resume_page(container, items, saved);
+        if resolved.is_none() {
+            crate::logger::log(format!(
+                "remote_ipc: saved book resume is outside the current readable pages saved_index={saved} item_count={}",
+                items.len()
+            ));
+        }
+        resolved
+    }
+
+    fn container_open_mode(&self, auto_open: bool) -> ContainerOpenMode {
+        if !auto_open {
+            ContainerOpenMode::Grid
+        } else if self.settings.book_open_resume.resumes() {
+            ContainerOpenMode::ResumePage
+        } else {
+            ContainerOpenMode::FirstPage
+        }
+    }
+
     fn enumerate_folder(
         &self,
         request: &ContainerRequest,
@@ -734,11 +817,14 @@ impl ContainerEngine {
         let listing = self
             .recompute_folder_listing(&resolved.logical)
             .map_err(media_error_from_remote_write)?;
+        let resume_page =
+            self.resume_page_for_items(&request.address, &resolved.logical, &listing.items, true);
         let total = listing
             .items
             .iter()
             .filter(|item| matches!(item, crate::grid_item::GridItem::Image(_)))
             .count();
+        let auto_open = listing.image_only && self.settings.auto_fullscreen_image_folders_enabled();
         let items = listing
             .items
             .into_iter()
@@ -762,6 +848,11 @@ impl ContainerEngine {
             kind: ContainerKind::Folder,
             effective_address: request.address.clone(),
             entries,
+            thumb_aspect_height_ratio: super::collections::aggregate_thumb_aspect_height_ratio(
+                &self.settings,
+            ),
+            resume_page,
+            open_mode: self.container_open_mode(auto_open),
             configured_spread_mode: spread.configured,
             effective_spread_mode: spread.effective,
             reading_direction: spread.reading_direction,
@@ -823,10 +914,14 @@ impl ContainerEngine {
             ));
         }
         let effective_segments = tree.collapse_redundant(&requested_segments);
+        let root_segments = tree.collapse_redundant(&[]);
         let effective_prefix = zip_prefix(&effective_segments);
         let (items, _) =
             tree.materialize_level(&effective_segments, crate::app::BOOK_READING_PAGE_ORDER);
         let total = items.len();
+        let at_resume_root = effective_segments == root_segments;
+        let resume_page =
+            self.resume_page_for_items(address, &resolved.logical, &items, at_resume_root);
         let items = items
             .into_iter()
             .take(CONTAINER_ENTRY_LIMIT)
@@ -881,6 +976,13 @@ impl ContainerEngine {
                 },
             },
             entries,
+            thumb_aspect_height_ratio: super::collections::aggregate_thumb_aspect_height_ratio(
+                &self.settings,
+            ),
+            resume_page,
+            open_mode: self.container_open_mode(
+                at_resume_root && self.settings.effective_auto_fullscreen_zip_pdf(),
+            ),
             configured_spread_mode: spread.configured,
             effective_spread_mode: spread.effective,
             reading_direction: spread.reading_direction,
@@ -916,6 +1018,7 @@ impl ContainerEngine {
                 content_type: None,
             })
             .collect::<Vec<_>>();
+        let resume_page = self.resume_page_for_items(address, &resolved.logical, &items, true);
         let entries = page_numbers
             .into_iter()
             .map(|page_number| ContainerEntry {
@@ -935,6 +1038,11 @@ impl ContainerEngine {
             kind: ContainerKind::Pdf,
             effective_address: address.clone(),
             entries,
+            thumb_aspect_height_ratio: super::collections::aggregate_thumb_aspect_height_ratio(
+                &self.settings,
+            ),
+            resume_page,
+            open_mode: self.container_open_mode(self.settings.effective_auto_fullscreen_zip_pdf()),
             configured_spread_mode: spread.configured,
             effective_spread_mode: spread.effective,
             reading_direction: spread.reading_direction,
@@ -1423,6 +1531,16 @@ fn grid_item_address(
     }
 }
 
+fn resolve_resume_page(
+    container: &RemoteAddress,
+    items: &[crate::grid_item::GridItem],
+    saved_index: usize,
+) -> Option<RemoteAddress> {
+    items
+        .get(saved_index)
+        .and_then(|item| grid_item_address(container, item))
+}
+
 fn core_spread_mode(mode: RemoteSpreadMode) -> crate::settings::SpreadMode {
     match mode {
         RemoteSpreadMode::Single => crate::settings::SpreadMode::Single,
@@ -1658,6 +1776,91 @@ fn thumbnail_error(code: ThumbnailErrorCode, message: impl Into<String>) -> Thum
 mod tests {
     use super::*;
     use crate::settings::FavoriteEntry;
+
+    #[test]
+    fn resume_page_resolution_rejects_positions_outside_the_current_pages() {
+        let container = RemoteAddress::file("favorite", "book.pdf");
+        let items = (0..3)
+            .map(|page_num| crate::grid_item::GridItem::PdfPage {
+                pdf_path: std::path::PathBuf::from("book.pdf"),
+                page_num,
+                content_type: None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            resolve_resume_page(&container, &items, 1),
+            Some(RemoteAddress {
+                favorite_id: "favorite".to_owned(),
+                relative_path: "book.pdf".to_owned(),
+                subresource: RemoteSubresource::PdfPage { page_number: 1 },
+            })
+        );
+        assert_eq!(resolve_resume_page(&container, &items, items.len()), None);
+        assert_eq!(
+            resolve_resume_page(&container, &items, items.len() + 20),
+            None
+        );
+    }
+
+    #[test]
+    fn container_open_mode_matches_the_local_auto_open_and_resume_settings() {
+        let mut settings = crate::settings::Settings::default();
+        settings.book_open_resume = crate::settings::ResumeMode::Resume;
+        let engine = ContainerEngine::new(settings.clone());
+        assert_eq!(engine.container_open_mode(false), ContainerOpenMode::Grid);
+        assert_eq!(
+            engine.container_open_mode(true),
+            ContainerOpenMode::ResumePage
+        );
+
+        settings.book_open_resume = crate::settings::ResumeMode::FromStart;
+        let engine = ContainerEngine::new(settings);
+        assert_eq!(
+            engine.container_open_mode(true),
+            ContainerOpenMode::FirstPage
+        );
+    }
+
+    #[test]
+    fn resume_read_failures_fall_back_without_failing_container_enumeration() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        let album = root.join("album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("001.jpg"), b"one").unwrap();
+        std::fs::write(album.join("002.jpg"), b"two").unwrap();
+        let favorite = FavoriteEntry::new("test".to_owned(), root);
+        let address = RemoteAddress::file(favorite.id.to_string(), "album");
+
+        for error in [
+            super::super::session::UiReadError::Busy,
+            super::super::session::UiReadError::Timeout,
+            super::super::session::UiReadError::Stopped,
+        ] {
+            let mut settings = crate::settings::Settings {
+                favorites: vec![favorite.clone()],
+                ..Default::default()
+            };
+            settings.auto_fullscreen_zip_pdf = true;
+            settings.auto_fullscreen_image_folders = true;
+            settings.book_open_resume = crate::settings::ResumeMode::Resume;
+            let engine = ContainerEngine::new_with_resume_error(settings, error);
+            let response = engine.container(ContainerRequest {
+                address: address.clone(),
+                spread_mode: None,
+                reading_direction: None,
+                force_single_page: false,
+            });
+
+            let ContainerResponse::Success(payload) = response else {
+                panic!("resume read failure must not fail container enumeration: {error:?}");
+            };
+            assert_eq!(payload.entries.len(), 2);
+            assert_eq!(payload.resume_page, None);
+            assert_eq!(payload.open_mode, ContainerOpenMode::ResumePage);
+        }
+    }
 
     #[test]
     fn pdf_page_range_rejects_the_upper_bound() {

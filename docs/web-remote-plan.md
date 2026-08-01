@@ -988,8 +988,8 @@ range だけを隠し、`1 / 1` の位置表示は維持する。位置、実ペ
 既存 version 1 への後方互換な加法とし、旧 JSON では既定 `false` を補う。localStorage が使えない
 場合もタブ内のメモリ値は更新する。ビューアの ☰ →「操作方法を見る」から保存値に関係なく再表示できる。
 
-メニューの操作ボタンは全画面サイズで2列にし、前後移動・ズーム・バー切替・fit を上、設定・ヘルプ・
-再読み込みを下に置く。キー表記は `shouldShowKeyboardShortcuts` で決める。`pointer: fine` は既定表示、
+メニューの操作ボタンは全画面サイズで2列にし、現在の階層と項目構成は §12.13 に従う。
+キー表記は `shouldShowKeyboardShortcuts` で決める。`pointer: fine` は既定表示、
 `pointer: coarse` は既定非表示とし、そのセッションで実際の `keydown` を1回観測した後は action 内の
 キー hint と「有効なキー」一覧をともに表示する。
 
@@ -1109,6 +1109,49 @@ local command とし、現在 hash を保った `location.reload()` を行う。
 
 Service Worker は登録しない。コンテンツの正本は母艦 PC にあり offline shell だけを残す意味がなく、
 更新後の JS / CSS を古い cache が保持する故障モードを増やすためである。
+
+### 12.13 iPhone 実機指摘の反映 (protocol v14, 2026-08-01)
+
+protocol v14 は `ContainerPayload` に `resume_page`、`open_mode`、
+`thumb_aspect_height_ratio` を追加する。読書履歴からだけ特別に再開する規則は作らない。
+ローカルと同じく、コンテナを開いたときに自動で viewer へ入るかは ZIP / PDF の
+`effective_auto_fullscreen_zip_pdf`、画像だけの通常フォルダの
+`auto_fullscreen_image_folders_enabled` で決め、自動で入る場合の「続きから / 最初から」は
+`book_open_resume` に従う。自動で入らない場合も保存位置を一覧カーソルへ復元する。
+`resume_page` は App 所有の `book_resume_db` を UI request queue 経由で読み、container worker が
+別 DB connection を開かない。直前の remote 書き込みと読み出しは同じ bounded FIFO を通す。
+
+保存された raw item index が現在も読み出せるページを指す場合だけ address に解決する。
+ファイル削除などで index が現在の items 範囲外、またはページでない item を指す場合は
+`resume_page=None` とし、ローカルの `resume_page_for_container` と同じく先頭の読み出せるページへ
+フォールバックする。UI request が Busy / Timeout / Stopped で読み出せなかった場合も、理由をログへ
+残して `resume_page=None` とする。再開位置は任意情報なので、この失敗を folder / ZIP / PDF の
+container 取得エラーへ伝播させない。Web の viewer は page address から `page_groups` 上の所属 group を引くため、
+見開き時は保存ページを含む見開きを開く。純粋関数テストで有効位置、ページ数ちょうどの上限、
+大幅な超過、Web 側の不一致 fallback を固定する。
+
+コンテナのサムネイル比率は collection 一覧と同じ
+`aggregate_thumb_aspect_height_ratio(&settings)` から取得する。これはローカル設定に対応する
+aggregate 比率の正本を共有し、コンテナ専用の既定値を持たない。通常のフォルダ / collection tile は
+代表画像として従来の `object-fit: cover` を維持する一方、ページ一覧 tile だけはページ全形状の判別を
+優先して `object-fit: contain` とする。
+
+safe area の漏れは、通常フォルダ、ZIP / PDF のページ一覧、読書履歴・ブックマーク・本棚・
+レーティング・スマートフォルダの collection 一覧が共有する mobile topbar / virtual grid と、
+home content 上端にあった。mobile topbar を通常 flow 内へ戻して top / left / right inset の内側に置き、
+親フォルダ、ホーム、現在位置のパンくず、操作メニューを常時表示する。virtual grid は JavaScript が
+inline `left/right` で safe-area 指定を潰していたため、可変余白を CSS custom property へ渡し、
+左右 inset との加算は CSS に一元化する。選択カーソルは tile 外側の outline ではなく内側の
+box-shadow とし、最上段でも欠けない。home content は top inset も持つ。CSS / source test は
+4 辺の指定、inline 上書きの不在、mobile topbar 非表示規則の不在を検査する。
+
+viewer のメイン操作メニューは使用頻度順に、ブックマーク、レーティング、表示サイズ、見開き設定
+(container のみ)、上下バー、全画面、ページ位置、一覧へ戻る、端末設定、操作方法、再読み込みとする。
+レーティングは次画面で解除 / ★1〜5、表示サイズはズームを戻す / 全体 / 幅 / 原寸、見開きは
+1ページ / LTR / LTR表紙 / RTL / RTL表紙、ページ位置は先頭 / 最後を選ぶ。前 / 次、拡大 / 縮小は
+メニューからだけ外し、画面端 tap / pinch と既存 keyboard command (`矢印` / `PageUp` /
+`PageDown` / `+` / `-`) は維持する。coarse pointer 用の高さと余白を詰め、全 menu page の action 数を
+最大 11 件に固定するテストを持つ。
 
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 

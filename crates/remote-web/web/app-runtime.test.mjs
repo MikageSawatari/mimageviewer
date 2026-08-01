@@ -70,11 +70,69 @@ globalThis.fetch = imageFetch;
 
 const {
   ImageViewer,
+  VIEWER_MENU_MAX_ACTIONS,
   activateFolderContainerForImage,
+  containerInitialImageIndex,
   loadFolder,
   parentContainerAddress,
   reloadApplication,
+  viewerMenuDefinitions,
 } = await import("./app.js");
+
+test("container opening resumes the matching page and otherwise falls back safely", () => {
+  const page = (pageNumber) => ({
+    kind: "image",
+    address: {
+      favorite_id: "favorite",
+      relative_path: "book.pdf",
+      subresource: { kind: "pdf_page", page_number: pageNumber },
+    },
+  });
+  const images = [page(0), page(1), page(2)];
+
+  assert.equal(containerInitialImageIndex({
+    openMode: "resume_page",
+    resumePage: images[1].address,
+    images,
+  }), 1);
+  assert.equal(containerInitialImageIndex({
+    openMode: "resume_page",
+    resumePage: page(20).address,
+    images,
+  }), 0);
+  assert.equal(containerInitialImageIndex({
+    openMode: "first_page",
+    resumePage: images[2].address,
+    images,
+  }), 0);
+  assert.equal(containerInitialImageIndex({
+    openMode: "grid",
+    resumePage: images[1].address,
+    images,
+  }), -1);
+});
+
+test("every iPhone viewer menu page stays within the fixed action limit", () => {
+  for (const hasContainer of [false, true]) {
+    const definitions = viewerMenuDefinitions({ hasContainer, barsVisible: true });
+    for (const [page, definition] of Object.entries(definitions)) {
+      assert.ok(
+        definition.actions.length <= VIEWER_MENU_MAX_ACTIONS,
+        `${page} has ${definition.actions.length} actions`
+      );
+    }
+    const main = definitions.main.actions;
+    const mainNames = main.map(([name]) => name);
+    assert.equal(mainNames.includes("prev_page"), false);
+    assert.equal(mainNames.includes("next_page"), false);
+    assert.equal(mainNames.includes("zoom_in"), false);
+    assert.equal(mainNames.includes("zoom_out"), false);
+    assert.equal(
+      main.filter(([, , , payload]) => payload?.menuPage === "rating").length,
+      1
+    );
+  }
+});
 
 test("plain image media routes resolve their containing folder", () => {
   assert.deepEqual(
