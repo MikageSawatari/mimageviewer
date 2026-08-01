@@ -5,7 +5,7 @@
 
 - 親計画: [web-remote-plan.md](web-remote-plan.md) (リモート閲覧機能全体の正本)
 - ブランチ: `web-remote` (worktree: `C:\home\mimageviewer-web`)
-- 現在のフェーズ: **設計確定 / 未実装** (2026-08-01)
+- 現在のフェーズ: **第 1 段 増分 1/7 実装済み** (encoder 抽象 / fallback / 画質 preset、2026-08-01)
 
 ---
 
@@ -89,7 +89,37 @@ open 失敗 (デバイス非搭載 / ドライバ非対応 / セッション上�
 | 5 | `libopenh264` | 常に可 | 最終手段。CPU 負荷が高いので既定画質を下げる |
 
 設定で明示指定も可能にする (`Auto` / 各エンコーダ名)。選ばれた encoder 名・実効ビットレート・
-エンコード所要時間は診断ログに残す。
+エンコード所要時間は診断ログに残す。明示指定が開けなかったときは**黙って別の段へ落ちない**。
+階段を降りるのは `Auto` のときだけで、明示指定の失敗は失敗として返す。
+
+#### 実測 (増分 1、2026-08-01、開発機 RTX 4090 / Windows 11)
+
+vendor の 6 DLL だけを配置した状態で 5 段すべての open を実測した。
+
+| encoder | 結果 | 入力形式 |
+|---|---|---|
+| `h264_nvenc` | 成功 | NV12 |
+| `h264_qsv` | 成功 | NV12 |
+| `h264_amf` | 失敗 (`amfrt64.dll failed to open`) | — |
+| `h264_mf` | 成功 | NV12 |
+| `libopenh264` | 成功 | YUV420P |
+
+- **`libopenh264` は追加 DLL なしで開けた。** 最終段は実在するので、この表の変更は不要
+- `h264_amf` の失敗は AMD GPU 非搭載の想定内。階段はこの段を飛ばして次へ進む
+- 再現手段:
+  `cargo test -p mimageviewer --lib probe_local_h264_encoder_open_results -- --ignored --nocapture`
+  (通常の test suite は hardware / DLL に依存しない)
+
+#### 後続増分への申し送り
+
+- **m3u8 の `CODECS` 属性と CMAF init segment は、encoder が実際に出した SPS
+  (extradata) から導くこと。** 想定の High profile を定数から書かない。
+  `libopenh264` の encoder は Constrained Baseline しか出さないため、最終段まで
+  落ちたときに宣言と中身がずれる。互換性の向きとしては安全側 (Baseline の方が広く
+  再生できる) だが、宣言が実体と違うと iOS のネイティブ経路で弾かれ得る
+- `src/video/stream/mod.rs` の `#![allow(dead_code)]` は、増分 5〜6 で
+  セッションから接続した時点で**外す**。それまでの間、このモジュール内の本当の
+  dead code は検出されない
 
 x264 は使わない (GPLv2。mIV は MIT なので持ち込めない)。OBS が x264 を同梱できるのは
 OBS 自身が GPLv2 だからであり、**OBS のコードも設定値の写経以上の流用はしない** (§9)。

@@ -53,6 +53,7 @@ mod native_window_thread_spike;
 pub mod normalize_scanner;
 pub mod normalize_types;
 pub mod screenshot;
+pub(crate) mod stream;
 pub mod swscale_helpers;
 pub mod thumbnail;
 pub mod tile_thumb_cache;
