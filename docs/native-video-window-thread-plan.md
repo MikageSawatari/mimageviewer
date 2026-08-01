@@ -686,6 +686,36 @@ decoder/audio/frame queue ownership を変更していない。
 単独 gate: fake bridge ack/stall/restart tests、focus/IME handler tests、VST editor owner
 Windows test。
 
+#### Stage 5 実装記録 (2026-08-01)
+
+- bridge protocol を v3 に上げ、`set_chain_owner` に単調 `request_id`、応答に
+  `owner_applied(request_id)` を追加した。C++ control thread は各 slot の GUI task を
+  `invoke_void_sync_for(kGuiMutationTimeout)` で完了確認してから ack する。GUI task が停止した場合は
+  既存の `terminate_bridge_after_gui_timeout` が bridge process を終了し、main process に停止した
+  plugin instance を戻さない。
+- Rust の `DspBridge` に owner request 専用 FIFO worker を置いた。通常の owner 更新と
+  pump の handoff は同じ queue を通り、worker だけが ack を bounded wait する。ack 欠落時は対象
+  bridge process を terminate/quarantine して terminal completion を返す。UI thread と pump thread は
+  request enqueue / completion channel だけを扱い、同期 wait しない。
+- pump は必要時に非表示 owner anchor HWND を自 thread 上で作成し、公開済み fullscreen host の
+  retirement を `old owner -> anchor request/ack -> final owner request/ack -> old destroy` の順にした。
+  old `NativeWindowHost` は completion まで pump の pending retirement が保持し、anchor は pump の
+  typed shutdown まで保持する。new publish event は handoff enqueue 後に render へ渡すため、App 側の
+  後続 owner 更新とも FIFO 順序が確定する。
+- cursor の幾何述語 `cursor_within_client` は、`GetCapture` または `WindowFromPoint` の実 target が
+  presenter/HUD topology に属するかを答える `cursor_input_owned` に置換した。別 top-level window が
+  presenter 矩形を覆う場合と Win32 判定不能時はいずれも false であり、隠す側には倒れない。
+  pointer activity clock、hidden、desired/applied icon は pump-owned `CursorAutoHideReducer` の単一 state
+  とし、render は cursor icon/auto-hide policy のみ publish する。HUD wndproc、`WM_SETCURSOR`、render
+  input handler は直接復帰させず、placement publish/retirement と owner handoff で reducer を reset する。
+  cursor health も pump だけが書く。
+- `WM_MOUSEACTIVATE = MA_NOACTIVATE`、HUD button -> pump focus claim、render route の IME
+  preedit/commit 順序、foreground claim 条件を sequence/pure test で固定した。fake owner worker では
+  delayed/missing completion と restart を再現し producer が待たないこと、request id 照合では stale ack
+  を捨てること、pump retirement gate では request/ack 前に old destroy が出ないことを固定した。
+- detached の述語、viewport、rect/focus model は変更していない。Stage 6 の hidden/source/EOF/
+  placement failure sequence hardeningにも踏み込んでいない。
+
 ### Stage 6: hidden/source/EOF と placement failure の lifecycle hardening
 
 変わるもの:
@@ -830,7 +860,7 @@ driver 内で止まったのか、どの HWND generation/operation だったか�
 - `NativeWindowHealth` は native output ごとの `Arc` とし、pump/render が書く本体は atomic scalar
   だけで構成した。pump thread id、presenter/HUD HWND + epoch、message dispatch sequence/time、
   pump request received/completed、render operation の active/last started/last completed、placement
-  遷移、source generation、visibility、cursor hidden/within/last activity を latest value として保持する。
+  遷移、source generation、visibility、cursor hidden/input-owned/last activity を latest value として保持する。
   registry の `Mutex<Vec<Weak<_>>>` は既存 UI heartbeat watchdog だけが 1 秒 tick で短時間取得し、
   pump/render は登録後に触れない。観測に path、タイトル、codec 等の media metadata は渡さない。
 - watchdog 専用 thread は増やさず、既存 `ui-heartbeat-watchdog` の 1 秒 tick を再利用した。watchdog
@@ -943,19 +973,15 @@ detached plan §11 に次の内容を反映した。
 
 ## 11. 調査中に判明した隣接問題
 
-VST owner 切替は現状 fire-and-forget である。Rust は
-`set_chain_owner` を bridge へ送り
-([src/video/dsp/bridge.rs:584](../src/video/dsp/bridge.rs#L584)-[590](../src/video/dsp/bridge.rs#L590))、
-bridge は slot GUI thread へ async post して `GWLP_HWNDPARENT` を変更する
-([crates/vst3-host/src/plugin_loader.cpp:1794](../crates/vst3-host/src/plugin_loader.cpp#L1794)-
-[1832](../crates/vst3-host/src/plugin_loader.cpp#L1832))。Rust 側には「owner 変更が実際に適用された」
-ack がない。
+VST owner 切替は Stage 4 時点では fire-and-forget であり、Rust が `set_chain_owner` を送った後、
+bridge が slot GUI thread へ async post した `GWLP_HWNDPARENT` 変更の完了を確認できなかった。
 
 そのため placement 切替で旧 presenter HWND を破棄するとき、VST GUI thread が遅延/停止していれば
 editor popup が旧 HWND を owner として保持したままになる可能性がある。今回実測された deadlock の
 直接原因ではないが、HWND lifecycle 分離時に無視できない cross-thread ownership race である。
-Stage 5 の request id 付き ack と pump-owned owner anchor で同時に閉じる。UI/pump が VST ack を
-同期 wait する修正は採用しない。
+Stage 5 で request id 付き ack、専用 owner worker、pump-owned owner anchor を実装してこの race を
+閉じた。pump は terminal completion 前に旧 host を destroy せず、GUI task timeout/ack 欠落は bridge
+process termination へ収束する。UI/pump が VST ack を同期 wait する経路は追加していない。
 
 もう一つの実装 gate は、DirectComposition が別 thread 所有 HWND を対象にする driver matrix で
 ある。これは既知 bug と断定せず、Stage 3 で production cutover 前に検証すべき未確定 risk として扱う。

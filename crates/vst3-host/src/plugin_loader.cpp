@@ -1791,32 +1791,35 @@ void PluginLoader::set_gui_topmost(bool topmost) {
     blog("set_gui_topmost: no bridge surface topmost=%d", topmost ? 1 : 0);
 }
 
-void PluginLoader::set_gui_owner(void* owner_hwnd) {
+bool PluginLoader::set_gui_owner(void* owner_hwnd) {
     if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
-        return;
+        return true;
     }
     if (!is_gui_thread()) {
         if (!gui_thread_) {
-            return;
+            return true;
         }
-        gui_thread().post_async([this, owner_hwnd]() {
-            set_gui_owner(owner_hwnd);
+        auto result = gui_thread().invoke_sync_for(kGuiMutationTimeout, "set_gui_owner", [this, owner_hwnd]() {
+            return set_gui_owner(owner_hwnd);
         });
-        return;
+        return result.value_or(false);
     }
 
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     HWND new_owner = reinterpret_cast<HWND>(owner_hwnd);
-    if (!container_hwnd || !IsWindow(container_hwnd) || !new_owner || !IsWindow(new_owner)) {
+    if (!container_hwnd || !IsWindow(container_hwnd)) {
+        return true;
+    }
+    if (!new_owner || !IsWindow(new_owner)) {
         blog("set_gui_owner: skipped surface=0x%llx owner=0x%llx",
              static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
              static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(new_owner)));
-        return;
+        return false;
     }
     HWND old_owner = reinterpret_cast<HWND>(GetWindowLongPtrW(container_hwnd, GWLP_HWNDPARENT));
     if (old_owner == new_owner) {
         view_host_hwnd_ = owner_hwnd;
-        return;
+        return true;
     }
     SetWindowLongPtrW(container_hwnd, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(new_owner));
     SetWindowPos(container_hwnd,
@@ -1830,6 +1833,7 @@ void PluginLoader::set_gui_owner(void* owner_hwnd) {
     blog("set_gui_owner: surface=0x%llx owner=0x%llx",
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(new_owner)));
+    return reinterpret_cast<HWND>(GetWindowLongPtrW(container_hwnd, GWLP_HWNDPARENT)) == new_owner;
 }
 
 void PluginLoader::set_gui_app_active(bool active) {

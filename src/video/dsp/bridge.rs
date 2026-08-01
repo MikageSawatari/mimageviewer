@@ -23,7 +23,9 @@ use windows::Win32::System::Memory::{
     PAGE_READWRITE, UnmapViewOfFile,
 };
 #[cfg(windows)]
-use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    CreateEventW, SetEvent, TerminateProcess, WaitForSingleObject,
+};
 #[cfg(windows)]
 use windows::core::{HSTRING, PCWSTR};
 
@@ -34,7 +36,8 @@ use windows::core::{HSTRING, PCWSTR};
 /// **bump 1 → 2** (T09 round 4): 旧 bridge は version 比較を no-op で握り潰していたので
 /// 1 のままだと stale bridge を検出できなかった。2 へ上げることで v0.8.x 以前の
 /// `mimageviewer-vst3-host.exe` (version=1 を返すだけ) を新 Rust 側で reject できる。
-pub const PROTOCOL_VERSION: u32 = 2;
+/// **bump 2 → 3** (Stage 5): `set_chain_owner` の request id / owner-applied ack を追加。
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// shared memory header — C++ 側 `crates/vst3-host/include/protocol.h::ShmHeader` と
 /// **同一バイナリレイアウト**でなければならない (cache line aligned 64 byte)。
@@ -223,6 +226,10 @@ pub enum Event {
         #[serde(default)]
         slot_id: u64,
     },
+    OwnerApplied {
+        #[serde(default)]
+        request_id: u64,
+    },
     /// プラグインの推奨 GUI サイズ (query_gui_size の応答)。
     /// `resizable` は IPlugView::canResize() の結果 (= ホスト側が WS_THICKFRAME を
     /// 付けるかの判断に使う)。古い bridge との互換性のため `#[serde(default)]` で false。
@@ -264,8 +271,11 @@ pub struct Bridge {
     reset_ack_rx: crossbeam_channel::Receiver<u64>,
     gui_user_hidden_rx: crossbeam_channel::Receiver<u64>,
     gui_bypass_toggle_rx: crossbeam_channel::Receiver<u64>,
+    owner_applied_rx: crossbeam_channel::Receiver<u64>,
     /// reset_sync helper が使う世代 ID counter。`fetch_add(1)` で発行する。
     next_reset_id: AtomicU64,
+    #[cfg(windows)]
+    process_handle: usize,
     #[cfg(windows)]
     shm: Option<SharedMemory>,
     #[cfg(windows)]
@@ -338,6 +348,11 @@ impl Bridge {
             command.creation_flags(CREATE_NO_WINDOW);
         }
         let mut child = command.spawn()?;
+        #[cfg(windows)]
+        let process_handle = {
+            use std::os::windows::io::AsRawHandle;
+            child.as_raw_handle() as usize
+        };
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
         let stderr = child.stderr.take().expect("stderr");
@@ -369,6 +384,7 @@ impl Bridge {
         let (reset_ack_tx, reset_ack_rx) = crossbeam_channel::bounded::<u64>(8);
         let (gui_user_hidden_tx, gui_user_hidden_rx) = crossbeam_channel::bounded::<u64>(64);
         let (gui_bypass_toggle_tx, gui_bypass_toggle_rx) = crossbeam_channel::bounded::<u64>(64);
+        let (owner_applied_tx, owner_applied_rx) = crossbeam_channel::bounded::<u64>(64);
         let cached_latency_for_pump = cached_latency.clone();
         let cached_latency_by_slot_for_pump = cached_latency_by_slot.clone();
         std::thread::Builder::new()
@@ -410,6 +426,9 @@ impl Bridge {
                         Ok(Event::GuiBypassToggle { slot_id }) => {
                             let _ = gui_bypass_toggle_tx.try_send(slot_id);
                         }
+                        Ok(Event::OwnerApplied { request_id }) => {
+                            let _ = owner_applied_tx.try_send(request_id);
+                        }
                         Ok(other) => {
                             // Loaded を受信したら cached_latency にも反映する
                             // (= 起動直後は LatencyChanged 通知が来ないプラグインに対応)
@@ -450,7 +469,10 @@ impl Bridge {
             reset_ack_rx,
             gui_user_hidden_rx,
             gui_bypass_toggle_rx,
+            owner_applied_rx,
             next_reset_id: AtomicU64::new(0),
+            #[cfg(windows)]
+            process_handle,
             #[cfg(windows)]
             shm: None,
             #[cfg(windows)]
@@ -582,11 +604,25 @@ impl Bridge {
     }
 
     /// 既に作成済みの editor surface の owner HWND を一括更新する。
-    pub fn set_chain_owner(&self, owner_hwnd: u64) -> std::io::Result<()> {
+    pub fn set_chain_owner(&self, request_id: u64, owner_hwnd: u64) -> std::io::Result<()> {
         self.send_value(&serde_json::json!({
             "cmd": "set_chain_owner",
+            "request_id": request_id,
             "owner_hwnd": owner_hwnd,
         }))
+    }
+
+    pub fn wait_owner_applied(&self, request_id: u64, timeout: std::time::Duration) -> bool {
+        wait_for_owner_applied(&self.owner_applied_rx, request_id, timeout)
+    }
+
+    #[cfg(windows)]
+    pub fn terminate_after_owner_timeout(&self) {
+        unsafe {
+            let process = HANDLE(self.process_handle as *mut _);
+            let _ = TerminateProcess(process, 1);
+            let _ = WaitForSingleObject(process, 1000);
+        }
     }
 
     /// プラグイン内部状態 (= EQ カーブ / chunk) を base64 文字列で取得する。
@@ -1055,6 +1091,58 @@ impl Bridge {
     pub fn shutdown_async(&self) -> std::io::Result<()> {
         let _ = self.send(&Cmd::Shutdown);
         Ok(())
+    }
+}
+
+fn wait_for_owner_applied(
+    receiver: &crossbeam_channel::Receiver<u64>,
+    request_id: u64,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        match receiver.recv_timeout(deadline - now) {
+            Ok(received) if received == request_id => return true,
+            Ok(received) => crate::logger::log(format!(
+                "[VST3 GUI] ignored stale owner_applied request_id={received}, expected={request_id}"
+            )),
+            Err(_) => return false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod owner_ack_tests {
+    use super::*;
+
+    #[test]
+    fn owner_ack_matches_request_and_drops_stale_pre_restart_ack() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(40).unwrap();
+        tx.send(42).unwrap();
+        assert!(wait_for_owner_applied(
+            &rx,
+            42,
+            std::time::Duration::from_millis(20)
+        ));
+
+        let (_old_tx, old_rx) = crossbeam_channel::unbounded();
+        let (new_tx, new_rx) = crossbeam_channel::unbounded();
+        new_tx.send(44).unwrap();
+        assert!(!wait_for_owner_applied(
+            &old_rx,
+            44,
+            std::time::Duration::from_millis(5)
+        ));
+        assert!(wait_for_owner_applied(
+            &new_rx,
+            44,
+            std::time::Duration::from_millis(20)
+        ));
     }
 }
 

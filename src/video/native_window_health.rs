@@ -178,7 +178,7 @@ pub(crate) struct NativeWindowHealth {
     source_generation: AtomicU64,
     visibility: AtomicU8,
     cursor_hidden: AtomicBool,
-    cursor_within_client: AtomicBool,
+    cursor_input_owned: AtomicBool,
     cursor_last_activity_stamp: AtomicU64,
     cursor_epoch: AtomicU64,
     owner_mismatch: AtomicBool,
@@ -231,7 +231,7 @@ impl NativeWindowHealth {
             source_generation: AtomicU64::new(0),
             visibility: AtomicU8::new(VisibilityHealth::Unknown as u8),
             cursor_hidden: AtomicBool::new(false),
-            cursor_within_client: AtomicBool::new(true),
+            cursor_input_owned: AtomicBool::new(false),
             cursor_last_activity_stamp: AtomicU64::new(0),
             cursor_epoch: AtomicU64::new(0),
             owner_mismatch: AtomicBool::new(false),
@@ -457,12 +457,12 @@ impl NativeWindowHealth {
         &self,
         epoch: u64,
         cursor_hidden: bool,
-        cursor_within_client: bool,
+        cursor_input_owned: bool,
         cursor_last_activity: Option<Instant>,
     ) {
         self.cursor_hidden.store(cursor_hidden, Ordering::Relaxed);
-        self.cursor_within_client
-            .store(cursor_within_client, Ordering::Relaxed);
+        self.cursor_input_owned
+            .store(cursor_input_owned, Ordering::Relaxed);
         self.cursor_last_activity_stamp.store(
             self.stamp_for_instant(cursor_last_activity),
             Ordering::Relaxed,
@@ -560,7 +560,7 @@ struct HealthSnapshot {
     source_generation: u64,
     visibility: VisibilityHealth,
     cursor_hidden: bool,
-    cursor_within_client: bool,
+    cursor_input_owned: bool,
     cursor_last_activity_age_ms: Option<u64>,
     cursor_epoch: u64,
 }
@@ -638,7 +638,7 @@ impl NativeWindowHealth {
             source_generation: self.source_generation.load(Ordering::Acquire),
             visibility: VisibilityHealth::from_code(self.visibility.load(Ordering::Acquire)),
             cursor_hidden: self.cursor_hidden.load(Ordering::Acquire),
-            cursor_within_client: self.cursor_within_client.load(Ordering::Acquire),
+            cursor_input_owned: self.cursor_input_owned.load(Ordering::Acquire),
             cursor_last_activity_age_ms: age_ms(
                 now_stamp,
                 self.cursor_last_activity_stamp.load(Ordering::Acquire),
@@ -740,7 +740,7 @@ fn format_snapshot(prefix: &str, snapshot: &HealthSnapshot) -> String {
          render_last_started_age_ms={} render_last_started_seq={} render_last_completed={} \
          render_last_completed_epoch={} render_last_completed_age_ms={} \
          render_last_completed_seq={} placement={} prior_placement={} placement_age_ms={} \
-         source_generation={} visibility={} cursor_hidden={} cursor_within_client={} \
+         source_generation={} visibility={} cursor_hidden={} cursor_input_owned={} \
          cursor_last_activity_age_ms={} cursor_epoch={} close_remains_possible={}",
         snapshot.pump_thread_id,
         snapshot.presenter_hwnd,
@@ -773,7 +773,7 @@ fn format_snapshot(prefix: &str, snapshot: &HealthSnapshot) -> String {
         snapshot.source_generation,
         snapshot.visibility.label(),
         snapshot.cursor_hidden,
-        snapshot.cursor_within_client,
+        snapshot.cursor_input_owned,
         optional_age(snapshot.cursor_last_activity_age_ms),
         snapshot.cursor_epoch,
         snapshot.pump_has_acked

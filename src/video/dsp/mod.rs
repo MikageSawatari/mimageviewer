@@ -111,6 +111,18 @@ pub struct GuiSignalChanges {
     pub bypass_updates: Vec<(String, bool)>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnerHandoffResult {
+    Applied,
+    BridgeTerminated,
+    QueueUnavailable,
+}
+
+struct OwnerRequest {
+    owners: Vec<u64>,
+    completion: Option<Box<dyn FnOnce(OwnerHandoffResult) + Send>>,
+}
+
 /// DspBridge — VST3 プラグインホスト bridge との対話を管理する singleton。
 ///
 /// アプリ起動から終了まで 1 個のインスタンスを保持する。
@@ -183,6 +195,14 @@ pub struct DspBridge {
     /// 済みなら新 worker が disable で wipe するため副作用なし、(b) 既に add 済みの
     /// プラグインも新 worker の disable→add ループで上書きされる。
     chain_rebuild_gen: AtomicU64,
+    owner_request_tx: crossbeam_channel::Sender<OwnerRequest>,
+    next_owner_request_id: AtomicU64,
+}
+
+impl std::fmt::Debug for DspBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DspBridge").finish_non_exhaustive()
+    }
 }
 
 struct DspBridgeInner {
@@ -260,7 +280,8 @@ pub(crate) struct PluginSlot {
 
 impl DspBridge {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+        let (owner_request_tx, owner_request_rx) = crossbeam_channel::bounded(64);
+        let this = Arc::new(Self {
             inner: Mutex::new(DspBridgeInner {
                 state: DspState::Disabled,
                 slots: Vec::new(),
@@ -282,7 +303,15 @@ impl DspBridge {
             editor_hwnds: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             hud_raise_hook: Mutex::new(None),
             chain_rebuild_gen: AtomicU64::new(0),
-        })
+            owner_request_tx,
+            next_owner_request_id: AtomicU64::new(0),
+        });
+        let weak = Arc::downgrade(&this);
+        std::thread::Builder::new()
+            .name("vst-owner-dispatch".to_string())
+            .spawn(move || owner_dispatch_loop(weak, owner_request_rx))
+            .ok();
+        this
     }
 
     /// チェーン再構築世代を 1 つ進め、新しい世代値を返す (T21 / R-VST-001)。
@@ -487,21 +516,41 @@ impl DspBridge {
         if owner_hwnd == 0 {
             return;
         }
-        let bridges: Vec<Arc<Bridge>> = {
-            let inner = self.inner.lock().unwrap();
-            let mut bridges: Vec<Arc<Bridge>> = Vec::new();
-            for slot in inner.slots.iter().filter(|s| s.gui_hwnd != 0) {
-                if !bridges.iter().any(|b| Arc::ptr_eq(b, &slot.bridge)) {
-                    bridges.push(slot.bridge.clone());
-                }
+        self.enqueue_owner_request(vec![owner_hwnd], None);
+    }
+
+    pub(crate) fn request_owner_handoff(
+        &self,
+        temporary_owner: u64,
+        final_owner: u64,
+        completion: impl FnOnce(OwnerHandoffResult) + Send + 'static,
+    ) {
+        self.enqueue_owner_request(
+            vec![temporary_owner, final_owner],
+            Some(Box::new(completion)),
+        );
+    }
+
+    fn enqueue_owner_request(
+        &self,
+        owners: Vec<u64>,
+        completion: Option<Box<dyn FnOnce(OwnerHandoffResult) + Send>>,
+    ) {
+        if owners.iter().any(|owner| *owner == 0) {
+            if let Some(completion) = completion {
+                completion(OwnerHandoffResult::QueueUnavailable);
             }
-            bridges
-        };
-        for bridge in bridges {
-            if let Err(err) = bridge.set_chain_owner(owner_hwnd) {
-                crate::logger::log(format!(
-                    "[VST3 GUI] set_chain_owner failed owner=0x{owner_hwnd:x}: {err}"
-                ));
+            return;
+        }
+        let request = OwnerRequest { owners, completion };
+        if let Err(err) = self.owner_request_tx.try_send(request) {
+            let request = err.into_inner();
+            if let Some(completion) = request.completion {
+                completion(OwnerHandoffResult::QueueUnavailable);
+            } else {
+                crate::logger::log(
+                    "[VST3 GUI] owner request queue unavailable; update rejected".to_string(),
+                );
             }
         }
     }
@@ -2365,11 +2414,154 @@ impl DspBridge {
             .count();
         self.active_slot_count.store(count, Ordering::Release);
     }
+
+    fn owner_bridges(&self) -> Vec<Arc<Bridge>> {
+        let inner = self.inner.lock().unwrap();
+        let mut bridges = Vec::new();
+        for slot in inner.slots.iter().filter(|slot| slot.gui_hwnd != 0) {
+            if !bridges
+                .iter()
+                .any(|bridge| Arc::ptr_eq(bridge, &slot.bridge))
+            {
+                bridges.push(Arc::clone(&slot.bridge));
+            }
+        }
+        bridges
+    }
+
+    fn apply_owner_sequence(&self, owners: &[u64]) -> OwnerHandoffResult {
+        let mut result = OwnerHandoffResult::Applied;
+        for owner in owners {
+            for bridge in self.owner_bridges() {
+                let request_id = self
+                    .next_owner_request_id
+                    .fetch_add(1, Ordering::AcqRel)
+                    .wrapping_add(1);
+                let sent = bridge.set_chain_owner(request_id, *owner).is_ok();
+                let applied =
+                    sent && bridge.wait_owner_applied(request_id, Duration::from_millis(1500));
+                if !applied {
+                    crate::logger::log(format!(
+                        "[VST3 GUI] owner ack missing request_id={request_id} owner=0x{owner:x}; terminating bridge pid={}",
+                        bridge.process_id()
+                    ));
+                    bridge.terminate_after_owner_timeout();
+                    self.quarantine_owner_bridge(&bridge);
+                    result = OwnerHandoffResult::BridgeTerminated;
+                }
+            }
+        }
+        result
+    }
+
+    fn quarantine_owner_bridge(&self, bridge: &Arc<Bridge>) {
+        let mut inner = self.inner.lock().unwrap();
+        for slot in inner
+            .slots
+            .iter_mut()
+            .filter(|slot| Arc::ptr_eq(&slot.bridge, bridge))
+        {
+            slot.state = SlotState::Error;
+            slot.bypass = true;
+            slot.gui_hwnd = 0;
+            slot.gui_visible = false;
+        }
+        self.recalc_active_count(&inner);
+        drop(inner);
+        self.refresh_editor_hwnds_snapshot();
+    }
+}
+
+trait OwnerRequestExecutor: Send + Sync + 'static {
+    fn execute_owner_sequence(&self, owners: &[u64]) -> OwnerHandoffResult;
+}
+
+impl OwnerRequestExecutor for DspBridge {
+    fn execute_owner_sequence(&self, owners: &[u64]) -> OwnerHandoffResult {
+        self.apply_owner_sequence(owners)
+    }
+}
+
+fn owner_dispatch_loop<T: OwnerRequestExecutor>(
+    bridge: std::sync::Weak<T>,
+    requests: crossbeam_channel::Receiver<OwnerRequest>,
+) {
+    while let Ok(request) = requests.recv() {
+        let Some(bridge) = bridge.upgrade() else {
+            break;
+        };
+        let result = bridge.execute_owner_sequence(&request.owners);
+        if let Some(completion) = request.completion {
+            completion(result);
+        }
+    }
 }
 
 impl Drop for DspBridge {
     fn drop(&mut self) {
         self.disable();
+    }
+}
+
+#[cfg(test)]
+mod owner_dispatch_tests {
+    use super::*;
+
+    struct FakeOwnerExecutor {
+        delay: Duration,
+        result: OwnerHandoffResult,
+    }
+
+    impl OwnerRequestExecutor for FakeOwnerExecutor {
+        fn execute_owner_sequence(&self, _owners: &[u64]) -> OwnerHandoffResult {
+            std::thread::sleep(self.delay);
+            self.result
+        }
+    }
+
+    fn submit_to_fake(result: OwnerHandoffResult) -> (Duration, OwnerHandoffResult) {
+        let executor = Arc::new(FakeOwnerExecutor {
+            delay: Duration::from_millis(80),
+            result,
+        });
+        let (request_tx, request_rx) = crossbeam_channel::unbounded();
+        let weak = Arc::downgrade(&executor);
+        let worker = std::thread::spawn(move || owner_dispatch_loop(weak, request_rx));
+        let (completion_tx, completion_rx) = crossbeam_channel::bounded(1);
+        let started = Instant::now();
+        request_tx
+            .send(OwnerRequest {
+                owners: vec![100, 200],
+                completion: Some(Box::new(move |result| {
+                    completion_tx.send(result).unwrap();
+                })),
+            })
+            .unwrap();
+        let submit_elapsed = started.elapsed();
+        let completed = completion_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(request_tx);
+        drop(executor);
+        worker.join().unwrap();
+        (submit_elapsed, completed)
+    }
+
+    #[test]
+    fn delayed_or_missing_owner_ack_never_blocks_request_producer() {
+        let (delayed_submit, delayed) = submit_to_fake(OwnerHandoffResult::Applied);
+        assert!(delayed_submit < Duration::from_millis(20));
+        assert_eq!(delayed, OwnerHandoffResult::Applied);
+
+        let (missing_submit, missing) = submit_to_fake(OwnerHandoffResult::BridgeTerminated);
+        assert!(missing_submit < Duration::from_millis(20));
+        assert_eq!(missing, OwnerHandoffResult::BridgeTerminated);
+    }
+
+    #[test]
+    fn restarted_executor_requires_its_own_completion() {
+        let (_, old_result) = submit_to_fake(OwnerHandoffResult::BridgeTerminated);
+        let (_, restarted_result) = submit_to_fake(OwnerHandoffResult::Applied);
+        assert_eq!(old_result, OwnerHandoffResult::BridgeTerminated);
+        assert_eq!(restarted_result, OwnerHandoffResult::Applied);
     }
 }
 

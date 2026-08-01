@@ -288,6 +288,10 @@ impl NativeVideoWindowEventSink {
                 | NativeVideoWindowEvent::DpiChanged { .. }
                 | NativeVideoWindowEvent::RequestRaiseHud
                 | NativeVideoWindowEvent::RequestFocusClaim
+                | NativeVideoWindowEvent::MouseMove(_)
+                | NativeVideoWindowEvent::MouseButton(_)
+                | NativeVideoWindowEvent::MouseWheel(_)
+                | NativeVideoWindowEvent::MouseLeave
                 | NativeVideoWindowEvent::Destroyed
         ) {
             self.pump_route.send(envelope.clone());
@@ -1654,13 +1658,17 @@ mod tests {
         sink.send(NativeVideoWindowEvent::CloseRequested { generation: 7 });
 
         let pump = pump_rx.drain();
-        assert_eq!(pump.len(), 2);
+        assert_eq!(pump.len(), 3);
         assert!(matches!(
             pump[0].event,
-            NativeVideoWindowEvent::RequestFocusClaim
+            NativeVideoWindowEvent::MouseMove(NativeVideoMouseEvent { x: 30, y: 40, .. })
         ));
         assert!(matches!(
             pump[1].event,
+            NativeVideoWindowEvent::RequestFocusClaim
+        ));
+        assert!(matches!(
+            pump[2].event,
             NativeVideoWindowEvent::CloseRequested { generation: 7 }
         ));
 
@@ -1677,6 +1685,57 @@ mod tests {
         assert!(matches!(
             render[2].event,
             NativeVideoWindowEvent::MouseMove(NativeVideoMouseEvent { x: 30, y: 40, .. })
+        ));
+        assert!(!overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn hud_focus_return_keeps_ime_preedit_commit_order_on_render_route() {
+        let overflow = Arc::new(AtomicBool::new(false));
+        let (pump_route, pump_rx) = native_window_event_route(16, Arc::clone(&overflow));
+        let (render_route, render_rx) = native_window_event_route(16, Arc::clone(&overflow));
+        let sink = NativeVideoWindowEventSink::new(9, 9, pump_route, render_route);
+
+        sink.send(NativeVideoWindowEvent::MouseButton(
+            NativeVideoMouseButtonEvent {
+                button: NativeVideoMouseButton::Left,
+                down: true,
+                double_click: false,
+                x: 10,
+                y: 20,
+                shift: false,
+                ctrl: false,
+            },
+        ));
+        sink.send(NativeVideoWindowEvent::RequestFocusClaim);
+        sink.send(NativeVideoWindowEvent::Ime(NativeVideoImeEvent::Preedit(
+            "にほ".to_string(),
+        )));
+        sink.send(NativeVideoWindowEvent::Ime(NativeVideoImeEvent::Commit(
+            "日本".to_string(),
+        )));
+
+        let pump = pump_rx.drain();
+        assert!(matches!(
+            pump[0].event,
+            NativeVideoWindowEvent::MouseButton(_)
+        ));
+        assert!(matches!(
+            pump[1].event,
+            NativeVideoWindowEvent::RequestFocusClaim
+        ));
+        let render = render_rx.drain();
+        assert!(matches!(
+            render[0].event,
+            NativeVideoWindowEvent::MouseButton(_)
+        ));
+        assert!(matches!(
+            render[1].event,
+            NativeVideoWindowEvent::Ime(NativeVideoImeEvent::Preedit(ref text)) if text == "にほ"
+        ));
+        assert!(matches!(
+            render[2].event,
+            NativeVideoWindowEvent::Ime(NativeVideoImeEvent::Commit(ref text)) if text == "日本"
         ));
         assert!(!overflow.load(Ordering::Acquire));
     }
