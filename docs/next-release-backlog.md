@@ -533,9 +533,20 @@
 - 1 のほうが構造的 (操作者の手順に依存しない)。着手時は
   [idle-health-check.md](idle-health-check.md) の §3 も揃えること。
 - 規模 / 優先度: Small / P2。**毎リリース必須のチェックが手順どおりでも落ちる**状態なので、
-  次版で片付ける。v2.9.1 は `static-foreground` / `static-background` の PASS と、
-  今回の変更 (バッジレイアウト / rename 移行 / 名前ダイアログ) がアイドル高画質化と
-  動画ピンの経路に触れていないことを根拠に出荷した。
+  次版で片付ける。
+- v2.9.1 の waiver 根拠 (2026-08-01 更新)。`static-foreground` / `static-background` の PASS に加え、
+  この版の変更が `video-pin-background` が見ている経路 (アイドル高画質化 / 動画ピンのタイル保持)
+  に触れていないこと。対象の変更は次のとおり:
+  - バッジレイアウト、rename 移行、ネイティブ名前ダイアログ
+  - **トレイ常駐中の再生継続** — hidden 中の `App::update` を 50ms で起こす経路を新設した。
+    アイドル高画質化とは別の wake 源だが、**静止時の消費は未実測**。次版で
+    `tray-resident` シナリオを足すこと (今回は前 2 シナリオが常駐なしの静止を見ている)。
+  - **スマートフォルダ セッション** — parked grid が keep 範囲分のサムネイルを保持する。
+  - **見開きの表示可否判定 (`FsPageLoadState`)** — 再入ループを止めた側なので、アイドル時の
+    work はむしろ減る。§1.29 参照。
+  - **入力所有権 (raw key permit / IME の viewport 分離)** と **native window health** —
+    後者は native video window が生きている間だけ 1 秒に 1 回 pump へ ping を送る。
+    無再生時は送らないが、**動画を開いたまま放置したときのアイドル影響は未実測**。
 
 ---
 
