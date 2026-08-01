@@ -1,0 +1,4 @@
+hls.js v1.6.16
+https://github.com/video-dev/hls.js
+Apache License 2.0 (hls.LICENSE.txt)
+sha256 442f599c34f103c3355b375a23bdff560592d7117d09a8c847242ea3de2d40e0  hls.min.js

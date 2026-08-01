@@ -286,6 +286,7 @@ test("folder list becomes renderable before spread metadata and open waits for i
           { kind: "dir", name: "child", path: "book/child" },
           { kind: "image", name: "001.jpg", path: "book/001.jpg" },
           { kind: "image", name: "002.jpg", path: "book/002.jpg" },
+          { kind: "video", name: "clip.mp4", path: "book/clip.mp4" },
         ],
       });
     }
@@ -299,7 +300,7 @@ test("folder list becomes renderable before spread metadata and open waits for i
   try {
     const loaded = await loadFolder("favorite", "book", performance.now());
     assert.equal(containerRequested, true);
-    assert.equal(loaded.metrics.entryCount, 3);
+    assert.equal(loaded.metrics.entryCount, 4);
     assert.equal(loaded.metrics.containerCount, 0);
 
     const pageAddress = {

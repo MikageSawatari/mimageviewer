@@ -394,6 +394,12 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             "local-settings.mjs",
             "text/javascript; charset=utf-8",
         ),
+        (Method::Get, "/video-stream.mjs") => {
+            static_file(state, "video-stream.mjs", "text/javascript; charset=utf-8")
+        }
+        (Method::Get, "/vendor/hls.min.js") => {
+            static_file(state, "vendor/hls.min.js", "text/javascript; charset=utf-8")
+        }
         (Method::Get, "/styles.css") => static_file(state, "styles.css", "text/css; charset=utf-8"),
         (Method::Get, "/manifest.webmanifest") => static_file(
             state,
@@ -2442,6 +2448,35 @@ mod tests {
         let response = route(&mut request, &state);
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"export {};");
+    }
+
+    #[test]
+    fn video_stream_modules_are_public_shell_assets_with_exact_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        std::fs::create_dir_all(temp.path().join("vendor")).unwrap();
+        std::fs::write(temp.path().join("video-stream.mjs"), b"export {};").unwrap();
+        std::fs::write(temp.path().join("vendor/hls.min.js"), b"window.Hls={};").unwrap();
+
+        for (path, expected) in [
+            ("/video-stream.mjs", b"export {};".as_slice()),
+            ("/vendor/hls.min.js", b"window.Hls={};".as_slice()),
+        ] {
+            let mut request: Request = TestRequest::new()
+                .with_method(Method::Get)
+                .with_path(path)
+                .into();
+            let response = route(&mut request, &state);
+            assert_eq!(response.status, 200, "{path}");
+            assert_eq!(response.content_type, "text/javascript; charset=utf-8");
+            assert_eq!(response.body, expected);
+        }
+
+        let mut prefix_request: Request = TestRequest::new()
+            .with_method(Method::Get)
+            .with_path("/vendor/hls.min.js/extra")
+            .into();
+        assert_eq!(route(&mut prefix_request, &state).status, 401);
     }
 
     #[test]

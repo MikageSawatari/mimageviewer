@@ -41,6 +41,10 @@ export const CommandName = Object.freeze({
   GRID_PAGE_PREV: "grid_page_prev",
   GRID_PAGE_NEXT: "grid_page_next",
   GRID_SELECT: "grid_select",
+  MEDIA_TOGGLE_PLAY: "media_toggle_play",
+  MEDIA_SEEK_RELATIVE: "media_seek_relative",
+  MEDIA_VOLUME: "media_volume",
+  MEDIA_QUALITY: "media_quality",
 });
 
 export const FitMode = Object.freeze({
@@ -70,6 +74,13 @@ export const ViewerGesture = Object.freeze({
   SWIPE_DOWN: "swipe_down",
   PAN: "pan",
 });
+
+export const VIDEO_QUALITY_PRESETS = Object.freeze([
+  Object.freeze({ id: "minimum", label: "最小", traffic: "約 210 MB / 時" }),
+  Object.freeze({ id: "low", label: "低", traffic: "約 400 MB / 時" }),
+  Object.freeze({ id: "standard", label: "標準", traffic: "約 730 MB / 時" }),
+  Object.freeze({ id: "high", label: "高", traffic: "約 1.4 GB / 時" }),
+]);
 
 export function command(name, payload = {}) {
   return { name, payload };
@@ -117,6 +128,24 @@ export function commandFromKey(input, context) {
     if (plain && key === "3") return command(CommandName.SPREAD_LTR_COVER);
     if (plain && key === "4") return command(CommandName.SPREAD_RTL);
     if (plain && key === "5") return command(CommandName.SPREAD_RTL_COVER);
+    return null;
+  }
+
+  if (context === "media") {
+    if (plain && key === " " && !input.repeat) {
+      return command(CommandName.MEDIA_TOGGLE_PLAY);
+    }
+    if (plain && key === "ArrowLeft") {
+      return command(CommandName.MEDIA_SEEK_RELATIVE, { seconds: -10 });
+    }
+    if (plain && key === "ArrowRight") {
+      return command(CommandName.MEDIA_SEEK_RELATIVE, { seconds: 10 });
+    }
+    if (plain && key === "ArrowDown") return command(CommandName.NEXT_PAGE);
+    if (plain && key === "ArrowUp") return command(CommandName.PREV_PAGE);
+    if (plain && ["Backspace", "Enter", "Escape"].includes(key) && !input.repeat) {
+      return command(CommandName.BACK);
+    }
     return null;
   }
 
@@ -340,6 +369,153 @@ export function viewerTapCommand(clientX, width, rtl = false) {
   if (ratio < 0.34) return command(rtl ? CommandName.NEXT_PAGE : CommandName.PREV_PAGE);
   if (ratio > 0.66) return command(rtl ? CommandName.PREV_PAGE : CommandName.NEXT_PAGE);
   return command(CommandName.TOGGLE_VIEWER_BARS);
+}
+
+export function videoTapCommand(clientX, width) {
+  const ratio = Math.max(0, Math.min(1, Number(clientX) / Math.max(1, Number(width) || 1)));
+  if (ratio < 0.34) {
+    return command(CommandName.MEDIA_SEEK_RELATIVE, { seconds: -10 });
+  }
+  if (ratio > 0.66) {
+    return command(CommandName.MEDIA_SEEK_RELATIVE, { seconds: 10 });
+  }
+  return command(CommandName.MEDIA_TOGGLE_PLAY);
+}
+
+export function videoPlaybackDecision(nativeHlsCanPlayType) {
+  const nativeHls = ["maybe", "probably"].includes(
+    String(nativeHlsCanPlayType ?? "").toLowerCase()
+  );
+  return nativeHls
+    ? { mode: "native", loadHlsJs: false }
+    : { mode: "hls_js", loadHlsJs: true };
+}
+
+export function videoQualityPreset(quality) {
+  return VIDEO_QUALITY_PRESETS.find((preset) => preset.id === quality) ??
+    VIDEO_QUALITY_PRESETS.find((preset) => preset.id === "standard");
+}
+
+export function videoTimelineAnchor({
+  serverPositionSecs,
+  mediaCurrentTimeSecs,
+  seekableEndSecs,
+  durationSecs,
+}) {
+  const duration = Math.max(0, Number(durationSecs) || 0);
+  const mediaTime = Math.max(0, Number(mediaCurrentTimeSecs) || 0);
+  const serverPosition = Math.max(0, Number(serverPositionSecs) || 0);
+  const seekableEnd = Number(seekableEndSecs);
+  const liveLag = Number.isFinite(seekableEnd)
+    ? Math.max(0, seekableEnd - mediaTime)
+    : 0;
+  return {
+    sourcePositionSecs: clampNumber(serverPosition - liveLag, 0, duration || serverPosition),
+    mediaTimeSecs: mediaTime,
+  };
+}
+
+export function videoTimelinePosition({
+  anchorSourcePositionSecs,
+  anchorMediaTimeSecs,
+  mediaCurrentTimeSecs,
+  durationSecs,
+}) {
+  const duration = Math.max(0, Number(durationSecs) || 0);
+  const position =
+    (Number(anchorSourcePositionSecs) || 0) +
+    (Number(mediaCurrentTimeSecs) || 0) -
+    (Number(anchorMediaTimeSecs) || 0);
+  return clampNumber(position, 0, duration || Math.max(0, position));
+}
+
+export function videoSeekPlan({
+  targetPositionSecs,
+  durationSecs,
+  anchorSourcePositionSecs,
+  anchorMediaTimeSecs,
+  seekableRanges = [],
+}) {
+  const duration = Math.max(0, Number(durationSecs) || 0);
+  const positionSecs = clampNumber(
+    Number(targetPositionSecs) || 0,
+    0,
+    duration || Math.max(0, Number(targetPositionSecs) || 0)
+  );
+  const mediaTimeSecs =
+    (Number(anchorMediaTimeSecs) || 0) +
+    positionSecs -
+    (Number(anchorSourcePositionSecs) || 0);
+  const local = seekableRanges.some((range) => {
+    const start = Number(Array.isArray(range) ? range[0] : range?.start);
+    const end = Number(Array.isArray(range) ? range[1] : range?.end);
+    return Number.isFinite(start) && Number.isFinite(end) &&
+      mediaTimeSecs >= start && mediaTimeSecs <= end;
+  });
+  return local
+    ? { kind: "local", positionSecs, mediaTimeSecs }
+    : { kind: "remote", positionSecs, mediaTimeSecs: null };
+}
+
+export function bufferingQualitySuggestion({
+  waitingSinceMs,
+  nowMs,
+  quality,
+  thresholdMs = 3000,
+}) {
+  if (!Number.isFinite(waitingSinceMs) ||
+      Number(nowMs) - Number(waitingSinceMs) < Math.max(0, Number(thresholdMs) || 0)) {
+    return null;
+  }
+  const index = VIDEO_QUALITY_PRESETS.findIndex((preset) => preset.id === quality);
+  if (index <= 0) return null;
+  return VIDEO_QUALITY_PRESETS[index - 1];
+}
+
+export function videoHttpStatusDecision(status, retryAfterSeconds = 1) {
+  const code = Number(status) || 0;
+  if (code === 503) {
+    return {
+      kind: "waiting",
+      retry: true,
+      retryDelayMs: Math.max(1, Number(retryAfterSeconds) || 1) * 1000,
+      message: "配信の準備を待っています。",
+    };
+  }
+  if (code === 410) {
+    return {
+      kind: "gone",
+      retry: false,
+      retryDelayMs: 0,
+      message: "再生が配信に追いつけず、必要な区間が保持範囲から外れました。",
+    };
+  }
+  if (code === 409) {
+    return {
+      kind: "generation_mismatch",
+      retry: true,
+      retryDelayMs: 0,
+      message: "配信が更新されたため、新しいプレイリストを取得しています。",
+    };
+  }
+  if (code === 404) {
+    return {
+      kind: "not_found",
+      retry: false,
+      retryDelayMs: 0,
+      message: "配信データが見つかりません。",
+    };
+  }
+  return {
+    kind: "error",
+    retry: false,
+    retryDelayMs: 0,
+    message: `配信データを取得できません (HTTP ${code || "不明"})。`,
+  };
+}
+
+function clampNumber(value, minimum, maximum) {
+  return Math.max(minimum, Math.min(maximum, value));
 }
 
 export function viewerSeekGroupIndex(physicalValue, groupCount, rtl = false) {

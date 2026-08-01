@@ -747,6 +747,62 @@ button {
   user-select: none;
 }
 
+.stream-video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  object-fit: contain;
+  pointer-events: auto;
+  user-select: none;
+}
+
+.video-stream-notice {
+  position: absolute;
+  z-index: 4;
+  top: 50%;
+  left: 50%;
+  display: grid;
+  width: min(560px, calc(100vw - 32px));
+  justify-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+  border: 1px solid rgb(255 255 255 / 18%);
+  border-radius: 16px;
+  color: #f5f7fc;
+  background: rgb(16 20 28 / 88%);
+  box-shadow: 0 12px 40px rgb(0 0 0 / 50%);
+  line-height: 1.5;
+  text-align: center;
+  transform: translate(-50%, -50%);
+  backdrop-filter: blur(12px);
+}
+
+.video-stream-notice[hidden] {
+  display: none;
+}
+
+.video-stream-notice[data-kind="waiting"],
+.video-stream-notice[data-kind="buffering"] {
+  border-color: rgb(111 161 239 / 65%);
+}
+
+.video-stream-notice[data-kind="gone"],
+.video-stream-notice[data-kind="error"] {
+  border-color: rgb(239 141 111 / 70%);
+}
+
+.video-stream-notice button {
+  min-height: 42px;
+  padding: 8px 14px;
+  border: 1px solid rgb(120 165 235 / 75%);
+  border-radius: 11px;
+  color: #f5f8ff;
+  background: rgb(69 111 181 / 72%);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
 .viewer-pages {
   display: flex;
   flex: 0 0 auto;
@@ -896,6 +952,17 @@ button {
   text-shadow: 0 1px 4px #000;
 }
 
+.video-stream-diagnostics {
+  overflow: hidden;
+  color: rgb(216 220 229 / 76%);
+  font-size: 0.7rem;
+  line-height: 1.3;
+  text-align: center;
+  text-overflow: ellipsis;
+  text-shadow: 0 1px 4px #000;
+  white-space: nowrap;
+}
+
 .viewer-seek {
   display: grid;
   min-width: 0;
@@ -1029,6 +1096,36 @@ button {
   font: 600 0.76rem/1.35 ui-monospace, "SFMono-Regular", Consolas, monospace;
   overflow-wrap: anywhere;
   text-align: left;
+}
+
+.command-menu-action.is-current {
+  border-color: rgb(115 157 226 / 84%);
+  background: rgb(73 112 181 / 48%);
+}
+
+.video-menu-volume {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 8px;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--surface-raised);
+}
+
+.video-menu-volume-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.video-menu-volume input {
+  width: 100%;
+  height: 28px;
+  margin: 0;
+  accent-color: var(--accent);
+  touch-action: none;
 }
 
 .command-shortcut-title {

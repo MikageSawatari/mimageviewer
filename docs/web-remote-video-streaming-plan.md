@@ -5,11 +5,10 @@
 
 - 親計画: [web-remote-plan.md](web-remote-plan.md) (リモート閲覧機能全体の正本)
 - ブランチ: `web-remote` (worktree: `C:\home\mimageviewer-web`)
-- 現在のフェーズ: **第 1 段 増分 6/7 実装済み** (encoder 抽象 / fallback / 画質
+- 現在のフェーズ: **第 1 段 増分 7/7 実装済み、実機検証待ち** (encoder 抽象 / fallback / 画質
   preset + 映像・音声 fMP4 segmenter / ring / m3u8 + audio tap / AAC + decoder-output
   video tap / HW download / scale / H.264 input + streaming session / remote owner 連携 /
-  generation / 設定 + protocol v15 IPC / HTTP・HLS ルート、2026-08-02)。残りはフロント
-  (増分 7)
+  generation / 設定 + protocol v15 IPC / HTTP・HLS ルート + Web フロント、2026-08-02)
 
 ---
 
@@ -535,6 +534,22 @@ allowlist と canonical containment を再検証する ([web-remote-plan.md](web
   (自動では下げない。§2 のとおり ABR は持たない)
 - iOS のバックグラウンド復帰時はセッション生存を `/api/video/state` で確認し、
   失効していれば同じ位置で `start` をやり直す
+
+#### 増分 7 実装記録 (フロントエンド、2026-08-02)
+
+- `canPlayType('application/vnd.apple.mpegurl')` が `maybe` / `probably` の端末は native HLS とし、
+  `vendor/hls.min.js` は読み込まない。それ以外の端末だけ、完全一致の public shell asset
+  `/vendor/hls.min.js` を script 要素で遅延ロードする。playlist / segment / video API は従来どおり
+  認証 guard 下で、native video、playlist probe、hls.js XHR のすべてを同一 origin Cookie 経路にした
+- シーク表示は state poll 時の本体位置から HLS live edge との差を引き、その source 位置と
+  `<video>.currentTime` をアンカーにして次の poll まで補間する。対象を `seekable` へ逆写像できる
+  場合は video 内だけで移動し、範囲外は `/api/video/seek` の新 generation / playlist へ差し替える
+- `waiting` 継続 3 秒で 1 段下の画質と 1 時間あたり通信量を提示し、利用者がボタンを押した時だけ
+  `media_quality` を送る。503 は `Retry-After` 後に再試行、410 は ring に追いつけなかった表示と
+  明示再接続、409 は state の current generation から playlist を再取得する
+- 動画のタップ、スワイプ、Space、矢印、音量、画質、F11 は `command-core.mjs` の既存 command
+  dispatch に統合した。`<video controls>` は使わず、シークバー、音量、画質 UI は自前 DOM とした。
+  visibility 復帰時に session が失効していれば、表示中の全体動画位置を保持して start + seek する
 
 ---
 

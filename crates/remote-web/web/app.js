@@ -45,6 +45,7 @@ import {
   loadLocalSettings,
   saveLocalSettings,
 } from "./local-settings.mjs";
+import { VideoStreamViewer } from "./video-stream.mjs";
 
 const app = document.querySelector("#app");
 const hudElement = document.querySelector("#telemetry-hud");
@@ -362,7 +363,11 @@ if (!RUNTIME_TEST_MODE) {
   }
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible" && state.authenticated) {
-      acquireRemoteSession("visibility_resume").catch(() => {});
+      acquireRemoteSession("visibility_resume")
+        .then(() => state.viewer?.isVideoStreamViewer
+          ? state.viewer.handleVisibilityResume()
+          : undefined)
+        .catch(() => {});
     }
   });
   boot();
@@ -659,13 +664,44 @@ async function dispatchRoute() {
       return;
     }
     if (route.kind === "media") {
-      await loadContainer(parentContainerAddress(route.address));
-      const index = state.images.findIndex(
+      const parentAddress = parentContainerAddress(route.address);
+      if (route.address.subresource.kind === "file") {
+        const loaded = await loadFolder(
+          parentAddress.favorite_id,
+          parentAddress.relative_path,
+          performance.now()
+        );
+        if (!loaded) return;
+        const entryIndex = state.entries.findIndex(
+          (entry) => addressIdentity(entryAddress(entry)) === addressIdentity(route.address)
+        );
+        const entry = state.entries[entryIndex];
+        if (!entry) {
+          throw new Error("フォルダ内のメディアが見つかりませんでした。");
+        }
+        if (entry.kind === "video") {
+          state.gridIndex = entryIndex;
+          renderVideoViewer(entry);
+          return;
+        }
+        const imageIndex = await activateFolderContainerForImage(route.address, entryIndex);
+        if (imageIndex < 0) {
+          throw new Error("表示できるメディアが見つかりませんでした。");
+        }
+        renderImageViewer(imageIndex, performance.now());
+        return;
+      }
+      await loadContainer(parentAddress);
+      const entry = state.entries.find(
         (entry) => addressIdentity(entryAddress(entry)) === addressIdentity(route.address)
       );
-      if (index < 0) {
+      if (!entry) {
         throw new Error("コンテナ内のページが見つかりませんでした。");
       }
+      const index = state.images.findIndex(
+        (image) => entryIdentity(image) === entryIdentity(entry)
+      );
+      if (index < 0) throw new Error("表示できるメディアが見つかりませんでした。");
       renderImageViewer(index, performance.now());
       return;
     }
@@ -912,6 +948,10 @@ function dispatchCommand(requested, meta = {}) {
         state.viewerBarsVisible ? "上下バーを隠す" : "上下バーを表示"
       );
       handled = true;
+    } else if (state.viewer?.isVideoStreamViewer) {
+      if (requested.name === CommandName.NEXT_PAGE) handled = changeVideoFile(1);
+      else if (requested.name === CommandName.PREV_PAGE) handled = changeVideoFile(-1);
+      else handled = state.viewer.execute(requested);
     } else if (requested.name === CommandName.NEXT_PAGE) handled = changeImage(1);
     else if (requested.name === CommandName.PREV_PAGE) handled = changeImage(-1);
     else if (requested.name === CommandName.FIRST_PAGE) handled = changeImageTo(0);
@@ -979,8 +1019,13 @@ function executeOpenCommand(payload, meta) {
     navigate(containerHash(payload.address));
     return true;
   }
+  const addressedMediaEntry = payload.kind === "media" && payload.address
+    ? state.entries.find(
+        (entry) => addressIdentity(entryAddress(entry)) === addressIdentity(payload.address)
+      )
+    : null;
   if (
-    (payload.kind === "image" || payload.kind === "media") &&
+    (payload.kind === "image" || addressedMediaEntry?.kind === "image") &&
     !state.collection &&
     !state.container &&
     state.folderContainerLoad
@@ -988,10 +1033,11 @@ function executeOpenCommand(payload, meta) {
     return openFolderImageFromGrid(payload, meta);
   }
   if (payload.kind === "media" && payload.address) {
+    const addressedEntry = addressedMediaEntry;
     const imageIndex = state.images.findIndex(
       (entry) => addressIdentity(entryAddress(entry)) === addressIdentity(payload.address)
     );
-    if (imageIndex < 0) return false;
+    if (!addressedEntry || (addressedEntry.kind !== "video" && imageIndex < 0)) return false;
     if (Number.isInteger(payload.entryIndex)) state.gridIndex = payload.entryIndex;
     tryEnterBrowserFullscreen();
     history.pushState(
@@ -1005,7 +1051,8 @@ function executeOpenCommand(payload, meta) {
       "",
       mediaHash(payload.address)
     );
-    renderImageViewer(imageIndex, meta.at ?? performance.now());
+    if (addressedEntry.kind === "video") renderVideoViewer(addressedEntry);
+    else renderImageViewer(imageIndex, meta.at ?? performance.now());
     return true;
   }
   if (
@@ -1140,6 +1187,12 @@ function openGridEntry(index, meta) {
       meta
     );
   }
+  if (entry.kind === "video") {
+    return executeOpenCommand(
+      { kind: "media", address: entryAddress(entry), entryIndex: index },
+      meta
+    );
+  }
   if (entry.kind !== "image") return false;
   const imageIndex = state.images.findIndex(
     (image) => entryIdentity(image) === entryIdentity(entry)
@@ -1193,7 +1246,7 @@ function onGlobalKeyDown(event) {
       menuOpen: Boolean(state.commandMenu?.isOpen()),
       rtl: isRtlReadingDirection(state.readingDirection),
     },
-    state.screenContext
+    state.viewer?.isVideoStreamViewer ? "media" : state.screenContext
   );
   if (!requested) return;
   event.preventDefault();
@@ -2067,6 +2120,7 @@ export async function loadFolder(
     (entry) =>
       entry.kind === "dir" ||
       entry.kind === "image" ||
+      entry.kind === "video" ||
       entry.kind === "zip" ||
       entry.kind === "pdf"
   );
@@ -2386,6 +2440,18 @@ function createGridTile(
           });
         }
       });
+    } else if (entry.kind === "video") {
+      tile.addEventListener("click", (event) => {
+        dispatchCommand(command(CommandName.OPEN, {
+          kind: "media",
+          address: entryAddress(entry),
+          entryIndex,
+        }), {
+          source: inputSourceFromEvent(event),
+          detail: "grid_tile",
+          at: performance.now(),
+        });
+      });
     } else if (["zip", "pdf", "directory"].includes(entry.kind)) {
       tile.addEventListener("click", (event) => {
         dispatchCommand(
@@ -2530,6 +2596,68 @@ function entryTypeLabel(kind) {
     archive: "archive",
     other: "file",
   }[kind] ?? kind;
+}
+
+function renderVideoViewer(entry) {
+  if (!entry || entry.kind !== "video") return;
+  cleanupScreen();
+  state.screenContext = "viewer";
+  state.viewerItemState = null;
+  state.viewerItemStateSequence += 1;
+  state.imageIndex = -1;
+  document.title = `${entry.name} — mIV Remote`;
+  const viewer = new VideoStreamViewer({
+    entry,
+    address: entryAddress(entry),
+    dispatch: (requested, meta) => dispatchCommand(requested, meta),
+    inputSource: inputSourceFromEvent,
+    apiJson,
+    apiPostJson,
+    keyboardAvailable: shouldShowKeyboardShortcuts({
+      coarsePointer: state.coarsePointer,
+      keyboardUsed: state.keyboardInputSeen,
+    }),
+  });
+  if (!state.viewerBarsVisible) viewer.setBarsVisible(false);
+  state.viewer = viewer;
+  state.commandMenu = viewer.menu;
+  app.append(viewer.root);
+  viewer.start().catch((error) => {
+    if (state.viewer === viewer) {
+      viewer.showOperationalError(error, "動画を開始できませんでした");
+    }
+  });
+}
+
+function changeVideoFile(delta) {
+  const viewer = state.viewer;
+  if (!viewer?.isVideoStreamViewer) return false;
+  const videos = state.entries.filter((entry) => entry.kind === "video");
+  const current = videos.findIndex(
+    (entry) => addressIdentity(entryAddress(entry)) === addressIdentity(viewer.address)
+  );
+  const nextIndex = current + Math.sign(Number(delta) || 0);
+  if (current < 0 || nextIndex < 0 || nextIndex >= videos.length) {
+    viewer.showBoundaryMessage(nextIndex < 0 ? "先頭の動画です" : "最後の動画です");
+    return true;
+  }
+  const entry = videos[nextIndex];
+  const entryIndex = state.entries.findIndex(
+    (candidate) => entryIdentity(candidate) === entryIdentity(entry)
+  );
+  if (entryIndex >= 0) state.gridIndex = entryIndex;
+  history.pushState(
+    {
+      ...(history.state ?? {}),
+      mivRoute: true,
+      viewerFromGrid: Boolean(history.state?.viewerFromGrid),
+      viewerDepth: (Number(history.state?.viewerDepth) || 0) + 1,
+    },
+    "",
+    mediaHash(entryAddress(entry))
+  );
+  renderVideoViewer(entry);
+  return true;
 }
 
 function renderImageViewer(index, interactionStartedAt = performance.now()) {
@@ -4913,9 +5041,13 @@ async function apiJson(path, params = {}, signal) {
   }
   if (!response.ok) {
     const detail = await response.clone().json().catch(() => ({}));
-    throw new Error(
+    const error = new Error(
       detail.message || `読み込みに失敗しました (HTTP ${response.status})。`
     );
+    error.status = response.status;
+    error.code = detail.error;
+    error.retryAfterSeconds = Number(response.headers.get("Retry-After")) || 1;
+    throw error;
   }
   return response.json();
 }
@@ -4944,6 +5076,7 @@ async function apiPostJson(path, body, signal) {
     );
     error.status = response.status;
     error.code = detail.error;
+    error.retryAfterSeconds = Number(response.headers.get("Retry-After")) || 1;
     throw error;
   }
   return response.json();

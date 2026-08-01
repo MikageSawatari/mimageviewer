@@ -7,6 +7,8 @@ import {
   ReadingDirection,
   SpreadMode,
   ViewerGesture,
+  VIDEO_QUALITY_PRESETS,
+  bufferingQualitySuggestion,
   clampGridColumnOverride,
   commandFromKey,
   containerPageTargetPx,
@@ -46,6 +48,13 @@ import {
   viewerSeekState,
   viewerSpreadLayout,
   viewerWheelCommand,
+  videoHttpStatusDecision,
+  videoPlaybackDecision,
+  videoQualityPreset,
+  videoSeekPlan,
+  videoTapCommand,
+  videoTimelineAnchor,
+  videoTimelinePosition,
 } from "./command-core.mjs";
 
 const key = (value, extra = {}) => ({ key: value, ...extra });
@@ -77,6 +86,115 @@ test("viewer keys map to the shared page and menu commands", () => {
   assert.equal(commandFromKey(key("0"), "viewer").name, CommandName.FIT_CYCLE);
   assert.equal(commandFromKey(key("1"), "viewer").name, CommandName.SPREAD_SINGLE);
   assert.equal(commandFromKey(key("5"), "viewer").name, CommandName.SPREAD_RTL_COVER);
+});
+
+test("media keys and tap zones map to the existing media command layer", () => {
+  assert.deepEqual(commandFromKey(key(" "), "media"), {
+    name: CommandName.MEDIA_TOGGLE_PLAY,
+    payload: {},
+  });
+  assert.equal(
+    commandFromKey(key("ArrowLeft"), "media").payload.seconds,
+    -10
+  );
+  assert.equal(
+    commandFromKey(key("ArrowRight"), "media").payload.seconds,
+    10
+  );
+  assert.equal(commandFromKey(key("ArrowUp"), "media").name, CommandName.PREV_PAGE);
+  assert.equal(commandFromKey(key("ArrowDown"), "media").name, CommandName.NEXT_PAGE);
+  assert.equal(videoTapCommand(20, 300).payload.seconds, -10);
+  assert.equal(videoTapCommand(150, 300).name, CommandName.MEDIA_TOGGLE_PLAY);
+  assert.equal(videoTapCommand(280, 300).payload.seconds, 10);
+});
+
+test("native HLS support avoids loading hls.js on iOS Safari", () => {
+  assert.deepEqual(videoPlaybackDecision("probably"), {
+    mode: "native",
+    loadHlsJs: false,
+  });
+  assert.deepEqual(videoPlaybackDecision("maybe"), {
+    mode: "native",
+    loadHlsJs: false,
+  });
+  assert.deepEqual(videoPlaybackDecision(""), {
+    mode: "hls_js",
+    loadHlsJs: true,
+  });
+});
+
+test("whole-video position composes server state with the HLS window", () => {
+  const anchor = videoTimelineAnchor({
+    serverPositionSecs: 300,
+    mediaCurrentTimeSecs: 55,
+    seekableEndSecs: 60,
+    durationSecs: 600,
+  });
+  assert.deepEqual(anchor, { sourcePositionSecs: 295, mediaTimeSecs: 55 });
+  assert.equal(videoTimelinePosition({
+    anchorSourcePositionSecs: anchor.sourcePositionSecs,
+    anchorMediaTimeSecs: anchor.mediaTimeSecs,
+    mediaCurrentTimeSecs: 57,
+    durationSecs: 600,
+  }), 297);
+
+  assert.deepEqual(videoSeekPlan({
+    targetPositionSecs: 270,
+    durationSecs: 600,
+    anchorSourcePositionSecs: anchor.sourcePositionSecs,
+    anchorMediaTimeSecs: anchor.mediaTimeSecs,
+    seekableRanges: [[0, 60]],
+  }), { kind: "local", positionSecs: 270, mediaTimeSecs: 30 });
+  assert.deepEqual(videoSeekPlan({
+    targetPositionSecs: 200,
+    durationSecs: 600,
+    anchorSourcePositionSecs: anchor.sourcePositionSecs,
+    anchorMediaTimeSecs: anchor.mediaTimeSecs,
+    seekableRanges: [[0, 60]],
+  }), { kind: "remote", positionSecs: 200, mediaTimeSecs: null });
+});
+
+test("three seconds of waiting only proposes one lower quality", () => {
+  assert.equal(bufferingQualitySuggestion({
+    waitingSinceMs: 1000,
+    nowMs: 3999,
+    quality: "standard",
+  }), null);
+  assert.equal(bufferingQualitySuggestion({
+    waitingSinceMs: 1000,
+    nowMs: 4000,
+    quality: "standard",
+  }).id, "low");
+  assert.equal(bufferingQualitySuggestion({
+    waitingSinceMs: 1000,
+    nowMs: 5000,
+    quality: "minimum",
+  }), null);
+});
+
+test("stream HTTP statuses keep waiting, gone and generation mismatch distinct", () => {
+  assert.deepEqual(videoHttpStatusDecision(503, 4), {
+    kind: "waiting",
+    retry: true,
+    retryDelayMs: 4000,
+    message: "配信の準備を待っています。",
+  });
+  assert.equal(videoHttpStatusDecision(410).kind, "gone");
+  assert.equal(videoHttpStatusDecision(409).kind, "generation_mismatch");
+  assert.equal(videoHttpStatusDecision(404).kind, "not_found");
+});
+
+test("quality presets keep their traffic estimates attached to the command value", () => {
+  assert.deepEqual(
+    VIDEO_QUALITY_PRESETS.map(({ id, label, traffic }) => [id, label, traffic]),
+    [
+      ["minimum", "最小", "約 210 MB / 時"],
+      ["low", "低", "約 400 MB / 時"],
+      ["standard", "標準", "約 730 MB / 時"],
+      ["high", "高", "約 1.4 GB / 時"],
+    ]
+  );
+  assert.equal(videoQualityPreset("unknown").id, "standard");
 });
 
 test("RTL reverses only physical horizontal viewer keys and tap zones", () => {
