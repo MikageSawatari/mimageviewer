@@ -58,6 +58,7 @@ pub mod dwm_transitions {
 pub mod edit_bundle;
 mod edit_bundle_app;
 pub mod edit_preview_cache;
+mod edit_source;
 pub mod editing_addon;
 pub mod editing_addon_download;
 pub mod egui_focus_policy;

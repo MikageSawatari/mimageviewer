@@ -60,6 +60,42 @@ pub fn load_comic_fonts() -> Option<FontSet> {
     None
 }
 
+pub(crate) fn referenced_font_keys(objects: &[AnnotationObject]) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut add = |key: &str| {
+        if !key.is_empty() && key != COMIC_FONT_KEY && !keys.iter().any(|existing| existing == key)
+        {
+            keys.push(key.to_string());
+        }
+    };
+    for object in objects {
+        if let Some(text) = object.text_block() {
+            add(&text.font_key);
+        }
+        if let comic_core::AnnotationKind::MessageWindow(window) = &object.kind {
+            add(&window.name_plate.name.font_key);
+        }
+    }
+    keys
+}
+
+pub(crate) fn load_comic_fonts_for(objects: &[AnnotationObject]) -> Option<FontSet> {
+    let mut fonts = load_comic_fonts()?;
+    let (_, paths) = crate::font_assets::enumerate_comic_fonts();
+    for key in referenced_font_keys(objects) {
+        let Some(path) = paths.get(&key) else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        if let Ok(font) = LoadedFont::from_bytes(key, bytes) {
+            fonts.insert(font);
+        }
+    }
+    Some(fonts)
+}
+
 /// comic-core の straight-alpha `RgbaOverlay` を `base` の上に src-over 合成し、
 /// `base` と同寸の新しい `ColorImage` を返す純関数。
 ///

@@ -444,7 +444,18 @@ impl CropDb {
         Ok(Self { conn })
     }
 
-    fn db_path() -> PathBuf {
+    pub fn open_readonly(path: &Path) -> Result<Self, rusqlite::Error> {
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(750))?;
+        Ok(Self { conn })
+    }
+
+    pub fn db_path() -> PathBuf {
         crate::data_dir::get().join("export_crop.db")
     }
 
@@ -469,6 +480,31 @@ impl CropDb {
             })
         })
         .ok()
+    }
+
+    pub(crate) fn get_checked(&self, page_key: &str) -> Result<Option<CropSettings>, String> {
+        use rusqlite::OptionalExtension as _;
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT min_x, min_y, max_x, max_y, aspect_mode
+                 FROM export_crop_pages WHERE page_path = ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        stmt.query_row([page_key], |row| {
+            let aspect: String = row.get(4)?;
+            Ok(CropSettings {
+                rect: CropRect {
+                    min_x: row.get::<_, f32>(0)?,
+                    min_y: row.get::<_, f32>(1)?,
+                    max_x: row.get::<_, f32>(2)?,
+                    max_y: row.get::<_, f32>(3)?,
+                },
+                aspect_mode: CropAspectMode::from_stable_key(&aspect),
+            })
+        })
+        .optional()
+        .map_err(|error| error.to_string())
     }
 
     pub fn set(&self, page_key: &str, settings: CropSettings) -> Result<(), rusqlite::Error> {

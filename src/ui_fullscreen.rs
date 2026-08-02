@@ -23743,17 +23743,7 @@ impl App {
     }
 
     pub(crate) fn current_conceal_preset_from_settings(&self) -> crate::conceal::ConcealPreset {
-        crate::conceal::ConcealPreset {
-            name: "現在の設定".to_string(),
-            conceal_type: self.settings.conceal_type,
-            mosaic_tile_mode: self.settings.conceal_mosaic_tile_mode,
-            mosaic_boundary: self.settings.conceal_mosaic_boundary,
-            fill_opacity_percent: self.settings.conceal_fill_opacity_percent,
-            fill_edge: self.settings.conceal_fill_edge,
-            blur_radius_px: self.settings.conceal_blur_radius_px,
-            blur_mode: self.settings.conceal_blur_mode,
-            blur_feather: self.settings.conceal_blur_feather,
-        }
+        crate::conceal::ConcealPreset::from_settings(&self.settings)
     }
 
     /// 動画のチャプター開始 / ブックマーク / ピンを 1 本の Vec に集約し pts 昇順で返す。

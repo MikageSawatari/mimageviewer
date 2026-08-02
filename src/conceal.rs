@@ -282,6 +282,22 @@ impl Default for ConcealPreset {
     }
 }
 
+impl ConcealPreset {
+    pub(crate) fn from_settings(settings: &crate::settings::Settings) -> Self {
+        Self {
+            name: "現在の設定".to_string(),
+            conceal_type: settings.conceal_type,
+            mosaic_tile_mode: settings.conceal_mosaic_tile_mode,
+            mosaic_boundary: settings.conceal_mosaic_boundary,
+            fill_opacity_percent: settings.conceal_fill_opacity_percent,
+            fill_edge: settings.conceal_fill_edge,
+            blur_radius_px: settings.conceal_blur_radius_px,
+            blur_mode: settings.conceal_blur_mode,
+            blur_feather: settings.conceal_blur_feather,
+        }
+    }
+}
+
 /// Settings のデフォルト値 (1% 刻みスライダーの 100%)。
 pub fn default_fill_opacity() -> u8 {
     100

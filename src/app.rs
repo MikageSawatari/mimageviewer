@@ -3580,7 +3580,7 @@ fn run_local_materialize(
     if cancel.load(Ordering::Relaxed) {
         return EditMaterializeResult::Cancelled { request };
     }
-    let mut layers = match layers_source {
+    let layers = match layers_source {
         LocalMaterializeLayers::Memory(layers) => layers,
         LocalMaterializeLayers::Database { path, page_key } => {
             let db_t0 = std::time::Instant::now();
@@ -3638,42 +3638,8 @@ fn run_local_materialize(
         return EditMaterializeResult::Cancelled { request };
     }
 
-    let [width, height] = source.size;
-    let raster_t0 = std::time::Instant::now();
-    for layer in &mut layers {
-        if cancel.load(Ordering::Relaxed) {
-            return EditMaterializeResult::Cancelled { request };
-        }
-        if !layer.masks_match_dims(width.max(1), height.max(1)) {
-            layer.resize_masks_to(width.max(1), height.max(1));
-        }
-    }
-    emit_edit_materialize_ms(
-        "raster",
-        "local_mask_resize",
-        perf_key.as_deref(),
-        request.input_seq,
-        raster_t0,
-    );
-
-    if !layers
-        .iter()
-        .any(|layer| layer.enabled && layer.opacity > 0.0)
-    {
-        return EditMaterializeResult::Ready {
-            request,
-            payload: EditMaterializePayload::LocalInactive { layers },
-        };
-    }
     let compose_t0 = std::time::Instant::now();
-    let rgba = crate::capture::color_image_to_rgba(&source);
-    let src = local_adjust_core::RgbaImageRef {
-        width,
-        height,
-        pixels: &rgba,
-    };
-    let rendered =
-        local_adjust_core::apply_layers_with_progress(src, &layers, Some(&cancel), |_| {});
+    let rendered = crate::edit_source::materialize_local_adjust(&source, layers, &cancel);
     emit_edit_materialize_ms(
         "compose",
         "local",
@@ -3682,17 +3648,19 @@ fn run_local_materialize(
         compose_t0,
     );
     match rendered {
-        Ok(out) if !cancel.load(Ordering::Relaxed) => EditMaterializeResult::Ready {
+        Ok(_) if cancel.load(Ordering::Relaxed) => EditMaterializeResult::Cancelled { request },
+        Ok(out) if out.active => EditMaterializeResult::Ready {
             request,
             payload: EditMaterializePayload::LocalReady {
-                layers,
-                image: egui::ColorImage::from_rgba_unmultiplied(
-                    [out.width, out.height],
-                    &out.pixels,
-                ),
+                layers: out.layers,
+                image: (*out.pixels).clone(),
             },
         },
-        Ok(_) | Err(local_adjust_core::LocalAdjustError::Cancelled) => {
+        Ok(out) => EditMaterializeResult::Ready {
+            request,
+            payload: EditMaterializePayload::LocalInactive { layers: out.layers },
+        },
+        Err(crate::edit_source::EditSourceError::Cancelled) => {
             EditMaterializeResult::Cancelled { request }
         }
         Err(err) => EditMaterializeResult::Failed {
@@ -3781,7 +3749,7 @@ fn run_conceal_materialize(
     if cancel.load(Ordering::Relaxed) {
         return EditMaterializeResult::Cancelled { request };
     }
-    let (mut bitmap, shapes) = loaded.unwrap_or_else(|| (vec![false; w * h], Vec::new()));
+    let (bitmap, shapes) = loaded.unwrap_or_else(|| (vec![false; w * h], Vec::new()));
     if matches!(
         request.kind,
         EditMaterializeKind::Conceal {
@@ -3809,51 +3777,40 @@ fn run_conceal_materialize(
         };
     }
 
-    let raster_t0 = std::time::Instant::now();
-    if !crate::mask_db::rasterize_shapes_into_cancel(&mut bitmap, &shapes, w, h, &cancel) {
-        return EditMaterializeResult::Cancelled { request };
-    }
+    let compose_t0 = std::time::Instant::now();
+    let image = crate::edit_source::materialize_conceal(
+        &source,
+        crate::edit_source::ConcealMaterialize {
+            mask: crate::edit_source::MaskSnapshot {
+                bitmap,
+                shapes: shapes.clone(),
+                size: [w, h],
+            },
+            preset: preset.expect("display conceal request has preset"),
+        },
+        &cancel,
+    );
     emit_edit_materialize_ms(
-        "raster",
+        "compose",
         "conceal",
         perf_key.as_deref(),
         request.input_seq,
-        raster_t0,
+        compose_t0,
     );
-    if cancel.load(Ordering::Relaxed) {
-        return EditMaterializeResult::Cancelled { request };
-    }
-    let image = if bitmap.iter().any(|&bit| bit) {
-        let compose_t0 = std::time::Instant::now();
-        let image = crate::conceal_compose::compose_with_preset_cancel(
-            &source,
-            &bitmap,
-            &preset.expect("display conceal request has preset"),
-            &cancel,
-        );
-        emit_edit_materialize_ms(
-            "compose",
-            "conceal",
-            perf_key.as_deref(),
-            request.input_seq,
-            compose_t0,
-        );
-        image
-    } else {
-        None
-    };
     if cancel.load(Ordering::Relaxed) {
         return EditMaterializeResult::Cancelled { request };
     }
     EditMaterializeResult::Ready {
         request,
         payload: match image {
-            Some(image) => EditMaterializePayload::ConcealDisplayReady {
-                image,
-                source_kind,
-                shape_count: shapes.len(),
-            },
-            None => EditMaterializePayload::ConcealDisplayEmpty {
+            Ok(image) if !Arc::ptr_eq(&image, &source) => {
+                EditMaterializePayload::ConcealDisplayReady {
+                    image: (*image).clone(),
+                    source_kind,
+                    shape_count: shapes.len(),
+                }
+            }
+            _ => EditMaterializePayload::ConcealDisplayEmpty {
                 source,
                 source_kind,
             },
@@ -49727,23 +49684,7 @@ impl App {
 
     /// ページの正規化キーを返す（DB 保存用）。
     pub(crate) fn page_path_key(&self, idx: usize) -> Option<String> {
-        let item = self.items.get(idx)?;
-        let key = match item {
-            GridItem::Image(p) => crate::adjustment_db::normalize_path(p),
-            GridItem::ZipImage {
-                zip_path,
-                entry_name,
-            } => {
-                // Keep released cache-ZIP page keys intact. Direct/cache parity would require an
-                // explicit user-data migration and is deliberately deferred.
-                crate::adjustment_db::zip_entry_key(zip_path, entry_name)
-            }
-            GridItem::PdfPage {
-                pdf_path, page_num, ..
-            } => crate::adjustment_db::zip_entry_key(pdf_path, &format!("page_{page_num}")),
-            _ => return None,
-        };
-        Some(key)
+        crate::edit_source::page_key_for_grid_item(self.items.get(idx)?)
     }
 
     pub(crate) fn invalidate_edit_preview_cache_for_key(&self, item_key: &str) {
@@ -50617,20 +50558,11 @@ impl App {
     ) -> Option<crate::export_crop::CropRect> {
         let source_size = self.current_raw_source_pixels(idx)?.size;
         let crop = self.export_crop_for_idx(idx, source_size)?;
-        if source_size == target_size {
-            return Some(crop.rect);
-        }
-        let sx = target_size[0] as f32 / source_size[0].max(1) as f32;
-        let sy = target_size[1] as f32 / source_size[1].max(1) as f32;
-        Some(
-            crate::export_crop::CropRect {
-                min_x: crop.rect.min_x * sx,
-                min_y: crop.rect.min_y * sy,
-                max_x: crop.rect.max_x * sx,
-                max_y: crop.rect.max_y * sy,
-            }
-            .sanitized(target_size[0], target_size[1]),
-        )
+        Some(crate::edit_source::export_crop_rect_for_pixels(
+            crop,
+            source_size,
+            target_size,
+        ))
     }
 
     /// 現在の input / erase mask / local adjust 世代から、補正レイヤー cache key を作る。
@@ -52330,37 +52262,68 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<Arc<egui::ColorImage>> {
-        let mut pixels = if self.mask_pages.contains(&idx) {
-            let _ = self.ensure_erase_result_texture(ctx, idx)?;
-            self.current_erase_result_pixels(idx)?
+        let raw = self.current_raw_source_pixels(idx)?;
+        let erase = if self.mask_pages.contains(&idx) {
+            let pixels = self
+                .ensure_erase_result_texture(ctx, idx)
+                .and_then(|_| self.current_erase_result_pixels(idx));
+            pixels.map_or(crate::edit_source::EditLayer::Pending, |pixels| {
+                crate::edit_source::EditLayer::Pixels(pixels)
+            })
         } else {
-            self.current_raw_source_pixels(idx)?
+            crate::edit_source::EditLayer::Absent
         };
 
-        if self.local_adjust_pages.contains(&idx)
+        let local_adjust = if self.local_adjust_pages.contains(&idx)
             || self.local_adjust_page_layers.contains_key(&idx)
         {
             self.maybe_start_local_adjust_render(idx);
             if !self.local_adjust_page_layers.contains_key(&idx) {
-                return None;
+                crate::edit_source::EditLayer::Pending
+            } else if self.has_active_local_adjust_layers(idx) {
+                self.current_local_adjust_pixels(idx).map_or(
+                    crate::edit_source::EditLayer::Pending,
+                    crate::edit_source::EditLayer::Pixels,
+                )
+            } else {
+                crate::edit_source::EditLayer::Absent
             }
-            if self.has_active_local_adjust_layers(idx) {
-                pixels = self.current_local_adjust_pixels(idx)?;
-            }
-        }
+        } else {
+            crate::edit_source::EditLayer::Absent
+        };
 
         let should_apply_conceal = self.conceal_pages.contains(&idx)
             || (self.conceal_mode
                 && self.conceal_preview_active
                 && self.fullscreen_idx == Some(idx));
-        if should_apply_conceal {
+        let conceal = if should_apply_conceal {
             let _ = self.ensure_conceal_texture(ctx, idx);
-            let entry = self.conceal_cache.get(&idx)?;
-            pixels = Arc::clone(&entry.pixels);
-        }
+            self.conceal_cache
+                .get(&idx)
+                .map_or(crate::edit_source::EditLayer::Pending, |entry| {
+                    crate::edit_source::EditLayer::Pixels(Arc::clone(&entry.pixels))
+                })
+        } else {
+            crate::edit_source::EditLayer::Absent
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = crate::edit_source::execute_edit_source(
+            crate::edit_source::EditSourceRequest {
+                raw,
+                erase,
+                local_adjust,
+                conceal,
+            },
+            &cancel,
+        )
+        .ok()?;
         // crop は表示パイプラインでは適用しない (暗転 overlay のみ)。実際の切り出しは
         // capture / export の最終段で `export_crop_rect_for_pixels` を使って行う。
-        Some(pixels)
+        match result {
+            crate::edit_source::EditSourceResult::Ready(output) => Some(output.pixels),
+            crate::edit_source::EditSourceResult::Pending
+            | crate::edit_source::EditSourceResult::Cancelled => None,
+        }
     }
 
     pub(crate) fn current_edit_result_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
@@ -54555,13 +54518,8 @@ impl App {
                 needed.push(k.to_string());
             }
         };
-        for o in objects {
-            if let Some(tb) = o.text_block() {
-                consider(&tb.font_key, &mut needed);
-            }
-            if let comic_core::AnnotationKind::MessageWindow(w) = &o.kind {
-                consider(&w.name_plate.name.font_key, &mut needed);
-            }
+        for key in crate::comic_overlay::referenced_font_keys(objects) {
+            consider(&key, &mut needed);
         }
         if self.comic_fonts.is_some() && needed.is_empty() {
             return self.comic_fonts.clone();

@@ -267,6 +267,7 @@ pub(crate) struct AdjustmentRenderSettings {
     pub(crate) favorites: Vec<FavoriteEntry>,
     pub(crate) global_preset: crate::adjustment::AdjustParams,
     pub(crate) creative_luts: Vec<crate::creative_lut::CreativeLutEntry>,
+    pub(crate) conceal_preset: crate::conceal::ConcealPreset,
 }
 
 impl AdjustmentRenderSettings {
@@ -276,6 +277,7 @@ impl AdjustmentRenderSettings {
             favorites: settings.favorites.clone(),
             global_preset: settings.global_preset.clone(),
             creative_luts: settings.creative_luts.clone(),
+            conceal_preset: crate::conceal::ConcealPreset::from_settings(settings),
         }
     }
 }
@@ -487,6 +489,45 @@ impl SettingsDb {
         &self,
     ) -> Result<AdjustmentRenderSettings, SettingsDbError> {
         let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        let conceal_preset = crate::conceal::ConcealPreset {
+            name: "現在の設定".to_string(),
+            conceal_type: read_settings_kv_typed(
+                &inner.conn,
+                "conceal_type",
+                crate::conceal::ConcealType::default,
+            )?,
+            mosaic_tile_mode: read_settings_kv_typed(
+                &inner.conn,
+                "conceal_mosaic_tile_mode",
+                crate::conceal::TileSizeMode::default,
+            )?,
+            mosaic_boundary: read_settings_kv_typed(
+                &inner.conn,
+                "conceal_mosaic_boundary",
+                crate::conceal::MosaicBoundary::default,
+            )?,
+            fill_opacity_percent: read_settings_kv_typed(
+                &inner.conn,
+                "conceal_fill_opacity_percent",
+                crate::conceal::default_fill_opacity,
+            )?,
+            fill_edge: read_settings_kv_typed(
+                &inner.conn,
+                "conceal_fill_edge",
+                crate::conceal::FillEdge::default,
+            )?,
+            blur_radius_px: read_settings_kv_typed(
+                &inner.conn,
+                "conceal_blur_radius_px",
+                crate::conceal::default_blur_radius_px,
+            )?,
+            blur_mode: read_settings_kv_typed(
+                &inner.conn,
+                "conceal_blur_mode",
+                crate::conceal::BlurMode::default,
+            )?,
+            blur_feather: read_settings_kv_typed(&inner.conn, "conceal_blur_feather", || false)?,
+        };
         Ok(AdjustmentRenderSettings {
             favorites: read_favorites(&inner.conn)?,
             global_preset: read_settings_kv_typed(
@@ -497,6 +538,7 @@ impl SettingsDb {
             creative_luts: read_settings_kv_typed(&inner.conn, "creative_luts", || {
                 crate::creative_lut::builtin_creative_lut_entries()
             })?,
+            conceal_preset,
         })
     }
 
@@ -3094,6 +3136,8 @@ mod tests {
         };
         settings.favorites = vec![favorite.clone()];
         settings.global_preset.brightness = 11.0;
+        settings.conceal_type = crate::conceal::ConcealType::BlackFill;
+        settings.conceal_fill_opacity_percent = 73;
         db.save_full(&settings).unwrap();
 
         let first = db.load_adjustment_render_settings().unwrap();
@@ -3102,16 +3146,26 @@ mod tests {
         assert_eq!(first.favorites[0].path, favorite.path);
         assert_eq!(first.global_preset.brightness, 11.0);
         assert_eq!(first.creative_luts, settings.creative_luts);
+        assert_eq!(
+            first.conceal_preset,
+            crate::conceal::ConcealPreset::from_settings(&settings)
+        );
 
         settings.favorites.clear();
         settings.global_preset.brightness = 37.0;
         settings.creative_luts.clear();
+        settings.conceal_type = crate::conceal::ConcealType::Blur;
+        settings.conceal_blur_radius_px = 41.0;
         db.save_full(&settings).unwrap();
 
         let second = db.load_adjustment_render_settings().unwrap();
         assert!(second.favorites.is_empty());
         assert_eq!(second.global_preset.brightness, 37.0);
         assert!(second.creative_luts.is_empty());
+        assert_eq!(
+            second.conceal_preset,
+            crate::conceal::ConcealPreset::from_settings(&settings)
+        );
     }
 
     #[test]

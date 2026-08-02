@@ -91,6 +91,43 @@ impl ConcealDb {
         Self::materialize_raw(raw, expected_w, expected_h, None)
     }
 
+    pub(crate) fn get_full_checked(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<bool>, Vec<Shape>, [usize; 2])>, String> {
+        use rusqlite::OptionalExtension as _;
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT bitmap_data, bitmap_w, bitmap_h, shapes
+                 FROM conceal_entries WHERE page_path = ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let row: Option<(Vec<u8>, usize, usize, Option<String>)> = stmt
+            .query_row([key], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)? as usize,
+                    row.get::<_, i64>(2)? as usize,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((bitmap_data, bitmap_w, bitmap_h, shapes_json)) = row else {
+            return Ok(None);
+        };
+        let raw = ConcealRawEntry {
+            bitmap_data,
+            bitmap_w,
+            bitmap_h,
+            shapes_json,
+        };
+        let (bitmap, shapes) = Self::materialize_raw(raw, bitmap_w, bitmap_h, None)
+            .ok_or_else(|| "conceal mask decompression failed".to_string())?;
+        Ok(Some((bitmap, shapes, [bitmap_w, bitmap_h])))
+    }
+
     /// SQLite/BLOB read だけを行う。deflate と JSON 復元を含めない。
     pub(crate) fn get_raw(&self, key: &str) -> Option<ConcealRawEntry> {
         let mut stmt = self

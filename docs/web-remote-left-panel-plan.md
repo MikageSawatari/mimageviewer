@@ -516,3 +516,25 @@ scale してベイクする。crop は `export_crop.db` の設定を読み、テ
 full-page の正本にすると解像度と鮮度の両方で App と一致しないため、段 1 の canonical source には
 使わない。`edit_preview_key` / `edit_preview_db` / `skip_cache` の 3 重外れを個別に直す配線も作らず、
 上記 headless materializer へ置き換える。
+
+#### 段 1b 編集結果 materialize の実装結果
+
+`src/edit_source.rs` に typed な `EditSourceRequest` / `EditLayer` と共有 executor を置き、
+App の `assemble_edit_result_pixels` も同じ layer 選択へ接続した。App が所有していた
+local-adjust / conceal の worker body と MI-GAN の model-load / inference / diffusion fallback
+選択も共有 body を呼ぶ。`Pending` は完成結果に昇格せず、順序は
+`raw → erase → local-adjust → conceal` のまま固定する。
+
+remote は heavy worker ごとに mask / local-adjust / conceal / comic / export-crop DB の
+read-only handle を所有する。worker 起動時 open が失敗して `None` でも Page ごとに再 open し、
+再 open 失敗は Page の明示的な Internal error とログへ出すため、一過性の失敗を worker の
+寿命へ latch しない。各 Page は安定 page key で committed snapshot を読み、snapshot 内容の
+SHA-256 を source stat・target・補正と共に CPU result cache key に含める。
+
+出力は共有 edit executor の後に共有 `FinalCompositePlan`、App と同じ comic font-key / stamp
+resolver、共有 crop 座標変換を通して WebP 化する。MI-GAN は erase row があるページだけ
+runtime を初期化し、Page ログへ edit 全体と erase / local / conceal の時間、diffusion fallback
+有無を記録する。MI-GAN は 512px tile を 48px 深さごとの複数 pass で処理するため、通常の
+小マスクは UI の既存想定どおり数秒でも、大きな穴は旧 60 秒を超え得る。Page の transport
+timeout は 10 分へ広げる。prefetch は後続要求で core cancel されるが、foreground は transport
+timeout が core 作業を cancel する protocol ではないため、この時間内で完走させる。

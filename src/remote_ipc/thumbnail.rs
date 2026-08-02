@@ -24,6 +24,11 @@ pub(super) struct WorkerContext {
     pub(super) folder_pin_db: Option<crate::folder_thumb_pins::FolderThumbPinDb>,
     rotation_db: Option<crate::rotation_db::RotationDb>,
     pub(super) adjustment_db: Option<crate::adjustment_db::AdjustmentDb>,
+    pub(super) mask_db: Option<crate::mask_db::MaskDb>,
+    pub(super) local_adjust_db: Option<crate::local_adjust_db::LocalAdjustDb>,
+    pub(super) conceal_db: Option<crate::conceal_db::ConcealDb>,
+    pub(super) comic_db: Option<crate::comic_db::ComicDb>,
+    pub(super) crop_db: Option<crate::export_crop::CropDb>,
 }
 
 impl WorkerContext {
@@ -32,6 +37,20 @@ impl WorkerContext {
             folder_pin_db: crate::folder_thumb_pins::FolderThumbPinDb::open().ok(),
             rotation_db: crate::rotation_db::RotationDb::open().ok(),
             adjustment_db: crate::adjustment_db::AdjustmentDb::open().ok(),
+            mask_db: crate::mask_db::MaskDb::open_readonly().ok(),
+            local_adjust_db: crate::local_adjust_db::LocalAdjustDb::open_readonly(
+                &crate::local_adjust_db::LocalAdjustDb::db_path(),
+            )
+            .ok(),
+            conceal_db: crate::conceal_db::ConcealDb::open_readonly(
+                &crate::conceal_db::ConcealDb::db_path(),
+            )
+            .ok(),
+            comic_db: crate::comic_db::ComicDb::open_readonly().ok(),
+            crop_db: crate::export_crop::CropDb::open_readonly(
+                &crate::export_crop::CropDb::db_path(),
+            )
+            .ok(),
         }
     }
 }

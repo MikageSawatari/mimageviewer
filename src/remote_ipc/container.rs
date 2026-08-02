@@ -33,6 +33,9 @@ pub(super) struct ContainerEngine {
     adjustment_settings: AdjustmentSettingsSource,
     creative_lut_cache: Mutex<RemoteCreativeLutCache>,
     page_composite_cache: Mutex<RemoteCompositeCache>,
+    comic_stamp_cache: Mutex<HashMap<String, Option<Arc<comic_core::RgbaOverlay>>>>,
+    inpaint_runtime: Mutex<Option<Arc<crate::ai::runtime::AiRuntime>>>,
+    inpaint_model_manager: Arc<crate::ai::model_manager::ModelManager>,
     page_prefetch_cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
@@ -52,6 +55,25 @@ struct RemotePreparedComposite {
     key: RemoteCompositeCacheKey,
     params: crate::adjustment::AdjustParams,
     lut_entry: Option<crate::creative_lut::CreativeLutEntry>,
+    edits: RemoteEditSnapshot,
+}
+
+struct RemoteEditSnapshot {
+    erase: Option<crate::edit_source::MaskSnapshot>,
+    local_adjust: Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
+    conceal: Option<crate::edit_source::MaskSnapshot>,
+    conceal_preset: crate::conceal::ConcealPreset,
+    comic: Vec<comic_core::AnnotationObject>,
+    export_crop: Option<crate::export_crop::CropSettings>,
+    fingerprint: [u8; 32],
+}
+
+struct RemoteMaterializedEdits {
+    pixels: Arc<egui::ColorImage>,
+    comic: Vec<comic_core::AnnotationObject>,
+    export_crop: Option<crate::export_crop::CropSettings>,
+    timing: crate::edit_source::EditSourceTiming,
+    used_diffusion_fallback: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -62,6 +84,7 @@ struct RemoteCompositeCacheKey {
     target_px: u32,
     params: crate::adjustment::AdjustParams,
     lut_entry: Option<crate::creative_lut::CreativeLutEntry>,
+    edit_fingerprint: [u8; 32],
 }
 
 struct RemoteCompositeCacheEntry {
@@ -265,6 +288,9 @@ impl ContainerEngine {
             adjustment_settings,
             creative_lut_cache: Mutex::new(RemoteCreativeLutCache::default()),
             page_composite_cache: Mutex::new(RemoteCompositeCache::default()),
+            comic_stamp_cache: Mutex::new(HashMap::new()),
+            inpaint_runtime: Mutex::new(None),
+            inpaint_model_manager: Arc::new(crate::ai::model_manager::ModelManager::new()),
             page_prefetch_cancel: Mutex::new(None),
         }
     }
@@ -289,6 +315,172 @@ impl ContainerEngine {
         }
     }
 
+    fn prepare_remote_edits(
+        &self,
+        page_key: &str,
+        settings: &crate::settings_db::AdjustmentRenderSettings,
+        context: &WorkerContext,
+    ) -> Result<RemoteEditSnapshot, MediaError> {
+        let erase = match context.mask_db.as_ref() {
+            Some(db) => load_mask_snapshot(db, page_key)?,
+            None => {
+                let db = crate::mask_db::MaskDb::open_readonly()
+                    .map_err(|error| remote_edit_db_open_error("erase", error))?;
+                load_mask_snapshot(&db, page_key)?
+            }
+        };
+        let local_adjust = match context.local_adjust_db.as_ref() {
+            Some(db) => db
+                .get_layers_checked(page_key)
+                .map_err(|error| remote_edit_db_read_error("local-adjust", error))?,
+            None => {
+                let db = crate::local_adjust_db::LocalAdjustDb::open_readonly(
+                    &crate::local_adjust_db::LocalAdjustDb::db_path(),
+                )
+                .map_err(|error| remote_edit_db_open_error("local-adjust", error))?;
+                db.get_layers_checked(page_key)
+                    .map_err(|error| remote_edit_db_read_error("local-adjust", error))?
+            }
+        };
+        let conceal = match context.conceal_db.as_ref() {
+            Some(db) => load_conceal_snapshot(db, page_key)?,
+            None => {
+                let db = crate::conceal_db::ConcealDb::open_readonly(
+                    &crate::conceal_db::ConcealDb::db_path(),
+                )
+                .map_err(|error| remote_edit_db_open_error("conceal", error))?;
+                load_conceal_snapshot(&db, page_key)?
+            }
+        };
+        let comic = match context.comic_db.as_ref() {
+            Some(db) => db
+                .get_checked(page_key)
+                .map_err(|error| remote_edit_db_read_error("comic", error))?
+                .unwrap_or_default(),
+            None => {
+                let db = crate::comic_db::ComicDb::open_readonly()
+                    .map_err(|error| remote_edit_db_open_error("comic", error))?;
+                db.get_checked(page_key)
+                    .map_err(|error| remote_edit_db_read_error("comic", error))?
+                    .unwrap_or_default()
+            }
+        };
+        let export_crop = match context.crop_db.as_ref() {
+            Some(db) => db
+                .get_checked(page_key)
+                .map_err(|error| remote_edit_db_read_error("export-crop", error))?,
+            None => {
+                let db = crate::export_crop::CropDb::open_readonly(
+                    &crate::export_crop::CropDb::db_path(),
+                )
+                .map_err(|error| remote_edit_db_open_error("export-crop", error))?;
+                db.get_checked(page_key)
+                    .map_err(|error| remote_edit_db_read_error("export-crop", error))?
+            }
+        };
+        let conceal_preset = settings.conceal_preset.clone();
+        let fingerprint = remote_edit_fingerprint(
+            erase.as_ref(),
+            local_adjust.as_ref(),
+            conceal.as_ref(),
+            &conceal_preset,
+            &comic,
+            export_crop.as_ref(),
+        )?;
+        Ok(RemoteEditSnapshot {
+            erase,
+            local_adjust,
+            conceal,
+            conceal_preset,
+            comic,
+            export_crop,
+            fingerprint,
+        })
+    }
+
+    fn remote_inpaint_runtime(&self) -> Option<Arc<crate::ai::runtime::AiRuntime>> {
+        let mut runtime = self
+            .inpaint_runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if runtime.is_none() {
+            match crate::ai::runtime::AiRuntime::new() {
+                Ok(created) => *runtime = Some(Arc::new(created)),
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "remote_ipc: MI-GAN runtime init failed; using diffusion fallback: {error}"
+                    ));
+                    return None;
+                }
+            }
+        }
+        runtime.clone()
+    }
+
+    fn execute_remote_edits(
+        &self,
+        source: Arc<egui::ColorImage>,
+        edits: RemoteEditSnapshot,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<RemoteMaterializedEdits, MediaError> {
+        let erase = match edits.erase {
+            Some(mask) => {
+                crate::edit_source::EditLayer::Materialize(crate::edit_source::EraseMaterialize {
+                    mask,
+                    runtime: self.remote_inpaint_runtime(),
+                    manager: Arc::clone(&self.inpaint_model_manager),
+                    log_prefix: "remote page".to_string(),
+                })
+            }
+            None => crate::edit_source::EditLayer::Absent,
+        };
+        let local_adjust =
+            edits
+                .local_adjust
+                .map_or(crate::edit_source::EditLayer::Absent, |layers| {
+                    crate::edit_source::EditLayer::Materialize(
+                        crate::edit_source::LocalAdjustMaterialize { layers },
+                    )
+                });
+        let conceal = edits
+            .conceal
+            .map_or(crate::edit_source::EditLayer::Absent, |mask| {
+                crate::edit_source::EditLayer::Materialize(crate::edit_source::ConcealMaterialize {
+                    mask,
+                    preset: edits.conceal_preset,
+                })
+            });
+        let result = crate::edit_source::execute_edit_source(
+            crate::edit_source::EditSourceRequest {
+                raw: source,
+                erase,
+                local_adjust,
+                conceal,
+            },
+            cancel,
+        )
+        .map_err(|error| {
+            crate::logger::log(format!("remote_ipc: edit materialization failed: {error}"));
+            media_error(
+                MediaErrorCode::RenderFailed,
+                "編集結果をページへ合成できませんでした",
+            )
+        })?;
+        let crate::edit_source::EditSourceResult::Ready(output) = result else {
+            return Err(media_error(
+                MediaErrorCode::Busy,
+                "ページの編集結果合成は取り消されました",
+            ));
+        };
+        Ok(RemoteMaterializedEdits {
+            pixels: output.pixels,
+            comic: edits.comic,
+            export_crop: edits.export_crop,
+            timing: output.timing,
+            used_diffusion_fallback: output.used_diffusion_fallback,
+        })
+    }
+
     fn prepare_remote_composite(
         &self,
         address: &RemoteAddress,
@@ -302,6 +494,7 @@ impl ContainerEngine {
             return Ok(None);
         };
         let settings = self.adjustment_render_settings()?;
+        let edits = self.prepare_remote_edits(&identity.page_key, &settings, context)?;
         // `WorkerContext` は worker 起動時に 1 度だけ DB を開く。その 1 回が失敗した状態を
         // そのまま合成失敗にすると、一過性の失敗でも **その worker を通る全ページ**が
         // 以後ずっと失敗する。開けない事実は隠さず、握り直しだけ試みる。
@@ -352,11 +545,13 @@ impl ContainerEngine {
             target_px,
             params: params.clone(),
             lut_entry: lut_entry.clone(),
+            edit_fingerprint: edits.fingerprint,
         };
         Ok(Some(RemotePreparedComposite {
             key,
             params,
             lut_entry,
+            edits,
         }))
     }
 
@@ -1678,13 +1873,16 @@ impl ContainerEngine {
         );
         drop(tx);
         let mut saw_canceled = false;
-        let color_image = rx
+        let (color_image, decoded_source_dims) = rx
             .into_iter()
             .find_map(|message| {
                 saw_canceled |= message.canceled;
-                (!message.finalized && !message.canceled).then_some(message.image)
+                if !message.finalized && !message.canceled {
+                    message.image.map(|image| (image, message.source_dims))
+                } else {
+                    None
+                }
             })
-            .flatten()
             .ok_or_else(|| {
                 if saw_canceled || cancel.load(Ordering::Relaxed) {
                     media_error(
@@ -1703,10 +1901,52 @@ impl ContainerEngine {
                     )
                 }
             })?;
+        let source_dims = decoded_source_dims
+            .map(|(width, height)| [width as usize, height as usize])
+            .unwrap_or(color_image.size);
         let mut pixels = Arc::new(color_image);
         if let Some(prepared) = prepared_composite {
+            let edit_started = Instant::now();
+            let materialized = self.execute_remote_edits(pixels, prepared.edits, &cancel)?;
+            pixels = materialized.pixels;
+            crate::logger::log(format!(
+                "remote_ipc: edit_materialize elapsed_ms={:.1} erase_ms={:.1} local_adjust_ms={:.1} conceal_ms={:.1} diffusion_fallback={}",
+                edit_started.elapsed().as_secs_f64() * 1000.0,
+                materialized.timing.erase_ms,
+                materialized.timing.local_adjust_ms,
+                materialized.timing.conceal_ms,
+                materialized.used_diffusion_fallback,
+            ));
             let lut = self.resolve_remote_lut(prepared.lut_entry.as_ref())?;
             pixels = execute_remote_composite(pixels, &prepared.params, lut, &cancel)?;
+            if !materialized.comic.is_empty()
+                && let Some(fonts) = crate::comic_overlay::load_comic_fonts_for(&materialized.comic)
+            {
+                pixels = crate::edit_source::comic_composite(
+                    &pixels,
+                    &materialized.comic,
+                    source_dims,
+                    &fonts,
+                    &mut self
+                        .comic_stamp_cache
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()),
+                    &cancel,
+                );
+            }
+            if let Some(crop) = materialized.export_crop {
+                let rect =
+                    crate::edit_source::export_crop_rect_for_pixels(crop, source_dims, pixels.size);
+                pixels = Arc::new(crate::export_crop::crop_color_image(&pixels, rect).map_err(
+                    |error| {
+                        crate::logger::log(format!("remote_ipc: export crop failed: {error}"));
+                        media_error(
+                            MediaErrorCode::RenderFailed,
+                            "ページの切り取り結果を作成できませんでした",
+                        )
+                    },
+                )?);
+            }
             self.page_composite_cache
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -1822,10 +2062,112 @@ impl ContainerEngine {
     }
 }
 
+fn load_mask_snapshot(
+    db: &crate::mask_db::MaskDb,
+    page_key: &str,
+) -> Result<Option<crate::edit_source::MaskSnapshot>, MediaError> {
+    let loaded = db
+        .get_full_checked(page_key)
+        .map_err(|error| remote_edit_db_read_error("erase", error))?;
+    Ok(
+        loaded.map(|(bitmap, shapes, size)| crate::edit_source::MaskSnapshot {
+            bitmap,
+            shapes,
+            size,
+        }),
+    )
+}
+
+fn load_conceal_snapshot(
+    db: &crate::conceal_db::ConcealDb,
+    page_key: &str,
+) -> Result<Option<crate::edit_source::MaskSnapshot>, MediaError> {
+    let loaded = db
+        .get_full_checked(page_key)
+        .map_err(|error| remote_edit_db_read_error("conceal", error))?;
+    Ok(
+        loaded.map(|(bitmap, shapes, size)| crate::edit_source::MaskSnapshot {
+            bitmap,
+            shapes,
+            size,
+        }),
+    )
+}
+
+fn remote_edit_fingerprint(
+    erase: Option<&crate::edit_source::MaskSnapshot>,
+    local_adjust: Option<&Vec<local_adjust_core::LocalAdjustmentLayer>>,
+    conceal: Option<&crate::edit_source::MaskSnapshot>,
+    conceal_preset: &crate::conceal::ConcealPreset,
+    comic: &[comic_core::AnnotationObject],
+    export_crop: Option<&crate::export_crop::CropSettings>,
+) -> Result<[u8; 32], MediaError> {
+    use sha2::Digest;
+    let mut digest = sha2::Sha256::new();
+    hash_remote_edit_value(
+        &mut digest,
+        b"erase",
+        &erase.map(|mask| (&mask.bitmap, &mask.shapes, mask.size)),
+    )?;
+    hash_remote_edit_value(&mut digest, b"local", &local_adjust)?;
+    hash_remote_edit_value(
+        &mut digest,
+        b"conceal",
+        &conceal.map(|mask| (&mask.bitmap, &mask.shapes, mask.size)),
+    )?;
+    if conceal.is_some() {
+        hash_remote_edit_value(&mut digest, b"conceal-preset", conceal_preset)?;
+    }
+    hash_remote_edit_value(&mut digest, b"comic", &comic)?;
+    hash_remote_edit_value(&mut digest, b"crop", &export_crop)?;
+    Ok(digest.finalize().into())
+}
+
+fn hash_remote_edit_value<T: serde::Serialize>(
+    digest: &mut sha2::Sha256,
+    label: &[u8],
+    value: &T,
+) -> Result<(), MediaError> {
+    use sha2::Digest;
+    digest.update(label);
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        crate::logger::log(format!(
+            "remote_ipc: edit snapshot fingerprint failed: {error}"
+        ));
+        media_error(
+            MediaErrorCode::Internal,
+            "編集結果のキャッシュキーを作成できませんでした",
+        )
+    })?;
+    digest.update(bytes);
+    Ok(())
+}
+
+fn remote_edit_db_open_error(kind: &str, error: rusqlite::Error) -> MediaError {
+    crate::logger::log(format!(
+        "remote_ipc: {kind} DB reopen failed for edit materialization: {error}"
+    ));
+    media_error(
+        MediaErrorCode::Internal,
+        "編集データベースを開けないためページを合成できません",
+    )
+}
+
+fn remote_edit_db_read_error(kind: &str, error: String) -> MediaError {
+    crate::logger::log(format!(
+        "remote_ipc: {kind} DB read failed for edit materialization: {error}"
+    ));
+    media_error(
+        MediaErrorCode::Internal,
+        "編集データベースを読めないためページを合成できません",
+    )
+}
+
 fn remote_adjustment_identity(
     address: &RemoteAddress,
     logical_path: &Path,
 ) -> Option<RemoteAdjustmentIdentity> {
+    let page_key = crate::edit_source::page_key_for_remote(logical_path, &address.subresource)?;
     match &address.subresource {
         RemoteSubresource::File => {
             let location_path = if is_zip_path(logical_path) || is_pdf_path(logical_path) {
@@ -1834,19 +2176,16 @@ fn remote_adjustment_identity(
                 logical_path.parent()?.to_path_buf()
             };
             Some(RemoteAdjustmentIdentity {
-                page_key: crate::adjustment_db::normalize_path(logical_path),
+                page_key,
                 location_path,
             })
         }
-        RemoteSubresource::ZipEntry { entry_name } => Some(RemoteAdjustmentIdentity {
-            page_key: crate::adjustment_db::zip_entry_key(logical_path, entry_name),
+        RemoteSubresource::ZipEntry { .. } => Some(RemoteAdjustmentIdentity {
+            page_key,
             location_path: logical_path.to_path_buf(),
         }),
-        RemoteSubresource::PdfPage { page_number } => Some(RemoteAdjustmentIdentity {
-            page_key: crate::adjustment_db::zip_entry_key(
-                logical_path,
-                &format!("page_{page_number}"),
-            ),
+        RemoteSubresource::PdfPage { .. } => Some(RemoteAdjustmentIdentity {
+            page_key,
             location_path: logical_path.to_path_buf(),
         }),
         RemoteSubresource::ZipDirectory { .. } => None,
@@ -2340,10 +2679,48 @@ mod tests {
             target_px: 1024,
             params: crate::adjustment::AdjustParams::default(),
             lut_entry: None,
+            edit_fingerprint: [0; 32],
         };
-        cache.insert(key.clone(), pixels);
+        cache.insert(key.clone(), Arc::clone(&pixels));
+        let base_key = key.clone();
         key.params.brightness = 10.0;
         assert!(cache.get(&key).is_none());
+        let mut edited_key = base_key;
+        edited_key.edit_fingerprint[0] = 1;
+        assert!(cache.get(&edited_key).is_none());
+    }
+
+    #[test]
+    fn remote_edit_adapter_materializes_conceal_before_final_composite() {
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let source = Arc::new(egui::ColorImage::new(
+            [2, 1],
+            vec![egui::Color32::RED, egui::Color32::GREEN],
+        ));
+        let mut preset = crate::conceal::ConcealPreset::default();
+        preset.conceal_type = crate::conceal::ConcealType::BlackFill;
+        preset.fill_opacity_percent = 100;
+        let result = engine
+            .execute_remote_edits(
+                source,
+                RemoteEditSnapshot {
+                    erase: None,
+                    local_adjust: None,
+                    conceal: Some(crate::edit_source::MaskSnapshot {
+                        bitmap: vec![true, false],
+                        shapes: Vec::new(),
+                        size: [2, 1],
+                    }),
+                    conceal_preset: preset,
+                    comic: Vec::new(),
+                    export_crop: None,
+                    fingerprint: [0; 32],
+                },
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+        assert_eq!(result.pixels.pixels[0], egui::Color32::BLACK);
+        assert_eq!(result.pixels.pixels[1], egui::Color32::GREEN);
     }
 
     #[test]

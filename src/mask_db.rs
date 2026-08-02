@@ -794,8 +794,12 @@ impl MaskDb {
     }
 
     pub fn open_readonly() -> Result<Self, rusqlite::Error> {
+        Self::open_readonly_at(&Self::db_path())
+    }
+
+    pub fn open_readonly_at(path: &std::path::Path) -> Result<Self, rusqlite::Error> {
         let conn = rusqlite::Connection::open_with_flags(
-            Self::db_path(),
+            path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
         conn.pragma_update(None, "query_only", true)?;
@@ -888,6 +892,38 @@ impl MaskDb {
             }
         }
         Some((mask, shapes))
+    }
+
+    pub(crate) fn get_full_checked(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<bool>, Vec<Shape>, [usize; 2])>, String> {
+        use rusqlite::OptionalExtension as _;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT mask_data, width, height, vectors FROM masks WHERE path = ?1")
+            .map_err(|error| error.to_string())?;
+        let row: Option<(Vec<u8>, usize, usize, Option<String>)> = stmt
+            .query_row([key], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)? as usize,
+                    row.get::<_, i64>(2)? as usize,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((blob, width, height, vectors_json)) = row else {
+            return Ok(None);
+        };
+        let bitmap = decompress_mask(&blob, width, height)
+            .ok_or_else(|| "erase mask decompression failed".to_string())?;
+        let shapes = vectors_json
+            .as_deref()
+            .map(shapes_from_json)
+            .unwrap_or_default();
+        Ok(Some((bitmap, shapes, [width, height])))
     }
 
     /// マスク＋ベクタを保存する。ビットマップが全 false でベクタも空なら削除する。

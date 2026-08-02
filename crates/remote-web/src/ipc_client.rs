@@ -26,9 +26,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// 実測 1.7 秒の RAW decode に約 6 倍の余裕を持たせつつ、HTTP worker を
 /// 無期限に保持しない。HTTP 側の入場制限とブラウザ再試行を前提にする。
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Full-page colorize and post filters can dominate raw decoding, so Page has
-/// a transport budget separate from lightweight metadata and thumbnail calls.
-const PAGE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+/// A committed erase mask can require many staged 512px MI-GAN tile passes.
+/// Keep this as transport grace, not a claim that dropping the HTTP wait
+/// cancels core work. Core prefetch replacement owns the cancellable path.
+const PAGE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_RETRIES: u32 = 2;
 /// Transport-only grace after the core's functional start budget, covering queue dispatch and
 /// named-pipe response routing without becoming a second application deadline.
@@ -1780,6 +1781,10 @@ mod tests {
         };
         assert_eq!(response_timeout_for(&request), PAGE_RESPONSE_TIMEOUT);
         assert!(PAGE_RESPONSE_TIMEOUT > RESPONSE_TIMEOUT);
+        assert!(
+            PAGE_RESPONSE_TIMEOUT >= Duration::from_secs(10 * 60),
+            "staged MI-GAN pages must not inherit the old 60 second budget"
+        );
     }
 
     #[test]

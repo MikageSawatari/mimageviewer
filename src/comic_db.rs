@@ -38,8 +38,12 @@ impl ComicDb {
     }
 
     pub fn open_readonly() -> Result<Self, rusqlite::Error> {
+        Self::open_readonly_at(&Self::db_path())
+    }
+
+    pub fn open_readonly_at(path: &std::path::Path) -> Result<Self, rusqlite::Error> {
         let conn = rusqlite::Connection::open_with_flags(
-            Self::db_path(),
+            path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
         conn.pragma_update(None, "query_only", true)?;
@@ -78,6 +82,27 @@ impl ComicDb {
                 None
             }
         }
+    }
+
+    pub(crate) fn get_checked(&self, key: &str) -> Result<Option<Vec<AnnotationObject>>, String> {
+        use rusqlite::OptionalExtension as _;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT doc_json FROM comic_entries WHERE page_path = ?1")
+            .map_err(|error| error.to_string())?;
+        let json: Option<String> = stmt
+            .query_row([key], |row| row.get(0))
+            .optional()
+            .map_err(|error| error.to_string())?;
+        Ok(json.and_then(|json| match serde_json::from_str(&json) {
+            Ok(objects) => Some(objects),
+            Err(error) => {
+                crate::logger::log(format!(
+                    "[comic] comic.db doc parse failed key={key}: {error}"
+                ));
+                None
+            }
+        }))
     }
 
     /// 生の `(doc_version, doc_json)` を取得する（サイドカー dual-write 用、パース回避）。

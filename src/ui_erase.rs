@@ -67,7 +67,7 @@ pub(crate) enum EraseInpaintProgress {
     DiffusionFallback,
 }
 
-fn report_inpaint_progress(
+pub(crate) fn report_inpaint_progress(
     progress_tx: Option<&mpsc::Sender<EraseInpaintProgress>>,
     progress: EraseInpaintProgress,
 ) {
@@ -2858,7 +2858,7 @@ impl App {
         let spawn_result = std::thread::Builder::new()
             .name("erase-inpaint".to_string())
             .spawn(move || {
-                let result = run_inpaint_pure(
+                let result = crate::edit_source::run_inpaint_pure(
                     runtime.as_ref(),
                     &manager,
                     &original,
@@ -3183,72 +3183,9 @@ pub(crate) fn erase_from_saved_mask(
     }
     let flattened = black_flatten_if_transparent(base);
     let input = flattened.as_ref().unwrap_or(base);
-    Ok(run_inpaint_pure(
+    Ok(crate::edit_source::run_inpaint_pure(
         runtime, manager, input, &composite, w, h, cancel, log_prefix, None,
     ))
-}
-
-fn run_inpaint_pure(
-    runtime: Option<&Arc<crate::ai::runtime::AiRuntime>>,
-    manager: &Arc<crate::ai::model_manager::ModelManager>,
-    original: &egui::ColorImage,
-    composite: &[bool],
-    w: usize,
-    h: usize,
-    cancel: &Arc<AtomicBool>,
-    log_prefix: &str,
-    progress_tx: Option<&mpsc::Sender<EraseInpaintProgress>>,
-) -> InpaintOutcome {
-    report_inpaint_progress(progress_tx, EraseInpaintProgress::Preparing);
-    if let Some(rt) = runtime {
-        let kind = crate::ai::ModelKind::InpaintMiGan;
-        match manager.model_path(kind) {
-            Some(model_path) => {
-                if !rt.is_loaded(kind) {
-                    if let Err(e) = rt.load_model(kind, &model_path) {
-                        crate::logger::log(format!(
-                            "[erase] {log_prefix} MI-GAN load failed: {e}, falling back to diffusion"
-                        ));
-                        report_inpaint_progress(
-                            progress_tx,
-                            EraseInpaintProgress::DiffusionFallback,
-                        );
-                        return InpaintOutcome {
-                            image: inpaint_diffuse(original, composite, w, h),
-                            used_diffusion_fallback: true,
-                        };
-                    }
-                }
-                match inpaint_migan(rt, original, composite, w, h, cancel, progress_tx) {
-                    Ok(image) => {
-                        return InpaintOutcome {
-                            image,
-                            used_diffusion_fallback: false,
-                        };
-                    }
-                    Err(e) => {
-                        crate::logger::log(format!(
-                            "[erase] {log_prefix} MI-GAN failed: {e}, falling back to diffusion"
-                        ));
-                    }
-                }
-            }
-            None => {
-                crate::logger::log(format!(
-                    "[erase] {log_prefix} MI-GAN model not found, falling back to diffusion"
-                ));
-            }
-        }
-    } else {
-        crate::logger::log(format!(
-            "[erase] {log_prefix} AI runtime not available, falling back to diffusion"
-        ));
-    }
-    report_inpaint_progress(progress_tx, EraseInpaintProgress::DiffusionFallback);
-    InpaintOutcome {
-        image: inpaint_diffuse(original, composite, w, h),
-        used_diffusion_fallback: true,
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3267,7 +3204,7 @@ const INPAINT_CONTEXT_PAD: usize = MIGAN_SIZE / 4;
 /// 実在する既知画素に近い領域から 48px ずつ内側へ確定する。各段では
 /// 「まだ埋めていない全領域」をモデル入力上の hole として隠し、「現在の帯」だけを
 /// 出力へ採用する。前段の生成結果は、次段で初めて既知画素として利用される。
-fn inpaint_migan(
+pub(crate) fn inpaint_migan(
     runtime: &crate::ai::runtime::AiRuntime,
     original: &egui::ColorImage,
     mask: &[bool],
@@ -3784,7 +3721,7 @@ struct TileRect {
     h: usize,
 }
 
-fn inpaint_diffuse(
+pub(crate) fn inpaint_diffuse(
     original: &egui::ColorImage,
     mask: &[bool],
     w: usize,

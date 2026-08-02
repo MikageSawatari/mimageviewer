@@ -59,6 +59,23 @@ impl LocalAdjustDb {
         serde_json::from_str(&json).ok()
     }
 
+    pub(crate) fn get_layers_checked(
+        &self,
+        page_key: &str,
+    ) -> Result<Option<Vec<LocalAdjustmentLayer>>, String> {
+        use rusqlite::OptionalExtension as _;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT layers_json FROM local_adjust_pages WHERE page_path = ?1")
+            .map_err(|error| error.to_string())?;
+        let json: Option<String> = stmt
+            .query_row([page_key], |row| row.get(0))
+            .optional()
+            .map_err(|error| error.to_string())?;
+        json.map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
     /// worker 側で SQLite 読み込みと JSON 復元を別々に計測するため、
     /// 永続化された JSON 文字列だけを取得する。
     pub fn get_layers_json(&self, page_key: &str) -> Option<String> {
