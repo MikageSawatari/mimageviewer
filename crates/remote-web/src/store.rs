@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::Instant;
 
 use image::GenericImageView;
-use mimageviewer_ipc::{ContainerEntry, RemoteAddress, RemoteEntry};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
-use serde::{Deserialize, Serialize};
+use mimageviewer_ipc::{ContainerEntry, FolderListEntry, RemoteAddress, RemoteEntry};
+use rusqlite::{Connection, OpenFlags};
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::diagnostics::duration_ms;
@@ -63,39 +63,7 @@ struct FavoriteSummary {
     name: String,
 }
 
-#[derive(Serialize)]
-pub struct ListResponse {
-    favorite_id: Uuid,
-    path: String,
-    thumb_aspect_height_ratio: f64,
-    entries: Vec<ListEntry>,
-}
-
-pub struct ListResult {
-    pub response: ListResponse,
-    pub metrics: ListMetrics,
-}
-
-#[derive(Serialize)]
-pub struct ListMetrics {
-    pub entry_count: usize,
-    pub scanned_count: usize,
-    pub zip_count: usize,
-    pub pdf_count: usize,
-    pub scan_ms: f64,
-}
-
-#[derive(Serialize)]
-pub struct ListEntry {
-    kind: EntryKind,
-    name: String,
-    path: String,
-    size: u64,
-    mtime: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
     Dir,
     Image,
@@ -136,62 +104,6 @@ pub struct ImageMetrics {
 pub struct Library {
     favorites: Vec<FavoriteRoot>,
     by_id: HashMap<Uuid, usize>,
-    thumb_aspect: StoredThumbAspect,
-    thumb_aspect_auto: bool,
-    auto_aspect_cache_path: PathBuf,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
-enum StoredThumbAspect {
-    Landscape16x9,
-    Landscape3x2,
-    Landscape4x3,
-    #[default]
-    Square,
-    Portrait3x4,
-    Portrait2x3,
-    Portrait9x16,
-}
-
-fn thumb_aspect_height_ratio(aspect: StoredThumbAspect) -> f64 {
-    match aspect {
-        StoredThumbAspect::Landscape16x9 => 9.0 / 16.0,
-        StoredThumbAspect::Landscape3x2 => 2.0 / 3.0,
-        StoredThumbAspect::Landscape4x3 => 3.0 / 4.0,
-        StoredThumbAspect::Square => 1.0,
-        StoredThumbAspect::Portrait3x4 => 4.0 / 3.0,
-        StoredThumbAspect::Portrait2x3 => 3.0 / 2.0,
-        StoredThumbAspect::Portrait9x16 => 16.0 / 9.0,
-    }
-}
-
-fn thumb_aspect_from_cache_int(value: i32) -> Option<StoredThumbAspect> {
-    // Keep this explicit mapping in lockstep with src/auto_aspect_cache.rs's
-    // aspect_to_int/aspect_from_int pair. Do not rely on Rust enum layout.
-    match value {
-        0 => Some(StoredThumbAspect::Landscape16x9),
-        1 => Some(StoredThumbAspect::Landscape3x2),
-        2 => Some(StoredThumbAspect::Landscape4x3),
-        3 => Some(StoredThumbAspect::Square),
-        4 => Some(StoredThumbAspect::Portrait3x4),
-        5 => Some(StoredThumbAspect::Portrait2x3),
-        6 => Some(StoredThumbAspect::Portrait9x16),
-        _ => None,
-    }
-}
-
-fn resolve_thumb_aspect_height_ratio(
-    manual: StoredThumbAspect,
-    auto: bool,
-    cached: Option<StoredThumbAspect>,
-) -> f64 {
-    let effective = if auto {
-        // This is App::effective_thumb_aspect's unresolved Auto fallback.
-        cached.unwrap_or(StoredThumbAspect::Square)
-    } else {
-        manual
-    };
-    thumb_aspect_height_ratio(effective)
 }
 
 impl Library {
@@ -200,9 +112,6 @@ impl Library {
         Self {
             favorites: Vec::new(),
             by_id: HashMap::new(),
-            thumb_aspect: StoredThumbAspect::Square,
-            thumb_aspect_auto: false,
-            auto_aspect_cache_path: PathBuf::from("auto_aspect_cache.db"),
         }
     }
 
@@ -215,19 +124,13 @@ impl Library {
                 path,
             }],
             by_id: HashMap::from([(id, 0)]),
-            thumb_aspect: StoredThumbAspect::Square,
-            thumb_aspect_auto: false,
-            auto_aspect_cache_path: PathBuf::from("auto_aspect_cache.db"),
         }
     }
 
     pub fn load(data_dir: &Path) -> Result<Self, StoreError> {
         let settings_path = data_dir.join("settings.db");
         let conn = open_read_only(&settings_path)?;
-        let thumb_aspect =
-            read_setting_json::<StoredThumbAspect>(&conn, "thumb_aspect")?.unwrap_or_default();
-        let thumb_aspect_auto =
-            read_setting_json::<bool>(&conn, "thumb_aspect_auto")?.unwrap_or(false);
+
         let mut stmt = conn.prepare(
             "SELECT id, name, path
              FROM favorites
@@ -256,13 +159,7 @@ impl Library {
             .map(|(idx, favorite)| (favorite.id, idx))
             .collect();
 
-        Ok(Self {
-            favorites,
-            by_id,
-            thumb_aspect,
-            thumb_aspect_auto,
-            auto_aspect_cache_path: data_dir.join("auto_aspect_cache.db"),
-        })
+        Ok(Self { favorites, by_id })
     }
 
     pub fn favorites(&self) -> FavoritesResponse {
@@ -289,6 +186,19 @@ impl Library {
                 return false;
             };
             resolve_existing(&favorite.path, &entry.relative_path).is_ok()
+        });
+    }
+
+    /// FolderList はセル本体とサムネイル出所の両方を外側の境界で再検証する。
+    pub fn retain_allowed_folder_list_entries(&self, entries: &mut Vec<FolderListEntry>) {
+        entries.retain(|entry| {
+            if self.validate_remote_address(&entry.address).is_err() {
+                return false;
+            }
+            entry.thumbnail_address == entry.address
+                || self
+                    .validate_remote_address(&entry.thumbnail_address)
+                    .is_ok()
         });
     }
 
@@ -348,99 +258,6 @@ impl Library {
 
     pub fn retain_allowed_container_entries(&self, entries: &mut Vec<ContainerEntry>) {
         entries.retain(|entry| self.validate_remote_address(&entry.address).is_ok());
-    }
-
-    pub fn list(&self, favorite_id: Uuid, relative: &str) -> Result<ListResult, StoreError> {
-        let favorite = self.favorite(favorite_id)?;
-        let directory = resolve_existing(&favorite.path, relative)?;
-        let metadata = std::fs::metadata(&directory)?;
-        if !metadata.is_dir() {
-            return Err(StoreError::BadRequest);
-        }
-        let logical_directory = logical_folder_path(&favorite.path, relative);
-        let cached_aspect = if self.thumb_aspect_auto {
-            read_cached_thumb_aspect(&self.auto_aspect_cache_path, &logical_directory)?
-        } else {
-            None
-        };
-        let thumb_aspect_height_ratio = resolve_thumb_aspect_height_ratio(
-            self.thumb_aspect,
-            self.thumb_aspect_auto,
-            cached_aspect,
-        );
-
-        let mut entries = Vec::new();
-        let mut scanned_count = 0;
-        let scan_started = Instant::now();
-        for entry_result in std::fs::read_dir(&directory)? {
-            let entry = entry_result?;
-            scanned_count += 1;
-            // DirEntry::file_type uses the FindFirstFile data on Windows. Do not
-            // replace this with per-entry Path::is_dir/is_file calls.
-            let file_type = entry.file_type()?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let child_relative = join_relative(relative, &name);
-            let entry_metadata = entry.metadata()?;
-
-            let metadata = if file_type.is_symlink() || is_reparse_point(&entry_metadata) {
-                // Links and Windows reparse points need a canonical containment
-                // check before even metadata is published. DirEntry metadata is
-                // cached on Windows, so regular entries gain no extra syscall.
-                let resolved = match resolve_existing(&favorite.path, &child_relative) {
-                    Ok(path) => path,
-                    Err(_) => continue,
-                };
-                std::fs::metadata(&resolved)?
-            } else if file_type.is_dir() || file_type.is_file() {
-                entry_metadata
-            } else {
-                // Special filesystem entries are not exposed by the PoC.
-                continue;
-            };
-            let effective_is_dir = file_type.is_dir() || metadata.is_dir();
-            let effective_is_file = file_type.is_file() || metadata.is_file();
-            let kind = classify_entry(&name, effective_is_dir, effective_is_file);
-            entries.push(ListEntry {
-                kind,
-                name,
-                path: child_relative,
-                size: if effective_is_dir { 0 } else { metadata.len() },
-                mtime: mtime_secs(&metadata),
-            });
-        }
-        let scan_ms = duration_ms(scan_started.elapsed());
-
-        entries.sort_by(|left, right| {
-            sort_group(left.kind)
-                .cmp(&sort_group(right.kind))
-                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-                .then_with(|| left.name.cmp(&right.name))
-        });
-
-        let entry_count = entries.len();
-        let zip_count = entries
-            .iter()
-            .filter(|entry| entry.kind == EntryKind::Zip)
-            .count();
-        let pdf_count = entries
-            .iter()
-            .filter(|entry| entry.kind == EntryKind::Pdf)
-            .count();
-        Ok(ListResult {
-            response: ListResponse {
-                favorite_id,
-                path: normalize_relative_for_url(relative),
-                thumb_aspect_height_ratio,
-                entries,
-            },
-            metrics: ListMetrics {
-                entry_count,
-                scanned_count,
-                zip_count,
-                pdf_count,
-                scan_ms,
-            },
-        })
     }
 
     pub fn image(
@@ -538,54 +355,6 @@ impl Library {
     }
 }
 
-fn read_setting_json<T: serde::de::DeserializeOwned>(
-    connection: &Connection,
-    key: &str,
-) -> Result<Option<T>, StoreError> {
-    let raw = connection
-        .query_row(
-            "SELECT value FROM settings_kv WHERE key = ?1",
-            params![key],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    Ok(raw.and_then(|value| serde_json::from_str(&value).ok()))
-}
-
-fn read_cached_thumb_aspect(
-    cache_path: &Path,
-    logical_folder: &Path,
-) -> Result<Option<StoredThumbAspect>, StoreError> {
-    match std::fs::metadata(cache_path) {
-        Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => return Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(StoreError::Io(error)),
-    }
-    let connection = open_read_only(cache_path)?;
-    let folder_key = normalize_keep_drive(logical_folder);
-    let raw = connection
-        .query_row(
-            "SELECT aspect FROM auto_aspect_cache WHERE folder_key = ?1",
-            params![folder_key],
-            |row| row.get::<_, i32>(0),
-        )
-        .optional()?;
-    Ok(raw.and_then(thumb_aspect_from_cache_int))
-}
-
-fn logical_folder_path(root: &Path, relative: &str) -> PathBuf {
-    if relative.is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(relative)
-    }
-}
-
-fn normalize_keep_drive(path: &Path) -> String {
-    path.to_string_lossy().to_lowercase().replace('\\', "/")
-}
-
 fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open_with_flags(
         path,
@@ -651,56 +420,11 @@ pub fn classify_entry(name: &str, is_dir: bool, is_file: bool) -> EntryKind {
     }
 }
 
-fn sort_group(kind: EntryKind) -> u8 {
-    match kind {
-        EntryKind::Dir => 0,
-        EntryKind::Image => 1,
-        _ => 2,
-    }
-}
-
-fn join_relative(parent: &str, name: &str) -> String {
-    if parent.is_empty() {
-        name.to_owned()
-    } else {
-        format!("{}/{}", normalize_relative_for_url(parent), name)
-    }
-}
-
-fn normalize_relative_for_url(relative: &str) -> String {
-    relative
-        .split(['/', '\\'])
-        .filter(|segment| !segment.is_empty() && *segment != ".")
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-fn mtime_secs(metadata: &std::fs::Metadata) -> i64 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-#[cfg(windows)]
-fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use image::{Rgba, RgbaImage};
+    use mimageviewer_ipc::{RemoteEntryKind, RemoteSubresource};
 
     #[test]
     fn classifies_all_api_entry_kinds() {
@@ -734,67 +458,6 @@ mod tests {
     }
 
     #[test]
-    fn thumb_aspect_cache_mapping_and_resolution_match_miv_sources() {
-        let cases = [
-            (0, StoredThumbAspect::Landscape16x9, 9.0 / 16.0),
-            (1, StoredThumbAspect::Landscape3x2, 2.0 / 3.0),
-            (2, StoredThumbAspect::Landscape4x3, 3.0 / 4.0),
-            (3, StoredThumbAspect::Square, 1.0),
-            (4, StoredThumbAspect::Portrait3x4, 4.0 / 3.0),
-            (5, StoredThumbAspect::Portrait2x3, 3.0 / 2.0),
-            (6, StoredThumbAspect::Portrait9x16, 16.0 / 9.0),
-        ];
-        for (raw, aspect, expected) in cases {
-            assert_eq!(thumb_aspect_from_cache_int(raw), Some(aspect));
-            let manual = resolve_thumb_aspect_height_ratio(aspect, false, None);
-            let automatic =
-                resolve_thumb_aspect_height_ratio(StoredThumbAspect::Square, true, Some(aspect));
-            assert!((manual - expected).abs() < f64::EPSILON);
-            assert!((automatic - expected).abs() < f64::EPSILON);
-        }
-        assert_eq!(thumb_aspect_from_cache_int(-1), None);
-        assert_eq!(thumb_aspect_from_cache_int(7), None);
-        assert_eq!(
-            resolve_thumb_aspect_height_ratio(StoredThumbAspect::Portrait9x16, true, None),
-            1.0
-        );
-        assert_eq!(
-            resolve_thumb_aspect_height_ratio(
-                StoredThumbAspect::Landscape3x2,
-                false,
-                Some(StoredThumbAspect::Portrait9x16),
-            ),
-            2.0 / 3.0
-        );
-    }
-
-    #[test]
-    fn auto_aspect_folder_key_keeps_drive_and_matches_logical_folder() {
-        let root = Path::new(r"C:\Books\Series");
-        assert_eq!(normalize_keep_drive(root), "c:/books/series");
-        assert_eq!(
-            normalize_keep_drive(&logical_folder_path(root, "Volume 01/Pages")),
-            "c:/books/series/volume 01/pages"
-        );
-        assert_eq!(logical_folder_path(root, ""), root);
-    }
-
-    #[test]
-    fn missing_auto_aspect_cache_falls_back_without_creating_a_database() {
-        let temp = tempfile::tempdir().unwrap();
-        let cache_path = temp.path().join("auto_aspect_cache.db");
-        assert_eq!(
-            read_cached_thumb_aspect(&cache_path, Path::new(r"C:\Books\Series")).unwrap(),
-            None
-        );
-        assert!(!cache_path.exists());
-        assert_eq!(
-            resolve_thumb_aspect_height_ratio(StoredThumbAspect::Landscape16x9, true, None),
-            1.0
-        );
-    }
-
-    #[test]
     fn read_only_connection_rejects_writes() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("settings.db");
@@ -820,9 +483,6 @@ mod tests {
                 path: PathBuf::from("C:/Users/example/Private"),
             }],
             by_id: HashMap::from([(id, 0)]),
-            thumb_aspect: StoredThumbAspect::Square,
-            thumb_aspect_auto: false,
-            auto_aspect_cache_path: PathBuf::from("auto_aspect_cache.db"),
         };
         let json = serde_json::to_string(&library.favorites()).unwrap();
         assert!(json.contains(&id.to_string()));
@@ -832,55 +492,57 @@ mod tests {
     }
 
     #[test]
-    fn listing_does_not_publish_a_link_that_escapes_the_favorite() {
+    fn folder_list_revalidates_cell_and_thumbnail_containment() {
         let temp = tempfile::tempdir().unwrap();
         let favorite_root = temp.path().join("favorite");
         let outside = temp.path().join("outside");
         std::fs::create_dir_all(&favorite_root).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(favorite_root.join("safe.jpg"), b"safe").unwrap();
         std::fs::write(outside.join("secret.jpg"), b"secret").unwrap();
         let link = favorite_root.join("escape");
 
         if let Err(error) = make_dir_link(&outside, &link) {
             if error.kind() == std::io::ErrorKind::PermissionDenied {
-                eprintln!("link creation is unavailable; listing assertion skipped");
+                eprintln!("link creation is unavailable; containment assertion skipped");
                 return;
             }
             panic!("failed to create test link: {error}");
         }
 
         let id = Uuid::from_u128(0xfedcba9876543210fedcba9876543210);
-        let library = Library {
-            favorites: vec![FavoriteRoot {
-                id,
-                name: "Fixture".to_owned(),
-                path: favorite_root,
-            }],
-            by_id: HashMap::from([(id, 0)]),
-            thumb_aspect: StoredThumbAspect::Square,
-            thumb_aspect_auto: false,
-            auto_aspect_cache_path: temp.path().join("auto_aspect_cache.db"),
+        let library = Library::with_favorite_for_test(id, favorite_root);
+        let address = |relative_path: &str| RemoteAddress {
+            favorite_id: id.to_string(),
+            relative_path: relative_path.to_owned(),
+            subresource: RemoteSubresource::File,
         };
-        let listing = library.list(id, "").unwrap();
-        assert!(
-            listing
-                .response
-                .entries
-                .iter()
-                .all(|entry| entry.name != "escape")
-        );
-        assert!(matches!(
-            library.list(id, "escape"),
-            Err(StoreError::NotFound)
-        ));
+        let entry = |name: &str, cell: &str, thumbnail: &str| FolderListEntry {
+            address: address(cell),
+            thumbnail_address: address(thumbnail),
+            name: name.to_owned(),
+            kind: RemoteEntryKind::Image,
+            size: 4,
+            mtime: 0,
+        };
+        let mut entries = vec![
+            entry("safe.jpg", "safe.jpg", "safe.jpg"),
+            entry("bad-cell.jpg", "escape/secret.jpg", "safe.jpg"),
+            entry("bad-thumbnail.jpg", "safe.jpg", "escape/secret.jpg"),
+        ];
+
+        library.retain_allowed_folder_list_entries(&mut entries);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "safe.jpg");
     }
 
     #[test]
-    fn library_reads_settings_aspect_and_image_without_db_mutation() {
+    fn library_reads_favorites_and_image_without_db_mutation() {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().join("data");
         let favorite_root = temp.path().join("favorite");
-        std::fs::create_dir_all(favorite_root.join("album")).unwrap();
+        std::fs::create_dir_all(&favorite_root).unwrap();
         std::fs::create_dir_all(&data_dir).unwrap();
 
         let image_path = favorite_root.join("page.png");
@@ -899,21 +561,13 @@ mod tests {
                     name TEXT NOT NULL,
                     path TEXT NOT NULL,
                     sort_index INTEGER NOT NULL
-                 );
-                 CREATE TABLE settings_kv (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                 );
-                 INSERT INTO settings_kv (key, value)
-                 VALUES ('thumb_aspect', '\"Landscape3x2\"');
-                 INSERT INTO settings_kv (key, value)
-                 VALUES ('thumb_aspect_auto', 'true');",
+                 );",
             )
             .unwrap();
             conn.execute(
                 "INSERT INTO favorites (id, name, path, sort_index)
                  VALUES (?1, ?2, ?3, 0)",
-                params![
+                rusqlite::params![
                     favorite_id.as_bytes().as_slice(),
                     "Fixture",
                     favorite_root.to_string_lossy().as_ref()
@@ -922,60 +576,19 @@ mod tests {
             .unwrap();
         }
 
-        let auto_aspect_cache_path = data_dir.join("auto_aspect_cache.db");
-        {
-            let conn = Connection::open(&auto_aspect_cache_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE auto_aspect_cache (
-                    folder_key TEXT PRIMARY KEY,
-                    aspect INTEGER NOT NULL,
-                    sample_count INTEGER NOT NULL DEFAULT 0,
-                    eligible_total INTEGER NOT NULL DEFAULT 0,
-                    updated_at INTEGER NOT NULL
-                 );",
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO auto_aspect_cache
-                 (folder_key, aspect, sample_count, eligible_total, updated_at)
-                 VALUES (?1, 0, 12, 20, 1)",
-                params![normalize_keep_drive(&favorite_root)],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO auto_aspect_cache
-                 (folder_key, aspect, sample_count, eligible_total, updated_at)
-                 VALUES (?1, 5, 12, 20, 1)",
-                params![normalize_keep_drive(&favorite_root.join("album"))],
-            )
-            .unwrap();
-        }
-
         let settings_before = std::fs::read(&settings_path).unwrap();
-        let auto_aspect_cache_before = std::fs::read(&auto_aspect_cache_path).unwrap();
         let library = Library::load(&data_dir).unwrap();
 
         let favorites_json = serde_json::to_string(&library.favorites()).unwrap();
         assert!(favorites_json.contains("Fixture"));
         assert!(!favorites_json.contains(&favorite_root.to_string_lossy().to_string()));
-
-        let listing = library.list(favorite_id, "").unwrap();
-        assert_eq!(listing.response.path, "");
-        assert!((listing.response.thumb_aspect_height_ratio - (9.0 / 16.0)).abs() < f64::EPSILON);
-        let nested_listing = library.list(favorite_id, "album").unwrap();
-        assert!(
-            (nested_listing.response.thumb_aspect_height_ratio - (3.0 / 2.0)).abs() < f64::EPSILON
-        );
-        assert!(listing.response.entries.iter().any(|entry| {
-            entry.kind == EntryKind::Dir && entry.name == "album" && entry.path == "album"
-        }));
-        assert!(listing.response.entries.iter().any(|entry| {
-            entry.kind == EntryKind::Image && entry.name == "page.png" && entry.path == "page.png"
-        }));
-        assert_eq!(listing.metrics.entry_count, 2);
-        assert_eq!(listing.metrics.scanned_count, 2);
+        let traversal = RemoteAddress {
+            favorite_id: favorite_id.to_string(),
+            relative_path: "../page.png".to_owned(),
+            subresource: RemoteSubresource::File,
+        };
         assert!(matches!(
-            library.list(favorite_id, ".."),
+            library.validate_remote_address(&traversal),
             Err(StoreError::BadRequest)
         ));
 
@@ -994,10 +607,6 @@ mod tests {
         assert_eq!(passthrough.metrics.webp_encode_ms, 0.0);
 
         assert_eq!(std::fs::read(&settings_path).unwrap(), settings_before);
-        assert_eq!(
-            std::fs::read(&auto_aspect_cache_path).unwrap(),
-            auto_aspect_cache_before
-        );
     }
 
     #[cfg(windows)]

@@ -8,16 +8,17 @@ use std::time::{Duration, Instant};
 use mimageviewer_ipc::{
     ClientHello, ClientMessage, CollectionError, CollectionErrorCode, CollectionKind,
     CollectionPayload, CollectionRequest, CollectionResponse, ContainerPayload, ContainerRequest,
-    ContainerResponse, FrameError, HomePayload, HomeRequest, HomeResponse, MAX_CONTROL_FRAME_BYTES,
-    MAX_RESPONSE_FRAME_BYTES, MediaError, MediaErrorCode, PIPE_NAME, PROTOCOL_VERSION, PagePayload,
-    PagePriority, PageRequest, PageResponse, RemoteAddress, RemoteWebConnectionInfo,
-    RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse,
-    RemoteWriteResult, RequestId, ServerMessage, SessionAcquireRequest, SessionPeerInfo,
-    SessionPingRequest, SessionResponse, SessionStatus, ThumbnailError, ThumbnailErrorCode,
-    ThumbnailRequest, ThumbnailResponse, VideoStreamControlAction, VideoStreamError,
-    VideoStreamErrorCode, VideoStreamPlaylistKind, VideoStreamPlaylistPayload, VideoStreamQuality,
-    VideoStreamResult, VideoStreamSeekPayload, VideoStreamSegmentIndex, VideoStreamSegmentPayload,
-    VideoStreamStartPayload, VideoStreamStatePayload, read_frame, write_frame,
+    ContainerResponse, FolderListPayload, FolderListRequest, FolderListResponse, FrameError,
+    HomePayload, HomeRequest, HomeResponse, MAX_CONTROL_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES,
+    MediaError, MediaErrorCode, PIPE_NAME, PROTOCOL_VERSION, PagePayload, PagePriority,
+    PageRequest, PageResponse, RemoteAddress, RemoteWebConnectionInfo, RemoteWriteError,
+    RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult, RequestId,
+    ServerMessage, SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionResponse,
+    SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse,
+    VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode, VideoStreamPlaylistKind,
+    VideoStreamPlaylistPayload, VideoStreamQuality, VideoStreamResult, VideoStreamSeekPayload,
+    VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamStartPayload,
+    VideoStreamStatePayload, read_frame, write_frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -476,6 +477,48 @@ impl ThumbnailClient {
                     "response_type_mismatch",
                     None,
                     "collection request received another response type",
+                )),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+        })
+    }
+    pub fn folder_list(
+        &self,
+        client_id: &str,
+        address: RemoteAddress,
+    ) -> Result<IpcSuccess<FolderListPayload>, ClientFailure> {
+        self.collection_request(|id| ClientMessage::FolderList {
+            id,
+            client_id: client_id.to_owned(),
+            request: FolderListRequest {
+                address: address.clone(),
+            },
+        })
+        .and_then(|success| match success.value {
+            ServerMessage::FolderList {
+                response: FolderListResponse::Success(payload),
+                ..
+            } => Ok(IpcSuccess {
+                value: payload,
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+                connection_id: success.connection_id,
+            }),
+            ServerMessage::FolderList {
+                response: FolderListResponse::Error(error),
+                ..
+            } => Err(ClientFailure {
+                error: ClientError::MediaRemote(error),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+            _ => Err(ClientFailure {
+                error: ClientError::Protocol(protocol_failure(
+                    "response_route",
+                    "response_type_mismatch",
+                    None,
+                    "folder list request received another response type",
                 )),
                 retry_count: success.retry_count,
                 retry_statuses: success.retry_statuses,

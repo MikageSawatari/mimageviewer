@@ -6,8 +6,9 @@ use std::time::Instant;
 
 use mimageviewer_ipc::{
     ContainerEntry, ContainerEntryKind, ContainerKind, ContainerOpenMode, ContainerPayload,
-    ContainerRequest, ContainerResponse, MediaError, MediaErrorCode, PageGroup, PagePayload,
-    PagePriority, PageRequest, PageResponse, RemoteAddress, RemoteReadingDirection,
+    ContainerRequest, ContainerResponse, FolderListEntry, FolderListPayload, FolderListRequest,
+    FolderListResponse, MediaError, MediaErrorCode, PageGroup, PagePayload, PagePriority,
+    PageRequest, PageResponse, RemoteAddress, RemoteEntryKind, RemoteReadingDirection,
     RemoteSpreadMode, RemoteSubresource, RemoteWriteError, RemoteWriteErrorCode,
     RemoteWriteRequest, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse,
 };
@@ -73,8 +74,22 @@ struct ValidatedPageContext {
 
 struct RecomputedFolderListing {
     items: Vec<crate::grid_item::GridItem>,
+    metas: Vec<Option<(i64, i64)>>,
+    video_thumb_overrides: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+    scan_ms: f64,
+    materialize_ms: f64,
     image_only: bool,
     compiled: bool,
+}
+fn folder_thumb_aspect_height_ratio(settings: &crate::settings::Settings, folder: &Path) -> f64 {
+    let aspect = if settings.thumb_aspect_auto {
+        crate::auto_aspect_cache::AutoAspectCacheDb::get_read_only(folder)
+            .map(|entry| entry.aspect)
+            .unwrap_or(crate::settings::ThumbAspect::Square)
+    } else {
+        settings.thumb_aspect
+    };
+    f64::from(aspect.height_ratio())
 }
 
 impl ContainerEngine {
@@ -146,6 +161,61 @@ impl ContainerEngine {
         crate::logger::log(format!(
             "remote_ipc: media_operation operation=container source_kind={source_kind} outcome={outcome} duration_ms={:.1} entry_count={entry_count} group_count={group_count} configured_spread={configured} effective_spread={effective} reading_direction={direction}",
             started.elapsed().as_secs_f64() * 1000.0
+        ));
+        response
+    }
+
+    pub(super) fn folder_list(&self, request: FolderListRequest) -> FolderListResponse {
+        let started = Instant::now();
+        let resolved = match self.resolve(&request.address) {
+            Ok(resolved) => resolved,
+            Err(error) => return FolderListResponse::Error(error),
+        };
+        if !matches!(request.address.subresource, RemoteSubresource::File)
+            || !std::fs::metadata(&resolved.canonical).is_ok_and(|metadata| metadata.is_dir())
+        {
+            return FolderListResponse::Error(media_error(
+                MediaErrorCode::BadRequest,
+                "フォルダ一覧のアドレスが不正です",
+            ));
+        }
+        let thumb_aspect_height_ratio =
+            folder_thumb_aspect_height_ratio(&self.settings, &resolved.logical);
+        let listing = match self.recompute_folder_listing(&resolved.logical) {
+            Ok(listing) => listing,
+            Err(error) => {
+                return FolderListResponse::Error(media_error_from_remote_write(error));
+            }
+        };
+        let entries = listing
+            .items
+            .iter()
+            .zip(&listing.metas)
+            .filter_map(|(item, meta)| {
+                self.folder_list_entry(
+                    &request.address,
+                    item,
+                    *meta,
+                    &listing.video_thumb_overrides,
+                )
+            })
+            .collect::<Vec<_>>();
+        let response = FolderListResponse::Success(FolderListPayload {
+            effective_address: request.address,
+            thumb_aspect_height_ratio,
+            entries,
+            scan_ms: listing.scan_ms,
+            materialize_ms: listing.materialize_ms,
+        });
+        let entry_count = match &response {
+            FolderListResponse::Success(payload) => payload.entries.len(),
+            FolderListResponse::Error(_) => 0,
+        };
+        crate::logger::log(format!(
+            "remote_ipc: media_operation operation=folder_list outcome=ok duration_ms={:.1} entry_count={entry_count} scan_ms={:.1} materialize_ms={:.1}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            listing.scan_ms,
+            listing.materialize_ms,
         ));
         response
     }
@@ -392,6 +462,7 @@ impl ContainerEngine {
         &self,
         folder: &Path,
     ) -> Result<RecomputedFolderListing, RemoteWriteError> {
+        let scan_started = Instant::now();
         let scan = crate::app::folder_scan::scan_directory_with_settings(folder, &self.settings)
             .map_err(|_| {
                 RemoteWriteError::new(
@@ -399,6 +470,7 @@ impl ContainerEngine {
                     "画像フォルダを走査できませんでした",
                 )
             })?;
+        let scan_ms = scan_started.elapsed().as_secs_f64() * 1000.0;
         let compiled =
             crate::books::is_direct_book_folder(&self.settings.books_root_path(), folder);
         let image_only = if compiled {
@@ -411,90 +483,74 @@ impl ContainerEngine {
                 &scan.all_media,
             )
         };
-        let (mut folders, mut metas): (Vec<_>, Vec<_>) = scan.folders.into_iter().unzip();
-        let mut all_media = scan.all_media;
-        if compiled {
-            folders.clear();
-            metas.clear();
-            all_media
-                .retain(|(_, kind, _, _)| *kind == crate::app::folder_scan::ScanMediaKind::Image);
-        }
-        let folder_sort = if compiled {
-            crate::settings::SortOrder::Numeric
-        } else {
-            self.settings.sort_order
-        };
-        let media_sort = crate::app::folder_media_sort_order(
-            folder_sort,
-            compiled,
-            folders.is_empty(),
-            all_media
-                .iter()
-                .all(|(_, kind, _, _)| *kind == crate::app::folder_scan::ScanMediaKind::Image),
-            self.settings.auto_fullscreen_image_folders_enabled(),
-        );
-        crate::grid_item::sort_folder_block(&mut folders, &mut metas, folder_sort);
-        all_media.sort_by(|left, right| {
-            let left_name = left
-                .0
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            let right_name = right
-                .0
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            let left_key = media_sort.name_key(left_name);
-            let right_key = media_sort.name_key(right_name);
-            media_sort.compare_name_keys(&left_key, left.2, &right_key, right.2)
-        });
-        if self.settings.skip_zip_if_folder_exists {
-            crate::app::folder_scan::filter_virtual_folder_duplicates(&mut folders, &mut metas);
-        }
-        if self.settings.skip_archive_if_zip_exists {
-            crate::app::folder_scan::filter_convertible_archive_duplicates(
-                &mut folders,
-                &mut metas,
-            );
-        }
-        if self.settings.skip_image_if_video_exists {
-            let _ = crate::app::folder_scan::filter_video_image_duplicates(
-                &mut all_media,
-                self.settings.video_thumb_use_sidecar_image,
-            );
-        }
-        if self.settings.skip_duplicate_images {
-            crate::app::folder_scan::filter_image_ext_duplicates(
-                &mut all_media,
-                &self.settings.image_ext_priority,
-            );
-        }
-        let mut items = folders;
-        for (path, kind, mtime, file_size) in all_media {
-            items.push(match kind {
-                crate::app::folder_scan::ScanMediaKind::Image => {
-                    crate::grid_item::GridItem::Image(path)
-                }
-                crate::app::folder_scan::ScanMediaKind::Video => {
-                    crate::grid_item::GridItem::Video(path)
-                }
-                crate::app::folder_scan::ScanMediaKind::Audio => {
-                    crate::grid_item::GridItem::Audio(path)
-                }
-            });
-            metas.push(Some((mtime, file_size)));
-        }
-        crate::grid_item::arrange_grid_items(
-            &mut items,
-            &mut metas,
-            &self.settings.grid_display_order,
-            Some(media_sort),
-        );
+        let materialize_started = Instant::now();
+        let materialized =
+            crate::app::materialize_local_folder_listing(folder, scan, &self.settings);
+        let materialize_ms = materialize_started.elapsed().as_secs_f64() * 1000.0;
         Ok(RecomputedFolderListing {
-            items,
+            items: materialized.items,
+            metas: materialized.metas,
+            video_thumb_overrides: materialized.video_thumb_overrides,
+            scan_ms,
+            materialize_ms,
             image_only,
             compiled,
+        })
+    }
+
+    fn folder_list_entry(
+        &self,
+        container: &RemoteAddress,
+        item: &crate::grid_item::GridItem,
+        meta: Option<(i64, i64)>,
+        video_thumb_overrides: &[(std::path::PathBuf, std::path::PathBuf)],
+    ) -> Option<FolderListEntry> {
+        let (path, kind) = match item {
+            crate::grid_item::GridItem::Folder(path) => (path, RemoteEntryKind::Folder),
+            crate::grid_item::GridItem::Image(path) => (path, RemoteEntryKind::Image),
+            crate::grid_item::GridItem::Video(path) => (path, RemoteEntryKind::Video),
+            crate::grid_item::GridItem::Audio(path) => (path, RemoteEntryKind::Audio),
+            crate::grid_item::GridItem::ZipFile(path) => (path, RemoteEntryKind::Zip),
+            crate::grid_item::GridItem::PdfFile(path) => (path, RemoteEntryKind::Pdf),
+            crate::grid_item::GridItem::ConvertibleArchive { path, .. } => {
+                (path, RemoteEntryKind::Archive)
+            }
+            _ => return None,
+        };
+        let address_for = |candidate: &Path| {
+            let name = candidate.file_name()?.to_str()?;
+            let parent = container.relative_path.trim_end_matches('/');
+            let relative_path = if parent.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{parent}/{name}")
+            };
+            Some(RemoteAddress::file(
+                container.favorite_id.clone(),
+                relative_path,
+            ))
+        };
+        let address = address_for(path)?;
+        self.resolve(&address).ok()?;
+        let thumbnail_address = if kind == RemoteEntryKind::Video {
+            video_thumb_overrides
+                .iter()
+                .rev()
+                .find(|(video, _)| crate::path_key::eq_keep_drive(video, path))
+                .and_then(|(_, image)| address_for(image))
+                .filter(|candidate| self.resolve(candidate).is_ok())
+                .unwrap_or_else(|| address.clone())
+        } else {
+            address.clone()
+        };
+        let (mtime, size) = meta.unwrap_or((0, 0));
+        Some(FolderListEntry {
+            address,
+            thumbnail_address,
+            name: item.name().into_owned(),
+            kind,
+            size: u64::try_from(size).unwrap_or(0),
+            mtime,
         })
     }
 
@@ -2046,33 +2102,77 @@ mod tests {
         engine: &ContainerEngine,
         favorite: &FavoriteEntry,
         relative_folder: &str,
-    ) {
-        fn identity(item: &crate::grid_item::GridItem) -> String {
-            let (kind, path) = match item {
-                crate::grid_item::GridItem::Folder(path) => ("folder", path),
-                crate::grid_item::GridItem::Image(path) => ("image", path),
-                crate::grid_item::GridItem::Video(path) => ("video", path),
-                crate::grid_item::GridItem::Audio(path) => ("audio", path),
-                crate::grid_item::GridItem::ZipFile(path) => ("zip", path),
-                crate::grid_item::GridItem::PdfFile(path) => ("pdf", path),
-                crate::grid_item::GridItem::ConvertibleArchive { path, .. } => {
-                    ("convertible", path)
-                }
-                _ => panic!("physical folder listing produced a virtual item"),
-            };
-            format!("{kind}:{}", crate::path_key::normalize_keep_drive(path))
-        }
-
+    ) -> FolderListPayload {
         let folder = favorite.path.join(relative_folder);
         let scan = crate::app::folder_scan::scan_directory_with_settings(&folder, &engine.settings)
             .unwrap();
         let local = crate::app::materialize_local_folder_listing(&folder, scan, &engine.settings);
-        let remote = engine.recompute_folder_listing(&folder).unwrap();
+        let response = engine.folder_list(FolderListRequest {
+            address: RemoteAddress::file(favorite.id.to_string(), relative_folder),
+        });
+        let FolderListResponse::Success(remote) = response else {
+            panic!("remote folder listing failed for {relative_folder}");
+        };
+
         assert_eq!(
-            remote.items.iter().map(identity).collect::<Vec<_>>(),
-            local.items.iter().map(identity).collect::<Vec<_>>(),
-            "local and remote folder assembly drifted for {relative_folder}"
+            remote.entries.len(),
+            local.items.len(),
+            "local and remote folder entry counts drifted for {relative_folder}"
         );
+        for ((entry, item), meta) in remote.entries.iter().zip(&local.items).zip(&local.metas) {
+            let (expected_kind, path) = match item {
+                crate::grid_item::GridItem::Folder(path) => (RemoteEntryKind::Folder, path),
+                crate::grid_item::GridItem::Image(path) => (RemoteEntryKind::Image, path),
+                crate::grid_item::GridItem::Video(path) => (RemoteEntryKind::Video, path),
+                crate::grid_item::GridItem::Audio(path) => (RemoteEntryKind::Audio, path),
+                crate::grid_item::GridItem::ZipFile(path) => (RemoteEntryKind::Zip, path),
+                crate::grid_item::GridItem::PdfFile(path) => (RemoteEntryKind::Pdf, path),
+                crate::grid_item::GridItem::ConvertibleArchive { path, .. } => {
+                    (RemoteEntryKind::Archive, path)
+                }
+                _ => panic!("physical folder listing produced a virtual item"),
+            };
+            let name = path.file_name().unwrap().to_string_lossy();
+            let expected_address =
+                RemoteAddress::file(favorite.id.to_string(), format!("{relative_folder}/{name}"));
+            let expected_thumbnail = if expected_kind == RemoteEntryKind::Video {
+                local
+                    .video_thumb_overrides
+                    .iter()
+                    .rev()
+                    .find(|(video, _)| crate::path_key::eq_keep_drive(video, path))
+                    .map(|(_, image)| {
+                        RemoteAddress::file(
+                            favorite.id.to_string(),
+                            format!(
+                                "{relative_folder}/{}",
+                                image.file_name().unwrap().to_string_lossy()
+                            ),
+                        )
+                    })
+                    .unwrap_or_else(|| expected_address.clone())
+            } else {
+                expected_address.clone()
+            };
+            let (expected_mtime, expected_size) = meta.unwrap_or((0, 0));
+
+            assert_eq!(entry.kind, expected_kind, "kind drifted for {name}");
+            assert_eq!(entry.name, name, "name drifted for {name}");
+            assert_eq!(
+                entry.address, expected_address,
+                "address drifted for {name}"
+            );
+            assert_eq!(
+                entry.thumbnail_address, expected_thumbnail,
+                "thumbnail source drifted for {name}"
+            );
+            assert_eq!(entry.mtime, expected_mtime, "mtime drifted for {name}");
+            assert_eq!(
+                entry.size,
+                u64::try_from(expected_size).unwrap_or(0),
+                "size drifted for {name}"
+            );
+        }
 
         let page_count = local
             .items
@@ -2098,8 +2198,9 @@ mod tests {
                     .count()
             );
         }
-    }
 
+        remote
+    }
     #[test]
     fn folder_recomputation_matches_local_listing_for_required_materials() {
         let temp = tempfile::tempdir().unwrap();
@@ -2117,6 +2218,7 @@ mod tests {
 
         std::fs::write(mixed.join("page.jpg"), b"page").unwrap();
         std::fs::write(mixed.join("clip.mp4"), b"video").unwrap();
+        std::fs::write(mixed.join("clip.jpg"), b"sidecar").unwrap();
 
         std::fs::write(duplicate_ext.join("same.jpg"), b"jpeg").unwrap();
         std::fs::write(duplicate_ext.join("same.png"), b"png").unwrap();
@@ -2131,12 +2233,31 @@ mod tests {
             favorites: vec![favorite.clone()],
             skip_duplicate_images: true,
             skip_zip_if_folder_exists: true,
+            skip_image_if_video_exists: true,
+            video_thumb_use_sidecar_image: true,
+            thumb_aspect_auto: false,
+            thumb_aspect: crate::settings::ThumbAspect::Landscape3x2,
             ..Default::default()
         };
         let engine = ContainerEngine::new(settings);
 
         for relative in ["image-only", "mixed", "duplicate-ext", "virtual-duplicate"] {
-            assert_local_remote_folder_listing_match(&engine, &favorite, relative);
+            let remote = assert_local_remote_folder_listing_match(&engine, &favorite, relative);
+            if relative == "mixed" {
+                assert!(
+                    remote.entries.iter().all(|entry| entry.name != "clip.jpg"),
+                    "the absorbed sidecar must not remain as an independent remote tile"
+                );
+                assert!((remote.thumb_aspect_height_ratio - (2.0 / 3.0)).abs() < 1e-6);
+                let video = remote
+                    .entries
+                    .iter()
+                    .find(|entry| entry.name == "clip.mp4")
+                    .expect("video entry");
+                assert_eq!(video.kind, RemoteEntryKind::Video);
+                assert_eq!(video.address.relative_path, "mixed/clip.mp4");
+                assert_eq!(video.thumbnail_address.relative_path, "mixed/clip.jpg");
+            }
         }
     }
 

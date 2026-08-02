@@ -30,9 +30,9 @@ pub(crate) struct ScannedDir {
 
 /// App::load_folder が走査結果から実際の一覧を組み立てた結果。
 ///
-/// remote IPC の読書位置再計算とは低レベルの sort / 重複除外関数を共有する一方、
-/// オーケストレーションは独立している。その差分を production のローカル出力と直接
-/// 比較できるよう、ローカル側の組み立て全体をこの pure helper に集約する。
+/// App::load_folder と remote IPC の通常フォルダ一覧 / 読書位置再計算が
+/// この同じ pure helper を使う。表示対象・sort・重複除外を変える場合はここだけを変更し、
+/// remote 側に別のオーケストレーションを増やさない。
 pub(crate) struct MaterializedFolderListing {
     pub(crate) items: Vec<GridItem>,
     pub(crate) metas: Vec<Option<(i64, i64)>>,

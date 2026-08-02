@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -129,6 +129,40 @@ fn looks_absolute_or_drive_qualified(value: &str) -> bool {
 pub struct ThumbnailRequest {
     pub address: RemoteAddress,
     pub target_px: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct FolderListRequest {
+    pub address: RemoteAddress,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct FolderListEntry {
+    /// Address of the listed cell, relative to its favorite root.
+    pub address: RemoteAddress,
+    /// Thumbnail source; a video's sidecar image may differ from `address`.
+    pub thumbnail_address: RemoteAddress,
+    pub name: String,
+    pub kind: RemoteEntryKind,
+    pub size: u64,
+    pub mtime: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FolderListPayload {
+    pub effective_address: RemoteAddress,
+    pub thumb_aspect_height_ratio: f64,
+    pub entries: Vec<FolderListEntry>,
+    /// Time spent scanning the directory and reading metadata.
+    pub scan_ms: f64,
+    /// Time spent in the canonical core materializer.
+    pub materialize_ms: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum FolderListResponse {
+    Success(FolderListPayload),
+    Error(MediaError),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -790,6 +824,11 @@ pub enum ClientMessage {
         client_id: String,
         request: CollectionRequest,
     },
+    FolderList {
+        id: RequestId,
+        client_id: String,
+        request: FolderListRequest,
+    },
     Container {
         id: RequestId,
         client_id: String,
@@ -859,6 +898,7 @@ impl ClientMessage {
             | Self::Thumbnail { id, .. }
             | Self::Home { id, .. }
             | Self::Collection { id, .. }
+            | Self::FolderList { id, .. }
             | Self::Container { id, .. }
             | Self::Page { id, .. }
             | Self::Write { id, .. }
@@ -896,6 +936,10 @@ pub enum ServerMessage {
     Collection {
         id: RequestId,
         response: CollectionResponse,
+    },
+    FolderList {
+        id: RequestId,
+        response: FolderListResponse,
     },
     Container {
         id: RequestId,
@@ -948,6 +992,7 @@ impl ServerMessage {
             | Self::Home { id, .. }
             | Self::Collection { id, .. }
             | Self::Container { id, .. }
+            | Self::FolderList { id, .. }
             | Self::Page { id, .. }
             | Self::Write { id, .. }
             | Self::VideoStreamStart { id, .. }
@@ -1153,8 +1198,51 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v15_video_pull_messages_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 15);
+    fn folder_list_round_trips_with_sidecar_provenance() {
+        let video = RemoteAddress::file("favorite", "movies/sample.mp4");
+        let sidecar = RemoteAddress::file("favorite", "movies/sample.jpg");
+        let request = ClientMessage::FolderList {
+            id: 49,
+            client_id: "test-client".to_owned(),
+            request: FolderListRequest {
+                address: RemoteAddress::file("favorite", "movies"),
+            },
+        };
+        let response = ServerMessage::FolderList {
+            id: 49,
+            response: FolderListResponse::Success(FolderListPayload {
+                effective_address: RemoteAddress::file("favorite", "movies"),
+                thumb_aspect_height_ratio: 9.0 / 16.0,
+                entries: vec![FolderListEntry {
+                    address: video,
+                    thumbnail_address: sidecar,
+                    name: "sample.mp4".to_owned(),
+                    kind: RemoteEntryKind::Video,
+                    size: 123,
+                    mtime: 456,
+                }],
+                scan_ms: 0.2,
+                materialize_ms: 0.1,
+            }),
+        };
+        let mut request_bytes = Vec::new();
+        write_frame(&mut request_bytes, &request).unwrap();
+        let actual_request: ClientMessage =
+            read_frame(&mut request_bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
+        assert_eq!(actual_request, request);
+
+        let mut response_bytes = Vec::new();
+        write_frame(&mut response_bytes, &response).unwrap();
+        let actual_response: ServerMessage =
+            read_frame(&mut response_bytes.as_slice(), MAX_RESPONSE_FRAME_BYTES).unwrap();
+        assert_eq!(actual_response, response);
+        let encoded = String::from_utf8(response_bytes[4..].to_vec()).unwrap();
+        assert!(!encoded.contains(":\\"));
+    }
+
+    #[test]
+    fn protocol_v16_video_pull_messages_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 16);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,

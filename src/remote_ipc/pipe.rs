@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use mimageviewer_ipc::{
     ClientHello, ClientMessage, CollectionError, CollectionErrorCode, CollectionResponse,
-    ContainerResponse, HomeResponse, MAX_CONTROL_FRAME_BYTES, MediaError, MediaErrorCode,
-    PIPE_NAME, PROTOCOL_VERSION, PagePriority, PageResponse, RemoteWriteError,
+    ContainerResponse, FolderListResponse, HomeResponse, MAX_CONTROL_FRAME_BYTES, MediaError,
+    MediaErrorCode, PIPE_NAME, PROTOCOL_VERSION, PagePriority, PageResponse, RemoteWriteError,
     RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, ServerMessage, SessionResponse,
     SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse, VideoStreamError,
     VideoStreamErrorCode, VideoStreamResult, negotiate, read_frame, write_frame,
@@ -188,11 +188,17 @@ impl ServerGuard {
         let stream_metrics = Arc::new(QueueMetrics::new("stream"));
         let prefetch_in_flight = Arc::new(AtomicUsize::new(0));
         let home_collection_engine = Arc::clone(&collection_engine);
+        let home_container_engine = Arc::clone(&container_engine);
         let home_worker_metrics = Arc::clone(&home_metrics);
         let home_worker = std::thread::Builder::new()
             .name("remote-home".to_owned())
             .spawn(move || {
-                home_worker_loop(home_work_rx, &home_collection_engine, &home_worker_metrics)
+                home_worker_loop(
+                    home_work_rx,
+                    &home_collection_engine,
+                    &home_container_engine,
+                    &home_worker_metrics,
+                )
             })
             .map_err(|error| format!("remote IPC home worker を開始できません: {error}"))?;
         let write_container_engine = Arc::clone(&container_engine);
@@ -425,6 +431,10 @@ fn worker_loop(
                         id,
                         response: collection_engine.collection(request),
                     },
+                    ClientMessage::FolderList { id, request, .. } => ServerMessage::FolderList {
+                        id,
+                        response: container_engine.folder_list(request),
+                    },
                     ClientMessage::Container { id, request, .. } => ServerMessage::Container {
                         id,
                         response: container_engine.container(request),
@@ -477,6 +487,7 @@ fn worker_loop(
 fn home_worker_loop(
     work_rx: mpsc::Receiver<Work>,
     collection_engine: &CollectionEngine,
+    container_engine: &ContainerEngine,
     metrics: &QueueMetrics,
 ) {
     crate::logger::log("remote_ipc: worker_started queue=home worker=home-0".to_owned());
@@ -499,6 +510,10 @@ fn home_worker_loop(
                     ClientMessage::Home { id, .. } => ServerMessage::Home {
                         id,
                         response: collection_engine.home(),
+                    },
+                    ClientMessage::FolderList { id, request, .. } => ServerMessage::FolderList {
+                        id,
+                        response: container_engine.folder_list(request),
                     },
                     other => service_stopped_response(&other),
                 },
@@ -857,6 +872,7 @@ fn request_kind(message: &ClientMessage) -> &'static str {
         ClientMessage::Thumbnail { .. } => "thumbnail",
         ClientMessage::Home { .. } => "home",
         ClientMessage::Collection { .. } => "collection",
+        ClientMessage::FolderList { .. } => "folder_list",
         ClientMessage::Container { .. } => "container",
         ClientMessage::Page { request, .. } => match request.priority {
             PagePriority::Foreground => "page_foreground",
@@ -875,7 +891,7 @@ fn request_kind(message: &ClientMessage) -> &'static str {
 
 fn work_lane(message: &ClientMessage) -> WorkLane {
     match message {
-        ClientMessage::Home { .. } => WorkLane::Home,
+        ClientMessage::Home { .. } | ClientMessage::FolderList { .. } => WorkLane::Home,
         ClientMessage::Write { .. } => WorkLane::Write,
         ClientMessage::VideoStreamStart { .. }
         | ClientMessage::VideoStreamControl { .. }
@@ -895,6 +911,7 @@ fn message_client_id(message: &ClientMessage) -> Option<&str> {
         | ClientMessage::Home { client_id, .. }
         | ClientMessage::Collection { client_id, .. }
         | ClientMessage::Container { client_id, .. }
+        | ClientMessage::FolderList { client_id, .. }
         | ClientMessage::Page { client_id, .. }
         | ClientMessage::Write { client_id, .. }
         | ClientMessage::VideoStreamStart { client_id, .. }
@@ -925,6 +942,7 @@ fn operation_description(message: &ClientMessage) -> String {
         ClientMessage::Home { .. } => "ホームを読み込み中".to_owned(),
         ClientMessage::Collection { .. } => "集約ビューを読み込み中".to_owned(),
         ClientMessage::Container { .. } => "コンテナを列挙中".to_owned(),
+        ClientMessage::FolderList { .. } => "フォルダ一覧を読み込み中".to_owned(),
         ClientMessage::Page { request, .. } => match request.address.subresource {
             mimageviewer_ipc::RemoteSubresource::PdfPage { page_number } => {
                 format!("PDF {} ページ目をレンダリング中", page_number + 1)
@@ -989,6 +1007,10 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
             response: ContainerResponse::Success(_),
             ..
         }
+        | ServerMessage::FolderList {
+            response: FolderListResponse::Success(_),
+            ..
+        }
         | ServerMessage::Page {
             response: PageResponse::Success(_),
             ..
@@ -1041,6 +1063,10 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
         }
         | ServerMessage::Container {
             response: ContainerResponse::Error(_),
+            ..
+        }
+        | ServerMessage::FolderList {
+            response: FolderListResponse::Error(_),
             ..
         }
         | ServerMessage::Page {
@@ -1495,6 +1521,13 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
                 "mIV 本体のコンテナワーカーが停止しています",
             )),
         },
+        ClientMessage::FolderList { id, .. } => ServerMessage::FolderList {
+            id: *id,
+            response: FolderListResponse::Error(MediaError::new(
+                MediaErrorCode::Internal,
+                "mIV 本体のフォルダ一覧ワーカーが停止しています",
+            )),
+        },
         ClientMessage::Page { id, .. } => ServerMessage::Page {
             id: *id,
             response: PageResponse::Error(MediaError::new(
@@ -1584,6 +1617,13 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
             response: ContainerResponse::Error(MediaError::new(
                 MediaErrorCode::Busy,
                 "mIV 本体のリモートコンテナ queue が混み合っています",
+            )),
+        },
+        ClientMessage::FolderList { id, .. } => ServerMessage::FolderList {
+            id: *id,
+            response: FolderListResponse::Error(MediaError::new(
+                MediaErrorCode::Busy,
+                "mIV 本体のリモートフォルダ一覧 queue が混み合っています",
             )),
         },
         ClientMessage::Page { id, .. } => ServerMessage::Page {
@@ -1881,9 +1921,16 @@ mod tests {
         let (work_tx, work_rx) = mpsc::sync_channel(2);
         let metrics = Arc::new(QueueMetrics::new("home-test"));
         let worker_metrics = Arc::clone(&metrics);
-        let collection_engine = CollectionEngine::new(crate::settings::Settings::default());
+        let settings = crate::settings::Settings::default();
+        let collection_engine = CollectionEngine::new(settings.clone());
+        let container_engine = ContainerEngine::new(settings);
         let worker = std::thread::spawn(move || {
-            home_worker_loop(work_rx, &collection_engine, &worker_metrics)
+            home_worker_loop(
+                work_rx,
+                &collection_engine,
+                &container_engine,
+                &worker_metrics,
+            )
         });
         let (reply_tx, reply_rx) = mpsc::channel();
         let session = SessionHandle::new();
@@ -1979,9 +2026,20 @@ mod tests {
             client_id: "test-client".to_owned(),
             request: mimageviewer_ipc::HomeRequest,
         };
+        let folder_list = ClientMessage::FolderList {
+            id: 83,
+            client_id: "test-client".to_owned(),
+            request: mimageviewer_ipc::FolderListRequest {
+                address: mimageviewer_ipc::RemoteAddress::file(
+                    "00000000-0000-0000-0000-000000000000",
+                    "album",
+                ),
+            },
+        };
         assert_eq!(work_lane(&segment), WorkLane::Stream);
         assert_eq!(work_lane(&thumbnail), WorkLane::Heavy);
         assert_eq!(work_lane(&home), WorkLane::Home);
+        assert_eq!(work_lane(&folder_list), WorkLane::Home);
 
         let (stream_tx, _stream_rx) = mpsc::sync_channel(1);
         stream_tx.try_send(Work::Stop).unwrap();

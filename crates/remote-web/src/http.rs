@@ -8,10 +8,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimageviewer_ipc::{
     CollectionErrorCode, CollectionKind, MediaErrorCode, PagePriority, RemoteAddress,
-    RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource, RemoteWriteErrorCode,
-    RemoteWriteRequest, SessionResponse, SessionStatus, VideoStreamControlAction,
-    VideoStreamErrorCode, VideoStreamPlaylistKind, VideoStreamQuality, VideoStreamSegmentIndex,
-    VideoStreamSegmentPayload,
+    RemoteEntryKind, RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource,
+    RemoteWriteErrorCode, RemoteWriteRequest, SessionResponse, SessionStatus,
+    VideoStreamControlAction, VideoStreamErrorCode, VideoStreamPlaylistKind, VideoStreamQuality,
+    VideoStreamSegmentIndex, VideoStreamSegmentPayload,
 };
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
@@ -85,6 +85,7 @@ pub struct IpcAdmission {
 
 #[derive(Clone, Copy)]
 enum IpcClass {
+    Browse,
     Home,
     Heavy,
     Prefetch,
@@ -450,9 +451,9 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
         }
         (Method::Get, "/api/home") => api_home(state, &remote_client_id),
         (Method::Get, "/api/collection") => api_collection(state, &query, &remote_client_id),
-        (Method::Get, "/api/list") => {
-            with_session_activity(state, &remote_client_id, || api_list(state, &query))
-        }
+        (Method::Get, "/api/list") => with_session_activity(state, &remote_client_id, || {
+            api_list(state, &query, &remote_client_id)
+        }),
         (Method::Get, "/api/container") => api_container(state, &query, &remote_client_id),
         (Method::Post, "/api/write") => api_write(request, state, &remote_client_id),
         (Method::Get, "/api/thumb") => api_thumb(state, &query, &remote_client_id),
@@ -1303,21 +1304,105 @@ fn collection_ipc_error_response(
     }))
 }
 
-fn api_list(state: &AppState, query: &[(String, String)]) -> HttpResponse {
+fn api_list(state: &AppState, query: &[(String, String)], client_id: &str) -> HttpResponse {
     let Some((favorite, path)) = favorite_and_path(query) else {
         return HttpResponse::text(400, "Bad Request");
     };
-    match state.library.list(favorite, path) {
-        Ok(value) => match HttpResponse::json(&value.response) {
-            Ok(response) => response
-                .with_header("Cache-Control", "no-store")
-                .with_log_details(json!({"list": value.metrics})),
-            Err(error) => {
-                eprintln!("remote-web: list JSON encoding failed: {error}");
-                HttpResponse::text(500, "Internal Server Error")
+    let address = RemoteAddress::file(favorite.to_string(), path);
+    if let Err(error) = state.library.validate_remote_address(&address) {
+        return store_error_response(error);
+    }
+    let started = Instant::now();
+    let result = match state.ipc_admission.run(IpcClass::Browse, || {
+        state.thumbnail_client.folder_list(client_id, address)
+    }) {
+        Ok(result) => result,
+        Err(busy) => return media_admission_busy_response(busy, "list"),
+    };
+    match result {
+        Ok(mut result) => {
+            if state
+                .library
+                .validate_remote_address(&result.value.effective_address)
+                .is_err()
+            {
+                return HttpResponse::text(502, "Bad Gateway");
             }
-        },
-        Err(error) => store_error_response(error),
+            let core_entry_count = result.value.entries.len();
+            state
+                .library
+                .retain_allowed_folder_list_entries(&mut result.value.entries);
+            let payload = result.value;
+            let entries = payload
+                .entries
+                .iter()
+                .map(|entry| {
+                    json!({
+                        "kind": folder_list_entry_kind(entry.kind),
+                        "name": entry.name,
+                        "path": entry.address.relative_path,
+                        "size": entry.size,
+                        "mtime": entry.mtime,
+                        "address": entry.address,
+                        "thumbnail_address": entry.thumbnail_address,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let entry_count = entries.len();
+            let zip_count = payload
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == RemoteEntryKind::Zip)
+                .count();
+            let pdf_count = payload
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == RemoteEntryKind::Pdf)
+                .count();
+            let response = json!({
+                "favorite_id": payload.effective_address.favorite_id,
+                "path": payload.effective_address.relative_path,
+                "thumb_aspect_height_ratio": payload.thumb_aspect_height_ratio,
+                "entries": entries,
+            });
+            match HttpResponse::json(&response) {
+                Ok(response) => response
+                    .with_header("Cache-Control", "no-store")
+                    .with_log_details(json!({
+                        "list": {
+                            "ipc_status": "ok",
+                            "ipc_ms": crate::diagnostics::duration_ms(started.elapsed()),
+                            "ipc_retry_count": result.retry_count,
+                            "ipc_retry_statuses": result.retry_statuses,
+                            "ipc_connection_id": result.connection_id,
+                            "entry_count": entry_count,
+                            "core_entry_count": core_entry_count,
+                            "zip_count": zip_count,
+                            "pdf_count": pdf_count,
+                            "scan_ms": payload.scan_ms,
+                            "materialize_ms": payload.materialize_ms,
+                        }
+                    })),
+                Err(error) => {
+                    eprintln!("remote-web: list JSON encoding failed: {error}");
+                    HttpResponse::text(500, "Internal Server Error")
+                }
+            }
+        }
+        Err(failure) => media_ipc_error_response(failure, started.elapsed(), "list", None),
+    }
+}
+
+fn folder_list_entry_kind(kind: RemoteEntryKind) -> &'static str {
+    match kind {
+        RemoteEntryKind::Folder => "dir",
+        RemoteEntryKind::Image => "image",
+        RemoteEntryKind::Video => "video",
+        RemoteEntryKind::Audio => "audio",
+        RemoteEntryKind::Zip => "zip",
+        RemoteEntryKind::Pdf => "pdf",
+        RemoteEntryKind::Archive => "archive",
+        RemoteEntryKind::Other => "other",
     }
 }
 
@@ -2848,30 +2933,18 @@ mod tests {
     }
 
     #[test]
-    fn saturated_streaming_leaves_thumbnail_and_list_capacity_available() {
+    fn saturated_streaming_leaves_thumbnail_and_folder_list_capacity_available() {
         let admission = IpcAdmission::new();
         let stream_permits = (0..MAX_CONCURRENT_STREAM_IPC)
             .map(|_| admission.try_enter(IpcClass::Stream).unwrap())
             .collect::<Vec<_>>();
-        assert!(admission.try_enter(IpcClass::Heavy).is_ok());
+        let thumbnail = admission.try_enter(IpcClass::Heavy).unwrap();
+        let folder_list = admission.try_enter(IpcClass::Browse).unwrap();
 
-        let temp = tempfile::tempdir().unwrap();
-        let favorite_id = Uuid::from_u128(0xfeedfacefeedfacefeedfacefeedface);
-        std::fs::write(temp.path().join("page.jpg"), b"fixture").unwrap();
-        let mut state = test_state(&temp);
-        state.library = Library::with_favorite_for_test(favorite_id, temp.path().to_owned());
-        let mut request: Request = TestRequest::new()
-            .with_method(Method::Get)
-            .with_path(&format!("/api/list?fav={favorite_id}&path="))
-            .with_header(cookie_header(&state))
-            .into();
-        let started = Instant::now();
-        let response = route(&mut request, &state);
-        assert_eq!(response.status, 200);
-        assert!(started.elapsed() < Duration::from_millis(50));
+        drop(folder_list);
+        drop(thumbnail);
         drop(stream_permits);
     }
-
     #[test]
     fn disconnected_thumbnail_ipc_returns_a_user_visible_service_error() {
         let response = ipc_error_response(
@@ -2995,6 +3068,7 @@ mod tests {
         let permits = (0..MAX_CONCURRENT_HEAVY_IPC)
             .map(|_| admission.try_enter(IpcClass::Heavy).unwrap())
             .collect::<Vec<_>>();
+        let _browse = admission.try_enter(IpcClass::Browse).unwrap();
         let started = Instant::now();
         let busy = match admission.try_enter(IpcClass::Heavy) {
             Ok(_) => panic!("heavy IPC admission unexpectedly succeeded"),

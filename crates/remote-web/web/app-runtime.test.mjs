@@ -96,14 +96,64 @@ const {
   ImageViewer,
   VIEWER_MENU_MAX_ACTIONS,
   activateFolderContainerForImage,
+  commandTelemetryEvent,
   containerInitialImageIndex,
   createGridTile,
   loadFolder,
   parentContainerAddress,
   reloadApplication,
   resolveMediaOpenRoute,
+  thumbnailAddressForEntry,
   viewerMenuDefinitions,
 } = await import("./app.js");
+test("open telemetry records the requested kind, media kind, and reached route", () => {
+  const event = commandTelemetryEvent(
+    {
+      name: "open",
+      payload: { kind: "media", mediaKind: "video" },
+    },
+    { detail: "grid_tile", openRoute: "media_video" },
+    "mouse",
+    "grid",
+    true
+  );
+
+  assert.equal(event.payload.kind, "media");
+  assert.equal(event.mediaKind, "video");
+  assert.equal(event.open_route, "media_video");
+  assert.equal(event.handled, true);
+
+  const rejected = commandTelemetryEvent(
+    { name: "open", payload: { kind: "image" } },
+    { openRoute: "legacy_image_rejected" },
+    "keyboard",
+    "grid",
+    false
+  );
+  assert.equal(rejected.payload.kind, "image");
+  assert.equal(rejected.mediaKind, null);
+  assert.equal(rejected.open_route, "legacy_image_rejected");
+  assert.equal(rejected.handled, false);
+});
+
+test("a folder-list video uses its absorbed sidecar as the thumbnail source", () => {
+  const video = {
+    favorite_id: "favorite",
+    relative_path: "movies/clip.mp4",
+    subresource: { kind: "file" },
+  };
+  const sidecar = {
+    favorite_id: "favorite",
+    relative_path: "movies/clip.jpg",
+    subresource: { kind: "file" },
+  };
+  assert.equal(
+    thumbnailAddressForEntry({ address: video, thumbnail_address: sidecar }),
+    sidecar
+  );
+  assert.equal(thumbnailAddressForEntry({ address: video }), video);
+});
+
 
 test("container opening resumes the matching page and otherwise falls back safely", () => {
   const page = (pageNumber) => ({

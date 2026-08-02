@@ -25,14 +25,15 @@ v3.0.0 の目玉として、外出先のスマートフォン / タブレット 
 [ブラウザ]  ──HTTP──▶  [mimageviewer-remote.exe]  ──IPC──▶  [mimageviewer-core.exe]
                          (crates/remote-web)                   (本体・単一 writer)
                               │
-                              └─ read-only で直接読む: 実ファイル / settings DB
+                              └─ read-only で直接読む: 実メディア / settings DB
 ```
 
 ### 2.1 読み書きの分離 (重要な不変条件)
 
 | 種別 | 担当 | 理由 |
 |---|---|---|
-| 読み取り (画像・動画バイト・一覧) | remote-web が **直接** read-only で読む | HTTP の range / 一覧走査を本体 UI から分離する |
+| 読み取り (画像・動画バイト) | remote-web が **直接** read-only で読む | HTTP の range / 画像配信を本体 UI から分離する |
+| 通常フォルダ一覧 | **IPC → 本体** | 表示対象・順序・sidecar 吸収・重複除去を本体の production materializer 1 箇所に固定する (§12.15) |
 | サムネイル参照・生成 | **IPC → 本体** | catalog の実態が当初想定と異なったため。本体の既存生成経路とキャッシュ方針を一元利用する (§9) |
 | 書き込み (読書履歴・ブックマーク・見開き・トリム・タグ・レーティング) | **必ず IPC → 本体** | 全永続ストアの writer を本体 1 つに固定する |
 | 重い生成 (PDF レンダ・AI アップスケール・カラー化・補正合成) | **IPC → 本体** | PDFium プール・ONNX セッション・GPU をステートフルに保持しているのは本体 |
@@ -154,7 +155,7 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 | エンドポイント | 内容 |
 |---|---|
 | `GET /api/favorites` | お気に入り一覧 (id, 表示名) を JSON で返す |
-| `GET /api/list?fav=<uuid>&path=<rel>` | 指定フォルダの直下と、そのフォルダでの実効サムネイル高さ比を JSON で返す。各要素は種別 (dir / image / video / audio / zip / pdf / other)・表示名・相対パス・サイズ・mtime |
+| `GET /api/list?fav=<uuid>&path=<rel>` | 本体の通常フォルダ一覧を IPC で取得する。従来の種別・表示名・相対パス・サイズ・mtime に加え、セルの `address` と吸収済み sidecar を含む `thumbnail_address` を返す |
 | `GET /api/thumb?fav=<uuid>&path=<rel>&w=<px>` | 画像・フォルダのサムネイルを本体へ IPC 中継し WebP で返す。本体未接続時は 503 と利用者向け理由を返す |
 | `GET /api/image-info?fav=<uuid>&path=<rel>` | EXIF 回転反映後の元画像寸法を返す。クライアントの実描画幅計算に使う |
 | `GET /api/image?fav=<uuid>&path=<rel>&w=<px>` | 画像を `w` に合わせて縮小し WebP で返す。リサイズ不要・EXIF identity・ブラウザ対応形式なら元バイトを素通しする |
@@ -162,10 +163,11 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 
 - サムネイルの catalog 参照・キー生成・生成・保存判定は本体の既存経路に集約する。remote-web は
   catalog の内部構造を知らず、専用サムネイル DB も持たない。この段階で扱う source は通常画像と
-  フォルダ代表である。ZIP / PDF の container page は後続増分で対応済みだが、動画 / 音声の
-  一覧サムネイルは動画配信第 1 段でも非スコープとする
+  フォルダ代表である。ZIP / PDF の container page は後続増分で対応済みであり、通常フォルダの動画は
+  本体で同名画像を sidecar として吸収した場合、その画像 address を `/api/thumb` へ渡す
 - 本体側でも favorite allowlist と canonical path の包含を検証し、remote-web の検証結果を信頼しない
-- 一覧の走査は `entry.file_type()` を使う (`Path::is_dir()` を per-entry で呼ばない)
+- 一覧の走査と materialize は本体 `scan_directory_with_settings` →
+  `materialize_local_folder_listing` だけを使い、remote-web に別の列挙を持たない
 
 #### フロントエンド (`crates/remote-web/web/`)
 
@@ -616,9 +618,10 @@ PoC の目的は「実回線で実用になるか」の確認だったが、**�
 120 秒だったため、重い依存先が HTTP server 全体を長時間止め得る構造になっていた。
 
 remote-web の HTTP worker は 12 本とし、非待機型 admission gate で IPC 全体を 6、うち
-サムネイルと集約一覧の重い要求を 4 に制限する。したがって IPC がすべて待機中でも少なくとも
-6 worker は `/api/favorites` / `/api/list` / 認証等へ使え、重い IPC が上限でも Home 用 IPC
-2 枠が残る。上限超過は queue 待ちせず HTTP 503 + `Retry-After: 1` と
+サムネイル・container・page・集約一覧の重い要求を 4 に制限する。通常フォルダの `/api/list` は
+全体 6 枠だけを使い heavy 4 枠を消費しないため、heavy が上限でも一覧 / Home 用に 2 枠が残る。
+IPC がすべて待機中でも少なくとも 6 worker は `/api/favorites` / 認証等の IPC-free endpoint に
+使える。上限超過は queue 待ちせず HTTP 503 + `Retry-After: 1` と
 `ipc_status=admission_busy` を返す。ブラウザの thumbnail 再試行がこの応答を処理する。
 
 IPC 応答期限は 10 秒とする。実測の最も遅い単発 RAW decode 1.7 秒に約 6 倍の余裕があり、
@@ -628,8 +631,9 @@ IPC 応答期限は 10 秒とする。実測の最も遅い単発 RAW decode 1.7
 再試行しない。多重化接続では期限切れ request id を tombstone として保持し、遅着応答だけを
 読み捨てるため、1 件の timeout が他の進行中要求や接続全体を巻き添えにしない。
 
-本体 IPC は Home を専用 queue + 1 worker に分離した。サムネイルと集約評価は別の heavy queue で
-処理し、利用者設定 worker 数の半分かつ最大 2 worker (`clamp(configured/2, 1, 2)`) に制限する。
+本体 IPC は Home と通常フォルダ一覧を専用 queue + 1 worker に分離した。サムネイルと集約評価は
+別の heavy queue で処理し、利用者設定 worker 数の半分かつ最大 2 worker
+(`clamp(configured/2, 1, 2)`) に制限する。
 remote IPC の読み取り・生成は UI thread を使わず、ローカル表示用 worker とも別である。
 §12.8 の短い App-owned 永続書き込みだけは UI thread で行う。CPU / disk の物理競合は
 残るが、remote 由来の decode を最大 2 本に抑え、1 クライアントが利用者設定上限の全 worker を
@@ -744,6 +748,10 @@ HTTP / hash route にも含めない。
 動画ストリーミングの実ファイルも同じ `RemoteAddress::File` と二重検証を通す。remote-web と
 本体はそれぞれ favorite allowlist、canonical containment、実ファイル種別を検証し、本体 IPC
 境界では remote-web の判定を信頼しない。
+
+通常フォルダ一覧も要求 address を両側で検証する。本体が返した各セルの `address` と
+`thumbnail_address` は remote-web が favorite allowlist と canonical containment を再検証し、
+sidecar だけが root 外を指す応答も除外する。同一 address の場合は同じ検証結果を共有する。
 
 ### 12.2 本体既存経路の再利用
 
@@ -1041,12 +1049,13 @@ viewer の ☰ を開くたびに `GetItemState` で `rating_db` と `book_bookm
 
 protocol v13 は `ContainerKind::Folder` を追加し、通常フォルダも ZIP / PDF と同じ
 `GET /api/container` / `ContainerPayload` / `page_groups` 経路へ載せる。本体
-`ContainerEngine` は favorite 境界内の実ディレクトリを走査し、ローカル一覧と同じ sort、
-カテゴリ配置、動画 sidecar、画像拡張子、実フォルダ対仮想コンテナの重複除外を適用する。
-remote-web の `/api/list` はサブフォルダと ZIP / PDF を含むグリッド情報の取得に残すが、
-一覧描画は `/api/list` の応答だけで確定する。`/api/list` と `/api/container` は同じ
-`AbortController` の所有下で並行開始するものの、`loadFolder` が待つのは前者だけであり、遅い
-本体 IPC / 2 回目の走査を一覧の first paint へ持ち込まない。
+`ContainerEngine` は favorite 境界内の実ディレクトリを走査した後、ローカル
+`App::load_folder` と同じ `materialize_local_folder_listing` を呼ぶ。sort、カテゴリ配置、動画
+sidecar、画像拡張子、実フォルダ対仮想コンテナの重複除外を別実装しない。
+protocol v16 以降の `/api/list` もこの結果を `FolderListPayload` として受け取り、一覧描画は
+その応答だけで確定する。`/api/list` と `/api/container` は同じ `AbortController` の所有下で
+並行開始し、`loadFolder` が待つのは前者だけである。両方とも IPC だが、通常一覧は heavy queue
+ではなく Home と同じ専用 queue を使い、container / thumbnail 待ちから分離する。
 
 folder container の promise は現在フォルダの文脈に保持する。応答済みなら画像タップ時に即座に、
 未完ならその既存 promise だけを待って `entries` / `page_groups` / spread mode / reading direction を
@@ -1074,12 +1083,13 @@ container 応答は fetch 実装が abort を無視して完了しても現在�
 `source_dims` による横長単独、RTL の画面左右順が ZIP / PDF と同じになる。純粋関数テストは
 LtrCover、横長境界、RTL、縦持ち Single を通常画像 item で固定する。
 
-読書位置の再計算 drift は、ローカル production の一覧組み立て全体を
-`materialize_local_folder_listing` に抽出し、独立した
-`ContainerEngine::recompute_folder_listing` の出力と直接比較する regression test で固定する。
-テスト素材は画像のみ、画像 + 動画、同 stem の複数画像拡張子、同名 ZIP + 実フォルダを含み、
-全 item の種別 / path / 順序に加えて各画像の raw item index、page position、page count を比較する。
-期待一覧のベタ書きではないため、ローカルまたはリモートの組み立て順だけを変えると失敗する。
+読書位置と一覧の drift は、`materialize_local_folder_listing` を唯一の production
+materializer とし、`ContainerEngine::recompute_folder_listing` をその薄い scan wrapper にすることで
+構造的に防ぐ。regression test は同じ materialized result と実際の `FolderListPayload` の全 item の
+種別 / path / 順序 / mtime / size / thumbnail source を比較する。素材は画像のみ、画像 + 動画 +
+同名 sidecar、同 stem の複数画像拡張子、同名 ZIP + 実フォルダを含むため、リモート投影が item を
+欠落・追加した場合や sidecar 出所を失った場合も失敗する。各画像の raw item index、page position、
+page count の検証も維持する。
 
 一覧へ戻る前の読書位置 flush は上限を短縮しない。現行は 30 秒 batch の最終値を生成して直列 write
 tail の完了を待つため、遷移後も書き込みを継続する方式へ変えると session ownership の返却や
@@ -1193,6 +1203,42 @@ topbar の親フォルダ / ホームだけに `navigation-icon` を付け、40�
 `/apple-touch-icon-precomposed.png` は既存 `icons/icon-180.png` を返し、manifest と同じく認証より
 前の static shell route に置く。
 
+### 12.15 通常フォルダ一覧の本体統一 (protocol v16, 2026-08-02)
+
+GET /api/list の remote-web ローカル走査を廃止し、FolderListRequest /
+FolderListPayload を本体 IPC へ追加する。正本は
+app::folder_scan::materialize_local_folder_listing である。App::load_folder が直接使い、
+remote container / folder list は ContainerEngine::recompute_folder_listing という scan wrapper
+から同じ関数を使う。remote-web は一覧の分類・sort・sidecar / 重複規則を持たない。
+
+FolderListEntry は address、thumbnail_address、name、RemoteEntryKind、size、
+mtime を運ぶ。動画と同名画像が video_thumb_use_sidecar_image により吸収された場合、動画の
+address は .mp4 のまま、thumbnail_address は吸収した画像になる。Web グリッドはセルの
+open には前者、/api/thumb には後者を使い、sidecar 画像を独立 tile として表示しない。
+
+タイル比率は手動設定なら本体 Settings、自動設定なら本体 auto_aspect_cache.db の該当フォルダを
+core 側で read-only 参照して運ぶ。DB が無い場合は作成せず Square へ戻るため、旧 /api/list の
+フォルダ別比率と既存の見た目を維持しつつ、remote-web から設定 / cache 読み取りを除去する。
+
+HTTP admission は既存の全体 6 枠だけを使い、heavy 4 枠と stream 専用 4 枠を消費しない。本体側も
+Home 専用 queue / worker を共有する。したがって thumbnail / container / page が heavy 上限でも
+通常一覧用に 2 枠が残る。saturated_ipc_does_not_block_an_ipc_free_endpoint は変更せず、
+stream・heavy・通常一覧の lane 分離を別テストで固定する。
+
+debug test harness の warm 30 回計測では、旧 remote-web ローカル走査は 318 件で p50 0.336 ms /
+p95 0.431 ms、522 件で p50 0.500 ms / p95 0.595 ms だった。新経路の core scan +
+production materialize + DTO 投影 + IPC frame encode/decode は 318 件で p50 22.704 ms /
+p95 27.485 ms、522 件で p50 37.741 ms / p95 42.854 ms。remote-web の独立 containment 再検証は
+それぞれ p50 16.256 ms / p95 19.887 ms、p50 27.039 ms / p95 29.188 ms であり、合算の p50 は
+約 39.0 ms / 64.8 ms である。稼働中の固定 pipe を奪わない測定のため named-pipe syscall と HTTP
+送出は含めず、frame codec までを測った値である。一覧は heavy queue 待ちから分離されるため、
+522 件でも操作入口を長時間塞がない。
+
+open command telemetry は全試行を記録し、nested payload.kind、mediaKind、
+open_route、handled を含める。成功 route も folder_container_image / media_image /
+media_video 等で記録するため、media_open_route_rejected /
+video_viewer_entry_rejected が 0 件でも、その手前のどの route が実際に使われたかを判断できる。
+
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 
 この節は設計ではなく**開発手順**の記録。会話ログにしか残らない知識を失わないために書く。
@@ -1263,7 +1309,7 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-動画ストリーミング IPC / HTTP を追加した 2026-08-02 時点の現行版は **v15**。
+通常フォルダ一覧 IPC を追加した 2026-08-02 時点の現行版は **v16**。
 
 ### 13.6 残タスク (2026-08-01 時点)
 

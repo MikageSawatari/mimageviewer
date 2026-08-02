@@ -834,6 +834,25 @@ function navigate(hash, routeState = {}) {
   dispatchRoute();
 }
 
+export function commandTelemetryEvent(requested, meta, source, context, handled = true) {
+  const event = {
+    type: "command",
+    command: requested.name,
+    input_source: source,
+    input_detail: meta.detail ? limitText(meta.detail, 80) : undefined,
+    context,
+  };
+  if (requested.name === CommandName.OPEN) {
+    event.payload = {
+      kind: requested.payload?.kind ?? "missing",
+    };
+    event.mediaKind = requested.payload?.mediaKind ?? null;
+    event.open_route = meta.openRoute ?? "not_reached";
+    event.handled = Boolean(handled);
+  }
+  return event;
+}
+
 function dispatchCommand(requested, meta = {}) {
   if (!requested?.name || !state.authenticated) return false;
   const source = meta.source ?? "mouse";
@@ -851,13 +870,9 @@ function dispatchCommand(requested, meta = {}) {
       reloadApplication();
     }
     if (meta.telemetry !== false) {
-      enqueueTelemetry({
-        type: "command",
-        command: requested.name,
-        input_source: source,
-        input_detail: meta.detail ? limitText(meta.detail, 80) : undefined,
-        context: state.screenContext,
-      });
+      enqueueTelemetry(
+        commandTelemetryEvent(requested, meta, source, state.screenContext)
+      );
     }
     return true;
   }
@@ -998,14 +1013,8 @@ function dispatchCommand(requested, meta = {}) {
     }
   }
 
-  if (handled && meta.telemetry !== false) {
-    enqueueTelemetry({
-      type: "command",
-      command: requested.name,
-      input_source: source,
-      input_detail: meta.detail ? limitText(meta.detail, 80) : undefined,
-      context,
-    });
+  if ((handled || requested.name === CommandName.OPEN) && meta.telemetry !== false) {
+    enqueueTelemetry(commandTelemetryEvent(requested, meta, source, context, handled));
   }
   return handled;
 }
@@ -1018,11 +1027,15 @@ export function resolveMediaOpenRoute(requestedKind, addressedEntry, imageIndex)
 }
 
 function executeOpenCommand(payload, meta) {
+  payload = payload ?? {};
+  meta = meta ?? {};
   if (payload.kind === "favorite" || payload.kind === "folder") {
+    meta.openRoute = payload.kind;
     navigate(folderHash(payload.favoriteId, payload.path ?? ""));
     return true;
   }
   if (payload.kind === "container" && payload.address) {
+    meta.openRoute = "container";
     navigate(containerHash(payload.address));
     return true;
   }
@@ -1039,6 +1052,7 @@ function executeOpenCommand(payload, meta) {
     !state.container &&
     state.folderContainerLoad
   ) {
+    meta.openRoute = "folder_container_image";
     return openFolderImageFromGrid(payload, meta);
   }
   if (payload.kind === "media" && payload.address) {
@@ -1048,6 +1062,7 @@ function executeOpenCommand(payload, meta) {
     );
     const mediaRoute = resolveMediaOpenRoute(requestedMediaKind, addressedEntry, imageIndex);
     if (!mediaRoute) {
+      meta.openRoute = "media_open_route_rejected";
       recordClientError("media_open_route_rejected", "メディアの表示経路を解決できませんでした", {
         expected_kind: requestedMediaKind ?? "missing",
         resolved_kind: addressedEntry?.kind ?? "missing",
@@ -1057,6 +1072,7 @@ function executeOpenCommand(payload, meta) {
       });
       return false;
     }
+    meta.openRoute = `media_${mediaRoute}`;
     if (Number.isInteger(payload.entryIndex)) state.gridIndex = payload.entryIndex;
     tryEnterBrowserFullscreen();
     history.pushState(
@@ -1071,7 +1087,10 @@ function executeOpenCommand(payload, meta) {
       mediaHash(payload.address)
     );
     if (mediaRoute === "video") {
-      if (!renderVideoViewer(addressedEntry)) return false;
+      if (!renderVideoViewer(addressedEntry)) {
+        meta.openRoute = "video_viewer_entry_rejected";
+        return false;
+      }
     } else {
       renderImageViewer(imageIndex, meta.at ?? performance.now());
     }
@@ -1084,9 +1103,11 @@ function executeOpenCommand(payload, meta) {
     payload.imageIndex >= state.images.length
   ) {
     return false;
+    meta.openRoute = "legacy_image_rejected";
   }
   if (state.collection) {
     tryEnterBrowserFullscreen();
+    meta.openRoute = "collection_image";
     navigate(imageHash(payload.favoriteId, payload.path), {
       viewerFromGrid: true,
       viewerDepth: 1,
@@ -1095,6 +1116,7 @@ function executeOpenCommand(payload, meta) {
     return true;
   }
   if (Number.isInteger(payload.entryIndex)) {
+  meta.openRoute = "folder_image";
     state.gridIndex = payload.entryIndex;
   }
   tryEnterBrowserFullscreen();
@@ -2531,6 +2553,14 @@ function entryAddress(entry) {
     subresource: { kind: "file" },
   };
 }
+export function thumbnailAddressForEntry(entry) {
+  return entry.thumbnail_address ?? entryAddress(entry);
+}
+
+function thumbnailBindingKey(entry) {
+  return `${entryIdentity(entry)}\nthumbnail\n${addressIdentity(thumbnailAddressForEntry(entry))}`;
+}
+
 
 function addressIdentity(address) {
   const target = address?.subresource ?? {};
@@ -3099,7 +3129,7 @@ function bindThumbnail(image, entry, tracker, cellWidth) {
   disposeThumbnailBinding(image);
   const generation = (Number(image._thumbnailGeneration) || 0) + 1;
   image._thumbnailGeneration = generation;
-  image._thumbnailPath = entryIdentity(entry);
+  image._thumbnailPath = thumbnailBindingKey(entry);
   image._thumbnailSettled = false;
   image.classList.remove("thumb-ready", "thumb-missing", "thumb-retry-exhausted");
   image.parentElement?.classList.remove("thumb-loaded");
@@ -3183,10 +3213,10 @@ function clearThumbnailServiceNotice() {
 }
 
 async function loadThumbnail(image, entry, tracker, generation, targetPx, signal) {
-  const bindingKey = entryIdentity(entry);
+  const bindingKey = thumbnailBindingKey(entry);
   const url = apiUrl(
     "/api/thumb",
-    addressQueryParams(entryAddress(entry), { w: targetPx })
+    addressQueryParams(thumbnailAddressForEntry(entry), { w: targetPx })
   );
   try {
     const result = await fetchThumbnailWithRetry(url, signal);
@@ -3781,7 +3811,7 @@ class ThumbnailGridTracker {
   begin(items) {
     if (this.destroyed || this.expected) return;
     for (const entry of items) {
-      this.pending.add(entryIdentity(entry));
+      this.pending.add(thumbnailBindingKey(entry));
     }
     this.expected = this.pending.size;
     if (!this.expected) this.finish();
