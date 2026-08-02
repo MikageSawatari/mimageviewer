@@ -28,8 +28,9 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
 なら CPU readback + `ctx.load_texture` で egui::Image 描画」の二経路 + 自動フォール
 バック構成だったが、v0.9 系で **native presenter** (`src/video/native_presenter`、
 独立 Win32 HWND + 自前 D3D11 swap chain + DirectComposition) に統一済み。
-動画再生は **常に native presenter 経路を必須**とする (旧 egui 描画パスと
-`MIV_NATIVE_VIDEO_PRESENTER` フォールバック環境変数は削除済み)。
+ローカル画面へ出す動画再生は **常に native presenter 経路を必須**とする (旧 egui 描画パスと
+`MIV_NATIVE_VIDEO_PRESENTER` フォールバック環境変数は削除済み)。例外は mIV Remote session が
+所有する headless player だけで、画面を作らず専用 consumer が通常出力 queue を drain する。
 
 ```
 [起動時]
@@ -440,6 +441,21 @@ queue が保持する数は 0、同期 download 中の現 source を含めても
 swscale → 選択 encoder 固有の NV12 / YUV420P input → H.264 encode する。増分 4 では session を
 接続しないため、この worker はまだ起動しない。
 
+### mIV Remote headless output consumer
+
+`VideoOutputConsumer` は通常の decoder 出力要求を `Presentation` と
+`RemoteHeadless` に分け、`VideoOutputState` が active consumer を単一の typed owner として保持する。
+ローカル再生と fast-swap は前者のままで、`video_rx` は従来どおり
+native presenter / UI が所有する。remote-owned player だけが後者を選び、専用 worker が
+`video_tx` の全 frame を連続受信して GPU slot を返したうえで破棄する。
+
+tap はこの queue へ積む前の decoder 分岐なので、通常 frame を捨てても配信用 frame は維持される。
+一方、通常 queue への enqueue 自体を省略しないのは、その consumer 境界が seek 世代ごとの
+`FirstFrameReady` と decoder back-pressure の所有者でもあるためである。headless worker は現在世代の
+最初の frame を受けたとき同 event を通知し、event channel が満杯でも frame drain を止めず再試行する。
+player の shutdown / error / Drop は shared cancel を立てて worker を join し、残 frame の GPU slot も
+返す。
+
 ## モジュール構成 (現行責務)
 
 行数は変動が大きく、恒久仕様と同じ表では管理しない。2026-07-26 監査時点の規模 snapshot は
@@ -514,6 +530,7 @@ BLOB 読み出しと WebP→RGBA decode は `video-marker-thumbs` worker で行�
 - 公開 API (`open` / `tick` / `seek` / `set_volume` / `set_loop_enabled` / `shutdown`)
 - decoder スレッド・audio スレッドのライフサイクル管理
 - native presenter のライフタイム管理 (`native_output: Option<NativeVideoOutput>`)
+- remote-owned player に限る headless video output consumer の起動・停止・join
 - `gpu_latest: Option<D3d11Frame>` / `future_frames: VecDeque<VideoFrame>` は native
   presenter 経路を持たない過渡状態用の保持フィールド (通常運用ではほぼ未使用)。
 
@@ -543,6 +560,11 @@ audio の `seek_target_secs` はユーザー要求 target (= timeline / engine a
 `trim_before_secs=Some(target)` で target まで preroll drop する。target 前の keyframe
 や preroll frame は表示せず、最初に presenter へ届く frame を `FirstFrameReady` /
 seek override clear の対象にする。seek 失敗時は両方 `None` で通常 pacing に戻す。
+remote headless では presenter の代わりに output consumer が `FirstFrameReady` を発火する。
+`SeekCompleted` で `Seeking → Buffering`、同 event と audio pump の `BufferReady` が揃って
+`Buffering → Playing` となり、最初の post-seek PCM を cpal callback が実消費した時点で
+seek override が解除される。したがって headless でも video consumer、audio pump、audio device
+callback の 3 者を止めない。
 frame-step seek だけは video 側 `trim_before_secs=None` と `frame_step=Some(...)` で流し、
 video decoder が decoded PTS を見て base の直前/直後の 1 枚だけを送出する。audio 側は
 基準 PTS まで trim し、停止中の余分な音声 decode を抑える。
@@ -1087,6 +1109,9 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 - audio 出力失敗時はクロックを wall-clock fallback に切替
 - 音声バッファ ≥100ms に達したら `EngineEvent::Audio(AudioEvent::BufferReady)` を発火
   (Phase 8.K で 500ms から下げた、典型的 audio_buf hover 帯に合わせた)
+- remote headless player も同じ default device、audio pump、cpal callback を起動する。
+  remote local mute は `output_volume` だけを 0 にし、Playing 中の processed queue 消費と
+  audio PTS 更新は継続する。Remote audio tap は processed push 直前なので mute の上流にある
 - 再生速度が 1.0x 以外の場合は、VST3 plugin chain の前段で
   `audio_stretch.rs` の Signalsmith Stretch wrapper を通し、pitch を維持したまま
   output/wall 秒の音声へ変換する。`ProcessedChunk::source_secs_per_output_sec` で

@@ -46142,6 +46142,7 @@ impl App {
             true,
             Some(false),
             false,
+            crate::video::VideoOutputConsumer::RemoteHeadless,
             #[cfg(windows)]
             None,
         );
@@ -46157,6 +46158,7 @@ impl App {
         from_grid: bool,
         autoplay_override: Option<bool>,
         ignore_resume: bool,
+        output_consumer: crate::video::VideoOutputConsumer,
         #[cfg(windows)] native_output_config: Option<crate::video::NativeVideoOutputConfig>,
     ) -> (crate::video::VideoPlayer, bool) {
         // 通常 open の spawn 制限は呼び出し側 (`start_fs_load` →
@@ -46229,7 +46231,7 @@ impl App {
         let start_normalize_scan_before_play =
             self.settings.audio_normalize_enabled && initial_normalize_lookup.is_none() && autoplay;
         let open_autoplay = autoplay && !start_normalize_scan_before_play;
-        let player = crate::video::VideoPlayer::open(
+        let player = crate::video::VideoPlayer::open_with_output_consumer(
             vp,
             vol,
             initial_normalize_gain,
@@ -46246,6 +46248,7 @@ impl App {
             },
             #[cfg(windows)]
             Some(self.dsp_bridge.clone()),
+            output_consumer,
             #[cfg(windows)]
             native_output_config,
         );
@@ -46774,6 +46777,7 @@ impl App {
                         from_grid,
                         autoplay_override,
                         ignore_resume,
+                        crate::video::VideoOutputConsumer::Presentation,
                         #[cfg(windows)]
                         native_config,
                     );

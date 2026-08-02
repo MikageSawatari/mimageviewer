@@ -150,6 +150,11 @@ OBS 自身が GPLv2 だからであり、**OBS のコードも設定値の写経
                           ブラウザ (<video> or hls.js)
 ```
 
+remote session が所有する headless player では native presenter の代わりに専用の
+headless output consumer が通常の `video_tx` を連続 drain して捨てる。video tap はこの
+queue とは別に decoder 側で複製されるため、配信用フレームは失われない。通常 player は
+従来どおり native presenter が同じ queue を消費し、この worker を作らない。
+
 ### 4.1 音声 tap — VST とノーマライズがそのまま乗る
 
 [src/video/audio.rs](../src/video/audio.rs) の audio pump は
@@ -586,6 +591,14 @@ guard で、動画処理開始後の timeout 8 個には数えない。
   presenter、folder load、`open_fullscreen` は作動させない。本体の既存表示状態は変えず、
   「リモート接続中」modal を配信中も表示し続ける。ローカルの既存 player / 音声モードの
   `Music` 表示も remote video start では切り替えない
+- headless player だけは `RemoteHeadless` output consumer を所有し、decoder の通常
+  `video_tx` を pacing せず連続 drain する。受け取った frame は GPU slot を返して破棄し、
+  seek 世代ごとの最初の frame で `FirstFrameReady` を発火する。通常 player は
+  `Presentation` のままで、native presenter / UI receiver の所有関係を変更しない
+- headless でも `audio::start` は通常どおり default output device、audio pump、cpal callback を
+  起動する。ローカル mute lease は callback の `output_volume` だけを 0 にし、processed queue は
+  Playing 中に消費し続ける。tap は processed queue push の直前なので device callback の mute より
+  上流にあり、最終 PCM の生成と remote 送信を止めない
 - 設定の enum は runtime の nested `EncoderPreference` 等を直接永続化せず、単純な scalar variant
   名を持つ `RemoteVideoEncoder` / `RemoteVideoQuality` として分離した。未知 variant は既存の
   forward-incompatible 判定に入り、`Corrupted` quarantine / backup 自動復旧を行わない。
@@ -676,12 +689,10 @@ guard で、動画処理開始後の timeout 8 個には数えない。
 
 ## 10. 制約・リスクと要検証事項
 
-1. **画面表示に依存しないか (要実機検証)** — 映像を decoder から tap するため、原理上は
-   presenter (PC 画面表示) と独立している。ただし現行の再生エンジンがフレーム消費を
-   present と結び付けている場合、ウィンドウ最小化・モニタスリープで再生が止まる可能性がある。
-   **最初に検証すべき項目**。止まる場合は、ストリーミング中に `ES_DISPLAY_REQUIRED` を
-   追加で立てる (現行 watchdog は `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` のみ) か、
-   ヘッドレス消費経路を用意する
+1. **画面表示への依存** — 映像 tap 自体は presenter と独立しているが、decoder の通常
+   `video_tx` には常時 consumer が必要。remote-owned headless player は専用 consumer が queue を
+   drain し、seek readiness の `FirstFrameReady` も通知するため、native window の表示状態や
+   monitor sleep に queue 進行を依存させない
 2. **PC 側の音** — mIV は音声出力がマスタークロックであり、デバイスを止めると映像も進まない
    恐れがある。`remote_video_mute_local_output` は**デバイスを回したまま音量 0** にする実装とし、
    ストリームは tap 点 (音量適用より前の最終 PCM) から取るため無音化の影響を受けない

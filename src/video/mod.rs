@@ -75,6 +75,14 @@ use std::sync::Mutex;
 use engine::EngineEvent;
 use engine::actor::{EngineActor, OpenOptions};
 
+/// Selects the owner that consumes the decoder's normal video output.
+/// Remote-only players do not own a display, so a dedicated worker drains their queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VideoOutputConsumer {
+    Presentation,
+    RemoteHeadless,
+}
+
 fn engine_state_code_name(code: u8) -> &'static str {
     match code {
         engine::actor::state_code::IDLE => "Idle",
@@ -183,6 +191,8 @@ pub struct VideoPlayer {
     ui_dropped_past_count: AtomicU64,
     cancel: Arc<AtomicBool>,
     decode: DecodeHandles,
+    /// Owns the selected decoder output consumer lifecycle as one typed state.
+    video_output: VideoOutputState,
     /// 保持目的に加え、Remote streaming session が audio tap controller を取得する。
     audio: Option<audio::AudioOutput>,
     info: Option<VideoInfo>,
@@ -1977,6 +1987,178 @@ fn native_drain_unpresented_queue(queue: &mut std::collections::VecDeque<VideoFr
 #[cfg(not(windows))]
 fn native_drain_unpresented_queue(queue: &mut std::collections::VecDeque<VideoFrame>) {
     queue.clear();
+}
+
+struct HeadlessVideoOutput {
+    stop: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HeadlessVideoOutput {
+    fn spawn(
+        video_rx: crossbeam_channel::Receiver<VideoFrame>,
+        player_cancel: Arc<AtomicBool>,
+        clock: Arc<AvClock>,
+        engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
+        displayed_frame_seq: Arc<AtomicU64>,
+        last_displayed_pts_bits: Arc<AtomicU64>,
+    ) -> Result<Self, String> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = std::thread::Builder::new()
+            .spawn(move || {
+                run_headless_video_output(
+                    video_rx,
+                    worker_stop,
+                    player_cancel,
+                    clock,
+                    engine_event_tx,
+                    displayed_frame_seq,
+                    last_displayed_pts_bits,
+                );
+            })
+            .map_err(|err| err.to_string())?;
+        Ok(Self {
+            stop,
+            worker: Some(worker),
+        })
+    }
+}
+
+impl Drop for HeadlessVideoOutput {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+enum VideoOutputState {
+    Presentation,
+    RemoteHeadless(HeadlessVideoOutput),
+    Inactive,
+}
+
+#[derive(Default)]
+struct HeadlessReadyState {
+    ready_epoch: Option<u64>,
+    pending: Option<(u64, f64)>,
+}
+
+impl HeadlessReadyState {
+    fn retry(&mut self, clock: &AvClock, engine_event_tx: &crossbeam_channel::Sender<EngineEvent>) {
+        let Some((epoch, pts)) = self.pending else {
+            return;
+        };
+        if clock.current_seek_serial() != epoch {
+            self.pending = None;
+        } else if try_send_headless_first_frame_ready(engine_event_tx, epoch, pts) {
+            self.ready_epoch = Some(epoch);
+            self.pending = None;
+        }
+    }
+
+    fn observe(&mut self, epoch: u64, pts: f64) {
+        if self.ready_epoch != Some(epoch)
+            && self.pending.map(|(pending_epoch, _)| pending_epoch) != Some(epoch)
+        {
+            self.pending = Some((epoch, pts));
+        }
+    }
+}
+
+fn run_headless_video_output(
+    video_rx: crossbeam_channel::Receiver<VideoFrame>,
+    stop: Arc<AtomicBool>,
+    player_cancel: Arc<AtomicBool>,
+    clock: Arc<AvClock>,
+    engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
+    displayed_frame_seq: Arc<AtomicU64>,
+    last_displayed_pts_bits: Arc<AtomicU64>,
+) {
+    let mut ready = HeadlessReadyState::default();
+    while !stop.load(Ordering::Acquire) && !player_cancel.load(Ordering::Acquire) {
+        ready.retry(&clock, &engine_event_tx);
+        match video_rx.recv_timeout(std::time::Duration::from_millis(5)) {
+            Ok(frame) => {
+                let epoch = frame.seek_serial;
+                let pts = frame.pts_secs;
+                if epoch == clock.current_seek_serial() {
+                    ready.observe(epoch, pts);
+                    last_displayed_pts_bits.store(pts.to_bits(), Ordering::Release);
+                    displayed_frame_seq.fetch_add(1, Ordering::AcqRel);
+                }
+                native_reset_unpresented_frame(frame);
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    while let Ok(frame) = video_rx.try_recv() {
+        native_reset_unpresented_frame(frame);
+    }
+}
+
+struct VideoOutputRoute {
+    player_rx: crossbeam_channel::Receiver<VideoFrame>,
+    state: VideoOutputState,
+    init_error: Option<String>,
+}
+
+fn route_video_output(
+    consumer: VideoOutputConsumer,
+    video_rx: crossbeam_channel::Receiver<VideoFrame>,
+    player_cancel: Arc<AtomicBool>,
+    clock: Arc<AvClock>,
+    engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
+    displayed_frame_seq: Arc<AtomicU64>,
+    last_displayed_pts_bits: Arc<AtomicU64>,
+) -> VideoOutputRoute {
+    match consumer {
+        VideoOutputConsumer::Presentation => {
+            return VideoOutputRoute {
+                player_rx: video_rx,
+                state: VideoOutputState::Presentation,
+                init_error: None,
+            };
+        }
+        VideoOutputConsumer::RemoteHeadless => {}
+    }
+
+    let player_rx = dummy_video_rx();
+    match HeadlessVideoOutput::spawn(
+        video_rx,
+        player_cancel,
+        clock,
+        engine_event_tx,
+        displayed_frame_seq,
+        last_displayed_pts_bits,
+    ) {
+        Ok(headless) => VideoOutputRoute {
+            player_rx,
+            state: VideoOutputState::RemoteHeadless(headless),
+            init_error: None,
+        },
+        Err(error) => VideoOutputRoute {
+            player_rx,
+            state: VideoOutputState::Inactive,
+            init_error: Some(error),
+        },
+    }
+}
+
+fn try_send_headless_first_frame_ready(
+    engine_event_tx: &crossbeam_channel::Sender<EngineEvent>,
+    epoch: u64,
+    pts: f64,
+) -> bool {
+    let event = EngineEvent::Decoder(engine::state::DecoderEvent::FirstFrameReady { epoch, pts });
+    match engine_event_tx.try_send(event) {
+        Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => true,
+        Err(crossbeam_channel::TrySendError::Full(_)) => false,
+    }
 }
 
 /// Hidden native presenters do not pace frames against the display clock. Drain both the
@@ -4962,6 +5144,7 @@ impl VideoPlayer {
             ui_dropped_past_count: AtomicU64::new(0),
             cancel: Arc::new(AtomicBool::new(true)),
             decode: dummy_decode_handles(),
+            video_output: VideoOutputState::Inactive,
             audio: None,
             info: None,
             error: None,
@@ -5091,6 +5274,46 @@ impl VideoPlayer {
         #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
         #[cfg(windows)] native_output_config: Option<NativeVideoOutputConfig>,
     ) -> Self {
+        Self::open_with_output_consumer(
+            path,
+            initial_volume,
+            initial_normalize_gain,
+            initial_audio_preroll_suspended,
+            autoplay,
+            resume_secs,
+            hw_decode,
+            deinterlace,
+            #[cfg(windows)]
+            gpu_video_device,
+            #[cfg(windows)]
+            dsp_bridge,
+            VideoOutputConsumer::Presentation,
+            #[cfg(windows)]
+            native_output_config,
+        )
+    }
+
+    pub(crate) fn open_with_output_consumer(
+        path: PathBuf,
+        initial_volume: f64,
+        initial_normalize_gain: f64,
+        initial_audio_preroll_suspended: bool,
+        autoplay: bool,
+        resume_secs: Option<f64>,
+        hw_decode: bool,
+        deinterlace: crate::settings::VideoDeinterlaceMode,
+        #[cfg(windows)] gpu_video_device: Option<
+            std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
+        >,
+        #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
+        output_consumer: VideoOutputConsumer,
+        #[cfg(windows)] native_output_config: Option<NativeVideoOutputConfig>,
+    ) -> Self {
+        #[cfg(windows)]
+        let native_output_config = match output_consumer {
+            VideoOutputConsumer::Presentation => native_output_config,
+            VideoOutputConsumer::RemoteHeadless => None,
+        };
         // FFmpeg DLL ロード (1 回目のみ実時間の I/O。以降は OnceLock で即返り)
         if let Err(e) = ffmpeg_loader::init() {
             // open 失敗時の dummy engine (Idle のまま)。実 decoder は起きないので、
@@ -5132,6 +5355,7 @@ impl VideoPlayer {
                 ui_dropped_past_count: AtomicU64::new(0),
                 cancel: Arc::new(AtomicBool::new(true)),
                 decode: dummy_decode_handles(),
+                video_output: VideoOutputState::Inactive,
                 audio: None,
                 info: None,
                 error: Some(format!("FFmpeg DLL のロードに失敗しました: {e}")),
@@ -5295,7 +5519,21 @@ impl VideoPlayer {
         let frame_step_active = Arc::new(AtomicBool::new(false));
         #[cfg(windows)]
         let duration_secs_bits = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
-        // 動画は native presenter (独立 HWND + D3D11 swap chain) を必須とする。
+        let VideoOutputRoute {
+            player_rx: video_rx,
+            state: video_output,
+            init_error: headless_init_error,
+        } = route_video_output(
+            output_consumer,
+            video_rx,
+            Arc::clone(&cancel),
+            Arc::clone(&clock),
+            engine_event_tx.clone(),
+            Arc::clone(&displayed_frame_seq),
+            Arc::clone(&last_displayed_pts_bits),
+        );
+        // Presentation 出力は native presenter (独立 HWND + D3D11 swap chain) を必須とする。
+        // RemoteHeadless は上の専用 consumer が video_rx を所有し、native output は作らない。
         // - `native_output_config = None`: 呼び出し元が後から `attach_native_output`
         //   で output を渡す fast-swap 経路のシグナル (= ここではエラー扱いしない)。
         //   実際にモニター情報取得失敗で None になった場合は、呼び出し元
@@ -5368,9 +5606,10 @@ impl VideoPlayer {
                 prep_progress,
                 video_tap,
             },
+            video_output,
             audio,
             info: None,
-            error: native_init_error,
+            error: headless_init_error.or(native_init_error),
             thumb_worker,
             marker_thumbnail_warmup_requests: Mutex::new(std::collections::HashMap::new()),
             future_frames: std::collections::VecDeque::new(),
@@ -7583,9 +7822,17 @@ impl VideoPlayer {
     ///
     /// 内部的には `shutdown()` と同じ処理 (cancel フラグ + audio drop) に加えて
     /// thumbnail worker も解放する。完全 idempotent なので open() から複数回呼んでも安全。
+    fn stop_video_output(&mut self) {
+        let previous = std::mem::replace(&mut self.video_output, VideoOutputState::Inactive);
+        if let VideoOutputState::RemoteHeadless(headless) = previous {
+            drop(headless);
+        }
+    }
+
     fn shutdown_workers_for_error(&mut self) {
         self.cancel
             .store(true, std::sync::atomic::Ordering::Release);
+        self.stop_video_output();
         self.pause_audio_output();
         self.clear_audio_output_buffer();
         self.audio.take();
@@ -7610,6 +7857,7 @@ impl VideoPlayer {
     pub fn shutdown(&mut self) {
         self.cancel
             .store(true, std::sync::atomic::Ordering::Release);
+        self.stop_video_output();
         #[cfg(windows)]
         {
             if let Some(mut frame) = self.gpu_latest.take() {
@@ -7630,6 +7878,7 @@ impl Drop for VideoPlayer {
         // shutdown() が事前に呼ばれていなければここで stop。
         self.cancel
             .store(true, std::sync::atomic::Ordering::Release);
+        self.stop_video_output();
         #[cfg(windows)]
         {
             if let Some(mut frame) = self.gpu_latest.take() {
@@ -7662,8 +7911,234 @@ fn dummy_audio_rx() -> crossbeam_channel::Receiver<decoder::AudioFrame> {
     rx
 }
 
+fn dummy_video_rx() -> crossbeam_channel::Receiver<VideoFrame> {
+    let (_, rx) = crossbeam_channel::bounded(0);
+    rx
+}
+
 #[cfg(test)]
 mod tests {
+    fn test_video_frame(epoch: u64, pts: f64) -> super::VideoFrame {
+        super::VideoFrame {
+            width: 1,
+            height: 1,
+            data: super::VideoFrameData::Cpu(vec![0; 4]),
+            sar_num: 1,
+            sar_den: 1,
+            pts_secs: pts,
+            seek_serial: epoch,
+        }
+    }
+
+    fn test_video_output_route(
+        consumer: super::VideoOutputConsumer,
+        capacity: usize,
+    ) -> (
+        crossbeam_channel::Sender<super::VideoFrame>,
+        super::VideoOutputRoute,
+        crossbeam_channel::Receiver<super::EngineEvent>,
+        std::sync::Arc<super::AvClock>,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        let (video_tx, video_rx) = crossbeam_channel::bounded(capacity);
+        let (event_tx, event_rx) = crossbeam_channel::bounded(64);
+        let seek_serial = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clock = std::sync::Arc::new(super::AvClock::new(1.0, seek_serial));
+        let displayed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let route = super::route_video_output(
+            consumer,
+            video_rx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::clone(&clock),
+            event_tx,
+            std::sync::Arc::clone(&displayed),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(f64::NAN.to_bits())),
+        );
+        (video_tx, route, event_rx, clock, displayed)
+    }
+
+    fn verify_headless_queue_drain(
+        video_tx: crossbeam_channel::Sender<super::VideoFrame>,
+        event_rx: crossbeam_channel::Receiver<super::EngineEvent>,
+        displayed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        send_headless_test_frames(&video_tx);
+        assert_headless_first_frame_ready(&event_rx);
+        wait_for_displayed_frames(&displayed, 64);
+    }
+
+    fn send_headless_test_frames(video_tx: &crossbeam_channel::Sender<super::VideoFrame>) {
+        for frame in 0..64 {
+            video_tx
+                .send_timeout(
+                    test_video_frame(0, frame as f64 / 60.0),
+                    std::time::Duration::from_secs(1),
+                )
+                .unwrap();
+        }
+    }
+
+    fn assert_headless_first_frame_ready(
+        event_rx: &crossbeam_channel::Receiver<super::EngineEvent>,
+    ) {
+        assert!(matches!(
+            event_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(super::EngineEvent::Decoder(
+                super::engine::state::DecoderEvent::FirstFrameReady { epoch: 0, .. }
+            ))
+        ));
+    }
+
+    fn wait_for_displayed_frames(displayed: &std::sync::atomic::AtomicU64, expected: u64) {
+        use std::sync::atomic::Ordering;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while displayed.load(Ordering::Acquire) < expected && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(displayed.load(Ordering::Acquire), expected);
+    }
+
+    fn test_playing_engine(
+        clock: std::sync::Arc<super::AvClock>,
+        seek_serial: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> super::EngineActor {
+        let mut engine = super::EngineActor::new(
+            super::OpenOptions {
+                autoplay: true,
+                ..Default::default()
+            },
+            seek_serial,
+            clock,
+        );
+        engine.begin_loading();
+        engine.handle_decoder_event(super::engine::state::DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 120.0,
+            has_audio: true,
+            has_video: true,
+        });
+        engine.handle_decoder_event(super::engine::state::DecoderEvent::FirstFrameReady {
+            epoch: 0,
+            pts: 0.0,
+        });
+        engine.handle_audio_event(super::engine::state::AudioEvent::BufferReady {
+            epoch: 0,
+            pts: 0.0,
+            wall_now: std::time::Instant::now(),
+        });
+        engine
+    }
+
+    fn headless_route_for_clock(
+        clock: std::sync::Arc<super::AvClock>,
+    ) -> (
+        crossbeam_channel::Sender<super::VideoFrame>,
+        super::VideoOutputRoute,
+        crossbeam_channel::Receiver<super::EngineEvent>,
+    ) {
+        let (video_tx, video_rx) = crossbeam_channel::bounded(1);
+        let (event_tx, event_rx) = crossbeam_channel::bounded(8);
+        let route = super::route_video_output(
+            super::VideoOutputConsumer::RemoteHeadless,
+            video_rx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            clock,
+            event_tx,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(f64::NAN.to_bits())),
+        );
+        (video_tx, route, event_rx)
+    }
+
+    #[test]
+    fn presentation_output_keeps_the_decoder_receiver_for_existing_consumers() {
+        let (video_tx, route, _, _, _) =
+            test_video_output_route(super::VideoOutputConsumer::Presentation, 1);
+        assert!(matches!(
+            &route.state,
+            super::VideoOutputState::Presentation
+        ));
+        assert!(route.init_error.is_none());
+
+        video_tx.try_send(test_video_frame(0, 1.0)).unwrap();
+        assert!(matches!(
+            video_tx.try_send(test_video_frame(0, 2.0)),
+            Err(crossbeam_channel::TrySendError::Full(_))
+        ));
+        assert_eq!(route.player_rx.recv().unwrap().pts_secs, 1.0);
+    }
+
+    #[test]
+    fn remote_headless_output_continuously_releases_decoder_queue_capacity() {
+        let (video_tx, route, event_rx, _, displayed) =
+            test_video_output_route(super::VideoOutputConsumer::RemoteHeadless, 1);
+        assert!(matches!(
+            &route.state,
+            super::VideoOutputState::RemoteHeadless(_)
+        ));
+        assert!(route.init_error.is_none());
+        verify_headless_queue_drain(video_tx, event_rx, displayed);
+    }
+
+    #[test]
+    fn dropping_remote_headless_output_releases_its_decoder_receiver() {
+        let (video_tx, route, _, _, _) =
+            test_video_output_route(super::VideoOutputConsumer::RemoteHeadless, 1);
+        drop(route);
+        assert!(matches!(
+            video_tx.try_send(test_video_frame(0, 0.0)),
+            Err(crossbeam_channel::TrySendError::Disconnected(_))
+        ));
+    }
+
+    #[test]
+    fn remote_headless_first_frame_allows_seek_to_leave_seeking() {
+        let seek_serial = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clock = std::sync::Arc::new(super::AvClock::new(1.0, seek_serial.clone()));
+        let mut engine = test_playing_engine(clock.clone(), seek_serial);
+        assert_eq!(
+            engine.published_state_code(),
+            super::engine::actor::state_code::PLAYING
+        );
+
+        engine.apply_command(super::engine::actor::TransportCommand::SeekAbsolute {
+            target_secs: 30.0,
+        });
+        let epoch = clock.current_seek_serial();
+        assert_eq!(
+            engine.published_state_code(),
+            super::engine::actor::state_code::SEEKING
+        );
+        engine.handle_decoder_event(super::engine::state::DecoderEvent::SeekCompleted {
+            epoch,
+            actual_pts: 30.0,
+        });
+
+        let (video_tx, _route, event_rx) = headless_route_for_clock(clock.clone());
+        video_tx.send(test_video_frame(epoch, 30.0)).unwrap();
+        let event = event_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let super::EngineEvent::Decoder(event) = event else {
+            panic!();
+        };
+        engine.handle_decoder_event(event);
+        engine.handle_audio_event(super::engine::state::AudioEvent::BufferReady {
+            epoch,
+            pts: 30.0,
+            wall_now: std::time::Instant::now(),
+        });
+
+        assert_eq!(
+            engine.published_state_code(),
+            super::engine::actor::state_code::PLAYING
+        );
+        assert!(clock.is_seeking());
+        clock.clear_seek_target_override(epoch);
+        assert!(!clock.is_seeking());
+    }
+
     #[test]
     fn native_presenter_visibility_honors_hidden_startup_state() {
         let hidden =

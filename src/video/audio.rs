@@ -2326,6 +2326,24 @@ mod tests {
     }
 
     #[test]
+    fn remote_local_mute_keeps_playing_callback_as_processed_consumer() {
+        let buf = make_buffer(48_000);
+        let clock = make_clock();
+        let _mute = clock.acquire_remote_local_output_mute();
+        let samples_per_sec = buf.lock().unwrap().samples_per_sec;
+        buf.lock()
+            .unwrap()
+            .processed
+            .push_back(make_chunk(vec![0.5; 480], 0.0, samples_per_sec));
+
+        let mut out = [1.0_f32; 480];
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
+
+        assert!(buf.lock().unwrap().processed.is_empty());
+        assert!(out.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
     fn dropping_audio_tap_lease_detaches_and_restores_allocation_free_playback_path() {
         let (command_tx, command_rx) = unbounded();
         let controller = AudioTapController {

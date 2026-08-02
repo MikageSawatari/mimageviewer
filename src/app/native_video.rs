@@ -1525,6 +1525,7 @@ impl App {
             false,
             autoplay_override,
             ignore_resume,
+            crate::video::VideoOutputConsumer::Presentation,
             None,
         );
         // 音声モードを維持する source swap は、decoder event を engine が取り込む前に
@@ -8362,6 +8363,7 @@ impl App {
             false,
             autoplay_override,
             ignore_resume,
+            crate::video::VideoOutputConsumer::Presentation,
             None,
         );
         new_player.attach_native_output(native_output);
