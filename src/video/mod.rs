@@ -2101,6 +2101,15 @@ struct HeadlessReadyState {
 }
 
 impl HeadlessReadyState {
+    fn follow_epoch(&mut self, live_epoch: u64) {
+        if self
+            .pending
+            .is_some_and(|(pending_epoch, _)| pending_epoch != live_epoch)
+        {
+            self.pending = None;
+        }
+    }
+
     fn retry(&mut self, clock: &AvClock, engine_event_tx: &crossbeam_channel::Sender<EngineEvent>) {
         let Some((epoch, pts)) = self.pending else {
             return;
@@ -2144,19 +2153,36 @@ fn run_headless_video_output(
     displayed_frame_seq: Arc<AtomicU64>,
     last_displayed_pts_bits: Arc<AtomicU64>,
 ) {
+    let mut live_epoch = clock.current_seek_serial();
     crate::logger::log(format!(
         "[remote-headless-video] consumer started: live_epoch={}",
-        clock.current_seek_serial()
+        live_epoch
     ));
     let mut ready = HeadlessReadyState::default();
     let mut drained_frames = 0_u64;
     while !stop.load(Ordering::Acquire) && !player_cancel.load(Ordering::Acquire) {
+        let current_epoch = clock.current_seek_serial();
+        if current_epoch != live_epoch {
+            crate::logger::log(format!(
+                "[remote-headless-video] consumer epoch changed: previous_epoch={live_epoch} live_epoch={current_epoch}"
+            ));
+            live_epoch = current_epoch;
+            ready.follow_epoch(live_epoch);
+        }
         ready.retry(&clock, &engine_event_tx);
         match video_rx.recv_timeout(std::time::Duration::from_millis(5)) {
             Ok(frame) => {
                 let epoch = frame.seek_serial;
                 let pts = frame.pts_secs;
-                if epoch == clock.current_seek_serial() {
+                let current_epoch = clock.current_seek_serial();
+                if current_epoch != live_epoch {
+                    crate::logger::log(format!(
+                        "[remote-headless-video] consumer epoch changed: previous_epoch={live_epoch} live_epoch={current_epoch}"
+                    ));
+                    live_epoch = current_epoch;
+                    ready.follow_epoch(live_epoch);
+                }
+                if epoch == live_epoch {
                     if ready.observe(epoch, pts) {
                         crate::logger::log(format!(
                             "[remote-headless-video] consumer active: epoch={epoch} first_pts={pts:.3} remaining_video_rx_len={}",
@@ -8356,6 +8382,33 @@ mod tests {
         ));
         assert!(route.init_error.is_none());
         verify_headless_queue_drain(video_tx, event_rx, displayed);
+    }
+
+    #[test]
+    fn remote_headless_output_follows_seek_epoch_started_after_consumer() {
+        let (video_tx, route, event_rx, clock, displayed) =
+            test_video_output_route(super::VideoOutputConsumer::RemoteHeadless, 1);
+        assert!(matches!(
+            &route.state,
+            super::VideoOutputState::RemoteHeadless(_)
+        ));
+
+        clock.request_seek(20.0);
+        let live_epoch = clock.current_seek_serial();
+        assert_eq!(live_epoch, 1);
+        video_tx.send(test_video_frame(0, 19.0)).unwrap();
+        video_tx.send(test_video_frame(live_epoch, 20.0)).unwrap();
+
+        assert!(matches!(
+            event_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(super::EngineEvent::Decoder(
+                super::engine::state::DecoderEvent::FirstFrameReady {
+                    epoch: 1,
+                    pts: 20.0,
+                }
+            ))
+        ));
+        wait_for_displayed_frames(&displayed, 1);
     }
 
     #[test]

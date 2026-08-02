@@ -132,6 +132,45 @@ struct GenerationResources {
     _local_mute: Option<crate::video::clock::RemoteLocalOutputMuteLease>,
 }
 
+struct GenerationWorkerCompletion {
+    status: StreamGenerationStatus,
+    log_line: Option<String>,
+}
+
+fn generation_worker_completion(
+    result: Result<(), String>,
+    cancelled: bool,
+) -> GenerationWorkerCompletion {
+    if cancelled {
+        return GenerationWorkerCompletion {
+            status: StreamGenerationStatus::Stopped,
+            log_line: None,
+        };
+    }
+    let error = match result {
+        Ok(()) => "streaming worker exited without cancellation".to_owned(),
+        Err(error) => error,
+    };
+    GenerationWorkerCompletion {
+        log_line: Some(format!("remote-stream generation worker failed: {error}")),
+        status: StreamGenerationStatus::Failed(error),
+    }
+}
+
+fn publish_generation_worker_completion<T>(
+    result: Result<(), String>,
+    cancel: &AtomicBool,
+    status: &SharedGenerationStatus,
+    resources: T,
+) {
+    let completion = generation_worker_completion(result, cancel.load(Ordering::Acquire));
+    if let Some(line) = completion.log_line {
+        crate::logger::log(line);
+    }
+    set_generation_status(status, completion.status);
+    drop(resources);
+}
+
 #[derive(Clone)]
 pub(crate) struct StreamingGenerationAccess {
     generation: StreamingGeneration,
@@ -210,27 +249,23 @@ impl StreamingGenerationHandle {
             .spawn(move || {
                 let result = run_generation_worker(
                     config,
-                    resources,
+                    &resources,
                     video_rx,
                     audio_rx,
                     command_rx,
                     Arc::clone(&worker_status),
                     Arc::clone(&worker_cancel),
                 );
-                let final_status = if worker_cancel.load(Ordering::Acquire) {
-                    StreamGenerationStatus::Stopped
-                } else {
-                    match result {
-                        Ok(()) => StreamGenerationStatus::Stopped,
-                        Err(error) => {
-                            crate::logger::log(format!(
-                                "remote-stream generation stopped with error: {error}"
-                            ));
-                            StreamGenerationStatus::Failed(error)
-                        }
-                    }
-                };
-                set_generation_status(&worker_status, final_status);
+                // Keep the registration and tap leases alive until after the Result has been
+                // classified. RemoteStreamingRegistration::drop sets this same cancel flag, so
+                // moving resources into run_generation_worker used to turn every real Err into
+                // the observation-only Stopped status and discard its reason.
+                publish_generation_worker_completion(
+                    result,
+                    &worker_cancel,
+                    &worker_status,
+                    resources,
+                );
             })
             .map_err(|error| format!("failed to spawn streaming worker: {error}"))?;
         Ok(Self {
@@ -670,14 +705,13 @@ fn fragment_limit_error(owner: &str) -> String {
 
 fn run_generation_worker(
     config: GenerationConfig,
-    resources: GenerationResources,
+    _resources: &GenerationResources,
     video_rx: Receiver<super::video_tap::TappedVideoFrame>,
     audio_rx: Receiver<crate::video::audio::ProcessedChunk>,
     command_rx: Receiver<WorkerCommand>,
     status: SharedGenerationStatus,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let _resources = resources;
     let timeline =
         StreamTimeline::new(config.source_start_secs).map_err(|error| error.to_string())?;
     // Both encoder opens are deliberately below the worker boundary. App::poll_remote_session
@@ -722,26 +756,56 @@ fn run_generation_worker(
         if cancel.load(Ordering::Acquire) {
             return Ok(());
         }
-        crossbeam_channel::select! {
-            recv(command_rx) -> command => match command {
-                Ok(command) => reply_with_resource(command, &segmenter),
-                Err(_) => return Ok(()),
-            },
-            recv(video_rx) -> tapped => {
-                let tapped = tapped.map_err(|_| "video tap disconnected".to_owned())?;
-                for packet in video.encode_frame(tapped, &segmenter).map_err(|error| error.to_string())? {
+        match receive_generation_worker_event(
+            &command_rx,
+            &video_rx,
+            &audio_rx,
+            Duration::from_millis(20),
+        )? {
+            GenerationWorkerEvent::Command(command) => reply_with_resource(command, &segmenter),
+            GenerationWorkerEvent::Video(tapped) => {
+                for packet in video
+                    .encode_frame(tapped, &segmenter)
+                    .map_err(|error| error.to_string())?
+                {
                     mux.enqueue_video(packet, config.frame_rate)?;
                 }
-            },
-            recv(audio_rx) -> chunk => {
-                let chunk = chunk.map_err(|_| "audio tap disconnected".to_owned())?;
+            }
+            GenerationWorkerEvent::Audio(chunk) => {
                 for packet in audio.push_chunk(chunk).map_err(|error| error.to_string())? {
                     mux.enqueue_audio(packet, audio.output_sample_rate())?;
                 }
-            },
-            default(Duration::from_millis(20)) => {}
+            }
+            GenerationWorkerEvent::Idle => {}
         }
         mux.drain(&mut segmenter)?;
+    }
+}
+
+enum GenerationWorkerEvent {
+    Command(WorkerCommand),
+    Video(super::video_tap::TappedVideoFrame),
+    Audio(crate::video::audio::ProcessedChunk),
+    Idle,
+}
+
+fn receive_generation_worker_event(
+    command_rx: &Receiver<WorkerCommand>,
+    video_rx: &Receiver<super::video_tap::TappedVideoFrame>,
+    audio_rx: &Receiver<crate::video::audio::ProcessedChunk>,
+    wait: Duration,
+) -> Result<GenerationWorkerEvent, String> {
+    crossbeam_channel::select! {
+        recv(command_rx) -> command => command
+            .map(GenerationWorkerEvent::Command)
+            .map_err(|_| "stream resource command channel disconnected".to_owned()),
+        recv(video_rx) -> tapped => tapped
+            .map(GenerationWorkerEvent::Video)
+            .map_err(|_| "video tap disconnected".to_owned()),
+        recv(audio_rx) -> chunk => chunk
+            .map(GenerationWorkerEvent::Audio)
+            .map_err(|_| "audio tap disconnected".to_owned()),
+        default(wait) => Ok(GenerationWorkerEvent::Idle),
     }
 }
 
@@ -770,6 +834,71 @@ fn reply_with_resource(command: WorkerCommand, segmenter: &Fmp4Segmenter) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SetCancelOnDrop(Arc<AtomicBool>);
+
+    impl Drop for SetCancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn worker_error_reason_survives_as_failed_status_and_log_line() {
+        let reason = "video tap disconnected";
+        let completion = generation_worker_completion(Err(reason.to_owned()), false);
+
+        assert_eq!(
+            completion.status,
+            StreamGenerationStatus::Failed(reason.to_owned())
+        );
+        assert_eq!(
+            completion.log_line.as_deref(),
+            Some("remote-stream generation worker failed: video tap disconnected")
+        );
+    }
+
+    #[test]
+    fn worker_error_is_published_before_resource_drop_sets_cancel() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let status = Arc::new((Mutex::new(StreamGenerationStatus::Opening), Condvar::new()));
+
+        publish_generation_worker_completion(
+            Err("video tap disconnected".to_owned()),
+            &cancel,
+            &status,
+            SetCancelOnDrop(Arc::clone(&cancel)),
+        );
+
+        assert!(cancel.load(Ordering::Acquire));
+        assert_eq!(
+            generation_status(&status),
+            StreamGenerationStatus::Failed("video tap disconnected".to_owned())
+        );
+    }
+
+    #[test]
+    fn generation_worker_remains_idle_while_waiting_for_first_video_frame() {
+        let (command_tx, command_rx) = bounded::<WorkerCommand>(1);
+        let (video_tx, video_rx) = bounded::<crate::video::stream::video_tap::TappedVideoFrame>(1);
+        let (audio_tx, audio_rx) = bounded::<crate::video::audio::ProcessedChunk>(1);
+
+        for _ in 0..3 {
+            assert!(matches!(
+                receive_generation_worker_event(
+                    &command_rx,
+                    &video_rx,
+                    &audio_rx,
+                    Duration::from_millis(1),
+                ),
+                Ok(GenerationWorkerEvent::Idle)
+            ));
+        }
+
+        // Keep every producer alive across all idle waits. No video frame yet is an idle state,
+        // not a disconnected or completed worker.
+        drop((command_tx, video_tx, audio_tx));
+    }
 
     #[test]
     fn unfinished_fragment_limit_stops_instead_of_restarting_a_generation() {

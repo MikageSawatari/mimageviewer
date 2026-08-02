@@ -622,6 +622,14 @@ guard で、動画処理開始後の timeout 8 個には数えない。
   世代ごとの最初の `audio_tx` 消費、engine 側の readiness event 受領を通常ログに残す。
   start 失敗時は 1 行に engine state、epoch、video/audio の required/ready、未処理 engine
   event 数、audio raw/processed/`audio_tx` 秒数をまとめ、構造化 perf にも同じ条件を記録する
+- headless consumer の開始ログに出る epoch は開始時 snapshot であり、consumer は
+  `clock.current_seek_serial()` の変化へ追随する。世代変更自体もログに残し、旧世代 frame は
+  drain だけして readiness には使わず、現世代最初の frame だけを `FirstFrameReady` にする
+- generation worker は video/audio frame がまだ無い間を idle として 20ms 単位で待ち続ける。
+  明示 cancel だけを `Stopped` とし、tap / resource channel 切断や encoder / muxer error は
+  `Failed(reason)` に保存する。registration / tap lease は `Result` を分類して status とログへ
+  reason を発行するまで drop しない。この reason は IPC の `VideoStreamError.message` から
+  remote-web 計測の `internal_message` まで保持し、利用者向け本文には露出しない
 
 ---
 

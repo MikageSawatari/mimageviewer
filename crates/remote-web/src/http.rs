@@ -3166,6 +3166,27 @@ mod tests {
             );
         }
 
+        let worker_reason = "video tap disconnected";
+        let worker_failure = video_ipc_error_response(crate::ipc_client::ClientFailure {
+            error: IpcClientError::VideoStreamRemote(mimageviewer_ipc::VideoStreamError::new(
+                VideoStreamErrorCode::Failed,
+                worker_reason,
+            )),
+            retry_count: 0,
+            retry_statuses: Vec::new(),
+        });
+        assert_eq!(worker_failure.status, 422);
+        let body: Value = serde_json::from_slice(&worker_failure.body).unwrap();
+        assert_eq!(body["error"], "stream_failed");
+        assert!(
+            !body["message"].as_str().unwrap().contains(worker_reason),
+            "the worker reason belongs in diagnostics, not the user-facing response"
+        );
+        assert_eq!(
+            worker_failure.log_details.as_ref().unwrap()["video_stream"]["internal_message"],
+            worker_reason
+        );
+
         let unavailable = video_ipc_error_response(crate::ipc_client::ClientFailure {
             error: IpcClientError::Unavailable(crate::ipc_client::ProtocolFailure::new(
                 "connect",
