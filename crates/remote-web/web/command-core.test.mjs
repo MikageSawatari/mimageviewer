@@ -188,8 +188,20 @@ test("stream HTTP statuses distinguish session and generation conflicts", () => 
     videoHttpStatusDecision(409, 1, "stream_session_mismatch").kind,
     "session_mismatch"
   );
+  assert.equal(
+    videoHttpStatusDecision(409, 1, "stream_session_mismatch").message,
+    "動画の配信が終了しました。もう一度開いてください。"
+  );
+  assert.equal(
+    videoHttpStatusDecision(409).message,
+    "動画の配信が終了しました。もう一度開いてください。"
+  );
   assert.equal(videoHttpStatusDecision(409).kind, "session_mismatch");
   assert.equal(videoHttpStatusDecision(404).kind, "not_found");
+  assert.equal(
+    videoHttpStatusDecision(500).message,
+    "動画を読み込めませんでした。もう一度お試しください。"
+  );
 });
 
 test("quality presets keep their traffic estimates attached to the command value", () => {

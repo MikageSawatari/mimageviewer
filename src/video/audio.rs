@@ -1000,7 +1000,6 @@ fn run_pump(
     audio_tap_command_rx: Receiver<AudioTapCommand>,
     #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
 ) {
-    let _ = engine_state; // 現状は logging 等で使う想定、API 互換のため受け取る
     #[cfg(windows)]
     boost_audio_pump_priority();
 
@@ -1200,6 +1199,39 @@ fn run_pump(
             // ── stale check (= clock より古い世代は破棄) ──
             if frame_seek_serial < cur_clock_serial {
                 break 'intake;
+            }
+
+            if should_reset_plugins {
+                let state = engine_state.load(Ordering::Acquire);
+                crate::logger::log(format!(
+                    "[audio-pump] audio_tx consumer active: serial={frame_seek_serial} pts={:.3} remaining_audio_tx_len={} engine_state={}",
+                    frame.pts_secs,
+                    rx.len(),
+                    super::engine_state_code_name(state)
+                ));
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "audio_pump",
+                        "audio_tx_consumer_active",
+                        None,
+                        0,
+                        &[
+                            (
+                                "seek_serial",
+                                serde_json::Value::from(frame_seek_serial as i64),
+                            ),
+                            ("pts", serde_json::Value::from(frame.pts_secs)),
+                            (
+                                "remaining_audio_tx_len",
+                                serde_json::Value::from(rx.len() as i64),
+                            ),
+                            (
+                                "engine_state",
+                                serde_json::Value::from(super::engine_state_code_name(state)),
+                            ),
+                        ],
+                    );
+                }
             }
 
             // ── raw_pending に積む + seek serial 切替を 1 lock で処理 ──
@@ -2341,6 +2373,118 @@ mod tests {
 
         assert!(buf.lock().unwrap().processed.is_empty());
         assert!(out.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn headless_seek_readiness_keeps_audio_tx_draining_without_a_device() {
+        const SAMPLE_RATE: u32 = 48_000;
+        const FRAME_SECS: f64 = 0.02;
+        const FRAME_COUNT: usize = 400;
+
+        let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+        let buffer = make_buffer(SAMPLE_RATE);
+        let diagnostics = make_diag();
+        let engine_state = Arc::new(AtomicU8::new(state_code::BUFFERING));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (audio_tx, audio_rx) = bounded(32);
+        let queue_observer = audio_tx.clone();
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (event_tx, event_rx) = bounded(64);
+        let (_tap_tx, tap_rx) = unbounded();
+
+        let pump = {
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&cancel);
+            let clock = Arc::clone(&clock);
+            let engine_state = Arc::clone(&engine_state);
+            let diagnostics = Arc::clone(&diagnostics);
+            std::thread::spawn(move || {
+                run_pump(
+                    audio_rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    event_tx,
+                    engine_state,
+                    diagnostics,
+                    tap_rx,
+                    #[cfg(windows)]
+                    None,
+                );
+            })
+        };
+
+        let (producer_done_tx, producer_done_rx) = bounded(1);
+        std::thread::spawn(move || {
+            for index in 0..FRAME_COUNT {
+                let pts_secs = index as f64 * FRAME_SECS;
+                let frame = AudioFrame {
+                    samples: vec![0.0; (SAMPLE_RATE as f64 * 2.0 * FRAME_SECS) as usize],
+                    pts_secs,
+                    seek_serial: 0,
+                    duration_secs: FRAME_SECS,
+                    queued_wall_secs: FRAME_SECS,
+                    audio_tx_accounting_epoch: 0,
+                    seek_target_secs: Some(0.0),
+                };
+                if audio_tx
+                    .send_timeout(frame, std::time::Duration::from_secs(3))
+                    .is_err()
+                {
+                    producer_done_tx.send(false).unwrap();
+                    return;
+                }
+            }
+            producer_done_tx.send(true).unwrap();
+        });
+
+        let ready = event_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("audio pump must publish BufferReady without a cpal device");
+        assert!(matches!(
+            ready,
+            crate::video::engine::EngineEvent::Audio(
+                crate::video::engine::state::AudioEvent::BufferReady { .. }
+            )
+        ));
+        engine_state.store(state_code::PLAYING, Ordering::Release);
+        clock.set_playing(true);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let produced_all = loop {
+            let mut out = vec![0.0; 1_920];
+            fill_output(&mut out, &buffer, &clock, &engine_state, &diagnostics);
+            match producer_done_rx.try_recv() {
+                Ok(result) => break result,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break false,
+                Err(crossbeam_channel::TryRecvError::Empty)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::yield_now();
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break false,
+            }
+        };
+
+        assert!(
+            produced_all,
+            "audio_tx must not remain full after headless readiness reaches Playing"
+        );
+        while queue_observer.len() > 0 && std::time::Instant::now() < deadline {
+            let mut out = vec![0.0; 1_920];
+            fill_output(&mut out, &buffer, &clock, &engine_state, &diagnostics);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            queue_observer.len(),
+            0,
+            "audio pump must take every queued decoder frame"
+        );
+
+        cancel.store(true, Ordering::Release);
+        let _ = shutdown_tx.try_send(());
+        pump.join().unwrap();
     }
 
     #[test]

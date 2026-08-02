@@ -71,6 +71,18 @@ impl Default for OpenOptions {
     }
 }
 
+/// Read-only snapshot used by timeout diagnostics. This deliberately mirrors the
+/// actor's existing typed state instead of introducing another readiness owner.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EngineReadinessSnapshot {
+    pub(crate) state: &'static str,
+    pub(crate) epoch: SeekEpoch,
+    pub(crate) video_required: bool,
+    pub(crate) video_ready: bool,
+    pub(crate) audio_required: bool,
+    pub(crate) audio_ready: bool,
+}
+
 /// `EngineActor` の内部 context。Phase 1c では struct skeleton のみ。
 ///
 /// 実際の thread / channel 配線は Phase 3 で行う。
@@ -219,6 +231,20 @@ impl EngineActor {
     /// 共有 `Arc<AtomicU64>` を `Acquire` で読む。
     pub fn current_seek_epoch(&self) -> SeekEpoch {
         self.seek_serial.load(Ordering::Acquire)
+    }
+
+    /// Capture the exact readiness condition currently owned by the actor.
+    pub(crate) fn readiness_snapshot(&self) -> EngineReadinessSnapshot {
+        let requirements =
+            ReadinessRequirements::for_media(self.has_audio, self.has_video, self.visual_mode);
+        EngineReadinessSnapshot {
+            state: self.state.name(),
+            epoch: self.current_seek_epoch(),
+            video_required: requirements.first_frame,
+            video_ready: self.latch.first_frame && self.latch.first_frame_pts.is_some(),
+            audio_required: requirements.audio_buffer,
+            audio_ready: self.latch.buffer_ready && self.latch.audio_anchor.is_some(),
+        }
     }
 
     /// 「ユーザー (もしくは autoplay) が再生したいと思っているか」の意図を返す。

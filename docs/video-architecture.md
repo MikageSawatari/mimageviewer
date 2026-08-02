@@ -469,6 +469,13 @@ tap はこの queue へ積む前の decoder 分岐なので、通常 frame を�
 player の shutdown / error / Drop は shared cancel を立てて worker を join し、残 frame の GPU slot も
 返す。
 
+remote streaming UI は `Opening` / `Starting` / `Streaming` の全状態でこの player を
+`tick` する。`VideoPlayer::tick` 冒頭の event drain が `SeekCompleted`、
+`FirstFrameReady`、`BufferReady` を `EngineActor` へ渡す所有境界であり、
+`Starting` だけを止めると decoder/pump worker が動いていても state は `Seeking` から進まない。
+headless worker は開始、世代最初の frame、`FirstFrameReady` 送信をログに残し、engine 側も
+各 readiness event の受領後に video/audio の required/ready を記録する。
+
 ## モジュール構成 (現行責務)
 
 行数は変動が大きく、恒久仕様と同じ表では管理しない。2026-07-26 監査時点の規模 snapshot は
@@ -1125,6 +1132,13 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 - remote headless player も同じ default device、audio pump、cpal callback を起動する。
   remote local mute は `output_volume` だけを 0 にし、Playing 中の processed queue 消費と
   audio PTS 更新は継続する。Remote audio tap は processed push 直前なので mute の上流にある
+- `audio_tx` の直接 consumer は audio pump である。非 Playing 中は cpal callback が
+  processed を drain しないため、pump は raw 先読みの非破壊上限 (5 秒) まで取り込んだ後に
+  intake を止め、bounded queue 経由で decoder/demux へ back-pressure を返す。
+  `SeekCompleted` が engine に取り込まれて `Buffering` へ進むと pump が `BufferReady` を送り、
+  video/audio readiness が揃った `Playing` で callback drain と pump intake が継続する。
+  pump は seek 世代で最初に受け取った current `AudioFrame` を、serial/PTS/残 queue/state とともに
+  通常ログへ残す
 - 再生速度が 1.0x 以外の場合は、VST3 plugin chain の前段で
   `audio_stretch.rs` の Signalsmith Stretch wrapper を通し、pitch を維持したまま
   output/wall 秒の音声へ変換する。`ProcessedChunk::source_secs_per_output_sec` で

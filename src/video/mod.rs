@@ -2059,6 +2059,7 @@ impl HeadlessVideoOutput {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker = std::thread::Builder::new()
+            .name("remote-headless-video-output".to_owned())
             .spawn(move || {
                 run_headless_video_output(
                     video_rx,
@@ -2106,17 +2107,30 @@ impl HeadlessReadyState {
         };
         if clock.current_seek_serial() != epoch {
             self.pending = None;
-        } else if try_send_headless_first_frame_ready(engine_event_tx, epoch, pts) {
-            self.ready_epoch = Some(epoch);
-            self.pending = None;
+        } else {
+            match try_send_headless_first_frame_ready(engine_event_tx, epoch, pts) {
+                HeadlessReadySend::Sent => {
+                    log_headless_first_frame_ready(epoch, pts);
+                    self.ready_epoch = Some(epoch);
+                    self.pending = None;
+                }
+                HeadlessReadySend::Full => {}
+                HeadlessReadySend::Disconnected => {
+                    self.ready_epoch = Some(epoch);
+                    self.pending = None;
+                }
+            }
         }
     }
 
-    fn observe(&mut self, epoch: u64, pts: f64) {
+    fn observe(&mut self, epoch: u64, pts: f64) -> bool {
         if self.ready_epoch != Some(epoch)
             && self.pending.map(|(pending_epoch, _)| pending_epoch) != Some(epoch)
         {
             self.pending = Some((epoch, pts));
+            true
+        } else {
+            false
         }
     }
 }
@@ -2130,7 +2144,12 @@ fn run_headless_video_output(
     displayed_frame_seq: Arc<AtomicU64>,
     last_displayed_pts_bits: Arc<AtomicU64>,
 ) {
+    crate::logger::log(format!(
+        "[remote-headless-video] consumer started: live_epoch={}",
+        clock.current_seek_serial()
+    ));
     let mut ready = HeadlessReadyState::default();
+    let mut drained_frames = 0_u64;
     while !stop.load(Ordering::Acquire) && !player_cancel.load(Ordering::Acquire) {
         ready.retry(&clock, &engine_event_tx);
         match video_rx.recv_timeout(std::time::Duration::from_millis(5)) {
@@ -2138,10 +2157,16 @@ fn run_headless_video_output(
                 let epoch = frame.seek_serial;
                 let pts = frame.pts_secs;
                 if epoch == clock.current_seek_serial() {
-                    ready.observe(epoch, pts);
+                    if ready.observe(epoch, pts) {
+                        crate::logger::log(format!(
+                            "[remote-headless-video] consumer active: epoch={epoch} first_pts={pts:.3} remaining_video_rx_len={}",
+                            video_rx.len()
+                        ));
+                    }
                     last_displayed_pts_bits.store(pts.to_bits(), Ordering::Release);
                     displayed_frame_seq.fetch_add(1, Ordering::AcqRel);
                 }
+                drained_frames = drained_frames.saturating_add(1);
                 native_reset_unpresented_frame(frame);
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -2150,8 +2175,12 @@ fn run_headless_video_output(
     }
 
     while let Ok(frame) = video_rx.try_recv() {
+        drained_frames = drained_frames.saturating_add(1);
         native_reset_unpresented_frame(frame);
     }
+    crate::logger::log(format!(
+        "[remote-headless-video] consumer stopped: drained_frames={drained_frames}"
+    ));
 }
 
 struct VideoOutputRoute {
@@ -2202,15 +2231,28 @@ fn route_video_output(
     }
 }
 
+enum HeadlessReadySend {
+    Sent,
+    Full,
+    Disconnected,
+}
+
+fn log_headless_first_frame_ready(epoch: u64, pts: f64) {
+    crate::logger::log(format!(
+        "[remote-headless-video] FirstFrameReady emitted: epoch={epoch} pts={pts:.3}"
+    ));
+}
+
 fn try_send_headless_first_frame_ready(
     engine_event_tx: &crossbeam_channel::Sender<EngineEvent>,
     epoch: u64,
     pts: f64,
-) -> bool {
+) -> HeadlessReadySend {
     let event = EngineEvent::Decoder(engine::state::DecoderEvent::FirstFrameReady { epoch, pts });
     match engine_event_tx.try_send(event) {
-        Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => true,
-        Err(crossbeam_channel::TrySendError::Full(_)) => false,
+        Ok(()) => HeadlessReadySend::Sent,
+        Err(crossbeam_channel::TrySendError::Full(_)) => HeadlessReadySend::Full,
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => HeadlessReadySend::Disconnected,
     }
 }
 
@@ -5217,7 +5259,7 @@ impl VideoPlayer {
             clock.clone(),
         )));
         let engine_state_atomic = engine.lock().unwrap().published_state_handle();
-        let (engine_event_tx, engine_event_rx) = crossbeam_channel::bounded(1);
+        let (engine_event_tx, engine_event_rx) = crossbeam_channel::bounded(8);
         Self {
             path,
             clock,
@@ -5757,9 +5799,38 @@ impl VideoPlayer {
     fn drain_engine_events(&mut self) {
         let mut engine = self.engine.lock().unwrap();
         while let Ok(ev) = self.engine_event_rx.try_recv() {
+            let readiness_event = match &ev {
+                EngineEvent::Decoder(engine::state::DecoderEvent::SeekCompleted {
+                    epoch,
+                    actual_pts,
+                }) => Some(("SeekCompleted", *epoch, *actual_pts)),
+                EngineEvent::Decoder(engine::state::DecoderEvent::FirstFrameReady {
+                    epoch,
+                    pts,
+                }) => Some(("FirstFrameReady", *epoch, *pts)),
+                EngineEvent::Audio(engine::state::AudioEvent::BufferReady {
+                    epoch, pts, ..
+                }) => Some(("BufferReady", *epoch, *pts)),
+                _ => None,
+            };
+            let before = readiness_event.map(|_| engine.readiness_snapshot());
             match ev {
                 EngineEvent::Decoder(d) => engine.handle_decoder_event(d),
                 EngineEvent::Audio(a) => engine.handle_audio_event(a),
+            }
+            if let (Some((event, epoch, pts)), Some(before)) = (readiness_event, before) {
+                let after = engine.readiness_snapshot();
+                if event != "BufferReady" || !before.audio_ready || before.state != after.state {
+                    crate::logger::log(format!(
+                        "[video-engine] readiness event received: event={event} event_epoch={epoch} pts={pts:.3} state={}->{} video_required={} video_ready={} audio_required={} audio_ready={}",
+                        before.state,
+                        after.state,
+                        after.video_required,
+                        after.video_ready,
+                        after.audio_required,
+                        after.audio_ready
+                    ));
+                }
             }
         }
     }
@@ -6203,10 +6274,102 @@ impl VideoPlayer {
         self.pending_resume_secs.is_none() && !self.clock.is_seeking()
     }
 
+    pub(crate) fn log_remote_start_failure(&self, code: &str, detail: &str) {
+        let readiness = self.engine.lock().unwrap().readiness_snapshot();
+        let queued_events = self.engine_event_rx.len();
+        let raw_pending_secs = self.clock.audio_raw_pending_secs();
+        let processed_secs = self.clock.audio_processed_secs();
+        let audio_tx_queued_secs = self.clock.audio_tx_queued_secs();
+        let video_waiting = readiness.video_required && !readiness.video_ready;
+        let audio_waiting = readiness.audio_required && !readiness.audio_ready;
+        let clock_seeking = self.clock.is_seeking();
+        crate::logger::log(format!(
+            "[remote-video] start failed: code={code} detail={detail:?} state={} epoch={} video_waiting={video_waiting} audio_waiting={audio_waiting} video_required={} video_ready={} audio_required={} audio_ready={} queued_engine_events={} clock_seeking={clock_seeking} audio_raw_pending_secs={raw_pending_secs:.3} audio_processed_secs={processed_secs:.3} audio_tx_queued_secs={audio_tx_queued_secs:.3}",
+            readiness.state,
+            readiness.epoch,
+            readiness.video_required,
+            readiness.video_ready,
+            readiness.audio_required,
+            readiness.audio_ready,
+            queued_events
+        ));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "remote_video",
+                "start_failed",
+                None,
+                0,
+                &[
+                    ("code", serde_json::Value::from(code)),
+                    ("engine_state", serde_json::Value::from(readiness.state)),
+                    ("epoch", serde_json::Value::from(readiness.epoch as i64)),
+                    (
+                        "video_required",
+                        serde_json::Value::from(readiness.video_required),
+                    ),
+                    (
+                        "video_ready",
+                        serde_json::Value::from(readiness.video_ready),
+                    ),
+                    ("video_waiting", serde_json::Value::from(video_waiting)),
+                    (
+                        "audio_required",
+                        serde_json::Value::from(readiness.audio_required),
+                    ),
+                    (
+                        "audio_ready",
+                        serde_json::Value::from(readiness.audio_ready),
+                    ),
+                    ("audio_waiting", serde_json::Value::from(audio_waiting)),
+                    ("clock_seeking", serde_json::Value::from(clock_seeking)),
+                    (
+                        "queued_engine_events",
+                        serde_json::Value::from(queued_events as i64),
+                    ),
+                    (
+                        "audio_raw_pending_secs",
+                        serde_json::Value::from(raw_pending_secs),
+                    ),
+                    (
+                        "audio_processed_secs",
+                        serde_json::Value::from(processed_secs),
+                    ),
+                    (
+                        "audio_tx_queued_secs",
+                        serde_json::Value::from(audio_tx_queued_secs),
+                    ),
+                ],
+            );
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn complete_remote_seek_for_test(&self) {
-        self.clock
-            .clear_seek_target_override(self.clock.current_seek_serial());
+        let epoch = self.clock.current_seek_serial();
+        self.engine_event_tx
+            .send(EngineEvent::Decoder(
+                engine::state::DecoderEvent::SeekCompleted {
+                    epoch,
+                    actual_pts: self.clock.now_secs(),
+                },
+            ))
+            .unwrap();
+        self.engine_event_tx
+            .send(EngineEvent::Decoder(
+                engine::state::DecoderEvent::FirstFrameReady {
+                    epoch,
+                    pts: self.clock.now_secs(),
+                },
+            ))
+            .unwrap();
+        self.engine_event_tx
+            .send(EngineEvent::Audio(engine::state::AudioEvent::BufferReady {
+                epoch,
+                pts: self.clock.now_secs(),
+                wall_now: std::time::Instant::now(),
+            }))
+            .unwrap();
+        self.clock.clear_seek_target_override(epoch);
     }
 
     #[cfg(test)]
@@ -6217,7 +6380,17 @@ impl VideoPlayer {
     #[cfg(test)]
     pub(crate) fn apply_pending_remote_resume_for_test(&mut self) {
         if let Some(target_secs) = self.pending_resume_secs.take() {
+            let epoch = self.clock.current_seek_serial();
+            self.engine.lock().unwrap().handle_decoder_event(
+                engine::state::DecoderEvent::InfoReceived {
+                    epoch,
+                    duration_secs: 30.0,
+                    has_audio: true,
+                    has_video: true,
+                },
+            );
             self.clock.request_seek(target_secs);
+            self.engine.lock().unwrap().handle_seek_request(target_secs);
             self.complete_remote_seek_for_test();
         }
     }

@@ -1357,6 +1357,17 @@ fn remote_video_stream_keeps_remote_dialog_without_entering_fullscreen() {
     // reproduce that ordering before the start response is allowed to leave the UI boundary.
     app.poll_remote_session(&egui::Context::default());
     assert!(app.apply_pending_remote_video_resume_for_test());
+    assert_eq!(
+        app.remote_video_player_engine_state_for_test(),
+        Some("Seeking"),
+        "queued seek readiness must still require the Starting owner to tick its player"
+    );
+    app.poll_remote_session(&egui::Context::default());
+    assert_eq!(
+        app.remote_video_player_engine_state_for_test(),
+        Some("Playing"),
+        "Starting must drain SeekCompleted, FirstFrameReady, and BufferReady"
+    );
     assert!(
         app.remote_video_player_intent_playing_for_test()
             .is_some_and(|playing| playing),

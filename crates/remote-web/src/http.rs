@@ -812,13 +812,24 @@ fn read_video_json<T: serde::de::DeserializeOwned>(
     })
 }
 
-fn video_request_error_response(status: u16, code: &str, message: &str) -> HttpResponse {
+fn video_request_error_response(status: u16, code: &str, internal_message: &str) -> HttpResponse {
+    let user_message = if status == 413 {
+        "送信した内容が大きすぎます。内容を減らしてもう一度お試しください。"
+    } else {
+        "動画の指定内容を確認して、もう一度お試しください。"
+    };
     HttpResponse::bytes(
         status,
         "application/json; charset=utf-8",
-        serde_json::to_vec(&json!({"error": code, "message": message})).unwrap_or_default(),
+        serde_json::to_vec(&json!({"error": code, "message": user_message})).unwrap_or_default(),
     )
     .with_header("Cache-Control", "no-store")
+    .with_log_details(json!({
+        "video_stream": {
+            "error_code": code,
+            "internal_message": internal_message,
+        }
+    }))
 }
 
 fn parse_stream_path(path: &str) -> Result<(u64, u64, StreamRouteResource), ()> {
@@ -905,49 +916,91 @@ fn video_admission_busy_response(busy: AdmissionBusy) -> HttpResponse {
     }))
 }
 
-fn video_not_ready_response(message: &str) -> HttpResponse {
+fn video_not_ready_response(internal_message: &str) -> HttpResponse {
     HttpResponse::bytes(
         503,
         "application/json; charset=utf-8",
-        serde_json::to_vec(&json!({"error": "stream_not_ready", "message": message}))
-            .unwrap_or_default(),
+        serde_json::to_vec(&json!({
+            "error": "stream_not_ready",
+            "message": "動画を準備しています。しばらくお待ちください。",
+        }))
+        .unwrap_or_default(),
     )
     .with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string())
     .with_header("Cache-Control", "no-store")
     .with_log_details(json!({
         "video_stream": {
             "error_code": "stream_not_ready",
+            "internal_message": internal_message,
         }
     }))
 }
 
+fn video_stream_user_message(code: VideoStreamErrorCode) -> &'static str {
+    match code {
+        VideoStreamErrorCode::StartQueueTimeout
+        | VideoStreamErrorCode::StartUiTimeout
+        | VideoStreamErrorCode::StartPlayerTimeout
+        | VideoStreamErrorCode::StartSeekTimeout
+        | VideoStreamErrorCode::StartEncoderTimeout
+        | VideoStreamErrorCode::StartPlaylistTimeout => {
+            "動画を開始できませんでした。もう一度お試しください。"
+        }
+        VideoStreamErrorCode::SessionMismatch | VideoStreamErrorCode::GenerationMismatch => {
+            "動画の配信が終了しました。もう一度開いてください。"
+        }
+        VideoStreamErrorCode::NotReady
+        | VideoStreamErrorCode::Busy
+        | VideoStreamErrorCode::ResourceTimeout => {
+            "動画を準備しています。しばらくしてからもう一度お試しください。"
+        }
+        VideoStreamErrorCode::BadRequest => "動画の指定内容を確認して、もう一度お試しください。",
+        VideoStreamErrorCode::FavoriteNotFound
+        | VideoStreamErrorCode::PathRejected
+        | VideoStreamErrorCode::NotFound => "動画が見つかりませんでした。",
+        VideoStreamErrorCode::Unsupported => "この動画は再生できません。",
+        VideoStreamErrorCode::UiTimeout => {
+            "動画の操作を完了できませんでした。もう一度お試しください。"
+        }
+        VideoStreamErrorCode::Failed | VideoStreamErrorCode::Internal => {
+            "動画を処理できませんでした。もう一度お試しください。"
+        }
+    }
+}
+
 fn video_ipc_error_response(failure: crate::ipc_client::ClientFailure) -> HttpResponse {
-    let (status, code, message, retryable) = match failure.error {
+    let (status, code, message, retryable, internal_message) = match failure.error {
         IpcClientError::Unavailable(_) => (
             503,
             "miv_not_running",
             "mIV 本体が起動していません。".to_owned(),
             true,
+            None,
         ),
         IpcClientError::VersionMismatch { client, server } => (
             503,
             "protocol_version_mismatch",
             format!("IPC 版が一致しません (remote-web={client}, mIV={server})。"),
             false,
+            None,
         ),
         IpcClientError::Protocol(detail) if detail.kind == "timeout" => (
             503,
             "ipc_timeout",
             "mIV 本体の応答が時間内に完了しませんでした。".to_owned(),
             true,
+            None,
         ),
         IpcClientError::Protocol(_) => (
             502,
             "ipc_protocol_error",
             "mIV 本体との通信に失敗しました。".to_owned(),
             false,
+            None,
         ),
         IpcClientError::VideoStreamRemote(error) => {
+            let user_message = video_stream_user_message(error.code).to_owned();
+            let internal_message = error.message;
             let (status, code, retryable) = match error.code {
                 VideoStreamErrorCode::BadRequest => (400, "stream_bad_request", false),
                 VideoStreamErrorCode::FavoriteNotFound => (404, "stream_favorite_not_found", false),
@@ -979,13 +1032,20 @@ fn video_ipc_error_response(failure: crate::ipc_client::ClientFailure) -> HttpRe
                 VideoStreamErrorCode::ResourceTimeout => (503, "stream_resource_timeout", true),
                 VideoStreamErrorCode::Internal => (500, "stream_internal", false),
             };
-            (status, code, error.message, retryable)
+            (
+                status,
+                code,
+                user_message,
+                retryable,
+                Some(internal_message),
+            )
         }
         IpcClientError::SessionRemote(response) => (
             session_http_status(response.status),
             "session_required",
             response.message,
             false,
+            None,
         ),
         IpcClientError::Remote(_)
         | IpcClientError::CollectionRemote(_)
@@ -995,6 +1055,7 @@ fn video_ipc_error_response(failure: crate::ipc_client::ClientFailure) -> HttpRe
             "ipc_response_type_mismatch",
             "mIV 本体から予期しない応答を受信しました。".to_owned(),
             false,
+            None,
         ),
     };
     let mut response = HttpResponse::bytes(
@@ -1005,6 +1066,13 @@ fn video_ipc_error_response(failure: crate::ipc_client::ClientFailure) -> HttpRe
     .with_header("Cache-Control", "no-store");
     if retryable {
         response = response.with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string());
+    }
+    if let Some(internal_message) = internal_message {
+        response = response.with_log_details(json!({
+            "video_stream": {
+                "internal_message": internal_message,
+            }
+        }));
     }
     response.with_body_error_code_log()
 }
@@ -3079,8 +3147,22 @@ mod tests {
             let body: Value = serde_json::from_slice(&timeout.body).unwrap();
             assert_eq!(body["error"], expected_error);
             assert_eq!(
+                body["message"],
+                "動画を開始できませんでした。もう一度お試しください。"
+            );
+            assert!(
+                !body["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("start stage deadline")
+            );
+            assert_eq!(
                 timeout.log_details.as_ref().unwrap()["video_stream"]["error_code"],
                 expected_error
+            );
+            assert_eq!(
+                timeout.log_details.as_ref().unwrap()["video_stream"]["internal_message"],
+                "start stage deadline"
             );
         }
 
@@ -3113,6 +3195,52 @@ mod tests {
                 .iter()
                 .any(|(name, value)| { *name == "Retry-After" && value == "1" })
         );
+    }
+
+    #[test]
+    fn video_stream_user_messages_never_expose_internal_start_terms() {
+        let codes = [
+            VideoStreamErrorCode::BadRequest,
+            VideoStreamErrorCode::FavoriteNotFound,
+            VideoStreamErrorCode::PathRejected,
+            VideoStreamErrorCode::NotFound,
+            VideoStreamErrorCode::Unsupported,
+            VideoStreamErrorCode::SessionMismatch,
+            VideoStreamErrorCode::GenerationMismatch,
+            VideoStreamErrorCode::NotReady,
+            VideoStreamErrorCode::Busy,
+            VideoStreamErrorCode::UiTimeout,
+            VideoStreamErrorCode::Failed,
+            VideoStreamErrorCode::StartQueueTimeout,
+            VideoStreamErrorCode::StartUiTimeout,
+            VideoStreamErrorCode::StartPlayerTimeout,
+            VideoStreamErrorCode::StartSeekTimeout,
+            VideoStreamErrorCode::StartEncoderTimeout,
+            VideoStreamErrorCode::StartPlaylistTimeout,
+            VideoStreamErrorCode::ResourceTimeout,
+            VideoStreamErrorCode::Internal,
+        ];
+        let forbidden = [
+            "player",
+            "seek",
+            "encoder",
+            "playlist",
+            "deadline",
+            "budget",
+            "内部状態",
+            "秒以内",
+            "状態が一致",
+        ];
+
+        for code in codes {
+            let message = video_stream_user_message(code);
+            for term in forbidden {
+                assert!(
+                    !message.contains(term),
+                    "{code:?} user message exposed internal term {term:?}: {message}"
+                );
+            }
+        }
     }
 
     #[test]

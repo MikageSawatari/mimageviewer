@@ -334,6 +334,9 @@ impl crate::app::App {
         code: VideoStreamErrorCode,
         message: String,
     ) {
+        crate::logger::log(format!(
+            "[remote-video] open failed: code={code:?} detail={message:?}"
+        ));
         if let Some(player) = opening.player.as_ref() {
             player.set_playing(false);
         }
@@ -350,6 +353,10 @@ impl crate::app::App {
         code: VideoStreamErrorCode,
         message: String,
     ) {
+        starting
+            .streaming
+            .player
+            .log_remote_start_failure(&format!("{code:?}"), &message);
         starting.streaming.player.set_playing(false);
         if let Some(handle) = self.remote_session_ui.handle.as_ref() {
             handle.clear_video_stream(Some(starting.streaming.session.id().0));
@@ -387,7 +394,7 @@ impl crate::app::App {
                 return;
             }
             AppRemoteVideoStreamState::Starting(starting) => {
-                self.poll_remote_video_starting(starting);
+                self.poll_remote_video_starting(starting, ctx);
                 return;
             }
             AppRemoteVideoStreamState::Streaming(streaming) => streaming,
@@ -429,7 +436,11 @@ impl crate::app::App {
         }
     }
 
-    fn poll_remote_video_starting(&mut self, starting: AppRemoteVideoStarting) {
+    fn poll_remote_video_starting(
+        &mut self,
+        mut starting: AppRemoteVideoStarting,
+        ctx: &egui::Context,
+    ) {
         if starting.claimed.ownership_response().status != SessionStatus::Active {
             self.fail_remote_video_starting(
                 starting,
@@ -438,6 +449,11 @@ impl crate::app::App {
             );
             return;
         }
+        // Starting owns the same headless player as Opening/Streaming. Its tick is the sole
+        // consumer of decoder/audio engine events, including SeekCompleted, FirstFrameReady,
+        // and BufferReady. Omitting it leaves the actor in Seeking and eventually back-pressures
+        // the otherwise-running audio pump.
+        starting.streaming.player.tick(ctx);
         self.poll_owned_remote_video_starting(starting);
     }
 
@@ -670,6 +686,21 @@ impl crate::app::App {
                 AppRemoteVideoStreamState::Streaming(streaming) => Some(streaming.player.as_ref()),
             })
             .map(crate::video::VideoPlayer::intent_playing)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remote_video_player_engine_state_for_test(&self) -> Option<&'static str> {
+        self.remote_session_ui
+            .video_stream
+            .as_ref()
+            .and_then(|state| match state {
+                AppRemoteVideoStreamState::Opening(opening) => opening.player.as_deref(),
+                AppRemoteVideoStreamState::Starting(starting) => {
+                    Some(starting.streaming.player.as_ref())
+                }
+                AppRemoteVideoStreamState::Streaming(streaming) => Some(streaming.player.as_ref()),
+            })
+            .map(crate::video::VideoPlayer::engine_state_name)
     }
 
     #[cfg(test)]

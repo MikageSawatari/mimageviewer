@@ -123,6 +123,31 @@ function abortableDelay(delayMs, signal) {
   });
 }
 
+export function videoUserErrorMessage(error, fallback = "動画を操作できませんでした") {
+  const code = String(error?.code ?? "");
+  if (code.startsWith("stream_start_")) {
+    return "動画を開始できませんでした。もう一度お試しください。";
+  }
+  if (code === "stream_session_mismatch" || code === "stream_generation_mismatch") {
+    return "動画の配信が終了しました。もう一度開いてください。";
+  }
+  if (code === "stream_not_ready" ||
+      code === "stream_busy" ||
+      code === "stream_resource_timeout") {
+    return "動画を準備しています。しばらくしてからもう一度お試しください。";
+  }
+  if (code === "stream_not_found" ||
+      code === "stream_favorite_not_found" ||
+      code === "stream_path_rejected") {
+    return "動画が見つかりませんでした。";
+  }
+  if (code === "stream_unsupported") {
+    return "この動画は再生できません。";
+  }
+  const summary = String(fallback || "動画を操作できませんでした").replace(/。+$/, "");
+  return summary + "。もう一度お試しください。";
+}
+
 export async function resolveVideoPlaylist({
   initialUrl,
   session,
@@ -173,7 +198,7 @@ export async function resolveVideoPlaylist({
       kind: "playlist_recovery_exhausted",
       retry: false,
       retryDelayMs: 0,
-      message: "プレイリストを取得できませんでした。",
+      message: "動画の再生を続けられませんでした。",
     },
   };
 }
@@ -560,7 +585,7 @@ export class VideoStreamViewer {
   async start(positionSecs = 0, restorePlaying = true) {
     this.playRequested = restorePlaying;
     this.clearPoll();
-    this.showNotice("動画エンコーダーを準備しています。", "waiting");
+    this.showNotice("動画を準備しています。", "waiting");
     let started;
     try {
       started = await this.requestWithWaiting(() => this.apiPostJson(
@@ -630,10 +655,7 @@ export class VideoStreamViewer {
           error?.code
         );
         if (decision.kind !== "waiting") throw error;
-        this.showNotice(
-          `${decision.message} ${error?.message ?? ""}`.trim(),
-          "waiting"
-        );
+        this.showNotice(decision.message, "waiting");
         await abortableDelay(decision.retryDelayMs, this.abortController.signal);
       }
     }
@@ -698,11 +720,11 @@ export class VideoStreamViewer {
     try {
       Hls = await loadHlsJs();
     } catch (error) {
-      this.showOperationalError(error, "HLS 再生機能を読み込めませんでした");
+      this.showOperationalError(error, "動画の再生機能を読み込めませんでした");
       return false;
     }
     if (!Hls.isSupported()) {
-      this.showNotice("このブラウザは HLS 再生に対応していません。", "error");
+      this.showNotice("このブラウザでは動画を再生できません。", "error");
       return false;
     }
     if (this.destroyed) return false;
@@ -739,7 +761,7 @@ export class VideoStreamViewer {
       if (decision.kind === "generation_mismatch") {
         this.showNotice(decision.message, "waiting");
         this.refreshGeneration().catch((error) => {
-          this.showOperationalError(error, "新しい配信を取得できませんでした");
+          this.showOperationalError(error, "動画の再生を再開できませんでした");
         });
         return;
       }
@@ -753,7 +775,7 @@ export class VideoStreamViewer {
     if (!data?.fatal) return;
     this.hls?.stopLoad();
     this.showNotice(
-      `再生データを読み込めません (${data?.details ?? "HLS エラー"})。`,
+      "動画を再生できませんでした。もう一度お試しください。",
       "error",
       "再接続",
       () => this.restartAt(this.currentPosition())
@@ -820,7 +842,7 @@ export class VideoStreamViewer {
     }
     if (requested.name === CommandName.MEDIA_SEEK_RELATIVE) {
       this.seekTo(this.currentPosition() + Number(requested.payload.seconds || 0))
-        .catch((error) => this.showOperationalError(error, "シークできませんでした"));
+        .catch((error) => this.showOperationalError(error, "再生位置を変更できませんでした"));
       return true;
     }
     if (requested.name === CommandName.MEDIA_VOLUME) {
@@ -992,7 +1014,6 @@ export class VideoStreamViewer {
     const preset = videoQualityPreset(this.quality);
     this.diagnostics.textContent = [
       `画質 ${preset.label} (${preset.traffic})`,
-      this.encoder ? `エンコーダー ${this.encoder}` : "エンコーダー 準備中",
       dimensions,
       bitrate,
     ].filter(Boolean).join(" · ");
@@ -1005,7 +1026,7 @@ export class VideoStreamViewer {
       this.pollTimer = 0;
       this.pollState().catch((error) => {
         if (error?.name !== "AbortError" && !this.destroyed) {
-          this.showOperationalError(error, "配信状態を確認できませんでした");
+          this.showOperationalError(error, "動画の状態を確認できませんでした");
           this.schedulePoll();
         }
       });
@@ -1190,14 +1211,12 @@ export class VideoStreamViewer {
 
   showStartFailure(error) {
     const preset = videoQualityPreset(this.quality);
-    const reason = error instanceof Error ? error.message : "理由を取得できませんでした。";
-    this.diagnostics.textContent = [
-      `画質 ${preset.label} (${preset.traffic})`,
-      `エンコーダー ${this.encoder || "本体設定（選択前）"}`,
-      `理由 ${reason}`,
-    ].join(" · ");
+    this.diagnostics.textContent = `画質 ${preset.label} (${preset.traffic})`;
     this.showNotice(
-      `動画ストリーミングを開始できませんでした。${reason}`,
+      videoUserErrorMessage(
+        { code: error?.code || "stream_start_failed" },
+        "動画を開始できませんでした"
+      ),
       "error",
       "再試行",
       () => this.start(this.currentPosition(), this.playRequested)
@@ -1206,8 +1225,7 @@ export class VideoStreamViewer {
 
   showOperationalError(error, prefix) {
     if (error?.name === "AbortError" || this.destroyed) return;
-    const reason = error instanceof Error ? error.message : "不明なエラーです。";
-    this.showNotice(`${prefix}。${reason}`, "error");
+    this.showNotice(videoUserErrorMessage(error, prefix), "error");
   }
 
   showBoundaryMessage(message) {

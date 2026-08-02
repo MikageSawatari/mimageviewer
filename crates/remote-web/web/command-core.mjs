@@ -487,7 +487,7 @@ export function videoHttpStatusDecision(status, retryAfterSeconds = 1, errorCode
       kind: "gone",
       retry: false,
       retryDelayMs: 0,
-      message: "再生が配信に追いつけず、必要な区間が保持範囲から外れました。",
+      message: "再生を続けられませんでした。現在位置からもう一度お試しください。",
     };
   }
   if (code === 409) {
@@ -496,16 +496,14 @@ export function videoHttpStatusDecision(status, retryAfterSeconds = 1, errorCode
         kind: "generation_mismatch",
         retry: true,
         retryDelayMs: 0,
-        message: "配信が更新されたため、新しいプレイリストを取得しています。",
+        message: "動画が更新されたため、再生を準備しています。",
       };
     }
     return {
       kind: "session_mismatch",
       retry: false,
       retryDelayMs: 0,
-      message: errorCode === "stream_session_mismatch"
-        ? "動画配信セッションが終了しました。"
-        : "動画配信の状態が一致しません。",
+      message: "動画の配信が終了しました。もう一度開いてください。",
     };
   }
   if (code === 404) {
@@ -513,14 +511,14 @@ export function videoHttpStatusDecision(status, retryAfterSeconds = 1, errorCode
       kind: "not_found",
       retry: false,
       retryDelayMs: 0,
-      message: "配信データが見つかりません。",
+      message: "動画を読み込めませんでした。",
     };
   }
   return {
     kind: "error",
     retry: false,
     retryDelayMs: 0,
-    message: `配信データを取得できません (HTTP ${code || "不明"})。`,
+    message: "動画を読み込めませんでした。もう一度お試しください。",
   };
 }
 

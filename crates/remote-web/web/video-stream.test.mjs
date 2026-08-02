@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { resolveVideoPlaylist } from "./video-stream.mjs";
+import {
+  resolveVideoPlaylist,
+  videoUserErrorMessage,
+} from "./video-stream.mjs";
 
 const jsonResponse = (status, body) => new Response(JSON.stringify(body), {
   status,
@@ -57,7 +60,25 @@ test("playlist generation recovery is finite and exposes failure", async () => {
 
   assert.equal(result.ok, false);
   assert.equal(result.decision.kind, "playlist_recovery_exhausted");
-  assert.equal(result.decision.message, "プレイリストを取得できませんでした。");
+  assert.equal(result.decision.message, "動画の再生を続けられませんでした。");
   assert.equal(playlistCalls, 3);
   assert.equal(stateCalls, 3);
+});
+
+test("user video errors hide internal stage details and keep code-based guidance", () => {
+  const error = new Error("要求された動画の player が 2 秒以内に準備できませんでした");
+  error.code = "stream_start_seek_timeout";
+  const message = videoUserErrorMessage(error, "動画を操作できませんでした");
+
+  assert.equal(message, "動画を開始できませんでした。もう一度お試しください。");
+  for (const term of ["player", "seek", "2 秒", "予算", "内部状態", "状態が一致"]) {
+    assert.equal(message.includes(term), false, term);
+  }
+  assert.equal(
+    videoUserErrorMessage(
+      { code: "stream_session_mismatch", message: "動画配信の状態が一致しません" },
+      "動画を操作できませんでした"
+    ),
+    "動画の配信が終了しました。もう一度開いてください。"
+  );
 });

@@ -422,6 +422,10 @@ HLS のライブウィンドウ (直近 60 秒) 内は `<video>` 上で完結す
   `stream_session_mismatch` / `stream_generation_mismatch` に分ける。本体未接続は 503 と
   既存の `miv_not_running` を返す。動画 API の JSON `error` は計測ログの
   `details.video_stream.error_code` にも記録する
+- 利用者へ返す `message` は再試行・再オープンなどの一般向け案内だけとし、start の段、
+  deadline、player / seek / encoder / playlist、内部状態は含めない。本体から返った詳細は
+  `details.video_stream.internal_message` と本体ログに残し、安定した JSON `error` は従来どおり
+  機械判定と計測へ使う
 - `POST /api/video/stop` は generation を受け取らず、指定 streaming session が無い場合も
   成功する冪等操作とする。別の有効 session ID を誤って停止しない
 - generation 開始直後は init と master / media playlist がまだ未確定になり得る。増分 6 は
@@ -605,6 +609,19 @@ guard で、動画処理開始後の timeout 8 個には数えない。
   本機能は未リリースのため既存値の migration は不要
 - ローカル出力 bool も文字列の未知値を serde の `unknown variant` として分類し、
   `Incompatible` で原本を温存する
+- `Opening` / `Starting` / `Streaming` の全所有状態で headless player を UI frame ごとに
+  `tick` する。`tick` 冒頭の engine event drain が `SeekCompleted`、headless
+  `FirstFrameReady`、audio pump の `BufferReady` を actor へ届ける唯一の経路である。
+  増分 16 直後は `Starting` だけ tick が欠け、両 readiness event が channel にあっても
+  engine は `Seeking` のままだった。その間 audio pump は `audio_tx` を約 5 秒分
+  `raw_pending` へ取り込んだ後、cpal callback が非 Playing で processed を drain しないため
+  非破壊 back-pressure 上限に達して停止し、decoder 側の bounded `audio_tx` が満杯になった。
+  `Starting` も同じ tick 契約へ戻すことで `Seeking → Buffering` 後に `BufferReady` が有効になり、
+  video/audio readiness が揃って `Playing` へ進む
+- headless worker の開始・現在世代の最初の frame 消費・`FirstFrameReady` 送信、audio pump の
+  世代ごとの最初の `audio_tx` 消費、engine 側の readiness event 受領を通常ログに残す。
+  start 失敗時は 1 行に engine state、epoch、video/audio の required/ready、未処理 engine
+  event 数、audio raw/processed/`audio_tx` 秒数をまとめ、構造化 perf にも同じ条件を記録する
 
 ---
 
@@ -641,8 +658,12 @@ guard で、動画処理開始後の timeout 8 個には数えない。
   `media_quality` を送る。503 は `Retry-After` 後に再試行、410 は ring に追いつけなかった表示と
   明示再接続、generation mismatch の 409 は state の current generation から URL を組み直す。
   playlist probe は再帰せず最大 6 回か 15 秒で終了し、回復不能なら
-  「プレイリストを取得できませんでした。」と再接続操作を表示する。session mismatch の 409 は
+  「動画の再生を続けられませんでした。」と再接続操作を表示する。session mismatch の 409 は
   再取得対象にしない
+- HTTP 本文や例外の内部メッセージを notice へ連結しない。start は
+  「動画を開始できませんでした。もう一度お試しください。」、session/generation 失効は
+  「動画の配信が終了しました。もう一度開いてください。」へ正規化し、HLS、encoder、
+  playlist、HTTP status などの実装語は利用者向けエラーへ出さない
 - 動画のタップ、スワイプ、Space、矢印、音量、画質、F11 は `command-core.mjs` の既存 command
   dispatch に統合した。`<video controls>` は使わず、シークバー、音量、画質 UI は自前 DOM とした。
   visibility 復帰時に session が失効していれば、表示中の全体動画位置を保持して start + seek する
