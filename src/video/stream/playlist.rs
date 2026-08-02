@@ -69,10 +69,6 @@ impl SegmentRing {
             .map_or(self.next_sequence, |segment| segment.sequence)
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.segments.is_empty()
-    }
-
     #[cfg(test)]
     pub(crate) fn next_sequence(&self) -> u64 {
         self.next_sequence
@@ -226,6 +222,9 @@ mod tests {
         assert!(!playlist.contains("#EXT-X-ENDLIST"));
     }
 
+    /// `EXTINF` は固定値ではなく fragment ごとの実測長である。長さの違う segment を
+    /// 混ぜる設計を検討するとき、この契約が既に成立していることが出発点になる
+    /// (`TARGETDURATION` は最長の切り上げ以上)。
     #[test]
     fn playlist_uses_measured_extinf_and_target_duration_covers_the_longest_segment() {
         let mut ring = SegmentRing::new(DEFAULT_SEGMENT_CAPACITY).unwrap();

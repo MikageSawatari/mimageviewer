@@ -7,9 +7,6 @@ use super::quality::StreamOutputParameters;
 
 /// 正本 §4.4 の segment/GOP 長。後続セグメンタもこの値を共有する。
 pub(crate) const SEGMENT_DURATION_SECS: u32 = 2;
-/// generation の最初の media segment だけを早く公開するための目標長。
-/// 後続 segment の GOP/境界は `SEGMENT_DURATION_SECS` のまま変えない。
-pub(crate) const INITIAL_SEGMENT_DURATION_MILLIS: u32 = 500;
 pub(crate) const H264_PROFILE: &str = "high";
 pub(crate) const H264_BIT_DEPTH: u8 = 8;
 pub(crate) const VIDEO_COLOR_SPACE: &str = "bt709";
@@ -122,13 +119,6 @@ impl FrameRate {
     pub(crate) fn keyint_frames(self) -> u32 {
         let numerator = u64::from(self.numerator) * u64::from(SEGMENT_DURATION_SECS);
         let rounded = (numerator + u64::from(self.denominator) / 2) / u64::from(self.denominator);
-        rounded.clamp(1, u64::from(u32::MAX)) as u32
-    }
-
-    pub(crate) fn initial_segment_frames(self) -> u32 {
-        let numerator = u64::from(self.numerator) * u64::from(INITIAL_SEGMENT_DURATION_MILLIS);
-        let denominator = u64::from(self.denominator) * 1_000;
-        let rounded = (numerator + denominator / 2) / denominator;
         rounded.clamp(1, u64::from(u32::MAX)) as u32
     }
 }
@@ -719,15 +709,6 @@ mod tests {
         assert_eq!(FrameRate::new(30, 1).unwrap().keyint_frames(), 60);
         assert_eq!(FrameRate::new(60, 1).unwrap().keyint_frames(), 120);
         assert_eq!(FrameRate::new(30_000, 1_001).unwrap().keyint_frames(), 60);
-        assert_eq!(FrameRate::new(24, 1).unwrap().initial_segment_frames(), 12);
-        assert_eq!(FrameRate::new(30, 1).unwrap().initial_segment_frames(), 15);
-        assert_eq!(FrameRate::new(60, 1).unwrap().initial_segment_frames(), 30);
-        assert_eq!(
-            FrameRate::new(30_000, 1_001)
-                .unwrap()
-                .initial_segment_frames(),
-            15
-        );
         assert!(FrameRate::new(0, 1).is_err());
     }
 
