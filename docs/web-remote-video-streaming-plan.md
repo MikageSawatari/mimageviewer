@@ -549,7 +549,7 @@ start の **15 秒**は、次の根拠で置く運用上限である。
 | generation resource response (`RESOURCE_TIMEOUT`) | 2 秒 | 4 本の stream worker を停止した generation worker から解放する | 通常の playlist/init/media/state のみ。start playlist は残予算を渡す |
 | 通常 IPC response | 10 秒 | start 以外の pending IPC / HTTP worker | start には使わない |
 | 通常 UI request accept | 2 秒 | control/seek/stop 等で UI queue 未受理を検出 | start は 2 秒を使わず start 残予算を使う |
-| browser playlist recovery | 最大 6 回か 15 秒 | start 後の generation mismatch / 一時 503 からの回復 | start 完了後の client recovery |
+| browser generation switch | 15 秒 | start 後の generation mismatch / 一時 503 からの回復を単一 owner で直列化 | start 完了後の client recovery |
 | browser first media segment | 15 秒 | playlist attach 後に media segment が 0 件のままの開始不能を検出 | core start 完了後。通常の再生中 buffering とは分離 |
 | remote session liveness | 60 秒 | client 消失時の owner / stream 解放 | request timeout ではない lifecycle guard |
 | paused-stream idle | 10 分 | 放置された停止中 stream の解放 | request timeout ではない lifecycle guard |
@@ -689,9 +689,18 @@ guard で、動画処理開始後の timeout 9 個には数えない。
 - `waiting` 継続 3 秒で 1 段下の画質と 1 時間あたり通信量を提示し、利用者がボタンを押した時だけ
   `media_quality` を送る。503 は `Retry-After` 後に再試行、410 は ring に追いつけなかった表示と
   明示再接続、generation mismatch の 409 は state の current generation から URL を組み直す。
-  playlist probe は再帰せず最大 6 回か 15 秒で終了し、回復不能なら
-  「動画の再生を続けられませんでした。」と再接続操作を表示する。session mismatch の 409 は
-  再取得対象にしない
+  session mismatch の 409 は再取得対象にしない
+- seek 応答、state poll の generation 変化、hls.js の generation mismatch 409 は
+  `VideoGenerationSwitchOwner` の 1 本へ合流する。owner は `idle / switching / attached` の
+  排他的状態を持ち、同一 generation と古い要求は進行中 Promise に相乗りし、より新しい
+  generation だけが古い per-switch `AbortController` を中止して置き換える。切替を受理した
+  同期時点で旧 hls.js / native source を停止し、旧世代からの追加 error event を無視する
+- generation switch の 15 秒 budget は owner が切替決定時に一度だけ作り、必要なら current
+  generation を state から解決する段階と、playlist が取得可能になるまでの probe 全体で
+  持ち回る。回数上限は置かない。503 と 409 の retry は `Retry-After` 以上かつ
+  250ms から最大 2 秒までの backoff とし、残予算を超えて待たない。予算内の 503 は待機表示の
+  まま継続し、予算満了時だけ `playlist_recovery_budget_exhausted` を内部 telemetry に残して
+  「動画の再生を続けられませんでした。」と再接続操作を表示する
 - playlist attach ごとに15秒の初回 media segment watchdog を持つ。hls.js は init を除く
   `FRAG_LOADED`、native は `loadeddata` / `canplay` で解除する。0件のままなら通常 buffering と
   分けて開始不能を表示し、telemetry に `no_media_segment_loaded_before_deadline`、playback mode、

@@ -2,13 +2,17 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  VideoGenerationSwitchOwner,
   resolveVideoPlaylist,
   videoUserErrorMessage,
 } from "./video-stream.mjs";
 
 const jsonResponse = (status, body) => new Response(JSON.stringify(body), {
   status,
-  headers: { "Content-Type": "application/json" },
+  headers: {
+    "Content-Type": "application/json",
+    "Retry-After": "1",
+  },
 });
 
 test("playlist 409 refreshes generation from state and recovers", async () => {
@@ -39,30 +43,185 @@ test("playlist 409 refreshes generation from state and recovers", async () => {
   assert.equal(stateCalls, 1);
 });
 
-test("playlist generation recovery is finite and exposes failure", async () => {
+test("four seconds of playlist 503 remains waiting inside the recovery budget", async () => {
+  let nowMs = 0;
   let playlistCalls = 0;
-  let stateCalls = 0;
   const result = await resolveVideoPlaylist({
     initialUrl: "/stream/1/1/index.m3u8",
     session: 1,
-    maxAttempts: 3,
-    timeoutMs: 60000,
+    timeoutMs: 15000,
+    now: () => nowMs,
     fetchPlaylist: async () => {
       playlistCalls += 1;
-      return jsonResponse(409, { error: "stream_generation_mismatch" });
+      return nowMs < 4000
+        ? jsonResponse(503, { error: "stream_not_ready" })
+        : new Response("#EXTM3U", { status: 200 });
     },
-    fetchState: async () => {
-      stateCalls += 1;
-      return { session: 1, generation: 1 };
+    fetchState: async () => ({ session: 1, generation: 1 }),
+    delay: async (delayMs) => { nowMs += delayMs; },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(playlistCalls, 5);
+  assert.equal(nowMs, 5000);
+});
+
+test("playlist recovery fails only when its elapsed-time budget is exhausted", async () => {
+  let nowMs = 0;
+  let playlistCalls = 0;
+  const decisions = [];
+  const result = await resolveVideoPlaylist({
+    initialUrl: "/stream/1/1/index.m3u8",
+    session: 1,
+    timeoutMs: 4500,
+    now: () => nowMs,
+    fetchPlaylist: async () => {
+      playlistCalls += 1;
+      return jsonResponse(503, { error: "stream_not_ready" });
     },
-    delay: async () => {},
+    fetchState: async () => ({ session: 1, generation: 1 }),
+    delay: async (delayMs) => { nowMs += delayMs; },
+    onDecision: (decision) => decisions.push(decision.kind),
   });
 
   assert.equal(result.ok, false);
   assert.equal(result.decision.kind, "playlist_recovery_exhausted");
+  assert.equal(result.decision.internalReason, "playlist_recovery_budget_exhausted");
   assert.equal(result.decision.message, "動画の再生を続けられませんでした。");
-  assert.equal(playlistCalls, 3);
-  assert.equal(stateCalls, 3);
+  assert.equal(result.decision.elapsedMs, 4500);
+  assert.equal(nowMs, 4500);
+  assert.equal(playlistCalls, 4);
+  assert.deepEqual(decisions, ["waiting", "waiting", "waiting", "waiting"]);
+});
+
+test("same-generation switch requests share one recovery loop", async () => {
+  let runs = 0;
+  let release;
+  const owner = new VideoGenerationSwitchOwner({
+    stopCurrent: () => {},
+    runSwitch: async () => {
+      runs += 1;
+      return new Promise((resolve) => { release = resolve; });
+    },
+  });
+  const target = { session: 4, generation: 5, url: "/stream/4/5/index.m3u8" };
+
+  const first = owner.request(target);
+  await Promise.resolve();
+  const second = owner.request(target);
+
+  assert.strictEqual(second, first);
+  assert.equal(runs, 1);
+  release(true);
+  assert.equal(await first, true);
+  assert.equal(owner.currentTarget().generation, 5);
+});
+
+test("newer generation replaces and aborts the older recovery loop", async () => {
+  const operations = [];
+  const owner = new VideoGenerationSwitchOwner({
+    stopCurrent: () => {},
+    runSwitch: async (operation) => new Promise((resolve) => {
+      operations.push({ operation, resolve });
+      operation.signal.addEventListener("abort", () => resolve(false), { once: true });
+    }),
+  });
+
+  const older = owner.request({
+    session: 4,
+    generation: 5,
+    url: "/stream/4/5/index.m3u8",
+  });
+  await Promise.resolve();
+  const newer = owner.request({
+    session: 4,
+    generation: 6,
+    url: "/stream/4/6/index.m3u8",
+  });
+  await Promise.resolve();
+  const stale = owner.request({
+    session: 4,
+    generation: 5,
+    url: "/stream/4/5/index.m3u8",
+  });
+
+  assert.notStrictEqual(newer, older);
+  assert.strictEqual(stale, newer);
+  assert.equal(operations.length, 2);
+  assert.equal(operations[0].operation.signal.aborted, true);
+  assert.equal(await older, false);
+  operations[1].resolve(true);
+  assert.equal(await newer, true);
+  assert.equal(owner.currentTarget().generation, 6);
+});
+
+test("generation switch silences the old HLS instance before recovery starts", async () => {
+  let recoveryStarted = false;
+  let release;
+  const oldHls = {
+    destroyed: false,
+    destroy() { this.destroyed = true; },
+  };
+  const owner = new VideoGenerationSwitchOwner({
+    stopCurrent: () => oldHls.destroy(),
+    runSwitch: async () => {
+      recoveryStarted = true;
+      return new Promise((resolve) => { release = resolve; });
+    },
+  });
+
+  const switched = owner.request({
+    session: 4,
+    generation: 5,
+    url: "/stream/4/5/index.m3u8",
+  });
+
+  assert.equal(oldHls.destroyed, true);
+  assert.equal(recoveryStarted, false);
+  await Promise.resolve();
+  assert.equal(recoveryStarted, true);
+  release(true);
+  assert.equal(await switched, true);
+});
+
+test("generation switch reports failure when its one owner budget expires", async () => {
+  let deadline;
+  let exhausted = 0;
+  let activeOperation;
+  const owner = new VideoGenerationSwitchOwner({
+    stopCurrent: () => {},
+    runSwitch: async (operation) => {
+      activeOperation = operation;
+      return new Promise((_resolve, reject) => {
+        operation.signal.addEventListener("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+    },
+    onBudgetExhausted: () => { exhausted += 1; },
+    setTimer: (callback) => {
+      deadline = callback;
+      return 1;
+    },
+    clearTimer: () => {},
+  });
+
+  const switched = owner.request({
+    session: 4,
+    generation: 5,
+    url: "/stream/4/5/index.m3u8",
+  });
+  await Promise.resolve();
+  assert.equal(exhausted, 0);
+
+  deadline();
+
+  assert.equal(await switched, false);
+  assert.equal(activeOperation.abortReason, "budget");
+  assert.equal(exhausted, 1);
+  assert.equal(owner.currentTarget(), null);
 });
 
 test("user video errors hide internal stage details and keep code-based guidance", () => {

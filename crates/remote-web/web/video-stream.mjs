@@ -20,8 +20,9 @@ const HLS_SCRIPT_PATH = "/vendor/hls.min.js";
 const VIDEO_STATE_POLL_MS = 1000;
 const WAITING_SUGGESTION_MS = 3000;
 const STARTUP_MEDIA_SEGMENT_TIMEOUT_MS = 15000;
-const PLAYLIST_RECOVERY_MAX_ATTEMPTS = 6;
 const PLAYLIST_RECOVERY_TIMEOUT_MS = 15000;
+const PLAYLIST_RECOVERY_BACKOFF_BASE_MS = 250;
+const PLAYLIST_RECOVERY_BACKOFF_MAX_MS = 2000;
 
 let hlsScriptPromise = null;
 
@@ -150,6 +151,48 @@ export function videoUserErrorMessage(error, fallback = "動画を操作でき�
   return summary + "。もう一度お試しください。";
 }
 
+export function createPlaylistRecoveryBudget({
+  startedAtMs = Date.now(),
+  timeoutMs = PLAYLIST_RECOVERY_TIMEOUT_MS,
+} = {}) {
+  const started = Number(startedAtMs) || 0;
+  const timeout = Math.max(1, Number(timeoutMs) || 1);
+  return Object.freeze({
+    startedAtMs: started,
+    deadlineMs: started + timeout,
+    timeoutMs: timeout,
+  });
+}
+
+function playlistRecoveryRemainingMs(budget, nowMs) {
+  return Math.max(0, Number(budget?.deadlineMs) - Number(nowMs));
+}
+
+function playlistRecoveryDelayMs(attempt, retryDelayMs) {
+  const exponent = Math.min(3, Math.max(0, Number(attempt) - 1));
+  const backoff = Math.min(
+    PLAYLIST_RECOVERY_BACKOFF_MAX_MS,
+    PLAYLIST_RECOVERY_BACKOFF_BASE_MS * 2 ** exponent
+  );
+  return Math.max(backoff, Math.max(0, Number(retryDelayMs) || 0));
+}
+
+function playlistRecoveryExhausted(budget, attempts, nowMs) {
+  return {
+    ok: false,
+    attempts,
+    decision: {
+      kind: "playlist_recovery_exhausted",
+      retry: false,
+      retryDelayMs: 0,
+      message: "動画の再生を続けられませんでした。",
+      internalReason: "playlist_recovery_budget_exhausted",
+      timeoutMs: Number(budget.timeoutMs) || PLAYLIST_RECOVERY_TIMEOUT_MS,
+      elapsedMs: Math.max(0, Number(nowMs) - Number(budget.startedAtMs)),
+    },
+  };
+}
+
 export async function resolveVideoPlaylist({
   initialUrl,
   session,
@@ -158,19 +201,29 @@ export async function resolveVideoPlaylist({
   signal,
   delay = abortableDelay,
   now = () => Date.now(),
-  maxAttempts = PLAYLIST_RECOVERY_MAX_ATTEMPTS,
   timeoutMs = PLAYLIST_RECOVERY_TIMEOUT_MS,
+  budget,
   onDecision = () => {},
+  onTarget = () => {},
+  onAttempt = () => {},
 }) {
   let url = String(initialUrl ?? "");
   let latestState = null;
-  const startedAt = now();
-  const attempts = Math.max(1, Number(maxAttempts) || 1);
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    if (attempt > 0 && now() - startedAt >= Math.max(1, Number(timeoutMs) || 1)) break;
+  const recoveryBudget = budget ?? createPlaylistRecoveryBudget({
+    startedAtMs: now(),
+    timeoutMs,
+  });
+  let attempts = 0;
+  while (playlistRecoveryRemainingMs(recoveryBudget, now()) > 0) {
+    attempts += 1;
+    onAttempt(attempts, url);
     const response = await fetchPlaylist(url, signal);
+    const responseAt = now();
+    if (playlistRecoveryRemainingMs(recoveryBudget, responseAt) <= 0) {
+      return playlistRecoveryExhausted(recoveryBudget, attempts, responseAt);
+    }
     if (response.ok) {
-      return { ok: true, url, state: latestState, attempts: attempt + 1 };
+      return { ok: true, url, state: latestState, attempts };
     }
     const detail = await response.clone().json().catch(() => ({}));
     const decision = videoHttpStatusDecision(
@@ -183,26 +236,195 @@ export async function resolveVideoPlaylist({
       latestState = await fetchState(session, signal);
       const currentSession = Number(latestState?.session ?? session);
       const generation = Number(latestState?.generation);
-      if (!Number.isFinite(currentSession) || !Number.isFinite(generation)) break;
+      if (!Number.isFinite(currentSession) || !Number.isFinite(generation)) {
+        return {
+          ok: false,
+          attempts,
+          decision: {
+            kind: "error",
+            retry: false,
+            retryDelayMs: 0,
+            message: "動画を読み込めませんでした。もう一度お試しください。",
+            internalReason: "playlist_generation_state_invalid",
+          },
+        };
+      }
       url = `/stream/${currentSession}/${generation}/index.m3u8`;
-      continue;
+      onTarget({
+        session: currentSession,
+        generation,
+        url,
+        state: latestState,
+      });
+    } else if (decision.kind !== "waiting") {
+      return { ok: false, decision, attempts };
     }
-    if (decision.kind === "waiting") {
-      await delay(decision.retryDelayMs, signal);
-      continue;
+
+    const remainingMs = playlistRecoveryRemainingMs(recoveryBudget, now());
+    if (remainingMs <= 0) {
+      return playlistRecoveryExhausted(recoveryBudget, attempts, now());
     }
-    return { ok: false, decision, attempts: attempt + 1 };
+    const retryDelayMs = playlistRecoveryDelayMs(attempts, decision.retryDelayMs);
+    await delay(Math.min(retryDelayMs, remainingMs), signal);
   }
+  return playlistRecoveryExhausted(recoveryBudget, attempts, now());
+}
+
+function normalizePlaylistTarget(target = {}) {
+  const session = Number(target.session);
+  const generation = target.generation === null || target.generation === undefined
+    ? null
+    : Number(target.generation);
   return {
-    ok: false,
-    attempts,
-    decision: {
-      kind: "playlist_recovery_exhausted",
-      retry: false,
-      retryDelayMs: 0,
-      message: "動画の再生を続けられませんでした。",
-    },
+    session: Number.isFinite(session) ? session : null,
+    generation: Number.isFinite(generation) ? generation : null,
+    url: String(target.url ?? ""),
   };
+}
+
+function targetsShareSession(left, right) {
+  return left.session !== null && left.session === right.session;
+}
+
+export class VideoGenerationSwitchOwner {
+  constructor({
+    stopCurrent,
+    runSwitch,
+    onBudgetExhausted = () => {},
+    now = () => Date.now(),
+    timeoutMs = PLAYLIST_RECOVERY_TIMEOUT_MS,
+    setTimer = (callback, delayMs) => setTimeout(callback, delayMs),
+    clearTimer = (timer) => clearTimeout(timer),
+  }) {
+    this.stopCurrent = stopCurrent;
+    this.runSwitch = runSwitch;
+    this.onBudgetExhausted = onBudgetExhausted;
+    this.now = now;
+    this.timeoutMs = timeoutMs;
+    this.setTimer = setTimer;
+    this.clearTimer = clearTimer;
+    this.state = { kind: "idle" };
+  }
+
+  isSwitching() {
+    return this.state.kind === "switching";
+  }
+
+  currentTarget() {
+    if (this.state.kind === "idle") return null;
+    const target = this.state.kind === "switching"
+      ? this.state.operation.target
+      : this.state.target;
+    return { ...target };
+  }
+
+  request(target, { force = false, initialRetryDelayMs = 0 } = {}) {
+    const requested = normalizePlaylistTarget(target);
+    if (this.state.kind === "switching") {
+      const active = this.state.operation;
+      if (this.shouldJoin(active.target, requested)) {
+        if (active.target.generation === null && requested.generation !== null) {
+          active.updateTarget(requested);
+        }
+        return active.promise;
+      }
+      active.abortReason = "superseded";
+      this.clearTimer(active.deadlineTimer);
+      active.controller.abort();
+    } else if (
+      !force &&
+      this.state.kind === "attached" &&
+      targetsShareSession(this.state.target, requested) &&
+      requested.generation !== null &&
+      this.state.target.generation !== null &&
+      requested.generation <= this.state.target.generation
+    ) {
+      return Promise.resolve(true);
+    }
+
+    const controller = new AbortController();
+    const operation = {
+      target: requested,
+      controller,
+      signal: controller.signal,
+      budget: createPlaylistRecoveryBudget({
+        startedAtMs: this.now(),
+        timeoutMs: this.timeoutMs,
+      }),
+      promise: null,
+      abortReason: "",
+      attempts: 0,
+      initialRetryDelayMs: Math.max(0, Number(initialRetryDelayMs) || 0),
+      deadlineTimer: 0,
+      owns: () => (
+        this.state.kind === "switching" &&
+        this.state.operation === operation
+      ),
+      isCurrent: () => (
+        operation.owns() &&
+        !operation.signal.aborted
+      ),
+      updateTarget: (nextTarget) => {
+        const next = normalizePlaylistTarget(nextTarget);
+        if (
+          targetsShareSession(operation.target, next) &&
+          operation.target.generation !== null &&
+          next.generation !== null &&
+          next.generation < operation.target.generation
+        ) {
+          return;
+        }
+        operation.target = next;
+      },
+    };
+    this.state = { kind: "switching", operation };
+    operation.promise = (async () => {
+      await Promise.resolve();
+      try {
+        const attached = Boolean(await this.runSwitch(operation));
+        if (operation.isCurrent()) {
+          this.state = attached
+            ? { kind: "attached", target: { ...operation.target } }
+            : { kind: "idle" };
+        }
+        return attached;
+      } catch (error) {
+        if (operation.abortReason === "budget" && operation.owns()) {
+          this.onBudgetExhausted(operation);
+          this.state = { kind: "idle" };
+          return false;
+        }
+        if (operation.owns()) this.state = { kind: "idle" };
+        if (operation.signal.aborted) return false;
+        throw error;
+      } finally {
+        this.clearTimer(operation.deadlineTimer);
+      }
+    })();
+    operation.deadlineTimer = this.setTimer(() => {
+      if (!operation.owns()) return;
+      operation.abortReason = "budget";
+      operation.controller.abort();
+    }, operation.budget.timeoutMs);
+    this.stopCurrent(requested);
+    return operation.promise;
+  }
+
+  shouldJoin(active, requested) {
+    if (!targetsShareSession(active, requested)) return false;
+    if (requested.generation === null) return true;
+    if (active.generation === null) return true;
+    return requested.generation <= active.generation;
+  }
+
+  cancel() {
+    if (this.state.kind === "switching") {
+      this.state.operation.abortReason = "cancelled";
+      this.clearTimer(this.state.operation.deadlineTimer);
+      this.state.operation.controller.abort();
+    }
+    this.state = { kind: "idle" };
+  }
 }
 
 class VideoStreamMenu {
@@ -443,7 +665,6 @@ export class VideoStreamViewer {
     this.restarting = false;
     this.draggingSeek = false;
     this.hls = null;
-    this.playlistUrl = "";
     this.pollTimer = 0;
     this.waitingTimer = 0;
     this.waitingSince = null;
@@ -462,6 +683,19 @@ export class VideoStreamViewer {
     this.video.setAttribute("playsinline", "");
     this.video.setAttribute("webkit-playsinline", "");
     this.video.setAttribute("aria-label", entry.name);
+    this.generationSwitch = new VideoGenerationSwitchOwner({
+      stopCurrent: () => this.stopPlaylistPlayback(),
+      runSwitch: (operation) => this.performGenerationSwitch(operation),
+      onBudgetExhausted: (operation) => this.handleGenerationSwitchFailure(
+        playlistRecoveryExhausted(
+          operation.budget,
+          operation.attempts,
+          performance.now()
+        ),
+        operation
+      ),
+      now: () => performance.now(),
+    });
     // Native controls intentionally remain disabled. Every operation is dispatched
     // through the same command layer as touch and keyboard input.
 
@@ -558,7 +792,7 @@ export class VideoStreamViewer {
     this.onLoadedData = () => this.checkPlaybackStartupProgress();
     this.onWaiting = () => this.beginWaiting();
     this.onNativeError = () => {
-      if (!this.destroyed && !this.hls) {
+      if (!this.destroyed && !this.hls && !this.generationSwitch.isSwitching()) {
         const startup = this.startupWatch;
         this.clearPlaybackStartupWatch();
         this.recordPlaybackIssue(
@@ -633,7 +867,7 @@ export class VideoStreamViewer {
     if (this.destroyed) return;
     this.session = started.session;
     this.generation = started.generation;
-    this.playlistUrl = started.playlist;
+    let playlistUrl = started.playlist;
     this.duration = Math.max(0, Number(started.duration_secs) || 0);
     this.encoder = String(started.encoder ?? "");
     this.codecs = String(started.codec ?? "");
@@ -652,7 +886,7 @@ export class VideoStreamViewer {
           this.abortController.signal
         ));
         this.generation = sought.generation;
-        this.playlistUrl = sought.playlist;
+        playlistUrl = sought.playlist;
         this.timelineAnchor.sourcePositionSecs = Math.min(positionSecs, this.duration);
       } catch (error) {
         if (error?.name === "AbortError" || this.destroyed) return;
@@ -661,7 +895,11 @@ export class VideoStreamViewer {
       }
     }
 
-    const attached = await this.attachPlaylist(this.playlistUrl);
+    const attached = await this.switchGeneration({
+      session: this.session,
+      generation: this.generation,
+      url: playlistUrl,
+    });
     if (!attached || this.destroyed) return;
     if (!restorePlaying) {
       await this.setPlaying(false);
@@ -692,11 +930,131 @@ export class VideoStreamViewer {
     throw error;
   }
 
-  async probePlaylist(url) {
+  switchGeneration(target, options) {
+    if (this.destroyed) return Promise.resolve(false);
+    return this.generationSwitch.request(target, options);
+  }
+
+  switchToCurrentGeneration() {
+    return this.switchGeneration({
+      session: this.session,
+      generation: null,
+      url: "",
+    });
+  }
+
+  async performGenerationSwitch(operation) {
+    if (operation.initialRetryDelayMs > 0) {
+      const remainingMs = playlistRecoveryRemainingMs(
+        operation.budget,
+        performance.now()
+      );
+      await abortableDelay(
+        Math.min(operation.initialRetryDelayMs, remainingMs),
+        operation.signal
+      );
+      if (!operation.isCurrent()) return false;
+    }
+    let target = { ...operation.target };
+    if (target.generation === null || !target.url) {
+      const beforeState = performance.now();
+      if (playlistRecoveryRemainingMs(operation.budget, beforeState) <= 0) {
+        const exhausted = playlistRecoveryExhausted(operation.budget, 0, beforeState);
+        this.handleGenerationSwitchFailure(exhausted, operation);
+        return false;
+      }
+      let mediaState;
+      try {
+        mediaState = await this.apiJson(
+          "/api/video/state",
+          { session: this.session },
+          operation.signal
+        );
+      } catch (error) {
+        if (
+          operation.isCurrent() &&
+          videoHttpStatusDecision(
+            error?.status,
+            error?.retryAfterSeconds,
+            error?.code
+          ).kind === "session_mismatch"
+        ) {
+          await this.restartAt(this.currentPosition());
+          return false;
+        }
+        throw error;
+      }
+      if (!operation.isCurrent()) return false;
+      const afterState = performance.now();
+      if (playlistRecoveryRemainingMs(operation.budget, afterState) <= 0) {
+        const exhausted = playlistRecoveryExhausted(operation.budget, 0, afterState);
+        this.handleGenerationSwitchFailure(exhausted, operation);
+        return false;
+      }
+      const currentSession = Number(mediaState?.session ?? this.session);
+      const generation = Number(mediaState?.generation);
+      if (!Number.isFinite(currentSession) || !Number.isFinite(generation)) {
+        this.showStatusDecision({
+          kind: "error",
+          message: "動画を読み込めませんでした。もう一度お試しください。",
+        });
+        return false;
+      }
+      operation.updateTarget({
+        session: currentSession,
+        generation,
+        url: `/stream/${currentSession}/${generation}/index.m3u8`,
+      });
+      target = { ...operation.target };
+      if (!this.serverStatePrecedesTarget(mediaState, target)) {
+        this.applyServerState(mediaState);
+      }
+    }
+
+    const result = await this.probePlaylist(target.url, operation);
+    if (!operation.isCurrent()) return false;
+    if (!result.ok) {
+      this.handleGenerationSwitchFailure(result, operation);
+      return false;
+    }
+    if (result.state) {
+      if (!this.serverStatePrecedesTarget(result.state, operation.target)) {
+        this.applyServerState(result.state);
+      }
+    }
+    operation.updateTarget({
+      ...operation.target,
+      url: result.url,
+    });
+    const attached = await this.attachResolvedPlaylist(result.url, operation);
+    if (attached && operation.isCurrent()) this.playIfRequested();
+    return attached;
+  }
+
+  handleGenerationSwitchFailure(result, operation) {
+    if (!operation.owns()) return;
+    if (result.decision?.kind === "playlist_recovery_exhausted") {
+      this.recordPlaybackIssue(
+        "video_stream_generation_switch_failed",
+        result.decision.internalReason,
+        {
+          timeout_ms: result.decision.timeoutMs,
+          elapsed_ms: Math.round(result.decision.elapsedMs),
+          attempts: result.attempts,
+          target_generation: operation.target.generation,
+        }
+      );
+    }
+    this.showStatusDecision(result.decision);
+  }
+
+  async probePlaylist(url, operation) {
     const result = await resolveVideoPlaylist({
       initialUrl: url,
       session: this.session,
-      signal: this.abortController.signal,
+      signal: operation.signal,
+      budget: operation.budget,
+      now: () => performance.now(),
       fetchPlaylist: (playlistUrl, signal) => fetch(playlistUrl, {
         credentials: "same-origin",
         cache: "no-store",
@@ -708,35 +1066,19 @@ export class VideoStreamViewer {
         { session },
         signal
       ),
-      onDecision: (decision, detail) => {
-        if (decision.retry) {
-          this.showNotice(
-            `${decision.message} ${detail.message ?? ""}`.trim(),
-            "waiting"
-          );
+      onDecision: (decision) => {
+        if (operation.isCurrent() && decision.retry) {
+          this.showNotice(decision.message, "waiting");
         }
       },
+      onTarget: (target) => operation.updateTarget(target),
+      onAttempt: (attempt) => { operation.attempts = attempt; },
     });
-    if (result.ok) {
-      if (result.state) this.applyServerState(result.state);
-      this.generation = result.state?.generation ?? this.generation;
-      return result.url;
-    }
-    this.showStatusDecision(result.decision);
-    return null;
+    return result;
   }
 
-  async attachPlaylist(url) {
-    if (!url || this.destroyed) return false;
-    const resolvedUrl = await this.probePlaylist(url);
-    if (!resolvedUrl) return false;
-    if (this.destroyed) return false;
-    url = resolvedUrl;
-    this.playlistUrl = url;
-    this.destroyHls();
-    this.video.pause();
-    this.video.removeAttribute("src");
-    this.video.load();
+  async attachResolvedPlaylist(url, operation) {
+    if (!url || this.destroyed || !operation.isCurrent()) return false;
     const capabilities = {
       nativeHlsCanPlayType: this.video.canPlayType(HLS_MIME),
       mediaSourceSupported: typeof globalThis.MediaSource === "function",
@@ -755,6 +1097,7 @@ export class VideoStreamViewer {
         );
       }
     }
+    if (this.destroyed || !operation.isCurrent()) return false;
     const hlsJsSupported = Boolean(Hls?.isSupported?.());
     const playback = videoPlaybackDecision({ ...capabilities, hlsJsSupported });
     if (playback.mode === "unsupported") {
@@ -788,7 +1131,7 @@ export class VideoStreamViewer {
       xhrSetup(xhr) { xhr.withCredentials = true; },
     });
     this.hls = hls;
-    hls.on(Hls.Events.ERROR, (_event, data) => this.onHlsError(data));
+    hls.on(Hls.Events.ERROR, (_event, data) => this.onHlsError(hls, data));
     hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
       if (data?.frag && data.frag.sn !== "initSegment") {
         this.markPlaybackMediaSegmentLoaded();
@@ -800,8 +1143,8 @@ export class VideoStreamViewer {
     return true;
   }
 
-  onHlsError(data) {
-    if (this.destroyed) return;
+  onHlsError(source, data) {
+    if (this.destroyed || this.hls !== source) return;
     const status = hlsHttpStatus(data);
     if (status) {
       const decision = videoHttpStatusDecision(
@@ -810,16 +1153,21 @@ export class VideoStreamViewer {
         hlsHttpErrorCode(data)
       );
       if (decision.kind === "waiting") {
-        this.clearPlaybackStartupWatch();
         this.showNotice(decision.message, "waiting");
-        this.hls?.stopLoad();
-        this.schedule(() => this.attachPlaylist(this.playlistUrl), decision.retryDelayMs);
+        const target = this.generationSwitch.currentTarget();
+        if (target) {
+          this.switchGeneration(target, {
+            force: true,
+            initialRetryDelayMs: decision.retryDelayMs,
+          }).catch((error) => {
+            this.showOperationalError(error, "動画の再生を再開できませんでした");
+          });
+        }
         return;
       }
       if (decision.kind === "generation_mismatch") {
-        this.clearPlaybackStartupWatch();
         this.showNotice(decision.message, "waiting");
-        this.refreshGeneration().catch((error) => {
+        this.switchToCurrentGeneration().catch((error) => {
           this.showOperationalError(error, "動画の再生を再開できませんでした");
         });
         return;
@@ -867,31 +1215,7 @@ export class VideoStreamViewer {
 
   async refreshGeneration() {
     if (!this.session || this.destroyed) return;
-    let mediaState;
-    try {
-      mediaState = await this.apiJson(
-        "/api/video/state",
-        { session: this.session },
-        this.abortController.signal
-      );
-    } catch (error) {
-      if (
-        videoHttpStatusDecision(
-          error?.status,
-          error?.retryAfterSeconds,
-          error?.code
-        ).kind === "session_mismatch"
-      ) {
-        await this.restartAt(this.currentPosition());
-        return;
-      }
-      throw error;
-    }
-    this.applyServerState(mediaState);
-    const playlist = `/stream/${this.session}/${mediaState.generation}/index.m3u8`;
-    this.generation = mediaState.generation;
-    await this.attachPlaylist(playlist);
-    this.playIfRequested();
+    await this.switchToCurrentGeneration();
   }
 
   execute(requested) {
@@ -989,13 +1313,15 @@ export class VideoStreamViewer {
       throw error;
     }
     this.generation = sought.generation;
-    this.playlistUrl = sought.playlist;
     this.timelineAnchor = {
       sourcePositionSecs: plan.positionSecs,
       mediaTimeSecs: 0,
     };
-    await this.attachPlaylist(sought.playlist);
-    this.playIfRequested();
+    await this.switchGeneration({
+      session: this.session,
+      generation: sought.generation,
+      url: sought.playlist,
+    });
   }
 
   async setVolume(requestedVolume) {
@@ -1054,6 +1380,18 @@ export class VideoStreamViewer {
     this.menu.setMediaState(this.menuState());
   }
 
+  serverStatePrecedesTarget(mediaState, target = this.generationSwitch.currentTarget()) {
+    if (!target || target.generation === null) return false;
+    const stateSession = Number(mediaState?.session ?? this.session);
+    const stateGeneration = Number(mediaState?.generation);
+    return (
+      Number.isFinite(stateSession) &&
+      Number.isFinite(stateGeneration) &&
+      stateSession === target.session &&
+      stateGeneration < target.generation
+    );
+  }
+
   updateProgress() {
     const position = this.currentPosition();
     if (!this.draggingSeek) this.seekInput.value = String(position);
@@ -1108,13 +1446,18 @@ export class VideoStreamViewer {
         this.abortController.signal
       );
       if (this.destroyed) return;
+      if (this.serverStatePrecedesTarget(mediaState)) {
+        this.schedulePoll();
+        return;
+      }
       const generationChanged = Number(mediaState.generation) !== Number(this.generation);
       this.applyServerState(mediaState);
       if (generationChanged) {
-        await this.attachPlaylist(
-          `/stream/${this.session}/${mediaState.generation}/index.m3u8`
-        );
-        this.playIfRequested();
+        await this.switchGeneration({
+          session: this.session,
+          generation: mediaState.generation,
+          url: `/stream/${this.session}/${mediaState.generation}/index.m3u8`,
+        });
       }
       this.schedulePoll();
     } catch (error) {
@@ -1154,12 +1497,19 @@ export class VideoStreamViewer {
         this.abortController.signal
       );
       if (this.destroyed) return;
+      if (this.serverStatePrecedesTarget(mediaState)) {
+        this.playIfRequested();
+        this.schedulePoll();
+        return;
+      }
       const generationChanged = Number(mediaState.generation) !== Number(this.generation);
       this.applyServerState(mediaState);
       if (generationChanged) {
-        await this.attachPlaylist(
-          `/stream/${this.session}/${mediaState.generation}/index.m3u8`
-        );
+        await this.switchGeneration({
+          session: this.session,
+          generation: mediaState.generation,
+          url: `/stream/${this.session}/${mediaState.generation}/index.m3u8`,
+        });
       }
       this.playIfRequested();
       this.schedulePoll();
@@ -1190,10 +1540,8 @@ export class VideoStreamViewer {
     const restorePlaying = this.playRequested;
     const oldSession = this.session;
     this.clearPoll();
-    this.destroyHls();
-    this.video.pause();
-    this.video.removeAttribute("src");
-    this.video.load();
+    this.generationSwitch.cancel();
+    this.stopPlaylistPlayback();
     this.session = null;
     this.generation = null;
     if (oldSession) {
@@ -1459,22 +1807,28 @@ export class VideoStreamViewer {
 
   destroyHls() {
     this.clearPlaybackStartupWatch();
-    this.hls?.destroy();
+    const hls = this.hls;
     this.hls = null;
+    hls?.destroy();
+  }
+
+  stopPlaylistPlayback() {
+    this.destroyHls();
+    this.video.pause();
+    this.video.removeAttribute("src");
+    this.video.load();
   }
 
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
     this.abortController.abort();
+    this.generationSwitch.cancel();
     this.clearPoll();
     clearTimeout(this.waitingTimer);
     for (const timer of this.pendingTimers) clearTimeout(timer);
     this.pendingTimers.clear();
-    this.destroyHls();
-    this.video.pause();
-    this.video.removeAttribute("src");
-    this.video.load();
+    this.stopPlaylistPlayback();
     this.video.removeEventListener("timeupdate", this.onTimeUpdate);
     this.video.removeEventListener("playing", this.onPlaying);
     this.video.removeEventListener("canplay", this.onCanPlay);
