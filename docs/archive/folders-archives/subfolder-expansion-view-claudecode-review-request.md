@@ -81,7 +81,7 @@ HDD、ネットワーク共有、クラウド同期フォルダでは、並列 I
 
 ### 2. synthetic view の lifecycle
 
-以下が既存の読書履歴 / レーティング一覧 / Ctrl+G 検索結果 / スタック表示と矛盾しないか確認してください。
+以下が既存の閲覧履歴 / レーティング一覧 / Ctrl+G 検索結果 / スタック表示と矛盾しないか確認してください。
 
 - `items_are_subfolder_expansion_view` の追加位置
 - `subfolder_expansion_synthetic_path()` を `is_synthetic_view_path` に足す方針

@@ -2,7 +2,7 @@
 
 ## 1. 正本
 
-検索、★固定、サブ展開、スマートフォルダ、読書履歴、ブックマーク一覧、レーティング一覧は同じ `App.items`
+検索、★固定、サブ展開、スマートフォルダ、閲覧履歴、ブックマーク一覧、レーティング一覧は同じ `App.items`
 surface を共有する。現在の最上位 surface と一時ビューからの復元先は
 `app/top_level_grid_view.rs` の `TopLevelGridView` / `TopLevelGridRestore` を正本とする。
 個別の `active` / `items_are_*` flag と synthetic path は描画・既存経路との互換情報であり、

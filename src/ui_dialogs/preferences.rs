@@ -105,7 +105,7 @@ pub(crate) enum PreferencesPage {
     DuplicateFiles,
     ExifDisplay,
     SpreadMode,
-    /// 履歴と復元 (読書履歴、読書/再生位置の復元)
+    /// 履歴と復元 (閲覧履歴、読書/再生位置の復元)
     PlaybackResume,
     SusiePlugins,
     /// v0.8.0: 検索インデックスの速度プロファイル
@@ -567,11 +567,11 @@ pub(crate) struct PreferencesState {
     pub book_resume_clear_requested: bool,
     /// 直近の ZIP/PDF 読書位置削除結果。
     pub book_resume_clear_result: Option<String>,
-    /// 環境設定を開いた時点 / 削除後の読書履歴の記憶件数。
+    /// 環境設定を開いた時点 / 削除後の閲覧履歴の記憶件数。
     pub reading_history_entry_count: usize,
-    /// 読書履歴クリアを App 側へ伝える one-shot フラグ。
+    /// 閲覧履歴クリアを App 側へ伝える one-shot フラグ。
     pub reading_history_clear_requested: bool,
-    /// 直近の読書履歴削除結果。
+    /// 直近の閲覧履歴削除結果。
     pub reading_history_clear_result: Option<String>,
 
     // ── エクスプローラ連携ページ用 ──────────────────────────────
@@ -1811,7 +1811,7 @@ impl App {
             }
         }
 
-        // 履歴と復元ページ: 読書履歴クリア (one-shot)。
+        // 履歴と復元ページ: 閲覧履歴クリア (one-shot)。
         let mut clear_reading_history_requested = false;
         if let Some(ps) = self.pref_state.as_mut() {
             if ps.reading_history_clear_requested {
@@ -1828,18 +1828,18 @@ impl App {
                     }
                     Err(e) => Err(format!("{e}")),
                 },
-                None => Err("読書履歴 DB を開けませんでした".to_string()),
+                None => Err("閲覧履歴 DB を開けませんでした".to_string()),
             };
             if let Some(ps) = self.pref_state.as_mut() {
                 match result {
                     Ok((deleted, remaining)) => {
                         ps.reading_history_entry_count = remaining;
                         ps.reading_history_clear_result =
-                            Some(format!("読書履歴を {deleted} 件削除しました。"));
+                            Some(format!("閲覧履歴を {deleted} 件削除しました。"));
                     }
                     Err(err) => {
                         ps.reading_history_clear_result =
-                            Some(format!("読書履歴の削除に失敗しました: {err}"));
+                            Some(format!("閲覧履歴の削除に失敗しました: {err}"));
                     }
                 }
             }

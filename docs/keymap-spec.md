@@ -38,7 +38,7 @@ Shell 連携 (コピー / パスコピー / フォルダを開く) は入力経�
 `Action = none` を明示した場合は無効化として扱う。
 お気に入りの前後移動 / 1〜20 番を開く、現在位置のルートディレクトリを開く、
 `C:\`〜`Z:\` を開く、`C:`〜`Z:` の最後の場所へ切り替える、場所▼の固定項目
-(ドライブ一覧 / 読書履歴 / ★1〜★5 / 本棚フォルダ / デスクトップ / ピクチャ / ダウンロード)
+(ドライブ一覧 / 閲覧履歴 / ★1〜★5 / 本棚フォルダ / デスクトップ / ピクチャ / ダウンロード)
 、ピン留めタグ 1〜20 の付与/解除も標準キーなしのサムネイル一覧 Action として割り当てられる。設定名は
 `GridFavorite...` / `GridOpenFavorite...` / `GridOpenCurrentDriveRoot` / `GridOpenDrive...` /
 `GridSwitchDrive...` /
@@ -87,6 +87,13 @@ focus 方向を最初の focusable widget 登録前に `FocusDirection::None` �
 する。no-repeat の <kbd>Tab</kbd> は repeat event も発火させず除去する。
 `wants_keyboard_input()` の gate はこの消費より先に維持し、TextEdit / IME やフォーカス中 UI が
 キーボードを所有している間は KeySlot と egui event の双方を残す。
+ただし IME composition 中の <kbd>Esc</kbd> press だけは、各 egui Context の input plugin が
+`Memory::begin_pass` より前に RawInput から除去する。これは変換キャンセルを egui の focus
+navigation に見せず未確定文字の選択を保つためで、release は残す。続く `Disabled` に
+`Commit` が無い場合だけ、同じ plugin が空の `Preedit("")` を直前へ 1 回補う。
+非 composing 時と 300ms grace 中だけの Esc は除去せず、通常のパネル / モーダル操作へ渡す。
+composition state は viewport ごとに独立し、main / fullscreen / detached を共有する App Context と
+native presenter Context の両方へ同じ plugin を登録する。
 IME 中は Windows の Alt+文字を含むキー処理で TextEdit の focus が一時的に外れる場合があるため、
 `ime_focus` が直前 pass の helper-managed field を 1 pass の `FocusRecovery` owner として保持する。
 この owner は TextEdit の再描画前から keymap を抑止し、同じ pass で field の focus を復帰する。
@@ -99,9 +106,12 @@ pointer 等で focus が正当に移れば次 pass の通常 hover 判定へ戻�
 
 診断は通常 logger の `[text-input-key]` として恒久的に残す。helper field が focused または直前 pass で
 focused だった各 key press について、前後の widget id / egui focus、id 変化、resolved keyboard owner / phase、
-同 pass で左 side panel を閉じた call site を記録する。無修飾の文字 key と physical key は `Char` に
-マスクし、入力内容を復元できない形にする。通常 record は process あたり 1 MiB で抑止し、id / focus /
-owner / close の異常 record は上限後も記録する。helper focus contract がない pass は key event を走査しない。
+同 pass で左 side panel を閉じた call site を記録する。通常 record は process あたり 1 MiB で
+抑止し、id / focus / owner / close の異常 record は上限後も記録する。文字 key と physical key は修飾キーの有無に
+かかわらず `Char` にマスクする。パスワード等の機密 helper field は focus contract 自体が
+diagnostic policy を所有し、`key` / `physical_key` / `modifiers` をすべて `Redacted` として、
+field id / focus / owner / phase / close site と押下件数だけを残す。helper focus contract がない
+pass は key event を走査しない。
 
 開発者向けメモ: 新しいキーボード操作を追加・変更するときは、ユーザーから明示されて
 いなくても keymap 対応要否を確認する。通常ショートカットは `KeyAction` に追加し、
@@ -132,6 +142,15 @@ folder navigation accumulator (`MAX_PENDING_NAV = 5`) を使う。トグル、�
 edge の寿命は 1 フレームのままにする。Action が消費しなかった edge は次の `begin_frame()` で
 破棄し、後のフレームへ持ち越さない。無制限の backlog を作って「押していないのに後から動く」
 挙動を避けるため、`begin_frame()` の `frame.clear()` は維持する。
+
+Windows の edge queue は HWND / viewport 単位で配送する。メイン HWND は `ViewportId::ROOT`、
+fullscreen / detached の HWND はその `fullscreen_viewport_id()` と対応付け、subclass proc が edge を
+投入した時点で送信元 HWND と viewport を `KeyEdge` へ焼き付ける。consume / pressed / frame-state /
+Enter-held の各 API は対象 `ViewportId` を必須引数にし、別 viewport の edge は成立判定も消費も
+しない。HWND の `WM_NCDESTROY` では対応とその HWND 由来の未処理 edge を同じ owner が除去するため、
+再生成後の viewport へ stale edge を配送しない。未登録 HWND は全 viewport へ公開せず `ROOT` として
+配送して診断ログへ記録する。メイン HWND は subclass が edge を publish できる前に `ROOT` 対応を
+登録済みにすることを不変条件とする。
 
 ## 固定入力 / KeyAction 対象外の整理
 
@@ -253,7 +272,7 @@ modifiers はイベント発生時点の情報として残し、離散ショー�
 | <kbd>Home</kbd> / <kbd>End</kbd> | フルスクリーン中の先頭 / 末尾の項目へ移動する。Action: `FsJumpFirst` / `FsJumpLast`。動画 native presenter 経路でも App 側へ転送する |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ。同じ親の直下だけを対象にし、移動先に image-like があればフルスクリーンを維持して先頭 image-like を開く。なければ一覧へ戻る。切り離した detached 窓 / always-new 窓では、メイン bundle との境界をまたがないため無効化し案内だけ出す |
 | マウスホイール | 前 / 次のファイル。縦/横連結モードでは連結方向へスクロール |
-| マウス戻る / 進む / ホイールクリック | `Settings.ring_shortcuts.mouse_buttons_image` / `mouse_buttons_video` に従い、物理戻る / 進むボタンとホイールクリックを個別に割り当てる。画像フルスクリーンでは Home/End 相当の先頭 / 末尾移動、全画面ズームモードも候補に含む。ウィンドウ最小化は通常フルスクリーン / detached viewer / native video で利用でき、動画は最小化後も再生を継続する。画像 / 動画フルスクリーンのマウスボタン候補では `C:\`〜`Z:\`、お気に入り、読書履歴、★一覧などの場所移動系は表示しない。新規環境と既定リセットは戻る / 進むがフォルダ履歴、ホイールクリックは未割り当て。従来どおりを選んだ既存環境は戻る / 進むのみ Ctrl+↑ / Ctrl+↓ 相当。ホイールクリックは 500ms 以内かつドラッグしきい値以下の短クリックだけ発火し、中ボタンドラッグズームとは分離する。全画面ズームモードへ割り当てた場合、Z キー長押し時の照準表示はスキップして現在のカーソル位置でズーム状態へ入る |
+| マウス戻る / 進む / ホイールクリック | `Settings.ring_shortcuts.mouse_buttons_image` / `mouse_buttons_video` に従い、物理戻る / 進むボタンとホイールクリックを個別に割り当てる。画像フルスクリーンでは Home/End 相当の先頭 / 末尾移動、全画面ズームモードも候補に含む。ウィンドウ最小化は通常フルスクリーン / detached viewer / native video で利用でき、動画は最小化後も再生を継続する。画像 / 動画フルスクリーンのマウスボタン候補では `C:\`〜`Z:\`、お気に入り、閲覧履歴、★一覧などの場所移動系は表示しない。新規環境と既定リセットは戻る / 進むがフォルダ履歴、ホイールクリックは未割り当て。従来どおりを選んだ既存環境は戻る / 進むのみ Ctrl+↑ / Ctrl+↓ 相当。ホイールクリックは 500ms 以内かつドラッグしきい値以下の短クリックだけ発火し、中ボタンドラッグズームとは分離する。全画面ズームモードへ割り当てた場合、Z キー長押し時の照準表示はスキップして現在のカーソル位置でズーム状態へ入る |
 | マウス左クリック | (画像) ページめくり。LTR では右半分クリックで次 / 左半分クリックで前、RTL では左半分クリックで次 / 右半分クリックで前 / (動画) 再生・一時停止トグル |
 | マウス右クリック短押し | `Settings.ring_shortcuts.short_right_click_image` / `short_right_click_video` に従い、画像 / 動画別にフルスクリーンを閉じる（既定）/ 何もしない / 右クリックメニュー表示を実行する。右ドラッグのリング方向・登録ジェスチャが発火した場合は実行しない。グリッドは従来どおりメニュー、編集モードは編集操作を優先する固定入力で、この設定の対象外 |
 | <kbd>F1</kbd>〜<kbd>F5</kbd> / <kbd>F6</kbd> | 表示中アイテムへレーティング 1〜5 / 解除 |
@@ -294,6 +313,12 @@ detached viewer とメイングリッドが同時に表示される場合、ゲ�
 短クリック判定は開始面を保持し、同時表示中の別面に入力がないフレームで取り消さない。
 これらは `KeyAction` ではなく固定入力レイヤーの責務である。
 
+gilrs のゲームパッド入力は HWND / viewport へ配送されないグローバル入力なので、mIV 内の
+文字入力面を排他的に選ばない。root viewport、操作対象 viewer viewport、独自 egui Context を持つ
+native video / music overlay の `wants_keyboard_input` のいずれかが active なら、固定ゲームパッド
+操作全体を止める。native overlay の状態は presenter から既存 output event bus の latest-value
+snapshot として一方向 publish し、App から presenter Context を直接参照しない。
+
 | 入力 | 動作 |
 |---|---|
 | 方向パッド / 左スティック | グリッドでは選択移動。詳細一覧では上下が 1 行移動、左右が表示行数ぶん前後にスキップ。画像ではページ送り。縦連結では上下がスクロール、左右がページ送り。横連結では左右がスクロール、上下がページ送り。左スティックは連結方向を連続スクロール。動画では左右がシーク / タイルカーソル移動、上下が前後ファイル移動 |
@@ -301,7 +326,7 @@ detached viewer とメイングリッドが同時に表示される場合、ゲ�
 | <kbd>LB</kbd> / <kbd>RB</kbd> | Ctrl+↑ / Ctrl+↓ と同じ前 / 次フォルダ移動 |
 | <kbd>LT</kbd> / <kbd>RT</kbd> | グリッドでは連続スクロール、画像ではズームアウト / ズームイン、動画では連続シーク |
 | 右スティック上下 | 画像フルスクリーンのズーム。LT/RT より速め |
-| <kbd>Select</kbd> | グリッドでは場所リストを開き、ドライブ一覧 / 読書履歴 / 本棚フォルダ / 既知フォルダ / ドライブを上下で選んで <kbd>A</kbd> で移動する。画像フルスクリーンでは見開きモードを巡回切り替え (単ページ / 見開き 左→右 / 左→右(表紙あり) / 右→左 / 右→左(表紙あり))。動画フルスクリーンではブックマーク / チャプター / ピンの一覧を開き、上下で選んで <kbd>A</kbd> で移動する |
+| <kbd>Select</kbd> | グリッドでは場所リストを開き、ドライブ一覧 / 閲覧履歴 / 本棚フォルダ / 既知フォルダ / ドライブを上下で選んで <kbd>A</kbd> で移動する。画像フルスクリーンでは見開きモードを巡回切り替え (単ページ / 見開き 左→右 / 左→右(表紙あり) / 右→左 / 右→左(表紙あり))。動画フルスクリーンではブックマーク / チャプター / ピンの一覧を開き、上下で選んで <kbd>A</kbd> で移動する |
 | <kbd>X</kbd>+方向パッド / 左スティック | リングショートカット。<kbd>X</kbd> を押しながら方向を選び、<kbd>X</kbd> を離すと現在コンテキスト (グリッド / 画像フルスクリーン / 動画フルスクリーン) のスロットに設定された一発アクションを実行する。左スティックは軽く触れた程度では方向確定せず無方向扱い。方向なしで離すと専用ピッカーパネルを開き、方向で行選択/値変更、<kbd>A</kbd> で一覧を開くか一覧項目を選択、<kbd>X</kbd> / <kbd>B</kbd> で確定して閉じる。<kbd>B</kbd> でリング選択もキャンセルできる。<kbd>X</kbd> リング中とピッカー表示中の方向入力は通常ナビゲーションへ流さない |
 | <kbd>Y</kbd> | グリッドではフォルダツリーペインを開閉する。表示時は現在フォルダへツリーカーソルを移す。非表示にする時、ツリーカーソルが別フォルダへ動いていれば <kbd>A</kbd>/<kbd>Enter</kbd> 相当でそのフォルダへ移動してグリッドへ戻る (動いていなければ単に閉じる)。動画では S キー相当。画像では Y+左右で Ctrl+左右相当の見開き 1 ページずらし、Y+上下で Home/End 相当の先頭 / 末尾移動 |
 | フォルダツリー表示中の方向パッド / 左スティック / <kbd>A</kbd> | ツリーカーソルを上下左右に移動し、<kbd>A</kbd> で選択フォルダを開く。決定後はツリーを自動で閉じ、グリッドへ戻る |

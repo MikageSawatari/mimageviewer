@@ -14,6 +14,27 @@
 
 ## 1. 優先候補
 
+> **v2.10.0 で修正済み・未リリース (2026-08-02)**。出荷時にこのブロックごと、`対応済み` と
+> 付いた項目本文も削除する (§1.29 を消し忘れた再発防止)。
+>
+> 全部入り (項目本文を既に削除したものを含む):
+>
+> - §1.22 — 別ウィンドウ入力中にキーがそちらへ行き続ける (本文削除済み)。
+> - §1.32 **(A) / (B)** — 変換中 ESC の focus loss と未確定文字残留。
+> - §1.33 — 本として扱わないフォルダで既定の見開きが適用される (本文削除済み)。
+>   既定値のフォールバックだけ止め、明示保存された値は尊重する仕様で実装した。
+> - §1.34 — パスワード入力中のキー識別情報が診断ログに残る。
+> - §1.35-**1** — リネームジャーナルの UI スレッド同期 I/O。**2 (部分失敗の再試行) は残る**。
+> - §1.36 — ゲームパッドの文字入力ゲート (下記のとおり 3 面へ訂正して実装)。
+> - §1.37-**1** — トレイ WM_PAINT の背圧。**2 / 3 (processor cache / hide 所有者) は残る**。
+> - §1.38 **の「変更中...」表示のみ** — モーダル span の構造 (§1.31 と合流) は未対応で残る。
+> - §1.39-**1** — `update_prefetch_window` の双子の非対称。**2 の PDF 毎フレームコストは残る**。
+> - §1.40 — 閲覧履歴 (動画・音声を含める / 自動進行由来は記録しない / 改名)。
+> - §1.41 — 静止画縮小表示のシャープ優先 / モアレ抑制切替。
+>
+> **known-issues.html から消えるのは 3 見出し**: 入力・キー操作の 2 件と見開き。
+> 残るのは VST カーソル (§1.28) と MPEG シーク (§1.13)。
+
 ### 1.7 detached 中の発火面解決の残り (? / トースト / スタック) — BA 報告
 
 - 残り (P3、発火面の window_id 粒度が必要):
@@ -139,68 +160,6 @@
   - UI スレッドへ ZIP/PDF 列挙や SQLite 単件照会を追加しない。
 - 規模 / 優先度: Medium〜Large / P3。
 
-### 1.22 キー入力を viewport / HWND 単位でルーティングする (案D)
-
-- 出典: 2026-07-29 のキーボード所有権レビュー (Codex Sol 設計レビュー + ClaudeCode)。
-  正本は [keyboard-input-ownership-plan.md](keyboard-input-ownership-plan.md)。本項は同計画の
-  §6「対象外」として切り出したもの。
-- 背景: 現状 Win32 の `KeyEdge` キューは全インストール HWND で共有され、送信元 HWND / viewport を
-  持たない ([src/key_input.rs](../src/key_input.rs))。IME 状態も `App` に 1 組しかなく、
-  各 viewport の入口から更新される。そのため「root ctx はキーボード不要、child ctx は TextEdit
-  編集中、物理キーキューはどちら由来か不明」という組み合わせが成立し得る。
-- 対応案: `KeyEdge` に送信元 HWND / viewport を持たせ、root / fullscreen / detached が
-  **自分由来の edge だけ**を消費する。IME 状態も `ViewportId -> ImeState` へ分離する。
-- 前提: **案A (`KeyboardOwner` / `ShortcutPermit` の単一ゲート) の完了後**に着手する。
-  案A で所有権判定が一元化されていれば、本項は「どの viewport の所有権か」を正しくするだけの
-  変更に縮む。
-- 影響範囲: Windows native 入力、egui viewport、detached / native presenter。HWND 再生成や
-  viewport lifecycle への対応が要る。detached リワークとの調整も必要
-  ([detached-rework-plan.md](detached-rework-plan.md) §2 / §11)。
-- **実機で確認した症状 (2026-08-01)**: F12 別ウィンドウで動画のブックマーク名を編集中に、
-  メインウィンドウをクリックしてそちらを操作しても、**キーが別ウィンドウのテキストエリアへ
-  行き続ける** (矢印キーがそちらの caret を動かす)。上の「root ctx はキーボード不要、child ctx は
-  TextEdit 編集中、物理キーキューはどちら由来か不明」がそのまま出た形。**v2.9.0 から同じ挙動**。
-- **利用者体験の観点** (優先度を再判断するときはこれも見ること): 編集中の別ウィンドウが
-  **視界に入っていないと、アプリ全体が壊れたと誤解する**。「入力欄を閉じれば直る」と気づく
-  手がかりが画面上に無い。技術的な影響範囲が狭くても、体感的な深刻度はこの分だけ高い。
-- 前提の進捗: 案A は v2.9.1 の `56db11bc` で pass 単位の所有者決定と生キーの permit 化まで入った。
-  IME 状態も viewport ごとへ分離済み。**本項は「どの viewport の所有権か」を正しくするだけに
-  縮んでいる**はず。
-- 併せて直す: [§1.32](#132-ime-変換中の-esc-が期待どおりに働かない-2-件) の IME 2 件。同じ領域なので
-  一括で設計する。
-- 規模 / 優先度: Large / P2 candidate。
-### 1.27 presenter スレッドが UI スレッドの窓の子 HWND を所有したままブロックする
-
-- 構造修正の設計: [Native video HWND ownership / pump 分離計画](native-video-window-thread-plan.md)。
-- 出典: 2026-07-29 のハング解析 (`cdb -pv` で両スレッドのスタックを実測)。
-- 症状: 動画をフルスクリーンで開いた直後に窓を閉じる / 切り替えると、アプリ全体が
-  完全に固まる。CPU はほぼ 0 で、`panic.log` に `UI THREAD HANG suspected` が 10 秒ごとに
-  出続ける。強制終了以外に復帰しない。
-- 実測した環:
-  1. UI スレッドが動画ビューア窓に `DestroyWindow` を呼ぶ
-     (`winit public_window_callback_inner::closure$4` → `NtUserDestroyWindow`)。
-  2. その窓の**子** `mIVNativeVideoWindow` は `native-video-presenter` スレッドが所有して
-     いる。子の破棄と活性化の移動は所有スレッドへの**同期メッセージ**になるため、
-     UI スレッドは `WM_ACTIVATE` → `DefWindowProcW` → `NtUserMessageCall` で待ちに入る。
-  3. presenter スレッドはそのとき D3D11 の中で待っている。実測したスタックは
-     `AcquireSync` → `NDXGI::CDevice::DXGIAcquireSync` → `CDevice::Flush` → nvwgf2umx →
-     `WaitForSingleObject`。
-  4. 相互待ちで永久ハング。
-- 構造的な問題: **HWND を所有するスレッドがメッセージを回さずにブロックし得る**こと。
-  presenter スレッドは GPU 待ちを含む処理を常に行うので、UI スレッド側のどんな窓操作
-  (破棄 / 活性化 / フォーカス / IME) でも同じ環が成立する。keyed mutex のタイムアウト値では
-  防げない (実測では 10ms 指定で 75 秒以上ブロックした。待っているのは `AcquireSync` 内部の
-  `Flush` で、タイムアウトの管轄外)。
-- 対応案 (どちらかを選ぶ):
-  1. **子 HWND を UI スレッドで作る**。presenter スレッドは GPU 処理だけを持ち、窓を
-     所有しない。Win32 の原則 (窓を持つスレッドはメッセージを回す) に沿う。
-  2. presenter スレッドで**ブロックし得る呼び出しを一切行わない**ことを保証する。
-     現実的には難しく、1 のほうが構造的。
-- Stage 4 後の運用制約: pump thread では GPU API を呼ばない。held frame の再提示にも
-  re-arm 用 `AcquireSync` を追加せず、reader key の維持と producer 側回復を使う
-  (`docs/video-architecture.md` の `FramePresentationState` 節参照)。
-- 規模 / 優先度: Medium〜Large / **P1** (ハード ハングのため)。
-
 ### 1.28 presenter の上に別の窓が乗るとカーソル auto-hide が解除されない
 
 - 出典: v2.9.1 リリース前の §7.2 実機確認 (2026-08-01)、シナリオ 5 (VST GUI) の最中。
@@ -239,52 +198,6 @@
   今回の発生は事後確認できなかった。§7.3 の health detection に `cursor_hidden` /
   `cursor_within_client` / `cursor_last_activity` / 直近の placement 遷移を含める。
 - 規模 / 優先度: Medium / **P2**。データ喪失は無いが、再生を止めるまで操作感が壊れる。
-
-### 1.29 見開き PDF の片ページが「読み込み中」のまま完走しない (再入ループ)
-
-- 出典: v2.9.1 リリース前の実機確認 (2026-08-01)。利用者報告 =「見開きの片ページが 10 秒以上
-  読み込み中のまま。スライダーを動かしたら表示された」。ログで再現痕跡を確認済み。
-- **リリース済み v2.9.0 の挙動**である (`git show v2.9.0:src/app.rs` に同じ早期 return がある)。
-  導入は `7c3a9363` "Unify PDF retained page cache"。
-- ログ証跡 (`open_fullscreen: idx=19` 直後から約 50 秒、合計 23,000 行弱):
-  - idx=19 (見開きの片方、final-AI が retained にある側) — **15,240 回**
-    `[PDF] Retained page final-ai available idx=19 reason=start_fs_load_skip_pdf_render`
-  - idx=20 (もう片方、実際に止まって見えた側) — **7,576 回**
-    `Retained page miss idx=20 ... target_px=2376 entries=10 reason=start_fs_load/resolution_mismatch`
-    と、その都度の `fs pdf render cancelled/interrupted Page 21` (スレッド番号が毎回加算)。
-  - 同区間で `[SLOW FRAME]` 39 回。
-- **確定している壊れた前提 (idx=19 側)**: 呼び出し側の再入ガードは
-  [ui_fullscreen.rs](../src/ui_fullscreen.rs) の
-  `if !self.fs_cache.contains_key(&idx) && !self.fs_pending.contains_key(&idx)` である。
-  ところが [app.rs](../src/app.rs) の `start_fs_load` にある
-  `has_retained_pdf_final_ai_for_current_params(idx)` の早期 return は、**`fs_pending` へ
-  登録しないまま return する**。したがって cache にも pending にも入らず、ガードが毎フレーム
-  通り、`start_fs_load` が延々と呼ばれ続ける。**「retained にあるから描画不要」と
-  「ロードが完了した」を同じ経路で表現できていない**のが構造的な誤り。
-- **確定した再入経路 (idx=20 側)**: 原因は
-  `pdf_target_changed` → `update_prefetch_window(fs_idx=19)`。`update_prefetch_window` は
-  `!fs_cache.contains_key(current_idx)` だけで現在ページをロード中と判定し、その間は current 以外の
-  `fs_pending` を全て remove + cancel する。idx=19 は retained final-AI から表示できる一方で
-  `fs_cache` には入らないため、各描画 pass で idx=20 の pending が落ち、次の見開きロードガードが
-  idx=20 を再投入していた。実ログの `211.018s` (idx=19 open) から `257.744s` (補正変更) まで
-  46.726 秒を再集計すると、idx=20 の `resolution_mismatch` は 7,576 回、Page 21 の cancel は
-  7,516 回、同区間の `Retained page evict` / idx=20 store / Page 21 render 完了はすべて **0 回**。
-  よって候補 2 の満杯 store による相互 evict は当該再入の原因ではない。source inspection でも、
-  current の完了が無い同区間に別 idx の pending を反復除去できる call site はこの経路だけである。
-- **症状パッチにしないこと**: 解像度一致判定 (`0.9..=1.1`) の閾値を緩める、キャンセルを止める、
-  再入を時間で抑制する、はいずれも根本原因に対応しない。producer (retained store / render 完了) と
-  consumer (表示・再入ガード) が「このページは表示可能か」について**同じ 1 つの状態**を見る形に
-  集約する。`fs_cache` / `fs_pending` / retained store の 3 つが別々に答えている現状が原因。
-- 関連: [final-composite-budget-thrash-plan.md](final-composite-budget-thrash-plan.md) と同じ
-  「再計算 → 破棄 → 再計算」の系統。ストアは別 (あちらは連結読みの texel 予算、こちらは PDF
-  retained page) だが、対策の考え方は流用できる可能性がある。
-- 完了条件 / 回帰テスト:
-  - 見開き表示で、両ページとも操作なしで表示に到達する (待つだけで完走する)。
-  - `start_fs_load` が同一 idx / 同一パラメータで毎フレーム再入しない状態遷移テスト。
-  - retained store が満杯のとき、見開きの 2 ページが相互に evict し合わない。
-  - 早期 return 経路でも、呼び出し側の再入ガードが「もう呼ばなくてよい」と判定できる。
-- 規模 / 優先度: Medium / **P1**。ページが表示されず、待っても直らない (操作して初めて解ける)。
-  副次的に毎フレームのスレッド生成と PDF レンダ投棄で CPU を焼く。
 
 ### 1.30 native video Stage 5 の再投入条件 (revert 済み、原因未確定)
 
@@ -339,8 +252,12 @@
   次の acquire が待たされる。
 - 効果: 窓の owner / z-order / visibility を動かす操作、DWM 合成の切替 (Independent Flip / MPO)、
   device-loss 周辺のいずれかが絡むと、**同期メッセージ 1 通で UI が任意時間停止し得る**。
-  §1.27 が「presenter スレッドが窓を持ったままブロックする」だったのに対し、こちらは
-  「UI スレッドが自分の窓のメッセージ処理中に GPU で止まる」。**同じ上位の破綻の別の面**。
+  Stage 4 で閉じた側 (presenter スレッドが窓を持ったままブロックする) に対し、こちらは
+  「UI スレッドが自分の窓のメッセージ処理中に GPU で止まる」。**同じ上位の破綻の別の面**で、
+  Stage 4 の pump 分離では届かない。
+- Stage 4 以降の運用制約 (維持すること): pump thread では GPU API を呼ばない。held frame の
+  再提示にも re-arm 用 `AcquireSync` を追加せず、reader key の維持と producer 側回復を使う
+  ([video-architecture.md](video-architecture.md) の `FramePresentationState` 節)。
 - 方向 (Codex 案):
   - wndproc は damage / resize / redraw 要求を記録して**即 return** する。
   - 実描画は外側の event-loop 境界へ post して coalesce する。
@@ -356,64 +273,303 @@
 - 規模 / 優先度: Large / **P1 candidate (基盤)**。次版で Web 配信とコンテナ詰め替えを載せる前に
   方針を決めておく。
 
-### 1.32 IME 変換中の ESC が期待どおりに働かない 2 件
+### 1.32 対応済み: IME 変換中の ESC が期待どおりに働かない 2 件
 
 - 出典: v2.9.1 リリース前の実機確認 (2026-08-01)。**どちらも v2.9.0 から同じ挙動**で、v2.9.1 の
   退行ではない。`829ba729` で入れた IME helper は単一行欄を揃えたもので、下記 2 件は範囲外だった。
-- **(A) 複数行の注釈本文で、変換中 ESC を押すとテキストエリアの focus まで外れる**。
-  ブックマーク名などの単一行欄では focus が残るので挙動が非対称。
-  - 原因: 吹き出し本文 ([ui_text.rs](../src/ui_text.rs) の `TextEdit::multiline(&mut t.text)`) は
-    [ime_focus.rs](../src/ime_focus.rs) の raw TextEdit allowlist に「Enter 改行と caret 操作を
-    所有する注釈本文の複数行 editor」として**意図的に登録**されており、helper の focus 復帰
-    (IME キー由来の一時的な focus loss を戻す処理) が効かない。
-  - 直し方: helper に複数行版を用意する。exemption の理由どおり **helper の Enter/submit 意味論が
-    複数行と噛み合わない**ので、focus 復帰だけを切り出せる形にする必要がある。
-- **(B) 変換中 ESC を押しても未確定文字がテキストに残る** (「あああ」+ ESC で「あああ」が残る)。
-  期待は未確定分が消えること。
-  - 原因: egui の `TextEdit` は preedit を**バッファへ直接書き込み**、消去は空の `Preedit("")` を
-    受け取ったときだけ行う (egui 0.33.3 `widgets/text_edit/builder.rs` の
-    「Empty prediction can be produced when user press backspace or escape during IME, so we clear
-    current text」というコメントがその前提を明示)。`ImeEvent::Disabled` のハンドラは
-    `ime_enabled = false` にするだけで**テキストを消さない**。この環境の ESC では
-    `Preedit("")` が来ず `Disabled` だけが届くため残る。
-  - 直し方: `ime_focus` は既に viewport ごとに composition 状態を持っているので、
-    **composing 中に `Commit` を伴わない `Disabled` を観測したら、その直前に空の `Preedit("")` を
-    挿入する**。egui が本来想定している経路に戻すだけで、症状パッチではない。
-  - ⚠️ **注意**: `Preedit("")` は `delete_selected()` を呼ぶので、composition が無いときに撃つと
-    **ユーザーの選択範囲を消す**。自前の composing 判定で厳密にゲートし、unit test で固定すること
-    (`ime_focus.rs` に合成 Ime イベントを流すテストの前例がある)。
-- **§1.22 と一緒に設計すること**。3 件とも「IME と入力所有権」という同じ領域で、§1.22 を直すときに
-  viewport ごとの IME 状態と focus の扱いを触る。バラバラに直すより一括のほうが筋が良い、と
-  2026-08-01 に判断してこの版では見送った。
-- 規模 / 優先度: (A) Medium / (B) Small / どちらも P2。データ喪失はなく、利用者は手で消せる。
+- **対応 (2026-08-01)**: App / native presenter の両 egui Context に同じ input plugin を登録し、
+  viewport ごとの composition state を単一 ownership で追跡する。composing 中の Esc press は
+  `Memory::begin_pass` より前に RawInput から除去し、release は残す。これにより未確定文字の
+  選択を保ち、Commit の無い composing `Disabled` の直前へ空の `Preedit("")` を 1 回だけ補える。
+  非 composing Esc と 300ms grace 中だけの Esc は除去しない。
+- **(A) の確認**: helper 対象外の raw `TextEdit::multiline` を使う回帰テストで、変換中 Esc の
+  pass 後も focus が残り、遅延 `Disabled` で未確定文字だけが消えることを固定した。複数行 helper の
+  追加変更は不要だった。
+- **(B) の確認**: composing / 非 composing / Commit / `Disabled` / 1 回だけの空 preedit /
+  viewport 分離を plugin 境界の unit test で固定した。
 
-### 1.33 本として扱わないフォルダでも既定の見開き設定が適用される
+### 1.34 パスワード入力中のキー識別情報が診断ログに残る
 
-- 出典: v2.9.1 リリース前の実機確認 (2026-08-01)。**v2.9.0 から同じ挙動**で、v2.9.1 の退行ではない。
-- 症状: 「画像のみのフォルダを本として扱う」が**オフ**のとき、および**オンでも画像以外の
-  ファイルがあるフォルダ**で、画像を開くと既定の見開き設定が適用されてしまう。
-  本として扱わないフォルダで見開きになるのは意図した動作ではない。
-- 使うべき述語は既にある: [app.rs](../src/app.rs) の `page_order_locked_for_current_view()` が
-  上記 2 条件をそのまま覆う (`auto_fullscreen_image_folders_enabled()` と
-  `items.iter().all(GridItem::Image)` の両方を見る)。
-- **⚠️ 素直にゲートすると本が壊れる**: 見開き設定の復元は `apply_spread_for_key` 経由で
-  **`start_loading_items` の中、items を読み込む前**に走る。その時点で `self.items` は空なので
-  述語の `!self.items.is_empty()` に引っかかって **false を返し、本物の本 (画像のみフォルダ)
-  でも見開きが効かなくなる**。直そうとしたバグより悪い結果になる。
-- 直し方 (どちらか):
-  1. **フォルダ走査から本判定を引き継ぐ**。`folder_scan` は既に `is_image_only_book_contents` を
-     計算しているので、その結果を spread 復元まで渡す。
-  2. **items 読み込み完了後に見開きを再適用する**。復元のタイミング自体を動かす。
-  どちらも読み込みシーケンスの構造変更になる。1 のほうが判定の出どころが 1 つで済む。
-- **未決の仕様判断**: 非本フォルダに**明示的に保存された**見開き設定は尊重するか。既定値の
-  フォールバックだけを止めるのか、保存値も無視するのか。着手前に決めること。
+- 出典: v2.9.1 出荷後の他セッションレビュー (2026-08-01、Codex)。**本セッションで source
+  inspection により確認済み**。
+- 壊れている前提: [ime_focus.rs](../src/ime_focus.rs) の `diagnostic_key_identity` は
+  **`modifiers.is_none()` のときだけ** 文字キーを `Char` へ匿名化する。修飾キーを伴う入力は
+  `DiagnosticKeyIdentity::Named(key)` になり、`key=` / `physical_key=` / `modifiers=` が
+  そのままログへ出る。つまり「文字は伏せる」という意図が、Shift や AltGr を使った瞬間に破れる。
+- 機密欄が同じ経路に乗っている: PDF ([pdf_password.rs](../src/ui_dialogs/pdf_password.rs)) と
+  書庫 ([archive_convert.rs](../src/ui_dialogs/archive_convert.rs)) のパスワード欄は
+  どちらも `ime_focus::add_singleline` で描いており、helper 管理欄なので診断対象になる。
+  `.password(true)` は**画面の伏せ字だけ**で、診断経路には効かない。
+- 露出の広さ: `log_key_diagnostic` の routine 記録は 1MB/プロセスで打ち切られるが、
+  **anomaly 記録は無制限**。`diagnostic_is_anomalous` の条件に「対象欄が focus を失った」が
+  含まれるため、パスワードダイアログのように focus が動く場面はむしろ anomaly 側へ倒れやすい。
+  ログは診断 ZIP に同梱されるため、利用者が送付した時点で外部へ出る。
+- 直し方: 匿名化の条件を「修飾キーの有無」から切り離す。文字キーは修飾の有無によらず
+  `Char` とし、機密欄では key 識別情報を一切残さない (欄そのものを診断対象外にするか、
+  `Char` すら出さない段階を設ける)。**修飾キー自体の記録も、機密欄では落とす**
+  (`modifiers=SHIFT` だけでも大文字・記号の位置が漏れる)。
+- 併せて見直す (N-8): 診断ログ全体のノイズ量。anomaly 記録が無制限であること、v2.9.1 で
+  health watchdog のログ (`append_panic_log_entry`、10 秒レート制限) が加わったことを含め、
+  利用者からログを受け取る運用に対して総量が妥当かを一度判断する。
 - 完了条件 / 回帰テスト:
-  - 本として扱うフォルダ (設定オン + 画像のみ)、ZIP / PDF / 変換アーカイブ、製本した本では
-    従来どおり見開きが効く。
-  - 設定オフのフォルダ、画像以外を含むフォルダでは既定の見開きが適用されない。
-  - `start_loading_items` の時点で判定が確定していること (items 未読込に依存しない) を
-    状態遷移テストで固定する。
-- 規模 / 優先度: Medium / P2。v2.9.1 では見送り (読み込み経路の構造変更になるため)。
+  - `Shift` / `AltGr` 併用の文字キーで `key=` / `physical_key=` に文字が出ない unit test。
+  - パスワード欄が focus を失う (= anomaly になる) 経路でも文字が出ないこと。
+- 規模 / 優先度: Small / **P1**。データ喪失ではないが情報漏えい経路であり、
+  **通常のバックログ扱いにせず v2.9.2 などの早いパッチで出す**ことを推奨する。
+
+### 1.35 リネーム移行ジャーナルの永続化 2 件
+
+- 出典: v2.9.1 出荷後の他セッションレビュー (2026-08-01、Codex)。両方とも source inspection で確認済み。
+  1. **対応済み (v2.10.0): UI スレッドでの同期 I/O (P2)**: [app.rs](../src/app.rs) の
+     `persist_rename_migration_journal` / `ensure_rename_migration_journal_loaded` は
+     `rename_key_migration::journal_save` / `journal_load` を同期で呼び、その中身は
+     `std::fs::read` / `write` / `remove_file` / `rename`。呼び出し元は
+     `poll_rename_migration_pending` などの UI スレッド経路である。小さな JSON なので通常は
+     短いが、ウイルス対策・低速ディスク・プロファイル同期の影響下では UI が止まる。
+     CLAUDE.md の「UI スレッドで同期 I/O を行わない」方針にも反する。
+     対応 = App が in-flight + queue + boot-retry の完全 snapshot を組み立てる所有境界は維持し、
+     書き出しだけを単一 latest-value worker へ移した。worker は revision 順に直列保存し、I/O 中の
+     中間 snapshot は最新値へ coalesce する。起動時 load は回復 entry を新規保存で消さない lazy guard を
+     優先して同期 1 回を維持し、通常 update の保存経路は enqueue のみ。終了時は最新 revision まで flush する。
+  2. **部分失敗が再試行されない (P2、仕様判断あり)**: worker が `panicked` を返したときだけ
+     ジョブを `rename_migration_boot_retry` へ戻す。`report.errors` に個別ストアの失敗が
+     入った場合はトーストを出すものの、ジョブは完了扱いでジャーナルから消える。一時的な
+     DB ロックや I/O エラーだと、編集結果やパス依存設定の一部が旧パスに残ったまま再起動でも
+     回復しない。
+     - **これは現状のコードコメントが明記している意図的な選択**である
+       (「per-store エラーは通常経路と同じ best-effort = 再試行しない」、v2.3.0 角度⑤ 検収時の判断)。
+       したがって着手前に「一時エラーと恒久エラーを区別できるか」「再試行の上限をどう置くか」を
+       決めること。無条件の再試行は、決定的に失敗するストアで無限ループになる。
+     - 移行処理自体は冪等に設計されているので、失敗ストアを保持して再試行する形にはできる。
+- 規模 / 優先度: 1 = Small〜Medium / P2、2 = Medium / P2 (仕様判断を先に決める)。
+
+### 1.36 ゲームパッドの文字入力ゲートは 3 面の union が必要 (2026-08-01 訂正)
+
+- 前段の誤った前提: viewer 宛なら fullscreen / detached viewport、そうでなければ root viewport
+  という排他選択で十分と考えた。しかし gilrs は App が直接 poll するグローバル入力で、
+  OS の keyboard routing を通らない。正しい不変条件は **mIV 内のどこかで文字入力中なら止める**。
+- 文字入力面は 3 つある。
+  1. App root viewport (一覧・ダイアログ)。
+  2. App fullscreen / detached viewport (静止画パネル)。
+  3. native video / music presenter overlay。これは `egui::Context::default()` で独自 Context を持ち、
+     App の `Context::data` からは viewport id を変えても見えない。実機ログでも detached 動画の
+     ブックマーク名入力は overlay 側 ROOT (`FFFF`) として観測され、App detached viewport (`39E5`) と別だった。
+- keyboard は presenter の `NativeOverlayInputRouting` が `wants_keyboard_input` / `text_input_active` を見て
+  App 転送を止めるが、ゲームパッドは presenter を経由しないため以前からこの保護を素通りしていた。
+- 対応: root と対象 viewer viewport の IME state を常に union し、さらに presenter が既に公開する
+  `NativeOverlayInputRouting::wants_keyboard_input` を既存 output event bus の latest-value snapshot として
+  App へ一方向 publish する。3 条件は `gamepad_text_input_active` だけが所有し、呼び出し側へ分散させない。
+  presenter Context の統合、presenter→App 直接参照、新しい逆向き channel は行わない。
+- 回帰テスト: root composing、viewer composing、presenter `wants_keyboard_input`、全て inactive の 4 状態を
+  1 つの predicate test で固定し、snapshot publish が semantic event として App へ漏れないことも固定する。
+- 規模 / 優先度: Small / P2。前段差分を本訂正で置換。
+
+### 1.37 トレイ常駐再生まわりの所有境界 3 件
+
+- 出典: v2.9.1 出荷後の他セッションレビュー (2026-08-01、ClaudeCode)。source inspection で確認済み。
+  v2.9.1 で「トレイ格納中も再生を続ける」経路を新設したことで、いずれも**この版から初めて
+  実際に通る**組み合わせになった。
+  1. **対応済み (v2.10.0) / P2: WM_PAINT ブリッジに背圧が無い**。[tray.rs](../src/tray.rs) の常駐ループは 50ms ごとに
+     `PostMessageW(WM_PAINT)` を投げるが、**未処理の wake を数えていない**。posted WM_PAINT は
+     無効領域由来のものと違って合体されないため、隠れている間の `App::update` が 50ms を
+     超えると投函が消費を上回る。戻り値は `let _ =` で捨てているので、スレッドの posted message
+     queue が溢れても検出できない。
+     対応 = `resident_media_wake_pending` を既存共有 atomic 群へ追加し、tray thread が false→true を
+     claim できた 1 件だけ投函、`App::update` 入口で ack する構造にした。可視化・wake 不要化・
+     `PostMessageW` 失敗では pending を reset し、失敗ログは状態変化時だけ出す。
+  2. **P3: 再生継続中に video processor cache を落とす**。
+     [tray_integration.rs](../src/tray_integration.rs) の `release_gpu_resources` は
+     detached 早期 return より前で `release_idle_pools()` を呼び、その中の
+     `processor_cache.take()` は**無条件**である (`hw_frames_pool.clear()` と
+     `shared_output_pool.retain(in_use)` は refcount 上安全)。
+     ⚠ **呼び出し順自体は v0.9.1 (`287eea9f`, 2026-05-19) からで、v2.9.1 で動かしたわけではない**。
+     新しいのは「格納中も再生が続く」ことのほうで、その結果この経路が再生中に走るようになった。
+     トレイ格納の瞬間に video processor の作り直しが 1 回入るはずで、実害は小さい。
+  3. **P3: 外部 hide 検出が tray 所有権に追随していない**。[app.rs](../src/app.rs) の
+     `IsWindowVisible` 追従分岐は `viewer_session_is_detached_or_switching()` だけで heartbeat
+     suspension を決め、`sync_media_presenter_visibility_for_tray()` /
+     `sync_retained_viewport_visibility_for_tray()` を呼ばない (これらは `hide_to_tray` /
+     復帰経路にしか無い)。同フレーム後半の `sync_tray_resident_media_wake()` が**値が変化した
+     ときだけ**自己修復するので実害は出にくいが、hide の所有者が 2 つある状態である。
+- 規模 / 優先度: 1 = Small / P2、2 と 3 = Small / P3。
+
+### 1.38 ネイティブ名前ダイアログが `App::update` の内側でモーダルを回す
+
+- 出典: v2.9.1 出荷後の他セッションレビュー (2026-08-01、ClaudeCode)。source inspection で確認済み。
+- 何が問題か: [rename_item.rs](../src/ui_dialogs/rename_item.rs) の
+  `show_rename_dialog_window` は `loop` の中で `native_name_dialog::prompt_name`
+  (`DialogBoxIndirectParamW` = 独自のモーダルメッセージループ) を呼び、バリデーション失敗の
+  たびに再表示する。`App::update` は `WM_PAINT` → `RedrawRequested` の同期 dispatch から
+  呼ばれるので、**wndproc の内側で無制限長のモーダルが回る**。
+  §1.31「UI スレッドが自分のメッセージ処理中に任意時間止まる」構造の一種なので、
+  **§1.31 の設計を決めるときに一緒に見る**のが筋が良い。
+  なお rename 自体は `rename_item_async` で worker 化されており、ここは**ダイアログの
+  モーダル span だけ**の問題である。
+- **副次的な退行は対応済み (2026-08-01)**: 既存 `rename_pending` を左下の進捗 overlay に接続し、
+  シェル rename 実行中の「変更中...」表示を復帰した。モーダル構造は変更していない。
+- 規模 / 優先度: Medium / P2 (§1.31 に合流)。残るのはモーダル span の構造だけ。
+
+### 1.39 見開き / 先読みの残り 1 件 (`9590b661` の続き)
+
+- 出典: v2.9.1 出荷後の他セッションレビュー (2026-08-01、ClaudeCode)。source inspection で確認済み。
+  1. **対応済み (2026-08-01)**: paged 側も `current_loading` で sibling pending を cancel した後、
+     return 前に `ensure_fs_page_load(current_idx)` で current producer を再確認する形へ統一した。
+     current が `NeedsLoad` の状態遷移テストで、cancel だけで終わらず `LoadPending` になることを固定した。
+  2. **P3: `fs_page_load_state` が PDF ページで毎フレーム String を作る**。
+     `has_retained_pdf_final_ai_for_current_params` → `retained_pdf_page_key_for` →
+     `metadata_cache_key(idx)` が String を生成し、HashMap を引く。
+     ⚠ **レビュー報告より実コストは小さい**: `effective_params` / `final_ai_key_for_pixels` は
+     retained cache に**該当エントリがあるときだけ**走る (無ければ `?` で抜ける)。
+     非 PDF は `items.get` + `matches!` で即 return なので無コスト。
+     とはいえ PDF フルスクリーンでは `update_prefetch_window` の current、prefetch ターゲット
+     全件、連結読み keep 範囲ループ全件、見開きパートナーから毎フレーム走るため、
+     key を 1 回作って使い回す形にできるかは見ておく。
+- 規模 / 優先度: 残る 2 は Small / P3。
+
+### 1.41 対応済み: 静止画縮小表示のシャープ優先 / モアレ抑制切替
+
+- **対応 (2026-08-02)**: 画像補正パネルのフィルタへ既定 ON のモアレ抑制チェックと
+  0.0〜1.5 の強度を追加。OFF は mip chain を保持したまま level 0 固定で読み、主表示、
+  wipe/diff 比較、360度パノラマの各 shader を同じ明示 uniform フラグで切り替える。
+  既定 ON / 0.0 は従来の bias 0.0 sampling を維持し、切替で texture 再 upload や
+  cache invalidation を行わない。
+
+- 出典: 5ch 専用スレ #153 (2026-08-02)。ZipPla と mImageViewer の同一ページ比較で、
+  mIV 側が少しぼやけて見えるという報告。提示画像では右側 (mIV) の細線・文字・トーンが
+  左側 (ZipPla) より低周波寄りに均されており、v2.7.0 で導入した GPU mipmap 縮小の影響が
+  出ている可能性が高い。元画像 / 表示倍率 / 補正設定は未確認のため、mipmap だけが原因とは
+  断定しない。
+- 方針:
+  1. 設定 UI は複雑にしない。画像補正パネルの「フィルタ」内を次の形へ整理する。
+     - `□ 縮小表示のモアレを抑制する`
+     - `より強く抑制: 0.0〜1.5`
+  2. 既定は **モアレ抑制 ON / より強く抑制 0.0**。0.0 は「抑制なし」ではなく、
+     **GPU 標準の mipmap 縮小**を意味する。既存の `image_mipmap_lod_bias = 0.0` と同じ
+     画質を維持し、v2.7.0 以降の既定挙動を急に変えない。
+  3. チェック OFF は、mip chain を作っていても表示時に **mip level 0 固定**で読む
+     シャープ優先モードにする。従来の bilinear 1-mip 縮小に近く、線は立ちやすいが
+     トーンのモアレ / ちらつきは戻りやすい。
+  4. チェック ON かつ値 > 0.0 は、現行の `image_mipmap_lod_bias` と同じく標準より粗い
+     mip level へ寄せる。値を上げるほどモアレは減るが、細部は柔らかくなる。
+- 実装メモ:
+  - managed texture は `DISPLAY_IMAGE_TEXTURE_OPTIONS` のまま完全 mip chain を生成してよい。
+    OFF 時は sampler の `lod_min_clamp` / `lod_max_clamp` または shader 側の
+    `textureSampleLevel(..., 0.0)` 相当で level 0 固定にする。texture 再生成なしで切り替え
+    られる経路を優先する。
+  - 比較 callback / 360 度パノラマは独自 shader / sampler を持つため、同じ設定が効くように
+    別途適用する。`PostFilter::Nearest`、動画、サムネイル、animated frame は既存どおり対象外。
+  - 既存 `image_mipmap_lod_bias` は「より強く抑制」の値として維持し、チェック ON/OFF 用の
+    bool 設定を追加するのが自然。旧設定しか無い環境では ON として読む。
+- 完了条件 / 回帰テスト:
+  - 既定設定 (ON / 0.0) で v2.9.1 までの縮小表示と同等になる。
+  - OFF で level 0 固定になり、線のシャープさが戻る一方、モアレ抑制が弱まることを手動確認する。
+  - ON の値変更で texture 再 upload / cache invalidation が起きず、表示だけライブに変わる。
+  - 比較表示と 360 度パノラマでも同じ設定が適用される。
+- 規模 / 優先度: Small〜Medium / P2。
+
+### 1.40 対応済み: 閲覧履歴 — 動画・音声を対象に含め、自動進行由来は記録しない
+
+- **対応 (2026-08-02)**: 動画・音声をファイル単位で追加し、ブックマークと同じ
+  すべて / 動画 / 音声 / 本 (+ 本の内訳) の絞り込みを実装。HistoryTrigger を通常 open、
+  native source swap、ZIP/PDF 列挙待ち、変換待ちまで必須引数で運び、スライドショー、
+  NextFolder、動画 / 動画音声モード / 音楽の EOF を AutoAdvance として記録対象外にした。
+  DB はメディア位置 / 尺の専用列を ALTER TABLE で追加し、未知 kind は行ごと読み飛ばす。
+  resume の既存条件と永続識別子 reading_history / ReadingHistory は変更していない。
+
+- 出典: 2026-08-01 のユーザー相談。「動画はブックマークには残るのに履歴には残らない」という
+  非対称の是非から。本項の調査は source inspection で確認済み。
+- 現状:
+  - 履歴の種別は [reading_history_db.rs](../src/reading_history_db.rs) の `ReadingHistoryKind` =
+    `folder` / `zip` / `pdf` / `archive` の 4 つ。記録判定 `record_reading_history` は
+    `is_readable_page_idx` (= `Image` / `ZipImage` / `PdfPage`) を通らないと即 return するため、
+    動画・音声は**構造的に入らない**。[reading-history-plan.md](reading-history-plan.md) §2.1 に
+    「動画は対象外」と明記された意図的な設計であり、退行ではない。
+  - ブックマークは [bookmark_browser.rs](../src/bookmark_browser.rs) が動画・音声・本を横断し、
+    `MediaFilter` (すべて / 動画 / 音声 / 本) + `BookKindFilter` + ソートを持つ。
+  - 履歴ビューは**絞り込みバーごと無効**。[ui_main.rs](../src/ui_main.rs) の facet filter bar が
+    `items_are_reading_history_view` で早期 return するため、種別で絞る手段が今は無い。
+  - 位置の記憶は媒体ごとに既にある (本 = `book_resume.db`、動画・音声 =
+    `settings.video_resume_positions`)。欠けているのは**動画・音声の時系列一覧だけ**である。
+- **resume の挙動は既に望ましい形なので変更しない**: `save_video_resume_position` は EOF /
+  3 秒未満 / 末尾 5 秒以内でエントリを削除し、それ以外を保存する。既定は「一覧から開く = 続きから」
+  「移動 = 続きから」。したがって「完走したら次回は先頭から、途中で止めたらその位置から」は
+  **現行どおり**で追加作業は無い。履歴はこれに依存せず、完走した動画も履歴には残す
+  (位置の記憶と、見たという事実は別物)。
+- 方針:
+  1. 動画・音声を履歴の対象に加える。記録単位はファイル (本はコンテナ)。
+  2. 名称を **閲覧履歴 → 閲覧履歴** へ改名する。音声を含めた時点で「読書」が成立しない。
+     ブックマークが 1 ビュー + 種別絞り込みで統合されている以上、履歴を媒体別ビューに
+     分割せず同じ形に揃える。
+  3. 種別絞り込みをブックマークと同型にする (すべて / 動画 / 音声 / 本 + 本の内訳)。ラベルと
+     並びを合わせて学習コストを 0 にする。前提として履歴ビューで絞り込みバーを有効化する。
+     並びは最終閲覧↓固定のままでよい。
+  4. **自動進行由来は記録しない**。記録するのはユーザーが選んだ遷移だけにする。
+     - 記録する: 一覧からのオープン、↑↓ / ホイールのファイル移動、Ctrl+↑↓、履歴 /
+       ブックマークからのオープン。
+     - 記録しない: 連続再生 (`VideoContinuousMode`) の EOF 遷移、スライドショーの自動送り、
+       スライドショーの `SlideshowEndAction::NextFolder`。
+     - 理由: 履歴は探し直すための足跡であり、自分で選んでいないものは足跡にならない。加えて
+       動画・音声は記録単位がファイルなので、フォルダを 1 つ流すだけで保持上限 1000 件を
+       自動生成が食い潰し、**本来残したい本が押し出されて機能自体が壊れる**。
+     - 画像側にも同じ穴が既にある: `try_start_slideshow_next_folder` で渡ったフォルダが 1 件ずつ
+       積まれる。同じ方針で塞ぐ (= 現状からの挙動変更になる)。同一フォルダ内の自動送りは
+       同一キーの upsert なので元から件数は増えない。
+     - 「流れてきた曲を後から探したい」需要が確認できたら、設定 (既定 OFF) で後付けできる。
+       需要が読めない段階で設定を足さない。
+- 実装上の注意:
+  - **DB はリリース済み**なので、動画の位置 / 尺を持つなら `ALTER TABLE ADD COLUMN` の
+    マイグレーションが要る。本の `last_page` / `page_count` に秒数を流用すると意味が混ざるので
+    別列にする。
+  - **旧版へのダウングレード**: `ReadingHistoryKind::from_str` は未知 kind を `unwrap_or(Folder)` に
+    落とすため、新版が書いた動画行を旧版が読むと**動画ファイルをフォルダとして表示・オープン
+    する**。未知 kind は行ごと読み飛ばす形へ変える。
+  - 記録タイミングは本と揃えて「開いた瞬間」でよい。自動進行を除外すれば、誤って開いたものが
+    残る実害は小さい。
+  - 完走した動画は resume 側のエントリが消えているので、履歴の位置表示は履歴自身の列から出す
+    (resume の有無に依存させない)。
+  - 改名の波及先: `StartupFolderMode::ReadingHistory`、環境設定「履歴と復元」、アドレスバー
+    「場所▼」、ファイルメニュー、`address` 文字列、[reading-history-plan.md](reading-history-plan.md)
+    §2.1、`htdocs/mimageviewer/manual/`。設定の enum 名を変えるなら旧値の読み替えを用意する。
+- 完了条件 / 回帰テスト:
+  - 動画・音声を手動で開くと履歴に載り、種別絞り込みで動画 / 音声 / 本を分けられる。
+  - 連続再生の EOF 遷移で履歴が増えない。スライドショーの自動送りと NextFolder でも増えない。
+  - 手動のファイル移動 (↑↓ / ホイール / Ctrl+↑↓) では従来どおり載る。
+  - 完走した動画も履歴に残り、次回オープンは先頭からになる (resume 側の既存挙動が
+    変わっていないことを固定する)。
+  - 新版が書いた動画行を旧版が読んでも、フォルダとして開かない。
+- 規模 / 優先度: Medium / P2。
+
+### 1.42 右クリックメニューの表示が遅い (シェル拡張を UI スレッドで同期ロード)
+
+- 出典: 2026-08-02 の v2.10.0 実機確認中の利用者報告。「右クリックメニューを開くのが
+  かなり遅い」ため、連続リネームのテストが現実的に行えなかった。
+- 壊れている前提: [native_context_menu.rs](../src/native_context_menu.rs) の
+  `query_shell_context_menu` は `IContextMenu::QueryContextMenu` を**メニュー構築時に
+  同期実行**する ([native_context_menu.rs:288](../src/native_context_menu.rs) と
+  [872](../src/native_context_menu.rs))。同 module に worker は無く、**UI スレッドで走る**。
+  `QueryContextMenu` はサードパーティのシェル拡張 (ウイルス対策 / クラウドストレージ /
+  書庫ソフト等) を列挙してロードするため、環境によっては数百 ms〜秒単位かかる。
+- 「Windows のせい」は半分正しい。遅いのは拡張側だが、**それを UI スレッドで待っているのは
+  mIV 側**であり、その間アプリ全体が固まる。CLAUDE.md「UI スレッドでの同期 I/O は即
+  worker 化する」の対象。
+- 未計測: 実際に何 ms かかっているか、どの拡張が支配的かは未測定。**着手前に計測すること**
+  (`perf::event` を `query_shell_context_menu` の前後に入れる)。環境差が大きいので、
+  遅い環境のログが取れると判断が早い。
+- 対応案 (計測してから選ぶ):
+  1. **シェル部分を遅延構築**する。mIV 自身のメニューを即座に出し、シェル項目は
+     サブメニューを開いた時点で初めて `QueryContextMenu` する。エクスプローラー互換の
+     見た目からは離れるが、体感は最も改善する。
+  2. mIV のメニューを先に表示し、シェル項目だけ**非同期に差し込む**。項目が後から
+     増えるので、開いた直後にクリックすると位置がずれる問題を設計で潰す必要がある。
+  3. 直近で使った拡張セットを**キャッシュ**する。COM オブジェクトの寿命と、
+     拡張の追加 / 削除の検知が要る。
+- ⚠ **症状パッチにしないこと**: タイムアウトで打ち切って一部の拡張を落とす、は
+  「どの拡張が出るか環境ごとに変わる」という新しい非決定性を持ち込むので採らない。
+- 完了条件 / 回帰テスト:
+  - 右クリックからメニュー表示までの UI スレッド占有時間を計測し、改善を数値で示す。
+  - シェル項目の実行 (`InvokeCommand`) が従来どおり動く。
+  - 拡張が 1 つも無い環境でも従来と同じメニューが出る。
+- 規模 / 優先度: Medium / P2。実害は「操作のたびに待たされる」で、データ喪失は無い。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
@@ -605,6 +761,14 @@
   [idle-health-check.md](idle-health-check.md) の §3 も揃えること。
 - 規模 / 優先度: Small / P2。**毎リリース必須のチェックが手順どおりでも落ちる**状態なので、
   次版で片付ける。
+- **v2.10.0 (2026-08-02) は 3 シナリオとも PASS**。waiver 不要。今回窓に当たらなかったのは、
+  **Enter を押す直前に対象フォルダを開き直した**ため。証拠は
+  `matched=170 (enqueue=23, idle_upgrade_enqueue=2, idle_upgrade_ineligible=2, ready=143)` で、
+  アイドル高画質化パスが対象タイルを実際に評価したうえで測定区間は完全 sleep
+  (perf event 0 件 / perf log 増加 0 バイト / CPU 1.2%)。
+  つまり**現状でも手順を「準備 → 即 Enter」に揃えれば通る**。ただしそれは操作者の手際に
+  依存する状態であり、上記の対応方針 1 (窓をセッション全体へ広げる) は引き続き有効。
+  なお `-TargetKey` が checklist から抜けていた件は `31b45449` で別途修正済み。
 - v2.9.1 の waiver 根拠 (2026-08-01 更新)。`static-foreground` / `static-background` の PASS に加え、
   この版の変更が `video-pin-background` が見ている経路 (アイドル高画質化 / 動画ピンのタイル保持)
   に触れていないこと。対象の変更は次のとおり:
@@ -614,10 +778,26 @@
     `tray-resident` シナリオを足すこと (今回は前 2 シナリオが常駐なしの静止を見ている)。
   - **スマートフォルダ セッション** — parked grid が keep 範囲分のサムネイルを保持する。
   - **見開きの表示可否判定 (`FsPageLoadState`)** — 再入ループを止めた側なので、アイドル時の
-    work はむしろ減る。§1.29 参照。
+    work はむしろ減る (`9590b661`)。
   - **入力所有権 (raw key permit / IME の viewport 分離)** と **native window health** —
     後者は native video window が生きている間だけ 1 秒に 1 回 pump へ ping を送る。
     無再生時は送らないが、**動画を開いたまま放置したときのアイドル影響は未実測**。
+
+### 5.5 v2.9.1 の perf smoke が最終 tree で未取得
+
+- 出典: v2.9.1 出荷後の他セッションレビュー (2026-08-01、ClaudeCode)。本セッションで確認済み。
+- 何が起きたか: perf smoke の記録は 2026-07-31 の tree のものしか無く (`17231956` は
+  CLAUDE.md の判定基準を書き足した commit で、計測そのものではない)、**8/1 に入った構造変更の
+  後に取り直した記録が見当たらない**。対象の変更は入力所有権 (`56db11bc` / `596bb65d`)、
+  `FsPageLoadState` (`9590b661`)、health watchdog (`2c11e4cd`)。
+- ずれている扱い: idle-health 側は §5.4 の waiver を「未実測部分を明示する」形に書き直したのに、
+  perf smoke 側は同じ扱いになっていない。CLAUDE.md Phase 2 の 9.6 は「UI 周り / I/O 経路に
+  変更を入れたリリースで実施」なので `FsPageLoadState` はまさに対象。
+- 対応 (どちらか):
+  1. v2.9.1 の tree で perf smoke を取り直す。**PDF フルスクリーンでの計測を含める**
+     (§1.39-2 の毎フレーム経路がそこにしか出ない)。
+  2. 取らない判断を §5.4 と同じ形で明文化する (何が未実測かを書く)。
+- 規模 / 優先度: Small / P2 (プロセス)。次版のリリース前確認までに片付ける。
 
 ---
 

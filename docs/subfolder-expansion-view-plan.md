@@ -186,7 +186,7 @@ ZIP/PDF/変換アーカイブの中身は展開しない。中身まで展開す
 
 - Drive list
 - ZIP/PDF 内
-- 読書履歴
+- 閲覧履歴
 - レーティング一覧
 - Ctrl+G 検索結果
 - Ctrl+S お気に入り検索結果グリッド
@@ -249,7 +249,7 @@ synthetic path:
 pub(crate) fn subfolder_expansion_synthetic_path() -> PathBuf;
 ```
 
-`is_synthetic_view_path` に追加し、検索結果 / 読書履歴 / レーティング一覧と同じく通常フォルダ
+`is_synthetic_view_path` に追加し、検索結果 / 閲覧履歴 / レーティング一覧と同じく通常フォルダ
 ナビゲーションから区別する。
 
 ### 4.1 synthetic path の効能

@@ -2221,7 +2221,7 @@ struct ViewerContextBundle {
     slideshow_playing: bool,
     slideshow_next_at: std::time::Instant,
     slideshow_anchor_idx: Option<usize>,
-    slideshow_scroll_anim: Option<SlideshowContinuousScrollAnim>,
+    continuous_reading_scroll_transition: Option<ContinuousReadingScrollTransition>,
     slideshow_scroll_range_cache: Option<(usize, f32, f32)>,
     pdf_password_request: Option<PdfPasswordRequest>,
     pdf_current_password: Option<String>,
@@ -2498,7 +2498,7 @@ impl ViewerContextBundle {
             slideshow_playing: false,
             slideshow_next_at: std::time::Instant::now(),
             slideshow_anchor_idx: None,
-            slideshow_scroll_anim: None,
+            continuous_reading_scroll_transition: None,
             slideshow_scroll_range_cache: None,
             pdf_password_request: None,
             pdf_current_password: None,
@@ -2560,7 +2560,7 @@ impl ViewerContextBundle {
 
     fn pause_background_work_keep_current_frame(&mut self) {
         self.slideshow_playing = false;
-        self.slideshow_scroll_anim = None;
+        self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
         self.fs_seek_drag_active = false;
         self.fs_seek_overlay_visible = false;
@@ -2601,13 +2601,26 @@ impl ViewerContextBundle {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SlideshowContinuousScrollAnim {
-    pub(crate) start_at: std::time::Instant,
-    pub(crate) end_at: std::time::Instant,
-    pub(crate) start_scroll: f32,
-    pub(crate) target_scroll: f32,
+pub(crate) enum ContinuousReadingScrollTransition {
+    Animating {
+        start_at: std::time::Instant,
+        end_at: std::time::Instant,
+        start_scroll: f32,
+        target_scroll: f32,
+        history_trigger: HistoryTrigger,
+    },
+    AwaitingReanchor {
+        history_trigger: HistoryTrigger,
+    },
 }
-
+impl ContinuousReadingScrollTransition {
+    pub(crate) fn history_trigger_for_reanchor(self) -> Option<HistoryTrigger> {
+        match self {
+            Self::Animating { .. } => None,
+            Self::AwaitingReanchor { history_trigger } => Some(history_trigger),
+        }
+    }
+}
 /// Condvar 付きキュー: ワーカーはキューが空のとき sleep ポーリングではなく wait() で待機し、
 /// push 側が notify_one() で起こす。
 pub(crate) type NotifyQueue = (Mutex<Vec<LoadRequest>>, Condvar);
@@ -2666,6 +2679,18 @@ fn main_window_clear_color(visuals: &egui::Visuals) -> [f32; 4] {
 /// Ctrl+↑↓ フォルダナビゲーションの発火元モード。DFS 完了後に mode に応じて
 /// 異なる後処理 (grid は load_folder のみ、fullscreen は fs 再オープン、favsearch は
 /// sibling fallback 付き) を行うため、`FolderNavPending` に記憶させる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryTrigger {
+    UserChosen,
+    AutoAdvance,
+}
+
+impl HistoryTrigger {
+    fn should_record(self) -> bool {
+        matches!(self, Self::UserChosen)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum FolderNavMode {
     /// 通常グリッド。DFS 結果をそのまま `load_folder` する。
@@ -2705,6 +2730,7 @@ pub(crate) enum FolderNavMode {
 /// 別ページへ fallback しない。
 #[derive(Clone, Debug)]
 pub(crate) struct DeferredFsReopen {
+    pub history_trigger: HistoryTrigger,
     /// true なら reopen 後にスライドショーを再開する (SlideshowNext 由来のときだけ)。
     /// また true のときは先頭の **静止画のみ** (Video 除外) を開く。
     /// (DFS 方向 forward は deferred reopen では使わない: フォルダ先頭着地固定のため。)
@@ -4661,6 +4687,13 @@ impl FolderNavMode {
             FolderNavMode::SiblingGrid | FolderNavMode::SiblingFullscreen
         )
     }
+
+    pub fn history_trigger(&self) -> HistoryTrigger {
+        match self {
+            FolderNavMode::SlideshowNext => HistoryTrigger::AutoAdvance,
+            _ => HistoryTrigger::UserChosen,
+        }
+    }
 }
 
 /// モードの種類と検索スコープを比較する。Favsearch は root / fullscreen が変わったら
@@ -6448,7 +6481,7 @@ pub(crate) fn search_results_synthetic_path() -> PathBuf {
     crate::data_dir::get().join("__search_results__")
 }
 
-/// 読書履歴ビューで current_folder に設定する合成パス。
+/// 閲覧履歴ビューで current_folder に設定する合成パス。
 /// `%APPDATA%/mimageviewer/__reading_history__` (実在させない、カタログキーとしてのみ使用)。
 pub(crate) fn reading_history_synthetic_path() -> PathBuf {
     crate::data_dir::get().join("__reading_history__")
@@ -6487,7 +6520,7 @@ fn main_window_title(
     indexing_active: bool,
 ) -> String {
     let base = if reading_history_view {
-        "読書履歴 - mimageviewer".to_string()
+        "閲覧履歴 - mimageviewer".to_string()
     } else if bookmark_view {
         "ブックマーク - mimageviewer".to_string()
     } else if subfolder_expansion_view {
@@ -6518,6 +6551,48 @@ pub(crate) fn is_synthetic_view_path(path: &Path) -> bool {
         || crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path())
         || smart_folder::is_smart_folder_synthetic_path(path)
         || crate::folder_tree::path_eq(path, &drive_list_synthetic_path())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageOrderViewKind {
+    Physical,
+    ReadingHistory,
+    Synthetic,
+}
+
+impl PageOrderViewKind {
+    fn for_loading_source(source_path: &Path) -> Self {
+        if crate::folder_tree::path_eq(source_path, &reading_history_synthetic_path()) {
+            Self::ReadingHistory
+        } else if is_synthetic_view_path(source_path) {
+            Self::Synthetic
+        } else {
+            Self::Physical
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SpreadRestoreDefaults {
+    spread_mode: crate::settings::SpreadMode,
+    reading_flow: crate::settings::ReadingFlow,
+    reading_direction: crate::settings::ReadingDirection,
+}
+
+impl SpreadRestoreDefaults {
+    const NON_BOOK: Self = Self {
+        spread_mode: crate::settings::SpreadMode::Single,
+        reading_flow: crate::settings::ReadingFlow::Paged,
+        reading_direction: crate::settings::ReadingDirection::Ltr,
+    };
+
+    fn for_book(settings: &crate::settings::Settings) -> Self {
+        Self {
+            spread_mode: settings.default_spread_mode,
+            reading_flow: settings.default_reading_flow,
+            reading_direction: settings.default_reading_direction,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6641,6 +6716,19 @@ enum MediaNavigationAction {
         delta: i32,
         landing: ManualMediaNavigationLanding,
     },
+}
+
+impl MediaNavigationAction {
+    fn history_trigger(&self) -> HistoryTrigger {
+        match self {
+            Self::VideoContinuousEof { .. } | Self::MusicContinuousEof { .. } => {
+                HistoryTrigger::AutoAdvance
+            }
+            #[cfg(windows)]
+            Self::VideoAudioModeContinuousEof { .. } => HistoryTrigger::AutoAdvance,
+            Self::Manual { .. } => HistoryTrigger::UserChosen,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -7578,9 +7666,8 @@ fn viewer_bundle_references_removed(
     })
 }
 
-#[cfg(windows)]
 #[derive(Clone, Debug)]
-struct ViewerContextMediaResumeUpdate {
+struct MediaResumeUpdate {
     path: PathBuf,
     key: String,
     position: f64,
@@ -7591,7 +7678,7 @@ struct ViewerContextMediaResumeUpdate {
 #[cfg(windows)]
 #[derive(Default, Debug)]
 struct ViewerContextMediaTeardownPlan {
-    resume_updates: Vec<ViewerContextMediaResumeUpdate>,
+    resume_updates: Vec<MediaResumeUpdate>,
     media_paths: Vec<PathBuf>,
     music_consumer: bool,
 }
@@ -7659,7 +7746,7 @@ fn viewer_context_media_teardown_plan(
                     .video_audio_vst
                     .as_ref()
                     .is_some_and(|state| state.fs_idx == *idx);
-            plan.resume_updates.push(ViewerContextMediaResumeUpdate {
+            plan.resume_updates.push(MediaResumeUpdate {
                 key: crate::adjustment_db::normalize_path(&path),
                 path,
                 position: video_resume_position_for_save(player, audio_mode_without_vst),
@@ -7752,7 +7839,7 @@ fn pause_viewer_context_bundle_media_for_remote_session(bundle: &ViewerContextBu
 #[cfg(windows)]
 fn apply_viewer_context_media_resume_updates(
     map: &mut std::collections::HashMap<String, f64>,
-    updates: &[ViewerContextMediaResumeUpdate],
+    updates: &[MediaResumeUpdate],
 ) -> Vec<String> {
     let mut removed = Vec::new();
     for update in updates {
@@ -8429,7 +8516,7 @@ pub struct App {
     pub(crate) items_are_global_search_view: bool,
     /// 現在の `items` がタグビュー (Ctrl+T) の一時結果一覧かを示す。
     pub(crate) items_are_tag_view: bool,
-    /// 現在の `items` が読書履歴の仮想ビューかを示す。
+    /// 現在の `items` が閲覧履歴の仮想ビューかを示す。
     pub(crate) items_are_reading_history_view: bool,
     /// 現在の `items` がブックマーク一覧の仮想ビューかを示す。
     pub(crate) items_are_bookmark_view: bool,
@@ -8639,6 +8726,10 @@ pub struct App {
     /// 最初の enqueue / poll の前に必ず読み込む (先に enqueue の persist が走ると
     /// 前セッションの回復エントリを上書きしてしまうため)。
     pub(crate) rename_migration_journal_loaded: bool,
+    /// Filesystem writes are serialized and coalesced off the UI thread. Created lazily so an
+    /// App that never changes a rename journal does not start another resident worker.
+    pub(crate) rename_migration_journal_writer:
+        Option<crate::rename_key_migration::RenameMigrationJournalWriter>,
     /// リネーム移行完了時に main 文脈の再構築が必要だったが、補正スライダーの
     /// ドラッグ中だったため次のドラッグ終了後フレームへ繰り延べた印 (角度⑦ P1)。
     pub(crate) rename_rehydrate_main_deferred: bool,
@@ -9427,6 +9518,8 @@ pub struct App {
     pub(crate) bookmark_delete_pending: Option<crate::bookmark_browser::BookmarkDeletePending>,
     pub(crate) bookmark_media_filter: crate::bookmark_browser::MediaFilter,
     pub(crate) bookmark_book_kind_filter: crate::bookmark_browser::BookKindFilter,
+    pub(crate) reading_history_media_filter: crate::bookmark_browser::MediaFilter,
+    pub(crate) reading_history_book_kind_filter: crate::bookmark_browser::BookKindFilter,
     pub(crate) bookmark_view_sort: crate::bookmark_browser::BookmarkViewSort,
     /// process 内で bookmark open request を一意にする単調増加 sequence。
     pub(crate) bookmark_open_request_seq: u64,
@@ -9469,19 +9562,19 @@ pub struct App {
         std::cell::Cell<Option<crate::keyboard_input::PendingTextInputFocusClaim>>,
     pub(crate) book_bookmark_request_seq: u64,
     pub(crate) book_bookmark_pending_requests: std::collections::HashSet<u64>,
-    /// フルスクリーンで読んだ本の履歴 DB。
+    /// ユーザーが開いた本・動画・音声の閲覧履歴 DB。
     pub(crate) reading_history_db: Option<crate::reading_history_db::ReadingHistoryDb>,
-    /// 読書履歴の書き込みを UI スレッドから外す background writer。
+    /// 閲覧履歴の書き込みを UI スレッドから外す background writer。
     pub(crate) reading_history_writer: Option<crate::reading_history_db::ReadingHistoryWriter>,
-    /// 読書履歴ビュー表示中の DB 行キャッシュ (key → row)。
+    /// 閲覧履歴ビュー表示中の DB 行キャッシュ (key → row)。
     pub(crate) reading_history_rows:
         std::collections::HashMap<String, crate::reading_history_db::ReadingHistoryEntry>,
-    /// 直近に読書履歴へ送った key と時刻。連続ページ送りの同一 key 書き込みを抑える。
+    /// 直近に閲覧履歴へ送った key と時刻。連続ページ送りの同一 key 書き込みを抑える。
     pub(crate) last_reading_history_touch: Option<(String, std::time::Instant)>,
-    /// 読書履歴ビューから開いた本の effective パス。本を閉じて親へ戻るとき、実ディレクトリ
-    /// ではなく読書履歴ビューへ戻すために使う。`effective_folder()` がこれと一致する間だけ
-    /// 「親 = 読書履歴」とみなす (深い階層へ潜った後は通常の親フォルダへ戻り、本の階層まで
-    /// 戻ったところで読書履歴へ抜ける)。
+    /// 閲覧履歴ビューから開いた本の effective パス。本を閉じて親へ戻るとき、実ディレクトリ
+    /// ではなく閲覧履歴ビューへ戻すために使う。`effective_folder()` がこれと一致する間だけ
+    /// 「親 = 閲覧履歴」とみなす (深い階層へ潜った後は通常の親フォルダへ戻り、本の階層まで
+    /// 戻ったところで閲覧履歴へ抜ける)。
     pub(crate) reading_history_return_from: Option<PathBuf>,
 
     // ── フルスクリーン表示モード ──────────────────────────────
@@ -9511,8 +9604,8 @@ pub struct App {
     pub(crate) slideshow_next_at: std::time::Instant,
     /// `slideshow_next_at` がどのフルスクリーン item の表示開始から数えているか。
     pub(crate) slideshow_anchor_idx: Option<usize>,
-    /// 連結読みスライドショーの間欠スクロールアニメーション状態。
-    pub(crate) slideshow_scroll_anim: Option<SlideshowContinuousScrollAnim>,
+    /// 連結読みスクロールの起点と、アニメーション / 再アンカー待ちを所有する typed state。
+    pub(crate) continuous_reading_scroll_transition: Option<ContinuousReadingScrollTransition>,
     /// 直近の連結読み描画で計算したスクロール可能範囲。
     /// (fullscreen_idx, min_scroll, max_scroll)
     pub(crate) slideshow_scroll_range_cache: Option<(usize, f32, f32)>,
@@ -9778,7 +9871,7 @@ pub struct App {
     /// 導入時の用途は Windows 固有 (動画 GPU レンダリングで
     /// `wgpu::Device::create_texture_from_hal::<Dx12>` 経由で D3D11 NT shared テクスチャを
     /// import する) だったが、現在は **プラットフォーム非依存の用途にも使う** —
-    /// mipmap の LOD bias 設定、比較モードの GPU テクスチャ解放、パノラマの settle overlay。
+    /// mipmap の sampling 設定、比較モードの GPU テクスチャ解放、パノラマの settle overlay。
     /// そのため `cfg(windows)` を付けない。付けると、cfg なしの経路 (`eframe::App::update`
     /// など) から参照するたびに非 Windows ビルドが壊れ、CI の
     /// `cargo check (ubuntu / non-Windows cfg)` でしか気付けない
@@ -11869,6 +11962,7 @@ impl App {
             rename_migration_in_flight: None,
             rename_migration_boot_retry: Vec::new(),
             rename_migration_journal_loaded: false,
+            rename_migration_journal_writer: None,
             rename_rehydrate_main_deferred: false,
             #[cfg(test)]
             rename_migration_data_dir_override: None,
@@ -12159,6 +12253,8 @@ impl App {
             bookmark_delete_pending: None,
             bookmark_media_filter: crate::bookmark_browser::MediaFilter::default(),
             bookmark_book_kind_filter: crate::bookmark_browser::BookKindFilter::default(),
+            reading_history_media_filter: crate::bookmark_browser::MediaFilter::default(),
+            reading_history_book_kind_filter: crate::bookmark_browser::BookKindFilter::default(),
             bookmark_view_sort: crate::bookmark_browser::BookmarkViewSort::default(),
             bookmark_open_request_seq: 0,
             bookmark_open_pending: None,
@@ -12191,7 +12287,7 @@ impl App {
             slideshow_playing: false,
             slideshow_next_at: std::time::Instant::now(),
             slideshow_anchor_idx: None,
-            slideshow_scroll_anim: None,
+            continuous_reading_scroll_transition: None,
             slideshow_scroll_range_cache: None,
             fs_viewport_shown: false,
             #[cfg(windows)]
@@ -13513,11 +13609,12 @@ impl App {
         self.bump_input_seq(kind, key.as_deref())
     }
 
-    /// 現在の viewport の IME 変換状態をイベント処理前に取り込む。
+    /// 現在の viewport の IME 変換状態をイベント処理前に参照し、診断を開始する。
     ///
     /// **重要**: egui の各ビューポートは独立したイベントキューを持つ。
-    /// `show_viewport_immediate` で別ビューポートを出している場合は、その closure の
-    /// 先頭でも呼ばないと、そのビューポート内の IME を取り逃がす。
+    /// pass 前 plugin が各 RawInput を viewport ごとに追跡する。App 側は
+    /// `show_viewport_immediate` の closure 先頭でもこの read-only 入口を呼び、
+    /// helper-field 診断をその viewport の処理前に開始する。
     pub(crate) fn update_ime_state(&mut self, ctx: &egui::Context) {
         let _ = crate::ime_focus::ime_input_active(ctx);
     }
@@ -14028,7 +14125,7 @@ impl App {
             slideshow_playing,
             slideshow_next_at,
             slideshow_anchor_idx,
-            slideshow_scroll_anim,
+            continuous_reading_scroll_transition,
             slideshow_scroll_range_cache,
             pdf_password_request,
             pdf_current_password,
@@ -14254,7 +14351,7 @@ impl App {
         swap_field!(slideshow_playing);
         swap_field!(slideshow_next_at);
         swap_field!(slideshow_anchor_idx);
-        swap_field!(slideshow_scroll_anim);
+        swap_field!(continuous_reading_scroll_transition);
         swap_field!(slideshow_scroll_range_cache);
         swap_field!(pdf_password_request);
         swap_field!(pdf_current_password);
@@ -14438,12 +14535,12 @@ impl App {
     /// グリッド上の「親へ戻る」操作 (Backspace / Alt+↑ / ツールバー⬆ / Pad B) の
     /// 共通ナビゲーション先を返す。ドライブルートでは親 `Path` が無いので、ドライブ
     /// 一覧へ戻す専用ナビを返す。
-    /// 読書履歴ビューから開いた本を「親へ戻る」操作で閉じるとき、実ディレクトリではなく
-    /// 読書履歴ビューへ戻す。本の effective パスにいる間だけ有効 (深い階層では None)。
+    /// 閲覧履歴ビューから開いた本を「親へ戻る」操作で閉じるとき、実ディレクトリではなく
+    /// 閲覧履歴ビューへ戻す。本の effective パスにいる間だけ有効 (深い階層では None)。
     pub(crate) fn reading_history_back_nav(&self) -> Option<crate::ui_main::AddressBarNav> {
         // ネスト ZIP の深い階層では本のルート扱いにしない。effective_folder() は深さに
         // 関わらず root ZIP のままなので、zip_nav の深さで明示的に弾く (root に戻ってから
-        // 読書履歴へ抜ける。docs「深い階層では通常の親へ」と整合させる。Esc 直帰経路も同じ)。
+        // 閲覧履歴へ抜ける。docs「深い階層では通常の親へ」と整合させる。Esc 直帰経路も同じ)。
         if self.zip_nav.as_ref().is_some_and(|n| !n.at_root()) {
             return None;
         }
@@ -14554,7 +14651,7 @@ impl App {
         }
     }
 
-    /// 読書履歴ビューの項目を開く直前に、消えたコンテナへ入らないようにする。
+    /// 閲覧履歴ビューの項目を開く直前に、消えたコンテナへ入らないようにする。
     ///
     /// 表示直後に履歴全体を検査すると、外付けドライブやネットワークパスで UI が重くなったり、
     /// 後から件数が変わって行がずれる体験になる。ここではユーザーが実際に開こうとした
@@ -14565,23 +14662,18 @@ impl App {
             return true;
         }
         let Some((path, key)) = self.items.get(idx).and_then(|item| {
-            let is_container = matches!(
-                item,
+            let path = match item {
+                GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
                 GridItem::Folder(_)
-                    | GridItem::ZipFile(_)
-                    | GridItem::PdfFile(_)
-                    | GridItem::ConvertibleArchive { .. }
-            );
-            is_container.then(|| {
-                (
-                    item.container_path().map(|p| p.to_path_buf()),
-                    reading_history_key_for_item(item),
-                )
-            })
+                | GridItem::ZipFile(_)
+                | GridItem::PdfFile(_)
+                | GridItem::ConvertibleArchive { .. } => {
+                    item.container_path().map(|path| path.to_path_buf())
+                }
+                _ => None,
+            }?;
+            Some((path, reading_history_key_for_item(item)))
         }) else {
-            return true;
-        };
-        let Some(path) = path else {
             return true;
         };
 
@@ -14589,7 +14681,7 @@ impl App {
             ReadingHistoryOpenPathStatus::Available => true,
             ReadingHistoryOpenPathStatus::Missing => {
                 self.show_feedback_toast(
-                    "ファイルが見つかりません。読書履歴は保持されています".to_string(),
+                    "ファイルが見つかりません。閲覧履歴は保持されています".to_string(),
                 );
                 let _ = key;
                 false
@@ -14604,11 +14696,11 @@ impl App {
         }
     }
 
-    /// グリッドからコンテナを開いたときに、読書履歴ビューへの戻り先予約を更新する。
+    /// グリッドからコンテナを開いたときに、閲覧履歴ビューへの戻り先予約を更新する。
     ///
-    /// - 読書履歴ビューで本 (コンテナ) を開いた → その本へ戻り先を焼き付ける。
-    /// - 読書履歴ビュー以外で別のコンテナを開いた → 古い予約を捨てる (別の本/フォルダへ
-    ///   出たので、以後 Backspace は読書履歴ではなく通常の親フォルダへ向かう)。
+    /// - 閲覧履歴ビューで本 (コンテナ) を開いた → その本へ戻り先を焼き付ける。
+    /// - 閲覧履歴ビュー以外で別のコンテナを開いた → 古い予約を捨てる (別の本/フォルダへ
+    ///   出たので、以後 Backspace は閲覧履歴ではなく通常の親フォルダへ向かう)。
     /// - 画像 / ページ等 (非コンテナ) のオープンでは予約を変えない (= 本の中でページを
     ///   読んでいるだけなので戻り先を保持する)。
     pub(crate) fn note_reading_history_open(&mut self, idx: usize) {
@@ -16121,12 +16213,17 @@ impl App {
 
     /// 指定キーの見開きモード / 連結方式 / 綴じ方向を `spread_db` から読み込んで
     /// `self.spread_mode` / `reading_flow` / `reading_direction` に適用する。
-    /// 未登録なら settings の既定値。旧 `SpreadMode::Vertical` は「単ページ + 縦連結」に読み替え。
+    /// 未登録なら呼び出し元が型で指定した既定値。旧 `SpreadMode::Vertical` は
+    /// 「単ページ + 縦連結」に読み替え。
     ///
     /// `start_loading_items` (フォルダ / 初回 ZIP open) と、ネスト ZIP の階層切替
     /// (`zip_nav_show_current_level` / finalize 後) の両方から呼び、本ごとに設定を復元する。
-    pub(crate) fn apply_spread_for_key(&mut self, key: &std::path::Path) {
-        self.apply_spread_for_key_with_fallback(key, None);
+    pub(crate) fn apply_spread_for_key(
+        &mut self,
+        key: &std::path::Path,
+        defaults: SpreadRestoreDefaults,
+    ) {
+        self.apply_spread_for_key_with_fallback(key, None, defaults);
     }
 
     /// `apply_spread_for_key` の fallback キー付き版。`key` に保存が無い項目を
@@ -16139,16 +16236,15 @@ impl App {
         &mut self,
         key: &std::path::Path,
         fallback: Option<&std::path::Path>,
+        defaults: SpreadRestoreDefaults,
     ) {
         let db = self.spread_db.as_ref();
         let stored = db
             .map(|db| db.get_state_with_fallback(key, fallback))
             .unwrap_or_default();
-        let stored_spread = stored.mode.unwrap_or(self.settings.default_spread_mode);
-        self.reading_flow = stored.flow.unwrap_or(self.settings.default_reading_flow);
-        self.reading_direction = stored
-            .direction
-            .unwrap_or(self.settings.default_reading_direction);
+        let stored_spread = stored.mode.unwrap_or(defaults.spread_mode);
+        self.reading_flow = stored.flow.unwrap_or(defaults.reading_flow);
+        self.reading_direction = stored.direction.unwrap_or(defaults.reading_direction);
         if stored_spread == crate::settings::SpreadMode::Vertical {
             self.spread_mode = crate::settings::SpreadMode::Single;
             self.reading_flow = crate::settings::ReadingFlow::Vertical;
@@ -16316,7 +16412,7 @@ impl App {
         // ドライブ一覧へ移るので in-flight のフォルダペイン open scan は破棄する。
         self.cancel_folder_pane_open();
         self.gamepad_location_picker = None;
-        // 読書履歴の戻り先予約はここで捨てる (本コンテキストを抜けた)。
+        // 閲覧履歴の戻り先予約はここで捨てる (本コンテキストを抜けた)。
         self.reading_history_return_from = None;
         self.clear_bookmark_view_return_state();
 
@@ -16719,7 +16815,7 @@ impl App {
             self.top_level_grid_view
                 .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
         }
-        // 読書履歴から開いた本以外の実フォルダへ明示ナビで出たら、戻り先予約を捨てる
+        // 閲覧履歴から開いた本以外の実フォルダへ明示ナビで出たら、戻り先予約を捨てる
         // (アドレスバー / 履歴戻る / フォルダナビ等。予約した本そのものを開き直す場合は維持)。
         if self
             .reading_history_return_from
@@ -17083,7 +17179,7 @@ impl App {
                     // detached で「継続ナビ」扱いになり、直前 active 窓を再利用してしまう。
                     self.fs_open_intent_from_grid = true;
                 }
-                self.open_fullscreen(new_idx);
+                self.open_fullscreen(new_idx, crate::app::HistoryTrigger::UserChosen);
                 self.selected = Some(new_idx);
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
@@ -17507,7 +17603,7 @@ impl App {
                 });
             self.selected = Some(idx);
             self.fs_open_intent_from_grid = true;
-            self.open_fullscreen(idx);
+            self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
             if let Some(state) = self.play_test.as_mut() {
                 state.launched_idx = Some(idx);
             }
@@ -18778,7 +18874,7 @@ impl App {
         self.update_favsearch_address();
     }
 
-    /// メニュー操作で読書履歴を開く。
+    /// メニュー操作で閲覧履歴を開く。
     ///
     /// 履歴 ←/→ からの復元は `dispatch_synthetic_folder_history_target` が
     /// `enter_reading_history` を直接呼ぶ。ここでだけ遷移を記録することで、メニュー起動時の
@@ -18788,10 +18884,10 @@ impl App {
         self.enter_reading_history();
     }
 
-    /// 読書履歴ビューを開く。
+    /// 閲覧履歴ビューを開く。
     pub(crate) fn enter_reading_history(&mut self) {
         crate::logger::log("=== enter_reading_history ===");
-        // いま読書履歴ビューにいるので、戻り先予約は消費済み扱いにする。
+        // いま閲覧履歴ビューにいるので、戻り先予約は消費済み扱いにする。
         self.reading_history_return_from = None;
         self.clear_bookmark_view_return_state();
         self.gamepad_location_picker = None;
@@ -18829,11 +18925,11 @@ impl App {
             Some(Ok(entries)) => entries,
             Some(Err(e)) => {
                 crate::logger::log(format!("reading-history: list failed: {e}"));
-                self.show_feedback_toast("[読書履歴を読み込めませんでした]".to_string());
+                self.show_feedback_toast("[閲覧履歴を読み込めませんでした]".to_string());
                 Vec::new()
             }
             None => {
-                self.show_feedback_toast("[読書履歴 DB を開けません]".to_string());
+                self.show_feedback_toast("[閲覧履歴 DB を開けません]".to_string());
                 Vec::new()
             }
         };
@@ -18845,14 +18941,12 @@ impl App {
         &mut self,
         entries: Vec<crate::reading_history_db::ReadingHistoryEntry>,
     ) {
-        let mut items: Vec<GridItem> = Vec::with_capacity(entries.len());
-        let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(entries.len());
-        let mut rows = std::collections::HashMap::with_capacity(entries.len());
-        for entry in entries.iter() {
-            image_metas.push(reading_history_meta_for_entry(entry));
-            items.push(reading_history_grid_item(entry));
-            rows.insert(entry.key.clone(), entry.clone());
-        }
+        let ReadingHistoryLoadInputs {
+            items,
+            image_metas,
+            video_items,
+            rows,
+        } = reading_history_load_inputs(entries);
 
         let pin_map_for_existing: std::collections::HashMap<
             String,
@@ -18889,14 +18983,14 @@ impl App {
             items,
             image_metas,
             existing_keys,
-            Vec::new(),
+            video_items,
             None,
         );
         self.items_are_reading_history_view = true;
         self.top_level_grid_view
             .replace_surface(top_level_grid_view::TopLevelGridSurface::ReadingHistory);
         self.reading_history_rows = rows;
-        self.address = "読書履歴".to_string();
+        self.address = "閲覧履歴".to_string();
         self.rebuild_visible_indices();
         if self.selected.is_none()
             && let Some(&idx) = self.visible_indices.first()
@@ -19325,23 +19419,23 @@ impl App {
         }
     }
 
-    /// 読書履歴ビューから 1 件削除する。
+    /// 閲覧履歴ビューから 1 件削除する。
     pub(crate) fn remove_reading_history_entry_for_idx(&mut self, idx: usize) {
         let Some(key) = self.items.get(idx).and_then(reading_history_key_for_item) else {
             return;
         };
         let result = match self.reading_history_db.as_ref() {
             Some(db) => db.remove_key(&key).map_err(|e| e.to_string()),
-            None => Err("読書履歴 DB を開けません".to_string()),
+            None => Err("閲覧履歴 DB を開けません".to_string()),
         };
         match result {
             Ok(()) => {
-                self.show_feedback_toast("[読書履歴から削除しました]".to_string());
+                self.show_feedback_toast("[閲覧履歴から削除しました]".to_string());
                 self.enter_reading_history();
             }
             Err(err) => {
                 crate::logger::log(format!("reading-history: remove failed: {err}"));
-                self.show_feedback_toast("[読書履歴の削除に失敗しました]".to_string());
+                self.show_feedback_toast("[閲覧履歴の削除に失敗しました]".to_string());
             }
         }
     }
@@ -19427,6 +19521,7 @@ impl App {
         // enumerate 完了で先頭ページを開く既存 deferred 機構へ載せ替える。
         if std::mem::take(&mut self.pending_auto_fs_open) {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
                 // 「ZIP/PDF × 一覧から開く」: 続きから / 先頭から を設定で切替。
@@ -19730,7 +19825,8 @@ impl App {
         // 本キーに未保存の項目は zip_path キーへフォールバック (v1.2.x 保存分の互換)。
         if let Some(key) = self.spread_container_key() {
             let fb = self.zip_nav.as_ref().map(|nav| nav.tree.zip_path.clone());
-            self.apply_spread_for_key_with_fallback(&key, fb.as_deref());
+            let defaults = SpreadRestoreDefaults::for_book(&self.settings);
+            self.apply_spread_for_key_with_fallback(&key, fb.as_deref(), defaults);
             self.apply_view_trim_for_key_with_fallback(&key, fb.as_deref());
         }
         self.enter_pending_rating_view_zipdir_after_open(&zip_path);
@@ -19986,7 +20082,8 @@ impl App {
         // キーへフォールバック (v1.2.x 保存分の互換 + ZIP 全体設定の継承)。
         if let Some(key) = self.spread_container_key() {
             let fb = self.zip_nav.as_ref().map(|nav| nav.tree.zip_path.clone());
-            self.apply_spread_for_key_with_fallback(&key, fb.as_deref());
+            let defaults = SpreadRestoreDefaults::for_book(&self.settings);
+            self.apply_spread_for_key_with_fallback(&key, fb.as_deref(), defaults);
             self.apply_view_trim_for_key_with_fallback(&key, fb.as_deref());
         }
         // ★付きの本を開いて一時解除したフィルタを、本より上の階層へ戻ったら復元する
@@ -20200,7 +20297,7 @@ impl App {
         self.zip_nav_show_current_level();
         // 新しい本の先頭画像をフルスクリーンで開く (Ctrl+↑↓ 慣習: 常に先頭着地)。
         if let Some(new_idx) = self.find_fullscreen_nav_target_filtered(true) {
-            self.open_fullscreen(new_idx);
+            self.open_fullscreen(new_idx, crate::app::HistoryTrigger::UserChosen);
             self.selected = Some(new_idx);
             self.scroll_to_selected = true;
             self.update_last_selected_image();
@@ -20216,7 +20313,7 @@ impl App {
             self.release_fs_nav_lock();
             self.slideshow_playing = false;
             self.slideshow_anchor_idx = None;
-            self.slideshow_scroll_anim = None;
+            self.continuous_reading_scroll_transition = None;
             self.slideshow_scroll_range_cache = None;
             self.close_fullscreen();
         }
@@ -20262,6 +20359,7 @@ impl App {
         // pending_auto_fs_open=false なのでここでは触らない (reopen が後段で set する)。
         if std::mem::take(&mut self.pending_auto_fs_open) {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
                 // 「ZIP/PDF × 一覧から開く」: 続きから / 先頭から を設定で切替。
@@ -20419,7 +20517,7 @@ impl App {
             if deferred.from_explicit_open {
                 self.fs_open_intent_from_grid = true;
             }
-            self.open_fullscreen(new_idx);
+            self.open_fullscreen(new_idx, deferred.history_trigger);
             self.selected = Some(new_idx);
             self.scroll_to_selected = true;
             self.update_last_selected_image();
@@ -21491,6 +21589,15 @@ impl App {
         self.pending_grid_scroll = None;
         self.scroll_hint.store(0, Ordering::Relaxed);
 
+        // `install_new_items_inner` は view flags と `self.items` を差し替えるため、今回の
+        // 読み込みが本かどうかは、確定済みの target source/items から先に決める。
+        let page_order_view_kind = PageOrderViewKind::for_loading_source(&source_path);
+        let spread_restore_defaults =
+            if self.page_order_locked_for_items(&source_path, &items, page_order_view_kind) {
+                SpreadRestoreDefaults::for_book(&self.settings)
+            } else {
+                SpreadRestoreDefaults::NON_BOOK
+            };
         let has_prepared_aggregate = prepared_subfolder
             .as_ref()
             .is_some_and(|metadata| metadata.aggregate.is_some());
@@ -21654,16 +21761,17 @@ impl App {
                 ],
             );
         }
-        // 表示モード: DB から読み込み、なければデフォルト値 (本体は apply_spread_for_key)。
+        // 表示モード: DB から読み込み、なければ読み込み対象が本のときだけ settings の既定値。
+        // 本でないビューは単ページ + ページ単位 + 左→右へ戻す。明示保存値はどちらでも優先する。
         // 旧実装の SpreadMode::Vertical は「単ページ + 縦連結」として解釈する。
         // ZIP の場合はここで一旦 zip_path キーで読むが、finalize_zip_enumerate が zip_nav
         // 設定後に「ルート本のキー (zip_path + 実効 prefix)」で読み直す (本ごと独立記憶)。
-        self.apply_spread_for_key(&source_path);
+        self.apply_spread_for_key(&source_path, spread_restore_defaults);
         self.apply_view_trim_for_key(&source_path);
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         self.slideshow_popup_open = false;
-        self.slideshow_scroll_anim = None;
+        self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
         self.search_filter = None;
         self.search_filter_origin_folder = None;
@@ -22188,7 +22296,7 @@ impl App {
             self.last_scroll_offset_y_tracked = self.scroll_offset_y;
             self.last_scroll_change_time = std::time::Instant::now();
         }
-        // 検索結果 / 読書履歴 / レーティング一覧用の合成パスは last_folder に記録しない (次回起動時に復元しないため)。
+        // 検索結果 / 閲覧履歴 / レーティング一覧用の合成パスは last_folder に記録しない (次回起動時に復元しないため)。
         // active detached viewer の PDF / ZIP ページ文脈も、メイン一覧とは独立した一時 context
         // なので last_folder / quick folder settings へ永続化しない。
         let save_t0 = std::time::Instant::now();
@@ -25424,15 +25532,25 @@ impl App {
 
     /// ジャーナル (`rename_key_migration::JOURNAL_FILE`) を現在の未完了ジョブ集合
     /// (in-flight + queue + boot_retry) で書き直す。enqueue / 完了 / Disconnected の
-    /// 状態変化ごとに呼ぶ (best-effort、失敗はログのみ)。
-    fn persist_rename_migration_journal(&self) {
+    /// 状態変化ごとに呼ぶ。App は完全 snapshot の組み立てだけを担い、filesystem I/O は
+    /// latest-value writer が直列実行する (best-effort、失敗はログのみ)。
+    fn persist_rename_migration_journal(&mut self) {
         let mut entries: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
         if let Some(job) = &self.rename_migration_in_flight {
             entries.push((job.old_path.clone(), job.new_path.clone()));
         }
         entries.extend(self.rename_migration_queue.iter().cloned());
         entries.extend(self.rename_migration_boot_retry.iter().cloned());
-        crate::rename_key_migration::journal_save(&self.rename_migration_data_dir(), &entries);
+        let data_dir = self.rename_migration_data_dir();
+        self.rename_migration_journal_writer
+            .get_or_insert_with(crate::rename_key_migration::RenameMigrationJournalWriter::spawn)
+            .enqueue(data_dir, entries);
+    }
+
+    fn flush_rename_migration_journal(&self) {
+        if let Some(writer) = self.rename_migration_journal_writer.as_ref() {
+            writer.flush();
+        }
     }
 
     /// 前セッションの未完了ジャーナルを読み込んでキューへ積む。最初の enqueue / poll の
@@ -25491,8 +25609,8 @@ impl App {
     /// ([`crate::rename_key_migration`]、対象ストアと制限はモジュール doc 参照)。
     /// DB の cold open が UI を止めないよう worker スレッドで実行し、完了は
     /// `poll_rename_migration_pending` が拾って in-memory キャッシュを引き直す。
-    /// ジョブはジャーナルにも書かれ、終了 / クラッシュ / トレイ Exit
-    /// (`std::process::exit` で `on_exit` を通らない) を跨いでも次回起動時に再実行される。
+    /// ジョブはジャーナルにも書かれ、終了 / クラッシュ / トレイ Exit を跨いでも次回起動時に
+    /// 再実行される。通常終了は `on_exit`、App drop は writer の Drop が最新 snapshot を flush する。
     pub(crate) fn spawn_rename_key_migration(
         &mut self,
         old_path: std::path::PathBuf,
@@ -26538,33 +26656,51 @@ impl App {
         crate::books::is_direct_book_folder(&self.book_root_path(), folder)
     }
 
-    /// 現在のビューがページ順を固定する「本」文脈か (= 一覧ソートが効かない)。
-    /// 製本した本 / 読書履歴 / ZIP・PDF・直接閲覧RAR・変換キャッシュを開いている /
+    /// 指定した読み込み対象がページ順を固定する「本」文脈か (= 一覧ソートが効かない)。
+    /// 製本した本 / 閲覧履歴 / ZIP・PDF・直接閲覧RAR・変換キャッシュを開いている /
     /// 画像のみフォルダを本扱いしている場合に true。
-    pub(crate) fn page_order_locked_for_current_view(&self) -> bool {
-        if self.current_folder_is_book_folder() || self.items_are_reading_history_view {
+    fn page_order_locked_for_items(
+        &self,
+        source_path: &Path,
+        items: &[GridItem],
+        view_kind: PageOrderViewKind,
+    ) -> bool {
+        if crate::books::is_direct_book_folder(&self.book_root_path(), source_path)
+            || view_kind == PageOrderViewKind::ReadingHistory
+        {
             return true;
         }
-
-        let Some(current_folder) = self.current_folder.as_deref() else {
-            return false;
-        };
-        if crate::folder_tree::is_open_as_container(current_folder) {
+        if crate::folder_tree::is_open_as_container(source_path) {
             return true;
         }
 
         self.settings.auto_fullscreen_image_folders_enabled()
-            && !self.items_are_rating_view
-            && !self.items_are_bookmark_view
-            && !self.items_are_global_search_view
-            && !self.items_are_tag_view
-            && !self.items_are_subfolder_expansion_view
-            && !self.items_are_smart_folder_view
-            && !self.items.is_empty()
-            && self
-                .items
-                .iter()
-                .all(|item| matches!(item, GridItem::Image(_)))
+            && view_kind == PageOrderViewKind::Physical
+            && Self::grid_items_are_image_only_folder_pages(items)
+    }
+
+    /// 現在のビュー用ラッパー。判定本体は読み込み前にも使える items 引数付き述語へ集約する。
+    pub(crate) fn page_order_locked_for_current_view(&self) -> bool {
+        if self.items_are_reading_history_view && self.current_folder.is_none() {
+            return true;
+        }
+        let Some(current_folder) = self.current_folder.as_deref() else {
+            return false;
+        };
+        let view_kind = if self.items_are_reading_history_view {
+            PageOrderViewKind::ReadingHistory
+        } else if self.items_are_rating_view
+            || self.items_are_bookmark_view
+            || self.items_are_global_search_view
+            || self.items_are_tag_view
+            || self.items_are_subfolder_expansion_view
+            || self.items_are_smart_folder_view
+        {
+            PageOrderViewKind::Synthetic
+        } else {
+            PageOrderViewKind::for_loading_source(current_folder)
+        };
+        self.page_order_locked_for_items(current_folder, &self.items, view_kind)
     }
 
     fn book_bookmark_view_is_synthetic(&self) -> bool {
@@ -27816,7 +27952,7 @@ impl App {
         provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
     ) {
         self.bookmark_relative_page_open_once = provenance.map(|value| (idx, value));
-        self.open_fullscreen_from_fs_navigation(ctx, idx);
+        self.open_fullscreen_from_fs_navigation(ctx, idx, crate::app::HistoryTrigger::UserChosen);
         self.bookmark_relative_page_open_once = None;
     }
 
@@ -31381,7 +31517,7 @@ impl App {
                     if !self.guard_reading_history_open(idx) {
                         return None;
                     }
-                    // 読書履歴ビューから本を開く場合は、閉じたときに読書履歴へ戻れるよう予約する。
+                    // 閲覧履歴ビューから本を開く場合は、閉じたときに閲覧履歴へ戻れるよう予約する。
                     self.note_reading_history_open(idx);
                     // ファイル名スタックの集約グリッドでメディアセルを Enter したら、フラット読書
                     // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常へ。
@@ -31443,7 +31579,7 @@ impl App {
                             // が拾って即 close する事故を防ぐ。詳細は
                             // `fs_suppress_enter_close_until_release` の doc 参照。
                             self.fs_suppress_enter_close_until_release = true;
-                            self.open_fullscreen(idx);
+                            self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
                         }
                         Some(GridItem::ConvertibleArchive { path, .. }) => {
                             let pf = path.clone();
@@ -32324,7 +32460,7 @@ impl App {
                 self.detached_viewer_independent_active = true;
                 self.detached_viewer_open_next_still_detached_once = true;
                 self.fs_open_intent_from_grid = true;
-                self.open_fullscreen(image_idx);
+                self.open_fullscreen(image_idx, crate::app::HistoryTrigger::UserChosen);
                 self.selected = Some(image_idx);
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
@@ -32573,12 +32709,14 @@ impl App {
         ctx: &egui::Context,
         restore_video_tile: bool,
         resume_slideshow: bool,
+        history_trigger: HistoryTrigger,
     ) -> &'static str {
         // フォルダナビ経路は特定 leaf を持たない (= target: None)。先頭着地。
         // 退出ルーティング (Esc→L1 / BS→L2) は現在のコンテナと設定で判定するので
         // ここでフラグを立てる必要はない。
         if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                history_trigger,
                 resume_slideshow,
                 target: DeferredFsTarget::None,
                 // 「ZIP/PDF × Ctrl+↑↓ 移動」: 続きから / 先頭から を設定で切替。
@@ -32597,6 +32735,7 @@ impl App {
             // find_fullscreen_nav_target_filtered が loose 画像なしフォルダで先頭 ZIP/PDF を
             // 仮想展開した場合もここに来る (current_folder が ZIP/PDF になっている)。
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                history_trigger,
                 resume_slideshow,
                 target: DeferredFsTarget::None,
                 // 「ZIP/PDF × Ctrl+↑↓ 移動」: 続きから / 先頭から を設定で切替。
@@ -32612,7 +32751,7 @@ impl App {
             #[cfg(not(windows))]
             let _ = restore_video_tile;
 
-            self.open_fullscreen(new_idx);
+            self.open_fullscreen(new_idx, history_trigger);
             self.selected = Some(new_idx);
             self.scroll_to_selected = true;
             self.update_last_selected_image();
@@ -32664,6 +32803,7 @@ impl App {
         let apply_seq = self.input_seq;
         let apply_mode_tag = result.mode.perf_tag();
         let continuation_mode = result.mode.clone();
+        let history_trigger = result.mode.history_trigger();
         let queued_steps = result.queued_steps;
         let mut continue_burst = true;
         if crate::perf::is_enabled() {
@@ -32749,6 +32889,7 @@ impl App {
                                 ctx,
                                 restore_video_tile,
                                 false,
+                                history_trigger,
                             );
                             if reason == "enumerate_defer" {
                                 emit_end(apply_t0, apply_seq, apply_mode_tag, reason);
@@ -32827,7 +32968,7 @@ impl App {
                     // 現在画像に留まる。フルスクリーンは維持。
                     self.slideshow_playing = false;
                     self.slideshow_anchor_idx = None;
-                    self.slideshow_scroll_anim = None;
+                    self.continuous_reading_scroll_transition = None;
                     self.slideshow_scroll_range_cache = None;
                     self.clear_pending_folder_nav_steps();
                     self.release_fs_nav_lock();
@@ -32846,7 +32987,7 @@ impl App {
         if matches!(result.mode, FolderNavMode::SlideshowNext) && !result.hit_image_folder {
             self.slideshow_playing = false;
             self.slideshow_anchor_idx = None;
-            self.slideshow_scroll_anim = None;
+            self.continuous_reading_scroll_transition = None;
             self.slideshow_scroll_range_cache = None;
             self.clear_pending_folder_nav_steps();
             self.release_fs_nav_lock();
@@ -32942,6 +33083,7 @@ impl App {
                         ctx,
                         restore_video_tile,
                         false,
+                        history_trigger,
                     );
                     if reason == "enumerate_defer" {
                         self.chain_folder_nav_if_pending(queued_steps, continuation_mode.clone());
@@ -32972,6 +33114,7 @@ impl App {
                             && self.attach_archive_convert_deferred_fullscreen(
                                 restore_video_tile,
                                 resume_slideshow,
+                                history_trigger,
                             );
                     self.clear_pending_folder_nav_steps();
                     if !deferred_conversion {
@@ -32992,6 +33135,7 @@ impl App {
                     ctx,
                     restore_video_tile,
                     resume_slideshow,
+                    history_trigger,
                 );
                 if reason == "enumerate_defer" {
                     self.chain_folder_nav_if_pending(queued_steps, continuation_mode.clone());
@@ -33048,6 +33192,7 @@ impl App {
                             ctx,
                             restore_video_tile,
                             false,
+                            history_trigger,
                         );
                         if reason == "enumerate_defer" {
                             self.chain_folder_nav_if_pending(
@@ -33076,6 +33221,7 @@ impl App {
                                 ctx,
                                 restore_video_tile,
                                 false,
+                                history_trigger,
                             );
                             if reason == "enumerate_defer" {
                                 emit_end(apply_t0, apply_seq, apply_mode_tag, reason);
@@ -33582,23 +33728,60 @@ impl App {
         self.last_book_resume = Some((folder, idx));
     }
 
-    /// 現在のフルスクリーンページを「最近読んだ本」として記録する。
-    pub(crate) fn record_reading_history(&mut self, idx: usize) {
-        if !self.settings.reading_history_enabled
+    /// Records a user-chosen fullscreen item in the persisted viewing history.
+    pub(crate) fn record_reading_history(&mut self, idx: usize, trigger: HistoryTrigger) {
+        if !trigger.should_record()
+            || !self.settings.reading_history_enabled
             || self.reading_history_writer.is_none()
-            || self.global_search.active
-            || self.items_are_global_search_view
-            || self.tag_view.active
-            || self.items_are_tag_view
-            || !self.is_readable_page_idx(idx)
         {
             return;
         }
-        let Some((page_pos, page_count)) = self.current_reading_history_page_position(idx) else {
+        let Some(item) = self.items.get(idx) else {
             return;
         };
-        let Some((path, kind, archive_format)) = self.reading_history_target_for_page(idx) else {
+        let is_media = matches!(item, GridItem::Video(_) | GridItem::Audio(_));
+        if !is_media
+            && (self.global_search.active
+                || self.items_are_global_search_view
+                || self.tag_view.active
+                || self.items_are_tag_view)
+        {
             return;
+        }
+        let (path, kind, archive_format, last_page, page_count) = match item {
+            GridItem::Video(path) => (
+                path.clone(),
+                crate::reading_history_db::ReadingHistoryKind::Video,
+                None,
+                None,
+                None,
+            ),
+            GridItem::Audio(path) => (
+                path.clone(),
+                crate::reading_history_db::ReadingHistoryKind::Audio,
+                None,
+                None,
+                None,
+            ),
+            _ if self.is_readable_page_idx(idx) => {
+                let Some((page_pos, page_count)) = self.current_reading_history_page_position(idx)
+                else {
+                    return;
+                };
+                let Some((path, kind, archive_format)) = self.reading_history_target_for_page(idx)
+                else {
+                    return;
+                };
+                let keep_progress = !self.zip_nav.as_ref().is_some_and(|n| !n.at_root());
+                (
+                    path,
+                    kind,
+                    archive_format,
+                    keep_progress.then_some(page_pos),
+                    keep_progress.then_some(page_count),
+                )
+            }
+            _ => return,
         };
         let key = crate::path_key::normalize_keep_drive(&path);
         let now = std::time::Instant::now();
@@ -33614,15 +33797,14 @@ impl App {
             return;
         }
 
-        let keep_progress = !self.zip_nav.as_ref().is_some_and(|n| !n.at_root());
         let title = reading_history_title_for_path(&path);
         let entry = crate::reading_history_db::ReadingHistoryEntry::new(
             path,
             kind,
             archive_format,
             title,
-            keep_progress.then_some(page_pos),
-            keep_progress.then_some(page_count),
+            last_page,
+            page_count,
         );
         if let Some(writer) = &self.reading_history_writer {
             writer.record(entry, self.settings.reading_history_limit);
@@ -35834,7 +36016,7 @@ impl App {
         &mut self,
         plans: &[ViewerContextMediaTeardownPlan],
     ) {
-        let updates: Vec<ViewerContextMediaResumeUpdate> = plans
+        let updates: Vec<MediaResumeUpdate> = plans
             .iter()
             .flat_map(|plan| plan.resume_updates.iter().cloned())
             .collect();
@@ -36944,6 +37126,7 @@ impl App {
             && let Some(target) = target
         {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::Required(target),
                 resume_to_last_page: false,
@@ -37270,7 +37453,7 @@ impl App {
             self.detached_viewer_open_next_still_detached_once = true;
             self.fs_open_intent_from_grid = false;
             self.adopt_active_detached_viewport_runtime_from_passive("resume_still_snapshot");
-            self.open_fullscreen(idx);
+            self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
             if let Some((zoom, pan)) = activate_zoom_pan {
                 self.fs_zoom = zoom;
                 self.fs_pan = pan;
@@ -38132,7 +38315,7 @@ impl App {
             slideshow_playing,
             slideshow_next_at,
             slideshow_anchor_idx,
-            slideshow_scroll_anim,
+            continuous_reading_scroll_transition,
             slideshow_scroll_range_cache,
             pdf_enumerate_pending,
             zip_enumerate_pending,
@@ -38294,7 +38477,7 @@ impl App {
             slideshow_playing,
             slideshow_next_at,
             slideshow_anchor_idx,
-            slideshow_scroll_anim,
+            continuous_reading_scroll_transition,
             slideshow_scroll_range_cache,
             cached_fs_seek_info,
             fs_nav_locked_gen,
@@ -38552,7 +38735,7 @@ impl App {
         ));
 
         self.with_active_detached_viewer_context(|detached| {
-            detached.open_fullscreen(idx);
+            detached.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
         })
         .expect("materialized physical context must remain present while opening");
         true
@@ -39889,10 +40072,14 @@ impl App {
                     .retain(|(idx, _, _)| *idx != selected);
             }
             let cursor_state = self.fullscreen_cursor_state();
-            self.open_fullscreen(selected);
+            self.open_fullscreen(selected, crate::app::HistoryTrigger::UserChosen);
             self.restore_fullscreen_cursor_state(ctx, cursor_state);
         } else {
-            self.open_fullscreen_from_fs_navigation(ctx, selected);
+            self.open_fullscreen_from_fs_navigation(
+                ctx,
+                selected,
+                crate::app::HistoryTrigger::UserChosen,
+            );
         }
         self.selected = Some(selected);
         self.scroll_to_selected = true;
@@ -40402,7 +40589,7 @@ impl App {
     /// ユーザー入力起点の場合は事前に `bump_input_seq` すること。slideshow や
     /// 見開き正規化のような内部起動は bump しないので、fs load は現在の
     /// `self.input_seq` (= 直近のユーザー入力) に紐づく。
-    pub fn open_fullscreen(&mut self, idx: usize) {
+    pub fn open_fullscreen(&mut self, idx: usize, history_trigger: HistoryTrigger) {
         #[cfg(windows)]
         if self.route_materialized_physical_still_open_to_active_context(idx) {
             return;
@@ -40484,7 +40671,7 @@ impl App {
         // 本ごとの読書位置レジューム: 画像本のページを開くたびに最後のページを記録
         // (再起動を跨いで復元する。dedup 付きなので連続ページ送りでも書き込みは最小)。
         self.record_book_resume(idx);
-        self.record_reading_history(idx);
+        self.record_reading_history(idx, history_trigger);
         self.video_continuous_last_eof = None;
         #[cfg(windows)]
         let entering_native_video_fullscreen =
@@ -40603,7 +40790,7 @@ impl App {
         self.fs_pan = egui::Vec2::ZERO;
         self.fs_pan_drag_start = None;
         self.fs_vertical_scroll = 0.0;
-        self.slideshow_scroll_anim = None;
+        self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
         self.fs_seek_drag_active = false;
         self.fs_seek_overlay_visible = false;
@@ -42497,10 +42684,11 @@ impl App {
                     }
                 }
             }
-            if !self.bookmark_view_matches_filter(i) {
+            if !self.bookmark_view_matches_filter(i) || !self.reading_history_view_matches_filter(i)
+            {
                 continue;
             }
-            if !self.items_are_reading_history_view && !self.passes_facet_filter(i, None) {
+            if !self.passes_facet_filter(i, None) {
                 continue;
             }
             if !self.passes_color_filter_for_scope(i, color_scope_signature) {
@@ -42632,10 +42820,11 @@ impl App {
                     }
                 }
             }
-            if !self.bookmark_view_matches_filter(i) {
+            if !self.bookmark_view_matches_filter(i) || !self.reading_history_view_matches_filter(i)
+            {
                 continue;
             }
-            if self.items_are_reading_history_view || self.passes_facet_filter(i, Some(ignore)) {
+            if self.passes_facet_filter(i, Some(ignore)) {
                 out.push(i);
             }
         }
@@ -42663,6 +42852,46 @@ impl App {
                 .bookmark_book_kind_filter
                 .matches(bookmark.container_kind),
             _ => true,
+        }
+    }
+
+    pub(crate) fn reading_history_view_matches_filter(&self, idx: usize) -> bool {
+        use crate::bookmark_browser::{BookKindFilter, MediaFilter};
+        use crate::reading_history_db::ReadingHistoryKind;
+
+        if !self.items_are_reading_history_view {
+            return true;
+        }
+        let Some(entry) = self
+            .items
+            .get(idx)
+            .and_then(reading_history_key_for_item)
+            .and_then(|key| self.reading_history_rows.get(&key))
+        else {
+            return false;
+        };
+        let media = match entry.kind {
+            ReadingHistoryKind::Video => MediaFilter::Video,
+            ReadingHistoryKind::Audio => MediaFilter::Audio,
+            ReadingHistoryKind::Folder
+            | ReadingHistoryKind::Zip
+            | ReadingHistoryKind::Pdf
+            | ReadingHistoryKind::Archive => MediaFilter::Book,
+        };
+        if self.reading_history_media_filter != MediaFilter::All
+            && self.reading_history_media_filter != media
+        {
+            return false;
+        }
+        if media != MediaFilter::Book {
+            return true;
+        }
+        match self.reading_history_book_kind_filter {
+            BookKindFilter::All => true,
+            BookKindFilter::ImageFolder => entry.kind == ReadingHistoryKind::Folder,
+            BookKindFilter::Zip => entry.kind == ReadingHistoryKind::Zip,
+            BookKindFilter::Pdf => entry.kind == ReadingHistoryKind::Pdf,
+            BookKindFilter::OtherArchive => entry.kind == ReadingHistoryKind::Archive,
         }
     }
 
@@ -45166,7 +45395,7 @@ impl App {
             ));
         }
         let folder = self.current_folder.as_ref()?;
-        // 検索結果 / 読書履歴 / レーティング一覧の擬似パスは実コンテナではない。
+        // 検索結果 / 閲覧履歴 / レーティング一覧の擬似パスは実コンテナではない。
         if is_synthetic_view_path(folder) {
             return None;
         }
@@ -47784,6 +48013,10 @@ impl App {
         }
 
         if current_loading {
+            // Paged and continuous-reading prefetch must both re-assert the
+            // current producer: `NeedsLoad` may cancel siblings but must not
+            // leave the display target without an in-flight request.
+            self.ensure_fs_page_load(current_idx);
             return;
         }
 
@@ -48313,7 +48546,7 @@ impl App {
         self.clear_meta_undo();
         self.slideshow_playing = false;
         self.slideshow_anchor_idx = None;
-        self.slideshow_scroll_anim = None;
+        self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
         self.fs_opened_at = None;
         self.fs_focus_grace_elapsed = false;
@@ -58351,7 +58584,7 @@ impl App {
         // しておく。これらは 360 OFF 後にユーザーが再度有効化できる。
         self.slideshow_playing = false;
         self.slideshow_anchor_idx = None;
-        self.slideshow_scroll_anim = None;
+        self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
         self.adjustment_mode = false;
         self.cache_current_edit_preview_if_ready();
@@ -59106,11 +59339,61 @@ impl App {
         }
     }
 
+    fn update_reading_history_media_progress(
+        &mut self,
+        path: &Path,
+        position_secs: f64,
+        duration_secs: f64,
+    ) {
+        let Some(update) = crate::reading_history_db::MediaProgressUpdate::from_seconds(
+            path,
+            position_secs,
+            duration_secs,
+        ) else {
+            return;
+        };
+        if let Some(entry) = self.reading_history_rows.get_mut(&update.key)
+            && matches!(
+                entry.kind,
+                crate::reading_history_db::ReadingHistoryKind::Video
+                    | crate::reading_history_db::ReadingHistoryKind::Audio
+            )
+        {
+            entry.media_position_ms = Some(update.position_ms);
+            entry.media_duration_ms = Some(update.duration_ms);
+        }
+        if let Some(writer) = &self.reading_history_writer {
+            writer.update_media_progress(update);
+        }
+    }
+
+    /// 手動 flush と定期保存が共有する、再生位置更新の唯一の適用入口。
+    fn apply_media_resume_updates(&mut self, updates: Vec<MediaResumeUpdate>) {
+        for update in updates {
+            self.update_reading_history_media_progress(
+                &update.path,
+                update.position,
+                update.duration,
+            );
+            let kept = save_video_resume_position(
+                &mut self.settings.video_resume_positions,
+                update.key.clone(),
+                update.position,
+                update.duration,
+                update.at_eof,
+            );
+            #[cfg(windows)]
+            if !kept {
+                self.video_resume_thumb_last_request.remove(&update.key);
+            }
+        }
+    }
+
     /// 動画再生プレイヤーの tick。
     /// fs_cache 内の `FsCacheEntry::Video` ごとに [`crate::video::VideoPlayer::tick`] を呼ぶ。
     /// 通常はフルスクリーン中の 1 つだけが入っている (動画は先読みしないため)。
     pub(crate) fn save_all_video_resume_positions(&mut self) {
-        let mut updates: Vec<(String, f64, f64, bool)> = Vec::new();
+        let mut updates: Vec<MediaResumeUpdate> = Vec::new();
         #[cfg(windows)]
         let mut thumb_requests: Vec<(std::path::PathBuf, String, f64)> = Vec::new();
         for (idx, entry) in &self.fs_cache {
@@ -59124,22 +59407,16 @@ impl App {
                 let pos = video_resume_position_for_save(player, audio_mode_without_vst);
                 #[cfg(windows)]
                 thumb_requests.push((player.path().clone(), key.clone(), pos));
-                updates.push((key, pos, player.duration(), player.is_at_eof()));
+                updates.push(MediaResumeUpdate {
+                    path: player.path().clone(),
+                    key,
+                    position: pos,
+                    duration: player.duration(),
+                    at_eof: player.is_at_eof(),
+                });
             }
         }
-        for (key, pos, dur, at_eof) in updates {
-            let kept = save_video_resume_position(
-                &mut self.settings.video_resume_positions,
-                key.clone(),
-                pos,
-                dur,
-                at_eof,
-            );
-            #[cfg(windows)]
-            if !kept {
-                self.video_resume_thumb_last_request.remove(&key);
-            }
-        }
+        self.apply_media_resume_updates(updates);
         #[cfg(windows)]
         for (path, key, pos) in thumb_requests {
             if self.settings.video_resume_positions.contains_key(&key) {
@@ -59722,11 +59999,18 @@ impl App {
         action: MediaNavigationAction,
         target_idx: Option<usize>,
     ) {
+        let history_trigger = action.history_trigger();
         match action {
             MediaNavigationAction::VideoContinuousEof {
                 fs_idx,
                 seek_serial,
-            } => self.apply_video_continuous_eof_target(ctx, fs_idx, seek_serial, target_idx),
+            } => self.apply_video_continuous_eof_target(
+                ctx,
+                fs_idx,
+                seek_serial,
+                target_idx,
+                history_trigger,
+            ),
             #[cfg(windows)]
             MediaNavigationAction::VideoAudioModeContinuousEof {
                 fs_idx,
@@ -59736,11 +60020,18 @@ impl App {
                 fs_idx,
                 seek_serial,
                 target_idx,
+                history_trigger,
             ),
             MediaNavigationAction::MusicContinuousEof {
                 fs_idx,
                 seek_serial,
-            } => self.apply_music_continuous_eof_target(ctx, fs_idx, seek_serial, target_idx),
+            } => self.apply_music_continuous_eof_target(
+                ctx,
+                fs_idx,
+                seek_serial,
+                target_idx,
+                history_trigger,
+            ),
             MediaNavigationAction::Manual {
                 fs_idx,
                 delta,
@@ -59752,11 +60043,15 @@ impl App {
                 if let Some(new_idx) = target_idx {
                     match landing {
                         ManualMediaNavigationLanding::Fullscreen => {
-                            self.open_fullscreen_from_fs_navigation(ctx, new_idx);
+                            self.open_fullscreen_from_fs_navigation(ctx, new_idx, history_trigger);
                         }
                         #[cfg(windows)]
                         ManualMediaNavigationLanding::NativeVideo => {
-                            self.open_native_video_fullscreen_from_navigation(ctx, new_idx);
+                            self.open_native_video_fullscreen_from_navigation(
+                                ctx,
+                                new_idx,
+                                history_trigger,
+                            );
                         }
                     }
                 } else {
@@ -59874,6 +60169,7 @@ impl App {
         fs_idx: usize,
         seek_serial: u64,
         target_idx: Option<usize>,
+        history_trigger: HistoryTrigger,
     ) {
         if self.fullscreen_idx != Some(fs_idx)
             || self.video_continuous_last_eof != Some((fs_idx, seek_serial))
@@ -59915,13 +60211,14 @@ impl App {
             next_idx,
             Some(true),
             true,
+            history_trigger,
         );
         #[cfg(not(windows))]
         {
             let _ = ctx;
             self.fs_video_open_autoplay_override = Some(true);
             self.fs_video_open_ignore_resume_once = true;
-            self.open_fullscreen(next_idx);
+            self.open_fullscreen(next_idx, history_trigger);
         }
     }
 
@@ -60003,6 +60300,7 @@ impl App {
         fs_idx: usize,
         seek_serial: u64,
         target_idx: Option<usize>,
+        history_trigger: HistoryTrigger,
     ) {
         if self.fullscreen_idx != Some(fs_idx)
             || self.video_audio_mode != Some(fs_idx)
@@ -60038,7 +60336,8 @@ impl App {
         // one-shot: defer が pending.audio_mode_after_swap へ焼き込み + deferral 開始時から
         // video_audio_mode=Some(next) を維持する。呼び出し直後に必ず戻す。
         self.source_swap_keep_audio_mode = true;
-        let swap_started = self.try_start_native_video_fast_swap(ctx, next_idx, Some(true), true);
+        let swap_started =
+            self.try_start_native_video_fast_swap(ctx, next_idx, Some(true), true, history_trigger);
         self.source_swap_keep_audio_mode = false;
         if !swap_started {
             // source-swap を開始できない稀ケース (native 出力が取れない等)。可視動画で開くと
@@ -60279,6 +60578,7 @@ impl App {
         fs_idx: usize,
         seek_serial: u64,
         target_idx: Option<usize>,
+        history_trigger: HistoryTrigger,
     ) {
         if self.fullscreen_idx != Some(fs_idx)
             || self.video_continuous_last_eof != Some((fs_idx, seek_serial))
@@ -60303,7 +60603,7 @@ impl App {
         }
         // 手動の音声前/次ファイルナビと同じ着地経路 (open_fullscreen が Audio → 音楽ビューへ
         // dispatch、build_audio_player_for_open は autoplay=true)。
-        self.open_fullscreen_from_fs_navigation(ctx, next_idx);
+        self.open_fullscreen_from_fs_navigation(ctx, next_idx, history_trigger);
     }
 
     /// ParkedLive poll 中の音声 EOF 進行。通常の `open_fullscreen` 系へ入ると active session /
@@ -60360,7 +60660,7 @@ impl App {
             .video_resume_last_save
             .map(|t| now.duration_since(t).as_secs_f64() >= 5.0)
             .unwrap_or(true);
-        let mut updates: Vec<(String, f64, f64, bool)> = Vec::new();
+        let mut updates: Vec<MediaResumeUpdate> = Vec::new();
 
         // Phase 0: bookmark cache を ensure (Phase 1 / Phase 3 で直読みするため)。
         // 既存の sync_native_video_timeline_markers 経路でも ensure されているが、
@@ -60553,7 +60853,13 @@ impl App {
                         player,
                         video_audio_mode == Some(*idx) && video_audio_vst_idx != Some(*idx),
                     );
-                    updates.push((path_key, pos, player.duration(), player.is_at_eof()));
+                    updates.push(MediaResumeUpdate {
+                        path: player.path().clone(),
+                        key: path_key,
+                        position: pos,
+                        duration: player.duration(),
+                        at_eof: player.is_at_eof(),
+                    });
                 }
                 if continuous_enabled
                     && !continuous_tile_active
@@ -60771,19 +61077,7 @@ impl App {
         }
         if do_save {
             self.video_resume_last_save = Some(now);
-            for (key, pos, dur, at_eof) in updates {
-                let kept = save_video_resume_position(
-                    &mut self.settings.video_resume_positions,
-                    key.clone(),
-                    pos,
-                    dur,
-                    at_eof,
-                );
-                #[cfg(windows)]
-                if !kept {
-                    self.video_resume_thumb_last_request.remove(&key);
-                }
-            }
+            self.apply_media_resume_updates(updates);
         }
         if let Some(d) = next_repaint {
             let d = d.saturating_sub(poll_started.elapsed());
@@ -60821,6 +61115,7 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.acknowledge_tray_resident_media_wake();
         crate::record_ui_heartbeat_tick();
         self.poll_remote_session(ctx);
         // Select and cache the root viewport owner before any shortcut path.
@@ -60837,10 +61132,11 @@ impl eframe::App for App {
             self.sync_native_video_grade();
         }
         if let Some(render_state) = self.wgpu_render_state.as_ref() {
-            render_state
-                .renderer
-                .write()
-                .set_image_lod_bias(self.settings.image_mipmap_lod_bias);
+            let mut renderer = render_state.renderer.write();
+            renderer.set_image_mipmap_sampling_enabled(
+                self.settings.image_mipmap_moire_reduction_enabled,
+            );
+            renderer.set_image_lod_bias(self.settings.image_mipmap_lod_bias);
         }
         // prefetch suppression gate: 同フレーム内の scroll 入力を即時に拾う。
         // `scroll_offset_y` への反映 (= process_scroll / handle_keyboard) を待たないので、
@@ -63371,6 +63667,42 @@ fn reading_history_storage_root_available(_path: &std::path::Path) -> bool {
     true
 }
 
+struct ReadingHistoryLoadInputs {
+    items: Vec<GridItem>,
+    image_metas: Vec<Option<(i64, i64)>>,
+    video_items: Vec<(usize, PathBuf, u64)>,
+    rows: std::collections::HashMap<String, crate::reading_history_db::ReadingHistoryEntry>,
+}
+
+fn reading_history_load_inputs(
+    entries: Vec<crate::reading_history_db::ReadingHistoryEntry>,
+) -> ReadingHistoryLoadInputs {
+    let mut items = Vec::with_capacity(entries.len());
+    let mut image_metas = Vec::with_capacity(entries.len());
+    let mut video_items = Vec::new();
+    let mut rows = std::collections::HashMap::with_capacity(entries.len());
+    for entry in entries {
+        let idx = items.len();
+        let item = reading_history_grid_item(&entry);
+        if matches!(item, GridItem::Video(_)) {
+            let file_size = entry
+                .file_size
+                .and_then(|size| u64::try_from(size).ok())
+                .unwrap_or(0);
+            video_items.push((idx, entry.path.clone(), file_size));
+        }
+        image_metas.push(reading_history_meta_for_entry(&entry));
+        items.push(item);
+        rows.insert(entry.key.clone(), entry);
+    }
+    ReadingHistoryLoadInputs {
+        items,
+        image_metas,
+        video_items,
+        rows,
+    }
+}
+
 fn reading_history_grid_item(entry: &crate::reading_history_db::ReadingHistoryEntry) -> GridItem {
     match entry.kind {
         crate::reading_history_db::ReadingHistoryKind::Folder => {
@@ -63391,6 +63723,8 @@ fn reading_history_grid_item(entry: &crate::reading_history_db::ReadingHistoryEn
                 GridItem::ZipFile(entry.path.clone())
             }
         }
+        crate::reading_history_db::ReadingHistoryKind::Video => GridItem::Video(entry.path.clone()),
+        crate::reading_history_db::ReadingHistoryKind::Audio => GridItem::Audio(entry.path.clone()),
     }
 }
 
@@ -63403,7 +63737,10 @@ fn reading_history_meta_for_entry(
 }
 
 pub(crate) fn reading_history_key_for_item(item: &GridItem) -> Option<String> {
-    let path = item.container_path()?;
+    let path = match item {
+        GridItem::Video(path) | GridItem::Audio(path) => path.as_path(),
+        _ => item.container_path()?,
+    };
     Some(crate::path_key::normalize_keep_drive(path))
 }
 

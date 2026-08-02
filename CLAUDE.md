@@ -395,10 +395,11 @@ TextEdit を含むダイアログで Enter / Escape を拾うときは **必ず�
 
 - **確定用**: `self.dialog_enter_pressed(ctx)` — IME 変換中は常に false
 - **キャンセル用**: `self.dialog_escape_pressed(ctx)` — IME 変換中は常に false
-- **判定ロジック**: `App::ime_input_active(ctx)` は `ime_focus` が `ViewportId` ごとの
-  `ctx.data_temp` に保持する composition 状態と、同じ viewport で直近 300ms 以内に届いた
-  Ime イベント有無の OR で判定。300ms グレースは Windows IME で `Ime::Disabled` と
-  `Key::Escape` が別フレームに届くケースを吸収するため。App-global な IME bool は持たない。
+- **判定ロジック**: 各 egui Context に登録した `ime_focus` の input plugin が
+  `ViewportId` ごとの composition 状態を単一 ownership で保持する。
+  `App::ime_input_active(ctx)` は現在 composing、または同じ viewport で直近 300ms 以内に
+  Ime event があった場合に true。300ms グレースは App shortcut 抑止専用であり、
+  Esc event の除去条件には使わない。
 
 上記はアプリ操作を抑止する責務で、TextEdit の focus 復帰とは別。日本語を入力できる新しい
 single-line TextEdit は `crate::ime_focus` の helper 経由で描画すること。同 helper が IME の
@@ -411,12 +412,22 @@ IMM32 の 2 経路と未対応範囲の正本は [src/ime_focus.rs](src/ime_focu
 
 **ビューポート別のイベントキュー**:
 egui の `show_viewport_immediate` は独立したイベントキューを持つ。メインビューポートと
-フルスクリーンビューポートは別キュー。IME 状態はビューポートごとに追跡が必要なので、
-`App::update_ime_state(ctx)` は **各ビューポートの入り口**で呼ばれている:
+フルスクリーンビューポートは別キュー。plugin は `memory.begin_pass` より前に各 RawInput を
+viewport ごとに追跡する。`App::update_ime_state(ctx)` は helper-field 診断を処理前に始めるため
+**各ビューポートの入り口**で呼ばれている:
 - メイン: [src/app.rs](src/app.rs) の `App::update` 先頭
 - フルスクリーン: [src/ui_fullscreen.rs](src/ui_fullscreen.rs) の `show_viewport_immediate` closure 先頭
 
 新しいビューポートを追加した場合、closure 先頭で `self.update_ime_state(ctx)` を必ず呼ぶこと。
+別 viewport を対象にする consumer は、その対象の既存 `ViewportId` を選んで
+`ime_focus::ime_input_active_in_viewport` から共有 snapshot を読む。これは read-only の入口であり、
+対象 viewport の event queue や composition state を更新しない。更新は必ず所有 viewport の pass に残す。
+
+変換中の Esc press は同 plugin が RawInput から除去し、egui の `Focus::begin_pass` に
+見せない。release は残す。これにより TextEdit の未確定文字選択を保ったまま、Windows が
+空の `Preedit("")` を送らず `Disabled` だけを送る経路では、Commit の無い composing
+`Disabled` の直前だけ空 preedit を補える。composition が無い `Disabled` へは挿入せず、
+非 composing Esc と 300ms grace 中だけの Esc は通常入力として残す。
 
 **借用の注意**:
 `egui::Window::show(ctx, |ui| {...})` の closure 内で `self` 経由のメソッド呼び出しは
@@ -1563,11 +1574,17 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    ```powershell
    .\scripts\check-idle-health.ps1 -Scenario static-foreground
    .\scripts\check-idle-health.ps1 -NoLaunch -Scenario static-background
-   .\scripts\check-idle-health.ps1 -NoLaunch -Scenario video-pin-background
+   .\scripts\check-idle-health.ps1 -NoLaunch -Scenario video-pin-background -TargetKey '<動画を代表画像に固定したフォルダのパス>'
    ```
    - 最初のコマンドが `mimageviewer-core.exe --perf-log` を起動する。各シナリオを準備して
      Enter を押す。前面シナリオは warmup 5 秒中にアプリへフォーカスを戻し、測定 15 秒の
      開始表示後は入力しない。背面シナリオは別ウィンドウを前面に保つ。
+   - **3 番目は `-TargetKey` が必須** (無いと引数エラーで即停止する)。値は perf log の
+     thumbnail key (フォルダタイルは `dir::<path>` 形式) への大文字小文字無視の部分一致。
+     **ピン作成直後は成立しない** — 作りたてのサムネイルは `from_cache=false` でアイドル
+     高画質化の候補にならないため、アプリ再起動後などキャッシュから読み直される状態で測る。
+     該当フォルダを用意できない版では、このシナリオを飛ばした旨と理由をリリース記録に残す
+     (アイドル高画質化パスに触れていない版なら妥当な waiver)。
    - CPU one-core ratio、update rate、repaint reason streak、同一 thumbnail work、通常 / perf
      ログ増加量のどれかが上限を超えたら exit 1。失敗を閾値緩和だけで通さず、
      `target/idle-health/*-perf.json` の原因と反復 key を確認する。

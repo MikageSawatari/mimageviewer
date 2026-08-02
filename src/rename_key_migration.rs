@@ -3,7 +3,7 @@
 //! アプリ内リネーム (`ui_dialogs/rename_item.rs`) の成功後に、旧 path をキーにした
 //! ユーザーデータ (★ / タグ / 回転 / 補正 / マスク / 隠蔽 / ローカル調整 / テキスト注釈 /
 //! 出力範囲 / 動画ピン / 動画・音楽ブックマーク / 本ページブックマーク / 代表サムネピン / 本 resume / 見開き /
-//! 読書履歴 / 編集プレビュー / PDF パスワード / 動画 .xmp サイドカー) を新 path キーへ引き継ぐ
+//! 閲覧履歴 / 編集プレビュー / PDF パスワード / 動画 .xmp サイドカー) を新 path キーへ引き継ぐ
 //! (docs/next-release-backlog.md §1.8 の段階 1+2、review-v2.3.0 角度④ (C))。
 //!
 //! 方式は [`crate::zip_key_migration`] と同じ:
@@ -21,7 +21,7 @@
 //! ## 対象外 (許容する制限)
 //! - **フォルダ改名時の配下 PDF パスワード**: キーが SHA-256 ハッシュのため列挙不可。
 //!   単一 PDF の改名だけ平文を読み直して付け替える。
-//! - **読書履歴の配下 prefix**: 履歴は自己修復する (次に開いたとき新キーで upsert)
+//! - **閲覧履歴の配下 prefix**: 履歴は自己修復する (次に開いたとき新キーで upsert)
 //!   ため exact のみ移行し、title も次回オープンで更新されるのに任せる。
 //! - **代表サムネピンの親フォルダ側 `source_rel`**: 親ピンが改名した子を container 相対
 //!   パスで指しているケース。大文字小文字を保った照合が SQL では難しく、壊れても
@@ -34,6 +34,51 @@
 //!   成功ハンドラからしか呼ばれない (外部リネームの検知は将来課題)。
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+
+#[derive(Debug)]
+struct JournalWriteSnapshot {
+    revision: u64,
+    data_dir: PathBuf,
+    entries: Vec<(PathBuf, PathBuf)>,
+}
+
+#[derive(Default)]
+struct JournalWriteState {
+    next_revision: u64,
+    latest: Option<JournalWriteSnapshot>,
+    completed_revision: u64,
+    shutdown: bool,
+    worker_stopped: bool,
+}
+
+impl JournalWriteState {
+    fn enqueue(&mut self, data_dir: PathBuf, entries: Vec<(PathBuf, PathBuf)>) -> u64 {
+        self.next_revision = self.next_revision.wrapping_add(1).max(1);
+        let revision = self.next_revision;
+        // App owns the contents. Keep only the newest waiting snapshot while an older write runs.
+        self.latest = Some(JournalWriteSnapshot {
+            revision,
+            data_dir,
+            entries,
+        });
+        revision
+    }
+
+    fn take_latest(&mut self) -> Option<JournalWriteSnapshot> {
+        self.latest.take()
+    }
+
+    fn complete(&mut self, revision: u64) {
+        self.completed_revision = self.completed_revision.max(revision);
+    }
+
+    fn is_flushed(&self, revision: u64) -> bool {
+        self.completed_revision >= revision
+    }
+}
+
+type JournalWriterShared = Arc<(Mutex<JournalWriteState>, Condvar)>;
 
 /// SQLite の既定可変長 parameter 上限 (999) を十分下回る exact purge の batch 幅。
 const PURGE_EXACT_BATCH_SIZE: usize = 500;
@@ -50,11 +95,11 @@ pub struct RenameMigrationReport {
 
 /// 未完了移行のジャーナルファイル名 (data_dir 直下)。
 ///
-/// リネーム移行は in-memory FIFO で直列実行されるため、通常終了・クラッシュ・トレイの
-/// 「終了」(hidden 時は `std::process::exit` で `on_exit` を通らない) でキュー / 実行中
+/// リネーム移行は in-memory FIFO で直列実行されるため、通常終了・クラッシュでキュー / 実行中
 /// ジョブが失われると、ファイルは新名なのにメタデータが旧キーに取り残される
-/// (角度⑤ Sol/Terra P1)。そこで enqueue 時にジャーナルへ追記し、**report を受信できた
-/// ジョブだけ**消し込む。起動時に残エントリを再実行すれば、クラッシュで一部ストアだけ
+/// (角度⑤ Sol/Terra P1)。そこで状態変化ごとに完全 snapshot を latest-value writer へ送り、
+/// **report を受信できたジョブだけ**消し込む。通常終了は最新 revision まで flush する。
+/// 起動時に残エントリを再実行すれば、クラッシュで一部ストアだけ
 /// commit された移行も冪等性 (UPDATE OR IGNORE + DELETE / 存在確認付き sidecar 改名)
 /// により安全に完走する。ジャーナルは「移行が少なくとも 1 回走ること」を保証するもので、
 /// per-store エラーの再試行はしない (通常経路と同じ best-effort)。
@@ -95,6 +140,105 @@ pub fn journal_save(data_dir: &Path, entries: &[(PathBuf, PathBuf)]) {
     }
 }
 
+/// Single background owner for rename-migration journal writes. The UI publishes complete
+/// latest-value snapshots, and one worker performs all filesystem I/O in revision order.
+pub(crate) struct RenameMigrationJournalWriter {
+    shared: JournalWriterShared,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RenameMigrationJournalWriter {
+    pub(crate) fn spawn() -> Self {
+        let shared = Arc::new((Mutex::new(JournalWriteState::default()), Condvar::new()));
+        let copy = Arc::clone(&shared);
+        let handle = std::thread::Builder::new()
+            .name("rename-migration-journal".into())
+            .spawn(move || run_journal_writer(copy))
+            .ok();
+        if handle.is_none() {
+            shared.as_ref().0.lock().unwrap().worker_stopped = true;
+            shared.as_ref().1.notify_all();
+            crate::logger::log("[RENAME-MIG] journal writer spawn failed");
+        }
+        Self { shared, handle }
+    }
+
+    pub(crate) fn enqueue(&self, data_dir: PathBuf, entries: Vec<(PathBuf, PathBuf)>) {
+        let (state, cv) = self.shared.as_ref();
+        let mut state = state.lock().unwrap();
+        if state.worker_stopped || state.shutdown {
+            crate::logger::log("[RENAME-MIG] journal writer unavailable; snapshot not saved");
+            return;
+        }
+        state.enqueue(data_dir, entries);
+        cv.notify_one();
+    }
+
+    pub(crate) fn flush(&self) {
+        let (state, cv) = self.shared.as_ref();
+        let mut state = state.lock().unwrap();
+        let target = state.next_revision;
+        while !state.is_flushed(target) && !state.worker_stopped {
+            state = cv.wait(state).unwrap();
+        }
+        if !state.is_flushed(target) {
+            crate::logger::log(format!(
+                "[RENAME-MIG] journal writer stopped before flush revision {target}"
+            ));
+        }
+    }
+}
+
+impl Drop for RenameMigrationJournalWriter {
+    fn drop(&mut self) {
+        self.flush();
+        {
+            let (state, cv) = self.shared.as_ref();
+            state.lock().unwrap().shutdown = true;
+            cv.notify_all();
+        }
+        if let Some(handle) = self.handle.take() {
+            if handle.join().is_err() {
+                crate::logger::log("[RENAME-MIG] journal writer panicked during shutdown");
+            }
+        }
+    }
+}
+
+struct JournalWriterStopGuard(JournalWriterShared);
+
+impl Drop for JournalWriterStopGuard {
+    fn drop(&mut self) {
+        let (state, cv) = self.0.as_ref();
+        if let Ok(mut state) = state.lock() {
+            state.worker_stopped = true;
+            cv.notify_all();
+        }
+    }
+}
+
+fn run_journal_writer(shared: JournalWriterShared) {
+    let _stop_guard = JournalWriterStopGuard(Arc::clone(&shared));
+    loop {
+        let snapshot = {
+            let (state, cv) = shared.as_ref();
+            let mut state = state.lock().unwrap();
+            while state.latest.is_none() && !state.shutdown {
+                state = cv.wait(state).unwrap();
+            }
+            match state.take_latest() {
+                Some(snapshot) => snapshot,
+                None if state.shutdown => return,
+                None => continue,
+            }
+        };
+        journal_save(&snapshot.data_dir, &snapshot.entries);
+        let (state, cv) = shared.as_ref();
+        state.lock().unwrap().complete(snapshot.revision);
+        cv.notify_all();
+    }
+}
+
 /// path-keyed SQLite ストアのキー正規化規則。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StoreKeyNormalization {
@@ -107,7 +251,7 @@ pub(crate) enum StoreKeyNormalization {
 /// リネームと mIV 内削除成功時 hard purge が共有する path-keyed SQLite 記述子。
 ///
 /// `unique` は rename の衝突処理にだけ使う。purge は全行を素の `DELETE` にする。
-/// `rename_generic=false` は raw `path` 列も同時更新する読書履歴だけで、rename 側は専用処理を
+/// `rename_generic=false` は raw `path` 列も同時更新する閲覧履歴だけで、rename 側は専用処理を
 /// 使うが purge 側は同じ記述子を使う。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StoreDescriptor {
@@ -346,7 +490,7 @@ pub fn run_at(data_dir: &Path, old_path: &Path, new_path: &Path) -> RenameMigrat
     // してはならない。専用 transaction で case-only rename も含めて追従させる。
     migrate_book_bookmarks(data_dir, old_path, new_path, &mut report);
 
-    // 5. 読書履歴 (exact のみ。raw path 列も更新する)。記述子自体は STORES にあり、
+    // 5. 閲覧履歴 (exact のみ。raw path 列も更新する)。記述子自体は STORES にあり、
     //    purge は exact + prefix で同じ行を削除する。
     if old_k != new_k {
         migrate_reading_history(data_dir, new_path, &old_k, &new_k, &mut report);
@@ -734,7 +878,7 @@ fn migrate_pdf_password(old_path: &Path, new_path: &Path, report: &mut RenameMig
     }
 }
 
-/// 読書履歴の exact 移行。key (正規化) と path (raw) の両方を新 path へ更新する。
+/// 閲覧履歴の exact 移行。key (正規化) と path (raw) の両方を新 path へ更新する。
 /// title は次回オープン時の upsert で自然に新名へ更新されるため触らない。
 fn migrate_reading_history(
     data_dir: &Path,
@@ -1095,6 +1239,36 @@ mod tests {
                 .contains("gone.jpg"),
             "failed flush must leave the previous sidecar intact"
         );
+    }
+
+    /// An in-flight old snapshot completes first; queued intermediate values coalesce to newest.
+    #[test]
+    fn journal_writer_state_keeps_only_newest_waiting_snapshot() {
+        let mut state = JournalWriteState::default();
+        let dir = PathBuf::from("data");
+        let rev1 = state.enqueue(dir.clone(), vec![("a".into(), "b".into())]);
+        let first = state.take_latest().unwrap();
+        let _rev2 = state.enqueue(dir.clone(), vec![("b".into(), "c".into())]);
+        let rev3 = state.enqueue(dir, vec![("c".into(), "d".into())]);
+
+        state.complete(first.revision);
+        assert_eq!(first.revision, rev1);
+        assert!(!state.is_flushed(rev3));
+        let newest = state.take_latest().unwrap();
+        assert_eq!(newest.revision, rev3);
+        assert_eq!(newest.entries, vec![("c".into(), "d".into())]);
+        state.complete(newest.revision);
+        assert!(state.is_flushed(rev3));
+    }
+
+    #[test]
+    fn journal_writer_drop_flushes_latest_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = vec![(PathBuf::from("old"), PathBuf::from("new"))];
+        let writer = RenameMigrationJournalWriter::spawn();
+        writer.enqueue(dir.path().to_path_buf(), entries.clone());
+        drop(writer);
+        assert_eq!(journal_load(dir.path()), entries);
     }
 
     /// ジャーナルの往復と消し込み (空で削除・無ければ空・壊れていたら破棄)。
@@ -1658,7 +1832,7 @@ mod tests {
         assert!(again.errors.is_empty());
     }
 
-    /// 読書履歴は exact のみ: key と raw path が新 path へ更新される。
+    /// 閲覧履歴は exact のみ: key と raw path が新 path へ更新される。
     #[test]
     fn migrates_reading_history_exact() {
         let dir = tempfile::tempdir().unwrap();

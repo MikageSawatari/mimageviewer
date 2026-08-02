@@ -330,7 +330,7 @@ ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く�
 複数ウィンドウモードでは `auto_fullscreen_zip_pdf` の保存値は書き換えず、実効値だけを ON として扱う。
 このモードではメイン一覧をページ一覧へ切り替える明示コマンド「ページを開く」/「一覧を開く」は
 利用しない。キー、右クリックメニュー、リング、マウスジェスチャのいずれから発火しても、共通の
-`open_grid_container_with_mode` 入口で理由をトースト表示して no-op とし、RAR 変換開始や読書履歴更新を
+`open_grid_container_with_mode` 入口で理由をトースト表示して no-op とし、RAR 変換開始や閲覧履歴更新を
 含む副作用を起こさない。通常 ZIP、直読み RAR、変換対象 RAR/7z/LZH でこの判定を分岐させない。
 
 - フル機能ウィンドウのグリッド open (`ui_main` ダブルクリック / `handle_keyboard` Enter) は

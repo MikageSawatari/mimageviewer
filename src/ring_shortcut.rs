@@ -1230,7 +1230,7 @@ impl RingActionId {
             | Self::OpenLocationRating4
             | Self::OpenLocationRating5 => unreachable!("handled by compact label helpers"),
             Self::OpenLocationDriveList => "ドライブ一覧",
-            Self::OpenLocationReadingHistory => "読書履歴",
+            Self::OpenLocationReadingHistory => "閲覧履歴",
             Self::OpenLocationBooksRoot => "本棚フォルダ",
             Self::OpenLocationDesktop => "デスクトップ",
             Self::OpenLocationPictures => "ピクチャ",

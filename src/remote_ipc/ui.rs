@@ -1530,7 +1530,9 @@ impl crate::app::App {
                 ) {
                     self.fs_video_open_autoplay_override = Some(false);
                 }
-                self.open_fullscreen(index);
+                // Re-establish the viewer that existed before the remote session. This is an
+                // automatic restoration, not a new item chosen by the local user.
+                self.open_fullscreen(index, crate::app::HistoryTrigger::AutoAdvance);
                 crate::logger::log(
                     "remote_ipc: fullscreen position restored after session release",
                 );

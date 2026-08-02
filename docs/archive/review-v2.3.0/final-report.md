@@ -542,7 +542,7 @@ Audio kind の保存値と検索フィルタ、Flat / DrilledInto の `GridItem:
 | 共通スマートフィルタ「種類」(通常/詳細/サブ展開/検索・タグ結果/レーティング一覧) | `GridItem::Audio → FacetItemKind::Audio`、動的件数・ラベル・保存退避あり | 音声が一覧にあるビューでは必要 | 変更なし。動画/Folder への混入なし |
 | Ctrl+S コンテナ検索「種別」 | フォルダ / ZIP / PDF のみ | コンテナ検索であり音声・動画は対象外 | 変更なし |
 | レーティング一覧 | `RatingItemKind::Audio=9` と `GridItem::Audio` 復元、共通種類 facet が利用可能 | 音声レーティングを扱うため Audio 分類が必要 | 対応済み、変更なし |
-| 読書履歴 | 画像本の Folder / ZIP / PDF / Archive のみ。動画・音声は記録対象外 | 「最近読んだ本」専用なので音声選択は不要 | 変更なし |
+| 閲覧履歴 | 画像本の Folder / ZIP / PDF / Archive のみ。動画・音声は記録対象外 | 「最近読んだ本」専用なので音声選択は不要 | 変更なし |
 | サブ展開 | 画像 / 動画だけのフラット表示と UI に明記し、Audio は走査対象外 | 現仕様では音声を扱わない | 変更なし |
 | 画像色フィルタ | `has_page_data` の画像/ZIP画像/PDFページと Stack のみ | 色を持たない音声は対象外 | 変更なし |
 | 同名ファイル処理 | アーカイブ対フォルダ、動画対画像、画像拡張子間の明示ルール。Audio は除外しない | 音声を動画 companion / 画像扱いしてはならない | 既存の kind 限定を確認、変更なし |
@@ -725,15 +725,15 @@ Audio kind の保存値と検索フィルタ、Flat / DrilledInto の `GridItem:
   外付け切断 / NAS offline / 権限エラーを含み得るため表示除外・open 抑止だけで DB は非破壊。
 - **共通ストア正本**: `rename_key_migration::STORES` に keep-drive / drive-stripped の正規化、
   DB / table / key column、rename の一意性を集約。rename と purge が同じ記述子を走査するため、
-  新ストア追加時に対象がずれない。読書履歴は rename 時だけ raw path 更新を伴う専用処理、
+  新ストア追加時に対象がずれない。閲覧履歴は rename 時だけ raw path 更新を伴う専用処理、
   PDF password は SHA-256 key のため削除前に worker が配下 PDF path を列挙する専用処理。
 - **削除連携**: Shell 成功 batch を UI へ送る前に worker 上で exact + `<key>/` +
   `<key>::` を `DELETE`。UI 完了ハンドラは rating / tags / rotation cache、タグ候補、
-  folder count、編集済み presence set、動画 marker / resume、読書履歴 cache、PDF password
+  folder count、編集済み presence set、動画 marker / resume、閲覧履歴 cache、PDF password
   in-memory store を同じ境界で整合させる。rename は従来 migration だけで、削除 purge と二重実行しない。
 - **missing 横断監査**: rating view / count / folder counter / prewarm には missing 起因の
   DELETE は無かった。タグビューの `should_prune_missing_path` + `prune_items` を撤去し、結果から
-  隠して行を保持するテストへ変更した。さらに読書履歴 open guard に missing 時の DB 削除が
+  隠して行を保持するテストへ変更した。さらに閲覧履歴 open guard に missing 時の DB 削除が
   あったため、toast + open 抑止のみへ非破壊化した。Tantivy / FTS / catalog / archive cache の
   stale delete は再生成可能な索引・cache であり、ユーザーメタではないため対象外。
 

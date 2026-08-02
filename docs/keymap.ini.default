@@ -130,7 +130,7 @@
 # GridSwitchDriveY = none ; Y:の最後の場所へ切り替える
 # GridSwitchDriveZ = none ; Z:の最後の場所へ切り替える
 # GridOpenLocationDriveList = none ; ドライブ一覧を開く
-# GridOpenLocationReadingHistory = none ; 読書履歴を開く
+# GridOpenLocationReadingHistory = none ; 閲覧履歴を開く
 # GridOpenLocationRating1 = none ; ★1一覧を開く
 # GridOpenLocationRating2 = none ; ★2一覧を開く
 # GridOpenLocationRating3 = none ; ★3一覧を開く

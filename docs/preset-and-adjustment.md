@@ -562,7 +562,11 @@ bilinear 補間ソースサンプリング + 水平ブラー (h_blur) で、「�
 **mipmap と旧設定の互換**: v2.7.0 から GPU が静止画の完全な mip chain を自動生成するため、
 手動回避策だった `Downscale2x` / `Downscale4x` は撤去した。保存済み設定にこれらが含まれる場合は
 `PostFilter::None` として読み込む。サムネイル、animated image、動画、mask、`Nearest` は mipmap
-対象外。実装詳細は [downscale-moire-lod-plan.md](downscale-moire-lod-plan.md) を参照。
+対象外。フィルタタブの全表示共通設定は、既定 ON / 0.0 で従来の標準 mipmap 縮小を維持する。
+OFF は mip chain を保持したまま level 0 固定で読み、シャープさを優先する。ON の強度を上げると
+より粗い level へ寄せてモアレ抑制を強める。切替は uniform だけで行い、補正・AI・サムネイルの
+cache invalidation や texture 再 upload は起こさない。実装詳細は
+[downscale-moire-lod-plan.md](downscale-moire-lod-plan.md) を参照。
 
 **並列化**: `rayon::par_chunks_mut` で行単位に並列処理。4K 画像でも 4080ms 程度。
 

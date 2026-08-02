@@ -91,9 +91,12 @@ pub fn record_raw_edge(source: KeyDebugSource, edge: KeyEdge) {
         return;
     }
     let line = format!(
-        "raw {:<12} {:<4} vk=0x{:02X} scan=0x{:02X} ext={} repeat={} mods={}",
+        "raw {:<12} {:<4} hwnd=0x{:x} viewport={:?} vk=0x{:02X} scan=0x{:02X} \
+         ext={} repeat={} mods={}",
         source.label(),
         if edge.pressed { "down" } else { "up" },
+        edge.source_hwnd,
+        edge.source_viewport,
         edge.virtual_key,
         edge.scan_code,
         edge.extended as u8,
@@ -112,6 +115,8 @@ pub fn record_native_video_key(
     record_raw_edge(
         KeyDebugSource::NativeVideo,
         KeyEdge {
+            source_hwnd: 0,
+            source_viewport: egui::ViewportId::ROOT,
             virtual_key: key.virtual_key,
             scan_code: key.scan_code,
             extended: key.extended,
@@ -175,9 +180,10 @@ pub fn render_overlay(ctx: &egui::Context) {
                 ui.set_min_width(360.0);
                 ui.label(egui::RichText::new("MIV_KEY_DEBUG").strong());
                 ui.monospace(format!(
-                    "frame_active={} key_down={}",
-                    crate::key_input::is_frame_active(),
-                    crate::key_input::frame_had_key_down()
+                    "viewport={:?} frame_active={} key_down={}",
+                    ctx.viewport_id(),
+                    crate::key_input::is_frame_active(ctx.viewport_id()),
+                    crate::key_input::frame_had_key_down(ctx.viewport_id())
                 ));
                 ui.separator();
                 if lines.is_empty() {

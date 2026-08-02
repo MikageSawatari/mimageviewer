@@ -94,7 +94,7 @@ Phase 1 として、場所横断の ★1〜★5 レーティング一覧ビュ�
 
 | ビュー | 状態フラグ | 構築 | 流用ポイント |
 | --- | --- | --- | --- |
-| 読書履歴 | `items_are_reading_history_view` | `enter_reading_history` → `install_reading_history_entries` | DB→GridItem→`start_loading_items`→`address` 差し替え、synthetic path、full-path cache key の雛形 |
+| 閲覧履歴 | `items_are_reading_history_view` | `enter_reading_history` → `install_reading_history_entries` | DB→GridItem→`start_loading_items`→`address` 差し替え、synthetic path、full-path cache key の雛形 |
 | Ctrl+G 検索 | `items_are_global_search_view` | `replace_search_view_items` ([global_search_ui.rs](../src/global_search_ui.rs)) | サムネ Loaded 保持つき items 差し替え (再ソート時に流用) |
 | タグビュー | `items_are_tag_view` | tag_view 内 | worker/cancel、saved_folder/nav_stack、コンテナ/通常ファイル混在一覧の雛形 |
 
@@ -369,7 +369,7 @@ stat は数千件規模になり得る (rating.db の ★N 行数ぶん)。**UI 
 ### 5.4 ★フィルタ / facet との関係
 
 `★3 レーティング一覧` の中で通常の `settings.rating_filter` がさらに効くと、
-「★3 を選んだのに空になる」など直感に反する。レーティングビューでは読書履歴ビューと同じく
+「★3 を選んだのに空になる」など直感に反する。レーティングビューでは閲覧履歴ビューと同じく
 通常の★フィルタは無効化または固定扱いにする。スマートフィルタは種類/場所/タグ/日付/サイズなど
 意味があるものは残してよい。場所 facet は元ファイル/元コンテナの親フォルダで絞り込むため、
 ★一覧の中から特定の元フォルダだけを残す用途に使える。ただし場所 facet は現在の表示スコープに
@@ -380,10 +380,10 @@ stat は数千件規模になり得る (rating.db の ★N 行数ぶん)。**UI 
 
 ## 6. メニュー
 
-- **場所▼** ([ui_main.rs](../src/ui_main.rs) のドライブ一覧/読書履歴/本棚の並び) に
+- **場所▼** ([ui_main.rs](../src/ui_main.rs) のドライブ一覧/閲覧履歴/本棚の並び) に
   `レーティング ▸ ★1 / ★2 / ★3 / ★4 / ★5` サブメニュー。各項目に `count_by_stars` の
   件数を併記 (任意)。
-- **ファイル** メニュー ([ui_main.rs](../src/ui_main.rs) の「読書履歴を開く」隣) にも
+- **ファイル** メニュー ([ui_main.rs](../src/ui_main.rs) の「閲覧履歴を開く」隣) にも
   同じサブメニューをミラー。
 - 5 項目をトップに並べず 1 サブメニューに畳む。
 - キー操作は追加しない (menu 駆動)。将来ショートカット化する場合のみ `KeyAction` 追加。

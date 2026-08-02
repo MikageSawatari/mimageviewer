@@ -608,7 +608,7 @@ fn descriptor_exclusion_inner(descriptor: &StoreDescriptor) -> Option<String> {
         return Some("ドライブ文字を保存しないキーから実体を安全に逆引きできないため".into());
     }
     (descriptor.file == "reading_history.db")
-        .then(|| "読書履歴は削除済みでも閲覧記録として残す仕様のため".into())
+        .then(|| "閲覧履歴は削除済みでも閲覧記録として残す仕様のため".into())
 }
 
 fn scan_supported_rows(
@@ -950,7 +950,7 @@ fn store_label(descriptor: &StoreDescriptor) -> &'static str {
         "folder_thumb_pins.db" => "代表サムネピン",
         "book_resume.db" => "読書位置",
         "spread.db" => "ページ表示モード",
-        "reading_history.db" => "読書履歴",
+        "reading_history.db" => "閲覧履歴",
         _ => descriptor.file,
     }
 }

@@ -108,8 +108,15 @@ fn parse_size(s: &str) -> Option<(u32, u32)> {
 pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
     let _com = ComApartment::init()?;
     let overflow_fault = Arc::new(AtomicBool::new(false));
+    let (pump_route, _pump_rx) = native_window_event_route(256, Arc::clone(&overflow_fault));
     let (event_route, event_rx) = native_window_event_route(256, overflow_fault);
-    let event_sink = NativeVideoWindowEventSink::new(0, 0, event_route.clone(), event_route);
+    let event_sink = NativeVideoWindowEventSink::new(
+        0,
+        0,
+        crate::video::native_window::NativeVideoWindowSource::Presenter,
+        pump_route,
+        event_route,
+    );
     let mut window = NativeWindowHost::create(NativeWindowHostConfig {
         window: NativeVideoWindowConfig {
             mode: NativeVideoWindowMode::Windowed {

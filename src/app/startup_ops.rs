@@ -720,7 +720,7 @@ impl App {
         ));
         self.bump_input_seq_for_item(input_reason, idx);
         self.fs_open_intent_from_grid = true;
-        self.open_fullscreen(idx);
+        self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
         Ok(idx)
     }
 }

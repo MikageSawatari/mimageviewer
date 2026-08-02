@@ -39,7 +39,7 @@ impl crate::app::App {
                 ui.add_space(4.0);
 
                 // パスワード入力欄
-                let resp = crate::ime_focus::add_singleline(
+                let resp = crate::ime_focus::add_singleline_sensitive(
                     ui,
                     &mut self.pdf_password_input,
                     None,

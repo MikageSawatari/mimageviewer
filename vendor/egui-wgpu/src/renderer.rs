@@ -8,6 +8,8 @@ use epaint::{PaintCallbackInfo, Primitive, Vertex, emath::NumExt as _};
 
 use wgpu::util::DeviceExt as _;
 
+const DEFAULT_IMAGE_MIPMAP_SAMPLING_ENABLED: bool = true;
+
 // Only implements Send + Sync on wasm32 in order to allow storing wgpu resources on the type map.
 #[cfg(not(all(
     target_arch = "wasm32",
@@ -153,8 +155,12 @@ struct UniformBuffer {
     predictable_texture_filtering: u32,
     /// Positive values prefer a coarser mip level for image minification.
     image_lod_bias: f32,
+    /// Preserve the pre-toggle uniform prefix and its existing padding slot.
+    _legacy_padding: f32,
+    /// 1 uses the implicit mip level (plus bias); 0 samples level 0 explicitly.
+    image_mipmap_sampling_enabled: u32,
     /// WGSL uniform structs round this layout up to the vec2 alignment.
-    _padding: f32,
+    _padding: u32,
 }
 
 struct SlicedBuffer {
@@ -260,6 +266,7 @@ pub struct Renderer {
 
     options: RendererOptions,
     image_lod_bias: f32,
+    image_mipmap_sampling_enabled: bool,
 
     /// Storage for resources shared with all invocations of [`CallbackTrait`]'s methods.
     ///
@@ -295,7 +302,11 @@ impl Renderer {
                 dithering: u32::from(options.dithering),
                 predictable_texture_filtering: u32::from(options.predictable_texture_filtering),
                 image_lod_bias: 0.0,
-                _padding: 0.0,
+                _legacy_padding: 0.0,
+                image_mipmap_sampling_enabled: u32::from(
+                    DEFAULT_IMAGE_MIPMAP_SAMPLING_ENABLED,
+                ),
+                _padding: 0,
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -468,6 +479,7 @@ impl Renderer {
             mipmap_generator: None,
             options,
             image_lod_bias: 0.0,
+            image_mipmap_sampling_enabled: DEFAULT_IMAGE_MIPMAP_SAMPLING_ENABLED,
             callback_resources: CallbackResources::default(),
         }
     }
@@ -483,6 +495,14 @@ impl Renderer {
         } else {
             0.0
         };
+    }
+
+    /// Select whether managed image textures use their mip chain while minifying.
+    ///
+    /// Disabling this keeps the texture and its mip levels intact, but samples
+    /// level 0 explicitly so switching modes never reallocates or uploads a texture.
+    pub fn set_image_mipmap_sampling_enabled(&mut self, enabled: bool) {
+        self.image_mipmap_sampling_enabled = enabled;
     }
 
     /// Executes the egui renderer onto an existing wgpu renderpass.
@@ -958,7 +978,9 @@ impl Renderer {
             dithering: u32::from(self.options.dithering),
             predictable_texture_filtering: u32::from(self.options.predictable_texture_filtering),
             image_lod_bias: self.image_lod_bias,
-            _padding: 0.0,
+            _legacy_padding: 0.0,
+            image_mipmap_sampling_enabled: u32::from(self.image_mipmap_sampling_enabled),
+            _padding: 0,
         };
         if uniform_buffer_content != self.previous_uniform_buffer_content {
             profiling::scope!("update uniforms");
@@ -1218,4 +1240,33 @@ fn egui_shader_with_lod_bias_parses_and_validates() {
     )
     .validate(&module)
     .expect("validate egui WGSL");
+}
+
+#[test]
+fn image_mipmap_sampling_uniform_preserves_legacy_default_and_layout() {
+    assert!(DEFAULT_IMAGE_MIPMAP_SAMPLING_ENABLED);
+    assert_eq!(std::mem::offset_of!(UniformBuffer, image_lod_bias), 16);
+    assert_eq!(std::mem::offset_of!(UniformBuffer, _legacy_padding), 20);
+    assert_eq!(
+        std::mem::offset_of!(UniformBuffer, image_mipmap_sampling_enabled),
+        24
+    );
+    assert_eq!(std::mem::size_of::<UniformBuffer>(), 32);
+
+    let default_uniform = UniformBuffer {
+        screen_size_in_points: [0.0, 0.0],
+        dithering: 0,
+        predictable_texture_filtering: 0,
+        image_lod_bias: 0.0,
+        _legacy_padding: 0.0,
+        image_mipmap_sampling_enabled: u32::from(DEFAULT_IMAGE_MIPMAP_SAMPLING_ENABLED),
+        _padding: 0,
+    };
+    assert_eq!(default_uniform.image_lod_bias, 0.0);
+    assert_eq!(default_uniform.image_mipmap_sampling_enabled, 1);
+
+    let shader = include_str!("egui.wgsl");
+    assert!(shader.contains("image_mipmap_sampling_enabled == 0"));
+    assert!(shader.contains("textureSampleLevel(r_tex_color"));
+    assert!(shader.contains("textureSampleBias("));
 }

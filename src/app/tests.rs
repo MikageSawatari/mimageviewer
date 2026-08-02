@@ -4,6 +4,14 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+#[test]
+fn display_image_texture_options_always_keep_the_complete_mip_chain() {
+    assert_eq!(
+        DISPLAY_IMAGE_TEXTURE_OPTIONS.mipmap_mode,
+        Some(egui::TextureFilter::Linear)
+    );
+}
+
 fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHandle) -> FsHoldover {
     FsHoldover::FolderNavigation(FsDisplayUnitHoldover {
         pages: vec![FsDisplayUnitHoldoverPage {
@@ -21,6 +29,7 @@ fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHand
 fn native_video_bookmark_commands_ignore_app_viewport_ime_state() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
+    crate::ime_focus::install_ime_input_policy(&ctx);
     let fs_idx = 0;
     app.fullscreen_idx = Some(fs_idx);
 
@@ -770,7 +779,7 @@ fn main_window_title_hides_internal_synthetic_paths() {
     let internal = PathBuf::from(r"C:\data\__reading_history__");
     assert_eq!(
         main_window_title(Some(&internal), true, false, false, None, false),
-        "読書履歴 - mimageviewer"
+        "閲覧履歴 - mimageviewer"
     );
     assert_eq!(
         main_window_title(Some(&internal), false, true, false, None, false),
@@ -5153,7 +5162,7 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.recent_folders, vec![recent0]);
     }
 
-    // ── §1.16: 合成ビュー (読書履歴 / ★一覧 / サブフォルダ展開) 表示中の ←/→ ──
+    // ── §1.16: 合成ビュー (閲覧履歴 / ★一覧 / サブフォルダ展開) 表示中の ←/→ ──
     // 案Bでは合成パスも通常の履歴に積み、pop 時に対応ビューを再構築する。
 
     #[test]
@@ -7220,6 +7229,8 @@ mod phase_c_drill_nav_tests {
                 last_read_at_ms: 1,
                 last_page: Some(1),
                 page_count: Some(2),
+                media_position_ms: None,
+                media_duration_ms: None,
                 file_size: None,
                 mtime_ms: None,
             },
@@ -7720,6 +7731,55 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
+    fn reading_history_loading_inputs_request_video_thumbnails_but_not_audio_waveforms() {
+        use crate::reading_history_db::{ReadingHistoryEntry, ReadingHistoryKind};
+
+        let video_path = std::path::PathBuf::from("c:/media/movie.mp4");
+        let audio_path = std::path::PathBuf::from("c:/media/song.flac");
+        let book_path = std::path::PathBuf::from("c:/books/book.zip");
+        let mut video = ReadingHistoryEntry::new(
+            video_path.clone(),
+            ReadingHistoryKind::Video,
+            None,
+            "movie.mp4".to_string(),
+            None,
+            None,
+        );
+        video.file_size = Some(12_345);
+        let mut audio = ReadingHistoryEntry::new(
+            audio_path.clone(),
+            ReadingHistoryKind::Audio,
+            None,
+            "song.flac".to_string(),
+            None,
+            None,
+        );
+        audio.file_size = Some(54_321);
+        let book = ReadingHistoryEntry::new(
+            book_path,
+            ReadingHistoryKind::Zip,
+            None,
+            "book.zip".to_string(),
+            None,
+            None,
+        );
+
+        let inputs = super::reading_history_load_inputs(vec![video, audio, book]);
+
+        assert_eq!(inputs.video_items, vec![(0, video_path, 12_345)]);
+        assert!(matches!(
+            inputs.items[0],
+            crate::grid_item::GridItem::Video(_)
+        ));
+        assert!(matches!(
+            inputs.items[1],
+            crate::grid_item::GridItem::Audio(_)
+        ));
+        assert_eq!(inputs.items.len(), 3);
+        assert_eq!(inputs.rows.len(), 3);
+    }
+
+    #[test]
     fn reading_history_metadata_is_available_to_grid_and_details_ui() {
         use crate::grid_item::GridItem;
         let mut app = setup_app();
@@ -7739,12 +7799,14 @@ mod phase_c_drill_nav_tests {
                 last_read_at_ms: 1_700_000_000_000,
                 last_page: Some(12),
                 page_count: Some(120),
+                media_position_ms: None,
+                media_duration_ms: None,
                 file_size: Some(1234),
                 mtime_ms: Some(1_700_000_000_000),
             },
         );
 
-        // 詳細表示は「最終閲覧」列と「既読位置」列に分離する。
+        // 詳細表示は「最終閲覧」列と「閲覧位置」列に分離する。
         let progress = app.reading_history_progress_for_idx(0).unwrap();
         assert_eq!(progress, "12 / 120");
         let last_read = app.reading_history_last_read_for_idx(0).unwrap();
@@ -7752,14 +7814,14 @@ mod phase_c_drill_nav_tests {
 
         let tooltip = app.reading_history_tooltip_lines(0).unwrap().join("\n");
         assert!(tooltip.contains("最終閲覧"));
-        assert!(tooltip.contains("既読位置 12 / 120"));
+        assert!(tooltip.contains("閲覧位置 12 / 120"));
 
         let selection_info = app
             .reading_history_selection_info_lines(0)
             .unwrap()
             .join("\n");
         assert!(selection_info.contains("最終閲覧"));
-        assert!(selection_info.contains("既読位置 12 / 120"));
+        assert!(selection_info.contains("閲覧位置 12 / 120"));
 
         app.settings.thumb_tooltip_show_reading_history_last_read = false;
         let selection_info = app
@@ -7767,13 +7829,296 @@ mod phase_c_drill_nav_tests {
             .unwrap()
             .join("\n");
         assert!(!selection_info.contains("最終閲覧"));
-        assert!(selection_info.contains("既読位置 12 / 120"));
+        assert!(selection_info.contains("閲覧位置 12 / 120"));
 
         app.settings.thumb_tooltip_show_reading_history_progress = false;
         assert!(app.reading_history_selection_info_lines(0).is_none());
         let tooltip = app.reading_history_tooltip_lines(0).unwrap().join("\n");
         assert!(tooltip.contains("最終閲覧"));
-        assert!(tooltip.contains("既読位置 12 / 120"));
+        assert!(tooltip.contains("閲覧位置 12 / 120"));
+    }
+
+    #[test]
+    fn manual_media_open_is_recordable_but_auto_advance_is_not() {
+        use crate::grid_item::GridItem;
+
+        let mut app = setup_app();
+        assert!(app.reading_history_writer.is_some());
+        app.settings.reading_history_enabled = true;
+        let video = std::path::PathBuf::from("c:/media/movie.mp4");
+        let audio = std::path::PathBuf::from("c:/media/song.flac");
+        app.items = vec![
+            GridItem::Video(video.clone()),
+            GridItem::Audio(audio.clone()),
+        ];
+        app.visible_indices = vec![0, 1];
+
+        app.record_reading_history(0, crate::app::HistoryTrigger::AutoAdvance);
+        assert!(app.last_reading_history_touch.is_none());
+
+        // Ctrl+G / tag の合成一覧でも、ユーザーが選んだメディアはファイル単位で明確なので記録する。
+        app.global_search.active = true;
+        app.items_are_global_search_view = true;
+        app.record_reading_history(0, crate::app::HistoryTrigger::UserChosen);
+        assert_eq!(
+            app.last_reading_history_touch
+                .as_ref()
+                .map(|(key, _)| key.as_str()),
+            Some(crate::path_key::normalize_keep_drive(&video).as_str())
+        );
+
+        app.global_search.active = false;
+        app.items_are_global_search_view = false;
+        app.record_reading_history(1, crate::app::HistoryTrigger::UserChosen);
+        assert_eq!(
+            app.last_reading_history_touch
+                .as_ref()
+                .map(|(key, _)| key.as_str()),
+            Some(crate::path_key::normalize_keep_drive(&audio).as_str())
+        );
+    }
+
+    #[test]
+    fn reading_history_media_filter_matches_bookmark_filter_vocabulary() {
+        use crate::bookmark_browser::{BookKindFilter, MediaFilter};
+        use crate::grid_item::GridItem;
+        use crate::reading_history_db::{ReadingHistoryEntry, ReadingHistoryKind};
+
+        let mut app = setup_app();
+        let specs = [
+            ("c:/media/movie.mp4", ReadingHistoryKind::Video),
+            ("c:/media/song.flac", ReadingHistoryKind::Audio),
+            ("c:/books/images", ReadingHistoryKind::Folder),
+            ("c:/books/book.zip", ReadingHistoryKind::Zip),
+            ("c:/books/book.pdf", ReadingHistoryKind::Pdf),
+            ("c:/books/book.rar", ReadingHistoryKind::Archive),
+        ];
+        app.items_are_reading_history_view = true;
+        for (path, kind) in specs {
+            let path = std::path::PathBuf::from(path);
+            let entry = ReadingHistoryEntry::new(
+                path.clone(),
+                kind,
+                None,
+                path.display().to_string(),
+                None,
+                None,
+            );
+            app.items.push(match kind {
+                ReadingHistoryKind::Video => GridItem::Video(path),
+                ReadingHistoryKind::Audio => GridItem::Audio(path),
+                ReadingHistoryKind::Folder => GridItem::Folder(path),
+                ReadingHistoryKind::Zip => GridItem::ZipFile(path),
+                ReadingHistoryKind::Pdf => GridItem::PdfFile(path),
+                ReadingHistoryKind::Archive => GridItem::ConvertibleArchive {
+                    path,
+                    format: crate::archive_converter::ArchiveFormat::Rar,
+                },
+            });
+            app.reading_history_rows.insert(entry.key.clone(), entry);
+        }
+
+        app.reading_history_media_filter = MediaFilter::Video;
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![0]);
+
+        app.reading_history_media_filter = MediaFilter::Audio;
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![1]);
+
+        app.reading_history_media_filter = MediaFilter::Book;
+        app.reading_history_book_kind_filter = BookKindFilter::Pdf;
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![4]);
+
+        app.reading_history_media_filter = MediaFilter::All;
+        app.reading_history_book_kind_filter = BookKindFilter::OtherArchive;
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![0, 1, 5]);
+    }
+
+    #[test]
+    fn reading_history_standard_facets_filter_kind_extension_and_place() {
+        use crate::grid_item::GridItem;
+        use crate::reading_history_db::{ReadingHistoryEntry, ReadingHistoryKind};
+        use crate::settings::FacetItemKind;
+
+        let mut app = setup_app();
+        let specs = [
+            ("c:/media/movie.mp4", ReadingHistoryKind::Video),
+            ("c:/other/song.flac", ReadingHistoryKind::Audio),
+            ("c:/books/book.zip", ReadingHistoryKind::Zip),
+        ];
+        app.items_are_reading_history_view = true;
+        for (path, kind) in specs {
+            let path = std::path::PathBuf::from(path);
+            let entry = ReadingHistoryEntry::new(
+                path.clone(),
+                kind,
+                None,
+                path.display().to_string(),
+                None,
+                None,
+            );
+            app.items.push(match kind {
+                ReadingHistoryKind::Video => GridItem::Video(path),
+                ReadingHistoryKind::Audio => GridItem::Audio(path),
+                ReadingHistoryKind::Zip => GridItem::ZipFile(path),
+                _ => unreachable!(),
+            });
+            app.reading_history_rows.insert(entry.key.clone(), entry);
+        }
+
+        app.settings.facet_filter.kinds.insert(FacetItemKind::Video);
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![0]);
+
+        app.settings.facet_filter.clear();
+        app.settings.facet_filter.exts.insert("flac".to_string());
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![1]);
+
+        app.settings.facet_filter.clear();
+        app.settings
+            .facet_filter
+            .place_keys
+            .insert(crate::adjustment_db::normalize_path(std::path::Path::new(
+                "c:/books",
+            )));
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![2]);
+    }
+
+    #[test]
+    fn reading_history_media_progress_updates_loaded_projection_only() {
+        use crate::reading_history_db::{ReadingHistoryEntry, ReadingHistoryKind};
+
+        let mut app = setup_app();
+        let video_path = std::path::PathBuf::from("c:/media/movie.mp4");
+        let audio_path = std::path::PathBuf::from("c:/media/song.flac");
+        let video = ReadingHistoryEntry::new(
+            video_path.clone(),
+            ReadingHistoryKind::Video,
+            None,
+            "movie.mp4".to_string(),
+            None,
+            None,
+        );
+        let audio = ReadingHistoryEntry::new(
+            audio_path.clone(),
+            ReadingHistoryKind::Audio,
+            None,
+            "song.flac".to_string(),
+            None,
+            None,
+        );
+        let video_key = video.key.clone();
+        let audio_key = audio.key.clone();
+        app.reading_history_rows.insert(video_key.clone(), video);
+        app.reading_history_rows.insert(audio_key.clone(), audio);
+
+        app.update_reading_history_media_progress(&video_path, 15.25, 120.5);
+        let video = &app.reading_history_rows[&video_key];
+        assert_eq!(video.media_position_ms, Some(15_250));
+        assert_eq!(video.media_duration_ms, Some(120_500));
+
+        app.update_reading_history_media_progress(&audio_path, 8.0, 42.0);
+        let audio = &app.reading_history_rows[&audio_key];
+        assert_eq!(audio.media_position_ms, Some(8_000));
+        assert_eq!(audio.media_duration_ms, Some(42_000));
+
+        let before_missing_update = app.reading_history_rows.clone();
+        app.update_reading_history_media_progress(
+            std::path::Path::new("c:/media/not-in-view.mp4"),
+            3.0,
+            9.0,
+        );
+        assert_eq!(app.reading_history_rows, before_missing_update);
+    }
+
+    #[test]
+    fn manual_flush_and_periodic_save_use_the_shared_media_resume_entry() {
+        let source = include_str!("../app.rs");
+        let shared_call = "self.apply_media_resume_updates(updates);";
+        let save_all = source
+            .split_once("pub(crate) fn save_all_video_resume_positions")
+            .unwrap()
+            .1
+            .split_once("fn maybe_schedule_video_resume_thumbnail")
+            .unwrap()
+            .0;
+        let poll = source
+            .split_once("pub(crate) fn poll_video")
+            .unwrap()
+            .1
+            .split_once("// eframe::App 実装")
+            .unwrap()
+            .0;
+
+        assert_eq!(save_all.matches(shared_call).count(), 1);
+        assert_eq!(poll.matches(shared_call).count(), 1);
+        assert!(!save_all.contains("reading_history_writer"));
+        assert!(!poll.contains("reading_history_writer"));
+    }
+
+    #[test]
+    fn media_history_progress_text_uses_history_owned_columns() {
+        use crate::grid_item::GridItem;
+        use crate::reading_history_db::{ReadingHistoryEntry, ReadingHistoryKind};
+
+        let mut app = setup_app();
+        let path = std::path::PathBuf::from("c:/media/movie.mp4");
+        let mut entry = ReadingHistoryEntry::new(
+            path.clone(),
+            ReadingHistoryKind::Video,
+            None,
+            "movie.mp4".to_string(),
+            None,
+            None,
+        );
+        entry.media_position_ms = Some(95_000);
+        entry.media_duration_ms = Some(100_000);
+        app.items_are_reading_history_view = true;
+        app.items = vec![GridItem::Video(path)];
+        app.reading_history_rows.insert(entry.key.clone(), entry);
+
+        assert_eq!(
+            app.reading_history_progress_for_idx(0).as_deref(),
+            Some("1:35 / 1:40")
+        );
+    }
+
+    #[test]
+    fn completed_video_keeps_history_progress_while_resume_is_removed() {
+        use crate::reading_history_db::{ReadingHistoryEntry, ReadingHistoryKind};
+
+        let path = std::path::PathBuf::from("c:/media/completed.mp4");
+        let key = crate::adjustment_db::normalize_path(&path);
+        let mut resume = std::collections::HashMap::from([(key.clone(), 90.0)]);
+        assert!(!crate::app::save_video_resume_position(
+            &mut resume,
+            key.clone(),
+            100.0,
+            100.0,
+            true,
+        ));
+        assert!(!resume.contains_key(&key));
+
+        let mut history = ReadingHistoryEntry::new(
+            path.clone(),
+            ReadingHistoryKind::Video,
+            None,
+            "completed.mp4".to_string(),
+            None,
+            None,
+        );
+        history.media_position_ms = Some(100_000);
+        history.media_duration_ms = Some(100_000);
+        assert!(matches!(
+            crate::app::reading_history_grid_item(&history),
+            crate::grid_item::GridItem::Video(reopened) if reopened == path
+        ));
+        assert_eq!(history.media_position_ms, Some(100_000));
     }
 
     #[test]
@@ -7801,6 +8146,8 @@ mod phase_c_drill_nav_tests {
                 last_read_at_ms: 1,
                 last_page: Some(1),
                 page_count: Some(2),
+                media_position_ms: None,
+                media_duration_ms: None,
                 file_size: None,
                 mtime_ms: None,
             },
@@ -7817,7 +8164,7 @@ mod phase_c_drill_nav_tests {
         assert!(
             app.fs_feedback_toast
                 .as_ref()
-                .is_some_and(|(text, _, _)| text.contains("読書履歴は保持"))
+                .is_some_and(|(text, _, _)| text.contains("閲覧履歴は保持"))
         );
     }
 
@@ -7826,7 +8173,7 @@ mod phase_c_drill_nav_tests {
         use crate::grid_item::GridItem;
         let mut app = setup_app();
 
-        // 読書履歴ビューで本 (ZIP) を開いた → 戻り先予約が立つ。
+        // 閲覧履歴ビューで本 (ZIP) を開いた → 戻り先予約が立つ。
         app.items_are_reading_history_view = true;
         app.items = vec![GridItem::ZipFile(std::path::PathBuf::from(
             "c:/books/a.zip",
@@ -7837,7 +8184,7 @@ mod phase_c_drill_nav_tests {
             Some(std::path::PathBuf::from("c:/books/a.zip"))
         );
 
-        // 本を開いた後 (ビューを抜け current_folder = 本) は、親へ戻る操作で読書履歴へ。
+        // 本を開いた後 (ビューを抜け current_folder = 本) は、親へ戻る操作で閲覧履歴へ。
         app.items_are_reading_history_view = false;
         app.current_folder = Some(std::path::PathBuf::from("c:/books/a.zip"));
         assert!(matches!(
@@ -7849,13 +8196,13 @@ mod phase_c_drill_nav_tests {
             Some(crate::ui_main::AddressBarNav::ReadingHistory)
         ));
 
-        // 本より深い階層 / 別の場所では通常の親フォルダ遷移 (= 読書履歴ではない)。
+        // 本より深い階層 / 別の場所では通常の親フォルダ遷移 (= 閲覧履歴ではない)。
         app.current_folder = Some(std::path::PathBuf::from("c:/books/a.zip/sub"));
         assert!(app.reading_history_back_nav().is_none());
         app.current_folder = Some(std::path::PathBuf::from("c:/other"));
         assert!(app.reading_history_back_nav().is_none());
 
-        // 読書履歴ビュー外で開いても予約は立たない。
+        // 閲覧履歴ビュー外で開いても予約は立たない。
         app.reading_history_return_from = None;
         app.items_are_reading_history_view = false;
         app.note_reading_history_open(0);
@@ -7887,7 +8234,7 @@ mod phase_c_drill_nav_tests {
             Some(std::path::PathBuf::from("c:/books/a.zip"))
         );
 
-        // 読書履歴ビュー以外で別のコンテナを開いたら予約を捨てる
+        // 閲覧履歴ビュー以外で別のコンテナを開いたら予約を捨てる
         // (= 別の本/フォルダへ出たので、以後 Backspace は通常の親フォルダへ)。
         app.items = vec![GridItem::Folder(std::path::PathBuf::from("c:/elsewhere"))];
         app.note_reading_history_open(0);
@@ -7900,7 +8247,7 @@ mod phase_c_drill_nav_tests {
         use crate::grid_item::GridItem;
         let mut app = setup_app();
 
-        // 読書履歴の変換アーカイブを開く → 予約は (キャッシュ ZIP ではなく) 元アーカイブ。
+        // 閲覧履歴の変換アーカイブを開く → 予約は (キャッシュ ZIP ではなく) 元アーカイブ。
         app.items_are_reading_history_view = true;
         app.items = vec![GridItem::ConvertibleArchive {
             path: std::path::PathBuf::from("c:/books/a.rar"),
@@ -7914,7 +8261,7 @@ mod phase_c_drill_nav_tests {
 
         // 開いた後は current_folder = キャッシュ ZIP / archive_source_override = 元アーカイブ。
         // open_archive_via_cache が予約を元アーカイブへ復元しているので、effective_folder()
-        // (= override) と一致し、閉じると読書履歴へ戻る。
+        // (= override) と一致し、閉じると閲覧履歴へ戻る。
         app.items_are_reading_history_view = false;
         app.current_folder = Some(std::path::PathBuf::from("c:/cache/abcd/book.zip"));
         app.archive_source_override = Some(std::path::PathBuf::from("c:/books/a.rar"));
@@ -12987,6 +13334,7 @@ mod favorite_adjustment_defaults_tests {
     fn pdf_password_prompt_preserves_only_explicit_deferred_reopen() {
         let mut app = setup_app();
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
             resume_to_last_page: true,
@@ -13000,6 +13348,7 @@ mod favorite_adjustment_defaults_tests {
         );
 
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
             resume_to_last_page: false,
@@ -13205,6 +13554,292 @@ mod favorite_adjustment_defaults_tests {
     fn enable_auto_image_folder_book(app: &mut App) {
         app.settings.auto_fullscreen_zip_pdf = true;
         app.settings.auto_fullscreen_image_folders = true;
+    }
+
+    fn set_non_single_spread_defaults(app: &mut App) {
+        app.settings.default_spread_mode = crate::settings::SpreadMode::RtlCover;
+        app.settings.default_reading_flow = crate::settings::ReadingFlow::Horizontal;
+        app.settings.default_reading_direction = crate::settings::ReadingDirection::Rtl;
+    }
+
+    fn assert_non_book_spread_state(app: &App) {
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Paged);
+        assert_eq!(
+            app.reading_direction,
+            crate::settings::ReadingDirection::Ltr
+        );
+    }
+
+    fn assert_book_default_spread_state(app: &App) {
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::RtlCover);
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Horizontal);
+        assert_eq!(
+            app.reading_direction,
+            crate::settings::ReadingDirection::Rtl
+        );
+    }
+
+    fn store_spread_for_test(
+        app: &App,
+        path: &Path,
+        spread_mode: crate::settings::SpreadMode,
+        reading_flow: crate::settings::ReadingFlow,
+        reading_direction: crate::settings::ReadingDirection,
+    ) {
+        let db = app.spread_db.as_ref().unwrap();
+        db.set(
+            path,
+            spread_mode,
+            app.settings.default_spread_mode,
+            app.settings.default_reading_flow,
+            app.settings.default_reading_direction,
+        )
+        .unwrap();
+        db.set_flow(
+            path,
+            reading_flow,
+            reading_direction,
+            app.settings.default_spread_mode,
+            app.settings.default_reading_flow,
+            app.settings.default_reading_direction,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn start_loading_items_classifies_incoming_pages_before_install() {
+        let mut app = setup_app();
+        enable_auto_image_folder_book(&mut app);
+        set_non_single_spread_defaults(&mut app);
+        let folder = app.tmp.path().join("incoming-image-book");
+        std::fs::create_dir_all(&folder).unwrap();
+        let page = folder.join("p001.jpg");
+
+        assert!(app.items.is_empty(), "pre-install self.items must be empty");
+        app.start_loading_items(
+            folder,
+            vec![GridItem::Image(page)],
+            vec![None],
+            std::collections::HashSet::new(),
+            Vec::new(),
+            None,
+        );
+
+        assert_book_default_spread_state(&app);
+    }
+
+    #[test]
+    fn start_loading_items_uses_non_book_defaults_for_disabled_or_mixed_folders() {
+        let mut app = setup_app();
+        set_non_single_spread_defaults(&mut app);
+        let disabled = app.tmp.path().join("disabled-image-book");
+        std::fs::create_dir_all(&disabled).unwrap();
+        app.start_loading_items(
+            disabled.clone(),
+            vec![GridItem::Image(disabled.join("p001.jpg"))],
+            vec![None],
+            std::collections::HashSet::new(),
+            Vec::new(),
+            None,
+        );
+        assert_non_book_spread_state(&app);
+
+        enable_auto_image_folder_book(&mut app);
+        let mixed = app.tmp.path().join("mixed-image-folder");
+        std::fs::create_dir_all(&mixed).unwrap();
+        app.start_loading_items(
+            mixed.clone(),
+            vec![
+                GridItem::Image(mixed.join("p001.jpg")),
+                GridItem::Folder(mixed.join("chapter")),
+            ],
+            vec![None, None],
+            std::collections::HashSet::new(),
+            Vec::new(),
+            None,
+        );
+        assert_non_book_spread_state(&app);
+    }
+
+    #[test]
+    fn start_loading_items_applies_non_book_defaults_before_view_flags_are_set() {
+        let mut app = setup_app();
+        enable_auto_image_folder_book(&mut app);
+        set_non_single_spread_defaults(&mut app);
+        let sources = [
+            search_results_synthetic_path(),
+            bookmark_view_synthetic_path(),
+            rating_view_synthetic_path(),
+            subfolder_expansion_synthetic_path(),
+            smart_folder::smart_folder_synthetic_path(uuid::Uuid::new_v4()),
+        ];
+
+        for source in sources {
+            app.start_loading_items(
+                source,
+                vec![GridItem::Image(PathBuf::from(r"C:\test\p001.jpg"))],
+                vec![None],
+                std::collections::HashSet::new(),
+                Vec::new(),
+                None,
+            );
+            assert_non_book_spread_state(&app);
+        }
+    }
+
+    #[test]
+    fn stored_spread_values_override_defaults_for_book_and_non_book() {
+        let mut app = setup_app();
+        enable_auto_image_folder_book(&mut app);
+        set_non_single_spread_defaults(&mut app);
+
+        let non_book = app.tmp.path().join("stored-non-book");
+        std::fs::create_dir_all(&non_book).unwrap();
+        store_spread_for_test(
+            &app,
+            &non_book,
+            crate::settings::SpreadMode::Ltr,
+            crate::settings::ReadingFlow::Vertical,
+            crate::settings::ReadingDirection::Ltr,
+        );
+        app.start_loading_items(
+            non_book.clone(),
+            vec![
+                GridItem::Image(non_book.join("p001.jpg")),
+                GridItem::Folder(non_book.join("chapter")),
+            ],
+            vec![None, None],
+            std::collections::HashSet::new(),
+            Vec::new(),
+            None,
+        );
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Ltr);
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
+        assert_eq!(
+            app.reading_direction,
+            crate::settings::ReadingDirection::Ltr
+        );
+
+        let book = app.tmp.path().join("stored-book.pdf");
+        store_spread_for_test(
+            &app,
+            &book,
+            crate::settings::SpreadMode::Single,
+            crate::settings::ReadingFlow::Vertical,
+            crate::settings::ReadingDirection::Ltr,
+        );
+        app.start_loading_items(
+            book.clone(),
+            vec![GridItem::PdfPage {
+                pdf_path: book,
+                page_num: 0,
+                content_type: None,
+            }],
+            vec![None],
+            std::collections::HashSet::new(),
+            Vec::new(),
+            None,
+        );
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
+        assert_eq!(
+            app.reading_direction,
+            crate::settings::ReadingDirection::Ltr
+        );
+    }
+
+    #[test]
+    fn nested_zip_spread_fallback_key_still_overrides_book_defaults() {
+        let mut app = setup_app();
+        set_non_single_spread_defaults(&mut app);
+        let root = PathBuf::from(r"C:\test\book.zip");
+        let nested = root.join("volume-1");
+        store_spread_for_test(
+            &app,
+            &root,
+            crate::settings::SpreadMode::LtrCover,
+            crate::settings::ReadingFlow::Vertical,
+            crate::settings::ReadingDirection::Ltr,
+        );
+
+        let defaults = SpreadRestoreDefaults::for_book(&app.settings);
+        app.apply_spread_for_key_with_fallback(&nested, Some(&root), defaults);
+
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::LtrCover);
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
+        assert_eq!(
+            app.reading_direction,
+            crate::settings::ReadingDirection::Ltr
+        );
+    }
+
+    #[test]
+    fn page_order_lock_classifies_all_book_loading_sources() {
+        let mut app = setup_app();
+        enable_auto_image_folder_book(&mut app);
+        let image_folder = app.tmp.path().join("image-book");
+        let image_pages = vec![GridItem::Image(image_folder.join("p001.jpg"))];
+        let mixed_items = vec![
+            GridItem::Image(image_folder.join("p001.jpg")),
+            GridItem::Folder(image_folder.join("chapter")),
+        ];
+
+        assert!(app.page_order_locked_for_items(
+            &image_folder,
+            &image_pages,
+            PageOrderViewKind::for_loading_source(&image_folder),
+        ));
+        assert!(!app.page_order_locked_for_items(
+            &image_folder,
+            &mixed_items,
+            PageOrderViewKind::for_loading_source(&image_folder),
+        ));
+        for container in ["book.zip", "book.cbz", "book.pdf", "converted-cache.zip"] {
+            let path = app.tmp.path().join(container);
+            assert!(app.page_order_locked_for_items(
+                &path,
+                &[],
+                PageOrderViewKind::for_loading_source(&path),
+            ));
+        }
+
+        let book_root = app.tmp.path().join("books");
+        let compiled_book = book_root.join("compiled");
+        app.settings.book_root = Some(book_root);
+        assert!(app.page_order_locked_for_items(
+            &compiled_book,
+            &mixed_items,
+            PageOrderViewKind::for_loading_source(&compiled_book),
+        ));
+        let history = reading_history_synthetic_path();
+        assert!(app.page_order_locked_for_items(
+            &history,
+            &mixed_items,
+            PageOrderViewKind::for_loading_source(&history),
+        ));
+    }
+
+    #[test]
+    fn page_order_lock_rejects_all_non_book_synthetic_loading_sources() {
+        let mut app = setup_app();
+        enable_auto_image_folder_book(&mut app);
+        let image_pages = vec![GridItem::Image(PathBuf::from(r"C:\test\p001.jpg"))];
+        let synthetic_sources = [
+            search_results_synthetic_path(),
+            bookmark_view_synthetic_path(),
+            rating_view_synthetic_path(),
+            subfolder_expansion_synthetic_path(),
+            smart_folder::smart_folder_synthetic_path(uuid::Uuid::new_v4()),
+        ];
+
+        for source in synthetic_sources {
+            assert!(!app.page_order_locked_for_items(
+                &source,
+                &image_pages,
+                PageOrderViewKind::for_loading_source(&source),
+            ));
+        }
     }
 
     #[test]
@@ -13491,7 +14126,19 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.page_order_locked_for_current_view());
         app.items_are_tag_view = false;
 
+        app.items_are_rating_view = true;
+        assert!(!app.page_order_locked_for_current_view());
+        app.items_are_rating_view = false;
+
+        app.items_are_bookmark_view = true;
+        assert!(!app.page_order_locked_for_current_view());
+        app.items_are_bookmark_view = false;
+
         app.items_are_subfolder_expansion_view = true;
+        assert!(!app.page_order_locked_for_current_view());
+        app.items_are_subfolder_expansion_view = false;
+
+        app.items_are_smart_folder_view = true;
         assert!(!app.page_order_locked_for_current_view());
     }
 
@@ -17767,6 +18414,7 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = None;
         app.items_generation = locked_gen + 1;
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
             resume_to_last_page: false,
@@ -17810,7 +18458,11 @@ mod favorite_adjustment_defaults_tests {
         app.fs_nav_locked_gen = Some(app.items_generation);
         app.fullscreen_idx = None;
 
-        assert!(app.attach_archive_convert_deferred_fullscreen(false, false));
+        assert!(app.attach_archive_convert_deferred_fullscreen(
+            false,
+            false,
+            crate::app::HistoryTrigger::UserChosen,
+        ));
         assert!(app.archive_convert_deferred_fullscreen_active());
         assert!(app.fs_nav_deferred_reopen_wait_active());
         assert!(
@@ -17846,7 +18498,11 @@ mod favorite_adjustment_defaults_tests {
         });
         app.fs_nav_locked_gen = Some(app.items_generation);
         assert!(
-            !app.attach_archive_convert_deferred_fullscreen(false, false),
+            !app.attach_archive_convert_deferred_fullscreen(
+                false,
+                false,
+                crate::app::HistoryTrigger::UserChosen,
+            ),
             "ユーザー確認が必要な変換では fullscreen 継続予約を付けない"
         );
         assert!(!app.archive_convert_deferred_fullscreen_active());
@@ -17874,7 +18530,11 @@ mod favorite_adjustment_defaults_tests {
             suppress_confirm_next_time: false,
         });
         assert!(
-            app.attach_archive_convert_deferred_fullscreen(false, false),
+            app.attach_archive_convert_deferred_fullscreen(
+                false,
+                false,
+                crate::app::HistoryTrigger::UserChosen,
+            ),
             "確認設定が Ask でも direct-read probe 中は fullscreen 復帰予約を保持する"
         );
         assert!(app.archive_convert_deferred_fullscreen_active());
@@ -17930,7 +18590,11 @@ mod favorite_adjustment_defaults_tests {
             suppress_confirm_next_time: false,
         });
         app.fs_nav_locked_gen = Some(app.items_generation);
-        assert!(app.attach_archive_convert_deferred_fullscreen(false, false));
+        assert!(app.attach_archive_convert_deferred_fullscreen(
+            false,
+            false,
+            crate::app::HistoryTrigger::UserChosen,
+        ));
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
@@ -17990,7 +18654,11 @@ mod favorite_adjustment_defaults_tests {
             suppress_confirm_next_time: false,
         });
         app.fs_nav_locked_gen = Some(app.items_generation);
-        assert!(app.attach_archive_convert_deferred_fullscreen(false, false));
+        assert!(app.attach_archive_convert_deferred_fullscreen(
+            false,
+            false,
+            crate::app::HistoryTrigger::UserChosen,
+        ));
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
@@ -18330,6 +18998,8 @@ mod favorite_adjustment_defaults_tests {
         let _owner = app.keyboard_owner_for_pass(&ctx);
         crate::key_input::set_test_frame(vec![
             crate::key_input::KeyEdge {
+                source_hwnd: 1,
+                source_viewport: egui::ViewportId::ROOT,
                 virtual_key: 0x28,
                 scan_code: 0x50,
                 extended: true,
@@ -18340,6 +19010,8 @@ mod favorite_adjustment_defaults_tests {
                 alt: false,
             },
             crate::key_input::KeyEdge {
+                source_hwnd: 1,
+                source_viewport: egui::ViewportId::ROOT,
                 virtual_key: 0x28,
                 scan_code: 0x50,
                 extended: true,
@@ -18646,6 +19318,7 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = None;
         app.items_generation += 1;
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
             resume_to_last_page: false,
@@ -23686,6 +24359,33 @@ mod pipeline_cache_refactor_tests {
     }
 
     #[test]
+    fn paged_prefetch_starts_current_needs_load_after_cancelling_siblings() {
+        let mut app = setup_app();
+        let current = push_image(&mut app, r"C:\missing\current.png");
+        let sibling = push_image(&mut app, r"C:\missing\sibling.png");
+        app.visible_indices = vec![current, sibling];
+        app.details_order = vec![current, sibling];
+        app.fullscreen_idx = Some(current);
+        assert_eq!(app.fs_page_load_state(current), FsPageLoadState::NeedsLoad);
+
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let sibling_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let input_seq = app.input_seq;
+        app.fs_pending
+            .insert(sibling, (Arc::clone(&sibling_cancel), rx, input_seq));
+
+        app.update_prefetch_window(current);
+
+        assert!(sibling_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.fs_pending.contains_key(&current));
+        assert_eq!(
+            app.fs_page_load_state(current),
+            FsPageLoadState::LoadPending,
+            "the paged twin must re-assert the current producer before returning",
+        );
+    }
+
+    #[test]
     fn pdf_spread_reaches_both_pages_without_user_input() {
         let ctx = egui::Context::default();
         let mut app = setup_app();
@@ -24404,7 +25104,7 @@ mod pipeline_cache_refactor_tests {
                 .expect("prefetch pending")
                 .cancel,
         );
-        app.open_fullscreen(target);
+        app.open_fullscreen(target, crate::app::HistoryTrigger::UserChosen);
         let displayed =
             app.start_final_effect_worker(&ctx, final_key, &params, Arc::clone(&source), true);
 
@@ -24506,7 +25206,7 @@ mod pipeline_cache_refactor_tests {
             },
         );
 
-        app.open_fullscreen(target);
+        app.open_fullscreen(target, crate::app::HistoryTrigger::UserChosen);
 
         assert!(
             app.final_composite_cache.contains_key(&target_final_key),
@@ -26623,6 +27323,7 @@ mod still_window_mode_key_tests {
             requested_at: now,
             deadline: now,
             input_seq: 0,
+            history_trigger: crate::app::HistoryTrigger::UserChosen,
             cursor_state: app.fullscreen_cursor_state(),
             parked_live_window_id: owner,
             audio_mode_after_swap: false,
@@ -26915,6 +27616,7 @@ mod still_window_mode_key_tests {
 
         install_detached_transition_gap_for_test(&mut app, window_id, move |bundle| {
             bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
                 resume_to_last_page: false,
@@ -27762,7 +28464,7 @@ mod still_window_mode_key_tests {
             ViewerPresentation::DetachedWindow
         );
 
-        app.open_fullscreen(idx);
+        app.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
 
         assert_eq!(app.fullscreen_idx, Some(idx));
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
@@ -27824,7 +28526,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_enabled = true;
         app.settings.detached_viewer_open_images_in_window = true;
         app.selected = Some(first);
-        app.open_fullscreen(first);
+        app.open_fullscreen(first, crate::app::HistoryTrigger::UserChosen);
 
         app.selected = Some(second);
         app.sync_detached_viewer_to_selected(&ctx);
@@ -28829,7 +29531,7 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::Fullscreen;
         install_video_audio_player_with_native_output(&mut app, current);
 
-        app.open_fullscreen_from_fs_navigation(&ctx, next);
+        app.open_fullscreen_from_fs_navigation(&ctx, next, crate::app::HistoryTrigger::UserChosen);
 
         let pending = app
             .native_video_source_swap_pending
@@ -28857,7 +29559,11 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::Fullscreen;
         install_video_audio_player_with_native_output(&mut app, current);
 
-        app.open_fullscreen_from_fs_navigation(&ctx, previous);
+        app.open_fullscreen_from_fs_navigation(
+            &ctx,
+            previous,
+            crate::app::HistoryTrigger::UserChosen,
+        );
 
         let pending = app
             .native_video_source_swap_pending
@@ -28886,7 +29592,13 @@ mod still_window_mode_key_tests {
         app.video_continuous_last_eof = Some((current, 7));
         install_video_audio_player_with_native_output(&mut app, current);
 
-        app.apply_video_audio_mode_continuous_eof_target(&ctx, current, 7, Some(next));
+        app.apply_video_audio_mode_continuous_eof_target(
+            &ctx,
+            current,
+            7,
+            Some(next),
+            crate::app::HistoryTrigger::AutoAdvance,
+        );
 
         let pending = app
             .native_video_source_swap_pending
@@ -29209,7 +29921,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.video_in_window_mode = true;
         app.selected = Some(first);
-        app.open_fullscreen(first);
+        app.open_fullscreen(first, crate::app::HistoryTrigger::UserChosen);
         // F12 で main に出している状態を再現 (設定既定は detached だが手動で main へ)。
         app.viewer_presentation = ViewerPresentation::MainWindow;
         app.native_video_in_window_active = true;
@@ -29264,7 +29976,7 @@ mod still_window_mode_key_tests {
         app.fs_open_intent_from_grid = true;
         app.fs_media_open_forced_presentation = None;
 
-        app.open_fullscreen(v2);
+        app.open_fullscreen(v2, crate::app::HistoryTrigger::UserChosen);
 
         assert_eq!(
             app.viewer_presentation,
@@ -29288,7 +30000,7 @@ mod still_window_mode_key_tests {
         app.fs_open_intent_from_grid = true;
         app.fs_media_open_forced_presentation = None;
 
-        app.open_fullscreen(audio);
+        app.open_fullscreen(audio, crate::app::HistoryTrigger::UserChosen);
 
         assert_eq!(app.fullscreen_idx, Some(audio));
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
@@ -30445,7 +31157,12 @@ mod still_window_mode_key_tests {
 
         let mut reason = "";
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            reason = app.reopen_fullscreen_after_folder_nav_load(ctx, false, false);
+            reason = app.reopen_fullscreen_after_folder_nav_load(
+                ctx,
+                false,
+                false,
+                crate::app::HistoryTrigger::UserChosen,
+            );
         });
 
         assert_eq!(reason, "done");
@@ -30586,6 +31303,7 @@ mod still_window_mode_key_tests {
 
         install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
             bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
                 resume_to_last_page: false,
@@ -30624,6 +31342,7 @@ mod still_window_mode_key_tests {
         let window_id = 22u64;
         let viewport_id = install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
             bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
                 resume_to_last_page: false,
@@ -30766,6 +31485,7 @@ mod still_window_mode_key_tests {
 
         install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
             bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
                 resume_to_last_page: false,
@@ -30918,6 +31638,7 @@ mod still_window_mode_key_tests {
 
         install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
             bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
                 resume_to_last_page: false,
@@ -31064,7 +31785,7 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
 
-        app.open_fullscreen_from_fs_navigation(&ctx, video);
+        app.open_fullscreen_from_fs_navigation(&ctx, video, crate::app::HistoryTrigger::UserChosen);
 
         assert_eq!(
             app.fullscreen_idx,
@@ -31100,7 +31821,7 @@ mod still_window_mode_key_tests {
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.fs_open_intent_from_grid = true;
 
-        app.open_fullscreen(second);
+        app.open_fullscreen(second, crate::app::HistoryTrigger::UserChosen);
         let first_window_id = app.detached_image_windows[0].id;
         app.fs_feedback_toast = Some((
             "previous viewer toast".to_string(),
@@ -31465,6 +32186,10 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(video);
         app.selected = Some(video);
         app.slideshow_playing = true;
+        app.continuous_reading_scroll_transition =
+            Some(ContinuousReadingScrollTransition::AwaitingReanchor {
+                history_trigger: HistoryTrigger::AutoAdvance,
+            });
         install_playing_test_media(&mut app, video, video_path, 17.5);
         let pixels = egui::ColorImage::filled([1, 1], egui::Color32::WHITE);
         let texture = ctx.load_texture(
@@ -31496,6 +32221,7 @@ mod still_window_mode_key_tests {
 
         assert_test_media_paused_at(&app, video, 17.5);
         assert!(!app.slideshow_playing);
+        assert!(app.continuous_reading_scroll_transition.is_none());
         assert!(!app.fs_cache[&animated].animation_is_playing());
 
         handle.local_disconnect();
@@ -32294,7 +33020,7 @@ mod still_window_mode_key_tests {
         );
 
         app.vst3_deferred_media_open = Some(video);
-        app.open_fullscreen(second);
+        app.open_fullscreen(second, crate::app::HistoryTrigger::UserChosen);
         assert_eq!(app.vst3_deferred_media_open, None);
         assert_eq!(
             app.active_detached_viewer_context
@@ -33056,6 +33782,33 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn rename_migration_journal_snapshot_contains_all_app_owned_states() {
+        let mut app = setup_app();
+        let dir = tempfile::tempdir().unwrap();
+        app.rename_migration_data_dir_override = Some(dir.path().to_path_buf());
+        app.rename_migration_journal_loaded = true;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let in_flight = (PathBuf::from("a"), PathBuf::from("b"));
+        let queued = (PathBuf::from("b"), PathBuf::from("c"));
+        let retry = (PathBuf::from("x"), PathBuf::from("y"));
+        app.rename_migration_in_flight = Some(RenameMigrationInFlight {
+            old_path: in_flight.0.clone(),
+            new_path: in_flight.1.clone(),
+            rx,
+        });
+        app.rename_migration_queue.push_back(queued.clone());
+        app.rename_migration_boot_retry.push(retry.clone());
+
+        app.persist_rename_migration_journal();
+        app.flush_rename_migration_journal();
+
+        assert_eq!(
+            crate::rename_key_migration::journal_load(dir.path()),
+            vec![in_flight, queued, retry]
+        );
+    }
+
+    #[test]
     fn rename_migration_queue_runs_fifo_and_lands_on_final_path() {
         // Sol rename-mig P1: 連続リネーム A→B→C を並列 worker にすると逆順実行で
         // 中間 path にデータが取り残される。FIFO 直列実行で最終 path に集約されること。
@@ -33091,6 +33844,7 @@ mod still_window_mode_key_tests {
             1,
             "2 本目は直列キューで待機する"
         );
+        app.flush_rename_migration_journal();
         assert_eq!(
             crate::rename_key_migration::journal_load(dir.path()).len(),
             2,
@@ -33118,6 +33872,7 @@ mod still_window_mode_key_tests {
             )
             .unwrap();
         assert_eq!(angle, 90, "FIFO 直列実行で最終 path に集約される");
+        app.flush_rename_migration_journal();
         assert!(
             crate::rename_key_migration::journal_load(dir.path()).is_empty(),
             "完了したジョブはジャーナルから消し込まれる"
@@ -33150,10 +33905,11 @@ mod still_window_mode_key_tests {
             vec![(x, y)],
             "削除された B を新側に持つジョブだけが落ちる"
         );
+        app.flush_rename_migration_journal();
         assert_eq!(
             crate::rename_key_migration::journal_load(dir.path()).len(),
             1,
-            "ジャーナルも同期して書き戻される"
+            "worker flush 後のジャーナルも同じ未完了集合になる"
         );
     }
 
@@ -33326,6 +34082,7 @@ mod still_window_mode_key_tests {
 
         app.poll_rename_migration_pending(&ctx);
         assert!(app.rename_migration_in_flight.is_none());
+        app.flush_rename_migration_journal();
         assert_eq!(
             crate::rename_key_migration::journal_load(dir.path()),
             vec![(a.clone(), b.clone())],
@@ -33382,6 +34139,7 @@ mod still_window_mode_key_tests {
                 |r| r.get(0),
             )
             .unwrap();
+        app.flush_rename_migration_journal();
         assert_eq!(angle, 270, "回復ジョブが移行を完走させる");
         assert!(
             crate::rename_key_migration::journal_load(dir.path()).is_empty(),
@@ -33609,14 +34367,14 @@ mod still_window_mode_key_tests {
         let finished =
             crate::adjustment_db::normalize_path(std::path::Path::new(r"C:\clips\finished.mp4"));
         let updates = vec![
-            ViewerContextMediaResumeUpdate {
+            MediaResumeUpdate {
                 path: PathBuf::from(r"C:\clips\keep.mp4"),
                 key: kept.clone(),
                 position: 37.5,
                 duration: 120.0,
                 at_eof: false,
             },
-            ViewerContextMediaResumeUpdate {
+            MediaResumeUpdate {
                 path: PathBuf::from(r"C:\clips\finished.mp4"),
                 key: finished.clone(),
                 position: 118.0,
@@ -34018,7 +34776,7 @@ mod still_window_mode_key_tests {
         app.detached_viewer_open_next_still_detached_once = false;
         app.fs_open_intent_from_grid = true;
 
-        app.open_fullscreen(idx);
+        app.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
 
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
         assert!(
@@ -34057,7 +34815,7 @@ mod still_window_mode_key_tests {
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.fs_open_intent_from_grid = true;
 
-        app.open_fullscreen(second);
+        app.open_fullscreen(second, crate::app::HistoryTrigger::UserChosen);
 
         assert_eq!(app.fullscreen_idx, Some(second));
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
@@ -34167,7 +34925,7 @@ mod still_window_mode_key_tests {
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.fs_open_intent_from_grid = true;
 
-        app.open_fullscreen(second);
+        app.open_fullscreen(second, crate::app::HistoryTrigger::UserChosen);
 
         assert_eq!(app.fullscreen_idx, Some(second));
         assert!(
@@ -34200,7 +34958,7 @@ mod still_window_mode_key_tests {
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.fs_open_intent_from_grid = true;
 
-        app.open_fullscreen(second);
+        app.open_fullscreen(second, crate::app::HistoryTrigger::UserChosen);
 
         assert_eq!(app.fullscreen_idx, Some(second));
         assert_eq!(app.detached_image_windows.len(), 1);
@@ -34380,6 +35138,7 @@ mod still_window_mode_key_tests {
         app.visible_indices = vec![0];
 
         app.open_deferred_fullscreen_after_enumerate(DeferredFsReopen {
+            history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
             resume_to_last_page: false,
@@ -34426,6 +35185,7 @@ mod still_window_mode_key_tests {
         app.visible_indices = vec![0];
 
         let outcome = app.open_deferred_fullscreen_after_enumerate(DeferredFsReopen {
+            history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::Required(crate::snapshot::SnapshotTarget::PdfPage {
                 pdf_path: pdf,
@@ -34518,7 +35278,7 @@ mod still_window_mode_key_tests {
                             "{book_label}: OFF mode direct-open keeps the legacy linked/open path"
                         );
                     } else {
-                        app.open_fullscreen(0);
+                        app.open_fullscreen(0, crate::app::HistoryTrigger::UserChosen);
                         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
                         assert!(
                             !app.detached_viewer_independent_active,
@@ -34787,6 +35547,7 @@ mod still_window_mode_key_tests {
         app.image_metas = vec![None];
         app.visible_indices = vec![0];
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
             resume_to_last_page: false,
@@ -35375,7 +36136,7 @@ mod still_window_mode_key_tests {
         app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
         app.begin_active_detached_session(window_id, DetachedSource::Book);
 
-        app.open_fullscreen(second_main);
+        app.open_fullscreen(second_main, crate::app::HistoryTrigger::UserChosen);
 
         assert_eq!(
             app.fullscreen_idx,
@@ -36915,7 +37676,7 @@ mod still_window_mode_key_tests {
         app.detached_viewer_folder_nav_reuse_window_once = true;
         let viewport_id_before = app.fullscreen_viewport_id();
 
-        app.open_fullscreen(second);
+        app.open_fullscreen(second, crate::app::HistoryTrigger::UserChosen);
 
         assert_eq!(app.fullscreen_idx, Some(second));
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
@@ -38790,7 +39551,7 @@ mod still_window_mode_key_tests {
         app.update_detached_window_runtime_flags(91, true, "test_linked_reuse");
 
         assert!(app.prepare_detached_context_for_grid_open(&ctx, second));
-        app.open_fullscreen(second);
+        app.open_fullscreen(second, crate::app::HistoryTrigger::UserChosen);
 
         assert_eq!(app.fullscreen_idx, Some(second));
         assert_eq!(app.detached_viewer_window_id, Some(91));
@@ -39007,6 +39768,7 @@ mod still_window_mode_key_tests {
             target_video,
             cursor_state,
             Some(81),
+            crate::app::HistoryTrigger::UserChosen,
         );
 
         assert!(
@@ -40081,7 +40843,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_enabled = true;
         app.settings.video_in_window_mode = false;
         app.selected = Some(first);
-        app.open_fullscreen(first);
+        app.open_fullscreen(first, crate::app::HistoryTrigger::UserChosen);
 
         app.selected = Some(second);
         app.sync_detached_viewer_to_selected(&ctx);
@@ -40110,7 +40872,7 @@ mod still_window_mode_key_tests {
             "non-§1.7 linked viewer keeps the legacy media cursor-follow behavior"
         );
         app.selected = Some(first);
-        app.open_fullscreen(first);
+        app.open_fullscreen(first, crate::app::HistoryTrigger::UserChosen);
 
         app.selected = Some(video);
         app.sync_detached_viewer_to_selected(&ctx);
@@ -40138,7 +40900,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_enabled = true;
         app.settings.video_in_window_mode = false;
         app.selected = Some(first);
-        app.open_fullscreen(first);
+        app.open_fullscreen(first, crate::app::HistoryTrigger::UserChosen);
 
         app.navigate_native_video_fullscreen(&ctx, first, 1);
         poll_media_navigation_until_done_for_test(&mut app, &ctx);
@@ -40163,12 +40925,18 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_enabled = true;
         app.settings.video_in_window_mode = false;
         app.selected = Some(first);
-        app.open_fullscreen(first);
+        app.open_fullscreen(first, crate::app::HistoryTrigger::UserChosen);
 
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
 
         app.fs_vertical_scroll = 125.0;
-        app.reanchor_continuous_reading_viewer(&ctx, &[0.0, 100.0], 1, second);
+        app.reanchor_continuous_reading_viewer(
+            &ctx,
+            &[0.0, 100.0],
+            1,
+            second,
+            crate::app::HistoryTrigger::UserChosen,
+        );
 
         assert_eq!(app.fullscreen_idx, Some(second));
         assert_eq!(app.selected, Some(second));
@@ -40211,7 +40979,7 @@ mod still_window_mode_key_tests {
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
         app.settings.detached_viewer_enabled = true;
         app.selected = Some(idx);
-        app.open_fullscreen(idx);
+        app.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
 
         app.fs_zoom = 2.0;
@@ -40239,7 +41007,7 @@ mod still_window_mode_key_tests {
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
         app.settings.detached_viewer_enabled = true;
         app.selected = Some(idx);
-        app.open_fullscreen(idx);
+        app.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
 
         app.fs_zoom = 2.5;
@@ -40267,7 +41035,7 @@ mod still_window_mode_key_tests {
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
         app.settings.detached_viewer_enabled = true;
         app.selected = Some(idx);
-        app.open_fullscreen(idx);
+        app.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
 
         app.fs_zoom = 2.5;
         app.items[idx] = GridItem::Image(PathBuf::from(r"C:\pics\replacement.jpg"));
@@ -45393,7 +46161,7 @@ fn fullscreen_side_panel_mode_persists_while_open_states_reset_on_exit() {
     app.items
         .push(GridItem::Image(PathBuf::from("C:/photos/panel-mode.jpg")));
     app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
-    app.open_fullscreen(idx);
+    app.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
     app.fs_click_info_open = true;
     app.adjustment_mode = true;
 
@@ -45407,7 +46175,7 @@ fn fullscreen_side_panel_mode_persists_while_open_states_reset_on_exit() {
     assert!(!app.metadata_panel_click_shown());
     assert!(!app.adjustment_mode);
 
-    app.open_fullscreen(idx);
+    app.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
     assert!(!app.metadata_panel_click_shown());
     assert!(!app.adjustment_mode);
 }
@@ -45421,18 +46189,58 @@ fn fullscreen_file_change_resets_left_and_right_click_panels() {
     app.items.push(GridItem::Image(PathBuf::new()));
     app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
 
-    app.open_fullscreen(first);
+    app.open_fullscreen(first, crate::app::HistoryTrigger::UserChosen);
     app.adjustment_mode = true;
     app.fs_click_info_open = true;
     assert!(app.metadata_panel_click_shown());
 
-    app.open_fullscreen(second);
+    app.open_fullscreen(second, crate::app::HistoryTrigger::UserChosen);
 
     assert!(!app.adjustment_mode);
     assert!(!app.fs_click_info_open);
     assert!(!app.metadata_panel_click_shown());
 }
 
+#[test]
+fn continuous_reanchor_history_trigger_controls_recording() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let folder = PathBuf::from("C:/photos");
+    app.current_folder = Some(folder.clone());
+    app.items = vec![
+        GridItem::Image(folder.join("a.jpg")),
+        GridItem::Image(folder.join("b.jpg")),
+    ];
+    app.visible_indices = vec![0, 1];
+    app.fullscreen_idx = Some(0);
+    app.fs_vertical_scroll = 125.0;
+
+    app.reanchor_continuous_reading_viewer(
+        &ctx,
+        &[0.0, 100.0],
+        1,
+        1,
+        crate::app::HistoryTrigger::AutoAdvance,
+    );
+    assert!(
+        app.last_reading_history_touch.is_none(),
+        "slideshow-driven reanchor must not touch viewing history"
+    );
+
+    app.reanchor_continuous_reading_viewer(
+        &ctx,
+        &[0.0, 100.0],
+        0,
+        0,
+        crate::app::HistoryTrigger::UserChosen,
+    );
+    assert_eq!(
+        app.last_reading_history_touch
+            .as_ref()
+            .map(|(key, _)| key.as_str()),
+        Some(crate::path_key::normalize_keep_drive(&folder).as_str())
+    );
+}
 #[test]
 fn continuous_reanchor_preserves_panels_and_page_trim_override() {
     let mut app = phase_c_support::setup_app();
@@ -45457,7 +46265,13 @@ fn continuous_reanchor_preserves_panels_and_page_trim_override() {
     app.view_trim_save_pending = true;
     app.fs_vertical_scroll = 125.0;
 
-    app.reanchor_continuous_reading_viewer(&ctx, &[0.0, 100.0], 1, second);
+    app.reanchor_continuous_reading_viewer(
+        &ctx,
+        &[0.0, 100.0],
+        1,
+        second,
+        crate::app::HistoryTrigger::UserChosen,
+    );
 
     assert_eq!(app.fullscreen_idx, Some(second));
     assert_eq!(app.fs_vertical_scroll, 25.0);
@@ -45871,7 +46685,9 @@ fn setup_fullscreen_fixed_key_test() -> (phase_c_support::AppTestEnv, usize, egu
     ]);
     let idx = app.items.len() - 2;
     app.fullscreen_idx = Some(idx);
-    (app, idx, egui::Context::default())
+    let ctx = egui::Context::default();
+    crate::ime_focus::install_ime_input_policy(&ctx);
+    (app, idx, ctx)
 }
 
 #[track_caller]
@@ -46152,6 +46968,7 @@ fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() 
     app.fullscreen_idx = Some(idx);
     app.adjustment_mode = true;
     let ctx = egui::Context::default();
+    crate::ime_focus::install_ime_input_policy(&ctx);
     let field_id = egui::Id::new("ime-bookmark-title-focus-contract");
     let mut title = String::new();
     let mut request_focus = true;
@@ -47593,5 +48410,67 @@ mod rating_write_failure_tests {
         app.apply_meta_redo();
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
         assert!(app.rating_write_handle.is_none());
+    }
+    #[test]
+    fn history_trigger_routes_manual_and_all_auto_advance_origins() {
+        assert!(HistoryTrigger::UserChosen.should_record());
+        assert!(!HistoryTrigger::AutoAdvance.should_record());
+
+        assert_eq!(
+            crate::ui_fullscreen::slideshow_history_trigger(),
+            HistoryTrigger::AutoAdvance
+        );
+        assert_eq!(
+            ContinuousReadingScrollTransition::AwaitingReanchor {
+                history_trigger: HistoryTrigger::AutoAdvance,
+            }
+            .history_trigger_for_reanchor(),
+            Some(HistoryTrigger::AutoAdvance)
+        );
+        assert_eq!(
+            ContinuousReadingScrollTransition::AwaitingReanchor {
+                history_trigger: HistoryTrigger::UserChosen,
+            }
+            .history_trigger_for_reanchor(),
+            Some(HistoryTrigger::UserChosen)
+        );
+        assert_eq!(
+            FolderNavMode::SlideshowNext.history_trigger(),
+            HistoryTrigger::AutoAdvance
+        );
+        assert_eq!(
+            MediaNavigationAction::VideoContinuousEof {
+                fs_idx: 1,
+                seek_serial: 2,
+            }
+            .history_trigger(),
+            HistoryTrigger::AutoAdvance
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            MediaNavigationAction::VideoAudioModeContinuousEof {
+                fs_idx: 1,
+                seek_serial: 2,
+            }
+            .history_trigger(),
+            HistoryTrigger::AutoAdvance
+        );
+        assert_eq!(
+            MediaNavigationAction::MusicContinuousEof {
+                fs_idx: 1,
+                seek_serial: 2,
+            }
+            .history_trigger(),
+            HistoryTrigger::AutoAdvance
+        );
+        assert_eq!(
+            MediaNavigationAction::Manual {
+                fs_idx: 1,
+                delta: 1,
+                landing: ManualMediaNavigationLanding::Fullscreen,
+            }
+            .history_trigger(),
+            HistoryTrigger::UserChosen
+        );
     }
 }

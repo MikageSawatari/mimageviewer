@@ -1,6 +1,6 @@
-# 読書履歴 機能設計
+# 閲覧履歴 機能設計
 
-フォルダ / ZIP / PDF など「画像ページを読む単位」を最近読んだ順に集めて表示する
+画像の本と動画・音声ファイルを、ユーザーが最近閲覧した順に集めて表示する
 専用ビューの要件と実装設計メモ。ClaudeCode レビュー後、MVP を実装済み
 (2026-06、`src/reading_history_db.rs` / `App::enter_reading_history`)。
 
@@ -16,42 +16,47 @@
 
 ## 1. 目的
 
-最近読んだフォルダ / ZIP / PDF を一覧化し、読みかけや最近読んだ本へ戻りやすくする。
-既存の「最近開いたフォルダ履歴」はフォルダバーの移動履歴であり、読書履歴とは目的が
+最近閲覧した画像フォルダ / ZIP / PDF / 変換アーカイブに加え、動画・音声ファイルを
+最終閲覧順に一覧化する。画像の本は親コンテナ、動画・音声はファイルを記録単位とする。
+既存の「最近開いたフォルダ履歴」はフォルダバーの移動履歴であり、閲覧履歴とは目的が
 違うため分離する。
 
-UI 名称は **読書履歴** とする。「本履歴」も短いが、既存機能の「製本」「本棚」と
-混同しやすいため、画面上の場所名は「読書履歴」、説明文では「最近読んだ本」を使う。
-
----
+UI 名称は **閲覧履歴** とする。DB テーブル名、kind の既存文字列、
+StartupFolderMode::ReadingHistory、address の内部キーなど、永続化・内部識別子は
+互換性維持のため変更しない。
 
 ## 2. 要件
 
 ### 2.1 対象
 
-記録対象は、フルスクリーンで `Image` / `ZipImage` / `PdfPage` を開いたときの
-親コンテナとする。動画は対象外。
+記録対象は、ユーザー操作でフルスクリーン表示した画像ページ、およびユーザー操作で
+再生を開始した動画・音声とする。画像ページは親コンテナ、動画・音声はファイル単位で記録する。
 
-| 開いたページ | 履歴に記録する単位 | 備考 |
+| 開いた項目 | 履歴に記録する単位 | 備考 |
 | --- | --- | --- |
-| `GridItem::Image(path)` | 親フォルダ | 通常フォルダ。画像ページだけで読む文脈のときに記録する |
-| `GridItem::ZipImage { zip_path, .. }` | ZIP / CBZ 本体 | 変換アーカイブ閲覧中は元 RAR / 7z / LZH を記録する |
-| `GridItem::PdfPage { pdf_path, .. }` | PDF 本体 | パスワード付き PDF は開けた後だけ記録される |
+| GridItem::Image(path) | 親フォルダ | 通常フォルダ。画像ページだけで読む文脈のときに記録する |
+| GridItem::ZipImage | ZIP / CBZ 本体 | 変換アーカイブ閲覧中は元 RAR / 7z / LZH を記録する |
+| GridItem::PdfPage | PDF 本体 | パスワード付き PDF は開けた後だけ記録される |
+| GridItem::Video(path) | 動画ファイル | 履歴自身に最終位置と尺を保存する |
+| GridItem::Audio(path) | 音声ファイル | 履歴自身に最終位置と尺を保存する |
 
-通常フォルダは、画像シークバーが「ページ移動」として成立するのと同じ条件を対象にする。
-具体的には、現在の表示順に含まれるナビゲーション対象がすべて `has_page_data`
-(`Image` / `ZipImage` / `PdfPage`) のときだけ記録する。フォルダ、動画、ZIP/PDF 本体、
-変換アーカイブ、検索コンテナなどが混在する通常フォルダは対象外。
+通常フォルダの画像は、画像シークバーが「ページ移動」として成立するのと同じ条件を対象にする。
+具体的には、現在の表示順に含まれるナビゲーション対象がすべて画像ページのときだけ、
+フォルダを本として記録する。動画・音声を開いた場合はこの画像文脈判定を通さず、
+対象ファイルそのものを記録する。
 
-製本ルート / 本棚の本も、同じ条件を満たすなら読書履歴に載せる。検索インデックスでは
-チャーン回避のため除外される場合があるが、本棚はコレクション、読書履歴は時系列という
-役割の違いがあるため、読んだ事実は履歴として扱う。
+一覧からのオープン、手動のファイル移動、履歴 / ブックマークからのオープンは記録する。
+連続再生の EOF 遷移、スライドショーの自動送り、
+SlideshowEndAction::NextFolder による遷移は記録しない。
+遷移起点は HistoryTrigger の必須引数として記録地点まで伝え、現在の再生状態から推測しない。
 
-ZIP / PDF は開いた中身がページ一覧であるため対象にする。ネスト ZIP や章分け CBZ の
-深い階層を読んでいる場合も、読書履歴では外側コンテナ (`zip_path`、または変換元
-アーカイブ) を記録する。既存の `book_resume` と異なり、読書履歴は「本へ戻る」一覧であり、
-深い階層のページ位置復元までは MVP で担わない。`zip_nav.at_root() == false` の場合は
-`last_page` / `page_count` を NULL にして、再オープンは既存の open / resume 設定に委ねる。
+製本ルート / 本棚の本も、同じ画像条件を満たすなら閲覧履歴に載せる。ZIP / PDF や
+ネスト ZIP / 章分け CBZ は外側コンテナを記録する。深い階層ではページ位置を NULL にし、
+再オープンは既存の open / resume 設定に委ねる。
+
+動画・音声の履歴位置は resume DB ではなく閲覧履歴自身の列を使う。完走時に既存の
+resume エントリが削除されても、閲覧した事実と履歴位置表示は残る。再オープン位置は
+従来どおり resume の規則に従うため、完走した動画は先頭から開く。
 
 ### 2.2 検索結果との関係
 
@@ -60,7 +65,7 @@ ZIP / PDF は開いた中身がページ一覧であるため対象にする。�
 | モード | 記録 | 理由 |
 | --- | --- | --- |
 | 通常閲覧 | 対象 | 実フォルダ / ZIP / PDF の読書文脈が明確 |
-| Ctrl+S コンテナ検索 | 対象 | フォルダ / ZIP / PDF を探して開く導線なので、読書履歴と一致する |
+| Ctrl+S コンテナ検索 | 対象 | フォルダ / ZIP / PDF を探して開く導線なので、閲覧履歴と一致する |
 | Ctrl+G アイテム検索 | 対象外 | ページ / ファイル単位の検索で、親コンテナを読んだとみなすか曖昧 |
 | タグビュー | 対象外 | Ctrl+G と同じく合成ビューの意味が強い |
 | Ctrl+F 現在地フィルタ | 対象 | 現在の実コンテナ内の一時絞り込みなので、通常閲覧の延長 |
@@ -83,7 +88,7 @@ Ctrl+F は現在の表示順に対する一時フィルタなので、判定も�
 ### 2.3 変換アーカイブ
 
 RAR / 7z / LZH / CBR / CB7 などの変換アーカイブは、ユーザー視点では 1 つの本なので
-読書履歴対象に含める。保存するパスは変換後キャッシュ ZIP ではなく、必ず元アーカイブ
+閲覧履歴対象に含める。保存するパスは変換後キャッシュ ZIP ではなく、必ず元アーカイブ
 パスにする。
 
 既存の `archive_source_override` / `effective_folder()` 規約に従う:
@@ -97,7 +102,7 @@ RAR / 7z / LZH / CBR / CB7 などの変換アーカイブは、ユーザー視�
 
 ### 2.4 履歴件数と設定
 
-- 既定で読書履歴の記録は ON
+- 既定で閲覧履歴の記録は ON
 - 保持件数は既定 1000
 - 最大 1000
 - 設定で記録を OFF にできる
@@ -105,7 +110,7 @@ RAR / 7z / LZH / CBR / CB7 などの変換アーカイブは、ユーザー視�
 - 保持件数を下げた場合は、設定保存時または次回記録時に古い項目から削除する
 - 記録 OFF は新規記録を止めるだけで、既存履歴は削除しない
 - 既存履歴は環境設定から全削除できる
-- 読書履歴ビューの右クリックメニューから 1 件ずつ削除できる
+- 閲覧履歴ビューの右クリックメニューから 1 件ずつ削除できる
 
 設定候補:
 
@@ -119,7 +124,7 @@ pub reading_history_limit: usize,       // default 1000, clamp 1..=1000
 
 ### 2.5 起動時表示
 
-起動時に開く場所へ「読書履歴」を追加する。
+起動時に開く場所へ「閲覧履歴」を追加する。
 
 ```rust
 pub enum StartupFolderMode {
@@ -132,7 +137,7 @@ pub enum StartupFolderMode {
 ```
 
 起動時モードが `ReadingHistory` の場合は、実フォルダではなく専用の合成ビューとして
-読書履歴を表示する。履歴が空なら空状態を表示する。DB が開けない場合もビュー自体は
+閲覧履歴を表示する。履歴が空なら空状態を表示する。DB が開けない場合もビュー自体は
 空で表示し、トーストとログで知らせる。
 
 起動先の解決は `known_folders::startup_folder()` の戻り値だけで分岐しない。既存の
@@ -163,7 +168,7 @@ pub enum ReadingHistoryOpenMode {
 
 ### 3.1 専用ビュー
 
-読書履歴は、検索結果やドライブ一覧と同じく、実在フォルダではない専用の場所として
+閲覧履歴は、検索結果やドライブ一覧と同じく、実在フォルダではない専用の場所として
 表示する。
 
 実装候補:
@@ -185,52 +190,39 @@ App 状態には `items_are_reading_history_view: bool` を追加する。
 back stack へ記録するため、メニュー起動直後から ← で元のフォルダへ戻れる。
 履歴から pop したときは実ディレクトリとしてロードせず `enter_reading_history()` へ
 ディスパッチし、DB から専用ビューを再構築する。これにより実フォルダへ移動した後も
-←/→ で読書履歴へ戻れ、`__reading_history__` を開いた空表示には落ちない。
+←/→ で閲覧履歴へ戻れ、`__reading_history__` を開いた空表示には落ちない。
 
-読書履歴ビューの `items` は、既存の `GridItem` を再利用する:
-
-| DB kind | GridItem |
-| --- | --- |
-| `folder` | `GridItem::Folder(path)` |
-| `zip` | `GridItem::ZipFile(path)` |
-| `pdf` | `GridItem::PdfFile(path)` |
-| `archive` | `GridItem::ConvertibleArchive { path, format }` |
-
+閲覧履歴ビューの items は既存の GridItem を再利用する。folder / zip / pdf / archive は
+従来のコンテナ項目、video / audio はそれぞれ Video / Audio として構築する。
 専用 `GridItem::ReadingHistoryContainer` は追加しない方針を第一候補にする。理由は、
 既存のサムネイル、open、rating、右クリックメニューの分岐を再利用でき、
 match arm の追加漏れを減らせるため。代表サムネ固定は現在フォルダを親コンテナとして
-記録する操作なので、合成パスの読書履歴ビューでは MVP 対象外にする。最終閲覧日時などの履歴メタ情報は
+記録する操作なので、合成パスの閲覧履歴ビューでは MVP 対象外にする。最終閲覧日時などの履歴メタ情報は
 `App.reading_history_rows` のような side table に保持し、idx ではなく正規化キーで参照する。
 表示順の再構築や削除で idx がずれてもメタ情報を取り違えないようにする。
 
-履歴ビューでは最近読んだ順を保つ必要があるため、ツールバーのソートや詳細ヘッダソートは
-無効化する。MVP では表示モード自体は既存設定を壊さないが、詳細表示でも
-`current_grid_order()` / `details_order` は DB の最近順を保つ。列ヘッダクリックによる並べ替えは
-読書履歴ビューでは無効にする。スマートフィルタ / ★フィルタも MVP では無効化する。
-履歴内検索は将来機能とする。
+履歴ビューは最終閲覧日時の降順を固定し、ソート UI は追加しない。種別絞り込みは
+ブックマークと同じ MediaFilter / BookKindFilter を使い、「すべて / 動画 / 音声 / 本」と
+本の内訳を同じラベル・順序で表示する。スマートフィルタ / ★フィルタは無効化する。
 
 ### 3.2 表示内容
 
 実装済みの表示内容:
 
-- サムネイルまたはコンテナアイコン
+- サムネイルまたはコンテナ / メディアアイコン
 - 表示名
-- サムネイル表示で選択中セルの下に出す最終閲覧日時 / 既読位置
-  (`環境設定 → 表示 → サムネイル` で個別に ON/OFF)
-- ホバー tooltip に場所 (フルパス) / 最終閲覧日時 / 既読位置 (複数フォルダ・ドライブの
-  同名本を場所で判別できるよう、場所をフルパスで先頭に出す)
-- 詳細表示モードでは `更新日時` 列を `最終閲覧` 列、`状態` 列を `既読位置` 列に読み替えて
-  別々の列に表示する (1 列に押し込めない)
+- サムネイル表示で選択中セルの下に出す最終閲覧日時 / 閲覧位置
+- ホバー tooltip の場所 / 最終閲覧日時 / 閲覧位置
+- 詳細表示の最終閲覧列 / 閲覧位置列
+- ブックマークと同型の種別絞り込み
 
-DB には最終閲覧日時と、取れる場合は `last_page` / `page_count` を保存する。MVP では
-表示は通常のグリッド/詳細表示を再利用しつつ、`App.reading_history_rows` side table から
-最終閲覧日時や `12 / 120` のような補助表示を引く。
-
+DB には最終閲覧日時と、本の last_page / page_count、動画・音声の
+media_position_ms / media_duration_ms を意味を分けた列として保存する。
 存在しない項目は、初回表示時に同期 `exists()` を大量に呼ばない。表示直後に worker で
 自動整理して件数を変えると、選択行やスクロール位置が動いて体験が悪くなるため、ユーザーが
 項目を開こうとした 1 件だけ確認する。パスの親ドライブ / 共有が利用可能で、対象だけが
 確実に存在しない場合は、移動せず「ファイルが見つからない」旨のトーストを出し、その行を
-読書履歴から削除する。外付けドライブ未接続、ネットワーク共有にアクセスできない、権限エラー
+閲覧履歴から削除する。外付けドライブ未接続、ネットワーク共有にアクセスできない、権限エラー
 など存在しないと断定できない場合は、移動せず「アクセスできません」と通知し、履歴行は残す。
 外付けドライブのドライブレターが変わった場合は、古い行が開けなくなり、新しい行が別 key
 として追加される。これは `normalize_keep_drive` を採用する代償として許容する。
@@ -238,37 +230,37 @@ DB には最終閲覧日時と、取れる場合は `last_page` / `page_count` �
 ### 3.3 操作
 
 - 入口: 製本とは無関係なので製本メニューには置かない。ファイルメニューの
-  「読書履歴を開く」と、アドレスバー「場所▼」の「読書履歴」(ドライブ一覧の下) から開く。
+  「閲覧履歴を開く」と、アドレスバー「場所▼」の「閲覧履歴」(ドライブ一覧の下) から開く。
   既存の「最近開いたフォルダ履歴」とは別物だと分かる配置にする。
-- ダブルクリック / Enter / Gamepad A: 通常のコンテナ open と同じ。ただし読書履歴ビューでは
+- ダブルクリック / Enter / Gamepad A: 通常のコンテナ open と同じ。ただし閲覧履歴ビューでは
   `guard_reading_history_open` が先に対象コンテナの存在を 1 件だけ確認する。確実に削除済みなら
   トーストを出してその行を履歴から削除し、コンテナの中には入らない。外付けドライブ未接続など
   存在しないと断定できない場合は、履歴を残したままトーストだけ出す。`note_reading_history_open` が
-  戻り先予約 (`reading_history_return_from`) を更新する: 読書履歴ビューで本 (コンテナ) を
-  開いたら本の container パスを焼き付け、読書履歴ビュー以外で別コンテナを開いたら捨てる。
+  戻り先予約 (`reading_history_return_from`) を更新する: 閲覧履歴ビューで本 (コンテナ) を
+  開いたら本の container パスを焼き付け、閲覧履歴ビュー以外で別コンテナを開いたら捨てる。
   画像 / ページ (非コンテナ) のオープンでは変えない (本の中でページを読むだけなので保持)
 - 本を「親へ戻る」操作で閉じる (Backspace / アドレスバーの親へ戻る / 自動フルスクリーン時の
-  Esc 直帰): 実ディレクトリではなく読書履歴ビューへ戻る。判定は `reading_history_back_nav()`
+  Esc 直帰): 実ディレクトリではなく閲覧履歴ビューへ戻る。判定は `reading_history_back_nav()`
   (= `effective_folder()` が `reading_history_return_from` と一致する間だけ ReadingHistory を
   返す)。`grid_parent_nav_target` / `resolve_grid_parent_nav` / `resolve_return_to_parent_nav`
   の 3 経路で同じ判定を通す
 - **戻り先予約の寿命管理**:
   - ネスト ZIP の深い階層 (`zip_nav` が root でない) では `reading_history_back_nav` は
     None を返す (`effective_folder()` は深さに関わらず root ZIP のままなので、明示的に弾く)。
-    root に戻ってから読書履歴へ抜ける = Esc 直帰経路でも深い階層から一気に戻らない
+    root に戻ってから閲覧履歴へ抜ける = Esc 直帰経路でも深い階層から一気に戻らない
   - 別の本 / フォルダへ明示ナビで出たら予約を捨てる: `load_folder_with_scan` が予約した本
     以外の実フォルダへ移ったときクリア、`enter_drive_list` でもクリア、コンテナの
     再オープン時は `note_reading_history_open` がクリア
-  - **変換アーカイブの例外**: 読書履歴の RAR/7z/LZH を開くと `open_archive_via_cache` /
+  - **変換アーカイブの例外**: 閲覧履歴の RAR/7z/LZH を開くと `open_archive_via_cache` /
     変換完了処理が `load_folder(cache_zip)` を呼ぶため、`cache_zip != 元アーカイブ` で予約が
     `load_folder_with_scan` のクリアに巻き込まれる。`archive_source_override` を元パスへ戻すのと
     同様に、ロード前に「予約が元アーカイブと一致したか」を退避し、ロード成功後に
-    `reading_history_return_from = 元アーカイブ` を書き戻す (= 閉じると読書履歴へ戻れる)。
-    読書履歴以外から開いた変換アーカイブでは退避フラグが立たないので誤保持しない
-- 読書履歴の合成パスは履歴 back/forward スタックに積まない (`record_folder_nav_transition` /
-  quick folder target capture で `__search_results__` と同様に除外)。読書履歴へ戻るのは上記
+    `reading_history_return_from = 元アーカイブ` を書き戻す (= 閉じると閲覧履歴へ戻れる)。
+    閲覧履歴以外から開いた変換アーカイブでは退避フラグが立たないので誤保持しない
+- 閲覧履歴の合成パスは履歴 back/forward スタックに積まない (`record_folder_nav_transition` /
+  quick folder target capture で `__search_results__` と同様に除外)。閲覧履歴へ戻るのは上記
   「親へ戻る」専用経路だけにし、Alt+← で実体のない合成パスを開こうとする事故を防ぐ
-- Backspace: 読書履歴へ来る前の場所に戻る。起動直後はドライブ一覧またはデスクトップへ
+- Backspace: 閲覧履歴へ来る前の場所に戻る。起動直後はドライブ一覧またはデスクトップへ
 - 右クリック:
   - 履歴から削除
   - この本のフォルダに移動 (本を含む実フォルダへ移動して前後の本を探す。
@@ -280,7 +272,7 @@ DB には最終閲覧日時と、取れる場合は `last_page` / `page_count` �
   - 記録 ON/OFF
   - 保持件数
   - 履歴を全削除
-  - 起動時に読書履歴を表示
+  - 起動時に閲覧履歴を表示
 
 操作可否は `items_are_drive_list` ではなく、検索結果ビューに近い扱いにする。履歴の各項目は
 実パスを持つため、rating、代表サムネ固定、右クリックメニュー、Explorer で場所を開く操作は
@@ -295,57 +287,26 @@ DB には最終閲覧日時と、取れる場合は `last_page` / `page_count` �
 
 ### 4.1 DB
 
-新規 DB を推奨:
+DB は次の既存パスを維持する:
 
-```text
-%APPDATA%/mimageviewer/reading_history.db
-```
+    %APPDATA%/mimageviewer/reading_history.db
 
-`book_resume.db` に同居させる案もあるが、読書履歴は一覧表示・削除・prune・存在確認など
-責務が異なるため、別 DB の方が管理しやすい。
+reading_history テーブルの既存列と既存 kind 文字列は変更しない。動画・音声対応では
+リリース済み DB を ALTER TABLE ADD COLUMN で移行し、次の専用列を追加する。
 
-schema 案:
+    media_position_ms INTEGER
+    media_duration_ms INTEGER
 
-```sql
-CREATE TABLE IF NOT EXISTS reading_history (
-    key TEXT PRIMARY KEY,
-    path TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    archive_format TEXT,
-    title TEXT NOT NULL,
-    last_read_at_ms INTEGER NOT NULL,
-    last_page INTEGER,
-    page_count INTEGER,
-    file_size INTEGER,
-    mtime_ms INTEGER
-);
+本の last_page / page_count に秒数を格納して意味を混在させない。kind には新規の
+video / audio を加えるが、folder / zip / pdf / archive の文字列はそのまま維持する。
+パス key も従来どおり path_key::normalize_keep_drive(path) を使う。
 
-CREATE INDEX IF NOT EXISTS idx_reading_history_last_read_at
-    ON reading_history(last_read_at_ms DESC);
-```
+一覧読み出しでは、未知 kind を Folder にフォールバックせず、その行だけ読み飛ばす。
+これにより今後の新 kind を古い実装が誤った項目種別として扱う事故を防ぐ。ただし、
+すでに配布済みの旧版バイナリ自体の挙動は今回の変更では修正できない。
 
-`kind` は `folder` / `zip` / `pdf` / `archive`。`archive_format` は `rar` / `7z` /
-`lzh` / `zip` など、`ArchiveFormat` へ戻せる文字列を保存する。通常 ZIP / PDF /
-フォルダでは NULL。
-
-`key` は `path_key::normalize_keep_drive(path)` を第一候補にする。読書履歴は実際に開く
-パスのリストなので、`book_resume.db` のようなドライブ文字除外よりも、別ドライブの
-同名パスを衝突させないことを優先する。将来、外付けドライブのドライブレター変化に
-追従したい場合は、別途ボリューム ID / ファイル ID の採用を検討する。keep-drive の代償として、
-外付けドライブのドライブレターが変わると旧行と新行が別履歴として並ぶ可能性がある。
-開こうとした時点で親ドライブ / 共有が利用可能なら、見つからない旧行だけを履歴から外す。
-
-`path` はユーザー視点の実パスをそのまま保存する。変換アーカイブでは元アーカイブパスであり、
-キャッシュ ZIP パスを保存してはいけない。
-
-`book_resume.db` とは key を共有しないし、共有する必要もない。既存の `record_book_resume`
-は `current_folder` を保存するため、変換アーカイブではキャッシュ ZIP 側の key になる。
-一方、読書履歴は元アーカイブを保存し、開くときに `load_folder_or_convert_archive...` 経由で
-既存の変換 / resume 経路へ合流する。したがって履歴用の path 解決 helper は
-`book_resume` の解決を流用せず、別に持つ。
-
-`last_page` / `page_count` は補助情報。履歴から開く挙動は既存の `book_resume.db` に従うため、
-この値は UI 表示と将来の直接ジャンプ用であり、MVP の open source of truth にはしない。
+動画・音声の位置更新は既存行に対する UPDATE のみとし、再生進捗の保存だけで新しい履歴行や
+最終閲覧順を作らない。履歴行の作成と最終閲覧日時の更新はユーザー操作による open 時だけ行う。
 
 ### 4.2 Reader / Writer
 
@@ -375,8 +336,8 @@ pub enum ReadingHistoryCommand {
 
 読み取りは以下のタイミングだけなので UI スレッド同期でも許容しやすい:
 
-- 起動時に読書履歴ビューを表示する
-- ユーザーが読書履歴ビューへ移動する
+- 起動時に閲覧履歴ビューを表示する
+- ユーザーが閲覧履歴ビューへ移動する
 - 環境設定で件数を表示する
 
 ただし DB open が cold で遅い可能性があるため、`App::new_from_settings` で一度 open し、
@@ -407,63 +368,34 @@ WHERE key NOT IN (
 
 ## 5. 記録ロジック
 
-記録は `record_book_resume(idx)` と同じ発火点に置く。ただし発火点だけを揃え、
-key / path 解決は読書履歴専用 helper で行う。`record_book_resume` は `current_folder` を
-保存するため、変換アーカイブではキャッシュ ZIP 側の key になり得るが、読書履歴では
-ユーザー視点の元アーカイブパスを保存する。
+記録地点には必須引数 HistoryTrigger を渡す。
 
-候補:
-
-```rust
-pub(crate) fn record_reading_history(&mut self, idx: usize) {
-    if !self.settings.reading_history_enabled { return; }
-    if self.global_search.active || self.items_are_global_search_view { return; }
-    if self.tag_view.active || self.items_are_tag_view { return; }
-    if !self.is_readable_page_idx(idx) { return; }
-    if !self.current_context_is_pure_image_pages(idx) { return; }
-
-    let Some(mut record) = self.reading_history_record_for_idx(idx) else { return; };
-    if self.zip_nav.as_ref().is_some_and(|n| !n.at_root()) {
-        record.last_page = None;
-        record.page_count = None;
+    enum HistoryTrigger {
+        UserChosen,
+        AutoAdvance,
     }
 
-    let key = record.key.clone();
-    if self.last_reading_history_key.as_ref() == Some(&key)
-        && !self.reading_history_touch_due(key.as_str())
-    {
-        return;
-    }
+UserChosen は一覧・履歴・ブックマークからの open と、上下キー / ホイール /
+Ctrl+上下による手動ファイル移動に使う。AutoAdvance は次の 5 起点から型付きで伝播する。
 
-    self.reading_history_writer.record(record, self.settings.reading_history_limit);
-    self.last_reading_history_key = Some(key);
-}
-```
+1. advance_slideshow
+2. try_start_slideshow_next_folder
+3. apply_video_continuous_eof_target
+4. apply_video_audio_mode_continuous_eof_target
+5. apply_music_continuous_eof_target
 
-`current_context_is_pure_image_pages` は、フルスクリーンのページシークバーが実際にページ
-ジャンプとして動く条件と揃える。既存の `fullscreen_seek_info` は `ui_fullscreen.rs`
-内部にあるため、共通化する場合は新しい走査を書かず、既存の `build_image_reading_indices` /
-`build_nav_indices` / `count_seek_overlay_non_image_items` を移設または共通 helper 化する。
-純粋 helper は「現在の表示順から image page indices と non-image count を作る」責務にする。
+record_reading_history は AutoAdvance なら記録せず、UserChosen のときだけ項目種別を解決する。
+画像は従来の純粋な画像ページ文脈を確認して親コンテナを upsert する。動画・音声は
+is_readable_page_idx の画像限定ガードを通さず、対象ファイルを video / audio として upsert する。
 
-`reading_history_record_for_idx` の解決規則:
+HistoryTrigger は open_fullscreen、フォルダ読み込み後の reopen、遅延 ZIP/PDF/変換アーカイブ、
+native video source swap、snapshot navigation、連結表示の scroll transition を含む遷移データに保持する。
+App に自動進行中フラグを置かず、slideshow_active 等の現在状態からも推測しない。
+引数に既定値を設けないため、新しい遷移経路は記録方針を明示しない限りコンパイルできない。
 
-1. `archive_source_override` がある場合はそれを保存し、`kind=archive` にする
-2. `GridItem::Image(path)` は現在の実フォルダ (`current_folder`、必要なら item の親) を保存し、
-   `kind=folder`
-3. `GridItem::ZipImage { zip_path, .. }` は `zip_path` を保存し、`kind=zip`
-4. `GridItem::PdfPage { pdf_path, .. }` は `pdf_path` を保存し、`kind=pdf`
-5. `current_folder` が `search_results_synthetic_path()` や `reading_history_synthetic_path()`
-   のような合成パスなら保存しない
-
-Ctrl+S 経由で開いた実コンテナは `favsearch.active` が真でも記録対象にする。Ctrl+G とタグ
-ビューは対象外なので、検索合成ビューから親コンテナを逆算する複雑な分岐は MVP では持たない。
-
-`last_read_at_ms` は upsert 時の現在時刻。`last_page` は `idx` ではなく、可能なら
-画像ページだけの reading position (`1-based`) を保存する。`page_count` も同じ helper から
-取れる場合に保存する。
-
----
+同一フォルダ内の画像自動送りは同じ key の upsert だったため件数は元から増えなかった。
+今回、NextFolder で別フォルダへ移った画像も AutoAdvance として記録対象外にし、
+自動送りのたびにフォルダ履歴が 1 件ずつ増える既存の穴を塞ぐ。
 
 ## 6. 履歴ビュー生成
 
@@ -478,7 +410,7 @@ Ctrl+S 経由で開いた実コンテナは `favsearch.active` が真でも記�
 5. `install_new_items(items, image_metas)` を呼ぶ
 6. `items_are_reading_history_view = true`
 7. `current_folder = Some(reading_history_synthetic_path())`
-8. `address = "読書履歴"`
+8. `address = "閲覧履歴"`
 9. `rebuild_visible_indices()`
 
 `install_new_items` は既定で `items_are_global_search_view` / `items_are_tag_view` /
@@ -494,14 +426,14 @@ Ctrl+S 経由で開いた実コンテナは `favsearch.active` が真でも記�
 `start_loading_items` を通すか、Ctrl+G の `replace_search_view_items` に近い軽量経路にするかは
 実装時に判断する。サムネイル worker / catalog / converted archive cache path refresh を
 通常どおり動かしたいので、MVP は `start_loading_items(reading_history_synthetic_path(), ...)`
-相当の通常経路が安全。ただし MVP では `StartupFolderMode::Previous` から読書履歴 synthetic
+相当の通常経路が安全。ただし MVP では `StartupFolderMode::Previous` から閲覧履歴 synthetic
 path を復元しない方針なので、通常経路を使う場合も `settings.last_folder` への保存は
 skip する。
 
 提案:
 
 - `StartupFolderMode::ReadingHistory` では直接 `enter_reading_history()`
-- ユーザーが明示的に読書履歴へ移動した場合も、MVP では `last_folder` に synthetic path を保存しない
+- ユーザーが明示的に閲覧履歴へ移動した場合も、MVP では `last_folder` に synthetic path を保存しない
 - 将来 `StartupFolderMode::Previous` で synthetic path を復元するなら、
   `resolve_openable_path` とは別に `is_reading_history_synthetic_path` を先に判定する
 
@@ -517,25 +449,25 @@ skip する。
 variant を先に見る。`Drives` と `ReadingHistory` がどちらも「実パスなし」になっても、
 呼び出し側で混同しないようにする。
 
-外部ファイラや SendTo からパスが渡された場合は、従来どおり明示パスを優先し、読書履歴起動は
+外部ファイラや SendTo からパスが渡された場合は、従来どおり明示パスを優先し、閲覧履歴起動は
 使わない。
 
 ### 7.2 Backspace / 履歴ボタン
 
-読書履歴は合成ビューなので、検索結果やドライブ一覧に近い扱いにする。
+閲覧履歴は合成ビューなので、検索結果やドライブ一覧に近い扱いにする。
 
-- 読書履歴へ入る前の場所があれば Backspace / 履歴戻るで戻る
+- 閲覧履歴へ入る前の場所があれば Backspace / 履歴戻るで戻る
 - 起動直後など戻り先がなければドライブ一覧またはデスクトップへ戻る
-- 読書履歴内の項目を開いた場合は、通常のフォルダ履歴へ遷移を積む
-- 読書履歴自体を「最近開いたフォルダ履歴」には入れない
+- 閲覧履歴内の項目を開いた場合は、通常のフォルダ履歴へ遷移を積む
+- 閲覧履歴自体を「最近開いたフォルダ履歴」には入れない
 
 ### 7.3 last_folder
 
-MVP では `settings.last_folder` に読書履歴の synthetic path を入れない。
+MVP では `settings.last_folder` に閲覧履歴の synthetic path を入れない。
 
-候補 A: `Previous` で読書履歴も復元する
+候補 A: `Previous` で閲覧履歴も復元する
 
-- 利点: 前回読書履歴を見て閉じたら次回も同じ場所から始まる
+- 利点: 前回閲覧履歴を見て閉じたら次回も同じ場所から始まる
 - 欠点: `last_folder` が実パス前提の処理に漏れると開けない
 
 候補 B: `ReadingHistory` モードの時だけ起動する
@@ -544,64 +476,18 @@ MVP では `settings.last_folder` に読書履歴の synthetic path を入れな
 - 欠点: 前回表示場所としての一貫性は少し落ちる
 
 MVP は候補 B を推奨する。`StartupFolderMode::ReadingHistory` が明示設定されているときだけ
-読書履歴で起動し、`Previous` 用の `last_folder` には実コンテナを保存し続ける。
+閲覧履歴で起動し、`Previous` 用の `last_folder` には実コンテナを保存し続ける。
 
 ---
 
-## 8. 実装ステップ案
+## 8. 実装内容
 
-1. `docs/spec.md` に仕様を反映する
-2. `settings.rs`
-   - `reading_history_enabled`
-   - `reading_history_limit`
-   - `StartupFolderMode::ReadingHistory`
-   - sanitize / default / unknown variant fallback / tests
-3. `reading_history_db.rs` を追加する
-   - schema
-   - `list_recent`
-   - `upsert`
-   - `remove`
-   - `clear`
-   - `prune` は新規 INSERT 時または設定変更時のみ
-   - background writer
-   - `book_resume_db` と同じ SQLite pragma / busy timeout 方針
-4. `App` 初期化
-   - DB open
-   - writer spawn
-   - `last_reading_history_key`
-   - `items_are_reading_history_view`
-   - `reading_history_rows`
-5. 記録経路
-   - `record_reading_history(idx)`
-   - `open_fullscreen` / continuous reading reanchor / seek overlay jump から呼ぶ
-   - Ctrl+G / tag view 除外
-   - Ctrl+S 実コンテナ許可
-   - 変換アーカイブは `archive_source_override` 優先
-   - ネスト ZIP / 章階層では外側コンテナだけ記録し、ページ位置は NULL
-   - `build_image_reading_indices` / `build_nav_indices` / `count_seek_overlay_non_image_items` を共通化
-   - 同一 key の連続更新を throttle
-6. 読書履歴ビュー
-   - `enter_reading_history`
-   - data_dir 配下の synthetic path
-   - `install_new_items` のリセットブロックに `items_are_reading_history_view` を追加
-   - `use_full_path_cache_keys()` に履歴ビューを追加
-   - 最近順固定
-   - empty state
-   - `last_folder` には synthetic path を保存しない
-7. UI
-   - ファイルメニュー「読書履歴を開く」 + アドレスバー「場所▼」の「読書履歴」(ドライブ一覧の下)
-   - 環境設定の記録 ON/OFF / 件数 / 全削除 / 起動時選択
-   - 右クリック「履歴から削除」
-8. 起動
-   - `StartupFolderMode::ReadingHistory`
-   - `startup_folder()` の `None` ではなく mode variant で分岐
-   - DB failure / empty fallback
-9. テスト
-   - DB upsert / prune / remove / clear
-   - 記録対象判定
-   - Ctrl+G 除外、Ctrl+S 実コンテナ許可
-   - 変換アーカイブが元パスで記録される
-   - 件数 clamp
+1. ReadingHistoryKind に video / audio を追加し、メディア位置専用列を migration する。
+2. record_reading_history と全 open / reopen 経路へ必須の HistoryTrigger を通す。
+3. 5 つの自動進行起点を AutoAdvance、手動起点を UserChosen とする。
+4. 閲覧履歴ビューで MediaFilter / BookKindFilter を有効化する。
+5. UI・マニュアル・製品ページ・設計文書の表示名称を「閲覧履歴」に統一する。
+6. 未知 kind の行は一覧読み出し時にスキップする。
 
 ---
 
@@ -609,60 +495,39 @@ MVP は候補 B を推奨する。`StartupFolderMode::ReadingHistory` が明示�
 
 Unit / App-level:
 
-- `ReadingHistoryDb` の upsert は同じ key を重複させず `last_read_at_ms` を更新する
-- limit 3 の状態で 4 件 upsert すると古い 1 件だけ消える
-- `reading_history_limit` は 1..=1000 に clamp される
-- `reading_history_enabled=false` では writer command が送られない
-- `GridItem::Video` は記録されない
-- `global_search.active=true` では `Image` でも記録されない
-- `favsearch.active=true` かつ実コンテナ内では記録される
-- `archive_source_override=Some(original.rar)` では cache ZIP ではなく `original.rar` が保存される
-- 変換アーカイブでは `book_resume` と読書履歴の key が一致しなくても、履歴から開く経路で
-  既存 resume に合流できる
-- ネスト ZIP / 章階層を読んだ場合は外側コンテナが記録され、`last_page` / `page_count` は NULL
-- 合成パス (`search_results_synthetic_path`, `reading_history_synthetic_path`) は記録されない
-- 混在フォルダ (Image + Video / Folder / ZipFile) は記録されない
-- Ctrl+F で混在フォルダを画像ページだけに絞った場合は記録される
-- `install_new_items` 後に `items_are_reading_history_view` が false へ戻る
-- 履歴ビューでは `use_full_path_cache_keys()` が true になり、通常フォルダへ戻ると false に戻る
-- Details 表示でも読書履歴の最近順が保たれ、列ヘッダソートが効かない
-- `StartupFolderMode::ReadingHistory` は `Drives` と混同せず、mode variant で分岐される
-- 未知の `StartupFolderMode` 値は設定全体を壊さず安全な既定値へフォールバックする
+- 同じ key の upsert は重複せず、保持上限 1000 件の規則が変わらない
+- リリース済み schema へ media_position_ms / media_duration_ms が追加される
+- 動画・音声の進捗更新は既存行だけを更新し、新規履歴を作らない
+- 未知 kind は Folder に変換されず行ごと読み飛ばされる
+- 動画・音声は UserChosen で記録され、AutoAdvance では記録されない
+- slideshow / NextFolder / video EOF / video-audio EOF / music EOF の 5 起点が AutoAdvance
+- 手動の一覧 open / ファイル移動は UserChosen
+- 完走時に resume が削除されても閲覧履歴行は残る
+- 動画 / 音声 / 本と本の内訳のフィルタ結果がブックマークと同じ意味になる
 
 Manual / smoke:
 
-- 通常フォルダの画像だけフォルダを読む → 読書履歴に出る
-- 画像 + 動画混在フォルダを読む → 出ない
-- ZIP / PDF を読む → 出る
-- RAR / 7z を変換して読む → 元アーカイブとして出る
-- 章フォルダを持つ CBZ を読む → 外側 CBZ として出る
-- Ctrl+S で ZIP / PDF を検索して読む → 出る
-- Ctrl+G で画像を検索して読む → 出ない
-- Ctrl+F で画像だけに絞って読む → 絞り込み後が画像ページだけなら出る
-- 読書履歴ビューから ZIP / PDF を開く → 既存の自動フルスクリーン / 続きから設定に従う
-- 読書履歴ビューで rating / 開く / コピー / 履歴から削除などの右クリック操作が使える
-- 読書履歴ビューでは代表サムネ固定が表示されない
-- 記録 OFF にして読む → 件数が増えない
-- 起動時表示を読書履歴にする → 読書履歴ビューで起動する
+- 画像フォルダ、ZIP、PDF、変換アーカイブを手動で読むと本として履歴へ出る
+- 動画・音声を手動で開くとファイル単位で履歴へ出る
+- 上下キー / ホイール / Ctrl+上下で手動移動した項目は履歴へ出る
+- 連続再生 EOF、スライドショー自動送り、NextFolder では履歴件数が増えない
+- 完走した動画は履歴に残り、次回は既存 resume 規則により先頭から開く
+- 種別絞り込みで動画 / 音声 / 本と本の内訳を分けられる
+- 起動時表示、履歴からの open、履歴からの削除が従来どおり動く
 
 UI snapshot:
 
-- 環境設定ページに読書履歴設定が表示される
-- 読書履歴ビューの空状態
-- 読書履歴ビューの通常状態
+- 環境設定ページに閲覧履歴設定が表示される
+- 閲覧履歴ビューの空状態 / 通常状態
+- 閲覧履歴ビューの動画 / 音声 / 本フィルタ
 
 ---
 
-## 10. レビューしてほしい点
+## 10. §1.40 で確定した判断
 
-- 「読書履歴」という名称でよいか。「最近読んだ本」を補助ラベルにする方針で違和感がないか。
-- 通常フォルダの対象判定を「現在のナビゲーション対象がすべて画像ページ」にすることで、
-  ユーザー期待と実装都合のバランスが取れているか。
-- Ctrl+G / タグビューを対象外、Ctrl+S を対象にする切り分けで十分か。
-- ネスト ZIP / 章階層では外側コンテナだけ記録し、ページ位置は NULL にする判断でよいか。
-- 製本ルート / 本棚の本も読書履歴に載せてよいか。MVP 方針は「載せる」。
-- `reading_history.db` を `book_resume.db` とは別にする判断でよいか。
-- 履歴ビューで既存 `GridItem` を再利用し、履歴メタ情報を side table に持つ設計でよいか。
-- 履歴ビューは表示モードを強制せず、詳細表示でも最近順固定・列ソート無効にする方針でよいか。
-- `StartupFolderMode::Previous` では読書履歴 synthetic path を復元せず、
-  明示的な `ReadingHistory` 起動モードだけにする MVP 方針でよいか。
+- UI 名称は「閲覧履歴」。既存の永続値と内部識別子は変更しない。
+- 動画・音声はファイル単位で履歴へ加え、位置と尺は専用列へ保存する。
+- 自動進行の 5 経路は HistoryTrigger::AutoAdvance を必須引数で伝播し、記録しない。
+- 種別絞り込みはブックマークの MediaFilter / BookKindFilter を流用する。
+- resume の削除条件や「続きから」の既存挙動は変更しない。
+- 保持上限は従来どおり 1000 件。

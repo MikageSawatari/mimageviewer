@@ -144,6 +144,13 @@ impl App {
         let _ = controller.set_resident_media_wake_enabled(false);
     }
 
+    /// Entering App::update consumes the one wake claimed by the tray thread.
+    pub(crate) fn acknowledge_tray_resident_media_wake(&self) {
+        if let Some(controller) = self.tray_controller.as_ref() {
+            controller.acknowledge_resident_media_wake();
+        }
+    }
+
     /// 閉じるボタン [×] が押されたか検出し、設定 ON + トレイ起動中なら hide に差し替える。
     /// 返り値は「hide に差し替えた (= アプリを終了させない)」かどうか。
     pub(crate) fn maybe_intercept_close(&mut self, ctx: &egui::Context) -> bool {
@@ -233,9 +240,8 @@ impl App {
         if keep_detached_viewer_alive {
             ctx.request_repaint();
         }
-        // 終了時と同じ永続化処理を hide のタイミングでも走らせる。
-        // トレイメニュー「終了」は hidden 状態では std::process::exit(0) で抜けるため
-        // on_exit が呼ばれない可能性があり、ここで確実に flush しておくことでデータロスを防ぐ。
+        // settings / sidecar は従来どおり hide 時にも保存する。トレイ「終了」は DWM cloak 後に
+        // 通常 close を通るため、リネーム journal writer の終了 flush は on_exit が担当する。
         self.persist_window_state_and_flush();
 
         // トレイの表示を更新
@@ -514,8 +520,7 @@ impl App {
                     // 可視状態で Quit が押されたケース: トレイスレッドが既に
                     // PostMessage(WM_CLOSE) 済み。`maybe_intercept_close` が
                     // tc.is_quit_requested() を見て close を通すのでここは何もしない。
-                    // (hidden 状態のときはトレイスレッドが直接 std::process::exit(0)
-                    //  するので、そもそもこの event は届かない)
+                    // hidden 状態でも DWM cloak + SW_SHOWNOACTIVATE で通常 close を通す。
                 }
             }
         }

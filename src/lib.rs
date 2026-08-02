@@ -1098,6 +1098,7 @@ pub fn run() -> eframe::Result {
             // creator closure: wgpu/winit 初期化後に 1 回だけ呼ばれる。
             // この closure の先頭までの所要時間 = eframe 自体のセットアップ時間。
             emit_startup("creator_enter", None);
+            ime_focus::install_ime_input_policy(&cc.egui_ctx);
             egui_focus_policy::install_tab_shortcut_focus_policy(&cc.egui_ctx);
             let t = Instant::now();
             ui_fonts::configure_fonts_with_settings(&cc.egui_ctx, &saved.ui_font);
@@ -1134,7 +1135,7 @@ pub fn run() -> eframe::Result {
             }
             app.applied_ui_theme = Some(resolved);
 
-            // wgpu::Device / Queue を保存。mipmap の LOD bias、比較モードの GPU
+            // wgpu::Device / Queue を保存。mipmap の sampling 設定、比較モードの GPU
             // テクスチャ、パノラマ overlay はプラットフォーム非依存でこれを使うため、
             // 保存自体は cfg なしで行う。Windows では同時に共有 D3D11 デバイスを
             // 初期化する (失敗してもアプリは起動継続、動画は旧経路 = CPU readback +

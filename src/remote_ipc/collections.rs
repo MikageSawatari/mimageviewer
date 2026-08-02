@@ -69,36 +69,15 @@ impl CollectionEngine {
         {
             crate::reading_history_db::ReadingHistoryDb::open_readonly()
                 .and_then(|db| db.list_recent(self.settings.reading_history_limit))
-                .map_err(|error| internal_error("読書履歴を読み込めませんでした", error))?
+                .map_err(|error| internal_error("閲覧履歴を読み込めませんでした", error))?
         } else {
             Vec::new()
         };
         let candidates = rows
             .into_iter()
-            .map(|entry| {
-                let current = entry.last_page.map(|page| page.max(0) as u64 + 1);
-                let total = entry.page_count.map(|count| count.max(0) as u64);
-                CandidateEntry {
-                    path: entry.path,
-                    name: entry.title,
-                    kind: match entry.kind {
-                        crate::reading_history_db::ReadingHistoryKind::Folder => {
-                            RemoteEntryKind::Folder
-                        }
-                        crate::reading_history_db::ReadingHistoryKind::Zip => RemoteEntryKind::Zip,
-                        crate::reading_history_db::ReadingHistoryKind::Pdf => RemoteEntryKind::Pdf,
-                        crate::reading_history_db::ReadingHistoryKind::Archive => {
-                            RemoteEntryKind::Archive
-                        }
-                    },
-                    detail: progress_label(current, total),
-                    progress_current: current,
-                    progress_total: total,
-                    rating: None,
-                }
-            })
+            .map(candidate_from_reading_history_entry)
             .collect();
-        Ok(self.payload("読書履歴", candidates))
+        Ok(self.payload("閲覧履歴", candidates))
     }
 
     fn rating(&self, stars: u8) -> Result<CollectionPayload, CollectionError> {
@@ -266,7 +245,7 @@ fn visible_places(settings: &Settings) -> Vec<PlaceSummary> {
     if settings.show_location_reading_history {
         places.push(PlaceSummary {
             kind: PlaceKind::ReadingHistory,
-            name: "読書履歴".to_owned(),
+            name: "閲覧履歴".to_owned(),
         });
     }
     if settings.show_location_rating {
@@ -361,11 +340,79 @@ pub(super) fn aggregate_thumb_aspect_height_ratio(settings: &Settings) -> f64 {
     }
 }
 
+fn candidate_from_reading_history_entry(
+    entry: crate::reading_history_db::ReadingHistoryEntry,
+) -> CandidateEntry {
+    use crate::reading_history_db::ReadingHistoryKind;
+
+    let (kind, current, total, detail) = match entry.kind {
+        ReadingHistoryKind::Folder
+        | ReadingHistoryKind::Zip
+        | ReadingHistoryKind::Pdf
+        | ReadingHistoryKind::Archive => {
+            let current = entry.last_page.map(|page| page.max(0) as u64 + 1);
+            let total = entry.page_count.map(|count| count.max(0) as u64);
+            let kind = match entry.kind {
+                ReadingHistoryKind::Folder => RemoteEntryKind::Folder,
+                ReadingHistoryKind::Zip => RemoteEntryKind::Zip,
+                ReadingHistoryKind::Pdf => RemoteEntryKind::Pdf,
+                ReadingHistoryKind::Archive => RemoteEntryKind::Archive,
+                ReadingHistoryKind::Video | ReadingHistoryKind::Audio => unreachable!(),
+            };
+            (kind, current, total, progress_label(current, total))
+        }
+        ReadingHistoryKind::Video | ReadingHistoryKind::Audio => {
+            let current = entry
+                .media_position_ms
+                .and_then(|value| u64::try_from(value).ok());
+            let total = entry
+                .media_duration_ms
+                .filter(|value| *value > 0)
+                .and_then(|value| u64::try_from(value).ok());
+            let kind = if entry.kind == ReadingHistoryKind::Audio {
+                RemoteEntryKind::Audio
+            } else {
+                RemoteEntryKind::Video
+            };
+            (kind, current, total, media_progress_label(current, total))
+        }
+    };
+    CandidateEntry {
+        path: entry.path,
+        name: entry.title,
+        kind,
+        detail,
+        progress_current: current,
+        progress_total: total,
+        rating: None,
+    }
+}
+
 fn progress_label(current: Option<u64>, total: Option<u64>) -> Option<String> {
     match (current, total) {
         (Some(current), Some(total)) if total > 0 => Some(format!("{current} / {total} ページ")),
         (Some(current), _) => Some(format!("{current} ページ")),
         _ => None,
+    }
+}
+
+fn media_progress_label(current_ms: Option<u64>, total_ms: Option<u64>) -> Option<String> {
+    let current = current_ms.map(format_media_time_ms)?;
+    Some(match total_ms {
+        Some(total) => format!("{current} / {}", format_media_time_ms(total)),
+        None => current,
+    })
+}
+
+fn format_media_time_ms(value_ms: u64) -> String {
+    let total_secs = value_ms / 1000;
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
     }
 }
 
@@ -386,6 +433,40 @@ fn internal_error(context: &str, error: impl std::fmt::Display) -> CollectionErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reading_history_media_entries_keep_kind_and_time_progress() {
+        let mut video = crate::reading_history_db::ReadingHistoryEntry::new(
+            PathBuf::from(r"C:\media\clip.mp4"),
+            crate::reading_history_db::ReadingHistoryKind::Video,
+            None,
+            "clip".to_owned(),
+            None,
+            None,
+        );
+        video.media_position_ms = Some(65_000);
+        video.media_duration_ms = Some(3_665_000);
+        let video = candidate_from_reading_history_entry(video);
+        assert_eq!(video.kind, RemoteEntryKind::Video);
+        assert_eq!(video.progress_current, Some(65_000));
+        assert_eq!(video.progress_total, Some(3_665_000));
+        assert_eq!(video.detail.as_deref(), Some("1:05 / 1:01:05"));
+
+        let audio = candidate_from_reading_history_entry(
+            crate::reading_history_db::ReadingHistoryEntry::new(
+                PathBuf::from(r"C:\media\track.flac"),
+                crate::reading_history_db::ReadingHistoryKind::Audio,
+                None,
+                "track".to_owned(),
+                None,
+                None,
+            ),
+        );
+        assert_eq!(audio.kind, RemoteEntryKind::Audio);
+        assert_eq!(audio.progress_current, None);
+        assert_eq!(audio.progress_total, None);
+        assert_eq!(audio.detail, None);
+    }
 
     #[test]
     fn hidden_location_settings_are_reflected() {

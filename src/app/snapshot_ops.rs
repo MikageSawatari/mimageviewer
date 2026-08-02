@@ -812,7 +812,12 @@ impl App {
     ///   - `load_folder(container_path)` で中身を items に展開
     ///   - 完了後に **最初の playable item を fullscreen で開く** (= 設計 §4.6)
     ///   - スライドショー継続の場合は `resume_slideshow` で起動
-    pub(crate) fn snapshot_open_entry(&mut self, entry_idx: usize, resume_slideshow: bool) -> bool {
+    pub(crate) fn snapshot_open_entry(
+        &mut self,
+        entry_idx: usize,
+        resume_slideshow: bool,
+        history_trigger: crate::app::HistoryTrigger,
+    ) -> bool {
         use crate::grid_item::GridItem;
         use crate::snapshot::{SnapshotEntryKind, SnapshotTarget};
         let Some(snap) = self.snapshot.as_ref() else {
@@ -836,7 +841,7 @@ impl App {
                     }
                     _ => false,
                 }) {
-                    self.open_fullscreen(idx);
+                    self.open_fullscreen(idx, history_trigger);
                     if resume_slideshow {
                         self.slideshow_playing = true;
                     }
@@ -846,7 +851,12 @@ impl App {
                 // (Codex 3rd P2 fix: 旧版は target を渡していなかったので first playable に
                 // 着地していた)
                 if let Some(folder) = target_path.parent().map(|p| p.to_path_buf()) {
-                    self.snapshot_load_and_open(folder, resume_slideshow, Some(entry_target));
+                    self.snapshot_load_and_open(
+                        folder,
+                        resume_slideshow,
+                        Some(entry_target),
+                        history_trigger,
+                    );
                     return true;
                 }
                 false
@@ -867,14 +877,19 @@ impl App {
                     } => *zp == zip_path && *en == entry_name,
                     _ => false,
                 }) {
-                    self.open_fullscreen(idx);
+                    self.open_fullscreen(idx, history_trigger);
                     if resume_slideshow {
                         self.slideshow_playing = true;
                     }
                     return true;
                 }
                 // 該当 zip が現在開かれていない → zip を load してから対象 entry を open
-                self.snapshot_load_and_open(zip_path, resume_slideshow, Some(entry_target));
+                self.snapshot_load_and_open(
+                    zip_path,
+                    resume_slideshow,
+                    Some(entry_target),
+                    history_trigger,
+                );
                 true
             }
             SnapshotEntryKind::PdfPage => {
@@ -889,13 +904,18 @@ impl App {
                     } => *pp == pdf_path && *pn == page_num,
                     _ => false,
                 }) {
-                    self.open_fullscreen(idx);
+                    self.open_fullscreen(idx, history_trigger);
                     if resume_slideshow {
                         self.slideshow_playing = true;
                     }
                     return true;
                 }
-                self.snapshot_load_and_open(pdf_path, resume_slideshow, Some(entry_target));
+                self.snapshot_load_and_open(
+                    pdf_path,
+                    resume_slideshow,
+                    Some(entry_target),
+                    history_trigger,
+                );
                 true
             }
             SnapshotEntryKind::Folder | SnapshotEntryKind::ZipFile | SnapshotEntryKind::PdfFile => {
@@ -903,7 +923,12 @@ impl App {
                     return false;
                 };
                 // container 経路は target None (= first playable に着地)
-                self.snapshot_load_and_open(container_path, resume_slideshow, None);
+                self.snapshot_load_and_open(
+                    container_path,
+                    resume_slideshow,
+                    None,
+                    history_trigger,
+                );
                 true
             }
             SnapshotEntryKind::ConvertibleArchive => {
@@ -921,7 +946,7 @@ impl App {
                     return false;
                 }
                 if let Some(cached) = self.try_archive_cache_lookup(&path) {
-                    self.snapshot_load_and_open(cached, resume_slideshow, None);
+                    self.snapshot_load_and_open(cached, resume_slideshow, None, history_trigger);
                     true
                 } else {
                     // cache 無し: snapshot 中は変換 dialog を出さず skip (= 次 entry に進む
@@ -950,6 +975,7 @@ impl App {
         folder_path: std::path::PathBuf,
         resume_slideshow: bool,
         target: Option<crate::snapshot::SnapshotTarget>,
+        history_trigger: crate::app::HistoryTrigger,
     ) {
         let was_fs = self.fullscreen_idx.is_some();
         // 現在 fullscreen を閉じる (= items が入れ替わるので)
@@ -981,6 +1007,7 @@ impl App {
         // ジャンプ・スライドショー復帰が対象ページに到達しなかった)。
         if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
             self.fs_nav_after_pdf_enumerate = Some(crate::app::DeferredFsReopen {
+                history_trigger,
                 resume_slideshow,
                 target: target.map_or(
                     crate::app::DeferredFsTarget::None,
@@ -1011,7 +1038,7 @@ impl App {
                 })
             });
         if let Some(idx) = open_idx {
-            self.open_fullscreen(idx);
+            self.open_fullscreen(idx, history_trigger);
             if resume_slideshow {
                 self.slideshow_playing = true;
             }
@@ -1077,9 +1104,10 @@ impl App {
         &mut self,
         entry_idx: usize,
         resume_slideshow: bool,
+        history_trigger: crate::app::HistoryTrigger,
     ) -> bool {
         let gen_before = self.items_generation;
-        let opened = self.snapshot_open_entry(entry_idx, resume_slideshow);
+        let opened = self.snapshot_open_entry(entry_idx, resume_slideshow, history_trigger);
         if self.items_generation == gen_before && self.fs_nav_after_pdf_enumerate.is_none() {
             self.release_fs_nav_lock();
         }
@@ -1098,6 +1126,7 @@ impl App {
         forward: bool,
         page_only: bool,
         resume_slideshow: bool,
+        history_trigger: crate::app::HistoryTrigger,
     ) -> bool {
         if !self.is_snapshot_active() {
             return false;
@@ -1114,7 +1143,7 @@ impl App {
         if let Some(idx) = next {
             // 直接 open 後の nav lock 解除を含めて wrapper に委譲 (= スライドショー経路と共有、
             // 経路漏れ防止)。
-            self.snapshot_open_entry_release_lock_if_direct(idx, resume_slideshow)
+            self.snapshot_open_entry_release_lock_if_direct(idx, resume_slideshow, history_trigger)
         } else {
             // 末尾: boundary hint + nav lock 解除
             // snapshot 経路は apply_folder_nav_result を通らないので、capture_fs_nav_holdover
@@ -1221,7 +1250,11 @@ impl App {
         };
         if entry_kind.is_playable_leaf() {
             // image-like → fullscreen で開く (= grid からでも snapshot 内 image を直接 view)
-            self.snapshot_open_entry(next_idx, /*resume_slideshow=*/ false)
+            self.snapshot_open_entry(
+                next_idx,
+                /*resume_slideshow=*/ false,
+                crate::app::HistoryTrigger::UserChosen,
+            )
         } else {
             // container → grid 表示で load_folder (fullscreen は開かない、既存挙動)
             let Some(entry) = self.snapshot.as_ref().and_then(|s| s.items.get(next_idx)) else {
@@ -1290,15 +1323,18 @@ impl App {
         if let Some(idx) = next {
             // スライドショー自動送りも fullscreen から holdover を取って呼ばれるので、直接 open
             // 後は nav lock を解除する (= 手動 Ctrl+↑↓ と共有の wrapper、Codex follow-up)。
-            let _ = self
-                .snapshot_open_entry_release_lock_if_direct(idx, /*resume_slideshow=*/ true);
+            let _ = self.snapshot_open_entry_release_lock_if_direct(
+                idx,
+                /*resume_slideshow=*/ true,
+                crate::app::HistoryTrigger::AutoAdvance,
+            );
             true
         } else {
             // 末尾: 次 entry 無し → slideshow 停止 + nav lock 解除
             self.release_fs_nav_lock();
             self.slideshow_playing = false;
             self.slideshow_anchor_idx = None;
-            self.slideshow_scroll_anim = None;
+            self.continuous_reading_scroll_transition = None;
             self.slideshow_scroll_range_cache = None;
             self.show_feedback_toast(
                 if forward {
@@ -1860,7 +1896,11 @@ mod tests {
         ]);
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
         // entry idx 1 (= b.png) を open する → items[1] が既にあるので open_fullscreen 直接呼び
-        let result = app.snapshot_open_entry(1, /*resume_slideshow=*/ false);
+        let result = app.snapshot_open_entry(
+            1,
+            /*resume_slideshow=*/ false,
+            crate::app::HistoryTrigger::UserChosen,
+        );
         assert!(result, "items 内 leaf の直接 open は true 返す");
         // fullscreen_idx は items の idx 経由で設定される
         assert_eq!(app.fullscreen_idx, Some(1));
@@ -1968,7 +2008,11 @@ mod tests {
         ]);
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
         // a を fullscreen で開く (= 現 items 内なので直接 open)。
-        assert!(app.snapshot_open_entry(0, /*resume_slideshow=*/ false));
+        assert!(app.snapshot_open_entry(
+            0,
+            /*resume_slideshow=*/ false,
+            crate::app::HistoryTrigger::UserChosen,
+        ));
         assert_eq!(app.fullscreen_idx, Some(0));
         // Ctrl+↑↓ 入口の capture_fs_nav_holdover が lock を立てた状態を再現。
         app.capture_fs_nav_holdover(0);
@@ -1976,7 +2020,13 @@ mod tests {
         let gen_before = app.items_generation;
 
         // 次の leaf (b) へ snapshot_navigate (= 直接 open、reload 無し)。
-        let moved = app.snapshot_navigate(&ctx, /*forward=*/ true, false, false);
+        let moved = app.snapshot_navigate(
+            &ctx,
+            /*forward=*/ true,
+            false,
+            false,
+            crate::app::HistoryTrigger::UserChosen,
+        );
 
         assert!(moved, "次の leaf へ移動する");
         assert_eq!(app.fullscreen_idx, Some(1), "b に移動");
@@ -2000,7 +2050,11 @@ mod tests {
             GridItem::Image(PathBuf::from(r"E:\test\b.png")),
         ]);
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
-        assert!(app.snapshot_open_entry(0, /*resume_slideshow=*/ true));
+        assert!(app.snapshot_open_entry(
+            0,
+            /*resume_slideshow=*/ true,
+            crate::app::HistoryTrigger::UserChosen,
+        ));
         assert_eq!(app.fullscreen_idx, Some(0));
         app.capture_fs_nav_holdover(0);
         assert!(app.fs_nav_is_locked());

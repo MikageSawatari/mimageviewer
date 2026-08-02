@@ -678,6 +678,17 @@ decoder/audio/frame queue ownership を変更していない。
   auto-hide が解除不能になる実機事象がある (backlog §1.28、2026-08-01 の §7.2 シナリオ 5)。
   auto-hide 状態の owner を reducer へ集約し、owner 切替の遷移でリセットする。
 
+2026-08-02 に上記 cursor slice だけを先行実装した。presenter / HUD source を mouse envelope に
+stamp し、pump drain 単位の typed routing state (`Unknown / Presenter / Hud /
+CapturedPresenter / CapturedHud`) と pump-owned auto-hide reducer に集約した。own capture は
+`GetCapture`、外部 top-level window への handoff は `WM_MOUSELEAVE` / source-stamped local move を
+使い、同期 hit-test の `WindowFromPoint` / `SendMessage` は使わない。ownership 喪失後は
+`SetCursor(Arrow)` を書かず外部 window の `WM_SETCURSOR` に委ねる。Open / placement switch /
+publish / hide / close / host lost / quarantine / capture lost / tracking failure は `Unknown` へ戻る。
+presenter↔HUD の両方向 handoff、capture、transition、stale epoch、window show の zero-delta seed を
+test で固定した。VST owner-applied ack / hidden anchor / bridge C++ はこの slice では変更せず、
+Stage 5 の残件として維持する。
+
 変わらないもの:
 
 - plugin DSP/audio path、editor の見た目、fullscreen 時のみ presenter を editor owner にする

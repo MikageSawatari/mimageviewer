@@ -8186,6 +8186,7 @@ fn draw_sliders(
     colorize_slots: &mut crate::colorize::ColorizePresetSlots,
     creative_luts: &[crate::creative_lut::CreativeLutEntry],
     creative_lut_library: &crate::creative_lut::CreativeLutLibrary,
+    image_mipmap_moire_reduction_enabled: &mut bool,
     image_mipmap_lod_bias: &mut f32,
     ai_feature_mode: crate::settings::AiFeatureMode,
     ai_denoise_disabled_limit: Option<crate::ai::upscale::AiProcessSizeLimit>,
@@ -8651,41 +8652,50 @@ fn draw_sliders(
         ui.separator();
         ui.add_space(4.0);
 
-        // ── ポストフィルタ (レトロ系 + 写真系エフェクト) ──
-        ui.label(
-            egui::RichText::new("縮小モアレ抑制")
-                .size(SECTION_FONT)
-                .color(ui.visuals().text_color()),
+        // ── 縮小表示とポストフィルタ (レトロ系 + 写真系エフェクト) ──
+        let moire_toggle = ui.checkbox(
+            image_mipmap_moire_reduction_enabled,
+            "縮小表示のモアレを抑制する",
+        )
+        .on_hover_text(
+            "ON: 縮小時のモアレやちらつきを抑えます。\nOFF: 線のくっきりさを優先しますが、モアレが出やすくなります。",
         );
-        ui.horizontal(|ui| {
-            ui.label("LOD 補正");
-            if *image_mipmap_lod_bias > 0.001
-                && ui
-                    .small_button("↩")
-                    .on_hover_text("標準の 0.0 に戻す")
-                    .clicked()
-            {
-                *image_mipmap_lod_bias = 0.0;
-                settings_changed = true;
-            }
-        });
-        let lod_response = ui
-            .add(
-                egui::Slider::new(image_mipmap_lod_bias, 0.0..=1.5)
-                    .step_by(0.1)
-                    .fixed_decimals(1),
-            )
-            .on_hover_text(
-                "全画像・全ウィンドウ共通。値を上げるほど粗い mip level を選び、\n\
-                 スクリーントーンのモアレを抑えます。通常写真は少し柔らかくなります。\n\
+        settings_changed |= moire_toggle.changed();
+        ui.indent("image_mipmap_moire_reduction_controls", |ui| {
+            ui.add_enabled_ui(*image_mipmap_moire_reduction_enabled, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("より強く抑制:");
+                    if *image_mipmap_lod_bias > 0.001
+                        && ui
+                            .small_button("↩")
+                            .on_hover_text("標準の 0.0 に戻す")
+                            .clicked()
+                    {
+                        *image_mipmap_lod_bias = 0.0;
+                        settings_changed = true;
+                    }
+                });
+                let strength_response = ui
+                    .add(
+                        egui::Slider::new(image_mipmap_lod_bias, 0.0..=1.5)
+                            .step_by(0.1)
+                            .fixed_decimals(1),
+                    )
+                    .on_hover_text(
+                        "全画像・全ウィンドウ共通。値を上げるほどモアレを強く抑え、\n\
+                 通常の写真やイラストは少し柔らかく見えます。\n\
                  目安: 0.0=標準、0.5=抑制、1.0=強い抑制。",
-            );
-        if lod_response.dragged() {
-            dragging = true;
-        }
-        if lod_response.drag_stopped() || (lod_response.changed() && !lod_response.dragged()) {
-            settings_changed = true;
-        }
+                    );
+                if strength_response.dragged() {
+                    dragging = true;
+                }
+                if strength_response.drag_stopped()
+                    || (strength_response.changed() && !strength_response.dragged())
+                {
+                    settings_changed = true;
+                }
+            });
+        });
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(4.0);
@@ -14026,6 +14036,7 @@ impl App {
                             &mut self.settings.colorize_preset_slots,
                             &self.settings.creative_luts,
                             &self.creative_lut_library,
+                            &mut self.settings.image_mipmap_moire_reduction_enabled,
                             &mut self.settings.image_mipmap_lod_bias,
                             self.settings.ai_feature_mode,
                             ai_denoise_disabled_limit,
@@ -14121,7 +14132,7 @@ impl App {
         );
         let (changed, is_dragging, settings_changed) = scroll_output.inner;
         let was_dragging = self.adjustment_dragging;
-        // LOD 等の settings_changed は drag_stopped の release フレームでだけ立つ。
+        // モアレ抑制の強さ等の settings_changed は drag_stopped の release フレームでだけ立つ。
         // `was_dragging` まで除外するとその最終値を失うため、現在ドラッグ中かだけを見る。
         if should_save_settings(settings_changed, is_dragging) {
             self.settings.save();

@@ -39,6 +39,8 @@ mod frame_selection;
 #[cfg(windows)]
 pub mod gpu_renderer;
 #[cfg(windows)]
+pub(crate) mod native_cursor;
+#[cfg(windows)]
 pub mod native_presenter;
 #[cfg(windows)]
 pub mod native_window;
@@ -400,6 +402,10 @@ impl NativeVideoInitialVisibility {
 #[derive(Clone, Debug)]
 pub enum NativeVideoOutputEvent {
     Window(native_window::NativeVideoWindowEvent),
+    /// Latest presenter-side input ownership snapshot. This is observation
+    /// state, not an App command, so `NativeVideoOutput::drain_events` consumes
+    /// it into the output-local snapshot before returning semantic events.
+    OverlayInputRouting(native_presenter::NativeOverlayInputRouting),
     Seek {
         target_secs: f64,
     },
@@ -566,7 +572,9 @@ const OUTPUT_EVENT_LATEST_SEEK_THUMBNAIL: usize = 1;
 #[cfg(windows)]
 const OUTPUT_EVENT_LATEST_VST_PANEL_POS: usize = 2;
 #[cfg(windows)]
-const OUTPUT_EVENT_LATEST_SLOTS: usize = 3;
+const OUTPUT_EVENT_LATEST_OVERLAY_INPUT_ROUTING: usize = 3;
+#[cfg(windows)]
+const OUTPUT_EVENT_LATEST_SLOTS: usize = 4;
 
 #[cfg(windows)]
 fn native_output_event_latest_slot(event: &NativeVideoOutputEvent) -> Option<usize> {
@@ -578,6 +586,9 @@ fn native_output_event_latest_slot(event: &NativeVideoOutputEvent) -> Option<usi
             Some(OUTPUT_EVENT_LATEST_SEEK_THUMBNAIL)
         }
         NativeVideoOutputEvent::SetVst3PanelPos { .. } => Some(OUTPUT_EVENT_LATEST_VST_PANEL_POS),
+        NativeVideoOutputEvent::OverlayInputRouting(_) => {
+            Some(OUTPUT_EVENT_LATEST_OVERLAY_INPUT_ROUTING)
+        }
         _ => None,
     }
 }
@@ -1198,6 +1209,10 @@ pub(crate) struct NativeVideoOutput {
     visibility_gate: Arc<NativeVideoOutputVisibilityGate>,
     command_tx: NativeCommandSender,
     event_rx: std::sync::Mutex<NativeOutputEventReceiver>,
+    /// Latest presenter-published input ownership snapshot. The UI thread
+    /// refreshes it while draining the existing output event bus; gamepad
+    /// polling reads it without reaching into the presenter thread.
+    overlay_input_routing: std::sync::Mutex<native_presenter::NativeOverlayInputRouting>,
     /// Presenter thread 内で起きた fatal init error (`CoInitializeEx` /
     /// `NativeWindowHost::create` / `NativeRenderCore::new` 失敗) を
     /// VideoPlayer に伝えるための one-shot ストレージ。
@@ -1251,16 +1266,21 @@ struct NativeVideoOutputThreads {
 impl NativeVideoOutput {
     #[cfg(test)]
     pub(crate) fn disconnected_for_test() -> Self {
+        Self::disconnected_for_test_with_event_sender().0
+    }
+
+    #[cfg(test)]
+    fn disconnected_for_test_with_event_sender() -> (Self, NativeOutputEventSender) {
         let channel_fault = Arc::new(AtomicBool::new(false));
         let (command_tx, _command_rx) = native_command_bus(8, Arc::clone(&channel_fault));
-        let (_event_tx, event_rx) = native_output_event_bus(8, channel_fault);
+        let (event_tx, event_rx) = native_output_event_bus(8, channel_fault);
         let hwnd = Arc::new(AtomicU64::new(0));
         let visibility_gate = Arc::new(NativeVideoOutputVisibilityGate::new(
             true,
             command_tx.clone(),
             Arc::clone(&hwnd),
         ));
-        Self {
+        let output = Self {
             cancel: Arc::new(AtomicBool::new(false)),
             hwnd,
             hud_hwnd: Arc::new(AtomicU64::new(0)),
@@ -1278,9 +1298,13 @@ impl NativeVideoOutput {
             visibility_gate,
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
+            overlay_input_routing: std::sync::Mutex::new(
+                native_presenter::NativeOverlayInputRouting::default(),
+            ),
             init_error: Arc::new(Mutex::new(None)),
             threads: None,
-        }
+        };
+        (output, event_tx)
     }
 
     #[cfg(test)]
@@ -1419,6 +1443,9 @@ impl NativeVideoOutput {
             visibility_gate,
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
+            overlay_input_routing: std::sync::Mutex::new(
+                native_presenter::NativeOverlayInputRouting::default(),
+            ),
             init_error,
             threads: Some(NativeVideoOutputThreads {
                 render,
@@ -1748,7 +1775,33 @@ impl NativeVideoOutput {
         let Ok(rx) = self.event_rx.lock() else {
             return Vec::new();
         };
-        rx.drain()
+        let mut events = rx.drain();
+        let mut latest_routing = None;
+        events.retain(|(_, event)| match event {
+            NativeVideoOutputEvent::OverlayInputRouting(routing) => {
+                latest_routing = Some(*routing);
+                false
+            }
+            _ => true,
+        });
+        if let Some(routing) = latest_routing
+            && let Ok(mut published) = self.overlay_input_routing.lock()
+        {
+            *published = routing;
+        }
+        events
+    }
+
+    pub(crate) fn overlay_input_routing_snapshot(
+        &self,
+    ) -> native_presenter::NativeOverlayInputRouting {
+        if self.is_closed() || self.is_presenter_hidden() {
+            return native_presenter::NativeOverlayInputRouting::default();
+        }
+        self.overlay_input_routing
+            .lock()
+            .map(|routing| *routing)
+            .unwrap_or_default()
     }
 }
 
@@ -2462,6 +2515,24 @@ fn send_native_output_event(
 }
 
 #[cfg(windows)]
+fn publish_native_overlay_input_routing(
+    tx: &NativeOutputEventSender,
+    source_epoch: u64,
+    published: &mut native_presenter::NativeOverlayInputRouting,
+    routing: native_presenter::NativeOverlayInputRouting,
+) {
+    if *published == routing {
+        return;
+    }
+    *published = routing;
+    send_native_output_event(
+        tx,
+        source_epoch,
+        NativeVideoOutputEvent::OverlayInputRouting(routing),
+    );
+}
+
+#[cfg(windows)]
 fn send_native_overlay_command(
     tx: &NativeOutputEventSender,
     source_epoch: u64,
@@ -2970,6 +3041,8 @@ fn run_native_video_output(
     let mut last_summary_log = Instant::now();
     let mut last_present_log = Instant::now();
     let mut last_overlay_tick = Instant::now();
+    let mut published_overlay_input_routing =
+        crate::video::native_presenter::NativeOverlayInputRouting::default();
     let mut last_source_state_probe = Instant::now();
     let mut last_vram_trace = run_started
         .checked_sub(Duration::from_secs(1))
@@ -3328,6 +3401,7 @@ fn run_native_video_output(
                     presenter.set_overlay_navigation_preview(preview);
                 }
                 NativeVideoOutputCommand::MarkCursorActivity => {
+                    window_pump.mark_cursor_activity(cur_generation)?;
                     presenter.mark_overlay_cursor_activity();
                 }
                 NativeVideoOutputCommand::RequestOverlayRender => {
@@ -3857,6 +3931,14 @@ fn run_native_video_output(
         }
 
         let presenter_hidden = presenter_visibility.is_hidden();
+        if presenter_hidden {
+            publish_native_overlay_input_routing(
+                &ui_event_tx,
+                source.source_epoch,
+                &mut published_overlay_input_routing,
+                crate::video::native_presenter::NativeOverlayInputRouting::default(),
+            );
+        }
         let cursor_poll_due = !presenter_hidden
             && last_cursor_poll
                 .map(|time| now.duration_since(time) >= Duration::from_millis(50))
@@ -4348,6 +4430,12 @@ fn run_native_video_output(
                     crate::video::native_presenter::NativeOverlayInputRouting::default()
                 }
             };
+            publish_native_overlay_input_routing(
+                &ui_event_tx,
+                source.source_epoch,
+                &mut published_overlay_input_routing,
+                overlay_routing,
+            );
             for event in &native_events {
                 if overlay_routing.should_forward_to_ui(event) {
                     send_native_output_event(
@@ -4380,6 +4468,12 @@ fn run_native_video_output(
                 source.clock.current_seek_serial(),
             ) {
                 Ok(outcome) => {
+                    publish_native_overlay_input_routing(
+                        &ui_event_tx,
+                        source.source_epoch,
+                        &mut published_overlay_input_routing,
+                        outcome.routing,
+                    );
                     sync_hud_regions(&window_pump, cur_generation, &presenter, &outcome);
                     for command in outcome.commands {
                         send_native_overlay_command(
@@ -6938,6 +7032,16 @@ impl VideoPlayer {
             .unwrap_or_default()
     }
 
+    #[cfg(windows)]
+    pub(crate) fn native_overlay_input_routing_snapshot(
+        &self,
+    ) -> native_presenter::NativeOverlayInputRouting {
+        self.native_output
+            .as_ref()
+            .map(NativeVideoOutput::overlay_input_routing_snapshot)
+            .unwrap_or_default()
+    }
+
     /// UI スレッドが毎フレーム呼ぶ。新しい info / video frame があれば反映する。
     /// 戻り値は次回再描画推奨時刻 (秒) — `ctx.request_repaint_after` に渡す目安。
     pub fn tick(&mut self, _ctx: &egui::Context) -> Option<std::time::Duration> {
@@ -8476,6 +8580,30 @@ mod tests {
             )
         ));
         assert!(!fault.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_output_consumes_overlay_routing_as_latest_observation_snapshot() {
+        let (output, tx) = super::NativeVideoOutput::disconnected_for_test_with_event_sender();
+        let focused = crate::video::native_presenter::NativeOverlayInputRouting {
+            wants_keyboard_input: true,
+            ..Default::default()
+        };
+        tx.send(
+            1,
+            super::NativeVideoOutputEvent::OverlayInputRouting(focused),
+        );
+
+        assert!(output.drain_events().is_empty());
+        assert!(output.overlay_input_routing_snapshot().wants_keyboard_input);
+
+        tx.send(
+            1,
+            super::NativeVideoOutputEvent::OverlayInputRouting(Default::default()),
+        );
+        assert!(output.drain_events().is_empty());
+        assert!(!output.overlay_input_routing_snapshot().wants_keyboard_input);
     }
 
     #[test]

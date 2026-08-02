@@ -1,6 +1,6 @@
 # トーン漫画の縮小モアレ対策 / GPU mipmap 実装
 
-**ステータス: mipmap + 調整可能な LOD 補正を実装済み、実機検証待ち (2026-07-25)。**
+**ステータス: mipmap + シャープ優先切替 + 調整可能な LOD 補正を実装済み、実機検証待ち。**
 
 フルスクリーンの大縮小時に発生するモアレについて、原因、採用した実装、互換方針をまとめる。
 
@@ -60,21 +60,25 @@ bind groupを選び、低LODで部分画像の反対端が混ざらないよう�
 `PostFilter::Nearest` は opt-in しない。これにより小 texture や頻繁に更新する texture の
 生成コストと VRAM 増加を避け、pixel-art の明示的な nearest 表示も維持する。
 
-### 2.3 調整可能な LOD 補正
+### 2.3 シャープ優先切替と調整可能な LOD 補正
 
-画像補正パネルの「フィルタ」に、全表示共通の `LOD 補正` を 0.0〜1.5、0.1 刻みで置く。
-既定 0.0 は GPU の標準 LOD 選択を維持する。0.5 は約半 level、1.0 は 1 level 粗い mip へ
-寄せるため、標準選択で残る中間縮小率のモアレを原稿ごとに抑えられる。大きくするほど
-モアレは減る一方で細部が軟らかくなる。
+画像補正パネルの「フィルタ」に、全表示共通のチェック
+`縮小表示のモアレを抑制する` と、配下の `より強く抑制`（0.0〜1.5、0.1 刻み）を置く。
 
-- managed 表示 texture: `egui.wgsl` の通常画像 sampling に `textureSampleBias` を使う。
-- wipe/diff 比較 callback: 同じ bias を比較 uniform へ渡し、両画像へ適用する。
-- 360度パノラマ: 経度シーム補正済みの explicit gradient を `2^bias` 倍し、
-  `textureSampleGrad` の level 選択を同量だけ粗い側へ寄せる。
+- 既定 ON / 0.0 は GPU の標準 LOD 選択を維持し、v2.7.0 以降の既定画質と同一にする。
+- OFF は完全な mip chain を作ったまま、shader で `textureSampleLevel(..., 0.0)` 相当を使い
+  level 0 固定で読む。従来の bilinear 1-mip 縮小に近いシャープ優先表示になる。
+- ON かつ正値は従来の LOD bias と同じ。0.5 は約半 level、1.0 は 1 level 粗い mip へ
+  寄せるため、値を上げるほどモアレは減る一方で細部が軟らかくなる。
 
-値は renderer uniform だけをライブ更新する。texture や mip chain の作り直し、cache
-invalidation、CPU resize は発生しない。mipmap 非対象 texture、`PostFilter::Nearest`、
-動画、サムネイルには適用しない。
+managed 表示 texture と wipe/diff 比較 callback は明示フラグで `textureSampleLevel` と
+`textureSampleBias` を切り替える。360度パノラマも同じフラグを持ち、ON では経度シーム補正済みの
+explicit gradient を `2^bias` 倍して `textureSampleGrad` の level 選択を粗い側へ寄せ、OFF では
+level 0 固定で読む。
+
+ON/OFF と値は renderer / callback uniform だけをライブ更新する。texture や mip chain の
+作り直し、再 upload、cache invalidation、CPU resize は発生しない。mipmap 非対象 texture、
+`PostFilter::Nearest`、動画、サムネイルには表示上の影響を与えない。
 
 ## 3. 描画・キャッシュ不変条件
 
@@ -110,9 +114,11 @@ invalidation、CPU resize は発生しない。mipmap 非対象 texture、`PostF
 
 - GPU validation error なしで通常画像、ZIP 画像、PDF ページを開けること。
 - 1/2 より大きい縮小率のトーン画像で、従来より周期的なモアレが減ること。
-- ウィンドウ幅を連続的に変え、少し拡大寄りになる中間縮小率でも `LOD 補正` 0.0 / 0.5 /
-  1.0 を比較でき、値を上げるとモアレが減って細部が段階的に軟らかくなること。
-- `LOD 補正` の変更で表示 texture の再 upload や cache invalidation が起きないこと。
+- 既定 ON / 0.0 で従来の uniform bias 0.0 と `textureSampleBias` 経路を維持すること。
+- OFF で level 0 固定分岐へ入り、線がくっきりする一方でモアレ / ちらつきが戻りやすいこと。
+- ウィンドウ幅を連続的に変え、ON の 0.0 / 0.5 / 1.0 を比較でき、値を上げるとモアレが
+  減って細部が段階的に軟らかくなること。
+- ON/OFF と強度の変更で表示 texture の再 upload や cache invalidation が起きないこと。
 - fit、見開き、縦横連結、ズーム往復、ルーペ、pixel grid の寸法と位置が変わらないこと。
 - 補正、AI、消しゴム、隠蔽、注釈の結果更新後も古い mip level が残らないこと。
 - Windowsのwipe/diff比較と360度パノラマを大縮小してもモアレが再発しないこと。

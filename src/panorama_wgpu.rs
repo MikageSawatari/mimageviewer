@@ -53,9 +53,12 @@ struct Params {
     // フル equirect なら (0, 0, 1, 1)。
     // 部分 FOV equirect (GPano CroppedArea*) は実画像 / フル球面比から計算 (Phase 1.5)。
     crop: vec4<f32>,
-    // sampling.x = mip LOD bias。textureSampleGrad では勾配を 2^bias 倍して
-    // 通常の textureSampleBias と同じく粗い level を選ぶ。
-    sampling: vec4<f32>,
+    // textureSampleGrad では勾配を 2^bias 倍して、通常の
+    // textureSampleBias と同じく粗い level を選ぶ。
+    lod_bias: f32,
+    // 1 は mip chain を使い、0 は level 0 固定で読む。
+    mipmap_sampling_enabled: u32,
+    _sampling_padding: vec2<u32>,
 };
 
 @group(0) @binding(0) var pano_tex: texture_2d<f32>;
@@ -160,7 +163,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             v_crop,
         ),
     );
-    let lod_scale = exp2(params.sampling.x);
+    if (params.mipmap_sampling_enabled == 0u) {
+        return textureSampleLevel(pano_tex, pano_samp, texture_uv, 0.0);
+    }
+    let lod_scale = exp2(params.lod_bias);
     return textureSampleGrad(
         pano_tex,
         pano_samp,
@@ -192,6 +198,7 @@ pub struct PanoramaShaderCallback {
     /// `crate::panorama::PanoUvTransform::IDENTITY` ならフル equirect。
     /// GPano `CroppedArea*` 宣言から計算 (`App::compute_pano_uv_transform`)。
     pub uv_transform: crate::panorama::PanoUvTransform,
+    pub mipmap_sampling_enabled: bool,
     pub lod_bias: f32,
     pub target_format: wgpu::TextureFormat,
 }
@@ -481,6 +488,7 @@ impl egui_wgpu::CallbackTrait for PanoramaShaderCallback {
                     self.fov_y,
                     self.aspect,
                     self.uv_transform,
+                    self.mipmap_sampling_enabled,
                     self.lod_bias,
                 );
                 queue.write_buffer(&uploaded.0.uniform, 0, &bytes);
@@ -865,6 +873,7 @@ mod tests {
         assert!(SHADER.contains("sphere_dy_raw.x - round(sphere_dy_raw.x)"));
         assert!(SHADER.contains("texture_dx * lod_scale"));
         assert!(SHADER.contains("texture_dy * lod_scale"));
+        assert!(SHADER.contains("textureSampleLevel"));
     }
 
     #[test]
@@ -875,10 +884,54 @@ mod tests {
             1.0,
             1.0,
             crate::panorama::PanoUvTransform::IDENTITY,
+            true,
             99.0,
         );
         let bias = f32::from_ne_bytes(bytes[32..36].try_into().unwrap());
         assert_eq!(bias, 1.5);
+    }
+
+    #[test]
+    fn panorama_default_preserves_bias_and_disabled_mode_selects_level_zero() {
+        let default_bytes = pano_uniform_bytes(
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            crate::panorama::PanoUvTransform::IDENTITY,
+            true,
+            0.0,
+        );
+        assert_eq!(
+            f32::from_ne_bytes(default_bytes[32..36].try_into().unwrap()),
+            0.0
+        );
+        assert_eq!(
+            u32::from_ne_bytes(default_bytes[36..40].try_into().unwrap()),
+            1
+        );
+
+        let disabled_bytes = pano_uniform_bytes(
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            crate::panorama::PanoUvTransform::IDENTITY,
+            false,
+            1.0,
+        );
+        assert_eq!(
+            u32::from_ne_bytes(disabled_bytes[36..40].try_into().unwrap()),
+            0
+        );
+
+        let module = wgpu::naga::front::wgsl::parse_str(SHADER).expect("parse panorama WGSL");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("validate panorama WGSL");
     }
 }
 
@@ -887,16 +940,19 @@ mod tests {
 /// レイアウト:
 /// - bytes[0..16]: pose = (yaw, pitch, fov_y, aspect)
 /// - bytes[16..32]: crop = (u_offset, v_offset, u_scale, v_scale)
-/// - bytes[32..48]: sampling = (lod_bias, 0, 0, 0)
+/// - bytes[32..36]: lod_bias
+/// - bytes[36..40]: mipmap_sampling_enabled (u32)
+/// - bytes[40..48]: padding
 pub fn pano_uniform_bytes(
     yaw: f32,
     pitch: f32,
     fov_y: f32,
     aspect: f32,
     uv_transform: crate::panorama::PanoUvTransform,
+    mipmap_sampling_enabled: bool,
     lod_bias: f32,
 ) -> [u8; 48] {
-    let values = [
+    let float_values = [
         yaw,
         pitch,
         fov_y,
@@ -906,13 +962,11 @@ pub fn pano_uniform_bytes(
         uv_transform.u_scale,
         uv_transform.v_scale,
         lod_bias.clamp(0.0, 1.5),
-        0.0,
-        0.0,
-        0.0,
     ];
     let mut bytes = [0u8; 48];
-    for (i, v) in values.iter().enumerate() {
+    for (i, v) in float_values.iter().enumerate() {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
     }
+    bytes[36..40].copy_from_slice(&u32::from(mipmap_sampling_enabled).to_ne_bytes());
     bytes
 }

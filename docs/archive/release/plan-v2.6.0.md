@@ -117,7 +117,7 @@ registry として設計し、canonical root の重複排除と参照数を一�
 - 直接閲覧または ZIP 変換対象になる RAR / CBR / 7z / LZH 等の対応アーカイブ
 
 コンテナの中身や PDF ページは走査時に展開せず、コンテナ 1 件として表示する。ZIP / PDF 内、
-検索結果、読書履歴など実検索元を一意に復元できない仮想ビューからルールは作成できない。
+検索結果、閲覧履歴など実検索元を一意に復元できない仮想ビューからルールは作成できない。
 
 ### 3.5 フラット表示と階層情報
 
@@ -189,7 +189,7 @@ PDF document info などファイル内容を大量に開く全文条件は MVP 
   - 登録済みスマートフォルダ一覧（選択で開く）
 - `MenuCommandId` / `TopMenuId` / menu layout sanitize と候補 parity test を更新する。
 - 「現在のアイテム表示条件を追加」は通常の実フォルダまたはサブ展開でだけ有効にする。ZIP / PDF 内、
-  検索結果、読書履歴等では disabled とし、理由を tooltip で表示する。サブ展開中でも Ctrl+F の
+  検索結果、閲覧履歴等では disabled とし、理由を tooltip で表示する。サブ展開中でも Ctrl+F の
   名前検索が有効なら、検索語を黙って捨てた広い条件を保存せず同様に追加を拒否する。
 - 「新しいスマートフォルダ…」は名前だけを入力して末尾へ追加する。条件は作成後に現在表示から追加する。
 - 名前は大文字小文字を無視して一意とし、新規作成と名前変更の両方で同じ検証を行う。
@@ -217,7 +217,7 @@ PDF document info などファイル内容を大量に開く全文条件は MVP 
   一度復元せずcontextを次の検索へ直接渡す。smart処理中に別のCtrl+F / S / G / T、または別の
   smartへ切り替える場合は、cancel前に同じcontextを次の所有者へ原子的に移譲する。Ctrl+Fは
   完成済みスマート一覧内のfilterとして許可し、sort / metadata prepare後に、worker中に更新された
-  最新queryを新しいitem indexへ再実行する。ドライブ一覧・読書履歴・レーティング一覧へ戻すときは
+  最新queryを新しいitem indexへ再実行する。ドライブ一覧・閲覧履歴・レーティング一覧へ戻すときは
   synthetic pathを実フォルダとしてloadせず、履歴と同じ専用dispatchで復元する。
 - 開くと現在の一覧を残したまま背景をグレーアウトした scan / prepare modal を表示し、
   「中止」以外の背面操作を止める。完成 snapshot だけを一括 install する。
@@ -270,7 +270,7 @@ PDF document info などファイル内容を大量に開く全文条件は MVP 
 - synthetic view からの open / back / forward / refresh / file operation 後の clamp
 - Ctrl+F / S / G / T・検索由来★固定からスマートフォルダを開いた際の相互排他と正しい戻り先、
   検索→検索、検索由来Snapshot→検索、進行中smart→検索 / 別smartのorigin移譲、stale worker破棄、
-  最新query再適用、ドライブ一覧・読書履歴・レーティング一覧から検索（直接 / Snapshot経由）後の
+  最新query再適用、ドライブ一覧・閲覧履歴・レーティング一覧から検索（直接 / Snapshot経由）後の
   復元、採用しない巨大prepare結果とcancel済みpending所有物がUIスレッド外でdropされること
 - サブ展開 → スマートフォルダ → 履歴戻る / 進むで同じ snapshot を復元すること
 - 名称の内部空白、空欄からの再入力、名称変更で走査を破棄しないこと、削除後の sort / 履歴復元、

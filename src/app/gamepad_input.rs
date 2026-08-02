@@ -65,6 +65,40 @@ fn request_ring_overlay_repaint_after(ctx: &egui::Context, duration: Duration) {
     }
 }
 
+#[cfg(windows)]
+fn gamepad_text_input_active(
+    ctx: &egui::Context,
+    viewer_viewport: Option<egui::ViewportId>,
+    presenter: crate::video::native_presenter::NativeOverlayInputRouting,
+) -> bool {
+    let root_active = if ctx.viewport_id() == egui::ViewportId::ROOT {
+        crate::ime_focus::ime_input_active(ctx)
+    } else {
+        crate::ime_focus::ime_input_active_in_viewport(ctx, egui::ViewportId::ROOT)
+    };
+    let viewer_active = viewer_viewport.is_some_and(|viewport_id| {
+        crate::ime_focus::ime_input_active_in_viewport(ctx, viewport_id)
+    });
+    root_active || viewer_active || presenter.wants_keyboard_input
+}
+
+#[cfg(not(windows))]
+fn gamepad_text_input_active(
+    ctx: &egui::Context,
+    viewer_viewport: Option<egui::ViewportId>,
+    _presenter: (),
+) -> bool {
+    let root_active = if ctx.viewport_id() == egui::ViewportId::ROOT {
+        crate::ime_focus::ime_input_active(ctx)
+    } else {
+        crate::ime_focus::ime_input_active_in_viewport(ctx, egui::ViewportId::ROOT)
+    };
+    let viewer_active = viewer_viewport.is_some_and(|viewport_id| {
+        crate::ime_focus::ime_input_active_in_viewport(ctx, viewport_id)
+    });
+    root_active || viewer_active
+}
+
 fn ring_location_action_for_key_action(action: KeyAction) -> Option<RingActionId> {
     if let Some(slot) = action.favorite_slot_number() {
         return RingActionId::favorite_slot_action(slot);
@@ -1796,10 +1830,16 @@ impl App {
         if foreground_app_hwnd().is_none() {
             return false;
         }
-        if self.ime_input_active(ctx) {
+        let targets_viewer = self.gamepad_targets_viewer();
+        let viewer_ime_viewport = targets_viewer.then(|| self.fullscreen_viewport_id());
+        #[cfg(windows)]
+        let presenter_input = self.gamepad_native_overlay_input_routing();
+        #[cfg(not(windows))]
+        let presenter_input = ();
+        if gamepad_text_input_active(ctx, viewer_ime_viewport, presenter_input) {
             return false;
         }
-        if self.gamepad_targets_viewer() {
+        if targets_viewer {
             return !self.any_modal_dialog_open_for_fullscreen_keys()
                 && self.fs_context_menu_idx.is_none()
                 && !self.erase_mode
@@ -1809,6 +1849,23 @@ impl App {
                 && !self.text_mode;
         }
         !self.shortcuts_blocked_by_text_input(ctx) && !ctx.is_popup_open()
+    }
+
+    #[cfg(windows)]
+    fn gamepad_native_overlay_input_routing(
+        &self,
+    ) -> crate::video::native_presenter::NativeOverlayInputRouting {
+        if let Some(pending) = self.native_video_source_swap_pending.as_ref() {
+            return pending.native_output.overlay_input_routing_snapshot();
+        }
+        self.fullscreen_idx
+            .and_then(|idx| match self.fs_cache.get(&idx) {
+                Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
+                    Some(player.native_overlay_input_routing_snapshot())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     fn reset_gamepad_continuous_steps(&mut self, now: Instant) {
@@ -2089,7 +2146,11 @@ impl App {
             {
                 let delta = axis * self.continuous_reading_gamepad_speed_px_per_sec(ctx) * dt;
                 if delta.abs() > 0.5 {
-                    self.scroll_vertical_reading_by(ctx, delta);
+                    self.scroll_vertical_reading_by(
+                        ctx,
+                        delta,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
                     changed = true;
                 }
             } else if continuous_active
@@ -5413,7 +5474,7 @@ impl App {
         if self.slideshow_playing {
             self.slideshow_playing = false;
             self.slideshow_anchor_idx = None;
-            self.slideshow_scroll_anim = None;
+            self.continuous_reading_scroll_transition = None;
             self.slideshow_scroll_range_cache = None;
         } else if matches!(
             self.items.get(fs_idx),
@@ -5614,11 +5675,19 @@ impl App {
         if continuous_active && self.reading_flow.is_vertical() {
             match dir {
                 PadDir::Down => {
-                    self.scroll_vertical_reading_step(ctx, 1.0);
+                    self.scroll_vertical_reading_step(
+                        ctx,
+                        1.0,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
                     return;
                 }
                 PadDir::Up => {
-                    self.scroll_vertical_reading_step(ctx, -1.0);
+                    self.scroll_vertical_reading_step(
+                        ctx,
+                        -1.0,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
                     return;
                 }
                 PadDir::Left | PadDir::Right => {}
@@ -5627,19 +5696,35 @@ impl App {
             let axis_rtl = self.reading_direction == ReadingDirection::Rtl;
             match dir {
                 PadDir::Right if !axis_rtl => {
-                    self.scroll_vertical_reading_step(ctx, 1.0);
+                    self.scroll_vertical_reading_step(
+                        ctx,
+                        1.0,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
                     return;
                 }
                 PadDir::Left if axis_rtl => {
-                    self.scroll_vertical_reading_step(ctx, 1.0);
+                    self.scroll_vertical_reading_step(
+                        ctx,
+                        1.0,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
                     return;
                 }
                 PadDir::Left if !axis_rtl => {
-                    self.scroll_vertical_reading_step(ctx, -1.0);
+                    self.scroll_vertical_reading_step(
+                        ctx,
+                        -1.0,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
                     return;
                 }
                 PadDir::Right if axis_rtl => {
-                    self.scroll_vertical_reading_step(ctx, -1.0);
+                    self.scroll_vertical_reading_step(
+                        ctx,
+                        -1.0,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
                     return;
                 }
                 PadDir::Up | PadDir::Down | PadDir::Left | PadDir::Right => {}
@@ -5861,8 +5946,8 @@ impl App {
                 nav: GamepadLocationNav::DriveList,
             },
             GamepadLocationEntry {
-                label: "読書履歴".to_string(),
-                value: "最近読んだ本".to_string(),
+                label: "閲覧履歴".to_string(),
+                value: "最近見た本・動画・音声".to_string(),
                 nav: GamepadLocationNav::ReadingHistory,
             },
             GamepadLocationEntry {
@@ -6021,7 +6106,7 @@ impl App {
         if !self.guard_reading_history_open(idx) {
             return None;
         }
-        // 読書履歴ビューから本を開く場合は、閉じたときに読書履歴へ戻れるよう予約する。
+        // 閲覧履歴ビューから本を開く場合は、閉じたときに閲覧履歴へ戻れるよう予約する。
         self.note_reading_history_open(idx);
         // ファイル名スタックの集約グリッドでメディアセルを開いたら、フラット読書フルスクリーンへ
         // (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ流れる。
@@ -6056,7 +6141,7 @@ impl App {
                 }
                 self.bump_input_seq_for_item("gamepad_grid_open", idx);
                 self.fs_open_intent_from_grid = true;
-                self.open_fullscreen(idx);
+                self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
                 None
             }
             Some(GridItem::ConvertibleArchive { path, format }) => {
@@ -6980,12 +7065,13 @@ mod tests {
     use super::{
         MouseMiddleInputSample, POST_FILTER_GROUPS, PadDir, continuous_reading_stick_axis,
         cycle_rating, cycle_video_playback_speed, gamepad_grid_nav_target_pos,
-        initial_gamepad_favorite_picker_tab, mouse_button_action_blocked_by_edit_mode,
-        mouse_flick_direction, picker_rows_for_context, post_filter_group_index,
-        post_filter_item_index_in_group, rating_label, right_drag_press_suppresses_context_menu,
-        ring_direction_from_dpad_buttons, ring_direction_from_stick,
-        ring_direction_from_stick_with_hysteresis, ring_shortcut_context_for_surface_state,
-        set_gamepad_favorite_picker_tab, update_mouse_middle_click_state,
+        gamepad_text_input_active, initial_gamepad_favorite_picker_tab,
+        mouse_button_action_blocked_by_edit_mode, mouse_flick_direction, picker_rows_for_context,
+        post_filter_group_index, post_filter_item_index_in_group, rating_label,
+        right_drag_press_suppresses_context_menu, ring_direction_from_dpad_buttons,
+        ring_direction_from_stick, ring_direction_from_stick_with_hysteresis,
+        ring_shortcut_context_for_surface_state, set_gamepad_favorite_picker_tab,
+        update_mouse_middle_click_state,
     };
     use crate::adjustment::PostFilter;
     use crate::app::ActionSurface;
@@ -6998,6 +7084,89 @@ mod tests {
     use crate::ring_shortcut::{RingActionId, RingShortcutContext};
     use crate::settings::{ReadingDirection, ReadingFlow};
     use eframe::egui;
+
+    fn viewport_raw_input(
+        viewport_id: egui::ViewportId,
+        events: Vec<egui::Event>,
+    ) -> egui::RawInput {
+        let mut input = egui::RawInput {
+            viewport_id,
+            events,
+            ..Default::default()
+        };
+        input.viewports.insert(
+            viewport_id,
+            egui::ViewportInfo {
+                parent: (viewport_id != egui::ViewportId::ROOT).then_some(egui::ViewportId::ROOT),
+                ..Default::default()
+            },
+        );
+        input
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gamepad_text_input_gate_unions_all_three_surfaces() {
+        let no_presenter_input =
+            crate::video::native_presenter::NativeOverlayInputRouting::default();
+        let presenter_input = crate::video::native_presenter::NativeOverlayInputRouting {
+            wants_keyboard_input: true,
+            ..Default::default()
+        };
+
+        let root_ctx = egui::Context::default();
+        crate::ime_focus::install_ime_input_policy(&root_ctx);
+        let viewer_viewport = egui::ViewportId::from_hash_of("gamepad-ime-viewer-root-union");
+        root_ctx.begin_pass(viewport_raw_input(
+            egui::ViewportId::ROOT,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+            ],
+        ));
+        assert!(gamepad_text_input_active(
+            &root_ctx,
+            Some(viewer_viewport),
+            no_presenter_input,
+        ));
+        let _ = root_ctx.end_pass();
+
+        let ctx = egui::Context::default();
+        crate::ime_focus::install_ime_input_policy(&ctx);
+        let fullscreen_viewport = egui::ViewportId::from_hash_of("gamepad-ime-viewer");
+        ctx.begin_pass(viewport_raw_input(
+            fullscreen_viewport,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+            ],
+        ));
+        assert!(crate::ime_focus::ime_input_active(&ctx));
+        let _ = ctx.end_pass();
+
+        ctx.begin_pass(viewport_raw_input(egui::ViewportId::ROOT, Vec::new()));
+        assert!(gamepad_text_input_active(
+            &ctx,
+            Some(fullscreen_viewport),
+            no_presenter_input,
+        ));
+        let _ = ctx.end_pass();
+
+        let presenter_ctx = egui::Context::default();
+        crate::ime_focus::install_ime_input_policy(&presenter_ctx);
+        presenter_ctx.begin_pass(viewport_raw_input(egui::ViewportId::ROOT, Vec::new()));
+        assert!(gamepad_text_input_active(
+            &presenter_ctx,
+            Some(viewer_viewport),
+            presenter_input,
+        ));
+        assert!(!gamepad_text_input_active(
+            &presenter_ctx,
+            Some(viewer_viewport),
+            no_presenter_input,
+        ));
+        let _ = presenter_ctx.end_pass();
+    }
 
     #[test]
     fn detached_ring_context_follows_drawing_surface() {

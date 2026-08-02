@@ -32,7 +32,8 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VsOut {
 }
 
 struct Params {
-    mode_wipe: vec4<f32>,
+    mode_wipe_lod_bias: vec3<f32>,
+    mipmap_sampling_enabled: u32,
 };
 
 @group(0) @binding(0) var pinned_tex: texture_2d<f32>;
@@ -40,12 +41,24 @@ struct Params {
 @group(0) @binding(2) var compare_sampler: sampler;
 @group(0) @binding(3) var<uniform> params: Params;
 
+fn sample_compare_texture(tex: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
+    if (params.mipmap_sampling_enabled == 0u) {
+        return textureSampleLevel(tex, compare_sampler, uv, 0.0);
+    }
+    return textureSampleBias(
+        tex,
+        compare_sampler,
+        uv,
+        params.mode_wipe_lod_bias.z,
+    );
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let pinned = textureSampleBias(pinned_tex, compare_sampler, in.uv, params.mode_wipe.z);
-    let current = textureSampleBias(current_tex, compare_sampler, in.uv, params.mode_wipe.z);
-    if (params.mode_wipe.x < 0.5) {
-        if (in.uv.x <= params.mode_wipe.y) {
+    let pinned = sample_compare_texture(pinned_tex, in.uv);
+    let current = sample_compare_texture(current_tex, in.uv);
+    if (params.mode_wipe_lod_bias.x < 0.5) {
+        if (in.uv.x <= params.mode_wipe_lod_bias.y) {
             return pinned;
         }
         return current;
@@ -70,6 +83,7 @@ pub struct CompareShaderCallback {
     pub current_rgba: Arc<Vec<u8>>,
     pub mode: CompareShaderMode,
     pub wipe_fraction: f32,
+    pub mipmap_sampling_enabled: bool,
     pub lod_bias: f32,
     pub target_format: wgpu::TextureFormat,
 }
@@ -280,7 +294,12 @@ impl CompareGpuResources {
             queue.write_buffer(
                 &pair.uniform,
                 0,
-                &uniform_bytes(callback.mode, callback.wipe_fraction, callback.lod_bias),
+                &uniform_bytes(
+                    callback.mode,
+                    callback.wipe_fraction,
+                    callback.mipmap_sampling_enabled,
+                    callback.lod_bias,
+                ),
             );
         }
     }
@@ -345,7 +364,12 @@ fn upload_rgba_texture(
     UploadedTexture { texture, view }
 }
 
-fn uniform_bytes(mode: CompareShaderMode, wipe_fraction: f32, lod_bias: f32) -> [u8; 16] {
+fn uniform_bytes(
+    mode: CompareShaderMode,
+    wipe_fraction: f32,
+    mipmap_sampling_enabled: bool,
+    lod_bias: f32,
+) -> [u8; 16] {
     let mode = match mode {
         CompareShaderMode::Wipe => 0.0_f32,
         CompareShaderMode::Diff => 1.0_f32,
@@ -354,12 +378,12 @@ fn uniform_bytes(mode: CompareShaderMode, wipe_fraction: f32, lod_bias: f32) -> 
         mode,
         wipe_fraction.clamp(0.05, 0.95),
         lod_bias.clamp(0.0, 1.5),
-        0.0,
     ];
     let mut bytes = [0_u8; 16];
     for (i, value) in values.iter().enumerate() {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&value.to_ne_bytes());
     }
+    bytes[12..16].copy_from_slice(&u32::from(mipmap_sampling_enabled).to_ne_bytes());
     bytes
 }
 
@@ -412,8 +436,38 @@ mod tests {
     #[test]
     fn compare_shader_and_uniform_apply_clamped_lod_bias() {
         assert!(SHADER.contains("textureSampleBias"));
-        let bytes = uniform_bytes(CompareShaderMode::Wipe, 0.5, 99.0);
+        assert!(SHADER.contains("textureSampleLevel"));
+        let bytes = uniform_bytes(CompareShaderMode::Wipe, 0.5, true, 99.0);
         let bias = f32::from_ne_bytes(bytes[8..12].try_into().unwrap());
+        let mipmap_sampling_enabled = u32::from_ne_bytes(bytes[12..16].try_into().unwrap());
         assert_eq!(bias, 1.5);
+        assert_eq!(mipmap_sampling_enabled, 1);
+    }
+
+    #[test]
+    fn compare_default_preserves_bias_and_disabled_mode_selects_level_zero() {
+        let default_bytes = uniform_bytes(CompareShaderMode::Wipe, 0.5, true, 0.0);
+        assert_eq!(
+            f32::from_ne_bytes(default_bytes[8..12].try_into().unwrap()),
+            0.0
+        );
+        assert_eq!(
+            u32::from_ne_bytes(default_bytes[12..16].try_into().unwrap()),
+            1
+        );
+
+        let disabled_bytes = uniform_bytes(CompareShaderMode::Wipe, 0.5, false, 1.0);
+        assert_eq!(
+            u32::from_ne_bytes(disabled_bytes[12..16].try_into().unwrap()),
+            0
+        );
+
+        let module = wgpu::naga::front::wgsl::parse_str(SHADER).expect("parse compare WGSL");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("validate compare WGSL");
     }
 }
