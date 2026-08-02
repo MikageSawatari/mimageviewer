@@ -2143,7 +2143,11 @@ impl App {
             {
                 let delta = axis * self.continuous_reading_gamepad_speed_px_per_sec(ctx) * dt;
                 if delta.abs() > 0.5 {
-                    self.scroll_vertical_reading_by(ctx, delta);
+                    self.scroll_vertical_reading_by(
+                        ctx,
+                        delta,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
                     changed = true;
                 }
             } else if continuous_active
@@ -5467,7 +5471,7 @@ impl App {
         if self.slideshow_playing {
             self.slideshow_playing = false;
             self.slideshow_anchor_idx = None;
-            self.slideshow_scroll_anim = None;
+            self.continuous_reading_scroll_transition = None;
             self.slideshow_scroll_range_cache = None;
         } else if matches!(
             self.items.get(fs_idx),
@@ -5668,11 +5672,19 @@ impl App {
         if continuous_active && self.reading_flow.is_vertical() {
             match dir {
                 PadDir::Down => {
-                    self.scroll_vertical_reading_step(ctx, 1.0);
+                    self.scroll_vertical_reading_step(
+                        ctx,
+                        1.0,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
                     return;
                 }
                 PadDir::Up => {
-                    self.scroll_vertical_reading_step(ctx, -1.0);
+                    self.scroll_vertical_reading_step(
+                        ctx,
+                        -1.0,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
                     return;
                 }
                 PadDir::Left | PadDir::Right => {}
@@ -5681,19 +5693,35 @@ impl App {
             let axis_rtl = self.reading_direction == ReadingDirection::Rtl;
             match dir {
                 PadDir::Right if !axis_rtl => {
-                    self.scroll_vertical_reading_step(ctx, 1.0);
+                    self.scroll_vertical_reading_step(
+                        ctx,
+                        1.0,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
                     return;
                 }
                 PadDir::Left if axis_rtl => {
-                    self.scroll_vertical_reading_step(ctx, 1.0);
+                    self.scroll_vertical_reading_step(
+                        ctx,
+                        1.0,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
                     return;
                 }
                 PadDir::Left if !axis_rtl => {
-                    self.scroll_vertical_reading_step(ctx, -1.0);
+                    self.scroll_vertical_reading_step(
+                        ctx,
+                        -1.0,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
                     return;
                 }
                 PadDir::Right if axis_rtl => {
-                    self.scroll_vertical_reading_step(ctx, -1.0);
+                    self.scroll_vertical_reading_step(
+                        ctx,
+                        -1.0,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
                     return;
                 }
                 PadDir::Up | PadDir::Down | PadDir::Left | PadDir::Right => {}
@@ -5915,8 +5943,8 @@ impl App {
                 nav: GamepadLocationNav::DriveList,
             },
             GamepadLocationEntry {
-                label: "読書履歴".to_string(),
-                value: "最近読んだ本".to_string(),
+                label: "閲覧履歴".to_string(),
+                value: "最近見た本・動画・音声".to_string(),
                 nav: GamepadLocationNav::ReadingHistory,
             },
             GamepadLocationEntry {
@@ -6075,7 +6103,7 @@ impl App {
         if !self.guard_reading_history_open(idx) {
             return None;
         }
-        // 読書履歴ビューから本を開く場合は、閉じたときに読書履歴へ戻れるよう予約する。
+        // 閲覧履歴ビューから本を開く場合は、閉じたときに閲覧履歴へ戻れるよう予約する。
         self.note_reading_history_open(idx);
         // ファイル名スタックの集約グリッドでメディアセルを開いたら、フラット読書フルスクリーンへ
         // (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ流れる。
@@ -6110,7 +6138,7 @@ impl App {
                 }
                 self.bump_input_seq_for_item("gamepad_grid_open", idx);
                 self.fs_open_intent_from_grid = true;
-                self.open_fullscreen(idx);
+                self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
                 None
             }
             Some(GridItem::ConvertibleArchive { path, format }) => {

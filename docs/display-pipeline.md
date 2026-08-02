@@ -743,11 +743,16 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
   見開き、連結読み、ルーペ、pixel grid の座標系は変更しない。
 - animated frame、動画、サムネイル、mask、checker、UI texture は対象外。明示的な
   `PostFilter::Nearest` も level 0 + nearest sampler のまま。
-- 画像補正パネルの「フィルタ」にある `LOD 補正` (`image_mipmap_lod_bias`) は 0.0〜1.5。
-  0.0 は GPU 標準選択、正値はより粗い mip level へ寄せて中間縮小率のモアレを抑える。
-  managed texture と wipe/diff 比較は `textureSampleBias`、360度パノラマは
-  `textureSampleGrad` に渡す微分を `2^bias` 倍して同じ補正を適用する。uniform だけを
-  ライブ更新するため texture 再生成は不要で、対象外 texture と `Nearest` には影響しない。
+- 画像補正パネルの「フィルタ」に、全表示共通の
+  `image_mipmap_moire_reduction_enabled`（表示名「縮小表示のモアレを抑制する」）と
+  `image_mipmap_lod_bias`（表示名「より強く抑制」、0.0〜1.5）を置く。既定の ON / 0.0 は
+  v2.7.0 以降と同じ GPU 標準 LOD 選択であり、既定画質を変えない。ON かつ正値はより粗い
+  mip level へ寄せて中間縮小率のモアレを強く抑える。OFF は mip chain を保持したまま
+  `textureSampleLevel(..., 0.0)` 相当で level 0 固定にし、モアレ抑制より線のシャープさを優先する。
+  managed texture、wipe/diff 比較、360度パノラマはいずれも明示フラグを uniform で受ける。
+  ON では managed / 比較が `textureSampleBias`、パノラマが `textureSampleGrad` に渡す微分の
+  `2^bias` 倍を使う。ON/OFF と強度は uniform だけをライブ更新し、texture 再生成、再 upload、
+  cache invalidation は行わない。対象外 texture と `Nearest` の表示結果には影響しない。
 - mip texture の partial update では全下位 level を再生成する。完全な chain の VRAM は level 0
   の約 1/3 増えるため、フルスクリーンの既存 prefetch / eviction 境界を越えて保持しない。
 
@@ -1109,7 +1114,7 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 フォルダ / 仮想ビューの読み込み時は、`page_order_locked_for_items` が install 前の
 `source_path` と確定済み `items`、対象ビュー種別から「この読み込みは本か」を一度だけ判定する。
 `spread.db` に明示値があれば本 / 非本のどちらでもその値を優先する。未保存の場合だけ、製本フォルダ、
-読書履歴、ZIP / CBZ / PDF / 直接閲覧・変換アーカイブ、設定 ON の画像のみフォルダには Settings の
+閲覧履歴、ZIP / CBZ / PDF / 直接閲覧・変換アーカイブ、設定 ON の画像のみフォルダには Settings の
 見開き・連結方式・読み方向の既定値を使い、それ以外の通常フォルダと合成ビューには
 単ページ + ページ単位 + 左→右を使う。ネスト ZIP の本キーから root ZIP キーへの fallback と、
 旧 `SpreadMode::Vertical` の読み替えは従来どおりである。

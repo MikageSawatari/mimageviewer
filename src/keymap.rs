@@ -2284,7 +2284,7 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
     MenuCommandSpec {
         id: MenuCommandId::FileReadingHistory,
         parent: TopMenuId::File,
-        label: "読書履歴を開く",
+        label: "閲覧履歴を開く",
         action: Some(KeyAction::GridOpenLocationReadingHistory),
     },
     MenuCommandSpec {
@@ -3716,7 +3716,7 @@ impl KeyAction {
                 unreachable!("handled by compact slot helpers")
             }
             GridOpenLocationDriveList => "ドライブ一覧を開く",
-            GridOpenLocationReadingHistory => "読書履歴を開く",
+            GridOpenLocationReadingHistory => "閲覧履歴を開く",
             GridOpenLocationRating1 => "★1一覧を開く",
             GridOpenLocationRating2 => "★2一覧を開く",
             GridOpenLocationRating3 => "★3一覧を開く",
@@ -7908,7 +7908,7 @@ mod tests {
         );
         assert_eq!(
             keymap.menu_command_label(MenuCommandId::FileReadingHistory),
-            "読書履歴を開く"
+            "閲覧履歴を開く"
         );
         assert_eq!(
             keymap.menu_command_label(MenuCommandId::FavoritesAddCurrentFolder),
@@ -8004,7 +8004,7 @@ mod tests {
         );
         assert_eq!(
             keymap.menu_command_label(MenuCommandId::FileReadingHistory),
-            "読書履歴を開く (Ctrl+L)"
+            "閲覧履歴を開く (Ctrl+L)"
         );
         assert_eq!(
             keymap.menu_command_label(MenuCommandId::FileLocalSearch),

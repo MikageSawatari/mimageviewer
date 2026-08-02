@@ -223,7 +223,7 @@
 >
 > **Phase 6 ファイルメニュー静的項目 catalog スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > `MenuCommandId::ALL` を追加して enum ⇄ catalog の drift をテストで検知する。ファイルメニューの
-> 静的項目 (フォルダを開く / 読書履歴 / 現在地フィルタ / キャプチャ保存フォルダ / ゴミ箱 / 終了)
+> 静的項目 (フォルダを開く / 閲覧履歴 / 現在地フィルタ / キャプチャ保存フォルダ / ゴミ箱 / 終了)
 > を `MenuCommandSpec` へ追加し、`render_menubar()` のラベル取得を catalog 経由にする。
 > `フォルダを開く…` は既存 `GlobalOpenFolder` と紐付け、表示上の shortcut も keymap 追従にする。
 > クリック処理・メニュー構成・保存形式は変更しない。

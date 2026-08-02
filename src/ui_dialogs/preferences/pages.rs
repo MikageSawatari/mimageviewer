@@ -656,11 +656,11 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.checkbox(&mut s.thumb_tooltip_show_full_location, "場所");
     ui.checkbox(
         &mut s.thumb_tooltip_show_reading_history_last_read,
-        "読書履歴: 最終閲覧",
+        "閲覧履歴: 最終閲覧",
     );
     ui.checkbox(
         &mut s.thumb_tooltip_show_reading_history_progress,
-        "読書履歴: 既読位置",
+        "閲覧履歴: 閲覧位置",
     );
 }
 
@@ -7158,7 +7158,7 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
     let s = &mut state.settings;
 
     ui.label(
-        "動画・音声・ZIP/PDF (本) の位置復元と、読書履歴を管理します。\n\
+        "動画・音声・ZIP/PDF (本) の位置復元と、閲覧履歴を管理します。\n\
          一覧から開いたとき / 移動したとき (Ctrl+↑↓ や ↓↑・ホイールでの前後移動) に、前回の\n\
          位置 (続きから) で開くか、最初/先頭から開くかを選べます。保存された位置が無いときは\n\
          自動的に先頭になります。",
@@ -7269,10 +7269,10 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
     ui.add_space(10.0);
     ui.separator();
     ui.add_space(8.0);
-    ui.label(egui::RichText::new("読書履歴").strong());
+    ui.label(egui::RichText::new("閲覧履歴").strong());
     ui.checkbox(
         &mut state.settings.reading_history_enabled,
-        "フルスクリーンで読んだ本を読書履歴に記録する",
+        "手動で開いた本・動画・音声を閲覧履歴に記録する",
     );
     ui.horizontal(|ui| {
         ui.label("保持件数:");
@@ -7287,8 +7287,8 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
         ));
     });
     let history_count = state.reading_history_entry_count;
-    ui.label(format!("読書履歴: {history_count} 件を記憶。"));
-    if history_count > 0 && ui.button("読書履歴をすべてクリア").clicked() {
+    ui.label(format!("閲覧履歴: {history_count} 件を記憶。"));
+    if history_count > 0 && ui.button("閲覧履歴をすべてクリア").clicked() {
         state.reading_history_clear_requested = true;
     }
     if let Some(msg) = &state.reading_history_clear_result {

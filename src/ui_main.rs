@@ -3534,6 +3534,25 @@ fn reading_history_last_read_text(
 fn reading_history_progress_text(
     entry: &crate::reading_history_db::ReadingHistoryEntry,
 ) -> Option<String> {
+    if matches!(
+        entry.kind,
+        crate::reading_history_db::ReadingHistoryKind::Video
+            | crate::reading_history_db::ReadingHistoryKind::Audio
+    ) {
+        let position_ms = entry.media_position_ms?;
+        if position_ms < 0 {
+            return None;
+        }
+        return match entry.media_duration_ms {
+            Some(duration_ms) if duration_ms > 0 => Some(format!(
+                "{} / {}",
+                format_reading_history_media_time(position_ms),
+                format_reading_history_media_time(duration_ms),
+            )),
+            _ => Some(format_reading_history_media_time(position_ms)),
+        };
+    }
+
     let page = entry.last_page?;
     if page <= 0 {
         return None;
@@ -3541,6 +3560,18 @@ fn reading_history_progress_text(
     match entry.page_count {
         Some(count) if count > 0 => Some(format!("{page} / {count}")),
         _ => Some(format!("{page} ページ目")),
+    }
+}
+
+fn format_reading_history_media_time(value_ms: i64) -> String {
+    let total_secs = value_ms.max(0) / 1000;
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
     }
 }
 
@@ -4991,7 +5022,7 @@ impl App {
                                     // disabled 専用ツールチップで理由を出す。
                                     ui.add_enabled(false, egui::Button::new("ソート順: 固定"))
                                         .on_disabled_hover_text(
-                                            "本として表示中や読書履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
+                                            "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
                                         );
                                 } else {
                                     ui.menu_button("ソート順", |ui| {
@@ -7212,7 +7243,7 @@ impl App {
                     let sort_label = toolbar_label(ui, "ソート:", 54.0, drag_enabled);
                     let sort_label = if book_sort_locked {
                         sort_label.hover_tip(
-                            "本として表示中や読書履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
+                            "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
                         )
                     } else if details_sort_disabled {
                         sort_label.hover_tip(
@@ -7256,7 +7287,7 @@ impl App {
                                 // 専用ツールチップで固定理由を出す。
                                 let resp = if book_sort_locked {
                                     resp.hover_tip_disabled(
-                                        "本として表示中や読書履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
+                                        "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
                                     )
                                 } else {
                                     resp.on_hover_text(order.description())
@@ -7393,7 +7424,7 @@ impl App {
                                 let combo_id = combo.response.id;
                                 if book_sort_locked {
                                     combo.response.hover_tip_disabled(
-                                        "本として表示中や読書履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
+                                        "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
                                     );
                                 }
                                 toolbar_combo_popup_open |=
@@ -8451,7 +8482,7 @@ impl App {
             .checkbox(&mut self.settings.show_location_drive_list, "ドライブ一覧")
             .changed();
         changed |= ui
-            .checkbox(&mut self.settings.show_location_reading_history, "読書履歴")
+            .checkbox(&mut self.settings.show_location_reading_history, "閲覧履歴")
             .changed();
         changed |= ui
             .checkbox(&mut self.settings.show_location_bookshelf, "本棚フォルダ")
@@ -8631,8 +8662,7 @@ impl App {
         if !self.settings.show_toolbar_facet_filter {
             return;
         }
-        if self.items.is_empty() || self.items_are_drive_list || self.items_are_reading_history_view
-        {
+        if self.items.is_empty() || self.items_are_drive_list {
             return;
         }
 
@@ -8642,6 +8672,7 @@ impl App {
         let mut rating_changed = false;
         let mut color_changed = false;
         let mut bookmark_filter_changed = false;
+        let mut reading_history_filter_changed = false;
         egui::TopBottomPanel::top("facet_filter_bar").show(ctx, |ui| {
             ui.add_space(1.0);
             ui.horizontal_wrapped(|ui| {
@@ -8652,6 +8683,47 @@ impl App {
                 show_sticky_context_menu(&filter_label_response, |ui| {
                     self.draw_facet_filter_bar_settings_menu(ui);
                 });
+                if self.items_are_reading_history_view {
+                    egui::ComboBox::from_id_salt("reading_history_grid_media_filter")
+                        .selected_text(format!(
+                            "閲覧履歴種別: {}",
+                            self.reading_history_media_filter.label()
+                        ))
+                        .show_ui(ui, |ui| {
+                            for filter in crate::bookmark_browser::MediaFilter::ALL {
+                                reading_history_filter_changed |= ui
+                                    .selectable_value(
+                                        &mut self.reading_history_media_filter,
+                                        filter,
+                                        filter.label(),
+                                    )
+                                    .changed();
+                            }
+                        });
+                    if matches!(
+                        self.reading_history_media_filter,
+                        crate::bookmark_browser::MediaFilter::All
+                            | crate::bookmark_browser::MediaFilter::Book
+                    ) {
+                        egui::ComboBox::from_id_salt("reading_history_grid_book_kind_filter")
+                            .selected_text(format!(
+                                "本: {}",
+                                self.reading_history_book_kind_filter.label()
+                            ))
+                            .show_ui(ui, |ui| {
+                                for filter in crate::bookmark_browser::BookKindFilter::ALL {
+                                    reading_history_filter_changed |= ui
+                                        .selectable_value(
+                                            &mut self.reading_history_book_kind_filter,
+                                            filter,
+                                            filter.label(),
+                                        )
+                                        .changed();
+                                }
+                            });
+                    }
+                    ui.separator();
+                }
                 if self.items_are_bookmark_view {
                     egui::ComboBox::from_id_salt("bookmark_grid_media_filter")
                         .selected_text(format!(
@@ -8790,10 +8862,16 @@ impl App {
                         != crate::bookmark_browser::MediaFilter::All
                         || self.bookmark_book_kind_filter
                             != crate::bookmark_browser::BookKindFilter::All);
+                let reading_history_filter_active = self.items_are_reading_history_view
+                    && (self.reading_history_media_filter
+                        != crate::bookmark_browser::MediaFilter::All
+                        || self.reading_history_book_kind_filter
+                            != crate::bookmark_browser::BookKindFilter::All);
                 if self.facet_filter_active()
                     || rating_filter_visible
                     || self.color_filter.enabled
                     || bookmark_filter_active
+                    || reading_history_filter_active
                 {
                     ui.separator();
                     self.draw_facet_active_chips(ui);
@@ -8817,6 +8895,13 @@ impl App {
                             self.bookmark_book_kind_filter =
                                 crate::bookmark_browser::BookKindFilter::All;
                             bookmark_filter_changed = true;
+                        }
+                        if reading_history_filter_active {
+                            self.reading_history_media_filter =
+                                crate::bookmark_browser::MediaFilter::All;
+                            self.reading_history_book_kind_filter =
+                                crate::bookmark_browser::BookKindFilter::All;
+                            reading_history_filter_changed = true;
                         }
                     }
                 }
@@ -8859,7 +8944,7 @@ impl App {
                 self.rebuild_visible_indices();
             }
         }
-        if bookmark_filter_changed {
+        if bookmark_filter_changed || reading_history_filter_changed {
             self.rebuild_visible_indices();
         }
     }
@@ -10574,7 +10659,7 @@ impl App {
                                         "ドライブ一覧へ [BS]".to_string()
                                     }
                                     Some(AddressBarNav::ReadingHistory) => {
-                                        "読書履歴へ戻る [BS]".to_string()
+                                        "閲覧履歴へ戻る [BS]".to_string()
                                     }
                                     Some(AddressBarNav::Bookmarks) => {
                                         "ブックマークへ戻る [BS]".to_string()
@@ -10679,7 +10764,7 @@ impl App {
                                 ui.close();
                             }
                             if self.settings.show_location_reading_history
-                                && ui.button("読書履歴").clicked()
+                                && ui.button("閲覧履歴").clicked()
                             {
                                 result = Some(AddressBarNav::ReadingHistory);
                                 ui.close();
@@ -11772,7 +11857,7 @@ impl App {
             return None;
         }
         if response.double_clicked() && self.guard_reading_history_open(idx) {
-            // 読書履歴ビューから本を開く場合は、閉じたときに読書履歴へ戻れるよう予約する。
+            // 閲覧履歴ビューから本を開く場合は、閉じたときに閲覧履歴へ戻れるよう予約する。
             self.note_reading_history_open(idx);
             // ファイル名スタックの集約グリッドでメディアセルをダブルクリックしたら、フラット読書
             // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ。
@@ -11856,7 +11941,7 @@ impl App {
                     // Enter を `consume_key` で拾って即 close する事故を防ぐためのガード。
                     // ダブルクリック経路では Enter event がそもそも無いので no-op。
                     self.fs_suppress_enter_close_until_release = true;
-                    self.open_fullscreen(idx);
+                    self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
                 }
                 Some(GridItem::ConvertibleArchive { path, .. }) => {
                     let pf = path.clone();
@@ -12575,13 +12660,13 @@ impl App {
         self.reading_history_rows.get(&key)
     }
 
-    /// 詳細表示「最終閲覧」列 (= 読書履歴ビューでは更新日時列を転用) の文字列。
+    /// 詳細表示「最終閲覧」列 (= 閲覧履歴ビューでは更新日時列を転用) の文字列。
     pub(crate) fn reading_history_last_read_for_idx(&self, idx: usize) -> Option<String> {
         let entry = self.reading_history_entry_for_idx(idx)?;
         reading_history_last_read_text(entry, self.settings.details_timestamp_show_seconds)
     }
 
-    /// 詳細表示「既読位置」列 (= 読書履歴ビューでは状態列を転用) の文字列。
+    /// 詳細表示「閲覧位置」列 (= 閲覧履歴ビューでは状態列を転用) の文字列。
     pub(crate) fn reading_history_progress_for_idx(&self, idx: usize) -> Option<String> {
         let entry = self.reading_history_entry_for_idx(idx)?;
         reading_history_progress_text(entry)
@@ -12602,7 +12687,7 @@ impl App {
             lines.push(format!("最終閲覧 {last_read}"));
         }
         if show_progress && let Some(progress) = reading_history_progress_text(entry) {
-            lines.push(format!("既読位置 {progress}"));
+            lines.push(format!("閲覧位置 {progress}"));
         }
         (!lines.is_empty()).then_some(lines)
     }
@@ -12623,8 +12708,8 @@ impl App {
         let Some(entry) = self.reading_history_entry_for_idx(idx) else {
             return;
         };
-        // 読書履歴は複数フォルダ / ドライブの本が混在するため、場所 (フルパス) を
-        // 先頭に出して同名の本を判別できるようにする。
+        // 閲覧履歴は複数フォルダ / ドライブの項目が混在するため、場所 (フルパス) を
+        // 先頭に出して同名の項目を判別できるようにする。
         let mut lines = vec![format!("場所 {}", entry.path.display())];
         if let Some(extra) = self.reading_history_tooltip_lines(idx) {
             lines.extend(extra);
@@ -12730,7 +12815,7 @@ impl App {
         });
     }
 
-    /// 現在のビューでその列に出す名前。ブックマーク / 読書履歴では同じ列が別の意味を
+    /// 現在のビューでその列に出す名前。ブックマーク / 閲覧履歴では同じ列が別の意味を
     /// 持つので、一覧ヘッダ (`details_header_title`) と列の表示切替メニュー
     /// (`draw_details_column_context_menu`) の**両方**がここを通る。片方だけ更新すると
     /// 「一覧には位置と出ているのにメニューには状態しか無い」状態になり、ユーザーが
@@ -12745,7 +12830,7 @@ impl App {
         } else if self.items_are_reading_history_view {
             match col {
                 DetailsColumn::Modified => "最終閲覧",
-                DetailsColumn::State => "既読位置",
+                DetailsColumn::State => "閲覧位置",
                 _ => col.title(),
             }
         } else {
@@ -13367,7 +13452,7 @@ impl App {
                 response.hover_tip("クリックで 昇順 → 降順 → ソートなし")
             } else if book_sort_locked && sort_key.is_some() {
                 response.hover_tip(
-                    "本として表示中や読書履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
+                    "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
                 )
             } else if sort_key.is_none() {
                 response.hover_tip("サムネイルプレビュー")
@@ -14797,6 +14882,77 @@ impl App {
 }
 
 #[cfg(test)]
+mod facet_filter_bar_tests {
+    use super::*;
+    use crate::app::setup_app_for_test;
+
+    fn collect_shape_text(shape: &egui::epaint::Shape, text: &mut String) {
+        match shape {
+            egui::epaint::Shape::Text(text_shape) => {
+                text.push_str(&text_shape.galley.job.text);
+                text.push('\n');
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_shape_text(shape, text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn render_filter_bar_text(reading_history: bool) -> String {
+        let mut app = setup_app_for_test();
+        app.settings.show_toolbar_facet_filter = true;
+        app.settings.toolbar_facet_filter_items = vec![
+            crate::settings::ToolbarFacetFilterItem::Kind,
+            crate::settings::ToolbarFacetFilterItem::Ext,
+            crate::settings::ToolbarFacetFilterItem::Place,
+        ];
+        app.items = vec![GridItem::Video(std::path::PathBuf::from(
+            "c:/media/movie.mp4",
+        ))];
+        app.visible_indices = vec![0];
+        app.items_are_reading_history_view = reading_history;
+        app.items_are_bookmark_view = !reading_history;
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 240.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render_facet_filter_bar(ctx),
+        );
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            collect_shape_text(&clipped.shape, &mut text);
+        }
+        text
+    }
+
+    #[test]
+    fn reading_history_and_bookmark_bars_both_render_standard_facets() {
+        let history = render_filter_bar_text(true);
+        assert!(history.contains("閲覧履歴種別: すべて"), "{history}");
+        assert!(history.contains("本: すべて"), "{history}");
+        for label in ["種類", "拡張子", "場所"] {
+            assert!(history.contains(label), "missing {label}: {history}");
+        }
+
+        let bookmark = render_filter_bar_text(false);
+        assert!(bookmark.contains("ブックマーク種別: すべて"), "{bookmark}");
+        assert!(bookmark.contains("本: すべて"), "{bookmark}");
+        for label in ["種類", "拡張子", "場所"] {
+            assert!(bookmark.contains(label), "missing {label}: {bookmark}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod details_column_view_title_tests {
     use super::*;
     use crate::app::setup_app_for_test;
@@ -14834,7 +14990,7 @@ mod details_column_view_title_tests {
         );
         assert_eq!(
             app.details_column_view_title(DetailsColumn::State),
-            "既読位置"
+            "閲覧位置"
         );
     }
 
@@ -16834,7 +16990,7 @@ mod compute_cell_size_tests {
                     app.details_best_fit_seed_width(ui, &history_state_key);
                 assert!(
                     history_state_dynamic,
-                    "読書履歴の既読位置は固定語彙でないため全行測る"
+                    "閲覧履歴の閲覧位置は固定語彙でないため全行測る"
                 );
                 checked = true;
             });

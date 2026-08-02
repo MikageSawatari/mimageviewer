@@ -1,7 +1,7 @@
-//! 最近読んだ本 (フォルダ / ZIP / PDF / 変換アーカイブ) の履歴 DB。
+//! ユーザーが開いた本・動画・音声の閲覧履歴 DB。
 //!
-//! `%APPDATA%/mimageviewer/reading_history.db` に、フルスクリーンで読んだ
-//! 本コンテナを MRU として保存する。ページ送り中に UI スレッドで同期 SQLite I/O を
+//! `%APPDATA%/mimageviewer/reading_history.db` に、本コンテナまたはメディアファイルを
+//! MRU として保存する。閲覧中に UI スレッドで同期 SQLite I/O を
 //! 行わないよう、書き込みは [`ReadingHistoryWriter`] の専用スレッドへ送る。
 
 use std::path::{Path, PathBuf};
@@ -12,10 +12,10 @@ use rusqlite::OptionalExtension;
 
 use crate::archive_converter::ArchiveFormat;
 
-/// 読書履歴の保存件数上限。
+/// 閲覧履歴の保存件数上限。
 pub const READING_HISTORY_LIMIT_MAX: usize = 1000;
 
-/// 読書履歴の保存件数デフォルト。
+/// 閲覧履歴の保存件数デフォルト。
 pub const READING_HISTORY_LIMIT_DEFAULT: usize = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,6 +24,8 @@ pub enum ReadingHistoryKind {
     Zip,
     Pdf,
     Archive,
+    Video,
+    Audio,
 }
 
 impl ReadingHistoryKind {
@@ -33,6 +35,8 @@ impl ReadingHistoryKind {
             Self::Zip => "zip",
             Self::Pdf => "pdf",
             Self::Archive => "archive",
+            Self::Video => "video",
+            Self::Audio => "audio",
         }
     }
 
@@ -42,6 +46,8 @@ impl ReadingHistoryKind {
             "zip" => Some(Self::Zip),
             "pdf" => Some(Self::Pdf),
             "archive" => Some(Self::Archive),
+            "video" => Some(Self::Video),
+            "audio" => Some(Self::Audio),
             _ => None,
         }
     }
@@ -57,6 +63,10 @@ pub struct ReadingHistoryEntry {
     pub last_read_at_ms: i64,
     pub last_page: Option<i64>,
     pub page_count: Option<i64>,
+    /// 動画・音声の最終再生位置。ページ位置とは別のミリ秒単位。
+    pub media_position_ms: Option<i64>,
+    /// 動画・音声の尺。ページ数とは別のミリ秒単位。
+    pub media_duration_ms: Option<i64>,
     pub file_size: Option<i64>,
     pub mtime_ms: Option<i64>,
 }
@@ -80,13 +90,15 @@ impl ReadingHistoryEntry {
             last_read_at_ms: now_ms(),
             last_page,
             page_count,
+            media_position_ms: None,
+            media_duration_ms: None,
             file_size: None,
             mtime_ms: None,
         }
     }
 }
 
-/// 読書履歴 DB ハンドル。
+/// 閲覧履歴 DB ハンドル。
 pub struct ReadingHistoryDb {
     conn: rusqlite::Connection,
 }
@@ -113,12 +125,16 @@ impl ReadingHistoryDb {
                 last_read_at_ms INTEGER NOT NULL,
                 last_page INTEGER,
                 page_count INTEGER,
+                media_position_ms INTEGER,
+                media_duration_ms INTEGER,
                 file_size INTEGER,
                 mtime_ms INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_reading_history_last_read
                 ON reading_history(last_read_at_ms DESC);",
         )?;
+        ensure_column(&conn, "media_position_ms", "INTEGER")?;
+        ensure_column(&conn, "media_duration_ms", "INTEGER")?;
         Ok(Self { conn })
     }
 
@@ -155,8 +171,9 @@ impl ReadingHistoryDb {
         self.conn.execute(
             "INSERT INTO reading_history (
                 key, path, kind, archive_format, title, last_read_at_ms,
-                last_page, page_count, file_size, mtime_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                last_page, page_count, media_position_ms, media_duration_ms,
+                file_size, mtime_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(key) DO UPDATE SET
                 path = excluded.path,
                 kind = excluded.kind,
@@ -165,6 +182,16 @@ impl ReadingHistoryDb {
                 last_read_at_ms = excluded.last_read_at_ms,
                 last_page = excluded.last_page,
                 page_count = excluded.page_count,
+                media_position_ms = CASE
+                    WHEN excluded.kind IN ('video', 'audio')
+                    THEN COALESCE(excluded.media_position_ms, reading_history.media_position_ms)
+                    ELSE NULL
+                END,
+                media_duration_ms = CASE
+                    WHEN excluded.kind IN ('video', 'audio')
+                    THEN COALESCE(excluded.media_duration_ms, reading_history.media_duration_ms)
+                    ELSE NULL
+                END,
                 file_size = excluded.file_size,
                 mtime_ms = excluded.mtime_ms",
             rusqlite::params![
@@ -176,6 +203,8 @@ impl ReadingHistoryDb {
                 entry.last_read_at_ms,
                 entry.last_page,
                 entry.page_count,
+                entry.media_position_ms,
+                entry.media_duration_ms,
                 entry.file_size,
                 entry.mtime_ms,
             ],
@@ -190,17 +219,38 @@ impl ReadingHistoryDb {
         let limit = clamp_limit(limit);
         let mut stmt = self.conn.prepare_cached(
             "SELECT key, path, kind, archive_format, title, last_read_at_ms,
-                    last_page, page_count, file_size, mtime_ms
+                    last_page, page_count, media_position_ms, media_duration_ms,
+                    file_size, mtime_ms
              FROM reading_history
+             WHERE kind IN ('folder', 'zip', 'pdf', 'archive', 'video', 'audio')
              ORDER BY last_read_at_ms DESC, key ASC
              LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit as i64], read_entry_row)?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            if let Some(entry) = row? {
+                out.push(entry);
+            }
         }
         Ok(out)
+    }
+
+    /// 既存の動画・音声履歴行だけに再生進捗を保存する。
+    ///
+    /// 自動進行先に履歴行を作らず、最終閲覧順も変えないため UPSERT は行わない。
+    pub fn update_media_progress(
+        &self,
+        key: &str,
+        position_ms: i64,
+        duration_ms: i64,
+    ) -> Result<usize, rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE reading_history
+             SET media_position_ms = ?2, media_duration_ms = ?3
+             WHERE key = ?1 AND kind IN ('video', 'audio')",
+            rusqlite::params![key, position_ms, duration_ms],
+        )
     }
 
     pub fn remove_key(&self, key: &str) -> Result<(), rusqlite::Error> {
@@ -246,7 +296,7 @@ impl ReadingHistoryDb {
     }
 }
 
-/// 読書履歴の書き込みを UI スレッドから外す background writer。
+/// 閲覧履歴の書き込みを UI スレッドから外す background writer。
 pub struct ReadingHistoryWriter {
     tx: Option<mpsc::Sender<ReadingHistoryCommand>>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -254,8 +304,38 @@ pub struct ReadingHistoryWriter {
 
 enum ReadingHistoryCommand {
     Upsert(ReadingHistoryEntry, usize),
+    UpdateMediaProgress(MediaProgressUpdate),
     RemoveKeys(Vec<String>),
     Prune(usize),
+}
+
+/// DB と閲覧履歴ビューの in-memory 射影へ同じ値を配るための正規化済み更新。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MediaProgressUpdate {
+    pub(crate) key: String,
+    pub(crate) position_ms: i64,
+    pub(crate) duration_ms: i64,
+}
+
+impl MediaProgressUpdate {
+    pub(crate) fn from_seconds(
+        path: &Path,
+        position_secs: f64,
+        duration_secs: f64,
+    ) -> Option<Self> {
+        if !position_secs.is_finite()
+            || !duration_secs.is_finite()
+            || position_secs < 0.0
+            || duration_secs <= 0.0
+        {
+            return None;
+        }
+        Some(Self {
+            key: normalize_path_keep_drive(path),
+            position_ms: secs_to_ms(position_secs),
+            duration_ms: secs_to_ms(duration_secs),
+        })
+    }
 }
 
 impl ReadingHistoryWriter {
@@ -274,6 +354,13 @@ impl ReadingHistoryWriter {
                 while let Ok(command) = rx.recv() {
                     let result = match command {
                         ReadingHistoryCommand::Upsert(entry, limit) => db.upsert(entry, limit),
+                        ReadingHistoryCommand::UpdateMediaProgress(update) => db
+                            .update_media_progress(
+                                &update.key,
+                                update.position_ms,
+                                update.duration_ms,
+                            )
+                            .map(|_| ()),
                         ReadingHistoryCommand::RemoveKeys(keys) => {
                             db.remove_keys(&keys).map(|_| ())
                         }
@@ -308,6 +395,12 @@ impl ReadingHistoryWriter {
         }
     }
 
+    pub(crate) fn update_media_progress(&self, update: MediaProgressUpdate) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(ReadingHistoryCommand::UpdateMediaProgress(update));
+        }
+    }
+
     pub fn remove_keys(&self, keys: Vec<String>) {
         if keys.is_empty() {
             return;
@@ -327,21 +420,49 @@ impl Drop for ReadingHistoryWriter {
     }
 }
 
-fn read_entry_row(row: &rusqlite::Row<'_>) -> Result<ReadingHistoryEntry, rusqlite::Error> {
+fn read_entry_row(row: &rusqlite::Row<'_>) -> Result<Option<ReadingHistoryEntry>, rusqlite::Error> {
     let kind_raw: String = row.get(2)?;
+    let Some(kind) = ReadingHistoryKind::from_str(&kind_raw) else {
+        return Ok(None);
+    };
     let format_raw: Option<String> = row.get(3)?;
-    Ok(ReadingHistoryEntry {
+    Ok(Some(ReadingHistoryEntry {
         key: row.get(0)?,
         path: PathBuf::from(row.get::<_, String>(1)?),
-        kind: ReadingHistoryKind::from_str(&kind_raw).unwrap_or(ReadingHistoryKind::Folder),
+        kind,
         archive_format: format_raw.as_deref().and_then(archive_format_from_str),
         title: row.get(4)?,
         last_read_at_ms: row.get(5)?,
         last_page: row.get(6)?,
         page_count: row.get(7)?,
-        file_size: row.get(8)?,
-        mtime_ms: row.get(9)?,
-    })
+        media_position_ms: row.get(8)?,
+        media_duration_ms: row.get(9)?,
+        file_size: row.get(10)?,
+        mtime_ms: row.get(11)?,
+    }))
+}
+
+fn ensure_column(
+    conn: &rusqlite::Connection,
+    name: &str,
+    sql_type: &str,
+) -> Result<(), rusqlite::Error> {
+    let mut stmt = conn.prepare("PRAGMA table_info(reading_history)")?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == name {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        &format!("ALTER TABLE reading_history ADD COLUMN {name} {sql_type}"),
+        [],
+    )?;
+    Ok(())
+}
+
+fn secs_to_ms(secs: f64) -> i64 {
+    (secs * 1000.0).round().clamp(0.0, i64::MAX as f64) as i64
 }
 
 fn normalize_path_keep_drive(path: &Path) -> String {
@@ -422,6 +543,8 @@ mod tests {
             last_read_at_ms: 1_000 + page,
             last_page: Some(page),
             page_count: Some(10),
+            media_position_ms: None,
+            media_duration_ms: None,
             file_size: None,
             mtime_ms: None,
         }
@@ -470,5 +593,128 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].last_page, Some(4));
         assert_eq!(rows[2].last_page, Some(2));
+    }
+    #[test]
+    fn released_schema_is_migrated_with_dedicated_media_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reading_history.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE reading_history (
+                key TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                archive_format TEXT,
+                title TEXT NOT NULL,
+                last_read_at_ms INTEGER NOT NULL,
+                last_page INTEGER,
+                page_count INTEGER,
+                file_size INTEGER,
+                mtime_ms INTEGER
+            );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = ReadingHistoryDb::open_at(path).unwrap();
+        let mut stmt = db
+            .conn
+            .prepare("PRAGMA table_info(reading_history)")
+            .unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "media_position_ms"));
+        assert!(columns.iter().any(|column| column == "media_duration_ms"));
+    }
+
+    #[test]
+    fn media_history_progress_is_owned_by_history_and_does_not_insert() {
+        let (_dir, db) = temp_db();
+        let path = PathBuf::from("C:/Media/movie.mp4");
+        let mut media = ReadingHistoryEntry::new(
+            path.clone(),
+            ReadingHistoryKind::Video,
+            None,
+            "movie.mp4".to_string(),
+            None,
+            None,
+        );
+        media.last_read_at_ms = 1234;
+        db.upsert(media, 1000).unwrap();
+
+        let key = normalize_path_keep_drive(&path);
+        assert_eq!(db.update_media_progress(&key, 95_000, 100_000).unwrap(), 1);
+        let row = db.list_recent(1000).unwrap().pop().unwrap();
+        assert_eq!(row.kind, ReadingHistoryKind::Video);
+        assert_eq!(row.last_read_at_ms, 1234);
+        assert_eq!(row.media_position_ms, Some(95_000));
+        assert_eq!(row.media_duration_ms, Some(100_000));
+        assert_eq!(row.last_page, None);
+        assert_eq!(row.page_count, None);
+
+        let mut reopened = ReadingHistoryEntry::new(
+            path,
+            ReadingHistoryKind::Video,
+            None,
+            "movie.mp4".to_string(),
+            None,
+            None,
+        );
+        reopened.last_read_at_ms = 5678;
+        db.upsert(reopened, 1000).unwrap();
+        let row = db.list_recent(1000).unwrap().pop().unwrap();
+        assert_eq!(row.last_read_at_ms, 5678);
+        assert_eq!(row.media_position_ms, Some(95_000));
+        assert_eq!(row.media_duration_ms, Some(100_000));
+
+        assert_eq!(
+            db.update_media_progress("c:/media/automatic.mp4", 10_000, 20_000)
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.count(), 1);
+    }
+
+    #[test]
+    fn unknown_kind_rows_are_skipped_instead_of_opened_as_folders() {
+        assert_eq!(ReadingHistoryKind::from_str("future_media"), None);
+        let (_dir, db) = temp_db();
+        db.conn
+            .execute(
+                "INSERT INTO reading_history
+                    (key, path, kind, title, last_read_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "c:/future/item.bin",
+                    "C:/Future/item.bin",
+                    "future_media",
+                    "item.bin",
+                    10_i64,
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(db.count(), 1);
+        assert!(db.list_recent(1000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn maximum_retention_remains_one_thousand_entries() {
+        let (_dir, db) = temp_db();
+        for i in 0..=READING_HISTORY_LIMIT_MAX {
+            db.upsert(entry(&format!("C:/Books/{i}.zip"), i as i64), 5000)
+                .unwrap();
+        }
+        assert_eq!(db.count(), READING_HISTORY_LIMIT_MAX);
+        let rows = db.list_recent(5000).unwrap();
+        assert_eq!(rows.len(), READING_HISTORY_LIMIT_MAX);
+        assert_eq!(
+            rows.first().and_then(|row| row.last_page),
+            Some(READING_HISTORY_LIMIT_MAX as i64)
+        );
+        assert_eq!(rows.last().and_then(|row| row.last_page), Some(1));
     }
 }

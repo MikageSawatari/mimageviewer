@@ -1105,7 +1105,7 @@ pub fn run() -> eframe::Result {
             }
             app.applied_ui_theme = Some(resolved);
 
-            // wgpu::Device / Queue を保存。mipmap の LOD bias、比較モードの GPU
+            // wgpu::Device / Queue を保存。mipmap の sampling 設定、比較モードの GPU
             // テクスチャ、パノラマ overlay はプラットフォーム非依存でこれを使うため、
             // 保存自体は cfg なしで行う。Windows では同時に共有 D3D11 デバイスを
             // 初期化する (失敗してもアプリは起動継続、動画は旧経路 = CPU readback +

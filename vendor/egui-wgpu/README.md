@@ -13,8 +13,10 @@ This was originally hosted at https://github.com/hasenbanck/egui_wgpu_backend
 
 This directory is based on `egui-wgpu` 0.33.3. The local patch adds opt-in mipmap allocation,
 GPU mip-chain generation, and mipmap sampler filtering for managed textures whose
-`TextureOptions::mipmap_mode` is set. See `docs/downscale-moire-lod-plan.md` in the application
-repository for the behavior and maintenance notes.
+`TextureOptions::mipmap_mode` is set. It also exposes a renderer uniform switch that keeps the
+chain allocated while choosing between normal mip sampling and explicit level-0 sampling.
+See `docs/downscale-moire-lod-plan.md` in the application repository for the behavior and
+maintenance notes.
 
 The upstream 0.33.3 license texts and copyright notice are preserved in
 [`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE).

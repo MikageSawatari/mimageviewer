@@ -54,7 +54,7 @@ PDF / ZIP / 画像フォルダを別ウィンドウで開くとき、メイン�
 
 - `MainGridContext`
   - メインウィンドウに表示する一覧。
-  - 親の本一覧、通常フォルダ、検索結果、タグビュー、読書履歴などを保持する。
+  - 親の本一覧、通常フォルダ、検索結果、タグビュー、閲覧履歴などを保持する。
   - detached independent viewer の操作では変更しない。
 - `ActiveViewerContext`
   - 現在操作対象の別ウィンドウ viewer が読むページ列。
@@ -375,7 +375,7 @@ active viewer 内のキーは active context へ作用する。
 - detached window close 後に active detached context が残っていない場合は、main/root viewport へ
   focus を 1 回だけ誘導し、OS が残存 passive window へ focus を順番に渡す見た目のちらつきを抑える。
 - detached book open の入口は、グリッドの Enter / ダブルクリック / ゲームパッド accept から
-  `open_grid_container_in_detached_book_context` に集約した。読書履歴 / タグ / レーティング等の
+  `open_grid_container_in_detached_book_context` に集約した。閲覧履歴 / タグ / レーティング等の
   ビューでも `PdfFile` / `ZipFile` として表示される項目は同じ経路を通る。
 - 現時点の detached book open 対象は `PdfFile` / `ZipFile`。画像フォルダは開いてみるまで
   「画像のみ」か確定できないため、この経路で先取りすると通常フォルダ移動を壊す。変換アーカイブも
@@ -432,7 +432,7 @@ active viewer 内のキーは active context へ作用する。
 ### Phase 5: polish and compatibility
 
 - 通常 linked detached viewer は既存の main sync を維持する。
-- Ctrl+S / Ctrl+G / 読書履歴 / タグビュー / レーティングビューからの container open を同じ方針に通す。
+- Ctrl+S / Ctrl+G / 閲覧履歴 / タグビュー / レーティングビューからの container open を同じ方針に通す。
 - スライドショー、folder nav、見開き、view trim、読書位置、代表サムネピン、PDF password の edge case を
   拡張テストする。
 

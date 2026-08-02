@@ -2768,7 +2768,7 @@ pub enum StartupFolderMode {
     Specific,
     /// 実フォルダではなく、接続済みドライブ一覧を表示する。
     Drives,
-    /// 実フォルダではなく、最近フルスクリーンで読んだ本の一覧を表示する。
+    /// 実フォルダではなく、最近手動で開いた本・動画・音声の一覧を表示する。
     ReadingHistory,
 }
 
@@ -2796,7 +2796,7 @@ impl StartupFolderMode {
             Self::Desktop => "デスクトップ",
             Self::Specific => "指定フォルダ",
             Self::Drives => "ドライブ一覧",
-            Self::ReadingHistory => "読書履歴",
+            Self::ReadingHistory => "閲覧履歴",
         }
     }
 }
@@ -3122,10 +3122,10 @@ pub struct Settings {
     /// 選択情報に場所をフルパスで表示する。
     #[serde(default)]
     pub thumb_tooltip_show_full_location: bool,
-    /// 選択情報に読書履歴の最終閲覧日時を表示する。
+    /// 選択情報に閲覧履歴の最終閲覧日時を表示する。
     #[serde(default = "default_true")]
     pub thumb_tooltip_show_reading_history_last_read: bool,
-    /// 選択情報に読書履歴の既読位置を表示する。
+    /// 選択情報に閲覧履歴の閲覧位置を表示する。
     #[serde(default = "default_true")]
     pub thumb_tooltip_show_reading_history_progress: bool,
 
@@ -3205,7 +3205,7 @@ pub struct Settings {
     /// フォルダバーの「場所▼」に仮想ドライブ一覧を表示する。
     #[serde(default = "default_true")]
     pub show_location_drive_list: bool,
-    /// フォルダバーの「場所▼」に読書履歴を表示する。
+    /// フォルダバーの「場所▼」に閲覧履歴を表示する。
     #[serde(default = "default_true")]
     pub show_location_reading_history: bool,
     /// フォルダバーの「場所▼」にレーティング一覧サブメニューを表示する。
@@ -3393,6 +3393,10 @@ pub struct Settings {
     /// 自動フィット時に 100% 未満へ縮小しない。
     #[serde(default)]
     pub fullscreen_fit_no_downscale: bool,
+    /// 縮小表示で mipmap sampling を使い、モアレ抑制を優先する。
+    /// false でも mip chain は保持し、表示時だけ level 0 固定で読む。
+    #[serde(default = "default_true")]
+    pub image_mipmap_moire_reduction_enabled: bool,
     /// 完全 mip chain を使う静止画表示で、GPU の自動 LOD を粗い側へ寄せる量。
     /// 0.0 は標準、0.5 / 1.0 はそれぞれ半段 / 1段ぶんモアレ抑制を優先する。
     #[serde(default)]
@@ -3824,10 +3828,10 @@ pub struct Settings {
     /// (位置復元マトリクス「音声 × 移動」。既定 = 最初から。誤って別曲へ行って戻っても頭から)
     #[serde(default = "default_resume_from_start")]
     pub music_nav_resume: ResumeMode,
-    /// フルスクリーンで開いた本 (フォルダ / ZIP / PDF) を読書履歴に記録するか。
+    /// ユーザーが開いた本 / 動画 / 音声を閲覧履歴に記録するか。
     #[serde(default = "default_true")]
     pub reading_history_enabled: bool,
-    /// 読書履歴の保持件数。既定 1000、上限 1000。
+    /// 閲覧履歴の保持件数。既定 1000、上限 1000。
     #[serde(default = "default_reading_history_limit")]
     pub reading_history_limit: usize,
     /// ハードウェアデコードを利用するか (Windows D3D11VA)。D3D11VA 非対応 codec は
@@ -4778,6 +4782,7 @@ impl Default for Settings {
             fullscreen_fit_mode: FullscreenFitMode::default(),
             fullscreen_fit_no_upscale: false,
             fullscreen_fit_no_downscale: false,
+            image_mipmap_moire_reduction_enabled: true,
             image_mipmap_lod_bias: 0.0,
             fullscreen_left_panel_tab: FullscreenLeftPanelTab::default(),
             adjustment_settings_tab: AdjustmentSettingsTab::default(),
@@ -6523,7 +6528,8 @@ impl Settings {
         self.text_preview_scale = src.text_preview_scale;
         self.text_smart_snap_enabled = src.text_smart_snap_enabled;
         self.thumb_quality = src.thumb_quality;
-        // ── 静止画 mipmap LOD (画像補正→フィルタでライブ編集) ──
+        // ── 静止画 mipmap sampling (画像補正→フィルタでライブ編集) ──
+        self.image_mipmap_moire_reduction_enabled = src.image_mipmap_moire_reduction_enabled;
         self.image_mipmap_lod_bias = src.image_mipmap_lod_bias;
         // ── 動画プレビュー補正 (native 動画左パネルでライブ編集) ──
         self.video_adjustments = src.video_adjustments.clone();
@@ -7972,6 +7978,7 @@ mod tests {
         assert_eq!(s.slideshow_continuous_scroll_secs, 0.2);
         assert_eq!(s.slideshow_continuous_scroll_percent, 50);
         assert_eq!(s.fullscreen_fit_mode, FullscreenFitMode::Page);
+        assert!(s.image_mipmap_moire_reduction_enabled);
         assert_eq!(s.image_mipmap_lod_bias, 0.0);
         assert!(!s.fullscreen_seek_bar_locked);
         assert!(!s.fullscreen_top_bar_locked);
@@ -8501,6 +8508,7 @@ mod tests {
         assert_eq!(loaded.thumb_quality, 75);
         assert_eq!(loaded.video_volume, VIDEO_VOLUME_DEFAULT);
         assert_eq!(loaded.video_playback_speed, 1.0);
+        assert!(loaded.image_mipmap_moire_reduction_enabled);
         assert_eq!(loaded.image_mipmap_lod_bias, 0.0);
         assert_eq!(
             loaded
@@ -8609,6 +8617,19 @@ mod tests {
         assert_eq!(loaded.video_deinterlace, VideoDeinterlaceMode::Auto);
         assert!(!loaded.video_grid_open_starts_from_beginning);
         assert!(loaded.favorites.is_empty());
+    }
+
+    #[test]
+    fn image_mipmap_moire_reduction_roundtrips_disabled_without_changing_strength() {
+        let mut selected = Settings::default();
+        selected.image_mipmap_moire_reduction_enabled = false;
+        selected.image_mipmap_lod_bias = 0.7;
+
+        let loaded: Settings =
+            serde_json::from_str(&serde_json::to_string(&selected).unwrap()).unwrap();
+
+        assert!(!loaded.image_mipmap_moire_reduction_enabled);
+        assert_eq!(loaded.image_mipmap_lod_bias, 0.7);
     }
 
     #[test]

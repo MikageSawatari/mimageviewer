@@ -155,6 +155,7 @@ pub(crate) struct NativeVideoSourceSwapPending {
     pub(crate) requested_at: std::time::Instant,
     pub(crate) deadline: std::time::Instant,
     pub(crate) input_seq: u64,
+    pub(crate) history_trigger: crate::app::HistoryTrigger,
     pub(crate) cursor_state: crate::ui_fullscreen::FullscreenCursorState,
     /// ParkedLive poll 中に enqueue された source-swap なら、その owner window id。
     /// Completion が別フレームへずれても通常 `open_fullscreen` 経路へ漏らさないため、
@@ -867,6 +868,7 @@ impl App {
         ignore_resume: bool,
         show_preparing_overlay: bool,
         reason: &'static str,
+        history_trigger: crate::app::HistoryTrigger,
     ) -> bool {
         let target_path = match self.items.get(target_idx).cloned() {
             Some(GridItem::Video(path)) => path,
@@ -927,6 +929,7 @@ impl App {
             pending.requested_at = now;
             pending.deadline = now + std::time::Duration::from_secs(10);
             pending.input_seq = self.input_seq;
+            pending.history_trigger = history_trigger;
             pending.parked_live_window_id = Self::source_swap_owner_after_update(
                 parked_live_window_id,
                 pending.parked_live_window_id,
@@ -1016,6 +1019,7 @@ impl App {
             requested_at: now,
             deadline: now + std::time::Duration::from_secs(10),
             input_seq: self.input_seq,
+            history_trigger,
             cursor_state: self.fullscreen_cursor_state(),
             parked_live_window_id,
             audio_mode_after_swap: keep_audio_mode,
@@ -1510,6 +1514,7 @@ impl App {
             reason,
             requested_at,
             input_seq,
+            history_trigger,
             cursor_state,
             parked_live_window_id,
             audio_mode_after_swap,
@@ -1551,6 +1556,7 @@ impl App {
                 target_idx,
                 cursor_state,
                 parked_live_window_id,
+                history_trigger,
             );
         if start_normalize_scan_before_play {
             if !self.start_normalize_scan_for_deferred_play_intent(target_idx) {
@@ -1671,6 +1677,7 @@ impl App {
         target_idx: usize,
         cursor_state: crate::ui_fullscreen::FullscreenCursorState,
         parked_live_window_id: Option<u64>,
+        history_trigger: crate::app::HistoryTrigger,
     ) -> bool {
         if let Some(window_id) = parked_live_window_id {
             self.video_continuous_last_eof = None;
@@ -1687,7 +1694,7 @@ impl App {
         // open_fullscreen 冒頭の一括ガードが現在の `viewer_presentation` から presentation
         // 維持 one-shot を焼き付ける。pending 中の F12 は player 不在で設定だけ反転しないよう
         // 共通入口で無視する (review-v2.3.0 追補3: 角度B-1、案a)。
-        self.open_fullscreen(target_idx);
+        self.open_fullscreen(target_idx, history_trigger);
         self.restore_fullscreen_cursor_state(ctx, cursor_state);
         true
     }
@@ -6826,7 +6833,11 @@ impl App {
                     crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, false);
                 match target {
                     Some(idx) if idx != fs_idx => {
-                        self.open_native_video_fullscreen_from_navigation(ctx, idx);
+                        self.open_native_video_fullscreen_from_navigation(
+                            ctx,
+                            idx,
+                            crate::app::HistoryTrigger::UserChosen,
+                        );
                     }
                     _ => {
                         self.show_native_video_boundary_toast(ctx, false);
@@ -6840,7 +6851,11 @@ impl App {
                     crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, true);
                 match target {
                     Some(idx) if idx != fs_idx => {
-                        self.open_native_video_fullscreen_from_navigation(ctx, idx);
+                        self.open_native_video_fullscreen_from_navigation(
+                            ctx,
+                            idx,
+                            crate::app::HistoryTrigger::UserChosen,
+                        );
                     }
                     _ => {
                         self.show_native_video_boundary_toast(ctx, true);
@@ -8298,6 +8313,7 @@ impl App {
         ignore_resume: bool,
         show_preparing_overlay: bool,
         reason: &'static str,
+        history_trigger: crate::app::HistoryTrigger,
     ) -> Option<NativeVideoSourceSwapStarted> {
         let Some(from_idx) = self.fullscreen_idx else {
             return None;
@@ -8379,7 +8395,7 @@ impl App {
         // 抑止状態を新しい動画に同期する。
         self.init_normalize_state_for_opened_video(target_idx);
 
-        self.open_fullscreen(target_idx);
+        self.open_fullscreen(target_idx, history_trigger);
         if start_normalize_scan_before_play {
             if !self.start_normalize_scan_for_deferred_play_intent(target_idx) {
                 self.resume_deferred_normalize_playback_without_scan(target_idx);
@@ -8484,6 +8500,7 @@ impl App {
                 false,
                 true,
                 "tile",
+                crate::app::HistoryTrigger::UserChosen,
             );
         }
         if self.video_tile_swap_pending.is_some() || self.native_video_fast_swap_pending.is_some() {
@@ -8513,12 +8530,19 @@ impl App {
                 false,
                 true,
                 "tile",
+                crate::app::HistoryTrigger::UserChosen,
             );
         }
 
-        let Some(started) =
-            self.start_native_video_source_swap(ctx, target_idx, Some(false), false, true, "tile")
-        else {
+        let Some(started) = self.start_native_video_source_swap(
+            ctx,
+            target_idx,
+            Some(false),
+            false,
+            true,
+            "tile",
+            crate::app::HistoryTrigger::UserChosen,
+        ) else {
             return false;
         };
 
@@ -8550,6 +8574,7 @@ impl App {
         target_idx: usize,
         autoplay_override: Option<bool>,
         ignore_resume: bool,
+        history_trigger: crate::app::HistoryTrigger,
     ) -> bool {
         // Gate checks first: 「これは本当に video→video fast-swap の候補か」が確定する
         // までは throttle 判定もしない。`live_count >= MAX` のときに throttle が早く
@@ -8563,6 +8588,7 @@ impl App {
                 ignore_resume,
                 false,
                 "navigation",
+                history_trigger,
             );
         }
         if self.native_video_fast_swap_pending.is_some() || self.video_tile_swap_pending.is_some() {
@@ -8639,6 +8665,7 @@ impl App {
                 ignore_resume,
                 false,
                 "navigation",
+                history_trigger,
             );
         }
 
@@ -8655,6 +8682,7 @@ impl App {
             ignore_resume,
             false,
             "navigation",
+            history_trigger,
         )
     }
 
@@ -8663,8 +8691,15 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         idx: usize,
+        history_trigger: crate::app::HistoryTrigger,
     ) {
-        self.open_native_video_fullscreen_from_navigation_with_options(ctx, idx, None, false);
+        self.open_native_video_fullscreen_from_navigation_with_options(
+            ctx,
+            idx,
+            None,
+            false,
+            history_trigger,
+        );
     }
 
     #[cfg(windows)]
@@ -8674,6 +8709,7 @@ impl App {
         idx: usize,
         autoplay_override: Option<bool>,
         ignore_resume: bool,
+        history_trigger: crate::app::HistoryTrigger,
     ) {
         self.sync_main_selection_from_viewer_idx(idx);
 
@@ -8707,7 +8743,13 @@ impl App {
             self.fs_media_open_forced_presentation = None;
             return;
         }
-        if self.try_start_native_video_fast_swap(ctx, idx, autoplay_override, ignore_resume) {
+        if self.try_start_native_video_fast_swap(
+            ctx,
+            idx,
+            autoplay_override,
+            ignore_resume,
+            history_trigger,
+        ) {
             self.fs_media_open_forced_presentation = None;
             return;
         }
@@ -8741,7 +8783,7 @@ impl App {
         self.fs_video_open_autoplay_override = autoplay_override;
         self.fs_video_open_ignore_resume_once = ignore_resume;
         let cursor_state = self.fullscreen_cursor_state();
-        self.open_fullscreen(idx);
+        self.open_fullscreen(idx, history_trigger);
         self.restore_fullscreen_cursor_state(ctx, cursor_state);
 
         if restore_video_tile && restore_target_is_video {

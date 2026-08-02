@@ -419,7 +419,7 @@ impl crate::app::App {
 
     /// スタックモードのトグルが使える状況か。
     /// 通常フォルダ、またはサブ展開スナップショット表示で有効。ZIP ツリー / PDF ページ一覧 /
-    /// 検索 / タグ / 読書履歴 / ドライブ一覧などの特殊・仮想ビューでは無効。
+    /// 検索 / タグ / 閲覧履歴 / ドライブ一覧などの特殊・仮想ビューでは無効。
     pub(crate) fn stack_mode_available(&self) -> bool {
         let regular_folder = self.current_folder_last_mtime.is_some();
         let subfolder_expansion = self.items_are_subfolder_expansion_view
@@ -656,7 +656,7 @@ impl crate::app::App {
         self.swap_stack_view_items(items, metas, &folder, Some(flat_idx));
         self.stack_showing_flat = true;
         self.fs_open_intent_from_grid = true;
-        self.open_fullscreen(flat_idx);
+        self.open_fullscreen(flat_idx, crate::app::HistoryTrigger::UserChosen);
     }
 
     /// フルスクリーン中の `Shift+↓↑`: 次/前のスタックの先頭画像へジャンプする。
@@ -674,7 +674,7 @@ impl crate::app::App {
             .as_ref()
             .and_then(|sv| sv.stack_jump_target(cur, forward));
         if let Some(t) = target {
-            self.open_fullscreen_from_fs_navigation(ctx, t);
+            self.open_fullscreen_from_fs_navigation(ctx, t, crate::app::HistoryTrigger::UserChosen);
         }
         true
     }

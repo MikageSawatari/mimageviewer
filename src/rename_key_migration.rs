@@ -3,7 +3,7 @@
 //! アプリ内リネーム (`ui_dialogs/rename_item.rs`) の成功後に、旧 path をキーにした
 //! ユーザーデータ (★ / タグ / 回転 / 補正 / マスク / 隠蔽 / ローカル調整 / テキスト注釈 /
 //! 出力範囲 / 動画ピン / 動画・音楽ブックマーク / 本ページブックマーク / 代表サムネピン / 本 resume / 見開き /
-//! 読書履歴 / 編集プレビュー / PDF パスワード / 動画 .xmp サイドカー) を新 path キーへ引き継ぐ
+//! 閲覧履歴 / 編集プレビュー / PDF パスワード / 動画 .xmp サイドカー) を新 path キーへ引き継ぐ
 //! (docs/next-release-backlog.md §1.8 の段階 1+2、review-v2.3.0 角度④ (C))。
 //!
 //! 方式は [`crate::zip_key_migration`] と同じ:
@@ -21,7 +21,7 @@
 //! ## 対象外 (許容する制限)
 //! - **フォルダ改名時の配下 PDF パスワード**: キーが SHA-256 ハッシュのため列挙不可。
 //!   単一 PDF の改名だけ平文を読み直して付け替える。
-//! - **読書履歴の配下 prefix**: 履歴は自己修復する (次に開いたとき新キーで upsert)
+//! - **閲覧履歴の配下 prefix**: 履歴は自己修復する (次に開いたとき新キーで upsert)
 //!   ため exact のみ移行し、title も次回オープンで更新されるのに任せる。
 //! - **代表サムネピンの親フォルダ側 `source_rel`**: 親ピンが改名した子を container 相対
 //!   パスで指しているケース。大文字小文字を保った照合が SQL では難しく、壊れても
@@ -107,7 +107,7 @@ pub(crate) enum StoreKeyNormalization {
 /// リネームと mIV 内削除成功時 hard purge が共有する path-keyed SQLite 記述子。
 ///
 /// `unique` は rename の衝突処理にだけ使う。purge は全行を素の `DELETE` にする。
-/// `rename_generic=false` は raw `path` 列も同時更新する読書履歴だけで、rename 側は専用処理を
+/// `rename_generic=false` は raw `path` 列も同時更新する閲覧履歴だけで、rename 側は専用処理を
 /// 使うが purge 側は同じ記述子を使う。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StoreDescriptor {
@@ -346,7 +346,7 @@ pub fn run_at(data_dir: &Path, old_path: &Path, new_path: &Path) -> RenameMigrat
     // してはならない。専用 transaction で case-only rename も含めて追従させる。
     migrate_book_bookmarks(data_dir, old_path, new_path, &mut report);
 
-    // 5. 読書履歴 (exact のみ。raw path 列も更新する)。記述子自体は STORES にあり、
+    // 5. 閲覧履歴 (exact のみ。raw path 列も更新する)。記述子自体は STORES にあり、
     //    purge は exact + prefix で同じ行を削除する。
     if old_k != new_k {
         migrate_reading_history(data_dir, new_path, &old_k, &new_k, &mut report);
@@ -734,7 +734,7 @@ fn migrate_pdf_password(old_path: &Path, new_path: &Path, report: &mut RenameMig
     }
 }
 
-/// 読書履歴の exact 移行。key (正規化) と path (raw) の両方を新 path へ更新する。
+/// 閲覧履歴の exact 移行。key (正規化) と path (raw) の両方を新 path へ更新する。
 /// title は次回オープン時の upsert で自然に新名へ更新されるため触らない。
 fn migrate_reading_history(
     data_dir: &Path,
@@ -1658,7 +1658,7 @@ mod tests {
         assert!(again.errors.is_empty());
     }
 
-    /// 読書履歴は exact のみ: key と raw path が新 path へ更新される。
+    /// 閲覧履歴は exact のみ: key と raw path が新 path へ更新される。
     #[test]
     fn migrates_reading_history_exact() {
         let dir = tempfile::tempdir().unwrap();

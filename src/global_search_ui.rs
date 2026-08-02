@@ -2056,7 +2056,11 @@ impl App {
                 .copied()
                 .find(|&i| is_fullscreen_target(self.items.get(i)));
             if let Some(idx) = image_idx {
-                self.open_fullscreen_from_fs_navigation(ctx, idx);
+                self.open_fullscreen_from_fs_navigation(
+                    ctx,
+                    idx,
+                    crate::app::HistoryTrigger::UserChosen,
+                );
                 self.selected = Some(idx);
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();

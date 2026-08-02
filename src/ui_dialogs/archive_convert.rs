@@ -518,6 +518,7 @@ impl App {
         &mut self,
         restore_video_tile: bool,
         resume_slideshow: bool,
+        history_trigger: crate::app::HistoryTrigger,
     ) -> bool {
         let resume_to_last_page = self.settings.book_nav_resume.resumes();
         let Some(state) = self.archive_convert.as_mut() else {
@@ -529,6 +530,7 @@ impl App {
         state.deferred_fullscreen = Some(ArchiveConvertDeferredFullscreen {
             restore_video_tile,
             reopen: crate::app::DeferredFsReopen {
+                history_trigger,
                 resume_slideshow,
                 target: crate::app::DeferredFsTarget::None,
                 resume_to_last_page,
@@ -722,6 +724,7 @@ impl App {
                     ctx,
                     deferred.restore_video_tile,
                     deferred.reopen.resume_slideshow,
+                    deferred.reopen.history_trigger,
                 );
                 if reason == "enumerate_defer" {
                     ctx.request_repaint();
@@ -776,7 +779,7 @@ impl App {
                 // 元 (RAR/7z/LZH) のパスを退避してから load_folder (キャッシュ ZIP) を実行、
                 // その後 override に元パスを書き戻すことで、UI 表示は元ファイルの場所のままに保つ。
                 let src = self.archive_convert.as_ref().map(|s| s.src_path.clone());
-                // load_folder(cache_zip) で読書履歴の戻り先予約が落ちるので、元アーカイブと
+                // load_folder(cache_zip) で閲覧履歴の戻り先予約が落ちるので、元アーカイブと
                 // 一致していたかを退避し、override 復元と同じく後で書き戻す。
                 let restore_reading_history = match (&src, &self.reading_history_return_from) {
                     (Some(s), Some(from)) => crate::folder_tree::path_eq(from, s),
@@ -904,6 +907,7 @@ impl App {
                         ctx,
                         deferred.restore_video_tile,
                         deferred.reopen.resume_slideshow,
+                        deferred.reopen.history_trigger,
                     );
                     if reason == "enumerate_defer" {
                         ctx.request_repaint();

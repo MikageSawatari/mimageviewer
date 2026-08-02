@@ -2000,6 +2000,10 @@ pub(crate) enum SpreadPair {
     Double { left: usize, right: usize },
 }
 
+pub(crate) fn slideshow_history_trigger() -> crate::app::HistoryTrigger {
+    crate::app::HistoryTrigger::AutoAdvance
+}
+
 impl App {
     /// 分析モードを解除し、関連する状態をリセットする。
     pub(crate) fn reset_analysis_mode(&mut self) {
@@ -6982,7 +6986,7 @@ impl App {
         self.fs_vertical_scroll = 0.0;
         self.update_last_selected_image();
         self.record_book_resume(target_idx);
-        self.record_reading_history(target_idx);
+        self.record_reading_history(target_idx, crate::app::HistoryTrigger::UserChosen);
         ctx.request_repaint();
     }
 
@@ -9494,7 +9498,7 @@ impl App {
                                 self.schedule_next_slideshow_from_now();
                             } else if slideshow_was_playing && !self.slideshow_playing {
                                 self.slideshow_anchor_idx = None;
-                                self.slideshow_scroll_anim = None;
+                                self.continuous_reading_scroll_transition = None;
                                 self.slideshow_scroll_range_cache = None;
                             }
                             // ▦ タイルボタンが押されたら toggle_video_tile_mode に dispatch
@@ -10969,7 +10973,7 @@ impl App {
                 return;
             }
             let cursor_state = self.fullscreen_cursor_state();
-            self.open_fullscreen(new_idx);
+            self.open_fullscreen(new_idx, crate::app::HistoryTrigger::UserChosen);
             self.restore_fullscreen_cursor_state(ctx, cursor_state);
             self.selected = Some(new_idx);
         }
@@ -12953,7 +12957,7 @@ impl App {
             if self.slideshow_playing {
                 self.slideshow_playing = false;
                 self.slideshow_anchor_idx = None;
-                self.slideshow_scroll_anim = None;
+                self.continuous_reading_scroll_transition = None;
                 self.slideshow_scroll_range_cache = None;
             } else if matches!(
                 self.items.get(fs_idx),
@@ -12976,7 +12980,7 @@ impl App {
             if self.slideshow_playing {
                 self.slideshow_playing = false;
                 self.slideshow_anchor_idx = None;
-                self.slideshow_scroll_anim = None;
+                self.continuous_reading_scroll_transition = None;
                 self.slideshow_scroll_range_cache = None;
                 self.slideshow_popup_open = false;
             } else {
@@ -13052,7 +13056,11 @@ impl App {
             if page_up {
                 scroll_delta -= page_step;
             }
-            self.scroll_vertical_reading_by(ctx, scroll_delta);
+            self.scroll_vertical_reading_by(
+                ctx,
+                scroll_delta,
+                crate::app::HistoryTrigger::UserChosen,
+            );
         }
         let nav_next = if vertical_reading {
             (arrow_right && !horizontal_cursor_rtl) || (arrow_left && horizontal_cursor_rtl)
@@ -13778,7 +13786,7 @@ impl App {
                 // FOV 操作に振る。前後ナビは矢印キーで行う。
             } else if !ctrl_held && continuous_active {
                 let delta = self.continuous_reading_wheel_delta_px(ctx, wheel_y);
-                self.scroll_vertical_reading_by(ctx, delta);
+                self.scroll_vertical_reading_by(ctx, delta, crate::app::HistoryTrigger::UserChosen);
             } else {
                 if should_zoom_fullscreen_wheel(ctrl_held, self.is_overlay_edit_mode_active()) {
                     // 通常モード: Ctrl+ホイールでズーム。
@@ -13884,7 +13892,11 @@ impl App {
                     pointer_delta,
                     mods.ctrl,
                 );
-                self.scroll_vertical_reading_by(ctx, delta.scroll);
+                self.scroll_vertical_reading_by(
+                    ctx,
+                    delta.scroll,
+                    crate::app::HistoryTrigger::UserChosen,
+                );
                 if delta.pan != egui::Vec2::ZERO {
                     // 連結方向は fs_vertical_scroll が正本。未使用の主軸側 fs_pan を
                     // 汚さず、レイアウトが参照する直交成分だけを動かす。
@@ -14335,7 +14347,7 @@ impl App {
             crate::settings::SlideshowEndAction::Stop => {
                 self.slideshow_playing = false;
                 self.slideshow_anchor_idx = None;
-                self.slideshow_scroll_anim = None;
+                self.continuous_reading_scroll_transition = None;
                 self.slideshow_scroll_range_cache = None;
             }
             crate::settings::SlideshowEndAction::LoopFolder => {
@@ -14368,7 +14380,7 @@ impl App {
         } else {
             self.slideshow_playing = false;
             self.slideshow_anchor_idx = None;
-            self.slideshow_scroll_anim = None;
+            self.continuous_reading_scroll_transition = None;
             self.slideshow_scroll_range_cache = None;
         }
     }
@@ -14430,7 +14442,7 @@ impl App {
         };
         self.slideshow_playing = false;
         self.slideshow_anchor_idx = None;
-        self.slideshow_scroll_anim = None;
+        self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
         self.capture_fs_nav_holdover(fs_idx);
         self.start_folder_nav(folder, true, crate::app::FolderNavMode::SlideshowNext);
@@ -14482,7 +14494,7 @@ impl App {
         let now = std::time::Instant::now();
         self.slideshow_next_at = now + self.slideshow_current_wait_duration();
         self.slideshow_anchor_idx = self.fullscreen_idx;
-        self.slideshow_scroll_anim = None;
+        self.continuous_reading_scroll_transition = None;
     }
 
     fn current_slideshow_frame_ready(&self, fs_idx: usize, state: &FsFrameState) -> bool {
@@ -14527,7 +14539,12 @@ impl App {
         }
     }
 
-    pub(crate) fn open_fullscreen_from_fs_navigation(&mut self, ctx: &egui::Context, idx: usize) {
+    pub(crate) fn open_fullscreen_from_fs_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        history_trigger: crate::app::HistoryTrigger,
+    ) {
         #[cfg(windows)]
         if self.should_block_detached_independent_still_navigation_to_video(idx) {
             self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedVideoUnsupported, false);
@@ -14565,7 +14582,8 @@ impl App {
             && matches!(self.items.get(idx), Some(GridItem::Video(_)))
         {
             self.source_swap_keep_audio_mode = true;
-            let started = self.try_start_native_video_fast_swap(ctx, idx, Some(true), true);
+            let started =
+                self.try_start_native_video_fast_swap(ctx, idx, Some(true), true, history_trigger);
             self.source_swap_keep_audio_mode = false;
             if started {
                 return;
@@ -14578,7 +14596,7 @@ impl App {
                     "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
                 );
             }
-            self.open_fullscreen(idx);
+            self.open_fullscreen(idx, history_trigger);
             self.restore_fullscreen_cursor_state(ctx, cursor_state);
             return;
         }
@@ -14588,7 +14606,7 @@ impl App {
             return;
         }
         #[cfg(windows)]
-        if self.try_start_native_video_fast_swap(ctx, idx, None, false) {
+        if self.try_start_native_video_fast_swap(ctx, idx, None, false, history_trigger) {
             return;
         }
 
@@ -14610,7 +14628,7 @@ impl App {
                 "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
             );
         }
-        self.open_fullscreen(idx);
+        self.open_fullscreen(idx, history_trigger);
         // `open_fullscreen` resets cursor idleness for a new fullscreen entry.
         // Fullscreen-internal navigation should keep the mouse cursor state continuous;
         // keyboard page turns must not revive a hidden cursor, while pointer navigation
@@ -14636,7 +14654,7 @@ impl App {
     fn open_fullscreen_from_slideshow_navigation(&mut self, ctx: &egui::Context, idx: usize) {
         // Timer-driven slideshow advances are fullscreen-internal navigation too, so
         // use the same cursor-state carry path as keyboard/mouse page turns.
-        self.open_fullscreen_from_fs_navigation(ctx, idx);
+        self.open_fullscreen_from_fs_navigation(ctx, idx, slideshow_history_trigger());
     }
 
     pub(crate) fn fullscreen_boundary_jump_target(
@@ -14811,7 +14829,7 @@ impl App {
         // ここでは止まらない。
         self.slideshow_playing = false;
         self.slideshow_anchor_idx = None;
-        self.slideshow_scroll_anim = None;
+        self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
         // Cross-scope ナビ (Ctrl+↑↓: 通常のフォルダ移動、Favsearch、Ctrl+G drilled into) が
         // 始まる時点で、video swap 由来の deferred nav delta は別フォルダ / 別検索スコープ
@@ -14848,7 +14866,11 @@ impl App {
         if self.is_snapshot_active() {
             self.capture_fs_nav_holdover(fs_idx);
             let _ = self.snapshot_navigate(
-                ctx, forward, /*page_only=*/ false, /*resume_slideshow=*/ false,
+                ctx,
+                forward,
+                /*page_only=*/ false,
+                /*resume_slideshow=*/ false,
+                crate::app::HistoryTrigger::UserChosen,
             );
             return;
         }
@@ -14935,7 +14957,7 @@ impl App {
         }
         self.slideshow_playing = false;
         self.slideshow_anchor_idx = None;
-        self.slideshow_scroll_anim = None;
+        self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
         #[cfg(windows)]
         if self.detached_physical_folder_nav_available() {
@@ -14963,7 +14985,11 @@ impl App {
         if self.is_snapshot_active() {
             self.capture_fs_nav_holdover(fs_idx);
             let _ = self.snapshot_navigate(
-                ctx, forward, /*page_only=*/ true, /*resume_slideshow=*/ false,
+                ctx,
+                forward,
+                /*page_only=*/ true,
+                /*resume_slideshow=*/ false,
+                crate::app::HistoryTrigger::UserChosen,
             );
             let _ = native_toast;
             return;
@@ -15137,7 +15163,11 @@ impl App {
             // close (Esc) / close_to_page_list (BS) は終端アクション。閉じた後に同フレームの
             // wheel 由来のページ移動等で別項目を開き直さないようガードする。
             if let Some(new_idx) = jump_to {
-                self.open_fullscreen_from_fs_navigation(ctx, new_idx);
+                self.open_fullscreen_from_fs_navigation(
+                    ctx,
+                    new_idx,
+                    crate::app::HistoryTrigger::UserChosen,
+                );
             } else if let FsPageNav::Target(new_idx) = page_nav {
                 let display_order = self.current_grid_order().to_vec();
                 let current_is_media = matches!(
@@ -15158,7 +15188,11 @@ impl App {
                         );
                     }
                 } else {
-                    self.open_fullscreen_from_fs_navigation(ctx, new_idx);
+                    self.open_fullscreen_from_fs_navigation(
+                        ctx,
+                        new_idx,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
                 }
             } else if let FsPageNav::Boundary { at_end } = page_nav {
                 self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
@@ -15193,7 +15227,11 @@ impl App {
                     fs_idx,
                     nav_delta,
                 ) {
-                    self.open_fullscreen_from_fs_navigation(ctx, new_idx);
+                    self.open_fullscreen_from_fs_navigation(
+                        ctx,
+                        new_idx,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
                 } else {
                     // 境界到達: 中央にヒントを出す (nav_delta > 0 なら末尾)
                     self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
@@ -15531,15 +15569,21 @@ impl App {
         None
     }
 
-    pub(crate) fn scroll_vertical_reading_by(&mut self, ctx: &egui::Context, delta: f32) {
+    pub(crate) fn scroll_vertical_reading_by(
+        &mut self,
+        ctx: &egui::Context,
+        delta: f32,
+        history_trigger: crate::app::HistoryTrigger,
+    ) {
         if delta.abs() <= 0.5 {
             return;
         }
-        self.slideshow_scroll_anim = None;
+        self.continuous_reading_scroll_transition = Some(
+            crate::app::ContinuousReadingScrollTransition::AwaitingReanchor { history_trigger },
+        );
         self.fs_vertical_scroll += delta;
         ctx.request_repaint();
     }
-
     fn continuous_reading_viewport_len_for_flow(&self, ctx: &egui::Context) -> f32 {
         let viewport = ctx.content_rect();
         let viewport = self
@@ -15670,63 +15714,78 @@ impl App {
         let current = self.fs_vertical_scroll.clamp(min_scroll, max_scroll);
         self.fs_vertical_scroll = current;
 
-        if let Some(anim) = self.slideshow_scroll_anim {
-            let scroll_duration = anim
-                .end_at
-                .saturating_duration_since(anim.start_at)
-                .as_secs_f32()
-                .max(0.001);
-            let t = now.saturating_duration_since(anim.start_at).as_secs_f32() / scroll_duration;
-            if t >= 1.0 {
-                self.fs_vertical_scroll = anim.target_scroll.clamp(min_scroll, max_scroll);
-                self.slideshow_scroll_anim = None;
-                self.slideshow_next_at = now + self.slideshow_continuous_wait_duration();
-                if crate::perf::is_enabled() {
-                    crate::perf::event(
-                        "slideshow",
-                        "continuous_scroll_end",
-                        None,
-                        self.input_seq,
-                        &[
-                            ("idx", serde_json::Value::from(fs_idx as u64)),
-                            (
-                                "scroll",
-                                serde_json::Value::from(self.fs_vertical_scroll as f64),
-                            ),
-                            ("max", serde_json::Value::from(max_scroll as f64)),
-                        ],
-                    );
+        if let Some(transition) = self.continuous_reading_scroll_transition {
+            match transition {
+                crate::app::ContinuousReadingScrollTransition::Animating {
+                    start_at,
+                    end_at,
+                    start_scroll,
+                    target_scroll,
+                    history_trigger,
+                } => {
+                    let scroll_duration = end_at
+                        .saturating_duration_since(start_at)
+                        .as_secs_f32()
+                        .max(0.001);
+                    let t = now.saturating_duration_since(start_at).as_secs_f32() / scroll_duration;
+                    if t >= 1.0 {
+                        self.fs_vertical_scroll = target_scroll.clamp(min_scroll, max_scroll);
+                        self.continuous_reading_scroll_transition = Some(
+                            crate::app::ContinuousReadingScrollTransition::AwaitingReanchor {
+                                history_trigger,
+                            },
+                        );
+                        self.slideshow_next_at = now + self.slideshow_continuous_wait_duration();
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "slideshow",
+                                "continuous_scroll_end",
+                                None,
+                                self.input_seq,
+                                &[
+                                    ("idx", serde_json::Value::from(fs_idx as u64)),
+                                    (
+                                        "scroll",
+                                        serde_json::Value::from(self.fs_vertical_scroll as f64),
+                                    ),
+                                    ("max", serde_json::Value::from(max_scroll as f64)),
+                                ],
+                            );
+                        }
+                        ctx.request_repaint_after(
+                            self.slideshow_continuous_wait_duration()
+                                .min(std::time::Duration::from_millis(100)),
+                        );
+                    } else {
+                        let t = t.clamp(0.0, 1.0);
+                        let eased = t * t * (3.0 - 2.0 * t);
+                        self.fs_vertical_scroll =
+                            start_scroll + (target_scroll - start_scroll) * eased;
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "slideshow",
+                                "continuous_scroll_step",
+                                None,
+                                self.input_seq,
+                                &[
+                                    ("idx", serde_json::Value::from(fs_idx as u64)),
+                                    ("t", serde_json::Value::from(t as f64)),
+                                    (
+                                        "scroll",
+                                        serde_json::Value::from(self.fs_vertical_scroll as f64),
+                                    ),
+                                ],
+                            );
+                        }
+                        ctx.request_repaint();
+                    }
+                    return true;
                 }
-                ctx.request_repaint_after(
-                    self.slideshow_continuous_wait_duration()
-                        .min(std::time::Duration::from_millis(100)),
-                );
-            } else {
-                let t = t.clamp(0.0, 1.0);
-                let eased = t * t * (3.0 - 2.0 * t);
-                self.fs_vertical_scroll =
-                    anim.start_scroll + (anim.target_scroll - anim.start_scroll) * eased;
-                if crate::perf::is_enabled() {
-                    crate::perf::event(
-                        "slideshow",
-                        "continuous_scroll_step",
-                        None,
-                        self.input_seq,
-                        &[
-                            ("idx", serde_json::Value::from(fs_idx as u64)),
-                            ("t", serde_json::Value::from(t as f64)),
-                            (
-                                "scroll",
-                                serde_json::Value::from(self.fs_vertical_scroll as f64),
-                            ),
-                        ],
-                    );
+                crate::app::ContinuousReadingScrollTransition::AwaitingReanchor { .. } => {
+                    return true;
                 }
-                ctx.request_repaint();
             }
-            return true;
         }
-
         if now < self.slideshow_next_at {
             let remaining = self.slideshow_next_at.saturating_duration_since(now);
             ctx.request_repaint_after(remaining.min(std::time::Duration::from_millis(100)));
@@ -15743,6 +15802,11 @@ impl App {
         let duration = self.slideshow_continuous_scroll_duration();
         if duration.is_zero() {
             self.fs_vertical_scroll = target;
+            self.continuous_reading_scroll_transition = Some(
+                crate::app::ContinuousReadingScrollTransition::AwaitingReanchor {
+                    history_trigger: slideshow_history_trigger(),
+                },
+            );
             self.slideshow_next_at = now + self.slideshow_continuous_wait_duration();
             ctx.request_repaint_after(
                 self.slideshow_continuous_wait_duration()
@@ -15751,12 +15815,14 @@ impl App {
             return true;
         }
 
-        self.slideshow_scroll_anim = Some(crate::app::SlideshowContinuousScrollAnim {
-            start_at: now,
-            end_at: now + duration,
-            start_scroll: current,
-            target_scroll: target,
-        });
+        self.continuous_reading_scroll_transition =
+            Some(crate::app::ContinuousReadingScrollTransition::Animating {
+                start_at: now,
+                end_at: now + duration,
+                start_scroll: current,
+                target_scroll: target,
+                history_trigger: slideshow_history_trigger(),
+            });
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "slideshow",
@@ -15779,8 +15845,17 @@ impl App {
         true
     }
 
-    pub(crate) fn scroll_vertical_reading_step(&mut self, ctx: &egui::Context, direction: f32) {
-        self.scroll_vertical_reading_by(ctx, direction * self.continuous_reading_key_step_px(ctx));
+    pub(crate) fn scroll_vertical_reading_step(
+        &mut self,
+        ctx: &egui::Context,
+        direction: f32,
+        history_trigger: crate::app::HistoryTrigger,
+    ) {
+        self.scroll_vertical_reading_by(
+            ctx,
+            direction * self.continuous_reading_key_step_px(ctx),
+            history_trigger,
+        );
     }
 
     pub(crate) fn persist_current_spread_mode(&self) {
@@ -15825,7 +15900,11 @@ impl App {
         // 表示トリムは全ユニットの寸法を変え得る。current unit をスクロール原点へ
         // 戻すことで、次フレームの再レイアウトでも編集対象ページを画面内に保つ。
         self.fs_vertical_scroll = 0.0;
-        self.slideshow_scroll_anim = None;
+        self.continuous_reading_scroll_transition = Some(
+            crate::app::ContinuousReadingScrollTransition::AwaitingReanchor {
+                history_trigger: crate::app::HistoryTrigger::UserChosen,
+            },
+        );
         self.slideshow_scroll_range_cache = None;
     }
 
@@ -16878,6 +16957,7 @@ impl App {
         old_offsets: &[f32],
         new_pos: usize,
         new_idx: usize,
+        history_trigger: crate::app::HistoryTrigger,
     ) {
         if self.items.get(new_idx).is_none() {
             return;
@@ -16892,7 +16972,7 @@ impl App {
         self.fullscreen_idx = Some(new_idx);
         self.sync_main_selection_from_viewer_idx(new_idx);
         self.record_book_resume(new_idx);
-        self.record_reading_history(new_idx);
+        self.record_reading_history(new_idx, history_trigger);
         self.slideshow_scroll_range_cache = None;
         ctx.request_repaint();
     }
@@ -17089,19 +17169,35 @@ impl App {
                 self.fullscreen_page_layout.push(transform);
             }
         }
-        // スライドショーの短時間スクロール中に current_pos を張り替えると、
-        // アニメーションの start/target が旧 offset 基準のまま残り、見た目の移動量が
-        // 不揃いになる。再アンカーはスクロール完了後のフレームで行う。
-        if self.slideshow_scroll_anim.is_none()
+        // 自動 / 手動の起点は scroll transition が所有し、再アンカーの記録地点まで
+        // HistoryTrigger を値として渡す。スライドショーの現在状態からは推測しない。
+        let reanchor_trigger = match self.continuous_reading_scroll_transition {
+            Some(transition) => {
+                let history_trigger = transition.history_trigger_for_reanchor();
+                if history_trigger.is_some() {
+                    self.continuous_reading_scroll_transition = None;
+                }
+                history_trigger
+            }
+            // transition を伴わない再アンカーは viewport resize / layout clamp の正規化。
+            // timed auto advance は必ず上の typed transition を経由する。
+            None => Some(crate::app::HistoryTrigger::UserChosen),
+        };
+        if let Some(history_trigger) = reanchor_trigger
             && let Some(new_pos) =
                 vertical_reading_nearest_position(&offsets, self.fs_vertical_scroll)
             && new_pos != current_pos
             && let Some(unit) = units.get(new_pos)
         {
             let new_idx = unit.anchor_idx;
-            self.reanchor_continuous_reading_viewer(ctx, &offsets, new_pos, new_idx);
+            self.reanchor_continuous_reading_viewer(
+                ctx,
+                &offsets,
+                new_pos,
+                new_idx,
+                history_trigger,
+            );
         }
-
         if continuous_reading_needs_repaint(
             any_raw_work_pending,
             has_deferred_processed,
@@ -17471,6 +17567,7 @@ impl App {
             current_rgba: Arc::clone(&pair.current_rgba),
             mode,
             wipe_fraction,
+            mipmap_sampling_enabled: self.settings.image_mipmap_moire_reduction_enabled,
             lod_bias: self.settings.image_mipmap_lod_bias,
             target_format,
         };
@@ -17655,6 +17752,7 @@ impl App {
             fov_y: pano.fov_y,
             aspect,
             uv_transform,
+            mipmap_sampling_enabled: self.settings.image_mipmap_moire_reduction_enabled,
             lod_bias: self.settings.image_mipmap_lod_bias,
             target_format,
         };

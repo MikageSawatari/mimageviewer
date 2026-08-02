@@ -240,7 +240,7 @@ impl App {
 
     /// 「今いるコンテナ」(current_folder = 実フォルダ / ZIP / PDF) にタグをトグルする。
     /// ツールバーのピンタグ Shift+右クリック用 (toolbar-customization-plan.md §1.1)。
-    /// 合成ビュー (検索 / タグビュー / 読書履歴) は対象コンテナが無いので no-op + 通知。
+    /// 合成ビュー (検索 / タグビュー / 閲覧履歴) は対象コンテナが無いので no-op + 通知。
     pub(crate) fn request_tag_toggle_for_current_container(&mut self, name: &str) {
         // ツールバーのピンタグ専用 (= グリッド面固定)。
         let surface = crate::app::ActionSurface::MainWindow;
@@ -251,7 +251,7 @@ impl App {
         // 合成ビューでは実コンテナが無いので no-op + 通知。判定は経路ごとに異なる:
         //   - Ctrl+G グローバル検索: current_folder は検索前の実フォルダのまま + global_search.active
         //     (擬似パスにならないのでフラグで判定 — これを落として実害が出た)。
-        //   - Ctrl+S お気に入り検索 / 読書履歴: current_folder が擬似パスになるのでパス一致で判定。
+        //   - Ctrl+S お気に入り検索 / 閲覧履歴: current_folder が擬似パスになるのでパス一致で判定。
         //   - タグビュー / ドライブ一覧: 専用フラグ。
         if self.global_search.active
             || crate::app::is_synthetic_view_path(&folder)
