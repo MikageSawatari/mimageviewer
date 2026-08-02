@@ -414,10 +414,6 @@ impl CfrTimelineFrameIndex {
     pub(crate) fn value(self) -> u64 {
         self.0
     }
-
-    fn is_segment_boundary(self, keyint_frames: u32) -> bool {
-        self.0 % u64::from(keyint_frames) == 0
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -456,6 +452,8 @@ pub(crate) struct Fmp4Segmenter {
     audio_source_time_base: ffmpeg::ffi::AVRational,
     audio_stream_time_base: ffmpeg::ffi::AVRational,
     keyint_frames: u32,
+    initial_segment_frames: u32,
+    next_forced_boundary_frame: u64,
     fragment: FragmentState,
     last_video_pts: Option<i64>,
     last_video_dts: Option<i64>,
@@ -615,6 +613,8 @@ impl Fmp4Segmenter {
             audio_source_time_base,
             audio_stream_time_base,
             keyint_frames: frame_rate.keyint_frames(),
+            initial_segment_frames: frame_rate.initial_segment_frames(),
+            next_forced_boundary_frame: u64::from(frame_rate.initial_segment_frames()),
             fragment: FragmentState::Empty,
             last_video_pts: None,
             last_video_dts: None,
@@ -703,8 +703,9 @@ impl Fmp4Segmenter {
         .max(0.0)
     }
 
-    /// CFR source timeline 上の 2 秒境界だけを I frame 指定する。encoder 側の
-    /// forced-IDR 設定と合わせ、各 fragment の先頭 packet を IDR にする。
+    /// CFR source timeline 上で、先頭 frame、初回短縮境界、その後の 2 秒境界を
+    /// I frame 指定する。encoder 側の forced-IDR 設定と合わせ、各 fragment の先頭
+    /// packet を IDR にする。
     ///
     /// `timeline_frame_index` は submitted frame の連番ではない。tap や encoder が frame を
     /// 落としても timeline 上の位置は詰めず、次の 2 秒境界を同じ source 時刻に保つ。
@@ -713,7 +714,21 @@ impl Fmp4Segmenter {
         timeline_frame_index: CfrTimelineFrameIndex,
         frame: &mut ffmpeg::util::frame::video::Video,
     ) -> bool {
-        let boundary = timeline_frame_index.is_segment_boundary(self.keyint_frames);
+        let frame_index = timeline_frame_index.value();
+        let keyint = u64::from(self.keyint_frames);
+        let initial = u64::from(self.initial_segment_frames);
+        // Before the first fragment actually closes, request both candidate grids. The
+        // initial-offset grid produces 0.5s + 2s segments when the accelerated IDR is honored;
+        // the original grid guarantees a two-second fallback when it is ignored. Once the first
+        // close is observed, `flush_current_segment` rebases the sole next boundary to the actual
+        // IDR, so normal operation does not keep injecting the fallback IDRs.
+        let awaiting_first_close = self.ring.is_empty();
+        let initial_offset_boundary =
+            frame_index >= initial && frame_index.saturating_sub(initial) % keyint == 0;
+        let original_boundary = frame_index % keyint == 0;
+        let boundary = frame_index == 0
+            || frame_index == self.next_forced_boundary_frame
+            || (awaiting_first_close && (initial_offset_boundary || original_boundary));
         frame.set_kind(if boundary {
             ffmpeg::picture::Type::I
         } else {
@@ -856,7 +871,12 @@ impl Fmp4Segmenter {
         };
         let mut completed = None;
         if let FragmentState::Writing { start_dts, end_dts } = self.fragment {
-            let boundary_dts = start_dts.saturating_add(i64::from(self.keyint_frames));
+            let target_frames = if self.ring.is_empty() {
+                self.initial_segment_frames
+            } else {
+                self.keyint_frames
+            };
+            let boundary_dts = start_dts.saturating_add(i64::from(target_frames));
             if dts >= boundary_dts {
                 if packet_is_idr()? {
                     if dts > boundary_dts {
@@ -928,6 +948,22 @@ impl Fmp4Segmenter {
         self.stats.delayed_idr_boundaries = self.stats.delayed_idr_boundaries.saturating_add(1);
         crate::logger::log(format!(
             "remote-stream fMP4 boundary delayed: nominal_dts={nominal_boundary_dts} observed_dts={observed_dts} delayed_idr_boundaries={}",
+            self.stats.delayed_idr_boundaries
+        ));
+    }
+
+    fn log_initial_segment_duration(&self, duration_secs: f64) {
+        let tick_secs =
+            f64::from(self.video_source_time_base.num) / f64::from(self.video_source_time_base.den);
+        let target_secs = f64::from(self.initial_segment_frames) * tick_secs;
+        let normal_secs = f64::from(self.keyint_frames) * tick_secs;
+        self.write_initial_segment_log(target_secs, normal_secs, duration_secs);
+    }
+
+    fn write_initial_segment_log(&self, target: f64, normal: f64, actual: f64) {
+        let shortened = actual < normal;
+        crate::logger::log(format!(
+            "remote-stream initial segment: target={target:.6}s actual={actual:.6}s shortened={shortened} delayed_idr={}",
             self.stats.delayed_idr_boundaries
         ));
     }
@@ -1014,6 +1050,14 @@ impl Fmp4Segmenter {
             .ring
             .push(duration_secs, bytes)
             .map_err(Fmp4SegmenterError::new)?;
+        if let Some(boundary_dts) = boundary_dts {
+            self.next_forced_boundary_frame = u64::try_from(boundary_dts)
+                .unwrap_or(0)
+                .saturating_add(u64::from(self.keyint_frames));
+        }
+        if sequence == 0 {
+            self.log_initial_segment_duration(duration_secs);
+        }
         if let Some(init) = completed_init {
             self.init_segment = InitSegmentState::Ready(init);
         }
@@ -1358,7 +1402,7 @@ mod tests {
         let audio = open_test_audio(output.audio_bitrate_bps);
         let mut segmenter =
             Fmp4Segmenter::with_capacity(&opened.encoder, &audio.encoder, frame_rate, 4).unwrap();
-        let missing_boundary_dts = i64::from(frame_rate.keyint_frames());
+        let missing_boundary_dts = i64::from(frame_rate.initial_segment_frames());
         let mut dropped_boundary_idr = false;
         let mut drop_first_boundary_idr = |packet: &ffmpeg::Packet| {
             if packet.dts() != Some(missing_boundary_dts) {
@@ -1403,18 +1447,18 @@ mod tests {
             panic!("final segment is absent");
         };
         completed.push((final_sequence, final_segment.bytes.clone()));
-        assert_eq!(completed.len(), 2);
+        assert_eq!(completed.len(), 3);
         assert_eq!(segmenter.stats().delayed_idr_boundaries, 1);
 
         let SegmentLookup::Found(extended) = segmenter.segment(0) else {
             panic!("extended segment is absent");
         };
-        assert!((extended.duration_secs - 4.0).abs() < 1e-6);
+        assert!((extended.duration_secs - 2.0).abs() < 1e-6);
         let playlist = segmenter
             .media_playlist()
             .expect("playlist is ready with the completed init segment");
-        assert!(playlist.contains("#EXT-X-TARGETDURATION:4\n"));
-        assert!(playlist.contains("#EXTINF:4.000000,\n0.m4s\n"));
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:2\n"));
+        assert!(playlist.contains("#EXTINF:2.000000,\n0.m4s\n"));
 
         let SegmentLookup::Found(after_gap) = segmenter.segment(1) else {
             panic!("segment after the missing boundary is absent");
@@ -1427,11 +1471,11 @@ mod tests {
         );
         assert!(probe.packets[0].key);
         assert!(probe.packets[0].idr);
-        assert!((probe.packets[0].dts_secs - 4.0).abs() < 1e-6);
+        assert!((probe.packets[0].dts_secs - 2.0).abs() < 1e-6);
     }
 
     #[test]
-    fn openh264_fmp4_segments_round_trip_in_process() {
+    fn first_segment_is_short_then_normal_segments_return_to_two_seconds() {
         let frame_rate = FrameRate::new(30, 1).unwrap();
         let output = StreamOutputParameters {
             dimensions: OutputDimensions {
@@ -1450,7 +1494,7 @@ mod tests {
         assert_eq!(opened.input_format, H264InputFormat::Yuv420p);
         let audio = open_test_audio(output.audio_bitrate_bps);
         let mut segmenter =
-            Fmp4Segmenter::with_capacity(&opened.encoder, &audio.encoder, frame_rate, 2).unwrap();
+            Fmp4Segmenter::with_capacity(&opened.encoder, &audio.encoder, frame_rate, 5).unwrap();
         assert!(segmenter.codecs().starts_with("avc1.42c0"));
         assert!(segmenter.codecs().ends_with(",mp4a.40.2"));
         assert!(segmenter.init_segment().is_none());
@@ -1470,7 +1514,7 @@ mod tests {
             assert_eq!(
                 segmenter
                     .prepare_video_frame(CfrTimelineFrameIndex::new(u64::from(index)), &mut frame),
-                index % frame_rate.keyint_frames() == 0
+                matches!(index, 0 | 15 | 75 | 135)
             );
             opened.encoder.send_frame(&frame).unwrap();
             drain_encoder(&mut opened.encoder, &mut segmenter, &mut completed);
@@ -1482,15 +1526,14 @@ mod tests {
             panic!("final segment is absent");
         };
         completed.push((final_sequence, final_segment.bytes.clone()));
-        assert_eq!(completed.len(), 3);
-        assert_eq!(segmenter.media_sequence(), 1);
-        assert_eq!(segmenter.next_sequence(), 3);
-        assert_eq!(segmenter.segment(0), SegmentLookup::Gone);
+        assert_eq!(completed.len(), 4);
+        assert_eq!(segmenter.media_sequence(), 0);
+        assert_eq!(segmenter.next_sequence(), 4);
         assert!(
             segmenter
                 .media_playlist()
                 .expect("media playlist is ready after the first segment")
-                .contains("#EXT-X-MEDIA-SEQUENCE:1\n")
+                .contains("#EXT-X-MEDIA-SEQUENCE:0\n")
         );
         let master = segmenter
             .master_playlist()
@@ -1501,18 +1544,28 @@ mod tests {
             .init_segment()
             .expect("init is ready after the first media segment");
         assert!(has_top_level_boxes(init, &[*b"ftyp", *b"moov"]));
+        let playlist = segmenter.media_playlist().unwrap();
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:2\n"));
+        assert!(playlist.contains("#EXTINF:0.500000,\n0.m4s\n"));
+        assert!(playlist.contains("#EXTINF:2.000000,\n1.m4s\n"));
+        assert!(playlist.contains("#EXTINF:2.000000,\n2.m4s\n"));
 
         let mut all_packets = Vec::new();
+        let expected_packet_counts = [15, 60, 60, 45];
+        let expected_starts = [0.0, 0.5, 2.5, 4.5];
         for (expected_sequence, (sequence, bytes)) in completed.iter().enumerate() {
             assert_eq!(*sequence, expected_sequence as u64);
             assert!(has_top_level_boxes(bytes, &[*b"moof", *b"mdat"]));
             let probe = read_with_ffmpeg(init, bytes);
             assert!(segmenter.codecs().starts_with(&probe.video_codecs));
             assert_eq!(probe.audio_codecs, "mp4a.40.2");
-            assert_eq!(probe.packets.len(), frame_rate.keyint_frames() as usize);
+            assert_eq!(
+                probe.packets.len(),
+                expected_packet_counts[expected_sequence]
+            );
             assert!(probe.packets[0].key);
             assert!(probe.packets[0].idr);
-            let expected_start = expected_sequence as f64 * 2.0;
+            let expected_start = expected_starts[expected_sequence];
             assert!((probe.packets[0].dts_secs - expected_start).abs() < 1e-6);
             all_packets.extend(probe.packets);
         }
@@ -1639,7 +1692,7 @@ mod tests {
             }
         }
         completed.push(segmenter.finish().unwrap().unwrap());
-        assert_eq!(completed, vec![0, 1]);
+        assert_eq!(completed, vec![0, 1, 2]);
         let mut observed_audio_pts = Vec::new();
         let mut first_video_dts_secs = None;
         for sequence in completed {

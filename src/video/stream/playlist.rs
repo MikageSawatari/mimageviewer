@@ -69,6 +69,10 @@ impl SegmentRing {
             .map_or(self.next_sequence, |segment| segment.sequence)
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
     #[cfg(test)]
     pub(crate) fn next_sequence(&self) -> u64 {
         self.next_sequence
@@ -220,6 +224,18 @@ mod tests {
         assert!(playlist.contains("#EXTINF:2.000000,\n0.m4s\n"));
         assert!(!playlist.contains("#EXT-X-PLAYLIST-TYPE"));
         assert!(!playlist.contains("#EXT-X-ENDLIST"));
+    }
+
+    #[test]
+    fn playlist_uses_measured_extinf_and_target_duration_covers_the_longest_segment() {
+        let mut ring = SegmentRing::new(DEFAULT_SEGMENT_CAPACITY).unwrap();
+        ring.push(0.5, vec![1]).unwrap();
+        ring.push(2.002, vec![2]).unwrap();
+
+        let playlist = ring.media_playlist();
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:3\n"));
+        assert!(playlist.contains("#EXTINF:0.500000,\n0.m4s\n"));
+        assert!(playlist.contains("#EXTINF:2.002000,\n1.m4s\n"));
     }
 
     #[test]
