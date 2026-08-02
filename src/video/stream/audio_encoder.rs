@@ -5,7 +5,7 @@ use ffmpeg::util::frame::audio::Audio as AudioFrame;
 use ffmpeg_the_third as ffmpeg;
 
 use super::encoder::{AUDIO_ENCODER_NAME, AUDIO_PROFILE, AUDIO_PROFILE_ID};
-use super::timeline::{StreamTimeline, StreamTimelineError};
+use super::timeline::{STREAM_TIMELINE_EPSILON_SECS, StreamTimeline, StreamTimelineError};
 use crate::video::audio::ProcessedChunk;
 
 const CHANNELS: usize = 2;
@@ -40,6 +40,8 @@ impl From<StreamTimelineError> for AacEncoderError {
 pub(crate) struct AacEncoderStats {
     pub(crate) stale_seek_chunks: u64,
     pub(crate) rejected_speed_chunks: u64,
+    pub(crate) pre_session_dropped_chunks: u64,
+    pub(crate) pre_session_trimmed_samples_per_channel: u64,
     pub(crate) input_samples_per_channel: u64,
     pub(crate) output_samples_per_channel: u64,
     pub(crate) encoded_frames: u64,
@@ -251,7 +253,7 @@ impl OpenedAacEncoder {
     /// seek 世代違いは明示的に捨て、非等速は歪んだ音を送らないため error にする。
     pub(crate) fn push_chunk(
         &mut self,
-        chunk: ProcessedChunk,
+        mut chunk: ProcessedChunk,
     ) -> Result<Vec<ffmpeg::Packet>, AacEncoderError> {
         if self.finished {
             return Err(AacEncoderError::new(
@@ -283,14 +285,39 @@ impl OpenedAacEncoder {
         {
             return Err(AacEncoderError::new("processed audio metadata is invalid"));
         }
-        let input_samples = chunk.samples.len() / CHANNELS;
-        let measured_duration = input_samples as f64 / f64::from(self.input_sample_rate);
+        let input_samples_before_alignment = chunk.samples.len() / CHANNELS;
+        let measured_duration =
+            input_samples_before_alignment as f64 / f64::from(self.input_sample_rate);
         if (measured_duration - chunk.duration_secs).abs() > 1.5 / f64::from(self.input_sample_rate)
         {
             return Err(AacEncoderError::new(
                 "processed audio duration does not match its sample count",
             ));
         }
+        if self.expected_next_source_pts_secs.is_none() {
+            match align_initial_chunk_to_session_start(
+                chunk,
+                self.timeline,
+                self.input_sample_rate,
+            )? {
+                InitialChunkAlignment::Drop => {
+                    self.stats.pre_session_dropped_chunks =
+                        self.stats.pre_session_dropped_chunks.saturating_add(1);
+                    return Ok(Vec::new());
+                }
+                InitialChunkAlignment::Keep {
+                    chunk: aligned,
+                    trimmed_samples_per_channel,
+                } => {
+                    chunk = aligned;
+                    self.stats.pre_session_trimmed_samples_per_channel = self
+                        .stats
+                        .pre_session_trimmed_samples_per_channel
+                        .saturating_add(trimmed_samples_per_channel as u64);
+                }
+            }
+        }
+        let input_samples = chunk.samples.len() / CHANNELS;
         if let Some(expected) = self.expected_next_source_pts_secs {
             let tolerance = 1.5 / f64::from(self.input_sample_rate);
             if (chunk.audible_pts_secs - expected).abs() > tolerance {
@@ -357,6 +384,77 @@ impl OpenedAacEncoder {
         }
         Ok(packets)
     }
+}
+
+enum InitialChunkAlignment {
+    Drop,
+    Keep {
+        chunk: ProcessedChunk,
+        trimmed_samples_per_channel: usize,
+    },
+}
+
+/// Align only the initial current-generation audio interval to the streaming session origin.
+///
+/// `StreamTimeline` deliberately rejects timestamps before its origin. Audio is different from a
+/// point timestamp because a `ProcessedChunk` covers a sample interval: complete pre-origin
+/// intervals are discarded, while an interval crossing the origin loses only its leading samples.
+/// The retained first sample keeps its real source PTS, so audio and video still use the same
+/// timeline instead of independently clamping timestamps to zero.
+fn align_initial_chunk_to_session_start(
+    mut chunk: ProcessedChunk,
+    timeline: StreamTimeline,
+    input_sample_rate: u32,
+) -> Result<InitialChunkAlignment, AacEncoderError> {
+    if input_sample_rate == 0 {
+        return Err(AacEncoderError::new(
+            "AAC input sample rate must be non-zero",
+        ));
+    }
+    let source_start_secs = timeline.source_start_secs();
+    if chunk.audible_pts_secs >= source_start_secs - STREAM_TIMELINE_EPSILON_SECS {
+        return Ok(InitialChunkAlignment::Keep {
+            chunk,
+            trimmed_samples_per_channel: 0,
+        });
+    }
+
+    let samples_per_channel = chunk.samples.len() / CHANNELS;
+    let source_secs_per_sample = chunk.source_secs_per_output_sec / f64::from(input_sample_rate);
+    let chunk_source_end_secs =
+        chunk.audible_pts_secs + samples_per_channel as f64 * source_secs_per_sample;
+    if chunk_source_end_secs <= source_start_secs {
+        return Ok(InitialChunkAlignment::Drop);
+    }
+
+    let source_secs_to_trim =
+        (source_start_secs - chunk.audible_pts_secs - STREAM_TIMELINE_EPSILON_SECS).max(0.0);
+    let mut trim_samples_per_channel =
+        (source_secs_to_trim / source_secs_per_sample).ceil() as usize;
+    trim_samples_per_channel = trim_samples_per_channel.min(samples_per_channel);
+    let mut new_audible_pts_secs =
+        chunk.audible_pts_secs + trim_samples_per_channel as f64 * source_secs_per_sample;
+    if new_audible_pts_secs < source_start_secs - STREAM_TIMELINE_EPSILON_SECS
+        && trim_samples_per_channel < samples_per_channel
+    {
+        trim_samples_per_channel += 1;
+        new_audible_pts_secs += source_secs_per_sample;
+    }
+    if trim_samples_per_channel >= samples_per_channel {
+        return Ok(InitialChunkAlignment::Drop);
+    }
+
+    chunk.samples.drain(..trim_samples_per_channel * CHANNELS);
+    chunk.audible_pts_secs = new_audible_pts_secs;
+    chunk.duration_secs =
+        (samples_per_channel - trim_samples_per_channel) as f64 / f64::from(input_sample_rate);
+    // This is an invariant check, not a clamp. A retained sample must be accepted by the same
+    // mapping that the video encoder uses.
+    timeline.relative_secs(chunk.audible_pts_secs)?;
+    Ok(InitialChunkAlignment::Keep {
+        chunk,
+        trimmed_samples_per_channel: trim_samples_per_channel,
+    })
 }
 
 fn deinterleave(samples: &[f32]) -> (Vec<f32>, Vec<f32>) {
@@ -510,6 +608,8 @@ fn drain_aac_packets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::video::stream::encoder::FrameRate;
+    use crate::video::stream::video_tap::cfr_timeline_frame_index;
 
     fn chunk(
         samples_per_channel: usize,
@@ -600,6 +700,69 @@ mod tests {
         assert!(encoder.assembler.is_none());
         assert_eq!(encoder.stats().stale_seek_chunks, 1);
         assert_eq!(encoder.stats().input_samples_per_channel, 0);
+    }
+
+    #[test]
+    fn resume_start_with_audio_latency_does_not_reject_pre_session_chunks() {
+        const SAMPLE_RATE: u32 = 48_000;
+        const CHUNK_SAMPLES: usize = 1_024;
+        const LATENCY_SAMPLES: usize = 3_371;
+        let source_start_secs = 67.267_2;
+        let latency_secs = LATENCY_SAMPLES as f64 / f64::from(SAMPLE_RATE);
+        let first_audible_pts_secs = source_start_secs - latency_secs;
+        let timeline = StreamTimeline::new(source_start_secs).unwrap();
+        let mut encoder = open_aac_encoder(SAMPLE_RATE, 96_000, 1, timeline).unwrap();
+
+        for index in 0..5 {
+            let pts =
+                first_audible_pts_secs + (index * CHUNK_SAMPLES) as f64 / f64::from(SAMPLE_RATE);
+            let mut input = chunk(CHUNK_SAMPLES, SAMPLE_RATE, pts, 1);
+            input.pdc_latency_secs_at_process = latency_secs;
+            encoder.push_chunk(input).unwrap();
+        }
+
+        let stats = encoder.stats();
+        assert_eq!(stats.pre_session_dropped_chunks, 3);
+        assert_eq!(
+            stats.pre_session_trimmed_samples_per_channel,
+            (LATENCY_SAMPLES - 3 * CHUNK_SAMPLES) as u64
+        );
+        assert_eq!(
+            stats.input_samples_per_channel,
+            (5 * CHUNK_SAMPLES - LATENCY_SAMPLES) as u64
+        );
+        assert!(encoder.assembler.is_some());
+    }
+
+    #[test]
+    fn latency_trimmed_audio_and_video_share_the_session_origin() {
+        const SAMPLE_RATE: u32 = 48_000;
+        const LATENCY_SAMPLES: usize = 3_371;
+        let source_start_secs = 67.267_2;
+        let latency_secs = LATENCY_SAMPLES as f64 / f64::from(SAMPLE_RATE);
+        let timeline = StreamTimeline::new(source_start_secs).unwrap();
+        let mut input = chunk(4_096, SAMPLE_RATE, source_start_secs - latency_secs, 1);
+        input.pdc_latency_secs_at_process = latency_secs;
+
+        let InitialChunkAlignment::Keep {
+            chunk: aligned,
+            trimmed_samples_per_channel,
+        } = align_initial_chunk_to_session_start(input, timeline, SAMPLE_RATE).unwrap()
+        else {
+            panic!("chunk crossing the session origin was dropped");
+        };
+
+        assert_eq!(trimmed_samples_per_channel, LATENCY_SAMPLES);
+        assert!((aligned.audible_pts_secs - source_start_secs).abs() <= 1.0e-9);
+        let audio_start_ticks = timeline
+            .relative_ticks(aligned.audible_pts_secs, SAMPLE_RATE)
+            .unwrap();
+        let video_start_slot =
+            cfr_timeline_frame_index(timeline, source_start_secs, FrameRate::new(30, 1).unwrap())
+                .unwrap()
+                .value();
+        assert_eq!(audio_start_ticks, 0);
+        assert_eq!(video_start_slot, 0);
     }
 
     #[test]

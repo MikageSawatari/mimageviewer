@@ -1,5 +1,7 @@
 use std::fmt;
 
+pub(crate) const STREAM_TIMELINE_EPSILON_SECS: f64 = 1.0e-9;
+
 /// 音声・映像が共有する source timeline → streaming session timeline の写像。
 /// session start の source PTS を唯一の原点とし、両 stream を同じ 0 起点へ移す。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -15,13 +17,21 @@ impl StreamTimeline {
         Ok(Self { source_start_secs })
     }
 
+    pub(crate) fn source_start_secs(self) -> f64 {
+        self.source_start_secs
+    }
+
     pub(crate) fn relative_secs(self, source_pts_secs: f64) -> Result<f64, StreamTimelineError> {
         if !source_pts_secs.is_finite() {
             return Err(StreamTimelineError::NonFiniteSourceTime);
         }
         let relative = source_pts_secs - self.source_start_secs;
-        if relative < -1.0e-9 {
-            return Err(StreamTimelineError::BeforeSessionStart);
+        if relative < -STREAM_TIMELINE_EPSILON_SECS {
+            return Err(StreamTimelineError::BeforeSessionStart {
+                source_pts_secs,
+                source_start_secs: self.source_start_secs,
+                delta_secs: relative,
+            });
         }
         Ok(relative.max(0.0))
     }
@@ -42,22 +52,33 @@ impl StreamTimeline {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum StreamTimelineError {
     NonFiniteSourceTime,
-    BeforeSessionStart,
+    BeforeSessionStart {
+        source_pts_secs: f64,
+        source_start_secs: f64,
+        delta_secs: f64,
+    },
     ZeroTimescale,
     TimestampOverflow,
 }
 
 impl fmt::Display for StreamTimelineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::NonFiniteSourceTime => "source timestamp must be finite",
-            Self::BeforeSessionStart => "source timestamp precedes streaming session start",
-            Self::ZeroTimescale => "streaming timescale must be non-zero",
-            Self::TimestampOverflow => "streaming timestamp exceeds i64 range",
-        })
+        match self {
+            Self::NonFiniteSourceTime => f.write_str("source timestamp must be finite"),
+            Self::BeforeSessionStart {
+                source_pts_secs,
+                source_start_secs,
+                delta_secs,
+            } => write!(
+                f,
+                "source timestamp precedes streaming session start: source_pts_secs={source_pts_secs:.9}, source_start_secs={source_start_secs:.9}, delta_secs={delta_secs:.9}"
+            ),
+            Self::ZeroTimescale => f.write_str("streaming timescale must be non-zero"),
+            Self::TimestampOverflow => f.write_str("streaming timestamp exceeds i64 range"),
+        }
     }
 }
 
@@ -78,9 +99,18 @@ mod tests {
     #[test]
     fn timestamps_before_session_are_not_silently_clamped() {
         let timeline = StreamTimeline::new(10.0).unwrap();
+        let error = timeline.relative_secs(9.5).unwrap_err();
         assert_eq!(
-            timeline.relative_secs(9.5),
-            Err(StreamTimelineError::BeforeSessionStart)
+            error,
+            StreamTimelineError::BeforeSessionStart {
+                source_pts_secs: 9.5,
+                source_start_secs: 10.0,
+                delta_secs: -0.5,
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "source timestamp precedes streaming session start: source_pts_secs=9.500000000, source_start_secs=10.000000000, delta_secs=-0.500000000"
         );
         assert_eq!(timeline.relative_secs(10.0 - 5.0e-10), Ok(0.0));
     }

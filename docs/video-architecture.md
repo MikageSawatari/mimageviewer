@@ -1132,6 +1132,10 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 - remote headless player も同じ default device、audio pump、cpal callback を起動する。
   remote local mute は `output_volume` だけを 0 にし、Playing 中の processed queue 消費と
   audio PTS 更新は継続する。Remote audio tap は processed push 直前なので mute の上流にある
+- Remote AAC encoder は session attach 時の source 位置を映像と共通の原点にする。PDC 補正後の
+  初期 `ProcessedChunk` が原点前から始まる場合、完全に前の区間は drop、原点を跨ぐ区間は
+  sample 単位で先頭だけを trim し、保持 sample の実 source PTS を共通 timeline へ写す。
+  timestamp 自体を 0 へ clamp したり、音声専用原点へ差し替えたりしない
 - `audio_tx` の直接 consumer は audio pump である。非 Playing 中は cpal callback が
   processed を drain しないため、pump は raw 先読みの非破壊上限 (5 秒) まで取り込んだ後に
   intake を止め、bounded queue 経由で decoder/demux へ back-pressure を返す。

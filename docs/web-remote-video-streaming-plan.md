@@ -246,6 +246,14 @@ HW デコード時 (`AV_PIX_FMT_D3D11`) は既存の `av_hwframe_transfer_data`
 両方を **source timeline のまま**セグメンタへ渡し、セッション開始時刻を 0 とする相対
 タイムスタンプへ写す。音声側が既に PDC を吸収しているので、リップシンクは自動的に合う。
 
+レジューム位置で session を attach すると、最初の post-DSP 音声区間は PDC 分だけ session
+原点より前から始まり得る。AAC 入力境界は現 seek 世代の初期 chunk を点ではなく
+`[audible_pts, audible_pts + duration)` の区間として扱い、全体が原点前なら捨てて件数を数え、
+原点を跨ぐ場合だけ先頭を sample 単位で削る。保持した最初の sample は実際の source PTS を
+維持し、映像と同じ `StreamTimeline` へ渡すため、別の音声原点や timestamp clamp は導入しない。
+`StreamTimeline` は意味のある原点前 timestamp を従来どおり error にし、診断には source PTS、
+session 原点、差分秒を含める。1ns の既存浮動小数点許容だけは共通定数として維持する。
+
 変速再生 (`playback_speed != 1.0`) は第 1 段では**非対応**とし、ストリーミング中は等速に
 固定する (`source_secs_per_output_sec` の扱いが増えるため。§12)。
 
@@ -259,6 +267,9 @@ HW デコード時 (`AV_PIX_FMT_D3D11`) は既存の `av_hwframe_transfer_data`
   0 秒 clamp を unit test で固定した。既存計算と一致し、異常は見つからなかった
 - `seek_serial` が session の期待世代と違う chunk は PCM assembler より前で捨てる。
   `source_secs_per_output_sec != 1.0` は黙って連続音声として扱わず error にして session 側へ返す
+- 実機検証是正 (2026-08-02): session attach 時の現在位置と PDC 補正済み先頭音声区間のずれを
+  AAC encoder の初期区間 trim で吸収した。完全な pre-session chunk の drop と、原点を跨ぐ
+  chunk の sample trim は PCM assembler より前で行い、その後の chunk 連続性検証は維持する
 
 ### 4.4 セグメンタ
 
