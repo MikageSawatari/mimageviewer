@@ -1309,7 +1309,8 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-通常フォルダ一覧 IPC を追加した 2026-08-02 時点の現行版は **v16**。
+通常フォルダ一覧 IPC の v16 に、動画 start/resource の stage 別 timeout code を追加した
+2026-08-02 時点の現行版は **v17**。
 
 ### 13.6 残タスク (2026-08-01 時点)
 

@@ -1313,11 +1313,11 @@ fn remote_video_start_returns_post_seek_generation_and_stop_is_idempotent() {
             .begin_operation("phone", "動画ストリーミングを開始中".to_owned())
             .unwrap();
         request_handle.submit_video_stream(
-            crate::remote_ipc::session::VideoStreamUiRequest::Start {
-                client_id: "phone".to_owned(),
-                path: request_path,
-                quality: mimageviewer_ipc::VideoStreamQuality::Standard,
-            },
+            crate::remote_ipc::session::VideoStreamUiRequest::start_for_test(
+                "phone".to_owned(),
+                request_path,
+                mimageviewer_ipc::VideoStreamQuality::Standard,
+            ),
             operation,
         )
     });

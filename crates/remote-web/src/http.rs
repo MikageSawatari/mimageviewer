@@ -914,6 +914,21 @@ fn video_ipc_error_response(failure: crate::ipc_client::ClientFailure) -> HttpRe
                 VideoStreamErrorCode::Busy => (503, "stream_busy", true),
                 VideoStreamErrorCode::UiTimeout => (504, "stream_ui_timeout", false),
                 VideoStreamErrorCode::Failed => (422, "stream_failed", false),
+                VideoStreamErrorCode::StartQueueTimeout => {
+                    (504, "stream_start_queue_timeout", false)
+                }
+                VideoStreamErrorCode::StartUiTimeout => (504, "stream_start_ui_timeout", false),
+                VideoStreamErrorCode::StartPlayerTimeout => {
+                    (504, "stream_start_player_timeout", false)
+                }
+                VideoStreamErrorCode::StartSeekTimeout => (504, "stream_start_seek_timeout", false),
+                VideoStreamErrorCode::StartEncoderTimeout => {
+                    (504, "stream_start_encoder_timeout", false)
+                }
+                VideoStreamErrorCode::StartPlaylistTimeout => {
+                    (504, "stream_start_playlist_timeout", false)
+                }
+                VideoStreamErrorCode::ResourceTimeout => (503, "stream_resource_timeout", true),
                 VideoStreamErrorCode::Internal => (500, "stream_internal", false),
             };
             (status, code, error.message, retryable)
@@ -2939,6 +2954,32 @@ mod tests {
             assert_eq!(body["error"], expected_error);
             assert_eq!(
                 mismatch.log_details.as_ref().unwrap()["video_stream"]["error_code"],
+                expected_error
+            );
+        }
+        for (code, expected_error) in [
+            (
+                VideoStreamErrorCode::StartPlayerTimeout,
+                "stream_start_player_timeout",
+            ),
+            (
+                VideoStreamErrorCode::StartEncoderTimeout,
+                "stream_start_encoder_timeout",
+            ),
+        ] {
+            let timeout = video_ipc_error_response(crate::ipc_client::ClientFailure {
+                error: IpcClientError::VideoStreamRemote(mimageviewer_ipc::VideoStreamError::new(
+                    code,
+                    "start stage deadline",
+                )),
+                retry_count: 0,
+                retry_statuses: Vec::new(),
+            });
+            assert_eq!(timeout.status, 504);
+            let body: Value = serde_json::from_slice(&timeout.body).unwrap();
+            assert_eq!(body["error"], expected_error);
+            assert_eq!(
+                timeout.log_details.as_ref().unwrap()["video_stream"]["error_code"],
                 expected_error
             );
         }

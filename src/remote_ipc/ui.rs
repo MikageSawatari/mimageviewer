@@ -17,6 +17,7 @@ use super::session::{
     PublishedVideoStream, SessionHandle, UiWriteOutcome, VideoStreamPlaybackState,
     VideoStreamUiOutcome, VideoStreamUiRequest,
 };
+use super::video_stream::{VideoStreamStartBudget, VideoStreamStartStage};
 
 #[derive(Default)]
 pub(crate) struct RemoteSessionUiState {
@@ -42,7 +43,7 @@ struct AppRemoteVideoOpening {
     requested_path: std::path::PathBuf,
     quality: crate::video::stream::quality::QualityPreset,
     fs_idx: usize,
-    opened_at: std::time::Instant,
+    budget: VideoStreamStartBudget,
 }
 
 struct AppRemoteVideoStreaming {
@@ -55,12 +56,9 @@ struct AppRemoteVideoStreaming {
 struct AppRemoteVideoStarting {
     claimed: ClaimedVideoStreamUiRequest,
     streaming: AppRemoteVideoStreaming,
-    started_at: std::time::Instant,
+    budget: VideoStreamStartBudget,
+    waiting_stage: VideoStreamStartStage,
 }
-
-const REMOTE_VIDEO_PLAYER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-const REMOTE_VIDEO_START_STABLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(7);
-
 // リモート配信の local surface は streaming UI state owner と同居させる。
 pub(crate) fn draw_remote_video_local_surface(
     ui: &mut egui::Ui,
@@ -167,10 +165,26 @@ fn video_stream_session_mismatch() -> VideoStreamUiOutcome {
     ))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteVideoStartReadiness {
+    Stable,
+    WaitingForSeek,
+    WaitingForEncoder,
+}
+
+impl RemoteVideoStartReadiness {
+    fn wait_stage(self) -> VideoStreamStartStage {
+        match self {
+            Self::Stable | Self::WaitingForSeek => VideoStreamStartStage::Seek,
+            Self::WaitingForEncoder => VideoStreamStartStage::Encoder,
+        }
+    }
+}
+
 fn remote_video_start_outcome_for_player(
     starting: &mut AppRemoteVideoStarting,
     player: &crate::video::VideoPlayer,
-) -> Result<(StreamReconcile, bool), String> {
+) -> Result<(StreamReconcile, RemoteVideoStartReadiness), String> {
     starting.streaming.playback.update(
         player.position_secs(),
         player.duration(),
@@ -178,17 +192,23 @@ fn remote_video_start_outcome_for_player(
         player.intent_playing(),
     );
     let reconcile = starting.streaming.session.reconcile(player);
-    let stable = matches!(reconcile, StreamReconcile::Active)
+    let seek_is_stable = matches!(reconcile, StreamReconcile::Active)
         && player.remote_stream_start_seek_is_settled()
         && starting
             .streaming
             .session
-            .generation_matches_player_seek(player)
-        && matches!(
-            starting.streaming.session.status(),
-            StreamGenerationStatus::Ready(_)
-        );
-    Ok((reconcile, stable))
+            .generation_matches_player_seek(player);
+    let readiness = if !seek_is_stable {
+        RemoteVideoStartReadiness::WaitingForSeek
+    } else if matches!(
+        starting.streaming.session.status(),
+        StreamGenerationStatus::Ready(_)
+    ) {
+        RemoteVideoStartReadiness::Stable
+    } else {
+        RemoteVideoStartReadiness::WaitingForEncoder
+    };
+    Ok((reconcile, readiness))
 }
 
 impl crate::app::App {
@@ -521,6 +541,10 @@ impl crate::app::App {
     }
 
     fn poll_owned_remote_video_starting(&mut self, mut starting: AppRemoteVideoStarting) {
+        if let Some(error) = starting.budget.expired_error(starting.waiting_stage) {
+            self.fail_remote_video_starting(starting, error.code, error.message);
+            return;
+        }
         let outcome = self.remote_video_start_outcome(&mut starting);
         self.finish_stable_remote_video_start(starting, outcome);
     }
@@ -528,7 +552,7 @@ impl crate::app::App {
     fn remote_video_start_outcome(
         &self,
         starting: &mut AppRemoteVideoStarting,
-    ) -> Result<(StreamReconcile, bool), String> {
+    ) -> Result<(StreamReconcile, RemoteVideoStartReadiness), String> {
         let player = match self.fs_cache.get(&starting.streaming.fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => player,
             _ => return Err("streaming media player was closed".to_owned()),
@@ -542,10 +566,14 @@ impl crate::app::App {
     fn finish_stable_remote_video_start(
         &mut self,
         starting: AppRemoteVideoStarting,
-        outcome: Result<(StreamReconcile, bool), String>,
+        outcome: Result<(StreamReconcile, RemoteVideoStartReadiness), String>,
     ) {
         match outcome {
-            Ok((StreamReconcile::Active, true)) => {
+            Ok((StreamReconcile::Active, RemoteVideoStartReadiness::Stable)) => {
+                if let Some(error) = starting.budget.expired_error(starting.waiting_stage) {
+                    self.fail_remote_video_starting(starting, error.code, error.message);
+                    return;
+                }
                 let published = PublishedVideoStream {
                     session: starting.streaming.session.id(),
                     generation: starting.streaming.session.access(),
@@ -560,27 +588,33 @@ impl crate::app::App {
                 self.remote_session_ui.video_stream =
                     Some(AppRemoteVideoStreamState::Streaming(starting.streaming));
             }
-            Ok((StreamReconcile::GenerationChanged(generation), _)) => {
+            Ok((StreamReconcile::GenerationChanged(generation), readiness)) => {
                 crate::logger::log(format!(
                     "remote-stream generation changed while start was stabilizing: {generation:?}"
                 ));
-                self.remote_session_ui.video_stream =
-                    Some(AppRemoteVideoStreamState::Starting(starting));
+                self.continue_or_timeout_remote_video_starting(starting, readiness);
             }
-            Ok((StreamReconcile::Active, false))
-                if starting.started_at.elapsed() < REMOTE_VIDEO_START_STABLE_TIMEOUT =>
-            {
-                self.remote_session_ui.video_stream =
-                    Some(AppRemoteVideoStreamState::Starting(starting));
+            Ok((StreamReconcile::Active, readiness)) => {
+                self.continue_or_timeout_remote_video_starting(starting, readiness);
             }
-            Ok((StreamReconcile::Active, false)) => self.fail_remote_video_starting(
-                starting,
-                VideoStreamErrorCode::NotReady,
-                "動画の seek と encoder が 7 秒以内に安定しませんでした".to_owned(),
-            ),
             Ok((StreamReconcile::Stop(reason), _)) | Err(reason) => {
                 self.fail_remote_video_starting(starting, VideoStreamErrorCode::Failed, reason)
             }
+        }
+    }
+
+    fn continue_or_timeout_remote_video_starting(
+        &mut self,
+        mut starting: AppRemoteVideoStarting,
+        readiness: RemoteVideoStartReadiness,
+    ) {
+        let waiting_stage = readiness.wait_stage();
+        if let Some(error) = starting.budget.expired_error(waiting_stage) {
+            self.fail_remote_video_starting(starting, error.code, error.message);
+        } else {
+            starting.waiting_stage = waiting_stage;
+            self.remote_session_ui.video_stream =
+                Some(AppRemoteVideoStreamState::Starting(starting));
         }
     }
 
@@ -591,6 +625,10 @@ impl crate::app::App {
                 VideoStreamErrorCode::SessionMismatch,
                 "リモートセッションの操作権が移動しました".to_owned(),
             );
+            return;
+        }
+        if let Some(error) = opening.budget.expired_error(VideoStreamStartStage::Player) {
+            self.fail_remote_video_opening(opening, error.code, error.message);
             return;
         }
 
@@ -638,6 +676,10 @@ impl crate::app::App {
 
         match readiness {
             Ok(true) => {
+                if let Some(error) = opening.budget.expired_error(VideoStreamStartStage::Player) {
+                    self.fail_remote_video_opening(opening, error.code, error.message);
+                    return;
+                }
                 let result = self.create_remote_video_streaming(
                     &opening.client_id,
                     &opening.requested_path,
@@ -650,23 +692,21 @@ impl crate::app::App {
                             AppRemoteVideoStreamState::Starting(AppRemoteVideoStarting {
                                 claimed: opening.claimed,
                                 streaming,
-                                started_at: std::time::Instant::now(),
+                                budget: opening.budget,
+                                waiting_stage: VideoStreamStartStage::Seek,
                             }),
                         );
                     }
                     Err(error) => opening.claimed.complete(video_stream_ui_failure(error)),
                 }
             }
-            Ok(false) if opening.opened_at.elapsed() < REMOTE_VIDEO_PLAYER_READY_TIMEOUT => {
-                self.remote_session_ui.video_stream =
-                    Some(AppRemoteVideoStreamState::Opening(opening));
-            }
             Ok(false) => {
-                self.fail_remote_video_opening(
-                    opening,
-                    VideoStreamErrorCode::NotReady,
-                    "要求された動画の player が 2 秒以内に準備できませんでした".to_owned(),
-                );
+                if let Some(error) = opening.budget.expired_error(VideoStreamStartStage::Player) {
+                    self.fail_remote_video_opening(opening, error.code, error.message);
+                } else {
+                    self.remote_session_ui.video_stream =
+                        Some(AppRemoteVideoStreamState::Opening(opening));
+                }
             }
             Err((code, message)) => {
                 self.fail_remote_video_opening(opening, code, message);
@@ -788,8 +828,9 @@ impl crate::app::App {
                 client_id,
                 path,
                 quality,
+                budget,
             } => {
-                self.begin_remote_video_start(pending, client_id, path, quality.into());
+                self.begin_remote_video_start(pending, client_id, path, quality.into(), budget);
                 return;
             }
             VideoStreamUiRequest::Control { session, action } => {
@@ -810,7 +851,12 @@ impl crate::app::App {
         client_id: String,
         requested_path: std::path::PathBuf,
         quality: crate::video::stream::quality::QualityPreset,
+        budget: VideoStreamStartBudget,
     ) {
+        if let Some(error) = budget.expired_error(VideoStreamStartStage::Ui) {
+            claimed.complete(VideoStreamUiOutcome::Error(error));
+            return;
+        }
         if !self.settings.remote_video_streaming_enabled {
             claimed.complete(video_stream_ui_failure(
                 "remote video streaming is disabled".to_owned(),
@@ -858,7 +904,7 @@ impl crate::app::App {
                 requested_path,
                 quality,
                 fs_idx,
-                opened_at: std::time::Instant::now(),
+                budget,
             }));
     }
 

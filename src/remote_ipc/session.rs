@@ -15,6 +15,7 @@ use crate::video::stream::session::{
     StreamingGeneration, StreamingGenerationAccess, StreamingSessionId,
 };
 
+use super::video_stream::{VideoStreamStartBudget, VideoStreamStartStage};
 pub(crate) const LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub(crate) const UI_REQUEST_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -534,6 +535,7 @@ pub(crate) enum VideoStreamUiRequest {
         client_id: String,
         path: PathBuf,
         quality: VideoStreamQuality,
+        budget: VideoStreamStartBudget,
     },
     Control {
         session: u64,
@@ -546,6 +548,22 @@ pub(crate) enum VideoStreamUiRequest {
     Stop {
         session: u64,
     },
+}
+
+impl VideoStreamUiRequest {
+    #[cfg(test)]
+    pub(crate) fn start_for_test(
+        client_id: String,
+        path: PathBuf,
+        quality: VideoStreamQuality,
+    ) -> Self {
+        Self::Start {
+            client_id,
+            path,
+            quality,
+            budget: VideoStreamStartBudget::from_enqueued_at(Instant::now()),
+        }
+    }
 }
 
 pub(crate) enum VideoStreamUiOutcome {
@@ -954,6 +972,13 @@ impl SessionHandle {
         request: VideoStreamUiRequest,
         operation: SessionOperation,
     ) -> VideoStreamUiOutcome {
+        let start_budget = match &request {
+            VideoStreamUiRequest::Start { budget, .. } => Some(*budget),
+            _ => None,
+        };
+        let accept_timeout = start_budget
+            .map(VideoStreamStartBudget::remaining)
+            .unwrap_or(UI_REQUEST_ACCEPT_TIMEOUT);
         let dispatch = Arc::new(UiRequestDispatch::pending());
         let (reply, receiver) = mpsc::sync_channel(1);
         let queued = QueuedRemoteUiRequest::VideoStream(QueuedVideoStreamUiRequest {
@@ -977,18 +1002,22 @@ impl SessionHandle {
                 );
             }
         }
-        match receiver.recv_timeout(UI_REQUEST_ACCEPT_TIMEOUT) {
+        match receiver.recv_timeout(accept_timeout) {
             Ok(outcome) => outcome,
             Err(mpsc::RecvTimeoutError::Disconnected) => video_stream_ui_error(
                 VideoStreamErrorCode::Internal,
                 "本体 UI の動画操作受付が停止しています",
             ),
-            Err(mpsc::RecvTimeoutError::Timeout) if dispatch.cancel_pending() => {
-                video_stream_ui_error(
+            Err(mpsc::RecvTimeoutError::Timeout) if dispatch.cancel_pending() => match start_budget
+            {
+                Some(budget) => {
+                    VideoStreamUiOutcome::Error(budget.timeout_error(VideoStreamStartStage::Ui))
+                }
+                None => video_stream_ui_error(
                     VideoStreamErrorCode::UiTimeout,
                     "本体 UI が 2 秒以内に動画操作要求を受理しませんでした",
-                )
-            }
+                ),
+            },
             Err(mpsc::RecvTimeoutError::Timeout) => receiver.recv().unwrap_or_else(|_| {
                 video_stream_ui_error(
                     VideoStreamErrorCode::Internal,

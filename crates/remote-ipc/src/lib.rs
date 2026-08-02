@@ -4,6 +4,7 @@
 
 use std::fmt;
 use std::io::{Read, Write};
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -13,9 +14,12 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
+/// One wall-clock budget for the complete remote video start path, from core IPC queueing
+/// through player/seek/encoder readiness and the first usable playlist.
+pub const VIDEO_STREAM_START_BUDGET: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ClientHello {
@@ -765,6 +769,13 @@ pub enum VideoStreamErrorCode {
     NotReady,
     Busy,
     UiTimeout,
+    StartQueueTimeout,
+    StartUiTimeout,
+    StartPlayerTimeout,
+    StartSeekTimeout,
+    StartEncoderTimeout,
+    StartPlaylistTimeout,
+    ResourceTimeout,
     Failed,
     Internal,
 }
@@ -1241,8 +1252,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v16_video_pull_messages_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 16);
+    fn protocol_v17_video_pull_messages_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 17);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -1284,8 +1295,8 @@ mod tests {
             ServerMessage::VideoStreamPlaylist {
                 id: 51,
                 response: VideoStreamResult::Error(VideoStreamError::new(
-                    VideoStreamErrorCode::GenerationMismatch,
-                    "old generation",
+                    VideoStreamErrorCode::StartEncoderTimeout,
+                    "encoder deadline",
                 )),
             },
         ] {

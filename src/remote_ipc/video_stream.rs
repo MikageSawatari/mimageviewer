@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use mimageviewer_ipc::{
-    RemoteAddress, RemoteSubresource, VideoStreamError, VideoStreamErrorCode,
-    VideoStreamPlaylistKind, VideoStreamPlaylistPayload, VideoStreamResult,
+    RemoteAddress, RemoteSubresource, VIDEO_STREAM_START_BUDGET, VideoStreamError,
+    VideoStreamErrorCode, VideoStreamPlaylistKind, VideoStreamPlaylistPayload, VideoStreamResult,
     VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamSize, VideoStreamStartPayload,
     VideoStreamStatePayload,
 };
@@ -15,8 +15,86 @@ use crate::video::stream::session::{
     StreamResourceKind, StreamSegmentBytes, StreamingGeneration, StreamingGenerationAccess,
 };
 
-const START_READY_TIMEOUT: Duration = Duration::from_secs(7);
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VideoStreamStartBudget {
+    deadline: Instant,
+}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum VideoStreamStartStage {
+    Queue,
+    Ui,
+    Player,
+    Seek,
+    Encoder,
+    Playlist,
+}
+
+impl VideoStreamStartBudget {
+    pub(super) fn from_enqueued_at(enqueued_at: Instant) -> Self {
+        Self {
+            deadline: enqueued_at + VIDEO_STREAM_START_BUDGET,
+        }
+    }
+
+    pub(super) fn remaining(self) -> Duration {
+        self.remaining_at(Instant::now())
+    }
+
+    pub(super) fn remaining_at(self, now: Instant) -> Duration {
+        self.deadline.saturating_duration_since(now)
+    }
+
+    pub(super) fn expired_error(self, stage: VideoStreamStartStage) -> Option<VideoStreamError> {
+        self.expired_error_at(Instant::now(), stage)
+    }
+
+    pub(super) fn expired_error_at(
+        self,
+        now: Instant,
+        stage: VideoStreamStartStage,
+    ) -> Option<VideoStreamError> {
+        self.remaining_at(now)
+            .is_zero()
+            .then(|| self.timeout_error(stage))
+    }
+
+    pub(super) fn timeout_error(self, stage: VideoStreamStartStage) -> VideoStreamError {
+        let (code, waiting_for) = match stage {
+            VideoStreamStartStage::Queue => (
+                VideoStreamErrorCode::StartQueueTimeout,
+                "本体の動画 stream queue で実行開始",
+            ),
+            VideoStreamStartStage::Ui => (
+                VideoStreamErrorCode::StartUiTimeout,
+                "本体 UI による動画開始要求の受理",
+            ),
+            VideoStreamStartStage::Player => (
+                VideoStreamErrorCode::StartPlayerTimeout,
+                "player の metadata・映像/音声 tap の準備",
+            ),
+            VideoStreamStartStage::Seek => (
+                VideoStreamErrorCode::StartSeekTimeout,
+                "再開位置への seek と generation の同期",
+            ),
+            VideoStreamStartStage::Encoder => (
+                VideoStreamErrorCode::StartEncoderTimeout,
+                "動画 encoder の初期化",
+            ),
+            VideoStreamStartStage::Playlist => (
+                VideoStreamErrorCode::StartPlaylistTimeout,
+                "最初の master playlist の生成",
+            ),
+        };
+        video_error(
+            code,
+            format!(
+                "動画 start の {} 秒予算を、{waiting_for}の待機中に使い切りました",
+                VIDEO_STREAM_START_BUDGET.as_secs()
+            ),
+        )
+    }
+}
 pub(super) struct VideoStreamEngine {
     settings: crate::settings::Settings,
 }
@@ -82,11 +160,11 @@ impl VideoStreamEngine {
     pub(super) fn complete_start(
         &self,
         stream: PublishedVideoStream,
+        budget: VideoStreamStartBudget,
     ) -> VideoStreamResult<VideoStreamStartPayload> {
-        let deadline = Instant::now() + START_READY_TIMEOUT;
-        match stream.generation.wait_ready(START_READY_TIMEOUT) {
+        match stream.generation.wait_ready(budget.remaining()) {
             StreamGenerationStatus::Ready(ready) => {
-                if let Err(error) = wait_for_start_playlist(&stream.generation, deadline) {
+                if let Err(error) = wait_for_start_playlist(&stream.generation, budget) {
                     return VideoStreamResult::Error(error);
                 }
                 let playback = stream.playback.snapshot();
@@ -102,10 +180,9 @@ impl VideoStreamEngine {
                     codecs: ready.codecs,
                 })
             }
-            StreamGenerationStatus::Opening => VideoStreamResult::Error(video_error(
-                VideoStreamErrorCode::NotReady,
-                "動画エンコーダの準備が完了していません",
-            )),
+            StreamGenerationStatus::Opening => {
+                VideoStreamResult::Error(budget.timeout_error(VideoStreamStartStage::Encoder))
+            }
             StreamGenerationStatus::Failed(error) => {
                 VideoStreamResult::Error(video_error(VideoStreamErrorCode::Failed, error))
             }
@@ -150,7 +227,7 @@ impl VideoStreamEngine {
                 VideoStreamErrorCode::Internal,
                 "プレイリスト応答の型が一致しません",
             )),
-            Err(error) => VideoStreamResult::Error(resource_error(error)),
+            Err(error) => VideoStreamResult::Error(resource_error(error, kind)),
         }
     }
 
@@ -207,7 +284,7 @@ impl VideoStreamEngine {
                 VideoStreamErrorCode::Internal,
                 "セグメント応答の型が一致しません",
             )),
-            Err(error) => VideoStreamResult::Error(resource_error(error)),
+            Err(error) => VideoStreamResult::Error(resource_error(error, kind)),
         }
     }
 
@@ -249,7 +326,9 @@ impl VideoStreamEngine {
                     "動画状態応答の型が一致しません",
                 ));
             }
-            Err(error) => return VideoStreamResult::Error(resource_error(error)),
+            Err(error) => {
+                return VideoStreamResult::Error(resource_error(error, StreamResourceKind::State));
+            }
         };
         VideoStreamResult::Success(state_payload(stream, ready, metrics))
     }
@@ -257,19 +336,27 @@ impl VideoStreamEngine {
 
 fn wait_for_start_playlist(
     generation: &StreamingGenerationAccess,
-    deadline: Instant,
+    budget: VideoStreamStartBudget,
 ) -> Result<(), VideoStreamError> {
-    wait_for_start_playlist_with(deadline, || {
-        generation.resource(generation.generation(), StreamResourceKind::MasterPlaylist)
+    wait_for_start_playlist_with(budget, |remaining| {
+        generation.resource_with_timeout(
+            generation.generation(),
+            StreamResourceKind::MasterPlaylist,
+            remaining,
+        )
     })
 }
 
 fn wait_for_start_playlist_with(
-    deadline: Instant,
-    mut request: impl FnMut() -> Result<StreamResource, StreamResourceError>,
+    budget: VideoStreamStartBudget,
+    mut request: impl FnMut(Duration) -> Result<StreamResource, StreamResourceError>,
 ) -> Result<(), VideoStreamError> {
     loop {
-        match request() {
+        let remaining = budget.remaining();
+        if remaining.is_zero() {
+            return Err(budget.timeout_error(VideoStreamStartStage::Playlist));
+        }
+        match request(remaining) {
             Ok(StreamResource::Playlist(Some(body))) if !body.is_empty() => return Ok(()),
             Ok(StreamResource::Playlist(None)) | Err(StreamResourceError::NotReady) => {}
             Ok(StreamResource::Playlist(Some(_))) => {
@@ -284,16 +371,14 @@ fn wait_for_start_playlist_with(
                     "プレイリスト応答の型が一致しません",
                 ));
             }
-            Err(error) => return Err(resource_error(error)),
+            Err(StreamResourceError::Timeout) => {
+                return Err(budget.timeout_error(VideoStreamStartStage::Playlist));
+            }
+            Err(error) => {
+                return Err(resource_error(error, StreamResourceKind::MasterPlaylist));
+            }
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(video_error(
-                VideoStreamErrorCode::NotReady,
-                "プレイリストが 7 秒以内に準備できませんでした",
-            ));
-        }
-        std::thread::sleep(remaining.min(Duration::from_millis(50)));
+        std::thread::sleep(budget.remaining().min(Duration::from_millis(50)));
     }
 }
 
@@ -343,7 +428,7 @@ fn resolve_error(error: ResolveError) -> VideoStreamError {
     video_error(code, message)
 }
 
-fn resource_error(error: StreamResourceError) -> VideoStreamError {
+fn resource_error(error: StreamResourceError, kind: StreamResourceKind) -> VideoStreamError {
     match error {
         StreamResourceError::GenerationMismatch => video_error(
             VideoStreamErrorCode::GenerationMismatch,
@@ -358,10 +443,19 @@ fn resource_error(error: StreamResourceError) -> VideoStreamError {
             VideoStreamErrorCode::Failed,
             "動画ストリーミングが停止しました",
         ),
-        StreamResourceError::Timeout => video_error(
-            VideoStreamErrorCode::NotReady,
-            "動画セグメントの取得が 2 秒以内に完了しませんでした",
-        ),
+        StreamResourceError::Timeout => {
+            let waiting_for = match kind {
+                StreamResourceKind::MasterPlaylist => "master playlist",
+                StreamResourceKind::MediaPlaylist => "media playlist",
+                StreamResourceKind::InitSegment => "初期化セグメント",
+                StreamResourceKind::MediaSegment(_) => "media segment",
+                StreamResourceKind::State => "stream state",
+            };
+            video_error(
+                VideoStreamErrorCode::ResourceTimeout,
+                format!("generation worker から {waiting_for} の応答を待つ内部期限を超えました"),
+            )
+        }
     }
 }
 
@@ -376,22 +470,38 @@ mod tests {
     #[test]
     fn resource_generation_mismatch_stays_typed_for_http_409() {
         assert_eq!(
-            resource_error(StreamResourceError::GenerationMismatch).code,
+            resource_error(
+                StreamResourceError::GenerationMismatch,
+                StreamResourceKind::MasterPlaylist
+            )
+            .code,
             VideoStreamErrorCode::GenerationMismatch
         );
     }
 
     #[test]
     fn readiness_and_timeout_never_become_empty_successes() {
-        for error in [StreamResourceError::NotReady, StreamResourceError::Timeout] {
-            assert_eq!(resource_error(error).code, VideoStreamErrorCode::NotReady);
-        }
+        assert_eq!(
+            resource_error(
+                StreamResourceError::NotReady,
+                StreamResourceKind::MediaPlaylist
+            )
+            .code,
+            VideoStreamErrorCode::NotReady
+        );
+        let timeout = resource_error(
+            StreamResourceError::Timeout,
+            StreamResourceKind::MediaSegment(42),
+        );
+        assert_eq!(timeout.code, VideoStreamErrorCode::ResourceTimeout);
+        assert!(timeout.message.contains("media segment"));
     }
 
     #[test]
     fn start_readiness_waits_until_the_playlist_is_obtainable() {
         let mut requests = 0;
-        let result = wait_for_start_playlist_with(Instant::now() + Duration::from_secs(1), || {
+        let budget = VideoStreamStartBudget::from_enqueued_at(Instant::now());
+        let result = wait_for_start_playlist_with(budget, |_| {
             requests += 1;
             Ok(StreamResource::Playlist(
                 (requests >= 2).then(|| "#EXTM3U".to_owned()),
@@ -399,6 +509,50 @@ mod tests {
         });
         assert!(result.is_ok());
         assert_eq!(requests, 2);
+    }
+
+    #[test]
+    fn player_wait_uses_the_outer_start_deadline_instead_of_the_old_two_second_cutoff() {
+        let started_at = Instant::now();
+        let budget = VideoStreamStartBudget::from_enqueued_at(started_at);
+
+        assert!(
+            budget
+                .expired_error_at(
+                    started_at + Duration::from_secs(2),
+                    VideoStreamStartStage::Player,
+                )
+                .is_none()
+        );
+        let error = budget
+            .expired_error_at(
+                started_at + VIDEO_STREAM_START_BUDGET,
+                VideoStreamStartStage::Player,
+            )
+            .expect("the single start deadline must eventually expire");
+        assert_eq!(error.code, VideoStreamErrorCode::StartPlayerTimeout);
+        assert!(error.message.contains("player"));
+    }
+
+    #[test]
+    fn exhausted_start_budget_identifies_the_wait_stage() {
+        let budget = VideoStreamStartBudget::from_enqueued_at(Instant::now());
+        for (stage, code, marker) in [
+            (
+                VideoStreamStartStage::Player,
+                VideoStreamErrorCode::StartPlayerTimeout,
+                "player",
+            ),
+            (
+                VideoStreamStartStage::Encoder,
+                VideoStreamErrorCode::StartEncoderTimeout,
+                "encoder",
+            ),
+        ] {
+            let error = budget.timeout_error(stage);
+            assert_eq!(error.code, code);
+            assert!(error.message.contains(marker));
+        }
     }
 
     #[test]

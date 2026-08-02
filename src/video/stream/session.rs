@@ -304,6 +304,15 @@ impl StreamingGenerationAccess {
         generation: StreamingGeneration,
         kind: StreamResourceKind,
     ) -> Result<StreamResource, StreamResourceError> {
+        self.resource_with_timeout(generation, kind, RESOURCE_TIMEOUT)
+    }
+
+    pub(crate) fn resource_with_timeout(
+        &self,
+        generation: StreamingGeneration,
+        kind: StreamResourceKind,
+        timeout: Duration,
+    ) -> Result<StreamResource, StreamResourceError> {
         validate_resource_generation(self.generation, generation)?;
         if matches!(kind, StreamResourceKind::MediaSegment(_)) {
             self.activity.note_segment_fetch();
@@ -324,7 +333,7 @@ impl StreamingGenerationAccess {
             })
             .map_err(|_| StreamResourceError::NotReady)?;
         reply_rx
-            .recv_timeout(RESOURCE_TIMEOUT)
+            .recv_timeout(timeout)
             .map_err(|_| StreamResourceError::Timeout)
     }
 }

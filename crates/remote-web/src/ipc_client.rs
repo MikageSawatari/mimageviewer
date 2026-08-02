@@ -15,10 +15,10 @@ use mimageviewer_ipc::{
     RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult, RequestId,
     ServerMessage, SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionResponse,
     SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse,
-    VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode, VideoStreamPlaylistKind,
-    VideoStreamPlaylistPayload, VideoStreamQuality, VideoStreamResult, VideoStreamSeekPayload,
-    VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamStartPayload,
-    VideoStreamStatePayload, read_frame, write_frame,
+    VIDEO_STREAM_START_BUDGET, VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode,
+    VideoStreamPlaylistKind, VideoStreamPlaylistPayload, VideoStreamQuality, VideoStreamResult,
+    VideoStreamSeekPayload, VideoStreamSegmentIndex, VideoStreamSegmentPayload,
+    VideoStreamStartPayload, VideoStreamStatePayload, read_frame, write_frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -26,12 +26,23 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// 無期限に保持しない。HTTP 側の入場制限とブラウザ再試行を前提にする。
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RETRIES: u32 = 2;
+/// Transport-only grace after the core's functional start budget, covering queue dispatch and
+/// named-pipe response routing without becoming a second application deadline.
+const VIDEO_START_RESPONSE_GRACE: Duration = Duration::from_secs(5);
 /// 本体を後から起動しても QR 用接続情報を自動通知できるよう、接続を常時監視する。
 /// 500 ms polling は named pipe の blocking reader とは別で、CPU / I/O を発生させない。
 const CONNECTION_HEALTH_POLL: Duration = Duration::from_millis(500);
 /// 初回は素早く追従し、常時停止中の本体へ過剰に接続しないよう 5 秒で頭打ちにする。
 const RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
+
+fn response_timeout_for(request: &ClientMessage) -> Duration {
+    if matches!(request, ClientMessage::VideoStreamStart { .. }) {
+        VIDEO_STREAM_START_BUDGET + VIDEO_START_RESPONSE_GRACE
+    } else {
+        RESPONSE_TIMEOUT
+    }
+}
 
 pub struct ThumbnailClient {
     pipe_name: String,
@@ -1166,6 +1177,7 @@ impl Connection {
         id: RequestId,
         request: ClientMessage,
     ) -> Result<ServerMessage, ProtocolFailure> {
+        let response_timeout = response_timeout_for(&request);
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.pending.register(id, reply_tx, &self.broken)?;
         let write_result = {
@@ -1181,7 +1193,7 @@ impl Connection {
             self.fail(failure.clone(), true);
             return Err(failure);
         }
-        match reply_rx.recv_timeout(RESPONSE_TIMEOUT) {
+        match reply_rx.recv_timeout(response_timeout) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.pending.expire(id);
@@ -1688,6 +1700,20 @@ mod tests {
         assert_eq!(calls, 1);
     }
 
+    #[test]
+    fn video_start_transport_timeout_outlives_the_core_start_budget() {
+        let request = ClientMessage::VideoStreamStart {
+            id: 1,
+            client_id: "client".to_owned(),
+            address: RemoteAddress::file("00000000-0000-0000-0000-000000000000", "movie.mp4"),
+            quality: VideoStreamQuality::Standard,
+        };
+        assert_eq!(
+            response_timeout_for(&request),
+            VIDEO_STREAM_START_BUDGET + VIDEO_START_RESPONSE_GRACE
+        );
+        assert!(response_timeout_for(&request) > VIDEO_STREAM_START_BUDGET);
+    }
     #[test]
     fn response_timeout_is_returned_to_http_without_internal_retry() {
         let mut calls = 0;

@@ -34,7 +34,7 @@ use super::session::{
     VideoStreamUiRequest,
 };
 use super::thumbnail::{ThumbnailEngine, WorkerContext};
-use super::video_stream::VideoStreamEngine;
+use super::video_stream::{VideoStreamEngine, VideoStreamStartBudget, VideoStreamStartStage};
 
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 const PIPE_MAX_INSTANCES: u32 = 16;
@@ -620,7 +620,8 @@ fn stream_worker_loop(
         ));
         let started_at = Instant::now();
         session_operation.started();
-        let response = execute_video_stream_request(message, engine, session, session_operation);
+        let response =
+            execute_video_stream_request(message, engine, session, session_operation, enqueued_at);
         let outcome = response_outcome(&response);
         let reply_ok = reply.send(response).is_ok();
         let (queued, active) = metrics.finished();
@@ -639,6 +640,7 @@ fn execute_video_stream_request(
     engine: &VideoStreamEngine,
     session: &SessionHandle,
     operation: SessionOperation,
+    enqueued_at: Instant,
 ) -> ServerMessage {
     match message {
         ClientMessage::VideoStreamStart {
@@ -646,36 +648,47 @@ fn execute_video_stream_request(
             client_id,
             address,
             quality,
-        } => match engine.resolve_start_address(&address) {
-            Ok(path) => match session.submit_video_stream(
-                VideoStreamUiRequest::Start {
-                    client_id,
-                    path,
-                    quality,
-                },
-                operation,
-            ) {
-                VideoStreamUiOutcome::Started(stream) => ServerMessage::VideoStreamStart {
-                    id,
-                    response: engine.complete_start(stream),
-                },
-                VideoStreamUiOutcome::Error(error) => ServerMessage::VideoStreamStart {
-                    id,
-                    response: VideoStreamResult::Error(error),
-                },
-                _ => ServerMessage::VideoStreamStart {
-                    id,
-                    response: unexpected_video_outcome("start"),
-                },
-            },
-            Err(error) => {
+        } => {
+            let budget = VideoStreamStartBudget::from_enqueued_at(enqueued_at);
+            if let Some(error) = budget.expired_error(VideoStreamStartStage::Queue) {
                 operation.finish(false);
-                ServerMessage::VideoStreamStart {
+                return ServerMessage::VideoStreamStart {
                     id,
                     response: VideoStreamResult::Error(error),
+                };
+            }
+            match engine.resolve_start_address(&address) {
+                Ok(path) => match session.submit_video_stream(
+                    VideoStreamUiRequest::Start {
+                        client_id,
+                        path,
+                        quality,
+                        budget,
+                    },
+                    operation,
+                ) {
+                    VideoStreamUiOutcome::Started(stream) => ServerMessage::VideoStreamStart {
+                        id,
+                        response: engine.complete_start(stream, budget),
+                    },
+                    VideoStreamUiOutcome::Error(error) => ServerMessage::VideoStreamStart {
+                        id,
+                        response: VideoStreamResult::Error(error),
+                    },
+                    _ => ServerMessage::VideoStreamStart {
+                        id,
+                        response: unexpected_video_outcome("start"),
+                    },
+                },
+                Err(error) => {
+                    operation.finish(false);
+                    ServerMessage::VideoStreamStart {
+                        id,
+                        response: VideoStreamResult::Error(error),
+                    }
                 }
             }
-        },
+        }
         ClientMessage::VideoStreamControl {
             id,
             session: stream_session,

@@ -423,7 +423,7 @@ HLS のライブウィンドウ (直近 60 秒) 内は `<video>` 上で完結す
   segmenter の typed `None` を保持して HTTP 503 または上限付き wait へ写像し、200 では
   必ず非空の init、または init と最初の media segment を参照できる playlist を返す
 
-### 6.2 IPC (protocol v15)
+### 6.2 IPC (動画 API 導入 v15、timeout stage code 追加 v17)
 
 既存の長寿命 duplex 多重化接続 ([web-remote-plan.md](web-remote-plan.md) §9.5-9.6) に
 `ClientMessage` / `ServerMessage` の variant を追加する。**セグメントは pull 型**とし、
@@ -450,8 +450,12 @@ thread は既存の「フォルダを開く → loaded item を選択 → fullsc
 その動画へ切り替え、player の metadata / audio tap が揃うまで typed `Opening` state を
 poll する。その後は start request を typed `Starting` state が保持し、pending resume が
 消費済み、seek 中でない、現在の seek serial と generation の expected serial が一致、
-encoder が Ready、という事実をすべて確認してから generation を publish する。IPC worker は
-同じ generation の master playlist が非空になるまで 7 秒上限で待って start を返す。
+encoder が Ready、という事実をすべて確認してから generation を publish する。
+
+start の wall-clock 予算は `mimageviewer_ipc::VIDEO_STREAM_START_BUDGET` の **15 秒だけ**を
+正本とする。本体が IPC request を stream queue へ積んだ時刻から deadline を一度だけ作り、
+UI 受付、player、resume seek / generation 同期、encoder、最初の non-empty master playlist
+まで同じ typed budget を移送する。各段は独自 timeout を開始せず、残時間だけを使う。
 別の項目が開いていても remote owner が操作権を占有しているため要求先へ切り替える。
 stop・owner 解放・失敗時は remote が開いた動画をその位置で pause して残し、開始前の項目へは
 戻さない。復元用の並行 state を持つと §2.2 の「位置を保持して手動再開」と競合するためである。
@@ -470,8 +474,9 @@ stream worker の teardown / join は引き続き UI thread 外で行う。
   **下**へ配置した。全新規 route の未認証要求が path/body/IPC 処理より先に 401 となる
   route-level test を置いた
 - generation 開始直後の playlist/init `None` は HTTP **503** + `Retry-After: 1` とする。
-  playlist/init/segment は空の成功 body を防御的にも拒否する。start の encoder readiness
-  待機だけは 7 秒上限とし、上限時は同じく 503 とする
+  playlist/init/segment は空の成功 body を防御的にも拒否する。増分 6 時点では encoder readiness
+  だけに根拠未記録の 7 秒 / 503 を置いたが、実機 timeout 是正で撤去し、後述の単一 15 秒 budget と
+  stage 別 504 に置き換えた
 - remote-web と本体の両方で `RemoteAddress` の favorite allowlist、実ファイル、
   canonical containment、対応動画拡張子を独立に検証する。seek / 画質変更後の旧 generation
   は新しい resource を返さず 409 とする
@@ -489,6 +494,44 @@ stream worker の teardown / join は引き続き UI thread 外で行う。
   その active stream を維持する
 - 409 本文の error code を session / generation で分離し、動画 API の JSON error code を
   remote-web 計測ログへ複写する
+
+#### 実機 timeout 是正 (単一 start budget、protocol v17、2026-08-02)
+
+start の **15 秒**は、次の根拠で置く運用上限である。
+
+- repository 内で実測済みの cold RAW decode は 1.7 秒で、通常 IPC 応答上限 10 秒はその約 6 倍を
+  根拠としている。動画 start は source open/probe に加えて D3D11 decoder、audio device、resume
+  seek、H.264/AAC encoder、playlist 初期化を直列に含むため、同じ 10 秒を上限にはしない
+- 15 秒なら 1.7 秒の約 8.8 倍で、Web 側の既存 playlist recovery horizon 15 秒とも一致する。
+  一方、4 本の stream worker を 60 秒 liveness 近く保持する値にはしない
+- これは cold 大容量動画の percentile 実測値ではない。v17 の stage 別 error code を計測ログへ
+  残し、`stream_start_player_timeout` / `stream_start_seek_timeout` /
+  `stream_start_encoder_timeout` / `stream_start_playlist_timeout` の分布を根拠に再調整する
+
+動画 path に直接関係する wall-clock timeout は次の **8 個**で、同じ仕事を二重に打ち切らない。
+
+| 境界 | 値 | 守るもの | start との関係 |
+|---|---:|---|---|
+| core start budget | 15 秒 | queue 受付から最初の usable playlist までの start 全体 | 機能上の唯一の start deadline |
+| remote-web start IPC response | 20 秒 (15+5) | named-pipe dispatch / response routing | transport guard。必ず core start より後 |
+| generation resource response (`RESOURCE_TIMEOUT`) | 2 秒 | 4 本の stream worker を停止した generation worker から解放する | 通常の playlist/init/media/state のみ。start playlist は残予算を渡す |
+| 通常 IPC response | 10 秒 | start 以外の pending IPC / HTTP worker | start には使わない |
+| 通常 UI request accept | 2 秒 | control/seek/stop 等で UI queue 未受理を検出 | start は 2 秒を使わず start 残予算を使う |
+| browser playlist recovery | 最大 6 回か 15 秒 | start 後の generation mismatch / 一時 503 からの回復 | start 完了後の client recovery |
+| remote session liveness | 60 秒 | client 消失時の owner / stream 解放 | request timeout ではない lifecycle guard |
+| paused-stream idle | 10 分 | 放置された停止中 stream の解放 | request timeout ではない lifecycle guard |
+
+`RESOURCE_TIMEOUT` の resource 読み出しは segment を生成する処理ではなく、generation worker が
+所有する in-memory segmenter/ring の snapshot command である。未生成 segment は待たずに
+`NotFound` / typed `None` を返す。したがって 2 秒は media I/O の所要時間ではなく、encoder 内で
+worker が停止した時に stream lane を占有し続けないための circuit breaker として維持する。
+timeout message は要求種別 (master/media playlist、init/media segment、state) を含み、HTTP は
+`stream_resource_timeout` を `details.video_stream.error_code` へ記録する。
+
+増分 5 の **6.0 秒**は wall-clock timeout ではなく、2 秒 GOP の 3 倍を許す source-timeline 上の
+unfinished fragment / interleave backlog 上限である。超過時は session を停止し、resource request
+の 2 秒や start の 15 秒とは合算しない。named-pipe connect 1 秒と reconnect backoff は接続基盤の
+guard で、動画処理開始後の timeout 8 個には数えない。
 
 ### 6.3 セッションと既存ロックの関係
 
