@@ -38,6 +38,7 @@ use windows_numerics::Matrix3x2;
 use crate::settings::FsSidePanelMode;
 use crate::ui_helpers::HoverTipExt;
 use crate::video::decoder::{VideoFrame, VideoFrameData};
+pub(crate) use crate::video::native_cursor::cursor_move_is_activity;
 use crate::video::native_window_health::NativeRenderOperation;
 use crate::video::native_window_host::{
     NativeCursorIcon, NativeRenderTarget, NativeRenderTargets, NativeWindowIntent,
@@ -453,32 +454,8 @@ struct NativeEguiOverlay {
     pixels_per_point: f32,
     width: u32,
     height: u32,
-    /// 最終ユーザー活動時刻 / overlay 表示時刻のうち最新のもの。
-    /// `!overlay_visible` 期間中、ここから設定秒数経過したら
-    /// `SetCursor(None)` でカーソルを隠す。更新タイミング:
-    /// - `push_native_event` (mouse native event): `Some(now)` にリセット。
-    /// - `mark_cursor_activity` (eframe 経由の pointer 活動反映): `Some(now)` にリセット。
-    /// - `render_once` で `overlay_visible == true` のフレーム: 毎回 `Some(now)` で再 bump
-    ///   (= overlay が見えている間は countdown を 0 にし続け、消えた瞬間から設定秒数測る)。
-    /// `None` は初期状態のみ (フルスクリーン入場直後で初回 render 前)。
-    cursor_last_activity: Option<Instant>,
-    /// 直前 render で `SetCursor(None)` を打った sticky フラグ。次の活動 / overlay 表示
-    /// が起きるまで true を維持し、`wants_periodic_tick()` が false を返して以降の
-    /// 余計な tick を止める。idle 判定後に確実に 1 回 `SetCursor(None)` を打つために
-    /// 「!cursor_hidden の間は tick 継続」という形で利用する。
-    cursor_hidden: bool,
-    /// 直近に観測したカーソルの client 座標 (presenter / HUD どちらの wndproc 由来でも、
-    /// fullscreen では同一 origin なので比較可能)。`push_native_event` の `MouseMove` が
-    /// **実際に位置が動いたか** を判定して auto-hide の活動扱いをゲートするために使う。
-    /// 実機修正 (2026-06-06): 動画 fullscreen の video→video キーナビ中、navigation
-    /// preview で HUD HWND の region が全画面化すると「カーソル下の window」が
-    /// presenter HWND ⇄ HUD HWND で切り替わり、OS が**位置不変 (zero-delta) の
-    /// `WM_MOUSEMOVE`** を新しい window に届ける。`cursor_polling_tick` の synthetic move も
-    /// 位置不変。これらを無条件に活動とみなすと、キー操作だけで auto-hide 済みカーソルが
-    /// 復活してしまう。位置が変わったときだけ活動とみなすことで一般的な動画プレイヤーと
-    /// 挙動を揃える。`MouseLeave` ではクリアしない (= 同位置の再入を活動と誤認しないため)。
-    cursor_activity_pos: Option<(i32, i32)>,
-    cursor_hide_delay_secs: f32,
+    // Cursor policy is emitted to the pump-owned reducer. Activity, hidden
+    // state, and input ownership do not live on the render thread.
     /// 音量ノーマライズ UI 状態 (App から `SetNormalizeOverlayState` で配信される)。
     normalize_state: crate::video::normalize_types::NormalizeOverlayState,
 }
@@ -1459,6 +1436,7 @@ impl NativeOverlayInputRouting {
             | NativeEvent::DpiChanged { .. }
             | NativeEvent::RequestRaiseHud
             | NativeEvent::RequestFocusClaim
+            | NativeEvent::CursorOwnership(_)
             | NativeEvent::Destroyed => false,
         }
     }
@@ -1909,7 +1887,6 @@ impl NativeRenderCore {
             };
             this.recreate_backbuffer(true)?;
             this.wait_for_initial_composition_ready();
-            this.publish_cursor_health();
             log_event(
                 "init",
                 &[
@@ -2671,22 +2648,6 @@ impl NativeRenderCore {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.window_observation = observation;
         }
-        self.publish_cursor_health();
-    }
-
-    fn publish_cursor_health(&self) {
-        let (hidden, within, last_activity) = self.egui_overlay.as_ref().map_or(
-            (false, self.window_observation.cursor_within_client, None),
-            |overlay| {
-                (
-                    overlay.cursor_hidden,
-                    overlay.window_observation.cursor_within_client,
-                    overlay.cursor_last_activity,
-                )
-            },
-        );
-        self.health
-            .record_cursor_state(self.window_epoch, hidden, within, last_activity);
     }
 
     /// **overlay (egui_wgpu) の surface だけ** を resize する。
@@ -2710,13 +2671,13 @@ impl NativeRenderCore {
         Ok(Vec::new())
     }
 
-    /// presenter thread loop から 50ms 周期で呼ばれる cursor polling。
+    /// presenter thread loop から 50ms 周期で呼ばれる HUD hover polling。
     /// 戻り値: `true` なら呼び出し側で `raise_hud_to_top()` + retry burst を起動すべき。
     /// HUD HWND が無い (= フォールバック経路) なら何もせず `false`。
     ///
     /// 役割:
     ///   1. pump の `NativeWindowObservation` から cursor の presenter 座標を取得。
-    ///   2. pump が観測した client rect 範囲チェック (= 別モニターに移ったケースは弾く):
+    ///   2. pump-owned router の input ownership と client 座標の範囲を確認し、
     ///      範囲外なら一度だけ synthetic `MouseLeave` を流して以降何もしない。
     ///   3. 範囲内: 直近 80ms 以内に HUD/presenter wndproc 経由の本物 `WM_MOUSEMOVE` が
     ///      届いていなければ synthetic `MouseMove` を overlay の `push_native_event` に流す
@@ -2787,7 +2748,7 @@ impl NativeRenderCore {
         let Some([x, y]) = observation.cursor_client_position else {
             return false;
         };
-        let in_range = observation.cursor_within_client
+        let in_range = observation.cursor_input_owned
             && x >= 0
             && y >= 0
             && (x as u32) < self.width
@@ -2887,7 +2848,6 @@ impl NativeRenderCore {
         } else {
             NativeOverlayInputOutcome::empty()
         };
-        self.publish_cursor_health();
         Ok(outcome)
     }
 
@@ -3235,7 +3195,6 @@ impl NativeRenderCore {
         } else {
             NativeOverlayInputOutcome::empty()
         };
-        self.publish_cursor_health();
         // Codex CP5 P1 反映: tick 経路でも overlay UI が時間経過で表示/非表示に変わるので、
         // 必ず HUD region に反映する。漏らすと periodic 表示状態 (= toast / hover preview /
         // tile overlay refresh 等) と region がズレて VST にクリックが奪われる。
@@ -3757,25 +3716,6 @@ impl NativeBlackBackground {
     }
 }
 
-/// `MouseMove` をカーソル auto-hide のアクティビティ (= カーソル復帰) とみなすか判定する。
-///
-/// 位置が変わらない move は復帰させない。動画 fullscreen の navigation preview で HUD HWND の
-/// region が全画面化すると、カーソル下の window が presenter HWND ⇄ HUD HWND で切り替わり、
-/// OS は位置不変 (zero-delta) の `WM_MOUSEMOVE` を新しい window へ届ける。`cursor_polling_tick`
-/// の synthetic move も位置不変。これらでキー操作だけのナビ中に auto-hide 済みカーソルが
-/// 復活する事象を防ぐ (2026-06-06)。直近位置が不明 (`None`) のときは、表示中なら通常の活動、
-/// hidden 中なら region 切替由来の spurious move とみなして抑制する。
-pub(crate) fn cursor_move_is_activity(
-    prev: Option<(i32, i32)>,
-    pos: (i32, i32),
-    cursor_hidden: bool,
-) -> bool {
-    match prev {
-        Some(prev) => prev != pos,
-        None => !cursor_hidden,
-    }
-}
-
 impl NativeEguiOverlay {
     fn new(
         visual: IDCompositionVisual,
@@ -3787,7 +3727,7 @@ impl NativeEguiOverlay {
         height: u32,
         os_pixels_per_point: f32,
         window_observation: NativeWindowObservation,
-        cursor_hide_delay_secs: f32,
+        _cursor_hide_delay_secs: f32,
         ui_scale: f32,
         text_contrast: crate::settings::TextContrast,
         ui_font: crate::settings::UiFontSettings,
@@ -3844,8 +3784,6 @@ impl NativeEguiOverlay {
         configure_overlay_style(&egui_ctx, text_contrast);
         let ui_scale = crate::settings::normalize_ui_scale_factor(ui_scale);
         let pixels_per_point = effective_overlay_pixels_per_point(os_pixels_per_point, ui_scale);
-        let cursor_hide_delay_secs =
-            crate::settings::clamp_fullscreen_cursor_hide_delay_secs(cursor_hide_delay_secs);
         let this = Self {
             health,
             window_epoch,
@@ -3973,10 +3911,6 @@ impl NativeEguiOverlay {
             pixels_per_point,
             width: width.max(1),
             height: height.max(1),
-            cursor_last_activity: None,
-            cursor_hidden: false,
-            cursor_activity_pos: None,
-            cursor_hide_delay_secs,
             normalize_state: crate::video::normalize_types::NormalizeOverlayState::default(),
         };
         this.configure();
@@ -3997,15 +3931,6 @@ impl NativeEguiOverlay {
             ],
         );
         Ok(this)
-    }
-
-    fn publish_cursor_health(&self) {
-        self.health.record_cursor_state(
-            self.window_epoch,
-            self.cursor_hidden,
-            self.window_observation.cursor_within_client,
-            self.cursor_last_activity,
-        );
     }
 
     fn resize(&mut self, width: u32, height: u32) -> Result<Vec<NativeWindowIntent>, String> {
@@ -4141,41 +4066,6 @@ impl NativeEguiOverlay {
         };
 
         self.event_count = self.event_count.saturating_add(1);
-        // カーソル auto-hide 用のアクティビティタイマ更新。キー操作では再表示せず、
-        // pointer 系イベントだけを活動とみなす。MouseLeave は「カーソルがウィンドウ
-        // から出た」ので活動とみなさない (= 隠す方向に進める)。
-        //
-        // 重要 (2026-06-06): `MouseMove` は **実際にカーソル位置が変わったときだけ** 活動と
-        // みなす。動画 fullscreen の video→video キーナビでは navigation preview 中に HUD HWND
-        // の region が全画面化し、「カーソル下の window」が presenter HWND ⇄ HUD HWND で
-        // 切り替わる。OS はこの切替で位置不変 (zero-delta) の `WM_MOUSEMOVE` を新しい window へ
-        // 届け、`cursor_polling_tick` も位置不変の synthetic move を流す。これらを無条件に活動
-        // とみなすと、キー操作だけのナビで auto-hide 済みカーソルが復活してしまう。詳細は
-        // `cursor_activity_pos` フィールドのコメント参照。Button / Wheel は明確なユーザー意図
-        // なので位置に関係なく活動扱いにする。
-        let cursor_activity = match &event {
-            NativeEvent::MouseMove(mouse) => {
-                let pos = (mouse.x, mouse.y);
-                let moved =
-                    cursor_move_is_activity(self.cursor_activity_pos, pos, self.cursor_hidden);
-                self.cursor_activity_pos = Some(pos);
-                moved
-            }
-            NativeEvent::MouseButton(button) => {
-                self.cursor_activity_pos = Some((button.x, button.y));
-                true
-            }
-            NativeEvent::MouseWheel(wheel) => {
-                self.cursor_activity_pos = Some((wheel.x, wheel.y));
-                true
-            }
-            _ => false,
-        };
-        if cursor_activity {
-            self.cursor_last_activity = Some(Instant::now());
-            self.cursor_hidden = false;
-        }
-        self.publish_cursor_health();
         if self.hud_dimmed && Self::hud_dimmed_suppresses_overlay_pointer_event(&event) {
             let was_visible = self.dimmed_hover_chrome_visible();
             self.update_raw_hover_pos_from_native_event(&event);
@@ -4390,7 +4280,7 @@ impl NativeEguiOverlay {
                 self.dirty = true;
             }
             NativeEvent::MouseLeave => {
-                if self.window_observation.has_hud && self.window_observation.cursor_within_client {
+                if self.window_observation.has_hud && self.window_observation.cursor_input_owned {
                     return;
                 }
                 self.pointer_pos = None;
@@ -4404,6 +4294,7 @@ impl NativeEguiOverlay {
             | NativeEvent::DpiChanged { .. }
             | NativeEvent::RequestRaiseHud
             | NativeEvent::RequestFocusClaim
+            | NativeEvent::CursorOwnership(_)
             | NativeEvent::Destroyed => {}
         }
     }
@@ -4874,15 +4765,10 @@ impl NativeEguiOverlay {
         visible
     }
 
-    /// eframe 経由でルーティングされた pointer 活動を反映する。
-    /// `push_native_event` を経由しない経路用の明示的な活動通知。
-    /// `dirty = true` を立てて次フレームで `render_once` を強制実行し、
-    /// `update_cursor_icon` を更新カーソルで上書きする (= 隠れていたら再表示)。
+    /// Cursor activity itself is reduced on the pump thread. Render only marks
+    /// the overlay dirty so its current cursor policy is republished.
     fn mark_cursor_activity(&mut self) {
-        self.cursor_last_activity = Some(Instant::now());
-        self.cursor_hidden = false;
         self.dirty = true;
-        self.publish_cursor_health();
     }
 
     fn request_render(&mut self) {
@@ -5093,21 +4979,6 @@ impl NativeEguiOverlay {
             || self.video_is_seeking
             || self.seek_status_visible_since.is_some()
             || self.video_limiter_visible_until.is_some()
-            // カーソル auto-hide のカウントダウン中、および idle 判定後でもまだ
-            // SetCursor(None) を 1 度も打てていない場合は tick を継続する。
-            // - cursor_last_activity が Some && !cursor_hidden:
-            //   - idle < 設定秒数: 経過判定を進めるため tick
-            //   - idle >= 設定秒数: 1 回 render_once を走らせて SetCursor(None) を打つため tick
-            //     (250 ms tick 間隔ぴったりに境界で wants_periodic_tick が false に
-            //     なって render が走らずカーソルが消えない、というバグを防ぐ)
-            // - cursor_hidden = true: 既に隠した → 次の活動 / overlay 表示まで tick 不要。
-            //   push_native_event 側で活動検出時に cursor_hidden を false に戻して tick を再開する。
-            // cursor が presenter の外 (in-window モードの main リサイズ枠など) に
-            // あるときは cursor 管理をしないので、auto-hide 用の周期 tick も不要
-            // (Codex P3: これが無いと cursor 外置きで overlay が永久 tick する)。
-            || (self.cursor_last_activity.is_some()
-                && !self.cursor_hidden
-                && self.cursor_within_focus_window())
     }
 
     fn repaint_due(&self, now: Instant) -> bool {
@@ -5925,12 +5796,6 @@ impl NativeEguiOverlay {
     ) -> Result<(Vec<NativeOverlayCommand>, Vec<NativeWindowIntent>), String> {
         let mut window_intents = Vec::new();
         let render_t0 = Instant::now();
-        // カーソル auto-hide のタイマを初回フレームで起動する。push_native_event 由来の
-        // 入力がまだ届いていなくても、フルスクリーン入場後に設定秒数経過で
-        // 隠れるようにするため。
-        if self.cursor_last_activity.is_none() {
-            self.cursor_last_activity = Some(Instant::now());
-        }
         if self
             .toast
             .as_ref()
@@ -7814,50 +7679,10 @@ impl NativeEguiOverlay {
         if let Some(intent) = self.ime_cursor_area_intent(full_output.platform_output.ime) {
             window_intents.push(intent);
         }
-        // パネル / HUD / トーストなどの「ユーザー操作対象 UI」が
-        // 一切出ていない (= cursor_blocking_overlay_visible が false) で、ユーザー
-        // 無操作が設定秒数経過したらカーソルを隠す。
-        // チェックマーク (`checked`) は単なる状態インジケータなので blocking には
-        // 含めない (= 静止画側 `fs_ui_is_clean` の挙動と揃える)。
-        // egui の cursor_icon を SetCursor(None) で上書きする。次回 pointer event
-        // 到来時に push_native_event 経由で cursor_last_activity が更新され、自然に復活する。
-        //
-        // 状態機械 (シンプル版):
-        // - cursor_blocking_overlay_visible == true: 毎フレーム cursor_last_activity を
-        //   Some(now) に bump して countdown を 0 に戻す (= 操作対象 UI が消えた
-        //   瞬間から設定秒数測り直す)。`wants_periodic_tick()` も
-        //   毎フレーム true なので pause 中も 250ms ごとに render が走る (P3 トレードオフ)。
-        // - cursor_blocking_overlay_visible == false: cursor_last_activity をそのまま
-        //   維持して idle を計算。設定秒数経過したらカーソル非表示。
-        // - cursor_should_hide は idle のみで判定 (cursor_hidden 状態の sticky carry は
-        //   不要 — pointer activity / overlay 表示で適切にリセットされるため)。
-        if cursor_blocking_overlay_visible {
-            self.cursor_last_activity = Some(Instant::now());
-            self.cursor_hidden = false;
-        }
-        let cursor_should_hide = !cursor_blocking_overlay_visible
-            && self
-                .cursor_last_activity
-                .map(|t| t.elapsed().as_secs_f32() >= self.cursor_hide_delay_secs)
-                .unwrap_or(false);
-        let resolved_cursor_icon = if cursor_should_hide {
-            egui::CursorIcon::None
-        } else {
-            full_output.platform_output.cursor_icon
-        };
-        // in-window モードで cursor が presenter child の外 (= main window の
-        // リサイズ枠やタイトルバー) にあるときは SetCursor しない。さもないと
-        // presenter が毎フレーム IDC_ARROW を打ち、main 側のリサイズカーソルと
-        // 交互にちらつく。fullscreen では focus_hwnd がモニタ全面なので常に内側
-        // 判定 = 従来動作。
-        let cursor_over_presenter = self.cursor_within_focus_window();
-        if cursor_over_presenter {
-            window_intents.push(NativeWindowIntent::SetCursor(Self::resolve_cursor_icon(
-                resolved_cursor_icon,
-            )));
-        }
-        self.cursor_hidden = cursor_should_hide && cursor_over_presenter;
-        self.publish_cursor_health();
+        window_intents.push(NativeWindowIntent::SetCursorPolicy {
+            icon: Self::resolve_cursor_icon(full_output.platform_output.cursor_icon),
+            auto_hide_allowed: !cursor_blocking_overlay_visible,
+        });
 
         let shape_count = full_output.shapes.len();
         for (id, image_delta) in &full_output.textures_delta.set {
@@ -7973,14 +7798,6 @@ impl NativeEguiOverlay {
             width,
             height,
         })
-    }
-
-    /// cursor の現在位置が `focus_hwnd` のクライアント矩形内かを返す。in-window
-    /// モードで presenter child の外 (main のリサイズ枠 / タイトルバー等) に出たら
-    /// cursor 管理を止める判定に使う。取得失敗時は true (= 従来どおり管理を継続) に
-    /// 倒す。fullscreen では focus_hwnd がモニタ全面なので常に true。
-    fn cursor_within_focus_window(&self) -> bool {
-        self.window_observation.cursor_within_client
     }
 
     fn resolve_cursor_icon(cursor_icon: egui::CursorIcon) -> NativeCursorIcon {

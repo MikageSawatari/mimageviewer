@@ -48,8 +48,9 @@ Stage 4 (2026-07-29) 以降、HWND owner と GPU work は別 thread である。
 `native-video-window-pump` は全 placement の create/message dispatch/mutate/destroy と typed
 window-host reducer だけを所有し、GPU ack や render join を同期 wait しない。
 `native-video-render` は D3D/DXGI/DComp、overlay GPU resource、frame selection/present を所有し、
-USER32 read/mutation は行わない。pump が 8ms 周期で採取する cursor/focus/capture snapshot と、
-render が返す focus/IME/cursor intent だけで接続する。
+USER32 read/mutation は行わない。pump が採取する幾何 cursor 座標 / focus / capture snapshot、
+source-stamped mouse ownership event と、render が返す focus / IME / cursor policy intent だけで
+接続する。cursor auto-hide の状態と `SetCursor` 書き込みは pump が所有する。
 
 `VideoPlayer::tick(_ctx)` は再生制御 / repaint hint / ホバーサムネイル要求のみ扱う。
 フレームの実体描画は native presenter 内のスレッドが行うため、`tick` で受け取る
@@ -170,8 +171,8 @@ normalize blocker / tile overlay / seek hover thumbnail / checkmark)。**activat
 ノブが上下端と重なったとき入力を奪うため。
 
 bar の hover 表示は pump の 8ms latest observation を render が **50ms 周期で評価**
-(`cursor_polling_tick`) して代替する。cursor が presenter HWND client rect 内なら synthetic
-`MouseMove` を `push_native_event` に流し、
+(`cursor_polling_tick`) して代替する。pump の input ownership が local で、幾何 cursor 座標も
+presenter HWND client rect 内なら synthetic `MouseMove` を `push_native_event` に流し、
 activation zone 内なら HUD raise burst をエンキューする (= VST 手動クリックで HUD が裏に回ったあとの
 復帰経路)。
 
@@ -185,33 +186,36 @@ activation zone 内なら HUD raise burst をエンキューする (= VST 手動
 ときに region を空に差し替える。HUD は穴のまま (= 不可視 / click-through) になり、preview / tile が
 消えるか mIV が前面へ戻れば次の publish で通常 region に戻る。動画切替・SwitchSource 自体は
 止めない (= 旧 presenter を閉じる normal open fallback の黒画面・背後ちらつきを再発させない)。
-**カーソル auto-hide と zero-delta `WM_MOUSEMOVE` (2026-06-06)**: navigation preview の全画面
+**カーソル auto-hide、input ownership、zero-delta `WM_MOUSEMOVE` (2026-06-06 / 2026-08-02)**:
+navigation preview の全画面
 region 化は passive な source swap 表示なので、カーソルの auto-hide 状態を維持したい
 (= 動画→動画のキーナビ中はカーソルを隠したまま、マウス操作でだけ復帰させる、一般的な
 動画プレイヤーと同じ挙動)。ところが全画面 region 化で「カーソル下の window」が presenter HWND
 ⇄ HUD HWND で切り替わると、OS は**位置不変 (zero-delta) の `WM_MOUSEMOVE`** を新しい window へ
-届ける。`cursor_polling_tick` の synthetic move も位置不変。さらにこの zero-delta move は
-3 つの ingress (overlay / HUD wndproc / App) のいずれでも「カーソル活動」と扱われうる。
-無条件に活動とみなすと、キー操作だけで auto-hide 済みカーソルが復活してしまう。対策は
-**「位置不変の move はどの ingress でもカーソルを復帰させない」** を 3 か所で徹底する:
+届ける。`cursor_polling_tick` の synthetic move も位置不変なので、無条件に活動とみなすと
+キー操作だけで auto-hide 済みカーソルが復活してしまう。一方、`GetCursorPos` →
+`ScreenToClient` の幾何結果を input ownership とみなすと、同じ client rect の上に VST editor
+などの別 top-level window が乗った間も presenter 所有と誤判定し、隠れた cursor の復帰経路を
+閉じてしまう。2026-08-02 以降は次の pump-owned contract に統一する:
 
-- **overlay (権威)**: `NativeEguiOverlay::push_native_event` の `MouseMove` は、`cursor_activity_pos`
-  (直近 client 座標、`MouseLeave` でクリアしない) と比較して**位置が実際に変わったときだけ**
-  `cursor_last_activity` をリセットする (純関数 `cursor_move_is_activity`)。`handle_window_events` は
-  forward 前に**全 native event**を `push_native_events` で処理するので、ここが活動判定の権威。
-  Button / Wheel は明確なユーザー意図なので無条件に活動扱い。
-- **HUD wndproc**: `WM_MOUSEMOVE` ではカーソルを復帰しない (move は zero-delta のことがあるため)。
-  実カーソル移動時の復帰は overlay ゲートが `cursor_hidden=false` にし、render が返す cursor
-  intent を pump の `NativeWindowHost` が適用する。pump は render の sleep/present と独立して
-  message dispatch を継続する。`WM_MOUSEWHEEL` / `WM_*BUTTON*` だけは genuine なので即時復帰
-  (`restore_cursor_for_mouse_activity`)。`WM_SETCURSOR` は `LRESULT(1)` のみ (DefWindowProc の
-  クラスカーソル抑止、実アイコンは `update_cursor_icon` が駆動)。
-- **App**: `handle_native_video_window_event` の `MouseMove` は、forward された move の client 座標が
-  実際に変わったときだけ `mark_native_video_hud_activity` (= `player.mark_cursor_activity()` で
-  overlay を復帰させる) を呼ぶ。位置不変なら repaint のみ。これがないと overlay の位置ゲートを
-  バイパスしてカーソルが復活する。判定は overlay と同じ純関数 `cursor_move_is_activity` を
-  `self.cursor_hidden` 付きで使うので、クリックで入場して move を一度も転送していない (= 直近位置
-  None) 状態で auto-hide → キーナビした場合も復活しない (None かつ hidden は spurious 扱い)。
+- presenter / HUD の wndproc は mouse event に `NativeVideoWindowSource` を焼き付ける。
+  presenter の既存 `TrackMouseEvent` / `WM_MOUSELEAVE` と HUD の cursor 専用 leave edge を
+  ownership router へ送る。HUD の generic `MouseLeave` は region 振動防止のため従来どおり
+  egui へ流さず、cursor ownership edge と意味を分離する。`TrackMouseEvent` 失敗は `Unknown`。
+- pump は同じ drain 内の enter 相当 move / leave / button / wheel / capture edge をすべて集約し、
+  `Unknown / Presenter / Hud / CapturedPresenter / CapturedHud` の typed routing state を 1 回だけ
+  更新する。presenter→HUD / HUD→presenter の handoff は通知順にかかわらず一時的な unowned を
+  publish せず、zero-delta move では hidden 状態と activity clock を維持する。own capture は
+  同じ pump thread 上の `GetCapture` で確認し、範囲外 drag も `Captured*` として所有する。
+- auto-hide reducer (`native_cursor.rs`) は routing 結果、直近 client 座標、render の cursor policy
+  を単独所有する。Open / placement switch / publish 世代切替 / hide / close / host lost /
+  quarantine / capture 喪失で `Unknown` に戻し、stale epoch/generation event は採用しない。
+  `Unknown` は隠す側に倒さず、window show で届く最初の zero-delta `WM_MOUSEMOVE` が local state を
+  seed する。Button / Wheel と App の明示 activity は genuine activity として扱う。
+- `SetCursor` は reducer が local client ownership または own capture を確定できた間だけ pump が
+  実行する。ownership を失ったら Arrow を書かず、VST のノブなど外部 window の `WM_SETCURSOR`
+  に任せる。cursor ownership 判定には同期 hit-test を使わず、`WindowFromPoint` /
+  `SendMessage` はこの経路へ導入しない。
 
 この事象は fullscreen 限定 (HUD HWND + `cursor_polling_tick` + 全画面 region 化が fullscreen にしか
 無い) なので、window モードでは元から再現しない。

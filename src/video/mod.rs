@@ -39,6 +39,8 @@ mod frame_selection;
 #[cfg(windows)]
 pub mod gpu_renderer;
 #[cfg(windows)]
+pub(crate) mod native_cursor;
+#[cfg(windows)]
 pub mod native_presenter;
 #[cfg(windows)]
 pub mod native_window;
@@ -3168,6 +3170,7 @@ fn run_native_video_output(
                     presenter.set_overlay_navigation_preview(preview);
                 }
                 NativeVideoOutputCommand::MarkCursorActivity => {
+                    window_pump.mark_cursor_activity(cur_generation)?;
                     presenter.mark_overlay_cursor_activity();
                 }
                 NativeVideoOutputCommand::RequestOverlayRender => {

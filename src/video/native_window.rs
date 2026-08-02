@@ -28,14 +28,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostQuitMessage, RegisterClassW, SC_MINIMIZE, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
     SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
     SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOWPOS, WM_APPCOMMAND, WM_CHAR, WM_CLOSE, WM_DESTROY,
-    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_NULL, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN,
-    WM_XBUTTONUP, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP,
-    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    TranslateMessage, WINDOW_EX_STYLE, WINDOWPOS, WM_APPCOMMAND, WM_CANCELMODE, WM_CAPTURECHANGED,
+    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT,
+    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE,
+    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::w;
 
@@ -58,6 +58,19 @@ pub enum NativeVideoImeEvent {
     Disabled,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeVideoWindowSource {
+    Presenter,
+    Hud,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeCursorOwnershipEdge {
+    Leave,
+    CaptureLost,
+    TrackingFailed,
+}
+
 #[derive(Clone, Debug)]
 pub enum NativeVideoWindowEvent {
     /// 通常のウィンドウ操作 (`×` / Alt+F4 / taskbar close) による close request。
@@ -76,6 +89,9 @@ pub enum NativeVideoWindowEvent {
     MouseButton(NativeVideoMouseButtonEvent),
     MouseWheel(NativeVideoMouseWheelEvent),
     MouseLeave,
+    /// Cursor ownership edge for the pump-owned router. This is distinct from
+    /// the generic `MouseLeave` consumed by egui pointer state.
+    CursorOwnership(NativeCursorOwnershipEdge),
     /// presenter HWND の `WM_WINDOWPOSCHANGED` で発火。HUD overlay HWND を
     /// presenter のジオメトリに追従させるために pump thread が消費する。
     /// UI 側には転送しない。
@@ -112,6 +128,7 @@ pub(crate) struct NativeVideoWindowEventEnvelope {
     pub(crate) sequence: u64,
     pub(crate) epoch: u64,
     pub(crate) generation: u64,
+    pub(crate) source: NativeVideoWindowSource,
     pub(crate) event: NativeVideoWindowEvent,
 }
 
@@ -135,6 +152,7 @@ fn native_window_event_latest_slot(event: &NativeVideoWindowEvent) -> Option<usi
         | NativeVideoWindowEvent::MouseButton(_)
         | NativeVideoWindowEvent::MouseWheel(_)
         | NativeVideoWindowEvent::MouseLeave
+        | NativeVideoWindowEvent::CursorOwnership(_)
         | NativeVideoWindowEvent::RequestFocusClaim
         | NativeVideoWindowEvent::Destroyed => None,
     }
@@ -255,6 +273,7 @@ impl NativeWindowEventReceiver {
 pub(crate) struct NativeVideoWindowEventSink {
     epoch: u64,
     generation: u64,
+    source: NativeVideoWindowSource,
     pump_route: NativeWindowEventRoute,
     render_route: NativeWindowEventRoute,
 }
@@ -263,12 +282,14 @@ impl NativeVideoWindowEventSink {
     pub(crate) fn new(
         epoch: u64,
         generation: u64,
+        source: NativeVideoWindowSource,
         pump_route: NativeWindowEventRoute,
         render_route: NativeWindowEventRoute,
     ) -> Self {
         Self {
             epoch,
             generation,
+            source,
             pump_route,
             render_route,
         }
@@ -279,6 +300,7 @@ impl NativeVideoWindowEventSink {
             sequence: 0,
             epoch: self.epoch,
             generation: self.generation,
+            source: self.source,
             event,
         };
         if matches!(
@@ -289,6 +311,10 @@ impl NativeVideoWindowEventSink {
                 | NativeVideoWindowEvent::RequestRaiseHud
                 | NativeVideoWindowEvent::RequestFocusClaim
                 | NativeVideoWindowEvent::Destroyed
+                | NativeVideoWindowEvent::MouseMove(_)
+                | NativeVideoWindowEvent::MouseButton(_)
+                | NativeVideoWindowEvent::MouseWheel(_)
+                | NativeVideoWindowEvent::CursorOwnership(_)
         ) {
             self.pump_route.send(envelope.clone());
         }
@@ -298,6 +324,7 @@ impl NativeVideoWindowEventSink {
                 | NativeVideoWindowEvent::RequestRaiseHud
                 | NativeVideoWindowEvent::RequestFocusClaim
                 | NativeVideoWindowEvent::Destroyed
+                | NativeVideoWindowEvent::CursorOwnership(_)
         ) {
             self.render_route.send(envelope);
         }
@@ -1268,7 +1295,6 @@ unsafe extern "system" fn wnd_proc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_MOUSEMOVE => {
-            track_mouse_leave(hwnd);
             if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
                 // CP9 実機 debug: presenter wndproc 経由の mouse は HUD region 外 (= 穴)
                 // のときに来るので、これが頻発しているなら HUD region に問題がある。
@@ -1293,6 +1319,11 @@ unsafe extern "system" fn wnd_proc(
                 sink.send(NativeVideoWindowEvent::MouseMove(native_mouse_event(
                     wparam, lparam,
                 )));
+                if !track_mouse_leave(hwnd) {
+                    sink.send(NativeVideoWindowEvent::CursorOwnership(
+                        NativeCursorOwnershipEdge::TrackingFailed,
+                    ));
+                }
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -1334,10 +1365,21 @@ unsafe extern "system" fn wnd_proc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_MOUSELEAVE => {
-            // WndProc は decode/enqueue のみ。HUD HWND へ移っただけの synthetic leave は、
-            // pump の cursor/client observation を受けた render 側で従来どおり抑止する。
+            // WndProc は decode/enqueue のみ。generic leave は egui pointer 用、source-stamped
+            // ownership edge は pump-owned cursor router 用として別々に送る。
             if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
                 sink.send(NativeVideoWindowEvent::MouseLeave);
+                sink.send(NativeVideoWindowEvent::CursorOwnership(
+                    NativeCursorOwnershipEdge::Leave,
+                ));
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_CAPTURECHANGED | WM_CANCELMODE => {
+            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
+                sink.send(NativeVideoWindowEvent::CursorOwnership(
+                    NativeCursorOwnershipEdge::CaptureLost,
+                ));
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -1591,16 +1633,14 @@ fn mouse_ctrl(wparam: WPARAM) -> bool {
     (wparam.0 & 0x0008) != 0
 }
 
-fn track_mouse_leave(hwnd: HWND) {
+fn track_mouse_leave(hwnd: HWND) -> bool {
     let mut track = TRACKMOUSEEVENT {
         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
         dwFlags: TME_LEAVE,
         hwndTrack: hwnd,
         dwHoverTime: 0,
     };
-    unsafe {
-        let _ = TrackMouseEvent(&mut track);
-    }
+    unsafe { TrackMouseEvent(&mut track).is_ok() }
 }
 
 fn signed_low_word(value: isize) -> i32 {
@@ -1614,6 +1654,54 @@ fn signed_high_word(value: isize) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW, WS_EX_TOOLWINDOW,
+    };
+
+    static CURSOR_WINDOW_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct TestTopLevelWindow(HWND);
+
+    impl Drop for TestTopLevelWindow {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
+    }
+
+    struct ForegroundRestore(HWND);
+
+    impl Drop for ForegroundRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.0.0.is_null() && IsWindow(Some(self.0)).as_bool() {
+                    let _ = SetForegroundWindow(self.0);
+                }
+            }
+        }
+    }
+
+    fn wait_for_cursor_window_event(
+        receiver: &NativeWindowEventReceiver,
+        description: &str,
+        mut predicate: impl FnMut(&NativeVideoWindowEventEnvelope) -> bool,
+    ) -> NativeVideoWindowEventEnvelope {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let _ = pump_thread_messages();
+            if let Some(event) = receiver.drain().into_iter().find(|event| predicate(event)) {
+                return event;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {description}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
 
     fn key(virtual_key: u32) -> NativeVideoWindowEvent {
         NativeVideoWindowEvent::KeyDown(NativeVideoKeyEvent {
@@ -1632,7 +1720,13 @@ mod tests {
         let overflow = Arc::new(AtomicBool::new(false));
         let (pump_route, pump_rx) = native_window_event_route(8, Arc::clone(&overflow));
         let (render_route, render_rx) = native_window_event_route(8, Arc::clone(&overflow));
-        let sink = NativeVideoWindowEventSink::new(7, 7, pump_route, render_route);
+        let sink = NativeVideoWindowEventSink::new(
+            7,
+            7,
+            NativeVideoWindowSource::Presenter,
+            pump_route,
+            render_route,
+        );
 
         sink.send(key(0x41));
         sink.send(NativeVideoWindowEvent::Ime(NativeVideoImeEvent::Commit(
@@ -1654,13 +1748,18 @@ mod tests {
         sink.send(NativeVideoWindowEvent::CloseRequested { generation: 7 });
 
         let pump = pump_rx.drain();
-        assert_eq!(pump.len(), 2);
+        assert_eq!(pump.len(), 3);
         assert!(matches!(
             pump[0].event,
+            NativeVideoWindowEvent::MouseMove(NativeVideoMouseEvent { x: 30, y: 40, .. })
+        ));
+        assert_eq!(pump[0].source, NativeVideoWindowSource::Presenter);
+        assert!(matches!(
+            pump[1].event,
             NativeVideoWindowEvent::RequestFocusClaim
         ));
         assert!(matches!(
-            pump[1].event,
+            pump[2].event,
             NativeVideoWindowEvent::CloseRequested { generation: 7 }
         ));
 
@@ -1689,14 +1788,132 @@ mod tests {
             sequence: 0,
             epoch: 1,
             generation: 1,
+            source: NativeVideoWindowSource::Presenter,
             event: key(0x41),
         });
         route.send(NativeVideoWindowEventEnvelope {
             sequence: 0,
             epoch: 1,
             generation: 1,
+            source: NativeVideoWindowSource::Presenter,
             event: key(0x42),
         });
         assert!(overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows input desktop; run explicitly"]
+    fn stationary_cursor_routes_separate_top_level_window_show_and_hide() {
+        let _guard = CURSOR_WINDOW_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _foreground_restore = ForegroundRestore(unsafe { GetForegroundWindow() });
+        let mut cursor = POINT::default();
+        if let Err(error) = unsafe { GetCursorPos(&mut cursor) } {
+            eprintln!("skipping interactive cursor-window test: GetCursorPos failed: {error:?}");
+            return;
+        }
+        let rect = RECT {
+            left: cursor.x - 32,
+            top: cursor.y - 32,
+            right: cursor.x + 32,
+            bottom: cursor.y + 32,
+        };
+        let hmodule = unsafe { GetModuleHandleW(None).expect("GetModuleHandleW") };
+        let cover = TestTopLevelWindow(
+            unsafe {
+                CreateWindowExW(
+                    WS_EX_TOOLWINDOW,
+                    w!("STATIC"),
+                    w!("mIV cursor ownership cover"),
+                    WS_POPUP,
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    None,
+                    None,
+                    Some(HINSTANCE(hmodule.0)),
+                    None,
+                )
+            }
+            .expect("create cover test window"),
+        );
+        unsafe {
+            SetWindowPos(
+                cover.0,
+                Some(HWND_TOPMOST),
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_SHOWWINDOW,
+            )
+            .expect("show initial cover test window");
+        }
+        let overflow = Arc::new(AtomicBool::new(false));
+        let (pump_route, pump_rx) = native_window_event_route(16, Arc::clone(&overflow));
+        let (render_route, _render_rx) = native_window_event_route(16, Arc::clone(&overflow));
+        let sink = NativeVideoWindowEventSink::new(
+            41,
+            41,
+            NativeVideoWindowSource::Presenter,
+            pump_route,
+            render_route,
+        );
+        let presenter = NativeVideoWindow::create(NativeVideoWindowConfig {
+            mode: NativeVideoWindowMode::Borderless { rect },
+            owner_hwnd: 0,
+            initially_visible: false,
+            activate_on_show: false,
+            close_on_escape: false,
+            event_sink: Some(sink),
+            generation: 41,
+        })
+        .expect("create presenter test window");
+        assert!(presenter.show_no_activate());
+        unsafe {
+            SetWindowPos(
+                presenter.hwnd(),
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+            .expect("raise presenter test window");
+        }
+        wait_for_cursor_window_event(&pump_rx, "presenter show seed", |event| {
+            event.source == NativeVideoWindowSource::Presenter
+                && matches!(event.event, NativeVideoWindowEvent::MouseMove(_))
+        });
+
+        unsafe {
+            SetWindowPos(
+                cover.0,
+                Some(HWND_TOPMOST),
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_SHOWWINDOW,
+            )
+            .expect("show cover test window");
+        }
+        wait_for_cursor_window_event(&pump_rx, "presenter leave after cover show", |event| {
+            event.source == NativeVideoWindowSource::Presenter
+                && matches!(
+                    event.event,
+                    NativeVideoWindowEvent::CursorOwnership(NativeCursorOwnershipEdge::Leave)
+                )
+        });
+
+        unsafe {
+            let _ = ShowWindow(cover.0, SW_HIDE);
+        }
+        assert!(!unsafe { IsWindowVisible(cover.0).as_bool() });
+        assert!(!overflow.load(Ordering::Acquire));
     }
 }

@@ -29,6 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::NativeVideoPlacement;
 use super::native_window::{
     ForegroundClaimReport, NativeVideoWindow, NativeVideoWindowConfig, NativeVideoWindowEventSink,
+    NativeVideoWindowSource,
 };
 use super::window_host_contract::{
     HostWindowTopology, HostWindows, OpaqueWindowHandle, OpaqueWindowId, WindowGeneration,
@@ -155,7 +156,10 @@ pub(crate) enum NativeWindowIntent {
         width: i32,
         height: i32,
     },
-    SetCursor(NativeCursorIcon),
+    SetCursorPolicy {
+        icon: NativeCursorIcon,
+        auto_hide_allowed: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -168,7 +172,9 @@ pub(crate) struct NativeFocusState {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeWindowObservation {
     pub(crate) cursor_client_position: Option<[i32; 2]>,
-    pub(crate) cursor_within_client: bool,
+    pub(crate) cursor_input_owned: bool,
+    pub(crate) cursor_hidden: bool,
+    pub(crate) cursor_last_activity: Option<std::time::Instant>,
     pub(crate) focus: NativeFocusState,
     pub(crate) global_lbutton_down: bool,
     pub(crate) has_hud: bool,
@@ -179,7 +185,9 @@ impl Default for NativeWindowObservation {
     fn default() -> Self {
         Self {
             cursor_client_position: None,
-            cursor_within_client: true,
+            cursor_input_owned: false,
+            cursor_hidden: false,
+            cursor_last_activity: None,
             focus: NativeFocusState {
                 target_id: 0,
                 thread_focus_id: 0,
@@ -250,7 +258,6 @@ enum NativeOwnedWindows {
 pub(crate) struct NativeWindowHost {
     windows: NativeOwnedWindows,
     affinity: WindowThreadAffinity,
-    cursor_was_hidden: Arc<std::sync::atomic::AtomicBool>,
     editor_hwnds_snapshot: Option<Arc<RwLock<std::collections::HashSet<u64>>>>,
     main_hwnd_for_raise: u64,
     last_logged_region_hash: Option<u64>,
@@ -264,7 +271,6 @@ impl NativeWindowHost {
         let affinity = WindowThreadAffinity::current();
         let generation = config.window.generation;
         let presenter = NativeVideoWindow::create(config.window)?;
-        let cursor_was_hidden = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let windows = match config.hud {
             NativeHudWindowRequest::Disabled => NativeOwnedWindows::PresenterOnly { presenter },
             NativeHudWindowRequest::Enabled { width, height } => {
@@ -288,7 +294,6 @@ impl NativeWindowHost {
                     height,
                     event_sink: config.event_sink,
                     regions: Arc::clone(&regions),
-                    cursor_was_hidden: Arc::clone(&cursor_was_hidden),
                 };
                 match hud_window::HudOverlayWindow::create(hud_config) {
                     Ok(hud) => NativeOwnedWindows::PresenterAndHud {
@@ -308,7 +313,6 @@ impl NativeWindowHost {
         let this = Self {
             windows,
             affinity,
-            cursor_was_hidden,
             editor_hwnds_snapshot: None,
             main_hwnd_for_raise: 0,
             last_logged_region_hash: None,
@@ -414,21 +418,11 @@ impl NativeWindowHost {
                 None
             }
         };
-        let cursor_within_client = unsafe {
-            let mut rect = RECT::default();
-            match (
-                cursor_client_position,
-                GetClientRect(hwnd, &mut rect).is_ok(),
-            ) {
-                (Some([x, y]), true) => {
-                    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
-                }
-                _ => true,
-            }
-        };
         NativeWindowObservation {
             cursor_client_position,
-            cursor_within_client,
+            cursor_input_owned: false,
+            cursor_hidden: false,
+            cursor_last_activity: None,
             focus: NativeFocusState {
                 target_id: hwnd.0 as usize as u64,
                 thread_focus_id: super::native_window::thread_focus_hwnd(),
@@ -448,7 +442,6 @@ impl NativeWindowHost {
         let Self {
             windows,
             affinity,
-            cursor_was_hidden,
             editor_hwnds_snapshot,
             main_hwnd_for_raise,
             last_logged_region_hash,
@@ -470,7 +463,6 @@ impl NativeWindowHost {
         Self {
             windows,
             affinity,
-            cursor_was_hidden,
             editor_hwnds_snapshot,
             main_hwnd_for_raise,
             last_logged_region_hash,
@@ -505,6 +497,21 @@ impl NativeWindowHost {
             NativeOwnedWindows::PresenterAndHud { hud, .. } => unsafe {
                 GetCapture() == hud.hwnd()
             },
+        }
+    }
+
+    pub(crate) fn cursor_capture_source(&self) -> Option<NativeVideoWindowSource> {
+        self.assert_owner_thread();
+        let capture = unsafe { GetCapture() };
+        if capture == self.presenter().hwnd() {
+            return Some(NativeVideoWindowSource::Presenter);
+        }
+        match &self.windows {
+            NativeOwnedWindows::PresenterOnly { .. } => None,
+            NativeOwnedWindows::PresenterAndHud { hud, .. } if capture == hud.hwnd() => {
+                Some(NativeVideoWindowSource::Hud)
+            }
+            NativeOwnedWindows::PresenterAndHud { .. } => None,
         }
     }
 
@@ -616,31 +623,32 @@ impl NativeWindowHost {
                         }
                     }
                 }
-                NativeWindowIntent::SetCursor(icon) => {
-                    let hidden = icon == NativeCursorIcon::Hidden;
-                    self.cursor_was_hidden
-                        .store(hidden, std::sync::atomic::Ordering::Release);
-                    if hidden {
-                        unsafe {
-                            SetCursor(None);
-                        }
-                        continue;
-                    }
-                    let cursor_id = match icon {
-                        NativeCursorIcon::Hidden => unreachable!(),
-                        NativeCursorIcon::Hand => IDC_HAND,
-                        NativeCursorIcon::Text => IDC_IBEAM,
-                        NativeCursorIcon::ResizeHorizontal => IDC_SIZEWE,
-                        NativeCursorIcon::ResizeVertical => IDC_SIZENS,
-                        NativeCursorIcon::Move => IDC_SIZEALL,
-                        NativeCursorIcon::NotAllowed => IDC_NO,
-                        NativeCursorIcon::Wait => IDC_WAIT,
-                        NativeCursorIcon::Arrow => IDC_ARROW,
-                    };
-                    if let Ok(cursor) = unsafe { LoadCursorW(None, cursor_id) } {
-                        unsafe {
-                            SetCursor(Some(cursor));
-                        }
+                NativeWindowIntent::SetCursorPolicy { .. } => {}
+            }
+        }
+    }
+
+    pub(crate) fn apply_cursor_icon(&self, icon: NativeCursorIcon) {
+        self.assert_owner_thread();
+        match icon {
+            NativeCursorIcon::Hidden => unsafe {
+                SetCursor(None);
+            },
+            icon => {
+                let cursor_id = match icon {
+                    NativeCursorIcon::Hidden => unreachable!(),
+                    NativeCursorIcon::Hand => IDC_HAND,
+                    NativeCursorIcon::Text => IDC_IBEAM,
+                    NativeCursorIcon::ResizeHorizontal => IDC_SIZEWE,
+                    NativeCursorIcon::ResizeVertical => IDC_SIZENS,
+                    NativeCursorIcon::Move => IDC_SIZEALL,
+                    NativeCursorIcon::NotAllowed => IDC_NO,
+                    NativeCursorIcon::Wait => IDC_WAIT,
+                    NativeCursorIcon::Arrow => IDC_ARROW,
+                };
+                if let Ok(cursor) = unsafe { LoadCursorW(None, cursor_id) } {
+                    unsafe {
+                        SetCursor(Some(cursor));
                     }
                 }
             }

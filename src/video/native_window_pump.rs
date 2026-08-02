@@ -10,9 +10,14 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
+use super::native_cursor::{
+    CursorAutoHideReducer, CursorRoutingEvent, CursorRoutingEventKind, CursorRoutingState,
+    reduce_cursor_routing_batch,
+};
 use super::native_window::{
-    NativeVideoWindowEvent, NativeVideoWindowEventEnvelope, NativeWindowEventReceiver,
-    NativeWindowEventRoute, native_window_event_route, post_typed_pump_quit,
+    NativeCursorOwnershipEdge, NativeVideoWindowEvent, NativeVideoWindowEventEnvelope,
+    NativeVideoWindowSource, NativeWindowEventReceiver, NativeWindowEventRoute,
+    native_window_event_route, post_typed_pump_quit,
 };
 use super::native_window_host::{
     NativeHudWindowRequest, NativeRenderTargetTransfer, NativeWindowHost, NativeWindowHostConfig,
@@ -81,6 +86,9 @@ enum PumpCommand {
     RaiseHud {
         epoch: u64,
     },
+    CursorActivity {
+        epoch: u64,
+    },
     RenderFault {
         request: u64,
         message: String,
@@ -101,7 +109,8 @@ impl PumpCommand {
             Self::Visibility { .. }
             | Self::Resize { .. }
             | Self::RaisePresenter { .. }
-            | Self::RaiseHud { .. } => None,
+            | Self::RaiseHud { .. }
+            | Self::CursorActivity { .. } => None,
         }
     }
 }
@@ -232,6 +241,10 @@ impl NativeWindowPumpRenderClient {
         self.send_control(PumpCommand::RaiseHud { epoch })
     }
 
+    pub(crate) fn mark_cursor_activity(&self, epoch: u64) -> Result<(), String> {
+        self.send_control(PumpCommand::CursorActivity { epoch })
+    }
+
     pub(crate) fn render_fault(&self, request: u64, message: String) {
         let _ = self.send_control(PumpCommand::RenderFault { request, message });
     }
@@ -357,6 +370,8 @@ struct PumpRuntime {
     parent_sizes: HashMap<WindowEpoch, (u32, u32)>,
     last_child_reflow: Instant,
     last_observation: Instant,
+    cursor_routing: CursorRoutingState,
+    cursor: CursorAutoHideReducer,
     shutdown_request: u64,
     quitting: bool,
 }
@@ -374,6 +389,7 @@ impl PumpRuntime {
         spawn
             .health
             .record_pump_thread(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() });
+        let cursor = CursorAutoHideReducer::new(spawn.config.cursor_hide_delay_secs);
         Self {
             config: spawn.config,
             cancel: spawn.cancel,
@@ -399,6 +415,8 @@ impl PumpRuntime {
             parent_sizes: HashMap::new(),
             last_child_reflow: Instant::now(),
             last_observation: Instant::now(),
+            cursor_routing: CursorRoutingState::Unknown,
+            cursor,
             shutdown_request: 0,
             quitting: false,
         }
@@ -461,6 +479,7 @@ impl PumpRuntime {
     fn handle_command(&mut self, command: PumpCommand) -> Result<(), String> {
         match command {
             PumpCommand::Open(request) => {
+                self.reset_cursor_for_transition(WindowEpoch(request.epoch));
                 self.requests.insert(WindowEpoch(request.epoch), request);
                 let spec = self.spec_for(request.placement);
                 self.dispatch(WindowHostInput::Command(WindowHostCommand::Open {
@@ -471,6 +490,8 @@ impl PumpRuntime {
                 }))?;
             }
             PumpCommand::Switch(request) => {
+                let reset_epoch = active_epoch(self.state).unwrap_or(WindowEpoch(request.epoch));
+                self.reset_cursor_for_transition(reset_epoch);
                 self.requests.insert(WindowEpoch(request.epoch), request);
                 let spec = self.spec_for(request.placement);
                 self.dispatch(WindowHostInput::Command(
@@ -498,6 +519,9 @@ impl PumpRuntime {
                 }))?;
             }
             PumpCommand::Visibility { epoch, visible } => {
+                if !visible {
+                    self.reset_cursor_for_transition(WindowEpoch(epoch));
+                }
                 self.dispatch(WindowHostInput::Command(WindowHostCommand::SetVisibility {
                     epoch: WindowEpoch(epoch),
                     visibility: visibility(visible),
@@ -526,6 +550,14 @@ impl PumpRuntime {
                 }))?;
             }
             PumpCommand::RaiseHud { epoch } => self.schedule_hud_raise(WindowEpoch(epoch)),
+            PumpCommand::CursorActivity { epoch } => {
+                let key = WindowEpoch(epoch);
+                if cursor_input_epoch(self.state) == Some(key) {
+                    let icon = self.cursor.record_external_activity(Instant::now());
+                    self.apply_cursor_icon(key, icon);
+                    self.record_cursor_health(key);
+                }
+            }
             PumpCommand::RenderFault { request, message } => {
                 self.record_fault(&message);
                 let _ = self.send_lifecycle(PumpLifecycleEvent::Fault {
@@ -628,9 +660,17 @@ impl PumpRuntime {
         };
         let width = (placement.rect.right - placement.rect.left).max(1) as u32;
         let height = (placement.rect.bottom - placement.rect.top).max(1) as u32;
-        let sink = super::native_window::NativeVideoWindowEventSink::new(
+        let presenter_sink = super::native_window::NativeVideoWindowEventSink::new(
             epoch.0,
             epoch.0,
+            NativeVideoWindowSource::Presenter,
+            self.pump_route.clone(),
+            self.render_route.clone(),
+        );
+        let hud_sink = super::native_window::NativeVideoWindowEventSink::new(
+            epoch.0,
+            epoch.0,
+            NativeVideoWindowSource::Hud,
             self.pump_route.clone(),
             self.render_route.clone(),
         );
@@ -644,7 +684,7 @@ impl PumpRuntime {
                 initially_visible: false,
                 activate_on_show: placement.activate_on_show,
                 close_on_escape: false,
-                event_sink: Some(sink.clone()),
+                event_sink: Some(presenter_sink),
                 generation: epoch.0,
             },
             hud: if spec.topology == HostWindowTopology::PresenterAndHud {
@@ -652,7 +692,7 @@ impl PumpRuntime {
             } else {
                 NativeHudWindowRequest::Disabled
             },
-            event_sink: sink,
+            event_sink: hud_sink,
         })?;
         window.set_editor_hwnds_snapshot(self.config.editor_hwnds_snapshot.clone());
         window.set_main_hwnd_for_raise_check(self.config.main_hwnd_for_raise);
@@ -719,8 +759,8 @@ impl PumpRuntime {
             return Ok(());
         };
         let window = window.retain_render_topology(topology);
-        window.apply_render_intents(&startup_intents);
         self.hosts.insert(key, window);
+        self.apply_window_intents(key, &startup_intents);
         self.dispatch(WindowHostInput::Event(WindowHostEvent::TargetReady {
             request: WindowRequestId(request),
             epoch: key,
@@ -732,6 +772,7 @@ impl PumpRuntime {
         host: HostedWindow,
         visibility: WindowVisibility,
     ) -> Result<(), String> {
+        self.reset_cursor_for_transition(host.epoch);
         let Some(window) = self.hosts.get(&host.epoch) else {
             return Err(format!(
                 "missing window host for publish epoch {}",
@@ -826,6 +867,7 @@ impl PumpRuntime {
     }
 
     fn destroy_host(&mut self, host: HostedWindow) -> Result<(), String> {
+        self.reset_cursor_for_transition(host.epoch);
         self.clear_published_if_matches(host.epoch);
         if let Some(mut window) = self.hosts.remove(&host.epoch) {
             window.destroy();
@@ -841,6 +883,7 @@ impl PumpRuntime {
     }
 
     fn remove_lost_host(&mut self, host: HostedWindow) {
+        self.reset_cursor_for_transition(host.epoch);
         self.clear_published_if_matches(host.epoch);
         self.hosts.remove(&host.epoch);
         self.requests.remove(&host.epoch);
@@ -904,6 +947,9 @@ impl PumpRuntime {
     fn begin_shutdown(&mut self, request: u64) {
         if self.quitting || matches!(self.state, WindowHostState::Closed) {
             return;
+        }
+        if let Some(epoch) = active_epoch(self.state) {
+            self.reset_cursor_for_transition(epoch);
         }
         self.shutdown_request = self.shutdown_request.max(request);
         if let Err(err) = self.dispatch(WindowHostInput::Command(WindowHostCommand::Shutdown {
@@ -994,10 +1040,15 @@ impl PumpRuntime {
     }
 
     fn drain_window_events(&mut self) -> Result<(), String> {
+        let active_before_drain = cursor_input_epoch(self.state);
+        let mut cursor_events = Vec::new();
         for envelope in self.pump_events.drain() {
             let epoch = WindowEpoch(envelope.epoch);
             if !self.hosts.contains_key(&epoch) {
                 continue;
+            }
+            if let Some(event) = cursor_routing_event_for_epoch(active_before_drain, &envelope) {
+                cursor_events.push(event);
             }
             match envelope.event {
                 NativeVideoWindowEvent::CloseRequested { .. } => {
@@ -1051,6 +1102,26 @@ impl PumpRuntime {
                 _ => {}
             }
         }
+        if let Some(epoch) = active_before_drain
+            && cursor_input_epoch(self.state) == Some(epoch)
+            && self.hosts.contains_key(&epoch)
+            && !cursor_events.is_empty()
+        {
+            let local_capture = self
+                .hosts
+                .get(&epoch)
+                .and_then(NativeWindowHost::cursor_capture_source);
+            let batch =
+                reduce_cursor_routing_batch(self.cursor_routing, &cursor_events, local_capture);
+            self.cursor_routing = batch.state;
+            let icon = self.cursor.apply_input_batch(
+                batch.state.input_ownership(),
+                batch.activity,
+                Instant::now(),
+            );
+            self.apply_cursor_icon(epoch, icon);
+            self.record_cursor_health(epoch);
+        }
         Ok(())
     }
 
@@ -1096,10 +1167,14 @@ impl PumpRuntime {
         let Some(update) = update else {
             return;
         };
-        let Some(window) = self.hosts.get_mut(&WindowEpoch(update.epoch)) else {
+        let epoch = WindowEpoch(update.epoch);
+        if !self.hosts.contains_key(&epoch) {
+            return;
+        }
+        self.apply_window_intents(epoch, &update.window_intents);
+        let Some(window) = self.hosts.get_mut(&epoch) else {
             return;
         };
-        window.apply_render_intents(&update.window_intents);
         if let Some(mut regions) = update.hud_regions {
             if update.fullscreen_overlay_active
                 && window.has_hud()
@@ -1122,6 +1197,11 @@ impl PumpRuntime {
 
     fn run_periodic_work(&mut self) {
         let now = Instant::now();
+        if let Some(epoch) = cursor_input_epoch(self.state) {
+            let icon = self.cursor.tick(now);
+            self.apply_cursor_icon(epoch, icon);
+            self.record_cursor_health(epoch);
+        }
         while self
             .hud_raise_deadlines
             .front()
@@ -1155,16 +1235,116 @@ impl PumpRuntime {
         if now.duration_since(self.last_observation) >= OBSERVATION_TICK {
             self.last_observation = now;
             if let Some(epoch) = active_epoch(self.state)
-                && let Some(window) = self.hosts.get(&epoch)
+                && let Some(value) = self.observe_window(epoch)
                 && let Ok(mut latest) = self.latest.observation.try_lock()
             {
                 *latest = Some(PumpObservation {
                     epoch: epoch.0,
-                    value: window.observe(),
+                    value,
                 });
             }
         }
     }
+
+    fn apply_window_intents(&mut self, epoch: WindowEpoch, intents: &[NativeWindowIntent]) {
+        for intent in intents {
+            if let NativeWindowIntent::SetCursorPolicy {
+                icon,
+                auto_hide_allowed,
+            } = *intent
+            {
+                let resolved =
+                    self.cursor
+                        .set_render_policy(icon, auto_hide_allowed, Instant::now());
+                self.apply_cursor_icon(epoch, resolved);
+            }
+        }
+        if let Some(window) = self.hosts.get(&epoch) {
+            window.apply_render_intents(intents);
+        }
+        self.record_cursor_health(epoch);
+    }
+
+    fn observe_window(&self, epoch: WindowEpoch) -> Option<NativeWindowObservation> {
+        let mut observation = self.hosts.get(&epoch)?.observe();
+        observation.cursor_input_owned = self.cursor.input_owned();
+        observation.cursor_hidden = self.cursor.hidden();
+        observation.cursor_last_activity = self.cursor.last_activity();
+        Some(observation)
+    }
+
+    fn reset_cursor_for_transition(&mut self, epoch: WindowEpoch) {
+        self.cursor_routing = CursorRoutingState::Unknown;
+        let icon = self.cursor.reset_for_transition(Instant::now());
+        debug_assert!(icon.is_none());
+        self.record_cursor_health(epoch);
+    }
+
+    fn apply_cursor_icon(
+        &self,
+        epoch: WindowEpoch,
+        icon: Option<super::native_window_host::NativeCursorIcon>,
+    ) {
+        if cursor_input_epoch(self.state) != Some(epoch)
+            || !self.cursor.input_owned()
+            || self.cursor_routing.input_ownership()
+                != super::native_cursor::CursorInputOwnership::Owned
+        {
+            return;
+        }
+        if let Some(icon) = icon
+            && let Some(window) = self.hosts.get(&epoch)
+        {
+            window.apply_cursor_icon(icon);
+        }
+    }
+
+    fn record_cursor_health(&self, epoch: WindowEpoch) {
+        if !self.hosts.contains_key(&epoch) {
+            return;
+        }
+        self.health.record_cursor_state(
+            epoch.0,
+            self.cursor.hidden(),
+            self.cursor.input_owned(),
+            self.cursor.last_activity(),
+        );
+    }
+}
+
+fn cursor_routing_event_for_epoch(
+    active_epoch: Option<WindowEpoch>,
+    envelope: &NativeVideoWindowEventEnvelope,
+) -> Option<CursorRoutingEvent> {
+    if active_epoch != Some(WindowEpoch(envelope.epoch)) || envelope.generation != envelope.epoch {
+        return None;
+    }
+    let kind = match &envelope.event {
+        NativeVideoWindowEvent::MouseMove(mouse) => {
+            CursorRoutingEventKind::Move([mouse.x, mouse.y])
+        }
+        NativeVideoWindowEvent::MouseButton(button) => CursorRoutingEventKind::Explicit {
+            position: [button.x, button.y],
+            establishes_target: button.down,
+        },
+        NativeVideoWindowEvent::MouseWheel(wheel) => CursorRoutingEventKind::Explicit {
+            position: [wheel.x, wheel.y],
+            // WM_MOUSEWHEEL is routed to the focus window, so it is genuine
+            // activity but does not by itself prove cursor input ownership.
+            establishes_target: false,
+        },
+        NativeVideoWindowEvent::CursorOwnership(edge) => match edge {
+            NativeCursorOwnershipEdge::Leave => CursorRoutingEventKind::Leave,
+            NativeCursorOwnershipEdge::CaptureLost => CursorRoutingEventKind::CaptureLost,
+            NativeCursorOwnershipEdge::TrackingFailed => CursorRoutingEventKind::TrackingFailed,
+        },
+        _ => return None,
+    };
+    Some(CursorRoutingEvent {
+        sequence: envelope.sequence,
+        source: envelope.source,
+        kind,
+    })
 }
 
 fn visibility(visible: bool) -> WindowVisibility {
@@ -1180,6 +1360,13 @@ fn active_epoch(state: WindowHostState) -> Option<WindowEpoch> {
         WindowHostState::Visible { host, .. } | WindowHostState::Hidden { host, .. } => {
             Some(host.epoch)
         }
+        _ => None,
+    }
+}
+
+fn cursor_input_epoch(state: WindowHostState) -> Option<WindowEpoch> {
+    match state {
+        WindowHostState::Visible { host, .. } => Some(host.epoch),
         _ => None,
     }
 }
@@ -1201,6 +1388,51 @@ mod tests {
 
     const STALL_TEST: &str = "video::native_window_pump::tests::production_parent_destroy_remains_bounded_during_render_stall";
     const STALL_CHILD_ENV: &str = "MIV_STAGE4_PRODUCTION_STALL_CHILD";
+
+    #[test]
+    fn cursor_route_rejects_stale_epoch_and_generation() {
+        let mut envelope = NativeVideoWindowEventEnvelope {
+            sequence: 1,
+            epoch: 8,
+            generation: 8,
+            source: NativeVideoWindowSource::Presenter,
+            event: NativeVideoWindowEvent::MouseMove(
+                super::super::native_window::NativeVideoMouseEvent {
+                    x: 10,
+                    y: 20,
+                    shift: false,
+                    ctrl: false,
+                },
+            ),
+        };
+        // Hidden/preparing/closing states expose no cursor input epoch, so
+        // queued pre-transition mouse messages cannot reseed ownership.
+        assert!(cursor_routing_event_for_epoch(None, &envelope).is_none());
+        assert!(cursor_routing_event_for_epoch(Some(WindowEpoch(7)), &envelope).is_none());
+        assert!(cursor_routing_event_for_epoch(Some(WindowEpoch(8)), &envelope).is_some());
+        envelope.generation = 7;
+        assert!(cursor_routing_event_for_epoch(Some(WindowEpoch(8)), &envelope).is_none());
+    }
+
+    #[test]
+    fn cursor_ownership_path_has_no_synchronous_hit_testing_or_send_message() {
+        let sources = [
+            include_str!("native_cursor.rs"),
+            include_str!("native_window.rs"),
+            include_str!("native_window_host.rs"),
+            include_str!("native_window_host/hud_window.rs"),
+            include_str!("native_presenter/render_core.rs"),
+            include_str!("native_window_pump.rs"),
+        ];
+        let window_from_point = ["Window", "FromPoint", "("].concat();
+        let send_message_w = ["Send", "MessageW", "("].concat();
+        let send_message_a = ["Send", "MessageA", "("].concat();
+        for source in sources {
+            assert!(!source.contains(&window_from_point));
+            assert!(!source.contains(&send_message_w));
+            assert!(!source.contains(&send_message_a));
+        }
+    }
 
     #[test]
     #[ignore = "requires Windows DComp hardware; runs in a watchdog subprocess"]
