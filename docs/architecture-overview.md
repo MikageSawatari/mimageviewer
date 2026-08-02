@@ -173,6 +173,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | モジュール | 役割 |
 | --- | --- |
 | `adjustment.rs` | `AdjustParams` (輝度/コントラスト/γ/彩度/色温度…)、LUT 適用、オート補正 |
+| `final_composite.rs` | 静止画のページ個別 > 現在地標準 > global 解決、`FinalCompositePlan`、tone → smart sharpen → colorize → Creative LUT → post_filter の共有 CPU executor。元画像・編集結果の materialize、final AI、cache / worker / GPU upload は App / remote adapter 側に残す |
 | `adjustment_db.rs` | フォルダ別プリセット・ページ別プリセットの SQLite 永続化 |
 | `rotation_db.rs` | 非破壊回転の SQLite 永続化 |
 | `audio_normalize_db.rs` | 動画音量ノーマライズの per-file 測定値 (integrated LUFS / true peak / 算出ゲイン) の SQLite 永続化 |

@@ -72,6 +72,7 @@ pub mod file_drag;
 pub mod filename_sort;
 pub mod filename_stack;
 pub mod filename_stack_script;
+mod final_composite;
 // filename_stack_ui は private な App へ impl を追加する library-internal module。
 mod filename_stack_ui;
 pub mod folder_pane;

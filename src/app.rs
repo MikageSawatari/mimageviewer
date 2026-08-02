@@ -6,6 +6,11 @@ use std::sync::{
     mpsc,
 };
 
+#[cfg(test)]
+use crate::final_composite::FinalCompositeTiming;
+use crate::final_composite::{
+    FinalCompositePlan, FinalCompositeResult, execute_final_composite, resolve_effective_params,
+};
 use crate::keymap::{CommandScope, KeyAction, LOCATION_NAVIGATION_ACTIONS, PINNED_TAG_ACTIONS};
 
 /// ZIP/対応アーカイブ、および本扱いの画像のみフォルダを読むときのページ順。
@@ -6026,128 +6031,12 @@ pub(crate) struct ColorizeMonoSummary {
 
 pub(crate) struct FinalEffectPending {
     cancel: Arc<AtomicBool>,
-    rx: mpsc::Receiver<FinalEffectResult>,
+    rx: mpsc::Receiver<FinalCompositeResult>,
     items_generation: u64,
     output_complete: bool,
     nearest_sampler: bool,
     /// 非表示ページの先読みとして起動した worker。表示要求時は同じ job を昇格して再利用する。
     prefetch: bool,
-}
-
-pub(crate) enum FinalEffectResult {
-    Ready {
-        pixels: Arc<egui::ColorImage>,
-        elapsed_ms: f64,
-        timing: FinalEffectTiming,
-    },
-    Cancelled,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct FinalEffectTiming {
-    adjust_ms: f64,
-    sharpen_ms: f64,
-    colorize_check_ms: f64,
-    colorize_apply_ms: f64,
-    creative_lut_ms: f64,
-    post_filter_ms: f64,
-    colorize_applied: bool,
-    colorize_mode: crate::colorize::ColorizeMode,
-    tone_method: crate::colorize::ToneDensityMethod,
-    tone_radius: f32,
-}
-
-struct FinalEffectJob {
-    source: Arc<egui::ColorImage>,
-    /// AI を使わない先読みでは、色調補正も worker 上で行って UI を止めない。
-    adjust_before_effect: Option<crate::adjustment::AdjustParams>,
-    smart_sharpen: u8,
-    colorize: crate::colorize::ColorizeParams,
-    creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
-    post_filter: crate::adjustment::PostFilter,
-}
-
-fn run_final_effect_job(job: FinalEffectJob, cancel: &AtomicBool) -> FinalEffectResult {
-    let started = std::time::Instant::now();
-    let mut timing = FinalEffectTiming {
-        colorize_mode: job.colorize.mode,
-        tone_method: job.colorize.tone_method,
-        tone_radius: job.colorize.tone_radius,
-        ..FinalEffectTiming::default()
-    };
-    if cancel.load(Ordering::Relaxed) {
-        return FinalEffectResult::Cancelled;
-    }
-    let stage_started = std::time::Instant::now();
-    let adjusted = if let Some(params) = job.adjust_before_effect.as_ref() {
-        Arc::new(crate::adjustment::apply_adjustments_fast(
-            &job.source,
-            params,
-        ))
-    } else {
-        job.source
-    };
-    timing.adjust_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
-    if cancel.load(Ordering::Relaxed) {
-        return FinalEffectResult::Cancelled;
-    }
-    let stage_started = std::time::Instant::now();
-    let sharpened = if job.smart_sharpen == 0 {
-        adjusted
-    } else {
-        Arc::new(crate::adjustment::apply_final_smart_sharpen(
-            &adjusted,
-            job.smart_sharpen,
-        ))
-    };
-    timing.sharpen_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
-    if cancel.load(Ordering::Relaxed) {
-        return FinalEffectResult::Cancelled;
-    }
-    let stage_started = std::time::Instant::now();
-    timing.colorize_applied = crate::colorize::should_apply(&sharpened, &job.colorize);
-    timing.colorize_check_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
-    let stage_started = std::time::Instant::now();
-    let colorized = if timing.colorize_applied {
-        match crate::colorize::apply_applicable_with_cancel(&sharpened, &job.colorize, cancel) {
-            Some(image) => Arc::new(image),
-            None => return FinalEffectResult::Cancelled,
-        }
-    } else {
-        sharpened
-    };
-    timing.colorize_apply_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
-    if cancel.load(Ordering::Relaxed) {
-        return FinalEffectResult::Cancelled;
-    }
-    let stage_started = std::time::Instant::now();
-    let lut_applied = if let Some((lut, strength)) = job.creative_lut {
-        Arc::new(crate::creative_lut::apply_to_color_image(
-            &colorized, &lut, strength,
-        ))
-    } else {
-        colorized
-    };
-    timing.creative_lut_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
-    if cancel.load(Ordering::Relaxed) {
-        return FinalEffectResult::Cancelled;
-    }
-    let stage_started = std::time::Instant::now();
-    let pixels = if job.post_filter != crate::adjustment::PostFilter::None {
-        Arc::new(crate::post_filter::apply(&lut_applied, job.post_filter))
-    } else {
-        lut_applied
-    };
-    timing.post_filter_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
-    if cancel.load(Ordering::Relaxed) {
-        FinalEffectResult::Cancelled
-    } else {
-        FinalEffectResult::Ready {
-            pixels,
-            elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
-            timing,
-        }
-    }
 }
 
 /// 見開きから消しゴムに入ったときのコンテキスト。Apply / Cancel で
@@ -49728,15 +49617,14 @@ impl App {
                     (Arc::clone(&edit_pixels), false, adjust)
                 }
             };
-            let job = FinalEffectJob {
-                source,
+            let plan = FinalCompositePlan {
                 adjust_before_effect,
                 smart_sharpen: params.effective_smart_sharpen(used_upscale),
                 colorize: params.colorize.clone(),
                 creative_lut,
                 post_filter: params.post_filter,
             };
-            if self.spawn_final_effect_job(ctx, final_key, job, true, true) {
+            if self.spawn_final_effect_job(ctx, final_key, source, plan, true, true) {
                 // 背景 CPU / GPU と完成時 upload を一度に積み上げない。
                 return;
             }
@@ -53825,7 +53713,7 @@ impl App {
                 continue;
             }
             match result {
-                FinalEffectResult::Ready {
+                FinalCompositeResult::Ready {
                     pixels,
                     elapsed_ms,
                     timing,
@@ -53919,7 +53807,7 @@ impl App {
                         );
                     }
                 }
-                FinalEffectResult::Cancelled => {
+                FinalCompositeResult::Cancelled => {
                     self.final_composite_cache
                         .remove_with_drop_reason(&key, "worker_cancelled");
                 }
@@ -53974,8 +53862,7 @@ impl App {
             return existing_texture;
         }
 
-        let job = FinalEffectJob {
-            source,
+        let plan = FinalCompositePlan {
             adjust_before_effect: None,
             smart_sharpen: 0,
             colorize: params.colorize.clone(),
@@ -53988,7 +53875,7 @@ impl App {
                 .flatten(),
             post_filter: params.post_filter,
         };
-        let _ = self.spawn_final_effect_job(ctx, key, job, output_complete, false);
+        let _ = self.spawn_final_effect_job(ctx, key, source, plan, output_complete, false);
         existing_texture
     }
 
@@ -54007,11 +53894,12 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         key: FinalCompositeKey,
-        job: FinalEffectJob,
+        source: Arc<egui::ColorImage>,
+        plan: FinalCompositePlan,
         output_complete: bool,
         prefetch: bool,
     ) -> bool {
-        let nearest_sampler = job.post_filter.needs_nearest_sampler();
+        let nearest_sampler = plan.needs_nearest_sampler();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
@@ -54023,7 +53911,7 @@ impl App {
         let spawn_result = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                let _ = tx.send(run_final_effect_job(job, &worker_cancel));
+                let _ = tx.send(execute_final_composite(source, plan, &worker_cancel));
             });
         match spawn_result {
             Ok(_) => {
@@ -56154,27 +56042,34 @@ impl App {
     ///
     /// 所有権が必要な呼び出し側は `.clone()` する。毎フレーム呼ばれるので無用なクローンを避ける。
     pub(crate) fn effective_params(&self, idx: usize) -> &crate::adjustment::AdjustParams {
-        if let Some(p) = self.adjustment_page_params.get(&idx) {
-            return p;
-        }
+        resolve_effective_params(
+            self.adjustment_page_params.get(&idx),
+            || self.location_default_adjust_params(idx),
+            &self.settings.global_preset,
+        )
+    }
+
+    /// 現在地 (製本ページ / 最近祖先の ON お気に入り) の標準。祖先探索は `PathBuf` 確保を
+    /// 伴うので、ページ個別がある idx では呼ばれない位置に置く。
+    fn location_default_adjust_params(
+        &self,
+        idx: usize,
+    ) -> Option<&crate::adjustment::AdjustParams> {
         if self.idx_is_compiled_book_page(idx) {
-            return Self::book_page_default_adjust_params();
+            return Some(Self::book_page_default_adjust_params());
         }
-        if let Some(p) = self.favorite_default_for_idx(idx) {
-            return p;
-        }
-        &self.settings.global_preset
+        self.favorite_default_for_idx(idx)
     }
 
     /// 指定 idx のコンテキストにおける「ページ個別を除いた有効パラメータ」。
     /// 個別設定の冗長判定 (個別を保存する意味があるか) に使う。
     /// 最近祖先の ON お気に入りがあればその標準、そうでなければ global。
     pub(crate) fn effective_default_for_idx(&self, idx: usize) -> &crate::adjustment::AdjustParams {
-        if self.idx_is_compiled_book_page(idx) {
-            return Self::book_page_default_adjust_params();
-        }
-        self.favorite_default_for_idx(idx)
-            .unwrap_or(&self.settings.global_preset)
+        resolve_effective_params(
+            None,
+            || self.location_default_adjust_params(idx),
+            &self.settings.global_preset,
+        )
     }
 
     fn refresh_edit_rollup_keys_from_dbs(&mut self) {

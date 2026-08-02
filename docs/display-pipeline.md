@@ -1347,6 +1347,12 @@ colorize / Creative LUT / post-filter は意図的に飛ばすため、grid / fu
   `final_composite_cache` を表示用に残したまま同一 key で再合成する。final-effect worker
   完了時の `insert` が未完了 entry を上書きするため、再合成中も直前のカラー化済み表示が
   継続する。
+- **共有 final composite 層**: tone / smart sharpen / colorize / Creative LUT / post_filter の
+  CPU 実行順は `final_composite::FinalCompositePlan` と `execute_final_composite` が App / remote
+  で共有する。final AI は tone 後・smart sharpen 前の独立した非同期 cache 層なので plan には
+  含めず、adapter が AI 前後の source と `used_upscale` 解決を所有する。raw / edit result の
+  source 選択も materialize と世代管理を持つ adapter の責務で、共有 executor は選択済み pixels
+  だけを受け取る。
 - **AI 結果の保持 LRU**: 完了済みの final AI pixels は `retained_final_ai_cache` にも
   `metadata_cache_key(idx) + edit_size + color_ai_hash + bg` で保持する。entry には
   smart sharpen 判定用の `used_upscale` も保持する。通常の

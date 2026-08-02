@@ -194,7 +194,7 @@ PC 側の表示も変わる。これは「操作感を揃える」の必然的�
 
 | 段 | 内容 | 価値 |
 | --- | --- | --- |
-| **0** | 段の順序とパラメータ解決を共有関数へ切り出す (§4.2) | これ自体は無変化。以降すべての土台 |
+| **0 ✅** | 段の順序とパラメータ解決を共有関数へ切り出す (§4.2) | これ自体は無変化。以降すべての土台 |
 | **1** | リモートのページレンダを共有関数に通す (色調 / フィルタ) | スマホで見る絵が PC と一致する |
 | **2** | 静止画の左パネル UI (画像補正・表示トリム・ブックマーク、編集系を除く) | 参照系が揃う |
 | **3** | **カラー化 / AI** をリモートから起動できるようにする | **利用者が最重要と挙げた 2 つ** |
@@ -399,3 +399,59 @@ PDF 再レンダや編集結果の materialize のため。
 4. App と remote が**それぞれ所有する** cache / worker / cancellation / 出力 adapter
 
 > 共有すべきものは**段取りを表す plan と変換 executor**。`egui::Context` は App 側 adapter に残す。
+
+#### 段 0 実装結果 (2026-08-03)
+
+`src/final_composite.rs` に次を切り出した:
+
+- `resolve_effective_params(page, location, global)` — 値だけを受け、ページ個別 > 現在地標準 >
+  global の参照を返す。`App::effective_params(idx)` はお気に入り最深一致や製本ページ標準を集める
+  adapter となり、従来と同じ優先順位でこの resolver を呼ぶ
+- `FinalCompositePlan` — tone、実行済み AI を踏まえた smart sharpen 強度、colorize、解決済み
+  Creative LUT、post_filter を保持する
+- `execute_final_composite` — 旧 `run_final_effect_job` の段順、cancel 境界、`should_apply` 判定を
+  そのまま移した共有 CPU executor
+
+元画像の選択は plan に含めない。raw / edit result の materialize は DB、generation、pending、
+cache の所有権を必要とし、選択済み pixels が executor の入力境界だからである。final AI も plan に
+含めない。現行どおり tone 後・smart sharpen 前に独立 cache / worker として実行し、adapter が
+AI 結果の有無と `used_upscale` を解決してから plan を作る。段 3 では remote adapter が同じ位置に
+自分の AI job / cache を持つ。
+
+#### 段 1 の編集結果供給契約
+
+remote adapter は `LoadRequest` の edit-preview 分岐を full-page の正本にはせず、次の安定キーを
+1 回導出して、補正・編集の全 DB lookup で共有する:
+
+- 通常画像: `adjustment_db::normalize_path(path)`
+- ZIP entry: `adjustment_db::zip_entry_key(zip_path, entry_name)`
+- PDF page: `adjustment_db::zip_entry_key(pdf_path, "page_{page_number}")`
+
+raw decode 後、App の `ensure_edit_result_pixels` と同じ順で headless materialize する:
+
+1. `mask.db` の bitmap + vector mask を source 寸法へ復元し、マスクがあれば MI-GAN inpaint
+2. `local_adjust.db` の layer JSON を読み、erase 結果を入力に `local-adjust-core` で合成
+3. `conceal.db` の bitmap + vector mask と現在の conceal preset を読み、local-adjust 結果へ合成
+
+この結果が `FinalCompositePlan` executor へ渡す edit-result source になる。各 DB handle、MI-GAN / local /
+conceal worker、cancel、generation、CPU result cache は remote session が所有し、App cache や
+`egui::Context` を共有しない。未完成の上位 layer がある間に下位 pixels から完成 result を作らない
+点も App と同じ契約にする。
+
+段 1 ではこの順序を remote に書き直さない。`App::assemble_edit_result_pixels` の layer 選択と、
+MI-GAN / local-adjust / conceal の UI 非依存 worker body を typed な edit-source request / executor として
+共有層へ出し、App adapter もそこへ接続し直す。App と remote の違いは DB snapshot・cache・worker
+queue・generation の所有者だけにする。これは元画像選択を `FinalCompositePlan` へ混ぜず、別の
+materialize 境界として共有するという段 0 の判断の後半である。
+
+`ensure_edit_result_pixels` 自体にはテキストと crop は入らない。テキストは complete な final
+composite の後段で `comic.db` の scene を同じ font / stamp resolver で source 座標から出力寸法へ
+scale してベイクする。crop は `export_crop.db` の設定を読み、テキスト合成後の最終出力へ
+`export_crop_rect_for_pixels` と同じ座標変換で適用する。したがって段 1 の headless 出力順は
+`raw → erase → local-adjust → conceal → shared final composite → comic → export crop → WebP encode`
+とする。
+
+`edit_preview_cache` は最大辺 2048px・下地 WebP q=90 で、保存も編集画面を閉じた境界に限られる。
+full-page の正本にすると解像度と鮮度の両方で App と一致しないため、段 1 の canonical source には
+使わない。`edit_preview_key` / `edit_preview_db` / `skip_cache` の 3 重外れを個別に直す配線も作らず、
+上記 headless materializer へ置き換える。

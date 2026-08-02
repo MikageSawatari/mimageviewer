@@ -21622,10 +21622,10 @@ mod pipeline_cache_refactor_tests {
         ));
         let (final_effect_tx, final_effect_rx) = std::sync::mpsc::channel();
         final_effect_tx
-            .send(FinalEffectResult::Ready {
+            .send(FinalCompositeResult::Ready {
                 pixels: Arc::clone(&complete_pixels),
                 elapsed_ms: 0.0,
-                timing: FinalEffectTiming::default(),
+                timing: FinalCompositeTiming::default(),
             })
             .unwrap();
         let items_generation = app.items_generation;
@@ -21890,10 +21890,10 @@ mod pipeline_cache_refactor_tests {
         ));
         let items_generation = app.items_generation;
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(FinalEffectResult::Ready {
+        tx.send(FinalCompositeResult::Ready {
             pixels: Arc::clone(&provisional_pixels),
             elapsed_ms: 0.0,
-            timing: FinalEffectTiming::default(),
+            timing: FinalCompositeTiming::default(),
         })
         .unwrap();
         app.final_effect_pending.insert(
@@ -21934,10 +21934,10 @@ mod pipeline_cache_refactor_tests {
             egui::Color32::from_rgb(130, 105, 80),
         ));
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(FinalEffectResult::Ready {
+        tx.send(FinalCompositeResult::Ready {
             pixels: complete_pixels,
             elapsed_ms: 0.0,
-            timing: FinalEffectTiming::default(),
+            timing: FinalCompositeTiming::default(),
         })
         .unwrap();
         app.final_effect_pending.insert(

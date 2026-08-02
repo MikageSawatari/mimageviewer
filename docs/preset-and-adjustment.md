@@ -47,7 +47,11 @@ effective =
       ?? settings.global_preset
 ```
 
-解決は `App::effective_params(idx)` に集約される。お気に入り層のルックアップには
+値の優先順位そのものは `final_composite::resolve_effective_params(page, location, global)` が
+共有する。`App::effective_params(idx)` は App adapter としてページ個別値を渡し、現在地標準は
+closure (`App::location_default_adjust_params(idx)`) として渡す。**ページ個別があるときに
+お気に入り探索を起こさないのは性能契約**で、この関数は毎フレーム呼ばれ、探索は `PathBuf`
+確保と祖先走査を伴う。お気に入り層のルックアップには
 `App::active_favorite_default_id_for_idx(idx)` を使う。これは
 **祖先お気に入りのうち `adjustment_favorite_params` に行を持つ (= ON) 最深のもの**
 (パス最長一致) を返す。ネスト登録 (例: `G:\pics` と `G:\pics\AI` が両方登録) では、
