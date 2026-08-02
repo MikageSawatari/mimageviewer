@@ -341,14 +341,17 @@
 ### 1.35 リネーム移行ジャーナルの永続化 2 件
 
 - 出典: v2.9.1 出荷後の他セッションレビュー (2026-08-01、Codex)。両方とも source inspection で確認済み。
-  1. **UI スレッドでの同期 I/O (P2)**: [app.rs](../src/app.rs) の
+  1. **対応済み (v2.10.0): UI スレッドでの同期 I/O (P2)**: [app.rs](../src/app.rs) の
      `persist_rename_migration_journal` / `ensure_rename_migration_journal_loaded` は
      `rename_key_migration::journal_save` / `journal_load` を同期で呼び、その中身は
      `std::fs::read` / `write` / `remove_file` / `rename`。呼び出し元は
      `poll_rename_migration_pending` などの UI スレッド経路である。小さな JSON なので通常は
      短いが、ウイルス対策・低速ディスク・プロファイル同期の影響下では UI が止まる。
      CLAUDE.md の「UI スレッドで同期 I/O を行わない」方針にも反する。
-     対応 = worker 化するか、既存の永続化所有者へ統合する。
+     対応 = App が in-flight + queue + boot-retry の完全 snapshot を組み立てる所有境界は維持し、
+     書き出しだけを単一 latest-value worker へ移した。worker は revision 順に直列保存し、I/O 中の
+     中間 snapshot は最新値へ coalesce する。起動時 load は回復 entry を新規保存で消さない lazy guard を
+     優先して同期 1 回を維持し、通常 update の保存経路は enqueue のみ。終了時は最新 revision まで flush する。
   2. **部分失敗が再試行されない (P2、仕様判断あり)**: worker が `panicked` を返したときだけ
      ジョブを `rename_migration_boot_retry` へ戻す。`report.errors` に個別ストアの失敗が
      入った場合はトーストを出すものの、ジョブは完了扱いでジャーナルから消える。一時的な
@@ -387,13 +390,14 @@
 - 出典: v2.9.1 出荷後の他セッションレビュー (2026-08-01、ClaudeCode)。source inspection で確認済み。
   v2.9.1 で「トレイ格納中も再生を続ける」経路を新設したことで、いずれも**この版から初めて
   実際に通る**組み合わせになった。
-  1. **P2: WM_PAINT ブリッジに背圧が無い**。[tray.rs](../src/tray.rs) の常駐ループは 50ms ごとに
+  1. **対応済み (v2.10.0) / P2: WM_PAINT ブリッジに背圧が無い**。[tray.rs](../src/tray.rs) の常駐ループは 50ms ごとに
      `PostMessageW(WM_PAINT)` を投げるが、**未処理の wake を数えていない**。posted WM_PAINT は
      無効領域由来のものと違って合体されないため、隠れている間の `App::update` が 50ms を
      超えると投函が消費を上回る。戻り値は `let _ =` で捨てているので、スレッドの posted message
      queue が溢れても検出できない。
-     対応 = App 側が「wake を消費した」ことを atomic で返し、未消化が 0 のときだけ投函する。
-     ack を 1 つ足すだけで構造的に閉じる。
+     対応 = `resident_media_wake_pending` を既存共有 atomic 群へ追加し、tray thread が false→true を
+     claim できた 1 件だけ投函、`App::update` 入口で ack する構造にした。可視化・wake 不要化・
+     `PostMessageW` 失敗では pending を reset し、失敗ログは状態変化時だけ出す。
   2. **P3: 再生継続中に video processor cache を落とす**。
      [tray_integration.rs](../src/tray_integration.rs) の `release_gpu_resources` は
      detached 早期 return より前で `release_idle_pools()` を呼び、その中の

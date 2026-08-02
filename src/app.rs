@@ -8704,6 +8704,10 @@ pub struct App {
     /// 最初の enqueue / poll の前に必ず読み込む (先に enqueue の persist が走ると
     /// 前セッションの回復エントリを上書きしてしまうため)。
     pub(crate) rename_migration_journal_loaded: bool,
+    /// Filesystem writes are serialized and coalesced off the UI thread. Created lazily so an
+    /// App that never changes a rename journal does not start another resident worker.
+    pub(crate) rename_migration_journal_writer:
+        Option<crate::rename_key_migration::RenameMigrationJournalWriter>,
     /// リネーム移行完了時に main 文脈の再構築が必要だったが、補正スライダーの
     /// ドラッグ中だったため次のドラッグ終了後フレームへ繰り延べた印 (角度⑦ P1)。
     pub(crate) rename_rehydrate_main_deferred: bool,
@@ -11936,6 +11940,7 @@ impl App {
             rename_migration_in_flight: None,
             rename_migration_boot_retry: Vec::new(),
             rename_migration_journal_loaded: false,
+            rename_migration_journal_writer: None,
             rename_rehydrate_main_deferred: false,
             #[cfg(test)]
             rename_migration_data_dir_override: None,
@@ -25579,15 +25584,25 @@ impl App {
 
     /// ジャーナル (`rename_key_migration::JOURNAL_FILE`) を現在の未完了ジョブ集合
     /// (in-flight + queue + boot_retry) で書き直す。enqueue / 完了 / Disconnected の
-    /// 状態変化ごとに呼ぶ (best-effort、失敗はログのみ)。
-    fn persist_rename_migration_journal(&self) {
+    /// 状態変化ごとに呼ぶ。App は完全 snapshot の組み立てだけを担い、filesystem I/O は
+    /// latest-value writer が直列実行する (best-effort、失敗はログのみ)。
+    fn persist_rename_migration_journal(&mut self) {
         let mut entries: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
         if let Some(job) = &self.rename_migration_in_flight {
             entries.push((job.old_path.clone(), job.new_path.clone()));
         }
         entries.extend(self.rename_migration_queue.iter().cloned());
         entries.extend(self.rename_migration_boot_retry.iter().cloned());
-        crate::rename_key_migration::journal_save(&self.rename_migration_data_dir(), &entries);
+        let data_dir = self.rename_migration_data_dir();
+        self.rename_migration_journal_writer
+            .get_or_insert_with(crate::rename_key_migration::RenameMigrationJournalWriter::spawn)
+            .enqueue(data_dir, entries);
+    }
+
+    fn flush_rename_migration_journal(&self) {
+        if let Some(writer) = self.rename_migration_journal_writer.as_ref() {
+            writer.flush();
+        }
     }
 
     /// 前セッションの未完了ジャーナルを読み込んでキューへ積む。最初の enqueue / poll の
@@ -25646,8 +25661,8 @@ impl App {
     /// ([`crate::rename_key_migration`]、対象ストアと制限はモジュール doc 参照)。
     /// DB の cold open が UI を止めないよう worker スレッドで実行し、完了は
     /// `poll_rename_migration_pending` が拾って in-memory キャッシュを引き直す。
-    /// ジョブはジャーナルにも書かれ、終了 / クラッシュ / トレイ Exit
-    /// (`std::process::exit` で `on_exit` を通らない) を跨いでも次回起動時に再実行される。
+    /// ジョブはジャーナルにも書かれ、終了 / クラッシュ / トレイ Exit を跨いでも次回起動時に
+    /// 再実行される。通常終了は `on_exit`、App drop は writer の Drop が最新 snapshot を flush する。
     pub(crate) fn spawn_rename_key_migration(
         &mut self,
         old_path: std::path::PathBuf,
@@ -61051,6 +61066,7 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.acknowledge_tray_resident_media_wake();
         crate::record_ui_heartbeat_tick();
         // Select and cache the root viewport owner before any shortcut path.
         // This also ages a root PendingFocus claim on every pass, including

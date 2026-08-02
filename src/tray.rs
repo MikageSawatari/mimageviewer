@@ -26,7 +26,8 @@
 //! - **常駐中の再生**: App が既存 media owner から「再生 intent または連続 EOF 遷移中」を
 //!   projection している間だけ、トレイスレッドの既存 50ms pump が hidden main HWND へ
 //!   `WM_PAINT` を 1 件 post する。これは winit の `RedrawRequested` を明示的に起こすための
-//!   Windows bridge であり、paused / EOF 停止 / still / 可視 window では post しない。
+//!   Windows bridge であり、共有 pending claim を `App::update` 入口が ack するまで次を post
+//!   しない。paused / EOF 停止 / still / 可視 window では pending を reset して post しない。
 //!
 //! ## スレッドモデル
 //!
@@ -144,6 +145,8 @@ pub struct TrayController {
     /// App の既存 player / EOF transition owner から導出した projection であり、
     /// tray residency 自体や detached window の有無を wake 条件にはしない。
     resident_media_wake_enabled: Arc<AtomicBool>,
+    /// true while one posted WM_PAINT wake has not yet entered App::update.
+    resident_media_wake_pending: Arc<AtomicBool>,
 }
 
 impl TrayController {
@@ -176,6 +179,8 @@ impl TrayController {
         let pause_checked_th = Arc::clone(&pause_checked);
         let resident_media_wake_enabled = Arc::new(AtomicBool::new(false));
         let resident_media_wake_enabled_th = Arc::clone(&resident_media_wake_enabled);
+        let resident_media_wake_pending = Arc::new(AtomicBool::new(false));
+        let resident_media_wake_pending_th = Arc::clone(&resident_media_wake_pending);
 
         let thread = std::thread::Builder::new()
             .name("mimv-tray".into())
@@ -195,6 +200,7 @@ impl TrayController {
                     placement_slot,
                     pause_checked_th,
                     resident_media_wake_enabled_th,
+                    resident_media_wake_pending_th,
                 );
             })
             .ok()?;
@@ -207,6 +213,7 @@ impl TrayController {
             quit_flag,
             pause_checked,
             resident_media_wake_enabled,
+            resident_media_wake_pending,
         })
     }
 
@@ -265,17 +272,36 @@ impl TrayController {
     /// its continuous-EOF handoff is active. This is a latest-value projection; the tray thread
     /// samples it from its existing 50ms pump without adding another timer or worker.
     pub(crate) fn set_resident_media_wake_enabled(&self, enabled: bool) -> bool {
-        self.resident_media_wake_enabled
+        let changed = self
+            .resident_media_wake_enabled
             .swap(enabled, Ordering::AcqRel)
-            != enabled
+            != enabled;
+        if !enabled {
+            self.resident_media_wake_pending
+                .store(false, Ordering::Release);
+        }
+        changed
+    }
+
+    /// App::update entry is the consumption boundary for one posted hidden-window wake.
+    pub(crate) fn acknowledge_resident_media_wake(&self) -> bool {
+        self.resident_media_wake_pending
+            .swap(false, Ordering::AcqRel)
     }
 }
 
-fn should_post_resident_media_wake(
+fn resident_media_wake_transition(
     main_window_visible: bool,
     resident_media_wake_enabled: bool,
-) -> bool {
-    !main_window_visible && resident_media_wake_enabled
+    wake_pending: bool,
+) -> (bool, bool) {
+    if main_window_visible || !resident_media_wake_enabled {
+        (false, false)
+    } else if wake_pending {
+        (false, true)
+    } else {
+        (true, true)
+    }
 }
 
 #[cfg(test)]
@@ -296,6 +322,7 @@ impl TrayController {
             quit_flag: Arc::new(AtomicBool::new(false)),
             pause_checked: Arc::new(AtomicBool::new(false)),
             resident_media_wake_enabled: Arc::new(AtomicBool::new(false)),
+            resident_media_wake_pending: Arc::new(AtomicBool::new(false)),
         };
         (ctrl, cmd_rx, event_tx)
     }
@@ -341,6 +368,7 @@ fn run_tray_thread(
     placement_slot: PlacementSlot,
     pause_checked: Arc<AtomicBool>,
     resident_media_wake_enabled: Arc<AtomicBool>,
+    resident_media_wake_pending: Arc<AtomicBool>,
 ) {
     use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -560,6 +588,7 @@ fn run_tray_thread(
     ));
 
     let mut iter: u64 = 0;
+    let mut resident_media_wake_post_failed = false;
     while !shutdown.load(Ordering::Relaxed) {
         iter = iter.wrapping_add(1);
 
@@ -600,12 +629,29 @@ fn run_tray_thread(
         // latest projection from the existing media owners; checking IsWindowVisible here also
         // closes the hide/show race without another App flag.
         let main_window_visible = unsafe { IsWindowVisible(make_hwnd(main_hwnd)).as_bool() };
-        if should_post_resident_media_wake(
+        let pending = resident_media_wake_pending.load(Ordering::Acquire);
+        let (should_post, next_pending) = resident_media_wake_transition(
             main_window_visible,
             resident_media_wake_enabled.load(Ordering::Acquire),
-        ) {
-            unsafe {
-                let _ = PostMessageW(Some(make_hwnd(main_hwnd)), WM_PAINT, WPARAM(0), LPARAM(0));
+            pending,
+        );
+        if !next_pending {
+            resident_media_wake_pending.store(false, Ordering::Release);
+        } else if should_post
+            && resident_media_wake_pending
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let result =
+                unsafe { PostMessageW(Some(make_hwnd(main_hwnd)), WM_PAINT, WPARAM(0), LPARAM(0)) };
+            if let Err(error) = result {
+                resident_media_wake_pending.store(false, Ordering::Release);
+                if !resident_media_wake_post_failed {
+                    crate::logger::log(format!("tray: resident WM_PAINT post failed: {error:?}"));
+                    resident_media_wake_post_failed = true;
+                }
+            } else {
+                resident_media_wake_post_failed = false;
             }
         }
 
@@ -663,10 +709,39 @@ mod tests {
 
     #[test]
     fn resident_media_wake_is_bounded_to_hidden_active_playback() {
-        assert!(should_post_resident_media_wake(false, true));
-        assert!(!should_post_resident_media_wake(true, true));
-        assert!(!should_post_resident_media_wake(false, false));
-        assert!(!should_post_resident_media_wake(true, false));
+        assert_eq!(
+            resident_media_wake_transition(false, true, false),
+            (true, true)
+        );
+        assert_eq!(
+            resident_media_wake_transition(false, true, true),
+            (false, true)
+        );
+        assert_eq!(
+            resident_media_wake_transition(false, false, true),
+            (false, false)
+        );
+        assert_eq!(
+            resident_media_wake_transition(true, true, true),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn resident_media_wake_ack_allows_the_next_post() {
+        let (ctrl, _cmd_rx, _event_tx) = TrayController::new_for_test();
+        ctrl.resident_media_wake_pending
+            .store(true, Ordering::Release);
+        assert!(ctrl.acknowledge_resident_media_wake());
+        let pending = ctrl.resident_media_wake_pending.load(Ordering::Acquire);
+        assert_eq!(
+            resident_media_wake_transition(false, true, pending),
+            (true, true)
+        );
+        ctrl.resident_media_wake_pending
+            .store(true, Ordering::Release);
+        ctrl.set_resident_media_wake_enabled(false);
+        assert!(!ctrl.resident_media_wake_pending.load(Ordering::Acquire));
     }
 
     /// 同じ値で 2 回叩いても冪等 (atomic への二重 store は無害、command 2 通は届く)。

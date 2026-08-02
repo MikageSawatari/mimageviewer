@@ -158,6 +158,20 @@ worker が途中で新しいエントリを読んだ場合、結果を UI に返
 worker や UI 側の優先書き込みを尊重できる。例: [execute_search](../src/app.rs) の
 `xmp_additions` マージ。
 
+### 2.4 latest-value 永続化 writer
+
+状態全体の小さな snapshot を頻繁に保存する場合は、要求ごとの短命 worker ではなく単一 writer を
+使う。UI は正本状態から完全 snapshot を作って共有 latest slot を置換し、worker は I/O 中に届いた
+中間値を捨てて最新値だけを次に書く。書き出しを 1 本へ直列化することで、古い内容が新しい内容の
+後から完了して上書きすることを防ぐ。各 snapshot に単調 revision を付け、終了時だけ最新 revision の
+完了まで Condvar で flush する。通常の `App::update` は slot 置換と notify だけを行う。
+
+実例はリネーム移行ジャーナル (`RenameMigrationJournalWriter`)。内容の正本は App の in-flight + FIFO
+queue + boot-retry のままで、worker は JSON の write / remove / rename だけを担う。起動時 load は、
+前セッションの回復 entry を新規 enqueue の保存で消さない順序が必要なため、最初の enqueue / poll
+前に同期で 1 回だけ行う。非同期 load に変える場合は Loaded になるまで enqueue と移行開始の両方を
+保留する typed state が必要であり、保存だけを先行させてはならない。
+
 ---
 
 ## 3. GPU テクスチャアップロード

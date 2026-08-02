@@ -33445,6 +33445,33 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn rename_migration_journal_snapshot_contains_all_app_owned_states() {
+        let mut app = setup_app();
+        let dir = tempfile::tempdir().unwrap();
+        app.rename_migration_data_dir_override = Some(dir.path().to_path_buf());
+        app.rename_migration_journal_loaded = true;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let in_flight = (PathBuf::from("a"), PathBuf::from("b"));
+        let queued = (PathBuf::from("b"), PathBuf::from("c"));
+        let retry = (PathBuf::from("x"), PathBuf::from("y"));
+        app.rename_migration_in_flight = Some(RenameMigrationInFlight {
+            old_path: in_flight.0.clone(),
+            new_path: in_flight.1.clone(),
+            rx,
+        });
+        app.rename_migration_queue.push_back(queued.clone());
+        app.rename_migration_boot_retry.push(retry.clone());
+
+        app.persist_rename_migration_journal();
+        app.flush_rename_migration_journal();
+
+        assert_eq!(
+            crate::rename_key_migration::journal_load(dir.path()),
+            vec![in_flight, queued, retry]
+        );
+    }
+
+    #[test]
     fn rename_migration_queue_runs_fifo_and_lands_on_final_path() {
         // Sol rename-mig P1: 連続リネーム A→B→C を並列 worker にすると逆順実行で
         // 中間 path にデータが取り残される。FIFO 直列実行で最終 path に集約されること。
@@ -33480,6 +33507,7 @@ mod still_window_mode_key_tests {
             1,
             "2 本目は直列キューで待機する"
         );
+        app.flush_rename_migration_journal();
         assert_eq!(
             crate::rename_key_migration::journal_load(dir.path()).len(),
             2,
@@ -33507,6 +33535,7 @@ mod still_window_mode_key_tests {
             )
             .unwrap();
         assert_eq!(angle, 90, "FIFO 直列実行で最終 path に集約される");
+        app.flush_rename_migration_journal();
         assert!(
             crate::rename_key_migration::journal_load(dir.path()).is_empty(),
             "完了したジョブはジャーナルから消し込まれる"
@@ -33539,10 +33568,11 @@ mod still_window_mode_key_tests {
             vec![(x, y)],
             "削除された B を新側に持つジョブだけが落ちる"
         );
+        app.flush_rename_migration_journal();
         assert_eq!(
             crate::rename_key_migration::journal_load(dir.path()).len(),
             1,
-            "ジャーナルも同期して書き戻される"
+            "worker flush 後のジャーナルも同じ未完了集合になる"
         );
     }
 
@@ -33715,6 +33745,7 @@ mod still_window_mode_key_tests {
 
         app.poll_rename_migration_pending(&ctx);
         assert!(app.rename_migration_in_flight.is_none());
+        app.flush_rename_migration_journal();
         assert_eq!(
             crate::rename_key_migration::journal_load(dir.path()),
             vec![(a.clone(), b.clone())],
@@ -33771,6 +33802,7 @@ mod still_window_mode_key_tests {
                 |r| r.get(0),
             )
             .unwrap();
+        app.flush_rename_migration_journal();
         assert_eq!(angle, 270, "回復ジョブが移行を完走させる");
         assert!(
             crate::rename_key_migration::journal_load(dir.path()).is_empty(),

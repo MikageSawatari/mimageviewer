@@ -326,5 +326,8 @@ impl App {
         #[cfg(windows)]
         self.save_detached_video_resume_positions_for_exit();
         self.persist_window_state_and_flush();
+        // Normal frames only enqueue latest-value journal snapshots. Exit is the one boundary
+        // that waits for the writer so the next startup can recover every unfinished rename.
+        self.flush_rename_migration_journal();
     }
 }
