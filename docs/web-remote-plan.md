@@ -161,8 +161,9 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 | `GET /` および静的ファイル | フロントエンドを配信 |
 
 - サムネイルの catalog 参照・キー生成・生成・保存判定は本体の既存経路に集約する。remote-web は
-  catalog の内部構造を知らず、専用サムネイル DB も持たない。今回扱う source は通常画像と
-  フォルダ代表で、ZIP / PDF / 動画 / 音声は後続増分とする
+  catalog の内部構造を知らず、専用サムネイル DB も持たない。この段階で扱う source は通常画像と
+  フォルダ代表である。ZIP / PDF の container page は後続増分で対応済みだが、動画 / 音声の
+  一覧サムネイルは動画配信第 1 段でも非スコープとする
 - 本体側でも favorite allowlist と canonical path の包含を検証し、remote-web の検証結果を信頼しない
 - 一覧の走査は `entry.file_type()` を使う (`Path::is_dir()` を per-entry で呼ばない)
 

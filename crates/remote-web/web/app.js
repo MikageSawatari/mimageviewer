@@ -1010,6 +1010,13 @@ function dispatchCommand(requested, meta = {}) {
   return handled;
 }
 
+export function resolveMediaOpenRoute(requestedKind, addressedEntry, imageIndex) {
+  if (!["image", "video"].includes(requestedKind)) return null;
+  if (!addressedEntry || addressedEntry.kind !== requestedKind) return null;
+  if (requestedKind === "image" && imageIndex < 0) return null;
+  return requestedKind;
+}
+
 function executeOpenCommand(payload, meta) {
   if (payload.kind === "favorite" || payload.kind === "folder") {
     navigate(folderHash(payload.favoriteId, payload.path ?? ""));
@@ -1024,7 +1031,9 @@ function executeOpenCommand(payload, meta) {
         (entry) => addressIdentity(entryAddress(entry)) === addressIdentity(payload.address)
       )
     : null;
+  const requestedMediaKind = payload.kind === "media" ? payload.mediaKind : payload.kind;
   if (
+    requestedMediaKind === "image" &&
     (payload.kind === "image" || addressedMediaEntry?.kind === "image") &&
     !state.collection &&
     !state.container &&
@@ -1037,7 +1046,17 @@ function executeOpenCommand(payload, meta) {
     const imageIndex = state.images.findIndex(
       (entry) => addressIdentity(entryAddress(entry)) === addressIdentity(payload.address)
     );
-    if (!addressedEntry || (addressedEntry.kind !== "video" && imageIndex < 0)) return false;
+    const mediaRoute = resolveMediaOpenRoute(requestedMediaKind, addressedEntry, imageIndex);
+    if (!mediaRoute) {
+      recordClientError("media_open_route_rejected", "メディアの表示経路を解決できませんでした", {
+        expected_kind: requestedMediaKind ?? "missing",
+        resolved_kind: addressedEntry?.kind ?? "missing",
+        entry_found: Boolean(addressedEntry),
+        image_found: imageIndex >= 0,
+        screen_context: state.screenContext,
+      });
+      return false;
+    }
     if (Number.isInteger(payload.entryIndex)) state.gridIndex = payload.entryIndex;
     tryEnterBrowserFullscreen();
     history.pushState(
@@ -1051,8 +1070,11 @@ function executeOpenCommand(payload, meta) {
       "",
       mediaHash(payload.address)
     );
-    if (addressedEntry.kind === "video") renderVideoViewer(addressedEntry);
-    else renderImageViewer(imageIndex, meta.at ?? performance.now());
+    if (mediaRoute === "video") {
+      if (!renderVideoViewer(addressedEntry)) return false;
+    } else {
+      renderImageViewer(imageIndex, meta.at ?? performance.now());
+    }
     return true;
   }
   if (
@@ -1189,7 +1211,12 @@ function openGridEntry(index, meta) {
   }
   if (entry.kind === "video") {
     return executeOpenCommand(
-      { kind: "media", address: entryAddress(entry), entryIndex: index },
+      {
+        kind: "media",
+        mediaKind: "video",
+        address: entryAddress(entry),
+        entryIndex: index,
+      },
       meta
     );
   }
@@ -1199,7 +1226,13 @@ function openGridEntry(index, meta) {
   );
   return executeOpenCommand(
     entry.address
-      ? { kind: "media", address: entry.address, imageIndex, entryIndex: index }
+      ? {
+          kind: "media",
+          mediaKind: "image",
+          address: entry.address,
+          imageIndex,
+          entryIndex: index,
+        }
       : { kind: "image", favoriteId, path, imageIndex, entryIndex: index },
     meta
   );
@@ -2365,12 +2398,13 @@ function buildBreadcrumbs() {
   return breadcrumbs;
 }
 
-function createGridTile(
+export function createGridTile(
   entry,
   entryIndex,
   imageIndexes,
   thumbnailTracker,
-  cellWidth
+  cellWidth,
+  commandDispatcher = dispatchCommand
 ) {
   const tile = element("button", "grid-tile");
   tile.type = "button";
@@ -2380,7 +2414,7 @@ function createGridTile(
   tile.classList.toggle("image-tile", entry.kind === "image");
   tile.classList.toggle("grid-active", entryIndex === state.gridIndex);
   tile.addEventListener("focus", () => {
-    dispatchCommand(command(CommandName.GRID_SELECT, { index: entryIndex }), {
+    commandDispatcher(command(CommandName.GRID_SELECT, { index: entryIndex }), {
       source: "keyboard",
       detail: "focus",
       telemetry: false,
@@ -2399,7 +2433,7 @@ function createGridTile(
     preview.append(image);
     preview.append(textElement("span", "folder", "type-badge"));
     tile.addEventListener("click", (event) => {
-      dispatchCommand(
+      commandDispatcher(
         command(CommandName.OPEN, {
           kind: "folder",
           favoriteId,
@@ -2422,6 +2456,7 @@ function createGridTile(
           const payload = entry.address
             ? {
                 kind: "media",
+                mediaKind: "image",
                 address: entry.address,
                 imageIndex: index,
                 entryIndex,
@@ -2433,7 +2468,7 @@ function createGridTile(
                 imageIndex: index,
                 entryIndex,
               };
-          dispatchCommand(command(CommandName.OPEN, payload), {
+          commandDispatcher(command(CommandName.OPEN, payload), {
             source: inputSourceFromEvent(event),
             detail: "grid_tile",
             at: performance.now(),
@@ -2442,8 +2477,9 @@ function createGridTile(
       });
     } else if (entry.kind === "video") {
       tile.addEventListener("click", (event) => {
-        dispatchCommand(command(CommandName.OPEN, {
+        commandDispatcher(command(CommandName.OPEN, {
           kind: "media",
+          mediaKind: "video",
           address: entryAddress(entry),
           entryIndex,
         }), {
@@ -2454,7 +2490,7 @@ function createGridTile(
       });
     } else if (["zip", "pdf", "directory"].includes(entry.kind)) {
       tile.addEventListener("click", (event) => {
-        dispatchCommand(
+        commandDispatcher(
           command(CommandName.OPEN, {
             kind: "container",
             address: entryAddress(entry),
@@ -2599,7 +2635,14 @@ function entryTypeLabel(kind) {
 }
 
 function renderVideoViewer(entry) {
-  if (!entry || entry.kind !== "video") return;
+  if (!entry || entry.kind !== "video") {
+    recordClientError("video_viewer_entry_rejected", "動画ビューアに動画以外が渡されました", {
+      entry_found: Boolean(entry),
+      resolved_kind: entry?.kind ?? "missing",
+      screen_context: state.screenContext,
+    });
+    return false;
+  }
   cleanupScreen();
   state.screenContext = "viewer";
   state.viewerItemState = null;
@@ -2627,6 +2670,7 @@ function renderVideoViewer(entry) {
       viewer.showOperationalError(error, "動画を開始できませんでした");
     }
   });
+  return true;
 }
 
 function changeVideoFile(delta) {

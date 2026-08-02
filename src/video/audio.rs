@@ -54,6 +54,39 @@ pub struct AudioOutput {
 }
 
 impl AudioOutput {
+    #[cfg(test)]
+    pub(crate) fn connected_without_output_for_test(sample_rate: u32) -> Self {
+        let buffer = Arc::new(Mutex::new(AudioBuffer {
+            processed: std::collections::VecDeque::new(),
+            drain_offset_in_first: 0,
+            raw_pending: std::collections::VecDeque::new(),
+            next_pts_secs: 0.0,
+            sample_rate,
+            samples_per_sec: sample_rate as f64 * 2.0,
+            pump_seek_serial: 0,
+            last_fill_stale_clear_logged_serial: 0,
+            pdc_latency_secs: 0.0,
+            pdc_latency_secs_applied: 0.0,
+        }));
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        std::mem::forget(shutdown_rx);
+        let (command_tx, command_rx) = unbounded();
+        std::mem::forget(command_rx);
+        Self {
+            stream: None,
+            buffer,
+            cancel: Arc::new(AtomicBool::new(false)),
+            shutdown_tx,
+            pump: None,
+            sample_rate,
+            diagnostics: Arc::new(AudioDiagnostics::new(std::time::Instant::now())),
+            audio_tap: AudioTapController {
+                command_tx,
+                next_owner_id: Arc::new(AtomicU64::new(1)),
+            },
+        }
+    }
+
     pub fn pause_stream(&self) {
         if let Some(stream) = self.stream.as_ref() {
             let _ = stream.pause();

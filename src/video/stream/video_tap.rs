@@ -130,6 +130,13 @@ impl VideoTapController {
         controller
     }
 
+    #[cfg(test)]
+    pub(crate) fn connected_without_frames_for_test() -> Self {
+        let (controller, producer) = video_tap_channel();
+        std::mem::forget(producer);
+        controller
+    }
+
     pub(crate) fn attach(
         &self,
         software_frame_capacity: usize,

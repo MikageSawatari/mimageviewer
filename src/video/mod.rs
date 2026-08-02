@@ -4931,6 +4931,45 @@ impl VideoPlayer {
     }
 
     #[cfg(test)]
+    pub(crate) fn stream_ready_disconnected_for_test(path: PathBuf) -> Self {
+        let mut player = Self::disconnected_for_test(path, 0.0);
+        player.decode.video_tap =
+            crate::video::stream::video_tap::VideoTapController::connected_without_frames_for_test(
+            );
+        player.audio =
+            Some(crate::video::audio::AudioOutput::connected_without_output_for_test(48_000));
+        player.info = Some(VideoInfo {
+            width: 640,
+            height: 360,
+            duration_secs: 30.0,
+            video_codec: "h264".to_owned(),
+            video_decoder: "test".to_owned(),
+            d3d11va_supported: false,
+            d3d11va_config: String::new(),
+            audio_codec: Some("aac".to_owned()),
+            audio_bit_rate_bps: 128_000,
+            has_audio: true,
+            has_video: true,
+            hw_decode_active: false,
+            gpu_path_active: false,
+            effective_deinterlace_mode: crate::settings::VideoDeinterlaceMode::Off,
+            dynamic: Arc::new(crate::video::decoder::VideoDynamicState::default()),
+            title: None,
+            artist: None,
+            original_url: None,
+            description: None,
+            avg_fps: 30.0,
+            fps_num: 30,
+            fps_den: 1,
+            bit_rate_bps: 1_000_000,
+            chapters: Vec::new(),
+            sar_num: 1,
+            sar_den: 1,
+        });
+        player
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_last_displayed_pts_for_test(&self, position_secs: f64) {
         self.last_displayed_pts_bits
             .store(position_secs.to_bits(), Ordering::Release);

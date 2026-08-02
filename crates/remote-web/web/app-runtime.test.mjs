@@ -6,7 +6,18 @@ class FakeElement {
     this.tagName = tag.toUpperCase();
     this.style = {};
     this.dataset = {};
-    this.classList = { add() {}, remove() {} };
+    const classes = new Set();
+    this.classList = {
+      add(...names) { names.forEach((name) => classes.add(name)); },
+      remove(...names) { names.forEach((name) => classes.delete(name)); },
+      toggle(name, force) {
+        const enabled = force === undefined ? !classes.has(name) : Boolean(force);
+        if (enabled) classes.add(name);
+        else classes.delete(name);
+        return enabled;
+      },
+      contains(name) { return classes.has(name); },
+    };
     this.hidden = false;
     this.clientWidth = 430;
     this.clientHeight = 800;
@@ -14,10 +25,23 @@ class FakeElement {
     this.naturalHeight = 1800;
     this.children = [];
     this.replacedWith = null;
+    this.listeners = new Map();
   }
 
-  addEventListener() {}
-  removeEventListener() {}
+  addEventListener(type, listener) {
+    const listeners = this.listeners.get(type) ?? [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+  removeEventListener(type, listener) {
+    this.listeners.set(
+      type,
+      (this.listeners.get(type) ?? []).filter((candidate) => candidate !== listener)
+    );
+  }
+  dispatchEvent(event) {
+    for (const listener of this.listeners.get(event.type) ?? []) listener(event);
+  }
   setAttribute() {}
   append(...nodes) { this.children.push(...nodes); }
   replaceChildren(...nodes) { this.children = nodes; }
@@ -73,9 +97,11 @@ const {
   VIEWER_MENU_MAX_ACTIONS,
   activateFolderContainerForImage,
   containerInitialImageIndex,
+  createGridTile,
   loadFolder,
   parentContainerAddress,
   reloadApplication,
+  resolveMediaOpenRoute,
   viewerMenuDefinitions,
 } = await import("./app.js");
 
@@ -147,6 +173,45 @@ test("plain image media routes resolve their containing folder", () => {
       subresource: { kind: "file" },
     }
   );
+});
+
+test("tapping a video grid tile preserves the video route", () => {
+  const address = {
+    favorite_id: "favorite",
+    relative_path: "clips/movie.mp4",
+    subresource: { kind: "file" },
+  };
+  const dispatched = [];
+  const tile = createGridTile(
+    { kind: "video", name: "movie.mp4", address },
+    4,
+    new Map(),
+    null,
+    180,
+    (requested, meta) => dispatched.push({ requested, meta })
+  );
+
+  tile.dispatchEvent({ type: "click", detail: 1, pointerType: "touch" });
+
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].requested.name, "open");
+  assert.deepEqual(dispatched[0].requested.payload, {
+    kind: "media",
+    mediaKind: "video",
+    address,
+    entryIndex: 4,
+  });
+  assert.equal(dispatched[0].meta.source, "touch");
+  assert.equal(dispatched[0].meta.detail, "grid_tile");
+  assert.equal(
+    resolveMediaOpenRoute(
+      dispatched[0].requested.payload.mediaKind,
+      { kind: "video", address },
+      -1
+    ),
+    "video"
+  );
+  assert.equal(resolveMediaOpenRoute("video", { kind: "image", address }, 0), null);
 });
 
 test("viewer load executes fetch, decode, layout and atomic replacement", async () => {

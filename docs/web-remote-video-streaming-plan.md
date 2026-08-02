@@ -440,6 +440,15 @@ remote-web が HTTP 要求を受けた時に取りに行く。push 型の非同�
 再生が途切れる。`address` は既存の `RemoteAddress` をそのまま使い、本体側で favorite
 allowlist と canonical containment を再検証する ([web-remote-plan.md](web-remote-plan.md) §12.1)。
 
+`VideoStreamStart` の `address` は照合用ではなく、再生対象を指定する正本である。本体 UI
+thread は既存の「フォルダを開く → loaded item を選択 → fullscreen player を開く」経路で
+その動画へ切り替え、player の metadata / audio tap が揃うまで typed `Opening` state を
+poll する。別の項目が開いていても remote owner が操作権を占有しているため要求先へ切り替える。
+stop・owner 解放・失敗時は remote が開いた動画をその位置で pause して残し、開始前の項目へは
+戻さない。復元用の並行 state を持つと §2.2 の「位置を保持して手動再開」と競合するためである。
+player open と `fs_cache` / `fullscreen_idx` の更新だけを UI thread が担当し、encoder open と
+stream worker の teardown / join は引き続き UI thread 外で行う。
+
 #### 増分 6 実装記録 (IPC + HTTP、2026-08-02)
 
 - `PROTOCOL_VERSION` は 14 から **15** へ更新した。動画操作、playlist、segment、state、
@@ -649,6 +658,11 @@ allowlist と canonical containment を再検証する ([web-remote-plan.md](web
 - 複数同時セッション
 - リモートからの動画編集操作 (トリム・キャプチャ等)
 - 元ファイルの直接ダウンロード
+- 一覧の動画・音声サムネイル。第 1 段の `/api/thumb` は通常画像・フォルダ代表と
+  container page だけを扱い、実在する動画への要求は `Unsupported` (HTTP 415) とする。
+  一覧は type badge / placeholder を表示する。後続で対応する場合は本体ローカル表示と同じ
+  Windows Shell API・catalog/cache 経路を core IPC 側から再利用し、remote-web 独自生成は
+  追加しない
 
 ---
 

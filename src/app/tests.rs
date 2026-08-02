@@ -1280,6 +1280,93 @@ fn auto_fullscreen_image_only_folder_opens_page_after_load() {
     );
 }
 
+#[test]
+fn remote_video_start_opens_target_when_no_fullscreen_media_is_open() {
+    let mut app = phase_c_support::setup_app();
+    let folder = app.tmp.path().join("remote-video");
+    std::fs::create_dir(&folder).unwrap();
+    let video = folder.join("clip.mp4");
+    std::fs::write(&video, b"invalid fixture; source open is asynchronous").unwrap();
+
+    #[cfg(windows)]
+    {
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.fullfeature_media_window = true;
+        app.settings.video_in_window_mode = false;
+    }
+    assert_eq!(app.fullscreen_idx, None);
+    let handle = crate::remote_ipc::session::SessionHandle::new();
+    app.set_remote_session_handle(handle.clone());
+    handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+        client_id: "phone".to_owned(),
+        peer: mimageviewer_ipc::SessionPeerInfo {
+            connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+            device_name: Some("phone".to_owned()),
+        },
+    });
+    app.poll_remote_session(&egui::Context::default());
+
+    let request_handle = handle.clone();
+    let request_path = video.clone();
+    let request_thread = std::thread::spawn(move || {
+        let operation = request_handle
+            .begin_operation("phone", "動画ストリーミングを開始中".to_owned())
+            .unwrap();
+        request_handle.submit_video_stream(
+            crate::remote_ipc::session::VideoStreamUiRequest::Start {
+                client_id: "phone".to_owned(),
+                path: request_path,
+                quality: mimageviewer_ipc::VideoStreamQuality::Standard,
+            },
+            operation,
+        )
+    });
+    let open_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while app.fullscreen_idx.is_none() && std::time::Instant::now() < open_deadline {
+        app.poll_remote_session(&egui::Context::default());
+        std::thread::yield_now();
+    }
+    let idx = app
+        .fullscreen_idx
+        .expect("start must open its address through the normal viewer path");
+
+    assert_eq!(app.fullscreen_idx, Some(idx));
+    assert_eq!(app.selected, Some(idx));
+    let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&idx) else {
+        panic!("the remote target must create the core VideoPlayer");
+    };
+    assert!(crate::folder_tree::path_eq(player.path(), &video));
+    #[cfg(windows)]
+    assert_ne!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+
+    app.fs_cache.insert(
+        idx,
+        FsCacheEntry::Video {
+            player: Box::new(
+                crate::video::VideoPlayer::stream_ready_disconnected_for_test(video.clone()),
+            ),
+            load_seq: 0,
+        },
+    );
+    app.poll_remote_session(&egui::Context::default());
+    let published = match request_thread.join().unwrap() {
+        crate::remote_ipc::session::VideoStreamUiOutcome::Started(published) => published,
+        crate::remote_ipc::session::VideoStreamUiOutcome::Error(error) => {
+            panic!(
+                "stream start failed after opening its target: {:?}: {}",
+                error.code, error.message
+            );
+        }
+        _ => panic!("stream start returned the wrong outcome after opening its target"),
+    };
+    assert!(matches!(
+        published
+            .generation
+            .wait_ready(std::time::Duration::from_secs(7)),
+        crate::video::stream::session::StreamGenerationStatus::Ready(_)
+    ));
+}
+
 #[cfg(windows)]
 #[test]
 fn auto_fullscreen_image_only_folder_preserves_grid_intent_for_always_new_detached() {

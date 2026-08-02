@@ -688,24 +688,95 @@ impl App {
     }
 
     fn open_startup_file_if_visible(&mut self, requested: &Path) {
+        if let Err(error) = self.open_loaded_file_fullscreen(requested, "startup_open_file") {
+            crate::logger::log(format!("startup open: {error}"));
+        }
+    }
+
+    /// Open a file through the same loaded-folder selection/fullscreen seam used by startup and
+    /// activation requests. The caller owns path validation and any folder load needed first.
+    pub(crate) fn open_loaded_file_fullscreen(
+        &mut self,
+        requested: &Path,
+        input_reason: &'static str,
+    ) -> Result<usize, String> {
         let Some(idx) = startup_file_idx(&self.items, requested) else {
-            crate::logger::log(format!(
-                "startup open: requested file not found in loaded folder: {}",
+            return Err(format!(
+                "requested file was not found in the loaded folder: {}",
                 requested.display()
             ));
-            return;
         };
+        if !startup_file_should_open_fullscreen(&self.items[idx]) {
+            return Err(format!(
+                "requested path is not playable media: {}",
+                requested.display()
+            ));
+        }
         self.selected = Some(idx);
         self.scroll_to_selected = true;
-        if startup_file_should_open_fullscreen(&self.items[idx]) {
-            crate::logger::log(format!(
-                "startup open: opening requested file in fullscreen: {}",
+        crate::logger::log(format!(
+            "{input_reason}: opening requested file through the loaded-folder viewer path: {}",
+            requested.display()
+        ));
+        self.bump_input_seq_for_item(input_reason, idx);
+        self.fs_open_intent_from_grid = true;
+        self.open_fullscreen(idx);
+        Ok(idx)
+    }
+
+    /// Drive a remote video request through the normal folder-load and loaded-file viewer path.
+    pub(crate) fn open_remote_video_target(&mut self, requested: &Path) -> Result<usize, String> {
+        if let Some(idx) = self.fullscreen_idx
+            && matches!(
+                self.fs_cache.get(&idx),
+                Some(FsCacheEntry::Video { player, .. })
+                    if crate::folder_tree::path_eq(player.path(), requested)
+            )
+        {
+            return Ok(idx);
+        }
+
+        let parent = requested.parent().ok_or_else(|| {
+            format!(
+                "requested video has no parent folder: {}",
+                requested.display()
+            )
+        })?;
+        let outcome =
+            self.load_folder_or_convert_archive_with_auto_fullscreen(parent.to_path_buf(), false);
+        if !matches!(outcome, FolderOpenOutcome::Loaded) {
+            return Err(format!(
+                "requested video's folder could not be opened: {}",
+                parent.display()
+            ));
+        }
+
+        let Some(idx) = startup_file_idx(&self.items, requested) else {
+            return Err(format!(
+                "requested video was not found after opening its folder: {}",
                 requested.display()
             ));
-            self.bump_input_seq_for_item("startup_open_file", idx);
-            self.fs_open_intent_from_grid = true;
-            self.open_fullscreen(idx);
+        };
+        if !matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+            return Err(format!(
+                "requested path is not classified as a video: {}",
+                requested.display()
+            ));
         }
+
+        #[cfg(windows)]
+        {
+            // Remote streaming owns one core player. The existing presentation one-shot keeps
+            // the normal open path in the mounted context instead of a detached media window.
+            self.fs_media_open_forced_presentation = Some(self.non_detached_viewer_presentation());
+        }
+        let opened = self.open_loaded_file_fullscreen(requested, "remote_video_start");
+        #[cfg(windows)]
+        if opened.is_err() {
+            // Do not leak a failed one-shot into the next unrelated local open.
+            self.fs_media_open_forced_presentation = None;
+        }
+        opened
     }
 }
 
