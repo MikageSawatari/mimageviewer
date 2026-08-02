@@ -102,6 +102,7 @@ fn run() -> Result<(), String> {
         request_sequence: AtomicU64::new(1),
         web_root: config.web_root,
         session_peers: Mutex::new(std::collections::HashMap::new()),
+        remote_client_identities: http::RemoteClientIdentities::default(),
     });
     let workers = HTTP_WORKER_COUNT;
     println!(

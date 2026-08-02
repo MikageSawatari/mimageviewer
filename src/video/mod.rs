@@ -1199,8 +1199,6 @@ pub(crate) struct NativeVideoOutput {
 #[cfg(windows)]
 struct NativeVideoOutputVisibilityGate {
     base_visible: AtomicBool,
-    remote_hide_owner: AtomicU64,
-    next_owner: AtomicU64,
     command_tx: NativeCommandSender,
     hwnd: Arc<AtomicU64>,
 }
@@ -1210,8 +1208,6 @@ impl NativeVideoOutputVisibilityGate {
     fn new(initial_visible: bool, command_tx: NativeCommandSender, hwnd: Arc<AtomicU64>) -> Self {
         Self {
             base_visible: AtomicBool::new(initial_visible),
-            remote_hide_owner: AtomicU64::new(0),
-            next_owner: AtomicU64::new(1),
             command_tx,
             hwnd,
         }
@@ -1220,16 +1216,6 @@ impl NativeVideoOutputVisibilityGate {
     fn set_base_visible(&self, visible: bool) {
         self.base_visible.store(visible, Ordering::Release);
         self.publish();
-    }
-
-    fn acquire_remote_hide(self: &Arc<Self>) -> RemoteLocalVideoOutputHideLease {
-        let owner = self.next_owner.fetch_add(1, Ordering::Relaxed).max(1);
-        self.remote_hide_owner.store(owner, Ordering::Release);
-        self.publish();
-        RemoteLocalVideoOutputHideLease {
-            gate: Arc::clone(self),
-            owner,
-        }
     }
 
     fn publish(&self) {
@@ -1242,35 +1228,6 @@ impl NativeVideoOutputVisibilityGate {
 
     fn effective_visible(&self) -> bool {
         self.base_visible.load(Ordering::Acquire)
-            && self.remote_hide_owner.load(Ordering::Acquire) == 0
-    }
-
-    fn base_visible(&self) -> bool {
-        self.base_visible.load(Ordering::Acquire)
-    }
-
-    fn remote_hidden(&self) -> bool {
-        self.remote_hide_owner.load(Ordering::Acquire) != 0
-    }
-}
-
-#[cfg(windows)]
-pub(crate) struct RemoteLocalVideoOutputHideLease {
-    gate: Arc<NativeVideoOutputVisibilityGate>,
-    owner: u64,
-}
-
-#[cfg(windows)]
-impl Drop for RemoteLocalVideoOutputHideLease {
-    fn drop(&mut self) {
-        if self
-            .gate
-            .remote_hide_owner
-            .compare_exchange(self.owner, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.gate.publish();
-        }
     }
 }
 
@@ -1486,23 +1443,6 @@ impl NativeVideoOutput {
     #[allow(dead_code)]
     pub(crate) fn set_window_visible(&self, visible: bool) {
         self.visibility_gate.set_base_visible(visible);
-    }
-
-    pub(crate) fn acquire_remote_hide(&self) -> RemoteLocalVideoOutputHideLease {
-        self.visibility_gate.acquire_remote_hide()
-    }
-
-    fn remote_hidden(&self) -> bool {
-        self.visibility_gate.remote_hidden()
-    }
-
-    fn base_visible(&self) -> bool {
-        self.visibility_gate.base_visible()
-    }
-
-    #[cfg(test)]
-    fn effective_visible_for_test(&self) -> bool {
-        self.visibility_gate.effective_visible()
     }
 
     /// presenter ウィンドウが現在 hide (consume-and-hold) 中か。exit の async 待ちで
@@ -5808,36 +5748,6 @@ impl VideoPlayer {
         self.clock.acquire_remote_local_output_mute()
     }
 
-    #[cfg(windows)]
-    pub(crate) fn acquire_remote_local_video_output_hide(
-        &self,
-    ) -> Option<RemoteLocalVideoOutputHideLease> {
-        self.native_output
-            .as_ref()
-            .map(NativeVideoOutput::acquire_remote_hide)
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn remote_local_video_output_hidden(&self) -> bool {
-        self.native_output
-            .as_ref()
-            .is_some_and(NativeVideoOutput::remote_hidden)
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn native_window_base_visible(&self) -> bool {
-        self.native_output
-            .as_ref()
-            .is_none_or(NativeVideoOutput::base_visible)
-    }
-
-    #[cfg(all(windows, test))]
-    pub(crate) fn remote_local_video_output_effectively_visible_for_test(&self) -> bool {
-        self.native_output
-            .as_ref()
-            .is_none_or(NativeVideoOutput::effective_visible_for_test)
-    }
-
     pub(crate) fn clear_audio_output_buffer(&self) {
         if let Some(audio) = &self.audio {
             audio.clear_buffer(&self.clock);
@@ -7762,35 +7672,6 @@ mod tests {
             super::NativePresenterVisibility::new(super::NativeVideoInitialVisibility::Visible);
         assert!(hidden.is_hidden());
         assert!(!visible.is_hidden());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn remote_and_audio_mode_visibility_owners_release_independently() {
-        let output = super::NativeVideoOutput::disconnected_for_test();
-
-        output.set_window_visible(false);
-        let remote_hide = output.acquire_remote_hide();
-        output.set_window_visible(true);
-        assert!(
-            !output.effective_visible_for_test(),
-            "audio mode exit must not reveal a presenter still owned by remote"
-        );
-        drop(remote_hide);
-        assert!(
-            output.effective_visible_for_test(),
-            "dropping the final remote hide must restore the base-visible presenter"
-        );
-
-        let remote_hide = output.acquire_remote_hide();
-        output.set_window_visible(false);
-        drop(remote_hide);
-        assert!(
-            !output.effective_visible_for_test(),
-            "remote stop must not reveal a presenter still hidden by audio mode"
-        );
-        output.set_window_visible(true);
-        assert!(output.effective_visible_for_test());
     }
 
     #[test]

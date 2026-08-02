@@ -581,13 +581,11 @@ guard で、動画処理開始後の timeout 8 個には数えない。
 - ローカル mute は audio device や PCM queue を止めず、owner-scoped lease が cpal callback の
   `output_volume` だけを 0 にする。post-DSP tap はその前 (processed queue push 前) なので、
   リモート PCM は mute の影響を受けない
-- ローカル映像非表示は streaming session が native presenter の owner-scoped lease を保持し、
-  既存の consume-and-hold 出口で `present()` だけを止める。decoder、video tap、最新 frame の
-  drain/selection は継続する。lease drop は tray / 動画→音声モードの base visibility と合成して
-  元の表示へ戻す。presenter 非表示中は動画→音声モードと同じ egui replacement seam に暗色の
-  `RemoteStreaming` surface を描き、配信中であることとファイル名を常時示す。本体の
-  「リモート接続中」modal も同じファイル名を表示し続ける。音声モードとの重なりは music surface
-  を優先し、片方の解除で他方の hide owner を解除しない
+- remote video の `VideoPlayer` は fullscreen cache ではなく streaming UI state が headless で
+  所有し、UI frame ごとに tick する。decoder、video/audio tap、encoder は動かすが native
+  presenter、folder load、`open_fullscreen` は作動させない。本体の既存表示状態は変えず、
+  「リモート接続中」modal を配信中も表示し続ける。ローカルの既存 player / 音声モードの
+  `Music` 表示も remote video start では切り替えない
 - 設定の enum は runtime の nested `EncoderPreference` 等を直接永続化せず、単純な scalar variant
   名を持つ `RemoteVideoEncoder` / `RemoteVideoQuality` として分離した。未知 variant は既存の
   forward-incompatible 判定に入り、`Corrupted` quarantine / backup 自動復旧を行わない。
@@ -649,7 +647,7 @@ guard で、動画処理開始後の timeout 8 個には数えない。
 | `remote_video_quality_default` | `Standard` | §6.4 のプリセット |
 | `remote_video_segment_window` | `30` | 保持セグメント数 (= 60 秒) |
 | `remote_video_mute_local_output` | `true` | ストリーミング中に PC 側スピーカーを無音にするか (§10-2) |
-| `remote_video_hide_local_output` | `true` | decoder を動かしたまま PC 側 presenter の表示だけを止めるか |
+| `remote_video_hide_local_output` | `true` | 旧設定 DB 互換キー。headless remote player 化後は UI に表示せず、動作には使わない |
 
 ---
 

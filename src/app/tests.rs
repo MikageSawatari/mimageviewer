@@ -1281,7 +1281,7 @@ fn auto_fullscreen_image_only_folder_opens_page_after_load() {
 }
 
 #[test]
-fn remote_video_start_returns_post_seek_generation_and_stop_is_idempotent() {
+fn remote_video_stream_keeps_remote_dialog_without_entering_fullscreen() {
     let mut app = phase_c_support::setup_app();
     let folder = app.tmp.path().join("remote-video");
     std::fs::create_dir(&folder).unwrap();
@@ -1295,6 +1295,9 @@ fn remote_video_start_returns_post_seek_generation_and_stop_is_idempotent() {
         app.settings.video_in_window_mode = false;
     }
     assert_eq!(app.fullscreen_idx, None);
+    let original_selected = app.selected;
+    #[cfg(windows)]
+    let original_presentation = app.viewer_presentation;
     let handle = crate::remote_ipc::session::SessionHandle::new();
     app.set_remote_session_handle(handle.clone());
     handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
@@ -1322,55 +1325,44 @@ fn remote_video_start_returns_post_seek_generation_and_stop_is_idempotent() {
         )
     });
     let open_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while app.fullscreen_idx.is_none() && std::time::Instant::now() < open_deadline {
+    while !app.remote_video_opening_for_test() && std::time::Instant::now() < open_deadline {
         app.poll_remote_session(&egui::Context::default());
+        assert_eq!(app.fullscreen_idx, None);
         std::thread::yield_now();
     }
-    let idx = app
-        .fullscreen_idx
-        .expect("start must open its address through the normal viewer path");
-
-    assert_eq!(app.fullscreen_idx, Some(idx));
-    assert_eq!(app.selected, Some(idx));
-    let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&idx) else {
-        panic!("the remote target must create the core VideoPlayer");
-    };
-    assert!(crate::folder_tree::path_eq(player.path(), &video));
+    assert!(app.remote_video_opening_for_test());
+    assert_eq!(app.fullscreen_idx, None);
+    assert_eq!(app.selected, original_selected);
+    assert!(
+        handle.snapshot().active.is_some(),
+        "the remote dialog owner remains active"
+    );
     #[cfg(windows)]
-    assert_ne!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+    assert_eq!(app.viewer_presentation, original_presentation);
 
     let mut ready_player =
         crate::video::VideoPlayer::stream_ready_disconnected_for_test(video.clone());
     ready_player.set_pending_remote_resume_for_test(4.0);
-    app.fs_cache.insert(
-        idx,
-        FsCacheEntry::Video {
-            player: Box::new(ready_player),
-            load_seq: 0,
-        },
-    );
+    assert!(app.replace_remote_video_player_for_test(ready_player));
     // The first poll attaches generation 1. Opening the player may then publish a resume seek;
     // reproduce that ordering before the start response is allowed to leave the UI boundary.
     app.poll_remote_session(&egui::Context::default());
-    let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get_mut(&idx) else {
-        panic!("stream-ready player was replaced");
-    };
-    player.apply_pending_remote_resume_for_test();
-    #[cfg(windows)]
-    assert!(player.remote_local_video_output_hidden());
+    assert!(app.apply_pending_remote_video_resume_for_test());
     assert!(
-        player.intent_playing(),
+        app.remote_video_player_intent_playing_for_test()
+            .is_some_and(|playing| playing),
         "decoder transport must remain active"
     );
-    assert_eq!(
-        app.fullscreen_egui_media_surface_for_idx(idx),
-        Some(crate::ui_fullscreen::FullscreenEguiMediaSurface::RemoteStreaming),
-        "remote hide must route the local viewer to a drawable egui surface"
+    assert_eq!(app.fullscreen_idx, None);
+    assert!(
+        handle.snapshot().active.is_some(),
+        "streaming keeps the remote dialog active"
     );
 
     let start_deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     while !request_thread.is_finished() && std::time::Instant::now() < start_deadline {
         app.poll_remote_session(&egui::Context::default());
+        assert_eq!(app.fullscreen_idx, None);
         std::thread::yield_now();
     }
     assert!(
@@ -1423,6 +1415,7 @@ fn remote_video_start_returns_post_seek_generation_and_stop_is_idempotent() {
     });
     while !unknown_stop.is_finished() {
         app.poll_remote_session(&egui::Context::default());
+        assert_eq!(app.fullscreen_idx, None);
         std::thread::yield_now();
     }
     assert!(matches!(
@@ -1444,6 +1437,7 @@ fn remote_video_start_returns_post_seek_generation_and_stop_is_idempotent() {
         });
         while !stop.is_finished() {
             app.poll_remote_session(&egui::Context::default());
+            assert_eq!(app.fullscreen_idx, None);
             std::thread::yield_now();
         }
         assert!(matches!(
@@ -1451,23 +1445,12 @@ fn remote_video_start_returns_post_seek_generation_and_stop_is_idempotent() {
             crate::remote_ipc::session::VideoStreamUiOutcome::Stopped
         ));
     }
-    let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&idx) else {
-        panic!("stream-ready player was removed");
-    };
-    assert!(!player.intent_playing());
-    #[cfg(windows)]
-    {
-        assert!(!player.remote_local_video_output_hidden());
-        assert!(
-            player.remote_local_video_output_effectively_visible_for_test(),
-            "stream stop must restore the normal presenter when no other hide owner remains"
-        );
-        assert_eq!(
-            app.fullscreen_egui_media_surface_for_idx(idx),
-            None,
-            "stream stop must remove the remote replacement surface"
-        );
-    }
+    assert_eq!(app.remote_video_player_intent_playing_for_test(), None);
+    assert_eq!(app.fullscreen_idx, None);
+    assert!(
+        handle.snapshot().active.is_some(),
+        "stop does not release the remote dialog"
+    );
 }
 
 #[cfg(windows)]

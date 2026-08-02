@@ -61,7 +61,11 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 - ブラウザごとのランダム client ID を各 API から IPC まで運び、別端末の要求を同じ
   remote-web process の owner として混同しない。保持できる owner は常に 1 client だけで、
   2 台目の操作は確認なしに owner を置き換える。旧 owner は「別の端末で使用中です」と表示し、
-  次の操作で acquire を送り直して奪い返す。client ID は認証 credential には使わない。
+  次の操作で acquire を送り直して奪い返す。client ID は認証 credential には使わない。通常の
+  `fetch` が送る `X-mIV-Remote-Client` を、認証済み `miv_remote_session` cookie ごとの
+  owner identity として remote-web 内で固定する。native HLS の `<video>` や header を付けない
+  stop は同じ cookie から owner を復元する。cookie 認証に失敗した要求は従来どおり
+  fail-closed guard で 401 とし、owner 解決へ進めない。
   認証後の全画面では左上の小さな badge に「操作中」または
   「別の端末が操作中 (操作すると取得します)」を常時表示し、確認や入力 blocking は行わない
 - session owner が変わった時、本体は既存の media pause、slideshow stop、owner-scoped native

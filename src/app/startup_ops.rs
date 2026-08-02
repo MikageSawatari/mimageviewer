@@ -723,61 +723,6 @@ impl App {
         self.open_fullscreen(idx);
         Ok(idx)
     }
-
-    /// Drive a remote video request through the normal folder-load and loaded-file viewer path.
-    pub(crate) fn open_remote_video_target(&mut self, requested: &Path) -> Result<usize, String> {
-        if let Some(idx) = self.fullscreen_idx
-            && matches!(
-                self.fs_cache.get(&idx),
-                Some(FsCacheEntry::Video { player, .. })
-                    if crate::folder_tree::path_eq(player.path(), requested)
-            )
-        {
-            return Ok(idx);
-        }
-
-        let parent = requested.parent().ok_or_else(|| {
-            format!(
-                "requested video has no parent folder: {}",
-                requested.display()
-            )
-        })?;
-        let outcome =
-            self.load_folder_or_convert_archive_with_auto_fullscreen(parent.to_path_buf(), false);
-        if !matches!(outcome, FolderOpenOutcome::Loaded) {
-            return Err(format!(
-                "requested video's folder could not be opened: {}",
-                parent.display()
-            ));
-        }
-
-        let Some(idx) = startup_file_idx(&self.items, requested) else {
-            return Err(format!(
-                "requested video was not found after opening its folder: {}",
-                requested.display()
-            ));
-        };
-        if !matches!(self.items.get(idx), Some(GridItem::Video(_))) {
-            return Err(format!(
-                "requested path is not classified as a video: {}",
-                requested.display()
-            ));
-        }
-
-        #[cfg(windows)]
-        {
-            // Remote streaming owns one core player. The existing presentation one-shot keeps
-            // the normal open path in the mounted context instead of a detached media window.
-            self.fs_media_open_forced_presentation = Some(self.non_detached_viewer_presentation());
-        }
-        let opened = self.open_loaded_file_fullscreen(requested, "remote_video_start");
-        #[cfg(windows)]
-        if opened.is_err() {
-            // Do not leak a failed one-shot into the next unrelated local open.
-            self.fs_media_open_forced_presentation = None;
-        }
-        opened
-    }
 }
 
 fn startup_file_idx(items: &[GridItem], requested: &Path) -> Option<usize> {

@@ -5889,13 +5889,6 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 &mut s.remote_video_mute_local_output,
                 "配信中はこの PC の音声をミュート",
             );
-            ui.checkbox(
-                &mut s.remote_video_hide_local_output,
-                "配信中はこの PC の映像を表示しない",
-            )
-            .on_hover_text(
-                "デコードとリモートへのフレーム送信は継続し、ローカル画面への表示だけを止めます。",
-            );
         });
 
         // 再生位置レジューム (続き/先頭の切替・位置クリア) は「履歴と復元」ページに集約。

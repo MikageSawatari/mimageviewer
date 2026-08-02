@@ -6,7 +6,6 @@ use mimageviewer_ipc::{
 };
 use qrcode::{Color, QrCode};
 
-use crate::fs_animation::FsCacheEntry;
 use crate::video::stream::session::{
     RemoteVideoStreamingSession, StreamGenerationStatus, StreamReconcile, StreamingGeneration,
 };
@@ -42,13 +41,13 @@ struct AppRemoteVideoOpening {
     client_id: String,
     requested_path: std::path::PathBuf,
     quality: crate::video::stream::quality::QualityPreset,
-    fs_idx: usize,
+    player: Option<Box<crate::video::VideoPlayer>>,
     budget: VideoStreamStartBudget,
 }
 
 struct AppRemoteVideoStreaming {
-    fs_idx: usize,
     requested_path: std::path::PathBuf,
+    player: Box<crate::video::VideoPlayer>,
     session: RemoteVideoStreamingSession,
     playback: std::sync::Arc<VideoStreamPlaybackState>,
 }
@@ -58,75 +57,6 @@ struct AppRemoteVideoStarting {
     streaming: AppRemoteVideoStreaming,
     budget: VideoStreamStartBudget,
     waiting_stage: VideoStreamStartStage,
-}
-// リモート配信の local surface は streaming UI state owner と同居させる。
-pub(crate) fn draw_remote_video_local_surface(
-    ui: &mut egui::Ui,
-    rect: egui::Rect,
-    source_name: &str,
-) {
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, crate::ui_music_timeline::MUSIC_VIEW_BG);
-    let center = rect.center();
-    let content_y = center.y - (rect.height() * 0.08).min(72.0);
-    draw_remote_video_local_surface_status(&painter, center, content_y);
-    draw_remote_video_local_surface_details(&painter, rect, content_y, source_name);
-}
-
-fn draw_remote_video_local_surface_status(
-    painter: &egui::Painter,
-    center: egui::Pos2,
-    content_y: f32,
-) {
-    let badge = egui::Rect::from_center_size(
-        egui::pos2(center.x, content_y - 64.0),
-        egui::vec2(104.0, 28.0),
-    );
-    painter.rect_filled(
-        badge,
-        badge.height() * 0.5,
-        egui::Color32::from_rgb(36, 82, 126),
-    );
-    painter.text(
-        badge.center(),
-        egui::Align2::CENTER_CENTER,
-        "REMOTE",
-        egui::FontId::proportional(13.0),
-        egui::Color32::from_rgb(224, 240, 255),
-    );
-    painter.text(
-        egui::pos2(center.x, content_y - 24.0),
-        egui::Align2::CENTER_CENTER,
-        "リモートへ配信中",
-        egui::FontId::proportional(24.0),
-        egui::Color32::from_gray(232),
-    );
-}
-
-fn draw_remote_video_local_surface_details(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    content_y: f32,
-    source_name: &str,
-) {
-    let filename = painter.layout(
-        source_name.to_owned(),
-        egui::FontId::proportional(18.0),
-        egui::Color32::from_rgb(126, 184, 238),
-        (rect.width() - 64.0).clamp(1.0, 720.0),
-    );
-    painter.galley(
-        egui::pos2(rect.center().x - filename.size().x * 0.5, content_y + 4.0),
-        filename,
-        egui::Color32::from_rgb(126, 184, 238),
-    );
-    painter.text(
-        egui::pos2(rect.center().x, content_y + 54.0),
-        egui::Align2::CENTER_CENTER,
-        "この PC では映像を非表示にしています",
-        egui::FontId::proportional(14.0),
-        egui::Color32::from_gray(158),
-    );
 }
 
 struct PendingRemoteBookmarkWrite {
@@ -182,28 +112,23 @@ impl RemoteVideoStartReadiness {
 }
 
 fn remote_video_start_outcome_for_player(
-    starting: &mut AppRemoteVideoStarting,
+    session: &mut RemoteVideoStreamingSession,
+    playback: &std::sync::Arc<VideoStreamPlaybackState>,
     player: &crate::video::VideoPlayer,
 ) -> Result<(StreamReconcile, RemoteVideoStartReadiness), String> {
-    starting.streaming.playback.update(
+    playback.update(
         player.position_secs(),
         player.duration(),
         player.volume(),
         player.intent_playing(),
     );
-    let reconcile = starting.streaming.session.reconcile(player);
+    let reconcile = session.reconcile(player);
     let seek_is_stable = matches!(reconcile, StreamReconcile::Active)
         && player.remote_stream_start_seek_is_settled()
-        && starting
-            .streaming
-            .session
-            .generation_matches_player_seek(player);
+        && session.generation_matches_player_seek(player);
     let readiness = if !seek_is_stable {
         RemoteVideoStartReadiness::WaitingForSeek
-    } else if matches!(
-        starting.streaming.session.status(),
-        StreamGenerationStatus::Ready(_)
-    ) {
+    } else if matches!(session.status(), StreamGenerationStatus::Ready(_)) {
         RemoteVideoStartReadiness::Stable
     } else {
         RemoteVideoStartReadiness::WaitingForEncoder
@@ -300,11 +225,9 @@ impl crate::app::App {
             self.remote_session_ui.last_control_return_sequence = snapshot.control_return_sequence;
             self.reload_after_remote_session_release();
         }
-        // Reconcile the previous frame's stream before draining new requests. A Start therefore
-        // gets one complete UI-frame boundary after the normal open path creates its player;
-        // metadata/tap readiness remains an asynchronous state transition instead of being
-        // sampled in the same call stack that initiated the open.
-        self.poll_remote_video_streaming();
+        // Reconcile the previous frame's stream before draining new requests. The remote session
+        // owns and ticks its headless player without changing the local viewer presentation.
+        self.poll_remote_video_streaming(ctx);
         // Observe owner transitions before draining its requests. In particular, an acquire and
         // the first video start can both arrive before the next UI frame; cancelling after the
         // drain would incorrectly reject that new owner's freshly opened stream.
@@ -327,7 +250,7 @@ impl crate::app::App {
         client_id: &str,
         requested_path: &std::path::Path,
         quality: crate::video::stream::quality::QualityPreset,
-        fs_idx: usize,
+        player: Box<crate::video::VideoPlayer>,
     ) -> Result<AppRemoteVideoStreaming, String> {
         if !self.settings.remote_video_streaming_enabled {
             return Err("remote video streaming is disabled".to_owned());
@@ -342,13 +265,8 @@ impl crate::app::App {
         let encoder = self.settings.remote_video_encoder.into();
         let segment_capacity = self.settings.remote_video_segment_window;
         let mute_local_output = self.settings.remote_video_mute_local_output;
-        let hide_local_video_output = self.settings.remote_video_hide_local_output;
-        let player = match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => player,
-            _ => return Err("the fullscreen item is not playable media".to_owned()),
-        };
         if !crate::folder_tree::path_eq(player.path(), requested_path) {
-            return Err("the requested video is not the current fullscreen media".to_owned());
+            return Err("the requested video is not the remote session player".to_owned());
         }
         let previous_speed = player.playback_speed();
         let speed_changed = (previous_speed - 1.0).abs() > 1.0e-6;
@@ -357,12 +275,11 @@ impl crate::app::App {
         }
         let session = match RemoteVideoStreamingSession::start(
             owner,
-            player,
+            &player,
             encoder,
             quality,
             segment_capacity,
             mute_local_output,
-            hide_local_video_output,
         ) {
             Ok(session) => session,
             Err(error) => {
@@ -380,8 +297,8 @@ impl crate::app::App {
             player.intent_playing(),
         ));
         Ok(AppRemoteVideoStreaming {
-            fs_idx,
             requested_path: requested_path.to_path_buf(),
+            player,
             session,
             playback,
         })
@@ -403,11 +320,7 @@ impl crate::app::App {
                 self.fail_remote_video_starting(starting, code, message.to_owned());
             }
             AppRemoteVideoStreamState::Streaming(streaming) => {
-                if let Some(FsCacheEntry::Video { player, .. }) =
-                    self.fs_cache.get(&streaming.fs_idx)
-                {
-                    player.set_playing(false);
-                }
+                streaming.player.set_playing(false);
                 if let Some(handle) = self.remote_session_ui.handle.as_ref() {
                     handle.clear_video_stream(Some(streaming.session.id().0));
                 }
@@ -421,7 +334,7 @@ impl crate::app::App {
         code: VideoStreamErrorCode,
         message: String,
     ) {
-        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&opening.fs_idx) {
+        if let Some(player) = opening.player.as_ref() {
             player.set_playing(false);
         }
         opening
@@ -437,11 +350,7 @@ impl crate::app::App {
         code: VideoStreamErrorCode,
         message: String,
     ) {
-        if let Some(FsCacheEntry::Video { player, .. }) =
-            self.fs_cache.get(&starting.streaming.fs_idx)
-        {
-            player.set_playing(false);
-        }
+        starting.streaming.player.set_playing(false);
         if let Some(handle) = self.remote_session_ui.handle.as_ref() {
             handle.clear_video_stream(Some(starting.streaming.session.id().0));
         }
@@ -468,13 +377,13 @@ impl crate::app::App {
         }
     }
 
-    fn poll_remote_video_streaming(&mut self) {
+    fn poll_remote_video_streaming(&mut self, ctx: &egui::Context) {
         let Some(state) = self.remote_session_ui.video_stream.take() else {
             return;
         };
         let mut streaming = match state {
             AppRemoteVideoStreamState::Opening(opening) => {
-                self.poll_remote_video_opening(opening);
+                self.poll_remote_video_opening(opening, ctx);
                 return;
             }
             AppRemoteVideoStreamState::Starting(starting) => {
@@ -483,18 +392,14 @@ impl crate::app::App {
             }
             AppRemoteVideoStreamState::Streaming(streaming) => streaming,
         };
-        let outcome = match self.fs_cache.get(&streaming.fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => {
-                streaming.playback.update(
-                    player.position_secs(),
-                    player.duration(),
-                    player.volume(),
-                    player.intent_playing(),
-                );
-                streaming.session.reconcile(player)
-            }
-            _ => StreamReconcile::Stop("streaming media player was closed".to_owned()),
-        };
+        streaming.player.tick(ctx);
+        streaming.playback.update(
+            streaming.player.position_secs(),
+            streaming.player.duration(),
+            streaming.player.volume(),
+            streaming.player.intent_playing(),
+        );
+        let outcome = streaming.session.reconcile(&streaming.player);
         match outcome {
             StreamReconcile::Active => {
                 self.remote_session_ui.video_stream =
@@ -515,11 +420,7 @@ impl crate::app::App {
                     Some(AppRemoteVideoStreamState::Streaming(streaming));
             }
             StreamReconcile::Stop(reason) => {
-                if let Some(FsCacheEntry::Video { player, .. }) =
-                    self.fs_cache.get(&streaming.fs_idx)
-                {
-                    player.set_playing(false);
-                }
+                streaming.player.set_playing(false);
                 if let Some(handle) = self.remote_session_ui.handle.as_ref() {
                     handle.clear_video_stream(Some(streaming.session.id().0));
                 }
@@ -553,14 +454,12 @@ impl crate::app::App {
         &self,
         starting: &mut AppRemoteVideoStarting,
     ) -> Result<(StreamReconcile, RemoteVideoStartReadiness), String> {
-        let player = match self.fs_cache.get(&starting.streaming.fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => player,
-            _ => return Err("streaming media player was closed".to_owned()),
-        };
-        if !crate::folder_tree::path_eq(player.path(), &starting.streaming.requested_path) {
+        let streaming = &mut starting.streaming;
+        let player = &streaming.player;
+        if !crate::folder_tree::path_eq(player.path(), &streaming.requested_path) {
             return Err("streaming media player was replaced".to_owned());
         }
-        remote_video_start_outcome_for_player(starting, player)
+        remote_video_start_outcome_for_player(&mut streaming.session, &streaming.playback, player)
     }
 
     fn finish_stable_remote_video_start(
@@ -618,7 +517,11 @@ impl crate::app::App {
         }
     }
 
-    fn poll_remote_video_opening(&mut self, opening: AppRemoteVideoOpening) {
+    fn poll_remote_video_opening(
+        &mut self,
+        mut opening: AppRemoteVideoOpening,
+        ctx: &egui::Context,
+    ) {
         if opening.claimed.ownership_response().status != SessionStatus::Active {
             self.fail_remote_video_opening(
                 opening,
@@ -632,46 +535,46 @@ impl crate::app::App {
             return;
         }
 
-        let readiness = if self.fullscreen_idx != Some(opening.fs_idx) {
-            Err((
-                VideoStreamErrorCode::Failed,
-                "要求した動画を開いている間に本体の表示対象が変更されました".to_owned(),
-            ))
-        } else {
-            match self.fs_cache.get(&opening.fs_idx) {
-                Some(FsCacheEntry::Video { player, .. })
-                    if !crate::folder_tree::path_eq(player.path(), &opening.requested_path) =>
-                {
+        if opening.player.is_none() {
+            opening.player = self.try_build_remote_video_player(&opening.requested_path);
+        }
+        if let Some(player) = opening.player.as_mut() {
+            player.tick(ctx);
+            if player.error().is_none()
+                && player.prep_progress().phase() != crate::video::avio_progress::prep_phase::DONE
+            {
+                self.activity_gate.bump();
+            }
+        }
+        let readiness = match opening.player.as_ref() {
+            Some(player)
+                if !crate::folder_tree::path_eq(player.path(), &opening.requested_path) =>
+            {
+                Err((
+                    VideoStreamErrorCode::Failed,
+                    "リモート配信用 player と要求された動画が一致しません".to_owned(),
+                ))
+            }
+            Some(player) => {
+                if let Some(error) = player.error() {
                     Err((
                         VideoStreamErrorCode::Failed,
-                        "本体が開いた動画と要求された動画が一致しません".to_owned(),
+                        format!("要求された動画を再生できません: {error}"),
                     ))
-                }
-                Some(FsCacheEntry::Video { player, .. }) => {
-                    if let Some(error) = player.error() {
+                } else if let Some(info) = player.info() {
+                    if !info.has_video || !info.has_audio {
                         Err((
                             VideoStreamErrorCode::Failed,
-                            format!("要求された動画を再生できません: {error}"),
+                            "remote streaming requires both video and audio streams".to_owned(),
                         ))
-                    } else if let Some(info) = player.info() {
-                        if !info.has_video || !info.has_audio {
-                            Err((
-                                VideoStreamErrorCode::Failed,
-                                "remote streaming requires both video and audio streams".to_owned(),
-                            ))
-                        } else {
-                            Ok(player.audio_tap_source().is_some())
-                        }
                     } else {
-                        Ok(false)
+                        Ok(player.audio_tap_source().is_some())
                     }
+                } else {
+                    Ok(false)
                 }
-                Some(_) => Err((
-                    VideoStreamErrorCode::Failed,
-                    "要求された動画の player を本体で作成できませんでした".to_owned(),
-                )),
-                None => Ok(false),
             }
+            None => Ok(false),
         };
 
         match readiness {
@@ -680,11 +583,15 @@ impl crate::app::App {
                     self.fail_remote_video_opening(opening, error.code, error.message);
                     return;
                 }
+                let player = opening
+                    .player
+                    .take()
+                    .expect("ready remote video opening must own a player");
                 let result = self.create_remote_video_streaming(
                     &opening.client_id,
                     &opening.requested_path,
                     opening.quality,
-                    opening.fs_idx,
+                    player,
                 );
                 match result {
                     Ok(streaming) => {
@@ -728,27 +635,60 @@ impl crate::app::App {
             })
     }
 
-    pub(crate) fn remote_video_local_surface_source(
-        &self,
-        fs_idx: usize,
-    ) -> Option<&std::path::Path> {
-        match self.remote_session_ui.video_stream.as_ref()? {
-            AppRemoteVideoStreamState::Opening(_) => None,
-            AppRemoteVideoStreamState::Starting(starting)
-                if starting.streaming.fs_idx == fs_idx
-                    && starting.streaming.session.hides_local_video_output() =>
-            {
-                Some(starting.streaming.requested_path.as_path())
+    #[cfg(test)]
+    pub(crate) fn replace_remote_video_player_for_test(
+        &mut self,
+        player: crate::video::VideoPlayer,
+    ) -> bool {
+        let Some(AppRemoteVideoStreamState::Opening(opening)) =
+            self.remote_session_ui.video_stream.as_mut()
+        else {
+            return false;
+        };
+        opening.player = Some(Box::new(player));
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remote_video_opening_for_test(&self) -> bool {
+        matches!(
+            self.remote_session_ui.video_stream,
+            Some(AppRemoteVideoStreamState::Opening(_))
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remote_video_player_intent_playing_for_test(&self) -> Option<bool> {
+        self.remote_session_ui
+            .video_stream
+            .as_ref()
+            .and_then(|state| match state {
+                AppRemoteVideoStreamState::Opening(opening) => opening.player.as_deref(),
+                AppRemoteVideoStreamState::Starting(starting) => {
+                    Some(starting.streaming.player.as_ref())
+                }
+                AppRemoteVideoStreamState::Streaming(streaming) => Some(streaming.player.as_ref()),
+            })
+            .map(crate::video::VideoPlayer::intent_playing)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_pending_remote_video_resume_for_test(&mut self) -> bool {
+        let player = match self.remote_session_ui.video_stream.as_mut() {
+            Some(AppRemoteVideoStreamState::Opening(opening)) => opening.player.as_deref_mut(),
+            Some(AppRemoteVideoStreamState::Starting(starting)) => {
+                Some(starting.streaming.player.as_mut())
             }
-            AppRemoteVideoStreamState::Streaming(streaming)
-                if streaming.fs_idx == fs_idx && streaming.session.hides_local_video_output() =>
-            {
-                Some(streaming.requested_path.as_path())
+            Some(AppRemoteVideoStreamState::Streaming(streaming)) => {
+                Some(streaming.player.as_mut())
             }
-            AppRemoteVideoStreamState::Starting(_) | AppRemoteVideoStreamState::Streaming(_) => {
-                None
-            }
-        }
+            None => None,
+        };
+        let Some(player) = player else {
+            return false;
+        };
+        player.apply_pending_remote_resume_for_test();
+        true
     }
 
     #[allow(dead_code)] // Increment 6 routes the existing media play/pause command here.
@@ -778,11 +718,7 @@ impl crate::app::App {
         let AppRemoteVideoStreamState::Streaming(streaming) = streaming else {
             return Err("remote video streaming is still opening".to_owned());
         };
-        let player = match self.fs_cache.get(&streaming.fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => player,
-            _ => return Err("streaming media player was closed".to_owned()),
-        };
-        streaming.session.change_quality(player, quality)
+        streaming.session.change_quality(&streaming.player, quality)
     }
 
     fn apply_pending_remote_ui_requests(&mut self, handle: &SessionHandle) {
@@ -879,22 +815,15 @@ impl crate::app::App {
             return;
         }
 
-        // A new remote start replaces the old remote stream before normal folder/viewer routing
-        // can drop its player. The requested address is authoritative while remote owns control.
+        // A new remote start replaces the previous remote-owned player. It does not route through
+        // the local folder/viewer open path, so the existing remote-session dialog remains the
+        // visible surface while the headless player decodes for the stream.
         self.cancel_remote_video_stream_state(
             VideoStreamErrorCode::Failed,
             "新しい動画ストリーミング開始要求に置き換えられました",
         );
-        let fs_idx = match self.open_remote_video_target(&requested_path) {
-            Ok(fs_idx) => fs_idx,
-            Err(error) => {
-                claimed.complete(video_stream_ui_failure(error));
-                return;
-            }
-        };
-        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            // Opening the normal viewer can honor local autoplay. Remote start owns transport,
-            // so hold the new player at its initial position until the stream worker is attached.
+        let player = self.try_build_remote_video_player(&requested_path);
+        if let Some(player) = player.as_ref() {
             player.set_playing(false);
         }
         self.remote_session_ui.video_stream =
@@ -903,7 +832,7 @@ impl crate::app::App {
                 client_id,
                 requested_path,
                 quality,
-                fs_idx,
+                player,
                 budget,
             }));
     }
@@ -921,12 +850,7 @@ impl crate::app::App {
                 Some(AppRemoteVideoStreamState::Streaming(streaming));
             return video_stream_session_mismatch();
         }
-        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&streaming.fs_idx) else {
-            if let Some(handle) = self.remote_session_ui.handle.as_ref() {
-                handle.clear_video_stream(Some(session));
-            }
-            return video_stream_ui_failure("streaming media player was closed".to_owned());
-        };
+        let player = &streaming.player;
         let result = match action {
             VideoStreamControlAction::Play => {
                 player.set_playing(true);
@@ -985,12 +909,7 @@ impl crate::app::App {
                 Some(AppRemoteVideoStreamState::Streaming(streaming));
             return video_stream_session_mismatch();
         }
-        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&streaming.fs_idx) else {
-            if let Some(handle) = self.remote_session_ui.handle.as_ref() {
-                handle.clear_video_stream(Some(session));
-            }
-            return video_stream_ui_failure("streaming media player was closed".to_owned());
-        };
+        let player = &streaming.player;
         let result = streaming.session.seek(player, position_secs);
         if result.is_ok()
             && let Some(handle) = self.remote_session_ui.handle.as_ref()
@@ -1032,11 +951,7 @@ impl crate::app::App {
             AppRemoteVideoStreamState::Streaming(streaming)
                 if streaming.session.id().0 == session =>
             {
-                if let Some(FsCacheEntry::Video { player, .. }) =
-                    self.fs_cache.get(&streaming.fs_idx)
-                {
-                    player.set_playing(false);
-                }
+                streaming.player.set_playing(false);
                 if let Some(handle) = self.remote_session_ui.handle.as_ref() {
                     handle.clear_video_stream(Some(session));
                 }
@@ -1965,32 +1880,6 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn remote_video_local_surface_snapshot_dark() {
-        use egui_kittest::Harness;
-
-        let mut fonts_ready = false;
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(640.0, 360.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(crate::ui_music_timeline::MUSIC_VIEW_BG))
-                    .show(ctx, |ui| {
-                        draw_remote_video_local_surface(ui, ui.max_rect(), "配信サンプル動画.mp4");
-                    });
-            });
-
-        harness.run();
-        harness.snapshot("remote_video_local_surface_dark");
-    }
 
     #[test]
     fn remote_spread_key_matches_worker_logical_favorite_path() {

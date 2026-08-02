@@ -3767,7 +3767,8 @@ pub struct Settings {
         deserialize_with = "deserialize_remote_video_output_bool"
     )]
     pub remote_video_mute_local_output: bool,
-    /// streaming 中も decoder / presenter を動かしたまま、ローカル present だけを止める。
+    /// 旧ローカル映像非表示設定。remote player の headless 化後は参照せず、設定 DB の
+    /// 後方互換のためだけに保持する。
     #[serde(
         default = "default_true",
         deserialize_with = "deserialize_remote_video_output_bool"

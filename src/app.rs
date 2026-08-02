@@ -46124,6 +46124,31 @@ impl App {
         }
     }
 
+    /// リモート配信用 player は viewer cache ではなく remote session が所有する。
+    /// native presenter を作らないため、本体の fullscreen / detached 表示状態は変えない。
+    pub(crate) fn try_build_remote_video_player(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Option<Box<crate::video::VideoPlayer>> {
+        let live_decoders = crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
+            .load(std::sync::atomic::Ordering::Acquire);
+        if live_decoders >= crate::video::decoder::MAX_LIVE_VIDEO_DECODE_THREADS {
+            return None;
+        }
+        self.activity_gate.bump();
+        let (player, deferred_normalize_scan) = self.build_video_player_for_open(
+            0,
+            path.to_path_buf(),
+            true,
+            Some(false),
+            false,
+            #[cfg(windows)]
+            None,
+        );
+        debug_assert!(!deferred_normalize_scan);
+        Some(Box::new(player))
+    }
+
     /// フルスクリーン通常 open 用の動画プレイヤーを構築する。
     fn build_video_player_for_open(
         &mut self,

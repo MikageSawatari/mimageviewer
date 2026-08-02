@@ -19,7 +19,9 @@ use serde_json::{Value, json};
 use tiny_http::{Header, Method, Request, Response, StatusCode};
 use uuid::Uuid;
 
-use crate::auth::{AuthDecision, AuthInput, AuthService, PinVerification};
+use crate::auth::{
+    AuthDecision, AuthInput, AuthService, AuthSessionIdentity, AuthSource, PinVerification,
+};
 use crate::diagnostics::{DiagnosticsLogger, RequestLog};
 use crate::ipc_client::{ClientError as IpcClientError, ThumbnailClient};
 use crate::store::{Library, StoreError};
@@ -49,6 +51,45 @@ pub struct AppState {
     pub request_sequence: AtomicU64,
     pub web_root: PathBuf,
     pub session_peers: Mutex<HashMap<std::net::IpAddr, mimageviewer_ipc::SessionPeerInfo>>,
+    pub remote_client_identities: RemoteClientIdentities,
+}
+
+#[derive(Default)]
+pub struct RemoteClientIdentities {
+    cookie_owners: Mutex<HashMap<AuthSessionIdentity, String>>,
+    unidentified_sequence: AtomicU64,
+}
+
+impl RemoteClientIdentities {
+    fn resolve(&self, request: &Request, auth: AuthDecision) -> String {
+        let header_client_id = remote_client_header(request);
+        match auth {
+            AuthDecision::Authorized(AuthSource::SessionCookie(identity)) => {
+                let Ok(mut owners) = self.cookie_owners.lock() else {
+                    return identity.fallback_client_id();
+                };
+                if let Some(owner) = owners.get(&identity) {
+                    return owner.clone();
+                }
+                let owner = header_client_id
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| identity.fallback_client_id());
+                owners.insert(identity, owner.clone());
+                owner
+            }
+            AuthDecision::Authorized(AuthSource::Bearer) => {
+                header_client_id.map(str::to_owned).unwrap_or_else(|| {
+                    format!(
+                        "bearer-unidentified-{}",
+                        self.unidentified_sequence.fetch_add(1, Ordering::Relaxed)
+                    )
+                })
+            }
+            AuthDecision::Unauthorized => {
+                unreachable!("unauthorized requests are rejected before client identity resolution")
+            }
+        }
+    }
 }
 
 pub struct SessionActivityNotifier {
@@ -403,11 +444,18 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
     };
 
     let method = request.method().clone();
-    let remote_client_id = remote_client_id(request).to_owned();
     let auth = state.auth.authorize(AuthInput {
         authorization: header_value(request, "Authorization"),
         cookie: header_value(request, "Cookie"),
     });
+    let remote_client_id = if auth != AuthDecision::Unauthorized
+        && (path.starts_with("/api/") || path.starts_with("/stream/"))
+        && !path.starts_with("/api/auth/")
+    {
+        state.remote_client_identities.resolve(request, auth)
+    } else {
+        String::new()
+    };
     let response = match (method, path) {
         (Method::Get, "/") => static_file(state, "index.html", "text/html; charset=utf-8"),
         (Method::Get, "/app.js") => static_file(state, "app.js", "text/javascript; charset=utf-8"),
@@ -2369,16 +2417,13 @@ fn header_value<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
     })
 }
 
-fn remote_client_id(request: &Request) -> &str {
-    const FALLBACK: &str = "legacy-client";
-    header_value(request, "X-mIV-Remote-Client")
-        .filter(|value| {
-            (8..=128).contains(&value.len())
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        })
-        .unwrap_or(FALLBACK)
+fn remote_client_header(request: &Request) -> Option<&str> {
+    header_value(request, "X-mIV-Remote-Client").filter(|value| {
+        (8..=128).contains(&value.len())
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    })
 }
 
 fn request_is_https(request: &Request) -> bool {
@@ -2523,6 +2568,7 @@ mod tests {
             request_sequence: AtomicU64::new(1),
             web_root: temp.path().to_owned(),
             session_peers: Mutex::new(HashMap::new()),
+            remote_client_identities: RemoteClientIdentities::default(),
         }
     }
 
@@ -2911,6 +2957,60 @@ mod tests {
             assert_eq!(response.status, 401, "{path}");
             assert_eq!(response.body, b"Unauthorized", "{path}");
         }
+    }
+
+    #[test]
+    fn stream_request_without_client_header_uses_same_cookie_session_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let cookie = cookie_header(&state);
+        let client_header =
+            Header::from_bytes("X-mIV-Remote-Client", "browser-client-1234").unwrap();
+        let start_request: Request = TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/video/start")
+            .with_header(cookie.clone())
+            .with_header(client_header)
+            .into();
+        let start_auth = state.auth.authorize(AuthInput {
+            authorization: header_value(&start_request, "Authorization"),
+            cookie: header_value(&start_request, "Cookie"),
+        });
+        assert_eq!(
+            state
+                .remote_client_identities
+                .resolve(&start_request, start_auth),
+            "browser-client-1234"
+        );
+
+        let stream_request: Request = TestRequest::new()
+            .with_method(Method::Get)
+            .with_path("/stream/1/1/index.m3u8")
+            .with_header(cookie)
+            .into();
+        let stream_auth = state.auth.authorize(AuthInput {
+            authorization: header_value(&stream_request, "Authorization"),
+            cookie: header_value(&stream_request, "Cookie"),
+        });
+        assert_eq!(
+            state
+                .remote_client_identities
+                .resolve(&stream_request, stream_auth),
+            "browser-client-1234"
+        );
+    }
+
+    #[test]
+    fn stream_request_without_authentication_remains_unauthorized() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let mut request: Request = TestRequest::new()
+            .with_method(Method::Get)
+            .with_path("/stream/1/1/index.m3u8")
+            .into();
+        let response = route(&mut request, &state);
+        assert_eq!(response.status, 401);
+        assert_eq!(response.body, b"Unauthorized");
     }
 
     #[test]

@@ -8,7 +8,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::{Algorithm, Argon2, Params, Version};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::diagnostics::resolve_external_file_path;
@@ -51,10 +51,19 @@ pub struct AuthService {
     lockout: Mutex<LockoutState>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuthSessionIdentity([u8; TOKEN_BYTES]);
+
+impl AuthSessionIdentity {
+    pub fn fallback_client_id(self) -> String {
+        format!("cookie-{}", encode_hex(&self.0))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthSource {
     Bearer,
-    SessionCookie,
+    SessionCookie(AuthSessionIdentity),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,7 +285,9 @@ impl AuthService {
             && let Some(candidate) = cookie_value(cookie_header, COOKIE_NAME)
             && self.session_matches(candidate, now_unix)
         {
-            return AuthDecision::Authorized(AuthSource::SessionCookie);
+            return AuthDecision::Authorized(AuthSource::SessionCookie(AuthSessionIdentity(
+                Sha256::digest(candidate.as_bytes()).into(),
+            )));
         }
         AuthDecision::Unauthorized
     }
@@ -569,7 +580,7 @@ mod tests {
         assert!(issued.header.contains("Max-Age=7776000"));
         assert!(!issued.header.contains("Secure"));
         let cookie = format!("{COOKIE_NAME}={}", issued.sensitive_value);
-        assert_eq!(
+        assert!(matches!(
             auth.authorize_at(
                 AuthInput {
                     cookie: Some(&cookie),
@@ -577,8 +588,8 @@ mod tests {
                 },
                 11
             ),
-            AuthDecision::Authorized(AuthSource::SessionCookie)
-        );
+            AuthDecision::Authorized(AuthSource::SessionCookie(_))
+        ));
         assert_eq!(
             auth.authorize_at(
                 AuthInput {

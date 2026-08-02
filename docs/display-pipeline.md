@@ -632,18 +632,11 @@ source swap 中の受動表示なのでカーソル idle をリセットせず�
 非表示カーソルを復活させない。画像⇄動画の遷移はこの fast path の対象外で、従来どおり
 `open_fullscreen` / `start_fs_load` 経路で扱う。
 
-mIV Remote の動画ストリーミング中にローカル映像を隠す場合は、decoder や video tap を停止せず、
-native presenter の `SetWindowVisible(false)` が持つ consume-and-hold 経路で `present()`
-だけを止める。`NativeVideoOutputVisibilityGate` は tray / 動画→音声モードの base visibility と
-remote session の owner-scoped hide lease を合成するため、stream 終了時に stale な lease が
-別の非表示理由を上書きして表示を戻すことはない。placement switch もこの合成後の可視性を
-引き継ぎ、通常 fullscreen / in-window / detached のどの presenter でも lease 中は表示しない。
-
-presenter の背面を未描画のまま露出させないため、hide lease を保持する streaming state は
-動画→音声モードと同じ `FullscreenEguiMediaSurface` の描画継ぎ目へ
-`RemoteStreaming` surface を投影する。surface は通常の暗色背景に配信中表示とファイル名を描き、
-専用 viewport / embedded / detached の既存経路で共通に使う。音声モードと重なる場合は music
-surface を優先し、どちらを描くかも追加フラグではなく既存の typed state と lease から導出する。
+mIV Remote の動画ストリーミングは fullscreen cache / native presenter を使わず、remote session
+state が headless `VideoPlayer` を所有して UI frame ごとに tick する。decoder と video/audio tap
+は継続するが、folder load、`open_fullscreen`、detached presentation は要求しない。そのため本体の
+既存表示を変更せず、「リモート接続中」modal を表示したまま配信できる。音声モードの `Music`
+surface は従来の music-only predicate のままで、remote streaming 専用 surface は持たない。
 
 動画タイルモード (`video_tile_state`) は再生中動画の `VideoInfo` からタイムスタンプ列を
 作り、`TileThumbnailWorker` が別 FFmpeg input でサムネイルを抽出する。タイルモードが

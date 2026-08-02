@@ -386,8 +386,6 @@ pub(crate) struct RemoteVideoStreamingSession {
     quality: QualityPreset,
     segment_capacity: usize,
     mute_local_output: bool,
-    #[cfg(windows)]
-    _local_video_hide: Option<crate::video::RemoteLocalVideoOutputHideLease>,
     next_generation: u64,
     current: StreamingGenerationHandle,
 }
@@ -400,17 +398,6 @@ pub(crate) enum StreamReconcile {
 }
 
 impl RemoteVideoStreamingSession {
-    pub(crate) fn hides_local_video_output(&self) -> bool {
-        #[cfg(windows)]
-        {
-            self._local_video_hide.is_some()
-        }
-        #[cfg(not(windows))]
-        {
-            false
-        }
-    }
-
     pub(crate) fn start(
         owner: RemoteSessionOwner,
         player: &crate::video::VideoPlayer,
@@ -418,17 +405,10 @@ impl RemoteVideoStreamingSession {
         quality: QualityPreset,
         segment_capacity: usize,
         mute_local_output: bool,
-        hide_local_video_output: bool,
     ) -> Result<Self, String> {
         if segment_capacity == 0 {
             return Err("remote streaming segment capacity must be non-zero".to_owned());
         }
-        #[cfg(windows)]
-        let local_video_hide = hide_local_video_output
-            .then(|| player.acquire_remote_local_video_output_hide())
-            .flatten();
-        #[cfg(not(windows))]
-        let _ = hide_local_video_output;
         let generation = StreamingGeneration(1);
         let current = StreamingGenerationHandle::start(
             generation,
@@ -447,8 +427,6 @@ impl RemoteVideoStreamingSession {
             quality,
             segment_capacity,
             mute_local_output,
-            #[cfg(windows)]
-            _local_video_hide: local_video_hide,
             next_generation: 2,
             current,
         })

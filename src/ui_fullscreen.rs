@@ -657,25 +657,6 @@ fn should_zoom_fullscreen_wheel(ctrl_held: bool, overlay_edit_mode: bool) -> boo
     ctrl_held || overlay_edit_mode
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FullscreenEguiMediaSurface {
-    Music,
-    RemoteStreaming,
-}
-
-fn resolve_fullscreen_egui_media_surface(
-    music_view_active: bool,
-    remote_streaming_active: bool,
-) -> Option<FullscreenEguiMediaSurface> {
-    if music_view_active {
-        Some(FullscreenEguiMediaSurface::Music)
-    } else if remote_streaming_active {
-        Some(FullscreenEguiMediaSurface::RemoteStreaming)
-    } else {
-        None
-    }
-}
-
 fn should_suppress_egui_wheel_for_native_detached_video(
     is_video: bool,
     detached: bool,
@@ -6840,23 +6821,13 @@ impl App {
             && self.fullscreen_seek_overlay_allowed(fs_idx, is_video)
     }
 
-    pub(crate) fn fullscreen_egui_media_surface_for_idx(
-        &self,
-        fs_idx: usize,
-    ) -> Option<FullscreenEguiMediaSurface> {
-        resolve_fullscreen_egui_media_surface(
-            self.fs_music_view_active(fs_idx),
-            self.remote_video_local_surface_source(fs_idx).is_some(),
-        )
-    }
-
     /// The fixed top bar may reserve image space only while the same chrome is drawable.
     /// Keep this predicate shared with the draw gate so edit/capture/music modes cannot
     /// leave an empty strip at the top of the fullscreen canvas.
     fn fullscreen_top_bar_chrome_allowed(&self, fs_idx: usize) -> bool {
         !self.is_overlay_edit_mode_active()
             && self.capture_region_selection.is_none()
-            && self.fullscreen_egui_media_surface_for_idx(fs_idx).is_none()
+            && !self.fs_music_view_active(fs_idx)
     }
 
     fn fullscreen_top_bar_locked_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
@@ -7833,9 +7804,9 @@ impl App {
             self.advance_animation(ctx, partner);
             self.ensure_fs_page_load(partner);
         }
-        // in-window モード中は静止画と egui replacement surface を専用 viewport ではなく
-        // メインウィンドウの egui ctx に直接描画する (embedded)。通常の動画だけは上の
-        // native backdrop 分岐で early-return する。
+        // in-window モード中は静止画を専用 viewport ではなくメインウィンドウの
+        // egui ctx に直接描画する (embedded)。本関数冒頭で動画は early-return
+        // 済みなので、ここに来る fs_idx は常に非動画。
         #[cfg(windows)]
         let embedded = self.fullscreen_embedded_still_active();
         #[cfg(not(windows))]
@@ -8025,11 +7996,11 @@ impl App {
                 let _ = (detached_seed_placement, detached_builder_placement);
                 self.build_fullscreen_viewport_builder()
             }
-        } else if state.is_video && self.fullscreen_egui_media_surface_for_idx(fs_idx).is_none() {
+        } else if state.is_video && !self.fs_music_view_active(fs_idx) {
             self.build_fullscreen_viewport_builder()
         } else {
-            // 音声ファイル、音声モードにトグルした動画、remote 配信で presenter を
-            // owner-scoped hide した動画は、egui replacement surface を描く。
+            // 音声ファイルおよび音声モードにトグルした動画 (Inc 7) は still/audio 側の viewport
+            // builder に寄せる (taskbar 属性を音声ファイルと揃える、Codex 7d 検証)。
             self.build_still_fullscreen_viewport_builder()
         };
         if !embedded && (need_show || !self.window_visible) {
@@ -8578,13 +8549,9 @@ impl App {
                                     } else {
                                         false
                                     };
-                                    let egui_media_surface =
-                                        self.fullscreen_egui_media_surface_for_idx(fs_idx);
-                                    if egui_media_surface
-                                        == Some(FullscreenEguiMediaSurface::Music)
-                                    {
-                                        // 音声: egui 音楽ビュー (D3、Inc 3)。通常の画像/
-                                        // ズーム/比較/回転経路はスキップする。
+                                    if self.fs_music_view_active(fs_idx) {
+                                        // 音声: egui 音楽ビュー (D3、Inc 3)。通常の画像/ズーム/
+                                        // 比較/回転経路はスキップする。
                                         music_view_frame_ui =
                                             self.draw_fs_music_view(ui, ctx, image_rect, fs_idx);
                                         // 上バーの閉じる× は描画中の直呼びを避け遅延フラグ経由で
@@ -8592,28 +8559,6 @@ impl App {
                                         if std::mem::take(&mut self.music_view_close_requested) {
                                             close_fs = true;
                                         }
-                                    } else if egui_media_surface
-                                        == Some(FullscreenEguiMediaSurface::RemoteStreaming)
-                                    {
-                                        let source_name = self
-                                            .remote_video_local_surface_source(fs_idx)
-                                            .map(|path| {
-                                                path.file_name()
-                                                    .unwrap_or(path.as_os_str())
-                                                    .to_string_lossy()
-                                                    .into_owned()
-                                            })
-                                            .unwrap_or_else(|| {
-                                                self.items
-                                                    .get(fs_idx)
-                                                    .map(|item| item.name().to_string())
-                                                    .unwrap_or_else(|| "video".to_owned())
-                                            });
-                                        crate::remote_ipc::ui::draw_remote_video_local_surface(
-                                            ui,
-                                            image_rect,
-                                            &source_name,
-                                        );
                                     } else if panorama_painted {
                                     } else if self.fs_zoom_mode_engaged()
                                         && !state.is_video
@@ -8840,7 +8785,7 @@ impl App {
                                             content_bbox,
                                         );
                                     }
-                                    } // replacement surface が無い通常描画ブロック終端
+                                    } // else (= !panorama_painted) ブロック終端
                                 }
                                 SpreadPair::Double { left, right } => {
                                     let compare_mode = self.compare_view_mode;
@@ -10380,11 +10325,11 @@ impl App {
 
     #[cfg(windows)]
     fn native_video_backdrop_target_for_fs(&self, fs_idx: usize) -> bool {
-        // presenter を隠したあとの egui replacement surface は動画 backdrop 対象から外す。
-        // ここを native-video 扱いのままにすると、render_fullscreen_viewport が early-return
-        // して replacement surface を描かず、隠した HWND の背面が露出する。
+        // 音声モードにトグルした動画 (Inc 7) は native presenter を detach 済みで egui 音楽ビューを
+        // 描くので、動画 backdrop 対象から外す。これを外さないと render_fullscreen_viewport が
+        // 冒頭で early-return して音楽ビューを描かず、画面が消える (実機バグ、Codex 7d 検証)。
         matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
-            && self.fullscreen_egui_media_surface_for_idx(fs_idx).is_none()
+            && !self.fs_music_view_active(fs_idx)
     }
 
     /// in-window モードで静止画 (= 非動画) フルスクリーンを表示中かどうか。
@@ -10404,10 +10349,11 @@ impl App {
     pub(crate) fn fullscreen_embedded_still_active(&self) -> bool {
         self.native_video_in_window_active
             && self.fullscreen_idx.is_some_and(|idx| {
-                // 音楽ビューと remote streaming surface も egui 描画なので静止画と同じ embedded
-                // 経路でウィンドウ内表示できる。音声モードは presenter を detach 済み、remote は
-                // owner-scoped hide 中で、どちらも native backdrop early-return の対象外。
-                self.fullscreen_egui_media_surface_for_idx(idx).is_some()
+                // 音楽ビュー (音声、および Inc 7 で音声モードにした動画) も egui 描画なので静止画と
+                // 同じ embedded 経路でウィンドウ内表示できる (Inc 5 FB: F11 でウィンドウ化)。native
+                // presenter を持たない (音声モードでは detach 済み) ので backdrop early-return には
+                // 掛からない。これは表示/描画経路のゲートなので fs_music_view_active を通す (3 概念分離)。
+                self.fs_music_view_active(idx)
                     || matches!(
                         self.items.get(idx),
                         Some(
@@ -27076,19 +27022,6 @@ mod tests {
         assert!(!should_suppress_egui_wheel_for_native_detached_video(
             true, true, true, true
         ));
-    }
-
-    #[test]
-    fn remote_streaming_selects_a_non_video_egui_surface_and_music_takes_precedence() {
-        assert_eq!(
-            resolve_fullscreen_egui_media_surface(false, true),
-            Some(FullscreenEguiMediaSurface::RemoteStreaming)
-        );
-        assert_eq!(
-            resolve_fullscreen_egui_media_surface(true, true),
-            Some(FullscreenEguiMediaSurface::Music)
-        );
-        assert_eq!(resolve_fullscreen_egui_media_surface(false, false), None);
     }
 
     #[test]
