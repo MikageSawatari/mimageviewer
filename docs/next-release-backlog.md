@@ -761,6 +761,14 @@
   [idle-health-check.md](idle-health-check.md) の §3 も揃えること。
 - 規模 / 優先度: Small / P2。**毎リリース必須のチェックが手順どおりでも落ちる**状態なので、
   次版で片付ける。
+- **v2.10.0 (2026-08-02) は 3 シナリオとも PASS**。waiver 不要。今回窓に当たらなかったのは、
+  **Enter を押す直前に対象フォルダを開き直した**ため。証拠は
+  `matched=170 (enqueue=23, idle_upgrade_enqueue=2, idle_upgrade_ineligible=2, ready=143)` で、
+  アイドル高画質化パスが対象タイルを実際に評価したうえで測定区間は完全 sleep
+  (perf event 0 件 / perf log 増加 0 バイト / CPU 1.2%)。
+  つまり**現状でも手順を「準備 → 即 Enter」に揃えれば通る**。ただしそれは操作者の手際に
+  依存する状態であり、上記の対応方針 1 (窓をセッション全体へ広げる) は引き続き有効。
+  なお `-TargetKey` が checklist から抜けていた件は `31b45449` で別途修正済み。
 - v2.9.1 の waiver 根拠 (2026-08-01 更新)。`static-foreground` / `static-background` の PASS に加え、
   この版の変更が `video-pin-background` が見ている経路 (アイドル高画質化 / 動画ピンのタイル保持)
   に触れていないこと。対象の変更は次のとおり:
