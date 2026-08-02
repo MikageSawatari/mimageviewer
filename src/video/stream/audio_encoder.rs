@@ -282,6 +282,7 @@ impl OpenedAacEncoder {
             || !chunk.duration_secs.is_finite()
             || !chunk.pdc_latency_secs_at_process.is_finite()
             || chunk.duration_secs < 0.0
+            || chunk.pdc_latency_secs_at_process < 0.0
         {
             return Err(AacEncoderError::new("processed audio metadata is invalid"));
         }
@@ -423,6 +424,16 @@ fn align_initial_chunk_to_session_start(
     let source_secs_per_sample = chunk.source_secs_per_output_sec / f64::from(input_sample_rate);
     let chunk_source_end_secs =
         chunk.audible_pts_secs + samples_per_channel as f64 * source_secs_per_sample;
+    let lead_secs = source_start_secs - chunk.audible_pts_secs;
+    let chunk_source_duration_secs = samples_per_channel as f64 * source_secs_per_sample;
+    let allowed_lead_secs = chunk.pdc_latency_secs_at_process + chunk_source_duration_secs;
+    if lead_secs > allowed_lead_secs + STREAM_TIMELINE_EPSILON_SECS {
+        let excess_secs = lead_secs - allowed_lead_secs;
+        return Err(AacEncoderError::new(format!(
+            "initial audio precedes streaming session beyond declared DSP latency: audible_pts_secs={:.9}, source_start_secs={source_start_secs:.9}, lead_secs={lead_secs:.9}, pdc_latency_secs={:.9}, chunk_source_duration_secs={chunk_source_duration_secs:.9}, allowed_lead_secs={allowed_lead_secs:.9}, excess_secs={excess_secs:.9}",
+            chunk.audible_pts_secs, chunk.pdc_latency_secs_at_process,
+        )));
+    }
     if chunk_source_end_secs <= source_start_secs {
         return Ok(InitialChunkAlignment::Drop);
     }
@@ -732,6 +743,31 @@ mod tests {
             (5 * CHUNK_SAMPLES - LATENCY_SAMPLES) as u64
         );
         assert!(encoder.assembler.is_some());
+    }
+
+    #[test]
+    fn pre_session_audio_beyond_declared_latency_fails_with_values() {
+        const SAMPLE_RATE: u32 = 48_000;
+        let source_start_secs = 67.267_2;
+        let timeline = StreamTimeline::new(source_start_secs).unwrap();
+        let mut encoder = open_aac_encoder(SAMPLE_RATE, 96_000, 1, timeline).unwrap();
+        let mut input = chunk(1_024, SAMPLE_RATE, source_start_secs - 1.0, 1);
+        input.pdc_latency_secs_at_process = 0.070_227;
+
+        let error = match encoder.push_chunk(input) {
+            Ok(_) => panic!("audio beyond the declared latency was accepted"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("audible_pts_secs=66.267200000"));
+        assert!(error.contains("source_start_secs=67.267200000"));
+        assert!(error.contains("lead_secs=1.000000000"));
+        assert!(error.contains("pdc_latency_secs=0.070227000"));
+        assert!(error.contains("chunk_source_duration_secs=0.021333333"));
+        assert!(error.contains("allowed_lead_secs=0.091560333"));
+        assert!(error.contains("excess_secs=0.908439667"));
+        assert_eq!(encoder.stats().pre_session_dropped_chunks, 0);
+        assert!(encoder.assembler.is_none());
     }
 
     #[test]

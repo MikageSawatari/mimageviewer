@@ -8,6 +8,7 @@ import {
   videoPlaybackDecision,
   videoQualityPreset,
   videoSeekPlan,
+  videoStartupDecision,
   videoTapCommand,
   videoTimelineAnchor,
   videoTimelinePosition,
@@ -18,6 +19,7 @@ const HLS_MIME = "application/vnd.apple.mpegurl";
 const HLS_SCRIPT_PATH = "/vendor/hls.min.js";
 const VIDEO_STATE_POLL_MS = 1000;
 const WAITING_SUGGESTION_MS = 3000;
+const STARTUP_MEDIA_SEGMENT_TIMEOUT_MS = 15000;
 const PLAYLIST_RECOVERY_MAX_ATTEMPTS = 6;
 const PLAYLIST_RECOVERY_TIMEOUT_MS = 15000;
 
@@ -415,6 +417,7 @@ export class VideoStreamViewer {
     inputSource,
     apiJson,
     apiPostJson,
+    reportPlaybackIssue = () => {},
     keyboardAvailable = true,
   }) {
     this.isVideoStreamViewer = true;
@@ -424,6 +427,7 @@ export class VideoStreamViewer {
     this.inputSource = inputSource;
     this.apiJson = apiJson;
     this.apiPostJson = apiPostJson;
+    this.reportPlaybackIssue = reportPlaybackIssue;
     this.quality = "standard";
     this.volume = 1;
     this.duration = 0;
@@ -443,6 +447,7 @@ export class VideoStreamViewer {
     this.pollTimer = 0;
     this.waitingTimer = 0;
     this.waitingSince = null;
+    this.startupWatch = null;
     this.noticeKind = "";
     this.abortController = new AbortController();
     this.pendingTimers = new Set();
@@ -538,12 +543,34 @@ export class VideoStreamViewer {
       );
     });
 
-    this.onTimeUpdate = () => this.updateProgress();
-    this.onPlaying = () => this.clearWaiting();
-    this.onCanPlay = () => this.playIfRequested();
+    this.onTimeUpdate = () => {
+      this.checkPlaybackStartupProgress();
+      this.updateProgress();
+    };
+    this.onPlaying = () => {
+      this.checkPlaybackStartupProgress();
+      this.clearWaiting();
+    };
+    this.onCanPlay = () => {
+      this.checkPlaybackStartupProgress();
+      this.playIfRequested();
+    };
+    this.onLoadedData = () => this.checkPlaybackStartupProgress();
     this.onWaiting = () => this.beginWaiting();
     this.onNativeError = () => {
       if (!this.destroyed && !this.hls) {
+        const startup = this.startupWatch;
+        this.clearPlaybackStartupWatch();
+        this.recordPlaybackIssue(
+          "video_stream_native_playback_error",
+          "native_hls_media_error",
+          {
+            playback_mode: startup?.mode ?? "native",
+            ready_state: Number(this.video.readyState) || 0,
+            network_state: Number(this.video.networkState) || 0,
+            media_error_code: Number(this.video.error?.code) || 0,
+          }
+        );
         this.showNotice(
           "再生データを読み込めません。現在位置から再接続できます。",
           "error",
@@ -555,6 +582,7 @@ export class VideoStreamViewer {
     this.video.addEventListener("timeupdate", this.onTimeUpdate);
     this.video.addEventListener("playing", this.onPlaying);
     this.video.addEventListener("canplay", this.onCanPlay);
+    this.video.addEventListener("loadeddata", this.onLoadedData);
     this.video.addEventListener("waiting", this.onWaiting);
     this.video.addEventListener("error", this.onNativeError);
 
@@ -709,24 +737,47 @@ export class VideoStreamViewer {
     this.video.pause();
     this.video.removeAttribute("src");
     this.video.load();
-    const playback = videoPlaybackDecision(this.video.canPlayType(HLS_MIME));
+    const capabilities = {
+      nativeHlsCanPlayType: this.video.canPlayType(HLS_MIME),
+      mediaSourceSupported: typeof globalThis.MediaSource === "function",
+      managedMediaSourceSupported:
+        typeof globalThis.ManagedMediaSource === "function",
+    };
+    let Hls = null;
+    if (capabilities.mediaSourceSupported || capabilities.managedMediaSourceSupported) {
+      try {
+        Hls = await loadHlsJs();
+      } catch (error) {
+        this.recordPlaybackIssue(
+          "video_stream_hls_js_load_failed",
+          "hls_js_script_load_failed",
+          { load_error_message: String(error?.message ?? error) }
+        );
+      }
+    }
+    const hlsJsSupported = Boolean(Hls?.isSupported?.());
+    const playback = videoPlaybackDecision({ ...capabilities, hlsJsSupported });
+    if (playback.mode === "unsupported") {
+      this.recordPlaybackIssue(
+        "video_stream_playback_unsupported",
+        playback.reason,
+        {
+          native_hls_can_play_type: capabilities.nativeHlsCanPlayType,
+          media_source_supported: capabilities.mediaSourceSupported,
+          managed_media_source_supported: capabilities.managedMediaSourceSupported,
+          hls_js_supported: hlsJsSupported,
+        }
+      );
+      this.showNotice("このブラウザでは動画を再生できません。", "error");
+      return false;
+    }
     if (playback.mode === "native") {
+      this.beginPlaybackStartupWatch("native");
       this.video.src = url;
       this.video.load();
       return true;
     }
 
-    let Hls;
-    try {
-      Hls = await loadHlsJs();
-    } catch (error) {
-      this.showOperationalError(error, "動画の再生機能を読み込めませんでした");
-      return false;
-    }
-    if (!Hls.isSupported()) {
-      this.showNotice("このブラウザでは動画を再生できません。", "error");
-      return false;
-    }
     if (this.destroyed) return false;
     const hls = new Hls({
       backBufferLength: 60,
@@ -738,6 +789,12 @@ export class VideoStreamViewer {
     });
     this.hls = hls;
     hls.on(Hls.Events.ERROR, (_event, data) => this.onHlsError(data));
+    hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
+      if (data?.frag && data.frag.sn !== "initSegment") {
+        this.markPlaybackMediaSegmentLoaded();
+      }
+    });
+    this.beginPlaybackStartupWatch("hls_js");
     hls.loadSource(url);
     hls.attachMedia(this.video);
     return true;
@@ -753,12 +810,14 @@ export class VideoStreamViewer {
         hlsHttpErrorCode(data)
       );
       if (decision.kind === "waiting") {
+        this.clearPlaybackStartupWatch();
         this.showNotice(decision.message, "waiting");
         this.hls?.stopLoad();
         this.schedule(() => this.attachPlaylist(this.playlistUrl), decision.retryDelayMs);
         return;
       }
       if (decision.kind === "generation_mismatch") {
+        this.clearPlaybackStartupWatch();
         this.showNotice(decision.message, "waiting");
         this.refreshGeneration().catch((error) => {
           this.showOperationalError(error, "動画の再生を再開できませんでした");
@@ -766,6 +825,7 @@ export class VideoStreamViewer {
         return;
       }
       if (decision.kind === "gone" || decision.kind === "not_found") {
+        this.clearPlaybackStartupWatch();
         this.hls?.stopLoad();
         this.video.pause();
         this.showStatusDecision(decision);
@@ -773,6 +833,7 @@ export class VideoStreamViewer {
       }
     }
     if (!data?.fatal) return;
+    this.clearPlaybackStartupWatch();
     this.hls?.stopLoad();
     this.showNotice(
       "動画を再生できませんでした。もう一度お試しください。",
@@ -1178,6 +1239,99 @@ export class VideoStreamViewer {
     }, WAITING_SUGGESTION_MS);
   }
 
+  beginPlaybackStartupWatch(mode) {
+    this.clearPlaybackStartupWatch();
+    const watch = {
+      mode,
+      startedAt: performance.now(),
+      mediaSegmentsLoaded: 0,
+      timer: 0,
+    };
+    this.startupWatch = watch;
+    this.schedulePlaybackStartupCheck(watch, STARTUP_MEDIA_SEGMENT_TIMEOUT_MS);
+  }
+
+  schedulePlaybackStartupCheck(watch, delayMs) {
+    watch.timer = setTimeout(
+      () => this.checkPlaybackStartup(watch),
+      Math.max(1, Number(delayMs) || 1)
+    );
+  }
+
+  markPlaybackMediaSegmentLoaded() {
+    const watch = this.startupWatch;
+    if (!watch) return;
+    watch.mediaSegmentsLoaded += 1;
+    this.checkPlaybackStartup(watch);
+  }
+
+  checkPlaybackStartupProgress() {
+    const watch = this.startupWatch;
+    if (watch) this.checkPlaybackStartup(watch);
+  }
+
+  checkPlaybackStartup(watch) {
+    if (this.destroyed || this.startupWatch !== watch) return;
+    clearTimeout(watch.timer);
+    watch.timer = 0;
+    const elapsedMs = performance.now() - watch.startedAt;
+    const decision = videoStartupDecision({
+      mediaSegmentsLoaded: watch.mediaSegmentsLoaded,
+      readyState: this.video.readyState,
+      elapsedMs,
+      timeoutMs: STARTUP_MEDIA_SEGMENT_TIMEOUT_MS,
+    });
+    if (decision.kind === "started") {
+      this.clearPlaybackStartupWatch();
+      return;
+    }
+    if (decision.kind === "waiting") {
+      this.schedulePlaybackStartupCheck(watch, decision.remainingMs);
+      return;
+    }
+
+    this.clearPlaybackStartupWatch();
+    this.hls?.stopLoad();
+    this.video.pause();
+    this.clearWaiting();
+    this.recordPlaybackIssue(
+      "video_stream_start_no_segment",
+      decision.internalReason,
+      {
+        playback_mode: watch.mode,
+        timeout_ms: STARTUP_MEDIA_SEGMENT_TIMEOUT_MS,
+        elapsed_ms: Math.round(elapsedMs),
+        media_segments_loaded: watch.mediaSegmentsLoaded,
+        ready_state: Number(this.video.readyState) || 0,
+        network_state: Number(this.video.networkState) || 0,
+      }
+    );
+    this.showNotice(
+      "このブラウザでは動画の再生を開始できませんでした。",
+      "error",
+      "再接続",
+      () => this.restartAt(this.currentPosition())
+    );
+  }
+
+  clearPlaybackStartupWatch() {
+    if (!this.startupWatch) return;
+    clearTimeout(this.startupWatch.timer);
+    this.startupWatch = null;
+  }
+
+  recordPlaybackIssue(category, internalReason, details = {}) {
+    try {
+      this.reportPlaybackIssue({
+        category,
+        internalReason,
+        session: this.session,
+        generation: this.generation,
+        ...details,
+      });
+    } catch {}
+  }
+
   clearWaiting() {
     clearTimeout(this.waitingTimer);
     this.waitingTimer = 0;
@@ -1304,6 +1458,7 @@ export class VideoStreamViewer {
   }
 
   destroyHls() {
+    this.clearPlaybackStartupWatch();
     this.hls?.destroy();
     this.hls = null;
   }
@@ -1323,6 +1478,7 @@ export class VideoStreamViewer {
     this.video.removeEventListener("timeupdate", this.onTimeUpdate);
     this.video.removeEventListener("playing", this.onPlaying);
     this.video.removeEventListener("canplay", this.onCanPlay);
+    this.video.removeEventListener("loadeddata", this.onLoadedData);
     this.video.removeEventListener("waiting", this.onWaiting);
     this.video.removeEventListener("error", this.onNativeError);
     this.stage.removeEventListener("pointerdown", this.pointerDown);

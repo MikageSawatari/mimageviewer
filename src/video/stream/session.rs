@@ -859,6 +859,38 @@ mod tests {
     }
 
     #[test]
+    fn excessive_pre_session_audio_becomes_failed_status_with_values() {
+        const SAMPLE_RATE: u32 = 48_000;
+        let source_start_secs = 67.267_2;
+        let timeline = StreamTimeline::new(source_start_secs).unwrap();
+        let mut audio = open_aac_encoder(SAMPLE_RATE, 96_000, 1, timeline).unwrap();
+        let result = audio
+            .push_chunk(crate::video::audio::ProcessedChunk {
+                samples: vec![0.0; 1_024 * 2],
+                audible_pts_secs: source_start_secs - 1.0,
+                duration_secs: 1_024.0 / f64::from(SAMPLE_RATE),
+                source_secs_per_output_sec: 1.0,
+                seek_serial: 1,
+                pdc_latency_secs_at_process: 0.070_227,
+            })
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+
+        let completion = generation_worker_completion(result, false);
+        let StreamGenerationStatus::Failed(reason) = completion.status else {
+            panic!("audio timeline error did not fail the generation");
+        };
+        assert!(reason.contains("audible_pts_secs=66.267200000"));
+        assert!(reason.contains("source_start_secs=67.267200000"));
+        assert!(reason.contains("allowed_lead_secs=0.091560333"));
+        assert!(reason.contains("excess_secs=0.908439667"));
+        assert_eq!(
+            completion.log_line.as_deref(),
+            Some(format!("remote-stream generation worker failed: {reason}").as_str())
+        );
+    }
+
+    #[test]
     fn worker_error_is_published_before_resource_drop_sets_cancel() {
         let cancel = Arc::new(AtomicBool::new(false));
         let status = Arc::new((Mutex::new(StreamGenerationStatus::Opening), Condvar::new()));

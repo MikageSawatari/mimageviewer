@@ -52,6 +52,7 @@ import {
   videoPlaybackDecision,
   videoQualityPreset,
   videoSeekPlan,
+  videoStartupDecision,
   videoTapCommand,
   videoTimelineAnchor,
   videoTimelinePosition,
@@ -108,19 +109,81 @@ test("media keys and tap zones map to the existing media command layer", () => {
   assert.equal(videoTapCommand(280, 300).payload.seconds, 10);
 });
 
-test("native HLS support avoids loading hls.js on iOS Safari", () => {
-  assert.deepEqual(videoPlaybackDecision("probably"), {
-    mode: "native",
-    loadHlsJs: false,
-  });
-  assert.deepEqual(videoPlaybackDecision("maybe"), {
-    mode: "native",
-    loadHlsJs: false,
-  });
-  assert.deepEqual(videoPlaybackDecision(""), {
+test("MSE selects hls.js even when canPlayType reports maybe", () => {
+  assert.deepEqual(videoPlaybackDecision({
+    nativeHlsCanPlayType: "maybe",
+    mediaSourceSupported: true,
+  }), {
     mode: "hls_js",
     loadHlsJs: true,
   });
+  assert.deepEqual(videoPlaybackDecision({
+    nativeHlsCanPlayType: "probably",
+    managedMediaSourceSupported: true,
+  }), {
+    mode: "hls_js",
+    loadHlsJs: true,
+  });
+});
+
+test("native HLS is the fallback when iOS has no MSE", () => {
+  assert.deepEqual(videoPlaybackDecision({ nativeHlsCanPlayType: "probably" }), {
+    mode: "native",
+    loadHlsJs: false,
+  });
+  assert.deepEqual(videoPlaybackDecision({ nativeHlsCanPlayType: "maybe" }), {
+    mode: "native",
+    loadHlsJs: false,
+  });
+  assert.deepEqual(videoPlaybackDecision({
+    nativeHlsCanPlayType: "probably",
+    mediaSourceSupported: true,
+    hlsJsSupported: false,
+  }), {
+    mode: "native",
+    loadHlsJs: false,
+  });
+});
+
+test("missing MSE and native HLS reports unsupported playback", () => {
+  assert.deepEqual(videoPlaybackDecision({ nativeHlsCanPlayType: "" }), {
+    mode: "unsupported",
+    loadHlsJs: false,
+    reason: "browser_has_no_supported_hls_playback_path",
+  });
+  assert.deepEqual(videoPlaybackDecision({
+    nativeHlsCanPlayType: "",
+    mediaSourceSupported: true,
+    hlsJsSupported: false,
+  }), {
+    mode: "unsupported",
+    loadHlsJs: false,
+    reason: "browser_has_no_supported_hls_playback_path",
+  });
+});
+
+test("startup detects a deadline with no fetched media segment", () => {
+  assert.deepEqual(videoStartupDecision({
+    mediaSegmentsLoaded: 0,
+    readyState: 0,
+    elapsedMs: 14999,
+    timeoutMs: 15000,
+  }), { kind: "waiting", remainingMs: 1 });
+  assert.deepEqual(videoStartupDecision({
+    mediaSegmentsLoaded: 0,
+    readyState: 0,
+    elapsedMs: 15000,
+    timeoutMs: 15000,
+  }), {
+    kind: "no_media_segment",
+    internalReason: "no_media_segment_loaded_before_deadline",
+  });
+  assert.deepEqual(videoStartupDecision({
+    mediaSegmentsLoaded: 1,
+    readyState: 0,
+    elapsedMs: 15000,
+    timeoutMs: 15000,
+  }), { kind: "started" });
 });
 
 test("whole-video position composes server state with the HLS window", () => {

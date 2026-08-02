@@ -2686,6 +2686,12 @@ function renderVideoViewer(entry) {
     inputSource: inputSourceFromEvent,
     apiJson,
     apiPostJson,
+    reportPlaybackIssue: ({ category, internalReason, ...details }) => {
+      recordClientError(category, internalReason, {
+        internal_reason: internalReason,
+        ...details,
+      });
+    },
     keyboardAvailable: shouldShowKeyboardShortcuts({
       coarsePointer: state.coarsePointer,
       keyboardUsed: state.keyboardInputSeen,

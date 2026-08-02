@@ -253,6 +253,9 @@ HW デコード時 (`AV_PIX_FMT_D3D11`) は既存の `av_hwframe_transfer_data`
 維持し、映像と同じ `StreamTimeline` へ渡すため、別の音声原点や timestamp clamp は導入しない。
 `StreamTimeline` は意味のある原点前 timestamp を従来どおり error にし、診断には source PTS、
 session 原点、差分秒を含める。1ns の既存浮動小数点許容だけは共通定数として維持する。
+初期 chunk の先行量は `pdc_latency_secs_at_process + 1 chunk の source duration` を上限とする。
+これは宣言済み DSP delay と sample 境界の余裕だけを許す値で、超過時は silent drop を続けず、
+audible PTS、session 原点、先行量、PDC、chunk duration、許容量、超過量を持つ worker error にする。
 
 変速再生 (`playback_speed != 1.0`) は第 1 段では**非対応**とし、ストリーミング中は等速に
 固定する (`source_secs_per_output_sec` の扱いが増えるため。§12)。
@@ -269,7 +272,8 @@ session 原点、差分秒を含める。1ns の既存浮動小数点許容だ�
   `source_secs_per_output_sec != 1.0` は黙って連続音声として扱わず error にして session 側へ返す
 - 実機検証是正 (2026-08-02): session attach 時の現在位置と PDC 補正済み先頭音声区間のずれを
   AAC encoder の初期区間 trim で吸収した。完全な pre-session chunk の drop と、原点を跨ぐ
-  chunk の sample trim は PCM assembler より前で行い、その後の chunk 連続性検証は維持する
+  chunk の sample trim は PCM assembler より前で行い、その後の chunk 連続性検証は維持する。
+  drop の許容は各 chunk が宣言する PDC + 1 chunk までとし、超過は数値付き `Failed` にする
 
 ### 4.4 セグメンタ
 
@@ -371,19 +375,27 @@ Android / PC は hls.js という広く使われた実装に委ねられる**。
 ### 5.2 クライアント分岐
 
 ```js
-if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    video.src = playlistUrl;          // iOS / iPadOS / macOS Safari
-} else {
+const mse = typeof MediaSource === 'function' ||
+    typeof ManagedMediaSource === 'function';
+const Hls = mse ? await loadHlsJs() : null;
+if (Hls?.isSupported()) {
     const hls = new Hls({ ... });     // Android Chrome / PC
     hls.loadSource(playlistUrl);
     hls.attachMedia(video);
+} else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.src = playlistUrl;          // iOS / iPadOS / macOS Safari
+} else {
+    showUnsupportedPlayback();
 }
 ```
 
 - hls.js は **Apache-2.0**。`dist/hls.min.js` 1 ファイルを `crates/remote-web/web/vendor/` へ
   置いて静的配信する。バンドラも TypeScript も導入しない
   ([web-remote-plan.md](web-remote-plan.md) §3.4 の「ビルドステップを導入しない」を維持)
-- iOS Safari では hls.js を**読み込まない** (MSE 制限があり動かないため、ネイティブに委ねる)
+- MSE / ManagedMediaSource が利用可能なら `Hls.isSupported()` を先に評価し、hls.js を第一候補にする。
+  Chrome は native HLS を再生できなくても `canPlayType` が `maybe` を返すため、native 判定を
+  先にしてはいけない。MSE が無い iOS Safari だけ native HLS へ fallback し、両方無ければ
+  明示的な再生非対応とする
 - **MSE を mIV が実装するわけではない。** MSE はブラウザ側の API であり、それを駆動するのは
   hls.js である。mIV 側の成果物は上記の分岐と hls.js の静的配信だけで、サーバの HLS 出力は
   iOS 向けとまったく同一のものを使う
@@ -528,7 +540,7 @@ start の **15 秒**は、次の根拠で置く運用上限である。
   残し、`stream_start_player_timeout` / `stream_start_seek_timeout` /
   `stream_start_encoder_timeout` / `stream_start_playlist_timeout` の分布を根拠に再調整する
 
-動画 path に直接関係する wall-clock timeout は次の **8 個**で、同じ仕事を二重に打ち切らない。
+動画 path に直接関係する wall-clock timeout は次の **9 個**で、同じ仕事を二重に打ち切らない。
 
 | 境界 | 値 | 守るもの | start との関係 |
 |---|---:|---|---|
@@ -538,6 +550,7 @@ start の **15 秒**は、次の根拠で置く運用上限である。
 | 通常 IPC response | 10 秒 | start 以外の pending IPC / HTTP worker | start には使わない |
 | 通常 UI request accept | 2 秒 | control/seek/stop 等で UI queue 未受理を検出 | start は 2 秒を使わず start 残予算を使う |
 | browser playlist recovery | 最大 6 回か 15 秒 | start 後の generation mismatch / 一時 503 からの回復 | start 完了後の client recovery |
+| browser first media segment | 15 秒 | playlist attach 後に media segment が 0 件のままの開始不能を検出 | core start 完了後。通常の再生中 buffering とは分離 |
 | remote session liveness | 60 秒 | client 消失時の owner / stream 解放 | request timeout ではない lifecycle guard |
 | paused-stream idle | 10 分 | 放置された停止中 stream の解放 | request timeout ではない lifecycle guard |
 
@@ -551,7 +564,7 @@ timeout message は要求種別 (master/media playlist、init/media segment、st
 増分 5 の **6.0 秒**は wall-clock timeout ではなく、2 秒 GOP の 3 倍を許す source-timeline 上の
 unfinished fragment / interleave backlog 上限である。超過時は session を停止し、resource request
 の 2 秒や start の 15 秒とは合算しない。named-pipe connect 1 秒と reconnect backoff は接続基盤の
-guard で、動画処理開始後の timeout 8 個には数えない。
+guard で、動画処理開始後の timeout 9 個には数えない。
 
 ### 6.3 セッションと既存ロックの関係
 
@@ -666,10 +679,10 @@ guard で、動画処理開始後の timeout 8 個には数えない。
 
 #### 増分 7 実装記録 (フロントエンド、2026-08-02)
 
-- `canPlayType('application/vnd.apple.mpegurl')` が `maybe` / `probably` の端末は native HLS とし、
-  `vendor/hls.min.js` は読み込まない。それ以外の端末だけ、完全一致の public shell asset
-  `/vendor/hls.min.js` を script 要素で遅延ロードする。playlist / segment / video API は従来どおり
-  認証 guard 下で、native video、playlist probe、hls.js XHR のすべてを同一 origin Cookie 経路にした
+- MSE / ManagedMediaSource がある端末は完全一致の public shell asset `/vendor/hls.min.js` を
+  遅延ロードして `Hls.isSupported()` を先に評価する。false の場合だけ native HLS を試し、両方
+  無ければ明示的な非対応表示にする。playlist / segment / video API は従来どおり認証 guard 下で、
+  native video、playlist probe、hls.js XHR のすべてを同一 origin Cookie 経路にした
 - シーク表示は state poll 時の本体位置から HLS live edge との差を引き、その source 位置と
   `<video>.currentTime` をアンカーにして次の poll まで補間する。対象を `seekable` へ逆写像できる
   場合は video 内だけで移動し、範囲外は `/api/video/seek` の新 generation / playlist へ差し替える
@@ -679,6 +692,10 @@ guard で、動画処理開始後の timeout 8 個には数えない。
   playlist probe は再帰せず最大 6 回か 15 秒で終了し、回復不能なら
   「動画の再生を続けられませんでした。」と再接続操作を表示する。session mismatch の 409 は
   再取得対象にしない
+- playlist attach ごとに15秒の初回 media segment watchdog を持つ。hls.js は init を除く
+  `FRAG_LOADED`、native は `loadeddata` / `canplay` で解除する。0件のままなら通常 buffering と
+  分けて開始不能を表示し、telemetry に `no_media_segment_loaded_before_deadline`、playback mode、
+  ready/network state、session/generation を残す
 - HTTP 本文や例外の内部メッセージを notice へ連結しない。start は
   「動画を開始できませんでした。もう一度お試しください。」、session/generation 失効は
   「動画の配信が終了しました。もう一度開いてください。」へ正規化し、HLS、encoder、

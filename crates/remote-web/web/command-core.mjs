@@ -382,13 +382,45 @@ export function videoTapCommand(clientX, width) {
   return command(CommandName.MEDIA_TOGGLE_PLAY);
 }
 
-export function videoPlaybackDecision(nativeHlsCanPlayType) {
+export function videoPlaybackDecision({
+  nativeHlsCanPlayType = "",
+  mediaSourceSupported = false,
+  managedMediaSourceSupported = false,
+  hlsJsSupported,
+} = {}) {
+  const mseSupported = mediaSourceSupported || managedMediaSourceSupported;
+  if (mseSupported && hlsJsSupported !== false) {
+    return { mode: "hls_js", loadHlsJs: true };
+  }
   const nativeHls = ["maybe", "probably"].includes(
     String(nativeHlsCanPlayType ?? "").toLowerCase()
   );
-  return nativeHls
-    ? { mode: "native", loadHlsJs: false }
-    : { mode: "hls_js", loadHlsJs: true };
+  if (nativeHls) return { mode: "native", loadHlsJs: false };
+  return {
+    mode: "unsupported",
+    loadHlsJs: false,
+    reason: "browser_has_no_supported_hls_playback_path",
+  };
+}
+
+export function videoStartupDecision({
+  mediaSegmentsLoaded = 0,
+  readyState = 0,
+  elapsedMs = 0,
+  timeoutMs = 15000,
+} = {}) {
+  if (Number(mediaSegmentsLoaded) > 0 || Number(readyState) >= 2) {
+    return { kind: "started" };
+  }
+  const timeout = Math.max(1, Number(timeoutMs) || 1);
+  const elapsed = Math.max(0, Number(elapsedMs) || 0);
+  if (elapsed < timeout) {
+    return { kind: "waiting", remainingMs: timeout - elapsed };
+  }
+  return {
+    kind: "no_media_segment",
+    internalReason: "no_media_segment_loaded_before_deadline",
+  };
 }
 
 export function videoQualityPreset(quality) {
