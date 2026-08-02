@@ -545,6 +545,10 @@ pub(crate) enum VideoStreamUiRequest {
         session: u64,
         position_secs: f64,
     },
+    Thumbnail {
+        session: u64,
+        position_secs: Option<f64>,
+    },
     Stop {
         session: u64,
     },
@@ -570,6 +574,9 @@ pub(crate) enum VideoStreamUiOutcome {
     Started(PublishedVideoStream),
     Controlled(SessionResponse),
     Seeked(StreamingGeneration),
+    ThumbnailPending,
+    ThumbnailReady(crate::video::thumbnail::Thumbnail),
+    ThumbnailCleared,
     Stopped,
     Error(VideoStreamError),
 }

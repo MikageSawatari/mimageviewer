@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -729,6 +729,19 @@ pub struct VideoStreamSeekPayload {
     pub generation: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum VideoStreamThumbnailPayload {
+    Pending,
+    Ready {
+        actual_pts_secs: f64,
+        width: u32,
+        height: u32,
+        webp_bytes: Vec<u8>,
+    },
+    Cleared,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct VideoStreamPlaylistPayload {
     pub body: String,
@@ -873,6 +886,12 @@ pub enum ClientMessage {
         session: u64,
         position_secs: f64,
     },
+    VideoStreamThumbnail {
+        id: RequestId,
+        client_id: String,
+        session: u64,
+        position_secs: Option<f64>,
+    },
     VideoStreamPlaylist {
         id: RequestId,
         client_id: String,
@@ -916,6 +935,7 @@ impl ClientMessage {
             | Self::VideoStreamStart { id, .. }
             | Self::VideoStreamControl { id, .. }
             | Self::VideoStreamSeek { id, .. }
+            | Self::VideoStreamThumbnail { id, .. }
             | Self::VideoStreamPlaylist { id, .. }
             | Self::VideoStreamSegment { id, .. }
             | Self::VideoStreamState { id, .. }
@@ -976,6 +996,10 @@ pub enum ServerMessage {
         id: RequestId,
         response: VideoStreamResult<VideoStreamSeekPayload>,
     },
+    VideoStreamThumbnail {
+        id: RequestId,
+        response: VideoStreamResult<VideoStreamThumbnailPayload>,
+    },
     VideoStreamPlaylist {
         id: RequestId,
         response: VideoStreamResult<VideoStreamPlaylistPayload>,
@@ -1009,6 +1033,7 @@ impl ServerMessage {
             | Self::VideoStreamStart { id, .. }
             | Self::VideoStreamControl { id, .. }
             | Self::VideoStreamSeek { id, .. }
+            | Self::VideoStreamThumbnail { id, .. }
             | Self::VideoStreamPlaylist { id, .. }
             | Self::VideoStreamSegment { id, .. }
             | Self::VideoStreamState { id, .. }
@@ -1252,8 +1277,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v17_video_pull_messages_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 17);
+    fn protocol_v18_video_pull_and_seek_thumbnail_messages_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 18);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -1278,6 +1303,12 @@ mod tests {
                 generation: 9,
                 index: VideoStreamSegmentIndex::Media { sequence: 12 },
             },
+            ClientMessage::VideoStreamThumbnail {
+                id: 53,
+                client_id: "test-client".to_owned(),
+                session: 7,
+                position_secs: Some(42.5),
+            },
         ];
         for expected in requests {
             let mut bytes = Vec::new();
@@ -1298,6 +1329,15 @@ mod tests {
                     VideoStreamErrorCode::StartEncoderTimeout,
                     "encoder deadline",
                 )),
+            },
+            ServerMessage::VideoStreamThumbnail {
+                id: 53,
+                response: VideoStreamResult::Success(VideoStreamThumbnailPayload::Ready {
+                    actual_pts_secs: 42.466,
+                    width: 320,
+                    height: 180,
+                    webp_bytes: vec![1, 2, 3],
+                }),
             },
         ] {
             let mut bytes = Vec::new();

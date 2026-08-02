@@ -3,9 +3,63 @@ import assert from "node:assert/strict";
 
 import {
   VideoGenerationSwitchOwner,
+  VideoSeekPreviewOwner,
   resolveVideoPlaylist,
   videoUserErrorMessage,
 } from "./video-stream.mjs";
+
+test("seek preview advances from seeking through decoded thumbnail to playback", () => {
+  const owner = new VideoSeekPreviewOwner({ matchToleranceSecs: 1 });
+  const request = owner.request(42.5);
+  assert.equal(owner.current().kind, "seeking");
+
+  assert.equal(owner.acceptThumbnail(request, {
+    actualPtsSecs: 42.466,
+    objectUrl: "blob:thumbnail",
+    width: 320,
+    height: 180,
+  }), true);
+  assert.deepEqual(owner.current(), {
+    kind: "thumbnail",
+    revision: request.revision,
+    targetSecs: 42.5,
+    label: "シーク中",
+    actualPtsSecs: 42.466,
+    objectUrl: "blob:thumbnail",
+    width: 320,
+    height: 180,
+  });
+
+  assert.equal(owner.playbackStarted(), true);
+  assert.deepEqual(owner.current(), { kind: "playback" });
+});
+
+test("playback is never held for a missing seek thumbnail", () => {
+  const owner = new VideoSeekPreviewOwner();
+  owner.request(90);
+  assert.equal(owner.playbackStarted(), true);
+  assert.equal(owner.current().kind, "playback");
+});
+
+test("seek drag keeps only the latest thumbnail request and rejects stale or wrong PTS", () => {
+  const owner = new VideoSeekPreviewOwner({ matchToleranceSecs: 0.5 });
+  const stale = owner.request(10, "移動先を確認中");
+  const latest = owner.request(35, "移動先を確認中");
+
+  assert.equal(owner.acceptThumbnail(stale, {
+    actualPtsSecs: 10,
+    objectUrl: "blob:stale",
+  }), false);
+  assert.equal(owner.acceptThumbnail(latest, {
+    actualPtsSecs: 32,
+    objectUrl: "blob:wrong-position",
+  }), false);
+  assert.equal(owner.acceptThumbnail(latest, {
+    actualPtsSecs: 35.033,
+    objectUrl: "blob:latest",
+  }), true);
+  assert.equal(owner.current().actualPtsSecs, 35.033);
+});
 
 const jsonResponse = (status, body) => new Response(JSON.stringify(body), {
   status,

@@ -8,7 +8,7 @@
 - 現在のフェーズ: **第 1 段 増分 7/7 + 実機検証是正を実装済み、再検証待ち** (encoder 抽象 / fallback / 画質
   preset + 映像・音声 fMP4 segmenter / ring / m3u8 + audio tap / AAC + decoder-output
   video tap / HW download / scale / H.264 input + streaming session / remote owner 連携 /
-  generation / 設定 + protocol v15 IPC / HTTP・HLS ルート + Web フロント、2026-08-02)
+  generation / 設定 + protocol v18 IPC / HTTP・HLS ルート + Web フロント、2026-08-03)
 
 ---
 
@@ -281,6 +281,9 @@ audible PTS、session 原点、先行量、PDC、chunk duration、許容量、�
 - セグメント長の目標は **2 秒**、GOP も 2 秒 (`keyint = fps * 2`, `scenecut` 無効) とし、
   各セグメントを必ず IDR から始める。tap / encoder の frame skip で予定境界の IDR が
   欠けた場合は停止せず、次の IDR まで現在セグメントを延長する
+- generation の最初のセグメントだけ 0.5 秒境界も forced-IDR 候補にし、実際に閉じた
+  境界から後続の 2 秒 GOP を再開する。エンコーダが短い IDR 指定を無視した場合は元の
+  2 秒境界を保険として残し、壊さず従来の初回 2 秒へ戻る
 - avformat の mp4 muxer を `movflags=frag_custom+delay_moov+default_base_is_moof+cmaf` 相当で
   使い、出力は `avio_alloc_context` によるメモリ書き出しにする。
   raw FFI は `ffmpeg_the_third::ffi::` 経由で既に本体各所で使っており、新しい依存にはならない
@@ -355,6 +358,18 @@ audible PTS、session 原点、先行量、PDC、chunk duration、許容量、�
   位置」である。**増分 4 の映像 tap は、投入できた frame で番号を詰め直してはいけない**
   (詰め直すと forced-IDR の位置が encoder の負荷次第でずれる)
 
+#### 実機待ち時間是正 B: 初回セグメント短縮 (2026-08-03)
+
+- `FrameRate` が 0.5 秒と 2 秒をそれぞれ CFR frame 数へ丸め、segmenter は初回だけ
+  0.5 秒の close 条件を使う。短縮 IDR を受理できる encoder では 0.5 秒で最初の
+  `moof+mdat` を公開し、以後は実際の close DTS + 2 秒へ境界を戻す
+- 初回 close 前は 0.5 秒 offset の候補と従来の 2 秒候補を併存させる。短縮 IDR が
+  出なければ既存の `AwaitingIdr` が次の IDR まで延長し、2 秒 IDR で従来挙動へ復帰する
+- `#EXTINF` は各 fragment の start/end DTS から測った値を使い、
+  `#EXT-X-TARGETDURATION` は ring 内の最大 `EXTINF` の切り上げ以上を維持する
+- generation ごとの最初の close で `remote-stream initial segment` を 1 行出し、
+  `target` / `actual` / `shortened` / `delayed_idr` により短縮の成否を実機で判別する
+
 ---
 
 ## 5. 配信プロトコルとクライアント
@@ -416,6 +431,13 @@ HLS のライブウィンドウ (直近 60 秒) 内は `<video>` 上で完結す
    (hls.js 側は `loadSource` をやり直す)
 4. 再バッファは 2〜4 秒
 
+シークバーのドラッグ開始から、中央表示は `シーク中` (ドラッグ中は `移動先を確認中`)
+→実際にデコードできた seek thumbnail→再生、の順で遷移する。thumbnail は既存
+`VideoPlayer` の latest-wins `ThumbnailWorker` を使い、応答の実 frame PTS が現在の要求位置に
+合う場合だけ表示する。新しいドラッグ位置は古い取得を中止して置き換える。`playing` が先に
+到着した場合は thumbnail を待たずに破棄し、配信 readiness や generation switch の条件には
+thumbnail を含めない。
+
 `#EXT-X-DISCONTINUITY` による同一プレイリスト継続は、iOS のネイティブ実装との相性を
 確認できるまで採らない。URL を切り替える方が確実で、実装も単純。
 
@@ -430,6 +452,7 @@ HLS のライブウィンドウ (直近 60 秒) 内は `<video>` 上で完結す
 | `POST /api/video/start` | `{fav, path, quality}` → `{session, generation, playlist, duration_secs, codec, encoder}` |
 | `POST /api/video/control` | `{session, action: play\|pause\|volume\|quality}` |
 | `POST /api/video/seek` | `{session, position_secs}` → 新 `generation` と `playlist` |
+| `POST /api/video/thumbnail` | `{session, position_secs}`。実 frame PTS 付き WebP、生成中は 202、`null` は要求解除 |
 | `GET /api/video/state` | 再生位置・尺・バッファ秒数・実効ビットレート・選択エンコーダ |
 | `POST /api/video/stop` | セッション終了。本体はストリーミングを止める |
 | `GET /stream/<session>/<gen>/index.m3u8` | CODECS を宣言する Master Playlist |
@@ -455,7 +478,7 @@ HLS のライブウィンドウ (直近 60 秒) 内は `<video>` 上で完結す
   segmenter の typed `None` を保持して HTTP 503 または上限付き wait へ写像し、200 では
   必ず非空の init、または init と最初の media segment を参照できる playlist を返す
 
-### 6.2 IPC (動画 API 導入 v15、timeout stage code 追加 v17)
+### 6.2 IPC (動画 API 導入 v15、timeout stage code 追加 v17、seek thumbnail 追加 v18)
 
 既存の長寿命 duplex 多重化接続 ([web-remote-plan.md](web-remote-plan.md) §9.5-9.6) に
 `ClientMessage` / `ServerMessage` の variant を追加する。**セグメントは pull 型**とし、
@@ -467,6 +490,7 @@ remote-web が HTTP 要求を受けた時に取りに行く。push 型の非同�
 | `VideoStreamStart { address, quality }` | `{ session, generation, duration_secs, encoder, video_size }` |
 | `VideoStreamControl { session, action }` | `SessionStatus` |
 | `VideoStreamSeek { session, position_secs }` | `{ generation }` |
+| `VideoStreamThumbnail { session, position_secs }` | `Pending` / 実 frame PTS + WebP / `Cleared` |
 | `VideoStreamPlaylist { session, generation, kind }` | master / media m3u8 本文 |
 | `VideoStreamSegment { session, generation, index }` | セグメントのバイト列 / `NotFound` / `Gone` |
 | `VideoStreamState { session }` | 再生位置・バッファ・ビットレート実績 |
@@ -712,6 +736,16 @@ guard で、動画処理開始後の timeout 9 個には数えない。
 - 動画のタップ、スワイプ、Space、矢印、音量、画質、F11 は `command-core.mjs` の既存 command
   dispatch に統合した。`<video controls>` は使わず、シークバー、音量、画質 UI は自前 DOM とした。
   visibility 復帰時に session が失効していれば、表示中の全体動画位置を保持して start + seek する
+
+#### 実機待ち時間是正 A: seek preview (2026-08-03)
+
+- protocol v18 の thumbnail request は UI thread で既存 worker の要求と cache snapshot だけを
+  行い、WebP encode は IPC stream worker へ逃がす。再生 decoder / generation worker / audio
+  readiness は待たず、thumbnail 完了も一切待たない
+- Web は `VideoSeekPreviewOwner` が request revision と `seeking / thumbnail / playback` を
+  単独所有する。range `input` は AbortController で旧 request を捨て、常に最新位置だけを poll する
+- thumbnail の要求位置ではなく応答 header の実 frame PTS を照合・表示する。thumbnail 未到着でも
+  `<video>` の `playing` を受けた時点で preview を終了し、通常再生を即座に前面へ戻す
 
 ---
 

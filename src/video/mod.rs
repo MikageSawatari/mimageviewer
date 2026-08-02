@@ -206,6 +206,9 @@ pub struct VideoPlayer {
     /// hover preview と同じ `ThumbnailWorker` を共有するため、marker 側の毎フレーム再要求が
     /// hover 要求を上書きし続けないようにする。
     marker_thumbnail_warmup_requests: Mutex<std::collections::HashMap<i64, std::time::Instant>>,
+    /// Remote seek/drag preview currently requested by the browser. Marker warmup shares the
+    /// thumbnail worker, so it must not replace an unsatisfied interactive remote request.
+    remote_seek_thumbnail_target_secs: Mutex<Option<f64>>,
     /// 未来フレーム (pts > clock now) のキュー。channel から pull した順に末尾に push、
     /// front から `pts <= now + small_margin` のものを取り出して表示。FIFO 連続性を保つことで
     /// 高 fps コンテンツでも display が channel head の far-future にジャンプしない。
@@ -5312,6 +5315,7 @@ impl VideoPlayer {
             error: None,
             thumb_worker: None,
             marker_thumbnail_warmup_requests: Mutex::new(std::collections::HashMap::new()),
+            remote_seek_thumbnail_target_secs: Mutex::new(None),
             future_frames: std::collections::VecDeque::new(),
             pending_resume_secs: None,
             last_seen_seek_serial: 0,
@@ -5523,6 +5527,7 @@ impl VideoPlayer {
                 error: Some(format!("FFmpeg DLL のロードに失敗しました: {e}")),
                 thumb_worker: None,
                 marker_thumbnail_warmup_requests: Mutex::new(std::collections::HashMap::new()),
+                remote_seek_thumbnail_target_secs: Mutex::new(None),
                 future_frames: std::collections::VecDeque::new(),
                 pending_resume_secs: None,
                 last_seen_seek_serial: 0,
@@ -5774,6 +5779,7 @@ impl VideoPlayer {
             error: headless_init_error.or(native_init_error),
             thumb_worker,
             marker_thumbnail_warmup_requests: Mutex::new(std::collections::HashMap::new()),
+            remote_seek_thumbnail_target_secs: Mutex::new(None),
             future_frames: std::collections::VecDeque::new(),
             pending_resume_secs: resume_secs,
             last_seen_seek_serial: 0,
@@ -5919,6 +5925,15 @@ impl VideoPlayer {
         {
             return true;
         }
+        if let Some(remote_target) = self
+            .remote_seek_thumbnail_target_secs
+            .lock()
+            .ok()
+            .and_then(|target| *target)
+            && self.nearest_seek_thumbnail(remote_target).is_none()
+        {
+            return true;
+        }
 
         let key = crate::video::thumbnail::bucket_key(target_secs);
         let now = std::time::Instant::now();
@@ -5985,6 +6000,26 @@ impl VideoPlayer {
         self.thumb_worker
             .as_ref()
             .and_then(|w| w.nearest(target_secs))
+    }
+
+    /// Remote seek/drag preview uses the same independent latest-wins worker as native hover.
+    /// This only schedules auxiliary decode work; stream readiness never waits for its result.
+    pub fn request_remote_seek_thumbnail(&self, target_secs: f64) -> Option<f64> {
+        if !target_secs.is_finite() || target_secs < 0.0 {
+            return None;
+        }
+        let target_secs = self.clamp_seek_target(target_secs);
+        if let Ok(mut target) = self.remote_seek_thumbnail_target_secs.lock() {
+            *target = Some(target_secs);
+        }
+        self.request_seek_thumbnail(target_secs);
+        Some(target_secs)
+    }
+
+    pub fn clear_remote_seek_thumbnail(&self) {
+        if let Ok(mut target) = self.remote_seek_thumbnail_target_secs.lock() {
+            *target = None;
+        }
     }
 
     pub fn path(&self) -> &PathBuf {

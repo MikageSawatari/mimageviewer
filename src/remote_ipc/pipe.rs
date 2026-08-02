@@ -9,7 +9,8 @@ use mimageviewer_ipc::{
     MediaErrorCode, PIPE_NAME, PROTOCOL_VERSION, PagePriority, PageResponse, RemoteWriteError,
     RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, ServerMessage, SessionResponse,
     SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse, VideoStreamError,
-    VideoStreamErrorCode, VideoStreamResult, negotiate, read_frame, write_frame,
+    VideoStreamErrorCode, VideoStreamResult, VideoStreamThumbnailPayload, negotiate, read_frame,
+    write_frame,
 };
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
@@ -469,6 +470,7 @@ fn worker_loop(
                     other @ (ClientMessage::VideoStreamStart { .. }
                     | ClientMessage::VideoStreamControl { .. }
                     | ClientMessage::VideoStreamSeek { .. }
+                    | ClientMessage::VideoStreamThumbnail { .. }
                     | ClientMessage::VideoStreamPlaylist { .. }
                     | ClientMessage::VideoStreamSegment { .. }
                     | ClientMessage::VideoStreamState { .. }
@@ -741,6 +743,41 @@ fn execute_video_stream_request(
                 response: unexpected_video_outcome("seek"),
             },
         },
+        ClientMessage::VideoStreamThumbnail {
+            id,
+            session: stream_session,
+            position_secs,
+            ..
+        } => match session.submit_video_stream(
+            VideoStreamUiRequest::Thumbnail {
+                session: stream_session,
+                position_secs,
+            },
+            operation,
+        ) {
+            VideoStreamUiOutcome::ThumbnailPending => ServerMessage::VideoStreamThumbnail {
+                id,
+                response: VideoStreamResult::Success(VideoStreamThumbnailPayload::Pending),
+            },
+            VideoStreamUiOutcome::ThumbnailReady(thumbnail) => {
+                ServerMessage::VideoStreamThumbnail {
+                    id,
+                    response: encode_video_stream_thumbnail(thumbnail),
+                }
+            }
+            VideoStreamUiOutcome::ThumbnailCleared => ServerMessage::VideoStreamThumbnail {
+                id,
+                response: VideoStreamResult::Success(VideoStreamThumbnailPayload::Cleared),
+            },
+            VideoStreamUiOutcome::Error(error) => ServerMessage::VideoStreamThumbnail {
+                id,
+                response: VideoStreamResult::Error(error),
+            },
+            _ => ServerMessage::VideoStreamThumbnail {
+                id,
+                response: unexpected_video_outcome("thumbnail"),
+            },
+        },
         ClientMessage::VideoStreamStop {
             id,
             session: stream_session,
@@ -836,6 +873,41 @@ fn unexpected_video_outcome<T>(operation: &str) -> VideoStreamResult<T> {
     ))
 }
 
+fn encode_video_stream_thumbnail(
+    thumbnail: crate::video::thumbnail::Thumbnail,
+) -> VideoStreamResult<VideoStreamThumbnailPayload> {
+    let expected_len = usize::try_from(thumbnail.width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(thumbnail.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4));
+    if expected_len != Some(thumbnail.rgba.len()) {
+        return VideoStreamResult::Error(VideoStreamError::new(
+            VideoStreamErrorCode::Internal,
+            "seek thumbnail RGBA dimensions do not match its payload",
+        ));
+    }
+    let webp_bytes =
+        webp::Encoder::from_rgba(thumbnail.rgba.as_slice(), thumbnail.width, thumbnail.height)
+            .encode(75.0)
+            .to_vec();
+    if webp_bytes.is_empty() {
+        return VideoStreamResult::Error(VideoStreamError::new(
+            VideoStreamErrorCode::Internal,
+            "seek thumbnail WebP encoding returned an empty payload",
+        ));
+    }
+    VideoStreamResult::Success(VideoStreamThumbnailPayload::Ready {
+        actual_pts_secs: thumbnail.target_secs,
+        width: thumbnail.width,
+        height: thumbnail.height,
+        webp_bytes,
+    })
+}
+
 fn execute_work(
     message: ClientMessage,
     reply: mpsc::Sender<ServerMessage>,
@@ -895,6 +967,7 @@ fn request_kind(message: &ClientMessage) -> &'static str {
         ClientMessage::VideoStreamStart { .. } => "video_stream_start",
         ClientMessage::VideoStreamControl { .. } => "video_stream_control",
         ClientMessage::VideoStreamSeek { .. } => "video_stream_seek",
+        ClientMessage::VideoStreamThumbnail { .. } => "video_stream_thumbnail",
         ClientMessage::VideoStreamPlaylist { .. } => "video_stream_playlist",
         ClientMessage::VideoStreamSegment { .. } => "video_stream_segment",
         ClientMessage::VideoStreamState { .. } => "video_stream_state",
@@ -909,6 +982,7 @@ fn work_lane(message: &ClientMessage) -> WorkLane {
         ClientMessage::VideoStreamStart { .. }
         | ClientMessage::VideoStreamControl { .. }
         | ClientMessage::VideoStreamSeek { .. }
+        | ClientMessage::VideoStreamThumbnail { .. }
         | ClientMessage::VideoStreamPlaylist { .. }
         | ClientMessage::VideoStreamSegment { .. }
         | ClientMessage::VideoStreamState { .. }
@@ -930,6 +1004,7 @@ fn message_client_id(message: &ClientMessage) -> Option<&str> {
         | ClientMessage::VideoStreamStart { client_id, .. }
         | ClientMessage::VideoStreamControl { client_id, .. }
         | ClientMessage::VideoStreamSeek { client_id, .. }
+        | ClientMessage::VideoStreamThumbnail { client_id, .. }
         | ClientMessage::VideoStreamPlaylist { client_id, .. }
         | ClientMessage::VideoStreamSegment { client_id, .. }
         | ClientMessage::VideoStreamState { client_id, .. }
@@ -976,6 +1051,7 @@ fn operation_description(message: &ClientMessage) -> String {
         ClientMessage::VideoStreamStart { .. } => "動画ストリーミングを開始中".to_owned(),
         ClientMessage::VideoStreamControl { .. } => "動画ストリーミングを操作中".to_owned(),
         ClientMessage::VideoStreamSeek { .. } => "動画ストリーミングをシーク中".to_owned(),
+        ClientMessage::VideoStreamThumbnail { .. } => "動画シークプレビューを取得中".to_owned(),
         ClientMessage::VideoStreamPlaylist { .. } => "動画プレイリストを取得中".to_owned(),
         ClientMessage::VideoStreamSegment { .. } => "動画セグメントを取得中".to_owned(),
         ClientMessage::VideoStreamState { .. } => "動画ストリーミング状態を取得中".to_owned(),
@@ -1044,6 +1120,10 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
             response: VideoStreamResult::Success(_),
             ..
         }
+        | ServerMessage::VideoStreamThumbnail {
+            response: VideoStreamResult::Success(_),
+            ..
+        }
         | ServerMessage::VideoStreamPlaylist {
             response: VideoStreamResult::Success(_),
             ..
@@ -1099,6 +1179,10 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
             ..
         }
         | ServerMessage::VideoStreamSeek {
+            response: VideoStreamResult::Error(_),
+            ..
+        }
+        | ServerMessage::VideoStreamThumbnail {
             response: VideoStreamResult::Error(_),
             ..
         }
@@ -1567,6 +1651,10 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
             id: *id,
             response: stopped_video_response(),
         },
+        ClientMessage::VideoStreamThumbnail { id, .. } => ServerMessage::VideoStreamThumbnail {
+            id: *id,
+            response: stopped_video_response(),
+        },
         ClientMessage::VideoStreamPlaylist { id, .. } => ServerMessage::VideoStreamPlaylist {
             id: *id,
             response: stopped_video_response(),
@@ -1662,6 +1750,10 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
             response: busy_video_response(),
         },
         ClientMessage::VideoStreamSeek { id, .. } => ServerMessage::VideoStreamSeek {
+            id: *id,
+            response: busy_video_response(),
+        },
+        ClientMessage::VideoStreamThumbnail { id, .. } => ServerMessage::VideoStreamThumbnail {
             id: *id,
             response: busy_video_response(),
         },

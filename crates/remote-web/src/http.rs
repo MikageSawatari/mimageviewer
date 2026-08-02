@@ -11,7 +11,7 @@ use mimageviewer_ipc::{
     RemoteEntryKind, RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource,
     RemoteWriteErrorCode, RemoteWriteRequest, SessionResponse, SessionStatus,
     VideoStreamControlAction, VideoStreamErrorCode, VideoStreamPlaylistKind, VideoStreamQuality,
-    VideoStreamSegmentIndex, VideoStreamSegmentPayload,
+    VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamThumbnailPayload,
 };
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
@@ -509,6 +509,9 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             api_video_control(request, state, &remote_client_id)
         }
         (Method::Post, "/api/video/seek") => api_video_seek(request, state, &remote_client_id),
+        (Method::Post, "/api/video/thumbnail") => {
+            api_video_thumbnail(request, state, &remote_client_id)
+        }
         (Method::Get, "/api/video/state") => api_video_state(state, &query, &remote_client_id),
         (Method::Post, "/api/video/stop") => api_video_stop(request, state, &remote_client_id),
         (Method::Get, path) if path.starts_with("/stream/") => {
@@ -550,6 +553,7 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             | "/api/video/start"
             | "/api/video/control"
             | "/api/video/seek"
+            | "/api/video/thumbnail"
             | "/api/video/stop",
         ) => HttpResponse::text(405, "Method Not Allowed")
             .with_header("Allow", "POST")
@@ -595,6 +599,13 @@ struct VideoControlBody {
 struct VideoSeekBody {
     session: u64,
     position_secs: f64,
+}
+
+#[derive(Deserialize)]
+struct VideoThumbnailBody {
+    session: u64,
+    #[serde(default)]
+    position_secs: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -694,6 +705,61 @@ fn api_video_seek(request: &mut Request, state: &AppState, client_id: &str) -> H
         .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
         .with_header("Cache-Control", "no-store"),
         Err(failure) => video_ipc_error_response(failure),
+    }
+}
+
+fn api_video_thumbnail(request: &mut Request, state: &AppState, client_id: &str) -> HttpResponse {
+    let body: VideoThumbnailBody = match read_video_json(request) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    if body
+        .position_secs
+        .is_some_and(|position| !position.is_finite() || position < 0.0)
+    {
+        return video_request_error_response(
+            400,
+            "stream_bad_request",
+            "thumbnail position_secs must be finite and non-negative",
+        );
+    }
+    state.session_activity.note(client_id);
+    let result = match state.ipc_admission.run(IpcClass::Stream, || {
+        state
+            .thumbnail_client
+            .video_stream_thumbnail(client_id, body.session, body.position_secs)
+    }) {
+        Ok(result) => result,
+        Err(busy) => return video_admission_busy_response(busy),
+    };
+    match result {
+        Ok(success) => video_thumbnail_http_response(success.value),
+        Err(failure) => video_ipc_error_response(failure),
+    }
+}
+
+fn video_thumbnail_http_response(payload: VideoStreamThumbnailPayload) -> HttpResponse {
+    match payload {
+        VideoStreamThumbnailPayload::Pending => HttpResponse::bytes(
+            202,
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&json!({"status": "pending"})).unwrap_or_default(),
+        )
+        .with_header("Cache-Control", "no-store"),
+        VideoStreamThumbnailPayload::Ready {
+            actual_pts_secs,
+            width,
+            height,
+            webp_bytes,
+        } => HttpResponse::bytes(200, "image/webp", webp_bytes)
+            .with_header("Cache-Control", "no-store")
+            .with_header("X-mIV-Video-Thumbnail-PTS", format!("{actual_pts_secs:.9}"))
+            .with_header("X-mIV-Video-Thumbnail-Width", width.to_string())
+            .with_header("X-mIV-Video-Thumbnail-Height", height.to_string()),
+        VideoStreamThumbnailPayload::Cleared => {
+            HttpResponse::bytes(204, "application/octet-stream", Vec::new())
+                .with_header("Cache-Control", "no-store")
+        }
     }
 }
 
@@ -2948,6 +3014,25 @@ mod tests {
     }
 
     #[test]
+    fn video_seek_thumbnail_http_preserves_pending_and_actual_frame_pts() {
+        let pending = video_thumbnail_http_response(VideoStreamThumbnailPayload::Pending);
+        assert_eq!(pending.status, 202);
+
+        let ready = video_thumbnail_http_response(VideoStreamThumbnailPayload::Ready {
+            actual_pts_secs: 12.466,
+            width: 320,
+            height: 180,
+            webp_bytes: vec![1, 2, 3],
+        });
+        assert_eq!(ready.status, 200);
+        assert_eq!(ready.content_type, "image/webp");
+        assert_eq!(ready.body, vec![1, 2, 3]);
+        assert!(ready.headers.iter().any(|(name, value)| {
+            *name == "X-mIV-Video-Thumbnail-PTS" && value == "12.466000000"
+        }));
+    }
+
+    #[test]
     fn write_ui_timeout_is_an_explicit_gateway_timeout_without_retry() {
         let response = write_ipc_error_response(
             crate::ipc_client::ClientFailure {
@@ -3005,6 +3090,11 @@ mod tests {
             (
                 Method::Post,
                 "/api/video/seek",
+                r#"{"session":1,"position_secs":12.5}"#,
+            ),
+            (
+                Method::Post,
+                "/api/video/thumbnail",
                 r#"{"session":1,"position_secs":12.5}"#,
             ),
             (Method::Get, "/api/video/state?session=1", ""),

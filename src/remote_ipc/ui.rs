@@ -807,6 +807,10 @@ impl crate::app::App {
                 session,
                 position_secs,
             } => self.apply_remote_video_seek(session, position_secs),
+            VideoStreamUiRequest::Thumbnail {
+                session,
+                position_secs,
+            } => self.apply_remote_video_thumbnail(session, position_secs),
             VideoStreamUiRequest::Stop { .. } => unreachable!("stop is handled before ownership"),
         };
         pending.complete(outcome);
@@ -955,6 +959,38 @@ impl crate::app::App {
         result
             .map(VideoStreamUiOutcome::Seeked)
             .unwrap_or_else(video_stream_ui_failure)
+    }
+
+    fn apply_remote_video_thumbnail(
+        &mut self,
+        session: u64,
+        position_secs: Option<f64>,
+    ) -> VideoStreamUiOutcome {
+        let Some(streaming) = self.take_remote_video_streaming() else {
+            return video_stream_session_mismatch();
+        };
+        if streaming.session.id().0 != session {
+            self.remote_session_ui.video_stream =
+                Some(AppRemoteVideoStreamState::Streaming(streaming));
+            return video_stream_session_mismatch();
+        }
+        let outcome = if let Some(position_secs) = position_secs {
+            match streaming
+                .player
+                .request_remote_seek_thumbnail(position_secs)
+            {
+                Some(target_secs) => streaming.player.nearest_seek_thumbnail(target_secs).map_or(
+                    VideoStreamUiOutcome::ThumbnailPending,
+                    VideoStreamUiOutcome::ThumbnailReady,
+                ),
+                None => video_stream_ui_failure("invalid remote thumbnail position".to_owned()),
+            }
+        } else {
+            streaming.player.clear_remote_seek_thumbnail();
+            VideoStreamUiOutcome::ThumbnailCleared
+        };
+        self.remote_session_ui.video_stream = Some(AppRemoteVideoStreamState::Streaming(streaming));
+        outcome
     }
 
     fn apply_remote_video_stop(&mut self, session: u64) -> VideoStreamUiOutcome {

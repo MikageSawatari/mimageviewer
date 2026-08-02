@@ -541,3 +541,29 @@ fn fit_within(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     let h = ((src_h as f64 * scale).round() as u32).max(1);
     (w, h)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn consecutive_drag_requests_keep_only_the_latest_pending_target() {
+        let (wake_tx, _wake_rx) = bounded(1);
+        let worker = ThumbnailWorker {
+            pending_target_bits: Arc::new(AtomicU64::new(PENDING_NONE)),
+            wake_tx,
+            state: Arc::new(Mutex::new(ThumbnailState::new())),
+            cancel: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        };
+
+        worker.request(1.0);
+        worker.request(8.0);
+        worker.request(21.5);
+
+        assert_eq!(
+            f64::from_bits(worker.pending_target_bits.load(Ordering::Acquire)),
+            21.5
+        );
+    }
+}

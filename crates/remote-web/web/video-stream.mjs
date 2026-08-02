@@ -23,6 +23,8 @@ const STARTUP_MEDIA_SEGMENT_TIMEOUT_MS = 15000;
 const PLAYLIST_RECOVERY_TIMEOUT_MS = 15000;
 const PLAYLIST_RECOVERY_BACKOFF_BASE_MS = 250;
 const PLAYLIST_RECOVERY_BACKOFF_MAX_MS = 2000;
+const SEEK_THUMBNAIL_POLL_MS = 120;
+const SEEK_THUMBNAIL_MATCH_TOLERANCE_SECS = 1.25;
 
 let hlsScriptPromise = null;
 
@@ -149,6 +151,57 @@ export function videoUserErrorMessage(error, fallback = "動画を操作でき�
   }
   const summary = String(fallback || "動画を操作できませんでした").replace(/。+$/, "");
   return summary + "。もう一度お試しください。";
+}
+
+export class VideoSeekPreviewOwner {
+  constructor({ matchToleranceSecs = SEEK_THUMBNAIL_MATCH_TOLERANCE_SECS } = {}) {
+    this.matchToleranceSecs = Math.max(0, Number(matchToleranceSecs) || 0);
+    this.revision = 0;
+    this.state = { kind: "playback" };
+  }
+
+  request(targetSecs, label = "シーク中") {
+    this.revision += 1;
+    this.state = {
+      kind: "seeking",
+      revision: this.revision,
+      targetSecs: Math.max(0, Number(targetSecs) || 0),
+      label: String(label),
+    };
+    return { ...this.state };
+  }
+
+  acceptThumbnail(request, { actualPtsSecs, objectUrl, width = 0, height = 0 }) {
+    const actual = Number(actualPtsSecs);
+    if (
+      this.state.kind === "playback" ||
+      request?.revision !== this.state.revision ||
+      !Number.isFinite(actual) ||
+      Math.abs(actual - this.state.targetSecs) > this.matchToleranceSecs
+    ) {
+      return false;
+    }
+    this.state = {
+      ...this.state,
+      kind: "thumbnail",
+      actualPtsSecs: actual,
+      objectUrl: String(objectUrl || ""),
+      width: Math.max(0, Number(width) || 0),
+      height: Math.max(0, Number(height) || 0),
+    };
+    return true;
+  }
+
+  playbackStarted() {
+    const wasActive = this.state.kind !== "playback";
+    this.revision += 1;
+    this.state = { kind: "playback" };
+    return wasActive;
+  }
+
+  current() {
+    return { ...this.state };
+  }
 }
 
 export function createPlaylistRecoveryBudget({
@@ -674,6 +727,10 @@ export class VideoStreamViewer {
     this.pendingTimers = new Set();
     this.pointers = new Map();
     this.singlePointer = null;
+    this.seekPreviewOwner = new VideoSeekPreviewOwner();
+    this.seekThumbnailAbort = null;
+    this.seekThumbnailObjectUrl = "";
+    this.seekThumbnailClear = Promise.resolve();
 
     this.root = element("section", "image-viewer video-stream-viewer");
     this.stage = element("div", "viewer-stage video-stream-stage");
@@ -683,6 +740,15 @@ export class VideoStreamViewer {
     this.video.setAttribute("playsinline", "");
     this.video.setAttribute("webkit-playsinline", "");
     this.video.setAttribute("aria-label", entry.name);
+    this.seekPreview = element("div", "video-seek-preview");
+    this.seekPreview.hidden = true;
+    this.seekPreview.setAttribute("role", "status");
+    this.seekPreview.setAttribute("aria-live", "polite");
+    this.seekPreviewImage = element("img", "video-seek-preview-image");
+    this.seekPreviewImage.alt = "";
+    this.seekPreviewImage.hidden = true;
+    this.seekPreviewLabel = textElement("div", "シーク中", "video-seek-preview-label");
+    this.seekPreview.append(this.seekPreviewImage, this.seekPreviewLabel);
     this.generationSwitch = new VideoGenerationSwitchOwner({
       stopCurrent: () => this.stopPlaylistPlayback(),
       runSwitch: (operation) => this.performGenerationSwitch(operation),
@@ -703,7 +769,7 @@ export class VideoStreamViewer {
     this.notice.hidden = true;
     this.notice.setAttribute("role", "status");
     this.notice.setAttribute("aria-live", "polite");
-    this.stage.append(this.video, this.notice);
+    this.stage.append(this.video, this.seekPreview, this.notice);
 
     const top = element("div", "viewer-ui top");
     const close = textElement("button", "×", "viewer-button");
@@ -763,7 +829,9 @@ export class VideoStreamViewer {
     });
     this.seekInput.addEventListener("input", () => {
       this.draggingSeek = true;
-      this.updateCounter(Number(this.seekInput.value));
+      const target = Number(this.seekInput.value);
+      this.updateCounter(target);
+      this.beginSeekPreview(target, "移動先を確認中");
     });
     this.seekInput.addEventListener("change", (event) => {
       const target = Number(this.seekInput.value);
@@ -784,12 +852,16 @@ export class VideoStreamViewer {
     this.onPlaying = () => {
       this.checkPlaybackStartupProgress();
       this.clearWaiting();
+      this.finishSeekPreview();
     };
     this.onCanPlay = () => {
       this.checkPlaybackStartupProgress();
       this.playIfRequested();
     };
-    this.onLoadedData = () => this.checkPlaybackStartupProgress();
+    this.onLoadedData = () => {
+      this.checkPlaybackStartupProgress();
+      if (!this.playRequested) this.finishSeekPreview();
+    };
     this.onWaiting = () => this.beginWaiting();
     this.onNativeError = () => {
       if (!this.destroyed && !this.hls && !this.generationSwitch.isSwitching()) {
@@ -1033,6 +1105,7 @@ export class VideoStreamViewer {
 
   handleGenerationSwitchFailure(result, operation) {
     if (!operation.owns()) return;
+    this.finishSeekPreview();
     if (result.decision?.kind === "playlist_recovery_exhausted") {
       this.recordPlaybackIssue(
         "video_stream_generation_switch_failed",
@@ -1283,6 +1356,117 @@ export class VideoStreamViewer {
     });
   }
 
+  beginSeekPreview(targetSecs, label = "シーク中") {
+    if (!this.session || this.destroyed) return;
+    const request = this.seekPreviewOwner.request(targetSecs, label);
+    this.seekThumbnailAbort?.abort();
+    this.seekThumbnailAbort = new AbortController();
+    this.clearSeekThumbnailObjectUrl();
+    this.renderSeekPreview();
+    const controller = this.seekThumbnailAbort;
+    Promise.resolve(this.seekThumbnailClear)
+      .then(() => this.pollSeekThumbnail(request, controller))
+      .catch((error) => {
+        if (error?.name !== "AbortError" && !this.destroyed) {
+          this.recordPlaybackIssue(
+            "video_seek_thumbnail_failed",
+            "seek_thumbnail_request_failed",
+            { error_message: String(error?.message ?? error) }
+          );
+        }
+      });
+  }
+
+  async pollSeekThumbnail(request, controller) {
+    while (!this.destroyed && !controller.signal.aborted) {
+      if (this.seekPreviewOwner.current().revision !== request.revision) return;
+      const response = await fetch("/api/video/thumbnail", {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: {
+          Accept: "image/webp, application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          session: this.session,
+          position_secs: request.targetSecs,
+        }),
+        signal: controller.signal,
+      });
+      if (response.status === 202) {
+        await abortableDelay(SEEK_THUMBNAIL_POLL_MS, controller.signal);
+        continue;
+      }
+      if (!response.ok) {
+        const error = new Error(`seek thumbnail HTTP ${response.status}`);
+        error.status = response.status;
+        throw error;
+      }
+      const actualPtsSecs = Number(response.headers.get("X-mIV-Video-Thumbnail-PTS"));
+      const width = Number(response.headers.get("X-mIV-Video-Thumbnail-Width"));
+      const height = Number(response.headers.get("X-mIV-Video-Thumbnail-Height"));
+      const objectUrl = URL.createObjectURL(await response.blob());
+      if (this.seekPreviewOwner.acceptThumbnail(
+        request,
+        { actualPtsSecs, objectUrl, width, height }
+      )) {
+        this.seekThumbnailObjectUrl = objectUrl;
+        this.renderSeekPreview();
+        return;
+      }
+      URL.revokeObjectURL(objectUrl);
+      await abortableDelay(SEEK_THUMBNAIL_POLL_MS, controller.signal);
+    }
+  }
+
+  renderSeekPreview() {
+    const preview = this.seekPreviewOwner.current();
+    if (preview.kind === "playback") {
+      this.seekPreview.hidden = true;
+      this.seekPreviewImage.hidden = true;
+      this.seekPreviewImage.removeAttribute("src");
+      return;
+    }
+    this.seekPreview.hidden = false;
+    if (preview.kind === "thumbnail") {
+      this.seekPreviewImage.src = preview.objectUrl;
+      this.seekPreviewImage.hidden = false;
+      this.seekPreviewLabel.textContent = `移動先 ${formatVideoTime(preview.actualPtsSecs)}`;
+    } else {
+      this.seekPreviewImage.hidden = true;
+      this.seekPreviewImage.removeAttribute("src");
+      this.seekPreviewLabel.textContent = preview.label;
+    }
+  }
+
+  clearSeekThumbnailObjectUrl() {
+    if (this.seekThumbnailObjectUrl) {
+      URL.revokeObjectURL(this.seekThumbnailObjectUrl);
+      this.seekThumbnailObjectUrl = "";
+    }
+  }
+
+  finishSeekPreview() {
+    if (!this.seekPreviewOwner.playbackStarted()) return;
+    this.seekThumbnailAbort?.abort();
+    this.seekThumbnailAbort = null;
+    this.clearSeekThumbnailObjectUrl();
+    this.renderSeekPreview();
+    const session = this.session;
+    if (!session || this.destroyed) return;
+    this.seekThumbnailClear = fetch("/api/video/thumbnail", {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ session, position_secs: null }),
+    }).catch(() => {});
+  }
+
   async seekTo(targetPositionSecs) {
     if (!this.session || this.destroyed) return;
     const plan = videoSeekPlan({
@@ -1295,9 +1479,11 @@ export class VideoStreamViewer {
     if (plan.kind === "local") {
       this.video.currentTime = plan.mediaTimeSecs;
       this.updateProgress();
+      this.finishSeekPreview();
       return;
     }
-    this.showNotice("指定位置の配信を準備しています。", "waiting");
+    this.beginSeekPreview(plan.positionSecs, "シーク中");
+    if (this.noticeKind === "waiting" || this.noticeKind === "buffering") this.hideNotice();
     let sought;
     try {
       sought = await this.requestWithWaiting(() => this.apiPostJson(
@@ -1306,6 +1492,7 @@ export class VideoStreamViewer {
         this.abortController.signal
       ));
     } catch (error) {
+      this.finishSeekPreview();
       if (error?.status === 409) {
         await this.restartAt(plan.positionSecs);
         return;
@@ -1690,6 +1877,12 @@ export class VideoStreamViewer {
   }
 
   showNotice(message, kind = "info", actionLabel = "", action = null) {
+    if (
+      this.seekPreviewOwner.current().kind !== "playback" &&
+      (kind === "waiting" || kind === "buffering")
+    ) {
+      return;
+    }
     this.noticeKind = kind;
     this.notice.dataset.kind = kind;
     this.notice.replaceChildren(textElement("span", message));
@@ -1823,6 +2016,9 @@ export class VideoStreamViewer {
     if (this.destroyed) return;
     this.destroyed = true;
     this.abortController.abort();
+    this.seekThumbnailAbort?.abort();
+    this.seekThumbnailAbort = null;
+    this.clearSeekThumbnailObjectUrl();
     this.generationSwitch.cancel();
     this.clearPoll();
     clearTimeout(this.waitingTimer);

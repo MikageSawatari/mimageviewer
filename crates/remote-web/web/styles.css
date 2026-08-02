@@ -757,6 +757,50 @@ button {
   user-select: none;
 }
 
+.video-seek-preview {
+  position: absolute;
+  z-index: 3;
+  top: 50%;
+  left: 50%;
+  display: grid;
+  width: min(480px, calc(100vw - 40px));
+  justify-items: center;
+  gap: 10px;
+  color: #f5f7fc;
+  text-align: center;
+  transform: translate(-50%, -50%);
+}
+
+.video-seek-preview[hidden] {
+  display: none;
+}
+
+.video-seek-preview-image {
+  display: block;
+  width: min(100%, 320px);
+  height: auto;
+  border: 1px solid rgb(255 255 255 / 24%);
+  border-radius: 12px;
+  background: #000;
+  box-shadow: 0 12px 40px rgb(0 0 0 / 58%);
+  object-fit: contain;
+}
+
+.video-seek-preview-image[hidden] {
+  display: none;
+}
+
+.video-seek-preview-label {
+  padding: 8px 13px;
+  border: 1px solid rgb(111 161 239 / 65%);
+  border-radius: 999px;
+  background: rgb(16 20 28 / 88%);
+  box-shadow: 0 4px 18px rgb(0 0 0 / 48%);
+  font-weight: 650;
+  text-shadow: 0 1px 4px #000;
+  backdrop-filter: blur(12px);
+}
+
 .video-stream-notice {
   position: absolute;
   z-index: 4;

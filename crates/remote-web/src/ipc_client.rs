@@ -18,7 +18,8 @@ use mimageviewer_ipc::{
     VIDEO_STREAM_START_BUDGET, VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode,
     VideoStreamPlaylistKind, VideoStreamPlaylistPayload, VideoStreamQuality, VideoStreamResult,
     VideoStreamSeekPayload, VideoStreamSegmentIndex, VideoStreamSegmentPayload,
-    VideoStreamStartPayload, VideoStreamStatePayload, read_frame, write_frame,
+    VideoStreamStartPayload, VideoStreamStatePayload, VideoStreamThumbnailPayload, read_frame,
+    write_frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -689,6 +690,26 @@ impl ThumbnailClient {
             |message| match message {
                 ServerMessage::VideoStreamSeek { response, .. } => Some(response),
                 _ => return None,
+            },
+        )
+    }
+
+    pub fn video_stream_thumbnail(
+        &self,
+        client_id: &str,
+        session: u64,
+        position_secs: Option<f64>,
+    ) -> Result<IpcSuccess<VideoStreamThumbnailPayload>, ClientFailure> {
+        self.video_request(
+            |id| ClientMessage::VideoStreamThumbnail {
+                id,
+                client_id: client_id.to_owned(),
+                session,
+                position_secs,
+            },
+            |message| match message {
+                ServerMessage::VideoStreamThumbnail { response, .. } => Some(response),
+                _ => None,
             },
         )
     }
