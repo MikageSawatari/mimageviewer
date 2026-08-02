@@ -472,7 +472,7 @@ export function bufferingQualitySuggestion({
   return VIDEO_QUALITY_PRESETS[index - 1];
 }
 
-export function videoHttpStatusDecision(status, retryAfterSeconds = 1) {
+export function videoHttpStatusDecision(status, retryAfterSeconds = 1, errorCode = "") {
   const code = Number(status) || 0;
   if (code === 503) {
     return {
@@ -491,11 +491,21 @@ export function videoHttpStatusDecision(status, retryAfterSeconds = 1) {
     };
   }
   if (code === 409) {
+    if (errorCode === "stream_generation_mismatch") {
+      return {
+        kind: "generation_mismatch",
+        retry: true,
+        retryDelayMs: 0,
+        message: "配信が更新されたため、新しいプレイリストを取得しています。",
+      };
+    }
     return {
-      kind: "generation_mismatch",
-      retry: true,
+      kind: "session_mismatch",
+      retry: false,
       retryDelayMs: 0,
-      message: "配信が更新されたため、新しいプレイリストを取得しています。",
+      message: errorCode === "stream_session_mismatch"
+        ? "動画配信セッションが終了しました。"
+        : "動画配信の状態が一致しません。",
     };
   }
   if (code === 404) {

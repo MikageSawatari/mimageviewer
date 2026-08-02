@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mimageviewer_ipc::{
     RemoteAddress, RemoteSubresource, VideoStreamError, VideoStreamErrorCode,
@@ -12,7 +12,7 @@ use super::path_guard::{ResolveError, resolve_existing};
 use super::session::{PublishedVideoStream, SessionHandle};
 use crate::video::stream::session::{
     StreamGenerationMetrics, StreamGenerationStatus, StreamResource, StreamResourceError,
-    StreamResourceKind, StreamSegmentBytes, StreamingGeneration,
+    StreamResourceKind, StreamSegmentBytes, StreamingGeneration, StreamingGenerationAccess,
 };
 
 const START_READY_TIMEOUT: Duration = Duration::from_secs(7);
@@ -83,8 +83,12 @@ impl VideoStreamEngine {
         &self,
         stream: PublishedVideoStream,
     ) -> VideoStreamResult<VideoStreamStartPayload> {
+        let deadline = Instant::now() + START_READY_TIMEOUT;
         match stream.generation.wait_ready(START_READY_TIMEOUT) {
             StreamGenerationStatus::Ready(ready) => {
+                if let Err(error) = wait_for_start_playlist(&stream.generation, deadline) {
+                    return VideoStreamResult::Error(error);
+                }
                 let playback = stream.playback.snapshot();
                 VideoStreamResult::Success(VideoStreamStartPayload {
                     session: stream.session.0,
@@ -251,6 +255,48 @@ impl VideoStreamEngine {
     }
 }
 
+fn wait_for_start_playlist(
+    generation: &StreamingGenerationAccess,
+    deadline: Instant,
+) -> Result<(), VideoStreamError> {
+    wait_for_start_playlist_with(deadline, || {
+        generation.resource(generation.generation(), StreamResourceKind::MasterPlaylist)
+    })
+}
+
+fn wait_for_start_playlist_with(
+    deadline: Instant,
+    mut request: impl FnMut() -> Result<StreamResource, StreamResourceError>,
+) -> Result<(), VideoStreamError> {
+    loop {
+        match request() {
+            Ok(StreamResource::Playlist(Some(body))) if !body.is_empty() => return Ok(()),
+            Ok(StreamResource::Playlist(None)) | Err(StreamResourceError::NotReady) => {}
+            Ok(StreamResource::Playlist(Some(_))) => {
+                return Err(video_error(
+                    VideoStreamErrorCode::Internal,
+                    "空のプレイリストを配信できません",
+                ));
+            }
+            Ok(_) => {
+                return Err(video_error(
+                    VideoStreamErrorCode::Internal,
+                    "プレイリスト応答の型が一致しません",
+                ));
+            }
+            Err(error) => return Err(resource_error(error)),
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(video_error(
+                VideoStreamErrorCode::NotReady,
+                "プレイリストが 7 秒以内に準備できませんでした",
+            ));
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+}
+
 fn state_payload(
     stream: PublishedVideoStream,
     ready: crate::video::stream::session::StreamReadyInfo,
@@ -340,6 +386,19 @@ mod tests {
         for error in [StreamResourceError::NotReady, StreamResourceError::Timeout] {
             assert_eq!(resource_error(error).code, VideoStreamErrorCode::NotReady);
         }
+    }
+
+    #[test]
+    fn start_readiness_waits_until_the_playlist_is_obtainable() {
+        let mut requests = 0;
+        let result = wait_for_start_playlist_with(Instant::now() + Duration::from_secs(1), || {
+            requests += 1;
+            Ok(StreamResource::Playlist(
+                (requests >= 2).then(|| "#EXTM3U".to_owned()),
+            ))
+        });
+        assert!(result.is_ok());
+        assert_eq!(requests, 2);
     }
 
     #[test]

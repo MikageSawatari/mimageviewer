@@ -327,6 +327,29 @@ impl HttpResponse {
         self
     }
 
+    fn with_body_error_code_log(mut self) -> Self {
+        let error_code = serde_json::from_slice::<Value>(&self.body)
+            .ok()
+            .and_then(|body| body.get("error").and_then(Value::as_str).map(str::to_owned));
+        let Some(error_code) = error_code else {
+            return self;
+        };
+        let details = self.log_details.get_or_insert_with(|| json!({}));
+        if !details.is_object() {
+            *details = json!({});
+        }
+        let root = details.as_object_mut().expect("log details object");
+        let video = root.entry("video_stream").or_insert_with(|| json!({}));
+        if !video.is_object() {
+            *video = json!({});
+        }
+        video
+            .as_object_mut()
+            .expect("video stream log details object")
+            .insert("error_code".to_owned(), Value::String(error_code));
+        self
+    }
+
     fn with_sensitive_value(mut self, value: impl Into<String>) -> Self {
         self.sensitive_values.push(value.into());
         self
@@ -372,6 +395,7 @@ pub fn handle(mut request: Request, state: &Arc<AppState>) {
 
 fn route(request: &mut Request, state: &AppState) -> HttpResponse {
     let (path, raw_query) = split_url(request.url());
+    let video_route = path.starts_with("/api/video/") || path.starts_with("/stream/");
     let query_result = parse_query(raw_query);
     let query = match query_result {
         Ok(query) => query,
@@ -487,6 +511,11 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             .with_header("Cache-Control", "no-store"),
     };
 
+    let response = if video_route {
+        response.with_body_error_code_log()
+    } else {
+        response
+    };
     response
         .with_header("X-Content-Type-Options", "nosniff")
         .with_header("Referrer-Policy", "no-referrer")
@@ -594,7 +623,11 @@ fn api_video_seek(request: &mut Request, state: &AppState, client_id: &str) -> H
         Err(response) => return response,
     };
     if !body.position_secs.is_finite() || body.position_secs < 0.0 {
-        return HttpResponse::text(400, "Bad Request").with_header("Cache-Control", "no-store");
+        return video_request_error_response(
+            400,
+            "stream_bad_request",
+            "position_secs must be finite and non-negative",
+        );
     }
     state.session_activity.note(client_id);
     let result = match state.ipc_admission.run(IpcClass::Stream, || {
@@ -621,7 +654,13 @@ fn api_video_state(state: &AppState, query: &[(String, String)], client_id: &str
         .and_then(|value| value.parse::<u64>().map_err(|_| ()))
     {
         Ok(session) => session,
-        Err(()) => return HttpResponse::text(400, "Bad Request"),
+        Err(()) => {
+            return video_request_error_response(
+                400,
+                "stream_bad_request",
+                "session query is required",
+            );
+        }
     };
     state.session_activity.note(client_id);
     let result = match state.ipc_admission.run(IpcClass::Stream, || {
@@ -705,10 +744,33 @@ fn read_video_json<T: serde::de::DeserializeOwned>(
 ) -> Result<T, HttpResponse> {
     let body = match read_body_limited(request, MAX_VIDEO_BODY_BYTES) {
         Ok(body) => body,
-        Err(BodyReadError::TooLarge) => return Err(HttpResponse::text(413, "Payload Too Large")),
-        Err(BodyReadError::Read) => return Err(HttpResponse::text(400, "Bad Request")),
+        Err(BodyReadError::TooLarge) => {
+            return Err(video_request_error_response(
+                413,
+                "stream_payload_too_large",
+                "video request body is too large",
+            ));
+        }
+        Err(BodyReadError::Read) => {
+            return Err(video_request_error_response(
+                400,
+                "stream_bad_request",
+                "video request body could not be read",
+            ));
+        }
     };
-    serde_json::from_slice(&body).map_err(|_| HttpResponse::text(400, "Bad Request"))
+    serde_json::from_slice(&body).map_err(|_| {
+        video_request_error_response(400, "stream_bad_request", "video request body is invalid")
+    })
+}
+
+fn video_request_error_response(status: u16, code: &str, message: &str) -> HttpResponse {
+    HttpResponse::bytes(
+        status,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&json!({"error": code, "message": message})).unwrap_or_default(),
+    )
+    .with_header("Cache-Control", "no-store")
 }
 
 fn parse_stream_path(path: &str) -> Result<(u64, u64, StreamRouteResource), ()> {
@@ -787,6 +849,7 @@ fn video_admission_busy_response(busy: AdmissionBusy) -> HttpResponse {
     .with_header("Cache-Control", "no-store")
     .with_log_details(json!({
         "video_stream": {
+            "error_code": "ipc_busy",
             "ipc_status": "admission_busy",
             "ipc_stream_in_flight": busy.stream_in_flight,
             "ipc_stream_limit": busy.stream_limit,
@@ -803,6 +866,11 @@ fn video_not_ready_response(message: &str) -> HttpResponse {
     )
     .with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string())
     .with_header("Cache-Control", "no-store")
+    .with_log_details(json!({
+        "video_stream": {
+            "error_code": "stream_not_ready",
+        }
+    }))
 }
 
 fn video_ipc_error_response(failure: crate::ipc_client::ClientFailure) -> HttpResponse {
@@ -832,20 +900,23 @@ fn video_ipc_error_response(failure: crate::ipc_client::ClientFailure) -> HttpRe
             false,
         ),
         IpcClientError::VideoStreamRemote(error) => {
-            let (status, retryable) = match error.code {
-                VideoStreamErrorCode::BadRequest => (400, false),
-                VideoStreamErrorCode::FavoriteNotFound
-                | VideoStreamErrorCode::PathRejected
-                | VideoStreamErrorCode::NotFound => (404, false),
-                VideoStreamErrorCode::Unsupported => (415, false),
-                VideoStreamErrorCode::SessionMismatch
-                | VideoStreamErrorCode::GenerationMismatch => (409, false),
-                VideoStreamErrorCode::NotReady | VideoStreamErrorCode::Busy => (503, true),
-                VideoStreamErrorCode::UiTimeout => (504, false),
-                VideoStreamErrorCode::Failed => (422, false),
-                VideoStreamErrorCode::Internal => (500, false),
+            let (status, code, retryable) = match error.code {
+                VideoStreamErrorCode::BadRequest => (400, "stream_bad_request", false),
+                VideoStreamErrorCode::FavoriteNotFound => (404, "stream_favorite_not_found", false),
+                VideoStreamErrorCode::PathRejected => (404, "stream_path_rejected", false),
+                VideoStreamErrorCode::NotFound => (404, "stream_not_found", false),
+                VideoStreamErrorCode::Unsupported => (415, "stream_unsupported", false),
+                VideoStreamErrorCode::SessionMismatch => (409, "stream_session_mismatch", false),
+                VideoStreamErrorCode::GenerationMismatch => {
+                    (409, "stream_generation_mismatch", false)
+                }
+                VideoStreamErrorCode::NotReady => (503, "stream_not_ready", true),
+                VideoStreamErrorCode::Busy => (503, "stream_busy", true),
+                VideoStreamErrorCode::UiTimeout => (504, "stream_ui_timeout", false),
+                VideoStreamErrorCode::Failed => (422, "stream_failed", false),
+                VideoStreamErrorCode::Internal => (500, "stream_internal", false),
             };
-            (status, "miv_video_stream_error", error.message, retryable)
+            (status, code, error.message, retryable)
         }
         IpcClientError::SessionRemote(response) => (
             session_http_status(response.status),
@@ -872,7 +943,7 @@ fn video_ipc_error_response(failure: crate::ipc_client::ClientFailure) -> HttpRe
     if retryable {
         response = response.with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string());
     }
-    response
+    response.with_body_error_code_log()
 }
 
 fn api_session_acquire(request: &Request, state: &AppState, client_id: &str) -> HttpResponse {
@@ -2846,9 +2917,15 @@ mod tests {
             410
         );
 
-        for code in [
-            VideoStreamErrorCode::SessionMismatch,
-            VideoStreamErrorCode::GenerationMismatch,
+        for (code, expected_error) in [
+            (
+                VideoStreamErrorCode::SessionMismatch,
+                "stream_session_mismatch",
+            ),
+            (
+                VideoStreamErrorCode::GenerationMismatch,
+                "stream_generation_mismatch",
+            ),
         ] {
             let mismatch = video_ipc_error_response(crate::ipc_client::ClientFailure {
                 error: IpcClientError::VideoStreamRemote(mimageviewer_ipc::VideoStreamError::new(
@@ -2858,6 +2935,12 @@ mod tests {
                 retry_statuses: Vec::new(),
             });
             assert_eq!(mismatch.status, 409);
+            let body: Value = serde_json::from_slice(&mismatch.body).unwrap();
+            assert_eq!(body["error"], expected_error);
+            assert_eq!(
+                mismatch.log_details.as_ref().unwrap()["video_stream"]["error_code"],
+                expected_error
+            );
         }
 
         let unavailable = video_ipc_error_response(crate::ipc_client::ClientFailure {

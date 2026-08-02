@@ -4442,6 +4442,28 @@ mod tests {
     }
 
     #[test]
+    fn unknown_remote_video_local_output_value_is_incompatible_not_corrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        let future = serde_json::to_string("FutureOutputMode").unwrap();
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "UPDATE settings_kv SET value = ?1 WHERE key = ?2",
+                params![future, "remote_video_hide_local_output"],
+            )
+            .unwrap();
+        let error = match db.load_into_settings() {
+            Ok(_) => panic!("future remote video output value must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SettingsDbError::Incompatible(_)));
+    }
+
+    #[test]
     fn unknown_remote_video_quality_is_incompatible_not_corrupted() {
         let dir = tempfile::tempdir().unwrap();
         let db = SettingsDb::create_new(dir.path()).unwrap();

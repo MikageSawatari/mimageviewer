@@ -3762,8 +3762,17 @@ pub struct Settings {
     #[serde(default = "default_remote_video_segment_window")]
     pub remote_video_segment_window: usize,
     /// streaming 中も audio device を動かしたまま、ローカル出力だけを 0 にする。
-    #[serde(default = "default_true")]
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_remote_video_output_bool"
+    )]
     pub remote_video_mute_local_output: bool,
+    /// streaming 中も decoder / presenter を動かしたまま、ローカル present だけを止める。
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_remote_video_output_bool"
+    )]
+    pub remote_video_hide_local_output: bool,
 
     // ── 動画インライン再生 ────────────────────────────────────────
     /// 動画再生時の既定音量 (線形ゲイン 0.0..+18dB 相当)。1.0 を超える値は
@@ -4478,6 +4487,33 @@ fn default_edit_preview_cache_max_bytes() -> u64 {
 fn default_true() -> bool {
     true
 }
+fn deserialize_remote_video_output_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct RemoteVideoOutputBoolVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for RemoteVideoOutputBoolVisitor {
+        type Value = bool;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a remote video output boolean")
+        }
+
+        fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+            Ok(value)
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Err(E::unknown_variant(value, &["true", "false"]))
+        }
+    }
+
+    deserializer.deserialize_any(RemoteVideoOutputBoolVisitor)
+}
 fn default_stack_separator() -> char {
     '_'
 }
@@ -4952,6 +4988,7 @@ impl Default for Settings {
             remote_video_quality_default: RemoteVideoQuality::Standard,
             remote_video_segment_window: default_remote_video_segment_window(),
             remote_video_mute_local_output: true,
+            remote_video_hide_local_output: true,
             video_volume: default_video_volume(),
             video_playback_speed: default_video_playback_speed(),
             video_autoplay: false,
@@ -6812,6 +6849,7 @@ mod tests {
         );
         assert_eq!(settings.remote_video_segment_window, 30);
         assert!(settings.remote_video_mute_local_output);
+        assert!(settings.remote_video_hide_local_output);
         assert_eq!(
             serde_json::to_value(RemoteVideoEncoder::Nvenc).unwrap(),
             serde_json::Value::String("Nvenc".to_owned())

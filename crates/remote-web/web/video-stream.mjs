@@ -18,6 +18,8 @@ const HLS_MIME = "application/vnd.apple.mpegurl";
 const HLS_SCRIPT_PATH = "/vendor/hls.min.js";
 const VIDEO_STATE_POLL_MS = 1000;
 const WAITING_SUGGESTION_MS = 3000;
+const PLAYLIST_RECOVERY_MAX_ATTEMPTS = 6;
+const PLAYLIST_RECOVERY_TIMEOUT_MS = 15000;
 
 let hlsScriptPromise = null;
 
@@ -73,6 +75,15 @@ function hlsRetryAfter(data) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
 }
 
+function hlsHttpErrorCode(data) {
+  let body = data?.response?.data;
+  if (body instanceof Uint8Array) body = new TextDecoder().decode(body);
+  if (typeof body === "string") {
+    try { body = JSON.parse(body); } catch { return ""; }
+  }
+  return typeof body?.error === "string" ? body.error : "";
+}
+
 function formatVideoTime(value) {
   const seconds = Math.max(0, Math.floor(Number(value) || 0));
   const hours = Math.floor(seconds / 3600);
@@ -110,6 +121,61 @@ function abortableDelay(delayMs, signal) {
     if (signal.aborted) aborted();
     else signal.addEventListener("abort", aborted, { once: true });
   });
+}
+
+export async function resolveVideoPlaylist({
+  initialUrl,
+  session,
+  fetchPlaylist,
+  fetchState,
+  signal,
+  delay = abortableDelay,
+  now = () => Date.now(),
+  maxAttempts = PLAYLIST_RECOVERY_MAX_ATTEMPTS,
+  timeoutMs = PLAYLIST_RECOVERY_TIMEOUT_MS,
+  onDecision = () => {},
+}) {
+  let url = String(initialUrl ?? "");
+  let latestState = null;
+  const startedAt = now();
+  const attempts = Math.max(1, Number(maxAttempts) || 1);
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (attempt > 0 && now() - startedAt >= Math.max(1, Number(timeoutMs) || 1)) break;
+    const response = await fetchPlaylist(url, signal);
+    if (response.ok) {
+      return { ok: true, url, state: latestState, attempts: attempt + 1 };
+    }
+    const detail = await response.clone().json().catch(() => ({}));
+    const decision = videoHttpStatusDecision(
+      response.status,
+      retryAfterSeconds(response),
+      detail.error
+    );
+    onDecision(decision, detail);
+    if (decision.kind === "generation_mismatch") {
+      latestState = await fetchState(session, signal);
+      const currentSession = Number(latestState?.session ?? session);
+      const generation = Number(latestState?.generation);
+      if (!Number.isFinite(currentSession) || !Number.isFinite(generation)) break;
+      url = `/stream/${currentSession}/${generation}/index.m3u8`;
+      continue;
+    }
+    if (decision.kind === "waiting") {
+      await delay(decision.retryDelayMs, signal);
+      continue;
+    }
+    return { ok: false, decision, attempts: attempt + 1 };
+  }
+  return {
+    ok: false,
+    attempts,
+    decision: {
+      kind: "playlist_recovery_exhausted",
+      retry: false,
+      retryDelayMs: 0,
+      message: "プレイリストを取得できませんでした。",
+    },
+  };
 }
 
 class VideoStreamMenu {
@@ -558,7 +624,11 @@ export class VideoStreamViewer {
         return await operation();
       } catch (error) {
         if (error?.name === "AbortError") throw error;
-        const decision = videoHttpStatusDecision(error?.status, error?.retryAfterSeconds);
+        const decision = videoHttpStatusDecision(
+          error?.status,
+          error?.retryAfterSeconds,
+          error?.code
+        );
         if (decision.kind !== "waiting") throw error;
         this.showNotice(
           `${decision.message} ${error?.message ?? ""}`.trim(),
@@ -573,42 +643,45 @@ export class VideoStreamViewer {
   }
 
   async probePlaylist(url) {
-    while (!this.destroyed) {
-      const response = await fetch(url, {
+    const result = await resolveVideoPlaylist({
+      initialUrl: url,
+      session: this.session,
+      signal: this.abortController.signal,
+      fetchPlaylist: (playlistUrl, signal) => fetch(playlistUrl, {
         credentials: "same-origin",
         cache: "no-store",
         headers: { Accept: HLS_MIME },
-        signal: this.abortController.signal,
-      });
-      if (response.ok) return true;
-      const detail = await response.clone().json().catch(() => ({}));
-      const decision = videoHttpStatusDecision(
-        response.status,
-        retryAfterSeconds(response)
-      );
-      if (decision.kind === "waiting") {
-        this.showNotice(
-          `${decision.message} ${detail.message ?? ""}`.trim(),
-          "waiting"
-        );
-        await abortableDelay(decision.retryDelayMs, this.abortController.signal);
-        continue;
-      }
-      if (decision.kind === "generation_mismatch") {
-        this.showNotice(decision.message, "waiting");
-        await this.refreshGeneration();
-        return false;
-      }
-      this.showStatusDecision(decision);
-      return false;
+        signal,
+      }),
+      fetchState: (session, signal) => this.apiJson(
+        "/api/video/state",
+        { session },
+        signal
+      ),
+      onDecision: (decision, detail) => {
+        if (decision.retry) {
+          this.showNotice(
+            `${decision.message} ${detail.message ?? ""}`.trim(),
+            "waiting"
+          );
+        }
+      },
+    });
+    if (result.ok) {
+      if (result.state) this.applyServerState(result.state);
+      this.generation = result.state?.generation ?? this.generation;
+      return result.url;
     }
-    return false;
+    this.showStatusDecision(result.decision);
+    return null;
   }
 
   async attachPlaylist(url) {
     if (!url || this.destroyed) return false;
-    if (!await this.probePlaylist(url)) return false;
+    const resolvedUrl = await this.probePlaylist(url);
+    if (!resolvedUrl) return false;
     if (this.destroyed) return false;
+    url = resolvedUrl;
     this.playlistUrl = url;
     this.destroyHls();
     this.video.pause();
@@ -652,7 +725,11 @@ export class VideoStreamViewer {
     if (this.destroyed) return;
     const status = hlsHttpStatus(data);
     if (status) {
-      const decision = videoHttpStatusDecision(status, hlsRetryAfter(data));
+      const decision = videoHttpStatusDecision(
+        status,
+        hlsRetryAfter(data),
+        hlsHttpErrorCode(data)
+      );
       if (decision.kind === "waiting") {
         this.showNotice(decision.message, "waiting");
         this.hls?.stopLoad();
@@ -693,6 +770,15 @@ export class VideoStreamViewer {
       );
       return;
     }
+    if (decision.kind === "playlist_recovery_exhausted") {
+      this.showNotice(
+        decision.message,
+        "error",
+        "再接続",
+        () => this.restartAt(this.currentPosition())
+      );
+      return;
+    }
     this.showNotice(decision.message, "error");
   }
 
@@ -700,13 +786,19 @@ export class VideoStreamViewer {
     if (!this.session || this.destroyed) return;
     let mediaState;
     try {
-      mediaState = await this.requestWithWaiting(() => this.apiJson(
+      mediaState = await this.apiJson(
         "/api/video/state",
         { session: this.session },
         this.abortController.signal
-      ));
+      );
     } catch (error) {
-      if (error?.status === 409) {
+      if (
+        videoHttpStatusDecision(
+          error?.status,
+          error?.retryAfterSeconds,
+          error?.code
+        ).kind === "session_mismatch"
+      ) {
         await this.restartAt(this.currentPosition());
         return;
       }
@@ -945,7 +1037,11 @@ export class VideoStreamViewer {
       this.schedulePoll();
     } catch (error) {
       if (error?.name === "AbortError") throw error;
-      const decision = videoHttpStatusDecision(error?.status, error?.retryAfterSeconds);
+      const decision = videoHttpStatusDecision(
+        error?.status,
+        error?.retryAfterSeconds,
+        error?.code
+      );
       if (decision.kind === "waiting") {
         this.showNotice(decision.message, "waiting");
         this.schedulePoll(decision.retryDelayMs);
@@ -953,6 +1049,12 @@ export class VideoStreamViewer {
       }
       if (decision.kind === "generation_mismatch") {
         await this.restartAt(this.currentPosition());
+        return;
+      }
+      if (decision.kind === "session_mismatch") {
+        this.hls?.stopLoad();
+        this.video.pause();
+        this.showStatusDecision(decision);
         return;
       }
       throw error;
@@ -986,7 +1088,11 @@ export class VideoStreamViewer {
         await this.restartAt(position);
         return;
       }
-      const decision = videoHttpStatusDecision(error?.status, error?.retryAfterSeconds);
+      const decision = videoHttpStatusDecision(
+        error?.status,
+        error?.retryAfterSeconds,
+        error?.code
+      );
       if (decision.kind === "waiting") {
         this.showNotice(decision.message, "waiting");
         this.schedulePoll(decision.retryDelayMs);

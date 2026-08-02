@@ -1184,6 +1184,7 @@ pub(crate) struct NativeVideoOutput {
     last_vst3_available: AtomicBool,
     last_checked: AtomicBool,
     last_text_contrast_strong: AtomicBool,
+    visibility_gate: Arc<NativeVideoOutputVisibilityGate>,
     command_tx: NativeCommandSender,
     event_rx: std::sync::Mutex<NativeOutputEventReceiver>,
     /// Presenter thread 内で起きた fatal init error (`CoInitializeEx` /
@@ -1192,6 +1193,77 @@ pub(crate) struct NativeVideoOutput {
     /// `take_init_error` で 1 度だけ取り出し、`VideoPlayer.error` に転写する。
     init_error: Arc<Mutex<Option<String>>>,
     threads: Option<NativeVideoOutputThreads>,
+}
+
+#[cfg(windows)]
+struct NativeVideoOutputVisibilityGate {
+    base_visible: AtomicBool,
+    remote_hide_owner: AtomicU64,
+    next_owner: AtomicU64,
+    command_tx: NativeCommandSender,
+    hwnd: Arc<AtomicU64>,
+}
+
+#[cfg(windows)]
+impl NativeVideoOutputVisibilityGate {
+    fn new(initial_visible: bool, command_tx: NativeCommandSender, hwnd: Arc<AtomicU64>) -> Self {
+        Self {
+            base_visible: AtomicBool::new(initial_visible),
+            remote_hide_owner: AtomicU64::new(0),
+            next_owner: AtomicU64::new(1),
+            command_tx,
+            hwnd,
+        }
+    }
+
+    fn set_base_visible(&self, visible: bool) {
+        self.base_visible.store(visible, Ordering::Release);
+        self.publish();
+    }
+
+    fn acquire_remote_hide(self: &Arc<Self>) -> RemoteLocalVideoOutputHideLease {
+        let owner = self.next_owner.fetch_add(1, Ordering::Relaxed).max(1);
+        self.remote_hide_owner.store(owner, Ordering::Release);
+        self.publish();
+        RemoteLocalVideoOutputHideLease {
+            gate: Arc::clone(self),
+            owner,
+        }
+    }
+
+    fn publish(&self) {
+        let visible = self.base_visible.load(Ordering::Acquire)
+            && self.remote_hide_owner.load(Ordering::Acquire) == 0;
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetWindowVisible { visible });
+        crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
+    }
+
+    #[cfg(test)]
+    fn remote_hidden(&self) -> bool {
+        self.remote_hide_owner.load(Ordering::Acquire) != 0
+    }
+}
+
+#[cfg(windows)]
+pub(crate) struct RemoteLocalVideoOutputHideLease {
+    gate: Arc<NativeVideoOutputVisibilityGate>,
+    owner: u64,
+}
+
+#[cfg(windows)]
+impl Drop for RemoteLocalVideoOutputHideLease {
+    fn drop(&mut self) {
+        if self
+            .gate
+            .remote_hide_owner
+            .compare_exchange(self.owner, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.gate.publish();
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1207,9 +1279,15 @@ impl NativeVideoOutput {
         let channel_fault = Arc::new(AtomicBool::new(false));
         let (command_tx, _command_rx) = native_command_bus(8, Arc::clone(&channel_fault));
         let (_event_tx, event_rx) = native_output_event_bus(8, channel_fault);
+        let hwnd = Arc::new(AtomicU64::new(0));
+        let visibility_gate = Arc::new(NativeVideoOutputVisibilityGate::new(
+            true,
+            command_tx.clone(),
+            Arc::clone(&hwnd),
+        ));
         Self {
             cancel: Arc::new(AtomicBool::new(false)),
-            hwnd: Arc::new(AtomicU64::new(0)),
+            hwnd,
             hud_hwnd: Arc::new(AtomicU64::new(0)),
             first_presented: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
@@ -1222,6 +1300,7 @@ impl NativeVideoOutput {
             last_vst3_available: AtomicBool::new(false),
             last_checked: AtomicBool::new(false),
             last_text_contrast_strong: AtomicBool::new(false),
+            visibility_gate,
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
             init_error: Arc::new(Mutex::new(None)),
@@ -1262,6 +1341,11 @@ impl NativeVideoOutput {
         let health = native_window_health::NativeWindowHealth::new_registered();
         let (event_tx, event_rx) = native_output_event_bus(512, Arc::clone(&channel_fault));
         let (command_tx, command_rx) = native_command_bus(512, Arc::clone(&channel_fault));
+        let visibility_gate = Arc::new(NativeVideoOutputVisibilityGate::new(
+            config.initial_visibility.is_visible(),
+            command_tx.clone(),
+            Arc::clone(&hwnd),
+        ));
         let init_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let thread_cancel = Arc::clone(&cancel);
         let thread_first_presented = Arc::clone(&first_presented);
@@ -1357,6 +1441,7 @@ impl NativeVideoOutput {
             last_vst3_available: AtomicBool::new(initial_vst3_available),
             last_checked: AtomicBool::new(initial_checked),
             last_text_contrast_strong: AtomicBool::new(initial_text_contrast_strong),
+            visibility_gate,
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
             init_error,
@@ -1392,10 +1477,16 @@ impl NativeVideoOutput {
     /// App (bin 専属) からのみ呼ばれる。lib build では app が stub のため dead に見える。
     #[allow(dead_code)]
     pub(crate) fn set_window_visible(&self, visible: bool) {
-        let _ = self
-            .command_tx
-            .send(NativeVideoOutputCommand::SetWindowVisible { visible });
-        crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
+        self.visibility_gate.set_base_visible(visible);
+    }
+
+    pub(crate) fn acquire_remote_hide(&self) -> RemoteLocalVideoOutputHideLease {
+        self.visibility_gate.acquire_remote_hide()
+    }
+
+    #[cfg(test)]
+    fn remote_hidden_for_test(&self) -> bool {
+        self.visibility_gate.remote_hidden()
     }
 
     /// presenter ウィンドウが現在 hide (consume-and-hold) 中か。exit の async 待ちで
@@ -4938,6 +5029,10 @@ impl VideoPlayer {
             );
         player.audio =
             Some(crate::video::audio::AudioOutput::connected_without_output_for_test(48_000));
+        #[cfg(windows)]
+        {
+            player.native_output = Some(NativeVideoOutput::disconnected_for_test());
+        }
         player.info = Some(VideoInfo {
             width: 640,
             height: 360,
@@ -5682,6 +5777,22 @@ impl VideoPlayer {
         self.clock.acquire_remote_local_output_mute()
     }
 
+    #[cfg(windows)]
+    pub(crate) fn acquire_remote_local_video_output_hide(
+        &self,
+    ) -> Option<RemoteLocalVideoOutputHideLease> {
+        self.native_output
+            .as_ref()
+            .map(NativeVideoOutput::acquire_remote_hide)
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn remote_local_video_output_hidden_for_test(&self) -> bool {
+        self.native_output
+            .as_ref()
+            .is_some_and(NativeVideoOutput::remote_hidden_for_test)
+    }
+
     pub(crate) fn clear_audio_output_buffer(&self) {
         if let Some(audio) = &self.audio {
             audio.clear_buffer(&self.clock);
@@ -5798,6 +5909,29 @@ impl VideoPlayer {
         let clamped = self.clamp_seek_target(target_secs);
         let mut state = self.user_seek_coalesce.lock().unwrap();
         self.issue_user_seek_locked(&mut state, clamped);
+    }
+
+    pub(crate) fn remote_stream_start_seek_is_settled(&self) -> bool {
+        self.pending_resume_secs.is_none() && !self.clock.is_seeking()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_remote_seek_for_test(&self) {
+        self.clock
+            .clear_seek_target_override(self.clock.current_seek_serial());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pending_remote_resume_for_test(&mut self, target_secs: f64) {
+        self.pending_resume_secs = Some(target_secs);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_pending_remote_resume_for_test(&mut self) {
+        if let Some(target_secs) = self.pending_resume_secs.take() {
+            self.clock.request_seek(target_secs);
+            self.complete_remote_seek_for_test();
+        }
     }
 
     /// 相対シーク (←→ ホットキー)。

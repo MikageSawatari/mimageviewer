@@ -5875,6 +5875,29 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
             ui.label(crate::settings::format_video_volume_db(s.video_volume));
         });
 
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("リモート動画ストリーミング").strong());
+        ui.add_space(4.0);
+        ui.checkbox(
+            &mut s.remote_video_streaming_enabled,
+            "リモート端末への動画配信を有効にする",
+        );
+        ui.add_enabled_ui(s.remote_video_streaming_enabled, |ui| {
+            ui.checkbox(
+                &mut s.remote_video_mute_local_output,
+                "配信中はこの PC の音声をミュート",
+            );
+            ui.checkbox(
+                &mut s.remote_video_hide_local_output,
+                "配信中はこの PC の映像を表示しない",
+            )
+            .on_hover_text(
+                "デコードとリモートへのフレーム送信は継続し、ローカル画面への表示だけを止めます。",
+            );
+        });
+
         // 再生位置レジューム (続き/先頭の切替・位置クリア) は「履歴と復元」ページに集約。
         ui.add_space(12.0);
         ui.separator();

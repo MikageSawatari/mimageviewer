@@ -1281,7 +1281,7 @@ fn auto_fullscreen_image_only_folder_opens_page_after_load() {
 }
 
 #[test]
-fn remote_video_start_opens_target_when_no_fullscreen_media_is_open() {
+fn remote_video_start_returns_post_seek_generation_and_stop_is_idempotent() {
     let mut app = phase_c_support::setup_app();
     let folder = app.tmp.path().join("remote-video");
     std::fs::create_dir(&folder).unwrap();
@@ -1339,16 +1339,39 @@ fn remote_video_start_opens_target_when_no_fullscreen_media_is_open() {
     #[cfg(windows)]
     assert_ne!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
 
+    let mut ready_player =
+        crate::video::VideoPlayer::stream_ready_disconnected_for_test(video.clone());
+    ready_player.set_pending_remote_resume_for_test(4.0);
     app.fs_cache.insert(
         idx,
         FsCacheEntry::Video {
-            player: Box::new(
-                crate::video::VideoPlayer::stream_ready_disconnected_for_test(video.clone()),
-            ),
+            player: Box::new(ready_player),
             load_seq: 0,
         },
     );
+    // The first poll attaches generation 1. Opening the player may then publish a resume seek;
+    // reproduce that ordering before the start response is allowed to leave the UI boundary.
     app.poll_remote_session(&egui::Context::default());
+    let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get_mut(&idx) else {
+        panic!("stream-ready player was replaced");
+    };
+    player.apply_pending_remote_resume_for_test();
+    #[cfg(windows)]
+    assert!(player.remote_local_video_output_hidden_for_test());
+    assert!(
+        player.intent_playing(),
+        "decoder transport must remain active"
+    );
+
+    let start_deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while !request_thread.is_finished() && std::time::Instant::now() < start_deadline {
+        app.poll_remote_session(&egui::Context::default());
+        std::thread::yield_now();
+    }
+    assert!(
+        request_thread.is_finished(),
+        "stable start response timed out"
+    );
     let published = match request_thread.join().unwrap() {
         crate::remote_ipc::session::VideoStreamUiOutcome::Started(published) => published,
         crate::remote_ipc::session::VideoStreamUiOutcome::Error(error) => {
@@ -1365,6 +1388,70 @@ fn remote_video_start_opens_target_when_no_fullscreen_media_is_open() {
             .wait_ready(std::time::Duration::from_secs(7)),
         crate::video::stream::session::StreamGenerationStatus::Ready(_)
     ));
+    assert!(
+        published.generation_id().0 >= 2,
+        "the generation created before the opening seek must not be returned"
+    );
+    assert!(matches!(
+        published.generation.resource(
+            published.generation_id(),
+            crate::video::stream::session::StreamResourceKind::MasterPlaylist,
+        ),
+        Ok(crate::video::stream::session::StreamResource::Playlist(_))
+    ));
+
+    let session = published.session.0;
+    let current = handle.video_stream(session).unwrap();
+    assert_eq!(current.generation_id(), published.generation_id());
+
+    let unknown_stop_handle = handle.clone();
+    let unknown_stop = std::thread::spawn(move || {
+        let operation = unknown_stop_handle
+            .begin_operation("phone", "動画ストリーミングを停止中".to_owned())
+            .unwrap();
+        unknown_stop_handle.submit_video_stream(
+            crate::remote_ipc::session::VideoStreamUiRequest::Stop {
+                session: session + 999,
+            },
+            operation,
+        )
+    });
+    while !unknown_stop.is_finished() {
+        app.poll_remote_session(&egui::Context::default());
+        std::thread::yield_now();
+    }
+    assert!(matches!(
+        unknown_stop.join().unwrap(),
+        crate::remote_ipc::session::VideoStreamUiOutcome::Stopped
+    ));
+    assert!(handle.video_stream(session).is_ok());
+
+    for _ in 0..2 {
+        let stop_handle = handle.clone();
+        let stop = std::thread::spawn(move || {
+            let operation = stop_handle
+                .begin_operation("phone", "動画ストリーミングを停止中".to_owned())
+                .unwrap();
+            stop_handle.submit_video_stream(
+                crate::remote_ipc::session::VideoStreamUiRequest::Stop { session },
+                operation,
+            )
+        });
+        while !stop.is_finished() {
+            app.poll_remote_session(&egui::Context::default());
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            stop.join().unwrap(),
+            crate::remote_ipc::session::VideoStreamUiOutcome::Stopped
+        ));
+    }
+    let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&idx) else {
+        panic!("stream-ready player was removed");
+    };
+    assert!(!player.intent_playing());
+    #[cfg(windows)]
+    assert!(!player.remote_local_video_output_hidden_for_test());
 }
 
 #[cfg(windows)]

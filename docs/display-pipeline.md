@@ -632,6 +632,12 @@ source swap 中の受動表示なのでカーソル idle をリセットせず�
 非表示カーソルを復活させない。画像⇄動画の遷移はこの fast path の対象外で、従来どおり
 `open_fullscreen` / `start_fs_load` 経路で扱う。
 
+mIV Remote の動画ストリーミング中にローカル映像を隠す場合は、decoder や video tap を停止せず、
+native presenter の `SetWindowVisible(false)` が持つ consume-and-hold 経路で `present()`
+だけを止める。`NativeVideoOutputVisibilityGate` は tray / 動画→音声モードの base visibility と
+remote session の owner-scoped hide lease を合成するため、stream 終了時に stale な lease が
+別の非表示理由を上書きして表示を戻すことはない。
+
 動画タイルモード (`video_tile_state`) は再生中動画の `VideoInfo` からタイムスタンプ列を
 作り、`TileThumbnailWorker` が別 FFmpeg input でサムネイルを抽出する。タイルモードが
 active の動画→動画ホイール移動でも同じ `SwitchSource` を使うが、

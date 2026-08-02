@@ -5,7 +5,7 @@
 
 - 親計画: [web-remote-plan.md](web-remote-plan.md) (リモート閲覧機能全体の正本)
 - ブランチ: `web-remote` (worktree: `C:\home\mimageviewer-web`)
-- 現在のフェーズ: **第 1 段 増分 7/7 実装済み、実機検証待ち** (encoder 抽象 / fallback / 画質
+- 現在のフェーズ: **第 1 段 増分 7/7 + 実機検証是正を実装済み、再検証待ち** (encoder 抽象 / fallback / 画質
   preset + 映像・音声 fMP4 segmenter / ring / m3u8 + audio tap / AAC + decoder-output
   video tap / HW download / scale / H.264 input + streaming session / remote owner 連携 /
   generation / 設定 + protocol v15 IPC / HTTP・HLS ルート + Web フロント、2026-08-02)
@@ -413,7 +413,12 @@ HLS のライブウィンドウ (直近 60 秒) 内は `<video>` 上で完結す
   どちらからも送られる
 - セグメントは `Cache-Control: no-store`、init segment だけ `immutable`
 - 未生成 / 存在しないセグメントは 404、ring から巻き取られたセグメントは 410 Gone、
-  セッション不一致は 409、本体未接続は 503 と既存の `miv_not_running` を返す
+  session / generation 不一致はどちらも 409 とするが、JSON の `error` をそれぞれ
+  `stream_session_mismatch` / `stream_generation_mismatch` に分ける。本体未接続は 503 と
+  既存の `miv_not_running` を返す。動画 API の JSON `error` は計測ログの
+  `details.video_stream.error_code` にも記録する
+- `POST /api/video/stop` は generation を受け取らず、指定 streaming session が無い場合も
+  成功する冪等操作とする。別の有効 session ID を誤って停止しない
 - generation 開始直後は init と master / media playlist がまだ未確定になり得る。増分 6 は
   segmenter の typed `None` を保持して HTTP 503 または上限付き wait へ写像し、200 では
   必ず非空の init、または init と最初の media segment を参照できる playlist を返す
@@ -443,7 +448,11 @@ allowlist と canonical containment を再検証する ([web-remote-plan.md](web
 `VideoStreamStart` の `address` は照合用ではなく、再生対象を指定する正本である。本体 UI
 thread は既存の「フォルダを開く → loaded item を選択 → fullscreen player を開く」経路で
 その動画へ切り替え、player の metadata / audio tap が揃うまで typed `Opening` state を
-poll する。別の項目が開いていても remote owner が操作権を占有しているため要求先へ切り替える。
+poll する。その後は start request を typed `Starting` state が保持し、pending resume が
+消費済み、seek 中でない、現在の seek serial と generation の expected serial が一致、
+encoder が Ready、という事実をすべて確認してから generation を publish する。IPC worker は
+同じ generation の master playlist が非空になるまで 7 秒上限で待って start を返す。
+別の項目が開いていても remote owner が操作権を占有しているため要求先へ切り替える。
 stop・owner 解放・失敗時は remote が開いた動画をその位置で pause して残し、開始前の項目へは
 戻さない。復元用の並行 state を持つと §2.2 の「位置を保持して手動再開」と競合するためである。
 player open と `fs_cache` / `fullscreen_idx` の更新だけを UI thread が担当し、encoder open と
@@ -468,6 +477,18 @@ stream worker の teardown / join は引き続き UI thread 外で行う。
   は新しい resource を返さず 409 とする
 - API seek は通常 UI の連打 coalescing を通さず decoder seek serial を即時に進めてから
   generation を発行する。これにより応答した generation と実際の seek を 1 対 1 に保つ
+
+#### 実機検証是正 (start/409/stop、2026-08-02)
+
+- start が generation access を clone した後、UI poll が opening/resume seek を検出して
+  current generation を交換しても、旧 clone の encoder readiness 待ちだけが成功して旧番号を
+  応答していた。`Opening → Starting → Streaming` に分け、seek と generation が一致するまで
+  claimed request を UI state に残すことで、返却境界を current generation の publish 後へ移した
+- stop は ownership 判定後の通常 control と分け、generation を参照せず streaming session ID
+  だけで処理する。既に停止済み / 未知 ID は成功、未知 ID が別の active stream を指さない場合は
+  その active stream を維持する
+- 409 本文の error code を session / generation で分離し、動画 API の JSON error code を
+  remote-web 計測ログへ複写する
 
 ### 6.3 セッションと既存ロックの関係
 
@@ -517,10 +538,16 @@ stream worker の teardown / join は引き続き UI thread 外で行う。
 - ローカル mute は audio device や PCM queue を止めず、owner-scoped lease が cpal callback の
   `output_volume` だけを 0 にする。post-DSP tap はその前 (processed queue push 前) なので、
   リモート PCM は mute の影響を受けない
+- ローカル映像非表示は streaming session が native presenter の owner-scoped lease を保持し、
+  既存の consume-and-hold 出口で `present()` だけを止める。decoder、video tap、最新 frame の
+  drain/selection は継続する。lease drop は tray / 動画→音声モードの base visibility と合成して
+  元の表示へ戻す。本体の「リモート接続中」modal は配信中のファイル名を表示し続ける
 - 設定の enum は runtime の nested `EncoderPreference` 等を直接永続化せず、単純な scalar variant
   名を持つ `RemoteVideoEncoder` / `RemoteVideoQuality` として分離した。未知 variant は既存の
   forward-incompatible 判定に入り、`Corrupted` quarantine / backup 自動復旧を行わない。
   本機能は未リリースのため既存値の migration は不要
+- ローカル出力 bool も文字列の未知値を serde の `unknown variant` として分類し、
+  `Incompatible` で原本を温存する
 
 ---
 
@@ -555,7 +582,10 @@ stream worker の teardown / join は引き続き UI thread 外で行う。
   場合は video 内だけで移動し、範囲外は `/api/video/seek` の新 generation / playlist へ差し替える
 - `waiting` 継続 3 秒で 1 段下の画質と 1 時間あたり通信量を提示し、利用者がボタンを押した時だけ
   `media_quality` を送る。503 は `Retry-After` 後に再試行、410 は ring に追いつけなかった表示と
-  明示再接続、409 は state の current generation から playlist を再取得する
+  明示再接続、generation mismatch の 409 は state の current generation から URL を組み直す。
+  playlist probe は再帰せず最大 6 回か 15 秒で終了し、回復不能なら
+  「プレイリストを取得できませんでした。」と再接続操作を表示する。session mismatch の 409 は
+  再取得対象にしない
 - 動画のタップ、スワイプ、Space、矢印、音量、画質、F11 は `command-core.mjs` の既存 command
   dispatch に統合した。`<video controls>` は使わず、シークバー、音量、画質 UI は自前 DOM とした。
   visibility 復帰時に session が失効していれば、表示中の全体動画位置を保持して start + seek する
@@ -573,6 +603,7 @@ stream worker の teardown / join は引き続き UI thread 外で行う。
 | `remote_video_quality_default` | `Standard` | §6.4 のプリセット |
 | `remote_video_segment_window` | `30` | 保持セグメント数 (= 60 秒) |
 | `remote_video_mute_local_output` | `true` | ストリーミング中に PC 側スピーカーを無音にするか (§10-2) |
+| `remote_video_hide_local_output` | `true` | decoder を動かしたまま PC 側 presenter の表示だけを止めるか |
 
 ---
 
@@ -712,6 +743,13 @@ Android 実機を保有していないため、**検証できる範囲と委ね�
 - A/V 同期: 既知の pts 列に対してセグメントのタイムスタンプが単調増加し、
   音声 `audible_pts_secs` と映像 pts のずれが 1 フレーム以内であること
 - セッション: 操作権喪失 / 生存タイムアウト / 放置タイムアウトでストリーミングが停止すること
+- start/stop: player open 後に resume seek serial が進んでも、start が返す generation を
+  playlist resource が current として受理すること。stop は未知 / 停止済み ID でも成功し、
+  active な別 ID は停止しないこと
+- Web: generation mismatch 409 後に state の current generation へ URL を更新して回復し、
+  mismatch が続く場合は有限回で利用者向け失敗表示になること。session mismatch と区別すること
+- ローカル出力: streaming 中も decoder transport を再生したまま presenter のみ非表示となり、
+  stop で元に戻ること。ローカル出力設定の未知値が `Incompatible` になること
 - `cargo test -p mimageviewer --lib` と `cargo test -p mimageviewer-remote` が緑
 
 ### 実機 (ユーザーが実施)
@@ -722,6 +760,8 @@ Android 実機を保有していないため、**検証できる範囲と委ね�
 - シーク・一時停止・画質変更が動作し、シーク後の再バッファが 5 秒以内
 - **PC 側のウィンドウを最小化 / モニタをスリープさせても再生が継続する** (§10-1)
 - ローカルへ操作権を戻すとストリーミングが停止し、本体の再生状態が壊れない
+- 既定設定では本体側の映像と音声が出ず、「リモート接続中」と配信中ファイル名が見える。
+  ストリーミング終了後は本体の映像表示が元に戻る
 
 ### 実機で記録する値
 

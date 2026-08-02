@@ -172,7 +172,7 @@ test("three seconds of waiting only proposes one lower quality", () => {
   }), null);
 });
 
-test("stream HTTP statuses keep waiting, gone and generation mismatch distinct", () => {
+test("stream HTTP statuses distinguish session and generation conflicts", () => {
   assert.deepEqual(videoHttpStatusDecision(503, 4), {
     kind: "waiting",
     retry: true,
@@ -180,7 +180,15 @@ test("stream HTTP statuses keep waiting, gone and generation mismatch distinct",
     message: "配信の準備を待っています。",
   });
   assert.equal(videoHttpStatusDecision(410).kind, "gone");
-  assert.equal(videoHttpStatusDecision(409).kind, "generation_mismatch");
+  assert.equal(
+    videoHttpStatusDecision(409, 1, "stream_generation_mismatch").kind,
+    "generation_mismatch"
+  );
+  assert.equal(
+    videoHttpStatusDecision(409, 1, "stream_session_mismatch").kind,
+    "session_mismatch"
+  );
+  assert.equal(videoHttpStatusDecision(409).kind, "session_mismatch");
   assert.equal(videoHttpStatusDecision(404).kind, "not_found");
 });
 
