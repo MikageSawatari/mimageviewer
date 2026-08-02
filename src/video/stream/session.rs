@@ -391,6 +391,17 @@ pub(crate) enum StreamReconcile {
 }
 
 impl RemoteVideoStreamingSession {
+    pub(crate) fn hides_local_video_output(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self._local_video_hide.is_some()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     pub(crate) fn start(
         owner: RemoteSessionOwner,
         player: &crate::video::VideoPlayer,

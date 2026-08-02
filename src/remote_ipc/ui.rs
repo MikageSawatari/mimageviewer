@@ -61,6 +61,76 @@ struct AppRemoteVideoStarting {
 const REMOTE_VIDEO_PLAYER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const REMOTE_VIDEO_START_STABLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(7);
 
+// リモート配信の local surface は streaming UI state owner と同居させる。
+pub(crate) fn draw_remote_video_local_surface(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    source_name: &str,
+) {
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, crate::ui_music_timeline::MUSIC_VIEW_BG);
+    let center = rect.center();
+    let content_y = center.y - (rect.height() * 0.08).min(72.0);
+    draw_remote_video_local_surface_status(&painter, center, content_y);
+    draw_remote_video_local_surface_details(&painter, rect, content_y, source_name);
+}
+
+fn draw_remote_video_local_surface_status(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    content_y: f32,
+) {
+    let badge = egui::Rect::from_center_size(
+        egui::pos2(center.x, content_y - 64.0),
+        egui::vec2(104.0, 28.0),
+    );
+    painter.rect_filled(
+        badge,
+        badge.height() * 0.5,
+        egui::Color32::from_rgb(36, 82, 126),
+    );
+    painter.text(
+        badge.center(),
+        egui::Align2::CENTER_CENTER,
+        "REMOTE",
+        egui::FontId::proportional(13.0),
+        egui::Color32::from_rgb(224, 240, 255),
+    );
+    painter.text(
+        egui::pos2(center.x, content_y - 24.0),
+        egui::Align2::CENTER_CENTER,
+        "リモートへ配信中",
+        egui::FontId::proportional(24.0),
+        egui::Color32::from_gray(232),
+    );
+}
+
+fn draw_remote_video_local_surface_details(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    content_y: f32,
+    source_name: &str,
+) {
+    let filename = painter.layout(
+        source_name.to_owned(),
+        egui::FontId::proportional(18.0),
+        egui::Color32::from_rgb(126, 184, 238),
+        (rect.width() - 64.0).clamp(1.0, 720.0),
+    );
+    painter.galley(
+        egui::pos2(rect.center().x - filename.size().x * 0.5, content_y + 4.0),
+        filename,
+        egui::Color32::from_rgb(126, 184, 238),
+    );
+    painter.text(
+        egui::pos2(rect.center().x, content_y + 54.0),
+        egui::Align2::CENTER_CENTER,
+        "この PC では映像を非表示にしています",
+        egui::FontId::proportional(14.0),
+        egui::Color32::from_gray(158),
+    );
+}
+
 struct PendingRemoteBookmarkWrite {
     claimed: ClaimedRemoteWrite,
     kind: PendingRemoteBookmarkWriteKind,
@@ -616,6 +686,29 @@ impl crate::app::App {
                 }
                 AppRemoteVideoStreamState::Streaming(streaming) => Some(streaming.session.status()),
             })
+    }
+
+    pub(crate) fn remote_video_local_surface_source(
+        &self,
+        fs_idx: usize,
+    ) -> Option<&std::path::Path> {
+        match self.remote_session_ui.video_stream.as_ref()? {
+            AppRemoteVideoStreamState::Opening(_) => None,
+            AppRemoteVideoStreamState::Starting(starting)
+                if starting.streaming.fs_idx == fs_idx
+                    && starting.streaming.session.hides_local_video_output() =>
+            {
+                Some(starting.streaming.requested_path.as_path())
+            }
+            AppRemoteVideoStreamState::Streaming(streaming)
+                if streaming.fs_idx == fs_idx && streaming.session.hides_local_video_output() =>
+            {
+                Some(streaming.requested_path.as_path())
+            }
+            AppRemoteVideoStreamState::Starting(_) | AppRemoteVideoStreamState::Streaming(_) => {
+                None
+            }
+        }
     }
 
     #[allow(dead_code)] // Increment 6 routes the existing media play/pause command here.
@@ -1826,6 +1919,32 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_video_local_surface_snapshot_dark() {
+        use egui_kittest::Harness;
+
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(640.0, 360.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(crate::ui_music_timeline::MUSIC_VIEW_BG))
+                    .show(ctx, |ui| {
+                        draw_remote_video_local_surface(ui, ui.max_rect(), "配信サンプル動画.mp4");
+                    });
+            });
+
+        harness.run();
+        harness.snapshot("remote_video_local_surface_dark");
+    }
 
     #[test]
     fn remote_spread_key_matches_worker_logical_favorite_path() {

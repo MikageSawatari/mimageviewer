@@ -1357,10 +1357,15 @@ fn remote_video_start_returns_post_seek_generation_and_stop_is_idempotent() {
     };
     player.apply_pending_remote_resume_for_test();
     #[cfg(windows)]
-    assert!(player.remote_local_video_output_hidden_for_test());
+    assert!(player.remote_local_video_output_hidden());
     assert!(
         player.intent_playing(),
         "decoder transport must remain active"
+    );
+    assert_eq!(
+        app.fullscreen_egui_media_surface_for_idx(idx),
+        Some(crate::ui_fullscreen::FullscreenEguiMediaSurface::RemoteStreaming),
+        "remote hide must route the local viewer to a drawable egui surface"
     );
 
     let start_deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
@@ -1451,7 +1456,18 @@ fn remote_video_start_returns_post_seek_generation_and_stop_is_idempotent() {
     };
     assert!(!player.intent_playing());
     #[cfg(windows)]
-    assert!(!player.remote_local_video_output_hidden_for_test());
+    {
+        assert!(!player.remote_local_video_output_hidden());
+        assert!(
+            player.remote_local_video_output_effectively_visible_for_test(),
+            "stream stop must restore the normal presenter when no other hide owner remains"
+        );
+        assert_eq!(
+            app.fullscreen_egui_media_surface_for_idx(idx),
+            None,
+            "stream stop must remove the remote replacement surface"
+        );
+    }
 }
 
 #[cfg(windows)]

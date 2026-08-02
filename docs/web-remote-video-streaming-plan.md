@@ -541,7 +541,10 @@ stream worker の teardown / join は引き続き UI thread 外で行う。
 - ローカル映像非表示は streaming session が native presenter の owner-scoped lease を保持し、
   既存の consume-and-hold 出口で `present()` だけを止める。decoder、video tap、最新 frame の
   drain/selection は継続する。lease drop は tray / 動画→音声モードの base visibility と合成して
-  元の表示へ戻す。本体の「リモート接続中」modal は配信中のファイル名を表示し続ける
+  元の表示へ戻す。presenter 非表示中は動画→音声モードと同じ egui replacement seam に暗色の
+  `RemoteStreaming` surface を描き、配信中であることとファイル名を常時示す。本体の
+  「リモート接続中」modal も同じファイル名を表示し続ける。音声モードとの重なりは music surface
+  を優先し、片方の解除で他方の hide owner を解除しない
 - 設定の enum は runtime の nested `EncoderPreference` 等を直接永続化せず、単純な scalar variant
   名を持つ `RemoteVideoEncoder` / `RemoteVideoQuality` として分離した。未知 variant は既存の
   forward-incompatible 判定に入り、`Corrupted` quarantine / backup 自動復旧を行わない。
@@ -749,7 +752,9 @@ Android 実機を保有していないため、**検証できる範囲と委ね�
 - Web: generation mismatch 409 後に state の current generation へ URL を更新して回復し、
   mismatch が続く場合は有限回で利用者向け失敗表示になること。session mismatch と区別すること
 - ローカル出力: streaming 中も decoder transport を再生したまま presenter のみ非表示となり、
-  stop で元に戻ること。ローカル出力設定の未知値が `Incompatible` になること
+  本体は空白ではなく暗色の配信中 surface とファイル名を表示すること。stop で通常の動画表示へ
+  戻ること。動画→音声モードと重ねて片方を解除しても、残る owner の非表示が維持されること。
+  ローカル出力設定の未知値が `Incompatible` になること
 - `cargo test -p mimageviewer --lib` と `cargo test -p mimageviewer-remote` が緑
 
 ### 実機 (ユーザーが実施)

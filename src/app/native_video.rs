@@ -31,9 +31,19 @@ fn native_video_key_physically_down(
 fn main_iconic_video_source_enabled(
     detached_or_switching: bool,
     is_video: bool,
-    music_view_active: bool,
+    egui_replacement_active: bool,
 ) -> bool {
-    !detached_or_switching && is_video && !music_view_active
+    !detached_or_switching && is_video && !egui_replacement_active
+}
+
+#[cfg(windows)]
+fn video_audio_exit_visibility_complete(
+    saw_hidden: bool,
+    presenter_hidden: bool,
+    base_visible: bool,
+    remote_hidden: bool,
+) -> bool {
+    saw_hidden && (!presenter_hidden || (base_visible && remote_hidden))
 }
 
 /// 動画ピン留めの「ピン位置のフレームをサムネ DB に書き戻す」非同期待ち用。
@@ -2182,11 +2192,11 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return false;
         };
-        // 音声モードにトグルした動画 (Inc 7) は音楽ビュー (egui) を描くので、動画 backdrop 扱いに
-        // しない。これを外さないと update ループが backdrop 分岐に入って main HWND を cloak したまま
-        // early-return し、音だけ残って画面が消える (実機バグ、Codex 7d 検証)。
+        // native presenter が owner-scoped hide 中で egui replacement surface を描く場合は
+        // backdrop 扱いにしない。update の native backdrop early-return を通すと、代替面と
+        // remote session modal の両方が描かれず、隠した presenter の背面が露出する。
         matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
-            && !self.fs_music_view_active(fs_idx)
+            && self.fullscreen_egui_media_surface_for_idx(fs_idx).is_none()
     }
 
     #[cfg(windows)]
@@ -2197,14 +2207,18 @@ impl App {
         let detached_or_switching = self.viewer_session_is_detached_or_switching();
         let source = self.fullscreen_idx.and_then(|fs_idx| {
             let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
-            let music_view_active = is_video && self.fs_music_view_active(fs_idx);
+            let egui_replacement_active =
+                is_video && self.fullscreen_egui_media_surface_for_idx(fs_idx).is_some();
             // The explicit DWM bitmap exists only because an in-main native presenter
             // covers the main HWND. A detached viewer has its own top-level taskbar
             // preview, so overriding the main HWND would make both previews show the
             // detached video. Passing None below also clears a bitmap left by a
             // main -> detached transition.
-            if !main_iconic_video_source_enabled(detached_or_switching, is_video, music_view_active)
-            {
+            if !main_iconic_video_source_enabled(
+                detached_or_switching,
+                is_video,
+                egui_replacement_active,
+            ) {
                 return None;
             }
             // 音声モードにトグルした動画 (Inc 7) は音声ファイル扱いなので DWM タスクバー
@@ -7595,12 +7609,14 @@ impl App {
             }
             _ => false,
         };
+        // 音声モードの base hide owner だけを解除する。remote hide owner が残っていれば
+        // visibility gate の effective value は false のままで、presenter は表示されない。
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_window_visible(true);
+        }
         if placement_matches {
             // 高速 show (シームレス)。presenter が再表示 (`!native_presenter_hidden()`) を
             // confirm するまで video_audio_mode は Some のまま保つ。
-            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                player.set_native_window_visible(true);
-            }
             self.video_audio_exit_pending = Some(super::VideoAudioExitPending {
                 fs_idx,
                 deadline: std::time::Instant::now() + std::time::Duration::from_millis(400),
@@ -7649,10 +7665,16 @@ impl App {
             self.video_audio_exit_pending = None;
             return;
         }
-        let (player_present, hidden) = match self.fs_cache.get(&pending.fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => (true, player.native_presenter_hidden()),
-            _ => (false, false),
-        };
+        let (player_present, hidden, base_visible, remote_hidden) =
+            match self.fs_cache.get(&pending.fs_idx) {
+                Some(FsCacheEntry::Video { player, .. }) => (
+                    true,
+                    player.native_presenter_hidden(),
+                    player.native_window_base_visible(),
+                    player.remote_local_video_output_hidden(),
+                ),
+                _ => (false, false, false, false),
+            };
         if !player_present {
             // player が消えた (evict 等): stuck を避けるため即完了扱いにしてモードを畳む。
             // mismatch 経路で張った SwitchPlacement pending が居ても PlacementSwitched は届かない
@@ -7673,7 +7695,7 @@ impl App {
             }
         }
         let saw_hidden = pending.saw_hidden || hidden;
-        if saw_hidden && !hidden {
+        if video_audio_exit_visibility_complete(saw_hidden, hidden, base_visible, remote_hidden) {
             // 再表示済み: 音楽ビューを畳んで動画表示へ (owner/HUD は次フレームの
             // ensure_native_video_front が再登録)。
             self.video_audio_mode = None;
@@ -7681,8 +7703,8 @@ impl App {
             self.video_audio_exit_pending = None;
             ctx.request_repaint();
             crate::logger::log(format!(
-                "[video-audio] exit fs_idx={} complete (presenter shown)",
-                pending.fs_idx
+                "[video-audio] exit fs_idx={} complete (presenter shown or still remote-owned)",
+                pending.fs_idx,
             ));
         } else if std::time::Instant::now() >= pending.deadline {
             // presenter が無応答 / switch 失敗: フォールバックで確実に復帰させる。
@@ -9082,7 +9104,7 @@ impl App {
 
 #[cfg(all(test, windows))]
 mod iconic_thumbnail_tests {
-    use super::main_iconic_video_source_enabled;
+    use super::{main_iconic_video_source_enabled, video_audio_exit_visibility_complete};
 
     #[test]
     fn main_iconic_video_source_is_only_for_in_main_video() {
@@ -9090,5 +9112,16 @@ mod iconic_thumbnail_tests {
         assert!(!main_iconic_video_source_enabled(true, true, false));
         assert!(!main_iconic_video_source_enabled(false, false, false));
         assert!(!main_iconic_video_source_enabled(false, true, true));
+    }
+
+    #[test]
+    fn audio_mode_exit_completes_without_revealing_remote_owned_presenter() {
+        assert!(video_audio_exit_visibility_complete(true, true, true, true));
+        assert!(!video_audio_exit_visibility_complete(
+            true, true, false, true
+        ));
+        assert!(video_audio_exit_visibility_complete(
+            true, false, true, false
+        ));
     }
 }

@@ -797,6 +797,7 @@ enum NativeVideoOutputCommand {
         owner_hwnd: u64,
         rect: windows::Win32::Foundation::RECT,
         activate_on_show: bool,
+        visible: bool,
     },
     /// native presenter HWND の `push_native_event` を経由しない pointer 活動を
     /// 伝搬する。NativeEguiOverlay の cursor auto-hide タイマをリセットして
@@ -1232,15 +1233,22 @@ impl NativeVideoOutputVisibilityGate {
     }
 
     fn publish(&self) {
-        let visible = self.base_visible.load(Ordering::Acquire)
-            && self.remote_hide_owner.load(Ordering::Acquire) == 0;
+        let visible = self.effective_visible();
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetWindowVisible { visible });
         crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
     }
 
-    #[cfg(test)]
+    fn effective_visible(&self) -> bool {
+        self.base_visible.load(Ordering::Acquire)
+            && self.remote_hide_owner.load(Ordering::Acquire) == 0
+    }
+
+    fn base_visible(&self) -> bool {
+        self.base_visible.load(Ordering::Acquire)
+    }
+
     fn remote_hidden(&self) -> bool {
         self.remote_hide_owner.load(Ordering::Acquire) != 0
     }
@@ -1484,9 +1492,17 @@ impl NativeVideoOutput {
         self.visibility_gate.acquire_remote_hide()
     }
 
-    #[cfg(test)]
-    fn remote_hidden_for_test(&self) -> bool {
+    fn remote_hidden(&self) -> bool {
         self.visibility_gate.remote_hidden()
+    }
+
+    fn base_visible(&self) -> bool {
+        self.visibility_gate.base_visible()
+    }
+
+    #[cfg(test)]
+    fn effective_visible_for_test(&self) -> bool {
+        self.visibility_gate.effective_visible()
     }
 
     /// presenter ウィンドウが現在 hide (consume-and-hold) 中か。exit の async 待ちで
@@ -1706,6 +1722,7 @@ impl NativeVideoOutput {
         rect: windows::Win32::Foundation::RECT,
         activate_on_show: bool,
     ) {
+        let visible = self.visibility_gate.effective_visible();
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SwitchPlacement {
@@ -1714,6 +1731,7 @@ impl NativeVideoOutput {
                 owner_hwnd,
                 rect,
                 activate_on_show,
+                visible,
             });
     }
 
@@ -3386,6 +3404,7 @@ fn run_native_video_output(
                     owner_hwnd,
                     rect: new_rect,
                     activate_on_show,
+                    visible,
                 } => {
                     if placement == cur_placement && owner_hwnd == cur_owner_hwnd {
                         window_pump.resize(cur_generation, placement, new_rect)?;
@@ -3406,7 +3425,7 @@ fn run_native_video_output(
                                 "[native-video] same placement resize failed: {err}"
                             )),
                         }
-                        if presenter_visibility.is_hidden() {
+                        if visible && presenter_visibility.is_hidden() {
                             let hidden_present = if frame_output.is_hidden() {
                                 frame_output
                                     .frame()
@@ -3440,6 +3459,15 @@ fn run_native_video_output(
                                 true,
                                 &cancel,
                             )?;
+                        } else if !visible && !presenter_visibility.is_hidden() {
+                            window_pump.set_visibility(cur_generation, false)?;
+                            wait_for_native_window_visibility(
+                                window_pump,
+                                cur_generation,
+                                false,
+                                &cancel,
+                            )?;
+                            frame_output.hide();
                         }
                         send_native_output_event(
                             &ui_event_tx,
@@ -3464,7 +3492,7 @@ fn run_native_video_output(
                         owner_hwnd,
                         rect: new_rect,
                         activate_on_show,
-                        initially_visible: !presenter_visibility.is_hidden(),
+                        initially_visible: visible,
                     })?;
                     let attach = wait_for_native_window_attach(
                         &window_pump,
@@ -3613,6 +3641,9 @@ fn run_native_video_output(
                     cur_owner_hwnd = owner_hwnd;
                     window_observation = attach.observation;
                     presenter.set_window_observation(window_observation);
+                    if !visible {
+                        frame_output.hide();
+                    }
                     native_events.clear();
                     last_cursor_poll = None;
                     last_native_mouse_at = None;
@@ -5786,11 +5817,25 @@ impl VideoPlayer {
             .map(NativeVideoOutput::acquire_remote_hide)
     }
 
-    #[cfg(all(windows, test))]
-    pub(crate) fn remote_local_video_output_hidden_for_test(&self) -> bool {
+    #[cfg(windows)]
+    pub(crate) fn remote_local_video_output_hidden(&self) -> bool {
         self.native_output
             .as_ref()
-            .is_some_and(NativeVideoOutput::remote_hidden_for_test)
+            .is_some_and(NativeVideoOutput::remote_hidden)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn native_window_base_visible(&self) -> bool {
+        self.native_output
+            .as_ref()
+            .is_none_or(NativeVideoOutput::base_visible)
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn remote_local_video_output_effectively_visible_for_test(&self) -> bool {
+        self.native_output
+            .as_ref()
+            .is_none_or(NativeVideoOutput::effective_visible_for_test)
     }
 
     pub(crate) fn clear_audio_output_buffer(&self) {
@@ -7717,6 +7762,35 @@ mod tests {
             super::NativePresenterVisibility::new(super::NativeVideoInitialVisibility::Visible);
         assert!(hidden.is_hidden());
         assert!(!visible.is_hidden());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_and_audio_mode_visibility_owners_release_independently() {
+        let output = super::NativeVideoOutput::disconnected_for_test();
+
+        output.set_window_visible(false);
+        let remote_hide = output.acquire_remote_hide();
+        output.set_window_visible(true);
+        assert!(
+            !output.effective_visible_for_test(),
+            "audio mode exit must not reveal a presenter still owned by remote"
+        );
+        drop(remote_hide);
+        assert!(
+            output.effective_visible_for_test(),
+            "dropping the final remote hide must restore the base-visible presenter"
+        );
+
+        let remote_hide = output.acquire_remote_hide();
+        output.set_window_visible(false);
+        drop(remote_hide);
+        assert!(
+            !output.effective_visible_for_test(),
+            "remote stop must not reveal a presenter still hidden by audio mode"
+        );
+        output.set_window_visible(true);
+        assert!(output.effective_visible_for_test());
     }
 
     #[test]

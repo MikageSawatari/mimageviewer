@@ -328,6 +328,16 @@ Windows 実機で確認済み。次は表示中 `App` の session 化か `MediaW
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**ClaudeCode 検収済み (2026-08-02):** remote video の owner-scoped hide 中に
+未描画面が露出する問題に対し、`src/ui_fullscreen.rs` / `src/app/native_video.rs` の既存
+native-video backdrop / embedded viewport 判定を、音声モード専用条件から typed
+`FullscreenEguiMediaSurface` (music / remote streaming) 条件へ一般化した。
+`src/video/mod.rs` の `SwitchPlacement` も output-local visibility gate の合成結果を引き継ぐ。
+新しい detached bool / Option、viewport ID / runtime / host lifecycle、geometry / focus、delay / retry
+は追加していない。Codex は、hide owner と代替描画を同じ streaming session fact から導出し、
+通常 / in-window / detached の既存 consumer を同じ ownership 境界で直す構造修正と判断した。
+**ClaudeCode 同意** — 検証した根拠: (1) `FullscreenEguiMediaSurface` は `resolve_fullscreen_egui_media_surface(music_view_active, remote_streaming_active)` の戻り値であり App に保存される状態ではない (憲法 3 に抵触しない)。(2) `SwitchPlacement` の `visible` は `visibility_gate.effective_visible()` の**合成済み**の値を既存コマンドで運ぶだけで、新しい placement の保存先も同期経路も作っていない (憲法 4)。むしろ無いと再配置で非表示が復活する。(3) rect 一致・時間窓・retry・追加 repaint・一括 reset のいずれも無い。(4) detached テストは削除も弱体化もされておらず 4,748 → 4,752 に増えている。
+
 | 日付 | 変更 | 触れた範囲 | 合意の根拠 |
 | --- | --- | --- | --- |
 | 2026-08-02 | remote video start の address を既存 folder/fullscreen open 経路へ通し、ローカル設定が detached media window を選ぶ場合も既存の presentation one-shot で mounted core player を選択 | `src/app/startup_ops.rs` の既存 folder load / loaded-file selection / `open_fullscreen` seam と `fs_media_open_forced_presentation`。detached predicate、viewport/runtime ownership、host registry、geometry/focus、window lifecycle は変更なし | ユーザー提示の正本は remote session が本体 player を占有し encoder tap を接続する設計であり、Codex の source inspection でも detached player では App 所有 `fs_cache` から streaming session を開始できないことを確認した。新規 detached bool / Option、placement state、geometry heuristic、delay/retry を追加せず、既存の一回限りの presentation request で通常 open を mounted context に具体化するため、症状パッチではなく既存 owner 境界の再利用として §2 に適合。**ClaudeCode 同意** — `fs_media_open_forced_presentation` が detached-rework stage-audio (`b2063ef3`) 由来の既存機構であり、今回の差分がその利用箇所を 2 つ増やすだけで新規の述語 / bool / Option / delay / retry / reset を導入していないことを確認した |
