@@ -6752,6 +6752,7 @@ impl App {
     #[cfg(windows)]
     fn install_key_input_subclass_for_viewport_rect(
         &self,
+        viewport: egui::ViewportId,
         outer_rect: egui::Rect,
         pixels_per_point: f32,
     ) {
@@ -6775,7 +6776,7 @@ impl App {
         };
         let hwnd_raw = hwnd.0 as usize as u64;
         if hwnd_raw != 0 {
-            crate::key_input::install_viewport_window_subclass(hwnd_raw);
+            crate::key_input::install_viewport_window_subclass(hwnd_raw, viewport);
         }
     }
 
@@ -8045,7 +8046,11 @@ impl App {
                         )
                     });
                     if !minimized && let Some(rect) = outer_rect {
-                        self.install_key_input_subclass_for_viewport_rect(rect, pixels_per_point);
+                        self.install_key_input_subclass_for_viewport_rect(
+                            fs_id,
+                            rect,
+                            pixels_per_point,
+                        );
                     }
                 }
                 #[cfg(windows)]

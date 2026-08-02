@@ -3224,9 +3224,9 @@ fn poll_command_chord_capture(
         return None;
     }
     #[cfg(windows)]
-    if crate::key_input::is_frame_active() {
+    if crate::key_input::is_frame_active(ctx.viewport_id()) {
         let mut result = None;
-        crate::key_input::consume_key_down(false, |edge| {
+        crate::key_input::consume_key_down(ctx.viewport_id(), false, |edge| {
             if is_win32_modifier_key(edge.virtual_key) {
                 return false;
             }

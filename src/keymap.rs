@@ -6184,13 +6184,13 @@ impl Keymap {
             return (false, false);
         }
         #[cfg(windows)]
-        if crate::key_input::is_frame_active() {
+        if crate::key_input::is_frame_active(ctx.viewport_id()) {
             let chords: Vec<Chord> = if let Some(chords) = self.overrides.get(&action) {
                 chords.iter().copied().collect()
             } else {
                 action.default_chords().iter().collect()
             };
-            return crate::key_input::consume_key_edges(|edge| {
+            return crate::key_input::consume_key_edges(ctx.viewport_id(), |edge| {
                 chords.iter().copied().any(|chord| {
                     let physical_match = chord.key.is_some_and(|name| {
                         name.matches_win32(edge.virtual_key, edge.scan_code, edge.extended)
@@ -6553,11 +6553,13 @@ impl Keymap {
             return false;
         }
         #[cfg(windows)]
-        if crate::key_input::is_frame_active() {
-            if crate::key_input::frame_had_key_down() {
-                let result = crate::key_input::consume_key_down_with_result(allow_repeat, |edge| {
-                    chord.matches_key_edge(edge)
-                });
+        if crate::key_input::is_frame_active(ctx.viewport_id()) {
+            if crate::key_input::frame_had_key_down(ctx.viewport_id()) {
+                let result = crate::key_input::consume_key_down_with_result(
+                    ctx.viewport_id(),
+                    allow_repeat,
+                    |edge| chord.matches_key_edge(edge),
+                );
                 if result.matched_count > 0 {
                     // The Win32 KeySlot queue and egui event queue describe the same physical
                     // press. Claim both at this ownership boundary so direct widget readers do
@@ -6620,10 +6622,14 @@ impl Keymap {
             return 0;
         }
         #[cfg(windows)]
-        if crate::key_input::is_frame_active() && crate::key_input::frame_had_key_down() {
-            let result = crate::key_input::consume_all_key_down_with_result(allow_repeat, |edge| {
-                chord.matches_key_edge(edge)
-            });
+        if crate::key_input::is_frame_active(ctx.viewport_id())
+            && crate::key_input::frame_had_key_down(ctx.viewport_id())
+        {
+            let result = crate::key_input::consume_all_key_down_with_result(
+                ctx.viewport_id(),
+                allow_repeat,
+                |edge| chord.matches_key_edge(edge),
+            );
             if result.matched_count > 0 {
                 Self::remove_all_matching_egui_key_presses(ctx, chord);
                 Self::cancel_claimed_tab_focus_traversal(ctx, chord);
@@ -6725,9 +6731,11 @@ impl Keymap {
             return false;
         }
         #[cfg(windows)]
-        if crate::key_input::is_frame_active() {
-            if crate::key_input::frame_had_key_down() {
-                return crate::key_input::pressed_key_down(|edge| chord.matches_key_edge(edge));
+        if crate::key_input::is_frame_active(ctx.viewport_id()) {
+            if crate::key_input::frame_had_key_down(ctx.viewport_id()) {
+                return crate::key_input::pressed_key_down(ctx.viewport_id(), |edge| {
+                    chord.matches_key_edge(edge)
+                });
             }
         }
         ctx.input(|i| {
@@ -6773,7 +6781,7 @@ impl Keymap {
             //   経由の「上段数字キーで誤発火」も起きない。
             // - Enter / NumpadEnter は共有 VK_RETURN を直接読まず、Win32 edge の extended bit
             //   から作る物理ラッチを使うため、KeyHold でも双方向に分離される。
-            key_held_via_os(name)
+            key_held_via_os(ctx.viewport_id(), name)
         }
         #[cfg(not(windows))]
         {
@@ -6928,13 +6936,13 @@ impl KeymapSettings {
 }
 
 #[cfg(windows)]
-fn key_held_via_os(key: KeyName) -> bool {
+fn key_held_via_os(viewport: egui::ViewportId, key: KeyName) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
-    if crate::key_input::is_frame_active() {
+    if crate::key_input::is_frame_active(viewport) {
         match key {
-            KeyName::Enter => return crate::key_input::return_key_held(false),
-            KeyName::NumpadEnter => return crate::key_input::return_key_held(true),
+            KeyName::Enter => return crate::key_input::return_key_held(viewport, false),
+            KeyName::NumpadEnter => return crate::key_input::return_key_held(viewport, true),
             _ => {}
         }
     }
@@ -7274,6 +7282,8 @@ mod tests {
     #[cfg(windows)]
     fn tab_edge(repeat: bool) -> crate::key_input::KeyEdge {
         crate::key_input::KeyEdge {
+            source_hwnd: 1,
+            source_viewport: egui::ViewportId::ROOT,
             virtual_key: 0x09,
             scan_code: 0x0f,
             extended: false,
@@ -7299,6 +7309,8 @@ mod tests {
         repeat: bool,
     ) -> crate::key_input::KeyEdge {
         crate::key_input::KeyEdge {
+            source_hwnd: 1,
+            source_viewport: egui::ViewportId::ROOT,
             virtual_key,
             scan_code,
             extended,
@@ -8879,6 +8891,7 @@ mod tests {
             2
         );
         assert!(!crate::key_input::pressed_key_down(
+            ctx.viewport_id(),
             |edge| edge.virtual_key == 0x28
         ));
         let _ = ctx.end_pass();
@@ -9042,6 +9055,7 @@ mod tests {
         assert!(!keymap.consume_action(&ctx, KeyAction::FsPostFilterNext));
         assert_eq!(ctx.input(|input| input.events.len()), 1);
         assert!(crate::key_input::pressed_key_down(
+            ctx.viewport_id(),
             |edge| edge.virtual_key == 0x54
         ));
         let _ = ctx.end_pass();
@@ -9256,6 +9270,7 @@ mod tests {
         assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
         assert_eq!(ctx.input(|i| i.events.len()), 1);
         assert!(crate::key_input::pressed_key_down(
+            ctx.viewport_id(),
             |edge| edge.virtual_key == 0x09
         ));
         egui::CentralPanel::default().show(&ctx, |ui| {
@@ -9539,6 +9554,8 @@ mod tests {
     #[test]
     fn key_hold_slot_matching_distinguishes_both_enter_directions() {
         let edge = |extended| crate::key_input::KeyEdge {
+            source_hwnd: 1,
+            source_viewport: egui::ViewportId::ROOT,
             virtual_key: 0x0D,
             scan_code: 0x1C,
             extended,

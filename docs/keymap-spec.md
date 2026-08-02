@@ -143,6 +143,15 @@ edge の寿命は 1 フレームのままにする。Action が消費しなか�
 破棄し、後のフレームへ持ち越さない。無制限の backlog を作って「押していないのに後から動く」
 挙動を避けるため、`begin_frame()` の `frame.clear()` は維持する。
 
+Windows の edge queue は HWND / viewport 単位で配送する。メイン HWND は `ViewportId::ROOT`、
+fullscreen / detached の HWND はその `fullscreen_viewport_id()` と対応付け、subclass proc が edge を
+投入した時点で送信元 HWND と viewport を `KeyEdge` へ焼き付ける。consume / pressed / frame-state /
+Enter-held の各 API は対象 `ViewportId` を必須引数にし、別 viewport の edge は成立判定も消費も
+しない。HWND の `WM_NCDESTROY` では対応とその HWND 由来の未処理 edge を同じ owner が除去するため、
+再生成後の viewport へ stale edge を配送しない。未登録 HWND は全 viewport へ公開せず `ROOT` として
+配送して診断ログへ記録する。メイン HWND は subclass が edge を publish できる前に `ROOT` 対応を
+登録済みにすることを不変条件とする。
+
 ## 固定入力 / KeyAction 対象外の整理
 
 操作カスタマイズの一覧に出すものは、原則として `KeyAction` 化された離散ショートカットだけにする。

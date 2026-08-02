@@ -4,7 +4,7 @@
 > 発端: フルスクリーンのパネル内 `TextEdit` へ入力するとショートカットが発動する / 逆に
 > ショートカットが効かなくなる問題の**度重なる再発**。直近の修正試行 `deb62b92` は
 > `52f2fff9` で revert 済み。
-> 案D (viewport / HWND を含む入力ルーティング) は本計画の対象外。バックログへ積む。
+> 案D (viewport / HWND を含む入力ルーティング) は 2026-08-02 に実装済み。§6 に記録する。
 
 ## 1. なぜ再発するのか
 
@@ -170,7 +170,7 @@ Codex の設計レビューで挙がったもの。**リリース前の回帰テ
   だけが 1 回発火する
 - widget ID がブックマーク行の追加 / 削除 / 並べ替え / サムネイル状態変化で変わらない
 
-### viewport (案D の前哨。今回は検出のみ)
+### viewport (案D で実装済み)
 
 - 1 回の物理押下を root と fullscreen が二重処理しない
 - child `TextEdit` 所有中の child 由来キーを root handler が処理しない
@@ -197,8 +197,17 @@ Codex の設計レビューで挙がったもの。**リリース前の回帰テ
 実機ログには最低限 `viewport_id` / 送信元 HWND / focused widget ID / `wants_keyboard_input` /
 IME 状態 / 選択された `KeyboardOwner` / KeySlot と egui のどちらから消費したか を**同一行**で残す。
 
-## 6. 対象外 (バックログへ)
+## 6. 案D 実装記録 (2026-08-02)
 
-**案D: viewport / HWND を含む入力ルーティング**。`KeyEdge` に送信元 HWND / viewport を持たせ、
-root / fullscreen / detached が自分由来の edge だけを消費する。IME 状態も `ViewportId -> ImeState`
-へ分離する。案A の完了後に検討する。
+- `key_input` が subclass 済み HWND と `ViewportId` の対応を単一 registry で所有し、
+  `KeyEdge` の投入時に送信元 HWND と viewport を焼き付ける。メイン HWND は `ROOT`、fullscreen / detached
+  HWND は `fullscreen_viewport_id()` を登録する。
+- 全 consume / pressed / frame-state / Enter-held API は対象 `ViewportId` を必須引数にし、対象 viewport
+  由来の edge だけを見る。`Keymap` は呼び出された `egui::Context::viewport_id()` を渡すため、案A の
+  `KeyboardOwner` / permit 判定と同じ viewport の edge だけを処理する。
+- `WM_NCDESTROY` では HWND 対応と同時に、その HWND 由来の pending / frame edge と、最後の HWND を
+  失った viewport の Enter held state を除去する。viewport 再生成後に stale edge / 対応を配送しない。
+- 未登録 HWND は全 viewport へ公開せず `ROOT` として配送する。メイン HWND の対応は subclass が edge を
+  publish できる前に必ず登録することを不変条件とし、未登録配送が起きた HWND は診断ログへ記録する。
+- unit test で sibling viewport の非消費、登録 / 解除 / HWND 再利用時の stale 対応除去、未登録 HWND の
+  `ROOT` 配送を固定する。IME 状態の viewport 分離は 2026-08-01 の実装を維持し、今回再設計していない。

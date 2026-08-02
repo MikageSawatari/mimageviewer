@@ -18825,6 +18825,8 @@ mod favorite_adjustment_defaults_tests {
         let _owner = app.keyboard_owner_for_pass(&ctx);
         crate::key_input::set_test_frame(vec![
             crate::key_input::KeyEdge {
+                source_hwnd: 1,
+                source_viewport: egui::ViewportId::ROOT,
                 virtual_key: 0x28,
                 scan_code: 0x50,
                 extended: true,
@@ -18835,6 +18837,8 @@ mod favorite_adjustment_defaults_tests {
                 alt: false,
             },
             crate::key_input::KeyEdge {
+                source_hwnd: 1,
+                source_viewport: egui::ViewportId::ROOT,
                 virtual_key: 0x28,
                 scan_code: 0x50,
                 extended: true,

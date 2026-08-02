@@ -150,37 +150,6 @@
   - UI スレッドへ ZIP/PDF 列挙や SQLite 単件照会を追加しない。
 - 規模 / 優先度: Medium〜Large / P3。
 
-### 1.22 キー入力を viewport / HWND 単位でルーティングする (案D)
-
-- 出典: 2026-07-29 のキーボード所有権レビュー (Codex Sol 設計レビュー + ClaudeCode)。
-  正本は [keyboard-input-ownership-plan.md](keyboard-input-ownership-plan.md)。本項は同計画の
-  §6「対象外」として切り出したもの。
-- 背景: 現状 Win32 の `KeyEdge` キューは全インストール HWND で共有され、送信元 HWND / viewport を
-  持たない ([src/key_input.rs](../src/key_input.rs))。IME 状態も `App` に 1 組しかなく、
-  各 viewport の入口から更新される。そのため「root ctx はキーボード不要、child ctx は TextEdit
-  編集中、物理キーキューはどちら由来か不明」という組み合わせが成立し得る。
-- 対応案: `KeyEdge` に送信元 HWND / viewport を持たせ、root / fullscreen / detached が
-  **自分由来の edge だけ**を消費する。IME 状態も `ViewportId -> ImeState` へ分離する。
-- 前提: **案A (`KeyboardOwner` / `ShortcutPermit` の単一ゲート) の完了後**に着手する。
-  案A で所有権判定が一元化されていれば、本項は「どの viewport の所有権か」を正しくするだけの
-  変更に縮む。
-- 影響範囲: Windows native 入力、egui viewport、detached / native presenter。HWND 再生成や
-  viewport lifecycle への対応が要る。detached リワークとの調整も必要
-  ([detached-rework-plan.md](detached-rework-plan.md) §2 / §11)。
-- **実機で確認した症状 (2026-08-01)**: F12 別ウィンドウで動画のブックマーク名を編集中に、
-  メインウィンドウをクリックしてそちらを操作しても、**キーが別ウィンドウのテキストエリアへ
-  行き続ける** (矢印キーがそちらの caret を動かす)。上の「root ctx はキーボード不要、child ctx は
-  TextEdit 編集中、物理キーキューはどちら由来か不明」がそのまま出た形。**v2.9.0 から同じ挙動**。
-- **利用者体験の観点** (優先度を再判断するときはこれも見ること): 編集中の別ウィンドウが
-  **視界に入っていないと、アプリ全体が壊れたと誤解する**。「入力欄を閉じれば直る」と気づく
-  手がかりが画面上に無い。技術的な影響範囲が狭くても、体感的な深刻度はこの分だけ高い。
-- 前提の進捗: 案A は v2.9.1 の `56db11bc` で pass 単位の所有者決定と生キーの permit 化まで入った。
-  IME 状態も viewport ごとへ分離済み。**本項は「どの viewport の所有権か」を正しくするだけに
-  縮んでいる**はず。
-- 併せて直す: [§1.32](#132-ime-変換中の-esc-が期待どおりに働かない-2-件) の IME 2 件。同じ領域なので
-  一括で設計する。
-- 規模 / 優先度: Large / P2 candidate。
-
 ### 1.28 presenter の上に別の窓が乗るとカーソル auto-hide が解除されない
 
 - 出典: v2.9.1 リリース前の §7.2 実機確認 (2026-08-01)、シナリオ 5 (VST GUI) の最中。
