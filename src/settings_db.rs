@@ -261,6 +261,25 @@ struct Inner {
     last_saved_vst3_slots_hash: Option<u64>,
 }
 
+/// The small live settings snapshot needed by still-image final composition.
+#[derive(Clone)]
+pub(crate) struct AdjustmentRenderSettings {
+    pub(crate) favorites: Vec<FavoriteEntry>,
+    pub(crate) global_preset: crate::adjustment::AdjustParams,
+    pub(crate) creative_luts: Vec<crate::creative_lut::CreativeLutEntry>,
+}
+
+impl AdjustmentRenderSettings {
+    #[cfg(test)]
+    pub(crate) fn from_settings(settings: &Settings) -> Self {
+        Self {
+            favorites: settings.favorites.clone(),
+            global_preset: settings.global_preset.clone(),
+            creative_luts: settings.creative_luts.clone(),
+        }
+    }
+}
+
 /// Transient 失敗時の retry 回数 + 間隔 (spec §5)。
 ///
 /// spec の「50ms backoff で最大 3 回 retry」を厳格に解釈し、
@@ -458,7 +477,27 @@ impl SettingsDb {
         let settings = build_settings_from_db(&inner.conn)?;
         inner.last_saved_vst3_chain_hash = Some(hash_vst3_plugins(&settings.vst3_plugins));
         inner.last_saved_vst3_slots_hash = Some(hash_vst3_chain_slots(&settings.vst3_chain_slots));
+
         Ok(settings)
+    }
+
+    /// Read only values that can change the final still-image composition.
+    /// Remote calls this at the start of every Page request, after UI commits.
+    pub(crate) fn load_adjustment_render_settings(
+        &self,
+    ) -> Result<AdjustmentRenderSettings, SettingsDbError> {
+        let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        Ok(AdjustmentRenderSettings {
+            favorites: read_favorites(&inner.conn)?,
+            global_preset: read_settings_kv_typed(
+                &inner.conn,
+                "global_preset",
+                crate::adjustment::AdjustParams::default,
+            )?,
+            creative_luts: read_settings_kv_typed(&inner.conn, "creative_luts", || {
+                crate::creative_lut::builtin_creative_lut_entries()
+            })?,
+        })
     }
 
     /// `Settings` を全テーブルに書き出す。
@@ -1766,6 +1805,26 @@ fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError
     Ok(settings)
 }
 
+fn read_settings_kv_typed<T>(
+    conn: &Connection,
+    key: &str,
+    default: impl FnOnce() -> T,
+) -> Result<T, SettingsDbError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let raw = match conn.query_row(
+        "SELECT value FROM settings_kv WHERE key = ?1",
+        [key],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(raw) => raw,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(default()),
+        Err(error) => return Err(error.into()),
+    };
+    serde_json::from_str(&raw).map_err(classify_settings_deserialization_error)
+}
+
 fn classify_settings_deserialization_error(error: serde_json::Error) -> SettingsDbError {
     let message = error.to_string();
     if message.contains("unknown variant") || message.contains("unknown field") {
@@ -3007,6 +3066,7 @@ mod tests {
         let loaded = db.load_into_settings().unwrap();
         assert_settings_eq(&original, &loaded);
         assert_eq!(loaded.ui_scale_factor, 1.5);
+
         assert_eq!(
             loaded.grid_click_selection_mode,
             crate::settings::GridClickSelectionMode::Explorer
@@ -3018,6 +3078,40 @@ mod tests {
         assert_eq!(video_slot.name, "Warm");
         assert_eq!(video_slot.adjustments.brightness, 12.0);
         assert_eq!(video_slot.adjustments.temperature, 24.0);
+    }
+
+    #[test]
+    fn adjustment_render_settings_are_read_from_each_committed_snapshot() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings::default();
+        let favorite = FavoriteEntry {
+            id: Uuid::new_v4(),
+            name: "nested".to_owned(),
+            path: PathBuf::from(r"C:\Pictures\nested"),
+            auto_index_structure: false,
+            auto_index_metadata: false,
+            auto_index_thumbs: false,
+        };
+        settings.favorites = vec![favorite.clone()];
+        settings.global_preset.brightness = 11.0;
+        db.save_full(&settings).unwrap();
+
+        let first = db.load_adjustment_render_settings().unwrap();
+        assert_eq!(first.favorites.len(), 1);
+        assert_eq!(first.favorites[0].id, favorite.id);
+        assert_eq!(first.favorites[0].path, favorite.path);
+        assert_eq!(first.global_preset.brightness, 11.0);
+        assert_eq!(first.creative_luts, settings.creative_luts);
+
+        settings.favorites.clear();
+        settings.global_preset.brightness = 37.0;
+        settings.creative_luts.clear();
+        db.save_full(&settings).unwrap();
+
+        let second = db.load_adjustment_render_settings().unwrap();
+        assert!(second.favorites.is_empty());
+        assert_eq!(second.global_preset.brightness, 37.0);
+        assert!(second.creative_luts.is_empty());
     }
 
     #[test]

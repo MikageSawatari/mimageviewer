@@ -26,6 +26,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// 実測 1.7 秒の RAW decode に約 6 倍の余裕を持たせつつ、HTTP worker を
 /// 無期限に保持しない。HTTP 側の入場制限とブラウザ再試行を前提にする。
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Full-page colorize and post filters can dominate raw decoding, so Page has
+/// a transport budget separate from lightweight metadata and thumbnail calls.
+const PAGE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RETRIES: u32 = 2;
 /// Transport-only grace after the core's functional start budget, covering queue dispatch and
 /// named-pipe response routing without becoming a second application deadline.
@@ -38,10 +41,12 @@ const RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
 
 fn response_timeout_for(request: &ClientMessage) -> Duration {
-    if matches!(request, ClientMessage::VideoStreamStart { .. }) {
-        VIDEO_STREAM_START_BUDGET + VIDEO_START_RESPONSE_GRACE
-    } else {
-        RESPONSE_TIMEOUT
+    match request {
+        ClientMessage::VideoStreamStart { .. } => {
+            VIDEO_STREAM_START_BUDGET + VIDEO_START_RESPONSE_GRACE
+        }
+        ClientMessage::Page { .. } => PAGE_RESPONSE_TIMEOUT,
+        _ => RESPONSE_TIMEOUT,
     }
 }
 
@@ -1760,6 +1765,21 @@ mod tests {
             })
         ));
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn page_transport_timeout_allows_full_page_composition() {
+        let request = ClientMessage::Page {
+            id: 1,
+            client_id: "client".to_owned(),
+            request: PageRequest {
+                address: RemoteAddress::file("00000000-0000-0000-0000-000000000000", "image.png"),
+                target_px: 2048,
+                priority: PagePriority::Foreground,
+            },
+        };
+        assert_eq!(response_timeout_for(&request), PAGE_RESPONSE_TIMEOUT);
+        assert!(PAGE_RESPONSE_TIMEOUT > RESPONSE_TIMEOUT);
     }
 
     #[test]

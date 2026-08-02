@@ -555,6 +555,20 @@ impl CreativeLutLibrary {
     }
 }
 
+/// Load one registered entry without mutating or migrating the library.
+///
+/// The remote adapter owns its parsed-LUT cache and uses this same parser and
+/// built-in generator as the desktop library.
+pub(crate) fn load_creative_lut_entry(
+    entry: &CreativeLutEntry,
+) -> Result<SharedCreativeLut, String> {
+    let lut = match entry.builtin {
+        Some(builtin) => build_builtin_creative_lut(builtin),
+        None => load_registered_cube_file(entry.id, &entry.path)?,
+    };
+    Ok(Arc::new(lut))
+}
+
 fn load_registered_cube_file(id: Uuid, source_path: &Path) -> Result<CubeLutParams, String> {
     let managed_path = managed_creative_lut_path(id);
     match std::fs::metadata(&managed_path) {

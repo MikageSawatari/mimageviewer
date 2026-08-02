@@ -24,6 +24,33 @@ pub(crate) fn resolve_effective_params<'a>(
     page.or_else(location_default).unwrap_or(global_default)
 }
 
+/// Select the deepest ancestor favorite that owns adjustment defaults.
+///
+/// App supplies an index-derived path; remote supplies the request path.
+/// `has_default` keeps storage ownership in each adapter.
+pub(crate) fn active_favorite_default_id_for_path(
+    path: &std::path::Path,
+    favorites: &[crate::settings::FavoriteEntry],
+    excluded_id: Option<uuid::Uuid>,
+    has_default: impl Fn(uuid::Uuid) -> bool,
+) -> Option<uuid::Uuid> {
+    let mut best: Option<uuid::Uuid> = None;
+    let mut best_len = 0usize;
+    for favorite in favorites {
+        if excluded_id == Some(favorite.id)
+            || !has_default(favorite.id)
+            || !crate::search_index_db::is_under(path, &favorite.path)
+        {
+            continue;
+        }
+        let len = favorite.path.as_os_str().len();
+        if best.is_none() || len > best_len {
+            best = Some(favorite.id);
+            best_len = len;
+        }
+    }
+    best
+}
 /// 選択・materialize 済み source に残っている最終 CPU 段の実行計画。
 ///
 /// 適用順は `tone -> smart sharpen -> colorize -> Creative LUT -> post_filter`。
@@ -44,6 +71,23 @@ pub(crate) struct FinalCompositePlan {
 impl FinalCompositePlan {
     pub(crate) fn needs_nearest_sampler(&self) -> bool {
         self.post_filter.needs_nearest_sampler()
+    }
+}
+
+/// Build the final CPU plan when the adapter does not execute final AI.
+///
+/// App uses this for its non-AI route and remote always uses it in stage 1.
+/// Smart sharpen therefore follows `effective_smart_sharpen(false)`.
+pub(crate) fn build_final_composite_plan_without_ai(
+    params: &crate::adjustment::AdjustParams,
+    creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
+) -> FinalCompositePlan {
+    FinalCompositePlan {
+        adjust_before_effect: (!params.is_color_identity()).then(|| params.clone()),
+        smart_sharpen: params.effective_smart_sharpen(false),
+        colorize: params.colorize.clone(),
+        creative_lut,
+        post_filter: params.post_filter,
     }
 }
 
@@ -207,6 +251,37 @@ mod tests {
 
         assert!(std::ptr::eq(resolved, &page));
         assert!(!looked_up);
+    }
+
+    #[test]
+    fn plan_without_ai_matches_the_app_non_ai_formula() {
+        let mut params = params_with_brightness(12.0);
+        params.smart_sharpen = 63;
+        params.post_filter = crate::adjustment::PostFilter::WarmTone;
+        params.colorize = crate::colorize::ColorizeParams::legacy_all_images(
+            crate::colorize::ColorizePalette::LegacySkin,
+        );
+        let lut = Arc::new(
+            local_adjust_core::parse_cube_lut(
+                "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
+                "identity",
+            )
+            .expect("valid test LUT"),
+        );
+
+        let plan = build_final_composite_plan_without_ai(&params, Some((Arc::clone(&lut), 0.4)));
+
+        assert_eq!(plan.adjust_before_effect.as_ref(), Some(&params));
+        assert_eq!(
+            plan.smart_sharpen,
+            params.effective_smart_sharpen(false),
+            "remote without AI must match App with used_upscale=false"
+        );
+        assert_eq!(plan.colorize, params.colorize);
+        let (actual_lut, strength) = plan.creative_lut.expect("resolved LUT");
+        assert!(Arc::ptr_eq(&actual_lut, &lut));
+        assert_eq!(strength, 0.4);
+        assert_eq!(plan.post_filter, params.post_filter);
     }
 
     #[test]

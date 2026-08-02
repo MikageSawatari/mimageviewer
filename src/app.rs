@@ -9,7 +9,8 @@ use std::sync::{
 #[cfg(test)]
 use crate::final_composite::FinalCompositeTiming;
 use crate::final_composite::{
-    FinalCompositePlan, FinalCompositeResult, execute_final_composite, resolve_effective_params,
+    FinalCompositePlan, FinalCompositeResult, active_favorite_default_id_for_path,
+    build_final_composite_plan_without_ai, execute_final_composite, resolve_effective_params,
 };
 use crate::keymap::{CommandScope, KeyAction, LOCATION_NAVIGATION_ACTIONS, PINNED_TAG_ACTIONS};
 
@@ -49599,6 +49600,7 @@ impl App {
             }
 
             let ai_key = self.final_ai_key_for_pixels(edit_key, edit_pixels.size, &params);
+            let ai_disabled = ai_key.is_none();
             let (source, used_upscale, adjust_before_effect) = match ai_key {
                 Some(key) => {
                     if let Some(entry) = self.final_ai_cache.get(&key).cloned() {
@@ -49617,12 +49619,16 @@ impl App {
                     (Arc::clone(&edit_pixels), false, adjust)
                 }
             };
-            let plan = FinalCompositePlan {
-                adjust_before_effect,
-                smart_sharpen: params.effective_smart_sharpen(used_upscale),
-                colorize: params.colorize.clone(),
-                creative_lut,
-                post_filter: params.post_filter,
+            let plan = if ai_disabled {
+                build_final_composite_plan_without_ai(&params, creative_lut)
+            } else {
+                FinalCompositePlan {
+                    adjust_before_effect,
+                    smart_sharpen: params.effective_smart_sharpen(used_upscale),
+                    colorize: params.colorize.clone(),
+                    creative_lut,
+                    post_filter: params.post_filter,
+                }
             };
             if self.spawn_final_effect_job(ctx, final_key, source, plan, true, true) {
                 // 背景 CPU / GPU と完成時 upload を一度に積み上げない。
@@ -56196,22 +56202,12 @@ impl App {
         excluded_id: Option<uuid::Uuid>,
     ) -> Option<uuid::Uuid> {
         let container_path = self.adjust_container_path_for_idx(idx)?;
-        let mut best: Option<uuid::Uuid> = None;
-        let mut best_len = 0usize;
-        for fav in &self.settings.favorites {
-            if excluded_id == Some(fav.id)
-                || !self.adjustment_favorite_params.contains_key(&fav.id)
-                || !crate::search_index_db::is_under(&container_path, &fav.path)
-            {
-                continue;
-            }
-            let len = fav.path.as_os_str().len();
-            if best.is_none() || len > best_len {
-                best = Some(fav.id);
-                best_len = len;
-            }
-        }
-        best
+        active_favorite_default_id_for_path(
+            &container_path,
+            &self.settings.favorites,
+            excluded_id,
+            |id| self.adjustment_favorite_params.contains_key(&id),
+        )
     }
 
     /// `favorite_id` の独自標準を解除した直後に `idx` へ適用される標準値。

@@ -7,6 +7,9 @@ mod video_stream;
 #[cfg(windows)]
 mod pipe;
 pub(crate) mod session;
+
+#[cfg(test)]
+pub(crate) use container::resolve_remote_effective_params_for_test;
 pub(crate) mod ui;
 
 pub(crate) struct RemoteIpcServer {

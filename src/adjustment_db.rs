@@ -104,6 +104,25 @@ impl AdjustmentDb {
         serde_json::from_str(&json).ok()
     }
 
+    /// Strict page read used by request/response adapters that must surface DB failures.
+    pub(crate) fn get_page_params_checked(
+        &self,
+        page_key: &str,
+    ) -> Result<Option<AdjustParams>, String> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT params_json FROM page_params WHERE page_path = ?1")
+            .map_err(|error| format!("page_params query prepare failed: {error}"))?;
+        let raw = match stmt.query_row([page_key], |row| row.get::<_, String>(0)) {
+            Ok(raw) => raw,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(error) => return Err(format!("page_params query failed: {error}")),
+        };
+        serde_json::from_str(&raw)
+            .map(Some)
+            .map_err(|error| format!("page_params JSON is invalid: {error}"))
+    }
+
     /// ページのパラメータを書き込む。
     ///
     /// 削除判定 (個別保存する意味があるか) は呼び出し側の責務。
@@ -262,6 +281,31 @@ impl AdjustmentDb {
             }
         }
         map
+    }
+
+    /// Strict favorite-default read used by remote rendering.
+    pub(crate) fn load_all_favorite_params_checked(
+        &self,
+    ) -> Result<HashMap<Uuid, AdjustParams>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT favorite_id, params_json FROM favorite_params")
+            .map_err(|error| format!("favorite_params query prepare failed: {error}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("favorite_params query failed: {error}"))?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (id, raw) = row.map_err(|error| format!("favorite_params row failed: {error}"))?;
+            let id = Uuid::parse_str(&id)
+                .map_err(|error| format!("favorite_params UUID is invalid: {error}"))?;
+            let params = serde_json::from_str(&raw)
+                .map_err(|error| format!("favorite_params JSON is invalid: {error}"))?;
+            map.insert(id, params);
+        }
+        Ok(map)
     }
 
     /// お気に入りの標準パラメータを書き込む。

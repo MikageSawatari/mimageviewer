@@ -10035,6 +10035,50 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn app_and_remote_resolve_the_same_nested_favorite_and_page_scopes() {
+        let mut app = setup_app();
+        let image_path = PathBuf::from("C:/pics/AI/deep/page.jpg");
+        let idx = push_image(&mut app, image_path.to_str().unwrap());
+        let outer = FavoriteEntry::new("outer".to_owned(), PathBuf::from("C:/pics"));
+        let inner = FavoriteEntry::new("inner".to_owned(), PathBuf::from("C:/pics/AI"));
+        let outer_id = outer.id;
+        let inner_id = inner.id;
+        app.settings.favorites = vec![outer, inner];
+        app.settings.global_preset = params_with_brightness(5.0);
+
+        let assert_same = |app: &App| {
+            let remote = crate::remote_ipc::resolve_remote_effective_params_for_test(
+                &image_path,
+                &mimageviewer_ipc::RemoteSubresource::File,
+                app.adjustment_page_params.get(&idx),
+                &app.settings.favorites,
+                &app.adjustment_favorite_params,
+                &app.settings.global_preset,
+            );
+            assert_eq!(remote, *app.effective_params(idx));
+            remote
+        };
+
+        assert_eq!(assert_same(&app).brightness, 5.0);
+
+        app.adjustment_favorite_params
+            .insert(outer_id, params_with_brightness(20.0));
+        assert_eq!(assert_same(&app).brightness, 20.0);
+
+        app.adjustment_favorite_params
+            .insert(inner_id, params_with_brightness(30.0));
+        assert_eq!(assert_same(&app).brightness, 30.0);
+
+        app.adjustment_page_params
+            .insert(idx, params_with_brightness(40.0));
+        assert_eq!(assert_same(&app).brightness, 40.0);
+
+        app.adjustment_page_params.remove(&idx);
+        app.adjustment_favorite_params.remove(&inner_id);
+        assert_eq!(assert_same(&app).brightness, 20.0);
+    }
+
+    #[test]
     fn apply_conceal_slot_to_selection_saves_pages_and_clears_caches() {
         let ctx = egui::Context::default();
         let mut app = setup_app();

@@ -64,10 +64,15 @@
 | 段 | リモートに乗っているか |
 | --- | --- |
 | **編集結果 (消しゴム / 隠蔽加工 / 切り取り / テキスト等)** | ❌ **乗らない** (§3.1.1) |
-| **色調** | ❌ **乗らない** |
+| **色調** | ✅ 段 1a で適用 |
+| **smart sharpen** | ✅ 段 1a で適用 (`used_upscale = false` 相当) |
 | **AI アップスケール / デノイズ** | ❌ **乗らない** |
-| **カラー化** | ❌ **乗らない** |
-| **ポストフィルタ** | ❌ **乗らない** |
+| **カラー化** | ✅ 段 1a で適用 |
+| **Creative LUT** | ✅ 段 1a で適用 |
+| **ポストフィルタ** | ✅ 段 1a で適用 |
+
+ここでの ✅ は「PC で永続化済みの補正を remote の Page 応答へ反映する」意味であり、
+remote から補正値を変更する UI はまだ段 2 / 3 の対象である。
 
 ### 3.1.1 ⚠ 編集結果が乗らないのは既存の不具合 (2026-08-03 判明)
 
@@ -195,7 +200,7 @@ PC 側の表示も変わる。これは「操作感を揃える」の必然的�
 | 段 | 内容 | 価値 |
 | --- | --- | --- |
 | **0 ✅** | 段の順序とパラメータ解決を共有関数へ切り出す (§4.2) | これ自体は無変化。以降すべての土台 |
-| **1** | リモートのページレンダを共有関数に通す (色調 / フィルタ) | スマホで見る絵が PC と一致する |
+| **1 (進行中)** | **1a ✅ 補正を共有関数に通す** / **1b 次回: 編集結果を materialize** | スマホで見る絵を PC と同じ段・値へ揃える |
 | **2** | 静止画の左パネル UI (画像補正・表示トリム・ブックマーク、編集系を除く) | 参照系が揃う |
 | **3** | **カラー化 / AI** をリモートから起動できるようにする | **利用者が最重要と挙げた 2 つ** |
 | **4** | 動画のジャンプタブ | 既存データを読むだけなので軽い |
@@ -417,6 +422,62 @@ cache の所有権を必要とし、選択済み pixels が executor の入力�
 含めない。現行どおり tone 後・smart sharpen 前に独立 cache / worker として実行し、adapter が
 AI 結果の有無と `used_upscale` を解決してから plan を作る。段 3 では remote adapter が同じ位置に
 自分の AI job / cache を持つ。
+
+#### 段 1a 補正適用の実装結果 (2026-08-03)
+
+この回は段 1 のうち補正だけを実装し、編集結果の materialize は次節の契約どおり次回へ残した。
+remote の Page worker は raw decode 後の `ColorImage` を次へ通す:
+
+```
+resolve_effective_params(page, location, global)
+  → build_final_composite_plan_without_ai
+  → execute_final_composite
+  → WebP encode
+```
+
+`build_final_composite_plan_without_ai` は App の final AI 無し経路と remote が共有し、smart sharpen は
+`effective_smart_sharpen(false)` で組み立てる。AI upscale / denoise は実行せず、tone → smart sharpen →
+colorize → Creative LUT → post-filter の段順、cancel 境界、`should_apply` は段 0 の executor に一任する。
+
+値は remote session 開始時に焼き付けない。各 Page 要求の合成準備時に、worker 上で次の順に読む:
+
+1. 稼働中の `settings.db` handle から favorites、`global_preset`、Creative LUT 登録を targeted read
+2. `WorkerContext.adjustment_db` から canonical page key の `page_params` を exact read
+3. page 個別値が無い場合だけ `favorite_params` を読み、現在地 path に対する最深の ON favorite を選択
+
+したがって PC 側の操作が各 DB へ commit された後に始まる次の Page 要求は、新しい page / location /
+global を読む。page 個別がある要求で favorite DB 全走査を起こさない性質も
+`resolve_effective_params` の lazy location 契約と揃える。
+
+favorite の選択は App の idx 経路と remote の path 経路が
+`active_favorite_default_id_for_path` を共有する。`app_and_remote_resolve_the_same_nested_favorite_and_page_scopes`
+は同じ通常画像について global → 外側 favorite → 内側 favorite → page 個別 → 内側 OFF の各状態を
+両 adapter で解決し、同じ `AdjustParams` になることを固定する。ZIP / PDF の page key は次節の
+canonical key と同じで、location path は App と同じくコンテナ本体である。
+
+remote 固有の所有物は次のとおり:
+
+- 合成済み CPU pixels の LRU: 最大 8 件かつ 128 MiB。key は page key、source mtime / size、target_px、
+  **解決済み全パラメータ**、LUT entry を含むため、PC 側の補正変更は cache miss になる
+- parsed Creative LUT の LRU: 最大 16 件。App の LUT library / cache は触らず、同じ parser と builtin
+  generator だけを共有する
+- Page cancel token: 新しい prefetch は古い prefetch を、foreground は進行中 prefetch を cancel する。
+  cancel は decode と共有 executor に渡し、置換された要求は `Busy` と明示的な理由で返す
+
+合成時間は各 cache miss で `final_composite elapsed_ms` と tone / sharpen / colorize check+apply /
+Creative LUT / post-filter の内訳をログへ出す。executor 自体には固定 deadline を置かない。
+remote-web の IPC 応答期限は Page だけ 10 秒から **60 秒**へ分離し、metadata / thumbnail の 10 秒は
+変えない。60 秒を超えた transport timeout は既存どおり HTTP へ返し、内部 retry で同じ重い合成を
+再実行しない。これにより遅い full-page colorize / post-filter を従来の raw decode 用 10 秒で
+失敗扱いにせず、真の timeout、DB / LUT 読み出し失敗、cancel を区別できる。
+debug build の合成単体計測では、2048x1365 の synthetic page に tone / smart sharpen /
+Gaussian tone-density colorize / built-in Creative LUT / post-filter をすべて通して約 0.84 秒だった。
+これは deadline ではなく参考値であり、実時間は入力サイズ・補正内容・実行環境に依存する。
+
+回帰テストは `plan_without_ai_matches_the_app_non_ai_formula` で App の AI 無し plan、
+`remote_default_adjustment_preserves_pixels` で既定 global の画素不変、
+`adjustment_render_settings_are_read_from_each_committed_snapshot` で commit 後の live 再読込も固定する。
+
 
 #### 段 1 の編集結果供給契約
 

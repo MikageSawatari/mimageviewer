@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::Instant;
 
@@ -17,6 +17,9 @@ use super::path_guard::{ResolveError, ResolvedFavoritePath, resolve_existing};
 use super::thumbnail::WorkerContext;
 
 const CONTAINER_ENTRY_LIMIT: usize = 1000;
+const REMOTE_COMPOSITE_CACHE_ENTRIES: usize = 8;
+const REMOTE_COMPOSITE_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const REMOTE_LUT_CACHE_ENTRIES: usize = 16;
 const MAX_PAGE_RENDER_PX: u32 = crate::pdf_loader::PDF_RENDER_MAX_LONG_PX;
 const PAGE_WEBP_QUALITY: f32 = 90.0;
 
@@ -27,6 +30,115 @@ pub(super) struct ContainerEngine {
     pdf_page_counts: Mutex<HashMap<PdfIdentity, u32>>,
     spread_db: Mutex<Option<crate::spread_db::SpreadDb>>,
     resume_reader: Option<ResumeReader>,
+    adjustment_settings: AdjustmentSettingsSource,
+    creative_lut_cache: Mutex<RemoteCreativeLutCache>,
+    page_composite_cache: Mutex<RemoteCompositeCache>,
+    page_prefetch_cancel: Mutex<Option<Arc<AtomicBool>>>,
+}
+
+enum AdjustmentSettingsSource {
+    Live,
+    #[cfg(test)]
+    Snapshot(crate::settings_db::AdjustmentRenderSettings),
+}
+
+#[derive(Clone)]
+struct RemoteAdjustmentIdentity {
+    page_key: String,
+    location_path: PathBuf,
+}
+
+struct RemotePreparedComposite {
+    key: RemoteCompositeCacheKey,
+    params: crate::adjustment::AdjustParams,
+    lut_entry: Option<crate::creative_lut::CreativeLutEntry>,
+}
+
+#[derive(Clone, PartialEq)]
+struct RemoteCompositeCacheKey {
+    page_key: String,
+    mtime: i64,
+    file_size: i64,
+    target_px: u32,
+    params: crate::adjustment::AdjustParams,
+    lut_entry: Option<crate::creative_lut::CreativeLutEntry>,
+}
+
+struct RemoteCompositeCacheEntry {
+    key: RemoteCompositeCacheKey,
+    pixels: Arc<egui::ColorImage>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct RemoteCompositeCache {
+    entries: VecDeque<RemoteCompositeCacheEntry>,
+    bytes: usize,
+}
+
+impl RemoteCompositeCache {
+    fn get(&mut self, key: &RemoteCompositeCacheKey) -> Option<Arc<egui::ColorImage>> {
+        let position = self.entries.iter().position(|entry| entry.key == *key)?;
+        let entry = self.entries.remove(position)?;
+        let pixels = Arc::clone(&entry.pixels);
+        self.entries.push_back(entry);
+        Some(pixels)
+    }
+
+    fn insert(&mut self, key: RemoteCompositeCacheKey, pixels: Arc<egui::ColorImage>) {
+        let bytes = pixels
+            .pixels
+            .len()
+            .saturating_mul(std::mem::size_of::<egui::Color32>());
+        if bytes > REMOTE_COMPOSITE_CACHE_BYTES {
+            return;
+        }
+        if let Some(position) = self.entries.iter().position(|entry| entry.key == key)
+            && let Some(entry) = self.entries.remove(position)
+        {
+            self.bytes = self.bytes.saturating_sub(entry.bytes);
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.entries
+            .push_back(RemoteCompositeCacheEntry { key, pixels, bytes });
+        while self.entries.len() > REMOTE_COMPOSITE_CACHE_ENTRIES
+            || self.bytes > REMOTE_COMPOSITE_CACHE_BYTES
+        {
+            let Some(entry) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(entry.bytes);
+        }
+    }
+}
+
+#[derive(Default)]
+struct RemoteCreativeLutCache {
+    entries: VecDeque<(
+        crate::creative_lut::CreativeLutEntry,
+        crate::creative_lut::SharedCreativeLut,
+    )>,
+}
+
+impl RemoteCreativeLutCache {
+    fn resolve(
+        &mut self,
+        entry: &crate::creative_lut::CreativeLutEntry,
+    ) -> Result<crate::creative_lut::SharedCreativeLut, String> {
+        if let Some(position) = self.entries.iter().position(|(cached, _)| cached == entry) {
+            let cached = self.entries.remove(position).expect("position exists");
+            let lut = Arc::clone(&cached.1);
+            self.entries.push_back(cached);
+            return Ok(lut);
+        }
+        self.entries.retain(|(cached, _)| cached.id != entry.id);
+        let lut = crate::creative_lut::load_creative_lut_entry(entry)?;
+        self.entries.push_back((entry.clone(), Arc::clone(&lut)));
+        while self.entries.len() > REMOTE_LUT_CACHE_ENTRIES {
+            self.entries.pop_front();
+        }
+        Ok(lut)
+    }
 }
 
 enum ResumeReader {
@@ -95,14 +207,21 @@ fn folder_thumb_aspect_height_ratio(settings: &crate::settings::Settings, folder
 impl ContainerEngine {
     #[cfg(test)]
     pub(super) fn new(settings: crate::settings::Settings) -> Self {
-        Self::new_inner(settings, None)
+        let adjustment_settings = AdjustmentSettingsSource::Snapshot(
+            crate::settings_db::AdjustmentRenderSettings::from_settings(&settings),
+        );
+        Self::new_inner(settings, None, adjustment_settings)
     }
 
     pub(super) fn new_with_session(
         settings: crate::settings::Settings,
         session: super::session::SessionHandle,
     ) -> Self {
-        Self::new_inner(settings, Some(ResumeReader::Session(session)))
+        Self::new_inner(
+            settings,
+            Some(ResumeReader::Session(session)),
+            AdjustmentSettingsSource::Live,
+        )
     }
 
     #[cfg(test)]
@@ -110,10 +229,21 @@ impl ContainerEngine {
         settings: crate::settings::Settings,
         error: super::session::UiReadError,
     ) -> Self {
-        Self::new_inner(settings, Some(ResumeReader::Error(error)))
+        let adjustment_settings = AdjustmentSettingsSource::Snapshot(
+            crate::settings_db::AdjustmentRenderSettings::from_settings(&settings),
+        );
+        Self::new_inner(
+            settings,
+            Some(ResumeReader::Error(error)),
+            adjustment_settings,
+        )
     }
 
-    fn new_inner(settings: crate::settings::Settings, resume_reader: Option<ResumeReader>) -> Self {
+    fn new_inner(
+        settings: crate::settings::Settings,
+        resume_reader: Option<ResumeReader>,
+        adjustment_settings: AdjustmentSettingsSource,
+    ) -> Self {
         let spread_db_path = crate::data_dir::get().join("spread.db");
         let spread_db =
             match crate::spread_db::SpreadDb::open_existing_read_only_at(&spread_db_path) {
@@ -132,6 +262,156 @@ impl ContainerEngine {
             pdf_page_counts: Mutex::new(HashMap::new()),
             spread_db: Mutex::new(spread_db),
             resume_reader,
+            adjustment_settings,
+            creative_lut_cache: Mutex::new(RemoteCreativeLutCache::default()),
+            page_composite_cache: Mutex::new(RemoteCompositeCache::default()),
+            page_prefetch_cancel: Mutex::new(None),
+        }
+    }
+    fn adjustment_render_settings(
+        &self,
+    ) -> Result<crate::settings_db::AdjustmentRenderSettings, MediaError> {
+        match &self.adjustment_settings {
+            AdjustmentSettingsSource::Live => {
+                crate::settings_db::with_db_result(|db| db.load_adjustment_render_settings())
+                    .map_err(|error| {
+                        crate::logger::log(format!(
+                            "remote_ipc: live adjustment settings read failed: {error}"
+                        ));
+                        media_error(
+                            MediaErrorCode::Internal,
+                            "最新の補正設定を読み込めませんでした",
+                        )
+                    })
+            }
+            #[cfg(test)]
+            AdjustmentSettingsSource::Snapshot(settings) => Ok(settings.clone()),
+        }
+    }
+
+    fn prepare_remote_composite(
+        &self,
+        address: &RemoteAddress,
+        logical_path: &Path,
+        mtime: i64,
+        file_size: i64,
+        target_px: u32,
+        context: &WorkerContext,
+    ) -> Result<Option<RemotePreparedComposite>, MediaError> {
+        let Some(identity) = remote_adjustment_identity(address, logical_path) else {
+            return Ok(None);
+        };
+        let settings = self.adjustment_render_settings()?;
+        // `WorkerContext` は worker 起動時に 1 度だけ DB を開く。その 1 回が失敗した状態を
+        // そのまま合成失敗にすると、一過性の失敗でも **その worker を通る全ページ**が
+        // 以後ずっと失敗する。開けない事実は隠さず、握り直しだけ試みる。
+        let reopened;
+        let adjustment_db = match context.adjustment_db.as_ref() {
+            Some(db) => db,
+            None => {
+                reopened = crate::adjustment_db::AdjustmentDb::open().map_err(|error| {
+                    crate::logger::log(format!(
+                        "remote_ipc: adjustment db reopen failed for page composition: {error}"
+                    ));
+                    media_error(
+                        MediaErrorCode::Internal,
+                        "補正データベースを開けないためページを合成できません",
+                    )
+                })?;
+                &reopened
+            }
+        };
+        let page = adjustment_db
+            .get_page_params_checked(&identity.page_key)
+            .map_err(|error| remote_adjustment_read_error("page", error))?;
+        let favorite_params = if page.is_none() {
+            adjustment_db
+                .load_all_favorite_params_checked()
+                .map_err(|error| remote_adjustment_read_error("location", error))?
+        } else {
+            HashMap::new()
+        };
+        let params = resolve_remote_effective_params(
+            &identity,
+            page.as_ref(),
+            &settings.favorites,
+            &favorite_params,
+            &settings.global_preset,
+        );
+        let lut_entry = params.creative_lut.id.and_then(|id| {
+            settings
+                .creative_luts
+                .iter()
+                .find(|entry| entry.id == id)
+                .cloned()
+        });
+        let key = RemoteCompositeCacheKey {
+            page_key: identity.page_key,
+            mtime,
+            file_size,
+            target_px,
+            params: params.clone(),
+            lut_entry: lut_entry.clone(),
+        };
+        Ok(Some(RemotePreparedComposite {
+            key,
+            params,
+            lut_entry,
+        }))
+    }
+
+    fn resolve_remote_lut(
+        &self,
+        entry: Option<&crate::creative_lut::CreativeLutEntry>,
+    ) -> Result<Option<crate::creative_lut::SharedCreativeLut>, MediaError> {
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        self.creative_lut_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .resolve(entry)
+            .map(Some)
+            .map_err(|error| {
+                crate::logger::log(format!(
+                    "remote_ipc: Creative LUT load failed id={}: {error}",
+                    entry.id
+                ));
+                media_error(
+                    MediaErrorCode::RenderFailed,
+                    "Creative LUT を読み込めないためページを合成できません",
+                )
+            })
+    }
+
+    fn begin_page_render(&self, priority: PagePriority) -> Arc<AtomicBool> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut prefetch = self
+            .page_prefetch_cancel
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(previous) = prefetch.take() {
+            previous.store(true, Ordering::Relaxed);
+        }
+        if priority == PagePriority::Prefetch {
+            *prefetch = Some(Arc::clone(&cancel));
+        }
+        cancel
+    }
+
+    fn finish_page_render(&self, priority: PagePriority, cancel: &Arc<AtomicBool>) {
+        if priority != PagePriority::Prefetch {
+            return;
+        }
+        let mut prefetch = self
+            .page_prefetch_cancel
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if prefetch
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, cancel))
+        {
+            *prefetch = None;
         }
     }
 
@@ -692,6 +972,7 @@ impl ContainerEngine {
             false,
             false,
             context,
+            None,
         ) {
             Ok(loaded) => crate::catalog::encode_thumb_webp(
                 &loaded.image,
@@ -732,6 +1013,7 @@ impl ContainerEngine {
             Ok(resolved) => resolved,
             Err(error) => return PageResponse::Error(error),
         };
+        let cancel = self.begin_page_render(priority);
         let response = match self.load_image(
             &request.address,
             &resolved,
@@ -739,6 +1021,7 @@ impl ContainerEngine {
             true,
             priority == PagePriority::Foreground,
             context,
+            Some(&cancel),
         ) {
             Ok(loaded) => match crate::catalog::encode_thumb_webp(
                 &loaded.image,
@@ -762,6 +1045,7 @@ impl ContainerEngine {
             PageResponse::Success(payload) => ("ok", payload.bytes.len()),
             PageResponse::Error(_) => ("error", 0),
         };
+        self.finish_page_render(priority, &cancel);
         crate::logger::log(format!(
             "remote_ipc: media_operation operation=page source_kind={source_kind} priority={} outcome={outcome} duration_ms={:.1} output_bytes={output_bytes}",
             if priority == PagePriority::Prefetch {
@@ -1228,6 +1512,7 @@ impl ContainerEngine {
         full_page: bool,
         foreground: bool,
         context: &WorkerContext,
+        external_cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<LoadedImage, MediaError> {
         if target_px == 0 || target_px > MAX_PAGE_RENDER_PX {
             return Err(media_error(
@@ -1313,6 +1598,38 @@ impl ContainerEngine {
             }
         };
 
+        let prepared_composite = if full_page {
+            self.prepare_remote_composite(
+                address,
+                &resolved.logical,
+                mtime,
+                file_size,
+                target_px,
+                context,
+            )?
+        } else {
+            None
+        };
+        if let Some(prepared) = prepared_composite.as_ref()
+            && let Some(pixels) = self
+                .page_composite_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&prepared.key)
+        {
+            if external_cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                return Err(media_error(
+                    MediaErrorCode::Busy,
+                    "先読みは新しいページ要求に置き換えられました",
+                ));
+            }
+            crate::logger::log(format!(
+                "remote_ipc: final_composite cache=hit key={}",
+                prepared.key.page_key
+            ));
+            return loaded_image_from_color_image(&pixels);
+        }
+
         let catalog = Arc::new(
             crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), catalog_folder)
                 .map_err(|error| {
@@ -1336,7 +1653,9 @@ impl ContainerEngine {
 
         let (tx, rx) = mpsc::channel();
         let done = Arc::new(AtomicUsize::new(0));
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = external_cancel
+            .cloned()
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let keep_start = Arc::new(AtomicUsize::new(0));
         let keep_end = Arc::new(AtomicUsize::new(usize::MAX));
         crate::thumb_loader::process_load_request(
@@ -1358,12 +1677,21 @@ impl ContainerEngine {
             context.adjustment_db.as_ref(),
         );
         drop(tx);
+        let mut saw_canceled = false;
         let color_image = rx
             .into_iter()
-            .find_map(|message| (!message.finalized && !message.canceled).then_some(message.image))
+            .find_map(|message| {
+                saw_canceled |= message.canceled;
+                (!message.finalized && !message.canceled).then_some(message.image)
+            })
             .flatten()
             .ok_or_else(|| {
-                if matches!(address.subresource, RemoteSubresource::ZipDirectory { .. }) {
+                if saw_canceled || cancel.load(Ordering::Relaxed) {
+                    media_error(
+                        MediaErrorCode::Busy,
+                        "先読みは新しいページ要求に置き換えられました",
+                    )
+                } else if matches!(address.subresource, RemoteSubresource::ZipDirectory { .. }) {
                     media_error(
                         MediaErrorCode::NotFound,
                         "ZIP 内に代表サムネイルが見つかりません",
@@ -1375,20 +1703,20 @@ impl ContainerEngine {
                     )
                 }
             })?;
-        let width = u32::try_from(color_image.size[0])
-            .map_err(|_| media_error(MediaErrorCode::RenderFailed, "画像寸法が範囲外です"))?;
-        let height = u32::try_from(color_image.size[1])
-            .map_err(|_| media_error(MediaErrorCode::RenderFailed, "画像寸法が範囲外です"))?;
-        let rgba = crate::capture::color_image_to_rgba(&color_image);
-        let image = image::RgbaImage::from_raw(width, height, rgba)
-            .map(image::DynamicImage::ImageRgba8)
-            .ok_or_else(|| {
-                media_error(
-                    MediaErrorCode::RenderFailed,
-                    "レンダリング結果を画像へ変換できませんでした",
-                )
-            })?;
-        Ok(LoadedImage { image })
+        let mut pixels = Arc::new(color_image);
+        if let Some(prepared) = prepared_composite {
+            let lut = self.resolve_remote_lut(prepared.lut_entry.as_ref())?;
+            pixels = execute_remote_composite(pixels, &prepared.params, lut, &cancel)?;
+            self.page_composite_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(prepared.key.clone(), Arc::clone(&pixels));
+            crate::logger::log(format!(
+                "remote_ipc: final_composite cache=miss key={}",
+                prepared.key.page_key
+            ));
+        }
+        loaded_image_from_color_image(&pixels)
     }
 
     fn ensure_pdf_page_in_range(
@@ -1492,6 +1820,139 @@ impl ContainerEngine {
         };
         Ok(count)
     }
+}
+
+fn remote_adjustment_identity(
+    address: &RemoteAddress,
+    logical_path: &Path,
+) -> Option<RemoteAdjustmentIdentity> {
+    match &address.subresource {
+        RemoteSubresource::File => {
+            let location_path = if is_zip_path(logical_path) || is_pdf_path(logical_path) {
+                logical_path.to_path_buf()
+            } else {
+                logical_path.parent()?.to_path_buf()
+            };
+            Some(RemoteAdjustmentIdentity {
+                page_key: crate::adjustment_db::normalize_path(logical_path),
+                location_path,
+            })
+        }
+        RemoteSubresource::ZipEntry { entry_name } => Some(RemoteAdjustmentIdentity {
+            page_key: crate::adjustment_db::zip_entry_key(logical_path, entry_name),
+            location_path: logical_path.to_path_buf(),
+        }),
+        RemoteSubresource::PdfPage { page_number } => Some(RemoteAdjustmentIdentity {
+            page_key: crate::adjustment_db::zip_entry_key(
+                logical_path,
+                &format!("page_{page_number}"),
+            ),
+            location_path: logical_path.to_path_buf(),
+        }),
+        RemoteSubresource::ZipDirectory { .. } => None,
+    }
+}
+
+fn resolve_remote_effective_params(
+    identity: &RemoteAdjustmentIdentity,
+    page: Option<&crate::adjustment::AdjustParams>,
+    favorites: &[crate::settings::FavoriteEntry],
+    favorite_params: &HashMap<uuid::Uuid, crate::adjustment::AdjustParams>,
+    global: &crate::adjustment::AdjustParams,
+) -> crate::adjustment::AdjustParams {
+    crate::final_composite::resolve_effective_params(
+        page,
+        || {
+            crate::final_composite::active_favorite_default_id_for_path(
+                &identity.location_path,
+                favorites,
+                None,
+                |id| favorite_params.contains_key(&id),
+            )
+            .and_then(|id| favorite_params.get(&id))
+        },
+        global,
+    )
+    .clone()
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_remote_effective_params_for_test(
+    logical_path: &Path,
+    subresource: &RemoteSubresource,
+    page: Option<&crate::adjustment::AdjustParams>,
+    favorites: &[crate::settings::FavoriteEntry],
+    favorite_params: &HashMap<uuid::Uuid, crate::adjustment::AdjustParams>,
+    global: &crate::adjustment::AdjustParams,
+) -> crate::adjustment::AdjustParams {
+    let address = RemoteAddress {
+        favorite_id: String::new(),
+        relative_path: String::new(),
+        subresource: subresource.clone(),
+    };
+    let identity = remote_adjustment_identity(&address, logical_path)
+        .expect("test subresource must identify a page");
+    resolve_remote_effective_params(&identity, page, favorites, favorite_params, global)
+}
+
+fn execute_remote_composite(
+    source: Arc<egui::ColorImage>,
+    params: &crate::adjustment::AdjustParams,
+    lut: Option<crate::creative_lut::SharedCreativeLut>,
+    cancel: &AtomicBool,
+) -> Result<Arc<egui::ColorImage>, MediaError> {
+    let creative_lut = lut.map(|lut| (lut, params.creative_lut.strength));
+    let plan = crate::final_composite::build_final_composite_plan_without_ai(params, creative_lut);
+    match crate::final_composite::execute_final_composite(source, plan, cancel) {
+        crate::final_composite::FinalCompositeResult::Ready {
+            pixels,
+            elapsed_ms,
+            timing,
+        } => {
+            crate::logger::log(format!(
+                "remote_ipc: final_composite elapsed_ms={elapsed_ms:.1} adjust_ms={:.1} sharpen_ms={:.1} colorize_check_ms={:.1} colorize_apply_ms={:.1} colorize_applied={} creative_lut_ms={:.1} post_filter_ms={:.1}",
+                timing.adjust_ms,
+                timing.sharpen_ms,
+                timing.colorize_check_ms,
+                timing.colorize_apply_ms,
+                timing.colorize_applied,
+                timing.creative_lut_ms,
+                timing.post_filter_ms,
+            ));
+            Ok(pixels)
+        }
+        crate::final_composite::FinalCompositeResult::Cancelled => Err(media_error(
+            MediaErrorCode::Busy,
+            "先読みは新しいページ要求に置き換えられました",
+        )),
+    }
+}
+
+fn loaded_image_from_color_image(pixels: &egui::ColorImage) -> Result<LoadedImage, MediaError> {
+    let width = u32::try_from(pixels.size[0])
+        .map_err(|_| media_error(MediaErrorCode::RenderFailed, "画像の幅が範囲外です"))?;
+    let height = u32::try_from(pixels.size[1])
+        .map_err(|_| media_error(MediaErrorCode::RenderFailed, "画像の高さが範囲外です"))?;
+    let rgba = crate::capture::color_image_to_rgba(pixels);
+    let image = image::RgbaImage::from_raw(width, height, rgba)
+        .map(image::DynamicImage::ImageRgba8)
+        .ok_or_else(|| {
+            media_error(
+                MediaErrorCode::RenderFailed,
+                "ページ画像を WebP エンコード用の形式へ変換できませんでした",
+            )
+        })?;
+    Ok(LoadedImage { image })
+}
+
+fn remote_adjustment_read_error(scope: &str, error: String) -> MediaError {
+    crate::logger::log(format!(
+        "remote_ipc: live adjustment DB read failed scope={scope}: {error}"
+    ));
+    media_error(
+        MediaErrorCode::Internal,
+        format!("最新の補正データを読み込めませんでした ({scope})"),
+    )
 }
 
 fn validated_context(
@@ -1833,6 +2294,88 @@ mod tests {
     use super::*;
     use crate::settings::FavoriteEntry;
 
+    #[test]
+    fn remote_default_adjustment_preserves_pixels() {
+        let source = Arc::new(egui::ColorImage::new(
+            [3, 2],
+            vec![
+                egui::Color32::from_rgba_unmultiplied(1, 2, 3, 255),
+                egui::Color32::from_rgba_unmultiplied(40, 50, 60, 200),
+                egui::Color32::from_rgba_unmultiplied(70, 80, 90, 128),
+                egui::Color32::from_rgba_unmultiplied(100, 110, 120, 255),
+                egui::Color32::from_rgba_unmultiplied(130, 140, 150, 64),
+                egui::Color32::from_rgba_unmultiplied(200, 210, 220, 255),
+            ],
+        ));
+        let result = execute_remote_composite(
+            Arc::clone(&source),
+            &crate::adjustment::AdjustParams::default(),
+            None,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(Arc::ptr_eq(&result, &source));
+        assert_eq!(result.pixels, source.pixels);
+    }
+
+    #[test]
+    fn foreground_page_cancels_only_the_active_remote_prefetch() {
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let prefetch = engine.begin_page_render(PagePriority::Prefetch);
+        let foreground = engine.begin_page_render(PagePriority::Foreground);
+
+        assert!(prefetch.load(Ordering::Relaxed));
+        assert!(!foreground.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn remote_composite_cache_key_includes_effective_params() {
+        let mut cache = RemoteCompositeCache::default();
+        let pixels = Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]));
+        let mut key = RemoteCompositeCacheKey {
+            page_key: "page".to_owned(),
+            mtime: 1,
+            file_size: 2,
+            target_px: 1024,
+            params: crate::adjustment::AdjustParams::default(),
+            lut_entry: None,
+        };
+        cache.insert(key.clone(), pixels);
+        key.params.brightness = 10.0;
+        assert!(cache.get(&key).is_none());
+    }
+
+    #[test]
+    fn remote_virtual_page_identity_uses_the_app_adjustment_keys_and_container_location() {
+        let container = PathBuf::from("C:/books/nested/book.zip");
+        let zip_address = RemoteAddress {
+            favorite_id: "favorite".to_owned(),
+            relative_path: "book.zip".to_owned(),
+            subresource: RemoteSubresource::ZipEntry {
+                entry_name: "Chapter/001.JPG".to_owned(),
+            },
+        };
+        let zip = remote_adjustment_identity(&zip_address, &container).unwrap();
+        assert_eq!(
+            zip.page_key,
+            crate::adjustment_db::zip_entry_key(&container, "Chapter/001.JPG")
+        );
+        assert_eq!(zip.location_path, container);
+
+        let pdf_path = PathBuf::from("C:/books/nested/book.pdf");
+        let pdf_address = RemoteAddress {
+            favorite_id: "favorite".to_owned(),
+            relative_path: "book.pdf".to_owned(),
+            subresource: RemoteSubresource::PdfPage { page_number: 7 },
+        };
+        let pdf = remote_adjustment_identity(&pdf_address, &pdf_path).unwrap();
+        assert_eq!(
+            pdf.page_key,
+            crate::adjustment_db::zip_entry_key(&pdf_path, "page_7")
+        );
+        assert_eq!(pdf.location_path, pdf_path);
+    }
     #[test]
     fn resume_page_resolution_rejects_positions_outside_the_current_pages() {
         let container = RemoteAddress::file("favorite", "book.pdf");
