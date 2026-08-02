@@ -261,6 +261,11 @@ impl App {
                 // タイトルバー以外の本文は単一の ScrollArea にまとめる。一覧や
                 // インデクサへ別の縦スクロールを持たせると、下部操作へ到達しづらく
                 // wheel の所有先も分かりにくくなるため、本文全体で 1 本だけにする。
+                //
+                // 本文は右端まで使う表 (操作列の「削除」ボタンが右端に来る) なので、
+                // floating bar の予約幅を確保しないとバーが最右列へ重なる。共通 style は
+                // 一覧の表示面積を優先して予約幅 0 なので、このダイアログで局所適用する。
+                ui.spacing_mut().scroll = super::non_overlapping_dialog_scroll_style(ui.spacing().scroll);
                 let body_height = ui.available_height().max(1.0);
                 egui::ScrollArea::vertical()
                     .id_salt("favorites_editor_body_scroll")
