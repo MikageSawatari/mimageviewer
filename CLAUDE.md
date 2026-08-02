@@ -1574,11 +1574,17 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    ```powershell
    .\scripts\check-idle-health.ps1 -Scenario static-foreground
    .\scripts\check-idle-health.ps1 -NoLaunch -Scenario static-background
-   .\scripts\check-idle-health.ps1 -NoLaunch -Scenario video-pin-background
+   .\scripts\check-idle-health.ps1 -NoLaunch -Scenario video-pin-background -TargetKey '<動画を代表画像に固定したフォルダのパス>'
    ```
    - 最初のコマンドが `mimageviewer-core.exe --perf-log` を起動する。各シナリオを準備して
      Enter を押す。前面シナリオは warmup 5 秒中にアプリへフォーカスを戻し、測定 15 秒の
      開始表示後は入力しない。背面シナリオは別ウィンドウを前面に保つ。
+   - **3 番目は `-TargetKey` が必須** (無いと引数エラーで即停止する)。値は perf log の
+     thumbnail key (フォルダタイルは `dir::<path>` 形式) への大文字小文字無視の部分一致。
+     **ピン作成直後は成立しない** — 作りたてのサムネイルは `from_cache=false` でアイドル
+     高画質化の候補にならないため、アプリ再起動後などキャッシュから読み直される状態で測る。
+     該当フォルダを用意できない版では、このシナリオを飛ばした旨と理由をリリース記録に残す
+     (アイドル高画質化パスに触れていない版なら妥当な waiver)。
    - CPU one-core ratio、update rate、repaint reason streak、同一 thumbnail work、通常 / perf
      ログ増加量のどれかが上限を超えたら exit 1。失敗を閾値緩和だけで通さず、
      `target/idle-health/*-perf.json` の原因と反復 key を確認する。
