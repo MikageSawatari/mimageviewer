@@ -31,6 +31,7 @@ import {
   togglePageOriginalFitMode,
   viewerTapCommand,
   viewerTapSequenceTransition,
+  viewerTapZone,
   nextFitMode,
   pagePrefetchPlan,
   planSpreadIntent,
@@ -500,25 +501,29 @@ test("double-tap fit toggles screen fit and original size", () => {
   assert.equal(togglePageOriginalFitMode(FitMode.WIDTH), FitMode.ORIGINAL);
 });
 
-test("touch double-tap recognition never delays the first single tap", () => {
+test("only center touches enter the double-tap window", () => {
   const first = viewerTapSequenceTransition(null, {
     x: 120,
     y: 240,
     atMs: 1_000,
+    width: 300,
     inputSource: "touch",
   });
-  assert.equal(first.action, "single_tap");
+  assert.equal(first.action, "pending_center_tap");
   assert.deepEqual(first.next, {
     x: 120,
     y: 240,
     atMs: 1_000,
     inputSource: "touch",
+    zone: "center",
   });
+  assert.equal(first.commitPrevious, false);
 
   const second = viewerTapSequenceTransition(first.next, {
     x: 126,
     y: 246,
     atMs: 1_240,
+    width: 300,
     inputSource: "touch",
   });
   assert.equal(second.action, "double_tap");
@@ -528,18 +533,43 @@ test("touch double-tap recognition never delays the first single tap", () => {
     x: 120,
     y: 240,
     atMs: 1_500,
+    width: 300,
     inputSource: "touch",
   });
-  assert.equal(late.action, "single_tap");
+  assert.equal(late.action, "pending_center_tap");
+  assert.equal(late.commitPrevious, true);
   assert.notEqual(late.next, null);
 
   const mouse = viewerTapSequenceTransition(null, {
     x: 120,
     y: 240,
     atMs: 2_000,
+    width: 300,
     inputSource: "mouse",
   });
-  assert.deepEqual(mouse, { action: "single_tap", next: null });
+  assert.deepEqual(mouse, { action: "single_tap", next: null, commitPrevious: false });
+});
+
+test("edge taps stay immediate and never become a double-tap", () => {
+  const left = viewerTapSequenceTransition(null, {
+    x: 10,
+    y: 240,
+    atMs: 1_000,
+    width: 300,
+    inputSource: "touch",
+  });
+  const secondLeft = viewerTapSequenceTransition(left.next, {
+    x: 12,
+    y: 242,
+    atMs: 1_100,
+    width: 300,
+    inputSource: "touch",
+  });
+  assert.deepEqual(left, { action: "edge_tap", next: null, commitPrevious: false });
+  assert.deepEqual(secondLeft, { action: "edge_tap", next: null, commitPrevious: false });
+  assert.equal(viewerTapZone(10, 300), "left");
+  assert.equal(viewerTapZone(150, 300), "center");
+  assert.equal(viewerTapZone(290, 300), "right");
 });
 
 test("spread layout fits the combined pages and preserves the configured gap", () => {

@@ -4601,6 +4601,7 @@ export class ImageViewer {
     this.objectUrls = [];
     this.loadingTimer = 0;
     this.boundaryMessageTimer = 0;
+    this.centerTapTimer = 0;
 
     this.pointerDown = (event) => this.onPointerDown(event);
     this.pointerMove = (event) => this.onPointerMove(event);
@@ -5040,6 +5041,35 @@ export class ImageViewer {
     this.pageLayer.style.transform = `translate3d(${this.panX}px, ${this.panY}px, 0) scale(${this.scale})`;
   }
 
+  cancelPendingCenterTap() {
+    clearTimeout(this.centerTapTimer);
+    this.centerTapTimer = 0;
+    state.viewerTapSequence = null;
+  }
+
+  commitPendingCenterTap() {
+    const pending = state.viewerTapSequence;
+    if (!pending || pending.zone !== "center") return;
+    this.cancelPendingCenterTap();
+    dispatchCommand(command(CommandName.TOGGLE_VIEWER_BARS), {
+      source: pending.inputSource,
+      detail: "tap_center",
+    });
+  }
+
+  schedulePendingCenterTap(pending) {
+    clearTimeout(this.centerTapTimer);
+    this.centerTapTimer = setTimeout(() => {
+      this.centerTapTimer = 0;
+      if (state.viewerTapSequence !== pending) return;
+      state.viewerTapSequence = null;
+      dispatchCommand(command(CommandName.TOGGLE_VIEWER_BARS), {
+        source: pending.inputSource,
+        detail: "tap_center",
+      });
+    }, 320);
+  }
+
   onPointerDown(event) {
     if (["mouse", "pen"].includes(event.pointerType) && event.button !== 0) return;
     this.stage.setPointerCapture?.(event.pointerId);
@@ -5195,20 +5225,27 @@ export class ImageViewer {
           detail: "swipe_down",
         });
       } else if (gesture === ViewerGesture.TAP) {
+        const tapAt = performance.now();
         const transition = viewerTapSequenceTransition(state.viewerTapSequence, {
           x: event.clientX,
           y: event.clientY,
-          atMs: performance.now(),
+          atMs: tapAt,
+          width: this.root.clientWidth,
           inputSource: source,
         });
+        if (transition.commitPrevious) this.commitPendingCenterTap();
         state.viewerTapSequence = transition.next;
         if (transition.action === "double_tap") {
+          this.cancelPendingCenterTap();
           dispatchCommand(command(CommandName.FIT_TOGGLE_PAGE_ORIGINAL), {
             source,
             detail: "double_tap_fit",
           });
+        } else if (transition.action === "pending_center_tap") {
+          this.schedulePendingCenterTap(transition.next);
         } else {
-          // Optimistic single tap: page/bar actions run now, with no double-tap timeout.
+          // Edge taps and non-touch taps are immediate. Only a touch in the center waits so the
+          // same two taps cannot also toggle the bars before changing magnification.
           dispatchCommand(viewerTapCommand(
             event.clientX,
             this.root.clientWidth,
@@ -5224,9 +5261,9 @@ export class ImageViewer {
           detail: "pan",
         });
       }
-      if (gesture !== ViewerGesture.TAP) state.viewerTapSequence = null;
+      if (gesture !== ViewerGesture.TAP) this.commitPendingCenterTap();
     } else if (!cancelled && this.pinched) {
-      state.viewerTapSequence = null;
+      this.commitPendingCenterTap();
       dispatchCommand(
         command(CommandName.SET_TRANSFORM, {
           scale: this.scale,
@@ -5282,6 +5319,8 @@ export class ImageViewer {
     clearTimeout(this.resizeTimer);
     clearTimeout(this.loadingTimer);
     clearTimeout(this.boundaryMessageTimer);
+    clearTimeout(this.centerTapTimer);
+    this.centerTapTimer = 0;
     this.loadingIndicator.hidden = true;
     this.boundaryMessage.hidden = true;
     this.loadSequence += 1;

@@ -190,21 +190,33 @@ export function togglePageOriginalFitMode(mode) {
   return mode === FitMode.ORIGINAL ? FitMode.PAGE : FitMode.ORIGINAL;
 }
 
-/// Recognize only the second touch as the double-tap action. The first tap is explicitly
-/// returned as `single_tap` immediately; callers do not start a timer or defer page navigation.
+export function viewerTapZone(clientX, width) {
+  const ratio = Math.max(0, Math.min(1, Number(clientX) / Math.max(1, Number(width) || 1)));
+  if (ratio < 0.34) return "left";
+  if (ratio > 0.66) return "right";
+  return "center";
+}
+
+/// Only center touches participate in double-tap recognition. Edge taps are returned immediately
+/// and clear any center candidate, so page navigation never waits for the double-tap window.
 export function viewerTapSequenceTransition(
   previous,
-  { x, y, atMs, inputSource = "touch" },
+  { x, y, atMs, width, inputSource = "touch" },
   { maxDelayMs = 320, maxDistancePx = 36 } = {}
 ) {
+  const zone = viewerTapZone(x, width);
   const current = {
     x: Number(x) || 0,
     y: Number(y) || 0,
     atMs: Number(atMs) || 0,
     inputSource,
+    zone,
   };
   if (inputSource !== "touch") {
-    return { action: "single_tap", next: null };
+    return { action: "single_tap", next: null, commitPrevious: Boolean(previous) };
+  }
+  if (zone !== "center") {
+    return { action: "edge_tap", next: null, commitPrevious: Boolean(previous) };
   }
   const elapsed = current.atMs - Number(previous?.atMs);
   const distance = Math.hypot(
@@ -213,13 +225,18 @@ export function viewerTapSequenceTransition(
   );
   if (
     previous?.inputSource === "touch" &&
+    previous?.zone === "center" &&
     elapsed >= 0 &&
     elapsed <= maxDelayMs &&
     distance <= maxDistancePx
   ) {
-    return { action: "double_tap", next: null };
+    return { action: "double_tap", next: null, commitPrevious: false };
   }
-  return { action: "single_tap", next: current };
+  return {
+    action: "pending_center_tap",
+    next: current,
+    commitPrevious: Boolean(previous),
+  };
 }
 
 export function nextSpreadMode(mode) {
@@ -403,9 +420,9 @@ export function viewerBoundaryMessage({
 }
 
 export function viewerTapCommand(clientX, width, rtl = false) {
-  const ratio = Math.max(0, Math.min(1, clientX / Math.max(1, width)));
-  if (ratio < 0.34) return command(rtl ? CommandName.NEXT_PAGE : CommandName.PREV_PAGE);
-  if (ratio > 0.66) return command(rtl ? CommandName.PREV_PAGE : CommandName.NEXT_PAGE);
+  const zone = viewerTapZone(clientX, width);
+  if (zone === "left") return command(rtl ? CommandName.NEXT_PAGE : CommandName.PREV_PAGE);
+  if (zone === "right") return command(rtl ? CommandName.PREV_PAGE : CommandName.NEXT_PAGE);
   return command(CommandName.TOGGLE_VIEWER_BARS);
 }
 
