@@ -423,6 +423,28 @@ export function videoStartupDecision({
   };
 }
 
+/// 走っている版と配信されている版が違うかを判定する。
+///
+/// 画面遷移がハッシュ変更なので、開きっぱなしのタブは自分の script を二度と取りに行かない。
+/// 中からは見分けが付かず、実際に「修正が入っていないコードで確認していた」往復が 1 度起きた。
+///
+/// 勝手に再読み込みはしない。動画の途中や読書の途中で画面が飛ぶ方が害が大きいので、
+/// 知らせるところまでを担当し、踏むかどうかは利用者が決める。一度知らせた token は
+/// 覚えておき、同じ更新で何度も出さない。
+export function appUpdateNotice({
+  runningToken,
+  servedToken,
+  dismissedToken = null,
+}) {
+  const running = String(runningToken ?? "");
+  const served = String(servedToken ?? "");
+  if (!running || !served || running === served) return { kind: "current" };
+  if (dismissedToken != null && String(dismissedToken) === served) {
+    return { kind: "dismissed" };
+  }
+  return { kind: "update_available", servedToken: served };
+}
+
 export function videoQualityPreset(quality) {
   return VIDEO_QUALITY_PRESETS.find((preset) => preset.id === quality) ??
     VIDEO_QUALITY_PRESETS.find((preset) => preset.id === "standard");

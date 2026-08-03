@@ -1390,3 +1390,41 @@ button:not(.grid-tile):focus-visible {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* 更新の告知。動画や読書の邪魔をしないよう下端に控えめに出し、再読み込みは利用者が押す。 */
+.app-update-banner {
+  position: fixed;
+  left: 50%;
+  bottom: max(16px, env(safe-area-inset-bottom, 0px));
+  transform: translateX(-50%);
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: calc(100vw - 32px);
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: rgba(24, 24, 27, 0.94);
+  color: #f4f4f5;
+  font-size: 14px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+}
+
+.app-update-banner button {
+  flex: none;
+  padding: 6px 12px;
+  border: 0;
+  border-radius: 8px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.app-update-banner-reload {
+  background: #2563eb;
+  color: #fff;
+}
+
+.app-update-banner-dismiss {
+  background: transparent;
+  color: #a1a1aa;
+}

@@ -504,6 +504,7 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             HttpResponse::text(405, "Method Not Allowed").with_header("Cache-Control", "no-store")
         }
         _ if auth == AuthDecision::Unauthorized => unauthorized(),
+        (Method::Get, "/api/app-version") => api_app_version(state),
         (Method::Post, "/api/video/start") => api_video_start(request, state, &remote_client_id),
         (Method::Post, "/api/video/control") => {
             api_video_control(request, state, &remote_client_id)
@@ -1248,6 +1249,52 @@ fn session_failure_response(failure: crate::ipc_client::ClientFailure) -> HttpRe
 fn unauthorized() -> HttpResponse {
     HttpResponse::text(401, "Unauthorized")
         .with_header("WWW-Authenticate", "Bearer")
+        .with_header("Cache-Control", "no-store")
+}
+
+/// Identify the web assets currently on disk.
+///
+/// The app is a single page whose screens are hash changes, so a tab that is already open never
+/// re-fetches its own scripts. It keeps running the build it was loaded with until someone
+/// reloads, which is invisible from the inside and has already cost one round of testing a fix
+/// that was not in the running code. Assets are read per request and served `no-cache`, so the
+/// only missing piece is telling the page that what it is running is no longer what is served.
+///
+/// Size and mtime are enough to notice a deploy and cost one `metadata` call per file; hashing
+/// the bytes would be exact but this is polled, and a rewrite that preserves both is not a case
+/// worth paying for on every poll.
+fn web_asset_token(web_root: &std::path::Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let Ok(entries) = fs::read_dir(web_root) else {
+        return String::new();
+    };
+    let mut files: Vec<(String, u64, i64)> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |delta| delta.as_millis() as i64);
+            Some((
+                entry.file_name().to_string_lossy().into_owned(),
+                metadata.len(),
+                modified,
+            ))
+        })
+        .collect();
+    // read_dir order is not defined, so fix it before hashing.
+    files.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    files.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn api_app_version(state: &AppState) -> HttpResponse {
+    HttpResponse::json(&json!({ "asset_token": web_asset_token(&state.web_root) }))
+        .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
         .with_header("Cache-Control", "no-store")
 }
 
@@ -3070,6 +3117,36 @@ mod tests {
         let response = route(&mut request, &state);
         assert_eq!(response.status, 401);
         assert_eq!(response.body, b"Unauthorized");
+    }
+
+    #[test]
+    fn the_asset_token_changes_when_an_asset_changes_and_needs_authentication() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        std::fs::write(state.web_root.join("app.js"), b"const build = 1;").unwrap();
+        let before = web_asset_token(&state.web_root);
+        assert!(!before.is_empty());
+        assert_eq!(
+            before,
+            web_asset_token(&state.web_root),
+            "an unchanged tree keeps its token, so polling does not cry wolf"
+        );
+
+        std::fs::write(state.web_root.join("app.js"), b"const build = 2222;").unwrap();
+        assert_ne!(before, web_asset_token(&state.web_root));
+
+        std::fs::write(state.web_root.join("later.mjs"), b"export {};").unwrap();
+        assert_ne!(
+            web_asset_token(&state.web_root),
+            before,
+            "a new asset counts as a deploy too"
+        );
+
+        let mut request: Request = TestRequest::new()
+            .with_method(Method::Get)
+            .with_path("/api/app-version")
+            .into();
+        assert_eq!(route(&mut request, &state).status, 401);
     }
 
     #[test]

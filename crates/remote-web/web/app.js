@@ -22,6 +22,7 @@ import {
   planSpreadIntent,
   reduceViewerTransform,
   readingProgressBatchTransition,
+  appUpdateNotice,
   resolveGridReturnViewport,
   sessionOwnerBadge,
   snappedGridOffset,
@@ -335,6 +336,9 @@ const state = {
   viewerItemState: null,
   viewerItemStateSequence: 0,
   gridViewerReturn: null,
+  appAssetToken: "",
+  appUpdateDismissedToken: null,
+  appUpdateBanner: null,
 };
 
 let recentPointerSource = { source: "mouse", at: 0 };
@@ -400,6 +404,7 @@ async function enterAuthenticatedApp() {
   renderLoading("リモートセッションを取得しています");
   await acquireRemoteSession("authenticated");
   startSessionPing();
+  startAppUpdateWatch().catch(() => {});
   renderLoading("お気に入りを読み込んでいます");
   const data = await apiJson("/api/favorites");
   state.favorites = data.favorites ?? [];
@@ -455,6 +460,66 @@ async function acquireRemoteSession(reason = "operation") {
     }
   })();
   return state.remoteSessionAcquirePromise;
+}
+
+const APP_UPDATE_POLL_INTERVAL_MS = 5 * 60 * 1000;
+
+/// 走っている版と配信されている版を突き合わせる。
+///
+/// 画面遷移がハッシュ変更なので、開きっぱなしのタブは自分の script を二度と取りに行かない。
+/// 見ている物が古いことは中からは分からないので、こちらから知らせる。
+async function readServedAssetToken() {
+  const data = await apiJson("/api/app-version");
+  return String(data.asset_token ?? "");
+}
+
+async function startAppUpdateWatch() {
+  try {
+    state.appAssetToken = await readServedAssetToken();
+  } catch {
+    // 起動時に取れなくても本題ではない。次の巡回で拾う。
+    return;
+  }
+  window.setInterval(() => {
+    checkForAppUpdate().catch(() => {});
+  }, APP_UPDATE_POLL_INTERVAL_MS);
+  // 端末を伏せている間に配り直されるのが一番多い経路なので、復帰時に必ず見る。
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      checkForAppUpdate().catch(() => {});
+    }
+  });
+}
+
+async function checkForAppUpdate() {
+  if (!state.authenticated) return;
+  const notice = appUpdateNotice({
+    runningToken: state.appAssetToken,
+    servedToken: await readServedAssetToken(),
+    dismissedToken: state.appUpdateDismissedToken,
+  });
+  if (notice.kind !== "update_available") return;
+  showAppUpdateBanner(notice.servedToken);
+}
+
+/// 勝手に再読み込みはしない。動画や読書の途中で画面が飛ぶ方が害が大きいので、
+/// 踏むかどうかは利用者が決める。
+function showAppUpdateBanner(servedToken) {
+  if (state.appUpdateBanner) return;
+  const banner = element("div", "app-update-banner");
+  banner.setAttribute("role", "status");
+  banner.append(textElement("span", "新しい版が配信されています。"));
+  const reload = textElement("button", "再読み込み", "app-update-banner-reload");
+  reload.addEventListener("click", () => reloadApplication());
+  const dismiss = textElement("button", "後で", "app-update-banner-dismiss");
+  dismiss.addEventListener("click", () => {
+    state.appUpdateDismissedToken = servedToken;
+    banner.remove();
+    state.appUpdateBanner = null;
+  });
+  banner.append(reload, dismiss);
+  document.body.append(banner);
+  state.appUpdateBanner = banner;
 }
 
 function startSessionPing() {

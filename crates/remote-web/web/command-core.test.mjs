@@ -55,6 +55,7 @@ import {
   videoSeekPlan,
   videoStartupDecision,
   videoTapCommand,
+  appUpdateNotice,
   shouldReanchorVideoTimeline,
   videoTimelineAnchor,
   videoTimelinePosition,
@@ -186,6 +187,30 @@ test("startup detects a deadline with no fetched media segment", () => {
     elapsedMs: 15000,
     timeoutMs: 15000,
   }), { kind: "started" });
+});
+
+test("a newer build is announced once, and never interrupts on its own", () => {
+  assert.deepEqual(
+    appUpdateNotice({ runningToken: "a", servedToken: "a" }),
+    { kind: "current" }
+  );
+  assert.deepEqual(
+    appUpdateNotice({ runningToken: "a", servedToken: "b" }),
+    { kind: "update_available", servedToken: "b" }
+  );
+  assert.deepEqual(
+    appUpdateNotice({ runningToken: "a", servedToken: "b", dismissedToken: "b" }),
+    { kind: "dismissed" },
+    "同じ更新を閉じたら黙る"
+  );
+  assert.deepEqual(
+    appUpdateNotice({ runningToken: "a", servedToken: "c", dismissedToken: "b" }),
+    { kind: "update_available", servedToken: "c" },
+    "さらに新しい版が出たら改めて知らせる"
+  );
+  // token が取れないとき (回線断・起動直後) に更新扱いしない。
+  assert.deepEqual(appUpdateNotice({ runningToken: "", servedToken: "b" }), { kind: "current" });
+  assert.deepEqual(appUpdateNotice({ runningToken: "a", servedToken: "" }), { kind: "current" });
 });
 
 test("the timeline is anchored once per generation, not on every state poll", () => {
