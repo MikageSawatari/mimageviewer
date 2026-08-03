@@ -22,6 +22,7 @@ import {
   planSpreadIntent,
   reduceViewerTransform,
   readingProgressBatchTransition,
+  resolveGridReturnViewport,
   sessionOwnerBadge,
   snappedGridOffset,
   thumbnailBindingMatches,
@@ -333,6 +334,7 @@ const state = {
   remoteSessionTimer: 0,
   viewerItemState: null,
   viewerItemStateSequence: 0,
+  gridViewerReturn: null,
 };
 
 let recentPointerSource = { source: "mouse", at: 0 };
@@ -638,6 +640,8 @@ function renderPinLogin(initialRemainingSeconds = 0) {
 async function dispatchRoute() {
   if (!state.authenticated) return;
   const route = parseRoute(location.hash);
+  rememberGridViewerReturnForRoute(route);
+  if (route.kind === 'home') state.gridViewerReturn = null;
   if (
     state.screenContext === "viewer" &&
     route.kind !== "media" &&
@@ -1052,6 +1056,7 @@ function executeOpenCommand(payload, meta) {
     !state.container &&
     state.folderContainerLoad
   ) {
+    rememberGridViewerReturn(addressedMediaEntry);
     meta.openRoute = "folder_container_image";
     return openFolderImageFromGrid(payload, meta);
   }
@@ -1073,6 +1078,7 @@ function executeOpenCommand(payload, meta) {
       return false;
     }
     meta.openRoute = `media_${mediaRoute}`;
+    rememberGridViewerReturn(addressedEntry);
     if (Number.isInteger(payload.entryIndex)) state.gridIndex = payload.entryIndex;
     tryEnterBrowserFullscreen();
     history.pushState(
@@ -1105,6 +1111,7 @@ function executeOpenCommand(payload, meta) {
     return false;
     meta.openRoute = "legacy_image_rejected";
   }
+  rememberGridViewerReturn(state.images[payload.imageIndex]);
   if (state.collection) {
     tryEnterBrowserFullscreen();
     meta.openRoute = "collection_image";
@@ -1345,6 +1352,48 @@ function inputSourceFromEvent(event) {
     return recentPointerSource.source;
   }
   return "mouse";
+}
+
+function rememberGridViewerReturn(entry) {
+  if (
+    state.screenContext !== 'grid' ||
+    !state.virtualGrid ||
+    !state.gridHash ||
+    !entry
+  ) {
+    return;
+  }
+  state.gridViewerReturn = {
+    sourceContext: state.gridHash,
+    viewedItemIdentity: entryIdentity(entry),
+    previousScrollTop: state.virtualGrid.scrollTop(),
+  };
+}
+
+function rememberGridViewerReturnForRoute(route) {
+  if (state.screenContext !== 'grid' || state.gridViewerReturn) return;
+  let targetAddress = null;
+  if (route.kind === 'media') {
+    targetAddress = route.address;
+  } else if (route.kind === 'image') {
+    targetAddress = {
+      favorite_id: route.favoriteId,
+      relative_path: route.path,
+      subresource: { kind: 'file' },
+    };
+  }
+  if (!targetAddress) return;
+  const identity = addressIdentity(targetAddress);
+  const entry = state.entries.find(
+    (candidate) => addressIdentity(entryAddress(candidate)) === identity
+  );
+  rememberGridViewerReturn(entry);
+}
+
+function updateGridViewerReturnItem(entry) {
+  if (state.gridViewerReturn && entry) {
+    state.gridViewerReturn.viewedItemIdentity = entryIdentity(entry);
+  }
 }
 
 function menuCommand(event, name, payload = {}) {
@@ -2200,6 +2249,8 @@ export async function loadFolder(
 
 function renderFolder(listMetrics = null, preserveRequestController = null) {
   const renderStartedAt = performance.now();
+  const gridViewerReturn = state.gridViewerReturn;
+  state.gridViewerReturn = null;
   cleanupScreen(preserveRequestController);
   state.screenContext = "grid";
   exitBrowserFullscreen();
@@ -2292,7 +2343,26 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
     state.thumbAspectHeightRatio,
     labelHeight
   );
-  state.virtualGrid.focusIndex(state.gridIndex, false);
+  const returnViewport = resolveGridReturnViewport({
+    ...gridViewerReturn,
+    destinationContext: state.gridHash,
+    itemIdentities: state.entries.map(entryIdentity),
+    columns: state.virtualGrid.columns,
+    rowPitch: state.virtualGrid.rowHeight,
+    viewportHeight: scroll.clientHeight,
+  });
+  if (returnViewport) {
+    // VirtualGrid の layout で列数・行高・最大 offset が確定した後、最初の仮想セルを
+    // materialize する前に復元する。DOM セルの完成待ちや 1-frame 遅延は不要で、先頭が
+    // 一瞬描かれることもない。
+    state.virtualGrid.restoreScrollTop(returnViewport.scrollTop);
+    if (returnViewport.targetIndex >= 0) {
+      state.gridIndex = returnViewport.targetIndex;
+      state.virtualGrid.focusIndex(state.gridIndex, false);
+    }
+  } else {
+    state.virtualGrid.focusIndex(state.gridIndex, false);
+  }
   if (listMetrics) {
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
@@ -2665,6 +2735,7 @@ function entryTypeLabel(kind) {
 }
 
 function renderVideoViewer(entry) {
+  updateGridViewerReturnItem(entry);
   if (!entry || entry.kind !== "video") {
     recordClientError("video_viewer_entry_rejected", "動画ビューアに動画以外が渡されました", {
       entry_found: Boolean(entry),
@@ -2745,6 +2816,7 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   const requestedEntry = state.images[index];
   const groupIndex = pageGroupIndexForEntry(requestedEntry);
   if (!requestedEntry || groupIndex < 0) return;
+  updateGridViewerReturnItem(state.pageGroups[groupIndex].anchor);
   cleanupScreen();
   state.screenContext = "viewer";
   state.viewerItemState = null;
@@ -2901,6 +2973,7 @@ function changeImageTo(nextGroupIndex) {
   state.pageGroupIndex = nextGroupIndex;
   state.viewer?.setSeekState(viewerSeekSnapshot(nextGroupIndex));
   const entry = state.pageGroups[nextGroupIndex].anchor;
+  updateGridViewerReturnItem(entry);
   state.imageIndex = state.images.findIndex(
     (image) => entryIdentity(image) === entryIdentity(entry)
   );
@@ -3747,6 +3820,19 @@ class VirtualGrid {
 
   visibleRowCount() {
     return Math.max(1, Math.floor(this.scroller.clientHeight / this.rowHeight));
+  }
+
+  scrollTop() {
+    return this.scroller.scrollTop;
+  }
+
+  restoreScrollTop(scrollTop) {
+    this.scroller.scrollTop = Math.max(
+      0,
+      Math.min(this.maxScrollOffset, Number(scrollTop) || 0)
+    );
+    this.lastRange = '';
+    this.schedule();
   }
 
   focusIndex(index, shouldFocus) {

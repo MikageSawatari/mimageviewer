@@ -877,6 +877,50 @@ export function snappedGridOffset(scrollTop, rowPitch, maxOffset) {
   return Math.max(0, Math.min(maximum, Math.round(offset / pitch) * pitch));
 }
 
+/// 本体の App::apply_scroll_to_selected と同じく、対象行が画面外のときだけ
+/// 上端または下端まで最小限動かす。対象が消えた場合は既存 offset の範囲 clamp だけ行う。
+export function resolveGridReturnViewport({
+  sourceContext,
+  destinationContext,
+  viewedItemIdentity,
+  itemIdentities,
+  previousScrollTop,
+  columns,
+  rowPitch,
+  viewportHeight,
+}) {
+  if (
+    !sourceContext ||
+    String(sourceContext) !== String(destinationContext)
+  ) {
+    return null;
+  }
+
+  const identities = Array.isArray(itemIdentities) ? itemIdentities : [];
+  const columnCount = Math.max(1, Math.floor(Number(columns) || 1));
+  const pitch = Math.max(1, Number(rowPitch) || 1);
+  const viewport = Math.max(0, Number(viewportHeight) || 0);
+  const rowCount = Math.ceil(identities.length / columnCount);
+  const { maxOffset } = gridScrollExtent(rowCount, pitch, viewport);
+  let scrollTop = snappedGridOffset(previousScrollTop, pitch, maxOffset);
+  const targetIndex = viewedItemIdentity == null
+    ? -1
+    : identities.indexOf(viewedItemIdentity);
+
+  if (targetIndex >= 0) {
+    const rowTop = Math.floor(targetIndex / columnCount) * pitch;
+    const rowBottom = rowTop + pitch;
+    if (rowTop < scrollTop) {
+      scrollTop = rowTop;
+    } else if (rowBottom > scrollTop + viewport) {
+      scrollTop = Math.ceil((rowBottom - viewport) / pitch) * pitch;
+    }
+    scrollTop = Math.max(0, Math.min(maxOffset, scrollTop));
+  }
+
+  return { targetIndex, scrollTop };
+}
+
 export function thumbnailBindingMatches(
   currentGeneration,
   currentPath,

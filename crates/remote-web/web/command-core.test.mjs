@@ -27,6 +27,7 @@ import {
   readingDirectionForSpreadMode,
   readingProgressBatchTransition,
   reduceViewerTransform,
+  resolveGridReturnViewport,
   viewerTapCommand,
   nextFitMode,
   pagePrefetchPlan,
@@ -924,6 +925,54 @@ test("grid scroll extent and snapping stay on whole row boundaries", () => {
     maxOffset: 0,
     totalHeight: 700,
   });
+});
+
+test('grid return scrolls only enough to reveal the previously viewed item', () => {
+  const itemIdentities = Array.from({ length: 40 }, (_, index) => 'item-' + index);
+  assert.deepEqual(
+    resolveGridReturnViewport({
+      sourceContext: 'folder-a',
+      destinationContext: 'folder-a',
+      viewedItemIdentity: 'item-22',
+      itemIdentities,
+      previousScrollTop: 200,
+      columns: 4,
+      rowPitch: 100,
+      viewportHeight: 300,
+    }),
+    { targetIndex: 22, scrollTop: 300 }
+  );
+});
+
+test('grid return clamps the old range instead of jumping to the top when the item is gone', () => {
+  const result = resolveGridReturnViewport({
+    sourceContext: 'folder-a',
+    destinationContext: 'folder-a',
+    viewedItemIdentity: 'deleted-item',
+    itemIdentities: Array.from({ length: 20 }, (_, index) => 'item-' + index),
+    previousScrollTop: 900,
+    columns: 2,
+    rowPitch: 100,
+    viewportHeight: 300,
+  });
+  assert.deepEqual(result, { targetIndex: -1, scrollTop: 700 });
+  assert.notEqual(result.scrollTop, 0);
+});
+
+test('grid return does not restore across folders', () => {
+  assert.equal(
+    resolveGridReturnViewport({
+      sourceContext: 'folder-a',
+      destinationContext: 'folder-b',
+      viewedItemIdentity: 'item-10',
+      itemIdentities: ['item-10'],
+      previousScrollTop: 600,
+      columns: 1,
+      rowPitch: 100,
+      viewportHeight: 300,
+    }),
+    null
+  );
 });
 
 test("thumbnail responses apply only to the tile generation and item that requested them", () => {
