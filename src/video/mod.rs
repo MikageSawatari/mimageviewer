@@ -30,6 +30,7 @@ pub mod audio_diagnostics;
 pub mod audio_stretch;
 pub mod avio_progress;
 pub mod clock;
+pub mod clockless_transcode;
 pub mod decoder;
 #[cfg(windows)]
 pub mod dsp;

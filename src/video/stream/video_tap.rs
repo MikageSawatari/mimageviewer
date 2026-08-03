@@ -63,6 +63,10 @@ pub(crate) struct TappedVideoFrame {
 }
 
 impl TappedVideoFrame {
+    pub(crate) fn as_video(&self) -> &Video {
+        self.frame.as_video()
+    }
+
     #[cfg(test)]
     pub(crate) fn from_owned_software_frame(
         frame: Video,
@@ -453,7 +457,6 @@ impl VideoStreamEncoder {
         &self.opened.encoder
     }
 
-    #[cfg(test)]
     pub(crate) fn input_format(&self) -> H264InputFormat {
         self.opened.input_format
     }

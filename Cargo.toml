@@ -112,6 +112,13 @@ bench = false
 required-features = ["dev-tools"]
 
 [[bin]]
+name = "clockless_transcode_bench"
+path = "src/bin/clockless_transcode_bench.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
 name = "diff_images"
 path = "src/bin/diff_images.rs"
 test = false

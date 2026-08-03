@@ -1,14 +1,16 @@
 # リモート動画ストリーミング 計画書
 
-外出先のブラウザから自宅 PC の動画を視聴するために、**mIV 本体が実時間でデコード・
-音声処理した結果を H.264 + AAC へ再エンコードし、HLS で配信する**。本書がこの機能の正本。
+外出先のブラウザから自宅 PC の動画を視聴するために、入力ファイルを **再生器とは独立した
+時計なし経路でデコードし、H.264 + AAC へ再エンコードして HLS で配信する**。本書がこの機能の正本。
+既存リリース候補は本体再生の decoder/audio tap を使う実時間経路だが、初回リリースまでに
+時計なし経路へ切り替える。既存経路は移行完了まで変更せず残す。
 
 - 親計画: [web-remote-plan.md](web-remote-plan.md) (リモート閲覧機能全体の正本)
 - ブランチ: `web-remote` (worktree: `C:\home\mimageviewer-web`)
-- 現在のフェーズ: **第 1 段 増分 7/7 + 実機検証是正を実装済み、再検証待ち** (encoder 抽象 / fallback / 画質
-  preset + 映像・音声 fMP4 segmenter / ring / m3u8 + audio tap / AAC + decoder-output
-  video tap / HW download / scale / H.264 input + streaming session / remote owner 連携 /
-  generation / 設定 + protocol v18 IPC / HTTP・HLS ルート + Web フロント、2026-08-03)
+- 現在のフェーズ: **時計なし移行 3 段の 1 段目 (駆動部 + 独立ベンチ、未配線)**。
+  `clockless_transcode` がファイルを独立 open し、demux / decode / 既存 encoder / AAC /
+  `Fmp4Segmenter` を時計なしで駆動する。既存 `VideoStreamSession` / generation worker、IPC、
+  HTTP、Web フロントはまだ従来経路のまま (2026-08-03)
 
 ---
 
@@ -40,7 +42,7 @@
 
 | 項目 | 決定 | 理由 |
 |---|---|---|
-| 取得方式 | **本体の再生セッションを実時間で tap** (§4) | VST・ノーマライズがそのまま乗る。本体ロック中の占有と整合 |
+| 取得方式 | **同じファイルを独立 open する時計なし経路** (§10.1) | 再生器・サウンドカードの 1x clock と表示 back-pressure から分離する。既存 tap 経路は移行完了まで保持 |
 | 配信プロトコル | **HLS (fMP4 / CMAF セグメント) 一本** | iOS ネイティブ対応。tiny_http のまま配れる。追加のサーバ依存ゼロ |
 | クライアント | iOS/macOS Safari は**ネイティブ再生**、それ以外は **hls.js** | サーバ実装は 1 本のまま両対応。独自 MSE 実装を書かない |
 | 映像コーデック | **H.264 (High profile, 8bit, BT.709)** 固定 | 全端末が確実にハードウェアデコードできる唯一の選択肢 |
@@ -358,17 +360,11 @@ audible PTS、session 原点、先行量、PDC、chunk duration、許容量、�
   位置」である。**増分 4 の映像 tap は、投入できた frame で番号を詰め直してはいけない**
   (詰め直すと forced-IDR の位置が encoder の負荷次第でずれる)
 
-#### 実機待ち時間是正 B: 初回セグメント短縮 (2026-08-03)
+#### 実機待ち時間是正 B: 初回セグメント短縮は撤回 (2026-08-03)
 
-- `FrameRate` が 0.5 秒と 2 秒をそれぞれ CFR frame 数へ丸め、segmenter は初回だけ
-  0.5 秒の close 条件を使う。短縮 IDR を受理できる encoder では 0.5 秒で最初の
-  `moof+mdat` を公開し、以後は実際の close DTS + 2 秒へ境界を戻す
-- 初回 close 前は 0.5 秒 offset の候補と従来の 2 秒候補を併存させる。短縮 IDR が
-  出なければ既存の `AwaitingIdr` が次の IDR まで延長し、2 秒 IDR で従来挙動へ復帰する
-- `#EXTINF` は各 fragment の start/end DTS から測った値を使い、
-  `#EXT-X-TARGETDURATION` は ring 内の最大 `EXTINF` の切り上げ以上を維持する
-- generation ごとの最初の close で `remote-stream initial segment` を 1 行出し、
-  `target` / `actual` / `shortened` / `delayed_idr` により短縮の成否を実機で判別する
+初回だけ 0.5 秒で閉じる案は実装後に `212933fc` で revert した。実時間生成では短縮して
+先に渡した分が直後の不足として残り、総待ち時間と回線揺れ耐性を改善できないためである。
+セグメント境界は従来の 2 秒を維持し、時計なし先行生成によって端末を生成先端から離す。
 
 ---
 
@@ -789,15 +785,16 @@ guard で、動画処理開始後の timeout 9 個には数えない。
 
 ## 10. 制約・リスクと要検証事項
 
-1. **画面表示への依存** — 映像 tap 自体は presenter と独立しているが、decoder の通常
+1. **画面表示への依存 (既存経路のみ)** — 映像 tap 自体は presenter と独立しているが、decoder の通常
    `video_tx` には常時 consumer が必要。remote-owned headless player は専用 consumer が queue を
    drain し、seek readiness の `FirstFrameReady` も通知するため、native window の表示状態や
    monitor sleep に queue 進行を依存させない
-2. **PC 側の音** — mIV は音声出力がマスタークロックであり、デバイスを止めると映像も進まない
+2. **PC 側の音 (既存経路のみ)** — mIV は音声出力がマスタークロックであり、デバイスを止めると映像も進まない
    恐れがある。`remote_video_mute_local_output` は**デバイスを回したまま音量 0** にする実装とし、
    ストリームは tap 点 (音量適用より前の最終 PCM) から取るため無音化の影響を受けない
-3. **エンコード遅延の蓄積** — 実時間 1x でしか生成できないため、回線が平均的に足りない場合は
-   遅延が伸び続ける。バッファ秒数を `/api/video/state` で監視し、閾値超過で画質降格を提案する
+3. **先行生成の上限** — 時計なし worker は segment ring に空きがある間だけ走り、満杯なら
+   `Condvar` で park する。端末が segment を解放すれば再開する。CPU/GPU を無制限に先食いせず、
+   生成先端と端末 playhead の距離を ring 容量で上限化する
 4. **同時 1 セッション** — 既存のセッションロックと同一なので追加の排他は不要
 5. **HDR 素材** — 第 1 段は BT.709 固定。HDR (PQ/HLG) 素材はトーンマッピングせずに送ると
    眠い絵になる。実機で確認し、必要なら `zscale` / `tonemap` の導入を第 2 段で検討する
@@ -807,11 +804,58 @@ guard で、動画処理開始後の timeout 9 個には数えない。
    エンコーダ入力側で CFR 化する
 8. **通信量** — 標準画質 1 時間で約 730MB。従量回線での利用は画質選択と通信量表示で支援する
 
+### 10.1 時計なし駆動部の実測 (移行 1/3、2026-08-03)
+
+`clockless_transcode_bench` を本体と別プロセス・別 runtime directory で実行した。
+標準画質 1280x720 H.264 NVENC、D3D11VA decode、30 秒区間、RTX 4090 / 24 logical CPU。
+HEVC は指定素材置場に 4K 実素材が無かったため、実 H.264 1080p60 素材から作った
+HEVC Main10 4K fixture であり、4K の行は合成入力として扱う。終端の未完 2 秒 fragment は
+今回の throughput 集計に含めない。
+
+| 入力 | 音声なし | AAC 込み | 音声による低下 | CPU | NVENC / NVDEC |
+|---|---:|---:|---:|---:|---:|
+| H.264 1080p30 | **8.37x** | **7.33x** | 12.5% | 約 1.0 core (全体の 4.2%) | 11–12% / 27–29% 同時 |
+| AV1 1080p30 | **9.15x** | **8.37x** | 8.5% | 約 1.0 core (全体の 4.2%) | 12–16% / 12–19% 同時 |
+| HEVC Main10 4K30 (fixture) | **2.28x** | **2.20x** | 3.6% | 約 1.0 core (全体の 4.1%) | 同時利用を確認 |
+| HEVC Main10 4K60 (fixture、重負荷) | **1.12x** | **1.09x** | 2.3% | 約 1.0 core (全体の 4.1%) | 3–4% / 11–16% 同時 |
+
+4K60 は **1.5x を下回る**。30 秒・音声なしの段階時間は demux 0.03 秒、decode 0.66 秒、
+GPU→CPU readback 14.45 秒、scale + encode 11.43 秒で、codec decode ではなく frame readback と
+CPU swscale が律速である。追加 profiler では 10 秒分の 4K60 swscale 単体が 3.20 秒、同区間の
+scale + encode が 3.87 秒だった。1080p も最大区間は readback、次が scale + encode であり、
+demux / codec decode は支配的でない。将来 4K60 に十分な余裕を持たせるには、D3D11 texture を
+CPU に戻さず GPU scale して NVENC へ渡す経路が次の性能投資候補になる。
+
+### 10.2 時計なし経路での状態所有方針
+
+- **VST3**: bridge の audio loop は入力 ring が空のときだけ待ち、処理要求自体を wall clock で
+  pace しないため、bridge は速く供給すれば速く処理できる構造である。ただし plugin setup は
+  `kRealtime` で、プラグイン固有の wall-clock 依存までは保証できない。移行 2/3 で実チェーンを
+  offline feed して倍率と出力を比較し、失敗する plugin がある場合は「リモートは VST 無効」を
+  明示仕様にする。今回のベンチ音声は VST を通していない
+- **位置**: server は generation、source origin、生成済み範囲、ring の earliest/latest、duration、
+  再生 intent を所有する。実 playhead は端末の media element が source of truth であり、
+  `/api/video/state` の本体位置を端末位置として返さない。resume/history が必要なときだけ端末が
+  playhead を報告する
+- **一時停止 / seek / 終端**: 一時停止中も ring 上限まで生成して park すればよい。seek は現在の
+  generation 交換規約を再利用し、旧 worker を段境界 cancel、新 generation は独立 open + seek
+  で開始する。終端だけは encoder/resampler/muxer を flush して最終 fragment を閉じた後に
+  `Ended` / playlist end marker を公開する明示状態が必要で、単なる ring 満杯とは区別する
+
 ---
 
 ## 11. 実装段階
 
-### 第 1 段 (本計画の主対象)
+### 時計なし移行 (初回リリース対象)
+
+1. **駆動部 + 実測 (本変更)** — 独立 Input、demux/decode、既存 H.264/AAC encoder と
+   `Fmp4Segmenter`、ring 容量 gate、段境界 cancel、dev-tools benchmark。production 未配線
+2. **session 配線** — `VideoStreamSession` の generation owner を時計なし worker へ接続し、
+   VST 方針、端末 playhead、seek/終端 flush を確定する。既存実時間経路は切替確認まで保持
+3. **Web/実機仕上げ** — 先読み window と解放 ACK、state 表現、pause/seek/end、iPhone 実機で
+   起動・シーク・回線揺れを検証して旧 tap 経路を整理する
+
+### 既存の実時間経路 第 1 段 (実装済み、移行元)
 
 | 内容 | 概算 |
 |---|---|
