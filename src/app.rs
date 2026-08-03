@@ -36138,7 +36138,11 @@ impl App {
     /// `VideoPlayer::tick` and the continuous EOF navigation decision are UI-owned, while
     /// Windows does not deliver the normal repaint WM_PAINT to a hidden root HWND. Keep the
     /// bridge active only for a current player with live play intent, an unhandled continuous
-    /// EOF, an EOF candidate resolver, or the typed media handoff started by that EOF.
+    /// EOF, an EOF candidate resolver, or the typed media handoff started by that EOF. Keeping the
+    /// resolver/handoff states in this projection makes the 50 ms bridge—not the generic hidden
+    /// scheduler's 100 ms floor—the clock for EOF and next-track progress. Scheduler direct passes
+    /// and bridge `WM_PAINT` callbacks are serialized on the winit main thread, and every update
+    /// entry acknowledges the single bridge claim.
     /// Paused/handled-terminal players, cached but non-current players, still images, and tray
     /// residency by itself do not qualify.
     #[cfg(windows)]

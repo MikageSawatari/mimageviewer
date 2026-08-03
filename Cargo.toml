@@ -12,9 +12,10 @@ members = [
     "tools/comic_lab",
     "tools/music_lab",
 ]
-exclude = ["crates/unrar-patched", "vendor/egui-wgpu"]
+exclude = ["crates/unrar-patched", "vendor/eframe", "vendor/egui-wgpu"]
 
 [patch.crates-io]
+eframe = { path = "vendor/eframe" }
 egui-wgpu = { path = "vendor/egui-wgpu" }
 
 # 配布バイナリ (本体 = `mimageviewer-core.exe` + launcher = `mimageviewer.exe`) の

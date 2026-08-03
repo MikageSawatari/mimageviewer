@@ -5,13 +5,13 @@
 //!
 //! ## 設計上の要点 (eframe 0.33 + tray-icon 0.20 の制約)
 //!
-//! eframe/winit は **ウィンドウが非表示の間 `App::update` を呼ばない**。
-//! `ViewportCommand::Visible(false)` でも Win32 `SW_HIDE` でも同じ。`request_repaint`
-//! は最終的に hidden HWND への `RedrawWindow(..., RDW_INTERNALPAINT)` となるが、Windows は
-//! hidden window へ `WM_PAINT` を配送しない。したがって「トレイメニューをクリック →
-//! App::update で処理」という素直な流れは**成立しない**。
+//! upstream eframe 0.33.3 では、hidden HWND へ要求した OS redraw が配送されないため、
+//! repaint の期限が来ても `App::update` へ到達しない。vendored scheduler はアプリが既に
+//! 要求した hidden repaint を 100 ms 以上の間隔で direct UI pass として消化するが、要求の
+//! 無い window に heartbeat は作らない。トレイの open / quit と active media の cadence は
+//! scheduler の repaint 有無に依存させず、トレイスレッド自身が Win32 経路で保証する。
 //!
-//! 解決策: トレイスレッド自身が Win32 を直接叩く。
+//! 解決策: generic pending work は scheduler、tray lifecycle と media clock はトレイスレッドが担う。
 //!
 //! - **開く (左クリック / メニュー)**: `ShowWindow(hwnd, SW_SHOW)` + `SetForegroundWindow`
 //!   をトレイスレッドから直接呼ぶ。ウィンドウが可視になれば winit/eframe は `update` を
@@ -27,7 +27,10 @@
 //!   projection している間だけ、トレイスレッドの既存 50ms pump が hidden main HWND へ
 //!   `WM_PAINT` を 1 件 post する。これは winit の `RedrawRequested` を明示的に起こすための
 //!   Windows bridge であり、共有 pending claim を `App::update` 入口が ack するまで次を post
-//!   しない。paused / EOF 停止 / still / 可視 window では pending を reset して post しない。
+//!   しない。scheduler の direct pass も同じ main thread で直列に入口を通り claim を ack するため、
+//!   同時実行はなく、先に入った pass が次の bounded wake を許可する。projection は EOF resolver と
+//!   typed handoff が終わるまで true のままなので、次トラック遷移は scheduler の 100ms 下限では
+//!   なく bridge の 50ms cadence で進む。paused / EOF 停止 / still / 可視 window では post しない。
 //!
 //! ## スレッドモデル
 //!
@@ -623,11 +626,12 @@ fn run_tray_thread(
             }
         }
 
-        // winit turns WM_PAINT into RedrawRequested, which is the only normal entry to
-        // eframe::App::update. RedrawWindow/request_repaint cannot create WM_PAINT for a hidden
-        // HWND, so active resident playback needs this explicit bridge. The App publishes the
-        // latest projection from the existing media owners; checking IsWindowVisible here also
-        // closes the hide/show race without another App flag.
+        // winit turns WM_PAINT into RedrawRequested. The vendored scheduler can also consume an
+        // app-requested hidden repaint by calling run_ui_and_paint directly, but its 100 ms floor
+        // is not the media clock. Active resident playback uses this explicit 50 ms bridge through
+        // EOF resolution/handoff. Both entries run serially on the winit main thread and clear the
+        // same pending claim at App::update entry; at most one bridge wake remains in flight.
+        // Checking IsWindowVisible here also closes the hide/show race without another App flag.
         let main_window_visible = unsafe { IsWindowVisible(make_hwnd(main_hwnd)).as_bool() };
         let pending = resident_media_wake_pending.load(Ordering::Acquire);
         let (should_post, next_pending) = resident_media_wake_transition(
