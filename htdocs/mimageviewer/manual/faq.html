@@ -76,7 +76,51 @@
     <h1 class="page-title">FAQ（よくある質問）</h1>
     <p class="page-desc">mImageViewer でよくいただく質問と回答をまとめています。</p>
 
-    <h2>アーカイブ・フォーマットについて</h2>
+    <nav class="page-toc">
+      <div class="page-toc-title">目次</div>
+      <ul>
+        <li><a href="#archive">アーカイブ・フォーマットについて</a>
+          <ul>
+            <li><a href="#archive-7z-lzh">RAR / 7z / LZH アーカイブに対応していますか？</a></li>
+            <li><a href="#archive-direct-rar">RAR / 7z / LZH を ZIP 変換せず直接開けますか？</a></li>
+            <li><a href="#archive-rar">RAR アーカイブには対応していますか？</a></li>
+            <li><a href="#archive-game">ゲーム独自のアーカイブ（xp3、arc、tlg、g00 等）には対応していますか？</a></li>
+            <li><a href="#format-retro">古い PC の画像形式（MAG、PI 等）には対応していますか？</a></li>
+            <li><a href="#susie-plugin">Susie プラグインは 32bit / 64bit どちらに対応していますか？</a></li>
+            <li><a href="#susie-config">Susie プラグインの個別設定を変更したい場合は？</a></li>
+          </ul>
+        </li>
+        <li><a href="#features">機能について</a>
+          <ul>
+            <li><a href="#ai-upscale-retro">AI アップスケールでレトロ CG を鑑賞したい</a></li>
+            <li><a href="#loupe">ルーペ機能の使い方は？</a></li>
+            <li><a href="#transparent-bg">透過画像の背景色を変えたい</a></li>
+            <li><a href="#theme">ダークモードに切り替えたい</a></li>
+            <li><a href="#export-edited-image">編集結果を別ファイルに保存するには？</a></li>
+          </ul>
+        </li>
+        <li><a href="#display">表示について</a>
+          <ul>
+            <li><a href="#moire-soft">他のビューアより少しぼやけて見えます</a></li>
+            <li><a href="#resize-flicker">ウィンドウの端をドラッグしてサイズを変えると、一瞬中身が伸び縮みして見えます</a></li>
+          </ul>
+        </li>
+        <li><a href="#planned">対応予定の機能</a>
+          <ul>
+            <li><a href="#mouse-gesture">マウスジェスチャーには対応していますか？</a></li>
+            <li><a href="#drag-from-browser">ブラウザからの画像ドロップに対応していますか？</a></li>
+          </ul>
+        </li>
+        <li><a href="#data">データ・保存場所</a>
+          <ul>
+            <li><a href="#data-location">アプリのデータ保存場所を別ドライブに移したい</a></li>
+            <li><a href="#archive-cache-cleanup">変換済みアーカイブキャッシュを削除したい</a></li>
+          </ul>
+        </li>
+      </ul>
+    </nav>
+
+    <h2 id="archive">アーカイブ・フォーマットについて</h2>
 
     <h3 id="archive-7z-lzh">RAR / 7z / LZH アーカイブに対応していますか？</h3>
     <p>対応しています。書庫の種類によって、そのまま直接ブラウズするものと、一度 ZIP に変換してから閲覧するものに分かれます。</p>
@@ -157,7 +201,7 @@
     またはレジストリに保存するため、同じ <code>.spi</code> ファイルを mImageViewer のプラグイン
     フォルダに置けば、設定値はそのまま反映されます。</p>
 
-    <h2>機能について</h2>
+    <h2 id="features">機能について</h2>
 
     <h3 id="ai-upscale-retro">AI アップスケールでレトロ CG を鑑賞したい</h3>
     <p>おすすめの手順:</p>
@@ -201,7 +245,56 @@
     <p>詳しい操作、ファイル名の規則、メタデータ保持については
     <a href="export.html">エクスポート</a>を参照してください。</p>
 
-    <h2>表示について</h2>
+    <h2 id="display">表示について</h2>
+
+    <h3 id="moire-soft">他のビューアより少しぼやけて見えます</h3>
+    <p>画像を縮小して表示するとき、<strong>モアレを抑える処理</strong>が働いているためです。
+    初期状態では有効になっています。設定で切り替えられます。</p>
+
+    <h4>モアレとは</h4>
+    <p>スクリーントーンや細かい網目のように<strong>細かい模様が規則正しく並んだ画像</strong>を縮小すると、
+    元の画像には無かった縞模様やちらつきが現れることがあります。これがモアレです。</p>
+    <p>下は説明用の作例です。左が原寸（100%）で見たスクリーントーン、中央がそれを 1/3 に縮小したものです。
+    細かい網点が消えて、代わりに<strong>元には無い粗い格子模様</strong>が出ているのが分かります。</p>
+    <div class="moire-samples">
+      <figure>
+        <img src="images/moire-source.webp" alt="原寸のスクリーントーン。細かい網点が規則正しく並んでいる" loading="lazy">
+        <figcaption>原寸（100%）</figcaption>
+      </figure>
+      <figure>
+        <img src="images/moire-aliased.webp" alt="抑制なしで縮小した状態。元には無い粗い格子模様が出ている" loading="lazy">
+        <figcaption>縮小・抑制なし（モアレ）</figcaption>
+      </figure>
+      <figure>
+        <img src="images/moire-suppressed.webp" alt="抑制ありで縮小した状態。縞は消えるが細部は柔らかい" loading="lazy">
+        <figcaption>縮小・抑制あり</figcaption>
+      </figure>
+    </div>
+    <p>右が抑制ありの状態です。格子模様は消えて元のトーンの濃さが素直に出ますが、
+    そのぶん線や細部は柔らかくなります。<strong>この柔らかさが「ぼやけて見える」の正体です。</strong></p>
+    <p>モアレは表示倍率が変わるたびに模様も変わるため、ページを送ったりウィンドウサイズを変えたりすると
+    ちらついて見えます。抑制すると、この動きも収まります。</p>
+
+    <h4>切り替え方</h4>
+    <p>フルスクリーン表示の左パネル →
+    <a href="adjustment.html">画像補正</a> → 「フィルタ」タブ →
+    <strong>「縮小表示のモアレを抑制する」</strong>で切り替えます。</p>
+    <ul>
+      <li><strong>チェックを外す：</strong>線のくっきりさを優先します。細い線や文字は立ちますが、
+        スクリーントーンのモアレや、表示を動かしたときのちらつきは出やすくなります</li>
+      <li><strong>チェックしたまま「より強く抑制」を上げる：</strong>モアレはさらに減りますが、
+        通常の写真やイラストも柔らかく見えるようになります。0.0 が標準です</li>
+    </ul>
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        全画像・全ウィンドウ共通の設定です。ページごとの設定や保存スロットには含まれません。
+        拡大表示や原寸表示のときは働きません（縮小しているときだけ効きます）。
+        詳細は<a href="adjustment.html#moire">画像補正の「縮小モアレ抑制」</a>をご覧ください。
+      </div>
+    </div>
+    <p>どちらが良いかは画像の内容と好みによります。スクリーントーンの多い漫画では抑制あり、
+    線画や文字をくっきり見たい場合は抑制なしが向いています。</p>
 
     <h3 id="resize-flicker">ウィンドウの端をドラッグしてサイズを変えると、一瞬中身が伸び縮みして見えます</h3>
     <p>不具合ではなく、表示のしくみ上の仕様です。mImageViewer は、サムネイル一覧やフルスクリーン表示を
@@ -220,7 +313,7 @@
       </div>
     </div>
 
-    <h2>対応予定の機能</h2>
+    <h2 id="planned">対応予定の機能</h2>
 
     <h3 id="mouse-gesture">マウスジェスチャーには対応していますか？</h3>
     <p>対応しています。設定メニューの「操作カスタマイズ…」で、右ドラッグを未使用 / リングショートカット / マウスジェスチャから選べます。マウスジェスチャは上下左右の軌跡を登録済みパターンと照合して実行します。</p>
@@ -228,7 +321,7 @@
     <h3 id="drag-from-browser">ブラウザからの画像ドロップに対応していますか？</h3>
     <p>現時点では未対応です。要望に応じて検討します。</p>
 
-    <h2>データ・保存場所</h2>
+    <h2 id="data">データ・保存場所</h2>
 
     <h3 id="data-location">アプリのデータ保存場所を別ドライブに移したい</h3>
     <p><code>--data-dir</code> オプションを使った手動移動で対応できます。手順は

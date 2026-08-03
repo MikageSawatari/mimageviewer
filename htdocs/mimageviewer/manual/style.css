@@ -169,6 +169,14 @@ h3 {
   margin: 1.75rem 0 0.5rem;
 }
 
+/* 長い項目の中を区切る小見出し。h3 (質問) より一段弱く見せる。 */
+h4 {
+  font-size: 0.92rem;
+  font-weight: 700;
+  color: var(--text-sub);
+  margin: 1.3rem 0 0.4rem;
+}
+
 /* ── Paragraph ───────────────────────────────── */
 p { margin-bottom: 0.9rem; color: var(--text-sub); }
 
@@ -277,6 +285,66 @@ ul li::marker { color: var(--pink-light); }
 .box.info  { background: #f0f7ff; border: 1px solid #b8d8fa; }
 .box.tip   { background: #f0faf4; border: 1px solid #a3ddb8; }
 .box.warn  { background: #fffbf0; border: 1px solid #f5d87a; }
+
+/* ── Moire sample figures (FAQ) ──────────────── */
+.moire-samples {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.9rem;
+  margin: 1.1rem 0 1.2rem;
+}
+.moire-samples figure {
+  flex: 1 1 200px;
+  min-width: 0;
+  margin: 0;
+}
+.moire-samples img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+}
+.moire-samples figcaption {
+  margin-top: 0.35rem;
+  font-size: 0.8rem;
+  color: var(--text-sub);
+  text-align: center;
+}
+
+/* ── Page TOC (in-page anchor list) ──────────── */
+.page-toc {
+  margin: 1.5rem 0 2rem;
+  padding: 1rem 1.25rem;
+  background: var(--pink-bg);
+  border: 1px solid var(--pink-pale);
+  border-radius: 10px;
+}
+.page-toc > .page-toc-title {
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 0.6rem;
+}
+.page-toc ul { list-style: none; margin: 0; padding: 0; }
+.page-toc > ul > li { margin-bottom: 0.7rem; }
+.page-toc > ul > li:last-child { margin-bottom: 0; }
+.page-toc > ul > li > a {
+  font-weight: 700;
+  font-size: 0.92rem;
+  color: var(--text);
+  text-decoration: none;
+}
+.page-toc > ul > li > a:hover { color: var(--accent); text-decoration: underline; }
+.page-toc ul ul { margin: 0.3rem 0 0 0.9rem; }
+.page-toc ul ul li { margin-bottom: 0.22rem; line-height: 1.5; }
+.page-toc ul ul a {
+  font-size: 0.87rem;
+  color: var(--text-sub);
+  text-decoration: none;
+}
+.page-toc ul ul a:hover { color: var(--accent); text-decoration: underline; }
 
 /* ── TOC cards (index page) ──────────────────── */
 .toc-grid {
