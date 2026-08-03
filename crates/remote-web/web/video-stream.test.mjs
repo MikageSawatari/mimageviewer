@@ -5,15 +5,18 @@ import {
   VideoGenerationSwitchOwner,
   VideoSeekPreviewOwner,
   hlsBufferConfig,
+  preventVideoNativeZoom,
   resolveVideoPlaylist,
   videoUserErrorMessage,
 } from "./video-stream.mjs";
 
-test("hls.js uses the server ring target for every buffer limit", () => {
+test("hls.js starts at the requested generation origin and uses every buffer limit", () => {
   assert.deepEqual(hlsBufferConfig(60), {
     backBufferLength: 60,
     maxBufferLength: 60,
     maxMaxBufferLength: 60,
+    startPosition: 0,
+    startOnSegmentBoundary: true,
   });
 });
 
@@ -41,6 +44,37 @@ test("seek preview advances from seeking through decoded thumbnail to playback",
 
   assert.equal(owner.playbackStarted(), true);
   assert.deepEqual(owner.current(), { kind: "playback" });
+});
+
+test("seek target remains the displayed position until replacement playback lands", () => {
+  const owner = new VideoSeekPreviewOwner();
+  assert.equal(owner.displayedPosition(18), 18);
+  owner.request(72.5, "seeking");
+  assert.equal(owner.displayedPosition(18.2), 72.5);
+  owner.acceptThumbnail(owner.current(), {
+    actualPtsSecs: 72.466,
+    objectUrl: "blob:thumbnail",
+  });
+  assert.equal(owner.displayedPosition(18.4), 72.5);
+  owner.playbackStarted();
+  assert.equal(owner.displayedPosition(72.6), 72.6);
+});
+
+test("video surface consumes native zoom gestures but preserves interactive controls", () => {
+  let prevented = 0;
+  const surfaceEvent = {
+    cancelable: true,
+    target: { closest: () => null },
+    preventDefault: () => { prevented += 1; },
+  };
+  assert.equal(preventVideoNativeZoom(surfaceEvent), true);
+  assert.equal(prevented, 1);
+  assert.equal(preventVideoNativeZoom({
+    ...surfaceEvent,
+    target: { closest: () => ({ tagName: "BUTTON" }) },
+  }), false);
+  assert.equal(preventVideoNativeZoom({ ...surfaceEvent, cancelable: false }), false);
+  assert.equal(prevented, 1);
 });
 
 test("playback is never held for a missing seek thumbnail", () => {

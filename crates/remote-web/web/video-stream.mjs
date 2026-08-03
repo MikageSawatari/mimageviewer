@@ -37,7 +37,16 @@ export function hlsBufferConfig(bufferTargetSecs) {
     backBufferLength: target,
     maxBufferLength: target,
     maxMaxBufferLength: target,
+    startPosition: 0,
+    startOnSegmentBoundary: true,
   };
+}
+
+export function preventVideoNativeZoom(event) {
+  if (event?.target?.closest?.("button, input, select, textarea, a")) return false;
+  if (!event?.cancelable) return false;
+  event.preventDefault?.();
+  return true;
 }
 
 function element(tag, className = "") {
@@ -207,6 +216,12 @@ export class VideoSeekPreviewOwner {
 
   current() {
     return { ...this.state };
+  }
+
+  displayedPosition(playbackPositionSecs) {
+    return this.state.kind === "playback"
+      ? Math.max(0, Number(playbackPositionSecs) || 0)
+      : this.state.targetSecs;
   }
 }
 
@@ -907,10 +922,18 @@ export class VideoStreamViewer {
     this.pointerMove = (event) => this.onPointerMove(event);
     this.pointerUp = (event) => this.onPointerUp(event, false);
     this.pointerCancel = (event) => this.onPointerUp(event, true);
+    // The video surface deliberately owns repeated taps (relative seek) and has no zoom mode.
+    // Suppress WebKit's native double-tap/pinch page zoom while leaving controls native.
+    this.nativeGesture = (event) => preventVideoNativeZoom(event);
     this.stage.addEventListener("pointerdown", this.pointerDown);
     this.stage.addEventListener("pointermove", this.pointerMove);
     this.stage.addEventListener("pointerup", this.pointerUp);
     this.stage.addEventListener("pointercancel", this.pointerCancel);
+    this.stage.addEventListener("touchend", this.nativeGesture, { passive: false });
+    this.stage.addEventListener("gesturestart", this.nativeGesture, { passive: false });
+    this.stage.addEventListener("gesturechange", this.nativeGesture, { passive: false });
+    this.stage.addEventListener("gestureend", this.nativeGesture, { passive: false });
+    this.stage.addEventListener("dblclick", this.nativeGesture);
   }
 
   menuState() {
@@ -1623,8 +1646,11 @@ export class VideoStreamViewer {
 
   updateProgress() {
     const position = this.currentPosition();
-    if (!this.draggingSeek) this.seekInput.value = String(position);
-    this.updateCounter(this.draggingSeek ? Number(this.seekInput.value) : position);
+    const displayed = this.draggingSeek
+      ? Number(this.seekInput.value)
+      : this.seekPreviewOwner.displayedPosition(position);
+    if (!this.draggingSeek) this.seekInput.value = String(displayed);
+    this.updateCounter(displayed);
   }
 
   updateCounter(position) {
@@ -2078,6 +2104,11 @@ export class VideoStreamViewer {
     this.stage.removeEventListener("pointermove", this.pointerMove);
     this.stage.removeEventListener("pointerup", this.pointerUp);
     this.stage.removeEventListener("pointercancel", this.pointerCancel);
+    this.stage.removeEventListener("touchend", this.nativeGesture);
+    this.stage.removeEventListener("gesturestart", this.nativeGesture);
+    this.stage.removeEventListener("gesturechange", this.nativeGesture);
+    this.stage.removeEventListener("gestureend", this.nativeGesture);
+    this.stage.removeEventListener("dblclick", this.nativeGesture);
     if (this.session) {
       fetch("/api/video/stop", {
         method: "POST",

@@ -747,6 +747,12 @@ button {
   user-select: none;
 }
 
+.video-stream-viewer,
+.video-stream-stage,
+.stream-video {
+  touch-action: none;
+}
+
 .stream-video {
   display: block;
   width: 100%;

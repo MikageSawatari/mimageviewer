@@ -113,6 +113,24 @@ test("the grid owns pinch scaling while one-finger vertical scroll stays native"
   assert.doesNotMatch(app, /縦持ちの列数|横持ちの列数/);
 });
 
+test("video owns repeated taps and pinch without allowing native page zoom", async () => {
+  const css = await readFile(new URL("styles.css", here), "utf8");
+  const video = await readFile(new URL("video-stream.mjs", here), "utf8");
+  assert.match(
+    css,
+    /\.video-stream-viewer,\s*\.video-stream-stage,\s*\.stream-video\s*\{[^}]*touch-action:\s*none/
+  );
+  assert.match(
+    video,
+    /addEventListener\("touchend", this\.nativeGesture, \{\s*passive: false,?\s*\}\)/
+  );
+  assert.match(video, /addEventListener\("gesturestart", this\.nativeGesture/);
+  assert.match(video, /addEventListener\("dblclick", this\.nativeGesture/);
+  assert.match(video, /removeEventListener\("touchend", this\.nativeGesture\)/);
+  assert.match(video, /removeEventListener\("gesturestart", this\.nativeGesture\)/);
+  assert.match(video, /removeEventListener\("dblclick", this\.nativeGesture\)/);
+});
+
 async function pngDimensions(relativePath) {
   const bytes = await readFile(new URL(relativePath, here));
   assert.deepEqual(

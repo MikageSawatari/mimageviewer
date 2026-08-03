@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -21,7 +21,9 @@ use ffmpeg_the_third as ffmpeg;
 use super::audio::ProcessedChunk;
 use super::audio::SafetyLimiter;
 use super::stream::audio_encoder::{OpenedAacEncoder, open_aac_encoder};
-use super::stream::encoder::{EncoderPreference, FrameRate, H264InputFormat};
+use super::stream::encoder::{
+    EncoderPreference, FrameRate, H264InputFormat, SEGMENT_DURATION_SECS,
+};
 use super::stream::playlist::SegmentLookup;
 use super::stream::quality::{OutputDimensions, QualityPreset};
 use super::stream::segmenter::Fmp4Segmenter;
@@ -72,6 +74,8 @@ pub struct ClocklessTranscodeOptions {
     pub profile_swscale: bool,
     /// Requested source-timeline origin for this generation.
     pub source_origin_secs: f64,
+    /// Runtime generation identifier used only for lifecycle diagnostics.
+    pub(crate) diagnostic_generation: Option<u64>,
 }
 
 impl ClocklessTranscodeOptions {
@@ -86,6 +90,7 @@ impl ClocklessTranscodeOptions {
             segment_capacity: 30,
             profile_swscale: false,
             source_origin_secs: 0.0,
+            diagnostic_generation: None,
         }
     }
 }
@@ -315,6 +320,11 @@ impl ClocklessStreamOutput {
 }
 
 fn media_playlist_with_end(mut body: String, ended: bool) -> String {
+    const START_AT_GENERATION_ORIGIN: &str = "#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n";
+    if !body.contains("#EXT-X-START:") {
+        let insert_at = body.find('\n').map_or(0, |index| index + 1);
+        body.insert_str(insert_at, START_AT_GENERATION_ORIGIN);
+    }
     if ended && !body.contains("#EXT-X-ENDLIST") {
         body.push_str("#EXT-X-ENDLIST\n");
     }
@@ -388,6 +398,7 @@ struct ClocklessControlInner {
     capacity: u64,
     auto_release: bool,
     cancel: AtomicBool,
+    diagnostic_generation: AtomicU64,
     external_cancel: Mutex<Option<Arc<AtomicBool>>>,
     state: Mutex<AheadState>,
     wake: Condvar,
@@ -420,6 +431,7 @@ impl ClocklessTranscodeControl {
                 capacity,
                 auto_release,
                 cancel: AtomicBool::new(false),
+                diagnostic_generation: AtomicU64::new(0),
                 external_cancel: Mutex::new(None),
                 state: Mutex::new(AheadState {
                     produced_segments: 0,
@@ -439,6 +451,19 @@ impl ClocklessTranscodeControl {
 
     pub(crate) fn bind_cancel_flag(&self, cancel: Arc<AtomicBool>) {
         *self.inner.external_cancel.lock().unwrap() = Some(cancel);
+    }
+
+    fn set_diagnostic_generation(&self, generation: Option<u64>) {
+        self.inner
+            .diagnostic_generation
+            .store(generation.unwrap_or(0), Ordering::Release);
+    }
+
+    fn diagnostic_generation(&self) -> String {
+        match self.inner.diagnostic_generation.load(Ordering::Acquire) {
+            0 => "standalone".to_owned(),
+            generation => generation.to_string(),
+        }
     }
 
     /// Release every segment through `sequence` (inclusive). Stale or future acknowledgements
@@ -485,17 +510,45 @@ impl ClocklessTranscodeControl {
                 return Err(ClocklessStop::Cancelled);
             }
             if state.phase == AheadPhase::Finishing {
+                if state.waiting_for_capacity {
+                    crate::logger::log(format!(
+                        "remote-stream clockless generation resumed: generation={} reason=finishing produced_segments={} released_segments={}",
+                        self.diagnostic_generation(),
+                        state.produced_segments,
+                        state.released_segments,
+                    ));
+                }
                 state.waiting_for_capacity = false;
                 return Ok(());
             }
             let ahead = state
                 .produced_segments
                 .saturating_sub(state.released_segments);
-            if ahead < self.inner.capacity {
+            // Keep one bounded working fragment beyond the advertised ahead target. Without it,
+            // a source ending just after a full segment parks before demux can observe EOF; the
+            // terminal fragment then has no URL that a browser could fetch to release capacity.
+            if ahead <= self.inner.capacity {
+                if state.waiting_for_capacity {
+                    crate::logger::log(format!(
+                        "remote-stream clockless generation resumed: generation={} produced_segments={} released_segments={} ahead_segments={ahead}",
+                        self.diagnostic_generation(),
+                        state.produced_segments,
+                        state.released_segments,
+                    ));
+                }
                 state.waiting_for_capacity = false;
                 return Ok(());
             }
-            state.waiting_for_capacity = true;
+            if !state.waiting_for_capacity {
+                state.waiting_for_capacity = true;
+                crate::logger::log(format!(
+                    "remote-stream clockless generation parked: generation={} produced_segments={} released_segments={} ahead_segments={ahead} target_segments={}",
+                    self.diagnostic_generation(),
+                    state.produced_segments,
+                    state.released_segments,
+                    self.inner.capacity,
+                ));
+            }
             state = self.inner.wake.wait(state).unwrap();
         }
     }
@@ -1031,6 +1084,34 @@ pub(crate) fn run_clockless_stream(
     audio_processing: ClocklessAudioProcessing,
     on_ready: impl FnOnce(ClocklessOutputInfo),
 ) -> Result<ClocklessTranscodeReport, String> {
+    control.set_diagnostic_generation(options.diagnostic_generation);
+    let generation = control.diagnostic_generation();
+    crate::logger::log(format!(
+        "remote-stream clockless generation start: generation={generation} origin_secs={:.3} prefetch_target_secs={:.3} segment_capacity={}",
+        options.source_origin_secs,
+        options.segment_capacity as f64 * f64::from(SEGMENT_DURATION_SECS),
+        options.segment_capacity,
+    ));
+    let result =
+        run_clockless_stream_inner(options, control, stream_output, audio_processing, on_ready);
+    let reason = match &result {
+        Ok(_) => "complete".to_owned(),
+        Err(error) if error == "clockless transcode cancelled" => "cancel".to_owned(),
+        Err(error) => format!("error error={error}"),
+    };
+    crate::logger::log(format!(
+        "remote-stream clockless generation stopped: generation={generation} reason={reason}"
+    ));
+    result
+}
+
+fn run_clockless_stream_inner(
+    options: &ClocklessTranscodeOptions,
+    control: &ClocklessTranscodeControl,
+    stream_output: ClocklessStreamOutput,
+    audio_processing: ClocklessAudioProcessing,
+    on_ready: impl FnOnce(ClocklessOutputInfo),
+) -> Result<ClocklessTranscodeReport, String> {
     validate_options(options, control)?;
     ffmpeg::init().map_err(|error| format!("FFmpeg initialization failed: {error}"))?;
     let wall_started = Instant::now();
@@ -1219,6 +1300,13 @@ pub(crate) fn run_clockless_stream(
                         if pts < source_origin_secs {
                             continue;
                         }
+                        if state.video_frames == 0 {
+                            crate::logger::log(format!(
+                                "remote-stream clockless first video frame: generation={} origin_secs={source_origin_secs:.3} frame_pts_secs={pts:.3} delta_secs={:.3}",
+                                state.control.diagnostic_generation(),
+                                pts - source_origin_secs,
+                            ));
+                        }
                         state.push_video_frame(&frame, pts)?;
                     }
                     Err(ffmpeg::Error::Other { errno }) if errno == FFMPEG_EAGAIN => break,
@@ -1264,7 +1352,15 @@ pub(crate) fn run_clockless_stream(
     // Capacity belongs at the packet/frame production boundary, not before demux. Otherwise a
     // final full segment can fill the live window and park the worker before it observes EOF.
     // Once EOF is known, the remaining codec delay and final fragment are bounded and use the
-    // ring's one reserved terminal slot.
+    // ring's reserved terminal slot after the bounded working fragment.
+    let ahead = state.control.snapshot();
+    crate::logger::log(format!(
+        "remote-stream clockless {} reached: generation={} transition=Producing->Finishing produced_segments={} released_segments={}",
+        if reached_limit { "source limit" } else { "EOF" },
+        state.control.diagnostic_generation(),
+        ahead.produced_segments,
+        ahead.released_segments,
+    ));
     state.control.begin_finishing();
 
     if !reached_limit {
@@ -1378,10 +1474,19 @@ fn finish_transcode(
         state.output.record_completed(sequence)?;
     }
     state.wait_for_capacity()?;
-    if let Some(sequence) = state.output.finish()? {
+    let terminal_sequence = state.output.finish()?;
+    if let Some(sequence) = terminal_sequence {
         state.completed_segments = state.completed_segments.max(sequence.saturating_add(1));
     }
     state.observe_segments();
+    let final_metrics = state.output.metrics();
+    crate::logger::log(format!(
+        "remote-stream clockless final fragment published: generation={} terminal_sequence={} generated_end_secs={:.3} ended={}",
+        state.control.diagnostic_generation(),
+        terminal_sequence.map_or_else(|| "none".to_owned(), |sequence| sequence.to_string()),
+        final_metrics.generated_end_secs,
+        final_metrics.ended,
+    ));
 
     let wall_secs = wall_started.elapsed().as_secs_f64();
     let source_secs_processed = (state.max_source_pts - source_start_secs).max(0.0);
@@ -1442,9 +1547,9 @@ fn validate_options(
 }
 
 fn retained_segment_capacity(segment_capacity: usize) -> Result<usize, String> {
-    segment_capacity
-        .checked_add(1)
-        .ok_or_else(|| "segment capacity leaves no room for the terminal fragment".to_owned())
+    segment_capacity.checked_add(2).ok_or_else(|| {
+        "segment capacity leaves no room for the working and terminal fragments".to_owned()
+    })
 }
 
 fn stream_start_secs(stream: &ffmpeg::Stream<'_>) -> f64 {
@@ -1476,12 +1581,11 @@ mod tests {
 
     use super::*;
 
-    fn write_finite_av_fixture(path: &Path) {
+    fn write_finite_av_fixture(path: &Path, video_frames: i64) {
         use ffmpeg::codec::packet::Flags;
 
         const WIDTH: usize = 320;
         const HEIGHT: usize = 180;
-        const VIDEO_FRAMES: i64 = 5;
         const AUDIO_SAMPLES_PER_PACKET: usize = 4_000;
         const AUDIO_RATE: i32 = 8_000;
 
@@ -1529,7 +1633,7 @@ mod tests {
         }
         output.write_header().unwrap();
 
-        for index in 0..VIDEO_FRAMES {
+        for index in 0..video_frames {
             let mut pixels = vec![0_u8; WIDTH * HEIGHT * 3];
             for pixel in pixels.chunks_exact_mut(3) {
                 pixel[0] = (index * 31) as u8;
@@ -1559,7 +1663,9 @@ mod tests {
     #[test]
     fn full_ahead_window_stops_and_release_resumes_driver() {
         let control = ClocklessTranscodeControl::manual(2).unwrap();
-        control.record_produced(2);
+        // The advertised two-segment target has one bounded working fragment. The producer
+        // parks before accepting another frame only after all three are occupied.
+        control.record_produced(3);
         let waiter = control.clone();
         let (tx, rx) = mpsc::channel();
         let thread = thread::spawn(move || {
@@ -1592,7 +1698,7 @@ mod tests {
     #[test]
     fn eof_finishing_uses_terminal_slot_without_waiting_for_an_unpublished_fragment() {
         let control = ClocklessTranscodeControl::manual(1).unwrap();
-        control.record_produced(1);
+        control.record_produced(2);
         let waiter = control.clone();
         let (tx, rx) = mpsc::channel();
         let thread = thread::spawn(move || {
@@ -1612,7 +1718,7 @@ mod tests {
 
         rx.recv_timeout(Duration::from_secs(1)).unwrap();
         thread.join().unwrap();
-        assert_eq!(control.snapshot().produced_segments, 1);
+        assert_eq!(control.snapshot().produced_segments, 2);
     }
 
     #[test]
@@ -1664,8 +1770,11 @@ mod tests {
     #[test]
     fn ended_output_adds_endlist_once_without_changing_live_playlists() {
         let live = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n".to_owned();
-        assert_eq!(media_playlist_with_end(live.clone(), false), live);
+        let started = media_playlist_with_end(live.clone(), false);
+        assert!(started.contains("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n"));
+        assert!(!started.contains("#EXT-X-ENDLIST"));
         let ended = media_playlist_with_end(live, true);
+        assert!(ended.contains("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n"));
         assert!(ended.ends_with("#EXT-X-ENDLIST\n"));
         assert_eq!(media_playlist_with_end(ended.clone(), true), ended);
     }
@@ -1728,7 +1837,7 @@ mod tests {
         let generated_path = temp.path().join("finite-av.avi");
         let external_path = std::env::var_os("MIV_CLOCKLESS_EOF_FIXTURE").map(PathBuf::from);
         let path = external_path.clone().unwrap_or_else(|| {
-            write_finite_av_fixture(&generated_path);
+            write_finite_av_fixture(&generated_path, 5);
             generated_path
         });
         let mut options = ClocklessTranscodeOptions::benchmark(path);
@@ -1784,6 +1893,53 @@ mod tests {
             output.segment(latest),
             ClocklessSegmentBytes::Found(_)
         ));
+        assert!(
+            output
+                .media_playlist()
+                .expect("final media playlist")
+                .ends_with("#EXT-X-ENDLIST\n")
+        );
+    }
+
+    #[test]
+    fn finite_source_reaches_end_after_filling_the_live_window_without_a_next_fetch() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("full-window-finite-av.avi");
+        // 2 fps for 4.5 seconds: two complete 2-second fragments plus a finite tail. With a
+        // one-segment live target this reproduces a browser that fetched the visible live edge
+        // but does not ask for an unpublished terminal fragment.
+        write_finite_av_fixture(&path, 9);
+        let mut options = ClocklessTranscodeOptions::benchmark(path);
+        options.hw_decode = false;
+        options.quality = ClocklessQuality::Minimum;
+        options.max_source_secs = None;
+        options.segment_capacity = 1;
+        let control = ClocklessTranscodeControl::manual(options.segment_capacity).unwrap();
+        let output = ClocklessStreamOutput::new(options.segment_capacity, 0.0).unwrap();
+        let worker_control = control.clone();
+        let worker_output = output.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = run_clockless_stream(
+                &options,
+                &worker_control,
+                worker_output,
+                ClocklessAudioProcessing::default(),
+                |_| {},
+            );
+            result_tx.send(result).unwrap();
+        });
+
+        let result = result_rx.recv_timeout(Duration::from_secs(5));
+        if result.is_err() {
+            control.cancel();
+        }
+        let result = result.expect(
+            "finite producer parked at the live edge before it could observe EOF and publish ENDLIST",
+        );
+        result.unwrap();
+        worker.join().unwrap();
+        assert!(output.metrics().ended);
         assert!(
             output
                 .media_playlist()

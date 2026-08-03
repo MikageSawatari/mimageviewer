@@ -105,6 +105,7 @@ impl fmt::Display for StreamResourceError {
 type SharedGenerationStatus = Arc<(Mutex<StreamGenerationStatus>, Condvar)>;
 
 struct GenerationConfig {
+    generation: StreamingGeneration,
     path: PathBuf,
     encoder: EncoderPreference,
     quality: QualityPreset,
@@ -226,6 +227,7 @@ impl StreamingGenerationHandle {
         let activity = registration.activity();
         let cancel = registration.cancel_flag();
         let config = GenerationConfig {
+            generation,
             path: source_path,
             encoder,
             quality,
@@ -607,6 +609,7 @@ fn run_generation_worker(
         segment_capacity: config.segment_capacity,
         profile_swscale: false,
         source_origin_secs: config.source_origin_secs,
+        diagnostic_generation: Some(config.generation.0),
     };
     run_clockless_stream(&options, control, output, config.audio_processing, on_ready).map(|_| ())
 }

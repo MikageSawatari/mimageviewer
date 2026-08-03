@@ -436,6 +436,28 @@ HLS のライブウィンドウ (直近 60 秒) 内は `<video>` 上で完結す
 到着した場合は thumbnail を待たずに破棄し、配信 readiness や generation switch の条件には
 thumbnail を含めない。
 
+#### 実機仕上げ是正 (generation 起点 / 終端 / gesture、2026-08-03)
+
+- generation の transcode seek は backward keyframe seek 後、映像は要求 origin 未満の PTS を
+  decode-and-discard し、音声は origin を跨ぐ packet だけ trim する。実機 HTTP ログで先頭取得が
+  `1.m4s` / `2.m4s` から始まった世代があり、2 / 4 秒ずれは decoder の着地ではなく live edge を
+  選んだ端末側の開始位置だった。media playlist は `EXT-X-START:TIME-OFFSET=0,PRECISE=YES` を
+  宣言し、hls.js にも `startPosition: 0` と segment boundary 開始を明示して generation 先頭を選ぶ
+- seek bar はドラッグ終了後も `VideoSeekPreviewOwner` の要求位置を表示の正本とする。
+  新 generation の `playing` / `loadeddata` で playback 所有へ戻るまでは、旧 media element の
+  `currentTime` で range / counter を巻き戻さない
+- 先読み窓を埋めた有限素材では、次の frame/chunk の capacity 待ちが demux の EOF 観測より先に
+  起き、未公開の終端を端末が取得して release することもできない循環があった。advertised target
+  の外に公開可能な working fragment 1 本を有界に許可し、ring は target + working + terminal の
+  2 予約 slot を持つ。working fragment が公開されれば通常の取得で再開でき、EOF 観測後の codec
+  drain は従来どおり terminal slot で完了する
+- 動画 surface は静止画の transform owner を通らず、tap zone が再生 / ±10 秒 command を所有する。
+  動画に拡大状態は設けない。連続 tap と pinch は Safari の native page zoom を明示的に抑止し、
+  静止画 viewer の拡大・reset 操作には影響させない
+- clockless worker は generation 開始 (origin / 先読み目標)、最初の映像 PTS、EOF から Finishing
+  への遷移、先読み満杯の park / resume、最終 fragment 公開と ended、停止理由
+  (complete / cancel / error) を `remote-stream clockless ...` の通常ログへ残す
+
 `#EXT-X-DISCONTINUITY` による同一プレイリスト継続は、iOS のネイティブ実装との相性を
 確認できるまで採らない。URL を切り替える方が確実で、実装も単純。
 
@@ -856,8 +878,9 @@ CPU に戻さず GPU scale して NVENC へ渡す経路が次の性能投資候�
   で開始する。終端は decoder、resampler、H.264/AAC encoder、A/V mux、既存
   `Fmp4Segmenter::finish()` の順に flush し、最終 fragment を ring に記録してから `Ended` と
   session 側の `#EXT-X-ENDLIST` を公開する。単なる ring 満杯とは区別する。live 30 本とは別に
-  terminal fragment 専用の 1 slot を ring に予約し、入力 EOF を観測した後の有限な codec drain は
-  未公開 fragment の取得待ちへ入れない
+  EOF を観測するための working fragment 1 slot と terminal fragment 1 slot を ring に予約する。
+  working fragment は公開・取得可能にし、入力 EOF を観測した後の有限な codec drain は未公開
+  fragment の取得待ちへ入れない
 - **世代資源の排他**: generation worker の auxiliary decoder / FFmpeg 所有 D3D11 device / H.264
   encoder の全寿命を process-wide lease で直列化する。seek や start が旧 handle の非同期 join より
   先に到着しても、旧 worker が戻り FFmpeg context が drop されるまでは次世代を open しない。
