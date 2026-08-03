@@ -37919,9 +37919,13 @@ impl App {
         let free_rotation = self.fs_free_rotation;
         let id = self.ensure_detached_viewer_window_id();
         let placement = self.ensure_detached_window_runtime_placement(id, "build_active_snapshot");
+        let pixels_per_point = ctx
+            .map(egui::Context::pixels_per_point)
+            .unwrap_or(self.detached_viewer_last_pixels_per_point);
         let (image_rect_norm, image_content_bbox) = self.detached_single_image_snapshot_layout(
             idx,
             placement,
+            pixels_per_point,
             texture_size,
             rotation,
             zoom_pan,

@@ -31,6 +31,7 @@ use crate::app::{
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
     FullscreenPageLayoutKind, ResolvedDisplayPlacement, ResolvedZTransform, ZTransformInput,
+    physical_pixel_scale, physical_scale_is_near_integer, quantize_points_to_physical_pixels,
 };
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
@@ -1341,6 +1342,20 @@ struct SpreadPageDrawRects {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct SpreadPageLayoutSize {
+    size: egui::Vec2,
+    scale_factor: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SpreadLayoutGeometry {
+    left: SpreadPageLayoutSize,
+    right: SpreadPageLayoutSize,
+    fit_size: egui::Vec2,
+    content_center_offset: egui::Vec2,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct CaptureRegionTarget {
     pub(crate) idx: usize,
     pub(crate) source_size: [usize; 2],
@@ -1406,6 +1421,7 @@ struct ContinuousReadingPageSize {
     width: f32,
     height: f32,
     content_bbox: Option<egui::Rect>,
+    logical_scale: f32,
 }
 
 impl ContinuousReadingPageSize {
@@ -1415,6 +1431,7 @@ impl ContinuousReadingPageSize {
             width,
             height,
             content_bbox: None,
+            logical_scale: 1.0,
         }
     }
 
@@ -1438,6 +1455,31 @@ struct ContinuousReadingUnitSize {
     width: f32,
     height: f32,
     page_gap: f32,
+    logical_scale: f32,
+}
+
+fn apply_continuous_spread_geometry(
+    size: &mut ContinuousReadingUnitSize,
+    match_page_heights: bool,
+) {
+    if size.pages.len() != 2 {
+        return;
+    }
+    let geometry = spread_layout_geometry(
+        egui::vec2(size.pages[0].width, size.pages[0].height),
+        egui::vec2(size.pages[1].width, size.pages[1].height),
+        size.pages[0].bbox(),
+        size.pages[1].bbox(),
+        match_page_heights,
+    );
+    size.pages[0].width = geometry.left.size.x;
+    size.pages[0].height = geometry.left.size.y;
+    size.pages[0].logical_scale = geometry.left.scale_factor;
+    size.pages[1].width = geometry.right.size.x;
+    size.pages[1].height = geometry.right.size.y;
+    size.pages[1].logical_scale = geometry.right.scale_factor;
+    size.width = geometry.fit_size.x;
+    size.height = geometry.fit_size.y;
 }
 
 fn continuous_spread_fit_width(
@@ -1478,6 +1520,7 @@ fn fs_image_draw_rect_for_size(
     free_rotation_rad: f32,
     fit_mode: FullscreenFitMode,
     fit_scale_limits: FullscreenFitScaleLimits,
+    pixels_per_point: f32,
     content_bbox: Option<egui::Rect>,
 ) -> Option<egui::Rect> {
     DisplayedImageTransform::resolve(DisplayedImageTransformInput {
@@ -1490,6 +1533,7 @@ fn fs_image_draw_rect_for_size(
         content_bbox,
         fit_mode,
         fit_scale_limits,
+        pixels_per_point,
         placement: ResolvedDisplayPlacement::Normal { zoom_pan },
     })
     .map(|transform| transform.full_image_rect)
@@ -1513,6 +1557,7 @@ fn fs_image_paint_rect_and_uv(
 fn continuous_reading_page_rects(
     unit_rect: egui::Rect,
     size: &ContinuousReadingUnitSize,
+    pixels_per_point: f32,
 ) -> Vec<(usize, egui::Rect, Option<egui::Rect>)> {
     let mut rects = Vec::with_capacity(size.pages.len());
     if size.pages.is_empty() {
@@ -1523,13 +1568,15 @@ fn continuous_reading_page_rects(
         let bbox = page.bbox();
         let visible_size = egui::vec2(page.visible_width(), page.visible_height());
         let visible_rect = egui::Rect::from_center_size(unit_rect.center(), visible_size);
-        let rect = egui::Rect::from_min_size(
-            egui::pos2(
-                visible_rect.min.x - bbox.min.x * page.width,
-                visible_rect.min.y - bbox.min.y * page.height,
-            ),
-            egui::vec2(page.width, page.height),
+        let mut rect_min = egui::pos2(
+            visible_rect.min.x - bbox.min.x * page.width,
+            visible_rect.min.y - bbox.min.y * page.height,
         );
+        if physical_scale_is_near_integer(page.logical_scale, pixels_per_point) {
+            rect_min.x = quantize_points_to_physical_pixels(rect_min.x, pixels_per_point);
+            rect_min.y = quantize_points_to_physical_pixels(rect_min.y, pixels_per_point);
+        }
+        let rect = egui::Rect::from_min_size(rect_min, egui::vec2(page.width, page.height));
         rects.push((page.idx, rect, page.content_bbox));
         return rects;
     }
@@ -1539,14 +1586,15 @@ fn continuous_reading_page_rects(
         .iter()
         .map(ContinuousReadingPageSize::visible_width)
         .sum::<f32>()
-        + size.page_gap.max(0.0) * size.pages.len().saturating_sub(1) as f32;
+        + quantize_points_to_physical_pixels(size.page_gap.max(0.0), pixels_per_point)
+            * size.pages.len().saturating_sub(1) as f32;
     let (visible_y_min, visible_y_max) = size.pages.iter().fold(
         (f32::INFINITY, f32::NEG_INFINITY),
         |(min_y, max_y), page| {
             let bbox = page.bbox();
             (
-                min_y.min(bbox.min.y * page.height),
-                max_y.max(bbox.max.y * page.height),
+                min_y.min(-page.height * 0.5 + bbox.min.y * page.height),
+                max_y.max(-page.height * 0.5 + bbox.max.y * page.height),
             )
         },
     );
@@ -1555,21 +1603,31 @@ fn continuous_reading_page_rects(
     } else {
         0.0
     };
-    let visible_h = if visible_y_max.is_finite() {
-        (visible_y_max - visible_y_min).max(1.0)
+    let visible_y_max = if visible_y_max.is_finite() {
+        visible_y_max
     } else {
         size.height.max(1.0)
     };
-    let full_top = unit_rect.center().y - visible_h * 0.5 - visible_y_min;
+    let visible_center_y = (visible_y_min + visible_y_max) * 0.5;
     let mut visible_x = unit_rect.center().x - total_visible_w.max(1.0) * 0.5;
+    let unit_snap = physical_scale_is_near_integer(size.logical_scale, pixels_per_point);
+    let page_gap = quantize_points_to_physical_pixels(size.page_gap.max(0.0), pixels_per_point);
 
     for page in &size.pages {
         let bbox = page.bbox();
-        let rect = egui::Rect::from_min_size(
-            egui::pos2(visible_x - bbox.min.x * page.width, full_top),
-            egui::vec2(page.width, page.height),
+        let mut rect_min = egui::pos2(
+            visible_x - bbox.min.x * page.width,
+            unit_rect.center().y - visible_center_y - page.height * 0.5,
         );
-        visible_x += page.visible_width() + size.page_gap.max(0.0);
+        if physical_scale_is_near_integer(page.logical_scale, pixels_per_point) {
+            rect_min.x = quantize_points_to_physical_pixels(rect_min.x, pixels_per_point);
+            rect_min.y = quantize_points_to_physical_pixels(rect_min.y, pixels_per_point);
+        }
+        let rect = egui::Rect::from_min_size(rect_min, egui::vec2(page.width, page.height));
+        visible_x += page.visible_width() + page_gap;
+        if unit_snap {
+            visible_x = quantize_points_to_physical_pixels(visible_x, pixels_per_point);
+        }
         rects.push((page.idx, rect, page.content_bbox));
     }
     rects
@@ -1603,36 +1661,97 @@ fn normalized_sub_rect(rect: egui::Rect, uv: egui::Rect) -> egui::Rect {
     )
 }
 
+fn spread_layout_geometry(
+    left_size: egui::Vec2,
+    right_size: egui::Vec2,
+    left_bbox: egui::Rect,
+    right_bbox: egui::Rect,
+    match_page_heights: bool,
+) -> SpreadLayoutGeometry {
+    let combined_h = left_size.y.max(right_size.y).max(1.0);
+    let page = |size: egui::Vec2| {
+        let scale_factor = if match_page_heights {
+            combined_h / size.y.max(1.0)
+        } else {
+            1.0
+        };
+        SpreadPageLayoutSize {
+            size: size * scale_factor,
+            scale_factor,
+        }
+    };
+    let left = page(left_size);
+    let right = page(right_size);
+    let layout_h = left.size.y.max(right.size.y).max(1.0);
+    let left_visible_w = (left_bbox.width() * left.size.x).max(1.0);
+    let right_visible_w = (right_bbox.width() * right.size.x).max(1.0);
+    let visible_y_extent = |page: SpreadPageLayoutSize, bbox: egui::Rect| {
+        let page_top = (layout_h - page.size.y) * 0.5;
+        (
+            page_top + bbox.min.y * page.size.y,
+            page_top + bbox.max.y * page.size.y,
+        )
+    };
+    let (left_y0, left_y1) = visible_y_extent(left, left_bbox);
+    let (right_y0, right_y1) = visible_y_extent(right, right_bbox);
+    let visible_y0 = left_y0.min(right_y0);
+    let visible_y1 = left_y1.max(right_y1);
+    let fit_h = (visible_y1 - visible_y0).max(1.0);
+
+    SpreadLayoutGeometry {
+        left,
+        right,
+        fit_size: egui::vec2(left_visible_w + right_visible_w, fit_h),
+        content_center_offset: egui::vec2(0.0, (visible_y0 + visible_y1) * 0.5 - layout_h * 0.5),
+    }
+}
+
 fn layout_spread_page_rects(
     center: egui::Pos2,
-    left_w: f32,
-    right_w: f32,
-    combined_h: f32,
+    geometry: SpreadLayoutGeometry,
     total_scale: f32,
     spread_gap: f32,
+    pixels_per_point: f32,
     left_bbox: egui::Rect,
     right_bbox: egui::Rect,
     content_active: bool,
 ) -> SpreadPageDrawRects {
-    let scaled_lw = left_w * total_scale;
-    let scaled_rw = right_w * total_scale;
-    let scaled_h = combined_h * total_scale;
-    let scaled_left_visible_w = (left_bbox.width() * left_w).max(1.0) * total_scale;
-    let scaled_right_visible_w = (right_bbox.width() * right_w).max(1.0) * total_scale;
+    let pixels_per_point = 1.0 / physical_pixel_scale(pixels_per_point);
+    let scaled_left_size = geometry.left.size * total_scale;
+    let scaled_right_size = geometry.right.size * total_scale;
+    let scaled_left_visible_w = (left_bbox.width() * geometry.left.size.x).max(1.0) * total_scale;
+    let scaled_right_visible_w =
+        (right_bbox.width() * geometry.right.size.x).max(1.0) * total_scale;
 
-    let total_visible_w = scaled_left_visible_w + spread_gap + scaled_right_visible_w;
-    let visible_start_x = center.x - total_visible_w * 0.5;
-    let start_y = center.y - scaled_h * 0.5;
-    let left_x = visible_start_x - left_bbox.min.x * scaled_lw;
-    let right_visible_x = visible_start_x + scaled_left_visible_w + spread_gap;
-    let right_x = right_visible_x - right_bbox.min.x * scaled_rw;
-
-    let left_rect =
-        egui::Rect::from_min_size(egui::pos2(left_x, start_y), egui::vec2(scaled_lw, scaled_h));
-    let right_rect = egui::Rect::from_min_size(
-        egui::pos2(right_x, start_y),
-        egui::vec2(scaled_rw, scaled_h),
+    let spread_gap_px = (spread_gap.max(0.0) * pixels_per_point).round();
+    let total_visible_w_px =
+        (scaled_left_visible_w + scaled_right_visible_w) * pixels_per_point + spread_gap_px;
+    let visible_start_x_px = center.x * pixels_per_point - total_visible_w_px * 0.5;
+    let left_y_px = (center.y - scaled_left_size.y * 0.5) * pixels_per_point;
+    let right_y_px = (center.y - scaled_right_size.y * 0.5) * pixels_per_point;
+    let left_x_px = visible_start_x_px - left_bbox.min.x * scaled_left_size.x * pixels_per_point;
+    let right_visible_x_px =
+        visible_start_x_px + scaled_left_visible_w * pixels_per_point + spread_gap_px;
+    let right_x_px = right_visible_x_px - right_bbox.min.x * scaled_right_size.x * pixels_per_point;
+    let from_px = |value: f32, snap: bool| {
+        if snap {
+            value.round() / pixels_per_point
+        } else {
+            value / pixels_per_point
+        }
+    };
+    let left_snap =
+        physical_scale_is_near_integer(total_scale * geometry.left.scale_factor, pixels_per_point);
+    let right_snap =
+        physical_scale_is_near_integer(total_scale * geometry.right.scale_factor, pixels_per_point);
+    let left_min = egui::pos2(from_px(left_x_px, left_snap), from_px(left_y_px, left_snap));
+    let right_min = egui::pos2(
+        from_px(right_x_px, right_snap),
+        from_px(right_y_px, right_snap),
     );
+
+    let left_rect = egui::Rect::from_min_size(left_min, scaled_left_size);
+    let right_rect = egui::Rect::from_min_size(right_min, scaled_right_size);
     let left_hit_rect = if content_active {
         normalized_sub_rect(left_rect, left_bbox)
     } else {
@@ -3038,7 +3157,10 @@ impl App {
         let cursor = ctx
             .input(|i| i.pointer.hover_pos())
             .unwrap_or_else(|| image_rect.center());
-        let no_limits = FullscreenFitScaleLimits::default();
+        let no_limits = FullscreenFitScaleLimits {
+            pixels_per_point: ctx.pixels_per_point(),
+            ..FullscreenFitScaleLimits::default()
+        };
         let Some(tex_size) = tex_size else {
             // テクスチャ未ロード: 通常のプレースホルダ描画へ委ねる。
             let bg_style = self.fs_bg_style(ctx);
@@ -3101,6 +3223,7 @@ impl App {
                 content_bbox: trim_bbox,
                 fit_mode: FullscreenFitMode::Page,
                 fit_scale_limits: no_limits,
+                pixels_per_point: ctx.pixels_per_point(),
                 placement: ResolvedDisplayPlacement::Z {
                     active,
                     factor: self.fs_zoom_factor,
@@ -3595,6 +3718,22 @@ fn zip_spread_zoom_pan(
     // target_vis_w が広がり、cover を下回って contain まで縮小できる。
     let contain = (view.x / composite.x).min(view.y / composite.y);
     let total = (view.x / target_vis_w).max(contain).max(f32::EPSILON);
+    let (pan, vis, center) = zip_spread_pan_for_total(view, composite, total, cursor_comp);
+    let zoom = if fit_scale > 0.0 {
+        total / fit_scale
+    } else {
+        1.0
+    };
+    (zoom, pan, vis, center)
+}
+
+fn zip_spread_pan_for_total(
+    view: egui::Vec2,
+    composite: egui::Vec2,
+    total_scale: f32,
+    cursor_comp: egui::Vec2,
+) -> (egui::Vec2, egui::Vec2, egui::Vec2) {
+    let total = total_scale.max(f32::EPSILON);
     let vis = egui::vec2(
         (view.x / total).min(composite.x),
         (view.y / total).min(composite.y),
@@ -3609,12 +3748,70 @@ fn zip_spread_zoom_pan(
         (composite.x / 2.0 - cx) * total,
         (composite.y / 2.0 - cy) * total,
     );
-    let zoom = if fit_scale > 0.0 {
-        total / fit_scale
+    (pan, vis, egui::vec2(cx, cy))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SpreadZipZoomResult {
+    zoom_pan: Option<(f32, egui::Vec2)>,
+    aim_frame: Option<egui::Rect>,
+    factor: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_spread_zip_zoom(
+    image_rect: egui::Rect,
+    pan_band: egui::Rect,
+    cursor: egui::Pos2,
+    fit_size: egui::Vec2,
+    spread_gap: f32,
+    fit_scale: f32,
+    factor: f32,
+    active: bool,
+    forced_total_scale: Option<f32>,
+) -> SpreadZipZoomResult {
+    let gap_page = spread_gap / fit_scale.max(f32::EPSILON);
+    let composite = egui::vec2(fit_size.x + gap_page, fit_size.y);
+    let single_page_w = fit_size.x * 0.5;
+    let z_contain = (image_rect.width() / composite.x).min(image_rect.height() / composite.y);
+    let factor_min = if image_rect.width() > 0.0 {
+        (1.2 * single_page_w * z_contain / image_rect.width()).min(1.0)
     } else {
         1.0
     };
-    (zoom, pan, vis, egui::vec2(cx, cy))
+    let factor = factor.clamp(factor_min, 16.0);
+    let cursor_comp = zip_cursor_image_px(pan_band, egui::Vec2::ZERO, composite, cursor);
+    let (zoom, pan, vis, center_comp) = match forced_total_scale {
+        Some(total_scale) => {
+            let (pan, vis, center) =
+                zip_spread_pan_for_total(image_rect.size(), composite, total_scale, cursor_comp);
+            (total_scale / fit_scale.max(f32::EPSILON), pan, vis, center)
+        }
+        None => zip_spread_zoom_pan(
+            image_rect.size(),
+            composite,
+            single_page_w,
+            factor,
+            fit_scale,
+            cursor_comp,
+        ),
+    };
+    if active {
+        SpreadZipZoomResult {
+            zoom_pan: Some((zoom, pan)),
+            aim_frame: None,
+            factor,
+        }
+    } else {
+        let comp_disp_min = image_rect.center() - composite * (fit_scale * 0.5);
+        let frame_min = comp_disp_min
+            + egui::vec2(center_comp.x - vis.x / 2.0, center_comp.y - vis.y / 2.0) * fit_scale;
+        SpreadZipZoomResult {
+            zoom_pan: None,
+            aim_frame: Some(egui::Rect::from_min_size(frame_min, vis * fit_scale)),
+            factor,
+        }
+    }
 }
 
 fn capture_region_outside_rects(bounds: egui::Rect, hole: egui::Rect) -> [egui::Rect; 4] {
@@ -3777,16 +3974,34 @@ fn count_seek_overlay_non_image_items(items: &[GridItem], nav_indices: &[usize])
         })
 }
 
-fn vertical_reading_offsets(heights: &[f32], gap: f32, current_pos: usize) -> Vec<f32> {
+fn vertical_reading_offsets(
+    heights: &[f32],
+    gap: f32,
+    current_pos: usize,
+    pixels_per_point: f32,
+    snap_to_physical_pixels: bool,
+) -> Vec<f32> {
     if heights.is_empty() || current_pos >= heights.len() {
         return Vec::new();
     }
+    let gap = if snap_to_physical_pixels {
+        quantize_points_to_physical_pixels(gap.max(0.0), pixels_per_point)
+    } else {
+        gap.max(0.0)
+    };
+    let quantize = |offset: f32| {
+        if snap_to_physical_pixels {
+            quantize_points_to_physical_pixels(offset, pixels_per_point)
+        } else {
+            offset
+        }
+    };
     let mut offsets = vec![0.0; heights.len()];
     for pos in current_pos + 1..heights.len() {
-        offsets[pos] = offsets[pos - 1] + (heights[pos - 1] + heights[pos]) * 0.5 + gap.max(0.0);
+        offsets[pos] = quantize(offsets[pos - 1] + (heights[pos - 1] + heights[pos]) * 0.5 + gap);
     }
     for pos in (0..current_pos).rev() {
-        offsets[pos] = offsets[pos + 1] - (heights[pos] + heights[pos + 1]) * 0.5 - gap.max(0.0);
+        offsets[pos] = quantize(offsets[pos + 1] - (heights[pos] + heights[pos + 1]) * 0.5 - gap);
     }
     offsets
 }
@@ -4963,6 +5178,7 @@ impl App {
         &mut self,
         idx: usize,
         placement: crate::settings::DetachedViewerWindowPlacement,
+        pixels_per_point: f32,
         texture_size: egui::Vec2,
         rotation: crate::rotation_db::Rotation,
         zoom_pan: Option<(f32, egui::Vec2)>,
@@ -4981,7 +5197,8 @@ impl App {
             zoom_pan,
             free_rotation,
             self.effective_fullscreen_fit_mode(),
-            self.fullscreen_fit_scale_limits(),
+            self.fullscreen_fit_scale_limits(pixels_per_point),
+            pixels_per_point,
             content_bbox,
         )
         .unwrap_or(image_rect);
@@ -4999,6 +5216,7 @@ impl App {
         idx: usize,
         placement: crate::settings::DetachedViewerWindowPlacement,
     ) -> Vec<crate::app::DetachedImageWindowFrozenPage> {
+        let pixels_per_point = ctx.pixels_per_point();
         let SpreadPair::Double { left, right } = self.resolve_visible_spread_pair(idx) else {
             return Vec::new();
         };
@@ -5048,44 +5266,25 @@ impl App {
         let left_bbox = content_left.unwrap_or(full_bbox);
         let right_bbox = content_right.unwrap_or(full_bbox);
         let content_active = content_left.is_some() || content_right.is_some();
-        let spread_gap = self.settings.spread_page_gap_px.min(200) as f32;
-        let combined_h = left_size.y.max(right_size.y);
-        let left_w = left_size.x * (combined_h / left_size.y);
-        let right_w = right_size.x * (combined_h / right_size.y);
+        let spread_gap = quantize_points_to_physical_pixels(
+            self.settings.spread_page_gap_px.min(200) as f32,
+            pixels_per_point,
+        );
+        let matched_geometry =
+            spread_layout_geometry(left_size, right_size, left_bbox, right_bbox, true);
         let fit_mode = self.effective_fullscreen_fit_mode();
-        let fit_scale_limits = self.fullscreen_fit_scale_limits();
+        let fit_scale_limits = self.fullscreen_fit_scale_limits(pixels_per_point);
         let zoom_pan = self.fs_zoom_pan();
-        let left_visible_w = (left_bbox.width() * left_w).max(1.0);
-        let right_visible_w = (right_bbox.width() * right_w).max(1.0);
-        let (fit_w, fit_h, content_center_offset) = if content_active {
-            let cy0 = (left_bbox.min.y * combined_h).min(right_bbox.min.y * combined_h);
-            let cy1 = (left_bbox.max.y * combined_h).max(right_bbox.max.y * combined_h);
-            (
-                left_visible_w + right_visible_w,
-                (cy1 - cy0).max(1.0),
-                egui::vec2(0.0, ((cy0 + cy1) * 0.5) - (combined_h * 0.5)),
-            )
-        } else {
-            (left_w + right_w, combined_h, egui::Vec2::ZERO)
-        };
         let page_fit = || {
-            ((image_rect.width() - spread_gap).max(1.0) / (left_w + right_w))
-                .min(image_rect.height() / combined_h)
-        };
-        let content_fit = || {
-            ((image_rect.width() - spread_gap).max(1.0) / fit_w).min(image_rect.height() / fit_h)
+            ((image_rect.width() - spread_gap).max(1.0) / matched_geometry.fit_size.x)
+                .min(image_rect.height() / matched_geometry.fit_size.y)
         };
         let fit_scale = match fit_mode {
-            FullscreenFitMode::Width if content_active => {
-                (image_rect.width() - spread_gap).max(1.0) / fit_w
-            }
             FullscreenFitMode::Width => {
-                (image_rect.width() - spread_gap).max(1.0) / (left_w + right_w)
+                (image_rect.width() - spread_gap).max(1.0) / matched_geometry.fit_size.x
             }
-            FullscreenFitMode::Height if content_active => image_rect.height() / fit_h,
-            FullscreenFitMode::Height => image_rect.height() / combined_h,
-            FullscreenFitMode::Original => 1.0,
-            _ if content_active => content_fit(),
+            FullscreenFitMode::Height => image_rect.height() / matched_geometry.fit_size.y,
+            FullscreenFitMode::Original => physical_pixel_scale(pixels_per_point),
             _ => page_fit(),
         };
         let fit_scale = fit_scale_limits.apply(fit_scale);
@@ -5093,14 +5292,18 @@ impl App {
             Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
             None => (fit_scale, image_rect.center()),
         };
-        let center = base_center - content_center_offset * total_scale;
+        let geometry = if physical_scale_is_near_integer(total_scale, pixels_per_point) {
+            spread_layout_geometry(left_size, right_size, left_bbox, right_bbox, false)
+        } else {
+            matched_geometry
+        };
+        let center = base_center - geometry.content_center_offset * total_scale;
         let rects = layout_spread_page_rects(
             center,
-            left_w,
-            right_w,
-            combined_h,
+            geometry,
             total_scale,
             spread_gap,
+            pixels_per_point,
             left_bbox,
             right_bbox,
             content_active,
@@ -5117,7 +5320,6 @@ impl App {
         let right_clip_rect_norm = Self::normalize_rect_to_full_rect(right_clip_rect, full_rect);
         let left_uv_rect = Self::full_uv_rect();
         let right_uv_rect = Self::full_uv_rect();
-        let pixels_per_point = ctx.pixels_per_point();
         self.log_detached_frozen_page_bake_debug(
             "spread",
             window_id,
@@ -8616,7 +8818,9 @@ impl App {
                                     // 同一述語で判定し、描画と入力の食い違いを構造的に防ぐ。
                                     let continuous_reading_active =
                                         self.continuous_reading_active_for_idx(fs_idx);
-                                    let fit_scale_limits = self.fullscreen_fit_scale_limits();
+                                    let pixels_per_point = ctx.pixels_per_point();
+                                    let fit_scale_limits =
+                                        self.fullscreen_fit_scale_limits(pixels_per_point);
                                     if continuous_reading_active {
                                         self.draw_fs_continuous_reading(
                                             ui,
@@ -8766,7 +8970,9 @@ impl App {
                                 SpreadPair::Double { left, right } => {
                                     let compare_mode = self.compare_view_mode;
                                     let zoom_pan = self.fs_zoom_pan();
-                                    let fit_scale_limits = self.fullscreen_fit_scale_limits();
+                                    let pixels_per_point = ctx.pixels_per_point();
+                                    let fit_scale_limits =
+                                        self.fullscreen_fit_scale_limits(pixels_per_point);
                                     let compare_requested = !matches!(
                                         compare_mode,
                                         crate::app::CompareViewMode::Off
@@ -8876,7 +9082,10 @@ impl App {
                                     free_rotation_rad: 0.0,
                                     content_bbox: None,
                                     fit_mode: FullscreenFitMode::Page,
-                                    fit_scale_limits: self.fullscreen_fit_scale_limits(),
+                                    fit_scale_limits: self.fullscreen_fit_scale_limits(
+                                        ctx.pixels_per_point(),
+                                    ),
+                                    pixels_per_point: ctx.pixels_per_point(),
                                     placement: ResolvedDisplayPlacement::Normal {
                                         zoom_pan: self.fs_zoom_pan(),
                                     },
@@ -13613,7 +13822,7 @@ impl App {
                     compare_base_rect,
                     size,
                     compare_zoom_pan,
-                    self.fullscreen_fit_scale_limits(),
+                    self.fullscreen_fit_scale_limits(ctx.pixels_per_point()),
                 )
             })
             .unwrap_or(compare_base_rect);
@@ -15487,6 +15696,7 @@ impl App {
                     content_bbox,
                     fit_mode,
                     fit_scale_limits,
+                    pixels_per_point: ui.ctx().pixels_per_point(),
                     placement: ResolvedDisplayPlacement::Normal { zoom_pan },
                 })
             }) else {
@@ -15663,6 +15873,7 @@ impl App {
             image_rect.height().max(1.0)
         };
         let zoom = self.fs_zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        let pixels_per_point = ctx.pixels_per_point();
         let prefer_processed = !self.analysis_mode;
         let mut sizes = Vec::with_capacity(units.len());
         for unit in &units {
@@ -15673,6 +15884,7 @@ impl App {
                 zoom,
                 fallback,
                 prefer_processed,
+                pixels_per_point,
             ));
         }
         let extents = sizes
@@ -15685,10 +15897,15 @@ impl App {
                 }
             })
             .collect::<Vec<_>>();
+        let snap_to_physical_pixels = sizes
+            .iter()
+            .all(|size| physical_scale_is_near_integer(size.logical_scale, pixels_per_point));
         let offsets = vertical_reading_offsets(
             &extents,
             self.settings.continuous_reading_gap_px.min(200) as f32,
             current_pos,
+            pixels_per_point,
+            snap_to_physical_pixels,
         );
         vertical_reading_scroll_range(&offsets, &extents, viewport_len)
     }
@@ -15988,10 +16205,11 @@ impl App {
         }
     }
 
-    fn fullscreen_fit_scale_limits(&self) -> FullscreenFitScaleLimits {
+    fn fullscreen_fit_scale_limits(&self, pixels_per_point: f32) -> FullscreenFitScaleLimits {
         FullscreenFitScaleLimits {
             no_upscale: self.settings.fullscreen_fit_no_upscale,
             no_downscale: self.settings.fullscreen_fit_no_downscale,
+            pixels_per_point,
         }
     }
 
@@ -16372,6 +16590,7 @@ impl App {
                     width: base.x.max(1.0),
                     height: base.y.max(1.0),
                     content_bbox,
+                    logical_scale: 1.0,
                 }
             })
             .collect::<Vec<_>>();
@@ -16388,51 +16607,20 @@ impl App {
                 width: page.visible_width(),
                 height: page.visible_height(),
                 page_gap: 0.0,
+                logical_scale: 1.0,
                 pages: vec![page],
             };
         }
 
-        let combined_h = page_bases
-            .iter()
-            .map(|page| page.height)
-            .fold(1.0_f32, f32::max);
-        let mut combined_w = 0.0;
-        for page in &mut page_bases {
-            page.width *= combined_h / page.height.max(1.0);
-            page.height = combined_h;
-            combined_w += page.width;
-        }
-        let content_active = page_bases.iter().any(|page| page.content_bbox.is_some());
-        let (unit_width, unit_height) = if content_active {
-            let width = page_bases
-                .iter()
-                .map(ContinuousReadingPageSize::visible_width)
-                .sum::<f32>();
-            let (min_y, max_y) = page_bases.iter().fold(
-                (f32::INFINITY, f32::NEG_INFINITY),
-                |(min_y, max_y), page| {
-                    let bbox = page.bbox();
-                    (
-                        min_y.min(bbox.min.y * page.height),
-                        max_y.max(bbox.max.y * page.height),
-                    )
-                },
-            );
-            let height = if min_y.is_finite() && max_y.is_finite() {
-                (max_y - min_y).max(1.0)
-            } else {
-                combined_h
-            };
-            (width, height)
-        } else {
-            (combined_w, combined_h)
-        };
-        ContinuousReadingUnitSize {
+        let mut size = ContinuousReadingUnitSize {
             pages: page_bases,
-            width: unit_width.max(1.0),
-            height: unit_height.max(1.0),
+            width: 1.0,
+            height: 1.0,
             page_gap: 0.0,
-        }
+            logical_scale: 1.0,
+        };
+        apply_continuous_spread_geometry(&mut size, false);
+        size
     }
 
     fn continuous_unit_size_for_flow(
@@ -16443,10 +16631,16 @@ impl App {
         zoom: f32,
         fallback: egui::Vec2,
         prefer_processed: bool,
+        pixels_per_point: f32,
     ) -> ContinuousReadingUnitSize {
-        let mut base = self.continuous_unit_base_size(unit, fallback, prefer_processed);
+        let raw_base = self.continuous_unit_base_size(unit, fallback, prefer_processed);
+        let mut base = raw_base.clone();
+        apply_continuous_spread_geometry(&mut base, true);
         let fit_mode = self.effective_fullscreen_fit_mode();
-        let spread_gap = self.settings.spread_page_gap_px.min(200) as f32;
+        let spread_gap = quantize_points_to_physical_pixels(
+            self.settings.spread_page_gap_px.min(200) as f32,
+            pixels_per_point,
+        );
         let page_gap = if base.pages.len() > 1 {
             spread_gap
         } else {
@@ -16462,12 +16656,12 @@ impl App {
         );
         let target_w = (image_rect.width() * zoom - fit_gap_total).max(1.0);
         let target_h = (image_rect.height() * zoom).max(1.0);
-        let fit_scale_limits = self.fullscreen_fit_scale_limits();
+        let fit_scale_limits = self.fullscreen_fit_scale_limits(pixels_per_point);
         let scale = {
             let scale_for = |target_w: f32, target_h: f32| match fit_mode {
                 FullscreenFitMode::Width => target_w / fit_width.max(1.0),
                 FullscreenFitMode::Height => target_h / base.height.max(1.0),
-                FullscreenFitMode::Original => 1.0,
+                FullscreenFitMode::Original => physical_pixel_scale(pixels_per_point),
                 FullscreenFitMode::Page => {
                     (target_w / base.width.max(1.0)).min(target_h / base.height.max(1.0))
                 }
@@ -16484,17 +16678,31 @@ impl App {
                 let auto_target_h = image_rect.height().max(1.0);
                 fit_scale_limits.apply(scale_for(auto_target_w, auto_target_h)) * zoom
             } else if matches!(fit_mode, FullscreenFitMode::Original) {
-                zoom
+                physical_pixel_scale(pixels_per_point) * zoom
             } else {
                 scale_for(target_w, target_h)
             }
         };
-        base.width = (fit_width * scale + fit_gap_total).max(1.0);
+        if base.pages.len() == 2 && physical_scale_is_near_integer(scale, pixels_per_point) {
+            base = raw_base;
+            apply_continuous_spread_geometry(&mut base, false);
+        }
+        let (layout_width, _) = continuous_spread_fit_width(
+            base.pages.len(),
+            base.width,
+            self.spread_mode,
+            flow,
+            fit_mode,
+            spread_gap,
+        );
+        base.width = (layout_width * scale + fit_gap_total).max(1.0);
         base.height = (base.height * scale).max(1.0);
         base.page_gap = page_gap;
+        base.logical_scale = scale;
         for page in &mut base.pages {
             page.width = (page.width * scale).max(1.0);
             page.height = (page.height * scale).max(1.0);
+            page.logical_scale *= scale;
         }
         base
     }
@@ -16533,6 +16741,7 @@ impl App {
             return None;
         }
         let flow = self.reading_flow;
+        let pixels_per_point = ctx.pixels_per_point();
         let fallback = egui::vec2(image_rect.width().max(1.0), image_rect.height().max(1.0));
         let viewport_len = if flow.is_horizontal() {
             image_rect.width().max(1.0)
@@ -16555,6 +16764,7 @@ impl App {
                     zoom,
                     fallback,
                     prefer_processed,
+                    pixels_per_point,
                 ));
             }
             let extents = sizes
@@ -16567,10 +16777,15 @@ impl App {
                     }
                 })
                 .collect::<Vec<_>>();
+            let snap_to_physical_pixels = sizes
+                .iter()
+                .all(|size| physical_scale_is_near_integer(size.logical_scale, pixels_per_point));
             offsets = vertical_reading_offsets(
                 &extents,
                 self.settings.continuous_reading_gap_px.min(200) as f32,
                 current_pos,
+                pixels_per_point,
+                snap_to_physical_pixels,
             );
             scroll_range =
                 vertical_reading_scroll_range(&offsets, &extents, viewport_len).unwrap_or_default();
@@ -16643,7 +16858,9 @@ impl App {
             };
             let unit_rect =
                 egui::Rect::from_center_size(unit_center, egui::vec2(size.width, size.height));
-            for (idx, rect, content_bbox) in continuous_reading_page_rects(unit_rect, size) {
+            for (idx, rect, content_bbox) in
+                continuous_reading_page_rects(unit_rect, size, pixels_per_point)
+            {
                 pages.push(VerticalReadingPage {
                     idx,
                     rect,
@@ -16662,6 +16879,7 @@ impl App {
         positions: &[usize],
         offsets: &[f32],
         prefer_processed: bool,
+        pixels_per_point: f32,
     ) -> Vec<VerticalReadingPage> {
         let flow = self.reading_flow;
         let fallback = egui::vec2(image_rect.width().max(1.0), image_rect.height().max(1.0));
@@ -16678,6 +16896,7 @@ impl App {
                 zoom,
                 fallback,
                 prefer_processed,
+                pixels_per_point,
             );
             let unit_center = if flow.is_horizontal() {
                 let sign = if self.reading_direction == crate::settings::ReadingDirection::Rtl {
@@ -16697,7 +16916,9 @@ impl App {
             };
             let unit_rect =
                 egui::Rect::from_center_size(unit_center, egui::vec2(size.width, size.height));
-            for (idx, rect, content_bbox) in continuous_reading_page_rects(unit_rect, &size) {
+            for (idx, rect, content_bbox) in
+                continuous_reading_page_rects(unit_rect, &size, pixels_per_point)
+            {
                 pages.push(VerticalReadingPage {
                     idx,
                     rect,
@@ -17027,6 +17248,7 @@ impl App {
             &prepare_positions,
             &offsets,
             prefer_processed_layout,
+            ctx.pixels_per_point(),
         );
         let prepare_page_set = prepare_pages
             .iter()
@@ -17157,6 +17379,7 @@ impl App {
                 display_tex.as_ref(),
                 allow_thumbnail,
                 page.content_bbox,
+                ctx.pixels_per_point(),
             ) {
                 if crate::perf::is_enabled()
                     && let Some(handle) = display_tex.as_ref()
@@ -17543,6 +17766,7 @@ impl App {
             // 比較は現行どおり明示的な Page fit。通常表示設定へ追従させない。
             fit_mode: FullscreenFitMode::Page,
             fit_scale_limits,
+            pixels_per_point: fit_scale_limits.pixels_per_point,
             placement: ResolvedDisplayPlacement::Normal { zoom_pan },
         })
         .map(|transform| transform.full_image_rect)
@@ -17556,13 +17780,14 @@ impl App {
         mode: crate::compare_wgpu::CompareShaderMode,
         wipe_fraction: f32,
         zoom_pan: Option<(f32, egui::Vec2)>,
+        pixels_per_point: f32,
     ) -> Option<(egui::Rect, egui::Shape)> {
         let target_format = self.wgpu_render_state.as_ref()?.target_format;
         let draw_rect = Self::compare_image_draw_rect(
             image_rect,
             pair.target_size,
             zoom_pan,
-            self.fullscreen_fit_scale_limits(),
+            self.fullscreen_fit_scale_limits(pixels_per_point),
         )?;
         let callback = crate::compare_wgpu::CompareShaderCallback {
             key: pair.key,
@@ -17590,6 +17815,7 @@ impl App {
         _mode: crate::compare_wgpu::CompareShaderMode,
         _wipe_fraction: f32,
         _zoom_pan: Option<(f32, egui::Vec2)>,
+        _pixels_per_point: f32,
     ) -> Option<(egui::Rect, egui::Shape)> {
         None
     }
@@ -18350,6 +18576,7 @@ impl App {
                     crate::compare_wgpu::CompareShaderMode::Wipe,
                     fraction,
                     zoom_pan,
+                    ctx.pixels_per_point(),
                 ),
                 crate::app::CompareViewMode::Diff => self.compare_shader_shape(
                     image_rect,
@@ -18357,6 +18584,7 @@ impl App {
                     crate::compare_wgpu::CompareShaderMode::Diff,
                     0.5,
                     zoom_pan,
+                    ctx.pixels_per_point(),
                 ),
                 _ => None,
             });
@@ -18371,7 +18599,7 @@ impl App {
             return true;
         }
 
-        let fit_scale_limits = self.fullscreen_fit_scale_limits();
+        let fit_scale_limits = self.fullscreen_fit_scale_limits(ctx.pixels_per_point());
         match mode {
             crate::app::CompareViewMode::PinnedNormal => {
                 let tex =
@@ -18879,7 +19107,7 @@ impl App {
                 let zoom_pan = self.fs_zoom_pan();
                 let free_rotation = self.fs_free_rotation;
                 let fit_mode = self.effective_fullscreen_fit_mode();
-                let fit_scale_limits = self.fullscreen_fit_scale_limits();
+                let fit_scale_limits = self.fullscreen_fit_scale_limits(ctx.pixels_per_point());
                 self.fullscreen_page_layout
                     .begin(FullscreenPageLayoutKind::Single);
                 let transform = {
@@ -18938,7 +19166,8 @@ impl App {
         self.fullscreen_page_layout.clear();
         let zoom_pan = self.fs_zoom_pan();
         let fit_mode = self.effective_fullscreen_fit_mode();
-        let fit_scale_limits = self.fullscreen_fit_scale_limits();
+        let pixels_per_point = ctx.pixels_per_point();
+        let fit_scale_limits = self.fullscreen_fit_scale_limits(pixels_per_point);
         let (left_rot, right_rot) = match display_override {
             Some((left, right)) => (left.rotation, right.rotation),
             None => (self.get_rotation(left_idx), self.get_rotation(right_idx)),
@@ -19054,77 +19283,33 @@ impl App {
         };
 
         if let (Some(ls), Some(rs)) = (left_size, right_size) {
-            let spread_gap = self.settings.spread_page_gap_px.min(200) as f32;
-            // 両ページの高さを揃える（高い方に合わせる）
-            let combined_h = ls.y.max(rs.y);
-            let left_w = ls.x * (combined_h / ls.y);
-            let right_w = rs.x * (combined_h / rs.y);
-
-            let combined_w = left_w + right_w;
+            let spread_gap = quantize_points_to_physical_pixels(
+                self.settings.spread_page_gap_px.min(200) as f32,
+                pixels_per_point,
+            );
             let full_bbox = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             let left_bbox = content_left.unwrap_or(full_bbox);
             let right_bbox = content_right.unwrap_or(full_bbox);
             let content_active = content_left.is_some() || content_right.is_some();
-            let left_visible_w = (left_bbox.width() * left_w).max(1.0);
-            let right_visible_w = (right_bbox.width() * right_w).max(1.0);
-
-            // 表示トリム / 余白カット時は、見える左右ページを gap に合わせて詰める。
-            // 中央側をトリムした場合も、切った領域が見開き中央に残らないようにする。
-            let (fit_w, fit_h, content_center_offset) = if content_active {
-                let cy0 = (left_bbox.min.y * combined_h).min(right_bbox.min.y * combined_h);
-                let cy1 = (left_bbox.max.y * combined_h).max(right_bbox.max.y * combined_h);
-                (
-                    left_visible_w + right_visible_w,
-                    (cy1 - cy0).max(1.0),
-                    egui::vec2(0.0, ((cy0 + cy1) * 0.5) - (combined_h * 0.5)),
-                )
-            } else {
-                (combined_w, combined_h, egui::Vec2::ZERO)
-            };
+            let matched_geometry = spread_layout_geometry(ls, rs, left_bbox, right_bbox, true);
+            let fit_w = matched_geometry.fit_size.x;
+            let fit_h = matched_geometry.fit_size.y;
             let page_fit = || {
-                ((image_rect.width() - spread_gap).max(1.0) / combined_w)
-                    .min(image_rect.height() / combined_h)
-            };
-            let content_fit = || {
                 ((image_rect.width() - spread_gap).max(1.0) / fit_w)
                     .min(image_rect.height() / fit_h)
             };
             let fit_scale = match fit_mode {
-                FullscreenFitMode::Width if content_active => {
-                    (image_rect.width() - spread_gap).max(1.0) / fit_w
-                }
-                FullscreenFitMode::Width => (image_rect.width() - spread_gap).max(1.0) / combined_w,
-                FullscreenFitMode::Height if content_active => image_rect.height() / fit_h,
-                FullscreenFitMode::Height => image_rect.height() / combined_h,
-                FullscreenFitMode::Original => 1.0,
-                _ if content_active => content_fit(),
+                FullscreenFitMode::Width => (image_rect.width() - spread_gap).max(1.0) / fit_w,
+                FullscreenFitMode::Height => image_rect.height() / fit_h,
+                FullscreenFitMode::Original => physical_pixel_scale(pixels_per_point),
                 _ => page_fit(),
             };
             let fit_scale = fit_scale_limits.apply(fit_scale);
 
-            // ZipPla 風 全画面ズーム (見開き): **トリム後合成ページ** (fit_w × fit_h、トリムが
-            // 無ければ combined_w × combined_h) を cover×factor 相当へ拡大し、カーソル位置でパン。
-            // composite をトリム後サイズにすることで pan/clamp がトリム配置 (content_center_offset +
-            // layout_spread_page_rects) と一致し、トリム後コンテンツだけを拡大表示する (余白を見せない)。
-            // 照準中は fit のまま枠 (aim_frame) を出す。
-            let mut aim_frame: Option<egui::Rect> = None;
-            let (zoom_pan, content_center_offset) = if self.fs_zoom_mode_engaged() {
-                // 合成ページ座標にページ間隔 (spread_gap) も page 単位 (spread_gap / fit_scale) で
-                // 含める (Codex P3)。これで照準枠/確定の中心計算が layout_spread_page_rects の gap
-                // 配置と一致する (確定中は layout 側の gap も同率で拡大する。下記 effective_gap)。
-                let gap_page = spread_gap / fit_scale.max(f32::EPSILON);
-                let composite = egui::vec2(fit_w + gap_page, fit_h);
-                let single_page_w = fit_w * 0.5;
-                // ズームアウト下限 = contain (合成ページの片方の軸が画面に収まる点)。factor を
-                // その下限まで clamp して dead zone を防ぐ (geometry も contain で floor する)。
-                let z_contain =
-                    (image_rect.width() / composite.x).min(image_rect.height() / composite.y);
-                let spread_factor_min = if image_rect.width() > 0.0 {
-                    (1.2 * single_page_w * z_contain / image_rect.width()).min(1.0)
-                } else {
-                    1.0
-                };
-                self.fs_zoom_factor = self.fs_zoom_factor.clamp(spread_factor_min, 16.0);
+            // ZipPla 風ズームの composite も最終的に選んだ見開き geometry から作る。
+            // 1:1 判定は zoom 後の total_scale で行うため、まず従来の高さ合わせ geometry で
+            // 候補倍率を解決し、1:1 ならページ固有寸法へ切り替えて同じ total_scale を保つ。
+            let zip_input = if self.fs_zoom_mode_engaged() {
                 let top_m = TOP_BAR_HOVER_Y.min(image_rect.height() * 0.25);
                 let bottom_m = (FS_SEEK_BAR_HEIGHT + 8.0).min(image_rect.height() * 0.25);
                 let pan_band = egui::Rect::from_min_max(
@@ -19134,38 +19319,64 @@ impl App {
                 let cursor = ctx
                     .input(|i| i.pointer.hover_pos())
                     .unwrap_or_else(|| image_rect.center());
-                let cursor_comp =
-                    zip_cursor_image_px(pan_band, egui::Vec2::ZERO, composite, cursor);
-                let (zoom, pan, vis, center_comp) = zip_spread_zoom_pan(
-                    image_rect.size(),
-                    composite,
-                    single_page_w,
-                    self.fs_zoom_factor,
-                    fit_scale,
-                    cursor_comp,
-                );
-                if self.fs_zoom_active {
-                    // content_center_offset (トリム中央寄せ) を active でも維持する。これにより
-                    // base_center + pan と layout のトリム配置の座標系が一致する (トリム無しでは 0)。
-                    (Some((zoom, pan)), content_center_offset)
-                } else {
-                    // 照準枠: トリム後合成ページが fit_scale で image_rect 中心に表示される前提。
-                    let comp_disp_min = image_rect.center() - composite * (fit_scale * 0.5);
-                    let frame_min = comp_disp_min
-                        + egui::vec2(center_comp.x - vis.x / 2.0, center_comp.y - vis.y / 2.0)
-                            * fit_scale;
-                    aim_frame = Some(egui::Rect::from_min_size(frame_min, vis * fit_scale));
-                    (None, content_center_offset)
-                }
+                Some((pan_band, cursor))
             } else {
-                (zoom_pan, content_center_offset)
+                None
             };
-
-            let (total_scale, base_center) = match zoom_pan {
+            let mut zip_result = zip_input.map(|(pan_band, cursor)| {
+                resolve_spread_zip_zoom(
+                    image_rect,
+                    pan_band,
+                    cursor,
+                    matched_geometry.fit_size,
+                    spread_gap,
+                    fit_scale,
+                    self.fs_zoom_factor,
+                    self.fs_zoom_active,
+                    None,
+                )
+            });
+            if let Some(result) = zip_result {
+                self.fs_zoom_factor = result.factor;
+            }
+            let mut resolved_zoom_pan = zip_result
+                .and_then(|result| result.zoom_pan)
+                .or(zoom_pan.filter(|_| zip_input.is_none()));
+            let (candidate_total_scale, _) = match resolved_zoom_pan {
                 Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
                 None => (fit_scale, image_rect.center()),
             };
-            let center = base_center - content_center_offset * total_scale;
+            let preserve_page_sizes =
+                physical_scale_is_near_integer(candidate_total_scale, pixels_per_point);
+            let geometry = if preserve_page_sizes {
+                spread_layout_geometry(ls, rs, left_bbox, right_bbox, false)
+            } else {
+                matched_geometry
+            };
+            if preserve_page_sizes && let Some((pan_band, cursor)) = zip_input {
+                let result = resolve_spread_zip_zoom(
+                    image_rect,
+                    pan_band,
+                    cursor,
+                    geometry.fit_size,
+                    spread_gap,
+                    fit_scale,
+                    self.fs_zoom_factor,
+                    self.fs_zoom_active,
+                    self.fs_zoom_active.then_some(candidate_total_scale),
+                );
+                // factor の owner は高さ合わせ geometry で解決した候補倍率。ここで固有寸法
+                // geometry 側の clamp を書き戻すと、次フレームの候補倍率が変わって両 geometry
+                // を往復し得る。選択後は total_scale だけを固定して composite/pan を再解決する。
+                resolved_zoom_pan = result.zoom_pan;
+                zip_result = Some(result);
+            }
+            let aim_frame = zip_result.and_then(|result| result.aim_frame);
+            let (total_scale, base_center) = match resolved_zoom_pan {
+                Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
+                None => (fit_scale, image_rect.center()),
+            };
+            let center = base_center - geometry.content_center_offset * total_scale;
 
             // ZipPla ズーム確定中は gap も合成ページと同率 (total_scale / fit_scale = zoom) で拡大し、
             // composite に含めた gap_page と整合させる (Codex P3: 照準枠 ↔ 確定の表示範囲を一致)。
@@ -19179,11 +19390,10 @@ impl App {
             // 見える領域を中央に配置し、フルページ矩形はその背後へ戻す。
             let spread_rects = layout_spread_page_rects(
                 center,
-                left_w,
-                right_w,
-                combined_h,
+                geometry,
                 total_scale,
                 effective_gap,
+                pixels_per_point,
                 left_bbox,
                 right_bbox,
                 content_active,
@@ -19235,6 +19445,7 @@ impl App {
                     display_tex,
                     allow_thumbnail,
                     content_bbox,
+                    pixels_per_point,
                 ) {
                     self.fullscreen_page_layout.push(transform);
                 }
@@ -19257,7 +19468,10 @@ impl App {
         } else {
             // サイズ不明の場合は均等分割フォールバック
             // (ズーム/パンはサイズが分かってからでないと正しく計算できないため適用しない)
-            let spread_gap = self.settings.spread_page_gap_px.min(200) as f32;
+            let spread_gap = quantize_points_to_physical_pixels(
+                self.settings.spread_page_gap_px.min(200) as f32,
+                pixels_per_point,
+            );
             let half_w = (image_rect.width() - spread_gap).max(2.0) / 2.0;
             let left_rect =
                 egui::Rect::from_min_size(image_rect.min, egui::vec2(half_w, image_rect.height()));
@@ -19309,6 +19523,7 @@ impl App {
                     display_tex,
                     allow_thumbnail,
                     content_bbox,
+                    pixels_per_point,
                 );
             }
             // フォールバック分岐: サイズ未確定でアスペクト比が崩れる可能性があるため、
@@ -19367,6 +19582,7 @@ impl App {
         display_tex: Option<&egui::TextureHandle>,
         allow_thumbnail: bool,
         content_bbox: Option<egui::Rect>,
+        pixels_per_point: f32,
     ) -> Option<DisplayedImageTransform> {
         let thumb_tex = if allow_thumbnail {
             match thumbnails.get(idx) {
@@ -19387,22 +19603,7 @@ impl App {
                 _ => tex_size,
             };
             let img_rect = fit_display_size_in_rect(rect, display_size);
-            let fit_bbox = content_bbox.filter(|_| rotation.is_none());
-            let (paint_rect, uv_rect) = match fit_bbox {
-                Some(bbox) => (normalized_sub_rect(img_rect, bbox), bbox),
-                None => (
-                    img_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                ),
-            };
-            // 回転中は bbox のズレを避けて背景を適用しない
-            if rotation.is_none() {
-                paint_transparent_bg(painter, paint_rect, bg_style);
-                painter.image(handle.id(), paint_rect, uv_rect, egui::Color32::WHITE);
-            } else {
-                crate::app::draw_rotated_image(painter, handle.id(), img_rect, rotation);
-            }
-            return DisplayedImageTransform::from_resolved_rect(
+            let transform = DisplayedImageTransform::from_resolved_rect(
                 DisplayedImageTransformInput {
                     page_idx: idx,
                     viewport_rect,
@@ -19412,11 +19613,21 @@ impl App {
                     free_rotation_rad: 0.0,
                     content_bbox,
                     fit_mode: FullscreenFitMode::Page,
-                    fit_scale_limits: FullscreenFitScaleLimits::default(),
+                    fit_scale_limits: FullscreenFitScaleLimits {
+                        pixels_per_point,
+                        ..FullscreenFitScaleLimits::default()
+                    },
+                    pixels_per_point,
                     placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
                 },
                 img_rect,
-            );
+            )?;
+            // 回転中は bbox のズレを避けて背景を適用しない
+            if rotation.is_none() {
+                paint_transparent_bg(painter, transform.paint_rect, bg_style);
+            }
+            transform.paint_texture(painter, handle.id(), egui::Color32::WHITE);
+            return Some(transform);
         } else {
             painter.text(
                 rect.center(),
@@ -21869,6 +22080,7 @@ impl App {
         page_rect: egui::Rect,
         source_size: [usize; 2],
         rotation: crate::rotation_db::Rotation,
+        pixels_per_point: f32,
     ) -> Option<DisplayedImageTransform> {
         let tex_size = egui::vec2(source_size[0].max(1) as f32, source_size[1].max(1) as f32);
         DisplayedImageTransform::resolve(DisplayedImageTransformInput {
@@ -21880,7 +22092,11 @@ impl App {
             free_rotation_rad: 0.0,
             content_bbox: None,
             fit_mode: FullscreenFitMode::Page,
-            fit_scale_limits: FullscreenFitScaleLimits::default(),
+            fit_scale_limits: FullscreenFitScaleLimits {
+                pixels_per_point,
+                ..FullscreenFitScaleLimits::default()
+            },
+            pixels_per_point,
             placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
         })
     }
@@ -21917,6 +22133,7 @@ impl App {
                     page.transform.full_image_rect,
                     source_size,
                     self.get_rotation(idx),
+                    ctx.pixels_per_point(),
                 )
                 .ok_or_else(|| "ページの表示矩形を解決できません".to_string())?
             } else {
@@ -26833,14 +27050,20 @@ mod tests {
     fn spread_layout_collapses_inner_trim_to_gap() {
         let left_bbox = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.90, 1.0));
         let right_bbox = egui::Rect::from_min_max(egui::pos2(0.10, 0.0), egui::pos2(1.0, 1.0));
+        let geometry = spread_layout_geometry(
+            egui::vec2(100.0, 120.0),
+            egui::vec2(100.0, 120.0),
+            left_bbox,
+            right_bbox,
+            true,
+        );
 
         let rects = layout_spread_page_rects(
             egui::pos2(500.0, 300.0),
-            100.0,
-            100.0,
-            120.0,
+            geometry,
             2.0,
             8.0,
+            1.0,
             left_bbox,
             right_bbox,
             true,
@@ -26870,14 +27093,20 @@ mod tests {
     #[test]
     fn spread_layout_without_trim_keeps_full_rect_gap() {
         let full_bbox = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let geometry = spread_layout_geometry(
+            egui::vec2(30.0, 20.0),
+            egui::vec2(40.0, 20.0),
+            full_bbox,
+            full_bbox,
+            true,
+        );
 
         let rects = layout_spread_page_rects(
             egui::pos2(100.0, 50.0),
-            30.0,
-            40.0,
-            20.0,
+            geometry,
             1.0,
             5.0,
+            1.0,
             full_bbox,
             full_bbox,
             false,
@@ -26886,6 +27115,140 @@ mod tests {
         assert_f32_close(rects.right_rect.left() - rects.left_rect.right(), 5.0);
         assert_eq!(rects.left_rect, rects.left_hit_rect);
         assert_eq!(rects.right_rect, rects.right_hit_rect);
+    }
+
+    #[test]
+    fn spread_layout_quantizes_odd_gap_and_snaps_page_origins() {
+        for pixels_per_point in [1.0, 1.25, 1.5] {
+            let full_bbox = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+            let geometry = spread_layout_geometry(
+                egui::vec2(101.0, 103.0),
+                egui::vec2(99.0, 103.0),
+                full_bbox,
+                full_bbox,
+                false,
+            );
+            let rects = layout_spread_page_rects(
+                egui::pos2(100.1, 80.3),
+                geometry,
+                physical_pixel_scale(pixels_per_point),
+                1.0,
+                pixels_per_point,
+                full_bbox,
+                full_bbox,
+                false,
+            );
+
+            assert_f32_close(rects.left_rect.min.x * pixels_per_point % 1.0, 0.0);
+            assert_f32_close(rects.left_rect.min.y * pixels_per_point % 1.0, 0.0);
+            assert_f32_close(rects.right_rect.min.x * pixels_per_point % 1.0, 0.0);
+            assert_f32_close(rects.right_rect.min.y * pixels_per_point % 1.0, 0.0);
+            assert_f32_close(
+                (rects.right_rect.left() - rects.left_rect.right()) * pixels_per_point,
+                pixels_per_point.round(),
+            );
+            assert_f32_close(rects.left_rect.width() * pixels_per_point, 101.0);
+            assert_f32_close(rects.right_rect.width() * pixels_per_point, 99.0);
+        }
+    }
+
+    #[test]
+    fn spread_original_preserves_unequal_page_sizes_at_physical_one_to_one() {
+        let full_bbox = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        let left_size = egui::vec2(800.0, 1121.0);
+        let right_size = egui::vec2(801.0, 1120.0);
+        let geometry = spread_layout_geometry(left_size, right_size, full_bbox, full_bbox, false);
+
+        for pixels_per_point in [1.0, 1.25, 1.5] {
+            let rects = layout_spread_page_rects(
+                egui::pos2(100.13, 80.27),
+                geometry,
+                physical_pixel_scale(pixels_per_point),
+                1.0,
+                pixels_per_point,
+                full_bbox,
+                full_bbox,
+                false,
+            );
+
+            assert_f32_close(rects.left_rect.width() * pixels_per_point, left_size.x);
+            assert_f32_close(rects.left_rect.height() * pixels_per_point, left_size.y);
+            assert_f32_close(rects.right_rect.width() * pixels_per_point, right_size.x);
+            assert_f32_close(rects.right_rect.height() * pixels_per_point, right_size.y);
+            for origin in [rects.left_rect.min, rects.right_rect.min] {
+                assert_f32_close(
+                    origin.x * pixels_per_point,
+                    (origin.x * pixels_per_point).round(),
+                );
+                assert_f32_close(
+                    origin.y * pixels_per_point,
+                    (origin.y * pixels_per_point).round(),
+                );
+            }
+            // 高さが奇数 px と偶数 px の組み合わせでは、両原点を整数 px に保ったまま
+            // 中心を完全一致させられない。スナップ後も最小誤差の 0.5 physical px 以内。
+            assert!(
+                (rects.left_rect.center().y - rects.right_rect.center().y).abs() * pixels_per_point
+                    <= 0.5 + 0.01
+            );
+        }
+    }
+
+    #[test]
+    fn spread_non_integer_fit_keeps_height_matching_and_vertical_centering() {
+        let full_bbox = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        let geometry = spread_layout_geometry(
+            egui::vec2(800.0, 1121.0),
+            egui::vec2(801.0, 1120.0),
+            full_bbox,
+            full_bbox,
+            true,
+        );
+        let rects = layout_spread_page_rects(
+            egui::pos2(100.13, 80.27),
+            geometry,
+            0.75,
+            1.0,
+            1.0,
+            full_bbox,
+            full_bbox,
+            false,
+        );
+
+        assert_f32_close(rects.left_rect.height(), rects.right_rect.height());
+        assert_f32_close(rects.left_rect.center().y, rects.right_rect.center().y);
+    }
+
+    #[test]
+    fn spread_height_matched_pages_snap_by_each_effective_scale() {
+        let full_bbox = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        let geometry = spread_layout_geometry(
+            egui::vec2(800.0, 1121.0),
+            egui::vec2(801.0, 1120.0),
+            full_bbox,
+            full_bbox,
+            true,
+        );
+        let total_scale = 1120.0 / 1121.0;
+        assert!(!physical_scale_is_near_integer(total_scale, 1.0));
+        assert!(physical_scale_is_near_integer(
+            total_scale * geometry.right.scale_factor,
+            1.0
+        ));
+
+        let rects = layout_spread_page_rects(
+            egui::pos2(100.13, 80.27),
+            geometry,
+            total_scale,
+            1.0,
+            1.0,
+            full_bbox,
+            full_bbox,
+            false,
+        );
+
+        assert_f32_close(rects.right_rect.min.x, rects.right_rect.min.x.round());
+        assert_f32_close(rects.right_rect.min.y, rects.right_rect.min.y.round());
     }
 
     #[test]
@@ -26903,6 +27266,7 @@ mod tests {
             content_bbox: None,
             fit_mode: FullscreenFitMode::Page,
             fit_scale_limits: FullscreenFitScaleLimits::default(),
+            pixels_per_point: 1.0,
             placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
         })
         .unwrap();
@@ -26941,6 +27305,7 @@ mod tests {
             content_bbox: None,
             fit_mode: FullscreenFitMode::Page,
             fit_scale_limits: FullscreenFitScaleLimits::default(),
+            pixels_per_point: 1.0,
             placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
         })
         .unwrap();
@@ -26972,6 +27337,7 @@ mod tests {
             page_rect,
             [200, 100],
             crate::rotation_db::Rotation::None,
+            1.0,
         )
         .unwrap();
 
@@ -27100,6 +27466,7 @@ mod tests {
             FullscreenFitScaleLimits {
                 no_upscale: true,
                 no_downscale: false,
+                pixels_per_point: 1.0,
             }
             .apply(2.0),
             1.0
@@ -27108,6 +27475,7 @@ mod tests {
             FullscreenFitScaleLimits {
                 no_upscale: false,
                 no_downscale: true,
+                pixels_per_point: 1.0,
             }
             .apply(0.5),
             1.0
@@ -27116,6 +27484,7 @@ mod tests {
             FullscreenFitScaleLimits {
                 no_upscale: true,
                 no_downscale: true,
+                pixels_per_point: 1.0,
             }
             .apply(0.5),
             1.0
@@ -27124,6 +27493,7 @@ mod tests {
             FullscreenFitScaleLimits {
                 no_upscale: true,
                 no_downscale: true,
+                pixels_per_point: 1.0,
             }
             .apply(2.0),
             1.0
@@ -27140,6 +27510,7 @@ mod tests {
             FullscreenFitScaleLimits {
                 no_upscale: true,
                 no_downscale: false,
+                pixels_per_point: 1.0,
             },
         )
         .unwrap();
@@ -27160,6 +27531,7 @@ mod tests {
             FullscreenFitScaleLimits {
                 no_upscale: false,
                 no_downscale: true,
+                pixels_per_point: 1.0,
             },
         )
         .unwrap();
@@ -27282,8 +27654,38 @@ mod tests {
 
     #[test]
     fn vertical_reading_offsets_center_current_page() {
-        let offsets = vertical_reading_offsets(&[100.0, 100.0, 100.0], 10.0, 1);
+        let offsets = vertical_reading_offsets(&[100.0, 100.0, 100.0], 10.0, 1, 1.0, false);
         assert_eq!(offsets, vec![-110.0, 0.0, 110.0]);
+    }
+
+    #[test]
+    fn continuous_reading_many_pages_keep_physical_pixel_origins() {
+        let pixels_per_point = 1.25;
+        let page_height = 101.0 / pixels_per_point;
+        let heights = vec![page_height; 257];
+        let offsets =
+            vertical_reading_offsets(&heights, 1.0, heights.len() / 2, pixels_per_point, true);
+        let mut page = ContinuousReadingPageSize::full(0, page_height, page_height);
+        page.logical_scale = physical_pixel_scale(pixels_per_point);
+        let size = ContinuousReadingUnitSize {
+            pages: vec![page],
+            width: page_height,
+            height: page_height,
+            page_gap: 0.0,
+            logical_scale: physical_pixel_scale(pixels_per_point),
+        };
+
+        for offset in offsets {
+            assert_f32_close(offset * pixels_per_point % 1.0, 0.0);
+            let unit_rect = egui::Rect::from_center_size(
+                egui::pos2(100.0, 100.0 + offset),
+                egui::vec2(page_height, page_height),
+            );
+            let rects = continuous_reading_page_rects(unit_rect, &size, pixels_per_point);
+            assert_f32_close(rects[0].1.min.x * pixels_per_point % 1.0, 0.0);
+            assert_f32_close(rects[0].1.min.y * pixels_per_point % 1.0, 0.0);
+            assert_f32_close(rects[0].1.height() * pixels_per_point, 101.0);
+        }
     }
 
     #[test]
@@ -27401,7 +27803,7 @@ mod tests {
     #[test]
     fn vertical_reading_visible_positions_follow_scroll() {
         let heights = [100.0, 100.0, 100.0];
-        let offsets = vertical_reading_offsets(&heights, 10.0, 1);
+        let offsets = vertical_reading_offsets(&heights, 10.0, 1, 1.0, false);
 
         assert_eq!(
             vertical_reading_visible_positions(&offsets, &heights, 0.0, 100.0),
@@ -27450,7 +27852,7 @@ mod tests {
     #[test]
     fn vertical_reading_scroll_clamps_to_book_edges() {
         let heights = [100.0, 100.0];
-        let offsets = vertical_reading_offsets(&heights, 10.0, 0);
+        let offsets = vertical_reading_offsets(&heights, 10.0, 0, 1.0, false);
 
         assert_eq!(
             vertical_reading_scroll_range(&offsets, &heights, 100.0),
@@ -27469,7 +27871,7 @@ mod tests {
     #[test]
     fn vertical_reading_reanchor_keeps_visual_position() {
         let heights = [100.0, 100.0, 100.0];
-        let offsets = vertical_reading_offsets(&heights, 10.0, 1);
+        let offsets = vertical_reading_offsets(&heights, 10.0, 1, 1.0, false);
 
         assert_eq!(vertical_reading_reanchor_scroll(110.0, &offsets, 2), 0.0);
         assert_eq!(vertical_reading_reanchor_scroll(-110.0, &offsets, 0), 0.0);
@@ -27575,8 +27977,9 @@ mod tests {
             width: 200.0,
             height: 100.0,
             page_gap: 0.0,
+            logical_scale: 1.0,
         };
-        let rects = continuous_reading_page_rects(unit_rect, &size);
+        let rects = continuous_reading_page_rects(unit_rect, &size, 1.0);
         assert_eq!(rects.len(), 1);
         assert_eq!(rects[0].0, 42);
         assert!((rects[0].1.center().x - unit_rect.center().x).abs() < 0.001);
@@ -27596,13 +27999,15 @@ mod tests {
                     egui::pos2(0.1, 0.0),
                     egui::pos2(0.9, 1.0),
                 )),
+                logical_scale: 1.0,
             }],
             width: 80.0,
             height: 100.0,
             page_gap: 0.0,
+            logical_scale: 1.0,
         };
 
-        let rects = continuous_reading_page_rects(unit_rect, &size);
+        let rects = continuous_reading_page_rects(unit_rect, &size, 1.0);
 
         assert_eq!(rects.len(), 1);
         assert_eq!(rects[0].0, 7);
@@ -27626,20 +28031,23 @@ mod tests {
                     width: 100.0,
                     height: 120.0,
                     content_bbox: Some(left_bbox),
+                    logical_scale: 1.0,
                 },
                 ContinuousReadingPageSize {
                     idx: 2,
                     width: 100.0,
                     height: 120.0,
                     content_bbox: Some(right_bbox),
+                    logical_scale: 1.0,
                 },
             ],
             width: 180.0,
             height: 120.0,
             page_gap: 10.0,
+            logical_scale: 1.0,
         };
 
-        let rects = continuous_reading_page_rects(unit_rect, &size);
+        let rects = continuous_reading_page_rects(unit_rect, &size, 1.0);
 
         assert_eq!(rects.len(), 2);
         let left_visible = normalized_sub_rect(rects[0].1, left_bbox);
@@ -27647,6 +28055,57 @@ mod tests {
         assert!((right_visible.left() - left_visible.right() - 10.0).abs() < 0.001);
         assert!((left_visible.left() - unit_rect.left()).abs() < 0.001);
         assert!((right_visible.right() - unit_rect.right()).abs() < 0.001);
+    }
+
+    #[test]
+    fn continuous_spread_preserves_unequal_pages_at_physical_one_to_one() {
+        for pixels_per_point in [1.0, 1.25, 1.5] {
+            let scale = physical_pixel_scale(pixels_per_point);
+            let mut size = ContinuousReadingUnitSize {
+                pages: vec![
+                    ContinuousReadingPageSize::full(1, 800.0, 1121.0),
+                    ContinuousReadingPageSize::full(2, 801.0, 1120.0),
+                ],
+                width: 1.0,
+                height: 1.0,
+                page_gap: 0.0,
+                logical_scale: 1.0,
+            };
+            apply_continuous_spread_geometry(&mut size, false);
+            size.width = size.width * scale + 1.0;
+            size.height *= scale;
+            size.page_gap = 1.0;
+            size.logical_scale = scale;
+            for page in &mut size.pages {
+                page.width *= scale;
+                page.height *= scale;
+                page.logical_scale *= scale;
+            }
+            let unit_rect = egui::Rect::from_center_size(
+                egui::pos2(100.13, 80.27),
+                egui::vec2(size.width, size.height),
+            );
+
+            let rects = continuous_reading_page_rects(unit_rect, &size, pixels_per_point);
+
+            assert_eq!(rects.len(), 2);
+            assert_f32_close(rects[0].1.height() * pixels_per_point, 1121.0);
+            assert_f32_close(rects[1].1.height() * pixels_per_point, 1120.0);
+            for (_, rect, _) in &rects {
+                assert_f32_close(
+                    rect.min.x * pixels_per_point,
+                    (rect.min.x * pixels_per_point).round(),
+                );
+                assert_f32_close(
+                    rect.min.y * pixels_per_point,
+                    (rect.min.y * pixels_per_point).round(),
+                );
+            }
+            assert!(
+                (rects[0].1.center().y - rects[1].1.center().y).abs() * pixels_per_point
+                    <= 0.5 + 0.01
+            );
+        }
     }
 
     // ── decide_local_adjust_preview_action unit tests ─────────────────────

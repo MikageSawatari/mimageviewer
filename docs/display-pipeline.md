@@ -918,10 +918,21 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 1. 上記の優先順位で解決済みのページテクスチャと source / texture size
 2. 表示トリムの実効 content bbox
 3. 回転 (rotation_db, 0/90/180/270) と一時的なフリー回転
-4. フィットモードと自動フィット倍率制限
+4. viewport 固有の `pixels_per_point`、フィットモード、自動フィット倍率制限
 5. Zoom / Pan、または Z ズームの確定済み placement
-6. paint rect / hit rect / UV / source↔screen 写像 / total scale
+6. 物理ピクセル境界へ整列済みの paint rect / hit rect / UV / source↔screen 写像 / total scale
 ```
+
+`Original` (100% 原寸) と「拡大しない」「縮小しない」の 100% 基準は論理 1.0 倍ではなく
+`1.0 / pixels_per_point` とする。`pixels_per_point` は描画対象 viewport の `egui::Context`
+から取得し、main と DPI が異なり得る detached / frozen viewport では main の値を流用しない。
+実効物理倍率 `total_scale * pixels_per_point` が整数に十分近い場合だけ、最終描画矩形の
+**位置**を `round(position * pixels_per_point) / pixels_per_point` へ整列する。矩形サイズは
+倍率とアスペクト比を保つため丸めない。見開きは物理 px 単位で配置し、ページ間隔も
+`round(gap * pixels_per_point) / pixels_per_point` へ量子化する。連結読みは各ページ位置の
+累積ごとに同じ量子化を行い、長いページ列でも端数誤差を持ち越さない。
+見開きで高さ合わせを行う非整数倍率では、ページごとの実効倍率
+`total_scale * height_match_scale` をこの判定に使う。
 
 fit / trim / rotation / zoom-pan を overlay や入力処理が再計算してはならない。
 `draw_fs_image` は解決した transform 自身で描画し、その同じ値を次の consumer へ渡す:
@@ -1011,7 +1022,7 @@ fit 解像度のまま (画像見開きは問題なし。PDF 見開きズーム�
 
 フィットメニュー下部の「拡大しない」「縮小しない」は `FullscreenFitScaleLimits` として
 自動フィット倍率にだけ適用する。つまりページ全体/横幅/縦幅が求めた `fit_scale`
-を 100% で clamp してから、ユーザー操作の `fs_zoom` を掛ける。明示的な Ctrl+ホイール、
+を物理 100% (`1.0 / pixels_per_point`) で clamp してから、ユーザー操作の `fs_zoom` を掛ける。明示的な Ctrl+ホイール、
 中ボタンドラッグ、ゲームパッド等の手動ズームは制限しない。`縮小しない` が ON の場合は
 ページ全体フィットでも 100% 表示で画面外へはみ出すことがあるため、`fullscreen_fit_allows_drag_pan`
 も true 扱いにしてパンできるようにする。
@@ -1134,11 +1145,15 @@ Ctrl+←/→ の「1 ページずらし」は `spread_mode` を保存し直さ�
 単独表示へ吸われず、先頭または横長ページ境界から一貫した見開き列として戻れる。
 横長ページ自体は単独ユニットのまま境界として扱い、自動的な表紙扱いにはしない:
 
-1. 各ページの表示サイズ (回転考慮) を算出し、高い方に揃えた連結幅・高さを計算
-2. `spread_page_gap_px` を左右ページの画面上の間隔として差し込み、フィットモードに応じた `fit_scale` を求める
-3. ズーム/パンを `(fit_scale * fs_zoom, image_rect.center() + fs_pan)` として合成し、合成中心から
-   左右ページ矩形を配置する (ズーム/パンは左右ページで共有、ページ間の分割位置は不変)
-4. ズーム/パンが有効なフレームでは `image_rect` にクリップして他の UI 領域へのはみ出しを防ぐ
+1. 各ページの表示サイズ (回転考慮) と content bbox から、従来どおり高い方へ揃えた
+   フィット候補 geometry を計算する
+2. `spread_page_gap_px` を左右ページの画面上の間隔として差し込み、フィットモードに応じた
+   `fit_scale` とズーム後の `total_scale` を求める
+3. `total_scale` の実効物理倍率が整数近傍なら高さ合わせを外し、各ページの固有寸法を保って
+   縦中央へ配置する。非整数ならフィット候補の高さ合わせを維持する
+4. ズーム/パンを `(fit_scale * fs_zoom, image_rect.center() + fs_pan)` として合成し、選択した
+   geometry の content center から左右ページ矩形を配置する
+5. ズーム/パンが有効なフレームでは `image_rect` にクリップして他の UI 領域へのはみ出しを防ぐ
 
 ページ単位表示のカラー化遷移も、この `SpreadDisplayUnit` / `resolve_spread_pair` と同じ境界を
 使う。表紙、末尾端数、横長ページは 1 ページ unit、通常見開きは画面順 2 ページ unit として
@@ -1146,6 +1161,10 @@ Ctrl+←/→ の「1 ページずらし」は `spread_mode` を保存し直さ�
 から得るため、遷移状態だけが別のペアを作ることはない。
 
 見開きのページ間隔は環境設定から変更でき、既定 4px、0px で左右ページを隙間なく接続する。
+実配置では対象 viewport の物理 px へ gap を丸め、物理整数倍率では DPI 125% / 150% でも
+各ページ原点を物理ピクセル境界へ着地させる。
+物理整数倍率では左右を同一倍率のまま縦中央へ揃えるため、元画像の高さが異なればノドに段差が
+生じる。これは片ページだけを非整数倍してぼかさず、物理 1:1 / 整数倍を守るための仕様である。
 見開き中も `rotation_db` の単独ページ回転 (R/L) は左右ページそれぞれに反映する。
 `fs_free_rotation` (Ctrl+ドラッグのフリー回転) は見開きに反映しないため、Ctrl+ドラッグは
 `handle_fs_wheel_and_click` 側で no-op にしている。
@@ -1164,6 +1183,9 @@ conceal、edit、final composite、comic、補正の完全mip chainをTextureId�
 通常見開きと同じ `spread_page_gap_px` を使う。見開き構成の縦連結 + 横幅フィットでは、
 表紙・横長ページ・端数の単独ページも仮想的な 2 ページ幅で fit scale を求め、実ページを中央寄せする。
 これにより表紙だけ横幅いっぱいに拡大されず、後続の見開きページと同じ倍率で読める。
+物理整数倍率では unit / page の累積位置を追加のたびに物理 px へ丸め、端数を次ページへ
+持ち越さない。連結読みの見開きユニットも通常見開きと同じ geometry 選択を使い、物理整数倍率では
+ページ固有の高さを保って縦中央へ配置し、非整数のフィット倍率では高さ合わせを維持する。
 表示トリムが有効なページは、各ページの見える bbox だけをユニット幅/高さとページ間 gap の基準にし、
 描画時も同じ bbox を UV に使う。見開きユニットでは左右の見える端が `spread_page_gap_px` で並ぶ。
 final composite / comic composite は厳密可視ページと準備帯を処理対象にし、キャッシュ済みの

@@ -4,11 +4,23 @@ use crate::rotation_db::Rotation;
 use crate::settings::FullscreenFitMode;
 
 const EPSILON: f32 = 1.0e-6;
+const PHYSICAL_SCALE_INTEGER_EPSILON: f32 = 1.0e-4;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct FullscreenFitScaleLimits {
     pub(crate) no_upscale: bool,
     pub(crate) no_downscale: bool,
+    pub(crate) pixels_per_point: f32,
+}
+
+impl Default for FullscreenFitScaleLimits {
+    fn default() -> Self {
+        Self {
+            no_upscale: false,
+            no_downscale: false,
+            pixels_per_point: 1.0,
+        }
+    }
 }
 
 impl FullscreenFitScaleLimits {
@@ -17,11 +29,12 @@ impl FullscreenFitScaleLimits {
     }
 
     pub(crate) fn apply(self, mut scale: f32) -> f32 {
+        let original_scale = physical_pixel_scale(self.pixels_per_point);
         if self.no_upscale {
-            scale = scale.min(1.0);
+            scale = scale.min(original_scale);
         }
         if self.no_downscale {
-            scale = scale.max(1.0);
+            scale = scale.max(original_scale);
         }
         scale
     }
@@ -58,6 +71,7 @@ pub(crate) struct DisplayedImageTransformInput {
     pub(crate) content_bbox: Option<egui::Rect>,
     pub(crate) fit_mode: FullscreenFitMode,
     pub(crate) fit_scale_limits: FullscreenFitScaleLimits,
+    pub(crate) pixels_per_point: f32,
     pub(crate) placement: ResolvedDisplayPlacement,
 }
 
@@ -124,8 +138,13 @@ impl DisplayedImageTransform {
                 input.viewport_rect.height() / display_size.y,
                 egui::Vec2::ZERO,
             ),
-            (FullscreenFitMode::Original, Some((_, _, center))) => (1.0, center),
-            (FullscreenFitMode::Original, None) => (1.0, egui::Vec2::ZERO),
+            (FullscreenFitMode::Original, Some((_, _, center))) => {
+                (physical_pixel_scale(input.pixels_per_point), center)
+            }
+            (FullscreenFitMode::Original, None) => (
+                physical_pixel_scale(input.pixels_per_point),
+                egui::Vec2::ZERO,
+            ),
             (_, Some((width, height, center))) => (
                 (input.viewport_rect.width() / width).min(input.viewport_rect.height() / height),
                 center,
@@ -164,6 +183,11 @@ impl DisplayedImageTransform {
         if !total_scale.is_finite() || total_scale <= 0.0 {
             return None;
         }
+        let full_image_rect = snap_rect_origin_to_physical_pixel(
+            full_image_rect,
+            total_scale,
+            input.pixels_per_point,
+        );
         let fit_bbox = effective_bbox(input.rotation, input.free_rotation_rad, input.content_bbox);
         let (paint_rect, uv_rect) = fit_bbox
             .map(|bbox| (normalized_sub_rect(full_image_rect, bbox), bbox))
@@ -451,6 +475,48 @@ impl ResolvedZTransform {
     }
 }
 
+pub(crate) fn physical_pixel_scale(pixels_per_point: f32) -> f32 {
+    1.0 / normalized_pixels_per_point(pixels_per_point)
+}
+
+pub(crate) fn quantize_points_to_physical_pixels(points: f32, pixels_per_point: f32) -> f32 {
+    let pixels_per_point = normalized_pixels_per_point(pixels_per_point);
+    (points * pixels_per_point).round() / pixels_per_point
+}
+
+pub(crate) fn physical_scale_is_near_integer(logical_scale: f32, pixels_per_point: f32) -> bool {
+    let physical_scale = logical_scale * normalized_pixels_per_point(pixels_per_point);
+    if !physical_scale.is_finite() || physical_scale <= 0.0 {
+        return false;
+    }
+    let nearest = physical_scale.round();
+    nearest >= 1.0
+        && (physical_scale - nearest).abs() <= PHYSICAL_SCALE_INTEGER_EPSILON * nearest.max(1.0)
+}
+
+fn normalized_pixels_per_point(pixels_per_point: f32) -> f32 {
+    if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    }
+}
+
+fn snap_rect_origin_to_physical_pixel(
+    rect: egui::Rect,
+    logical_scale: f32,
+    pixels_per_point: f32,
+) -> egui::Rect {
+    if !physical_scale_is_near_integer(logical_scale, pixels_per_point) {
+        return rect;
+    }
+    let snapped_min = egui::pos2(
+        quantize_points_to_physical_pixels(rect.min.x, pixels_per_point),
+        quantize_points_to_physical_pixels(rect.min.y, pixels_per_point),
+    );
+    egui::Rect::from_min_size(snapped_min, rect.size())
+}
+
 fn size_is_valid(size: egui::Vec2) -> bool {
     size.x.is_finite() && size.y.is_finite() && size.x > 0.0 && size.y > 0.0
 }
@@ -671,6 +737,7 @@ mod tests {
             content_bbox,
             fit_mode,
             fit_scale_limits: FullscreenFitScaleLimits::default(),
+            pixels_per_point: 1.0,
             placement: ResolvedDisplayPlacement::Normal {
                 zoom_pan: Some((1.35, egui::vec2(23.0, -17.0))),
             },
@@ -703,6 +770,7 @@ mod tests {
                 content_bbox: None,
                 fit_mode: FullscreenFitMode::Page,
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point: 1.0,
                 placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
             },
             rect,
@@ -962,5 +1030,113 @@ mod tests {
         no_down.placement = ResolvedDisplayPlacement::Normal { zoom_pan: None };
         let no_down = DisplayedImageTransform::resolve(no_down).unwrap();
         close(no_down.total_scale, 1.0);
+    }
+
+    #[test]
+    fn original_and_scale_limits_use_physical_pixel_baseline() {
+        for pixels_per_point in [1.25, 1.5] {
+            let mut original = input(FullscreenFitMode::Original, Rotation::None, None);
+            original.pixels_per_point = pixels_per_point;
+            original.fit_scale_limits.pixels_per_point = pixels_per_point;
+            original.placement = ResolvedDisplayPlacement::Normal { zoom_pan: None };
+            let original = DisplayedImageTransform::resolve(original).unwrap();
+            close(original.total_scale, 1.0 / pixels_per_point);
+
+            let mut no_up = input(FullscreenFitMode::Page, Rotation::None, None);
+            no_up.viewport_rect =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(5000.0, 4000.0));
+            no_up.pixels_per_point = pixels_per_point;
+            no_up.fit_scale_limits = FullscreenFitScaleLimits {
+                no_upscale: true,
+                no_downscale: false,
+                pixels_per_point,
+            };
+            no_up.placement = ResolvedDisplayPlacement::Normal { zoom_pan: None };
+            let no_up = DisplayedImageTransform::resolve(no_up).unwrap();
+            close(no_up.total_scale, 1.0 / pixels_per_point);
+
+            let mut no_down = input(FullscreenFitMode::Page, Rotation::None, None);
+            no_down.viewport_rect =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 200.0));
+            no_down.pixels_per_point = pixels_per_point;
+            no_down.fit_scale_limits = FullscreenFitScaleLimits {
+                no_upscale: false,
+                no_downscale: true,
+                pixels_per_point,
+            };
+            no_down.placement = ResolvedDisplayPlacement::Normal { zoom_pan: None };
+            let no_down = DisplayedImageTransform::resolve(no_down).unwrap();
+            close(no_down.total_scale, 1.0 / pixels_per_point);
+        }
+    }
+
+    #[test]
+    fn integer_physical_scale_snaps_origin_without_rounding_size() {
+        let pixels_per_point = 1.25;
+        let texture_size = egui::vec2(101.0, 99.0);
+        let transform = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            page_idx: 0,
+            viewport_rect: egui::Rect::from_center_size(
+                egui::pos2(100.0, 100.0),
+                egui::vec2(200.0, 200.0),
+            ),
+            source_size: texture_size,
+            texture_size,
+            rotation: Rotation::None,
+            free_rotation_rad: 0.0,
+            content_bbox: None,
+            fit_mode: FullscreenFitMode::Original,
+            fit_scale_limits: FullscreenFitScaleLimits {
+                pixels_per_point,
+                ..FullscreenFitScaleLimits::default()
+            },
+            pixels_per_point,
+            placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+        })
+        .unwrap();
+
+        close(
+            transform.full_image_rect.min.x * pixels_per_point % 1.0,
+            0.0,
+        );
+        close(
+            transform.full_image_rect.min.y * pixels_per_point % 1.0,
+            0.0,
+        );
+        close(
+            transform.full_image_rect.width() * pixels_per_point,
+            texture_size.x,
+        );
+        close(
+            transform.full_image_rect.height() * pixels_per_point,
+            texture_size.y,
+        );
+    }
+
+    #[test]
+    fn non_integer_physical_scale_keeps_unsnapped_origin() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.25, 0.75), egui::vec2(130.0, 130.0));
+        let transform = DisplayedImageTransform::from_resolved_rect(
+            DisplayedImageTransformInput {
+                page_idx: 0,
+                viewport_rect: egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(500.0, 500.0),
+                ),
+                source_size: egui::vec2(100.0, 100.0),
+                texture_size: egui::vec2(100.0, 100.0),
+                rotation: Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point: 1.0,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            },
+            rect,
+        )
+        .unwrap();
+
+        rect_close(transform.full_image_rect, rect);
     }
 }

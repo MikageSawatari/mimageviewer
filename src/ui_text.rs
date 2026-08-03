@@ -10542,6 +10542,7 @@ mod tests {
                 fit_mode: crate::settings::FullscreenFitMode::Page,
                 fit_scale_limits:
                     crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                pixels_per_point: 1.0,
                 placement: crate::displayed_image_transform::ResolvedDisplayPlacement::Normal {
                     zoom_pan: None,
                 },
