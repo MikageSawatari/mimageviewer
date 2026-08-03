@@ -93,6 +93,18 @@ test("still-image panel reserves the agreed viewport while its transparent shiel
     css,
     /\.viewer-command-menu-layer > \.command-menu-scrim\s*\{[^}]*background:\s*transparent/
   );
+  assert.match(
+    css,
+    /\.viewer-command-menu-layer\[data-motion="opening"\] > \.viewer-command-menu\s*\{[^}]*animation:\s*viewer-panel-rise-in/
+  );
+  assert.match(
+    css,
+    /@keyframes viewer-panel-rise-in\s*\{[^}]*translate3d\(0,\s*100%,\s*0\)/
+  );
+  assert.match(
+    css,
+    /\.viewer-command-menu-layer\[data-motion="closing"\] > \.viewer-command-menu\s*\{[^}]*animation:\s*viewer-panel-drop-out/
+  );
   assert.match(app, /classList\.add\("viewer-command-menu-layer"\)/);
   assert.match(app, /viewerPanelTab:\s*"functions"/);
 });

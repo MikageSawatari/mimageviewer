@@ -38,6 +38,7 @@ import {
   viewerGestureDecision,
   viewerPanelGestureAction,
   viewerPanelTransition,
+  viewerResizePlan,
   viewerVerticalScrollDecision,
   viewerTapCommand,
   viewerTapSequenceTransition,
@@ -67,6 +68,7 @@ const THUMBNAIL_MAX_CONCURRENCY = thumbnailRequestConcurrency(
 );
 const PAGE_LOADING_INDICATOR_DELAY_MS = 225;
 const PAGE_BOUNDARY_MESSAGE_DURATION_MS = 2400;
+const VIEWER_PANEL_ANIMATION_MS = 180;
 // 要求幅是正後の実測約 457 KiB/ページなら、進行方向 8 ページで約 3.6 MiB。
 // 逆方向 1 ページと表示中を含めても 12 件なら約 5.4 MiB で、32 MiB 上限に十分余裕がある。
 // prefetch は直列かつ foreground が active request を abort するため表示要求を待たせない。
@@ -1090,7 +1092,9 @@ function dispatchCommand(requested, meta = {}) {
       } else if (requested.name === CommandName.FIT_ORIGINAL) {
         fitMode = FitMode.ORIGINAL;
       } else if (requested.name === CommandName.FIT_TOGGLE_PAGE_ORIGINAL) {
-        fitMode = togglePageOriginalFitMode(state.fitMode);
+        fitMode = togglePageOriginalFitMode(state.fitMode, {
+          scale: state.viewer?.scale,
+        });
       }
       if (fitMode) {
         state.fitMode = fitMode;
@@ -2234,12 +2238,22 @@ async function refreshContainerSpread(
   const loaded = await loadContainer(address, {
     forceSinglePage,
   });
-  if (!loaded) return;
-  if (!viewer || !currentIdentity) return;
+  if (!loaded || state.viewer !== viewer || !viewer || !currentIdentity) return;
   const imageIndex = state.images.findIndex(
     (entry) => entryIdentity(entry) === currentIdentity
   );
-  if (imageIndex >= 0) renderImageViewer(imageIndex, performance.now());
+  if (imageIndex < 0) return;
+  const groupIndex = pageGroupIndexForEntry(state.images[imageIndex]);
+  if (groupIndex < 0) return;
+  const group = state.pageGroups[groupIndex];
+  state.pageGroupIndex = groupIndex;
+  state.imageIndex = state.images.findIndex(
+    (entry) => entryIdentity(entry) === entryIdentity(group.anchor)
+  );
+  updateGridViewerReturnItem(group.anchor);
+  viewer.cancelPendingCenterTap();
+  viewer.setSeekState(viewerSeekSnapshot());
+  await updateViewerImage(performance.now());
 }
 
 export async function loadFolder(
@@ -4199,6 +4213,8 @@ class CommandMenu {
     this.previousFocus = null;
     this.panelState = null;
     this.panelPointer = null;
+    this.panelMotionTimer = 0;
+    this.panelMotionListener = null;
     this.suppressPanelClick = false;
     this.actionLabels = new Map();
     this.ratingActions = new Map();
@@ -4443,6 +4459,7 @@ class CommandMenu {
 
   open() {
     if (this.opened) return;
+    if (this.isViewerPanel) this.cancelViewerPanelMotion();
     if (this.isViewerPanel) this.selectViewerTab(state.viewerPanelTab);
     else this.showPage("main");
     this.opened = true;
@@ -4451,6 +4468,7 @@ class CommandMenu {
     this.owner.classList.add("menu-open");
     if (this.isViewerPanel) {
       this.updateViewerPanelLayout(ViewerPanelAction.OPEN);
+      this.startViewerPanelMotion("opening");
       refreshViewerItemState().catch((error) => {
         state.viewer?.showBoundaryMessage(
           error instanceof Error ? error.message : "現在値を取得できませんでした。"
@@ -4460,9 +4478,20 @@ class CommandMenu {
     requestAnimationFrame(() => this.closeButton.focus());
   }
 
-  close(restoreFocus = true) {
+  close(restoreFocus = true, animate = true) {
     if (!this.opened) return;
     this.opened = false;
+    if (this.isViewerPanel && animate) {
+      this.startViewerPanelMotion("closing", () => {
+        this.finishClose(restoreFocus);
+      });
+      return;
+    }
+    if (this.isViewerPanel) this.cancelViewerPanelMotion();
+    this.finishClose(restoreFocus);
+  }
+
+  finishClose(restoreFocus) {
     if (this.isViewerPanel) this.updateViewerPanelLayout(ViewerPanelAction.CLOSE);
     this.root.hidden = true;
     this.owner.classList.remove("menu-open");
@@ -4471,8 +4500,43 @@ class CommandMenu {
     }
   }
 
+  startViewerPanelMotion(motion, onFinished = () => {}) {
+    this.cancelViewerPanelMotion();
+    this.root.dataset.motion = motion;
+    let finished = false;
+    const finish = (event) => {
+      if (finished || (event?.target && event.target !== this.panel)) return;
+      finished = true;
+      if (this.panelMotionListener) {
+        this.panel.removeEventListener("animationend", this.panelMotionListener);
+      }
+      clearTimeout(this.panelMotionTimer);
+      this.panelMotionTimer = 0;
+      this.panelMotionListener = null;
+      if (this.root.dataset.motion === motion) delete this.root.dataset.motion;
+      onFinished();
+    };
+    this.panelMotionListener = finish;
+    this.panel.addEventListener("animationend", finish);
+    this.panelMotionTimer = setTimeout(
+      finish,
+      VIEWER_PANEL_ANIMATION_MS + 80
+    );
+  }
+
+  cancelViewerPanelMotion() {
+    if (this.panelMotionListener) {
+      this.panel.removeEventListener("animationend", this.panelMotionListener);
+    }
+    clearTimeout(this.panelMotionTimer);
+    this.panelMotionTimer = 0;
+    this.panelMotionListener = null;
+    delete this.root.dataset.motion;
+  }
+
   destroy() {
-    this.close(false);
+    this.close(false, false);
+    if (this.isViewerPanel) this.cancelViewerPanelMotion();
     if (this.isViewerPanel) {
       this.root.removeEventListener("pointerdown", this.panelPointerDown);
       this.root.removeEventListener("pointerup", this.panelPointerUp);
@@ -4502,11 +4566,12 @@ class CommandMenu {
       next.orientation === "landscape"
     );
     if (!next.shouldRefit) return;
-    if (next.resetTransform) state.fitMode = FitMode.PAGE;
-    requestAnimationFrame(() => {
-      if (state.commandMenu !== this || this.opened !== next.open) return;
-      state.viewer?.refitVisibleContent(FitMode.PAGE, { resetTransform: true });
-    });
+    if (next.open) state.fitMode = FitMode.PAGE;
+    if (state.commandMenu !== this || this.opened !== next.open) return;
+    state.viewer?.refitVisibleContent(
+      next.open ? FitMode.PAGE : state.fitMode,
+      { resetTransform: true }
+    );
   }
 
   onPanelPointerDown(event) {
@@ -4803,7 +4868,12 @@ export class ImageViewer {
       clearTimeout(this.resizeTimer);
       this.resizeTimer = setTimeout(() => {
         const forceSinglePage = shouldForceSinglePageForViewport();
-        if (state.container && forceSinglePage !== state.forceSinglePage) {
+        const plan = viewerResizePlan({
+          hasContainer: Boolean(state.container),
+          forceSinglePageChanged: forceSinglePage !== state.forceSinglePage,
+          panelOpen: Boolean(state.commandMenu?.isOpen()),
+        });
+        if (plan.refreshContainer) {
           refreshContainerSpread(forceSinglePage).catch(renderError);
           return;
         }

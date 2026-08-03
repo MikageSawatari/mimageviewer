@@ -196,7 +196,8 @@ export function nextFitMode(mode) {
   return FitMode.PAGE;
 }
 
-export function togglePageOriginalFitMode(mode) {
+export function togglePageOriginalFitMode(mode, { scale = 1 } = {}) {
+  if ((Number(scale) || 1) > 1.01) return FitMode.PAGE;
   return mode === FitMode.ORIGINAL ? FitMode.PAGE : FitMode.ORIGINAL;
 }
 
@@ -338,6 +339,21 @@ export function viewerPanelTransition(
     layout,
     shouldRefit: openChanged || (open && orientationChanged),
     resetTransform: action === ViewerPanelAction.OPEN && !wasOpen,
+  };
+}
+
+/// Describe how a viewport resize updates the mounted viewer shell.
+/// Spread rematerialization updates the mounted viewer instead of replacing its panel owner.
+export function viewerResizePlan({
+  hasContainer = false,
+  forceSinglePageChanged = false,
+  panelOpen = false,
+} = {}) {
+  const refreshContainer = Boolean(hasContainer && forceSinglePageChanged);
+  return {
+    refreshContainer,
+    rebuildViewer: false,
+    keepPanelOpen: Boolean(panelOpen),
   };
 }
 

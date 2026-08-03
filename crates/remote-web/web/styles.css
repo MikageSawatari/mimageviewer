@@ -1193,6 +1193,24 @@ button {
     max(12px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
 }
 
+.viewer-command-menu-layer[data-motion="opening"] > .viewer-command-menu {
+  animation: viewer-panel-rise-in 180ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.viewer-command-menu-layer[data-motion="closing"] > .viewer-command-menu {
+  animation: viewer-panel-drop-out 180ms cubic-bezier(0.4, 0, 0.8, 0.2) both;
+}
+
+@keyframes viewer-panel-rise-in {
+  from { transform: translate3d(0, 100%, 0); }
+  to { transform: translate3d(0, 0, 0); }
+}
+
+@keyframes viewer-panel-drop-out {
+  from { transform: translate3d(0, 0, 0); }
+  to { transform: translate3d(0, 100%, 0); }
+}
+
 .viewer-command-menu-layer[data-orientation="landscape"] {
   align-items: stretch;
   justify-items: start;
@@ -1258,6 +1276,12 @@ button {
 
 .viewer-command-menu-layer[data-orientation="landscape"] .command-menu-actions {
   grid-template-columns: 1fr;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .viewer-command-menu-layer[data-motion] > .viewer-command-menu {
+    animation-duration: 1ms;
+  }
 }
 
 .video-menu-volume {

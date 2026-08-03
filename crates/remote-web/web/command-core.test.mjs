@@ -52,6 +52,7 @@ import {
   viewerPanelGestureAction,
   viewerPanelLayout,
   viewerPanelTransition,
+  viewerResizePlan,
   viewerVerticalScrollDecision,
   viewerSeekGroupIndex,
   viewerSeekState,
@@ -504,6 +505,11 @@ test("double-tap fit toggles screen fit and original size", () => {
   assert.equal(togglePageOriginalFitMode(FitMode.PAGE), FitMode.ORIGINAL);
   assert.equal(togglePageOriginalFitMode(FitMode.ORIGINAL), FitMode.PAGE);
   assert.equal(togglePageOriginalFitMode(FitMode.WIDTH), FitMode.ORIGINAL);
+  assert.equal(
+    togglePageOriginalFitMode(FitMode.PAGE, { scale: 2.4 }),
+    FitMode.PAGE,
+    "pinch zoom must settle on page fit instead of flashing page fit and applying original size"
+  );
 });
 
 test("only center touches enter the double-tap window", () => {
@@ -906,6 +912,21 @@ test("an open viewer panel changes side and refits when orientation changes", ()
     width: 506.4,
     height: 390,
   });
+});
+
+test("orientation spread refresh keeps the mounted viewer and its open panel", () => {
+  assert.deepEqual(
+    viewerResizePlan({
+      hasContainer: true,
+      forceSinglePageChanged: true,
+      panelOpen: true,
+    }),
+    {
+      refreshContainer: true,
+      rebuildViewer: false,
+      keepPanelOpen: true,
+    }
+  );
 });
 
 test("viewer panel swipe uses the existing gesture arbitration without stealing taps, paging, or pan", () => {
