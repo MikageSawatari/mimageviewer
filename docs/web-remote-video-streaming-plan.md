@@ -30,7 +30,7 @@ production の配信 worker に旧経路や silent fallback は残さない。
 - **リモート操作中は本体がロックされる** ([web-remote-plan.md](web-remote-plan.md) §2.2)。
   session / generation を 1 経路に限定でき、時計なし worker の所有権と相性が良い
 - 音声も同じファイルから独立 decode できる。音量正規化 gain は metadata player から snapshot
-  して AAC 前段へ再適用し、VST3 はリモート非対応として経路から外す
+  し、リモートセッション専用の VST3 チェーンとともに PC と同じ順序で AAC 前段へ適用する
 - 解像度・ビットレートを送信側で決められるので、帯域に合わせて画質を落とせる
 
 **したがって remux + 音声フォールバックは不要になり、本方式がそれを完全に置き換える。**
@@ -135,7 +135,7 @@ OBS 自身が GPLv2 だからであり、**OBS のコードも設定値の写経
        ┌────────────────── mimageviewer-core.exe ──────────────────┐
        │                                                           │
  file ─┼─▶ clockless demux/decode ─┬─▶ scale ─▶ H.264 encoder ───┐ │
-       │                           └─▶ normalize ─▶ AAC encoder ─┤ │
+       │                           └─▶ normalize ─▶ VST3 ─▶ limiter ─▶ AAC ─┤ │
        │                                                        ▼ │
        │                              fMP4 segmenter + 60 秒 ring │
        │                                                           │
@@ -153,12 +153,24 @@ remote session が所有する headless `VideoPlayer` は pause のまま metada
 音量正規化 gain、seek thumbnail を提供する。配信 frame と transport clock は一切供給せず、
 generation worker が同じファイルを独立 open する。
 
-### 4.1 時計なし音声 — ノーマライズを再適用し、VST3 は通さない
+### 4.1 時計なし音声 — normalize → VST3 → safety limiter
 
 production の時計なし worker は decoded PCM に `VideoPlayer::normalize_gain()` の確定値を
-掛けてから AAC encoder へ渡す。+gain のときだけ既存 `SafetyLimiter` を通す。VST3 は
-§10.2 の実測結果によりリモート配信では明示的に無効とし、headless player にも
-`DspBridge` を渡さない。以下の tap 設計は移行元の記録であり、production 配信には使わない。
+固定 gain として掛け、リモートセッション専用 `DspBridge` の active plugin、既存
+`SafetyLimiter` の順に通してから AAC encoder へ渡す。これは PC の
+**time stretch → normalize gain → VST3 `process_block` → safety limiter** から時計依存の
+time stretch だけを除いた順序である。VST の sample rate に PCM を resample し、VST PDC と
+limiter lookahead は AAC へ渡す `audible_pts_secs` から差し引く。
+
+paused headless player は引き続き metadata / thumbnail 専用なので `DspBridge` を渡さない。
+VST は generation ではなく streaming session が所有する別ホストで処理する。chain load は
+generation worker 内で一度だけ行い、全世代が同じ `Arc` を共有する (§10.2)。ロード全体は start
+の 15 秒予算の残りから encoder/playlist 用 3 秒を予約した値（上限 10 秒）で打ち切り、
+全失敗または process 失敗時は normalized dry で
+動画配信を継続する。ただし IPC/Web の VST 状態と本体のリモート接続 modal に警告を表示し、
+黙った pass-through にはしない。
+
+以下の tap 設計は移行元の記録であり、production 配信には使わない。
 
 [src/video/audio.rs](../src/video/audio.rs) の audio pump は
 **time stretch → normalize gain → VST3 `process_block` → safety limiter** の順に処理した
@@ -507,7 +519,7 @@ thumbnail を含めない。
   segmenter の typed `None` を保持して HTTP 503 または上限付き wait へ写像し、200 では
   必ず非空の init、または init と最初の media segment を参照できる playlist を返す
 
-### 6.2 IPC (動画 API 導入 v15、timeout v17、seek thumbnail v18、時計なし状態分離 v19、終端規則 v20)
+### 6.2 IPC (動画 API v15、timeout v17、thumbnail v18、時計なし v19、終端 v20、VST 状態 v21)
 
 既存の長寿命 duplex 多重化接続 ([web-remote-plan.md](web-remote-plan.md) §9.5-9.6) に
 `ClientMessage` / `ServerMessage` の variant を追加する。**セグメントは pull 型**とし、
@@ -516,13 +528,13 @@ remote-web が HTTP 要求を受けた時に取りに行く。push 型の非同�
 
 | request | response |
 |---|---|
-| `VideoStreamStart { address, quality }` | `{ session, generation, duration_secs, source_origin_secs, buffer_target_secs, encoder, video_size, end_behavior }` |
+| `VideoStreamStart { address, quality }` | `{ session, generation, duration_secs, source_origin_secs, buffer_target_secs, encoder, video_size, audio_processing, end_behavior }` |
 | `VideoStreamControl { session, action }` | `SessionStatus` |
 | `VideoStreamSeek { session, position_secs }` | `{ generation }` |
 | `VideoStreamThumbnail { session, position_secs }` | `Pending` / 実 frame PTS + WebP / `Cleared` |
 | `VideoStreamPlaylist { session, generation, kind }` | master / media m3u8 本文 |
 | `VideoStreamSegment { session, generation, index }` | セグメントのバイト列 / `NotFound` / `Gone` |
-| `VideoStreamState { session }` | generation/source origin、生成済み/ring 範囲、先読み目標、終端、再生 intent、バッファ/ビットレート実績 |
+| `VideoStreamState { session }` | generation/source origin、生成済み/ring 範囲、先読み目標、終端、再生 intent、バッファ/ビットレート実績、最新の `audio_processing` |
 | `VideoStreamStop { session }` | — |
 
 セグメント IPC は既存の **heavy queue ではなく専用 lane** に置く。エンコード済みバイトを
@@ -560,6 +572,11 @@ stream worker の teardown / join は引き続き UI thread 外で行う。
 `wrap` を持つ `Next` の typed union とする。本体がローカル再生と同じ helper / 設定から決め、
 remote-web は判断材料となる別設定を保存しない。Chapter / Bookmark の全境界を渡すのは、同じ
 stream session 内で seek した後も端末が現在区間を選び直せるようにするためである。
+
+`PROTOCOL_VERSION` 21 は start / state に `VideoStreamAudioProcessing` を追加する。
+`vst3_requested`、`vst3_active`、active slot 数、利用者向け warning を持ち、ロード後だけでなく
+処理中の dry fallback も state poll で端末へ伝える。端末は warning を notice と診断行へ残し、
+本体側も同じ status owner をリモート接続 modal に表示する。
 
 #### 増分 6 実装記録 (IPC + HTTP、2026-08-02)
 
@@ -876,10 +893,15 @@ CPU に戻さず GPU scale して NVENC へ渡す経路が次の性能投資候�
 
 ### 10.2 時計なし経路での状態所有方針
 
-- **VST3**: **リモート配信では通さない。** 実設定を SQLite online backup した隔離 profile で
-  44.1 kHz / 480 frame の 60 秒 fast-feed を試したが、稼働中本体 2 系統が既に host を保持する
-  条件で 3 本目の実チェーンは `SSL Meter Pro` の load event が 20 秒 timeout になり、full chain
-  を安全に認定できなかった。稼働中 bridge への注入は行わず、失敗時方針どおり明示的に無効化した
+- **VST3**: mIV を全停止して再測定した実 chain (active 5、44.1 kHz、60 秒 fast-feed) は
+  `wall_secs=2.040909`、**29.399x realtime**。1080p 映像込み全体の 8.4x より十分速く、律速ではない。
+  前回の `SSL Meter Pro` 20 秒 timeout は同時に 3 host を立てた測定条件が原因だった。このため
+  ローカル再生の App-global host へ高速配信を混在させず、streaming session が **専用 host を 1 個だけ**
+  所有する。`ClocklessAudioProcessing` の processor / failure / status を全 generation が `Arc` clone
+  し、既存 generation resource lease が旧 worker と新 worker の VST 使用も直列化する。したがって
+  generation 切替中も **ローカル 1 + リモート 1 = 最大 2 host** であり、新旧世代に比例して増えない。
+  bypass plugin はリモート host へ load せず、設定順を保った active plugin だけを一度 load する。
+  load 時間は start 残予算から後段用 3 秒を予約した値（上限 10 秒）に制限する
 - **音量正規化**: remote player は autoplay=false で開くため deferred scan を持たず、open 前の
   DB lookup (未測定なら 1.0) で `normalize_gain` が確定する。`RemoteStreamStartInputs` を
   generation 作成時に snapshot し、時計なし PCM の AAC 前段で固定 gain として適用する
@@ -913,7 +935,7 @@ CPU に戻さず GPU scale して NVENC へ渡す経路が次の性能投資候�
 1. **駆動部 + 実測 (完了)** — 独立 Input、demux/decode、既存 H.264/AAC encoder と
    `Fmp4Segmenter`、ring 容量 gate、段境界 cancel、dev-tools benchmark
 2. **session 配線 (完了)** — generation owner を時計なし worker へ接続。60 秒先読み、
-   terminal playhead、seek、EOF flush / ENDLIST、VST / normalize 方針を確定し、旧 tap worker を削除
+   terminal playhead、seek、EOF flush / ENDLIST、session 共有 VST + normalize を確定し、旧 tap worker を削除
 3. **Web/実機仕上げ (次)** — iPhone 実機で起動・シーク・回線揺れ・自然終端を検証する
 
 ### 既存の実時間経路 第 1 段 (実装済み、移行元)
@@ -1012,12 +1034,16 @@ Android 実機を保有していないため、**検証できる範囲と委ね�
   seek thumbnail を提供し、frame/audio transport は clockless worker だけが所有すること。
   resume origin 確定後も paused player の `clock.is_seeking()` が true のままのケースで
   `poll_remote_video_opening` が `Starting` へ進むこと
+- audio DSP: fixed normalize gain の後に session 共有 VST3、その後に safety limiter を通ること。
+  generation 交換で processor の `Arc` が同一で host 数が増えず、VST load / process 失敗時も
+  normalized dry の動画配信を継続して start/state と本体 modal に warning が出ること
 - `cargo test -p mimageviewer --lib` と `cargo test -p mimageviewer-remote` が緑
 
 ### 実機 (ユーザーが実施)
 
 - iPhone / iPad の Safari で、HEVC / AV1 / WMV / MKV いずれの素材でも再生できる
-- 音量ノーマライズがリモート側の音に反映され、VST3 はリモート音声へ適用されない
+- 音量ノーマライズと active VST3 chain がリモート音声へ順番どおり反映される。
+  VST3 を意図的に失敗させても動画は dry 音声で継続し、端末と本体の両方で未適用警告が見える
 - 5G / 公衆 Wi-Fi それぞれで標準画質が途切れずに再生できる
 - シーク・一時停止・画質変更が動作し、シーク後の再バッファが 5 秒以内
 - **PC 側のウィンドウを最小化 / モニタをスリープさせても再生が継続する** (§10-1)

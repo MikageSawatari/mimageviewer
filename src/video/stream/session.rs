@@ -11,7 +11,8 @@ use crate::remote_ipc::session::{
 };
 use crate::video::clockless_transcode::{
     ClocklessAudioProcessing, ClocklessOutputInfo, ClocklessSegmentBytes, ClocklessStreamOutput,
-    ClocklessTranscodeControl, ClocklessTranscodeOptions, run_clockless_stream,
+    ClocklessTranscodeControl, ClocklessTranscodeOptions, ClocklessVstStatus,
+    ClocklessVstStatusSnapshot, run_clockless_stream,
 };
 
 const RESOURCE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -196,6 +197,7 @@ pub(crate) struct StreamingGenerationAccess {
     output: ClocklessStreamOutput,
     control: ClocklessTranscodeControl,
     activity: RemoteStreamingActivity,
+    audio_status: ClocklessVstStatus,
 }
 
 pub(crate) struct StreamingGenerationHandle {
@@ -204,6 +206,7 @@ pub(crate) struct StreamingGenerationHandle {
     output: ClocklessStreamOutput,
     control: ClocklessTranscodeControl,
     activity: RemoteStreamingActivity,
+    audio_status: ClocklessVstStatus,
     _registration: RemoteStreamingRegistration,
     cancel: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -236,6 +239,7 @@ impl StreamingGenerationHandle {
             hw_decode,
             audio_processing,
         };
+        let audio_status = config.audio_processing.vst3_status();
         let output = ClocklessStreamOutput::new(segment_capacity, source_origin_secs)?;
         let control = ClocklessTranscodeControl::manual(segment_capacity)?;
         control.bind_cancel_flag(Arc::clone(&cancel));
@@ -275,6 +279,7 @@ impl StreamingGenerationHandle {
             output,
             control,
             activity,
+            audio_status,
             _registration: registration,
             cancel,
             worker: Some(worker),
@@ -296,6 +301,7 @@ impl StreamingGenerationHandle {
             output: self.output.clone(),
             control: self.control.clone(),
             activity: self.activity.clone(),
+            audio_status: self.audio_status.clone(),
         }
     }
 
@@ -312,6 +318,10 @@ impl StreamingGenerationAccess {
 
     pub(crate) fn status(&self) -> StreamGenerationStatus {
         generation_status(&self.status)
+    }
+
+    pub(crate) fn audio_status(&self) -> ClocklessVstStatusSnapshot {
+        self.audio_status.snapshot()
     }
 
     pub(crate) fn wait_ready(&self, timeout: Duration) -> StreamGenerationStatus {

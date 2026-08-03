@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -732,6 +732,14 @@ pub enum VideoStreamEndBehavior {
     Next { wrap: bool },
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct VideoStreamAudioProcessing {
+    pub vst3_requested: bool,
+    pub vst3_active: bool,
+    pub vst3_active_slots: u32,
+    pub vst3_warning: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct VideoStreamStartPayload {
     pub session: u64,
@@ -742,6 +750,7 @@ pub struct VideoStreamStartPayload {
     pub encoder: String,
     pub video_size: VideoStreamSize,
     pub codecs: String,
+    pub audio_processing: VideoStreamAudioProcessing,
     pub end_behavior: VideoStreamEndBehavior,
 }
 
@@ -794,6 +803,7 @@ pub struct VideoStreamStatePayload {
     pub encoder: String,
     pub video_size: VideoStreamSize,
     pub codecs: String,
+    pub audio_processing: VideoStreamAudioProcessing,
     pub play_intent: bool,
     pub volume: f64,
 }
@@ -1204,6 +1214,12 @@ mod tests {
                 height: 1080,
             },
             codecs: "avc1.640028,mp4a.40.2".to_owned(),
+            audio_processing: VideoStreamAudioProcessing {
+                vst3_requested: true,
+                vst3_active: true,
+                vst3_active_slots: 5,
+                vst3_warning: None,
+            },
             play_intent: true,
             volume: 0.75,
         };
@@ -1343,8 +1359,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v20_video_pull_seek_thumbnail_and_end_behavior_messages_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 20);
+    fn protocol_v21_video_pull_seek_thumbnail_end_behavior_and_audio_status_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 21);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -1399,6 +1415,12 @@ mod tests {
                         height: 1080,
                     },
                     codecs: "avc1.640028,mp4a.40.2".to_owned(),
+                    audio_processing: VideoStreamAudioProcessing {
+                        vst3_requested: true,
+                        vst3_active: false,
+                        vst3_active_slots: 0,
+                        vst3_warning: Some("VST3 を適用できませんでした".to_owned()),
+                    },
                     end_behavior: VideoStreamEndBehavior::Next { wrap: true },
                 }),
             },

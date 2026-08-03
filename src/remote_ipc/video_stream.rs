@@ -2,10 +2,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use mimageviewer_ipc::{
-    RemoteAddress, RemoteSubresource, VIDEO_STREAM_START_BUDGET, VideoStreamError,
-    VideoStreamErrorCode, VideoStreamPlaylistKind, VideoStreamPlaylistPayload, VideoStreamResult,
-    VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamSize, VideoStreamStartPayload,
-    VideoStreamStatePayload,
+    RemoteAddress, RemoteSubresource, VIDEO_STREAM_START_BUDGET, VideoStreamAudioProcessing,
+    VideoStreamError, VideoStreamErrorCode, VideoStreamPlaylistKind, VideoStreamPlaylistPayload,
+    VideoStreamResult, VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamSize,
+    VideoStreamStartPayload, VideoStreamStatePayload,
 };
 
 use super::path_guard::{ResolveError, resolve_existing};
@@ -198,6 +198,7 @@ impl VideoStreamEngine {
                         height: ready.output_dimensions.height,
                     },
                     codecs: ready.codecs,
+                    audio_processing: audio_processing_payload(stream.generation.audio_status()),
                     end_behavior: stream.end_behavior,
                 })
             }
@@ -430,8 +431,20 @@ fn state_payload(
             height: ready.output_dimensions.height,
         },
         codecs: ready.codecs,
+        audio_processing: audio_processing_payload(stream.generation.audio_status()),
         play_intent: playback.play_intent,
         volume: playback.volume,
+    }
+}
+
+fn audio_processing_payload(
+    status: crate::video::clockless_transcode::ClocklessVstStatusSnapshot,
+) -> VideoStreamAudioProcessing {
+    VideoStreamAudioProcessing {
+        vst3_requested: status.requested,
+        vst3_active: status.active,
+        vst3_active_slots: status.active_slots,
+        vst3_warning: status.warning,
     }
 }
 

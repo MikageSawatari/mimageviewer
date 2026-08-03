@@ -651,6 +651,7 @@ fn api_video_start(request: &mut Request, state: &AppState, client_id: &str) -> 
                 "codec": payload.codecs,
                 "encoder": payload.encoder,
                 "video_size": payload.video_size,
+                "audio_processing": payload.audio_processing,
                 "end_behavior": payload.end_behavior,
             }))
             .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))

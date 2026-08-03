@@ -5,11 +5,10 @@
 //! - **C++ bridge プロセス** (`mimageviewer-vst3-host.exe`) を `include_bytes!` で
 //!   メイン exe に埋め込み、初回 VST3 enable 時に
 //!   `%APPDATA%\mimageviewer\vst3\` に展開する (PDFium / Susie ワーカーと同パターン)。
-//! - **DspBridge** がアプリ起動から終了まで生存する singleton。プラグインスロットの
-//!   Vec を保持し、各スロットが独立した bridge プロセスを所有する。
-//! - **プラグインチェーン**: スロットを順番に通すマルチプラグイン構成。
-//!   bypass=true のスロットはスキップ。各スロットの IPC roundtrip ~1-2ms なので
-//!   実用的には ~5 個までが realtime 維持の目安 (= 1024-sample frame で 21ms 予算)。
+//! - **DspBridge** は 1 本のチェーンを所有する。ローカル再生ではアプリ lifetime の
+//!   singleton、時計なしリモート配信ではセッション lifetime の別インスタンスを使う。
+//! - **プラグインチェーン**: 全スロットを 1 bridge プロセス内で順番に処理する。
+//!   bypass=true のスロットはスキップし、チェーン全体の音声 IPC は 1 roundtrip。
 //! - 音声経路への結線は [`super::audio`] の audio-pump スレッドで行う。
 
 #![cfg(windows)]
@@ -111,10 +110,11 @@ pub struct GuiSignalChanges {
     pub bypass_updates: Vec<(String, bool)>,
 }
 
-/// DspBridge — VST3 プラグインホスト bridge との対話を管理する singleton。
+/// DspBridge — 1 本の VST3 チェーンホスト bridge との対話を管理する。
 ///
-/// アプリ起動から終了まで 1 個のインスタンスを保持する。
-/// `Arc<DspBridge>` 化して audio-pump thread と UI thread から共有アクセス。
+/// ローカル再生用はアプリ起動から終了まで 1 個を保持する。時計なしリモート配信は
+/// ローカルの時間状態を壊さないようセッション専用の 1 個を持ち、全配信世代で共有する。
+/// 各所有者内では `Arc<DspBridge>` 化して audio-pump / worker と制御側から共有アクセス。
 pub struct DspBridge {
     inner: Mutex<DspBridgeInner>,
     /// audio-pump thread が高速判定するためのフラグ。Mutex を取らずに読める。
@@ -806,6 +806,32 @@ impl DspBridge {
         initial_window_pos: Option<(i32, i32)>,
         initial_window_size: Option<(u32, u32)>,
     ) -> Result<usize, String> {
+        self.add_plugin_with_load_timeout(
+            plugin_path,
+            sample_rate,
+            block_size,
+            bypass,
+            user_hidden,
+            initial_state,
+            initial_window_pos,
+            initial_window_size,
+            std::time::Duration::from_secs(20),
+        )
+    }
+
+    /// Worker-only variant for callers with a stricter enclosing operation budget.
+    pub(crate) fn add_plugin_with_load_timeout(
+        &self,
+        plugin_path: &str,
+        sample_rate: u32,
+        block_size: u32,
+        bypass: bool,
+        user_hidden: bool,
+        initial_state: Option<&str>,
+        initial_window_pos: Option<(i32, i32)>,
+        initial_window_size: Option<(u32, u32)>,
+        load_timeout: std::time::Duration,
+    ) -> Result<usize, String> {
         // enable 状態チェック (Mutex を保持しない)
         if !self.is_enabled() {
             return Err("VST3 が無効化されています (enable を先に)".to_string());
@@ -889,7 +915,7 @@ impl DspBridge {
         }
 
         // loaded イベントを待つ (= bridge は state 復元 + setActive 完了後に Loaded を返す)
-        let load_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let load_deadline = std::time::Instant::now() + load_timeout;
         let (plugin_name, latency_samples) = loop {
             let now = std::time::Instant::now();
             if now >= load_deadline {

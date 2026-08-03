@@ -33,7 +33,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 │   - TRT エンジンビルダー (--tensorrt-build サブプロセス、初回1回)│
 │   - TRT 推論ワーカー (--tensorrt-infer-worker サブプロセス × 1)│
 │   - AI 推論スレッド (ort + DirectML、TRT は別プロセス経由)     │
-│   - VST3 host bridge プロセス (mimageviewer-vst3-host.exe × 1)│
+│   - VST3 host bridge (通常 ×1、remote VST 配信中は最大 ×2)    │
 │     [docs/vst3-integration.md](vst3-integration.md)            │
 │   - 動画サムネイルスレッド, フォルダナビゲーション, etc.       │
 └───────────────┬──────────────────────────────────────────────┘
@@ -126,7 +126,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `archive_cache.rs` | 変換済み ZIP のマッピング DB (`%APPDATA%/mimageviewer/archive_cache.db`)。元ファイルパス + mtime + size で lookup、変換後 ZIP は `archive_cache/<hash[..2]>/<hash>/*.zip`。設定された容量上限がある場合は変換完了後に `last_access_at` の古い順で削除する。パスワード付き RAR 由来でもキャッシュ ZIP は暗号化されないため、管理 UI で `PW` と表示し削除可能にする。将来版/旧版由来の未知 `format` 行も `旧形式 / 不明` と raw format 値で表示し、同じ管理 UI から削除できる |
 | `fs_animation.rs` | GIF / APNG / WebP アニメーションのフレーム展開 |
 | `video_thumb.rs` | 動画サムネイル取得 (Windows Shell API) |
-| `video/` | 動画インライン再生。`mod.rs` (VideoPlayer 公開 API) / `ffmpeg_loader.rs` (FFmpeg LGPL DLL が exe 同居しているか検証 — 展開は launcher が起動時に行い、ロードは Windows ローダが行う) / `decoder.rs` (avformat/avcodec/swscale デコード worker、`VideoDynamicState` で per-frame 状態を atomic 共有) / `audio.rs` (cpal/WASAPI 出力 + ring buffer + VST3 前段の time-stretch) / `audio_stretch.rs` (Signalsmith Stretch による pitch 維持の倍速音声処理) / `clock.rs` (AV マスタークロック)。FsCacheEntry::Video が VideoPlayer を所有。`VideoInfo.dynamic` は decoder thread / native presenter thread / UI で共有し、右パネルの「フレーム表示」「デインターレース」を動的更新する |
+| `video/` | 動画インライン再生とリモート時計なし配信。`mod.rs` (VideoPlayer 公開 API) / `ffmpeg_loader.rs` (FFmpeg LGPL DLL 検証) / `decoder.rs` (通常再生 decode worker) / `audio.rs` (cpal/WASAPI + local VST3) / `clockless_transcode.rs` と `stream/session.rs` (再生時計から独立した H.264/AAC/fMP4 generation、session 共有 remote VST3) / `audio_stretch.rs` / `clock.rs`。FsCacheEntry::Video が VideoPlayer を所有し、remote headless player は metadata / thumbnail だけを提供する |
 | `folder_tree.rs` | 深さ優先前順トラバーサル (Ctrl+↑↓ 用) |
 | `panorama.rs` / `panorama_wgpu.rs` | 360 度パノラマビュー (Phase 1 + 1.5 + 2a)。`panorama.rs` は state / GPano XMP 検出 / 解像度ゲート / settle policy / CPU bilinear sampler / `render_settle_overlay`、`panorama_wgpu.rs` は equirect WGSL シェーダ + 8K base アップロード + settle overlay の alpha blend pipeline。詳細は [`docs/panorama-360-view-plan.md`](panorama-360-view-plan.md) |
 

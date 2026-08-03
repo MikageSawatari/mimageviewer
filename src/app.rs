@@ -46327,6 +46327,9 @@ impl App {
                 output_consumer,
                 crate::video::VideoOutputConsumer::RemoteHeadless
             ) {
+                // The paused headless player is metadata/thumbnail-only and never feeds realtime
+                // PCM. Clockless streaming owns one separate session VST3 host shared by every
+                // generation, so it must not also attach the App-global local-playback bridge here.
                 None
             } else {
                 Some(self.dsp_bridge.clone())

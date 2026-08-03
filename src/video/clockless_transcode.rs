@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use ffmpeg::format::Pixel;
@@ -141,16 +141,289 @@ pub(crate) enum ClocklessSegmentBytes {
     NotFound,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClocklessVstStatusSnapshot {
+    pub(crate) requested: bool,
+    pub(crate) active: bool,
+    pub(crate) active_slots: u32,
+    pub(crate) warning: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ClocklessVstStatus {
+    inner: Arc<Mutex<ClocklessVstStatusSnapshot>>,
+}
+
+impl ClocklessVstStatus {
+    fn new(snapshot: ClocklessVstStatusSnapshot) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(snapshot)),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> ClocklessVstStatusSnapshot {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn mark_processing_failed(&self) {
+        let mut status = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        status.active = false;
+        status.active_slots = 0;
+        status.warning =
+            Some("VST3 の音声処理に失敗したため、配信は VST3 なしで継続しています。".to_owned());
+    }
+
+    fn mark_prepared(&self, prepared: &ClocklessVstPrepareResult) {
+        let mut status = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        status.active = prepared.active_slots > 0;
+        status.active_slots = prepared.active_slots;
+        status.warning = prepared.warning.clone();
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ClocklessVstPrepareResult {
+    active_slots: u32,
+    warning: Option<String>,
+}
+
+pub(crate) trait ClocklessVstProcessor: Send + Sync {
+    fn sample_rate(&self) -> u32;
+    fn prepare(&self) -> ClocklessVstPrepareResult;
+    fn reset(&self);
+    fn total_latency_samples(&self) -> u32;
+    fn process_block(&self, src: &[f32], dst: &mut [f32]) -> Result<(), String>;
+}
+
+#[cfg(windows)]
+impl ClocklessVstProcessor for super::dsp::DspBridge {
+    fn sample_rate(&self) -> u32 {
+        super::dsp::DspBridge::sample_rate(self)
+    }
+
+    fn prepare(&self) -> ClocklessVstPrepareResult {
+        ClocklessVstPrepareResult {
+            active_slots: u32::try_from(self.active_slot_count()).unwrap_or(u32::MAX),
+            warning: None,
+        }
+    }
+
+    fn reset(&self) {
+        super::dsp::DspBridge::reset_plugins_sync(self);
+    }
+
+    fn total_latency_samples(&self) -> u32 {
+        super::dsp::DspBridge::total_latency_samples(self)
+    }
+
+    fn process_block(&self, src: &[f32], dst: &mut [f32]) -> Result<(), String> {
+        super::dsp::DspBridge::process_block(self, src, dst)
+    }
+}
+
+#[cfg(windows)]
+struct RemoteVstProcessor {
+    bridge: Arc<super::dsp::DspBridge>,
+    plugins: Vec<crate::settings::Vst3PluginEntry>,
+    sample_rate: u32,
+    load_budget: Duration,
+    prepared: std::sync::OnceLock<ClocklessVstPrepareResult>,
+}
+
+#[cfg(windows)]
+impl RemoteVstProcessor {
+    fn prepare_once(&self) -> ClocklessVstPrepareResult {
+        self.prepared
+            .get_or_init(|| {
+                if self.load_budget.is_zero() {
+                    return ClocklessVstPrepareResult {
+                        active_slots: 0,
+                        warning: Some(
+                            "VST3 の初期化時間を確保できなかったため、配信は VST3 なしで継続しています。"
+                                .to_owned(),
+                        ),
+                    };
+                }
+                if let Err(error) = self.bridge.enable() {
+                    crate::logger::log(format!(
+                        "remote-stream VST3 host enable failed; continuing dry: {error}"
+                    ));
+                    return ClocklessVstPrepareResult {
+                        active_slots: 0,
+                        warning: Some(
+                            "VST3 ホストを開始できなかったため、配信は VST3 なしで継続しています。"
+                                .to_owned(),
+                        ),
+                    };
+                }
+
+                let requested_active = self.plugins.iter().filter(|plugin| !plugin.bypass).count();
+                let mut load_failures = 0_usize;
+                let load_deadline = Instant::now() + self.load_budget;
+                for plugin in self.plugins.iter().filter(|plugin| !plugin.bypass) {
+                    let Some(load_timeout) = load_deadline.checked_duration_since(Instant::now())
+                    else {
+                        load_failures = load_failures.saturating_add(1);
+                        self.bridge.disable_with_reason(Some(
+                            "Remote VST3 initialization exceeded its start-budget share".to_owned(),
+                        ));
+                        break;
+                    };
+                    if let Err(error) = self.bridge.add_plugin_with_load_timeout(
+                        &plugin.path,
+                        self.sample_rate,
+                        480,
+                        false,
+                        plugin.user_hidden,
+                        plugin.state.as_deref(),
+                        None,
+                        None,
+                        load_timeout,
+                    ) {
+                        load_failures = load_failures.saturating_add(1);
+                        crate::logger::log(format!(
+                            "remote-stream VST3 load failed path={:?}; continuing: {error}",
+                            plugin.path
+                        ));
+                        if !self.bridge.is_enabled() {
+                            break;
+                        }
+                    }
+                }
+
+                let active_slots = self.bridge.active_slot_count();
+                let warning = if requested_active > 0 && active_slots == 0 {
+                    Some(
+                        "VST3 プラグインを読み込めなかったため、配信は VST3 なしで継続しています。"
+                            .to_owned(),
+                    )
+                } else if load_failures > 0 || active_slots < requested_active {
+                    Some(format!(
+                        "一部の VST3 プラグインを読み込めなかったため、{active_slots}/{requested_active} 個だけ適用しています。"
+                    ))
+                } else {
+                    None
+                };
+                ClocklessVstPrepareResult {
+                    active_slots: u32::try_from(active_slots).unwrap_or(u32::MAX),
+                    warning,
+                }
+            })
+            .clone()
+    }
+}
+
+#[cfg(windows)]
+impl ClocklessVstProcessor for RemoteVstProcessor {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn prepare(&self) -> ClocklessVstPrepareResult {
+        self.prepare_once()
+    }
+
+    fn reset(&self) {
+        self.bridge.reset_plugins_sync();
+    }
+
+    fn total_latency_samples(&self) -> u32 {
+        self.bridge.total_latency_samples()
+    }
+
+    fn process_block(&self, src: &[f32], dst: &mut [f32]) -> Result<(), String> {
+        self.bridge.process_block(src, dst)
+    }
+}
+
+#[derive(Clone)]
+struct ClocklessVstChain {
+    processor: Arc<dyn ClocklessVstProcessor>,
+    failed: Arc<AtomicBool>,
+    status: ClocklessVstStatus,
+}
+
 #[derive(Clone)]
 pub(crate) struct ClocklessAudioProcessing {
     pub(crate) normalize_gain: f64,
+    vst3: Option<ClocklessVstChain>,
+    vst3_status: ClocklessVstStatus,
+}
+
+impl ClocklessAudioProcessing {
+    pub(crate) fn without_vst3(normalize_gain: f64) -> Self {
+        let vst3_status = ClocklessVstStatus::new(ClocklessVstStatusSnapshot {
+            requested: false,
+            active: false,
+            active_slots: 0,
+            warning: None,
+        });
+        Self {
+            normalize_gain,
+            vst3: None,
+            vst3_status,
+        }
+    }
+
+    pub(crate) fn with_vst3(
+        normalize_gain: f64,
+        processor: Arc<dyn ClocklessVstProcessor>,
+        active_slots: u32,
+        warning: Option<String>,
+    ) -> Self {
+        let vst3_status = ClocklessVstStatus::new(ClocklessVstStatusSnapshot {
+            requested: true,
+            active: active_slots > 0,
+            active_slots,
+            warning,
+        });
+        Self {
+            normalize_gain,
+            vst3: Some(ClocklessVstChain {
+                processor,
+                failed: Arc::new(AtomicBool::new(false)),
+                status: vst3_status.clone(),
+            }),
+            vst3_status,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn with_remote_vst3(
+        normalize_gain: f64,
+        plugins: Vec<crate::settings::Vst3PluginEntry>,
+        sample_rate: u32,
+        load_budget: Duration,
+    ) -> Self {
+        let processor: Arc<dyn ClocklessVstProcessor> = Arc::new(RemoteVstProcessor {
+            bridge: super::dsp::DspBridge::new(),
+            plugins,
+            sample_rate: sample_rate.max(1),
+            load_budget,
+            prepared: std::sync::OnceLock::new(),
+        });
+        Self::with_vst3(normalize_gain, processor, 0, None)
+    }
+
+    pub(crate) fn vst3_status(&self) -> ClocklessVstStatus {
+        self.vst3_status.clone()
+    }
+
+    fn processing_sample_rate(&self) -> u32 {
+        self.vst3
+            .as_ref()
+            .map(|chain| chain.processor.sample_rate())
+            .filter(|sample_rate| *sample_rate > 0)
+            .unwrap_or(AUDIO_OUTPUT_RATE)
+    }
 }
 
 impl Default for ClocklessAudioProcessing {
     fn default() -> Self {
-        Self {
-            normalize_gain: 1.0,
-        }
+        Self::without_vst3(1.0)
     }
 }
 
@@ -821,6 +1094,8 @@ impl AudioPath {
 
 struct ClocklessAudioProcessor {
     normalize_gain: f32,
+    vst3: Option<ClocklessVstChain>,
+    vst3_output: Vec<f32>,
     limiter: SafetyLimiter,
 }
 
@@ -829,8 +1104,22 @@ impl ClocklessAudioProcessor {
         if !config.normalize_gain.is_finite() || config.normalize_gain < 0.0 {
             return Err("normalize gain must be finite and non-negative".to_owned());
         }
+        let mut vst3 = config.vst3;
+        if let Some(chain) = vst3.as_ref()
+            && !chain.failed.load(Ordering::Acquire)
+        {
+            let prepared = chain.processor.prepare();
+            chain.status.mark_prepared(&prepared);
+            if prepared.active_slots > 0 {
+                chain.processor.reset();
+            } else {
+                vst3 = None;
+            }
+        }
         Ok(Self {
             normalize_gain: config.normalize_gain as f32,
+            vst3,
+            vst3_output: Vec::new(),
             limiter: SafetyLimiter::new(sample_rate, 2),
         })
     }
@@ -843,7 +1132,35 @@ impl ClocklessAudioProcessor {
         }
 
         let mut latency_secs = 0.0;
-        if self.normalize_gain > 1.0 + f32::EPSILON {
+        let mut vst3_applied = false;
+        if let Some(chain) = self
+            .vst3
+            .as_ref()
+            .filter(|chain| !chain.failed.load(Ordering::Acquire))
+        {
+            self.vst3_output.resize(chunk.samples.len(), 0.0);
+            match chain
+                .processor
+                .process_block(&chunk.samples, &mut self.vst3_output)
+            {
+                Ok(()) => {
+                    std::mem::swap(&mut chunk.samples, &mut self.vst3_output);
+                    latency_secs += chain.processor.total_latency_samples() as f64
+                        / f64::from(chain.processor.sample_rate().max(1));
+                    vst3_applied = true;
+                }
+                Err(error) => {
+                    if !chain.failed.swap(true, Ordering::AcqRel) {
+                        crate::logger::log(format!(
+                            "remote-stream VST3 process failed; continuing dry: {error}"
+                        ));
+                        chain.status.mark_processing_failed();
+                    }
+                }
+            }
+        }
+
+        if vst3_applied || self.normalize_gain > 1.0 + f32::EPSILON {
             self.limiter.process_block(&mut chunk.samples);
             latency_secs += self.limiter.latency_secs();
         } else {
@@ -1166,7 +1483,10 @@ fn run_clockless_stream_inner(
     };
     let source_origin_secs = options.source_origin_secs.max(source_start_secs);
     let timeline = StreamTimeline::new(source_origin_secs).map_err(|error| error.to_string())?;
-    let processing_sample_rate = AUDIO_OUTPUT_RATE;
+    // The shared VST3 host is configured for the PC output rate. Resample the clockless PCM to
+    // that same rate before normalize -> VST3 -> limiter, then let the AAC encoder retain or
+    // convert that rate as needed.
+    let processing_sample_rate = audio_processing.processing_sample_rate();
     let mut audio_path = audio_stream
         .map(|stream| AudioPath::open(stream, processing_sample_rate))
         .transpose()?;
@@ -1575,11 +1895,88 @@ fn selected_frame_rate(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
     use super::*;
+
+    struct FakeVstProcessor {
+        sample_rate: u32,
+        fail: bool,
+        prepare_active_slots: u32,
+        prepare_warning: Option<String>,
+        reset_count: AtomicUsize,
+        inputs: Mutex<Vec<Vec<f32>>>,
+    }
+
+    impl FakeVstProcessor {
+        fn new(sample_rate: u32, fail: bool) -> Self {
+            Self {
+                sample_rate,
+                fail,
+                prepare_active_slots: 1,
+                prepare_warning: None,
+                reset_count: AtomicUsize::new(0),
+                inputs: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn unavailable(sample_rate: u32) -> Self {
+            Self {
+                sample_rate,
+                fail: false,
+                prepare_active_slots: 0,
+                prepare_warning: Some(
+                    "VST3 プラグインを読み込めなかったため、配信を継続しています。".to_owned(),
+                ),
+                reset_count: AtomicUsize::new(0),
+                inputs: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ClocklessVstProcessor for FakeVstProcessor {
+        fn sample_rate(&self) -> u32 {
+            self.sample_rate
+        }
+
+        fn prepare(&self) -> ClocklessVstPrepareResult {
+            ClocklessVstPrepareResult {
+                active_slots: self.prepare_active_slots,
+                warning: self.prepare_warning.clone(),
+            }
+        }
+
+        fn reset(&self) {
+            self.reset_count.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn total_latency_samples(&self) -> u32 {
+            0
+        }
+
+        fn process_block(&self, src: &[f32], dst: &mut [f32]) -> Result<(), String> {
+            self.inputs.lock().unwrap().push(src.to_vec());
+            if self.fail {
+                return Err("fixture VST failure".to_owned());
+            }
+            dst.copy_from_slice(src);
+            Ok(())
+        }
+    }
+
+    fn audio_chunk(samples: Vec<f32>) -> ProcessedChunk {
+        ProcessedChunk {
+            samples,
+            audible_pts_secs: 10.0,
+            duration_secs: 1.0 / f64::from(AUDIO_OUTPUT_RATE),
+            source_secs_per_output_sec: 1.0,
+            seek_serial: SEEK_SERIAL,
+            pdc_latency_secs_at_process: 0.0,
+        }
+    }
 
     fn write_finite_av_fixture(path: &Path, video_frames: i64) {
         use ffmpeg::codec::packet::Flags;
@@ -1811,9 +2208,7 @@ mod tests {
     #[test]
     fn normalize_gain_is_applied_before_remote_audio_encoding() {
         let mut processor = ClocklessAudioProcessor::new(
-            ClocklessAudioProcessing {
-                normalize_gain: 0.579,
-            },
+            ClocklessAudioProcessing::without_vst3(0.579),
             AUDIO_OUTPUT_RATE,
         )
         .unwrap();
@@ -1829,6 +2224,82 @@ mod tests {
         assert!((chunk.samples[0] - 0.579).abs() < 1.0e-6);
         assert!((chunk.samples[1] + 0.2895).abs() < 1.0e-6);
         assert_eq!(chunk.audible_pts_secs, 10.0);
+    }
+
+    #[test]
+    fn remote_normalize_runs_before_the_shared_vst_chain() {
+        let host = Arc::new(FakeVstProcessor::new(44_100, false));
+        let processor_handle: Arc<dyn ClocklessVstProcessor> = host.clone();
+        let config = ClocklessAudioProcessing::with_vst3(0.5, processor_handle, 1, None);
+        assert_eq!(config.processing_sample_rate(), 44_100);
+        let mut processor = ClocklessAudioProcessor::new(config, 44_100).unwrap();
+        let _ = processor.process(audio_chunk(vec![0.4, -0.2]));
+
+        assert_eq!(host.reset_count.load(Ordering::Acquire), 1);
+        assert_eq!(host.inputs.lock().unwrap().as_slice(), &[vec![0.2, -0.1]]);
+    }
+
+    #[test]
+    fn vst_processing_failure_keeps_remote_audio_running_dry_and_publishes_warning() {
+        let host = Arc::new(FakeVstProcessor::new(AUDIO_OUTPUT_RATE, true));
+        let processor_handle: Arc<dyn ClocklessVstProcessor> = host;
+        let config = ClocklessAudioProcessing::with_vst3(0.5, processor_handle, 1, None);
+        let status = config.vst3_status();
+        let mut processor = ClocklessAudioProcessor::new(config, AUDIO_OUTPUT_RATE).unwrap();
+        let chunk = processor.process(audio_chunk(vec![0.4, -0.2]));
+
+        assert_eq!(chunk.samples, vec![0.2, -0.1]);
+        let status = status.snapshot();
+        assert!(status.requested);
+        assert!(!status.active);
+        assert_eq!(status.active_slots, 0);
+        assert!(
+            status
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("継続"))
+        );
+    }
+
+    #[test]
+    fn vst_load_failure_keeps_remote_audio_running_dry_and_publishes_warning() {
+        let host = Arc::new(FakeVstProcessor::unavailable(AUDIO_OUTPUT_RATE));
+        let processor_handle: Arc<dyn ClocklessVstProcessor> = host.clone();
+        let config = ClocklessAudioProcessing::with_vst3(0.5, processor_handle, 0, None);
+        let status = config.vst3_status();
+        let mut processor = ClocklessAudioProcessor::new(config, AUDIO_OUTPUT_RATE).unwrap();
+        let chunk = processor.process(audio_chunk(vec![0.4, -0.2]));
+
+        assert_eq!(chunk.samples, vec![0.2, -0.1]);
+        assert_eq!(host.reset_count.load(Ordering::Acquire), 0);
+        assert!(host.inputs.lock().unwrap().is_empty());
+        let status = status.snapshot();
+        assert!(status.requested);
+        assert!(!status.active);
+        assert_eq!(status.active_slots, 0);
+        assert!(
+            status
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("読み込めなかった"))
+        );
+    }
+
+    #[test]
+    fn generation_switch_reuses_one_session_vst_host() {
+        let host = Arc::new(FakeVstProcessor::new(AUDIO_OUTPUT_RATE, false));
+        let processor_handle: Arc<dyn ClocklessVstProcessor> = host;
+        let session = ClocklessAudioProcessing::with_vst3(1.0, processor_handle, 1, None);
+        let old_generation = session.clone();
+        let new_generation = session.clone();
+        let old_host = &old_generation.vst3.as_ref().unwrap().processor;
+        let new_host = &new_generation.vst3.as_ref().unwrap().processor;
+
+        assert!(Arc::ptr_eq(old_host, new_host));
+        assert!(Arc::ptr_eq(
+            &old_generation.vst3.as_ref().unwrap().failed,
+            &new_generation.vst3.as_ref().unwrap().failed,
+        ));
     }
 
     #[test]

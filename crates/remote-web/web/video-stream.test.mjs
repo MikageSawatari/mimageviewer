@@ -7,9 +7,30 @@ import {
   hlsBufferConfig,
   preventVideoNativeZoom,
   resolveVideoPlaylist,
+  videoAudioProcessingPresentation,
   videoEndDecision,
   videoUserErrorMessage,
 } from "./video-stream.mjs";
+
+test("VST3 processing failures remain visible while the video keeps a playable status", () => {
+  assert.deepEqual(videoAudioProcessingPresentation({
+    vst3_requested: true,
+    vst3_active: false,
+    vst3_active_slots: 0,
+    vst3_warning: "VST3 を適用できないため、配信を継続しています。",
+  }), {
+    requested: true,
+    active: false,
+    activeSlots: 0,
+    warning: "VST3 を適用できないため、配信を継続しています。",
+    detail: "VST3 未適用",
+  });
+  assert.equal(videoAudioProcessingPresentation({
+    vst3_requested: true,
+    vst3_active: true,
+    vst3_active_slots: 5,
+  }).detail, "VST3 5");
+});
 
 test("video EOF follows the PC continuous OFF and loop OFF stop rule", () => {
   assert.deepEqual(videoEndDecision({

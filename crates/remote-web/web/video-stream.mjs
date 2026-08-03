@@ -43,6 +43,26 @@ export function hlsBufferConfig(bufferTargetSecs) {
   };
 }
 
+export function videoAudioProcessingPresentation(status = {}) {
+  const requested = Boolean(status?.vst3_requested);
+  const active = Boolean(status?.vst3_active);
+  const activeSlots = Math.max(0, Math.floor(Number(status?.vst3_active_slots) || 0));
+  const warning = typeof status?.vst3_warning === "string"
+    ? status.vst3_warning.trim()
+    : "";
+  return {
+    requested,
+    active,
+    activeSlots,
+    warning,
+    detail: active
+      ? `VST3 ${activeSlots}`
+      : requested
+        ? (warning ? "VST3 未適用" : "VST3 バイパス")
+        : "",
+  };
+}
+
 export function preventVideoNativeZoom(event) {
   if (event?.target?.closest?.("button, input, select, textarea, a")) return false;
   if (!event?.cancelable) return false;
@@ -852,6 +872,8 @@ export class VideoStreamViewer {
     this.generation = null;
     this.encoder = "";
     this.codecs = "";
+    this.audioProcessing = videoAudioProcessingPresentation();
+    this.lastAnnouncedAudioWarning = "";
     this.lastState = null;
     this.timelineAnchor = { sourcePositionSecs: 0, mediaTimeSecs: 0 };
     this.timelineAnchorGeneration = null;
@@ -1099,6 +1121,7 @@ export class VideoStreamViewer {
     this.bufferTargetSecs = hlsBufferConfig(started.buffer_target_secs).maxBufferLength;
     this.encoder = String(started.encoder ?? "");
     this.codecs = String(started.codec ?? "");
+    this.updateAudioProcessing(started.audio_processing, false);
     this.endBehavior = started.end_behavior ?? { kind: "stop" };
     this.endPositionSample = null;
     this.endTransitionPending = false;
@@ -1139,6 +1162,7 @@ export class VideoStreamViewer {
       url: playlistUrl,
     });
     if (!attached || this.destroyed) return;
+    this.announceAudioProcessingWarning();
     if (!restorePlaying) {
       await this.setPlaying(false);
     } else {
@@ -1835,6 +1859,7 @@ export class VideoStreamViewer {
     this.video.volume = this.volume;
     this.encoder = String(mediaState.encoder ?? this.encoder);
     this.codecs = String(mediaState.codecs ?? this.codecs);
+    this.updateAudioProcessing(mediaState.audio_processing, true);
     this.playRequested = Boolean(mediaState.play_intent);
     this.seekInput.max = String(this.duration);
     if (
@@ -1881,6 +1906,24 @@ export class VideoStreamViewer {
     this.seekInput.setAttribute("aria-valuetext", this.counter.value);
   }
 
+  updateAudioProcessing(status, announce) {
+    this.audioProcessing = videoAudioProcessingPresentation(status);
+    if (!this.audioProcessing.warning) this.lastAnnouncedAudioWarning = "";
+    if (announce) this.announceAudioProcessingWarning();
+  }
+
+  announceAudioProcessingWarning() {
+    const warning = this.audioProcessing.warning;
+    if (!warning || warning === this.lastAnnouncedAudioWarning) return;
+    this.lastAnnouncedAudioWarning = warning;
+    this.showNotice(warning, "warning");
+    this.schedule(() => {
+      if (this.noticeKind === "warning" && this.audioProcessing.warning === warning) {
+        this.hideNotice();
+      }
+    }, 6000);
+  }
+
   updateDiagnostics(source = {}) {
     const size = source.video_size;
     const dimensions = size?.width && size?.height ? `${size.width}×${size.height}` : "";
@@ -1892,7 +1935,9 @@ export class VideoStreamViewer {
       `画質 ${preset.label} (${preset.traffic})`,
       dimensions,
       bitrate,
+      this.audioProcessing.detail,
     ].filter(Boolean).join(" · ");
+    this.diagnostics.classList.toggle("is-warning", Boolean(this.audioProcessing.warning));
   }
 
   schedulePoll(delayMs = VIDEO_STATE_POLL_MS) {

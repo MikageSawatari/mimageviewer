@@ -88,6 +88,12 @@ fn resolve_remote_video_end_behavior(
     }
 }
 
+fn remote_vst_load_budget(start_budget_remaining: std::time::Duration) -> std::time::Duration {
+    start_budget_remaining
+        .saturating_sub(std::time::Duration::from_secs(3))
+        .min(std::time::Duration::from_secs(10))
+}
+
 struct AppRemoteVideoStarting {
     claimed: ClaimedVideoStreamUiRequest,
     streaming: AppRemoteVideoStreaming,
@@ -281,6 +287,7 @@ impl crate::app::App {
         quality: crate::video::stream::quality::QualityPreset,
         start_inputs: crate::video::RemoteStreamStartInputs,
         player: Box<crate::video::VideoPlayer>,
+        start_budget_remaining: std::time::Duration,
     ) -> Result<AppRemoteVideoStreaming, String> {
         if !self.settings.remote_video_streaming_enabled {
             return Err("remote video streaming is disabled".to_owned());
@@ -327,6 +334,8 @@ impl crate::app::App {
         if speed_changed {
             player.set_playback_speed(1.0);
         }
+        let audio_processing = self
+            .remote_clockless_audio_processing(start_inputs.normalize_gain, start_budget_remaining);
         let session = match RemoteVideoStreamingSession::start(
             owner,
             &player,
@@ -335,9 +344,7 @@ impl crate::app::App {
             quality,
             segment_capacity,
             self.settings.video_hw_decode,
-            crate::video::clockless_transcode::ClocklessAudioProcessing {
-                normalize_gain: start_inputs.normalize_gain,
-            },
+            audio_processing,
         ) {
             Ok(session) => session,
             Err(error) => {
@@ -359,6 +366,39 @@ impl crate::app::App {
             playback,
             end_behavior,
         })
+    }
+
+    fn remote_clockless_audio_processing(
+        &self,
+        normalize_gain: f64,
+        start_budget_remaining: std::time::Duration,
+    ) -> crate::video::clockless_transcode::ClocklessAudioProcessing {
+        #[cfg(not(windows))]
+        {
+            let _ = start_budget_remaining;
+            return crate::video::clockless_transcode::ClocklessAudioProcessing::without_vst3(
+                normalize_gain,
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            use crate::video::clockless_transcode::ClocklessAudioProcessing;
+
+            if !self.settings.vst3_enabled || self.settings.vst3_plugins.is_empty() {
+                return ClocklessAudioProcessing::without_vst3(normalize_gain);
+            }
+
+            // This creates one session-owned host. Generation configs clone its Arc, while the
+            // worker-side OnceLock loads the chain only once and never blocks the UI thread.
+            let sample_rate = crate::video::audio::default_output_sample_rate().unwrap_or(48_000);
+            ClocklessAudioProcessing::with_remote_vst3(
+                normalize_gain,
+                self.settings.vst3_plugins.clone(),
+                sample_rate,
+                remote_vst_load_budget(start_budget_remaining),
+            )
+        }
     }
 
     fn cancel_remote_video_stream_state(
@@ -648,6 +688,7 @@ impl crate::app::App {
                     opening.quality,
                     start_inputs,
                     player,
+                    opening.budget.remaining(),
                 );
                 match result {
                     Ok(streaming) => {
@@ -1492,6 +1533,19 @@ impl crate::app::App {
                     .to_string_lossy()
                     .into_owned()
             });
+        let streaming_audio_status =
+            self.remote_session_ui
+                .video_stream
+                .as_ref()
+                .and_then(|state| match state {
+                    AppRemoteVideoStreamState::Opening(_) => None,
+                    AppRemoteVideoStreamState::Starting(starting) => {
+                        Some(starting.streaming.session.access().audio_status())
+                    }
+                    AppRemoteVideoStreamState::Streaming(streaming) => {
+                        Some(streaming.session.access().audio_status())
+                    }
+                });
         let mut disconnect = false;
         egui::Modal::new(egui::Id::new("remote_session_modal")).show(ctx, |ui| {
             ui.heading("リモート接続中");
@@ -1500,6 +1554,16 @@ impl crate::app::App {
             ui.separator();
             if let Some(source) = streaming_source.as_deref() {
                 ui.label(egui::RichText::new(format!("リモートへ配信中: {source}")).strong());
+            }
+            if let Some(status) = streaming_audio_status.as_ref() {
+                if let Some(warning) = status.warning.as_deref() {
+                    ui.colored_label(egui::Color32::from_rgb(255, 190, 90), warning);
+                } else if status.active {
+                    ui.label(format!(
+                        "VST3: {} 個を配信音声へ適用中",
+                        status.active_slots
+                    ));
+                }
             }
             ui.label(format!(
                 "現在の処理: {}",
@@ -2034,6 +2098,19 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_vst_load_budget_preserves_the_encoder_playlist_reserve() {
+        assert_eq!(
+            remote_vst_load_budget(std::time::Duration::from_secs(15)),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            remote_vst_load_budget(std::time::Duration::from_secs(8)),
+            std::time::Duration::from_secs(5)
+        );
+        assert!(remote_vst_load_budget(std::time::Duration::from_secs(2)).is_zero());
+    }
 
     #[test]
     fn remote_video_end_behavior_matches_local_continuous_and_loop_precedence() {

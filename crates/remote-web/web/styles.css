@@ -837,9 +837,17 @@ button {
   border-color: rgb(111 161 239 / 65%);
 }
 
+.video-stream-notice[data-kind="warning"] {
+  border-color: rgb(255 190 90 / 78%);
+}
+
 .video-stream-notice[data-kind="gone"],
 .video-stream-notice[data-kind="error"] {
   border-color: rgb(239 141 111 / 70%);
+}
+
+.video-stream-diagnostics.is-warning {
+  color: #ffd28a;
 }
 
 .video-stream-notice button {
