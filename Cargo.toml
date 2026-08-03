@@ -118,6 +118,13 @@ bench = false
 required-features = ["dev-tools"]
 
 [[bin]]
+name = "gpu_lanczos_spike"
+path = "src/bin/gpu_lanczos_spike.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
 name = "normalize_probe"
 path = "src/bin/normalize_probe.rs"
 test = false

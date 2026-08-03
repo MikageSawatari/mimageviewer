@@ -1,6 +1,6 @@
 ﻿# 100%原寸のドットバイドット化と縮小リサンプルの改善 (v2.11.0)
 
-**ステータス: 段階1・2および §4.2.1 追補実装済み、段階3・4未実装。実装 = Codex Sol / レビュー・検収 = ClaudeCode。**
+**ステータス: 段階1・2および §4.2.1 追補実装済み、段階3 spike 実施済み、段階4未実装。実装 = Codex Sol / レビュー・検収 = ClaudeCode。**
 
 利用者報告 (2026-08-03) を起点に、フルスクリーン表示の「原寸なのにぼやける」問題と、
 「縮小するとモアレかぼやけの二択になる」問題をまとめて解決する。
@@ -372,6 +372,159 @@ Lanczos の前縮小に使う。
 前例と同じく、**読み飛ばして無視する移行**を用意すること。黙って消すと設定全体が読めなく
 なる。[CLAUDE.md 「永続データ・スキーマ変更時の判断」](../CLAUDE.md) のリリース済み扱い。
 
+### 4.3.2 段階3 spike の結論 (2026-08-04)
+
+**結論: 問いAは go、統合方式は C-1 を推奨する。段階4の製品統合には未着手。**
+
+#### 問いA — size_vec2() の分離
+
+commit b38610d5 時点で size_vec2() はリポジトリ全体に 43 呼び出し、そのうち
+ui_fullscreen.rs に 29 呼び出しある。全件を次のように分類した。
+
+| 分類 | 呼び出し数 | 場所と用途 |
+| --- | ---: | --- |
+| 静止画の論理レイアウト。縮小 TextureHandle へ単純置換すると壊れる | 12 | ui_fullscreen.rs:5245/5246, 7780, 9074, 15686, 16501, 16516, 19240/19241, 19543, 19598、および app.rs:37916。単ページ、見開き、連結読み、detached frozen snapshot の寸法 |
+| 静止画の論理情報または原寸参照。単純置換すると壊れる | 6 | ui_fullscreen.rs:4253, 10265, 10303, 10356, 10465, 19041。縦横判定、原寸/GPU clamp 表示、AI 出力寸法、ルーペ |
+| 縮小テクスチャの対象外 | 25 | animated frame、thumbnail、動画、detached 診断ログ、UI preview、grid、Text UI、設定画面、thumb quality、comic lab |
+
+したがって、**既存 TextureHandle を表示サイズの TextureHandle で置き換える素朴な案は no-go**。
+一方、C-1 は次の ownership 境界にすれば分離できる。
+
+1. 元の TextureHandle と各 cache は一切置き換えず、size_vec2() の owner として残す。
+2. DisplayedImageTransform は元ハンドルの論理寸法から従来どおり解決する。
+3. Lanczos 出力は wgpu texture と登録済み TextureId の typed resource として別に持つ。
+4. DisplayedImageTransform::paint_texture に渡す TextureId だけを出力側へ差し替える。
+   同メソッドは実テクスチャ寸法を読まず、0..1 の UV と任意の TextureId だけを Mesh に載せる。
+
+egui-wgpu の公開 Renderer::texture から managed level 0 の wgpu texture を参照でき、
+Renderer::register_native_texture で Rgba8Unorm の出力を登録できることも spike の型検査で確認した。
+新規 vendoring は不要。
+
+ルーペは現在の resolve_fs_processed_texture → 元 TextureHandle の経路をそのまま使い、
+Lanczos TextureId を渡さない。pixel grid はユーザー拡大が 1 倍超のときだけ描かれるため、
+§4.4 の縮小分岐と排他的であり、同様に元ハンドルの論理寸法を使い続けられる。
+
+分離そのものの段階4工数は 1〜2 日程度。単ページだけでなく見開き・連結・holdover・detached
+snapshot を同じ typed paint resource に通し、別の bool / Option を増やさないことが条件。
+
+#### 問いB — C-1 を推奨
+
+**C-1 (register_native_texture + paint TextureId の差し替え) を採る。**
+既存 DisplayedImageTransform が自由回転、表示トリム UV、見開き、連結読み、tint、clip、
+source↔screen 写像を既に所有しており、その最後の TextureId だけを交換できるため。
+
+C-2 は size_vec2() から独立できるが、CallbackTrait 側で同じ geometry、clip、tint、trim、
+自由回転、ページごとの paint order を再実装することになる。表示 transform の owner が二重化し、
+段階4の回帰面と detached rework への波及が C-1 より大きい。
+
+#### 問いC — RTX 4090 実測
+
+開発専用 gpu_lanczos_spike を追加し、mImageViewer 本体を起動せず DX12 で測定した。
+実装は vertical → horizontal の separable 2 pass。縮小時の support は各軸で 3/scale、
+すなわち最大タップ数を約 6/scale へ引き伸ばす。中間 texture は Rgba16Float とし、
+負のローブを pass 間の Rgba8 clamp で失わない。最終出力だけ register_native_texture が要求する
+Rgba8Unorm とした。
+
+素材は src_2480x3508.png。各測定は 5 回 warmup 後に 50 回を 1 timestamp query 区間で測り、
+独立 4 run の中央値を採った。mip 有効時は brief 指定どおり
+L = floor(log2(1/s)) を適用した。
+
+| 縮小率 | 経路 | mip level | 残り比率 | 最大タップ (縦/横) | 実 texture fetch | GPU 時間中央値 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 0.63 | level 0 直接 | 0 | 0.630 | 10 / 10 | 85.0M | 0.164 ms |
+| 0.63 | mip 前縮小 | 0 | 0.630 | 10 / 10 | 85.0M | 0.168 ms |
+| 0.41 | level 0 直接 | 0 | 0.410 | 15 / 15 | 73.5M | 0.193 ms |
+| 0.41 | mip 前縮小 | 1 | 0.820 | 8 / 8 | 23.7M | 0.047 ms |
+| 0.25 | level 0 直接 | 0 | 0.250 | 24 / 24 | 65.1M | 0.136 ms |
+| 0.25 | mip 前縮小 | 2 | 1.000 | 5 / 5 | 5.4M | 0.027 ms |
+
+ミップ前縮小を使えば残り比率は 0.5〜1.0、実ループの最大タップは 5〜10、
+fetch は 5.4〜85.0M に収まり、§4.3 の 30〜120M 目安と同じくソース解像度に対して有界になる。
+0.25 の 5 tap は倍率がちょうど 1.0 で support 端のゼロ重みを fetch しない実装上の値。
+
+#### CPU 参照との品質差
+
+GPU 出力を full/r<率>_lanczos3.png と全画素比較した。
+
+| 縮小率 | 経路 | MAE | RMSE | 最大差 | 2 階調超の画素 |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 0.63 | level 0 直接 | 0.0194 | 0.1393 | 1 | 0% |
+| 0.41 | level 0 直接 | 0.0258 | 0.1608 | 1 | 0% |
+| 0.25 | level 0 直接 | 0.0304 | 0.1744 | 1 | 0% |
+| 0.41 | box mip level 1 → Lanczos | 4.3752 | 10.1723 | 111 | 29.48% |
+| 0.25 | box mip level 2 → Lanczos | 3.8615 | 10.1112 | 97 | 24.33% |
+
+level 0 直接経路は float64 の CPU 参照と最大 1 階調差であり、カーネル引き伸ばしを含めて
+参照実装を再現した。したがって網点の平坦化と 1px 細線の保持は CPU 参照と数値上同等。
+
+一方、現行 box mip を 0.41 / 0.25 で先に使うと、後段が Lanczos でも full-resolution
+Lanczos 参照とは一致しない。これは固定 6 tap の問題ではなく、box 前縮小で情報を先に失うため。
+§4.3 の「通常の閲覧倍率 0.25〜1.0 は level 0 から直接」と整合する結果なので、
+**段階4では少なくとも 0.25〜1.0 を直接 Lanczos とし、mip 前縮小は 0.25 未満の極端縮小だけに
+限定する**。切替閾値とヒステリシスは段階4で決める。brief の L 式は mip 前縮小を有効にした
+ケースの計測としては確認済みだが、0.41 / 0.25 の通常経路へ無条件適用しない。
+
+#### ClaudeCode 検収時の追加結論 — mip 前縮小は全面的に不要 (2026-08-04)
+
+spike の実測値は、**separable Lanczos の縮小コストがソース画素数で有界**であることを示している。
+測定値と次の式が完全に一致する (ソース 2480×3508 = 8.70M px)。
+
+```
+fetch 数 ≈ 6 × W_src × H_src × (1 + s)        s = 縮小率
+  s=0.63 → 52.2M × 1.63 = 85.1M   (実測 85.0M)
+  s=0.41 → 52.2M × 1.41 = 73.6M   (実測 73.5M)
+  s=0.25 → 52.2M × 1.25 = 65.3M   (実測 65.1M)
+```
+
+pass1 (縦) の出力は `W_src × H_dst`、タップは `6/s` なので、両者の s が打ち消し合って
+**s に依存しない**。pass2 は `s` に比例する。つまり **縮小率が小さくなるほどコストは減る**。
+タップ数が発散する、という §4.3 当初の前提は誤りだった。
+
+mIV は表示テクスチャを長辺 8192 へ clamp している (`clamp_dynamic_for_gpu`) ため、
+直接経路の最悪ケースも有界になる。
+
+```
+最大ソース = 8192 × 8192 = 67.1M px
+最大 fetch = 6 × 67.1M × 2 = 805M
+RTX 4090 の実測スループット (85.0M / 0.164ms = 518M fetch/ms) → 約 1.6 ms
+```
+
+したがって **mip 前縮小は不要**。加えて box mip 経路は品質が明確に劣る
+(MAE 3.86〜4.38、最大差 97〜111、2 階調超が 24〜29%)。
+
+**決定: 段階4 では mip 前縮小を実装しない。全縮小率で level 0 から直接 Lanczos する。**
+
+これにより次が同時に消える。
+
+- 品質の崖 (切替点で box mip の劣化が入る)
+- **ズーム中の唯一の不連続点** — §4.3 で懸念していた mip level 切替の pop
+- 切替閾値とヒステリシスの設計・実装 (段階4 見積もりの「mip 閾値/ヒステリシス」項目)
+- mip chain の品質に対する依存
+
+残る考慮点:
+
+- 低スペック GPU では最悪ケース (8192² のソースを小さく表示) が 20〜40ms 級になり得る。
+  ただし再生成は**表示矩形が変わったときだけ**で、静止した閲覧中は発生しない。
+  §3.3 の A案 (高スペック機を想定し、報告が来たら対応) の範囲内として受容する。
+- 静止画表示が mip chain を使わなくなるなら、`DISPLAY_IMAGE_TEXTURE_OPTIONS` の
+  `mipmap_mode` を外して VRAM を約 1/3 削減できる可能性がある。ただし比較表示 (wipe/diff) と
+  360 度パノラマは自前の mip chain を使い続けるため、**静止画経路に限った判断**として
+  段階4 で扱う。
+
+#### 段階4の見積もりと残リスク
+
+段階4は 6〜9 日程度を見込む。
+
+- typed paint resource、source/generation/target size key、TextureId の free/update: 2〜3 日
+- 単ページ・見開き・連結・holdover・detached snapshot の統合: 2〜3 日
+- resize 量子化、mip 閾値/ヒステリシス、viewer-context 単位の cancel/evict: 1〜2 日
+- VRAM 会計・回帰テスト・perf 計装: 1 日
+
+主なリスクは、リサイズ中の再確保、古い source generation の出力採用、native TextureId の
+解放漏れ、連結読みの二重 texture を共有 VRAM pool へ実寸計上すること、box mip 切替点の画質差。
+比較表示と 360 度パノラマは既存 callback ownership が別なので、通常静止画 C-1 と混ぜず
+段階4の対象範囲を明示して扱う。
+
 ### 4.4 拡大 / 等倍 / 縮小の境界
 
 **ここを曖昧にすると両機能が干渉する。** 実効の物理スケールで 3 分岐する。
@@ -508,7 +661,7 @@ Lanczos リサンプルは PDF ページにも同様に適用する (表示テ�
 ```
 1. ppp 配管 + 物理 1:1                              完了 (2026-08-03)
 2. ピクセルスナップ (位置のみ)                      完了 (2026-08-03)
-3. GPU Lanczos の spike (mipmap.rs を雛形に実測)    1〜2日
+3. GPU Lanczos の spike (mipmap.rs を雛形に実測)    完了 (2026-08-04)
 4. 案C 本実装                                       5〜8日
 5. 設定 / ドキュメント / テスト / 手動検証          3〜4日
                                               計 約3週間

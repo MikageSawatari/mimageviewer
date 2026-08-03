@@ -88,6 +88,8 @@ pub mod gamepad;
 pub mod global_search;
 mod global_search_ui;
 pub mod gpu_info;
+#[cfg(any(test, feature = "dev-tools"))]
+pub mod gpu_lanczos_spike;
 pub mod grid_item;
 mod ime_focus;
 pub mod indexer_manager;
