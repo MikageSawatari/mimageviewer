@@ -445,7 +445,10 @@ thumbnail を含めない。
   宣言し、hls.js にも `startPosition: 0` と segment boundary 開始を明示して generation 先頭を選ぶ
 - seek bar はドラッグ終了後も `VideoSeekPreviewOwner` の要求位置を表示の正本とする。
   新 generation の `playing` / `loadeddata` で playback 所有へ戻るまでは、旧 media element の
-  `currentTime` で range / counter を巻き戻さない
+  `currentTime` で range / counter を巻き戻さない。±10 秒の連続入力も同じ owner に載せ、
+  実位置ではなく直前の要求位置へ増分を累積する。要求失敗時は request revision が一致する
+  preview だけを playback 所有へ戻す。着地時も request revision と実際に attach 済みの
+  generation が一致する場合だけ解除し、古い世代の失敗・再生開始で新しい連打位置を消さない
 - 先読み窓を埋めた有限素材では、次の frame/chunk の capacity 待ちが demux の EOF 観測より先に
   起き、未公開の終端を端末が取得して release することもできない循環があった。advertised target
   の外に公開可能な working fragment 1 本を有界に許可し、ring は target + working + terminal の

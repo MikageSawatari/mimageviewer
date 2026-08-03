@@ -60,6 +60,41 @@ test("seek target remains the displayed position until replacement playback land
   assert.equal(owner.displayedPosition(72.6), 72.6);
 });
 
+test("repeated relative seek previews accumulate from the latest requested position", () => {
+  const owner = new VideoSeekPreviewOwner();
+  const first = owner.requestRelative(42.774, -10, 284.5);
+  const second = owner.requestRelative(43.012, -10, 284.5);
+  const third = owner.requestRelative(43.251, -10, 284.5);
+
+  assert.ok(Math.abs(first.targetSecs - 32.774) < 1e-9);
+  assert.ok(Math.abs(second.targetSecs - 22.774) < 1e-9);
+  assert.ok(Math.abs(third.targetSecs - 12.774) < 1e-9);
+  assert.ok(Math.abs(owner.displayedPosition(43.5) - 12.774) < 1e-9);
+});
+
+test("relative seek preview returns to the landed playback position", () => {
+  const owner = new VideoSeekPreviewOwner();
+  const request = owner.requestRelative(42.774, -10, 284.5);
+
+  assert.ok(Math.abs(owner.displayedPosition(43) - 32.774) < 1e-9);
+  assert.equal(owner.bindGeneration(request, 8), true);
+  assert.equal(owner.playbackGenerationStarted(7), false);
+  assert.ok(Math.abs(owner.displayedPosition(43.1) - 32.774) < 1e-9);
+  assert.equal(owner.playbackGenerationStarted(8), true);
+  assert.equal(owner.displayedPosition(32.8), 32.8);
+});
+
+test("failed relative seek does not strand or clear a newer requested position", () => {
+  const owner = new VideoSeekPreviewOwner();
+  const stale = owner.requestRelative(42.774, -10, 284.5);
+  const latest = owner.requestRelative(43, -10, 284.5);
+
+  assert.equal(owner.requestFailed(stale), false);
+  assert.ok(Math.abs(owner.displayedPosition(43.2) - 22.774) < 1e-9);
+  assert.equal(owner.requestFailed(latest), true);
+  assert.equal(owner.displayedPosition(43.2), 43.2);
+});
+
 test("video surface consumes native zoom gestures but preserves interactive controls", () => {
   let prevented = 0;
   const surfaceEvent = {
@@ -209,8 +244,10 @@ test("same-generation switch requests share one recovery loop", async () => {
 
   assert.strictEqual(second, first);
   assert.equal(runs, 1);
+  assert.equal(owner.attachedTarget(), null);
   release(true);
   assert.equal(await first, true);
+  assert.equal(owner.attachedTarget().generation, 5);
   assert.equal(owner.currentTarget().generation, 5);
 });
 

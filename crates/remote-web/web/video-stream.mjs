@@ -186,6 +186,22 @@ export class VideoSeekPreviewOwner {
     return { ...this.state };
   }
 
+  requestRelative(playbackPositionSecs, deltaSecs, durationSecs, label = "シーク中") {
+    const basePositionSecs = this.displayedPosition(playbackPositionSecs);
+    const delta = Number(deltaSecs);
+    const duration = Number(durationSecs);
+    const targetSecs = Math.max(
+      0,
+      basePositionSecs + (Number.isFinite(delta) ? delta : 0)
+    );
+    return this.request(
+      Number.isFinite(duration) && duration > 0
+        ? Math.min(duration, targetSecs)
+        : targetSecs,
+      label
+    );
+  }
+
   acceptThumbnail(request, { actualPtsSecs, objectUrl, width = 0, height = 0 }) {
     const actual = Number(actualPtsSecs);
     if (
@@ -207,11 +223,41 @@ export class VideoSeekPreviewOwner {
     return true;
   }
 
-  playbackStarted() {
+  bindGeneration(request, generation) {
+    const expectedGeneration = Number(generation);
+    if (
+      this.state.kind === "playback" ||
+      request?.revision !== this.state.revision ||
+      !Number.isFinite(expectedGeneration)
+    ) {
+      return false;
+    }
+    this.state = { ...this.state, expectedGeneration };
+    return true;
+  }
+
+  playbackGenerationStarted(generation) {
+    const attachedGeneration = Number(generation);
+    if (
+      this.state.kind === "playback" ||
+      !Number.isFinite(attachedGeneration) ||
+      attachedGeneration !== this.state.expectedGeneration
+    ) {
+      return false;
+    }
+    return this.playbackStarted({ revision: this.state.revision });
+  }
+
+  playbackStarted(request = null) {
+    if (request !== null && request?.revision !== this.state.revision) return false;
     const wasActive = this.state.kind !== "playback";
     this.revision += 1;
     this.state = { kind: "playback" };
     return wasActive;
+  }
+
+  requestFailed(request) {
+    return this.playbackStarted(request);
   }
 
   current() {
@@ -390,6 +436,10 @@ export class VideoGenerationSwitchOwner {
       ? this.state.operation.target
       : this.state.target;
     return { ...target };
+  }
+
+  attachedTarget() {
+    return this.state.kind === "attached" ? { ...this.state.target } : null;
   }
 
   request(target, { force = false, initialRetryDelayMs = 0 } = {}) {
@@ -873,7 +923,7 @@ export class VideoStreamViewer {
     this.onPlaying = () => {
       this.checkPlaybackStartupProgress();
       this.clearWaiting();
-      this.finishSeekPreview();
+      this.finishSeekPreviewForAttachedGeneration();
     };
     this.onCanPlay = () => {
       this.checkPlaybackStartupProgress();
@@ -881,7 +931,7 @@ export class VideoStreamViewer {
     };
     this.onLoadedData = () => {
       this.checkPlaybackStartupProgress();
-      if (!this.playRequested) this.finishSeekPreview();
+      if (!this.playRequested) this.finishSeekPreviewForAttachedGeneration();
     };
     this.onWaiting = () => this.beginWaiting();
     this.onEnded = () => {
@@ -1147,7 +1197,6 @@ export class VideoStreamViewer {
 
   handleGenerationSwitchFailure(result, operation) {
     if (!operation.owns()) return;
-    this.finishSeekPreview();
     if (result.decision?.kind === "playlist_recovery_exhausted") {
       this.recordPlaybackIssue(
         "video_stream_generation_switch_failed",
@@ -1340,7 +1389,12 @@ export class VideoStreamViewer {
       return true;
     }
     if (requested.name === CommandName.MEDIA_SEEK_RELATIVE) {
-      this.seekTo(this.currentPosition() + Number(requested.payload.seconds || 0))
+      const request = this.beginRelativeSeekPreview(
+        Number(requested.payload.seconds || 0),
+        "シーク中"
+      );
+      if (!request) return true;
+      this.seekTo(request.targetSecs, request)
         .catch((error) => this.showOperationalError(error, "再生位置を変更できませんでした"));
       return true;
     }
@@ -1403,12 +1457,28 @@ export class VideoStreamViewer {
   }
 
   beginSeekPreview(targetSecs, label = "シーク中") {
-    if (!this.session || this.destroyed) return;
+    if (!this.session || this.destroyed) return null;
     const request = this.seekPreviewOwner.request(targetSecs, label);
+    return this.activateSeekPreview(request);
+  }
+
+  beginRelativeSeekPreview(deltaSecs, label = "シーク中") {
+    if (!this.session || this.destroyed) return null;
+    const request = this.seekPreviewOwner.requestRelative(
+      this.currentPosition(),
+      deltaSecs,
+      this.duration,
+      label
+    );
+    return this.activateSeekPreview(request);
+  }
+
+  activateSeekPreview(request) {
     this.seekThumbnailAbort?.abort();
     this.seekThumbnailAbort = new AbortController();
     this.clearSeekThumbnailObjectUrl();
     this.renderSeekPreview();
+    this.updateProgress();
     const controller = this.seekThumbnailAbort;
     Promise.resolve(this.seekThumbnailClear)
       .then(() => this.pollSeekThumbnail(request, controller))
@@ -1421,6 +1491,7 @@ export class VideoStreamViewer {
           );
         }
       });
+    return request;
   }
 
   async pollSeekThumbnail(request, controller) {
@@ -1493,12 +1564,28 @@ export class VideoStreamViewer {
     }
   }
 
-  finishSeekPreview() {
-    if (!this.seekPreviewOwner.playbackStarted()) return;
+  finishSeekPreview(request = null) {
+    this.releaseSeekPreview(this.seekPreviewOwner.playbackStarted(request));
+  }
+
+  finishSeekPreviewForAttachedGeneration() {
+    const generation = this.generationSwitch.attachedTarget()?.generation;
+    this.releaseSeekPreview(
+      this.seekPreviewOwner.playbackGenerationStarted(generation)
+    );
+  }
+
+  cancelSeekPreview(request) {
+    this.releaseSeekPreview(this.seekPreviewOwner.requestFailed(request));
+  }
+
+  releaseSeekPreview(released) {
+    if (!released) return;
     this.seekThumbnailAbort?.abort();
     this.seekThumbnailAbort = null;
     this.clearSeekThumbnailObjectUrl();
     this.renderSeekPreview();
+    this.updateProgress();
     const session = this.session;
     if (!session || this.destroyed) return;
     this.seekThumbnailClear = fetch("/api/video/thumbnail", {
@@ -1513,7 +1600,7 @@ export class VideoStreamViewer {
     }).catch(() => {});
   }
 
-  async seekTo(targetPositionSecs) {
+  async seekTo(targetPositionSecs, previewRequest = null) {
     if (!this.session || this.destroyed) return;
     const plan = videoSeekPlan({
       targetPositionSecs,
@@ -1524,11 +1611,15 @@ export class VideoStreamViewer {
     });
     if (plan.kind === "local") {
       this.video.currentTime = plan.mediaTimeSecs;
+      this.finishSeekPreview(previewRequest);
       this.updateProgress();
-      this.finishSeekPreview();
       return;
     }
-    this.beginSeekPreview(plan.positionSecs, "シーク中");
+    const request = previewRequest ?? this.beginSeekPreview(
+      plan.positionSecs,
+      "シーク中"
+    );
+    if (!request) return;
     if (this.noticeKind === "waiting" || this.noticeKind === "buffering") this.hideNotice();
     let sought;
     try {
@@ -1538,7 +1629,7 @@ export class VideoStreamViewer {
         this.abortController.signal
       ));
     } catch (error) {
-      this.finishSeekPreview();
+      this.cancelSeekPreview(request);
       if (error?.status === 409) {
         await this.restartAt(plan.positionSecs);
         return;
@@ -1546,16 +1637,23 @@ export class VideoStreamViewer {
       throw error;
     }
     this.generation = sought.generation;
+    this.seekPreviewOwner.bindGeneration(request, sought.generation);
     this.timelineAnchor = {
       sourcePositionSecs: plan.positionSecs,
       mediaTimeSecs: 0,
     };
     this.timelineAnchorGeneration = sought.generation;
-    await this.switchGeneration({
-      session: this.session,
-      generation: sought.generation,
-      url: sought.playlist,
-    });
+    try {
+      const attached = await this.switchGeneration({
+        session: this.session,
+        generation: sought.generation,
+        url: sought.playlist,
+      });
+      if (!attached) this.cancelSeekPreview(request);
+    } catch (error) {
+      this.cancelSeekPreview(request);
+      throw error;
+    }
   }
 
   async setVolume(requestedVolume) {
