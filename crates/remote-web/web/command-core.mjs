@@ -447,6 +447,21 @@ export function videoTimelineAnchor({
   };
 }
 
+/// 基準点は世代ごとに 1 度だけ置く。`videoTimelineAnchor` の `serverPosition - liveLag` は
+/// 2 つの揺れる値の差で、`liveLag` はセグメントが届くたびに 0 と segment 長の間を鋸歯状に
+/// 往復する。毎回の状態ポーリングで引き直すと、その揺れがそのまま表示位置の前後になる
+/// (2026-08-04 実機: 1:27 と 1:26 を往復)。世代の中では端末自身の再生位置だけで進める。
+///
+/// 非実時間トランスコードを入れると本体の位置は端末よりさらに先行するので、この分離は
+/// 表示の見栄えではなく前提条件になる。
+export function shouldReanchorVideoTimeline({
+  anchoredGeneration,
+  stateGeneration,
+}) {
+  if (anchoredGeneration == null) return true;
+  return Number(anchoredGeneration) !== Number(stateGeneration);
+}
+
 export function videoTimelinePosition({
   anchorSourcePositionSecs,
   anchorMediaTimeSecs,

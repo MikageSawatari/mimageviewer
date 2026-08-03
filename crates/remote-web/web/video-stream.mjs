@@ -10,6 +10,7 @@ import {
   videoSeekPlan,
   videoStartupDecision,
   videoTapCommand,
+  shouldReanchorVideoTimeline,
   videoTimelineAnchor,
   videoTimelinePosition,
   viewerGestureDecision,
@@ -712,6 +713,7 @@ export class VideoStreamViewer {
     this.codecs = "";
     this.lastState = null;
     this.timelineAnchor = { sourcePositionSecs: 0, mediaTimeSecs: 0 };
+    this.timelineAnchorGeneration = null;
     this.playRequested = true;
     this.barsVisible = true;
     this.destroyed = false;
@@ -948,6 +950,7 @@ export class VideoStreamViewer {
       sourcePositionSecs: 0,
       mediaTimeSecs: Number(this.video.currentTime) || 0,
     };
+    this.timelineAnchorGeneration = this.generation;
     this.updateDiagnostics(started);
 
     if (Number(positionSecs) > 0.25) {
@@ -960,6 +963,7 @@ export class VideoStreamViewer {
         this.generation = sought.generation;
         playlistUrl = sought.playlist;
         this.timelineAnchor.sourcePositionSecs = Math.min(positionSecs, this.duration);
+        this.timelineAnchorGeneration = this.generation;
       } catch (error) {
         if (error?.name === "AbortError" || this.destroyed) return;
         this.showOperationalError(error, "同じ位置から再開できませんでした");
@@ -1504,6 +1508,7 @@ export class VideoStreamViewer {
       sourcePositionSecs: plan.positionSecs,
       mediaTimeSecs: 0,
     };
+    this.timelineAnchorGeneration = sought.generation;
     await this.switchGeneration({
       session: this.session,
       generation: sought.generation,
@@ -1556,12 +1561,20 @@ export class VideoStreamViewer {
     this.codecs = String(mediaState.codecs ?? this.codecs);
     this.playRequested = Boolean(mediaState.playing);
     this.seekInput.max = String(this.duration);
-    this.timelineAnchor = videoTimelineAnchor({
-      serverPositionSecs: mediaState.position_secs,
-      mediaCurrentTimeSecs: this.video.currentTime,
-      seekableEndSecs: lastSeekableEnd(this.video),
-      durationSecs: this.duration,
-    });
+    if (
+      shouldReanchorVideoTimeline({
+        anchoredGeneration: this.timelineAnchorGeneration,
+        stateGeneration: mediaState.generation,
+      })
+    ) {
+      this.timelineAnchor = videoTimelineAnchor({
+        serverPositionSecs: mediaState.position_secs,
+        mediaCurrentTimeSecs: this.video.currentTime,
+        seekableEndSecs: lastSeekableEnd(this.video),
+        durationSecs: this.duration,
+      });
+      this.timelineAnchorGeneration = mediaState.generation;
+    }
     this.updateProgress();
     this.updateDiagnostics(mediaState);
     this.menu.setMediaState(this.menuState());

@@ -55,6 +55,7 @@ import {
   videoSeekPlan,
   videoStartupDecision,
   videoTapCommand,
+  shouldReanchorVideoTimeline,
   videoTimelineAnchor,
   videoTimelinePosition,
 } from "./command-core.mjs";
@@ -185,6 +186,51 @@ test("startup detects a deadline with no fetched media segment", () => {
     elapsedMs: 15000,
     timeoutMs: 15000,
   }), { kind: "started" });
+});
+
+test("the timeline is anchored once per generation, not on every state poll", () => {
+  // liveLag = seekableEnd - currentTime は segment 到着ごとに 0 と segment 長の間を
+  // 往復するので、毎回の poll で anchor を引き直すと表示位置がその幅だけ前後する。
+  assert.equal(
+    shouldReanchorVideoTimeline({ anchoredGeneration: null, stateGeneration: 7 }),
+    true,
+    "初回は基準点が無いので置く"
+  );
+  assert.equal(
+    shouldReanchorVideoTimeline({ anchoredGeneration: 7, stateGeneration: 7 }),
+    false,
+    "同じ世代の poll では引き直さない"
+  );
+  assert.equal(
+    shouldReanchorVideoTimeline({ anchoredGeneration: 7, stateGeneration: 8 }),
+    true,
+    "世代が変わったら置き直す"
+  );
+
+  // 同じ世代で liveLag だけが揺れても、表示位置は端末自身の再生位置で進む。
+  const anchor = videoTimelineAnchor({
+    serverPositionSecs: 300,
+    mediaCurrentTimeSecs: 55,
+    seekableEndSecs: 60,
+    durationSecs: 600,
+  });
+  const jittered = videoTimelineAnchor({
+    serverPositionSecs: 302,
+    mediaCurrentTimeSecs: 57,
+    seekableEndSecs: 62,
+    durationSecs: 600,
+  });
+  assert.notDeepEqual(anchor, jittered, "poll ごとの anchor は揺れる (だから固定する)");
+  assert.equal(
+    videoTimelinePosition({
+      anchorSourcePositionSecs: anchor.sourcePositionSecs,
+      anchorMediaTimeSecs: anchor.mediaTimeSecs,
+      mediaCurrentTimeSecs: 57,
+      durationSecs: 600,
+    }),
+    297,
+    "固定した基準点なら 2 秒進んだぶんだけ素直に進む"
+  );
 });
 
 test("whole-video position composes server state with the HLS window", () => {
