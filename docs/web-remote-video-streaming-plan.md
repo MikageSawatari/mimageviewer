@@ -855,7 +855,17 @@ CPU に戻さず GPU scale して NVENC へ渡す経路が次の性能投資候�
   generation 交換規約を再利用し、旧 worker を段境界 cancel、新 generation は独立 open + seek
   で開始する。終端は decoder、resampler、H.264/AAC encoder、A/V mux、既存
   `Fmp4Segmenter::finish()` の順に flush し、最終 fragment を ring に記録してから `Ended` と
-  session 側の `#EXT-X-ENDLIST` を公開する。単なる ring 満杯とは区別する
+  session 側の `#EXT-X-ENDLIST` を公開する。単なる ring 満杯とは区別する。live 30 本とは別に
+  terminal fragment 専用の 1 slot を ring に予約し、入力 EOF を観測した後の有限な codec drain は
+  未公開 fragment の取得待ちへ入れない
+- **世代資源の排他**: generation worker の auxiliary decoder / FFmpeg 所有 D3D11 device / H.264
+  encoder の全寿命を process-wide lease で直列化する。seek や start が旧 handle の非同期 join より
+  先に到着しても、旧 worker が戻り FFmpeg context が drop されるまでは次世代を open しない。
+  streaming registration は GPU 資源ではなく generation handle の寿命で保持し、worker が EOF へ
+  到達した後の play/pause を ownership loss にしない
+- **端末 seek の正本**: seek bar は指を離した時点の全体位置を absolute command として保持する。
+  session acquire 後に playhead を再加算しない。通常の初回 start は保存 resume を受け入れるが、
+  `restartAt` の明示位置は 0 秒も含めて start 応答の origin と照合し、異なれば `/api/video/seek` する
 
 ---
 

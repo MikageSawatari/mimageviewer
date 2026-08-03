@@ -4,10 +4,12 @@ import {
   ViewerGesture,
   bufferingQualitySuggestion,
   command,
+  videoAbsoluteSeekCommand,
   videoHttpStatusDecision,
   videoPlaybackDecision,
   videoQualityPreset,
   videoSeekPlan,
+  videoStartSeekTarget,
   videoStartupDecision,
   videoTapCommand,
   shouldReanchorVideoTimeline,
@@ -844,9 +846,7 @@ export class VideoStreamViewer {
       this.draggingSeek = false;
       send(
         event,
-        command(CommandName.MEDIA_SEEK_RELATIVE, {
-          seconds: target - this.currentPosition(),
-        }),
+        videoAbsoluteSeekCommand(target),
         "seek_bar"
       );
     });
@@ -927,7 +927,7 @@ export class VideoStreamViewer {
     this.root.classList.toggle("viewer-bars-hidden", !visible);
   }
 
-  async start(positionSecs = 0, restorePlaying = true) {
+  async start(positionSecs = null, restorePlaying = true) {
     this.playRequested = restorePlaying;
     this.clearPoll();
     this.showNotice("動画を準備しています。", "waiting");
@@ -963,16 +963,21 @@ export class VideoStreamViewer {
     this.timelineAnchorGeneration = this.generation;
     this.updateDiagnostics(started);
 
-    if (Number(positionSecs) > 0.25) {
+    const startSeekTarget = videoStartSeekTarget({
+      requestedPositionSecs: positionSecs,
+      sourceOriginSecs: started.source_origin_secs,
+      durationSecs: this.duration,
+    });
+    if (startSeekTarget !== null) {
       try {
         const sought = await this.requestWithWaiting(() => this.apiPostJson(
           "/api/video/seek",
-          { session: this.session, position_secs: Math.min(positionSecs, this.duration) },
+          { session: this.session, position_secs: startSeekTarget },
           this.abortController.signal
         ));
         this.generation = sought.generation;
         playlistUrl = sought.playlist;
-        this.timelineAnchor.sourcePositionSecs = Math.min(positionSecs, this.duration);
+        this.timelineAnchor.sourcePositionSecs = startSeekTarget;
         this.timelineAnchorGeneration = this.generation;
       } catch (error) {
         if (error?.name === "AbortError" || this.destroyed) return;
@@ -1313,6 +1318,11 @@ export class VideoStreamViewer {
     }
     if (requested.name === CommandName.MEDIA_SEEK_RELATIVE) {
       this.seekTo(this.currentPosition() + Number(requested.payload.seconds || 0))
+        .catch((error) => this.showOperationalError(error, "再生位置を変更できませんでした"));
+      return true;
+    }
+    if (requested.name === CommandName.MEDIA_SEEK_ABSOLUTE) {
+      this.seekTo(Number(requested.payload.positionSecs) || 0)
         .catch((error) => this.showOperationalError(error, "再生位置を変更できませんでした"));
       return true;
     }

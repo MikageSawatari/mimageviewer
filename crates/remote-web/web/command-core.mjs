@@ -42,6 +42,7 @@ export const CommandName = Object.freeze({
   GRID_PAGE_NEXT: "grid_page_next",
   GRID_SELECT: "grid_select",
   MEDIA_TOGGLE_PLAY: "media_toggle_play",
+  MEDIA_SEEK_ABSOLUTE: "media_seek_absolute",
   MEDIA_SEEK_RELATIVE: "media_seek_relative",
   MEDIA_VOLUME: "media_volume",
   MEDIA_QUALITY: "media_quality",
@@ -512,6 +513,36 @@ export function videoSeekPlan({
   return local
     ? { kind: "local", positionSecs, mediaTimeSecs }
     : { kind: "remote", positionSecs, mediaTimeSecs: null };
+}
+
+export function videoAbsoluteSeekCommand(targetPositionSecs) {
+  const positionSecs = Number(targetPositionSecs);
+  return command(CommandName.MEDIA_SEEK_ABSOLUTE, {
+    positionSecs: Number.isFinite(positionSecs) ? Math.max(0, positionSecs) : 0,
+  });
+}
+
+/// An omitted position means a normal open and preserves the core's saved resume position.
+/// Any explicit position, including zero, must win over a different origin returned by start.
+export function videoStartSeekTarget({
+  requestedPositionSecs,
+  sourceOriginSecs,
+  durationSecs,
+  toleranceSecs = 0.25,
+}) {
+  if (requestedPositionSecs === null || requestedPositionSecs === undefined) return null;
+  const requested = Number(requestedPositionSecs);
+  if (!Number.isFinite(requested)) return null;
+  const duration = Math.max(0, Number(durationSecs) || 0);
+  const target = clampNumber(requested, 0, duration || Math.max(0, requested));
+  const origin = clampNumber(
+    Number(sourceOriginSecs) || 0,
+    0,
+    duration || Math.max(0, Number(sourceOriginSecs) || 0)
+  );
+  return Math.abs(target - origin) > Math.max(0, Number(toleranceSecs) || 0)
+    ? target
+    : null;
 }
 
 export function bufferingQualitySuggestion({

@@ -157,15 +157,16 @@ impl ClocklessStreamOutput {
         if !source_origin_secs.is_finite() || source_origin_secs < 0.0 {
             return Err("source origin must be finite and non-negative".to_owned());
         }
+        let retained_capacity = retained_segment_capacity(segment_capacity)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(ClocklessOutputState {
                 segmenter: None,
                 info: None,
-                segment_capacity,
+                segment_capacity: retained_capacity,
                 source_origin_secs,
                 generated_duration_secs: 0.0,
                 evicted_duration_secs: 0.0,
-                retained: VecDeque::with_capacity(segment_capacity),
+                retained: VecDeque::with_capacity(retained_capacity),
                 ended: false,
             })),
         })
@@ -373,6 +374,13 @@ struct AheadState {
     produced_segments: u64,
     released_segments: u64,
     waiting_for_capacity: bool,
+    phase: AheadPhase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AheadPhase {
+    Producing,
+    Finishing,
 }
 
 #[derive(Debug)]
@@ -417,6 +425,7 @@ impl ClocklessTranscodeControl {
                     produced_segments: 0,
                     released_segments: 0,
                     waiting_for_capacity: false,
+                    phase: AheadPhase::Producing,
                 }),
                 wake: Condvar::new(),
             }),
@@ -475,6 +484,10 @@ impl ClocklessTranscodeControl {
                 state.waiting_for_capacity = false;
                 return Err(ClocklessStop::Cancelled);
             }
+            if state.phase == AheadPhase::Finishing {
+                state.waiting_for_capacity = false;
+                return Ok(());
+            }
             let ahead = state
                 .produced_segments
                 .saturating_sub(state.released_segments);
@@ -485,6 +498,16 @@ impl ClocklessTranscodeControl {
             state.waiting_for_capacity = true;
             state = self.inner.wake.wait(state).unwrap();
         }
+    }
+
+    /// EOF has already been observed, so only bounded decoder/encoder delay and the final
+    /// fragment remain. They use the output ring's dedicated terminal slot instead of waiting
+    /// for a browser request that cannot name the unpublished final fragment yet.
+    fn begin_finishing(&self) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.phase = AheadPhase::Finishing;
+        state.waiting_for_capacity = false;
+        self.inner.wake.notify_all();
     }
 
     fn record_produced(&self, produced_segments: u64) {
@@ -1094,7 +1117,7 @@ pub(crate) fn run_clockless_stream(
         video.encoder(),
         &audio_encoder.encoder,
         frame_rate,
-        options.segment_capacity,
+        retained_segment_capacity(options.segment_capacity)?,
     )
     .map_err(|error| error.to_string())?;
     let encoder = video.encoder_kind().as_str().to_owned();
@@ -1160,7 +1183,6 @@ pub(crate) fn run_clockless_stream(
     let mut reached_limit = false;
     let mut packets = input.packets();
     while !reached_limit {
-        state.wait_for_capacity()?;
         state.checkpoint()?;
         let started = Instant::now();
         let item = packets.next();
@@ -1238,6 +1260,12 @@ pub(crate) fn run_clockless_stream(
             }
         }
     }
+
+    // Capacity belongs at the packet/frame production boundary, not before demux. Otherwise a
+    // final full segment can fill the live window and park the worker before it observes EOF.
+    // Once EOF is known, the remaining codec delay and final fragment are bounded and use the
+    // ring's one reserved terminal slot.
+    state.control.begin_finishing();
 
     if !reached_limit {
         state.checkpoint()?;
@@ -1397,6 +1425,7 @@ fn validate_options(
     if options.segment_capacity == 0 {
         return Err("segment capacity must be non-zero".to_owned());
     }
+    retained_segment_capacity(options.segment_capacity)?;
     if u64::try_from(options.segment_capacity).ok() != Some(control.inner.capacity) {
         return Err("control capacity does not match transcode options".to_owned());
     }
@@ -1410,6 +1439,12 @@ fn validate_options(
         return Err("source origin must be finite and non-negative".to_owned());
     }
     Ok(())
+}
+
+fn retained_segment_capacity(segment_capacity: usize) -> Result<usize, String> {
+    segment_capacity
+        .checked_add(1)
+        .ok_or_else(|| "segment capacity leaves no room for the terminal fragment".to_owned())
 }
 
 fn stream_start_secs(stream: &ffmpeg::Stream<'_>) -> f64 {
@@ -1434,11 +1469,92 @@ fn selected_frame_rate(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
     use super::*;
+
+    fn write_finite_av_fixture(path: &Path) {
+        use ffmpeg::codec::packet::Flags;
+
+        const WIDTH: usize = 320;
+        const HEIGHT: usize = 180;
+        const VIDEO_FRAMES: i64 = 5;
+        const AUDIO_SAMPLES_PER_PACKET: usize = 4_000;
+        const AUDIO_RATE: i32 = 8_000;
+
+        ffmpeg::init().unwrap();
+        let mut output = ffmpeg::format::output_as(path, "avi").unwrap();
+        let video_codec = ffmpeg::codec::encoder::find(ffmpeg::codec::Id::RAWVIDEO).unwrap();
+        let audio_codec = ffmpeg::codec::encoder::find(ffmpeg::codec::Id::PCM_S16LE).unwrap();
+        let video_index;
+        {
+            let mut stream = output.add_stream(video_codec).unwrap();
+            video_index = stream.index();
+            stream.set_time_base((1, 2));
+            stream.set_rate((2, 1));
+            stream.set_avg_frame_rate((2, 1));
+            let mut parameters = stream.parameters_mut();
+            unsafe {
+                let parameters = &mut *parameters.as_mut_ptr();
+                parameters.codec_type = ffmpeg::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+                parameters.codec_id = ffmpeg::ffi::AVCodecID::AV_CODEC_ID_RAWVIDEO;
+                parameters.format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_BGR24 as i32;
+                parameters.width = WIDTH as i32;
+                parameters.height = HEIGHT as i32;
+                parameters.framerate = ffmpeg::ffi::AVRational { num: 2, den: 1 };
+                parameters.bits_per_coded_sample = 24;
+            }
+        }
+        let audio_index;
+        {
+            let mut stream = output.add_stream(audio_codec).unwrap();
+            audio_index = stream.index();
+            stream.set_time_base((1, AUDIO_RATE));
+            let mut parameters = stream.parameters_mut();
+            unsafe {
+                let parameters = &mut *parameters.as_mut_ptr();
+                parameters.codec_type = ffmpeg::ffi::AVMediaType::AVMEDIA_TYPE_AUDIO;
+                parameters.codec_id = ffmpeg::ffi::AVCodecID::AV_CODEC_ID_PCM_S16LE;
+                parameters.format = ffmpeg::ffi::AVSampleFormat::AV_SAMPLE_FMT_S16 as i32;
+                parameters.sample_rate = AUDIO_RATE;
+                parameters.bits_per_coded_sample = 16;
+                parameters.bits_per_raw_sample = 16;
+                parameters.block_align = 4;
+                parameters.bit_rate = i64::from(AUDIO_RATE) * 16 * 2;
+                ffmpeg::ffi::av_channel_layout_default(&mut parameters.ch_layout, 2);
+            }
+        }
+        output.write_header().unwrap();
+
+        for index in 0..VIDEO_FRAMES {
+            let mut pixels = vec![0_u8; WIDTH * HEIGHT * 3];
+            for pixel in pixels.chunks_exact_mut(3) {
+                pixel[0] = (index * 31) as u8;
+                pixel[1] = 64;
+                pixel[2] = 192;
+            }
+            let mut video = ffmpeg::Packet::copy(&pixels);
+            video.set_stream(video_index);
+            video.set_pts(Some(index));
+            video.set_dts(Some(index));
+            video.set_duration(1);
+            video.set_flags(Flags::KEY);
+            video.write_interleaved(&mut output).unwrap();
+
+            let samples = vec![0_u8; AUDIO_SAMPLES_PER_PACKET * 2 * std::mem::size_of::<i16>()];
+            let mut audio = ffmpeg::Packet::copy(&samples);
+            audio.set_stream(audio_index);
+            audio.set_pts(Some(index * AUDIO_SAMPLES_PER_PACKET as i64));
+            audio.set_dts(Some(index * AUDIO_SAMPLES_PER_PACKET as i64));
+            audio.set_duration(AUDIO_SAMPLES_PER_PACKET as i64);
+            audio.set_flags(Flags::KEY);
+            audio.write_interleaved(&mut output).unwrap();
+        }
+        output.write_trailer().unwrap();
+    }
 
     #[test]
     fn full_ahead_window_stops_and_release_resumes_driver() {
@@ -1471,6 +1587,32 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(1)).unwrap();
         thread.join().unwrap();
         assert!(!control.snapshot().waiting_for_capacity);
+    }
+
+    #[test]
+    fn eof_finishing_uses_terminal_slot_without_waiting_for_an_unpublished_fragment() {
+        let control = ClocklessTranscodeControl::manual(1).unwrap();
+        control.record_produced(1);
+        let waiter = control.clone();
+        let (tx, rx) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            waiter.wait_for_capacity().unwrap();
+            tx.send(()).unwrap();
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !control.snapshot().waiting_for_capacity {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "driver never parked on the full live window"
+            );
+            thread::yield_now();
+        }
+        control.begin_finishing();
+
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        thread.join().unwrap();
+        assert_eq!(control.snapshot().produced_segments, 1);
     }
 
     #[test]
@@ -1581,25 +1723,59 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "set MIV_CLOCKLESS_EOF_FIXTURE to a real finite A/V file"]
     fn finite_fixture_flushes_final_fragment_and_endlist() {
-        let path = std::env::var_os("MIV_CLOCKLESS_EOF_FIXTURE")
-            .map(PathBuf::from)
-            .expect("MIV_CLOCKLESS_EOF_FIXTURE");
+        let temp = tempfile::tempdir().unwrap();
+        let generated_path = temp.path().join("finite-av.avi");
+        let external_path = std::env::var_os("MIV_CLOCKLESS_EOF_FIXTURE").map(PathBuf::from);
+        let path = external_path.clone().unwrap_or_else(|| {
+            write_finite_av_fixture(&generated_path);
+            generated_path
+        });
         let mut options = ClocklessTranscodeOptions::benchmark(path);
         options.hw_decode = false;
         options.quality = ClocklessQuality::Minimum;
         options.max_source_secs = None;
-        let control = ClocklessTranscodeControl::auto_releasing(options.segment_capacity).unwrap();
+        options.segment_capacity = 1;
+        let control = ClocklessTranscodeControl::manual(options.segment_capacity).unwrap();
         let output = ClocklessStreamOutput::new(options.segment_capacity, 0.0).unwrap();
-        run_clockless_stream(
-            &options,
-            &control,
-            output.clone(),
-            ClocklessAudioProcessing::default(),
-            |_| {},
-        )
-        .unwrap();
+        let worker_control = control.clone();
+        let worker_output = output.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = run_clockless_stream(
+                &options,
+                &worker_control,
+                worker_output,
+                ClocklessAudioProcessing::default(),
+                |_| {},
+            );
+            result_tx.send(result).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let result = loop {
+            match result_rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(result) => break result,
+                Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => {
+                    // A real, longer fixture needs an HLS-like consumer to advance its one-slot
+                    // live window. The generated 2.5 s fixture deliberately leaves the slot full
+                    // so the terminal-reserve regression remains exact.
+                    if external_path.is_some()
+                        && let Some(sequence) = output.metrics().latest_sequence
+                    {
+                        control.release_through(sequence);
+                    }
+                }
+                Err(error) => {
+                    control.cancel();
+                    worker.join().unwrap();
+                    panic!(
+                        "finite transcode did not reach EOF while the terminal slot was full: {error}"
+                    );
+                }
+            }
+        };
+        result.unwrap();
+        worker.join().unwrap();
 
         let metrics = output.metrics();
         assert!(metrics.ended);

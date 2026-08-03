@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::encoder::{EncoderPreference, H264EncoderKind, SEGMENT_DURATION_SECS};
@@ -17,6 +17,7 @@ use crate::video::clockless_transcode::{
 const RESOURCE_TIMEOUT: Duration = Duration::from_secs(2);
 
 static NEXT_STREAMING_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+static GENERATION_RESOURCE_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct StreamingSessionId(pub(crate) u64);
@@ -113,10 +114,6 @@ struct GenerationConfig {
     audio_processing: ClocklessAudioProcessing,
 }
 
-struct GenerationResources {
-    _registration: RemoteStreamingRegistration,
-}
-
 struct GenerationWorkerCompletion {
     status: StreamGenerationStatus,
     log_line: Option<String>,
@@ -142,12 +139,11 @@ fn generation_worker_completion(
     }
 }
 
-fn publish_generation_worker_completion<T>(
+fn publish_generation_worker_completion(
     result: Result<(), String>,
     cancel: &AtomicBool,
     status: &SharedGenerationStatus,
     output: &ClocklessStreamOutput,
-    resources: T,
 ) {
     if result.is_ok()
         && !cancel.load(Ordering::Acquire)
@@ -157,7 +153,6 @@ fn publish_generation_worker_completion<T>(
             status,
             StreamGenerationStatus::Ended(stream_ready_info(info)),
         );
-        drop(resources);
         return;
     }
     let completion = generation_worker_completion(result, cancel.load(Ordering::Acquire));
@@ -165,7 +160,6 @@ fn publish_generation_worker_completion<T>(
         crate::logger::log(line);
     }
     set_generation_status(status, completion.status);
-    drop(resources);
 }
 
 fn stream_ready_info(info: ClocklessOutputInfo) -> StreamReadyInfo {
@@ -176,6 +170,22 @@ fn stream_ready_info(info: ClocklessOutputInfo) -> StreamReadyInfo {
         audio_bitrate_bps: info.audio_bitrate_bps,
         codecs: info.codecs,
     }
+}
+
+/// FFmpeg owns the auxiliary decoder's D3D11 device and the selected H.264 encoder session.
+/// Keep their entire lifetimes under one process-wide lease: a replacement may be queued before
+/// the UI has finished dropping the old handle, but it cannot allocate GPU resources until the
+/// cancelled worker has returned and all of its stack-owned FFmpeg contexts have been dropped.
+fn run_with_generation_resource_lease(
+    cancel: &AtomicBool,
+    run: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let gate = GENERATION_RESOURCE_GATE.get_or_init(|| Mutex::new(()));
+    let _lease = gate.lock().unwrap_or_else(|error| error.into_inner());
+    if cancel.load(Ordering::Acquire) {
+        return Err("clockless transcode cancelled before resource allocation".to_owned());
+    }
+    run()
 }
 
 #[derive(Clone)]
@@ -193,6 +203,7 @@ pub(crate) struct StreamingGenerationHandle {
     output: ClocklessStreamOutput,
     control: ClocklessTranscodeControl,
     activity: RemoteStreamingActivity,
+    _registration: RemoteStreamingRegistration,
     cancel: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -214,9 +225,6 @@ impl StreamingGenerationHandle {
             .map_err(|response| response.message)?;
         let activity = registration.activity();
         let cancel = registration.cancel_flag();
-        let resources = GenerationResources {
-            _registration: registration,
-        };
         let config = GenerationConfig {
             path: source_path,
             encoder,
@@ -238,23 +246,24 @@ impl StreamingGenerationHandle {
             .name("remote-stream-generation".to_owned())
             .spawn(move || {
                 let ready_status = Arc::clone(&worker_status);
-                let result = run_generation_worker(
-                    config,
-                    &worker_control,
-                    worker_output.clone(),
-                    move |info| {
-                        set_generation_status(
-                            &ready_status,
-                            StreamGenerationStatus::Ready(stream_ready_info(info)),
-                        );
-                    },
-                );
+                let result = run_with_generation_resource_lease(&worker_cancel, || {
+                    run_generation_worker(
+                        config,
+                        &worker_control,
+                        worker_output.clone(),
+                        move |info| {
+                            set_generation_status(
+                                &ready_status,
+                                StreamGenerationStatus::Ready(stream_ready_info(info)),
+                            );
+                        },
+                    )
+                });
                 publish_generation_worker_completion(
                     result,
                     &worker_cancel,
                     &worker_status,
                     &worker_output,
-                    resources,
                 );
             })
             .map_err(|error| format!("failed to spawn streaming worker: {error}"))?;
@@ -264,6 +273,7 @@ impl StreamingGenerationHandle {
             output,
             control,
             activity,
+            _registration: registration,
             cancel,
             worker: Some(worker),
         })
@@ -607,12 +617,66 @@ mod tests {
     use crate::video::stream::audio_encoder::open_aac_encoder;
     use crate::video::stream::timeline::StreamTimeline;
 
-    struct SetCancelOnDrop(Arc<AtomicBool>);
+    struct MarkDroppedOnDrop(Arc<AtomicBool>);
 
-    impl Drop for SetCancelOnDrop {
+    impl Drop for MarkDroppedOnDrop {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
         }
+    }
+
+    #[test]
+    fn consecutive_generations_wait_until_previous_gpu_resources_are_dropped() {
+        let first_cancel = Arc::new(AtomicBool::new(false));
+        let second_cancel = Arc::new(AtomicBool::new(false));
+        let first_dropped = Arc::new(AtomicBool::new(false));
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let first_cancel_worker = Arc::clone(&first_cancel);
+        let first_dropped_worker = Arc::clone(&first_dropped);
+        let first = std::thread::spawn(move || {
+            run_with_generation_resource_lease(&first_cancel_worker, || {
+                let _resource = MarkDroppedOnDrop(first_dropped_worker);
+                first_entered_tx.send(()).unwrap();
+                release_first_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let (second_attempted_tx, second_attempted_rx) = std::sync::mpsc::channel();
+        let (second_entered_tx, second_entered_rx) = std::sync::mpsc::channel();
+        let second_cancel_worker = Arc::clone(&second_cancel);
+        let first_dropped_for_second = Arc::clone(&first_dropped);
+        let second = std::thread::spawn(move || {
+            second_attempted_tx.send(()).unwrap();
+            run_with_generation_resource_lease(&second_cancel_worker, || {
+                assert!(
+                    first_dropped_for_second.load(Ordering::Acquire),
+                    "replacement allocated before the prior generation resource was dropped"
+                );
+                second_entered_tx.send(()).unwrap();
+                Ok(())
+            })
+        });
+        second_attempted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            second_entered_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "replacement entered the GPU resource lifetime concurrently"
+        );
+
+        release_first_tx.send(()).unwrap();
+        second_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
     }
 
     #[test]
@@ -663,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_error_is_published_before_resource_drop_sets_cancel() {
+    fn worker_completion_does_not_end_the_generation_ownership_lifetime() {
         let cancel = Arc::new(AtomicBool::new(false));
         let status = Arc::new((Mutex::new(StreamGenerationStatus::Opening), Condvar::new()));
         let output = ClocklessStreamOutput::new(30, 0.0).unwrap();
@@ -673,10 +737,9 @@ mod tests {
             &cancel,
             &status,
             &output,
-            SetCancelOnDrop(Arc::clone(&cancel)),
         );
 
-        assert!(cancel.load(Ordering::Acquire));
+        assert!(!cancel.load(Ordering::Acquire));
         assert_eq!(
             generation_status(&status),
             StreamGenerationStatus::Failed("video tap disconnected".to_owned())

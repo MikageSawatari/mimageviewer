@@ -49,10 +49,12 @@ import {
   viewerSeekState,
   viewerSpreadLayout,
   viewerWheelCommand,
+  videoAbsoluteSeekCommand,
   videoHttpStatusDecision,
   videoPlaybackDecision,
   videoQualityPreset,
   videoSeekPlan,
+  videoStartSeekTarget,
   videoStartupDecision,
   videoTapCommand,
   appUpdateNotice,
@@ -281,6 +283,44 @@ test("whole-video position composes source origin with the media element playhea
     anchorMediaTimeSecs: anchor.mediaTimeSecs,
     seekableRanges: [[0, 60]],
   }), { kind: "remote", positionSecs: 200, mediaTimeSecs: null });
+});
+
+test("seek bar keeps its absolute target across delayed session acquisition", () => {
+  const positionWhenReleased = 45;
+  const positionWhenExecuted = 52;
+  const targetPosition = 0;
+  const oldRelativeResult = positionWhenExecuted + (targetPosition - positionWhenReleased);
+  assert.equal(oldRelativeResult, 7, "the old relative command reproduced the mid-track restart");
+
+  assert.deepEqual(videoAbsoluteSeekCommand(targetPosition), {
+    name: CommandName.MEDIA_SEEK_ABSOLUTE,
+    payload: { positionSecs: 0 },
+  });
+  assert.deepEqual(videoSeekPlan({
+    targetPositionSecs: targetPosition,
+    durationSecs: 600,
+    anchorSourcePositionSecs: 0,
+    anchorMediaTimeSecs: 0,
+    seekableRanges: [[0, 60]],
+  }), { kind: "local", positionSecs: 0, mediaTimeSecs: 0 });
+});
+
+test("explicit zero restart overrides saved resume while an initial open preserves it", () => {
+  assert.equal(videoStartSeekTarget({
+    requestedPositionSecs: null,
+    sourceOriginSecs: 35.3,
+    durationSecs: 180,
+  }), null, "normal open preserves the core resume position");
+  assert.equal(videoStartSeekTarget({
+    requestedPositionSecs: 0,
+    sourceOriginSecs: 35.3,
+    durationSecs: 180,
+  }), 0, "restartAt(0) must issue a server seek even though the value is zero");
+  assert.equal(videoStartSeekTarget({
+    requestedPositionSecs: 35.31,
+    sourceOriginSecs: 35.3,
+    durationSecs: 180,
+  }), null, "a matching start origin does not create another generation");
 });
 
 test("three seconds of waiting only proposes one lower quality", () => {
