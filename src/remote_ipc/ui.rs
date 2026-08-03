@@ -2,7 +2,7 @@ use mimageviewer_ipc::{
     RemoteItemState, RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource,
     RemoteWebFeatureStatus, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest,
     RemoteWriteResponse, RemoteWriteResult, SessionConnectionKind, SessionResponse, SessionStatus,
-    VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode,
+    VideoStreamControlAction, VideoStreamEndBehavior, VideoStreamError, VideoStreamErrorCode,
 };
 use qrcode::{Color, QrCode};
 
@@ -50,6 +50,42 @@ struct AppRemoteVideoStreaming {
     player: Box<crate::video::VideoPlayer>,
     session: RemoteVideoStreamingSession,
     playback: std::sync::Arc<VideoStreamPlaybackState>,
+    end_behavior: VideoStreamEndBehavior,
+}
+
+fn resolve_remote_video_end_behavior(
+    continuous_mode: crate::video::VideoContinuousMode,
+    loop_mode: crate::settings::VideoLoopMode,
+    chapter_starts: Vec<f64>,
+    bookmark_starts: Vec<f64>,
+) -> VideoStreamEndBehavior {
+    match continuous_mode {
+        crate::video::VideoContinuousMode::Continuous => {
+            return VideoStreamEndBehavior::Next { wrap: false };
+        }
+        crate::video::VideoContinuousMode::ContinuousLoop => {
+            return VideoStreamEndBehavior::Next { wrap: true };
+        }
+        crate::video::VideoContinuousMode::Off => {}
+    }
+
+    let effective = crate::settings::effective_loop_mode(
+        loop_mode,
+        !chapter_starts.is_empty(),
+        !bookmark_starts.is_empty(),
+    );
+    match effective {
+        crate::settings::VideoLoopMode::Off => VideoStreamEndBehavior::Stop,
+        crate::settings::VideoLoopMode::Full => VideoStreamEndBehavior::Loop {
+            boundary_starts_secs: vec![0.0],
+        },
+        crate::settings::VideoLoopMode::Chapter => VideoStreamEndBehavior::Loop {
+            boundary_starts_secs: chapter_starts,
+        },
+        crate::settings::VideoLoopMode::Bookmark => VideoStreamEndBehavior::Loop {
+            boundary_starts_secs: bookmark_starts,
+        },
+    }
 }
 
 struct AppRemoteVideoStarting {
@@ -261,6 +297,31 @@ impl crate::app::App {
         if !crate::folder_tree::path_eq(player.path(), requested_path) {
             return Err("the requested video is not the remote session player".to_owned());
         }
+        let chapter_starts = player
+            .info()
+            .map(|info| crate::video::decoder::boundary_starts_from_chapters(&info.chapters))
+            .unwrap_or_default();
+        let bookmark_starts = if matches!(
+            self.settings.video_loop_mode,
+            crate::settings::VideoLoopMode::Bookmark
+        ) && matches!(
+            self.video_continuous_mode,
+            crate::video::VideoContinuousMode::Off
+        ) {
+            self.video_bookmark_db
+                .as_ref()
+                .map(|db| db.list_marker_entries(player.path()))
+                .map(|bookmarks| crate::video_bookmarks::boundary_starts_from_bookmarks(&bookmarks))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let end_behavior = resolve_remote_video_end_behavior(
+            self.video_continuous_mode,
+            self.settings.video_loop_mode,
+            chapter_starts,
+            bookmark_starts,
+        );
         let previous_speed = player.playback_speed();
         let speed_changed = (previous_speed - 1.0).abs() > 1.0e-6;
         if speed_changed {
@@ -296,6 +357,7 @@ impl crate::app::App {
             player,
             session,
             playback,
+            end_behavior,
         })
     }
 
@@ -475,6 +537,7 @@ impl crate::app::App {
                     generation: starting.streaming.session.access(),
                     playback: std::sync::Arc::clone(&starting.streaming.playback),
                     buffer_target_secs: starting.streaming.session.buffer_target_secs(),
+                    end_behavior: starting.streaming.end_behavior.clone(),
                 };
                 if let Some(handle) = self.remote_session_ui.handle.as_ref() {
                     handle.publish_video_stream(published.clone());
@@ -942,6 +1005,7 @@ impl crate::app::App {
                 generation: streaming.session.access(),
                 playback: std::sync::Arc::clone(&streaming.playback),
                 buffer_target_secs: streaming.session.buffer_target_secs(),
+                end_behavior: streaming.end_behavior.clone(),
             });
         }
         self.remote_session_ui.video_stream = Some(AppRemoteVideoStreamState::Streaming(streaming));
@@ -973,6 +1037,7 @@ impl crate::app::App {
                 generation: streaming.session.access(),
                 playback: std::sync::Arc::clone(&streaming.playback),
                 buffer_target_secs: streaming.session.buffer_target_secs(),
+                end_behavior: streaming.end_behavior.clone(),
             });
         }
         self.remote_session_ui.video_stream = Some(AppRemoteVideoStreamState::Streaming(streaming));
@@ -1969,6 +2034,85 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_video_end_behavior_matches_local_continuous_and_loop_precedence() {
+        use crate::settings::VideoLoopMode;
+        use crate::video::VideoContinuousMode;
+
+        assert_eq!(
+            resolve_remote_video_end_behavior(
+                VideoContinuousMode::Off,
+                VideoLoopMode::Off,
+                Vec::new(),
+                Vec::new(),
+            ),
+            VideoStreamEndBehavior::Stop,
+            "continuous OFF and loop OFF stop at EOF"
+        );
+        assert_eq!(
+            resolve_remote_video_end_behavior(
+                VideoContinuousMode::Continuous,
+                VideoLoopMode::Full,
+                Vec::new(),
+                Vec::new(),
+            ),
+            VideoStreamEndBehavior::Next { wrap: false },
+            "continuous playback suppresses the local loop setting"
+        );
+        assert_eq!(
+            resolve_remote_video_end_behavior(
+                VideoContinuousMode::ContinuousLoop,
+                VideoLoopMode::Off,
+                Vec::new(),
+                Vec::new(),
+            ),
+            VideoStreamEndBehavior::Next { wrap: true },
+            "continuous-loop wraps the video list"
+        );
+        assert_eq!(
+            resolve_remote_video_end_behavior(
+                VideoContinuousMode::Off,
+                VideoLoopMode::Full,
+                Vec::new(),
+                Vec::new(),
+            ),
+            VideoStreamEndBehavior::Loop {
+                boundary_starts_secs: vec![0.0],
+            },
+            "whole-video loop returns to zero"
+        );
+    }
+
+    #[test]
+    fn remote_video_end_behavior_keeps_local_section_loop_boundaries_and_fallback() {
+        use crate::settings::VideoLoopMode;
+        use crate::video::VideoContinuousMode;
+
+        assert_eq!(
+            resolve_remote_video_end_behavior(
+                VideoContinuousMode::Off,
+                VideoLoopMode::Chapter,
+                vec![12.0, 42.5],
+                Vec::new(),
+            ),
+            VideoStreamEndBehavior::Loop {
+                boundary_starts_secs: vec![12.0, 42.5],
+            }
+        );
+        assert_eq!(
+            resolve_remote_video_end_behavior(
+                VideoContinuousMode::Off,
+                VideoLoopMode::Bookmark,
+                Vec::new(),
+                Vec::new(),
+            ),
+            VideoStreamEndBehavior::Loop {
+                boundary_starts_secs: vec![0.0],
+            },
+            "a missing bookmark set degrades to the same full loop as local playback"
+        );
+    }
 
     #[test]
     fn remote_spread_key_matches_worker_logical_favorite_path() {

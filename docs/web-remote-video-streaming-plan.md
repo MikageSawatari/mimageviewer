@@ -457,6 +457,12 @@ thumbnail を含めない。
 - 動画 surface は静止画の transform owner を通らず、tap zone が再生 / ±10 秒 command を所有する。
   動画に拡大状態は設けない。連続 tap と pinch は Safari の native page zoom を明示的に抑止し、
   静止画 viewer の拡大・reset 操作には影響させない
+- 動画の終端規則は端末設定を別に持たず、本体の `video_continuous_mode` と
+  `video_loop_mode` を stream start 時に解決して `end_behavior` として渡す。連続再生は表示順の
+  次動画へ進み末尾で停止、連続ループは末尾から先頭へ戻る。連続再生 OFF ではループ OFF は停止、
+  Full は 0 秒、Chapter / Bookmark は現在区間の開始へ戻る。区間データが無い Chapter /
+  Bookmark は本体と同じく Full へ降格する。スライドショーの終端動作は静止画専用で動画には
+  適用しない。次動画は Web の既存 `renderVideoViewer` → `VideoStreamViewer.start` 経路で開く
 - clockless worker は generation 開始 (origin / 先読み目標)、最初の映像 PTS、EOF から Finishing
   への遷移、先読み満杯の park / resume、最終 fragment 公開と ended、停止理由
   (complete / cancel / error) を `remote-stream clockless ...` の通常ログへ残す
@@ -472,7 +478,7 @@ thumbnail を含めない。
 
 | エンドポイント | 内容 |
 |---|---|
-| `POST /api/video/start` | `{fav, path, quality}` → `{session, generation, playlist, duration_secs, source_origin_secs, buffer_target_secs, codec, encoder}` |
+| `POST /api/video/start` | `{fav, path, quality}` → `{session, generation, playlist, duration_secs, source_origin_secs, buffer_target_secs, codec, encoder, end_behavior}` |
 | `POST /api/video/control` | `{session, action: play\|pause\|volume\|quality}`。quality は端末の `position_secs` も送る |
 | `POST /api/video/seek` | `{session, position_secs}` → 新 `generation` と `playlist` |
 | `POST /api/video/thumbnail` | `{session, position_secs}`。実 frame PTS 付き WebP、生成中は 202、`null` は要求解除 |
@@ -501,7 +507,7 @@ thumbnail を含めない。
   segmenter の typed `None` を保持して HTTP 503 または上限付き wait へ写像し、200 では
   必ず非空の init、または init と最初の media segment を参照できる playlist を返す
 
-### 6.2 IPC (動画 API 導入 v15、timeout v17、seek thumbnail v18、時計なし状態分離 v19)
+### 6.2 IPC (動画 API 導入 v15、timeout v17、seek thumbnail v18、時計なし状態分離 v19、終端規則 v20)
 
 既存の長寿命 duplex 多重化接続 ([web-remote-plan.md](web-remote-plan.md) §9.5-9.6) に
 `ClientMessage` / `ServerMessage` の variant を追加する。**セグメントは pull 型**とし、
@@ -510,7 +516,7 @@ remote-web が HTTP 要求を受けた時に取りに行く。push 型の非同�
 
 | request | response |
 |---|---|
-| `VideoStreamStart { address, quality }` | `{ session, generation, duration_secs, source_origin_secs, buffer_target_secs, encoder, video_size }` |
+| `VideoStreamStart { address, quality }` | `{ session, generation, duration_secs, source_origin_secs, buffer_target_secs, encoder, video_size, end_behavior }` |
 | `VideoStreamControl { session, action }` | `SessionStatus` |
 | `VideoStreamSeek { session, position_secs }` | `{ generation }` |
 | `VideoStreamThumbnail { session, position_secs }` | `Pending` / 実 frame PTS + WebP / `Cleared` |
@@ -549,6 +555,11 @@ stop・owner 解放・失敗時は remote が開いた動画をその位置で p
 戻さない。復元用の並行 state を持つと §2.2 の「位置を保持して手動再開」と競合するためである。
 player open と `fs_cache` / `fullscreen_idx` の更新だけを UI thread が担当し、encoder open と
 stream worker の teardown / join は引き続き UI thread 外で行う。
+
+`PROTOCOL_VERSION` 20 の `VideoStreamEndBehavior` は `Stop`、境界開始秒列を持つ `Loop`、
+`wrap` を持つ `Next` の typed union とする。本体がローカル再生と同じ helper / 設定から決め、
+remote-web は判断材料となる別設定を保存しない。Chapter / Bookmark の全境界を渡すのは、同じ
+stream session 内で seek した後も端末が現在区間を選び直せるようにするためである。
 
 #### 増分 6 実装記録 (IPC + HTTP、2026-08-02)
 

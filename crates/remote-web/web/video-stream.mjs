@@ -28,6 +28,7 @@ const PLAYLIST_RECOVERY_BACKOFF_BASE_MS = 250;
 const PLAYLIST_RECOVERY_BACKOFF_MAX_MS = 2000;
 const SEEK_THUMBNAIL_POLL_MS = 120;
 const SEEK_THUMBNAIL_MATCH_TOLERANCE_SECS = 1.25;
+const VIDEO_LOOP_BOUNDARY_TOLERANCE_SECS = 0.020;
 
 let hlsScriptPromise = null;
 
@@ -47,6 +48,75 @@ export function preventVideoNativeZoom(event) {
   if (!event?.cancelable) return false;
   event.preventDefault?.();
   return true;
+}
+
+function normalizedVideoLoopBoundaries(behavior) {
+  const values = behavior?.kind === "loop" ? behavior.boundary_starts_secs : [];
+  const normalized = [...new Set((values ?? [])
+    .map(Number)
+    .filter((value) => Number.isFinite(value) && value >= 0)
+    .sort((left, right) => left - right))];
+  return normalized.length ? normalized : [0];
+}
+
+function videoLoopInterval(behavior, positionSecs) {
+  const position = Math.max(0, Number(positionSecs) || 0);
+  const starts = normalizedVideoLoopBoundaries(behavior);
+  let start = 0;
+  for (const candidate of starts) {
+    if (candidate > position) break;
+    start = candidate;
+  }
+  return {
+    start,
+    end: starts.find((candidate) => candidate > start) ?? null,
+  };
+}
+
+/// Resolve the terminal/boundary action published by the PC-side settings owner.
+/// `ended=false` mirrors the local chapter/bookmark boundary tick; `ended=true` handles EOF.
+export function videoEndDecision({
+  behavior,
+  previousPositionSecs = null,
+  positionSecs = 0,
+  ended = false,
+  playing = true,
+  toleranceSecs = VIDEO_LOOP_BOUNDARY_TOLERANCE_SECS,
+} = {}) {
+  if (behavior?.kind === "next") {
+    return ended
+      ? { kind: "next", wrap: Boolean(behavior.wrap) }
+      : { kind: "continue" };
+  }
+  if (behavior?.kind !== "loop") {
+    return ended ? { kind: "stop" } : { kind: "continue" };
+  }
+  if (!ended && !playing) return { kind: "continue" };
+
+  const position = Math.max(0, Number(positionSecs) || 0);
+  if (ended) {
+    const previous = Number(previousPositionSecs);
+    const intervalPosition = Number.isFinite(previous) && previous <= position
+      ? previous
+      : position;
+    return {
+      kind: "loop",
+      positionSecs: videoLoopInterval(behavior, intervalPosition).start,
+    };
+  }
+  const previous = Number(previousPositionSecs);
+  if (!Number.isFinite(previous) || position < previous || position <= previous + 1.0e-9) {
+    return { kind: "continue" };
+  }
+  const interval = videoLoopInterval(behavior, previous);
+  if (
+    interval.end !== null &&
+    previous < interval.end &&
+    position >= interval.end - Math.max(0, Number(toleranceSecs) || 0)
+  ) {
+    return { kind: "loop", positionSecs: interval.start };
+  }
+  return { kind: "continue" };
 }
 
 function element(tag, className = "") {
@@ -804,6 +874,9 @@ export class VideoStreamViewer {
     this.seekThumbnailAbort = null;
     this.seekThumbnailObjectUrl = "";
     this.seekThumbnailClear = Promise.resolve();
+    this.endBehavior = { kind: "stop" };
+    this.endPositionSample = null;
+    this.endTransitionPending = false;
 
     this.root = element("section", "image-viewer video-stream-viewer");
     this.stage = element("div", "viewer-stage video-stream-stage");
@@ -919,6 +992,7 @@ export class VideoStreamViewer {
     this.onTimeUpdate = () => {
       this.checkPlaybackStartupProgress();
       this.updateProgress();
+      this.handlePlaybackBoundary(false);
     };
     this.onPlaying = () => {
       this.checkPlaybackStartupProgress();
@@ -934,10 +1008,7 @@ export class VideoStreamViewer {
       if (!this.playRequested) this.finishSeekPreviewForAttachedGeneration();
     };
     this.onWaiting = () => this.beginWaiting();
-    this.onEnded = () => {
-      this.setPlaying(false).catch(() => {});
-      this.updateProgress();
-    };
+    this.onEnded = () => this.handlePlaybackBoundary(true);
     this.onNativeError = () => {
       if (!this.destroyed && !this.hls && !this.generationSwitch.isSwitching()) {
         const startup = this.startupWatch;
@@ -1028,6 +1099,9 @@ export class VideoStreamViewer {
     this.bufferTargetSecs = hlsBufferConfig(started.buffer_target_secs).maxBufferLength;
     this.encoder = String(started.encoder ?? "");
     this.codecs = String(started.codec ?? "");
+    this.endBehavior = started.end_behavior ?? { kind: "stop" };
+    this.endPositionSample = null;
+    this.endTransitionPending = false;
     this.seekInput.max = String(this.duration);
     this.timelineAnchor = {
       sourcePositionSecs: Math.max(0, Number(started.source_origin_secs) || 0),
@@ -1437,6 +1511,53 @@ export class VideoStreamViewer {
     else this.video.pause();
   }
 
+  handlePlaybackBoundary(ended) {
+    if (this.destroyed || this.endTransitionPending) return;
+    const position = this.currentPosition();
+    const previous = this.endPositionSample?.generation === this.generation
+      ? this.endPositionSample.positionSecs
+      : null;
+    this.endPositionSample = {
+      generation: this.generation,
+      positionSecs: position,
+    };
+    const decision = videoEndDecision({
+      behavior: this.endBehavior,
+      previousPositionSecs: previous,
+      positionSecs: position,
+      ended,
+      playing: this.playRequested && !this.video.paused,
+    });
+    if (decision.kind === "continue") return;
+    this.endTransitionPending = true;
+
+    if (decision.kind === "stop") {
+      this.setPlaying(false).catch(() => {});
+      this.updateProgress();
+      return;
+    }
+    if (decision.kind === "next") {
+      // app.js either opens the target through the existing start route, or stops this ended
+      // viewer when there is no target. Do not publish a pause before a successful transition:
+      // that would race the next stream's autoplay intent.
+      this.dispatch(command(CommandName.NEXT_PAGE, { wrap: decision.wrap }), {
+        source: "media",
+        detail: "video_ended",
+        telemetry: false,
+      });
+      return;
+    }
+
+    this.playRequested = true;
+    this.seekTo(decision.positionSecs)
+      .then(() => this.playIfRequested())
+      .catch((error) => this.showOperationalError(error, "ループ再生を続けられませんでした"))
+      .finally(() => {
+        this.endPositionSample = null;
+        this.endTransitionPending = false;
+      });
+  }
+
   async playIfRequested() {
     if (!this.playRequested || this.destroyed || !this.video.src && !this.hls) return;
     try {
@@ -1602,6 +1723,9 @@ export class VideoStreamViewer {
 
   async seekTo(targetPositionSecs, previewRequest = null) {
     if (!this.session || this.destroyed) return;
+    // Browser equivalent of the PC player's seek-serial baseline reset: a paused/manual
+    // seek across a chapter boundary is not normal playback crossing that boundary.
+    this.endPositionSample = null;
     const plan = videoSeekPlan({
       targetPositionSecs,
       durationSecs: this.duration,

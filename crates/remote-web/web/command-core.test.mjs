@@ -28,7 +28,9 @@ import {
   readingProgressBatchTransition,
   reduceViewerTransform,
   resolveGridReturnViewport,
+  togglePageOriginalFitMode,
   viewerTapCommand,
+  viewerTapSequenceTransition,
   nextFitMode,
   pagePrefetchPlan,
   planSpreadIntent,
@@ -490,6 +492,54 @@ test("fit mode cycle and request width use the actual rendered image width", () 
   });
   assert.equal(original.cssWidth, 1000);
   assert.equal(original.requestWidth, 1000);
+});
+
+test("double-tap fit toggles screen fit and original size", () => {
+  assert.equal(togglePageOriginalFitMode(FitMode.PAGE), FitMode.ORIGINAL);
+  assert.equal(togglePageOriginalFitMode(FitMode.ORIGINAL), FitMode.PAGE);
+  assert.equal(togglePageOriginalFitMode(FitMode.WIDTH), FitMode.ORIGINAL);
+});
+
+test("touch double-tap recognition never delays the first single tap", () => {
+  const first = viewerTapSequenceTransition(null, {
+    x: 120,
+    y: 240,
+    atMs: 1_000,
+    inputSource: "touch",
+  });
+  assert.equal(first.action, "single_tap");
+  assert.deepEqual(first.next, {
+    x: 120,
+    y: 240,
+    atMs: 1_000,
+    inputSource: "touch",
+  });
+
+  const second = viewerTapSequenceTransition(first.next, {
+    x: 126,
+    y: 246,
+    atMs: 1_240,
+    inputSource: "touch",
+  });
+  assert.equal(second.action, "double_tap");
+  assert.equal(second.next, null);
+
+  const late = viewerTapSequenceTransition(first.next, {
+    x: 120,
+    y: 240,
+    atMs: 1_500,
+    inputSource: "touch",
+  });
+  assert.equal(late.action, "single_tap");
+  assert.notEqual(late.next, null);
+
+  const mouse = viewerTapSequenceTransition(null, {
+    x: 120,
+    y: 240,
+    atMs: 2_000,
+    inputSource: "mouse",
+  });
+  assert.deepEqual(mouse, { action: "single_tap", next: null });
 });
 
 test("spread layout fits the combined pages and preserves the configured gap", () => {

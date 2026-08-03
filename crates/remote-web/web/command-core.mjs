@@ -10,6 +10,7 @@ export const CommandName = Object.freeze({
   FIT_PAGE: "fit_page",
   FIT_WIDTH: "fit_width",
   FIT_ORIGINAL: "fit_original",
+  FIT_TOGGLE_PAGE_ORIGINAL: "fit_toggle_page_original",
   SPREAD_CYCLE: "spread_cycle",
   SPREAD_SINGLE: "spread_single",
   SPREAD_LTR: "spread_ltr",
@@ -183,6 +184,42 @@ export function nextFitMode(mode) {
   if (mode === FitMode.PAGE) return FitMode.WIDTH;
   if (mode === FitMode.WIDTH) return FitMode.ORIGINAL;
   return FitMode.PAGE;
+}
+
+export function togglePageOriginalFitMode(mode) {
+  return mode === FitMode.ORIGINAL ? FitMode.PAGE : FitMode.ORIGINAL;
+}
+
+/// Recognize only the second touch as the double-tap action. The first tap is explicitly
+/// returned as `single_tap` immediately; callers do not start a timer or defer page navigation.
+export function viewerTapSequenceTransition(
+  previous,
+  { x, y, atMs, inputSource = "touch" },
+  { maxDelayMs = 320, maxDistancePx = 36 } = {}
+) {
+  const current = {
+    x: Number(x) || 0,
+    y: Number(y) || 0,
+    atMs: Number(atMs) || 0,
+    inputSource,
+  };
+  if (inputSource !== "touch") {
+    return { action: "single_tap", next: null };
+  }
+  const elapsed = current.atMs - Number(previous?.atMs);
+  const distance = Math.hypot(
+    current.x - (Number(previous?.x) || 0),
+    current.y - (Number(previous?.y) || 0)
+  );
+  if (
+    previous?.inputSource === "touch" &&
+    elapsed >= 0 &&
+    elapsed <= maxDelayMs &&
+    distance <= maxDistancePx
+  ) {
+    return { action: "double_tap", next: null };
+  }
+  return { action: "single_tap", next: current };
 }
 
 export function nextSpreadMode(mode) {

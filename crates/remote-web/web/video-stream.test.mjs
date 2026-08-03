@@ -7,8 +7,55 @@ import {
   hlsBufferConfig,
   preventVideoNativeZoom,
   resolveVideoPlaylist,
+  videoEndDecision,
   videoUserErrorMessage,
 } from "./video-stream.mjs";
+
+test("video EOF follows the PC continuous OFF and loop OFF stop rule", () => {
+  assert.deepEqual(videoEndDecision({
+    behavior: { kind: "stop" },
+    positionSecs: 284.5,
+    ended: true,
+  }), { kind: "stop" });
+});
+
+test("video EOF advances or wraps for the two PC continuous modes", () => {
+  assert.deepEqual(videoEndDecision({
+    behavior: { kind: "next", wrap: false },
+    positionSecs: 284.5,
+    ended: true,
+  }), { kind: "next", wrap: false });
+  assert.deepEqual(videoEndDecision({
+    behavior: { kind: "next", wrap: true },
+    positionSecs: 284.5,
+    ended: true,
+  }), { kind: "next", wrap: true });
+});
+
+test("whole and section loop policies return to the PC-owned interval start", () => {
+  assert.deepEqual(videoEndDecision({
+    behavior: { kind: "loop", boundary_starts_secs: [0] },
+    positionSecs: 284.5,
+    ended: true,
+  }), { kind: "loop", positionSecs: 0 });
+  assert.deepEqual(videoEndDecision({
+    behavior: { kind: "loop", boundary_starts_secs: [12, 42.5, 90] },
+    previousPositionSecs: 42.49,
+    positionSecs: 42.51,
+  }), { kind: "loop", positionSecs: 12 });
+  assert.deepEqual(videoEndDecision({
+    behavior: { kind: "loop", boundary_starts_secs: [12, 42.5, 90] },
+    previousPositionSecs: 42.49,
+    positionSecs: 42.51,
+    playing: false,
+  }), { kind: "continue" });
+  assert.deepEqual(videoEndDecision({
+    behavior: { kind: "loop", boundary_starts_secs: [12, 42.5, 90] },
+    previousPositionSecs: 89.99,
+    positionSecs: 90,
+    ended: true,
+  }), { kind: "loop", positionSecs: 42.5 });
+});
 
 test("hls.js starts at the requested generation origin and uses every buffer limit", () => {
   assert.deepEqual(hlsBufferConfig(60), {

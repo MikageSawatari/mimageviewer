@@ -104,8 +104,15 @@ const {
   reloadApplication,
   resolveMediaOpenRoute,
   thumbnailAddressForEntry,
+  videoFileTargetIndex,
   viewerMenuDefinitions,
 } = await import("./app.js");
+
+test("continuous video navigation stops at the end or wraps to the first video", () => {
+  assert.equal(videoFileTargetIndex(0, 3, 1, false), 1);
+  assert.equal(videoFileTargetIndex(2, 3, 1, false), -1);
+  assert.equal(videoFileTargetIndex(2, 3, 1, true), 0);
+});
 test("open telemetry records the requested kind, media kind, and reached route", () => {
   const event = commandTelemetryEvent(
     {

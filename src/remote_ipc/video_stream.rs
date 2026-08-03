@@ -198,6 +198,7 @@ impl VideoStreamEngine {
                         height: ready.output_dimensions.height,
                     },
                     codecs: ready.codecs,
+                    end_behavior: stream.end_behavior,
                 })
             }
             StreamGenerationStatus::Opening => {

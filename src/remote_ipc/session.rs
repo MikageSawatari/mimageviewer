@@ -518,6 +518,7 @@ pub(crate) struct PublishedVideoStream {
     pub(crate) generation: StreamingGenerationAccess,
     pub(crate) playback: Arc<VideoStreamPlaybackState>,
     pub(crate) buffer_target_secs: f64,
+    pub(crate) end_behavior: mimageviewer_ipc::VideoStreamEndBehavior,
 }
 
 impl PublishedVideoStream {

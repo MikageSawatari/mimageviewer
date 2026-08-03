@@ -30,12 +30,14 @@ import {
   thumbnailRequestConcurrency,
   thumbnailRequestStartCount,
   thumbnailRetryDecision,
+  togglePageOriginalFitMode,
   shouldShowGridCursor,
   shouldShowLoadingIndicator,
   shouldShowKeyboardShortcuts,
   viewerGestureDecision,
   viewerVerticalScrollDecision,
   viewerTapCommand,
+  viewerTapSequenceTransition,
   viewerImageLayout,
   viewerBoundaryMessage,
   viewerSeekGroupIndex,
@@ -314,6 +316,7 @@ const state = {
   coarsePointer: Boolean(globalThis.matchMedia?.("(pointer: coarse)")?.matches),
   keyboardInputSeen: false,
   fitMode: FitMode.PAGE,
+  viewerTapSequence: null,
   imageInfoCache: new Map(),
   containerImageInfoHints: new Map(),
   pageDirection: 1,
@@ -1033,9 +1036,20 @@ function dispatchCommand(requested, meta = {}) {
       );
       handled = true;
     } else if (state.viewer?.isVideoStreamViewer) {
-      if (requested.name === CommandName.NEXT_PAGE) handled = changeVideoFile(1);
-      else if (requested.name === CommandName.PREV_PAGE) handled = changeVideoFile(-1);
-      else handled = state.viewer.execute(requested);
+      if (requested.name === CommandName.NEXT_PAGE) {
+        const endingViewer = state.viewer;
+        const result = changeVideoFile(1, Boolean(requested.payload.wrap));
+        handled = result.handled;
+        if (
+          meta.detail === "video_ended" &&
+          !result.advanced &&
+          state.viewer === endingViewer
+        ) {
+          endingViewer.setPlaying(false).catch(() => {});
+        }
+      } else if (requested.name === CommandName.PREV_PAGE) {
+        handled = changeVideoFile(-1).handled;
+      } else handled = state.viewer.execute(requested);
     } else if (requested.name === CommandName.NEXT_PAGE) handled = changeImage(1);
     else if (requested.name === CommandName.PREV_PAGE) handled = changeImage(-1);
     else if (requested.name === CommandName.FIRST_PAGE) handled = changeImageTo(0);
@@ -1071,6 +1085,8 @@ function dispatchCommand(requested, meta = {}) {
         fitMode = FitMode.WIDTH;
       } else if (requested.name === CommandName.FIT_ORIGINAL) {
         fitMode = FitMode.ORIGINAL;
+      } else if (requested.name === CommandName.FIT_TOGGLE_PAGE_ORIGINAL) {
+        fitMode = togglePageOriginalFitMode(state.fitMode);
       }
       if (fitMode) {
         state.fitMode = fitMode;
@@ -1494,6 +1510,7 @@ function cleanupScreen(preserveRequestController = null) {
   state.localSettingsDialog = null;
   state.gestureHelpDialog?.destroy();
   state.gestureHelpDialog = null;
+  state.viewerTapSequence = null;
   state.viewer?.destroy();
   state.viewer = null;
   state.screenContext = "loading";
@@ -2845,17 +2862,28 @@ function renderVideoViewer(entry) {
   return true;
 }
 
-function changeVideoFile(delta) {
+export function videoFileTargetIndex(currentIndex, count, delta, wrap = false) {
+  const length = Math.max(0, Math.floor(Number(count) || 0));
+  const current = Math.floor(Number(currentIndex));
+  const step = Math.sign(Number(delta) || 0);
+  if (!Number.isInteger(current) || current < 0 || current >= length || !step) return -1;
+  const target = current + step;
+  if (target >= 0 && target < length) return target;
+  if (!wrap || !length) return -1;
+  return target < 0 ? length - 1 : 0;
+}
+
+function changeVideoFile(delta, wrap = false) {
   const viewer = state.viewer;
-  if (!viewer?.isVideoStreamViewer) return false;
+  if (!viewer?.isVideoStreamViewer) return { handled: false, advanced: false };
   const videos = state.entries.filter((entry) => entry.kind === "video");
   const current = videos.findIndex(
     (entry) => addressIdentity(entryAddress(entry)) === addressIdentity(viewer.address)
   );
-  const nextIndex = current + Math.sign(Number(delta) || 0);
-  if (current < 0 || nextIndex < 0 || nextIndex >= videos.length) {
-    viewer.showBoundaryMessage(nextIndex < 0 ? "先頭の動画です" : "最後の動画です");
-    return true;
+  const nextIndex = videoFileTargetIndex(current, videos.length, delta, wrap);
+  if (nextIndex < 0) {
+    viewer.showBoundaryMessage(Number(delta) < 0 ? "先頭の動画です" : "最後の動画です");
+    return { handled: true, advanced: false };
   }
   const entry = videos[nextIndex];
   const entryIndex = state.entries.findIndex(
@@ -2873,7 +2901,7 @@ function changeVideoFile(delta) {
     mediaHash(entryAddress(entry))
   );
   renderVideoViewer(entry);
-  return true;
+  return { handled: true, advanced: true };
 }
 
 function renderImageViewer(index, interactionStartedAt = performance.now()) {
@@ -4382,7 +4410,7 @@ class GestureHelpDialog {
     );
     const note = textElement(
       "p",
-      "拡大中は1本指で画像を動かせます。スワイプ操作よりパンを優先します。",
+      "ダブルタップでページ全体と100%原寸を切り替えます。拡大中は1本指で画像を動かせます。",
       "gesture-help-note"
     );
     const done = textElement("button", "わかりました", "gesture-help-done");
@@ -5167,21 +5195,38 @@ export class ImageViewer {
           detail: "swipe_down",
         });
       } else if (gesture === ViewerGesture.TAP) {
-        dispatchCommand(viewerTapCommand(
-          event.clientX,
-          this.root.clientWidth,
-          isRtlReadingDirection(state.readingDirection)
-        ), {
-          source,
-          detail: "tap_zone",
+        const transition = viewerTapSequenceTransition(state.viewerTapSequence, {
+          x: event.clientX,
+          y: event.clientY,
+          atMs: performance.now(),
+          inputSource: source,
         });
+        state.viewerTapSequence = transition.next;
+        if (transition.action === "double_tap") {
+          dispatchCommand(command(CommandName.FIT_TOGGLE_PAGE_ORIGINAL), {
+            source,
+            detail: "double_tap_fit",
+          });
+        } else {
+          // Optimistic single tap: page/bar actions run now, with no double-tap timeout.
+          dispatchCommand(viewerTapCommand(
+            event.clientX,
+            this.root.clientWidth,
+            isRtlReadingDirection(state.readingDirection)
+          ), {
+            source,
+            detail: "tap_zone",
+          });
+        }
       } else if (gesture === ViewerGesture.PAN) {
         dispatchCommand(command(CommandName.PAN_BY, { dx: 0, dy: 0 }), {
           source,
           detail: "pan",
         });
       }
+      if (gesture !== ViewerGesture.TAP) state.viewerTapSequence = null;
     } else if (!cancelled && this.pinched) {
+      state.viewerTapSequence = null;
       dispatchCommand(
         command(CommandName.SET_TRANSFORM, {
           scale: this.scale,

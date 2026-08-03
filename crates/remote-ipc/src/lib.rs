@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -719,6 +719,19 @@ pub struct VideoStreamSize {
     pub height: u32,
 }
 
+/// Browser-side action when a remote video reaches a playback boundary.
+///
+/// The core resolves this from the same `video_loop_mode` / `video_continuous_mode`
+/// settings used by local playback. `Loop` carries every boundary start so a seek performed
+/// after the initial stream start can select the same chapter/bookmark interval as the PC.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VideoStreamEndBehavior {
+    Stop,
+    Loop { boundary_starts_secs: Vec<f64> },
+    Next { wrap: bool },
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct VideoStreamStartPayload {
     pub session: u64,
@@ -729,6 +742,7 @@ pub struct VideoStreamStartPayload {
     pub encoder: String,
     pub video_size: VideoStreamSize,
     pub codecs: String,
+    pub end_behavior: VideoStreamEndBehavior,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1329,8 +1343,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v19_video_pull_and_seek_thumbnail_messages_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 19);
+    fn protocol_v20_video_pull_seek_thumbnail_and_end_behavior_messages_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 20);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -1371,6 +1385,23 @@ mod tests {
         }
 
         for expected in [
+            ServerMessage::VideoStreamStart {
+                id: 50,
+                response: VideoStreamResult::Success(VideoStreamStartPayload {
+                    session: 7,
+                    generation: 9,
+                    duration_secs: 284.5,
+                    source_origin_secs: 0.0,
+                    buffer_target_secs: 60.0,
+                    encoder: "software".to_owned(),
+                    video_size: VideoStreamSize {
+                        width: 1920,
+                        height: 1080,
+                    },
+                    codecs: "avc1.640028,mp4a.40.2".to_owned(),
+                    end_behavior: VideoStreamEndBehavior::Next { wrap: true },
+                }),
+            },
             ServerMessage::VideoStreamSegment {
                 id: 52,
                 response: VideoStreamResult::Success(VideoStreamSegmentPayload::Gone),
