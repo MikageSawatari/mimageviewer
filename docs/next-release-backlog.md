@@ -571,6 +571,71 @@
   - 拡張が 1 つも無い環境でも従来と同じメニューが出る。
 - 規模 / 優先度: Medium / P2。実害は「操作のたびに待たされる」で、データ喪失は無い。
 
+### 1.43 Enter でフルスクリーンを開くと全画面ズームモードに入る (Enter 系 KeyHold の所有権が開幕フレームで抜ける)
+
+- 出典: 2026-08-04 の利用者報告と同日の調査。「画像フォルダで Enter で画像を開くと最初から
+  Z のズームモードになっている。Z を 1 回押すと解除できる。ダブルクリックでは起きない」。
+- 再現条件: **Enter / テンキー Enter を KeyHold アクションに割り当てている**こと。報告環境の
+  keymap override は `FsZoomMode = Z, NumpadEnter`。既定 (Z のみ) では成立しないので、
+  データ保存先が別のポータブル版では再現しない。**バージョン差ではなく設定差**であり、
+  同じ `%APPDATA%` を使うインストール版なら旧バージョンでも再現するとみられる。
+- 壊れている前提:
+  1. `key_held_via_os` ([keymap.rs:6939](../src/keymap.rs)) は Enter / NumpadEnter を
+     「送信元 HWND 由来の物理ラッチ」で判定するが、それは `is_frame_active(viewport)` が
+     true のときだけで、false のときは `GetAsyncKeyState(VK_RETURN)` にフォールバックする。
+     `KeyName::Enter` と `KeyName::NumpadEnter` は `to_vk()` が同じ 0x0D
+     ([keymap.rs:636](../src/keymap.rs)) なので、この経路は本体 / テンキーの区別も
+     どのウィンドウのキーかの区別も失う。
+  2. `frame_active_viewports` は subclass 登録済み HWND を持つ viewport の集合
+     ([key_input.rs:333](../src/key_input.rs))。フルスクリーンの viewport は
+     `install_key_input_subclass_for_viewport_rect` が outer_rect と可視ウィンドウの
+     rect 一致で HWND を見つけてから登録する ([ui_fullscreen.rs:6955](../src/ui_fullscreen.rs)、
+     呼び出しは [8247](../src/ui_fullscreen.rs)) ため、**新規作成直後の数フレームは false**。
+  3. その間 `update_fs_zoom_mode_keys` ([ui_fullscreen.rs:3070](../src/ui_fullscreen.rs)) が
+     「まだ押されたままの Enter」を押下エッジとして拾って `fs_zoom_aiming = true` にし、
+     離した瞬間の離しエッジで `fs_zoom_active = true` を確定させる。
+- 影響範囲: FsZoomMode 固有ではない。**Enter / NumpadEnter を割り当てた全ての KeyHold
+  アクション** (`*SpacePan` 等) と、**新規 viewport の開幕フレーム全般**が同じ穴を通る。
+  713d36bf 以前は frame-active gate 自体が無く常に `GetAsyncKeyState` だったので、
+  713d36bf は同じ穴の frame-active 側だけを塞いだ状態になっている。
+- 対応案: `is_frame_active` でない viewport では Enter 系 KeyHold を **false にする**
+  (送信元を確認できないなら押下扱いしない) のが所有権の筋。`GetAsyncKeyState`
+  フォールバックは per-HWND ラッチの外に残った旧経路。
+- ⚠ 症状パッチにしないこと: 「FS 入場時に `fs_zoom_z_was_down` を現在の押下状態で
+  初期化する」「開幕 N ms はズームモードを無効にする」は、この 1 アクションの見え方を
+  消すだけで、他の KeyHold と他 viewport の同型を残す。
+- 完了条件 / 回帰テスト:
+  - `FsZoomMode` に NumpadEnter を割り当てた状態で Enter 開閉を繰り返してもズームモードに
+    入らない。
+  - subclass 登録前後で Enter hold の判定が一致する (viewport 単位の unit test)。
+  - 本体 Enter とテンキー Enter の分離が保たれる (既存
+    `key_hold_slot_matching_distinguishes_both_enter_directions` の hold 経路版)。
+- 当面の回避: 操作カスタマイズで `FsZoomMode` から NumpadEnter を外す。
+- 規模 / 優先度: Small / P2。データ喪失は無いが、Enter で開くたびに表示が壊れる。
+
+### 1.44 上部バーをロックすると静止画のスライドショーインジケータが隠れる
+
+- 出典: 2026-08-04 の利用者報告。「静止画で上のツールバーをロックしていると、
+  スライドショーのインジケータが見えない」。
+- 壊れている前提: `draw_slideshow_progress_indicator` は円形インジケータを
+  `full_rect.max.x - 22, full_rect.min.y + 22` = **ウィンドウ全体矩形の右上**に描く
+  ([ui_fullscreen.rs:18895](../src/ui_fullscreen.rs))。一方、上部バーをロックすると
+  (`fullscreen_top_bar_locked`) バーは常時表示になり、**インジケータより後に**
+  描かれる ([ui_fullscreen.rs:9270](../src/ui_fullscreen.rs) → [9493](../src/ui_fullscreen.rs))
+  ため、同じ帯を上書きする。非ロック時はバーがホバー時しか出ないので見えていた。
+- 同型: 上端に置く他のインジケータも `full_rect` 基準なので同じ穴を通る。
+  `draw_fs_transparent_bg_indicator` ([18862](../src/ui_fullscreen.rs)) と
+  `draw_original_preview_indicator` ([18888](../src/ui_fullscreen.rs))。下端の
+  `draw_compare_pin_indicator` はシークバーのロックに対して同じ関係になる。
+- 対応案: インジケータの基準を、ロック時にバーが確保した後のコンテンツ矩形
+  (`fullscreen_media_rect` 系) に統一する。個別に「ロック中は 40px 下げる」のような
+  定数を足すと、バー高さの変更・DPI・UI 表示倍率で再びずれる。
+- 完了条件 / 回帰テスト:
+  - 上部バーのロック ON / OFF、ホバー中 / 非ホバーのいずれでもインジケータが見える。
+  - 透過背景インジケータと原画プレビュー表示も同様に隠れない。
+  - UI スナップショット (`cargo test --test ui_snapshot`) に差分が出るなら意図確認のうえ更新。
+- 規模 / 優先度: Small / P3。見た目のみで機能欠落は無い。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
