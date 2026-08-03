@@ -54,6 +54,39 @@ test("the online-only remote shell does not register a service worker", async ()
   assert.doesNotMatch(app, /navigator\.serviceWorker|serviceWorker\.register/);
 });
 
+test("the hidden attribute always overrides component display rules", async () => {
+  const css = await readFile(new URL("styles.css", here), "utf8");
+  assert.match(
+    css,
+    /(?:^|\n)\[hidden\]\s*\{[^}]*display:\s*none\s*!important\s*;/
+  );
+});
+
+test("update banner resolves viewport width before laying out text and buttons", async () => {
+  const css = await readFile(new URL("styles.css", here), "utf8");
+  const banner = css.match(/\.app-update-banner\s*\{([^}]*)\}/)?.[1] ?? "";
+  assert.match(banner, /left:\s*max\(16px,\s*env\(safe-area-inset-left/);
+  assert.match(banner, /right:\s*max\(16px,\s*env\(safe-area-inset-right/);
+  assert.match(banner, /flex-wrap:\s*wrap/);
+  assert.match(banner, /justify-content:\s*center/);
+  assert.doesNotMatch(banner, /left:\s*50%|translateX\(-50%\)/);
+  assert.match(
+    css,
+    /\.app-update-banner\s*>\s*span\s*\{[^}]*flex:\s*1\s+1\s+16ch;[^}]*min-width:\s*0;/
+  );
+  assert.match(css, /\.app-update-banner button\s*\{[^}]*flex:\s*none;/);
+  assert.match(css, /\.viewer-boundary-message\s*\{[^}]*width:\s*max-content;/);
+});
+
+test("adjustment ranges keep normalized handles and expose their actual values", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  assert.match(app, /input\.min\s*=\s*"0";\s*input\.max\s*=\s*"1";\s*input\.step\s*=\s*"any";/);
+  assert.match(app, /input\.setAttribute\("aria-valuemin",\s*String\(min\)\)/);
+  assert.match(app, /input\.setAttribute\("aria-valuemax",\s*String\(max\)\)/);
+  assert.match(app, /control\.input\.setAttribute\("aria-valuenow",\s*String\(value\)\)/);
+  assert.match(app, /control\.input\.setAttribute\("aria-valuetext",\s*valueText\)/);
+});
+
 test("safe areas protect portrait bars and landscape side controls", async () => {
   const css = await readFile(new URL("styles.css", here), "utf8");
   const app = await readFile(new URL("app.js", here), "utf8");
@@ -107,6 +140,17 @@ test("still-image panel reserves the agreed viewport while its transparent shiel
   );
   assert.match(app, /classList\.add\("viewer-command-menu-layer"\)/);
   assert.match(app, /viewerPanelTab:\s*"functions"/);
+});
+
+test("adjustment slider resets keep a stable reserved layout slot", async () => {
+  const css = await readFile(new URL("styles.css", here), "utf8");
+  const app = await readFile(new URL("app.js", here), "utf8");
+  assert.match(
+    css,
+    /\.adjustment-slider-reset-slot\s*\{[^}]*width:\s*36px;[^}]*min-height:\s*36px;/
+  );
+  assert.match(app, /resetSlot\.append\(resetButton\)/);
+  assert.match(app, /resetButton\.hidden\s*=\s*!adjustmentResetVisible/);
 });
 
 test("image tiles preserve portrait and landscape shape below a separate label row", async () => {

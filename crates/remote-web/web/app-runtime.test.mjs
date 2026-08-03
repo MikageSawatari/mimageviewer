@@ -94,6 +94,7 @@ globalThis.fetch = imageFetch;
 
 const {
   ImageViewer,
+  LatestOnlyTaskQueue,
   VIEWER_MENU_MAX_ACTIONS,
   VIEWER_PANEL_TABS,
   activateFolderContainerForImage,
@@ -101,6 +102,7 @@ const {
   containerInitialImageIndex,
   createGridTile,
   loadFolder,
+  normalizeRemoteAdjustmentValues,
   parentContainerAddress,
   reloadApplication,
   resolveMediaOpenRoute,
@@ -228,6 +230,52 @@ test("still-image panel exposes the agreed tabs in desktop order", () => {
       ["bookmarks", "ブックマーク"],
     ]
   );
+});
+
+test("adjustment preview keeps one request in flight and coalesces to the latest value", async () => {
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const started = [];
+  const completed = [];
+  let active = 0;
+  let maxActive = 0;
+  const queue = new LatestOnlyTaskQueue(async (value) => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    started.push(value);
+    if (value === 1) await firstGate;
+    completed.push(value);
+    active -= 1;
+  });
+
+  queue.enqueue(1);
+  await Promise.resolve();
+  queue.enqueue(2);
+  queue.enqueue(3);
+  releaseFirst();
+  for (let attempt = 0; attempt < 20 && completed.length < 2; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  assert.deepEqual(started, [1, 3]);
+  assert.deepEqual(completed, [1, 3]);
+  assert.equal(maxActive, 1);
+});
+
+test("remote adjustment normalization keeps valid local slider defaults and bounds", () => {
+  assert.deepEqual(normalizeRemoteAdjustmentValues(), {
+    brightness: 0,
+    contrast: 0,
+    gamma: 1,
+    saturation: 0,
+    temperature: 0,
+    black_point: 0,
+    white_point: 255,
+    midtone: 1,
+    auto_mode: null,
+  });
+  assert.equal(normalizeRemoteAdjustmentValues({ black_point: 255 }).black_point, 254);
+  assert.equal(normalizeRemoteAdjustmentValues({ white_point: 0 }).white_point, 1);
 });
 
 test("plain image media routes resolve their containing folder", () => {

@@ -10231,6 +10231,148 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn key_based_page_adjustment_updates_mounted_state_and_preserves_remote_undo() {
+        let mut app = setup_app();
+        let path = PathBuf::from("C:/pics/remote-page.jpg");
+        let idx = push_image(&mut app, path.to_str().unwrap());
+        let mut target = app.page_adjustment_target_for_idx(idx).unwrap();
+        target.idx_hint = None;
+        let mut params = AdjustParams::default();
+        params.brightness = 31.0;
+
+        app.capture_adjust_full_for_target(target.clone(), "remote test".to_owned(), |app| {
+            app.restore_page_params_for_target(&target, Some(params.clone()));
+        });
+
+        assert_eq!(app.adjustment_page_params[&idx], params);
+        assert_eq!(
+            app.adjustment_db
+                .as_ref()
+                .unwrap()
+                .get_page_params(&target.page_key),
+            Some(params.clone())
+        );
+        assert!(app.adjusted_page_keys.contains(&target.page_key));
+        assert!(
+            app.pinned_adjustment_refresh_keys
+                .contains(&target.page_key)
+        );
+        app.apply_meta_undo();
+        assert!(!app.adjustment_page_params.contains_key(&idx));
+        assert_eq!(
+            app.adjustment_db
+                .as_ref()
+                .unwrap()
+                .get_page_params(&target.page_key),
+            None
+        );
+
+        app.apply_meta_redo();
+        assert_eq!(app.adjustment_page_params[&idx], params);
+        assert_eq!(
+            app.adjustment_db
+                .as_ref()
+                .unwrap()
+                .get_page_params(&target.page_key),
+            Some(params)
+        );
+    }
+
+    #[test]
+    fn remote_page_key_undo_works_when_the_page_is_not_mounted() {
+        let mut app = setup_app();
+        let path = PathBuf::from("C:/elsewhere/remote-only.jpg");
+        let target = PageAdjustmentTarget {
+            page_key: crate::adjustment_db::normalize_path(&path),
+            location_path: path.parent().map(PathBuf::from),
+            sidecar_coords: None,
+            compiled_book: false,
+            idx_hint: None,
+        };
+        let mut params = AdjustParams::default();
+        params.contrast = 22.0;
+
+        app.capture_adjust_full_for_target(target.clone(), "remote external".to_owned(), |app| {
+            app.restore_page_params_for_target(&target, Some(params.clone()));
+        });
+        assert_eq!(
+            app.stored_page_params_for_target(&target),
+            Some(params.clone())
+        );
+
+        app.apply_meta_undo();
+        assert_eq!(app.stored_page_params_for_target(&target), None);
+
+        app.apply_meta_redo();
+        assert_eq!(
+            app.stored_page_params_for_target(&target),
+            Some(params.clone())
+        );
+
+        let original_global = app.settings.global_preset.clone();
+        let mut new_standard = original_global.clone();
+        new_standard.brightness = 44.0;
+        app.capture_adjust_full_for_target(target.clone(), "remote standard".to_owned(), |app| {
+            app.copy_params_to_global(new_standard.clone());
+            app.restore_page_params_for_target(&target, None);
+        });
+        assert_eq!(app.settings.global_preset, new_standard);
+        assert_eq!(app.stored_page_params_for_target(&target), None);
+
+        app.apply_meta_undo();
+        assert_eq!(app.settings.global_preset, original_global);
+        assert_eq!(app.stored_page_params_for_target(&target), Some(params));
+    }
+
+    #[test]
+    fn unmounted_page_adjustment_set_queues_pinned_thumbnail_refresh() {
+        let mut app = setup_app();
+        let path = PathBuf::from("C:/elsewhere/pinned-remote-page.jpg");
+        let target = PageAdjustmentTarget {
+            page_key: crate::adjustment_db::normalize_path(&path),
+            location_path: path.parent().map(PathBuf::from),
+            sidecar_coords: None,
+            compiled_book: false,
+            idx_hint: None,
+        };
+        assert!(app.page_adjustment_indices(&target).is_empty());
+        let mut params = AdjustParams::default();
+        params.brightness = 27.0;
+
+        app.set_page_params_for_target(&target, params).unwrap();
+
+        assert!(
+            app.pinned_adjustment_refresh_keys
+                .contains(&target.page_key)
+        );
+    }
+
+    #[test]
+    fn unmounted_page_adjustment_clear_queues_pinned_thumbnail_refresh() {
+        let mut app = setup_app();
+        let path = PathBuf::from("C:/elsewhere/pinned-remote-page.jpg");
+        let target = PageAdjustmentTarget {
+            page_key: crate::adjustment_db::normalize_path(&path),
+            location_path: path.parent().map(PathBuf::from),
+            sidecar_coords: None,
+            compiled_book: false,
+            idx_hint: None,
+        };
+        assert!(app.page_adjustment_indices(&target).is_empty());
+        let mut params = AdjustParams::default();
+        params.contrast = 19.0;
+        app.set_page_params_for_target(&target, params).unwrap();
+        app.pinned_adjustment_refresh_keys.clear();
+
+        app.clear_page_params_for_target(&target).unwrap();
+
+        assert!(
+            app.pinned_adjustment_refresh_keys
+                .contains(&target.page_key)
+        );
+    }
+
+    #[test]
     fn apply_conceal_slot_to_selection_saves_pages_and_clears_caches() {
         let ctx = egui::Context::default();
         let mut app = setup_app();

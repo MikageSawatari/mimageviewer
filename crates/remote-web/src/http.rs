@@ -1847,6 +1847,7 @@ fn api_write(request: &mut Request, state: &AppState, client_id: &str) -> HttpRe
         Ok(result) => HttpResponse::json(&json!({
             "applied": true,
             "item_state": result.value.item_state,
+            "adjustment_state": result.value.adjustment_state,
         }))
         .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
         .with_header("Cache-Control", "no-store")
@@ -1935,6 +1936,14 @@ fn api_page(state: &AppState, query: &[(String, String)], client_id: &str) -> Ht
         Ok(Some("1")) => PagePriority::Prefetch,
         _ => return HttpResponse::text(400, "Bad Request"),
     };
+    let adjustment_preview = match query_value(query, "adjustment_preview") {
+        Ok(None) => None,
+        Ok(Some(value)) => match serde_json::from_str(value) {
+            Ok(preview) => Some(preview),
+            Err(_) => return HttpResponse::text(400, "Bad Request"),
+        },
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
     let ipc_class = if priority == PagePriority::Prefetch {
         IpcClass::Prefetch
     } else {
@@ -1942,9 +1951,13 @@ fn api_page(state: &AppState, query: &[(String, String)], client_id: &str) -> Ht
     };
     let started = Instant::now();
     let result = match state.ipc_admission.run(ipc_class, || {
-        state
-            .thumbnail_client
-            .page(client_id, address.clone(), target_px, priority)
+        state.thumbnail_client.page(
+            client_id,
+            address.clone(),
+            target_px,
+            priority,
+            adjustment_preview.clone(),
+        )
     }) {
         Ok(result) => result,
         Err(busy) => return media_admission_busy_response(busy, "page"),
@@ -1954,7 +1967,14 @@ fn api_page(state: &AppState, query: &[(String, String)], client_id: &str) -> Ht
             let payload = result.value;
             let blob_bytes = payload.bytes.len();
             HttpResponse::bytes(200, "image/webp", payload.bytes)
-                .with_header("Cache-Control", "private, max-age=60")
+                .with_header(
+                    "Cache-Control",
+                    if adjustment_preview.is_some() {
+                        "no-store"
+                    } else {
+                        "private, max-age=60"
+                    },
+                )
                 .with_header("X-mIV-Image-Width", payload.width.to_string())
                 .with_header("X-mIV-Image-Height", payload.height.to_string())
                 .with_log_details(json!({

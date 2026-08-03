@@ -67,12 +67,93 @@ import {
   videoStartupDecision,
   videoTapCommand,
   appUpdateNotice,
+  adjustmentResetVisible,
+  rangeValueFromNormalized,
+  rangeValueToNormalized,
+  relativeRangeDragValue,
   shouldReanchorVideoTimeline,
   videoTimelineAnchor,
   videoTimelinePosition,
 } from "./command-core.mjs";
 
 const key = (value, extra = {}) => ({ key: value, ...extra });
+
+test("relative range drag follows travel, clamps, and snaps independently of press position", () => {
+  const drag = (startClientX, currentClientX) => relativeRangeDragValue({
+    startValue: 0,
+    startClientX,
+    currentClientX,
+    trackWidth: 200,
+    min: -100,
+    max: 100,
+    step: 1,
+  });
+  assert.equal(drag(10, 30), 20);
+  assert.equal(drag(150, 170), 20);
+  assert.equal(drag(90, 90), 0);
+  assert.equal(relativeRangeDragValue({
+    startValue: 1,
+    startClientX: 20,
+    currentClientX: 31,
+    trackWidth: 100,
+    min: 0.2,
+    max: 5,
+    step: 0.01,
+    logarithmic: true,
+  }), 1.42);
+  assert.equal(relativeRangeDragValue({
+    startValue: 250,
+    startClientX: 0,
+    currentClientX: 100,
+    trackWidth: 100,
+    min: 0,
+    max: 254,
+    step: 1,
+  }), 254);
+});
+
+test("positive logarithmic adjustment ranges match egui normalized positions", () => {
+  assert.equal(rangeValueToNormalized({
+    value: 1,
+    min: 0.2,
+    max: 5,
+    logarithmic: true,
+  }), 0.5);
+  assert.equal(rangeValueFromNormalized({
+    normalized: 0.5,
+    min: 0.2,
+    max: 5,
+    step: 0.01,
+    logarithmic: true,
+  }), 1);
+  assert.equal(rangeValueToNormalized({
+    value: 1,
+    min: 0.1,
+    max: 10,
+    logarithmic: true,
+  }), 0.5);
+  assert.equal(rangeValueFromNormalized({
+    normalized: 0,
+    min: 0.2,
+    max: 5,
+    logarithmic: true,
+  }), 0.2);
+  assert.equal(rangeValueFromNormalized({
+    normalized: 1,
+    min: 0.2,
+    max: 5,
+    logarithmic: true,
+  }), 5);
+  assert.equal(rangeValueToNormalized({ value: 0, min: -100, max: 100 }), 0.5);
+});
+
+test("adjustment reset visibility follows defaults, epsilon, and disabled state", () => {
+  assert.equal(adjustmentResetVisible({ value: 0, defaultValue: 0 }), false);
+  assert.equal(adjustmentResetVisible({ value: 2, defaultValue: 0 }), true);
+  assert.equal(adjustmentResetVisible({ value: 2, defaultValue: 0, disabled: true }), false);
+  assert.equal(adjustmentResetVisible({ value: 1.0005, defaultValue: 1, epsilon: 0.001 }), false);
+  assert.equal(adjustmentResetVisible({ value: 1.002, defaultValue: 1, epsilon: 0.001 }), true);
+});
 
 test("session owner badge keeps the two non-blocking ownership states explicit", () => {
   assert.deepEqual(sessionOwnerBadge("active"), {

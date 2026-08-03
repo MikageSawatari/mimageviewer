@@ -776,6 +776,136 @@ function clampNumber(value, minimum, maximum) {
   return Math.max(minimum, Math.min(maximum, value));
 }
 
+/// Matches egui 0.33's positive, finite logarithmic slider mapping.
+/// Endpoints are handled before the logarithm, just as egui does.
+export function rangeValueToNormalized({
+  value,
+  min,
+  max,
+  logarithmic = false,
+}) {
+  const minimum = Number(min);
+  const maximum = Number(max);
+  if (!Number.isFinite(minimum) || !Number.isFinite(maximum)) return 0;
+  if (minimum === maximum) return 0.5;
+  if (minimum > maximum) {
+    return 1 - rangeValueToNormalized({
+      value,
+      min: maximum,
+      max: minimum,
+      logarithmic,
+    });
+  }
+  const current = Number(value);
+  if (!Number.isFinite(current) || current <= minimum) return 0;
+  if (current >= maximum) return 1;
+  if (logarithmic && minimum > 0) {
+    const minLog = Math.log10(minimum);
+    return clampNumber(
+      (Math.log10(current) - minLog) / (Math.log10(maximum) - minLog),
+      0,
+      1
+    );
+  }
+  return clampNumber((current - minimum) / (maximum - minimum), 0, 1);
+}
+
+export function rangeValueFromNormalized({
+  normalized,
+  min,
+  max,
+  step = null,
+  logarithmic = false,
+}) {
+  const minimum = Number(min);
+  const maximum = Number(max);
+  if (!Number.isFinite(minimum) || !Number.isFinite(maximum)) return 0;
+  if (minimum === maximum) return minimum;
+  if (minimum > maximum) {
+    return rangeValueFromNormalized({
+      normalized: 1 - Number(normalized),
+      min: maximum,
+      max: minimum,
+      step,
+      logarithmic,
+    });
+  }
+  const position = clampNumber(Number(normalized) || 0, 0, 1);
+  let value;
+  if (position <= 0) {
+    value = minimum;
+  } else if (position >= 1) {
+    value = maximum;
+  } else if (logarithmic && minimum > 0) {
+    const minLog = Math.log10(minimum);
+    value = 10 ** (minLog + (Math.log10(maximum) - minLog) * position);
+  } else {
+    value = minimum + (maximum - minimum) * position;
+  }
+  value = clampNumber(value, minimum, maximum);
+  const increment = Number(step);
+  if (Number.isFinite(increment) && increment > 0) {
+    value = minimum + Math.round((value - minimum) / increment) * increment;
+  }
+  return clampNumber(Number(value.toFixed(12)), minimum, maximum);
+}
+
+/// Maps pointer travel to a range value without using the pointer-down position as a value.
+/// Moving by one full track width traverses the normalized track; the result follows egui's
+/// selected curve and min-anchored step grid.
+export function relativeRangeDragValue({
+  startValue,
+  startClientX,
+  currentClientX,
+  trackWidth,
+  min,
+  max,
+  step = 1,
+  logarithmic = false,
+}) {
+  const parsedMin = Number(min);
+  const parsedMax = Number(max);
+  if (!Number.isFinite(parsedMin) || !Number.isFinite(parsedMax)) return 0;
+  const minimum = Math.min(parsedMin, parsedMax);
+  const maximum = Math.max(parsedMin, parsedMax);
+  const parsedStart = Number(startValue);
+  const start = clampNumber(
+    Number.isFinite(parsedStart) ? parsedStart : minimum,
+    minimum,
+    maximum
+  );
+  const delta = Number(currentClientX) - Number(startClientX);
+  if (!Number.isFinite(delta) || delta === 0) return start;
+  const width = Number(trackWidth);
+  if (!Number.isFinite(width) || width <= 0 || maximum === minimum) return start;
+  const startPosition = rangeValueToNormalized({
+    value: start,
+    min: minimum,
+    max: maximum,
+    logarithmic,
+  });
+  return rangeValueFromNormalized({
+    normalized: startPosition + delta / width,
+    min: minimum,
+    max: maximum,
+    step,
+    logarithmic,
+  });
+}
+
+export function adjustmentResetVisible({
+  value,
+  defaultValue,
+  disabled = false,
+  epsilon = 0,
+}) {
+  if (disabled) return false;
+  const current = Number(value);
+  const baseline = Number(defaultValue);
+  if (!Number.isFinite(current) || !Number.isFinite(baseline)) return false;
+  return Math.abs(current - baseline) > Math.max(0, Number(epsilon) || 0);
+}
+
 export function viewerSeekGroupIndex(physicalValue, groupCount, rtl = false) {
   const count = Math.max(0, Math.floor(Number(groupCount) || 0));
   if (!count) return -1;

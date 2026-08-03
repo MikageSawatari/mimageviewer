@@ -6061,6 +6061,19 @@ pub(crate) struct AdjustmentDragSession {
     pub before: Option<crate::adjustment::AdjustParams>,
 }
 
+/// ページ補正の永続 identity。idx が存在しない remote ページも同じ writer へ流す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageAdjustmentTarget {
+    pub page_key: String,
+    /// お気に入り標準の祖先解決に使う場所。製本ページは `None` (= 無補正固定)。
+    pub location_path: Option<std::path::PathBuf>,
+    pub sidecar_coords: Option<(std::path::PathBuf, String)>,
+    pub compiled_book: bool,
+    /// ローカル UI の既存 `set_page_params(idx, ...)` だけが設定する。
+    /// remote は `None` とし、同じ key が mounted items にあればそこへ反映する。
+    pub idx_hint: Option<usize>,
+}
+
 /// 画像補正パネルで選ばれている書き込み先。
 ///
 /// 表示中だけ保持する UI 状態で、設定や adjustment.db には永続化しない。
@@ -49697,6 +49710,23 @@ impl App {
         crate::edit_source::page_key_for_grid_item(self.items.get(idx)?)
     }
 
+    pub(crate) fn page_adjustment_target_for_idx(
+        &self,
+        idx: usize,
+    ) -> Option<PageAdjustmentTarget> {
+        let page_key = self.page_path_key(idx)?;
+        let compiled_book = self.idx_is_compiled_book_page(idx);
+        Some(PageAdjustmentTarget {
+            page_key,
+            location_path: (!compiled_book)
+                .then(|| self.adjust_container_path_for_idx(idx))
+                .flatten(),
+            sidecar_coords: (!compiled_book).then(|| self.sidecar_coords(idx)).flatten(),
+            compiled_book,
+            idx_hint: Some(idx),
+        })
+    }
+
     pub(crate) fn invalidate_edit_preview_cache_for_key(&self, item_key: &str) {
         if let Some(service) = &self.edit_preview_cache {
             service.delete(item_key.to_string());
@@ -56224,6 +56254,165 @@ impl App {
         }
     }
 
+    fn page_adjustment_indices(&self, target: &PageAdjustmentTarget) -> Vec<usize> {
+        if let Some(idx) = target.idx_hint {
+            return (self.page_path_key(idx).as_deref() == Some(target.page_key.as_str()))
+                .then_some(vec![idx])
+                .unwrap_or_default();
+        }
+        (0..self.items.len())
+            .filter(|idx| self.page_path_key(*idx).as_deref() == Some(target.page_key.as_str()))
+            .collect()
+    }
+
+    pub(crate) fn stored_page_params_for_target(
+        &self,
+        target: &PageAdjustmentTarget,
+    ) -> Option<crate::adjustment::AdjustParams> {
+        self.page_adjustment_indices(target)
+            .into_iter()
+            .find_map(|idx| self.adjustment_page_params.get(&idx).cloned())
+            .or_else(|| {
+                self.adjustment_db
+                    .as_ref()
+                    .and_then(|db| db.get_page_params(&target.page_key))
+            })
+    }
+
+    pub(crate) fn adjustment_standard_scope_for_target(
+        &self,
+        target: &PageAdjustmentTarget,
+    ) -> AdjustmentStandardScope {
+        let favorite = target.location_path.as_deref().and_then(|path| {
+            crate::final_composite::active_favorite_default_id_for_path(
+                path,
+                &self.settings.favorites,
+                None,
+                |id| self.adjustment_favorite_params.contains_key(&id),
+            )
+        });
+        favorite
+            .map(AdjustmentStandardScope::Favorite)
+            .unwrap_or(AdjustmentStandardScope::Global)
+    }
+
+    pub(crate) fn adjustment_standard_params_for_target(
+        &self,
+        target: &PageAdjustmentTarget,
+    ) -> crate::adjustment::AdjustParams {
+        if target.compiled_book {
+            return Self::book_page_default_adjust_params().clone();
+        }
+        match self.adjustment_standard_scope_for_target(target) {
+            AdjustmentStandardScope::Favorite(id) => self
+                .adjustment_favorite_params
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| self.settings.global_preset.clone()),
+            AdjustmentStandardScope::Global => self.settings.global_preset.clone(),
+        }
+    }
+
+    pub(crate) fn effective_params_for_target(
+        &self,
+        target: &PageAdjustmentTarget,
+    ) -> crate::adjustment::AdjustParams {
+        self.stored_page_params_for_target(target)
+            .unwrap_or_else(|| self.adjustment_standard_params_for_target(target))
+    }
+
+    pub(crate) fn adjustment_standard_label_for_target(
+        &self,
+        target: &PageAdjustmentTarget,
+    ) -> String {
+        if target.compiled_book {
+            return "標準（本の無補正）".to_string();
+        }
+        match self.adjustment_standard_scope_for_target(target) {
+            AdjustmentStandardScope::Favorite(id) => {
+                let name = self
+                    .settings
+                    .favorite_by_id(id)
+                    .map(|favorite| crate::ui_helpers::truncate_name(&favorite.name, 7))
+                    .unwrap_or_default();
+                format!("標準（お気に入り「{name}」）")
+            }
+            AdjustmentStandardScope::Global => "標準（共通）".to_string(),
+        }
+    }
+
+    /// page key を正本に個別パラメータを書き込む。idx は mounted 表示状態の反映にだけ使う。
+    ///
+    /// 軽量な adjustment / compare キャッシュと generation はここで更新する。
+    /// final pipeline / AI キャッシュは before / after の差分分類が必要なので、mounted
+    /// ページを変更する呼び出し側は `clear_caches_for_param_change` も通すこと。
+    pub(crate) fn set_page_params_for_target(
+        &mut self,
+        target: &PageAdjustmentTarget,
+        params: crate::adjustment::AdjustParams,
+    ) -> Result<(), String> {
+        // 固定代表サムネは、親コンテナだけが mounted で参照元ページ自体は items に
+        // 無い場合がある。親セルの refresh 判定は idx ではなく page key の実効値で行う。
+        let old_effective_for_key = self.effective_params_for_target(target);
+        let indices = self.page_adjustment_indices(target);
+        let old_by_idx = indices
+            .iter()
+            .map(|idx| (*idx, self.effective_params(*idx).clone()))
+            .collect::<Vec<_>>();
+        let matches_default = params == self.adjustment_standard_params_for_target(target);
+        let db_result = match &self.adjustment_db {
+            Some(db) if matches_default => db.remove_page_params(&target.page_key),
+            Some(db) => db.set_page_params(&target.page_key, &params),
+            None => Ok(()),
+        }
+        .map_err(|error| error.to_string());
+
+        for idx in &indices {
+            if matches_default {
+                self.adjustment_page_params.remove(idx);
+            } else {
+                self.adjustment_page_params.insert(*idx, params.clone());
+            }
+        }
+        Self::set_page_key_presence(
+            &mut self.adjusted_page_keys,
+            &target.page_key,
+            !matches_default,
+        );
+        if matches_default {
+            self.with_sidecar_coords_mut(target.sidecar_coords.as_ref(), |sidecar, rel| {
+                sidecar.remove_adjust(rel)
+            });
+        } else {
+            let sidecar_params = params.clone();
+            self.with_sidecar_coords_mut(target.sidecar_coords.as_ref(), move |sidecar, rel| {
+                sidecar.set_adjust(rel, sidecar_params)
+            });
+        }
+
+        let thumb_color_changed = !old_effective_for_key.color_settings_eq(&params);
+        for idx in indices {
+            self.adjustment_cache.remove(&idx);
+            self.invalidate_compare_prepared_for_idx(idx);
+            if old_by_idx
+                .iter()
+                .find(|(candidate, _)| *candidate == idx)
+                .is_some_and(|(_, old)| !old.color_settings_eq(&params))
+            {
+                self.thumb_adjust_tex.remove(&idx);
+            }
+            self.bump_adjustment_generation(idx);
+        }
+        if thumb_color_changed {
+            self.pinned_adjustment_refresh_keys
+                .insert(target.page_key.clone());
+        }
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Edits,
+        );
+        db_result
+    }
+
     /// 指定ページに個別パラメータを書込む (DB にも保存)。
     ///
     /// `params` が「そのページで効く標準」(= お気に入り標準 or global_preset) と
@@ -56232,45 +56421,87 @@ impl App {
     /// グローバルが AI ON の状態で個別に「AI OFF」を設定したいケースを取りこぼしたため、
     /// 標準との等価比較に変更した。お気に入り標準もこれで同じ扱いになる。
     pub(crate) fn set_page_params(&mut self, idx: usize, params: crate::adjustment::AdjustParams) {
-        // サムネ補正テクスチャは色調 (brightness..midtone + auto_mode) が変わるときだけ
-        // 落とす。post_filter / smart_sharpen はサムネに乗らないため温存できる。
-        let thumb_color_changed = !self.effective_params(idx).color_settings_eq(&params);
-        let matches_default = params == *self.effective_default_for_idx(idx);
-        if matches_default {
-            self.adjustment_page_params.remove(&idx);
-            if let Some(key) = self.page_path_key(idx) {
-                if let Some(db) = &self.adjustment_db {
-                    let _ = db.remove_page_params(&key);
-                }
-                Self::set_page_key_presence(&mut self.adjusted_page_keys, &key, false);
-            }
-            self.with_sidecar_mut(idx, |sc, rel| sc.remove_adjust(rel));
-        } else {
-            self.adjustment_page_params.insert(idx, params.clone());
-            if let Some(key) = self.page_path_key(idx) {
-                if let Some(db) = &self.adjustment_db {
-                    let _ = db.set_page_params(&key, &params);
-                }
-                Self::set_page_key_presence(&mut self.adjusted_page_keys, &key, true);
-            }
-            self.with_sidecar_mut(idx, move |sc, rel| sc.set_adjust(rel, params));
+        if let Some(target) = self.page_adjustment_target_for_idx(idx) {
+            let _ = self.set_page_params_for_target(&target, params);
         }
-        // 補正値が変わった可能性があるので、軽量な表示キャッシュは常に落とす。
-        // final pipeline / AI キャッシュは差分分類が必要なので呼び出し側で
-        // clear_caches_for_param_change を通す。
-        self.adjustment_cache.remove(&idx);
-        self.invalidate_compare_prepared_for_idx(idx);
+    }
+
+    pub(crate) fn clear_page_params_for_target(
+        &mut self,
+        target: &PageAdjustmentTarget,
+    ) -> Result<(), String> {
+        // set と同様、未 mounted の固定代表参照元も key 単位で変化を検出する。
+        let old_effective_for_key = self.effective_params_for_target(target);
+        let fallback = self.adjustment_standard_params_for_target(target);
+        let thumb_color_changed = !old_effective_for_key.color_settings_eq(&fallback);
+        let indices = self.page_adjustment_indices(target);
+        let old_by_idx = indices
+            .iter()
+            .map(|idx| (*idx, self.effective_params(*idx).clone()))
+            .collect::<Vec<_>>();
+        let db_result = self
+            .adjustment_db
+            .as_ref()
+            .map(|db| db.remove_page_params(&target.page_key))
+            .unwrap_or(Ok(()))
+            .map_err(|error| error.to_string());
+
+        for idx in &indices {
+            self.adjustment_page_params.remove(idx);
+        }
+        Self::set_page_key_presence(&mut self.adjusted_page_keys, &target.page_key, false);
+        self.with_sidecar_coords_mut(target.sidecar_coords.as_ref(), |sidecar, rel| {
+            sidecar.remove_adjust(rel)
+        });
+
+        for idx in indices {
+            let old = old_by_idx
+                .iter()
+                .find(|(candidate, _)| *candidate == idx)
+                .map(|(_, params)| params)
+                .unwrap_or(&fallback);
+            let new_params = self.effective_params(idx).clone();
+            self.adjustment_cache.remove(&idx);
+            self.invalidate_compare_prepared_for_idx(idx);
+            self.bump_adjustment_generation(idx);
+            if !old.color_settings_eq(&new_params) {
+                self.thumb_adjust_tex.remove(&idx);
+            }
+            if !old.ai_settings_eq(&new_params) {
+                self.purge_upscale_for_idx(idx);
+            }
+        }
         if thumb_color_changed {
-            self.thumb_adjust_tex.remove(&idx);
-            if let Some(key) = self.page_path_key(idx) {
-                self.pinned_adjustment_refresh_keys.insert(key);
-            }
+            self.pinned_adjustment_refresh_keys
+                .insert(target.page_key.clone());
         }
-        // 360 度パノラマビュー: 補正パラメータが変わったので世代 bump (§3.6.2.2)。
-        self.bump_adjustment_generation(idx);
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
+        db_result
+    }
+
+    pub(crate) fn restore_page_params_for_target(
+        &mut self,
+        target: &PageAdjustmentTarget,
+        params: Option<crate::adjustment::AdjustParams>,
+    ) {
+        match params {
+            Some(params) => {
+                let old_by_idx = self
+                    .page_adjustment_indices(target)
+                    .into_iter()
+                    .map(|idx| (idx, self.effective_params(idx).clone()))
+                    .collect::<Vec<_>>();
+                let _ = self.set_page_params_for_target(target, params.clone());
+                for (idx, old) in old_by_idx {
+                    self.clear_caches_for_param_change(idx, &old, &params);
+                }
+            }
+            None => {
+                let _ = self.clear_page_params_for_target(target);
+            }
+        }
     }
 
     /// 指定ページの個別設定を解除する (DB からも削除)。
@@ -56280,33 +56511,9 @@ impl App {
     /// 失敗マーカ / pending をクリアして次フレームで再実行されるようにする。
     /// 色調 (adjustment) キャッシュは常にクリアする。
     pub(crate) fn clear_page_params(&mut self, idx: usize) {
-        let old_params = self.effective_params(idx).clone();
-        self.adjustment_page_params.remove(&idx);
-        let new_params = self.effective_params(idx).clone();
-        if let Some(key) = self.page_path_key(idx) {
-            if let Some(db) = &self.adjustment_db {
-                let _ = db.remove_page_params(&key);
-            }
-            Self::set_page_key_presence(&mut self.adjusted_page_keys, &key, false);
+        if let Some(target) = self.page_adjustment_target_for_idx(idx) {
+            let _ = self.clear_page_params_for_target(&target);
         }
-        self.with_sidecar_mut(idx, |sc, rel| sc.remove_adjust(rel));
-        self.adjustment_cache.remove(&idx);
-        self.invalidate_compare_prepared_for_idx(idx);
-        // 360 度パノラマビュー: cache 内容が変わったので世代 bump (§3.6.2.2)。
-        self.bump_adjustment_generation(idx);
-        // サムネは色調が実際に変わるときだけ再生成 (post_filter / smart_sharpen は非対象)。
-        if !old_params.color_settings_eq(&new_params) {
-            self.thumb_adjust_tex.remove(&idx);
-            if let Some(key) = self.page_path_key(idx) {
-                self.pinned_adjustment_refresh_keys.insert(key);
-            }
-        }
-        if !old_params.ai_settings_eq(&new_params) {
-            self.purge_upscale_for_idx(idx);
-        }
-        self.schedule_current_smart_folder_metadata_refresh(
-            smart_folder::SmartFolderMetadataDependency::Edits,
-        );
     }
 
     /// 画像系グリッドアイテム (`Image` / `ZipImage` / `PdfPage`) の (idx, DB キー) 一覧を集める。

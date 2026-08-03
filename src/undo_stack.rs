@@ -48,6 +48,9 @@ pub enum AdjustUndoScope {
     /// フルスクリーン idx。フルスクリーン中の画像移動・終了で undo_stack ごとクリア
     /// されるので idx の陳腐化は起きない前提。
     Page(usize),
+    /// 一覧に mount されていない remote ページ。論理キーと永続化座標を capture 時に
+    /// 固定し、ページ移動後も同じ対象へ Undo/Redo する。
+    PageKey(crate::app::PageAdjustmentTarget),
     /// お気に入り標準 (`adjustment_favorite_params[uuid]`)。
     Favorite(uuid::Uuid),
     /// アプリ全体標準 (`settings.global_preset`)。

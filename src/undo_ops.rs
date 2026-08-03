@@ -407,6 +407,9 @@ impl App {
                     }
                 }
             },
+            AdjustUndoScope::PageKey(page_target) => {
+                self.restore_page_params_for_target(page_target, target.clone());
+            }
             AdjustUndoScope::Favorite(id) => match target {
                 Some(p) => self.set_favorite_default(*id, p.clone()),
                 None => self.clear_favorite_default(*id),
@@ -494,9 +497,35 @@ impl App {
     where
         F: FnOnce(&mut App),
     {
+        self.capture_adjust_full_inner(None, summary, write_op);
+    }
+
+    /// mount されていない remote ページも、上層スコープの副作用と同じ Undo 1 件へまとめる。
+    pub(crate) fn capture_adjust_full_for_target<F>(
+        &mut self,
+        target: crate::app::PageAdjustmentTarget,
+        summary: String,
+        write_op: F,
+    ) where
+        F: FnOnce(&mut App),
+    {
+        self.capture_adjust_full_inner(Some(target), summary, write_op);
+    }
+
+    fn capture_adjust_full_inner<F>(
+        &mut self,
+        external_target: Option<crate::app::PageAdjustmentTarget>,
+        summary: String,
+        write_op: F,
+    ) where
+        F: FnOnce(&mut App),
+    {
         let pages_before = self.adjustment_page_params.clone();
         let favs_before = self.adjustment_favorite_params.clone();
         let global_before = self.settings.global_preset.clone();
+        let external_before = external_target
+            .as_ref()
+            .and_then(|target| self.stored_page_params_for_target(target));
 
         write_op(self);
 
@@ -554,6 +583,23 @@ impl App {
             });
         }
 
+        if let Some(target) = external_target {
+            let represented_by_index = changes.iter().any(|change| match &change.scope {
+                AdjustUndoScope::Page(idx) => {
+                    self.page_path_key(*idx).as_deref() == Some(target.page_key.as_str())
+                }
+                _ => false,
+            });
+            let external_after = self.stored_page_params_for_target(&target);
+            if !represented_by_index && external_before != external_after {
+                changes.push(AdjustmentChange {
+                    scope: AdjustUndoScope::PageKey(target),
+                    before: external_before,
+                    after: external_after,
+                });
+            }
+        }
+
         self.push_adjustment_undo_entry(changes, summary);
     }
 
@@ -602,7 +648,7 @@ fn adjust_scope_priority(scope: &AdjustUndoScope) -> u8 {
     match scope {
         AdjustUndoScope::Global => 0,
         AdjustUndoScope::Favorite(_) => 1,
-        AdjustUndoScope::Page(_) => 2,
+        AdjustUndoScope::Page(_) | AdjustUndoScope::PageKey(_) => 2,
     }
 }
 

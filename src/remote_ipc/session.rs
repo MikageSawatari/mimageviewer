@@ -1499,11 +1499,27 @@ mod tests {
                 bookmarked: true,
             },
             RemoteWriteRequest::GetItemState {
-                address: page,
+                address: page.clone(),
                 context_address: container,
                 page_index: 3,
                 bookmark_supported: true,
             },
+            RemoteWriteRequest::SetAdjustment {
+                address: page.clone(),
+                scope: mimageviewer_ipc::RemoteAdjustmentScope::Page,
+                values: mimageviewer_ipc::RemoteAdjustmentValues {
+                    brightness: 12.0,
+                    contrast: -4.0,
+                    gamma: 1.1,
+                    saturation: 5.0,
+                    temperature: 2.0,
+                    black_point: 3,
+                    white_point: 250,
+                    midtone: 0.9,
+                    auto_mode: None,
+                },
+            },
+            RemoteWriteRequest::GetAdjustmentState { address: page },
         ]
     }
 

@@ -599,6 +599,7 @@ impl ThumbnailClient {
         address: RemoteAddress,
         target_px: u32,
         priority: PagePriority,
+        adjustment_preview: Option<mimageviewer_ipc::RemoteAdjustmentPreview>,
     ) -> Result<IpcSuccess<PagePayload>, ClientFailure> {
         self.collection_request(|id| ClientMessage::Page {
             id,
@@ -607,6 +608,7 @@ impl ThumbnailClient {
                 address: address.clone(),
                 target_px,
                 priority,
+                adjustment_preview: adjustment_preview.clone(),
             },
         })
         .and_then(|success| match success.value {
@@ -1777,6 +1779,7 @@ mod tests {
                 address: RemoteAddress::file("00000000-0000-0000-0000-000000000000", "image.png"),
                 target_px: 2048,
                 priority: PagePriority::Foreground,
+                adjustment_preview: None,
             },
         };
         assert_eq!(response_timeout_for(&request), PAGE_RESPONSE_TIMEOUT);

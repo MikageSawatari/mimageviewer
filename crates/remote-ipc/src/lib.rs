@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 22;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -210,10 +210,67 @@ impl RemoteReadingDirection {
     }
 }
 
+/// リモートの画像補正パネルが編集できる即時パラメータ。
+///
+/// AI / カラー化 / post-filter 等は段 3 まで読み取り専用にし、この型へは入れない。
+/// 書き込み側は保存済みの完全な `AdjustParams` にこの差分だけを重ねるため、Web が
+/// 非公開フィールドを消したり既定値へ戻したりしない。
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RemoteAdjustmentValues {
+    pub brightness: f32,
+    pub contrast: f32,
+    pub gamma: f32,
+    pub saturation: f32,
+    pub temperature: f32,
+    pub black_point: u8,
+    pub white_point: u8,
+    pub midtone: f32,
+    pub auto_mode: Option<RemoteAutoMode>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAutoMode {
+    Auto,
+    MangaCleanup,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAdjustmentScope {
+    Standard,
+    Page,
+}
+
+/// Page 応答だけに適用する未確定値。DB / sidecar / App state は変更しない。
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RemoteAdjustmentPreview {
+    pub scope: RemoteAdjustmentScope,
+    pub values: RemoteAdjustmentValues,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteAdjustmentReadOnlyState {
+    pub colorize_enabled: bool,
+    pub upscale_label: String,
+    pub denoise_label: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RemoteAdjustmentState {
+    pub effective_values: RemoteAdjustmentValues,
+    pub standard_values: RemoteAdjustmentValues,
+    pub selected_scope: RemoteAdjustmentScope,
+    pub has_page_override: bool,
+    pub standard_label: String,
+    pub standard_available: bool,
+    pub read_only: RemoteAdjustmentReadOnlyState,
+}
+
 /// 本体 UI thread が所有する永続ハンドルで適用する書き込み要求。
 ///
 /// 書き込み種別はこの enum だけへ追加し、IPC / UI 間に種別ごとの pending field を作らない。
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RemoteWriteRequest {
     SetSpread {
@@ -253,6 +310,14 @@ pub enum RemoteWriteRequest {
         /// write worker がローカルのブックマーク対象条件から上書きする。
         bookmark_supported: bool,
     },
+    SetAdjustment {
+        address: RemoteAddress,
+        scope: RemoteAdjustmentScope,
+        values: RemoteAdjustmentValues,
+    },
+    GetAdjustmentState {
+        address: RemoteAddress,
+    },
 }
 
 impl RemoteWriteRequest {
@@ -262,7 +327,9 @@ impl RemoteWriteRequest {
             | Self::RecordReadingProgress { address, .. }
             | Self::SetRating { address, .. }
             | Self::SetBookmark { address, .. }
-            | Self::GetItemState { address, .. } => address,
+            | Self::GetItemState { address, .. }
+            | Self::SetAdjustment { address, .. }
+            | Self::GetAdjustmentState { address } => address,
         }
     }
 
@@ -277,7 +344,10 @@ impl RemoteWriteRequest {
             | Self::GetItemState {
                 context_address, ..
             } => Some(context_address),
-            Self::SetSpread { .. } | Self::SetRating { .. } => None,
+            Self::SetSpread { .. }
+            | Self::SetRating { .. }
+            | Self::SetAdjustment { .. }
+            | Self::GetAdjustmentState { .. } => None,
         }
     }
 
@@ -288,19 +358,22 @@ impl RemoteWriteRequest {
             Self::SetRating { .. } => "set_rating",
             Self::SetBookmark { .. } => "set_bookmark",
             Self::GetItemState { .. } => "get_item_state",
+            Self::SetAdjustment { .. } => "set_adjustment",
+            Self::GetAdjustmentState { .. } => "get_adjustment_state",
         }
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum RemoteWriteResponse {
     Success(RemoteWriteResult),
     Error(RemoteWriteError),
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct RemoteWriteResult {
     pub item_state: Option<RemoteItemState>,
+    pub adjustment_state: Option<RemoteAdjustmentState>,
 }
 
 impl RemoteWriteResult {
@@ -311,6 +384,14 @@ impl RemoteWriteResult {
     pub fn item_state(item_state: RemoteItemState) -> Self {
         Self {
             item_state: Some(item_state),
+            adjustment_state: None,
+        }
+    }
+
+    pub fn adjustment_state(adjustment_state: RemoteAdjustmentState) -> Self {
+        Self {
+            item_state: None,
+            adjustment_state: Some(adjustment_state),
         }
     }
 }
@@ -425,12 +506,15 @@ pub enum ContainerResponse {
     Error(MediaError),
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PageRequest {
     pub address: RemoteAddress,
     /// 表示用ラスタの長辺上限。
     pub target_px: u32,
     pub priority: PagePriority,
+    /// 未確定の画像補正プレビュー。永続化せず、この応答の合成だけへ適用する。
+    #[serde(default)]
+    pub adjustment_preview: Option<RemoteAdjustmentPreview>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1306,6 +1390,20 @@ mod tests {
                 },
                 target_px: 1805,
                 priority: PagePriority::Prefetch,
+                adjustment_preview: Some(RemoteAdjustmentPreview {
+                    scope: RemoteAdjustmentScope::Page,
+                    values: RemoteAdjustmentValues {
+                        brightness: 8.0,
+                        contrast: 0.0,
+                        gamma: 1.0,
+                        saturation: 0.0,
+                        temperature: 0.0,
+                        black_point: 0,
+                        white_point: 255,
+                        midtone: 1.0,
+                        auto_mode: None,
+                    },
+                }),
             },
         };
         let mut bytes = Vec::new();
@@ -1359,8 +1457,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v21_video_pull_seek_thumbnail_end_behavior_and_audio_status_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 21);
+    fn protocol_v22_video_pull_seek_thumbnail_end_behavior_and_audio_status_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 22);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -1555,11 +1653,27 @@ mod tests {
                 bookmarked: true,
             },
             RemoteWriteRequest::GetItemState {
-                address: page,
+                address: page.clone(),
                 context_address: container,
                 page_index: 2,
                 bookmark_supported: true,
             },
+            RemoteWriteRequest::SetAdjustment {
+                address: page.clone(),
+                scope: RemoteAdjustmentScope::Page,
+                values: RemoteAdjustmentValues {
+                    brightness: 12.0,
+                    contrast: -4.0,
+                    gamma: 1.1,
+                    saturation: 5.0,
+                    temperature: 2.0,
+                    black_point: 3,
+                    white_point: 250,
+                    midtone: 0.9,
+                    auto_mode: Some(RemoteAutoMode::Auto),
+                },
+            },
+            RemoteWriteRequest::GetAdjustmentState { address: page },
         ];
         for request in requests {
             let encoded = serde_json::to_vec(&request).unwrap();
@@ -1576,6 +1690,45 @@ mod tests {
         let encoded = serde_json::to_vec(&response).unwrap();
         let decoded: RemoteWriteResponse = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, response);
+
+        let adjustment = RemoteWriteResponse::Success(RemoteWriteResult::adjustment_state(
+            RemoteAdjustmentState {
+                effective_values: RemoteAdjustmentValues {
+                    brightness: 1.0,
+                    contrast: 2.0,
+                    gamma: 1.0,
+                    saturation: 0.0,
+                    temperature: 0.0,
+                    black_point: 0,
+                    white_point: 255,
+                    midtone: 1.0,
+                    auto_mode: None,
+                },
+                standard_values: RemoteAdjustmentValues {
+                    brightness: 0.0,
+                    contrast: 0.0,
+                    gamma: 1.0,
+                    saturation: 0.0,
+                    temperature: 0.0,
+                    black_point: 0,
+                    white_point: 255,
+                    midtone: 1.0,
+                    auto_mode: None,
+                },
+                selected_scope: RemoteAdjustmentScope::Page,
+                has_page_override: true,
+                standard_label: "標準（共通）".to_owned(),
+                standard_available: true,
+                read_only: RemoteAdjustmentReadOnlyState {
+                    colorize_enabled: false,
+                    upscale_label: "なし".to_owned(),
+                    denoise_label: "なし".to_owned(),
+                },
+            },
+        ));
+        let encoded = serde_json::to_vec(&adjustment).unwrap();
+        let decoded: RemoteWriteResponse = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, adjustment);
     }
 
     #[test]

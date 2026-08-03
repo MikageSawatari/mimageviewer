@@ -1046,6 +1046,8 @@ fn operation_description(message: &ClientMessage) -> String {
             RemoteWriteRequest::SetRating { .. } => "レーティングを書き込み中",
             RemoteWriteRequest::SetBookmark { .. } => "ブックマークを書き込み中",
             RemoteWriteRequest::GetItemState { .. } => "ページ情報を確認中",
+            RemoteWriteRequest::SetAdjustment { .. } => "画像補正を書き込み中",
+            RemoteWriteRequest::GetAdjustmentState { .. } => "画像補正を確認中",
         }
         .to_owned(),
         ClientMessage::VideoStreamStart { .. } => "動画ストリーミングを開始中".to_owned(),

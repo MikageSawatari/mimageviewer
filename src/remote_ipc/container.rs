@@ -49,6 +49,7 @@ enum AdjustmentSettingsSource {
 struct RemoteAdjustmentIdentity {
     page_key: String,
     location_path: PathBuf,
+    compiled_book: bool,
 }
 
 struct RemotePreparedComposite {
@@ -488,11 +489,16 @@ impl ContainerEngine {
         mtime: i64,
         file_size: i64,
         target_px: u32,
+        preview: Option<&mimageviewer_ipc::RemoteAdjustmentPreview>,
         context: &WorkerContext,
     ) -> Result<Option<RemotePreparedComposite>, MediaError> {
-        let Some(identity) = remote_adjustment_identity(address, logical_path) else {
+        let Some(mut identity) = remote_adjustment_identity(address, logical_path) else {
             return Ok(None);
         };
+        identity.compiled_book = matches!(address.subresource, RemoteSubresource::File)
+            && logical_path.parent().is_some_and(|parent| {
+                crate::books::is_direct_book_folder(&self.settings.books_root_path(), parent)
+            });
         let settings = self.adjustment_render_settings()?;
         let edits = self.prepare_remote_edits(&identity.page_key, &settings, context)?;
         // `WorkerContext` は worker 起動時に 1 度だけ DB を開く。その 1 回が失敗した状態を
@@ -517,20 +523,34 @@ impl ContainerEngine {
         let page = adjustment_db
             .get_page_params_checked(&identity.page_key)
             .map_err(|error| remote_adjustment_read_error("page", error))?;
-        let favorite_params = if page.is_none() {
+        let favorite_params = if page.is_none()
+            || preview.is_some_and(|preview| {
+                preview.scope == mimageviewer_ipc::RemoteAdjustmentScope::Standard
+            }) {
             adjustment_db
                 .load_all_favorite_params_checked()
                 .map_err(|error| remote_adjustment_read_error("location", error))?
         } else {
             HashMap::new()
         };
-        let params = resolve_remote_effective_params(
+        let selected_page = if preview.is_some_and(|preview| {
+            preview.scope == mimageviewer_ipc::RemoteAdjustmentScope::Standard
+        }) {
+            None
+        } else {
+            page.as_ref()
+        };
+        let mut params = resolve_remote_effective_params(
             &identity,
-            page.as_ref(),
+            selected_page,
             &settings.favorites,
             &favorite_params,
             &settings.global_preset,
         );
+        if let Some(preview) = preview {
+            params = super::apply_remote_adjustment_values(params, &preview.values)
+                .map_err(|message| media_error(MediaErrorCode::BadRequest, message))?;
+        }
         let lut_entry = params.creative_lut.id.and_then(|id| {
             settings
                 .creative_luts
@@ -785,6 +805,20 @@ impl ContainerEngine {
                 *page_index = validated.page_index;
                 *bookmark_supported = validated.bookmark_supported;
                 Ok(())
+            }
+            RemoteWriteRequest::SetAdjustment {
+                address, values, ..
+            } => {
+                self.validate_rating_page(address)?;
+                super::apply_remote_adjustment_values(
+                    crate::adjustment::AdjustParams::default(),
+                    values,
+                )
+                .map(|_| ())
+                .map_err(|message| RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, message))
+            }
+            RemoteWriteRequest::GetAdjustmentState { address } => {
+                self.validate_rating_page(address)
             }
         }
     }
@@ -1168,6 +1202,7 @@ impl ContainerEngine {
             false,
             context,
             None,
+            None,
         ) {
             Ok(loaded) => crate::catalog::encode_thumb_webp(
                 &loaded.image,
@@ -1204,6 +1239,14 @@ impl ContainerEngine {
                 "画像サイズが範囲外です",
             ));
         }
+        if let Some(preview) = request.adjustment_preview.as_ref()
+            && let Err(message) = super::apply_remote_adjustment_values(
+                crate::adjustment::AdjustParams::default(),
+                &preview.values,
+            )
+        {
+            return PageResponse::Error(media_error(MediaErrorCode::BadRequest, message));
+        }
         let resolved = match self.resolve(&request.address) {
             Ok(resolved) => resolved,
             Err(error) => return PageResponse::Error(error),
@@ -1217,6 +1260,7 @@ impl ContainerEngine {
             priority == PagePriority::Foreground,
             context,
             Some(&cancel),
+            request.adjustment_preview.as_ref(),
         ) {
             Ok(loaded) => match crate::catalog::encode_thumb_webp(
                 &loaded.image,
@@ -1708,6 +1752,7 @@ impl ContainerEngine {
         foreground: bool,
         context: &WorkerContext,
         external_cancel: Option<&Arc<AtomicBool>>,
+        adjustment_preview: Option<&mimageviewer_ipc::RemoteAdjustmentPreview>,
     ) -> Result<LoadedImage, MediaError> {
         if target_px == 0 || target_px > MAX_PAGE_RENDER_PX {
             return Err(media_error(
@@ -1800,6 +1845,7 @@ impl ContainerEngine {
                 mtime,
                 file_size,
                 target_px,
+                adjustment_preview,
                 context,
             )?
         } else {
@@ -2178,15 +2224,18 @@ fn remote_adjustment_identity(
             Some(RemoteAdjustmentIdentity {
                 page_key,
                 location_path,
+                compiled_book: false,
             })
         }
         RemoteSubresource::ZipEntry { .. } => Some(RemoteAdjustmentIdentity {
             page_key,
             location_path: logical_path.to_path_buf(),
+            compiled_book: false,
         }),
         RemoteSubresource::PdfPage { .. } => Some(RemoteAdjustmentIdentity {
             page_key,
             location_path: logical_path.to_path_buf(),
+            compiled_book: false,
         }),
         RemoteSubresource::ZipDirectory { .. } => None,
     }
@@ -2199,6 +2248,9 @@ fn resolve_remote_effective_params(
     favorite_params: &HashMap<uuid::Uuid, crate::adjustment::AdjustParams>,
     global: &crate::adjustment::AdjustParams,
 ) -> crate::adjustment::AdjustParams {
+    if identity.compiled_book {
+        return page.cloned().unwrap_or_default();
+    }
     crate::final_composite::resolve_effective_params(
         page,
         || {
@@ -2688,6 +2740,26 @@ mod tests {
         let mut edited_key = base_key;
         edited_key.edit_fingerprint[0] = 1;
         assert!(cache.get(&edited_key).is_none());
+    }
+
+    #[test]
+    fn compiled_book_remote_adjustment_uses_identity_until_a_page_override_exists() {
+        let identity = RemoteAdjustmentIdentity {
+            page_key: "compiled-page".to_owned(),
+            location_path: PathBuf::from("C:/books/compiled"),
+            compiled_book: true,
+        };
+        let mut global = crate::adjustment::AdjustParams::default();
+        global.brightness = 45.0;
+        let resolved =
+            resolve_remote_effective_params(&identity, None, &[], &HashMap::new(), &global);
+        assert_eq!(resolved, crate::adjustment::AdjustParams::default());
+
+        let mut page = crate::adjustment::AdjustParams::default();
+        page.brightness = 18.0;
+        let resolved =
+            resolve_remote_effective_params(&identity, Some(&page), &[], &HashMap::new(), &global);
+        assert_eq!(resolved, page);
     }
 
     #[test]

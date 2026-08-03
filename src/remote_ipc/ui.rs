@@ -1,7 +1,8 @@
 use mimageviewer_ipc::{
-    RemoteItemState, RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource,
-    RemoteWebFeatureStatus, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest,
-    RemoteWriteResponse, RemoteWriteResult, SessionConnectionKind, SessionResponse, SessionStatus,
+    RemoteAdjustmentReadOnlyState, RemoteAdjustmentScope, RemoteAdjustmentState, RemoteItemState,
+    RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource, RemoteWebFeatureStatus,
+    RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse,
+    RemoteWriteResult, SessionConnectionKind, SessionResponse, SessionStatus,
     VideoStreamControlAction, VideoStreamEndBehavior, VideoStreamError, VideoStreamErrorCode,
 };
 use qrcode::{Color, QrCode};
@@ -267,7 +268,7 @@ impl crate::app::App {
         // the first video start can both arrive before the next UI frame; cancelling after the
         // drain would incorrectly reject that new owner's freshly opened stream.
         if let Some(handle) = handle.as_ref() {
-            self.apply_pending_remote_ui_requests(handle);
+            self.apply_pending_remote_ui_requests(handle, ctx);
         }
         self.poll_remote_fullscreen_restore();
         if matches!(
@@ -861,10 +862,12 @@ impl crate::app::App {
         streaming.session.change_quality(quality, position_secs)
     }
 
-    fn apply_pending_remote_ui_requests(&mut self, handle: &SessionHandle) {
+    fn apply_pending_remote_ui_requests(&mut self, handle: &SessionHandle, ctx: &egui::Context) {
         for pending in handle.take_pending_ui_requests() {
             match pending {
-                ClaimedRemoteUiRequest::Write(pending) => self.apply_pending_remote_write(pending),
+                ClaimedRemoteUiRequest::Write(pending) => {
+                    self.apply_pending_remote_write(pending, ctx)
+                }
                 ClaimedRemoteUiRequest::BookResumeRead(pending) => {
                     let latest = self.last_book_resume.as_ref().and_then(|(path, page)| {
                         (crate::path_key::normalize(path)
@@ -1157,7 +1160,7 @@ impl crate::app::App {
         VideoStreamUiOutcome::Stopped
     }
 
-    fn apply_pending_remote_write(&mut self, pending: ClaimedRemoteWrite) {
+    fn apply_pending_remote_write(&mut self, pending: ClaimedRemoteWrite, ctx: &egui::Context) {
         let ownership = pending.ownership_response();
         if ownership.status != SessionStatus::Active {
             pending.complete(UiWriteOutcome::Session(ownership));
@@ -1172,6 +1175,7 @@ impl crate::app::App {
         }
         let response = self.apply_remote_write(pending.request());
         pending.complete(UiWriteOutcome::Write(response));
+        ctx.request_repaint();
     }
 
     fn apply_remote_write(&mut self, request: &RemoteWriteRequest) -> RemoteWriteResponse {
@@ -1200,6 +1204,14 @@ impl crate::app::App {
             ),
             RemoteWriteRequest::SetRating { address, stars } => {
                 self.persist_remote_rating(address, *stars)
+            }
+            RemoteWriteRequest::SetAdjustment {
+                address,
+                scope,
+                values,
+            } => self.persist_remote_adjustment(address, *scope, values),
+            RemoteWriteRequest::GetAdjustmentState { address } => {
+                self.remote_adjustment_state(address)
             }
             RemoteWriteRequest::SetBookmark { .. } | RemoteWriteRequest::GetItemState { .. } => {
                 write_error(
@@ -1443,6 +1455,123 @@ impl crate::app::App {
             }
         }
         RemoteWriteResponse::Success(RemoteWriteResult::applied())
+    }
+
+    fn remote_adjustment_state(
+        &self,
+        address: &mimageviewer_ipc::RemoteAddress,
+    ) -> RemoteWriteResponse {
+        let target = match remote_adjustment_target(&self.settings, address) {
+            Ok(target) => target,
+            Err(error) => return RemoteWriteResponse::Error(error),
+        };
+        if self.adjustment_db.is_none() {
+            return write_error(
+                RemoteWriteErrorCode::PersistenceFailed,
+                "画像補正 DB を利用できません",
+            );
+        }
+        RemoteWriteResponse::Success(RemoteWriteResult::adjustment_state(
+            self.remote_adjustment_state_for_target(&target),
+        ))
+    }
+
+    fn remote_adjustment_state_for_target(
+        &self,
+        target: &crate::app::PageAdjustmentTarget,
+    ) -> RemoteAdjustmentState {
+        let page = self.stored_page_params_for_target(target);
+        let standard = self.adjustment_standard_params_for_target(target);
+        let effective = page.clone().unwrap_or_else(|| standard.clone());
+        let denoise_label = effective
+            .denoise_model
+            .as_deref()
+            .and_then(crate::ai::ModelKind::from_str)
+            .map(|model| model.display_label())
+            .unwrap_or(if effective.denoise_model.is_some() {
+                "不明"
+            } else {
+                "なし"
+            })
+            .to_string();
+        RemoteAdjustmentState {
+            effective_values: super::remote_adjustment_values(&effective),
+            standard_values: super::remote_adjustment_values(&standard),
+            selected_scope: if target.compiled_book || page.is_some() {
+                RemoteAdjustmentScope::Page
+            } else {
+                RemoteAdjustmentScope::Standard
+            },
+            has_page_override: page.is_some(),
+            standard_label: self.adjustment_standard_label_for_target(target),
+            standard_available: !target.compiled_book,
+            read_only: RemoteAdjustmentReadOnlyState {
+                colorize_enabled: effective.colorize.is_enabled(),
+                upscale_label: crate::adjustment::upscale_model_label(
+                    effective.upscale_model.as_deref(),
+                )
+                .to_string(),
+                denoise_label,
+            },
+        }
+    }
+
+    fn persist_remote_adjustment(
+        &mut self,
+        address: &mimageviewer_ipc::RemoteAddress,
+        scope: RemoteAdjustmentScope,
+        values: &mimageviewer_ipc::RemoteAdjustmentValues,
+    ) -> RemoteWriteResponse {
+        let target = match remote_adjustment_target(&self.settings, address) {
+            Ok(target) => target,
+            Err(error) => return RemoteWriteResponse::Error(error),
+        };
+        if self.adjustment_db.is_none() {
+            return write_error(
+                RemoteWriteErrorCode::PersistenceFailed,
+                "画像補正 DB を利用できません",
+            );
+        }
+        if scope == RemoteAdjustmentScope::Standard && target.compiled_book {
+            return write_error(
+                RemoteWriteErrorCode::Unsupported,
+                "製本ページの標準は無補正固定です",
+            );
+        }
+        let base = match scope {
+            RemoteAdjustmentScope::Page => self.effective_params_for_target(&target),
+            RemoteAdjustmentScope::Standard => self.adjustment_standard_params_for_target(&target),
+        };
+        let params = match super::apply_remote_adjustment_values(base, values) {
+            Ok(params) => params,
+            Err(message) => return write_error(RemoteWriteErrorCode::BadRequest, message),
+        };
+        let undo_target = target.clone();
+        self.capture_adjust_full_for_target(
+            undo_target,
+            "リモート画像補正".to_string(),
+            |app| match scope {
+                RemoteAdjustmentScope::Page => {
+                    app.restore_page_params_for_target(&target, Some(params));
+                }
+                RemoteAdjustmentScope::Standard => {
+                    match app.adjustment_standard_scope_for_target(&target) {
+                        crate::app::AdjustmentStandardScope::Favorite(id) => {
+                            app.set_favorite_default(id, params)
+                        }
+                        crate::app::AdjustmentStandardScope::Global => {
+                            app.copy_params_to_global(params)
+                        }
+                    }
+                    if app.stored_page_params_for_target(&target).is_some() {
+                        app.restore_page_params_for_target(&target, None);
+                    }
+                }
+            },
+        );
+        RemoteWriteResponse::Success(RemoteWriteResult::adjustment_state(
+            self.remote_adjustment_state_for_target(&target),
+        ))
     }
 
     pub(crate) fn finish_remote_bookmark_event(
@@ -1811,6 +1940,88 @@ struct RemoteRatingTarget {
     key: String,
     meta: crate::rating_db::RatingMeta,
     xmp_target: Option<std::path::PathBuf>,
+}
+
+fn remote_adjustment_target(
+    settings: &crate::settings::Settings,
+    address: &mimageviewer_ipc::RemoteAddress,
+) -> Result<crate::app::PageAdjustmentTarget, RemoteWriteError> {
+    let logical = remote_logical_path(settings, address)?;
+    let page_key = crate::edit_source::page_key_for_remote(&logical, &address.subresource)
+        .ok_or_else(|| {
+            RemoteWriteError::new(
+                RemoteWriteErrorCode::Unsupported,
+                "この項目は画像補正の対象ではありません",
+            )
+        })?;
+    let compiled_book = matches!(address.subresource, RemoteSubresource::File)
+        && logical.parent().is_some_and(|parent| {
+            crate::books::is_direct_book_folder(&settings.books_root_path(), parent)
+        });
+    let location_path = if compiled_book {
+        None
+    } else {
+        match &address.subresource {
+            RemoteSubresource::File => logical.parent().map(std::path::Path::to_path_buf),
+            RemoteSubresource::ZipEntry { .. } | RemoteSubresource::PdfPage { .. } => {
+                Some(logical.clone())
+            }
+            RemoteSubresource::ZipDirectory { .. } => None,
+        }
+    };
+    let sidecar_coords = if compiled_book {
+        None
+    } else {
+        let folder = logical
+            .parent()
+            .ok_or_else(|| {
+                RemoteWriteError::new(
+                    RemoteWriteErrorCode::BadRequest,
+                    "補正 sidecar の親フォルダを解決できません",
+                )
+            })?
+            .to_path_buf();
+        let container_name = logical
+            .file_name()
+            .ok_or_else(|| {
+                RemoteWriteError::new(
+                    RemoteWriteErrorCode::BadRequest,
+                    "補正 sidecar の項目名を解決できません",
+                )
+            })?
+            .to_string_lossy()
+            .to_lowercase();
+        let rel_key = match &address.subresource {
+            RemoteSubresource::File => {
+                crate::sidecar::real_file_rel_key(&logical).ok_or_else(|| {
+                    RemoteWriteError::new(
+                        RemoteWriteErrorCode::BadRequest,
+                        "補正 sidecar の項目名を解決できません",
+                    )
+                })?
+            }
+            RemoteSubresource::ZipEntry { entry_name } => {
+                format!("{container_name}::{}", entry_name.to_lowercase())
+            }
+            RemoteSubresource::PdfPage { page_number } => {
+                format!("{container_name}::page_{page_number}")
+            }
+            RemoteSubresource::ZipDirectory { .. } => {
+                return Err(RemoteWriteError::new(
+                    RemoteWriteErrorCode::Unsupported,
+                    "ZIP 内フォルダは画像補正の対象ではありません",
+                ));
+            }
+        };
+        Some((folder, rel_key))
+    };
+    Ok(crate::app::PageAdjustmentTarget {
+        page_key,
+        location_path,
+        sidecar_coords,
+        compiled_book,
+        idx_hint: None,
+    })
 }
 
 fn remote_rating_target(

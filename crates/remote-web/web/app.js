@@ -5,6 +5,7 @@ import {
   SpreadMode,
   ViewerGesture,
   ViewerPanelAction,
+  adjustmentResetVisible,
   command,
   commandFromKey,
   containerPageTargetPx,
@@ -23,6 +24,9 @@ import {
   planSpreadIntent,
   reduceViewerTransform,
   readingProgressBatchTransition,
+  rangeValueFromNormalized,
+  rangeValueToNormalized,
+  relativeRangeDragValue,
   appUpdateNotice,
   resolveGridReturnViewport,
   sessionOwnerBadge,
@@ -127,6 +131,45 @@ class RequestLimiter {
           this.active -= 1;
           this.drain();
         });
+    }
+  }
+}
+
+/// 進行中を中断せず、待機中は最後の 1 件だけを残す直列キュー。
+/// 補正プレビューが UI 入力の回数だけ IPC を詰まらせないために使う。
+export class LatestOnlyTaskQueue {
+  constructor(run, onError = () => {}) {
+    this.run = run;
+    this.onError = onError;
+    this.running = false;
+    this.latest = null;
+  }
+
+  enqueue(value) {
+    this.latest = value;
+    if (!this.running) this.pump();
+  }
+
+  clear() {
+    this.latest = null;
+  }
+
+  async pump() {
+    if (this.running) return;
+    this.running = true;
+    try {
+      while (this.latest !== null) {
+        const value = this.latest;
+        this.latest = null;
+        try {
+          await this.run(value);
+        } catch (error) {
+          if (error?.name !== "AbortError") this.onError(error);
+        }
+      }
+    } finally {
+      this.running = false;
+      if (this.latest !== null) this.pump();
     }
   }
 }
@@ -344,6 +387,7 @@ const state = {
   remoteSessionTimer: 0,
   viewerItemState: null,
   viewerItemStateSequence: 0,
+  pageRenderRevision: 0,
   gridViewerReturn: null,
   appAssetToken: "",
   appUpdateDismissedToken: null,
@@ -517,7 +561,9 @@ function showAppUpdateBanner(servedToken) {
   if (state.appUpdateBanner) return;
   const banner = element("div", "app-update-banner");
   banner.setAttribute("role", "status");
-  banner.append(textElement("span", "新しい版が配信されています。"));
+  // 375px 幅で本文・ボタンが 1 行に収まる長さにしている。これより長くすると
+  // 本文が折り返し、末尾数文字だけが 2 行目に残る (実測: 14 文字で 2 行)。
+  banner.append(textElement("span", "新しい版があります"));
   const reload = textElement("button", "再読み込み", "app-update-banner-reload");
   reload.addEventListener("click", () => reloadApplication());
   const dismiss = textElement("button", "後で", "app-update-banner-dismiss");
@@ -3145,6 +3191,7 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
     interactionStartedAt,
   });
   if (!displayed || state.viewer !== viewer) return;
+  state.commandMenu?.refreshAdjustment();
   observeReadingProgress();
   if (group.entries.every((entry) => entry.address)) {
     schedulePagePrefetch(viewer).catch(() => {});
@@ -3208,7 +3255,18 @@ async function schedulePagePrefetch(viewer) {
   pageResourceCache.schedule(requests.filter(Boolean));
 }
 
-function imageRequest(entry, info, stage, { prefetch = false, layout = null } = {}) {
+function imageRequest(
+  entry,
+  info,
+  stage,
+  {
+    prefetch = false,
+    layout = null,
+    targetPxOverride = null,
+    adjustmentPreview = null,
+    previewRevision = null,
+  } = {}
+) {
   const dpr = window.devicePixelRatio || 1;
   if (entry.address) {
     const resolvedLayout = layout ?? viewerImageLayout({
@@ -3220,7 +3278,7 @@ function imageRequest(entry, info, stage, { prefetch = false, layout = null } = 
         devicePixelRatio: dpr,
         maxRequestWidth: 8192,
       });
-    const targetPx = containerPageTargetPx({
+    const targetPx = targetPxOverride ?? containerPageTargetPx({
       requestWidth: resolvedLayout.requestWidth,
       sourceWidth: info.width,
       sourceHeight: info.height,
@@ -3234,9 +3292,15 @@ function imageRequest(entry, info, stage, { prefetch = false, layout = null } = 
         addressQueryParams(entry.address, {
           w: targetPx,
           ...(prefetch ? { prefetch: 1 } : {}),
+          rev: previewRevision ?? state.pageRenderRevision,
+          ...(adjustmentPreview
+            ? { adjustment_preview: JSON.stringify(adjustmentPreview) }
+            : {}),
         })
       ),
-      cacheKey: `${infoCacheKey}\n${targetPx}`,
+      cacheKey: adjustmentPreview
+        ? null
+        : `${infoCacheKey}\n${targetPx}\n${state.pageRenderRevision}`,
       width: targetPx,
       cssWidth: resolvedLayout.cssWidth,
       dpr,
@@ -4204,6 +4268,579 @@ function menuDefinition(context, page = "main") {
   };
 }
 
+const REMOTE_ADJUSTMENT_CONTROLS = Object.freeze([
+  ["brightness", "明るさ", -100, 100, 1, false],
+  ["contrast", "コントラスト", -100, 100, 1, false],
+  ["gamma", "ガンマ", 0.2, 5, 0.01, true],
+  ["saturation", "彩度", -100, 100, 1, false],
+  ["temperature", "色温度", -100, 100, 1, false],
+  ["black_point", "黒点", 0, 254, 1, false],
+  ["white_point", "白点", 1, 255, 1, false],
+  ["midtone", "中間点", 0.1, 10, 0.01, true],
+]);
+
+const DEFAULT_REMOTE_ADJUSTMENT_VALUES = Object.freeze({
+  brightness: 0,
+  contrast: 0,
+  gamma: 1,
+  saturation: 0,
+  temperature: 0,
+  black_point: 0,
+  white_point: 255,
+  midtone: 1,
+  auto_mode: null,
+});
+
+export function normalizeRemoteAdjustmentValues(values = {}) {
+  const source = { ...DEFAULT_REMOTE_ADJUSTMENT_VALUES, ...values };
+  return {
+    brightness: Number(source.brightness) || 0,
+    contrast: Number(source.contrast) || 0,
+    gamma: Number(source.gamma) || 1,
+    saturation: Number(source.saturation) || 0,
+    temperature: Number(source.temperature) || 0,
+    black_point: clamp(Math.round(Number(source.black_point) || 0), 0, 254),
+    white_point: clamp(Math.round(Number(source.white_point) || 0), 1, 255),
+    midtone: Number(source.midtone) || 1,
+    auto_mode: ["auto", "manga_cleanup"].includes(source.auto_mode)
+      ? source.auto_mode
+      : null,
+  };
+}
+
+class ViewerAdjustmentPanel {
+  constructor() {
+    this.root = element("div", "viewer-adjustment-panel");
+    this.targetIndex = 0;
+    this.groupIdentity = "";
+    this.scope = "standard";
+    this.values = normalizeRemoteAdjustmentValues();
+    this.serverState = null;
+    this.refreshSequence = 0;
+    this.previewEpoch = 0;
+    this.previewSequence = 0;
+    this.commitSequence = 0;
+    this.writeTail = Promise.resolve();
+    this.dirty = false;
+    this.disabled = false;
+    this.controls = new Map();
+    this.previewQueue = new LatestOnlyTaskQueue(
+      (job) => this.runPreview(job),
+      (error) => this.showError(error)
+    );
+    this.build();
+  }
+
+  build() {
+    this.targetRow = element("div", "adjustment-target-row");
+    this.targetRow.append(textElement("span", "対象", "adjustment-section-label"));
+    this.targetButtons = ["左", "右"].map((label, index) => {
+      const button = textElement("button", label, "adjustment-target-button");
+      button.type = "button";
+      button.addEventListener("click", () => {
+        if (this.targetIndex === index) return;
+        this.targetIndex = index;
+        this.syncTargetButtons();
+        this.refresh().catch((error) => this.showError(error));
+      });
+      this.targetRow.append(button);
+      return button;
+    });
+
+    this.scopeFieldset = element("fieldset", "adjustment-scope");
+    this.scopeFieldset.append(textElement("legend", "保存先"));
+    this.scopeInputs = new Map();
+    const scopeGroupName = `remote-adjustment-scope-${Math.random().toString(36).slice(2)}`;
+    for (const [scope, label] of [["standard", "標準"], ["page", "このページ"]]) {
+      const wrapper = element("label", "adjustment-scope-option");
+      const input = document.createElement("input");
+      input.type = "radio";
+      input.name = scopeGroupName;
+      input.value = scope;
+      input.addEventListener("change", () => {
+        if (!input.checked) return;
+        this.changeScope(scope).catch((error) => this.showError(error));
+      });
+      const text = textElement("span", label);
+      wrapper.append(input, text);
+      this.scopeFieldset.append(wrapper);
+      this.scopeInputs.set(scope, { input, text });
+    }
+
+    const autoRow = element("label", "adjustment-auto-row");
+    autoRow.append(textElement("span", "自動補正"));
+    this.autoSelect = document.createElement("select");
+    for (const [value, label] of [
+      ["", "なし"],
+      ["auto", "自動レベル"],
+      ["manga_cleanup", "モノクロ漫画補正"],
+    ]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      this.autoSelect.append(option);
+    }
+    this.autoSelect.addEventListener("change", () => {
+      this.values.auto_mode = this.autoSelect.value || null;
+      this.setDisabled(false);
+      this.commitCurrent().catch((error) => this.showError(error));
+    });
+    autoRow.append(this.autoSelect);
+
+    this.sliderList = element("div", "adjustment-slider-list");
+    const sliderGroupId = `remote-adjustment-${Math.random().toString(36).slice(2)}`;
+    for (const [key, label, min, max, step, logarithmic] of REMOTE_ADJUSTMENT_CONTROLS) {
+      const defaultValue = DEFAULT_REMOTE_ADJUSTMENT_VALUES[key];
+      const row = element("div", "adjustment-slider-row");
+      const heading = element("div", "adjustment-slider-heading");
+      const sliderLabel = textElement("label", label);
+      const output = textElement("output", "");
+      const headingActions = element("span", "adjustment-slider-heading-actions");
+      const resetSlot = element("span", "adjustment-slider-reset-slot");
+      const resetButton = textElement("button", "↩", "adjustment-slider-reset");
+      resetButton.type = "button";
+      resetButton.hidden = true;
+      resetButton.title = "デフォルトに戻す";
+      resetButton.setAttribute("aria-label", `${label}をデフォルトに戻す`);
+      resetButton.addEventListener("pointerdown", (event) => event.stopPropagation());
+      resetButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (resetButton.hidden || resetButton.disabled) return;
+        this.values[key] = defaultValue;
+        this.dirty = false;
+        this.syncControl(key);
+        this.commitCurrent().catch((error) => this.showError(error));
+      });
+      resetSlot.append(resetButton);
+      headingActions.append(output, resetSlot);
+      heading.append(sliderLabel, headingActions);
+      const input = document.createElement("input");
+      input.type = "range";
+      input.id = `${sliderGroupId}-${key}`;
+      sliderLabel.htmlFor = input.id;
+      // The native range owns focus, keyboard input and accessibility. Its value is the
+      // normalized handle position so logarithmic controls also paint in the right place.
+      input.min = "0";
+      input.max = "1";
+      input.step = "any";
+      input.setAttribute("aria-valuemin", String(min));
+      input.setAttribute("aria-valuemax", String(max));
+      let pointerDrag = null;
+      const applyValue = (raw) => {
+        if (!Number.isFinite(raw)) return false;
+        const value = rangeValueFromNormalized({
+          normalized: rangeValueToNormalized({
+            value: raw,
+            min,
+            max,
+            logarithmic,
+          }),
+          min,
+          max,
+          step,
+          logarithmic,
+        });
+        if (this.values[key] === value) return false;
+        this.values[key] = value;
+        this.dirty = true;
+        this.syncControl(key);
+        this.queuePreview();
+        return true;
+      };
+      const applyNormalizedPosition = (position) => {
+        const changed = applyValue(rangeValueFromNormalized({
+          normalized: position,
+          min,
+          max,
+          step,
+          logarithmic,
+        }));
+        // A sub-step native move must not leave the painted handle detached from the
+        // unchanged actual value.
+        if (!changed) this.syncControl(key);
+        return changed;
+      };
+      input.addEventListener("input", () => {
+        // A native range must remain the keyboard/ARIA owner, but native track dragging is
+        // suppressed while the relative pointer gesture owns this control.
+        if (pointerDrag) {
+          this.syncControl(key);
+          return;
+        }
+        applyNormalizedPosition(Number(input.value));
+      });
+      const finish = (event) => {
+        event.stopPropagation();
+        if (!this.dirty) return;
+        this.dirty = false;
+        this.commitCurrent().catch((error) => this.showError(error));
+      };
+      const keyboardKeys = new Set([
+        "ArrowLeft",
+        "ArrowDown",
+        "ArrowRight",
+        "ArrowUp",
+        "PageDown",
+        "PageUp",
+        "Home",
+        "End",
+      ]);
+      let keyboardAdjusting = false;
+      input.addEventListener("keydown", (event) => {
+        if (input.disabled || !keyboardKeys.has(event.key)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const current = Number(this.values[key]);
+        let next = current;
+        if (event.key === "Home") next = min;
+        else if (event.key === "End") next = max;
+        else if (event.key === "PageDown") next -= (max - min) / 10;
+        else if (event.key === "PageUp") next += (max - min) / 10;
+        else if (["ArrowLeft", "ArrowDown"].includes(event.key)) next -= step;
+        else next += step;
+        keyboardAdjusting = applyValue(next) || keyboardAdjusting;
+      });
+      input.addEventListener("keyup", (event) => {
+        if (!keyboardKeys.has(event.key)) return;
+        event.stopPropagation();
+        if (!keyboardAdjusting) return;
+        keyboardAdjusting = false;
+        finish(event);
+      });
+      input.addEventListener("blur", (event) => {
+        if (!keyboardAdjusting) return;
+        keyboardAdjusting = false;
+        finish(event);
+      });
+      input.addEventListener("pointerdown", (event) => {
+        event.stopPropagation();
+        if (input.disabled || event.isPrimary === false) return;
+        if (typeof event.button === "number" && event.button !== 0) return;
+        if (event.cancelable) event.preventDefault();
+        pointerDrag = {
+          pointerId: event.pointerId,
+          startClientX: event.clientX,
+          startValue: Number(this.values[key]),
+          trackWidth: input.getBoundingClientRect().width,
+        };
+        input.focus({ preventScroll: true });
+        try {
+          input.setPointerCapture(event.pointerId);
+        } catch (_error) {
+          // Pointer capture can fail when the browser has already cancelled the pointer.
+        }
+      });
+      input.addEventListener("pointermove", (event) => {
+        if (!pointerDrag || pointerDrag.pointerId !== event.pointerId) return;
+        event.stopPropagation();
+        if (event.cancelable) event.preventDefault();
+        applyValue(relativeRangeDragValue({
+          startValue: pointerDrag.startValue,
+          startClientX: pointerDrag.startClientX,
+          currentClientX: event.clientX,
+          trackWidth: pointerDrag.trackWidth,
+          min,
+          max,
+          step,
+          logarithmic,
+        }));
+      });
+      const finishPointer = (event) => {
+        if (pointerDrag && pointerDrag.pointerId !== event.pointerId) {
+          event.stopPropagation();
+          return;
+        }
+        if (pointerDrag) {
+          if (event.cancelable) event.preventDefault();
+          try {
+            if (input.hasPointerCapture(event.pointerId)) {
+              input.releasePointerCapture(event.pointerId);
+            }
+          } catch (_error) {
+            // The browser may release capture before dispatching pointercancel.
+          }
+          pointerDrag = null;
+        }
+        finish(event);
+      };
+      input.addEventListener("pointerup", finishPointer);
+      input.addEventListener("pointercancel", finishPointer);
+      input.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      });
+      for (const eventName of ["touchend", "touchcancel", "change"]) {
+        input.addEventListener(eventName, finish);
+      }
+      row.append(heading, input);
+      this.sliderList.append(row);
+      this.controls.set(key, {
+        input,
+        output,
+        min,
+        max,
+        step,
+        logarithmic,
+        defaultValue,
+        resetButton,
+      });
+    }
+
+    this.readOnly = element("div", "adjustment-read-only");
+    this.resetButton = textElement("button", "即時補正をリセット", "adjustment-reset");
+    this.resetButton.type = "button";
+    this.resetButton.addEventListener("click", () => {
+      this.values = normalizeRemoteAdjustmentValues(DEFAULT_REMOTE_ADJUSTMENT_VALUES);
+      this.syncControls();
+      this.setDisabled(false);
+      this.commitCurrent().catch((error) => this.showError(error));
+    });
+    this.status = textElement("p", "", "adjustment-status");
+    this.root.append(
+      this.targetRow,
+      this.scopeFieldset,
+      autoRow,
+      this.sliderList,
+      this.readOnly,
+      this.resetButton,
+      this.status
+    );
+    this.syncControls();
+    this.setDisabled(false);
+  }
+
+  currentTarget() {
+    const group = currentPageGroup();
+    const entry = group?.entries[this.targetIndex];
+    const address = entry ? entryAddress(entry) : null;
+    if (!entry || !address?.favorite_id) return null;
+    return {
+      entry,
+      address,
+      pageIndex: this.targetIndex,
+      identity: `${state.pageGroupIndex}\n${addressIdentity(address)}`,
+    };
+  }
+
+  async refresh() {
+    const group = currentPageGroup();
+    const nextGroupIdentity = `${state.pageGroupIndex}\n${(group?.entries ?? [])
+      .map(entryIdentity)
+      .join("\n")}`;
+    if (this.groupIdentity !== nextGroupIdentity) {
+      this.groupIdentity = nextGroupIdentity;
+      this.targetIndex = 0;
+      this.previewEpoch += 1;
+      this.previewQueue.clear();
+    }
+    this.targetRow.hidden = (group?.entries.length ?? 0) !== 2;
+    this.syncTargetButtons();
+    const target = this.currentTarget();
+    if (!target) {
+      this.setDisabled(true);
+      this.status.textContent = "このページは画像補正の対象ではありません。";
+      return;
+    }
+    const sequence = ++this.refreshSequence;
+    this.setDisabled(true);
+    this.status.textContent = "現在値を読み込み中…";
+    const response = await apiPostJson("/api/write", {
+      kind: "get_adjustment_state",
+      address: target.address,
+    });
+    if (sequence !== this.refreshSequence || this.currentTarget()?.identity !== target.identity) {
+      return;
+    }
+    if (!response.adjustment_state) {
+      throw new Error("画像補正の現在値を取得できませんでした。");
+    }
+    this.applyServerState(response.adjustment_state);
+    this.setDisabled(false);
+    this.status.textContent = "スライダーを離すと保存します。";
+  }
+
+  applyServerState(adjustmentState) {
+    this.serverState = adjustmentState;
+    this.status.classList.remove("is-error");
+    this.scope = adjustmentState.selected_scope === "page" ? "page" : "standard";
+    this.values = normalizeRemoteAdjustmentValues(adjustmentState.effective_values);
+    const standard = this.scopeInputs.get("standard");
+    standard.text.textContent = adjustmentState.standard_label || "標準";
+    standard.input.disabled = !adjustmentState.standard_available;
+    this.scopeInputs.get(this.scope).input.checked = true;
+    const readOnly = adjustmentState.read_only ?? {};
+    this.readOnly.replaceChildren(
+      textElement("strong", "現在の後段処理"),
+      textElement("span", `カラー化: ${readOnly.colorize_enabled ? "ON" : "OFF"}`),
+      textElement("span", `AI アップスケール: ${readOnly.upscale_label || "なし"}`),
+      textElement("span", `AI デノイズ: ${readOnly.denoise_label || "なし"}`)
+    );
+    this.syncControls();
+    this.setDisabled(false);
+  }
+
+  async changeScope(scope) {
+    if (scope === this.scope) return;
+    const previousState = this.serverState;
+    this.scope = scope;
+    this.values = normalizeRemoteAdjustmentValues(
+      scope === "standard"
+        ? previousState?.standard_values
+        : previousState?.effective_values
+    );
+    this.syncControls();
+    this.setDisabled(false);
+    if (scope === "standard" && previousState?.has_page_override) {
+      await this.commitCurrent();
+    }
+  }
+
+  queuePreview() {
+    const target = this.currentTarget();
+    if (!target) return;
+    const epoch = this.previewEpoch;
+    this.previewQueue.enqueue({
+      ...target,
+      epoch,
+      sequence: ++this.previewSequence,
+      scope: this.scope,
+      values: normalizeRemoteAdjustmentValues(this.values),
+    });
+  }
+
+  async runPreview(job) {
+    if (job.epoch !== this.previewEpoch || this.currentTarget()?.identity !== job.identity) return;
+    const info = await imageInfo(job.entry);
+    if (job.epoch !== this.previewEpoch || this.currentTarget()?.identity !== job.identity) return;
+    const request = imageRequest(job.entry, info, state.viewer.stage, {
+      targetPxOverride: 768,
+      adjustmentPreview: { scope: job.scope, values: job.values },
+      previewRevision: `preview-${state.pageRenderRevision}-${job.sequence}`,
+    });
+    const response = await observedFetch(request.url, { credentials: "same-origin" });
+    if (!response.ok) {
+      const detail = await response.clone().json().catch(() => ({}));
+      throw new Error(detail.message || `補正プレビューに失敗しました (HTTP ${response.status})。`);
+    }
+    const blob = await response.blob();
+    if (
+      job.epoch !== this.previewEpoch ||
+      this.previewQueue.latest !== null ||
+      this.currentTarget()?.identity !== job.identity
+    ) {
+      return;
+    }
+    await state.viewer?.replacePageBlob(job.pageIndex, blob, job.entry.name);
+  }
+
+  commitCurrent() {
+    const target = this.currentTarget();
+    if (!target) return Promise.resolve();
+    this.previewEpoch += 1;
+    this.previewQueue.clear();
+    const commitId = ++this.commitSequence;
+    const request = {
+      kind: "set_adjustment",
+      address: target.address,
+      scope: this.scope,
+      values: normalizeRemoteAdjustmentValues(this.values),
+    };
+    this.status.textContent = "保存中…";
+    this.writeTail = this.writeTail.catch(() => {}).then(async () => {
+      const response = await apiPostJson("/api/write", request);
+      if (commitId !== this.commitSequence || this.currentTarget()?.identity !== target.identity) {
+        return;
+      }
+      if (!response.adjustment_state) {
+        throw new Error("画像補正の保存結果を取得できませんでした。");
+      }
+      this.applyServerState(response.adjustment_state);
+      state.pageRenderRevision += 1;
+      pageResourceCache.clear();
+      await updateViewerImage(performance.now());
+      if (commitId === this.commitSequence) this.status.textContent = "保存しました。";
+    }).catch((error) => {
+      if (commitId === this.commitSequence) this.showError(error);
+      throw error;
+    });
+    return this.writeTail;
+  }
+
+  syncControl(key) {
+    const control = this.controls.get(key);
+    if (!control) return;
+    const value = Number(this.values[key]);
+    control.input.value = String(rangeValueToNormalized({
+      value,
+      min: control.min,
+      max: control.max,
+      logarithmic: control.logarithmic,
+    }));
+    const valueText = control.step < 1
+      ? Number(this.values[key]).toFixed(2)
+      : String(Math.round(this.values[key]));
+    control.output.value = valueText;
+    control.input.setAttribute("aria-valuenow", String(value));
+    control.input.setAttribute("aria-valuetext", valueText);
+    this.syncResetButton(key);
+  }
+
+  syncResetButton(key) {
+    const control = this.controls.get(key);
+    if (!control) return;
+    const manualDisabled = this.disabled || this.values.auto_mode !== null;
+    control.resetButton.disabled = manualDisabled;
+    control.resetButton.hidden = !adjustmentResetVisible({
+      value: this.values[key],
+      defaultValue: control.defaultValue,
+      disabled: manualDisabled,
+      epsilon: control.step < 1 ? 0.001 : 0,
+    });
+  }
+
+  syncControls() {
+    for (const key of this.controls.keys()) this.syncControl(key);
+    this.autoSelect.value = this.values.auto_mode ?? "";
+    for (const [scope, value] of this.scopeInputs) value.input.checked = scope === this.scope;
+  }
+
+  syncTargetButtons() {
+    this.targetButtons.forEach((button, index) => {
+      const selected = index === this.targetIndex;
+      button.classList.toggle("is-selected", selected);
+      button.setAttribute("aria-pressed", selected ? "true" : "false");
+    });
+  }
+
+  setDisabled(disabled) {
+    this.disabled = disabled;
+    const manualDisabled = disabled || this.values.auto_mode !== null;
+    for (const [key, { input }] of this.controls) {
+      input.disabled = manualDisabled;
+      this.syncResetButton(key);
+    }
+    this.autoSelect.disabled = disabled;
+    this.resetButton.disabled = disabled;
+    for (const [scope, value] of this.scopeInputs) {
+      value.input.disabled = disabled || (scope === "standard" && this.serverState?.standard_available === false);
+    }
+  }
+
+  showError(error) {
+    this.status.textContent = error instanceof Error
+      ? error.message
+      : "画像補正を更新できませんでした。";
+    this.status.classList.add("is-error");
+  }
+
+  destroy() {
+    this.refreshSequence += 1;
+    this.previewEpoch += 1;
+    this.previewQueue.clear();
+  }
+}
+
 class CommandMenu {
   constructor(host, context, owner = host) {
     this.context = context;
@@ -4222,6 +4859,7 @@ class CommandMenu {
     this.ratingSummaryAction = null;
     this.keyboardElements = [];
     this.viewerTabButtons = new Map();
+    this.adjustmentPanel = null;
     const definition = menuDefinition(context, "main");
     this.root = element("div", "command-menu-layer");
     if (this.isViewerPanel) this.root.classList.add("viewer-command-menu-layer");
@@ -4394,7 +5032,13 @@ class CommandMenu {
     this.keyboardElements = [];
     this.actions.hidden = true;
     this.placeholder.hidden = false;
-    this.placeholder.replaceChildren(textElement("h3", tab.label));
+    if (tab.id === "adjustment") {
+      this.adjustmentPanel ??= new ViewerAdjustmentPanel();
+      this.placeholder.replaceChildren(this.adjustmentPanel.root);
+      this.adjustmentPanel.refresh().catch((error) => this.adjustmentPanel.showError(error));
+    } else {
+      this.placeholder.replaceChildren(textElement("h3", tab.label));
+    }
     for (const target of this.shortcutElements) target.hidden = true;
   }
 
@@ -4409,6 +5053,11 @@ class CommandMenu {
 
   isOpen() {
     return this.opened;
+  }
+
+  refreshAdjustment() {
+    if (!this.opened || state.viewerPanelTab !== "adjustment") return;
+    this.adjustmentPanel?.refresh().catch((error) => this.adjustmentPanel.showError(error));
   }
 
   toggle() {
@@ -4543,6 +5192,7 @@ class CommandMenu {
       this.root.removeEventListener("pointercancel", this.panelPointerCancel);
       this.root.removeEventListener("click", this.panelClickCapture, true);
       window.removeEventListener("resize", this.viewportResize);
+      this.adjustmentPanel?.destroy();
     }
     this.root.remove();
   }
@@ -5017,6 +5667,40 @@ export class ImageViewer {
       this.panY = 0;
     }
     this.applyTransform();
+    return true;
+  }
+
+  /// 補正プレビューだけを差し替える。表示レイアウトとズームは維持する。
+  async replacePageBlob(pageIndex, blob, alt = "画像補正プレビュー") {
+    const previous = this.images[pageIndex];
+    if (!previous || !(blob instanceof Blob)) return false;
+    const objectUrl = URL.createObjectURL(blob);
+    const image = element("img", "viewer-image");
+    image.alt = alt;
+    image.draggable = false;
+    image.dataset.telemetryObserved = "true";
+    image.style.cssText = previous.style.cssText;
+    for (const [key, value] of Object.entries(previous.dataset)) {
+      image.dataset[key] = value;
+    }
+    image.src = objectUrl;
+    try {
+      await image.decode();
+    } catch (error) {
+      URL.revokeObjectURL(objectUrl);
+      throw error;
+    }
+    if (this.images[pageIndex] !== previous) {
+      URL.revokeObjectURL(objectUrl);
+      return false;
+    }
+    const previousUrl = this.objectUrls[pageIndex];
+    previous.replaceWith(image);
+    this.images[pageIndex] = image;
+    this.image = this.images[0];
+    this.objectUrls[pageIndex] = objectUrl;
+    this.objectUrl = this.images.length === 1 ? objectUrl : null;
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
     return true;
   }
 

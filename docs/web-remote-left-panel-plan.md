@@ -1,6 +1,7 @@
 # mIV Remote 左パネル 設計メモ
 
-状態: **設計中 (未実装)**。親の正本は [web-remote-plan.md](web-remote-plan.md)。
+状態: **段 2a（静止画の即時画像補正）まで実装済み**。親の正本は
+[web-remote-plan.md](web-remote-plan.md)。
 関連: [display-pipeline.md](display-pipeline.md) / [preset-and-adjustment.md](preset-and-adjustment.md) /
 [adjustment-scope-selector-plan.md](adjustment-scope-selector-plan.md) /
 [fullscreen-side-panel-mode-plan.md](fullscreen-side-panel-mode-plan.md) /
@@ -72,7 +73,8 @@
 | **ポストフィルタ** | ✅ 段 1a で適用 |
 
 ここでの ✅ は「PC で永続化済みの補正を remote の Page 応答へ反映する」意味であり、
-remote から補正値を変更する UI はまだ段 2 / 3 の対象である。
+remote から即時補正値を変更する UI は段 2a で実装済み。カラー化 / AI の書き込み UI は
+段 3 の対象である。
 
 ### 3.1.1 ⚠ 編集結果が乗らないのは既存の不具合 (2026-08-03 判明)
 
@@ -201,13 +203,52 @@ PC 側の表示も変わる。これは「操作感を揃える」の必然的�
 | --- | --- | --- |
 | **0 ✅** | 段の順序とパラメータ解決を共有関数へ切り出す (§4.2) | これ自体は無変化。以降すべての土台 |
 | **1 ✅** | **1a 補正を共有関数に通す** / **1b 編集結果を materialize** | スマホで見る絵を PC と同じ段・値へ揃える |
-| **2 (器 ✅ / 操作は次回)** | 静止画の向き対応パネル UI とタブ。画像補正・表示トリム・ブックマークの実操作は後続 | 実機で向きと操作感を先に検証できる |
+| **2a ✅** | 静止画の向き対応パネル UI と、画像補正の即時階層（スコープ、色調 8 項目、自動補正、リセット） | 絵を見ながら本体と同じ値・保存先を操作できる |
+| **2b** | 表示トリム、ブックマーク、画像補正の残る軽量操作 | 静止画パネルの軽量操作を完成させる |
 | **3** | **カラー化 / AI** をリモートから起動できるようにする | **利用者が最重要と挙げた 2 つ** |
 | **4** | 動画のジャンプタブ | 既存データを読むだけなので軽い |
 | **5** | 動画の補正 (エンコーダ入力への grade 段) | 重い。単独で判断する |
 
-段 1 の合成経路を土台として、段 2 以降の UI / 操作を接続する。段 2 の器だけの回では
-実操作をまだ接続しない。
+段 1 の合成経路を土台として、段 2 以降の UI / 操作を接続する。
+
+### 7.1 段 2a 実装結果 (2026-08-03)
+
+`RemoteWriteRequest`（protocol v22）へ補正の現在値取得と確定書き込みを追加した。Web は
+`adjustment.db` を直接開かず、本体 UI thread 上で既存の page / favorite / global writer と
+キャッシュ無効化を通る。即時値だけを wire 型に出し、カラー化、AI、post-filter、LUT、
+smart sharpen は完全な `AdjustParams` の base に残したまま上書きする。
+
+ページ個別 writer は `PageAdjustmentTarget`（page key、標準解決用 location、sidecar 座標、
+製本判定）を正本にした。従来の `set_page_params(idx, ...)` はこの target を作る薄い入口で、
+idx は mounted map / texture / generation の反映対象を探す用途だけに残る。remote のページが
+現在の `items` に無くても DB と sidecar へ保存でき、mount 済みなら同じ key の idx に
+`clear_caches_for_param_change` まで反映する。key target 自体を持つ Undo scope も追加し、
+remote のドラッグ確定 1 回を Ctrl+Z の 1 件として戻せる。
+
+標準スコープへの切替はデスクトップと同じく対象ページの個別設定を解除する。以降の変更は、
+現在地に ON のお気に入り標準があればそこへ、なければ global へ書く。見開きは remote の
+`PageGroup.pages` が物理的な画面左→右の順である契約を使い、2 ページ時だけ「左 / 右」を出す。
+読書方向の anchor を補正対象には流用しない。
+
+既存 Page API は `target_px` をすでに持ち 1px 以上の任意の低解像度を要求できた。
+`PagePriority` は Foreground / Prefetch の scheduling だけで画質指定ではなかったため、新しい
+画質 enum は作らず、未確定の即時値を `PageRequest.adjustment_preview` として最小追加した。
+Web はドラッグ中 768px を要求し、同じ `FinalCompositePlan` / executor を通す。実行中は常に
+1 本、待機値は最新 1 件へ coalesce し、`pointerup` / `pointercancel` / `touchend` /
+`touchcancel` で 1 回だけ確定する。確定後は URL revision を進めて通常解像度を再取得する。
+
+iOS の native range はトラック押下をドラッグとして扱わないため、range 自体を位置・ARIA・
+キーボード操作の正本に残したまま pointer capture で相対ドラッグを所有する。押下時には値を
+変えず、以後の横移動 1 トラック幅を正規化位置 0〜1 全体へ写像して step に丸める。ガンマと
+中間点は egui 0.33 と同じ正の対数写像（log-space の線形補間）で位置と実値を往復し、range の
+つまみも既定値 1.0 で中央に置く。移動が無ければプレビューも確定も発生させない。各スライダーの
+`↩` は本体と同じ既定値・自動補正中の非表示・
+ガンマ / 中間点の 0.001 許容を使い、非表示時も固定 slot を残して行レイアウトを動かさない。
+個別リセットは共通リセットと同じ確定 writer へ即時に流す。
+
+段 1a の説明にあった「remote は常に page → location → global」とする記述には例外の記載漏れが
+あった。本体の製本フォルダ直下ページは page override が無ければ favorite / global ではなく
+**無補正固定**である。remote resolver もこの規則へ合わせ、製本ページでは標準スコープを無効化した。
 
 **段 4 (動画ジャンプ) は段 0〜3 と独立**なので、先に入れることもできる。
 既存の `video_bookmarks` / `video_chapter_thumbs` を読んで返すだけで、
