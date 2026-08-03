@@ -7,6 +7,8 @@ import {
   ReadingDirection,
   SpreadMode,
   ViewerGesture,
+  ViewerPanelAction,
+  ViewerPanelOrientation,
   VIDEO_QUALITY_PRESETS,
   bufferingQualitySuggestion,
   clampGridColumnOverride,
@@ -47,6 +49,9 @@ import {
   viewerImageLayout,
   viewerBoundaryMessage,
   viewerGestureDecision,
+  viewerPanelGestureAction,
+  viewerPanelLayout,
+  viewerPanelTransition,
   viewerVerticalScrollDecision,
   viewerSeekGroupIndex,
   viewerSeekState,
@@ -831,6 +836,141 @@ test("viewer gesture separates vertical and horizontal swipes", () => {
   );
   assert.equal(
     viewerGestureDecision({ dx: 60, dy: 50, elapsedMs: 180 }),
+    null
+  );
+});
+
+test("viewer panel dimensions follow portrait bottom-half and landscape left-40-percent rules", () => {
+  assert.deepEqual(
+    viewerPanelLayout({ viewportWidth: 390, viewportHeight: 844 }),
+    {
+      orientation: ViewerPanelOrientation.PORTRAIT,
+      panel: { x: 0, y: 422, width: 390, height: 422 },
+      image: { x: 0, y: 0, width: 390, height: 422 },
+    }
+  );
+  assert.deepEqual(
+    viewerPanelLayout({ viewportWidth: 844, viewportHeight: 390 }),
+    {
+      orientation: ViewerPanelOrientation.LANDSCAPE,
+      panel: { x: 0, y: 0, width: 337.6, height: 390 },
+      image: { x: 337.6, y: 0, width: 506.4, height: 390 },
+    }
+  );
+});
+
+test("viewer panel open and close transitions request image refits", () => {
+  const closed = viewerPanelTransition(null, {
+    action: ViewerPanelAction.CLOSE,
+    viewportWidth: 390,
+    viewportHeight: 844,
+  });
+  assert.equal(closed.shouldRefit, false);
+  assert.deepEqual(closed.layout.image, { x: 0, y: 0, width: 390, height: 844 });
+
+  const opened = viewerPanelTransition(closed, {
+    action: ViewerPanelAction.OPEN,
+    viewportWidth: 390,
+    viewportHeight: 844,
+  });
+  assert.equal(opened.shouldRefit, true);
+  assert.equal(opened.resetTransform, true);
+  assert.deepEqual(opened.layout.image, { x: 0, y: 0, width: 390, height: 422 });
+
+  const closedAgain = viewerPanelTransition(opened, {
+    action: ViewerPanelAction.CLOSE,
+    viewportWidth: 390,
+    viewportHeight: 844,
+  });
+  assert.equal(closedAgain.shouldRefit, true);
+  assert.deepEqual(closedAgain.layout.image, { x: 0, y: 0, width: 390, height: 844 });
+});
+
+test("an open viewer panel changes side and refits when orientation changes", () => {
+  const portrait = viewerPanelTransition(null, {
+    action: ViewerPanelAction.OPEN,
+    viewportWidth: 390,
+    viewportHeight: 844,
+  });
+  const landscape = viewerPanelTransition(portrait, {
+    action: "resize",
+    viewportWidth: 844,
+    viewportHeight: 390,
+  });
+  assert.equal(landscape.open, true);
+  assert.equal(landscape.orientation, ViewerPanelOrientation.LANDSCAPE);
+  assert.equal(landscape.shouldRefit, true);
+  assert.deepEqual(landscape.layout.image, {
+    x: 337.6,
+    y: 0,
+    width: 506.4,
+    height: 390,
+  });
+});
+
+test("viewer panel swipe uses the existing gesture arbitration without stealing taps, paging, or pan", () => {
+  const swipeUp = viewerGestureDecision({ dx: 8, dy: -80, elapsedMs: 180 });
+  assert.equal(
+    viewerPanelGestureAction({
+      gesture: swipeUp,
+      startY: 300,
+      contentTop: 0,
+      contentBottom: 844,
+    }),
+    ViewerPanelAction.OPEN
+  );
+  assert.equal(
+    viewerPanelGestureAction({
+      gesture: swipeUp,
+      startY: 810,
+      contentTop: 0,
+      contentBottom: 844,
+    }),
+    null
+  );
+  assert.equal(
+    viewerPanelGestureAction({
+      gesture: viewerGestureDecision({ dx: -80, dy: 8, elapsedMs: 180 }),
+      startY: 300,
+      contentBottom: 844,
+    }),
+    null
+  );
+  assert.equal(
+    viewerPanelGestureAction({
+      gesture: viewerGestureDecision({ dx: 2, dy: 2, elapsedMs: 120 }),
+      startY: 300,
+      contentBottom: 844,
+    }),
+    null
+  );
+  assert.equal(
+    viewerPanelGestureAction({
+      gesture: viewerGestureDecision({
+        dx: 0,
+        dy: -100,
+        elapsedMs: 180,
+        moved: true,
+        zoomed: true,
+      }),
+      startY: 300,
+      contentBottom: 844,
+    }),
+    null
+  );
+  assert.equal(
+    viewerPanelGestureAction({
+      gesture: ViewerGesture.SWIPE_DOWN,
+      panelOpen: true,
+    }),
+    ViewerPanelAction.CLOSE
+  );
+  assert.equal(
+    viewerPanelGestureAction({
+      gesture: ViewerGesture.SWIPE_DOWN,
+      panelOpen: true,
+      contentScrolled: true,
+    }),
     null
   );
 });

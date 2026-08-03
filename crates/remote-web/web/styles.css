@@ -1161,6 +1161,105 @@ button {
   background: rgb(73 112 181 / 48%);
 }
 
+.image-viewer.viewer-panel-open.viewer-panel-portrait > .viewer-stage {
+  bottom: 50%;
+}
+
+.image-viewer.viewer-panel-open.viewer-panel-landscape > .viewer-stage {
+  left: 40%;
+}
+
+.image-viewer.viewer-panel-open > .viewer-ui {
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+}
+
+.command-menu-layer.viewer-command-menu-layer {
+  align-items: end;
+  justify-items: stretch;
+}
+
+.viewer-command-menu-layer > .command-menu-scrim {
+  background: transparent;
+}
+
+.viewer-command-menu-layer > .viewer-command-menu {
+  width: 100%;
+  height: 50%;
+  max-height: none;
+  overflow: hidden;
+  padding: 12px max(16px, env(safe-area-inset-right))
+    max(12px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+}
+
+.viewer-command-menu-layer[data-orientation="landscape"] {
+  align-items: stretch;
+  justify-items: start;
+}
+
+.viewer-command-menu-layer[data-orientation="landscape"] > .viewer-command-menu {
+  width: 40%;
+  height: 100%;
+  padding: max(12px, env(safe-area-inset-top)) 12px
+    max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+  border-width: 0 1px 0 0;
+  border-radius: 0;
+  box-shadow: 20px 0 70px rgb(0 0 0 / 38%);
+}
+
+.viewer-panel-tabs {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(max-content, 1fr));
+  overflow-x: auto;
+  flex: 0 0 auto;
+  margin-top: 10px;
+  border-bottom: 1px solid var(--line);
+  scrollbar-width: thin;
+}
+
+.viewer-panel-tab {
+  min-height: 42px;
+  padding: 7px 8px;
+  border: 0;
+  border-bottom: 3px solid transparent;
+  color: var(--muted);
+  background: transparent;
+  font-size: 0.82rem;
+  font-weight: 650;
+  cursor: pointer;
+  touch-action: manipulation;
+  white-space: nowrap;
+}
+
+.viewer-panel-tab.is-selected {
+  border-bottom-color: var(--accent);
+  color: #f3f7ff;
+}
+
+.viewer-command-menu-body {
+  min-height: 0;
+  overflow: auto;
+  flex: 1 1 auto;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+}
+
+.viewer-panel-placeholder {
+  min-height: 120px;
+  padding: 20px 4px;
+}
+
+.viewer-panel-placeholder h3 {
+  margin: 0;
+  color: #f3f7ff;
+  font-size: 1rem;
+}
+
+.viewer-command-menu-layer[data-orientation="landscape"] .command-menu-actions {
+  grid-template-columns: 1fr;
+}
+
 .video-menu-volume {
   display: grid;
   grid-column: 1 / -1;

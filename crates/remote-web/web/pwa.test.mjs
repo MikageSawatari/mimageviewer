@@ -70,6 +70,33 @@ test("safe areas protect portrait bars and landscape side controls", async () =>
   assert.doesNotMatch(css, /\.screen > \.topbar > :not\(\.menu-trigger\)/);
 });
 
+test("still-image panel reserves the agreed viewport while its transparent shield owns input", async () => {
+  const css = await readFile(new URL("styles.css", here), "utf8");
+  const app = await readFile(new URL("app.js", here), "utf8");
+  assert.match(
+    css,
+    /\.image-viewer\.viewer-panel-open\.viewer-panel-portrait > \.viewer-stage\s*\{[^}]*bottom:\s*50%/
+  );
+  assert.match(
+    css,
+    /\.image-viewer\.viewer-panel-open\.viewer-panel-landscape > \.viewer-stage\s*\{[^}]*left:\s*40%/
+  );
+  assert.match(
+    css,
+    /\.viewer-command-menu-layer > \.viewer-command-menu\s*\{[^}]*width:\s*100%;[^}]*height:\s*50%/
+  );
+  assert.match(
+    css,
+    /\.viewer-command-menu-layer\[data-orientation="landscape"\] > \.viewer-command-menu\s*\{[^}]*width:\s*40%;[^}]*height:\s*100%/
+  );
+  assert.match(
+    css,
+    /\.viewer-command-menu-layer > \.command-menu-scrim\s*\{[^}]*background:\s*transparent/
+  );
+  assert.match(app, /classList\.add\("viewer-command-menu-layer"\)/);
+  assert.match(app, /viewerPanelTab:\s*"functions"/);
+});
+
 test("image tiles preserve portrait and landscape shape below a separate label row", async () => {
   const css = await readFile(new URL("styles.css", here), "utf8");
   const app = await readFile(new URL("app.js", here), "utf8");

@@ -4,6 +4,7 @@ import {
   ReadingDirection,
   SpreadMode,
   ViewerGesture,
+  ViewerPanelAction,
   command,
   commandFromKey,
   containerPageTargetPx,
@@ -35,6 +36,8 @@ import {
   shouldShowLoadingIndicator,
   shouldShowKeyboardShortcuts,
   viewerGestureDecision,
+  viewerPanelGestureAction,
+  viewerPanelTransition,
   viewerVerticalScrollDecision,
   viewerTapCommand,
   viewerTapSequenceTransition,
@@ -313,6 +316,7 @@ const state = {
   localSettingsDialog: null,
   gestureHelpDialog: null,
   viewerBarsVisible: true,
+  viewerPanelTab: "functions",
   coarsePointer: Boolean(globalThis.matchMedia?.("(pointer: coarse)")?.matches),
   keyboardInputSeen: false,
   fitMode: FitMode.PAGE,
@@ -4048,6 +4052,13 @@ const MenuPageAction = Object.freeze({
   POSITION: "menu_page_position",
 });
 
+export const VIEWER_PANEL_TABS = Object.freeze([
+  Object.freeze({ id: "functions", label: "機能" }),
+  Object.freeze({ id: "adjustment", label: "画像補正" }),
+  Object.freeze({ id: "view_trim", label: "表示トリム" }),
+  Object.freeze({ id: "bookmarks", label: "ブックマーク" }),
+]);
+
 export const VIEWER_MENU_MAX_ACTIONS = 11;
 
 export function viewerMenuDefinitions({ hasContainer, barsVisible }) {
@@ -4073,7 +4084,7 @@ export function viewerMenuDefinitions({ hasContainer, barsVisible }) {
   ];
   return {
     main: {
-      title: "画像の操作",
+      title: "機能",
       actions: mainActions,
       shortcuts: [
         ["前 / 次", "← ↑ PageUp / → ↓ PageDown"],
@@ -4183,23 +4194,35 @@ class CommandMenu {
   constructor(host, context, owner = host) {
     this.context = context;
     this.owner = owner;
+    this.isViewerPanel = context === "viewer";
     this.opened = false;
     this.previousFocus = null;
+    this.panelState = null;
+    this.panelPointer = null;
+    this.suppressPanelClick = false;
     this.actionLabels = new Map();
     this.ratingActions = new Map();
     this.bookmarkAction = null;
     this.ratingSummaryAction = null;
     this.keyboardElements = [];
+    this.viewerTabButtons = new Map();
     const definition = menuDefinition(context, "main");
     this.root = element("div", "command-menu-layer");
+    if (this.isViewerPanel) this.root.classList.add("viewer-command-menu-layer");
     this.root.hidden = true;
 
     const scrim = element("button", "command-menu-scrim");
     scrim.type = "button";
     scrim.setAttribute("aria-label", "操作メニューを閉じる");
-    scrim.addEventListener("click", (event) => menuCommand(event, CommandName.TOGGLE_MENU));
+    scrim.addEventListener("click", (event) => {
+      if (this.isViewerPanel) this.close();
+      else menuCommand(event, CommandName.TOGGLE_MENU);
+    });
 
-    const panel = element("section", "command-menu");
+    const panel = element(
+      "section",
+      this.isViewerPanel ? "command-menu viewer-command-menu" : "command-menu"
+    );
     panel.setAttribute("role", "dialog");
     panel.setAttribute("aria-modal", "true");
     this.panel = panel;
@@ -4207,7 +4230,10 @@ class CommandMenu {
     const close = textElement("button", "×", "command-menu-close");
     close.type = "button";
     close.setAttribute("aria-label", "操作メニューを閉じる");
-    close.addEventListener("click", (event) => menuCommand(event, CommandName.TOGGLE_MENU));
+    close.addEventListener("click", (event) => {
+      if (this.isViewerPanel) this.close();
+      else menuCommand(event, CommandName.TOGGLE_MENU);
+    });
     const title = textElement("h2", definition.title);
     header.append(title, close);
     this.title = title;
@@ -4223,14 +4249,64 @@ class CommandMenu {
       shortcuts.append(textElement("dt", label), textElement("dd", keys));
     }
     this.shortcutElements = [shortcutTitle, shortcuts];
-    panel.append(header, actions, shortcutTitle, shortcuts);
+    if (this.isViewerPanel) {
+      const tabs = element("nav", "viewer-panel-tabs");
+      tabs.setAttribute("role", "tablist");
+      tabs.setAttribute("aria-label", "画像パネルのタブ");
+      for (const tab of VIEWER_PANEL_TABS) {
+        const button = textElement("button", tab.label, "viewer-panel-tab");
+        button.type = "button";
+        button.setAttribute("role", "tab");
+        button.addEventListener("click", (event) => {
+          event.stopPropagation();
+          this.selectViewerTab(tab.id);
+        });
+        this.viewerTabButtons.set(tab.id, button);
+        tabs.append(button);
+      }
+      this.viewerTabs = tabs;
+      this.placeholder = element("section", "viewer-panel-placeholder");
+      this.placeholder.hidden = true;
+      const body = element("div", "viewer-command-menu-body");
+      body.append(actions, this.placeholder, shortcutTitle, shortcuts);
+      this.panelBody = body;
+      panel.append(header, tabs, body);
+    } else {
+      panel.append(header, actions, shortcutTitle, shortcuts);
+    }
     this.root.append(scrim, panel);
     host.append(this.root);
-    this.showPage("main");
+    if (this.isViewerPanel) {
+      this.panelPointerDown = (event) => this.onPanelPointerDown(event);
+      this.panelPointerUp = (event) => this.onPanelPointerUp(event, false);
+      this.panelPointerCancel = (event) => this.onPanelPointerUp(event, true);
+      this.panelClickCapture = (event) => {
+        if (!this.suppressPanelClick) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        this.suppressPanelClick = false;
+      };
+      this.viewportResize = () => this.updateViewerPanelLayout();
+      this.root.addEventListener("pointerdown", this.panelPointerDown);
+      this.root.addEventListener("pointerup", this.panelPointerUp);
+      this.root.addEventListener("pointercancel", this.panelPointerCancel);
+      this.root.addEventListener("click", this.panelClickCapture, true);
+      window.addEventListener("resize", this.viewportResize);
+      this.updateViewerPanelLayout();
+      this.selectViewerTab(state.viewerPanelTab);
+    } else {
+      this.showPage("main");
+    }
   }
 
   showPage(page) {
     const definition = menuDefinition(this.context, page);
+    if (this.isViewerPanel) {
+      state.viewerPanelTab = "functions";
+      this.syncViewerTabButtons("functions");
+      this.actions.hidden = false;
+      this.placeholder.hidden = true;
+    }
     this.currentPage = page;
     this.title.textContent = definition.title;
     this.panel.setAttribute("aria-label", definition.title);
@@ -4279,6 +4355,39 @@ class CommandMenu {
     }));
     if (this.context === "viewer") {
       this.setItemState(state.viewerItemState, state.viewerItemState === null);
+    }
+  }
+
+  selectViewerTab(tabId) {
+    if (!this.isViewerPanel) return;
+    const tab = VIEWER_PANEL_TABS.find((candidate) => candidate.id === tabId) ??
+      VIEWER_PANEL_TABS[0];
+    state.viewerPanelTab = tab.id;
+    this.syncViewerTabButtons(tab.id);
+    if (tab.id === "functions") {
+      this.showPage("main");
+      return;
+    }
+    this.currentPage = `tab:${tab.id}`;
+    this.title.textContent = tab.label;
+    this.panel.setAttribute("aria-label", tab.label);
+    this.actionLabels.clear();
+    this.ratingActions.clear();
+    this.bookmarkAction = null;
+    this.ratingSummaryAction = null;
+    this.keyboardElements = [];
+    this.actions.hidden = true;
+    this.placeholder.hidden = false;
+    this.placeholder.replaceChildren(textElement("h3", tab.label));
+    for (const target of this.shortcutElements) target.hidden = true;
+  }
+
+  syncViewerTabButtons(selectedId) {
+    for (const [id, button] of this.viewerTabButtons) {
+      const selected = id === selectedId;
+      button.classList.toggle("is-selected", selected);
+      button.setAttribute("aria-selected", selected ? "true" : "false");
+      button.tabIndex = selected ? 0 : -1;
     }
   }
 
@@ -4334,12 +4443,14 @@ class CommandMenu {
 
   open() {
     if (this.opened) return;
-    this.showPage("main");
+    if (this.isViewerPanel) this.selectViewerTab(state.viewerPanelTab);
+    else this.showPage("main");
     this.opened = true;
     this.previousFocus = document.activeElement;
     this.root.hidden = false;
     this.owner.classList.add("menu-open");
-    if (this.context === "viewer") {
+    if (this.isViewerPanel) {
+      this.updateViewerPanelLayout(ViewerPanelAction.OPEN);
       refreshViewerItemState().catch((error) => {
         state.viewer?.showBoundaryMessage(
           error instanceof Error ? error.message : "現在値を取得できませんでした。"
@@ -4352,6 +4463,7 @@ class CommandMenu {
   close(restoreFocus = true) {
     if (!this.opened) return;
     this.opened = false;
+    if (this.isViewerPanel) this.updateViewerPanelLayout(ViewerPanelAction.CLOSE);
     this.root.hidden = true;
     this.owner.classList.remove("menu-open");
     if (restoreFocus && this.previousFocus instanceof HTMLElement) {
@@ -4361,7 +4473,79 @@ class CommandMenu {
 
   destroy() {
     this.close(false);
+    if (this.isViewerPanel) {
+      this.root.removeEventListener("pointerdown", this.panelPointerDown);
+      this.root.removeEventListener("pointerup", this.panelPointerUp);
+      this.root.removeEventListener("pointercancel", this.panelPointerCancel);
+      this.root.removeEventListener("click", this.panelClickCapture, true);
+      window.removeEventListener("resize", this.viewportResize);
+    }
     this.root.remove();
+  }
+
+  updateViewerPanelLayout(action = "resize") {
+    if (!this.isViewerPanel) return;
+    const next = viewerPanelTransition(this.panelState, {
+      action,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    });
+    this.panelState = next;
+    this.root.dataset.orientation = next.orientation;
+    this.owner.classList.toggle("viewer-panel-open", next.open);
+    this.owner.classList.toggle(
+      "viewer-panel-portrait",
+      next.orientation === "portrait"
+    );
+    this.owner.classList.toggle(
+      "viewer-panel-landscape",
+      next.orientation === "landscape"
+    );
+    if (!next.shouldRefit) return;
+    if (next.resetTransform) state.fitMode = FitMode.PAGE;
+    requestAnimationFrame(() => {
+      if (state.commandMenu !== this || this.opened !== next.open) return;
+      state.viewer?.refitVisibleContent(FitMode.PAGE, { resetTransform: true });
+    });
+  }
+
+  onPanelPointerDown(event) {
+    if (event.isPrimary === false) return;
+    if (["mouse", "pen"].includes(event.pointerType) && event.button !== 0) return;
+    this.panelPointer = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      startedAt: performance.now(),
+      scrollTop: this.panelBody?.scrollTop ?? this.panel.scrollTop ?? 0,
+    };
+  }
+
+  onPanelPointerUp(event, cancelled) {
+    const pointer = this.panelPointer;
+    if (!pointer || pointer.pointerId !== event.pointerId) return;
+    this.panelPointer = null;
+    const scrollTop = this.panelBody?.scrollTop ?? this.panel.scrollTop ?? 0;
+    const contentScrolled = Math.abs(scrollTop - pointer.scrollTop) > 0.5;
+    const gesture = viewerGestureDecision({
+      dx: event.clientX - pointer.startX,
+      dy: event.clientY - pointer.startY,
+      elapsedMs: performance.now() - pointer.startedAt,
+      moved: contentScrolled,
+      contentScrolled,
+      cancelled,
+    });
+    const action = viewerPanelGestureAction({
+      gesture,
+      panelOpen: true,
+      contentScrolled,
+    });
+    if (action !== ViewerPanelAction.CLOSE) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.suppressPanelClick = true;
+    this.close();
+    setTimeout(() => { this.suppressPanelClick = false; }, 0);
   }
 }
 
@@ -4728,6 +4912,42 @@ export class ImageViewer {
   setPageLayerSize(width, height) {
     this.pageLayer.style.width = `${Math.max(1, Number(width) || 1)}px`;
     this.pageLayer.style.height = `${Math.max(1, Number(height) || 1)}px`;
+  }
+
+  refitVisibleContent(fitMode = FitMode.PAGE, { resetTransform = true } = {}) {
+    const sources = this.images.map((image) => ({
+      width: Number(image.dataset.sourceWidth) || image.naturalWidth,
+      height: Number(image.dataset.sourceHeight) || image.naturalHeight,
+    }));
+    if (sources.some((source) => !(source.width > 0 && source.height > 0))) return false;
+    const layout = viewerSpreadLayout({
+      mode: fitMode,
+      pages: sources,
+      viewportWidth: this.stage.clientWidth || window.innerWidth,
+      viewportHeight: this.stage.clientHeight || window.innerHeight,
+      devicePixelRatio: window.devicePixelRatio || 1,
+      gap: this.images.length > 1 ? Number.parseFloat(this.pageLayer.style.gap) || 0 : 0,
+    });
+    this.fitMode = fitMode;
+    this.stage.dataset.fitMode = fitMode;
+    this.pageLayer.style.gap = `${layout.gap}px`;
+    this.setPageLayerSize(layout.cssWidth, layout.cssHeight);
+    this.images.forEach((image, index) => {
+      const page = layout.pages[index];
+      image.style.width = `${page.cssWidth}px`;
+      image.style.height = `${page.cssHeight}px`;
+      image.style.maxWidth = "none";
+      image.style.maxHeight = "none";
+    });
+    this.stage.scrollTop = 0;
+    this.stage.scrollLeft = 0;
+    if (resetTransform) {
+      this.scale = 1;
+      this.panX = 0;
+      this.panY = 0;
+    }
+    this.applyTransform();
+    return true;
   }
 
   async loadMeasuredImage(request, interactionStartedAt, name, info) {
@@ -5197,6 +5417,17 @@ export class ImageViewer {
         edgeGuarded: single.edgeGuarded,
         cancelled,
       });
+      const stageBounds = this.stage.getBoundingClientRect?.() ?? {
+        top: 0,
+        bottom: this.stage.clientHeight || window.innerHeight,
+      };
+      const panelAction = viewerPanelGestureAction({
+        gesture,
+        panelOpen: false,
+        startY: single.startY,
+        contentTop: stageBounds.top,
+        contentBottom: stageBounds.bottom,
+      });
       if (
         gesture === ViewerGesture.SWIPE_LEFT ||
         gesture === ViewerGesture.SWIPE_RIGHT
@@ -5214,7 +5445,7 @@ export class ImageViewer {
           ),
           { source, detail: swipeLeft ? "swipe_left" : "swipe_right" }
         );
-      } else if (gesture === ViewerGesture.SWIPE_UP) {
+      } else if (panelAction === ViewerPanelAction.OPEN) {
         dispatchCommand(command(CommandName.TOGGLE_MENU), {
           source,
           detail: "swipe_up",

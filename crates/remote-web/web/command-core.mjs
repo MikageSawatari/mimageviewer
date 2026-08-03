@@ -77,6 +77,16 @@ export const ViewerGesture = Object.freeze({
   PAN: "pan",
 });
 
+export const ViewerPanelOrientation = Object.freeze({
+  PORTRAIT: "portrait",
+  LANDSCAPE: "landscape",
+});
+
+export const ViewerPanelAction = Object.freeze({
+  OPEN: "open",
+  CLOSE: "close",
+});
+
 export const VIDEO_QUALITY_PRESETS = Object.freeze([
   Object.freeze({ id: "minimum", label: "最小", traffic: "約 210 MB / 時" }),
   Object.freeze({ id: "low", label: "低", traffic: "約 400 MB / 時" }),
@@ -274,6 +284,88 @@ export function readingDirectionForSpreadMode(mode, currentDirection) {
 /// 正方形は横持ち側に倒し、縦が横を 1px でも上回ると表示限定 Single にする。
 export function isPortraitViewport(width, height) {
   return Math.max(0, Number(height) || 0) > Math.max(0, Number(width) || 0);
+}
+
+/// 静止画パネルと、パネルを除いた画像 viewport の寸法を同じ判定から導く。
+/// 縦持ちは下 50%、横持ち（正方形を含む）は左 40% をパネルが使う。
+export function viewerPanelLayout({ viewportWidth, viewportHeight, open = true } = {}) {
+  const width = Math.max(0, Number(viewportWidth) || 0);
+  const height = Math.max(0, Number(viewportHeight) || 0);
+  const orientation = isPortraitViewport(width, height)
+    ? ViewerPanelOrientation.PORTRAIT
+    : ViewerPanelOrientation.LANDSCAPE;
+  if (!open) {
+    return {
+      orientation,
+      panel: { x: 0, y: height, width: 0, height: 0 },
+      image: { x: 0, y: 0, width, height },
+    };
+  }
+  if (orientation === ViewerPanelOrientation.PORTRAIT) {
+    const imageHeight = height * 0.5;
+    return {
+      orientation,
+      panel: { x: 0, y: imageHeight, width, height: height - imageHeight },
+      image: { x: 0, y: 0, width, height: imageHeight },
+    };
+  }
+  const panelWidth = width * 0.4;
+  return {
+    orientation,
+    panel: { x: 0, y: 0, width: panelWidth, height },
+    image: { x: panelWidth, y: 0, width: width - panelWidth, height },
+  };
+}
+
+/// open / close / resize を 1 つの panel state transition として扱う。
+export function viewerPanelTransition(
+  current,
+  { action = "resize", viewportWidth, viewportHeight } = {}
+) {
+  const wasOpen = Boolean(current?.open);
+  const open = action === ViewerPanelAction.OPEN
+    ? true
+    : action === ViewerPanelAction.CLOSE
+      ? false
+      : wasOpen;
+  const layout = viewerPanelLayout({ viewportWidth, viewportHeight, open });
+  const orientationChanged = Boolean(current?.orientation) &&
+    current.orientation !== layout.orientation;
+  const openChanged = wasOpen !== open;
+  return {
+    open,
+    orientation: layout.orientation,
+    layout,
+    shouldRefit: openChanged || (open && orientationChanged),
+    resetTransform: action === ViewerPanelAction.OPEN && !wasOpen,
+  };
+}
+
+/// viewerGestureDecision の結果から panel 専用の open / close だけを選ぶ。
+/// open はホームインジケータやブラウザ端ジェスチャを避けたコンテンツ内開始に限定する。
+export function viewerPanelGestureAction({
+  gesture,
+  panelOpen = false,
+  startY,
+  contentTop = 0,
+  contentBottom,
+  edgeInset = 48,
+  contentScrolled = false,
+} = {}) {
+  if (panelOpen) {
+    return gesture === ViewerGesture.SWIPE_DOWN && !contentScrolled
+      ? ViewerPanelAction.CLOSE
+      : null;
+  }
+  if (gesture !== ViewerGesture.SWIPE_UP) return null;
+  const top = Number(contentTop) || 0;
+  const bottom = Number(contentBottom);
+  const y = Number(startY);
+  const inset = Math.max(0, Number(edgeInset) || 0);
+  if (!Number.isFinite(bottom) || !Number.isFinite(y)) return null;
+  return y >= top + inset && y <= bottom - inset
+    ? ViewerPanelAction.OPEN
+    : null;
 }
 
 /// 画面向きによる描画限定 Single と、利用者が明示した永続書き込みを分離する。

@@ -95,6 +95,7 @@ globalThis.fetch = imageFetch;
 const {
   ImageViewer,
   VIEWER_MENU_MAX_ACTIONS,
+  VIEWER_PANEL_TABS,
   activateFolderContainerForImage,
   commandTelemetryEvent,
   containerInitialImageIndex,
@@ -217,6 +218,18 @@ test("every iPhone viewer menu page stays within the fixed action limit", () => 
   }
 });
 
+test("still-image panel exposes the agreed tabs in desktop order", () => {
+  assert.deepEqual(
+    VIEWER_PANEL_TABS.map(({ id, label }) => [id, label]),
+    [
+      ["functions", "機能"],
+      ["adjustment", "画像補正"],
+      ["view_trim", "表示トリム"],
+      ["bookmarks", "ブックマーク"],
+    ]
+  );
+});
+
 test("plain image media routes resolve their containing folder", () => {
   assert.deepEqual(
     parentContainerAddress({
@@ -316,6 +329,23 @@ test("viewer load executes fetch, decode, layout and atomic replacement", async 
   assert.equal(viewer.pageLayer.style.height, "645px");
   assert.equal(viewer.image.dataset.sourceWidth, "1200");
   assert.equal(loadingIndicator.hidden, true);
+
+  viewer.scale = 2;
+  viewer.panX = 24;
+  viewer.panY = -18;
+  stage.clientWidth = 390;
+  stage.clientHeight = 422;
+  assert.equal(viewer.refitVisibleContent(), true);
+  assert.equal(Math.round(parseFloat(viewer.image.style.width)), 281);
+  assert.equal(parseFloat(viewer.image.style.height), 422);
+  assert.equal(viewer.scale, 1);
+  assert.equal(viewer.panX, 0);
+  assert.equal(viewer.panY, 0);
+
+  stage.clientHeight = 844;
+  assert.equal(viewer.refitVisibleContent(), true);
+  assert.equal(parseFloat(viewer.image.style.width), 390);
+  assert.equal(parseFloat(viewer.image.style.height), 585);
   viewer.destroy();
 });
 
