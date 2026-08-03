@@ -523,7 +523,6 @@ impl VideoStreamEncoder {
         Ok(packets)
     }
 
-    #[cfg(test)]
     pub(crate) fn finish(&mut self) -> Result<Vec<ffmpeg::Packet>, VideoStreamEncoderError> {
         if self.finished {
             return Ok(Vec::new());

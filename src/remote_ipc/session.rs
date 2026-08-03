@@ -467,53 +467,49 @@ pub(crate) enum UiWriteOutcome {
 }
 
 pub(crate) struct VideoStreamPlaybackState {
-    position_secs: AtomicU64,
     duration_secs: AtomicU64,
     volume: AtomicU64,
-    playing: AtomicBool,
+    play_intent: AtomicBool,
 }
 
 impl VideoStreamPlaybackState {
-    pub(crate) fn new(position_secs: f64, duration_secs: f64, volume: f64, playing: bool) -> Self {
+    pub(crate) fn new(duration_secs: f64, volume: f64, play_intent: bool) -> Self {
         Self {
-            position_secs: AtomicU64::new(position_secs.to_bits()),
             duration_secs: AtomicU64::new(duration_secs.to_bits()),
             volume: AtomicU64::new(volume.to_bits()),
-            playing: AtomicBool::new(playing),
+            play_intent: AtomicBool::new(play_intent),
         }
     }
 
-    pub(crate) fn update(
-        &self,
-        position_secs: f64,
-        duration_secs: f64,
-        volume: f64,
-        playing: bool,
-    ) {
-        self.position_secs
-            .store(position_secs.to_bits(), Ordering::Release);
+    pub(crate) fn update(&self, duration_secs: f64, volume: f64, play_intent: bool) {
         self.duration_secs
             .store(duration_secs.to_bits(), Ordering::Release);
         self.volume.store(volume.to_bits(), Ordering::Release);
-        self.playing.store(playing, Ordering::Release);
+        self.play_intent.store(play_intent, Ordering::Release);
+    }
+
+    pub(crate) fn set_play_intent(&self, play_intent: bool) {
+        self.play_intent.store(play_intent, Ordering::Release);
+    }
+
+    pub(crate) fn set_volume(&self, volume: f64) {
+        self.volume.store(volume.to_bits(), Ordering::Release);
     }
 
     pub(crate) fn snapshot(&self) -> VideoStreamPlaybackSnapshot {
         VideoStreamPlaybackSnapshot {
-            position_secs: f64::from_bits(self.position_secs.load(Ordering::Acquire)),
             duration_secs: f64::from_bits(self.duration_secs.load(Ordering::Acquire)),
             volume: f64::from_bits(self.volume.load(Ordering::Acquire)),
-            playing: self.playing.load(Ordering::Acquire),
+            play_intent: self.play_intent.load(Ordering::Acquire),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct VideoStreamPlaybackSnapshot {
-    pub(crate) position_secs: f64,
     pub(crate) duration_secs: f64,
     pub(crate) volume: f64,
-    pub(crate) playing: bool,
+    pub(crate) play_intent: bool,
 }
 
 #[derive(Clone)]
@@ -521,6 +517,7 @@ pub(crate) struct PublishedVideoStream {
     pub(crate) session: StreamingSessionId,
     pub(crate) generation: StreamingGenerationAccess,
     pub(crate) playback: Arc<VideoStreamPlaybackState>,
+    pub(crate) buffer_target_secs: f64,
 }
 
 impl PublishedVideoStream {

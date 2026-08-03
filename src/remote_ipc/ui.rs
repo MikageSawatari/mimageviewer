@@ -98,14 +98,13 @@ fn video_stream_session_mismatch() -> VideoStreamUiOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemoteVideoStartReadiness {
     Stable,
-    WaitingForSeek,
     WaitingForEncoder,
 }
 
 impl RemoteVideoStartReadiness {
     fn wait_stage(self) -> VideoStreamStartStage {
         match self {
-            Self::Stable | Self::WaitingForSeek => VideoStreamStartStage::Seek,
+            Self::Stable => VideoStreamStartStage::Seek,
             Self::WaitingForEncoder => VideoStreamStartStage::Encoder,
         }
     }
@@ -116,19 +115,13 @@ fn remote_video_start_outcome_for_player(
     playback: &std::sync::Arc<VideoStreamPlaybackState>,
     player: &crate::video::VideoPlayer,
 ) -> Result<(StreamReconcile, RemoteVideoStartReadiness), String> {
-    playback.update(
-        player.position_secs(),
-        player.duration(),
-        player.volume(),
-        player.intent_playing(),
-    );
-    let reconcile = session.reconcile(player);
-    let seek_is_stable = matches!(reconcile, StreamReconcile::Active)
-        && player.remote_stream_start_seek_is_settled()
-        && session.generation_matches_player_seek(player);
-    let readiness = if !seek_is_stable {
-        RemoteVideoStartReadiness::WaitingForSeek
-    } else if matches!(session.status(), StreamGenerationStatus::Ready(_)) {
+    let snapshot = playback.snapshot();
+    playback.update(player.duration(), player.volume(), snapshot.play_intent);
+    let reconcile = session.reconcile();
+    let readiness = if matches!(
+        session.status(),
+        StreamGenerationStatus::Ready(_) | StreamGenerationStatus::Ended(_)
+    ) {
         RemoteVideoStartReadiness::Stable
     } else {
         RemoteVideoStartReadiness::WaitingForEncoder
@@ -264,7 +257,6 @@ impl crate::app::App {
             .map_err(|response| response.message)?;
         let encoder = self.settings.remote_video_encoder.into();
         let segment_capacity = self.settings.remote_video_segment_window;
-        let mute_local_output = self.settings.remote_video_mute_local_output;
         if !crate::folder_tree::path_eq(player.path(), requested_path) {
             return Err("the requested video is not the remote session player".to_owned());
         }
@@ -279,7 +271,10 @@ impl crate::app::App {
             encoder,
             quality,
             segment_capacity,
-            mute_local_output,
+            self.settings.video_hw_decode,
+            crate::video::clockless_transcode::ClocklessAudioProcessing {
+                normalize_gain: player.normalize_gain(),
+            },
         ) {
             Ok(session) => session,
             Err(error) => {
@@ -289,12 +284,10 @@ impl crate::app::App {
                 return Err(error);
             }
         };
-        player.set_playing(true);
         let playback = std::sync::Arc::new(VideoStreamPlaybackState::new(
-            player.position_secs(),
             player.duration(),
             player.volume(),
-            player.intent_playing(),
+            true,
         ));
         Ok(AppRemoteVideoStreaming {
             requested_path: requested_path.to_path_buf(),
@@ -400,29 +393,15 @@ impl crate::app::App {
             AppRemoteVideoStreamState::Streaming(streaming) => streaming,
         };
         streaming.player.tick(ctx);
+        let snapshot = streaming.playback.snapshot();
         streaming.playback.update(
-            streaming.player.position_secs(),
             streaming.player.duration(),
             streaming.player.volume(),
-            streaming.player.intent_playing(),
+            snapshot.play_intent,
         );
-        let outcome = streaming.session.reconcile(&streaming.player);
+        let outcome = streaming.session.reconcile();
         match outcome {
             StreamReconcile::Active => {
-                self.remote_session_ui.video_stream =
-                    Some(AppRemoteVideoStreamState::Streaming(streaming));
-            }
-            StreamReconcile::GenerationChanged(generation) => {
-                crate::logger::log(format!(
-                    "remote-stream generation changed after seek: {generation:?}"
-                ));
-                if let Some(handle) = self.remote_session_ui.handle.as_ref() {
-                    handle.publish_video_stream(PublishedVideoStream {
-                        session: streaming.session.id(),
-                        generation: streaming.session.access(),
-                        playback: std::sync::Arc::clone(&streaming.playback),
-                    });
-                }
                 self.remote_session_ui.video_stream =
                     Some(AppRemoteVideoStreamState::Streaming(streaming));
             }
@@ -493,6 +472,7 @@ impl crate::app::App {
                     session: starting.streaming.session.id(),
                     generation: starting.streaming.session.access(),
                     playback: std::sync::Arc::clone(&starting.streaming.playback),
+                    buffer_target_secs: starting.streaming.session.buffer_target_secs(),
                 };
                 if let Some(handle) = self.remote_session_ui.handle.as_ref() {
                     handle.publish_video_stream(published.clone());
@@ -502,12 +482,6 @@ impl crate::app::App {
                     .complete(VideoStreamUiOutcome::Started(published));
                 self.remote_session_ui.video_stream =
                     Some(AppRemoteVideoStreamState::Streaming(starting.streaming));
-            }
-            Ok((StreamReconcile::GenerationChanged(generation), readiness)) => {
-                crate::logger::log(format!(
-                    "remote-stream generation changed while start was stabilizing: {generation:?}"
-                ));
-                self.continue_or_timeout_remote_video_starting(starting, readiness);
             }
             Ok((StreamReconcile::Active, readiness)) => {
                 self.continue_or_timeout_remote_video_starting(starting, readiness);
@@ -584,7 +558,7 @@ impl crate::app::App {
                             "remote streaming requires both video and audio streams".to_owned(),
                         ))
                     } else {
-                        Ok(player.audio_tap_source().is_some())
+                        Ok(player.remote_stream_start_seek_is_settled())
                     }
                 } else {
                     Ok(false)
@@ -731,7 +705,11 @@ impl crate::app::App {
                 AppRemoteVideoStreamState::Opening(_) => false,
                 AppRemoteVideoStreamState::Starting(_) => false,
                 AppRemoteVideoStreamState::Streaming(streaming) => {
-                    streaming.session.set_playing(playing)
+                    let accepted = streaming.session.set_playing(playing);
+                    if accepted {
+                        streaming.playback.set_play_intent(playing);
+                    }
+                    accepted
                 }
             })
     }
@@ -740,6 +718,7 @@ impl crate::app::App {
     pub(crate) fn change_remote_video_streaming_quality(
         &mut self,
         quality: crate::video::stream::quality::QualityPreset,
+        position_secs: f64,
     ) -> Result<StreamingGeneration, String> {
         let streaming = self
             .remote_session_ui
@@ -749,7 +728,7 @@ impl crate::app::App {
         let AppRemoteVideoStreamState::Streaming(streaming) = streaming else {
             return Err("remote video streaming is still opening".to_owned());
         };
-        streaming.session.change_quality(&streaming.player, quality)
+        streaming.session.change_quality(quality, position_secs)
     }
 
     fn apply_pending_remote_ui_requests(&mut self, handle: &SessionHandle) {
@@ -885,35 +864,49 @@ impl crate::app::App {
                 Some(AppRemoteVideoStreamState::Streaming(streaming));
             return video_stream_session_mismatch();
         }
-        let player = &streaming.player;
         let result = match action {
             VideoStreamControlAction::Play => {
-                player.set_playing(true);
-                Ok(())
+                streaming.playback.set_play_intent(true);
+                streaming
+                    .session
+                    .set_playing(true)
+                    .then_some(())
+                    .ok_or_else(|| "remote session ownership was lost".to_owned())
             }
             VideoStreamControlAction::Pause => {
-                player.set_playing(false);
-                Ok(())
+                streaming.playback.set_play_intent(false);
+                streaming
+                    .session
+                    .set_playing(false)
+                    .then_some(())
+                    .ok_or_else(|| "remote session ownership was lost".to_owned())
             }
             VideoStreamControlAction::Volume { volume }
                 if volume.is_finite() && (0.0..=1.0).contains(&volume) =>
             {
-                player.set_volume(volume);
+                streaming.player.set_volume(volume);
+                streaming.playback.set_volume(volume);
                 Ok(())
             }
             VideoStreamControlAction::Volume { .. } => {
                 Err("volume must be finite and between 0 and 1".to_owned())
             }
-            VideoStreamControlAction::Quality { quality } => streaming
+            VideoStreamControlAction::Quality {
+                quality,
+                position_secs,
+            } if position_secs.is_finite() && position_secs >= 0.0 => streaming
                 .session
-                .change_quality(player, quality.into())
+                .change_quality(quality.into(), position_secs)
                 .map(|_| ()),
+            VideoStreamControlAction::Quality { .. } => {
+                Err("quality position must be finite and non-negative".to_owned())
+            }
         };
+        let snapshot = streaming.playback.snapshot();
         streaming.playback.update(
-            player.position_secs(),
-            player.duration(),
-            player.volume(),
-            player.intent_playing(),
+            streaming.player.duration(),
+            snapshot.volume,
+            snapshot.play_intent,
         );
         if result.is_ok()
             && let Some(handle) = self.remote_session_ui.handle.as_ref()
@@ -922,6 +915,7 @@ impl crate::app::App {
                 session: streaming.session.id(),
                 generation: streaming.session.access(),
                 playback: std::sync::Arc::clone(&streaming.playback),
+                buffer_target_secs: streaming.session.buffer_target_secs(),
             });
         }
         self.remote_session_ui.video_stream = Some(AppRemoteVideoStreamState::Streaming(streaming));
@@ -944,8 +938,7 @@ impl crate::app::App {
                 Some(AppRemoteVideoStreamState::Streaming(streaming));
             return video_stream_session_mismatch();
         }
-        let player = &streaming.player;
-        let result = streaming.session.seek(player, position_secs);
+        let result = streaming.session.seek(position_secs);
         if result.is_ok()
             && let Some(handle) = self.remote_session_ui.handle.as_ref()
         {
@@ -953,6 +946,7 @@ impl crate::app::App {
                 session: streaming.session.id(),
                 generation: streaming.session.access(),
                 playback: std::sync::Arc::clone(&streaming.playback),
+                buffer_target_secs: streaming.session.buffer_target_secs(),
             });
         }
         self.remote_session_ui.video_stream = Some(AppRemoteVideoStreamState::Streaming(streaming));

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -690,8 +690,13 @@ pub enum VideoStreamQuality {
 pub enum VideoStreamControlAction {
     Play,
     Pause,
-    Volume { volume: f64 },
-    Quality { quality: VideoStreamQuality },
+    Volume {
+        volume: f64,
+    },
+    Quality {
+        quality: VideoStreamQuality,
+        position_secs: f64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -719,6 +724,8 @@ pub struct VideoStreamStartPayload {
     pub session: u64,
     pub generation: u64,
     pub duration_secs: f64,
+    pub source_origin_secs: f64,
+    pub buffer_target_secs: f64,
     pub encoder: String,
     pub video_size: VideoStreamSize,
     pub codecs: String,
@@ -758,14 +765,22 @@ pub enum VideoStreamSegmentPayload {
 pub struct VideoStreamStatePayload {
     pub session: u64,
     pub generation: u64,
-    pub position_secs: f64,
     pub duration_secs: f64,
+    pub source_origin_secs: f64,
+    pub generated_start_secs: f64,
+    pub generated_end_secs: f64,
+    pub ring_start_secs: f64,
+    pub ring_end_secs: f64,
+    pub ring_earliest_sequence: Option<u64>,
+    pub ring_latest_sequence: Option<u64>,
+    pub buffer_target_secs: f64,
     pub buffered_secs: f64,
     pub effective_bitrate_bps: u64,
+    pub ended: bool,
     pub encoder: String,
     pub video_size: VideoStreamSize,
     pub codecs: String,
-    pub playing: bool,
+    pub play_intent: bool,
     pub volume: f64,
 }
 
@@ -1153,6 +1168,43 @@ mod tests {
     }
 
     #[test]
+    fn video_stream_state_separates_generation_progress_from_terminal_playhead() {
+        let state = VideoStreamStatePayload {
+            session: 3,
+            generation: 8,
+            duration_secs: 600.0,
+            source_origin_secs: 240.0,
+            generated_start_secs: 240.0,
+            generated_end_secs: 300.0,
+            ring_start_secs: 240.0,
+            ring_end_secs: 300.0,
+            ring_earliest_sequence: Some(0),
+            ring_latest_sequence: Some(29),
+            buffer_target_secs: 60.0,
+            buffered_secs: 60.0,
+            effective_bitrate_bps: 1_500_000,
+            ended: false,
+            encoder: "nvenc".to_owned(),
+            video_size: VideoStreamSize {
+                width: 1920,
+                height: 1080,
+            },
+            codecs: "avc1.640028,mp4a.40.2".to_owned(),
+            play_intent: true,
+            volume: 0.75,
+        };
+
+        let value = serde_json::to_value(state).unwrap();
+        assert_eq!(value["source_origin_secs"], 240.0);
+        assert_eq!(value["generated_end_secs"], 300.0);
+        assert_eq!(value["buffer_target_secs"], 60.0);
+        assert_eq!(value["play_intent"], true);
+        assert_eq!(value["ended"], false);
+        assert!(value.get("position_secs").is_none());
+        assert!(value.get("playing").is_none());
+    }
+
+    #[test]
     fn session_acquire_round_trips_peer_metadata() {
         let expected = ClientMessage::SessionAcquire {
             id: 9,
@@ -1277,8 +1329,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v18_video_pull_and_seek_thumbnail_messages_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 18);
+    fn protocol_v19_video_pull_and_seek_thumbnail_messages_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 19);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,

@@ -29,6 +29,15 @@ const SEEK_THUMBNAIL_MATCH_TOLERANCE_SECS = 1.25;
 
 let hlsScriptPromise = null;
 
+export function hlsBufferConfig(bufferTargetSecs) {
+  const target = Math.max(1, Number(bufferTargetSecs) || 1);
+  return {
+    backBufferLength: target,
+    maxBufferLength: target,
+    maxMaxBufferLength: target,
+  };
+}
+
 function element(tag, className = "") {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -106,12 +115,6 @@ function seekableRanges(media) {
     ranges.push([media.seekable.start(index), media.seekable.end(index)]);
   }
   return ranges;
-}
-
-function lastSeekableEnd(media) {
-  return media.seekable.length
-    ? media.seekable.end(media.seekable.length - 1)
-    : Number.NaN;
 }
 
 function abortableDelay(delayMs, signal) {
@@ -707,6 +710,7 @@ export class VideoStreamViewer {
     this.quality = "standard";
     this.volume = 1;
     this.duration = 0;
+    this.bufferTargetSecs = null;
     this.session = null;
     this.generation = null;
     this.encoder = "";
@@ -865,6 +869,10 @@ export class VideoStreamViewer {
       if (!this.playRequested) this.finishSeekPreview();
     };
     this.onWaiting = () => this.beginWaiting();
+    this.onEnded = () => {
+      this.setPlaying(false).catch(() => {});
+      this.updateProgress();
+    };
     this.onNativeError = () => {
       if (!this.destroyed && !this.hls && !this.generationSwitch.isSwitching()) {
         const startup = this.startupWatch;
@@ -892,6 +900,7 @@ export class VideoStreamViewer {
     this.video.addEventListener("canplay", this.onCanPlay);
     this.video.addEventListener("loadeddata", this.onLoadedData);
     this.video.addEventListener("waiting", this.onWaiting);
+    this.video.addEventListener("ended", this.onEnded);
     this.video.addEventListener("error", this.onNativeError);
 
     this.pointerDown = (event) => this.onPointerDown(event);
@@ -943,12 +952,13 @@ export class VideoStreamViewer {
     this.generation = started.generation;
     let playlistUrl = started.playlist;
     this.duration = Math.max(0, Number(started.duration_secs) || 0);
+    this.bufferTargetSecs = hlsBufferConfig(started.buffer_target_secs).maxBufferLength;
     this.encoder = String(started.encoder ?? "");
     this.codecs = String(started.codec ?? "");
     this.seekInput.max = String(this.duration);
     this.timelineAnchor = {
-      sourcePositionSecs: 0,
-      mediaTimeSecs: Number(this.video.currentTime) || 0,
+      sourcePositionSecs: Math.max(0, Number(started.source_origin_secs) || 0),
+      mediaTimeSecs: 0,
     };
     this.timelineAnchorGeneration = this.generation;
     this.updateDiagnostics(started);
@@ -1200,8 +1210,7 @@ export class VideoStreamViewer {
 
     if (this.destroyed) return false;
     const hls = new Hls({
-      backBufferLength: 60,
-      maxBufferLength: 60,
+      ...hlsBufferConfig(this.bufferTargetSecs),
       manifestLoadingMaxRetry: 0,
       levelLoadingMaxRetry: 0,
       fragLoadingMaxRetry: 0,
@@ -1323,20 +1332,20 @@ export class VideoStreamViewer {
   }
 
   async togglePlaying() {
-    const shouldPlay = this.video.paused || !this.lastState?.playing;
+    const shouldPlay = this.video.paused || !this.lastState?.play_intent;
     await this.setPlaying(shouldPlay);
   }
 
   async setPlaying(playing) {
     this.playRequested = Boolean(playing);
-    if (this.session && Boolean(this.lastState?.playing) !== this.playRequested) {
+    if (this.session && Boolean(this.lastState?.play_intent) !== this.playRequested) {
       await this.apiPostJson(
         "/api/video/control",
         { session: this.session, action: this.playRequested ? "play" : "pause" },
         this.abortController.signal
       );
     }
-    if (this.lastState) this.lastState.playing = this.playRequested;
+    if (this.lastState) this.lastState.play_intent = this.playRequested;
     if (this.playRequested) await this.playIfRequested();
     else this.video.pause();
   }
@@ -1525,6 +1534,7 @@ export class VideoStreamViewer {
       this.abortController.signal
     );
     this.volume = volume;
+    this.video.volume = volume;
     if (this.lastState) this.lastState.volume = volume;
     this.menu.setMediaState(this.menuState());
   }
@@ -1533,10 +1543,16 @@ export class VideoStreamViewer {
     const preset = videoQualityPreset(quality);
     if (!this.session || this.destroyed || preset.id !== quality || quality === this.quality) return;
     this.showNotice(`${preset.label}画質へ切り替えています。`, "waiting");
+    const positionSecs = this.currentPosition();
     try {
       await this.apiPostJson(
         "/api/video/control",
-        { session: this.session, action: "quality", quality },
+        {
+          session: this.session,
+          action: "quality",
+          quality,
+          position_secs: positionSecs,
+        },
         this.abortController.signal
       );
     } catch (error) {
@@ -1556,10 +1572,15 @@ export class VideoStreamViewer {
     this.lastState = mediaState;
     this.generation = mediaState.generation;
     this.duration = Math.max(0, Number(mediaState.duration_secs) || this.duration);
+    this.bufferTargetSecs = Math.max(
+      1,
+      Number(mediaState.buffer_target_secs) || this.bufferTargetSecs
+    );
     this.volume = Math.max(0, Math.min(1, Number(mediaState.volume) || 0));
+    this.video.volume = this.volume;
     this.encoder = String(mediaState.encoder ?? this.encoder);
     this.codecs = String(mediaState.codecs ?? this.codecs);
-    this.playRequested = Boolean(mediaState.playing);
+    this.playRequested = Boolean(mediaState.play_intent);
     this.seekInput.max = String(this.duration);
     if (
       shouldReanchorVideoTimeline({
@@ -1568,9 +1589,7 @@ export class VideoStreamViewer {
       })
     ) {
       this.timelineAnchor = videoTimelineAnchor({
-        serverPositionSecs: mediaState.position_secs,
-        mediaCurrentTimeSecs: this.video.currentTime,
-        seekableEndSecs: lastSeekableEnd(this.video),
+        sourceOriginSecs: mediaState.source_origin_secs,
         durationSecs: this.duration,
       });
       this.timelineAnchorGeneration = mediaState.generation;
@@ -2043,6 +2062,7 @@ export class VideoStreamViewer {
     this.video.removeEventListener("canplay", this.onCanPlay);
     this.video.removeEventListener("loadeddata", this.onLoadedData);
     this.video.removeEventListener("waiting", this.onWaiting);
+    this.video.removeEventListener("ended", this.onEnded);
     this.video.removeEventListener("error", this.onNativeError);
     this.stage.removeEventListener("pointerdown", this.pointerDown);
     this.stage.removeEventListener("pointermove", this.pointerMove);

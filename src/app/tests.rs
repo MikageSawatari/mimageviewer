@@ -1292,10 +1292,53 @@ fn auto_fullscreen_image_only_folder_opens_page_after_load() {
 #[test]
 fn remote_video_stream_keeps_remote_dialog_without_entering_fullscreen() {
     let mut app = phase_c_support::setup_app();
+    app.settings.remote_video_encoder = crate::settings::RemoteVideoEncoder::OpenH264;
     let folder = app.tmp.path().join("remote-video");
     std::fs::create_dir(&folder).unwrap();
     let video = folder.join("clip.mp4");
-    std::fs::write(&video, b"invalid fixture; source open is asynchronous").unwrap();
+    use base64::Engine as _;
+    const CLOCKLESS_AV_FIXTURE: &str = concat!(
+        "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",
+        "AAAAAAAAAC1pbHN0AAAAJal0b28AAAAdZGF0YQAAAAEAAAAATGF2ZjYyLjEyLjEwMAAAAAhmcmVlAAAD0m1kYXTeAgBMYXZjNjIu",
+        "MjguMTAwAEIgCMEYOAAAAlMGBf//T9xF6b3m2Ui3lizYINkj7u94MjY0IC0gY29yZSAxNjUgcjMyMjMgMDQ4MGNiMCAtIEguMjY0",
+        "L01QRUctNCBBVkMgY29kZWMgLSBDb3B5bGVmdCAyMDAzLTIwMjUgLSBodHRwOi8vd3d3LnZpZGVvbGFuLm9yZy94MjY0Lmh0bWwg",
+        "LSBvcHRpb25zOiBjYWJhYz0wIHJlZj0xIGRlYmxvY2s9MDowOjAgYW5hbHlzZT0wOjAgbWU9ZGlhIHN1Ym1lPTAgcHN5PTEgcHN5",
+        "X3JkPTEuMDA6MC4wMiBtaXhlZF9yZWY9MCBtZV9yYW5nZT0xNiBjaHJvbWFfbWU9MSB0cmVsbGlzPTAgOHg4ZGN0PTAgY3FtPTAg",
+        "ZGVhZHpvbmU9MjEsMTEgZmFzdF9wc2tpcD0xIGNocm9tYV9xcF9vZmZzZXQ9MCB0aHJlYWRzPTEgbG9va2FoZWFkX3RocmVhZHM9",
+        "MSBzbGljZWRfdGhyZWFkcz0wIG5yPTAgZGVjaW1hdGU9MSBpbnRlcmxhY2VkPTAgYmx1cmF5X2NvbXBhdD0wIGNvbnN0cmFpbmVk",
+        "X2ludHJhPTAgYmZyYW1lcz0wIHdlaWdodHA9MCBrZXlpbnQ9MjUwIGtleWludF9taW49NSBzY2VuZWN1dD0wIGludHJhX3JlZnJl",
+        "c2g9MCByYz1jcmYgbWJ0cmVlPTAgY3JmPTIzLjAgcWNvbXA9MC42MCBxcG1pbj0wIHFwbWF4PTY5IHFwc3RlcD00IGlwX3JhdGlv",
+        "PTEuNDAgYXE9MACAAAAAFmWIhDomKAAJAsnJyddddddddddddeAhEARgjBwhEARgjBwhEARgjBwhEARgjBwhEARgjBwhEARgjBwh",
+        "EARgjBwhEARgjBwhEARgjBwhEARgjBwAAAAGQZogFKCMIRAEYIwcIRAEYIwcIRAEYIwcIRAEYIwcIRAEYIwcIRAEYIwcIRAEYIwc",
+        "IRAEYIwcAAAABkGaQBSgjCEQBGCMHCEQBGCMHCEQBGCMHCEQBGCMHCEQBGCMHCEQBGCMHCEQBGCMHCEQBGCMHCEQBGCMHAAAAAZB",
+        "mmAUoIwhEARgjBwhEARgjBwhEARgjBwhEARgjBwhEARgjBwhEARgjBwhEARgjBwhEARgjBwhEARgjBwAAAAGQZqAFaCMIRAEYIwc",
+        "IRAEYIwcIRAEYIwcIRAEYIwcIRAEYIwcIRAEYIwcIRAEYIwcIRAEYIwcIRAEYIwc",
+    );
+    let fixture = base64::engine::general_purpose::STANDARD
+        .decode(CLOCKLESS_AV_FIXTURE)
+        .unwrap();
+    std::fs::write(&video, fixture).unwrap();
 
     #[cfg(windows)]
     {
@@ -1365,13 +1408,13 @@ fn remote_video_stream_keeps_remote_dialog_without_entering_fullscreen() {
     app.poll_remote_session(&egui::Context::default());
     assert_eq!(
         app.remote_video_player_engine_state_for_test(),
-        Some("Playing"),
-        "Starting must drain SeekCompleted, FirstFrameReady, and BufferReady"
+        Some("Paused"),
+        "Starting must drain seek readiness without turning the metadata player into the transport"
     );
-    assert!(
-        app.remote_video_player_intent_playing_for_test()
-            .is_some_and(|playing| playing),
-        "decoder transport must remain active"
+    assert_eq!(
+        app.remote_video_player_intent_playing_for_test(),
+        Some(false),
+        "the terminal owns play intent; the metadata player must stay paused"
     );
     assert_eq!(app.fullscreen_idx, None);
     assert!(
@@ -1405,9 +1448,10 @@ fn remote_video_stream_keeps_remote_dialog_without_entering_fullscreen() {
             .wait_ready(std::time::Duration::from_secs(7)),
         crate::video::stream::session::StreamGenerationStatus::Ready(_)
     ));
-    assert!(
-        published.generation_id().0 >= 2,
-        "the generation created before the opening seek must not be returned"
+    assert_eq!(
+        published.generation_id().0,
+        1,
+        "clockless generation starts only after the metadata seek has settled"
     );
     assert!(matches!(
         published.generation.resource(

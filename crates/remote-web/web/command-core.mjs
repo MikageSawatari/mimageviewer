@@ -451,31 +451,19 @@ export function videoQualityPreset(quality) {
 }
 
 export function videoTimelineAnchor({
-  serverPositionSecs,
-  mediaCurrentTimeSecs,
-  seekableEndSecs,
+  sourceOriginSecs,
   durationSecs,
 }) {
   const duration = Math.max(0, Number(durationSecs) || 0);
-  const mediaTime = Math.max(0, Number(mediaCurrentTimeSecs) || 0);
-  const serverPosition = Math.max(0, Number(serverPositionSecs) || 0);
-  const seekableEnd = Number(seekableEndSecs);
-  const liveLag = Number.isFinite(seekableEnd)
-    ? Math.max(0, seekableEnd - mediaTime)
-    : 0;
+  const sourceOrigin = Math.max(0, Number(sourceOriginSecs) || 0);
   return {
-    sourcePositionSecs: clampNumber(serverPosition - liveLag, 0, duration || serverPosition),
-    mediaTimeSecs: mediaTime,
+    sourcePositionSecs: clampNumber(sourceOrigin, 0, duration || sourceOrigin),
+    mediaTimeSecs: 0,
   };
 }
 
-/// 基準点は世代ごとに 1 度だけ置く。`videoTimelineAnchor` の `serverPosition - liveLag` は
-/// 2 つの揺れる値の差で、`liveLag` はセグメントが届くたびに 0 と segment 長の間を鋸歯状に
-/// 往復する。毎回の状態ポーリングで引き直すと、その揺れがそのまま表示位置の前後になる
-/// (2026-08-04 実機: 1:27 と 1:26 を往復)。世代の中では端末自身の再生位置だけで進める。
-///
-/// 非実時間トランスコードを入れると本体の位置は端末よりさらに先行するので、この分離は
-/// 表示の見栄えではなく前提条件になる。
+/// 基準点は世代ごとに 1 度だけ source origin へ置く。生成端は端末より先行するため、世代の
+/// 中では端末自身の media currentTime だけで実 playhead を進める。
 export function shouldReanchorVideoTimeline({
   anchoredGeneration,
   stateGeneration,

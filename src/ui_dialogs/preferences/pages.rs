@@ -5884,12 +5884,6 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
             &mut s.remote_video_streaming_enabled,
             "リモート端末への動画配信を有効にする",
         );
-        ui.add_enabled_ui(s.remote_video_streaming_enabled, |ui| {
-            ui.checkbox(
-                &mut s.remote_video_mute_local_output,
-                "配信中はこの PC の音声をミュート",
-            );
-        });
 
         // 再生位置レジューム (続き/先頭の切替・位置クリア) は「履歴と復元」ページに集約。
         ui.add_space(12.0);

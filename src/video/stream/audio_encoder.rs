@@ -481,7 +481,6 @@ fn deinterleave(samples: &[f32]) -> (Vec<f32>, Vec<f32>) {
 
 impl OpenedAacEncoder {
     /// swresample の delay と 1024-sample 未満の末尾を吐き、AAC encoder を drain する。
-    #[cfg(test)]
     pub(crate) fn finish(&mut self) -> Result<Vec<ffmpeg::Packet>, AacEncoderError> {
         if self.finished {
             return Ok(Vec::new());
@@ -553,7 +552,6 @@ fn resample_interleaved(
     ))
 }
 
-#[cfg(test)]
 fn flush_resampler(
     resampler: &mut ffmpeg::software::resampling::Context,
     output_rate: u32,

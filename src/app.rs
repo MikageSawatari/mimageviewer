@@ -46323,7 +46323,14 @@ impl App {
                 None
             },
             #[cfg(windows)]
-            Some(self.dsp_bridge.clone()),
+            if matches!(
+                output_consumer,
+                crate::video::VideoOutputConsumer::RemoteHeadless
+            ) {
+                None
+            } else {
+                Some(self.dsp_bridge.clone())
+            },
             output_consumer,
             #[cfg(windows)]
             native_output_config,

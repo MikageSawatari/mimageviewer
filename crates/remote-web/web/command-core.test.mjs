@@ -214,8 +214,8 @@ test("a newer build is announced once, and never interrupts on its own", () => {
 });
 
 test("the timeline is anchored once per generation, not on every state poll", () => {
-  // liveLag = seekableEnd - currentTime は segment 到着ごとに 0 と segment 長の間を
-  // 往復するので、毎回の poll で anchor を引き直すと表示位置がその幅だけ前後する。
+  // generation edge は端末 playhead ではない。同じ generation の生成が進んでも
+  // source origin は固定し、media element の currentTime だけで位置を進める。
   assert.equal(
     shouldReanchorVideoTimeline({ anchoredGeneration: null, stateGeneration: 7 }),
     true,
@@ -232,40 +232,34 @@ test("the timeline is anchored once per generation, not on every state poll", ()
     "世代が変わったら置き直す"
   );
 
-  // 同じ世代で liveLag だけが揺れても、表示位置は端末自身の再生位置で進む。
   const anchor = videoTimelineAnchor({
-    serverPositionSecs: 300,
-    mediaCurrentTimeSecs: 55,
-    seekableEndSecs: 60,
+    sourceOriginSecs: 240,
     durationSecs: 600,
   });
   const jittered = videoTimelineAnchor({
-    serverPositionSecs: 302,
-    mediaCurrentTimeSecs: 57,
-    seekableEndSecs: 62,
+    sourceOriginSecs: 240,
+    generatedEndSecs: 302,
     durationSecs: 600,
   });
-  assert.notDeepEqual(anchor, jittered, "poll ごとの anchor は揺れる (だから固定する)");
+  assert.deepEqual(anchor, jittered, "生成端は timeline anchor に影響しない");
   assert.equal(
     videoTimelinePosition({
       anchorSourcePositionSecs: anchor.sourcePositionSecs,
       anchorMediaTimeSecs: anchor.mediaTimeSecs,
-      mediaCurrentTimeSecs: 57,
+      mediaCurrentTimeSecs: 2,
       durationSecs: 600,
     }),
-    297,
+    242,
     "固定した基準点なら 2 秒進んだぶんだけ素直に進む"
   );
 });
 
-test("whole-video position composes server state with the HLS window", () => {
+test("whole-video position composes source origin with the media element playhead", () => {
   const anchor = videoTimelineAnchor({
-    serverPositionSecs: 300,
-    mediaCurrentTimeSecs: 55,
-    seekableEndSecs: 60,
+    sourceOriginSecs: 240,
     durationSecs: 600,
   });
-  assert.deepEqual(anchor, { sourcePositionSecs: 295, mediaTimeSecs: 55 });
+  assert.deepEqual(anchor, { sourcePositionSecs: 240, mediaTimeSecs: 0 });
   assert.equal(videoTimelinePosition({
     anchorSourcePositionSecs: anchor.sourcePositionSecs,
     anchorMediaTimeSecs: anchor.mediaTimeSecs,

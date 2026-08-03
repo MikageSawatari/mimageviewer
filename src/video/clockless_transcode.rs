@@ -1,8 +1,8 @@
 //! Clock-free remote-video transcode driver.
 //!
 //! This path owns a separate demuxer/decoder and never consults `VideoPlayer`, the presentation
-//! clock, or the audio device. It is intentionally not wired to `VideoStreamSession` yet. The
-//! development benchmark is its only caller in this increment.
+//! clock, or the audio device. The remote streaming session owns this driver and consumes its
+//! bounded output ring; the standalone benchmark uses the same path with automatic consumption.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -19,8 +19,10 @@ use ffmpeg::util::frame::{Audio, Video};
 use ffmpeg_the_third as ffmpeg;
 
 use super::audio::ProcessedChunk;
+use super::audio::SafetyLimiter;
 use super::stream::audio_encoder::{OpenedAacEncoder, open_aac_encoder};
 use super::stream::encoder::{EncoderPreference, FrameRate, H264InputFormat};
+use super::stream::playlist::SegmentLookup;
 use super::stream::quality::{OutputDimensions, QualityPreset};
 use super::stream::segmenter::Fmp4Segmenter;
 use super::stream::timeline::StreamTimeline;
@@ -61,12 +63,15 @@ pub struct ClocklessTranscodeOptions {
     pub include_audio: bool,
     pub hw_decode: bool,
     pub quality: ClocklessQuality,
+    pub(crate) encoder: EncoderPreference,
     /// `None` decodes to EOF. The limit is measured from the selected streams' earliest start.
     pub max_source_secs: Option<f64>,
     pub segment_capacity: usize,
     /// Run one extra swscale operation per video frame for stage attribution. This intentionally
     /// reduces throughput and must be false for the headline real-time multiple.
     pub profile_swscale: bool,
+    /// Requested source-timeline origin for this generation.
+    pub source_origin_secs: f64,
 }
 
 impl ClocklessTranscodeOptions {
@@ -76,11 +81,243 @@ impl ClocklessTranscodeOptions {
             include_audio: true,
             hw_decode: true,
             quality: ClocklessQuality::Standard,
+            encoder: EncoderPreference::Auto,
             max_source_secs: Some(30.0),
             segment_capacity: 30,
             profile_swscale: false,
+            source_origin_secs: 0.0,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClocklessOutputInfo {
+    pub(crate) encoder: super::stream::encoder::H264EncoderKind,
+    pub(crate) output_dimensions: OutputDimensions,
+    pub(crate) video_bitrate_bps: u64,
+    pub(crate) audio_bitrate_bps: u64,
+    pub(crate) codecs: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ClocklessOutputMetrics {
+    pub(crate) source_origin_secs: f64,
+    pub(crate) generated_start_secs: f64,
+    pub(crate) generated_end_secs: f64,
+    pub(crate) ring_start_secs: f64,
+    pub(crate) ring_end_secs: f64,
+    pub(crate) earliest_sequence: Option<u64>,
+    pub(crate) latest_sequence: Option<u64>,
+    pub(crate) buffered_secs: f64,
+    pub(crate) effective_bitrate_bps: u64,
+    pub(crate) ended: bool,
+}
+
+struct ClocklessOutputState {
+    segmenter: Option<Fmp4Segmenter>,
+    info: Option<ClocklessOutputInfo>,
+    segment_capacity: usize,
+    source_origin_secs: f64,
+    generated_duration_secs: f64,
+    evicted_duration_secs: f64,
+    retained: VecDeque<(u64, f64)>,
+    ended: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct ClocklessStreamOutput {
+    inner: Arc<Mutex<ClocklessOutputState>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ClocklessSegmentBytes {
+    Found(Vec<u8>),
+    Gone,
+    NotFound,
+}
+
+#[derive(Clone)]
+pub(crate) struct ClocklessAudioProcessing {
+    pub(crate) normalize_gain: f64,
+}
+
+impl Default for ClocklessAudioProcessing {
+    fn default() -> Self {
+        Self {
+            normalize_gain: 1.0,
+        }
+    }
+}
+
+impl ClocklessStreamOutput {
+    pub(crate) fn new(segment_capacity: usize, source_origin_secs: f64) -> Result<Self, String> {
+        if segment_capacity == 0 {
+            return Err("segment capacity must be non-zero".to_owned());
+        }
+        if !source_origin_secs.is_finite() || source_origin_secs < 0.0 {
+            return Err("source origin must be finite and non-negative".to_owned());
+        }
+        Ok(Self {
+            inner: Arc::new(Mutex::new(ClocklessOutputState {
+                segmenter: None,
+                info: None,
+                segment_capacity,
+                source_origin_secs,
+                generated_duration_secs: 0.0,
+                evicted_duration_secs: 0.0,
+                retained: VecDeque::with_capacity(segment_capacity),
+                ended: false,
+            })),
+        })
+    }
+
+    pub(crate) fn info(&self) -> Option<ClocklessOutputInfo> {
+        self.inner.lock().unwrap().info.clone()
+    }
+
+    pub(crate) fn master_playlist(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .segmenter
+            .as_ref()
+            .and_then(Fmp4Segmenter::master_playlist)
+    }
+
+    pub(crate) fn media_playlist(&self) -> Option<String> {
+        let state = self.inner.lock().unwrap();
+        state
+            .segmenter
+            .as_ref()?
+            .media_playlist()
+            .map(|body| media_playlist_with_end(body, state.ended))
+    }
+
+    pub(crate) fn init_segment(&self) -> Option<Vec<u8>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .segmenter
+            .as_ref()
+            .and_then(Fmp4Segmenter::init_segment)
+            .map(<[u8]>::to_vec)
+    }
+
+    pub(crate) fn segment(&self, sequence: u64) -> ClocklessSegmentBytes {
+        let state = self.inner.lock().unwrap();
+        let Some(segmenter) = state.segmenter.as_ref() else {
+            return ClocklessSegmentBytes::NotFound;
+        };
+        match segmenter.segment(sequence) {
+            SegmentLookup::Found(segment) => ClocklessSegmentBytes::Found(segment.bytes.clone()),
+            SegmentLookup::Gone => ClocklessSegmentBytes::Gone,
+            SegmentLookup::NotFound => ClocklessSegmentBytes::NotFound,
+        }
+    }
+
+    pub(crate) fn metrics(&self) -> ClocklessOutputMetrics {
+        let state = self.inner.lock().unwrap();
+        let generated_end_secs = state.source_origin_secs + state.generated_duration_secs;
+        ClocklessOutputMetrics {
+            source_origin_secs: state.source_origin_secs,
+            generated_start_secs: state.source_origin_secs,
+            generated_end_secs,
+            ring_start_secs: state.source_origin_secs + state.evicted_duration_secs,
+            ring_end_secs: generated_end_secs,
+            earliest_sequence: state.retained.front().map(|(sequence, _)| *sequence),
+            latest_sequence: state.retained.back().map(|(sequence, _)| *sequence),
+            buffered_secs: state
+                .segmenter
+                .as_ref()
+                .map_or(0.0, Fmp4Segmenter::buffered_duration_secs),
+            effective_bitrate_bps: state
+                .segmenter
+                .as_ref()
+                .map_or(0, Fmp4Segmenter::effective_bitrate_bps),
+            ended: state.ended,
+        }
+    }
+
+    fn install(
+        &self,
+        segmenter: Fmp4Segmenter,
+        info: ClocklessOutputInfo,
+        source_origin_secs: f64,
+    ) {
+        let mut state = self.inner.lock().unwrap();
+        state.segmenter = Some(segmenter);
+        state.info = Some(info);
+        state.source_origin_secs = source_origin_secs;
+    }
+
+    fn with_segmenter<T>(
+        &self,
+        action: impl FnOnce(&mut Fmp4Segmenter) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut state = self.inner.lock().unwrap();
+        let segmenter = state
+            .segmenter
+            .as_mut()
+            .ok_or_else(|| "clockless output is not initialized".to_owned())?;
+        action(segmenter)
+    }
+
+    fn record_completed(&self, sequence: u64) -> Result<(), String> {
+        let mut state = self.inner.lock().unwrap();
+        if state
+            .retained
+            .back()
+            .is_some_and(|(last, _)| *last >= sequence)
+        {
+            return Ok(());
+        }
+        let first = state
+            .retained
+            .back()
+            .map_or(0, |(last, _)| last.saturating_add(1));
+        for completed in first..=sequence {
+            let duration = match state
+                .segmenter
+                .as_ref()
+                .ok_or_else(|| "clockless output is not initialized".to_owned())?
+                .segment(completed)
+            {
+                SegmentLookup::Found(segment) => segment.duration_secs,
+                _ => return Err(format!("completed segment {completed} is unavailable")),
+            };
+            state.generated_duration_secs += duration;
+            state.retained.push_back((completed, duration));
+        }
+        while state.retained.len() > state.segment_capacity {
+            if let Some((_, duration)) = state.retained.pop_front() {
+                state.evicted_duration_secs += duration;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<Option<u64>, String> {
+        let mut state = self.inner.lock().unwrap();
+        let sequence = state
+            .segmenter
+            .as_mut()
+            .ok_or_else(|| "clockless output is not initialized".to_owned())?
+            .finish()
+            .map_err(|error| error.to_string())?;
+        drop(state);
+        if let Some(sequence) = sequence {
+            self.record_completed(sequence)?;
+        }
+        self.inner.lock().unwrap().ended = true;
+        Ok(sequence)
+    }
+}
+
+fn media_playlist_with_end(mut body: String, ended: bool) -> String {
+    if ended && !body.contains("#EXT-X-ENDLIST") {
+        body.push_str("#EXT-X-ENDLIST\n");
+    }
+    body
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -92,6 +329,7 @@ pub struct ClocklessStageTimes {
     pub video_scale_encode_secs: f64,
     pub profiled_swscale_secs: f64,
     pub audio_decode_resample_secs: f64,
+    pub audio_process_secs: f64,
     pub audio_encode_secs: f64,
     pub mux_secs: f64,
 }
@@ -142,6 +380,7 @@ struct ClocklessControlInner {
     capacity: u64,
     auto_release: bool,
     cancel: AtomicBool,
+    external_cancel: Mutex<Option<Arc<AtomicBool>>>,
     state: Mutex<AheadState>,
     wake: Condvar,
 }
@@ -173,6 +412,7 @@ impl ClocklessTranscodeControl {
                 capacity,
                 auto_release,
                 cancel: AtomicBool::new(false),
+                external_cancel: Mutex::new(None),
                 state: Mutex::new(AheadState {
                     produced_segments: 0,
                     released_segments: 0,
@@ -186,6 +426,10 @@ impl ClocklessTranscodeControl {
     pub fn cancel(&self) {
         self.inner.cancel.store(true, Ordering::Release);
         self.inner.wake.notify_all();
+    }
+
+    pub(crate) fn bind_cancel_flag(&self, cancel: Arc<AtomicBool>) {
+        *self.inner.external_cancel.lock().unwrap() = Some(cancel);
     }
 
     /// Release every segment through `sequence` (inclusive). Stale or future acknowledgements
@@ -211,7 +455,14 @@ impl ClocklessTranscodeControl {
     }
 
     fn checkpoint(&self) -> Result<(), ClocklessStop> {
-        if self.inner.cancel.load(Ordering::Acquire) {
+        let externally_cancelled = self
+            .inner
+            .external_cancel
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(Ordering::Acquire));
+        if self.inner.cancel.load(Ordering::Acquire) || externally_cancelled {
             return Err(ClocklessStop::Cancelled);
         }
         Ok(())
@@ -302,6 +553,10 @@ impl ClocklessMux {
         self.drain_while(segmenter, |dts| dts <= watermark)
     }
 
+    fn drain_all(&mut self, segmenter: &mut Fmp4Segmenter) -> Result<Option<u64>, String> {
+        self.drain_while(segmenter, |_| true)
+    }
+
     fn drain_while(
         &mut self,
         segmenter: &mut Fmp4Segmenter,
@@ -357,12 +612,13 @@ struct AudioPath {
     resampler: ffmpeg::software::resampling::Context,
     time_base_secs: f64,
     input_rate: u32,
+    output_rate: u32,
     next_pts_secs: Option<f64>,
     codec_name: String,
 }
 
 impl AudioPath {
-    fn open(stream: ffmpeg::Stream<'_>) -> Result<Self, String> {
+    fn open(stream: ffmpeg::Stream<'_>, output_rate: u32) -> Result<Self, String> {
         let time_base = stream.time_base();
         let context = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|error| format!("audio decoder context: {error}"))?;
@@ -380,7 +636,7 @@ impl AudioPath {
             input_rate,
             Sample::F32(SampleType::Packed),
             ffmpeg::ChannelLayout::STEREO,
-            AUDIO_OUTPUT_RATE,
+            output_rate,
         )
         .map_err(|error| format!("audio resampler open: {error}"))?;
         Ok(Self {
@@ -388,6 +644,7 @@ impl AudioPath {
             resampler,
             time_base_secs: f64::from(time_base.numerator()) / f64::from(time_base.denominator()),
             input_rate,
+            output_rate,
             next_pts_secs: None,
             codec_name,
         })
@@ -408,7 +665,7 @@ impl AudioPath {
         let output_samples = resample_output_capacity(
             frame.samples() as u64,
             self.input_rate,
-            AUDIO_OUTPUT_RATE,
+            self.output_rate,
             delay,
         );
         if output_samples == 0 {
@@ -421,7 +678,7 @@ impl AudioPath {
                 output_samples,
                 ffmpeg::ChannelLayoutMask::STEREO,
             );
-            output.set_rate(AUDIO_OUTPUT_RATE);
+            output.set_rate(self.output_rate);
         }
         self.resampler
             .run(frame, &mut output)
@@ -448,7 +705,7 @@ impl AudioPath {
             }
             std::slice::from_raw_parts(ptr, element_count).to_vec()
         };
-        let duration_secs = frames as f64 / f64::from(AUDIO_OUTPUT_RATE);
+        let duration_secs = frames as f64 / f64::from(self.output_rate);
         self.next_pts_secs = Some(pts + duration_secs);
         Ok(Some(ProcessedChunk {
             samples,
@@ -458,6 +715,67 @@ impl AudioPath {
             seek_serial: SEEK_SERIAL,
             pdc_latency_secs_at_process: 0.0,
         }))
+    }
+
+    fn flush_resampler(&mut self) -> Result<Option<ProcessedChunk>, String> {
+        let pts = self.next_pts_secs.unwrap_or(0.0);
+        let delay = self
+            .resampler
+            .delay()
+            .map(|delay| delay.output.max(0) as usize)
+            .unwrap_or(0);
+        if delay == 0 {
+            return Ok(None);
+        }
+        let mut output = Audio::empty();
+        unsafe {
+            output.alloc(
+                Sample::F32(SampleType::Packed),
+                delay.saturating_add(32),
+                ffmpeg::ChannelLayoutMask::STEREO,
+            );
+            output.set_rate(self.output_rate);
+        }
+        self.resampler
+            .flush(&mut output)
+            .map_err(|error| format!("audio resampler flush: {error}"))?;
+        self.output_to_chunk(output, pts)
+    }
+}
+
+struct ClocklessAudioProcessor {
+    normalize_gain: f32,
+    limiter: SafetyLimiter,
+}
+
+impl ClocklessAudioProcessor {
+    fn new(config: ClocklessAudioProcessing, sample_rate: u32) -> Result<Self, String> {
+        if !config.normalize_gain.is_finite() || config.normalize_gain < 0.0 {
+            return Err("normalize gain must be finite and non-negative".to_owned());
+        }
+        Ok(Self {
+            normalize_gain: config.normalize_gain as f32,
+            limiter: SafetyLimiter::new(sample_rate, 2),
+        })
+    }
+
+    fn process(&mut self, mut chunk: ProcessedChunk) -> ProcessedChunk {
+        if (self.normalize_gain - 1.0).abs() > f32::EPSILON {
+            for sample in &mut chunk.samples {
+                *sample *= self.normalize_gain;
+            }
+        }
+
+        let mut latency_secs = 0.0;
+        if self.normalize_gain > 1.0 + f32::EPSILON {
+            self.limiter.process_block(&mut chunk.samples);
+            latency_secs += self.limiter.latency_secs();
+        } else {
+            self.limiter.reset();
+        }
+        chunk.audible_pts_secs -= latency_secs;
+        chunk.pdc_latency_secs_at_process = latency_secs;
+        chunk
     }
 }
 
@@ -546,7 +864,8 @@ struct DriverState<'a> {
     video_tap: VideoTapProducer,
     video_rx: Receiver<TappedVideoFrame>,
     audio_encoder: OpenedAacEncoder,
-    segmenter: Fmp4Segmenter,
+    output: ClocklessStreamOutput,
+    audio_processor: ClocklessAudioProcessor,
     mux: ClocklessMux,
     scale_profiler: Option<ScaleProfiler>,
     times: ClocklessStageTimes,
@@ -576,6 +895,7 @@ impl DriverState<'_> {
     }
 
     fn push_video_frame(&mut self, frame: &Video, pts_secs: f64) -> Result<(), String> {
+        self.wait_for_capacity()?;
         self.checkpoint()?;
         let started = Instant::now();
         self.video_tap.try_publish(frame, pts_secs, SEEK_SERIAL);
@@ -602,10 +922,11 @@ impl DriverState<'_> {
         }
         self.checkpoint()?;
         let started = Instant::now();
-        let packets = self
-            .video
-            .encode_frame(tapped, &self.segmenter)
-            .map_err(|error| error.to_string())?;
+        let packets = self.output.with_segmenter(|segmenter| {
+            self.video
+                .encode_frame(tapped, segmenter)
+                .map_err(|error| error.to_string())
+        })?;
         self.times.video_scale_encode_secs += started.elapsed().as_secs_f64();
         for packet in packets {
             self.mux.enqueue_video(packet, self.frame_rate)?;
@@ -616,7 +937,11 @@ impl DriverState<'_> {
     }
 
     fn push_audio_chunk(&mut self, chunk: ProcessedChunk) -> Result<(), String> {
+        self.wait_for_capacity()?;
         self.checkpoint()?;
+        let started = Instant::now();
+        let chunk = self.audio_processor.process(chunk);
+        self.times.audio_process_secs += started.elapsed().as_secs_f64();
         let started = Instant::now();
         let packets = self
             .audio_encoder
@@ -635,18 +960,23 @@ impl DriverState<'_> {
         self.checkpoint()?;
         let started = Instant::now();
         if self.options.include_audio {
-            if let Some(sequence) = self.mux.drain_ready(&mut self.segmenter)? {
+            let sequence = self
+                .output
+                .with_segmenter(|segmenter| self.mux.drain_ready(segmenter))?;
+            if let Some(sequence) = sequence {
                 self.completed_segments = self.completed_segments.max(sequence.saturating_add(1));
+                self.output.record_completed(sequence)?;
             }
         } else {
             while let Some(packet) = self.mux.video.pop_front() {
-                if let Some(sequence) = self
-                    .segmenter
-                    .push_packet(&packet.packet)
-                    .map_err(|error| error.to_string())?
-                {
+                if let Some(sequence) = self.output.with_segmenter(|segmenter| {
+                    segmenter
+                        .push_packet(&packet.packet)
+                        .map_err(|error| error.to_string())
+                })? {
                     self.completed_segments =
                         self.completed_segments.max(sequence.saturating_add(1));
+                    self.output.record_completed(sequence)?;
                 }
             }
         }
@@ -660,6 +990,23 @@ impl DriverState<'_> {
 pub fn run_clockless_transcode(
     options: &ClocklessTranscodeOptions,
     control: &ClocklessTranscodeControl,
+) -> Result<ClocklessTranscodeReport, String> {
+    let output = ClocklessStreamOutput::new(options.segment_capacity, options.source_origin_secs)?;
+    run_clockless_stream(
+        options,
+        control,
+        output,
+        ClocklessAudioProcessing::default(),
+        |_| {},
+    )
+}
+
+pub(crate) fn run_clockless_stream(
+    options: &ClocklessTranscodeOptions,
+    control: &ClocklessTranscodeControl,
+    stream_output: ClocklessStreamOutput,
+    audio_processing: ClocklessAudioProcessing,
+    on_ready: impl FnOnce(ClocklessOutputInfo),
 ) -> Result<ClocklessTranscodeReport, String> {
     validate_options(options, control)?;
     ffmpeg::init().map_err(|error| format!("FFmpeg initialization failed: {error}"))?;
@@ -713,8 +1060,12 @@ pub fn run_clockless_transcode(
     } else {
         0.0
     };
-    let timeline = StreamTimeline::new(source_start_secs).map_err(|error| error.to_string())?;
-    let mut audio_path = audio_stream.map(AudioPath::open).transpose()?;
+    let source_origin_secs = options.source_origin_secs.max(source_start_secs);
+    let timeline = StreamTimeline::new(source_origin_secs).map_err(|error| error.to_string())?;
+    let processing_sample_rate = AUDIO_OUTPUT_RATE;
+    let mut audio_path = audio_stream
+        .map(|stream| AudioPath::open(stream, processing_sample_rate))
+        .transpose()?;
     if options.include_audio && audio_path.is_none() {
         return Err("include_audio was requested but the input has no audio stream".to_owned());
     }
@@ -723,7 +1074,7 @@ pub fn run_clockless_transcode(
     let (video_tap_controller, video_tap) = video_tap_channel();
     let (_video_tap_lease, video_rx) = video_tap_controller.attach(1).map_err(str::to_owned)?;
     let video = open_video_stream_encoder(
-        EncoderPreference::Auto,
+        options.encoder,
         options.quality.internal(),
         source_width,
         source_height,
@@ -733,7 +1084,7 @@ pub fn run_clockless_transcode(
     )
     .map_err(|error| error.to_string())?;
     let audio_encoder = open_aac_encoder(
-        AUDIO_OUTPUT_RATE,
+        processing_sample_rate,
         options.quality.internal().parameters().audio_bitrate_bps,
         SEEK_SERIAL,
         timeline,
@@ -748,6 +1099,16 @@ pub fn run_clockless_transcode(
     .map_err(|error| error.to_string())?;
     let encoder = video.encoder_kind().as_str().to_owned();
     let output = video.output_parameters().dimensions;
+    let output_info = ClocklessOutputInfo {
+        encoder: video.encoder_kind(),
+        output_dimensions: output,
+        video_bitrate_bps: video.effective_video_bitrate_bps(),
+        audio_bitrate_bps: audio_encoder.effective_bitrate_bps(),
+        codecs: segmenter.codecs().to_owned(),
+    };
+    let audio_processor = ClocklessAudioProcessor::new(audio_processing, processing_sample_rate)?;
+    stream_output.install(segmenter, output_info.clone(), source_origin_secs);
+    on_ready(output_info);
     let mut state = DriverState {
         options,
         control,
@@ -756,7 +1117,8 @@ pub fn run_clockless_transcode(
         video_tap,
         video_rx,
         audio_encoder,
-        segmenter,
+        output: stream_output,
+        audio_processor,
         mux: ClocklessMux::default(),
         scale_profiler: None,
         times,
@@ -765,15 +1127,36 @@ pub fn run_clockless_transcode(
         audio_frames: 0,
         scale_profile_samples: 0,
         completed_segments: 0,
-        max_source_pts: source_start_secs,
+        max_source_pts: source_origin_secs,
     };
 
     let limit_at = options
         .max_source_secs
-        .map(|seconds| source_start_secs + seconds);
+        .map(|seconds| source_origin_secs + seconds);
     let video_tb_secs =
         f64::from(video_time_base.numerator()) / f64::from(video_time_base.denominator());
-    let mut next_video_pts = source_start_secs;
+    let mut next_video_pts = source_origin_secs;
+    if source_origin_secs > source_start_secs + f64::EPSILON {
+        let target = (source_origin_secs * 1_000_000.0).round() as i64;
+        let seek_result = unsafe {
+            ffmpeg::ffi::av_seek_frame(
+                input.as_mut_ptr(),
+                -1,
+                target,
+                ffmpeg::ffi::AVSEEK_FLAG_BACKWARD as i32,
+            )
+        };
+        if seek_result < 0 {
+            return Err(format!(
+                "clockless seek to {source_origin_secs:.3}s failed: {seek_result}"
+            ));
+        }
+        video_decoder.decoder_mut().flush();
+        if let Some(path) = audio_path.as_mut() {
+            path.decoder.flush();
+            path.next_pts_secs = None;
+        }
+    }
     let mut reached_limit = false;
     let mut packets = input.packets();
     while !reached_limit {
@@ -811,6 +1194,9 @@ pub fn run_clockless_transcode(
                             reached_limit = true;
                             break;
                         }
+                        if pts < source_origin_secs {
+                            continue;
+                        }
                         state.push_video_frame(&frame, pts)?;
                     }
                     Err(ffmpeg::Error::Other { errno }) if errno == FFMPEG_EAGAIN => break,
@@ -840,7 +1226,9 @@ pub fn run_clockless_transcode(
                         state.times.audio_decode_resample_secs +=
                             convert_started.elapsed().as_secs_f64();
                         if let Some(chunk) = chunk {
-                            state.push_audio_chunk(chunk)?;
+                            if chunk.audible_pts_secs + chunk.duration_secs >= source_origin_secs {
+                                state.push_audio_chunk(chunk)?;
+                            }
                         }
                     }
                     Err(ffmpeg::Error::Other { errno }) if errno == FFMPEG_EAGAIN => break,
@@ -851,10 +1239,59 @@ pub fn run_clockless_transcode(
         }
     }
 
+    if !reached_limit {
+        state.checkpoint()?;
+        video_decoder
+            .decoder_mut()
+            .send_eof()
+            .map_err(|error| format!("video send_eof: {error}"))?;
+        loop {
+            let mut frame = Video::empty();
+            match video_decoder.decoder_mut().receive_frame(&mut frame) {
+                Ok(()) => {
+                    let pts = super::decoder::video_frame_timestamp(&frame)
+                        .map(|pts| pts as f64 * video_tb_secs)
+                        .unwrap_or(next_video_pts);
+                    next_video_pts =
+                        pts + f64::from(frame_rate.denominator) / f64::from(frame_rate.numerator);
+                    if pts >= source_origin_secs {
+                        state.push_video_frame(&frame, pts)?;
+                    }
+                }
+                Err(ffmpeg::Error::Eof) => break,
+                Err(ffmpeg::Error::Other { errno }) if errno == FFMPEG_EAGAIN => break,
+                Err(error) => return Err(format!("video drain receive_frame: {error}")),
+            }
+        }
+        if let Some(path) = audio_path.as_mut() {
+            path.decoder
+                .send_eof()
+                .map_err(|error| format!("audio send_eof: {error}"))?;
+            loop {
+                let mut frame = Audio::empty();
+                match path.decoder.receive_frame(&mut frame) {
+                    Ok(()) => {
+                        if let Some(chunk) = path.frame_to_chunk(&mut frame)?
+                            && chunk.audible_pts_secs + chunk.duration_secs >= source_origin_secs
+                        {
+                            state.push_audio_chunk(chunk)?;
+                        }
+                    }
+                    Err(ffmpeg::Error::Eof) => break,
+                    Err(ffmpeg::Error::Other { errno }) if errno == FFMPEG_EAGAIN => break,
+                    Err(error) => return Err(format!("audio drain receive_frame: {error}")),
+                }
+            }
+            if let Some(chunk) = path.flush_resampler()? {
+                state.push_audio_chunk(chunk)?;
+            }
+        }
+    }
+
     finish_transcode(
         state,
         audio_path.as_mut(),
-        source_start_secs,
+        source_origin_secs,
         wall_started,
         source_codec,
         source_width,
@@ -884,22 +1321,37 @@ fn finish_transcode(
 ) -> Result<ClocklessTranscodeReport, String> {
     state.wait_for_capacity()?;
     state.checkpoint()?;
+    let started = Instant::now();
+    for packet in state.video.finish().map_err(|error| error.to_string())? {
+        state.mux.enqueue_video(packet, state.frame_rate)?;
+    }
+    state.times.video_scale_encode_secs += started.elapsed().as_secs_f64();
     if state.options.include_audio {
         let started = Instant::now();
-        if let Some(sequence) = state.mux.drain_ready(&mut state.segmenter)? {
-            state.completed_segments = state.completed_segments.max(sequence.saturating_add(1));
+        for packet in state
+            .audio_encoder
+            .finish()
+            .map_err(|error| error.to_string())?
+        {
+            state
+                .mux
+                .enqueue_audio(packet, state.audio_encoder.output_sample_rate())?;
         }
-        state.times.mux_secs += started.elapsed().as_secs_f64();
-    } else {
-        while let Some(packet) = state.mux.video.pop_front() {
-            if let Some(sequence) = state
-                .segmenter
-                .push_packet(&packet.packet)
-                .map_err(|error| error.to_string())?
-            {
-                state.completed_segments = state.completed_segments.max(sequence.saturating_add(1));
-            }
-        }
+        state.times.audio_encode_secs += started.elapsed().as_secs_f64();
+    }
+
+    let started = Instant::now();
+    let completed = state
+        .output
+        .with_segmenter(|segmenter| state.mux.drain_all(segmenter))?;
+    state.times.mux_secs += started.elapsed().as_secs_f64();
+    if let Some(sequence) = completed {
+        state.completed_segments = state.completed_segments.max(sequence.saturating_add(1));
+        state.output.record_completed(sequence)?;
+    }
+    state.wait_for_capacity()?;
+    if let Some(sequence) = state.output.finish()? {
+        state.completed_segments = state.completed_segments.max(sequence.saturating_add(1));
     }
     state.observe_segments();
 
@@ -954,6 +1406,9 @@ fn validate_options(
     {
         return Err("max source seconds must be finite and positive".to_owned());
     }
+    if !options.source_origin_secs.is_finite() || options.source_origin_secs < 0.0 {
+        return Err("source origin must be finite and non-negative".to_owned());
+    }
     Ok(())
 }
 
@@ -996,9 +1451,21 @@ mod tests {
             tx.send(()).unwrap();
         });
 
-        thread::sleep(Duration::from_millis(30));
-        assert!(rx.try_recv().is_err());
-        assert!(control.snapshot().waiting_for_capacity);
+        // 「少し眠ればもう待機に入っているはず」は仮定であって観測ではない。lib test 全件
+        // (4800 超) と並列に走ると、この thread が 30ms 以内に scheduler へ回る保証は無く、
+        // 実際に単独では通るのに全件実行でだけ落ちた。状態そのものを待つ。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !control.snapshot().waiting_for_capacity {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "driver never parked on a full ahead window"
+            );
+            thread::yield_now();
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a parked driver must not have produced past the window"
+        );
 
         control.release_through(0);
         rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -1050,5 +1517,174 @@ mod tests {
                 cancelled: false,
             }
         );
+    }
+
+    #[test]
+    fn ended_output_adds_endlist_once_without_changing_live_playlists() {
+        let live = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n".to_owned();
+        assert_eq!(media_playlist_with_end(live.clone(), false), live);
+        let ended = media_playlist_with_end(live, true);
+        assert!(ended.ends_with("#EXT-X-ENDLIST\n"));
+        assert_eq!(media_playlist_with_end(ended.clone(), true), ended);
+    }
+
+    #[test]
+    fn seek_cancels_old_worker_at_boundary_while_new_generation_runs_independently() {
+        let old = ClocklessTranscodeControl::manual(1).unwrap();
+        let replacement = ClocklessTranscodeControl::manual(1).unwrap();
+        let old_worker = old.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (leave_tx, leave_rx) = mpsc::channel();
+        let (old_result_tx, old_result_rx) = mpsc::channel();
+        let old_thread = thread::spawn(move || {
+            let result = old_worker.run_stage(|| {
+                entered_tx.send(()).unwrap();
+                leave_rx.recv().unwrap();
+            });
+            old_result_tx.send(result).unwrap();
+        });
+
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(replacement.run_stage(|| 17_u32), Ok(17));
+        old.cancel();
+        leave_tx.send(()).unwrap();
+
+        assert_eq!(
+            old_result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(ClocklessStop::Cancelled)
+        );
+        assert_eq!(replacement.checkpoint(), Ok(()));
+        old_thread.join().unwrap();
+    }
+
+    #[test]
+    fn normalize_gain_is_applied_before_remote_audio_encoding() {
+        let mut processor = ClocklessAudioProcessor::new(
+            ClocklessAudioProcessing {
+                normalize_gain: 0.579,
+            },
+            AUDIO_OUTPUT_RATE,
+        )
+        .unwrap();
+        let chunk = processor.process(ProcessedChunk {
+            samples: vec![1.0, -0.5],
+            audible_pts_secs: 10.0,
+            duration_secs: 1.0 / f64::from(AUDIO_OUTPUT_RATE),
+            source_secs_per_output_sec: 1.0,
+            seek_serial: SEEK_SERIAL,
+            pdc_latency_secs_at_process: 0.0,
+        });
+
+        assert!((chunk.samples[0] - 0.579).abs() < 1.0e-6);
+        assert!((chunk.samples[1] + 0.2895).abs() < 1.0e-6);
+        assert_eq!(chunk.audible_pts_secs, 10.0);
+    }
+
+    #[test]
+    #[ignore = "set MIV_CLOCKLESS_EOF_FIXTURE to a real finite A/V file"]
+    fn finite_fixture_flushes_final_fragment_and_endlist() {
+        let path = std::env::var_os("MIV_CLOCKLESS_EOF_FIXTURE")
+            .map(PathBuf::from)
+            .expect("MIV_CLOCKLESS_EOF_FIXTURE");
+        let mut options = ClocklessTranscodeOptions::benchmark(path);
+        options.hw_decode = false;
+        options.quality = ClocklessQuality::Minimum;
+        options.max_source_secs = None;
+        let control = ClocklessTranscodeControl::auto_releasing(options.segment_capacity).unwrap();
+        let output = ClocklessStreamOutput::new(options.segment_capacity, 0.0).unwrap();
+        run_clockless_stream(
+            &options,
+            &control,
+            output.clone(),
+            ClocklessAudioProcessing::default(),
+            |_| {},
+        )
+        .unwrap();
+
+        let metrics = output.metrics();
+        assert!(metrics.ended);
+        let latest = metrics.latest_sequence.expect("final fragment sequence");
+        assert!(matches!(
+            output.segment(latest),
+            ClocklessSegmentBytes::Found(_)
+        ));
+        assert!(
+            output
+                .media_playlist()
+                .expect("final media playlist")
+                .ends_with("#EXT-X-ENDLIST\n")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "set MIV_VST_FAST_PROFILE_DIR to an isolated settings.db copy"]
+    fn configured_vst_chain_accepts_sixty_seconds_of_clockless_feed() {
+        let profile_dir = std::env::var_os("MIV_VST_FAST_PROFILE_DIR")
+            .map(PathBuf::from)
+            .expect("MIV_VST_FAST_PROFILE_DIR");
+        let sample_rate = std::env::var("MIV_VST_FAST_SAMPLE_RATE")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(44_100);
+        const BLOCK_FRAMES: u32 = 480;
+        const SOURCE_SECS: u32 = 60;
+
+        let _data_dir_serial = crate::data_dir::test_override_lock();
+        crate::data_dir::set_test_override(Some(profile_dir));
+        crate::settings_db::reset_global_for_test();
+        crate::settings_db::set_save_suppressed(false);
+        let settings = crate::settings::Settings::load();
+        assert!(settings.vst3_enabled, "configured VST3 chain is disabled");
+        assert!(
+            !settings.vst3_plugins.is_empty(),
+            "configured VST3 chain is empty"
+        );
+
+        let bridge = super::super::dsp::DspBridge::new();
+        bridge.enable().unwrap();
+        for plugin in &settings.vst3_plugins {
+            bridge
+                .add_plugin(
+                    &plugin.path,
+                    sample_rate,
+                    BLOCK_FRAMES,
+                    plugin.bypass,
+                    plugin.user_hidden,
+                    plugin.state.as_deref(),
+                    None,
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("load {}: {error}", plugin.path));
+        }
+        assert!(
+            bridge.active_slot_count() > 0,
+            "configured chain has no active VST3 slots"
+        );
+        bridge.reset_plugins_sync();
+
+        let block_samples = BLOCK_FRAMES as usize * 2;
+        let source = vec![0.0_f32; block_samples];
+        let mut destination = vec![0.0_f32; block_samples];
+        let blocks = u64::from(sample_rate)
+            .saturating_mul(u64::from(SOURCE_SECS))
+            .div_ceil(u64::from(BLOCK_FRAMES));
+        let started = Instant::now();
+        for _ in 0..blocks {
+            bridge
+                .process_block(&source, &mut destination)
+                .expect("VST3 fast feed");
+        }
+        let elapsed_secs = started.elapsed().as_secs_f64();
+        let realtime_multiple = f64::from(SOURCE_SECS) / elapsed_secs;
+        eprintln!(
+            "MIV_VST_FAST_FEED sample_rate={sample_rate} active_slots={} \
+             source_secs={SOURCE_SECS} wall_secs={elapsed_secs:.6} realtime_x={realtime_multiple:.3}",
+            bridge.active_slot_count()
+        );
+
+        bridge.disable();
+        crate::settings_db::reset_global_for_test();
+        crate::data_dir::set_test_override(None);
     }
 }

@@ -3765,7 +3765,10 @@ pub struct Settings {
     /// メモリ上に保持する 2 秒 media segment の本数。
     #[serde(default = "default_remote_video_segment_window")]
     pub remote_video_segment_window: usize,
-    /// streaming 中も audio device を動かしたまま、ローカル出力だけを 0 にする。
+    /// 旧ローカル音声ミュート設定。配信が時計なしトランスコードへ移り、headless player が
+    /// 音声デバイスを持たなくなったので、ミュートすべきローカル出力そのものが無い。
+    /// 隣の `remote_video_hide_local_output` と同じく、参照せず設定 DB の後方互換のためだけに
+    /// 保持する (環境設定にも出さない)。
     #[serde(
         default = "default_true",
         deserialize_with = "deserialize_remote_video_output_bool"

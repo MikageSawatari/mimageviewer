@@ -678,31 +678,6 @@ impl Fmp4Segmenter {
         self.stats
     }
 
-    /// まだ ring へ確定していない fragment の source-timeline 長。
-    /// video の末尾に加え、muxer へ渡した audio が先行していればその末尾まで含める。
-    pub(crate) fn pending_fragment_duration_secs(&self) -> f64 {
-        let (start_dts, video_end_dts) = match self.fragment {
-            FragmentState::Empty => return 0.0,
-            FragmentState::Writing { start_dts, end_dts }
-            | FragmentState::AwaitingIdr {
-                start_dts, end_dts, ..
-            } => (start_dts, end_dts),
-        };
-        let audio_end_in_video_ticks = self.last_audio_end_dts.map(|audio_end| unsafe {
-            ffmpeg::ffi::av_rescale_q(
-                audio_end,
-                self.audio_source_time_base,
-                self.video_source_time_base,
-            )
-        });
-        let end_dts = audio_end_in_video_ticks
-            .map_or(video_end_dts, |audio_end| video_end_dts.max(audio_end));
-        (end_dts.saturating_sub(start_dts).max(0) as f64
-            * f64::from(self.video_source_time_base.num)
-            / f64::from(self.video_source_time_base.den))
-        .max(0.0)
-    }
-
     /// CFR source timeline 上の 2 秒境界だけを I frame 指定する。encoder 側の
     /// forced-IDR 設定と合わせ、各 fragment の先頭 packet を IDR にする。
     ///
@@ -1025,7 +1000,6 @@ impl Fmp4Segmenter {
     }
 
     /// session stop/test 終了時だけ、2 秒未満の末尾 fragment も確定して trailer を閉じる。
-    #[cfg(test)]
     pub(crate) fn finish(&mut self) -> Result<Option<u64>, Fmp4SegmenterError> {
         match self.lifecycle {
             SegmenterLifecycle::Finished => return Ok(None),

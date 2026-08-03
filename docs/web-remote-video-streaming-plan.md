@@ -2,15 +2,15 @@
 
 外出先のブラウザから自宅 PC の動画を視聴するために、入力ファイルを **再生器とは独立した
 時計なし経路でデコードし、H.264 + AAC へ再エンコードして HLS で配信する**。本書がこの機能の正本。
-既存リリース候補は本体再生の decoder/audio tap を使う実時間経路だが、初回リリースまでに
-時計なし経路へ切り替える。既存経路は移行完了まで変更せず残す。
+本体再生の decoder/audio tap を使う実時間経路から時計なし経路へ切り替え済みであり、
+production の配信 worker に旧経路や silent fallback は残さない。
 
 - 親計画: [web-remote-plan.md](web-remote-plan.md) (リモート閲覧機能全体の正本)
 - ブランチ: `web-remote` (worktree: `C:\home\mimageviewer-web`)
-- 現在のフェーズ: **時計なし移行 3 段の 1 段目 (駆動部 + 独立ベンチ、未配線)**。
+- 現在のフェーズ: **時計なし移行 3 段の 2 段目 (session / IPC / Web 配線済み)**。
   `clockless_transcode` がファイルを独立 open し、demux / decode / 既存 encoder / AAC /
-  `Fmp4Segmenter` を時計なしで駆動する。既存 `VideoStreamSession` / generation worker、IPC、
-  HTTP、Web フロントはまだ従来経路のまま (2026-08-03)
+  `Fmp4Segmenter` を時計なしで駆動する。generation、60 秒 ring、端末 timeline、seek、
+  EOF flush / ENDLIST まで production 経路へ接続した (2026-08-03)
 
 ---
 
@@ -28,10 +28,9 @@
 トランスコードはこの両方を同時に解消する。さらに mIV 固有の事情として、
 
 - **リモート操作中は本体がロックされる** ([web-remote-plan.md](web-remote-plan.md) §2.2)。
-  つまり本体の再生エンジンをリモート専用に占有できる。ミラー方式と相性が良い
-- 音声は VST3 チェイン・ラウドネスノーマライズ・セーフティリミッタを通した**最終 PCM が
-  1 箇所に揃っている** ([src/video/audio.rs](../src/video/audio.rs) の audio pump)。
-  ここを分岐させるだけで「PC で聞いているのと同じ音」が pts 付きで取れる
+  session / generation を 1 経路に限定でき、時計なし worker の所有権と相性が良い
+- 音声も同じファイルから独立 decode できる。音量正規化 gain は metadata player から snapshot
+  して AAC 前段へ再適用し、VST3 はリモート非対応として経路から外す
 - 解像度・ビットレートを送信側で決められるので、帯域に合わせて画質を落とせる
 
 **したがって remux + 音声フォールバックは不要になり、本方式がそれを完全に置き換える。**
@@ -42,7 +41,7 @@
 
 | 項目 | 決定 | 理由 |
 |---|---|---|
-| 取得方式 | **同じファイルを独立 open する時計なし経路** (§10.1) | 再生器・サウンドカードの 1x clock と表示 back-pressure から分離する。既存 tap 経路は移行完了まで保持 |
+| 取得方式 | **同じファイルを独立 open する時計なし経路** (§10.1) | 再生器・サウンドカードの 1x clock と表示 back-pressure から分離する。旧 tap worker は削除済み |
 | 配信プロトコル | **HLS (fMP4 / CMAF セグメント) 一本** | iOS ネイティブ対応。tiny_http のまま配れる。追加のサーバ依存ゼロ |
 | クライアント | iOS/macOS Safari は**ネイティブ再生**、それ以外は **hls.js** | サーバ実装は 1 本のまま両対応。独自 MSE 実装を書かない |
 | 映像コーデック | **H.264 (High profile, 8bit, BT.709)** 固定 | 全端末が確実にハードウェアデコードできる唯一の選択肢 |
@@ -133,17 +132,15 @@ OBS 自身が GPLv2 だからであり、**OBS のコードも設定値の写経
 ## 4. パイプライン設計
 
 ```
-       ┌──────────────── mimageviewer-core.exe ────────────────┐
-       │                                                       │
- file ─┼─▶ decoder ─┬─▶ presenter (PC 画面表示。従来どおり)      │
-       │            └─▶ [video tap] ─▶ scale ─▶ H.264 encoder ─┐│
-       │                                                      ││
-       │    audio pump ─┬─▶ cpal (PC スピーカー。従来どおり)     ││
-       │  (VST/normalize)└─▶ [audio tap] ─▶ AAC encoder ───────┤│
-       │                                                      ▼│
-       │                                          fMP4 セグメンタ│
-       │                                        (リングバッファ) │
-       └──────────────────────────┬────────────────────────────┘
+       ┌────────────────── mimageviewer-core.exe ──────────────────┐
+       │                                                           │
+ file ─┼─▶ clockless demux/decode ─┬─▶ scale ─▶ H.264 encoder ───┐ │
+       │                           └─▶ normalize ─▶ AAC encoder ─┤ │
+       │                                                        ▼ │
+       │                              fMP4 segmenter + 60 秒 ring │
+       │                                                           │
+       │  paused headless VideoPlayer: metadata / resume / thumbnail│
+       └────────────────────────────┬──────────────────────────────┘
                                   │ IPC (pull 型)
        ┌──────────────────────────▼────────────────────────────┐
        │  mimageviewer-remote.exe : m3u8 / init.mp4 / seg.m4s   │
@@ -152,12 +149,16 @@ OBS 自身が GPLv2 だからであり、**OBS のコードも設定値の写経
                           ブラウザ (<video> or hls.js)
 ```
 
-remote session が所有する headless player では native presenter の代わりに専用の
-headless output consumer が通常の `video_tx` を連続 drain して捨てる。video tap はこの
-queue とは別に decoder 側で複製されるため、配信用フレームは失われない。通常 player は
-従来どおり native presenter が同じ queue を消費し、この worker を作らない。
+remote session が所有する headless `VideoPlayer` は pause のまま metadata、resume origin、
+音量正規化 gain、seek thumbnail を提供する。配信 frame と transport clock は一切供給せず、
+generation worker が同じファイルを独立 open する。
 
-### 4.1 音声 tap — VST とノーマライズがそのまま乗る
+### 4.1 時計なし音声 — ノーマライズを再適用し、VST3 は通さない
+
+production の時計なし worker は decoded PCM に `VideoPlayer::normalize_gain()` の確定値を
+掛けてから AAC encoder へ渡す。+gain のときだけ既存 `SafetyLimiter` を通す。VST3 は
+§10.2 の実測結果によりリモート配信では明示的に無効とし、headless player にも
+`DspBridge` を渡さない。以下の tap 設計は移行元の記録であり、production 配信には使わない。
 
 [src/video/audio.rs](../src/video/audio.rs) の audio pump は
 **time stretch → normalize gain → VST3 `process_block` → safety limiter** の順に処理した
@@ -421,11 +422,12 @@ if (Hls?.isSupported()) {
 HLS のライブウィンドウ (直近 60 秒) 内は `<video>` 上で完結するが、**UI 上のシークバーは
 常に動画全体を表す**。ウィンドウ外へのシークは次の流れになる。
 
-1. Web → `POST /api/video/seek` → IPC → 本体が実際に seek
-2. 本体はエンコーダとセグメント列をリセットし、**新しい session generation** を発行
+1. Web → `POST /api/video/seek` → IPC。端末の media element が持つ全体位置を送る
+2. 本体は旧 worker を段境界で停止し、入力ファイルを指定位置から独立 open/seek する
+   **新しい session generation** を発行する
 3. m3u8 の URL に generation を含めるため、クライアントは `video.src` を差し替える
    (hls.js 側は `loadSource` をやり直す)
-4. 再バッファは 2〜4 秒
+4. 新 generation は実時間 clock を待たず、ring 上限まで先行生成する
 
 シークバーのドラッグ開始から、中央表示は `シーク中` (ドラッグ中は `移動先を確認中`)
 →実際にデコードできた seek thumbnail→再生、の順で遷移する。thumbnail は既存
@@ -445,11 +447,11 @@ thumbnail を含めない。
 
 | エンドポイント | 内容 |
 |---|---|
-| `POST /api/video/start` | `{fav, path, quality}` → `{session, generation, playlist, duration_secs, codec, encoder}` |
-| `POST /api/video/control` | `{session, action: play\|pause\|volume\|quality}` |
+| `POST /api/video/start` | `{fav, path, quality}` → `{session, generation, playlist, duration_secs, source_origin_secs, buffer_target_secs, codec, encoder}` |
+| `POST /api/video/control` | `{session, action: play\|pause\|volume\|quality}`。quality は端末の `position_secs` も送る |
 | `POST /api/video/seek` | `{session, position_secs}` → 新 `generation` と `playlist` |
 | `POST /api/video/thumbnail` | `{session, position_secs}`。実 frame PTS 付き WebP、生成中は 202、`null` は要求解除 |
-| `GET /api/video/state` | 再生位置・尺・バッファ秒数・実効ビットレート・選択エンコーダ |
+| `GET /api/video/state` | generation、source origin、生成済み/ring 範囲、尺、先読み目標、実効ビットレート、終端、再生 intent。実 playhead は返さない |
 | `POST /api/video/stop` | セッション終了。本体はストリーミングを止める |
 | `GET /stream/<session>/<gen>/index.m3u8` | CODECS を宣言する Master Playlist |
 | `GET /stream/<session>/<gen>/media.m3u8` | MEDIA-SEQUENCE を持つ live Media Playlist |
@@ -474,7 +476,7 @@ thumbnail を含めない。
   segmenter の typed `None` を保持して HTTP 503 または上限付き wait へ写像し、200 では
   必ず非空の init、または init と最初の media segment を参照できる playlist を返す
 
-### 6.2 IPC (動画 API 導入 v15、timeout stage code 追加 v17、seek thumbnail 追加 v18)
+### 6.2 IPC (動画 API 導入 v15、timeout v17、seek thumbnail v18、時計なし状態分離 v19)
 
 既存の長寿命 duplex 多重化接続 ([web-remote-plan.md](web-remote-plan.md) §9.5-9.6) に
 `ClientMessage` / `ServerMessage` の variant を追加する。**セグメントは pull 型**とし、
@@ -483,13 +485,13 @@ remote-web が HTTP 要求を受けた時に取りに行く。push 型の非同�
 
 | request | response |
 |---|---|
-| `VideoStreamStart { address, quality }` | `{ session, generation, duration_secs, encoder, video_size }` |
+| `VideoStreamStart { address, quality }` | `{ session, generation, duration_secs, source_origin_secs, buffer_target_secs, encoder, video_size }` |
 | `VideoStreamControl { session, action }` | `SessionStatus` |
 | `VideoStreamSeek { session, position_secs }` | `{ generation }` |
 | `VideoStreamThumbnail { session, position_secs }` | `Pending` / 実 frame PTS + WebP / `Cleared` |
 | `VideoStreamPlaylist { session, generation, kind }` | master / media m3u8 本文 |
 | `VideoStreamSegment { session, generation, index }` | セグメントのバイト列 / `NotFound` / `Gone` |
-| `VideoStreamState { session }` | 再生位置・バッファ・ビットレート実績 |
+| `VideoStreamState { session }` | generation/source origin、生成済み/ring 範囲、先読み目標、終端、再生 intent、バッファ/ビットレート実績 |
 | `VideoStreamStop { session }` | — |
 
 セグメント IPC は既存の **heavy queue ではなく専用 lane** に置く。エンコード済みバイトを
@@ -498,11 +500,10 @@ remote-web が HTTP 要求を受けた時に取りに行く。push 型の非同�
 allowlist と canonical containment を再検証する ([web-remote-plan.md](web-remote-plan.md) §12.1)。
 
 `VideoStreamStart` の `address` は照合用ではなく、再生対象を指定する正本である。本体 UI
-thread は既存の「フォルダを開く → loaded item を選択 → fullscreen player を開く」経路で
-その動画へ切り替え、player の metadata / audio tap が揃うまで typed `Opening` state を
-poll する。その後は start request を typed `Starting` state が保持し、pending resume が
-消費済み、seek 中でない、現在の seek serial と generation の expected serial が一致、
-encoder が Ready、という事実をすべて確認してから generation を publish する。
+thread は headless `VideoPlayer` を開き、metadata、duration、pending resume、normalize gain が
+確定するまで typed `Opening` state を poll する。player は pause のまま transport には使わず、
+typed `Starting` が同じファイルを独立 open する時計なし worker の encoder と最初の playlist
+readiness を確認してから generation を publish する。
 
 start の wall-clock 予算は `mimageviewer_ipc::VIDEO_STREAM_START_BUDGET` の **15 秒だけ**を
 正本とする。本体が IPC request を stream queue へ積んだ時刻から deadline を一度だけ作り、
@@ -610,7 +611,10 @@ guard で、動画処理開始後の timeout 9 個には数えない。
 - 通信量の目安を Web の画質選択 UI に表示する
   ([web-remote-plan.md](web-remote-plan.md) §6.5.6 の「従量課金回線への配慮」)
 
-#### 増分 5 実装記録 (session + settings、2026-08-01)
+#### 増分 5 実装記録 (旧実時間 session + settings、2026-08-01、時計なし移行で廃止)
+
+以下は旧 tap 経路の履歴であり、現在の production 配線ではない。現在の所有関係は §4 と
+§10.2 を正本とする。
 
 - `src/video/stream/session.rs` の generation worker が audio/video tap lease と receiver、
   H.264/AAC encoder、fMP4 segmenter/ring を一括所有する。H.264/AAC の open は worker 内で
@@ -690,21 +694,21 @@ guard で、動画処理開始後の timeout 9 個には数えない。
 | 画質 | メニュー | — | `media_quality` |
 | 全画面 | メニュー | `F11` | `toggle_fullscreen` (既存) |
 
-- シークバーは自前 DOM。位置は `/api/video/state` のポーリング (1 秒間隔) と
-  `<video>` の `currentTime` の合成で表示する
+- シークバーは自前 DOM。generation ごとに state の `source_origin_secs` を 1 度だけ基準点へ
+  置き、以後は `<video>.currentTime` を足して表示する。生成端は playhead に使わない
 - バッファ不足 (`waiting` イベント) が 3 秒以上続いたら画質を 1 段下げる提案を出す
   (自動では下げない。§2 のとおり ABR は持たない)
 - iOS のバックグラウンド復帰時はセッション生存を `/api/video/state` で確認し、
   失効していれば同じ位置で `start` をやり直す
 
-#### 増分 7 実装記録 (フロントエンド、2026-08-02)
+#### 増分 7 実装記録 (フロントエンド、2026-08-02。timeline anchor は段 2 で更新)
 
 - MSE / ManagedMediaSource がある端末は完全一致の public shell asset `/vendor/hls.min.js` を
   遅延ロードして `Hls.isSupported()` を先に評価する。false の場合だけ native HLS を試し、両方
   無ければ明示的な非対応表示にする。playlist / segment / video API は従来どおり認証 guard 下で、
   native video、playlist probe、hls.js XHR のすべてを同一 origin Cookie 経路にした
-- シーク表示は state poll 時の本体位置から HLS live edge との差を引き、その source 位置と
-  `<video>.currentTime` をアンカーにして次の poll まで補間する。対象を `seekable` へ逆写像できる
+- 初版の server position/live edge 差分 anchor は段 2 で廃止した。現在は generation の
+  `source_origin_secs` と media time 0 を一度だけ anchor にし、対象を `seekable` へ逆写像できる
   場合は video 内だけで移動し、範囲外は `/api/video/seek` の新 generation / playlist へ差し替える
 - `waiting` 継続 3 秒で 1 段下の画質と 1 時間あたり通信量を提示し、利用者がボタンを押した時だけ
   `media_quality` を送る。503 は `Retry-After` 後に再試行、410 は ring に追いつけなかった表示と
@@ -755,7 +759,7 @@ guard で、動画処理開始後の timeout 9 個には数えない。
 | `remote_video_encoder` | `Auto` | `Auto` / `Nvenc` / `Qsv` / `Amf` / `MediaFoundation` / `OpenH264` |
 | `remote_video_quality_default` | `Standard` | §6.4 のプリセット |
 | `remote_video_segment_window` | `30` | 保持セグメント数 (= 60 秒) |
-| `remote_video_mute_local_output` | `true` | ストリーミング中に PC 側スピーカーを無音にするか (§10-2) |
+| `remote_video_mute_local_output` | `true` | 旧実時間経路の DB 互換キー。時計なし移行後は UI に表示せず、動作には使わない |
 | `remote_video_hide_local_output` | `true` | 旧設定 DB 互換キー。headless remote player 化後は UI に表示せず、動作には使わない |
 
 ---
@@ -785,16 +789,14 @@ guard で、動画処理開始後の timeout 9 個には数えない。
 
 ## 10. 制約・リスクと要検証事項
 
-1. **画面表示への依存 (既存経路のみ)** — 映像 tap 自体は presenter と独立しているが、decoder の通常
-   `video_tx` には常時 consumer が必要。remote-owned headless player は専用 consumer が queue を
-   drain し、seek readiness の `FirstFrameReady` も通知するため、native window の表示状態や
-   monitor sleep に queue 進行を依存させない
-2. **PC 側の音 (既存経路のみ)** — mIV は音声出力がマスタークロックであり、デバイスを止めると映像も進まない
-   恐れがある。`remote_video_mute_local_output` は**デバイスを回したまま音量 0** にする実装とし、
-   ストリームは tap 点 (音量適用より前の最終 PCM) から取るため無音化の影響を受けない
-3. **先行生成の上限** — 時計なし worker は segment ring に空きがある間だけ走り、満杯なら
-   `Condvar` で park する。端末が segment を解放すれば再開する。CPU/GPU を無制限に先食いせず、
-   生成先端と端末 playhead の距離を ring 容量で上限化する
+1. **画面表示への非依存** — 時計なし worker は presenter queue を使わないため、native window の
+   表示状態や monitor sleep に進行を依存させない
+2. **PC 側の音への非依存** — cpal / audio master clock を使わず、decoded PCM を直接 AAC へ渡す。
+   headless metadata player は pause のままなので PC スピーカーへ出力しない
+3. **先行生成の上限** — 2 秒 × 30 segment = **60 秒**。時計なし worker は segment ring に
+   空きがある間だけ走り、満杯なら `Condvar` で park する。端末の segment 取得で解放して再開する。
+   同じ 60 秒を state の `buffer_target_secs` で端末へ渡し、hls.js の `maxBufferLength` と
+   `maxMaxBufferLength` の両方へ設定するため、server と端末を別々には変更できない
 4. **同時 1 セッション** — 既存のセッションロックと同一なので追加の排他は不要
 5. **HDR 素材** — 第 1 段は BT.709 固定。HDR (PQ/HLG) 素材はトーンマッピングせずに送ると
    眠い絵になる。実機で確認し、必要なら `zscale` / `tonemap` の導入を第 2 段で検討する
@@ -828,19 +830,21 @@ CPU に戻さず GPU scale して NVENC へ渡す経路が次の性能投資候�
 
 ### 10.2 時計なし経路での状態所有方針
 
-- **VST3**: bridge の audio loop は入力 ring が空のときだけ待ち、処理要求自体を wall clock で
-  pace しないため、bridge は速く供給すれば速く処理できる構造である。ただし plugin setup は
-  `kRealtime` で、プラグイン固有の wall-clock 依存までは保証できない。移行 2/3 で実チェーンを
-  offline feed して倍率と出力を比較し、失敗する plugin がある場合は「リモートは VST 無効」を
-  明示仕様にする。今回のベンチ音声は VST を通していない
+- **VST3**: **リモート配信では通さない。** 実設定を SQLite online backup した隔離 profile で
+  44.1 kHz / 480 frame の 60 秒 fast-feed を試したが、稼働中本体 2 系統が既に host を保持する
+  条件で 3 本目の実チェーンは `SSL Meter Pro` の load event が 20 秒 timeout になり、full chain
+  を安全に認定できなかった。稼働中 bridge への注入は行わず、失敗時方針どおり明示的に無効化した
+- **音量正規化**: metadata player が保持する確定 `normalize_gain` を generation 作成時に snapshot
+  し、時計なし PCM の AAC 前段で固定 gain として適用する
 - **位置**: server は generation、source origin、生成済み範囲、ring の earliest/latest、duration、
   再生 intent を所有する。実 playhead は端末の media element が source of truth であり、
   `/api/video/state` の本体位置を端末位置として返さない。resume/history が必要なときだけ端末が
   playhead を報告する
-- **一時停止 / seek / 終端**: 一時停止中も ring 上限まで生成して park すればよい。seek は現在の
+- **一時停止 / seek / 終端**: 一時停止中も ring 上限まで生成して park する。seek は現在の
   generation 交換規約を再利用し、旧 worker を段境界 cancel、新 generation は独立 open + seek
-  で開始する。終端だけは encoder/resampler/muxer を flush して最終 fragment を閉じた後に
-  `Ended` / playlist end marker を公開する明示状態が必要で、単なる ring 満杯とは区別する
+  で開始する。終端は decoder、resampler、H.264/AAC encoder、A/V mux、既存
+  `Fmp4Segmenter::finish()` の順に flush し、最終 fragment を ring に記録してから `Ended` と
+  session 側の `#EXT-X-ENDLIST` を公開する。単なる ring 満杯とは区別する
 
 ---
 
@@ -848,12 +852,11 @@ CPU に戻さず GPU scale して NVENC へ渡す経路が次の性能投資候�
 
 ### 時計なし移行 (初回リリース対象)
 
-1. **駆動部 + 実測 (本変更)** — 独立 Input、demux/decode、既存 H.264/AAC encoder と
-   `Fmp4Segmenter`、ring 容量 gate、段境界 cancel、dev-tools benchmark。production 未配線
-2. **session 配線** — `VideoStreamSession` の generation owner を時計なし worker へ接続し、
-   VST 方針、端末 playhead、seek/終端 flush を確定する。既存実時間経路は切替確認まで保持
-3. **Web/実機仕上げ** — 先読み window と解放 ACK、state 表現、pause/seek/end、iPhone 実機で
-   起動・シーク・回線揺れを検証して旧 tap 経路を整理する
+1. **駆動部 + 実測 (完了)** — 独立 Input、demux/decode、既存 H.264/AAC encoder と
+   `Fmp4Segmenter`、ring 容量 gate、段境界 cancel、dev-tools benchmark
+2. **session 配線 (完了)** — generation owner を時計なし worker へ接続。60 秒先読み、
+   terminal playhead、seek、EOF flush / ENDLIST、VST / normalize 方針を確定し、旧 tap worker を削除
+3. **Web/実機仕上げ (次)** — iPhone 実機で起動・シーク・回線揺れ・自然終端を検証する
 
 ### 既存の実時間経路 第 1 段 (実装済み、移行元)
 
@@ -942,21 +945,19 @@ Android 実機を保有していないため、**検証できる範囲と委ね�
 - A/V 同期: 既知の pts 列に対してセグメントのタイムスタンプが単調増加し、
   音声 `audible_pts_secs` と映像 pts のずれが 1 フレーム以内であること
 - セッション: 操作権喪失 / 生存タイムアウト / 放置タイムアウトでストリーミングが停止すること
-- start/stop: player open 後に resume seek serial が進んでも、start が返す generation を
-  playlist resource が current として受理すること。stop は未知 / 停止済み ID でも成功し、
+- start/stop: metadata player の resume origin から開始した generation を playlist resource が
+  current として受理すること。stop は未知 / 停止済み ID でも成功し、
   active な別 ID は停止しないこと
 - Web: generation mismatch 409 後に state の current generation へ URL を更新して回復し、
   mismatch が続く場合は有限回で利用者向け失敗表示になること。session mismatch と区別すること
-- ローカル出力: streaming 中も decoder transport を再生したまま presenter のみ非表示となり、
-  本体は空白ではなく暗色の配信中 surface とファイル名を表示すること。stop で通常の動画表示へ
-  戻ること。動画→音声モードと重ねて片方を解除しても、残る owner の非表示が維持されること。
-  ローカル出力設定の未知値が `Incompatible` になること
+- metadata player: streaming 中も pause のまま duration / resume origin / normalize gain /
+  seek thumbnail を提供し、frame/audio transport は clockless worker だけが所有すること
 - `cargo test -p mimageviewer --lib` と `cargo test -p mimageviewer-remote` が緑
 
 ### 実機 (ユーザーが実施)
 
 - iPhone / iPad の Safari で、HEVC / AV1 / WMV / MKV いずれの素材でも再生できる
-- VST3 チェインと音量ノーマライズが**リモート側の音に反映されている**
+- 音量ノーマライズがリモート側の音に反映され、VST3 はリモート音声へ適用されない
 - 5G / 公衆 Wi-Fi それぞれで標準画質が途切れずに再生できる
 - シーク・一時停止・画質変更が動作し、シーク後の再バッファが 5 秒以内
 - **PC 側のウィンドウを最小化 / モニタをスリープさせても再生が継続する** (§10-1)

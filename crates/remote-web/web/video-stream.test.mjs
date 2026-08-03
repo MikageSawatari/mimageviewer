@@ -4,9 +4,18 @@ import assert from "node:assert/strict";
 import {
   VideoGenerationSwitchOwner,
   VideoSeekPreviewOwner,
+  hlsBufferConfig,
   resolveVideoPlaylist,
   videoUserErrorMessage,
 } from "./video-stream.mjs";
+
+test("hls.js uses the server ring target for every buffer limit", () => {
+  assert.deepEqual(hlsBufferConfig(60), {
+    backBufferLength: 60,
+    maxBufferLength: 60,
+    maxMaxBufferLength: 60,
+  });
+});
 
 test("seek preview advances from seeking through decoded thumbnail to playback", () => {
   const owner = new VideoSeekPreviewOwner({ matchToleranceSecs: 1 });

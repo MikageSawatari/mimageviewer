@@ -520,7 +520,7 @@ const NORMALIZE_GAIN_RAMP_SECS: f64 = 4.0;
 /// OS mixer 側で hard clip するのを避けるための最終安全網。制作向け limiter ではなく
 /// 視聴用の保護なので、パラメータは固定し、VST3 チェーンまたは手動 boost が active の
 /// ときだけ動かす。
-struct SafetyLimiter {
+pub(crate) struct SafetyLimiter {
     channels: usize,
     lookahead_frames: usize,
     delay: Vec<f32>,
@@ -537,7 +537,7 @@ struct SafetyLimiter {
 }
 
 impl SafetyLimiter {
-    fn new(sample_rate: u32, channels: usize) -> Self {
+    pub(crate) fn new(sample_rate: u32, channels: usize) -> Self {
         let lookahead_frames =
             ((sample_rate as f64 * SAFETY_LIMITER_LOOKAHEAD_SECS).round() as usize).max(1);
         let release_coeff =
@@ -558,11 +558,11 @@ impl SafetyLimiter {
         }
     }
 
-    fn latency_secs(&self) -> f64 {
+    pub(crate) fn latency_secs(&self) -> f64 {
         self.lookahead_frames as f64 / self.sample_rate as f64
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.delay.fill(0.0);
         self.write_frame = 0;
         self.gain = 1.0;
@@ -576,7 +576,7 @@ impl SafetyLimiter {
     /// 判定は音量フェーダー (出力ゲイン) に依存しない。リミッターはフェーダー前段で
     /// 内部信号に作用するので、戻り値は「内部チェーンが 0 dBFS をどれだけ超えたか」を
     /// そのまま表す。
-    fn process_block(&mut self, samples: &mut [f32]) -> bool {
+    pub(crate) fn process_block(&mut self, samples: &mut [f32]) -> bool {
         if samples.is_empty() || self.channels == 0 {
             return false;
         }

@@ -646,6 +646,8 @@ fn api_video_start(request: &mut Request, state: &AppState, client_id: &str) -> 
                 "generation": payload.generation,
                 "playlist": video_playlist_url(payload.session, payload.generation),
                 "duration_secs": payload.duration_secs,
+                "source_origin_secs": payload.source_origin_secs,
+                "buffer_target_secs": payload.buffer_target_secs,
                 "codec": payload.codecs,
                 "encoder": payload.encoder,
                 "video_size": payload.video_size,

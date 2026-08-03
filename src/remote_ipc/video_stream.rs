@@ -163,15 +163,35 @@ impl VideoStreamEngine {
         budget: VideoStreamStartBudget,
     ) -> VideoStreamResult<VideoStreamStartPayload> {
         match stream.generation.wait_ready(budget.remaining()) {
-            StreamGenerationStatus::Ready(ready) => {
+            StreamGenerationStatus::Ready(ready) | StreamGenerationStatus::Ended(ready) => {
                 if let Err(error) = wait_for_start_playlist(&stream.generation, budget) {
                     return VideoStreamResult::Error(error);
                 }
+                let metrics = match stream
+                    .generation
+                    .resource(stream.generation_id(), StreamResourceKind::State)
+                {
+                    Ok(StreamResource::State(metrics)) => metrics,
+                    Ok(_) => {
+                        return VideoStreamResult::Error(video_error(
+                            VideoStreamErrorCode::Internal,
+                            "動画状態応答の型が一致しません",
+                        ));
+                    }
+                    Err(error) => {
+                        return VideoStreamResult::Error(resource_error(
+                            error,
+                            StreamResourceKind::State,
+                        ));
+                    }
+                };
                 let playback = stream.playback.snapshot();
                 VideoStreamResult::Success(VideoStreamStartPayload {
                     session: stream.session.0,
                     generation: stream.generation_id().0,
                     duration_secs: playback.duration_secs,
+                    source_origin_secs: metrics.source_origin_secs,
+                    buffer_target_secs: stream.buffer_target_secs,
                     encoder: ready.encoder.as_str().to_owned(),
                     video_size: VideoStreamSize {
                         width: ready.output_dimensions.width,
@@ -298,7 +318,7 @@ impl VideoStreamEngine {
             Err(error) => return VideoStreamResult::Error(error),
         };
         let ready = match stream.generation.status() {
-            StreamGenerationStatus::Ready(ready) => ready,
+            StreamGenerationStatus::Ready(ready) | StreamGenerationStatus::Ended(ready) => ready,
             StreamGenerationStatus::Opening => {
                 return VideoStreamResult::Error(video_error(
                     VideoStreamErrorCode::NotReady,
@@ -391,17 +411,25 @@ fn state_payload(
     VideoStreamStatePayload {
         session: stream.session.0,
         generation: stream.generation_id().0,
-        position_secs: playback.position_secs,
         duration_secs: playback.duration_secs,
+        source_origin_secs: metrics.source_origin_secs,
+        generated_start_secs: metrics.generated_start_secs,
+        generated_end_secs: metrics.generated_end_secs,
+        ring_start_secs: metrics.ring_start_secs,
+        ring_end_secs: metrics.ring_end_secs,
+        ring_earliest_sequence: metrics.earliest_sequence,
+        ring_latest_sequence: metrics.latest_sequence,
+        buffer_target_secs: stream.buffer_target_secs,
         buffered_secs: metrics.buffered_secs,
         effective_bitrate_bps: metrics.effective_bitrate_bps,
+        ended: metrics.ended,
         encoder: ready.encoder.as_str().to_owned(),
         video_size: VideoStreamSize {
             width: ready.output_dimensions.width,
             height: ready.output_dimensions.height,
         },
         codecs: ready.codecs,
-        playing: playback.playing,
+        play_intent: playback.play_intent,
         volume: playback.volume,
     }
 }

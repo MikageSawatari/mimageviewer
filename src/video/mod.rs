@@ -6192,27 +6192,9 @@ impl VideoPlayer {
         ));
     }
 
-    /// Decoder-output video tap attachment point for the streaming session owner.
-    pub(crate) fn video_tap_controller(
-        &self,
-    ) -> crate::video::stream::video_tap::VideoTapController {
-        self.decode.video_tap.clone()
-    }
-
-    /// post-DSP audio tap と実 output sample rate。音声出力が無ければ stream 非対応。
-    pub(crate) fn audio_tap_source(
-        &self,
-    ) -> Option<(crate::video::audio::AudioTapController, u32)> {
-        self.audio
-            .as_ref()
-            .map(|audio| (audio.audio_tap_controller(), audio.sample_rate))
-    }
-
-    pub(crate) fn acquire_remote_local_output_mute(
-        &self,
-    ) -> crate::video::clock::RemoteLocalOutputMuteLease {
-        self.clock.acquire_remote_local_output_mute()
-    }
+    // 配信が時計なしトランスコードへ移り、再生器から映像 tap / 音声 tap / ローカル出力
+    // ミュートを取り出す入口は無くなった。呼ばれない扉を残すと「配信は再生器から取れる」
+    // という読み方が生き続けるので閉じてある。
 
     pub(crate) fn clear_audio_output_buffer(&self) {
         if let Some(audio) = &self.audio {
