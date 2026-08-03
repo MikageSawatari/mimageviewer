@@ -505,9 +505,19 @@ thread は headless `VideoPlayer` を開き、metadata、duration、pending resu
 typed `Starting` が同じファイルを独立 open する時計なし worker の encoder と最初の playlist
 readiness を確認してから generation を publish する。
 
+`Opening` の門は `RemoteStreamStartInputs` (duration、video/audio track、source origin、
+normalize gain) の確定である。`pending_resume_secs` は metadata から duration を得た後に
+末尾 guard を含む正規化を行ってから消費され、採用した seek target は `request_seek` が
+`position_secs()` へ同期的に公開する。このため `pending_resume_secs == None` になった時点で
+source origin は確定している。pause のままでは frame/audio を再生消費しないため
+`clock.is_seeking()` が残り得るが、これは metadata player の transport 状態であって generation
+入力ではなく、門には含めない。normalize gain は player open 前の DB lookup で決まり、
+remote player は autoplay=false のため deferred normalize scan を開始しない。門を通る際に
+これらを同じ typed snapshot へ固定し、generation は player の後続 transport 状態を再読しない。
+
 start の wall-clock 予算は `mimageviewer_ipc::VIDEO_STREAM_START_BUDGET` の **15 秒だけ**を
 正本とする。本体が IPC request を stream queue へ積んだ時刻から deadline を一度だけ作り、
-UI 受付、player、resume seek / generation 同期、encoder、最初の non-empty master playlist
+UI 受付、player と start input snapshot、encoder、最初の non-empty master playlist
 まで同じ typed budget を移送する。各段は独自 timeout を開始せず、残時間だけを使う。
 別の項目が開いていても remote owner が操作権を占有しているため要求先へ切り替える。
 stop・owner 解放・失敗時は remote が開いた動画をその位置で pause して残し、開始前の項目へは
@@ -834,8 +844,9 @@ CPU に戻さず GPU scale して NVENC へ渡す経路が次の性能投資候�
   44.1 kHz / 480 frame の 60 秒 fast-feed を試したが、稼働中本体 2 系統が既に host を保持する
   条件で 3 本目の実チェーンは `SSL Meter Pro` の load event が 20 秒 timeout になり、full chain
   を安全に認定できなかった。稼働中 bridge への注入は行わず、失敗時方針どおり明示的に無効化した
-- **音量正規化**: metadata player が保持する確定 `normalize_gain` を generation 作成時に snapshot
-  し、時計なし PCM の AAC 前段で固定 gain として適用する
+- **音量正規化**: remote player は autoplay=false で開くため deferred scan を持たず、open 前の
+  DB lookup (未測定なら 1.0) で `normalize_gain` が確定する。`RemoteStreamStartInputs` を
+  generation 作成時に snapshot し、時計なし PCM の AAC 前段で固定 gain として適用する
 - **位置**: server は generation、source origin、生成済み範囲、ring の earliest/latest、duration、
   再生 intent を所有する。実 playhead は端末の media element が source of truth であり、
   `/api/video/state` の本体位置を端末位置として返さない。resume/history が必要なときだけ端末が
@@ -951,7 +962,9 @@ Android 実機を保有していないため、**検証できる範囲と委ね�
 - Web: generation mismatch 409 後に state の current generation へ URL を更新して回復し、
   mismatch が続く場合は有限回で利用者向け失敗表示になること。session mismatch と区別すること
 - metadata player: streaming 中も pause のまま duration / resume origin / normalize gain /
-  seek thumbnail を提供し、frame/audio transport は clockless worker だけが所有すること
+  seek thumbnail を提供し、frame/audio transport は clockless worker だけが所有すること。
+  resume origin 確定後も paused player の `clock.is_seeking()` が true のままのケースで
+  `poll_remote_video_opening` が `Starting` へ進むこと
 - `cargo test -p mimageviewer --lib` と `cargo test -p mimageviewer-remote` が緑
 
 ### 実機 (ユーザーが実施)

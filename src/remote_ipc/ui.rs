@@ -243,6 +243,7 @@ impl crate::app::App {
         client_id: &str,
         requested_path: &std::path::Path,
         quality: crate::video::stream::quality::QualityPreset,
+        start_inputs: crate::video::RemoteStreamStartInputs,
         player: Box<crate::video::VideoPlayer>,
     ) -> Result<AppRemoteVideoStreaming, String> {
         if !self.settings.remote_video_streaming_enabled {
@@ -268,12 +269,13 @@ impl crate::app::App {
         let session = match RemoteVideoStreamingSession::start(
             owner,
             &player,
+            start_inputs,
             encoder,
             quality,
             segment_capacity,
             self.settings.video_hw_decode,
             crate::video::clockless_transcode::ClocklessAudioProcessing {
-                normalize_gain: player.normalize_gain(),
+                normalize_gain: start_inputs.normalize_gain,
             },
         ) {
             Ok(session) => session,
@@ -285,7 +287,7 @@ impl crate::app::App {
             }
         };
         let playback = std::sync::Arc::new(VideoStreamPlaybackState::new(
-            player.duration(),
+            start_inputs.duration_secs,
             player.volume(),
             true,
         ));
@@ -551,24 +553,24 @@ impl crate::app::App {
                         VideoStreamErrorCode::Failed,
                         format!("要求された動画を再生できません: {error}"),
                     ))
-                } else if let Some(info) = player.info() {
-                    if !info.has_video || !info.has_audio {
+                } else if let Some(inputs) = player.remote_stream_start_inputs() {
+                    if !inputs.has_video || !inputs.has_audio {
                         Err((
                             VideoStreamErrorCode::Failed,
                             "remote streaming requires both video and audio streams".to_owned(),
                         ))
                     } else {
-                        Ok(player.remote_stream_start_seek_is_settled())
+                        Ok(Some(inputs))
                     }
                 } else {
-                    Ok(false)
+                    Ok(None)
                 }
             }
-            None => Ok(false),
+            None => Ok(None),
         };
 
         match readiness {
-            Ok(true) => {
+            Ok(Some(start_inputs)) => {
                 if let Some(error) = opening.budget.expired_error(VideoStreamStartStage::Player) {
                     self.fail_remote_video_opening(opening, error.code, error.message);
                     return;
@@ -581,6 +583,7 @@ impl crate::app::App {
                     &opening.client_id,
                     &opening.requested_path,
                     opening.quality,
+                    start_inputs,
                     player,
                 );
                 match result {
@@ -597,7 +600,7 @@ impl crate::app::App {
                     Err(error) => opening.claimed.complete(video_stream_ui_failure(error)),
                 }
             }
-            Ok(false) => {
+            Ok(None) => {
                 if let Some(error) = opening.budget.expired_error(VideoStreamStartStage::Player) {
                     self.fail_remote_video_opening(opening, error.code, error.message);
                 } else {
@@ -648,6 +651,14 @@ impl crate::app::App {
     }
 
     #[cfg(test)]
+    pub(crate) fn remote_video_starting_for_test(&self) -> bool {
+        matches!(
+            self.remote_session_ui.video_stream,
+            Some(AppRemoteVideoStreamState::Starting(_))
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn remote_video_player_intent_playing_for_test(&self) -> Option<bool> {
         self.remote_session_ui
             .video_stream
@@ -675,6 +686,21 @@ impl crate::app::App {
                 AppRemoteVideoStreamState::Streaming(streaming) => Some(streaming.player.as_ref()),
             })
             .map(crate::video::VideoPlayer::engine_state_name)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remote_video_player_clock_seeking_for_test(&self) -> Option<bool> {
+        self.remote_session_ui
+            .video_stream
+            .as_ref()
+            .and_then(|state| match state {
+                AppRemoteVideoStreamState::Opening(opening) => opening.player.as_deref(),
+                AppRemoteVideoStreamState::Starting(starting) => {
+                    Some(starting.streaming.player.as_ref())
+                }
+                AppRemoteVideoStreamState::Streaming(streaming) => Some(streaming.player.as_ref()),
+            })
+            .map(crate::video::VideoPlayer::clock_is_seeking_for_test)
     }
 
     #[cfg(test)]

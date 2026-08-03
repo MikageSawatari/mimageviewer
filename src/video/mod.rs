@@ -86,6 +86,20 @@ pub(crate) enum VideoOutputConsumer {
     RemoteHeadless,
 }
 
+/// Inputs frozen at the boundary between the paused remote metadata player and a clockless
+/// streaming generation.
+///
+/// The generation must use this snapshot rather than consulting the player's transport later:
+/// the browser owns play intent, while the metadata player deliberately remains paused.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RemoteStreamStartInputs {
+    pub(crate) duration_secs: f64,
+    pub(crate) has_video: bool,
+    pub(crate) has_audio: bool,
+    pub(crate) source_origin_secs: f64,
+    pub(crate) normalize_gain: f64,
+}
+
 fn engine_state_code_name(code: u8) -> &'static str {
     match code {
         engine::actor::state_code::IDLE => "Idle",
@@ -6314,8 +6328,29 @@ impl VideoPlayer {
         self.issue_user_seek_locked(&mut state, clamped);
     }
 
-    pub(crate) fn remote_stream_start_seek_is_settled(&self) -> bool {
-        self.pending_resume_secs.is_none() && !self.clock.is_seeking()
+    /// Freeze every player-owned input needed to start a clockless remote generation.
+    ///
+    /// `pending_resume_secs` is consumed only after metadata supplies the duration and
+    /// `sanitize_resume_for_duration` has selected either the saved resume point or the start.
+    /// When a resume is selected, `request_seek` synchronously publishes that target through
+    /// `position_secs`, so the source origin is already final even though a paused player can keep
+    /// its seek override indefinitely. We therefore must not wait for `clock.is_seeking()` here.
+    ///
+    /// The remote player is opened with autoplay disabled, which also disables deferred normalize
+    /// scanning. Its gain is installed before decoder/audio workers start; copying it into this
+    /// snapshot fixes the value used by the independent generation.
+    pub(crate) fn remote_stream_start_inputs(&self) -> Option<RemoteStreamStartInputs> {
+        let info = self.info.as_ref()?;
+        if self.pending_resume_secs.is_some() {
+            return None;
+        }
+        Some(RemoteStreamStartInputs {
+            duration_secs: info.duration_secs,
+            has_video: info.has_video,
+            has_audio: info.has_audio,
+            source_origin_secs: self.position_secs(),
+            normalize_gain: self.normalize_gain(),
+        })
     }
 
     pub(crate) fn log_remote_start_failure(&self, code: &str, detail: &str) {
@@ -6388,7 +6423,7 @@ impl VideoPlayer {
     }
 
     #[cfg(test)]
-    pub(crate) fn complete_remote_seek_for_test(&self) {
+    fn enqueue_remote_seek_readiness_for_test(&self) {
         let epoch = self.clock.current_seek_serial();
         self.engine_event_tx
             .send(EngineEvent::Decoder(
@@ -6413,7 +6448,6 @@ impl VideoPlayer {
                 wall_now: std::time::Instant::now(),
             }))
             .unwrap();
-        self.clock.clear_seek_target_override(epoch);
     }
 
     #[cfg(test)]
@@ -6435,8 +6469,15 @@ impl VideoPlayer {
             );
             self.clock.request_seek(target_secs);
             self.engine.lock().unwrap().handle_seek_request(target_secs);
-            self.complete_remote_seek_for_test();
+            // Mirror the real paused metadata player: readiness reaches the actor, but without
+            // playback consuming a frame/sample the clock seek override remains set.
+            self.enqueue_remote_seek_readiness_for_test();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clock_is_seeking_for_test(&self) -> bool {
+        self.clock.is_seeking()
     }
 
     /// 相対シーク (←→ ホットキー)。

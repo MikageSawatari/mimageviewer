@@ -1290,6 +1290,96 @@ fn auto_fullscreen_image_only_folder_opens_page_after_load() {
 }
 
 #[test]
+fn remote_video_opening_accepts_paused_metadata_player_with_clock_seek_pending() {
+    let mut app = phase_c_support::setup_app();
+    app.settings.remote_video_encoder = crate::settings::RemoteVideoEncoder::OpenH264;
+    let folder = app.tmp.path().join("remote-video-opening");
+    std::fs::create_dir(&folder).unwrap();
+    let video = folder.join("clip.mp4");
+    std::fs::write(&video, b"the metadata player is replaced before decode").unwrap();
+
+    let handle = crate::remote_ipc::session::SessionHandle::new();
+    app.set_remote_session_handle(handle.clone());
+    handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+        client_id: "phone".to_owned(),
+        peer: mimageviewer_ipc::SessionPeerInfo {
+            connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+            device_name: Some("phone".to_owned()),
+        },
+    });
+    app.poll_remote_session(&egui::Context::default());
+
+    let request_handle = handle.clone();
+    let request_path = video.clone();
+    let request_thread = std::thread::spawn(move || {
+        let operation = request_handle
+            .begin_operation("phone", "Starting remote video stream".to_owned())
+            .unwrap();
+        request_handle.submit_video_stream(
+            crate::remote_ipc::session::VideoStreamUiRequest::start_for_test(
+                "phone".to_owned(),
+                request_path,
+                mimageviewer_ipc::VideoStreamQuality::Standard,
+            ),
+            operation,
+        )
+    });
+    let opening_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while !app.remote_video_opening_for_test() && std::time::Instant::now() < opening_deadline {
+        app.poll_remote_session(&egui::Context::default());
+        std::thread::yield_now();
+    }
+    assert!(app.remote_video_opening_for_test());
+
+    let mut metadata_player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(video);
+    metadata_player.set_pending_remote_resume_for_test(4.0);
+    assert!(app.replace_remote_video_player_for_test(metadata_player));
+
+    app.poll_remote_session(&egui::Context::default());
+    assert!(
+        app.remote_video_opening_for_test(),
+        "pending resume must keep Opening from freezing the source origin too early"
+    );
+    assert!(app.apply_pending_remote_video_resume_for_test());
+    assert_eq!(
+        app.remote_video_player_clock_seeking_for_test(),
+        Some(true),
+        "the fixture must retain the paused player's clock seek override"
+    );
+
+    app.poll_remote_session(&egui::Context::default());
+    assert!(
+        app.remote_video_starting_for_test(),
+        "poll_remote_video_opening must accept fixed source inputs without waiting for playback"
+    );
+    assert_eq!(
+        app.remote_video_player_engine_state_for_test(),
+        Some("Paused")
+    );
+    assert_eq!(
+        app.remote_video_player_intent_playing_for_test(),
+        Some(false)
+    );
+    assert_eq!(
+        app.remote_video_player_clock_seeking_for_test(),
+        Some(true),
+        "clock seek completion is a transport concern and must not be the opening gate"
+    );
+
+    handle.local_disconnect();
+    let cancel_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while !request_thread.is_finished() && std::time::Instant::now() < cancel_deadline {
+        app.poll_remote_session(&egui::Context::default());
+        std::thread::yield_now();
+    }
+    assert!(request_thread.is_finished());
+    assert!(matches!(
+        request_thread.join().unwrap(),
+        crate::remote_ipc::session::VideoStreamUiOutcome::Error(_)
+    ));
+}
+
+#[test]
 fn remote_video_stream_keeps_remote_dialog_without_entering_fullscreen() {
     let mut app = phase_c_support::setup_app();
     app.settings.remote_video_encoder = crate::settings::RemoteVideoEncoder::OpenH264;
@@ -1416,6 +1506,11 @@ fn remote_video_stream_keeps_remote_dialog_without_entering_fullscreen() {
         Some(false),
         "the terminal owns play intent; the metadata player must stay paused"
     );
+    assert_eq!(
+        app.remote_video_player_clock_seeking_for_test(),
+        Some(true),
+        "paused metadata transport may retain its seek override after source origin is fixed"
+    );
     assert_eq!(app.fullscreen_idx, None);
     assert!(
         handle.snapshot().active.is_some(),
@@ -1451,7 +1546,20 @@ fn remote_video_stream_keeps_remote_dialog_without_entering_fullscreen() {
     assert_eq!(
         published.generation_id().0,
         1,
-        "clockless generation starts only after the metadata seek has settled"
+        "clockless generation starts once metadata-derived source inputs are fixed"
+    );
+    let origin = match published.generation.resource(
+        published.generation_id(),
+        crate::video::stream::session::StreamResourceKind::State,
+    ) {
+        Ok(crate::video::stream::session::StreamResource::State(metrics)) => {
+            metrics.source_origin_secs
+        }
+        other => panic!("stream state resource was not available: {other:?}"),
+    };
+    assert!(
+        (origin - 4.0).abs() < 1.0e-9,
+        "the clockless generation must use the resolved resume origin"
     );
     assert!(matches!(
         published.generation.resource(

@@ -452,6 +452,7 @@ impl RemoteVideoStreamingSession {
     pub(crate) fn start(
         owner: RemoteSessionOwner,
         player: &crate::video::VideoPlayer,
+        inputs: crate::video::RemoteStreamStartInputs,
         encoder: EncoderPreference,
         quality: QualityPreset,
         segment_capacity: usize,
@@ -461,10 +462,7 @@ impl RemoteVideoStreamingSession {
         if segment_capacity == 0 {
             return Err("remote streaming segment capacity must be non-zero".to_owned());
         }
-        let info = player
-            .info()
-            .ok_or_else(|| "video metadata is not ready".to_owned())?;
-        if !info.has_video || !info.has_audio {
+        if !inputs.has_video || !inputs.has_audio {
             return Err("remote streaming requires both video and audio streams".to_owned());
         }
         let generation = StreamingGeneration(1);
@@ -472,7 +470,7 @@ impl RemoteVideoStreamingSession {
             generation,
             &owner,
             player.path().clone(),
-            player.position_secs(),
+            inputs.source_origin_secs,
             encoder,
             quality,
             segment_capacity,
