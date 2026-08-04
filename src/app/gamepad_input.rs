@@ -1820,7 +1820,7 @@ impl App {
     }
 
     fn gamepad_dispatch_allowed(&self, ctx: &egui::Context) -> bool {
-        if self.remote_session_active() {
+        if self.remote_session_blocks_local_control() {
             return false;
         }
         // gilrs はグローバル入力 (ウィンドウフォーカス非依存) なので、mIV が前面に

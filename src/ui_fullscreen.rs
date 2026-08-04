@@ -6705,7 +6705,7 @@ impl App {
                 ));
             }
             let mut activation_armed = window.activation_armed;
-            if !self.remote_session_active()
+            if !self.remote_session_blocks_local_control()
                 && Self::detached_passive_window_update_activation(
                     can_activate,
                     window.activation_ready_frame,

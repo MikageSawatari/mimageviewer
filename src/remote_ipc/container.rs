@@ -34,8 +34,7 @@ pub(super) struct ContainerEngine {
     creative_lut_cache: Mutex<RemoteCreativeLutCache>,
     page_composite_cache: Mutex<RemoteCompositeCache>,
     comic_stamp_cache: Mutex<HashMap<String, Option<Arc<comic_core::RgbaOverlay>>>>,
-    inpaint_runtime: Mutex<Option<Arc<crate::ai::runtime::AiRuntime>>>,
-    inpaint_model_manager: Arc<crate::ai::model_manager::ModelManager>,
+    session: Option<super::session::SessionHandle>,
     page_prefetch_cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
@@ -234,7 +233,7 @@ impl ContainerEngine {
         let adjustment_settings = AdjustmentSettingsSource::Snapshot(
             crate::settings_db::AdjustmentRenderSettings::from_settings(&settings),
         );
-        Self::new_inner(settings, None, adjustment_settings)
+        Self::new_inner(settings, None, None, adjustment_settings)
     }
 
     pub(super) fn new_with_session(
@@ -243,7 +242,8 @@ impl ContainerEngine {
     ) -> Self {
         Self::new_inner(
             settings,
-            Some(ResumeReader::Session(session)),
+            Some(ResumeReader::Session(session.clone())),
+            Some(session),
             AdjustmentSettingsSource::Live,
         )
     }
@@ -259,6 +259,7 @@ impl ContainerEngine {
         Self::new_inner(
             settings,
             Some(ResumeReader::Error(error)),
+            None,
             adjustment_settings,
         )
     }
@@ -266,6 +267,7 @@ impl ContainerEngine {
     fn new_inner(
         settings: crate::settings::Settings,
         resume_reader: Option<ResumeReader>,
+        session: Option<super::session::SessionHandle>,
         adjustment_settings: AdjustmentSettingsSource,
     ) -> Self {
         let spread_db_path = crate::data_dir::get().join("spread.db");
@@ -290,8 +292,7 @@ impl ContainerEngine {
             creative_lut_cache: Mutex::new(RemoteCreativeLutCache::default()),
             page_composite_cache: Mutex::new(RemoteCompositeCache::default()),
             comic_stamp_cache: Mutex::new(HashMap::new()),
-            inpaint_runtime: Mutex::new(None),
-            inpaint_model_manager: Arc::new(crate::ai::model_manager::ModelManager::new()),
+            session,
             page_prefetch_cancel: Mutex::new(None),
         }
     }
@@ -399,37 +400,29 @@ impl ContainerEngine {
         })
     }
 
-    fn remote_inpaint_runtime(&self) -> Option<Arc<crate::ai::runtime::AiRuntime>> {
-        let mut runtime = self
-            .inpaint_runtime
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if runtime.is_none() {
-            match crate::ai::runtime::AiRuntime::new() {
-                Ok(created) => *runtime = Some(Arc::new(created)),
-                Err(error) => {
-                    crate::logger::log(format!(
-                        "remote_ipc: MI-GAN runtime init failed; using diffusion fallback: {error}"
-                    ));
-                    return None;
-                }
-            }
-        }
-        runtime.clone()
-    }
-
     fn execute_remote_edits(
         &self,
         source: Arc<egui::ColorImage>,
         edits: RemoteEditSnapshot,
         cancel: &Arc<AtomicBool>,
     ) -> Result<RemoteMaterializedEdits, MediaError> {
+        let ai_resources = edits.erase.as_ref().and_then(|_| {
+            self.session
+                .as_ref()
+                .and_then(super::session::SessionHandle::remote_ai_resources)
+        });
+        let inpaint_runtime = ai_resources
+            .as_ref()
+            .map(|resources| Arc::clone(&resources.runtime));
+        let inpaint_manager = ai_resources
+            .map(|resources| resources.manager)
+            .unwrap_or_else(|| Arc::new(crate::ai::model_manager::ModelManager::new()));
         let erase = match edits.erase {
             Some(mask) => {
                 crate::edit_source::EditLayer::Materialize(crate::edit_source::EraseMaterialize {
                     mask,
-                    runtime: self.remote_inpaint_runtime(),
-                    manager: Arc::clone(&self.inpaint_model_manager),
+                    runtime: inpaint_runtime,
+                    manager: inpaint_manager,
                     log_prefix: "remote page".to_string(),
                 })
             }
@@ -599,8 +592,12 @@ impl ContainerEngine {
             })
     }
 
-    fn begin_page_render(&self, priority: PagePriority) -> Arc<AtomicBool> {
-        let cancel = Arc::new(AtomicBool::new(false));
+    fn begin_page_render(
+        &self,
+        priority: PagePriority,
+        session_cancel: Option<Arc<AtomicBool>>,
+    ) -> Arc<AtomicBool> {
+        let cancel = session_cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let mut prefetch = self
             .page_prefetch_cancel
             .lock()
@@ -1229,7 +1226,21 @@ impl ContainerEngine {
         response
     }
 
-    pub(super) fn page(&self, request: PageRequest, context: &WorkerContext) -> PageResponse {
+    pub(super) fn page_with_session_cancel(
+        &self,
+        request: PageRequest,
+        context: &WorkerContext,
+        session_cancel: Arc<AtomicBool>,
+    ) -> PageResponse {
+        self.page_inner(request, context, Some(session_cancel))
+    }
+
+    fn page_inner(
+        &self,
+        request: PageRequest,
+        context: &WorkerContext,
+        session_cancel: Option<Arc<AtomicBool>>,
+    ) -> PageResponse {
         let started = Instant::now();
         let source_kind = media_source_kind(&request.address);
         let priority = request.priority;
@@ -1251,7 +1262,7 @@ impl ContainerEngine {
             Ok(resolved) => resolved,
             Err(error) => return PageResponse::Error(error),
         };
-        let cancel = self.begin_page_render(priority);
+        let cancel = self.begin_page_render(priority, session_cancel);
         let response = match self.load_image(
             &request.address,
             &resolved,
@@ -2713,8 +2724,8 @@ mod tests {
     #[test]
     fn foreground_page_cancels_only_the_active_remote_prefetch() {
         let engine = ContainerEngine::new(crate::settings::Settings::default());
-        let prefetch = engine.begin_page_render(PagePriority::Prefetch);
-        let foreground = engine.begin_page_render(PagePriority::Foreground);
+        let prefetch = engine.begin_page_render(PagePriority::Prefetch, None);
+        let foreground = engine.begin_page_render(PagePriority::Foreground, None);
 
         assert!(prefetch.load(Ordering::Relaxed));
         assert!(!foreground.load(Ordering::Relaxed));

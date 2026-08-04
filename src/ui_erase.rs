@@ -2831,6 +2831,9 @@ impl App {
         log_prefix: &'static str,
         is_preview: bool,
     ) {
+        if self.remote_session_blocks_local_control() {
+            return;
+        }
         self.ensure_ai_runtime();
         let runtime = self.ai_runtime.clone();
         let manager = self.ai_model_manager.clone();
@@ -2854,10 +2857,12 @@ impl App {
         let (tx, rx) = mpsc::channel::<egui::ColorImage>();
         let (progress_tx, progress_rx) = mpsc::channel::<EraseInpaintProgress>();
         let ctx_clone = ctx.clone();
+        let local_ai_activity = self.local_ai_activity_lease();
 
         let spawn_result = std::thread::Builder::new()
             .name("erase-inpaint".to_string())
             .spawn(move || {
+                let _local_ai_activity = local_ai_activity;
                 let result = crate::edit_source::run_inpaint_pure(
                     runtime.as_ref(),
                     &manager,

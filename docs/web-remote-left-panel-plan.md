@@ -5,7 +5,8 @@
 関連: [display-pipeline.md](display-pipeline.md) / [preset-and-adjustment.md](preset-and-adjustment.md) /
 [adjustment-scope-selector-plan.md](adjustment-scope-selector-plan.md) /
 [fullscreen-side-panel-mode-plan.md](fullscreen-side-panel-mode-plan.md) /
-[web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md)
+[web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md) /
+[web-remote-ai-plan.md](web-remote-ai-plan.md)
 
 ---
 
@@ -215,6 +216,10 @@ PC 側の表示も変わる。これは「操作感を揃える」の必然的�
 | **5** | 動画の補正 (エンコーダ入力への grade 段) | 重い。単独で判断する |
 
 段 1 の合成経路を土台として、段 2 以降の UI / 操作を接続する。
+
+段 3b は remote 接続中の PC modal 排他、接続取得 / 切断 drain barrier、
+stable remote key、HTTP job lifecycle、画面消灯復帰、重複 AiRuntime、VRAM / 撤退条件までを
+[web-remote-ai-plan.md](web-remote-ai-plan.md) に分離した。現在は設計案であり未実装。
 
 ### 7.1 段 2a 実装結果 (2026-08-03)
 
@@ -495,7 +500,9 @@ PDF 再レンダや編集結果の materialize のため。
 1. ページ個別・場所の標準・global を解決する**共有 resolver**
 2. 適用順と解決済みパラメータを表す **`FinalCompositePlan`**
 3. tone / sharpen / colorize / LUT / postfilter の**共有 CPU executor**
-4. App と remote が**それぞれ所有する** cache / worker / cancellation / 出力 adapter
+4. App と remote が**それぞれ所有する** cache / cancellation / 出力 adapter。
+   CPU final composite worker は別所有だが、段 3b の GPU inference は App 所有の
+   singleton Runtime / typed bridge を通し、接続取得と切断の barrier で local と直列化する
 
 > 共有すべきものは**段取りを表す plan と変換 executor**。`egui::Context` は App 側 adapter に残す。
 
@@ -514,8 +521,12 @@ PDF 再レンダや編集結果の materialize のため。
 元画像の選択は plan に含めない。raw / edit result の materialize は DB、generation、pending、
 cache の所有権を必要とし、選択済み pixels が executor の入力境界だからである。final AI も plan に
 含めない。現行どおり tone 後・smart sharpen 前に独立 cache / worker として実行し、adapter が
-AI 結果の有無と `used_upscale` を解決してから plan を作る。段 3 では remote adapter が同じ位置に
-自分の AI job / cache を持つ。
+AI 結果の有無と `used_upscale` を解決してから plan を作る。
+段 3b の再調査で、remote 接続中は PC の main / fullscreen 入力が modal で停止するため、
+PC 優先 preemption は不要と確定した。一方、接続前から残る local AI と切断時の remote AI は
+境界をまたぎ得るため、App 所有の singleton Runtime / typed bridge と接続 lifecycle の
+acquire / drain barrier で直列化する。adapter 固有なのは remote stable-key cache、cancel owner、
+最終出力とする。詳細は [web-remote-ai-plan.md](web-remote-ai-plan.md)。
 
 #### 段 1a 補正適用の実装結果 (2026-08-03)
 

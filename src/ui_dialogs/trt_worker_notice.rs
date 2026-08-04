@@ -15,10 +15,9 @@
 //! - 時間で自動消滅しない (ユーザー認知が必要なため)
 //! - `TrtBuildPhase::Building` 中は出さない (ビルダー dialog と被るため)
 
-use eframe::egui;
-
 use crate::ai::runtime::{WorkerNotice, WorkerNoticeKind};
 use crate::app::App;
+use eframe::egui;
 
 /// セッション中の worker 自動再起動の上限。
 ///
@@ -151,7 +150,7 @@ impl App {
             self.trt_worker_notice = None;
             if let Some(rt) = self.ai_runtime.as_ref() {
                 let runtime_arc = rt.clone();
-                Self::spawn_trt_worker_pool(&runtime_arc);
+                Self::spawn_trt_worker_pool(&runtime_arc, self.local_ai_activity_lease());
             }
         } else if close_clicked {
             self.trt_worker_notice = None;

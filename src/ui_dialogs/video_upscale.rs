@@ -348,7 +348,7 @@ impl App {
     pub(crate) fn poll_video_upscale_queue(&mut self, ctx: &egui::Context) {
         self.poll_video_upscale_delete_results();
         self.poll_video_upscale_running_result();
-        if self.video_upscale_running.is_none() {
+        if self.video_upscale_running.is_none() && !self.remote_session_blocks_local_control() {
             self.start_next_video_upscale_task();
         }
         if self.video_upscale_running.is_some() {

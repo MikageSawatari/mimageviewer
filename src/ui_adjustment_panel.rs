@@ -12004,6 +12004,9 @@ impl App {
     }
 
     fn start_local_adjust_subject_segmentation(&mut self, fs_idx: usize, layer_idx: usize) {
+        if self.remote_session_blocks_local_control() {
+            return;
+        }
         if self.local_adjust_segmentation_pending.is_some() {
             self.show_feedback_toast("マスク生成中です".to_string());
             return;
@@ -12039,9 +12042,11 @@ impl App {
             .copied()
             .unwrap_or(0);
         let (tx, rx) = std::sync::mpsc::channel();
+        let local_ai_activity = self.local_ai_activity_lease();
         let spawn_result = std::thread::Builder::new()
             .name("local-adjust-subject-segmentation".to_string())
             .spawn(move || {
+                let _local_ai_activity = local_ai_activity;
                 let result = run_local_adjust_subject_segmentation(runtime, model_path, source)
                     .map(LocalAdjustGeneratedMask::Subject);
                 let _ = tx.send(result);

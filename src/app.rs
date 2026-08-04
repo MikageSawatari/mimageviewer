@@ -5521,6 +5521,25 @@ pub(crate) struct AiJob {
     pub(crate) adjust_before_ai: Option<crate::adjustment::AdjustParams>,
     pub(crate) denoise_kind: Option<crate::ai::ModelKind>,
     pub(crate) upscale_kind: Option<crate::ai::ModelKind>,
+    /// viewer bundle から pending が外れた後も worker 終端まで acquire barrier に残す。
+    _local_activity: LocalAiActivityLease,
+}
+
+pub(crate) struct LocalAiActivityLease {
+    active: Arc<AtomicUsize>,
+}
+
+impl LocalAiActivityLease {
+    fn new(active: Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::AcqRel);
+        Self { active }
+    }
+}
+
+impl Drop for LocalAiActivityLease {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct AiJobQueueState {
@@ -5578,6 +5597,16 @@ impl AiJobQueue {
             AiJobPriority::Prefetch => q.prefetch.push_back(job),
         }
         cv.notify_one();
+    }
+
+    /// queue order is left intact; every queued/in-flight owner observes its existing token.
+    fn cancel_all(&self) {
+        let (mtx, cv) = &*self.inner;
+        let q = mtx.lock().unwrap();
+        for job in q.display.iter().chain(q.prefetch.iter()) {
+            job.cancel.store(true, Ordering::Release);
+        }
+        cv.notify_all();
     }
 }
 
@@ -9933,6 +9962,9 @@ pub struct App {
     pub(crate) ai_runtime: Option<std::sync::Arc<crate::ai::runtime::AiRuntime>>,
     /// AI モデルマネージャ
     pub(crate) ai_model_manager: std::sync::Arc<crate::ai::model_manager::ModelManager>,
+    /// local AI worker の実 lifetime。viewer bundle の pending map から cancel 済み
+    /// entry が外れても、remote acquire はこの値が 0 になるまで進まない。
+    local_ai_activity: Arc<AtomicUsize>,
     /// AI アップスケール有効フラグ
     pub(crate) ai_upscale_enabled: bool,
     /// AI アップスケールモデルの手動オーバーライド (None = 自動)
@@ -12308,6 +12340,7 @@ impl App {
             // AI (settings から復元)
             ai_runtime: None,
             ai_model_manager: std::sync::Arc::new(crate::ai::model_manager::ModelManager::new()),
+            local_ai_activity: Arc::new(AtomicUsize::new(0)),
             ai_upscale_enabled,
             ai_upscale_model_override,
             ai_denoise_model: None,
@@ -13668,7 +13701,7 @@ impl App {
     /// main / fullscreen で別々の一覧を持つと、新規ダイアログ追加時に片方だけ漏れて
     /// wheel・キーが背面へ伝播するため、モーダル相当の状態は必ずここへ集約する。
     fn common_modal_dialog_open(&self) -> bool {
-        self.remote_session_active()
+        self.remote_session_blocks_local_control()
             || self.remote_connection_dialog_open()
             || self.show_stats_dialog
             || self.show_favorites_editor
@@ -33843,7 +33876,7 @@ impl App {
         main_viewport_focused: bool,
         fullscreen_root_key_handled: bool,
     ) {
-        if self.remote_session_active() {
+        if self.remote_session_blocks_local_control() {
             return;
         }
         if !self.viewer_session_blocks_main_window() {
@@ -46788,7 +46821,7 @@ impl App {
             }
             if !self.fs_cache.contains_key(&idx) {
                 let from_grid = std::mem::take(&mut self.fs_open_intent_from_grid);
-                let autoplay_override = if self.remote_session_active() {
+                let autoplay_override = if self.remote_session_blocks_local_control() {
                     self.fs_video_open_autoplay_override = None;
                     Some(false)
                 } else {
@@ -46940,8 +46973,11 @@ impl App {
                 // 一覧から開いた (grid) か移動 (nav) かのワンショットフラグを消費する
                 // (動画分岐と同じ std::mem::take 規約)。resume 設定の選択に使う。
                 let from_grid = std::mem::take(&mut self.fs_open_intent_from_grid);
-                let (player, start_normalize_scan_before_play) =
-                    self.build_audio_player_for_open(ap, from_grid, !self.remote_session_active());
+                let (player, start_normalize_scan_before_play) = self.build_audio_player_for_open(
+                    ap,
+                    from_grid,
+                    !self.remote_session_blocks_local_control(),
+                );
                 self.fs_cache.insert(
                     idx,
                     FsCacheEntry::Video {
@@ -48789,7 +48825,7 @@ impl App {
                 crate::logger::log(
                     "[AI] AI バックエンド変更: → TensorRT (worker pool 起動)".to_string(),
                 );
-                Self::spawn_trt_worker_pool(runtime);
+                Self::spawn_trt_worker_pool(runtime, self.local_ai_activity_lease());
             }
             (false, true) => {
                 crate::logger::log(
@@ -48814,23 +48850,115 @@ impl App {
     /// - 起動時は TensorRT 設定でも worker pool を自動起動しない。CUDA/TensorRT
     ///   provider DLL はプロセス境界外とはいえ driver crash を誘発し得るため、実際に
     ///   AI 処理が必要になったタイミングで遅延起動する。
-    pub(crate) fn ensure_ai_runtime(&mut self) {
-        if self.ai_runtime.is_none() {
-            // 常に DirectML で起動 (Phase 3)
-            match crate::ai::runtime::AiRuntime::new_with_backend(crate::ai::AiBackend::DirectMl) {
-                Ok(rt) => {
-                    let active = rt.active_backend();
-                    crate::logger::log(format!(
-                        "[AI] Runtime initialized (DirectML always in main, requested={:?}, effective={:?})",
-                        active.requested, active.effective
-                    ));
-                    let runtime_arc = std::sync::Arc::new(rt);
+    fn cancel_mounted_context_ai_for_remote_barrier(&mut self) {
+        for pending in self.final_ai_pending.values() {
+            pending.cancel.store(true, Ordering::Release);
+        }
+        for pending in self.erase_inpaint_pending.values() {
+            pending.cancel.store(true, Ordering::Release);
+        }
+    }
 
-                    self.ai_runtime = Some(runtime_arc);
+    fn mounted_context_ai_quiesced_for_remote_barrier(&self) -> bool {
+        self.final_ai_pending.is_empty() && self.erase_inpaint_pending.is_empty()
+    }
+
+    pub(crate) fn begin_local_ai_remote_barrier(&mut self) -> bool {
+        if let Some(queue) = self.ai_job_queue.as_ref() {
+            queue.cancel_all();
+        }
+        self.cancel_mounted_context_ai_for_remote_barrier();
+        #[cfg(windows)]
+        {
+            let _ = self.with_active_detached_viewer_context(|app| {
+                app.cancel_mounted_context_ai_for_remote_barrier();
+            });
+        }
+        for (cancel, _) in self.ai_upscale_pending.values() {
+            cancel.store(true, Ordering::Release);
+        }
+        let resume_video_upscale =
+            self.video_upscale_running.is_some() && !self.video_upscale_queue.paused;
+        if let Some(running) = self.video_upscale_running.as_ref() {
+            running.pause.store(true, Ordering::Release);
+        }
+        resume_video_upscale
+    }
+
+    pub(crate) fn local_ai_activity_lease(&self) -> LocalAiActivityLease {
+        LocalAiActivityLease::new(Arc::clone(&self.local_ai_activity))
+    }
+
+    pub(crate) fn local_ai_remote_barrier_quiesced(&mut self) -> bool {
+        let mounted_quiesced = self.mounted_context_ai_quiesced_for_remote_barrier();
+        #[cfg(windows)]
+        let detached_quiesced = self
+            .with_active_detached_viewer_context(|app| {
+                app.mounted_context_ai_quiesced_for_remote_barrier()
+            })
+            .unwrap_or(true);
+        #[cfg(not(windows))]
+        let detached_quiesced = true;
+        let video_quiesced = self
+            .video_upscale_running
+            .as_ref()
+            .is_none_or(|running| running.paused_idle.load(Ordering::Acquire));
+        mounted_quiesced
+            && detached_quiesced
+            && self.ai_upscale_pending.is_empty()
+            && self.retained_final_ai_orphans.is_empty()
+            && self.local_adjust_segmentation_pending.is_none()
+            && self.book_op_pending.is_none()
+            && self.local_ai_activity.load(Ordering::Acquire) == 0
+            && !self.trt_restart_in_flight.load(Ordering::Acquire)
+            && video_quiesced
+    }
+
+    pub(crate) fn release_local_ai_remote_barrier(&mut self, resume_video_upscale: bool) {
+        if resume_video_upscale && let Some(running) = self.video_upscale_running.as_ref() {
+            running
+                .pause
+                .store(self.video_upscale_queue.paused, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn ensure_ai_runtime(&mut self) {
+        if self.ai_runtime.is_some() {
+            return;
+        }
+        let bridge = self.remote_ai_execution_bridge();
+        if let Some(bridge) = bridge.as_ref() {
+            match bridge.claim_local_runtime_init() {
+                crate::remote_ipc::session::RemoteLocalRuntimeClaim::Ready(runtime) => {
+                    self.ai_runtime = Some(runtime);
+                    return;
                 }
-                Err(e) => {
-                    crate::logger::log(format!("[AI] Runtime init failed: {e}"));
+                crate::remote_ipc::session::RemoteLocalRuntimeClaim::WaitingForRemote => {
+                    // Runtime construction remains on the remote worker. poll_remote_session
+                    // adopts it after completion; never wait on its Condvar from the UI thread.
+                    return;
                 }
+                crate::remote_ipc::session::RemoteLocalRuntimeClaim::Initialize => {}
+            }
+        }
+        // 常に DirectML で起動 (Phase 3)
+        let created =
+            crate::ai::runtime::AiRuntime::new_with_backend(crate::ai::AiBackend::DirectMl);
+        let created = match bridge.as_ref() {
+            Some(bridge) => bridge.complete_claimed_runtime_init(created),
+            None => created.map(std::sync::Arc::new),
+        };
+        match created {
+            Ok(runtime) => {
+                let active = runtime.active_backend();
+                crate::logger::log(format!(
+                    "[AI] Runtime initialized (DirectML always in main, requested={:?}, effective={:?})",
+                    active.requested, active.effective
+                ));
+                self.ai_runtime = Some(runtime);
+            }
+            Err(e) => {
+                crate::logger::log(format!("[AI] Runtime init failed: {e}"));
             }
         }
     }
@@ -48880,21 +49008,13 @@ impl App {
     /// 既に立っていたら早期 return (= 別の spawn が進行中)。worker 死亡時に
     /// 並行する複数の AI 推論が同じ DiedDuringInfer を観測しても 1 回しか
     /// 新 pool を起こさない (Codex P2 指摘)。
-    pub(crate) fn spawn_trt_worker_pool(runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>) {
-        Self::spawn_trt_worker_pool_inner(
-            runtime,
-            /* guard = */ None,
-            std::time::Duration::ZERO,
-        );
-    }
-
     /// `spawn_trt_worker_pool` の guard 付き版。worker 死亡時の自動再起動から
     /// 呼ぶ際に使う (= 複数の死亡通知が並行して走る場合の多重 spawn を防ぐ)。
     pub(crate) fn spawn_trt_worker_pool_guarded(
         runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
         guard: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
-        Self::spawn_trt_worker_pool_inner(runtime, Some(guard), std::time::Duration::ZERO);
+        Self::spawn_trt_worker_pool_inner(runtime, Some(guard), None, std::time::Duration::ZERO);
     }
 
     /// `spawn_trt_worker_pool_guarded` の遅延版。起動 timeout 直後の transient retry で
@@ -48904,12 +49024,20 @@ impl App {
         guard: std::sync::Arc<std::sync::atomic::AtomicBool>,
         delay: std::time::Duration,
     ) {
-        Self::spawn_trt_worker_pool_inner(runtime, Some(guard), delay);
+        Self::spawn_trt_worker_pool_inner(runtime, Some(guard), None, delay);
+    }
+
+    pub(crate) fn spawn_trt_worker_pool(
+        runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
+        activity: LocalAiActivityLease,
+    ) {
+        Self::spawn_trt_worker_pool_inner(runtime, None, Some(activity), std::time::Duration::ZERO);
     }
 
     fn spawn_trt_worker_pool_inner(
         runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
         guard: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        local_ai_activity: Option<LocalAiActivityLease>,
         delay: std::time::Duration,
     ) {
         // CAS: false → true。すでに in-flight なら true のままで、ここは false 戻り → skip。
@@ -48933,6 +49061,7 @@ impl App {
         if let Err(e) = std::thread::Builder::new()
             .name("trt-worker-spawn".to_string())
             .spawn(move || {
+                let _local_ai_activity = local_ai_activity;
                 if !delay.is_zero() {
                     crate::logger::log(format!(
                         "[AI] TRT worker pool 再起動を {} ms 待ってから試行します",
@@ -49076,6 +49205,9 @@ impl App {
     /// - アップスケール時: 2K 以上の画像はスキップ
     #[allow(dead_code)] // Legacy AI cache is kept until P2.4 staged deletion.
     pub(crate) fn maybe_start_ai_upscale(&mut self, current_idx: usize) {
+        if self.remote_session_blocks_local_control() {
+            return;
+        }
         let denoise_enabled = self.ai_denoise_model.is_some();
         let upscale_enabled = self.ai_upscale_enabled;
 
@@ -49266,8 +49398,10 @@ impl App {
         // composite-first はアップスケールパスのみ必要 (1x のデノイズは Lanczos 拡大の
         // ズレが生じないため、アルファ保持パスでそのまま処理できる)。
         let composite_first = upscale_model.is_some();
+        let local_ai_activity = self.local_ai_activity_lease();
 
         std::thread::spawn(move || {
+            let _local_ai_activity = local_ai_activity;
             // composite-first: アップスケールあり時のみ bg 単色に合成してから AI に渡す。
             // これにより AI モデルがアルファ境界の RGB ガベージに引きずられず、
             // 輪郭がきれいにアップスケールされる。背景色は出力に焼き付くため、
@@ -49635,6 +49769,9 @@ impl App {
     /// - `maybe_start_final_ai` 内の "active pending check" は cancel 済を除外
     ///   しないため、ここで `has_uncancelled_final_ai_pending` を別途 gate する。
     pub(crate) fn prefetch_final_ai(&mut self, ctx: &egui::Context, current_idx: usize) {
+        if self.remote_session_blocks_local_control() {
+            return;
+        }
         // 背景 final-effect は現在ページの ensure 経路に依存せず、fullscreen work
         // セクション自体で回収する。ensure 側の poll はコピー / 書き出し等の入口用に残す。
         self.poll_final_effects(ctx);
@@ -53480,6 +53617,11 @@ impl App {
         params: crate::adjustment::AdjustParams,
         source_is_color_adjusted: bool,
     ) -> bool {
+        // Keep the composite provisional while remote owns the singleton runtime. The final
+        // release reload retries this path before PC input is enabled.
+        if self.remote_session_blocks_local_control() {
+            return true;
+        }
         if self.final_ai_cache.contains_key(&key) || self.final_ai_pending.contains_key(&key) {
             return true;
         }
@@ -53653,6 +53795,7 @@ impl App {
                 adjust_before_ai,
                 denoise_kind: denoise_model,
                 upscale_kind: upscale_model,
+                _local_activity: self.local_ai_activity_lease(),
             });
         }
         crate::logger::log(format!(
@@ -59280,7 +59423,7 @@ impl App {
                         .collect();
                     let now = ctx.input(|i| i.time);
                     let first_delay = textures.first().map(|(_, d)| *d).unwrap_or(0.1);
-                    let playback = if self.remote_session_active()
+                    let playback = if self.remote_session_blocks_local_control()
                         || self.consume_remote_animation_pause_restore(key)
                     {
                         AnimationPlayback::Paused

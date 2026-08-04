@@ -419,7 +419,7 @@ fn worker_loop(
                 metrics,
                 &format!("heavy-{worker_index}"),
                 session_operation,
-                |message| match message {
+                |message, cancel| match message {
                     ClientMessage::Thumbnail { id, request, .. } => ServerMessage::Thumbnail {
                         id,
                         response: thumbnail_engine.handle(request, &context, container_engine),
@@ -442,7 +442,8 @@ fn worker_loop(
                     },
                     ClientMessage::Page { id, request, .. } => ServerMessage::Page {
                         id,
-                        response: container_engine.page(request, &context),
+                        response: container_engine
+                            .page_with_session_cancel(request, &context, cancel),
                     },
                     ClientMessage::Write { id, .. } => ServerMessage::Write {
                         id,
@@ -508,7 +509,7 @@ fn home_worker_loop(
                 metrics,
                 "home-0",
                 session_operation,
-                |message| match message {
+                |message, _cancel| match message {
                     ClientMessage::Home { id, .. } => ServerMessage::Home {
                         id,
                         response: collection_engine.home(),
@@ -551,30 +552,38 @@ fn write_worker_loop(
             enqueued_at.elapsed().as_secs_f64() * 1000.0
         ));
         let started_at = Instant::now();
-        let response = match message {
-            ClientMessage::Write {
-                id, mut request, ..
-            } => {
-                if let Err(error) = container_engine.validate_write_request(&mut request) {
-                    session_operation.started();
-                    session_operation.finish(false);
-                    ServerMessage::Write {
-                        id,
-                        response: RemoteWriteResponse::Error(error),
-                    }
-                } else {
-                    match session.submit_write(request, session_operation) {
-                        UiWriteOutcome::Write(response) => ServerMessage::Write { id, response },
-                        UiWriteOutcome::Session(response) => {
-                            ServerMessage::Session { id, response }
+        let response = if let Err(response) = session_operation.wait_until_active() {
+            ServerMessage::Session {
+                id: request_id,
+                response,
+            }
+        } else {
+            session_operation.started();
+            match message {
+                ClientMessage::Write {
+                    id, mut request, ..
+                } => {
+                    if let Err(error) = container_engine.validate_write_request(&mut request) {
+                        session_operation.finish(false);
+                        ServerMessage::Write {
+                            id,
+                            response: RemoteWriteResponse::Error(error),
+                        }
+                    } else {
+                        match session.submit_write(request, session_operation) {
+                            UiWriteOutcome::Write(response) => {
+                                ServerMessage::Write { id, response }
+                            }
+                            UiWriteOutcome::Session(response) => {
+                                ServerMessage::Session { id, response }
+                            }
                         }
                     }
                 }
-            }
-            other => {
-                session_operation.started();
-                session_operation.finish(false);
-                service_stopped_response(&other)
+                other => {
+                    session_operation.finish(false);
+                    service_stopped_response(&other)
+                }
             }
         };
         let outcome = response_outcome(&response);
@@ -621,9 +630,15 @@ fn stream_worker_loop(
             enqueued_at.elapsed().as_secs_f64() * 1000.0
         ));
         let started_at = Instant::now();
-        session_operation.started();
-        let response =
-            execute_video_stream_request(message, engine, session, session_operation, enqueued_at);
+        let response = if let Err(response) = session_operation.wait_until_active() {
+            ServerMessage::Session {
+                id: request_id,
+                response,
+            }
+        } else {
+            session_operation.started();
+            execute_video_stream_request(message, engine, session, session_operation, enqueued_at)
+        };
         let outcome = response_outcome(&response);
         let reply_ok = reply.send(response).is_ok();
         let (queued, active) = metrics.finished();
@@ -915,7 +930,7 @@ fn execute_work(
     metrics: &QueueMetrics,
     worker: &str,
     session_operation: SessionOperation,
-    handler: impl FnOnce(ClientMessage) -> ServerMessage,
+    handler: impl FnOnce(ClientMessage, Arc<AtomicBool>) -> ServerMessage,
 ) {
     let request_id = message.id();
     let request_kind = request_kind(&message);
@@ -926,8 +941,15 @@ fn execute_work(
         enqueued_at.elapsed().as_secs_f64() * 1000.0
     ));
     let started_at = Instant::now();
-    session_operation.started();
-    let response = handler(message);
+    let response = if let Err(response) = session_operation.wait_until_active() {
+        ServerMessage::Session {
+            id: request_id,
+            response,
+        }
+    } else {
+        session_operation.started();
+        handler(message, session_operation.cancel_flag())
+    };
     let ownership = session_operation.ownership_response();
     let response = if ownership.status == SessionStatus::Active {
         response
@@ -1434,11 +1456,14 @@ fn handle_connection(
             ClientMessage::SessionActivity { id, client_id } => {
                 let response =
                     match session.begin_operation(client_id, "API 要求を処理中".to_owned()) {
-                        Ok(operation) => {
-                            operation.started();
-                            operation.finish(true);
-                            SessionResponse::active()
-                        }
+                        Ok(operation) => match operation.wait_until_active() {
+                            Ok(()) => {
+                                operation.started();
+                                operation.finish(true);
+                                SessionResponse::active()
+                            }
+                            Err(response) => response,
+                        },
                         Err(response) => response,
                     };
                 let _ = reply_tx.send(ServerMessage::Session { id: *id, response });
@@ -2048,6 +2073,7 @@ mod tests {
                 device_name: None,
             },
         });
+        assert!(session.finish_acquire(session.snapshot().generation));
         let session_operation = session
             .begin_operation("test-client", "ホームを読み込み中".to_owned())
             .unwrap();

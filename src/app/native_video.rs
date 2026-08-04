@@ -3087,7 +3087,7 @@ impl App {
             ));
             return;
         }
-        if self.remote_session_active()
+        if self.remote_session_blocks_local_control()
             && Self::native_video_output_event_blocked_while_parked_live(&event)
         {
             crate::logger::log(

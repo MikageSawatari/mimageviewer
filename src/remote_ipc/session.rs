@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimageviewer_ipc::{
@@ -32,6 +32,76 @@ enum ReleaseReason {
     Superseded,
 }
 
+/// PC と remote の排他的な操作権 lifecycle。
+///
+/// `active: Option<_>` や複数の bool から状態を推測せず、この phase だけを正本にする。
+/// App を生成しない unit test で遷移規則を固定できるよう、時刻・I/O・worker を持たない。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RemoteControlPhase {
+    #[default]
+    Local,
+    AcquiringRemote,
+    RemoteActive,
+    DrainingRemote,
+}
+
+impl RemoteControlPhase {
+    pub(crate) fn blocks_local_control(self) -> bool {
+        !matches!(self, Self::Local)
+    }
+
+    pub(crate) fn accepts_remote_work(self) -> bool {
+        matches!(self, Self::RemoteActive)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RemoteControlLifecycle {
+    phase: RemoteControlPhase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteControlTransition {
+    BeginAcquire,
+    FinishAcquire,
+    BeginDrain,
+    FinishDrain,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemoteControlTransitionError {
+    phase: RemoteControlPhase,
+    transition: RemoteControlTransition,
+}
+
+impl RemoteControlLifecycle {
+    fn transition(
+        &mut self,
+        transition: RemoteControlTransition,
+    ) -> Result<(), RemoteControlTransitionError> {
+        let next = match (self.phase, transition) {
+            (RemoteControlPhase::Local, RemoteControlTransition::BeginAcquire) => {
+                RemoteControlPhase::AcquiringRemote
+            }
+            (RemoteControlPhase::AcquiringRemote, RemoteControlTransition::FinishAcquire) => {
+                RemoteControlPhase::RemoteActive
+            }
+            (
+                RemoteControlPhase::AcquiringRemote | RemoteControlPhase::RemoteActive,
+                RemoteControlTransition::BeginDrain,
+            ) => RemoteControlPhase::DrainingRemote,
+            (RemoteControlPhase::DrainingRemote, RemoteControlTransition::FinishDrain) => {
+                RemoteControlPhase::Local
+            }
+            (phase, transition) => {
+                return Err(RemoteControlTransitionError { phase, transition });
+            }
+        };
+        self.phase = next;
+        Ok(())
+    }
+}
+
 impl ReleaseReason {
     fn status(self) -> SessionStatus {
         match self {
@@ -46,6 +116,7 @@ impl ReleaseReason {
 struct OperationState {
     description: String,
     started: bool,
+    cancel: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +152,7 @@ impl ActiveSession {
 
 #[derive(Debug)]
 struct SessionStateMachine {
+    lifecycle: RemoteControlLifecycle,
     active: Option<ActiveSession>,
     last_owner: Option<String>,
     last_release_reason: Option<ReleaseReason>,
@@ -89,11 +161,14 @@ struct SessionStateMachine {
     next_streaming_registration: u64,
     acquisition_sequence: u64,
     control_return_sequence: u64,
+    drain_reason: Option<ReleaseReason>,
+    app_drain_complete: bool,
 }
 
 impl Default for SessionStateMachine {
     fn default() -> Self {
         Self {
+            lifecycle: RemoteControlLifecycle::default(),
             active: None,
             last_owner: None,
             last_release_reason: None,
@@ -102,6 +177,8 @@ impl Default for SessionStateMachine {
             next_streaming_registration: 1,
             acquisition_sequence: 0,
             control_return_sequence: 0,
+            drain_reason: None,
+            app_drain_complete: false,
         }
     }
 }
@@ -116,21 +193,32 @@ impl SessionStateMachine {
         if let Some(active) = self.active.as_mut()
             && active.client_id == request.client_id
         {
+            if self.lifecycle.phase == RemoteControlPhase::DrainingRemote {
+                return session_closing_response();
+            }
             active.last_ping = now;
             active.last_activity = now;
             active.peer = request.peer;
             return SessionResponse::active();
         }
 
-        if let Some(mut previous) = self.active.take() {
-            previous.cancel_streaming();
-            self.last_owner = Some(previous.client_id);
-            self.last_release_reason = Some(ReleaseReason::Superseded);
+        if self.active.is_some() {
+            self.begin_drain(ReleaseReason::Superseded);
+            return session_closing_response();
+        }
+        if self
+            .lifecycle
+            .transition(RemoteControlTransition::BeginAcquire)
+            .is_err()
+        {
+            return session_closing_response();
         }
         self.generation = self.generation.wrapping_add(1);
         self.acquisition_sequence = self.acquisition_sequence.wrapping_add(1);
         self.last_owner = Some(request.client_id.clone());
         self.last_release_reason = None;
+        self.drain_reason = None;
+        self.app_drain_complete = false;
         self.active = Some(ActiveSession {
             client_id: request.client_id,
             peer: request.peer,
@@ -148,6 +236,15 @@ impl SessionStateMachine {
         SessionResponse::active()
     }
 
+    fn finish_acquire(&mut self, generation: u64) -> bool {
+        generation == self.generation
+            && self.active.is_some()
+            && self
+                .lifecycle
+                .transition(RemoteControlTransition::FinishAcquire)
+                .is_ok()
+    }
+
     fn ping(&mut self, now: Duration, request: &SessionPingRequest) -> SessionResponse {
         self.expire(now);
         let Some(active) = self.active.as_mut() else {
@@ -158,6 +255,9 @@ impl SessionStateMachine {
                 SessionStatus::Superseded,
                 "別の端末で使用中です。操作すると操作権を取得します。",
             );
+        }
+        if self.lifecycle.phase == RemoteControlPhase::DrainingRemote {
+            return session_closing_response();
         }
         active.last_ping = now;
         active.media_playing = request.media_playing;
@@ -172,8 +272,11 @@ impl SessionStateMachine {
         now: Duration,
         client_id: &str,
         description: String,
-    ) -> Result<(u64, u64), SessionResponse> {
+    ) -> Result<(u64, u64, Arc<AtomicBool>), SessionResponse> {
         self.expire(now);
+        if self.lifecycle.phase == RemoteControlPhase::DrainingRemote {
+            return Err(session_closing_response());
+        }
         let Some(active) = self.active.as_mut() else {
             return Err(self.inactive_response(client_id));
         };
@@ -188,18 +291,23 @@ impl SessionStateMachine {
         active.request_count = active.request_count.saturating_add(1);
         let token = self.next_operation;
         self.next_operation = self.next_operation.wrapping_add(1).max(1);
+        let cancel = Arc::new(AtomicBool::new(false));
         active.operations.insert(
             token,
             OperationState {
                 description,
                 started: false,
+                cancel: Arc::clone(&cancel),
             },
         );
-        Ok((self.generation, token))
+        Ok((self.generation, token, cancel))
     }
 
     fn streaming_owner(&mut self, now: Duration, client_id: &str) -> Result<u64, SessionResponse> {
         self.expire(now);
+        if !self.lifecycle.phase.accepts_remote_work() {
+            return Err(session_closing_response());
+        }
         let Some(active) = self.active.as_mut() else {
             return Err(self.inactive_response(client_id));
         };
@@ -222,6 +330,9 @@ impl SessionStateMachine {
         cancel: Arc<AtomicBool>,
     ) -> Result<u64, SessionResponse> {
         self.expire(now);
+        if !self.lifecycle.phase.accepts_remote_work() {
+            return Err(session_closing_response());
+        }
         let Some(active) = self.active.as_mut() else {
             return Err(self.inactive_response(client_id));
         };
@@ -299,36 +410,41 @@ impl SessionStateMachine {
         }
     }
 
-    fn start_operation(&mut self, generation: u64, token: u64) {
-        if generation == self.generation
+    fn start_operation(&mut self, generation: u64, token: u64) -> bool {
+        if self.lifecycle.phase.accepts_remote_work()
+            && generation == self.generation
             && let Some(operation) = self
                 .active
                 .as_mut()
                 .and_then(|active| active.operations.get_mut(&token))
         {
             operation.started = true;
+            return true;
         }
+        false
     }
 
-    fn finish_operation(&mut self, generation: u64, token: u64, success: bool) {
+    fn finish_operation(&mut self, generation: u64, token: u64, success: bool) -> bool {
         if generation != self.generation {
-            return;
+            return false;
         }
         let Some(active) = self.active.as_mut() else {
-            return;
+            return false;
         };
         if active.operations.remove(&token).is_none() {
-            return;
+            return false;
         }
         if success {
             active.completed_count = active.completed_count.saturating_add(1);
         } else {
             active.failed_count = active.failed_count.saturating_add(1);
         }
+        self.try_finish_drain()
     }
 
+    #[cfg(test)]
     fn local_disconnect(&mut self) {
-        self.release(ReleaseReason::Local);
+        self.begin_drain(ReleaseReason::Local);
     }
 
     fn expire(&mut self, now: Duration) -> Option<ReleaseReason> {
@@ -348,22 +464,84 @@ impl SessionStateMachine {
             }
         });
         if let Some(reason) = reason {
-            self.release(reason);
+            self.begin_drain(reason);
         }
         reason
     }
 
-    fn release(&mut self, reason: ReleaseReason) {
-        let Some(mut active) = self.active.take() else {
-            return;
-        };
-        active.cancel_streaming();
-        self.last_owner = Some(active.client_id);
-        self.last_release_reason = Some(reason);
-        self.generation = self.generation.wrapping_add(1);
-        if reason != ReleaseReason::Superseded {
-            self.control_return_sequence = self.control_return_sequence.wrapping_add(1);
+    fn begin_drain(&mut self, reason: ReleaseReason) -> bool {
+        if self
+            .lifecycle
+            .transition(RemoteControlTransition::BeginDrain)
+            .is_err()
+        {
+            return false;
         }
+        self.drain_reason = Some(reason);
+        self.app_drain_complete = false;
+        if let Some(active) = self.active.as_mut() {
+            active.cancel_streaming();
+            for operation in active.operations.values() {
+                operation.cancel.store(true, Ordering::Release);
+            }
+        }
+        true
+    }
+
+    fn complete_app_drain(&mut self, generation: u64) -> bool {
+        if generation != self.generation
+            || self.lifecycle.phase != RemoteControlPhase::DrainingRemote
+        {
+            return false;
+        }
+        self.app_drain_complete = true;
+        self.try_finish_drain()
+    }
+
+    fn try_finish_drain(&mut self) -> bool {
+        if self.lifecycle.phase != RemoteControlPhase::DrainingRemote
+            || !self.app_drain_complete
+            || self
+                .active
+                .as_ref()
+                .is_some_and(|active| !active.operations.is_empty())
+        {
+            return false;
+        }
+        let reason = self.drain_reason.unwrap_or(ReleaseReason::Local);
+        match self.release(reason) {
+            Ok(()) => true,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "remote_ipc: lifecycle invariant violation: transition={:?} phase={:?}",
+                    error.transition, error.phase
+                ));
+                false
+            }
+        }
+    }
+
+    fn release(&mut self, reason: ReleaseReason) -> Result<(), RemoteControlTransitionError> {
+        // Final release is owned by the typed phase transition. `active` is session payload,
+        // not a sentinel for whether control may return to the PC.
+        self.lifecycle
+            .transition(RemoteControlTransition::FinishDrain)?;
+
+        if let Some(mut active) = self.active.take() {
+            active.cancel_streaming();
+            self.last_owner = Some(active.client_id);
+        } else {
+            crate::logger::log(
+                "remote_ipc: lifecycle invariant violation: final drain has no active session payload"
+                    .to_owned(),
+            );
+        }
+        self.last_release_reason = Some(reason);
+        self.drain_reason = None;
+        self.app_drain_complete = false;
+        self.generation = self.generation.wrapping_add(1);
+        self.control_return_sequence = self.control_return_sequence.wrapping_add(1);
+        Ok(())
     }
 
     fn inactive_response(&self, client_id: &str) -> SessionResponse {
@@ -410,6 +588,8 @@ impl SessionStateMachine {
                 .is_some_and(|streaming| streaming.playing),
         });
         SessionSnapshot {
+            phase: self.lifecycle.phase,
+            generation: self.generation,
             active,
             acquisition_sequence: self.acquisition_sequence,
             control_return_sequence: self.control_return_sequence,
@@ -424,6 +604,13 @@ fn status_response(status: SessionStatus, message: impl Into<String>) -> Session
         status,
         message: message.into(),
     }
+}
+
+fn session_closing_response() -> SessionResponse {
+    status_response(
+        SessionStatus::LocalInUse,
+        "リモートセッションを安全に終了しています。完了後に再接続してください。",
+    )
 }
 
 fn release_message(reason: ReleaseReason) -> &'static str {
@@ -454,6 +641,8 @@ pub(crate) struct ActiveSessionSnapshot {
 
 #[derive(Clone, Debug)]
 pub(crate) struct SessionSnapshot {
+    pub(crate) phase: RemoteControlPhase,
+    pub(crate) generation: u64,
     pub(crate) active: Option<ActiveSessionSnapshot>,
     pub(crate) acquisition_sequence: u64,
     pub(crate) control_return_sequence: u64,
@@ -639,6 +828,145 @@ pub(crate) enum UiReadError {
     Stopped,
 }
 
+/// App が所有し、remote worker へ許可した AI 資源だけを公開する bridge。
+#[derive(Clone)]
+pub(crate) struct RemoteAiExecutionBridge {
+    runtime: Arc<(Mutex<RemoteAiRuntimeState>, Condvar)>,
+    manager: Arc<crate::ai::model_manager::ModelManager>,
+}
+
+enum RemoteAiRuntimeState {
+    Empty,
+    Initializing,
+    Ready(Arc<crate::ai::runtime::AiRuntime>),
+}
+
+pub(crate) enum RemoteLocalRuntimeClaim {
+    Initialize,
+    WaitingForRemote,
+    Ready(Arc<crate::ai::runtime::AiRuntime>),
+}
+
+pub(crate) struct RemoteAiResources {
+    pub(crate) runtime: Arc<crate::ai::runtime::AiRuntime>,
+    pub(crate) manager: Arc<crate::ai::model_manager::ModelManager>,
+}
+
+impl RemoteAiExecutionBridge {
+    pub(crate) fn new(
+        runtime: Option<Arc<crate::ai::runtime::AiRuntime>>,
+        manager: Arc<crate::ai::model_manager::ModelManager>,
+    ) -> Self {
+        let state = runtime.map_or(RemoteAiRuntimeState::Empty, RemoteAiRuntimeState::Ready);
+        Self {
+            runtime: Arc::new((Mutex::new(state), Condvar::new())),
+            manager,
+        }
+    }
+
+    pub(crate) fn ready_runtime(&self) -> Option<Arc<crate::ai::runtime::AiRuntime>> {
+        let (state, _) = &*self.runtime;
+        match &*state.lock().unwrap_or_else(|error| error.into_inner()) {
+            RemoteAiRuntimeState::Ready(runtime) => Some(Arc::clone(runtime)),
+            RemoteAiRuntimeState::Empty | RemoteAiRuntimeState::Initializing => None,
+        }
+    }
+
+    /// Runtime constructor を実行してよい owner を一つに限定する。
+    ///
+    /// remote worker が初期化中なら App は UI thread で待たず、後続 frame の
+    /// ready_runtime poll に委ねる。逆に App が claim 済みなら remote worker は
+    /// Condvar で待つため、起動直後の acquire と初回 App update が競合しても
+    /// Runtime を二重生成しない。
+    pub(crate) fn claim_local_runtime_init(&self) -> RemoteLocalRuntimeClaim {
+        let (state, wake) = &*self.runtime;
+        let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+        match &*state {
+            RemoteAiRuntimeState::Ready(existing) => {
+                RemoteLocalRuntimeClaim::Ready(Arc::clone(existing))
+            }
+            RemoteAiRuntimeState::Initializing => RemoteLocalRuntimeClaim::WaitingForRemote,
+            RemoteAiRuntimeState::Empty => {
+                *state = RemoteAiRuntimeState::Initializing;
+                // No waiter exists yet, but keep all state changes paired with the same
+                // Condvar owner.
+                wake.notify_all();
+                RemoteLocalRuntimeClaim::Initialize
+            }
+        }
+    }
+
+    pub(crate) fn complete_claimed_runtime_init(
+        &self,
+        created: Result<crate::ai::runtime::AiRuntime, crate::ai::AiError>,
+    ) -> Result<Arc<crate::ai::runtime::AiRuntime>, crate::ai::AiError> {
+        let (runtime_state, wake) = &*self.runtime;
+        let mut state = runtime_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match created {
+            Ok(runtime) => {
+                let runtime = Arc::new(runtime);
+                debug_assert!(matches!(*state, RemoteAiRuntimeState::Initializing));
+                *state = RemoteAiRuntimeState::Ready(Arc::clone(&runtime));
+                wake.notify_all();
+                Ok(runtime)
+            }
+            Err(error) => {
+                if matches!(*state, RemoteAiRuntimeState::Initializing) {
+                    *state = RemoteAiRuntimeState::Empty;
+                }
+                wake.notify_all();
+                Err(error)
+            }
+        }
+    }
+
+    /// shared runtime が未生成なら、この呼び出し元 remote worker 上で生成する。
+    pub(crate) fn resources_for_remote(&self) -> Option<RemoteAiResources> {
+        self.resources_for_remote_inner()
+    }
+}
+
+impl RemoteAiExecutionBridge {
+    fn resources_for_remote_inner(&self) -> Option<RemoteAiResources> {
+        let (runtime_state, wake) = &*self.runtime;
+        let mut state = runtime_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        loop {
+            match &*state {
+                RemoteAiRuntimeState::Ready(runtime) => {
+                    return Some(RemoteAiResources {
+                        runtime: Arc::clone(runtime),
+                        manager: Arc::clone(&self.manager),
+                    });
+                }
+                RemoteAiRuntimeState::Initializing => {
+                    state = wake.wait(state).unwrap_or_else(|error| error.into_inner());
+                }
+                RemoteAiRuntimeState::Empty => break,
+            }
+        }
+        *state = RemoteAiRuntimeState::Initializing;
+        drop(state);
+        let created =
+            crate::ai::runtime::AiRuntime::new_with_backend(crate::ai::AiBackend::DirectMl);
+        match self.complete_claimed_runtime_init(created) {
+            Ok(runtime) => Some(RemoteAiResources {
+                runtime,
+                manager: Arc::clone(&self.manager),
+            }),
+            Err(error) => {
+                crate::logger::log(format!(
+                    "remote_ipc: shared AI runtime init failed; using diffusion fallback: {error}"
+                ));
+                None
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct SessionHandle {
     inner: Arc<Mutex<SessionStateMachine>>,
@@ -648,6 +976,8 @@ pub(crate) struct SessionHandle {
     ui_request_tx: mpsc::SyncSender<QueuedRemoteUiRequest>,
     ui_request_rx: Arc<Mutex<mpsc::Receiver<QueuedRemoteUiRequest>>>,
     published_video_stream: Arc<Mutex<Option<PublishedVideoStream>>>,
+    phase_wake: Arc<(Mutex<u64>, Condvar)>,
+    ai_bridge: Arc<Mutex<Option<RemoteAiExecutionBridge>>>,
 }
 
 impl UiRequestDispatch {
@@ -736,6 +1066,8 @@ impl SessionHandle {
             ui_request_tx,
             ui_request_rx: Arc::new(Mutex::new(ui_request_rx)),
             published_video_stream: Arc::new(Mutex::new(None)),
+            phase_wake: Arc::new((Mutex::new(0), Condvar::new())),
+            ai_bridge: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -762,14 +1094,15 @@ impl SessionHandle {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
-        let (response, owner_changed) = {
+        let (response, phase_changed) = {
             let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            let generation = state.generation;
+            let phase = state.lifecycle.phase;
             let response = state.acquire(self.now(), connected_unix_ms, request);
-            (response, state.generation != generation)
+            (response, state.lifecycle.phase != phase)
         };
-        if owner_changed {
+        if phase_changed {
             self.clear_video_stream(None);
+            self.notify_phase_changed();
         }
         crate::logger::log(format!(
             "remote_ipc: session_acquired connection_kind={peer_kind:?} peer={peer_name}"
@@ -779,10 +1112,18 @@ impl SessionHandle {
     }
 
     pub(crate) fn ping(&self, request: &SessionPingRequest) -> SessionResponse {
-        self.inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .ping(self.now(), request)
+        let (response, phase_changed) = {
+            let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let phase = state.lifecycle.phase;
+            let response = state.ping(self.now(), request);
+            (response, state.lifecycle.phase != phase)
+        };
+        if phase_changed {
+            self.clear_video_stream(None);
+            self.notify_phase_changed();
+            self.notify_ui();
+        }
+        response
     }
 
     pub(crate) fn begin_operation(
@@ -790,18 +1131,53 @@ impl SessionHandle {
         client_id: &str,
         description: String,
     ) -> Result<SessionOperation, SessionResponse> {
-        let (generation, token) = self
-            .inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .begin_operation(self.now(), client_id, description)?;
+        let (result, phase_changed) = {
+            let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let phase = state.lifecycle.phase;
+            let result = state.begin_operation(self.now(), client_id, description);
+            (result, state.lifecycle.phase != phase)
+        };
+        if phase_changed {
+            self.clear_video_stream(None);
+            self.notify_phase_changed();
+            self.notify_ui();
+        }
+        let (generation, token, cancel) = result?;
         Ok(SessionOperation {
             handle: self.clone(),
             generation,
             token,
             client_id: client_id.to_owned(),
+            cancel,
             finished: false,
         })
+    }
+
+    pub(crate) fn finish_acquire(&self, generation: u64) -> bool {
+        let changed = self
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .finish_acquire(generation);
+        if changed {
+            self.notify_phase_changed();
+            self.notify_ui();
+        }
+        changed
+    }
+
+    pub(crate) fn complete_app_drain(&self, generation: u64) -> bool {
+        let released = self
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .complete_app_drain(generation);
+        if released {
+            self.clear_video_stream(None);
+            self.notify_phase_changed();
+            self.notify_ui();
+        }
+        released
     }
 
     /// 長寿命の streaming session を現在の remote owner に結び付ける token を返す。
@@ -841,6 +1217,24 @@ impl SessionHandle {
             .rev()
             .find_map(|(_, info)| info.clone());
         snapshot
+    }
+
+    pub(crate) fn install_ai_bridge(&self, bridge: RemoteAiExecutionBridge) {
+        *self
+            .ai_bridge
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(bridge);
+    }
+
+    pub(crate) fn ai_bridge(&self) -> Option<RemoteAiExecutionBridge> {
+        self.ai_bridge
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn remote_ai_resources(&self) -> Option<RemoteAiResources> {
+        self.ai_bridge()?.resources_for_remote()
     }
 
     pub(crate) fn remote_web_connected(&self, connection_id: u64) {
@@ -885,13 +1279,17 @@ impl SessionHandle {
     }
 
     pub(crate) fn local_disconnect(&self) {
-        self.inner
+        let phase_changed = self
+            .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .local_disconnect();
-        self.clear_video_stream(None);
-        crate::logger::log("remote_ipc: session_released reason=local".to_owned());
-        self.notify_ui();
+            .begin_drain(ReleaseReason::Local);
+        if phase_changed {
+            self.clear_video_stream(None); // drain starts before release
+            self.notify_phase_changed();
+            crate::logger::log("remote_ipc: session_drain_started reason=local".to_owned());
+            self.notify_ui();
+        }
     }
 
     pub(crate) fn submit_write(
@@ -1147,14 +1545,26 @@ impl SessionHandle {
         }
     }
 
+    fn notify_phase_changed(&self) {
+        let (epoch, wake) = &*self.phase_wake;
+        let mut epoch = epoch.lock().unwrap_or_else(|error| error.into_inner());
+        *epoch = epoch.wrapping_add(1);
+        wake.notify_all();
+    }
+
     fn expire(&self) -> Option<ReleaseReason> {
-        let reason = self
-            .inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .expire(self.now());
+        let (reason, phase_changed) = {
+            let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let phase = state.lifecycle.phase;
+            let reason = state.expire(self.now());
+            (reason, state.lifecycle.phase != phase)
+        };
         if reason.is_some() {
             self.clear_video_stream(None);
+        }
+        if phase_changed {
+            self.notify_phase_changed();
+            self.notify_ui();
         }
         reason
     }
@@ -1175,6 +1585,7 @@ impl RemoteSessionOwner {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         state.generation == self.generation
+            && state.lifecycle.phase.accepts_remote_work()
             && state
                 .active
                 .as_ref()
@@ -1316,10 +1727,49 @@ pub(crate) struct SessionOperation {
     generation: u64,
     token: u64,
     client_id: String,
+    cancel: Arc<AtomicBool>,
     finished: bool,
 }
 
 impl SessionOperation {
+    pub(crate) fn wait_until_active(&self) -> Result<(), SessionResponse> {
+        loop {
+            let (epoch, wake) = &*self.handle.phase_wake;
+            let epoch = epoch.lock().unwrap_or_else(|error| error.into_inner());
+            let response = {
+                let state = self
+                    .handle
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if state.generation != self.generation
+                    || !state
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| active.client_id == self.client_id)
+                {
+                    Some(Err(state.inactive_response(&self.client_id)))
+                } else {
+                    match state.lifecycle.phase {
+                        RemoteControlPhase::RemoteActive => Some(Ok(())),
+                        RemoteControlPhase::DrainingRemote | RemoteControlPhase::Local => {
+                            Some(Err(session_closing_response()))
+                        }
+                        RemoteControlPhase::AcquiringRemote => None,
+                    }
+                }
+            };
+            if let Some(response) = response {
+                return response;
+            }
+            drop(wake.wait(epoch).unwrap_or_else(|error| error.into_inner()));
+        }
+    }
+
+    pub(crate) fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
+
     pub(crate) fn started(&self) {
         self.handle
             .inner
@@ -1329,12 +1779,22 @@ impl SessionOperation {
     }
 
     pub(crate) fn finish(mut self, success: bool) {
-        self.handle
+        self.finish_inner(success);
+        self.finished = true;
+    }
+
+    fn finish_inner(&self, success: bool) {
+        let released = self
+            .handle
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .finish_operation(self.generation, self.token, success);
-        self.finished = true;
+        if released {
+            self.handle.clear_video_stream(None);
+            self.handle.notify_phase_changed();
+            self.handle.notify_ui();
+        }
     }
 
     pub(crate) fn ownership_response(&self) -> SessionResponse {
@@ -1345,9 +1805,16 @@ impl SessionOperation {
             .unwrap_or_else(|error| error.into_inner());
         match state.active.as_ref() {
             Some(active)
-                if state.generation == self.generation && active.client_id == self.client_id =>
+                if state.generation == self.generation
+                    && active.client_id == self.client_id
+                    && state.lifecycle.phase != RemoteControlPhase::DrainingRemote =>
             {
                 SessionResponse::active()
+            }
+            Some(active)
+                if state.generation == self.generation && active.client_id == self.client_id =>
+            {
+                session_closing_response()
             }
             Some(_) => status_response(
                 SessionStatus::Superseded,
@@ -1361,11 +1828,7 @@ impl SessionOperation {
 impl Drop for SessionOperation {
     fn drop(&mut self) {
         if !self.finished {
-            self.handle
-                .inner
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .finish_operation(self.generation, self.token, false);
+            self.finish_inner(false);
         }
     }
 }
@@ -1412,7 +1875,7 @@ fn session_watchdog(handle: SessionHandle, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Acquire) {
         if let Some(reason) = handle.expire() {
             crate::logger::log(format!(
-                "remote_ipc: session_released reason={}",
+                "remote_ipc: session_drain_started reason={}",
                 match reason {
                     ReleaseReason::LivenessTimeout => "liveness_timeout",
                     ReleaseReason::IdleTimeout => "idle_timeout",
@@ -1545,6 +2008,172 @@ mod tests {
                 .status,
             SessionStatus::Active
         );
+        assert!(state.finish_acquire(state.generation));
+    }
+
+    #[test]
+    fn remote_control_lifecycle_has_one_valid_linear_path() {
+        let mut lifecycle = RemoteControlLifecycle::default();
+        assert_eq!(lifecycle.phase, RemoteControlPhase::Local);
+        assert!(!lifecycle.phase.blocks_local_control());
+        assert!(
+            lifecycle
+                .transition(RemoteControlTransition::BeginAcquire)
+                .is_ok()
+        );
+        assert_eq!(lifecycle.phase, RemoteControlPhase::AcquiringRemote);
+        assert!(lifecycle.phase.blocks_local_control());
+        assert!(!lifecycle.phase.accepts_remote_work());
+        assert!(
+            lifecycle
+                .transition(RemoteControlTransition::FinishAcquire)
+                .is_ok()
+        );
+        assert_eq!(lifecycle.phase, RemoteControlPhase::RemoteActive);
+        assert!(lifecycle.phase.accepts_remote_work());
+        assert!(
+            lifecycle
+                .transition(RemoteControlTransition::BeginDrain)
+                .is_ok()
+        );
+        assert_eq!(lifecycle.phase, RemoteControlPhase::DrainingRemote);
+        assert!(lifecycle.phase.blocks_local_control());
+        assert!(!lifecycle.phase.accepts_remote_work());
+        assert!(
+            lifecycle
+                .transition(RemoteControlTransition::FinishDrain)
+                .is_ok()
+        );
+        assert_eq!(lifecycle.phase, RemoteControlPhase::Local);
+    }
+
+    #[test]
+    fn remote_control_lifecycle_rejects_skipped_and_duplicate_transitions() {
+        let mut lifecycle = RemoteControlLifecycle::default();
+        assert!(
+            lifecycle
+                .transition(RemoteControlTransition::FinishAcquire)
+                .is_err()
+        );
+        assert!(
+            lifecycle
+                .transition(RemoteControlTransition::BeginDrain)
+                .is_err()
+        );
+        assert!(
+            lifecycle
+                .transition(RemoteControlTransition::FinishDrain)
+                .is_err()
+        );
+        assert!(
+            lifecycle
+                .transition(RemoteControlTransition::BeginAcquire)
+                .is_ok()
+        );
+        assert!(
+            lifecycle
+                .transition(RemoteControlTransition::BeginAcquire)
+                .is_err()
+        );
+        assert!(
+            lifecycle
+                .transition(RemoteControlTransition::FinishDrain)
+                .is_err()
+        );
+        assert!(
+            lifecycle
+                .transition(RemoteControlTransition::BeginDrain)
+                .is_ok()
+        );
+        assert!(
+            lifecycle
+                .transition(RemoteControlTransition::FinishAcquire)
+                .is_err()
+        );
+        assert!(
+            lifecycle
+                .transition(RemoteControlTransition::BeginDrain)
+                .is_err()
+        );
+        assert!(
+            lifecycle
+                .transition(RemoteControlTransition::FinishDrain)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn final_drain_without_active_payload_returns_local_exactly_once() {
+        let mut state = SessionStateMachine::default();
+        acquire(&mut state, Duration::ZERO);
+        state.local_disconnect();
+        let draining_generation = state.generation;
+        let control_before = state.control_return_sequence;
+
+        // This reproduces the broken intermediate state seen in dev-runtime: the session
+        // payload was already taken while the typed lifecycle still said DrainingRemote.
+        let _detached_payload = state.active.take().expect("active session payload");
+
+        assert!(state.complete_app_drain(draining_generation));
+        assert_eq!(state.lifecycle.phase, RemoteControlPhase::Local);
+        assert!(!state.lifecycle.phase.blocks_local_control());
+        assert_eq!(
+            state.control_return_sequence,
+            control_before.wrapping_add(1)
+        );
+
+        let released_generation = state.generation;
+        assert!(!state.complete_app_drain(released_generation));
+        assert_eq!(state.lifecycle.phase, RemoteControlPhase::Local);
+        assert_eq!(
+            state.control_return_sequence,
+            control_before.wrapping_add(1),
+            "a completed drain must not publish control return twice"
+        );
+    }
+
+    #[test]
+    fn shared_runtime_initialization_has_exactly_one_claimant() {
+        let bridge = RemoteAiExecutionBridge::new(
+            None,
+            Arc::new(crate::ai::model_manager::ModelManager::new()),
+        );
+        assert!(matches!(
+            bridge.claim_local_runtime_init(),
+            RemoteLocalRuntimeClaim::Initialize
+        ));
+        assert!(matches!(
+            bridge.claim_local_runtime_init(),
+            RemoteLocalRuntimeClaim::WaitingForRemote
+        ));
+        assert!(bridge.ready_runtime().is_none());
+    }
+
+    #[test]
+    fn queued_operation_waits_for_acquire_barrier_and_wakes_on_activation() {
+        let handle = SessionHandle::new();
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        let generation = handle.snapshot().generation;
+        let operation = handle
+            .begin_operation("client", "queued".to_owned())
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = operation.wait_until_active();
+            let _ = tx.send(result.as_ref().map(|_| ()).map_err(|value| value.status));
+            operation.finish(result.is_ok());
+        });
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(handle.finish_acquire(generation));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), Ok(()));
+        worker.join().unwrap();
     }
 
     #[test]
@@ -1555,6 +2184,9 @@ mod tests {
             state.expire(LIVENESS_TIMEOUT),
             Some(ReleaseReason::LivenessTimeout)
         );
+        assert_eq!(state.lifecycle.phase, RemoteControlPhase::DrainingRemote);
+        assert!(state.active.is_some());
+        assert!(state.complete_app_drain(state.generation));
         assert!(state.active.is_none());
     }
 
@@ -1627,6 +2259,9 @@ mod tests {
         state.local_disconnect();
 
         assert!(cancel.load(Ordering::Acquire));
+        assert_eq!(state.lifecycle.phase, RemoteControlPhase::DrainingRemote);
+        assert!(state.active.is_some());
+        assert!(state.complete_app_drain(state.generation));
         assert!(state.active.is_none());
         assert_eq!(state.last_release_reason, Some(ReleaseReason::Local));
     }
@@ -1695,7 +2330,7 @@ mod tests {
                 SessionStatus::Active
             );
         }
-        let (generation, token) = state
+        let (generation, token, _cancel) = state
             .begin_operation(now, "client", "一覧を取得中".to_owned())
             .unwrap();
         state.finish_operation(generation, token, true);
@@ -1714,6 +2349,7 @@ mod tests {
                 .status,
             SessionStatus::LocalInUse
         );
+        assert!(state.complete_app_drain(state.generation));
         acquire(&mut state, Duration::from_secs(2));
         assert!(
             state
@@ -1906,33 +2542,61 @@ mod tests {
             client_id: "client".to_owned(),
             peer: peer(),
         });
+        let generation = handle.snapshot().generation;
         let operation = handle.begin_operation("client", "test".to_owned()).unwrap();
+        let cancel = operation.cancel_flag();
         handle.local_disconnect();
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::DrainingRemote);
+        assert!(handle.snapshot().active.is_some());
+        assert!(cancel.load(Ordering::Acquire));
         assert_eq!(
             operation.ownership_response().status,
             SessionStatus::LocalInUse
         );
+        assert!(!handle.complete_app_drain(generation));
+        operation.finish(false);
+        let released = handle.snapshot();
+        assert_eq!(released.phase, RemoteControlPhase::Local);
+        assert!(released.active.is_none());
+        assert_eq!(released.control_return_sequence, 1);
     }
 
     #[test]
-    fn later_remote_client_supersedes_the_previous_owner() {
+    fn later_remote_client_waits_for_the_previous_owner_to_drain() {
         let handle = SessionHandle::new();
         handle.acquire(SessionAcquireRequest {
             client_id: "client-a".to_owned(),
             peer: peer(),
         });
+        let generation = handle.snapshot().generation;
         let old_operation = handle
             .begin_operation("client-a", "old".to_owned())
             .unwrap();
-        handle.acquire(SessionAcquireRequest {
+        let takeover = handle.acquire(SessionAcquireRequest {
             client_id: "client-b".to_owned(),
             peer: peer(),
         });
+        assert_eq!(takeover.status, SessionStatus::LocalInUse);
         assert_eq!(
             old_operation.ownership_response().status,
-            SessionStatus::Superseded
+            SessionStatus::LocalInUse
         );
-        assert!(handle.begin_operation("client-b", "new".to_owned()).is_ok());
+        assert!(
+            handle
+                .begin_operation("client-b", "new".to_owned())
+                .is_err()
+        );
+        old_operation.finish(false);
+        assert!(handle.complete_app_drain(generation));
+        assert_eq!(
+            handle
+                .acquire(SessionAcquireRequest {
+                    client_id: "client-b".to_owned(),
+                    peer: peer(),
+                })
+                .status,
+            SessionStatus::Active
+        );
     }
 
     #[test]
@@ -1946,6 +2610,10 @@ mod tests {
         let first = handle.snapshot().acquisition_sequence;
         handle.acquire(request("client-a"));
         assert_eq!(handle.snapshot().acquisition_sequence, first);
+        handle.acquire(request("client-b"));
+        let draining = handle.snapshot();
+        assert_eq!(draining.acquisition_sequence, first);
+        assert!(handle.complete_app_drain(draining.generation));
         handle.acquire(request("client-b"));
         assert_eq!(handle.snapshot().acquisition_sequence, first + 1);
         assert_eq!(

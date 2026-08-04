@@ -29,6 +29,12 @@ pub(crate) struct RemoteSessionUiState {
     pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
     show_connection_dialog: bool,
     video_stream: Option<AppRemoteVideoStreamState>,
+    local_ai_lease: Option<RemoteLocalAiLease>,
+}
+
+#[derive(Default)]
+struct RemoteLocalAiLease {
+    resume_video_upscale: bool,
 }
 
 enum AppRemoteVideoStreamState {
@@ -181,6 +187,10 @@ impl crate::app::App {
             snapshot.acquisition_sequence
         };
         self.remote_session_ui.last_control_return_sequence = snapshot.control_return_sequence;
+        handle.install_ai_bridge(super::session::RemoteAiExecutionBridge::new(
+            self.ai_runtime.clone(),
+            std::sync::Arc::clone(&self.ai_model_manager),
+        ));
         self.remote_session_ui.handle = Some(handle);
     }
 
@@ -190,6 +200,15 @@ impl crate::app::App {
 
     pub(crate) fn remote_connection_dialog_open(&self) -> bool {
         self.remote_session_ui.show_connection_dialog
+    }
+
+    pub(crate) fn remote_ai_execution_bridge(
+        &self,
+    ) -> Option<super::session::RemoteAiExecutionBridge> {
+        self.remote_session_ui
+            .handle
+            .as_ref()
+            .and_then(SessionHandle::ai_bridge)
     }
 
     pub(crate) fn consume_remote_animation_pause_restore(&mut self, index: usize) -> bool {
@@ -210,11 +229,21 @@ impl crate::app::App {
         matches
     }
 
-    pub(crate) fn remote_session_active(&self) -> bool {
+    pub(crate) fn remote_session_blocks_local_control(&self) -> bool {
         self.remote_session_ui
             .handle
             .as_ref()
-            .is_some_and(|handle| handle.snapshot().active.is_some())
+            .is_some_and(|handle| handle.snapshot().phase.blocks_local_control())
+    }
+
+    #[allow(dead_code)] // 3b-1 remote AI admission uses only the operational phase.
+    pub(crate) fn remote_session_operational(&self) -> bool {
+        self.remote_session_ui
+            .handle
+            .as_ref()
+            .is_some_and(|handle| {
+                handle.snapshot().phase == super::session::RemoteControlPhase::RemoteActive
+            })
     }
 
     pub(crate) fn poll_remote_session(&mut self, ctx: &egui::Context) {
@@ -222,14 +251,24 @@ impl crate::app::App {
         if let Some(handle) = handle.as_ref() {
             handle.install_repaint_context(ctx);
         }
+        if self.ai_runtime.is_none()
+            && let Some(runtime) = self
+                .remote_ai_execution_bridge()
+                .and_then(|bridge| bridge.ready_runtime())
+        {
+            self.ai_runtime = Some(runtime);
+        }
         let snapshot = self
             .remote_session_ui
             .handle
             .as_ref()
             .map(SessionHandle::snapshot);
-        let active = snapshot
+        let remote_phase = snapshot
             .as_ref()
-            .is_some_and(|value| value.active.is_some());
+            .map_or(super::session::RemoteControlPhase::Local, |value| {
+                value.phase
+            });
+        let blocks_local_control = remote_phase.blocks_local_control();
         let acquisition_changed = snapshot.as_ref().is_some_and(|snapshot| {
             snapshot.acquisition_sequence != self.remote_session_ui.last_acquisition_sequence
         });
@@ -254,12 +293,31 @@ impl crate::app::App {
             crate::logger::log(format!(
                 "remote_ipc: local playback paused on session acquire media={media} slideshow={slideshow} animations={animations} continuous_pending={continuous}"
             ));
+            let resume_video_upscale = self.begin_local_ai_remote_barrier();
+            self.remote_session_ui.local_ai_lease = Some(RemoteLocalAiLease {
+                resume_video_upscale,
+            });
         }
-        if let Some(snapshot) = snapshot
+        if remote_phase == super::session::RemoteControlPhase::AcquiringRemote
+            && self.local_ai_remote_barrier_quiesced()
+            && let (Some(handle), Some(snapshot)) = (handle.as_ref(), snapshot.as_ref())
+        {
+            handle.finish_acquire(snapshot.generation);
+        }
+        if let Some(snapshot) = snapshot.as_ref()
             && control_returned
         {
             self.remote_session_ui.last_control_return_sequence = snapshot.control_return_sequence;
+            if let Some(lease) = self.remote_session_ui.local_ai_lease.take() {
+                self.release_local_ai_remote_barrier(lease.resume_video_upscale);
+            }
             self.reload_after_remote_session_release();
+        }
+        if remote_phase == super::session::RemoteControlPhase::DrainingRemote {
+            self.cancel_remote_video_stream_state(
+                VideoStreamErrorCode::SessionMismatch,
+                "リモートセッションを終了しています",
+            );
         }
         // Reconcile the previous frame's stream before draining new requests. The remote session
         // owns and ticks its headless player without changing the local viewer presentation.
@@ -271,12 +329,25 @@ impl crate::app::App {
             self.apply_pending_remote_ui_requests(handle, ctx);
         }
         self.poll_remote_fullscreen_restore();
+        if remote_phase == super::session::RemoteControlPhase::DrainingRemote
+            && let (Some(handle), Some(snapshot)) = (handle.as_ref(), snapshot.as_ref())
+            && handle.complete_app_drain(snapshot.generation)
+        {
+            let released = handle.snapshot();
+            self.remote_session_ui.last_control_return_sequence = released.control_return_sequence;
+            if let Some(lease) = self.remote_session_ui.local_ai_lease.take() {
+                self.release_local_ai_remote_barrier(lease.resume_video_upscale);
+            }
+            self.reload_after_remote_session_release();
+        }
         if matches!(
             self.remote_session_ui.video_stream.as_ref(),
             Some(AppRemoteVideoStreamState::Opening(_) | AppRemoteVideoStreamState::Starting(_))
         ) {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
-        } else if active || self.remote_session_ui.pending_fullscreen_restore.is_some() {
+        } else if blocks_local_control
+            || self.remote_session_ui.pending_fullscreen_restore.is_some()
+        {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
     }
@@ -1643,12 +1714,16 @@ impl crate::app::App {
     }
 
     pub(crate) fn show_remote_session_dialog(&mut self, ctx: &egui::Context) {
-        let snapshot = self
+        let session_snapshot = self
             .remote_session_ui
             .handle
             .as_ref()
-            .and_then(|handle| handle.snapshot().active);
-        let Some(snapshot) = snapshot else {
+            .map(SessionHandle::snapshot);
+        let Some(session_snapshot) = session_snapshot else {
+            return;
+        };
+        let phase = session_snapshot.phase;
+        let Some(snapshot) = session_snapshot.active else {
             return;
         };
         let streaming_source = self
@@ -1681,7 +1756,14 @@ impl crate::app::App {
                 });
         let mut disconnect = false;
         egui::Modal::new(egui::Id::new("remote_session_modal")).show(ctx, |ui| {
-            ui.heading("リモート接続中");
+            ui.heading(match phase {
+                super::session::RemoteControlPhase::AcquiringRemote => "リモート接続の準備中",
+                super::session::RemoteControlPhase::DrainingRemote => {
+                    "リモート接続を終了しています"
+                }
+                super::session::RemoteControlPhase::RemoteActive => "リモート接続中",
+                super::session::RemoteControlPhase::Local => return,
+            });
             ui.add_space(6.0);
             show_connection_summary(ui, &snapshot);
             ui.separator();
@@ -1714,7 +1796,10 @@ impl crate::app::App {
             ui.label("切断するとローカル操作へ戻ります。リモートは次の操作時に再接続できます。");
             ui.add_space(8.0);
             if ui
-                .add_sized([160.0, 34.0], egui::Button::new("切断する"))
+                .add_enabled(
+                    phase != super::session::RemoteControlPhase::DrainingRemote,
+                    egui::Button::new("切断する").min_size(egui::vec2(160.0, 34.0)),
+                )
                 .clicked()
             {
                 disconnect = true;

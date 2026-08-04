@@ -32609,6 +32609,79 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn remote_session_barriers_keep_modal_until_final_release() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+
+        assert!(!app.remote_session_blocks_local_control());
+        app.poll_remote_session(&ctx);
+        assert_eq!(
+            handle.snapshot().phase,
+            crate::remote_ipc::session::RemoteControlPhase::Local
+        );
+        assert_eq!(handle.snapshot().acquisition_sequence, 0);
+        assert_eq!(handle.snapshot().control_return_sequence, 0);
+
+        let local_ai_activity = app.local_ai_activity_lease();
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".to_owned(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: Some("phone".to_owned()),
+            },
+        });
+        assert!(app.remote_session_blocks_local_control());
+        app.poll_remote_session(&ctx);
+        assert_eq!(
+            handle.snapshot().phase,
+            crate::remote_ipc::session::RemoteControlPhase::AcquiringRemote,
+            "remote work must wait for the local worker terminal lease"
+        );
+        drop(local_ai_activity);
+        app.poll_remote_session(&ctx);
+        assert_eq!(
+            handle.snapshot().phase,
+            crate::remote_ipc::session::RemoteControlPhase::RemoteActive
+        );
+
+        let control_before = handle.snapshot().control_return_sequence;
+        handle.local_disconnect();
+        assert_eq!(
+            handle.snapshot().phase,
+            crate::remote_ipc::session::RemoteControlPhase::DrainingRemote
+        );
+        assert!(app.remote_session_blocks_local_control());
+        assert_eq!(
+            handle.snapshot().control_return_sequence,
+            control_before,
+            "drain start must not publish control return"
+        );
+
+        app.poll_remote_session(&ctx);
+        let released = handle.snapshot();
+        assert_eq!(
+            released.phase,
+            crate::remote_ipc::session::RemoteControlPhase::Local
+        );
+        assert_eq!(
+            released.control_return_sequence,
+            control_before.wrapping_add(1)
+        );
+        assert!(!app.remote_session_blocks_local_control());
+
+        // A later frame must not observe the completed drain as another release/reload.
+        app.poll_remote_session(&ctx);
+        let after_later_poll = handle.snapshot();
+        assert_eq!(after_later_poll.phase, released.phase);
+        assert_eq!(
+            after_later_poll.control_return_sequence,
+            released.control_return_sequence
+        );
+    }
+
+    #[test]
     #[cfg(windows)]
     fn remote_session_acquire_pauses_mounted_active_and_parked_live_media_at_position() {
         let mut app = setup_app();
