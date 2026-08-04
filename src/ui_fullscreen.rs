@@ -2279,6 +2279,7 @@ impl App {
             resource,
             logical_scale,
             pixels_per_point,
+            self.settings.downscale_smoothing_percent,
         );
         if let Some(stats) = stats
             && crate::perf::is_enabled()
@@ -2301,6 +2302,8 @@ impl App {
                     ("source_h", stats.source_size[1].into()),
                     ("target_w", stats.target_size[0].into()),
                     ("target_h", stats.target_size[1].into()),
+                    ("smoothing_percent", stats.smoothing_percent.into()),
+                    ("blur_factor", f64::from(stats.blur_factor).into()),
                     ("texture_fetches", stats.texture_fetches.into()),
                     ("encode_submit_cpu_ms", stats.encode_submit_cpu_ms.into()),
                     ("regeneration_count", stats.regeneration_count.into()),
@@ -17926,8 +17929,6 @@ impl App {
             current_rgba: Arc::clone(&pair.current_rgba),
             mode,
             wipe_fraction,
-            mipmap_sampling_enabled: self.settings.image_mipmap_moire_reduction_enabled,
-            lod_bias: self.settings.image_mipmap_lod_bias,
             target_format,
         };
         Some((
@@ -18112,8 +18113,6 @@ impl App {
             fov_y: pano.fov_y,
             aspect,
             uv_transform,
-            mipmap_sampling_enabled: self.settings.image_mipmap_moire_reduction_enabled,
-            lod_bias: self.settings.image_mipmap_lod_bias,
             target_format,
         };
         let shape = egui::Shape::Callback(egui_wgpu::Callback::new_paint_callback(

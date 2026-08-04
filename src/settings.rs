@@ -2805,6 +2805,23 @@ impl StartupFolderMode {
 // Settings
 // -----------------------------------------------------------------------
 
+pub const DOWNSCALE_SMOOTHING_PERCENT_MIN: u32 = 0;
+pub const DOWNSCALE_SMOOTHING_PERCENT_MAX: u32 = 100;
+pub const DOWNSCALE_SMOOTHING_PERCENT_STEP: u32 = 10;
+
+pub fn sanitize_downscale_smoothing_percent(percent: u32) -> u32 {
+    let clamped = percent.clamp(
+        DOWNSCALE_SMOOTHING_PERCENT_MIN,
+        DOWNSCALE_SMOOTHING_PERCENT_MAX,
+    );
+    ((clamped + DOWNSCALE_SMOOTHING_PERCENT_STEP / 2) / DOWNSCALE_SMOOTHING_PERCENT_STEP)
+        * DOWNSCALE_SMOOTHING_PERCENT_STEP
+}
+
+pub fn downscale_smoothing_blur_factor(percent: u32) -> f32 {
+    1.0 + sanitize_downscale_smoothing_percent(percent) as f32 * 0.003
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Settings {
     #[serde(default = "default_grid_cols")]
@@ -3393,14 +3410,9 @@ pub struct Settings {
     /// 自動フィット時に 100% 未満へ縮小しない。
     #[serde(default)]
     pub fullscreen_fit_no_downscale: bool,
-    /// 縮小表示で mipmap sampling を使い、モアレ抑制を優先する。
-    /// false でも mip chain は保持し、表示時だけ level 0 固定で読む。
-    #[serde(default = "default_true")]
-    pub image_mipmap_moire_reduction_enabled: bool,
-    /// 完全 mip chain を使う静止画表示で、GPU の自動 LOD を粗い側へ寄せる量。
-    /// 0.0 は標準、0.5 / 1.0 はそれぞれ半段 / 1段ぶんモアレ抑制を優先する。
+    /// 通常の縮小表示で使う Lanczos3 の支持幅調整 (0..=100、10刻み)。
     #[serde(default)]
-    pub image_mipmap_lod_bias: f32,
+    pub downscale_smoothing_percent: u32,
     /// フルスクリーン左ホバーパネルで最後に開いていたタブ。
     #[serde(default)]
     pub fullscreen_left_panel_tab: FullscreenLeftPanelTab,
@@ -4782,8 +4794,7 @@ impl Default for Settings {
             fullscreen_fit_mode: FullscreenFitMode::default(),
             fullscreen_fit_no_upscale: false,
             fullscreen_fit_no_downscale: false,
-            image_mipmap_moire_reduction_enabled: true,
-            image_mipmap_lod_bias: 0.0,
+            downscale_smoothing_percent: DOWNSCALE_SMOOTHING_PERCENT_MIN,
             fullscreen_left_panel_tab: FullscreenLeftPanelTab::default(),
             adjustment_settings_tab: AdjustmentSettingsTab::default(),
             creative_luts: crate::creative_lut::builtin_creative_lut_entries(),
@@ -6209,11 +6220,8 @@ impl Settings {
         self.continuous_reading_gamepad_scroll_percent_per_sec = self
             .continuous_reading_gamepad_scroll_percent_per_sec
             .clamp(10, 300);
-        self.image_mipmap_lod_bias = if self.image_mipmap_lod_bias.is_finite() {
-            self.image_mipmap_lod_bias.clamp(0.0, 1.5)
-        } else {
-            0.0
-        };
+        self.downscale_smoothing_percent =
+            sanitize_downscale_smoothing_percent(self.downscale_smoothing_percent);
         self.fullscreen_jump_percent = self
             .fullscreen_jump_percent
             .clamp(FULLSCREEN_JUMP_PERCENT_MIN, FULLSCREEN_JUMP_PERCENT_MAX);
@@ -6528,9 +6536,8 @@ impl Settings {
         self.text_preview_scale = src.text_preview_scale;
         self.text_smart_snap_enabled = src.text_smart_snap_enabled;
         self.thumb_quality = src.thumb_quality;
-        // ── 静止画 mipmap sampling (画像補正→フィルタでライブ編集) ──
-        self.image_mipmap_moire_reduction_enabled = src.image_mipmap_moire_reduction_enabled;
-        self.image_mipmap_lod_bias = src.image_mipmap_lod_bias;
+        // ── 縮小時のなめらかさ (画像補正→フィルタでライブ編集) ──
+        self.downscale_smoothing_percent = src.downscale_smoothing_percent;
         // ── 動画プレビュー補正 (native 動画左パネルでライブ編集) ──
         self.video_adjustments = src.video_adjustments.clone();
         self.video_preset_slots = src.video_preset_slots.clone();
@@ -7978,8 +7985,10 @@ mod tests {
         assert_eq!(s.slideshow_continuous_scroll_secs, 0.2);
         assert_eq!(s.slideshow_continuous_scroll_percent, 50);
         assert_eq!(s.fullscreen_fit_mode, FullscreenFitMode::Page);
-        assert!(s.image_mipmap_moire_reduction_enabled);
-        assert_eq!(s.image_mipmap_lod_bias, 0.0);
+        assert_eq!(
+            s.downscale_smoothing_percent,
+            DOWNSCALE_SMOOTHING_PERCENT_MIN
+        );
         assert!(!s.fullscreen_seek_bar_locked);
         assert!(!s.fullscreen_top_bar_locked);
         assert_eq!(
@@ -8508,8 +8517,10 @@ mod tests {
         assert_eq!(loaded.thumb_quality, 75);
         assert_eq!(loaded.video_volume, VIDEO_VOLUME_DEFAULT);
         assert_eq!(loaded.video_playback_speed, 1.0);
-        assert!(loaded.image_mipmap_moire_reduction_enabled);
-        assert_eq!(loaded.image_mipmap_lod_bias, 0.0);
+        assert_eq!(
+            loaded.downscale_smoothing_percent,
+            DOWNSCALE_SMOOTHING_PERCENT_MIN
+        );
         assert_eq!(
             loaded
                 .creative_luts
@@ -8620,16 +8631,39 @@ mod tests {
     }
 
     #[test]
-    fn image_mipmap_moire_reduction_roundtrips_disabled_without_changing_strength() {
-        let mut selected = Settings::default();
-        selected.image_mipmap_moire_reduction_enabled = false;
-        selected.image_mipmap_lod_bias = 0.7;
+    fn downscale_smoothing_percent_maps_to_bounded_blur_factor() {
+        assert!((downscale_smoothing_blur_factor(0) - 1.0).abs() < f32::EPSILON);
+        assert!((downscale_smoothing_blur_factor(50) - 1.15).abs() < f32::EPSILON);
+        assert!((downscale_smoothing_blur_factor(100) - 1.30).abs() < f32::EPSILON);
+        assert!((downscale_smoothing_blur_factor(999) - 1.30).abs() < f32::EPSILON);
+    }
 
+    #[test]
+    fn downscale_smoothing_percent_roundtrips() {
+        let mut selected = Settings::default();
+        selected.downscale_smoothing_percent = 50;
         let loaded: Settings =
             serde_json::from_str(&serde_json::to_string(&selected).unwrap()).unwrap();
+        assert_eq!(loaded.downscale_smoothing_percent, 50);
+    }
 
-        assert!(!loaded.image_mipmap_moire_reduction_enabled);
-        assert_eq!(loaded.image_mipmap_lod_bias, 0.7);
+    #[test]
+    fn retired_mipmap_settings_are_ignored_during_deserialization() {
+        let loaded: Settings = serde_json::from_str(
+            r#"{
+                "image_mipmap_moire_reduction_enabled": false,
+                "image_mipmap_lod_bias": 1.25
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            loaded.downscale_smoothing_percent,
+            DOWNSCALE_SMOOTHING_PERCENT_MIN
+        );
+        let serialized = serde_json::to_string(&loaded).unwrap();
+        assert!(!serialized.contains("image_mipmap_moire_reduction_enabled"));
+        assert!(!serialized.contains("image_mipmap_lod_bias"));
     }
 
     #[test]
@@ -8803,12 +8837,15 @@ mod tests {
         s.fullscreen_cursor_hide_delay_secs = 99.0;
         s.retained_final_ai_cache_max_entries = 999;
         s.retained_final_ai_cache_max_mib = 999_999;
-        s.image_mipmap_lod_bias = 99.0;
+        s.downscale_smoothing_percent = 99;
         s.sanitize();
         assert_eq!(s.spread_page_gap_px, 200);
         assert_eq!(s.continuous_reading_gap_px, 200);
         assert_eq!(s.continuous_reading_wheel_scroll_percent, 1);
-        assert_eq!(s.image_mipmap_lod_bias, 1.5);
+        assert_eq!(
+            s.downscale_smoothing_percent,
+            DOWNSCALE_SMOOTHING_PERCENT_MAX
+        );
         assert_eq!(s.continuous_reading_key_scroll_percent, 100);
         assert_eq!(s.continuous_reading_gamepad_scroll_percent_per_sec, 300);
         assert_eq!(s.slideshow_interval_secs, 3.0);

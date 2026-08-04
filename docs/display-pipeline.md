@@ -729,7 +729,7 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
 自分で保証するか、`clamp_dynamic_for_gpu` を掛けてから格納する。UI スレッド側の
 同期 Triangle リサイズを増やさないこと。
 
-**静止画の GPU mipmap**:
+**mip chain を保持する経路**:
 
 - `DISPLAY_IMAGE_TEXTURE_OPTIONS` を指定した managed texture は、ローカル差し替えした
   `vendor/egui-wgpu` が level 0 upload 後に完全な mip chain を GPU render pass で生成する。
@@ -743,20 +743,15 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
   見開き、連結読み、ルーペ、pixel grid の座標系は変更しない。
 - animated frame、動画、サムネイル、mask、checker、UI texture は対象外。明示的な
   `PostFilter::Nearest` も level 0 + nearest sampler のまま。
-- 画像補正パネルの「フィルタ」に、全表示共通の
-  `image_mipmap_moire_reduction_enabled`（表示名「縮小表示のモアレを抑制する」）と
-  `image_mipmap_lod_bias`（表示名「より強く抑制」、0.0〜1.5）を置く。既定の ON / 0.0 は
-  v2.7.0 以降と同じ GPU 標準 LOD 選択であり、既定画質を変えない。ON かつ正値はより粗い
-  mip level へ寄せて中間縮小率のモアレを強く抑える。OFF は mip chain を保持したまま
-  `textureSampleLevel(..., 0.0)` 相当で level 0 固定にし、モアレ抑制より線のシャープさを優先する。
-  managed texture、wipe/diff 比較、360度パノラマはいずれも明示フラグを uniform で受ける。
-  ON では managed / 比較が `textureSampleBias`、パノラマが `textureSampleGrad` に渡す微分の
-  `2^bias` 倍を使う。ON/OFF と強度は uniform だけをライブ更新し、texture 再生成、再 upload、
-  cache invalidation は行わない。対象外 texture と `Nearest` の表示結果には影響しない。
+- 通常静止画の縮小は level 0 を入力に §2.4.1 の Lanczos3 出力を生成する。通常静止画向けの
+  LOD bias / level 0 切替 uniform と renderer setter は持たない。wipe/diff 比較は固定の
+  implicit mipmap sampling、360度パノラマは周期補正した勾配による `textureSampleGrad` を使う。
+  「縮小時のなめらかさ」は通常静止画の Lanczos3 支持幅だけを変更し、比較・パノラマには影響しない。
 - mip texture の partial update では全下位 level を再生成する。完全な chain の VRAM は level 0
   の約 1/3 増えるため、フルスクリーンの既存 prefetch / eviction 境界を越えて保持しない。
 
-詳細は [downscale-moire-lod-plan.md](downscale-moire-lod-plan.md) を参照。
+旧 LOD 設計の履歴は [downscale-moire-lod-plan.md](downscale-moire-lod-plan.md)、現在の決定は
+[dot-by-dot-and-downscale-plan.md](dot-by-dot-and-downscale-plan.md) を参照。
 
 **原寸表示とダウンスケール警告 (`source_dims`)**:
 
@@ -967,7 +962,11 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 Lanczos3 の native texture を別所有し、`DisplayedImageTransform::paint_texture` に渡す
 `TextureId` だけを差し替える (C-1)。shader は段階3 spike と同じもので、level 0 の
 `Rgba8Unorm` source を vertical `Rgba16Float`、horizontal `Rgba8Unorm` の 2 pass で
-直接リサンプルする。box mip 前縮小、倍率閾値、ヒステリシスは持たない。
+直接リサンプルする。box mip 前縮小、倍率閾値、ヒステリシスは持たない。Lanczos4 は採用しない。
+画像補正パネルの「縮小時のなめらかさ」は 0〜100%・10% 刻みで、
+`blur = 1.0 + percent × 0.003`（1.00〜1.30）へ変換する。各軸の
+`filter_stretch = max(1, 1 / scale) × blur` とし、支持幅・重み・CPU 側の推定 fetch 数を
+同じ値から導出する。既定の 0% は blur 1.00 である。
 
 分岐は `total_scale * pixels_per_point` と
 `physical_scale_is_near_integer` を共通基準にする。
@@ -984,13 +983,15 @@ resource を通る。見開きは高さ合わせ係数を含むページ別実�
 動画、mask、checker、UI preview は direct 経路のままである。
 
 Lanczos cache は viewer context ごとに所有し、key は page idx、元 `TextureId`、
-`items_generation`、ページ別 `input_generation`、目標寸法から成る。回転・trim は full source
+`items_generation`、ページ別 `input_generation`、目標寸法、正規化済み smoothing percent
+から成る。設定値が変わると context 内の Lanczos 出力 cache を消去し、typed resource に保持した
+旧 percent と一致しない出力も再利用しない。回転・trim は full source
 出力を変えないため key に入れない。source ごとの直近 2 寸法、context 全体 64 entry の LRU とし、
 fullscreen close / invalidation / context park・swap / 連結読み keep-set に追従する。native
 `TextureId` は cache、holdover、snapshot が共有する `Arc` lease の最終 drop で free する。
 出力は `LanczosOutputs` として実寸・mip なしで VRAM 会計し、perf log の
-`gpu/lanczos_regenerate` に source / target、推定 fetch 数、encode + submit CPU 時間、
-累積再生成回数を記録する。
+`gpu/lanczos_regenerate` に source / target、smoothing percent / blur、推定 fetch 数、
+encode + submit CPU 時間、累積再生成回数を記録する。
 
 静止画の最終フィット矩形は `fullscreen_media_rect` が所有する。下部ページシークバー固定時は
 `FS_SEEK_BAR_HEIGHT`、上部情報バー固定時は `TOP_BAR_HEIGHT` をそれぞれ `full_rect` から除外し、

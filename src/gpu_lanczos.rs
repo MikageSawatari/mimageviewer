@@ -72,6 +72,7 @@ pub(crate) enum FullscreenPaintResource {
         page_idx: usize,
         source: egui::TextureHandle,
         generation: FullscreenPaintSourceGeneration,
+        smoothing_percent: u32,
         output: Arc<LanczosOutput>,
     },
 }
@@ -162,12 +163,13 @@ impl FullscreenPaintResource {
         }
     }
 
-    fn with_lanczos(&self, output: Arc<LanczosOutput>) -> Self {
+    fn with_lanczos(&self, output: Arc<LanczosOutput>, smoothing_percent: u32) -> Self {
         let (page_idx, source, generation) = self.resampleable_parts().unwrap();
         Self::Lanczos {
             page_idx,
             source: source.clone(),
             generation,
+            smoothing_percent,
             output,
         }
     }
@@ -179,6 +181,7 @@ struct LanczosCacheKey {
     source_texture_id: egui::TextureId,
     generation: FullscreenPaintSourceGeneration,
     target_size: [u32; 2],
+    smoothing_percent: u32,
 }
 
 struct LanczosCacheEntry {
@@ -190,6 +193,8 @@ struct LanczosCacheEntry {
 pub(crate) struct LanczosGenerationStats {
     pub(crate) source_size: [u32; 2],
     pub(crate) target_size: [u32; 2],
+    pub(crate) smoothing_percent: u32,
+    pub(crate) blur_factor: f32,
     pub(crate) texture_fetches: u64,
     pub(crate) encode_submit_cpu_ms: f64,
     pub(crate) regeneration_count: u64,
@@ -201,6 +206,7 @@ pub(crate) struct GpuLanczosCache {
     entries: HashMap<LanczosCacheKey, LanczosCacheEntry>,
     use_clock: u64,
     regeneration_count: u64,
+    active_smoothing_percent: u32,
 }
 
 impl GpuLanczosCache {
@@ -210,7 +216,11 @@ impl GpuLanczosCache {
         resource: &FullscreenPaintResource,
         logical_scale: f32,
         pixels_per_point: f32,
+        smoothing_percent: u32,
     ) -> (FullscreenPaintResource, Option<LanczosGenerationStats>) {
+        let smoothing_percent =
+            crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
+        self.sync_smoothing_percent(smoothing_percent);
         if resource.resampleable_parts().is_none()
             || fullscreen_paint_scale_branch(logical_scale, pixels_per_point)
                 != FullscreenPaintScaleBranch::DownscaleLanczos
@@ -230,8 +240,13 @@ impl GpuLanczosCache {
         if target_size == source_size {
             return (resource.original_resampleable(), None);
         }
-        if let FullscreenPaintResource::Lanczos { output, .. } = resource
+        if let FullscreenPaintResource::Lanczos {
+            output,
+            smoothing_percent: resource_smoothing,
+            ..
+        } = resource
             && output.size == target_size
+            && *resource_smoothing == smoothing_percent
         {
             return (resource.clone(), None);
         }
@@ -240,6 +255,7 @@ impl GpuLanczosCache {
             source_texture_id: source.id(),
             generation,
             target_size,
+            smoothing_percent,
         };
         self.resolve_key(render_state, resource, key)
     }
@@ -253,7 +269,10 @@ impl GpuLanczosCache {
         self.use_clock = self.use_clock.wrapping_add(1);
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.last_used = self.use_clock;
-            return (resource.with_lanczos(entry.output.clone()), None);
+            return (
+                resource.with_lanczos(entry.output.clone(), key.smoothing_percent),
+                None,
+            );
         }
         self.entries.retain(|candidate, _| {
             candidate.page_idx != key.page_idx
@@ -263,6 +282,7 @@ impl GpuLanczosCache {
         let plan = match LanczosPlan::new(
             [resource.size()[0] as u32, resource.size()[1] as u32],
             key.target_size,
+            key.smoothing_percent,
         ) {
             Ok(plan) => plan,
             Err(_) => return (resource.original_resampleable(), None),
@@ -350,6 +370,8 @@ impl GpuLanczosCache {
         let stats = LanczosGenerationStats {
             source_size: plan.source_size,
             target_size: plan.target_size,
+            smoothing_percent: plan.smoothing_percent,
+            blur_factor: plan.blur_factor,
             texture_fetches: plan.texture_fetches,
             encode_submit_cpu_ms: started.elapsed().as_secs_f64() * 1000.0,
             regeneration_count: self.regeneration_count,
@@ -363,7 +385,10 @@ impl GpuLanczosCache {
         );
         self.prune_source_targets(key);
         self.prune_global_lru();
-        (resource.with_lanczos(output), Some(stats))
+        (
+            resource.with_lanczos(output, key.smoothing_percent),
+            Some(stats),
+        )
     }
 
     pub(crate) fn retain_page_indices(&mut self, keep: &std::collections::HashSet<usize>) {
@@ -376,6 +401,17 @@ impl GpuLanczosCache {
 
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    fn sync_smoothing_percent(&mut self, smoothing_percent: u32) -> bool {
+        let smoothing_percent =
+            crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
+        if self.active_smoothing_percent == smoothing_percent {
+            return false;
+        }
+        self.entries.clear();
+        self.active_smoothing_percent = smoothing_percent;
+        true
     }
 
     pub(crate) fn outputs(&self) -> impl Iterator<Item = (usize, &Arc<LanczosOutput>)> {
@@ -392,6 +428,7 @@ impl GpuLanczosCache {
                 key.page_idx == inserted.page_idx
                     && key.source_texture_id == inserted.source_texture_id
                     && key.generation == inserted.generation
+                    && key.smoothing_percent == inserted.smoothing_percent
             })
             .map(|(key, entry)| (*key, entry.last_used))
             .collect::<Vec<_>>();
@@ -477,11 +514,17 @@ impl Drop for NativeTextureIdLease {
 struct LanczosPlan {
     source_size: [u32; 2],
     target_size: [u32; 2],
+    smoothing_percent: u32,
+    blur_factor: f32,
     texture_fetches: u64,
 }
 
 impl LanczosPlan {
-    fn new(source_size: [u32; 2], target_size: [u32; 2]) -> Result<Self, ()> {
+    fn new(
+        source_size: [u32; 2],
+        target_size: [u32; 2],
+        smoothing_percent: u32,
+    ) -> Result<Self, ()> {
         if source_size.contains(&0)
             || target_size.contains(&0)
             || target_size[0] > source_size[0]
@@ -489,13 +532,18 @@ impl LanczosPlan {
         {
             return Err(());
         }
-        let vertical = axis_fetch_count(source_size[1], target_size[1])
+        let smoothing_percent =
+            crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
+        let blur_factor = crate::settings::downscale_smoothing_blur_factor(smoothing_percent);
+        let vertical = axis_fetch_count(source_size[1], target_size[1], blur_factor)
             .saturating_mul(u64::from(source_size[0]));
-        let horizontal = axis_fetch_count(source_size[0], target_size[0])
+        let horizontal = axis_fetch_count(source_size[0], target_size[0], blur_factor)
             .saturating_mul(u64::from(target_size[1]));
         Ok(Self {
             source_size,
             target_size,
+            smoothing_percent,
+            blur_factor,
             texture_fetches: vertical.saturating_add(horizontal),
         })
     }
@@ -515,9 +563,14 @@ fn quantized_target_size(source_size: [u32; 2], scale: f32, quantum: u32) -> [u3
     [quantize(source_size[0]), quantize(source_size[1])]
 }
 
-fn sample_range(source_len: u32, target_len: u32, target_index: u32) -> (u32, u32) {
+fn sample_range(
+    source_len: u32,
+    target_len: u32,
+    target_index: u32,
+    blur_factor: f32,
+) -> (u32, u32) {
     let scale = target_len as f64 / source_len as f64;
-    let stretch = (1.0 / scale).max(1.0);
+    let stretch = (1.0 / scale).max(1.0) * f64::from(blur_factor.clamp(1.0, 1.3));
     let support = 3.0 * stretch;
     let center = (target_index as f64 + 0.5) / scale;
     let start =
@@ -526,10 +579,10 @@ fn sample_range(source_len: u32, target_len: u32, target_index: u32) -> (u32, u3
     (start, end.max(start))
 }
 
-fn axis_fetch_count(source_len: u32, target_len: u32) -> u64 {
+fn axis_fetch_count(source_len: u32, target_len: u32, blur_factor: f32) -> u64 {
     (0..target_len)
         .map(|index| {
-            let (start, end) = sample_range(source_len, target_len, index);
+            let (start, end) = sample_range(source_len, target_len, index, blur_factor);
             u64::from(end - start)
         })
         .sum()
@@ -621,8 +674,10 @@ impl Lanczos3Resampler {
         let output_texture =
             create_target_texture(device, plan.target_size, wgpu::TextureFormat::Rgba8Unorm);
         let output_view = output_texture.create_view(&Default::default());
-        let vertical_uniform = target_len_uniform(device, plan.target_size[1]);
-        let horizontal_uniform = target_len_uniform(device, plan.target_size[0]);
+        let vertical_uniform =
+            resample_params_uniform(device, plan.target_size[1], plan.blur_factor);
+        let horizontal_uniform =
+            resample_params_uniform(device, plan.target_size[0], plan.blur_factor);
         let vertical_bind_group = create_bind_group(
             device,
             &self.bind_group_layout,
@@ -722,9 +777,14 @@ fn create_target_texture(
     })
 }
 
-fn target_len_uniform(device: &wgpu::Device, target_len: u32) -> wgpu::Buffer {
+fn resample_params_uniform(
+    device: &wgpu::Device,
+    target_len: u32,
+    blur_factor: f32,
+) -> wgpu::Buffer {
     let mut bytes = [0_u8; 16];
     bytes[..4].copy_from_slice(&target_len.to_ne_bytes());
+    bytes[4..8].copy_from_slice(&blur_factor.to_ne_bytes());
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
         contents: &bytes,
@@ -857,12 +917,18 @@ mod tests {
             source_texture_id: egui::TextureId::Managed(7),
             generation: FullscreenPaintSourceGeneration { items: 4, input: 8 },
             target_size: [640, 480],
+            smoothing_percent: 0,
         };
         let changed = LanczosCacheKey {
             generation: FullscreenPaintSourceGeneration { items: 4, input: 9 },
             ..base
         };
         assert_ne!(base, changed);
+        let smoothing_changed = LanczosCacheKey {
+            smoothing_percent: 50,
+            ..base
+        };
+        assert_ne!(base, smoothing_changed);
     }
 
     struct CountingReleaser(AtomicUsize);
@@ -889,14 +955,42 @@ mod tests {
 
     #[test]
     fn product_plan_is_direct_level_zero_work() {
-        let plan = LanczosPlan::new([2480, 3508], [620, 877]).unwrap();
+        let plan = LanczosPlan::new([2480, 3508], [620, 877], 0).unwrap();
         assert_eq!(plan.source_size, [2480, 3508]);
         assert_eq!(plan.target_size, [620, 877]);
+        assert_eq!(plan.smoothing_percent, 0);
+        assert!((plan.blur_factor - 1.0).abs() < f32::EPSILON);
         assert!(plan.texture_fetches > 0);
     }
 
     #[test]
+    fn smoothing_change_invalidates_cache_identity_once() {
+        let mut cache = GpuLanczosCache::default();
+        assert!(!cache.sync_smoothing_percent(0));
+        assert!(cache.sync_smoothing_percent(50));
+        assert_eq!(cache.active_smoothing_percent, 50);
+        assert!(!cache.sync_smoothing_percent(50));
+        assert!(cache.sync_smoothing_percent(100));
+        assert_eq!(cache.active_smoothing_percent, 100);
+    }
+
+    #[test]
+    fn smoothing_expands_sample_bounds_and_fetch_estimate() {
+        let standard = LanczosPlan::new([2480, 3508], [1562, 2210], 0).unwrap();
+        let smooth = LanczosPlan::new([2480, 3508], [1562, 2210], 100).unwrap();
+        assert_eq!(smooth.smoothing_percent, 100);
+        assert!((smooth.blur_factor - 1.30).abs() < f32::EPSILON);
+        assert!(smooth.texture_fetches > standard.texture_fetches);
+
+        let standard_range = sample_range(2480, 1562, 700, standard.blur_factor);
+        let smooth_range = sample_range(2480, 1562, 700, smooth.blur_factor);
+        assert!(smooth_range.1 - smooth_range.0 > standard_range.1 - standard_range.0);
+    }
+
+    #[test]
     fn product_shader_validates() {
+        assert!(LANCZOS3_SHADER.contains("blur_factor"));
+        assert!(LANCZOS3_SHADER.contains("clamp(params.blur_factor, 1.0, 1.3)"));
         let module = wgpu::naga::front::wgsl::parse_str(LANCZOS3_SHADER).unwrap();
         wgpu::naga::valid::Validator::new(
             wgpu::naga::valid::ValidationFlags::all(),

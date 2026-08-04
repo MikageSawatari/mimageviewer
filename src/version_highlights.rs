@@ -531,6 +531,24 @@ const TABLE: &[VersionHighlights] = &[
                    既定は今までと同じ見え方のままです。",
         }],
     },
+    VersionHighlights {
+        version: "2.11.0",
+        must_read: &[
+            HighlightItem {
+                title: "原寸表示は物理ピクセル基準になりました",
+                body: "「100%原寸」「拡大しない」「縮小しない」は、画面の物理ピクセルを基準に\
+                       表示するようになりました。高 DPI 環境では、同じ画像が従来より小さく\
+                       表示されることがあります。",
+            },
+            HighlightItem {
+                title: "縮小表示の画質と設定が変わりました",
+                body: "縮小表示の画質を改善し、これまでのモアレ抑制の設定は\
+                       「縮小時のなめらかさ」に変わりました。網点やトーンのちらつきが\
+                       気になるときに値を上げてください。上げるほど細部は柔らかくなります。",
+            },
+        ],
+        highlights: &[],
+    },
 ];
 
 #[cfg(test)]
@@ -812,6 +830,18 @@ mod tests {
             .expect("クリック表示モードの highlights がある");
         assert!(click_to_show.body.contains("別のファイルへ移動すると"));
         assert!(!click_to_show.body.contains("入り直したりしても維持"));
+    }
+
+    #[test]
+    fn embedded_table_contains_v2_11_0_must_read_entries() {
+        let entries = for_version("2.11.0", table());
+        assert_eq!(versions(&entries), ["2.11.0"]);
+        let entry = entries[0];
+        assert!(entry.highlights.is_empty());
+        assert_eq!(entry.must_read.len(), 2);
+        assert!(entry.must_read[0].body.contains("物理ピクセル"));
+        assert!(entry.must_read[0].body.contains("高 DPI"));
+        assert!(entry.must_read[1].body.contains("縮小時のなめらかさ"));
     }
 
     #[test]

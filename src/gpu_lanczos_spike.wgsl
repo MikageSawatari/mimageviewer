@@ -4,7 +4,7 @@ struct VertexOutput {
 
 struct ResampleParams {
     target_len: u32,
-    _padding0: u32,
+    blur_factor: f32,
     _padding1: u32,
     _padding2: u32,
 };
@@ -58,7 +58,7 @@ fn sample_bounds(center: f32, support: f32, source_len: u32) -> vec2<i32> {
 fn resample_vertical(target_coord: vec2<u32>) -> vec4<f32> {
     let source_size = textureDimensions(source_texture, 0);
     let scale = f32(params.target_len) / f32(source_size.y);
-    let filter_stretch = max(1.0, 1.0 / scale);
+    let filter_stretch = max(1.0, 1.0 / scale) * clamp(params.blur_factor, 1.0, 1.3);
     let support = LANCZOS_SUPPORT * filter_stretch;
     let center = (f32(target_coord.y) + 0.5) / scale;
     let bounds = sample_bounds(center, support, source_size.y);
@@ -90,7 +90,7 @@ fn resample_vertical(target_coord: vec2<u32>) -> vec4<f32> {
 fn resample_horizontal(target_coord: vec2<u32>) -> vec4<f32> {
     let source_size = textureDimensions(source_texture, 0);
     let scale = f32(params.target_len) / f32(source_size.x);
-    let filter_stretch = max(1.0, 1.0 / scale);
+    let filter_stretch = max(1.0, 1.0 / scale) * clamp(params.blur_factor, 1.0, 1.3);
     let support = LANCZOS_SUPPORT * filter_stretch;
     let center = (f32(target_coord.x) + 0.5) / scale;
     let bounds = sample_bounds(center, support, source_size.x);

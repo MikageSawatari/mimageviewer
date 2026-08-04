@@ -1,6 +1,12 @@
 # トーン漫画の縮小モアレ対策 / GPU mipmap 実装
 
-**ステータス: mipmap + シャープ優先切替 + 調整可能な LOD 補正を実装済み、実機検証待ち。**
+**ステータス: v2.10.0 までの履歴資料。通常静止画の最終表示方式と設定は v2.11.0 計画で置き換え済み。**
+
+> [!IMPORTANT]
+> 現在の正本は [dot-by-dot-and-downscale-plan.md](dot-by-dot-and-downscale-plan.md)。
+> 通常静止画の縮小表示は表示サイズへの Lanczos3 直接リサンプルへ移行し、ここで設計した
+> trilinear の ON/OFF と LOD bias は削除した。v2.10.0 の旧設定値は読込時に無視する。
+> GPU mipmap generator は削除せず、wipe/diff 比較表示と 360 度パノラマが使い続ける。
 
 フルスクリーンの大縮小時に発生するモアレについて、原因、採用した実装、互換方針をまとめる。
 

@@ -389,6 +389,7 @@ pub fn managed_source_texture<'a>(
 fn target_len_uniform(device: &wgpu::Device, target_len: u32, axis: &str) -> wgpu::Buffer {
     let mut bytes = [0_u8; 16];
     bytes[..4].copy_from_slice(&target_len.to_ne_bytes());
+    bytes[4..8].copy_from_slice(&1.0_f32.to_ne_bytes());
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some(&format!("mIV Lanczos spike {axis} uniform")),
         contents: &bytes,

@@ -9852,7 +9852,7 @@ pub struct App {
     /// 導入時の用途は Windows 固有 (動画 GPU レンダリングで
     /// `wgpu::Device::create_texture_from_hal::<Dx12>` 経由で D3D11 NT shared テクスチャを
     /// import する) だったが、現在は **プラットフォーム非依存の用途にも使う** —
-    /// mipmap の sampling 設定、比較モードの GPU テクスチャ解放、パノラマの settle overlay。
+    /// GPU Lanczos、比較モードの GPU テクスチャ解放、パノラマの settle overlay。
     /// そのため `cfg(windows)` を付けない。付けると、cfg なしの経路 (`eframe::App::update`
     /// など) から参照するたびに非 Windows ビルドが壊れ、CI の
     /// `cargo check (ubuntu / non-Windows cfg)` でしか気付けない
@@ -61113,13 +61113,6 @@ impl eframe::App for App {
             self.clear_all_final_pipeline_caches();
             #[cfg(windows)]
             self.sync_native_video_grade();
-        }
-        if let Some(render_state) = self.wgpu_render_state.as_ref() {
-            let mut renderer = render_state.renderer.write();
-            renderer.set_image_mipmap_sampling_enabled(
-                self.settings.image_mipmap_moire_reduction_enabled,
-            );
-            renderer.set_image_lod_bias(self.settings.image_mipmap_lod_bias);
         }
         // prefetch suppression gate: 同フレーム内の scroll 入力を即時に拾う。
         // `scroll_offset_y` への反映 (= process_scroll / handle_keyboard) を待たないので、
