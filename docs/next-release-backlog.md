@@ -1,4 +1,4 @@
-# 次リリース検討バックログ
+﻿# 次リリース検討バックログ
 
 このファイルは、まだ着手していない作業候補だけを置く恒久バックログ。
 完了した項目はコミット履歴・リリースノート・個別設計メモに任せ、このファイルからは削除する。
@@ -33,7 +33,7 @@
 > - §1.41 — 静止画縮小表示のシャープ優先 / モアレ抑制切替。
 >
 > **known-issues.html から消えるのは 3 見出し**: 入力・キー操作の 2 件と見開き。
-> 残るのは VST カーソル (§1.28) と MPEG シーク (§1.13)。
+> 残るのは MPEG シーク (§1.13)。VST カーソル (§1.28) は v2.10.0 で対応済み。
 
 ### 1.7 detached 中の発火面解決の残り (? / トースト / スタック) — BA 報告
 
@@ -160,7 +160,16 @@
   - UI スレッドへ ZIP/PDF 列挙や SQLite 単件照会を追加しない。
 - 規模 / 優先度: Medium〜Large / P3。
 
-### 1.28 presenter の上に別の窓が乗るとカーソル auto-hide が解除されない
+### 1.28 対応済み: presenter の上に別の窓が乗るとカーソル auto-hide が解除されない
+
+- **対応 (2026-08-02、v2.10.0 に含まれる)**: commit `e1940617`
+  「Ask which window has the pointer, not where the pointer is」。幾何判定の
+  `cursor_within_client` を、pump が所有する typed router (`NativeCursorOwnershipEdge` /
+  `CursorOwnership` イベント) と auto-hide reducer へ置き換えた。下記の対応案どおりの
+  構造的修正。detached-rework-plan.md の 2026-08-02 行にも記録あり。
+- **v2.10.0 リリース時に、手順 Phase 1 の 6.5「既知の問題ページから、この版で直した項目を
+  削除する」が漏れていた。** v2.11.0 で known-issues.html から削除する。
+
 
 - 出典: v2.9.1 リリース前の §7.2 実機確認 (2026-08-01)、シナリオ 5 (VST GUI) の最中。
 - 症状: フルスクリーンで動画を**再生中**に VST エディタを開こうとしたところ、マウスカーソルが
@@ -426,7 +435,11 @@
      key を 1 回作って使い回す形にできるかは見ておく。
 - 規模 / 優先度: 残る 2 は Small / P3。
 
-### 1.41 対応済み: 静止画縮小表示のシャープ優先 / モアレ抑制切替
+### 1.41 対応済み: 静止画縮小表示のシャープ優先 / モアレ抑制切替 (v2.10.0 履歴)
+
+> v2.11.0 では通常静止画を表示サイズへ Lanczos3 で直接縮小する方式へ置き換え、
+> この節の ON/OFF と LOD bias は削除した。現在の仕様は
+> [dot-by-dot-and-downscale-plan.md](dot-by-dot-and-downscale-plan.md) §4.3.1 / §4.3.3 を参照。
 
 - **対応 (2026-08-02)**: 画像補正パネルのフィルタへ既定 ON のモアレ抑制チェックと
   0.0〜1.5 の強度を追加。OFF は mip chain を保持したまま level 0 固定で読み、主表示、
@@ -571,6 +584,144 @@
   - 拡張が 1 つも無い環境でも従来と同じメニューが出る。
 - 規模 / 優先度: Medium / P2。実害は「操作のたびに待たされる」で、データ喪失は無い。
 
+### 1.43 Enter でフルスクリーンを開くと全画面ズームモードに入る (Enter 系 KeyHold の所有権が開幕フレームで抜ける)
+
+- 出典: 2026-08-04 の利用者報告と同日の調査。「画像フォルダで Enter で画像を開くと最初から
+  Z のズームモードになっている。Z を 1 回押すと解除できる。ダブルクリックでは起きない」。
+- 再現条件: **Enter / テンキー Enter を KeyHold アクションに割り当てている**こと。報告環境の
+  keymap override は `FsZoomMode = Z, NumpadEnter`。既定 (Z のみ) では成立しないので、
+  データ保存先が別のポータブル版では再現しない。**バージョン差ではなく設定差**であり、
+  同じ `%APPDATA%` を使うインストール版なら旧バージョンでも再現するとみられる。
+- 壊れている前提:
+  1. `key_held_via_os` ([keymap.rs:6939](../src/keymap.rs)) は Enter / NumpadEnter を
+     「送信元 HWND 由来の物理ラッチ」で判定するが、それは `is_frame_active(viewport)` が
+     true のときだけで、false のときは `GetAsyncKeyState(VK_RETURN)` にフォールバックする。
+     `KeyName::Enter` と `KeyName::NumpadEnter` は `to_vk()` が同じ 0x0D
+     ([keymap.rs:636](../src/keymap.rs)) なので、この経路は本体 / テンキーの区別も
+     どのウィンドウのキーかの区別も失う。
+  2. `frame_active_viewports` は subclass 登録済み HWND を持つ viewport の集合
+     ([key_input.rs:333](../src/key_input.rs))。フルスクリーンの viewport は
+     `install_key_input_subclass_for_viewport_rect` が outer_rect と可視ウィンドウの
+     rect 一致で HWND を見つけてから登録する ([ui_fullscreen.rs:6955](../src/ui_fullscreen.rs)、
+     呼び出しは [8247](../src/ui_fullscreen.rs)) ため、**新規作成直後の数フレームは false**。
+  3. その間 `update_fs_zoom_mode_keys` ([ui_fullscreen.rs:3070](../src/ui_fullscreen.rs)) が
+     「まだ押されたままの Enter」を押下エッジとして拾って `fs_zoom_aiming = true` にし、
+     離した瞬間の離しエッジで `fs_zoom_active = true` を確定させる。
+- 影響範囲: FsZoomMode 固有ではない。**Enter / NumpadEnter を割り当てた全ての KeyHold
+  アクション** (`*SpacePan` 等) と、**新規 viewport の開幕フレーム全般**が同じ穴を通る。
+  713d36bf 以前は frame-active gate 自体が無く常に `GetAsyncKeyState` だったので、
+  713d36bf は同じ穴の frame-active 側だけを塞いだ状態になっている。
+- 対応案: `is_frame_active` でない viewport では Enter 系 KeyHold を **false にする**
+  (送信元を確認できないなら押下扱いしない) のが所有権の筋。`GetAsyncKeyState`
+  フォールバックは per-HWND ラッチの外に残った旧経路。
+- ⚠ 症状パッチにしないこと: 「FS 入場時に `fs_zoom_z_was_down` を現在の押下状態で
+  初期化する」「開幕 N ms はズームモードを無効にする」は、この 1 アクションの見え方を
+  消すだけで、他の KeyHold と他 viewport の同型を残す。
+- 完了条件 / 回帰テスト:
+  - `FsZoomMode` に NumpadEnter を割り当てた状態で Enter 開閉を繰り返してもズームモードに
+    入らない。
+  - subclass 登録前後で Enter hold の判定が一致する (viewport 単位の unit test)。
+  - 本体 Enter とテンキー Enter の分離が保たれる (既存
+    `key_hold_slot_matching_distinguishes_both_enter_directions` の hold 経路版)。
+- 当面の回避: 操作カスタマイズで `FsZoomMode` から NumpadEnter を外す。
+- 規模 / 優先度: Small / P2。データ喪失は無いが、Enter で開くたびに表示が壊れる。
+
+### 1.45 縮小に EWA (Jinc) 経路を検討する
+
+- 出所: 2026-08-04 の利用者経由の意見 (MPC-BE / MPC Video Renderer の Jinc2m 評価) と、
+  それを受けた再測定。正本は
+  [dot-by-dot-and-downscale-plan.md](dot-by-dot-and-downscale-plan.md) §4.3.4。
+- 測定結果: EWA Jinc3 は網点の残留が**角度にほぼ依存しない** (0/15/30/45 度で 11.0〜11.7)。
+  現行の分離 Lanczos3 blur1.00 は同条件で 13.5→48.8 と角度で 3.6 倍悪化する。しかも
+  0 度の細線コントラストは同等 (123.4 vs 123.5) を保つ。**分離 blur1.00 に対しては全角度で優位。**
+- ただし: ①不規則トーン (実スキャン相当) では分離 blur1.30 に負ける (36.38 vs 30.23) ので
+  「なめらかさ」設定は残る ②斜めディテールは分離 blur1.00 比 8〜10% 落ちる (円形通過域が
+  対角の角を落とす選択的バイアス) ③**コストが約 6.5 倍** (0.41 縮小で約 196 タップ vs 約 30)。
+- 着手時に見るべき点:
+  - リサイズ中の実測。結果はキャッシュされるので静止時は一度きりだが、リサイズ中は
+    毎フレーム走る。ここが採否の分かれ目
+  - 現行の分離経路を置き換えるのか、拡大側にだけ入れるのか。MPC-VR 自身は
+    「拡大は Jinc2m、縮小は Lanczos」を推奨しており、拡大側の方が素性は良い
+  - 経路を 2 本持つ判断は §3.3 の「縮小経路は 1 本化する」と衝突する。増やすなら理由を残す
+- 規模 / 優先度: Medium / P3。現行が壊れているのではなく、より良い候補があるという位置づけ。
+
+### 1.46 静止画の拡大品質を上げる (bilinear をやめる) — 実施決定
+
+**2026-08-04 に実施を決定した項目。**「やるか」ではなく「どのアルゴリズムにするか」を
+決める段階から始める。動画の拡大は §1.47 へ分離した (難易度が別物のため)。
+
+**現状の問題**: 拡大は**素の bilinear**。[gpu_lanczos.rs](../src/gpu_lanczos.rs) の
+`GpuLanczosCache::resolve` が `DownscaleLanczos` 以外を素通しし、テクスチャは
+`DISPLAY_IMAGE_TEXTURE_OPTIONS` (LINEAR) で貼られるだけ。2〜4 倍ズームでの劣化が大きい。
+AI アップスケール (数秒かかる) と bilinear (即時・低品質) の中間が無く、
+「AI は少し重い」利用者の受け皿が存在しない。
+
+**方針**: 設定を増やさず**固定で置き換える**。bilinear を選びたい利用者は想定しない。
+「補間なし」を明示したい場合はポストフィルタの「ニアレスト（補間なし）」が既にあり、
+`needs_nearest_sampler()` で NEAREST サンプラーに切り替わる ([app.rs](../src/app.rs) 4 箇所)
+ので、逃げ道は用意済み。ドット絵・整数倍ズーム用途はこちらで足りる。
+
+**アルゴリズム選定 (着手時の最初の作業)**。Jinc で決め打ちしない。系統別の候補:
+
+| 系統 | 候補 | 位置づけ |
+| --- | --- | --- |
+| 固定カーネル | **EWA Jinc3**、Catmull-Rom、Mitchell、Lanczos3 | 学習なし。Jinc は円形通過域で斜めエッジの階段が出ない |
+| エッジ方向適応 | **FSR 1.0 (EASU)**、NVIDIA Image Scaling | どちらも MIT。4K でも 0.2ms 級。エッジ適応 + シャープ化 |
+| 学習済みカーネル / 軽量 NN | **Anime4K**、ravu (RAISR 系)、FSRCNNX | **題材 (漫画・線画・イラスト) との一致度が最も高い**。推論ではなくシェーダなので軽い |
+
+- **Anime4K が最有力候補**。用途が漫画・線画に完全に一致する。Jinc は線の方向を見ないので、
+  斜め線の階段は減っても線の再構成まではしない
+- ⚠ **エッジ適応系・学習済み系は未実測。** 根拠は一般的評価だけ。
+  **Lanczos4 の失敗 (0 度トーンだけ見て「上位互換」と誤判定) を繰り返さないこと。**
+  実画像 (漫画スキャン・AI 生成イラスト・写真) で比較シートを作り、利用者判断を仰ぐ
+- ライセンスを必ず確認する。mIV は MIT。FSR1 / NIS は MIT だが Anime4K / ravu は要確認
+
+**実装規模 (EWA Jinc の場合の実測見積もり)**: Medium。今回の Lanczos 統合の 4〜6 割。
+
+| 項目 | 規模 | 備考 |
+| --- | ---: | --- |
+| WGSL シェーダ新規 | ~120 行 | **1 パス**で済む (非分離なので縦横 2 パスが不要)。現行の分離シェーダより単純 |
+| J1 の LUT 生成 | ~40 行 | WGSL にベッセル関数が無い。CPU で 1D LUT (1024 要素) を作って渡す (madVR / mpv と同じ) |
+| Plan / パイプライン | ~150 行 | `LanczosPlan::new` が `target > source` を `Err` で弾いている。拡大用 plan と fetch 見積もりが要る |
+| キャッシュ分岐 | ~30 行 | `resolve` の分岐 1 本。cache / lease / resource の枠組みはそのまま使える |
+| VRAM 会計 | ~50 行 | 縮小は出力が必ず小さいので現行会計は安全側。**拡大は出力が元より大きく前提が反転する** |
+| テスト | ~150 行 | 分岐 / plan / シェーダ検証 |
+
+**行数より重いリスク (ここが採否の分かれ目)**:
+
+1. **ズーム中の再生成コスト。** 目標サイズは 1px 単位で厳密 (量子化は品質のため見送り済み、
+   §4.3.3) なので連続ズーム中は毎フレーム作り直す。**拡大は出力が元の 4〜16 倍になり得る**。
+   必ず実測する
+2. **ドットバイドットを壊さないこと。** `OriginalOneToOne` は素通しのまま維持する
+3. 上限クランプ。拡大の出力サイズは上に開いている (8 倍ズーム × 4000px = 32000px)
+
+**コスト計算の注意**: 拡大はカーネルを `1/scale` へ広げないので支持半径 3.238 固定
+(ズーム倍率に依らない)。有効タップ約 33、シェーダ実装で約 49〜81 フェッチ。
+縮小の約 196 タップとは別物で、§1.45 の「6.5 倍」を拡大へ適用しない。しかも結果は
+`GpuLanczosCache` に乗るので、静止時は毎フレームではなく倍率変更時の 1 回だけ。
+
+- 正本: [dot-by-dot-and-downscale-plan.md](dot-by-dot-and-downscale-plan.md) §4.3.4 (Jinc の測定)
+- 規模 / 優先度: Medium / **P2 (実施決定)**。
+
+### 1.47 動画の拡大に高品質リサンプルを入れる — コストではなく構造の問題
+
+§1.46 の動画版。**GPU 性能ではなく動画表示の構造が障害**なので、別案件として扱う。
+
+- native presenter は **swap chain を動画解像度で作り**、フレームを `CopySubresourceRegion`
+  で 1:1 コピーし、**`IDCompositionVisual::SetTransform2` で拡大している**
+  ([render_core.rs](../src/video/native_presenter/render_core.rs) の
+  `compute_video_visual_transform`)。つまり**拡大しているのは mIV ではなく DWM / DComp**。
+  mIV のシェーダは通っていない (色補正が identity でないときだけ grade シェーダが走るが、
+  それも動画解像度で動く)
+- 入れるには ①swap chain をウィンドウ解像度にする ②grade シェーダを常時通す
+  ③visual transform を SAR 補正だけにする、の 3 点が要る。keyed mutex / swap chain 世代 /
+  MPO cover / DComp commit のタイミングという**最も壊れやすい箇所**に触る
+- VSR は [video-architecture.md](video-architecture.md) で**スコープ外と決定済み**なので、
+  先例として使えるものが無い
+- 毎フレーム走るので実測必須。4K 出力で概算 1〜2ms (RTX 4090) / 3〜6ms (ミドルレンジ)。
+  60fps の予算 16.7ms に対し 6〜36%。デコードと競合する。静止画と違いキャッシュが効かない
+- 規模 / 優先度: Large / P3。単独リリースで実機検証を厚く取る規模。**§1.46 の後**。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
@@ -683,6 +834,23 @@
 - 規模 / リスク: Medium / 中。動画系の手動確認を含めて別タスクで扱う。
 
 ## 5. リリース前確認 / 依存更新
+
+### 5.0 v2.11.0 で見送った依存更新 — 次サイクル冒頭で実施
+
+v2.11.0 (2026-08-04) の Phase 2 で新版を確認したが、**検証時間を優先して見送った**。
+次のリリースサイクルの**最初の作業**として片付ける。出荷直前に上げない。
+
+| 依存 | v2.11.0 出荷時 | 確認できた新版 |
+| --- | --- | --- |
+| PDFium | BUILD=7961 | chromium/7988 |
+| FFmpeg | n7.1.5-10-g2aefd64d48 | n7.1.5-12-g1fdbca85aa |
+
+見送りの理由: v2.11.0 は表示パイプラインの修正で PDF レンダリングにも動画デコードにも
+触れていない。PDFium を上げれば PDF 表示の再確認が要り、FFmpeg を上げれば LGPL 対応ソースの
+差し替えも伴う ([ffmpeg-lgpl-source-distribution.md](ffmpeg-lgpl-source-distribution.md))。
+
+FFmpeg の版確認は **DLL の ProductVersion を正**とする。`vendor/ffmpeg/VERSION` は
+ローリング名を掴んで腐ることがある。
 
 ### 5.1 ネイティブ依存
 

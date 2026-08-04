@@ -16,7 +16,7 @@ fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHand
     FsHoldover::FolderNavigation(FsDisplayUnitHoldover {
         pages: vec![FsDisplayUnitHoldoverPage {
             idx: page_idx,
-            texture,
+            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
             rotation: crate::rotation_db::Rotation::None,
             source_size: None,
             content_bbox: None,
@@ -102,7 +102,7 @@ fn paused_test_window(
     );
     DetachedImageWindowSnapshot {
         id,
-        texture,
+        texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
         title: format!("paused-{id}"),
         location_display: format!("paused-{id}"),
         image_dims: None,
@@ -17551,6 +17551,7 @@ mod favorite_adjustment_defaults_tests {
                     fit_mode: crate::settings::FullscreenFitMode::Page,
                     fit_scale_limits:
                         crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                    pixels_per_point: 1.0,
                     placement: crate::displayed_image_transform::ResolvedDisplayPlacement::Normal {
                         zoom_pan: None,
                     },
@@ -18179,7 +18180,7 @@ mod favorite_adjustment_defaults_tests {
         app.continuous_page_transitions.insert(
             3,
             ContinuousPageTransition {
-                texture: first,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(first),
                 items_generation: first_generation,
             },
         );
@@ -18200,7 +18201,7 @@ mod favorite_adjustment_defaults_tests {
         app.continuous_page_transitions.insert(
             9,
             ContinuousPageTransition {
-                texture: second,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(second),
                 items_generation: second_generation,
             },
         );
@@ -20858,7 +20859,7 @@ mod pipeline_cache_refactor_tests {
             previous: FsDisplayUnitHoldover {
                 pages: vec![FsDisplayUnitHoldoverPage {
                     idx: page_idx,
-                    texture,
+                    texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
                     rotation: crate::rotation_db::Rotation::None,
                     source_size: None,
                     content_bbox: None,
@@ -27590,7 +27591,7 @@ mod still_window_mode_key_tests {
         );
         DetachedImageWindowSnapshot {
             id,
-            texture,
+            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
             title: format!("parked-{id}"),
             location_display: format!("parked-{id}"),
             image_dims: None,
@@ -33641,7 +33642,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 7,
-                texture: tex,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
                 title: "parked media".to_owned(),
                 location_display: "parked media".to_owned(),
                 image_dims: None,
@@ -33724,7 +33725,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 61,
-                texture: media_tex,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(media_tex),
                 title: "parked media".to_owned(),
                 location_display: "parked media".to_owned(),
                 image_dims: None,
@@ -33945,7 +33946,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 61,
-                texture: media_tex,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(media_tex),
                 title: "parked media".to_owned(),
                 location_display: "parked media".to_owned(),
                 image_dims: None,
@@ -34011,7 +34012,7 @@ mod still_window_mode_key_tests {
         let make_snapshot =
             |id: u64, tex: egui::TextureHandle, path: &str| DetachedImageWindowSnapshot {
                 id,
-                texture: tex,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
                 title: format!("still {id}"),
                 location_display: format!("still {id}"),
                 image_dims: None,
@@ -34458,7 +34459,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 91,
-                texture: media_tex,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(media_tex),
                 title: "parked".to_owned(),
                 location_display: "parked".to_owned(),
                 image_dims: None,
@@ -34741,7 +34742,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 95,
-                texture: tex,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
                 title: "parked music".to_owned(),
                 location_display: "parked music".to_owned(),
                 image_dims: None,
@@ -35138,7 +35139,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 93,
-                texture: tex,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
                 title: "parked".to_owned(),
                 location_display: "parked".to_owned(),
                 image_dims: None,
@@ -35187,7 +35188,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 94,
-                texture: tex,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
                 title: "parked still".to_owned(),
                 location_display: "parked still".to_owned(),
                 image_dims: None,
@@ -36115,7 +36116,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 42,
-                texture,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
                 title: "a.pdf - mimageviewer".to_string(),
                 location_display: "a.pdf".to_string(),
                 image_dims: Some((1, 1)),
@@ -36219,7 +36220,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 42,
-                texture: first_texture,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(first_texture),
                 title: "a.pdf - mimageviewer".to_string(),
                 location_display: "a.pdf".to_string(),
                 image_dims: Some((1, 1)),
@@ -36447,7 +36448,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 1,
-                texture,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
                 title: "pinned.pdf - mimageviewer".to_string(),
                 location_display: "pinned.pdf".to_string(),
                 image_dims: Some((1, 1)),
@@ -37780,7 +37781,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 22,
-                texture: tex,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
                 title: "passive".to_owned(),
                 location_display: "passive".to_owned(),
                 image_dims: Some((1, 1)),
@@ -38717,7 +38718,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 43,
-                texture,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
                 title: "a.jpg - mimageviewer".to_string(),
                 location_display: "a.jpg".to_string(),
                 image_dims: Some((1, 1)),
@@ -38841,7 +38842,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 62,
-                texture,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
                 title: "parked.flac - mimageviewer".to_owned(),
                 location_display: "parked.flac".to_owned(),
                 image_dims: None,
@@ -38945,7 +38946,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 102,
-                texture: texture.clone(),
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture.clone()),
                 title: "passive.jpg - mimageviewer".to_owned(),
                 location_display: "passive.jpg".to_owned(),
                 image_dims: Some((1, 1)),
@@ -38979,7 +38980,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 103,
-                texture,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
                 title: "live.mp4 - mimageviewer".to_owned(),
                 location_display: "live.mp4".to_owned(),
                 image_dims: None,
@@ -39220,7 +39221,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 61,
-                texture: tex,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
                 title: "live".to_owned(),
                 location_display: "live".to_owned(),
                 image_dims: None,
@@ -39323,7 +39324,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 72,
-                texture,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
                 title: "live.mp4 - mimageviewer".to_owned(),
                 location_display: "live.mp4".to_owned(),
                 image_dims: None,
@@ -40108,7 +40109,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 71,
-                texture: tex,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
                 title: "old".to_owned(),
                 location_display: "old".to_owned(),
                 image_dims: None,
@@ -40163,7 +40164,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 81,
-                texture: tex,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
                 title: "live".to_owned(),
                 location_display: "live".to_owned(),
                 image_dims: None,
@@ -41063,7 +41064,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 82,
-                texture: tex,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
                 title: "live".to_owned(),
                 location_display: "live".to_owned(),
                 image_dims: None,
@@ -42654,7 +42655,7 @@ mod still_window_mode_key_tests {
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 7,
-                texture,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
                 title: "a.jpg - mimageviewer".to_string(),
                 location_display: "a.jpg".to_string(),
                 image_dims: Some((1, 1)),
@@ -42722,7 +42723,7 @@ mod still_window_mode_key_tests {
         let placement = app.detached_viewer_window_placement();
         let snapshot = DetachedImageWindowSnapshot {
             id: 7,
-            texture,
+            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
             title: "a.jpg - mimageviewer".to_string(),
             location_display: "a.jpg".to_string(),
             image_dims: Some((1, 1)),
@@ -42817,7 +42818,7 @@ mod still_window_mode_key_tests {
         };
         let snapshot = DetachedImageWindowSnapshot {
             id: 7,
-            texture,
+            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
             title: "deferred.jpg - mimageviewer".to_string(),
             location_display: "deferred.jpg".to_string(),
             image_dims: Some((1, 1)),

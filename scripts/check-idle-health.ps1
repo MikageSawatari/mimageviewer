@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("static-foreground", "static-background", "video-pin-background")]
+    [ValidateSet("static-foreground", "static-background", "video-pin-background", "tray-residency")]
     [string]$Scenario = "static-foreground",
     [string]$TargetKey = "",
     [string]$ExePath = "",
@@ -25,16 +25,87 @@ elseif ($PSBoundParameters.ContainsKey("TargetKey")) {
     throw "-TargetKey is valid only with -Scenario video-pin-background"
 }
 
-if (-not ("MivIdleHealthNative" -as [type])) {
+# Add-Type keeps a compiled type for the whole PowerShell session, and this
+# guard skips recompiling it. A console that already ran an older copy of this
+# script therefore keeps the OLD implementation, silently. Bump the trailing
+# number whenever the C# below changes so a stale session recompiles instead of
+# reporting results from code that is no longer in the file. (2026-08-04: the
+# tray gate fix looked like it had not applied for exactly this reason.)
+if (-not ("MivIdleHealthNative2" -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
-public static class MivIdleHealthNative {
+using System.Text;
+public static class MivIdleHealthNative2 {
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
 
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetClassName(IntPtr hWnd, StringBuilder buffer, int maxCount);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+
+    // Framework-internal top-level windows that the app cannot hide and that the
+    // user never sees. Counting them makes the tray gate unpassable:
+    //   Winit Thread Event Target - winit's 15x15 event sink, always WS_VISIBLE
+    //   IME / MSCTFIME UI         - the per-thread IME helpers Windows creates
+    // Verified 2026-08-04 by enumerating a tray-resident core: hiding the real
+    // main window took the visible count from 2 to 1, and the survivor was the
+    // winit event target.
+    static readonly string[] HelperClasses = {
+        "Winit Thread Event Target",
+        "IME",
+        "MSCTFIME UI",
+    };
+
+    static bool IsUserFacing(IntPtr hWnd) {
+        if (!IsWindowVisible(hWnd)) { return false; }
+        var name = new StringBuilder(256);
+        GetClassName(hWnd, name, name.Capacity);
+        string cls = name.ToString();
+        foreach (string helper in HelperClasses) {
+            if (cls == helper) { return false; }
+        }
+        // Backstop for helpers we have not named: nothing the user can see is tiny.
+        RECT r;
+        if (GetWindowRect(hWnd, out r) && (r.Right - r.Left < 64 || r.Bottom - r.Top < 64)) {
+            return false;
+        }
+        return true;
+    }
+
+    public static int[] GetTopLevelWindowCounts(uint processId) {
+        int total = 0;
+        int visible = 0;
+        EnumWindows(delegate (IntPtr hWnd, IntPtr lParam) {
+            uint ownerProcessId;
+            GetWindowThreadProcessId(hWnd, out ownerProcessId);
+            if (ownerProcessId == processId) {
+                total++;
+                if (IsUserFacing(hWnd)) {
+                    visible++;
+                }
+            }
+            return true;
+        }, IntPtr.Zero);
+        return new int[] { total, visible };
+    }
 }
 '@
 }
@@ -48,16 +119,25 @@ function Get-FileLength {
 }
 
 function Get-ForegroundProcessId {
-    $window = [MivIdleHealthNative]::GetForegroundWindow()
+    $window = [MivIdleHealthNative2]::GetForegroundWindow()
     if ($window -eq [IntPtr]::Zero) {
         return 0
     }
     [uint32]$foregroundProcessId = 0
-    [void][MivIdleHealthNative]::GetWindowThreadProcessId(
+    [void][MivIdleHealthNative2]::GetWindowThreadProcessId(
         $window,
         [ref]$foregroundProcessId
     )
     return [int]$foregroundProcessId
+}
+
+function Get-ProcessTopLevelWindowSummary {
+    param([int]$Id)
+    $counts = [MivIdleHealthNative2]::GetTopLevelWindowCounts([uint32]$Id)
+    return [pscustomobject]@{
+        Total = [int]$counts[0]
+        Visible = [int]$counts[1]
+    }
 }
 
 function Format-Invariant {
@@ -167,8 +247,15 @@ Write-Host "PID      : $($Process.Id)"
 Write-Host "Perf log : $PerfLog"
 Write-Host ""
 Write-Host "Prepare the requested static state, then do not touch the mouse or keyboard during measurement."
-Write-Host "After Enter, use the $WarmupSeconds-second warmup to return focus to mImageViewer for a foreground scenario."
-Write-Host "For a background scenario, leave another window in the foreground during warmup."
+if ($Scenario -eq "tray-residency") {
+    Write-Host "Open a thumbnail-heavy folder, then close the main window while thumbnails are still loading."
+    Write-Host "Confirm the app remains in the tray and its taskbar/main window is no longer visible before pressing Enter."
+    Write-Host "The gate verifies that the process owns at least one top-level window and that all are hidden."
+}
+else {
+    Write-Host "After Enter, use the $WarmupSeconds-second warmup to return focus to mImageViewer for a foreground scenario."
+    Write-Host "For a background scenario, leave another window in the foreground during warmup."
+}
 Write-Host "Input during warmup is excluded; stop interacting when the measurement countdown begins."
 $Process = Get-LiveProcess -Id $Process.Id
 $EvidenceStartWall = Get-Date
@@ -191,6 +278,7 @@ $StartCpu = $Process.TotalProcessorTime.TotalSeconds
 $StartAppLogBytes = Get-FileLength -Path $AppLog
 $StartPerfLogBytes = Get-FileLength -Path $PerfLog
 $StartForegroundProcessId = Get-ForegroundProcessId
+$StartWindowSummary = Get-ProcessTopLevelWindowSummary -Id $Process.Id
 $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 Write-Host "Measuring: $MeasureSeconds seconds (do not interact)"
@@ -204,6 +292,7 @@ $EndCpu = $Process.TotalProcessorTime.TotalSeconds
 $EndAppLogBytes = Get-FileLength -Path $AppLog
 $EndPerfLogBytes = Get-FileLength -Path $PerfLog
 $EndForegroundProcessId = Get-ForegroundProcessId
+$EndWindowSummary = Get-ProcessTopLevelWindowSummary -Id $Process.Id
 
 $ElapsedSeconds = [Math]::Max($Stopwatch.Elapsed.TotalSeconds, 0.001)
 $CpuDeltaSeconds = [Math]::Max($EndCpu - $StartCpu, 0.0)
@@ -250,7 +339,21 @@ $Warnings = New-Object System.Collections.Generic.List[string]
 $ScenarioLower = $Scenario.ToLowerInvariant()
 $TargetForegroundAtStart = $StartForegroundProcessId -eq $Process.Id
 $TargetForegroundAtEnd = $EndForegroundProcessId -eq $Process.Id
-if ($StartForegroundProcessId -eq 0 -or $EndForegroundProcessId -eq 0) {
+if ($Scenario -eq "tray-residency") {
+    if ($StartWindowSummary.Total -lt 1 -or $EndWindowSummary.Total -lt 1) {
+        $Failures.Add(
+            "tray-residency could not observe an owned top-level window " +
+            "(start=$($StartWindowSummary.Total) end=$($EndWindowSummary.Total))"
+        )
+    }
+    if ($StartWindowSummary.Visible -ne 0 -or $EndWindowSummary.Visible -ne 0) {
+        $Failures.Add(
+            "tray-residency had a visible top-level window " +
+            "(start=$($StartWindowSummary.Visible) end=$($EndWindowSummary.Visible))"
+        )
+    }
+}
+elseif ($StartForegroundProcessId -eq 0 -or $EndForegroundProcessId -eq 0) {
     $Failures.Add("foreground process could not be observed at both measurement boundaries")
 }
 elseif ($ScenarioLower.Contains("background")) {
@@ -310,6 +413,10 @@ $ProcessReport = [ordered]@{
         start_process_elapsed_secs = $StartProcessElapsed
         end_process_elapsed_secs = $EndProcessElapsed
         measured_wall_secs = $ElapsedSeconds
+        top_level_count_start = $StartWindowSummary.Total
+        top_level_count_end = $EndWindowSummary.Total
+        visible_count_start = $StartWindowSummary.Visible
+        visible_count_end = $EndWindowSummary.Visible
     }
     metrics = [ordered]@{
         cpu_delta_secs = $CpuDeltaSeconds
@@ -334,6 +441,8 @@ Write-Host "CPU one-core ratio : $([Math]::Round($CpuCoreRatio, 4))"
 Write-Host "App log growth     : $AppLogGrowth bytes"
 Write-Host "Perf log growth    : $PerfLogGrowth bytes"
 Write-Host "Target foreground  : start=$TargetForegroundAtStart end=$TargetForegroundAtEnd"
+Write-Host "Top-level windows  : start=$($StartWindowSummary.Total)/$($StartWindowSummary.Visible) visible " +
+    "end=$($EndWindowSummary.Total)/$($EndWindowSummary.Visible) visible"
 foreach ($Warning in $Warnings) {
     Write-Warning $Warning
 }

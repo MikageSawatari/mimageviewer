@@ -1807,8 +1807,6 @@ dependencies = [
 [[package]]
 name = "eframe"
 version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "457481173e6db5ca9fa2be93a58df8f4c7be639587aeb4853b526c6cf87db4e6"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -3929,7 +3927,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer"
-version = "2.10.0"
+version = "2.11.0"
 dependencies = [
  "ab_glyph",
  "base64",
@@ -4007,7 +4005,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-launcher"
-version = "2.10.0"
+version = "2.11.0"
 dependencies = [
  "sha2",
  "windows 0.61.3",

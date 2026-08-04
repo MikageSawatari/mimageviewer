@@ -742,7 +742,7 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
 自分で保証するか、`clamp_dynamic_for_gpu` を掛けてから格納する。UI スレッド側の
 同期 Triangle リサイズを増やさないこと。
 
-**静止画の GPU mipmap**:
+**mip chain を保持する経路**:
 
 - `DISPLAY_IMAGE_TEXTURE_OPTIONS` を指定した managed texture は、ローカル差し替えした
   `vendor/egui-wgpu` が level 0 upload 後に完全な mip chain を GPU render pass で生成する。
@@ -756,20 +756,15 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
   見開き、連結読み、ルーペ、pixel grid の座標系は変更しない。
 - animated frame、動画、サムネイル、mask、checker、UI texture は対象外。明示的な
   `PostFilter::Nearest` も level 0 + nearest sampler のまま。
-- 画像補正パネルの「フィルタ」に、全表示共通の
-  `image_mipmap_moire_reduction_enabled`（表示名「縮小表示のモアレを抑制する」）と
-  `image_mipmap_lod_bias`（表示名「より強く抑制」、0.0〜1.5）を置く。既定の ON / 0.0 は
-  v2.7.0 以降と同じ GPU 標準 LOD 選択であり、既定画質を変えない。ON かつ正値はより粗い
-  mip level へ寄せて中間縮小率のモアレを強く抑える。OFF は mip chain を保持したまま
-  `textureSampleLevel(..., 0.0)` 相当で level 0 固定にし、モアレ抑制より線のシャープさを優先する。
-  managed texture、wipe/diff 比較、360度パノラマはいずれも明示フラグを uniform で受ける。
-  ON では managed / 比較が `textureSampleBias`、パノラマが `textureSampleGrad` に渡す微分の
-  `2^bias` 倍を使う。ON/OFF と強度は uniform だけをライブ更新し、texture 再生成、再 upload、
-  cache invalidation は行わない。対象外 texture と `Nearest` の表示結果には影響しない。
+- 通常静止画の縮小は level 0 を入力に §2.4.1 の Lanczos3 出力を生成する。通常静止画向けの
+  LOD bias / level 0 切替 uniform と renderer setter は持たない。wipe/diff 比較は固定の
+  implicit mipmap sampling、360度パノラマは周期補正した勾配による `textureSampleGrad` を使う。
+  「縮小時のなめらかさ」は通常静止画の Lanczos3 支持幅だけを変更し、比較・パノラマには影響しない。
 - mip texture の partial update では全下位 level を再生成する。完全な chain の VRAM は level 0
   の約 1/3 増えるため、フルスクリーンの既存 prefetch / eviction 境界を越えて保持しない。
 
-詳細は [downscale-moire-lod-plan.md](downscale-moire-lod-plan.md) を参照。
+旧 LOD 設計の履歴は [downscale-moire-lod-plan.md](downscale-moire-lod-plan.md)、現在の決定は
+[dot-by-dot-and-downscale-plan.md](dot-by-dot-and-downscale-plan.md) を参照。
 
 **原寸表示とダウンスケール警告 (`source_dims`)**:
 
@@ -931,10 +926,21 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 1. 上記の優先順位で解決済みのページテクスチャと source / texture size
 2. 表示トリムの実効 content bbox
 3. 回転 (rotation_db, 0/90/180/270) と一時的なフリー回転
-4. フィットモードと自動フィット倍率制限
+4. viewport 固有の `pixels_per_point`、フィットモード、自動フィット倍率制限
 5. Zoom / Pan、または Z ズームの確定済み placement
-6. paint rect / hit rect / UV / source↔screen 写像 / total scale
+6. 物理ピクセル境界へ整列済みの paint rect / hit rect / UV / source↔screen 写像 / total scale
 ```
+
+`Original` (100% 原寸) と「拡大しない」「縮小しない」の 100% 基準は論理 1.0 倍ではなく
+`1.0 / pixels_per_point` とする。`pixels_per_point` は描画対象 viewport の `egui::Context`
+から取得し、main と DPI が異なり得る detached / frozen viewport では main の値を流用しない。
+実効物理倍率 `total_scale * pixels_per_point` が整数に十分近い場合だけ、最終描画矩形の
+**位置**を `round(position * pixels_per_point) / pixels_per_point` へ整列する。矩形サイズは
+倍率とアスペクト比を保つため丸めない。見開きは物理 px 単位で配置し、ページ間隔も
+`round(gap * pixels_per_point) / pixels_per_point` へ量子化する。連結読みは各ページ位置の
+累積ごとに同じ量子化を行い、長いページ列でも端数誤差を持ち越さない。
+見開きで高さ合わせを行う非整数倍率では、ページごとの実効倍率
+`total_scale * height_match_scale` をこの判定に使う。
 
 fit / trim / rotation / zoom-pan を overlay や入力処理が再計算してはならない。
 `draw_fs_image` は解決した transform 自身で描画し、その同じ値を次の consumer へ渡す:
@@ -956,11 +962,60 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 見開き / 連結読みのページ配置計算は引き続き `ui_fullscreen.rs` が担当し、その結果を
 `DisplayedImageTransform::from_resolved_rect` で共通レイアウトへ登録する。
 
+### 2.4.1 フルスクリーン静止画の GPU Lanczos3 縮小
+
+通常静止画は、上記の表示優先順位と
+`edit -> color -> final AI -> smart sharpen -> post_filter` の合成をすべて解決した**後**に、
+最終 paint 専用の `FullscreenPaintResource` へ包む。この段階は source cache や合成結果を
+置き換えず、ピクセル内容の優先順位・合成順序にも介入しない。
+
+`FullscreenPaintResource` は `Direct / Resampleable / Lanczos` の typed state で、全 variant が
+元の `TextureHandle` を保持する。レイアウト、trim UV、回転、hit-test、pixel grid は元ハンドルの
+`size_vec2()` から従来どおり `DisplayedImageTransform` が解決する。縮小時だけ separable
+Lanczos3 の native texture を別所有し、`DisplayedImageTransform::paint_texture` に渡す
+`TextureId` だけを差し替える (C-1)。shader は段階3 spike と同じもので、level 0 の
+`Rgba8Unorm` source を vertical `Rgba16Float`、horizontal `Rgba8Unorm` の 2 pass で
+直接リサンプルする。box mip 前縮小、倍率閾値、ヒステリシスは持たない。Lanczos4 は採用しない。
+画像補正パネルの「縮小時のなめらかさ」は 0〜100%・10% 刻みで、
+`blur = 1.0 + percent × 0.003`（1.00〜1.30）へ変換する。各軸の
+`filter_stretch = max(1, 1 / scale) × blur` とし、支持幅・重み・CPU 側の推定 fetch 数を
+同じ値から導出する。既定の 0% は blur 1.00 である。
+
+分岐は `total_scale * pixels_per_point` と
+`physical_scale_is_near_integer` を共通基準にする。
+
+- 1.0 未満: CPU 参照と同じ `floor(source × physical_scale)` の目標寸法へ Lanczos3。
+- 1.0: 元 `TextureId` を直接 paint し、段階1・2のドットバイドットを維持。
+- 1.0 超: 元 `TextureId` を直接 paint し、従来の post-filter 設定に従う。
+
+単ページ、見開きの各ページ、縦 / 横連結読み、page transition、nav / colorize holdover、
+detached single / spread / continuous frozen snapshot と keep-alive backstop は同じ typed
+resource を通る。見開きは高さ合わせ係数を含むページ別実効倍率を使う。ルーペは鮮明な元画素が
+必要なので `resolve_fs_processed_texture -> TextureHandle` の元経路、pixel grid は元論理寸法の
+まま。比較表示 (wipe/diff) と 360 度パノラマは既存 callback ownership、thumbnail、animated、
+動画、mask、checker、UI preview は direct 経路のままである。
+
+Lanczos cache は viewer context ごとに所有し、key は page idx、元 `TextureId`、
+`items_generation`、ページ別 `input_generation`、目標寸法、正規化済み smoothing percent
+から成る。設定値が変わると context 内の Lanczos 出力 cache を消去し、typed resource に保持した
+旧 percent と一致しない出力も再利用しない。回転・trim は full source
+出力を変えないため key に入れない。source ごとの直近 2 寸法、context 全体 64 entry の LRU とし、
+fullscreen close / invalidation / context park・swap / 連結読み keep-set に追従する。native
+`TextureId` は cache、holdover、snapshot が共有する `Arc` lease の最終 drop で free する。
+出力は `LanczosOutputs` として実寸・mip なしで VRAM 会計し、perf log の
+`gpu/lanczos_regenerate` に source / target、smoothing percent / blur、推定 fetch 数、
+encode + submit CPU 時間、累積再生成回数を記録する。
+
 静止画の最終フィット矩形は `fullscreen_media_rect` が所有する。下部ページシークバー固定時は
 `FS_SEEK_BAR_HEIGHT`、上部情報バー固定時は `TOP_BAR_HEIGHT` をそれぞれ `full_rect` から除外し、
 両方固定なら上下を同時に除外した同一矩形を、単ページ・見開き・連結読み・入力座標へ渡す。
 固定領域の予約は各バーの描画可否と同じ述語を使う。特に編集／注釈・範囲キャプチャ・音楽ビューで
 上部バーを抑止するときは `TOP_BAR_HEIGHT` も予約せず、非表示バー由来の黒帯を残さない。
+上端の原画プレビュー・スライドショー進捗インジケータと、下端の比較ピンインジケータも
+この同じ矩形を配置基準にし、固定バーの高さを個別の定数補正として重ねない。
+透過背景 (Shift+B) の変更通知は共通の feedback toast だけが担い、専用インジケータを持たない。
+同じ文言・同じ表示時間 (`FEEDBACK_TOAST_DURATION`) の表示を 2 系統に分けると、上部バー固定時に
+右上で重なるため。持続表示が要る原画プレビューと違い、モード変更の一時通知はトーストの役目である。
 上部情報バーの見開き2ページ情報は表示済み `fs_cache` / `ThumbnailState` / `image_metas` だけから
 構築し、HUD 描画のために同期ファイル I/O やアーカイブ読み込みを追加しない。AI 処理名と
 処理後解像度も current page の一時状態ではなくページ別の実効補正値・cache から解決し、
@@ -1024,7 +1079,7 @@ fit 解像度のまま (画像見開きは問題なし。PDF 見開きズーム�
 
 フィットメニュー下部の「拡大しない」「縮小しない」は `FullscreenFitScaleLimits` として
 自動フィット倍率にだけ適用する。つまりページ全体/横幅/縦幅が求めた `fit_scale`
-を 100% で clamp してから、ユーザー操作の `fs_zoom` を掛ける。明示的な Ctrl+ホイール、
+を物理 100% (`1.0 / pixels_per_point`) で clamp してから、ユーザー操作の `fs_zoom` を掛ける。明示的な Ctrl+ホイール、
 中ボタンドラッグ、ゲームパッド等の手動ズームは制限しない。`縮小しない` が ON の場合は
 ページ全体フィットでも 100% 表示で画面外へはみ出すことがあるため、`fullscreen_fit_allows_drag_pan`
 も true 扱いにしてパンできるようにする。
@@ -1147,11 +1202,15 @@ Ctrl+←/→ の「1 ページずらし」は `spread_mode` を保存し直さ�
 単独表示へ吸われず、先頭または横長ページ境界から一貫した見開き列として戻れる。
 横長ページ自体は単独ユニットのまま境界として扱い、自動的な表紙扱いにはしない:
 
-1. 各ページの表示サイズ (回転考慮) を算出し、高い方に揃えた連結幅・高さを計算
-2. `spread_page_gap_px` を左右ページの画面上の間隔として差し込み、フィットモードに応じた `fit_scale` を求める
-3. ズーム/パンを `(fit_scale * fs_zoom, image_rect.center() + fs_pan)` として合成し、合成中心から
-   左右ページ矩形を配置する (ズーム/パンは左右ページで共有、ページ間の分割位置は不変)
-4. ズーム/パンが有効なフレームでは `image_rect` にクリップして他の UI 領域へのはみ出しを防ぐ
+1. 各ページの表示サイズ (回転考慮) と content bbox から、従来どおり高い方へ揃えた
+   フィット候補 geometry を計算する
+2. `spread_page_gap_px` を左右ページの画面上の間隔として差し込み、フィットモードに応じた
+   `fit_scale` とズーム後の `total_scale` を求める
+3. `total_scale` の実効物理倍率が整数近傍なら高さ合わせを外し、各ページの固有寸法を保って
+   縦中央へ配置する。非整数ならフィット候補の高さ合わせを維持する
+4. ズーム/パンを `(fit_scale * fs_zoom, image_rect.center() + fs_pan)` として合成し、選択した
+   geometry の content center から左右ページ矩形を配置する
+5. ズーム/パンが有効なフレームでは `image_rect` にクリップして他の UI 領域へのはみ出しを防ぐ
 
 ページ単位表示のカラー化遷移も、この `SpreadDisplayUnit` / `resolve_spread_pair` と同じ境界を
 使う。表紙、末尾端数、横長ページは 1 ページ unit、通常見開きは画面順 2 ページ unit として
@@ -1159,6 +1218,10 @@ Ctrl+←/→ の「1 ページずらし」は `spread_mode` を保存し直さ�
 から得るため、遷移状態だけが別のペアを作ることはない。
 
 見開きのページ間隔は環境設定から変更でき、既定 4px、0px で左右ページを隙間なく接続する。
+実配置では対象 viewport の物理 px へ gap を丸め、物理整数倍率では DPI 125% / 150% でも
+各ページ原点を物理ピクセル境界へ着地させる。
+物理整数倍率では左右を同一倍率のまま縦中央へ揃えるため、元画像の高さが異なればノドに段差が
+生じる。これは片ページだけを非整数倍してぼかさず、物理 1:1 / 整数倍を守るための仕様である。
 見開き中も `rotation_db` の単独ページ回転 (R/L) は左右ページそれぞれに反映する。
 `fs_free_rotation` (Ctrl+ドラッグのフリー回転) は見開きに反映しないため、Ctrl+ドラッグは
 `handle_fs_wheel_and_click` 側で no-op にしている。
@@ -1177,6 +1240,9 @@ conceal、edit、final composite、comic、補正の完全mip chainをTextureId�
 通常見開きと同じ `spread_page_gap_px` を使う。見開き構成の縦連結 + 横幅フィットでは、
 表紙・横長ページ・端数の単独ページも仮想的な 2 ページ幅で fit scale を求め、実ページを中央寄せする。
 これにより表紙だけ横幅いっぱいに拡大されず、後続の見開きページと同じ倍率で読める。
+物理整数倍率では unit / page の累積位置を追加のたびに物理 px へ丸め、端数を次ページへ
+持ち越さない。連結読みの見開きユニットも通常見開きと同じ geometry 選択を使い、物理整数倍率では
+ページ固有の高さを保って縦中央へ配置し、非整数のフィット倍率では高さ合わせを維持する。
 表示トリムが有効なページは、各ページの見える bbox だけをユニット幅/高さとページ間 gap の基準にし、
 描画時も同じ bbox を UV に使う。見開きユニットでは左右の見える端が `spread_page_gap_px` で並ぶ。
 final composite / comic composite は厳密可視ページと準備帯を処理対象にし、キャッシュ済みの

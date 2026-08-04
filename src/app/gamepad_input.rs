@@ -5498,8 +5498,6 @@ impl App {
         }
         let modulo: u8 = if self.ai_upscale_enabled { 2 } else { 3 };
         self.fs_transparent_bg_mode = (self.fs_transparent_bg_mode + 1) % modulo;
-        self.fs_transparent_bg_indicator_until =
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(1200));
         self.show_feedback_toast(
             crate::ui_fullscreen::transparent_bg_toast(self.fs_transparent_bg_mode).to_string(),
         );

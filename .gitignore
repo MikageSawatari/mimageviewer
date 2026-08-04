@@ -1,5 +1,9 @@
 /target
 /target-*/
+# vendoring したクレート (vendor/eframe など) が持ち込む build 出力。
+# `/target` はリポジトリ直下しか外さないため、これが無いと vendor 配下の
+# target/ が丸ごと追跡されてしまう (2026-08-04 に 850MB 混入させた)。
+target/
 /testimage
 /test_images
 mimageviewer.log

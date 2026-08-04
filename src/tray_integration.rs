@@ -144,7 +144,9 @@ impl App {
         let _ = controller.set_resident_media_wake_enabled(false);
     }
 
-    /// Entering App::update consumes the one wake claimed by the tray thread.
+    /// Every `App::update` entry consumes the one wake claimed by the tray thread. A vendored
+    /// scheduler pass and a queued `WM_PAINT` are serialized on the winit main thread; whichever
+    /// enters first clears the claim so the 50 ms pump can post the next bounded media wake.
     pub(crate) fn acknowledge_tray_resident_media_wake(&self) {
         if let Some(controller) = self.tray_controller.as_ref() {
             controller.acknowledge_resident_media_wake();
@@ -179,10 +181,12 @@ impl App {
 
     /// ウィンドウを非表示にしてタスクトレイ状態へ遷移する。
     ///
-    /// **重要**: `ViewportCommand::Visible(false)` は使わない。どちらの hide でも通常の
-    /// `App::update` は止まるが、Win32 `ShowWindow(hwnd, SW_HIDE)` を直接使えばトレイスレッドが
-    /// App を経由せず復帰できる。active media だけは同スレッドの bounded WM_PAINT bridge が
-    /// UI-owned EOF state machine を進める。
+    /// **重要**: `ViewportCommand::Visible(false)` は使わない。Win32
+    /// `ShowWindow(hwnd, SW_HIDE)` を直接使うことで、トレイスレッドは App を経由せず復帰できる。
+    /// hidden 中は vendored eframe scheduler がアプリ要求済み repaint だけを 100 ms 以上の間隔で
+    /// direct UI pass として消化し、要求が無ければ sleep する。active media は別途、同スレッドの
+    /// bounded 50 ms `WM_PAINT` bridge が EOF / 次トラック遷移を駆動する。両入口は winit main
+    /// thread 上で直列化され、各 `App::update` 入口が bridge の pending claim を ack する。
     ///
     /// サイズ保存について: hide の直前に `GetWindowPlacement` で rect を丸ごと捕獲しておき、
     /// 復帰時に `SetWindowPlacement` で完全復元する。eframe/winit の DPI 丸めを完全に

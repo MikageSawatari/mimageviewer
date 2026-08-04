@@ -611,3 +611,38 @@ ui.allocate_ui_with_layout(
 内容量に合わせてコンパクトにしたいパネルでは、前フレームの
 `ScrollAreaOutput::content_size.y` を保存し、その値を次フレームの確保高さに使う。
 この場合も、親領域を確保してから `ScrollArea` を置く点は同じ。
+
+---
+
+## 11. hidden / トレイ常駐中の repaint 契約 (2026-08-03)
+
+Windows の非表示 HWND は通常の `RedrawRequested` を返さない。したがって repaint scheduler は
+「要求時刻が来たら `ControlFlow::Poll` にして OS redraw を待つ」という可視 window 用の契約を
+そのまま hidden / minimized window に適用してはならない。eframe 0.33.3 のこの欠陥が、
+トレイ格納後に `App::update` は止まっているのに main thread が 1 コアを占有する原因だった。
+計装と producer / consumer の詳細は
+[tray-residency-cpu-spin-investigation.md](tray-residency-cpu-spin-investigation.md) を参照する。
+
+このプロジェクトの契約は次のとおり。
+
+- visible window は従来どおり `request_redraw` → OS `RedrawRequested` → `run_ui_and_paint` で消化する。
+- invisible / minimized window の期限到来 repaint は vendored eframe が直接 `run_ui_and_paint` して
+  消化する。hidden window に対して `ControlFlow::Poll` は設定しない。
+- hidden 中にアプリが要求した repaint は最短 100 ms に制限する。direct pass 後は既存時刻と
+  `now + 100 ms` の最大値だけを採用し、即時要求を後ろへ送る一方、先の予定を早めない。既存要求の
+  無い still / paused tray resident に heartbeat を作らない。
+- Pending thumbnail、worker completion、fullscreen cleanup など個々の producer に
+  `tray_active` guard を追加しない。producer を黙らせると復帰時の完成通知や viewport command を
+  失うため、consumer である scheduler 側を正しくする。
+- active resident media だけは既存 tray thread の bounded 50 ms `WM_PAINT` bridge を使う。
+  scheduler direct pass と bridge callback は同じ winit main thread 上で直列化され、全 update 入口が
+  bridge の単一 pending claim を ack する。EOF resolver / typed handoff まで wake projection を維持
+  するため、動画・音楽の EOF / 次トラック遷移は scheduler の 100 ms 下限ではなく 50 ms 粒度で
+  進む。open / restore / quit / external activation の wake 経路も変更しない。
+- hidden 時の `sleep`、無条件 `Wait`、repaint 全消去は CPU を薄めるだけ、または正当な wake を
+  失うため禁止する。
+
+この契約は root / fullscreen / detached の全 native window に共通だが、detached viewer の
+predicate、viewport identity、host / presenter ownership は変更しない。event-loop scheduler を
+変更した場合は `cargo test -p mimageviewer --lib` に加え、vendored eframe の hidden repaint unit test と
+`check-idle-health.ps1 -Scenario tray-residency` を実行する。

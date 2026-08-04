@@ -409,6 +409,7 @@ mod local_adjust_segmentation_tests {
                 fit_mode: crate::settings::FullscreenFitMode::Page,
                 fit_scale_limits:
                     crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                pixels_per_point: 1.0,
                 placement: crate::displayed_image_transform::ResolvedDisplayPlacement::Normal {
                     zoom_pan: None,
                 },
@@ -8186,8 +8187,7 @@ fn draw_sliders(
     colorize_slots: &mut crate::colorize::ColorizePresetSlots,
     creative_luts: &[crate::creative_lut::CreativeLutEntry],
     creative_lut_library: &crate::creative_lut::CreativeLutLibrary,
-    image_mipmap_moire_reduction_enabled: &mut bool,
-    image_mipmap_lod_bias: &mut f32,
+    downscale_smoothing_percent: &mut u32,
     ai_feature_mode: crate::settings::AiFeatureMode,
     ai_denoise_disabled_limit: Option<crate::ai::upscale::AiProcessSizeLimit>,
     ai_upscale_disabled_limit: Option<crate::ai::upscale::AiProcessSizeLimit>,
@@ -8653,49 +8653,40 @@ fn draw_sliders(
         ui.add_space(4.0);
 
         // ── 縮小表示とポストフィルタ (レトロ系 + 写真系エフェクト) ──
-        let moire_toggle = ui.checkbox(
-            image_mipmap_moire_reduction_enabled,
-            "縮小表示のモアレを抑制する",
-        )
-        .on_hover_text(
-            "ON: 縮小時のモアレやちらつきを抑えます。\nOFF: 線のくっきりさを優先しますが、モアレが出やすくなります。",
-        );
-        settings_changed |= moire_toggle.changed();
-        ui.indent("image_mipmap_moire_reduction_controls", |ui| {
-            ui.add_enabled_ui(*image_mipmap_moire_reduction_enabled, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("より強く抑制:");
-                    if *image_mipmap_lod_bias > 0.001
-                        && ui
-                            .small_button("↩")
-                            .on_hover_text("標準の 0.0 に戻す")
-                            .clicked()
-                    {
-                        *image_mipmap_lod_bias = 0.0;
-                        settings_changed = true;
-                    }
-                });
-                let strength_response = ui
-                    .add(
-                        egui::Slider::new(image_mipmap_lod_bias, 0.0..=1.5)
-                            .step_by(0.1)
-                            .fixed_decimals(1),
-                    )
-                    .on_hover_text(
-                        "全画像・全ウィンドウ共通。値を上げるほどモアレを強く抑え、\n\
-                 通常の写真やイラストは少し柔らかく見えます。\n\
-                 目安: 0.0=標準、0.5=抑制、1.0=強い抑制。",
-                    );
-                if strength_response.dragged() {
-                    dragging = true;
-                }
-                if strength_response.drag_stopped()
-                    || (strength_response.changed() && !strength_response.dragged())
-                {
-                    settings_changed = true;
-                }
-            });
+        ui.horizontal(|ui| {
+            ui.label("縮小時のなめらかさ");
+            if *downscale_smoothing_percent != crate::settings::DOWNSCALE_SMOOTHING_PERCENT_MIN
+                && ui
+                    .small_button("↩")
+                    .on_hover_text("既定の 0% に戻す")
+                    .clicked()
+            {
+                *downscale_smoothing_percent = crate::settings::DOWNSCALE_SMOOTHING_PERCENT_MIN;
+                settings_changed = true;
+            }
         });
+        let smoothing_response = ui
+            .add(
+                egui::Slider::new(
+                    downscale_smoothing_percent,
+                    crate::settings::DOWNSCALE_SMOOTHING_PERCENT_MIN
+                        ..=crate::settings::DOWNSCALE_SMOOTHING_PERCENT_MAX,
+                )
+                .step_by(crate::settings::DOWNSCALE_SMOOTHING_PERCENT_STEP as f64)
+                .suffix("%"),
+            )
+            .on_hover_text(
+                "縮小表示で網点やトーンのちらつきが気になるときに上げます。\n\
+                 上げるほど細部は柔らかくなります",
+            );
+        if smoothing_response.dragged() {
+            dragging = true;
+        }
+        if smoothing_response.drag_stopped()
+            || (smoothing_response.changed() && !smoothing_response.dragged())
+        {
+            settings_changed = true;
+        }
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(4.0);
@@ -14041,8 +14032,7 @@ impl App {
                             &mut self.settings.colorize_preset_slots,
                             &self.settings.creative_luts,
                             &self.creative_lut_library,
-                            &mut self.settings.image_mipmap_moire_reduction_enabled,
-                            &mut self.settings.image_mipmap_lod_bias,
+                            &mut self.settings.downscale_smoothing_percent,
                             self.settings.ai_feature_mode,
                             ai_denoise_disabled_limit,
                             ai_upscale_disabled_limit,

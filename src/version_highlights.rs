@@ -531,6 +531,25 @@ const TABLE: &[VersionHighlights] = &[
                    既定は今までと同じ見え方のままです。",
         }],
     },
+    VersionHighlights {
+        version: "2.11.0",
+        must_read: &[
+            HighlightItem {
+                title: "原寸表示は画面のピクセル基準になりました",
+                body: "「100%原寸」「拡大しない」「縮小しない」は、画面のピクセルと画像のピクセルが\
+                       1対1で対応する表示になりました。Windows側で拡大縮小（125%・150%など）を\
+                       設定している場合、同じ画像がこれまでより小さく表示されます。\
+                       そのぶん線や文字はくっきりします。",
+            },
+            HighlightItem {
+                title: "縮小表示の画質と設定が変わりました",
+                body: "縮小表示の画質を改善し、これまでのモアレ抑制の設定は\
+                       「縮小時のなめらかさ」に変わりました。網点やトーンのちらつきが\
+                       気になるときに値を上げてください。上げるほど細部は柔らかくなります。",
+            },
+        ],
+        highlights: &[],
+    },
 ];
 
 #[cfg(test)]
@@ -812,6 +831,18 @@ mod tests {
             .expect("クリック表示モードの highlights がある");
         assert!(click_to_show.body.contains("別のファイルへ移動すると"));
         assert!(!click_to_show.body.contains("入り直したりしても維持"));
+    }
+
+    #[test]
+    fn embedded_table_contains_v2_11_0_must_read_entries() {
+        let entries = for_version("2.11.0", table());
+        assert_eq!(versions(&entries), ["2.11.0"]);
+        let entry = entries[0];
+        assert!(entry.highlights.is_empty());
+        assert_eq!(entry.must_read.len(), 2);
+        assert!(entry.must_read[0].body.contains("1対1"));
+        assert!(entry.must_read[0].body.contains("拡大縮小"));
+        assert!(entry.must_read[1].body.contains("縮小時のなめらかさ"));
     }
 
     #[test]

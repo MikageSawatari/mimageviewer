@@ -45,6 +45,7 @@ PID との整合性と計測窓の有効性を確認するもので、独立し�
 .\scripts\check-idle-health.ps1 -NoLaunch -Scenario static-background
 .\scripts\check-idle-health.ps1 -NoLaunch -Scenario video-pin-background `
     -TargetKey 'D:\media\video-pin-folder'
+.\scripts\check-idle-health.ps1 -NoLaunch -Scenario tray-residency
 ```
 
 既存の対象プロセスを明示する場合は `-ProcessId <PID>` を使う。そのプロセスが
@@ -53,7 +54,7 @@ PID との整合性と計測窓の有効性を確認するもので、独立し�
 結果は `target/idle-health/` に 2 ファイル出る。
 
 - `*-perf.json`: update / repaint / work 反復の解析結果
-- `*-process.json`: CPU / ログ増加量と、両検査を統合した最終 PASS / FAIL
+- `*-process.json`: CPU / ログ増加量、top-level / visible window 数と、両検査を統合した最終 PASS / FAIL
 
 スクリプトは失敗時に exit 1 を返す。起動した mImageViewer は追加シナリオを続けられるよう
 終了させないので、検査後に通常操作で完全終了する。
@@ -66,6 +67,25 @@ PID との整合性と計測窓の有効性を確認するもので、独立し�
 2. 同じ状態を背面へ移して静止 (`static-background`)
 3. 動画を代表画像に固定したフォルダを keep 範囲内へ置き、背面で静止
    (`video-pin-background`)
+4. サムネイルが多いフォルダを開き、読込完了前に閉じてトレイへ格納したまま静止
+   (`tray-residency`)
+
+`tray-residency` は Enter 前に手動で close-to-tray を行う。**トレイ常駐は既定 OFF** なので、
+先に環境設定 →「タスクトレイ常駐」→「アプリを閉じる代わりに、タスクトレイに常駐する」を
+ON にしてから `[×]` で閉じる。**最小化では成立しない** — Win32 では最小化したウィンドウも
+`IsWindowVisible` が真を返すため。
+
+warmup 後の測定開始時と 15 秒後の終了時に、対象 PID が top-level window を 1 個以上所有し、
+その visible window 数がどちらも 0 であることを必須にする。これにより「単に別ウィンドウの
+背面に置いた」測定をトレイ常駐として誤採用しない。
+
+visible の数え方は**利用者から見えるウィンドウに限る**。framework が作る隠せない top-level
+window を数えるとこのゲートは永久に通らない。除外するのは `Winit Thread Event Target`
+(winit の 15x15 イベント受け窓。常に `WS_VISIBLE`)、`IME` / `MSCTFIME UI` (Windows が
+スレッドごとに作る IME ヘルパ) と、64x64 未満のウィンドウ (名前を挙げていないヘルパ用の
+保険)。2026-08-04 にトレイ常駐中の core を実際に列挙して確認した: メインウィンドウを隠すと
+visible が 2 → 1 に減り、残った 1 個が winit のイベント受け窓だった。CPU one-core ratio と perf / log gate は他シナリオと共通で、
+paused media / still は完全 sleep、active media はこの静止シナリオの対象外とする。
 
 `video-pin-background` では、動画を代表画像に固定したフォルダのパスを `-TargetKey` で渡す。
 この値は perf log の thumbnail event の `key` に対して、大文字小文字を無視した部分一致で
@@ -126,4 +146,6 @@ python scripts\test_analyze_perf.py
 ```
 
 このテストは `scripts/build-dist.ps1` の先頭でも必ず実行され、解析ゲート自体の退行がある
-状態では配布ビルドへ進まない。
+状態では配布ビルドへ進まない。hidden repaint scheduler の純ロジックは vendored eframe の
+unit test で production の throttle 関数に対して「即時要求を最短 100 ms 後へ送る」
+「既に先の予定を早めない」「既存要求の無い window に heartbeat を挿入しない」を検査する。

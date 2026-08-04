@@ -254,6 +254,11 @@ VRAM 検出失敗時も 4 GiB 行と同じ HIGH 約 429M texel となり、旧�
 推定式は使わない。小さく有界な checker、stamp、font preview、mask preview、音楽 timeline 等は
 対象外とする。
 
+v2.11.0 段階4 では、通常静止画の GPU Lanczos3 出力を `LanczosOutputs` として追加した。
+出力 native `TextureId` と実 texture 寸法を mip なしで数え、main / active・paused detached
+viewer-context cache、detached snapshot / frozen page を同じ accountant で重複排除する。
+連結読みのページ集合別見積もりでは cache key の page owner で絞り、対象外ページを混ぜない。
+
 perf が有効なときだけ約 1 秒間隔で cat=`gpu` / kind=`vram_accounting` を出し、全 texel/byte、
 pool とモード別上限、subsystem ごとの texel/byte を記録する。この第 2 段では全 Tier 共通の
 逐次調停は追加せず、上記 2 モード配分だけを eviction/admission へ接続する。
