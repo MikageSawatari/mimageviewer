@@ -163,6 +163,10 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   実 root は `subfolder_expansion_root`、実際の走査起点は `subfolder_expansion_roots` に保持する。`last_folder`、通常フォルダ履歴、
   コンテナ★、catalog `delete_missing` など実フォルダ前提の処理には載せない。
   既存の★フィルタ、タグ、詳細表示、場所 facet、画像色フィルタ、Ctrl+F 現在地フィルタは実パス item に対して使える。
+  サブ展開中の場所表示は、走査起点の選択とは独立して、サブ展開を押した実フォルダ
+  (`subfolder_expansion_root`) からの相対パスに統一する。root 自身は「(直下)」、root 外など
+  相対化できないパスはフルパスへフォールバックする。このラベルは場所 facet、選択情報、
+  ツールチップ、詳細表示の任意列「場所」で共有する。
   画像色フィルタは画像だけを対象にし、大量件数では通常フォルダと同じ確認ゲートを挟む。表示順は現在のソート設定に従い、
   同値は root 相対の親フォルダとフルパスで安定化する。ソート変更時は保持中の
   スナップショットをメモリ内で再ソートし、ファイルシステムは再走査しない。サブ展開ビュー上でも
@@ -354,7 +358,7 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
 - 設定で指定した **列数** の可変グリッド（行数は画面に応じて自動）
 - 各セルはアスペクト比を維持してサムネイルを表示（余白はセル背景色で埋める）
 - セルサイズ = ウィンドウの残余領域 ÷ 列数
-- 選択中セルの下にはサムネイル情報ツールチップを表示する。既定はファイル名と画像解像度、動画・音声ではファイル名と長さ、ZIP / PDF / 画像のみフォルダ / 親 ZIP 内の子 ZIP・RAR / 直読み RAR ではページ数も表示する。表示内容は環境設定 → 表示 → サムネイルで、種類 / ページ数 / サイズ / 更新日時 / 作成日時 / 動画解像度 / コーデック / 親フォルダ名 / 場所 (フルパス) / 閲覧履歴の最終閲覧 / 閲覧履歴の閲覧位置を切り替えられる (長さ・コーデックは動画・音声の両方)。閲覧履歴ビューでは、ホバー tooltip に場所 (フルパス) / 最終閲覧日時 / 閲覧位置を表示する (複数フォルダ・ドライブの同名本を場所で判別できるようにする)。ツールチップ幅はセル幅固定ではなく最大約 2.5 セル分を使い、画面右端ではセル右端に合わせて画面内に収める。ページ数や長さなど未取得の値は選択中の 1 件だけバックグラウンドで遅延取得する
+- サムネイル表示では、選択中セルの下にサムネイル情報ツールチップを表示する。既定はファイル名と画像解像度、動画・音声ではファイル名と長さ、ZIP / PDF / 画像のみフォルダ / 親 ZIP 内の子 ZIP・RAR / 直読み RAR ではページ数も表示する。表示内容は環境設定 → 表示 → サムネイルで、種類 / ページ数 / サイズ / 更新日時 / 作成日時 / 動画解像度 / コーデック / 親フォルダ名 / 場所 / 閲覧履歴の最終閲覧 / 閲覧履歴の閲覧位置を切り替えられる (長さ・コーデックは動画・音声の両方)。閲覧履歴ビューでは、ホバー tooltip に場所 / 最終閲覧日時 / 閲覧位置を表示する (複数フォルダ・ドライブの同名本を場所で判別できるようにする)。ツールチップ幅はセル幅固定ではなく最大約 2.5 セル分を使い、画面右端ではセル右端に合わせて画面内に収める。ページ数や長さなど未取得の値は選択中の 1 件だけバックグラウンドで遅延取得する。詳細表示では行のテキストツールチップを出さず、列と下部情報バーで同じ情報を確認する。ただし、プレビューアイコンへ重ねたときに別 viewport で開く大きなサムネイルプレビューは維持する
 - **仮想スクロール実装**（下記詳細参照）
 
 ---
@@ -1417,7 +1421,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 |--------|-----|---------|------|
 | `grid_cols` | usize | 4 | サムネイルグリッド列数（1〜10） |
 | `grid_view_mode` | GridViewMode | Thumbnail | グリッドの表示モード。`Thumbnail` は従来のサムネイルグリッド、`Details` は行ベースの詳細一覧 |
-| `details_sort_key` | DetailsSortKey | Toolbar | 詳細表示モードの列ヘッダソートキー。`Toolbar` はツールバーのロード時ソート順、ほかに Name / Rating / Tags / Kind / Size / Modified / Created / State / ImageDimensions / VideoDuration / VideoDimensions / VideoCodec |
+| `details_sort_key` | DetailsSortKey | Toolbar | 詳細表示モードの列ヘッダソートキー。`Toolbar` はツールバーのロード時ソート順、ほかに Name / Rating / Tags / Kind / PageCount / Place / Size / Modified / Created / State / ImageDimensions / VideoDuration / VideoDimensions / VideoCodec |
 | `details_sort_ascending` | bool | true | 詳細表示モードの列ソート方向。`true` は昇順、`false` は降順 |
 | `details_size_display_mode` | DetailsSizeDisplayMode | Optimal | 詳細表示モードのサイズ列表示。`Optimal` は B / KB / MB / GB から自動選択、固定モードは Bytes / KB / MB |
 | `details_timestamp_show_seconds` | bool | false | 詳細表示モードの更新日時 / 作成日時を秒まで表示するか |
@@ -1431,6 +1435,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `details_show_tags` | bool | true | 詳細表示モードで `タグ` 列を表示するか |
 | `details_show_kind` | bool | true | 詳細表示モードで `種類` 列を表示するか |
 | `details_show_page_count` | bool | true | 詳細表示モードで遅延ロード列 `ページ数` を表示するか。ZIP / PDF / 画像のみフォルダ / 親 ZIP 内の子 ZIP・RAR / 直読み RAR が対象 |
+| `details_show_place` | bool | false | 詳細表示モードで `場所` 列を表示するか。サブ展開中は押した実フォルダからの相対パス、それ以外は場所 facet と同じラベルを表示する。列順 / 列幅 / ソートキーの `Place` は旧版向けに保存用 clone から carrier へ退避し、読み込み後に復元する |
 | `details_show_size` | bool | true | 詳細表示モードで `サイズ` 列を表示するか |
 | `details_show_modified` | bool | true | 詳細表示モードで `更新日時` 列を表示するか |
 | `details_show_created` | bool | false | 詳細表示モードで遅延ロード列 `作成日時` を表示するか |
@@ -1449,6 +1454,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `details_selection_bar_show_tags` | bool | true | セット C で `タグ` 列を表示するか |
 | `details_selection_bar_show_kind` | bool | true | セット C で `種類` 列を表示するか |
 | `details_selection_bar_show_page_count` | bool | true | セット C で遅延ロード列 `ページ数` を表示するか |
+| `details_selection_bar_show_place` | bool | false | セット C で `場所` 列を表示するか。専用列順 / 列幅の `Place` も旧版向け carrier へ退避する |
 | `details_selection_bar_show_size` | bool | true | セット C で `サイズ` 列を表示するか |
 | `details_selection_bar_show_modified` | bool | true | セット C で `更新日時` 列を表示するか |
 | `details_selection_bar_show_created` | bool | false | セット C で遅延ロード列 `作成日時` を表示するか |
@@ -1460,7 +1466,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `facet_filter` | FacetFilter | default | スマートフィルタ条件。種類・拡張子・タグ・日付・サイズ・状態・AI モデル・生成ツールなど。サイズは従来 4 区分または `FacetSizeValue` の数値 + KB / MB / GB による最小 / 最大範囲で、下限を含み上限を含まない。Range は旧版向けに保存用クローンの `size_extended_stash` へ退避し、読み込み後に復元する。場所条件はセッション中の一時状態で、フォルダ / ZIP / PDF / 仮想ビューの移動時に解除し、設定には保存しない。絞り込み中に ZIP/PDF/フォルダなどのコンテナへ入ると親階層の条件を一時退避し、内側では別条件を設定できる。Backspace などで親階層へ戻ると退避した条件を復元する |
 | `thumb_aspect` | ThumbAspect | Square | サムネイル縦横比（16:9 / 3:2 / 4:3 / 1:1 / 3:4 / 2:3 / 9:16）。`thumb_aspect_auto = false` のときに使われる。Auto モード時もこの値は手動値として保持され、Manual に戻すと復活する。 |
 | `thumb_aspect_auto` | bool | false | サムネイル比率の自動選択モード。`true` のときフォルダ内画像の比率に応じてグリッドセル比率を自動で切り替える。フォルダおよび安定したブックマーク仮想一覧ごとの前回確定値は `auto_aspect_cache.db` に保存され、再訪時の初期比率に使われる。ブックマーク一覧は非同期再構築前の空一覧段階から前回値を復元し、毎回 `1:1` を経由しない。キャッシュ復元時は保存時の sample 数と同等以上の実測 sample が集まるまで、途中統計による上書きを抑制する。キャッシュ管理ダイアログの現在フォルダ削除 / 全削除 / 古いキャッシュ削除で、この判定結果も対応する範囲だけ削除される (詳細: [auto-thumb-aspect-plan.md](auto-thumb-aspect-plan.md))。 |
-| `selection_info_display_mode` | SelectionInfoDisplayMode | Tooltip | 一覧の選択情報をツールチップ / 下部情報バーのどこへ出すか。`Tooltip` / `BottomBar` / `Both` / `Hidden`。未知値は sanitize で `Tooltip` に正規化する。下部情報バーはグリッドの `CentralPanel` より先に「ヘッダ + カーソル位置の 1 行 + solid 横スクロールバー専用レーン」の高さを予約し、データ行は選択やアイテム操作を受け付けない。サムネイル表示時は常にセット A、詳細表示時は `details_selection_bar_mode` に従ってセット A / C / 非表示を選ぶ。A/C ともプレビュー列は自動除外し、その幅は空白として予約せず名前列へ移す。バーのヘッダは列幅ドラッグ、一覧全体を母集団にした best-fit、編集対象に応じた右クリック列メニューを持つが、ソートと列順ドラッグは持たない。詳細表示のバーのメニューでは A / C をその場で切り替えられる。実際に表示する遅延列だけ、ツールチップ設定に関係なく選択中の 1 件をバックグラウンドで読み込む |
+| `selection_info_display_mode` | SelectionInfoDisplayMode | Tooltip | 一覧の選択情報をツールチップ / 下部情報バーのどこへ出すか。`Tooltip` / `BottomBar` / `Both` / `Hidden`。未知値は sanitize で `Tooltip` に正規化する。下部情報バーはグリッドの `CentralPanel` より先に「ヘッダ + カーソル位置の 1 行 + solid 横スクロールバー専用レーン」の高さを予約し、データ行は選択やアイテム操作を受け付けない。サムネイル表示時は常にセット A、詳細表示時は `details_selection_bar_mode` に従ってセット A / C / 非表示を選ぶ。A/C ともプレビュー列は自動除外し、その幅は空白として予約せず名前列へ移す。バーのヘッダは列幅ドラッグ、列境界ダブルクリックによる一覧全体を母集団にした best-fit、列順ドラッグ、編集対象に応じた右クリック列メニューを持つが、ソートは持たない。列順ドラッグはセット A 使用時に `details_column_order`、専用セット C 使用時に `details_selection_bar_column_order` だけを書き換え、バーに描かないプレビュー列の位置は保持する。詳細表示のバーのメニューでは A / C をその場で切り替えられる。実際に表示する遅延列だけ、ツールチップ設定に関係なく選択中の 1 件をバックグラウンドで読み込む |
 | `grid_click_selection_mode` | GridClickSelectionMode | Explorer | サムネイル / 詳細表示に共通のクリック選択方式。`Explorer` は通常クリックで単一選択、空白クリックで全解除、Ctrl で個別トグル、Shift でアンカーからの範囲へ置換する。`Check` は通常 / 空白クリックで既存チェックを維持し、Shift 範囲を追加する。v2.9.0 の重要な変更点が表示対象になる更新後初回だけ `Explorer` へ切り替え、以後ユーザーが `Check` へ戻した設定は上書きしない。新しい移行フラグは持たず、`previous_last_seen_version` と重要な変更点の選択結果から導出する。未知値は sanitize で `Check` に正規化する |
 | `grid_cursor_wrap` | bool | false | サムネイル / 詳細表示の矢印キー相当のカーソル移動を端でループする。左右は一覧の先頭 / 末尾をつなぎ、上下は同じ列の先頭行 / 最終有効行をつなぐ。Home / End / PageUp / PageDown と、詳細表示でのゲームパッド左右ページ移動は対象外 |
 | `thumb_tooltip_show_filename` | bool | true | 選択情報にファイル名を表示するか |

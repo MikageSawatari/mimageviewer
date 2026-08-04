@@ -14,6 +14,15 @@ use std::time::{Duration, Instant};
 
 const MAX_SUBFOLDER_EXPANSION_DEPTH: u32 = crate::settings::SUBFOLDER_EXPANSION_MAX_DEPTH_DEFAULT;
 
+pub(crate) fn relative_place_label(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    if relative.as_os_str().is_empty() {
+        Some("(直下)".to_string())
+    } else {
+        Some(relative.display().to_string())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SubfolderExpansionDepthChoice {
     RootOnly,
@@ -2386,6 +2395,29 @@ fn remove_paths_from_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_place_labels_use_the_pressed_root() {
+        let root = PathBuf::from(r"C:\library");
+        assert_eq!(
+            relative_place_label(&root, &root).as_deref(),
+            Some("(直下)")
+        );
+
+        let deep = root.join("ID203").join("thumb");
+        assert_eq!(
+            relative_place_label(&root, &deep),
+            Some(Path::new("ID203").join("thumb").display().to_string())
+        );
+
+        // 複数起点から走査しても、表示基準は各起点ではなくボタンを押した root のまま。
+        let selected_root = root.join("ID203");
+        assert_eq!(
+            relative_place_label(&root, &selected_root),
+            Some("ID203".to_string())
+        );
+        assert_eq!(relative_place_label(&root, Path::new(r"D:\outside")), None);
+    }
 
     fn test_scan_options(image_folder_books: bool) -> SubfolderExpansionOptions {
         SubfolderExpansionOptions {

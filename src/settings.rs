@@ -672,6 +672,7 @@ pub enum DetailsSortKey {
     Tags,
     Kind,
     PageCount,
+    Place,
     Size,
     Modified,
     Created,
@@ -691,6 +692,7 @@ impl DetailsSortKey {
             Self::Tags => "タグ",
             Self::Kind => "種類",
             Self::PageCount => "ページ数",
+            Self::Place => "場所",
             Self::Size => "サイズ",
             Self::Modified => "更新日時",
             Self::Created => "作成日時",
@@ -779,6 +781,7 @@ pub enum DetailsColumnId {
     Tags,
     Kind,
     PageCount,
+    Place,
     Size,
     Modified,
     Created,
@@ -798,6 +801,7 @@ impl DetailsColumnId {
             Self::Tags,
             Self::Kind,
             Self::PageCount,
+            Self::Place,
             Self::Size,
             Self::Modified,
             Self::Created,
@@ -2983,6 +2987,9 @@ pub struct Settings {
     /// 保存時だけ旧版が読める `Toolbar` へ退避し、読み込み後に戻す。
     #[serde(default)]
     pub(crate) details_page_count_sort_stash: bool,
+    /// 旧版が知らない `DetailsSortKey::Place` の保存用キャリア。
+    #[serde(default)]
+    pub(crate) details_place_sort_stash: bool,
     #[serde(default = "default_details_sort_ascending")]
     pub details_sort_ascending: bool,
     #[serde(default)]
@@ -3000,6 +3007,15 @@ pub struct Settings {
     pub(crate) details_page_count_column_index_stash: Option<usize>,
     #[serde(default)]
     pub(crate) details_page_count_column_width_stash: Option<f32>,
+    /// 旧版が知らない場所列の位置・幅を、旧版が無視する追加フィールドへ退避する。
+    #[serde(default)]
+    pub(crate) details_place_column_index_stash: Option<usize>,
+    #[serde(default)]
+    pub(crate) details_place_column_width_stash: Option<f32>,
+    #[serde(default)]
+    pub(crate) details_selection_bar_place_column_index_stash: Option<usize>,
+    #[serde(default)]
+    pub(crate) details_selection_bar_place_column_width_stash: Option<f32>,
     #[serde(default = "default_true")]
     pub details_show_preview: bool,
     #[serde(default = "default_true")]
@@ -3010,6 +3026,8 @@ pub struct Settings {
     pub details_show_kind: bool,
     #[serde(default = "default_true")]
     pub details_show_page_count: bool,
+    #[serde(default)]
+    pub details_show_place: bool,
     #[serde(default = "default_true")]
     pub details_show_size: bool,
     #[serde(default = "default_true")]
@@ -3052,6 +3070,8 @@ pub struct Settings {
     pub details_selection_bar_show_kind: bool,
     #[serde(default = "default_true")]
     pub details_selection_bar_show_page_count: bool,
+    #[serde(default)]
+    pub details_selection_bar_show_place: bool,
     #[serde(default = "default_true")]
     pub details_selection_bar_show_size: bool,
     #[serde(default = "default_true")]
@@ -4831,6 +4851,7 @@ impl Default for Settings {
             grid_cursor_wrap: false,
             details_sort_key: DetailsSortKey::default(),
             details_page_count_sort_stash: false,
+            details_place_sort_stash: false,
             details_sort_ascending: default_details_sort_ascending(),
             details_size_display_mode: DetailsSizeDisplayMode::default(),
             details_timestamp_show_seconds: false,
@@ -4839,6 +4860,10 @@ impl Default for Settings {
             details_column_widths: Vec::new(),
             details_page_count_column_index_stash: None,
             details_page_count_column_width_stash: None,
+            details_place_column_index_stash: None,
+            details_place_column_width_stash: None,
+            details_selection_bar_place_column_index_stash: None,
+            details_selection_bar_place_column_width_stash: None,
             details_name_width_auto: true,
             details_name_width: default_details_name_width(),
             details_show_preview: true,
@@ -4846,6 +4871,7 @@ impl Default for Settings {
             details_show_tags: true,
             details_show_kind: true,
             details_show_page_count: true,
+            details_show_place: false,
             details_show_size: true,
             details_show_modified: true,
             details_show_created: false,
@@ -4862,6 +4888,7 @@ impl Default for Settings {
             details_selection_bar_show_tags: true,
             details_selection_bar_show_kind: true,
             details_selection_bar_show_page_count: true,
+            details_selection_bar_show_place: false,
             details_selection_bar_show_size: true,
             details_selection_bar_show_modified: true,
             details_selection_bar_show_created: false,
@@ -6267,6 +6294,99 @@ impl Settings {
         }
     }
 
+    /// 場所列を、この列を知らない旧版が deserialize できる形へ退避する。
+    ///
+    /// `PageCount` と同じく、live state ではなく永続化用 clone にだけ適用する。
+    /// 下部情報バー専用の列設定もリリース済みフィールドなので、そこに `Place` を
+    /// 残すと旧版が未知 variant で設定全体を隔離するため、同じ carrier へ退避する。
+    pub(crate) fn stash_details_place_for_persist(&mut self) {
+        self.details_place_sort_stash = matches!(self.details_sort_key, DetailsSortKey::Place);
+        if self.details_place_sort_stash {
+            self.details_sort_key = DetailsSortKey::Toolbar;
+        }
+
+        self.details_place_column_index_stash = self
+            .details_column_order
+            .iter()
+            .position(|column| *column == DetailsColumnId::Place);
+        self.details_column_order
+            .retain(|column| *column != DetailsColumnId::Place);
+
+        self.details_place_column_width_stash = self
+            .details_column_widths
+            .iter()
+            .find(|entry| entry.column == DetailsColumnId::Place)
+            .map(|entry| entry.width);
+        self.details_column_widths
+            .retain(|entry| entry.column != DetailsColumnId::Place);
+
+        self.details_selection_bar_place_column_index_stash = self
+            .details_selection_bar_column_order
+            .iter()
+            .position(|column| *column == DetailsColumnId::Place);
+        self.details_selection_bar_column_order
+            .retain(|column| *column != DetailsColumnId::Place);
+
+        self.details_selection_bar_place_column_width_stash = self
+            .details_selection_bar_column_widths
+            .iter()
+            .find(|entry| entry.column == DetailsColumnId::Place)
+            .map(|entry| entry.width);
+        self.details_selection_bar_column_widths
+            .retain(|entry| entry.column != DetailsColumnId::Place);
+    }
+
+    fn restore_details_place_after_load(&mut self) {
+        if std::mem::take(&mut self.details_place_sort_stash) {
+            self.details_sort_key = DetailsSortKey::Place;
+        }
+
+        if let Some(index) = self.details_place_column_index_stash.take()
+            && !self.details_column_order.contains(&DetailsColumnId::Place)
+        {
+            self.details_column_order.insert(
+                index.min(self.details_column_order.len()),
+                DetailsColumnId::Place,
+            );
+        }
+
+        if let Some(width) = self.details_place_column_width_stash.take()
+            && !self
+                .details_column_widths
+                .iter()
+                .any(|entry| entry.column == DetailsColumnId::Place)
+        {
+            self.details_column_widths.push(DetailsColumnWidth {
+                column: DetailsColumnId::Place,
+                width,
+            });
+        }
+
+        if let Some(index) = self.details_selection_bar_place_column_index_stash.take()
+            && !self
+                .details_selection_bar_column_order
+                .contains(&DetailsColumnId::Place)
+        {
+            self.details_selection_bar_column_order.insert(
+                index.min(self.details_selection_bar_column_order.len()),
+                DetailsColumnId::Place,
+            );
+        }
+
+        if let Some(width) = self.details_selection_bar_place_column_width_stash.take()
+            && !self
+                .details_selection_bar_column_widths
+                .iter()
+                .any(|entry| entry.column == DetailsColumnId::Place)
+        {
+            self.details_selection_bar_column_widths
+                .push(DetailsColumnWidth {
+                    column: DetailsColumnId::Place,
+                    width,
+                });
+        }
+    }
+
     /// 詳細一覧の列設定一式を、詳細表示中の下部情報バー専用設定へ複製する。
     ///
     /// モードは変更しない。モード遷移を所有する呼び出し側が、専用設定へ切り替わる
@@ -6279,6 +6399,7 @@ impl Settings {
         self.details_selection_bar_show_tags = self.details_show_tags;
         self.details_selection_bar_show_kind = self.details_show_kind;
         self.details_selection_bar_show_page_count = self.details_show_page_count;
+        self.details_selection_bar_show_place = self.details_show_place;
         self.details_selection_bar_show_size = self.details_show_size;
         self.details_selection_bar_show_modified = self.details_show_modified;
         self.details_selection_bar_show_created = self.details_show_created;
@@ -6501,6 +6622,7 @@ impl Settings {
             });
         }
         self.restore_details_page_count_after_load();
+        self.restore_details_place_after_load();
         sanitize_details_column_order(&mut self.details_column_order);
         sanitize_details_column_widths(&mut self.details_column_widths);
         sanitize_details_column_order(&mut self.details_selection_bar_column_order);
@@ -6624,6 +6746,7 @@ impl Settings {
         self.details_show_tags = src.details_show_tags;
         self.details_show_kind = src.details_show_kind;
         self.details_show_page_count = src.details_show_page_count;
+        self.details_show_place = src.details_show_place;
         self.details_show_size = src.details_show_size;
         self.details_show_modified = src.details_show_modified;
         self.details_show_created = src.details_show_created;
@@ -6641,6 +6764,7 @@ impl Settings {
         self.details_selection_bar_show_tags = src.details_selection_bar_show_tags;
         self.details_selection_bar_show_kind = src.details_selection_bar_show_kind;
         self.details_selection_bar_show_page_count = src.details_selection_bar_show_page_count;
+        self.details_selection_bar_show_place = src.details_selection_bar_show_place;
         self.details_selection_bar_show_size = src.details_selection_bar_show_size;
         self.details_selection_bar_show_modified = src.details_selection_bar_show_modified;
         self.details_selection_bar_show_created = src.details_selection_bar_show_created;
@@ -6991,6 +7115,10 @@ mod tests {
         assert_eq!(
             settings.details_selection_bar_show_page_count,
             settings.details_show_page_count
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_place,
+            settings.details_show_place
         );
         assert_eq!(
             settings.details_selection_bar_show_size,
@@ -7999,6 +8127,176 @@ mod tests {
         assert!(!loaded.details_page_count_sort_stash);
         assert!(loaded.details_page_count_column_index_stash.is_none());
         assert!(loaded.details_page_count_column_width_stash.is_none());
+    }
+
+    #[test]
+    fn place_details_stash_keeps_persisted_form_compatible() {
+        let mut settings = Settings::default();
+        settings.details_sort_key = DetailsSortKey::Place;
+        settings.details_column_order = vec![
+            DetailsColumnId::Preview,
+            DetailsColumnId::Name,
+            DetailsColumnId::Place,
+            DetailsColumnId::Size,
+        ];
+        settings.details_column_widths = vec![
+            DetailsColumnWidth {
+                column: DetailsColumnId::Place,
+                width: 180.0,
+            },
+            DetailsColumnWidth {
+                column: DetailsColumnId::Size,
+                width: 128.0,
+            },
+        ];
+        settings.details_selection_bar_column_order = vec![
+            DetailsColumnId::Preview,
+            DetailsColumnId::Name,
+            DetailsColumnId::Place,
+            DetailsColumnId::Kind,
+        ];
+        settings.details_selection_bar_column_widths = vec![DetailsColumnWidth {
+            column: DetailsColumnId::Place,
+            width: 220.0,
+        }];
+
+        let mut persisted = settings.clone();
+        persisted.stash_details_place_for_persist();
+        let json = serde_json::to_value(&persisted).unwrap();
+
+        #[derive(serde::Deserialize, Debug, PartialEq, Eq)]
+        enum PreviousDetailsSortKey {
+            Toolbar,
+            Name,
+            Rating,
+            Tags,
+            Kind,
+            PageCount,
+            Size,
+            Modified,
+            Created,
+            State,
+            ImageDimensions,
+            VideoDuration,
+            VideoDimensions,
+            VideoCodec,
+        }
+        #[derive(serde::Deserialize, Debug, PartialEq, Eq)]
+        enum PreviousDetailsColumnId {
+            Preview,
+            Name,
+            Rating,
+            Tags,
+            Kind,
+            PageCount,
+            Size,
+            Modified,
+            Created,
+            State,
+            ImageDimensions,
+            VideoDuration,
+            VideoDimensions,
+            VideoCodec,
+        }
+        #[derive(serde::Deserialize)]
+        struct PreviousDetailsColumnWidth {
+            column: PreviousDetailsColumnId,
+            width: f32,
+        }
+        #[derive(serde::Deserialize)]
+        struct PreviousSettings {
+            details_sort_key: PreviousDetailsSortKey,
+            details_column_order: Vec<PreviousDetailsColumnId>,
+            details_column_widths: Vec<PreviousDetailsColumnWidth>,
+            details_selection_bar_column_order: Vec<PreviousDetailsColumnId>,
+            details_selection_bar_column_widths: Vec<PreviousDetailsColumnWidth>,
+        }
+
+        let previous: PreviousSettings = serde_json::from_value(json.clone())
+            .expect("previous shape must ignore the place-column carriers");
+        assert_eq!(previous.details_sort_key, PreviousDetailsSortKey::Toolbar);
+        assert_eq!(
+            previous.details_column_order,
+            vec![
+                PreviousDetailsColumnId::Preview,
+                PreviousDetailsColumnId::Name,
+                PreviousDetailsColumnId::Size,
+            ]
+        );
+        assert_eq!(
+            previous.details_selection_bar_column_order,
+            vec![
+                PreviousDetailsColumnId::Preview,
+                PreviousDetailsColumnId::Name,
+                PreviousDetailsColumnId::Kind,
+            ]
+        );
+        assert_eq!(previous.details_column_widths.len(), 1);
+        assert_eq!(
+            previous.details_column_widths[0].column,
+            PreviousDetailsColumnId::Size
+        );
+        assert!((previous.details_column_widths[0].width - 128.0).abs() < 0.1);
+        assert!(previous.details_selection_bar_column_widths.is_empty());
+
+        let mut loaded: Settings = serde_json::from_value(json).unwrap();
+        loaded.sanitize();
+        assert_eq!(loaded.details_sort_key, DetailsSortKey::Place);
+        assert_eq!(
+            loaded
+                .details_column_order
+                .iter()
+                .position(|column| *column == DetailsColumnId::Place),
+            Some(2)
+        );
+        assert!(loaded.details_column_widths.iter().any(|entry| {
+            entry.column == DetailsColumnId::Place && (entry.width - 180.0).abs() < 0.1
+        }));
+        assert_eq!(
+            loaded
+                .details_selection_bar_column_order
+                .iter()
+                .position(|column| *column == DetailsColumnId::Place),
+            Some(2)
+        );
+        assert!(
+            loaded
+                .details_selection_bar_column_widths
+                .iter()
+                .any(|entry| {
+                    entry.column == DetailsColumnId::Place && (entry.width - 220.0).abs() < 0.1
+                })
+        );
+        assert!(!loaded.details_place_sort_stash);
+        assert!(loaded.details_place_column_index_stash.is_none());
+        assert!(loaded.details_place_column_width_stash.is_none());
+        assert!(
+            loaded
+                .details_selection_bar_place_column_index_stash
+                .is_none()
+        );
+        assert!(
+            loaded
+                .details_selection_bar_place_column_width_stash
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extended_details_column_stashes_preserve_relative_order() {
+        let mut settings = Settings::default();
+        settings.details_column_order = DetailsColumnId::default_order().to_vec();
+        let expected = settings.details_column_order.clone();
+
+        let mut persisted = settings.clone();
+        // sanitize restores PageCount before Place, so persistence removes them in reverse.
+        persisted.stash_details_place_for_persist();
+        persisted.stash_details_page_count_for_persist();
+        let json = serde_json::to_string(&persisted).unwrap();
+
+        let mut loaded: Settings = serde_json::from_str(&json).unwrap();
+        loaded.sanitize();
+        assert_eq!(loaded.details_column_order, expected);
     }
 
     #[test]

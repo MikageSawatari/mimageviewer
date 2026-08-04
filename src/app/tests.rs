@@ -6082,6 +6082,60 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
+    fn facet_place_label_is_relative_only_in_subfolder_expansion_view() {
+        let mut app = setup_app();
+        let root = std::path::PathBuf::from(r"C:\library");
+        let selected_root = root.join("ID203");
+        let deep = selected_root.join("thumb");
+
+        assert_eq!(
+            app.facet_place_label_for_path(&deep),
+            deep.display().to_string(),
+            "通常ビューでは従来どおりフルパスを表示する"
+        );
+
+        app.items_are_subfolder_expansion_view = true;
+        app.subfolder_expansion_root = Some(root.clone());
+        app.subfolder_expansion_roots = vec![selected_root];
+        assert_eq!(
+            app.facet_place_label_for_path(&deep),
+            std::path::Path::new("ID203")
+                .join("thumb")
+                .display()
+                .to_string(),
+            "複数起点でも押下位置の root を基準にする"
+        );
+        assert_eq!(app.facet_place_label_for_path(&root), "(直下)");
+
+        let outside = std::path::PathBuf::from(r"D:\outside");
+        assert_eq!(
+            app.facet_place_label_for_path(&outside),
+            outside.display().to_string(),
+            "root 外は既存のフルパス表記へフォールバックする"
+        );
+    }
+
+    #[test]
+    fn details_place_sort_uses_the_shared_place_label() {
+        let mut app = setup_app();
+        let root = std::path::PathBuf::from(r"C:\library");
+        app.items = vec![
+            crate::grid_item::GridItem::Image(root.join("B").join("page.jpg")),
+            crate::grid_item::GridItem::Image(root.join("A").join("page.jpg")),
+        ];
+        app.visible_indices = vec![0, 1];
+        app.details_order = app.visible_indices.clone();
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_show_place = true;
+        app.items_are_subfolder_expansion_view = true;
+        app.subfolder_expansion_root = Some(root);
+
+        app.set_details_sort_key(crate::settings::DetailsSortKey::Place);
+
+        assert_eq!(app.details_order, vec![1, 0]);
+    }
+
+    #[test]
     fn facet_place_filter_clears_when_scope_changes() {
         use crate::grid_item::{GridItem, ThumbnailState};
 

@@ -42941,6 +42941,12 @@ impl App {
     }
 
     pub(crate) fn facet_place_label_for_path(&self, path: &Path) -> String {
+        if self.items_are_subfolder_expansion_view
+            && let Some(root) = self.subfolder_expansion_root.as_deref()
+            && let Some(label) = subfolder_expansion::relative_place_label(root, path)
+        {
+            return label;
+        }
         self.book_address_label_for_path(path)
             .unwrap_or_else(|| path.display().to_string())
     }
@@ -43691,6 +43697,7 @@ impl App {
             DetailsSortKey::Tags => self.settings.details_show_tags,
             DetailsSortKey::Kind => self.settings.details_show_kind,
             DetailsSortKey::PageCount => self.settings.details_show_page_count,
+            DetailsSortKey::Place => self.settings.details_show_place,
             DetailsSortKey::Size => self.settings.details_show_size,
             DetailsSortKey::Modified => self.settings.details_show_modified,
             DetailsSortKey::Created => self.settings.details_show_created,
@@ -43820,6 +43827,11 @@ impl App {
             DetailsSortKey::PageCount => {
                 DetailsSortPrimary::U64(self.details_page_count_sort_value(idx))
             }
+            DetailsSortKey::Place => DetailsSortPrimary::Text(
+                self.facet_place_path_for_idx(idx)
+                    .map(|path| self.facet_place_label_for_path(&path))
+                    .unwrap_or_default(),
+            ),
             DetailsSortKey::Size => {
                 DetailsSortPrimary::I64(self.details_meta_value(idx).map(|(_, size)| size))
             }

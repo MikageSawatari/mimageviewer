@@ -484,6 +484,9 @@ impl SettingsDb {
         // v2.5.0 が知らない enum variant は、旧版が無視できる追加フィールドへ退避した
         // clone を永続化する。live state は変更しない。
         let mut persisted = settings.clone();
+        // Column carriers are restored PageCount -> Place during sanitize, so remove them
+        // in the reverse order to preserve their relative positions when both are present.
+        persisted.stash_details_place_for_persist();
         persisted.stash_details_page_count_for_persist();
         persisted.facet_filter.stash_kind_audio_for_persist();
         persisted.facet_filter.stash_extended_date_for_persist();
@@ -3631,6 +3634,56 @@ mod tests {
         assert_eq!(read("details_page_count_sort_stash"), "true");
         assert_eq!(read("details_page_count_column_index_stash"), "2");
         assert_eq!(read("details_page_count_column_width_stash"), "96.0");
+    }
+
+    #[test]
+    fn place_details_are_persisted_without_unknown_variants() {
+        let dir = TempDir::new().unwrap();
+        let mut settings = Settings::default();
+        settings.details_sort_key = crate::settings::DetailsSortKey::Place;
+        settings.details_column_order = vec![
+            crate::settings::DetailsColumnId::Name,
+            crate::settings::DetailsColumnId::Place,
+            crate::settings::DetailsColumnId::Size,
+        ];
+        settings.details_column_widths = vec![crate::settings::DetailsColumnWidth {
+            column: crate::settings::DetailsColumnId::Place,
+            width: 180.0,
+        }];
+        settings.details_selection_bar_column_order = vec![
+            crate::settings::DetailsColumnId::Name,
+            crate::settings::DetailsColumnId::Place,
+        ];
+        settings.details_selection_bar_column_widths = vec![crate::settings::DetailsColumnWidth {
+            column: crate::settings::DetailsColumnId::Place,
+            width: 220.0,
+        }];
+
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&settings).unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("settings.db")).unwrap();
+        let read = |key: &str| -> String {
+            conn.query_row(
+                "SELECT value FROM settings_kv WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(read("details_sort_key"), r#""Toolbar""#);
+        assert!(!read("details_column_order").contains("Place"));
+        assert!(!read("details_column_widths").contains("Place"));
+        assert!(!read("details_selection_bar_column_order").contains("Place"));
+        assert!(!read("details_selection_bar_column_widths").contains("Place"));
+        assert_eq!(read("details_place_sort_stash"), "true");
+        assert_eq!(read("details_place_column_index_stash"), "1");
+        assert_eq!(read("details_place_column_width_stash"), "180.0");
+        assert_eq!(read("details_selection_bar_place_column_index_stash"), "1");
+        assert_eq!(
+            read("details_selection_bar_place_column_width_stash"),
+            "220.0"
+        );
     }
 
     #[test]
