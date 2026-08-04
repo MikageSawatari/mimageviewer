@@ -70,10 +70,21 @@ PID との整合性と計測窓の有効性を確認するもので、独立し�
 4. サムネイルが多いフォルダを開き、読込完了前に閉じてトレイへ格納したまま静止
    (`tray-residency`)
 
-`tray-residency` は Enter 前に手動で close-to-tray を行う。warmup 後の測定開始時と
-15 秒後の終了時に、対象 PID が top-level window を 1 個以上所有し、その visible window 数が
-どちらも 0 であることを必須にする。これにより「単に別ウィンドウの背面に置いた」測定を
-トレイ常駐として誤採用しない。CPU one-core ratio と perf / log gate は他シナリオと共通で、
+`tray-residency` は Enter 前に手動で close-to-tray を行う。**トレイ常駐は既定 OFF** なので、
+先に環境設定 →「タスクトレイ常駐」→「アプリを閉じる代わりに、タスクトレイに常駐する」を
+ON にしてから `[×]` で閉じる。**最小化では成立しない** — Win32 では最小化したウィンドウも
+`IsWindowVisible` が真を返すため。
+
+warmup 後の測定開始時と 15 秒後の終了時に、対象 PID が top-level window を 1 個以上所有し、
+その visible window 数がどちらも 0 であることを必須にする。これにより「単に別ウィンドウの
+背面に置いた」測定をトレイ常駐として誤採用しない。
+
+visible の数え方は**利用者から見えるウィンドウに限る**。framework が作る隠せない top-level
+window を数えるとこのゲートは永久に通らない。除外するのは `Winit Thread Event Target`
+(winit の 15x15 イベント受け窓。常に `WS_VISIBLE`)、`IME` / `MSCTFIME UI` (Windows が
+スレッドごとに作る IME ヘルパ) と、64x64 未満のウィンドウ (名前を挙げていないヘルパ用の
+保険)。2026-08-04 にトレイ常駐中の core を実際に列挙して確認した: メインウィンドウを隠すと
+visible が 2 → 1 に減り、残った 1 個が winit のイベント受け窓だった。CPU one-core ratio と perf / log gate は他シナリオと共通で、
 paused media / still は完全 sleep、active media はこの静止シナリオの対象外とする。
 
 `video-pin-background` では、動画を代表画像に固定したフォルダのパスを `-TargetKey` で渡す。

@@ -29,6 +29,7 @@ if (-not ("MivIdleHealthNative" -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 public static class MivIdleHealthNative {
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
@@ -45,6 +46,44 @@ public static class MivIdleHealthNative {
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool IsWindowVisible(IntPtr hWnd);
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetClassName(IntPtr hWnd, StringBuilder buffer, int maxCount);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+
+    // Framework-internal top-level windows that the app cannot hide and that the
+    // user never sees. Counting them makes the tray gate unpassable:
+    //   Winit Thread Event Target - winit's 15x15 event sink, always WS_VISIBLE
+    //   IME / MSCTFIME UI         - the per-thread IME helpers Windows creates
+    // Verified 2026-08-04 by enumerating a tray-resident core: hiding the real
+    // main window took the visible count from 2 to 1, and the survivor was the
+    // winit event target.
+    static readonly string[] HelperClasses = {
+        "Winit Thread Event Target",
+        "IME",
+        "MSCTFIME UI",
+    };
+
+    static bool IsUserFacing(IntPtr hWnd) {
+        if (!IsWindowVisible(hWnd)) { return false; }
+        var name = new StringBuilder(256);
+        GetClassName(hWnd, name, name.Capacity);
+        string cls = name.ToString();
+        foreach (string helper in HelperClasses) {
+            if (cls == helper) { return false; }
+        }
+        // Backstop for helpers we have not named: nothing the user can see is tiny.
+        RECT r;
+        if (GetWindowRect(hWnd, out r) && (r.Right - r.Left < 64 || r.Bottom - r.Top < 64)) {
+            return false;
+        }
+        return true;
+    }
+
     public static int[] GetTopLevelWindowCounts(uint processId) {
         int total = 0;
         int visible = 0;
@@ -53,7 +92,7 @@ public static class MivIdleHealthNative {
             GetWindowThreadProcessId(hWnd, out ownerProcessId);
             if (ownerProcessId == processId) {
                 total++;
-                if (IsWindowVisible(hWnd)) {
+                if (IsUserFacing(hWnd)) {
                     visible++;
                 }
             }
