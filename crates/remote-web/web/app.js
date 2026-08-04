@@ -52,6 +52,8 @@ import {
   viewerSeekState,
   viewerSpreadLayout,
   viewerWheelCommand,
+  zoomedPageTargetPx,
+  shouldRequestZoomedResolution,
 } from "./command-core.mjs";
 import {
   loadLocalSettings,
@@ -84,6 +86,7 @@ const SESSION_PING_INTERVAL_MS = 30_000;
 const READING_PROGRESS_INTERVAL_MS = 30_000;
 const AI_FOREGROUND_POLL_MS = 500;
 const AI_RETRY_DELAYS_MS = Object.freeze([1000, 2000, 5000]);
+const ZOOM_RESOLUTION_SETTLE_MS = 180;
 const AI_TERMINAL_STATES = new Set([
   "ready",
   "superseded",
@@ -3215,6 +3218,7 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
       address: entryAddress(entry),
       target_px: request.width,
       name: entry.name,
+      request,
     }))
   ).catch((error) => state.remoteAiController?.showRequestError(error));
   state.commandMenu?.refreshAdjustment();
@@ -3357,6 +3361,21 @@ function imageRequest(
     dpr,
     layout: resolvedLayout,
     fitMode: state.fitMode,
+  };
+}
+
+function pageRequestAtTarget(request, targetPx) {
+  if (!request?.url) return null;
+  const target = Math.max(1, Math.min(8192, Math.round(Number(targetPx) || 1)));
+  const url = new URL(request.url, window.location.origin);
+  url.searchParams.set("w", String(target));
+  url.searchParams.delete("prefetch");
+  return {
+    ...request,
+    url: url.toString(),
+    cacheKey: request.cacheKey ? `${request.cacheKey}\nzoomed:${target}` : null,
+    width: target,
+    prefetch: false,
   };
 }
 
@@ -6101,6 +6120,48 @@ function createRemoteAiRequestId(groupHash) {
   return `miv-ai:${groupHash}:${unique}`;
 }
 
+export function remoteAiZoomDispatchDecision({
+  aiEnabled,
+  startPosted = false,
+  jobState = null,
+  readyPageCount = null,
+}) {
+  if (aiEnabled === false) return "none";
+  if (startPosted) return "wait";
+  if (jobState && !AI_TERMINAL_STATES.has(jobState)) return "wait";
+  if (jobState === "ready" && Number(readyPageCount) <= 0) return "none";
+  if (jobState && jobState !== "ready") return "none";
+  return "start";
+}
+
+export function zoomResolutionPerfEvent({
+  resultKind,
+  fitDisplayedAt,
+  zoomRequestedAt,
+  replacedAt,
+  pageCount,
+  requestedTargets,
+  bytes = 0,
+  fitAiCompletedAt = null,
+  zoomJobStartedAt = null,
+}) {
+  const duration = (end, start) => Number.isFinite(end) && Number.isFinite(start)
+    ? roundMs(Math.max(0, end - start))
+    : null;
+  return {
+    type: "zoom_resolution",
+    result_kind: resultKind,
+    page_count: Math.max(0, Number(pageCount) || 0),
+    requested_targets: requestedTargets.map((value) => Math.max(1, Number(value) || 1)),
+    bytes: Math.max(0, Number(bytes) || 0),
+    fit_display_to_zoom_request_ms: duration(zoomRequestedAt, fitDisplayedAt),
+    zoom_request_to_replace_ms: duration(replacedAt, zoomRequestedAt),
+    fit_display_to_replace_ms: duration(replacedAt, fitDisplayedAt),
+    fit_ai_complete_to_zoom_job_ms: duration(zoomJobStartedAt, fitAiCompletedAt),
+    zoom_job_to_replace_ms: duration(replacedAt, zoomJobStartedAt),
+  };
+}
+
 export class RemoteAiController {
   constructor(viewer, stage) {
     this.viewer = viewer;
@@ -6116,6 +6177,17 @@ export class RemoteAiController {
     this.hideTimer = 0;
     this.retryIndex = 0;
     this.destroyed = false;
+    this.resolutionTier = "fit";
+    this.fitDisplayedAt = null;
+    this.zoomRequestedAt = null;
+    this.zoomBasePromise = null;
+    this.zoomFetchController = null;
+    this.aiEnabled = null;
+    this.jobTier = "fit";
+    this.startPosted = false;
+    this.fitReadyIndexes = [];
+    this.fitAiCompletedAt = null;
+    this.zoomJobStartedAt = null;
 
     this.root = element("div", "viewer-ai-status");
     this.root.hidden = true;
@@ -6135,15 +6207,28 @@ export class RemoteAiController {
   async displayGroup(pages) {
     const normalized = pages
       .filter((page) => page?.address)
-      .map((page) => ({
+      .map((page, viewerPageIndex) => ({
         address: page.address,
         target_px: Math.max(1, Math.round(Number(page.target_px) || 1)),
+        zoom_target_px: zoomedPageTargetPx(page.target_px),
+        zoom_request: pageRequestAtTarget(page.request, zoomedPageTargetPx(page.target_px)),
+        viewer_page_index: viewerPageIndex,
         name: String(page.name || "画像"),
       }));
     if (!normalized.length || normalized.length > 2) return;
     const groupHash = remoteAiGroupHash(normalized);
     this.displayVersion += 1;
     this.clearPoll();
+    this.zoomFetchController?.abort();
+    this.zoomFetchController = null;
+    this.zoomBasePromise = null;
+    this.resolutionTier = "fit";
+    this.fitDisplayedAt = performance.now();
+    this.zoomRequestedAt = null;
+    this.jobTier = "fit";
+    this.fitReadyIndexes = [];
+    this.fitAiCompletedAt = null;
+    this.zoomJobStartedAt = null;
     if (groupHash === this.groupHash && this.job) {
       this.pages = normalized;
       await this.handleSnapshot(this.job, this.generation);
@@ -6155,7 +6240,110 @@ export class RemoteAiController {
     this.requestId = null;
     this.job = null;
     this.appliedIdentity = "";
+    this.aiEnabled = null;
+    this.startPosted = false;
     this.hide();
+    if (document.visibilityState === "hidden") return;
+    if (await this.recoverCurrent(generation)) return;
+    await this.startIfEnabled(generation);
+  }
+
+  hasZoomedResolution() {
+    return this.resolutionTier === "zoomed";
+  }
+
+  readyViewerPageIndexes(snapshot = this.job) {
+    return (snapshot?.page_outcomes ?? [])
+      .filter((outcome) => outcome.state === "ready")
+      .map((outcome) => this.pages[Number(outcome.page_index)]?.viewer_page_index)
+      .filter((index) => Number.isInteger(index));
+  }
+
+  async requestZoomed() {
+    if (this.destroyed || this.resolutionTier === "zoomed" || !this.pages.length) return false;
+    const changedPages = this.pages.filter((page) =>
+      page.zoom_request && page.zoom_target_px > page.target_px
+    );
+    this.resolutionTier = "zoomed";
+    if (!changedPages.length) return false;
+    this.zoomRequestedAt = performance.now();
+    const displayVersion = this.displayVersion;
+    const readyIndexes = new Set(this.fitReadyIndexes);
+    const basePages = readyIndexes.size
+      ? changedPages.filter((page) => !readyIndexes.has(page.viewer_page_index))
+      : changedPages;
+    this.zoomFetchController?.abort();
+    const controller = new AbortController();
+    this.zoomFetchController = controller;
+    this.zoomBasePromise = (async () => {
+      if (!basePages.length) return true;
+      const resources = await Promise.all(basePages.map((page) =>
+        pageResourceCache.loadForeground(page.zoom_request, controller.signal)
+      ));
+      if (controller.signal.aborted || displayVersion !== this.displayVersion) return false;
+      const replacements = resources.map((resource, index) => ({
+        pageIndex: basePages[index].viewer_page_index,
+        blob: resource.blob,
+        alt: basePages[index].name,
+      }));
+      const replaced = await this.viewer.replacePageBlobs(replacements);
+      if (!replaced || controller.signal.aborted || displayVersion !== this.displayVersion) {
+        return false;
+      }
+      const replacedAt = performance.now();
+      enqueueTelemetry(zoomResolutionPerfEvent({
+        resultKind: "source",
+        fitDisplayedAt: this.fitDisplayedAt,
+        zoomRequestedAt: this.zoomRequestedAt,
+        replacedAt,
+        pageCount: replacements.length,
+        requestedTargets: basePages.map((page) => page.zoom_target_px),
+        bytes: resources.reduce((sum, resource) => sum + resource.blob.size, 0),
+      }));
+      return true;
+    })().catch((error) => {
+      if (error?.name !== "AbortError") recordClientError("zoom_resolution_load", error);
+      return false;
+    });
+    await this.zoomBasePromise;
+    if (displayVersion !== this.displayVersion || controller.signal.aborted) return false;
+    await this.promoteZoomAi();
+    return true;
+  }
+
+  async promoteZoomAi() {
+    if (this.destroyed || this.resolutionTier !== "zoomed" || this.jobTier === "zoomed") return;
+    const readyPageCount = this.job?.state === "ready"
+      ? this.readyViewerPageIndexes(this.job).length
+      : null;
+    const decision = remoteAiZoomDispatchDecision({
+      aiEnabled: this.aiEnabled,
+      startPosted: this.startPosted,
+      jobState: this.job?.state ?? null,
+      readyPageCount,
+    });
+    if (decision !== "start") return;
+    await this.beginZoomAiGroup();
+  }
+
+  async beginZoomAiGroup() {
+    if (
+      this.jobTier === "zoomed" ||
+      !this.pages.some((page) => page.zoom_target_px > page.target_px)
+    ) return;
+    const generation = ++this.generation;
+    this.clearPoll();
+    this.pages = this.pages.map((page) => ({
+      ...page,
+      target_px: page.zoom_target_px,
+    }));
+    this.groupHash = remoteAiGroupHash(this.pages);
+    this.requestId = null;
+    this.job = null;
+    this.appliedIdentity = "";
+    this.jobTier = "zoomed";
+    this.startPosted = false;
+    this.zoomJobStartedAt = performance.now();
     if (document.visibilityState === "hidden") return;
     if (await this.recoverCurrent(generation)) return;
     await this.startIfEnabled(generation);
@@ -6170,16 +6358,25 @@ export class RemoteAiController {
       return response.adjustment_state;
     }));
     if (!this.isCurrent(generation)) return;
-    if (!adjustmentStates.some((adjustment) => adjustment?.effective_ai_enabled === true)) {
+    this.aiEnabled = adjustmentStates.some(
+      (adjustment) => adjustment?.effective_ai_enabled === true
+    );
+    if (!this.aiEnabled) {
       this.hide();
       return;
     }
     this.requestId = createRemoteAiRequestId(this.groupHash);
     this.show("準備しています", { cancellable: true });
-    const snapshot = await apiPostJson("/api/ai/jobs", {
-      request_id: this.requestId,
-      pages: this.pages.map(({ address, target_px }) => ({ address, target_px })),
-    });
+    this.startPosted = true;
+    let snapshot;
+    try {
+      snapshot = await apiPostJson("/api/ai/jobs", {
+        request_id: this.requestId,
+        pages: this.pages.map(({ address, target_px }) => ({ address, target_px })),
+      });
+    } finally {
+      if (this.isCurrent(generation)) this.startPosted = false;
+    }
     if (!this.isCurrent(generation)) return;
     await this.handleSnapshot(snapshot, generation);
   }
@@ -6249,6 +6446,21 @@ export class RemoteAiController {
     }
     this.clearPoll();
     if (snapshot.state === "ready") {
+      if (this.jobTier === "fit") this.fitAiCompletedAt = performance.now();
+      if (
+        this.jobTier === "fit" &&
+        this.resolutionTier === "zoomed" &&
+        this.pages.some((page) => page.zoom_target_px > page.target_px)
+      ) {
+        await this.zoomBasePromise;
+        if (!this.isCurrent(generation) || this.job?.job_id !== snapshot.job_id) return;
+        if (this.readyViewerPageIndexes(snapshot).length > 0) {
+          await this.beginZoomAiGroup();
+        } else {
+          await this.applyReady(snapshot, generation);
+        }
+        return;
+      }
       await this.applyReady(snapshot, generation);
       return;
     }
@@ -6289,9 +6501,11 @@ export class RemoteAiController {
         const detail = await response.clone().json().catch(() => ({}));
         throw new Error(detail.message || "AI 処理後の画像を取得できませんでした。");
       }
+      const blob = await response.blob();
       return {
-        pageIndex,
-        blob: await response.blob(),
+        pageIndex: this.pages[pageIndex]?.viewer_page_index ?? pageIndex,
+        blob,
+        bytes: blob.size,
         alt: this.pages[pageIndex]?.name || "AI 処理後の画像",
       };
     }));
@@ -6299,6 +6513,25 @@ export class RemoteAiController {
     const replaced = await this.viewer.replacePageBlobs(replacements);
     if (!replaced || !this.isCurrent(generation)) return;
     this.appliedIdentity = appliedIdentity;
+    if (this.jobTier === "fit") {
+      this.fitReadyIndexes = replacements.map((replacement) => replacement.pageIndex);
+    } else if (this.jobTier === "zoomed") {
+      const replacedAt = performance.now();
+      enqueueTelemetry(zoomResolutionPerfEvent({
+        resultKind: "ai",
+        fitDisplayedAt: this.fitDisplayedAt,
+        zoomRequestedAt: this.zoomRequestedAt,
+        replacedAt,
+        pageCount: replacements.length,
+        requestedTargets: replacements.map((replacement) =>
+          this.pages.find((page) => page.viewer_page_index === replacement.pageIndex)?.target_px
+            ?? 1
+        ),
+        bytes: replacements.reduce((sum, replacement) => sum + replacement.bytes, 0),
+        fitAiCompletedAt: this.fitAiCompletedAt,
+        zoomJobStartedAt: this.zoomJobStartedAt,
+      }));
+    }
     this.show(notApplicable.length
       ? "AI 処理が完了しました。一部のページは元の表示です。"
       : "AI 処理が完了しました。", { cancellable: false, hideAfterMs: 2400 });
@@ -6368,6 +6601,8 @@ export class RemoteAiController {
     this.destroyed = true;
     this.generation += 1;
     this.clearPoll();
+    this.zoomFetchController?.abort();
+    this.zoomFetchController = null;
     clearTimeout(this.hideTimer);
     this.root.remove();
     if (activeJobId) {
@@ -6425,6 +6660,7 @@ export class ImageViewer {
     this.wheelDelta = 0;
     this.lastWheelCommandAt = 0;
     this.resizeTimer = 0;
+    this.resolutionTimer = 0;
     this.loadSequence = 0;
     this.fetchController = null;
     this.objectUrl = null;
@@ -6599,6 +6835,25 @@ export class ImageViewer {
     }
     this.applyTransform();
     return true;
+  }
+
+  scheduleZoomResolution() {
+    clearTimeout(this.resolutionTimer);
+    this.resolutionTimer = window.setTimeout(() => {
+      this.resolutionTimer = 0;
+      const controller = state.remoteAiController;
+      if (!controller || !shouldRequestZoomedResolution({
+        scale: this.scale,
+        pointerCount: this.pointers.size,
+        pinchActive: Boolean(this.pinch),
+        alreadyZoomed: controller.hasZoomedResolution(),
+      })) {
+        return;
+      }
+      controller.requestZoomed().catch((error) => {
+        recordClientError("zoom_resolution_request", error);
+      });
+    }, ZOOM_RESOLUTION_SETTLE_MS);
   }
 
   /// 補正プレビューだけを差し替える。表示レイアウトとズームは維持する。
@@ -6961,6 +7216,11 @@ export class ImageViewer {
     this.panX = next.panX;
     this.panY = next.panY;
     this.applyTransform();
+    if ([CommandName.ZOOM_IN, CommandName.ZOOM_OUT, CommandName.SET_TRANSFORM].includes(
+      requested.name
+    )) {
+      this.scheduleZoomResolution();
+    }
     return true;
   }
 
@@ -7255,6 +7515,7 @@ export class ImageViewer {
 
   destroy() {
     clearTimeout(this.resizeTimer);
+    clearTimeout(this.resolutionTimer);
     clearTimeout(this.loadingTimer);
     clearTimeout(this.boundaryMessageTimer);
     clearTimeout(this.centerTapTimer);

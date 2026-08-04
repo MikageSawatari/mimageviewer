@@ -74,6 +74,8 @@ import {
   shouldReanchorVideoTimeline,
   videoTimelineAnchor,
   videoTimelinePosition,
+  zoomedPageTargetPx,
+  shouldRequestZoomedResolution,
 } from "./command-core.mjs";
 
 const key = (value, extra = {}) => ({ key: value, ...extra });
@@ -1513,4 +1515,19 @@ test("viewer transform commands dispatch through one pure state transition", () 
     initial
   );
   assert.equal(reduceViewerTransform(initial, { name: CommandName.NEXT_PAGE }), null);
+});
+
+test("viewer resolution uses one coarse zoomed tier capped at 8192", () => {
+  assert.equal(zoomedPageTargetPx(1200), 7200);
+  assert.equal(zoomedPageTargetPx(1800), 8192);
+  assert.equal(zoomedPageTargetPx(0), 6);
+});
+
+test("zoomed resolution waits until pinch input has settled and never downgrades", () => {
+  assert.equal(shouldRequestZoomedResolution({ scale: 3, pointerCount: 2 }), false);
+  assert.equal(shouldRequestZoomedResolution({ scale: 3, pinchActive: true }), false);
+  assert.equal(shouldRequestZoomedResolution({ scale: 1 }), false);
+  assert.equal(shouldRequestZoomedResolution({ scale: 3 }), true);
+  assert.equal(shouldRequestZoomedResolution({ scale: 1, alreadyZoomed: true }), false);
+  assert.equal(shouldRequestZoomedResolution({ scale: 3, alreadyZoomed: true }), false);
 });

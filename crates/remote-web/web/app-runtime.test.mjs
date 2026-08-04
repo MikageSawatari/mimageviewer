@@ -108,12 +108,61 @@ const {
   reloadApplication,
   remoteAiProgressText,
   remoteAiPollingDelay,
+  remoteAiZoomDispatchDecision,
   resolveMediaOpenRoute,
   selectRecoverableRemoteAiJob,
+  zoomResolutionPerfEvent,
   thumbnailAddressForEntry,
   videoFileTargetIndex,
   viewerMenuDefinitions,
 } = await import("./app.js");
+
+test("zoom AI waits for a nonterminal fit job and starts only after Ready", () => {
+  assert.equal(remoteAiZoomDispatchDecision({
+    aiEnabled: true,
+    jobState: "upscaling",
+  }), "wait");
+  assert.equal(remoteAiZoomDispatchDecision({
+    aiEnabled: true,
+    startPosted: true,
+  }), "wait");
+  assert.equal(remoteAiZoomDispatchDecision({
+    aiEnabled: true,
+    jobState: "ready",
+    readyPageCount: 1,
+  }), "start");
+  assert.equal(remoteAiZoomDispatchDecision({
+    aiEnabled: true,
+    jobState: "ready",
+    readyPageCount: 0,
+  }), "none");
+  assert.equal(remoteAiZoomDispatchDecision({ aiEnabled: false }), "none");
+});
+
+test("zoom resolution telemetry exposes fit, request, job, and replacement intervals", () => {
+  assert.deepEqual(zoomResolutionPerfEvent({
+    resultKind: "ai",
+    fitDisplayedAt: 100,
+    zoomRequestedAt: 350,
+    fitAiCompletedAt: 500,
+    zoomJobStartedAt: 540,
+    replacedAt: 900,
+    pageCount: 2,
+    requestedTargets: [7200, 8192],
+    bytes: 1234,
+  }), {
+    type: "zoom_resolution",
+    result_kind: "ai",
+    page_count: 2,
+    requested_targets: [7200, 8192],
+    bytes: 1234,
+    fit_display_to_zoom_request_ms: 250,
+    zoom_request_to_replace_ms: 550,
+    fit_display_to_replace_ms: 800,
+    fit_ai_complete_to_zoom_job_ms: 40,
+    zoom_job_to_replace_ms: 360,
+  });
+});
 
 test("continuous video navigation stops at the end or wraps to the first video", () => {
   assert.equal(videoFileTargetIndex(0, 3, 1, false), 1);

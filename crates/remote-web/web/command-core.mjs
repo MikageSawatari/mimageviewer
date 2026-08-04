@@ -1390,6 +1390,25 @@ export function containerPageTargetPx({
   );
 }
 
+export function zoomedPageTargetPx(
+  fitTargetPx,
+  { multiplier = 6, maximum = 8192 } = {}
+) {
+  const fit = Math.max(1, Math.ceil(Number(fitTargetPx) || 1));
+  const zoom = Math.max(1, Number(multiplier) || 1);
+  const limit = Math.max(1, Math.floor(Number(maximum) || 1));
+  return Math.min(limit, Math.ceil(fit * zoom));
+}
+
+export function shouldRequestZoomedResolution({
+  scale,
+  pointerCount = 0,
+  pinchActive = false,
+  alreadyZoomed = false,
+}) {
+  return !alreadyZoomed && !pinchActive && Number(pointerCount) < 2 && Number(scale) > 1.01;
+}
+
 export function shouldShowLoadingIndicator(
   pending,
   elapsedMs,

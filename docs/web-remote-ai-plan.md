@@ -1,6 +1,6 @@
 # mIV Remote 段 3b — AI アップスケール / デノイズ設計
 
-状態: **3b-0・3b-1a・3b-1b・3b-2 実装済み、3b-2 は実機確認待ち**
+状態: **3b-0・3b-1a・3b-1b・3b-2 実装・実機確認済み**
 （2026-08-04）。
 
 親計画: [web-remote-left-panel-plan.md](web-remote-left-panel-plan.md)
@@ -451,6 +451,15 @@ page / stage / tile counter だけを表示し、percent は合成しない。ag
 `Ready` のページだけ result を取得し、全 result を decode 後に見開き DOM を一度だけ更新する。
 `NotApplicable` は元画像を保ち、失敗表示にしない。
 
+**ズーム解像度追補 (2026-08-04):** viewer の画像取得は `fit` と `zoomed` の 2 段とする。
+ピンチ中は現在画像の CSS 変形だけを行い、入力終了後 180 ms 経過時に各ページを独立して
+`min(8192, fit target × 6)` で再取得する。`target_px` は上限であり、server の
+`resize_dynamic_fit` は元画像を超えて拡大しない。見開きは左右を同じ group のまま別 target で扱い、
+viewport に見えている側だけを取得する最適化は行わない。等倍へ戻しても `zoomed` 結果を保持する。
+AI が有効な場合、fit job が nonterminal または開始 POST 中なら zoom job を pending にし、fit が
+`Ready` になって native cache へ格納された後だけ別 target の job を開始する。fit AI が既に表示済みなら
+AI 適用ページを非 AI 画像へ戻さず、対象外ページだけ高解像度の元画像へ差し替える。
+
 ## 14. 必須 test / 計測
 
 - acquire で PC modal が先に開き、main / fullscreen / detached 入力が止まる
@@ -467,3 +476,5 @@ page / stage / tile counter だけを表示し、percent は合成しない。ag
 - vector PDF は AI を起動せず、raster PDF は本体と同じ native input へ収束する
 - 空き VRAM 値を変えても適用判断と key が変わらない
 - perf は acquire local-drain、remote inference、disconnect drain を分離記録する
+- zoom 解像度は `zoom_resolution` event で fit 表示完了、zoom 要求、zoom job 開始、表示差し替えの
+  各区間、要求 target、転送 bytes を分離記録する
