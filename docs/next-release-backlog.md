@@ -669,12 +669,20 @@ AI アップスケール (数秒かかる) と bilinear (即時・低品質) の
 | エッジ方向適応 | **FSR 1.0 (EASU)**、NVIDIA Image Scaling | どちらも MIT。4K でも 0.2ms 級。エッジ適応 + シャープ化 |
 | 学習済みカーネル / 軽量 NN | **Anime4K**、ravu (RAISR 系)、FSRCNNX | **題材 (漫画・線画・イラスト) との一致度が最も高い**。推論ではなくシェーダなので軽い |
 
-- **Anime4K が最有力候補**。用途が漫画・線画に完全に一致する。Jinc は線の方向を見ないので、
-  斜め線の階段は減っても線の再構成まではしない
-- ⚠ **エッジ適応系・学習済み系は未実測。** 根拠は一般的評価だけ。
-  **Lanczos4 の失敗 (0 度トーンだけ見て「上位互換」と誤判定) を繰り返さないこと。**
-  実画像 (漫画スキャン・AI 生成イラスト・写真) で比較シートを作り、利用者判断を仰ぐ
-- ライセンスを必ず確認する。mIV は MIT。FSR1 / NIS は MIT だが Anime4K / ravu は要確認
+**2026-08-04: 比較を実施した。正本は
+[upscale-algorithm-selection.md](upscale-algorithm-selection.md)**
+(目視シート = `C:\home\mimageviewer_testdata_upscale\sheet\index.html`)。要点:
+
+- ライセンスで **ravu (LGPL-3.0) と FSRCNNX (GPL-3.0) が脱落**。Anime4K / FSR1 / NIS は MIT で採用可
+- **題材で勝者が割れる**。線画・漫画・AI イラストは Anime4K、写真は NIS が上位。
+  「1 つで全部最良」ではない。固定 1 本にするか題材で切り替えるかが未決
+- **EWA Jinc は拡大では最下位** (bilinear より下、ハロも大きい)。§1.45 の縮小測定を
+  そのまま拡大へ持ち込めないことが確認できた。MPC-VR の `Jinc2m` 相当 (`ewa_lanczos`) でも
+  分離 Lanczos3 に負ける
+- 実行コストは想定より軽い。4MP 出力で Anime4K VL でも bilinear +1.7ms (RTX 4090)。
+  最大リスクとしていた「ズーム中の毎フレーム再生成」は採否の分かれ目にならない可能性が高い
+- 残る論点は移植コスト。mIV は wgpu (WGSL) なので mpv/GLSL のリファレンスをそのまま使えない。
+  Anime4K は多段 CNN + 中間レンダーターゲットで **Large**
 
 **実装規模 (EWA Jinc の場合の実測見積もり)**: Medium。今回の Lanczos 統合の 4〜6 割。
 
@@ -700,8 +708,9 @@ AI アップスケール (数秒かかる) と bilinear (即時・低品質) の
 縮小の約 196 タップとは別物で、§1.45 の「6.5 倍」を拡大へ適用しない。しかも結果は
 `GpuLanczosCache` に乗るので、静止時は毎フレームではなく倍率変更時の 1 回だけ。
 
-- 正本: [dot-by-dot-and-downscale-plan.md](dot-by-dot-and-downscale-plan.md) §4.3.4 (Jinc の測定)
-- 規模 / 優先度: Medium / **P2 (実施決定)**。
+- 正本: [upscale-algorithm-selection.md](upscale-algorithm-selection.md) (比較結果) /
+  [dot-by-dot-and-downscale-plan.md](dot-by-dot-and-downscale-plan.md) §4.3.4 (縮小側の Jinc 測定)
+- 規模 / 優先度: Medium / **P2 (実施決定)**。アルゴリズム選定は目視シートで利用者判断待ち。
 
 ### 1.47 動画の拡大に高品質リサンプルを入れる — コストではなく構造の問題
 
@@ -893,30 +902,45 @@ AI アップスケール (数秒かかる) と bilinear (即時・低品質) の
 
 ## 5. リリース前確認 / 依存更新
 
-### 5.0 v2.11.0 で見送った依存更新 — 次サイクル冒頭で実施
+### 5.0 対応済み: v2.11.0 で見送った依存更新 (2026-08-04、v2.12.0 サイクル冒頭で実施)
 
-v2.11.0 (2026-08-04) の Phase 2 で新版を確認したが、**検証時間を優先して見送った**。
-次のリリースサイクルの**最初の作業**として片付ける。出荷直前に上げない。
+v2.11.0 (2026-08-04) の Phase 2 で新版を確認したが検証時間を優先して見送っていた分を、
+v2.12.0 サイクルの最初の作業として取り込んだ。
 
-| 依存 | v2.11.0 出荷時 | 確認できた新版 |
+| 依存 | v2.11.0 出荷時 | v2.12.0 で採用 |
 | --- | --- | --- |
-| PDFium | BUILD=7961 | chromium/7988 |
-| FFmpeg | n7.1.5-10-g2aefd64d48 | n7.1.5-12-g1fdbca85aa |
+| PDFium | BUILD=7961 (MAJOR=152) | **BUILD=7988 (MAJOR=153)** |
+| FFmpeg | n7.1.5-10-g2aefd64d48 | **n7.1.5-12-g1fdbca85aa** |
 
-見送りの理由: v2.11.0 は表示パイプラインの修正で PDF レンダリングにも動画デコードにも
-触れていない。PDFium を上げれば PDF 表示の再確認が要り、FFmpeg を上げれば LGPL 対応ソースの
-差し替えも伴う ([ffmpeg-lgpl-source-distribution.md](ffmpeg-lgpl-source-distribution.md))。
+同時に実施したこと:
 
-FFmpeg の版確認は **DLL の ProductVersion を正**とする。`vendor/ffmpeg/VERSION` は
-ローリング名を掴んで腐ることがある。
+- `vendor/ffmpeg/VERSION` と 6 DLL の `ProductVersion` の一致を確認
+  (`n7.1.5-12-g1fdbca85aa-20260803`)。版確認は **DLL の ProductVersion を正**とする
+- 対応ソース `htdocs/mimageviewer/ffmpeg-n7.1.5-12-g1fdbca85aa-source.tar.gz` を取得。
+  展開ディレクトリ名の commit hash と `RELEASE`=7.1.5 を検証し `.sha256` を併置
+- `docs/ffmpeg-lgpl-current-report.txt` を再生成。`--enable-lib*` の増減は無かったので
+  [ffmpeg-lgpl-source-distribution.md](ffmpeg-lgpl-source-distribution.md) の
+  外部ライブラリ表は据え置き
+- **副産物: 製品ページの FFmpeg 節が 2 版ぶん腐っていたのを修正した。**
+  `htdocs/mimageviewer/index.html` は `n7.1.5-2-g998de74adf` のまま止まっており、しかも
+  commit 厳密でない release tarball を指していた。アプリ内表記は `build.rs` が
+  `vendor/ffmpeg/VERSION` から焼き込むので追随していたが、サイト側は手書きで追随しない。
+  再発防止として CLAUDE.md のリリース手順に更新項目を明記した
+
+**旧 vendor の退避先**: `C:\home\mimageviewer_vendor_backup\rollback-v2.11.0\`
+(v2.11.0 出荷時の `pdfium` / `ffmpeg` をそのまま複製)。実機確認で問題が出たらここへ戻す。
+`setup-pdfium.sh` は常に最新を取るのでバージョン指定の再取得手段が無い。
+
+**⚠ 未確認 (実機)**: PDFium は MAJOR が 152 → 153 に上がっている。通常 / パスワード付き
+PDF の表示とページ数、動画 / 音声の再生は実機確認が要る。
 
 ### 5.1 ネイティブ依存
 
 | 対象 | 現状 / 次の確認 | 注意点 |
 | --- | --- | --- |
 | VST3 SDK / bridge | C++ ソース変更がなければ再ビルド不要 | 更新時は商用プラグインで実機確認 |
-| PDFium | v2.7.0 は `chromium/7947` を維持。`chromium/7961` への更新は次版候補 | 更新後は通常 / パスワード付き PDF の表示とページ数を実機確認 |
-| FFmpeg | v2.7.0 は `n7.1.5-2-g998de74adf` を維持。`n7.1.5-9-gb9a218bc1e` への更新は次版候補 | DLL・VERSION・LGPL 対応ソースを同じ commit に揃えて動画 / 音声を実機確認 |
+| PDFium | v2.12.0 サイクルで `chromium/7988` へ更新済み (§5.0) | 更新後は通常 / パスワード付き PDF の表示とページ数を実機確認 |
+| FFmpeg | v2.12.0 サイクルで `n7.1.5-12-g1fdbca85aa` へ更新済み (§5.0) | DLL・VERSION・LGPL 対応ソース・製品ページの FFmpeg 節を同じ commit に揃えて動画 / 音声を実機確認 |
 
 ### 5.2 Rust クレート
 
