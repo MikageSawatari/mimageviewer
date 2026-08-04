@@ -535,10 +535,11 @@ const TABLE: &[VersionHighlights] = &[
         version: "2.11.0",
         must_read: &[
             HighlightItem {
-                title: "原寸表示は物理ピクセル基準になりました",
-                body: "「100%原寸」「拡大しない」「縮小しない」は、画面の物理ピクセルを基準に\
-                       表示するようになりました。高 DPI 環境では、同じ画像が従来より小さく\
-                       表示されることがあります。",
+                title: "原寸表示は画面のピクセル基準になりました",
+                body: "「100%原寸」「拡大しない」「縮小しない」は、画面のピクセルと画像のピクセルが\
+                       1対1で対応する表示になりました。Windows側で拡大縮小（125%・150%など）を\
+                       設定している場合、同じ画像がこれまでより小さく表示されます。\
+                       そのぶん線や文字はくっきりします。",
             },
             HighlightItem {
                 title: "縮小表示の画質と設定が変わりました",
@@ -839,8 +840,8 @@ mod tests {
         let entry = entries[0];
         assert!(entry.highlights.is_empty());
         assert_eq!(entry.must_read.len(), 2);
-        assert!(entry.must_read[0].body.contains("物理ピクセル"));
-        assert!(entry.must_read[0].body.contains("高 DPI"));
+        assert!(entry.must_read[0].body.contains("1対1"));
+        assert!(entry.must_read[0].body.contains("拡大縮小"));
         assert!(entry.must_read[1].body.contains("縮小時のなめらかさ"));
     }
 
