@@ -91,6 +91,23 @@ pub(crate) fn build_final_composite_plan_without_ai(
     }
 }
 
+/// Build the remaining final CPU plan after final AI has consumed the tone stage.
+/// `used_upscale` is part of smart-sharpen's effective-value rule and therefore must be
+/// supplied from the actual executor result, not inferred again from requested settings.
+pub(crate) fn build_final_composite_plan_after_ai(
+    params: &crate::adjustment::AdjustParams,
+    creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
+    used_upscale: bool,
+) -> FinalCompositePlan {
+    FinalCompositePlan {
+        adjust_before_effect: None,
+        smart_sharpen: params.effective_smart_sharpen(used_upscale),
+        colorize: params.colorize.clone(),
+        creative_lut,
+        post_filter: params.post_filter,
+    }
+}
+
 pub(crate) enum FinalCompositeResult {
     Ready {
         pixels: Arc<egui::ColorImage>,

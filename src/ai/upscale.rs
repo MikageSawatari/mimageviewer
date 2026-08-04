@@ -266,6 +266,17 @@ pub fn upscale(
     upscale_with_timings(runtime, model_kind, input, cancel, None).map(|(img, _)| img)
 }
 
+pub(crate) fn upscale_with_progress(
+    runtime: &AiRuntime,
+    model_kind: ModelKind,
+    input: &image::DynamicImage,
+    cancel: &Arc<AtomicBool>,
+    progress: Option<&dyn Fn(usize, usize)>,
+) -> Result<egui::ColorImage, AiError> {
+    upscale_with_timings_impl(runtime, model_kind, input, cancel, None, None, progress)
+        .map(|(result, _)| result.image)
+}
+
 /// final pipeline 用: 4x 全面の中間画像を作らず、GPU テクスチャ上限内の
 /// ターゲットサイズへ直接合成する。
 pub fn upscale_to_max_dim(
@@ -275,8 +286,36 @@ pub fn upscale_to_max_dim(
     cancel: &Arc<AtomicBool>,
     max_dim: u32,
 ) -> Result<UpscaledImage, AiError> {
-    upscale_with_timings_impl(runtime, model_kind, input, cancel, None, Some(max_dim))
-        .map(|(result, _)| result)
+    upscale_with_timings_impl(
+        runtime,
+        model_kind,
+        input,
+        cancel,
+        None,
+        Some(max_dim),
+        None,
+    )
+    .map(|(result, _)| result)
+}
+
+pub fn upscale_to_max_dim_with_progress(
+    runtime: &AiRuntime,
+    model_kind: ModelKind,
+    input: &image::DynamicImage,
+    cancel: &Arc<AtomicBool>,
+    max_dim: u32,
+    progress: Option<&dyn Fn(usize, usize)>,
+) -> Result<UpscaledImage, AiError> {
+    upscale_with_timings_impl(
+        runtime,
+        model_kind,
+        input,
+        cancel,
+        None,
+        Some(max_dim),
+        progress,
+    )
+    .map(|(result, _)| result)
 }
 
 /// `upscale` のタイミング計測版。ベンチマーク用。
@@ -290,8 +329,16 @@ pub fn upscale_with_timings(
     cancel: &Arc<AtomicBool>,
     tile_size_override: Option<u32>,
 ) -> Result<(egui::ColorImage, UpscaleTimings), AiError> {
-    upscale_with_timings_impl(runtime, model_kind, input, cancel, tile_size_override, None)
-        .map(|(result, timings)| (result.image, timings))
+    upscale_with_timings_impl(
+        runtime,
+        model_kind,
+        input,
+        cancel,
+        tile_size_override,
+        None,
+        None,
+    )
+    .map(|(result, timings)| (result.image, timings))
 }
 
 fn upscale_with_timings_impl(
@@ -301,6 +348,7 @@ fn upscale_with_timings_impl(
     cancel: &Arc<AtomicBool>,
     tile_size_override: Option<u32>,
     target_max_dim: Option<u32>,
+    progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<(UpscaledImage, UpscaleTimings), AiError> {
     let t_all = std::time::Instant::now();
     let t_prep = std::time::Instant::now();
@@ -365,6 +413,9 @@ fn upscale_with_timings_impl(
     let alpha_resample_ms = t_alpha.elapsed().as_secs_f64() * 1000.0;
 
     let tiles = compute_tiles(in_w, in_h, tile_size, TILE_OVERLAP);
+    if let Some(progress) = progress {
+        progress(0, tiles.len());
+    }
     let perf_enabled = crate::perf::is_enabled();
     let t_upscale = std::time::Instant::now();
     if perf_enabled {
@@ -497,6 +548,10 @@ fn upscale_with_timings_impl(
                 {
                     let _ = blender.join();
                     return Err(AiError::Ort(String::from("blender thread died")));
+                }
+
+                if let Some(progress) = progress {
+                    progress(tile_idx + 1, tiles.len());
                 }
 
                 if perf_enabled {

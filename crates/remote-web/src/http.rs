@@ -8,10 +8,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimageviewer_ipc::{
     CollectionErrorCode, CollectionKind, MediaErrorCode, PagePriority, RemoteAddress,
-    RemoteEntryKind, RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource,
-    RemoteWriteErrorCode, RemoteWriteRequest, SessionResponse, SessionStatus,
-    VideoStreamControlAction, VideoStreamErrorCode, VideoStreamPlaylistKind, VideoStreamQuality,
-    VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamThumbnailPayload,
+    RemoteAiJobError, RemoteAiJobErrorCode, RemoteAiStartRequest, RemoteEntryKind,
+    RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource, RemoteWriteErrorCode,
+    RemoteWriteRequest, SessionResponse, SessionStatus, VideoStreamControlAction,
+    VideoStreamErrorCode, VideoStreamPlaylistKind, VideoStreamQuality, VideoStreamSegmentIndex,
+    VideoStreamSegmentPayload, VideoStreamThumbnailPayload,
 };
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
@@ -30,6 +31,7 @@ const MAX_TELEMETRY_BODY_BYTES: usize = 64 * 1024;
 const MAX_PIN_BODY_BYTES: usize = 4 * 1024;
 const MAX_WRITE_BODY_BYTES: usize = 16 * 1024;
 const MAX_VIDEO_BODY_BYTES: usize = 16 * 1024;
+const MAX_AI_JOB_BODY_BYTES: usize = 32 * 1024;
 const MAX_TELEMETRY_EVENTS: usize = 128;
 const TELEMETRY_REQUESTS_PER_WINDOW: usize = 30;
 const TELEMETRY_WINDOW: Duration = Duration::from_secs(60);
@@ -531,6 +533,24 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             api_list(state, &query, &remote_client_id)
         }),
         (Method::Get, "/api/container") => api_container(state, &query, &remote_client_id),
+        (Method::Post, "/api/ai/jobs") => api_ai_job_start(request, state, &remote_client_id),
+        (Method::Get, "/api/ai/jobs") => api_ai_jobs_recoverable(state, &query, &remote_client_id),
+        (Method::Get, path) if ai_result_job_id(path).is_some() => api_ai_job_result(
+            state,
+            ai_result_job_id(path).expect("guard checked result route"),
+            &query,
+            &remote_client_id,
+        ),
+        (Method::Get, path) if ai_state_job_id(path).is_some() => api_ai_job_state(
+            state,
+            ai_state_job_id(path).expect("guard checked state route"),
+            &remote_client_id,
+        ),
+        (Method::Delete, path) if ai_state_job_id(path).is_some() => api_ai_job_cancel(
+            state,
+            ai_state_job_id(path).expect("guard checked cancel route"),
+            &remote_client_id,
+        ),
         (Method::Post, "/api/write") => api_write(request, state, &remote_client_id),
         (Method::Get, "/api/thumb") => api_thumb(state, &query, &remote_client_id),
         (Method::Get, "/api/image-info") => {
@@ -545,6 +565,14 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
         (_, path) if path.starts_with("/stream/") => HttpResponse::text(405, "Method Not Allowed")
             .with_header("Allow", "GET")
             .with_header("Cache-Control", "no-store"),
+        (_, "/api/ai/jobs") => HttpResponse::text(405, "Method Not Allowed")
+            .with_header("Allow", "GET, POST")
+            .with_header("Cache-Control", "no-store"),
+        (_, path) if path.starts_with("/api/ai/jobs/") => {
+            HttpResponse::text(405, "Method Not Allowed")
+                .with_header("Allow", "GET, DELETE")
+                .with_header("Cache-Control", "no-store")
+        }
         (
             _,
             "/api/telemetry"
@@ -572,6 +600,226 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
     response
         .with_header("X-Content-Type-Options", "nosniff")
         .with_header("Referrer-Policy", "no-referrer")
+}
+
+fn ai_state_job_id(path: &str) -> Option<&str> {
+    let job_id = path.strip_prefix("/api/ai/jobs/")?;
+    (!job_id.is_empty() && !job_id.contains('/')).then_some(job_id)
+}
+
+fn ai_result_job_id(path: &str) -> Option<&str> {
+    let job_id = path
+        .strip_prefix("/api/ai/jobs/")?
+        .strip_suffix("/result")?;
+    (!job_id.is_empty() && !job_id.contains('/')).then_some(job_id)
+}
+
+fn api_ai_job_start(request: &mut Request, state: &AppState, client_id: &str) -> HttpResponse {
+    let body = match read_body_limited(request, MAX_AI_JOB_BODY_BYTES) {
+        Ok(body) => body,
+        Err(BodyReadError::TooLarge) => return HttpResponse::text(413, "Payload Too Large"),
+        Err(BodyReadError::Read) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let request: RemoteAiStartRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => return HttpResponse::text(400, "Bad Request"),
+    };
+    for page in &request.pages {
+        if let Err(error) = state.library.validate_remote_address(&page.address) {
+            return store_error_response(error).with_header("Cache-Control", "no-store");
+        }
+    }
+    let result = match state.ipc_admission.run(IpcClass::Home, || {
+        state.thumbnail_client.remote_ai_start(client_id, request)
+    }) {
+        Ok(result) => result,
+        Err(_) => return ai_admission_busy_response(),
+    };
+    match result {
+        Ok(success) => {
+            let mut response = HttpResponse::json(&success.value)
+                .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"));
+            response.status = 202;
+            response.with_header("Cache-Control", "no-store")
+        }
+        Err(failure) => ai_ipc_error_response(failure),
+    }
+}
+
+fn api_ai_jobs_recoverable(
+    state: &AppState,
+    query: &[(String, String)],
+    client_id: &str,
+) -> HttpResponse {
+    if query_value(query, "recoverable") != Ok(Some("1")) {
+        return HttpResponse::text(400, "Bad Request");
+    }
+    let result = match state.ipc_admission.run(IpcClass::Home, || {
+        state.thumbnail_client.remote_ai_recoverable(client_id)
+    }) {
+        Ok(result) => result,
+        Err(_) => return ai_admission_busy_response(),
+    };
+    match result {
+        Ok(success) => HttpResponse::json(&success.value)
+            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+            .with_header("Cache-Control", "no-store"),
+        Err(failure) => ai_ipc_error_response(failure),
+    }
+}
+
+fn api_ai_job_state(state: &AppState, job_id: &str, client_id: &str) -> HttpResponse {
+    let result = match state.ipc_admission.run(IpcClass::Home, || {
+        state.thumbnail_client.remote_ai_state(client_id, job_id)
+    }) {
+        Ok(result) => result,
+        Err(_) => return ai_admission_busy_response(),
+    };
+    match result {
+        Ok(success) => HttpResponse::json(&success.value)
+            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+            .with_header("Cache-Control", "no-store"),
+        Err(failure) => ai_ipc_error_response(failure),
+    }
+}
+
+fn api_ai_job_cancel(state: &AppState, job_id: &str, client_id: &str) -> HttpResponse {
+    let result = match state.ipc_admission.run(IpcClass::Home, || {
+        state.thumbnail_client.remote_ai_cancel(client_id, job_id)
+    }) {
+        Ok(result) => result,
+        Err(_) => return ai_admission_busy_response(),
+    };
+    match result {
+        Ok(success) => {
+            let terminal = success.value.state.is_terminal();
+            let mut response = HttpResponse::json(&success.value)
+                .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"));
+            response.status = if terminal { 200 } else { 202 };
+            response.with_header("Cache-Control", "no-store")
+        }
+        Err(failure) => ai_ipc_error_response(failure),
+    }
+}
+
+fn api_ai_job_result(
+    state: &AppState,
+    job_id: &str,
+    query: &[(String, String)],
+    client_id: &str,
+) -> HttpResponse {
+    let page = match required_query_value(query, "page")
+        .and_then(|value| value.parse::<u32>().map_err(|_| ()))
+    {
+        Ok(page) => page,
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let result = match state.ipc_admission.run(IpcClass::Heavy, || {
+        state
+            .thumbnail_client
+            .remote_ai_result(client_id, job_id, page)
+    }) {
+        Ok(result) => result,
+        Err(_) => return ai_admission_busy_response(),
+    };
+    match result {
+        Ok(success) if success.value.content_type == "image/webp" => {
+            HttpResponse::bytes(200, "image/webp", success.value.bytes)
+                .with_header("Cache-Control", "no-store")
+        }
+        Ok(_) => HttpResponse::text(502, "Bad Gateway").with_header("Cache-Control", "no-store"),
+        Err(failure) => ai_ipc_error_response(failure),
+    }
+}
+
+fn ai_admission_busy_response() -> HttpResponse {
+    HttpResponse::bytes(
+        503,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&json!({
+            "error": "ipc_busy",
+            "message": "remote AI request admission is busy",
+        }))
+        .unwrap_or_default(),
+    )
+    .with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string())
+    .with_header("Cache-Control", "no-store")
+}
+
+fn ai_ipc_error_response(failure: crate::ipc_client::ClientFailure) -> HttpResponse {
+    let (status, code, message, terminal_code) = match failure.error {
+        IpcClientError::RemoteAi(RemoteAiJobError {
+            code,
+            message,
+            terminal_code,
+        }) => {
+            let status = match code {
+                RemoteAiJobErrorCode::BadRequest => 400,
+                RemoteAiJobErrorCode::StartExpired => 504,
+                RemoteAiJobErrorCode::SessionClosing | RemoteAiJobErrorCode::NotReady => 409,
+                RemoteAiJobErrorCode::NotFound | RemoteAiJobErrorCode::Forbidden => 404,
+                RemoteAiJobErrorCode::JobGone => 410,
+                RemoteAiJobErrorCode::PageOutOfRange => 416,
+                RemoteAiJobErrorCode::Internal => 500,
+            };
+            (
+                status,
+                remote_ai_job_error_name(code).to_owned(),
+                message,
+                terminal_code,
+            )
+        }
+        IpcClientError::Unavailable(_) => (
+            503,
+            "miv_not_running".to_owned(),
+            "mIV core is not available".to_owned(),
+            None,
+        ),
+        IpcClientError::VersionMismatch { .. } => (
+            503,
+            "protocol_version_mismatch".to_owned(),
+            "IPC protocol versions do not match".to_owned(),
+            None,
+        ),
+        IpcClientError::Protocol(_) => (
+            502,
+            "ipc_protocol_error".to_owned(),
+            "IPC request failed".to_owned(),
+            None,
+        ),
+        IpcClientError::SessionRemote(response) => (
+            session_http_status(response.status),
+            "session_required".to_owned(),
+            response.message,
+            None,
+        ),
+        other => (500, "ipc_error".to_owned(), other.to_string(), None),
+    };
+    HttpResponse::bytes(
+        status,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&json!({
+            "error": code,
+            "message": message,
+            "terminal_code": terminal_code,
+        }))
+        .unwrap_or_default(),
+    )
+    .with_header("Cache-Control", "no-store")
+}
+
+fn remote_ai_job_error_name(code: RemoteAiJobErrorCode) -> &'static str {
+    match code {
+        RemoteAiJobErrorCode::BadRequest => "bad_request",
+        RemoteAiJobErrorCode::StartExpired => "start_expired",
+        RemoteAiJobErrorCode::SessionClosing => "session_closing",
+        RemoteAiJobErrorCode::NotFound => "not_found",
+        RemoteAiJobErrorCode::Forbidden => "forbidden",
+        RemoteAiJobErrorCode::JobGone => "job_gone",
+        RemoteAiJobErrorCode::NotReady => "not_ready",
+        RemoteAiJobErrorCode::PageOutOfRange => "page_out_of_range",
+        RemoteAiJobErrorCode::Internal => "internal",
+    }
 }
 
 #[derive(Deserialize)]
@@ -1121,7 +1369,8 @@ fn video_ipc_error_response(failure: crate::ipc_client::ClientFailure) -> HttpRe
         IpcClientError::Remote(_)
         | IpcClientError::CollectionRemote(_)
         | IpcClientError::MediaRemote(_)
-        | IpcClientError::WriteRemote(_) => (
+        | IpcClientError::WriteRemote(_)
+        | IpcClientError::RemoteAi(_) => (
             502,
             "ipc_response_type_mismatch",
             "mIV 本体から予期しない応答を受信しました。".to_owned(),
@@ -1245,7 +1494,8 @@ fn session_failure_response(failure: crate::ipc_client::ClientFailure) -> HttpRe
         | IpcClientError::CollectionRemote(_)
         | IpcClientError::MediaRemote(_)
         | IpcClientError::WriteRemote(_)
-        | IpcClientError::VideoStreamRemote(_) => HttpResponse::text(502, "Bad Gateway"),
+        | IpcClientError::VideoStreamRemote(_)
+        | IpcClientError::RemoteAi(_) => HttpResponse::text(502, "Bad Gateway"),
     }
     .with_header("Cache-Control", "no-store")
 }
@@ -1594,6 +1844,7 @@ fn collection_ipc_error_response(
         IpcClientError::Remote(error) => (500, "miv_collection_error", error.message),
         IpcClientError::WriteRemote(error) => (500, "miv_collection_error", error.message),
         IpcClientError::VideoStreamRemote(error) => (500, "miv_collection_error", error.message),
+        IpcClientError::RemoteAi(error) => (500, "miv_collection_error", error.message),
         IpcClientError::SessionRemote(response) => (
             session_http_status(response.status),
             "session_required",
@@ -2110,7 +2361,8 @@ fn write_ipc_error_response(
         IpcClientError::Remote(_)
         | IpcClientError::CollectionRemote(_)
         | IpcClientError::MediaRemote(_)
-        | IpcClientError::VideoStreamRemote(_) => (
+        | IpcClientError::VideoStreamRemote(_)
+        | IpcClientError::RemoteAi(_) => (
             500,
             "miv_write_error",
             "書き込みに失敗しました。".to_owned(),
@@ -2195,6 +2447,7 @@ fn media_ipc_error_response(
         IpcClientError::CollectionRemote(error) => (500, "miv_media_error", error.message),
         IpcClientError::WriteRemote(error) => (500, "miv_media_error", error.message),
         IpcClientError::VideoStreamRemote(error) => (500, "miv_media_error", error.message),
+        IpcClientError::RemoteAi(error) => (500, "miv_media_error", error.message),
         IpcClientError::SessionRemote(response) => (
             session_http_status(response.status),
             "session_required",
@@ -2329,6 +2582,7 @@ fn ipc_error_response(
         IpcClientError::MediaRemote(remote) => (500, "miv_thumbnail_error", remote.message),
         IpcClientError::WriteRemote(remote) => (500, "miv_thumbnail_error", remote.message),
         IpcClientError::VideoStreamRemote(remote) => (500, "miv_thumbnail_error", remote.message),
+        IpcClientError::RemoteAi(remote) => (500, "miv_thumbnail_error", remote.message),
         IpcClientError::SessionRemote(response) => (
             session_http_status(response.status),
             "session_required",
@@ -3174,7 +3428,7 @@ mod tests {
     }
 
     #[test]
-    fn every_video_and_stream_route_is_below_the_fail_closed_auth_guard() {
+    fn every_video_stream_and_ai_route_is_below_the_fail_closed_auth_guard() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_state(&temp);
         let requests = [
@@ -3204,6 +3458,17 @@ mod tests {
             (Method::Get, "/stream/1/1/media.m3u8", ""),
             (Method::Get, "/stream/1/1/init.mp4", ""),
             (Method::Get, "/stream/1/1/0.m4s", ""),
+            // AI job 経路も同じ guard の下に置く。開始は GPU 推論を起こし、state /
+            // result は画像そのものを返すため、video / stream と同じ扱いにする。
+            (
+                Method::Post,
+                "/api/ai/jobs",
+                r#"{"request_id":"r1","pages":[]}"#,
+            ),
+            (Method::Get, "/api/ai/jobs?recoverable=1", ""),
+            (Method::Get, "/api/ai/jobs/1-1", ""),
+            (Method::Get, "/api/ai/jobs/1-1/result?page=0", ""),
+            (Method::Delete, "/api/ai/jobs/1-1", ""),
         ];
 
         for (method, path, body) in requests {
@@ -3882,5 +4147,48 @@ mod tests {
         );
         assert_eq!(details["https_detected"], true);
         assert_eq!(details["https_source"], "x_forwarded_proto");
+    }
+
+    #[test]
+    fn remote_ai_dynamic_routes_are_exact_and_keep_result_page_separate() {
+        assert_eq!(ai_state_job_id("/api/ai/jobs/7-1"), Some("7-1"));
+        assert_eq!(ai_result_job_id("/api/ai/jobs/7-1/result"), Some("7-1"));
+        assert_eq!(ai_state_job_id("/api/ai/jobs/7-1/result"), None);
+        assert_eq!(ai_result_job_id("/api/ai/jobs/7-1/result/extra"), None);
+        assert_eq!(ai_state_job_id("/api/ai/jobs/"), None);
+    }
+
+    #[test]
+    fn remote_ai_typed_errors_map_to_stable_http_statuses() {
+        let cases = [
+            (RemoteAiJobErrorCode::BadRequest, 400, "bad_request"),
+            (RemoteAiJobErrorCode::StartExpired, 504, "start_expired"),
+            (RemoteAiJobErrorCode::SessionClosing, 409, "session_closing"),
+            (RemoteAiJobErrorCode::NotReady, 409, "not_ready"),
+            (RemoteAiJobErrorCode::NotFound, 404, "not_found"),
+            (RemoteAiJobErrorCode::Forbidden, 404, "forbidden"),
+            (RemoteAiJobErrorCode::JobGone, 410, "job_gone"),
+            (
+                RemoteAiJobErrorCode::PageOutOfRange,
+                416,
+                "page_out_of_range",
+            ),
+            (RemoteAiJobErrorCode::Internal, 500, "internal"),
+        ];
+        for (code, expected_status, expected_name) in cases {
+            let response = ai_ipc_error_response(crate::ipc_client::ClientFailure {
+                error: IpcClientError::RemoteAi(RemoteAiJobError {
+                    code,
+                    message: "typed failure".to_owned(),
+                    terminal_code: Some(mimageviewer_ipc::RemoteAiTerminalCode::VectorPdf),
+                }),
+                retry_count: 0,
+                retry_statuses: Vec::new(),
+            });
+            assert_eq!(response.status, expected_status, "{code:?}");
+            let body: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["error"], expected_name);
+            assert_eq!(body["terminal_code"], "vector_pdf");
+        }
     }
 }

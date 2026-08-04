@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimageviewer_ipc::{
@@ -29,7 +29,14 @@ enum ReleaseReason {
     Local,
     LivenessTimeout,
     IdleTimeout,
+    BackgroundExpired,
     Superseded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteClientPresence {
+    Foreground,
+    Detached { since: Duration },
 }
 
 /// PC と remote の排他的な操作権 lifecycle。
@@ -106,7 +113,9 @@ impl ReleaseReason {
     fn status(self) -> SessionStatus {
         match self {
             Self::Local => SessionStatus::LocalInUse,
-            Self::LivenessTimeout | Self::IdleTimeout => SessionStatus::Expired,
+            Self::LivenessTimeout | Self::IdleTimeout | Self::BackgroundExpired => {
+                SessionStatus::Expired
+            }
             Self::Superseded => SessionStatus::Superseded,
         }
     }
@@ -127,6 +136,7 @@ struct ActiveSession {
     pub(crate) connected_at: Duration,
     last_ping: Duration,
     last_activity: Duration,
+    presence: RemoteClientPresence,
     media_playing: bool,
     streaming: Option<StreamingRegistration>,
     request_count: u64,
@@ -198,6 +208,7 @@ impl SessionStateMachine {
             }
             active.last_ping = now;
             active.last_activity = now;
+            active.presence = RemoteClientPresence::Foreground;
             active.peer = request.peer;
             return SessionResponse::active();
         }
@@ -226,6 +237,7 @@ impl SessionStateMachine {
             connected_at: now,
             last_ping: now,
             last_activity: now,
+            presence: RemoteClientPresence::Foreground,
             media_playing: false,
             streaming: None,
             request_count: 0,
@@ -260,11 +272,27 @@ impl SessionStateMachine {
             return session_closing_response();
         }
         active.last_ping = now;
+        active.presence = RemoteClientPresence::Foreground;
         active.media_playing = request.media_playing;
         if request.user_active {
             active.last_activity = now;
         }
         SessionResponse::active()
+    }
+
+    fn note_ai_client_seen(&mut self, now: Duration, client_id: &str) -> bool {
+        let Some(active) = self.active.as_mut() else {
+            return false;
+        };
+        if active.client_id != client_id
+            || self.lifecycle.phase == RemoteControlPhase::DrainingRemote
+        {
+            return false;
+        }
+        active.last_ping = now;
+        active.last_activity = now;
+        active.presence = RemoteClientPresence::Foreground;
+        true
     }
 
     fn begin_operation(
@@ -288,6 +316,7 @@ impl SessionStateMachine {
         }
         active.last_ping = now;
         active.last_activity = now;
+        active.presence = RemoteClientPresence::Foreground;
         active.request_count = active.request_count.saturating_add(1);
         let token = self.next_operation;
         self.next_operation = self.next_operation.wrapping_add(1).max(1);
@@ -448,9 +477,21 @@ impl SessionStateMachine {
     }
 
     fn expire(&mut self, now: Duration) -> Option<ReleaseReason> {
+        self.expire_with_ai(now, false)
+    }
+
+    fn expire_with_ai(&mut self, now: Duration, has_nonterminal_ai: bool) -> Option<ReleaseReason> {
         let reason = self.active.as_ref().and_then(|active| {
             if now.saturating_sub(active.last_ping) >= LIVENESS_TIMEOUT {
-                Some(ReleaseReason::LivenessTimeout)
+                if has_nonterminal_ai {
+                    if now.saturating_sub(active.last_activity) >= IDLE_TIMEOUT {
+                        Some(ReleaseReason::BackgroundExpired)
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(ReleaseReason::LivenessTimeout)
+                }
             } else if !active.media_playing
                 && !active
                     .streaming
@@ -458,11 +499,23 @@ impl SessionStateMachine {
                     .is_some_and(|streaming| streaming.playing)
                 && now.saturating_sub(active.last_activity) >= IDLE_TIMEOUT
             {
-                Some(ReleaseReason::IdleTimeout)
+                Some(if has_nonterminal_ai {
+                    ReleaseReason::BackgroundExpired
+                } else {
+                    ReleaseReason::IdleTimeout
+                })
             } else {
                 None
             }
         });
+        if reason.is_none()
+            && has_nonterminal_ai
+            && let Some(active) = self.active.as_mut()
+            && now.saturating_sub(active.last_ping) >= LIVENESS_TIMEOUT
+            && matches!(active.presence, RemoteClientPresence::Foreground)
+        {
+            active.presence = RemoteClientPresence::Detached { since: now };
+        }
         if let Some(reason) = reason {
             self.begin_drain(reason);
         }
@@ -618,6 +671,9 @@ fn release_message(reason: ReleaseReason) -> &'static str {
         ReleaseReason::Local => "ローカルで使用中です。操作すると再接続します。",
         ReleaseReason::LivenessTimeout => "接続の生存確認が途絶えました。再接続してください。",
         ReleaseReason::IdleTimeout => "放置時間を超えたため切断されました。再接続してください。",
+        ReleaseReason::BackgroundExpired => {
+            "バックグラウンド保持時間を超えたため切断されました。再接続してください。"
+        }
         ReleaseReason::Superseded => "別の端末で使用中です。操作すると操作権を取得します。",
     }
 }
@@ -833,6 +889,7 @@ pub(crate) enum UiReadError {
 pub(crate) struct RemoteAiExecutionBridge {
     runtime: Arc<(Mutex<RemoteAiRuntimeState>, Condvar)>,
     manager: Arc<crate::ai::model_manager::ModelManager>,
+    background_mode: Arc<AtomicU8>,
 }
 
 enum RemoteAiRuntimeState {
@@ -850,18 +907,25 @@ pub(crate) enum RemoteLocalRuntimeClaim {
 pub(crate) struct RemoteAiResources {
     pub(crate) runtime: Arc<crate::ai::runtime::AiRuntime>,
     pub(crate) manager: Arc<crate::ai::model_manager::ModelManager>,
+    pub(crate) background_mode: u8,
 }
 
 impl RemoteAiExecutionBridge {
     pub(crate) fn new(
         runtime: Option<Arc<crate::ai::runtime::AiRuntime>>,
         manager: Arc<crate::ai::model_manager::ModelManager>,
+        background_mode: u8,
     ) -> Self {
         let state = runtime.map_or(RemoteAiRuntimeState::Empty, RemoteAiRuntimeState::Ready);
         Self {
             runtime: Arc::new((Mutex::new(state), Condvar::new())),
             manager,
+            background_mode: Arc::new(AtomicU8::new(background_mode.min(2))),
         }
+    }
+
+    pub(crate) fn set_background_mode(&self, mode: u8) {
+        self.background_mode.store(mode.min(2), Ordering::Release);
     }
 
     pub(crate) fn ready_runtime(&self) -> Option<Arc<crate::ai::runtime::AiRuntime>> {
@@ -940,6 +1004,7 @@ impl RemoteAiExecutionBridge {
                     return Some(RemoteAiResources {
                         runtime: Arc::clone(runtime),
                         manager: Arc::clone(&self.manager),
+                        background_mode: self.background_mode.load(Ordering::Acquire),
                     });
                 }
                 RemoteAiRuntimeState::Initializing => {
@@ -956,6 +1021,7 @@ impl RemoteAiExecutionBridge {
             Ok(runtime) => Some(RemoteAiResources {
                 runtime,
                 manager: Arc::clone(&self.manager),
+                background_mode: self.background_mode.load(Ordering::Acquire),
             }),
             Err(error) => {
                 crate::logger::log(format!(
@@ -978,6 +1044,7 @@ pub(crate) struct SessionHandle {
     published_video_stream: Arc<Mutex<Option<PublishedVideoStream>>>,
     phase_wake: Arc<(Mutex<u64>, Condvar)>,
     ai_bridge: Arc<Mutex<Option<RemoteAiExecutionBridge>>>,
+    ai_jobs: Arc<Mutex<Weak<super::ai_job::RemoteAiJobRegistry>>>,
 }
 
 impl UiRequestDispatch {
@@ -1068,7 +1135,22 @@ impl SessionHandle {
             published_video_stream: Arc::new(Mutex::new(None)),
             phase_wake: Arc::new((Mutex::new(0), Condvar::new())),
             ai_bridge: Arc::new(Mutex::new(None)),
+            ai_jobs: Arc::new(Mutex::new(Weak::new())),
         }
+    }
+
+    pub(crate) fn install_ai_jobs(&self, jobs: &Arc<super::ai_job::RemoteAiJobRegistry>) {
+        *self
+            .ai_jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(jobs);
+    }
+
+    pub(crate) fn ai_job_registry(&self) -> Option<Arc<super::ai_job::RemoteAiJobRegistry>> {
+        self.ai_jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .upgrade()
     }
 
     fn now(&self) -> Duration {
@@ -1094,15 +1176,24 @@ impl SessionHandle {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
-        let (response, phase_changed) = {
+        let (response, phase_changed, drain_reason) = {
             let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             let phase = state.lifecycle.phase;
             let response = state.acquire(self.now(), connected_unix_ms, request);
-            (response, state.lifecycle.phase != phase)
+            (
+                response,
+                state.lifecycle.phase != phase,
+                (state.lifecycle.phase == RemoteControlPhase::DrainingRemote)
+                    .then_some(state.drain_reason)
+                    .flatten(),
+            )
         };
         if phase_changed {
             self.clear_video_stream(None);
             self.notify_phase_changed();
+        }
+        if let Some(reason) = drain_reason {
+            self.notify_ai_drain(reason);
         }
         crate::logger::log(format!(
             "remote_ipc: session_acquired connection_kind={peer_kind:?} peer={peer_name}"
@@ -1112,8 +1203,14 @@ impl SessionHandle {
     }
 
     pub(crate) fn ping(&self, request: &SessionPingRequest) -> SessionResponse {
+        let has_nonterminal_ai = self
+            .ai_job_registry()
+            .is_some_and(|jobs| jobs.has_nonterminal_jobs());
         let (response, phase_changed) = {
             let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            if has_nonterminal_ai {
+                state.note_ai_client_seen(self.now(), &request.client_id);
+            }
             let phase = state.lifecycle.phase;
             let response = state.ping(self.now(), request);
             (response, state.lifecycle.phase != phase)
@@ -1131,8 +1228,14 @@ impl SessionHandle {
         client_id: &str,
         description: String,
     ) -> Result<SessionOperation, SessionResponse> {
+        let has_nonterminal_ai = self
+            .ai_job_registry()
+            .is_some_and(|jobs| jobs.has_nonterminal_jobs());
         let (result, phase_changed) = {
             let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            if has_nonterminal_ai {
+                state.note_ai_client_seen(self.now(), client_id);
+            }
             let phase = state.lifecycle.phase;
             let result = state.begin_operation(self.now(), client_id, description);
             (result, state.lifecycle.phase != phase)
@@ -1285,11 +1388,38 @@ impl SessionHandle {
             .unwrap_or_else(|error| error.into_inner())
             .begin_drain(ReleaseReason::Local);
         if phase_changed {
+            self.notify_ai_drain(ReleaseReason::Local);
             self.clear_video_stream(None); // drain starts before release
             self.notify_phase_changed();
             crate::logger::log("remote_ipc: session_drain_started reason=local".to_owned());
             self.notify_ui();
         }
+    }
+
+    pub(crate) fn note_ai_client_seen(&self, client_id: &str) {
+        let changed = self
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .note_ai_client_seen(self.now(), client_id);
+        if changed {
+            self.notify_ui();
+        }
+    }
+
+    fn notify_ai_drain(&self, reason: ReleaseReason) {
+        let Some(jobs) = self.ai_job_registry() else {
+            return;
+        };
+        let cause = match reason {
+            ReleaseReason::Local => super::ai_job::RemoteAiDrainCause::DiscardedByHost,
+            ReleaseReason::BackgroundExpired => {
+                super::ai_job::RemoteAiDrainCause::BackgroundExpired
+            }
+            ReleaseReason::Superseded => super::ai_job::RemoteAiDrainCause::Superseded,
+            ReleaseReason::LivenessTimeout | ReleaseReason::IdleTimeout => return,
+        };
+        jobs.on_session_drain(cause);
     }
 
     pub(crate) fn submit_write(
@@ -1553,14 +1683,20 @@ impl SessionHandle {
     }
 
     fn expire(&self) -> Option<ReleaseReason> {
+        let has_nonterminal_ai = self
+            .ai_job_registry()
+            .is_some_and(|jobs| jobs.has_nonterminal_jobs());
         let (reason, phase_changed) = {
             let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             let phase = state.lifecycle.phase;
-            let reason = state.expire(self.now());
+            let reason = state.expire_with_ai(self.now(), has_nonterminal_ai);
             (reason, state.lifecycle.phase != phase)
         };
         if reason.is_some() {
             self.clear_video_stream(None);
+        }
+        if let Some(reason) = reason {
+            self.notify_ai_drain(reason);
         }
         if phase_changed {
             self.notify_phase_changed();
@@ -1732,6 +1868,10 @@ pub(crate) struct SessionOperation {
 }
 
 impl SessionOperation {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub(crate) fn wait_until_active(&self) -> Result<(), SessionResponse> {
         loop {
             let (epoch, wake) = &*self.handle.phase_wake;
@@ -1879,6 +2019,7 @@ fn session_watchdog(handle: SessionHandle, stop: Arc<AtomicBool>) {
                 match reason {
                     ReleaseReason::LivenessTimeout => "liveness_timeout",
                     ReleaseReason::IdleTimeout => "idle_timeout",
+                    ReleaseReason::BackgroundExpired => "background_expired",
                     ReleaseReason::Local => "local",
                     ReleaseReason::Superseded => "superseded",
                 }
@@ -2103,6 +2244,39 @@ mod tests {
     }
 
     #[test]
+    fn nonterminal_ai_detaches_on_liveness_and_same_client_recovers_it() {
+        let mut state = SessionStateMachine::default();
+        acquire(&mut state, Duration::ZERO);
+
+        assert_eq!(state.expire_with_ai(LIVENESS_TIMEOUT, true), None);
+        assert_eq!(state.lifecycle.phase, RemoteControlPhase::RemoteActive);
+        assert!(matches!(
+            state.active.as_ref().map(|active| active.presence),
+            Some(RemoteClientPresence::Detached { .. })
+        ));
+
+        assert!(state.note_ai_client_seen(LIVENESS_TIMEOUT + Duration::from_secs(1), "client"));
+        assert!(matches!(
+            state.active.as_ref().map(|active| active.presence),
+            Some(RemoteClientPresence::Foreground)
+        ));
+        assert_eq!(state.lifecycle.phase, RemoteControlPhase::RemoteActive);
+    }
+
+    #[test]
+    fn nonterminal_ai_background_expiry_enters_typed_drain() {
+        let mut state = SessionStateMachine::default();
+        acquire(&mut state, Duration::ZERO);
+
+        assert_eq!(
+            state.expire_with_ai(IDLE_TIMEOUT, true),
+            Some(ReleaseReason::BackgroundExpired)
+        );
+        assert_eq!(state.lifecycle.phase, RemoteControlPhase::DrainingRemote);
+        assert_eq!(state.drain_reason, Some(ReleaseReason::BackgroundExpired));
+    }
+
+    #[test]
     fn final_drain_without_active_payload_returns_local_exactly_once() {
         let mut state = SessionStateMachine::default();
         acquire(&mut state, Duration::ZERO);
@@ -2137,6 +2311,7 @@ mod tests {
         let bridge = RemoteAiExecutionBridge::new(
             None,
             Arc::new(crate::ai::model_manager::ModelManager::new()),
+            0,
         );
         assert!(matches!(
             bridge.claim_local_runtime_init(),

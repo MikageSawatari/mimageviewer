@@ -454,6 +454,7 @@ const MSG_SHUTDOWN: u8 = 3;
 /// 全文検索インデクサが PDF メタ情報を ingest するために使う (§16 step 17)。
 const MSG_GET_INFO: u8 = 4;
 const MSG_DISPLAY_RENDER: u8 = 5;
+const MSG_ANALYZE_PAGE: u8 = 6;
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
 
@@ -501,6 +502,20 @@ fn encode_get_info_request(path: &Path, password: Option<&str>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     buf.push(MSG_GET_INFO);
     encode_path_and_password(&mut buf, path, password);
+    buf
+}
+
+fn encode_analyze_page_request(path: &Path, page_num: u32, password: Option<&str>) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    buf.push(MSG_ANALYZE_PAGE);
+    let path_lossy = path.to_string_lossy();
+    let path_bytes = path_lossy.as_bytes();
+    let pw_bytes = password.unwrap_or("").as_bytes();
+    buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(path_bytes);
+    buf.extend_from_slice(&page_num.to_le_bytes());
+    buf.extend_from_slice(&(pw_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(pw_bytes);
     buf
 }
 
@@ -664,6 +679,46 @@ fn decode_request(data: &[u8]) -> std::io::Result<DecodedRequest> {
             let (path, password, _) = decode_path_and_password(payload)?;
             Ok(DecodedRequest::GetInfo { path, password })
         }
+        MSG_ANALYZE_PAGE => {
+            if payload.len() < 2 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "analyze request too short",
+                ));
+            }
+            let path_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+            if payload.len() < 2 + path_len + 4 + 2 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "analyze request truncated",
+                ));
+            }
+            let path_str = std::str::from_utf8(&payload[2..2 + path_len])
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let rest = &payload[2 + path_len..];
+            let page_num = u32::from_le_bytes(rest[..4].try_into().unwrap());
+            let pw_len = u16::from_le_bytes(rest[4..6].try_into().unwrap()) as usize;
+            if rest.len() < 6 + pw_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "analyze password truncated",
+                ));
+            }
+            let password = if pw_len == 0 {
+                None
+            } else {
+                Some(
+                    std::str::from_utf8(&rest[6..6 + pw_len])
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+                        .to_owned(),
+                )
+            };
+            Ok(DecodedRequest::AnalyzePage {
+                path: PathBuf::from(path_str),
+                page_num,
+                password,
+            })
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown message type: {msg_type}"),
@@ -684,6 +739,11 @@ enum DecodedRequest {
     },
     GetInfo {
         path: PathBuf,
+        password: Option<String>,
+    },
+    AnalyzePage {
+        path: PathBuf,
+        page_num: u32,
         password: Option<String>,
     },
     Shutdown,
@@ -785,6 +845,18 @@ pub fn run_worker_process() {
                     }
                 }
             }
+            DecodedRequest::AnalyzePage {
+                path,
+                page_num,
+                password,
+            } => match ipc_analyze_page(&pdfium, &path, page_num, password.as_deref()) {
+                Ok(resp) => {
+                    let _ = write_msg(&mut stdout, &resp);
+                }
+                Err(e) => {
+                    let _ = send_error(&mut stdout, &e.to_string());
+                }
+            },
             DecodedRequest::Shutdown => break,
         }
     }
@@ -893,6 +965,52 @@ fn ipc_render(
     buf.extend_from_slice(&page_count.to_le_bytes());
     buf.extend_from_slice(pixels);
     Ok(buf)
+}
+
+/// Render を行わず、AI canonical 判定に必要な page content と native raster 寸法だけ返す。
+fn ipc_analyze_page(
+    pdfium: &Pdfium,
+    path: &Path,
+    page_num: u32,
+    password: Option<&str>,
+) -> std::io::Result<Vec<u8>> {
+    let analysis = core_analyze_page(pdfium, path, page_num, password)?;
+    let mut buf = Vec::with_capacity(14);
+    buf.push(STATUS_OK);
+    match analysis.content_type {
+        PdfPageContentType::Vector => {
+            buf.push(0);
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        }
+        PdfPageContentType::Raster { w, h } => {
+            buf.push(1);
+            buf.extend_from_slice(&w.to_le_bytes());
+            buf.extend_from_slice(&h.to_le_bytes());
+        }
+    }
+    buf.extend_from_slice(&analysis.page_count.to_le_bytes());
+    Ok(buf)
+}
+
+fn core_analyze_page(
+    pdfium: &Pdfium,
+    path: &Path,
+    page_num: u32,
+    password: Option<&str>,
+) -> std::io::Result<PdfPageAnalysis> {
+    let doc = pdfium
+        .load_pdf_from_file(path, password)
+        .map_err(pdfium_open_error)?;
+    let page_count = doc.pages().len() as u32;
+    let page = doc
+        .pages()
+        .get(page_num as u16)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+    Ok(PdfPageAnalysis {
+        content_type: analyze_page_content(&page),
+        page_count,
+    })
 }
 
 /// core_render に page_count 取得を追加した拡張版 (v1.0.0)。
@@ -1685,6 +1803,41 @@ impl PdfWorkerPool {
             page_count,
         })
     }
+
+    fn parse_analyze_page_response(data: &[u8]) -> std::io::Result<PdfPageAnalysis> {
+        if data.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "empty response",
+            ));
+        }
+        if data[0] == STATUS_ERR {
+            let msg = std::str::from_utf8(&data[1..]).unwrap_or("unknown error");
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
+        }
+        if data[0] != STATUS_OK || data.len() != 14 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid analyze response",
+            ));
+        }
+        let w = u32::from_le_bytes(data[2..6].try_into().unwrap());
+        let h = u32::from_le_bytes(data[6..10].try_into().unwrap());
+        let content_type = match data[1] {
+            0 => PdfPageContentType::Vector,
+            1 if w > 0 && h > 0 => PdfPageContentType::Raster { w, h },
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid analyze content type",
+                ));
+            }
+        };
+        Ok(PdfPageAnalysis {
+            content_type,
+            page_count: u32::from_le_bytes(data[10..14].try_into().unwrap()),
+        })
+    }
 }
 
 /// ディスパッチャースレッドのメインループ。
@@ -1945,6 +2098,13 @@ enum WorkerRequest {
         cancel: Option<Arc<AtomicBool>>,
         reply: mpsc::Sender<std::io::Result<RenderResult>>,
     },
+    AnalyzePage {
+        path: PathBuf,
+        page_num: u32,
+        password: Option<String>,
+        cancel: Option<Arc<AtomicBool>>,
+        reply: mpsc::Sender<std::io::Result<PdfPageAnalysis>>,
+    },
     /// PDF document info (§16 step 17, ingest_worker 経由で呼ばれる)
     GetInfo {
         path: PathBuf,
@@ -2109,6 +2269,22 @@ impl PdfWorker {
                 }
                 let _ = reply.send(result);
             }
+            WorkerRequest::AnalyzePage {
+                path,
+                page_num,
+                password,
+                cancel,
+                reply,
+            } => {
+                if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    return;
+                }
+                let result = core_analyze_page(pdfium, &path, page_num, password.as_deref());
+                if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    return;
+                }
+                let _ = reply.send(result);
+            }
             WorkerRequest::GetInfo {
                 path,
                 password,
@@ -2144,6 +2320,12 @@ impl PdfWorker {
                 let _ = reply.send(PdfAccessStatus::Error(e.to_string()));
             }
             WorkerRequest::Render { reply, .. } => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )));
+            }
+            WorkerRequest::AnalyzePage { reply, .. } => {
                 let _ = reply.send(Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     e.to_string(),
@@ -2333,6 +2515,13 @@ pub struct RenderResult {
     pub page_count: u32,
 }
 
+/// Render せずに取得した PDF page の canonical 判定情報。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PdfPageAnalysis {
+    pub content_type: PdfPageContentType,
+    pub page_count: u32,
+}
+
 /// AI 入力用 PDF canonical renderer の型付き結果。
 /// Vector は pixel を持たず、Raster だけが本体と同じ native-long-edge raster を持つ。
 pub enum CanonicalPdfPage {
@@ -2427,6 +2616,41 @@ pub fn get_document_info(
     let _ = get_worker().priority_tx.send(WorkerRequest::GetInfo {
         path: pdf_path.to_path_buf(),
         password: password.map(String::from),
+        reply: tx,
+    });
+    rx.recv()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?
+}
+
+/// AI canonical loader が vector PDF を pixel 化する前に型付きで拒否するための解析 API。
+/// worker process pool と in-process fallback のどちらでも PDFium 呼び出しは worker 上で行う。
+pub fn analyze_page_content_type(
+    pdf_path: &Path,
+    page_num: u32,
+    password: Option<&str>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> std::io::Result<PdfPageAnalysis> {
+    let pool = get_pool();
+    if pool.worker_count > 0 {
+        let req = encode_analyze_page_request(pdf_path, page_num, password);
+        let perf_key = crate::grid_item::pdf_page_perf_key(pdf_path, page_num);
+        let resp = pool.execute(
+            &req,
+            cancel.as_ref(),
+            JobPriority::Normal,
+            Some(perf_key),
+            0,
+            CancelWaitPolicy::AbortOnCancel,
+        )?;
+        return PdfWorkerPool::parse_analyze_page_response(&resp);
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let _ = get_worker().priority_tx.send(WorkerRequest::AnalyzePage {
+        path: pdf_path.to_path_buf(),
+        page_num,
+        password: password.map(String::from),
+        cancel,
         reply: tx,
     });
     rx.recv()
@@ -3237,6 +3461,50 @@ C:\isolated\miv-data"#
             }
             _ => panic!("unexpected decoded request"),
         }
+    }
+
+    #[test]
+    fn analyze_page_request_and_typed_response_round_trip_without_pixels() {
+        let encoded = encode_analyze_page_request(Path::new("sample.pdf"), 9, Some("secret"));
+        match decode_request(&encoded).unwrap() {
+            DecodedRequest::AnalyzePage {
+                path,
+                page_num,
+                password,
+            } => {
+                assert_eq!(path, PathBuf::from("sample.pdf"));
+                assert_eq!(page_num, 9);
+                assert_eq!(password.as_deref(), Some("secret"));
+            }
+            _ => panic!("unexpected decoded request"),
+        }
+
+        let mut response = vec![STATUS_OK, 1];
+        response.extend_from_slice(&824u32.to_le_bytes());
+        response.extend_from_slice(&1200u32.to_le_bytes());
+        response.extend_from_slice(&42u32.to_le_bytes());
+        assert_eq!(
+            response.len(),
+            14,
+            "analysis response contains no raster bytes"
+        );
+        assert_eq!(
+            PdfWorkerPool::parse_analyze_page_response(&response).unwrap(),
+            PdfPageAnalysis {
+                content_type: PdfPageContentType::Raster { w: 824, h: 1200 },
+                page_count: 42,
+            }
+        );
+
+        response[1] = 0;
+        response[2..10].fill(0);
+        assert_eq!(
+            PdfWorkerPool::parse_analyze_page_response(&response).unwrap(),
+            PdfPageAnalysis {
+                content_type: PdfPageContentType::Vector,
+                page_count: 42,
+            }
+        );
     }
 
     #[test]

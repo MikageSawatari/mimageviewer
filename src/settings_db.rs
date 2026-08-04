@@ -268,6 +268,12 @@ pub(crate) struct AdjustmentRenderSettings {
     pub(crate) global_preset: crate::adjustment::AdjustParams,
     pub(crate) creative_luts: Vec<crate::creative_lut::CreativeLutEntry>,
     pub(crate) conceal_preset: crate::conceal::ConcealPreset,
+    pub(crate) ai_feature_mode: crate::settings::AiFeatureMode,
+    pub(crate) ai_upscale_limit: crate::ai::upscale::AiProcessSizeLimit,
+    pub(crate) ai_denoise_limit: crate::ai::upscale::AiProcessSizeLimit,
+    pub(crate) ai_backend: Option<String>,
+    pub(crate) retained_final_ai_cache_max_entries: usize,
+    pub(crate) retained_final_ai_cache_max_mib: u64,
 }
 
 impl AdjustmentRenderSettings {
@@ -278,6 +284,12 @@ impl AdjustmentRenderSettings {
             global_preset: settings.global_preset.clone(),
             creative_luts: settings.creative_luts.clone(),
             conceal_preset: crate::conceal::ConcealPreset::from_settings(settings),
+            ai_feature_mode: settings.ai_feature_mode,
+            ai_upscale_limit: settings.ai_upscale_limit(),
+            ai_denoise_limit: settings.ai_denoise_limit(),
+            ai_backend: settings.ai_backend.clone(),
+            retained_final_ai_cache_max_entries: settings.retained_final_ai_cache_max_entries,
+            retained_final_ai_cache_max_mib: settings.retained_final_ai_cache_max_mib,
         }
     }
 }
@@ -489,6 +501,13 @@ impl SettingsDb {
         &self,
     ) -> Result<AdjustmentRenderSettings, SettingsDbError> {
         let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        let defaults = Settings::default();
+        let upscale_skip_px = read_settings_kv_typed(&inner.conn, "ai_upscale_skip_px", || {
+            defaults.ai_upscale_skip_px
+        })?;
+        let denoise_skip_px = read_settings_kv_typed(&inner.conn, "ai_denoise_skip_px", || {
+            defaults.ai_denoise_skip_px
+        })?;
         let conceal_preset = crate::conceal::ConcealPreset {
             name: "現在の設定".to_string(),
             conceal_type: read_settings_kv_typed(
@@ -539,6 +558,30 @@ impl SettingsDb {
                 crate::creative_lut::builtin_creative_lut_entries()
             })?,
             conceal_preset,
+            ai_feature_mode: read_settings_kv_typed(
+                &inner.conn,
+                "ai_feature_mode",
+                crate::settings::AiFeatureMode::default,
+            )?,
+            ai_upscale_limit: read_settings_kv_typed(&inner.conn, "ai_upscale_size_limit", || {
+                None
+            })?
+            .unwrap_or_else(|| crate::ai::upscale::AiProcessSizeLimit::square(upscale_skip_px)),
+            ai_denoise_limit: read_settings_kv_typed(&inner.conn, "ai_denoise_size_limit", || {
+                None
+            })?
+            .unwrap_or_else(|| crate::ai::upscale::AiProcessSizeLimit::square(denoise_skip_px)),
+            ai_backend: read_settings_kv_typed(&inner.conn, "ai_backend", || None)?,
+            retained_final_ai_cache_max_entries: read_settings_kv_typed(
+                &inner.conn,
+                "retained_final_ai_cache_max_entries",
+                || defaults.retained_final_ai_cache_max_entries,
+            )?,
+            retained_final_ai_cache_max_mib: read_settings_kv_typed(
+                &inner.conn,
+                "retained_final_ai_cache_max_mib",
+                || defaults.retained_final_ai_cache_max_mib,
+            )?,
         })
     }
 

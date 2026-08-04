@@ -145,6 +145,7 @@ pub(super) struct ServerGuard {
     write_work_tx: mpsc::SyncSender<Work>,
     stream_work_tx: mpsc::SyncSender<Work>,
     session_runtime: SessionRuntime,
+    _ai_jobs: Arc<super::ai_job::RemoteAiJobRegistry>,
 }
 
 impl ServerGuard {
@@ -174,6 +175,11 @@ impl ServerGuard {
             settings.clone(),
             session_handle.clone(),
         ));
+        let ai_executor = Arc::new(super::ai_job::ContainerRemoteAiExecutor::new(Arc::clone(
+            &container_engine,
+        )));
+        let ai_jobs = super::ai_job::RemoteAiJobRegistry::new(ai_executor);
+        session_handle.install_ai_jobs(&ai_jobs);
         let video_stream_engine = Arc::new(VideoStreamEngine::new(settings.clone()));
         let collection_engine = Arc::new(CollectionEngine::new(settings));
         let (heavy_work_tx, heavy_work_rx) = mpsc::sync_channel::<Work>(HEAVY_WORK_QUEUE_CAPACITY);
@@ -340,6 +346,7 @@ impl ServerGuard {
             write_work_tx,
             stream_work_tx,
             session_runtime,
+            _ai_jobs: ai_jobs,
         })
     }
 
@@ -475,7 +482,12 @@ fn worker_loop(
                     | ClientMessage::VideoStreamPlaylist { .. }
                     | ClientMessage::VideoStreamSegment { .. }
                     | ClientMessage::VideoStreamState { .. }
-                    | ClientMessage::VideoStreamStop { .. }) => service_stopped_response(&other),
+                    | ClientMessage::VideoStreamStop { .. }
+                    | ClientMessage::RemoteAiStart { .. }
+                    | ClientMessage::RemoteAiState { .. }
+                    | ClientMessage::RemoteAiRecoverable { .. }
+                    | ClientMessage::RemoteAiCancel { .. }
+                    | ClientMessage::RemoteAiResult { .. }) => service_stopped_response(&other),
                 },
             ),
             Ok(Work::Stop) | Err(_) => break,
@@ -985,6 +997,11 @@ fn request_kind(message: &ClientMessage) -> &'static str {
             PagePriority::Foreground => "page_foreground",
             PagePriority::Prefetch => "page_prefetch",
         },
+        ClientMessage::RemoteAiStart { .. } => "remote_ai_start",
+        ClientMessage::RemoteAiState { .. } => "remote_ai_state",
+        ClientMessage::RemoteAiRecoverable { .. } => "remote_ai_recoverable",
+        ClientMessage::RemoteAiCancel { .. } => "remote_ai_cancel",
+        ClientMessage::RemoteAiResult { .. } => "remote_ai_result",
         ClientMessage::Write { .. } => "write",
         ClientMessage::VideoStreamStart { .. } => "video_stream_start",
         ClientMessage::VideoStreamControl { .. } => "video_stream_control",
@@ -1009,6 +1026,11 @@ fn work_lane(message: &ClientMessage) -> WorkLane {
         | ClientMessage::VideoStreamSegment { .. }
         | ClientMessage::VideoStreamState { .. }
         | ClientMessage::VideoStreamStop { .. } => WorkLane::Stream,
+        ClientMessage::RemoteAiStart { .. }
+        | ClientMessage::RemoteAiState { .. }
+        | ClientMessage::RemoteAiRecoverable { .. }
+        | ClientMessage::RemoteAiCancel { .. }
+        | ClientMessage::RemoteAiResult { .. } => WorkLane::Heavy,
         _ => WorkLane::Heavy,
     }
 }
@@ -1022,6 +1044,11 @@ fn message_client_id(message: &ClientMessage) -> Option<&str> {
         | ClientMessage::Container { client_id, .. }
         | ClientMessage::FolderList { client_id, .. }
         | ClientMessage::Page { client_id, .. }
+        | ClientMessage::RemoteAiStart { client_id, .. }
+        | ClientMessage::RemoteAiState { client_id, .. }
+        | ClientMessage::RemoteAiRecoverable { client_id, .. }
+        | ClientMessage::RemoteAiCancel { client_id, .. }
+        | ClientMessage::RemoteAiResult { client_id, .. }
         | ClientMessage::Write { client_id, .. }
         | ClientMessage::VideoStreamStart { client_id, .. }
         | ClientMessage::VideoStreamControl { client_id, .. }
@@ -1062,6 +1089,11 @@ fn operation_description(message: &ClientMessage) -> String {
             }
             _ => "ページをレンダリング中".to_owned(),
         },
+        ClientMessage::RemoteAiStart { .. } => "remote AI job を開始中".to_owned(),
+        ClientMessage::RemoteAiState { .. } => "remote AI job の状態を確認中".to_owned(),
+        ClientMessage::RemoteAiRecoverable { .. } => "復帰可能な remote AI job を確認中".to_owned(),
+        ClientMessage::RemoteAiCancel { .. } => "remote AI job を取り消し中".to_owned(),
+        ClientMessage::RemoteAiResult { .. } => "remote AI result を取得中".to_owned(),
         ClientMessage::Write { request, .. } => match request {
             RemoteWriteRequest::SetSpread { .. } => "見開き設定を書き込み中",
             RemoteWriteRequest::RecordReadingProgress { .. } => "読書位置を記録中",
@@ -1091,6 +1123,43 @@ fn session_response(status: SessionStatus, message: impl Into<String>) -> Sessio
         status,
         message: message.into(),
     }
+}
+
+fn ai_session_error(response: SessionResponse) -> mimageviewer_ipc::RemoteAiJobError {
+    mimageviewer_ipc::RemoteAiJobError::new(
+        mimageviewer_ipc::RemoteAiJobErrorCode::SessionClosing,
+        response.message,
+    )
+}
+
+fn ai_stopped_error() -> mimageviewer_ipc::RemoteAiJobError {
+    mimageviewer_ipc::RemoteAiJobError::new(
+        mimageviewer_ipc::RemoteAiJobErrorCode::Internal,
+        "remote AI job registry is not available",
+    )
+}
+
+fn ai_busy_error() -> mimageviewer_ipc::RemoteAiJobError {
+    mimageviewer_ipc::RemoteAiJobError::new(
+        mimageviewer_ipc::RemoteAiJobErrorCode::Internal,
+        "remote AI queue is busy",
+    )
+}
+
+fn ai_start_stopped() -> mimageviewer_ipc::RemoteAiStartResponse {
+    mimageviewer_ipc::RemoteAiStartResponse::Error(ai_stopped_error())
+}
+fn ai_state_stopped() -> mimageviewer_ipc::RemoteAiStateResponse {
+    mimageviewer_ipc::RemoteAiStateResponse::Error(ai_stopped_error())
+}
+fn ai_recoverable_stopped() -> mimageviewer_ipc::RemoteAiRecoverableResponse {
+    mimageviewer_ipc::RemoteAiRecoverableResponse::Error(ai_stopped_error())
+}
+fn ai_cancel_stopped() -> mimageviewer_ipc::RemoteAiCancelResponse {
+    mimageviewer_ipc::RemoteAiCancelResponse::Error(ai_stopped_error())
+}
+fn ai_result_stopped() -> mimageviewer_ipc::RemoteAiResultResponse {
+    mimageviewer_ipc::RemoteAiResultResponse::Error(ai_stopped_error())
 }
 
 fn response_outcome(response: &ServerMessage) -> &'static str {
@@ -1126,6 +1195,26 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
         }
         | ServerMessage::Page {
             response: PageResponse::Success(_),
+            ..
+        }
+        | ServerMessage::RemoteAiStart {
+            response: mimageviewer_ipc::RemoteAiStartResponse::Accepted(_),
+            ..
+        }
+        | ServerMessage::RemoteAiState {
+            response: mimageviewer_ipc::RemoteAiStateResponse::Success(_),
+            ..
+        }
+        | ServerMessage::RemoteAiRecoverable {
+            response: mimageviewer_ipc::RemoteAiRecoverableResponse::Success(_),
+            ..
+        }
+        | ServerMessage::RemoteAiCancel {
+            response: mimageviewer_ipc::RemoteAiCancelResponse::Success(_),
+            ..
+        }
+        | ServerMessage::RemoteAiResult {
+            response: mimageviewer_ipc::RemoteAiResultResponse::Success(_),
             ..
         }
         | ServerMessage::Write {
@@ -1188,6 +1277,26 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
         }
         | ServerMessage::Page {
             response: PageResponse::Error(_),
+            ..
+        }
+        | ServerMessage::RemoteAiStart {
+            response: mimageviewer_ipc::RemoteAiStartResponse::Error(_),
+            ..
+        }
+        | ServerMessage::RemoteAiState {
+            response: mimageviewer_ipc::RemoteAiStateResponse::Error(_),
+            ..
+        }
+        | ServerMessage::RemoteAiRecoverable {
+            response: mimageviewer_ipc::RemoteAiRecoverableResponse::Error(_),
+            ..
+        }
+        | ServerMessage::RemoteAiCancel {
+            response: mimageviewer_ipc::RemoteAiCancelResponse::Error(_),
+            ..
+        }
+        | ServerMessage::RemoteAiResult {
+            response: mimageviewer_ipc::RemoteAiResultResponse::Error(_),
             ..
         }
         | ServerMessage::Write {
@@ -1469,6 +1578,82 @@ fn handle_connection(
                 let _ = reply_tx.send(ServerMessage::Session { id: *id, response });
                 continue;
             }
+            ClientMessage::RemoteAiStart {
+                id,
+                client_id,
+                request,
+                accept_before_unix_ms,
+            } => {
+                session.note_ai_client_seen(client_id);
+                let response = match session.begin_operation(client_id, "remote AI job".to_owned())
+                {
+                    Ok(operation) => session
+                        .ai_job_registry()
+                        .map(|jobs| {
+                            jobs.start(
+                                client_id.clone(),
+                                request.clone(),
+                                *accept_before_unix_ms,
+                                operation,
+                            )
+                        })
+                        .unwrap_or_else(ai_start_stopped),
+                    Err(session_response) => mimageviewer_ipc::RemoteAiStartResponse::Error(
+                        ai_session_error(session_response),
+                    ),
+                };
+                let _ = reply_tx.send(ServerMessage::RemoteAiStart { id: *id, response });
+                continue;
+            }
+            ClientMessage::RemoteAiState {
+                id,
+                client_id,
+                job_id,
+            } => {
+                session.note_ai_client_seen(client_id);
+                let response = session
+                    .ai_job_registry()
+                    .map(|jobs| jobs.state(client_id, job_id))
+                    .unwrap_or_else(ai_state_stopped);
+                let _ = reply_tx.send(ServerMessage::RemoteAiState { id: *id, response });
+                continue;
+            }
+            ClientMessage::RemoteAiRecoverable { id, client_id } => {
+                session.note_ai_client_seen(client_id);
+                let response = session
+                    .ai_job_registry()
+                    .map(|jobs| jobs.recoverable(client_id))
+                    .unwrap_or_else(ai_recoverable_stopped);
+                let _ = reply_tx.send(ServerMessage::RemoteAiRecoverable { id: *id, response });
+                continue;
+            }
+            ClientMessage::RemoteAiCancel {
+                id,
+                client_id,
+                job_id,
+            } => {
+                session.note_ai_client_seen(client_id);
+                let response = session
+                    .ai_job_registry()
+                    .map(|jobs| jobs.cancel(client_id, job_id))
+                    .unwrap_or_else(ai_cancel_stopped);
+                let _ = reply_tx.send(ServerMessage::RemoteAiCancel { id: *id, response });
+                continue;
+            }
+            ClientMessage::RemoteAiResult {
+                id,
+                client_id,
+                job_id,
+                page_index,
+            } => {
+                session.note_ai_client_seen(client_id);
+                let response = session
+                    .ai_job_registry()
+                    .map(|jobs| jobs.result(client_id, job_id, *page_index as usize))
+                    .unwrap_or_else(ai_result_stopped);
+                let _ = reply_tx.send(ServerMessage::RemoteAiResult { id: *id, response });
+                continue;
+            }
             _ => {}
         }
         let client_id =
@@ -1666,6 +1851,26 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
                 "mIV 本体の書き込みワーカーが停止しています",
             )),
         },
+        ClientMessage::RemoteAiStart { id, .. } => ServerMessage::RemoteAiStart {
+            id: *id,
+            response: ai_start_stopped(),
+        },
+        ClientMessage::RemoteAiState { id, .. } => ServerMessage::RemoteAiState {
+            id: *id,
+            response: ai_state_stopped(),
+        },
+        ClientMessage::RemoteAiRecoverable { id, .. } => ServerMessage::RemoteAiRecoverable {
+            id: *id,
+            response: ai_recoverable_stopped(),
+        },
+        ClientMessage::RemoteAiCancel { id, .. } => ServerMessage::RemoteAiCancel {
+            id: *id,
+            response: ai_cancel_stopped(),
+        },
+        ClientMessage::RemoteAiResult { id, .. } => ServerMessage::RemoteAiResult {
+            id: *id,
+            response: ai_result_stopped(),
+        },
         ClientMessage::VideoStreamStart { id, .. } => ServerMessage::VideoStreamStart {
             id: *id,
             response: stopped_video_response(),
@@ -1767,6 +1972,26 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
                 RemoteWriteErrorCode::Busy,
                 "mIV 本体のリモート書き込み queue が混み合っています",
             )),
+        },
+        ClientMessage::RemoteAiStart { id, .. } => ServerMessage::RemoteAiStart {
+            id: *id,
+            response: mimageviewer_ipc::RemoteAiStartResponse::Error(ai_busy_error()),
+        },
+        ClientMessage::RemoteAiState { id, .. } => ServerMessage::RemoteAiState {
+            id: *id,
+            response: mimageviewer_ipc::RemoteAiStateResponse::Error(ai_busy_error()),
+        },
+        ClientMessage::RemoteAiRecoverable { id, .. } => ServerMessage::RemoteAiRecoverable {
+            id: *id,
+            response: mimageviewer_ipc::RemoteAiRecoverableResponse::Error(ai_busy_error()),
+        },
+        ClientMessage::RemoteAiCancel { id, .. } => ServerMessage::RemoteAiCancel {
+            id: *id,
+            response: mimageviewer_ipc::RemoteAiCancelResponse::Error(ai_busy_error()),
+        },
+        ClientMessage::RemoteAiResult { id, .. } => ServerMessage::RemoteAiResult {
+            id: *id,
+            response: mimageviewer_ipc::RemoteAiResultResponse::Error(ai_busy_error()),
         },
         ClientMessage::VideoStreamStart { id, .. } => ServerMessage::VideoStreamStart {
             id: *id,

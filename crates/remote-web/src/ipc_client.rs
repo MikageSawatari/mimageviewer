@@ -3,7 +3,7 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimageviewer_ipc::{
     ClientHello, ClientMessage, CollectionError, CollectionErrorCode, CollectionKind,
@@ -11,15 +11,17 @@ use mimageviewer_ipc::{
     ContainerResponse, FolderListPayload, FolderListRequest, FolderListResponse, FrameError,
     HomePayload, HomeRequest, HomeResponse, MAX_CONTROL_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES,
     MediaError, MediaErrorCode, PIPE_NAME, PROTOCOL_VERSION, PagePayload, PagePriority,
-    PageRequest, PageResponse, RemoteAddress, RemoteWebConnectionInfo, RemoteWriteError,
-    RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult, RequestId,
-    ServerMessage, SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionResponse,
-    SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse,
-    VIDEO_STREAM_START_BUDGET, VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode,
-    VideoStreamPlaylistKind, VideoStreamPlaylistPayload, VideoStreamQuality, VideoStreamResult,
-    VideoStreamSeekPayload, VideoStreamSegmentIndex, VideoStreamSegmentPayload,
-    VideoStreamStartPayload, VideoStreamStatePayload, VideoStreamThumbnailPayload, read_frame,
-    write_frame,
+    PageRequest, PageResponse, REMOTE_AI_START_ACCEPT_BUDGET, RemoteAddress,
+    RemoteAiCancelResponse, RemoteAiJobError, RemoteAiJobSnapshot, RemoteAiRecoverableResponse,
+    RemoteAiResultResponse, RemoteAiStartRequest, RemoteAiStartResponse, RemoteAiStateResponse,
+    RemoteWebConnectionInfo, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest,
+    RemoteWriteResponse, RemoteWriteResult, RequestId, ServerMessage, SessionAcquireRequest,
+    SessionPeerInfo, SessionPingRequest, SessionResponse, SessionStatus, ThumbnailError,
+    ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse, VIDEO_STREAM_START_BUDGET,
+    VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode, VideoStreamPlaylistKind,
+    VideoStreamPlaylistPayload, VideoStreamQuality, VideoStreamResult, VideoStreamSeekPayload,
+    VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamStartPayload,
+    VideoStreamStatePayload, VideoStreamThumbnailPayload, read_frame, write_frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -126,6 +128,7 @@ pub enum ClientError {
     WriteRemote(RemoteWriteError),
     SessionRemote(SessionResponse),
     VideoStreamRemote(VideoStreamError),
+    RemoteAi(RemoteAiJobError),
 }
 
 impl ClientError {
@@ -187,6 +190,7 @@ impl ClientError {
             }
             .to_owned(),
             Self::VideoStreamRemote(error) => format!("miv_video_{:?}", error.code).to_lowercase(),
+            Self::RemoteAi(error) => format!("miv_remote_ai_{:?}", error.code).to_lowercase(),
         }
     }
 
@@ -232,6 +236,13 @@ impl fmt::Display for ClientError {
             Self::SessionRemote(response) => write!(f, "{}", response.message),
             Self::VideoStreamRemote(error) => {
                 write!(f, "mIV 本体が動画要求を拒否しました: {}", error.message)
+            }
+            Self::RemoteAi(error) => {
+                write!(
+                    f,
+                    "mIV 本体が remote AI 要求を拒否しました: {}",
+                    error.message
+                )
             }
         }
     }
@@ -639,6 +650,153 @@ impl ThumbnailClient {
                 retry_count: success.retry_count,
                 retry_statuses: success.retry_statuses,
             }),
+        })
+    }
+
+    pub fn remote_ai_start(
+        &self,
+        client_id: &str,
+        request: RemoteAiStartRequest,
+    ) -> Result<IpcSuccess<RemoteAiJobSnapshot>, ClientFailure> {
+        let accept_before_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .saturating_add(REMOTE_AI_START_ACCEPT_BUDGET)
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        self.remote_ai_request(
+            |id| ClientMessage::RemoteAiStart {
+                id,
+                client_id: client_id.to_owned(),
+                request: request.clone(),
+                accept_before_unix_ms,
+            },
+            |message| match message {
+                ServerMessage::RemoteAiStart { response, .. } => Some(match response {
+                    RemoteAiStartResponse::Accepted(snapshot) => Ok(snapshot),
+                    RemoteAiStartResponse::Error(error) => Err(error),
+                }),
+                _ => None,
+            },
+        )
+    }
+
+    pub fn remote_ai_state(
+        &self,
+        client_id: &str,
+        job_id: &str,
+    ) -> Result<IpcSuccess<RemoteAiJobSnapshot>, ClientFailure> {
+        self.remote_ai_request(
+            |id| ClientMessage::RemoteAiState {
+                id,
+                client_id: client_id.to_owned(),
+                job_id: job_id.to_owned(),
+            },
+            |message| match message {
+                ServerMessage::RemoteAiState { response, .. } => Some(match response {
+                    RemoteAiStateResponse::Success(snapshot) => Ok(snapshot),
+                    RemoteAiStateResponse::Error(error) => Err(error),
+                }),
+                _ => None,
+            },
+        )
+    }
+
+    pub fn remote_ai_recoverable(
+        &self,
+        client_id: &str,
+    ) -> Result<IpcSuccess<Vec<RemoteAiJobSnapshot>>, ClientFailure> {
+        self.remote_ai_request(
+            |id| ClientMessage::RemoteAiRecoverable {
+                id,
+                client_id: client_id.to_owned(),
+            },
+            |message| match message {
+                ServerMessage::RemoteAiRecoverable { response, .. } => Some(match response {
+                    RemoteAiRecoverableResponse::Success(snapshots) => Ok(snapshots),
+                    RemoteAiRecoverableResponse::Error(error) => Err(error),
+                }),
+                _ => None,
+            },
+        )
+    }
+
+    pub fn remote_ai_cancel(
+        &self,
+        client_id: &str,
+        job_id: &str,
+    ) -> Result<IpcSuccess<RemoteAiJobSnapshot>, ClientFailure> {
+        self.remote_ai_request(
+            |id| ClientMessage::RemoteAiCancel {
+                id,
+                client_id: client_id.to_owned(),
+                job_id: job_id.to_owned(),
+            },
+            |message| match message {
+                ServerMessage::RemoteAiCancel { response, .. } => Some(match response {
+                    RemoteAiCancelResponse::Success(snapshot) => Ok(snapshot),
+                    RemoteAiCancelResponse::Error(error) => Err(error),
+                }),
+                _ => None,
+            },
+        )
+    }
+
+    pub fn remote_ai_result(
+        &self,
+        client_id: &str,
+        job_id: &str,
+        page_index: u32,
+    ) -> Result<IpcSuccess<PagePayload>, ClientFailure> {
+        self.remote_ai_request(
+            |id| ClientMessage::RemoteAiResult {
+                id,
+                client_id: client_id.to_owned(),
+                job_id: job_id.to_owned(),
+                page_index,
+            },
+            |message| match message {
+                ServerMessage::RemoteAiResult { response, .. } => Some(match response {
+                    RemoteAiResultResponse::Success(payload) => Ok(payload),
+                    RemoteAiResultResponse::Error(error) => Err(error),
+                }),
+                _ => None,
+            },
+        )
+    }
+
+    fn remote_ai_request<T>(
+        &self,
+        request: impl Fn(RequestId) -> ClientMessage,
+        response: impl Fn(ServerMessage) -> Option<Result<T, RemoteAiJobError>>,
+    ) -> Result<IpcSuccess<T>, ClientFailure> {
+        self.collection_request(request).and_then(|success| {
+            let Some(routed) = response(success.value) else {
+                return Err(ClientFailure {
+                    error: ClientError::Protocol(protocol_failure(
+                        "response_route",
+                        "response_type_mismatch",
+                        None,
+                        "remote AI request received another response type",
+                    )),
+                    retry_count: success.retry_count,
+                    retry_statuses: success.retry_statuses,
+                });
+            };
+            match routed {
+                Ok(value) => Ok(IpcSuccess {
+                    value,
+                    retry_count: success.retry_count,
+                    retry_statuses: success.retry_statuses,
+                    connection_id: success.connection_id,
+                }),
+                Err(error) => Err(ClientFailure {
+                    error: ClientError::RemoteAi(error),
+                    retry_count: success.retry_count,
+                    retry_statuses: success.retry_statuses,
+                }),
+            }
         })
     }
 

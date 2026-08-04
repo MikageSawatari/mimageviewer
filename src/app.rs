@@ -48770,6 +48770,9 @@ impl App {
     }
 
     pub(crate) fn begin_local_ai_remote_barrier(&mut self) -> bool {
+        if let Some(bridge) = self.remote_ai_execution_bridge() {
+            bridge.set_background_mode(self.fs_transparent_bg_mode);
+        }
         if let Some(queue) = self.ai_job_queue.as_ref() {
             queue.cancel_all();
         }
@@ -53482,30 +53485,14 @@ impl App {
         &self,
         params: &crate::adjustment::AdjustParams,
     ) -> Option<Option<crate::ai::ModelKind>> {
-        if matches!(
-            self.settings.ai_feature_mode,
-            crate::settings::AiFeatureMode::Disabled
-        ) {
-            return None;
-        }
-        let request = params.upscale_model_kind()?;
-        match request {
-            None => Some(None),
-            Some(kind) if self.settings.ai_feature_mode.allows_upscale_model(kind) => {
-                Some(Some(kind))
-            }
-            Some(_) => None,
-        }
+        crate::ai::final_pipeline::effective_upscale_request(self.settings.ai_feature_mode, params)
     }
 
     fn effective_denoise_request(
         &self,
         params: &crate::adjustment::AdjustParams,
     ) -> Option<crate::ai::ModelKind> {
-        if !self.settings.ai_feature_mode.allows_denoise() {
-            return None;
-        }
-        params.denoise_model_kind()
+        crate::ai::final_pipeline::effective_denoise_request(self.settings.ai_feature_mode, params)
     }
 
     /// 戻り値: この key の AI 結果がいずれ届く見込みがあるか。
@@ -65178,162 +65165,44 @@ fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
     let runtime = &job.runtime;
     let manager = &job.manager;
     let cancel = &job.cancel;
-    let source_size = job.source.size;
     let retained_key = job.retained_key.clone();
     let retained_epoch = job.retained_epoch;
 
-    // モデルロードは worker 上で。ロードに失敗したモデルは「使えない」扱いに落とす
-    // (UI スレッドで load していた旧設計と最終状態は同じ: 両方不可なら Failed)。
-    let denoise_model = match job.denoise_kind {
-        Some(kind) => match ensure_model_loaded(runtime, manager, kind) {
-            Ok(()) => Some(kind),
-            Err(err) => {
-                crate::logger::log(format!("[AI] Final denoise model load failed: {err}"));
-                None
-            }
-        },
-        None => None,
+    let request = crate::ai::final_pipeline::FinalAiExecutionRequest {
+        source: Arc::clone(&job.source),
+        adjust_before_ai: job.adjust_before_ai.clone(),
+        denoise_kind: job.denoise_kind,
+        upscale_kind: job.upscale_kind,
+        background_mode: key.bg,
     };
-    let upscale_model = match job.upscale_kind {
-        Some(kind) => match ensure_model_loaded(runtime, manager, kind) {
-            Ok(()) => Some(kind),
-            Err(err) => {
-                crate::logger::log(format!("[AI] Final upscale model load failed: {err}"));
-                None
-            }
-        },
-        None => None,
-    };
-    if denoise_model.is_none() && upscale_model.is_none() {
-        return FinalAiResult::Failed {
+    match crate::ai::final_pipeline::execute_selected_final_ai(
+        runtime,
+        manager,
+        request,
+        cancel,
+        &crate::ai::final_pipeline::NoFinalAiProgress,
+    ) {
+        Ok(output) => FinalAiResult::Ready {
             job_id,
             key,
-            error: "no usable AI model (load failed)".to_string(),
-        };
-    }
-    if cancel.load(Ordering::Relaxed) {
-        return FinalAiResult::Cancelled { job_id, key };
-    }
-    let source = if let Some(params) = job.adjust_before_ai.as_ref() {
-        Arc::new(crate::adjustment::apply_adjustments_fast(
-            &job.source,
-            params,
-        ))
-    } else {
-        Arc::clone(&job.source)
-    };
-    if cancel.load(Ordering::Relaxed) {
-        return FinalAiResult::Cancelled { job_id, key };
-    }
-
-    let bg_rgb: [u8; 3] = if key.bg == 1 {
-        [255, 255, 255]
-    } else {
-        [0, 0, 0]
-    };
-    let composite_first = upscale_model.is_some();
-    let mut dynimg = if composite_first {
-        color_image_to_dynamic_composited(&source, bg_rgb)
-    } else {
-        color_image_to_dynamic(&source)
-    };
-
-    if let Some(denoise_kind) = denoise_model {
-        match crate::ai::denoise::denoise(runtime, denoise_kind, &dynimg, cancel) {
-            Ok(denoised) => {
-                if upscale_model.is_some() {
-                    dynimg = color_image_to_dynamic(&denoised);
-                } else {
-                    return FinalAiResult::Ready {
-                        job_id,
-                        key,
-                        retained_key,
-                        retained_epoch,
-                        source_size,
-                        image: denoised,
-                        used_upscale: false,
-                    };
-                }
-            }
-            Err(err) => {
-                if cancel.load(Ordering::Relaxed) {
-                    return FinalAiResult::Cancelled { job_id, key };
-                }
-                if upscale_model.is_none() {
-                    return FinalAiResult::Failed {
-                        job_id,
-                        key,
-                        error: err.to_string(),
-                    };
-                }
-                crate::logger::log(format!(
-                    "[AI] Final denoise failed for idx={}: {err}",
-                    key.edit_key.idx
-                ));
-            }
+            retained_key,
+            retained_epoch,
+            source_size: output.source_size,
+            image: output.image,
+            used_upscale: output.used_upscale,
+        },
+        Err(crate::ai::final_pipeline::FinalAiExecutionError::Cancelled) => {
+            FinalAiResult::Cancelled { job_id, key }
+        }
+        Err(crate::ai::final_pipeline::FinalAiExecutionError::Failed(error)) => {
+            FinalAiResult::Failed { job_id, key, error }
         }
     }
-
-    if let Some(upscale_kind) = upscale_model {
-        match crate::ai::upscale::upscale_to_max_dim(
-            runtime,
-            upscale_kind,
-            &dynimg,
-            cancel,
-            MAX_TEXTURE_DIM as u32,
-        ) {
-            // 4x 全面が GPU テクスチャ上限を超える場合でも、upscaler 側で最終
-            // ターゲットサイズへ直接合成する。clamp は安全網として残す。
-            Ok(result) => FinalAiResult::Ready {
-                job_id,
-                key,
-                retained_key,
-                retained_epoch,
-                source_size,
-                image: clamp_color_image_for_gpu(result.image),
-                used_upscale: result.used_upscale,
-            },
-            Err(err) => {
-                if cancel.load(Ordering::Relaxed) {
-                    FinalAiResult::Cancelled { job_id, key }
-                } else {
-                    FinalAiResult::Failed {
-                        job_id,
-                        key,
-                        error: err.to_string(),
-                    }
-                }
-            }
-        }
-    } else {
-        // denoise だけ成功し upscale_model=None の分岐は上で return 済みなので論理的に
-        // 到達しない。安全網として Failed (= 非 AI 表示へフォールバック) を返す。
-        FinalAiResult::Failed {
-            job_id,
-            key,
-            error: "no upscale model after denoise".to_string(),
-        }
-    }
-}
-
-/// 指定モデルがロード済みでなければロードする (worker スレッド専用)。
-fn ensure_model_loaded(
-    runtime: &crate::ai::runtime::AiRuntime,
-    manager: &crate::ai::model_manager::ModelManager,
-    kind: crate::ai::ModelKind,
-) -> Result<(), String> {
-    if runtime.is_loaded(kind) {
-        return Ok(());
-    }
-    let path = manager
-        .model_path(kind)
-        .ok_or_else(|| format!("model path not found for {kind:?}"))?;
-    runtime.load_model(kind, &path).map_err(|e| e.to_string())
 }
 
 /// egui::ColorImage → image::DynamicImage 変換ヘルパー。
 /// AI 推論の入力に使う。
-fn color_image_to_dynamic(ci: &egui::ColorImage) -> image::DynamicImage {
+pub(crate) fn color_image_to_dynamic(ci: &egui::ColorImage) -> image::DynamicImage {
     let w = ci.size[0] as u32;
     let h = ci.size[1] as u32;
     // Color32 は premultiplied で格納されているため、unmultiply してから書き出す。

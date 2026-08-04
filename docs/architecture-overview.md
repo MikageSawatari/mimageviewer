@@ -71,6 +71,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `app/top_level_grid_view.rs` | 通常一覧、検索、★固定、サブ展開、スマートフォルダ、閲覧履歴、レーティング一覧が共有する最上位 grid surface の単一 ownership と完全な復元 snapshot。スマートフォルダでは root の表示順、現在 entry、entry 内 current / Backspace stack を所有する。既存の個別 active flag は描画互換用に残す |
 | `app/smart_folder.rs` | 保存済みスマートフォルダの複数ルール / root 走査、フォルダ / 画像 / 動画 / 音声 / ZIP / PDF / 対応アーカイブ収集、物理フォルダ単位の同名正規化、ルール OR 条件適用、現在の全体ソート順と保存済みグループ化単位による prepare、snapshot 履歴復元、進捗 / cancel / stale generation 破棄を担当する。同名動画 sidecar は full-path key の snapshot として表示へ渡す。prepare worker は exact key の編集状態、変換アーカイブ対応、catalog、固定代表を一括準備し、UI install に同期 DB I/O を残さない。ソートだけの再構築は同一 snapshot generation の正規化 key 配列・採用 entry index・sparse metadata と共有 catalog cache を再利用し、DB を再照会しない。metadata DB の書込完了境界で revision を進め、古い cache / 完了結果は論理的に失効させる。巨大な旧 cache、revision / tombstone / generation / 表示定義の不一致で採用しない完成済みprepare結果、cancel時のpending receiver内に到着済み結果と大件数確認待ちsnapshotは、type-erased payloadとして専用 workerへ渡しUIスレッド外で破棄する。検索 / ★固定との相互排他は入口と worker 完了時の両方で検証し、検索結果・検索由来 Snapshot・進行中 smart から別の最上位ビューへ直行するときは復元なしで元 `TopLevelGridRestore` を原子的に移譲する。実フォルダ entry を開いた後の scope は `TopLevelGridView::SmartFolder` に残し、親移動と Ctrl+↑/↓ を entry root 内へ制限する。削除 tombstone は scan/prepare 世代と照合し、成功 snapshot 採用まで破棄しない。通常一覧のソート順・サムネイル / 詳細表示は定義へ保存も上書きもしない |
 | `app/tests.rs` | `App` 周辺の unit test / App-level 状態機械テスト |
+| `remote_ipc/ai_job.rs` | mIV Remote AI の job registry、13 状態、typed terminal、10 分 result / metadata 保持と tombstone、idempotent request identity、executor trait を所有する。job ごとの `RemoteAiJobLease` が `SessionOperation` を executor 終端まで保持して disconnect / supersede / background expiry の drain barrier に参加し、fake executor test が GPU 無しで lifecycle を固定する |
 | `settings.rs` | 設定の永続化 API (`Settings::load` / `save`)。Phase 3 で SQLite 経路に切替 (= `settings_db::boot_settings_db` / `with_db_result` 経由)。旧 JSON 経路 (`try_load_with_recovery` / `rotate_backups` / `write_atomic` 等) は `#[allow(dead_code)]` で残置 (将来削除予定) |
 | `ui_fonts.rs` / `ui_font_catalog.rs` | v2.7.0 UI フォント基盤。前者は日本語の正立した選択 face + 記号 / 絵文字 / CJK fallback、動画・音声の固定サイズ HUD label 用の既定 family を含む `FontDefinitions`、実メトリクス由来の縦位置補正、atlas resync 用 cache を所有する。後者は worker からシステム font / TTC face を列挙し、日本語 coverage と upright style の判定、ユーザー font 取り込み、プレビュー raster を行う |
 | `settings_db.rs` | 設定永続化 SQLite バックエンド (`%APPDATA%/mimageviewer/settings.db`)。spec §5 の起動決定木 (`boot_settings_db`)、世代バックアップ (`SettingsDb::rotate_backups` で `bak1..bak10`)、JSON migration (`migrate_from_settings_json`)、quarantine (`quarantine_db_files`)、save 抑止フラグ (`save_suppressed`) を提供。詳細は [docs/settings-sqlite-migration.md](settings-sqlite-migration.md) |
@@ -117,6 +118,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | モジュール | 役割 |
 | --- | --- |
 | `zip_loader.rs` | ZIP 内の画像列挙、エントリバイト取得、先頭画像抽出。ネスト ZIP (ZIP in ZIP) は再帰列挙し (表示は `zip_tree` でツリー化)、内側 ZIP バイト列は 256MB LRU キャッシュに保持。非 ZIP アーカイブ (RAR/7z/LZH) のエントリは `has_foreign_archives` フラグで検出して変換提案へつなぐ (v1.3.0)。読み戻しは literal フルネーム一致 → ネスト境界分割の順 (変換キャッシュのフラットエントリ対応)。画像判定は `folder_tree::is_recognized_image_ext` に委譲 (ネイティブ + WIC + Susie) |
+| `canonical_image_loader.rs` | fullscreen と remote AI が共有する静止画 canonical decoder。通常 file / verified bytes / ZIP・CBZ entry（nested ZIP を含む）を typed source で受け、image crate → WIC → Susie の順、EXIF 適用、GIF/APNG/WebP の既存 Animated 分類、通常 static の 8192 clamp を一箇所に置く。panorama 用 native tee は呼び出し側の従来位置に残し、raster PDF は `pdf_loader` の canonical renderer が担当する |
 | `pdf_loader.rs` | PDFium ワーカープロセスプール。ページ列挙・レンダリング |
 | `pdf_passwords.rs` | PDF パスワードの DPAPI 暗号化永続化 |
 | `wic_decoder.rs` | HEIC/AVIF/JXL/TIFF/RAW のデコード (Windows Imaging Component) |
@@ -173,6 +175,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | モジュール | 役割 |
 | --- | --- |
 | `adjustment.rs` | `AdjustParams` (輝度/コントラスト/γ/彩度/色温度…)、LUT 適用、オート補正 |
+| `ai/final_pipeline.rs` | fullscreen と remote AI が共有する effective upscale / denoise model 選択、native 寸法 size gate、model load、denoise → upscale 実行順の正本。任意の progress sink を受け、local は no-op、remote は model / tile phase を job progress へ投影する。model load failure 時の既存 fallback と cancel 境界を共有し、本体と remote の適用判定・出力順を分岐させない |
 | `final_composite.rs` | 静止画のページ個別 > 現在地標準 > global 解決、`FinalCompositePlan`、tone → smart sharpen → colorize → Creative LUT → post_filter の共有 CPU executor。元画像・編集結果の materialize、final AI、cache / worker / GPU upload は App / remote adapter 側に残す |
 | `adjustment_db.rs` | フォルダ別プリセット・ページ別プリセットの SQLite 永続化 |
 | `rotation_db.rs` | 非破壊回転の SQLite 永続化 |

@@ -8,9 +8,10 @@ use mimageviewer_ipc::{
     ContainerEntry, ContainerEntryKind, ContainerKind, ContainerOpenMode, ContainerPayload,
     ContainerRequest, ContainerResponse, FolderListEntry, FolderListPayload, FolderListRequest,
     FolderListResponse, MediaError, MediaErrorCode, PageGroup, PagePayload, PagePriority,
-    PageRequest, PageResponse, RemoteAddress, RemoteEntryKind, RemoteReadingDirection,
-    RemoteSpreadMode, RemoteSubresource, RemoteWriteError, RemoteWriteErrorCode,
-    RemoteWriteRequest, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse,
+    PageRequest, PageResponse, RemoteAddress, RemoteAiProgressPhase, RemoteAiStartRequest,
+    RemoteAiTerminalCode, RemoteEntryKind, RemoteReadingDirection, RemoteSpreadMode,
+    RemoteSubresource, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, ThumbnailError,
+    ThumbnailErrorCode, ThumbnailResponse,
 };
 
 use super::path_guard::{ResolveError, ResolvedFavoritePath, resolve_existing};
@@ -22,6 +23,8 @@ const REMOTE_COMPOSITE_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const REMOTE_LUT_CACHE_ENTRIES: usize = 16;
 const MAX_PAGE_RENDER_PX: u32 = crate::pdf_loader::PDF_RENDER_MAX_LONG_PX;
 const PAGE_WEBP_QUALITY: f32 = 90.0;
+/// Bump only when the native remote AI pipeline changes pixel semantics.
+const REMOTE_AI_PIPELINE_SCHEMA: u32 = 1;
 
 pub(super) struct ContainerEngine {
     settings: Arc<crate::settings::Settings>,
@@ -33,6 +36,7 @@ pub(super) struct ContainerEngine {
     adjustment_settings: AdjustmentSettingsSource,
     creative_lut_cache: Mutex<RemoteCreativeLutCache>,
     page_composite_cache: Mutex<RemoteCompositeCache>,
+    remote_ai_native_cache: Mutex<RemoteAiNativeCache>,
     comic_stamp_cache: Mutex<HashMap<String, Option<Arc<comic_core::RgbaOverlay>>>>,
     session: Option<super::session::SessionHandle>,
     page_prefetch_cancel: Mutex<Option<Arc<AtomicBool>>>,
@@ -51,13 +55,16 @@ struct RemoteAdjustmentIdentity {
     compiled_book: bool,
 }
 
+#[derive(Clone)]
 struct RemotePreparedComposite {
     key: RemoteCompositeCacheKey,
     params: crate::adjustment::AdjustParams,
     lut_entry: Option<crate::creative_lut::CreativeLutEntry>,
     edits: RemoteEditSnapshot,
+    settings: crate::settings_db::AdjustmentRenderSettings,
 }
 
+#[derive(Clone)]
 struct RemoteEditSnapshot {
     erase: Option<crate::edit_source::MaskSnapshot>,
     local_adjust: Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
@@ -66,6 +73,7 @@ struct RemoteEditSnapshot {
     comic: Vec<comic_core::AnnotationObject>,
     export_crop: Option<crate::export_crop::CropSettings>,
     fingerprint: [u8; 32],
+    pre_ai_fingerprint: [u8; 32],
 }
 
 struct RemoteMaterializedEdits {
@@ -91,6 +99,118 @@ struct RemoteCompositeCacheEntry {
     key: RemoteCompositeCacheKey,
     pixels: Arc<egui::ColorImage>,
     bytes: usize,
+}
+
+#[derive(Clone, PartialEq)]
+struct RemoteAiNativeCacheKey {
+    page_key: String,
+    mtime: i64,
+    file_size: i64,
+    source_size: [usize; 2],
+    pre_ai_params: crate::adjustment::AdjustParams,
+    pre_ai_edit_fingerprint: [u8; 32],
+    ai_feature_mode: crate::settings::AiFeatureMode,
+    ai_upscale_limit: crate::ai::upscale::AiProcessSizeLimit,
+    ai_denoise_limit: crate::ai::upscale::AiProcessSizeLimit,
+    ai_backend: Option<String>,
+    background_mode: u8,
+    pipeline_schema: u32,
+    model_epoch: [u8; 32],
+}
+
+#[derive(Clone, PartialEq)]
+struct RemoteAiResultIdentity {
+    composite: RemoteCompositeCacheKey,
+    ai_feature_mode: crate::settings::AiFeatureMode,
+    ai_upscale_limit: crate::ai::upscale::AiProcessSizeLimit,
+    ai_denoise_limit: crate::ai::upscale::AiProcessSizeLimit,
+    ai_backend: Option<String>,
+    retained_max_entries: usize,
+    retained_max_mib: u64,
+    background_mode: u8,
+}
+
+impl RemoteAiResultIdentity {
+    fn from_prepared(prepared: &RemotePreparedComposite, background_mode: u8) -> Self {
+        Self {
+            composite: prepared.key.clone(),
+            ai_feature_mode: prepared.settings.ai_feature_mode,
+            ai_upscale_limit: prepared.settings.ai_upscale_limit,
+            ai_denoise_limit: prepared.settings.ai_denoise_limit,
+            ai_backend: prepared.settings.ai_backend.clone(),
+            retained_max_entries: prepared.settings.retained_final_ai_cache_max_entries,
+            retained_max_mib: prepared.settings.retained_final_ai_cache_max_mib,
+            background_mode,
+        }
+    }
+}
+
+struct RemoteAiNativeCacheEntry {
+    key: RemoteAiNativeCacheKey,
+    pixels: Arc<egui::ColorImage>,
+    used_upscale: bool,
+    bytes: u64,
+}
+
+#[derive(Default)]
+struct RemoteAiNativeCache {
+    entries: VecDeque<RemoteAiNativeCacheEntry>,
+    bytes: u64,
+}
+
+impl RemoteAiNativeCache {
+    fn enforce_budget(&mut self, max_entries: usize, max_bytes: u64) {
+        if max_entries == 0 || max_bytes == 0 {
+            self.entries.clear();
+            self.bytes = 0;
+            return;
+        }
+        while self.entries.len() > max_entries || self.bytes > max_bytes {
+            let Some(removed) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(removed.bytes);
+        }
+    }
+
+    fn get(&mut self, key: &RemoteAiNativeCacheKey) -> Option<(Arc<egui::ColorImage>, bool)> {
+        let position = self.entries.iter().position(|entry| entry.key == *key)?;
+        let entry = self.entries.remove(position)?;
+        let result = (Arc::clone(&entry.pixels), entry.used_upscale);
+        self.entries.push_back(entry);
+        Some(result)
+    }
+
+    fn insert(
+        &mut self,
+        key: RemoteAiNativeCacheKey,
+        pixels: Arc<egui::ColorImage>,
+        used_upscale: bool,
+        max_entries: usize,
+        max_bytes: u64,
+    ) {
+        if max_entries == 0 || max_bytes == 0 {
+            self.enforce_budget(max_entries, max_bytes);
+            return;
+        }
+        let bytes = pixels.as_raw().len() as u64;
+        if bytes > max_bytes {
+            return;
+        }
+        if let Some(position) = self.entries.iter().position(|entry| entry.key == key)
+            && let Some(previous) = self.entries.remove(position)
+        {
+            self.bytes = self.bytes.saturating_sub(previous.bytes);
+        }
+        self.entries.push_back(RemoteAiNativeCacheEntry {
+            key,
+            pixels,
+            used_upscale,
+            bytes,
+        });
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.enforce_budget(max_entries, max_bytes);
+    }
 }
 
 #[derive(Default)]
@@ -291,6 +411,7 @@ impl ContainerEngine {
             adjustment_settings,
             creative_lut_cache: Mutex::new(RemoteCreativeLutCache::default()),
             page_composite_cache: Mutex::new(RemoteCompositeCache::default()),
+            remote_ai_native_cache: Mutex::new(RemoteAiNativeCache::default()),
             comic_stamp_cache: Mutex::new(HashMap::new()),
             session,
             page_prefetch_cancel: Mutex::new(None),
@@ -389,6 +510,12 @@ impl ContainerEngine {
             &comic,
             export_crop.as_ref(),
         )?;
+        let pre_ai_fingerprint = remote_pre_ai_edit_fingerprint(
+            erase.as_ref(),
+            local_adjust.as_ref(),
+            conceal.as_ref(),
+            &conceal_preset,
+        )?;
         Ok(RemoteEditSnapshot {
             erase,
             local_adjust,
@@ -397,6 +524,7 @@ impl ContainerEngine {
             comic,
             export_crop,
             fingerprint,
+            pre_ai_fingerprint,
         })
     }
 
@@ -565,6 +693,7 @@ impl ContainerEngine {
             params,
             lut_entry,
             edits,
+            settings,
         }))
     }
 
@@ -1318,6 +1447,432 @@ impl ContainerEngine {
             &address.relative_path,
         )
         .map_err(resolve_media_error)
+    }
+
+    pub(super) fn execute_remote_ai(
+        &self,
+        request: &RemoteAiStartRequest,
+        progress: &dyn super::ai_job::RemoteAiProgressSink,
+        cancel: &Arc<AtomicBool>,
+    ) -> super::ai_job::RemoteAiExecutionOutcome {
+        match self.execute_remote_ai_inner(request, progress, cancel) {
+            Ok(results) => super::ai_job::RemoteAiExecutionOutcome::Ready(results),
+            Err(RemoteAiRunError::NotApplicable {
+                code,
+                message,
+                page_index,
+            }) => super::ai_job::RemoteAiExecutionOutcome::NotApplicable {
+                code,
+                message,
+                page_index,
+            },
+            Err(RemoteAiRunError::Superseded(message)) => {
+                super::ai_job::RemoteAiExecutionOutcome::Superseded(message)
+            }
+            Err(RemoteAiRunError::Failed(message)) => {
+                super::ai_job::RemoteAiExecutionOutcome::Failed(message)
+            }
+        }
+    }
+
+    fn execute_remote_ai_inner(
+        &self,
+        request: &RemoteAiStartRequest,
+        progress: &dyn super::ai_job::RemoteAiProgressSink,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<Vec<PagePayload>, RemoteAiRunError> {
+        self.execute_remote_ai_inner_with(
+            request,
+            progress,
+            cancel,
+            &|engine, address, logical_path, mtime, file_size, target_px, context| {
+                engine.prepare_remote_composite(
+                    address,
+                    logical_path,
+                    mtime,
+                    file_size,
+                    target_px,
+                    None,
+                    context,
+                )
+            },
+            &|engine, address, resolved, metadata, page_index, cancel| {
+                engine.decode_remote_ai_source(address, resolved, metadata, page_index, cancel)
+            },
+            &|engine| {
+                engine
+                    .session
+                    .as_ref()
+                    .and_then(super::session::SessionHandle::remote_ai_resources)
+            },
+        )
+    }
+
+    fn execute_remote_ai_inner_with(
+        &self,
+        request: &RemoteAiStartRequest,
+        progress: &dyn super::ai_job::RemoteAiProgressSink,
+        cancel: &Arc<AtomicBool>,
+        prepare_composite: &dyn Fn(
+            &Self,
+            &RemoteAddress,
+            &Path,
+            i64,
+            i64,
+            u32,
+            &WorkerContext,
+        ) -> Result<Option<RemotePreparedComposite>, MediaError>,
+        decode_source: &dyn Fn(
+            &Self,
+            &RemoteAddress,
+            &ResolvedFavoritePath,
+            &std::fs::Metadata,
+            usize,
+            &Arc<AtomicBool>,
+        )
+            -> Result<(Arc<egui::ColorImage>, [usize; 2]), RemoteAiRunError>,
+        resources_for_remote: &dyn Fn(&Self) -> Option<super::session::RemoteAiResources>,
+    ) -> Result<Vec<PagePayload>, RemoteAiRunError> {
+        let context = WorkerContext::open();
+        let page_count = request.pages.len();
+        let mut results = Vec::with_capacity(page_count);
+        let mut identities = Vec::with_capacity(page_count);
+
+        for (page_index, page) in request.pages.iter().enumerate() {
+            check_remote_ai_cancel(cancel)?;
+            progress.update(
+                mimageviewer_ipc::RemoteAiJobState::PreparingSource,
+                Some(remote_ai_progress(
+                    RemoteAiProgressPhase::PreparingSource,
+                    page_index,
+                    page_count,
+                    0,
+                    None,
+                )),
+            );
+            let resolved = self.resolve(&page.address).map_err(remote_ai_media_error)?;
+            let metadata = std::fs::metadata(&resolved.canonical)
+                .map_err(|error| RemoteAiRunError::Failed(format!("source metadata: {error}")))?;
+            if !metadata.is_file() {
+                return Err(RemoteAiRunError::Failed(
+                    "AI source is not a file".to_owned(),
+                ));
+            }
+            let mtime = crate::ui_helpers::mtime_secs(&metadata);
+            let file_size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+            let prepared = prepare_composite(
+                self,
+                &page.address,
+                &resolved.logical,
+                mtime,
+                file_size,
+                page.target_px,
+                &context,
+            )
+            .map_err(remote_ai_media_error)?
+            .ok_or_else(|| {
+                RemoteAiRunError::Failed("address does not identify an image page".to_owned())
+            })?;
+            let (source, source_dims) = decode_source(
+                self,
+                &page.address,
+                &resolved,
+                &metadata,
+                page_index,
+                cancel,
+            )?;
+            check_remote_ai_cancel(cancel)?;
+            let pre_ai_edit_fingerprint = prepared.edits.pre_ai_fingerprint;
+            let materialized = self
+                .execute_remote_edits(source, prepared.edits.clone(), cancel)
+                .map_err(remote_ai_media_error)?;
+            let selected = crate::ai::final_pipeline::select_final_ai_models(
+                &materialized.pixels,
+                &prepared.params,
+                prepared.settings.ai_feature_mode,
+                prepared.settings.ai_upscale_limit,
+                prepared.settings.ai_denoise_limit,
+            )
+            .ok_or_else(|| RemoteAiRunError::NotApplicable {
+                code: RemoteAiTerminalCode::SizeGate,
+                message: "AI is disabled or the source is outside the configured size gate"
+                    .to_owned(),
+                page_index,
+            })?;
+            // Animated/vector/size-gated sources terminate above without initializing or loading
+            // the shared runtime. Only an applicable final-AI request claims the bridge.
+            let resources = resources_for_remote(self)
+                .ok_or_else(|| RemoteAiRunError::Failed("AI runtime is unavailable".to_owned()))?;
+
+            let native_key = RemoteAiNativeCacheKey {
+                page_key: prepared.key.page_key.clone(),
+                mtime,
+                file_size,
+                source_size: materialized.pixels.size,
+                pre_ai_params: remote_ai_pre_params(&prepared.params),
+                pre_ai_edit_fingerprint,
+                ai_feature_mode: prepared.settings.ai_feature_mode,
+                ai_upscale_limit: prepared.settings.ai_upscale_limit,
+                ai_denoise_limit: prepared.settings.ai_denoise_limit,
+                ai_backend: prepared.settings.ai_backend.clone(),
+                background_mode: resources.background_mode,
+                pipeline_schema: REMOTE_AI_PIPELINE_SCHEMA,
+                model_epoch: remote_ai_model_epoch(
+                    &resources.runtime,
+                    &resources.manager,
+                    selected,
+                ),
+            };
+            let (max_entries, max_bytes) =
+                remote_ai_native_budget(&prepared.settings).unwrap_or((0, 0));
+            let cached = {
+                let mut cache = self
+                    .remote_ai_native_cache
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                // Re-apply the live retained-cache settings even on a hit. Otherwise lowering
+                // the configured budget would not affect remote entries until the next miss.
+                cache.enforce_budget(max_entries, max_bytes);
+                cache.get(&native_key)
+            };
+            let (native_pixels, used_upscale) = match cached {
+                Some(hit) => hit,
+                None => {
+                    let progress_adapter = ContainerFinalAiProgress {
+                        sink: progress,
+                        page_index,
+                        page_count,
+                    };
+                    let output = crate::ai::final_pipeline::execute_selected_final_ai(
+                        &resources.runtime,
+                        &resources.manager,
+                        crate::ai::final_pipeline::FinalAiExecutionRequest {
+                            source: Arc::clone(&materialized.pixels),
+                            adjust_before_ai: (!prepared.params.is_color_identity())
+                                .then(|| prepared.params.clone()),
+                            denoise_kind: selected.denoise,
+                            upscale_kind: selected.upscale,
+                            background_mode: resources.background_mode,
+                        },
+                        cancel,
+                        &progress_adapter,
+                    )
+                    .map_err(|error| match error {
+                        crate::ai::final_pipeline::FinalAiExecutionError::Cancelled => {
+                            RemoteAiRunError::Failed("AI job was cancelled".to_owned())
+                        }
+                        crate::ai::final_pipeline::FinalAiExecutionError::Failed(error) => {
+                            RemoteAiRunError::Failed(error)
+                        }
+                    })?;
+                    let pixels = Arc::new(output.image);
+                    self.remote_ai_native_cache
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert(
+                            native_key,
+                            Arc::clone(&pixels),
+                            output.used_upscale,
+                            max_entries,
+                            max_bytes,
+                        );
+                    (pixels, output.used_upscale)
+                }
+            };
+
+            progress.update(
+                mimageviewer_ipc::RemoteAiJobState::Finalizing,
+                Some(remote_ai_progress(
+                    RemoteAiProgressPhase::Finalizing,
+                    page_index,
+                    page_count,
+                    4,
+                    None,
+                )),
+            );
+            check_remote_ai_cancel(cancel)?;
+            let lut = self
+                .resolve_remote_lut(prepared.lut_entry.as_ref())
+                .map_err(remote_ai_media_error)?;
+            let plan = crate::final_composite::build_final_composite_plan_after_ai(
+                &prepared.params,
+                lut.map(|lut| (lut, prepared.params.creative_lut.strength)),
+                used_upscale,
+            );
+            let mut pixels = match crate::final_composite::execute_final_composite(
+                native_pixels,
+                plan,
+                cancel,
+            ) {
+                crate::final_composite::FinalCompositeResult::Ready { pixels, .. } => pixels,
+                crate::final_composite::FinalCompositeResult::Cancelled => {
+                    return Err(RemoteAiRunError::Failed("AI job was cancelled".to_owned()));
+                }
+            };
+            if !materialized.comic.is_empty()
+                && let Some(fonts) = crate::comic_overlay::load_comic_fonts_for(&materialized.comic)
+            {
+                pixels = crate::edit_source::comic_composite(
+                    &pixels,
+                    &materialized.comic,
+                    source_dims,
+                    &fonts,
+                    &mut self
+                        .comic_stamp_cache
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()),
+                    cancel,
+                );
+            }
+            if let Some(crop) = materialized.export_crop {
+                let rect =
+                    crate::edit_source::export_crop_rect_for_pixels(crop, source_dims, pixels.size);
+                pixels = Arc::new(
+                    crate::export_crop::crop_color_image(&pixels, rect)
+                        .map_err(|error| RemoteAiRunError::Failed(error.to_string()))?,
+                );
+            }
+            let image = loaded_image_from_color_image(&pixels).map_err(remote_ai_media_error)?;
+            let (bytes, width, height) =
+                crate::catalog::encode_thumb_webp(&image.image, page.target_px, PAGE_WEBP_QUALITY)
+                    .ok_or_else(|| RemoteAiRunError::Failed("WebP encoding failed".to_owned()))?;
+            results.push(PagePayload {
+                bytes,
+                content_type: "image/webp".to_owned(),
+                width,
+                height,
+            });
+            identities.push((
+                page.address.clone(),
+                page.target_px,
+                RemoteAiResultIdentity::from_prepared(&prepared, resources.background_mode),
+            ));
+        }
+
+        // Result bytes are publishable only if source/edit/settings still match the snapshots
+        // that produced them. Re-open worker DB handles so this is a true completion-time read.
+        let validation_context = WorkerContext::open();
+        let current_background = self
+            .session
+            .as_ref()
+            .and_then(super::session::SessionHandle::remote_ai_resources)
+            .map(|resources| resources.background_mode)
+            .ok_or_else(|| RemoteAiRunError::Superseded("AI runtime was detached".to_owned()))?;
+        for (address, target_px, expected) in identities {
+            check_remote_ai_cancel(cancel)?;
+            let resolved = self.resolve(&address).map_err(|_| {
+                RemoteAiRunError::Superseded("source is no longer available".to_owned())
+            })?;
+            let metadata = std::fs::metadata(&resolved.canonical)
+                .map_err(|_| RemoteAiRunError::Superseded("source metadata changed".to_owned()))?;
+            let current = self
+                .prepare_remote_composite(
+                    &address,
+                    &resolved.logical,
+                    crate::ui_helpers::mtime_secs(&metadata),
+                    i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+                    target_px,
+                    None,
+                    &validation_context,
+                )
+                .map_err(|_| {
+                    RemoteAiRunError::Superseded("source snapshot cannot be revalidated".to_owned())
+                })?
+                .map(|prepared| {
+                    RemoteAiResultIdentity::from_prepared(&prepared, current_background)
+                });
+            if current.as_ref() != Some(&expected) {
+                return Err(RemoteAiRunError::Superseded(
+                    "source, edits, or AI settings changed while the job was running".to_owned(),
+                ));
+            }
+        }
+        Ok(results)
+    }
+
+    fn decode_remote_ai_source(
+        &self,
+        address: &RemoteAddress,
+        resolved: &ResolvedFavoritePath,
+        metadata: &std::fs::Metadata,
+        page_index: usize,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(Arc<egui::ColorImage>, [usize; 2]), RemoteAiRunError> {
+        match &address.subresource {
+            RemoteSubresource::File if is_image_path(&resolved.logical) => {
+                decode_remote_ai_canonical(
+                    crate::canonical_image_loader::CanonicalImageSource::File {
+                        path: &resolved.canonical,
+                        verified_bytes: None,
+                    },
+                    page_index,
+                    cancel,
+                )
+            }
+            RemoteSubresource::ZipEntry { entry_name } if is_zip_path(&resolved.logical) => {
+                decode_remote_ai_canonical(
+                    crate::canonical_image_loader::CanonicalImageSource::ArchiveEntry {
+                        archive_path: &resolved.canonical,
+                        entry_name,
+                    },
+                    page_index,
+                    cancel,
+                )
+            }
+            RemoteSubresource::PdfPage { page_number } if is_pdf_path(&resolved.logical) => {
+                self.ensure_pdf_page_in_range(resolved, metadata, *page_number)
+                    .map_err(remote_ai_media_error)?;
+                let password = self.pdf_passwords.get(&resolved.logical);
+                let analysis = crate::pdf_loader::analyze_page_content_type(
+                    &resolved.canonical,
+                    *page_number,
+                    password.as_deref(),
+                    Some(Arc::clone(cancel)),
+                )
+                .map_err(|error| RemoteAiRunError::Failed(error.to_string()))?;
+                if matches!(
+                    analysis.content_type,
+                    crate::pdf_loader::PdfPageContentType::Vector
+                ) {
+                    return Err(RemoteAiRunError::NotApplicable {
+                        code: RemoteAiTerminalCode::VectorPdf,
+                        message: "vector PDF pages are not AI raster sources".to_owned(),
+                        page_index,
+                    });
+                }
+                match crate::pdf_loader::render_page_canonical_raster(
+                    &resolved.canonical,
+                    *page_number,
+                    analysis.content_type,
+                    password.as_deref(),
+                    Some(Arc::clone(cancel)),
+                    crate::pdf_loader::JobPriority::Normal,
+                    0,
+                    crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+                )
+                .map_err(|error| RemoteAiRunError::Failed(error.to_string()))?
+                {
+                    crate::pdf_loader::CanonicalPdfPage::Vector => {
+                        Err(RemoteAiRunError::NotApplicable {
+                            code: RemoteAiTerminalCode::VectorPdf,
+                            message: "PDF page became vector during canonical render".to_owned(),
+                            page_index,
+                        })
+                    }
+                    crate::pdf_loader::CanonicalPdfPage::Raster {
+                        image, native_dims, ..
+                    } => Ok((
+                        Arc::new(crate::canonical_image_loader::dynamic_image_to_color_image(
+                            &image,
+                        )),
+                        [native_dims[0] as usize, native_dims[1] as usize],
+                    )),
+                }
+            }
+            _ => Err(RemoteAiRunError::Failed(
+                "address is not a supported still-image page".to_owned(),
+            )),
+        }
     }
 
     fn enumerate(
@@ -2180,6 +2735,31 @@ fn remote_edit_fingerprint(
     Ok(digest.finalize().into())
 }
 
+fn remote_pre_ai_edit_fingerprint(
+    erase: Option<&crate::edit_source::MaskSnapshot>,
+    local_adjust: Option<&Vec<local_adjust_core::LocalAdjustmentLayer>>,
+    conceal: Option<&crate::edit_source::MaskSnapshot>,
+    conceal_preset: &crate::conceal::ConcealPreset,
+) -> Result<[u8; 32], MediaError> {
+    use sha2::Digest;
+    let mut digest = sha2::Sha256::new();
+    hash_remote_edit_value(
+        &mut digest,
+        b"erase",
+        &erase.map(|mask| (&mask.bitmap, &mask.shapes, mask.size)),
+    )?;
+    hash_remote_edit_value(&mut digest, b"local", &local_adjust)?;
+    hash_remote_edit_value(
+        &mut digest,
+        b"conceal",
+        &conceal.map(|mask| (&mask.bitmap, &mask.shapes, mask.size)),
+    )?;
+    if conceal.is_some() {
+        hash_remote_edit_value(&mut digest, b"conceal-preset", conceal_preset)?;
+    }
+    Ok(digest.finalize().into())
+}
+
 fn hash_remote_edit_value<T: serde::Serialize>(
     digest: &mut sha2::Sha256,
     label: &[u8],
@@ -2327,6 +2907,185 @@ fn execute_remote_composite(
             MediaErrorCode::Busy,
             "先読みは新しいページ要求に置き換えられました",
         )),
+    }
+}
+
+enum RemoteAiRunError {
+    NotApplicable {
+        code: RemoteAiTerminalCode,
+        message: String,
+        page_index: usize,
+    },
+    Superseded(String),
+    Failed(String),
+}
+
+fn remote_ai_media_error(error: MediaError) -> RemoteAiRunError {
+    RemoteAiRunError::Failed(error.message)
+}
+
+fn check_remote_ai_cancel(cancel: &AtomicBool) -> Result<(), RemoteAiRunError> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(RemoteAiRunError::Failed("AI job was cancelled".to_owned()))
+    } else {
+        Ok(())
+    }
+}
+
+fn remote_ai_pre_params(
+    params: &crate::adjustment::AdjustParams,
+) -> crate::adjustment::AdjustParams {
+    let mut result = params.clone();
+    result.post_filter = crate::adjustment::PostFilter::None;
+    result.creative_lut = crate::creative_lut::CreativeLutSelection::default();
+    result.colorize = crate::colorize::ColorizeParams::default();
+    result.smart_sharpen = 0;
+    result
+}
+
+fn remote_ai_native_budget(
+    settings: &crate::settings_db::AdjustmentRenderSettings,
+) -> Option<(usize, u64)> {
+    let max_entries = settings.retained_final_ai_cache_max_entries;
+    let max_mib = settings.retained_final_ai_cache_max_mib;
+    if max_entries == 0 || max_mib == 0 {
+        return None;
+    }
+    Some((max_entries, max_mib.saturating_mul(1024 * 1024)))
+}
+
+fn remote_ai_model_epoch(
+    runtime: &crate::ai::runtime::AiRuntime,
+    manager: &crate::ai::model_manager::ModelManager,
+    selected: crate::ai::final_pipeline::SelectedFinalAiModels,
+) -> [u8; 32] {
+    use sha2::Digest;
+    let mut digest = sha2::Sha256::new();
+    digest.update(REMOTE_AI_PIPELINE_SCHEMA.to_le_bytes());
+    digest.update(runtime.active_backend().requested.as_str().as_bytes());
+    digest.update(runtime.active_backend().effective.as_str().as_bytes());
+    digest.update(crate::ai::tensorrt_pack::EXPECTED_TRT_PACK_VERSION.to_le_bytes());
+    for kind in [selected.denoise, selected.upscale].into_iter().flatten() {
+        digest.update(format!("{kind:?}").as_bytes());
+        digest.update([u8::from(runtime.should_route_to_worker(kind))]);
+        if let Some(path) = manager.model_path(kind) {
+            digest.update(path.as_os_str().to_string_lossy().as_bytes());
+            if let Ok(metadata) = std::fs::metadata(path) {
+                digest.update(metadata.len().to_le_bytes());
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or_default();
+                digest.update(modified.to_le_bytes());
+            }
+        }
+    }
+    digest.finalize().into()
+}
+
+fn remote_ai_progress(
+    phase: RemoteAiProgressPhase,
+    page_index: usize,
+    page_count: usize,
+    stage_index: u32,
+    tiles: Option<(usize, usize)>,
+) -> mimageviewer_ipc::RemoteAiProgress {
+    mimageviewer_ipc::RemoteAiProgress {
+        phase,
+        page_index: page_index as u32,
+        page_count: page_count as u32,
+        stage_index,
+        stage_count: 5,
+        completed_tiles: tiles.map(|(completed, _)| completed as u32),
+        total_tiles: tiles.map(|(_, total)| total as u32),
+    }
+}
+
+struct ContainerFinalAiProgress<'a> {
+    sink: &'a dyn super::ai_job::RemoteAiProgressSink,
+    page_index: usize,
+    page_count: usize,
+}
+
+impl crate::ai::final_pipeline::FinalAiProgressSink for ContainerFinalAiProgress<'_> {
+    fn loading_model(&self, _kind: crate::ai::ModelKind) {
+        self.sink.update(
+            mimageviewer_ipc::RemoteAiJobState::LoadingModel,
+            Some(remote_ai_progress(
+                RemoteAiProgressPhase::LoadingModel,
+                self.page_index,
+                self.page_count,
+                1,
+                None,
+            )),
+        );
+    }
+
+    fn denoising(&self, completed_tiles: usize, total_tiles: usize) {
+        self.sink.update(
+            mimageviewer_ipc::RemoteAiJobState::Denoising,
+            Some(remote_ai_progress(
+                RemoteAiProgressPhase::Denoising,
+                self.page_index,
+                self.page_count,
+                2,
+                Some((completed_tiles, total_tiles)),
+            )),
+        );
+    }
+
+    fn upscaling(&self, completed_tiles: usize, total_tiles: usize) {
+        self.sink.update(
+            mimageviewer_ipc::RemoteAiJobState::Upscaling,
+            Some(remote_ai_progress(
+                RemoteAiProgressPhase::Upscaling,
+                self.page_index,
+                self.page_count,
+                3,
+                Some((completed_tiles, total_tiles)),
+            )),
+        );
+    }
+}
+
+fn decode_remote_ai_canonical(
+    source: crate::canonical_image_loader::CanonicalImageSource<'_>,
+    page_index: usize,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(Arc<egui::ColorImage>, [usize; 2]), RemoteAiRunError> {
+    let decoded = crate::canonical_image_loader::decode_canonical_image(
+        source,
+        crate::canonical_image_loader::CanonicalDecodeOptions {
+            susie_priority: true,
+            susie_cancel: Some(cancel),
+        },
+    )
+    .map_err(|error| RemoteAiRunError::Failed(error.to_string()))?;
+    match decoded {
+        crate::canonical_image_loader::CanonicalImageDecode::Static(image) => {
+            let raster = image.into_gpu_raster();
+            Ok((Arc::new(raster.pixels), raster.source_dims))
+        }
+        crate::canonical_image_loader::CanonicalImageDecode::Animated { format, .. } => {
+            let (code, label) = match format {
+                crate::canonical_image_loader::CanonicalAnimatedFormat::Gif => {
+                    (RemoteAiTerminalCode::AnimatedGif, "animated GIF")
+                }
+                crate::canonical_image_loader::CanonicalAnimatedFormat::Apng => {
+                    (RemoteAiTerminalCode::AnimatedApng, "animated PNG")
+                }
+                crate::canonical_image_loader::CanonicalAnimatedFormat::WebP => {
+                    (RemoteAiTerminalCode::AnimatedWebp, "animated WebP")
+                }
+            };
+            Err(RemoteAiRunError::NotApplicable {
+                code,
+                message: format!("{label} is not an AI still-image source"),
+                page_index,
+            })
+        }
     }
 }
 
@@ -2695,6 +3454,359 @@ fn thumbnail_error(code: ThumbnailErrorCode, message: impl Into<String>) -> Thum
 mod tests {
     use super::*;
     use crate::settings::FavoriteEntry;
+    use std::io::{Cursor, Write};
+
+    struct NoRemoteAiProgress;
+
+    impl super::super::ai_job::RemoteAiProgressSink for NoRemoteAiProgress {
+        fn update(
+            &self,
+            _state: mimageviewer_ipc::RemoteAiJobState,
+            _progress: Option<mimageviewer_ipc::RemoteAiProgress>,
+        ) {
+        }
+    }
+
+    fn remote_ai_test_png(width: u32, height: u32) -> Vec<u8> {
+        let image = image::RgbaImage::from_fn(width, height, |x, y| {
+            image::Rgba([
+                (x * 53 + y * 7) as u8,
+                (x * 11 + y * 61) as u8,
+                (x * 29 + y * 17) as u8,
+                255,
+            ])
+        });
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .unwrap();
+        bytes
+    }
+
+    fn remote_ai_test_zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut output = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut output);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, bytes) in entries {
+                writer.start_file(*name, options).unwrap();
+                writer.write_all(bytes).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        output.into_inner()
+    }
+
+    fn write_remote_ai_test_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        std::fs::write(path, remote_ai_test_zip_bytes(entries)).unwrap();
+    }
+
+    fn remote_ai_test_request(address: RemoteAddress) -> RemoteAiStartRequest {
+        RemoteAiStartRequest {
+            request_id: "remote-ai-container-test".to_owned(),
+            pages: vec![mimageviewer_ipc::RemoteAiPageRequest {
+                address,
+                target_px: 1024,
+            }],
+        }
+    }
+
+    fn remote_ai_cache_key(page_key: &str) -> RemoteAiNativeCacheKey {
+        RemoteAiNativeCacheKey {
+            page_key: page_key.to_owned(),
+            mtime: 1,
+            file_size: 2,
+            source_size: [2, 2],
+            pre_ai_params: crate::adjustment::AdjustParams::default(),
+            pre_ai_edit_fingerprint: [0; 32],
+            ai_feature_mode: crate::settings::AiFeatureMode::Light,
+            ai_upscale_limit: crate::ai::upscale::AiProcessSizeLimit::square(4096),
+            ai_denoise_limit: crate::ai::upscale::AiProcessSizeLimit::square(4096),
+            ai_backend: Some("directml".to_owned()),
+            background_mode: 0,
+            pipeline_schema: REMOTE_AI_PIPELINE_SCHEMA,
+            model_epoch: [0; 32],
+        }
+    }
+
+    #[test]
+    fn remote_ai_native_budget_is_derived_exactly_from_retained_settings() {
+        let mut settings = crate::settings::Settings::default();
+        settings.retained_final_ai_cache_max_entries = 7;
+        settings.retained_final_ai_cache_max_mib = 23;
+        let snapshot = crate::settings_db::AdjustmentRenderSettings::from_settings(&settings);
+        assert_eq!(
+            remote_ai_native_budget(&snapshot),
+            Some((7, 23 * 1024 * 1024))
+        );
+
+        settings.retained_final_ai_cache_max_entries = 0;
+        let snapshot = crate::settings_db::AdjustmentRenderSettings::from_settings(&settings);
+        assert_eq!(remote_ai_native_budget(&snapshot), None);
+    }
+
+    #[test]
+    fn remote_ai_native_cache_obeys_both_independent_lru_bounds() {
+        let pixels = Arc::new(egui::ColorImage::new([2, 2], vec![egui::Color32::BLACK; 4]));
+        let bytes = pixels.as_raw().len() as u64;
+        let mut cache = RemoteAiNativeCache::default();
+        cache.insert(
+            remote_ai_cache_key("one"),
+            Arc::clone(&pixels),
+            false,
+            1,
+            bytes * 2,
+        );
+        cache.insert(
+            remote_ai_cache_key("two"),
+            Arc::clone(&pixels),
+            true,
+            1,
+            bytes * 2,
+        );
+        assert!(cache.get(&remote_ai_cache_key("one")).is_none());
+        assert_eq!(
+            cache.get(&remote_ai_cache_key("two")).map(|hit| hit.1),
+            Some(true)
+        );
+
+        cache.insert(
+            remote_ai_cache_key("three"),
+            Arc::clone(&pixels),
+            false,
+            3,
+            bytes,
+        );
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].key.page_key, "three");
+
+        cache.insert(remote_ai_cache_key("disabled"), pixels, false, 0, bytes);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn remote_ai_native_cache_applies_lowered_live_budget_before_lookup() {
+        let pixels = Arc::new(egui::ColorImage::new([2, 2], vec![egui::Color32::BLACK; 4]));
+        let bytes = pixels.as_raw().len() as u64;
+        let mut cache = RemoteAiNativeCache::default();
+        for page_key in ["one", "two"] {
+            cache.insert(
+                remote_ai_cache_key(page_key),
+                Arc::clone(&pixels),
+                false,
+                2,
+                bytes * 2,
+            );
+        }
+
+        cache.enforce_budget(1, bytes * 2);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].key.page_key, "two");
+
+        cache.enforce_budget(0, bytes * 2);
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.bytes, 0);
+    }
+
+    #[test]
+    fn remote_executor_rejects_vector_pdf_and_size_gate_before_runtime_acquisition() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("vector.pdf"),
+            b"classification is supplied by the test seam",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("large.png"),
+            b"decode is supplied by the test seam",
+        )
+        .unwrap();
+        let favorite = FavoriteEntry::new("test".to_owned(), root);
+        let mut settings = crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            ..Default::default()
+        };
+        settings.ai_feature_mode = crate::settings::AiFeatureMode::Light;
+        settings.global_preset.upscale_model = Some("realesr_general_v3".to_owned());
+        settings.ai_upscale_size_limit = Some(crate::ai::upscale::AiProcessSizeLimit::square(4));
+        let render_settings =
+            crate::settings_db::AdjustmentRenderSettings::from_settings(&settings);
+        let engine = ContainerEngine::new(settings);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let runtime_acquisitions = AtomicUsize::new(0);
+        let resources = |_engine: &ContainerEngine| {
+            runtime_acquisitions.fetch_add(1, Ordering::Relaxed);
+            None
+        };
+        let prepare = |_engine: &ContainerEngine,
+                       address: &RemoteAddress,
+                       logical_path: &Path,
+                       mtime: i64,
+                       file_size: i64,
+                       target_px: u32,
+                       _context: &WorkerContext| {
+            let params = render_settings.global_preset.clone();
+            let page_key =
+                crate::edit_source::page_key_for_remote(logical_path, &address.subresource)
+                    .expect("test address identifies a page");
+            Ok(Some(RemotePreparedComposite {
+                key: RemoteCompositeCacheKey {
+                    page_key,
+                    mtime,
+                    file_size,
+                    target_px,
+                    params: params.clone(),
+                    lut_entry: None,
+                    edit_fingerprint: [0; 32],
+                },
+                params,
+                lut_entry: None,
+                edits: RemoteEditSnapshot {
+                    erase: None,
+                    local_adjust: None,
+                    conceal: None,
+                    conceal_preset: render_settings.conceal_preset.clone(),
+                    comic: Vec::new(),
+                    export_crop: None,
+                    fingerprint: [0; 32],
+                    pre_ai_fingerprint: [0; 32],
+                },
+                settings: render_settings.clone(),
+            }))
+        };
+        let decode = |_engine: &ContainerEngine,
+                      address: &RemoteAddress,
+                      _resolved: &ResolvedFavoritePath,
+                      _metadata: &std::fs::Metadata,
+                      page_index: usize,
+                      _cancel: &Arc<AtomicBool>| {
+            if matches!(address.subresource, RemoteSubresource::PdfPage { .. }) {
+                Err(RemoteAiRunError::NotApplicable {
+                    code: RemoteAiTerminalCode::VectorPdf,
+                    message: "vector fixture".to_owned(),
+                    page_index,
+                })
+            } else {
+                Ok((
+                    Arc::new(egui::ColorImage::new(
+                        [4, 3],
+                        vec![egui::Color32::BLACK; 12],
+                    )),
+                    [4, 3],
+                ))
+            }
+        };
+
+        let vector = remote_ai_test_request(RemoteAddress {
+            favorite_id: favorite.id.to_string(),
+            relative_path: "vector.pdf".to_owned(),
+            subresource: RemoteSubresource::PdfPage { page_number: 0 },
+        });
+        let vector_result = engine.execute_remote_ai_inner_with(
+            &vector,
+            &NoRemoteAiProgress,
+            &cancel,
+            &prepare,
+            &decode,
+            &resources,
+        );
+        match vector_result {
+            Err(RemoteAiRunError::NotApplicable {
+                code: RemoteAiTerminalCode::VectorPdf,
+                page_index: 0,
+                ..
+            }) => {}
+            Err(RemoteAiRunError::NotApplicable { code, message, .. }) => {
+                panic!("unexpected vector terminal {code:?}: {message}");
+            }
+            Err(RemoteAiRunError::Superseded(message)) => {
+                panic!("vector fixture was superseded: {message}");
+            }
+            Err(RemoteAiRunError::Failed(message)) => {
+                panic!("vector fixture failed before classification: {message}");
+            }
+            Ok(_) => panic!("vector fixture unexpectedly reached AI output"),
+        }
+
+        let size_gated =
+            remote_ai_test_request(RemoteAddress::file(favorite.id.to_string(), "large.png"));
+        let size_result = engine.execute_remote_ai_inner_with(
+            &size_gated,
+            &NoRemoteAiProgress,
+            &cancel,
+            &prepare,
+            &decode,
+            &resources,
+        );
+        match size_result {
+            Err(RemoteAiRunError::NotApplicable {
+                code: RemoteAiTerminalCode::SizeGate,
+                page_index: 0,
+                ..
+            }) => {}
+            Err(RemoteAiRunError::NotApplicable { code, message, .. }) => {
+                panic!("unexpected size terminal {code:?}: {message}");
+            }
+            Err(RemoteAiRunError::Superseded(message)) => {
+                panic!("size fixture was superseded: {message}");
+            }
+            Err(RemoteAiRunError::Failed(message)) => {
+                panic!("size fixture failed before gate: {message}");
+            }
+            Ok(_) => panic!("size fixture unexpectedly reached AI output"),
+        }
+        assert_eq!(runtime_acquisitions.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn decode_remote_ai_source_routes_nested_zip_through_the_canonical_decoder() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        std::fs::create_dir_all(&root).unwrap();
+        let page = remote_ai_test_png(4, 3);
+        let inner = remote_ai_test_zip_bytes(&[("page.png", &page)]);
+        let outer = root.join("book.cbz");
+        write_remote_ai_test_zip(&outer, &[("chapter.zip", &inner)]);
+        let favorite = FavoriteEntry::new("test".to_owned(), root);
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            ..Default::default()
+        });
+        let address = RemoteAddress {
+            favorite_id: favorite.id.to_string(),
+            relative_path: "book.cbz".to_owned(),
+            subresource: RemoteSubresource::ZipEntry {
+                entry_name: "chapter.zip/page.png".to_owned(),
+            },
+        };
+        let resolved = engine.resolve(&address).unwrap();
+        let metadata = std::fs::metadata(&resolved.canonical).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let Ok((actual, actual_dims)) =
+            engine.decode_remote_ai_source(&address, &resolved, &metadata, 0, &cancel)
+        else {
+            panic!("nested ZIP remote source must decode");
+        };
+        let Ok((expected, expected_dims)) = decode_remote_ai_canonical(
+            crate::canonical_image_loader::CanonicalImageSource::File {
+                path: Path::new("page.png"),
+                verified_bytes: Some(&page),
+            },
+            0,
+            &cancel,
+        ) else {
+            panic!("verified page bytes must decode canonically");
+        };
+
+        assert_eq!(actual_dims, [4, 3]);
+        assert_eq!(actual_dims, expected_dims);
+        assert_eq!(actual.size, expected.size);
+        assert_eq!(actual.pixels, expected.pixels);
+    }
 
     #[test]
     fn remote_default_adjustment_preserves_pixels() {
@@ -2798,6 +3910,7 @@ mod tests {
                     comic: Vec::new(),
                     export_crop: None,
                     fingerprint: [0; 32],
+                    pre_ai_fingerprint: [0; 32],
                 },
                 &Arc::new(AtomicBool::new(false)),
             )

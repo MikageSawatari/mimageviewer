@@ -14,12 +14,15 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 23;
+pub const PROTOCOL_VERSION: u32 = 24;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
 /// through player/seek/encoder readiness and the first usable playlist.
 pub const VIDEO_STREAM_START_BUDGET: Duration = Duration::from_secs(15);
+/// A remote AI POST must be admitted by the core within this window. The job itself has no
+/// inference deadline after admission.
+pub const REMOTE_AI_START_ACCEPT_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ClientHello {
@@ -1010,6 +1013,172 @@ pub struct VideoStreamError {
     pub message: String,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteAiPageRequest {
+    pub address: RemoteAddress,
+    pub target_px: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteAiStartRequest {
+    /// Client-generated idempotency key. Repeating it returns the original job.
+    pub request_id: String,
+    /// Current display group in left-to-right screen order (one or two pages).
+    pub pages: Vec<RemoteAiPageRequest>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAiJobState {
+    WaitingForLocalDrain,
+    PreparingSource,
+    LoadingModel,
+    Denoising,
+    Upscaling,
+    Finalizing,
+    Cancelling,
+    Ready,
+    Superseded,
+    CancelledByUser,
+    DiscardedByHost,
+    BackgroundExpired,
+    Failed,
+}
+
+impl RemoteAiJobState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Ready
+                | Self::Superseded
+                | Self::CancelledByUser
+                | Self::DiscardedByHost
+                | Self::BackgroundExpired
+                | Self::Failed
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAiProgressPhase {
+    WaitingForLocalDrain,
+    PreparingSource,
+    LoadingModel,
+    Denoising,
+    Upscaling,
+    Finalizing,
+    Cancelling,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteAiProgress {
+    pub phase: RemoteAiProgressPhase,
+    pub page_index: u32,
+    pub page_count: u32,
+    pub stage_index: u32,
+    pub stage_count: u32,
+    pub completed_tiles: Option<u32>,
+    pub total_tiles: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAiTerminalCode {
+    AnimatedGif,
+    AnimatedApng,
+    AnimatedWebp,
+    VectorPdf,
+    SizeGate,
+    Superseded,
+    CancelledByUser,
+    DiscardedByHost,
+    BackgroundExpired,
+    SourceChanged,
+    ExecutionFailed,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteAiTerminalDetail {
+    pub code: RemoteAiTerminalCode,
+    pub message: String,
+    pub page_index: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteAiJobSnapshot {
+    pub job_id: String,
+    pub request_id: String,
+    pub state: RemoteAiJobState,
+    pub progress: Option<RemoteAiProgress>,
+    pub terminal: Option<RemoteAiTerminalDetail>,
+    pub page_count: u32,
+    pub created_unix_ms: u64,
+    pub updated_unix_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAiJobErrorCode {
+    BadRequest,
+    StartExpired,
+    SessionClosing,
+    NotFound,
+    Forbidden,
+    JobGone,
+    NotReady,
+    PageOutOfRange,
+    Internal,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteAiJobError {
+    pub code: RemoteAiJobErrorCode,
+    pub message: String,
+    /// Preserved after heavy terminal metadata/result bytes have expired.
+    pub terminal_code: Option<RemoteAiTerminalCode>,
+}
+
+impl RemoteAiJobError {
+    pub fn new(code: RemoteAiJobErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            terminal_code: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum RemoteAiStartResponse {
+    Accepted(RemoteAiJobSnapshot),
+    Error(RemoteAiJobError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum RemoteAiStateResponse {
+    Success(RemoteAiJobSnapshot),
+    Error(RemoteAiJobError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum RemoteAiRecoverableResponse {
+    Success(Vec<RemoteAiJobSnapshot>),
+    Error(RemoteAiJobError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum RemoteAiCancelResponse {
+    Success(RemoteAiJobSnapshot),
+    Error(RemoteAiJobError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum RemoteAiResultResponse {
+    Success(PagePayload),
+    Error(RemoteAiJobError),
+}
+
 impl VideoStreamError {
     pub fn new(code: VideoStreamErrorCode, message: impl Into<String>) -> Self {
         Self {
@@ -1073,6 +1242,32 @@ pub enum ClientMessage {
         id: RequestId,
         client_id: String,
         request: PageRequest,
+    },
+    RemoteAiStart {
+        id: RequestId,
+        client_id: String,
+        request: RemoteAiStartRequest,
+        accept_before_unix_ms: u64,
+    },
+    RemoteAiState {
+        id: RequestId,
+        client_id: String,
+        job_id: String,
+    },
+    RemoteAiRecoverable {
+        id: RequestId,
+        client_id: String,
+    },
+    RemoteAiCancel {
+        id: RequestId,
+        client_id: String,
+        job_id: String,
+    },
+    RemoteAiResult {
+        id: RequestId,
+        client_id: String,
+        job_id: String,
+        page_index: u32,
     },
     Write {
         id: RequestId,
@@ -1142,6 +1337,11 @@ impl ClientMessage {
             | Self::FolderList { id, .. }
             | Self::Container { id, .. }
             | Self::Page { id, .. }
+            | Self::RemoteAiStart { id, .. }
+            | Self::RemoteAiState { id, .. }
+            | Self::RemoteAiRecoverable { id, .. }
+            | Self::RemoteAiCancel { id, .. }
+            | Self::RemoteAiResult { id, .. }
             | Self::Write { id, .. }
             | Self::VideoStreamStart { id, .. }
             | Self::VideoStreamControl { id, .. }
@@ -1190,6 +1390,26 @@ pub enum ServerMessage {
     Page {
         id: RequestId,
         response: PageResponse,
+    },
+    RemoteAiStart {
+        id: RequestId,
+        response: RemoteAiStartResponse,
+    },
+    RemoteAiState {
+        id: RequestId,
+        response: RemoteAiStateResponse,
+    },
+    RemoteAiRecoverable {
+        id: RequestId,
+        response: RemoteAiRecoverableResponse,
+    },
+    RemoteAiCancel {
+        id: RequestId,
+        response: RemoteAiCancelResponse,
+    },
+    RemoteAiResult {
+        id: RequestId,
+        response: RemoteAiResultResponse,
     },
     Write {
         id: RequestId,
@@ -1240,6 +1460,11 @@ impl ServerMessage {
             | Self::Container { id, .. }
             | Self::FolderList { id, .. }
             | Self::Page { id, .. }
+            | Self::RemoteAiStart { id, .. }
+            | Self::RemoteAiState { id, .. }
+            | Self::RemoteAiRecoverable { id, .. }
+            | Self::RemoteAiCancel { id, .. }
+            | Self::RemoteAiResult { id, .. }
             | Self::Write { id, .. }
             | Self::VideoStreamStart { id, .. }
             | Self::VideoStreamControl { id, .. }
@@ -1546,8 +1771,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v23_video_pull_seek_thumbnail_end_behavior_and_audio_status_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 23);
+    fn protocol_v24_video_pull_seek_thumbnail_end_behavior_and_audio_status_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 24);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -1963,5 +2188,76 @@ mod tests {
             assert_eq!(decoded, address);
             assert!(!String::from_utf8(encoded).unwrap().contains("C:"));
         }
+    }
+
+    #[test]
+    fn protocol_v24_remote_ai_messages_and_typed_terminal_round_trip() {
+        let address = RemoteAddress::file("30d6c167-7148-4f3e-9a5a-21c5fd31ecb2", "pages/001.png");
+        let start = RemoteAiStartRequest {
+            request_id: "request-1".to_owned(),
+            pages: vec![RemoteAiPageRequest {
+                address,
+                target_px: 1600,
+            }],
+        };
+        let client_messages = vec![
+            ClientMessage::RemoteAiStart {
+                id: 1,
+                client_id: "phone".to_owned(),
+                request: start,
+                accept_before_unix_ms: 1_900_000_000_000,
+            },
+            ClientMessage::RemoteAiState {
+                id: 2,
+                client_id: "phone".to_owned(),
+                job_id: "7-1".to_owned(),
+            },
+            ClientMessage::RemoteAiRecoverable {
+                id: 3,
+                client_id: "phone".to_owned(),
+            },
+            ClientMessage::RemoteAiCancel {
+                id: 4,
+                client_id: "phone".to_owned(),
+                job_id: "7-1".to_owned(),
+            },
+            ClientMessage::RemoteAiResult {
+                id: 5,
+                client_id: "phone".to_owned(),
+                job_id: "7-1".to_owned(),
+                page_index: 0,
+            },
+        ];
+        for message in client_messages {
+            let mut frame = Vec::new();
+            write_frame(&mut frame, &message).unwrap();
+            let decoded: ClientMessage =
+                read_frame(&mut frame.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
+            assert_eq!(decoded, message);
+        }
+
+        let snapshot = RemoteAiJobSnapshot {
+            job_id: "7-1".to_owned(),
+            request_id: "request-1".to_owned(),
+            state: RemoteAiJobState::Failed,
+            progress: None,
+            terminal: Some(RemoteAiTerminalDetail {
+                code: RemoteAiTerminalCode::VectorPdf,
+                message: "not applicable".to_owned(),
+                page_index: Some(0),
+            }),
+            page_count: 1,
+            created_unix_ms: 10,
+            updated_unix_ms: 20,
+        };
+        let message = ServerMessage::RemoteAiState {
+            id: 2,
+            response: RemoteAiStateResponse::Success(snapshot),
+        };
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &message).unwrap();
+        let decoded: ServerMessage =
+            read_frame(&mut frame.as_slice(), MAX_RESPONSE_FRAME_BYTES).unwrap();
+        assert_eq!(decoded, message);
     }
 }

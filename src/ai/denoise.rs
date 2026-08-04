@@ -19,6 +19,16 @@ pub fn denoise(
     input: &image::DynamicImage,
     cancel: &Arc<AtomicBool>,
 ) -> Result<egui::ColorImage, AiError> {
+    denoise_with_progress(runtime, model_kind, input, cancel, None)
+}
+
+pub fn denoise_with_progress(
+    runtime: &AiRuntime,
+    model_kind: ModelKind,
+    input: &image::DynamicImage,
+    cancel: &Arc<AtomicBool>,
+    progress: Option<&dyn Fn(usize, usize)>,
+) -> Result<egui::ColorImage, AiError> {
     let (w, h) = (input.width(), input.height());
     let perf_enabled = crate::perf::is_enabled();
     let t0 = std::time::Instant::now();
@@ -40,7 +50,8 @@ pub fn denoise(
     }
     crate::logger::log(format!("[AI] Denoise {}x{} with {:?}", w, h, model_kind));
 
-    let result = super::upscale::upscale(runtime, model_kind, input, cancel)?;
+    let result =
+        super::upscale::upscale_with_progress(runtime, model_kind, input, cancel, progress)?;
 
     crate::logger::log(format!(
         "[AI] Denoise complete: {}x{} with {:?}",

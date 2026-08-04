@@ -190,6 +190,7 @@ impl crate::app::App {
         handle.install_ai_bridge(super::session::RemoteAiExecutionBridge::new(
             self.ai_runtime.clone(),
             std::sync::Arc::clone(&self.ai_model_manager),
+            self.fs_transparent_bg_mode,
         ));
         self.remote_session_ui.handle = Some(handle);
     }

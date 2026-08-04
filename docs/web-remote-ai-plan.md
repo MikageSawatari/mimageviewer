@@ -1,6 +1,6 @@
 # mIV Remote 段 3b — AI アップスケール / デノイズ設計
 
-状態: **3b-0 実装済み、3b-1a はコード・自動 test 済みで実機 smoke 待ち、3b-1b 以降は未実装**
+状態: **3b-0・3b-1a・3b-1b 実装済み、3b-2 は未実装**
 （2026-08-04）。
 
 親計画: [web-remote-left-panel-plan.md](web-remote-left-panel-plan.md)
@@ -88,10 +88,16 @@ remote の静止画にも本体と同じ順序・model・size 規則で適用す
 | B | `App` の `Arc<AiRuntime>` だけを remote worker へ公開 | GPU は直列化できるが、受付、取消、drain 完了、stale result 採用を `App` が統制できないため不採用 |
 | **C** | **`App` が install する型付き `RemoteAiExecutionBridge` を通す** | **singleton Runtime、worker 上の重処理、session generation と drain の一元管理を両立するため推奨** |
 
-推奨案 C でも、秒単位の処理を UI thread で実行しない。UI thread が行うのは受付、
-effective params と session generation の検証、job 登録、終端結果の採用だけである。
-source preparation、model load、inference、final composite、encode は worker で行い、
-状態遷移だけを typed message と repaint wakeup で `App` へ返す。
+推奨案 C でも、秒単位の処理を UI thread で実行しない。source preparation、model load、
+inference、final composite、encode は worker で行い、状態遷移だけを typed message と
+repaint wakeup で `App` へ返す。
+
+`App` が持つのは acquire / drain barrier と job lease の会計だけである。effective params と
+snapshot の取得・再検証は worker 側に置く。remote の live settings / edit DB 取得は
+`ContainerEngine` worker が所有しており、検証のために UI thread へ引き戻すと DB 読み取りを
+UI thread へ持ち込むことになる。これは §2 の「UI thread は decode / edit materialize /
+worker join を行わない」と衝突する。旧版はここを「UI thread が effective params を検証」と
+書いていたが、実コードの所有境界と合わないため訂正した (2026-08-04)。
 
 既存 local `AiJobQueue` の Display LIFO / Prefetch FIFO は変更しない。remote のための
 priority lane は追加せず、接続取得後は local producer を止めて remote job だけを admission する。
@@ -396,9 +402,10 @@ AI 設定だけを書けて remote の絵には AI が乗らない状態は出�
 - この段では remote AI UI と real final AI job を出さない
 
 **実装済み (2026-08-04):** 上記 lifecycle、barrier、inventory、singleton bridge と
-final-release 順序を実装。remote final AI job / UI / job protocol は未実装のまま。
+final-release 順序を実装。この段の時点では未実装だった remote final AI job / job protocol は
+3b-1b で接続済み。remote AI UI は 3b-2 のまま。
 
-### 3b-1a: 共有 canonical decoder（実機 smoke 待ち）
+### 3b-1a: 共有 canonical decoder（完了）
 
 - fullscreen の通常画像 / verified bytes / ZIP・nested ZIP を同じ typed source decoder へ集約する
 - GIF/APNG/WebP の現行 Animated 分類、image crate → WIC → Susie、EXIF 適用を共有する
@@ -408,15 +415,26 @@ final-release 順序を実装。remote final AI job / UI / job protocol は未�
 - この段では remote / job protocol へ接続しない。本体 fullscreen の無挙動変更を先に
   自動 test と実機 smoke で確認する
 
-**実装状況 (2026-08-04):** コードと自動 test は完了。通常画像 / EXIF 回転 / ZIP /
-ZIP 内 GIF / animated GIF / panorama / 8192 超の実機 fullscreen smoke 待ち。
+**実装状況 (2026-08-04):** `7b8b31a1`。コードと自動 test に加え、通常画像 / EXIF 回転 /
+ZIP / ZIP 内 GIF / animated GIF・APNG・WebP / panorama / 8192 超の実機 fullscreen smoke まで完了。
 
-### 3b-1b: job protocol と end-to-end backend
+### 3b-1b: job protocol と end-to-end backend（完了）
 
 - fake executor で start / state / cancel / disconnect / background recovery を固定する
 - source、MI-GAN、final AI、final composite、WebP を bridge へ接続する
 - 通常画像、ZIP、nested archive、raster PDF、製本 page の canonical input を揃える
 - vector PDF、size gate、stale result 拒否、terminal 10 分保持を実装する
+
+**実装状況 (2026-08-04):** backend と protocol を実装。job ごとに `SessionOperation` を保持して
+disconnect drain へ参加し、参照 IPC は session operation を増やさない。client presence は
+foreground / detached を型で分け、background 復帰・10 分 expiry・terminal/result 10 分保持を
+fake executor test で固定した。AI cache key と公開 result identity は分離し、公開直前に source /
+edit / settings snapshot を worker で再取得して不一致を stale とする。native AI cache は local cache
+と eviction を共有しない専用 LRU だが、上限値は同じ既存設定
+`retained_final_ai_cache_max_entries` / `retained_final_ai_cache_max_mib` をそのまま使用し、0 は無効とする。
+result は Finalizing で page ごとに一度だけ縮小・WebP encode し、保持済み bytes を GET へ返す。
+vector PDF / size gate は runtime 取得前に typed `not_applicable` へ終端し、nested ZIP は remote
+source decoder から共有 canonical decoder へ到達することを focused test で直接固定した。
 
 ### 3b-2: Web UI
 

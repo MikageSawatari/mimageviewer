@@ -10,6 +10,7 @@
 
 pub mod classify;
 pub mod denoise;
+pub mod final_pipeline;
 pub mod model_manager;
 pub mod runtime;
 pub mod tensorrt_builder;
