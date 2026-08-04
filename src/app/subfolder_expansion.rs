@@ -6,13 +6,200 @@
 
 use super::*;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-const MAX_SUBFOLDER_EXPANSION_DEPTH: u32 = 40;
+const MAX_SUBFOLDER_EXPANSION_DEPTH: u32 = crate::settings::SUBFOLDER_EXPANSION_MAX_DEPTH_DEFAULT;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubfolderExpansionDepthChoice {
+    RootOnly,
+    One,
+    Two,
+    Three,
+    Four,
+    Five,
+    Ten,
+    Unlimited,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubfolderExpansionButtonAction {
+    OpenDialog,
+    ExitImmediately,
+    Disabled,
+}
+
+impl SubfolderExpansionButtonAction {
+    pub(crate) fn for_state(is_on: bool, is_busy: bool) -> Self {
+        if is_busy {
+            Self::Disabled
+        } else if is_on {
+            Self::ExitImmediately
+        } else {
+            Self::OpenDialog
+        }
+    }
+}
+
+impl SubfolderExpansionDepthChoice {
+    // 浅い側は 1 刻みで並べる。5 階層あたりまでは「ちょうどこの深さ」を指定したい
+    // ことがあるため (実機確認での要望)。それより深い側は刻みを粗くする。
+    pub(crate) const ALL: [Self; 8] = [
+        Self::RootOnly,
+        Self::One,
+        Self::Two,
+        Self::Three,
+        Self::Four,
+        Self::Five,
+        Self::Ten,
+        Self::Unlimited,
+    ];
+
+    pub(crate) fn from_setting(value: u32) -> Self {
+        match value {
+            0 => Self::RootOnly,
+            1 => Self::One,
+            2 => Self::Two,
+            3 => Self::Three,
+            4 => Self::Four,
+            5 => Self::Five,
+            10 => Self::Ten,
+            MAX_SUBFOLDER_EXPANSION_DEPTH => Self::Unlimited,
+            _ => Self::Unlimited,
+        }
+    }
+
+    pub(crate) fn setting_value(self) -> u32 {
+        self.max_depth()
+    }
+
+    /// The walker pushes every selected root at depth 0 and skips only when
+    /// depth is greater than max_depth. Thus 0 reads the roots themselves,
+    /// while N includes exactly N directory levels below each root.
+    /// “Unlimited” keeps the old effective safety limit of 40.
+    pub(crate) fn max_depth(self) -> u32 {
+        match self {
+            Self::RootOnly => 0,
+            Self::One => 1,
+            Self::Two => 2,
+            Self::Three => 3,
+            Self::Four => 4,
+            Self::Five => 5,
+            Self::Ten => 10,
+            Self::Unlimited => MAX_SUBFOLDER_EXPANSION_DEPTH,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::RootOnly => "起点のみ",
+            Self::One => "1 階層",
+            Self::Two => "2 階層",
+            Self::Three => "3 階層",
+            Self::Four => "4 階層",
+            Self::Five => "5 階層",
+            Self::Ten => "10 階層",
+            Self::Unlimited => "無制限",
+        }
+    }
+}
+
+pub(crate) const SUBFOLDER_EXPANSION_FILTER_KINDS: [crate::settings::FacetItemKind; 5] = [
+    crate::settings::FacetItemKind::Folder,
+    crate::settings::FacetItemKind::Image,
+    crate::settings::FacetItemKind::Video,
+    crate::settings::FacetItemKind::Zip,
+    crate::settings::FacetItemKind::Pdf,
+];
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SubfolderExpansionScanFilter {
+    pub(crate) kinds: BTreeSet<crate::settings::FacetItemKind>,
+    pub(crate) date_preset: Option<crate::settings::FacetDatePreset>,
+    pub(crate) size_preset: Option<crate::settings::FacetSizePreset>,
+}
+
+impl SubfolderExpansionScanFilter {
+    pub(crate) fn from_settings(settings: &crate::settings::Settings) -> Self {
+        Self {
+            kinds: settings.subfolder_expansion_filter_kinds.clone(),
+            date_preset: settings.subfolder_expansion_filter_date_preset,
+            size_preset: settings.subfolder_expansion_filter_size_preset,
+        }
+    }
+
+    pub(crate) fn apply_to_settings(&self, settings: &mut crate::settings::Settings) {
+        settings.subfolder_expansion_filter_kinds = self.kinds.clone();
+        settings.subfolder_expansion_filter_date_preset = self.date_preset;
+        settings.subfolder_expansion_filter_size_preset = self.size_preset;
+    }
+
+    pub(crate) fn active_summary(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if !self.kinds.is_empty() {
+            let labels = SUBFOLDER_EXPANSION_FILTER_KINDS
+                .iter()
+                .filter(|kind| self.kinds.contains(kind))
+                .map(|kind| kind.label())
+                .collect::<Vec<_>>()
+                .join("、");
+            parts.push(format!("種類: {labels}"));
+        }
+        if let Some(size) = self.size_preset.filter(|size| size.is_effective()) {
+            parts.push(format!("サイズ: {}", size.label()));
+        }
+        if let Some(date) = self.date_preset {
+            parts.push(format!("更新日: {}", date.label()));
+        }
+        (!parts.is_empty()).then(|| parts.join(" / "))
+    }
+
+    fn kind_matches(&self, kind: crate::settings::FacetItemKind) -> bool {
+        self.kinds.is_empty() || self.kinds.contains(&kind)
+    }
+
+    fn file_matches(
+        &self,
+        kind: crate::settings::FacetItemKind,
+        mtime: i64,
+        file_size: i64,
+        now: i64,
+    ) -> bool {
+        if !self.kind_matches(kind) {
+            return false;
+        }
+        if let Some(size) = self.size_preset {
+            let file_size = file_size.max(0) as u64;
+            let (min, max) = size.range_bytes();
+            if file_size < min || max.is_some_and(|max| file_size >= max) {
+                return false;
+            }
+        }
+        self.date_preset
+            .is_none_or(|date| date.matches_mtime(mtime, now))
+    }
+
+    fn entry_matches(
+        &self,
+        kind: SubfolderExpansionEntryKind,
+        mtime: i64,
+        file_size: i64,
+        now: i64,
+    ) -> bool {
+        let facet_kind = kind.facet_kind();
+        if kind == SubfolderExpansionEntryKind::Folder {
+            // 画像フォルダ本にはファイル同様のサイズや代表更新日時を定義しない。
+            // 種類だけを適用し、サイズ・日付条件では除外しない。
+            self.kind_matches(facet_kind)
+        } else {
+            self.file_matches(facet_kind, mtime, file_size, now)
+        }
+    }
+}
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const PREPARE_CONFIRM_ITEM_THRESHOLD: usize = 100_000;
 /// `sort_unstable_by` の比較関数を途中で変えずにキャンセルへ応答するためのソート単位。
@@ -30,6 +217,7 @@ pub(crate) struct SubfolderExpansionOptions {
     include_convertible_archives: bool,
     show_hidden_files: bool,
     image_ext_priority: Vec<String>,
+    scan_filter: SubfolderExpansionScanFilter,
 }
 
 impl From<&crate::settings::Settings> for SubfolderExpansionOptions {
@@ -43,6 +231,7 @@ impl From<&crate::settings::Settings> for SubfolderExpansionOptions {
             include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
             show_hidden_files: settings.show_hidden_files,
             image_ext_priority: settings.image_ext_priority.clone(),
+            scan_filter: SubfolderExpansionScanFilter::from_settings(settings),
         }
     }
 }
@@ -76,7 +265,7 @@ impl SubfolderExpansionProgress {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SubfolderExpansionEntryKind {
     Folder,
     Zip,
@@ -86,6 +275,16 @@ pub(crate) enum SubfolderExpansionEntryKind {
 }
 
 impl SubfolderExpansionEntryKind {
+    fn facet_kind(self) -> crate::settings::FacetItemKind {
+        match self {
+            Self::Folder => crate::settings::FacetItemKind::Folder,
+            Self::Zip => crate::settings::FacetItemKind::Zip,
+            Self::Pdf => crate::settings::FacetItemKind::Pdf,
+            Self::Image => crate::settings::FacetItemKind::Image,
+            Self::Video => crate::settings::FacetItemKind::Video,
+        }
+    }
+
     fn to_grid_item(self, path: PathBuf) -> GridItem {
         match self {
             Self::Folder => GridItem::Folder(path),
@@ -118,6 +317,7 @@ pub(crate) struct SubfolderExpansionEntry {
 pub(crate) struct SubfolderExpansionResult {
     pub(crate) root: PathBuf,
     pub(crate) roots: Vec<PathBuf>,
+    pub(crate) scan_filter: SubfolderExpansionScanFilter,
     pub(crate) entries: Vec<SubfolderExpansionEntry>,
     /// 動画パスの正規化キー -> 同名 sidecar 画像パス。
     ///
@@ -131,6 +331,7 @@ pub(crate) struct SubfolderExpansionResult {
 pub(crate) struct SubfolderExpansionSnapshot {
     pub(crate) root: PathBuf,
     pub(crate) roots: Vec<PathBuf>,
+    pub(crate) scan_filter: SubfolderExpansionScanFilter,
     /// 再ソート準備 worker と UI が巨大な走査結果を複製せず共有する。
     pub(crate) entries: Arc<Vec<SubfolderExpansionEntry>>,
     pub(crate) video_thumb_overrides: HashMap<String, PathBuf>,
@@ -278,6 +479,7 @@ pub(crate) fn spawn_subfolder_expansion_worker(
     root: PathBuf,
     roots: Vec<PathBuf>,
     options: SubfolderExpansionOptions,
+    max_depth: u32,
     io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
     activity_gate: Arc<crate::activity_gate::ActivityGate>,
 ) -> Result<SubfolderExpansionPending, String> {
@@ -294,6 +496,7 @@ pub(crate) fn spawn_subfolder_expansion_worker(
                 root_w,
                 roots_w,
                 options,
+                max_depth,
                 Arc::clone(&cancel_w),
                 &io_sem,
                 &activity_gate,
@@ -321,6 +524,7 @@ fn scan_subfolder_expansion(
     root: PathBuf,
     roots: Vec<PathBuf>,
     options: SubfolderExpansionOptions,
+    max_depth: u32,
     cancel: Arc<AtomicBool>,
     io_sem: &crate::io_semaphore::GlobalIoSemaphore,
     activity_gate: &crate::activity_gate::ActivityGate,
@@ -330,21 +534,34 @@ fn scan_subfolder_expansion(
     let mut result = SubfolderExpansionResult {
         root: root.clone(),
         roots: roots.clone(),
+        scan_filter: options.scan_filter.clone(),
         entries: Vec::new(),
         video_thumb_overrides: HashMap::new(),
         diag: SubfolderExpansionDiag::default(),
     };
     let items_found = std::cell::Cell::new(0usize);
     let last_progress = std::cell::Cell::new(Instant::now());
+    let filter_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0);
     let walk_diag = super::recursive_snapshot_scan::walk_snapshot_roots(
         &roots,
-        MAX_SUBFOLDER_EXPANSION_DEPTH,
+        max_depth,
         &cancel,
         Some(io_sem),
         Some(activity_gate),
         |_, dir, entries, cancel| {
             let mut subdirs = Vec::new();
-            scan_one_directory(dir, entries, &options, cancel, &mut result, &mut subdirs);
+            scan_one_directory(
+                dir,
+                entries,
+                &options,
+                filter_now,
+                cancel,
+                &mut result,
+                &mut subdirs,
+            );
             items_found.set(result.diag.items_found);
             subdirs
         },
@@ -401,6 +618,7 @@ fn scan_one_directory(
     dir: &Path,
     read_dir: std::fs::ReadDir,
     options: &SubfolderExpansionOptions,
+    filter_now: i64,
     cancel: &AtomicBool,
     result: &mut SubfolderExpansionResult,
     subdirs: &mut Vec<PathBuf>,
@@ -514,21 +732,44 @@ fn scan_one_directory(
         if metadata.is_none() {
             result.diag.metadata_errors += 1;
         }
-        result.entries.push(SubfolderExpansionEntry {
-            path: dir.to_path_buf(),
-            kind: SubfolderExpansionEntryKind::Folder,
-            mtime: metadata.as_ref().map_or(0, crate::ui_helpers::mtime_secs),
-            file_size: 0,
-        });
-        result.diag.items_found += 1;
+        let mtime = metadata.as_ref().map_or(0, crate::ui_helpers::mtime_secs);
+        if options.scan_filter.entry_matches(
+            SubfolderExpansionEntryKind::Folder,
+            mtime,
+            0,
+            filter_now,
+        ) {
+            result.entries.push(SubfolderExpansionEntry {
+                path: dir.to_path_buf(),
+                kind: SubfolderExpansionEntryKind::Folder,
+                mtime,
+                file_size: 0,
+            });
+            result.diag.items_found += 1;
+        }
         return;
     }
 
     if options.skip_zip_if_folder_exists {
         containers.retain(|entry| !real_folder_names.contains(&super::stem_lower(&entry.path)));
     }
+    containers.retain(|entry| {
+        options
+            .scan_filter
+            .entry_matches(entry.kind, entry.mtime, entry.file_size, filter_now)
+    });
     apply_duplicate_filters_to_media(&mut media, options, &mut result.video_thumb_overrides);
     media.retain(|(_, kind, _, _)| *kind != super::folder_scan::ScanMediaKind::Audio);
+    media.retain(|(_, kind, mtime, file_size)| {
+        let entry_kind = match kind {
+            super::folder_scan::ScanMediaKind::Image => SubfolderExpansionEntryKind::Image,
+            super::folder_scan::ScanMediaKind::Video => SubfolderExpansionEntryKind::Video,
+            super::folder_scan::ScanMediaKind::Audio => return false,
+        };
+        options
+            .scan_filter
+            .entry_matches(entry_kind, *mtime, *file_size, filter_now)
+    });
     result.diag.items_found += media.len() + containers.len();
     result.entries.extend(containers);
     result
@@ -1143,14 +1384,24 @@ impl App {
 
     pub(crate) fn subfolder_expansion_action_tooltip(&self) -> String {
         let roots = self.selected_subfolder_expansion_roots();
-        if roots.is_empty() {
+        let action = if roots.is_empty() {
             "現在のフォルダ以下の画像・動画・ZIP・PDFを一覧表示\n「画像のみのフォルダを本として扱う」がオンなら、そのフォルダは1項目にまとめます\nフォルダを Space / Ctrl+クリックで選ぶと、選んだフォルダだけをまとめて展開できます".to_string()
         } else {
             format!(
                 "チェックした {} 個のフォルダ以下の画像・動画・ZIP・PDFをまとめて一覧表示",
                 roots.len()
             )
+        };
+        let depth = SubfolderExpansionDepthChoice::from_setting(
+            self.settings.subfolder_expansion_max_depth,
+        );
+        let mut tooltip = format!("{action}\n走査階層: {}", depth.label());
+        if let Some(summary) =
+            SubfolderExpansionScanFilter::from_settings(&self.settings).active_summary()
+        {
+            tooltip.push_str(&format!("\n走査時の絞り込み: {summary}"));
         }
+        tooltip
     }
 
     pub(crate) fn subfolder_expansion_available(&self) -> bool {
@@ -1232,6 +1483,22 @@ impl App {
         })
     }
 
+    pub(crate) fn activate_subfolder_expansion_button(&mut self) {
+        match SubfolderExpansionButtonAction::for_state(
+            self.subfolder_expansion_on(),
+            self.subfolder_expansion_busy(),
+        ) {
+            SubfolderExpansionButtonAction::OpenDialog => {
+                self.show_subfolder_expansion_dialog = true;
+            }
+            SubfolderExpansionButtonAction::ExitImmediately => {
+                self.show_subfolder_expansion_dialog = false;
+                self.exit_subfolder_expansion_view();
+            }
+            SubfolderExpansionButtonAction::Disabled => {}
+        }
+    }
+
     pub(crate) fn toggle_subfolder_expansion_view(&mut self) {
         if self.subfolder_expansion_pending.is_some()
             || self.subfolder_expansion_install_pending.is_some()
@@ -1301,7 +1568,9 @@ impl App {
         self.subfolder_expansion_confirm_pending = None;
         self.subfolder_expansion_progress = Some(SubfolderExpansionProgress::default());
         self.subfolder_expansion_diag = None;
-        self.address = subfolder_expansion_view_label("サブ展開中", &root, &roots);
+        let options = SubfolderExpansionOptions::from(&self.settings);
+        self.address =
+            subfolder_expansion_view_label("サブ展開中", &root, &roots, Some(&options.scan_filter));
 
         let io_sem = self
             .indexer_manager
@@ -1313,10 +1582,15 @@ impl App {
                 ))
             });
 
+        let max_depth = SubfolderExpansionDepthChoice::from_setting(
+            self.settings.subfolder_expansion_max_depth,
+        )
+        .max_depth();
         match spawn_subfolder_expansion_worker(
             root.clone(),
             roots,
-            SubfolderExpansionOptions::from(&self.settings),
+            options,
+            max_depth,
             io_sem,
             Arc::clone(&self.activity_gate),
         ) {
@@ -1385,7 +1659,8 @@ impl App {
             .get_or_insert_with(|| root.clone());
         self.subfolder_expansion_progress = None;
         self.subfolder_expansion_install_pending = None;
-        self.address = subfolder_expansion_view_label("サブ展開", &root, &roots);
+        self.address =
+            subfolder_expansion_view_label("サブ展開", &root, &roots, Some(&snapshot.scan_filter));
     }
 
     pub(crate) fn exit_subfolder_expansion_view(&mut self) {
@@ -1509,6 +1784,7 @@ impl App {
         let SubfolderExpansionResult {
             root,
             roots,
+            scan_filter,
             entries,
             video_thumb_overrides,
             diag,
@@ -1516,6 +1792,7 @@ impl App {
         let snapshot = SubfolderExpansionSnapshot {
             root,
             roots,
+            scan_filter,
             entries: Arc::new(entries),
             video_thumb_overrides,
             diag,
@@ -1533,8 +1810,12 @@ impl App {
         if item_count >= PREPARE_CONFIRM_ITEM_THRESHOLD {
             self.subfolder_expansion_progress =
                 Some(SubfolderExpansionProgress::from_diag(&snapshot.diag, None));
-            self.address =
-                subfolder_expansion_view_label("サブ展開確認待ち", &snapshot.root, &snapshot.roots);
+            self.address = subfolder_expansion_view_label(
+                "サブ展開確認待ち",
+                &snapshot.root,
+                &snapshot.roots,
+                Some(&snapshot.scan_filter),
+            );
             self.subfolder_expansion_confirm_pending = Some(SubfolderExpansionConfirmPending {
                 snapshot,
                 show_toast,
@@ -1565,8 +1846,12 @@ impl App {
         }
         self.subfolder_expansion_progress =
             Some(SubfolderExpansionProgress::from_diag(&snapshot.diag, None));
-        self.address =
-            subfolder_expansion_view_label("サブ展開準備中", &snapshot.root, &snapshot.roots);
+        self.address = subfolder_expansion_view_label(
+            "サブ展開準備中",
+            &snapshot.root,
+            &snapshot.roots,
+            Some(&snapshot.scan_filter),
+        );
         let options = SubfolderExpansionPrepareOptions {
             sort: self.book_sort_order_for_path(&snapshot.root),
             order: self.settings.subfolder_expansion_order,
@@ -1784,6 +2069,7 @@ impl App {
         }
         let root = snapshot.root.clone();
         let roots = snapshot.roots.clone();
+        let scan_filter = snapshot.scan_filter.clone();
         let diag = snapshot.diag.clone();
         let video_thumb_overrides = snapshot.video_thumb_overrides.clone();
         self.video_thumb_overrides.clear();
@@ -1823,7 +2109,8 @@ impl App {
         self.subfolder_expansion_snapshot = Some(snapshot);
         self.subfolder_expansion_progress = None;
         self.subfolder_expansion_diag = Some(diag.clone());
-        self.address = subfolder_expansion_view_label("サブ展開", &root, &roots);
+        self.address =
+            subfolder_expansion_view_label("サブ展開", &root, &roots, Some(&scan_filter));
         if perf_on {
             crate::perf::event(
                 "subfolder",
@@ -2004,7 +2291,12 @@ impl App {
                     self.subfolder_expansion_root.clone(),
                     self.subfolder_expansion_roots.clone(),
                 ) {
-                    self.address = subfolder_expansion_view_label("サブ展開", &root, &roots);
+                    let scan_filter = self
+                        .subfolder_expansion_snapshot
+                        .as_ref()
+                        .map(|snapshot| &snapshot.scan_filter);
+                    self.address =
+                        subfolder_expansion_view_label("サブ展開", &root, &roots, scan_filter);
                 }
             } else if let Some(current) = self.current_folder.clone() {
                 self.address = self
@@ -2047,12 +2339,21 @@ impl App {
     }
 }
 
-fn subfolder_expansion_view_label(prefix: &str, root: &Path, roots: &[PathBuf]) -> String {
-    if roots.len() > 1 {
+fn subfolder_expansion_view_label(
+    prefix: &str,
+    root: &Path,
+    roots: &[PathBuf],
+    scan_filter: Option<&SubfolderExpansionScanFilter>,
+) -> String {
+    let mut label = if roots.len() > 1 {
         format!("{prefix}: {} ({}フォルダ)", root.display(), roots.len())
     } else {
         format!("{prefix}: {}", root.display())
+    };
+    if let Some(summary) = scan_filter.and_then(SubfolderExpansionScanFilter::active_summary) {
+        label.push_str(&format!(" [{}]", summary));
     }
+    label
 }
 
 fn expansion_roots_eq(a: &[PathBuf], b: &[PathBuf]) -> bool {
@@ -2096,15 +2397,21 @@ mod tests {
             include_convertible_archives: false,
             show_hidden_files: true,
             image_ext_priority: Vec::new(),
+            scan_filter: SubfolderExpansionScanFilter::default(),
         }
     }
 
-    fn scan_test_root(root: &Path, options: SubfolderExpansionOptions) -> SubfolderExpansionResult {
+    fn scan_test_root_with_max_depth(
+        root: &Path,
+        options: SubfolderExpansionOptions,
+        max_depth: u32,
+    ) -> SubfolderExpansionResult {
         let (tx, _rx) = mpsc::channel();
         scan_subfolder_expansion(
             root.to_path_buf(),
             vec![root.to_path_buf()],
             options,
+            max_depth,
             Arc::new(AtomicBool::new(false)),
             &crate::io_semaphore::GlobalIoSemaphore::new(1),
             &crate::activity_gate::ActivityGate::new(0),
@@ -2113,9 +2420,289 @@ mod tests {
         .expect("scan should finish")
     }
 
+    fn scan_test_root(root: &Path, options: SubfolderExpansionOptions) -> SubfolderExpansionResult {
+        scan_test_root_with_max_depth(
+            root,
+            options,
+            SubfolderExpansionDepthChoice::Unlimited.max_depth(),
+        )
+    }
+
     #[test]
     fn synthetic_path_is_registered_as_synthetic_view() {
         assert!(is_synthetic_view_path(&subfolder_expansion_synthetic_path()));
+    }
+
+    #[test]
+    fn depth_choice_maps_root_only_and_unlimited_to_walker_max_depth() {
+        assert_eq!(SubfolderExpansionDepthChoice::RootOnly.max_depth(), 0);
+        assert_eq!(
+            SubfolderExpansionDepthChoice::Unlimited.max_depth(),
+            MAX_SUBFOLDER_EXPANSION_DEPTH
+        );
+        assert_eq!(
+            SubfolderExpansionDepthChoice::from_setting(0),
+            SubfolderExpansionDepthChoice::RootOnly
+        );
+        assert_eq!(
+            SubfolderExpansionDepthChoice::from_setting(
+                crate::settings::SUBFOLDER_EXPANSION_MAX_DEPTH_DEFAULT
+            ),
+            SubfolderExpansionDepthChoice::Unlimited
+        );
+        assert_eq!(
+            SubfolderExpansionDepthChoice::from_setting(4),
+            SubfolderExpansionDepthChoice::Four
+        );
+        // 選択肢に無い値は「無制限」へ寄せる。浅くする方向へ倒すと、保存値の解釈が
+        // ずれたときに項目が見えなくなるため。
+        assert_eq!(
+            SubfolderExpansionDepthChoice::from_setting(7),
+            SubfolderExpansionDepthChoice::Unlimited
+        );
+    }
+
+    #[test]
+    fn subfolder_expansion_button_action_matches_off_on_and_busy_states() {
+        assert_eq!(
+            SubfolderExpansionButtonAction::for_state(false, false),
+            SubfolderExpansionButtonAction::OpenDialog
+        );
+        assert_eq!(
+            SubfolderExpansionButtonAction::for_state(true, false),
+            SubfolderExpansionButtonAction::ExitImmediately
+        );
+        assert_eq!(
+            SubfolderExpansionButtonAction::for_state(false, true),
+            SubfolderExpansionButtonAction::Disabled
+        );
+        assert_eq!(
+            SubfolderExpansionButtonAction::for_state(true, true),
+            SubfolderExpansionButtonAction::Disabled
+        );
+    }
+
+    #[test]
+    fn subfolder_expansion_view_label_shows_the_applied_scan_filter() {
+        let mut filter = SubfolderExpansionScanFilter::default();
+        filter.kinds.insert(crate::settings::FacetItemKind::Image);
+        filter.size_preset = Some(crate::settings::FacetSizePreset::Range {
+            min: Some(crate::settings::FacetSizeValue::new(
+                100,
+                crate::settings::FacetSizeUnit::KB,
+            )),
+            max: Some(crate::settings::FacetSizeValue::new(
+                2,
+                crate::settings::FacetSizeUnit::MB,
+            )),
+        });
+        filter.date_preset = Some(crate::settings::FacetDatePreset::Last7Days);
+
+        let label = subfolder_expansion_view_label(
+            "サブ展開",
+            Path::new("C:\\root"),
+            &[PathBuf::from("C:\\root")],
+            Some(&filter),
+        );
+
+        assert!(label.contains("種類: 画像"));
+        assert!(label.contains("サイズ: 100KB〜2MB未満"));
+        assert!(label.contains("更新日: 7日以内"));
+        assert_eq!(
+            subfolder_expansion_view_label(
+                "サブ展開",
+                Path::new("C:\\root"),
+                &[PathBuf::from("C:\\root")],
+                Some(&SubfolderExpansionScanFilter::default()),
+            ),
+            "サブ展開: C:\\root"
+        );
+    }
+
+    #[test]
+    fn scan_depth_limit_changes_how_many_tree_levels_are_collected() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().join("root");
+        let child = root.join("child");
+        let grandchild = child.join("grandchild");
+        std::fs::create_dir_all(&grandchild).unwrap();
+        std::fs::write(root.join("root.jpg"), b"root").unwrap();
+        std::fs::write(child.join("child.jpg"), b"child").unwrap();
+        std::fs::write(grandchild.join("grandchild.jpg"), b"grandchild").unwrap();
+        let options = test_scan_options(false);
+
+        let root_only = scan_test_root_with_max_depth(&root, options.clone(), 0);
+        let one_level = scan_test_root_with_max_depth(&root, options.clone(), 1);
+        let two_levels = scan_test_root_with_max_depth(&root, options, 2);
+
+        assert_eq!(root_only.entries.len(), 1);
+        assert_eq!(one_level.entries.len(), 2);
+        assert_eq!(two_levels.entries.len(), 3);
+        assert_eq!(root_only.diag.depth_limit_hits, 1);
+        assert_eq!(one_level.diag.depth_limit_hits, 1);
+        assert_eq!(two_levels.diag.depth_limit_hits, 0);
+    }
+
+    #[test]
+    fn scan_kind_filter_excludes_non_matching_entries() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("page.jpg"), b"image").unwrap();
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        std::fs::write(root.join("book.zip"), b"zip").unwrap();
+        std::fs::write(root.join("document.pdf"), b"pdf").unwrap();
+        let mut options = test_scan_options(false);
+        options
+            .scan_filter
+            .kinds
+            .insert(crate::settings::FacetItemKind::Image);
+        options
+            .scan_filter
+            .kinds
+            .insert(crate::settings::FacetItemKind::Pdf);
+
+        let result = scan_test_root(&root, options);
+        let kinds = result
+            .entries
+            .iter()
+            .map(|entry| entry.kind)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(result.entries.len(), 2);
+        assert!(kinds.contains(&SubfolderExpansionEntryKind::Image));
+        assert!(kinds.contains(&SubfolderExpansionEntryKind::Pdf));
+    }
+
+    #[test]
+    fn scan_size_filter_excludes_non_matching_files() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("small.jpg"), vec![0; 512]).unwrap();
+        std::fs::write(root.join("large.jpg"), vec![0; 2 * 1024 * 1024]).unwrap();
+        let mut options = test_scan_options(false);
+        options.scan_filter.size_preset = Some(crate::settings::FacetSizePreset::Under1MiB);
+
+        let result = scan_test_root(&root, options);
+
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(
+            result.entries[0]
+                .path
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("small.jpg")
+        );
+    }
+
+    #[test]
+    fn scan_size_range_filter_excludes_files_outside_the_range() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("small.jpg"), vec![0; 50 * 1024]).unwrap();
+        std::fs::write(root.join("inside.jpg"), vec![0; 150 * 1024]).unwrap();
+        std::fs::write(root.join("large.jpg"), vec![0; 300 * 1024]).unwrap();
+        let mut options = test_scan_options(false);
+        options.scan_filter.size_preset = Some(crate::settings::FacetSizePreset::Range {
+            min: Some(crate::settings::FacetSizeValue::new(
+                100,
+                crate::settings::FacetSizeUnit::KB,
+            )),
+            max: Some(crate::settings::FacetSizeValue::new(
+                200,
+                crate::settings::FacetSizeUnit::KB,
+            )),
+        });
+
+        let result = scan_test_root(&root, options);
+
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(
+            result.entries[0]
+                .path
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("inside.jpg")
+        );
+    }
+
+    #[test]
+    fn scan_date_filter_excludes_non_matching_files() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let recent = root.join("recent.jpg");
+        let old = root.join("old.jpg");
+        std::fs::write(&recent, b"recent").unwrap();
+        std::fs::write(&old, b"old").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(946_684_800))
+            .unwrap();
+        let mut options = test_scan_options(false);
+        options.scan_filter.date_preset = Some(crate::settings::FacetDatePreset::Today);
+
+        let result = scan_test_root(&root, options);
+
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].path, recent);
+    }
+
+    #[test]
+    fn image_folder_book_ignores_size_and_date_filters() {
+        let filter = SubfolderExpansionScanFilter {
+            kinds: BTreeSet::new(),
+            date_preset: Some(crate::settings::FacetDatePreset::Today),
+            size_preset: Some(crate::settings::FacetSizePreset::Over100MiB),
+        };
+        assert!(filter.entry_matches(SubfolderExpansionEntryKind::Folder, 1, 0, 2_000_000_000));
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().join("root");
+        let book = root.join("book");
+        std::fs::create_dir_all(&book).unwrap();
+        std::fs::write(book.join("001.jpg"), b"first").unwrap();
+        let mut options = test_scan_options(true);
+        options.scan_filter = filter;
+
+        let result = scan_test_root(&root, options);
+
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].kind, SubfolderExpansionEntryKind::Folder);
+        assert_eq!(result.entries[0].path, book);
+    }
+
+    #[test]
+    fn no_scan_filter_keeps_the_previous_entry_set() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("page.jpg"), b"image").unwrap();
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        std::fs::write(root.join("book.zip"), b"zip").unwrap();
+        std::fs::write(root.join("document.pdf"), b"pdf").unwrap();
+
+        let result = scan_test_root(&root, test_scan_options(false));
+        let kinds = result
+            .entries
+            .iter()
+            .map(|entry| entry.kind)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(result.entries.len(), 4);
+        assert_eq!(
+            kinds,
+            HashSet::from([
+                SubfolderExpansionEntryKind::Image,
+                SubfolderExpansionEntryKind::Video,
+                SubfolderExpansionEntryKind::Zip,
+                SubfolderExpansionEntryKind::Pdf,
+            ])
+        );
     }
 
     #[test]
@@ -2183,7 +2770,9 @@ mod tests {
                 include_convertible_archives: false,
                 show_hidden_files: true,
                 image_ext_priority: Vec::new(),
+                scan_filter: SubfolderExpansionScanFilter::default(),
             },
+            SubfolderExpansionDepthChoice::Unlimited.max_depth(),
             Arc::new(AtomicBool::new(false)),
             &io_sem,
             &activity_gate,
@@ -2292,6 +2881,7 @@ mod tests {
         let snapshot = SubfolderExpansionSnapshot {
             root: root.clone(),
             roots: vec![root],
+            scan_filter: SubfolderExpansionScanFilter::default(),
             entries: Arc::new(entries),
             video_thumb_overrides: HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
@@ -2419,6 +3009,7 @@ mod tests {
             include_convertible_archives: false,
             show_hidden_files: true,
             image_ext_priority: vec!["jpg".into(), "png".into()],
+            scan_filter: SubfolderExpansionScanFilter::default(),
         };
         let mut overrides = HashMap::new();
         apply_duplicate_filters_to_media(&mut media, &options, &mut overrides);
@@ -2574,6 +3165,7 @@ mod tests {
         let snapshot = SubfolderExpansionSnapshot {
             root: root.clone(),
             roots: vec![root],
+            scan_filter: SubfolderExpansionScanFilter::default(),
             entries: Arc::clone(&entries),
             video_thumb_overrides: HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
@@ -2640,6 +3232,7 @@ mod tests {
         let snapshot = SubfolderExpansionSnapshot {
             root: root.clone(),
             roots: vec![root],
+            scan_filter: SubfolderExpansionScanFilter::default(),
             entries,
             video_thumb_overrides: HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
@@ -2872,6 +3465,7 @@ mod tests {
         let mut snapshot = SubfolderExpansionSnapshot {
             root: root.clone(),
             roots: vec![root],
+            scan_filter: SubfolderExpansionScanFilter::default(),
             entries: Arc::new(vec![
                 SubfolderExpansionEntry {
                     path: kept_video.clone(),

@@ -145,6 +145,9 @@ pub struct SmartFolderFilter {
     pub date_preset: Option<FacetDatePreset>,
     #[serde(default)]
     pub size_preset: Option<FacetSizePreset>,
+    /// Range を知らない旧版向けの保存用キャリア。実行時の正は size_preset。
+    #[serde(default)]
+    pub size_extended_stash: Option<FacetSizePreset>,
     /// 0=未評価、1..=5=星。全 false は sanitize で「全て」に補正する。
     #[serde(default = "default_smart_folder_ratings")]
     pub ratings: [bool; 6],
@@ -177,6 +180,7 @@ impl Default for SmartFolderFilter {
             extensions: std::collections::BTreeSet::new(),
             date_preset: None,
             size_preset: None,
+            size_extended_stash: None,
             ratings: default_smart_folder_ratings(),
             tags: std::collections::BTreeSet::new(),
             tag_mode: FacetTagMode::default(),
@@ -190,6 +194,20 @@ impl Default for SmartFolderFilter {
 }
 
 impl SmartFolderFilter {
+    pub fn stash_extended_size_for_persist(&mut self) {
+        if matches!(self.size_preset, Some(FacetSizePreset::Range { .. })) {
+            self.size_extended_stash = self.size_preset.take();
+        } else {
+            self.size_extended_stash = None;
+        }
+    }
+
+    pub fn restore_extended_size_after_load(&mut self) {
+        if let Some(preset) = self.size_extended_stash.take() {
+            self.size_preset = Some(preset);
+        }
+    }
+
     pub fn stash_bookmark_states_for_persist(&mut self) {
         self.bookmarked_stash = self.edits.remove(&FacetEditFlag::Bookmarked);
         self.unbookmarked_stash = self.edits.remove(&FacetEditFlag::Unbookmarked);
@@ -1074,21 +1092,92 @@ impl FacetDatePreset {
     }
 }
 
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+pub enum FacetSizeUnit {
+    KB,
+    MB,
+    GB,
+}
+
+impl FacetSizeUnit {
+    pub const ALL: [Self; 3] = [Self::KB, Self::MB, Self::GB];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::KB => "KB",
+            Self::MB => "MB",
+            Self::GB => "GB",
+        }
+    }
+
+    fn bytes_per_unit(self) -> u64 {
+        match self {
+            Self::KB => 1024,
+            Self::MB => 1024 * 1024,
+            Self::GB => 1024 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+pub struct FacetSizeValue {
+    pub value: u32,
+    pub unit: FacetSizeUnit,
+}
+
+impl FacetSizeValue {
+    pub const fn new(value: u32, unit: FacetSizeUnit) -> Self {
+        Self { value, unit }
+    }
+
+    pub fn label(self) -> String {
+        format!("{}{}", self.value, self.unit.label())
+    }
+
+    pub fn bytes(self) -> u64 {
+        u64::from(self.value) * self.unit.bytes_per_unit()
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FacetSizePreset {
     Under1MiB,
     MiB1To10,
     MiB10To100,
     Over100MiB,
+    Range {
+        min: Option<FacetSizeValue>,
+        max: Option<FacetSizeValue>,
+    },
 }
 
 impl FacetSizePreset {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Under1MiB => "1MB未満",
-            Self::MiB1To10 => "1〜10MB",
-            Self::MiB10To100 => "10〜100MB",
-            Self::Over100MiB => "100MB以上",
+    pub fn label(self) -> String {
+        match self.sanitized() {
+            Self::Under1MiB => "1MB未満".to_string(),
+            Self::MiB1To10 => "1〜10MB".to_string(),
+            Self::MiB10To100 => "10〜100MB".to_string(),
+            Self::Over100MiB => "100MB以上".to_string(),
+            Self::Range {
+                min: Some(min),
+                max: Some(max),
+            } => format!("{}〜{}未満", min.label(), max.label()),
+            Self::Range {
+                min: Some(min),
+                max: None,
+            } => format!("{}以上", min.label()),
+            Self::Range {
+                min: None,
+                max: Some(max),
+            } => format!("{}未満", max.label()),
+            Self::Range {
+                min: None,
+                max: None,
+            } => "範囲指定".to_string(),
         }
     }
 
@@ -1101,13 +1190,49 @@ impl FacetSizePreset {
         ]
     }
 
+    /// 実際に何かを絞り込む条件になっているか。
+    ///
+    /// `範囲指定` を選んだ直後は下限・上限ともチェックが外れており、この状態は
+    /// 「サイズで絞っていない」のと同じ。`is_some()` だけで有効判定すると、
+    /// 何も絞っていないのにフィルタが効いているように見える。
+    pub fn is_effective(self) -> bool {
+        !matches!(
+            self,
+            Self::Range {
+                min: None,
+                max: None
+            }
+        )
+    }
+
     pub fn range_bytes(self) -> (u64, Option<u64>) {
         const MIB: u64 = 1024 * 1024;
-        match self {
+        match self.sanitized() {
             Self::Under1MiB => (0, Some(MIB)),
             Self::MiB1To10 => (MIB, Some(10 * MIB)),
             Self::MiB10To100 => (10 * MIB, Some(100 * MIB)),
             Self::Over100MiB => (100 * MIB, None),
+            Self::Range { min, max } => (
+                min.map_or(0, FacetSizeValue::bytes),
+                max.map(FacetSizeValue::bytes),
+            ),
+        }
+    }
+
+    pub fn sanitized(self) -> Self {
+        match self {
+            Self::Range { mut min, mut max } => {
+                // 日付範囲と同じく、逆順は入力値と単位を保ったまま最小・最大を交換する。
+                // 判定側は常に下限を含み、上限を含まない [min, max) として扱う。
+                if min
+                    .zip(max)
+                    .is_some_and(|(min, max)| min.bytes() > max.bytes())
+                {
+                    std::mem::swap(&mut min, &mut max);
+                }
+                Self::Range { min, max }
+            }
+            preset => preset,
         }
     }
 }
@@ -1214,6 +1339,10 @@ pub struct FacetFilter {
     pub date_extended_stash: Option<FacetDatePreset>,
     #[serde(default)]
     pub size_preset: Option<FacetSizePreset>,
+    /// 旧版が知らないサイズの範囲指定を退避する保存用キャリア。旧版が読む
+    /// size_preset には従来の 4 variant だけを書き、実行時の正は常に size_preset。
+    #[serde(default)]
+    pub size_extended_stash: Option<FacetSizePreset>,
     #[serde(default)]
     pub edits: std::collections::BTreeSet<FacetEditFlag>,
     #[serde(default, alias = "ai_adjustment_include_descendants")]
@@ -1273,6 +1402,22 @@ impl FacetFilter {
         }
     }
 
+    /// Range を知らない旧版が設定全体を破損扱いしないよう、未知フィールドへ退避する。
+    /// live な Settings には適用せず、保存用クローンに対してだけ使う。
+    pub fn stash_extended_size_for_persist(&mut self) {
+        if matches!(self.size_preset, Some(FacetSizePreset::Range { .. })) {
+            self.size_extended_stash = self.size_preset.take();
+        } else {
+            self.size_extended_stash = None;
+        }
+    }
+
+    pub fn restore_extended_size_after_load(&mut self) {
+        if let Some(preset) = self.size_extended_stash.take() {
+            self.size_preset = Some(preset);
+        }
+    }
+
     pub fn stash_bookmark_states_for_persist(&mut self) {
         self.bookmarked_stash = self.edits.remove(&FacetEditFlag::Bookmarked);
         self.unbookmarked_stash = self.edits.remove(&FacetEditFlag::Unbookmarked);
@@ -1296,7 +1441,7 @@ impl FacetFilter {
             || !self.tags.is_empty()
             || self.include_untagged
             || self.date_preset.is_some()
-            || self.size_preset.is_some()
+            || self.size_preset.is_some_and(FacetSizePreset::is_effective)
             || !self.edits.is_empty()
     }
 
@@ -2991,6 +3136,19 @@ pub struct Settings {
     /// サブフォルダ展開ビューでフォルダ境界を優先するか。
     #[serde(default)]
     pub subfolder_expansion_order: SubfolderExpansionOrder,
+    /// サブ展開の走査起点から何階層下まで読むか。0 は起点だけ、40 は UI 上の
+    /// 「無制限」かつ reparse point loop 対策を兼ねる従来の実効上限。
+    #[serde(default = "default_subfolder_expansion_max_depth")]
+    pub subfolder_expansion_max_depth: u32,
+    /// サブ展開の走査時に収集する種類。空集合は全種類。
+    #[serde(default)]
+    pub subfolder_expansion_filter_kinds: std::collections::BTreeSet<FacetItemKind>,
+    /// サブ展開の走査時にファイルへ適用する更新日条件。
+    #[serde(default)]
+    pub subfolder_expansion_filter_date_preset: Option<FacetDatePreset>,
+    /// サブ展開の走査時にファイルへ適用するサイズ条件。
+    #[serde(default)]
+    pub subfolder_expansion_filter_size_preset: Option<FacetSizePreset>,
     /// 実フォルダ / アーカイブ類 / 画像 / 動画・音声を 4 行へ割り当てる表示順。
     /// 同じ行は `sort_order` で混在ソートし、空行は表示時に読み飛ばす。
     #[serde(default)]
@@ -4407,6 +4565,8 @@ pub const RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_DEFAULT: usize = 10;
 pub const RETAINED_FINAL_AI_CACHE_MAX_MIB_MIN: u64 = 0;
 pub const RETAINED_FINAL_AI_CACHE_MAX_MIB_MAX: u64 = 8192;
 pub const RETAINED_FINAL_AI_CACHE_MAX_MIB_DEFAULT: u64 = 512;
+/// サブ展開の「無制限」が使う従来の実効上限。
+pub const SUBFOLDER_EXPANSION_MAX_DEPTH_DEFAULT: u32 = 40;
 
 fn default_grid_cols() -> usize {
     4
@@ -4425,6 +4585,9 @@ fn default_prefetch_forward() -> usize {
 }
 fn default_folder_skip_limit() -> usize {
     5
+}
+fn default_subfolder_expansion_max_depth() -> u32 {
+    SUBFOLDER_EXPANSION_MAX_DEPTH_DEFAULT
 }
 fn default_thumb_px() -> u32 {
     512
@@ -4730,6 +4893,10 @@ impl Default for Settings {
             show_hidden_files: false,
             sort_order: SortOrder::default(),
             subfolder_expansion_order: SubfolderExpansionOrder::default(),
+            subfolder_expansion_max_depth: default_subfolder_expansion_max_depth(),
+            subfolder_expansion_filter_kinds: std::collections::BTreeSet::new(),
+            subfolder_expansion_filter_date_preset: None,
+            subfolder_expansion_filter_size_preset: None,
             grid_display_order: GridDisplayOrder::default(),
             thumb_px: default_thumb_px(),
             text_preview_scale: default_text_preview_scale(),
@@ -6131,6 +6298,24 @@ impl Settings {
         self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
         self.ui_font.sanitize();
         self.grid_display_order.normalize();
+        self.subfolder_expansion_filter_kinds.retain(|kind| {
+            matches!(
+                kind,
+                FacetItemKind::Folder
+                    | FacetItemKind::Image
+                    | FacetItemKind::Video
+                    | FacetItemKind::Zip
+                    | FacetItemKind::Pdf
+            )
+        });
+        self.subfolder_expansion_filter_date_preset = self
+            .subfolder_expansion_filter_date_preset
+            .map(FacetDatePreset::sanitized);
+        // この設定キー自体が未リリースなので、旧版はフィールドごと無視する。
+        // FacetFilter のようなダウングレード互換 stash は不要。
+        self.subfolder_expansion_filter_size_preset = self
+            .subfolder_expansion_filter_size_preset
+            .map(FacetSizePreset::sanitized);
         // 環境設定 UI 側のレンジ (1..=30) と整合させる。
         // 下限 0 は navigate_folder_with_skip が first を評価せず Ctrl+↑↓ が
         // 事実上機能しなくなる。上限を超える値は ZIP 中身検査込みの DFS が
@@ -6308,8 +6493,10 @@ impl Settings {
                 if rule.filter.edits.remove(&FacetEditFlag::AiAdjustment) {
                     rule.filter.edits.insert(FacetEditFlag::Adjustment);
                 }
+                rule.filter.restore_extended_size_after_load();
                 rule.filter.restore_bookmark_states_after_load();
                 rule.filter.date_preset = rule.filter.date_preset.map(FacetDatePreset::sanitized);
+                rule.filter.size_preset = rule.filter.size_preset.map(FacetSizePreset::sanitized);
                 true
             });
         }
@@ -6345,11 +6532,16 @@ impl Settings {
             self.facet_filter.edits.insert(FacetEditFlag::Adjustment);
         }
         self.facet_filter.restore_extended_date_after_load();
+        self.facet_filter.restore_extended_size_after_load();
         self.facet_filter.restore_bookmark_states_after_load();
         self.facet_filter.date_preset = self
             .facet_filter
             .date_preset
             .map(FacetDatePreset::sanitized);
+        self.facet_filter.size_preset = self
+            .facet_filter
+            .size_preset
+            .map(FacetSizePreset::sanitized);
         // 保存時に退避した種類フィルタの Audio を kinds へ戻す (v2.2.0 ダウングレード互換、
         // `FacetFilter::kind_audio_stash` のコメント参照)。
         self.facet_filter.restore_kind_audio_after_load();
@@ -6464,6 +6656,10 @@ impl Settings {
         self.thumb_aspect = src.thumb_aspect;
         self.sort_order = src.sort_order;
         self.subfolder_expansion_order = src.subfolder_expansion_order;
+        self.subfolder_expansion_max_depth = src.subfolder_expansion_max_depth;
+        self.subfolder_expansion_filter_kinds = src.subfolder_expansion_filter_kinds.clone();
+        self.subfolder_expansion_filter_date_preset = src.subfolder_expansion_filter_date_preset;
+        self.subfolder_expansion_filter_size_preset = src.subfolder_expansion_filter_size_preset;
         self.rating_filter = src.rating_filter;
         self.folder_tree_pane_visible = src.folder_tree_pane_visible;
         self.folder_tree_pane_width_ratio = src.folder_tree_pane_width_ratio;
@@ -7640,6 +7836,63 @@ mod tests {
     }
 
     #[test]
+    fn facet_extended_size_stash_keeps_persisted_form_compatible() {
+        let range = FacetSizePreset::Range {
+            min: Some(FacetSizeValue::new(100, FacetSizeUnit::KB)),
+            max: Some(FacetSizeValue::new(2, FacetSizeUnit::MB)),
+        };
+        let mut facet = FacetFilter {
+            size_preset: Some(range),
+            ..FacetFilter::default()
+        };
+        let original = facet.clone();
+        facet.stash_extended_size_for_persist();
+        let json = serde_json::to_value(&facet).unwrap();
+        assert!(json["size_preset"].is_null());
+        assert!(!json["size_extended_stash"].is_null());
+
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        enum LegacySizePreset {
+            Under1MiB,
+            MiB1To10,
+            MiB10To100,
+            Over100MiB,
+        }
+        #[derive(serde::Deserialize)]
+        struct LegacyFacetFilter {
+            #[serde(default)]
+            size_preset: Option<LegacySizePreset>,
+        }
+        let legacy: LegacyFacetFilter = serde_json::from_value(json.clone())
+            .expect("legacy shape must ignore the extended size carrier");
+        assert!(legacy.size_preset.is_none());
+
+        let mut loaded: FacetFilter = serde_json::from_value(json).unwrap();
+        loaded.restore_extended_size_after_load();
+        assert_eq!(loaded, original);
+
+        let mut old_choice = FacetFilter {
+            size_preset: Some(FacetSizePreset::MiB10To100),
+            ..FacetFilter::default()
+        };
+        old_choice.stash_extended_size_for_persist();
+        assert_eq!(old_choice.size_preset, Some(FacetSizePreset::MiB10To100));
+        assert!(old_choice.size_extended_stash.is_none());
+
+        let mut smart = SmartFolderFilter {
+            size_preset: Some(range),
+            ..SmartFolderFilter::default()
+        };
+        let smart_original = smart.clone();
+        smart.stash_extended_size_for_persist();
+        assert!(smart.size_preset.is_none());
+        assert_eq!(smart.size_extended_stash, Some(range));
+        smart.restore_extended_size_after_load();
+        assert_eq!(smart, smart_original);
+    }
+
+    #[test]
     fn page_count_details_stash_keeps_persisted_form_v25_compatible() {
         let mut settings = Settings::default();
         settings.details_sort_key = DetailsSortKey::PageCount;
@@ -7959,6 +8212,13 @@ mod tests {
         assert!(!s.show_hidden_files);
         assert_eq!(s.sort_order, SortOrder::FileName);
         assert_eq!(s.subfolder_expansion_order, SubfolderExpansionOrder::Flat);
+        assert_eq!(
+            s.subfolder_expansion_max_depth,
+            SUBFOLDER_EXPANSION_MAX_DEPTH_DEFAULT
+        );
+        assert!(s.subfolder_expansion_filter_kinds.is_empty());
+        assert!(s.subfolder_expansion_filter_date_preset.is_none());
+        assert!(s.subfolder_expansion_filter_size_preset.is_none());
         assert_eq!(s.thumb_px, 512);
         assert_eq!(s.thumb_quality, 75);
         assert_eq!(s.cache_policy, CachePolicy::Auto);
@@ -9562,6 +9822,66 @@ mod tests {
     }
 
     #[test]
+    fn facet_size_ranges_convert_units_and_keep_existing_boundaries() {
+        const KIB: u64 = 1024;
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        assert_eq!(FacetSizeValue::new(7, FacetSizeUnit::KB).bytes(), 7 * KIB);
+        assert_eq!(FacetSizeValue::new(7, FacetSizeUnit::MB).bytes(), 7 * MIB);
+        assert_eq!(FacetSizeValue::new(7, FacetSizeUnit::GB).bytes(), 7 * GIB);
+
+        assert_eq!(
+            FacetSizePreset::Range {
+                min: Some(FacetSizeValue::new(100, FacetSizeUnit::KB)),
+                max: None,
+            }
+            .range_bytes(),
+            (100 * KIB, None)
+        );
+        assert_eq!(
+            FacetSizePreset::Range {
+                min: None,
+                max: Some(FacetSizeValue::new(2, FacetSizeUnit::MB)),
+            }
+            .range_bytes(),
+            (0, Some(2 * MIB))
+        );
+        assert_eq!(
+            FacetSizePreset::Range {
+                min: Some(FacetSizeValue::new(100, FacetSizeUnit::KB)),
+                max: Some(FacetSizeValue::new(2, FacetSizeUnit::MB)),
+            }
+            .range_bytes(),
+            (100 * KIB, Some(2 * MIB))
+        );
+
+        let reversed = FacetSizePreset::Range {
+            min: Some(FacetSizeValue::new(2, FacetSizeUnit::GB)),
+            max: Some(FacetSizeValue::new(512, FacetSizeUnit::MB)),
+        };
+        assert_eq!(reversed.range_bytes(), (512 * MIB, Some(2 * GIB)));
+        assert_eq!(
+            reversed.sanitized(),
+            FacetSizePreset::Range {
+                min: Some(FacetSizeValue::new(512, FacetSizeUnit::MB)),
+                max: Some(FacetSizeValue::new(2, FacetSizeUnit::GB)),
+            }
+        );
+
+        assert_eq!(FacetSizePreset::Under1MiB.range_bytes(), (0, Some(MIB)));
+        assert_eq!(
+            FacetSizePreset::MiB1To10.range_bytes(),
+            (MIB, Some(10 * MIB))
+        );
+        assert_eq!(
+            FacetSizePreset::MiB10To100.range_bytes(),
+            (10 * MIB, Some(100 * MIB))
+        );
+        assert_eq!(FacetSizePreset::Over100MiB.range_bytes(), (100 * MIB, None));
+    }
+
+    #[test]
     fn facet_date_sanitize_clamps_values_and_orders_range() {
         assert_eq!(
             FacetDatePreset::CustomDays(0).sanitized(),
@@ -10440,6 +10760,55 @@ mod tests {
         }
 
         #[test]
+        fn subfolder_expansion_scan_settings_db_roundtrip() {
+            let missing: Settings = serde_json::from_str("{}").unwrap();
+            assert_eq!(
+                missing.subfolder_expansion_max_depth,
+                SUBFOLDER_EXPANSION_MAX_DEPTH_DEFAULT
+            );
+            assert!(missing.subfolder_expansion_filter_kinds.is_empty());
+            assert!(missing.subfolder_expansion_filter_date_preset.is_none());
+            assert!(missing.subfolder_expansion_filter_size_preset.is_none());
+
+            let env = setup_backup_env();
+            let _initial = Settings::load();
+            assert!(data_db_path(&env).exists());
+
+            let mut settings = Settings::default();
+            settings.subfolder_expansion_max_depth = 2;
+            settings
+                .subfolder_expansion_filter_kinds
+                .insert(FacetItemKind::Image);
+            settings
+                .subfolder_expansion_filter_kinds
+                .insert(FacetItemKind::Pdf);
+            settings.subfolder_expansion_filter_date_preset = Some(FacetDatePreset::CustomDays(45));
+            settings.subfolder_expansion_filter_size_preset = Some(FacetSizePreset::Range {
+                min: Some(FacetSizeValue::new(100, FacetSizeUnit::KB)),
+                max: Some(FacetSizeValue::new(2, FacetSizeUnit::MB)),
+            });
+            settings.save();
+
+            reset_backup_state_for_test();
+            let loaded = Settings::load();
+            assert_eq!(loaded.subfolder_expansion_max_depth, 2);
+            assert_eq!(
+                loaded.subfolder_expansion_filter_kinds,
+                settings.subfolder_expansion_filter_kinds
+            );
+            assert_eq!(
+                loaded.subfolder_expansion_filter_date_preset,
+                Some(FacetDatePreset::CustomDays(45))
+            );
+            assert_eq!(
+                loaded.subfolder_expansion_filter_size_preset,
+                Some(FacetSizePreset::Range {
+                    min: Some(FacetSizeValue::new(100, FacetSizeUnit::KB)),
+                    max: Some(FacetSizeValue::new(2, FacetSizeUnit::MB)),
+                })
+            );
+        }
+        #[test]
         fn details_selection_bar_settings_db_roundtrip() {
             let env = setup_backup_env();
             let _initial = Settings::load();
@@ -10551,7 +10920,10 @@ mod tests {
             s.facet_filter.include_untagged = true;
             s.facet_filter.tag_mode = FacetTagMode::All;
             s.facet_filter.date_preset = Some(FacetDatePreset::Last30Days);
-            s.facet_filter.size_preset = Some(FacetSizePreset::MiB10To100);
+            s.facet_filter.size_preset = Some(FacetSizePreset::Range {
+                min: Some(FacetSizeValue::new(100, FacetSizeUnit::KB)),
+                max: Some(FacetSizeValue::new(2, FacetSizeUnit::MB)),
+            });
             s.facet_filter.edits.insert(FacetEditFlag::Tagged);
             s.facet_filter.edit_include_descendants = true;
             s.thumb_aspect_auto = true;
@@ -10780,7 +11152,10 @@ mod tests {
             );
             assert_eq!(
                 loaded.facet_filter.size_preset,
-                Some(FacetSizePreset::MiB10To100),
+                Some(FacetSizePreset::Range {
+                    min: Some(FacetSizeValue::new(100, FacetSizeUnit::KB)),
+                    max: Some(FacetSizeValue::new(2, FacetSizeUnit::MB)),
+                }),
                 "facet_filter size preset should survive roundtrip"
             );
             assert!(

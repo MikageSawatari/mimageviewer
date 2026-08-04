@@ -110,6 +110,9 @@ pub(crate) mod smart_folder;
 mod snapshot_ops;
 mod startup_ops;
 mod subfolder_expansion;
+pub(crate) use subfolder_expansion::{
+    SUBFOLDER_EXPANSION_FILTER_KINDS, SubfolderExpansionDepthChoice, SubfolderExpansionScanFilter,
+};
 pub(crate) mod top_level_grid_view;
 #[cfg(windows)]
 mod viewer_session;
@@ -9944,6 +9947,8 @@ pub struct App {
     /// snapshot を prepare worker と共有中に削除された実パス。巨大 Arc を UI
     /// スレッドで copy-on-write せず、以後の再構築で除外する tombstone。
     pub(crate) subfolder_expansion_removed_paths: std::collections::HashSet<String>,
+    /// OFF 状態のサブ展開ボタンから開く走査階層設定ダイアログ。
+    pub(crate) show_subfolder_expansion_dialog: bool,
     /// サブ展開 worker の進行中状態。
     pub(crate) subfolder_expansion_pending: Option<subfolder_expansion::SubfolderExpansionPending>,
     /// サブ展開 worker 完了後、ソート・一覧構築・メタ DB 読み込みを行う非同期準備。
@@ -12398,6 +12403,7 @@ impl App {
             subfolder_expansion_saved_folder: None,
             subfolder_expansion_snapshot: None,
             subfolder_expansion_removed_paths: std::collections::HashSet::new(),
+            show_subfolder_expansion_dialog: false,
             subfolder_expansion_pending: None,
             subfolder_expansion_install_pending: None,
             subfolder_expansion_confirm_pending: None,
@@ -13796,6 +13802,7 @@ impl App {
             || self.fullscreen_tag_picker_open
             || self.show_fav_add_dialog
             || self.show_open_folder_dialog
+            || self.show_subfolder_expansion_dialog
             // Native name dialogs stop App::update while their OS modal loop is
             // active. Keep only the queued-launch flags here so the triggering
             // frame cannot leak input to the grid. Their async workers are not
@@ -62292,6 +62299,7 @@ impl eframe::App for App {
         self.show_tag_apply_dialog(ctx);
         self.show_fav_add_dialog_window(ctx);
         let open_folder_nav = self.show_open_folder_dialog_window(ctx);
+        self.show_subfolder_expansion_dialog_window(ctx);
         self.show_new_folder_dialog_window(ctx);
         self.show_rename_dialog_window(ctx);
         self.draw_book_manager(ctx);

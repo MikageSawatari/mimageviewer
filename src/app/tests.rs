@@ -5291,6 +5291,7 @@ mod phase_c_folder_nav_history_tests {
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
             root: root.clone(),
             roots: vec![root],
+            scan_filter: Default::default(),
             entries: vec![SubfolderExpansionEntry {
                 path: image.clone(),
                 kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
@@ -5423,6 +5424,7 @@ mod phase_c_folder_nav_history_tests {
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
             root,
             roots: vec![a],
+            scan_filter: Default::default(),
             entries: vec![SubfolderExpansionEntry {
                 path: original.clone(),
                 kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
@@ -7130,6 +7132,7 @@ mod phase_c_drill_nav_tests {
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
             root: root.clone(),
             roots: vec![a.clone()],
+            scan_filter: Default::default(),
             entries: vec![SubfolderExpansionEntry {
                 path: image.clone(),
                 kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
@@ -7179,6 +7182,7 @@ mod phase_c_drill_nav_tests {
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
             root: root.clone(),
             roots: vec![a],
+            scan_filter: Default::default(),
             entries: vec![SubfolderExpansionEntry {
                 path: image.clone(),
                 kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
@@ -7227,6 +7231,7 @@ mod phase_c_drill_nav_tests {
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
             root,
             roots: vec![a],
+            scan_filter: Default::default(),
             entries: vec![SubfolderExpansionEntry {
                 path: image.clone(),
                 kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
@@ -7273,6 +7278,7 @@ mod phase_c_drill_nav_tests {
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
             root,
             roots: vec![a],
+            scan_filter: Default::default(),
             entries: vec![SubfolderExpansionEntry {
                 path: original.clone(),
                 kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
@@ -7373,6 +7379,7 @@ mod phase_c_drill_nav_tests {
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
             root,
             roots: vec![a],
+            scan_filter: Default::default(),
             entries: vec![SubfolderExpansionEntry {
                 path: original.clone(),
                 kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
@@ -7420,6 +7427,42 @@ mod phase_c_drill_nav_tests {
                 .any(|item| matches!(item, GridItem::Image(path) if path == &original)),
             "レーティング一覧で start_loading_items を通った後でも退避 snapshot へ戻す"
         );
+    }
+
+    #[test]
+    fn subfolder_expansion_button_opens_dialog_when_view_is_off() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        app.current_folder = Some(root);
+        app.current_folder_last_mtime = Some(std::time::SystemTime::now());
+
+        assert!(!app.subfolder_expansion_on());
+        assert!(!app.subfolder_expansion_busy());
+        assert!(!app.show_subfolder_expansion_dialog);
+
+        app.activate_subfolder_expansion_button();
+
+        assert!(app.show_subfolder_expansion_dialog);
+        assert!(app.subfolder_expansion_pending.is_none());
+    }
+
+    #[test]
+    fn subfolder_expansion_button_exits_immediately_when_view_is_on() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        app.current_folder = Some(subfolder_expansion_synthetic_path());
+        app.items_are_subfolder_expansion_view = true;
+        app.subfolder_expansion_root = Some(root.clone());
+        app.subfolder_expansion_roots = vec![root.clone()];
+        app.subfolder_expansion_saved_folder = Some(root);
+        app.show_subfolder_expansion_dialog = true;
+
+        app.activate_subfolder_expansion_button();
+
+        assert!(!app.items_are_subfolder_expansion_view);
+        assert!(!app.show_subfolder_expansion_dialog);
     }
 
     #[test]
@@ -43815,6 +43858,17 @@ fn settings_restore_blocks_background_dialog_input() {
 }
 
 #[test]
+fn subfolder_expansion_dialog_is_registered_as_common_modal() {
+    let mut app = phase_c_support::setup_app();
+    assert!(!app.any_dialog_open());
+
+    app.show_subfolder_expansion_dialog = true;
+
+    assert!(app.any_dialog_open());
+    assert!(app.any_modal_dialog_open_for_fullscreen_keys());
+}
+
+#[test]
 fn common_dialog_registry_covers_cache_and_setup_dialogs() {
     let mut app = phase_c_support::setup_app();
     assert!(!app.any_dialog_open());
@@ -45602,6 +45656,7 @@ mod smart_folder_transition_tests {
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
             root: root.clone(),
             roots: vec![root],
+            scan_filter: Default::default(),
             entries: vec![SubfolderExpansionEntry {
                 path: image.clone(),
                 kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
@@ -45764,6 +45819,7 @@ fn subfolder_display_prepare_blocks_background_input() {
             snapshot: subfolder_expansion::SubfolderExpansionSnapshot {
                 root: root.clone(),
                 roots: vec![root],
+                scan_filter: Default::default(),
                 entries: std::sync::Arc::new(Vec::new()),
                 video_thumb_overrides: std::collections::HashMap::new(),
                 diag: subfolder_expansion::SubfolderExpansionDiag::default(),

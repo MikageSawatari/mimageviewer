@@ -18,7 +18,8 @@ use crate::keymap::{KeyAction, Keymap, MenuCommandId, TopMenuId, resolve_menu_la
 use crate::settings::{
     DetailsColumnId, DetailsColumnWidth, DetailsRowStyle, DetailsSelectionBarMode,
     DetailsSizeDisplayMode, DetailsSortKey, FacetCalendarDate, FacetDatePreset, FacetEditFlag,
-    FacetItemKind, FacetSizePreset, FacetTagMode, GridClickSelectionMode, GridViewMode,
+    FacetItemKind, FacetSizePreset, FacetSizeUnit, FacetSizeValue, FacetTagMode,
+    GridClickSelectionMode, GridViewMode,
 };
 // open_external_player はグリッドからは使わなくなった (動画はフルスクリーン化 →
 // インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
@@ -473,6 +474,44 @@ fn draw_facet_calendar_date_row(
     value.sanitize();
     *date = enabled.then_some(value);
     *date != before
+}
+
+/// サイズ範囲の片側 1 行を描く。
+///
+/// 関係語 (`以上` / `未満`) は値の**後ろ**へ置く。前に置くと「最大 100 KB 未満」のように
+/// 日本語として読めない並びになる (実機確認で指摘された)。行全体で
+/// 「下限 100 KB 以上」「上限 1 MB 未満」と読める並びにする。
+pub(crate) fn draw_facet_size_value_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    relation: &str,
+    id: &'static str,
+    value: &mut Option<FacetSizeValue>,
+    default: FacetSizeValue,
+) -> bool {
+    let before = *value;
+    let mut enabled = value.is_some();
+    let mut current = value.unwrap_or(default);
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut enabled, label);
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.add(
+                egui::DragValue::new(&mut current.value)
+                    .range(0..=u32::MAX)
+                    .speed(1),
+            );
+            egui::ComboBox::from_id_salt(("facet_size_unit", id))
+                .selected_text(current.unit.label())
+                .show_ui(ui, |ui| {
+                    for unit in FacetSizeUnit::ALL {
+                        ui.selectable_value(&mut current.unit, unit, unit.label());
+                    }
+                });
+            ui.label(relation);
+        });
+    });
+    *value = enabled.then_some(current);
+    *value != before
 }
 
 fn prepare_ai_facet_menu_popup(ui: &mut egui::Ui) {
@@ -9628,27 +9667,72 @@ impl App {
     fn draw_facet_size_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let active = usize::from(self.settings.facet_filter.size_preset.is_some());
         let mut changed = false;
-        let menu = ui.menu_button(facet_menu_label("サイズ", active), |ui| {
-            prepare_facet_menu_popup(ui);
-            let current = self.settings.facet_filter.size_preset;
-            if ui.selectable_label(current.is_none(), "すべて").clicked() {
-                self.settings.facet_filter.size_preset = None;
-                changed = true;
-                ui.close();
-            }
-            ui.separator();
-            for &preset in FacetSizePreset::all() {
-                if ui
-                    .selectable_label(current == Some(preset), preset.label())
-                    .clicked()
-                {
-                    self.settings.facet_filter.size_preset = Some(preset);
-                    changed = true;
-                    ui.close();
-                }
-            }
-        });
-        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
+        let (menu_response, _) =
+            egui::containers::menu::MenuButton::new(facet_menu_label("サイズ", active))
+                .config(sticky_facet_menu_config())
+                .ui(ui, |ui| {
+                    prepare_facet_menu_popup(ui);
+                    let current = self.settings.facet_filter.size_preset;
+                    if ui.selectable_label(current.is_none(), "すべて").clicked() {
+                        self.settings.facet_filter.size_preset = None;
+                        changed = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    for &preset in FacetSizePreset::all() {
+                        if ui
+                            .selectable_label(current == Some(preset), preset.label())
+                            .clicked()
+                        {
+                            self.settings.facet_filter.size_preset = Some(preset);
+                            changed = true;
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    let range_selected = matches!(
+                        self.settings.facet_filter.size_preset,
+                        Some(FacetSizePreset::Range { .. })
+                    );
+                    if ui.selectable_label(range_selected, "範囲指定").clicked() {
+                        if !range_selected {
+                            // 両端ともチェックを外した状態から始める。片方に既定値を入れて
+                            // おくと、範囲指定を選んだだけで意図しない絞り込みが掛かる。
+                            self.settings.facet_filter.size_preset = Some(FacetSizePreset::Range {
+                                min: None,
+                                max: None,
+                            });
+                        }
+                        changed = true;
+                    }
+                    if let Some(FacetSizePreset::Range { mut min, mut max }) =
+                        self.settings.facet_filter.size_preset
+                    {
+                        let mut range_changed = false;
+                        range_changed |= draw_facet_size_value_row(
+                            ui,
+                            "下限",
+                            "以上",
+                            "main_min",
+                            &mut min,
+                            FacetSizeValue::new(100, FacetSizeUnit::KB),
+                        );
+                        range_changed |= draw_facet_size_value_row(
+                            ui,
+                            "上限",
+                            "未満",
+                            "main_max",
+                            &mut max,
+                            FacetSizeValue::new(1, FacetSizeUnit::MB),
+                        );
+                        if range_changed {
+                            self.settings.facet_filter.size_preset =
+                                Some(FacetSizePreset::Range { min, max }.sanitized());
+                            changed = true;
+                        }
+                    }
+                });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu_response);
         changed
     }
 
@@ -10488,7 +10572,7 @@ impl App {
                 // ファイル名スタックのトグルクリックは closure 後に処理する (load_folder で
                 // App ミュータブル借用が必要)。
                 let mut stack_toggle = false;
-                let mut subfolder_expansion_toggle = false;
+                let mut subfolder_expansion_button_clicked = false;
                 // 検索中の ⬆ ボタン (検索仮想階層を 1 段ドリルアップ) を closure 後に適用。
                 let mut search_drill_up = false;
                 ui.horizontal(|ui| {
@@ -10912,7 +10996,11 @@ impl App {
                             ui.add_space(4.0);
                         }
                         if subfolder_expansion_available {
-                            let tooltip = if subfolder_expansion_pending {
+                            let depth_choice =
+                                crate::app::SubfolderExpansionDepthChoice::from_setting(
+                                    self.settings.subfolder_expansion_max_depth,
+                                );
+                            let mut tooltip = if subfolder_expansion_pending {
                                 subfolder_expansion_pending_tooltip
                                     .clone()
                                     .unwrap_or_else(|| "サブフォルダを走査中".to_string())
@@ -10921,6 +11009,13 @@ impl App {
                             } else {
                                 self.subfolder_expansion_action_tooltip()
                             };
+                            if subfolder_expansion_pending || subfolder_expansion_on {
+                                tooltip.push_str(&format!(
+                                    "\n走査階層: {}",
+                                    depth_choice.label()
+                                ));
+                            }
+
                             let resp = ui
                                 .add_enabled(
                                     !subfolder_expansion_pending,
@@ -10931,7 +11026,7 @@ impl App {
                                 )
                                 .hover_tip(tooltip);
                             if resp.clicked() {
-                                subfolder_expansion_toggle = true;
+                                subfolder_expansion_button_clicked = true;
                             }
                             ui.add_space(4.0);
                         }
@@ -11122,8 +11217,8 @@ impl App {
                 if stack_toggle {
                     self.toggle_stack_mode();
                 }
-                if subfolder_expansion_toggle {
-                    self.toggle_subfolder_expansion_view();
+                if subfolder_expansion_button_clicked {
+                    self.activate_subfolder_expansion_button();
                 }
                 if let Some(forward) = tree_nav {
                     // 検索中は ▲▼ を検索仮想階層の前後ヒット移動に振り分ける

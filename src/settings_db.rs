@@ -487,9 +487,11 @@ impl SettingsDb {
         persisted.stash_details_page_count_for_persist();
         persisted.facet_filter.stash_kind_audio_for_persist();
         persisted.facet_filter.stash_extended_date_for_persist();
+        persisted.facet_filter.stash_extended_size_for_persist();
         persisted.facet_filter.stash_bookmark_states_for_persist();
         for definition in &mut persisted.smart_folders {
             for rule in &mut definition.rules {
+                rule.filter.stash_extended_size_for_persist();
                 rule.filter.stash_bookmark_states_for_persist();
             }
         }
