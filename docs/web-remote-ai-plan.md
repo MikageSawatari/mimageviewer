@@ -52,7 +52,7 @@ remote の静止画にも本体と同じ順序・model・size 規則で適用す
   post-filter のまま変えない。
 - remote が操作権を持つ間と、その取得・解放処理中は PC 入力を再開しない。
 - local と remote の GPU inference は接続 lifecycle の barrier で直列化する。
-- UI thread は model load、inference、decode、edit materialize、WebP encode、worker join を行わない。
+- UI thread は model load、inference、decode、edit materialize、JPEG encode、worker join を行わない。
 - 実行時の空き VRAM / RAM によって AI の適用可否や結果を変えない。
 - remote のために別のアップスケール / デノイズ規則を作らない。
 
@@ -332,7 +332,7 @@ model load / Runtime 初期化を UI thread へ移していない。
 
 `src/app/vram_accounting.rs` は egui `TextureHandle` を数えるため、ONNX Runtime の
 session / tensor / provider allocation と CPU `ColorImage` は会計に入らない。
-remote 最終画像も WebP であり egui texture へ upload しない。
+remote 最終画像も JPEG であり egui texture へ upload しない。
 
 推論領域を texture 相当として擬似加算せず、必要なら入力寸法、tile 数、backend、model、
 elapsed、CPU buffer 概算を観測専用 perf event にする。値を admission には使わない。
@@ -351,7 +351,7 @@ local cache を evict しない。適用判断と上限は設定だけで決め�
 - App の `AiRuntime` / `ModelManager` と local `AiJobQueue` の既存規則
 - cancel token、tile 境界、model / size / PDF 判定
 - `FinalCompositePlan` / `execute_final_composite`
-- remote の decode / materialize / composite / WebP adapter
+- remote の decode / materialize / composite / JPEG adapter
 - final release 後の `reload_after_remote_session_release()`
 
 新設または一般化:
@@ -421,7 +421,7 @@ ZIP / ZIP 内 GIF / animated GIF・APNG・WebP / panorama / 8192 超の実機 fu
 ### 3b-1b: job protocol と end-to-end backend（完了）
 
 - fake executor で start / state / cancel / disconnect / background recovery を固定する
-- source、MI-GAN、final AI、final composite、WebP を bridge へ接続する
+- source、MI-GAN、final AI、final composite、JPEG を bridge へ接続する
 - 通常画像、ZIP、nested archive、raster PDF、製本 page の canonical input を揃える
 - vector PDF、size gate、stale result 拒否、terminal 10 分保持を実装する
 
@@ -432,7 +432,7 @@ fake executor test で固定した。AI cache key と公開 result identity は�
 edit / settings snapshot を worker で再取得して不一致を stale とする。native AI cache は local cache
 と eviction を共有しない専用 LRU だが、上限値は同じ既存設定
 `retained_final_ai_cache_max_entries` / `retained_final_ai_cache_max_mib` をそのまま使用し、0 は無効とする。
-result は Finalizing で page ごとに一度だけ縮小・WebP encode し、保持済み bytes を GET へ返す。
+result は Finalizing で page ごとに一度だけ縮小・JPEG encode し、保持済み bytes を GET へ返す。
 vector PDF / size gate は runtime 取得前に typed `not_applicable` へ終端し、nested ZIP は remote
 source decoder から共有 canonical decoder へ到達することを focused test で直接固定した。
 
@@ -451,14 +451,20 @@ page / stage / tile counter だけを表示し、percent は合成しない。ag
 `Ready` のページだけ result を取得し、全 result を decode 後に見開き DOM を一度だけ更新する。
 `NotApplicable` は元画像を保ち、失敗表示にしない。
 
-**ズーム解像度追補 (2026-08-04):** viewer の画像取得は `fit` と `zoomed` の 2 段とする。
-ピンチ中は現在画像の CSS 変形だけを行い、入力終了後 180 ms 経過時に各ページを独立して
-`min(8192, fit target × 6)` で再取得する。`target_px` は上限であり、server の
-`resize_dynamic_fit` は元画像を超えて拡大しない。見開きは左右を同じ group のまま別 target で扱い、
-viewport に見えている側だけを取得する最適化は行わない。等倍へ戻しても `zoomed` 結果を保持する。
-AI が有効な場合、fit job が nonterminal または開始 POST 中なら zoom job を pending にし、fit が
-`Ready` になって native cache へ格納された後だけ別 target の job を開始する。fit AI が既に表示済みなら
-AI 適用ページを非 AI 画像へ戻さず、対象外ページだけ高解像度の元画像へ差し替える。
+**転送画質追補 (2026-08-04):** viewer の通常ページと AI result は、サムネイル用 WebP とは分け、
+turbojpeg q85 の JPEG で返す。画質は端末別に「高品質 8192 / 標準 4096 / 軽量 2048 /
+最軽量 1024」の長辺上限から選び、既定は標準とする。`resize_dynamic_fit` は元画像を超えて
+拡大しない。実行時の帯域や空き資源による自動変更は行わない。ピンチ拡大は取得済み画像の
+CSS 変形だけとし、fit / zoomed の 2 段取得と `zoom_resolution` telemetry は撤去する。
+先読みも表示と同じ target を使い、直列・前方 3 / 後方 1 ページとする。`remoteAiGroupHash` は
+`target_px` を保持し、画質変更は現在の job を supersede する。native AI cache key は target を
+含まないため、同じ source / edit / settings snapshot なら final AI 推論結果を再利用できる。
+
+release build・実経路相当の Lanczos3 resize + RGB 変換を含む追試では、8192×4096 で
+WebP q90 が 1447.8 ms / 2,177,822 bytes、JPEG q85 が 129.4 ms / 3,122,815 bytes、
+4096×2048 で WebP q90 が 464.4 ms / 941,202 bytes、JPEG q85 が 88.5 ms /
+1,174,871 bytes だった。素材によって JPEG は約 1.25〜1.43 倍になるが、文字と細部を守りつつ
+encode 時間を大幅に短縮するため q85 を採用する。
 
 ## 14. 必須 test / 計測
 
@@ -476,5 +482,4 @@ AI 適用ページを非 AI 画像へ戻さず、対象外ページだけ高解�
 - vector PDF は AI を起動せず、raster PDF は本体と同じ native input へ収束する
 - 空き VRAM 値を変えても適用判断と key が変わらない
 - perf は acquire local-drain、remote inference、disconnect drain を分離記録する
-- zoom 解像度は `zoom_resolution` event で fit 表示完了、zoom 要求、zoom job 開始、表示差し替えの
-  各区間、要求 target、転送 bytes を分離記録する
+- JPEG encoder は 8192 / 4096 の実測時間と bytes を記録し、ページ / AI result の Content-Type を固定する

@@ -824,7 +824,7 @@ mod tests {
     fn fake_page_payload() -> PagePayload {
         PagePayload {
             bytes: vec![1, 2, 3],
-            content_type: "image/webp".to_owned(),
+            content_type: "image/jpeg".to_owned(),
             width: 1,
             height: 1,
         }

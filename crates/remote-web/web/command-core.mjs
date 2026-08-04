@@ -23,6 +23,7 @@ export const CommandName = Object.freeze({
   TOGGLE_VIEWER_BARS: "toggle_viewer_bars",
   OPEN_GESTURE_HELP: "open_gesture_help",
   OPEN_LOCAL_SETTINGS: "open_local_settings",
+  SET_IMAGE_QUALITY: "set_image_quality",
   SET_RATING: "set_rating",
   TOGGLE_BOOKMARK: "toggle_bookmark",
   BACK: "back",
@@ -93,6 +94,18 @@ export const VIDEO_QUALITY_PRESETS = Object.freeze([
   Object.freeze({ id: "standard", label: "標準", traffic: "約 730 MB / 時" }),
   Object.freeze({ id: "high", label: "高", traffic: "約 1.4 GB / 時" }),
 ]);
+
+export const IMAGE_QUALITY_PRESETS = Object.freeze([
+  Object.freeze({ id: "high", label: "高品質", maxLongSide: 8192 }),
+  Object.freeze({ id: "standard", label: "標準", maxLongSide: 4096 }),
+  Object.freeze({ id: "light", label: "軽量", maxLongSide: 2048 }),
+  Object.freeze({ id: "minimum", label: "最軽量", maxLongSide: 1024 }),
+]);
+
+export function imageQualityPreset(quality) {
+  return IMAGE_QUALITY_PRESETS.find((preset) => preset.id === quality) ??
+    IMAGE_QUALITY_PRESETS.find((preset) => preset.id === "standard");
+}
 
 export function command(name, payload = {}) {
   return { name, payload };
@@ -1346,7 +1359,7 @@ export function pagePrefetchPlan({
   visibleIndexes,
   itemCount,
   direction,
-  ahead = 8,
+  ahead = 3,
   behind = 1,
 }) {
   const count = Math.max(0, Math.floor(Number(itemCount) || 0));
@@ -1371,42 +1384,6 @@ export function pagePrefetchPlan({
     push(backwardEdge - step * offset);
   }
   return result;
-}
-
-export function containerPageTargetPx({
-  requestWidth,
-  sourceWidth,
-  sourceHeight,
-  minimum = 256,
-  maximum = 8192,
-}) {
-  const width = Math.max(1, Number(sourceWidth) || 1);
-  const height = Math.max(1, Number(sourceHeight) || 1);
-  const physicalWidth = Math.max(1, Number(requestWidth) || 1);
-  const physicalHeight = physicalWidth * height / width;
-  return Math.max(
-    minimum,
-    Math.min(maximum, Math.ceil(Math.max(physicalWidth, physicalHeight)))
-  );
-}
-
-export function zoomedPageTargetPx(
-  fitTargetPx,
-  { multiplier = 6, maximum = 8192 } = {}
-) {
-  const fit = Math.max(1, Math.ceil(Number(fitTargetPx) || 1));
-  const zoom = Math.max(1, Number(multiplier) || 1);
-  const limit = Math.max(1, Math.floor(Number(maximum) || 1));
-  return Math.min(limit, Math.ceil(fit * zoom));
-}
-
-export function shouldRequestZoomedResolution({
-  scale,
-  pointerCount = 0,
-  pinchActive = false,
-  alreadyZoomed = false,
-}) {
-  return !alreadyZoomed && !pinchActive && Number(pointerCount) < 2 && Number(scale) > 1.01;
 }
 
 export function shouldShowLoadingIndicator(

@@ -13,6 +13,7 @@ import {
 test("local settings use the current defaults when no value exists", () => {
   assert.deepEqual(parseLocalSettings(null), {
     version: 1,
+    imageQuality: "standard",
     portraitSinglePage: true,
     gestureHelpDismissed: false,
     gridColumnsPortrait: 0,
@@ -35,6 +36,7 @@ test("invalid local settings fall back without throwing", () => {
 test("local settings serialize and restore as one versioned value", () => {
   const settings = {
     version: 1,
+    imageQuality: "high",
     portraitSinglePage: false,
     gestureHelpDismissed: true,
     gridColumnsPortrait: 3,
@@ -54,6 +56,7 @@ test("storage failures use in-memory defaults and never escape", () => {
   });
   assert.deepEqual(saveLocalSettings({
     version: 1,
+    imageQuality: "light",
     portraitSinglePage: false,
     gestureHelpDismissed: true,
     gridColumnsPortrait: 4,
@@ -61,6 +64,7 @@ test("storage failures use in-memory defaults and never escape", () => {
   }, unavailable), {
     settings: {
       version: 1,
+      imageQuality: "light",
       portraitSinglePage: false,
       gestureHelpDismissed: true,
       gridColumnsPortrait: 4,
@@ -78,6 +82,7 @@ test("storage helpers use one aggregate key", () => {
   };
   const saved = saveLocalSettings({
     version: 1,
+    imageQuality: "minimum",
     portraitSinglePage: false,
     gestureHelpDismissed: true,
     gridColumnsPortrait: 2,
@@ -94,6 +99,7 @@ test("older version-one values add the gesture help default", () => {
     parseLocalSettings(JSON.stringify({ version: 1, portraitSinglePage: false })),
     {
       version: 1,
+      imageQuality: "standard",
       portraitSinglePage: false,
       gestureHelpDismissed: false,
       gridColumnsPortrait: 0,
@@ -113,6 +119,7 @@ test("grid column settings clamp per field without replacing existing values", (
     })),
     {
       version: 1,
+      imageQuality: "standard",
       portraitSinglePage: false,
       gestureHelpDismissed: true,
       gridColumnsPortrait: 2,
@@ -129,10 +136,22 @@ test("grid column settings clamp per field without replacing existing values", (
     })),
     {
       version: 1,
+      imageQuality: "standard",
       portraitSinglePage: false,
       gestureHelpDismissed: true,
       gridColumnsPortrait: 0,
       gridColumnsLandscape: 0,
     }
+  );
+});
+
+test("image quality is device-local, defaults to standard, and rejects unknown values", () => {
+  assert.equal(
+    parseLocalSettings(JSON.stringify({ version: 1, imageQuality: "high" })).imageQuality,
+    "high"
+  );
+  assert.equal(
+    parseLocalSettings(JSON.stringify({ version: 1, imageQuality: "unexpected" })).imageQuality,
+    "standard"
   );
 });

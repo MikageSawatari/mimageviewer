@@ -779,7 +779,7 @@ Web からの password 入力・保存は行わない。
 ### 12.3 HTTP / UI と件数・時間上限
 
 認証必須の `GET /api/container` がコンテナの 1 階層を返し、`GET /api/page` がページを
-WebP で返す。`GET /api/thumb` は同じ address query (`entry` / `prefix` / `page` のいずれか)
+turbojpeg q85 の JPEG で返す。`GET /api/thumb` はサムネイル用 WebP のまま、同じ address query（`entry` / `prefix` / `page` のいずれか）
 へ拡張する。コンテナは最大 1000 項目を返し、超過時は `truncated=true` と `entry_limit` を
 画面に表示する。ページングはこの増分では行わない。
 
@@ -840,16 +840,13 @@ PDFium の `PasswordError` は subprocess protocol を通しても失われな�
 取得開始直後に参照を保持しない `new Image()` へ次の1枚を設定するだけで、方向、abort、保持上限、
 foreground との優先度を持っていなかった。
 
-表示完了後、最後の操作方向へ8ページ、逆方向へ1ページを順次先読みする。要求幅是正後の実測
-約457 KiB/ページでは進行方向8ページが約3.6 MiBなので、帯域と待ち時間の均衡点として採用した。
-計画関数は現在の
-`visibleIndexes` を受けるため、次の見開き増分では `[left, right]` を渡すだけで同じ境界計算を
-利用できる。先読み通信は同時1件、圧縮 Blob の LRU は最大12件かつ32 MiBとし、viewer を離れた時、
-別方向の foreground を要求した時、または計画から外れた時は `AbortController` で不要な fetch を
-中断する。ready Blob は foreground が直接使い、network / IPC 待ちなしで decode と原子的差替えへ
-進む。
+2026-08-04 の画質 mode 導入後は、表示と先読みを同じ長辺上限（8192 / 4096 / 2048 /
+1024、既定 4096）で取得する。標準画質の実測約 1.2 MiB/ページに対し、進行方向 3 ページで
+従来の約 3.6 MiB という帯域根拠を維持するため、前方 3 ページ、逆方向 1 ページへ変更した。
+先読み通信は同時 1 件、圧縮 Blob の LRU は最大 12 件かつ 32 MiB のままとする。viewer を離れた時、
+別 target の foreground を要求した時、または計画から外れた時は不要な fetch を中断する。
 
-現行 protocol v13 の `PageRequest.priority` は `Foreground` / `Prefetch` を共有型で表す。remote-web は
+現行 protocol の `PageRequest.priority` は `Foreground` / `Prefetch` を共有型で表す。remote-web は
 prefetch admission を1件に制限し、all / heavy の最終1枠を使用させない。本体も全接続合計の
 prefetch queued + active を1件に制限し、remote heavy worker が1本しかない設定では prefetch を
 `Busy` で拒否する。2 worker 時も heavy queue / active が空の時だけ先読みを開始し、最大1本なので
@@ -857,13 +854,11 @@ prefetch queued + active を1件に制限し、remote heavy worker が1本しか
 では foreground を `HighNormal`、prefetch を `Normal` に送り、ローカル UI の `Critical` 予約枠は
 リモート要求に使用しない。
 
-旧 container page の要求長辺は `max(viewport width, viewport height) * DPR` で、縦長ページを
-全体 fit する場合も不要な viewport 高さを要求していた。実ログの PDF target 3,840 群 (n=38) は
-IPC p50 1,323 ms / p95 1,712 ms、blob p50 2.36 MiBだったのに対し、target 1,805 以下群 (n=16) は
-IPC p50 371 ms / p95 696 ms、blob p50 457 KiBだった。修正後は
-`rendered physical width × source aspect` の長辺を `w` とする。最初のページで得た実縦横比を
-container hint として後続ページと先読みに利用し、全体 fit の同一実機例では target 3,840 から
-約1,802へ下がる。先頭ページだけは実寸未取得なので従来の安全な viewport 推定を使う。
+ページ本体と AI result はサムネイルの WebP encoder を共用せず、turbojpeg q85 の JPEG で返す。
+画質設定は `local-settings.mjs` の version 1 aggregate に省略可能 field として保存し、旧保存値や
+不正値は標準 4096 へ正規化する。ピンチ拡大は取得済み画像の CSS 変形だけを行い、追加取得しない。
+画質変更時は `target_px` を含む page cache / AI result identity が変わるため、現在ページを同じ
+画質で再取得し、進行中の AI job は既存 supersede 規則へ入る。
 
 foreground が225 msを超えた時だけ、表示中の旧ページ中央へ高さ3 pxの半透明 indeterminate barを
 重ねる。完了、失敗、abort で必ず消し、速い cache hit では一瞬も表示しない。閾値判定と先読み順、

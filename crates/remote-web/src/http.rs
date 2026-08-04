@@ -702,6 +702,13 @@ fn api_ai_job_cancel(state: &AppState, job_id: &str, client_id: &str) -> HttpRes
     }
 }
 
+fn remote_page_content_type(content_type: &str) -> Option<&'static str> {
+    match content_type {
+        "image/jpeg" => Some("image/jpeg"),
+        _ => None,
+    }
+}
+
 fn api_ai_job_result(
     state: &AppState,
     job_id: &str,
@@ -723,11 +730,14 @@ fn api_ai_job_result(
         Err(_) => return ai_admission_busy_response(),
     };
     match result {
-        Ok(success) if success.value.content_type == "image/webp" => {
-            HttpResponse::bytes(200, "image/webp", success.value.bytes)
+        Ok(success) => {
+            let Some(content_type) = remote_page_content_type(&success.value.content_type) else {
+                return HttpResponse::text(502, "Bad Gateway")
+                    .with_header("Cache-Control", "no-store");
+            };
+            HttpResponse::bytes(200, content_type, success.value.bytes)
                 .with_header("Cache-Control", "no-store")
         }
-        Ok(_) => HttpResponse::text(502, "Bad Gateway").with_header("Cache-Control", "no-store"),
         Err(failure) => ai_ipc_error_response(failure),
     }
 }
@@ -2219,7 +2229,10 @@ fn api_page(state: &AppState, query: &[(String, String)], client_id: &str) -> Ht
         Ok(result) => {
             let payload = result.value;
             let blob_bytes = payload.bytes.len();
-            HttpResponse::bytes(200, "image/webp", payload.bytes)
+            let Some(content_type) = remote_page_content_type(&payload.content_type) else {
+                return HttpResponse::text(502, "Bad Gateway");
+            };
+            HttpResponse::bytes(200, content_type, payload.bytes)
                 .with_header(
                     "Cache-Control",
                     if adjustment_preview.is_some() {
@@ -3357,6 +3370,13 @@ mod tests {
         assert!(ready.headers.iter().any(|(name, value)| {
             *name == "X-mIV-Video-Thumbnail-PTS" && value == "12.466000000"
         }));
+    }
+
+    #[test]
+    fn remote_page_and_ai_result_http_accept_only_the_jpeg_payload_contract() {
+        assert_eq!(remote_page_content_type("image/jpeg"), Some("image/jpeg"));
+        assert_eq!(remote_page_content_type("image/webp"), None);
+        assert_eq!(remote_page_content_type("image/png"), None);
     }
 
     #[test]

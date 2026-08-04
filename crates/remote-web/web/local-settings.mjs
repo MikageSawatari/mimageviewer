@@ -1,9 +1,12 @@
+import { imageQualityPreset } from "./command-core.mjs";
+
 export const LOCAL_SETTINGS_STORAGE_KEY = "miv-remote-local-settings";
 export const LOCAL_SETTINGS_VERSION = 1;
 
 export function defaultLocalSettings() {
   return {
     version: LOCAL_SETTINGS_VERSION,
+    imageQuality: "standard",
     portraitSinglePage: true,
     gestureHelpDismissed: false,
     gridColumnsPortrait: 0,
@@ -25,6 +28,7 @@ export function normalizeLocalSettings(value) {
   }
   return {
     version: LOCAL_SETTINGS_VERSION,
+    imageQuality: imageQualityPreset(value.imageQuality).id,
     portraitSinglePage:
       typeof value.portraitSinglePage === "boolean"
         ? value.portraitSinglePage

@@ -84,7 +84,7 @@ globalThis.cancelAnimationFrame = () => {};
 const imageFetch = async () => new Response(new Blob([new Uint8Array([1, 2, 3])]), {
   status: 200,
   headers: {
-    "Content-Type": "image/webp",
+    "Content-Type": "image/jpeg",
     "X-mIV-Request-Id": "runtime-test",
     "X-mIV-Image-Width": "1200",
     "X-mIV-Image-Height": "1800",
@@ -108,61 +108,12 @@ const {
   reloadApplication,
   remoteAiProgressText,
   remoteAiPollingDelay,
-  remoteAiZoomDispatchDecision,
   resolveMediaOpenRoute,
   selectRecoverableRemoteAiJob,
-  zoomResolutionPerfEvent,
   thumbnailAddressForEntry,
   videoFileTargetIndex,
   viewerMenuDefinitions,
 } = await import("./app.js");
-
-test("zoom AI waits for a nonterminal fit job and starts only after Ready", () => {
-  assert.equal(remoteAiZoomDispatchDecision({
-    aiEnabled: true,
-    jobState: "upscaling",
-  }), "wait");
-  assert.equal(remoteAiZoomDispatchDecision({
-    aiEnabled: true,
-    startPosted: true,
-  }), "wait");
-  assert.equal(remoteAiZoomDispatchDecision({
-    aiEnabled: true,
-    jobState: "ready",
-    readyPageCount: 1,
-  }), "start");
-  assert.equal(remoteAiZoomDispatchDecision({
-    aiEnabled: true,
-    jobState: "ready",
-    readyPageCount: 0,
-  }), "none");
-  assert.equal(remoteAiZoomDispatchDecision({ aiEnabled: false }), "none");
-});
-
-test("zoom resolution telemetry exposes fit, request, job, and replacement intervals", () => {
-  assert.deepEqual(zoomResolutionPerfEvent({
-    resultKind: "ai",
-    fitDisplayedAt: 100,
-    zoomRequestedAt: 350,
-    fitAiCompletedAt: 500,
-    zoomJobStartedAt: 540,
-    replacedAt: 900,
-    pageCount: 2,
-    requestedTargets: [7200, 8192],
-    bytes: 1234,
-  }), {
-    type: "zoom_resolution",
-    result_kind: "ai",
-    page_count: 2,
-    requested_targets: [7200, 8192],
-    bytes: 1234,
-    fit_display_to_zoom_request_ms: 250,
-    zoom_request_to_replace_ms: 550,
-    fit_display_to_replace_ms: 800,
-    fit_ai_complete_to_zoom_job_ms: 40,
-    zoom_job_to_replace_ms: 360,
-  });
-});
 
 test("continuous video navigation stops at the end or wraps to the first video", () => {
   assert.equal(videoFileTargetIndex(0, 3, 1, false), 1);
@@ -271,6 +222,29 @@ test("every iPhone viewer menu page stays within the fixed action limit", () => 
       1
     );
   }
+});
+
+test("viewer display menu exposes all image quality modes and marks the device choice", () => {
+  const definitions = viewerMenuDefinitions({
+    hasContainer: true,
+    barsVisible: true,
+    imageQuality: "light",
+  });
+  const qualityActions = definitions.display.actions
+    .filter(([name]) => name === "set_image_quality");
+  assert.deepEqual(
+    qualityActions.map(([, label, hint, payload]) => [
+      label,
+      hint,
+      payload.quality,
+    ]),
+    [
+      ["高品質", "最大 8192 px", "high"],
+      ["標準", "最大 4096 px", "standard"],
+      ["✓ 軽量", "最大 2048 px", "light"],
+      ["最軽量", "最大 1024 px", "minimum"],
+    ]
+  );
 });
 
 test("still-image panel exposes the agreed tabs in desktop order", () => {

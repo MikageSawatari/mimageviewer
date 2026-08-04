@@ -9,11 +9,11 @@ import {
   ViewerGesture,
   ViewerPanelAction,
   ViewerPanelOrientation,
+  IMAGE_QUALITY_PRESETS,
   VIDEO_QUALITY_PRESETS,
   bufferingQualitySuggestion,
   clampGridColumnOverride,
   commandFromKey,
-  containerPageTargetPx,
   createReadingProgressBatch,
   gridColumnOverrideFieldForViewport,
   gridColumnOverrideForViewport,
@@ -25,6 +25,7 @@ import {
   isPortraitViewport,
   isRtlReadingDirection,
   isRtlSpread,
+  imageQualityPreset,
   nextSpreadMode,
   readingDirectionForSpreadMode,
   readingProgressBatchTransition,
@@ -74,8 +75,6 @@ import {
   shouldReanchorVideoTimeline,
   videoTimelineAnchor,
   videoTimelinePosition,
-  zoomedPageTargetPx,
-  shouldRequestZoomedResolution,
 } from "./command-core.mjs";
 
 const key = (value, extra = {}) => ({ key: value, ...extra });
@@ -476,6 +475,20 @@ test("quality presets keep their traffic estimates attached to the command value
     ]
   );
   assert.equal(videoQualityPreset("unknown").id, "standard");
+});
+
+test("image quality presets keep four deterministic long-side limits", () => {
+  assert.deepEqual(
+    IMAGE_QUALITY_PRESETS.map(({ id, label, maxLongSide }) => [id, label, maxLongSide]),
+    [
+      ["high", "高品質", 8192],
+      ["standard", "標準", 4096],
+      ["light", "軽量", 2048],
+      ["minimum", "最軽量", 1024],
+    ]
+  );
+  assert.equal(imageQualityPreset("high").maxLongSide, 8192);
+  assert.equal(imageQualityPreset("unknown").id, "standard");
 });
 
 test("RTL reverses only physical horizontal viewer keys and tap zones", () => {
@@ -1460,38 +1473,19 @@ test("thumbnail admission busy returns to the queue without spending retry budge
 test("page prefetch follows reading direction and accepts a future spread", () => {
   assert.deepEqual(
     pagePrefetchPlan({ visibleIndexes: [10], itemCount: 20, direction: 1 }),
-    [11, 12, 13, 14, 15, 16, 17, 18, 9]
+    [11, 12, 13, 9]
   );
   assert.deepEqual(
     pagePrefetchPlan({ visibleIndexes: [10], itemCount: 20, direction: -1 }),
-    [9, 8, 7, 6, 5, 4, 3, 2, 11]
+    [9, 8, 7, 11]
   );
   assert.deepEqual(
     pagePrefetchPlan({ visibleIndexes: [10, 11], itemCount: 20, direction: 1 }),
-    [12, 13, 14, 15, 16, 17, 18, 19, 9]
+    [12, 13, 14, 9]
   );
   assert.deepEqual(
     pagePrefetchPlan({ visibleIndexes: [0], itemCount: 3, direction: -1 }),
     [1]
-  );
-});
-
-test("container page target uses the rendered width and source aspect", () => {
-  assert.equal(
-    containerPageTargetPx({
-      requestWidth: 1250,
-      sourceWidth: 2665,
-      sourceHeight: 3840,
-    }),
-    1802
-  );
-  assert.equal(
-    containerPageTargetPx({
-      requestWidth: 2400,
-      sourceWidth: 1600,
-      sourceHeight: 900,
-    }),
-    2400
   );
 });
 
@@ -1515,19 +1509,4 @@ test("viewer transform commands dispatch through one pure state transition", () 
     initial
   );
   assert.equal(reduceViewerTransform(initial, { name: CommandName.NEXT_PAGE }), null);
-});
-
-test("viewer resolution uses one coarse zoomed tier capped at 8192", () => {
-  assert.equal(zoomedPageTargetPx(1200), 7200);
-  assert.equal(zoomedPageTargetPx(1800), 8192);
-  assert.equal(zoomedPageTargetPx(0), 6);
-});
-
-test("zoomed resolution waits until pinch input has settled and never downgrades", () => {
-  assert.equal(shouldRequestZoomedResolution({ scale: 3, pointerCount: 2 }), false);
-  assert.equal(shouldRequestZoomedResolution({ scale: 3, pinchActive: true }), false);
-  assert.equal(shouldRequestZoomedResolution({ scale: 1 }), false);
-  assert.equal(shouldRequestZoomedResolution({ scale: 3 }), true);
-  assert.equal(shouldRequestZoomedResolution({ scale: 1, alreadyZoomed: true }), false);
-  assert.equal(shouldRequestZoomedResolution({ scale: 3, alreadyZoomed: true }), false);
 });

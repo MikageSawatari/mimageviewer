@@ -22,9 +22,27 @@ const REMOTE_COMPOSITE_CACHE_ENTRIES: usize = 8;
 const REMOTE_COMPOSITE_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const REMOTE_LUT_CACHE_ENTRIES: usize = 16;
 const MAX_PAGE_RENDER_PX: u32 = crate::pdf_loader::PDF_RENDER_MAX_LONG_PX;
-const PAGE_WEBP_QUALITY: f32 = 90.0;
+const PAGE_JPEG_QUALITY: i32 = 85;
 /// Bump only when the native remote AI pipeline changes pixel semantics.
 const REMOTE_AI_PIPELINE_SCHEMA: u32 = 1;
+
+/// Remote の表示ページ専用 encoder。サムネイル cache の WebP 形式とは共有しない。
+fn encode_remote_page_jpeg(
+    image: &image::DynamicImage,
+    long_side: u32,
+) -> Option<(Vec<u8>, u32, u32)> {
+    let resized = crate::fast_resize::resize_dynamic_fit(
+        image,
+        long_side,
+        long_side,
+        crate::fast_resize::Quality::Lanczos3,
+    );
+    let rgb = resized.to_rgb8();
+    let (width, height) = (rgb.width(), rgb.height());
+    let bytes =
+        turbojpeg::compress_image(&rgb, PAGE_JPEG_QUALITY, turbojpeg::Subsamp::Sub2x2).ok()?;
+    Some((bytes.to_vec(), width, height))
+}
 
 pub(super) struct ContainerEngine {
     settings: Arc<crate::settings::Settings>,
@@ -1402,20 +1420,16 @@ impl ContainerEngine {
             Some(&cancel),
             request.adjustment_preview.as_ref(),
         ) {
-            Ok(loaded) => match crate::catalog::encode_thumb_webp(
-                &loaded.image,
-                request.target_px,
-                PAGE_WEBP_QUALITY,
-            ) {
+            Ok(loaded) => match encode_remote_page_jpeg(&loaded.image, request.target_px) {
                 Some((bytes, width, height)) => PageResponse::Success(PagePayload {
                     bytes,
-                    content_type: "image/webp".to_owned(),
+                    content_type: "image/jpeg".to_owned(),
                     width,
                     height,
                 }),
                 None => PageResponse::Error(media_error(
                     MediaErrorCode::RenderFailed,
-                    "WebP エンコードに失敗しました",
+                    "JPEG エンコードに失敗しました",
                 )),
             },
             Err(error) => PageResponse::Error(error),
@@ -1745,13 +1759,12 @@ impl ContainerEngine {
                 );
             }
             let image = loaded_image_from_color_image(&pixels).map_err(remote_ai_media_error)?;
-            let (bytes, width, height) =
-                crate::catalog::encode_thumb_webp(&image.image, page.target_px, PAGE_WEBP_QUALITY)
-                    .ok_or_else(|| RemoteAiRunError::Failed("WebP encoding failed".to_owned()))?;
+            let (bytes, width, height) = encode_remote_page_jpeg(&image.image, page.target_px)
+                .ok_or_else(|| RemoteAiRunError::Failed("JPEG encoding failed".to_owned()))?;
             Ok((
                 PagePayload {
                     bytes,
-                    content_type: "image/webp".to_owned(),
+                    content_type: "image/jpeg".to_owned(),
                     width,
                     height,
                 },
@@ -3515,6 +3528,26 @@ mod tests {
             .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
             .unwrap();
         bytes
+    }
+
+    #[test]
+    fn remote_page_jpeg_encoder_respects_long_side_and_never_upscales() {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(40, 20, |x, y| {
+            image::Rgba([x as u8, y as u8, (x + y) as u8, 127])
+        }));
+
+        let (resized_bytes, resized_width, resized_height) =
+            encode_remote_page_jpeg(&image, 10).expect("JPEG encode");
+        assert_eq!((resized_width, resized_height), (10, 5));
+        assert_eq!(&resized_bytes[..2], &[0xff, 0xd8]);
+        let resized = image::load_from_memory(&resized_bytes).expect("JPEG decode");
+        assert_eq!((resized.width(), resized.height()), (10, 5));
+
+        let (native_bytes, native_width, native_height) =
+            encode_remote_page_jpeg(&image, 8192).expect("JPEG encode");
+        assert_eq!((native_width, native_height), (40, 20));
+        let native = image::load_from_memory(&native_bytes).expect("JPEG decode");
+        assert_eq!((native.width(), native.height()), (40, 20));
     }
 
     fn remote_ai_test_zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
