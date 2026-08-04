@@ -87,6 +87,24 @@ test("adjustment ranges keep normalized handles and expose their actual values",
   assert.match(app, /control\.input\.setAttribute\("aria-valuetext",\s*valueText\)/);
 });
 
+test("colorize controls use the adjustment preview and commit path without losing custom points", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  assert.match(app, /normalizeRemoteColorizeParams\(source\.colorize\)/);
+  assert.match(app, /control_points:\s*pointSource\.map/);
+  assert.match(app, /this\.addColorizeSlider\([\s\S]*"mono_tolerance"/);
+  assert.match(app, /this\.addColorizeSlider\([\s\S]*"density_normalization_strength"/);
+  assert.match(app, /this\.addColorizeSlider\([\s\S]*"luminance_weight"/);
+  assert.match(app, /this\.addColorizeSlider\([\s\S]*"tone_radius"/);
+  assert.match(app, /this\.addColorizeSlider\([\s\S]*"tone_strength"/);
+  assert.match(
+    app,
+    /"tone_strength",\s*"トーン密度の強さ",\s*0,\s*100,\s*1,\s*\(\) => this\.values\.colorize\.tone_method !== "off"/
+  );
+  assert.match(app, /adjustmentPreview:\s*\{\s*scope:\s*job\.scope,\s*values:\s*job\.values\s*\}/);
+  assert.match(app, /kind:\s*"set_adjustment"[\s\S]*values:\s*normalizeRemoteAdjustmentValues/);
+  assert.doesNotMatch(app, /readOnly\.colorize_enabled/);
+});
+
 test("safe areas protect portrait bars and landscape side controls", async () => {
   const css = await readFile(new URL("styles.css", here), "utf8");
   const app = await readFile(new URL("app.js", here), "utf8");

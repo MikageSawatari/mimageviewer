@@ -103,6 +103,7 @@ const {
   createGridTile,
   loadFolder,
   normalizeRemoteAdjustmentValues,
+  normalizeRemoteColorizeParams,
   parentContainerAddress,
   reloadApplication,
   resolveMediaOpenRoute,
@@ -273,9 +274,57 @@ test("remote adjustment normalization keeps valid local slider defaults and boun
     white_point: 255,
     midtone: 1,
     auto_mode: null,
+    colorize: {
+      mode: "disabled",
+      mono_tolerance: 12,
+      palette: "legacy4_color",
+      control_points: [
+        { color: [0, 0, 0], strength: 3 },
+        { color: [75, 0, 130], strength: 1 },
+        { color: [205, 92, 92], strength: 1 },
+        { color: [245, 222, 179], strength: 1 },
+        { color: [240, 248, 255], strength: 1 },
+      ],
+      luminance_weight: 100,
+      density_normalization_strength: 0,
+      tone_method: "off",
+      tone_radius: 1,
+      tone_strength: 100,
+    },
   });
   assert.equal(normalizeRemoteAdjustmentValues({ black_point: 255 }).black_point, 254);
   assert.equal(normalizeRemoteAdjustmentValues({ white_point: 0 }).white_point, 1);
+});
+
+test("remote colorize normalization preserves custom points and clamps desktop ranges", () => {
+  const colorize = normalizeRemoteColorizeParams({
+    mode: "monochrome_only",
+    mono_tolerance: 99,
+    palette: "custom",
+    control_points: [
+      { color: [-1, 20, 999], strength: 12 },
+      { color: [200, 180, 160], strength: 0.5 },
+    ],
+    luminance_weight: -5,
+    density_normalization_strength: 120,
+    tone_method: "gaussian",
+    tone_radius: 8,
+    tone_strength: 42,
+  });
+  assert.deepEqual(colorize, {
+    mode: "monochrome_only",
+    mono_tolerance: 64,
+    palette: "custom",
+    control_points: [
+      { color: [0, 20, 255], strength: 10 },
+      { color: [200, 180, 160], strength: 0.5 },
+    ],
+    luminance_weight: 0,
+    density_normalization_strength: 100,
+    tone_method: "gaussian",
+    tone_radius: 4,
+    tone_strength: 42,
+  });
 });
 
 test("plain image media routes resolve their containing folder", () => {

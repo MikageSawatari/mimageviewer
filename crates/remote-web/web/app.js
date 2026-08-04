@@ -4279,6 +4279,26 @@ const REMOTE_ADJUSTMENT_CONTROLS = Object.freeze([
   ["midtone", "中間点", 0.1, 10, 0.01, true],
 ]);
 
+const DEFAULT_REMOTE_COLORIZE_CONTROL_POINTS = Object.freeze([
+  Object.freeze({ color: [0, 0, 0], strength: 3 }),
+  Object.freeze({ color: [75, 0, 130], strength: 1 }),
+  Object.freeze({ color: [205, 92, 92], strength: 1 }),
+  Object.freeze({ color: [245, 222, 179], strength: 1 }),
+  Object.freeze({ color: [240, 248, 255], strength: 1 }),
+]);
+
+const DEFAULT_REMOTE_COLORIZE_VALUES = Object.freeze({
+  mode: "disabled",
+  mono_tolerance: 12,
+  palette: "legacy4_color",
+  control_points: DEFAULT_REMOTE_COLORIZE_CONTROL_POINTS,
+  luminance_weight: 100,
+  density_normalization_strength: 0,
+  tone_method: "off",
+  tone_radius: 1,
+  tone_strength: 100,
+});
+
 const DEFAULT_REMOTE_ADJUSTMENT_VALUES = Object.freeze({
   brightness: 0,
   contrast: 0,
@@ -4289,7 +4309,55 @@ const DEFAULT_REMOTE_ADJUSTMENT_VALUES = Object.freeze({
   white_point: 255,
   midtone: 1,
   auto_mode: null,
+  colorize: DEFAULT_REMOTE_COLORIZE_VALUES,
 });
+
+function finiteNumber(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+export function normalizeRemoteColorizeParams(values = {}) {
+  const source = { ...DEFAULT_REMOTE_COLORIZE_VALUES, ...values };
+  const suppliedPoints = Array.isArray(source.control_points)
+    ? source.control_points.slice(0, 10)
+    : [];
+  const pointSource = suppliedPoints.length >= 2
+    ? suppliedPoints
+    : DEFAULT_REMOTE_COLORIZE_CONTROL_POINTS;
+  return {
+    mode: ["disabled", "monochrome_only", "all_images"].includes(source.mode)
+      ? source.mode
+      : "disabled",
+    mono_tolerance: clamp(Math.round(finiteNumber(source.mono_tolerance, 12)), 1, 64),
+    palette: ["legacy4_color", "legacy_skin", "custom"].includes(source.palette)
+      ? source.palette
+      : "legacy4_color",
+    control_points: pointSource.map((point) => ({
+      color: [0, 1, 2].map((index) => clamp(
+        Math.round(finiteNumber(point?.color?.[index], 0)),
+        0,
+        255
+      )),
+      strength: clamp(finiteNumber(point?.strength, 1), 0, 10),
+    })),
+    luminance_weight: clamp(
+      Math.round(finiteNumber(source.luminance_weight, 100)),
+      0,
+      100
+    ),
+    density_normalization_strength: clamp(
+      Math.round(finiteNumber(source.density_normalization_strength, 0)),
+      0,
+      100
+    ),
+    tone_method: ["off", "fast", "local_mean", "gaussian"].includes(source.tone_method)
+      ? source.tone_method
+      : "off",
+    tone_radius: clamp(finiteNumber(source.tone_radius, 1), 0.1, 4),
+    tone_strength: clamp(Math.round(finiteNumber(source.tone_strength, 100)), 0, 100),
+  };
+}
 
 export function normalizeRemoteAdjustmentValues(values = {}) {
   const source = { ...DEFAULT_REMOTE_ADJUSTMENT_VALUES, ...values };
@@ -4305,6 +4373,7 @@ export function normalizeRemoteAdjustmentValues(values = {}) {
     auto_mode: ["auto", "manga_cleanup"].includes(source.auto_mode)
       ? source.auto_mode
       : null,
+    colorize: normalizeRemoteColorizeParams(source.colorize),
   };
 }
 
@@ -4324,6 +4393,8 @@ class ViewerAdjustmentPanel {
     this.dirty = false;
     this.disabled = false;
     this.controls = new Map();
+    this.colorizeControls = new Map();
+    this.colorizePresetSlots = [null, null, null, null];
     this.previewQueue = new LatestOnlyTaskQueue(
       (job) => this.runPreview(job),
       (error) => this.showError(error)
@@ -4587,11 +4658,174 @@ class ViewerAdjustmentPanel {
       });
     }
 
+    this.colorizeSection = element("section", "adjustment-colorize");
+    this.colorizeSection.append(textElement("h3", "カラー化"));
+
+    const modeRow = element("label", "adjustment-option-row");
+    modeRow.append(textElement("span", "適用対象"));
+    this.colorizeModeSelect = document.createElement("select");
+    for (const [value, label] of [
+      ["disabled", "OFF"],
+      ["monochrome_only", "モノクロ系画像だけ"],
+      ["all_images", "すべての画像"],
+    ]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      this.colorizeModeSelect.append(option);
+    }
+    this.colorizeModeSelect.addEventListener("change", () => {
+      this.values.colorize.mode = this.colorizeModeSelect.value;
+      this.syncColorizeControls();
+      this.setDisabled(false);
+      this.commitCurrent().catch((error) => this.showError(error));
+    });
+    modeRow.append(this.colorizeModeSelect);
+    this.colorizeSection.append(modeRow);
+
+    this.colorizeSettings = element("div", "adjustment-colorize-settings");
+    this.colorizeSliderList = element("div", "adjustment-slider-list");
+    this.addColorizeSlider(
+      this.colorizeSliderList,
+      "mono_tolerance",
+      "モノクロ判定の許容値",
+      1,
+      64,
+      1,
+      () => this.values.colorize.mode === "monochrome_only"
+    );
+    this.addColorizeSlider(
+      this.colorizeSliderList,
+      "density_normalization_strength",
+      "濃さを整える",
+      0,
+      100,
+      1
+    );
+
+    const paletteRow = element("label", "adjustment-option-row");
+    paletteRow.append(textElement("span", "パレット"));
+    this.colorizePaletteSelect = document.createElement("select");
+    for (const [value, label] of [
+      ["legacy4_color", "4色刷り（従来互換）"],
+      ["legacy_skin", "肌色（従来互換）"],
+      ["custom", "カスタム"],
+    ]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      this.colorizePaletteSelect.append(option);
+    }
+    this.colorizePaletteSelect.addEventListener("change", () => {
+      this.values.colorize.palette = this.colorizePaletteSelect.value;
+      this.syncColorizeControls();
+      this.commitCurrent().catch((error) => this.showError(error));
+    });
+    paletteRow.append(this.colorizePaletteSelect);
+    this.colorizeSettings.append(paletteRow);
+    this.customPaletteNote = textElement(
+      "p",
+      "カスタムの制御点は PC 版で編集できます。ここでは保存済みの配色をそのまま使います。",
+      "adjustment-colorize-note"
+    );
+    this.colorizeSettings.append(this.customPaletteNote);
+
+    this.addColorizeSlider(
+      this.colorizeSliderList,
+      "luminance_weight",
+      "元画像の明るさを保持",
+      0,
+      100,
+      1
+    );
+
+    const toneRow = element("label", "adjustment-option-row");
+    toneRow.append(textElement("span", "トーン密度"));
+    this.colorizeToneSelect = document.createElement("select");
+    for (const [value, label] of [
+      ["off", "OFF（画素の輝度をそのまま使用）"],
+      ["fast", "高速（縮小平均）"],
+      ["local_mean", "弱（局所平均）"],
+      ["gaussian", "強（ガウシアン）"],
+    ]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      this.colorizeToneSelect.append(option);
+    }
+    this.colorizeToneSelect.addEventListener("change", () => {
+      this.values.colorize.tone_method = this.colorizeToneSelect.value;
+      this.syncColorizeControls();
+      this.commitCurrent().catch((error) => this.showError(error));
+    });
+    toneRow.append(this.colorizeToneSelect);
+    this.colorizeSettings.append(toneRow);
+    this.colorizeToneDescription = textElement(
+      "p",
+      "",
+      "adjustment-colorize-note"
+    );
+    this.colorizeSettings.append(this.colorizeToneDescription);
+
+    this.addColorizeSlider(
+      this.colorizeSliderList,
+      "tone_radius",
+      "検出スケール",
+      0.1,
+      4,
+      0.1,
+      () => this.values.colorize.tone_method !== "off"
+    );
+    this.addColorizeSlider(
+      this.colorizeSliderList,
+      "tone_strength",
+      "トーン密度の強さ",
+      0,
+      100,
+      1,
+      () => this.values.colorize.tone_method !== "off"
+    );
+    this.colorizeSettings.append(this.colorizeSliderList);
+    this.colorizeSection.append(this.colorizeSettings);
+
+    this.colorizePresetSection = element("div", "adjustment-colorize-presets");
+    this.colorizePresetSection.append(
+      textElement("span", "カラー化設定保存スロット", "adjustment-section-label")
+    );
+    const slotButtons = element("div", "adjustment-colorize-preset-buttons");
+    this.colorizePresetButtons = Array.from({ length: 4 }, (_, index) => {
+      const button = textElement("button", String(index + 1));
+      button.type = "button";
+      button.title = `スロット${index + 1}を読み込む`;
+      button.addEventListener("click", () => {
+        const preset = this.colorizePresetSlots[index];
+        if (!preset || button.disabled) return;
+        this.values.colorize = normalizeRemoteColorizeParams(preset);
+        this.dirty = false;
+        this.syncColorizeControls();
+        this.commitCurrent().catch((error) => this.showError(error));
+      });
+      slotButtons.append(button);
+      return button;
+    });
+    this.colorizePresetSection.append(
+      slotButtons,
+      textElement(
+        "small",
+        "読み込みのみ。スロットへの保存とカスタム配色の編集は PC 版で行います。"
+      )
+    );
+    this.colorizeSection.append(this.colorizePresetSection);
+
     this.readOnly = element("div", "adjustment-read-only");
     this.resetButton = textElement("button", "即時補正をリセット", "adjustment-reset");
     this.resetButton.type = "button";
     this.resetButton.addEventListener("click", () => {
-      this.values = normalizeRemoteAdjustmentValues(DEFAULT_REMOTE_ADJUSTMENT_VALUES);
+      const colorize = this.values.colorize;
+      this.values = normalizeRemoteAdjustmentValues({
+        ...DEFAULT_REMOTE_ADJUSTMENT_VALUES,
+        colorize,
+      });
       this.syncControls();
       this.setDisabled(false);
       this.commitCurrent().catch((error) => this.showError(error));
@@ -4602,12 +4836,210 @@ class ViewerAdjustmentPanel {
       this.scopeFieldset,
       autoRow,
       this.sliderList,
+      this.colorizeSection,
       this.readOnly,
       this.resetButton,
       this.status
     );
     this.syncControls();
     this.setDisabled(false);
+  }
+
+  addColorizeSlider(parent, key, label, min, max, step, visibleWhen = () => true) {
+    const defaultValue = DEFAULT_REMOTE_COLORIZE_VALUES[key];
+    const row = element("div", "adjustment-slider-row");
+    if (key === "mono_tolerance") {
+      row.title = "黄ばみや青みを含む画像をモノクロ系とみなす許容値です。";
+    } else if (key === "density_normalization_strength") {
+      row.title = "画像の輝度から黒点と白点を検出し、濃さとコントラストを整えます。";
+    } else if (key === "tone_radius") {
+      row.title = "長辺2048pxを基準にしたスクリーントーンの検出スケールです。";
+    }
+    const heading = element("div", "adjustment-slider-heading");
+    const sliderLabel = textElement("label", label);
+    const output = textElement("output", "");
+    const headingActions = element("span", "adjustment-slider-heading-actions");
+    const resetSlot = element("span", "adjustment-slider-reset-slot");
+    const resetButton = textElement("button", "↩", "adjustment-slider-reset");
+    resetButton.type = "button";
+    resetButton.hidden = true;
+    resetButton.title = "デフォルトに戻す";
+    resetButton.setAttribute("aria-label", `${label}をデフォルトに戻す`);
+    resetButton.addEventListener("pointerdown", (event) => event.stopPropagation());
+    resetButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (resetButton.hidden || resetButton.disabled) return;
+      this.values.colorize[key] = defaultValue;
+      this.dirty = false;
+      this.syncColorizeControl(key);
+      this.commitCurrent().catch((error) => this.showError(error));
+    });
+    resetSlot.append(resetButton);
+    headingActions.append(output, resetSlot);
+    heading.append(sliderLabel, headingActions);
+
+    const input = document.createElement("input");
+    input.type = "range";
+    input.id = `remote-colorize-${key}-${Math.random().toString(36).slice(2)}`;
+    sliderLabel.htmlFor = input.id;
+    input.min = "0";
+    input.max = "1";
+    input.step = "any";
+    input.setAttribute("aria-valuemin", String(min));
+    input.setAttribute("aria-valuemax", String(max));
+    let pointerDrag = null;
+    const applyValue = (raw) => {
+      if (!Number.isFinite(raw)) return false;
+      const value = rangeValueFromNormalized({
+        normalized: rangeValueToNormalized({ value: raw, min, max, logarithmic: false }),
+        min,
+        max,
+        step,
+        logarithmic: false,
+      });
+      if (this.values.colorize[key] === value) return false;
+      this.values.colorize[key] = value;
+      this.dirty = true;
+      this.syncColorizeControl(key);
+      this.queuePreview();
+      return true;
+    };
+    const applyNormalizedPosition = (position) => {
+      const changed = applyValue(rangeValueFromNormalized({
+        normalized: position,
+        min,
+        max,
+        step,
+        logarithmic: false,
+      }));
+      if (!changed) this.syncColorizeControl(key);
+      return changed;
+    };
+    input.addEventListener("input", () => {
+      if (pointerDrag) {
+        this.syncColorizeControl(key);
+        return;
+      }
+      applyNormalizedPosition(Number(input.value));
+    });
+    const finish = (event) => {
+      event.stopPropagation();
+      if (!this.dirty) return;
+      this.dirty = false;
+      this.commitCurrent().catch((error) => this.showError(error));
+    };
+    const keyboardKeys = new Set([
+      "ArrowLeft",
+      "ArrowDown",
+      "ArrowRight",
+      "ArrowUp",
+      "PageDown",
+      "PageUp",
+      "Home",
+      "End",
+    ]);
+    let keyboardAdjusting = false;
+    input.addEventListener("keydown", (event) => {
+      if (input.disabled || !keyboardKeys.has(event.key)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const current = Number(this.values.colorize[key]);
+      let next = current;
+      if (event.key === "Home") next = min;
+      else if (event.key === "End") next = max;
+      else if (event.key === "PageDown") next -= (max - min) / 10;
+      else if (event.key === "PageUp") next += (max - min) / 10;
+      else if (["ArrowLeft", "ArrowDown"].includes(event.key)) next -= step;
+      else next += step;
+      keyboardAdjusting = applyValue(next) || keyboardAdjusting;
+    });
+    input.addEventListener("keyup", (event) => {
+      if (!keyboardKeys.has(event.key)) return;
+      event.stopPropagation();
+      if (!keyboardAdjusting) return;
+      keyboardAdjusting = false;
+      finish(event);
+    });
+    input.addEventListener("blur", (event) => {
+      if (!keyboardAdjusting) return;
+      keyboardAdjusting = false;
+      finish(event);
+    });
+    input.addEventListener("pointerdown", (event) => {
+      event.stopPropagation();
+      if (input.disabled || event.isPrimary === false) return;
+      if (typeof event.button === "number" && event.button !== 0) return;
+      if (event.cancelable) event.preventDefault();
+      pointerDrag = {
+        pointerId: event.pointerId,
+        startClientX: event.clientX,
+        startValue: Number(this.values.colorize[key]),
+        trackWidth: input.getBoundingClientRect().width,
+      };
+      input.focus({ preventScroll: true });
+      try {
+        input.setPointerCapture(event.pointerId);
+      } catch (_error) {
+        // Pointer capture can fail when the browser has already cancelled the pointer.
+      }
+    });
+    input.addEventListener("pointermove", (event) => {
+      if (!pointerDrag || pointerDrag.pointerId !== event.pointerId) return;
+      event.stopPropagation();
+      if (event.cancelable) event.preventDefault();
+      applyValue(relativeRangeDragValue({
+        startValue: pointerDrag.startValue,
+        startClientX: pointerDrag.startClientX,
+        currentClientX: event.clientX,
+        trackWidth: pointerDrag.trackWidth,
+        min,
+        max,
+        step,
+        logarithmic: false,
+      }));
+    });
+    const finishPointer = (event) => {
+      if (pointerDrag && pointerDrag.pointerId !== event.pointerId) {
+        event.stopPropagation();
+        return;
+      }
+      if (pointerDrag) {
+        if (event.cancelable) event.preventDefault();
+        try {
+          if (input.hasPointerCapture(event.pointerId)) {
+            input.releasePointerCapture(event.pointerId);
+          }
+        } catch (_error) {
+          // The browser may release capture before dispatching pointercancel.
+        }
+        pointerDrag = null;
+      }
+      finish(event);
+    };
+    input.addEventListener("pointerup", finishPointer);
+    input.addEventListener("pointercancel", finishPointer);
+    input.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    });
+    for (const eventName of ["touchend", "touchcancel", "change"]) {
+      input.addEventListener(eventName, finish);
+    }
+
+    row.append(heading, input);
+    parent.append(row);
+    this.colorizeControls.set(key, {
+      row,
+      input,
+      output,
+      min,
+      max,
+      step,
+      defaultValue,
+      resetButton,
+      visibleWhen,
+    });
   }
 
   currentTarget() {
@@ -4665,14 +5097,17 @@ class ViewerAdjustmentPanel {
     this.status.classList.remove("is-error");
     this.scope = adjustmentState.selected_scope === "page" ? "page" : "standard";
     this.values = normalizeRemoteAdjustmentValues(adjustmentState.effective_values);
+    this.colorizePresetSlots = Array.from({ length: 4 }, (_, index) => {
+      const preset = adjustmentState.colorize_preset_slots?.[index];
+      return preset ? normalizeRemoteColorizeParams(preset) : null;
+    });
     const standard = this.scopeInputs.get("standard");
     standard.text.textContent = adjustmentState.standard_label || "標準";
     standard.input.disabled = !adjustmentState.standard_available;
     this.scopeInputs.get(this.scope).input.checked = true;
     const readOnly = adjustmentState.read_only ?? {};
     this.readOnly.replaceChildren(
-      textElement("strong", "現在の後段処理"),
-      textElement("span", `カラー化: ${readOnly.colorize_enabled ? "ON" : "OFF"}`),
+      textElement("strong", "現在の AI 処理"),
       textElement("span", `AI アップスケール: ${readOnly.upscale_label || "なし"}`),
       textElement("span", `AI デノイズ: ${readOnly.denoise_label || "なし"}`)
     );
@@ -4799,10 +5234,58 @@ class ViewerAdjustmentPanel {
     });
   }
 
+  syncColorizeControl(key) {
+    const control = this.colorizeControls.get(key);
+    if (!control) return;
+    control.row.hidden = !control.visibleWhen();
+    const value = Number(this.values.colorize[key]);
+    control.input.value = String(rangeValueToNormalized({
+      value,
+      min: control.min,
+      max: control.max,
+      logarithmic: false,
+    }));
+    const valueText = control.step === 0.1
+      ? value.toFixed(1)
+      : String(Math.round(value));
+    control.output.value = valueText;
+    control.input.setAttribute("aria-valuenow", String(value));
+    control.input.setAttribute("aria-valuetext", valueText);
+    this.syncColorizeResetButton(key);
+  }
+
+  syncColorizeResetButton(key) {
+    const control = this.colorizeControls.get(key);
+    if (!control) return;
+    const colorizeDisabled = this.disabled || this.values.colorize.mode === "disabled";
+    control.resetButton.disabled = colorizeDisabled;
+    control.resetButton.hidden = !adjustmentResetVisible({
+      value: this.values.colorize[key],
+      defaultValue: control.defaultValue,
+      disabled: colorizeDisabled,
+      epsilon: control.step < 1 ? 0.001 : 0,
+    });
+  }
+
+  syncColorizeControls() {
+    this.colorizeModeSelect.value = this.values.colorize.mode;
+    this.colorizePaletteSelect.value = this.values.colorize.palette;
+    this.colorizeToneSelect.value = this.values.colorize.tone_method;
+    this.colorizeToneDescription.textContent = ({
+      off: "スクリーントーンの網点を濃淡へ変換しません。",
+      fast: "縮小平均で網点を濃淡化します。大きな画像でも高速ですが、細部は少し滑らかになります。",
+      local_mean: "局所平均を1回適用します。網点を少しだけなじませたい場合に向きます。",
+      gaussian: "局所平均を3回重ねてガウスぼかしを近似します。より広く滑らかに濃淡化します。",
+    })[this.values.colorize.tone_method];
+    this.customPaletteNote.hidden = this.values.colorize.palette !== "custom";
+    for (const key of this.colorizeControls.keys()) this.syncColorizeControl(key);
+  }
+
   syncControls() {
     for (const key of this.controls.keys()) this.syncControl(key);
     this.autoSelect.value = this.values.auto_mode ?? "";
     for (const [scope, value] of this.scopeInputs) value.input.checked = scope === this.scope;
+    this.syncColorizeControls();
   }
 
   syncTargetButtons() {
@@ -4820,6 +5303,17 @@ class ViewerAdjustmentPanel {
       input.disabled = manualDisabled;
       this.syncResetButton(key);
     }
+    const colorizeDisabled = disabled || this.values.colorize.mode === "disabled";
+    for (const [key, { input }] of this.colorizeControls) {
+      input.disabled = colorizeDisabled;
+      this.syncColorizeResetButton(key);
+    }
+    this.colorizeModeSelect.disabled = disabled;
+    this.colorizePaletteSelect.disabled = colorizeDisabled;
+    this.colorizeToneSelect.disabled = colorizeDisabled;
+    this.colorizePresetButtons.forEach((button, index) => {
+      button.disabled = disabled || this.colorizePresetSlots[index] === null;
+    });
     this.autoSelect.disabled = disabled;
     this.resetButton.disabled = disabled;
     for (const [scope, value] of this.scopeInputs) {

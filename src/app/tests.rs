@@ -10348,6 +10348,35 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn unmounted_colorize_only_set_and_clear_do_not_refresh_pinned_thumbnails() {
+        let mut app = setup_app();
+        let path = PathBuf::from("C:/elsewhere/colorized-remote-page.jpg");
+        let target = PageAdjustmentTarget {
+            page_key: crate::adjustment_db::normalize_path(&path),
+            location_path: path.parent().map(PathBuf::from),
+            sidecar_coords: None,
+            compiled_book: false,
+            idx_hint: None,
+        };
+        let mut params = AdjustParams::default();
+        params.colorize.mode = crate::colorize::ColorizeMode::AllImages;
+
+        app.set_page_params_for_target(&target, params).unwrap();
+        assert!(
+            !app.pinned_adjustment_refresh_keys
+                .contains(&target.page_key),
+            "colorize is intentionally absent from thumbnail rendering"
+        );
+
+        app.clear_page_params_for_target(&target).unwrap();
+        assert!(
+            !app.pinned_adjustment_refresh_keys
+                .contains(&target.page_key),
+            "clearing a colorize-only override must not invalidate thumbnails"
+        );
+    }
+
+    #[test]
     fn unmounted_page_adjustment_clear_queues_pinned_thumbnail_refresh() {
         let mut app = setup_app();
         let path = PathBuf::from("C:/elsewhere/pinned-remote-page.jpg");

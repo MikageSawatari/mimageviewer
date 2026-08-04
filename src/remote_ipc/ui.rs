@@ -1505,8 +1505,12 @@ impl crate::app::App {
             has_page_override: page.is_some(),
             standard_label: self.adjustment_standard_label_for_target(target),
             standard_available: !target.compiled_book,
+            colorize_preset_slots: std::array::from_fn(|index| {
+                self.settings.colorize_preset_slots.slots[index]
+                    .as_ref()
+                    .map(super::remote_colorize_params)
+            }),
             read_only: RemoteAdjustmentReadOnlyState {
-                colorize_enabled: effective.colorize.is_enabled(),
                 upscale_label: crate::adjustment::upscale_model_label(
                     effective.upscale_model.as_deref(),
                 )

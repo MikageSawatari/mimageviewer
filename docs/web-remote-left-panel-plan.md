@@ -1,6 +1,6 @@
 # mIV Remote 左パネル 設計メモ
 
-状態: **段 2a（静止画の即時画像補正）まで実装済み**。親の正本は
+状態: **段 3a（カラー化の remote 操作）まで実装済み**。親の正本は
 [web-remote-plan.md](web-remote-plan.md)。
 関連: [display-pipeline.md](display-pipeline.md) / [preset-and-adjustment.md](preset-and-adjustment.md) /
 [adjustment-scope-selector-plan.md](adjustment-scope-selector-plan.md) /
@@ -73,8 +73,8 @@
 | **ポストフィルタ** | ✅ 段 1a で適用 |
 
 ここでの ✅ は「PC で永続化済みの補正を remote の Page 応答へ反映する」意味であり、
-remote から即時補正値を変更する UI は段 2a で実装済み。カラー化 / AI の書き込み UI は
-段 3 の対象である。
+remote から即時補正値を変更する UI は段 2a、カラー化の書き込み UI は段 3a で実装済み。
+AI の書き込みと実行は段 3b の対象である。
 
 ### 3.1.1 ⚠ 編集結果が乗らないのは既存の不具合 (2026-08-03 判明)
 
@@ -100,9 +100,9 @@ remote から即時補正値を変更する UI は段 2a で実装済み。カ�
 ([app.rs:54461](../src/app.rs)) が持っているが、これは **`&mut App` + `egui::Context` を要求し、
 フルスクリーンの `idx` に紐づく** = UI スレッド専用で、リモートの IPC ワーカーからは呼べない。
 
-**したがって「スマホでカラー化を ON にする」を成立させるには、
-リモートのページレンダを補正パイプラインに通す作業が本体側に必要になる。**
-左パネルの UI はその後の話。
+この制約は段 1 で、idx に依存しない remote adapter が共有 final-composite executor を
+呼ぶ構造へ直した。段 3a は同じ経路へカラー化の未確定値 / 永続値を渡し、別の描画経路を
+追加せずに操作を接続している。
 
 ### 3.2 動画: さらに深い
 
@@ -185,8 +185,12 @@ PC 側の表示も変わる。これは「操作感を揃える」の必然的�
 
 | 階層 | 例 | 目標 | 扱い |
 | --- | --- | --- | --- |
-| 即時 | 色調スライダー、トリム、フィルタ | 数十 ms | ドラッグ中はプレビュー、確定時に本適用 |
-| 秒 | **AI アップスケール / デノイズ / カラー化** | 数秒 | 進捗と取り消しが要る |
+| 即時 | 色調スライダー、カラー化、トリム、フィルタ | 数十 ms | ドラッグ中はプレビュー、確定時に本適用 |
+| 秒 | **AI アップスケール / デノイズ** | 数秒 | 進捗と取り消しが要る |
+
+カラー化はトーン密度を含むため当初「秒」側と見積もっていたが、段 3a の 768px 実測では
+最も重い Gaussian でも共有 executor 内 5.45ms（最適化 profile、576x768、8 回中央値）だった。
+したがって段 2a と同じ in-flight 1 本 + 最新値 coalesce で扱う。
 
 秒側は動画配信で作った規律をそのまま使う:
 
@@ -205,7 +209,8 @@ PC 側の表示も変わる。これは「操作感を揃える」の必然的�
 | **1 ✅** | **1a 補正を共有関数に通す** / **1b 編集結果を materialize** | スマホで見る絵を PC と同じ段・値へ揃える |
 | **2a ✅** | 静止画の向き対応パネル UI と、画像補正の即時階層（スコープ、色調 8 項目、自動補正、リセット） | 絵を見ながら本体と同じ値・保存先を操作できる |
 | **2b** | 表示トリム、ブックマーク、画像補正の残る軽量操作 | 静止画パネルの軽量操作を完成させる |
-| **3** | **カラー化 / AI** をリモートから起動できるようにする | **利用者が最重要と挙げた 2 つ** |
+| **3a ✅** | カラー化をリモートから操作できるようにする | 描画済みだったカラー化をスマホから設定できる |
+| **3b** | AI アップスケール / デノイズをリモートから起動できるようにする | 利用者が最重要と挙げた残る重処理 |
 | **4** | 動画のジャンプタブ | 既存データを読むだけなので軽い |
 | **5** | 動画の補正 (エンコーダ入力への grade 段) | 重い。単独で判断する |
 
@@ -249,6 +254,25 @@ iOS の native range はトラック押下をドラッグとして扱わない�
 段 1a の説明にあった「remote は常に page → location → global」とする記述には例外の記載漏れが
 あった。本体の製本フォルダ直下ページは page override が無ければ favorite / global ではなく
 **無補正固定**である。remote resolver もこの規則へ合わせ、製本ページでは標準スコープを無効化した。
+
+### 7.2 段 3a 実装結果 (2026-08-04)
+
+protocol v23 で `RemoteAdjustmentValues` に本体 `ColorizeParams` と同形の型付き値を追加した。
+mode / mono tolerance / palette / control points / luminance weight / density normalization /
+tone method / radius / strength をすべて round-trip する。Web は mode、許容値、濃さ補正、
+palette、輝度保持、トーン密度を編集できる。Custom の control points は失わず保持するが、
+配色編集は PC に残す。
+
+デスクトップのカラー化保存スロットは global Settings 所有で、対象スコープの adjustment writer
+とは別責務である。段 3a は既存スロットを状態応答に含め、読み込み時だけ保存済み
+`ColorizeParams` 一式を既存 `SetAdjustment` へ渡す。スロット保存のために別 writer や
+`SetAdjustment` の二重責務は追加しない。
+
+プレビューは段 2a と同じ 768px、in-flight 1 本、最新値 coalesce を使う。最適化 profile の
+576x768 合成実測（初回除外、8 回中央値）は、通常 1.26ms、濃さ補正 100% 2.15ms、Fast
+2.02ms、LocalMean 3.86ms、Gaussian 5.45ms。MonochromeOnly の PCA 判定込みでも 1.54ms
+だったため、専用 queue / debounce は設けない。カラー化はサムネイル段に含まれないため、
+page writer の thumbnail/pinned thumbnail 無効化も発生させない。
 
 **段 4 (動画ジャンプ) は段 0〜3 と独立**なので、先に入れることもできる。
 既存の `video_bookmarks` / `video_chapter_thumbs` を読んで返すだけで、

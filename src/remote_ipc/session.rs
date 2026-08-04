@@ -1517,6 +1517,7 @@ mod tests {
                     white_point: 250,
                     midtone: 0.9,
                     auto_mode: None,
+                    colorize: mimageviewer_ipc::RemoteColorizeParams::default(),
                 },
             },
             RemoteWriteRequest::GetAdjustmentState { address: page },

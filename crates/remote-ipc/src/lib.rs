@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -210,9 +210,9 @@ impl RemoteReadingDirection {
     }
 }
 
-/// リモートの画像補正パネルが編集できる即時パラメータ。
+/// リモートの画像補正パネルが編集できるパラメータ。
 ///
-/// AI / カラー化 / post-filter 等は段 3 まで読み取り専用にし、この型へは入れない。
+/// AI / post-filter 等はまだ読み取り専用にし、この型へは入れない。
 /// 書き込み側は保存済みの完全な `AdjustParams` にこの差分だけを重ねるため、Web が
 /// 非公開フィールドを消したり既定値へ戻したりしない。
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -226,6 +226,7 @@ pub struct RemoteAdjustmentValues {
     pub white_point: u8,
     pub midtone: f32,
     pub auto_mode: Option<RemoteAutoMode>,
+    pub colorize: RemoteColorizeParams,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -233,6 +234,92 @@ pub struct RemoteAdjustmentValues {
 pub enum RemoteAutoMode {
     Auto,
     MangaCleanup,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteColorizeMode {
+    #[default]
+    Disabled,
+    MonochromeOnly,
+    AllImages,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteColorizePalette {
+    #[default]
+    Legacy4Color,
+    LegacySkin,
+    Custom,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RemoteColorizeControlPoint {
+    pub color: [u8; 3],
+    pub strength: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteToneDensityMethod {
+    #[default]
+    Off,
+    Fast,
+    LocalMean,
+    Gaussian,
+}
+
+/// 本体の `ColorizeParams` と同じ意味・範囲を持つ wire 表現。
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RemoteColorizeParams {
+    pub mode: RemoteColorizeMode,
+    pub mono_tolerance: u8,
+    pub palette: RemoteColorizePalette,
+    /// Web では編集しないが、Custom の正本値を round-trip で保持する。
+    pub control_points: Vec<RemoteColorizeControlPoint>,
+    pub luminance_weight: u8,
+    pub density_normalization_strength: u8,
+    pub tone_method: RemoteToneDensityMethod,
+    pub tone_radius: f32,
+    pub tone_strength: u8,
+}
+
+impl Default for RemoteColorizeParams {
+    fn default() -> Self {
+        Self {
+            mode: RemoteColorizeMode::Disabled,
+            mono_tolerance: 12,
+            palette: RemoteColorizePalette::Legacy4Color,
+            control_points: vec![
+                RemoteColorizeControlPoint {
+                    color: [0, 0, 0],
+                    strength: 3.0,
+                },
+                RemoteColorizeControlPoint {
+                    color: [75, 0, 130],
+                    strength: 1.0,
+                },
+                RemoteColorizeControlPoint {
+                    color: [205, 92, 92],
+                    strength: 1.0,
+                },
+                RemoteColorizeControlPoint {
+                    color: [245, 222, 179],
+                    strength: 1.0,
+                },
+                RemoteColorizeControlPoint {
+                    color: [240, 248, 255],
+                    strength: 1.0,
+                },
+            ],
+            luminance_weight: 100,
+            density_normalization_strength: 0,
+            tone_method: RemoteToneDensityMethod::Off,
+            tone_radius: 1.0,
+            tone_strength: 100,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -251,7 +338,6 @@ pub struct RemoteAdjustmentPreview {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct RemoteAdjustmentReadOnlyState {
-    pub colorize_enabled: bool,
     pub upscale_label: String,
     pub denoise_label: String,
 }
@@ -264,6 +350,8 @@ pub struct RemoteAdjustmentState {
     pub has_page_override: bool,
     pub standard_label: String,
     pub standard_available: bool,
+    /// デスクトップのグローバル保存スロット。Web は読み込みだけを提供する。
+    pub colorize_preset_slots: [Option<RemoteColorizeParams>; 4],
     pub read_only: RemoteAdjustmentReadOnlyState,
 }
 
@@ -1402,6 +1490,7 @@ mod tests {
                         white_point: 255,
                         midtone: 1.0,
                         auto_mode: None,
+                        colorize: RemoteColorizeParams::default(),
                     },
                 }),
             },
@@ -1457,8 +1546,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v22_video_pull_seek_thumbnail_end_behavior_and_audio_status_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 22);
+    fn protocol_v23_video_pull_seek_thumbnail_end_behavior_and_audio_status_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 23);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -1671,6 +1760,21 @@ mod tests {
                     white_point: 250,
                     midtone: 0.9,
                     auto_mode: Some(RemoteAutoMode::Auto),
+                    colorize: RemoteColorizeParams {
+                        mode: RemoteColorizeMode::AllImages,
+                        palette: RemoteColorizePalette::Custom,
+                        control_points: vec![
+                            RemoteColorizeControlPoint {
+                                color: [4, 8, 18],
+                                strength: 2.0,
+                            },
+                            RemoteColorizeControlPoint {
+                                color: [245, 235, 210],
+                                strength: 0.75,
+                            },
+                        ],
+                        ..RemoteColorizeParams::default()
+                    },
                 },
             },
             RemoteWriteRequest::GetAdjustmentState { address: page },
@@ -1703,6 +1807,7 @@ mod tests {
                     white_point: 255,
                     midtone: 1.0,
                     auto_mode: None,
+                    colorize: RemoteColorizeParams::default(),
                 },
                 standard_values: RemoteAdjustmentValues {
                     brightness: 0.0,
@@ -1714,13 +1819,22 @@ mod tests {
                     white_point: 255,
                     midtone: 1.0,
                     auto_mode: None,
+                    colorize: RemoteColorizeParams::default(),
                 },
                 selected_scope: RemoteAdjustmentScope::Page,
                 has_page_override: true,
                 standard_label: "標準（共通）".to_owned(),
                 standard_available: true,
+                colorize_preset_slots: [
+                    Some(RemoteColorizeParams {
+                        mode: RemoteColorizeMode::MonochromeOnly,
+                        ..RemoteColorizeParams::default()
+                    }),
+                    None,
+                    None,
+                    None,
+                ],
                 read_only: RemoteAdjustmentReadOnlyState {
-                    colorize_enabled: false,
                     upscale_label: "なし".to_owned(),
                     denoise_label: "なし".to_owned(),
                 },

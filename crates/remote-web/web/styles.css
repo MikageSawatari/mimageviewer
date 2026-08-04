@@ -1289,6 +1289,7 @@ button {
 .adjustment-target-row,
 .adjustment-scope,
 .adjustment-auto-row,
+.adjustment-colorize,
 .adjustment-read-only {
   border: 1px solid var(--line);
   border-radius: 12px;
@@ -1424,6 +1425,78 @@ button {
   width: 100%;
   min-height: 28px;
   touch-action: none;
+}
+
+.adjustment-colorize {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+}
+
+.adjustment-colorize h3 {
+  margin: 0;
+  color: #f3f7ff;
+  font-size: 0.92rem;
+}
+
+.adjustment-colorize-settings {
+  display: grid;
+  gap: 8px;
+}
+
+.adjustment-option-row {
+  display: grid;
+  grid-template-columns: minmax(110px, 1fr) minmax(140px, 1.45fr);
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.adjustment-option-row select {
+  min-width: 0;
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: inherit;
+  background: var(--surface);
+}
+
+.adjustment-colorize-note {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 9px;
+  color: var(--muted);
+  background: rgb(255 255 255 / 4%);
+  font-size: 0.74rem;
+  line-height: 1.5;
+}
+
+.adjustment-colorize-presets {
+  display: grid;
+  gap: 7px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
+
+.adjustment-colorize-preset-buttons {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.adjustment-colorize-preset-buttons button {
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: inherit;
+  background: var(--surface);
+}
+
+.adjustment-colorize-presets small {
+  color: var(--muted);
+  font-size: 0.7rem;
+  line-height: 1.45;
 }
 
 .adjustment-read-only {
