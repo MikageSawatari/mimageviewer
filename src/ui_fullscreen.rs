@@ -1828,13 +1828,13 @@ fn choose_layout_base_size(
 /// 3 モードとした。以前はテーマの反対色を計算していたが、Light テーマ時に
 /// `反対色 = 黒 = ビューポート既定` となり 2 モード連続で視覚変化なしになるバグが
 /// あったため撤去 (v0.7.0 フィードバック)。
-pub(crate) enum FsBgStyle<'a> {
+pub(crate) enum FsBgStyle {
     /// 塗らない (0 = ビューポート既定 / 常に黒地)
     Default,
     /// 単色で塗りつぶす (1 = 白)
     Solid(egui::Color32),
     /// 市松パターン (2)。テクスチャは Wrap=Repeat で作成済みであること。
-    Checker(&'a egui::TextureHandle),
+    Checker(egui::TextureHandle),
 }
 
 /// B キーで選択されたモードから描画スタイルを構築する。
@@ -1842,14 +1842,11 @@ pub(crate) enum FsBgStyle<'a> {
 /// - mode = 0: `Default` (塗らない — ビューポート既定の黒が透けて見える)
 /// - mode = 1: `Solid(WHITE)`
 /// - mode = 2: `Checker` (中間グレー市松)
-pub(crate) fn transparent_bg_style<'a>(
-    mode: u8,
-    checker: Option<&'a egui::TextureHandle>,
-) -> FsBgStyle<'a> {
+pub(crate) fn transparent_bg_style(mode: u8, checker: Option<&egui::TextureHandle>) -> FsBgStyle {
     match mode {
         1 => FsBgStyle::Solid(egui::Color32::WHITE),
         2 => match checker {
-            Some(t) => FsBgStyle::Checker(t),
+            Some(t) => FsBgStyle::Checker(t.clone()),
             None => FsBgStyle::Default,
         },
         _ => FsBgStyle::Default,
@@ -1866,11 +1863,7 @@ pub(crate) fn transparent_bg_toast(mode: u8) -> &'static str {
 }
 
 /// `rect` 内に透過背景を描画する。画像テクスチャを描く**直前**に呼ぶこと。
-pub(crate) fn paint_transparent_bg(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    style: &FsBgStyle<'_>,
-) {
+pub(crate) fn paint_transparent_bg(painter: &egui::Painter, rect: egui::Rect, style: &FsBgStyle) {
     match style {
         FsBgStyle::Default => {}
         FsBgStyle::Solid(color) => {
@@ -2252,6 +2245,71 @@ impl App {
         None
     }
 
+    pub(crate) fn fullscreen_paint_resource_for_texture(
+        &self,
+        idx: usize,
+        texture: egui::TextureHandle,
+    ) -> crate::gpu_lanczos::FullscreenPaintResource {
+        let is_thumbnail = self.thumbnails.get(idx).is_some_and(|thumbnail| {
+            matches!(thumbnail, ThumbnailState::Loaded { tex, .. } if tex.id() == texture.id())
+        });
+        if self.fs_entry_is_animated(idx) || is_thumbnail {
+            crate::gpu_lanczos::FullscreenPaintResource::direct(texture)
+        } else {
+            crate::gpu_lanczos::FullscreenPaintResource::resampleable(
+                idx,
+                texture,
+                crate::gpu_lanczos::FullscreenPaintSourceGeneration {
+                    items: self.items_generation,
+                    input: self.input_generation.get(&idx).copied().unwrap_or(0),
+                },
+            )
+        }
+    }
+
+    pub(crate) fn prepare_fullscreen_paint_resource(
+        &mut self,
+        resource: &crate::gpu_lanczos::FullscreenPaintResource,
+        logical_scale: f32,
+        pixels_per_point: f32,
+    ) -> crate::gpu_lanczos::FullscreenPaintResource {
+        let render_state = self.wgpu_render_state.clone();
+        let (prepared, stats) = self.fs_lanczos_cache.resolve(
+            render_state.as_ref(),
+            resource,
+            logical_scale,
+            pixels_per_point,
+        );
+        if let Some(stats) = stats
+            && crate::perf::is_enabled()
+        {
+            let idx = match resource {
+                crate::gpu_lanczos::FullscreenPaintResource::Resampleable { page_idx, .. }
+                | crate::gpu_lanczos::FullscreenPaintResource::Lanczos { page_idx, .. } => {
+                    Some(*page_idx)
+                }
+                crate::gpu_lanczos::FullscreenPaintResource::Direct { .. } => None,
+            };
+            let key = idx.and_then(|idx| self.perf_item_key(idx));
+            crate::perf::event(
+                "gpu",
+                "lanczos_regenerate",
+                key.as_deref(),
+                self.input_seq,
+                &[
+                    ("source_w", stats.source_size[0].into()),
+                    ("source_h", stats.source_size[1].into()),
+                    ("target_w", stats.target_size[0].into()),
+                    ("target_h", stats.target_size[1].into()),
+                    ("texture_fetches", stats.texture_fetches.into()),
+                    ("encode_submit_cpu_ms", stats.encode_submit_cpu_ms.into()),
+                    ("regeneration_count", stats.regeneration_count.into()),
+                ],
+            );
+        }
+        prepared
+    }
+
     pub(crate) fn colorize_display_requires_final_effect(&self, idx: usize) -> bool {
         if self.post_filter_bypassed
             || self.fs_entry_is_animated(idx)
@@ -2472,7 +2530,8 @@ impl App {
         rotation: crate::rotation_db::Rotation,
         content_bbox: Option<egui::Rect>,
     ) -> Option<FsDisplayUnitHoldoverPage> {
-        let texture = self.resolve_fs_display_tex(idx, true)?;
+        let texture = self
+            .fullscreen_paint_resource_for_texture(idx, self.resolve_fs_display_tex(idx, true)?);
         let source_size = self
             .source_dims_for_idx(idx)
             .map(|(width, height)| egui::vec2(width, height));
@@ -3147,6 +3206,10 @@ impl App {
         state: &FsFrameState,
     ) -> Option<DisplayedImageTransform> {
         let rotation = self.get_rotation(fs_idx);
+        let paint_resource = state
+            .tex
+            .clone()
+            .map(|texture| self.fullscreen_paint_resource_for_texture(fs_idx, texture));
         let active = self.fs_zoom_active;
         let pixel_grid = self.fs_pixel_grid_enabled;
         let tex_size = state
@@ -3164,13 +3227,13 @@ impl App {
         let Some(tex_size) = tex_size else {
             // テクスチャ未ロード: 通常のプレースホルダ描画へ委ねる。
             let bg_style = self.fs_bg_style(ctx);
-            return Self::draw_fs_image(
+            return self.draw_fs_image(
                 ui,
                 image_rect,
                 fs_idx,
                 None,
                 None,
-                state.tex.as_ref(),
+                paint_resource.as_ref(),
                 state.thumb_tex.as_ref(),
                 state.is_video,
                 state.vst3_waiting_for_video,
@@ -3242,13 +3305,13 @@ impl App {
         };
         let bg_style = self.fs_bg_style(ctx);
         let transform = resolved.transform;
-        Self::draw_fs_image(
+        self.draw_fs_image(
             ui,
             image_rect,
             fs_idx,
             Some(source_size),
             Some(transform),
-            state.tex.as_ref(),
+            paint_resource.as_ref(),
             state.thumb_tex.as_ref(),
             false,
             false,
@@ -5120,12 +5183,22 @@ impl App {
             .enumerate()
             .filter_map(|page| {
                 let (page_ord, page) = page;
-                let texture = if self.analysis_mode {
+                let source_texture = if self.analysis_mode {
                     self.resolve_original_preview_tex(page.idx)
                 } else {
                     self.vertical_reading_cached_processed_texture(page.idx)
                         .or_else(|| self.resolve_fs_display_tex(page.idx, true))
                 }?;
+                let resource = self.fullscreen_paint_resource_for_texture(page.idx, source_texture);
+                let rotated_size =
+                    rotated_display_size(resource.size_vec2(), self.get_rotation(page.idx));
+                let logical_scale = (page.rect.width() / rotated_size.x.max(1.0))
+                    .min(page.rect.height() / rotated_size.y.max(1.0));
+                let texture = self.prepare_fullscreen_paint_resource(
+                    &resource,
+                    logical_scale,
+                    pixels_per_point,
+                );
                 let rect_norm = Self::normalize_rect_to_full_rect(page.rect, full_rect);
                 let uv_rect = Self::full_uv_rect();
                 let clip_rect_norm = rect_norm;
@@ -5308,6 +5381,18 @@ impl App {
             right_bbox,
             content_active,
         );
+        let left_resource = self.fullscreen_paint_resource_for_texture(left, left_texture);
+        let left_texture = self.prepare_fullscreen_paint_resource(
+            &left_resource,
+            total_scale * geometry.left.scale_factor,
+            pixels_per_point,
+        );
+        let right_resource = self.fullscreen_paint_resource_for_texture(right, right_texture);
+        let right_texture = self.prepare_fullscreen_paint_resource(
+            &right_resource,
+            total_scale * geometry.right.scale_factor,
+            pixels_per_point,
+        );
         let background = self.detached_frozen_background_for_snapshot(ctx);
         let left_rect_norm = Self::normalize_rect_to_full_rect(rects.left_rect, full_rect);
         let right_rect_norm = Self::normalize_rect_to_full_rect(rects.right_rect, full_rect);
@@ -5399,14 +5484,14 @@ impl App {
     #[cfg(windows)]
     fn detached_frozen_background_style(
         background: &crate::app::DetachedImageWindowFrozenBackground,
-    ) -> FsBgStyle<'_> {
+    ) -> FsBgStyle {
         match background {
             crate::app::DetachedImageWindowFrozenBackground::Default => FsBgStyle::Default,
             crate::app::DetachedImageWindowFrozenBackground::Solid(color) => {
                 FsBgStyle::Solid(*color)
             }
             crate::app::DetachedImageWindowFrozenBackground::Checker(texture) => {
-                FsBgStyle::Checker(texture)
+                FsBgStyle::Checker(texture.clone())
             }
         }
     }
@@ -7530,7 +7615,7 @@ impl App {
                         "deferred_keep_alive",
                         "nav_holdover",
                         Some(page.idx),
-                        &page.texture,
+                        page.texture.source_texture(),
                     );
                 }
             }
@@ -7759,11 +7844,15 @@ impl App {
                     "detached_backstop",
                     texture_source,
                     Some(page.idx),
-                    &page.texture,
+                    page.texture.source_texture(),
                 );
             }
         }
         let backstop_window_id = self.active_detached_session.map(|s| s.window_id);
+        let live_resource = live_tex.clone().and_then(|texture| {
+            self.fullscreen_idx
+                .map(|idx| self.fullscreen_paint_resource_for_texture(idx, texture))
+        });
         let hwnd_before = backstop_window_id.and_then(|window_id| {
             self.detached_window_hwnd_snapshot_before_show(
                 window_id,
@@ -7775,17 +7864,22 @@ impl App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                 .show(vp_ctx, |ui| {
-                    if let Some(handle) = live_tex.as_ref() {
+                    if let Some(resource) = live_resource.as_ref() {
                         let avail = ui.available_size();
-                        let tex_size = handle.size_vec2();
+                        let tex_size = resource.size_vec2();
                         if tex_size.x > 0.0 && tex_size.y > 0.0 && avail.x > 0.0 && avail.y > 0.0 {
                             let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y);
                             let img_rect = egui::Rect::from_center_size(
                                 ui.max_rect().center(),
                                 egui::vec2(tex_size.x * scale, tex_size.y * scale),
                             );
+                            let paint_resource = self.prepare_fullscreen_paint_resource(
+                                resource,
+                                scale,
+                                vp_ctx.pixels_per_point(),
+                            );
                             ui.painter().image(
-                                handle.id(),
+                                paint_resource.paint_texture_id(),
                                 img_rect,
                                 egui::Rect::from_min_max(
                                     egui::pos2(0.0, 0.0),
@@ -7834,7 +7928,7 @@ impl App {
                     "embedded_deferred",
                     "nav_holdover",
                     Some(page.idx),
-                    &page.texture,
+                    page.texture.source_texture(),
                 );
             }
         }
@@ -7903,7 +7997,7 @@ impl App {
                     "viewport_enter",
                     "nav_holdover",
                     Some(page.idx),
-                    &page.texture,
+                    page.texture.source_texture(),
                 );
             }
         }
@@ -8880,14 +8974,17 @@ impl App {
                                             } else {
                                                 self.view_trim_single_content_bbox(fs_idx)
                                             };
+                                            let paint_resource = state.tex.clone().map(
+                                                crate::gpu_lanczos::FullscreenPaintResource::direct,
+                                            );
                                             let bg_style = self.fs_bg_style(ctx);
-                                            single_transform = Self::draw_fs_image(
+                                            single_transform = self.draw_fs_image(
                                                 ui,
                                                 image_rect,
                                                 fs_idx,
                                                 source_size,
                                                 None,
-                                                state.tex.as_ref(),
+                                                paint_resource.as_ref(),
                                                 state.thumb_tex.as_ref(),
                                                 state.is_video,
                                                 state.vst3_waiting_for_video,
@@ -8952,10 +9049,15 @@ impl App {
                                         } else {
                                             self.view_trim_single_content_bbox(fs_idx)
                                         };
+                                        let paint_resource = state.tex.clone().map(|texture| {
+                                            self.fullscreen_paint_resource_for_texture(
+                                                fs_idx, texture,
+                                            )
+                                        });
                                         let bg_style = self.fs_bg_style(ctx);
-                                        single_transform = Self::draw_fs_image(
+                                        single_transform = self.draw_fs_image(
                                             ui, image_rect, fs_idx, source_size, None,
-                                            state.tex.as_ref(), state.thumb_tex.as_ref(),
+                                            paint_resource.as_ref(), state.thumb_tex.as_ref(),
                                             state.is_video, state.vst3_waiting_for_video,
                                             state.fs_load_failed, fs_rotation, zp,
                                             free_rot, &bg_style, &state.location_display,
@@ -9233,7 +9335,7 @@ impl App {
                                     "fullscreen_overlay",
                                     "colorize_display_unit_holdover",
                                     Some(page.idx),
-                                    &page.texture,
+                                    page.texture.source_texture(),
                                 );
                             }
                             self.draw_fs_display_unit_holdover(
@@ -9252,7 +9354,7 @@ impl App {
                                     "fullscreen_overlay",
                                     "nav_holdover",
                                     Some(page.idx),
-                                    &page.texture,
+                                    page.texture.source_texture(),
                                 );
                             }
                             self.draw_fs_display_unit_holdover(
@@ -15657,12 +15759,13 @@ impl App {
     /// 静止画 / アニメーション / サムネイル / プレースホルダーだけを扱う。
     #[allow(clippy::too_many_arguments)]
     fn draw_fs_image(
+        &mut self,
         ui: &mut egui::Ui,
         full_rect: egui::Rect,
         page_idx: usize,
         source_size: Option<egui::Vec2>,
         resolved_transform: Option<DisplayedImageTransform>,
-        tex: Option<&egui::TextureHandle>,
+        tex: Option<&crate::gpu_lanczos::FullscreenPaintResource>,
         thumb_tex: Option<&egui::TextureHandle>,
         is_video: bool,
         vst3_waiting_for_video: bool,
@@ -15670,7 +15773,7 @@ impl App {
         rotation: crate::rotation_db::Rotation,
         zoom_pan: Option<(f32, egui::Vec2)>,
         free_rotation_rad: f32,
-        bg_style: &FsBgStyle<'_>,
+        bg_style: &FsBgStyle,
         // 読込中プレースホルダ直下に出す対象パス (`location_display_for` 参照)。
         // 空ならラベル描画をスキップ。
         location_display: &str,
@@ -15681,8 +15784,16 @@ impl App {
         content_bbox: Option<egui::Rect>,
     ) -> Option<DisplayedImageTransform> {
         let using_full_texture = tex.is_some();
-        let display_tex = Self::fs_display_texture_choice(is_video, tex, thumb_tex);
-        if let Some(handle) = display_tex {
+        let thumb_resource = thumb_tex
+            .cloned()
+            .map(crate::gpu_lanczos::FullscreenPaintResource::direct);
+        let display_tex = if is_video {
+            tex
+        } else {
+            tex.or(thumb_resource.as_ref())
+        };
+        if let Some(resource) = display_tex {
+            let handle = resource.source_texture();
             let tex_size = handle.size_vec2();
             let fit_bbox = fs_image_fit_bbox(rotation, free_rotation_rad, content_bbox);
             let Some(transform) = resolved_transform.or_else(|| {
@@ -15720,7 +15831,16 @@ impl App {
             if rotation.is_none() && free_rotation_rad.abs() <= TRANSFORM_EPSILON {
                 paint_transparent_bg(&painter, paint_rect, bg_style);
             }
-            transform.paint_texture(&painter, handle.id(), egui::Color32::WHITE);
+            let paint_resource = self.prepare_fullscreen_paint_resource(
+                resource,
+                transform.total_scale,
+                ui.ctx().pixels_per_point(),
+            );
+            transform.paint_texture(
+                &painter,
+                paint_resource.paint_texture_id(),
+                egui::Color32::WHITE,
+            );
             if fit_bbox.is_none()
                 && should_draw_fs_pixel_grid(pixel_grid_enabled, using_full_texture, zoom_pan)
             {
@@ -17094,6 +17214,7 @@ impl App {
         self.save_all_video_resume_positions();
         self.fs_cache
             .retain(|k, v| keep_set.contains(k) || matches!(v, FsCacheEntry::Video { .. }));
+        self.fs_lanczos_cache.retain_page_indices(&keep_set);
 
         let current_idx = self.fullscreen_idx.unwrap_or(units[current_pos].anchor_idx);
         let current_loading = keep_set.contains(&current_idx)
@@ -17304,9 +17425,10 @@ impl App {
             let display_tex = if original_preview_active {
                 self.resolve_original_preview_tex(page.idx)
                     .or_else(|| self.resolve_fs_display_tex(page.idx, true))
+                    .map(|texture| self.fullscreen_paint_resource_for_texture(page.idx, texture))
             } else if let Some(tex) = self.vertical_reading_cached_processed_texture(page.idx) {
                 self.observe_continuous_page_processed_texture(page.idx, &tex);
-                Some(tex)
+                Some(self.fullscreen_paint_resource_for_texture(page.idx, tex))
             } else if process_indices.contains(&page.idx) {
                 // 連結読みでも単ページ/見開きと同じ final pipeline を使う。ただし
                 // 新規 GPU upload は未生成の可視ページだけを 1 フレームずつ進め、
@@ -17337,10 +17459,16 @@ impl App {
                         // 実機で観測された固着を再発させないため次フレームでも解決を試す。
                         ContinuousProcessedAttempt::Unresolved
                     };
-                processed.or_else(|| self.continuous_page_transition_texture(page.idx))
+                processed
+                    .map(|texture| self.fullscreen_paint_resource_for_texture(page.idx, texture))
+                    .or_else(|| self.continuous_page_transition_texture(page.idx))
             } else {
                 self.continuous_page_transition_texture(page.idx)
-                    .or_else(|| self.resolve_fs_display_tex(page.idx, true))
+                    .or_else(|| {
+                        self.resolve_fs_display_tex(page.idx, true).map(|texture| {
+                            self.fullscreen_paint_resource_for_texture(page.idx, texture)
+                        })
+                    })
             };
             if matches!(self.fs_cache.get(&page.idx), Some(FsCacheEntry::Failed)) {
                 painter.text(
@@ -17366,14 +17494,13 @@ impl App {
             let source_size = self
                 .source_dims_for_idx(page.idx)
                 .map(|(w, h)| egui::vec2(w, h));
-            if let Some(transform) = Self::draw_fs_spread_page(
+            if let Some(transform) = self.draw_fs_spread_page(
                 &painter,
                 image_rect,
                 page.rect,
                 page.idx,
                 source_size,
                 rotation,
-                &self.thumbnails,
                 &bg_style,
                 &location,
                 display_tex.as_ref(),
@@ -17385,13 +17512,15 @@ impl App {
                     && let Some(handle) = display_tex.as_ref()
                     && self
                         .continuous_page_transition_texture(page.idx)
-                        .is_some_and(|transition| transition.id() == handle.id())
+                        .is_some_and(|transition| {
+                            transition.source_texture_id() == handle.source_texture_id()
+                        })
                 {
                     self.trace_fs_texture_choice(
                         "continuous_page",
                         "continuous_transition",
                         Some(page.idx),
-                        handle,
+                        handle.source_texture(),
                     );
                 }
                 self.fullscreen_page_layout.push(transform);
@@ -18687,7 +18816,7 @@ impl App {
         full_rect: egui::Rect,
         tex: &egui::TextureHandle,
         zoom_pan: Option<(f32, egui::Vec2)>,
-        bg_style: &FsBgStyle<'_>,
+        bg_style: &FsBgStyle,
         clip_rect: Option<egui::Rect>,
         fit_scale_limits: FullscreenFitScaleLimits,
     ) {
@@ -18821,7 +18950,7 @@ impl App {
 
     /// 現在の `fs_transparent_bg_mode` から描画スタイルを返す。
     /// 市松モードのときはテクスチャを lazy 生成する。
-    fn fs_bg_style<'a>(&'a mut self, ctx: &egui::Context) -> FsBgStyle<'a> {
+    fn fs_bg_style(&mut self, ctx: &egui::Context) -> FsBgStyle {
         if self.fs_transparent_bg_mode == 2 {
             self.ensure_checker_texture(ctx);
         }
@@ -19112,7 +19241,7 @@ impl App {
                     .begin(FullscreenPageLayoutKind::Single);
                 let transform = {
                     let bg_style = self.fs_bg_style(ctx);
-                    Self::draw_fs_image(
+                    self.draw_fs_image(
                         ui,
                         image_rect,
                         page.idx,
@@ -19214,8 +19343,10 @@ impl App {
         let (left_display_tex, right_display_tex) = match display_override {
             Some((left, right)) => (Some(left.texture.clone()), Some(right.texture.clone())),
             None => (
-                self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active),
-                self.resolve_fs_processed_texture(ctx, right_idx, original_preview_active),
+                self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active)
+                    .map(|texture| self.fullscreen_paint_resource_for_texture(left_idx, texture)),
+                self.resolve_fs_processed_texture(ctx, right_idx, original_preview_active)
+                    .map(|texture| self.fullscreen_paint_resource_for_texture(right_idx, texture)),
             ),
         };
         // 透過背景スタイル (bg_style はテクスチャ借用を含むため左右描画の前後で寿命に注意)
@@ -19432,14 +19563,13 @@ impl App {
                     content_right,
                 ),
             ] {
-                if let Some(transform) = Self::draw_fs_spread_page(
+                if let Some(transform) = self.draw_fs_spread_page(
                     &painter,
                     image_rect,
                     rect,
                     idx,
                     source_size,
                     rot,
-                    &self.thumbnails,
                     &bg_style,
                     location,
                     display_tex,
@@ -19510,14 +19640,13 @@ impl App {
                     content_right,
                 ),
             ] {
-                Self::draw_fs_spread_page(
+                self.draw_fs_spread_page(
                     &painter,
                     image_rect,
                     rect,
                     idx,
                     source_size,
                     rot,
-                    &self.thumbnails,
                     &bg_style,
                     location,
                     display_tex,
@@ -19570,23 +19699,25 @@ impl App {
     /// ここではページ単位の thumbnail フォールバックだけを担当する。
     #[allow(clippy::too_many_arguments)]
     fn draw_fs_spread_page(
+        &mut self,
         painter: &egui::Painter,
         viewport_rect: egui::Rect,
         rect: egui::Rect,
         idx: usize,
         source_size: Option<egui::Vec2>,
         rotation: crate::rotation_db::Rotation,
-        thumbnails: &[ThumbnailState],
-        bg_style: &FsBgStyle<'_>,
+        bg_style: &FsBgStyle,
         location_display: &str,
-        display_tex: Option<&egui::TextureHandle>,
+        display_tex: Option<&crate::gpu_lanczos::FullscreenPaintResource>,
         allow_thumbnail: bool,
         content_bbox: Option<egui::Rect>,
         pixels_per_point: f32,
     ) -> Option<DisplayedImageTransform> {
         let thumb_tex = if allow_thumbnail {
-            match thumbnails.get(idx) {
-                Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
+            match self.thumbnails.get(idx) {
+                Some(ThumbnailState::Loaded { tex, .. }) => Some(
+                    crate::gpu_lanczos::FullscreenPaintResource::direct(tex.clone()),
+                ),
                 _ => None,
             }
         } else {
@@ -19626,7 +19757,16 @@ impl App {
             if rotation.is_none() {
                 paint_transparent_bg(painter, transform.paint_rect, bg_style);
             }
-            transform.paint_texture(painter, handle.id(), egui::Color32::WHITE);
+            let paint_resource = self.prepare_fullscreen_paint_resource(
+                handle,
+                transform.total_scale,
+                pixels_per_point,
+            );
+            transform.paint_texture(
+                painter,
+                paint_resource.paint_texture_id(),
+                egui::Color32::WHITE,
+            );
             return Some(transform);
         } else {
             painter.text(
@@ -25128,7 +25268,7 @@ mod tests {
             previous: FsDisplayUnitHoldover {
                 pages: vec![FsDisplayUnitHoldoverPage {
                     idx: 0,
-                    texture: texture.clone(),
+                    texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture.clone()),
                     rotation: crate::rotation_db::Rotation::None,
                     source_size: None,
                     content_bbox: None,
@@ -25149,7 +25289,7 @@ mod tests {
         let folder_navigation = FsHoldover::FolderNavigation(FsDisplayUnitHoldover {
             pages: vec![FsDisplayUnitHoldoverPage {
                 idx: 0,
-                texture,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
                 rotation: crate::rotation_db::Rotation::None,
                 source_size: None,
                 content_bbox: None,

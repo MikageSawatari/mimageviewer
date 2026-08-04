@@ -131,13 +131,14 @@ pub(crate) enum VramSubsystem {
     ComicCache,
     EditResultCache,
     ContinuousPageTransitions,
+    LanczosOutputs,
     Thumbnails,
     ThumbTextures,
     ThumbAdjustTex,
 }
 
 impl VramSubsystem {
-    pub(crate) const ALL: [Self; 13] = [
+    pub(crate) const ALL: [Self; 14] = [
         Self::FsCache,
         Self::FinalCompositeCache,
         Self::AdjustmentCache,
@@ -148,6 +149,7 @@ impl VramSubsystem {
         Self::ComicCache,
         Self::EditResultCache,
         Self::ContinuousPageTransitions,
+        Self::LanczosOutputs,
         Self::Thumbnails,
         Self::ThumbTextures,
         Self::ThumbAdjustTex,
@@ -165,6 +167,7 @@ impl VramSubsystem {
             Self::ComicCache => "comic_cache",
             Self::EditResultCache => "edit_result_cache",
             Self::ContinuousPageTransitions => "continuous_page_transitions",
+            Self::LanczosOutputs => "lanczos_outputs",
             Self::Thumbnails => "thumbnails",
             Self::ThumbTextures => "thumb_textures",
             Self::ThumbAdjustTex => "thumb_adjust_tex",
@@ -190,7 +193,7 @@ impl VramAccountant {
         self.add_texture_id(subsystem, texture.id(), texture.size(), mipmapped);
     }
 
-    fn add_texture_id(
+    pub(crate) fn add_texture_id(
         &mut self,
         subsystem: VramSubsystem,
         texture_id: egui::TextureId,

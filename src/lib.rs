@@ -47,6 +47,7 @@ mod displayed_image_transform;
 pub mod dwm_iconic_thumbnail;
 #[cfg(windows)]
 pub mod dwm_transitions;
+mod gpu_lanczos;
 pub mod metadata_transfer;
 /// 非 Windows stub: DWM (Desktop Window Manager) は Windows 専用。HWND を取らず
 /// クロスプラットフォーム経路から呼ばれる helper だけ no-op を提供する

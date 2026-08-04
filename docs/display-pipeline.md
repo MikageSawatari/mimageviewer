@@ -954,6 +954,44 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 見開き / 連結読みのページ配置計算は引き続き `ui_fullscreen.rs` が担当し、その結果を
 `DisplayedImageTransform::from_resolved_rect` で共通レイアウトへ登録する。
 
+### 2.4.1 フルスクリーン静止画の GPU Lanczos3 縮小
+
+通常静止画は、上記の表示優先順位と
+`edit -> color -> final AI -> smart sharpen -> post_filter` の合成をすべて解決した**後**に、
+最終 paint 専用の `FullscreenPaintResource` へ包む。この段階は source cache や合成結果を
+置き換えず、ピクセル内容の優先順位・合成順序にも介入しない。
+
+`FullscreenPaintResource` は `Direct / Resampleable / Lanczos` の typed state で、全 variant が
+元の `TextureHandle` を保持する。レイアウト、trim UV、回転、hit-test、pixel grid は元ハンドルの
+`size_vec2()` から従来どおり `DisplayedImageTransform` が解決する。縮小時だけ separable
+Lanczos3 の native texture を別所有し、`DisplayedImageTransform::paint_texture` に渡す
+`TextureId` だけを差し替える (C-1)。shader は段階3 spike と同じもので、level 0 の
+`Rgba8Unorm` source を vertical `Rgba16Float`、horizontal `Rgba8Unorm` の 2 pass で
+直接リサンプルする。box mip 前縮小、倍率閾値、ヒステリシスは持たない。
+
+分岐は `total_scale * pixels_per_point` と
+`physical_scale_is_near_integer` を共通基準にする。
+
+- 1.0 未満: CPU 参照と同じ `floor(source × physical_scale)` の目標寸法へ Lanczos3。
+- 1.0: 元 `TextureId` を直接 paint し、段階1・2のドットバイドットを維持。
+- 1.0 超: 元 `TextureId` を直接 paint し、従来の post-filter 設定に従う。
+
+単ページ、見開きの各ページ、縦 / 横連結読み、page transition、nav / colorize holdover、
+detached single / spread / continuous frozen snapshot と keep-alive backstop は同じ typed
+resource を通る。見開きは高さ合わせ係数を含むページ別実効倍率を使う。ルーペは鮮明な元画素が
+必要なので `resolve_fs_processed_texture -> TextureHandle` の元経路、pixel grid は元論理寸法の
+まま。比較表示 (wipe/diff) と 360 度パノラマは既存 callback ownership、thumbnail、animated、
+動画、mask、checker、UI preview は direct 経路のままである。
+
+Lanczos cache は viewer context ごとに所有し、key は page idx、元 `TextureId`、
+`items_generation`、ページ別 `input_generation`、目標寸法から成る。回転・trim は full source
+出力を変えないため key に入れない。source ごとの直近 2 寸法、context 全体 64 entry の LRU とし、
+fullscreen close / invalidation / context park・swap / 連結読み keep-set に追従する。native
+`TextureId` は cache、holdover、snapshot が共有する `Arc` lease の最終 drop で free する。
+出力は `LanczosOutputs` として実寸・mip なしで VRAM 会計し、perf log の
+`gpu/lanczos_regenerate` に source / target、推定 fetch 数、encode + submit CPU 時間、
+累積再生成回数を記録する。
+
 静止画の最終フィット矩形は `fullscreen_media_rect` が所有する。下部ページシークバー固定時は
 `FS_SEEK_BAR_HEIGHT`、上部情報バー固定時は `TOP_BAR_HEIGHT` をそれぞれ `full_rect` から除外し、
 両方固定なら上下を同時に除外した同一矩形を、単ページ・見開き・連結読み・入力座標へ渡す。

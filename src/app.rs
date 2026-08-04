@@ -368,7 +368,7 @@ pub(crate) struct ViewerSyncStamp {
 #[cfg(windows)]
 pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) id: u64,
-    pub(crate) texture: egui::TextureHandle,
+    pub(crate) texture: crate::gpu_lanczos::FullscreenPaintResource,
     pub(crate) title: String,
     pub(crate) location_display: String,
     pub(crate) image_dims: Option<(u32, u32)>,
@@ -389,7 +389,7 @@ pub(crate) struct DetachedImageWindowSnapshot {
 
 #[derive(Clone)]
 pub(crate) struct DetachedImageWindowFrozenPage {
-    pub(crate) texture: egui::TextureHandle,
+    pub(crate) texture: crate::gpu_lanczos::FullscreenPaintResource,
     pub(crate) paint_rect_norm: egui::Rect,
     pub(crate) uv_rect: egui::Rect,
     pub(crate) clip_rect_norm: egui::Rect,
@@ -408,7 +408,7 @@ pub(crate) enum DetachedImageWindowFrozenBackground {
 #[derive(Clone)]
 pub(crate) struct DeferredDetachedImageWindowView {
     pub(crate) id: u64,
-    pub(crate) texture: egui::TextureHandle,
+    pub(crate) texture: crate::gpu_lanczos::FullscreenPaintResource,
     pub(crate) location_display: String,
     pub(crate) image_dims: Option<(u32, u32)>,
     pub(crate) rotation: crate::rotation_db::Rotation,
@@ -2163,6 +2163,7 @@ struct ViewerContextBundle {
     view_trim_dirty_page_overrides: std::collections::HashSet<usize>,
     view_trim_save_pending: bool,
     fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache,
     fs_margin_bbox_cache: std::collections::HashMap<usize, (u64, usize, Option<egui::Rect>)>,
     input_generation: std::collections::HashMap<usize, u64>,
     fs_pending:
@@ -2449,6 +2450,7 @@ impl ViewerContextBundle {
             view_trim_dirty_page_overrides: std::collections::HashSet::new(),
             view_trim_save_pending: false,
             fs_cache: std::collections::HashMap::new(),
+            fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache::default(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             input_generation: std::collections::HashMap::new(),
             fs_pending: std::collections::HashMap::new(),
@@ -5941,7 +5943,7 @@ fn should_return_cached_final_composite(
 /// 保持する表示専用状態。idx と texture だけを別々に持つと一覧差し替え後の同じ idx に
 /// 誤適用できるため、所有する items 世代と一体で管理する。
 pub(crate) struct ContinuousPageTransition {
-    pub(crate) texture: egui::TextureHandle,
+    pub(crate) texture: crate::gpu_lanczos::FullscreenPaintResource,
     pub(crate) items_generation: u64,
 }
 
@@ -6012,7 +6014,7 @@ pub(crate) struct FsDisplayUnitHoldoverPage {
     /// Geometry must never be re-derived from it because folder navigation can replace items
     /// while the holdover remains visible.
     pub(crate) idx: usize,
-    pub(crate) texture: egui::TextureHandle,
+    pub(crate) texture: crate::gpu_lanczos::FullscreenPaintResource,
     pub(crate) rotation: crate::rotation_db::Rotation,
     pub(crate) source_size: Option<egui::Vec2>,
     pub(crate) content_bbox: Option<egui::Rect>,
@@ -8419,6 +8421,7 @@ pub struct App {
     next_detached_viewer_context_serial: u64,
     /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）
     pub(crate) fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    pub(crate) fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache,
     /// raw Static 画素の近モノクロ要約。TextureId が source identity を兼ねるため、
     /// 再デコードや PDF 再レンダ後の古い値は lookup 時に自然に stale になる。
     pub(crate) colorize_mono_summary_cache: std::collections::HashMap<usize, ColorizeMonoSummary>,
@@ -11842,6 +11845,7 @@ impl App {
             #[cfg(windows)]
             next_detached_viewer_context_serial: 1,
             fs_cache: std::collections::HashMap::new(),
+            fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache::default(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             view_trim_mode: false,
             view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode::default(),
@@ -14051,6 +14055,7 @@ impl App {
             view_trim_dirty_page_overrides,
             view_trim_save_pending,
             fs_cache,
+            fs_lanczos_cache,
             fs_margin_bbox_cache,
             input_generation,
             fs_pending,
@@ -14277,6 +14282,7 @@ impl App {
         swap_field!(view_trim_dirty_page_overrides);
         swap_field!(view_trim_save_pending);
         swap_field!(fs_cache);
+        swap_field!(fs_lanczos_cache);
         swap_field!(fs_margin_bbox_cache);
         swap_field!(input_generation);
         swap_field!(fs_pending);
@@ -16492,6 +16498,7 @@ impl App {
         self.thumb_edit_preview_layers.clear();
         self.thumb_adjust_tex.clear();
         self.fs_cache.clear();
+        self.fs_lanczos_cache.clear();
         self.fs_upload_backlog.clear();
         self.fs_pending.clear();
         self.input_generation.clear();
@@ -23904,6 +23911,7 @@ impl App {
         self.cancel_all_comic_bakes();
         self.fs_early_dims.clear();
         self.fs_cache.clear();
+        self.fs_lanczos_cache.clear();
         self.fs_margin_bbox_cache.clear();
         self.fs_upload_backlog.clear();
 
@@ -37931,6 +37939,17 @@ impl App {
             zoom_pan,
             free_rotation,
         );
+        let rotated_size = match rotation {
+            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
+                egui::vec2(texture_size.y, texture_size.x)
+            }
+            _ => texture_size,
+        };
+        let logical_scale = (image_rect_norm.width() * placement.w / rotated_size.x.max(1.0))
+            .min(image_rect_norm.height() * placement.h / rotated_size.y.max(1.0));
+        let texture = self.fullscreen_paint_resource_for_texture(idx, texture);
+        let texture =
+            self.prepare_fullscreen_paint_resource(&texture, logical_scale, pixels_per_point);
         let frozen_continuous_pages = ctx
             .map(|ctx| self.detached_frozen_pages_for_snapshot(ctx, id, idx, placement))
             .unwrap_or_default();
@@ -37996,7 +38015,7 @@ impl App {
         ));
         Some(DetachedImageWindowSnapshot {
             id,
-            texture,
+            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
             title,
             location_display,
             image_dims: None,
@@ -38227,6 +38246,7 @@ impl App {
             view_trim_dirty_page_overrides,
             view_trim_save_pending,
             fs_cache,
+            fs_lanczos_cache,
             fs_margin_bbox_cache,
             input_generation,
             fs_pending,
@@ -38406,6 +38426,7 @@ impl App {
             analysis_filter_mag,
             analysis_guide_drag,
             fs_cache,
+            fs_lanczos_cache,
             fs_margin_bbox_cache,
             input_generation,
             fs_pending,
@@ -47949,6 +47970,7 @@ impl App {
         }
         // KEEP 範囲外のテクスチャを破棄（VRAM 節約）
         self.fs_cache.retain(|k, _| keep_set.contains(k));
+        self.fs_lanczos_cache.retain_page_indices(&keep_set);
         self.fs_margin_bbox_cache
             .retain(|k, _| keep_set.contains(k));
 
@@ -48637,6 +48659,7 @@ impl App {
         let fc_drop_t0 = std::time::Instant::now();
         let fc_drop_count = self.fs_cache.len();
         self.fs_cache.clear();
+        self.fs_lanczos_cache.clear();
         self.fs_margin_bbox_cache.clear();
         let fc_drop_ms = fc_drop_t0.elapsed().as_secs_f64() * 1000.0;
         if crate::perf::is_enabled() {
@@ -51854,6 +51877,7 @@ impl App {
     pub(crate) fn bump_input_generation_for_fs_cache_reload(&mut self, idx: usize) {
         let slot = self.input_generation.entry(idx).or_insert(0);
         *slot = slot.wrapping_add(1);
+        self.fs_lanczos_cache.remove_page(idx);
         self.cancel_erase_commit_pending_for_idx(idx);
         self.clear_erase_result_caches_for_idx(idx);
         self.clear_local_adjust_caches_for_idx(idx);
@@ -51870,6 +51894,7 @@ impl App {
 
     fn set_continuous_page_transition(&mut self, idx: usize, texture: egui::TextureHandle) {
         if self.continuous_page_transition_is_owned_here(idx) {
+            let texture = self.fullscreen_paint_resource_for_texture(idx, texture);
             self.continuous_page_transitions.insert(
                 idx,
                 ContinuousPageTransition {
@@ -51885,7 +51910,7 @@ impl App {
     pub(crate) fn continuous_page_transition_texture(
         &self,
         idx: usize,
-    ) -> Option<egui::TextureHandle> {
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
         self.continuous_page_transition_is_owned_here(idx)
             .then(|| self.continuous_page_transitions.get(&idx))
             .flatten()

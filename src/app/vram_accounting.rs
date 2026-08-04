@@ -25,12 +25,68 @@ fn includes_idx(indices: Option<&std::collections::HashSet<usize>>, idx: usize) 
     indices.is_none_or(|indices| indices.contains(&idx))
 }
 
+fn add_lanczos_resource(
+    accountant: &mut VramAccountant,
+    resource: &crate::gpu_lanczos::FullscreenPaintResource,
+) {
+    if let Some(output) = resource.lanczos_output() {
+        accountant.add_texture_id(
+            VramSubsystem::LanczosOutputs,
+            output.texture_id(),
+            output.size(),
+            false,
+        );
+    }
+}
+
+fn add_lanczos_cache(
+    accountant: &mut VramAccountant,
+    cache: &crate::gpu_lanczos::GpuLanczosCache,
+    indices: Option<&std::collections::HashSet<usize>>,
+) {
+    for (idx, output) in cache.outputs() {
+        if includes_idx(indices, idx) {
+            accountant.add_texture_id(
+                VramSubsystem::LanczosOutputs,
+                output.texture_id(),
+                output.size(),
+                false,
+            );
+        }
+    }
+}
+
 impl App {
+    #[cfg(windows)]
+    fn add_detached_lanczos_textures(&self, accountant: &mut VramAccountant) {
+        if let Some(active) = self.active_detached_viewer_context.as_ref() {
+            add_lanczos_cache(accountant, &active.bundle.fs_lanczos_cache, None);
+        }
+        for window in &self.detached_image_windows {
+            add_lanczos_resource(accountant, &window.texture);
+            for page in &window.frozen_continuous_pages {
+                add_lanczos_resource(accountant, &page.texture);
+            }
+            if let Some(bundle) = window.paused_bundle.as_deref() {
+                add_lanczos_cache(accountant, &bundle.fs_lanczos_cache, None);
+            }
+        }
+        for shared in self.deferred_detached_image_window_views.values() {
+            if let Some(view) = shared.view() {
+                add_lanczos_resource(accountant, &view.texture);
+                for page in &view.frozen_continuous_pages {
+                    add_lanczos_resource(accountant, &page.texture);
+                }
+            }
+        }
+    }
+
     fn add_fullscreen_textures(
         &self,
         accountant: &mut VramAccountant,
         indices: Option<&std::collections::HashSet<usize>>,
     ) {
+        add_lanczos_cache(accountant, &self.fs_lanczos_cache, indices);
         for (&idx, entry) in &self.fs_cache {
             if includes_idx(indices, idx) {
                 add_fs_cache_entry(accountant, VramSubsystem::FsCache, entry);
@@ -92,9 +148,10 @@ impl App {
             if includes_idx(indices, idx) {
                 accountant.add_texture(
                     VramSubsystem::ContinuousPageTransitions,
-                    &entry.texture,
+                    entry.texture.source_texture(),
                     true,
                 );
+                add_lanczos_resource(accountant, &entry.texture);
             }
         }
     }
@@ -138,6 +195,8 @@ impl App {
     pub(crate) fn vram_accounting_snapshot(&self) -> VramAccountingSnapshot {
         let mut accountant = VramAccountant::default();
         self.add_fullscreen_textures(&mut accountant, None);
+        #[cfg(windows)]
+        self.add_detached_lanczos_textures(&mut accountant);
         self.add_thumbnail_textures(&mut accountant, None);
         accountant.finish()
     }
