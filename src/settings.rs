@@ -3764,6 +3764,12 @@ pub struct Settings {
     #[serde(default)]
     pub perf_log_enabled: bool,
 
+    // ── mIV Remote service ─────────────────────────────────────────
+    /// 有効時は同じディレクトリの remote 接続用実行ファイルを開始する。
+    /// ネットワーク待受を伴うため既定 OFF。設定確定時に即時反映する。
+    #[serde(default)]
+    pub remote_service_enabled: bool,
+
     // ── mIV Remote 動画ストリーミング ─────────────────────────────
     /// リモート動画・音声ストリーミング機能そのものを許可する。
     #[serde(default = "default_true")]
@@ -5003,6 +5009,7 @@ impl Default for Settings {
             update_check_enabled: true,
             update_check_dismissed_version: None,
             perf_log_enabled: false,
+            remote_service_enabled: false,
             remote_video_streaming_enabled: true,
             remote_video_encoder: RemoteVideoEncoder::Auto,
             remote_video_quality_default: RemoteVideoQuality::Standard,
@@ -6858,6 +6865,7 @@ mod tests {
     #[test]
     fn remote_video_streaming_defaults_and_enum_storage_are_stable() {
         let settings = Settings::default();
+        assert!(!settings.remote_service_enabled);
         assert!(settings.remote_video_streaming_enabled);
         assert_eq!(settings.remote_video_encoder, RemoteVideoEncoder::Auto);
         assert_eq!(

@@ -42,6 +42,8 @@ const CONNECTION_HEALTH_POLL: Duration = Duration::from_millis(500);
 /// 初回は素早く追従し、常時停止中の本体へ過剰に接続しないよう 5 秒で頭打ちにする。
 const RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
+/// core 管理下では、最大 backoff 3 回分を越えて本体へ戻れなければ孤児とみなす。
+pub const MANAGED_CORE_RECONNECT_GRACE: Duration = RECONNECT_MAX_DELAY.saturating_mul(3);
 
 fn response_timeout_for(request: &ClientMessage) -> Duration {
     match request {
@@ -266,7 +268,10 @@ impl ThumbnailClient {
             .unwrap_or_else(|error| error.into_inner()) = Some(info);
     }
 
-    pub fn start_connection_maintainer(self: &Arc<Self>) -> Result<ConnectionMaintainer, String> {
+    pub fn start_connection_maintainer(
+        self: &Arc<Self>,
+        disconnect_grace: Option<Duration>,
+    ) -> Result<ConnectionMaintainer, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new((Mutex::new(()), Condvar::new()));
         let worker_client = Arc::clone(self);
@@ -275,8 +280,9 @@ impl ThumbnailClient {
         let thread = std::thread::Builder::new()
             .name("remote-ipc-maintainer".to_owned())
             .spawn(move || {
-                run_connection_maintainer(
+                let managed_core_lost = run_connection_maintainer(
                     &worker_stop,
+                    disconnect_grace,
                     || {
                         worker_client
                             .get_connection()
@@ -304,6 +310,13 @@ impl ThumbnailClient {
                         }
                     },
                 );
+                if managed_core_lost {
+                    eprintln!(
+                        "remote-web: 本体との接続を{}秒間復旧できなかったため終了します",
+                        MANAGED_CORE_RECONNECT_GRACE.as_secs()
+                    );
+                    std::process::exit(0);
+                }
             })
             .map_err(|error| format!("IPC 常時接続 worker を開始できません: {error}"))?;
         Ok(ConnectionMaintainer {
@@ -1167,14 +1180,16 @@ enum ConnectionMaintenanceEvent {
 /// transport を差し替えたテストでも「本体の後起動」と「切断後の再通知」を同じ loop で固定する。
 fn run_connection_maintainer<C>(
     stop: &AtomicBool,
+    disconnect_grace: Option<Duration>,
     mut connect_and_announce: impl FnMut() -> Result<C, String>,
     mut is_broken: impl FnMut(&C) -> bool,
     mut wait: impl FnMut(Duration),
     mut report: impl FnMut(ConnectionMaintenanceEvent),
-) {
+) -> bool {
     let mut consecutive_failures = 0_u32;
     let mut reported_max_delay = false;
     let mut recovering = false;
+    let mut unavailable_for = Duration::ZERO;
     while !stop.load(Ordering::Acquire) {
         match connect_and_announce() {
             Ok(connection) => {
@@ -1183,6 +1198,7 @@ fn run_connection_maintainer<C>(
                 });
                 consecutive_failures = 0;
                 reported_max_delay = false;
+                unavailable_for = Duration::ZERO;
                 while !stop.load(Ordering::Acquire) && !is_broken(&connection) {
                     wait(CONNECTION_HEALTH_POLL);
                 }
@@ -1203,10 +1219,18 @@ fn run_connection_maintainer<C>(
                     reported_max_delay |= retry_after == RECONNECT_MAX_DELAY;
                 }
                 consecutive_failures = consecutive_failures.saturating_add(1);
+                let retry_after = disconnect_grace
+                    .map(|grace| retry_after.min(grace.saturating_sub(unavailable_for)))
+                    .unwrap_or(retry_after);
                 wait(retry_after);
+                unavailable_for = unavailable_for.saturating_add(retry_after);
+                if disconnect_grace.is_some_and(|grace| unavailable_for >= grace) {
+                    return true;
+                }
             }
         }
     }
+    false
 }
 
 fn reconnect_delay(consecutive_failures: u32) -> Duration {
@@ -1755,6 +1779,7 @@ mod tests {
 
         run_connection_maintainer(
             &stop,
+            Some(Duration::from_secs(1)),
             || {
                 attempts.set(attempts.get() + 1);
                 if !server_running.get() {
@@ -1795,6 +1820,43 @@ mod tests {
         assert_eq!(reconnect_delay(4), Duration::from_secs(4));
         assert_eq!(reconnect_delay(5), RECONNECT_MAX_DELAY);
         assert_eq!(reconnect_delay(u32::MAX), RECONNECT_MAX_DELAY);
+    }
+
+    #[test]
+    fn managed_remote_exits_after_core_reconnect_grace() {
+        let stop = AtomicBool::new(false);
+        let waited = Cell::new(Duration::ZERO);
+        let exited = run_connection_maintainer(
+            &stop,
+            Some(Duration::from_secs(1)),
+            || -> Result<(), String> { Err("pipe not found".to_owned()) },
+            |_| false,
+            |delay| waited.set(waited.get().saturating_add(delay)),
+            |_| {},
+        );
+        assert!(exited);
+        assert_eq!(waited.get(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn externally_started_remote_keeps_waiting_for_core() {
+        let stop = AtomicBool::new(false);
+        let waits = Cell::new(0_u32);
+        let exited = run_connection_maintainer(
+            &stop,
+            None,
+            || -> Result<(), String> { Err("pipe not found".to_owned()) },
+            |_| false,
+            |_| {
+                waits.set(waits.get() + 1);
+                if waits.get() == 8 {
+                    stop.store(true, Ordering::Release);
+                }
+            },
+            |_| {},
+        );
+        assert!(!exited);
+        assert_eq!(waits.get(), 8);
     }
 
     #[test]

@@ -2201,8 +2201,8 @@ impl MenuCommandId {
         Self::SettingsRestoreSettings,
         Self::SettingsOperationCustomize,
         Self::SettingsPreferences,
-        Self::HelpOpenManual,
         Self::HelpRemoteConnection,
+        Self::HelpOpenManual,
         Self::HelpOpenLogs,
         Self::HelpShowWhatsNew,
         Self::HelpAbout,
@@ -2489,15 +2489,16 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         action: Some(KeyAction::GridOpenPreferences),
     },
     MenuCommandSpec {
-        id: MenuCommandId::HelpOpenManual,
-        parent: TopMenuId::Help,
-        label: "ヘルプサイトを開く",
+        id: MenuCommandId::HelpRemoteConnection,
+        // stable ID は保存済み hidden/order 互換のため維持し、親だけ設定へ移す。
+        parent: TopMenuId::Settings,
+        label: "リモート接続…",
         action: None,
     },
     MenuCommandSpec {
-        id: MenuCommandId::HelpRemoteConnection,
+        id: MenuCommandId::HelpOpenManual,
         parent: TopMenuId::Help,
-        label: "リモート接続…",
+        label: "ヘルプサイトを開く",
         action: None,
     },
     MenuCommandSpec {
@@ -7798,7 +7799,6 @@ mod tests {
             vec![
                 MenuCommandId::HelpAbout,
                 MenuCommandId::HelpOpenManual,
-                MenuCommandId::HelpRemoteConnection,
                 MenuCommandId::HelpShowWhatsNew,
             ]
         );
@@ -7825,6 +7825,32 @@ mod tests {
             settings_menu
                 .commands
                 .contains(&MenuCommandId::SettingsPreferences)
+        );
+        let preferences = settings_menu
+            .commands
+            .iter()
+            .position(|id| *id == MenuCommandId::SettingsPreferences)
+            .unwrap();
+        let remote = settings_menu
+            .commands
+            .iter()
+            .position(|id| *id == MenuCommandId::HelpRemoteConnection)
+            .unwrap();
+        assert!(remote > preferences);
+    }
+
+    #[test]
+    fn moved_remote_command_keeps_its_saved_hidden_identity() {
+        let settings = MenuLayoutSettings {
+            hidden_commands: vec!["HelpRemoteConnection".to_owned()],
+            ..Default::default()
+        };
+        let resolved = resolve_menu_layout(&settings);
+        assert!(
+            resolved
+                .menus
+                .iter()
+                .all(|menu| { !menu.commands.contains(&MenuCommandId::HelpRemoteConnection) })
         );
     }
 

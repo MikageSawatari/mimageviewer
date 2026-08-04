@@ -1824,7 +1824,7 @@ fn collection_ipc_error_response(
         IpcClientError::Unavailable(_) => (
             503,
             "miv_not_running",
-            "mIV 本体が起動していません。mIV を --remote-ipc 付きで起動してください。".to_owned(),
+            "mIV 本体が起動していません。mIV を起動してください。".to_owned(),
         ),
         IpcClientError::VersionMismatch { client, server } => (
             503,
@@ -2421,7 +2421,7 @@ fn media_ipc_error_response(
         IpcClientError::Unavailable(_) => (
             503,
             "miv_not_running",
-            "mIV 本体が起動していません。mIV を --remote-ipc 付きで起動してください。".to_owned(),
+            "mIV 本体が起動していません。mIV を起動してください。".to_owned(),
         ),
         IpcClientError::VersionMismatch { client, server } => (
             503,
@@ -2553,7 +2553,7 @@ fn ipc_error_response(
         IpcClientError::Unavailable(_) => (
             503,
             "miv_not_running",
-            "mIV 本体が起動していません。mIV を --remote-ipc 付きで起動してください。".to_owned(),
+            "mIV 本体が起動していません。mIV を起動してください。".to_owned(),
         ),
         IpcClientError::VersionMismatch { client, server } => (
             503,

@@ -48,7 +48,7 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 
 ### 2.2 セッションと排他
 
-`--remote-ipc` 起動時だけ本体に単一の remote session owner を置く。ブラウザは認証後に
+本体に単一の remote session owner を置く。ブラウザは認証後に
 `POST /api/session/acquire` で確認なしに操作権を取得し、本体は「リモート接続中」ダイアログを
 出して main / fullscreen / detached / native presenter の通常入力をロックする。操作者は常に
 1 人であり、2 台目やローカルとの競合は**後から操作した側が勝つ**。表示フォルダ等の状態同期はしない。
@@ -122,11 +122,22 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 - 接続用 QR コードには URL だけを含め、PIN や Bearer は含めない。URL は `--url`、Tailscale の
   `--json` 状態、bind 先の順で決める。remote-web は確定 URL、`tailscale serve` 状態、PIN 設定済み
   bool だけを protocol v8 の接続情報として本体へ通知する。本体は独自検出せず、ヘルプの
-  「リモート接続…」に QR、URL、接続状態を表示する。`--remote-ipc` 無しでは無効理由を表示する。
+  設定メニューの「リモート接続…」に QR、URL、即時反映する opt-in、受付状態、active session の
+  有無に基づく二値の利用状況を表示する。排他的 owner なので端末台数は表示しない。
   remote-web はブラウザ要求と独立した常駐 worker で IPC を維持し、250 ms から 5 秒上限の指数
   backoff で再接続する。接続 / 再接続の handshake 完了時に接続情報を必ず再通知する。本体 UI は
-  handshake 済み接続を URL 受信前から追跡し、「remote-web が起動していない」と
-  「remote-web は起動済みだが接続情報を受信中」を区別する
+  handshake 済み接続を URL 受信前から追跡し、準備中、版不一致、起動失敗、接続情報の受信中を区別する
+
+### 3.2.1 core 所有の service lifecycle
+
+core は local-only / current-user-only の named pipe を常設する。設定ダイアログの OK で保存済み
+opt-in を確定し、専用 owner worker へ希望状態を送る。worker は有効時に同じディレクトリの
+`mimageviewer-remote.exe` を起動し、初期化済みの `data_dir` を `--data-dir` で渡す。無効化時の
+kill / wait も worker 側で行い、UI thread を止めない。core が spawn した `Child` だけを終了対象とし、
+プロセス名や port から外部起動分の所有を推定しない。
+stdout は起動時 Bearer token を含むため収集せず、stderr の安全な診断だけを本体 UI へ渡す。
+管理用 marker を受けた remote は IPC を累積 15 秒復旧できなければ自ら終了し、core の強制終了でも
+画像を配信する孤児を残さない。手動起動には marker が無く、従来どおり無期限に再接続を待つ。
 
 ### 3.3 バインドアドレス
 
@@ -564,8 +575,9 @@ commit `865d9c2a` で導入した remote-web 側のオンデマンド生成と�
 
 IPC の型と版数は GUI / native runtime 非依存の `crates/remote-ipc` に集約する。接続時に
 `PROTOCOL_VERSION` を照合し、不一致なら接続を拒否して client / server の双方の版数をログへ出す。
-本体は `--remote-ipc` がある場合だけローカル named pipe を開き、受信と生成を UI thread 外の
-上限制御された worker で処理する。同名 pipe が既に存在する場合は二重起動せずエラーを記録する。
+本体は起動中常に `PIPE_REJECT_REMOTE_CLIENTS` と current-user-only DACL を付けた local named pipe を
+開き、受信と生成を UI thread 外の上限制御された worker で処理する。同名 pipe が既に存在する場合は
+二重起動せずエラーを記録する。ネットワーク待受は opt-in で開始する remote exe だけが所有する。
 
 実機初回測定では 1 要求 1 接続だったため、571 要求中 274 件が接続成立後の
 `ipc_protocol_error` になった。直接原因は、旧 server の `PipeStream::flush` が空実装のまま、
@@ -715,7 +727,7 @@ HTTP は認証必須の `GET /api/home` と `GET /api/collection` を追加す�
 
 ```powershell
 Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
-  -ArgumentList '--data-dir', '.\target\dev-runtime\data', '--remote-ipc'
+  -ArgumentList '--data-dir', '.\target\dev-runtime\data'
 ```
 
 remote-webにも同じdata directoryを渡し、同じお気に入り・設定を読む。
@@ -726,10 +738,10 @@ Start-Process -FilePath .\target\remote-home-release\release\mimageviewer-remote
 ```
 
 remote thumbnail IPC の `\\.\pipe\mimageviewer-remote-thumbnail` はremote-web側の接続先との互換性を
-保つため固定のままとする。2つの本体へ同時に `--remote-ipc` を付けると、後発側は
-`FILE_FLAG_FIRST_PIPE_INSTANCE` による作成失敗を「同名サーバが既に存在する可能性」と stderr と
-各data directoryの `logs/mimageviewer.log` に記録し、GUI本体自体は起動を継続する。通常運用側には
-`--remote-ipc` を付けず、検証側だけをremote-webの接続先にする。
+保つため固定のままとする。named pipe は常設なので、異なる data directory の本体を 2 つ起動した
+場合も先発側だけが remote-web の接続先になる。後発側は `FILE_FLAG_FIRST_PIPE_INSTANCE` による
+作成失敗を stderr と各data directoryの `logs/mimageviewer.log` に記録し、GUI本体自体は起動を
+継続する。隔離側の remote を検証するときは、通常運用側を先に終了して pipe owner を一意にする。
 
 ## 12. ZIP / PDF のリモート閲覧 (2026-07-31)
 
@@ -1264,13 +1276,12 @@ video_viewer_entry_rejected が 0 件でも、その手前のどの route が実
 ```powershell
 # 本体 (ユーザーが実行する。エージェントは mIV 本体を起動しない)
 Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
-  -ArgumentList '--data-dir','.\target\dev-runtime\data','--remote-ipc'
+  -ArgumentList '--data-dir','.\target\dev-runtime\data'
 ```
 
 - データディレクトリが既定と異なると、mutex / activate event / open-path pipe /
-  shutdown event の 4 つが別名前空間になるため、**通常版 mIV を起動したままでよい** (§11)
-- `--remote-ipc` は**検証側だけ**に付ける (IPC の pipe 名は固定のため、両方に付けると
-  後発側が拒否される)
+  shutdown event の 4 つは別名前空間になる。ただし remote IPC の pipe 名だけは固定かつ常設なので、
+  **隔離側の remote を検証するときは通常版 mIV を終了する** (§11)
 - 隔離データは `%APPDATA%\mimageviewer` から robocopy で作った。`fts_index` / `runtime` /
   `tensorrt*` / `logs` / `_recovery` は除外して約 11.6GB (元は 113GB)
 

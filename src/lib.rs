@@ -726,7 +726,6 @@ fn maybe_handle_version_or_help() -> bool {
              Options:\n  \
              -V, --version  Print version and exit\n  \
              -h, --help     Print this help and exit\n  \
-                 --remote-ipc  Enable the local remote-thumbnail IPC server\n\
              \n\
              PATH  Open the given image file or folder on startup.\n",
             ver = env!("CARGO_PKG_VERSION"),
@@ -1072,25 +1071,43 @@ pub fn run() -> eframe::Result {
         ..Default::default()
     };
 
-    // 縦串フェーズの thumbnail IPC は明示指定時だけ有効。受信・生成はすべて
-    // 読み取りと検証は remote_ipc 配下の専用スレッドで行う。永続書き込みだけは
+    // ローカル named pipe は常設する。受信・生成の読み取りと検証は remote_ipc 配下の
+    // 専用スレッドで行う。永続書き込みだけは
     // App 所有ハンドルを使うため、型付き queue と repaint wakeup 経由で UI thread に渡す。
     // guard は run_native が戻るまで保持し、Drop で listener と worker を閉じる。
-    let _remote_ipc_server = if has_arg("--remote-ipc") {
-        match remote_ipc::RemoteIpcServer::start(saved.clone()) {
-            Ok(server) => Some(server),
+    let remote_service_status = remote_ipc::RemoteServiceStatus::stopped();
+    let _remote_ipc_server = match remote_ipc::RemoteIpcServer::start(saved.clone()) {
+        Ok(server) => Some(server),
+        Err(error) => {
+            eprintln!("remote IPC を開始できません: {error}");
+            logger::log(format!("remote_ipc: startup failed: {error}"));
+            remote_service_status.set_error("本体側のリモート接続を開始できませんでした");
+            None
+        }
+    };
+    let remote_session_handle = _remote_ipc_server
+        .as_ref()
+        .map(remote_ipc::RemoteIpcServer::session_handle);
+    // server より後に所有し、逆順 Drop で service を先に止めてから pipe を閉じる。
+    let _remote_service_manager = if _remote_ipc_server.is_some() {
+        match remote_ipc::RemoteServiceManager::start(
+            data_dir::get(),
+            saved.remote_service_enabled,
+            remote_service_status.clone(),
+        ) {
+            Ok(manager) => Some(manager),
             Err(error) => {
-                eprintln!("remote IPC を開始できません: {error}");
-                logger::log(format!("remote_ipc: startup failed: {error}"));
+                logger::log(format!("remote_service: manager startup failed: {error}"));
+                remote_service_status.set_error(error);
                 None
             }
         }
     } else {
         None
     };
-    let remote_session_handle = _remote_ipc_server
+    let remote_service_control = _remote_service_manager
         .as_ref()
-        .map(remote_ipc::RemoteIpcServer::session_handle);
+        .map(remote_ipc::RemoteServiceManager::control);
 
     // eframe::run_native に入る手前までを 1 つの marker として記録する。
     // これ以降は eframe (winit + wgpu) の初期化が走り、creator closure が呼ばれる。
@@ -1132,6 +1149,10 @@ pub fn run() -> eframe::Result {
             if let Some(handle) = remote_session_handle.clone() {
                 app.set_remote_session_handle(handle);
             }
+            app.set_remote_service_control(
+                remote_service_status.clone(),
+                remote_service_control.clone(),
+            );
             emit_startup("app_default", Some(t));
             if let Some(path) = startup_open_path.clone() {
                 app.set_startup_open_path(path);

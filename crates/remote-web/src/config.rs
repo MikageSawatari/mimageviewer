@@ -14,6 +14,8 @@ pub struct Config {
     pub set_pin: Option<String>,
     pub public_url: Option<String>,
     pub web_root: PathBuf,
+    /// core が所有する子プロセス。IPC を失ったままなら孤児化を避けるため終了する。
+    pub managed_by_core: bool,
 }
 
 impl Config {
@@ -29,6 +31,7 @@ impl Config {
         let mut auth_path = PathBuf::from("remote-web-auth.json");
         let mut set_pin = None;
         let mut public_url = None;
+        let mut managed_by_core = false;
         let mut args = args.into_iter();
 
         while let Some(arg) = args.next() {
@@ -73,6 +76,7 @@ impl Config {
                     let value = args.next().ok_or("--url には接続 URL が必要です")?;
                     public_url = Some(value.to_string_lossy().into_owned());
                 }
+                "--managed-by-core" => managed_by_core = true,
                 "--help" | "-h" => return Err(help_text().to_owned()),
                 other => return Err(format!("不明な引数です: {other}\n\n{}", help_text())),
             }
@@ -89,6 +93,7 @@ impl Config {
             set_pin,
             public_url,
             web_root,
+            managed_by_core,
         })
     }
 }
@@ -126,6 +131,16 @@ mod tests {
         assert_eq!(
             config.public_url.as_deref(),
             Some("https://example.ts.net/")
+        );
+    }
+
+    #[test]
+    fn managed_marker_is_typed_and_external_launch_stays_unmanaged() {
+        assert!(!Config::parse_args([]).unwrap().managed_by_core);
+        assert!(
+            Config::parse_args([OsString::from("--managed-by-core")])
+                .unwrap()
+                .managed_by_core
         );
     }
 }

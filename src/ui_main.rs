@@ -5183,6 +5183,16 @@ impl App {
                                                 ui.close();
                                             }
                                         }
+                                        MenuCommandId::HelpRemoteConnection => {
+                                            ui.separator();
+                                            if ui
+                                                .button(&help_remote_connection_menu_label)
+                                                .clicked()
+                                            {
+                                                self.open_remote_connection_dialog();
+                                                ui.close();
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -5216,15 +5226,6 @@ impl App {
                                                 let url =
                                                     crate::ui_helpers::manual_url("index.html", None);
                                                 crate::ui_helpers::open_url(&url);
-                                                ui.close();
-                                            }
-                                        }
-                                        MenuCommandId::HelpRemoteConnection => {
-                                            if ui
-                                                .button(&help_remote_connection_menu_label)
-                                                .clicked()
-                                            {
-                                                self.open_remote_connection_dialog();
                                                 ui.close();
                                             }
                                         }

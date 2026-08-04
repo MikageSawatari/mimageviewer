@@ -1744,7 +1744,7 @@ function ipcUnavailableMessage() {
   const status = element("div", "home-ipc-error");
   status.append(
     textElement("strong", "mIV 本体が起動していません"),
-    textElement("p", "mIV を --remote-ipc 付きで起動すると、この一覧を利用できます。")
+    textElement("p", "mIV を起動すると、この一覧を利用できます。")
   );
   return status;
 }

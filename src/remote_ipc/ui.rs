@@ -23,14 +23,63 @@ use super::video_stream::{VideoStreamStartBudget, VideoStreamStartStage};
 #[derive(Default)]
 pub(crate) struct RemoteSessionUiState {
     handle: Option<SessionHandle>,
+    remote_service_status: Option<super::RemoteServiceStatus>,
+    remote_service_control: Option<super::RemoteServiceControl>,
     last_acquisition_sequence: u64,
     last_control_return_sequence: u64,
     pending_fullscreen_restore: Option<PendingFullscreenRestore>,
     paused_animation_restore_key: Option<String>,
     pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
-    show_connection_dialog: bool,
+    connection_dialog: Option<RemoteConnectionDialogState>,
     video_stream: Option<AppRemoteVideoStreamState>,
     local_ai_lease: Option<RemoteLocalAiLease>,
+}
+
+#[derive(Clone, Copy)]
+struct RemoteConnectionDialogState {
+    enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteConnectionDialogOutcome {
+    Apply(bool),
+    Discard,
+    Keep(bool),
+}
+
+fn remote_connection_dialog_outcome(
+    enabled: bool,
+    apply: bool,
+    cancel: bool,
+    open: bool,
+) -> RemoteConnectionDialogOutcome {
+    if apply {
+        RemoteConnectionDialogOutcome::Apply(enabled)
+    } else if cancel || !open {
+        RemoteConnectionDialogOutcome::Discard
+    } else {
+        RemoteConnectionDialogOutcome::Keep(enabled)
+    }
+}
+
+fn remote_connection_state_label(
+    accepting: bool,
+    diagnostic: &super::service::RemoteServiceDiagnostic,
+) -> &'static str {
+    if accepting {
+        "受け付けています"
+    } else {
+        match diagnostic {
+            super::service::RemoteServiceDiagnostic::Stopped => "停止しています",
+            super::service::RemoteServiceDiagnostic::Starting => "準備しています",
+            super::service::RemoteServiceDiagnostic::VersionMismatch
+            | super::service::RemoteServiceDiagnostic::Error(_) => "開始できません",
+        }
+    }
+}
+
+fn remote_client_state_label(active: bool) -> &'static str {
+    if active { "操作中" } else { "なし" }
 }
 
 #[derive(Default)]
@@ -196,12 +245,23 @@ impl crate::app::App {
         self.remote_session_ui.handle = Some(handle);
     }
 
+    pub(crate) fn set_remote_service_control(
+        &mut self,
+        status: super::RemoteServiceStatus,
+        control: Option<super::RemoteServiceControl>,
+    ) {
+        self.remote_session_ui.remote_service_status = Some(status);
+        self.remote_session_ui.remote_service_control = control;
+    }
+
     pub(crate) fn open_remote_connection_dialog(&mut self) {
-        self.remote_session_ui.show_connection_dialog = true;
+        self.remote_session_ui.connection_dialog = Some(RemoteConnectionDialogState {
+            enabled: self.settings.remote_service_enabled,
+        });
     }
 
     pub(crate) fn remote_connection_dialog_open(&self) -> bool {
-        self.remote_session_ui.show_connection_dialog
+        self.remote_session_ui.connection_dialog.is_some()
     }
 
     pub(crate) fn remote_ai_execution_bridge(
@@ -1826,10 +1886,10 @@ impl crate::app::App {
     }
 
     pub(crate) fn show_remote_connection_dialog(&mut self, ctx: &egui::Context) {
-        if !self.remote_session_ui.show_connection_dialog {
+        let Some(dialog) = self.remote_session_ui.connection_dialog else {
             return;
-        }
-        let ipc_enabled = self.remote_session_ui.handle.is_some();
+        };
+        let mut enabled = dialog.enabled;
         let snapshot = self
             .remote_session_ui
             .handle
@@ -1838,63 +1898,116 @@ impl crate::app::App {
         let remote_web_connected = snapshot
             .as_ref()
             .is_some_and(|snapshot| snapshot.remote_web_connected);
-        let info = snapshot.and_then(|snapshot| snapshot.remote_web);
+        let remote_client_active = snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.active.is_some());
+        let info = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.remote_web.clone());
+        let service_diagnostic = self
+            .remote_session_ui
+            .remote_service_status
+            .as_ref()
+            .map(super::RemoteServiceStatus::snapshot)
+            .unwrap_or(super::service::RemoteServiceDiagnostic::Stopped);
+        let accepting = remote_web_connected && info.is_some();
+        let escape_pressed = self.dialog_escape_pressed(ctx);
         let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
         egui::Window::new("リモート接続")
             .id(egui::Id::new("remote_connection_dialog"))
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
             .show(ctx, |ui| {
-                if !ipc_enabled {
-                    ui.heading("リモート接続は無効です");
-                    ui.label("mIV 本体を --remote-ipc 付きで起動してください。");
-                    return;
-                }
-                let Some(info) = info.as_ref() else {
-                    if remote_web_connected {
-                        ui.heading("remote-web は起動しています");
-                        ui.label("接続状態: IPC 接続済み / 接続情報を受信中");
-                        ui.label("通常は間もなく URL と QR コードが表示されます。");
-                        ui.small(
-                            "この表示が続く場合は remote-web と本体の版が一致しているか確認してください。",
-                        );
-                    } else {
-                        ui.heading("remote-web が起動していません");
-                        ui.label("接続状態: 本体への IPC 接続なし");
-                        ui.label("mimageviewer-remote.exe を起動してください。");
-                        ui.small(
-                            "既に起動済みなら、自動再接続のため最大 5 秒ほど待ってください。",
-                        );
-                    }
-                    return;
-                };
+                ui.checkbox(&mut enabled, "この端末からリモート接続を利用する");
+                ui.separator();
+                let state_label = remote_connection_state_label(accepting, &service_diagnostic);
+                ui.horizontal(|ui| {
+                    ui.label("状態:");
+                    ui.strong(state_label);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("利用状況:");
+                    ui.strong(remote_client_state_label(remote_client_active));
+                });
 
-                ui.label("接続状態: remote-web 接続済み");
-                ui.label(format!(
-                    "tailscale serve: {}",
-                    remote_feature_status_label(info.tailscale_serve)
-                ));
-                ui.label(format!(
-                    "PIN: {}",
-                    if info.pin_configured {
-                        "設定済み"
-                    } else {
-                        "未設定"
+                if !accepting {
+                    match &service_diagnostic {
+                        super::service::RemoteServiceDiagnostic::VersionMismatch => {
+                            ui.label("本体とリモート接続機能の版が一致しません。");
+                            ui.label("両方を同じビルドで更新してください。");
+                        }
+                        super::service::RemoteServiceDiagnostic::Error(error) => {
+                            ui.label(error);
+                        }
+                        super::service::RemoteServiceDiagnostic::Starting => {
+                            ui.small("通常は数秒で接続先が表示されます。");
+                        }
+                        super::service::RemoteServiceDiagnostic::Stopped => {}
                     }
-                ));
-                ui.add_space(6.0);
-                paint_qr(ui, &info.public_url);
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.monospace(&info.public_url);
-                    if ui.button("コピー").clicked() {
-                        ui.ctx().copy_text(info.public_url.clone());
+                }
+
+                if accepting && let Some(info) = info.as_ref() {
+                    ui.separator();
+                    ui.label(format!(
+                        "tailscale serve: {}",
+                        remote_feature_status_label(info.tailscale_serve)
+                    ));
+                    ui.label(format!(
+                        "PIN: {}",
+                        if info.pin_configured {
+                            "設定済み"
+                        } else {
+                            "未設定"
+                        }
+                    ));
+                    ui.add_space(6.0);
+                    paint_qr(ui, &info.public_url);
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.monospace(&info.public_url);
+                        if ui.button("コピー").clicked() {
+                            ui.ctx().copy_text(info.public_url.clone());
+                        }
+                    });
+                    ui.small("QR コードには接続先だけが含まれ、PIN などの認証情報は含まれません。");
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("  OK  ").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        cancel = true;
                     }
                 });
-                ui.small("QR コードには URL だけを含み、PIN や Bearer トークンは含みません。");
             });
-        self.remote_session_ui.show_connection_dialog = open;
+        match remote_connection_dialog_outcome(enabled, apply, cancel || escape_pressed, open) {
+            RemoteConnectionDialogOutcome::Apply(enabled) => {
+                self.settings.remote_service_enabled = enabled;
+                self.settings.save();
+                if let Some(control) = self.remote_session_ui.remote_service_control.as_ref() {
+                    control.set_enabled(enabled);
+                } else if enabled
+                    && let Some(status) = self.remote_session_ui.remote_service_status.as_ref()
+                {
+                    status.set_error("リモート接続を開始できませんでした");
+                }
+                self.remote_session_ui.connection_dialog = None;
+                ctx.request_repaint();
+            }
+            RemoteConnectionDialogOutcome::Discard => {
+                self.remote_session_ui.connection_dialog = None;
+            }
+            RemoteConnectionDialogOutcome::Keep(enabled) => {
+                self.remote_session_ui.connection_dialog =
+                    Some(RemoteConnectionDialogState { enabled });
+                ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            }
+        }
     }
 
     fn reload_after_remote_session_release(&mut self) {
@@ -2437,6 +2550,42 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_connection_dialog_applies_only_ok_and_discards_cancel() {
+        assert_eq!(
+            remote_connection_dialog_outcome(true, true, false, true),
+            RemoteConnectionDialogOutcome::Apply(true)
+        );
+        assert_eq!(
+            remote_connection_dialog_outcome(true, false, true, true),
+            RemoteConnectionDialogOutcome::Discard
+        );
+        assert_eq!(
+            remote_connection_dialog_outcome(true, false, false, false),
+            RemoteConnectionDialogOutcome::Discard
+        );
+    }
+
+    #[test]
+    fn remote_connection_labels_use_health_and_active_session_separately() {
+        assert_eq!(
+            remote_connection_state_label(
+                true,
+                &crate::remote_ipc::service::RemoteServiceDiagnostic::Starting
+            ),
+            "受け付けています"
+        );
+        assert_eq!(
+            remote_connection_state_label(
+                false,
+                &crate::remote_ipc::service::RemoteServiceDiagnostic::Stopped
+            ),
+            "停止しています"
+        );
+        assert_eq!(remote_client_state_label(false), "なし");
+        assert_eq!(remote_client_state_label(true), "操作中");
+    }
 
     #[test]
     fn remote_ai_catalog_exposes_core_labels_and_server_side_mode_permissions() {

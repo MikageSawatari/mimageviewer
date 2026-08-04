@@ -2,12 +2,14 @@ mod ai_job;
 mod collections;
 mod container;
 mod path_guard;
+mod service;
 mod thumbnail;
 mod video_stream;
 
 #[cfg(windows)]
 mod pipe;
 pub(crate) mod session;
+pub(crate) use service::{RemoteServiceControl, RemoteServiceManager, RemoteServiceStatus};
 
 #[cfg(test)]
 pub(crate) use container::resolve_remote_effective_params_for_test;
@@ -336,7 +338,7 @@ impl RemoteIpcServer {
         #[cfg(not(windows))]
         {
             let _ = settings;
-            Err("--remote-ipc は Windows の名前付きパイプ専用です".to_owned())
+            Err("リモート接続は Windows の名前付きパイプ専用です".to_owned())
         }
     }
 

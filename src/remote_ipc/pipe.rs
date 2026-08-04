@@ -14,7 +14,13 @@ use mimageviewer_ipc::{
 };
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-    GetLastError, HANDLE,
+    GENERIC_ALL, GetLastError, HANDLE,
+};
+use windows::Win32::Security::{
+    ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce, GetLengthSid, GetTokenInformation,
+    InitializeAcl, InitializeSecurityDescriptor, IsValidSid, PSECURITY_DESCRIPTOR,
+    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER,
+    TokenUser,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
@@ -26,6 +32,8 @@ use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, NAMED_PIPE_MODE, PIPE_READMODE_BYTE,
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
 };
+use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::PCWSTR;
 
 use super::collections::CollectionEngine;
@@ -1790,7 +1798,7 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
             ServerMessage::RemoteWebConnectionInfo {
                 id: *id,
                 accepted: false,
-                message: "mIV 本体のリモートサービスが停止しています".to_owned(),
+                message: "mIV 本体のリモート接続機能が停止しています".to_owned(),
             }
         }
         ClientMessage::SessionAcquire { id, .. }
@@ -1799,7 +1807,7 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
             id: *id,
             response: session_response(
                 SessionStatus::NotAcquired,
-                "mIV 本体のリモートサービスが停止しています",
+                "mIV 本体のリモート接続機能が停止しています",
             ),
         },
         ClientMessage::Thumbnail { id, .. } => ServerMessage::Thumbnail {
@@ -1912,7 +1920,7 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
             ServerMessage::RemoteWebConnectionInfo {
                 id: *id,
                 accepted: false,
-                message: "mIV 本体のリモートサービスが混み合っています".to_owned(),
+                message: "mIV 本体のリモート接続機能が混み合っています".to_owned(),
             }
         }
         ClientMessage::SessionAcquire { id, .. }
@@ -1921,7 +1929,7 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
             id: *id,
             response: session_response(
                 SessionStatus::NotAcquired,
-                "mIV 本体のリモートサービスが混み合っています",
+                "mIV 本体のリモート接続機能が混み合っています",
             ),
         },
         ClientMessage::Thumbnail { id, .. } => ServerMessage::Thumbnail {
@@ -2057,12 +2065,90 @@ fn frame_error_kind(error: &mimageviewer_ipc::FrameError) -> &'static str {
     }
 }
 
+/// `PIPE_REJECT_REMOTE_CLIENTS` はネットワーク経由だけを拒否する。既定 DACL はローカルの
+/// Everyone に read を許すため、current user だけに full access を与える DACL を明示する。
+struct CurrentUserPipeSecurity {
+    _acl: Vec<u32>,
+    descriptor: SECURITY_DESCRIPTOR,
+}
+
+impl CurrentUserPipeSecurity {
+    fn attributes(&mut self) -> SECURITY_ATTRIBUTES {
+        SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: (&mut self.descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+            bInheritHandle: false.into(),
+        }
+    }
+}
+
+fn current_user_pipe_security() -> Result<CurrentUserPipeSecurity, std::io::Error> {
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+        .map_err(|_| std::io::Error::last_os_error())?;
+
+    let result = (|| {
+        let mut token_user_bytes = 0_u32;
+        let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut token_user_bytes) };
+        if token_user_bytes < std::mem::size_of::<TOKEN_USER>() as u32 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let word_size = std::mem::size_of::<usize>();
+        let mut token_user = vec![0_usize; (token_user_bytes as usize).div_ceil(word_size)];
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(token_user.as_mut_ptr().cast()),
+                token_user_bytes,
+                &mut token_user_bytes,
+            )
+        }
+        .map_err(|_| std::io::Error::last_os_error())?;
+        let token_user =
+            unsafe { std::ptr::read_unaligned(token_user.as_ptr().cast::<TOKEN_USER>()) };
+        let sid = token_user.User.Sid;
+        if !unsafe { IsValidSid(sid) }.as_bool() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "current user SID is invalid",
+            ));
+        }
+
+        let acl_bytes = std::mem::size_of::<ACL>() + std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+            - std::mem::size_of::<u32>()
+            + unsafe { GetLengthSid(sid) } as usize;
+        let mut acl = vec![0_u32; acl_bytes.div_ceil(std::mem::size_of::<u32>())];
+        let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
+        unsafe { InitializeAcl(acl_ptr, (acl.len() * 4) as u32, ACL_REVISION) }
+            .map_err(|_| std::io::Error::last_os_error())?;
+        unsafe { AddAccessAllowedAce(acl_ptr, ACL_REVISION, GENERIC_ALL.0, sid) }
+            .map_err(|_| std::io::Error::last_os_error())?;
+
+        let mut descriptor = SECURITY_DESCRIPTOR::default();
+        let descriptor_ptr =
+            PSECURITY_DESCRIPTOR((&mut descriptor as *mut SECURITY_DESCRIPTOR).cast());
+        unsafe { InitializeSecurityDescriptor(descriptor_ptr, SECURITY_DESCRIPTOR_REVISION) }
+            .map_err(|_| std::io::Error::last_os_error())?;
+        unsafe { SetSecurityDescriptorDacl(descriptor_ptr, true, Some(acl_ptr), false) }
+            .map_err(|_| std::io::Error::last_os_error())?;
+        Ok(CurrentUserPipeSecurity {
+            _acl: acl,
+            descriptor,
+        })
+    })();
+    let _ = unsafe { CloseHandle(token) };
+    result
+}
+
 fn create_server_pipe(first: bool) -> Result<PipeStream, std::io::Error> {
     let name = wide_nul(PIPE_NAME);
     let access = server_pipe_access(first);
     let mode = NAMED_PIPE_MODE(
         PIPE_TYPE_BYTE.0 | PIPE_READMODE_BYTE.0 | PIPE_WAIT.0 | PIPE_REJECT_REMOTE_CLIENTS.0,
     );
+    let mut security = current_user_pipe_security()?;
+    let security_attributes = security.attributes();
     let handle = unsafe {
         CreateNamedPipeW(
             PCWSTR(name.as_ptr()),
@@ -2072,7 +2158,7 @@ fn create_server_pipe(first: bool) -> Result<PipeStream, std::io::Error> {
             PIPE_BUFFER_BYTES,
             PIPE_BUFFER_BYTES,
             0,
-            None,
+            Some(&security_attributes),
         )
     };
     if handle.is_invalid() {
@@ -2262,6 +2348,13 @@ fn wide_nul(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_pipe_dacl_has_one_current_user_ace() {
+        let security = current_user_pipe_security().unwrap();
+        let acl = unsafe { &*security._acl.as_ptr().cast::<ACL>() };
+        assert_eq!(acl.AceCount, 1);
+    }
 
     #[test]
     fn overlapped_transport_and_home_queue_complete_round_trip() {
