@@ -626,29 +626,6 @@
 - 当面の回避: 操作カスタマイズで `FsZoomMode` から NumpadEnter を外す。
 - 規模 / 優先度: Small / P2。データ喪失は無いが、Enter で開くたびに表示が壊れる。
 
-### 1.44 上部バーをロックすると静止画のスライドショーインジケータが隠れる
-
-- 出典: 2026-08-04 の利用者報告。「静止画で上のツールバーをロックしていると、
-  スライドショーのインジケータが見えない」。
-- 壊れている前提: `draw_slideshow_progress_indicator` は円形インジケータを
-  `full_rect.max.x - 22, full_rect.min.y + 22` = **ウィンドウ全体矩形の右上**に描く
-  ([ui_fullscreen.rs:18895](../src/ui_fullscreen.rs))。一方、上部バーをロックすると
-  (`fullscreen_top_bar_locked`) バーは常時表示になり、**インジケータより後に**
-  描かれる ([ui_fullscreen.rs:9270](../src/ui_fullscreen.rs) → [9493](../src/ui_fullscreen.rs))
-  ため、同じ帯を上書きする。非ロック時はバーがホバー時しか出ないので見えていた。
-- 同型: 上端に置く他のインジケータも `full_rect` 基準なので同じ穴を通る。
-  `draw_fs_transparent_bg_indicator` ([18862](../src/ui_fullscreen.rs)) と
-  `draw_original_preview_indicator` ([18888](../src/ui_fullscreen.rs))。下端の
-  `draw_compare_pin_indicator` はシークバーのロックに対して同じ関係になる。
-- 対応案: インジケータの基準を、ロック時にバーが確保した後のコンテンツ矩形
-  (`fullscreen_media_rect` 系) に統一する。個別に「ロック中は 40px 下げる」のような
-  定数を足すと、バー高さの変更・DPI・UI 表示倍率で再びずれる。
-- 完了条件 / 回帰テスト:
-  - 上部バーのロック ON / OFF、ホバー中 / 非ホバーのいずれでもインジケータが見える。
-  - 透過背景インジケータと原画プレビュー表示も同様に隠れない。
-  - UI スナップショット (`cargo test --test ui_snapshot`) に差分が出るなら意図確認のうえ更新。
-- 規模 / 優先度: Small / P3。見た目のみで機能欠落は無い。
-
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断

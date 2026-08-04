@@ -9786,8 +9786,6 @@ pub struct App {
     pub(crate) fs_transparent_bg_mode: u8,
     /// 16×16 の市松テクスチャ (Wrap=Repeat)。最初に B キーで市松にしたとき lazy init。
     pub(crate) fs_checker_texture: Option<egui::TextureHandle>,
-    /// 背景モード変更直後に表示するインジケータの消去期限。
-    pub(crate) fs_transparent_bg_indicator_until: Option<std::time::Instant>,
     /// ポストフィルタ (AdjustParams.post_filter) を一時的にバイパスするフラグ。
     /// 消しゴム / 分析モード中は true にして、apply_sync_adjustment が post-filter
     /// 段をスキップし color-only のテクスチャを作るようにする。
@@ -12353,7 +12351,6 @@ impl App {
             fs_transparent_bg_mode: 0,
             fs_checker_texture: None,
             post_filter_bypassed: false,
-            fs_transparent_bg_indicator_until: None,
             analysis_mode: false,
             analysis_hover_color: None,
             analysis_pinned_color: None,
@@ -40782,7 +40779,6 @@ impl App {
         self.fs_rotation_drag_start = None;
         // 透過背景は「一時的な好み」なので画像切替時にリセット (plan-v0.7.0.md の方針)
         self.fs_transparent_bg_mode = 0;
-        self.fs_transparent_bg_indicator_until = None;
 
         match self.items.get(idx) {
             Some(GridItem::Image(_))

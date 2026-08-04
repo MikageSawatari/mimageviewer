@@ -8783,12 +8783,14 @@ impl App {
                             cfg!(windows) && state.is_video && self.settings.vst3_enabled
                                 && self.settings.vst3_gui_visible
                                 && self.settings.vst3_video_compact;
+                        let content_rect =
+                            self.fullscreen_media_rect(full_rect, fs_idx, state.is_video);
                         let image_rect = if analysis_active {
                             analysis_image_rect(full_rect)
                         } else if vst3_compact_active {
                             vst3_compact_image_rect(full_rect)
                         } else {
-                            self.fullscreen_media_rect(full_rect, fs_idx, state.is_video)
+                            content_rect
                         };
                         let source_size = self
                             .source_dims_for_idx(fs_idx)
@@ -9368,13 +9370,17 @@ impl App {
                             );
                         }
 
-                        // ── 透過背景インジケータ (Shift+B 変更直後のみフェード表示) ──
-                        self.draw_fs_transparent_bg_indicator(ui, full_rect);
-                        self.draw_original_preview_indicator(ui, full_rect, state.original_preview_active);
+                        // 透過背景 (Shift+B) の変更通知は共通トーストが担う。同じ文言・同じ
+                        // 表示時間の専用インジケータを並べると右上で重なるため持たない。
+                        self.draw_original_preview_indicator(
+                            ui,
+                            content_rect,
+                            state.original_preview_active,
+                        );
                         self.sync_slideshow_anchor_for_frame(ctx, fs_idx, &state);
-                        self.draw_slideshow_progress_indicator(ui, full_rect, ctx);
+                        self.draw_slideshow_progress_indicator(ui, content_rect, ctx);
                         if !state.is_video {
-                            self.draw_compare_pin_indicator(ui, full_rect, ctx);
+                            self.draw_compare_pin_indicator(ui, content_rect, ctx);
                         }
                         fs_overlay_ms = overlay_t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -13140,8 +13146,6 @@ impl App {
             } else {
                 let modulo: u8 = if self.ai_upscale_enabled { 2 } else { 3 };
                 self.fs_transparent_bg_mode = (self.fs_transparent_bg_mode + 1) % modulo;
-                self.fs_transparent_bg_indicator_until =
-                    Some(std::time::Instant::now() + std::time::Duration::from_millis(1200));
                 let label = transparent_bg_toast(self.fs_transparent_bg_mode);
                 self.show_feedback_toast(label.to_string());
                 // AI アップスケール (composite-first) では表示物が背景別の (idx,bg) 結果。
@@ -18854,7 +18858,7 @@ impl App {
     fn draw_compare_pin_indicator(
         &mut self,
         ui: &mut egui::Ui,
-        full_rect: egui::Rect,
+        content_rect: egui::Rect,
         ctx: &egui::Context,
     ) {
         let Some(display_name) = self
@@ -18879,12 +18883,12 @@ impl App {
             .painter()
             .layout_no_wrap(label, font, egui::Color32::WHITE);
         let thumb_size = egui::vec2(72.0, 54.0);
-        let width = (thumb_size.x + 10.0 + galley.size().x).min(full_rect.width() - 32.0);
+        let width = (thumb_size.x + 10.0 + galley.size().x).min(content_rect.width() - 32.0);
         let panel_size = egui::vec2(width + 16.0, thumb_size.y + 16.0);
         let panel_rect = egui::Rect::from_min_size(
             egui::pos2(
-                full_rect.max.x - panel_size.x - 18.0,
-                full_rect.max.y - panel_size.y - 18.0,
+                content_rect.max.x - panel_size.x - 18.0,
+                content_rect.max.y - panel_size.y - 18.0,
             ),
             panel_size,
         );
@@ -18959,49 +18963,12 @@ impl App {
         )
     }
 
-    /// 透過背景モードが Default 以外のとき、画面右上に現在モードを示す。
-    /// モード変更直後 (`fs_transparent_bg_indicator_until` 有効) のみ表示。
-    fn draw_fs_transparent_bg_indicator(&mut self, ui: &egui::Ui, full_rect: egui::Rect) {
-        let Some(until) = self.fs_transparent_bg_indicator_until else {
-            return;
-        };
-        let now = std::time::Instant::now();
-        if now >= until {
-            self.fs_transparent_bg_indicator_until = None;
-            return;
-        }
-        // フェードアウト: 最後 400ms で alpha を下げる
-        let remaining = until.saturating_duration_since(now);
-        let alpha_f = (remaining.as_millis().min(400) as f32) / 400.0;
-        let alpha = (alpha_f * 220.0) as u8;
-        // 3 モード循環 (テーマ非依存): ビューポート既定の黒 (0) / 白 (1) / 市松 (2)。
-        let label = match self.fs_transparent_bg_mode {
-            1 => "背景: 白",
-            2 => "背景: 市松",
-            _ => "背景: 黒",
-        };
-        let painter = ui.painter();
-        let font = egui::FontId::proportional(14.0);
-        let galley = painter.layout_no_wrap(
-            label.to_string(),
-            font,
-            egui::Color32::from_white_alpha(alpha),
-        );
-        let pos = egui::pos2(
-            full_rect.max.x - galley.size().x - 16.0,
-            full_rect.min.y + 12.0,
-        );
-        let bg = egui::Rect::from_min_size(pos, galley.size()).expand(6.0);
-        painter.rect_filled(
-            bg,
-            4.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, alpha.saturating_sub(40)),
-        );
-        painter.galley(pos, galley, egui::Color32::from_white_alpha(alpha));
-        ui.ctx().request_repaint(); // フェードを継続
-    }
-
-    fn draw_original_preview_indicator(&self, ui: &egui::Ui, full_rect: egui::Rect, active: bool) {
+    fn draw_original_preview_indicator(
+        &self,
+        ui: &egui::Ui,
+        content_rect: egui::Rect,
+        active: bool,
+    ) {
         if !active {
             return;
         }
@@ -19013,7 +18980,7 @@ impl App {
         let painter = ui.painter();
         let font = egui::FontId::proportional(14.0);
         let galley = painter.layout_no_wrap(label.to_string(), font, egui::Color32::WHITE);
-        let pos = egui::pos2(full_rect.min.x + 16.0, full_rect.min.y + 12.0);
+        let pos = egui::pos2(content_rect.min.x + 16.0, content_rect.min.y + 12.0);
         let bg = egui::Rect::from_min_size(pos, galley.size()).expand(6.0);
         painter.rect_filled(bg, 4.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190));
         painter.galley(pos, galley, egui::Color32::WHITE);
@@ -19023,7 +18990,7 @@ impl App {
     fn draw_slideshow_progress_indicator(
         &self,
         ui: &egui::Ui,
-        full_rect: egui::Rect,
+        content_rect: egui::Rect,
         ctx: &egui::Context,
     ) {
         if !self.slideshow_playing {
@@ -19050,7 +19017,7 @@ impl App {
         };
 
         let painter = ui.painter();
-        let center = egui::pos2(full_rect.max.x - 22.0, full_rect.min.y + 22.0);
+        let center = egui::pos2(content_rect.max.x - 22.0, content_rect.min.y + 22.0);
         let radius = 8.0;
         painter.circle_stroke(
             center,
