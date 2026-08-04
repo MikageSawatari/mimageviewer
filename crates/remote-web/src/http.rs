@@ -757,6 +757,7 @@ fn ai_ipc_error_response(failure: crate::ipc_client::ClientFailure) -> HttpRespo
                 RemoteAiJobErrorCode::BadRequest => 400,
                 RemoteAiJobErrorCode::StartExpired => 504,
                 RemoteAiJobErrorCode::SessionClosing | RemoteAiJobErrorCode::NotReady => 409,
+                RemoteAiJobErrorCode::PageNotApplicable => 422,
                 RemoteAiJobErrorCode::NotFound | RemoteAiJobErrorCode::Forbidden => 404,
                 RemoteAiJobErrorCode::JobGone => 410,
                 RemoteAiJobErrorCode::PageOutOfRange => 416,
@@ -817,6 +818,7 @@ fn remote_ai_job_error_name(code: RemoteAiJobErrorCode) -> &'static str {
         RemoteAiJobErrorCode::Forbidden => "forbidden",
         RemoteAiJobErrorCode::JobGone => "job_gone",
         RemoteAiJobErrorCode::NotReady => "not_ready",
+        RemoteAiJobErrorCode::PageNotApplicable => "page_not_applicable",
         RemoteAiJobErrorCode::PageOutOfRange => "page_out_of_range",
         RemoteAiJobErrorCode::Internal => "internal",
     }
@@ -4165,6 +4167,11 @@ mod tests {
             (RemoteAiJobErrorCode::StartExpired, 504, "start_expired"),
             (RemoteAiJobErrorCode::SessionClosing, 409, "session_closing"),
             (RemoteAiJobErrorCode::NotReady, 409, "not_ready"),
+            (
+                RemoteAiJobErrorCode::PageNotApplicable,
+                422,
+                "page_not_applicable",
+            ),
             (RemoteAiJobErrorCode::NotFound, 404, "not_found"),
             (RemoteAiJobErrorCode::Forbidden, 404, "forbidden"),
             (RemoteAiJobErrorCode::JobGone, 410, "job_gone"),

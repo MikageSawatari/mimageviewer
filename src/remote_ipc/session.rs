@@ -2122,6 +2122,7 @@ mod tests {
                     midtone: 0.9,
                     auto_mode: None,
                     colorize: mimageviewer_ipc::RemoteColorizeParams::default(),
+                    ai: None,
                 },
             },
             RemoteWriteRequest::GetAdjustmentState { address: page },

@@ -32,6 +32,10 @@ pub(crate) fn remote_adjustment_values(
             }
         }),
         colorize: remote_colorize_params(&params.colorize),
+        ai: Some(mimageviewer_ipc::RemoteAiAdjustmentValues {
+            upscale_model: params.upscale_model.clone(),
+            denoise_model: params.denoise_model.clone(),
+        }),
     }
 }
 
@@ -196,6 +200,23 @@ pub(crate) fn apply_remote_adjustment_values(
         tone_radius: colorize.tone_radius,
         tone_strength: colorize.tone_strength,
     };
+    if let Some(ai) = values.ai.as_ref() {
+        if let Some(key) = ai.upscale_model.as_deref()
+            && key != "auto"
+            && !crate::ai::ModelKind::from_str(key)
+                .is_some_and(|model| crate::ai::ModelKind::upscale_models().contains(&model))
+        {
+            return Err("AI アップスケールの選択値が不正です");
+        }
+        if let Some(key) = ai.denoise_model.as_deref()
+            && !crate::ai::ModelKind::from_str(key)
+                .is_some_and(|model| crate::ai::ModelKind::denoise_models().contains(&model))
+        {
+            return Err("AI デノイズの選択値が不正です");
+        }
+        params.upscale_model = ai.upscale_model.clone();
+        params.denoise_model = ai.denoise_model.clone();
+    }
     Ok(params)
 }
 
@@ -244,8 +265,14 @@ mod adjustment_value_tests {
 
         let applied = apply_remote_adjustment_values(base.clone(), &values).unwrap();
 
-        assert_eq!(applied.upscale_model, base.upscale_model);
-        assert_eq!(applied.denoise_model, base.denoise_model);
+        assert_eq!(
+            applied.upscale_model,
+            values.ai.as_ref().unwrap().upscale_model
+        );
+        assert_eq!(
+            applied.denoise_model,
+            values.ai.as_ref().unwrap().denoise_model
+        );
         assert_eq!(remote_colorize_params(&applied.colorize), values.colorize);
         assert_eq!(applied.smart_sharpen, base.smart_sharpen);
         assert_eq!(remote_adjustment_values(&applied), values);
@@ -255,6 +282,31 @@ mod adjustment_value_tests {
     fn remote_immediate_overlay_rejects_non_finite_values() {
         let mut values = remote_adjustment_values(&crate::adjustment::AdjustParams::default());
         values.gamma = f32::NAN;
+        assert!(apply_remote_adjustment_values(Default::default(), &values).is_err());
+    }
+
+    #[test]
+    fn missing_remote_ai_values_preserve_saved_models() {
+        let base = crate::adjustment::AdjustParams {
+            upscale_model: Some("auto".to_owned()),
+            denoise_model: Some("denoise_realplksr".to_owned()),
+            ..Default::default()
+        };
+        let mut values = remote_adjustment_values(&base);
+        values.ai = None;
+        let applied = apply_remote_adjustment_values(base.clone(), &values).unwrap();
+        assert_eq!(applied.upscale_model, base.upscale_model);
+        assert_eq!(applied.denoise_model, base.denoise_model);
+    }
+
+    #[test]
+    fn remote_ai_values_reject_unknown_or_wrong_kind_models() {
+        let mut values = remote_adjustment_values(&crate::adjustment::AdjustParams::default());
+        values.ai.as_mut().unwrap().upscale_model = Some("denoise_realplksr".to_owned());
+        assert!(apply_remote_adjustment_values(Default::default(), &values).is_err());
+
+        values.ai.as_mut().unwrap().upscale_model = Some("realcugan_4x".to_owned());
+        values.ai.as_mut().unwrap().denoise_model = Some("realcugan_4x".to_owned());
         assert!(apply_remote_adjustment_values(Default::default(), &values).is_err());
     }
 

@@ -82,6 +82,16 @@ const PAGE_RESOURCE_CACHE_LIMIT = 12;
 const PAGE_RESOURCE_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const SESSION_PING_INTERVAL_MS = 30_000;
 const READING_PROGRESS_INTERVAL_MS = 30_000;
+const AI_FOREGROUND_POLL_MS = 500;
+const AI_RETRY_DELAYS_MS = Object.freeze([1000, 2000, 5000]);
+const AI_TERMINAL_STATES = new Set([
+  "ready",
+  "superseded",
+  "cancelled_by_user",
+  "discarded_by_host",
+  "background_expired",
+  "failed",
+]);
 const RUNTIME_TEST_MODE = globalThis.__MIV_RUNTIME_TEST_MODE__ === true;
 const REMOTE_CLIENT_ID = loadRemoteClientId();
 const LOCAL_SETTINGS_LOAD = loadLocalSettings();
@@ -375,6 +385,7 @@ const state = {
   thumbnailTracker: null,
   viewer: null,
   commandMenu: null,
+  remoteAiController: null,
   thumbnailNotice: null,
   screenContext: "loading",
   gridIndex: 0,
@@ -421,11 +432,16 @@ if (!RUNTIME_TEST_MODE) {
     hudElement.hidden = true;
   }
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && state.authenticated) {
+    if (document.visibilityState !== "visible") {
+      state.remoteAiController?.suspend();
+    } else if (state.authenticated) {
       acquireRemoteSession("visibility_resume")
-        .then(() => state.viewer?.isVideoStreamViewer
-          ? state.viewer.handleVisibilityResume()
-          : undefined)
+        .then(() => {
+          if (state.viewer?.isVideoStreamViewer) {
+            return state.viewer.handleVisibilityResume();
+          }
+          return state.remoteAiController?.handleForegroundResume();
+        })
         .catch(() => {});
     }
   });
@@ -1565,6 +1581,8 @@ function cleanupScreen(preserveRequestController = null) {
   state.gestureHelpDialog?.destroy();
   state.gestureHelpDialog = null;
   state.viewerTapSequence = null;
+  state.remoteAiController?.destroy();
+  state.remoteAiController = null;
   state.viewer?.destroy();
   state.viewer = null;
   state.screenContext = "loading";
@@ -3049,6 +3067,7 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
     loadingIndicator,
     boundaryMessage,
   });
+  state.remoteAiController = new RemoteAiController(state.viewer, stage);
   close.addEventListener("click", (event) => {
     event.stopPropagation();
     dispatchCommand(command(CommandName.BACK), {
@@ -3191,6 +3210,13 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
     interactionStartedAt,
   });
   if (!displayed || state.viewer !== viewer) return;
+  state.remoteAiController?.displayGroup(
+    pages.map(({ entry, request }) => ({
+      address: entryAddress(entry),
+      target_px: request.width,
+      name: entry.name,
+    }))
+  ).catch((error) => state.remoteAiController?.showRequestError(error));
   state.commandMenu?.refreshAdjustment();
   observeReadingProgress();
   if (group.entries.every((entry) => entry.address)) {
@@ -4361,6 +4387,16 @@ export function normalizeRemoteColorizeParams(values = {}) {
 
 export function normalizeRemoteAdjustmentValues(values = {}) {
   const source = { ...DEFAULT_REMOTE_ADJUSTMENT_VALUES, ...values };
+  const ai = source.ai && typeof source.ai === "object"
+    ? {
+        upscale_model: typeof source.ai.upscale_model === "string"
+          ? source.ai.upscale_model
+          : null,
+        denoise_model: typeof source.ai.denoise_model === "string"
+          ? source.ai.denoise_model
+          : null,
+      }
+    : null;
   return {
     brightness: Number(source.brightness) || 0,
     contrast: Number(source.contrast) || 0,
@@ -4374,6 +4410,7 @@ export function normalizeRemoteAdjustmentValues(values = {}) {
       ? source.auto_mode
       : null,
     colorize: normalizeRemoteColorizeParams(source.colorize),
+    ai,
   };
 }
 
@@ -4817,14 +4854,36 @@ class ViewerAdjustmentPanel {
     );
     this.colorizeSection.append(this.colorizePresetSection);
 
-    this.readOnly = element("div", "adjustment-read-only");
+    this.aiSection = element("section", "adjustment-ai");
+    this.aiSection.append(textElement("h3", "AI 処理"));
+    this.aiSelects = new Map();
+    for (const [key, label] of [
+      ["upscale_model", "AI アップスケール"],
+      ["denoise_model", "AI デノイズ"],
+    ]) {
+      const row = element("label", "adjustment-option-row");
+      row.append(textElement("span", label));
+      const select = document.createElement("select");
+      select.addEventListener("change", () => {
+        this.values.ai ??= { upscale_model: null, denoise_model: null };
+        this.values.ai[key] = select.value || null;
+        this.commitCurrent().catch((error) => this.showError(error));
+      });
+      row.append(select);
+      this.aiSection.append(row);
+      this.aiSelects.set(key, select);
+    }
+    this.aiAvailability = textElement("p", "", "adjustment-colorize-note");
+    this.aiSection.append(this.aiAvailability);
     this.resetButton = textElement("button", "即時補正をリセット", "adjustment-reset");
     this.resetButton.type = "button";
     this.resetButton.addEventListener("click", () => {
       const colorize = this.values.colorize;
+      const ai = this.values.ai;
       this.values = normalizeRemoteAdjustmentValues({
         ...DEFAULT_REMOTE_ADJUSTMENT_VALUES,
         colorize,
+        ai,
       });
       this.syncControls();
       this.setDisabled(false);
@@ -4837,7 +4896,7 @@ class ViewerAdjustmentPanel {
       autoRow,
       this.sliderList,
       this.colorizeSection,
-      this.readOnly,
+      this.aiSection,
       this.resetButton,
       this.status
     );
@@ -5105,12 +5164,10 @@ class ViewerAdjustmentPanel {
     standard.text.textContent = adjustmentState.standard_label || "標準";
     standard.input.disabled = !adjustmentState.standard_available;
     this.scopeInputs.get(this.scope).input.checked = true;
-    const readOnly = adjustmentState.read_only ?? {};
-    this.readOnly.replaceChildren(
-      textElement("strong", "現在の AI 処理"),
-      textElement("span", `AI アップスケール: ${readOnly.upscale_label || "なし"}`),
-      textElement("span", `AI デノイズ: ${readOnly.denoise_label || "なし"}`)
-    );
+    this.syncAiControls(adjustmentState.ai_model_catalog);
+    this.aiAvailability.textContent = adjustmentState.effective_ai_enabled
+      ? "この設定では、表示時に AI 処理を行います。"
+      : "この設定では、表示時に AI 処理を行いません。";
     this.syncControls();
     this.setDisabled(false);
   }
@@ -5286,6 +5343,32 @@ class ViewerAdjustmentPanel {
     this.autoSelect.value = this.values.auto_mode ?? "";
     for (const [scope, value] of this.scopeInputs) value.input.checked = scope === this.scope;
     this.syncColorizeControls();
+    this.syncAiControls(this.serverState?.ai_model_catalog);
+  }
+
+  syncAiControls(catalog = {}) {
+    const selected = this.values.ai ?? { upscale_model: null, denoise_model: null };
+    for (const [key, select] of this.aiSelects ?? []) {
+      const catalogKey = key === "upscale_model" ? "upscale" : "denoise";
+      const entries = Array.isArray(catalog?.[catalogKey]) ? catalog[catalogKey] : [];
+      const selectedKey = selected[key] ?? "";
+      const options = entries.map((entry) => {
+        const option = document.createElement("option");
+        option.value = entry.key ?? "";
+        option.textContent = entry.label || "なし";
+        option.disabled = entry.selectable === false;
+        return option;
+      });
+      if (!options.some((option) => option.value === selectedKey)) {
+        const fallback = document.createElement("option");
+        fallback.value = selectedKey;
+        fallback.textContent = selectedKey ? "現在の設定" : "なし";
+        fallback.disabled = true;
+        options.push(fallback);
+      }
+      select.replaceChildren(...options);
+      select.value = selectedKey;
+    }
   }
 
   syncTargetButtons() {
@@ -5315,6 +5398,7 @@ class ViewerAdjustmentPanel {
       button.disabled = disabled || this.colorizePresetSlots[index] === null;
     });
     this.autoSelect.disabled = disabled;
+    for (const select of this.aiSelects.values()) select.disabled = disabled;
     this.resetButton.disabled = disabled;
     for (const [scope, value] of this.scopeInputs) {
       value.input.disabled = disabled || (scope === "standard" && this.serverState?.standard_available === false);
@@ -5942,6 +6026,359 @@ class LocalSettingsDialog {
   }
 }
 
+const REMOTE_AI_PHASE_LABELS = Object.freeze({
+  // 接続を取ったとき PC 側に処理が残っていると、それが終わるまで始められない。
+  // 待ちが数秒続き得るので、他の phase と同じ「準備しています」に丸めず理由を出す。
+  waiting_for_local_drain: "PC 側の処理を待っています",
+  preparing_source: "画像を準備しています",
+  loading_model: "準備しています",
+  denoising: "ノイズを除去しています",
+  upscaling: "拡大しています",
+  finalizing: "表示を整えています",
+  cancelling: "取り消しています",
+});
+
+export function remoteAiProgressText(snapshot) {
+  const progress = snapshot?.progress;
+  if (!progress) return "AI 処理を進めています";
+  const parts = [REMOTE_AI_PHASE_LABELS[progress.phase] || "AI 処理を進めています"];
+  const pageCount = Math.max(1, Number(progress.page_count) || Number(snapshot.page_count) || 1);
+  const pageIndex = Math.min(pageCount - 1, Math.max(0, Number(progress.page_index) || 0));
+  if (pageCount > 1) parts.push(`ページ ${pageIndex + 1} / ${pageCount}`);
+  const stageCount = Math.max(1, Number(progress.stage_count) || 1);
+  const stageIndex = Math.min(stageCount - 1, Math.max(0, Number(progress.stage_index) || 0));
+  if (stageCount > 1) parts.push(`処理 ${stageIndex + 1} / ${stageCount}`);
+  const completed = Number(progress.completed_tiles);
+  const total = Number(progress.total_tiles);
+  if (Number.isInteger(completed) && Number.isInteger(total) && total > 0) {
+    parts.push(`進み具合 ${Math.min(completed, total)} / ${total}`);
+  }
+  return parts.join(" · ");
+}
+
+export function remoteAiPollingDelay({ visibilityState, terminal, failureCount = null }) {
+  if (visibilityState === "hidden" || terminal) return null;
+  if (failureCount === null) return AI_FOREGROUND_POLL_MS;
+  return AI_RETRY_DELAYS_MS[
+    Math.min(Math.max(0, Number(failureCount) || 0), AI_RETRY_DELAYS_MS.length - 1)
+  ];
+}
+
+function remoteAiGroupHash(pages, revision = state.pageRenderRevision) {
+  const source = `${revision}\n${pages.map((page) =>
+    `${addressIdentity(page.address)}\n${Math.max(1, Number(page.target_px) || 1)}`
+  ).join("\n---\n")}`;
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  for (let index = 0; index < source.length; index += 1) {
+    const code = source.charCodeAt(index);
+    first = Math.imul(first ^ code, 0x01000193) >>> 0;
+    second = Math.imul(second ^ code, 0x85ebca6b) >>> 0;
+  }
+  return `${first.toString(16).padStart(8, "0")}${second.toString(16).padStart(8, "0")}`;
+}
+
+export function selectRecoverableRemoteAiJob(jobs, groupHash, requestId = null) {
+  const candidates = Array.isArray(jobs) ? jobs : [];
+  if (requestId) {
+    const exact = candidates.find((job) => job?.request_id === requestId);
+    if (exact) return exact;
+  }
+  const prefix = `miv-ai:${groupHash}:`;
+  return candidates
+    .filter((job) =>
+      typeof job?.request_id === "string" &&
+      job.request_id.startsWith(prefix) &&
+      job.state !== "cancelling" &&
+      !AI_TERMINAL_STATES.has(job.state)
+    )
+    .sort((left, right) => Number(right.created_unix_ms) - Number(left.created_unix_ms))[0] ?? null;
+}
+
+function createRemoteAiRequestId(groupHash) {
+  const unique = globalThis.crypto?.randomUUID?.() ??
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return `miv-ai:${groupHash}:${unique}`;
+}
+
+export class RemoteAiController {
+  constructor(viewer, stage) {
+    this.viewer = viewer;
+    this.stage = stage;
+    this.pages = [];
+    this.groupHash = "";
+    this.requestId = null;
+    this.job = null;
+    this.generation = 0;
+    this.displayVersion = 0;
+    this.appliedIdentity = "";
+    this.pollTimer = 0;
+    this.hideTimer = 0;
+    this.retryIndex = 0;
+    this.destroyed = false;
+
+    this.root = element("div", "viewer-ai-status");
+    this.root.hidden = true;
+    this.root.setAttribute("role", "status");
+    this.root.setAttribute("aria-live", "polite");
+    this.message = textElement("span", "");
+    this.cancelButton = textElement("button", "取り消す");
+    this.cancelButton.type = "button";
+    this.cancelButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      this.cancel().catch((error) => this.showRequestError(error));
+    });
+    this.root.append(this.message, this.cancelButton);
+    viewer.root.append(this.root);
+  }
+
+  async displayGroup(pages) {
+    const normalized = pages
+      .filter((page) => page?.address)
+      .map((page) => ({
+        address: page.address,
+        target_px: Math.max(1, Math.round(Number(page.target_px) || 1)),
+        name: String(page.name || "画像"),
+      }));
+    if (!normalized.length || normalized.length > 2) return;
+    const groupHash = remoteAiGroupHash(normalized);
+    this.displayVersion += 1;
+    this.clearPoll();
+    if (groupHash === this.groupHash && this.job) {
+      this.pages = normalized;
+      await this.handleSnapshot(this.job, this.generation);
+      return;
+    }
+    const generation = ++this.generation;
+    this.pages = normalized;
+    this.groupHash = groupHash;
+    this.requestId = null;
+    this.job = null;
+    this.appliedIdentity = "";
+    this.hide();
+    if (document.visibilityState === "hidden") return;
+    if (await this.recoverCurrent(generation)) return;
+    await this.startIfEnabled(generation);
+  }
+
+  async startIfEnabled(generation) {
+    const adjustmentStates = await Promise.all(this.pages.map(async (page) => {
+      const response = await apiPostJson("/api/write", {
+        kind: "get_adjustment_state",
+        address: page.address,
+      });
+      return response.adjustment_state;
+    }));
+    if (!this.isCurrent(generation)) return;
+    if (!adjustmentStates.some((adjustment) => adjustment?.effective_ai_enabled === true)) {
+      this.hide();
+      return;
+    }
+    this.requestId = createRemoteAiRequestId(this.groupHash);
+    this.show("準備しています", { cancellable: true });
+    const snapshot = await apiPostJson("/api/ai/jobs", {
+      request_id: this.requestId,
+      pages: this.pages.map(({ address, target_px }) => ({ address, target_px })),
+    });
+    if (!this.isCurrent(generation)) return;
+    await this.handleSnapshot(snapshot, generation);
+  }
+
+  async recoverCurrent(generation = this.generation) {
+    const jobs = await apiJson("/api/ai/jobs", { recoverable: 1 });
+    if (!this.isCurrent(generation)) return false;
+    const recovered = selectRecoverableRemoteAiJob(jobs, this.groupHash, this.requestId);
+    if (!recovered || Number(recovered.page_count) !== this.pages.length) return false;
+    this.requestId = recovered.request_id;
+    await this.handleSnapshot(recovered, generation);
+    return true;
+  }
+
+  async handleForegroundResume() {
+    if (this.destroyed || !this.pages.length) return;
+    this.clearPoll();
+    const generation = this.generation;
+    try {
+      if (await this.recoverCurrent(generation)) return;
+      await this.startIfEnabled(generation);
+    } catch (error) {
+      if (this.isCurrent(generation)) this.retryAfterFailure(error, generation);
+    }
+  }
+
+  suspend() {
+    this.clearPoll();
+  }
+
+  async poll(generation = this.generation) {
+    if (!this.isCurrent(generation) || document.visibilityState === "hidden" || !this.job) return;
+    try {
+      const snapshot = await apiJson(`/api/ai/jobs/${encodeURIComponent(this.job.job_id)}`);
+      if (!this.isCurrent(generation)) return;
+      this.retryIndex = 0;
+      await this.handleSnapshot(snapshot, generation);
+    } catch (error) {
+      if (this.isCurrent(generation)) this.retryAfterFailure(error, generation);
+    }
+  }
+
+  retryAfterFailure(error, generation) {
+    if (error instanceof AuthenticationRequiredError) return;
+    this.show("接続を確認しています", { cancellable: Boolean(this.job) });
+    const delay = remoteAiPollingDelay({
+      visibilityState: document.visibilityState,
+      terminal: false,
+      failureCount: this.retryIndex,
+    });
+    this.retryIndex += 1;
+    if (delay !== null) this.schedulePoll(delay, generation);
+  }
+
+  async handleSnapshot(snapshot, generation) {
+    if (!this.isCurrent(generation) || !snapshot?.job_id) return;
+    this.job = snapshot;
+    this.requestId = snapshot.request_id;
+    if (!AI_TERMINAL_STATES.has(snapshot.state)) {
+      this.show(remoteAiProgressText(snapshot), { cancellable: snapshot.state !== "cancelling" });
+      const delay = remoteAiPollingDelay({
+        visibilityState: document.visibilityState,
+        terminal: false,
+      });
+      if (delay !== null) this.schedulePoll(delay, generation);
+      return;
+    }
+    this.clearPoll();
+    if (snapshot.state === "ready") {
+      await this.applyReady(snapshot, generation);
+      return;
+    }
+    const message = snapshot.terminal?.message || "AI 処理を完了できませんでした。";
+    this.show(message, { error: snapshot.state === "failed", cancellable: false });
+  }
+
+  async applyReady(snapshot, generation) {
+    const ready = (snapshot.page_outcomes ?? [])
+      .filter((outcome) => outcome.state === "ready")
+      .map((outcome) => Number(outcome.page_index))
+      .filter((index) => Number.isInteger(index) && index >= 0 && index < this.pages.length);
+    const notApplicable = (snapshot.page_outcomes ?? [])
+      .filter((outcome) => outcome.state === "not_applicable");
+    if (!ready.length) {
+      const details = notApplicable
+        .map((outcome) => outcome.terminal?.message)
+        .filter(Boolean);
+      this.show(details.join(" / ") || "この画像では AI 処理を使いません。", {
+        cancellable: false,
+      });
+      return;
+    }
+    const appliedIdentity = `${snapshot.job_id}:${this.displayVersion}`;
+    if (this.appliedIdentity === appliedIdentity) {
+      this.show(notApplicable.length
+        ? "AI 処理が完了しました。一部のページは元の表示です。"
+        : "AI 処理が完了しました。", { cancellable: false, hideAfterMs: 2400 });
+      return;
+    }
+    this.show("表示を整えています", { cancellable: false });
+    const replacements = await Promise.all(ready.map(async (pageIndex) => {
+      const response = await observedFetch(
+        `/api/ai/jobs/${encodeURIComponent(snapshot.job_id)}/result?page=${pageIndex}`,
+        { credentials: "same-origin", headers: { Accept: "image/webp" } }
+      );
+      if (!response.ok) {
+        const detail = await response.clone().json().catch(() => ({}));
+        throw new Error(detail.message || "AI 処理後の画像を取得できませんでした。");
+      }
+      return {
+        pageIndex,
+        blob: await response.blob(),
+        alt: this.pages[pageIndex]?.name || "AI 処理後の画像",
+      };
+    }));
+    if (!this.isCurrent(generation) || this.job?.job_id !== snapshot.job_id) return;
+    const replaced = await this.viewer.replacePageBlobs(replacements);
+    if (!replaced || !this.isCurrent(generation)) return;
+    this.appliedIdentity = appliedIdentity;
+    this.show(notApplicable.length
+      ? "AI 処理が完了しました。一部のページは元の表示です。"
+      : "AI 処理が完了しました。", { cancellable: false, hideAfterMs: 2400 });
+  }
+
+  async cancel() {
+    const job = this.job;
+    if (!job || AI_TERMINAL_STATES.has(job.state)) return;
+    this.show("取り消しています", { cancellable: false });
+    const response = await observedFetch(
+      `/api/ai/jobs/${encodeURIComponent(job.job_id)}`,
+      { method: "DELETE", credentials: "same-origin", headers: { Accept: "application/json" } }
+    );
+    if (!response.ok) {
+      const detail = await response.clone().json().catch(() => ({}));
+      throw new Error(detail.message || "AI 処理を取り消せませんでした。");
+    }
+    await this.handleSnapshot(await response.json(), this.generation);
+  }
+
+  showRequestError(_error) {
+    this.show("AI 処理を開始できませんでした。", { error: true, cancellable: false });
+  }
+
+  show(message, { error = false, cancellable = false, hideAfterMs = 0 } = {}) {
+    clearTimeout(this.hideTimer);
+    this.hideTimer = 0;
+    this.message.textContent = message;
+    this.root.classList.toggle("is-error", error);
+    this.cancelButton.hidden = !cancellable;
+    this.root.hidden = false;
+    if (hideAfterMs > 0) {
+      this.hideTimer = window.setTimeout(() => this.hide(), hideAfterMs);
+    }
+  }
+
+  hide() {
+    clearTimeout(this.hideTimer);
+    this.hideTimer = 0;
+    this.root.hidden = true;
+    this.root.classList.remove("is-error");
+  }
+
+  schedulePoll(delay, generation) {
+    this.clearPoll();
+    if (document.visibilityState === "hidden" || !this.isCurrent(generation)) return;
+    this.pollTimer = window.setTimeout(() => {
+      this.pollTimer = 0;
+      this.poll(generation);
+    }, delay);
+  }
+
+  clearPoll() {
+    clearTimeout(this.pollTimer);
+    this.pollTimer = 0;
+  }
+
+  isCurrent(generation) {
+    return !this.destroyed && generation === this.generation;
+  }
+
+  destroy() {
+    if (this.destroyed) return;
+    const activeJobId = this.job && !AI_TERMINAL_STATES.has(this.job.state)
+      ? this.job.job_id
+      : null;
+    this.destroyed = true;
+    this.generation += 1;
+    this.clearPoll();
+    clearTimeout(this.hideTimer);
+    this.root.remove();
+    if (activeJobId) {
+      observedFetch(`/api/ai/jobs/${encodeURIComponent(activeJobId)}`, {
+        method: "DELETE",
+        credentials: "same-origin",
+      }).catch(() => {});
+    }
+  }
+}
+
 export class ImageViewer {
   constructor({
     root,
@@ -6166,35 +6603,57 @@ export class ImageViewer {
 
   /// 補正プレビューだけを差し替える。表示レイアウトとズームは維持する。
   async replacePageBlob(pageIndex, blob, alt = "画像補正プレビュー") {
-    const previous = this.images[pageIndex];
-    if (!previous || !(blob instanceof Blob)) return false;
-    const objectUrl = URL.createObjectURL(blob);
-    const image = element("img", "viewer-image");
-    image.alt = alt;
-    image.draggable = false;
-    image.dataset.telemetryObserved = "true";
-    image.style.cssText = previous.style.cssText;
-    for (const [key, value] of Object.entries(previous.dataset)) {
-      image.dataset[key] = value;
-    }
-    image.src = objectUrl;
+    return this.replacePageBlobs([{ pageIndex, blob, alt }]);
+  }
+
+  /// すべて decode できた後に一度だけ DOM を更新する。指定されていないページは保持する。
+  async replacePageBlobs(replacements) {
+    const previousImages = this.images.slice();
+    const prepared = [];
     try {
-      await image.decode();
+      for (const replacement of replacements) {
+        const pageIndex = Number(replacement.pageIndex);
+        const previous = previousImages[pageIndex];
+        if (!previous || !(replacement.blob instanceof Blob)) continue;
+        const objectUrl = URL.createObjectURL(replacement.blob);
+        const image = element("img", "viewer-image");
+        image.alt = replacement.alt || previous.alt;
+        image.draggable = false;
+        image.dataset.telemetryObserved = "true";
+        image.style.cssText = previous.style.cssText;
+        for (const [key, value] of Object.entries(previous.dataset)) {
+          image.dataset[key] = value;
+        }
+        image.src = objectUrl;
+        prepared.push({ pageIndex, image, objectUrl });
+      }
+      await Promise.all(prepared.map(({ image }) => image.decode()));
     } catch (error) {
-      URL.revokeObjectURL(objectUrl);
+      prepared.forEach(({ objectUrl }) => URL.revokeObjectURL(objectUrl));
       throw error;
     }
-    if (this.images[pageIndex] !== previous) {
-      URL.revokeObjectURL(objectUrl);
+    if (
+      !prepared.length ||
+      previousImages.length !== this.images.length ||
+      previousImages.some((image, index) => this.images[index] !== image)
+    ) {
+      prepared.forEach(({ objectUrl }) => URL.revokeObjectURL(objectUrl));
       return false;
     }
-    const previousUrl = this.objectUrls[pageIndex];
-    previous.replaceWith(image);
-    this.images[pageIndex] = image;
-    this.image = this.images[0];
-    this.objectUrls[pageIndex] = objectUrl;
-    this.objectUrl = this.images.length === 1 ? objectUrl : null;
-    if (previousUrl) URL.revokeObjectURL(previousUrl);
+    const nextImages = previousImages.slice();
+    const nextUrls = this.objectUrls.slice();
+    const replacedUrls = [];
+    for (const { pageIndex, image, objectUrl } of prepared) {
+      nextImages[pageIndex] = image;
+      if (nextUrls[pageIndex]) replacedUrls.push(nextUrls[pageIndex]);
+      nextUrls[pageIndex] = objectUrl;
+    }
+    this.pageLayer.replaceChildren(...nextImages);
+    this.images = nextImages;
+    this.image = nextImages[0];
+    this.objectUrls = nextUrls;
+    this.objectUrl = nextImages.length === 1 ? nextUrls[0] : null;
+    replacedUrls.forEach((url) => URL.revokeObjectURL(url));
     return true;
   }
 

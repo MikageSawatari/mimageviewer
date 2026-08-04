@@ -1,9 +1,10 @@
 use mimageviewer_ipc::{
-    RemoteAdjustmentReadOnlyState, RemoteAdjustmentScope, RemoteAdjustmentState, RemoteItemState,
-    RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource, RemoteWebFeatureStatus,
-    RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse,
-    RemoteWriteResult, SessionConnectionKind, SessionResponse, SessionStatus,
-    VideoStreamControlAction, VideoStreamEndBehavior, VideoStreamError, VideoStreamErrorCode,
+    RemoteAdjustmentReadOnlyState, RemoteAdjustmentScope, RemoteAdjustmentState,
+    RemoteAiModelCatalog, RemoteAiModelOption, RemoteItemState, RemoteReadingDirection,
+    RemoteSpreadMode, RemoteSubresource, RemoteWebFeatureStatus, RemoteWriteError,
+    RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult,
+    SessionConnectionKind, SessionResponse, SessionStatus, VideoStreamControlAction,
+    VideoStreamEndBehavior, VideoStreamError, VideoStreamErrorCode,
 };
 use qrcode::{Color, QrCode};
 
@@ -1555,6 +1556,7 @@ impl crate::app::App {
         let page = self.stored_page_params_for_target(target);
         let standard = self.adjustment_standard_params_for_target(target);
         let effective = page.clone().unwrap_or_else(|| standard.clone());
+        let ai_mode = self.settings.ai_feature_mode;
         let denoise_label = effective
             .denoise_model
             .as_deref()
@@ -1582,6 +1584,13 @@ impl crate::app::App {
                     .as_ref()
                     .map(super::remote_colorize_params)
             }),
+            ai_model_catalog: remote_ai_model_catalog(ai_mode),
+            effective_ai_enabled: crate::ai::final_pipeline::effective_upscale_request(
+                ai_mode, &effective,
+            )
+            .is_some()
+                || crate::ai::final_pipeline::effective_denoise_request(ai_mode, &effective)
+                    .is_some(),
             read_only: RemoteAdjustmentReadOnlyState {
                 upscale_label: crate::adjustment::upscale_model_label(
                     effective.upscale_model.as_deref(),
@@ -2032,6 +2041,35 @@ struct RemoteRatingTarget {
     xmp_target: Option<std::path::PathBuf>,
 }
 
+fn remote_ai_model_catalog(mode: crate::settings::AiFeatureMode) -> RemoteAiModelCatalog {
+    let upscale = crate::adjustment::upscale_menu_items()
+        .into_iter()
+        .map(|(label, key)| RemoteAiModelOption {
+            key: key.map(str::to_owned),
+            label: label.to_owned(),
+            selectable: match key {
+                None => true,
+                Some("auto") => !matches!(mode, crate::settings::AiFeatureMode::Disabled),
+                Some(key) => crate::ai::ModelKind::from_str(key)
+                    .is_some_and(|model| mode.allows_upscale_model(model)),
+            },
+        })
+        .collect();
+    let mut denoise = vec![RemoteAiModelOption {
+        key: None,
+        label: "なし".to_owned(),
+        selectable: true,
+    }];
+    denoise.extend(crate::ai::ModelKind::denoise_models().iter().map(|model| {
+        RemoteAiModelOption {
+            key: Some(model.as_str().to_owned()),
+            label: model.display_label().to_owned(),
+            selectable: mode.allows_denoise(),
+        }
+    }));
+    RemoteAiModelCatalog { upscale, denoise }
+}
+
 fn remote_adjustment_target(
     settings: &crate::settings::Settings,
     address: &mimageviewer_ipc::RemoteAddress,
@@ -2399,6 +2437,24 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_ai_catalog_exposes_core_labels_and_server_side_mode_permissions() {
+        let light = remote_ai_model_catalog(crate::settings::AiFeatureMode::Light);
+        assert!(light.upscale.iter().any(|entry| {
+            entry.key.as_deref() == Some("realcugan_4x")
+                && entry.label == crate::ai::ModelKind::UpscaleRealCugan4x.display_label()
+                && entry.selectable
+        }));
+        assert!(light.upscale.iter().any(|entry| {
+            entry.key.as_deref() == Some("realesrgan_x4plus") && !entry.selectable
+        }));
+        assert!(light.denoise.iter().skip(1).all(|entry| !entry.selectable));
+
+        let high = remote_ai_model_catalog(crate::settings::AiFeatureMode::HighQuality);
+        assert!(high.upscale.iter().all(|entry| entry.selectable));
+        assert!(high.denoise.iter().all(|entry| entry.selectable));
+    }
 
     #[test]
     fn remote_vst_load_budget_preserves_the_encoder_playlist_reserve() {

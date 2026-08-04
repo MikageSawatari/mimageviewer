@@ -1456,21 +1456,28 @@ impl ContainerEngine {
         cancel: &Arc<AtomicBool>,
     ) -> super::ai_job::RemoteAiExecutionOutcome {
         match self.execute_remote_ai_inner(request, progress, cancel) {
-            Ok(results) => super::ai_job::RemoteAiExecutionOutcome::Ready(results),
+            Ok(results) => super::ai_job::RemoteAiExecutionOutcome::Completed(results),
             Err(RemoteAiRunError::NotApplicable {
                 code,
                 message,
                 page_index,
-            }) => super::ai_job::RemoteAiExecutionOutcome::NotApplicable {
-                code,
-                message,
-                page_index,
-            },
+            }) => super::ai_job::RemoteAiExecutionOutcome::Failed(format!(
+                "page-local NotApplicable escaped aggregation at page {page_index}: {code:?}: {message}"
+            )),
             Err(RemoteAiRunError::Superseded(message)) => {
-                super::ai_job::RemoteAiExecutionOutcome::Superseded(message)
+                crate::logger::log(format!(
+                    "remote_ipc: remote AI result rejected as stale: {message}"
+                ));
+                super::ai_job::RemoteAiExecutionOutcome::Superseded(
+                    "表示中の画像または設定が変わったため、AI 処理結果を使用しませんでした"
+                        .to_owned(),
+                )
             }
             Err(RemoteAiRunError::Failed(message)) => {
-                super::ai_job::RemoteAiExecutionOutcome::Failed(message)
+                crate::logger::log(format!("remote_ipc: remote AI execution failed: {message}"));
+                super::ai_job::RemoteAiExecutionOutcome::Failed(
+                    "AI 処理を完了できませんでした".to_owned(),
+                )
             }
         }
     }
@@ -1480,7 +1487,7 @@ impl ContainerEngine {
         request: &RemoteAiStartRequest,
         progress: &dyn super::ai_job::RemoteAiProgressSink,
         cancel: &Arc<AtomicBool>,
-    ) -> Result<Vec<PagePayload>, RemoteAiRunError> {
+    ) -> Result<Vec<super::ai_job::RemoteAiPageExecutionOutcome>, RemoteAiRunError> {
         self.execute_remote_ai_inner_with(
             request,
             progress,
@@ -1532,13 +1539,17 @@ impl ContainerEngine {
         )
             -> Result<(Arc<egui::ColorImage>, [usize; 2]), RemoteAiRunError>,
         resources_for_remote: &dyn Fn(&Self) -> Option<super::session::RemoteAiResources>,
-    ) -> Result<Vec<PagePayload>, RemoteAiRunError> {
+    ) -> Result<Vec<super::ai_job::RemoteAiPageExecutionOutcome>, RemoteAiRunError> {
         let context = WorkerContext::open();
         let page_count = request.pages.len();
         let mut results = Vec::with_capacity(page_count);
         let mut identities = Vec::with_capacity(page_count);
 
         for (page_index, page) in request.pages.iter().enumerate() {
+            let page_result = (|| -> Result<
+                (PagePayload, (RemoteAddress, u32, RemoteAiResultIdentity)),
+                RemoteAiRunError,
+            > {
             check_remote_ai_cancel(cancel)?;
             progress.update(
                 mimageviewer_ipc::RemoteAiJobState::PreparingSource,
@@ -1595,12 +1606,13 @@ impl ContainerEngine {
             )
             .ok_or_else(|| RemoteAiRunError::NotApplicable {
                 code: RemoteAiTerminalCode::SizeGate,
-                message: "AI is disabled or the source is outside the configured size gate"
+                message: "AI が無効か、元画像が設定された処理サイズ上限の対象外です"
                     .to_owned(),
                 page_index,
             })?;
-            // Animated/vector/size-gated sources terminate above without initializing or loading
-            // the shared runtime. Only an applicable final-AI request claims the bridge.
+            // Animated/vector/size-gated pages become page-local NotApplicable outcomes above
+            // without initializing or loading the shared runtime. Remaining pages continue, and
+            // only an applicable final-AI request claims the bridge.
             let resources = resources_for_remote(self)
                 .ok_or_else(|| RemoteAiRunError::Failed("AI runtime is unavailable".to_owned()))?;
 
@@ -1736,19 +1748,38 @@ impl ContainerEngine {
             let (bytes, width, height) =
                 crate::catalog::encode_thumb_webp(&image.image, page.target_px, PAGE_WEBP_QUALITY)
                     .ok_or_else(|| RemoteAiRunError::Failed("WebP encoding failed".to_owned()))?;
-            results.push(PagePayload {
-                bytes,
-                content_type: "image/webp".to_owned(),
-                width,
-                height,
-            });
-            identities.push((
-                page.address.clone(),
-                page.target_px,
-                RemoteAiResultIdentity::from_prepared(&prepared, resources.background_mode),
-            ));
+            Ok((
+                PagePayload {
+                    bytes,
+                    content_type: "image/webp".to_owned(),
+                    width,
+                    height,
+                },
+                (
+                    page.address.clone(),
+                    page.target_px,
+                    RemoteAiResultIdentity::from_prepared(&prepared, resources.background_mode),
+                ),
+            ))
+            })();
+            match page_result {
+                Ok((payload, identity)) => {
+                    results.push(super::ai_job::RemoteAiPageExecutionOutcome::Ready(payload));
+                    identities.push(identity);
+                }
+                Err(RemoteAiRunError::NotApplicable { code, message, .. }) => {
+                    results.push(super::ai_job::RemoteAiPageExecutionOutcome::NotApplicable {
+                        code,
+                        message,
+                    });
+                }
+                Err(error) => return Err(error),
+            }
         }
 
+        if identities.is_empty() {
+            return Ok(results);
+        }
         // Result bytes are publishable only if source/edit/settings still match the snapshots
         // that produced them. Re-open worker DB handles so this is a true completion-time read.
         let validation_context = WorkerContext::open();
@@ -1836,7 +1867,7 @@ impl ContainerEngine {
                 ) {
                     return Err(RemoteAiRunError::NotApplicable {
                         code: RemoteAiTerminalCode::VectorPdf,
-                        message: "vector PDF pages are not AI raster sources".to_owned(),
+                        message: "ベクター PDF ページは AI 静止画処理の対象外です".to_owned(),
                         page_index,
                     });
                 }
@@ -1855,7 +1886,9 @@ impl ContainerEngine {
                     crate::pdf_loader::CanonicalPdfPage::Vector => {
                         Err(RemoteAiRunError::NotApplicable {
                             code: RemoteAiTerminalCode::VectorPdf,
-                            message: "PDF page became vector during canonical render".to_owned(),
+                            message:
+                                "PDF ページがベクターとして判定されたため AI 静止画処理の対象外です"
+                                    .to_owned(),
                             page_index,
                         })
                     }
@@ -2910,6 +2943,7 @@ fn execute_remote_composite(
     }
 }
 
+#[derive(Debug)]
 enum RemoteAiRunError {
     NotApplicable {
         code: RemoteAiTerminalCode,
@@ -3071,18 +3105,18 @@ fn decode_remote_ai_canonical(
         crate::canonical_image_loader::CanonicalImageDecode::Animated { format, .. } => {
             let (code, label) = match format {
                 crate::canonical_image_loader::CanonicalAnimatedFormat::Gif => {
-                    (RemoteAiTerminalCode::AnimatedGif, "animated GIF")
+                    (RemoteAiTerminalCode::AnimatedGif, "アニメーション GIF")
                 }
                 crate::canonical_image_loader::CanonicalAnimatedFormat::Apng => {
-                    (RemoteAiTerminalCode::AnimatedApng, "animated PNG")
+                    (RemoteAiTerminalCode::AnimatedApng, "アニメーション PNG")
                 }
                 crate::canonical_image_loader::CanonicalAnimatedFormat::WebP => {
-                    (RemoteAiTerminalCode::AnimatedWebp, "animated WebP")
+                    (RemoteAiTerminalCode::AnimatedWebp, "アニメーション WebP")
                 }
             };
             Err(RemoteAiRunError::NotApplicable {
                 code,
-                message: format!("{label} is not an AI still-image source"),
+                message: format!("{label} は AI 静止画処理の対象外です"),
                 page_index,
             })
         }
@@ -3700,64 +3734,38 @@ mod tests {
             }
         };
 
-        let vector = remote_ai_test_request(RemoteAddress {
+        let mut mixed = remote_ai_test_request(RemoteAddress {
             favorite_id: favorite.id.to_string(),
             relative_path: "vector.pdf".to_owned(),
             subresource: RemoteSubresource::PdfPage { page_number: 0 },
         });
-        let vector_result = engine.execute_remote_ai_inner_with(
-            &vector,
-            &NoRemoteAiProgress,
-            &cancel,
-            &prepare,
-            &decode,
-            &resources,
-        );
-        match vector_result {
-            Err(RemoteAiRunError::NotApplicable {
-                code: RemoteAiTerminalCode::VectorPdf,
-                page_index: 0,
-                ..
-            }) => {}
-            Err(RemoteAiRunError::NotApplicable { code, message, .. }) => {
-                panic!("unexpected vector terminal {code:?}: {message}");
-            }
-            Err(RemoteAiRunError::Superseded(message)) => {
-                panic!("vector fixture was superseded: {message}");
-            }
-            Err(RemoteAiRunError::Failed(message)) => {
-                panic!("vector fixture failed before classification: {message}");
-            }
-            Ok(_) => panic!("vector fixture unexpectedly reached AI output"),
-        }
-
-        let size_gated =
-            remote_ai_test_request(RemoteAddress::file(favorite.id.to_string(), "large.png"));
-        let size_result = engine.execute_remote_ai_inner_with(
-            &size_gated,
-            &NoRemoteAiProgress,
-            &cancel,
-            &prepare,
-            &decode,
-            &resources,
-        );
-        match size_result {
-            Err(RemoteAiRunError::NotApplicable {
-                code: RemoteAiTerminalCode::SizeGate,
-                page_index: 0,
-                ..
-            }) => {}
-            Err(RemoteAiRunError::NotApplicable { code, message, .. }) => {
-                panic!("unexpected size terminal {code:?}: {message}");
-            }
-            Err(RemoteAiRunError::Superseded(message)) => {
-                panic!("size fixture was superseded: {message}");
-            }
-            Err(RemoteAiRunError::Failed(message)) => {
-                panic!("size fixture failed before gate: {message}");
-            }
-            Ok(_) => panic!("size fixture unexpectedly reached AI output"),
-        }
+        mixed.pages.push(mimageviewer_ipc::RemoteAiPageRequest {
+            address: RemoteAddress::file(favorite.id.to_string(), "large.png"),
+            target_px: 1024,
+        });
+        let outcomes = engine
+            .execute_remote_ai_inner_with(
+                &mixed,
+                &NoRemoteAiProgress,
+                &cancel,
+                &prepare,
+                &decode,
+                &resources,
+            )
+            .unwrap();
+        assert!(matches!(
+            outcomes.as_slice(),
+            [
+                super::super::ai_job::RemoteAiPageExecutionOutcome::NotApplicable {
+                    code: RemoteAiTerminalCode::VectorPdf,
+                    ..
+                },
+                super::super::ai_job::RemoteAiPageExecutionOutcome::NotApplicable {
+                    code: RemoteAiTerminalCode::SizeGate,
+                    ..
+                }
+            ]
+        ));
         assert_eq!(runtime_acquisitions.load(Ordering::Relaxed), 0);
     }
 

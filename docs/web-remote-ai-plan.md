@@ -1,6 +1,6 @@
 # mIV Remote 段 3b — AI アップスケール / デノイズ設計
 
-状態: **3b-0・3b-1a・3b-1b 実装済み、3b-2 は未実装**
+状態: **3b-0・3b-1a・3b-1b・3b-2 実装済み、3b-2 は実機確認待ち**
 （2026-08-04）。
 
 親計画: [web-remote-left-panel-plan.md](web-remote-left-panel-plan.md)
@@ -441,6 +441,15 @@ source decoder から共有 canonical decoder へ到達することを focused t
 - AI model 選択を `SetAdjustment` へ接続する
 - phase / tile 進捗、取消、acquire 待ち、disconnect error、画面消灯復帰を表示する
 - 実機で接続直前の local AI、AI 中の PC 切断、画面消灯復帰を確認する
+
+**実装済み (2026-08-04):** `RemoteAdjustmentValues` の省略可能な typed `ai` と、
+`AiFeatureMode` の選択可否を含む server-owned model catalog を追加した。旧 SPA の `ai` 欠落は
+AI 値を変更しない。SPA は `/api/page` の表示完了後に現在の 1〜2 ページだけを自動開始し、
+foreground では 500 ms、通信失敗時は 1 s → 2 s → 5 s で state を取得する。background では
+timer を停止し、復帰時は session 再取得後に recoverable を先に照会する。進捗は phase と server の
+page / stage / tile counter だけを表示し、percent は合成しない。aggregate `Ready` の page outcome が
+`Ready` のページだけ result を取得し、全 result を decode 後に見開き DOM を一度だけ更新する。
+`NotApplicable` は元画像を保ち、失敗表示にしない。
 
 ## 14. 必須 test / 計測
 

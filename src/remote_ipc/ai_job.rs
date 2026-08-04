@@ -5,9 +5,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimageviewer_ipc::{
     PagePayload, RemoteAiCancelResponse, RemoteAiJobError, RemoteAiJobErrorCode,
-    RemoteAiJobSnapshot, RemoteAiJobState, RemoteAiProgress, RemoteAiProgressPhase,
-    RemoteAiRecoverableResponse, RemoteAiResultResponse, RemoteAiStartRequest,
-    RemoteAiStartResponse, RemoteAiStateResponse, RemoteAiTerminalCode, RemoteAiTerminalDetail,
+    RemoteAiJobSnapshot, RemoteAiJobState, RemoteAiPageOutcome, RemoteAiPageOutcomeState,
+    RemoteAiProgress, RemoteAiProgressPhase, RemoteAiRecoverableResponse, RemoteAiResultResponse,
+    RemoteAiStartRequest, RemoteAiStartResponse, RemoteAiStateResponse, RemoteAiTerminalCode,
+    RemoteAiTerminalDetail,
 };
 
 use super::session::SessionOperation;
@@ -49,13 +50,16 @@ pub(crate) trait RemoteAiExecutor: Send + Sync {
     ) -> RemoteAiExecutionOutcome;
 }
 
-pub(crate) enum RemoteAiExecutionOutcome {
-    Ready(Vec<PagePayload>),
+pub(crate) enum RemoteAiPageExecutionOutcome {
+    Ready(PagePayload),
     NotApplicable {
         code: RemoteAiTerminalCode,
         message: String,
-        page_index: usize,
     },
+}
+
+pub(crate) enum RemoteAiExecutionOutcome {
+    Completed(Vec<RemoteAiPageExecutionOutcome>),
     Superseded(String),
     Failed(String),
 }
@@ -107,7 +111,7 @@ struct JobEntry {
     snapshot: RemoteAiJobSnapshot,
     cancel: Arc<AtomicBool>,
     requested_terminal: Option<(RemoteAiJobState, RemoteAiTerminalDetail)>,
-    results: Vec<PagePayload>,
+    results: Vec<Option<PagePayload>>,
     terminal_at: Option<Duration>,
 }
 
@@ -221,7 +225,7 @@ impl RemoteAiJobRegistry {
                 job,
                 RemoteAiJobState::Superseded,
                 RemoteAiTerminalCode::Superseded,
-                "新しい page group に置き換えられました",
+                "新しく表示したページの AI 処理に切り替えました",
             );
         }
         state.next_sequence = state.next_sequence.wrapping_add(1).max(1);
@@ -233,6 +237,13 @@ impl RemoteAiJobRegistry {
             progress: Some(waiting_progress(request.pages.len())),
             terminal: None,
             page_count: request.pages.len() as u32,
+            page_outcomes: (0..request.pages.len())
+                .map(|page_index| RemoteAiPageOutcome {
+                    page_index: page_index as u32,
+                    state: RemoteAiPageOutcomeState::Pending,
+                    terminal: None,
+                })
+                .collect(),
             created_unix_ms: unix_ms,
             updated_unix_ms: unix_ms,
         };
@@ -297,18 +308,23 @@ impl RemoteAiJobRegistry {
                 let cancel = registry.cancel_for(&thread_job_id);
                 let outcome = match cancel {
                     Some(cancel) => executor.execute(&request, &reporter, &cancel),
-                    None => RemoteAiExecutionOutcome::Failed("AI job disappeared".to_owned()),
+                    None => {
+                        RemoteAiExecutionOutcome::Failed("AI 処理を開始できませんでした".to_owned())
+                    }
                 };
-                let success = matches!(outcome, RemoteAiExecutionOutcome::Ready(_));
+                let success = matches!(outcome, RemoteAiExecutionOutcome::Completed(_));
                 registry.complete(&thread_job_id, outcome);
                 lease.finish(success);
             });
         if let Err(error) = spawn {
             self.complete(
                 &job_id,
-                RemoteAiExecutionOutcome::Failed(format!(
-                    "remote AI worker could not start: {error}"
-                )),
+                RemoteAiExecutionOutcome::Failed({
+                    crate::logger::log(format!(
+                        "remote_ipc: remote AI thread start failed: {error}"
+                    ));
+                    "AI 処理を開始できませんでした".to_owned()
+                }),
             );
         }
     }
@@ -335,7 +351,7 @@ impl RemoteAiJobRegistry {
                 RemoteAiJobState::Failed,
                 terminal_detail(
                     RemoteAiTerminalCode::ExecutionFailed,
-                    "AI job could not enter the active session",
+                    "AI 処理を開始できませんでした",
                     None,
                 ),
                 self.now(),
@@ -354,33 +370,48 @@ impl RemoteAiJobRegistry {
             return;
         }
         match outcome {
-            RemoteAiExecutionOutcome::Ready(results) => {
-                if results.len() != job.request.pages.len() {
+            RemoteAiExecutionOutcome::Completed(outcomes) => {
+                if outcomes.len() != job.request.pages.len() {
                     set_terminal(
                         job,
                         RemoteAiJobState::Failed,
                         terminal_detail(
                             RemoteAiTerminalCode::ExecutionFailed,
-                            "AI executor returned the wrong page count",
+                            "AI 処理を完了できませんでした",
                             None,
                         ),
                         now,
                     );
                 } else {
-                    job.results = results;
+                    job.results.clear();
+                    job.snapshot.page_outcomes.clear();
+                    for (page_index, outcome) in outcomes.into_iter().enumerate() {
+                        match outcome {
+                            RemoteAiPageExecutionOutcome::Ready(result) => {
+                                job.results.push(Some(result));
+                                job.snapshot.page_outcomes.push(RemoteAiPageOutcome {
+                                    page_index: page_index as u32,
+                                    state: RemoteAiPageOutcomeState::Ready,
+                                    terminal: None,
+                                });
+                            }
+                            RemoteAiPageExecutionOutcome::NotApplicable { code, message } => {
+                                job.results.push(None);
+                                job.snapshot.page_outcomes.push(RemoteAiPageOutcome {
+                                    page_index: page_index as u32,
+                                    state: RemoteAiPageOutcomeState::NotApplicable,
+                                    terminal: Some(terminal_detail(
+                                        code,
+                                        message,
+                                        Some(page_index),
+                                    )),
+                                });
+                            }
+                        }
+                    }
                     set_terminal_ready(job, now);
                 }
             }
-            RemoteAiExecutionOutcome::NotApplicable {
-                code,
-                message,
-                page_index,
-            } => set_terminal(
-                job,
-                RemoteAiJobState::Failed,
-                terminal_detail(code, message, Some(page_index)),
-                now,
-            ),
             RemoteAiExecutionOutcome::Superseded(message) => set_terminal(
                 job,
                 RemoteAiJobState::Superseded,
@@ -462,7 +493,23 @@ impl RemoteAiJobRegistry {
                 "AI result is not ready",
             ));
         }
-        RemoteAiResultResponse::Success(job.results[page_index].clone())
+        match job.results.get(page_index).and_then(Clone::clone) {
+            Some(result) => RemoteAiResultResponse::Success(result),
+            None => {
+                let terminal_code = job
+                    .snapshot
+                    .page_outcomes
+                    .get(page_index)
+                    .and_then(|outcome| outcome.terminal.as_ref())
+                    .map(|terminal| terminal.code);
+                let mut error = RemoteAiJobError::new(
+                    RemoteAiJobErrorCode::PageNotApplicable,
+                    "このページは AI 処理の対象外です",
+                );
+                error.terminal_code = terminal_code;
+                RemoteAiResultResponse::Error(error)
+            }
+        }
     }
 
     fn request_cancel_all(
@@ -710,6 +757,7 @@ mod tests {
         Ready,
         Failed(&'static str),
         NotApplicable(RemoteAiTerminalCode),
+        Mixed(RemoteAiTerminalCode),
     }
 
     struct ControlledExecutor {
@@ -732,27 +780,53 @@ mod tests {
                 })
                 .expect("test call receiver");
             match wait.recv().expect("test completion") {
-                FakeCompletion::Ready => RemoteAiExecutionOutcome::Ready(
+                FakeCompletion::Ready => RemoteAiExecutionOutcome::Completed(
                     request
                         .pages
                         .iter()
-                        .map(|_| PagePayload {
-                            bytes: vec![1, 2, 3],
-                            content_type: "image/webp".to_owned(),
-                            width: 1,
-                            height: 1,
-                        })
+                        .map(|_| RemoteAiPageExecutionOutcome::Ready(fake_page_payload()))
                         .collect(),
                 ),
                 FakeCompletion::Failed(message) => {
                     RemoteAiExecutionOutcome::Failed(message.to_owned())
                 }
-                FakeCompletion::NotApplicable(code) => RemoteAiExecutionOutcome::NotApplicable {
-                    code,
-                    message: "not applicable in registry test".to_owned(),
-                    page_index: 0,
-                },
+                FakeCompletion::NotApplicable(code) => RemoteAiExecutionOutcome::Completed(
+                    request
+                        .pages
+                        .iter()
+                        .map(|_| RemoteAiPageExecutionOutcome::NotApplicable {
+                            code,
+                            message: "not applicable in registry test".to_owned(),
+                        })
+                        .collect(),
+                ),
+                FakeCompletion::Mixed(code) => RemoteAiExecutionOutcome::Completed(
+                    request
+                        .pages
+                        .iter()
+                        .enumerate()
+                        .map(|(index, _)| {
+                            if index == 0 {
+                                RemoteAiPageExecutionOutcome::Ready(fake_page_payload())
+                            } else {
+                                RemoteAiPageExecutionOutcome::NotApplicable {
+                                    code,
+                                    message: "not applicable in registry test".to_owned(),
+                                }
+                            }
+                        })
+                        .collect(),
+                ),
             }
+        }
+    }
+
+    fn fake_page_payload() -> PagePayload {
+        PagePayload {
+            bytes: vec![1, 2, 3],
+            content_type: "image/webp".to_owned(),
+            width: 1,
+            height: 1,
         }
     }
 
@@ -804,15 +878,18 @@ mod tests {
         registry: &Arc<RemoteAiJobRegistry>,
         request_id: &str,
     ) -> RemoteAiJobSnapshot {
+        start_with_request(session, registry, request(request_id))
+    }
+
+    fn start_with_request(
+        session: &super::super::session::SessionHandle,
+        registry: &Arc<RemoteAiJobRegistry>,
+        request: RemoteAiStartRequest,
+    ) -> RemoteAiJobSnapshot {
         let operation = session
             .begin_operation("client", "remote AI test".to_owned())
             .unwrap();
-        match registry.start(
-            "client".to_owned(),
-            request(request_id),
-            u64::MAX,
-            operation,
-        ) {
+        match registry.start("client".to_owned(), request, u64::MAX, operation) {
             RemoteAiStartResponse::Accepted(snapshot) => snapshot,
             RemoteAiStartResponse::Error(error) => panic!("start failed: {error:?}"),
         }
@@ -945,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn not_applicable_vector_size_and_animated_results_become_failed_terminals() {
+    fn all_not_applicable_pages_complete_as_ready_with_typed_page_outcomes() {
         let (session, registry, calls) = fixture();
         for (index, code) in [
             RemoteAiTerminalCode::VectorPdf,
@@ -964,9 +1041,75 @@ mod tests {
                 .complete
                 .send(FakeCompletion::NotApplicable(code))
                 .unwrap();
-            let terminal = wait_for_state(&registry, &job.job_id, RemoteAiJobState::Failed);
-            assert_eq!(terminal.terminal.unwrap().code, code);
+            let completed = wait_for_state(&registry, &job.job_id, RemoteAiJobState::Ready);
+            assert!(completed.terminal.is_none());
+            assert_eq!(completed.page_outcomes.len(), 1);
+            assert_eq!(
+                completed.page_outcomes[0].state,
+                RemoteAiPageOutcomeState::NotApplicable
+            );
+            assert_eq!(
+                completed.page_outcomes[0]
+                    .terminal
+                    .as_ref()
+                    .map(|terminal| terminal.code),
+                Some(code)
+            );
+            assert!(matches!(
+                registry.result("client", &job.job_id, 0),
+                RemoteAiResultResponse::Error(RemoteAiJobError {
+                    code: RemoteAiJobErrorCode::PageNotApplicable,
+                    terminal_code: Some(result_code),
+                    ..
+                }) if result_code == code
+            ));
         }
+    }
+
+    #[test]
+    fn mixed_ready_and_not_applicable_pages_publish_only_the_ready_result() {
+        let (session, registry, calls) = fixture();
+        let mut mixed_request = request("mixed-page-outcomes");
+        mixed_request
+            .pages
+            .push(mimageviewer_ipc::RemoteAiPageRequest {
+                address: mimageviewer_ipc::RemoteAddress::file(
+                    "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+                    "vector.pdf",
+                ),
+                target_px: 1024,
+            });
+        let job = start_with_request(&session, &registry, mixed_request);
+        calls
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .complete
+            .send(FakeCompletion::Mixed(RemoteAiTerminalCode::VectorPdf))
+            .unwrap();
+
+        let completed = wait_for_state(&registry, &job.job_id, RemoteAiJobState::Ready);
+        assert!(completed.terminal.is_none());
+        assert_eq!(completed.page_outcomes.len(), 2);
+        assert_eq!(
+            completed.page_outcomes[0].state,
+            RemoteAiPageOutcomeState::Ready
+        );
+        assert_eq!(
+            completed.page_outcomes[1].state,
+            RemoteAiPageOutcomeState::NotApplicable
+        );
+        assert!(matches!(
+            registry.result("client", &job.job_id, 0),
+            RemoteAiResultResponse::Success(PagePayload { bytes, .. }) if bytes == vec![1, 2, 3]
+        ));
+        assert!(matches!(
+            registry.result("client", &job.job_id, 1),
+            RemoteAiResultResponse::Error(RemoteAiJobError {
+                code: RemoteAiJobErrorCode::PageNotApplicable,
+                terminal_code: Some(RemoteAiTerminalCode::VectorPdf),
+                ..
+            })
+        ));
     }
 
     #[test]

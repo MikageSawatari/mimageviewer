@@ -46,7 +46,7 @@ class FakeElement {
   append(...nodes) { this.children.push(...nodes); }
   replaceChildren(...nodes) { this.children = nodes; }
   replaceWith(node) { this.replacedWith = node; }
-  async decode() {}
+  async decode() { return FakeElement.decodeHook?.(this); }
 }
 
 const app = new FakeElement("main");
@@ -106,7 +106,10 @@ const {
   normalizeRemoteColorizeParams,
   parentContainerAddress,
   reloadApplication,
+  remoteAiProgressText,
+  remoteAiPollingDelay,
   resolveMediaOpenRoute,
+  selectRecoverableRemoteAiJob,
   thumbnailAddressForEntry,
   videoFileTargetIndex,
   viewerMenuDefinitions,
@@ -291,9 +294,71 @@ test("remote adjustment normalization keeps valid local slider defaults and boun
       tone_radius: 1,
       tone_strength: 100,
     },
+    ai: null,
   });
   assert.equal(normalizeRemoteAdjustmentValues({ black_point: 255 }).black_point, 254);
   assert.equal(normalizeRemoteAdjustmentValues({ white_point: 0 }).white_point, 1);
+  assert.deepEqual(
+    normalizeRemoteAdjustmentValues({
+      ai: { upscale_model: "auto", denoise_model: "denoise_realplksr" },
+    }).ai,
+    { upscale_model: "auto", denoise_model: "denoise_realplksr" }
+  );
+});
+
+test("AI progress shows only server counters and never invents a percentage", () => {
+  const text = remoteAiProgressText({
+    page_count: 2,
+    progress: {
+      phase: "upscaling",
+      page_index: 1,
+      page_count: 2,
+      stage_index: 1,
+      stage_count: 2,
+      completed_tiles: 3,
+      total_tiles: 8,
+    },
+  });
+  assert.equal(text, "拡大しています · ページ 2 / 2 · 処理 2 / 2 · 進み具合 3 / 8");
+  assert.equal(text.includes("%"), false);
+  assert.equal(
+    remoteAiProgressText({ progress: { phase: "loading_model", page_count: 1 } }),
+    "準備しています"
+  );
+});
+
+test("AI recovery prefers the exact request and otherwise only resumes a running group", () => {
+  const jobs = [
+    { request_id: "miv-ai:group:old", state: "ready", created_unix_ms: 30 },
+    { request_id: "miv-ai:group:cancelling", state: "cancelling", created_unix_ms: 50 },
+    { request_id: "miv-ai:group:running", state: "upscaling", created_unix_ms: 20 },
+    { request_id: "miv-ai:other:running", state: "denoising", created_unix_ms: 40 },
+  ];
+  assert.equal(
+    selectRecoverableRemoteAiJob(jobs, "group")?.request_id,
+    "miv-ai:group:running"
+  );
+  assert.equal(
+    selectRecoverableRemoteAiJob(jobs, "group", "miv-ai:group:old")?.state,
+    "ready"
+  );
+});
+
+test("AI polling stops in background and uses the agreed foreground backoff", () => {
+  assert.equal(remoteAiPollingDelay({ visibilityState: "visible", terminal: false }), 500);
+  assert.equal(
+    remoteAiPollingDelay({ visibilityState: "hidden", terminal: false, failureCount: 0 }),
+    null
+  );
+  assert.equal(remoteAiPollingDelay({ visibilityState: "visible", terminal: true }), null);
+  assert.deepEqual(
+    [0, 1, 2, 3].map((failureCount) => remoteAiPollingDelay({
+      visibilityState: "visible",
+      terminal: false,
+      failureCount,
+    })),
+    [1000, 2000, 5000, 5000]
+  );
 });
 
 test("remote colorize normalization preserves custom points and clamps desktop ranges", () => {
@@ -498,6 +563,22 @@ test("spread waits for both pages and atomically replaces the page layer", async
   assert.equal(Math.round(parseFloat(pageLayer.style.height)), 1000);
   assert.equal(Math.round(parseFloat(viewer.images[0].style.width)), 667);
   assert.equal(Math.round(parseFloat(viewer.images[0].style.height)), 1000);
+
+  const originalPages = viewer.images.slice();
+  let releaseDecode;
+  const decodeGate = new Promise((resolve) => { releaseDecode = resolve; });
+  FakeElement.decodeHook = () => decodeGate;
+  const replacement = viewer.replacePageBlobs([
+    { pageIndex: 0, blob: new Blob(["left"]), alt: "AI left" },
+  ]);
+  await Promise.resolve();
+  assert.equal(pageLayer.children[0], originalPages[0]);
+  assert.equal(pageLayer.children[1], originalPages[1]);
+  releaseDecode();
+  assert.equal(await replacement, true);
+  FakeElement.decodeHook = null;
+  assert.notEqual(pageLayer.children[0], originalPages[0]);
+  assert.equal(pageLayer.children[1], originalPages[1]);
 
   const singleDisplayed = await viewer.loadGroup({
     pages: [page(3)],

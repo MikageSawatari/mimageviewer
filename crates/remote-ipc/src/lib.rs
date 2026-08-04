@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 24;
+pub const PROTOCOL_VERSION: u32 = 25;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -213,9 +213,32 @@ impl RemoteReadingDirection {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteAiAdjustmentValues {
+    /// `None` はアップスケールなし、`Some("auto")` は本体の自動選択。
+    pub upscale_model: Option<String>,
+    /// `None` はデノイズなし。
+    pub denoise_model: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteAiModelOption {
+    /// `None` は「なし」。モデルキーと表示ラベルは本体を正本にする。
+    pub key: Option<String>,
+    pub label: String,
+    /// 現在の `AiFeatureMode` で新たに選択できるか。保存済みの非許可値は破棄しない。
+    pub selectable: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteAiModelCatalog {
+    pub upscale: Vec<RemoteAiModelOption>,
+    pub denoise: Vec<RemoteAiModelOption>,
+}
+
 /// リモートの画像補正パネルが編集できるパラメータ。
 ///
-/// AI / post-filter 等はまだ読み取り専用にし、この型へは入れない。
+/// post-filter 等はまだ読み取り専用にし、この型へは入れない。
 /// 書き込み側は保存済みの完全な `AdjustParams` にこの差分だけを重ねるため、Web が
 /// 非公開フィールドを消したり既定値へ戻したりしない。
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -230,6 +253,9 @@ pub struct RemoteAdjustmentValues {
     pub midtone: f32,
     pub auto_mode: Option<RemoteAutoMode>,
     pub colorize: RemoteColorizeParams,
+    /// 旧 SPA の payload では欠落する。`None` は AI 値を変更しない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai: Option<RemoteAiAdjustmentValues>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -355,6 +381,9 @@ pub struct RemoteAdjustmentState {
     pub standard_available: bool,
     /// デスクトップのグローバル保存スロット。Web は読み込みだけを提供する。
     pub colorize_preset_slots: [Option<RemoteColorizeParams>; 4],
+    pub ai_model_catalog: RemoteAiModelCatalog,
+    /// `AiFeatureMode` を適用した後、effective params が final AI を一つ以上要求するか。
+    pub effective_ai_enabled: bool,
     pub read_only: RemoteAdjustmentReadOnlyState,
 }
 
@@ -1105,6 +1134,21 @@ pub struct RemoteAiTerminalDetail {
     pub page_index: Option<u32>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAiPageOutcomeState {
+    Pending,
+    Ready,
+    NotApplicable,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteAiPageOutcome {
+    pub page_index: u32,
+    pub state: RemoteAiPageOutcomeState,
+    pub terminal: Option<RemoteAiTerminalDetail>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct RemoteAiJobSnapshot {
     pub job_id: String,
@@ -1113,6 +1157,9 @@ pub struct RemoteAiJobSnapshot {
     pub progress: Option<RemoteAiProgress>,
     pub terminal: Option<RemoteAiTerminalDetail>,
     pub page_count: u32,
+    /// Page-local completion. Aggregate `Ready` means every page reached one of these terminal
+    /// outcomes; it does not require every page to have replacement bytes.
+    pub page_outcomes: Vec<RemoteAiPageOutcome>,
     pub created_unix_ms: u64,
     pub updated_unix_ms: u64,
 }
@@ -1127,6 +1174,7 @@ pub enum RemoteAiJobErrorCode {
     Forbidden,
     JobGone,
     NotReady,
+    PageNotApplicable,
     PageOutOfRange,
     Internal,
 }
@@ -1716,6 +1764,7 @@ mod tests {
                         midtone: 1.0,
                         auto_mode: None,
                         colorize: RemoteColorizeParams::default(),
+                        ai: None,
                     },
                 }),
             },
@@ -1771,8 +1820,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v24_video_pull_seek_thumbnail_end_behavior_and_audio_status_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 24);
+    fn protocol_v25_video_pull_seek_thumbnail_end_behavior_and_audio_status_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 25);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -2000,6 +2049,10 @@ mod tests {
                         ],
                         ..RemoteColorizeParams::default()
                     },
+                    ai: Some(RemoteAiAdjustmentValues {
+                        upscale_model: Some("auto".to_owned()),
+                        denoise_model: None,
+                    }),
                 },
             },
             RemoteWriteRequest::GetAdjustmentState { address: page },
@@ -2033,6 +2086,10 @@ mod tests {
                     midtone: 1.0,
                     auto_mode: None,
                     colorize: RemoteColorizeParams::default(),
+                    ai: Some(RemoteAiAdjustmentValues {
+                        upscale_model: Some("auto".to_owned()),
+                        denoise_model: None,
+                    }),
                 },
                 standard_values: RemoteAdjustmentValues {
                     brightness: 0.0,
@@ -2045,6 +2102,10 @@ mod tests {
                     midtone: 1.0,
                     auto_mode: None,
                     colorize: RemoteColorizeParams::default(),
+                    ai: Some(RemoteAiAdjustmentValues {
+                        upscale_model: None,
+                        denoise_model: None,
+                    }),
                 },
                 selected_scope: RemoteAdjustmentScope::Page,
                 has_page_override: true,
@@ -2059,6 +2120,26 @@ mod tests {
                     None,
                     None,
                 ],
+                ai_model_catalog: RemoteAiModelCatalog {
+                    upscale: vec![
+                        RemoteAiModelOption {
+                            key: None,
+                            label: "なし".to_owned(),
+                            selectable: true,
+                        },
+                        RemoteAiModelOption {
+                            key: Some("auto".to_owned()),
+                            label: "自動 (画像タイプ判別)".to_owned(),
+                            selectable: true,
+                        },
+                    ],
+                    denoise: vec![RemoteAiModelOption {
+                        key: None,
+                        label: "なし".to_owned(),
+                        selectable: true,
+                    }],
+                },
+                effective_ai_enabled: true,
                 read_only: RemoteAdjustmentReadOnlyState {
                     upscale_label: "なし".to_owned(),
                     denoise_label: "なし".to_owned(),
@@ -2191,7 +2272,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v24_remote_ai_messages_and_typed_terminal_round_trip() {
+    fn protocol_v25_remote_ai_messages_and_page_outcomes_round_trip() {
         let address = RemoteAddress::file("30d6c167-7148-4f3e-9a5a-21c5fd31ecb2", "pages/001.png");
         let start = RemoteAiStartRequest {
             request_id: "request-1".to_owned(),
@@ -2239,14 +2320,19 @@ mod tests {
         let snapshot = RemoteAiJobSnapshot {
             job_id: "7-1".to_owned(),
             request_id: "request-1".to_owned(),
-            state: RemoteAiJobState::Failed,
+            state: RemoteAiJobState::Ready,
             progress: None,
-            terminal: Some(RemoteAiTerminalDetail {
-                code: RemoteAiTerminalCode::VectorPdf,
-                message: "not applicable".to_owned(),
-                page_index: Some(0),
-            }),
+            terminal: None,
             page_count: 1,
+            page_outcomes: vec![RemoteAiPageOutcome {
+                page_index: 0,
+                state: RemoteAiPageOutcomeState::NotApplicable,
+                terminal: Some(RemoteAiTerminalDetail {
+                    code: RemoteAiTerminalCode::VectorPdf,
+                    message: "not applicable".to_owned(),
+                    page_index: Some(0),
+                }),
+            }],
             created_unix_ms: 10,
             updated_unix_ms: 20,
         };
