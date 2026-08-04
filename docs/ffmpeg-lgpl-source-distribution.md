@@ -79,6 +79,30 @@ curl -sSL --fail -o htdocs/mimageviewer/ffmpeg-<BUILD-ID>-source.tar.gz \
 Keep the tarballs of previous releases in place. Users of an older
 mImageViewer are entitled to the source matching *their* build.
 
+### Where The Tarball Lives
+
+The tarball is a distribution artifact, not repository source, so it is **not tracked in
+git** (`.gitignore` excludes `htdocs/mimageviewer/ffmpeg-*-source.tar.*`). At 16 MB per
+FFmpeg update it would grow the history permanently for no benefit — git is not the
+distribution channel; mikage.to is.
+
+Three copies matter, and they are not interchangeable:
+
+| Copy | Purpose |
+| --- | --- |
+| mikage.to | The one users are entitled to. Must stay up for as long as that build is in the wild. |
+| `C:\home\mimageviewer_vendor_backup\ffmpeg-lgpl-source\` | The exact published bytes, kept outside the repo tree. |
+| `.sha256` (tracked in git) | The record of what was published. Tiny, so it stays in history. |
+
+Re-fetching from `https://github.com/FFmpeg/FFmpeg/archive/<hash>.tar.gz` recovers the
+same *source*, but **GitHub's commit archives are not byte-stable** (their compression has
+changed before), so a fresh download may not match the published `.sha256`. That is not a
+licence problem — the content is identical — but it does mean the backup copy is what
+keeps the published checksum verifiable.
+
+Tarballs committed before this rule stay tracked; removing them needs a history rewrite
+and is a separate decision.
+
 ### Two Places Carry The Build ID
 
 The in-app notice derives its text from `vendor/ffmpeg/VERSION` at build time
