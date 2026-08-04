@@ -23,7 +23,6 @@ export const CommandName = Object.freeze({
   TOGGLE_VIEWER_BARS: "toggle_viewer_bars",
   OPEN_GESTURE_HELP: "open_gesture_help",
   OPEN_LOCAL_SETTINGS: "open_local_settings",
-  SET_IMAGE_QUALITY: "set_image_quality",
   SET_RATING: "set_rating",
   TOGGLE_BOOKMARK: "toggle_bookmark",
   BACK: "back",

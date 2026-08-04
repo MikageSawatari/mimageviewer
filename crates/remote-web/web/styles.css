@@ -1644,6 +1644,21 @@ button {
   gap: 18px;
 }
 
+.local-settings-group {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.local-settings-group-title {
+  margin-bottom: 2px;
+  color: #f3f7ff;
+  font-size: 0.92rem;
+  font-weight: 700;
+}
+
 .gesture-help-dialog {
   gap: 16px;
 }

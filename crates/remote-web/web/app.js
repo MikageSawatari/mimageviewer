@@ -1135,24 +1135,6 @@ function dispatchCommand(requested, meta = {}) {
     } else if (requested.name === CommandName.TOGGLE_BOOKMARK) {
       toggleViewerBookmark().catch(() => {});
       handled = true;
-    } else if (requested.name === CommandName.SET_IMAGE_QUALITY) {
-      const preset = IMAGE_QUALITY_PRESETS.find(
-        (candidate) => candidate.id === requested.payload?.quality
-      );
-      if (preset) {
-        const changed = state.localSettings.imageQuality !== preset.id;
-        const saved = saveLocalSettings({
-          ...state.localSettings,
-          imageQuality: preset.id,
-        });
-        state.localSettings = saved.settings;
-        state.localSettingsStorageAvailable = saved.saved;
-        if (changed) {
-          pageResourceCache.clear();
-          updateViewerImage(performance.now()).catch(renderError);
-        }
-        handled = true;
-      }
     } else if (requested.name.startsWith("spread_")) {
       const spreadModes = {
         [CommandName.SPREAD_SINGLE]: SpreadMode.SINGLE,
@@ -4179,16 +4161,12 @@ export const VIEWER_PANEL_TABS = Object.freeze([
 
 export const VIEWER_MENU_MAX_ACTIONS = 11;
 
-export function viewerMenuDefinitions({
-  hasContainer,
-  barsVisible,
-  imageQuality = "standard",
-}) {
+export function viewerMenuDefinitions({ hasContainer, barsVisible }) {
   const back = [MenuPageAction.BACK, "操作メニューへ戻る", "戻る"];
   const mainActions = [
     [CommandName.TOGGLE_BOOKMARK, "ブックマークを読み込み中…", "現在のページ"],
     [MenuPageAction.RATING, "レーティング", "★を選択", { menuPage: "rating" }],
-    [MenuPageAction.DISPLAY, "表示と画質", "フィット / 画質", { menuPage: "display" }],
+    [MenuPageAction.DISPLAY, "表示", "フィット / 原寸", { menuPage: "display" }],
     ...(hasContainer
       ? [[MenuPageAction.SPREAD, "見開き設定", "1〜5", { menuPage: "spread" }]]
       : []),
@@ -4234,19 +4212,13 @@ export function viewerMenuDefinitions({
       ],
     },
     display: {
-      title: "表示と画質",
+      title: "表示",
       actions: [
         back,
         [CommandName.ZOOM_RESET, "ズームを戻す", "メニュー"],
         [CommandName.FIT_PAGE, "全体フィット", "0 で切替"],
         [CommandName.FIT_WIDTH, "幅フィット", "0 で切替"],
         [CommandName.FIT_ORIGINAL, "原寸 (100%)", "0 で切替"],
-        ...IMAGE_QUALITY_PRESETS.map((preset) => [
-          CommandName.SET_IMAGE_QUALITY,
-          `${preset.id === imageQuality ? "✓ " : ""}${preset.label}`,
-          `最大 ${preset.maxLongSide} px`,
-          { quality: preset.id },
-        ]),
       ],
     },
     spread: {
@@ -4276,7 +4248,6 @@ function menuDefinition(context, page = "main") {
     const definitions = viewerMenuDefinitions({
       hasContainer: Boolean(state.container),
       barsVisible: state.viewerBarsVisible,
-      imageQuality: state.localSettings.imageQuality,
     });
     return definitions[page] ?? definitions.main;
   }
@@ -5960,6 +5931,31 @@ function openLocalSettingsDialog() {
   state.localSettingsDialog = new LocalSettingsDialog(app);
 }
 
+function setLocalImageQuality(quality) {
+  const preset = IMAGE_QUALITY_PRESETS.find(
+    (candidate) => candidate.id === quality
+  );
+  if (!preset) return false;
+  const changed = state.localSettings.imageQuality !== preset.id;
+  const saved = saveLocalSettings({
+    ...state.localSettings,
+    imageQuality: preset.id,
+  });
+  state.localSettings = saved.settings;
+  state.localSettingsStorageAvailable = saved.saved;
+  if (changed) {
+    pageResourceCache.clear();
+    if (
+      state.screenContext === "viewer" &&
+      state.viewer &&
+      !state.viewer.isVideoStreamViewer
+    ) {
+      updateViewerImage(performance.now()).catch(renderError);
+    }
+  }
+  return true;
+}
+
 class LocalSettingsDialog {
   constructor(host) {
     this.previousFocus = document.activeElement;
@@ -5996,6 +5992,30 @@ class LocalSettingsDialog {
     );
     option.append(checkbox, copy);
 
+    const qualityGroup = element("fieldset", "local-settings-group");
+    qualityGroup.append(
+      textElement("legend", "画像の画質", "local-settings-group-title")
+    );
+    for (const preset of IMAGE_QUALITY_PRESETS) {
+      const qualityOption = element("label", "local-settings-option");
+      const radio = element("input");
+      radio.type = "radio";
+      radio.name = "image-quality";
+      radio.value = preset.id;
+      radio.checked = state.localSettings.imageQuality === preset.id;
+      const qualityCopy = element("span", "local-settings-copy");
+      qualityCopy.append(
+        textElement("strong", preset.label),
+        textElement("small", `最大 ${preset.maxLongSide} px`)
+      );
+      qualityOption.append(radio, qualityCopy);
+      radio.addEventListener("change", () => {
+        if (!radio.checked || !setLocalImageQuality(preset.id)) return;
+        this.updateStorageStatus();
+      });
+      qualityGroup.append(qualityOption);
+    }
+
     this.status = textElement("p", "", "local-settings-status");
     this.updateStorageStatus();
     checkbox.addEventListener("change", () => {
@@ -6016,7 +6036,7 @@ class LocalSettingsDialog {
       }
     });
 
-    panel.append(header, option, this.status);
+    panel.append(header, option, qualityGroup, this.status);
     this.root.append(scrim, panel);
     this.root.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {

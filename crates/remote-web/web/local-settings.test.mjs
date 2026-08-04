@@ -145,11 +145,18 @@ test("grid column settings clamp per field without replacing existing values", (
   );
 });
 
-test("image quality is device-local, defaults to standard, and rejects unknown values", () => {
-  assert.equal(
-    parseLocalSettings(JSON.stringify({ version: 1, imageQuality: "high" })).imageQuality,
-    "high"
-  );
+test("all image quality choices round-trip as device-local settings", () => {
+  for (const imageQuality of ["high", "standard", "light", "minimum"]) {
+    const settings = { ...defaultLocalSettings(), imageQuality };
+    assert.equal(
+      parseLocalSettings(serializeLocalSettings(settings)).imageQuality,
+      imageQuality
+    );
+  }
+});
+
+test("image quality defaults to standard and rejects unknown values", () => {
+  assert.equal(parseLocalSettings(null).imageQuality, "standard");
   assert.equal(
     parseLocalSettings(JSON.stringify({ version: 1, imageQuality: "unexpected" })).imageQuality,
     "standard"

@@ -224,25 +224,24 @@ test("every iPhone viewer menu page stays within the fixed action limit", () => 
   }
 });
 
-test("viewer display menu exposes all image quality modes and marks the device choice", () => {
+test("viewer display menu contains only controls for the current view", () => {
   const definitions = viewerMenuDefinitions({
     hasContainer: true,
     barsVisible: true,
-    imageQuality: "light",
   });
-  const qualityActions = definitions.display.actions
-    .filter(([name]) => name === "set_image_quality");
+  const displayEntry = definitions.main.actions.find(
+    ([, , , payload]) => payload?.menuPage === "display"
+  );
+  assert.deepEqual(displayEntry.slice(1, 3), ["表示", "フィット / 原寸"]);
+  assert.equal(definitions.display.title, "表示");
   assert.deepEqual(
-    qualityActions.map(([, label, hint, payload]) => [
-      label,
-      hint,
-      payload.quality,
-    ]),
+    definitions.display.actions.map(([name, label]) => [name, label]),
     [
-      ["高品質", "最大 8192 px", "high"],
-      ["標準", "最大 4096 px", "standard"],
-      ["✓ 軽量", "最大 2048 px", "light"],
-      ["最軽量", "最大 1024 px", "minimum"],
+      ["menu_page_back", "操作メニューへ戻る"],
+      ["zoom_reset", "ズームを戻す"],
+      ["fit_page", "全体フィット"],
+      ["fit_width", "幅フィット"],
+      ["fit_original", "原寸 (100%)"],
     ]
   );
 });

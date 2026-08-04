@@ -855,8 +855,9 @@ prefetch queued + active を1件に制限し、remote heavy worker が1本しか
 リモート要求に使用しない。
 
 ページ本体と AI result はサムネイルの WebP encoder を共用せず、turbojpeg q85 の JPEG で返す。
-画質設定は `local-settings.mjs` の version 1 aggregate に省略可能 field として保存し、旧保存値や
-不正値は標準 4096 へ正規化する。ピンチ拡大は取得済み画像の CSS 変形だけを行い、追加取得しない。
+画質設定は ☰ の「端末の設定」で選び、`local-settings.mjs` の version 1 aggregate に省略可能
+field として保存する。旧保存値や不正値は標準 4096 へ正規化する。ピンチ拡大は取得済み画像の
+CSS 変形だけを行い、追加取得しない。
 画質変更時は `target_px` を含む page cache / AI result identity が変わるため、現在ページを同じ
 画質で再取得し、進行中の AI job は既存 supersede 規則へ入る。
 
