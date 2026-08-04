@@ -25,12 +25,18 @@ elseif ($PSBoundParameters.ContainsKey("TargetKey")) {
     throw "-TargetKey is valid only with -Scenario video-pin-background"
 }
 
-if (-not ("MivIdleHealthNative" -as [type])) {
+# Add-Type keeps a compiled type for the whole PowerShell session, and this
+# guard skips recompiling it. A console that already ran an older copy of this
+# script therefore keeps the OLD implementation, silently. Bump the trailing
+# number whenever the C# below changes so a stale session recompiles instead of
+# reporting results from code that is no longer in the file. (2026-08-04: the
+# tray gate fix looked like it had not applied for exactly this reason.)
+if (-not ("MivIdleHealthNative2" -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
-public static class MivIdleHealthNative {
+public static class MivIdleHealthNative2 {
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
 
@@ -113,12 +119,12 @@ function Get-FileLength {
 }
 
 function Get-ForegroundProcessId {
-    $window = [MivIdleHealthNative]::GetForegroundWindow()
+    $window = [MivIdleHealthNative2]::GetForegroundWindow()
     if ($window -eq [IntPtr]::Zero) {
         return 0
     }
     [uint32]$foregroundProcessId = 0
-    [void][MivIdleHealthNative]::GetWindowThreadProcessId(
+    [void][MivIdleHealthNative2]::GetWindowThreadProcessId(
         $window,
         [ref]$foregroundProcessId
     )
@@ -127,7 +133,7 @@ function Get-ForegroundProcessId {
 
 function Get-ProcessTopLevelWindowSummary {
     param([int]$Id)
-    $counts = [MivIdleHealthNative]::GetTopLevelWindowCounts([uint32]$Id)
+    $counts = [MivIdleHealthNative2]::GetTopLevelWindowCounts([uint32]$Id)
     return [pscustomobject]@{
         Total = [int]$counts[0]
         Visible = [int]$counts[1]
