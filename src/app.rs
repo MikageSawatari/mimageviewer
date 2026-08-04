@@ -37951,9 +37951,48 @@ impl App {
         };
         let logical_scale = (image_rect_norm.width() * placement.w / rotated_size.x.max(1.0))
             .min(image_rect_norm.height() * placement.h / rotated_size.y.max(1.0));
+        let snapshot_rect = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
+        );
+        let image_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                image_rect_norm.min.x * snapshot_rect.width(),
+                image_rect_norm.min.y * snapshot_rect.height(),
+            ),
+            egui::pos2(
+                image_rect_norm.max.x * snapshot_rect.width(),
+                image_rect_norm.max.y * snapshot_rect.height(),
+            ),
+        );
+        let visible_source_uv_rect =
+            crate::displayed_image_transform::DisplayedImageTransform::from_resolved_rect(
+                crate::displayed_image_transform::DisplayedImageTransformInput {
+                    page_idx: idx,
+                    viewport_rect: snapshot_rect,
+                    source_size: texture_size,
+                    texture_size,
+                    rotation,
+                    free_rotation_rad: free_rotation,
+                    content_bbox: image_content_bbox,
+                    fit_mode: crate::settings::FullscreenFitMode::Page,
+                    fit_scale_limits:
+                        crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                    pixels_per_point,
+                    placement: crate::displayed_image_transform::ResolvedDisplayPlacement::Normal {
+                        zoom_pan: None,
+                    },
+                },
+                image_rect,
+            )
+            .and_then(|transform| transform.visible_source_uv_rect(snapshot_rect));
         let texture = self.fullscreen_paint_resource_for_texture(idx, texture);
-        let texture =
-            self.prepare_fullscreen_paint_resource(&texture, logical_scale, pixels_per_point);
+        let texture = self.prepare_fullscreen_paint_resource(
+            &texture,
+            logical_scale,
+            pixels_per_point,
+            visible_source_uv_rect,
+        );
         let frozen_continuous_pages = ctx
             .map(|ctx| self.detached_frozen_pages_for_snapshot(ctx, id, idx, placement))
             .unwrap_or_default();

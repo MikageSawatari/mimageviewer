@@ -2272,6 +2272,7 @@ impl App {
         resource: &crate::gpu_lanczos::FullscreenPaintResource,
         logical_scale: f32,
         pixels_per_point: f32,
+        visible_source_uv_rect: Option<egui::Rect>,
     ) -> crate::gpu_lanczos::FullscreenPaintResource {
         let render_state = self.wgpu_render_state.clone();
         let post_filter = if self.post_filter_bypassed {
@@ -2287,6 +2288,7 @@ impl App {
             resource,
             logical_scale,
             pixels_per_point,
+            visible_source_uv_rect,
             post_filter,
             self.settings.downscale_smoothing_percent,
         );
@@ -2307,6 +2309,34 @@ impl App {
                             ("target_w", stats.target_size[0].into()),
                             ("target_h", stats.target_size[1].into()),
                             ("scale_branch", stats.scale_branch.as_str().into()),
+                            (
+                                "visible_source_x",
+                                stats
+                                    .visible_source_region
+                                    .map(|region| region[0].into())
+                                    .unwrap_or(serde_json::Value::Null),
+                            ),
+                            (
+                                "visible_source_y",
+                                stats
+                                    .visible_source_region
+                                    .map(|region| region[1].into())
+                                    .unwrap_or(serde_json::Value::Null),
+                            ),
+                            (
+                                "visible_source_w",
+                                stats
+                                    .visible_source_region
+                                    .map(|region| region[2].into())
+                                    .unwrap_or(serde_json::Value::Null),
+                            ),
+                            (
+                                "visible_source_h",
+                                stats
+                                    .visible_source_region
+                                    .map(|region| region[3].into())
+                                    .unwrap_or(serde_json::Value::Null),
+                            ),
                             ("smoothing_percent", stats.smoothing_percent.into()),
                             ("blur_factor", f64::from(stats.blur_factor).into()),
                             ("texture_fetches", stats.texture_fetches.into()),
@@ -5220,10 +5250,27 @@ impl App {
                     rotated_display_size(resource.size_vec2(), self.get_rotation(page.idx));
                 let logical_scale = (page.rect.width() / rotated_size.x.max(1.0))
                     .min(page.rect.height() / rotated_size.y.max(1.0));
+                let transform = DisplayedImageTransform::from_resolved_rect(
+                    DisplayedImageTransformInput {
+                        page_idx: page.idx,
+                        viewport_rect: full_rect,
+                        source_size: resource.size_vec2(),
+                        texture_size: resource.size_vec2(),
+                        rotation: self.get_rotation(page.idx),
+                        free_rotation_rad: 0.0,
+                        content_bbox: None,
+                        fit_mode: FullscreenFitMode::Page,
+                        fit_scale_limits: FullscreenFitScaleLimits::default(),
+                        pixels_per_point,
+                        placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                    },
+                    page.rect,
+                )?;
                 let texture = self.prepare_fullscreen_paint_resource(
                     &resource,
                     logical_scale,
                     pixels_per_point,
+                    transform.visible_source_uv_rect(full_rect),
                 );
                 let rect_norm = Self::normalize_rect_to_full_rect(page.rect, full_rect);
                 let uv_rect = Self::full_uv_rect();
@@ -5407,26 +5454,60 @@ impl App {
             right_bbox,
             content_active,
         );
+        let left_clip_rect = Self::spread_page_horizontal_visible_clip(rects.left_rect, left_bbox)
+            .intersect(image_rect);
+        let right_clip_rect =
+            Self::spread_page_horizontal_visible_clip(rects.right_rect, right_bbox)
+                .intersect(image_rect);
+        let left_transform = DisplayedImageTransform::from_resolved_rect(
+            DisplayedImageTransformInput {
+                page_idx: left,
+                viewport_rect: image_rect,
+                source_size: left_texture.size_vec2(),
+                texture_size: left_texture.size_vec2(),
+                rotation: left_rot,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            },
+            rects.left_rect,
+        );
+        let right_transform = DisplayedImageTransform::from_resolved_rect(
+            DisplayedImageTransformInput {
+                page_idx: right,
+                viewport_rect: image_rect,
+                source_size: right_texture.size_vec2(),
+                texture_size: right_texture.size_vec2(),
+                rotation: right_rot,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            },
+            rects.right_rect,
+        );
         let left_resource = self.fullscreen_paint_resource_for_texture(left, left_texture);
         let left_texture = self.prepare_fullscreen_paint_resource(
             &left_resource,
             total_scale * geometry.left.scale_factor,
             pixels_per_point,
+            left_transform.and_then(|transform| transform.visible_source_uv_rect(left_clip_rect)),
         );
         let right_resource = self.fullscreen_paint_resource_for_texture(right, right_texture);
         let right_texture = self.prepare_fullscreen_paint_resource(
             &right_resource,
             total_scale * geometry.right.scale_factor,
             pixels_per_point,
+            right_transform.and_then(|transform| transform.visible_source_uv_rect(right_clip_rect)),
         );
         let background = self.detached_frozen_background_for_snapshot(ctx);
         let left_rect_norm = Self::normalize_rect_to_full_rect(rects.left_rect, full_rect);
         let right_rect_norm = Self::normalize_rect_to_full_rect(rects.right_rect, full_rect);
-        let left_clip_rect = Self::spread_page_horizontal_visible_clip(rects.left_rect, left_bbox)
-            .intersect(image_rect);
-        let right_clip_rect =
-            Self::spread_page_horizontal_visible_clip(rects.right_rect, right_bbox)
-                .intersect(image_rect);
         let left_clip_rect_norm = Self::normalize_rect_to_full_rect(left_clip_rect, full_rect);
         let right_clip_rect_norm = Self::normalize_rect_to_full_rect(right_clip_rect, full_rect);
         let left_uv_rect = Self::full_uv_rect();
@@ -5539,10 +5620,34 @@ impl App {
         );
         if window.rotation.is_none() && window.free_rotation.abs() <= TRANSFORM_EPSILON {
             paint_transparent_bg(&painter, paint_rect, &bg_style);
-            painter.image(
+            if let Some(source_uv_rect) = window.texture.visible_source_uv_rect() {
+                crate::displayed_image_transform::paint_source_region_texture(
+                    &painter,
+                    window.texture.id(),
+                    image_rect,
+                    window.rotation,
+                    window.free_rotation,
+                    source_uv_rect,
+                    Self::full_uv_rect(),
+                    egui::Color32::WHITE,
+                );
+            } else {
+                painter.image(
+                    window.texture.id(),
+                    paint_rect,
+                    uv_rect,
+                    egui::Color32::WHITE,
+                );
+            }
+        } else if let Some(source_uv_rect) = window.texture.visible_source_uv_rect() {
+            crate::displayed_image_transform::paint_source_region_texture(
+                &painter,
                 window.texture.id(),
-                paint_rect,
-                uv_rect,
+                image_rect,
+                window.rotation,
+                window.free_rotation,
+                source_uv_rect,
+                Self::full_uv_rect(),
                 egui::Color32::WHITE,
             );
         } else {
@@ -5572,10 +5677,34 @@ impl App {
                 let bg_style = Self::detached_frozen_background_style(&page.background);
                 if page.rotation.is_none() {
                     paint_transparent_bg(&painter, paint_rect, &bg_style);
-                    painter.image(
+                    if let Some(source_uv_rect) = page.texture.visible_source_uv_rect() {
+                        crate::displayed_image_transform::paint_source_region_texture(
+                            &painter,
+                            page.texture.id(),
+                            paint_rect,
+                            page.rotation,
+                            0.0,
+                            source_uv_rect,
+                            Self::full_uv_rect(),
+                            egui::Color32::WHITE,
+                        );
+                    } else {
+                        painter.image(
+                            page.texture.id(),
+                            paint_rect,
+                            page.uv_rect,
+                            egui::Color32::WHITE,
+                        );
+                    }
+                } else if let Some(source_uv_rect) = page.texture.visible_source_uv_rect() {
+                    crate::displayed_image_transform::paint_source_region_texture(
+                        &painter,
                         page.texture.id(),
                         paint_rect,
-                        page.uv_rect,
+                        page.rotation,
+                        0.0,
+                        source_uv_rect,
+                        Self::full_uv_rect(),
                         egui::Color32::WHITE,
                     );
                 } else {
@@ -7903,6 +8032,7 @@ impl App {
                                 resource,
                                 scale,
                                 vp_ctx.pixels_per_point(),
+                                Some(Self::full_uv_rect()),
                             );
                             ui.painter().image(
                                 paint_resource.paint_texture_id(),
@@ -15865,12 +15995,22 @@ impl App {
                 resource,
                 transform.total_scale,
                 ui.ctx().pixels_per_point(),
+                transform.visible_source_uv_rect(painter.clip_rect()),
             );
-            transform.paint_texture(
-                &painter,
-                paint_resource.paint_texture_id(),
-                egui::Color32::WHITE,
-            );
+            if let Some(source_uv_rect) = paint_resource.visible_source_uv_rect() {
+                transform.paint_texture_source_region(
+                    &painter,
+                    paint_resource.paint_texture_id(),
+                    source_uv_rect,
+                    egui::Color32::WHITE,
+                );
+            } else {
+                transform.paint_texture(
+                    &painter,
+                    paint_resource.paint_texture_id(),
+                    egui::Color32::WHITE,
+                );
+            }
             if fit_bbox.is_none()
                 && should_draw_fs_pixel_grid(pixel_grid_enabled, using_full_texture, zoom_pan)
             {
@@ -19750,12 +19890,22 @@ impl App {
                 handle,
                 transform.total_scale,
                 pixels_per_point,
+                transform.visible_source_uv_rect(painter.clip_rect()),
             );
-            transform.paint_texture(
-                painter,
-                paint_resource.paint_texture_id(),
-                egui::Color32::WHITE,
-            );
+            if let Some(source_uv_rect) = paint_resource.visible_source_uv_rect() {
+                transform.paint_texture_source_region(
+                    painter,
+                    paint_resource.paint_texture_id(),
+                    source_uv_rect,
+                    egui::Color32::WHITE,
+                );
+            } else {
+                transform.paint_texture(
+                    painter,
+                    paint_resource.paint_texture_id(),
+                    egui::Color32::WHITE,
+                );
+            }
             return Some(transform);
         } else {
             painter.text(

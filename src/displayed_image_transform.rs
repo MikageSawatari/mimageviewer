@@ -266,6 +266,45 @@ impl DisplayedImageTransform {
         (sx + sy) * 0.5
     }
 
+    /// Returns the source UV rectangle that is both inside the active display trim
+    /// and visible through the current viewport/paint clip. Free rotation can make
+    /// the exact visible source shape non-rectangular, so the smallest axis-aligned
+    /// source rectangle containing that polygon is returned.
+    pub(crate) fn visible_source_uv_rect(&self, clip_rect: egui::Rect) -> Option<egui::Rect> {
+        let clip_rect = self.viewport_rect.intersect(clip_rect);
+        if !rect_is_valid(clip_rect) {
+            return None;
+        }
+        let source_corners = [
+            self.uv_rect.left_top(),
+            self.uv_rect.right_top(),
+            self.uv_rect.right_bottom(),
+            self.uv_rect.left_bottom(),
+        ];
+        let mut visible_polygon = source_corners
+            .into_iter()
+            .map(|source| self.source_normalized_to_screen(source))
+            .collect::<Vec<_>>();
+        for edge in 0..4 {
+            visible_polygon = clip_polygon_to_rect_edge(&visible_polygon, clip_rect, edge);
+            if visible_polygon.is_empty() {
+                return None;
+            }
+        }
+
+        let mut min = egui::pos2(f32::INFINITY, f32::INFINITY);
+        let mut max = egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for screen in visible_polygon {
+            let source = self.screen_to_source_normalized(screen);
+            min.x = min.x.min(source.x);
+            min.y = min.y.min(source.y);
+            max.x = max.x.max(source.x);
+            max.y = max.y.max(source.y);
+        }
+        let visible = egui::Rect::from_min_max(min, max).intersect(self.uv_rect);
+        rect_is_valid(visible).then_some(visible)
+    }
+
     pub(crate) fn paint_texture(
         &self,
         painter: &egui::Painter,
@@ -301,6 +340,68 @@ impl DisplayedImageTransform {
         mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
         painter.add(egui::Shape::mesh(mesh));
     }
+
+    /// Paint a texture representing only `source_uv_rect` at the matching place
+    /// in this transform. This is used by visible-region upscale outputs; the
+    /// normal full-image/downscale path continues to use `paint_texture`.
+    pub(crate) fn paint_texture_source_region(
+        &self,
+        painter: &egui::Painter,
+        texture_id: egui::TextureId,
+        source_uv_rect: egui::Rect,
+        tint: egui::Color32,
+    ) {
+        paint_source_region_texture(
+            painter,
+            texture_id,
+            self.full_image_rect,
+            self.rotation,
+            self.free_rotation_rad,
+            source_uv_rect,
+            full_uv_rect(),
+            tint,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_source_region_texture(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    full_image_rect: egui::Rect,
+    rotation: Rotation,
+    free_rotation_rad: f32,
+    source_uv_rect: egui::Rect,
+    texture_uv_rect: egui::Rect,
+    tint: egui::Color32,
+) {
+    let source_uvs = [
+        source_uv_rect.left_top(),
+        source_uv_rect.right_top(),
+        source_uv_rect.right_bottom(),
+        source_uv_rect.left_bottom(),
+    ];
+    let texture_uvs = [
+        texture_uv_rect.left_top(),
+        texture_uv_rect.right_top(),
+        texture_uv_rect.right_bottom(),
+        texture_uv_rect.left_bottom(),
+    ];
+    let mut mesh = egui::Mesh::with_texture(texture_id);
+    for (source, texture_uv) in source_uvs.into_iter().zip(texture_uvs) {
+        let (u, v) = forward_uv(rotation, source.x, source.y);
+        let position = egui::pos2(
+            full_image_rect.left() + u * full_image_rect.width(),
+            full_image_rect.top() + v * full_image_rect.height(),
+        );
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: rotate_about(position, full_image_rect.center(), free_rotation_rad),
+            uv: texture_uv,
+            color: tint,
+        });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -528,6 +629,51 @@ fn rect_is_valid(rect: egui::Rect) -> bool {
         && rect.max.y.is_finite()
         && rect.width() > 0.0
         && rect.height() > 0.0
+}
+
+fn clip_polygon_to_rect_edge(
+    polygon: &[egui::Pos2],
+    clip: egui::Rect,
+    edge: usize,
+) -> Vec<egui::Pos2> {
+    if polygon.is_empty() {
+        return Vec::new();
+    }
+    let inside = |point: egui::Pos2| match edge {
+        0 => point.x >= clip.left(),
+        1 => point.x <= clip.right(),
+        2 => point.y >= clip.top(),
+        _ => point.y <= clip.bottom(),
+    };
+    let intersection = |start: egui::Pos2, end: egui::Pos2| {
+        let delta = end - start;
+        let t = match edge {
+            0 => (clip.left() - start.x) / delta.x,
+            1 => (clip.right() - start.x) / delta.x,
+            2 => (clip.top() - start.y) / delta.y,
+            _ => (clip.bottom() - start.y) / delta.y,
+        }
+        .clamp(0.0, 1.0);
+        start + delta * t
+    };
+
+    let mut output = Vec::with_capacity(polygon.len() + 2);
+    let mut previous = *polygon.last().unwrap();
+    let mut previous_inside = inside(previous);
+    for &current in polygon {
+        let current_inside = inside(current);
+        if current_inside {
+            if !previous_inside {
+                output.push(intersection(previous, current));
+            }
+            output.push(current);
+        } else if previous_inside {
+            output.push(intersection(previous, current));
+        }
+        previous = current;
+        previous_inside = current_inside;
+    }
+    output
 }
 
 fn rotated_size(size: egui::Vec2, rotation: Rotation) -> egui::Vec2 {
@@ -965,6 +1111,77 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn visible_source_rect_intersects_trim_and_viewport() {
+        let trim = egui::Rect::from_min_max(egui::pos2(0.20, 0.10), egui::pos2(0.90, 0.80));
+        let transform = DisplayedImageTransform::from_resolved_rect(
+            DisplayedImageTransformInput {
+                page_idx: 7,
+                viewport_rect: egui::Rect::from_min_max(
+                    egui::pos2(25.0, 10.0),
+                    egui::pos2(75.0, 90.0),
+                ),
+                source_size: egui::vec2(100.0, 100.0),
+                texture_size: egui::vec2(100.0, 100.0),
+                rotation: Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: Some(trim),
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point: 1.0,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            },
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 100.0)),
+        )
+        .unwrap();
+
+        let visible = transform
+            .visible_source_uv_rect(egui::Rect::from_min_max(
+                egui::pos2(0.0, 20.0),
+                egui::pos2(60.0, 70.0),
+            ))
+            .unwrap();
+        rect_close(
+            visible,
+            egui::Rect::from_min_max(egui::pos2(0.25, 0.20), egui::pos2(0.60, 0.70)),
+        );
+    }
+
+    #[test]
+    fn visible_source_rect_tracks_orthogonal_rotation() {
+        let transform = DisplayedImageTransform::from_resolved_rect(
+            DisplayedImageTransformInput {
+                page_idx: 7,
+                viewport_rect: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(100.0, 200.0),
+                ),
+                source_size: egui::vec2(200.0, 100.0),
+                texture_size: egui::vec2(200.0, 100.0),
+                rotation: Rotation::Cw90,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point: 1.0,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            },
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 200.0)),
+        )
+        .unwrap();
+
+        let visible = transform
+            .visible_source_uv_rect(egui::Rect::from_min_max(
+                egui::pos2(0.0, 50.0),
+                egui::pos2(50.0, 150.0),
+            ))
+            .unwrap();
+        rect_close(
+            visible,
+            egui::Rect::from_min_max(egui::pos2(0.25, 0.50), egui::pos2(0.75, 1.0)),
+        );
     }
 
     #[test]
