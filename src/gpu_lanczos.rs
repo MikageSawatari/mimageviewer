@@ -1,42 +1,71 @@
-//! Product GPU Lanczos3 downscaling for fullscreen still-image paint resources.
+//! Product GPU Lanczos3 resampling for fullscreen still-image paint resources.
 //!
 //! The original [`egui::TextureHandle`] remains the logical-size owner. A native
-//! downscale texture only replaces the [`egui::TextureId`] supplied to paint.
+//! resampled texture only replaces the [`egui::TextureId`] supplied to paint.
 
-use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Instant,
+};
 
 use wgpu::util::DeviceExt as _;
 
-use crate::displayed_image_transform::physical_scale_is_near_integer;
+use crate::{adjustment::PostFilter, displayed_image_transform::physical_scale_is_near_integer};
 
 const LANCZOS3_SHADER: &str = include_str!("gpu_lanczos_spike.wgsl");
 const MAX_CACHE_ENTRIES: usize = 64;
 const MAX_TARGETS_PER_SOURCE: usize = 2;
+// Keep the generated texture within the app's cross-GPU edge limit and cap one
+// persistent RGBA8 output at 64 MiB. The two-pass intermediate is also bounded
+// because each upscale axis is smaller than its corresponding output axis.
+const MAX_UPSCALE_TARGET_DIMENSION: u32 = crate::app::MAX_TEXTURE_DIM as u32;
+const MAX_UPSCALE_TARGET_PIXELS: u64 = 4096 * 4096;
+const MAX_CACHED_UPSCALE_PIXELS: u64 = MAX_UPSCALE_TARGET_PIXELS * 2;
 
 /// A coarser bucket visibly shifts hard edges after the final linear resize. The
 /// CPU-reference comparison is recorded in the stage-4 plan, so exact 1 px targets
 /// deliberately take precedence over allocation bucketing.
 pub(crate) const TARGET_SIZE_QUANTUM: u32 = 1;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum FullscreenPaintScaleBranch {
     DownscaleLanczos,
     OriginalOneToOne,
+    UpscaleLanczos,
     OriginalUpscale,
+}
+
+impl FullscreenPaintScaleBranch {
+    fn uses_lanczos(self) -> bool {
+        matches!(self, Self::DownscaleLanczos | Self::UpscaleLanczos)
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::DownscaleLanczos => "downscale",
+            Self::OriginalOneToOne => "one_to_one",
+            Self::UpscaleLanczos => "upscale",
+            Self::OriginalUpscale => "original_upscale",
+        }
+    }
 }
 
 pub(crate) fn fullscreen_paint_scale_branch(
     logical_scale: f32,
     pixels_per_point: f32,
+    post_filter: PostFilter,
 ) -> FullscreenPaintScaleBranch {
-    if physical_scale_is_near_integer(logical_scale, pixels_per_point) {
-        if physical_scale(logical_scale, pixels_per_point) <= 1.0 + 1.0e-4 {
-            FullscreenPaintScaleBranch::OriginalOneToOne
-        } else {
-            FullscreenPaintScaleBranch::OriginalUpscale
-        }
-    } else if physical_scale(logical_scale, pixels_per_point) < 1.0 {
+    let physical_scale = physical_scale(logical_scale, pixels_per_point);
+    if physical_scale_is_near_integer(logical_scale, pixels_per_point)
+        && physical_scale <= 1.0 + 1.0e-4
+    {
+        FullscreenPaintScaleBranch::OriginalOneToOne
+    } else if physical_scale < 1.0 {
         FullscreenPaintScaleBranch::DownscaleLanczos
+    } else if post_filter == PostFilter::None {
+        FullscreenPaintScaleBranch::UpscaleLanczos
     } else {
         FullscreenPaintScaleBranch::OriginalUpscale
     }
@@ -132,6 +161,13 @@ impl FullscreenPaintResource {
         }
     }
 
+    pub(crate) fn page_idx(&self) -> Option<usize> {
+        match self {
+            Self::Resampleable { page_idx, .. } | Self::Lanczos { page_idx, .. } => Some(*page_idx),
+            Self::Direct { .. } => None,
+        }
+    }
+
     fn resampleable_parts(
         &self,
     ) -> Option<(usize, &egui::TextureHandle, FullscreenPaintSourceGeneration)> {
@@ -182,6 +218,14 @@ struct LanczosCacheKey {
     generation: FullscreenPaintSourceGeneration,
     target_size: [u32; 2],
     smoothing_percent: u32,
+    scale_branch: FullscreenPaintScaleBranch,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct LanczosFallbackSourceKey {
+    page_idx: usize,
+    source_texture_id: egui::TextureId,
+    generation: FullscreenPaintSourceGeneration,
 }
 
 struct LanczosCacheEntry {
@@ -198,6 +242,27 @@ pub(crate) struct LanczosGenerationStats {
     pub(crate) texture_fetches: u64,
     pub(crate) encode_submit_cpu_ms: f64,
     pub(crate) regeneration_count: u64,
+    pub(crate) scale_branch: FullscreenPaintScaleBranch,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LanczosLimitFallbackStats {
+    pub(crate) source_size: [u32; 2],
+    pub(crate) target_size: [u32; 2],
+    pub(crate) max_dimension: u32,
+    pub(crate) max_pixels: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LanczosPerfEvent {
+    Generated(LanczosGenerationStats),
+    UpscaleLimitFallback(LanczosLimitFallbackStats),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LanczosTargetDecision {
+    Resample,
+    OriginalFallback,
 }
 
 #[derive(Default)]
@@ -207,6 +272,7 @@ pub(crate) struct GpuLanczosCache {
     use_clock: u64,
     regeneration_count: u64,
     active_smoothing_percent: u32,
+    limit_fallback_sources: HashSet<LanczosFallbackSourceKey>,
 }
 
 impl GpuLanczosCache {
@@ -216,15 +282,15 @@ impl GpuLanczosCache {
         resource: &FullscreenPaintResource,
         logical_scale: f32,
         pixels_per_point: f32,
+        post_filter: PostFilter,
         smoothing_percent: u32,
-    ) -> (FullscreenPaintResource, Option<LanczosGenerationStats>) {
+    ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
         let smoothing_percent =
             crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
         self.sync_smoothing_percent(smoothing_percent);
-        if resource.resampleable_parts().is_none()
-            || fullscreen_paint_scale_branch(logical_scale, pixels_per_point)
-                != FullscreenPaintScaleBranch::DownscaleLanczos
-        {
+        let scale_branch =
+            fullscreen_paint_scale_branch(logical_scale, pixels_per_point, post_filter);
+        if resource.resampleable_parts().is_none() || !scale_branch.uses_lanczos() {
             return (resource.original_resampleable(), None);
         }
         let Some(render_state) = render_state else {
@@ -232,21 +298,46 @@ impl GpuLanczosCache {
         };
         let (page_idx, source, generation) = resource.resampleable_parts().unwrap();
         let source_size = [source.size()[0] as u32, source.size()[1] as u32];
-        let target_size = quantized_target_size(
-            source_size,
-            physical_scale(logical_scale, pixels_per_point),
-            TARGET_SIZE_QUANTUM,
-        );
+        let physical_scale = physical_scale(logical_scale, pixels_per_point);
+        let target_size = quantized_target_size(source_size, physical_scale, TARGET_SIZE_QUANTUM);
         if target_size == source_size {
             return (resource.original_resampleable(), None);
         }
+        let fallback_source = LanczosFallbackSourceKey {
+            page_idx,
+            source_texture_id: source.id(),
+            generation,
+        };
+        if lanczos_target_decision(scale_branch, target_size)
+            == LanczosTargetDecision::OriginalFallback
+        {
+            let first_for_source = self.limit_fallback_sources.insert(fallback_source);
+            let event = first_for_source.then_some(LanczosPerfEvent::UpscaleLimitFallback(
+                LanczosLimitFallbackStats {
+                    source_size,
+                    target_size,
+                    max_dimension: MAX_UPSCALE_TARGET_DIMENSION,
+                    max_pixels: MAX_UPSCALE_TARGET_PIXELS,
+                },
+            ));
+            return (resource.original_resampleable(), event);
+        }
+        self.limit_fallback_sources.remove(&fallback_source);
+        // The user-facing smoothing control is specifically for downscaling. Keeping
+        // upscale at zero also leaves the Lanczos3 support radius at exactly 3.0.
+        let effective_smoothing_percent =
+            if scale_branch == FullscreenPaintScaleBranch::DownscaleLanczos {
+                smoothing_percent
+            } else {
+                0
+            };
         if let FullscreenPaintResource::Lanczos {
             output,
             smoothing_percent: resource_smoothing,
             ..
         } = resource
             && output.size == target_size
-            && *resource_smoothing == smoothing_percent
+            && *resource_smoothing == effective_smoothing_percent
         {
             return (resource.clone(), None);
         }
@@ -255,7 +346,8 @@ impl GpuLanczosCache {
             source_texture_id: source.id(),
             generation,
             target_size,
-            smoothing_percent,
+            smoothing_percent: effective_smoothing_percent,
+            scale_branch,
         };
         self.resolve_key(render_state, resource, key)
     }
@@ -265,7 +357,7 @@ impl GpuLanczosCache {
         render_state: &egui_wgpu::RenderState,
         resource: &FullscreenPaintResource,
         key: LanczosCacheKey,
-    ) -> (FullscreenPaintResource, Option<LanczosGenerationStats>) {
+    ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
         self.use_clock = self.use_clock.wrapping_add(1);
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.last_used = self.use_clock;
@@ -296,7 +388,7 @@ impl GpuLanczosCache {
         resource: &FullscreenPaintResource,
         key: LanczosCacheKey,
         plan: LanczosPlan,
-    ) -> (FullscreenPaintResource, Option<LanczosGenerationStats>) {
+    ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
         let started = Instant::now();
         let mut renderer = render_state.renderer.write();
         let Some(source_texture) = renderer
@@ -331,7 +423,7 @@ impl GpuLanczosCache {
         job: LanczosJob,
         texture_id: egui::TextureId,
         started: Instant,
-    ) -> (FullscreenPaintResource, Option<LanczosGenerationStats>) {
+    ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
         self.encode_and_finish(rs, resource, key, plan, job, texture_id, started)
     }
 
@@ -345,7 +437,7 @@ impl GpuLanczosCache {
         job: LanczosJob,
         texture_id: egui::TextureId,
         started: Instant,
-    ) -> (FullscreenPaintResource, Option<LanczosGenerationStats>) {
+    ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
         let mut encoder = rs.device.create_command_encoder(&Default::default());
         self.resampler.as_ref().unwrap().encode(&mut encoder, &job);
         rs.queue.submit(Some(encoder.finish()));
@@ -365,7 +457,7 @@ impl GpuLanczosCache {
         plan: LanczosPlan,
         output: Arc<LanczosOutput>,
         started: Instant,
-    ) -> (FullscreenPaintResource, Option<LanczosGenerationStats>) {
+    ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
         self.regeneration_count = self.regeneration_count.wrapping_add(1);
         let stats = LanczosGenerationStats {
             source_size: plan.source_size,
@@ -375,6 +467,7 @@ impl GpuLanczosCache {
             texture_fetches: plan.texture_fetches,
             encode_submit_cpu_ms: started.elapsed().as_secs_f64() * 1000.0,
             regeneration_count: self.regeneration_count,
+            scale_branch: key.scale_branch,
         };
         self.entries.insert(
             key,
@@ -385,22 +478,28 @@ impl GpuLanczosCache {
         );
         self.prune_source_targets(key);
         self.prune_global_lru();
+        self.prune_upscale_pixels();
         (
             resource.with_lanczos(output, key.smoothing_percent),
-            Some(stats),
+            Some(LanczosPerfEvent::Generated(stats)),
         )
     }
 
     pub(crate) fn retain_page_indices(&mut self, keep: &std::collections::HashSet<usize>) {
         self.entries.retain(|key, _| keep.contains(&key.page_idx));
+        self.limit_fallback_sources
+            .retain(|key| keep.contains(&key.page_idx));
     }
 
     pub(crate) fn remove_page(&mut self, page_idx: usize) {
         self.entries.retain(|key, _| key.page_idx != page_idx);
+        self.limit_fallback_sources
+            .retain(|key| key.page_idx != page_idx);
     }
 
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
+        self.limit_fallback_sources.clear();
     }
 
     fn sync_smoothing_percent(&mut self, smoothing_percent: u32) -> bool {
@@ -443,6 +542,31 @@ impl GpuLanczosCache {
             let Some(oldest) = self
                 .entries
                 .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn prune_upscale_pixels(&mut self) {
+        loop {
+            let total = self
+                .entries
+                .iter()
+                .filter(|(key, _)| key.scale_branch == FullscreenPaintScaleBranch::UpscaleLanczos)
+                .fold(0_u64, |pixels, (key, _)| {
+                    pixels.saturating_add(target_pixels(key.target_size))
+                });
+            if total <= MAX_CACHED_UPSCALE_PIXELS {
+                break;
+            }
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .filter(|(key, _)| key.scale_branch == FullscreenPaintScaleBranch::UpscaleLanczos)
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(key, _)| *key)
             else {
@@ -525,11 +649,7 @@ impl LanczosPlan {
         target_size: [u32; 2],
         smoothing_percent: u32,
     ) -> Result<Self, ()> {
-        if source_size.contains(&0)
-            || target_size.contains(&0)
-            || target_size[0] > source_size[0]
-            || target_size[1] > source_size[1]
-        {
+        if source_size.contains(&0) || target_size.contains(&0) {
             return Err(());
         }
         let smoothing_percent =
@@ -552,15 +672,42 @@ impl LanczosPlan {
 fn quantized_target_size(source_size: [u32; 2], scale: f32, quantum: u32) -> [u32; 2] {
     let quantum = quantum.max(1);
     let quantize = |source: u32| {
-        let exact = ((source as f64 * f64::from(scale)).floor() as u32).clamp(1, source);
-        exact
+        let exact = ((source as f64 * f64::from(scale)).floor() as u32).max(1);
+        let quantized = exact
             .saturating_add(quantum - 1)
             .checked_div(quantum)
             .unwrap_or(1)
-            .saturating_mul(quantum)
-            .min(source)
+            .saturating_mul(quantum);
+        if scale <= 1.0 {
+            quantized.min(source)
+        } else {
+            quantized
+        }
     };
     [quantize(source_size[0]), quantize(source_size[1])]
+}
+
+fn target_pixels(size: [u32; 2]) -> u64 {
+    u64::from(size[0]).saturating_mul(u64::from(size[1]))
+}
+
+fn upscale_target_within_limits(target_size: [u32; 2]) -> bool {
+    target_size[0] <= MAX_UPSCALE_TARGET_DIMENSION
+        && target_size[1] <= MAX_UPSCALE_TARGET_DIMENSION
+        && target_pixels(target_size) <= MAX_UPSCALE_TARGET_PIXELS
+}
+
+fn lanczos_target_decision(
+    scale_branch: FullscreenPaintScaleBranch,
+    target_size: [u32; 2],
+) -> LanczosTargetDecision {
+    if scale_branch == FullscreenPaintScaleBranch::UpscaleLanczos
+        && !upscale_target_within_limits(target_size)
+    {
+        LanczosTargetDecision::OriginalFallback
+    } else {
+        LanczosTargetDecision::Resample
+    }
 }
 
 fn sample_range(
@@ -857,35 +1004,55 @@ mod tests {
     #[test]
     fn scale_branches_match_dot_by_dot_boundary() {
         assert_eq!(
-            fullscreen_paint_scale_branch(0.75, 1.0),
+            fullscreen_paint_scale_branch(0.75, 1.0, PostFilter::None),
             FullscreenPaintScaleBranch::DownscaleLanczos
         );
         assert_eq!(
-            fullscreen_paint_scale_branch(1.0, 1.0),
+            fullscreen_paint_scale_branch(1.0, 1.0, PostFilter::None),
             FullscreenPaintScaleBranch::OriginalOneToOne
         );
         assert_eq!(
-            fullscreen_paint_scale_branch(1.25, 1.0),
-            FullscreenPaintScaleBranch::OriginalUpscale
+            fullscreen_paint_scale_branch(1.25, 1.0, PostFilter::None),
+            FullscreenPaintScaleBranch::UpscaleLanczos
         );
         assert_eq!(
-            fullscreen_paint_scale_branch(2.0, 1.0),
-            FullscreenPaintScaleBranch::OriginalUpscale
+            fullscreen_paint_scale_branch(2.0, 1.0, PostFilter::None),
+            FullscreenPaintScaleBranch::UpscaleLanczos
         );
         assert!(physical_scale_is_near_integer(2.0, 1.0));
         assert_eq!(
-            fullscreen_paint_scale_branch(0.5, 2.0),
+            fullscreen_paint_scale_branch(0.5, 2.0, PostFilter::None),
             FullscreenPaintScaleBranch::OriginalOneToOne
         );
         assert!(physical_scale_is_near_integer(0.5, 2.0));
     }
 
     #[test]
+    fn nearest_and_effect_filters_only_bypass_upscale_lanczos() {
+        assert_eq!(
+            fullscreen_paint_scale_branch(2.0, 1.0, PostFilter::Nearest),
+            FullscreenPaintScaleBranch::OriginalUpscale
+        );
+        assert_eq!(
+            fullscreen_paint_scale_branch(1.25, 1.0, PostFilter::Sepia),
+            FullscreenPaintScaleBranch::OriginalUpscale
+        );
+        assert_eq!(
+            fullscreen_paint_scale_branch(0.75, 1.0, PostFilter::Nearest),
+            FullscreenPaintScaleBranch::DownscaleLanczos
+        );
+        assert_eq!(
+            fullscreen_paint_scale_branch(0.75, 1.0, PostFilter::Sepia),
+            FullscreenPaintScaleBranch::DownscaleLanczos
+        );
+    }
+
+    #[test]
     fn near_one_never_enters_lanczos() {
         for scale in [1.0, 1.0 - 5.0e-5, 1.0 + 5.0e-5] {
-            assert_ne!(
-                fullscreen_paint_scale_branch(scale, 1.0),
-                FullscreenPaintScaleBranch::DownscaleLanczos
+            assert_eq!(
+                fullscreen_paint_scale_branch(scale, 1.0, PostFilter::None),
+                FullscreenPaintScaleBranch::OriginalOneToOne
             );
         }
     }
@@ -911,6 +1078,39 @@ mod tests {
     }
 
     #[test]
+    fn upscale_targets_include_integer_and_fractional_scales() {
+        assert_eq!(
+            quantized_target_size([1200, 800], 2.0, TARGET_SIZE_QUANTUM),
+            [2400, 1600]
+        );
+        assert_eq!(
+            quantized_target_size([1200, 800], 1.25, TARGET_SIZE_QUANTUM),
+            [1500, 1000]
+        );
+    }
+
+    #[test]
+    fn upscale_limits_fall_back_to_original_before_allocating_oversized_targets() {
+        assert!(upscale_target_within_limits([4096, 4096]));
+        assert!(upscale_target_within_limits([8192, 2048]));
+        assert!(!upscale_target_within_limits([4097, 4096]));
+        assert!(!upscale_target_within_limits([8193, 1]));
+        assert_eq!(
+            lanczos_target_decision(FullscreenPaintScaleBranch::UpscaleLanczos, [4097, 4096]),
+            LanczosTargetDecision::OriginalFallback
+        );
+        assert_eq!(
+            lanczos_target_decision(FullscreenPaintScaleBranch::UpscaleLanczos, [8193, 1]),
+            LanczosTargetDecision::OriginalFallback
+        );
+        assert_eq!(
+            lanczos_target_decision(FullscreenPaintScaleBranch::DownscaleLanczos, [8192, 8192]),
+            LanczosTargetDecision::Resample,
+            "the new upscale guard must not change the existing downscale path"
+        );
+    }
+
+    #[test]
     fn source_generation_is_cache_identity() {
         let base = LanczosCacheKey {
             page_idx: 3,
@@ -918,6 +1118,7 @@ mod tests {
             generation: FullscreenPaintSourceGeneration { items: 4, input: 8 },
             target_size: [640, 480],
             smoothing_percent: 0,
+            scale_branch: FullscreenPaintScaleBranch::DownscaleLanczos,
         };
         let changed = LanczosCacheKey {
             generation: FullscreenPaintSourceGeneration { items: 4, input: 9 },
@@ -929,6 +1130,11 @@ mod tests {
             ..base
         };
         assert_ne!(base, smoothing_changed);
+        let branch_changed = LanczosCacheKey {
+            scale_branch: FullscreenPaintScaleBranch::UpscaleLanczos,
+            ..base
+        };
+        assert_ne!(base, branch_changed);
     }
 
     struct CountingReleaser(AtomicUsize);
@@ -960,6 +1166,19 @@ mod tests {
         assert_eq!(plan.target_size, [620, 877]);
         assert_eq!(plan.smoothing_percent, 0);
         assert!((plan.blur_factor - 1.0).abs() < f32::EPSILON);
+        assert!(plan.texture_fetches > 0);
+    }
+
+    #[test]
+    fn product_plan_accepts_upscale_targets_without_widening_support() {
+        let plan = LanczosPlan::new([1920, 1080], [3840, 2160], 0).unwrap();
+        assert_eq!(plan.source_size, [1920, 1080]);
+        assert_eq!(plan.target_size, [3840, 2160]);
+        assert!((plan.blur_factor - 1.0).abs() < f32::EPSILON);
+        assert_eq!(
+            sample_range(1920, 3840, 2000, plan.blur_factor),
+            (997, 1003)
+        );
         assert!(plan.texture_fetches > 0);
     }
 

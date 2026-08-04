@@ -949,7 +949,7 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 見開き / 連結読みのページ配置計算は引き続き `ui_fullscreen.rs` が担当し、その結果を
 `DisplayedImageTransform::from_resolved_rect` で共通レイアウトへ登録する。
 
-### 2.4.1 フルスクリーン静止画の GPU Lanczos3 縮小
+### 2.4.1 フルスクリーン静止画の GPU Lanczos3 縮小・標準拡大
 
 通常静止画は、上記の表示優先順位と
 `edit -> color -> final AI -> smart sharpen -> post_filter` の合成をすべて解決した**後**に、
@@ -958,7 +958,7 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 
 `FullscreenPaintResource` は `Direct / Resampleable / Lanczos` の typed state で、全 variant が
 元の `TextureHandle` を保持する。レイアウト、trim UV、回転、hit-test、pixel grid は元ハンドルの
-`size_vec2()` から従来どおり `DisplayedImageTransform` が解決する。縮小時だけ separable
+`size_vec2()` から従来どおり `DisplayedImageTransform` が解決する。縮小時と標準フィルタでの拡大時だけ separable
 Lanczos3 の native texture を別所有し、`DisplayedImageTransform::paint_texture` に渡す
 `TextureId` だけを差し替える (C-1)。shader は段階3 spike と同じもので、level 0 の
 `Rgba8Unorm` source を vertical `Rgba16Float`、horizontal `Rgba8Unorm` の 2 pass で
@@ -973,7 +973,15 @@ Lanczos3 の native texture を別所有し、`DisplayedImageTransform::paint_te
 
 - 1.0 未満: CPU 参照と同じ `floor(source × physical_scale)` の目標寸法へ Lanczos3。
 - 1.0: 元 `TextureId` を直接 paint し、段階1・2のドットバイドットを維持。
-- 1.0 超: 元 `TextureId` を直接 paint し、従来の post-filter 設定に従う。
+- 1.0 超かつ `PostFilter::None`: 同じシェーダで表示寸法へ Lanczos3。整数倍も含む。
+  拡大では blur 1.00 固定とし、`filter_stretch` を 1.0 より広げない。
+- 1.0 超かつ `PostFilter::Nearest`: 元 `TextureId` を直接 paint し、NEAREST を維持。
+- 1.0 超かつ CRT / レトロ / セピア等の効果 post-filter: 元 `TextureId` を直接 paint し、
+  従来の LINEAR を維持。拡大方式と効果は独立選択にしない。
+
+拡大出力は一辺 8192px、総画素 4096×4096 相当までとし、いずれかを超える場合は
+Lanczos texture を生成せず従来の LINEAR 表示へ戻す。フォールバックは同じ source generation
+につき一度 `gpu/lanczos_upscale_limit_fallback` へ記録する。
 
 単ページ、見開きの各ページ、縦 / 横連結読み、page transition、nav / colorize holdover、
 detached single / spread / continuous frozen snapshot と keep-alive backstop は同じ typed
@@ -983,15 +991,18 @@ resource を通る。見開きは高さ合わせ係数を含むページ別実�
 動画、mask、checker、UI preview は direct 経路のままである。
 
 Lanczos cache は viewer context ごとに所有し、key は page idx、元 `TextureId`、
-`items_generation`、ページ別 `input_generation`、目標寸法、正規化済み smoothing percent
+`items_generation`、ページ別 `input_generation`、目標寸法、正規化済み smoothing percent、
+拡大 / 縮小 branch
 から成る。設定値が変わると context 内の Lanczos 出力 cache を消去し、typed resource に保持した
 旧 percent と一致しない出力も再利用しない。回転・trim は full source
 出力を変えないため key に入れない。source ごとの直近 2 寸法、context 全体 64 entry の LRU とし、
 fullscreen close / invalidation / context park・swap / 連結読み keep-set に追従する。native
 `TextureId` は cache、holdover、snapshot が共有する `Arc` lease の最終 drop で free する。
-出力は `LanczosOutputs` として実寸・mip なしで VRAM 会計し、perf log の
+出力は `LanczosOutputs` として実寸・mip なしで VRAM 会計する。拡大 cache だけは context ごとに
+総画素 4096×4096 相当の 2 枚分を追加上限として古い entry を落とし、縮小 cache の保持規則は変えない。
+perf log の
 `gpu/lanczos_regenerate` に source / target、smoothing percent / blur、推定 fetch 数、
-encode + submit CPU 時間、累積再生成回数を記録する。
+encode + submit CPU 時間、累積再生成回数、拡大 / 縮小の別を記録する。
 
 静止画の最終フィット矩形は `fullscreen_media_rect` が所有する。下部ページシークバー固定時は
 `FS_SEEK_BAR_HEIGHT`、上部情報バー固定時は `TOP_BAR_HEIGHT` をそれぞれ `full_rect` から除外し、

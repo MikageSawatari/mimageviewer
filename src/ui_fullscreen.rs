@@ -2274,41 +2274,64 @@ impl App {
         pixels_per_point: f32,
     ) -> crate::gpu_lanczos::FullscreenPaintResource {
         let render_state = self.wgpu_render_state.clone();
-        let (prepared, stats) = self.fs_lanczos_cache.resolve(
+        let post_filter = if self.post_filter_bypassed {
+            crate::adjustment::PostFilter::None
+        } else {
+            resource
+                .page_idx()
+                .map(|idx| self.effective_params(idx).post_filter)
+                .unwrap_or(crate::adjustment::PostFilter::None)
+        };
+        let (prepared, perf_event) = self.fs_lanczos_cache.resolve(
             render_state.as_ref(),
             resource,
             logical_scale,
             pixels_per_point,
+            post_filter,
             self.settings.downscale_smoothing_percent,
         );
-        if let Some(stats) = stats
+        if let Some(perf_event) = perf_event
             && crate::perf::is_enabled()
         {
-            let idx = match resource {
-                crate::gpu_lanczos::FullscreenPaintResource::Resampleable { page_idx, .. }
-                | crate::gpu_lanczos::FullscreenPaintResource::Lanczos { page_idx, .. } => {
-                    Some(*page_idx)
+            let key = resource.page_idx().and_then(|idx| self.perf_item_key(idx));
+            match perf_event {
+                crate::gpu_lanczos::LanczosPerfEvent::Generated(stats) => {
+                    crate::perf::event(
+                        "gpu",
+                        "lanczos_regenerate",
+                        key.as_deref(),
+                        self.input_seq,
+                        &[
+                            ("source_w", stats.source_size[0].into()),
+                            ("source_h", stats.source_size[1].into()),
+                            ("target_w", stats.target_size[0].into()),
+                            ("target_h", stats.target_size[1].into()),
+                            ("scale_branch", stats.scale_branch.as_str().into()),
+                            ("smoothing_percent", stats.smoothing_percent.into()),
+                            ("blur_factor", f64::from(stats.blur_factor).into()),
+                            ("texture_fetches", stats.texture_fetches.into()),
+                            ("encode_submit_cpu_ms", stats.encode_submit_cpu_ms.into()),
+                            ("regeneration_count", stats.regeneration_count.into()),
+                        ],
+                    );
                 }
-                crate::gpu_lanczos::FullscreenPaintResource::Direct { .. } => None,
-            };
-            let key = idx.and_then(|idx| self.perf_item_key(idx));
-            crate::perf::event(
-                "gpu",
-                "lanczos_regenerate",
-                key.as_deref(),
-                self.input_seq,
-                &[
-                    ("source_w", stats.source_size[0].into()),
-                    ("source_h", stats.source_size[1].into()),
-                    ("target_w", stats.target_size[0].into()),
-                    ("target_h", stats.target_size[1].into()),
-                    ("smoothing_percent", stats.smoothing_percent.into()),
-                    ("blur_factor", f64::from(stats.blur_factor).into()),
-                    ("texture_fetches", stats.texture_fetches.into()),
-                    ("encode_submit_cpu_ms", stats.encode_submit_cpu_ms.into()),
-                    ("regeneration_count", stats.regeneration_count.into()),
-                ],
-            );
+                crate::gpu_lanczos::LanczosPerfEvent::UpscaleLimitFallback(stats) => {
+                    crate::perf::event(
+                        "gpu",
+                        "lanczos_upscale_limit_fallback",
+                        key.as_deref(),
+                        self.input_seq,
+                        &[
+                            ("source_w", stats.source_size[0].into()),
+                            ("source_h", stats.source_size[1].into()),
+                            ("target_w", stats.target_size[0].into()),
+                            ("target_h", stats.target_size[1].into()),
+                            ("max_dimension", stats.max_dimension.into()),
+                            ("max_pixels", stats.max_pixels.into()),
+                        ],
+                    );
+                }
+            }
         }
         prepared
     }

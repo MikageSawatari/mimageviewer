@@ -24,13 +24,13 @@ pub enum AutoMode {
 
 /// ポストフィルタ (レトロ系表示エフェクト)。
 ///
-/// 色調補正の後段で CPU 処理として適用される。`None` = 現状挙動、
+/// 色調補正の後段で CPU 処理として適用される。`None` = 標準表示 (拡大は Lanczos3)、
 /// `Nearest` = CPU 変換はしないが NEAREST サンプラーで拡大する。
 /// その他は CRT ブラウン管風 / 減色 / 複合プリセット。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PostFilter {
-    /// フィルタ無し (補間あり、LINEAR サンプラー) = デフォルト
+    /// フィルタ無し (標準の Lanczos3 拡大) = デフォルト
     #[default]
     #[serde(alias = "downscale2x", alias = "downscale4x")]
     None,
