@@ -358,10 +358,10 @@ continuous transition が実際に選ばれた場合も同イベントへ `branc
 `App::start_fs_load` (app.rs) が std::thread::spawn で 1 枚ごとに spawn:
 
 ```
-          ┌─ GridItem::Image      → image::open() → 失敗時 WIC フォールバック → EXIF 適用
-          ├─ GridItem::ZipImage   → zip_loader で bytes 読み出し → image::load_from_memory
-          │                          → 失敗時 WIC ストリームフォールバック (SHCreateMemStream)
-          │                          → bytes から EXIF Orientation 適用
+          ┌─ GridItem::Image      ┐
+          ├─ GridItem::ZipImage   ┴→ canonical_image_loader::decode_canonical_image
+          │                          → image crate → WIC → Susie の順で static fallback
+          │                          → EXIF Orientation 適用済み native image
           └─ GridItem::PdfPage    → pdf_loader::render_page_for_display
                                      (実 viewport×ppp、PDF ワーカープロセス)
                                      ※zoom 時は倍率に応じて再レンダリング
@@ -379,6 +379,13 @@ Animated (`FsCacheEntry::Animated`) は playback-only として扱う。表示�
 これは edit/final cache key が idx + generation ベースで、フレーム番号を含まないため、
 1 フレームを派生キャッシュに入れると以後の `current_frame` 更新が画面へ出ず
 アニメーションが停止して見えるため。
+
+`decode_canonical_image` は fullscreen の現行分類も共有する。通常ファイルの GIF/APNG と、
+通常ファイル・ZIP 内の WebP は Animated を返す。ZIP 内 GIF/APNG は animated 拒否ではなく、
+従来どおり static fallback で先頭フレームを読む。Static は EXIF 適用後・8192 clamp 前の
+native `DynamicImage` と `source_dims` を返す。panorama tee はこの native image を受け取り、
+非 panorama の GPU raster 化だけが `CanonicalStaticImage::into_gpu_raster` で従来と同じ
+Bilinear 8192 clamp を行う。
 
 PDF 初回レンダは、描画先の `fullscreen_media_rect` の論理 point 寸法へ、その
 viewport context の effective `pixels_per_point` (OS DPI × UI scale) を掛けて物理 viewport

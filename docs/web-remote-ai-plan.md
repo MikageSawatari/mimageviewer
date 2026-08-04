@@ -1,6 +1,7 @@
 # mIV Remote 段 3b — AI アップスケール / デノイズ設計
 
-状態: **3b-0 実装済み、3b-1 以降は未実装**（2026-08-04、接続中の排他性を反映して全面改稿）。
+状態: **3b-0 実装済み、3b-1a はコード・自動 test 済みで実機 smoke 待ち、3b-1b 以降は未実装**
+（2026-08-04）。
 
 親計画: [web-remote-left-panel-plan.md](web-remote-left-panel-plan.md)
 
@@ -397,7 +398,20 @@ AI 設定だけを書けて remote の絵には AI が乗らない状態は出�
 **実装済み (2026-08-04):** 上記 lifecycle、barrier、inventory、singleton bridge と
 final-release 順序を実装。remote final AI job / UI / job protocol は未実装のまま。
 
-### 3b-1: job protocol と end-to-end backend
+### 3b-1a: 共有 canonical decoder（実機 smoke 待ち）
+
+- fullscreen の通常画像 / verified bytes / ZIP・nested ZIP を同じ typed source decoder へ集約する
+- GIF/APNG/WebP の現行 Animated 分類、image crate → WIC → Susie、EXIF 適用を共有する
+- panorama は clamp 前 native image を従来位置で tee し、通常 static だけ 8192 clamp する
+- raster PDF は既知 content-type snapshot から native 長辺（最大 8192）で render し、
+  vector は render しない canonical API を用意する
+- この段では remote / job protocol へ接続しない。本体 fullscreen の無挙動変更を先に
+  自動 test と実機 smoke で確認する
+
+**実装状況 (2026-08-04):** コードと自動 test は完了。通常画像 / EXIF 回転 / ZIP /
+ZIP 内 GIF / animated GIF / panorama / 8192 超の実機 fullscreen smoke 待ち。
+
+### 3b-1b: job protocol と end-to-end backend
 
 - fake executor で start / state / cancel / disconnect / background recovery を固定する
 - source、MI-GAN、final AI、final composite、WebP を bridge へ接続する

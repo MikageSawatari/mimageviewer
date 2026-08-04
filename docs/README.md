@@ -19,7 +19,7 @@
 | [preset-and-adjustment.md](preset-and-adjustment.md) | 補正・プリセット・AI キャッシュを触るとき。**無効化ルールの早見表** |
 | [adjustment-scope-selector-plan.md](adjustment-scope-selector-plan.md) | **設計合意済み・未実装**。補正スコープを「このページの個別設定 > その場所の標準」の 2 段へ再設計する計画。お気に入りごとの `□ お気に入り用標準設定を使う` (既定 OFF、ON/OFF の実体は `favorite_params` 行の有無)、標準（共通）/ 標準（お気に入り「xxx」）の名称、`Ctrl+Alt+数字` の書き込み先統一と `Ctrl+Alt+-` 追加、表示トリムとの語彙・見た目統一。永続データ変更なし・移行不要 |
 | [ai-processing-size-threshold-plan.md](ai-processing-size-threshold-plan.md) | AI 処理の入力サイズ閾値、縮小規則、テスト要件を触るとき |
-| [web-remote-ai-plan.md](web-remote-ai-plan.md) | **段 3b 設計案・未実装**。remote AI アップスケール / デノイズの PC modal 排他、接続取得 / 切断 drain barrier、App 所有 singleton Runtime、stable remote key、HTTP job、画面消灯復帰、VRAM、撤退条件 |
+| [web-remote-ai-plan.md](web-remote-ai-plan.md) | **段 3b-0 実装済み、3b-1a 自動 test 済み・実機 smoke 待ち**。remote AI アップスケール / デノイズの PC modal 排他、共有 canonical decoder、接続取得 / 切断 drain barrier、App 所有 singleton Runtime、stable remote key、HTTP job、画面消灯復帰、VRAM、撤退条件 |
 | [local-adjust-testing.md](local-adjust-testing.md) | 部分補正レイヤーの回帰テスト、合成順、キャッシュ無効化を検証するとき |
 | [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグを触るとき。**Ctrl+S/F/G の経路 + インデクサパイプライン + DB 責任分離** |
 | [top-level-grid-view.md](top-level-grid-view.md) | 検索・★固定・サブ展開・スマートフォルダ等の最上位一覧 ownership / 復元 snapshot と、スマートフォルダ root / scoped drill の不変条件 |

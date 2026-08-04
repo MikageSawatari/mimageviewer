@@ -2312,6 +2312,13 @@ pub fn zoom_render_long_edge(base_px: u32, zoom: f32, native_cap: Option<u32>) -
     target
 }
 
+/// Raster PDF の AI 入力に使う本体 canonical 長辺。
+/// native を絶対上限にしつつ、全 PDF render の 8192 上限も適用する。
+pub fn canonical_pdf_raster_long_edge(content_type: PdfPageContentType) -> Option<u32> {
+    let native_long = content_type.native_long_edge()?;
+    Some(zoom_render_long_edge(native_long, 1.0, Some(native_long)))
+}
+
 /// PDF ページ render の結果一式 (v1.0.0)。
 ///
 /// 従来は `(image, content_type)` のタプルだったが、PDF メタキャッシュ
@@ -2324,6 +2331,17 @@ pub struct RenderResult {
     pub image: image::DynamicImage,
     pub content_type: PdfPageContentType,
     pub page_count: u32,
+}
+
+/// AI 入力用 PDF canonical renderer の型付き結果。
+/// Vector は pixel を持たず、Raster だけが本体と同じ native-long-edge raster を持つ。
+pub enum CanonicalPdfPage {
+    Vector,
+    Raster {
+        image: image::DynamicImage,
+        native_dims: [u32; 2],
+        page_count: u32,
+    },
 }
 
 pub struct PdfPageEntry {
@@ -2521,6 +2539,68 @@ pub fn render_page_for_display(
         context_epoch,
         cancel_policy,
     )
+}
+
+/// 既に解析済みの PDF content type snapshot から AI 用 canonical raster を得る。
+///
+/// Vector は PDFium render を起動せず [`CanonicalPdfPage::Vector`] を返す。Raster は
+/// 本体 AI reconcile と同じ native-long-edge / 8192 cap で render する。render 中に
+/// source が差し替わって content type/dims が変わった場合は、実際の解析結果で 1 回だけ
+/// target を再計算する。
+#[allow(clippy::too_many_arguments)]
+pub fn render_page_canonical_raster(
+    pdf_path: &Path,
+    page_num: u32,
+    content_type: PdfPageContentType,
+    password: Option<&str>,
+    cancel: Option<Arc<AtomicBool>>,
+    priority: JobPriority,
+    context_epoch: u64,
+    cancel_policy: CancelWaitPolicy,
+) -> std::io::Result<CanonicalPdfPage> {
+    render_page_canonical_raster_with(content_type, |target_px| {
+        render_page(
+            pdf_path,
+            page_num,
+            target_px,
+            password,
+            cancel.clone(),
+            priority,
+            context_epoch,
+            cancel_policy,
+        )
+    })
+}
+
+fn render_page_canonical_raster_with(
+    content_type: PdfPageContentType,
+    mut render: impl FnMut(u32) -> std::io::Result<RenderResult>,
+) -> std::io::Result<CanonicalPdfPage> {
+    let Some(mut target_px) = canonical_pdf_raster_long_edge(content_type) else {
+        return Ok(CanonicalPdfPage::Vector);
+    };
+
+    for _attempt in 0..2 {
+        let result = render(target_px)?;
+        let PdfPageContentType::Raster { w, h } = result.content_type else {
+            return Ok(CanonicalPdfPage::Vector);
+        };
+        let actual_target = canonical_pdf_raster_long_edge(result.content_type)
+            .expect("Raster content type always has a native target");
+        if actual_target == target_px {
+            return Ok(CanonicalPdfPage::Raster {
+                image: result.image,
+                native_dims: [w, h],
+                page_count: result.page_count,
+            });
+        }
+        target_px = actual_target;
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "PDF raster native dimensions changed repeatedly while rendering",
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3035,6 +3115,92 @@ C:\isolated\miv-data"#
         assert_eq!(zoom_render_long_edge(6000, 2.0, None), 8192);
         assert_eq!(zoom_render_long_edge(2376, 2.0, Some(3000)), 3000);
         assert_eq!(zoom_render_long_edge(120, 1.0, Some(120)), 120);
+    }
+
+    #[test]
+    fn canonical_pdf_target_is_native_long_edge_with_the_existing_cap() {
+        assert_eq!(
+            canonical_pdf_raster_long_edge(PdfPageContentType::Vector),
+            None
+        );
+        assert_eq!(
+            canonical_pdf_raster_long_edge(PdfPageContentType::Raster { w: 824, h: 1200 }),
+            Some(1200)
+        );
+        assert_eq!(
+            canonical_pdf_raster_long_edge(PdfPageContentType::Raster { w: 100, h: 200 }),
+            Some(200)
+        );
+        assert_eq!(
+            canonical_pdf_raster_long_edge(PdfPageContentType::Raster { w: 9000, h: 10_000 }),
+            Some(PDF_RENDER_MAX_LONG_PX)
+        );
+    }
+
+    #[test]
+    fn canonical_pdf_vector_never_invokes_the_renderer() {
+        let page = render_page_canonical_raster_with(PdfPageContentType::Vector, |_| {
+            panic!("vector canonical input must not be rasterized")
+        })
+        .unwrap();
+        assert!(matches!(page, CanonicalPdfPage::Vector));
+    }
+
+    #[test]
+    fn canonical_pdf_raster_uses_the_exact_native_target_and_identity() {
+        let mut targets = Vec::new();
+        let page = render_page_canonical_raster_with(
+            PdfPageContentType::Raster { w: 824, h: 1200 },
+            |target| {
+                targets.push(target);
+                Ok(RenderResult {
+                    image: image::DynamicImage::new_rgba8(824, 1200),
+                    content_type: PdfPageContentType::Raster { w: 824, h: 1200 },
+                    page_count: 17,
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(targets, vec![1200]);
+        let CanonicalPdfPage::Raster {
+            image,
+            native_dims,
+            page_count,
+        } = page
+        else {
+            panic!("raster canonical input should return a raster")
+        };
+        assert_eq!((image.width(), image.height()), (824, 1200));
+        assert_eq!(native_dims, [824, 1200]);
+        assert_eq!(page_count, 17);
+    }
+
+    #[test]
+    fn canonical_pdf_raster_recomputes_once_from_the_rendered_snapshot() {
+        let mut targets = Vec::new();
+        let page = render_page_canonical_raster_with(
+            PdfPageContentType::Raster { w: 824, h: 1200 },
+            |target| {
+                targets.push(target);
+                Ok(RenderResult {
+                    image: image::DynamicImage::new_rgba8(1000, 2000),
+                    content_type: PdfPageContentType::Raster { w: 1000, h: 2000 },
+                    page_count: 3,
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(targets, vec![1200, 2000]);
+        assert!(matches!(
+            page,
+            CanonicalPdfPage::Raster {
+                native_dims: [1000, 2000],
+                page_count: 3,
+                ..
+            }
+        ));
     }
 
     #[test]

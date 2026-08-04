@@ -4745,11 +4745,11 @@ pub(crate) use crate::thumb_loader::{
     CACHE_KEY_ARCHIVE, CACHE_KEY_PDF, CACHE_KEY_SEARCH_REP, CACHE_KEY_ZIP,
 };
 
-use crate::fs_animation::{
-    AnimationPlayback, FsCacheEntry, FsLoadResult, decode_apng_frames,
-    decode_apng_frames_from_bytes, decode_gif_frames, decode_gif_frames_from_bytes,
-    decode_webp_frames, decode_webp_frames_from_bytes,
+use crate::canonical_image_loader::{
+    CanonicalAnimatedFormat, CanonicalDecodeError, CanonicalDecodeOptions, CanonicalImageDecode,
+    CanonicalImageSource, CanonicalStaticImage, decode_canonical_image,
 };
+use crate::fs_animation::{AnimationPlayback, FsCacheEntry, FsLoadResult};
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::thumb_loader::{
     CacheDecision, DctDecodeError, LoadRequest, ScaleStats, ThumbMsg, apply_orientation,
@@ -47321,175 +47321,61 @@ impl App {
                 return;
             }
 
-            // ZIP エントリの場合は先にバイト列を抽出
-            let zip_bytes: Option<Vec<u8>> = if let Some(ref entry_name) = zip_entry {
-                match crate::zip_loader::read_entry_bytes(&path, entry_name) {
-                    Ok(b) => Some(b),
-                    Err(e) => {
-                        crate::logger::log(format!("  fs zip read FAIL: {e}  {name}"));
-                        if crate::perf::is_enabled() {
-                            crate::perf::event(
-                                "fs",
-                                "decode_fail",
-                                perf_key_worker.as_deref(),
-                                perf_seq,
-                                &[("format", serde_json::Value::from("zip_read"))],
-                            );
-                        }
-                        // PDF / 静止画のデコード失敗 arm と同じく、UI が「読込中...」の
-                        // まま固着しないよう失敗を明示通知する (送らないと tx drop で
-                        // チャネル切断 → poll_prefetch が Failed を入れず is_loading が
-                        // 永久 true になる。v1.0.0 安定性レビュー P2-1)。
-                        let _ = tx.send(FsLoadResult::Failed);
-                        emit_exit("zip_read_fail");
-                        return;
-                    }
+            // `ArchiveEntry` が verified bytes を持たないのは、relative bookmark の
+            // provenance が画像フォルダ本にしか付かないため。identity と item は
+            // `RelativePath` ↔ `Image` / `ArchiveEntry` ↔ `ZipImage` で型ごとに
+            // 対応しており、ZIP ページに provenance が付く経路は現在存在しない。
+            // ZIP へ relative provenance を導入するときは、ここで verified bytes を
+            // `ArchiveEntry` へも渡すこと。渡さないと ZIP から読み直すため、
+            // 検証済み bytes を迂回する (旧経路の `verified.or(zip_bytes)` 相当の
+            // 優先順位が必要)。
+            let canonical_source = if let Some(entry_name) = zip_entry.as_deref() {
+                CanonicalImageSource::ArchiveEntry {
+                    archive_path: &path,
+                    entry_name,
                 }
             } else {
-                None
-            };
-            let source_bytes = verified_source_bytes.or(zip_bytes);
-
-            // GIF: アニメーション試行 (通常パスのみ, ZIP は未対応)
-            if ext == "gif" && zip_entry.is_none() {
-                let frames = match source_bytes.as_deref() {
-                    Some(bytes) => decode_gif_frames_from_bytes(bytes),
-                    None => decode_gif_frames(&path),
-                };
-                if let Some(frames) = frames {
-                    let elapsed = t.elapsed().as_secs_f64() * 1000.0;
-                    crate::logger::log(format!(
-                        "  fs load anim-gif: {elapsed:.0}ms  idx={idx}  {name}  {} frames",
-                        frames.len()
-                    ));
-                    if crate::perf::is_enabled() {
-                        crate::perf::event(
-                            "fs",
-                            "decode_end",
-                            perf_key_worker.as_deref(),
-                            perf_seq,
-                            &[
-                                ("ms", serde_json::Value::from(elapsed)),
-                                ("format", serde_json::Value::from("gif_anim")),
-                                ("frames", serde_json::Value::from(frames.len())),
-                            ],
-                        );
-                    }
-                    let _ = tx.send(FsLoadResult::Animated(frames));
-                    emit_exit("gif_anim");
-                    return;
-                }
-            }
-
-            // PNG: APNG アニメーション試行 (通常パスのみ, ZIP は未対応)
-            if ext == "png" && zip_entry.is_none() {
-                let frames = match source_bytes.as_deref() {
-                    Some(bytes) => decode_apng_frames_from_bytes(bytes),
-                    None => decode_apng_frames(&path),
-                };
-                if let Some(frames) = frames {
-                    let elapsed = t.elapsed().as_secs_f64() * 1000.0;
-                    crate::logger::log(format!(
-                        "  fs load anim-png: {elapsed:.0}ms  idx={idx}  {name}  {} frames",
-                        frames.len()
-                    ));
-                    if crate::perf::is_enabled() {
-                        crate::perf::event(
-                            "fs",
-                            "decode_end",
-                            perf_key_worker.as_deref(),
-                            perf_seq,
-                            &[
-                                ("ms", serde_json::Value::from(elapsed)),
-                                ("format", serde_json::Value::from("png_anim")),
-                                ("frames", serde_json::Value::from(frames.len())),
-                            ],
-                        );
-                    }
-                    let _ = tx.send(FsLoadResult::Animated(frames));
-                    emit_exit("png_anim");
-                    return;
-                }
-            }
-
-            // WebP: アニメーション試行。通常ファイルと ZIP 内 bytes の両方に対応する。
-            if ext == "webp" {
-                let frames = match source_bytes.as_deref() {
-                    Some(bytes) => decode_webp_frames_from_bytes(bytes),
-                    None => decode_webp_frames(&path),
-                };
-                if let Some(frames) = frames {
-                    let elapsed = t.elapsed().as_secs_f64() * 1000.0;
-                    crate::logger::log(format!(
-                        "  fs load anim-webp: {elapsed:.0}ms  idx={idx}  {name}  {} frames",
-                        frames.len()
-                    ));
-                    if crate::perf::is_enabled() {
-                        crate::perf::event(
-                            "fs",
-                            "decode_end",
-                            perf_key_worker.as_deref(),
-                            perf_seq,
-                            &[
-                                ("ms", serde_json::Value::from(elapsed)),
-                                ("format", serde_json::Value::from("webp_anim")),
-                                ("frames", serde_json::Value::from(frames.len())),
-                                ("is_zip", serde_json::Value::from(zip_entry.is_some())),
-                            ],
-                        );
-                    }
-                    let _ = tx.send(FsLoadResult::Animated(frames));
-                    emit_exit("webp_anim");
-                    return;
-                }
-            }
-
-            // 静止画フォールバック
-            // image クレート → WIC → Susie プラグインの順で試す
-            // ZIP エントリは SHCreateMemStream + CreateDecoderFromStream 経由で WIC へフォールバック
-            let open_result = if let Some(bytes) = source_bytes.as_deref() {
-                let hint = zip_entry
-                    .as_deref()
-                    .or_else(|| path.file_name().and_then(|name| name.to_str()))
-                    .unwrap_or("");
-                match image::load_from_memory(bytes) {
-                    Ok(img) => Ok(img),
-                    Err(e) => {
-                        match crate::wic_decoder::decode_to_dynamic_image_from_bytes(bytes) {
-                            Some(img) => Ok(img),
-                            // フルスクリーン画像ロードは現在表示中のため priority=true
-                            None => {
-                                match crate::susie_loader::decode_bytes(hint, bytes, true, None) {
-                                    Ok(img) => Ok(img),
-                                    Err(_) => Err(e),
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                match image::open(&path) {
-                    Ok(img) => Ok(img),
-                    Err(e) => match crate::wic_decoder::decode_to_dynamic_image(&path) {
-                        Some(img) => Ok(img),
-                        // フルスクリーン画像ロードは現在表示中のため priority=true
-                        None => match crate::susie_loader::decode_file(&path, true, None) {
-                            Ok(img) => Ok(img),
-                            Err(_) => Err(e),
-                        },
-                    },
+                CanonicalImageSource::File {
+                    path: &path,
+                    verified_bytes: verified_source_bytes.as_deref(),
                 }
             };
-            match open_result {
-                Ok(img) => {
-                    // EXIF Orientation 自動回転。ZIP はエントリのバイト列から読む。
-                    let img = match source_bytes.as_deref() {
-                        Some(bytes) => {
-                            crate::thumb_loader::apply_exif_orientation_from_bytes(img, bytes)
+            let canonical_decode =
+                decode_canonical_image(canonical_source, CanonicalDecodeOptions::fullscreen());
+
+            match canonical_decode {
+                Ok(CanonicalImageDecode::Animated { format, frames }) => {
+                    let elapsed = t.elapsed().as_secs_f64() * 1000.0;
+                    crate::logger::log(format!(
+                        "  fs load {}: {elapsed:.0}ms  idx={idx}  {name}  {} frames",
+                        format.log_label(),
+                        frames.len()
+                    ));
+                    if crate::perf::is_enabled() {
+                        let mut fields = vec![
+                            ("ms", serde_json::Value::from(elapsed)),
+                            ("format", serde_json::Value::from(format.perf_name())),
+                            ("frames", serde_json::Value::from(frames.len())),
+                        ];
+                        if format == CanonicalAnimatedFormat::WebP {
+                            fields.push(("is_zip", serde_json::Value::from(zip_entry.is_some())));
                         }
-                        None => crate::thumb_loader::apply_exif_orientation(img, &path),
-                    };
-                    let source_dims = [img.width() as usize, img.height() as usize];
+                        crate::perf::event(
+                            "fs",
+                            "decode_end",
+                            perf_key_worker.as_deref(),
+                            perf_seq,
+                            &fields,
+                        );
+                    }
+                    let _ = tx.send(FsLoadResult::Animated(frames));
+                    emit_exit(format.exit_reason());
+                    return;
+                }
+                Ok(CanonicalImageDecode::Static(CanonicalStaticImage {
+                    image: img,
+                    source_dims,
+                })) => {
                     let source_pixels = (source_dims[0] as u64) * (source_dims[1] as u64);
                     // 360 度パノラマビュー Phase 2a: tee 判定
                     // (docs/panorama-360-view-plan.md §4.6.0)。
@@ -47585,9 +47471,14 @@ impl App {
                     // 既存パス (非 360 候補 / BaseOnly / NeedsUserConfirmation):
                     // GPU テクスチャ上限 (MAX_TEXTURE_DIM=8192) を超える巨大画像は
                     // worker で DynamicImage のまま Bilinear リサイズしておく。
-                    let img = clamp_dynamic_for_gpu(img);
-                    let (w, h) = (img.width(), img.height());
-                    let ci = dynamic_image_to_color_image(&img);
+                    let raster = CanonicalStaticImage {
+                        image: img,
+                        source_dims,
+                    }
+                    .into_gpu_raster();
+                    let (w, h) = (raster.pixels.size[0], raster.pixels.size[1]);
+                    let ci = raster.pixels;
+                    let source_dims = raster.source_dims;
                     let elapsed = t.elapsed().as_secs_f64() * 1000.0;
                     crate::logger::log(format!(
                         "  fs load: {elapsed:.0}ms  idx={idx}  {name}  {w}x{h}"
@@ -47609,7 +47500,22 @@ impl App {
                     let _ = tx.send(FsLoadResult::Static { ci, source_dims });
                     emit_exit("static_ok");
                 }
-                Err(e) => {
+                Err(CanonicalDecodeError::SourceRead(e)) => {
+                    crate::logger::log(format!("  fs zip read FAIL: {e}  {name}"));
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "fs",
+                            "decode_fail",
+                            perf_key_worker.as_deref(),
+                            perf_seq,
+                            &[("format", serde_json::Value::from("zip_read"))],
+                        );
+                    }
+                    // archive read 失敗も終端 Failed を通知し、is_loading の固着を防ぐ。
+                    let _ = tx.send(FsLoadResult::Failed);
+                    emit_exit("zip_read_fail");
+                }
+                Err(CanonicalDecodeError::Decode(e)) => {
                     crate::logger::log(format!("  fs load FAIL: {e}  {name}"));
                     if crate::perf::is_enabled() {
                         crate::perf::event(
@@ -65069,15 +64975,14 @@ pub(crate) fn compute_pano_settle_output_size(viewport: (u32, u32)) -> (u32, u32
 }
 
 pub(crate) fn dynamic_image_to_color_image(img: &image::DynamicImage) -> egui::ColorImage {
-    let rgba = img.to_rgba8();
-    let size = [rgba.width() as usize, rgba.height() as usize];
-    egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
+    crate::canonical_image_loader::dynamic_image_to_color_image(img)
 }
 
 /// wgpu テクスチャの最大次元。wgpu デフォルト制限は 8192px。
 /// GPU 実機はもっと大きいが (RTX 4090 = 16384)、eframe が
 /// デフォルト Limits で初期化するため 8192 を超えるとパニックする。
-pub(crate) const MAX_TEXTURE_DIM: usize = 8192;
+pub(crate) const MAX_TEXTURE_DIM: usize =
+    crate::canonical_image_loader::CANONICAL_RASTER_MAX_LONG_EDGE as usize;
 
 /// GPU テクスチャ上限を超える `ColorImage` を縮小して返す。
 /// 上限内であればクローンせず共有参照をそのまま `Cow::Borrowed` で返す。
@@ -65146,25 +65051,7 @@ pub(crate) fn clamp_color_image_for_gpu(ci: egui::ColorImage) -> egui::ColorImag
 /// スカラー `resize_exact(Triangle)` に比べて 7K-9K クラスで 5-10 倍速い。
 /// 上限内なら入力をそのまま返す (クローンなし)。
 pub(crate) fn clamp_dynamic_for_gpu(img: image::DynamicImage) -> image::DynamicImage {
-    let (w, h) = (img.width() as usize, img.height() as usize);
-    if w <= MAX_TEXTURE_DIM && h <= MAX_TEXTURE_DIM {
-        return img;
-    }
-    let scale = MAX_TEXTURE_DIM as f64 / w.max(h) as f64;
-    let new_w = ((w as f64 * scale).round() as u32).max(1);
-    let new_h = ((h as f64 * scale).round() as u32).max(1);
-    let t0 = std::time::Instant::now();
-    let resized = crate::fast_resize::resize_dynamic_exact(
-        &img,
-        new_w,
-        new_h,
-        crate::fast_resize::Quality::Bilinear,
-    );
-    crate::logger::log(format!(
-        "  clamp_dynamic_for_gpu: {w}x{h} → {new_w}x{new_h} (limit {MAX_TEXTURE_DIM}) in {:.0}ms",
-        t0.elapsed().as_secs_f64() * 1000.0
-    ));
-    resized
+    crate::canonical_image_loader::clamp_dynamic_for_gpu(img)
 }
 
 /// 回転した画像を Mesh で描画する。

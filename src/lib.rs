@@ -22,6 +22,7 @@ pub mod book_resume_db;
 pub mod bookmark_browser;
 pub mod books;
 pub mod cache_maintenance;
+pub mod canonical_image_loader;
 pub mod capture;
 pub mod catalog;
 pub mod changelog_markdown;
