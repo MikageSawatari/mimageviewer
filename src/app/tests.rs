@@ -5660,9 +5660,10 @@ mod phase_c_folder_nav_history_tests {
 #[cfg(test)]
 mod phase_c_drill_nav_tests {
     use super::phase_c_support::setup_app;
-    use crate::app::subfolder_expansion_synthetic_path;
+    use crate::app::{App, FacetField, subfolder_expansion_synthetic_path};
     use crate::global_search::GlobalHit;
     use crate::global_search_ui::GlobalSearchView;
+    use std::path::PathBuf;
 
     fn grid_key_nav(
         app: &mut crate::app::App,
@@ -5957,6 +5958,173 @@ mod phase_c_drill_nav_tests {
             app.visible_indices.is_empty(),
             "通常表示の unrated folder は ★3-only で隠れる"
         );
+    }
+
+    fn install_ready_facet_name_cache(app: &mut App, query: &str) {
+        app.facet_name_input = query.to_owned();
+        app.settings.facet_filter.name_query = query.to_owned();
+        app.facet_name_tokens = crate::search_query::parse(query);
+        app.facet_name_cache = app
+            .items
+            .iter()
+            .map(|item| item.name().to_lowercase().into_boxed_str())
+            .collect();
+        app.facet_name_cache_generation = Some(app.items_generation);
+    }
+
+    #[test]
+    fn facet_name_filter_composes_with_kind_and_candidate_counts() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::settings::FacetItemKind;
+
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::Image(PathBuf::from("c:/pics/Alpha Photo.JPG")),
+            GridItem::Video(PathBuf::from("c:/pics/alpha movie.mp4")),
+            GridItem::Image(PathBuf::from("c:/pics/beta photo.jpg")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![None; app.items.len()];
+        app.settings.facet_filter.kinds.insert(FacetItemKind::Image);
+        install_ready_facet_name_cache(&mut app, "ALPHA");
+
+        app.rebuild_visible_indices();
+
+        assert_eq!(
+            app.visible_indices,
+            vec![0],
+            "ファイル名と種類は同じ eager pass で AND 合成される"
+        );
+        assert_eq!(
+            app.facet_candidate_indices(FacetField::Kind),
+            vec![0, 1],
+            "種類候補の件数もファイル名条件を適用した集合から求める"
+        );
+        assert_eq!(
+            app.facet_candidate_indices(FacetField::Name),
+            vec![0, 2],
+            "名前軸だけを外した候補集合では種類条件を維持する"
+        );
+    }
+
+    #[test]
+    fn facet_name_filter_keeps_visible_and_details_sources_in_sync() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::Image(PathBuf::from("c:/pics/alpha-2.jpg")),
+            GridItem::Image(PathBuf::from("c:/pics/beta.jpg")),
+            GridItem::Image(PathBuf::from("c:/pics/alpha-1.jpg")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![None; app.items.len()];
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        install_ready_facet_name_cache(&mut app, "alpha");
+
+        app.rebuild_visible_indices();
+
+        let visible = app
+            .visible_indices
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let details = app
+            .details_order
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(visible, std::collections::BTreeSet::from([0, 2]));
+        assert_eq!(
+            details, visible,
+            "詳細表示も visible_indices と同じ集合を使う"
+        );
+    }
+
+    #[test]
+    fn facet_name_filter_passes_through_until_cache_is_ready() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::Image(PathBuf::from("c:/pics/alpha.jpg")),
+            GridItem::Image(PathBuf::from("c:/pics/beta.jpg")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![None; app.items.len()];
+        app.facet_name_input = "no-match".to_owned();
+        app.settings.facet_filter.name_query = app.facet_name_input.clone();
+        app.facet_name_tokens = crate::search_query::parse(&app.facet_name_input);
+
+        app.rebuild_visible_indices();
+
+        assert_eq!(
+            app.visible_indices,
+            vec![0, 1],
+            "正規化キャッシュ準備中は一覧を空にしない"
+        );
+    }
+
+    #[test]
+    fn facet_name_cache_is_invalidated_when_items_are_replaced() {
+        use crate::grid_item::GridItem;
+
+        let mut app = setup_app();
+        app.install_new_items(
+            vec![GridItem::Image(PathBuf::from("c:/old/needle.jpg"))],
+            vec![None],
+        );
+        install_ready_facet_name_cache(&mut app, "needle");
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![0]);
+
+        app.install_new_items(
+            vec![GridItem::Image(PathBuf::from("c:/new/other.jpg"))],
+            vec![None],
+        );
+
+        assert!(app.facet_name_cache.is_empty());
+        assert_eq!(app.facet_name_cache_generation, None);
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.visible_indices,
+            vec![0],
+            "新一覧の準備中に旧 basename を照合へ使わない"
+        );
+
+        install_ready_facet_name_cache(&mut app, "needle");
+        app.rebuild_visible_indices();
+        assert!(
+            app.visible_indices.is_empty(),
+            "新一覧の basename が準備できた後は新しい名前だけで判定する"
+        );
+    }
+
+    #[test]
+    fn facet_name_debounce_does_not_apply_during_ime_input() {
+        let mut app = setup_app();
+        app.facet_name_input = "未確定".to_owned();
+        app.facet_name_debounce_deadline = Some(std::time::Instant::now());
+        let ctx = egui::Context::default();
+        crate::ime_focus::install_ime_input_policy(&ctx);
+        ctx.begin_pass(egui::RawInput {
+            events: vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("未確定".to_owned())),
+            ],
+            ..Default::default()
+        });
+        app.update_ime_state(&ctx);
+
+        app.poll_facet_name_filter(&ctx);
+
+        assert!(app.settings.facet_filter.name_query.is_empty());
+        assert!(
+            app.facet_name_debounce_deadline
+                .is_some_and(|deadline| deadline > std::time::Instant::now()),
+            "IME 中は debounce の残り時間を消費しない"
+        );
+        let _ = ctx.end_pass();
     }
 
     #[test]
@@ -19552,6 +19720,13 @@ mod favorite_adjustment_defaults_tests {
         app.search_has_focus = true;
         assert!(blocked(&app));
         app.search_has_focus = false;
+        // 絞り込みバーの常設ファイル名欄
+        app.facet_name_has_focus = true;
+        assert!(
+            blocked(&app),
+            "ファイル名フィルター入力中も grid shortcut を抑止する"
+        );
+        app.facet_name_has_focus = false;
         // Ctrl+S バー
         app.favsearch.has_focus = true;
         assert!(blocked(&app));

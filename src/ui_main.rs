@@ -8746,6 +8746,7 @@ impl App {
     // ── スマートフィルタバー ────────────────────────────────────────
 
     pub(crate) fn render_facet_filter_bar(&mut self, ctx: &egui::Context) {
+        self.facet_name_has_focus = false;
         self.color_filter.input_has_focus = false;
         if !self.settings.show_toolbar_facet_filter {
             return;
@@ -8759,6 +8760,7 @@ impl App {
         let mut non_place_facet_changed = false;
         let mut rating_changed = false;
         let mut color_changed = false;
+        let mut facet_name_changed = false;
         let mut bookmark_filter_changed = false;
         let mut reading_history_filter_changed = false;
         egui::TopBottomPanel::top("facet_filter_bar").show(ctx, |ui| {
@@ -8930,6 +8932,38 @@ impl App {
                     }
                 }
 
+                ui.separator();
+                let mut output = crate::ime_focus::show_singleline(
+                    ui,
+                    &mut self.facet_name_input,
+                    None,
+                    |edit| edit.hint_text("ファイル名").desired_width(160.0),
+                );
+                let response_changed = output.response.changed();
+                let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
+                    ui,
+                    &mut output,
+                    &mut self.facet_name_input,
+                );
+                let response = output
+                    .response
+                    .clone()
+                    .on_hover_text("表示中の一覧をファイル名で絞り込みます");
+                self.facet_name_has_focus |= response.has_focus();
+                if response_changed || menu_changed {
+                    self.schedule_facet_name_filter_update();
+                }
+                if ui
+                    .add_enabled(
+                        !self.facet_name_input.is_empty(),
+                        egui::Button::new("×").small(),
+                    )
+                    .hover_tip("ファイル名フィルターを解除")
+                    .clicked()
+                {
+                    facet_name_changed |= self.clear_facet_name_filter_state();
+                }
+
                 if self.facet_filter_suppressed() {
                     let resp = ui
                         .small_button(
@@ -8962,10 +8996,13 @@ impl App {
                     || reading_history_filter_active
                 {
                     ui.separator();
-                    self.draw_facet_active_chips(ui);
+                    if self.draw_facet_active_chips(ui) {
+                        facet_name_changed |= self.clear_facet_name_filter_state();
+                    }
                     self.draw_color_filter_active_chip(ui);
                     if ui.small_button("全解除").clicked() {
                         if self.facet_filter_active() {
+                            facet_name_changed |= self.clear_facet_name_filter_state();
                             self.settings.facet_filter.clear();
                             facet_changed = true;
                         }
@@ -9005,11 +9042,12 @@ impl App {
         if rating_changed {
             self.drop_rating_filter_suppression_on_user_edit();
         }
-        let color_scope_changed = (facet_changed || rating_changed) && self.color_filter.enabled;
+        let color_scope_changed =
+            (facet_changed || facet_name_changed || rating_changed) && self.color_filter.enabled;
         if color_scope_changed {
             self.color_filter.applied_scope_signature = None;
         }
-        if facet_changed || rating_changed {
+        if facet_changed || facet_name_changed || rating_changed {
             let preserve_place_counts =
                 place_changed && !non_place_facet_changed && !rating_changed;
             let place_counts_cache = preserve_place_counts
@@ -10221,8 +10259,15 @@ impl App {
         true
     }
 
-    fn draw_facet_active_chips(&self, ui: &mut egui::Ui) {
+    fn draw_facet_active_chips(&self, ui: &mut egui::Ui) -> bool {
         let filter = &self.settings.facet_filter;
+        let clear_name = if filter.name_query.is_empty() {
+            false
+        } else {
+            ui.small_button(format!("ファイル名:{} ×", filter.name_query))
+                .hover_tip("ファイル名フィルターを解除")
+                .clicked()
+        };
         if !filter.kinds.is_empty() {
             facet_chip(ui, format!("種類:{}", filter.kinds.len()));
         }
@@ -10325,6 +10370,7 @@ impl App {
             let values = values.join(",");
             facet_chip(ui, format!("状態:{values}"));
         }
+        clear_name
     }
 
     fn draw_color_filter_active_chip(&self, ui: &mut egui::Ui) {
@@ -15122,6 +15168,7 @@ mod facet_filter_bar_tests {
         for label in ["種類", "拡張子", "場所"] {
             assert!(history.contains(label), "missing {label}: {history}");
         }
+        assert!(history.contains("ファイル名"), "{history}");
 
         let bookmark = render_filter_bar_text(false);
         assert!(bookmark.contains("ブックマーク種別: すべて"), "{bookmark}");
@@ -15129,6 +15176,7 @@ mod facet_filter_bar_tests {
         for label in ["種類", "拡張子", "場所"] {
             assert!(bookmark.contains(label), "missing {label}: {bookmark}");
         }
+        assert!(bookmark.contains("ファイル名"), "{bookmark}");
     }
 }
 

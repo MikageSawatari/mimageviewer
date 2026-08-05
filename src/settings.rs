@@ -1351,6 +1351,10 @@ impl FacetEditFlag {
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct FacetFilter {
+    /// 開いている一覧にだけ紐づく一時的なファイル名絞り込み。次回起動時に
+    /// 「なぜか一覧が空」の状態を作らないよう、設定には永続化しない。
+    #[serde(skip_serializing, skip_deserializing)]
+    pub name_query: String,
     #[serde(default)]
     pub kinds: std::collections::BTreeSet<FacetItemKind>,
     #[serde(default)]
@@ -1470,7 +1474,8 @@ impl FacetFilter {
     }
 
     pub fn is_active(&self) -> bool {
-        !self.kinds.is_empty()
+        !self.name_query.is_empty()
+            || !self.kinds.is_empty()
             || !self.exts.is_empty()
             || !self.place_keys.is_empty()
             || !self.ai_models.is_empty()
@@ -8135,6 +8140,21 @@ mod tests {
         // 文字列は設定全体を破損扱いにせず、未知の種類として安全に読み込む。
         let kind: FacetItemKind = serde_json::from_str(r#""Separator""#).unwrap();
         assert_eq!(kind, FacetItemKind::Unknown);
+    }
+
+    #[test]
+    fn facet_name_query_is_session_only() {
+        let mut filter = FacetFilter::default();
+        filter.name_query = "temporary".to_owned();
+
+        let json = serde_json::to_value(&filter).unwrap();
+        assert!(json.get("name_query").is_none());
+
+        let loaded: FacetFilter = serde_json::from_value(serde_json::json!({
+            "name_query": "stale"
+        }))
+        .unwrap();
+        assert!(loaded.name_query.is_empty());
     }
 
     /// 種類フィルタの Audio は保存時に kinds から `kind_audio_stash` へ退避され、

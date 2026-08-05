@@ -95,6 +95,7 @@ mod cache_ops;
 mod color_filter;
 #[cfg(windows)]
 mod detached_window_manager;
+mod facet_name_filter;
 mod folder_scan;
 mod gamepad_input;
 mod grid_paint;
@@ -9205,6 +9206,18 @@ pub struct App {
     /// anchor 配下へ入ると現在の filter を退避して内側は filter なしで始め、
     /// 内側で新しい filter を設定できる。anchor 外へ戻ると退避した filter を復元する。
     pub(crate) facet_filter_suppression_stack: Vec<FacetFilterSuppression>,
+    /// 絞り込みバーで編集中のファイル名。適用済み query とは debounce 境界で分ける。
+    pub(crate) facet_name_input: String,
+    /// ファイル名欄がフォーカス中なら grid shortcut を抑止する。
+    pub(crate) facet_name_has_focus: bool,
+    /// 適用済み query の解析結果。各 item の照合では再 parse しない。
+    pub(crate) facet_name_tokens: Vec<crate::search_query::Token>,
+    pub(crate) facet_name_debounce_deadline: Option<std::time::Instant>,
+    /// `items` と同じ添字の、小文字化済み basename。
+    pub(crate) facet_name_cache: Vec<Box<str>>,
+    pub(crate) facet_name_cache_generation: Option<u64>,
+    facet_name_cache_pending: Option<facet_name_filter::FacetNameCachePending>,
+    facet_name_cache_failed_generation: Option<u64>,
     /// facet タグメニュー内の一時検索文字列。設定には保存しない。
     pub(crate) facet_tag_search_query: String,
     /// 色フィルタの一時状態。Settings へ保存しないオンデマンド絞り込み。
@@ -11451,6 +11464,8 @@ impl App {
         let settings_boot_problem_source = settings_boot_problem_source(load_meta.boot_source);
         let show_mouse_nav_migration_prompt =
             Self::should_show_mouse_nav_migration_prompt(&settings, &load_meta);
+        let facet_name_input = settings.facet_filter.name_query.clone();
+        let facet_name_tokens = crate::search_query::parse(&facet_name_input);
         // 更新後 初回起動の「重要な変更点」(version_highlights ④)。
         // 開発用 `--whatsnew-from <ver>` で任意の前バージョンから強制表示できる
         // (再インストール不要でまたぎ表示を目視確認するため。docs/version-highlights-plan.md §5)。
@@ -12141,6 +12156,14 @@ impl App {
             ai_model_facet_requested: false,
             facet_filter_scope: None,
             facet_filter_suppression_stack: Vec::new(),
+            facet_name_input,
+            facet_name_has_focus: false,
+            facet_name_tokens,
+            facet_name_debounce_deadline: None,
+            facet_name_cache: Vec::new(),
+            facet_name_cache_generation: None,
+            facet_name_cache_pending: None,
+            facet_name_cache_failed_generation: None,
             facet_tag_search_query: String::new(),
             color_filter: crate::color_search::ColorFilterState::default(),
             color_filter_scope_refresh_pending: false,
@@ -13360,6 +13383,7 @@ impl App {
         let idx = self.items.len();
         self.items.push(item);
         self.thumbnails.push(ThumbnailState::Pending);
+        self.invalidate_facet_name_cache();
         idx
     }
 
@@ -13660,6 +13684,7 @@ impl App {
         let tracked_text_input_focused = is_root
             && (self.address_has_focus
                 || self.search_has_focus
+                || self.facet_name_has_focus
                 || self.favsearch.has_focus
                 || self.global_search.has_focus
                 || self.tag_view.has_focus
@@ -17661,6 +17686,7 @@ impl App {
                     self.image_metas.push(None);
                     self.thumbnails.push(ThumbnailState::Pending);
                     self.items_generation = self.items_generation.wrapping_add(1);
+                    self.invalidate_facet_name_cache();
                     self.visible_indices.push(idx);
                     idx
                 });
@@ -19615,6 +19641,7 @@ impl App {
         self.items.clear();
         self.thumbnails.clear();
         self.image_metas.clear();
+        self.invalidate_facet_name_cache();
         self.visible_indices.clear();
         self.details_order.clear();
         self.details_tag_prewarm_indices.clear();
@@ -22444,6 +22471,7 @@ impl App {
             })
             .collect();
         self.items_generation = self.items_generation.wrapping_add(1);
+        self.invalidate_facet_name_cache();
         // 一覧全体の差し替えでは同じ index が別アイテムを指し得るため、クリック範囲選択の
         // 起点を失効させる。Ctrl+G streaming のように内容 identity で追従できる経路だけ、
         // 呼び出し側が旧 key を保存して新世代へ明示的に再マップする。
@@ -23860,6 +23888,7 @@ impl App {
     pub(crate) fn invalidate_idx_state_and_queues(&mut self) {
         use std::sync::atomic::Ordering;
 
+        self.invalidate_facet_name_cache();
         self.requested.clear();
         // items / thumbnails are replaced by several synthetic-view paths without going
         // through install_new_items.  The memo is idx-keyed, so retaining it would make an
@@ -42708,6 +42737,11 @@ impl App {
         } else {
             None
         };
+        let facet_name_filter_t0 = (crate::perf::is_enabled()
+            && !self.facet_name_tokens.is_empty()
+            && self.facet_name_cache_generation == Some(self.items_generation)
+            && self.facet_name_cache.len() == self.items.len())
+        .then(std::time::Instant::now);
         // 表示集合が変わると facet 件数も変わる (ui_main::facet_*_counts)。
         self.facet_tag_counts_cache = None;
         self.facet_place_counts_cache = None;
@@ -42762,6 +42796,29 @@ impl App {
             result.push(i);
         }
         self.visible_indices = result;
+        if let Some(t0) = facet_name_filter_t0 {
+            crate::perf::event(
+                "facet_name",
+                "filter_apply",
+                None,
+                0,
+                &[
+                    ("items", serde_json::Value::from(n)),
+                    (
+                        "visible",
+                        serde_json::Value::from(self.visible_indices.len()),
+                    ),
+                    (
+                        "tokens",
+                        serde_json::Value::from(self.facet_name_tokens.len()),
+                    ),
+                    (
+                        "ms",
+                        serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                ],
+            );
+        }
         if let (Some(t0), Some(scope_signature)) = (color_filter_t0, color_scope_signature) {
             crate::perf::event(
                 "color",
@@ -43421,6 +43478,9 @@ impl App {
 
         if !self.facet_filter_effectively_active() {
             return true;
+        }
+        if ignore != Some(FacetField::Name) && !self.passes_facet_name_filter(idx) {
+            return false;
         }
         let Some(item) = self.items.get(idx).cloned() else {
             return false;
@@ -45100,6 +45160,7 @@ impl App {
             return;
         }
         let saved_filter = std::mem::take(&mut self.settings.facet_filter);
+        self.sync_facet_name_runtime_from_filter();
         self.facet_filter_suppression_stack
             .push(FacetFilterSuppression {
                 anchor,
@@ -45166,6 +45227,7 @@ impl App {
     pub(crate) fn restore_facet_filter_suppression(&mut self) -> bool {
         if let Some(suppression) = self.facet_filter_suppression_stack.pop() {
             self.settings.facet_filter = suppression.saved_filter;
+            self.sync_facet_name_runtime_from_filter();
             self.settings.save();
             true
         } else {
@@ -61770,6 +61832,7 @@ impl eframe::App for App {
         self.poll_local_adjust_lut_load(ctx);
         self.poll_local_adjust_segmentation(ctx);
         self.poll_search(ctx);
+        self.poll_facet_name_filter(ctx);
         self.poll_color_scan(ctx);
         self.poll_favsearch();
         self.poll_tag_view();
