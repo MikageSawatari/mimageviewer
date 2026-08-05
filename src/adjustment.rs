@@ -26,6 +26,7 @@ pub enum AutoMode {
 ///
 /// 色調補正の後段で CPU 処理として適用される。`None` = 標準表示 (拡大は Lanczos3)、
 /// `Nearest` = CPU 変換はしないが NEAREST サンプラーで拡大する。
+/// `UpscaleSharp` passes through the CPU stage and changes only display upscaling.
 /// その他は CRT ブラウン管風 / 減色 / 複合プリセット。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +37,8 @@ pub enum PostFilter {
     None,
     /// 補間なし (NEAREST サンプラー、ピクセル転送のみ)
     Nearest,
+    /// Sharp photo upscaling at paint time, with no CPU color transform.
+    UpscaleSharp,
     /// CRT シンプル: スキャンライン + シャドウマスク
     CrtSimple,
     /// CRT フル: CRT Simple + 樽型歪み + bloom
@@ -134,6 +137,7 @@ impl PostFilter {
         // レトロ系
         Self::None,
         Self::Nearest,
+        Self::UpscaleSharp,
         Self::CrtSimple,
         Self::CrtFull,
         Self::CrtArcade,
@@ -181,6 +185,7 @@ impl PostFilter {
         match self {
             Self::None => "標準（補間あり）",
             Self::Nearest => "ニアレスト（補間なし）",
+            Self::UpscaleSharp => "シャープ拡大",
             Self::CrtSimple => "CRT シンプル（控えめ）",
             Self::CrtFull => "CRT フル（歪み+強グロー）",
             Self::CrtArcade => "CRT アーケード（高コントラスト）",

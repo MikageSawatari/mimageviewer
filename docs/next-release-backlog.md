@@ -656,6 +656,8 @@
 - 物理等倍 (`OriginalOneToOne`) はリサンプルせず、ドットバイドットを維持する
 - `PostFilter::Nearest` は、拡大では従来どおり NEAREST で直接描画する。縮小は
   モアレを戻さないため、従来どおり Lanczos3 を通す
+- `PostFilter::UpscaleSharp`（シャープ拡大）は、拡大だけ公式 NVIDIA Image Scaling SDK 由来の
+  WGSL shader を使う。縮小は `DownscaleLanczos`、物理等倍は元 texture のまま
 - CRT / レトロ / セピア等の効果付きポストフィルタは、拡大では従来どおり LINEAR で描画する。
   標準の高品質拡大と効果の同時指定には対応しない
 - 拡大ではカーネルを広げず、支持半径は Lanczos3 本来の 3.0 とする。縮小用の
@@ -669,8 +671,9 @@
 - 拡大出力キャッシュは 4096×4096 相当の 2 枚分を上限に LRU 解放する。既存の縮小キャッシュ
   上限は変更しない
 
-NIS の「シャープ」、Anime4K の「アニメ塗り」は比較で有力だったが、WGSL シェーダの移植を
-伴うため別作業とする。この項目では `PostFilter` の追加や設定 DB の変更を行わない。
+NIS の「シャープ」は選択式の「シャープ拡大」として実装済み。標準 Lanczos3 と同じ可視領域・
+出力上限・cache ownership を使い、branch key で結果を分離する。Anime4K の「アニメ塗り」は
+WGSL shader と多段 buffer が必要なため、引き続き別作業とする。
 
 ### 1.47 動画の拡大に高品質リサンプルを入れる — コストではなく構造の問題
 

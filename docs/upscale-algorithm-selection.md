@@ -1,6 +1,6 @@
 # 静止画 拡大アルゴリズムの選定
 
-ステータス: **比較完了。標準拡大へ Lanczos3 を実装済み**
+ステータス: **比較完了。標準拡大へ Lanczos3、選択式のシャープ拡大へ NIS を実装済み**
 対象: [next-release-backlog.md](next-release-backlog.md) §1.46 (静止画の拡大)
 関連: [dot-by-dot-and-downscale-plan.md](dot-by-dot-and-downscale-plan.md) (縮小側の正本) /
 [display-pipeline.md](display-pipeline.md)
@@ -241,6 +241,24 @@ Anime4K は線を再構成する方向に働くので、同じ条件で紙目は
 静止時は倍率変更時の 1 回だけ。ただしこれは RTX 4090 での libplacebo 実装であり、
 ミドルレンジ GPU と WGSL 移植後の実測は採用候補を絞ってから別途取る。
 
+### 4.7 比較に使った NIS はリンギング抑制が実質無効だった (§4.4 への注記)
+
+実装時に公式 SDK と突き合わせて分かったこと。**比較に使った agyild の mpv 移植は
+`kEps` を `1.0` にしている。公式の値は `1/255`。**
+
+`kEps` は `CalcLTI` の `contrast_ratio = max(a, b) / (min(a, b) + kEps)` だけに現れる。
+輝度が 0〜1 に正規化されている以上、`kEps = 1.0` では比が常に 1 前後に留まり、
+`saturate((ratio - 2) * 0.125)` が 0 に張り付く。つまり **LTI が常に 1.0 になり、
+NVIDIA が入れたリンギング抑制が丸ごと効かなくなる**。
+
+したがって §4.4 の「NIS は紙の粒状ノイズを増幅する」は、
+**抑制を切った状態の NIS を見た観察**である。mIV の実装は公式の `1/255` を使うので、
+同じ素材でもシート版よりグレインの持ち上がりは弱いはずである。
+シート版と実装で見え方が違っても不具合ではない。
+
+これは「移植元を公式 SDK にする」判断が結果的に効いた例でもある。
+mpv 移植をそのまま持ってきていたら、この差に気付かないまま出荷していた。
+
 ---
 
 ## 5. mIV へ入れるときの移植コスト
@@ -252,7 +270,7 @@ mIV の描画は **wgpu (WGSL)**。ここで通した GLSL / mpv shader は**そ
 | Catmull-Rom / Mitchell / Lanczos3 / Spline36 | 小 | 既存の分離 Lanczos シェーダの係数差し替えで済む |
 | EWA 系 | 中 | 非分離 1 パス + J1 の CPU LUT (§1.46 の見積もりどおり) |
 | FSR 1.0 | 中 | AMD 公式から WGSL へ。EASU 1 パス + RCAS 1 パス、約 200 行 |
-| NIS | 中〜大 | 係数 LUT テクスチャ 2 枚 + スキャンライン単位の処理。GLSL 544 行 |
+| NIS | 中〜大 | 公式 SDK の 64 位相係数表と 6×6 support を WGSL fragment shader へ移植 |
 | Anime4K | 大 | 多段 CNN。中間レンダーターゲット (4ch × 数枚) と 7 パス以上の描画グラフが要る |
 
 Anime4K 固有の構造的な制約:
@@ -285,5 +303,26 @@ Anime4K 固有の構造的な制約:
   source / branch ごと 2 entry / 全体 64 entry LRU と併用する。拡大だけ可視 source UV を
   cache key に含め、縮小 cache の目標計算と保持規則は変えない
 
-NIS（写真）と Anime4K（線画・イラスト）は比較上の優位があるが、WGSL 移植と専用の中間
-バッファが必要なため別作業とする。今回の Lanczos3 はその追加を妨げない基礎経路でもある。
+追加実装では `PostFilter::UpscaleSharp`（シャープ拡大）を選んだ物理 1.0 倍超の表示に
+NVIDIA Image Scaling を使う。`PostFilter::None` の Lanczos3 は既定のまま変更しない。
+
+- 移植元は NVIDIA Image Scaling SDK の公式 `NIS_Scaler.h` と `NIS_Config.h`。比較に使った
+  agyild の mpv shader は LUMA plane だけを処理するため、実装の移植元にはしていない。
+  mIV の実装は公式版と同じく RGB texture を bilinear 取得し、輝度で求めた補正を RGB 3
+  channel へ反映する
+- 公式 compute shader の共有メモリ tile は性能最適化なので省き、出力 1 pixel ごとに 6×6
+  support を `textureLoad` する 1 pass fragment shader とした。64 位相の scale / USM 係数と
+  方向判定の数式は公式 SDK から移植し、倍率上限は設けない
+- alpha は bilinear のまま USM を適用せず、premultiplied RGB も alpha 以下へ保つ。
+  透過境界でシャープ化由来の halo を作らないためである
+- 可視 source 領域、目標寸法、出力上限、LINEAR fallback、context 別 cache / LRU は
+  `UpscaleLanczos` と共通。cache key の branch で両者を分離する。perf event 名は
+  `gpu/lanczos_regenerate` / `gpu/lanczos_upscale_limit_fallback` を共用し、
+  `scale_branch` フィールド (`upscale_nis`) で区別する。branch ごとに event 名を分けると、
+  片方の名前で書いた集計が他方を 0 件と報告し「生成されていない」と読めてしまう。
+  拡大経路が 1 度も発火していなかったのを見つけたのがまさにこの集計なので、
+  名前を分けると同じ発見ができなくなる
+- 物理 1.0 倍は元 texture、1.0 未満は既存 `DownscaleLanczos` のまま。`UpscaleSharp` を選んでも
+  縮小シェーダ・なめらかさ・cache identity は変更しない
+
+Anime4K（線画・イラスト）は引き続き後続候補であり、この実装には含めない。

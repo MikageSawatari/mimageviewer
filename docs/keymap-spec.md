@@ -379,7 +379,7 @@ snapshot として一方向 publish し、App から presenter Context を直接
 | <kbd>Shift</kbd>+<kbd>C</kbd> | Wipe 比較を ON/OFF (左=ピン、右=現在) |
 | <kbd>Alt</kbd>+<kbd>C</kbd> | 差分比較を ON/OFF (RGB チャンネルごとの差分を色付きで強調表示) |
 | <kbd>U</kbd> / <kbd>Shift</kbd>+<kbd>U</kbd> / <kbd>Alt</kbd>+<kbd>U</kbd> | AI モデル 次 / 前 / リセット。標準キーなしの `FsAiModelAuto` / `FsAiModelRealEsrganX4Plus` / `FsAiModelRealEsrganAnime6B` / `FsAiModelRealCugan4x` / `FsAiModelNmkdSiax4x` / `FsAiModelRealEsrGeneralV3` にキーを割り当てると、任意の AI モデルへ直接切り替えられる |
-| <kbd>T</kbd> / <kbd>Shift</kbd>+<kbd>T</kbd> / <kbd>Alt</kbd>+<kbd>T</kbd> | ポストフィルタ 次 / 前 / 標準 (リセット)。標準キーなしの `FsPostFilter...` 系 Action にキーを割り当てると、任意のポストフィルタへ直接切り替えられる |
+| <kbd>T</kbd> / <kbd>Shift</kbd>+<kbd>T</kbd> / <kbd>Alt</kbd>+<kbd>T</kbd> | ポストフィルタ 次 / 前 / 標準 (リセット)。標準キーなしの `FsPostFilterUpscaleSharp` など `FsPostFilter...` 系 Action にキーを割り当てると、任意のポストフィルタへ直接切り替えられる |
 | <kbd>V</kbd> | 360 度パノラマモード トグル (360 候補画像のみ) |
 | <kbd>Ctrl</kbd>+<kbd>S</kbd> | 現在画像 / アニメーション現在フレーム / ZIP 内画像 / PDF ページをキャプチャ保存フォルダへ保存 |
 

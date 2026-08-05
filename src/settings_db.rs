@@ -484,6 +484,7 @@ impl SettingsDb {
         // v2.5.0 が知らない enum variant は、旧版が無視できる追加フィールドへ退避した
         // clone を永続化する。live state は変更しない。
         let mut persisted = settings.clone();
+        persisted.stash_post_filter_variants_for_persist();
         // Column carriers are restored PageCount -> Place during sanitize, so remove them
         // in the reverse order to preserve their relative positions when both are present.
         persisted.stash_details_place_for_persist();
@@ -3023,6 +3024,53 @@ mod tests {
         assert_eq!(video_slot.name, "Warm");
         assert_eq!(video_slot.adjustments.brightness, 12.0);
         assert_eq!(video_slot.adjustments.temperature, 24.0);
+    }
+
+    #[test]
+    fn post_filter_downgrade_stash_roundtrips_through_settings_db() {
+        use crate::adjustment::{AdjustParams, PostFilter, PresetSlot};
+
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut original = Settings::default();
+        original.global_preset.post_filter = PostFilter::UpscaleSharp;
+        original.preset_slots.slots[9] = Some(PresetSlot {
+            name: "sharp".to_owned(),
+            params: AdjustParams {
+                post_filter: PostFilter::UpscaleSharp,
+                ..Default::default()
+            },
+        });
+        db.save_full(&original).unwrap();
+
+        {
+            let inner = db.inner.lock().unwrap();
+            for key in ["global_preset", "preset_slots"] {
+                let value: String = inner
+                    .conn
+                    .query_row(
+                        "SELECT value FROM settings_kv WHERE key = ?1",
+                        [key],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(
+                    !value.contains("upscale_sharp"),
+                    "v2.11.0-visible {key} JSON must not contain the new enum variant"
+                );
+            }
+        }
+
+        let mut loaded = db.load_into_settings().unwrap();
+        crate::settings::apply_load_time_migrations(&mut loaded);
+        assert_eq!(loaded.global_preset.post_filter, PostFilter::UpscaleSharp);
+        assert_eq!(
+            loaded.preset_slots.slots[9]
+                .as_ref()
+                .unwrap()
+                .params
+                .post_filter,
+            PostFilter::UpscaleSharp
+        );
     }
 
     #[test]

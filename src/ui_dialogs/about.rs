@@ -68,6 +68,10 @@ impl App {
                         ui.label("MIT — bilibili");
                         ui.end_row();
 
+                        ui.label("NVIDIA Image Scaling");
+                        ui.label("MIT — NVIDIA CORPORATION & AFFILIATES");
+                        ui.end_row();
+
                         ui.label("4x-NMKD-Siax-200k");
                         ui.label("WTFPL — Nmkd");
                         ui.end_row();

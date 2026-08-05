@@ -2971,6 +2971,35 @@ pub fn downscale_smoothing_blur_factor(percent: u32) -> f32 {
     1.0 + sanitize_downscale_smoothing_percent(percent) as f32 * 0.003
 }
 
+/// Carrier for post-filter variants that released builds cannot deserialize.
+///
+/// Settings persistence writes only old variants into `AdjustParams::post_filter` and records
+/// newer choices here. Add one boolean per future variant so an older build can continue to
+/// ignore this whole field without parsing another enum.
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PostFilterDowngradeStash {
+    #[serde(default)]
+    sharp_upscale: bool,
+}
+
+impl PostFilterDowngradeStash {
+    fn stash_for_persist(&mut self, params: &mut crate::adjustment::AdjustParams) {
+        self.sharp_upscale = matches!(
+            params.post_filter,
+            crate::adjustment::PostFilter::UpscaleSharp
+        );
+        if self.sharp_upscale {
+            params.post_filter = crate::adjustment::PostFilter::None;
+        }
+    }
+
+    fn restore_after_load(&mut self, params: &mut crate::adjustment::AdjustParams) {
+        if std::mem::take(&mut self.sharp_upscale) {
+            params.post_filter = crate::adjustment::PostFilter::UpscaleSharp;
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Settings {
     #[serde(default = "default_grid_cols")]
@@ -3866,6 +3895,12 @@ pub struct Settings {
     /// 保存スロット (10個)。名前付きで保存した補正設定。
     #[serde(default)]
     pub preset_slots: crate::adjustment::PresetSlots,
+    /// New post-filter variants are removed from the two persisted preset paths and carried in
+    /// this additive field so v2.11.0 can deserialize the rest of Settings during downgrade.
+    #[serde(default)]
+    pub(crate) post_filter_global_preset_stash: PostFilterDowngradeStash,
+    #[serde(default)]
+    pub(crate) post_filter_preset_slot_stashes: [PostFilterDowngradeStash; 10],
     /// カラー化専用保存スロット (4個)。他の画像補正値を変更せずに呼び出す。
     #[serde(default)]
     pub colorize_preset_slots: crate::colorize::ColorizePresetSlots,
@@ -5099,6 +5134,8 @@ impl Default for Settings {
             ai_backend: None,
             global_preset: crate::adjustment::AdjustParams::default(),
             preset_slots: crate::adjustment::PresetSlots::default(),
+            post_filter_global_preset_stash: PostFilterDowngradeStash::default(),
+            post_filter_preset_slot_stashes: [PostFilterDowngradeStash::default(); 10],
             colorize_preset_slots: crate::colorize::ColorizePresetSlots::default(),
             sidecar_backup_enabled: true,
             tag_sidecar_backup_enabled: false,
@@ -6237,6 +6274,35 @@ impl Settings {
         true
     }
 
+    /// Move post-filter variants unknown to v2.11.0 out of both Settings-owned preset paths.
+    ///
+    /// This runs only on the persistence clone. The live Settings keeps the selected variant.
+    pub(crate) fn stash_post_filter_variants_for_persist(&mut self) {
+        self.post_filter_global_preset_stash
+            .stash_for_persist(&mut self.global_preset);
+        for index in 0..self.preset_slots.slots.len() {
+            let stash = &mut self.post_filter_preset_slot_stashes[index];
+            if let Some(slot) = self.preset_slots.slots[index].as_mut() {
+                stash.stash_for_persist(&mut slot.params);
+            } else {
+                *stash = PostFilterDowngradeStash::default();
+            }
+        }
+    }
+
+    fn restore_post_filter_variants_after_load(&mut self) {
+        self.post_filter_global_preset_stash
+            .restore_after_load(&mut self.global_preset);
+        for index in 0..self.preset_slots.slots.len() {
+            let stash = &mut self.post_filter_preset_slot_stashes[index];
+            if let Some(slot) = self.preset_slots.slots[index].as_mut() {
+                stash.restore_after_load(&mut slot.params);
+            } else {
+                *stash = PostFilterDowngradeStash::default();
+            }
+        }
+    }
+
     /// v2.6.0 で追加したページ数列を、v2.5.0 が deserialize できる形へ退避する。
     ///
     /// 旧版が読む既存フィールドには既知の variant だけを残し、ページ数列の状態は
@@ -6415,6 +6481,7 @@ impl Settings {
     /// 読み込んだ設定値を安全範囲に補正する (JSON 手編集で範囲外の値が入った場合の防衛)。
     /// お気に入りの UUID マイグレーションもここで行う。
     fn sanitize(&mut self) {
+        self.restore_post_filter_variants_after_load();
         self.text_contrast = self.text_contrast.normalized();
         self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
         self.ui_font.sanitize();
@@ -7795,6 +7862,125 @@ mod tests {
         assert!(
             ToolbarFacetFilterItem::visible_order(&[]).is_empty(),
             "空 Vec は「全部隠す」として保持する"
+        );
+    }
+
+    #[test]
+    fn post_filter_stash_keeps_persisted_presets_v211_compatible() {
+        use crate::adjustment::{PostFilter, PresetSlot};
+
+        let mut settings = Settings::default();
+        settings.global_preset.post_filter = PostFilter::UpscaleSharp;
+        settings.preset_slots.slots[0] = Some(PresetSlot {
+            name: "sharp".to_owned(),
+            params: crate::adjustment::AdjustParams {
+                post_filter: PostFilter::UpscaleSharp,
+                ..Default::default()
+            },
+        });
+        settings.preset_slots.slots[1] = Some(PresetSlot {
+            name: "legacy".to_owned(),
+            params: crate::adjustment::AdjustParams {
+                post_filter: PostFilter::Sepia,
+                ..Default::default()
+            },
+        });
+
+        let mut persisted = settings.clone();
+        persisted.stash_post_filter_variants_for_persist();
+        let json = serde_json::to_value(&persisted).unwrap();
+
+        assert_eq!(json["global_preset"]["post_filter"], "none");
+        assert_eq!(
+            json["preset_slots"]["slots"][0]["params"]["post_filter"],
+            "none"
+        );
+        assert_eq!(
+            json["preset_slots"]["slots"][1]["params"]["post_filter"],
+            "sepia"
+        );
+        assert_eq!(
+            json["post_filter_global_preset_stash"]["sharp_upscale"],
+            true
+        );
+        assert_eq!(
+            json["post_filter_preset_slot_stashes"][0]["sharp_upscale"],
+            true
+        );
+        assert!(
+            !json.to_string().contains("upscale_sharp"),
+            "v2.11.0-visible enum fields must not contain the new variant"
+        );
+
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum V211PostFilter {
+            None,
+            Sepia,
+        }
+        #[derive(serde::Deserialize)]
+        struct V211AdjustParams {
+            post_filter: V211PostFilter,
+        }
+        #[derive(serde::Deserialize)]
+        struct V211PresetSlot {
+            params: V211AdjustParams,
+        }
+        #[derive(serde::Deserialize)]
+        struct V211PresetSlots {
+            slots: [Option<V211PresetSlot>; 10],
+        }
+        #[derive(serde::Deserialize)]
+        struct V211Settings {
+            global_preset: V211AdjustParams,
+            preset_slots: V211PresetSlots,
+        }
+
+        let old: V211Settings = serde_json::from_value(json.clone())
+            .expect("v2.11.0 shape must ignore the additive carrier fields");
+        assert_eq!(old.global_preset.post_filter, V211PostFilter::None);
+        assert_eq!(
+            old.preset_slots.slots[0]
+                .as_ref()
+                .unwrap()
+                .params
+                .post_filter,
+            V211PostFilter::None
+        );
+        assert_eq!(
+            old.preset_slots.slots[1]
+                .as_ref()
+                .unwrap()
+                .params
+                .post_filter,
+            V211PostFilter::Sepia
+        );
+
+        let mut loaded: Settings = serde_json::from_value(json).unwrap();
+        loaded.sanitize();
+        assert_eq!(loaded.global_preset.post_filter, PostFilter::UpscaleSharp);
+        assert_eq!(
+            loaded.preset_slots.slots[0]
+                .as_ref()
+                .unwrap()
+                .params
+                .post_filter,
+            PostFilter::UpscaleSharp
+        );
+        assert_eq!(
+            loaded.preset_slots.slots[1]
+                .as_ref()
+                .unwrap()
+                .params
+                .post_filter,
+            PostFilter::Sepia
+        );
+        assert!(!loaded.post_filter_global_preset_stash.sharp_upscale);
+        assert!(
+            loaded
+                .post_filter_preset_slot_stashes
+                .iter()
+                .all(|stash| !stash.sharp_upscale)
         );
     }
 

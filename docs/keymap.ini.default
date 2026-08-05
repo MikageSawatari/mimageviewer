@@ -341,6 +341,7 @@
 # FsPostFilterPrev = Shift+T ; ポストフィルタを前へ切り替える
 # FsPostFilterReset = Alt+T ; ポストフィルタを標準に戻す
 # FsPostFilterNearest = none ; ポストフィルタをニアレスト（補間なし）にする
+# FsPostFilterUpscaleSharp = none ; ポストフィルタをシャープ拡大にする
 # FsPostFilterCrtSimple = none ; ポストフィルタをCRT シンプル（控えめ）にする
 # FsPostFilterCrtFull = none ; ポストフィルタをCRT フル（歪み+強グロー）にする
 # FsPostFilterCrtArcade = none ; ポストフィルタをCRT アーケード（高コントラスト）にする

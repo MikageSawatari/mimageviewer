@@ -1426,6 +1426,7 @@ pub enum KeyAction {
     FsPostFilterPrev,
     FsPostFilterReset,
     FsPostFilterNearest,
+    FsPostFilterUpscaleSharp,
     FsPostFilterCrtSimple,
     FsPostFilterCrtFull,
     FsPostFilterCrtArcade,
@@ -1846,6 +1847,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsPostFilterPrev,
     KeyAction::FsPostFilterReset,
     KeyAction::FsPostFilterNearest,
+    KeyAction::FsPostFilterUpscaleSharp,
     KeyAction::FsPostFilterCrtSimple,
     KeyAction::FsPostFilterCrtFull,
     KeyAction::FsPostFilterCrtArcade,
@@ -3329,6 +3331,7 @@ impl KeyAction {
             FsPostFilterPrev => "FsPostFilterPrev",
             FsPostFilterReset => "FsPostFilterReset",
             FsPostFilterNearest => "FsPostFilterNearest",
+            FsPostFilterUpscaleSharp => "FsPostFilterUpscaleSharp",
             FsPostFilterCrtSimple => "FsPostFilterCrtSimple",
             FsPostFilterCrtFull => "FsPostFilterCrtFull",
             FsPostFilterCrtArcade => "FsPostFilterCrtArcade",
@@ -3871,6 +3874,7 @@ impl KeyAction {
             FsPostFilterPrev => "ポストフィルタを前へ切り替える",
             FsPostFilterReset => "ポストフィルタを標準に戻す",
             FsPostFilterNearest => "ポストフィルタをニアレスト（補間なし）にする",
+            FsPostFilterUpscaleSharp => "ポストフィルタをシャープ拡大にする",
             FsPostFilterCrtSimple => "ポストフィルタをCRT シンプル（控えめ）にする",
             FsPostFilterCrtFull => "ポストフィルタをCRT フル（歪み+強グロー）にする",
             FsPostFilterCrtArcade => "ポストフィルタをCRT アーケード（高コントラスト）にする",
@@ -4278,6 +4282,7 @@ impl KeyAction {
             | FsPostFilterPrev
             | FsPostFilterReset
             | FsPostFilterNearest
+            | FsPostFilterUpscaleSharp
             | FsPostFilterCrtSimple
             | FsPostFilterCrtFull
             | FsPostFilterCrtArcade
@@ -4671,6 +4676,7 @@ impl KeyAction {
             | FsPostFilterPrev
             | FsPostFilterReset
             | FsPostFilterNearest
+            | FsPostFilterUpscaleSharp
             | FsPostFilterCrtSimple
             | FsPostFilterCrtFull
             | FsPostFilterCrtArcade
@@ -5100,6 +5106,7 @@ impl KeyAction {
             FsPostFilterPrev => ChordList::one(Chord::shift(T)),
             FsPostFilterReset => ChordList::one(Chord::alt(T)),
             FsPostFilterNearest
+            | FsPostFilterUpscaleSharp
             | FsPostFilterCrtSimple
             | FsPostFilterCrtFull
             | FsPostFilterCrtArcade
@@ -8633,6 +8640,7 @@ mod tests {
             KeyAction::FsAiModelNmkdSiax4x,
             KeyAction::FsAiModelRealEsrGeneralV3,
             KeyAction::FsPostFilterNearest,
+            KeyAction::FsPostFilterUpscaleSharp,
             KeyAction::FsPostFilterCrtSimple,
             KeyAction::FsPostFilterCrtFull,
             KeyAction::FsPostFilterCrtArcade,

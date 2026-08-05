@@ -204,6 +204,10 @@ const FS_AI_MODEL_DIRECT_ACTIONS: &[(KeyAction, Option<&str>, &str)] = &[
 
 const FS_POST_FILTER_DIRECT_ACTIONS: &[(KeyAction, PostFilter)] = &[
     (KeyAction::FsPostFilterNearest, PostFilter::Nearest),
+    (
+        KeyAction::FsPostFilterUpscaleSharp,
+        PostFilter::UpscaleSharp,
+    ),
     (KeyAction::FsPostFilterCrtSimple, PostFilter::CrtSimple),
     (KeyAction::FsPostFilterCrtFull, PostFilter::CrtFull),
     (KeyAction::FsPostFilterCrtArcade, PostFilter::CrtArcade),
@@ -2298,6 +2302,10 @@ impl App {
             let key = resource.page_idx().and_then(|idx| self.perf_item_key(idx));
             match perf_event {
                 crate::gpu_lanczos::LanczosPerfEvent::Generated(stats) => {
+                    // Every resampler branch shares one event name and is told apart by the
+                    // scale_branch field. Splitting the name would let a log query written for
+                    // one branch report zero for another and read as "nothing was generated" -
+                    // which is how the upscale path was found to be dead in the first place.
                     crate::perf::event(
                         "gpu",
                         "lanczos_regenerate",
@@ -2358,6 +2366,7 @@ impl App {
                             ("target_h", stats.target_size[1].into()),
                             ("max_dimension", stats.max_dimension.into()),
                             ("max_pixels", stats.max_pixels.into()),
+                            ("scale_branch", stats.scale_branch.as_str().into()),
                         ],
                     );
                 }

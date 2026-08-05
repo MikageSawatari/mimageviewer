@@ -8713,6 +8713,11 @@ fn draw_sliders(
                 PostFilter::Nearest,
                 PostFilter::Nearest.display_label(),
             );
+            ui.radio_value(
+                &mut params.post_filter,
+                PostFilter::UpscaleSharp,
+                PostFilter::UpscaleSharp.display_label(),
+            );
             ui.separator();
             group_heading(ui, "── CRT ──");
             ui.radio_value(
