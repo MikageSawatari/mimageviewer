@@ -201,7 +201,10 @@ fn native_grid_context_menu_target_kind(target: &NativeGridContextMenuTarget) ->
     }
 }
 
-fn delete_confirm_label_for_targets(targets: &[(usize, PathBuf)]) -> String {
+const DELETE_FOLDER_OMITTED_FILES_WARNING: &str =
+    "フォルダの中には一覧に表示していないファイルも含まれます";
+
+fn delete_confirm_label_for_targets(targets: &[(usize, PathBuf)], items: &[GridItem]) -> String {
     let kind = if delete_targets_may_permanently_delete(targets) {
         DeleteConfirmKind::MayPermanent
     } else {
@@ -215,7 +218,11 @@ fn delete_confirm_label_for_targets(targets: &[(usize, PathBuf)]) -> String {
             .and_then(|n| n.to_str())
             .unwrap_or("?")
     });
-    let mut label = build_delete_confirm_label(count, single_name, kind);
+    // 対象決定時の GridItem だけを参照する。確認表示のための metadata/read_dir は行わない。
+    let includes_folder = targets
+        .iter()
+        .any(|(idx, _)| matches!(items.get(*idx), Some(GridItem::Folder(_))));
+    let mut label = build_delete_confirm_label(count, single_name, kind, includes_folder);
     if count > 1 {
         label.push_str("\n\n対象:");
         for (_, path) in targets.iter().take(DELETE_CONFIRM_VISIBLE_TARGET_LIMIT) {
@@ -238,8 +245,9 @@ fn build_delete_confirm_label(
     count: usize,
     single_name: Option<&str>,
     kind: DeleteConfirmKind,
+    includes_folder: bool,
 ) -> String {
-    match (kind, count, single_name) {
+    let mut label = match (kind, count, single_name) {
         (DeleteConfirmKind::RecycleBin, 1, Some(name)) => {
             format!("「{name}」をゴミ箱に移動しますか？")
         }
@@ -254,7 +262,12 @@ fn build_delete_confirm_label(
             "{count} 件のうち、ゴミ箱に移動できない場所の項目があります。\n\
              完全に削除される場合があります。削除しますか？"
         ),
+    };
+    if includes_folder {
+        label.push_str("\n\n");
+        label.push_str(DELETE_FOLDER_OMITTED_FILES_WARNING);
     }
+    label
 }
 
 fn native_path_text(path: &Path) -> String {
@@ -2035,8 +2048,10 @@ impl crate::app::App {
         }
 
         if self.delete_confirm_label.is_none() {
-            self.delete_confirm_label =
-                Some(delete_confirm_label_for_targets(&self.delete_targets));
+            self.delete_confirm_label = Some(delete_confirm_label_for_targets(
+                &self.delete_targets,
+                &self.items,
+            ));
         }
         let label = self.delete_confirm_label.clone().unwrap_or_default();
 
@@ -2815,17 +2830,21 @@ mod delete_confirm_tests {
     #[test]
     fn delete_confirm_label_keeps_recycle_bin_wording_for_normal_targets() {
         let label =
-            build_delete_confirm_label(1, Some("sample.jpg"), DeleteConfirmKind::RecycleBin);
+            build_delete_confirm_label(1, Some("sample.jpg"), DeleteConfirmKind::RecycleBin, false);
         assert_eq!(label, "「sample.jpg」をゴミ箱に移動しますか？");
 
-        let label = build_delete_confirm_label(3, None, DeleteConfirmKind::RecycleBin);
+        let label = build_delete_confirm_label(3, None, DeleteConfirmKind::RecycleBin, false);
         assert_eq!(label, "3 件の項目をゴミ箱に移動しますか？");
     }
 
     #[test]
     fn delete_confirm_label_warns_when_delete_may_be_permanent() {
-        let label =
-            build_delete_confirm_label(1, Some("sample.jpg"), DeleteConfirmKind::MayPermanent);
+        let label = build_delete_confirm_label(
+            1,
+            Some("sample.jpg"),
+            DeleteConfirmKind::MayPermanent,
+            false,
+        );
         assert!(
             label.contains("完全に削除される場合があります"),
             "single-target warning should mention permanent deletion: {label}"
@@ -2835,11 +2854,43 @@ mod delete_confirm_tests {
             "single-target warning should include the file name: {label}"
         );
 
-        let label = build_delete_confirm_label(2, None, DeleteConfirmKind::MayPermanent);
+        let label = build_delete_confirm_label(2, None, DeleteConfirmKind::MayPermanent, false);
         assert!(
             label.contains("ゴミ箱に移動できない場所"),
             "multi-target warning should mention non-recyclable locations: {label}"
         );
+    }
+
+    #[test]
+    fn delete_confirm_always_warns_for_folders_but_not_file_only_targets() {
+        for kind in [
+            DeleteConfirmKind::RecycleBin,
+            DeleteConfirmKind::MayPermanent,
+        ] {
+            let folder_label = build_delete_confirm_label(1, Some("album"), kind, true);
+            assert!(
+                folder_label.contains(DELETE_FOLDER_OMITTED_FILES_WARNING),
+                "folder warning is required for every delete route: {folder_label}"
+            );
+
+            let file_label = build_delete_confirm_label(1, Some("photo.jpg"), kind, false);
+            assert!(
+                !file_label.contains(DELETE_FOLDER_OMITTED_FILES_WARNING),
+                "file-only deletion must not show the folder warning: {file_label}"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_target_kind_is_derived_from_the_existing_grid_item_without_io() {
+        let folder = PathBuf::from(r"C:\pictures\album");
+        let targets = vec![(0, folder.clone())];
+        let folder_label =
+            delete_confirm_label_for_targets(&targets, &[GridItem::Folder(folder.clone())]);
+        assert!(folder_label.contains(DELETE_FOLDER_OMITTED_FILES_WARNING));
+
+        let file_label = delete_confirm_label_for_targets(&targets, &[GridItem::Image(folder)]);
+        assert!(!file_label.contains(DELETE_FOLDER_OMITTED_FILES_WARNING));
     }
 
     #[test]
@@ -2853,7 +2904,11 @@ mod delete_confirm_tests {
             })
             .collect::<Vec<_>>();
 
-        let label = delete_confirm_label_for_targets(&targets);
+        let items = targets
+            .iter()
+            .map(|(_, path)| GridItem::Image(path.clone()))
+            .collect::<Vec<_>>();
+        let label = delete_confirm_label_for_targets(&targets, &items);
 
         for idx in 0..DELETE_CONFIRM_VISIBLE_TARGET_LIMIT {
             assert!(
@@ -2870,7 +2925,8 @@ mod delete_confirm_tests {
     fn delete_confirm_single_target_keeps_natural_filename_wording() {
         let targets = vec![(0, PathBuf::from(r"C:\pictures\only_one.jpg"))];
 
-        let label = delete_confirm_label_for_targets(&targets);
+        let items = vec![GridItem::Image(targets[0].1.clone())];
+        let label = delete_confirm_label_for_targets(&targets, &items);
 
         assert!(label.contains("only_one.jpg"));
         assert!(!label.contains("\n\n対象:"));

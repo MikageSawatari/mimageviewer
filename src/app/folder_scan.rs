@@ -12,6 +12,23 @@ pub(crate) enum ScanMediaKind {
     Audio,
 }
 
+/// 通常フォルダ一覧を作るときに、物理フォルダ内には存在するが一覧へ出さなかった項目数。
+///
+/// `hidden` / `unsupported` は既存の `read_dir` ループ内で分類し、`same_name` は同名設定の
+/// filter が実際に除いた差分を加算する。件数表示のための追加走査や metadata I/O は行わない。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OmittedFolderEntryCounts {
+    pub(crate) same_name: usize,
+    pub(crate) hidden: usize,
+    pub(crate) unsupported: usize,
+}
+
+impl OmittedFolderEntryCounts {
+    pub(crate) fn primary_count(self) -> usize {
+        self.same_name.saturating_add(self.hidden)
+    }
+}
+
 /// ディレクトリ走査結果 (read_dir + 各エントリ metadata 取得の成果物)。
 ///
 /// Ctrl+↑↓ 移動時は DFS スレッドで事前に走査しておき、UI スレッドの
@@ -26,6 +43,8 @@ pub(crate) struct ScannedDir {
     /// (path, kind, mtime, file_size) のタプル。load_folder 内で sort_order
     /// 設定に基づいてソートされる。
     pub all_media: Vec<(PathBuf, ScanMediaKind, i64, i64)>,
+    /// 走査時点で一覧へ出さなかった項目。`same_name` は後段の同名 filter 適用時に入る。
+    pub omitted: OmittedFolderEntryCounts,
 }
 
 #[derive(Clone, Debug)]
@@ -138,6 +157,7 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     scan_directory_with_convertible_archives(path, true, false).unwrap_or_else(|_| ScannedDir {
         folders: Vec::new(),
         all_media: Vec::new(),
+        omitted: OmittedFolderEntryCounts::default(),
     })
 }
 
@@ -171,6 +191,7 @@ where
 {
     let mut folders: Vec<(GridItem, Option<(i64, i64)>)> = Vec::new();
     let mut all_media: Vec<(PathBuf, ScanMediaKind, i64, i64)> = Vec::new();
+    let mut omitted = OmittedFolderEntryCounts::default();
     let mut entry_file_names_ci: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for entry in entries {
@@ -190,6 +211,7 @@ where
             .unwrap_or(crate::fs_entry::DirEntryKind::Other);
         entry_file_names_ci.insert(entry.file_name().to_string_lossy().to_lowercase());
         if crate::fs_entry::should_hide_fs_entry(&entry, show_hidden_files) {
+            omitted.hidden = omitted.hidden.saturating_add(1);
             continue;
         }
         let p = entry.path();
@@ -204,6 +226,7 @@ where
             folders.push((GridItem::Folder(p), Some((mtime, 0))));
         } else if crate::folder_tree::is_apple_double(&p) {
             // macOS/iPhone AppleDouble メタデータ - スキップ
+            omitted.hidden = omitted.hidden.saturating_add(1);
         } else if kind.is_file()
             && let Some(ext) = p.extension().and_then(|e| e.to_str())
         {
@@ -234,11 +257,26 @@ where
                     },
                     Some((mtime, file_size)),
                 ));
+            } else {
+                omitted.unsupported = omitted.unsupported.saturating_add(1);
             }
+        } else if kind.is_file() {
+            // 拡張子のない通常ファイルも、一覧対象外のファイルとして内訳に含める。
+            omitted.unsupported = omitted.unsupported.saturating_add(1);
         }
     }
     filter_upscaled_video_pairs_fast(&mut all_media, &entry_file_names_ci);
-    Ok(ScannedDir { folders, all_media })
+    Ok(ScannedDir {
+        folders,
+        all_media,
+        omitted,
+    })
+}
+
+#[derive(Debug, Default)]
+pub(super) struct VideoImageDuplicateFilterResult {
+    pub(super) sidecars: Vec<(PathBuf, PathBuf)>,
+    pub(super) omitted: usize,
 }
 
 pub(super) fn filter_upscaled_video_pairs_fast(
@@ -291,7 +329,7 @@ pub(super) fn filter_upscaled_video_pairs_fast(
 pub(super) fn filter_video_image_duplicates(
     media: &mut Vec<(PathBuf, ScanMediaKind, i64, i64)>,
     use_sidecar: bool,
-) -> Vec<(PathBuf, PathBuf)> {
+) -> VideoImageDuplicateFilterResult {
     let mut videos_by_stem: std::collections::HashMap<String, Vec<PathBuf>> =
         std::collections::HashMap::new();
     for (path, kind, _, _) in media.iter() {
@@ -303,7 +341,7 @@ pub(super) fn filter_video_image_duplicates(
         }
     }
     if videos_by_stem.is_empty() {
-        return Vec::new();
+        return VideoImageDuplicateFilterResult::default();
     }
 
     let mut sidecars = Vec::new();
@@ -318,17 +356,21 @@ pub(super) fn filter_video_image_duplicates(
         }
     }
 
+    let before = media.len();
     media.retain(|(path, kind, _, _)| {
         *kind != ScanMediaKind::Image || !videos_by_stem.contains_key(&super::stem_lower(path))
     });
-    sidecars
+    VideoImageDuplicateFilterResult {
+        sidecars,
+        omitted: before.saturating_sub(media.len()),
+    }
 }
 
 /// ZIP/PDF/対応アーカイブと同名の実フォルダがあれば、実フォルダを一覧の正本にする。
 pub(super) fn filter_virtual_folder_duplicates(
     folders: &mut Vec<GridItem>,
     folder_metas: &mut Vec<Option<(i64, i64)>>,
-) {
+) -> usize {
     let real_folder_names: std::collections::HashSet<String> = folders
         .iter()
         .filter_map(|item| match item {
@@ -354,13 +396,14 @@ pub(super) fn filter_virtual_folder_duplicates(
     folders.retain(|_| *iter.next().unwrap());
     let mut iter = keep.iter();
     folder_metas.retain(|_| *iter.next().unwrap());
+    keep.iter().filter(|keep| !**keep).count()
 }
 
 /// 同名の ZIP/CBZ があれば、変換元になる RAR/7z/LZH 等を一覧から除外する。
 pub(super) fn filter_convertible_archive_duplicates(
     folders: &mut Vec<GridItem>,
     folder_metas: &mut Vec<Option<(i64, i64)>>,
-) {
+) -> usize {
     let zip_stems: std::collections::HashSet<String> = folders
         .iter()
         .filter_map(|item| match item {
@@ -369,7 +412,7 @@ pub(super) fn filter_convertible_archive_duplicates(
         })
         .collect();
     if zip_stems.is_empty() {
-        return;
+        return 0;
     }
     let keep: Vec<bool> = folders
         .iter()
@@ -384,13 +427,14 @@ pub(super) fn filter_convertible_archive_duplicates(
     folders.retain(|_| *iter.next().unwrap());
     let mut iter = keep.iter();
     folder_metas.retain(|_| *iter.next().unwrap());
+    keep.iter().filter(|keep| !**keep).count()
 }
 
 /// 同名ステムの画像を拡張子優先順で 1 件へ絞る。一覧と画像フォルダのページ数で共有する。
 pub(super) fn filter_image_ext_duplicates(
     all_media: &mut Vec<(PathBuf, ScanMediaKind, i64, i64)>,
     priority: &[String],
-) {
+) -> usize {
     let mut best: std::collections::HashMap<String, (usize, usize)> =
         std::collections::HashMap::new();
     for (index, (path, kind, _, _)) in all_media.iter().enumerate() {
@@ -428,8 +472,9 @@ pub(super) fn filter_image_ext_duplicates(
         .map(|(_, &(_, index))| index)
         .collect();
     if keep_indices.is_empty() {
-        return;
+        return 0;
     }
+    let before = all_media.len();
     let mut index = 0usize;
     all_media.retain(|(path, kind, _, _)| {
         let current = index;
@@ -440,6 +485,7 @@ pub(super) fn filter_image_ext_duplicates(
         let stem = super::stem_lower(path);
         stem_counts.get(&stem).copied().unwrap_or(0) <= 1 || keep_indices.contains(&current)
     });
+    before.saturating_sub(all_media.len())
 }
 
 pub(super) fn is_miv_upscaled_derivative(path: &std::path::Path) -> bool {
@@ -507,6 +553,12 @@ pub(crate) fn signature_from_scan(scan: &ScannedDir) -> u64 {
     entries.sort();
     let mut hasher = DefaultHasher::new();
     entries.len().hash(&mut hasher);
+    // `omitted` は意図的に含めない。この signature は「一覧を差し替える必要があるか」を
+    // 判定するもので、`hidden` / `unsupported` には Explorer が書く Thumbs.db / desktop.ini
+    // (どちらも hidden 属性) が入る。これを含めるとサムネイルキャッシュが書かれるたびに
+    // items 差し替えと AI / PDF キャッシュ破棄が走り、この signature が防いでいるはずの
+    // ちらつきを自ら起こす。チップは一覧を作った同じ走査から導出するので、表示中の一覧とは
+    // 常に整合しており、実際に一覧が変わったときの再ロードで更新される。
     for e in &entries {
         e.hash(&mut hasher);
     }
@@ -596,6 +648,67 @@ mod page_count_tests {
             image_folder_page_count(temp.path(), &options(true)).unwrap(),
             Some(2)
         );
+    }
+
+    #[test]
+    fn omitted_counts_reuse_scan_results_and_keep_unsupported_out_of_primary() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("001.jpg"), b"jpg").unwrap();
+        std::fs::write(temp.path().join("001.png"), b"png").unwrap();
+        std::fs::write(temp.path().join("notes.txt"), b"text").unwrap();
+        std::fs::write(temp.path().join("state"), b"extensionless").unwrap();
+        std::fs::write(temp.path().join("._finder.jpg"), b"apple double").unwrap();
+
+        // 内訳はこの既存 read_dir の結果から導出する。件数取得専用の再走査 API は持たない。
+        let mut scan = scan_directory_with_convertible_archives(temp.path(), true, false).unwrap();
+        scan.omitted.same_name =
+            filter_image_ext_duplicates(&mut scan.all_media, &["png".to_owned(), "jpg".to_owned()]);
+
+        assert_eq!(scan.omitted.same_name, 1);
+        assert_eq!(scan.omitted.hidden, 1);
+        assert_eq!(scan.omitted.unsupported, 2);
+        assert_eq!(scan.omitted.primary_count(), 2);
+        assert_eq!(scan.all_media.len(), 1);
+    }
+
+    #[test]
+    fn unsupported_only_does_not_create_a_primary_omitted_count() {
+        let counts = OmittedFolderEntryCounts {
+            same_name: 0,
+            hidden: 0,
+            unsupported: 5,
+        };
+        assert_eq!(counts.primary_count(), 0);
+    }
+
+    #[test]
+    fn video_image_filter_returns_the_actual_folded_difference() {
+        let mut media = vec![
+            (
+                PathBuf::from(r"C:\media\clip.mp4"),
+                ScanMediaKind::Video,
+                0,
+                0,
+            ),
+            (
+                PathBuf::from(r"C:\media\clip.jpg"),
+                ScanMediaKind::Image,
+                0,
+                0,
+            ),
+            (
+                PathBuf::from(r"C:\media\other.jpg"),
+                ScanMediaKind::Image,
+                0,
+                0,
+            ),
+        ];
+
+        let filtered = filter_video_image_duplicates(&mut media, false);
+
+        assert_eq!(filtered.omitted, 1);
+        assert!(filtered.sidecars.is_empty());
+        assert_eq!(media.len(), 2);
     }
 
     #[test]

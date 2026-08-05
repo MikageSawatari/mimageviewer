@@ -530,7 +530,10 @@ pub(crate) struct PreferencesState {
     pub operation_tab: OperationCustomizeTab,
     pub operation_settings_tab: OperationSettingsTab,
     pub operation_assignment_editor: Option<OperationAssignmentEditor>,
+    /// コマンド一覧 / キーボード図を絞り込む、利用者が選んだ場所。
     pub operation_keyboard_context: Option<crate::keymap::KeyContext>,
+    /// 開いている割り当て編集セッションだけが使う場所。Key target では action から導出する。
+    pub operation_assignment_keyboard_context: Option<crate::keymap::KeyContext>,
     pub operation_keyboard_ctrl: bool,
     pub operation_keyboard_shift: bool,
     pub operation_keyboard_alt: bool,
@@ -770,6 +773,7 @@ impl PreferencesState {
             operation_settings_tab: OperationSettingsTab::Behavior,
             operation_assignment_editor: None,
             operation_keyboard_context: None,
+            operation_assignment_keyboard_context: None,
             operation_keyboard_ctrl: false,
             operation_keyboard_shift: false,
             operation_keyboard_alt: false,
@@ -1132,6 +1136,19 @@ fn advance_preferences_scroll_generation(
     }
 }
 
+fn advance_preferences_scroll_generation_on_open(
+    show_preferences: bool,
+    open_last_frame: &mut bool,
+    sequence: &mut u64,
+) -> Option<u64> {
+    let opened = show_preferences && !*open_last_frame;
+    *open_last_frame = show_preferences;
+    opened.then(|| {
+        *sequence = sequence.wrapping_add(1);
+        *sequence
+    })
+}
+
 /// 指定ディレクトリ配下のファイル合計サイズを返す。エラーや不在は 0。
 /// AI バックエンドページの "X MiB を解放" 表示等で使う。
 fn dir_size_bytes(dir: &std::path::Path) -> u64 {
@@ -1179,6 +1196,11 @@ fn prepare_preferences_settings_for_commit(
 }
 
 impl App {
+    pub(crate) fn open_preferences_page(&mut self, page: PreferencesPage) {
+        self.preferences_requested_page = Some(page);
+        self.show_preferences = true;
+    }
+
     fn preferences_dialog_has_unsaved_changes(&self) -> bool {
         let Some(state) = self.pref_state.as_ref() else {
             return false;
@@ -1261,6 +1283,14 @@ impl App {
     }
 
     pub(crate) fn show_preferences_dialog(&mut self, ctx: &egui::Context) {
+        // ScrollArea の id は open edge でだけ変える。毎フレーム変えると利用者が
+        // スクロールできない。sequence は PreferencesState より長寿命にして、閉じて
+        // state が破棄されても次回 open で過去の id を再利用しない。
+        let opened_scroll_generation = advance_preferences_scroll_generation_on_open(
+            self.show_preferences,
+            &mut self.preferences_open_last_frame,
+            &mut self.preferences_right_panel_scroll_sequence,
+        );
         if !self.show_preferences {
             return;
         }
@@ -1291,6 +1321,24 @@ impl App {
                 new_state.vst3_discovered = self.vst3_discovered.clone();
             }
             self.pref_state = Some(new_state);
+        }
+        if let Some(generation) = opened_scroll_generation {
+            self.pref_state
+                .as_mut()
+                .expect("preferences state was initialized above")
+                .right_panel_scroll_generation = generation;
+        }
+
+        if let Some(requested) = self.preferences_requested_page.take() {
+            if let Some(state) = self.pref_state.as_mut() {
+                let previous = state.selected;
+                state.selected = requested;
+                advance_preferences_scroll_generation(
+                    previous,
+                    state.selected,
+                    &mut state.right_panel_scroll_generation,
+                );
+            }
         }
 
         // 毎フレーム refresh: auto-bypass されたスロットを取得して PreferencesState に反映。
@@ -1437,6 +1485,10 @@ impl App {
                     }
                 });
             });
+
+        if let Some(state) = self.pref_state.as_ref() {
+            self.preferences_right_panel_scroll_sequence = state.right_panel_scroll_generation;
+        }
 
         let mut close_requested_this_frame = false;
         if apply {
@@ -2477,6 +2529,53 @@ mod tests {
             &mut generation,
         );
         assert_eq!(generation, 8);
+    }
+
+    #[test]
+    fn preferences_scroll_generation_advances_once_per_open_edge() {
+        let mut open_last_frame = false;
+        let mut sequence = 11;
+
+        assert_eq!(
+            advance_preferences_scroll_generation_on_open(
+                false,
+                &mut open_last_frame,
+                &mut sequence
+            ),
+            None
+        );
+        assert_eq!(
+            advance_preferences_scroll_generation_on_open(
+                true,
+                &mut open_last_frame,
+                &mut sequence
+            ),
+            Some(12)
+        );
+        assert_eq!(
+            advance_preferences_scroll_generation_on_open(
+                true,
+                &mut open_last_frame,
+                &mut sequence
+            ),
+            None
+        );
+        assert_eq!(
+            advance_preferences_scroll_generation_on_open(
+                false,
+                &mut open_last_frame,
+                &mut sequence
+            ),
+            None
+        );
+        assert_eq!(
+            advance_preferences_scroll_generation_on_open(
+                true,
+                &mut open_last_frame,
+                &mut sequence
+            ),
+            Some(13)
+        );
     }
 
     #[test]

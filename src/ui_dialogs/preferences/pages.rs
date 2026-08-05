@@ -1900,7 +1900,6 @@ fn draw_operation_assignment_editor_body(
 ) {
     match (&editor.target, editor.tab) {
         (OperationAssignmentTarget::Key(action), OperationAssignmentTab::Keyboard) => {
-            state.operation_keyboard_context = Some(action.context());
             let keymap = Keymap::from_settings(&state.settings.keymap);
             let conflicts = keymap.binding_conflicts();
             command_editor_for_action(ui, state, &keymap, &conflicts, ime_active, *action);
@@ -2002,8 +2001,9 @@ fn command_editor_source_chord_section(
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label("場所:");
-            let selected =
-                operation_keyboard_context_filter_label(state.operation_keyboard_context);
+            let selected = operation_keyboard_context_filter_label(
+                state.operation_assignment_keyboard_context,
+            );
             egui::ComboBox::from_id_salt((
                 "command_editor_source_chord_context",
                 chord_label.clone(),
@@ -2013,18 +2013,22 @@ fn command_editor_source_chord_section(
             .show_ui(ui, |ui| {
                 for context in key_assignment_context_filters() {
                     let label = operation_keyboard_context_filter_label(context);
-                    ui.selectable_value(&mut state.operation_keyboard_context, context, label);
+                    ui.selectable_value(
+                        &mut state.operation_assignment_keyboard_context,
+                        context,
+                        label,
+                    );
                 }
             });
         });
 
-        let matches = actions_for_chord(keymap, chord, state.operation_keyboard_context);
+        let matches = actions_for_chord(keymap, chord, state.operation_assignment_keyboard_context);
         if matches.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 ui.label("現在の割り当て:");
                 ui.label(egui::RichText::new("割り当てなし").weak());
             });
-        } else if state.operation_keyboard_context.is_none() {
+        } else if state.operation_assignment_keyboard_context.is_none() {
             // 場所「すべて」: 場所ごとに 1 行ずつ改行して表示する (横に連結すると複数割り当て時に
             // 読みにくい、実機 FB)。各行は「場所: 操作」で、場所名ぶん軽くインデントする。
             ui.label("現在の割り当て:");
@@ -2055,7 +2059,7 @@ fn command_editor_source_chord_section(
     let filter = state.command_filter.trim().to_string();
     let key_filter = state.command_key_filter.trim().to_string();
     egui::Frame::group(ui.style()).show(ui, |ui| {
-        let heading = match state.operation_keyboard_context {
+        let heading = match state.operation_assignment_keyboard_context {
             Some(context) => format!(
                 "{} に割り当てる操作を選ぶ",
                 operation_keyboard_context_filter_label(Some(context))
@@ -2086,7 +2090,7 @@ fn command_editor_source_chord_section(
                             .filter(|action| action.is_user_facing())
                         {
                             if !operation_keyboard_context_filter_matches(
-                                state.operation_keyboard_context,
+                                state.operation_assignment_keyboard_context,
                                 action.context(),
                             ) {
                                 continue;
@@ -2187,10 +2191,13 @@ fn open_operation_assignment_editor(
     target: OperationAssignmentTarget,
     tab: OperationAssignmentTab,
 ) {
-    if let OperationAssignmentTarget::Key(action) = &target {
-        state.operation_keyboard_context =
-            operation_keyboard_context_filter_for_context(action.context());
-    }
+    // 一覧 filter は利用者の選択として保持する。編集側はセッション固有の値を持ち、
+    // Key target では対象 action から導出するため、編集を開いても一覧 filter は変えない。
+    state.operation_assignment_keyboard_context = match &target {
+        OperationAssignmentTarget::Key(action) => Some(action.context()),
+        OperationAssignmentTarget::Chord(_) => state.operation_keyboard_context,
+        _ => None,
+    };
     if let OperationAssignmentTarget::Chord(chord) = &target {
         state.command_editor_source_chord = Some(*chord);
     }
@@ -2206,6 +2213,7 @@ fn open_operation_assignment_editor(
 
 fn close_assignment_editors(state: &mut PreferencesState) {
     state.operation_assignment_editor = None;
+    state.operation_assignment_keyboard_context = None;
     state.command_editor_source_chord = None;
     state.command_capture_slot = None;
     state.command_edit_notice = None;
@@ -7038,6 +7046,18 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     ui.small("通常の左右キーによるページ移動だけに適用します。前／次コマンド、Shift+左右、Ctrl+左右、PageUp／PageDown、画面端クリック、ホイールの方向は変わりません。");
     ui.checkbox(&mut s.fullscreen_top_bar_locked, "上部情報バーを固定表示");
     ui.small("ON のときはフルスクリーン上端に情報バー領域を確保し、画像と重ならないようにフィットします。上部バーの鍵アイコンからも切り替えできます。");
+    // 上下は同じ固定クロームの余白なので、見た目を揃え、設定項目を増やしすぎない
+    // 共通値 1 つにする。個別値が必要になる具体例が出るまでは対称な設定を正本とする。
+    ui.horizontal(|ui| {
+        ui.label("固定バーと画像の間隔");
+        ui.add(
+            egui::DragValue::new(&mut s.fullscreen_fixed_bar_gap_px)
+                .range(0..=crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX)
+                .speed(1)
+                .suffix(" px"),
+        );
+    });
+    ui.small("固定表示中の上部情報バーと下部ページシークバーに共通で適用します。0 px ではバーの直後まで画像領域として使います。");
     ui.checkbox(
         &mut s.fullscreen_page_number_overlay,
         "ページ番号を常時表示",
@@ -7490,7 +7510,9 @@ fn open_in_explorer(path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AI_SIZE_LIMIT_OPTIONS, modifier_hold_editor_choice, natural_operation_label_cmp,
+        AI_SIZE_LIMIT_OPTIONS, OperationAssignmentTab, OperationAssignmentTarget, PreferencesState,
+        apply_command_editor, close_assignment_editors, modifier_hold_editor_choice,
+        natural_operation_label_cmp, open_operation_assignment_editor,
         ring_bindings_for_key_action,
     };
     use crate::app::MAX_TEXTURE_DIM;
@@ -7563,5 +7585,38 @@ mod tests {
                 RingActionId::OpenOperationCustomize,
             )]
         );
+    }
+
+    #[test]
+    fn opening_key_assignment_editor_preserves_overview_context_filter() {
+        let mut state = PreferencesState::from_settings(
+            &crate::settings::Settings::default(),
+            None,
+            false,
+            0,
+            0,
+            0,
+        );
+        state.operation_keyboard_context = None;
+
+        let action = KeyAction::GridOpenPreferences;
+        open_operation_assignment_editor(
+            &mut state,
+            OperationAssignmentTarget::Key(action),
+            OperationAssignmentTab::Keyboard,
+        );
+
+        assert_eq!(state.operation_keyboard_context, None);
+        assert_eq!(
+            state.operation_assignment_keyboard_context,
+            Some(action.context())
+        );
+
+        state.command_chord_inputs[0] = "F24".to_string();
+        apply_command_editor(&mut state, action);
+        assert_eq!(state.command_edit_error, None);
+        close_assignment_editors(&mut state);
+        assert_eq!(state.operation_keyboard_context, None);
+        assert_eq!(state.operation_assignment_keyboard_context, None);
     }
 }

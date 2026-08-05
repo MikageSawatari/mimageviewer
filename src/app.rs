@@ -97,6 +97,7 @@ mod color_filter;
 mod detached_window_manager;
 mod facet_name_filter;
 mod folder_scan;
+pub(crate) use folder_scan::OmittedFolderEntryCounts;
 mod gamepad_input;
 mod grid_paint;
 pub(crate) mod metadata_import_refresh;
@@ -8134,9 +8135,20 @@ pub(crate) enum MetadataTransferTagDbReleaseState {
     },
 }
 
+/// main の通常フォルダ一覧に対応する、走査時点の「一覧へ出さなかった項目」キャッシュ。
+///
+/// detached / サブ展開 / スマートフォルダ / 検索結果はこのキャッシュを更新せず、UI 側も
+/// `TopLevelGridSurface::Folder` と path の一致を確認してから表示する。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NormalFolderOmittedEntries {
+    pub(crate) folder: PathBuf,
+    pub(crate) counts: folder_scan::OmittedFolderEntryCounts,
+}
+
 pub struct App {
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
+    pub(crate) normal_folder_omitted_entries: Option<NormalFolderOmittedEntries>,
     pub(crate) navigation_scope: ViewerNavigationScope,
     pub(crate) items: Vec<GridItem>,
     pub(crate) thumbnails: Vec<ThumbnailState>,
@@ -8737,6 +8749,12 @@ pub struct App {
 
     // ── 統合環境設定ダイアログ ─────────────────────────────────────
     pub(crate) show_preferences: bool,
+    /// 前フレームの環境設定可視フラグ。false -> true の open edge だけを検出する。
+    pub(crate) preferences_open_last_frame: bool,
+    /// 右ペイン ScrollArea の id に使う、ダイアログを閉じても保持する単調増加値。
+    pub(crate) preferences_right_panel_scroll_sequence: u64,
+    /// 一覧内の導線などから、環境設定を特定ページで開く one-shot request。
+    pub(crate) preferences_requested_page: Option<crate::ui_dialogs::preferences::PreferencesPage>,
     /// 統合環境設定の一時編集状態
     pub(crate) pref_state: Option<crate::ui_dialogs::preferences::PreferencesState>,
     pub(crate) show_preferences_discard_confirm: bool,
@@ -11766,6 +11784,7 @@ impl App {
         let app = Self {
             address: String::new(),
             current_folder: None,
+            normal_folder_omitted_entries: None,
             navigation_scope: ViewerNavigationScope::Main,
             items: Vec::new(),
             thumbnails: Vec::new(),
@@ -11981,6 +12000,9 @@ impl App {
             #[cfg(test)]
             rename_migration_data_dir_override: None,
             show_preferences: false,
+            preferences_open_last_frame: false,
+            preferences_right_panel_scroll_sequence: 0,
+            preferences_requested_page: None,
             show_preferences_discard_confirm: false,
             show_operation_customize: false,
             show_operation_customize_discard_confirm: false,
@@ -17036,6 +17058,7 @@ impl App {
         // フォーカス復帰時の差分判定用シグネチャ。scan を消費する前に計算しておき、
         // `start_loading_items` に引数として渡す。
         let folder_signature = signature_from_scan(&scan);
+        let mut omitted_entries = scan.omitted;
         let (mut folders, mut folder_metas): (Vec<GridItem>, Vec<Option<(i64, i64)>>) =
             scan.folders.into_iter().unzip();
         let mut all_media = scan.all_media;
@@ -17108,7 +17131,21 @@ impl App {
         // ── 同名ファイルフィルタ ─────────────────────────────────────
         let dup_t0 = std::time::Instant::now();
         self.video_thumb_overrides.clear();
-        self.apply_duplicate_filters(&mut folders, &mut folder_metas, &mut all_media);
+        omitted_entries.same_name =
+            self.apply_duplicate_filters(&mut folders, &mut folder_metas, &mut all_media);
+        if !detached_physical
+            && matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Folder
+            )
+        {
+            // main の通常フォルダだけがこの常設チップの対象。サブ展開・スマートフォルダ・
+            // 検索結果は後追い範囲なので、同じ filter を共有していてもここへ公開しない。
+            self.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+                folder: path.clone(),
+                counts: omitted_entries,
+            });
+        }
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -42657,28 +42694,60 @@ impl App {
         }
     }
 
-    /// 同名ファイルフィルタを適用する。
+    /// 現在の main surface が通常フォルダで、走査キャッシュも同じ場所なら内訳を返す。
+    pub(crate) fn current_normal_folder_omitted_counts(
+        &self,
+    ) -> Option<folder_scan::OmittedFolderEntryCounts> {
+        if self.navigation_scope.is_detached_physical()
+            || self.search_filter.is_some()
+            || self.search_pending.is_some()
+            || self.stack_mode_requested
+            || !matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Folder
+            )
+        {
+            // サブ展開・スマートフォルダ・検索結果・スタックは後追い範囲。物理フォルダの
+            // scan/filter を共有していても、素の通常フォルダ一覧以外にはチップを出さない。
+            return None;
+        }
+        let current = self.current_folder.as_deref()?;
+        self.normal_folder_omitted_entries
+            .as_ref()
+            .filter(|entries| crate::folder_tree::path_eq(&entries.folder, current))
+            .map(|entries| entries.counts)
+    }
+
+    /// 同名ファイルフィルタを適用し、実際に一覧から畳んだ合計件数を返す。
     fn apply_duplicate_filters(
         &mut self,
         folders: &mut Vec<GridItem>,
         folder_metas: &mut Vec<Option<(i64, i64)>>,
         all_media: &mut Vec<(PathBuf, crate::app::folder_scan::ScanMediaKind, i64, i64)>,
-    ) {
+    ) -> usize {
+        let mut omitted = 0usize;
         if self.settings.skip_zip_if_folder_exists {
-            Self::filter_virtual_folder_duplicates(folders, folder_metas);
+            omitted = omitted.saturating_add(Self::filter_virtual_folder_duplicates(
+                folders,
+                folder_metas,
+            ));
         }
         if self.settings.skip_archive_if_zip_exists {
-            Self::filter_convertible_archive_duplicates(folders, folder_metas);
+            omitted = omitted.saturating_add(Self::filter_convertible_archive_duplicates(
+                folders,
+                folder_metas,
+            ));
         }
         if self.settings.skip_image_if_video_exists {
-            self.filter_video_image_duplicates(all_media);
+            omitted = omitted.saturating_add(self.filter_video_image_duplicates(all_media));
         }
         if self.settings.skip_duplicate_images {
-            crate::app::folder_scan::filter_image_ext_duplicates(
+            omitted = omitted.saturating_add(crate::app::folder_scan::filter_image_ext_duplicates(
                 all_media,
                 &self.settings.image_ext_priority,
-            );
+            ));
         }
+        omitted
     }
 
     /// ZIP/PDF + フォルダの重複: 同名フォルダがあれば ZIP/PDF エントリをスキップ。
@@ -42690,16 +42759,16 @@ impl App {
     fn filter_virtual_folder_duplicates(
         folders: &mut Vec<GridItem>,
         folder_metas: &mut Vec<Option<(i64, i64)>>,
-    ) {
-        crate::app::folder_scan::filter_virtual_folder_duplicates(folders, folder_metas);
+    ) -> usize {
+        crate::app::folder_scan::filter_virtual_folder_duplicates(folders, folder_metas)
     }
 
     /// Prefer native ZIP/CBZ over a same-stem RAR/7z/LZH archive.
     fn filter_convertible_archive_duplicates(
         folders: &mut Vec<GridItem>,
         folder_metas: &mut Vec<Option<(i64, i64)>>,
-    ) {
-        crate::app::folder_scan::filter_convertible_archive_duplicates(folders, folder_metas);
+    ) -> usize {
+        crate::app::folder_scan::filter_convertible_archive_duplicates(folders, folder_metas)
     }
 
     /// 動画 + 画像の重複: 同名の動画があれば画像をスキップし、
@@ -42712,13 +42781,14 @@ impl App {
     fn filter_video_image_duplicates(
         &mut self,
         all_media: &mut Vec<(PathBuf, crate::app::folder_scan::ScanMediaKind, i64, i64)>,
-    ) {
+    ) -> usize {
         let use_sidecar = self.settings.video_thumb_use_sidecar_image;
-        for (video, image) in
-            crate::app::folder_scan::filter_video_image_duplicates(all_media, use_sidecar)
-        {
+        let filtered =
+            crate::app::folder_scan::filter_video_image_duplicates(all_media, use_sidecar);
+        for (video, image) in filtered.sidecars {
             self.video_thumb_overrides.insert(stem_lower(&video), image);
         }
+        filtered.omitted
     }
 
     /// `search_filter` とレーティングフィルタに基づいて `visible_indices` を再計算する。

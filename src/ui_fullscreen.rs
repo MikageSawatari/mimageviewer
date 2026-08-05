@@ -4589,6 +4589,26 @@ fn fullscreen_seek_panel_rect(full_rect: egui::Rect) -> egui::Rect {
     .intersect(full_rect)
 }
 
+fn fullscreen_seek_separator_y(panel_rect: egui::Rect, locked: bool) -> f32 {
+    if locked {
+        panel_rect.top() + 0.5
+    } else {
+        panel_rect.top()
+    }
+}
+
+/// 上部バーの区切り線 y。固定時は線をバーの内側 (上) へ寄せる。
+///
+/// 1px stroke は指定 y を中心に描かれるので、バーの境界にそのまま置くと半分が画像側に載る。
+/// 固定時は画像がその境界まで来るため、下端が「画像上の明るい線」として見える。
+fn fullscreen_top_bar_separator_y(bar_rect: egui::Rect, locked: bool) -> f32 {
+    if locked {
+        bar_rect.bottom() - 0.5
+    } else {
+        bar_rect.bottom()
+    }
+}
+
 fn fullscreen_seek_fraction_from_x(track_rect: egui::Rect, pointer_x: f32, rtl: bool) -> f32 {
     let raw = ((pointer_x - track_rect.left()) / track_rect.width().max(1.0)).clamp(0.0, 1.0);
     if rtl { 1.0 - raw } else { raw }
@@ -4607,14 +4627,16 @@ fn fullscreen_rect_excluding_fixed_bars(
     full_rect: egui::Rect,
     top_locked: bool,
     seek_locked: bool,
+    fixed_bar_gap_px: u32,
 ) -> egui::Rect {
+    let gap = fixed_bar_gap_px.min(crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX) as f32;
     let top = if top_locked {
-        (full_rect.top() + TOP_BAR_HEIGHT).min(full_rect.bottom() - 1.0)
+        (full_rect.top() + TOP_BAR_HEIGHT + gap).min(full_rect.bottom() - 1.0)
     } else {
         full_rect.top()
     };
     let bottom = if seek_locked {
-        (full_rect.bottom() - FS_SEEK_BAR_HEIGHT).max(top + 1.0)
+        (full_rect.bottom() - FS_SEEK_BAR_HEIGHT - gap).max(top + 1.0)
     } else {
         full_rect.bottom()
     };
@@ -7870,6 +7892,7 @@ impl App {
             full_rect,
             self.fullscreen_top_bar_locked_for_idx(fs_idx, is_video),
             self.fullscreen_seek_bar_locked_for_idx(fs_idx, is_video),
+            self.settings.fullscreen_fixed_bar_gap_px,
         )
     }
 
@@ -8098,9 +8121,12 @@ impl App {
             0.0,
             egui::Color32::from_rgba_unmultiplied(8, 10, 14, 224),
         );
+        // 固定時だけ 1px stroke をバー内側へ収める。色だけを弱める方法は背後の画像輝度で
+        // 見え方が変わるため、境界上に半分はみ出す原因を幾何的に除く。ホバー表示は依頼どおり
+        // 従来座標を維持する。
         ui.painter().hline(
             panel_rect.x_range(),
-            panel_rect.top(),
+            fullscreen_seek_separator_y(panel_rect, locked),
             egui::Stroke::new(
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 42),
@@ -21854,10 +21880,11 @@ impl App {
             0.0,
             egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
         );
+        let separator_y = fullscreen_top_bar_separator_y(bar_rect, top_bar_locked);
         ui.painter().line_segment(
             [
-                egui::pos2(bar_rect.min.x, bar_rect.max.y),
-                egui::pos2(bar_rect.max.x, bar_rect.max.y),
+                egui::pos2(bar_rect.min.x, separator_y),
+                egui::pos2(bar_rect.max.x, separator_y),
             ],
             egui::Stroke::new(
                 1.0,
@@ -30526,7 +30553,7 @@ mod tests {
     fn locked_seek_bar_reserves_bottom_media_rect() {
         let full = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 800.0));
         let panel = fullscreen_seek_panel_rect(full);
-        let media = fullscreen_rect_excluding_fixed_bars(full, false, true);
+        let media = fullscreen_rect_excluding_fixed_bars(full, false, true, 0);
 
         assert_eq!(panel.top(), 800.0 - FS_SEEK_BAR_HEIGHT);
         assert_eq!(panel.bottom(), 800.0);
@@ -30538,11 +30565,53 @@ mod tests {
     #[test]
     fn locked_top_and_seek_bars_reserve_both_edges_of_media_rect() {
         let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
-        let media = fullscreen_rect_excluding_fixed_bars(full, true, true);
+        let media = fullscreen_rect_excluding_fixed_bars(full, true, true, 0);
 
         assert_eq!(media.top(), TOP_BAR_HEIGHT);
         assert_eq!(media.bottom(), 800.0 - FS_SEEK_BAR_HEIGHT);
         assert_eq!(media.width(), full.width());
+    }
+
+    #[test]
+    fn fixed_bar_gap_is_subtracted_only_at_locked_edges() {
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let both = fullscreen_rect_excluding_fixed_bars(full, true, true, 24);
+        assert_eq!(both.top(), TOP_BAR_HEIGHT + 24.0);
+        assert_eq!(both.bottom(), 800.0 - FS_SEEK_BAR_HEIGHT - 24.0);
+
+        let hover_bars = fullscreen_rect_excluding_fixed_bars(full, false, false, 24);
+        assert_eq!(hover_bars, full);
+
+        let panel = fullscreen_seek_panel_rect(full);
+        assert_eq!(fullscreen_seek_separator_y(panel, false), panel.top());
+        assert_eq!(fullscreen_seek_separator_y(panel, true), panel.top() + 0.5);
+    }
+
+    /// 上下どちらの固定バーも、区切り線が画像側へはみ出さないこと。
+    /// 上部だけ直して下部を忘れる (逆も) 退行を 1 本で塞ぐ。
+    #[test]
+    fn locked_bar_separators_stay_inside_both_bars() {
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let top_bar = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), TOP_BAR_HEIGHT));
+        let seek_panel = fullscreen_seek_panel_rect(full);
+        let media = fullscreen_rect_excluding_fixed_bars(full, true, true, 0);
+        const HALF_STROKE: f32 = 0.5;
+
+        let top_y = fullscreen_top_bar_separator_y(top_bar, true);
+        assert!(
+            top_y + HALF_STROKE <= media.top(),
+            "top separator must not paint onto the image: {top_y} vs {}",
+            media.top()
+        );
+        assert!(top_y - HALF_STROKE >= top_bar.top());
+
+        let seek_y = fullscreen_seek_separator_y(seek_panel, true);
+        assert!(
+            seek_y - HALF_STROKE >= media.bottom(),
+            "seek separator must not paint onto the image: {seek_y} vs {}",
+            media.bottom()
+        );
+        assert!(seek_y + HALF_STROKE <= seek_panel.bottom());
     }
 
     #[test]
