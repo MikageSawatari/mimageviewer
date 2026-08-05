@@ -9,9 +9,10 @@ use mimageviewer_ipc::{
     ContainerRequest, ContainerResponse, FolderListEntry, FolderListPayload, FolderListRequest,
     FolderListResponse, MediaError, MediaErrorCode, PageGroup, PagePayload, PagePriority,
     PageRequest, PageResponse, RemoteAddress, RemoteAiProgressPhase, RemoteAiStartRequest,
-    RemoteAiTerminalCode, RemoteEntryKind, RemoteReadingDirection, RemoteSpreadMode,
-    RemoteSubresource, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, ThumbnailError,
-    ThumbnailErrorCode, ThumbnailResponse,
+    RemoteAiTerminalCode, RemoteBookBookmarkList, RemoteBookBookmarkRow, RemoteBookBookmarkTarget,
+    RemoteEntryKind, RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource, RemoteWriteError,
+    RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult,
+    ThumbnailError, ThumbnailErrorCode, ThumbnailResponse,
 };
 
 use super::path_guard::{ResolveError, ResolvedFavoritePath, resolve_existing};
@@ -343,6 +344,11 @@ struct ValidatedPageContext {
     record_history: bool,
     record_resume: bool,
     bookmark_supported: bool,
+}
+
+struct PreparedZipBookmarkList {
+    resolved: ResolvedFavoritePath,
+    tree: crate::zip_tree::ZipTree,
 }
 
 struct RecomputedFolderListing {
@@ -927,6 +933,18 @@ impl ContainerEngine {
                 context_address,
                 page_index,
                 ..
+            }
+            | RemoteWriteRequest::SetBookBookmarkTitle {
+                address,
+                context_address,
+                page_index,
+                ..
+            }
+            | RemoteWriteRequest::RemoveBookBookmark {
+                address,
+                context_address,
+                page_index,
+                ..
             } => {
                 let validated = self.validate_page_context(address, context_address)?;
                 if !validated.bookmark_supported {
@@ -950,6 +968,17 @@ impl ContainerEngine {
                 *bookmark_supported = validated.bookmark_supported;
                 Ok(())
             }
+            RemoteWriteRequest::ListBookBookmarks {
+                address,
+                context_address,
+                page_index,
+                bookmark_supported,
+            } => {
+                let validated = self.validate_page_context(address, context_address)?;
+                *page_index = validated.page_index;
+                *bookmark_supported = validated.bookmark_supported;
+                Ok(())
+            }
             RemoteWriteRequest::SetAdjustment {
                 address, values, ..
             } => {
@@ -965,6 +994,268 @@ impl ContainerEngine {
                 self.validate_rating_page(address)
             }
         }
+    }
+
+    /// 現在の本の一覧を write worker 上で組み立てる。DB 読み出しとコンテナ列挙は
+    /// UI thread に渡さず、同じ write FIFO 内で先行する mutation の完了後に行う。
+    pub(super) fn book_bookmarks(&self, request: &mut RemoteWriteRequest) -> RemoteWriteResponse {
+        let prepared_zip = match self.prepare_book_bookmark_list(request) {
+            Ok(prepared) => prepared,
+            Err(error) => return RemoteWriteResponse::Error(error),
+        };
+        let RemoteWriteRequest::ListBookBookmarks {
+            context_address,
+            bookmark_supported,
+            ..
+        } = request
+        else {
+            return RemoteWriteResponse::Error(RemoteWriteError::new(
+                RemoteWriteErrorCode::Internal,
+                "ブックマーク一覧要求の種別が一致しません",
+            ));
+        };
+        if !*bookmark_supported {
+            return RemoteWriteResponse::Success(RemoteWriteResult::book_bookmarks(
+                RemoteBookBookmarkList {
+                    supported: false,
+                    rows: Vec::new(),
+                },
+            ));
+        }
+
+        let fallback_resolved;
+        let resolved = if let Some(prepared) = prepared_zip.as_ref() {
+            &prepared.resolved
+        } else {
+            fallback_resolved = match self.resolve(context_address) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    return RemoteWriteResponse::Error(remote_write_error_from_media(error));
+                }
+            };
+            &fallback_resolved
+        };
+        let bookmarks =
+            match crate::book_bookmarks::load_for_container_from_disk_readonly(&resolved.logical) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "remote_ipc: book bookmark list read failed: {error}"
+                    ));
+                    return RemoteWriteResponse::Error(RemoteWriteError::new(
+                        RemoteWriteErrorCode::PersistenceFailed,
+                        "ブックマーク一覧を読み込めませんでした",
+                    ));
+                }
+            };
+        let container_address = RemoteAddress::file(
+            context_address.favorite_id.clone(),
+            context_address.relative_path.clone(),
+        );
+
+        let rows = if std::fs::metadata(&resolved.canonical).is_ok_and(|metadata| metadata.is_dir())
+        {
+            let listing = match self.recompute_folder_listing(&resolved.logical) {
+                Ok(listing) => listing,
+                Err(error) => return RemoteWriteResponse::Error(error),
+            };
+            bookmarks
+                .into_iter()
+                .map(|bookmark| {
+                    let target = match &bookmark.page_identity {
+                        crate::book_bookmarks::PageIdentity::RelativePath(wanted) => listing
+                            .items
+                            .iter()
+                            .enumerate()
+                            .find_map(|(item_index, item)| {
+                                let crate::grid_item::GridItem::Image(path) = item else {
+                                    return None;
+                                };
+                                let relative = path.strip_prefix(&resolved.logical).ok()?;
+                                (normalize_remote_bookmark_path(&relative.to_string_lossy())
+                                    == normalize_remote_bookmark_path(wanted))
+                                .then(|| {
+                                    grid_item_address(&container_address, item).map(|address| {
+                                        RemoteBookBookmarkTarget {
+                                            address,
+                                            context_address: container_address.clone(),
+                                            item_index: u32::try_from(item_index)
+                                                .unwrap_or(u32::MAX),
+                                        }
+                                    })
+                                })
+                                .flatten()
+                            }),
+                        _ => None,
+                    };
+                    remote_bookmark_row(bookmark, target)
+                })
+                .collect()
+        } else if is_zip_path(&resolved.logical) {
+            let tree = &prepared_zip
+                .as_ref()
+                .expect("ZIP bookmark list is prepared during validation")
+                .tree;
+            bookmarks
+                .into_iter()
+                .map(|bookmark| {
+                    let target = match &bookmark.page_identity {
+                        crate::book_bookmarks::PageIdentity::ArchiveEntry(entry_name) => {
+                            crate::book_bookmarks::resolve_archive_bookmark_target(
+                                &tree,
+                                entry_name,
+                                &self.settings.grid_display_order,
+                            )
+                            .and_then(|target| {
+                                let address =
+                                    zip_entry_address(&container_address, &target.entry_name);
+                                address.validate_syntax().ok()?;
+                                let context_address = RemoteAddress {
+                                    favorite_id: container_address.favorite_id.clone(),
+                                    relative_path: container_address.relative_path.clone(),
+                                    subresource: if target.effective_prefix.is_empty() {
+                                        RemoteSubresource::File
+                                    } else {
+                                        RemoteSubresource::ZipDirectory {
+                                            prefix: target.effective_prefix,
+                                        }
+                                    },
+                                };
+                                Some(RemoteBookBookmarkTarget {
+                                    address,
+                                    context_address,
+                                    item_index: u32::try_from(target.item_index).ok()?,
+                                })
+                            })
+                        }
+                        _ => None,
+                    };
+                    remote_bookmark_row(bookmark, target)
+                })
+                .collect()
+        } else if is_pdf_path(&resolved.logical) {
+            let metadata = match std::fs::metadata(&resolved.canonical) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    return RemoteWriteResponse::Error(RemoteWriteError::new(
+                        RemoteWriteErrorCode::NotFound,
+                        "PDF が見つかりません",
+                    ));
+                }
+            };
+            let page_count = match self.pdf_page_count(&resolved, &metadata) {
+                Ok(page_count) => page_count,
+                Err(error) => {
+                    return RemoteWriteResponse::Error(remote_write_error_from_media(error));
+                }
+            };
+            bookmarks
+                .into_iter()
+                .map(|bookmark| {
+                    let target = match &bookmark.page_identity {
+                        crate::book_bookmarks::PageIdentity::PdfPage(page_number)
+                            if *page_number < page_count =>
+                        {
+                            Some(RemoteBookBookmarkTarget {
+                                address: RemoteAddress {
+                                    favorite_id: container_address.favorite_id.clone(),
+                                    relative_path: container_address.relative_path.clone(),
+                                    subresource: RemoteSubresource::PdfPage {
+                                        page_number: *page_number,
+                                    },
+                                },
+                                context_address: container_address.clone(),
+                                item_index: *page_number,
+                            })
+                        }
+                        _ => None,
+                    };
+                    remote_bookmark_row(bookmark, target)
+                })
+                .collect()
+        } else {
+            bookmarks
+                .into_iter()
+                .map(|bookmark| remote_bookmark_row(bookmark, None))
+                .collect()
+        };
+
+        RemoteWriteResponse::Success(RemoteWriteResult::book_bookmarks(RemoteBookBookmarkList {
+            supported: true,
+            rows,
+        }))
+    }
+
+    fn prepare_book_bookmark_list(
+        &self,
+        request: &mut RemoteWriteRequest,
+    ) -> Result<Option<PreparedZipBookmarkList>, RemoteWriteError> {
+        let is_zip_page = matches!(
+            request,
+            RemoteWriteRequest::ListBookBookmarks {
+                address: RemoteAddress {
+                    subresource: RemoteSubresource::ZipEntry { .. },
+                    ..
+                },
+                ..
+            }
+        );
+        if !is_zip_page {
+            self.validate_write_request(request)?;
+            return Ok(None);
+        }
+
+        let RemoteWriteRequest::ListBookBookmarks {
+            address,
+            context_address,
+            page_index,
+            bookmark_supported,
+        } = request
+        else {
+            return Err(RemoteWriteError::new(
+                RemoteWriteErrorCode::Internal,
+                "ブックマーク一覧要求の種別が一致しません",
+            ));
+        };
+        if address.favorite_id != context_address.favorite_id {
+            return Err(RemoteWriteError::new(
+                RemoteWriteErrorCode::BadRequest,
+                "ページと閲覧コンテキストが一致しません",
+            ));
+        }
+        let RemoteSubresource::ZipEntry { entry_name } = &address.subresource else {
+            unreachable!("ZIP bookmark list was checked above");
+        };
+        let (resolved, requested_prefix, enumeration) =
+            self.enumerate_zip_page_context(address, context_address)?;
+
+        // 現行のページ検証は archive 内の全 entry を見る。一方、一覧の移動先は
+        // RemoteAddress として安全な entry だけを公開する。この差を保ったまま、重い
+        // archive 列挙だけを共有し、tree の構築はメモリ上でそれぞれ行う。
+        let validation_tree =
+            crate::zip_tree::ZipTree::build(resolved.logical.clone(), enumeration.entries.clone());
+        let validated =
+            self.validate_zip_page_in_tree(&validation_tree, &requested_prefix, entry_name)?;
+        *page_index = validated.page_index;
+        *bookmark_supported = validated.bookmark_supported;
+
+        let container_address = RemoteAddress::file(
+            context_address.favorite_id.clone(),
+            context_address.relative_path.clone(),
+        );
+        let safe_entries = enumeration
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                zip_entry_address(&container_address, &entry.entry_name)
+                    .validate_syntax()
+                    .is_ok()
+            })
+            .collect();
+        Ok(Some(PreparedZipBookmarkList {
+            tree: crate::zip_tree::ZipTree::build(resolved.logical.clone(), safe_entries),
+            resolved,
+        }))
     }
 
     fn validate_rating_page(&self, address: &RemoteAddress) -> Result<(), RemoteWriteError> {
@@ -1213,6 +1504,24 @@ impl ContainerEngine {
         context_address: &RemoteAddress,
         entry_name: &str,
     ) -> Result<ValidatedPageContext, RemoteWriteError> {
+        let (resolved, requested_prefix, enumeration) =
+            self.enumerate_zip_page_context(address, context_address)?;
+        let tree = crate::zip_tree::ZipTree::build(resolved.logical, enumeration.entries);
+        self.validate_zip_page_in_tree(&tree, &requested_prefix, entry_name)
+    }
+
+    fn enumerate_zip_page_context(
+        &self,
+        address: &RemoteAddress,
+        context_address: &RemoteAddress,
+    ) -> Result<
+        (
+            ResolvedFavoritePath,
+            String,
+            crate::zip_loader::ZipEnumeration,
+        ),
+        RemoteWriteError,
+    > {
         if address.relative_path != context_address.relative_path {
             return Err(RemoteWriteError::new(
                 RemoteWriteErrorCode::BadRequest,
@@ -1245,7 +1554,15 @@ impl ContainerEngine {
                     "ZIP を列挙できませんでした",
                 )
             })?;
-        let tree = crate::zip_tree::ZipTree::build(resolved.logical, enumeration.entries);
+        Ok((resolved, requested_prefix, enumeration))
+    }
+
+    fn validate_zip_page_in_tree(
+        &self,
+        tree: &crate::zip_tree::ZipTree,
+        requested_prefix: &str,
+        entry_name: &str,
+    ) -> Result<ValidatedPageContext, RemoteWriteError> {
         let requested_segments = zip_prefix_segments(&requested_prefix);
         if tree.node_at(&requested_segments).is_none() {
             return Err(RemoteWriteError::new(
@@ -3224,6 +3541,23 @@ fn zip_entry_address(container: &RemoteAddress, entry_name: &str) -> RemoteAddre
     }
 }
 
+fn normalize_remote_bookmark_path(value: &str) -> String {
+    value.replace('\\', "/").to_lowercase()
+}
+
+fn remote_bookmark_row(
+    bookmark: crate::book_bookmarks::BookBookmark,
+    target: Option<RemoteBookBookmarkTarget>,
+) -> RemoteBookBookmarkRow {
+    RemoteBookBookmarkRow {
+        id: bookmark.id,
+        title: bookmark.title,
+        page_index_hint: u32::try_from(bookmark.page_index_hint).unwrap_or(u32::MAX),
+        page_label: bookmark.page_identity.display_name(),
+        target,
+    }
+}
+
 fn grid_item_address(
     container: &RemoteAddress,
     item: &crate::grid_item::GridItem,
@@ -4203,8 +4537,8 @@ mod tests {
         ));
 
         let mut query = RemoteWriteRequest::GetItemState {
-            address: page,
-            context_address: context,
+            address: page.clone(),
+            context_address: context.clone(),
             page_index: 999,
             bookmark_supported: false,
         };
@@ -4217,6 +4551,194 @@ mod tests {
                 ..
             }
         ));
+
+        let mut list = RemoteWriteRequest::ListBookBookmarks {
+            address: page.clone(),
+            context_address: context.clone(),
+            page_index: 999,
+            bookmark_supported: false,
+        };
+        engine.validate_write_request(&mut list).unwrap();
+        assert!(matches!(
+            list,
+            RemoteWriteRequest::ListBookBookmarks {
+                page_index: 1,
+                bookmark_supported: true,
+                ..
+            }
+        ));
+
+        for mut mutation in [
+            RemoteWriteRequest::SetBookBookmarkTitle {
+                address: page.clone(),
+                context_address: context.clone(),
+                page_index: 999,
+                id: 7,
+                title: "page".to_owned(),
+            },
+            RemoteWriteRequest::RemoveBookBookmark {
+                address: page.clone(),
+                context_address: context.clone(),
+                page_index: 999,
+                id: 7,
+            },
+        ] {
+            engine.validate_write_request(&mut mutation).unwrap();
+            assert_eq!(mutation.context_address(), Some(&context));
+            assert!(matches!(
+                mutation,
+                RemoteWriteRequest::SetBookBookmarkTitle { page_index: 1, .. }
+                    | RemoteWriteRequest::RemoveBookBookmark { page_index: 1, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn folder_bookmark_list_keeps_db_order_hint_and_resolved_target_separate() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        let album = root.join("album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("001.jpg"), b"one").unwrap();
+        std::fs::write(album.join("002.jpg"), b"two").unwrap();
+        let favorite = FavoriteEntry::new("test".to_owned(), root);
+        let mut settings = crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            ..Default::default()
+        };
+        settings.auto_fullscreen_zip_pdf = true;
+        settings.auto_fullscreen_image_folders = true;
+        let engine = ContainerEngine::new(settings);
+
+        let service = crate::book_bookmarks::BookBookmarkService::spawn().unwrap();
+        service.add(
+            1,
+            crate::book_bookmarks::NewBookBookmark {
+                container_path: album,
+                container_kind: crate::book_bookmarks::BookContainerKind::ImageFolder,
+                page_identity: crate::book_bookmarks::PageIdentity::RelativePath(
+                    "002.jpg".to_owned(),
+                ),
+                page_index_hint: 99,
+            },
+        );
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match service.try_recv() {
+                Ok(crate::book_bookmarks::BookBookmarkEvent::Added { result: Ok(_), .. }) => break,
+                Ok(event) => panic!("unexpected bookmark event: {event:?}"),
+                Err(std::sync::mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("bookmark service did not add the row: {error}"),
+            }
+        }
+
+        let context = RemoteAddress::file(favorite.id.to_string(), "album");
+        let mut request = RemoteWriteRequest::ListBookBookmarks {
+            address: RemoteAddress::file(favorite.id.to_string(), "album/001.jpg"),
+            context_address: context.clone(),
+            page_index: 999,
+            bookmark_supported: false,
+        };
+        let RemoteWriteResponse::Success(result) = engine.book_bookmarks(&mut request) else {
+            panic!("bookmark list failed");
+        };
+        let list = result.book_bookmarks.unwrap();
+        assert!(list.supported);
+        assert_eq!(list.rows.len(), 1);
+        let row = &list.rows[0];
+        assert_eq!(row.page_index_hint, 99);
+        assert_eq!(row.page_label, "002.jpg");
+        let target = row.target.as_ref().unwrap();
+        assert_eq!(target.item_index, 1);
+        assert_eq!(target.context_address, context);
+        assert_eq!(
+            target.address,
+            RemoteAddress::file(favorite.id.to_string(), "album/002.jpg")
+        );
+    }
+
+    #[test]
+    fn zip_bookmark_list_combines_validation_with_cross_prefix_resolution() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        std::fs::create_dir_all(&root).unwrap();
+        let zip_path = root.join("book.zip");
+        write_remote_ai_test_zip(
+            &zip_path,
+            &[("part-a/001.jpg", b"one"), ("part-b/002.jpg", b"two")],
+        );
+        let favorite = FavoriteEntry::new("test".to_owned(), root);
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            ..Default::default()
+        });
+
+        let service = crate::book_bookmarks::BookBookmarkService::spawn().unwrap();
+        service.add(
+            1,
+            crate::book_bookmarks::NewBookBookmark {
+                container_path: zip_path,
+                container_kind: crate::book_bookmarks::BookContainerKind::OtherArchive,
+                page_identity: crate::book_bookmarks::PageIdentity::ArchiveEntry(
+                    "part-b/002.jpg".to_owned(),
+                ),
+                page_index_hint: 99,
+            },
+        );
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match service.try_recv() {
+                Ok(crate::book_bookmarks::BookBookmarkEvent::Added { result: Ok(_), .. }) => break,
+                Ok(event) => panic!("unexpected bookmark event: {event:?}"),
+                Err(std::sync::mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("bookmark service did not add the row: {error}"),
+            }
+        }
+
+        let mut request = RemoteWriteRequest::ListBookBookmarks {
+            address: RemoteAddress {
+                favorite_id: favorite.id.to_string(),
+                relative_path: "book.zip".to_owned(),
+                subresource: RemoteSubresource::ZipEntry {
+                    entry_name: "part-a/001.jpg".to_owned(),
+                },
+            },
+            context_address: RemoteAddress {
+                favorite_id: favorite.id.to_string(),
+                relative_path: "book.zip".to_owned(),
+                subresource: RemoteSubresource::ZipDirectory {
+                    prefix: "part-a/".to_owned(),
+                },
+            },
+            page_index: 999,
+            bookmark_supported: false,
+        };
+        let RemoteWriteResponse::Success(result) = engine.book_bookmarks(&mut request) else {
+            panic!("ZIP bookmark list failed");
+        };
+        let list = result.book_bookmarks.unwrap();
+        assert!(list.supported);
+        assert_eq!(list.rows.len(), 1);
+        let target = list.rows[0].target.as_ref().unwrap();
+        assert_eq!(target.item_index, 0);
+        assert_eq!(
+            target.address.subresource,
+            RemoteSubresource::ZipEntry {
+                entry_name: "part-b/002.jpg".to_owned(),
+            }
+        );
+        assert_eq!(
+            target.context_address.subresource,
+            RemoteSubresource::ZipDirectory {
+                prefix: "part-b/".to_owned(),
+            }
+        );
     }
 
     #[test]
@@ -4253,6 +4775,23 @@ mod tests {
                 ..
             }
         ));
+
+        let mut list = RemoteWriteRequest::ListBookBookmarks {
+            address: RemoteAddress::file(favorite.id.to_string(), "album/001.jpg"),
+            context_address: RemoteAddress::file(favorite.id.to_string(), "album"),
+            page_index: 999,
+            bookmark_supported: true,
+        };
+        let RemoteWriteResponse::Success(result) = engine.book_bookmarks(&mut list) else {
+            panic!("unsupported bookmark list should be a successful capability response");
+        };
+        assert_eq!(
+            result.book_bookmarks,
+            Some(RemoteBookBookmarkList {
+                supported: false,
+                rows: Vec::new(),
+            })
+        );
     }
 
     fn assert_local_remote_folder_listing_match(

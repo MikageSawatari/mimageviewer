@@ -2238,6 +2238,7 @@ fn api_write(request: &mut Request, state: &AppState, client_id: &str) -> HttpRe
             "applied": true,
             "item_state": result.value.item_state,
             "adjustment_state": result.value.adjustment_state,
+            "book_bookmarks": result.value.book_bookmarks,
         }))
         .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
         .with_header("Cache-Control", "no-store")

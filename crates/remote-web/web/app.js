@@ -1865,6 +1865,12 @@ async function loadContainer(address, options = {}) {
     return false;
   }
   state.requestController = null;
+  if (
+    options.requiredAddress &&
+    remoteBookBookmarkTargetEntryIndex(data.entries, options.requiredAddress) < 0
+  ) {
+    return false;
+  }
   applyContainerData(address, data, forceSinglePage, options);
   return true;
 }
@@ -2217,6 +2223,48 @@ async function toggleViewerBookmark() {
       failure instanceof Error ? failure.message : "ブックマークを変更できませんでした。"
     );
   }
+}
+
+async function openRemoteBookBookmarkTarget(target) {
+  const viewer = state.viewer;
+  if (!viewer || !target?.address || !target?.contextAddress) return false;
+  const loaded = await loadContainer(target.contextAddress, {
+    forceSinglePage: shouldForceSinglePageForViewport(),
+    requiredAddress: target.address,
+  });
+  if (!loaded || state.viewer !== viewer || state.screenContext !== "viewer") return false;
+
+  const entryIndex = remoteBookBookmarkTargetEntryIndex(state.entries, target.address);
+  const entry = state.entries[entryIndex];
+  const imageIndex = state.images.findIndex(
+    (candidate) => addressIdentity(entryAddress(candidate)) === addressIdentity(target.address)
+  );
+  const groupIndex = imageIndex >= 0 ? pageGroupIndexForEntry(state.images[imageIndex]) : -1;
+  const group = state.pageGroups[groupIndex];
+  if (!entry || imageIndex < 0 || !group) return false;
+
+  state.pageDirection = 1;
+  state.pageGroupIndex = groupIndex;
+  state.imageIndex = state.images.findIndex(
+    (candidate) => entryIdentity(candidate) === entryIdentity(group.anchor)
+  );
+  updateGridViewerReturnItem(group.anchor);
+  viewer.hideBoundaryMessage();
+  viewer.cancelPendingCenterTap();
+  viewer.setSeekState(viewerSeekSnapshot(groupIndex));
+  const viewerDepth = (Number(history.state?.viewerDepth) || 0) + 1;
+  history.pushState(
+    {
+      ...(history.state ?? {}),
+      mivRoute: true,
+      viewerFromGrid: Boolean(history.state?.viewerFromGrid),
+      viewerDepth,
+    },
+    "",
+    mediaHash(entryAddress(group.anchor))
+  );
+  await updateViewerImage(performance.now());
+  return true;
 }
 
 async function flushReadingProgress(reset = true) {
@@ -3227,6 +3275,7 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
     }))
   ).catch((error) => state.remoteAiController?.showRequestError(error));
   state.commandMenu?.refreshAdjustment();
+  state.commandMenu?.refreshBookmarks();
   observeReadingProgress();
   if (group.entries.every((entry) => entry.address)) {
     schedulePagePrefetch(viewer).catch(() => {});
@@ -4168,6 +4217,64 @@ export const VIEWER_PANEL_TABS = Object.freeze([
 ]);
 
 export const VIEWER_MENU_MAX_ACTIONS = 11;
+
+function remoteAddressLooksValid(address) {
+  return Boolean(
+    address &&
+    typeof address.favorite_id === "string" &&
+    typeof address.relative_path === "string" &&
+    typeof address.subresource?.kind === "string"
+  );
+}
+
+export function normalizeRemoteBookBookmarkList(value) {
+  const rows = Array.isArray(value?.rows) ? value.rows : [];
+  return {
+    supported: Boolean(value?.supported),
+    rows: rows.flatMap((row) => {
+      const id = Number(row?.id);
+      if (!Number.isSafeInteger(id)) return [];
+      const hint = Number(row?.page_index_hint);
+      const targetIndex = Number(row?.target?.item_index);
+      const target =
+        remoteAddressLooksValid(row?.target?.address) &&
+        remoteAddressLooksValid(row?.target?.context_address) &&
+        Number.isSafeInteger(targetIndex) &&
+        targetIndex >= 0
+          ? {
+              address: row.target.address,
+              contextAddress: row.target.context_address,
+              itemIndex: targetIndex,
+            }
+          : null;
+      return [{
+        id,
+        title: typeof row?.title === "string" && row.title.length ? row.title : null,
+        pageIndexHint: Number.isSafeInteger(hint) && hint >= 0 ? hint : 0,
+        pageLabel: typeof row?.page_label === "string" ? row.page_label : "",
+        target,
+      }];
+    }),
+  };
+}
+
+export function remoteBookBookmarkDisplayPage(row) {
+  const index = row?.target?.itemIndex ?? row?.pageIndexHint ?? 0;
+  return Math.max(0, Number(index) || 0) + 1;
+}
+
+export function remoteBookBookmarkTargetEntryIndex(entries, address) {
+  if (!remoteAddressLooksValid(address) || !Array.isArray(entries)) return -1;
+  const identity = addressIdentity(address);
+  return entries.findIndex(
+    (entry) => remoteAddressLooksValid(entryAddress(entry)) &&
+      addressIdentity(entryAddress(entry)) === identity
+  );
+}
+
+function remoteBookContainerIdentity(address) {
+  return `${address?.favorite_id ?? ""}\n${address?.relative_path ?? ""}`;
+}
 
 export function viewerMenuDefinitions({ hasContainer, barsVisible }) {
   const back = [MenuPageAction.BACK, "操作メニューへ戻る", "戻る"];
@@ -5423,6 +5530,323 @@ class ViewerAdjustmentPanel {
   }
 }
 
+class ViewerBookmarkPanel {
+  constructor() {
+    this.root = element("div", "viewer-bookmark-panel");
+    this.content = element("div", "viewer-bookmark-content");
+    this.status = textElement("p", "", "viewer-bookmark-status");
+    this.status.setAttribute("aria-live", "polite");
+    this.root.append(this.content, this.status);
+    this.list = null;
+    this.contextIdentity = "";
+    this.loading = false;
+    this.busy = false;
+    this.editingId = null;
+    this.refreshSequence = 0;
+    this.refreshController = null;
+    this.render();
+  }
+
+  currentTarget() {
+    return currentRemotePageTarget();
+  }
+
+  async refresh() {
+    const target = this.currentTarget();
+    const sequence = ++this.refreshSequence;
+    this.refreshController?.abort();
+    const controller = new AbortController();
+    this.refreshController = controller;
+    this.loading = true;
+    this.clearStatus();
+    this.render();
+    if (!target) {
+      this.list = { supported: false, rows: [] };
+      this.contextIdentity = "";
+      this.loading = false;
+      this.render();
+      return;
+    }
+    const contextIdentity = remoteBookContainerIdentity(target.contextAddress);
+    try {
+      const response = await apiPostJson("/api/write", {
+        kind: "list_book_bookmarks",
+        address: target.address,
+        context_address: target.contextAddress,
+        page_index: target.pageIndex,
+        bookmark_supported: false,
+      }, controller.signal);
+      if (sequence !== this.refreshSequence || controller.signal.aborted) return;
+      if (remoteBookContainerIdentity(this.currentTarget()?.contextAddress) !== contextIdentity) {
+        this.loading = false;
+        this.refresh().catch(() => {});
+        return;
+      }
+      if (!response.book_bookmarks) {
+        throw new Error("ブックマーク一覧を取得できませんでした。");
+      }
+      this.list = normalizeRemoteBookBookmarkList(response.book_bookmarks);
+      this.contextIdentity = contextIdentity;
+      this.loading = false;
+      this.render();
+    } catch (error) {
+      if (controller.signal.aborted || sequence !== this.refreshSequence) return;
+      this.loading = false;
+      this.showError(error);
+      this.render();
+      throw error;
+    }
+  }
+
+  updateCurrentPage() {
+    const contextIdentity = remoteBookContainerIdentity(this.currentTarget()?.contextAddress);
+    if (this.contextIdentity && this.contextIdentity !== contextIdentity && !this.loading) {
+      this.refresh().catch(() => {});
+      return;
+    }
+    this.render();
+  }
+
+  render() {
+    const list = this.list;
+    if (this.loading && !list) {
+      this.content.replaceChildren(textElement("p", "読み込み中…", "viewer-bookmark-empty"));
+      return;
+    }
+    if (!list?.supported) {
+      const message = element("div", "viewer-bookmark-unsupported");
+      message.append(
+        textElement("p", "この画像は本のブックマーク対象ではありません。"),
+        textElement(
+          "p",
+          "製本、画像のみフォルダ本、ZIP・PDF・対応アーカイブで利用できます。"
+        )
+      );
+      this.content.replaceChildren(message);
+      return;
+    }
+
+    const header = element("div", "viewer-bookmark-header");
+    const add = textElement("button", "追加", "viewer-bookmark-add");
+    add.type = "button";
+    add.disabled = this.busy;
+    add.setAttribute("aria-label", "現在ページをブックマークに追加");
+    add.addEventListener("click", () => this.addCurrent());
+    header.append(
+      textElement("strong", "この本のブックマーク"),
+      textElement("span", `${list.rows.length} 件`, "viewer-bookmark-count"),
+      add
+    );
+    const rows = element("div", "viewer-bookmark-rows");
+    if (!list.rows.length) {
+      rows.append(
+        textElement("p", "ブックマークはまだありません。", "viewer-bookmark-empty"),
+        textElement(
+          "p",
+          "上の追加ボタンで現在ページを追加できます。",
+          "viewer-bookmark-hint"
+        )
+      );
+    } else {
+      for (const row of list.rows) rows.append(this.buildRow(row));
+    }
+    this.content.replaceChildren(header, rows);
+  }
+
+  buildRow(row) {
+    const article = element("article", "viewer-bookmark-row");
+    const currentAddress = this.currentTarget()?.address;
+    const isCurrent = Boolean(
+      row.target && currentAddress &&
+      addressIdentity(row.target.address) === addressIdentity(currentAddress)
+    );
+    article.classList.toggle("is-current", isCurrent);
+    article.classList.toggle("is-unresolved", !row.target);
+
+    const main = element("button", "viewer-bookmark-main");
+    main.type = "button";
+    main.disabled = this.busy || !row.target;
+    const thumbnail = element("span", "viewer-bookmark-thumbnail");
+    thumbnail.textContent = row.target ? "…" : "!";
+    if (row.target) {
+      const image = document.createElement("img");
+      image.alt = "";
+      image.loading = "lazy";
+      image.decoding = "async";
+      image.addEventListener("load", () => thumbnail.classList.add("is-loaded"));
+      image.addEventListener("error", () => image.remove());
+      image.src = apiUrl(
+        "/api/thumb",
+        addressQueryParams(row.target.address, { w: 116 })
+      );
+      thumbnail.append(image);
+    }
+    const details = element("span", "viewer-bookmark-details");
+    details.append(
+      textElement("strong", row.title ?? "名称なし", "viewer-bookmark-title"),
+      textElement(
+        "span",
+        `${remoteBookBookmarkDisplayPage(row)} ページ`,
+        "viewer-bookmark-page"
+      ),
+      textElement("span", row.pageLabel, "viewer-bookmark-label")
+    );
+    if (!row.target) {
+      details.append(
+        textElement(
+          "span",
+          "ページが見つかりません",
+          "viewer-bookmark-missing"
+        )
+      );
+    }
+    main.append(thumbnail, details);
+    if (row.target) {
+      main.addEventListener("click", () => this.openRow(row));
+    }
+    article.append(main);
+
+    if (this.editingId === row.id) {
+      article.append(this.buildTitleEditor(row));
+    } else {
+      const controls = element("div", "viewer-bookmark-controls");
+      const edit = textElement("button", "名前を編集");
+      edit.type = "button";
+      edit.disabled = this.busy;
+      edit.addEventListener("click", () => {
+        this.editingId = row.id;
+        this.render();
+      });
+      const remove = textElement("button", "削除");
+      remove.type = "button";
+      remove.disabled = this.busy;
+      remove.addEventListener("click", () => this.removeRow(row));
+      controls.append(edit, remove);
+      article.append(controls);
+    }
+    return article;
+  }
+
+  buildTitleEditor(row) {
+    const editor = element("div", "viewer-bookmark-editor");
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = row.title ?? "";
+    input.autocomplete = "off";
+    input.setAttribute("aria-label", "ブックマーク名");
+    const save = textElement("button", "保存");
+    save.type = "button";
+    save.disabled = this.busy;
+    save.addEventListener("click", () => this.setTitle(row, input.value));
+    const clear = textElement("button", "名称なし");
+    clear.type = "button";
+    clear.disabled = this.busy;
+    clear.addEventListener("click", () => this.setTitle(row, ""));
+    const cancel = textElement("button", "キャンセル");
+    cancel.type = "button";
+    cancel.disabled = this.busy;
+    cancel.addEventListener("click", () => {
+      this.editingId = null;
+      this.render();
+    });
+    editor.append(input, save, clear, cancel);
+    requestAnimationFrame(() => input.focus({ preventScroll: true }));
+    return editor;
+  }
+
+  async openRow(row) {
+    if (this.busy || !row.target) return;
+    this.busy = true;
+    this.clearStatus();
+    this.render();
+    try {
+      const opened = await openRemoteBookBookmarkTarget(row.target);
+      if (!opened) throw new Error("ページが見つかりません");
+      this.updateCurrentPage();
+    } catch (error) {
+      this.showError(error instanceof Error ? error : new Error("ページが見つかりません"));
+    } finally {
+      this.busy = false;
+      this.render();
+    }
+  }
+
+  addCurrent() {
+    const target = this.currentTarget();
+    if (!target) return;
+    this.mutate({
+      kind: "set_bookmark",
+      address: target.address,
+      context_address: target.contextAddress,
+      page_index: target.pageIndex,
+      bookmarked: true,
+    }, "ブックマークを追加しました。");
+  }
+
+  setTitle(row, title) {
+    const target = this.currentTarget();
+    if (!target) return;
+    this.mutate({
+      kind: "set_book_bookmark_title",
+      address: target.address,
+      context_address: target.contextAddress,
+      page_index: target.pageIndex,
+      id: row.id,
+      title,
+    }, "ブックマーク名を更新しました。");
+  }
+
+  removeRow(row) {
+    const target = this.currentTarget();
+    if (!target) return;
+    this.mutate({
+      kind: "remove_book_bookmark",
+      address: target.address,
+      context_address: target.contextAddress,
+      page_index: target.pageIndex,
+      id: row.id,
+    }, "ブックマークを削除しました。");
+  }
+
+  async mutate(request, successMessage) {
+    if (this.busy) return;
+    this.busy = true;
+    this.status.textContent = "保存中…";
+    this.status.classList.remove("is-error");
+    this.render();
+    try {
+      await apiPostJson("/api/write", request);
+      this.editingId = null;
+      await refreshViewerItemState().catch(() => {});
+      await this.refresh();
+      this.status.textContent = successMessage;
+    } catch (error) {
+      this.showError(error);
+    } finally {
+      this.busy = false;
+      this.render();
+    }
+  }
+
+  clearStatus() {
+    this.status.textContent = "";
+    this.status.classList.remove("is-error");
+  }
+
+  showError(error) {
+    this.status.textContent = error instanceof Error
+      ? error.message
+      : "ブックマークを更新できませんでした。";
+    this.status.classList.add("is-error");
+  }
+
+  destroy() {
+    this.refreshSequence += 1;
+    this.refreshController?.abort();
+    this.refreshController = null;
+  }
+}
+
 class CommandMenu {
   constructor(host, context, owner = host) {
     this.context = context;
@@ -5442,6 +5866,7 @@ class CommandMenu {
     this.keyboardElements = [];
     this.viewerTabButtons = new Map();
     this.adjustmentPanel = null;
+    this.bookmarkPanel = null;
     const definition = menuDefinition(context, "main");
     this.root = element("div", "command-menu-layer");
     if (this.isViewerPanel) this.root.classList.add("viewer-command-menu-layer");
@@ -5618,6 +6043,10 @@ class CommandMenu {
       this.adjustmentPanel ??= new ViewerAdjustmentPanel();
       this.placeholder.replaceChildren(this.adjustmentPanel.root);
       this.adjustmentPanel.refresh().catch((error) => this.adjustmentPanel.showError(error));
+    } else if (tab.id === "bookmarks") {
+      this.bookmarkPanel ??= new ViewerBookmarkPanel();
+      this.placeholder.replaceChildren(this.bookmarkPanel.root);
+      this.bookmarkPanel.refresh().catch((error) => this.bookmarkPanel.showError(error));
     } else {
       this.placeholder.replaceChildren(textElement("h3", tab.label));
     }
@@ -5640,6 +6069,11 @@ class CommandMenu {
   refreshAdjustment() {
     if (!this.opened || state.viewerPanelTab !== "adjustment") return;
     this.adjustmentPanel?.refresh().catch((error) => this.adjustmentPanel.showError(error));
+  }
+
+  refreshBookmarks() {
+    if (!this.opened || state.viewerPanelTab !== "bookmarks") return;
+    this.bookmarkPanel?.updateCurrentPage();
   }
 
   toggle() {
@@ -5775,6 +6209,7 @@ class CommandMenu {
       this.root.removeEventListener("click", this.panelClickCapture, true);
       window.removeEventListener("resize", this.viewportResize);
       this.adjustmentPanel?.destroy();
+      this.bookmarkPanel?.destroy();
     }
     this.root.remove();
   }

@@ -162,11 +162,21 @@ struct AppRemoteVideoStarting {
 struct PendingRemoteBookmarkWrite {
     claimed: ClaimedRemoteWrite,
     kind: PendingRemoteBookmarkWriteKind,
+    container_path: std::path::PathBuf,
 }
 
 enum PendingRemoteBookmarkWriteKind {
     ReadState { rating: u8 },
     SetPresence,
+    SetTitle,
+    Remove,
+}
+
+enum RemoteBookmarkRequestAction {
+    ReadState { bookmark_supported: bool },
+    SetPresence { present: bool },
+    SetTitle { id: i64, title: String },
+    Remove { id: i64 },
 }
 
 struct PendingFullscreenRestore {
@@ -1311,7 +1321,10 @@ impl crate::app::App {
         }
         if matches!(
             pending.request(),
-            RemoteWriteRequest::SetBookmark { .. } | RemoteWriteRequest::GetItemState { .. }
+            RemoteWriteRequest::SetBookmark { .. }
+                | RemoteWriteRequest::GetItemState { .. }
+                | RemoteWriteRequest::SetBookBookmarkTitle { .. }
+                | RemoteWriteRequest::RemoveBookBookmark { .. }
         ) {
             self.begin_remote_bookmark_write(pending);
             return;
@@ -1356,24 +1369,33 @@ impl crate::app::App {
             RemoteWriteRequest::GetAdjustmentState { address } => {
                 self.remote_adjustment_state(address)
             }
-            RemoteWriteRequest::SetBookmark { .. } | RemoteWriteRequest::GetItemState { .. } => {
-                write_error(
-                    RemoteWriteErrorCode::Internal,
-                    "ブックマーク要求の非同期経路が使われませんでした",
-                )
-            }
+            RemoteWriteRequest::SetBookmark { .. }
+            | RemoteWriteRequest::GetItemState { .. }
+            | RemoteWriteRequest::ListBookBookmarks { .. }
+            | RemoteWriteRequest::SetBookBookmarkTitle { .. }
+            | RemoteWriteRequest::RemoveBookBookmark { .. } => write_error(
+                RemoteWriteErrorCode::Internal,
+                "ブックマーク要求の非同期経路が使われませんでした",
+            ),
         }
     }
 
     fn begin_remote_bookmark_write(&mut self, pending: ClaimedRemoteWrite) {
         let request = pending.request().clone();
-        let (address, context_address, page_index, requested_presence, supported) = match request {
+        let (address, context_address, page_index, action) = match request {
             RemoteWriteRequest::SetBookmark {
                 address,
                 context_address,
                 page_index,
                 bookmarked,
-            } => (address, context_address, page_index, Some(bookmarked), true),
+            } => (
+                address,
+                context_address,
+                page_index,
+                RemoteBookmarkRequestAction::SetPresence {
+                    present: bookmarked,
+                },
+            ),
             RemoteWriteRequest::GetItemState {
                 address,
                 context_address,
@@ -1383,37 +1405,65 @@ impl crate::app::App {
                 address,
                 context_address,
                 page_index,
-                None,
-                bookmark_supported,
+                RemoteBookmarkRequestAction::ReadState { bookmark_supported },
+            ),
+            RemoteWriteRequest::SetBookBookmarkTitle {
+                address,
+                context_address,
+                page_index,
+                id,
+                title,
+            } => (
+                address,
+                context_address,
+                page_index,
+                RemoteBookmarkRequestAction::SetTitle { id, title },
+            ),
+            RemoteWriteRequest::RemoveBookBookmark {
+                address,
+                context_address,
+                page_index,
+                id,
+            } => (
+                address,
+                context_address,
+                page_index,
+                RemoteBookmarkRequestAction::Remove { id },
             ),
             _ => unreachable!("only bookmark-backed requests are deferred"),
         };
-        let rating = match remote_rating_target(&self.settings, &address) {
-            Ok(target) => {
-                let Some(db) = self.rating_db.as_ref() else {
-                    pending.complete(UiWriteOutcome::Write(write_error(
-                        RemoteWriteErrorCode::PersistenceFailed,
-                        "レーティング DB を利用できません",
-                    )));
+        let rating = if let RemoteBookmarkRequestAction::ReadState { bookmark_supported } = &action
+        {
+            let rating = match remote_rating_target(&self.settings, &address) {
+                Ok(target) => {
+                    let Some(db) = self.rating_db.as_ref() else {
+                        pending.complete(UiWriteOutcome::Write(write_error(
+                            RemoteWriteErrorCode::PersistenceFailed,
+                            "レーティング DB を利用できません",
+                        )));
+                        return;
+                    };
+                    db.get(&target.key)
+                }
+                Err(error) => {
+                    pending.complete(UiWriteOutcome::Write(RemoteWriteResponse::Error(error)));
                     return;
-                };
-                db.get(&target.key)
-            }
-            Err(error) => {
-                pending.complete(UiWriteOutcome::Write(RemoteWriteResponse::Error(error)));
+                }
+            };
+            if !bookmark_supported {
+                pending.complete(UiWriteOutcome::Write(RemoteWriteResponse::Success(
+                    RemoteWriteResult::item_state(RemoteItemState {
+                        rating,
+                        bookmark_supported: false,
+                        bookmarked: false,
+                    }),
+                )));
                 return;
             }
+            Some(rating)
+        } else {
+            None
         };
-        if requested_presence.is_none() && !supported {
-            pending.complete(UiWriteOutcome::Write(RemoteWriteResponse::Success(
-                RemoteWriteResult::item_state(RemoteItemState {
-                    rating,
-                    bookmark_supported: false,
-                    bookmarked: false,
-                }),
-            )));
-            return;
-        }
         let draft =
             match remote_bookmark_draft(&self.settings, &address, &context_address, page_index) {
                 Ok(draft) => draft,
@@ -1430,12 +1480,26 @@ impl crate::app::App {
             )));
             return;
         };
-        let kind = if let Some(present) = requested_presence {
-            service.set_page_presence(request_id, draft, present);
-            PendingRemoteBookmarkWriteKind::SetPresence
-        } else {
-            service.get_page_presence(request_id, draft);
-            PendingRemoteBookmarkWriteKind::ReadState { rating }
+        let container_path = draft.container_path.clone();
+        let kind = match action {
+            RemoteBookmarkRequestAction::ReadState { .. } => {
+                service.get_page_presence(request_id, draft);
+                PendingRemoteBookmarkWriteKind::ReadState {
+                    rating: rating.expect("read state computes rating"),
+                }
+            }
+            RemoteBookmarkRequestAction::SetPresence { present } => {
+                service.set_page_presence(request_id, draft, present);
+                PendingRemoteBookmarkWriteKind::SetPresence
+            }
+            RemoteBookmarkRequestAction::SetTitle { id, title } => {
+                service.set_title_in_container(request_id, id, title, container_path.clone());
+                PendingRemoteBookmarkWriteKind::SetTitle
+            }
+            RemoteBookmarkRequestAction::Remove { id } => {
+                service.remove_in_container(request_id, id, container_path.clone());
+                PendingRemoteBookmarkWriteKind::Remove
+            }
         };
         self.book_bookmark_pending_requests.insert(request_id);
         self.remote_session_ui.pending_bookmark_writes.insert(
@@ -1443,6 +1507,7 @@ impl crate::app::App {
             PendingRemoteBookmarkWrite {
                 claimed: pending,
                 kind,
+                container_path,
             },
         );
     }
@@ -1733,17 +1798,13 @@ impl crate::app::App {
         &mut self,
         event: &crate::book_bookmarks::BookBookmarkEvent,
     ) -> bool {
-        let (request_id, result, is_read) = match event {
-            crate::book_bookmarks::BookBookmarkEvent::PagePresenceRead {
-                request_id,
-                result,
-                ..
-            } => (*request_id, result, true),
-            crate::book_bookmarks::BookBookmarkEvent::PagePresenceSet {
-                request_id,
-                result,
-                ..
-            } => (*request_id, result, false),
+        let request_id = match event {
+            crate::book_bookmarks::BookBookmarkEvent::PagePresenceRead { request_id, .. }
+            | crate::book_bookmarks::BookBookmarkEvent::PagePresenceSet { request_id, .. }
+            | crate::book_bookmarks::BookBookmarkEvent::Removed { request_id, .. }
+            | crate::book_bookmarks::BookBookmarkEvent::TitleUpdated { request_id, .. } => {
+                *request_id
+            }
             _ => return false,
         };
         let Some(pending) = self
@@ -1751,35 +1812,92 @@ impl crate::app::App {
             .pending_bookmark_writes
             .remove(&request_id)
         else {
-            return true;
+            return matches!(
+                event,
+                crate::book_bookmarks::BookBookmarkEvent::PagePresenceRead { .. }
+                    | crate::book_bookmarks::BookBookmarkEvent::PagePresenceSet { .. }
+            );
         };
         self.book_bookmark_pending_requests.remove(&request_id);
-        let response = match (&pending.kind, result, is_read) {
-            (PendingRemoteBookmarkWriteKind::ReadState { rating }, Ok(bookmarked), true) => {
+        let (response, changed) = match (&pending.kind, event) {
+            (
+                PendingRemoteBookmarkWriteKind::ReadState { rating },
+                crate::book_bookmarks::BookBookmarkEvent::PagePresenceRead {
+                    result: Ok(bookmarked),
+                    ..
+                },
+            ) => (
                 RemoteWriteResponse::Success(RemoteWriteResult::item_state(RemoteItemState {
                     rating: *rating,
                     bookmark_supported: true,
                     bookmarked: *bookmarked,
-                }))
-            }
-            (PendingRemoteBookmarkWriteKind::SetPresence, Ok(_), false) => {
-                self.notify_bookmarks_changed();
-                RemoteWriteResponse::Success(RemoteWriteResult::applied())
-            }
-            (_, Err(error), _) => {
+                })),
+                false,
+            ),
+            (
+                PendingRemoteBookmarkWriteKind::SetPresence,
+                crate::book_bookmarks::BookBookmarkEvent::PagePresenceSet { result: Ok(_), .. },
+            )
+            | (
+                PendingRemoteBookmarkWriteKind::SetTitle,
+                crate::book_bookmarks::BookBookmarkEvent::TitleUpdated { result: Ok(_), .. },
+            )
+            | (
+                PendingRemoteBookmarkWriteKind::Remove,
+                crate::book_bookmarks::BookBookmarkEvent::Removed { result: Ok(_), .. },
+            ) => (
+                RemoteWriteResponse::Success(RemoteWriteResult::applied()),
+                true,
+            ),
+            (
+                _,
+                crate::book_bookmarks::BookBookmarkEvent::PagePresenceRead {
+                    result: Err(error),
+                    ..
+                },
+            )
+            | (
+                _,
+                crate::book_bookmarks::BookBookmarkEvent::PagePresenceSet {
+                    result: Err(error),
+                    ..
+                },
+            )
+            | (
+                _,
+                crate::book_bookmarks::BookBookmarkEvent::Removed {
+                    result: Err(error), ..
+                },
+            )
+            | (
+                _,
+                crate::book_bookmarks::BookBookmarkEvent::TitleUpdated {
+                    result: Err(error), ..
+                },
+            ) => {
                 crate::logger::log(format!(
                     "remote_ipc: bookmark service request failed request_id={request_id} error={error}"
                 ));
-                write_error(
-                    RemoteWriteErrorCode::PersistenceFailed,
-                    "ブックマーク DB の操作に失敗しました",
+                (
+                    write_error(
+                        RemoteWriteErrorCode::PersistenceFailed,
+                        "ブックマーク DB の操作に失敗しました",
+                    ),
+                    false,
                 )
             }
-            _ => write_error(
-                RemoteWriteErrorCode::Internal,
-                "ブックマーク応答の種別が一致しません",
+            _ => (
+                write_error(
+                    RemoteWriteErrorCode::Internal,
+                    "ブックマーク応答の種別が一致しません",
+                ),
+                false,
             ),
         };
+        if changed {
+            self.invalidate_current_book_bookmarks_for_container(&pending.container_path);
+            self.notify_bookmarks_changed();
+        }
         pending.claimed.complete(UiWriteOutcome::Write(response));
         true
     }

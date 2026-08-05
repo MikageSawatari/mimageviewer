@@ -3087,6 +3087,14 @@ pub(crate) struct BookBookmarkTitleEdit {
     pub(crate) request_focus: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BookBookmarkPanelResolution {
+    /// 現在 materialize 済みの階層にある index。サムネイルと現在行の強調に使う。
+    pub(crate) current_item_index: Option<usize>,
+    /// コンテナ全体で解決した表示階層の index。欠落判定とページ表示に使う。
+    pub(crate) target_item_index: Option<usize>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum CompareViewMode {
     Off,
@@ -26913,6 +26921,21 @@ impl App {
         self.notify_bookmarks_changed();
     }
 
+    pub(crate) fn invalidate_current_book_bookmarks_for_container(&mut self, path: &Path) {
+        let key = crate::book_bookmarks::container_key(path);
+        let mounted = self.current_book_bookmarks_key.as_deref() == Some(key.as_str());
+        let loading = self
+            .current_book_bookmarks_request
+            .as_ref()
+            .is_some_and(|(_, pending_key)| pending_key == &key);
+        if mounted || loading {
+            self.current_book_bookmarks.clear();
+            self.current_book_bookmarks_key = None;
+            self.current_book_bookmarks_request = None;
+            self.clear_book_bookmark_title_edit();
+        }
+    }
+
     pub(crate) fn book_bookmark_item_idx(
         &self,
         bookmark: &crate::book_bookmarks::BookBookmark,
@@ -26942,6 +26965,40 @@ impl App {
             };
             matches.then_some(idx)
         })
+    }
+
+    fn resolve_current_archive_bookmark_target(
+        &self,
+        bookmark: &crate::book_bookmarks::BookBookmark,
+    ) -> Option<crate::book_bookmarks::ResolvedArchiveBookmarkTarget> {
+        let crate::book_bookmarks::PageIdentity::ArchiveEntry(entry_name) = &bookmark.page_identity
+        else {
+            return None;
+        };
+        let nav = self.zip_nav.as_ref()?;
+        if !crate::path_key::eq_keep_drive(&nav.tree.zip_path, &bookmark.container_path) {
+            return None;
+        }
+        crate::book_bookmarks::resolve_archive_bookmark_target(
+            &nav.tree,
+            entry_name,
+            &self.settings.grid_display_order,
+        )
+    }
+
+    pub(crate) fn book_bookmark_panel_resolution(
+        &self,
+        bookmark: &crate::book_bookmarks::BookBookmark,
+    ) -> BookBookmarkPanelResolution {
+        let current_item_index = self.book_bookmark_item_idx(bookmark);
+        let target_item_index = current_item_index.or_else(|| {
+            self.resolve_current_archive_bookmark_target(bookmark)
+                .map(|target| target.item_index)
+        });
+        BookBookmarkPanelResolution {
+            current_item_index,
+            target_item_index,
+        }
     }
 
     pub(crate) fn jump_to_current_book_bookmark(
@@ -26987,37 +27044,13 @@ impl App {
         &mut self,
         bookmark: &crate::book_bookmarks::BookBookmark,
     ) -> bool {
-        let crate::book_bookmarks::PageIdentity::ArchiveEntry(entry_name) = &bookmark.page_identity
-        else {
+        let Some(target) = self.resolve_current_archive_bookmark_target(bookmark) else {
             return false;
         };
-        let normalized = entry_name.replace('\\', "/");
-        // `/` を含まない entry の親は ZIP root (`[]`)。保存済み identity に先頭 `/`
-        // や `\\` が混ざっていても、空 segment を除いた絶対 prefix として解決する。
-        let prefix = normalized
-            .rsplit_once('/')
-            .map(|(prefix, _)| prefix)
-            .unwrap_or_default();
-        let segments: Vec<String> = prefix
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .map(str::to_string)
-            .collect();
         let Some(nav) = self.zip_nav.as_mut() else {
             return false;
         };
-        // `ZipNavState::enter` は通常 UI の実在 `ZipDir` 用で、任意 prefix 自体は検証しない。
-        // bookmark identity は stale になり得るため、現在階層を変更する前に tree 上の存在を
-        // 確認する。root の空 segments は `node_at(&[])` で有効になる。
-        if nav.tree.node_at(&segments).is_none() {
-            return false;
-        }
-        let absolute_prefix = if segments.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", segments.join("/"))
-        };
-        nav.enter(&absolute_prefix);
+        nav.enter(&target.effective_prefix);
         self.zip_nav_show_current_level();
         true
     }

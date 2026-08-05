@@ -2105,9 +2105,28 @@ mod tests {
             },
             RemoteWriteRequest::GetItemState {
                 address: page.clone(),
-                context_address: container,
+                context_address: container.clone(),
                 page_index: 3,
                 bookmark_supported: true,
+            },
+            RemoteWriteRequest::ListBookBookmarks {
+                address: page.clone(),
+                context_address: container.clone(),
+                page_index: 3,
+                bookmark_supported: true,
+            },
+            RemoteWriteRequest::SetBookBookmarkTitle {
+                address: page.clone(),
+                context_address: container.clone(),
+                page_index: 3,
+                id: 17,
+                title: "要確認".to_owned(),
+            },
+            RemoteWriteRequest::RemoveBookBookmark {
+                address: page.clone(),
+                context_address: container,
+                page_index: 3,
+                id: 17,
             },
             RemoteWriteRequest::SetAdjustment {
                 address: page.clone(),

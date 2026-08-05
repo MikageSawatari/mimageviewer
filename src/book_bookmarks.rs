@@ -199,7 +199,9 @@ pub enum BookBookmarkEvent {
 enum BookBookmarkRequest {
     Add(u64, NewBookBookmark),
     Remove(u64, i64),
+    RemoveInContainer(u64, i64, PathBuf),
     SetTitle(u64, i64, String),
+    SetTitleInContainer(u64, i64, String, PathBuf),
     ListContainer(u64, PathBuf),
     ListAll(u64),
     MigratePaths(u64, Vec<(PathBuf, PathBuf)>, Option<String>),
@@ -242,7 +244,19 @@ impl BookBookmarkService {
                                         result: Err(message.clone()),
                                     }
                                 }
+                                BookBookmarkRequest::RemoveInContainer(request_id, _, _) => {
+                                    BookBookmarkEvent::Removed {
+                                        request_id,
+                                        result: Err(message.clone()),
+                                    }
+                                }
                                 BookBookmarkRequest::SetTitle(request_id, _, _) => {
+                                    BookBookmarkEvent::TitleUpdated {
+                                        request_id,
+                                        result: Err(message.clone()),
+                                    }
+                                }
+                                BookBookmarkRequest::SetTitleInContainer(request_id, _, _, _) => {
                                     BookBookmarkEvent::TitleUpdated {
                                         request_id,
                                         result: Err(message.clone()),
@@ -300,6 +314,15 @@ impl BookBookmarkService {
                             request_id,
                             result: db.remove(id).map(|_| id).map_err(|err| err.to_string()),
                         },
+                        BookBookmarkRequest::RemoveInContainer(request_id, id, container_path) => {
+                            BookBookmarkEvent::Removed {
+                                request_id,
+                                result: db
+                                    .remove_in_container(id, &container_path)
+                                    .map(|_| id)
+                                    .map_err(|err| err.to_string()),
+                            }
+                        }
                         BookBookmarkRequest::SetTitle(request_id, id, title) => {
                             BookBookmarkEvent::TitleUpdated {
                                 request_id,
@@ -309,6 +332,18 @@ impl BookBookmarkService {
                                     .map_err(|err| err.to_string()),
                             }
                         }
+                        BookBookmarkRequest::SetTitleInContainer(
+                            request_id,
+                            id,
+                            title,
+                            container_path,
+                        ) => BookBookmarkEvent::TitleUpdated {
+                            request_id,
+                            result: db
+                                .set_title_in_container(id, Some(&title), &container_path)
+                                .map(|title| (id, title))
+                                .map_err(|err| err.to_string()),
+                        },
                         BookBookmarkRequest::ListContainer(request_id, path) => {
                             let container_key = container_key(&path);
                             BookBookmarkEvent::ContainerListed {
@@ -374,9 +409,36 @@ impl BookBookmarkService {
         }
     }
 
+    pub fn remove_in_container(&self, request_id: u64, id: i64, container_path: PathBuf) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(BookBookmarkRequest::RemoveInContainer(
+                request_id,
+                id,
+                container_path,
+            ));
+        }
+    }
+
     pub fn set_title(&self, request_id: u64, id: i64, title: String) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(BookBookmarkRequest::SetTitle(request_id, id, title));
+        }
+    }
+
+    pub fn set_title_in_container(
+        &self,
+        request_id: u64,
+        id: i64,
+        title: String,
+        container_path: PathBuf,
+    ) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(BookBookmarkRequest::SetTitleInContainer(
+                request_id,
+                id,
+                title,
+                container_path,
+            ));
         }
     }
 
@@ -560,6 +622,18 @@ impl BookBookmarkDb {
         Ok(())
     }
 
+    fn remove_in_container(&self, id: i64, path: &Path) -> Result<(), rusqlite::Error> {
+        let changed = self.conn.execute(
+            "DELETE FROM book_bookmarks WHERE id = ?1 AND container_key = ?2",
+            rusqlite::params![id, container_key(path)],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        }
+    }
+
     fn page_is_bookmarked(&self, entry: &NewBookBookmark) -> Result<bool, rusqlite::Error> {
         let key = container_key(&entry.container_path);
         let (page_kind, _, page_key) = entry.page_identity.storage_parts();
@@ -599,6 +673,24 @@ impl BookBookmarkDb {
             rusqlite::params![title.as_deref(), id],
         )?;
         Ok(title)
+    }
+
+    fn set_title_in_container(
+        &self,
+        id: i64,
+        title: Option<&str>,
+        path: &Path,
+    ) -> Result<Option<String>, rusqlite::Error> {
+        let title = normalize_bookmark_title(title);
+        let changed = self.conn.execute(
+            "UPDATE book_bookmarks SET title = ?1 WHERE id = ?2 AND container_key = ?3",
+            rusqlite::params![title.as_deref(), id, container_key(path)],
+        )?;
+        if changed == 1 {
+            Ok(title)
+        } else {
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        }
     }
 
     fn list_for_container(&self, path: &Path) -> Result<Vec<BookBookmark>, rusqlite::Error> {
@@ -1405,6 +1497,13 @@ pub fn load_all_from_disk_readonly() -> Result<Vec<BookBookmark>, rusqlite::Erro
     BookBookmarkDb::open_readonly(&db_path())?.list_all()
 }
 
+/// Remote write worker 用のコンテナ単位読み出し。DB を作成・更新しない。
+pub fn load_for_container_from_disk_readonly(
+    path: &Path,
+) -> Result<Vec<BookBookmark>, rusqlite::Error> {
+    BookBookmarkDb::open_readonly(&db_path())?.list_for_container(path)
+}
+
 /// 横断一覧の削除 worker 用。元コンテナやページは一切操作しない。
 pub fn remove_from_disk(id: i64) -> Result<(), rusqlite::Error> {
     BookBookmarkDb::open()?.remove(id)
@@ -1412,6 +1511,73 @@ pub fn remove_from_disk(id: i64) -> Result<(), rusqlite::Error> {
 
 pub fn container_key(path: &Path) -> String {
     crate::path_key::normalize_keep_drive(path)
+}
+
+/// ZIP 全体に保存された identity を、実際にそのページを表示する階層へ解決した結果。
+/// 現在 materialize 済みの階層には依存しない。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedArchiveBookmarkTarget {
+    pub entry_name: String,
+    pub effective_prefix: String,
+    pub item_index: usize,
+}
+
+pub(crate) fn resolve_archive_bookmark_target(
+    tree: &crate::zip_tree::ZipTree,
+    entry_name: &str,
+    display_order: &crate::settings::GridDisplayOrder,
+) -> Option<ResolvedArchiveBookmarkTarget> {
+    fn find_entry(node: &crate::zip_tree::ZipTreeNode, wanted: &str) -> Option<String> {
+        if let Some(entry) = node
+            .images
+            .iter()
+            .find(|entry| normalize_page_path(&entry.entry_name) == wanted)
+        {
+            return Some(entry.entry_name.clone());
+        }
+        node.dirs
+            .values()
+            .find_map(|child| find_entry(child, wanted))
+    }
+
+    let actual_entry_name = find_entry(&tree.root, &normalize_page_path(entry_name))?;
+    let parent = actual_entry_name
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or_default();
+    let parent_segments = parent
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let effective_segments = tree.collapse_redundant(&parent_segments);
+    let (mut items, mut metas) =
+        tree.materialize_level(&effective_segments, crate::app::BOOK_READING_PAGE_ORDER);
+    crate::grid_item::arrange_grid_items(
+        &mut items,
+        &mut metas,
+        display_order,
+        Some(crate::app::BOOK_READING_PAGE_ORDER),
+    );
+    let item_index = items.iter().position(|item| {
+        matches!(
+            item,
+            crate::grid_item::GridItem::ZipImage {
+                entry_name: candidate,
+                ..
+            } if normalize_page_path(candidate) == normalize_page_path(&actual_entry_name)
+        )
+    })?;
+    let effective_prefix = if effective_segments.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", effective_segments.join("/"))
+    };
+    Some(ResolvedArchiveBookmarkTarget {
+        entry_name: actual_entry_name,
+        effective_prefix,
+        item_index,
+    })
 }
 
 /// 画像フォルダ系ブックマークの相対ページを、実体の container 境界まで確認した結果。
@@ -1888,6 +2054,82 @@ mod tests {
         let (saved, _) = db.add(&entry).unwrap();
         db.remove(saved.id).unwrap();
         assert!(db.list_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn scoped_remove_and_title_reject_an_id_from_another_container() {
+        let db = open_in_memory();
+        let first = NewBookBookmark {
+            container_path: PathBuf::from("C:/Books/a.pdf"),
+            container_kind: BookContainerKind::Pdf,
+            page_identity: PageIdentity::PdfPage(1),
+            page_index_hint: 1,
+        };
+        let second_path = PathBuf::from("C:/Books/b.pdf");
+        let (saved, _) = db.add(&first).unwrap();
+
+        assert!(
+            db.set_title_in_container(saved.id, Some("wrong"), &second_path)
+                .is_err()
+        );
+        assert!(db.remove_in_container(saved.id, &second_path).is_err());
+        assert_eq!(
+            db.list_for_container(&first.container_path).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            db.list_for_container(&first.container_path).unwrap()[0].title,
+            None
+        );
+
+        assert_eq!(
+            db.set_title_in_container(saved.id, Some("right"), &first.container_path)
+                .unwrap()
+                .as_deref(),
+            Some("right")
+        );
+        db.remove_in_container(saved.id, &first.container_path)
+            .unwrap();
+        assert!(db.list_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn archive_bookmark_target_resolves_another_prefix_and_missing_rows() {
+        let entries = vec![
+            crate::zip_loader::ZipImageEntry {
+                entry_name: "book-a/001.jpg".to_owned(),
+                uncompressed_size: 10,
+                mtime: 1,
+            },
+            crate::zip_loader::ZipImageEntry {
+                entry_name: "book-b/wrapper/010.jpg".to_owned(),
+                uncompressed_size: 10,
+                mtime: 1,
+            },
+            crate::zip_loader::ZipImageEntry {
+                entry_name: "book-b/wrapper/020.jpg".to_owned(),
+                uncompressed_size: 10,
+                mtime: 1,
+            },
+        ];
+        let tree = crate::zip_tree::ZipTree::build(PathBuf::from("C:/Books/all.zip"), entries);
+        let target = resolve_archive_bookmark_target(
+            &tree,
+            r"BOOK-B\WRAPPER\020.JPG",
+            &crate::settings::GridDisplayOrder::default(),
+        )
+        .unwrap();
+        assert_eq!(target.entry_name, "book-b/wrapper/020.jpg");
+        assert_eq!(target.effective_prefix, "book-b/wrapper/");
+        assert_eq!(target.item_index, 1);
+        assert!(
+            resolve_archive_bookmark_target(
+                &tree,
+                "book-b/wrapper/missing.jpg",
+                &crate::settings::GridDisplayOrder::default(),
+            )
+            .is_none()
+        );
     }
 
     #[test]

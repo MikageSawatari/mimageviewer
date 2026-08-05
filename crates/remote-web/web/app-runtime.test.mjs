@@ -103,11 +103,14 @@ const {
   createGridTile,
   loadFolder,
   normalizeRemoteAdjustmentValues,
+  normalizeRemoteBookBookmarkList,
   normalizeRemoteColorizeParams,
   parentContainerAddress,
   reloadApplication,
   remoteAiProgressText,
   remoteAiPollingDelay,
+  remoteBookBookmarkDisplayPage,
+  remoteBookBookmarkTargetEntryIndex,
   resolveMediaOpenRoute,
   selectRecoverableRemoteAiJob,
   thumbnailAddressForEntry,
@@ -166,6 +169,56 @@ test("a folder-list video uses its absorbed sidecar as the thumbnail source", ()
     sidecar
   );
   assert.equal(thumbnailAddressForEntry({ address: video }), video);
+});
+
+test("book bookmark rows preserve DB order and keep hint separate from resolved target", () => {
+  const address = (pageNumber) => ({
+    favorite_id: "favorite",
+    relative_path: "book.pdf",
+    subresource: { kind: "pdf_page", page_number: pageNumber },
+  });
+  const context = {
+    favorite_id: "favorite",
+    relative_path: "book.pdf",
+    subresource: { kind: "file" },
+  };
+  const list = normalizeRemoteBookBookmarkList({
+    supported: true,
+    rows: [
+      {
+        id: 20,
+        title: "後半",
+        page_index_hint: 99,
+        page_label: "100 ページ",
+        target: {
+          address: address(4),
+          context_address: context,
+          item_index: 4,
+        },
+      },
+      {
+        id: 10,
+        title: null,
+        page_index_hint: 7,
+        page_label: "missing.jpg",
+        target: null,
+      },
+    ],
+  });
+
+  assert.equal(list.supported, true);
+  assert.deepEqual(list.rows.map((row) => row.id), [20, 10]);
+  assert.equal(remoteBookBookmarkDisplayPage(list.rows[0]), 5);
+  assert.equal(remoteBookBookmarkDisplayPage(list.rows[1]), 8);
+  assert.equal(list.rows[1].target, null);
+  assert.equal(
+    remoteBookBookmarkTargetEntryIndex(
+      [{ kind: "image", address: address(3) }, { kind: "image", address: address(4) }],
+      list.rows[0].target.address
+    ),
+    1
+  );
+  assert.equal(remoteBookBookmarkTargetEntryIndex([], list.rows[0].target.address), -1);
 });
 
 

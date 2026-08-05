@@ -618,7 +618,11 @@ fn write_worker_loop(
                 ClientMessage::Write {
                     id, mut request, ..
                 } => {
-                    if let Err(error) = container_engine.validate_write_request(&mut request) {
+                    if matches!(request, RemoteWriteRequest::ListBookBookmarks { .. }) {
+                        let response = container_engine.book_bookmarks(&mut request);
+                        finish_direct_write_request(id, session_operation, response)
+                    } else if let Err(error) = container_engine.validate_write_request(&mut request)
+                    {
                         session_operation.finish(false);
                         ServerMessage::Write {
                             id,
@@ -650,6 +654,24 @@ fn write_worker_loop(
         ));
     }
     crate::logger::log("remote_ipc: worker_stopped queue=write worker=write-0".to_owned());
+}
+
+fn finish_direct_write_request(
+    id: mimageviewer_ipc::RequestId,
+    operation: SessionOperation,
+    response: RemoteWriteResponse,
+) -> ServerMessage {
+    let ownership = operation.ownership_response();
+    let response = if ownership.status == SessionStatus::Active {
+        ServerMessage::Write { id, response }
+    } else {
+        ServerMessage::Session {
+            id,
+            response: ownership,
+        }
+    };
+    operation.finish(response_outcome(&response) == "ok");
+    response
 }
 
 fn stream_worker_loop(
@@ -1149,6 +1171,9 @@ fn operation_description(message: &ClientMessage) -> String {
             RemoteWriteRequest::SetRating { .. } => "レーティングを書き込み中",
             RemoteWriteRequest::SetBookmark { .. } => "ブックマークを書き込み中",
             RemoteWriteRequest::GetItemState { .. } => "ページ情報を確認中",
+            RemoteWriteRequest::ListBookBookmarks { .. } => "ブックマーク一覧を確認中",
+            RemoteWriteRequest::SetBookBookmarkTitle { .. } => "ブックマーク名を書き込み中",
+            RemoteWriteRequest::RemoveBookBookmark { .. } => "ブックマークを削除中",
             RemoteWriteRequest::SetAdjustment { .. } => "画像補正を書き込み中",
             RemoteWriteRequest::GetAdjustmentState { .. } => "画像補正を確認中",
         }

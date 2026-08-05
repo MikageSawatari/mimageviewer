@@ -13002,11 +13002,14 @@ impl App {
 
         self.ensure_current_book_bookmarks_loaded(fs_idx);
         let rows = self.current_book_bookmarks.clone();
-        let resolved: Vec<_> = rows
+        let resolutions: Vec<_> = rows
             .iter()
-            .map(|bookmark| self.book_bookmark_item_idx(bookmark))
+            .map(|bookmark| self.book_bookmark_panel_resolution(bookmark))
             .collect();
-        let thumb_indices: Vec<usize> = resolved.iter().flatten().copied().collect();
+        let thumb_indices: Vec<usize> = resolutions
+            .iter()
+            .filter_map(|resolution| resolution.current_item_index)
+            .collect();
         self.ensure_bookmark_panel_thumbnails(&thumb_indices);
 
         let add_tooltip = self
@@ -13067,8 +13070,8 @@ impl App {
             .max_height(body_height - 32.0)
             .show(ui, |ui| {
                 ui.set_width((body_width - BODY_SCROLLBAR_RESERVE).max(120.0));
-                for (bookmark, item_idx) in rows.iter().zip(resolved.iter()) {
-                    let is_current = *item_idx == Some(fs_idx);
+                for (bookmark, resolution) in rows.iter().zip(resolutions.iter()) {
+                    let is_current = resolution.current_item_index == Some(fs_idx);
                     let fill = if is_current {
                         egui::Color32::from_rgba_unmultiplied(55, 105, 165, 150)
                     } else {
@@ -13086,10 +13089,10 @@ impl App {
                                 ui.allocate_exact_size(thumb_size, egui::Sense::hover());
                             ui.painter()
                                 .rect_filled(thumb_rect, 3.0, egui::Color32::from_gray(28));
-                            if let Some(idx) = item_idx
+                            if let Some(idx) = resolution.current_item_index
                                 && let Some(crate::grid_item::ThumbnailState::Loaded {
                                     tex, ..
-                                }) = self.thumbnails.get(*idx)
+                                }) = self.thumbnails.get(idx)
                             {
                                 let [tw, th] = tex.size();
                                 let scale = (thumb_rect.width() / tw.max(1) as f32)
@@ -13110,7 +13113,11 @@ impl App {
                                 ui.painter().text(
                                     thumb_rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    if item_idx.is_some() { "…" } else { "!" },
+                                    if resolution.target_item_index.is_some() {
+                                        "…"
+                                    } else {
+                                        "!"
+                                    },
                                     egui::FontId::proportional(18.0),
                                     egui::Color32::from_gray(165),
                                 );
@@ -13159,7 +13166,8 @@ impl App {
                                 }
                                 ui.label(format!(
                                     "{} ページ",
-                                    (*item_idx)
+                                    resolution
+                                        .target_item_index
                                         .unwrap_or(bookmark.page_index_hint)
                                         .saturating_add(1)
                                 ));
@@ -13167,7 +13175,7 @@ impl App {
                                     egui::RichText::new(bookmark.page_identity.display_name())
                                         .small(),
                                 );
-                                if item_idx.is_none() {
+                                if resolution.target_item_index.is_none() {
                                     ui.label(
                                         egui::RichText::new("ページが見つかりません")
                                             .small()

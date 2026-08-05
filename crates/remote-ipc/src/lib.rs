@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 26;
+pub const PROTOCOL_VERSION: u32 = 27;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -430,6 +430,28 @@ pub enum RemoteWriteRequest {
         /// write worker がローカルのブックマーク対象条件から上書きする。
         bookmark_supported: bool,
     },
+    /// 現在の本 / コンテナに属するページブックマークを DB 順のまま取得する。
+    /// 一覧の列挙・解決は write worker で行い、UI thread へ I/O を持ち込まない。
+    ListBookBookmarks {
+        address: RemoteAddress,
+        context_address: RemoteAddress,
+        page_index: u32,
+        /// write worker がローカルのブックマーク対象条件から上書きする。
+        bookmark_supported: bool,
+    },
+    SetBookBookmarkTitle {
+        address: RemoteAddress,
+        context_address: RemoteAddress,
+        page_index: u32,
+        id: i64,
+        title: String,
+    },
+    RemoveBookBookmark {
+        address: RemoteAddress,
+        context_address: RemoteAddress,
+        page_index: u32,
+        id: i64,
+    },
     SetAdjustment {
         address: RemoteAddress,
         scope: RemoteAdjustmentScope,
@@ -448,6 +470,9 @@ impl RemoteWriteRequest {
             | Self::SetRating { address, .. }
             | Self::SetBookmark { address, .. }
             | Self::GetItemState { address, .. }
+            | Self::ListBookBookmarks { address, .. }
+            | Self::SetBookBookmarkTitle { address, .. }
+            | Self::RemoveBookBookmark { address, .. }
             | Self::SetAdjustment { address, .. }
             | Self::GetAdjustmentState { address } => address,
         }
@@ -462,6 +487,15 @@ impl RemoteWriteRequest {
                 context_address, ..
             }
             | Self::GetItemState {
+                context_address, ..
+            }
+            | Self::ListBookBookmarks {
+                context_address, ..
+            }
+            | Self::SetBookBookmarkTitle {
+                context_address, ..
+            }
+            | Self::RemoveBookBookmark {
                 context_address, ..
             } => Some(context_address),
             Self::SetSpread { .. }
@@ -478,6 +512,9 @@ impl RemoteWriteRequest {
             Self::SetRating { .. } => "set_rating",
             Self::SetBookmark { .. } => "set_bookmark",
             Self::GetItemState { .. } => "get_item_state",
+            Self::ListBookBookmarks { .. } => "list_book_bookmarks",
+            Self::SetBookBookmarkTitle { .. } => "set_book_bookmark_title",
+            Self::RemoveBookBookmark { .. } => "remove_book_bookmark",
             Self::SetAdjustment { .. } => "set_adjustment",
             Self::GetAdjustmentState { .. } => "get_adjustment_state",
         }
@@ -494,6 +531,7 @@ pub enum RemoteWriteResponse {
 pub struct RemoteWriteResult {
     pub item_state: Option<RemoteItemState>,
     pub adjustment_state: Option<RemoteAdjustmentState>,
+    pub book_bookmarks: Option<RemoteBookBookmarkList>,
 }
 
 impl RemoteWriteResult {
@@ -505,6 +543,7 @@ impl RemoteWriteResult {
         Self {
             item_state: Some(item_state),
             adjustment_state: None,
+            book_bookmarks: None,
         }
     }
 
@@ -512,6 +551,15 @@ impl RemoteWriteResult {
         Self {
             item_state: None,
             adjustment_state: Some(adjustment_state),
+            book_bookmarks: None,
+        }
+    }
+
+    pub fn book_bookmarks(book_bookmarks: RemoteBookBookmarkList) -> Self {
+        Self {
+            item_state: None,
+            adjustment_state: None,
+            book_bookmarks: Some(book_bookmarks),
         }
     }
 }
@@ -521,6 +569,31 @@ pub struct RemoteItemState {
     pub rating: u8,
     pub bookmark_supported: bool,
     pub bookmarked: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteBookBookmarkList {
+    pub supported: bool,
+    pub rows: Vec<RemoteBookBookmarkRow>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteBookBookmarkRow {
+    pub id: i64,
+    pub title: Option<String>,
+    pub page_index_hint: u32,
+    pub page_label: String,
+    /// `Some` のときだけ移動・サムネイル取得が可能。解決可否を別 field に重複させない。
+    pub target: Option<RemoteBookBookmarkTarget>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteBookBookmarkTarget {
+    /// 移動先かつ既存 `/api/thumb` に渡すページ address。
+    pub address: RemoteAddress,
+    /// 移動先ページを含む、collapse 後の実効コンテナ address。
+    pub context_address: RemoteAddress,
+    pub item_index: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1887,8 +1960,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v26_video_pull_jump_thumbnail_end_behavior_and_audio_status_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 26);
+    fn protocol_v27_video_pull_jump_thumbnail_end_behavior_and_audio_status_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 27);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -2117,9 +2190,28 @@ mod tests {
             },
             RemoteWriteRequest::GetItemState {
                 address: page.clone(),
-                context_address: container,
+                context_address: container.clone(),
                 page_index: 2,
                 bookmark_supported: true,
+            },
+            RemoteWriteRequest::ListBookBookmarks {
+                address: page.clone(),
+                context_address: container.clone(),
+                page_index: 2,
+                bookmark_supported: true,
+            },
+            RemoteWriteRequest::SetBookBookmarkTitle {
+                address: page.clone(),
+                context_address: container.clone(),
+                page_index: 2,
+                id: 41,
+                title: "見開き".to_owned(),
+            },
+            RemoteWriteRequest::RemoveBookBookmark {
+                address: page.clone(),
+                context_address: container,
+                page_index: 2,
+                id: 41,
             },
             RemoteWriteRequest::SetAdjustment {
                 address: page.clone(),
@@ -2172,6 +2264,38 @@ mod tests {
         let encoded = serde_json::to_vec(&response).unwrap();
         let decoded: RemoteWriteResponse = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, response);
+
+        let bookmark_list = RemoteWriteResponse::Success(RemoteWriteResult::book_bookmarks(
+            RemoteBookBookmarkList {
+                supported: true,
+                rows: vec![RemoteBookBookmarkRow {
+                    id: 41,
+                    title: Some("見開き".to_owned()),
+                    page_index_hint: 8,
+                    page_label: "009.jpg".to_owned(),
+                    target: Some(RemoteBookBookmarkTarget {
+                        address: RemoteAddress {
+                            favorite_id: "favorite".to_owned(),
+                            relative_path: "books/book.zip".to_owned(),
+                            subresource: RemoteSubresource::ZipEntry {
+                                entry_name: "chapter/009.jpg".to_owned(),
+                            },
+                        },
+                        context_address: RemoteAddress {
+                            favorite_id: "favorite".to_owned(),
+                            relative_path: "books/book.zip".to_owned(),
+                            subresource: RemoteSubresource::ZipDirectory {
+                                prefix: "chapter/".to_owned(),
+                            },
+                        },
+                        item_index: 8,
+                    }),
+                }],
+            },
+        ));
+        let encoded = serde_json::to_vec(&bookmark_list).unwrap();
+        let decoded: RemoteWriteResponse = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, bookmark_list);
 
         let adjustment = RemoteWriteResponse::Success(RemoteWriteResult::adjustment_state(
             RemoteAdjustmentState {
