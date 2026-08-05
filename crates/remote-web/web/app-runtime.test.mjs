@@ -101,6 +101,7 @@ const {
   commandTelemetryEvent,
   containerInitialImageIndex,
   createGridTile,
+  gridReturnItemIdentity,
   loadFolder,
   normalizeRemoteAdjustmentValues,
   normalizeRemoteBookBookmarkList,
@@ -111,6 +112,7 @@ const {
   remoteAiPollingDelay,
   remoteBookBookmarkDisplayPage,
   remoteBookBookmarkTargetEntryIndex,
+  resolveLegacyImageOpenRoute,
   resolveMediaOpenRoute,
   selectRecoverableRemoteAiJob,
   thumbnailAddressForEntry,
@@ -153,6 +155,21 @@ test("open telemetry records the requested kind, media kind, and reached route",
   assert.equal(rejected.handled, false);
 });
 
+test("legacy image telemetry resolves rejection and folder route without entryIndex", () => {
+  assert.equal(
+    resolveLegacyImageOpenRoute({ kind: "image", imageIndex: -1 }, 3, false),
+    "legacy_image_rejected"
+  );
+  assert.equal(
+    resolveLegacyImageOpenRoute({ kind: "image", imageIndex: 1 }, 3, false),
+    "folder_image"
+  );
+  assert.equal(
+    resolveLegacyImageOpenRoute({ kind: "image", imageIndex: 1 }, 3, true),
+    "collection_image"
+  );
+});
+
 test("a folder-list video uses its absorbed sidecar as the thumbnail source", () => {
   const video = {
     favorite_id: "favorite",
@@ -169,6 +186,22 @@ test("a folder-list video uses its absorbed sidecar as the thumbnail source", ()
     sidecar
   );
   assert.equal(thumbnailAddressForEntry({ address: video }), video);
+});
+
+test("grid return identity matches collection and addressed forms of the same item", () => {
+  const address = {
+    favorite_id: "favorite",
+    relative_path: "album/child",
+    subresource: { kind: "file" },
+  };
+  assert.equal(
+    gridReturnItemIdentity({
+      kind: "folder",
+      favorite_id: address.favorite_id,
+      relative_path: address.relative_path,
+    }),
+    gridReturnItemIdentity({ kind: "folder", address })
+  );
 });
 
 test("book bookmark rows preserve DB order and keep hint separate from resolved target", () => {

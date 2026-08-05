@@ -1256,25 +1256,106 @@ export function snappedGridOffset(scrollTop, rowPitch, maxOffset) {
   return Math.max(0, Math.min(maximum, Math.round(offset / pitch) * pitch));
 }
 
+export const GRID_VIEWPORT_MEMORY_LIMIT = 64;
+
+const GridViewportAnchorKind = Object.freeze({
+  NONE: "none",
+  ITEM: "item",
+});
+
+/// 操作カーソルとは別に、一覧へ戻ったとき可視化すべき明示 target だけを所有する。
+export class GridViewportAnchor {
+  constructor(itemIdentities) {
+    this.itemIdentities = Array.isArray(itemIdentities)
+      ? itemIdentities.slice()
+      : [];
+    this.state = { kind: GridViewportAnchorKind.NONE };
+  }
+
+  select(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= this.itemIdentities.length) {
+      return false;
+    }
+    const identity = this.itemIdentities[index];
+    if (identity == null) return false;
+    this.state = {
+      kind: GridViewportAnchorKind.ITEM,
+      identity: String(identity),
+    };
+    return true;
+  }
+
+  snapshot(previousScrollTop) {
+    return {
+      previousScrollTop: Math.max(0, Number(previousScrollTop) || 0),
+      targetItemIdentity:
+        this.state.kind === GridViewportAnchorKind.ITEM
+          ? this.state.identity
+          : null,
+    };
+  }
+}
+
+/// 一覧 context ごとの scroll / 選択対象を、session 内だけで有界に保持する。
+/// Map の挿入順を LRU 順として使い、参照・更新した context を末尾 (MRU) へ移す。
+export class GridViewportMemory {
+  constructor(limit = GRID_VIEWPORT_MEMORY_LIMIT) {
+    this.limit = Math.max(
+      1,
+      Math.floor(Number(limit) || GRID_VIEWPORT_MEMORY_LIMIT)
+    );
+    this.entries = new Map();
+  }
+
+  remember(context, { previousScrollTop = 0, targetItemIdentity = null } = {}) {
+    const key = String(context ?? "");
+    if (!key) return;
+    const snapshot = {
+      previousScrollTop: Math.max(0, Number(previousScrollTop) || 0),
+      targetItemIdentity:
+        targetItemIdentity == null ? null : String(targetItemIdentity),
+    };
+    this.entries.delete(key);
+    this.entries.set(key, snapshot);
+    while (this.entries.size > this.limit) {
+      this.entries.delete(this.entries.keys().next().value);
+    }
+  }
+
+  updateTarget(context, targetItemIdentity) {
+    const key = String(context ?? "");
+    if (!key || targetItemIdentity == null) return;
+    const current = this.entries.get(key);
+    this.remember(key, {
+      previousScrollTop: current?.previousScrollTop ?? 0,
+      targetItemIdentity,
+    });
+  }
+
+  recall(context) {
+    const key = String(context ?? "");
+    const snapshot = this.entries.get(key);
+    if (!snapshot) return null;
+    this.entries.delete(key);
+    this.entries.set(key, snapshot);
+    return { ...snapshot };
+  }
+
+  get size() {
+    return this.entries.size;
+  }
+}
+
 /// 本体の App::apply_scroll_to_selected と同じく、対象行が画面外のときだけ
 /// 上端または下端まで最小限動かす。対象が消えた場合は既存 offset の範囲 clamp だけ行う。
 export function resolveGridReturnViewport({
-  sourceContext,
-  destinationContext,
-  viewedItemIdentity,
+  targetItemIdentity,
   itemIdentities,
   previousScrollTop,
   columns,
   rowPitch,
   viewportHeight,
 }) {
-  if (
-    !sourceContext ||
-    String(sourceContext) !== String(destinationContext)
-  ) {
-    return null;
-  }
-
   const identities = Array.isArray(itemIdentities) ? itemIdentities : [];
   const columnCount = Math.max(1, Math.floor(Number(columns) || 1));
   const pitch = Math.max(1, Number(rowPitch) || 1);
@@ -1282,9 +1363,9 @@ export function resolveGridReturnViewport({
   const rowCount = Math.ceil(identities.length / columnCount);
   const { maxOffset } = gridScrollExtent(rowCount, pitch, viewport);
   let scrollTop = snappedGridOffset(previousScrollTop, pitch, maxOffset);
-  const targetIndex = viewedItemIdentity == null
+  const targetIndex = targetItemIdentity == null
     ? -1
-    : identities.indexOf(viewedItemIdentity);
+    : identities.indexOf(targetItemIdentity);
 
   if (targetIndex >= 0) {
     const rowTop = Math.floor(targetIndex / columnCount) * pitch;

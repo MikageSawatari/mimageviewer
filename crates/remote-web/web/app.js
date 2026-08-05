@@ -1,6 +1,8 @@
 import {
   CommandName,
   FitMode,
+  GridViewportAnchor,
+  GridViewportMemory,
   IMAGE_QUALITY_PRESETS,
   ReadingDirection,
   SpreadMode,
@@ -401,7 +403,7 @@ const state = {
   viewerItemState: null,
   viewerItemStateSequence: 0,
   pageRenderRevision: 0,
-  gridViewerReturn: null,
+  gridViewportMemory: new GridViewportMemory(),
   appAssetToken: "",
   appUpdateDismissedToken: null,
   appUpdateBanner: null,
@@ -783,8 +785,6 @@ function renderPinLogin(initialRemainingSeconds = 0) {
 async function dispatchRoute() {
   if (!state.authenticated) return;
   const route = parseRoute(location.hash);
-  rememberGridViewerReturnForRoute(route);
-  if (route.kind === 'home') state.gridViewerReturn = null;
   if (
     state.screenContext === "viewer" &&
     route.kind !== "media" &&
@@ -1069,6 +1069,7 @@ function dispatchCommand(requested, meta = {}) {
       : state.folderPath
         ? folderHash(state.favoriteId, parentPath(state.folderPath))
         : homeHash("favorites");
+    rememberParentGridReturnTarget(target);
     navigate(target);
     handled = true;
   } else if (
@@ -1096,6 +1097,7 @@ function dispatchCommand(requested, meta = {}) {
     const index = Number(requested.payload.index);
     if (state.screenContext === "grid" && Number.isInteger(index)) {
       state.gridIndex = clamp(index, 0, Math.max(0, state.entries.length - 1));
+      state.virtualGrid?.selectReturnAnchor(state.gridIndex);
       state.virtualGrid?.focusIndex(state.gridIndex, false);
       handled = true;
     }
@@ -1188,9 +1190,30 @@ export function resolveMediaOpenRoute(requestedKind, addressedEntry, imageIndex)
   return requestedKind;
 }
 
+export function resolveLegacyImageOpenRoute(payload, imageCount, isCollection) {
+  if (
+    payload?.kind !== "image" ||
+    !Number.isInteger(payload.imageIndex) ||
+    payload.imageIndex < 0 ||
+    payload.imageIndex >= imageCount
+  ) {
+    return "legacy_image_rejected";
+  }
+  return isCollection ? "collection_image" : "folder_image";
+}
+
 function executeOpenCommand(payload, meta) {
   payload = payload ?? {};
   meta = meta ?? {};
+  if (
+    state.screenContext === "grid" &&
+    Number.isInteger(payload.entryIndex) &&
+    payload.entryIndex >= 0 &&
+    payload.entryIndex < state.entries.length
+  ) {
+    state.gridIndex = payload.entryIndex;
+    state.virtualGrid?.selectReturnAnchor(payload.entryIndex);
+  }
   if (payload.kind === "favorite" || payload.kind === "folder") {
     meta.openRoute = payload.kind;
     navigate(folderHash(payload.favoriteId, payload.path ?? ""));
@@ -1214,7 +1237,6 @@ function executeOpenCommand(payload, meta) {
     !state.container &&
     state.folderContainerLoad
   ) {
-    rememberGridViewerReturn(addressedMediaEntry);
     meta.openRoute = "folder_container_image";
     return openFolderImageFromGrid(payload, meta);
   }
@@ -1236,8 +1258,6 @@ function executeOpenCommand(payload, meta) {
       return false;
     }
     meta.openRoute = `media_${mediaRoute}`;
-    rememberGridViewerReturn(addressedEntry);
-    if (Number.isInteger(payload.entryIndex)) state.gridIndex = payload.entryIndex;
     tryEnterBrowserFullscreen();
     history.pushState(
       {
@@ -1260,29 +1280,21 @@ function executeOpenCommand(payload, meta) {
     }
     return true;
   }
-  if (
-    payload.kind !== "image" ||
-    !Number.isInteger(payload.imageIndex) ||
-    payload.imageIndex < 0 ||
-    payload.imageIndex >= state.images.length
-  ) {
-    return false;
-    meta.openRoute = "legacy_image_rejected";
-  }
-  rememberGridViewerReturn(state.images[payload.imageIndex]);
+  const legacyOpenRoute = resolveLegacyImageOpenRoute(
+    payload,
+    state.images.length,
+    Boolean(state.collection)
+  );
+  meta.openRoute = legacyOpenRoute;
+  if (legacyOpenRoute === "legacy_image_rejected") return false;
   if (state.collection) {
     tryEnterBrowserFullscreen();
-    meta.openRoute = "collection_image";
     navigate(imageHash(payload.favoriteId, payload.path), {
       viewerFromGrid: true,
       viewerDepth: 1,
       returnHash: location.hash,
     });
     return true;
-  }
-  if (Number.isInteger(payload.entryIndex)) {
-  meta.openRoute = "folder_image";
-    state.gridIndex = payload.entryIndex;
   }
   tryEnterBrowserFullscreen();
   history.pushState(
@@ -1307,8 +1319,6 @@ function openFolderImageFromGrid(payload, meta) {
     subresource: { kind: "file" },
   };
   if (!pageAddress.favorite_id || !pageAddress.relative_path) return false;
-  if (Number.isInteger(payload.entryIndex)) state.gridIndex = payload.entryIndex;
-
   const folderLoad = state.folderContainerLoad;
   const returnHash = folderHash(state.favoriteId, state.folderPath);
   tryEnterBrowserFullscreen();
@@ -1380,7 +1390,7 @@ function openGridEntry(index, meta) {
   const path = entryPath(entry);
   if (entryIsFolder(entry)) {
     return executeOpenCommand(
-      { kind: "folder", favoriteId, path },
+      { kind: "folder", favoriteId, path, entryIndex: index },
       meta
     );
   }
@@ -1436,6 +1446,7 @@ function executeGridNavigation(name) {
   });
   if (nextIndex < 0) return false;
   state.gridIndex = nextIndex;
+  state.virtualGrid.selectReturnAnchor(nextIndex);
   state.virtualGrid.focusIndex(nextIndex, true);
   return true;
 }
@@ -1512,46 +1523,52 @@ function inputSourceFromEvent(event) {
   return "mouse";
 }
 
-function rememberGridViewerReturn(entry) {
+function rememberCurrentGridViewport() {
   if (
     state.screenContext !== 'grid' ||
     !state.virtualGrid ||
-    !state.gridHash ||
-    !entry
+    !state.virtualGrid.context
   ) {
     return;
   }
-  state.gridViewerReturn = {
-    sourceContext: state.gridHash,
-    viewedItemIdentity: entryIdentity(entry),
-    previousScrollTop: state.virtualGrid.scrollTop(),
-  };
-}
-
-function rememberGridViewerReturnForRoute(route) {
-  if (state.screenContext !== 'grid' || state.gridViewerReturn) return;
-  let targetAddress = null;
-  if (route.kind === 'media') {
-    targetAddress = route.address;
-  } else if (route.kind === 'image') {
-    targetAddress = {
-      favorite_id: route.favoriteId,
-      relative_path: route.path,
-      subresource: { kind: 'file' },
-    };
-  }
-  if (!targetAddress) return;
-  const identity = addressIdentity(targetAddress);
-  const entry = state.entries.find(
-    (candidate) => addressIdentity(entryAddress(candidate)) === identity
+  const grid = state.virtualGrid;
+  // Browser history can finish the next route's async load before this DOM is torn down.
+  // Read the context/return anchor owned by the rendered grid, never the already-replaced state.
+  state.gridViewportMemory.remember(
+    grid.context,
+    grid.viewportAnchor.snapshot(grid.scrollTop())
   );
-  rememberGridViewerReturn(entry);
 }
 
-function updateGridViewerReturnItem(entry) {
-  if (state.gridViewerReturn && entry) {
-    state.gridViewerReturn.viewedItemIdentity = entryIdentity(entry);
-  }
+function updateGridReturnTargetItem(entry) {
+  const sourceContext = history.state?.returnHash;
+  if (!sourceContext || !entry) return;
+  state.gridViewportMemory.updateTarget(
+    sourceContext,
+    gridReturnItemIdentity(entry)
+  );
+}
+
+function rememberParentGridReturnTarget(targetHash) {
+  const returnContext = state.container
+    ? containerParentHash(state.container.address)
+    : targetHash;
+  const targetKind = parseRoute(returnContext).kind;
+  if (!["folder", "container", "collection"].includes(targetKind)) return;
+  const currentAddress = state.container?.address ?? (
+    !state.collection && state.favoriteId
+      ? {
+          favorite_id: state.favoriteId,
+          relative_path: state.folderPath,
+          subresource: { kind: "file" },
+        }
+      : null
+  );
+  if (!currentAddress) return;
+  state.gridViewportMemory.updateTarget(
+    returnContext,
+    addressIdentity(currentAddress)
+  );
 }
 
 function menuCommand(event, name, payload = {}) {
@@ -1562,6 +1579,7 @@ function menuCommand(event, name, payload = {}) {
 }
 
 function cleanupScreen(preserveRequestController = null) {
+  rememberCurrentGridViewport();
   clearInterval(state.authCountdownTimer);
   state.authCountdownTimer = 0;
   if (
@@ -2248,7 +2266,7 @@ async function openRemoteBookBookmarkTarget(target) {
   state.imageIndex = state.images.findIndex(
     (candidate) => entryIdentity(candidate) === entryIdentity(group.anchor)
   );
-  updateGridViewerReturnItem(group.anchor);
+  updateGridReturnTargetItem(group.anchor);
   viewer.hideBoundaryMessage();
   viewer.cancelPendingCenterTap();
   viewer.setSeekState(viewerSeekSnapshot(groupIndex));
@@ -2369,7 +2387,7 @@ async function refreshContainerSpread(
   state.imageIndex = state.images.findIndex(
     (entry) => entryIdentity(entry) === entryIdentity(group.anchor)
   );
-  updateGridViewerReturnItem(group.anchor);
+  updateGridReturnTargetItem(group.anchor);
   viewer.cancelPendingCenterTap();
   viewer.setSeekState(viewerSeekSnapshot());
   await updateViewerImage(performance.now());
@@ -2468,8 +2486,6 @@ export async function loadFolder(
 
 function renderFolder(listMetrics = null, preserveRequestController = null) {
   const renderStartedAt = performance.now();
-  const gridViewerReturn = state.gridViewerReturn;
-  state.gridViewerReturn = null;
   cleanupScreen(preserveRequestController);
   state.screenContext = "grid";
   exitBrowserFullscreen();
@@ -2550,6 +2566,7 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
   const imageIndexes = new Map(
     state.images.map((entry, index) => [entryIdentity(entry), index])
   );
+  const gridItemIdentities = state.entries.map(gridReturnItemIdentity);
   const labelHeight = gridLabelHeightForEntries(state.entries);
   state.virtualGrid = new VirtualGrid(
     scroll,
@@ -2560,12 +2577,16 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
       createGridTile(entry, index, imageIndexes, state.thumbnailTracker, cellWidth),
     (initialItems) => state.thumbnailTracker?.begin(initialItems),
     state.thumbAspectHeightRatio,
-    labelHeight
+    labelHeight,
+    {
+      context: state.gridHash,
+      itemIdentities: gridItemIdentities,
+    }
   );
+  const gridViewport = state.gridViewportMemory.recall(state.gridHash);
   const returnViewport = resolveGridReturnViewport({
-    ...gridViewerReturn,
-    destinationContext: state.gridHash,
-    itemIdentities: state.entries.map(entryIdentity),
+    ...gridViewport,
+    itemIdentities: state.virtualGrid.itemIdentities,
     columns: state.virtualGrid.columns,
     rowPitch: state.virtualGrid.rowHeight,
     viewportHeight: scroll.clientHeight,
@@ -2577,6 +2598,7 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
     state.virtualGrid.restoreScrollTop(returnViewport.scrollTop);
     if (returnViewport.targetIndex >= 0) {
       state.gridIndex = returnViewport.targetIndex;
+      state.virtualGrid.selectReturnAnchor(state.gridIndex);
       state.virtualGrid.focusIndex(state.gridIndex, false);
     }
   } else {
@@ -2875,6 +2897,10 @@ function entryIdentity(entry) {
     : `${entry.favorite_id ?? state.favoriteId ?? ""}\n${entryPath(entry)}`;
 }
 
+export function gridReturnItemIdentity(entry) {
+  return addressIdentity(entryAddress(entry));
+}
+
 function addressQueryParams(address, extra = {}) {
   const params = {
     fav: address.favorite_id,
@@ -2954,7 +2980,6 @@ function entryTypeLabel(kind) {
 }
 
 function renderVideoViewer(entry) {
-  updateGridViewerReturnItem(entry);
   if (!entry || entry.kind !== "video") {
     recordClientError("video_viewer_entry_rejected", "動画ビューアに動画以外が渡されました", {
       entry_found: Boolean(entry),
@@ -2965,6 +2990,7 @@ function renderVideoViewer(entry) {
   }
   cleanupScreen();
   state.screenContext = "viewer";
+  updateGridReturnTargetItem(entry);
   state.viewerItemState = null;
   state.viewerItemStateSequence += 1;
   state.imageIndex = -1;
@@ -3048,9 +3074,9 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   const requestedEntry = state.images[index];
   const groupIndex = pageGroupIndexForEntry(requestedEntry);
   if (!requestedEntry || groupIndex < 0) return;
-  updateGridViewerReturnItem(state.pageGroups[groupIndex].anchor);
   cleanupScreen();
   state.screenContext = "viewer";
+  updateGridReturnTargetItem(state.pageGroups[groupIndex].anchor);
   state.viewerItemState = null;
   state.viewerItemStateSequence += 1;
   if (previousIndex >= 0 && previousIndex !== index) {
@@ -3206,7 +3232,7 @@ function changeImageTo(nextGroupIndex) {
   state.pageGroupIndex = nextGroupIndex;
   state.viewer?.setSeekState(viewerSeekSnapshot(nextGroupIndex));
   const entry = state.pageGroups[nextGroupIndex].anchor;
-  updateGridViewerReturnItem(entry);
+  updateGridReturnTargetItem(entry);
   state.imageIndex = state.images.findIndex(
     (image) => entryIdentity(image) === entryIdentity(entry)
   );
@@ -3726,7 +3752,8 @@ class VirtualGrid {
     renderCell,
     onInitialItems,
     aspectHeightRatio,
-    labelHeight
+    labelHeight,
+    viewportState = {}
   ) {
     this.scroller = scroller;
     this.space = space;
@@ -3736,6 +3763,13 @@ class VirtualGrid {
     this.onInitialItems = onInitialItems;
     this.aspectHeightRatio = aspectHeightRatio;
     this.requestedLabelHeight = labelHeight;
+    // These values describe this rendered list. Keep them with the DOM because a route
+    // load may replace the global grid state before cleanupScreen destroys this instance.
+    this.context = String(viewportState.context ?? "");
+    this.itemIdentities = Array.isArray(viewportState.itemIdentities)
+      ? viewportState.itemIdentities.slice()
+      : [];
+    this.viewportAnchor = new GridViewportAnchor(this.itemIdentities);
     this.initialItemsReported = false;
     this.cells = new Map();
     this.columns = 1;
@@ -4087,6 +4121,10 @@ class VirtualGrid {
     );
     this.lastRange = '';
     this.schedule();
+  }
+
+  selectReturnAnchor(index) {
+    this.viewportAnchor.select(index);
   }
 
   focusIndex(index, shouldFocus) {

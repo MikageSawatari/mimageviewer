@@ -4,6 +4,9 @@ import assert from "node:assert/strict";
 import {
   CommandName,
   FitMode,
+  GRID_VIEWPORT_MEMORY_LIMIT,
+  GridViewportAnchor,
+  GridViewportMemory,
   ReadingDirection,
   SpreadMode,
   ViewerGesture,
@@ -1394,9 +1397,7 @@ test('grid return scrolls only enough to reveal the previously viewed item', () 
   const itemIdentities = Array.from({ length: 40 }, (_, index) => 'item-' + index);
   assert.deepEqual(
     resolveGridReturnViewport({
-      sourceContext: 'folder-a',
-      destinationContext: 'folder-a',
-      viewedItemIdentity: 'item-22',
+      targetItemIdentity: 'item-22',
       itemIdentities,
       previousScrollTop: 200,
       columns: 4,
@@ -1409,9 +1410,7 @@ test('grid return scrolls only enough to reveal the previously viewed item', () 
 
 test('grid return clamps the old range instead of jumping to the top when the item is gone', () => {
   const result = resolveGridReturnViewport({
-    sourceContext: 'folder-a',
-    destinationContext: 'folder-a',
-    viewedItemIdentity: 'deleted-item',
+    targetItemIdentity: 'deleted-item',
     itemIdentities: Array.from({ length: 20 }, (_, index) => 'item-' + index),
     previousScrollTop: 900,
     columns: 2,
@@ -1422,20 +1421,120 @@ test('grid return clamps the old range instead of jumping to the top when the it
   assert.notEqual(result.scrollTop, 0);
 });
 
-test('grid return does not restore across folders', () => {
-  assert.equal(
+test('an untouched grid has no anchor while a real first-item selection anchors item zero', () => {
+  const itemIdentities = Array.from({ length: 30 }, (_, index) => 'item' + index);
+  const anchor = new GridViewportAnchor(itemIdentities);
+  const untouched = anchor.snapshot(800);
+  assert.deepEqual(untouched, {
+    previousScrollTop: 800,
+    targetItemIdentity: null,
+  });
+  assert.deepEqual(
     resolveGridReturnViewport({
-      sourceContext: 'folder-a',
-      destinationContext: 'folder-b',
-      viewedItemIdentity: 'item-10',
-      itemIdentities: ['item-10'],
-      previousScrollTop: 600,
-      columns: 1,
+      ...untouched,
+      itemIdentities,
+      columns: 3,
+      rowPitch: 200,
+      viewportHeight: 600,
+    }),
+    { targetIndex: -1, scrollTop: 800 }
+  );
+
+  assert.equal(anchor.select(0), true);
+  const selectedFirst = anchor.snapshot(800);
+  assert.deepEqual(selectedFirst, {
+    previousScrollTop: 800,
+    targetItemIdentity: 'item0',
+  });
+  assert.deepEqual(
+    resolveGridReturnViewport({
+      ...selectedFirst,
+      itemIdentities,
+      columns: 3,
+      rowPitch: 200,
+      viewportHeight: 600,
+    }),
+    { targetIndex: 0, scrollTop: 0 }
+  );
+});
+
+test('grid viewport memory keeps multi-level round trips independent', () => {
+  const memory = new GridViewportMemory(4);
+  memory.remember('folder-a', {
+    previousScrollTop: 200,
+    targetItemIdentity: 'child-22',
+  });
+  memory.remember('folder-a/child-22', {
+    previousScrollTop: 100,
+    targetItemIdentity: 'grandchild-35',
+  });
+
+  assert.deepEqual(
+    resolveGridReturnViewport({
+      ...memory.recall('folder-a/child-22'),
+      itemIdentities: Array.from(
+        { length: 50 },
+        (_, index) => index === 35 ? 'grandchild-35' : 'child-item-' + index
+      ),
+      columns: 5,
       rowPitch: 100,
       viewportHeight: 300,
     }),
-    null
+    { targetIndex: 35, scrollTop: 500 }
   );
+  assert.deepEqual(
+    resolveGridReturnViewport({
+      ...memory.recall('folder-a'),
+      itemIdentities: Array.from(
+        { length: 40 },
+        (_, index) => index === 22 ? 'child-22' : 'parent-item-' + index
+      ),
+      columns: 4,
+      rowPitch: 100,
+      viewportHeight: 300,
+    }),
+    { targetIndex: 22, scrollTop: 300 }
+  );
+  assert.equal(memory.recall('folder-b'), null);
+});
+
+test('grid viewport memory keeps scroll while viewer and parent navigation update the target', () => {
+  const memory = new GridViewportMemory(4);
+  memory.remember('collection', {
+    previousScrollTop: 700,
+    targetItemIdentity: 'page-1',
+  });
+  memory.updateTarget('collection', 'page-9');
+  assert.deepEqual(memory.recall('collection'), {
+    previousScrollTop: 700,
+    targetItemIdentity: 'page-9',
+  });
+
+  memory.updateTarget('unvisited-parent', 'departed-child');
+  assert.deepEqual(memory.recall('unvisited-parent'), {
+    previousScrollTop: 0,
+    targetItemIdentity: 'departed-child',
+  });
+});
+
+test('grid viewport memory evicts the least recently used context', () => {
+  const memory = new GridViewportMemory(2);
+  memory.remember('folder-a', { previousScrollTop: 100 });
+  memory.remember('folder-b', { previousScrollTop: 200 });
+  assert.equal(memory.recall('folder-a').previousScrollTop, 100);
+  memory.remember('folder-c', { previousScrollTop: 300 });
+
+  assert.equal(memory.size, 2);
+  assert.equal(memory.recall('folder-b'), null);
+  assert.equal(memory.recall('folder-a').previousScrollTop, 100);
+  assert.equal(memory.recall('folder-c').previousScrollTop, 300);
+
+  const defaultMemory = new GridViewportMemory();
+  for (let index = 0; index <= GRID_VIEWPORT_MEMORY_LIMIT; index += 1) {
+    defaultMemory.remember('default-' + index, { previousScrollTop: index });
+  }
+  assert.equal(defaultMemory.size, GRID_VIEWPORT_MEMORY_LIMIT);
+  assert.equal(defaultMemory.recall('default-0'), null);
 });
 
 test("thumbnail responses apply only to the tile generation and item that requested them", () => {
