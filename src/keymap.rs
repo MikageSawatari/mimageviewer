@@ -732,6 +732,21 @@ impl KeySlot {
         }
     }
 
+    /// Extended-bit discriminator for KeyHold slots whose physical identity
+    /// cannot be recovered from `GetAsyncKeyState(to_vk())` alone.
+    ///
+    /// Main Enter and numpad Enter intentionally share VK_RETURN and already
+    /// have a per-HWND held latch that preserves the extended bit. Other slots
+    /// keep their existing VK fallback; this fix does not broaden that boundary.
+    #[cfg(windows)]
+    const fn routed_hold_extended(self) -> Option<bool> {
+        match self {
+            KeyName::Enter => Some(false),
+            KeyName::NumpadEnter => Some(true),
+            _ => None,
+        }
+    }
+
     /// KeyHold の同フレーム押下+離し (fast-tap) 救済に使う egui Key。
     /// `to_egui` が**別の物理キーへ畳む**もの (Numpad0-9 → 上段 Num0-9) は None を返し、
     /// テンキー割当なのに上段数字キーのイベントを消費 / 誤発火させない
@@ -7122,14 +7137,28 @@ impl KeymapSettings {
 fn key_held_via_os(viewport: egui::ViewportId, key: KeyName) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
-    if crate::key_input::is_frame_active(viewport) {
-        match key {
-            KeyName::Enter => return crate::key_input::return_key_held(viewport, false),
-            KeyName::NumpadEnter => return crate::key_input::return_key_held(viewport, true),
-            _ => {}
-        }
+    let routed_physical_state = key
+        .routed_hold_extended()
+        .and_then(|extended| crate::key_input::routed_return_key_held(viewport, extended));
+    key_held_from_os_sources(key, routed_physical_state, |virtual_key| unsafe {
+        GetAsyncKeyState(virtual_key as i32) < 0
+    })
+}
+
+#[cfg(windows)]
+fn key_held_from_os_sources(
+    key: KeyName,
+    routed_physical_state: Option<bool>,
+    async_key_state: impl FnOnce(u32) -> bool,
+) -> bool {
+    if key.routed_hold_extended().is_some() {
+        // These slots share a VK with another physical key. Without a
+        // source-routed viewport latch, process-global async state cannot tell
+        // which HWND or physical slot owns the hold, so the only safe result
+        // is not-held. Other slots keep their existing async fallback.
+        return routed_physical_state.unwrap_or(false);
     }
-    unsafe { GetAsyncKeyState(key.to_vk() as i32) < 0 }
+    async_key_state(key.to_vk())
 }
 
 #[cfg(windows)]
@@ -7575,6 +7604,130 @@ mod tests {
         fn drop(&mut self) {
             crate::key_input::clear_test_frame();
         }
+    }
+
+    /// VK を共有するスロットは `GetAsyncKeyState` だけでは物理的にどちらか判別できない。
+    /// `key_held_from_os_sources` はそのうち **送信元付きラッチを持つ Enter ペアだけ**を
+    /// routed 必須にしているので、共有ペアが増えたら境界の見直しが要る。増えたことに
+    /// 気付けるよう、既知の共有をここで固定する。
+    ///
+    /// `Backslash` / `IntlYen` (0xDC) も共有だが、extended bit で分かれる Enter と違って
+    /// scan code でしか分かれず、対応するラッチが無い。KeyHold へ割り当てたときの
+    /// 取り違えは残る (§1.43 の後続、実害は Enter と違って「開いた瞬間に押されている」
+    /// 状況が無いので小さい)。
+    #[test]
+    fn shared_virtual_keys_stay_limited_to_the_known_pairs() {
+        let source = include_str!("keymap.rs");
+        let body = source
+            .split_once("pub fn to_vk(self) -> u32 {")
+            .expect("to_vk exists")
+            .1
+            .split_once(
+                "
+    }",
+            )
+            .expect("to_vk ends")
+            .0;
+
+        let mut by_vk: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for line in body.lines() {
+            let Some((slot, vk)) = line.trim().trim_end_matches(',').split_once("=> ") else {
+                continue;
+            };
+            let Some(slot) = slot.trim().strip_prefix("KeyName::") else {
+                continue;
+            };
+            if !vk.starts_with("0x") {
+                continue;
+            }
+            by_vk
+                .entry(vk.to_string())
+                .or_default()
+                .push(slot.to_string());
+        }
+        assert!(by_vk.len() > 50, "to_vk arms were not parsed: {by_vk:?}");
+
+        let shared: Vec<(String, Vec<String>)> = by_vk
+            .into_iter()
+            .filter(|(_, slots)| slots.len() > 1)
+            .collect();
+        let expected = vec![
+            (
+                "0x0D".to_string(),
+                vec!["Enter".to_string(), "NumpadEnter".to_string()],
+            ),
+            (
+                "0xDC".to_string(),
+                vec!["Backslash".to_string(), "IntlYen".to_string()],
+            ),
+        ];
+        assert_eq!(
+            shared, expected,
+            "a new shared VK needs a source-routed hold decision like the Enter pair"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fs_zoom_numpad_enter_does_not_use_unrouted_vk_return_hold() {
+        let mut settings = KeymapSettings::default();
+        settings.set_override_chords(
+            KeyAction::FsZoomMode,
+            vec![Chord::key(KeyName::NumpadEnter)],
+        );
+        let keymap = Keymap::from_settings(&settings);
+        let chords = keymap.override_chords(KeyAction::FsZoomMode).unwrap();
+        let key = chords[0].key_name().unwrap();
+
+        assert_eq!(key, KeyName::NumpadEnter);
+        assert!(!key_held_from_os_sources(key, None, |_| unreachable!()));
+        assert!(key_held_from_os_sources(KeyName::Z, None, |virtual_key| {
+            assert_eq!(virtual_key, 0x5A);
+            true
+        }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn enter_hold_stays_false_before_and_after_viewport_routing_without_owned_input() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let viewport = egui::ViewportId::from_hash_of(1_u64);
+        crate::key_input::clear_test_frame();
+
+        let before_registration = key_held_from_os_sources(
+            KeyName::Enter,
+            crate::key_input::routed_return_key_held(viewport, false),
+            |_| true,
+        );
+
+        crate::key_input::set_test_frame_for_viewport(viewport, Vec::new());
+        crate::key_input::set_test_return_key_state(viewport, false, false);
+        let after_registration = key_held_from_os_sources(
+            KeyName::Enter,
+            crate::key_input::routed_return_key_held(viewport, false),
+            |_| true,
+        );
+
+        assert_eq!((before_registration, after_registration), (false, false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn key_hold_state_distinguishes_both_enter_directions() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let viewport = egui::ViewportId::from_hash_of(2_u64);
+        crate::key_input::set_test_frame_for_viewport(viewport, Vec::new());
+
+        crate::key_input::set_test_return_key_state(viewport, true, false);
+        assert!(key_held_via_os(viewport, KeyName::Enter));
+        assert!(!key_held_via_os(viewport, KeyName::NumpadEnter));
+
+        crate::key_input::set_test_return_key_state(viewport, false, true);
+        assert!(!key_held_via_os(viewport, KeyName::Enter));
+        assert!(key_held_via_os(viewport, KeyName::NumpadEnter));
     }
 
     fn key_action_enum_names_from_source() -> std::collections::BTreeSet<String> {

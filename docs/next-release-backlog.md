@@ -584,7 +584,7 @@
   - 拡張が 1 つも無い環境でも従来と同じメニューが出る。
 - 規模 / 優先度: Medium / P2。実害は「操作のたびに待たされる」で、データ喪失は無い。
 
-### 1.43 Enter でフルスクリーンを開くと全画面ズームモードに入る (Enter 系 KeyHold の所有権が開幕フレームで抜ける)
+### 1.43 対応済み: Enter でフルスクリーンを開くと全画面ズームモードに入る (Enter 系 KeyHold の所有権が開幕フレームで抜ける)
 
 - 出典: 2026-08-04 の利用者報告と同日の調査。「画像フォルダで Enter で画像を開くと最初から
   Z のズームモードになっている。Z を 1 回押すと解除できる。ダブルクリックでは起きない」。
@@ -611,9 +611,19 @@
   アクション** (`*SpacePan` 等) と、**新規 viewport の開幕フレーム全般**が同じ穴を通る。
   713d36bf 以前は frame-active gate 自体が無く常に `GetAsyncKeyState` だったので、
   713d36bf は同じ穴の frame-active 側だけを塞いだ状態になっている。
-- 対応案: `is_frame_active` でない viewport では Enter 系 KeyHold を **false にする**
-  (送信元を確認できないなら押下扱いしない) のが所有権の筋。`GetAsyncKeyState`
-  フォールバックは per-HWND ラッチの外に残った旧経路。
+- 対応 (2026-08-05): `key_input::routed_return_key_held` は対象 viewport が frame-active の
+  ときだけ main / numpad 別の物理ラッチを返し、未登録の開幕フレームは `None` にする。
+  `key_held_via_os` は送信元と物理種別を復元できない Enter / NumpadEnter の `None` を
+  **false** とし、`GetAsyncKeyState(VK_RETURN)` へフォールバックしない。その他の KeyHold は
+  既存の VK ベース判定を維持する。既定 keymap、登録後のラッチ、本体 / テンキー Enter の分離、
+  既定 Z のズーム操作は変更していない。
+- 残件 (P3): 検収で追加した `shared_virtual_keys_stay_limited_to_the_known_pairs` が、
+  **`Backslash` / `IntlYen` も `0xDC` を共有している**ことを検出した。Enter ペアと違って
+  extended bit ではなく scan code でしか分かれず、対応する per-HWND ラッチが無いため、
+  今回は routed 必須の対象へ含めていない。この 2 つを KeyHold へ割り当てると
+  `GetAsyncKeyState(0xDC)` がどちらの物理キーか判別できず取り違える。実害は Enter より
+  小さい (フルスクリーンを開く操作がこのキーではないので「開いた瞬間に押されている」
+  状況が無い)。ラッチを scan code 対応へ広げるかは次サイクルで判断する。
 - ⚠ 症状パッチにしないこと: 「FS 入場時に `fs_zoom_z_was_down` を現在の押下状態で
   初期化する」「開幕 N ms はズームモードを無効にする」は、この 1 アクションの見え方を
   消すだけで、他の KeyHold と他 viewport の同型を残す。

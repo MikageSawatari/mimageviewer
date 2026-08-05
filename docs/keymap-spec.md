@@ -28,6 +28,11 @@ OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対
 正本にする。egui 0.33 の `physical_key` は両者を同じ `egui::Key::Enter` へ畳むため、
 この 2 スロットの照合には使わない。旧 `keymap.ini` と現行設定の表記は従来どおり
 `Enter` / `NumpadEnter` で、migration や破壊的な表記変更は行わない。
+KeyHold の押下中状態も viewport に対応付いた Win32 ラッチだけを正本にする。新規 viewport の
+subclass 登録前など、対象 viewport の送信元付きラッチを確認できないフレームでは、
+`Enter` / `NumpadEnter` を未押下として扱い、物理種別と送信元 HWND を失う
+`GetAsyncKeyState(VK_RETURN)` へフォールバックしない。固有 VK をそのまま識別に使える
+その他の KeyHold は従来の OS 状態参照を維持する。
 OS 予約ショートカット (例: Alt+F4 / Alt+Tab / Win キー系) は keymap では上書きできない。
 `Esc` と修飾なし矢印ナビゲーションは、モード脱出と閲覧の最低限の固定入力として keymap 対象外にする。
 Enter / Backspace / Home / End / PageUp / PageDown などの閲覧操作は文脈ごとの `KeyAction`
