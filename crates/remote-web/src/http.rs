@@ -476,6 +476,12 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             static_file(state, "vendor/hls.min.js", "text/javascript; charset=utf-8")
         }
         (Method::Get, "/styles.css") => static_file(state, "styles.css", "text/css; charset=utf-8"),
+        (Method::Get, "/service-worker.js") => {
+            static_file(state, "service-worker.js", "text/javascript; charset=utf-8")
+        }
+        (Method::Get, "/offline.html") => {
+            static_file(state, "offline.html", "text/html; charset=utf-8")
+        }
         (Method::Get, "/manifest.webmanifest") => static_file(
             state,
             "manifest.webmanifest",
@@ -3176,6 +3182,18 @@ mod tests {
         let state = test_state(&temp);
         std::fs::create_dir_all(temp.path().join("icons")).unwrap();
         let assets = [
+            (
+                "/service-worker.js",
+                "service-worker.js",
+                "text/javascript; charset=utf-8",
+                b"self.addEventListener('fetch', () => {});".as_slice(),
+            ),
+            (
+                "/offline.html",
+                "offline.html",
+                "text/html; charset=utf-8",
+                b"<!doctype html><title>offline</title>".as_slice(),
+            ),
             (
                 "/manifest.webmanifest",
                 "manifest.webmanifest",

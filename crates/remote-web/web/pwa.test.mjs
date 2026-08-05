@@ -1,8 +1,33 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { runInNewContext } from "node:vm";
 
 const here = new URL("./", import.meta.url);
+
+async function loadServiceWorker({ fetchImpl, cachedResponse }) {
+  const listeners = new Map();
+  const worker = await readFile(new URL("service-worker.js", here), "utf8");
+  runInNewContext(worker, {
+    self: {
+      addEventListener(type, listener) {
+        listeners.set(type, listener);
+      },
+      skipWaiting: async () => {},
+      clients: { claim: async () => {} },
+    },
+    caches: {
+      open: async () => ({ add: async () => {} }),
+      keys: async () => [],
+      delete: async () => true,
+      match: async () => cachedResponse,
+    },
+    fetch: fetchImpl,
+    Request,
+    Response,
+  });
+  return listeners;
+}
 
 test("manifest describes the standalone shell and every supplied icon", async () => {
   const manifest = JSON.parse(
@@ -49,9 +74,92 @@ test("HTML advertises the PWA and iOS standalone metadata", async () => {
   );
 });
 
-test("the online-only remote shell does not register a service worker", async () => {
+test("the shell registers a root-scoped service worker without script caching", async () => {
   const app = await readFile(new URL("app.js", here), "utf8");
-  assert.doesNotMatch(app, /navigator\.serviceWorker|serviceWorker\.register/);
+  assert.match(
+    app,
+    /navigator\.serviceWorker\s*\.register\("\/service-worker\.js",\s*\{\s*scope:\s*"\/",\s*updateViaCache:\s*"none"\s*\}\)/
+  );
+});
+
+test("the service worker only falls back for failed page navigations", async () => {
+  const worker = await readFile(new URL("service-worker.js", here), "utf8");
+  assert.match(worker, /request\.method !== "GET" \|\| request\.mode !== "navigate"/);
+  assert.match(
+    worker,
+    /fetch\(request\)[\s\S]*response\.status < 500[\s\S]*offlineNavigation/
+  );
+  assert.match(worker, /\.catch\(\(\) => offlineNavigation\(\)\)/);
+});
+
+test("API requests bypass the worker while a 502 navigation uses the cached guide", async () => {
+  let networkCalls = 0;
+  const listeners = await loadServiceWorker({
+    fetchImpl: async () => {
+      networkCalls += 1;
+      return new Response("", { status: 502 });
+    },
+    cachedResponse: new Response("<h1>cached guide</h1>", {
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    }),
+  });
+  const onFetch = listeners.get("fetch");
+
+  let apiIntercepted = false;
+  onFetch({
+    request: { method: "GET", mode: "cors", url: "https://example.test/api/page" },
+    respondWith() {
+      apiIntercepted = true;
+    },
+  });
+  assert.equal(apiIntercepted, false);
+  assert.equal(networkCalls, 0);
+
+  let navigationResponse;
+  onFetch({
+    request: { method: "GET", mode: "navigate", url: "https://example.test/" },
+    respondWith(response) {
+      navigationResponse = response;
+    },
+  });
+  assert.equal(await (await navigationResponse).text(), "<h1>cached guide</h1>");
+  assert.equal(networkCalls, 1);
+});
+
+test("successful navigations always return the current network response", async () => {
+  const listeners = await loadServiceWorker({
+    fetchImpl: async () => new Response("<h1>fresh shell</h1>"),
+    cachedResponse: new Response("<h1>cached guide</h1>"),
+  });
+  let navigationResponse;
+  listeners.get("fetch")({
+    request: { method: "GET", mode: "navigate", url: "https://example.test/" },
+    respondWith(response) {
+      navigationResponse = response;
+    },
+  });
+  assert.equal(await (await navigationResponse).text(), "<h1>fresh shell</h1>");
+});
+
+test("the offline cache contains only the static connection guide", async () => {
+  const worker = await readFile(new URL("service-worker.js", here), "utf8");
+  assert.match(worker, /const OFFLINE_URL = "\/offline\.html"/);
+  assert.match(
+    worker,
+    /cache\.add\(new Request\(OFFLINE_URL, \{ cache: "reload" \}\)\)/
+  );
+  assert.doesNotMatch(worker, /cache\.put|addAll/);
+  assert.doesNotMatch(worker, /\/api\/|\/app\.js|\/styles\.css|\/icons\/|thumbnail/);
+});
+
+test("the offline guide is standalone, actionable, and uses the manifest background", async () => {
+  const html = await readFile(new URL("offline.html", here), "utf8");
+  assert.match(html, /mIV に接続できません/);
+  assert.match(html, /PC で mIV が起動していること/);
+  assert.match(html, /リモート接続が有効/);
+  assert.match(html, /href="\/">もう一度試す/);
+  assert.match(html, /background:\s*#111318/);
+  assert.doesNotMatch(html, /service worker|502|プロキシ|ポート|IPC/i);
 });
 
 test("the hidden attribute always overrides component display rules", async () => {

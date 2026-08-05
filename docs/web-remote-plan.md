@@ -1148,8 +1148,21 @@ local command とし、現在 hash を保った `location.reload()` を行う。
 外部リンクを提供していないため外部サイトへ出る導線の閉じ込めは存在しない。追加時は同一 scope の
 内部 route と区別して OS browser へ渡す。
 
-Service Worker は登録しない。コンテンツの正本は母艦 PC にあり offline shell だけを残す意味がなく、
-更新後の JS / CSS を古い cache が保持する故障モードを増やすためである。
+Service Worker は接続不能時の案内だけを担当する。保存するのは独立した
+`offline.html` 1 件で、通常の page navigation は必ず network-first とし、通信失敗または
+5xx のときだけ案内へ切り替える。案内は PC で mIV が起動していることとリモート接続が
+有効であることの確認を促し、standalone でも空の error response をそのまま表示しない。
+
+`app.js` / CSS / manifest / icon は Cache API へ保存せず、通常どおり network から読む。
+fetch handler は navigation 以外へ介入しないため、認証応答、`/api/page`、
+`/api/ai/jobs/*/result`、thumbnail を含む全 API / 利用者画像は端末の offline cache に
+入らない。Service Worker script は `updateViaCache: "none"` で確認し、asset token による
+既存の「新しい版があります」通知だけを更新案内の正本とする。
+
+初回の成功した読み込みより前は Service Worker 自体が端末に存在しないため案内不能である。
+特に iOS のホーム画面版は、一度 online で起動して登録と activate を完了した後の
+scope 内 navigation から案内対象になる。この初回制約は「受付停止中も HTTP listener を
+残す」形では回避せず、受付停止時に network listener を閉じる不変条件を優先する。
 
 ### 12.13 iPhone 実機指摘の反映 (protocol v14, 2026-08-01)
 

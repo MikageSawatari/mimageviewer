@@ -408,6 +408,11 @@ const state = {
 
 let recentPointerSource = { source: "mouse", at: 0 };
 if (!RUNTIME_TEST_MODE) {
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker
+      .register("/service-worker.js", { scope: "/", updateViaCache: "none" })
+      .catch(() => {});
+  }
   updateKeyboardAvailability();
   window.addEventListener("popstate", () => {
     acquireRemoteSession("browser_history")
