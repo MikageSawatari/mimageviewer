@@ -2067,6 +2067,11 @@ pub(crate) mod phase_c_support {
         };
         let mut app = App::new_for_test(config);
         app.settings.first_setup_completed = true;
+        // `data_dir` の差し替えだけでは製本ルートは隔離されない。`book_root` が None のままだと
+        // `settings_books_root` が既定 (= 利用者の実ピクチャフォルダ) を返し、そこへ本フォルダを
+        // 作るテストが実データを書き換える。テストが実利用のフォルダへ触れないよう、ここで
+        // 一緒に temp dir へ向ける。
+        app.settings.book_root = Some(tmp.path().join("books"));
         AppTestEnv {
             app,
             _guard: guard,
