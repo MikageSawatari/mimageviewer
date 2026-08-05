@@ -182,6 +182,7 @@ pub struct Keymap {
 # FsCapture = none            ; 明示的に無効化する例
 
 [FsImage.hold]
+# FsNavigatorHold = Shift      ; ナビゲータ保持の修飾を Alt → Shift (ModifierHold = 修飾のみ)
 # FsLoupeHold = Ctrl          ; ルーペ保持の修飾を Shift → Ctrl (ModifierHold = 修飾のみ)
 
 [Erase]
@@ -237,7 +238,7 @@ impl Keymap {
                                      key: &crate::video::native_window::NativeVideoKeyEvent)
                                      -> bool;
 
-    /// (D-1) ModifierHold: 解決済み修飾を i.modifiers から読む (ルーペ)。
+    /// (D-1) ModifierHold: 解決済み修飾を i.modifiers から読む (ナビゲータ / ルーペ)。
     pub fn modifier_held(&self, ctx: &egui::Context, action: KeyAction,
                          def: ModKind) -> bool;
 
@@ -330,7 +331,7 @@ if !key.repeat && self.keymap.matches_vk(KeyAction::VideoMute, &key, 0x4D, false
 | **3** | **編集モード配線** (全て consume 経路・自己完結): Erase / Conceal / Crop / Text / LocalAdjust | ui_erase.rs(34) / ui_conceal.rs(30) / ui_crop.rs / ui_text.rs / ui_fullscreen.rs(la ブロック) | 大 | 各モードを 1 巡 |
 | **4** | **Grid 配線** (key_pressed 経路、非消費 = 衝突で両発火に注意)。Ctrl+A/D/Shift+A など純粋キー操作は候補、OS クリップボード / D&D は固定扱い | app.rs `handle_keyboard`(≈47) | 中 | グリッドナビ + 衝突仕様の確認 |
 | **5** | **FsVideo 配線** (VK 経路。§4.6 画像との重なり要注意) + FsCommon。`native_video_fullscreen_shortcut_key` の静的ホワイトリストも keymap 連動にする | app/native_video.rs(≈50) / ui_fullscreen.rs(共通分) / video/native_presenter/mod.rs | 大 | 動画節を 1 巡 + Shift+↑↓ 音量等の回帰 |
-| **6** | **hold 系の上書き対応**: ModifierHold (loupe) / KeyHold (Space パン) を `modifier_held`/`key_held` 経由に。Shift→Ctrl、Space→P のような同種差し替えを確認 | ui_fullscreen.rs(7340) / ui_erase.rs(1214) / ui_conceal.rs(987) | 小 | ルーペ修飾差し替え / パンキー差し替え |
+| **6** | **hold 系の上書き対応**: ModifierHold (navigator / loupe) / KeyHold (Space パン) を `modifier_held`/`key_held` 経由に。Alt→Shift、Shift→Ctrl、Space→P のような同種差し替えを確認 | ui_fullscreen.rs(7340) / ui_erase.rs(1214) / ui_conceal.rs(987) | 小 | ナビゲータ / ルーペ修飾差し替え / パンキー差し替え |
 | **7** | 仕上げ: 標準 keymap.ini.default 配布、docs 更新、glyph lint、`cargo fmt`、追加 unit/snapshot | docs / htdocs | 小 | §9 |
 
 - **段階出荷可**: 各フェーズ完了時点でビルド通過 & 既存挙動維持 (未移行サイトはデフォルト動作)。
@@ -543,6 +544,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsSpreadShiftLeft/Right `Ctrl+←/→` (P)
 - FsSlideshow `S` ★ / FsSpaceCheck `Space` (スライドショー停止またはチェックトグル) ★
 - FsRotateCw `R` ★ / FsRotateCcw `L` ★ / FsImageAnalysis `Shift+Z` ★ / FsPanorama `V` ★ / FsPixelGrid `G` ★ (旧 `FsAnalysis = Z` を v2.0.0 で改名・既定変更)
+- FsNavigatorToggle `Alt+N` (P) / FsNavigatorHold `Alt` (MH。修飾↔修飾のみ)
 - FsLoupeLockToggle `M` (P) ★ / FsLoupeHold `Shift` (MH, Ph6。修飾↔修飾のみ)
 - FsEraseMode `E` ★ / FsLocalAdjustMode `Ctrl+G` ★ / FsConcealMode `Ctrl+M` ★ / FsBgCycle `B` ★
 - FsExport `Ctrl+E` ★ / FsCapture `Ctrl+S` ★

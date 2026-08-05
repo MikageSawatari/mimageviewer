@@ -40,6 +40,7 @@
 # FsSlideshow.2 = S      ; S も残したい場合は明示的に併記
 # FsCapture = none       ; キャプチャ保存キーを無効化
 # FsLoupeLockToggle = L  ; ルーペ固定表示のトグルを L に変更
+# FsNavigatorHold = Ctrl ; 押している間だけナビゲータ表示する修飾キーを Ctrl に変更
 # FsLoupeHold = Ctrl     ; 押している間だけルーペ表示する修飾キーを Ctrl に変更
 #
 # [Rating]
@@ -302,6 +303,7 @@
 # FsZoomMode = Z ; 全画面ズームモード (押している間ズーム範囲を指定)
 # FsPanorama = V ; 360度パノラマモードを切り替える
 # FsNavigatorToggle = Alt+N ; ナビゲータの表示を切り替える
+# FsNavigatorHold = Alt ; 押している間だけナビゲータを表示する
 # FsPixelGrid = G ; ピクセルグリッド表示を切り替える
 # FsLoupeLockToggle = M ; ルーペの固定表示を切り替える
 # FsLoupeHold = Shift ; 押している間だけルーペを表示する

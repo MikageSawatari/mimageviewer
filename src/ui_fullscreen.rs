@@ -146,6 +146,33 @@ enum PanoramaNavigatorInteraction {
     },
 }
 
+fn fs_navigator_visibility_requested(
+    fixed_visible: bool,
+    hold_active: bool,
+    focused: bool,
+    interaction_active: bool,
+) -> bool {
+    fixed_visible || (focused && hold_active) || interaction_active
+}
+
+/// ナビゲータが「掴まれている」= 表示を続けなければ操作が途切れる状態か。
+///
+/// 判定は変種の列挙ではなく `Idle` 以外かどうかで行う。`PendingCenter` のように
+/// **意図的に次フレームへ持ち越す**変種があり、それを列挙から落とすと修飾キーを
+/// 離した次のフレームでゲートが閉じ、持ち越した移動が黙って捨てられる。
+/// 変種が増えたときも安全側 (表示を維持する側) へ倒れるようにする。
+fn fs_navigator_interaction_active(ctx: &egui::Context) -> bool {
+    ctx.data(|data| {
+        !matches!(
+            data.get_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id()),
+            None | Some(FsNavigatorInteraction::Idle)
+        ) || !matches!(
+            data.get_temp::<PanoramaNavigatorInteraction>(panorama_navigator_interaction_id()),
+            None | Some(PanoramaNavigatorInteraction::Idle)
+        )
+    })
+}
+
 fn fs_navigator_interaction_id() -> egui::Id {
     egui::Id::new("fs_navigator_interaction")
 }
@@ -14243,9 +14270,20 @@ impl App {
     }
 
     /// ホイールとクリックを処理し、(page_nav, close) を返す。
-    fn fs_navigator_allowed(&self, fs_idx: usize) -> bool {
-        self.settings.fullscreen_navigator_visible
-            && !self.analysis_mode
+    fn fs_navigator_allowed(&self, ctx: &egui::Context, fs_idx: usize) -> bool {
+        let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
+        let hold_active = self
+            .keymap
+            .modifier_held_action(ctx, KeyAction::FsNavigatorHold);
+        let interaction_active = fs_navigator_interaction_active(ctx);
+        // 「修飾キーを押している間」と「ナビゲータを掴んでいる間」は別の状態。
+        // ドラッグ中は後者を優先し、Alt を離しても操作を最後まで継続させる。
+        fs_navigator_visibility_requested(
+            self.settings.fullscreen_navigator_visible,
+            hold_active,
+            focused,
+            interaction_active,
+        ) && !self.analysis_mode
             && !self.adjustment_mode
             && !self.is_overlay_edit_mode_active()
             && !self.view_trim_mode
@@ -14617,7 +14655,7 @@ impl App {
         image_rect: egui::Rect,
         fs_idx: usize,
     ) -> bool {
-        if !self.fs_navigator_allowed(fs_idx) {
+        if !self.fs_navigator_allowed(ctx, fs_idx) {
             ctx.data_mut(|data| {
                 data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id());
                 data.remove_temp::<PanoramaNavigatorInteraction>(
@@ -15035,7 +15073,7 @@ impl App {
         image_rect: egui::Rect,
         fs_idx: usize,
     ) {
-        if !self.fs_navigator_allowed(fs_idx) {
+        if !self.fs_navigator_allowed(ctx, fs_idx) {
             return;
         }
         if self.is_panorama_mode_active(fs_idx) {
@@ -26943,6 +26981,82 @@ mod tests {
         assert!((actual.top() - expected.top()).abs() < EPSILON);
         assert!((actual.right() - expected.right()).abs() < EPSILON);
         assert!((actual.bottom() - expected.bottom()).abs() < EPSILON);
+    }
+
+    #[test]
+    fn navigator_hold_requests_visibility_when_fixed_setting_is_off() {
+        assert!(fs_navigator_visibility_requested(false, true, true, false));
+    }
+
+    #[test]
+    fn navigator_is_not_requested_when_fixed_setting_and_hold_are_off() {
+        assert!(!fs_navigator_visibility_requested(
+            false, false, true, false
+        ));
+    }
+
+    #[test]
+    fn navigator_interaction_keeps_visibility_after_hold_is_released() {
+        let ctx = egui::Context::default();
+        for interaction in [
+            FsNavigatorInteraction::Select {
+                start: egui::Pos2::ZERO,
+                current: egui::Pos2::ZERO,
+            },
+            FsNavigatorInteraction::Pan {
+                start: egui::Pos2::ZERO,
+                start_pan: egui::Vec2::ZERO,
+                screen_scale: 1.0,
+            },
+            FsNavigatorInteraction::PendingPanTransition {
+                start: egui::Pos2::ZERO,
+                page_idx: 0,
+                source_uv: egui::Pos2::ZERO,
+            },
+            // 次フレームで消費される持ち越し。ここを漏らすと、修飾キーを離した直後の
+            // ダブルクリック / 範囲指定が黙って捨てられる。
+            FsNavigatorInteraction::PendingCenter {
+                page_idx: 0,
+                source_uv: egui::Pos2::ZERO,
+            },
+        ] {
+            ctx.data_mut(|data| data.insert_temp(fs_navigator_interaction_id(), interaction));
+            assert!(fs_navigator_visibility_requested(
+                false,
+                false,
+                true,
+                fs_navigator_interaction_active(&ctx)
+            ));
+        }
+        ctx.data_mut(|data| {
+            data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
+        });
+        for interaction in [
+            PanoramaNavigatorInteraction::Select {
+                start: egui::Pos2::ZERO,
+                current: egui::Pos2::ZERO,
+            },
+            PanoramaNavigatorInteraction::Pan {
+                start_uv: egui::Pos2::ZERO,
+                start_yaw: 0.0,
+                start_pitch: 0.0,
+            },
+        ] {
+            ctx.data_mut(|data| data.insert_temp(panorama_navigator_interaction_id(), interaction));
+            assert!(fs_navigator_visibility_requested(
+                false,
+                false,
+                true,
+                fs_navigator_interaction_active(&ctx)
+            ));
+        }
+    }
+
+    #[test]
+    fn navigator_hold_does_not_request_visibility_without_focus() {
+        assert!(!fs_navigator_visibility_requested(
+            false, true, false, false
+        ));
     }
 
     #[test]

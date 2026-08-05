@@ -1395,6 +1395,7 @@ pub enum KeyAction {
     FsZoomMode,
     FsPanorama,
     FsNavigatorToggle,
+    FsNavigatorHold,
     FsPixelGrid,
     FsLoupeLockToggle,
     FsLoupeHold,
@@ -1818,6 +1819,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsZoomMode,
     KeyAction::FsPanorama,
     KeyAction::FsNavigatorToggle,
+    KeyAction::FsNavigatorHold,
     KeyAction::FsPixelGrid,
     KeyAction::FsLoupeLockToggle,
     KeyAction::FsLoupeHold,
@@ -3304,6 +3306,7 @@ impl KeyAction {
             FsZoomMode => "FsZoomMode",
             FsPanorama => "FsPanorama",
             FsNavigatorToggle => "FsNavigatorToggle",
+            FsNavigatorHold => "FsNavigatorHold",
             FsPixelGrid => "FsPixelGrid",
             FsLoupeLockToggle => "FsLoupeLockToggle",
             FsLoupeHold => "FsLoupeHold",
@@ -3849,6 +3852,7 @@ impl KeyAction {
             FsZoomMode => "全画面ズームモード (押している間ズーム範囲を指定)",
             FsPanorama => "360度パノラマモードを切り替える",
             FsNavigatorToggle => "ナビゲータの表示を切り替える",
+            FsNavigatorHold => "押している間だけナビゲータを表示する",
             FsPixelGrid => "ピクセルグリッド表示を切り替える",
             FsLoupeLockToggle => "ルーペの固定表示を切り替える",
             FsLoupeHold => "押している間だけルーペを表示する",
@@ -4259,6 +4263,7 @@ impl KeyAction {
             | FsZoomMode
             | FsPanorama
             | FsNavigatorToggle
+            | FsNavigatorHold
             | FsPixelGrid
             | FsLoupeLockToggle
             | FsLoupeHold
@@ -4436,7 +4441,7 @@ impl KeyAction {
     pub fn trigger(self) -> KeyTrigger {
         use KeyAction::*;
         match self {
-            FsLoupeHold => KeyTrigger::ModifierHold,
+            FsNavigatorHold | FsLoupeHold => KeyTrigger::ModifierHold,
             EraseSpacePan | ConcealSpacePan | CropSpacePan | TextSpacePan | LaSpacePan
             | FsZoomMode => KeyTrigger::KeyHold,
             GlobalLocalSearch
@@ -5087,6 +5092,7 @@ impl KeyAction {
             FsZoomMode => ChordList::one(Chord::key(Z)),
             FsPanorama => ChordList::one(Chord::key(V)),
             FsNavigatorToggle => ChordList::one(Chord::alt(N)),
+            FsNavigatorHold => ChordList::one(Chord::modifier(ModKind::Alt)),
             FsPixelGrid => ChordList::one(Chord::key(G)),
             FsLoupeLockToggle => ChordList::one(Chord::key(M)),
             FsLoupeHold => ChordList::one(Chord::modifier(ModKind::Shift)),
@@ -6484,6 +6490,9 @@ impl Keymap {
         out.push_str("# FsSlideshow.2 = S      ; S も残したい場合は明示的に併記\n");
         out.push_str("# FsCapture = none       ; キャプチャ保存キーを無効化\n");
         out.push_str("# FsLoupeLockToggle = L  ; ルーペ固定表示のトグルを L に変更\n");
+        out.push_str(
+            "# FsNavigatorHold = Ctrl ; 押している間だけナビゲータ表示する修飾キーを Ctrl に変更\n",
+        );
         out.push_str(
             "# FsLoupeHold = Ctrl     ; 押している間だけルーペ表示する修飾キーを Ctrl に変更\n",
         );
@@ -8874,6 +8883,17 @@ mod tests {
                     .default_chords()
                     .iter()
                     .any(|candidate| candidate == chord))
+        );
+    }
+
+    #[test]
+    fn navigator_hold_uses_alt_modifier_hold_in_image_fullscreen() {
+        let navigator_hold = KeyAction::FsNavigatorHold;
+        assert_eq!(navigator_hold.context(), KeyContext::FsImage);
+        assert_eq!(navigator_hold.trigger(), KeyTrigger::ModifierHold);
+        assert_eq!(
+            navigator_hold.default_chords().iter().next(),
+            Some(Chord::modifier(ModKind::Alt))
         );
     }
 
