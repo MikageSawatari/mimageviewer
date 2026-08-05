@@ -5627,6 +5627,7 @@ mod phase_c_folder_nav_history_tests {
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
             root: root.clone(),
             roots: vec![root],
+            scan_filter: Default::default(),
             entries: vec![SubfolderExpansionEntry {
                 path: image.clone(),
                 kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
@@ -5759,6 +5760,7 @@ mod phase_c_folder_nav_history_tests {
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
             root,
             roots: vec![a],
+            scan_filter: Default::default(),
             entries: vec![SubfolderExpansionEntry {
                 path: original.clone(),
                 kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
@@ -5994,9 +5996,13 @@ mod phase_c_folder_nav_history_tests {
 #[cfg(test)]
 mod phase_c_drill_nav_tests {
     use super::phase_c_support::setup_app;
-    use crate::app::subfolder_expansion_synthetic_path;
+    use crate::app::{
+        ActiveDetachedViewerContext, App, FacetField, ViewerContextBundle,
+        subfolder_expansion_synthetic_path,
+    };
     use crate::global_search::GlobalHit;
     use crate::global_search_ui::GlobalSearchView;
+    use std::path::PathBuf;
 
     fn grid_key_nav(
         app: &mut crate::app::App,
@@ -6293,6 +6299,241 @@ mod phase_c_drill_nav_tests {
         );
     }
 
+    fn install_ready_facet_name_cache(app: &mut App, query: &str) {
+        app.facet_name_input = query.to_owned();
+        app.settings.facet_filter.name_query = query.to_owned();
+        app.facet_name_tokens = crate::search_query::parse(query);
+        app.facet_name_cache = app
+            .items
+            .iter()
+            .map(|item| item.name().to_lowercase().into_boxed_str())
+            .collect();
+        app.facet_name_cache_generation = Some(app.items_generation);
+    }
+
+    #[test]
+    fn facet_name_filter_composes_with_kind_and_candidate_counts() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::settings::FacetItemKind;
+
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::Image(PathBuf::from("c:/pics/Alpha Photo.JPG")),
+            GridItem::Video(PathBuf::from("c:/pics/alpha movie.mp4")),
+            GridItem::Image(PathBuf::from("c:/pics/beta photo.jpg")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![None; app.items.len()];
+        app.settings.facet_filter.kinds.insert(FacetItemKind::Image);
+        install_ready_facet_name_cache(&mut app, "ALPHA");
+
+        app.rebuild_visible_indices();
+
+        assert_eq!(
+            app.visible_indices,
+            vec![0],
+            "ファイル名と種類は同じ eager pass で AND 合成される"
+        );
+        assert_eq!(
+            app.facet_candidate_indices(FacetField::Kind),
+            vec![0, 1],
+            "種類候補の件数もファイル名条件を適用した集合から求める"
+        );
+        assert_eq!(
+            app.facet_candidate_indices(FacetField::Name),
+            vec![0, 2],
+            "名前軸だけを外した候補集合では種類条件を維持する"
+        );
+    }
+
+    #[test]
+    fn facet_name_filter_keeps_visible_and_details_sources_in_sync() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::Image(PathBuf::from("c:/pics/alpha-2.jpg")),
+            GridItem::Image(PathBuf::from("c:/pics/beta.jpg")),
+            GridItem::Image(PathBuf::from("c:/pics/alpha-1.jpg")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![None; app.items.len()];
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        install_ready_facet_name_cache(&mut app, "alpha");
+
+        app.rebuild_visible_indices();
+
+        let visible = app
+            .visible_indices
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let details = app
+            .details_order
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(visible, std::collections::BTreeSet::from([0, 2]));
+        assert_eq!(
+            details, visible,
+            "詳細表示も visible_indices と同じ集合を使う"
+        );
+    }
+
+    #[test]
+    fn facet_name_filter_passes_through_until_cache_is_ready() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::Image(PathBuf::from("c:/pics/alpha.jpg")),
+            GridItem::Image(PathBuf::from("c:/pics/beta.jpg")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![None; app.items.len()];
+        app.facet_name_input = "no-match".to_owned();
+        app.settings.facet_filter.name_query = app.facet_name_input.clone();
+        app.facet_name_tokens = crate::search_query::parse(&app.facet_name_input);
+
+        app.rebuild_visible_indices();
+
+        assert_eq!(
+            app.visible_indices,
+            vec![0, 1],
+            "正規化キャッシュ準備中は一覧を空にしない"
+        );
+    }
+
+    #[test]
+    fn facet_name_cache_is_invalidated_when_items_are_replaced() {
+        use crate::grid_item::GridItem;
+
+        let mut app = setup_app();
+        app.install_new_items(
+            vec![GridItem::Image(PathBuf::from("c:/old/needle.jpg"))],
+            vec![None],
+        );
+        install_ready_facet_name_cache(&mut app, "needle");
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![0]);
+
+        app.install_new_items(
+            vec![GridItem::Image(PathBuf::from("c:/new/other.jpg"))],
+            vec![None],
+        );
+
+        assert!(app.facet_name_cache.is_empty());
+        assert_eq!(app.facet_name_cache_generation, None);
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.visible_indices,
+            vec![0],
+            "新一覧の準備中に旧 basename を照合へ使わない"
+        );
+
+        install_ready_facet_name_cache(&mut app, "needle");
+        app.rebuild_visible_indices();
+        assert!(
+            app.visible_indices.is_empty(),
+            "新一覧の basename が準備できた後は新しい名前だけで判定する"
+        );
+    }
+
+    #[test]
+    fn facet_name_cache_does_not_cross_equal_generation_viewer_bundles() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::Image(PathBuf::from("c:/main/alpha.jpg")),
+            GridItem::Image(PathBuf::from("c:/main/other.jpg")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![None; app.items.len()];
+        app.items_generation = 5;
+        install_ready_facet_name_cache(&mut app, "alpha");
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![0]);
+
+        let mut detached = ViewerContextBundle::empty();
+        detached.items = vec![
+            GridItem::Image(PathBuf::from("c:/detached/other.jpg")),
+            GridItem::Image(PathBuf::from("c:/detached/alpha.jpg")),
+        ];
+        detached.thumbnails = vec![ThumbnailState::Pending; detached.items.len()];
+        detached.image_metas = vec![None; detached.items.len()];
+        detached.items_generation = app.items_generation;
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: detached });
+
+        let (while_detached_cache_is_empty, after_detached_cache_is_ready) = app
+            .with_active_detached_viewer_context(|mounted| {
+                assert!(
+                    mounted.facet_name_cache.is_empty(),
+                    "detached bundle must not inherit main's equal-generation cache"
+                );
+                mounted.rebuild_visible_indices();
+                let while_cache_is_empty = mounted.visible_indices.clone();
+
+                install_ready_facet_name_cache(mounted, "alpha");
+                mounted.rebuild_visible_indices();
+                (while_cache_is_empty, mounted.visible_indices.clone())
+            })
+            .expect("detached bundle is present");
+
+        assert_eq!(
+            while_detached_cache_is_empty,
+            vec![0, 1],
+            "cache 準備前の detached 一覧を main の basename で絞り込まない"
+        );
+        assert_eq!(
+            after_detached_cache_is_ready,
+            vec![1],
+            "detached 自身の basename cache だけで絞り込む"
+        );
+
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.visible_indices,
+            vec![0],
+            "detached の cache 構築後も main bundle の cache を維持する"
+        );
+        assert_eq!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .expect("detached bundle remains parked")
+                .bundle
+                .facet_name_cache_generation,
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn facet_name_debounce_does_not_apply_during_ime_input() {
+        let mut app = setup_app();
+        app.facet_name_input = "未確定".to_owned();
+        app.facet_name_debounce_deadline = Some(std::time::Instant::now());
+        let ctx = egui::Context::default();
+        crate::ime_focus::install_ime_input_policy(&ctx);
+        ctx.begin_pass(egui::RawInput {
+            events: vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("未確定".to_owned())),
+            ],
+            ..Default::default()
+        });
+        app.update_ime_state(&ctx);
+
+        app.poll_facet_name_debounce(&ctx);
+
+        assert!(app.settings.facet_filter.name_query.is_empty());
+        assert!(
+            app.facet_name_debounce_deadline
+                .is_some_and(|deadline| deadline > std::time::Instant::now()),
+            "IME 中は debounce の残り時間を消費しない"
+        );
+        let _ = ctx.end_pass();
+    }
+
     #[test]
     fn facet_tag_passthrough_for_folder_still_applies_date_filter() {
         use crate::grid_item::{GridItem, ThumbnailState};
@@ -6413,6 +6654,60 @@ mod phase_c_drill_nav_tests {
             "本棚 > 資料集",
             "製本フォルダは実パスではなく本棚の仮想表記で表示する"
         );
+    }
+
+    #[test]
+    fn facet_place_label_is_relative_only_in_subfolder_expansion_view() {
+        let mut app = setup_app();
+        let root = std::path::PathBuf::from(r"C:\library");
+        let selected_root = root.join("ID203");
+        let deep = selected_root.join("thumb");
+
+        assert_eq!(
+            app.facet_place_label_for_path(&deep),
+            deep.display().to_string(),
+            "通常ビューでは従来どおりフルパスを表示する"
+        );
+
+        app.items_are_subfolder_expansion_view = true;
+        app.subfolder_expansion_root = Some(root.clone());
+        app.subfolder_expansion_roots = vec![selected_root];
+        assert_eq!(
+            app.facet_place_label_for_path(&deep),
+            std::path::Path::new("ID203")
+                .join("thumb")
+                .display()
+                .to_string(),
+            "複数起点でも押下位置の root を基準にする"
+        );
+        assert_eq!(app.facet_place_label_for_path(&root), "(直下)");
+
+        let outside = std::path::PathBuf::from(r"D:\outside");
+        assert_eq!(
+            app.facet_place_label_for_path(&outside),
+            outside.display().to_string(),
+            "root 外は既存のフルパス表記へフォールバックする"
+        );
+    }
+
+    #[test]
+    fn details_place_sort_uses_the_shared_place_label() {
+        let mut app = setup_app();
+        let root = std::path::PathBuf::from(r"C:\library");
+        app.items = vec![
+            crate::grid_item::GridItem::Image(root.join("B").join("page.jpg")),
+            crate::grid_item::GridItem::Image(root.join("A").join("page.jpg")),
+        ];
+        app.visible_indices = vec![0, 1];
+        app.details_order = app.visible_indices.clone();
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_show_place = true;
+        app.items_are_subfolder_expansion_view = true;
+        app.subfolder_expansion_root = Some(root);
+
+        app.set_details_sort_key(crate::settings::DetailsSortKey::Place);
+
+        assert_eq!(app.details_order, vec![1, 0]);
     }
 
     #[test]
@@ -7466,6 +7761,7 @@ mod phase_c_drill_nav_tests {
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
             root: root.clone(),
             roots: vec![a.clone()],
+            scan_filter: Default::default(),
             entries: vec![SubfolderExpansionEntry {
                 path: image.clone(),
                 kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
@@ -7515,6 +7811,7 @@ mod phase_c_drill_nav_tests {
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
             root: root.clone(),
             roots: vec![a],
+            scan_filter: Default::default(),
             entries: vec![SubfolderExpansionEntry {
                 path: image.clone(),
                 kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
@@ -7563,6 +7860,7 @@ mod phase_c_drill_nav_tests {
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
             root,
             roots: vec![a],
+            scan_filter: Default::default(),
             entries: vec![SubfolderExpansionEntry {
                 path: image.clone(),
                 kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
@@ -7609,6 +7907,7 @@ mod phase_c_drill_nav_tests {
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
             root,
             roots: vec![a],
+            scan_filter: Default::default(),
             entries: vec![SubfolderExpansionEntry {
                 path: original.clone(),
                 kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
@@ -7709,6 +8008,7 @@ mod phase_c_drill_nav_tests {
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
             root,
             roots: vec![a],
+            scan_filter: Default::default(),
             entries: vec![SubfolderExpansionEntry {
                 path: original.clone(),
                 kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
@@ -7756,6 +8056,42 @@ mod phase_c_drill_nav_tests {
                 .any(|item| matches!(item, GridItem::Image(path) if path == &original)),
             "レーティング一覧で start_loading_items を通った後でも退避 snapshot へ戻す"
         );
+    }
+
+    #[test]
+    fn subfolder_expansion_button_opens_dialog_when_view_is_off() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        app.current_folder = Some(root);
+        app.current_folder_last_mtime = Some(std::time::SystemTime::now());
+
+        assert!(!app.subfolder_expansion_on());
+        assert!(!app.subfolder_expansion_busy());
+        assert!(!app.show_subfolder_expansion_dialog);
+
+        app.activate_subfolder_expansion_button();
+
+        assert!(app.show_subfolder_expansion_dialog);
+        assert!(app.subfolder_expansion_pending.is_none());
+    }
+
+    #[test]
+    fn subfolder_expansion_button_exits_immediately_when_view_is_on() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        app.current_folder = Some(subfolder_expansion_synthetic_path());
+        app.items_are_subfolder_expansion_view = true;
+        app.subfolder_expansion_root = Some(root.clone());
+        app.subfolder_expansion_roots = vec![root.clone()];
+        app.subfolder_expansion_saved_folder = Some(root);
+        app.show_subfolder_expansion_dialog = true;
+
+        app.activate_subfolder_expansion_button();
+
+        assert!(!app.items_are_subfolder_expansion_view);
+        assert!(!app.show_subfolder_expansion_dialog);
     }
 
     #[test]
@@ -20006,6 +20342,13 @@ mod favorite_adjustment_defaults_tests {
         app.search_has_focus = true;
         assert!(blocked(&app));
         app.search_has_focus = false;
+        // 絞り込みバーの常設ファイル名欄
+        app.facet_name_has_focus = true;
+        assert!(
+            blocked(&app),
+            "ファイル名フィルター入力中も grid shortcut を抑止する"
+        );
+        app.facet_name_has_focus = false;
         // Ctrl+S バー
         app.favsearch.has_focus = true;
         assert!(blocked(&app));
@@ -44599,6 +44942,17 @@ fn settings_restore_blocks_background_dialog_input() {
 }
 
 #[test]
+fn subfolder_expansion_dialog_is_registered_as_common_modal() {
+    let mut app = phase_c_support::setup_app();
+    assert!(!app.any_dialog_open());
+
+    app.show_subfolder_expansion_dialog = true;
+
+    assert!(app.any_dialog_open());
+    assert!(app.any_modal_dialog_open_for_fullscreen_keys());
+}
+
+#[test]
 fn common_dialog_registry_covers_cache_and_setup_dialogs() {
     let mut app = phase_c_support::setup_app();
     assert!(!app.any_dialog_open());
@@ -46386,6 +46740,7 @@ mod smart_folder_transition_tests {
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
             root: root.clone(),
             roots: vec![root],
+            scan_filter: Default::default(),
             entries: vec![SubfolderExpansionEntry {
                 path: image.clone(),
                 kind: crate::app::subfolder_expansion::SubfolderExpansionEntryKind::Image,
@@ -46548,6 +46903,7 @@ fn subfolder_display_prepare_blocks_background_input() {
             snapshot: subfolder_expansion::SubfolderExpansionSnapshot {
                 root: root.clone(),
                 roots: vec![root],
+                scan_filter: Default::default(),
                 entries: std::sync::Arc::new(Vec::new()),
                 video_thumb_overrides: std::collections::HashMap::new(),
                 diag: subfolder_expansion::SubfolderExpansionDiag::default(),

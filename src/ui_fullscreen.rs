@@ -30,8 +30,9 @@ use crate::app::{
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
-    FullscreenPageLayoutKind, ResolvedDisplayPlacement, ResolvedZTransform, ZTransformInput,
-    physical_pixel_scale, physical_scale_is_near_integer, quantize_points_to_physical_pixels,
+    FullscreenPageLayout, FullscreenPageLayoutKind, ResolvedDisplayPlacement, ResolvedZTransform,
+    ZTransformInput, physical_pixel_scale, physical_scale_is_near_integer,
+    quantize_points_to_physical_pixels,
 };
 use crate::fs_animation::{AnimationPlayback, FsCacheEntry};
 use crate::grid_item::{GridItem, ThumbnailState};
@@ -41,7 +42,8 @@ use crate::keymap::{
 };
 use crate::pdf_loader::PdfPageContentType;
 use crate::settings::{
-    FullscreenFitMode, ReadingDirection, ReadingFlow, SlideshowEndAction, SpreadMode,
+    FULLSCREEN_NAVIGATOR_SIZE_MAX, FULLSCREEN_NAVIGATOR_SIZE_MIN, FullscreenFitMode,
+    FullscreenNavigatorCorner, ReadingDirection, ReadingFlow, SlideshowEndAction, SpreadMode,
 };
 use crate::ui_helpers::{HoverTipExt, open_external_player};
 
@@ -49,6 +51,582 @@ const COMPARE_INDICATOR_MAX_WIDTH: u32 = 72;
 const COMPARE_INDICATOR_MAX_HEIGHT: u32 = 54;
 // Tuned on real hardware to avoid a brief status flash on normal page turns.
 const COLORIZE_WAIT_INDICATOR_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+const FS_NAVIGATOR_HEADER_HEIGHT: f32 = 26.0;
+const FS_NAVIGATOR_MARGIN: f32 = 12.0;
+const FS_NAVIGATOR_WHEEL_STEP: f32 = 20.0;
+const FS_NAVIGATOR_MIN_SELECTION: f32 = 8.0;
+/// Keep roughly one standard touch target visible so a dragged image always has an obvious
+/// recovery area. On an image or viewport smaller than this, the whole shorter axis is required.
+const FS_PAN_MIN_VISIBLE_PX: f32 = 48.0;
+const PANORAMA_NAVIGATOR_EDGE_SAMPLES: usize = 24;
+
+#[derive(Clone, Copy)]
+struct FlatNavigatorPage {
+    main: DisplayedImageTransform,
+    navigator: DisplayedImageTransform,
+}
+
+#[derive(Clone)]
+struct FlatNavigatorLayout {
+    panel_rect: egui::Rect,
+    header_rect: egui::Rect,
+    canvas_rect: egui::Rect,
+    content_rect: egui::Rect,
+    visible_rect: egui::Rect,
+    screen_scale: f32,
+    pages: Vec<FlatNavigatorPage>,
+}
+
+#[derive(Clone)]
+struct PanoramaNavigatorLayout {
+    panel_rect: egui::Rect,
+    header_rect: egui::Rect,
+    canvas_rect: egui::Rect,
+    content_rect: egui::Rect,
+    outline_segments: Vec<Vec<egui::Pos2>>,
+}
+
+impl FlatNavigatorLayout {
+    fn page_at(&self, pos: egui::Pos2) -> Option<FlatNavigatorPage> {
+        self.pages
+            .iter()
+            .copied()
+            .find(|page| page.navigator.contains_screen(pos))
+    }
+
+    fn nearest_page_at(&self, pos: egui::Pos2) -> Option<(FlatNavigatorPage, egui::Pos2)> {
+        self.page_at(pos).map(|page| (page, pos)).or_else(|| {
+            self.pages
+                .iter()
+                .copied()
+                .map(|page| {
+                    let clamped =
+                        pos.clamp(page.navigator.paint_rect.min, page.navigator.paint_rect.max);
+                    (page, clamped, clamped.distance_sq(pos))
+                })
+                .min_by(|a, b| a.2.total_cmp(&b.2))
+                .map(|(page, clamped, _)| (page, clamped))
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum FsNavigatorInteraction {
+    #[default]
+    Idle,
+    Select {
+        start: egui::Pos2,
+        current: egui::Pos2,
+    },
+    Pan {
+        start: egui::Pos2,
+        start_pan: egui::Vec2,
+        screen_scale: f32,
+    },
+    PendingPanTransition {
+        start: egui::Pos2,
+        page_idx: usize,
+        source_uv: egui::Pos2,
+    },
+    PendingCenter {
+        page_idx: usize,
+        source_uv: egui::Pos2,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum PanoramaNavigatorInteraction {
+    #[default]
+    Idle,
+    Select {
+        start: egui::Pos2,
+        current: egui::Pos2,
+    },
+    Pan {
+        start_uv: egui::Pos2,
+        start_yaw: f32,
+        start_pitch: f32,
+    },
+}
+
+fn fs_navigator_visibility_requested(
+    fixed_visible: bool,
+    hold_active: bool,
+    focused: bool,
+    interaction_active: bool,
+) -> bool {
+    fixed_visible || (focused && hold_active) || interaction_active
+}
+
+/// ナビゲータが「掴まれている」= 表示を続けなければ操作が途切れる状態か。
+///
+/// 判定は変種の列挙ではなく `Idle` 以外かどうかで行う。`PendingCenter` のように
+/// **意図的に次フレームへ持ち越す**変種があり、それを列挙から落とすと修飾キーを
+/// 離した次のフレームでゲートが閉じ、持ち越した移動が黙って捨てられる。
+/// 変種が増えたときも安全側 (表示を維持する側) へ倒れるようにする。
+fn fs_navigator_interaction_active(ctx: &egui::Context) -> bool {
+    ctx.data(|data| {
+        !matches!(
+            data.get_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id()),
+            None | Some(FsNavigatorInteraction::Idle)
+        ) || !matches!(
+            data.get_temp::<PanoramaNavigatorInteraction>(panorama_navigator_interaction_id()),
+            None | Some(PanoramaNavigatorInteraction::Idle)
+        )
+    })
+}
+
+fn fs_navigator_interaction_id() -> egui::Id {
+    egui::Id::new("fs_navigator_interaction")
+}
+
+fn panorama_navigator_interaction_id() -> egui::Id {
+    egui::Id::new("panorama_navigator_interaction")
+}
+
+fn fs_navigator_rect_is_valid(rect: egui::Rect) -> bool {
+    rect.min.x.is_finite()
+        && rect.min.y.is_finite()
+        && rect.max.x.is_finite()
+        && rect.max.y.is_finite()
+        && rect.width() > 0.0
+        && rect.height() > 0.0
+}
+
+fn fs_navigator_union_rect(a: Option<egui::Rect>, b: egui::Rect) -> Option<egui::Rect> {
+    if !fs_navigator_rect_is_valid(b) {
+        return a;
+    }
+    Some(match a {
+        Some(a) => egui::Rect::from_min_max(
+            egui::pos2(a.left().min(b.left()), a.top().min(b.top())),
+            egui::pos2(a.right().max(b.right()), a.bottom().max(b.bottom())),
+        ),
+        None => b,
+    })
+}
+
+fn fs_navigator_source_rect_aabb(
+    transform: &DisplayedImageTransform,
+    source_rect: egui::Rect,
+) -> egui::Rect {
+    let points = [
+        source_rect.left_top(),
+        source_rect.right_top(),
+        source_rect.right_bottom(),
+        source_rect.left_bottom(),
+    ];
+    let mut min = egui::pos2(f32::INFINITY, f32::INFINITY);
+    let mut max = egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for point in points {
+        let point = transform.source_normalized_to_screen(point);
+        min.x = min.x.min(point.x);
+        min.y = min.y.min(point.y);
+        max.x = max.x.max(point.x);
+        max.y = max.y.max(point.y);
+    }
+    egui::Rect::from_min_max(min, max)
+}
+
+fn fs_navigator_uv_rect_is_full(visible: egui::Rect, full: egui::Rect) -> bool {
+    const EPSILON: f32 = 1.0e-4;
+    (visible.left() - full.left()).abs() <= EPSILON
+        && (visible.top() - full.top()).abs() <= EPSILON
+        && (visible.right() - full.right()).abs() <= EPSILON
+        && (visible.bottom() - full.bottom()).abs() <= EPSILON
+}
+
+fn flat_navigator_main_pages(
+    layout: &FullscreenPageLayout,
+) -> Option<Vec<DisplayedImageTransform>> {
+    match layout.kind() {
+        FullscreenPageLayoutKind::Single => layout.single_page().map(|page| vec![page.transform]),
+        FullscreenPageLayoutKind::Spread => {
+            let (left_idx, right_idx) = layout.spread_pair()?;
+            Some(vec![
+                layout.page_by_idx(left_idx)?.transform,
+                layout.page_by_idx(right_idx)?.transform,
+            ])
+        }
+        FullscreenPageLayoutKind::Empty | FullscreenPageLayoutKind::Continuous => None,
+    }
+}
+
+fn normal_zoom_pan(transform: DisplayedImageTransform) -> Option<(f32, egui::Vec2)> {
+    match transform.placement {
+        ResolvedDisplayPlacement::Normal { zoom_pan } => {
+            Some(zoom_pan.unwrap_or((1.0, egui::Vec2::ZERO)))
+        }
+        ResolvedDisplayPlacement::Z { .. } => None,
+    }
+}
+
+fn pan_correction_for_minimum_overlap(
+    image_rect: egui::Rect,
+    viewport_rect: egui::Rect,
+) -> egui::Vec2 {
+    let overlap_x = FS_PAN_MIN_VISIBLE_PX
+        .min(image_rect.width())
+        .min(viewport_rect.width());
+    let overlap_y = FS_PAN_MIN_VISIBLE_PX
+        .min(image_rect.height())
+        .min(viewport_rect.height());
+    let min_x = viewport_rect.left() + overlap_x - image_rect.right();
+    let max_x = viewport_rect.right() - overlap_x - image_rect.left();
+    let min_y = viewport_rect.top() + overlap_y - image_rect.bottom();
+    let max_y = viewport_rect.bottom() - overlap_y - image_rect.top();
+    egui::vec2(0.0_f32.clamp(min_x, max_x), 0.0_f32.clamp(min_y, max_y))
+}
+
+/// Clamp a proposed normal-view pan against the resolved page geometry from the previous frame.
+///
+/// Each normal transform stores the zoom/pan that produced it, so zoom changes can project the
+/// current drawn rectangles to the proposed state without duplicating fit/trim/spread layout.
+/// Continuous reading and Z transforms deliberately return the proposed value unchanged because
+/// those modes own their scroll/pan constraints separately.
+fn clamp_fullscreen_pan_from_layout(
+    layout: &FullscreenPageLayout,
+    proposed_zoom: f32,
+    proposed_pan: egui::Vec2,
+) -> egui::Vec2 {
+    if !proposed_zoom.is_finite()
+        || proposed_zoom <= 0.0
+        || !proposed_pan.x.is_finite()
+        || !proposed_pan.y.is_finite()
+    {
+        return proposed_pan;
+    }
+    let Some(pages) = flat_navigator_main_pages(layout) else {
+        return proposed_pan;
+    };
+
+    pages
+        .into_iter()
+        .filter_map(|page| {
+            let (base_zoom, base_pan) = normal_zoom_pan(page)?;
+            if !base_zoom.is_finite() || base_zoom <= 0.0 {
+                return None;
+            }
+            let ratio = proposed_zoom / base_zoom;
+            let current_anchor = page.viewport_rect.center() + base_pan;
+            let proposed_anchor = page.viewport_rect.center() + proposed_pan;
+            let drawn_rect = fs_navigator_source_rect_aabb(&page, page.uv_rect);
+            let projected_rect = egui::Rect::from_min_max(
+                proposed_anchor + (drawn_rect.min - current_anchor) * ratio,
+                proposed_anchor + (drawn_rect.max - current_anchor) * ratio,
+            );
+            let correction = pan_correction_for_minimum_overlap(projected_rect, page.viewport_rect);
+            Some((correction.length_sq(), proposed_pan + correction))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map_or(proposed_pan, |(_, pan)| pan)
+}
+
+fn fs_navigator_panel_rect(
+    host_rect: egui::Rect,
+    requested_size: f32,
+    corner: FullscreenNavigatorCorner,
+) -> Option<(egui::Rect, egui::Rect, egui::Rect)> {
+    let available_size = (host_rect.width() - FS_NAVIGATOR_MARGIN * 2.0)
+        .min(host_rect.height() - FS_NAVIGATOR_MARGIN * 2.0 - FS_NAVIGATOR_HEADER_HEIGHT);
+    if !available_size.is_finite() || available_size < 80.0 {
+        return None;
+    }
+    let canvas_size = requested_size
+        .clamp(FULLSCREEN_NAVIGATOR_SIZE_MIN, FULLSCREEN_NAVIGATOR_SIZE_MAX)
+        .min(available_size);
+    let panel_size = egui::vec2(canvas_size, canvas_size + FS_NAVIGATOR_HEADER_HEIGHT);
+    let corner = corner.normalized();
+    let min = match corner {
+        FullscreenNavigatorCorner::TopLeft => {
+            host_rect.left_top() + egui::vec2(FS_NAVIGATOR_MARGIN, FS_NAVIGATOR_MARGIN)
+        }
+        FullscreenNavigatorCorner::TopRight => egui::pos2(
+            host_rect.right() - FS_NAVIGATOR_MARGIN - panel_size.x,
+            host_rect.top() + FS_NAVIGATOR_MARGIN,
+        ),
+        FullscreenNavigatorCorner::BottomLeft => egui::pos2(
+            host_rect.left() + FS_NAVIGATOR_MARGIN,
+            host_rect.bottom() - FS_NAVIGATOR_MARGIN - panel_size.y,
+        ),
+        FullscreenNavigatorCorner::BottomRight => egui::pos2(
+            host_rect.right() - FS_NAVIGATOR_MARGIN - panel_size.x,
+            host_rect.bottom() - FS_NAVIGATOR_MARGIN - panel_size.y,
+        ),
+        FullscreenNavigatorCorner::Unknown => unreachable!("normalized navigator corner"),
+    };
+    let panel_rect = egui::Rect::from_min_size(min, panel_size);
+    let header_rect =
+        egui::Rect::from_min_size(min, egui::vec2(canvas_size, FS_NAVIGATOR_HEADER_HEIGHT));
+    let canvas_rect = egui::Rect::from_min_size(
+        egui::pos2(min.x, min.y + FS_NAVIGATOR_HEADER_HEIGHT),
+        egui::vec2(canvas_size, canvas_size),
+    );
+    Some((panel_rect, header_rect, canvas_rect))
+}
+
+fn fs_navigator_edge_exclusion_rect(
+    host_rect: egui::Rect,
+    panel_rect: egui::Rect,
+    corner: FullscreenNavigatorCorner,
+) -> egui::Rect {
+    match corner.normalized() {
+        FullscreenNavigatorCorner::TopLeft => {
+            egui::Rect::from_min_max(host_rect.left_top(), panel_rect.right_bottom())
+        }
+        FullscreenNavigatorCorner::TopRight => egui::Rect::from_min_max(
+            egui::pos2(panel_rect.left(), host_rect.top()),
+            egui::pos2(host_rect.right(), panel_rect.bottom()),
+        ),
+        FullscreenNavigatorCorner::BottomLeft => egui::Rect::from_min_max(
+            egui::pos2(host_rect.left(), panel_rect.top()),
+            egui::pos2(panel_rect.right(), host_rect.bottom()),
+        ),
+        FullscreenNavigatorCorner::BottomRight => {
+            egui::Rect::from_min_max(panel_rect.left_top(), host_rect.right_bottom())
+        }
+        FullscreenNavigatorCorner::Unknown => unreachable!("normalized navigator corner"),
+    }
+}
+
+fn fullscreen_edge_hover_allowed(pos: egui::Pos2, navigator_exclusion: Option<egui::Rect>) -> bool {
+    !navigator_exclusion.is_some_and(|rect| rect.contains(pos))
+}
+
+fn build_flat_navigator_layout(
+    layout: &FullscreenPageLayout,
+    clip_rect: egui::Rect,
+    host_rect: egui::Rect,
+    requested_size: f32,
+    corner: FullscreenNavigatorCorner,
+) -> Option<FlatNavigatorLayout> {
+    let main_pages = flat_navigator_main_pages(layout)?;
+    if main_pages
+        .iter()
+        .any(|page| page.free_rotation_rad.abs() > TRANSFORM_EPSILON)
+    {
+        return None;
+    }
+
+    let visible_uvs = main_pages
+        .iter()
+        .map(|page| page.visible_source_uv_rect(clip_rect))
+        .collect::<Vec<_>>();
+    // When every page is already fully visible, the outline would cover the entire overview and
+    // convey no useful position information. Keep the user's enabled setting, but hide the panel
+    // until zoom, pan, trim, or a fit mode makes only part of the source visible.
+    if main_pages.iter().zip(&visible_uvs).all(|(page, visible)| {
+        visible.is_some_and(|rect| fs_navigator_uv_rect_is_full(rect, page.uv_rect))
+    }) {
+        return None;
+    }
+
+    let content_bounds = main_pages.iter().fold(None, |bounds, page| {
+        fs_navigator_union_rect(bounds, page.full_image_rect)
+    })?;
+    let (panel_rect, header_rect, canvas_rect) =
+        fs_navigator_panel_rect(host_rect, requested_size, corner)?;
+    let screen_scale = (canvas_rect.width() / content_bounds.width())
+        .min(canvas_rect.height() / content_bounds.height());
+    if !screen_scale.is_finite() || screen_scale <= 0.0 {
+        return None;
+    }
+    let map_rect = |rect: egui::Rect| {
+        egui::Rect::from_center_size(
+            canvas_rect.center() + (rect.center() - content_bounds.center()) * screen_scale,
+            rect.size() * screen_scale,
+        )
+    };
+
+    let mut pages = Vec::with_capacity(main_pages.len());
+    let mut content_rect = None;
+    let mut visible_rect = None;
+    for (main, visible_uv) in main_pages.into_iter().zip(visible_uvs) {
+        let navigator = DisplayedImageTransform::from_resolved_rect(
+            DisplayedImageTransformInput {
+                page_idx: main.page_idx,
+                viewport_rect: canvas_rect,
+                source_size: main.source_size,
+                texture_size: main.texture_size,
+                rotation: main.rotation,
+                free_rotation_rad: 0.0,
+                // The catalog thumbnail represents the unprocessed source. Only the page
+                // rotation and resolved spread placement belong in the overview; active trim
+                // remains visible through the frame derived from the main transform.
+                content_bbox: None,
+                fit_mode: main.fit_mode,
+                fit_scale_limits: main.fit_scale_limits,
+                pixels_per_point: main.fit_scale_limits.pixels_per_point,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            },
+            map_rect(main.full_image_rect),
+        )?;
+        content_rect = fs_navigator_union_rect(content_rect, navigator.full_image_rect);
+        if let Some(visible_uv) = visible_uv {
+            visible_rect = fs_navigator_union_rect(
+                visible_rect,
+                fs_navigator_source_rect_aabb(&navigator, visible_uv),
+            );
+        }
+        pages.push(FlatNavigatorPage { main, navigator });
+    }
+
+    Some(FlatNavigatorLayout {
+        panel_rect,
+        header_rect,
+        canvas_rect,
+        content_rect: content_rect?.intersect(canvas_rect),
+        visible_rect: visible_rect?.intersect(canvas_rect),
+        screen_scale,
+        pages,
+    })
+}
+
+fn panorama_navigator_screen_to_uv(content_rect: egui::Rect, pos: egui::Pos2) -> egui::Pos2 {
+    let pos = pos.clamp(content_rect.min, content_rect.max);
+    egui::pos2(
+        ((pos.x - content_rect.left()) / content_rect.width().max(f32::EPSILON)).clamp(0.0, 1.0),
+        ((pos.y - content_rect.top()) / content_rect.height().max(f32::EPSILON)).clamp(0.0, 1.0),
+    )
+}
+
+fn panorama_navigator_uv_to_yaw_pitch(uv: egui::Pos2) -> (f32, f32) {
+    // `ndc_to_equirect_uv` and the WGSL renderer use a camera-yaw convention
+    // whose center longitude is `-yaw`, so the inverse must negate the usual
+    // equirect longitude expression to round-trip the actually drawn view.
+    let yaw = -(uv.x.clamp(0.0, 1.0) - 0.5) * std::f32::consts::TAU;
+    let pitch = ((0.5 - uv.y.clamp(0.0, 1.0)) * std::f32::consts::PI)
+        .clamp(-crate::panorama::PITCH_LIMIT, crate::panorama::PITCH_LIMIT);
+    (yaw, pitch)
+}
+
+fn panorama_navigator_wrap_yaw(yaw: f32) -> f32 {
+    (yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+}
+
+fn panorama_navigator_fov_from_height(selection_height: f32, content_height: f32) -> f32 {
+    let fov_y = selection_height.abs() / content_height.max(f32::EPSILON) * std::f32::consts::PI;
+    if fov_y.is_finite() {
+        fov_y.clamp(crate::panorama::FOV_MIN, crate::panorama::FOV_MAX)
+    } else {
+        crate::panorama::FOV_MAX
+    }
+}
+
+fn panorama_navigator_outline_segments(
+    content_rect: egui::Rect,
+    viewport_rect: egui::Rect,
+    yaw: f32,
+    pitch: f32,
+    fov_y: f32,
+) -> Vec<Vec<egui::Pos2>> {
+    let aspect = if viewport_rect.height() > 0.0 {
+        viewport_rect.width() / viewport_rect.height()
+    } else {
+        1.0
+    };
+    // Keep these derivations identical to `try_paint_panorama` and
+    // `panorama_wgpu`: aspect = viewport_w / viewport_h and
+    // tan_half = tan(fov_y / 2).
+    let tan_half = (fov_y.clamp(crate::panorama::FOV_MIN, crate::panorama::FOV_MAX) * 0.5).tan();
+    let samples = PANORAMA_NAVIGATOR_EDGE_SAMPLES;
+    let mut ndc_points = Vec::with_capacity(samples * 4 + 1);
+    for step in 0..=samples {
+        let t = step as f32 / samples as f32;
+        ndc_points.push((-1.0 + t * 2.0, 1.0));
+    }
+    for step in 1..=samples {
+        let t = step as f32 / samples as f32;
+        ndc_points.push((1.0, 1.0 - t * 2.0));
+    }
+    for step in 1..=samples {
+        let t = step as f32 / samples as f32;
+        ndc_points.push((1.0 - t * 2.0, -1.0));
+    }
+    for step in 1..=samples {
+        let t = step as f32 / samples as f32;
+        ndc_points.push((-1.0, -1.0 + t * 2.0));
+    }
+
+    let mut segments = Vec::new();
+    let mut current = Vec::new();
+    let mut previous_u: Option<f32> = None;
+    for (u_ndc, v_ndc) in ndc_points {
+        let (u, v) =
+            crate::panorama::ndc_to_equirect_uv(u_ndc, v_ndc, aspect, tan_half, yaw, pitch);
+        // The equirect seam wraps from u=1 to u=0. Splitting adjacent samples
+        // whose U jump exceeds half the texture prevents a false line across
+        // the complete overview.
+        if previous_u.is_some_and(|previous| (u - previous).abs() > 0.5) {
+            if current.len() >= 2 {
+                segments.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+        }
+        current.push(egui::pos2(
+            content_rect.left() + u * content_rect.width(),
+            content_rect.top() + v * content_rect.height(),
+        ));
+        previous_u = Some(u);
+    }
+    if current.len() >= 2 {
+        segments.push(current);
+    }
+    // Near a pole with a broad FOV, the projected outline may encircle the
+    // pole. This sampled and seam-split approximation is intentionally only
+    // directionally accurate: the navigator is an orientation aid, not a
+    // spherical selection editor.
+    segments
+}
+
+fn build_panorama_navigator_layout(
+    source_size: egui::Vec2,
+    viewport_rect: egui::Rect,
+    host_rect: egui::Rect,
+    requested_size: f32,
+    corner: FullscreenNavigatorCorner,
+    yaw: f32,
+    pitch: f32,
+    fov_y: f32,
+) -> Option<PanoramaNavigatorLayout> {
+    if !source_size.x.is_finite()
+        || !source_size.y.is_finite()
+        || source_size.x <= 0.0
+        || source_size.y <= 0.0
+    {
+        return None;
+    }
+    let (panel_rect, header_rect, canvas_rect) =
+        fs_navigator_panel_rect(host_rect, requested_size, corner)?;
+    let content_rect = fit_display_size_in_rect(canvas_rect, source_size);
+    let outline_segments =
+        panorama_navigator_outline_segments(content_rect, viewport_rect, yaw, pitch, fov_y);
+    // Unlike a flat page, even FOV_MAX cannot show the whole sphere at once.
+    // Once the user enables the navigator, panorama mode therefore never
+    // applies the flat layout's whole-image auto-hide rule.
+    Some(PanoramaNavigatorLayout {
+        panel_rect,
+        header_rect,
+        canvas_rect,
+        content_rect,
+        outline_segments,
+    })
+}
+
+fn fs_navigator_corner_button_rect(header_rect: egui::Rect, index: usize) -> egui::Rect {
+    const BUTTON_SIZE: f32 = 16.0;
+    const BUTTON_GAP: f32 = 3.0;
+    let total_width = BUTTON_SIZE * 4.0 + BUTTON_GAP * 3.0;
+    let left = header_rect.right() - 6.0 - total_width;
+    egui::Rect::from_min_size(
+        egui::pos2(
+            left + index as f32 * (BUTTON_SIZE + BUTTON_GAP),
+            header_rect.center().y - BUTTON_SIZE * 0.5,
+        ),
+        egui::vec2(BUTTON_SIZE, BUTTON_SIZE),
+    )
+}
 
 enum FsNavHoldoverDecision {
     Unavailable,
@@ -204,6 +782,14 @@ const FS_AI_MODEL_DIRECT_ACTIONS: &[(KeyAction, Option<&str>, &str)] = &[
 
 const FS_POST_FILTER_DIRECT_ACTIONS: &[(KeyAction, PostFilter)] = &[
     (KeyAction::FsPostFilterNearest, PostFilter::Nearest),
+    (
+        KeyAction::FsPostFilterUpscaleSharp,
+        PostFilter::UpscaleSharp,
+    ),
+    (
+        KeyAction::FsPostFilterUpscaleAnime,
+        PostFilter::UpscaleAnime,
+    ),
     (KeyAction::FsPostFilterCrtSimple, PostFilter::CrtSimple),
     (KeyAction::FsPostFilterCrtFull, PostFilter::CrtFull),
     (KeyAction::FsPostFilterCrtArcade, PostFilter::CrtArcade),
@@ -451,8 +1037,9 @@ fn fullscreen_side_panel_contains_pointer(
     mode: crate::settings::FsSidePanelMode,
     right_panel_visible: bool,
     left_panel_visible: bool,
+    navigator_exclusion: Option<egui::Rect>,
 ) -> bool {
-    if !chrome_enabled {
+    if !chrome_enabled || !fullscreen_edge_hover_allowed(pos, navigator_exclusion) {
         return false;
     }
     let click_mode = mode.normalized() == crate::settings::FsSidePanelMode::ClickToShow;
@@ -579,12 +1166,15 @@ pub(crate) fn metadata_panel_hover_active_at(
     full_rect: egui::Rect,
     pointer_pos: Option<egui::Pos2>,
     was_active: bool,
+    navigator_exclusion: Option<egui::Rect>,
 ) -> bool {
     let activation_rect = metadata_panel_hover_activation_rect(full_rect);
     let sustain_rect = metadata_panel_rect(full_rect)
         .expand(crate::ui_helpers::panel_hover_sustain_px(full_rect.width()));
-    pointer_pos
-        .is_some_and(|p| activation_rect.contains(p) || (was_active && sustain_rect.contains(p)))
+    pointer_pos.is_some_and(|p| {
+        fullscreen_edge_hover_allowed(p, navigator_exclusion)
+            && (activation_rect.contains(p) || (was_active && sustain_rect.contains(p)))
+    })
 }
 
 /// 画像用左パネルの端ホバーラッチを現在座標から更新する。
@@ -594,6 +1184,7 @@ fn adjustment_panel_hover_active_at(
     full_rect: egui::Rect,
     pointer_pos: Option<egui::Pos2>,
     was_active: bool,
+    navigator_exclusion: Option<egui::Rect>,
 ) -> bool {
     let strip =
         crate::ui_helpers::panel_edge_trigger_px(full_rect.width()).min(full_rect.width().max(0.0));
@@ -604,7 +1195,8 @@ fn adjustment_panel_hover_active_at(
     let sustain_rect = adjustment_panel_rect(full_rect)
         .expand(crate::ui_helpers::panel_hover_sustain_px(full_rect.width()));
     pointer_pos.is_some_and(|pos| {
-        activation_rect.contains(pos) || (was_active && sustain_rect.contains(pos))
+        fullscreen_edge_hover_allowed(pos, navigator_exclusion)
+            && (activation_rect.contains(pos) || (was_active && sustain_rect.contains(pos)))
     })
 }
 
@@ -984,18 +1576,6 @@ fn current_foreground_hwnd() -> usize {
 #[cfg(not(windows))]
 fn current_foreground_hwnd() -> usize {
     0
-}
-
-#[cfg(windows)]
-fn original_preview_shortcut_held(_ctx: &egui::Context) -> bool {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_RCONTROL};
-
-    unsafe { GetAsyncKeyState(VK_RCONTROL.0 as i32) < 0 }
-}
-
-#[cfg(not(windows))]
-fn original_preview_shortcut_held(ctx: &egui::Context) -> bool {
-    ctx.input(|i| i.key_down(egui::Key::Num0))
 }
 
 /// 物理的な Ctrl キー押下を OS から直接読む。フルスクリーンビューポートでは
@@ -1480,6 +2060,10 @@ fn apply_continuous_spread_geometry(
     size.pages[1].logical_scale = geometry.right.scale_factor;
     size.width = geometry.fit_size.x;
     size.height = geometry.fit_size.y;
+}
+
+fn spread_should_match_page_heights(fit_mode: FullscreenFitMode) -> bool {
+    !matches!(fit_mode, FullscreenFitMode::Original)
 }
 
 fn continuous_spread_fit_width(
@@ -2162,8 +2746,9 @@ impl App {
         if self.analysis_mode {
             // 分析→通常: ズーム/パンを引き継ぐ
             self.fs_zoom = self.analysis_zoom;
-            self.fs_pan = self.analysis_pan;
+            let proposed_pan = self.analysis_pan;
             self.reset_analysis_mode();
+            self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
         } else {
             // 通常→分析: ズーム/パンを引き継ぐ
             self.analysis_zoom = self.fs_zoom;
@@ -2272,43 +2857,102 @@ impl App {
         resource: &crate::gpu_lanczos::FullscreenPaintResource,
         logical_scale: f32,
         pixels_per_point: f32,
+        visible_source_uv_rect: Option<egui::Rect>,
     ) -> crate::gpu_lanczos::FullscreenPaintResource {
         let render_state = self.wgpu_render_state.clone();
-        let (prepared, stats) = self.fs_lanczos_cache.resolve(
+        let post_filter = if self.post_filter_bypassed {
+            crate::adjustment::PostFilter::None
+        } else {
+            resource
+                .page_idx()
+                .map(|idx| self.effective_params(idx).post_filter)
+                .unwrap_or(crate::adjustment::PostFilter::None)
+        };
+        let (prepared, perf_event) = self.fs_lanczos_cache.resolve(
             render_state.as_ref(),
             resource,
             logical_scale,
             pixels_per_point,
+            visible_source_uv_rect,
+            post_filter,
             self.settings.downscale_smoothing_percent,
+            self.settings.anime_upscale_source_limit,
         );
-        if let Some(stats) = stats
+        if let Some(perf_event) = perf_event
             && crate::perf::is_enabled()
         {
-            let idx = match resource {
-                crate::gpu_lanczos::FullscreenPaintResource::Resampleable { page_idx, .. }
-                | crate::gpu_lanczos::FullscreenPaintResource::Lanczos { page_idx, .. } => {
-                    Some(*page_idx)
+            let key = resource.page_idx().and_then(|idx| self.perf_item_key(idx));
+            match perf_event {
+                crate::gpu_lanczos::LanczosPerfEvent::Generated(stats) => {
+                    // Every resampler branch shares one event name and is told apart by the
+                    // scale_branch field. Splitting the name would let a log query written for
+                    // one branch report zero for another and read as "nothing was generated" -
+                    // which is how the upscale path was found to be dead in the first place.
+                    crate::perf::event(
+                        "gpu",
+                        "lanczos_regenerate",
+                        key.as_deref(),
+                        self.input_seq,
+                        &[
+                            ("source_w", stats.source_size[0].into()),
+                            ("source_h", stats.source_size[1].into()),
+                            ("target_w", stats.target_size[0].into()),
+                            ("target_h", stats.target_size[1].into()),
+                            ("scale_branch", stats.scale_branch.as_str().into()),
+                            (
+                                "visible_source_x",
+                                stats
+                                    .visible_source_region
+                                    .map(|region| region[0].into())
+                                    .unwrap_or(serde_json::Value::Null),
+                            ),
+                            (
+                                "visible_source_y",
+                                stats
+                                    .visible_source_region
+                                    .map(|region| region[1].into())
+                                    .unwrap_or(serde_json::Value::Null),
+                            ),
+                            (
+                                "visible_source_w",
+                                stats
+                                    .visible_source_region
+                                    .map(|region| region[2].into())
+                                    .unwrap_or(serde_json::Value::Null),
+                            ),
+                            (
+                                "visible_source_h",
+                                stats
+                                    .visible_source_region
+                                    .map(|region| region[3].into())
+                                    .unwrap_or(serde_json::Value::Null),
+                            ),
+                            ("smoothing_percent", stats.smoothing_percent.into()),
+                            ("blur_factor", f64::from(stats.blur_factor).into()),
+                            ("texture_fetches", stats.texture_fetches.into()),
+                            ("encode_submit_cpu_ms", stats.encode_submit_cpu_ms.into()),
+                            ("regeneration_count", stats.regeneration_count.into()),
+                        ],
+                    );
                 }
-                crate::gpu_lanczos::FullscreenPaintResource::Direct { .. } => None,
-            };
-            let key = idx.and_then(|idx| self.perf_item_key(idx));
-            crate::perf::event(
-                "gpu",
-                "lanczos_regenerate",
-                key.as_deref(),
-                self.input_seq,
-                &[
-                    ("source_w", stats.source_size[0].into()),
-                    ("source_h", stats.source_size[1].into()),
-                    ("target_w", stats.target_size[0].into()),
-                    ("target_h", stats.target_size[1].into()),
-                    ("smoothing_percent", stats.smoothing_percent.into()),
-                    ("blur_factor", f64::from(stats.blur_factor).into()),
-                    ("texture_fetches", stats.texture_fetches.into()),
-                    ("encode_submit_cpu_ms", stats.encode_submit_cpu_ms.into()),
-                    ("regeneration_count", stats.regeneration_count.into()),
-                ],
-            );
+                crate::gpu_lanczos::LanczosPerfEvent::UpscaleLimitFallback(stats) => {
+                    crate::perf::event(
+                        "gpu",
+                        "lanczos_upscale_limit_fallback",
+                        key.as_deref(),
+                        self.input_seq,
+                        &[
+                            ("source_w", stats.source_size[0].into()),
+                            ("source_h", stats.source_size[1].into()),
+                            ("target_w", stats.target_size[0].into()),
+                            ("target_h", stats.target_size[1].into()),
+                            ("max_dimension", stats.max_dimension.into()),
+                            ("max_pixels", stats.max_pixels.into()),
+                            ("scale_branch", stats.scale_branch.as_str().into()),
+                        ],
+                    );
+                }
+            }
         }
         prepared
     }
@@ -2671,8 +3315,8 @@ impl App {
         }
     }
 
-    /// 右 Ctrl ホールド中だけ、mIV 側の派生表示 (補正 / AI / 消しゴム補完) を
-    /// 迂回して raw decode の元画像テクスチャを選ぶ。
+    /// 元画像表示の ModifierHold が成立している間だけ、mIV 側の派生表示
+    /// (補正 / AI / 消しゴム補完) を迂回して raw decode の元画像テクスチャを選ぶ。
     ///
     /// フォーカスは `ctx.input(|i| i.viewport().focused)` ではなく
     /// `self.fs_prev_focused` で確認する: この関数の呼び出し元
@@ -2681,14 +3325,14 @@ impl App {
     /// OS フォーカスを持っている間は常に `Some(false)` を返してしまう。
     /// `fs_prev_focused` はフルスクリーン viewport closure 内で毎フレーム更新される
     /// ので、フルスクリーン側の前フレーム focus 状態を反映する。`GetAsyncKeyState`
-    /// 単体だと動画/アニメ駆動の repaint 中に他アプリの右Ctrl を拾うリスクがあるので、
+    /// 単体だと動画/アニメ駆動の repaint 中に他アプリの割り当てキーを拾うリスクがあるので、
     /// 必ずフォーカス gate と AND させる。
     ///
     /// Shift 検出も `ctx.input(|i| i.modifiers.shift)` ではなく OS API を使う。
     /// `prepare_fullscreen_state` は `show_viewport_immediate` の外側で呼ばれるため、
     /// ここでの ctx はメインビューポートのもの。フルスクリーンが OS フォーカスを
     /// 持っている間、メイン ctx の modifier event は届かない
-    /// (= `i.modifiers.shift` が常に false)。右Ctrl 検出と同じ理由。
+    /// (= `i.modifiers.shift` が常に false)。元画像表示の修飾キー検出と同じ理由。
     fn original_preview_active(&self, ctx: &egui::Context, idx: usize) -> bool {
         if !self.fs_prev_focused {
             return false;
@@ -2696,10 +3340,18 @@ impl App {
         if self.any_modal_dialog_open_for_fullscreen_keys() {
             return false;
         }
-        if !original_preview_shortcut_held(ctx) {
+        // この位置の ctx は main viewport のため、そこに残った FocusedUi/TextInput owner を
+        // 元画像表示の抑止条件にはできない。実際の fullscreen focus と modal は上で明示的に
+        // gate 済みなので、この呼び出しだけ keymap owner 判定を迂回して OS 状態を解決する。
+        if !self
+            .keymap
+            .modifier_held_action_for_external_viewport(ctx, KeyAction::FsOriginalPreviewHold)
+        {
             return false;
         }
-        if self.local_adjust_mode && shift_held_via_os() {
+        // 補正レイヤー固有の Ctrl+Shift バイパスだけを優先する。元画像表示を
+        // RightShift / Alt などへ変更した場合、Shift 単独で抑止してはならない。
+        if self.local_adjust_mode && ctrl_held_via_os() && shift_held_via_os() {
             return false;
         }
         matches!(
@@ -2712,7 +3364,7 @@ impl App {
 
     /// 現在の表示が final pipeline (補正 / AI / カラー化合成) を迂回するか。
     ///
-    /// 元画像表示 (右 Ctrl) と分析モードは raw `fs_cache` を直接描くため、
+    /// 元画像表示と分析モードは raw `fs_cache` を直接描くため、
     /// 描画側 (`resolve_fs_processed_texture`) と nav lock 解放側
     /// (`poll_fs_nav_lock`) は必ずこの述語を共有する。片方だけ更新すると
     /// 「表示は出ているのに lock が解放されない」型のデッドロックになる。
@@ -2777,7 +3429,7 @@ impl App {
             return self.current_animated_frame_texture(idx);
         }
         // Z 分析モードは AI / 補正 / 注釈 / 隠蔽 / 消しゴム / 局所補正をすべてバイパスして
-        // **raw 元画像**を表示する (右 Ctrl の original preview と同じ経路)。分析パネルの色取得・
+        // **raw 元画像**を表示する (original preview と同じ経路)。分析パネルの色取得・
         // ヒストグラム・グレースケール/拡大鏡オーバーレイは raw fs_cache を読むので、表示も raw に
         // 揃えることで「クリックした見た目の色 = 分析値」が一致する (Codex 指摘 + ユーザー要望)。
         if self.fs_display_bypasses_final_pipeline(original_preview_active) {
@@ -3358,6 +4010,21 @@ impl App {
         Some(transform)
     }
 
+    /// 利用者入力から通常表示の pan を変更する唯一の入口。
+    ///
+    /// Z ズームと連結読みはそれぞれ専用制約を持つため、このクランプを適用しない。
+    fn set_fs_pan_from_input(&mut self, proposed_zoom: f32, proposed_pan: egui::Vec2) {
+        self.fs_pan = if self.fs_zoom_mode_engaged() {
+            proposed_pan
+        } else {
+            clamp_fullscreen_pan_from_layout(
+                &self.fullscreen_page_layout,
+                proposed_zoom,
+                proposed_pan,
+            )
+        };
+    }
+
     /// 中ボタンドラッグズームを処理する。
     ///
     /// ホイール押し込み + 上下ドラッグで fs_zoom / analysis_zoom を連続的に変える。
@@ -3433,7 +4100,7 @@ impl App {
                     self.analysis_pan = new_pan;
                 } else {
                     self.fs_zoom = new_zoom;
-                    self.fs_pan = new_pan;
+                    self.set_fs_pan_from_input(new_zoom, new_pan);
                 }
                 return true;
             }
@@ -3531,7 +4198,7 @@ impl App {
         } else if primary_down
             && let (Some((start_pos, start_pan)), Some(pos)) = (self.fs_pan_drag_start, pointer_pos)
         {
-            self.fs_pan = start_pan + (pos - start_pos);
+            self.set_fs_pan_from_input(self.fs_zoom, start_pan + (pos - start_pos));
         }
         if primary_released {
             self.fs_pan_drag_start = None;
@@ -3582,6 +4249,7 @@ impl App {
         if (self.fs_zoom - old_zoom).abs() <= f32::EPSILON {
             return false;
         }
+        self.set_fs_pan_from_input(self.fs_zoom, self.fs_pan);
         self.maybe_rerender_pdf(self.fs_zoom);
         true
     }
@@ -3594,7 +4262,7 @@ impl App {
         {
             return false;
         }
-        self.fs_pan += delta;
+        self.set_fs_pan_from_input(self.fs_zoom, self.fs_pan + delta);
         true
     }
 }
@@ -3834,7 +4502,6 @@ fn resolve_spread_zip_zoom(
     fit_scale: f32,
     factor: f32,
     active: bool,
-    forced_total_scale: Option<f32>,
 ) -> SpreadZipZoomResult {
     let gap_page = spread_gap / fit_scale.max(f32::EPSILON);
     let composite = egui::vec2(fit_size.x + gap_page, fit_size.y);
@@ -3847,21 +4514,14 @@ fn resolve_spread_zip_zoom(
     };
     let factor = factor.clamp(factor_min, 16.0);
     let cursor_comp = zip_cursor_image_px(pan_band, egui::Vec2::ZERO, composite, cursor);
-    let (zoom, pan, vis, center_comp) = match forced_total_scale {
-        Some(total_scale) => {
-            let (pan, vis, center) =
-                zip_spread_pan_for_total(image_rect.size(), composite, total_scale, cursor_comp);
-            (total_scale / fit_scale.max(f32::EPSILON), pan, vis, center)
-        }
-        None => zip_spread_zoom_pan(
-            image_rect.size(),
-            composite,
-            single_page_w,
-            factor,
-            fit_scale,
-            cursor_comp,
-        ),
-    };
+    let (zoom, pan, vis, center_comp) = zip_spread_zoom_pan(
+        image_rect.size(),
+        composite,
+        single_page_w,
+        factor,
+        fit_scale,
+        cursor_comp,
+    );
     if active {
         SpreadZipZoomResult {
             zoom_pan: Some((zoom, pan)),
@@ -5227,10 +5887,27 @@ impl App {
                     rotated_display_size(resource.size_vec2(), self.get_rotation(page.idx));
                 let logical_scale = (page.rect.width() / rotated_size.x.max(1.0))
                     .min(page.rect.height() / rotated_size.y.max(1.0));
+                let transform = DisplayedImageTransform::from_resolved_rect(
+                    DisplayedImageTransformInput {
+                        page_idx: page.idx,
+                        viewport_rect: full_rect,
+                        source_size: resource.size_vec2(),
+                        texture_size: resource.size_vec2(),
+                        rotation: self.get_rotation(page.idx),
+                        free_rotation_rad: 0.0,
+                        content_bbox: None,
+                        fit_mode: FullscreenFitMode::Page,
+                        fit_scale_limits: FullscreenFitScaleLimits::default(),
+                        pixels_per_point,
+                        placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                    },
+                    page.rect,
+                )?;
                 let texture = self.prepare_fullscreen_paint_resource(
                     &resource,
                     logical_scale,
                     pixels_per_point,
+                    transform.visible_source_uv_rect(full_rect),
                 );
                 let rect_norm = Self::normalize_rect_to_full_rect(page.rect, full_rect);
                 let uv_rect = Self::full_uv_rect();
@@ -5376,20 +6053,25 @@ impl App {
             self.settings.spread_page_gap_px.min(200) as f32,
             pixels_per_point,
         );
-        let matched_geometry =
-            spread_layout_geometry(left_size, right_size, left_bbox, right_bbox, true);
         let fit_mode = self.effective_fullscreen_fit_mode();
+        let geometry = spread_layout_geometry(
+            left_size,
+            right_size,
+            left_bbox,
+            right_bbox,
+            spread_should_match_page_heights(fit_mode),
+        );
         let fit_scale_limits = self.fullscreen_fit_scale_limits(pixels_per_point);
         let zoom_pan = self.fs_zoom_pan();
         let page_fit = || {
-            ((image_rect.width() - spread_gap).max(1.0) / matched_geometry.fit_size.x)
-                .min(image_rect.height() / matched_geometry.fit_size.y)
+            ((image_rect.width() - spread_gap).max(1.0) / geometry.fit_size.x)
+                .min(image_rect.height() / geometry.fit_size.y)
         };
         let fit_scale = match fit_mode {
             FullscreenFitMode::Width => {
-                (image_rect.width() - spread_gap).max(1.0) / matched_geometry.fit_size.x
+                (image_rect.width() - spread_gap).max(1.0) / geometry.fit_size.x
             }
-            FullscreenFitMode::Height => image_rect.height() / matched_geometry.fit_size.y,
+            FullscreenFitMode::Height => image_rect.height() / geometry.fit_size.y,
             FullscreenFitMode::Original => physical_pixel_scale(pixels_per_point),
             _ => page_fit(),
         };
@@ -5397,11 +6079,6 @@ impl App {
         let (total_scale, base_center) = match zoom_pan {
             Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
             None => (fit_scale, image_rect.center()),
-        };
-        let geometry = if physical_scale_is_near_integer(total_scale, pixels_per_point) {
-            spread_layout_geometry(left_size, right_size, left_bbox, right_bbox, false)
-        } else {
-            matched_geometry
         };
         let center = base_center - geometry.content_center_offset * total_scale;
         let rects = layout_spread_page_rects(
@@ -5414,26 +6091,60 @@ impl App {
             right_bbox,
             content_active,
         );
+        let left_clip_rect = Self::spread_page_horizontal_visible_clip(rects.left_rect, left_bbox)
+            .intersect(image_rect);
+        let right_clip_rect =
+            Self::spread_page_horizontal_visible_clip(rects.right_rect, right_bbox)
+                .intersect(image_rect);
+        let left_transform = DisplayedImageTransform::from_resolved_rect(
+            DisplayedImageTransformInput {
+                page_idx: left,
+                viewport_rect: image_rect,
+                source_size: left_texture.size_vec2(),
+                texture_size: left_texture.size_vec2(),
+                rotation: left_rot,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            },
+            rects.left_rect,
+        );
+        let right_transform = DisplayedImageTransform::from_resolved_rect(
+            DisplayedImageTransformInput {
+                page_idx: right,
+                viewport_rect: image_rect,
+                source_size: right_texture.size_vec2(),
+                texture_size: right_texture.size_vec2(),
+                rotation: right_rot,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            },
+            rects.right_rect,
+        );
         let left_resource = self.fullscreen_paint_resource_for_texture(left, left_texture);
         let left_texture = self.prepare_fullscreen_paint_resource(
             &left_resource,
             total_scale * geometry.left.scale_factor,
             pixels_per_point,
+            left_transform.and_then(|transform| transform.visible_source_uv_rect(left_clip_rect)),
         );
         let right_resource = self.fullscreen_paint_resource_for_texture(right, right_texture);
         let right_texture = self.prepare_fullscreen_paint_resource(
             &right_resource,
             total_scale * geometry.right.scale_factor,
             pixels_per_point,
+            right_transform.and_then(|transform| transform.visible_source_uv_rect(right_clip_rect)),
         );
         let background = self.detached_frozen_background_for_snapshot(ctx);
         let left_rect_norm = Self::normalize_rect_to_full_rect(rects.left_rect, full_rect);
         let right_rect_norm = Self::normalize_rect_to_full_rect(rects.right_rect, full_rect);
-        let left_clip_rect = Self::spread_page_horizontal_visible_clip(rects.left_rect, left_bbox)
-            .intersect(image_rect);
-        let right_clip_rect =
-            Self::spread_page_horizontal_visible_clip(rects.right_rect, right_bbox)
-                .intersect(image_rect);
         let left_clip_rect_norm = Self::normalize_rect_to_full_rect(left_clip_rect, full_rect);
         let right_clip_rect_norm = Self::normalize_rect_to_full_rect(right_clip_rect, full_rect);
         let left_uv_rect = Self::full_uv_rect();
@@ -5546,10 +6257,34 @@ impl App {
         );
         if window.rotation.is_none() && window.free_rotation.abs() <= TRANSFORM_EPSILON {
             paint_transparent_bg(&painter, paint_rect, &bg_style);
-            painter.image(
+            if let Some(source_uv_rect) = window.texture.visible_source_uv_rect() {
+                crate::displayed_image_transform::paint_source_region_texture(
+                    &painter,
+                    window.texture.id(),
+                    image_rect,
+                    window.rotation,
+                    window.free_rotation,
+                    source_uv_rect,
+                    Self::full_uv_rect(),
+                    egui::Color32::WHITE,
+                );
+            } else {
+                painter.image(
+                    window.texture.id(),
+                    paint_rect,
+                    uv_rect,
+                    egui::Color32::WHITE,
+                );
+            }
+        } else if let Some(source_uv_rect) = window.texture.visible_source_uv_rect() {
+            crate::displayed_image_transform::paint_source_region_texture(
+                &painter,
                 window.texture.id(),
-                paint_rect,
-                uv_rect,
+                image_rect,
+                window.rotation,
+                window.free_rotation,
+                source_uv_rect,
+                Self::full_uv_rect(),
                 egui::Color32::WHITE,
             );
         } else {
@@ -5579,10 +6314,34 @@ impl App {
                 let bg_style = Self::detached_frozen_background_style(&page.background);
                 if page.rotation.is_none() {
                     paint_transparent_bg(&painter, paint_rect, &bg_style);
-                    painter.image(
+                    if let Some(source_uv_rect) = page.texture.visible_source_uv_rect() {
+                        crate::displayed_image_transform::paint_source_region_texture(
+                            &painter,
+                            page.texture.id(),
+                            paint_rect,
+                            page.rotation,
+                            0.0,
+                            source_uv_rect,
+                            Self::full_uv_rect(),
+                            egui::Color32::WHITE,
+                        );
+                    } else {
+                        painter.image(
+                            page.texture.id(),
+                            paint_rect,
+                            page.uv_rect,
+                            egui::Color32::WHITE,
+                        );
+                    }
+                } else if let Some(source_uv_rect) = page.texture.visible_source_uv_rect() {
+                    crate::displayed_image_transform::paint_source_region_texture(
+                        &painter,
                         page.texture.id(),
                         paint_rect,
-                        page.uv_rect,
+                        page.rotation,
+                        0.0,
+                        source_uv_rect,
+                        Self::full_uv_rect(),
                         egui::Color32::WHITE,
                     );
                 } else {
@@ -7342,10 +8101,11 @@ impl App {
             egui::pos2(full_rect.left(), full_rect.bottom() - SEEK_HOVER_HEIGHT),
             full_rect.right_bottom(),
         );
+        let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
         let bottom_hover = ctx.input(|i| {
-            i.pointer
-                .hover_pos()
-                .is_some_and(|pos| bottom_band.contains(pos))
+            i.pointer.hover_pos().is_some_and(|pos| {
+                bottom_band.contains(pos) && fullscreen_edge_hover_allowed(pos, navigator_exclusion)
+            })
         });
         // 可視判定 (O(1)) を info 構築より先に行う: 非表示フレームで全 items の
         // filter+collect を毎フレーム回さない (10k ページ級アーカイブの hot path)。
@@ -7913,6 +8673,7 @@ impl App {
                                 resource,
                                 scale,
                                 vp_ctx.pixels_per_point(),
+                                Some(Self::full_uv_rect()),
                             );
                             ui.painter().image(
                                 paint_resource.paint_texture_id(),
@@ -9403,6 +10164,10 @@ impl App {
                             );
                         }
 
+                        // Keep the fixed overview above transient display-unit holdovers. The
+                        // navigator stays absent until the target frame has a resolved page layout.
+                        self.draw_fs_navigator(ui, ctx, image_rect, fs_idx);
+
                         // 透過背景 (Shift+B) の変更通知は共通トーストが担う。同じ文言・同じ
                         // 表示時間の専用インジケータを並べると右上で重なるため持たない。
                         self.draw_original_preview_indicator(
@@ -9702,11 +10467,19 @@ impl App {
                             let mut bar_analysis_pressed = false;
                             let mut side_panel_mode_pressed = false;
                             let mut top_bar_lock_pressed = false;
+                            let navigator_exclusion =
+                                self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
                             let hover_in_top = ctx.input(|i| {
                                 !self.cursor_hidden
                                     && i.pointer
                                         .hover_pos()
-                                        .is_some_and(|p| p.y < TOP_BAR_HOVER_Y)
+                                        .is_some_and(|p| {
+                                            p.y < TOP_BAR_HOVER_Y
+                                                && fullscreen_edge_hover_allowed(
+                                                    p,
+                                                    navigator_exclusion,
+                                                )
+                                        })
                             });
                             let top_bar_visible = still_top_bar_visible_from_inputs(
                                 StillTopBarVisibilityInputs {
@@ -9797,6 +10570,7 @@ impl App {
                                 self.settings.fullscreen_top_bar_locked,
                                 &mut top_bar_lock_pressed,
                                 self.cursor_hidden,
+                                navigator_exclusion,
                             );
                             if top_bar_lock_pressed {
                                 self.settings.fullscreen_top_bar_locked =
@@ -11491,9 +12265,12 @@ impl App {
             let h = pixels.size[1] as u32;
             let limit = self.settings.ai_upscale_limit();
             if !crate::ai::upscale::should_process_rect(w, h, limit) {
-                toast.push_str(&format!(
-                    "\n(解像度が高いためアップスケール処理無効: {w}×{h} は上限 {} 未満の範囲外)",
-                    limit.label()
+                toast.push('\n');
+                toast.push_str(&crate::ui_helpers::processing_size_disabled_toast_line(
+                    "アップスケール",
+                    w,
+                    h,
+                    &format!("{} 未満", limit.label()),
                 ));
             }
         }
@@ -11504,29 +12281,62 @@ impl App {
         });
     }
 
+    pub(crate) fn anime_upscale_limit_warning(
+        &self,
+        fs_idx: usize,
+        pixels_per_point: f32,
+    ) -> Option<([u32; 2], u32)> {
+        let limit = self.settings.anime_upscale_source_limit.max_long_edge()?;
+        let transform = self.fullscreen_page_layout.page_by_idx(fs_idx)?.transform;
+        if crate::gpu_lanczos::fullscreen_paint_scale_branch(
+            transform.total_scale,
+            pixels_per_point,
+            PostFilter::UpscaleAnime,
+        ) != crate::gpu_lanczos::FullscreenPaintScaleBranch::UpscaleAnime
+        {
+            return None;
+        }
+        let visible = transform.visible_source_uv_rect(transform.viewport_rect)?;
+        let source_size = [
+            transform.texture_size.x.round().max(1.0) as u32,
+            transform.texture_size.y.round().max(1.0) as u32,
+        ];
+        let size = crate::gpu_lanczos::anime_source_region_dimensions(source_size, visible)?;
+        (size[0].max(size[1]) > limit).then_some((size, limit))
+    }
+
     fn apply_fullscreen_post_filter_selection(
         &mut self,
         fs_idx: usize,
         next: PostFilter,
         shortcut_label: &'static str,
+        pixels_per_point: f32,
     ) {
         let scope = self.resolve_adjust_scope(fs_idx);
         let old_params = self.effective_params(fs_idx).clone();
-        if old_params.post_filter == next {
-            self.show_feedback_toast(format!(
-                "[{shortcut_label}: {} / {}]",
-                scope.label(),
-                next.display_label()
+        let mut toast = format!(
+            "[{shortcut_label}: {} / {}]",
+            scope.label(),
+            next.display_label()
+        );
+        if next == PostFilter::UpscaleAnime
+            && let Some((size, limit)) = self.anime_upscale_limit_warning(fs_idx, pixels_per_point)
+        {
+            toast.push('\n');
+            toast.push_str(&crate::ui_helpers::processing_size_disabled_toast_line(
+                "アニメ塗り拡大",
+                size[0],
+                size[1],
+                &format!("長辺 {limit}px 以下"),
             ));
+        }
+        if old_params.post_filter == next {
+            self.show_feedback_toast(toast);
             return;
         }
         let mut params = old_params.clone();
         params.post_filter = next;
-        self.show_feedback_toast(format!(
-            "[{shortcut_label}: {} / {}]",
-            scope.label(),
-            next.display_label()
-        ));
+        self.show_feedback_toast(toast);
         self.capture_adjust_full(
             format!("ポストフィルタ: {}", next.display_label()),
             |app| {
@@ -12487,6 +13297,11 @@ impl App {
         // ここで奪っても消しゴム中は届かない (= mode-scoped 共存)。
         let key_v_panorama_raw =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsPanorama);
+        let key_n_navigator = !is_video_fs
+            && !fs_music_view_active
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsNavigatorToggle);
         let key_g =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsPixelGrid);
         let key_m = !fs_music_view_active
@@ -13021,7 +13836,12 @@ impl App {
         if let Some(palette) = colorize_direct {
             self.apply_fullscreen_colorize_selection(fs_idx, palette, "カラー化");
         } else if let Some(filter) = post_filter_direct {
-            self.apply_fullscreen_post_filter_selection(fs_idx, filter, "PF");
+            self.apply_fullscreen_post_filter_selection(
+                fs_idx,
+                filter,
+                "PF",
+                ctx.pixels_per_point(),
+            );
         } else if key_t || key_t_shift || key_t_alt {
             let all = PostFilter::ALL;
             let cur = all
@@ -13036,7 +13856,7 @@ impl App {
                 (cur + 1) % all.len()
             };
             let next = all[next_idx];
-            self.apply_fullscreen_post_filter_selection(fs_idx, next, "T");
+            self.apply_fullscreen_post_filter_selection(fs_idx, next, "T", ctx.pixels_per_point());
         }
 
         // Ctrl+数字キー: 保存スロットを現在ページに適用 (= ページ個別化)
@@ -13140,6 +13960,19 @@ impl App {
         // V を押しても no-op (= 一般的なキーマップ慣例)。
         if key_v_panorama && !is_spread_double && self.detect_panorama(fs_idx).is_some() {
             self.toggle_panorama_mode(fs_idx);
+        }
+        if key_n_navigator {
+            self.settings.fullscreen_navigator_visible =
+                !self.settings.fullscreen_navigator_visible;
+            self.settings.save();
+            // The navigator and loupe intentionally coexist: the former is a fixed overview,
+            // while the latter is a cursor-local inspection tool. The selected navigator corner
+            // gives users a stable way to keep the two overlays apart.
+            self.show_feedback_toast(if self.settings.fullscreen_navigator_visible {
+                "[ナビゲータ ON（拡大中に表示）]".to_string()
+            } else {
+                "[ナビゲータ OFF]".to_string()
+            });
         }
         if key_z && !is_spread_double {
             if !self.analysis_mode && self.adjustment_mode {
@@ -13614,6 +14447,1031 @@ impl App {
     }
 
     /// ホイールとクリックを処理し、(page_nav, close) を返す。
+    fn fs_navigator_allowed(&self, ctx: &egui::Context, fs_idx: usize) -> bool {
+        let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
+        let hold_active = self
+            .keymap
+            .modifier_held_action(ctx, KeyAction::FsNavigatorHold);
+        let interaction_active = fs_navigator_interaction_active(ctx);
+        // 「修飾キーを押している間」と「ナビゲータを掴んでいる間」は別の状態。
+        // ドラッグ中は後者を優先し、Alt を離しても操作を最後まで継続させる。
+        fs_navigator_visibility_requested(
+            self.settings.fullscreen_navigator_visible,
+            hold_active,
+            focused,
+            interaction_active,
+        ) && !self.analysis_mode
+            && !self.adjustment_mode
+            && !self.is_overlay_edit_mode_active()
+            && !self.view_trim_mode
+            && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
+            && self.capture_region_selection.is_none()
+            && matches!(
+                self.items.get(fs_idx),
+                Some(GridItem::Image(_))
+                    | Some(GridItem::ZipImage { .. })
+                    | Some(GridItem::PdfPage { .. })
+            )
+    }
+
+    fn fs_navigator_layout(&self, image_rect: egui::Rect) -> Option<FlatNavigatorLayout> {
+        build_flat_navigator_layout(
+            &self.fullscreen_page_layout,
+            image_rect,
+            image_rect,
+            self.settings.fullscreen_navigator_size,
+            self.settings.fullscreen_navigator_corner,
+        )
+    }
+
+    pub(crate) fn fullscreen_navigator_edge_exclusion(
+        &self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+    ) -> Option<egui::Rect> {
+        let fs_idx = self.fullscreen_idx?;
+        if !self.fs_navigator_allowed(ctx, fs_idx) {
+            return None;
+        }
+        let image_rect = self.fullscreen_media_rect(full_rect, fs_idx, false);
+        let panel_rect = if self.is_panorama_mode_active(fs_idx) {
+            self.panorama_navigator_layout(image_rect, fs_idx)?
+                .panel_rect
+        } else {
+            self.fs_navigator_layout(image_rect)?.panel_rect
+        };
+        Some(fs_navigator_edge_exclusion_rect(
+            image_rect,
+            panel_rect,
+            self.settings.fullscreen_navigator_corner,
+        ))
+    }
+
+    fn panorama_navigator_layout(
+        &self,
+        image_rect: egui::Rect,
+        fs_idx: usize,
+    ) -> Option<PanoramaNavigatorLayout> {
+        let pano = self.panorama_state.as_ref()?;
+        let (source_w, source_h) = self.source_dims_for_idx(fs_idx)?;
+        build_panorama_navigator_layout(
+            egui::vec2(source_w, source_h),
+            image_rect,
+            image_rect,
+            self.settings.fullscreen_navigator_size,
+            self.settings.fullscreen_navigator_corner,
+            pano.yaw,
+            pano.pitch,
+            pano.fov_y,
+        )
+    }
+
+    fn fs_navigator_current_manual_zoom(
+        &self,
+        layout: &FlatNavigatorLayout,
+        image_rect: egui::Rect,
+    ) -> f32 {
+        if !self.fs_zoom_mode_engaged() {
+            return self.fs_zoom;
+        }
+        if let [page] = layout.pages.as_slice() {
+            let main = page.main;
+            let base = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+                page_idx: main.page_idx,
+                viewport_rect: main.viewport_rect,
+                source_size: main.source_size,
+                texture_size: main.texture_size,
+                rotation: main.rotation,
+                free_rotation_rad: main.free_rotation_rad,
+                content_bbox: main.content_bbox,
+                fit_mode: main.fit_mode,
+                fit_scale_limits: main.fit_scale_limits,
+                pixels_per_point: main.fit_scale_limits.pixels_per_point,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            });
+            return base
+                .map(|base| main.total_scale / base.total_scale.max(f32::EPSILON))
+                .unwrap_or(self.fs_zoom_factor)
+                .clamp(ZOOM_MIN, ZOOM_MAX);
+        }
+        // The spread fit scale is not stored on the resolved transform, so it has to be derived
+        // the same way the spread layout derives it. Keep this in step with `draw_fs_spread`
+        // (and the frozen-snapshot copy in `detached_spread_frozen_pages_for_snapshot`): the
+        // height-matching predicate is already shared through
+        // `spread_should_match_page_heights`, but the fit scale match is not, and a divergence
+        // here would silently report the wrong manual zoom when leaving Z mode on a spread.
+        if let [left, right] = layout.pages.as_slice() {
+            let full_bbox = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+            let left_bbox = left.main.content_bbox.unwrap_or(full_bbox);
+            let right_bbox = right.main.content_bbox.unwrap_or(full_bbox);
+            let left_size = rotated_display_size(left.main.texture_size, left.main.rotation);
+            let right_size = rotated_display_size(right.main.texture_size, right.main.rotation);
+            let fit_mode = self.effective_fullscreen_fit_mode();
+            let geometry = spread_layout_geometry(
+                left_size,
+                right_size,
+                left_bbox,
+                right_bbox,
+                spread_should_match_page_heights(fit_mode),
+            );
+            let pixels_per_point = left.main.fit_scale_limits.pixels_per_point;
+            let spread_gap = quantize_points_to_physical_pixels(
+                self.settings.spread_page_gap_px.min(200) as f32,
+                pixels_per_point,
+            );
+            let page_fit = || {
+                ((image_rect.width() - spread_gap).max(1.0) / geometry.fit_size.x)
+                    .min(image_rect.height() / geometry.fit_size.y)
+            };
+            let fit_scale = match fit_mode {
+                FullscreenFitMode::Width => {
+                    (image_rect.width() - spread_gap).max(1.0) / geometry.fit_size.x
+                }
+                FullscreenFitMode::Height => image_rect.height() / geometry.fit_size.y,
+                FullscreenFitMode::Original => physical_pixel_scale(pixels_per_point),
+                _ => page_fit(),
+            };
+            let fit_scale = self
+                .fullscreen_fit_scale_limits(pixels_per_point)
+                .apply(fit_scale);
+            return (left.main.total_scale / fit_scale.max(f32::EPSILON)).clamp(ZOOM_MIN, ZOOM_MAX);
+        }
+        self.fs_zoom_factor.clamp(ZOOM_MIN, ZOOM_MAX)
+    }
+
+    fn fs_navigator_adopt_manual_zoom(
+        &mut self,
+        layout: &FlatNavigatorLayout,
+        image_rect: egui::Rect,
+    ) -> bool {
+        if !self.fs_zoom_mode_engaged() {
+            return false;
+        }
+        self.fs_zoom = self.fs_navigator_current_manual_zoom(layout, image_rect);
+        self.fs_zoom_reset();
+        self.set_fs_pan_from_input(self.fs_zoom, egui::Vec2::ZERO);
+        true
+    }
+
+    fn handle_panorama_navigator_input(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        fs_idx: usize,
+    ) -> bool {
+        let Some(layout) = self.panorama_navigator_layout(image_rect, fs_idx) else {
+            ctx.data_mut(|data| {
+                data.remove_temp::<PanoramaNavigatorInteraction>(
+                    panorama_navigator_interaction_id(),
+                )
+            });
+            return false;
+        };
+        let interaction = ctx.data(|data| {
+            data.get_temp::<PanoramaNavigatorInteraction>(panorama_navigator_interaction_id())
+        });
+        let pointer_pos = ctx.input(|input| input.pointer.interact_pos());
+        let drag_active = matches!(
+            interaction,
+            Some(
+                PanoramaNavigatorInteraction::Select { .. }
+                    | PanoramaNavigatorInteraction::Pan { .. }
+            )
+        );
+        if !drag_active && !pointer_pos.is_some_and(|pos| layout.panel_rect.contains(pos)) {
+            return false;
+        }
+
+        let wheel_y = ctx.input(|input| input.raw_scroll_delta.y);
+        if wheel_y.abs() > 0.5 && pointer_pos.is_some_and(|pos| layout.panel_rect.contains(pos)) {
+            let old_size = self.settings.fullscreen_navigator_size;
+            self.settings.fullscreen_navigator_size = (old_size
+                + wheel_y.signum() * FS_NAVIGATOR_WHEEL_STEP)
+                .clamp(FULLSCREEN_NAVIGATOR_SIZE_MIN, FULLSCREEN_NAVIGATOR_SIZE_MAX);
+            if self.settings.fullscreen_navigator_size != old_size {
+                self.settings.save();
+                ctx.request_repaint();
+            }
+            ctx.input_mut(|input| {
+                input.raw_scroll_delta = egui::Vec2::ZERO;
+                input.smooth_scroll_delta = egui::Vec2::ZERO;
+                input
+                    .events
+                    .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
+            });
+        }
+
+        for (index, &corner) in FullscreenNavigatorCorner::ALL.iter().enumerate() {
+            let rect = fs_navigator_corner_button_rect(layout.header_rect, index);
+            let tooltip = match corner {
+                FullscreenNavigatorCorner::TopLeft => "左上に移動",
+                FullscreenNavigatorCorner::TopRight => "右上に移動",
+                FullscreenNavigatorCorner::BottomLeft => "左下に移動",
+                FullscreenNavigatorCorner::BottomRight => "右下に移動",
+                FullscreenNavigatorCorner::Unknown => unreachable!("known navigator corner"),
+            };
+            if ui
+                .interact(
+                    rect,
+                    egui::Id::new("panorama_navigator_corner").with(index),
+                    egui::Sense::click(),
+                )
+                .on_hover_text(tooltip)
+                .clicked()
+            {
+                self.settings.fullscreen_navigator_corner = corner;
+                self.settings.save();
+                ctx.request_repaint();
+                return true;
+            }
+        }
+
+        let response = ui
+            .interact(
+                layout.canvas_rect,
+                egui::Id::new("panorama_navigator_canvas"),
+                egui::Sense::click_and_drag(),
+            )
+            .on_hover_text(
+                "左ドラッグ: 範囲を拡大 / 右ドラッグ: 表示位置を移動 / ダブルクリック: 中央へ移動 / ホイール: サイズ変更",
+            );
+        let clamp_to_canvas = |pos: egui::Pos2| {
+            egui::pos2(
+                pos.x
+                    .clamp(layout.canvas_rect.left(), layout.canvas_rect.right()),
+                pos.y
+                    .clamp(layout.canvas_rect.top(), layout.canvas_rect.bottom()),
+            )
+        };
+        let pointer_pos = pointer_pos.map(clamp_to_canvas);
+        let (
+            primary_pressed,
+            primary_down,
+            primary_released,
+            secondary_pressed,
+            secondary_down,
+            secondary_released,
+        ) = ctx.input(|input| {
+            (
+                input.pointer.button_pressed(egui::PointerButton::Primary),
+                input.pointer.button_down(egui::PointerButton::Primary),
+                input.pointer.button_released(egui::PointerButton::Primary),
+                input.pointer.button_pressed(egui::PointerButton::Secondary),
+                input.pointer.button_down(egui::PointerButton::Secondary),
+                input
+                    .pointer
+                    .button_released(egui::PointerButton::Secondary),
+            )
+        });
+
+        if response.double_clicked()
+            && let Some(pos) = pointer_pos
+        {
+            let uv = panorama_navigator_screen_to_uv(layout.content_rect, pos);
+            let (yaw, pitch) = panorama_navigator_uv_to_yaw_pitch(uv);
+            if let Some(pano) = self.panorama_state.as_mut() {
+                pano.yaw = yaw;
+                pano.pitch = pitch;
+                pano.sanitize();
+            }
+            ctx.data_mut(|data| {
+                data.remove_temp::<PanoramaNavigatorInteraction>(
+                    panorama_navigator_interaction_id(),
+                )
+            });
+            ctx.request_repaint();
+            return true;
+        }
+
+        if primary_pressed
+            && let Some(pos) = pointer_pos
+            && layout.canvas_rect.contains(pos)
+        {
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    panorama_navigator_interaction_id(),
+                    PanoramaNavigatorInteraction::Select {
+                        start: pos,
+                        current: pos,
+                    },
+                )
+            });
+        } else if primary_down
+            && let Some(pos) = pointer_pos
+            && let Some(PanoramaNavigatorInteraction::Select { start, .. }) = interaction
+        {
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    panorama_navigator_interaction_id(),
+                    PanoramaNavigatorInteraction::Select {
+                        start,
+                        current: pos,
+                    },
+                )
+            });
+            ctx.request_repaint();
+        }
+
+        if primary_released
+            && let Some(PanoramaNavigatorInteraction::Select { start, current }) = interaction
+        {
+            let selection = egui::Rect::from_two_pos(start, current).intersect(layout.content_rect);
+            if selection.width() >= FS_NAVIGATOR_MIN_SELECTION
+                && selection.height() >= FS_NAVIGATOR_MIN_SELECTION
+            {
+                let uv = panorama_navigator_screen_to_uv(layout.content_rect, selection.center());
+                let (yaw, pitch) = panorama_navigator_uv_to_yaw_pitch(uv);
+                let fov_y = panorama_navigator_fov_from_height(
+                    selection.height(),
+                    layout.content_rect.height(),
+                );
+                if let Some(pano) = self.panorama_state.as_mut() {
+                    pano.yaw = yaw;
+                    pano.pitch = pitch;
+                    pano.fov_y = fov_y;
+                    pano.sanitize();
+                }
+                ctx.request_repaint();
+            }
+            ctx.data_mut(|data| {
+                data.remove_temp::<PanoramaNavigatorInteraction>(
+                    panorama_navigator_interaction_id(),
+                )
+            });
+        }
+
+        if secondary_pressed
+            && let Some(pos) = pointer_pos
+            && layout.canvas_rect.contains(pos)
+            && let Some(pano) = self.panorama_state.as_ref()
+        {
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    panorama_navigator_interaction_id(),
+                    PanoramaNavigatorInteraction::Pan {
+                        start_uv: panorama_navigator_screen_to_uv(layout.content_rect, pos),
+                        start_yaw: pano.yaw,
+                        start_pitch: pano.pitch,
+                    },
+                )
+            });
+        } else if secondary_down
+            && let Some(pos) = pointer_pos
+            && let Some(PanoramaNavigatorInteraction::Pan {
+                start_uv,
+                start_yaw,
+                start_pitch,
+            }) = interaction
+        {
+            let current_uv = panorama_navigator_screen_to_uv(layout.content_rect, pos);
+            let delta_uv = current_uv - start_uv;
+            if let Some(pano) = self.panorama_state.as_mut() {
+                pano.yaw =
+                    panorama_navigator_wrap_yaw(start_yaw - delta_uv.x * std::f32::consts::TAU);
+                pano.pitch = (start_pitch - delta_uv.y * std::f32::consts::PI)
+                    .clamp(-crate::panorama::PITCH_LIMIT, crate::panorama::PITCH_LIMIT);
+                pano.sanitize();
+            }
+            ctx.request_repaint();
+        }
+        if secondary_released
+            && matches!(interaction, Some(PanoramaNavigatorInteraction::Pan { .. }))
+        {
+            ctx.data_mut(|data| {
+                data.remove_temp::<PanoramaNavigatorInteraction>(
+                    panorama_navigator_interaction_id(),
+                )
+            });
+        }
+
+        true
+    }
+
+    fn handle_fs_navigator_input(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        fs_idx: usize,
+    ) -> bool {
+        if !self.fs_navigator_allowed(ctx, fs_idx) {
+            ctx.data_mut(|data| {
+                data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id());
+                data.remove_temp::<PanoramaNavigatorInteraction>(
+                    panorama_navigator_interaction_id(),
+                );
+            });
+            return false;
+        }
+        if self.is_panorama_mode_active(fs_idx) {
+            ctx.data_mut(|data| {
+                data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
+            });
+            return self.handle_panorama_navigator_input(ui, ctx, image_rect, fs_idx);
+        }
+        ctx.data_mut(|data| {
+            data.remove_temp::<PanoramaNavigatorInteraction>(panorama_navigator_interaction_id())
+        });
+        let Some(layout) = self.fs_navigator_layout(image_rect) else {
+            ctx.data_mut(|data| {
+                data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
+            });
+            return false;
+        };
+        let interaction =
+            ctx.data(|data| data.get_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id()));
+        let pointer_pos = ctx.input(|input| input.pointer.interact_pos());
+        let drag_active = matches!(
+            interaction,
+            Some(
+                FsNavigatorInteraction::Select { .. }
+                    | FsNavigatorInteraction::Pan { .. }
+                    | FsNavigatorInteraction::PendingPanTransition { .. }
+            )
+        );
+        if !drag_active && !pointer_pos.is_some_and(|pos| layout.panel_rect.contains(pos)) {
+            return false;
+        }
+
+        let wheel_y = ctx.input(|input| input.raw_scroll_delta.y);
+        if wheel_y.abs() > 0.5 && pointer_pos.is_some_and(|pos| layout.panel_rect.contains(pos)) {
+            let old_size = self.settings.fullscreen_navigator_size;
+            self.settings.fullscreen_navigator_size = (old_size
+                + wheel_y.signum() * FS_NAVIGATOR_WHEEL_STEP)
+                .clamp(FULLSCREEN_NAVIGATOR_SIZE_MIN, FULLSCREEN_NAVIGATOR_SIZE_MAX);
+            if self.settings.fullscreen_navigator_size != old_size {
+                self.settings.save();
+                ctx.request_repaint();
+            }
+            ctx.input_mut(|input| {
+                input.raw_scroll_delta = egui::Vec2::ZERO;
+                input.smooth_scroll_delta = egui::Vec2::ZERO;
+                input
+                    .events
+                    .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
+            });
+        }
+
+        for (index, &corner) in FullscreenNavigatorCorner::ALL.iter().enumerate() {
+            let rect = fs_navigator_corner_button_rect(layout.header_rect, index);
+            let tooltip = match corner {
+                FullscreenNavigatorCorner::TopLeft => "左上に移動",
+                FullscreenNavigatorCorner::TopRight => "右上に移動",
+                FullscreenNavigatorCorner::BottomLeft => "左下に移動",
+                FullscreenNavigatorCorner::BottomRight => "右下に移動",
+                FullscreenNavigatorCorner::Unknown => unreachable!("known navigator corner"),
+            };
+            if ui
+                .interact(
+                    rect,
+                    egui::Id::new("fs_navigator_corner").with(index),
+                    egui::Sense::click(),
+                )
+                .on_hover_text(tooltip)
+                .clicked()
+            {
+                self.settings.fullscreen_navigator_corner = corner;
+                self.settings.save();
+                ctx.request_repaint();
+                return true;
+            }
+        }
+
+        let response = ui
+            .interact(
+                layout.canvas_rect,
+                egui::Id::new("fs_navigator_canvas"),
+                egui::Sense::click_and_drag(),
+            )
+            .on_hover_text(
+                "左ドラッグ: 範囲を拡大 / 右ドラッグ: 表示位置を移動 / ダブルクリック: 中央へ移動 / ホイール: サイズ変更",
+            );
+        let clamp_to_canvas = |pos: egui::Pos2| {
+            egui::pos2(
+                pos.x
+                    .clamp(layout.canvas_rect.left(), layout.canvas_rect.right()),
+                pos.y
+                    .clamp(layout.canvas_rect.top(), layout.canvas_rect.bottom()),
+            )
+        };
+        let pointer_pos = pointer_pos.map(clamp_to_canvas);
+        let (
+            primary_pressed,
+            primary_down,
+            primary_released,
+            secondary_pressed,
+            secondary_down,
+            secondary_released,
+        ) = ctx.input(|input| {
+            (
+                input.pointer.button_pressed(egui::PointerButton::Primary),
+                input.pointer.button_down(egui::PointerButton::Primary),
+                input.pointer.button_released(egui::PointerButton::Primary),
+                input.pointer.button_pressed(egui::PointerButton::Secondary),
+                input.pointer.button_down(egui::PointerButton::Secondary),
+                input
+                    .pointer
+                    .button_released(egui::PointerButton::Secondary),
+            )
+        });
+
+        if response.double_clicked()
+            && let Some(pos) = pointer_pos
+            && let Some((page, source_pos)) = layout.nearest_page_at(pos)
+        {
+            let source_uv = page.navigator.screen_to_source_normalized(source_pos);
+            let transitioned = self.fs_navigator_adopt_manual_zoom(&layout, image_rect);
+            let proposed_pan = page
+                .main
+                .pan_to_center_source_normalized(source_uv, self.fs_pan);
+            self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
+            if transitioned {
+                ctx.data_mut(|data| {
+                    data.insert_temp(
+                        fs_navigator_interaction_id(),
+                        FsNavigatorInteraction::PendingCenter {
+                            page_idx: page.main.page_idx,
+                            source_uv,
+                        },
+                    )
+                });
+            } else {
+                ctx.data_mut(|data| {
+                    data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
+                });
+            }
+            ctx.request_repaint();
+            return true;
+        }
+
+        if primary_pressed
+            && let Some(pos) = pointer_pos
+            && layout.canvas_rect.contains(pos)
+        {
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    fs_navigator_interaction_id(),
+                    FsNavigatorInteraction::Select {
+                        start: pos,
+                        current: pos,
+                    },
+                )
+            });
+        } else if primary_down
+            && let Some(pos) = pointer_pos
+            && let Some(FsNavigatorInteraction::Select { start, .. }) = interaction
+        {
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    fs_navigator_interaction_id(),
+                    FsNavigatorInteraction::Select {
+                        start,
+                        current: pos,
+                    },
+                )
+            });
+            ctx.request_repaint();
+        }
+
+        if primary_released
+            && let Some(FsNavigatorInteraction::Select { start, current }) = interaction
+        {
+            let selection = egui::Rect::from_two_pos(start, current).intersect(layout.content_rect);
+            if selection.width() >= FS_NAVIGATOR_MIN_SELECTION
+                && selection.height() >= FS_NAVIGATOR_MIN_SELECTION
+                && let Some((page, source_pos)) = layout.nearest_page_at(selection.center())
+            {
+                let source_uv = page.navigator.screen_to_source_normalized(source_pos);
+                self.fs_navigator_adopt_manual_zoom(&layout, image_rect);
+                let old_zoom = self.fs_zoom.max(f32::EPSILON);
+                let selected_screen_size = selection.size() / layout.screen_scale;
+                let factor = (image_rect.width() / selected_screen_size.x.max(1.0))
+                    .min(image_rect.height() / selected_screen_size.y.max(1.0));
+                let new_zoom = (old_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+                let target_screen = page.main.source_normalized_to_screen(source_uv);
+                let proposed_pan = zoom_preserve_pivot(
+                    target_screen,
+                    image_rect.center(),
+                    self.fs_pan,
+                    old_zoom,
+                    new_zoom,
+                ) + (image_rect.center() - target_screen);
+                self.fs_zoom = new_zoom;
+                self.set_fs_pan_from_input(new_zoom, proposed_pan);
+                self.maybe_rerender_pdf(new_zoom);
+                ctx.data_mut(|data| {
+                    data.insert_temp(
+                        fs_navigator_interaction_id(),
+                        FsNavigatorInteraction::PendingCenter {
+                            page_idx: page.main.page_idx,
+                            source_uv,
+                        },
+                    )
+                });
+                ctx.request_repaint();
+            } else {
+                ctx.data_mut(|data| {
+                    data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
+                });
+            }
+        }
+
+        if secondary_pressed
+            && let Some(pos) = pointer_pos
+            && layout.canvas_rect.contains(pos)
+        {
+            if self.fs_zoom_mode_engaged() {
+                let current_view_pos = layout.visible_rect.center();
+                if let Some((page, source_pos)) = layout.nearest_page_at(current_view_pos) {
+                    let source_uv = page.navigator.screen_to_source_normalized(source_pos);
+                    self.fs_navigator_adopt_manual_zoom(&layout, image_rect);
+                    ctx.data_mut(|data| {
+                        data.insert_temp(
+                            fs_navigator_interaction_id(),
+                            FsNavigatorInteraction::PendingPanTransition {
+                                start: pos,
+                                page_idx: page.main.page_idx,
+                                source_uv,
+                            },
+                        )
+                    });
+                    ctx.request_repaint();
+                }
+            } else {
+                ctx.data_mut(|data| {
+                    data.insert_temp(
+                        fs_navigator_interaction_id(),
+                        FsNavigatorInteraction::Pan {
+                            start: pos,
+                            start_pan: self.fs_pan,
+                            screen_scale: layout.screen_scale,
+                        },
+                    )
+                });
+            }
+        } else if secondary_down
+            && let Some(pos) = pointer_pos
+            && let Some(FsNavigatorInteraction::Pan {
+                start,
+                start_pan,
+                screen_scale,
+            }) = interaction
+        {
+            let proposed_pan = start_pan - (pos - start) / screen_scale.max(f32::EPSILON);
+            self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
+            ctx.request_repaint();
+        }
+        if secondary_released
+            && matches!(
+                interaction,
+                Some(
+                    FsNavigatorInteraction::Pan { .. }
+                        | FsNavigatorInteraction::PendingPanTransition { .. }
+                )
+            )
+        {
+            ctx.data_mut(|data| {
+                data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
+            });
+        }
+
+        true
+    }
+
+    fn draw_panorama_navigator(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        fs_idx: usize,
+    ) {
+        let Some(layout) = self.panorama_navigator_layout(image_rect, fs_idx) else {
+            return;
+        };
+        let interaction = ctx.data(|data| {
+            data.get_temp::<PanoramaNavigatorInteraction>(panorama_navigator_interaction_id())
+        });
+
+        let painter = ui.painter();
+        painter.rect_filled(
+            layout.panel_rect,
+            5.0,
+            egui::Color32::from_rgba_unmultiplied(16, 18, 22, 232),
+        );
+        painter.rect_filled(
+            layout.header_rect,
+            5.0,
+            egui::Color32::from_rgba_unmultiplied(34, 38, 46, 245),
+        );
+        painter.text(
+            layout.header_rect.left_center() + egui::vec2(8.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            "ナビゲータ",
+            egui::FontId::proportional(12.0),
+            egui::Color32::WHITE,
+        );
+        for (index, &corner) in FullscreenNavigatorCorner::ALL.iter().enumerate() {
+            let button = fs_navigator_corner_button_rect(layout.header_rect, index);
+            let selected = corner == self.settings.fullscreen_navigator_corner.normalized();
+            painter.rect_filled(
+                button,
+                2.0,
+                if selected {
+                    egui::Color32::from_rgb(64, 112, 172)
+                } else {
+                    egui::Color32::from_gray(54)
+                },
+            );
+            painter.rect_stroke(
+                button,
+                2.0,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(142)),
+                egui::StrokeKind::Inside,
+            );
+            let marker_center = match corner {
+                FullscreenNavigatorCorner::TopLeft => button.left_top() + egui::vec2(4.0, 4.0),
+                FullscreenNavigatorCorner::TopRight => button.right_top() + egui::vec2(-4.0, 4.0),
+                FullscreenNavigatorCorner::BottomLeft => {
+                    button.left_bottom() + egui::vec2(4.0, -4.0)
+                }
+                FullscreenNavigatorCorner::BottomRight => {
+                    button.right_bottom() + egui::vec2(-4.0, -4.0)
+                }
+                FullscreenNavigatorCorner::Unknown => unreachable!("known navigator corner"),
+            };
+            painter.circle_filled(marker_center, 2.0, egui::Color32::WHITE);
+        }
+
+        let canvas_painter = painter.with_clip_rect(layout.canvas_rect);
+        canvas_painter.rect_filled(layout.canvas_rect, 0.0, egui::Color32::BLACK);
+        if let Some(ThumbnailState::Loaded { tex, .. }) = self.thumbnails.get(fs_idx) {
+            canvas_painter.image(
+                tex.id(),
+                layout.content_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            canvas_painter.rect_filled(layout.content_rect, 0.0, egui::Color32::from_gray(42));
+        }
+        canvas_painter.rect_stroke(
+            layout.content_rect,
+            0.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(96)),
+            egui::StrokeKind::Inside,
+        );
+        for segment in &layout.outline_segments {
+            canvas_painter.add(egui::Shape::line(
+                segment.clone(),
+                egui::Stroke::new(4.0, egui::Color32::from_black_alpha(220)),
+            ));
+        }
+        for segment in &layout.outline_segments {
+            canvas_painter.add(egui::Shape::line(
+                segment.clone(),
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 218, 76)),
+            ));
+        }
+        if let Some(PanoramaNavigatorInteraction::Select { start, current }) = interaction {
+            let selection = egui::Rect::from_two_pos(start, current).intersect(layout.content_rect);
+            canvas_painter.rect_filled(
+                selection,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(70, 135, 210, 54),
+            );
+            canvas_painter.rect_stroke(
+                selection,
+                0.0,
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(110, 184, 255)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        painter.rect_stroke(
+            layout.panel_rect,
+            5.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(126)),
+            egui::StrokeKind::Inside,
+        );
+
+        if ctx.input(|input| {
+            input
+                .pointer
+                .hover_pos()
+                .is_some_and(|pos| layout.canvas_rect.contains(pos))
+        }) {
+            let secondary_down = ctx.input(|input| input.pointer.secondary_down());
+            ctx.set_cursor_icon(if secondary_down {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Crosshair
+            });
+        }
+    }
+
+    fn draw_fs_navigator(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        fs_idx: usize,
+    ) {
+        if !self.fs_navigator_allowed(ctx, fs_idx) {
+            return;
+        }
+        if self.is_panorama_mode_active(fs_idx) {
+            self.draw_panorama_navigator(ui, ctx, image_rect, fs_idx);
+            return;
+        }
+        let Some(layout) = self.fs_navigator_layout(image_rect) else {
+            return;
+        };
+
+        let interaction =
+            ctx.data(|data| data.get_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id()));
+        match interaction {
+            Some(FsNavigatorInteraction::PendingCenter {
+                page_idx,
+                source_uv,
+            }) => {
+                if let Some(page) = layout
+                    .pages
+                    .iter()
+                    .find(|page| page.main.page_idx == page_idx)
+                {
+                    let proposed_pan = page
+                        .main
+                        .pan_to_center_source_normalized(source_uv, self.fs_pan);
+                    self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
+                    ctx.request_repaint();
+                }
+                ctx.data_mut(|data| {
+                    data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
+                });
+            }
+            Some(FsNavigatorInteraction::PendingPanTransition {
+                start,
+                page_idx,
+                source_uv,
+            }) => {
+                if let Some(page) = layout
+                    .pages
+                    .iter()
+                    .find(|page| page.main.page_idx == page_idx)
+                {
+                    let proposed_pan = page
+                        .main
+                        .pan_to_center_source_normalized(source_uv, self.fs_pan);
+                    self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
+                    if ctx.input(|input| input.pointer.secondary_down()) {
+                        ctx.data_mut(|data| {
+                            data.insert_temp(
+                                fs_navigator_interaction_id(),
+                                FsNavigatorInteraction::Pan {
+                                    start,
+                                    start_pan: self.fs_pan,
+                                    screen_scale: layout.screen_scale,
+                                },
+                            )
+                        });
+                    } else {
+                        ctx.data_mut(|data| {
+                            data.remove_temp::<FsNavigatorInteraction>(
+                                fs_navigator_interaction_id(),
+                            )
+                        });
+                    }
+                    ctx.request_repaint();
+                }
+            }
+            Some(
+                FsNavigatorInteraction::Idle
+                | FsNavigatorInteraction::Select { .. }
+                | FsNavigatorInteraction::Pan { .. },
+            )
+            | None => {}
+        }
+
+        let painter = ui.painter();
+        painter.rect_filled(
+            layout.panel_rect,
+            5.0,
+            egui::Color32::from_rgba_unmultiplied(16, 18, 22, 232),
+        );
+        painter.rect_filled(
+            layout.header_rect,
+            5.0,
+            egui::Color32::from_rgba_unmultiplied(34, 38, 46, 245),
+        );
+        painter.text(
+            layout.header_rect.left_center() + egui::vec2(8.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            "ナビゲータ",
+            egui::FontId::proportional(12.0),
+            egui::Color32::WHITE,
+        );
+        for (index, &corner) in FullscreenNavigatorCorner::ALL.iter().enumerate() {
+            let button = fs_navigator_corner_button_rect(layout.header_rect, index);
+            let selected = corner == self.settings.fullscreen_navigator_corner.normalized();
+            painter.rect_filled(
+                button,
+                2.0,
+                if selected {
+                    egui::Color32::from_rgb(64, 112, 172)
+                } else {
+                    egui::Color32::from_gray(54)
+                },
+            );
+            painter.rect_stroke(
+                button,
+                2.0,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(142)),
+                egui::StrokeKind::Inside,
+            );
+            let marker_center = match corner {
+                FullscreenNavigatorCorner::TopLeft => button.left_top() + egui::vec2(4.0, 4.0),
+                FullscreenNavigatorCorner::TopRight => button.right_top() + egui::vec2(-4.0, 4.0),
+                FullscreenNavigatorCorner::BottomLeft => {
+                    button.left_bottom() + egui::vec2(4.0, -4.0)
+                }
+                FullscreenNavigatorCorner::BottomRight => {
+                    button.right_bottom() + egui::vec2(-4.0, -4.0)
+                }
+                FullscreenNavigatorCorner::Unknown => unreachable!("known navigator corner"),
+            };
+            painter.circle_filled(marker_center, 2.0, egui::Color32::WHITE);
+        }
+
+        let canvas_painter = painter.with_clip_rect(layout.canvas_rect);
+        canvas_painter.rect_filled(layout.canvas_rect, 0.0, egui::Color32::BLACK);
+        for page in &layout.pages {
+            if let Some(ThumbnailState::Loaded { tex, .. }) =
+                self.thumbnails.get(page.main.page_idx)
+            {
+                page.navigator
+                    .paint_texture(&canvas_painter, tex.id(), egui::Color32::WHITE);
+            } else {
+                canvas_painter.rect_filled(
+                    page.navigator.paint_rect,
+                    0.0,
+                    egui::Color32::from_gray(42),
+                );
+            }
+            canvas_painter.rect_stroke(
+                page.navigator.paint_rect,
+                0.0,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(96)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        canvas_painter.rect_stroke(
+            layout.visible_rect,
+            0.0,
+            egui::Stroke::new(4.0, egui::Color32::from_black_alpha(220)),
+            egui::StrokeKind::Inside,
+        );
+        canvas_painter.rect_stroke(
+            layout.visible_rect,
+            0.0,
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 218, 76)),
+            egui::StrokeKind::Inside,
+        );
+        if let Some(FsNavigatorInteraction::Select { start, current }) = interaction {
+            let selection = egui::Rect::from_two_pos(start, current).intersect(layout.content_rect);
+            canvas_painter.rect_filled(
+                selection,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(70, 135, 210, 54),
+            );
+            canvas_painter.rect_stroke(
+                selection,
+                0.0,
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(110, 184, 255)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        painter.rect_stroke(
+            layout.panel_rect,
+            5.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(126)),
+            egui::StrokeKind::Inside,
+        );
+
+        if ctx.input(|input| {
+            input
+                .pointer
+                .hover_pos()
+                .is_some_and(|pos| layout.canvas_rect.contains(pos))
+        }) {
+            let secondary_down = ctx.input(|input| input.pointer.secondary_down());
+            ctx.set_cursor_icon(if secondary_down {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Crosshair
+            });
+        }
+    }
+
     fn handle_fs_wheel_and_click(
         &mut self,
         ui: &mut egui::Ui,
@@ -13636,6 +15494,12 @@ impl App {
             .fullscreen_idx
             .map(|idx| self.fullscreen_media_rect(full_rect, idx, state.is_video))
             .unwrap_or(full_rect);
+        let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
+        if let Some(navigator_idx) = self.fullscreen_idx
+            && self.handle_fs_navigator_input(ui, ctx, default_image_rect, navigator_idx)
+        {
+            return (FsPageNav::None, false);
+        }
         if self.capture_region_selection.is_some() {
             return (FsPageNav::None, false);
         }
@@ -13800,6 +15664,7 @@ impl App {
                             self.settings.fullscreen_side_panel_mode,
                             has_right_panel,
                             self.adjustment_mode,
+                            navigator_exclusion,
                         );
                         let in_music_side_panel = music_side_panel_contains_pointer(
                             full_rect,
@@ -13930,6 +15795,7 @@ impl App {
                     full_rect,
                     ctx.input(|input| input.pointer.hover_pos()),
                     self.adjustment_mode,
+                    navigator_exclusion,
                 );
             if left_panel_hover_active || bookmark_title_focused {
                 self.adjustment_mode = true;
@@ -14164,14 +16030,18 @@ impl App {
                     // ズームへ割り当てる。パネル上は cursor_in_panel でここへ来ないため
                     // パネルスクロールを維持できる。
                     let mouse = ctx.input(|i| i.pointer.hover_pos());
+                    let mut proposed_zoom = self.fs_zoom;
+                    let mut proposed_pan = self.fs_pan;
                     let changed = Self::apply_wheel_zoom(
-                        &mut self.fs_zoom,
-                        &mut self.fs_pan,
+                        &mut proposed_zoom,
+                        &mut proposed_pan,
                         wheel_y,
                         mouse,
                         default_image_rect.center(),
                     );
                     if changed {
+                        self.fs_zoom = proposed_zoom;
+                        self.set_fs_pan_from_input(proposed_zoom, proposed_pan);
                         self.maybe_rerender_pdf(self.fs_zoom);
                     }
                 } else {
@@ -14287,7 +16157,7 @@ impl App {
                 } else if primary_down {
                     if let Some((start_pos, start_pan)) = self.fs_pan_drag_start {
                         if let Some(pos) = pointer_pos {
-                            self.fs_pan = start_pan + (pos - start_pos);
+                            self.set_fs_pan_from_input(self.fs_zoom, start_pan + (pos - start_pos));
                         }
                     }
                 }
@@ -14363,6 +16233,7 @@ impl App {
                                     self.settings.fullscreen_side_panel_mode,
                                     has_right_panel,
                                     self.adjustment_mode,
+                                    navigator_exclusion,
                                 );
                                 let in_seek_panel =
                                     seek_panel_interactive && seek_panel_rect.contains(pos);
@@ -15905,12 +17776,22 @@ impl App {
                 resource,
                 transform.total_scale,
                 ui.ctx().pixels_per_point(),
+                transform.visible_source_uv_rect(painter.clip_rect()),
             );
-            transform.paint_texture(
-                &painter,
-                paint_resource.paint_texture_id(),
-                egui::Color32::WHITE,
-            );
+            if let Some(source_uv_rect) = paint_resource.visible_source_uv_rect() {
+                transform.paint_texture_source_region(
+                    &painter,
+                    paint_resource.paint_texture_id(),
+                    source_uv_rect,
+                    egui::Color32::WHITE,
+                );
+            } else {
+                transform.paint_texture(
+                    &painter,
+                    paint_resource.paint_texture_id(),
+                    egui::Color32::WHITE,
+                );
+            }
             if fit_bbox.is_none()
                 && should_draw_fs_pixel_grid(pixel_grid_enabled, using_full_texture, zoom_pan)
             {
@@ -16823,10 +18704,9 @@ impl App {
         prefer_processed: bool,
         pixels_per_point: f32,
     ) -> ContinuousReadingUnitSize {
-        let raw_base = self.continuous_unit_base_size(unit, fallback, prefer_processed);
-        let mut base = raw_base.clone();
-        apply_continuous_spread_geometry(&mut base, true);
         let fit_mode = self.effective_fullscreen_fit_mode();
+        let mut base = self.continuous_unit_base_size(unit, fallback, prefer_processed);
+        apply_continuous_spread_geometry(&mut base, spread_should_match_page_heights(fit_mode));
         let spread_gap = quantize_points_to_physical_pixels(
             self.settings.spread_page_gap_px.min(200) as f32,
             pixels_per_point,
@@ -16873,10 +18753,6 @@ impl App {
                 scale_for(target_w, target_h)
             }
         };
-        if base.pages.len() == 2 && physical_scale_is_near_integer(scale, pixels_per_point) {
-            base = raw_base;
-            apply_continuous_spread_geometry(&mut base, false);
-        }
         let (layout_width, _) = continuous_spread_fit_width(
             base.pages.len(),
             base.width,
@@ -17577,6 +19453,7 @@ impl App {
                 allow_thumbnail,
                 page.content_bbox,
                 ctx.pixels_per_point(),
+                ResolvedDisplayPlacement::Normal { zoom_pan: None },
             ) {
                 if crate::perf::is_enabled()
                     && let Some(handle) = display_tex.as_ref()
@@ -19035,14 +20912,14 @@ impl App {
         if !active {
             return;
         }
-        let label = if cfg!(windows) {
-            "元画像表示中: 右Ctrl"
-        } else {
-            "元画像表示中: 0"
-        };
+        let shortcut = self
+            .keymap
+            .chord_labels(KeyAction::FsOriginalPreviewHold)
+            .join(" / ");
+        let label = format!("元画像表示中: {shortcut}");
         let painter = ui.painter();
         let font = egui::FontId::proportional(14.0);
-        let galley = painter.layout_no_wrap(label.to_string(), font, egui::Color32::WHITE);
+        let galley = painter.layout_no_wrap(label, font, egui::Color32::WHITE);
         let pos = egui::pos2(content_rect.min.x + 16.0, content_rect.min.y + 12.0);
         let bg = egui::Rect::from_min_size(pos, galley.size()).expand(6.0);
         painter.rect_filled(bg, 4.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190));
@@ -19451,9 +21328,15 @@ impl App {
             let left_bbox = content_left.unwrap_or(full_bbox);
             let right_bbox = content_right.unwrap_or(full_bbox);
             let content_active = content_left.is_some() || content_right.is_some();
-            let matched_geometry = spread_layout_geometry(ls, rs, left_bbox, right_bbox, true);
-            let fit_w = matched_geometry.fit_size.x;
-            let fit_h = matched_geometry.fit_size.y;
+            let geometry = spread_layout_geometry(
+                ls,
+                rs,
+                left_bbox,
+                right_bbox,
+                spread_should_match_page_heights(fit_mode),
+            );
+            let fit_w = geometry.fit_size.x;
+            let fit_h = geometry.fit_size.y;
             let page_fit = || {
                 ((image_rect.width() - spread_gap).max(1.0) / fit_w)
                     .min(image_rect.height() / fit_h)
@@ -19466,9 +21349,9 @@ impl App {
             };
             let fit_scale = fit_scale_limits.apply(fit_scale);
 
-            // ZipPla 風ズームの composite も最終的に選んだ見開き geometry から作る。
-            // 1:1 判定は zoom 後の total_scale で行うため、まず従来の高さ合わせ geometry で
-            // 候補倍率を解決し、1:1 ならページ固有寸法へ切り替えて同じ total_scale を保つ。
+            // Height matching now depends only on fit mode, so the geometry is final before the
+            // ZipPla solve. The old result-dependent geometry feedback loop is structurally gone,
+            // and zoom needs to be resolved only once.
             let zip_input = if self.fs_zoom_mode_engaged() {
                 let top_m = TOP_BAR_HOVER_Y.min(image_rect.height() * 0.25);
                 let bottom_m = (FS_SEEK_BAR_HEIGHT + 8.0).min(image_rect.height() * 0.25);
@@ -19483,38 +21366,8 @@ impl App {
             } else {
                 None
             };
-            let mut zip_result = zip_input.map(|(pan_band, cursor)| {
+            let zip_result = zip_input.map(|(pan_band, cursor)| {
                 resolve_spread_zip_zoom(
-                    image_rect,
-                    pan_band,
-                    cursor,
-                    matched_geometry.fit_size,
-                    spread_gap,
-                    fit_scale,
-                    self.fs_zoom_factor,
-                    self.fs_zoom_active,
-                    None,
-                )
-            });
-            if let Some(result) = zip_result {
-                self.fs_zoom_factor = result.factor;
-            }
-            let mut resolved_zoom_pan = zip_result
-                .and_then(|result| result.zoom_pan)
-                .or(zoom_pan.filter(|_| zip_input.is_none()));
-            let (candidate_total_scale, _) = match resolved_zoom_pan {
-                Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
-                None => (fit_scale, image_rect.center()),
-            };
-            let preserve_page_sizes =
-                physical_scale_is_near_integer(candidate_total_scale, pixels_per_point);
-            let geometry = if preserve_page_sizes {
-                spread_layout_geometry(ls, rs, left_bbox, right_bbox, false)
-            } else {
-                matched_geometry
-            };
-            if preserve_page_sizes && let Some((pan_band, cursor)) = zip_input {
-                let result = resolve_spread_zip_zoom(
                     image_rect,
                     pan_band,
                     cursor,
@@ -19523,20 +21376,31 @@ impl App {
                     fit_scale,
                     self.fs_zoom_factor,
                     self.fs_zoom_active,
-                    self.fs_zoom_active.then_some(candidate_total_scale),
-                );
-                // factor の owner は高さ合わせ geometry で解決した候補倍率。ここで固有寸法
-                // geometry 側の clamp を書き戻すと、次フレームの候補倍率が変わって両 geometry
-                // を往復し得る。選択後は total_scale だけを固定して composite/pan を再解決する。
-                resolved_zoom_pan = result.zoom_pan;
-                zip_result = Some(result);
+                )
+            });
+            if let Some(result) = zip_result {
+                self.fs_zoom_factor = result.factor;
             }
+            let resolved_zoom_pan = zip_result
+                .and_then(|result| result.zoom_pan)
+                .or(zoom_pan.filter(|_| zip_input.is_none()));
             let aim_frame = zip_result.and_then(|result| result.aim_frame);
             let (total_scale, base_center) = match resolved_zoom_pan {
                 Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
                 None => (fit_scale, image_rect.center()),
             };
             let center = base_center - geometry.content_center_offset * total_scale;
+            let resolved_placement = if zip_input.is_some() {
+                ResolvedDisplayPlacement::Z {
+                    active: self.fs_zoom_active,
+                    factor: self.fs_zoom_factor,
+                    zoom_pan: resolved_zoom_pan,
+                }
+            } else {
+                ResolvedDisplayPlacement::Normal {
+                    zoom_pan: resolved_zoom_pan,
+                }
+            };
 
             // ZipPla ズーム確定中は gap も合成ページと同率 (total_scale / fit_scale = zoom) で拡大し、
             // composite に含めた gap_page と整合させる (Codex P3: 照準枠 ↔ 確定の表示範囲を一致)。
@@ -19605,6 +21469,7 @@ impl App {
                     allow_thumbnail,
                     content_bbox,
                     pixels_per_point,
+                    resolved_placement,
                 ) {
                     self.fullscreen_page_layout.push(transform);
                 }
@@ -19682,6 +21547,7 @@ impl App {
                     allow_thumbnail,
                     content_bbox,
                     pixels_per_point,
+                    ResolvedDisplayPlacement::Normal { zoom_pan: None },
                 );
             }
             // フォールバック分岐: サイズ未確定でアスペクト比が崩れる可能性があるため、
@@ -19741,6 +21607,7 @@ impl App {
         allow_thumbnail: bool,
         content_bbox: Option<egui::Rect>,
         pixels_per_point: f32,
+        placement: ResolvedDisplayPlacement,
     ) -> Option<DisplayedImageTransform> {
         let thumb_tex = if allow_thumbnail {
             match self.thumbnails.get(idx) {
@@ -19778,7 +21645,7 @@ impl App {
                         ..FullscreenFitScaleLimits::default()
                     },
                     pixels_per_point,
-                    placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                    placement,
                 },
                 img_rect,
             )?;
@@ -19790,12 +21657,22 @@ impl App {
                 handle,
                 transform.total_scale,
                 pixels_per_point,
+                transform.visible_source_uv_rect(painter.clip_rect()),
             );
-            transform.paint_texture(
-                painter,
-                paint_resource.paint_texture_id(),
-                egui::Color32::WHITE,
-            );
+            if let Some(source_uv_rect) = paint_resource.visible_source_uv_rect() {
+                transform.paint_texture_source_region(
+                    painter,
+                    paint_resource.paint_texture_id(),
+                    source_uv_rect,
+                    egui::Color32::WHITE,
+                );
+            } else {
+                transform.paint_texture(
+                    painter,
+                    paint_resource.paint_texture_id(),
+                    egui::Color32::WHITE,
+                );
+            }
             return Some(transform);
         } else {
             painter.text(
@@ -19833,7 +21710,11 @@ impl App {
         // event arrives. Do not let that passive position keep hover UI "visible" and
         // immediately revive the OS cursor after slideshow advances.
         let passive_hover_enabled = !self.cursor_hidden;
-        let in_top = passive_hover_enabled && pointer.is_some_and(|p| p.y < TOP_BAR_HOVER_Y);
+        let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
+        let in_top = passive_hover_enabled
+            && pointer.is_some_and(|p| {
+                p.y < TOP_BAR_HOVER_Y && fullscreen_edge_hover_allowed(p, navigator_exclusion)
+            });
         let click_mode = self.settings.fullscreen_side_panel_mode.normalized()
             == crate::settings::FsSidePanelMode::ClickToShow;
         let in_right = passive_hover_enabled
@@ -19843,12 +21724,13 @@ impl App {
                 } else {
                     metadata_panel_hover_activation_rect(full_rect)
                 };
-                rect.contains(p)
+                rect.contains(p) && fullscreen_edge_hover_allowed(p, navigator_exclusion)
             });
         let in_left_callout = passive_hover_enabled
             && click_mode
             && pointer.is_some_and(|p| {
                 panel_callout_edge_rect(full_rect, crate::ui_helpers::PanelEdge::Left).contains(p)
+                    && fullscreen_edge_hover_allowed(p, navigator_exclusion)
             });
         // 動画再生中の HUD / speed popup は native presenter overlay 側で管理されるため
         // egui main window のカーソル可視判定からは除外する (= 旧 egui HUD は撤去済)。
@@ -19953,12 +21835,16 @@ impl App {
         top_bar_locked: bool,
         top_bar_lock_pressed: &mut bool,
         cursor_hidden: bool,
+        navigator_exclusion: Option<egui::Rect>,
     ) {
         let hover_in_top = ctx.input(|i| {
             !cursor_hidden
                 && i.pointer
                     .hover_pos()
-                    .map(|p| p.y < TOP_BAR_HOVER_Y)
+                    .map(|p| {
+                        p.y < TOP_BAR_HOVER_Y
+                            && fullscreen_edge_hover_allowed(p, navigator_exclusion)
+                    })
                     .unwrap_or(false)
         });
         if !still_top_bar_visible_from_inputs(StillTopBarVisibilityInputs {
@@ -25273,6 +27159,648 @@ mod tests {
     use crate::ring_shortcut::{RightDragContext, ViewerShortRightClickAction};
     use std::path::PathBuf;
 
+    fn navigator_test_transform(
+        page_idx: usize,
+        rotation: crate::rotation_db::Rotation,
+        placement: ResolvedDisplayPlacement,
+    ) -> DisplayedImageTransform {
+        navigator_test_transform_with_content(page_idx, rotation, placement, None)
+    }
+
+    fn navigator_test_transform_with_content(
+        page_idx: usize,
+        rotation: crate::rotation_db::Rotation,
+        placement: ResolvedDisplayPlacement,
+        content_bbox: Option<egui::Rect>,
+    ) -> DisplayedImageTransform {
+        DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            page_idx,
+            viewport_rect: egui::Rect::from_min_size(
+                egui::pos2(20.0, 30.0),
+                egui::vec2(1000.0, 640.0),
+            ),
+            source_size: egui::vec2(1600.0, 1200.0),
+            texture_size: egui::vec2(800.0, 600.0),
+            rotation,
+            free_rotation_rad: 0.0,
+            content_bbox,
+            fit_mode: FullscreenFitMode::Page,
+            fit_scale_limits: FullscreenFitScaleLimits::default(),
+            pixels_per_point: 1.0,
+            placement,
+        })
+        .unwrap()
+    }
+
+    fn navigator_test_transform_from_rect(
+        page_idx: usize,
+        viewport_rect: egui::Rect,
+        full_image_rect: egui::Rect,
+    ) -> DisplayedImageTransform {
+        navigator_test_transform_from_rect_with_placement(
+            page_idx,
+            viewport_rect,
+            full_image_rect,
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((2.0, egui::Vec2::ZERO)),
+            },
+        )
+    }
+
+    fn navigator_test_transform_from_rect_with_placement(
+        page_idx: usize,
+        viewport_rect: egui::Rect,
+        full_image_rect: egui::Rect,
+        placement: ResolvedDisplayPlacement,
+    ) -> DisplayedImageTransform {
+        DisplayedImageTransform::from_resolved_rect(
+            DisplayedImageTransformInput {
+                page_idx,
+                viewport_rect,
+                source_size: egui::vec2(1600.0, 1200.0),
+                texture_size: egui::vec2(800.0, 600.0),
+                rotation: crate::rotation_db::Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point: 1.0,
+                placement,
+            },
+            full_image_rect,
+        )
+        .unwrap()
+    }
+
+    fn assert_rect_close(actual: egui::Rect, expected: egui::Rect) {
+        const EPSILON: f32 = 1.0e-3;
+        assert!((actual.left() - expected.left()).abs() < EPSILON);
+        assert!((actual.top() - expected.top()).abs() < EPSILON);
+        assert!((actual.right() - expected.right()).abs() < EPSILON);
+        assert!((actual.bottom() - expected.bottom()).abs() < EPSILON);
+    }
+
+    #[test]
+    fn navigator_hold_requests_visibility_when_fixed_setting_is_off() {
+        assert!(fs_navigator_visibility_requested(false, true, true, false));
+    }
+
+    #[test]
+    fn navigator_is_not_requested_when_fixed_setting_and_hold_are_off() {
+        assert!(!fs_navigator_visibility_requested(
+            false, false, true, false
+        ));
+    }
+
+    fn single_page_layout_with_pan(zoom: f32, pan: egui::Vec2) -> FullscreenPageLayout {
+        let mut layout = FullscreenPageLayout::default();
+        layout.begin(FullscreenPageLayoutKind::Single);
+        layout.push(navigator_test_transform(
+            1,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((zoom, pan)),
+            },
+        ));
+        layout
+    }
+
+    #[test]
+    fn navigator_pan_clamp_keeps_visible_source_and_navigator_available() {
+        let zoom = 3.0;
+        let layout = single_page_layout_with_pan(zoom, egui::Vec2::ZERO);
+        let pan =
+            clamp_fullscreen_pan_from_layout(&layout, zoom, egui::vec2(100_000.0, -100_000.0));
+        let moved = single_page_layout_with_pan(zoom, pan);
+        let page = moved.single_page().unwrap().transform;
+
+        assert!(page.visible_source_uv_rect(page.viewport_rect).is_some());
+        assert!(
+            build_flat_navigator_layout(
+                &moved,
+                page.viewport_rect,
+                page.viewport_rect,
+                260.0,
+                FullscreenNavigatorCorner::BottomRight,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn repeated_space_style_pan_cannot_move_image_fully_outside() {
+        let zoom = 2.5;
+        let mut pan = egui::Vec2::ZERO;
+        for delta in [
+            egui::vec2(50_000.0, 0.0),
+            egui::vec2(0.0, 50_000.0),
+            egui::vec2(-100_000.0, 0.0),
+            egui::vec2(0.0, -100_000.0),
+        ] {
+            let layout = single_page_layout_with_pan(zoom, pan);
+            pan = clamp_fullscreen_pan_from_layout(&layout, zoom, pan + delta);
+            let moved = single_page_layout_with_pan(zoom, pan);
+            let page = moved.single_page().unwrap().transform;
+            assert!(page.visible_source_uv_rect(page.viewport_rect).is_some());
+        }
+    }
+
+    #[test]
+    fn pan_inside_allowed_range_is_unchanged() {
+        let zoom = 3.0;
+        let layout = single_page_layout_with_pan(zoom, egui::Vec2::ZERO);
+        let proposed = egui::vec2(37.0, -29.0);
+        assert_eq!(
+            clamp_fullscreen_pan_from_layout(&layout, zoom, proposed),
+            proposed
+        );
+    }
+
+    #[test]
+    fn spread_pan_clamp_uses_resolved_zoom_pan_and_keeps_a_page_visible() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(1000.0, 640.0));
+        let zoom = 3.0;
+        let base_pan = egui::vec2(120.0, 0.0);
+        let placement = ResolvedDisplayPlacement::Normal {
+            zoom_pan: Some((zoom, base_pan)),
+        };
+        let left_rect =
+            egui::Rect::from_min_size(egui::pos2(-560.0, -100.0), egui::vec2(1200.0, 900.0));
+        let right_rect =
+            egui::Rect::from_min_size(egui::pos2(640.0, -100.0), egui::vec2(1200.0, 900.0));
+        let mut layout = FullscreenPageLayout::default();
+        layout.begin(FullscreenPageLayoutKind::Spread);
+        layout.push(navigator_test_transform_from_rect_with_placement(
+            1, viewport, left_rect, placement,
+        ));
+        layout.push(navigator_test_transform_from_rect_with_placement(
+            2, viewport, right_rect, placement,
+        ));
+
+        let pan =
+            clamp_fullscreen_pan_from_layout(&layout, zoom, egui::vec2(100_000.0, -100_000.0));
+        let delta = pan - base_pan;
+        let moved_rect =
+            |rect: egui::Rect| egui::Rect::from_min_max(rect.min + delta, rect.max + delta);
+        let moved = [left_rect, right_rect]
+            .into_iter()
+            .enumerate()
+            .map(|(index, rect)| {
+                navigator_test_transform_from_rect_with_placement(
+                    index + 1,
+                    viewport,
+                    moved_rect(rect),
+                    ResolvedDisplayPlacement::Normal {
+                        zoom_pan: Some((zoom, pan)),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            moved
+                .iter()
+                .any(|page| page.visible_source_uv_rect(viewport).is_some()),
+            "at least one spread page must remain recoverable"
+        );
+    }
+
+    #[test]
+    fn z_zoom_and_continuous_layouts_keep_their_existing_pan_owners() {
+        let proposed = egui::vec2(100_000.0, -100_000.0);
+        let mut z_layout = FullscreenPageLayout::default();
+        z_layout.begin(FullscreenPageLayoutKind::Single);
+        z_layout.push(navigator_test_transform(
+            1,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Z {
+                active: true,
+                factor: 3.0,
+                zoom_pan: Some((3.0, egui::Vec2::ZERO)),
+            },
+        ));
+        assert_eq!(
+            clamp_fullscreen_pan_from_layout(&z_layout, 3.0, proposed),
+            proposed
+        );
+
+        let mut continuous = FullscreenPageLayout::default();
+        continuous.begin(FullscreenPageLayoutKind::Continuous);
+        continuous.push(navigator_test_transform(
+            1,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((3.0, egui::Vec2::ZERO)),
+            },
+        ));
+        assert_eq!(
+            clamp_fullscreen_pan_from_layout(&continuous, 3.0, proposed),
+            proposed
+        );
+    }
+
+    #[test]
+    fn navigator_exclusion_reaches_only_its_adjacent_edges() {
+        let host = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        for corner in [
+            FullscreenNavigatorCorner::TopLeft,
+            FullscreenNavigatorCorner::TopRight,
+            FullscreenNavigatorCorner::BottomLeft,
+            FullscreenNavigatorCorner::BottomRight,
+        ] {
+            let (panel, _, _) = fs_navigator_panel_rect(host, 260.0, corner).unwrap();
+            let exclusion = fs_navigator_edge_exclusion_rect(host, panel, corner);
+            let left = egui::pos2(host.left() + 1.0, panel.center().y);
+            let right = egui::pos2(host.right() - 1.0, panel.center().y);
+            let top = egui::pos2(panel.center().x, host.top() + 1.0);
+            let bottom = egui::pos2(panel.center().x, host.bottom() - 1.0);
+            let on_left = matches!(
+                corner,
+                FullscreenNavigatorCorner::TopLeft | FullscreenNavigatorCorner::BottomLeft
+            );
+            let on_top = matches!(
+                corner,
+                FullscreenNavigatorCorner::TopLeft | FullscreenNavigatorCorner::TopRight
+            );
+
+            assert_eq!(
+                fullscreen_edge_hover_allowed(left, Some(exclusion)),
+                !on_left
+            );
+            assert_eq!(
+                fullscreen_edge_hover_allowed(right, Some(exclusion)),
+                on_left
+            );
+            assert_eq!(fullscreen_edge_hover_allowed(top, Some(exclusion)), !on_top);
+            assert_eq!(
+                fullscreen_edge_hover_allowed(bottom, Some(exclusion)),
+                on_top
+            );
+        }
+    }
+
+    #[test]
+    fn navigator_exclusion_blocks_same_side_panel_but_not_opposite_or_hidden() {
+        let host = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let (panel, _, _) =
+            fs_navigator_panel_rect(host, 260.0, FullscreenNavigatorCorner::BottomRight).unwrap();
+        let exclusion =
+            fs_navigator_edge_exclusion_rect(host, panel, FullscreenNavigatorCorner::BottomRight);
+        let right = egui::pos2(host.right() - 1.0, panel.center().y);
+        let left = egui::pos2(host.left() + 1.0, panel.center().y);
+        let mode = crate::settings::FsSidePanelMode::Hover;
+
+        assert!(!fullscreen_side_panel_contains_pointer(
+            host,
+            right,
+            true,
+            mode,
+            false,
+            false,
+            Some(exclusion),
+        ));
+        assert!(fullscreen_side_panel_contains_pointer(
+            host,
+            left,
+            true,
+            mode,
+            false,
+            true,
+            Some(exclusion),
+        ));
+        assert!(fullscreen_side_panel_contains_pointer(
+            host, right, true, mode, false, false, None,
+        ));
+    }
+
+    #[test]
+    fn navigator_interaction_keeps_visibility_after_hold_is_released() {
+        let ctx = egui::Context::default();
+        for interaction in [
+            FsNavigatorInteraction::Select {
+                start: egui::Pos2::ZERO,
+                current: egui::Pos2::ZERO,
+            },
+            FsNavigatorInteraction::Pan {
+                start: egui::Pos2::ZERO,
+                start_pan: egui::Vec2::ZERO,
+                screen_scale: 1.0,
+            },
+            FsNavigatorInteraction::PendingPanTransition {
+                start: egui::Pos2::ZERO,
+                page_idx: 0,
+                source_uv: egui::Pos2::ZERO,
+            },
+            // 次フレームで消費される持ち越し。ここを漏らすと、修飾キーを離した直後の
+            // ダブルクリック / 範囲指定が黙って捨てられる。
+            FsNavigatorInteraction::PendingCenter {
+                page_idx: 0,
+                source_uv: egui::Pos2::ZERO,
+            },
+        ] {
+            ctx.data_mut(|data| data.insert_temp(fs_navigator_interaction_id(), interaction));
+            assert!(fs_navigator_visibility_requested(
+                false,
+                false,
+                true,
+                fs_navigator_interaction_active(&ctx)
+            ));
+        }
+        ctx.data_mut(|data| {
+            data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
+        });
+        for interaction in [
+            PanoramaNavigatorInteraction::Select {
+                start: egui::Pos2::ZERO,
+                current: egui::Pos2::ZERO,
+            },
+            PanoramaNavigatorInteraction::Pan {
+                start_uv: egui::Pos2::ZERO,
+                start_yaw: 0.0,
+                start_pitch: 0.0,
+            },
+        ] {
+            ctx.data_mut(|data| data.insert_temp(panorama_navigator_interaction_id(), interaction));
+            assert!(fs_navigator_visibility_requested(
+                false,
+                false,
+                true,
+                fs_navigator_interaction_active(&ctx)
+            ));
+        }
+    }
+
+    #[test]
+    fn navigator_hold_does_not_request_visibility_without_focus() {
+        assert!(!fs_navigator_visibility_requested(
+            false, true, false, false
+        ));
+    }
+
+    #[test]
+    fn flat_navigator_visible_frame_comes_from_visible_source_uv_rect() {
+        let main = navigator_test_transform(
+            3,
+            crate::rotation_db::Rotation::Cw90,
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((2.75, egui::vec2(71.0, -39.0))),
+            },
+        );
+        let mut pages = FullscreenPageLayout::default();
+        pages.begin(FullscreenPageLayoutKind::Single);
+        pages.push(main);
+        let host = main.viewport_rect;
+
+        let navigator = build_flat_navigator_layout(
+            &pages,
+            host,
+            host,
+            260.0,
+            FullscreenNavigatorCorner::BottomRight,
+        )
+        .unwrap();
+        let visible_uv = main.visible_source_uv_rect(host).unwrap();
+        let expected = fs_navigator_source_rect_aabb(&navigator.pages[0].navigator, visible_uv)
+            .intersect(navigator.canvas_rect);
+
+        assert_rect_close(navigator.visible_rect, expected);
+    }
+
+    #[test]
+    fn flat_navigator_keeps_catalog_thumbnail_full_when_view_is_trimmed() {
+        let trim = egui::Rect::from_min_max(egui::pos2(0.15, 0.10), egui::pos2(0.82, 0.91));
+        let main = navigator_test_transform_with_content(
+            4,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((2.0, egui::vec2(31.0, -17.0))),
+            },
+            Some(trim),
+        );
+        let mut pages = FullscreenPageLayout::default();
+        pages.begin(FullscreenPageLayoutKind::Single);
+        pages.push(main);
+        let navigator = build_flat_navigator_layout(
+            &pages,
+            main.viewport_rect,
+            main.viewport_rect,
+            260.0,
+            FullscreenNavigatorCorner::BottomRight,
+        )
+        .unwrap();
+
+        assert_rect_close(
+            navigator.pages[0].navigator.uv_rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        );
+        let visible_uv = main.visible_source_uv_rect(main.viewport_rect).unwrap();
+        assert_rect_close(
+            navigator.visible_rect,
+            fs_navigator_source_rect_aabb(&navigator.pages[0].navigator, visible_uv)
+                .intersect(navigator.canvas_rect),
+        );
+    }
+
+    #[test]
+    fn flat_navigator_spread_preserves_drawn_page_order_and_gap() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(1000.0, 640.0));
+        let left = navigator_test_transform_from_rect(
+            11,
+            viewport,
+            egui::Rect::from_min_size(egui::pos2(-350.0, 80.0), egui::vec2(720.0, 540.0)),
+        );
+        let right = navigator_test_transform_from_rect(
+            10,
+            viewport,
+            egui::Rect::from_min_size(egui::pos2(390.0, 80.0), egui::vec2(720.0, 540.0)),
+        );
+        let mut pages = FullscreenPageLayout::default();
+        pages.begin(FullscreenPageLayoutKind::Spread);
+        pages.push(left);
+        pages.push(right);
+
+        let navigator = build_flat_navigator_layout(
+            &pages,
+            viewport,
+            viewport,
+            260.0,
+            FullscreenNavigatorCorner::TopLeft,
+        )
+        .unwrap();
+
+        assert_eq!(
+            navigator
+                .pages
+                .iter()
+                .map(|page| page.main.page_idx)
+                .collect::<Vec<_>>(),
+            vec![11, 10]
+        );
+        assert!(
+            navigator.pages[0].navigator.full_image_rect.right()
+                < navigator.pages[1].navigator.full_image_rect.left()
+        );
+    }
+
+    #[test]
+    fn flat_navigator_hides_when_the_whole_image_is_visible() {
+        let main = navigator_test_transform(
+            3,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal { zoom_pan: None },
+        );
+        let mut pages = FullscreenPageLayout::default();
+        pages.begin(FullscreenPageLayoutKind::Single);
+        pages.push(main);
+
+        assert!(
+            build_flat_navigator_layout(
+                &pages,
+                main.viewport_rect,
+                main.viewport_rect,
+                260.0,
+                FullscreenNavigatorCorner::BottomRight,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn flat_navigator_is_unavailable_for_continuous_reading() {
+        let mut pages = FullscreenPageLayout::default();
+        pages.begin(FullscreenPageLayoutKind::Continuous);
+        pages.push(navigator_test_transform(
+            1,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((2.0, egui::Vec2::ZERO)),
+            },
+        ));
+        let host = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 640.0));
+
+        assert!(
+            build_flat_navigator_layout(
+                &pages,
+                host,
+                host,
+                260.0,
+                FullscreenNavigatorCorner::BottomRight,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn flat_navigator_double_click_position_round_trips_to_view_center() {
+        let start_pan = egui::vec2(63.0, -22.0);
+        let main = navigator_test_transform(
+            5,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((3.0, start_pan)),
+            },
+        );
+        let mut pages = FullscreenPageLayout::default();
+        pages.begin(FullscreenPageLayoutKind::Single);
+        pages.push(main);
+        let host = main.viewport_rect;
+        let navigator = build_flat_navigator_layout(
+            &pages,
+            host,
+            host,
+            260.0,
+            FullscreenNavigatorCorner::BottomRight,
+        )
+        .unwrap();
+        let target_uv = egui::pos2(0.37, 0.62);
+        let click = navigator.pages[0]
+            .navigator
+            .source_normalized_to_screen(target_uv);
+        let mapped_uv = navigator.pages[0]
+            .navigator
+            .screen_to_source_normalized(click);
+        let centered_pan = main.pan_to_center_source_normalized(mapped_uv, start_pan);
+        let centered = navigator_test_transform(
+            5,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((3.0, centered_pan)),
+            },
+        );
+        let visible = centered.visible_source_uv_rect(host).unwrap();
+
+        assert!((visible.center().x - target_uv.x).abs() < 1.0e-4);
+        assert!((visible.center().y - target_uv.y).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn panorama_navigator_outline_splits_only_at_equirect_seam() {
+        let content = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0));
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let away_from_seam = panorama_navigator_outline_segments(content, viewport, 0.0, 0.0, 0.8);
+        let across_seam = panorama_navigator_outline_segments(
+            content,
+            viewport,
+            std::f32::consts::PI - 0.05,
+            0.0,
+            0.8,
+        );
+
+        assert_eq!(away_from_seam.len(), 1);
+        assert!(across_seam.len() > 1);
+    }
+
+    #[test]
+    fn panorama_navigator_click_uv_round_trips_yaw_and_pitch() {
+        let expected_yaw = 0.73;
+        let expected_pitch = -0.41;
+        let (u, v) = crate::panorama::ndc_to_equirect_uv(
+            0.0,
+            0.0,
+            16.0 / 9.0,
+            (1.2_f32 * 0.5).tan(),
+            expected_yaw,
+            expected_pitch,
+        );
+        let (actual_yaw, actual_pitch) = panorama_navigator_uv_to_yaw_pitch(egui::pos2(u, v));
+
+        assert!((actual_yaw - expected_yaw).abs() < 1.0e-4);
+        assert!((actual_pitch - expected_pitch).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn panorama_navigator_selection_height_clamps_fov() {
+        let content_height = 200.0;
+        assert_eq!(
+            panorama_navigator_fov_from_height(0.0, content_height),
+            crate::panorama::FOV_MIN
+        );
+        assert_eq!(
+            panorama_navigator_fov_from_height(content_height, content_height),
+            crate::panorama::FOV_MAX
+        );
+        let middle = panorama_navigator_fov_from_height(50.0, content_height);
+        assert!((crate::panorama::FOV_MIN..=crate::panorama::FOV_MAX).contains(&middle));
+        assert!((middle - std::f32::consts::FRAC_PI_4).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn panorama_navigator_remains_visible_at_max_fov() {
+        let host = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let layout = build_panorama_navigator_layout(
+            egui::vec2(4000.0, 2000.0),
+            host,
+            host,
+            260.0,
+            FullscreenNavigatorCorner::BottomRight,
+            0.0,
+            0.0,
+            crate::panorama::FOV_MAX,
+        );
+
+        assert!(layout.is_some());
+    }
+
     #[test]
     fn colorize_wait_indicator_requires_colorize_state_and_full_delay() {
         let ctx = egui::Context::default();
@@ -25529,7 +28057,7 @@ mod tests {
             Some(model.as_str())
         );
 
-        app.apply_fullscreen_post_filter_selection(idx, PostFilter::Sepia, "T");
+        app.apply_fullscreen_post_filter_selection(idx, PostFilter::Sepia, "T", 1.0);
         assert_eq!(app.effective_params(idx).post_filter, PostFilter::Sepia);
 
         app.apply_fullscreen_colorize_selection(
@@ -26090,6 +28618,7 @@ mod tests {
                 crate::settings::FsSidePanelMode::ClickToShow,
                 true,
                 true,
+                None,
             ));
         }
         assert!(fullscreen_side_panel_contains_pointer(
@@ -26099,6 +28628,7 @@ mod tests {
             crate::settings::FsSidePanelMode::ClickToShow,
             false,
             false,
+            None,
         ));
     }
 
@@ -26211,16 +28741,19 @@ mod tests {
             viewport,
             Some(egui::pos2(viewport.right() - 1.0, panel.center().y)),
             false,
+            None,
         ));
         assert!(metadata_panel_hover_active_at(
             viewport,
             Some(inside_left),
-            true
+            true,
+            None,
         ));
         assert!(!metadata_panel_hover_active_at(
             viewport,
             Some(inside_left),
-            false
+            false,
+            None,
         ));
     }
 
@@ -26234,6 +28767,7 @@ mod tests {
             viewport,
             Some(egui::pos2(viewport.left() + 1.0, viewport.center().y)),
             false,
+            None,
         ));
 
         // 左端からタブへ斜めに移動するとき、パネル上端の少し上を通っても維持する。
@@ -26242,19 +28776,24 @@ mod tests {
             viewport,
             Some(above_tab_path),
             true,
+            None,
         ));
         assert!(!adjustment_panel_hover_active_at(
             viewport,
             Some(above_tab_path),
             false,
+            None,
         ));
 
         assert!(!adjustment_panel_hover_active_at(
             viewport,
             Some(egui::pos2(panel.right() + sustain + 1.0, panel.center().y,)),
             true,
+            None,
         ));
-        assert!(!adjustment_panel_hover_active_at(viewport, None, true));
+        assert!(!adjustment_panel_hover_active_at(
+            viewport, None, true, None
+        ));
     }
 
     #[test]
@@ -26291,6 +28830,7 @@ mod tests {
             mode,
             false,
             true,
+            None,
         ));
         assert!(!fullscreen_side_panel_contains_pointer(
             viewport,
@@ -26299,6 +28839,7 @@ mod tests {
             mode,
             false,
             true,
+            None,
         ));
     }
 
@@ -27387,6 +29928,123 @@ mod tests {
     }
 
     #[test]
+    fn spread_height_matching_depends_on_fit_mode_not_zoom_scale() {
+        let full_bbox = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        let left_size = egui::vec2(800.0, 1200.0);
+        let right_size = egui::vec2(600.0, 800.0);
+
+        for (fit_mode, expected_right_scale) in [
+            (FullscreenFitMode::Original, 1.0),
+            (FullscreenFitMode::Page, 1.5),
+            (FullscreenFitMode::MarginFit, 1.5),
+            (FullscreenFitMode::Width, 1.5),
+            (FullscreenFitMode::Height, 1.5),
+        ] {
+            for total_scale in [0.5, 1.0, 1.01, 2.0, 2.01] {
+                let geometry = spread_layout_geometry(
+                    left_size,
+                    right_size,
+                    full_bbox,
+                    full_bbox,
+                    spread_should_match_page_heights(fit_mode),
+                );
+                let rects = layout_spread_page_rects(
+                    egui::pos2(1000.0, 700.0),
+                    geometry,
+                    total_scale,
+                    4.0,
+                    1.0,
+                    full_bbox,
+                    full_bbox,
+                    false,
+                );
+
+                assert_f32_close(geometry.left.scale_factor, 1.0);
+                assert_f32_close(geometry.right.scale_factor, expected_right_scale);
+                assert_f32_close(rects.left_rect.height(), 1200.0 * total_scale);
+                assert_f32_close(
+                    rects.right_rect.height(),
+                    800.0 * expected_right_scale * total_scale,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn equal_height_spread_is_unchanged_for_every_fit_mode_and_zoom_scale() {
+        let full_bbox = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        let left_size = egui::vec2(800.0, 1200.0);
+        let right_size = egui::vec2(600.0, 1200.0);
+
+        for fit_mode in [
+            FullscreenFitMode::Original,
+            FullscreenFitMode::Page,
+            FullscreenFitMode::MarginFit,
+            FullscreenFitMode::Width,
+            FullscreenFitMode::Height,
+        ] {
+            for total_scale in [0.5, 1.0, 1.01, 2.0, 2.01] {
+                let geometry = spread_layout_geometry(
+                    left_size,
+                    right_size,
+                    full_bbox,
+                    full_bbox,
+                    spread_should_match_page_heights(fit_mode),
+                );
+                let rects = layout_spread_page_rects(
+                    egui::pos2(1000.0, 700.0),
+                    geometry,
+                    total_scale,
+                    4.0,
+                    1.0,
+                    full_bbox,
+                    full_bbox,
+                    false,
+                );
+
+                assert_f32_close(geometry.left.scale_factor, 1.0);
+                assert_f32_close(geometry.right.scale_factor, 1.0);
+                assert_f32_close(rects.left_rect.height(), 1200.0 * total_scale);
+                assert_f32_close(rects.right_rect.height(), 1200.0 * total_scale);
+            }
+        }
+    }
+
+    #[test]
+    fn spread_zip_zoom_for_non_original_fit_keeps_matched_geometry_zoom_and_pan() {
+        let full_bbox = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        let image_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let pan_band = egui::Rect::from_min_max(egui::pos2(0.0, 80.0), egui::pos2(1920.0, 1020.0));
+        let cursor = egui::pos2(430.0, 260.0);
+        let spread_gap = 4.0;
+        let fit_scale = 0.6;
+        let geometry = spread_layout_geometry(
+            egui::vec2(800.0, 1200.0),
+            egui::vec2(600.0, 800.0),
+            full_bbox,
+            full_bbox,
+            spread_should_match_page_heights(FullscreenFitMode::Page),
+        );
+        let result = resolve_spread_zip_zoom(
+            image_rect,
+            pan_band,
+            cursor,
+            geometry.fit_size,
+            spread_gap,
+            fit_scale,
+            1.25,
+            true,
+        );
+        let (zoom, pan) = result.zoom_pan.unwrap();
+
+        assert_f32_close(geometry.right.scale_factor, 1.5);
+        assert_f32_close(result.factor, 1.25);
+        assert_f32_close(zoom, 3.921_568_6);
+        assert_f32_close(pan.x, 1047.843_1);
+        assert_f32_close(pan.y, 871.088_87);
+    }
+
+    #[test]
     fn spread_non_integer_fit_keeps_height_matching_and_vertical_centering() {
         let full_bbox = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
         let geometry = spread_layout_geometry(
@@ -28297,6 +30955,42 @@ mod tests {
                 (rects[0].1.center().y - rects[1].1.center().y).abs() * pixels_per_point
                     <= 0.5 + 0.01
             );
+        }
+    }
+
+    #[test]
+    fn continuous_spread_height_matching_depends_on_fit_mode_not_zoom_scale() {
+        for (fit_mode, expected_right_scale) in [
+            (FullscreenFitMode::Original, 1.0),
+            (FullscreenFitMode::Page, 1.5),
+            (FullscreenFitMode::MarginFit, 1.5),
+            (FullscreenFitMode::Width, 1.5),
+            (FullscreenFitMode::Height, 1.5),
+        ] {
+            for total_scale in [0.5, 1.0, 1.01, 2.0, 2.01] {
+                let mut size = ContinuousReadingUnitSize {
+                    pages: vec![
+                        ContinuousReadingPageSize::full(1, 800.0, 1200.0),
+                        ContinuousReadingPageSize::full(2, 600.0, 800.0),
+                    ],
+                    width: 1.0,
+                    height: 1.0,
+                    page_gap: 0.0,
+                    logical_scale: 1.0,
+                };
+                apply_continuous_spread_geometry(
+                    &mut size,
+                    spread_should_match_page_heights(fit_mode),
+                );
+
+                assert_f32_close(size.pages[0].logical_scale, 1.0);
+                assert_f32_close(size.pages[1].logical_scale, expected_right_scale);
+                assert_f32_close(size.pages[0].height * total_scale, 1200.0 * total_scale);
+                assert_f32_close(
+                    size.pages[1].height * total_scale,
+                    800.0 * expected_right_scale * total_scale,
+                );
+            }
         }
     }
 

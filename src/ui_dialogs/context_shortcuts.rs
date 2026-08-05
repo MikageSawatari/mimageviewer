@@ -212,11 +212,12 @@ const TEXT_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
         keys: "中ボタン+上下ドラッグ",
         description: "ドラッグ開始位置を中心にズームする",
     },
-    FixedShortcutRow {
-        keys: "右Ctrl",
-        description: "押している間だけテキスト注釈を外した元画像を表示する",
-    },
 ];
+
+const TEXT_SUPPLEMENTAL_ACTION_ROWS: &[(KeyAction, &str)] = &[(
+    KeyAction::FsOriginalPreviewHold,
+    "押している間だけテキスト注釈を外した元画像を表示する",
+)];
 
 #[derive(Clone, Copy)]
 enum ShortcutHelpContext {
@@ -267,6 +268,19 @@ impl ShortcutHelpContext {
             Self::Crop => CROP_FIXED_SHORTCUT_ROWS,
             Self::LocalAdjust => LOCAL_ADJUST_FIXED_SHORTCUT_ROWS,
             Self::Text => TEXT_FIXED_SHORTCUT_ROWS,
+        }
+    }
+
+    fn supplemental_action_rows(self) -> &'static [(KeyAction, &'static str)] {
+        match self {
+            Self::Text => TEXT_SUPPLEMENTAL_ACTION_ROWS,
+            Self::Grid
+            | Self::FsImage
+            | Self::FsVideo
+            | Self::Erase
+            | Self::Conceal
+            | Self::Crop
+            | Self::LocalAdjust => &[],
         }
     }
 
@@ -337,6 +351,11 @@ impl App {
                         for scope in help_context.active_scopes() {
                             draw_command_scope_rows(ui, *scope, &rows);
                         }
+                        draw_supplemental_action_rows(
+                            ui,
+                            &self.keymap,
+                            help_context.supplemental_action_rows(),
+                        );
                         draw_fixed_rows(ui, &self.keymap, help_context.fixed_rows());
                     });
 
@@ -458,4 +477,65 @@ fn draw_fixed_rows(ui: &mut egui::Ui, keymap: &crate::keymap::Keymap, rows: &[Fi
                 ui.end_row();
             }
         });
+}
+
+fn supplemental_action_shortcut_label(keymap: &crate::keymap::Keymap, action: KeyAction) -> String {
+    let labels = keymap.chord_labels(action);
+    if labels.is_empty() {
+        "未設定".to_string()
+    } else {
+        labels.join(" / ")
+    }
+}
+
+fn draw_supplemental_action_rows(
+    ui: &mut egui::Ui,
+    keymap: &crate::keymap::Keymap,
+    rows: &[(KeyAction, &str)],
+) {
+    if rows.is_empty() {
+        return;
+    }
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new("共通操作").strong());
+    ui.add_space(2.0);
+    egui::Grid::new(("context_shortcuts_supplemental", rows.as_ptr() as usize))
+        .num_columns(2)
+        .spacing([18.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            for (action, description) in rows {
+                ui.monospace(supplemental_action_shortcut_label(keymap, *action));
+                ui.label(*description);
+                ui.end_row();
+            }
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supplemental_action_shortcut_label;
+    use crate::keymap::{Chord, KeyAction, Keymap, KeymapSettings, ModKind};
+
+    #[test]
+    fn original_preview_help_label_follows_assignment_and_disabled_state() {
+        let action = KeyAction::FsOriginalPreviewHold;
+        assert_eq!(
+            supplemental_action_shortcut_label(&Keymap::empty(), action),
+            "右Ctrl"
+        );
+
+        let mut settings = KeymapSettings::default();
+        settings.set_override_chords(action, vec![Chord::modifier(ModKind::RightShift)]);
+        assert_eq!(
+            supplemental_action_shortcut_label(&Keymap::from_settings(&settings), action),
+            "右Shift"
+        );
+
+        settings.disable_action(action);
+        assert_eq!(
+            supplemental_action_shortcut_label(&Keymap::from_settings(&settings), action),
+            "未設定"
+        );
+    }
 }

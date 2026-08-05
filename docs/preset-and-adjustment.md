@@ -425,6 +425,7 @@ LUT はカラー化の後、既存ポストフィルタの前に適用し、元�
 | --- | --- | --- |
 | 基本 | `None` | フィルタなし (LINEAR サンプラー、デフォルト) |
 | 基本 | `Nearest` | ピクセル補完なし (NEAREST サンプラーのみ、CPU 変換は clone) |
+| 基本 | `UpscaleSharp` | 拡大時だけ NIS。等倍は元 texture、縮小は Lanczos3。CPU 変換は clone |
 | CRT | `CrtSimple` | sin² スキャンライン + RGB アパーチャマスク + 微 glow |
 | CRT | `CrtFull` | CrtSimple + 樽型歪み + 強 phosphor glow |
 | CRT | `CrtArcade` | 太スキャンライン + 濃マスク + 高輝度 |
@@ -562,6 +563,13 @@ bilinear 補間ソースサンプリング + 水平ブラー (h_blur) で、「�
 - `PostFilter::Nearest` のみ `TextureOptions::NEAREST` でアップロード
 - その他 (CRT/減色/複合を含む静止画) は linear + linear mipmap でアップロード。縮小時のモアレを防ぎ、CRT の phosphor
   感を出すため。NEAREST だと CRT 結果を画面スケールに合わせる際に周期的黒線が出る。
+- `PostFilter::UpscaleSharp` は CPU post-filter では加工せず、最終 paint の物理倍率が 1.0 を
+  超えるときだけ GPU NIS branch へ入る。1.0 以下の sampler / Lanczos3 縮小は標準と同じ。
+
+**設定 DB のダウングレード互換**: `Settings::global_preset` と 10 個の `preset_slots` を保存するとき、
+`UpscaleSharp` は専用 bool carrier へ退避し、旧版が読む `PostFilter` field には `None` を書く。
+現行版は読み込み後の sanitize で carrier から復元する。`adjustment.db`、sidecar、metadata transfer は
+行単位の JSON なのでこの全体保護 stash の対象外であり、未知 variant を旧版が開くとその 1 件だけが落ちる。
 
 **縮小表示と旧設定の互換**: 手動回避策だった `Downscale2x` / `Downscale4x` は撤去済みで、
 保存済み設定に含まれる場合は `PostFilter::None` として読み込む。通常静止画の縮小は最終合成後の
@@ -597,10 +605,10 @@ final composite の `params_hash` から `colorize` / `creative_lut` / `post_fil
 
 ### 2.5 元画像プレビュー
 
-右 Ctrl を押している間だけ、補正 / ポストフィルタ / AI アップスケール・デノイズ /
+元画像表示に割り当てた修飾キー (既定は右 Ctrl) を押している間だけ、補正 / ポストフィルタ / AI アップスケール・デノイズ /
 消しゴム補完結果 / 隠蔽加工を表示選択から外し、元画像を一時表示する。これは「比較用の描画 override」
 であり、`edit_result_cache` / final pipeline cache の無効化、DB 書き換え、AI ジョブの停止は
-行わない。表示元は常に raw 専用の `fs_cache` で、消しゴム補完済みページでも
+行わない。この操作は操作カスタマイズで変更または無効化できる。表示元は常に raw 専用の `fs_cache` で、消しゴム補完済みページでも
 `erase_base_cache` は参照しない。
 
 ### 2.6 Auto モード

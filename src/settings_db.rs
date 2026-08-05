@@ -608,12 +608,19 @@ impl SettingsDb {
         // v2.5.0 が知らない enum variant は、旧版が無視できる追加フィールドへ退避した
         // clone を永続化する。live state は変更しない。
         let mut persisted = settings.clone();
+        persisted.stash_post_filter_variants_for_persist();
+        persisted.stash_toolbar_name_filter_for_persist();
+        // Column carriers are restored PageCount -> Place during sanitize, so remove them
+        // in the reverse order to preserve their relative positions when both are present.
+        persisted.stash_details_place_for_persist();
         persisted.stash_details_page_count_for_persist();
         persisted.facet_filter.stash_kind_audio_for_persist();
         persisted.facet_filter.stash_extended_date_for_persist();
+        persisted.facet_filter.stash_extended_size_for_persist();
         persisted.facet_filter.stash_bookmark_states_for_persist();
         for definition in &mut persisted.smart_folders {
             for rule in &mut definition.rules {
+                rule.filter.stash_extended_size_for_persist();
                 rule.filter.stash_bookmark_states_for_persist();
             }
         }
@@ -3128,9 +3135,13 @@ mod tests {
     }
 
     fn assert_settings_eq(a: &Settings, b: &Settings) {
+        // DB には旧版が読める downgrade carrier 形式を保存するため、通常起動と同じ
+        // load-time migration を通した live state 同士を比較する。
+        let mut restored = b.clone();
+        crate::settings::apply_load_time_migrations(&mut restored);
         // 大型構造体なのでフィールドごと比較はせず、serde の JSON で同等性を見る。
         let aj = serde_json::to_value(a).unwrap();
-        let bj = serde_json::to_value(b).unwrap();
+        let bj = serde_json::to_value(&restored).unwrap();
         assert_eq!(aj, bj, "Settings did not round-trip via SQLite");
     }
 
@@ -3208,6 +3219,53 @@ mod tests {
         assert_eq!(
             second.conceal_preset,
             crate::conceal::ConcealPreset::from_settings(&settings)
+        );
+    }
+
+    #[test]
+    fn post_filter_downgrade_stash_roundtrips_through_settings_db() {
+        use crate::adjustment::{AdjustParams, PostFilter, PresetSlot};
+
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut original = Settings::default();
+        original.global_preset.post_filter = PostFilter::UpscaleSharp;
+        original.preset_slots.slots[9] = Some(PresetSlot {
+            name: "sharp".to_owned(),
+            params: AdjustParams {
+                post_filter: PostFilter::UpscaleSharp,
+                ..Default::default()
+            },
+        });
+        db.save_full(&original).unwrap();
+
+        {
+            let inner = db.inner.lock().unwrap();
+            for key in ["global_preset", "preset_slots"] {
+                let value: String = inner
+                    .conn
+                    .query_row(
+                        "SELECT value FROM settings_kv WHERE key = ?1",
+                        [key],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(
+                    !value.contains("upscale_sharp"),
+                    "v2.11.0-visible {key} JSON must not contain the new enum variant"
+                );
+            }
+        }
+
+        let mut loaded = db.load_into_settings().unwrap();
+        crate::settings::apply_load_time_migrations(&mut loaded);
+        assert_eq!(loaded.global_preset.post_filter, PostFilter::UpscaleSharp);
+        assert_eq!(
+            loaded.preset_slots.slots[9]
+                .as_ref()
+                .unwrap()
+                .params
+                .post_filter,
+            PostFilter::UpscaleSharp
         );
     }
 
@@ -3820,6 +3878,97 @@ mod tests {
         assert_eq!(read("details_page_count_sort_stash"), "true");
         assert_eq!(read("details_page_count_column_index_stash"), "2");
         assert_eq!(read("details_page_count_column_width_stash"), "96.0");
+    }
+
+    #[test]
+    fn toolbar_name_filter_is_stashed_out_of_released_enum_array() {
+        let dir = TempDir::new().unwrap();
+        let mut settings = Settings::default();
+        settings.toolbar_facet_filter_items = vec![
+            crate::settings::ToolbarFacetFilterItem::Ext,
+            crate::settings::ToolbarFacetFilterItem::NameFilter,
+            crate::settings::ToolbarFacetFilterItem::Kind,
+        ];
+
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&settings).unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("settings.db")).unwrap();
+        let read = |key: &str| -> String {
+            conn.query_row(
+                "SELECT value FROM settings_kv WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(read("toolbar_facet_filter_items"), r#"["Ext","Kind"]"#);
+        assert_eq!(read("toolbar_facet_name_filter_index_stash"), "1");
+    }
+
+    #[test]
+    fn facet_name_filter_width_roundtrips_through_settings_db() {
+        use crate::settings::FacetNameFilterWidth;
+
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        for &width in FacetNameFilterWidth::all() {
+            let mut settings = Settings::default();
+            settings.facet_name_filter_width = width;
+            db.save_full(&settings).unwrap();
+            let mut loaded = db.load_into_settings().unwrap();
+            crate::settings::apply_load_time_migrations(&mut loaded);
+            assert_eq!(loaded.facet_name_filter_width, width);
+        }
+    }
+
+    #[test]
+    fn place_details_are_persisted_without_unknown_variants() {
+        let dir = TempDir::new().unwrap();
+        let mut settings = Settings::default();
+        settings.details_sort_key = crate::settings::DetailsSortKey::Place;
+        settings.details_column_order = vec![
+            crate::settings::DetailsColumnId::Name,
+            crate::settings::DetailsColumnId::Place,
+            crate::settings::DetailsColumnId::Size,
+        ];
+        settings.details_column_widths = vec![crate::settings::DetailsColumnWidth {
+            column: crate::settings::DetailsColumnId::Place,
+            width: 180.0,
+        }];
+        settings.details_selection_bar_column_order = vec![
+            crate::settings::DetailsColumnId::Name,
+            crate::settings::DetailsColumnId::Place,
+        ];
+        settings.details_selection_bar_column_widths = vec![crate::settings::DetailsColumnWidth {
+            column: crate::settings::DetailsColumnId::Place,
+            width: 220.0,
+        }];
+
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&settings).unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("settings.db")).unwrap();
+        let read = |key: &str| -> String {
+            conn.query_row(
+                "SELECT value FROM settings_kv WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(read("details_sort_key"), r#""Toolbar""#);
+        assert!(!read("details_column_order").contains("Place"));
+        assert!(!read("details_column_widths").contains("Place"));
+        assert!(!read("details_selection_bar_column_order").contains("Place"));
+        assert!(!read("details_selection_bar_column_widths").contains("Place"));
+        assert_eq!(read("details_place_sort_stash"), "true");
+        assert_eq!(read("details_place_column_index_stash"), "1");
+        assert_eq!(read("details_place_column_width_stash"), "180.0");
+        assert_eq!(read("details_selection_bar_place_column_index_stash"), "1");
+        assert_eq!(
+            read("details_selection_bar_place_column_width_stash"),
+            "220.0"
+        );
     }
 
     #[test]

@@ -109,10 +109,87 @@ impl BindingPolicy {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ModKind {
+    /// 左右どちらの Ctrl でもよい。既存の `Ctrl` の意味を維持する。
     Ctrl,
+    /// 左右どちらの Shift でもよい。既存の `Shift` の意味を維持する。
     Shift,
+    /// 左右どちらの Alt でもよい。既存の `Alt` の意味を維持する。
     Alt,
+    /// 右 Ctrl だけ。
+    RightCtrl,
+    /// 右 Shift だけ。
+    RightShift,
+    /// 右 Alt だけ。
+    RightAlt,
 }
+
+impl ModKind {
+    pub const ALL: [Self; 6] = [
+        Self::Ctrl,
+        Self::Shift,
+        Self::Alt,
+        Self::RightCtrl,
+        Self::RightShift,
+        Self::RightAlt,
+    ];
+
+    pub const fn all() -> &'static [Self] {
+        &Self::ALL
+    }
+
+    pub const fn settings_name(self) -> &'static str {
+        match self {
+            Self::Ctrl => "Ctrl",
+            Self::Shift => "Shift",
+            Self::Alt => "Alt",
+            Self::RightCtrl => "RightCtrl",
+            Self::RightShift => "RightShift",
+            Self::RightAlt => "RightAlt",
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Ctrl => "Ctrl",
+            Self::Shift => "Shift",
+            Self::Alt => "Alt",
+            Self::RightCtrl => "右Ctrl",
+            Self::RightShift => "右Shift",
+            Self::RightAlt => "右Alt",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("ctrl") || value.eq_ignore_ascii_case("control") {
+            Some(Self::Ctrl)
+        } else if value.eq_ignore_ascii_case("shift") {
+            Some(Self::Shift)
+        } else if value.eq_ignore_ascii_case("alt") {
+            Some(Self::Alt)
+        } else if value.eq_ignore_ascii_case("rightctrl")
+            || value.eq_ignore_ascii_case("rightcontrol")
+        {
+            Some(Self::RightCtrl)
+        } else if value.eq_ignore_ascii_case("rightshift") {
+            Some(Self::RightShift)
+        } else if value.eq_ignore_ascii_case("rightalt") {
+            Some(Self::RightAlt)
+        } else {
+            None
+        }
+    }
+
+    const fn egui_projection(self) -> Self {
+        match self {
+            Self::Ctrl | Self::RightCtrl => Self::Ctrl,
+            Self::Shift | Self::RightShift => Self::Shift,
+            Self::Alt | Self::RightAlt => Self::Alt,
+        }
+    }
+}
+
+// 左側限定は現在の利用要望がなく、右側だけを選べれば「よく触る側を避ける」用途を
+// 満たせるため追加しない。Ctrl / Shift / Alt は従来どおり左右不問を表す。
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum KeySlot {
@@ -929,27 +1006,23 @@ impl KeySlot {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Chord {
-    pub ctrl: bool,
-    pub shift: bool,
-    pub alt: bool,
-    pub key: Option<KeyName>,
+pub enum Chord {
+    Key {
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+        key: KeyName,
+    },
+    Modifier(ModKind),
 }
 
 impl Chord {
-    pub const NONE: Chord = Chord {
-        ctrl: false,
-        shift: false,
-        alt: false,
-        key: None,
-    };
-
     pub const fn new(ctrl: bool, shift: bool, alt: bool, key: KeyName) -> Self {
-        Self {
+        Self::Key {
             ctrl,
             shift,
             alt,
-            key: Some(key),
+            key,
         }
     }
 
@@ -978,49 +1051,85 @@ impl Chord {
     }
 
     pub const fn modifier(kind: ModKind) -> Self {
-        match kind {
-            ModKind::Ctrl => Self {
-                ctrl: true,
-                shift: false,
-                alt: false,
-                key: None,
-            },
-            ModKind::Shift => Self {
-                ctrl: false,
-                shift: true,
-                alt: false,
-                key: None,
-            },
-            ModKind::Alt => Self {
-                ctrl: false,
-                shift: false,
-                alt: true,
-                key: None,
-            },
+        Self::Modifier(kind)
+    }
+
+    const fn key_name(self) -> Option<KeyName> {
+        match self {
+            Self::Key { key, .. } => Some(key),
+            Self::Modifier(_) => None,
+        }
+    }
+
+    const fn modifier_kind(self) -> Option<ModKind> {
+        match self {
+            Self::Key { .. } => None,
+            Self::Modifier(kind) => Some(kind),
+        }
+    }
+
+    const fn key_modifiers(self) -> Option<(bool, bool, bool)> {
+        match self {
+            Self::Key {
+                ctrl, shift, alt, ..
+            } => Some((ctrl, shift, alt)),
+            Self::Modifier(_) => None,
+        }
+    }
+
+    const fn has_key_modifiers(self) -> bool {
+        match self.key_modifiers() {
+            Some((ctrl, shift, alt)) => ctrl || shift || alt,
+            None => false,
         }
     }
 
     fn matches_egui(self, key: egui::Key, modifiers: egui::Modifiers) -> bool {
-        self.key.is_some_and(|name| name.to_egui() == Some(key))
-            && modifiers.ctrl == self.ctrl
-            && modifiers.shift == self.shift
-            && modifiers.alt == self.alt
+        let Self::Key {
+            ctrl,
+            shift,
+            alt,
+            key: name,
+        } = self
+        else {
+            return false;
+        };
+        name.to_egui() == Some(key)
+            && modifiers.ctrl == ctrl
+            && modifiers.shift == shift
+            && modifiers.alt == alt
             && !modifiers.mac_cmd
     }
 
     fn matches_modifiers(self, modifiers: egui::Modifiers) -> bool {
-        self.key.is_none()
-            && modifiers.ctrl == self.ctrl
-            && modifiers.shift == self.shift
-            && modifiers.alt == self.alt
+        let Self::Modifier(kind) = self else {
+            return false;
+        };
+        // egui::Modifiers は左右を区別できない。非 Windows の fallback では右側限定を
+        // 対応する左右不問の修飾キーへ縮退させる。
+        let (ctrl, shift, alt) = match kind.egui_projection() {
+            ModKind::Ctrl => (true, false, false),
+            ModKind::Shift => (false, true, false),
+            ModKind::Alt => (false, false, true),
+            ModKind::RightCtrl | ModKind::RightShift | ModKind::RightAlt => unreachable!(),
+        };
+        modifiers.ctrl == ctrl
+            && modifiers.shift == shift
+            && modifiers.alt == alt
             && !modifiers.mac_cmd
     }
 
     fn matches_vk_parts(self, virtual_key: u32, ctrl: bool, shift: bool, alt: bool) -> bool {
-        self.key.is_some_and(|name| name.to_vk() == virtual_key)
-            && self.ctrl == ctrl
-            && self.shift == shift
-            && self.alt == alt
+        let Self::Key {
+            ctrl: chord_ctrl,
+            shift: chord_shift,
+            alt: chord_alt,
+            key,
+        } = self
+        else {
+            return false;
+        };
+        key.to_vk() == virtual_key && chord_ctrl == ctrl && chord_shift == shift && chord_alt == alt
     }
 
     fn matches_win32_parts(
@@ -1032,11 +1141,19 @@ impl Chord {
         shift: bool,
         alt: bool,
     ) -> bool {
-        self.key
-            .is_some_and(|name| name.matches_win32(virtual_key, scan_code, extended))
-            && self.ctrl == ctrl
-            && self.shift == shift
-            && self.alt == alt
+        let Self::Key {
+            ctrl: chord_ctrl,
+            shift: chord_shift,
+            alt: chord_alt,
+            key,
+        } = self
+        else {
+            return false;
+        };
+        key.matches_win32(virtual_key, scan_code, extended)
+            && chord_ctrl == ctrl
+            && chord_shift == shift
+            && chord_alt == alt
     }
 
     #[cfg(windows)]
@@ -1053,28 +1170,24 @@ impl Chord {
 
     fn validate_for_trigger(self, trigger: KeyTrigger) -> Result<(), &'static str> {
         match trigger {
-            KeyTrigger::Press => {
-                if self.key.is_some() {
-                    Ok(())
-                } else {
-                    Err("Press actions require a normal key")
-                }
+            KeyTrigger::Press if matches!(self, Self::Key { .. }) => Ok(()),
+            KeyTrigger::Press => Err("Press actions require a normal key"),
+            KeyTrigger::ModifierHold if matches!(self, Self::Modifier(_)) => Ok(()),
+            KeyTrigger::ModifierHold => Err("ModifierHold actions accept exactly one modifier key"),
+            KeyTrigger::KeyHold
+                if matches!(
+                    self,
+                    Self::Key {
+                        ctrl: false,
+                        shift: false,
+                        alt: false,
+                        ..
+                    }
+                ) =>
+            {
+                Ok(())
             }
-            KeyTrigger::ModifierHold => {
-                let mod_count = self.ctrl as u8 + self.shift as u8 + self.alt as u8;
-                if self.key.is_none() && mod_count == 1 {
-                    Ok(())
-                } else {
-                    Err("ModifierHold actions accept exactly one modifier key")
-                }
-            }
-            KeyTrigger::KeyHold => {
-                if self.key.is_some() && !self.ctrl && !self.shift && !self.alt {
-                    Ok(())
-                } else {
-                    Err("KeyHold actions accept one normal key without modifiers")
-                }
-            }
+            KeyTrigger::KeyHold => Err("KeyHold actions accept one normal key without modifiers"),
         }
     }
 
@@ -1087,71 +1200,82 @@ impl Chord {
     }
 
     fn format_name(self, settings: bool) -> String {
-        let question_mark = self.shift && self.key == Some(KeyName::Slash);
+        let Self::Key {
+            ctrl,
+            shift,
+            alt,
+            key,
+        } = self
+        else {
+            let Self::Modifier(kind) = self else {
+                unreachable!()
+            };
+            return if settings {
+                kind.settings_name()
+            } else {
+                kind.display_name()
+            }
+            .to_string();
+        };
+        let question_mark = shift && key == KeyName::Slash;
         let mut parts = Vec::new();
-        if self.ctrl {
+        if ctrl {
             parts.push("Ctrl".to_string());
         }
-        if self.shift && !question_mark {
+        if shift && !question_mark {
             parts.push("Shift".to_string());
         }
-        if self.alt {
+        if alt {
             parts.push("Alt".to_string());
         }
         if question_mark {
             parts.push("?".to_string());
             return parts.join("+");
         }
-        if let Some(key) = self.key {
-            parts.push(if settings {
-                key.settings_name().to_string()
-            } else {
-                key.display_name().to_string()
-            });
-        }
-        if parts.is_empty() {
-            "none".to_string()
+        parts.push(if settings {
+            key.settings_name().to_string()
         } else {
-            parts.join("+")
-        }
+            key.display_name().to_string()
+        });
+        parts.join("+")
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct ChordList {
-    chords: [Chord; 3],
+    chords: [Option<Chord>; 3],
     len: usize,
 }
 
 impl ChordList {
     pub const EMPTY: Self = Self {
-        chords: [Chord::NONE; 3],
+        chords: [None; 3],
         len: 0,
     };
 
     pub const fn one(a: Chord) -> Self {
         Self {
-            chords: [a, Chord::NONE, Chord::NONE],
+            chords: [Some(a), None, None],
             len: 1,
         }
     }
 
     pub const fn two(a: Chord, b: Chord) -> Self {
         Self {
-            chords: [a, b, Chord::NONE],
+            chords: [Some(a), Some(b), None],
             len: 2,
         }
     }
 
     pub const fn three(a: Chord, b: Chord, c: Chord) -> Self {
         Self {
-            chords: [a, b, c],
+            chords: [Some(a), Some(b), Some(c)],
             len: 3,
         }
     }
 
     pub fn iter(self) -> impl Iterator<Item = Chord> {
-        self.chords.into_iter().take(self.len)
+        self.chords.into_iter().take(self.len).flatten()
     }
 
     pub fn is_empty(self) -> bool {
@@ -1394,9 +1518,12 @@ pub enum KeyAction {
     FsImageAnalysis,
     FsZoomMode,
     FsPanorama,
+    FsNavigatorToggle,
+    FsNavigatorHold,
     FsPixelGrid,
     FsLoupeLockToggle,
     FsLoupeHold,
+    FsOriginalPreviewHold,
     FsEraseMode,
     FsLocalAdjustMode,
     FsConcealMode,
@@ -1426,6 +1553,8 @@ pub enum KeyAction {
     FsPostFilterPrev,
     FsPostFilterReset,
     FsPostFilterNearest,
+    FsPostFilterUpscaleSharp,
+    FsPostFilterUpscaleAnime,
     FsPostFilterCrtSimple,
     FsPostFilterCrtFull,
     FsPostFilterCrtArcade,
@@ -1814,9 +1943,12 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsImageAnalysis,
     KeyAction::FsZoomMode,
     KeyAction::FsPanorama,
+    KeyAction::FsNavigatorToggle,
+    KeyAction::FsNavigatorHold,
     KeyAction::FsPixelGrid,
     KeyAction::FsLoupeLockToggle,
     KeyAction::FsLoupeHold,
+    KeyAction::FsOriginalPreviewHold,
     KeyAction::FsEraseMode,
     KeyAction::FsLocalAdjustMode,
     KeyAction::FsConcealMode,
@@ -1846,6 +1978,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsPostFilterPrev,
     KeyAction::FsPostFilterReset,
     KeyAction::FsPostFilterNearest,
+    KeyAction::FsPostFilterUpscaleSharp,
+    KeyAction::FsPostFilterUpscaleAnime,
     KeyAction::FsPostFilterCrtSimple,
     KeyAction::FsPostFilterCrtFull,
     KeyAction::FsPostFilterCrtArcade,
@@ -3307,9 +3441,12 @@ impl KeyAction {
             FsImageAnalysis => "FsImageAnalysis",
             FsZoomMode => "FsZoomMode",
             FsPanorama => "FsPanorama",
+            FsNavigatorToggle => "FsNavigatorToggle",
+            FsNavigatorHold => "FsNavigatorHold",
             FsPixelGrid => "FsPixelGrid",
             FsLoupeLockToggle => "FsLoupeLockToggle",
             FsLoupeHold => "FsLoupeHold",
+            FsOriginalPreviewHold => "FsOriginalPreviewHold",
             FsEraseMode => "FsEraseMode",
             FsLocalAdjustMode => "FsLocalAdjustMode",
             FsConcealMode => "FsConcealMode",
@@ -3339,6 +3476,8 @@ impl KeyAction {
             FsPostFilterPrev => "FsPostFilterPrev",
             FsPostFilterReset => "FsPostFilterReset",
             FsPostFilterNearest => "FsPostFilterNearest",
+            FsPostFilterUpscaleSharp => "FsPostFilterUpscaleSharp",
+            FsPostFilterUpscaleAnime => "FsPostFilterUpscaleAnime",
             FsPostFilterCrtSimple => "FsPostFilterCrtSimple",
             FsPostFilterCrtFull => "FsPostFilterCrtFull",
             FsPostFilterCrtArcade => "FsPostFilterCrtArcade",
@@ -3849,9 +3988,12 @@ impl KeyAction {
             FsImageAnalysis => "画像分析モードを開く",
             FsZoomMode => "全画面ズームモード (押している間ズーム範囲を指定)",
             FsPanorama => "360度パノラマモードを切り替える",
+            FsNavigatorToggle => "ナビゲータの表示を切り替える",
+            FsNavigatorHold => "押している間だけナビゲータを表示する",
             FsPixelGrid => "ピクセルグリッド表示を切り替える",
             FsLoupeLockToggle => "ルーペの固定表示を切り替える",
             FsLoupeHold => "押している間だけルーペを表示する",
+            FsOriginalPreviewHold => "押している間だけ元画像を表示する",
             FsEraseMode => "消しゴムモードを開始または確定する",
             FsLocalAdjustMode => "補正レイヤーモードを開始する",
             FsConcealMode => "隠蔽加工モードを開始または終了する",
@@ -3881,6 +4023,8 @@ impl KeyAction {
             FsPostFilterPrev => "ポストフィルタを前へ切り替える",
             FsPostFilterReset => "ポストフィルタを標準に戻す",
             FsPostFilterNearest => "ポストフィルタをニアレスト（補間なし）にする",
+            FsPostFilterUpscaleSharp => "ポストフィルタをシャープ拡大にする",
+            FsPostFilterUpscaleAnime => "ポストフィルタをアニメ塗り拡大にする",
             FsPostFilterCrtSimple => "ポストフィルタをCRT シンプル（控えめ）にする",
             FsPostFilterCrtFull => "ポストフィルタをCRT フル（歪み+強グロー）にする",
             FsPostFilterCrtArcade => "ポストフィルタをCRT アーケード（高コントラスト）にする",
@@ -4256,9 +4400,12 @@ impl KeyAction {
             | FsImageAnalysis
             | FsZoomMode
             | FsPanorama
+            | FsNavigatorToggle
+            | FsNavigatorHold
             | FsPixelGrid
             | FsLoupeLockToggle
             | FsLoupeHold
+            | FsOriginalPreviewHold
             | FsEraseMode
             | FsLocalAdjustMode
             | FsConcealMode
@@ -4288,6 +4435,8 @@ impl KeyAction {
             | FsPostFilterPrev
             | FsPostFilterReset
             | FsPostFilterNearest
+            | FsPostFilterUpscaleSharp
+            | FsPostFilterUpscaleAnime
             | FsPostFilterCrtSimple
             | FsPostFilterCrtFull
             | FsPostFilterCrtArcade
@@ -4431,7 +4580,7 @@ impl KeyAction {
     pub fn trigger(self) -> KeyTrigger {
         use KeyAction::*;
         match self {
-            FsLoupeHold => KeyTrigger::ModifierHold,
+            FsNavigatorHold | FsLoupeHold | FsOriginalPreviewHold => KeyTrigger::ModifierHold,
             EraseSpacePan | ConcealSpacePan | CropSpacePan | TextSpacePan | LaSpacePan
             | FsZoomMode => KeyTrigger::KeyHold,
             GlobalLocalSearch
@@ -4650,6 +4799,7 @@ impl KeyAction {
             | FsRotateCcw
             | FsImageAnalysis
             | FsPanorama
+            | FsNavigatorToggle
             | FsPixelGrid
             | FsLoupeLockToggle
             | FsEraseMode
@@ -4681,6 +4831,8 @@ impl KeyAction {
             | FsPostFilterPrev
             | FsPostFilterReset
             | FsPostFilterNearest
+            | FsPostFilterUpscaleSharp
+            | FsPostFilterUpscaleAnime
             | FsPostFilterCrtSimple
             | FsPostFilterCrtFull
             | FsPostFilterCrtArcade
@@ -5078,9 +5230,12 @@ impl KeyAction {
             FsImageAnalysis => ChordList::one(Chord::shift(Z)),
             FsZoomMode => ChordList::one(Chord::key(Z)),
             FsPanorama => ChordList::one(Chord::key(V)),
+            FsNavigatorToggle => ChordList::one(Chord::alt(N)),
+            FsNavigatorHold => ChordList::one(Chord::modifier(ModKind::Alt)),
             FsPixelGrid => ChordList::one(Chord::key(G)),
             FsLoupeLockToggle => ChordList::one(Chord::key(M)),
             FsLoupeHold => ChordList::one(Chord::modifier(ModKind::Shift)),
+            FsOriginalPreviewHold => ChordList::one(Chord::modifier(ModKind::RightCtrl)),
             FsEraseMode => ChordList::one(Chord::key(E)),
             FsLocalAdjustMode => ChordList::one(Chord::ctrl(G)),
             FsConcealMode => ChordList::one(Chord::ctrl(M)),
@@ -5110,6 +5265,8 @@ impl KeyAction {
             FsPostFilterPrev => ChordList::one(Chord::shift(T)),
             FsPostFilterReset => ChordList::one(Chord::alt(T)),
             FsPostFilterNearest
+            | FsPostFilterUpscaleSharp
+            | FsPostFilterUpscaleAnime
             | FsPostFilterCrtSimple
             | FsPostFilterCrtFull
             | FsPostFilterCrtArcade
@@ -5816,10 +5973,10 @@ impl Keymap {
             .into_iter()
             .next()
             .and_then(|chord| {
-                if chord.ctrl || chord.shift || chord.alt {
+                if chord.has_key_modifiers() {
                     None
                 } else {
-                    chord.key.map(KeyName::display_name)
+                    chord.key_name().map(KeyName::display_name)
                 }
             })
     }
@@ -6202,7 +6359,7 @@ impl Keymap {
             };
             return crate::key_input::consume_key_edges(ctx.viewport_id(), |edge| {
                 chords.iter().copied().any(|chord| {
-                    let physical_match = chord.key.is_some_and(|name| {
+                    let physical_match = chord.key_name().is_some_and(|name| {
                         name.matches_win32(edge.virtual_key, edge.scan_code, edge.extended)
                     });
                     // A release still belongs to the physical slot even when a
@@ -6218,13 +6375,13 @@ impl Keymap {
         let keys: Vec<egui::Key> = if let Some(chords) = self.overrides.get(&action) {
             chords
                 .iter()
-                .filter_map(|c| c.key.and_then(KeyName::egui_key_for_hold_edges))
+                .filter_map(|c| c.key_name().and_then(KeyName::egui_key_for_hold_edges))
                 .collect()
         } else {
             action
                 .default_chords()
                 .iter()
-                .filter_map(|c| c.key.and_then(KeyName::egui_key_for_hold_edges))
+                .filter_map(|c| c.key_name().and_then(KeyName::egui_key_for_hold_edges))
                 .collect()
         };
         if keys.is_empty() {
@@ -6266,6 +6423,29 @@ impl Keymap {
         if crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
             return false;
         }
+        self.modifier_held_action_without_owner_gate(ctx, action)
+    }
+
+    /// Resolve a ModifierHold whose physical state belongs to another focused viewport.
+    ///
+    /// The caller must provide its own focus and modal gates. This exists for fullscreen state
+    /// prepared from the main viewport context: the main context's cached keyboard owner can
+    /// still describe a stale focused widget even though Windows state belongs to the focused
+    /// fullscreen viewport.
+    pub(crate) fn modifier_held_action_for_external_viewport(
+        &self,
+        ctx: &egui::Context,
+        action: KeyAction,
+    ) -> bool {
+        debug_assert_eq!(action.trigger(), KeyTrigger::ModifierHold);
+        self.modifier_held_action_without_owner_gate(ctx, action)
+    }
+
+    fn modifier_held_action_without_owner_gate(
+        &self,
+        ctx: &egui::Context,
+        action: KeyAction,
+    ) -> bool {
         if let Some(chords) = self.overrides.get(&action) {
             return chords
                 .iter()
@@ -6444,7 +6624,12 @@ impl Keymap {
         out.push_str("# - 行末の ; 以降は説明コメントです。コメント解除後も残してかまいません。\n");
         out.push_str("# - 競合は拒否しません。競合時は先に判定された操作が有効になります。\n");
         out.push_str("# - 通常の押下操作は Ctrl/Shift/Alt + 通常キーを指定できます。\n");
-        out.push_str("# - ModifierHold は Ctrl / Shift / Alt のいずれか 1 つだけ指定できます。\n");
+        out.push_str(
+            "# - ModifierHold は Ctrl / Shift / Alt / RightCtrl / RightShift / RightAlt の\n",
+        );
+        out.push_str(
+            "#   いずれか 1 つだけ指定できます。Right* は右側限定、それ以外は左右不問です。\n",
+        );
         out.push_str("# - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。\n");
         out.push_str(
             "# - キー名の例: A..Z, 0..9, Numpad0..Numpad9, F1..F24, Left, Right, Up, Down,\n",
@@ -6474,7 +6659,13 @@ impl Keymap {
         out.push_str("# FsCapture = none       ; キャプチャ保存キーを無効化\n");
         out.push_str("# FsLoupeLockToggle = L  ; ルーペ固定表示のトグルを L に変更\n");
         out.push_str(
+            "# FsNavigatorHold = Ctrl ; 押している間だけナビゲータ表示する修飾キーを Ctrl に変更\n",
+        );
+        out.push_str(
             "# FsLoupeHold = Ctrl     ; 押している間だけルーペ表示する修飾キーを Ctrl に変更\n",
+        );
+        out.push_str(
+            "# FsOriginalPreviewHold = none ; 押している間だけ元画像表示する操作を無効化\n",
         );
         out.push_str("#\n");
         out.push_str("# [Rating]\n");
@@ -6556,7 +6747,7 @@ impl Keymap {
     }
 
     fn consume_chord_inner(&self, ctx: &egui::Context, chord: Chord, allow_repeat: bool) -> bool {
-        if chord.key.is_none() {
+        if chord.key_name().is_none() {
             return false;
         }
         if crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
@@ -6628,7 +6819,7 @@ impl Keymap {
         chord: Chord,
         allow_repeat: bool,
     ) -> usize {
-        if chord.key.is_none() || crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
+        if chord.key_name().is_none() || crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
             return 0;
         }
         #[cfg(windows)]
@@ -6685,7 +6876,7 @@ impl Keymap {
     }
 
     fn cancel_claimed_tab_focus_traversal(ctx: &egui::Context, chord: Chord) {
-        if chord.key == Some(KeyName::Tab) {
+        if chord.key_name() == Some(KeyName::Tab) {
             crate::egui_focus_policy::cancel_tab_focus_traversal(ctx);
         }
     }
@@ -6734,7 +6925,7 @@ impl Keymap {
     }
 
     fn pressed_chord(&self, ctx: &egui::Context, chord: Chord) -> bool {
-        if chord.key.is_none() {
+        if chord.key_name().is_none() {
             return false;
         }
         if crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
@@ -6764,10 +6955,10 @@ impl Keymap {
     }
 
     fn key_held_chord(&self, ctx: &egui::Context, chord: Chord) -> bool {
-        if chord.ctrl || chord.shift || chord.alt {
+        if chord.has_key_modifiers() {
             return false;
         }
-        let Some(name) = chord.key else {
+        let Some(name) = chord.key_name() else {
             return false;
         };
         // KeyHold は「修飾キーなしの通常キー」契約 (validate_for_trigger 参照)。修飾キーが
@@ -6807,16 +6998,8 @@ impl Keymap {
 
     fn modifier_held_chord(&self, ctx: &egui::Context, chord: Chord) -> bool {
         #[cfg(windows)]
-        if chord.key.is_none() {
-            if chord.ctrl {
-                return modifier_held_via_os(ModKind::Ctrl);
-            }
-            if chord.shift {
-                return modifier_held_via_os(ModKind::Shift);
-            }
-            if chord.alt {
-                return modifier_held_via_os(ModKind::Alt);
-            }
+        if let Some(kind) = chord.modifier_kind() {
+            return modifier_held_via_os(kind);
         }
         ctx.input(|i| chord.matches_modifiers(i.modifiers))
     }
@@ -6960,16 +7143,26 @@ fn key_held_via_os(viewport: egui::ViewportId, key: KeyName) -> bool {
 }
 
 #[cfg(windows)]
-pub(crate) fn modifier_held_via_os(kind: ModKind) -> bool {
+const fn modifier_virtual_key(kind: ModKind) -> u16 {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT,
+        VK_CONTROL, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
     };
 
-    let vk = match kind {
+    match kind {
         ModKind::Ctrl => VK_CONTROL.0,
         ModKind::Shift => VK_SHIFT.0,
         ModKind::Alt => VK_MENU.0,
-    };
+        ModKind::RightCtrl => VK_RCONTROL.0,
+        ModKind::RightShift => VK_RSHIFT.0,
+        ModKind::RightAlt => VK_RMENU.0,
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn modifier_held_via_os(kind: ModKind) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+
+    let vk = modifier_virtual_key(kind);
     unsafe { GetAsyncKeyState(vk as i32) < 0 }
 }
 
@@ -7013,7 +7206,15 @@ pub fn native_video_fullscreen_shortcut_key(
 }
 
 fn is_context_shortcuts_help_question_chord(chord: Chord) -> bool {
-    chord.key == Some(KeyName::Slash) && chord.shift && !chord.ctrl && !chord.alt
+    matches!(
+        chord,
+        Chord::Key {
+            ctrl: false,
+            shift: true,
+            alt: false,
+            key: KeyName::Slash,
+        }
+    )
 }
 
 #[cfg(windows)]
@@ -7159,34 +7360,73 @@ pub fn parse_chord_for_action(action: KeyAction, text: &str) -> Result<Option<Ch
 }
 
 fn parse_chord(rhs: &str) -> Result<Chord, String> {
-    let mut chord = Chord::NONE;
-    let mut key_seen = false;
+    let mut ctrl = false;
+    let mut shift = false;
+    let mut alt = false;
+    let mut key = None;
+    let mut right_modifier = None;
     for token in rhs.split('+').map(str::trim).filter(|s| !s.is_empty()) {
-        if token.eq_ignore_ascii_case("ctrl") || token.eq_ignore_ascii_case("control") {
-            chord.ctrl = true;
-        } else if token.eq_ignore_ascii_case("shift") {
-            chord.shift = true;
-        } else if token.eq_ignore_ascii_case("alt") {
-            chord.alt = true;
+        if let Some(kind) = ModKind::parse(token) {
+            match kind {
+                ModKind::Ctrl | ModKind::Shift | ModKind::Alt => {
+                    if right_modifier.is_some() {
+                        return Err(format!(
+                            "'{rhs}' uses a right-side modifier with another key"
+                        ));
+                    }
+                    match kind {
+                        ModKind::Ctrl => ctrl = true,
+                        ModKind::Shift => shift = true,
+                        ModKind::Alt => alt = true,
+                        ModKind::RightCtrl | ModKind::RightShift | ModKind::RightAlt => {
+                            unreachable!()
+                        }
+                    }
+                }
+                ModKind::RightCtrl | ModKind::RightShift | ModKind::RightAlt => {
+                    if key.is_some() || ctrl || shift || alt {
+                        return Err(format!(
+                            "'{rhs}' uses a right-side modifier with another key"
+                        ));
+                    }
+                    if right_modifier.is_some_and(|current| current != kind) {
+                        return Err(format!("'{rhs}' has more than one modifier key"));
+                    }
+                    right_modifier = Some(kind);
+                }
+            }
         } else {
-            if key_seen {
+            if key.is_some() {
                 return Err(format!("'{rhs}' has more than one normal key"));
             }
-            if token == "?" || token.eq_ignore_ascii_case("questionmark") {
-                chord.shift = true;
-                chord.key = Some(KeyName::Slash);
-            } else {
-                let key =
-                    KeyName::parse(token).ok_or_else(|| format!("unknown key name '{token}'"))?;
-                chord.key = Some(key);
+            if right_modifier.is_some() {
+                return Err(format!(
+                    "'{rhs}' uses a right-side modifier with another key"
+                ));
             }
-            key_seen = true;
+            if token == "?" || token.eq_ignore_ascii_case("questionmark") {
+                shift = true;
+                key = Some(KeyName::Slash);
+            } else {
+                let parsed =
+                    KeyName::parse(token).ok_or_else(|| format!("unknown key name '{token}'"))?;
+                key = Some(parsed);
+            }
         }
     }
-    if !key_seen && !chord.ctrl && !chord.shift && !chord.alt {
-        return Err("empty key chord".to_string());
+    if let Some(kind) = right_modifier {
+        return Ok(Chord::modifier(kind));
     }
-    Ok(chord)
+    if let Some(key) = key {
+        return Ok(Chord::new(ctrl, shift, alt, key));
+    }
+    match (ctrl, shift, alt) {
+        (true, false, false) => Ok(Chord::modifier(ModKind::Ctrl)),
+        (false, true, false) => Ok(Chord::modifier(ModKind::Shift)),
+        (false, false, true) => Ok(Chord::modifier(ModKind::Alt)),
+        (false, false, false) => Err("empty key chord".to_string()),
+        _ => Err(format!("'{rhs}' has more than one modifier key")),
+    }
 }
 
 fn next_legacy_keymap_backup_path(path: &Path) -> PathBuf {
@@ -8670,6 +8910,8 @@ mod tests {
             KeyAction::FsAiModelNmkdSiax4x,
             KeyAction::FsAiModelRealEsrGeneralV3,
             KeyAction::FsPostFilterNearest,
+            KeyAction::FsPostFilterUpscaleSharp,
+            KeyAction::FsPostFilterUpscaleAnime,
             KeyAction::FsPostFilterCrtSimple,
             KeyAction::FsPostFilterCrtFull,
             KeyAction::FsPostFilterCrtArcade,
@@ -8870,6 +9112,86 @@ mod tests {
             KeyAction::FsImageAnalysis.default_chords().iter().next(),
             Some(Chord::shift(KeyName::Z))
         );
+    }
+
+    #[test]
+    fn navigator_uses_free_alt_n_image_fullscreen_chord() {
+        let navigator = KeyAction::FsNavigatorToggle;
+        let chord = Chord::alt(KeyName::N);
+        assert_eq!(navigator.context(), KeyContext::FsImage);
+        assert_eq!(navigator.trigger(), KeyTrigger::Press);
+        assert_eq!(navigator.default_chords().iter().next(), Some(chord));
+        assert!(
+            KeyAction::all()
+                .iter()
+                .copied()
+                .filter(|action| *action != navigator && action.context() == KeyContext::FsImage)
+                .all(|action| !action
+                    .default_chords()
+                    .iter()
+                    .any(|candidate| candidate == chord))
+        );
+    }
+
+    #[test]
+    fn navigator_hold_uses_alt_modifier_hold_in_image_fullscreen() {
+        let navigator_hold = KeyAction::FsNavigatorHold;
+        assert_eq!(navigator_hold.context(), KeyContext::FsImage);
+        assert_eq!(navigator_hold.trigger(), KeyTrigger::ModifierHold);
+        assert_eq!(
+            navigator_hold.default_chords().iter().next(),
+            Some(Chord::modifier(ModKind::Alt))
+        );
+    }
+
+    #[test]
+    fn original_preview_hold_uses_right_ctrl_modifier_hold_in_image_fullscreen() {
+        let original_preview = KeyAction::FsOriginalPreviewHold;
+        assert_eq!(original_preview.context(), KeyContext::FsImage);
+        assert_eq!(original_preview.trigger(), KeyTrigger::ModifierHold);
+        assert_eq!(
+            original_preview.default_chords().iter().next(),
+            Some(Chord::modifier(ModKind::RightCtrl))
+        );
+    }
+
+    #[test]
+    fn modifier_kind_names_and_egui_fallback_cover_all_variants() {
+        let cases = [
+            (ModKind::Ctrl, "Ctrl", "Ctrl"),
+            (ModKind::Shift, "Shift", "Shift"),
+            (ModKind::Alt, "Alt", "Alt"),
+            (ModKind::RightCtrl, "RightCtrl", "右Ctrl"),
+            (ModKind::RightShift, "RightShift", "右Shift"),
+            (ModKind::RightAlt, "RightAlt", "右Alt"),
+        ];
+        assert_eq!(ModKind::all().len(), cases.len());
+        for (kind, settings, display) in cases {
+            let chord = Chord::modifier(kind);
+            assert_eq!(ModKind::parse(settings), Some(kind));
+            assert_eq!(chord.modifier_kind(), Some(kind));
+            assert_eq!(chord.settings_name(), settings);
+            assert_eq!(chord.display_name(), display);
+        }
+
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert!(Chord::modifier(ModKind::Ctrl).matches_modifiers(ctrl));
+        assert!(Chord::modifier(ModKind::RightCtrl).matches_modifiers(ctrl));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn right_ctrl_modifier_maps_only_to_the_right_ctrl_vk() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LCONTROL, VK_RCONTROL};
+
+        let chord = parse_chord("RightCtrl").unwrap();
+        let kind = chord.modifier_kind().expect("modifier chord");
+        assert_eq!(kind, ModKind::RightCtrl);
+        assert_eq!(modifier_virtual_key(kind), VK_RCONTROL.0);
+        assert_ne!(modifier_virtual_key(kind), VK_LCONTROL.0);
     }
 
     #[test]
@@ -10379,6 +10701,51 @@ mod tests {
     }
 
     #[test]
+    fn original_preview_right_ctrl_ini_roundtrips_through_settings() {
+        let keymap = Keymap::from_ini_str("[FsImage]\nFsOriginalPreviewHold = RightCtrl\n");
+        assert!(keymap.warnings().is_empty(), "{:?}", keymap.warnings());
+        let settings = KeymapSettings::from_keymap(&keymap);
+        assert!(settings.overrides.iter().any(|binding| {
+            binding.action == "FsOriginalPreviewHold"
+                && binding.chords == vec!["RightCtrl".to_string()]
+        }));
+        assert_eq!(
+            Keymap::from_settings(&settings).effective_chords(KeyAction::FsOriginalPreviewHold),
+            vec![Chord::modifier(ModKind::RightCtrl)]
+        );
+    }
+
+    #[test]
+    fn legacy_modifier_hold_ini_without_right_variants_still_loads() {
+        let keymap = Keymap::from_ini_str("[FsImage]\nFsNavigatorHold = Ctrl\nFsLoupeHold = Alt\n");
+        assert!(keymap.warnings().is_empty(), "{:?}", keymap.warnings());
+        assert_eq!(
+            keymap.effective_chords(KeyAction::FsNavigatorHold),
+            vec![Chord::modifier(ModKind::Ctrl)]
+        );
+        assert_eq!(
+            keymap.effective_chords(KeyAction::FsLoupeHold),
+            vec![Chord::modifier(ModKind::Alt)]
+        );
+        // FsOriginalPreviewHold 自体が存在しない旧ファイルでも、新しい既定値を補う。
+        assert_eq!(
+            keymap.effective_chords(KeyAction::FsOriginalPreviewHold),
+            vec![Chord::modifier(ModKind::RightCtrl)]
+        );
+    }
+
+    #[test]
+    fn original_preview_hold_can_be_disabled() {
+        let mut settings = KeymapSettings::default();
+        settings.disable_action(KeyAction::FsOriginalPreviewHold);
+        assert!(
+            Keymap::from_settings(&settings)
+                .effective_chords(KeyAction::FsOriginalPreviewHold)
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn keymap_settings_edit_helpers_set_disable_and_restore_default() {
         let mut settings = KeymapSettings::default();
         settings.set_override_chords(
@@ -10458,6 +10825,17 @@ mod tests {
         );
         assert_eq!(parse_chord_for_action(KeyAction::GridPin, "none"), Ok(None));
         assert!(parse_chord_for_action(KeyAction::FsLoupeHold, "Ctrl+F13").is_err());
+        for name in ["RightCtrl", "RightShift", "RightAlt"] {
+            assert!(
+                parse_chord_for_action(KeyAction::FsOriginalPreviewHold, name)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(
+            parse_chord_for_action(KeyAction::FsOriginalPreviewHold, "RightCtrl+RightShift")
+                .is_err()
+        );
         assert!(parse_chord_for_action(KeyAction::EraseSpacePan, "Ctrl+Space").is_err());
     }
 

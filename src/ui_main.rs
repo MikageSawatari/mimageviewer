@@ -18,7 +18,8 @@ use crate::keymap::{KeyAction, Keymap, MenuCommandId, TopMenuId, resolve_menu_la
 use crate::settings::{
     DetailsColumnId, DetailsColumnWidth, DetailsRowStyle, DetailsSelectionBarMode,
     DetailsSizeDisplayMode, DetailsSortKey, FacetCalendarDate, FacetDatePreset, FacetEditFlag,
-    FacetItemKind, FacetSizePreset, FacetTagMode, GridClickSelectionMode, GridViewMode,
+    FacetItemKind, FacetSizePreset, FacetSizeUnit, FacetSizeValue, FacetTagMode,
+    GridClickSelectionMode, GridViewMode,
 };
 // open_external_player はグリッドからは使わなくなった (動画はフルスクリーン化 →
 // インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
@@ -473,6 +474,44 @@ fn draw_facet_calendar_date_row(
     value.sanitize();
     *date = enabled.then_some(value);
     *date != before
+}
+
+/// サイズ範囲の片側 1 行を描く。
+///
+/// 関係語 (`以上` / `未満`) は値の**後ろ**へ置く。前に置くと「最大 100 KB 未満」のように
+/// 日本語として読めない並びになる (実機確認で指摘された)。行全体で
+/// 「下限 100 KB 以上」「上限 1 MB 未満」と読める並びにする。
+pub(crate) fn draw_facet_size_value_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    relation: &str,
+    id: &'static str,
+    value: &mut Option<FacetSizeValue>,
+    default: FacetSizeValue,
+) -> bool {
+    let before = *value;
+    let mut enabled = value.is_some();
+    let mut current = value.unwrap_or(default);
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut enabled, label);
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.add(
+                egui::DragValue::new(&mut current.value)
+                    .range(0..=u32::MAX)
+                    .speed(1),
+            );
+            egui::ComboBox::from_id_salt(("facet_size_unit", id))
+                .selected_text(current.unit.label())
+                .show_ui(ui, |ui| {
+                    for unit in FacetSizeUnit::ALL {
+                        ui.selectable_value(&mut current.unit, unit, unit.label());
+                    }
+                });
+            ui.label(relation);
+        });
+    });
+    *value = enabled.then_some(current);
+    *value != before
 }
 
 fn prepare_ai_facet_menu_popup(ui: &mut egui::Ui) {
@@ -1115,6 +1154,7 @@ pub(crate) enum DetailsColumn {
     Tags,
     Kind,
     PageCount,
+    Place,
     Size,
     Modified,
     Created,
@@ -1257,6 +1297,16 @@ impl DetailsColumnSet {
         }
     }
 
+    fn column_order_mut<'a>(
+        self,
+        settings: &'a mut crate::settings::Settings,
+    ) -> &'a mut Vec<DetailsColumnId> {
+        match self {
+            Self::Details | Self::SharedBar => &mut settings.details_column_order,
+            Self::DedicatedBar => &mut settings.details_selection_bar_column_order,
+        }
+    }
+
     fn column_widths<'a>(
         self,
         settings: &'a crate::settings::Settings,
@@ -1291,6 +1341,7 @@ impl DetailsColumn {
             Self::Tags,
             Self::Kind,
             Self::PageCount,
+            Self::Place,
             Self::Size,
             Self::Modified,
             Self::Created,
@@ -1310,6 +1361,7 @@ impl DetailsColumn {
             Self::Tags => "タグ",
             Self::Kind => "種類",
             Self::PageCount => "ページ数",
+            Self::Place => "場所",
             Self::Size => "サイズ",
             Self::Modified => "更新日時",
             Self::Created => "作成日時",
@@ -1329,6 +1381,7 @@ impl DetailsColumn {
             Self::Tags => DetailsColumnId::Tags,
             Self::Kind => DetailsColumnId::Kind,
             Self::PageCount => DetailsColumnId::PageCount,
+            Self::Place => DetailsColumnId::Place,
             Self::Size => DetailsColumnId::Size,
             Self::Modified => DetailsColumnId::Modified,
             Self::Created => DetailsColumnId::Created,
@@ -1348,6 +1401,7 @@ impl DetailsColumn {
             DetailsColumnId::Tags => Self::Tags,
             DetailsColumnId::Kind => Self::Kind,
             DetailsColumnId::PageCount => Self::PageCount,
+            DetailsColumnId::Place => Self::Place,
             DetailsColumnId::Size => Self::Size,
             DetailsColumnId::Modified => Self::Modified,
             DetailsColumnId::Created => Self::Created,
@@ -1367,6 +1421,7 @@ impl DetailsColumn {
             Self::Tags => Some(DetailsSortKey::Tags),
             Self::Kind => Some(DetailsSortKey::Kind),
             Self::PageCount => Some(DetailsSortKey::PageCount),
+            Self::Place => Some(DetailsSortKey::Place),
             Self::Size => Some(DetailsSortKey::Size),
             Self::Modified => Some(DetailsSortKey::Modified),
             Self::Created => Some(DetailsSortKey::Created),
@@ -1413,6 +1468,9 @@ impl DetailsColumn {
             Self::PageCount => dedicated
                 .then_some(settings.details_selection_bar_show_page_count)
                 .unwrap_or(settings.details_show_page_count),
+            Self::Place => dedicated
+                .then_some(settings.details_selection_bar_show_place)
+                .unwrap_or(settings.details_show_place),
             Self::Size => dedicated
                 .then_some(settings.details_selection_bar_show_size)
                 .unwrap_or(settings.details_show_size),
@@ -1452,6 +1510,7 @@ impl DetailsColumn {
             Self::Tags => 160.0,
             Self::Kind => 96.0,
             Self::PageCount => 80.0,
+            Self::Place => 180.0,
             Self::Size => 92.0,
             Self::Modified | Self::Created => 138.0,
             Self::State => 127.0,
@@ -1482,6 +1541,18 @@ fn details_ordered_columns(
     column_set: DetailsColumnSet,
     include_hidden: bool,
 ) -> Vec<DetailsColumn> {
+    details_storage_ordered_columns(settings, column_set)
+        .into_iter()
+        .filter(|col| {
+            column_set.includes(*col) && (include_hidden || col.visible(settings, column_set))
+        })
+        .collect()
+}
+
+fn details_storage_ordered_columns(
+    settings: &crate::settings::Settings,
+    column_set: DetailsColumnSet,
+) -> Vec<DetailsColumn> {
     let mut ordered = Vec::with_capacity(DetailsColumn::all().len());
     let source: Vec<DetailsColumnId> = if column_set.column_order(settings).is_empty() {
         DetailsColumnId::default_order().to_vec()
@@ -1500,11 +1571,6 @@ fn details_ordered_columns(
         }
     }
     ordered
-        .into_iter()
-        .filter(|col| {
-            column_set.includes(*col) && (include_hidden || col.visible(settings, column_set))
-        })
-        .collect()
 }
 
 fn details_column_is_visible(
@@ -1525,6 +1591,10 @@ fn details_visible_columns(
 fn selection_info_bottom_bar_is_hidden(settings: &crate::settings::Settings) -> bool {
     settings.grid_view_mode == GridViewMode::Details
         && settings.details_selection_bar_mode.normalized() == DetailsSelectionBarMode::Hidden
+}
+
+fn grid_row_text_tooltips_enabled(grid_view_mode: GridViewMode) -> bool {
+    grid_view_mode != GridViewMode::Details
 }
 
 fn selection_info_bottom_bar_column_set(settings: &crate::settings::Settings) -> DetailsColumnSet {
@@ -1706,6 +1776,7 @@ fn details_column_visibility_slot(
         (false, DetailsColumn::Tags) => &mut settings.details_show_tags,
         (false, DetailsColumn::Kind) => &mut settings.details_show_kind,
         (false, DetailsColumn::PageCount) => &mut settings.details_show_page_count,
+        (false, DetailsColumn::Place) => &mut settings.details_show_place,
         (false, DetailsColumn::Size) => &mut settings.details_show_size,
         (false, DetailsColumn::Modified) => &mut settings.details_show_modified,
         (false, DetailsColumn::Created) => &mut settings.details_show_created,
@@ -1719,6 +1790,7 @@ fn details_column_visibility_slot(
         (true, DetailsColumn::Tags) => &mut settings.details_selection_bar_show_tags,
         (true, DetailsColumn::Kind) => &mut settings.details_selection_bar_show_kind,
         (true, DetailsColumn::PageCount) => &mut settings.details_selection_bar_show_page_count,
+        (true, DetailsColumn::Place) => &mut settings.details_selection_bar_show_place,
         (true, DetailsColumn::Size) => &mut settings.details_selection_bar_show_size,
         (true, DetailsColumn::Modified) => &mut settings.details_selection_bar_show_modified,
         (true, DetailsColumn::Created) => &mut settings.details_selection_bar_show_created,
@@ -1772,6 +1844,7 @@ struct DetailsColumnMenuState {
     show_tags: bool,
     show_kind: bool,
     show_page_count: bool,
+    show_place: bool,
     show_size: bool,
     show_modified: bool,
     show_created: bool,
@@ -1807,6 +1880,7 @@ impl DetailsColumnMenuState {
             show_tags: DetailsColumn::Tags.visible(settings, column_set),
             show_kind: DetailsColumn::Kind.visible(settings, column_set),
             show_page_count: DetailsColumn::PageCount.visible(settings, column_set),
+            show_place: DetailsColumn::Place.visible(settings, column_set),
             show_size: DetailsColumn::Size.visible(settings, column_set),
             show_modified: DetailsColumn::Modified.visible(settings, column_set),
             show_created: DetailsColumn::Created.visible(settings, column_set),
@@ -1870,6 +1944,7 @@ fn apply_details_column_menu_visibility(
             (DetailsColumn::Tags, state.show_tags),
             (DetailsColumn::Kind, state.show_kind),
             (DetailsColumn::PageCount, state.show_page_count),
+            (DetailsColumn::Place, state.show_place),
             (DetailsColumn::Size, state.show_size),
         ],
     );
@@ -2578,6 +2653,7 @@ fn clamp_details_tooltip_axis(value: f32, min: f32, max: f32) -> f32 {
 
 fn reorder_details_column(
     settings: &mut crate::settings::Settings,
+    column_set: DetailsColumnSet,
     dragged: DetailsColumn,
     target: DetailsColumn,
     insert_after_target: bool,
@@ -2585,7 +2661,7 @@ fn reorder_details_column(
     if dragged == target {
         return false;
     }
-    let mut columns = details_ordered_columns(settings, DetailsColumnSet::Details, true);
+    let mut columns = details_ordered_columns(settings, column_set, true);
     let Some(from_pos) = columns.iter().position(|col| *col == dragged) else {
         return false;
     };
@@ -2599,19 +2675,31 @@ fn reorder_details_column(
         target_pos
     };
     columns.insert(insert_pos.min(columns.len()), dragged);
-    let new_order = columns
+    // Bottom bars omit Preview, but their persisted order may still contain it. Replace only
+    // columns owned by this surface so a bar reorder cannot drop or relocate excluded columns.
+    let mut reordered = columns.into_iter();
+    let new_order = details_storage_ordered_columns(settings, column_set)
         .into_iter()
+        .map(|column| {
+            if column_set.includes(column) {
+                reordered.next().unwrap_or(column)
+            } else {
+                column
+            }
+        })
         .map(DetailsColumn::id)
         .collect::<Vec<_>>();
-    if settings.details_column_order == new_order {
+    let stored_order = column_set.column_order_mut(settings);
+    if *stored_order == new_order {
         return false;
     }
-    settings.details_column_order = new_order;
+    *stored_order = new_order;
     true
 }
 
 fn finish_details_header_drag(
     settings: &mut crate::settings::Settings,
+    column_set: DetailsColumnSet,
     columns: &[(DetailsColumn, egui::Rect)],
     drag: DetailsHeaderDrag,
     min_delta_x: f32,
@@ -2623,7 +2711,7 @@ fn finish_details_header_drag(
         return false;
     };
     let insert_after = drag.latest.x > target_rect.center().x;
-    reorder_details_column(settings, drag.column, target, insert_after)
+    reorder_details_column(settings, column_set, drag.column, target, insert_after)
 }
 
 // ── ツールバー セクション カスタマイズ helper (v2.0.0 Phase 3) ──────────────
@@ -8671,6 +8759,7 @@ impl App {
     // ── スマートフィルタバー ────────────────────────────────────────
 
     pub(crate) fn render_facet_filter_bar(&mut self, ctx: &egui::Context) {
+        self.facet_name_has_focus = false;
         self.color_filter.input_has_focus = false;
         if !self.settings.show_toolbar_facet_filter {
             return;
@@ -8684,6 +8773,7 @@ impl App {
         let mut non_place_facet_changed = false;
         let mut rating_changed = false;
         let mut color_changed = false;
+        let mut facet_name_changed = false;
         let mut bookmark_filter_changed = false;
         let mut reading_history_filter_changed = false;
         egui::TopBottomPanel::top("facet_filter_bar").show(ctx, |ui| {
@@ -8793,6 +8883,9 @@ impl App {
                             facet_items.push(FI::Place);
                         }
                     }
+                    if !facet_items.contains(&FI::NameFilter) {
+                        facet_name_changed |= self.clear_facet_name_filter_state();
+                    }
                 }
                 if facet_items.is_empty() {
                     ui.label(egui::RichText::new("(右クリックでボタンを選択)").weak());
@@ -8851,6 +8944,44 @@ impl App {
                                 color_changed |= self.draw_facet_color_menu(ui);
                             }
                         }
+                        FI::NameFilter => {
+                            ui.separator();
+                            let mut output = crate::ime_focus::show_singleline(
+                                ui,
+                                &mut self.facet_name_input,
+                                None,
+                                |edit| {
+                                    edit.hint_text("ファイル名").desired_width(
+                                        self.settings.facet_name_filter_width.width(),
+                                    )
+                                },
+                            );
+                            let response_changed = output.response.changed();
+                            let menu_changed =
+                                crate::ui_helpers::singleline_text_edit_context_menu(
+                                    ui,
+                                    &mut output,
+                                    &mut self.facet_name_input,
+                                );
+                            let response = output
+                                .response
+                                .clone()
+                                .on_hover_text("表示中の一覧をファイル名で絞り込みます");
+                            self.facet_name_has_focus |= response.has_focus();
+                            if response_changed || menu_changed {
+                                self.schedule_facet_name_filter_update();
+                            }
+                            if ui
+                                .add_enabled(
+                                    !self.facet_name_input.is_empty(),
+                                    egui::Button::new("×").small(),
+                                )
+                                .hover_tip("ファイル名フィルターを解除")
+                                .clicked()
+                            {
+                                facet_name_changed |= self.clear_facet_name_filter_state();
+                            }
+                        }
                         FI::Unknown => {}
                     }
                 }
@@ -8891,6 +9022,7 @@ impl App {
                     self.draw_color_filter_active_chip(ui);
                     if ui.small_button("全解除").clicked() {
                         if self.facet_filter_active() {
+                            facet_name_changed |= self.clear_facet_name_filter_state();
                             self.settings.facet_filter.clear();
                             facet_changed = true;
                         }
@@ -8930,11 +9062,12 @@ impl App {
         if rating_changed {
             self.drop_rating_filter_suppression_on_user_edit();
         }
-        let color_scope_changed = (facet_changed || rating_changed) && self.color_filter.enabled;
+        let color_scope_changed =
+            (facet_changed || facet_name_changed || rating_changed) && self.color_filter.enabled;
         if color_scope_changed {
             self.color_filter.applied_scope_signature = None;
         }
-        if facet_changed || rating_changed {
+        if facet_changed || facet_name_changed || rating_changed {
             let preserve_place_counts =
                 place_changed && !non_place_facet_changed && !rating_changed;
             let place_counts_cache = preserve_place_counts
@@ -9039,7 +9172,7 @@ impl App {
 
         draw_sticky_settings_menu_header(ui, "絞り込みバー", true);
         ui.separator();
-        ui.label("表示するボタン:");
+        ui.label("表示する項目:");
         let mut changed = false;
         for &item in FI::all() {
             let mut checked = self.settings.toolbar_facet_filter_items.contains(&item);
@@ -9057,6 +9190,20 @@ impl App {
                 changed = true;
             }
         }
+
+        ui.separator();
+        ui.label("ファイル名欄の幅:");
+        ui.horizontal(|ui| {
+            for &width in crate::settings::FacetNameFilterWidth::all() {
+                changed |= ui
+                    .selectable_value(
+                        &mut self.settings.facet_name_filter_width,
+                        width,
+                        width.label(),
+                    )
+                    .changed();
+            }
+        });
 
         ui.separator();
         if ui
@@ -9641,27 +9788,72 @@ impl App {
     fn draw_facet_size_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let active = usize::from(self.settings.facet_filter.size_preset.is_some());
         let mut changed = false;
-        let menu = ui.menu_button(facet_menu_label("サイズ", active), |ui| {
-            prepare_facet_menu_popup(ui);
-            let current = self.settings.facet_filter.size_preset;
-            if ui.selectable_label(current.is_none(), "すべて").clicked() {
-                self.settings.facet_filter.size_preset = None;
-                changed = true;
-                ui.close();
-            }
-            ui.separator();
-            for &preset in FacetSizePreset::all() {
-                if ui
-                    .selectable_label(current == Some(preset), preset.label())
-                    .clicked()
-                {
-                    self.settings.facet_filter.size_preset = Some(preset);
-                    changed = true;
-                    ui.close();
-                }
-            }
-        });
-        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
+        let (menu_response, _) =
+            egui::containers::menu::MenuButton::new(facet_menu_label("サイズ", active))
+                .config(sticky_facet_menu_config())
+                .ui(ui, |ui| {
+                    prepare_facet_menu_popup(ui);
+                    let current = self.settings.facet_filter.size_preset;
+                    if ui.selectable_label(current.is_none(), "すべて").clicked() {
+                        self.settings.facet_filter.size_preset = None;
+                        changed = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    for &preset in FacetSizePreset::all() {
+                        if ui
+                            .selectable_label(current == Some(preset), preset.label())
+                            .clicked()
+                        {
+                            self.settings.facet_filter.size_preset = Some(preset);
+                            changed = true;
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    let range_selected = matches!(
+                        self.settings.facet_filter.size_preset,
+                        Some(FacetSizePreset::Range { .. })
+                    );
+                    if ui.selectable_label(range_selected, "範囲指定").clicked() {
+                        if !range_selected {
+                            // 両端ともチェックを外した状態から始める。片方に既定値を入れて
+                            // おくと、範囲指定を選んだだけで意図しない絞り込みが掛かる。
+                            self.settings.facet_filter.size_preset = Some(FacetSizePreset::Range {
+                                min: None,
+                                max: None,
+                            });
+                        }
+                        changed = true;
+                    }
+                    if let Some(FacetSizePreset::Range { mut min, mut max }) =
+                        self.settings.facet_filter.size_preset
+                    {
+                        let mut range_changed = false;
+                        range_changed |= draw_facet_size_value_row(
+                            ui,
+                            "下限",
+                            "以上",
+                            "main_min",
+                            &mut min,
+                            FacetSizeValue::new(100, FacetSizeUnit::KB),
+                        );
+                        range_changed |= draw_facet_size_value_row(
+                            ui,
+                            "上限",
+                            "未満",
+                            "main_max",
+                            &mut max,
+                            FacetSizeValue::new(1, FacetSizeUnit::MB),
+                        );
+                        if range_changed {
+                            self.settings.facet_filter.size_preset =
+                                Some(FacetSizePreset::Range { min, max }.sanitized());
+                            changed = true;
+                        }
+                    }
+                });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu_response);
         changed
     }
 
@@ -10501,7 +10693,7 @@ impl App {
                 // ファイル名スタックのトグルクリックは closure 後に処理する (load_folder で
                 // App ミュータブル借用が必要)。
                 let mut stack_toggle = false;
-                let mut subfolder_expansion_toggle = false;
+                let mut subfolder_expansion_button_clicked = false;
                 // 検索中の ⬆ ボタン (検索仮想階層を 1 段ドリルアップ) を closure 後に適用。
                 let mut search_drill_up = false;
                 ui.horizontal(|ui| {
@@ -10925,7 +11117,11 @@ impl App {
                             ui.add_space(4.0);
                         }
                         if subfolder_expansion_available {
-                            let tooltip = if subfolder_expansion_pending {
+                            let depth_choice =
+                                crate::app::SubfolderExpansionDepthChoice::from_setting(
+                                    self.settings.subfolder_expansion_max_depth,
+                                );
+                            let mut tooltip = if subfolder_expansion_pending {
                                 subfolder_expansion_pending_tooltip
                                     .clone()
                                     .unwrap_or_else(|| "サブフォルダを走査中".to_string())
@@ -10934,6 +11130,13 @@ impl App {
                             } else {
                                 self.subfolder_expansion_action_tooltip()
                             };
+                            if subfolder_expansion_pending || subfolder_expansion_on {
+                                tooltip.push_str(&format!(
+                                    "\n走査階層: {}",
+                                    depth_choice.label()
+                                ));
+                            }
+
                             let resp = ui
                                 .add_enabled(
                                     !subfolder_expansion_pending,
@@ -10944,7 +11147,7 @@ impl App {
                                 )
                                 .hover_tip(tooltip);
                             if resp.clicked() {
-                                subfolder_expansion_toggle = true;
+                                subfolder_expansion_button_clicked = true;
                             }
                             ui.add_space(4.0);
                         }
@@ -11135,8 +11338,8 @@ impl App {
                 if stack_toggle {
                     self.toggle_stack_mode();
                 }
-                if subfolder_expansion_toggle {
-                    self.toggle_subfolder_expansion_view();
+                if subfolder_expansion_button_clicked {
+                    self.activate_subfolder_expansion_button();
                 }
                 if let Some(forward) = tree_nav {
                     // 検索中は ▲▼ を検索仮想階層の前後ヒット移動に振り分ける
@@ -12417,7 +12620,7 @@ impl App {
                                 spread_pair_cursor_idx == Some(idx),
                                 DetailsColumnSet::Details,
                                 false,
-                                true,
+                                grid_row_text_tooltips_enabled(self.settings.grid_view_mode),
                             ) {
                                 hovered_preview = Some((idx, preview_rect));
                             }
@@ -12888,17 +13091,102 @@ impl App {
         }
     }
 
+    fn interact_details_header_drag(
+        &mut self,
+        ui: &mut egui::Ui,
+        column_set: DetailsColumnSet,
+        column: DetailsColumn,
+        column_rect: egui::Rect,
+        columns: &[(DetailsColumn, egui::Rect)],
+    ) -> egui::Response {
+        let mut header_hit = column_rect;
+        // Keep the rightmost 8 px exclusive to the existing resize interaction.
+        if header_hit.width() > 16.0 {
+            header_hit.max.x -= 8.0;
+        }
+        let response = ui.interact(
+            header_hit,
+            ui.id().with(("details_header", column_set, column)),
+            egui::Sense::click_and_drag(),
+        );
+        let drag_state_id = ui.id().with(("details_header_drag_state", column_set));
+        if response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+        if response.drag_started_by(egui::PointerButton::Primary)
+            && let Some(pos) = ui.ctx().input(|input| {
+                input
+                    .pointer
+                    .interact_pos()
+                    .or_else(|| input.pointer.latest_pos())
+            })
+        {
+            let start = ui
+                .ctx()
+                .input(|input| input.pointer.press_origin().unwrap_or(pos));
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    drag_state_id,
+                    Some(DetailsHeaderDrag {
+                        column,
+                        start,
+                        latest: pos,
+                    }),
+                )
+            });
+        }
+        if response.dragged_by(egui::PointerButton::Primary)
+            && let Some(pos) = ui.ctx().input(|input| {
+                input
+                    .pointer
+                    .interact_pos()
+                    .or_else(|| input.pointer.latest_pos())
+            })
+        {
+            ui.ctx().data_mut(|data| {
+                let mut drag = data
+                    .get_temp::<Option<DetailsHeaderDrag>>(drag_state_id)
+                    .flatten()
+                    .unwrap_or(DetailsHeaderDrag {
+                        column,
+                        start: pos,
+                        latest: pos,
+                    });
+                if drag.column == column {
+                    drag.latest = pos;
+                }
+                data.insert_temp(drag_state_id, Some(drag));
+            });
+        }
+        if response.drag_stopped_by(egui::PointerButton::Primary) {
+            let stopped_drag = ui
+                .ctx()
+                .data_mut(|data| data.remove_temp::<Option<DetailsHeaderDrag>>(drag_state_id))
+                .flatten();
+            if let Some(mut drag) = stopped_drag {
+                if let Some(pos) = ui.ctx().input(|input| input.pointer.latest_pos()) {
+                    drag.latest = pos;
+                }
+                if finish_details_header_drag(&mut self.settings, column_set, columns, drag, 12.0) {
+                    crate::logger::log(format!(
+                        "details header reorder ({column_set:?}): {:?} -> x {:.1}",
+                        drag.column.id(),
+                        drag.latest.x
+                    ));
+                    self.settings.save();
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+        response
+    }
+
     fn draw_details_header_static(
         &mut self,
         ui: &mut egui::Ui,
         rect: egui::Rect,
         column_set: DetailsColumnSet,
     ) {
-        let response = ui.interact(
-            rect,
-            ui.id().with("details_header_static_context_menu"),
-            egui::Sense::click(),
-        );
         let bg = ui.visuals().extreme_bg_color;
         let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
         let text_color = ui.visuals().strong_text_color();
@@ -12915,6 +13203,8 @@ impl App {
             .find_map(|(column, rect)| (*column == DetailsColumn::Name).then_some(rect.width()))
             .unwrap_or_else(|| DetailsColumn::Name.default_width());
         for (col, col_rect) in columns.iter().copied() {
+            let response =
+                self.interact_details_header_drag(ui, column_set, col, col_rect, &columns);
             draw_details_text(
                 ui,
                 col_rect,
@@ -12928,19 +13218,19 @@ impl App {
                 egui::Stroke::new(1.0, stroke_color),
             );
             self.draw_details_column_resize_handle(ui, col, col_rect, column_set, book_sort_locked);
+            let origin = if self.settings.grid_view_mode == GridViewMode::Details {
+                DetailsColumnMenuOrigin::DetailsSelectionBar
+            } else {
+                DetailsColumnMenuOrigin::ThumbnailSelectionBar
+            };
+            self.show_details_column_context_menu(
+                ui,
+                &response,
+                column_set,
+                origin,
+                current_name_width,
+            );
         }
-        let origin = if self.settings.grid_view_mode == GridViewMode::Details {
-            DetailsColumnMenuOrigin::DetailsSelectionBar
-        } else {
-            DetailsColumnMenuOrigin::ThumbnailSelectionBar
-        };
-        self.show_details_column_context_menu(
-            ui,
-            &response,
-            column_set,
-            origin,
-            current_name_width,
-        );
     }
 
     fn details_best_fit_job_id() -> egui::Id {
@@ -13347,18 +13637,13 @@ impl App {
 
         let columns =
             details_column_rects_for_columns(rect, &self.settings, DetailsColumnSet::Details);
-        let header_drag_id = ui.id().with("details_header_drag_state");
         for (col, col_rect) in columns.iter().copied() {
-            let mut header_hit = col_rect;
-            // 右端 8px は列幅リサイズ専用にする。ヘッダ本体と重ねないことで、境界の
-            // ダブルクリックがソートや列入れ替えにも伝わるのを防ぐ。
-            if header_hit.width() > 16.0 {
-                header_hit.max.x -= 8.0;
-            }
-            let response = ui.interact(
-                header_hit,
-                ui.id().with(("details_header", col)),
-                egui::Sense::click_and_drag(),
+            let response = self.interact_details_header_drag(
+                ui,
+                DetailsColumnSet::Details,
+                col,
+                col_rect,
+                &columns,
             );
             if response.hovered() {
                 ui.painter().rect_filled(col_rect, 0.0, hover_bg);
@@ -13371,66 +13656,6 @@ impl App {
             if response.clicked() && sort_enabled {
                 if let Some(sort_key) = sort_key {
                     self.set_details_sort_key(sort_key);
-                }
-            }
-            if response.dragged() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-            }
-            if response.drag_started_by(egui::PointerButton::Primary)
-                && let Some(pos) = ui
-                    .ctx()
-                    .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
-            {
-                let start = ui.ctx().input(|i| i.pointer.press_origin().unwrap_or(pos));
-                ui.ctx().data_mut(|data| {
-                    data.insert_temp(
-                        header_drag_id,
-                        Some(DetailsHeaderDrag {
-                            column: col,
-                            start,
-                            latest: pos,
-                        }),
-                    )
-                });
-            }
-            if response.dragged_by(egui::PointerButton::Primary)
-                && let Some(pos) = ui
-                    .ctx()
-                    .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
-            {
-                ui.ctx().data_mut(|data| {
-                    let mut drag = data
-                        .get_temp::<Option<DetailsHeaderDrag>>(header_drag_id)
-                        .flatten()
-                        .unwrap_or(DetailsHeaderDrag {
-                            column: col,
-                            start: pos,
-                            latest: pos,
-                        });
-                    if drag.column == col {
-                        drag.latest = pos;
-                    }
-                    data.insert_temp(header_drag_id, Some(drag));
-                });
-            }
-            if response.drag_stopped_by(egui::PointerButton::Primary) {
-                let stopped_drag = ui
-                    .ctx()
-                    .data_mut(|data| data.remove_temp::<Option<DetailsHeaderDrag>>(header_drag_id))
-                    .flatten();
-                if let Some(mut drag) = stopped_drag {
-                    if let Some(pos) = ui.ctx().input(|i| i.pointer.latest_pos()) {
-                        drag.latest = pos;
-                    }
-                    if finish_details_header_drag(&mut self.settings, &columns, drag, 12.0) {
-                        crate::logger::log(format!(
-                            "details header reorder: {:?} -> x {:.1}",
-                            drag.column.id(),
-                            drag.latest.x
-                        ));
-                        self.settings.save();
-                        ui.ctx().request_repaint();
-                    }
                 }
             }
             let title = self.details_header_title(col, book_sort_locked, true);
@@ -13574,6 +13799,7 @@ impl App {
                     .on_hover_text(
                         "ZIP / PDF / 画像のみフォルダのページ数をバックグラウンドで読み込みます",
                     );
+                ui.checkbox(&mut menu_state.show_place, "場所");
                 ui.checkbox(&mut menu_state.show_size, "サイズ");
                 ui.checkbox(&mut menu_state.show_modified, modified_label);
                 ui.checkbox(&mut menu_state.show_state, state_label);
@@ -13658,6 +13884,10 @@ impl App {
                 self.current_folder.as_deref(),
             ),
             DetailsColumn::PageCount => self.details_page_count_text(idx),
+            DetailsColumn::Place => self
+                .facet_place_path_for_idx(idx)
+                .map(|path| self.facet_place_label_for_path(&path))
+                .unwrap_or_default(),
             DetailsColumn::Size => meta
                 .and_then(|(_, size)| (size > 0).then_some(size))
                 .map(|size| {
@@ -13845,6 +14075,14 @@ impl App {
                     col_rect,
                     row_data.text(DetailsColumn::PageCount),
                     egui::Align2::RIGHT_CENTER,
+                    text_color,
+                    false,
+                ),
+                DetailsColumn::Place => draw_details_text(
+                    ui,
+                    col_rect,
+                    row_data.text(DetailsColumn::Place),
+                    egui::Align2::LEFT_CENTER,
                     text_color,
                     false,
                 ),
@@ -14796,6 +15034,7 @@ impl App {
         // メインウィンドウを専有するビューア中は出さない (独自のホバーヘッダーを持つため)。
         if self.viewer_session_blocks_main_window()
             || !self.settings.selection_info_display_mode.shows_tooltip()
+            || !grid_row_text_tooltips_enabled(self.settings.grid_view_mode)
             || self.items_are_drive_list
         {
             return;
@@ -14921,6 +15160,7 @@ mod facet_filter_bar_tests {
             crate::settings::ToolbarFacetFilterItem::Kind,
             crate::settings::ToolbarFacetFilterItem::Ext,
             crate::settings::ToolbarFacetFilterItem::Place,
+            crate::settings::ToolbarFacetFilterItem::NameFilter,
         ];
         app.items = vec![GridItem::Video(std::path::PathBuf::from(
             "c:/media/movie.mp4",
@@ -14955,6 +15195,7 @@ mod facet_filter_bar_tests {
         for label in ["種類", "拡張子", "場所"] {
             assert!(history.contains(label), "missing {label}: {history}");
         }
+        assert!(history.contains("ファイル名"), "{history}");
 
         let bookmark = render_filter_bar_text(false);
         assert!(bookmark.contains("ブックマーク種別: すべて"), "{bookmark}");
@@ -14962,6 +15203,74 @@ mod facet_filter_bar_tests {
         for label in ["種類", "拡張子", "場所"] {
             assert!(bookmark.contains(label), "missing {label}: {bookmark}");
         }
+        assert!(bookmark.contains("ファイル名"), "{bookmark}");
+    }
+
+    #[test]
+    fn hidden_name_filter_is_not_drawn_and_clears_invisible_condition() {
+        let mut app = setup_app_for_test();
+        app.settings.show_toolbar_facet_filter = true;
+        app.settings.toolbar_facet_filter_items =
+            vec![crate::settings::ToolbarFacetFilterItem::Kind];
+        app.settings.facet_filter.name_query = "needle".to_owned();
+        app.facet_name_input = "needle".to_owned();
+        app.items = vec![GridItem::Image(std::path::PathBuf::from(
+            "c:/media/needle.jpg",
+        ))];
+        app.visible_indices = vec![0];
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 200.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render_facet_filter_bar(ctx),
+        );
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            collect_shape_text(&clipped.shape, &mut text);
+        }
+
+        assert!(!text.contains("ファイル名"), "{text}");
+        assert!(app.facet_name_input.is_empty());
+        assert!(app.settings.facet_filter.name_query.is_empty());
+    }
+
+    #[test]
+    fn active_name_filter_uses_input_only_without_duplicate_chip() {
+        let mut app = setup_app_for_test();
+        app.settings.show_toolbar_facet_filter = true;
+        app.settings.toolbar_facet_filter_items =
+            vec![crate::settings::ToolbarFacetFilterItem::NameFilter];
+        app.settings.facet_filter.name_query = "needle".to_owned();
+        app.facet_name_input = "needle".to_owned();
+        app.items = vec![GridItem::Image(std::path::PathBuf::from(
+            "c:/media/needle.jpg",
+        ))];
+        app.visible_indices = vec![0];
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 200.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render_facet_filter_bar(ctx),
+        );
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            collect_shape_text(&clipped.shape, &mut text);
+        }
+
+        assert!(text.contains("needle"), "{text}");
+        assert!(!text.contains("ファイル名:needle"), "{text}");
     }
 }
 
@@ -15055,6 +15364,29 @@ mod selection_info_tests {
             rendered_at_px: 128,
             source_dims: Some(dims),
         }
+    }
+
+    #[test]
+    fn row_text_tooltips_are_disabled_only_in_details_view() {
+        assert!(grid_row_text_tooltips_enabled(GridViewMode::Thumbnail));
+        assert!(!grid_row_text_tooltips_enabled(GridViewMode::Details));
+    }
+
+    #[test]
+    fn details_place_column_uses_subfolder_relative_label() {
+        let root = PathBuf::from(r"C:\library");
+        let mut app = app_with_item(
+            GridItem::Image(root.join("ID203").join("thumb").join("page.jpg")),
+            None,
+        );
+        app.items_are_subfolder_expansion_view = true;
+        app.subfolder_expansion_root = Some(root);
+
+        let data = app.details_row_data(0, &[DetailsColumn::Place]).unwrap();
+        assert_eq!(
+            data.text(DetailsColumn::Place),
+            Path::new("ID203").join("thumb").display().to_string()
+        );
     }
 
     #[test]
@@ -18042,6 +18374,7 @@ mod compute_cell_size_tests {
 
         assert!(reorder_details_column(
             &mut settings,
+            DetailsColumnSet::Details,
             DetailsColumn::Size,
             DetailsColumn::Name,
             false
@@ -18080,6 +18413,7 @@ mod compute_cell_size_tests {
 
         assert!(finish_details_header_drag(
             &mut settings,
+            DetailsColumnSet::Details,
             &columns,
             DetailsHeaderDrag {
                 column: DetailsColumn::Size,
@@ -18100,6 +18434,114 @@ mod compute_cell_size_tests {
             .position(|id| *id == DetailsColumnId::Name)
             .expect("name column is present");
         assert!(size_pos < name_pos);
+    }
+
+    #[test]
+    fn dedicated_bar_reorder_changes_only_dedicated_order() {
+        let mut settings = crate::settings::Settings::default();
+        settings.details_column_order = DetailsColumnId::default_order().to_vec();
+        settings.details_selection_bar_column_order = DetailsColumnId::default_order().to_vec();
+        let details_before = settings.details_column_order.clone();
+        let preview_before = settings
+            .details_selection_bar_column_order
+            .iter()
+            .position(|id| *id == DetailsColumnId::Preview);
+
+        assert!(reorder_details_column(
+            &mut settings,
+            DetailsColumnSet::DedicatedBar,
+            DetailsColumn::Size,
+            DetailsColumn::Name,
+            false,
+        ));
+
+        assert_eq!(settings.details_column_order, details_before);
+        assert_eq!(
+            settings
+                .details_selection_bar_column_order
+                .iter()
+                .position(|id| *id == DetailsColumnId::Preview),
+            preview_before,
+            "the bar-only reorder must preserve its excluded Preview entry"
+        );
+        let size_pos = settings
+            .details_selection_bar_column_order
+            .iter()
+            .position(|id| *id == DetailsColumnId::Size)
+            .unwrap();
+        let name_pos = settings
+            .details_selection_bar_column_order
+            .iter()
+            .position(|id| *id == DetailsColumnId::Name)
+            .unwrap();
+        assert!(size_pos < name_pos);
+    }
+
+    #[test]
+    fn shared_bar_reorder_changes_shared_details_order() {
+        let mut settings = crate::settings::Settings::default();
+        settings.details_column_order = DetailsColumnId::default_order().to_vec();
+        settings.details_selection_bar_column_order = DetailsColumnId::default_order().to_vec();
+        let dedicated_before = settings.details_selection_bar_column_order.clone();
+        let preview_before = settings
+            .details_column_order
+            .iter()
+            .position(|id| *id == DetailsColumnId::Preview);
+
+        assert!(reorder_details_column(
+            &mut settings,
+            DetailsColumnSet::SharedBar,
+            DetailsColumn::Size,
+            DetailsColumn::Name,
+            false,
+        ));
+
+        assert_eq!(
+            settings.details_selection_bar_column_order,
+            dedicated_before
+        );
+        assert_eq!(
+            settings
+                .details_column_order
+                .iter()
+                .position(|id| *id == DetailsColumnId::Preview),
+            preview_before,
+            "the shared bar must not relocate the Preview column it does not draw"
+        );
+        let size_pos = settings
+            .details_column_order
+            .iter()
+            .position(|id| *id == DetailsColumnId::Size)
+            .unwrap();
+        let name_pos = settings
+            .details_column_order
+            .iter()
+            .position(|id| *id == DetailsColumnId::Name)
+            .unwrap();
+        assert!(size_pos < name_pos);
+    }
+
+    #[test]
+    fn details_reorder_same_column_is_a_noop_for_every_column_set() {
+        for column_set in [
+            DetailsColumnSet::Details,
+            DetailsColumnSet::SharedBar,
+            DetailsColumnSet::DedicatedBar,
+        ] {
+            let mut settings = crate::settings::Settings::default();
+            settings.details_column_order = DetailsColumnId::default_order().to_vec();
+            settings.details_selection_bar_column_order = DetailsColumnId::default_order().to_vec();
+            let before = serde_json::to_value(&settings).unwrap();
+
+            assert!(!reorder_details_column(
+                &mut settings,
+                column_set,
+                DetailsColumn::Size,
+                DetailsColumn::Size,
+                true,
+            ));
+            assert_eq!(serde_json::to_value(&settings).unwrap(), before);
+        }
     }
 
     #[test]

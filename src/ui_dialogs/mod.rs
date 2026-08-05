@@ -31,6 +31,7 @@ mod settings_incompatible;
 pub(crate) mod settings_restore;
 pub(crate) mod smart_folder_editor;
 mod stats_dialog;
+mod subfolder_expansion;
 mod tag_apply;
 mod tag_editor;
 mod thumb_quality;

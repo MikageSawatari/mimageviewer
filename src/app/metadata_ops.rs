@@ -106,6 +106,7 @@ pub(super) fn format_details_timestamp(secs: i64, _show_seconds: bool) -> String
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FacetField {
+    Name,
     Kind,
     Ext,
     Place,

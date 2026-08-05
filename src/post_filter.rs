@@ -15,10 +15,14 @@ use crate::adjustment::PostFilter;
 use egui::{Color32, ColorImage};
 use rayon::prelude::*;
 
-/// ポストフィルタを適用する。`None` / `Nearest` は pixel clone (サンプラー切替で見た目が変わる)。
+/// Applies the post-filter. Upscaling choices clone the pixels because their appearance changes
+/// only when the paint-time resampler is selected.
 pub fn apply(src: &ColorImage, filter: PostFilter) -> ColorImage {
     match filter {
-        PostFilter::None | PostFilter::Nearest => src.clone(),
+        PostFilter::None
+        | PostFilter::Nearest
+        | PostFilter::UpscaleSharp
+        | PostFilter::UpscaleAnime => src.clone(),
         PostFilter::CrtSimple => crt::apply_simple(src),
         PostFilter::CrtFull => crt::apply_full(src),
         PostFilter::CrtArcade => crt::apply_arcade(src),
@@ -1669,6 +1673,22 @@ mod tests {
     }
 
     #[test]
+    fn upscale_sharp_is_identity_clone_on_the_cpu_stage() {
+        let src = make_test_image(16, 16);
+        let out = apply(&src, PostFilter::UpscaleSharp);
+        assert_eq!(out.size, src.size);
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn upscale_anime_is_identity_clone_on_the_cpu_stage() {
+        let src = make_test_image(16, 16);
+        let out = apply(&src, PostFilter::UpscaleAnime);
+        assert_eq!(out.size, src.size);
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
     fn pseudocolor_endpoints_black_and_white() {
         // 純グレー 0 → 黒、255 → 白 (両プリセットとも端点は無彩色)。
         for pf in [PostFilter::PseudoColor4, PostFilter::PseudoColorSkin] {
@@ -1909,7 +1929,13 @@ mod tests {
         }
         let src = ColorImage::new([w, h], pixels);
         for &f in PostFilter::ALL {
-            if matches!(f, PostFilter::None | PostFilter::Nearest) {
+            if matches!(
+                f,
+                PostFilter::None
+                    | PostFilter::Nearest
+                    | PostFilter::UpscaleSharp
+                    | PostFilter::UpscaleAnime
+            ) {
                 continue; // これらは clone なので自明
             }
             let out = apply(&src, f);

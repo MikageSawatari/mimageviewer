@@ -2,18 +2,18 @@ struct VertexOutput {
     @builtin(position) position: vec4<f32>,
 };
 
-struct ResampleParams {
+struct ResampleRegionParams {
     target_len: u32,
-    blur_factor: f32,
-    _padding1: u32,
-    _padding2: u32,
+    source_start: f32,
+    source_len: f32,
+    cross_start: u32,
 };
 
 @group(0) @binding(0)
 var source_texture: texture_2d<f32>;
 
 @group(0) @binding(1)
-var<uniform> params: ResampleParams;
+var<uniform> params: ResampleRegionParams;
 
 const PI: f32 = 3.14159265358979323846;
 const LANCZOS_SUPPORT: f32 = 3.0;
@@ -29,10 +29,10 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return output;
 }
 
-// NOTE: `sinc` / `lanczos3` are duplicated in gpu_lanczos_visible_upscale.wgsl.
-// The two shaders differ only in what they read (whole source vs a visible sub-rect)
-// and in blur_factor, which upscaling does not use. If the kernel changes here,
-// change it there too - a split kernel would make shrinking and enlarging disagree.
+// NOTE: `sinc` / `lanczos3` are duplicated from gpu_lanczos_spike.wgsl and must stay
+// identical to it. They are kept separate because this pass takes a source-region
+// origin and has no blur_factor, and the downscale shader is a shipped, verified
+// path that a shared-uniform refactor would have to disturb.
 fn sinc(x: f32) -> f32 {
     if abs(x) < 1.0e-6 {
         return 1.0;
@@ -48,35 +48,32 @@ fn lanczos3(x: f32) -> f32 {
     return sinc(x) * sinc(x / LANCZOS_SUPPORT);
 }
 
-fn sample_bounds(center: f32, support: f32, source_len: u32) -> vec2<i32> {
-    // Samples are centered at index + 0.5. The strict support boundary excludes
-    // the zero-weight endpoints, keeping the real fetch bound at ceil(6 / scale).
-    let start = i32(floor(center - 0.5 - support)) + 1;
-    let end = i32(ceil(center - 0.5 + support));
+fn sample_bounds(center: f32, source_len: u32) -> vec2<i32> {
+    let start = i32(floor(center - 0.5 - LANCZOS_SUPPORT)) + 1;
+    let end = i32(ceil(center - 0.5 + LANCZOS_SUPPORT));
     return vec2<i32>(
         clamp(start, 0, i32(source_len)),
         clamp(end, 0, i32(source_len)),
     );
 }
 
+fn source_center(target_index: u32) -> f32 {
+    let scale = f32(params.target_len) / params.source_len;
+    return params.source_start + (f32(target_index) + 0.5) / scale;
+}
+
 fn resample_vertical(target_coord: vec2<u32>) -> vec4<f32> {
     let source_size = textureDimensions(source_texture, 0);
-    let scale = f32(params.target_len) / f32(source_size.y);
-    // Upscaling intentionally keeps the kernel at its native radius (stretch 1.0).
-    // Only downscaling widens it by 1 / scale to reject frequencies the target cannot hold.
-    let filter_stretch = max(1.0, 1.0 / scale) * clamp(params.blur_factor, 1.0, 1.3);
-    let support = LANCZOS_SUPPORT * filter_stretch;
-    let center = (f32(target_coord.y) + 0.5) / scale;
-    let bounds = sample_bounds(center, support, source_size.y);
+    let center = source_center(target_coord.y);
+    let bounds = sample_bounds(center, source_size.y);
 
     var color_sum = vec4<f32>(0.0);
     var weight_sum = 0.0;
     for (var source_y = bounds.x; source_y < bounds.y; source_y++) {
-        let distance = (f32(source_y) + 0.5 - center) / filter_stretch;
-        let weight = lanczos3(distance);
+        let weight = lanczos3(f32(source_y) + 0.5 - center);
         color_sum += textureLoad(
             source_texture,
-            vec2<i32>(i32(target_coord.x), source_y),
+            vec2<i32>(i32(params.cross_start + target_coord.x), source_y),
             0,
         ) * weight;
         weight_sum += weight;
@@ -86,7 +83,7 @@ fn resample_vertical(target_coord: vec2<u32>) -> vec4<f32> {
         let nearest = clamp(i32(floor(center)), 0, i32(source_size.y) - 1);
         return textureLoad(
             source_texture,
-            vec2<i32>(i32(target_coord.x), nearest),
+            vec2<i32>(i32(params.cross_start + target_coord.x), nearest),
             0,
         );
     }
@@ -95,19 +92,13 @@ fn resample_vertical(target_coord: vec2<u32>) -> vec4<f32> {
 
 fn resample_horizontal(target_coord: vec2<u32>) -> vec4<f32> {
     let source_size = textureDimensions(source_texture, 0);
-    let scale = f32(params.target_len) / f32(source_size.x);
-    // Upscaling intentionally keeps the kernel at its native radius (stretch 1.0).
-    // Only downscaling widens it by 1 / scale to reject frequencies the target cannot hold.
-    let filter_stretch = max(1.0, 1.0 / scale) * clamp(params.blur_factor, 1.0, 1.3);
-    let support = LANCZOS_SUPPORT * filter_stretch;
-    let center = (f32(target_coord.x) + 0.5) / scale;
-    let bounds = sample_bounds(center, support, source_size.x);
+    let center = source_center(target_coord.x);
+    let bounds = sample_bounds(center, source_size.x);
 
     var color_sum = vec4<f32>(0.0);
     var weight_sum = 0.0;
     for (var source_x = bounds.x; source_x < bounds.y; source_x++) {
-        let distance = (f32(source_x) + 0.5 - center) / filter_stretch;
-        let weight = lanczos3(distance);
+        let weight = lanczos3(f32(source_x) + 0.5 - center);
         color_sum += textureLoad(
             source_texture,
             vec2<i32>(source_x, i32(target_coord.y)),

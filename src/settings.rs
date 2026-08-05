@@ -145,6 +145,9 @@ pub struct SmartFolderFilter {
     pub date_preset: Option<FacetDatePreset>,
     #[serde(default)]
     pub size_preset: Option<FacetSizePreset>,
+    /// Range を知らない旧版向けの保存用キャリア。実行時の正は size_preset。
+    #[serde(default)]
+    pub size_extended_stash: Option<FacetSizePreset>,
     /// 0=未評価、1..=5=星。全 false は sanitize で「全て」に補正する。
     #[serde(default = "default_smart_folder_ratings")]
     pub ratings: [bool; 6],
@@ -177,6 +180,7 @@ impl Default for SmartFolderFilter {
             extensions: std::collections::BTreeSet::new(),
             date_preset: None,
             size_preset: None,
+            size_extended_stash: None,
             ratings: default_smart_folder_ratings(),
             tags: std::collections::BTreeSet::new(),
             tag_mode: FacetTagMode::default(),
@@ -190,6 +194,20 @@ impl Default for SmartFolderFilter {
 }
 
 impl SmartFolderFilter {
+    pub fn stash_extended_size_for_persist(&mut self) {
+        if matches!(self.size_preset, Some(FacetSizePreset::Range { .. })) {
+            self.size_extended_stash = self.size_preset.take();
+        } else {
+            self.size_extended_stash = None;
+        }
+    }
+
+    pub fn restore_extended_size_after_load(&mut self) {
+        if let Some(preset) = self.size_extended_stash.take() {
+            self.size_preset = Some(preset);
+        }
+    }
+
     pub fn stash_bookmark_states_for_persist(&mut self) {
         self.bookmarked_stash = self.edits.remove(&FacetEditFlag::Bookmarked);
         self.unbookmarked_stash = self.edits.remove(&FacetEditFlag::Unbookmarked);
@@ -642,6 +660,39 @@ impl FsSidePanelMode {
 }
 
 // -----------------------------------------------------------------------
+// Fullscreen navigator placement
+// -----------------------------------------------------------------------
+
+/// Corner used by the fullscreen overview navigator.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FullscreenNavigatorCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    #[default]
+    BottomRight,
+    #[serde(other)]
+    Unknown,
+}
+
+impl FullscreenNavigatorCorner {
+    pub const ALL: &'static [Self] = &[
+        Self::TopLeft,
+        Self::TopRight,
+        Self::BottomLeft,
+        Self::BottomRight,
+    ];
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::BottomRight,
+            corner => corner,
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // 詳細表示ソート
 // -----------------------------------------------------------------------
 
@@ -654,6 +705,7 @@ pub enum DetailsSortKey {
     Tags,
     Kind,
     PageCount,
+    Place,
     Size,
     Modified,
     Created,
@@ -673,6 +725,7 @@ impl DetailsSortKey {
             Self::Tags => "タグ",
             Self::Kind => "種類",
             Self::PageCount => "ページ数",
+            Self::Place => "場所",
             Self::Size => "サイズ",
             Self::Modified => "更新日時",
             Self::Created => "作成日時",
@@ -761,6 +814,7 @@ pub enum DetailsColumnId {
     Tags,
     Kind,
     PageCount,
+    Place,
     Size,
     Modified,
     Created,
@@ -780,6 +834,7 @@ impl DetailsColumnId {
             Self::Tags,
             Self::Kind,
             Self::PageCount,
+            Self::Place,
             Self::Size,
             Self::Modified,
             Self::Created,
@@ -1074,21 +1129,92 @@ impl FacetDatePreset {
     }
 }
 
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+pub enum FacetSizeUnit {
+    KB,
+    MB,
+    GB,
+}
+
+impl FacetSizeUnit {
+    pub const ALL: [Self; 3] = [Self::KB, Self::MB, Self::GB];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::KB => "KB",
+            Self::MB => "MB",
+            Self::GB => "GB",
+        }
+    }
+
+    fn bytes_per_unit(self) -> u64 {
+        match self {
+            Self::KB => 1024,
+            Self::MB => 1024 * 1024,
+            Self::GB => 1024 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+pub struct FacetSizeValue {
+    pub value: u32,
+    pub unit: FacetSizeUnit,
+}
+
+impl FacetSizeValue {
+    pub const fn new(value: u32, unit: FacetSizeUnit) -> Self {
+        Self { value, unit }
+    }
+
+    pub fn label(self) -> String {
+        format!("{}{}", self.value, self.unit.label())
+    }
+
+    pub fn bytes(self) -> u64 {
+        u64::from(self.value) * self.unit.bytes_per_unit()
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FacetSizePreset {
     Under1MiB,
     MiB1To10,
     MiB10To100,
     Over100MiB,
+    Range {
+        min: Option<FacetSizeValue>,
+        max: Option<FacetSizeValue>,
+    },
 }
 
 impl FacetSizePreset {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Under1MiB => "1MB未満",
-            Self::MiB1To10 => "1〜10MB",
-            Self::MiB10To100 => "10〜100MB",
-            Self::Over100MiB => "100MB以上",
+    pub fn label(self) -> String {
+        match self.sanitized() {
+            Self::Under1MiB => "1MB未満".to_string(),
+            Self::MiB1To10 => "1〜10MB".to_string(),
+            Self::MiB10To100 => "10〜100MB".to_string(),
+            Self::Over100MiB => "100MB以上".to_string(),
+            Self::Range {
+                min: Some(min),
+                max: Some(max),
+            } => format!("{}〜{}未満", min.label(), max.label()),
+            Self::Range {
+                min: Some(min),
+                max: None,
+            } => format!("{}以上", min.label()),
+            Self::Range {
+                min: None,
+                max: Some(max),
+            } => format!("{}未満", max.label()),
+            Self::Range {
+                min: None,
+                max: None,
+            } => "範囲指定".to_string(),
         }
     }
 
@@ -1101,13 +1227,49 @@ impl FacetSizePreset {
         ]
     }
 
+    /// 実際に何かを絞り込む条件になっているか。
+    ///
+    /// `範囲指定` を選んだ直後は下限・上限ともチェックが外れており、この状態は
+    /// 「サイズで絞っていない」のと同じ。`is_some()` だけで有効判定すると、
+    /// 何も絞っていないのにフィルタが効いているように見える。
+    pub fn is_effective(self) -> bool {
+        !matches!(
+            self,
+            Self::Range {
+                min: None,
+                max: None
+            }
+        )
+    }
+
     pub fn range_bytes(self) -> (u64, Option<u64>) {
         const MIB: u64 = 1024 * 1024;
-        match self {
+        match self.sanitized() {
             Self::Under1MiB => (0, Some(MIB)),
             Self::MiB1To10 => (MIB, Some(10 * MIB)),
             Self::MiB10To100 => (10 * MIB, Some(100 * MIB)),
             Self::Over100MiB => (100 * MIB, None),
+            Self::Range { min, max } => (
+                min.map_or(0, FacetSizeValue::bytes),
+                max.map(FacetSizeValue::bytes),
+            ),
+        }
+    }
+
+    pub fn sanitized(self) -> Self {
+        match self {
+            Self::Range { mut min, mut max } => {
+                // 日付範囲と同じく、逆順は入力値と単位を保ったまま最小・最大を交換する。
+                // 判定側は常に下限を含み、上限を含まない [min, max) として扱う。
+                if min
+                    .zip(max)
+                    .is_some_and(|(min, max)| min.bytes() > max.bytes())
+                {
+                    std::mem::swap(&mut min, &mut max);
+                }
+                Self::Range { min, max }
+            }
+            preset => preset,
         }
     }
 }
@@ -1189,6 +1351,10 @@ impl FacetEditFlag {
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct FacetFilter {
+    /// 開いている一覧にだけ紐づく一時的なファイル名絞り込み。次回起動時に
+    /// 「なぜか一覧が空」の状態を作らないよう、設定には永続化しない。
+    #[serde(skip_serializing, skip_deserializing)]
+    pub name_query: String,
     #[serde(default)]
     pub kinds: std::collections::BTreeSet<FacetItemKind>,
     #[serde(default)]
@@ -1214,6 +1380,10 @@ pub struct FacetFilter {
     pub date_extended_stash: Option<FacetDatePreset>,
     #[serde(default)]
     pub size_preset: Option<FacetSizePreset>,
+    /// 旧版が知らないサイズの範囲指定を退避する保存用キャリア。旧版が読む
+    /// size_preset には従来の 4 variant だけを書き、実行時の正は常に size_preset。
+    #[serde(default)]
+    pub size_extended_stash: Option<FacetSizePreset>,
     #[serde(default)]
     pub edits: std::collections::BTreeSet<FacetEditFlag>,
     #[serde(default, alias = "ai_adjustment_include_descendants")]
@@ -1273,6 +1443,22 @@ impl FacetFilter {
         }
     }
 
+    /// Range を知らない旧版が設定全体を破損扱いしないよう、未知フィールドへ退避する。
+    /// live な Settings には適用せず、保存用クローンに対してだけ使う。
+    pub fn stash_extended_size_for_persist(&mut self) {
+        if matches!(self.size_preset, Some(FacetSizePreset::Range { .. })) {
+            self.size_extended_stash = self.size_preset.take();
+        } else {
+            self.size_extended_stash = None;
+        }
+    }
+
+    pub fn restore_extended_size_after_load(&mut self) {
+        if let Some(preset) = self.size_extended_stash.take() {
+            self.size_preset = Some(preset);
+        }
+    }
+
     pub fn stash_bookmark_states_for_persist(&mut self) {
         self.bookmarked_stash = self.edits.remove(&FacetEditFlag::Bookmarked);
         self.unbookmarked_stash = self.edits.remove(&FacetEditFlag::Unbookmarked);
@@ -1288,7 +1474,8 @@ impl FacetFilter {
     }
 
     pub fn is_active(&self) -> bool {
-        !self.kinds.is_empty()
+        !self.name_query.is_empty()
+            || !self.kinds.is_empty()
             || !self.exts.is_empty()
             || !self.place_keys.is_empty()
             || !self.ai_models.is_empty()
@@ -1296,7 +1483,7 @@ impl FacetFilter {
             || !self.tags.is_empty()
             || self.include_untagged
             || self.date_preset.is_some()
-            || self.size_preset.is_some()
+            || self.size_preset.is_some_and(FacetSizePreset::is_effective)
             || !self.edits.is_empty()
     }
 
@@ -1469,6 +1656,7 @@ pub enum ToolbarFacetFilterItem {
     Size,
     Edit,
     Color,
+    NameFilter,
     /// 未知のボタン (将来バージョンが書いた変種を旧バイナリが読んだ場合)。
     #[serde(other)]
     Unknown,
@@ -1488,6 +1676,7 @@ impl ToolbarFacetFilterItem {
             Self::Size,
             Self::Edit,
             Self::Color,
+            Self::NameFilter,
         ]
     }
 
@@ -1504,6 +1693,7 @@ impl ToolbarFacetFilterItem {
             Self::Size => "サイズ",
             Self::Edit => "状態",
             Self::Color => "画像色",
+            Self::NameFilter => "ファイル名",
             Self::Unknown => "不明",
         }
     }
@@ -1528,6 +1718,54 @@ impl ToolbarFacetFilterItem {
                 .position(|candidate| candidate == item)
                 .unwrap_or(usize::MAX)
         });
+    }
+}
+
+pub const FACET_NAME_FILTER_WIDTH_SMALL: f32 = 90.0;
+pub const FACET_NAME_FILTER_WIDTH_MEDIUM: f32 = 140.0;
+pub const FACET_NAME_FILTER_WIDTH_LARGE: f32 = 200.0;
+/// The stash field predates neither the item nor an explicit visibility bit. Reserve the maximum
+/// index to distinguish “hidden by the user” from a legacy settings file where the field is absent.
+const TOOLBAR_NAME_FILTER_HIDDEN_STASH: usize = usize::MAX;
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FacetNameFilterWidth {
+    Small,
+    #[default]
+    Medium,
+    Large,
+    #[serde(other)]
+    Unknown,
+}
+
+impl FacetNameFilterWidth {
+    pub fn all() -> &'static [Self] {
+        &[Self::Small, Self::Medium, Self::Large]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Small => "小",
+            Self::Medium => "中",
+            Self::Large => "大",
+            Self::Unknown => "中",
+        }
+    }
+
+    pub fn width(self) -> f32 {
+        match self.normalized() {
+            Self::Small => FACET_NAME_FILTER_WIDTH_SMALL,
+            Self::Medium => FACET_NAME_FILTER_WIDTH_MEDIUM,
+            Self::Large => FACET_NAME_FILTER_WIDTH_LARGE,
+            Self::Unknown => unreachable!("normalized facet name filter width"),
+        }
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::Medium,
+            value => value,
+        }
     }
 }
 
@@ -2822,6 +3060,73 @@ pub fn downscale_smoothing_blur_factor(percent: u32) -> f32 {
     1.0 + sanitize_downscale_smoothing_percent(percent) as f32 * 0.003
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnimeUpscaleSourceLimit {
+    Px2048,
+    #[default]
+    Px4096,
+    Unlimited,
+}
+
+impl AnimeUpscaleSourceLimit {
+    pub const ALL: [Self; 3] = [Self::Px2048, Self::Px4096, Self::Unlimited];
+
+    pub fn max_long_edge(self) -> Option<u32> {
+        match self {
+            Self::Px2048 => Some(2048),
+            Self::Px4096 => Some(4096),
+            Self::Unlimited => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Px2048 => "2048px",
+            Self::Px4096 => "4096px",
+            Self::Unlimited => "制限なし",
+        }
+    }
+}
+
+/// Carrier for post-filter variants that released builds cannot deserialize.
+///
+/// Settings persistence writes only old variants into `AdjustParams::post_filter` and records
+/// newer choices here. Add one boolean per future variant so an older build can continue to
+/// ignore this whole field without parsing another enum.
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PostFilterDowngradeStash {
+    #[serde(default)]
+    sharp_upscale: bool,
+    #[serde(default)]
+    anime_upscale: bool,
+}
+
+impl PostFilterDowngradeStash {
+    fn stash_for_persist(&mut self, params: &mut crate::adjustment::AdjustParams) {
+        self.sharp_upscale = matches!(
+            params.post_filter,
+            crate::adjustment::PostFilter::UpscaleSharp
+        );
+        self.anime_upscale = matches!(
+            params.post_filter,
+            crate::adjustment::PostFilter::UpscaleAnime
+        );
+        if self.sharp_upscale || self.anime_upscale {
+            params.post_filter = crate::adjustment::PostFilter::None;
+        }
+    }
+
+    fn restore_after_load(&mut self, params: &mut crate::adjustment::AdjustParams) {
+        if std::mem::take(&mut self.anime_upscale) {
+            self.sharp_upscale = false;
+            params.post_filter = crate::adjustment::PostFilter::UpscaleAnime;
+        } else if std::mem::take(&mut self.sharp_upscale) {
+            params.post_filter = crate::adjustment::PostFilter::UpscaleSharp;
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Settings {
     #[serde(default = "default_grid_cols")]
@@ -2838,6 +3143,9 @@ pub struct Settings {
     /// 保存時だけ旧版が読める `Toolbar` へ退避し、読み込み後に戻す。
     #[serde(default)]
     pub(crate) details_page_count_sort_stash: bool,
+    /// 旧版が知らない `DetailsSortKey::Place` の保存用キャリア。
+    #[serde(default)]
+    pub(crate) details_place_sort_stash: bool,
     #[serde(default = "default_details_sort_ascending")]
     pub details_sort_ascending: bool,
     #[serde(default)]
@@ -2855,6 +3163,15 @@ pub struct Settings {
     pub(crate) details_page_count_column_index_stash: Option<usize>,
     #[serde(default)]
     pub(crate) details_page_count_column_width_stash: Option<f32>,
+    /// 旧版が知らない場所列の位置・幅を、旧版が無視する追加フィールドへ退避する。
+    #[serde(default)]
+    pub(crate) details_place_column_index_stash: Option<usize>,
+    #[serde(default)]
+    pub(crate) details_place_column_width_stash: Option<f32>,
+    #[serde(default)]
+    pub(crate) details_selection_bar_place_column_index_stash: Option<usize>,
+    #[serde(default)]
+    pub(crate) details_selection_bar_place_column_width_stash: Option<f32>,
     #[serde(default = "default_true")]
     pub details_show_preview: bool,
     #[serde(default = "default_true")]
@@ -2865,6 +3182,8 @@ pub struct Settings {
     pub details_show_kind: bool,
     #[serde(default = "default_true")]
     pub details_show_page_count: bool,
+    #[serde(default)]
+    pub details_show_place: bool,
     #[serde(default = "default_true")]
     pub details_show_size: bool,
     #[serde(default = "default_true")]
@@ -2907,6 +3226,8 @@ pub struct Settings {
     pub details_selection_bar_show_kind: bool,
     #[serde(default = "default_true")]
     pub details_selection_bar_show_page_count: bool,
+    #[serde(default)]
+    pub details_selection_bar_show_place: bool,
     #[serde(default = "default_true")]
     pub details_selection_bar_show_size: bool,
     #[serde(default = "default_true")]
@@ -2991,6 +3312,19 @@ pub struct Settings {
     /// サブフォルダ展開ビューでフォルダ境界を優先するか。
     #[serde(default)]
     pub subfolder_expansion_order: SubfolderExpansionOrder,
+    /// サブ展開の走査起点から何階層下まで読むか。0 は起点だけ、40 は UI 上の
+    /// 「無制限」かつ reparse point loop 対策を兼ねる従来の実効上限。
+    #[serde(default = "default_subfolder_expansion_max_depth")]
+    pub subfolder_expansion_max_depth: u32,
+    /// サブ展開の走査時に収集する種類。空集合は全種類。
+    #[serde(default)]
+    pub subfolder_expansion_filter_kinds: std::collections::BTreeSet<FacetItemKind>,
+    /// サブ展開の走査時にファイルへ適用する更新日条件。
+    #[serde(default)]
+    pub subfolder_expansion_filter_date_preset: Option<FacetDatePreset>,
+    /// サブ展開の走査時にファイルへ適用するサイズ条件。
+    #[serde(default)]
+    pub subfolder_expansion_filter_size_preset: Option<FacetSizePreset>,
     /// 実フォルダ / アーカイブ類 / 画像 / 動画・音声を 4 行へ割り当てる表示順。
     /// 同じ行は `sort_order` で混在ソートし、空行は表示時に読み飛ばす。
     #[serde(default)]
@@ -3413,6 +3747,9 @@ pub struct Settings {
     /// 通常の縮小表示で使う Lanczos3 の支持幅調整 (0..=100、10刻み)。
     #[serde(default)]
     pub downscale_smoothing_percent: u32,
+    /// Long-edge cap for the visible source region processed by illustration upscaling.
+    #[serde(default)]
+    pub anime_upscale_source_limit: AnimeUpscaleSourceLimit,
     /// フルスクリーン左ホバーパネルで最後に開いていたタブ。
     #[serde(default)]
     pub fullscreen_left_panel_tab: FullscreenLeftPanelTab,
@@ -3426,6 +3763,15 @@ pub struct Settings {
     /// フルスクリーン左右パネルを呼び出す方法。
     #[serde(default)]
     pub fullscreen_side_panel_mode: FsSidePanelMode,
+    /// Show the overview navigator while only part of a flat image is visible.
+    #[serde(default)]
+    pub fullscreen_navigator_visible: bool,
+    /// Screen corner used by the fullscreen navigator.
+    #[serde(default)]
+    pub fullscreen_navigator_corner: FullscreenNavigatorCorner,
+    /// Length of one side of the navigator canvas in logical points.
+    #[serde(default = "default_fullscreen_navigator_size")]
+    pub fullscreen_navigator_size: f32,
     /// 静止画フルスクリーン下部のページシークバーを常時表示し、画像領域から除外する。
     #[serde(default)]
     pub fullscreen_seek_bar_locked: bool,
@@ -3560,6 +3906,14 @@ pub struct Settings {
     /// 空 Vec は「ボタンを全部隠す」。アクティブ条件のチップと全解除は引き続き表示する。
     #[serde(default = "default_toolbar_facet_filter_items")]
     pub toolbar_facet_filter_items: Vec<ToolbarFacetFilterItem>,
+    /// `NameFilter` の位置を旧版が無視できる追加フィールドへ退避する保存用キャリア。
+    /// `usize::MAX` は明示的な非表示、`None` はこの項目が無かった旧設定を表す。
+    /// 実行時の正は `toolbar_facet_filter_items` 側で、保存用 clone だけがこの値を持つ。
+    #[serde(default)]
+    pub toolbar_facet_name_filter_index_stash: Option<usize>,
+    /// 絞り込みバーのファイル名入力欄の幅。
+    #[serde(default)]
+    pub facet_name_filter_width: FacetNameFilterWidth,
     /// ツールバーのセクション並び順 (v2.0.0)。空 = 既定順。
     /// `ToolbarSectionId::ordered_with_fallback` で未登録セクションを補完する。
     #[serde(default)]
@@ -3688,6 +4042,12 @@ pub struct Settings {
     /// 保存スロット (10個)。名前付きで保存した補正設定。
     #[serde(default)]
     pub preset_slots: crate::adjustment::PresetSlots,
+    /// New post-filter variants are removed from the two persisted preset paths and carried in
+    /// this additive field so v2.11.0 can deserialize the rest of Settings during downgrade.
+    #[serde(default)]
+    pub(crate) post_filter_global_preset_stash: PostFilterDowngradeStash,
+    #[serde(default)]
+    pub(crate) post_filter_preset_slot_stashes: [PostFilterDowngradeStash; 10],
     /// カラー化専用保存スロット (4個)。他の画像補正値を変更せずに呼び出す。
     #[serde(default)]
     pub colorize_preset_slots: crate::colorize::ColorizePresetSlots,
@@ -4466,12 +4826,17 @@ pub const FULLSCREEN_FIXED_JUMP_DEFAULT: usize = 10;
 pub const FULLSCREEN_CURSOR_HIDE_DELAY_MIN_SECS: f32 = 0.1;
 pub const FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS: f32 = 5.0;
 pub const FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS: f32 = 1.0;
+pub const FULLSCREEN_NAVIGATOR_SIZE_MIN: f32 = 160.0;
+pub const FULLSCREEN_NAVIGATOR_SIZE_MAX: f32 = 520.0;
+pub const FULLSCREEN_NAVIGATOR_SIZE_DEFAULT: f32 = 260.0;
 pub const RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MIN: usize = 0;
 pub const RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MAX: usize = 20;
 pub const RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_DEFAULT: usize = 10;
 pub const RETAINED_FINAL_AI_CACHE_MAX_MIB_MIN: u64 = 0;
 pub const RETAINED_FINAL_AI_CACHE_MAX_MIB_MAX: u64 = 8192;
 pub const RETAINED_FINAL_AI_CACHE_MAX_MIB_DEFAULT: u64 = 512;
+/// サブ展開の「無制限」が使う従来の実効上限。
+pub const SUBFOLDER_EXPANSION_MAX_DEPTH_DEFAULT: u32 = 40;
 
 fn default_grid_cols() -> usize {
     4
@@ -4490,6 +4855,9 @@ fn default_prefetch_forward() -> usize {
 }
 fn default_folder_skip_limit() -> usize {
     5
+}
+fn default_subfolder_expansion_max_depth() -> u32 {
+    SUBFOLDER_EXPANSION_MAX_DEPTH_DEFAULT
 }
 fn default_thumb_px() -> u32 {
     512
@@ -4557,6 +4925,10 @@ fn default_quick_folder_drive_current_dirs() -> [BTreeMap<String, PathBuf>; 2] {
 }
 fn default_fullscreen_cursor_hide_delay_secs() -> f32 {
     FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS
+}
+
+fn default_fullscreen_navigator_size() -> f32 {
+    FULLSCREEN_NAVIGATOR_SIZE_DEFAULT
 }
 pub(crate) fn default_folder_tree_pane_width_ratio() -> f32 {
     0.22
@@ -4760,6 +5132,7 @@ impl Default for Settings {
             grid_cursor_wrap: false,
             details_sort_key: DetailsSortKey::default(),
             details_page_count_sort_stash: false,
+            details_place_sort_stash: false,
             details_sort_ascending: default_details_sort_ascending(),
             details_size_display_mode: DetailsSizeDisplayMode::default(),
             details_timestamp_show_seconds: false,
@@ -4768,6 +5141,10 @@ impl Default for Settings {
             details_column_widths: Vec::new(),
             details_page_count_column_index_stash: None,
             details_page_count_column_width_stash: None,
+            details_place_column_index_stash: None,
+            details_place_column_width_stash: None,
+            details_selection_bar_place_column_index_stash: None,
+            details_selection_bar_place_column_width_stash: None,
             details_name_width_auto: true,
             details_name_width: default_details_name_width(),
             details_show_preview: true,
@@ -4775,6 +5152,7 @@ impl Default for Settings {
             details_show_tags: true,
             details_show_kind: true,
             details_show_page_count: true,
+            details_show_place: false,
             details_show_size: true,
             details_show_modified: true,
             details_show_created: false,
@@ -4791,6 +5169,7 @@ impl Default for Settings {
             details_selection_bar_show_tags: true,
             details_selection_bar_show_kind: true,
             details_selection_bar_show_page_count: true,
+            details_selection_bar_show_place: false,
             details_selection_bar_show_size: true,
             details_selection_bar_show_modified: true,
             details_selection_bar_show_created: false,
@@ -4822,6 +5201,10 @@ impl Default for Settings {
             show_hidden_files: false,
             sort_order: SortOrder::default(),
             subfolder_expansion_order: SubfolderExpansionOrder::default(),
+            subfolder_expansion_max_depth: default_subfolder_expansion_max_depth(),
+            subfolder_expansion_filter_kinds: std::collections::BTreeSet::new(),
+            subfolder_expansion_filter_date_preset: None,
+            subfolder_expansion_filter_size_preset: None,
             grid_display_order: GridDisplayOrder::default(),
             thumb_px: default_thumb_px(),
             text_preview_scale: default_text_preview_scale(),
@@ -4887,10 +5270,14 @@ impl Default for Settings {
             fullscreen_fit_no_upscale: false,
             fullscreen_fit_no_downscale: false,
             downscale_smoothing_percent: DOWNSCALE_SMOOTHING_PERCENT_MIN,
+            anime_upscale_source_limit: AnimeUpscaleSourceLimit::default(),
             fullscreen_left_panel_tab: FullscreenLeftPanelTab::default(),
             adjustment_settings_tab: AdjustmentSettingsTab::default(),
             creative_luts: crate::creative_lut::builtin_creative_lut_entries(),
             fullscreen_side_panel_mode: FsSidePanelMode::default(),
+            fullscreen_navigator_visible: false,
+            fullscreen_navigator_corner: FullscreenNavigatorCorner::default(),
+            fullscreen_navigator_size: FULLSCREEN_NAVIGATOR_SIZE_DEFAULT,
             fullscreen_seek_bar_locked: false,
             fullscreen_top_bar_locked: false,
             fullscreen_seek_direction: FullscreenSeekDirection::default(),
@@ -4970,6 +5357,8 @@ impl Default for Settings {
             toolbar_bookshelf_collapsed: false,
             toolbar_sort_items: default_toolbar_sort_items(),
             toolbar_facet_filter_items: default_toolbar_facet_filter_items(),
+            toolbar_facet_name_filter_index_stash: None,
+            facet_name_filter_width: FacetNameFilterWidth::default(),
             toolbar_section_order: Vec::new(),
             show_toolbar_cols: true,
             show_toolbar_aspect: true,
@@ -4997,6 +5386,8 @@ impl Default for Settings {
             ai_backend: None,
             global_preset: crate::adjustment::AdjustParams::default(),
             preset_slots: crate::adjustment::PresetSlots::default(),
+            post_filter_global_preset_stash: PostFilterDowngradeStash::default(),
+            post_filter_preset_slot_stashes: [PostFilterDowngradeStash::default(); 10],
             colorize_preset_slots: crate::colorize::ColorizePresetSlots::default(),
             sidecar_backup_enabled: true,
             tag_sidecar_backup_enabled: false,
@@ -6142,6 +6533,70 @@ impl Settings {
         true
     }
 
+    /// Move post-filter variants unknown to v2.11.0 out of both Settings-owned preset paths.
+    ///
+    /// This runs only on the persistence clone. The live Settings keeps the selected variant.
+    pub(crate) fn stash_post_filter_variants_for_persist(&mut self) {
+        self.post_filter_global_preset_stash
+            .stash_for_persist(&mut self.global_preset);
+        for index in 0..self.preset_slots.slots.len() {
+            let stash = &mut self.post_filter_preset_slot_stashes[index];
+            if let Some(slot) = self.preset_slots.slots[index].as_mut() {
+                stash.stash_for_persist(&mut slot.params);
+            } else {
+                *stash = PostFilterDowngradeStash::default();
+            }
+        }
+    }
+
+    /// `NameFilter` を知らない旧版が既存 enum 配列を安全に読める形へ退避する。
+    /// live state ではなく、永続化用 clone にだけ適用する。
+    pub(crate) fn stash_toolbar_name_filter_for_persist(&mut self) {
+        self.toolbar_facet_name_filter_index_stash = Some(
+            self.toolbar_facet_filter_items
+                .iter()
+                .position(|item| *item == ToolbarFacetFilterItem::NameFilter)
+                .unwrap_or(TOOLBAR_NAME_FILTER_HIDDEN_STASH),
+        );
+        self.toolbar_facet_filter_items
+            .retain(|item| *item != ToolbarFacetFilterItem::NameFilter);
+    }
+
+    fn restore_toolbar_name_filter_after_load(&mut self) {
+        let stashed = self.toolbar_facet_name_filter_index_stash.take();
+        if self
+            .toolbar_facet_filter_items
+            .contains(&ToolbarFacetFilterItem::NameFilter)
+        {
+            return;
+        }
+        match stashed {
+            Some(TOOLBAR_NAME_FILTER_HIDDEN_STASH) => {}
+            Some(index) => self.toolbar_facet_filter_items.insert(
+                index.min(self.toolbar_facet_filter_items.len()),
+                ToolbarFacetFilterItem::NameFilter,
+            ),
+            // Existing settings predate both NameFilter and its carrier. The input was previously
+            // always visible, so preserve that behavior on the first load after upgrading.
+            None => self
+                .toolbar_facet_filter_items
+                .push(ToolbarFacetFilterItem::NameFilter),
+        }
+    }
+
+    fn restore_post_filter_variants_after_load(&mut self) {
+        self.post_filter_global_preset_stash
+            .restore_after_load(&mut self.global_preset);
+        for index in 0..self.preset_slots.slots.len() {
+            let stash = &mut self.post_filter_preset_slot_stashes[index];
+            if let Some(slot) = self.preset_slots.slots[index].as_mut() {
+                stash.restore_after_load(&mut slot.params);
+            } else {
+                *stash = PostFilterDowngradeStash::default();
+            }
+        }
+    }
+
     /// v2.6.0 で追加したページ数列を、v2.5.0 が deserialize できる形へ退避する。
     ///
     /// 旧版が読む既存フィールドには既知の variant だけを残し、ページ数列の状態は
@@ -6199,6 +6654,99 @@ impl Settings {
         }
     }
 
+    /// 場所列を、この列を知らない旧版が deserialize できる形へ退避する。
+    ///
+    /// `PageCount` と同じく、live state ではなく永続化用 clone にだけ適用する。
+    /// 下部情報バー専用の列設定もリリース済みフィールドなので、そこに `Place` を
+    /// 残すと旧版が未知 variant で設定全体を隔離するため、同じ carrier へ退避する。
+    pub(crate) fn stash_details_place_for_persist(&mut self) {
+        self.details_place_sort_stash = matches!(self.details_sort_key, DetailsSortKey::Place);
+        if self.details_place_sort_stash {
+            self.details_sort_key = DetailsSortKey::Toolbar;
+        }
+
+        self.details_place_column_index_stash = self
+            .details_column_order
+            .iter()
+            .position(|column| *column == DetailsColumnId::Place);
+        self.details_column_order
+            .retain(|column| *column != DetailsColumnId::Place);
+
+        self.details_place_column_width_stash = self
+            .details_column_widths
+            .iter()
+            .find(|entry| entry.column == DetailsColumnId::Place)
+            .map(|entry| entry.width);
+        self.details_column_widths
+            .retain(|entry| entry.column != DetailsColumnId::Place);
+
+        self.details_selection_bar_place_column_index_stash = self
+            .details_selection_bar_column_order
+            .iter()
+            .position(|column| *column == DetailsColumnId::Place);
+        self.details_selection_bar_column_order
+            .retain(|column| *column != DetailsColumnId::Place);
+
+        self.details_selection_bar_place_column_width_stash = self
+            .details_selection_bar_column_widths
+            .iter()
+            .find(|entry| entry.column == DetailsColumnId::Place)
+            .map(|entry| entry.width);
+        self.details_selection_bar_column_widths
+            .retain(|entry| entry.column != DetailsColumnId::Place);
+    }
+
+    fn restore_details_place_after_load(&mut self) {
+        if std::mem::take(&mut self.details_place_sort_stash) {
+            self.details_sort_key = DetailsSortKey::Place;
+        }
+
+        if let Some(index) = self.details_place_column_index_stash.take()
+            && !self.details_column_order.contains(&DetailsColumnId::Place)
+        {
+            self.details_column_order.insert(
+                index.min(self.details_column_order.len()),
+                DetailsColumnId::Place,
+            );
+        }
+
+        if let Some(width) = self.details_place_column_width_stash.take()
+            && !self
+                .details_column_widths
+                .iter()
+                .any(|entry| entry.column == DetailsColumnId::Place)
+        {
+            self.details_column_widths.push(DetailsColumnWidth {
+                column: DetailsColumnId::Place,
+                width,
+            });
+        }
+
+        if let Some(index) = self.details_selection_bar_place_column_index_stash.take()
+            && !self
+                .details_selection_bar_column_order
+                .contains(&DetailsColumnId::Place)
+        {
+            self.details_selection_bar_column_order.insert(
+                index.min(self.details_selection_bar_column_order.len()),
+                DetailsColumnId::Place,
+            );
+        }
+
+        if let Some(width) = self.details_selection_bar_place_column_width_stash.take()
+            && !self
+                .details_selection_bar_column_widths
+                .iter()
+                .any(|entry| entry.column == DetailsColumnId::Place)
+        {
+            self.details_selection_bar_column_widths
+                .push(DetailsColumnWidth {
+                    column: DetailsColumnId::Place,
+                    width,
+                });
+        }
+    }
+
     /// 詳細一覧の列設定一式を、詳細表示中の下部情報バー専用設定へ複製する。
     ///
     /// モードは変更しない。モード遷移を所有する呼び出し側が、専用設定へ切り替わる
@@ -6211,6 +6759,7 @@ impl Settings {
         self.details_selection_bar_show_tags = self.details_show_tags;
         self.details_selection_bar_show_kind = self.details_show_kind;
         self.details_selection_bar_show_page_count = self.details_show_page_count;
+        self.details_selection_bar_show_place = self.details_show_place;
         self.details_selection_bar_show_size = self.details_show_size;
         self.details_selection_bar_show_modified = self.details_show_modified;
         self.details_selection_bar_show_created = self.details_show_created;
@@ -6226,10 +6775,30 @@ impl Settings {
     /// 読み込んだ設定値を安全範囲に補正する (JSON 手編集で範囲外の値が入った場合の防衛)。
     /// お気に入りの UUID マイグレーションもここで行う。
     fn sanitize(&mut self) {
+        self.restore_post_filter_variants_after_load();
+        self.restore_toolbar_name_filter_after_load();
         self.text_contrast = self.text_contrast.normalized();
         self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
         self.ui_font.sanitize();
         self.grid_display_order.normalize();
+        self.subfolder_expansion_filter_kinds.retain(|kind| {
+            matches!(
+                kind,
+                FacetItemKind::Folder
+                    | FacetItemKind::Image
+                    | FacetItemKind::Video
+                    | FacetItemKind::Zip
+                    | FacetItemKind::Pdf
+            )
+        });
+        self.subfolder_expansion_filter_date_preset = self
+            .subfolder_expansion_filter_date_preset
+            .map(FacetDatePreset::sanitized);
+        // この設定キー自体が未リリースなので、旧版はフィールドごと無視する。
+        // FacetFilter のようなダウングレード互換 stash は不要。
+        self.subfolder_expansion_filter_size_preset = self
+            .subfolder_expansion_filter_size_preset
+            .map(FacetSizePreset::sanitized);
         // 環境設定 UI 側のレンジ (1..=30) と整合させる。
         // 下限 0 は navigate_folder_with_skip が first を評価せず Ctrl+↑↓ が
         // 事実上機能しなくなる。上限を超える値は ZIP 中身検査込みの DFS が
@@ -6335,6 +6904,13 @@ impl Settings {
             .clamp(1, crate::reading_history_db::READING_HISTORY_LIMIT_MAX);
         self.fullscreen_cursor_hide_delay_secs =
             clamp_fullscreen_cursor_hide_delay_secs(self.fullscreen_cursor_hide_delay_secs);
+        self.fullscreen_navigator_corner = self.fullscreen_navigator_corner.normalized();
+        self.fullscreen_navigator_size = if self.fullscreen_navigator_size.is_finite() {
+            self.fullscreen_navigator_size
+                .clamp(FULLSCREEN_NAVIGATOR_SIZE_MIN, FULLSCREEN_NAVIGATOR_SIZE_MAX)
+        } else {
+            FULLSCREEN_NAVIGATOR_SIZE_DEFAULT
+        };
         self.retained_final_ai_cache_max_entries = self.retained_final_ai_cache_max_entries.clamp(
             RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MIN,
             RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MAX,
@@ -6410,18 +6986,22 @@ impl Settings {
                 if rule.filter.edits.remove(&FacetEditFlag::AiAdjustment) {
                     rule.filter.edits.insert(FacetEditFlag::Adjustment);
                 }
+                rule.filter.restore_extended_size_after_load();
                 rule.filter.restore_bookmark_states_after_load();
                 rule.filter.date_preset = rule.filter.date_preset.map(FacetDatePreset::sanitized);
+                rule.filter.size_preset = rule.filter.size_preset.map(FacetSizePreset::sanitized);
                 true
             });
         }
         self.restore_details_page_count_after_load();
+        self.restore_details_place_after_load();
         sanitize_details_column_order(&mut self.details_column_order);
         sanitize_details_column_widths(&mut self.details_column_widths);
         sanitize_details_column_order(&mut self.details_selection_bar_column_order);
         sanitize_details_column_widths(&mut self.details_selection_bar_column_widths);
         self.toolbar_facet_filter_items =
             ToolbarFacetFilterItem::visible_order(&self.toolbar_facet_filter_items);
+        self.facet_name_filter_width = self.facet_name_filter_width.normalized();
         self.grid_click_selection_mode = self.grid_click_selection_mode.normalized();
         // grid_cursor_wrap は bool のため不正値を持たない。旧設定の欠落は serde default で
         // false に補い、sanitize では読み込んだ ON/OFF をそのまま維持する。
@@ -6447,11 +7027,16 @@ impl Settings {
             self.facet_filter.edits.insert(FacetEditFlag::Adjustment);
         }
         self.facet_filter.restore_extended_date_after_load();
+        self.facet_filter.restore_extended_size_after_load();
         self.facet_filter.restore_bookmark_states_after_load();
         self.facet_filter.date_preset = self
             .facet_filter
             .date_preset
             .map(FacetDatePreset::sanitized);
+        self.facet_filter.size_preset = self
+            .facet_filter
+            .size_preset
+            .map(FacetSizePreset::sanitized);
         // 保存時に退避した種類フィルタの Audio を kinds へ戻す (v2.2.0 ダウングレード互換、
         // `FacetFilter::kind_audio_stash` のコメント参照)。
         self.facet_filter.restore_kind_audio_after_load();
@@ -6534,6 +7119,7 @@ impl Settings {
         self.details_show_tags = src.details_show_tags;
         self.details_show_kind = src.details_show_kind;
         self.details_show_page_count = src.details_show_page_count;
+        self.details_show_place = src.details_show_place;
         self.details_show_size = src.details_show_size;
         self.details_show_modified = src.details_show_modified;
         self.details_show_created = src.details_show_created;
@@ -6551,6 +7137,7 @@ impl Settings {
         self.details_selection_bar_show_tags = src.details_selection_bar_show_tags;
         self.details_selection_bar_show_kind = src.details_selection_bar_show_kind;
         self.details_selection_bar_show_page_count = src.details_selection_bar_show_page_count;
+        self.details_selection_bar_show_place = src.details_selection_bar_show_place;
         self.details_selection_bar_show_size = src.details_selection_bar_show_size;
         self.details_selection_bar_show_modified = src.details_selection_bar_show_modified;
         self.details_selection_bar_show_created = src.details_selection_bar_show_created;
@@ -6566,6 +7153,10 @@ impl Settings {
         self.thumb_aspect = src.thumb_aspect;
         self.sort_order = src.sort_order;
         self.subfolder_expansion_order = src.subfolder_expansion_order;
+        self.subfolder_expansion_max_depth = src.subfolder_expansion_max_depth;
+        self.subfolder_expansion_filter_kinds = src.subfolder_expansion_filter_kinds.clone();
+        self.subfolder_expansion_filter_date_preset = src.subfolder_expansion_filter_date_preset;
+        self.subfolder_expansion_filter_size_preset = src.subfolder_expansion_filter_size_preset;
         self.rating_filter = src.rating_filter;
         self.folder_tree_pane_visible = src.folder_tree_pane_visible;
         self.folder_tree_pane_width_ratio = src.folder_tree_pane_width_ratio;
@@ -6603,6 +7194,9 @@ impl Settings {
         self.toolbar_aspect_auto_visible = src.toolbar_aspect_auto_visible;
         self.toolbar_sort_items = std::mem::take(&mut src.toolbar_sort_items);
         self.toolbar_facet_filter_items = std::mem::take(&mut src.toolbar_facet_filter_items);
+        self.toolbar_facet_name_filter_index_stash =
+            src.toolbar_facet_name_filter_index_stash.take();
+        self.facet_name_filter_width = src.facet_name_filter_width;
         self.toolbar_section_order = std::mem::take(&mut src.toolbar_section_order);
         self.toolbar_section_new_row = std::mem::take(&mut src.toolbar_section_new_row);
         self.toolbar_section_drag_enabled = src.toolbar_section_drag_enabled;
@@ -6920,6 +7514,10 @@ mod tests {
         assert_eq!(
             settings.details_selection_bar_show_page_count,
             settings.details_show_page_count
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_place,
+            settings.details_show_place
         );
         assert_eq!(
             settings.details_selection_bar_show_size,
@@ -7600,11 +8198,276 @@ mod tests {
     }
 
     #[test]
+    fn facet_name_filter_width_roundtrips_all_choices() {
+        for &width in FacetNameFilterWidth::all() {
+            let mut settings = Settings::default();
+            settings.facet_name_filter_width = width;
+            let json = serde_json::to_string(&settings).unwrap();
+            let loaded: Settings = serde_json::from_str(&json).unwrap();
+            assert_eq!(loaded.facet_name_filter_width, width);
+        }
+        assert_eq!(FacetNameFilterWidth::Small.width(), 90.0);
+        assert_eq!(FacetNameFilterWidth::Medium.width(), 140.0);
+        assert_eq!(FacetNameFilterWidth::Large.width(), 200.0);
+    }
+
+    #[test]
+    fn toolbar_name_filter_stash_preserves_order_and_old_enum_shape() {
+        let mut settings = Settings::default();
+        settings.toolbar_facet_filter_items = vec![
+            ToolbarFacetFilterItem::Ext,
+            ToolbarFacetFilterItem::NameFilter,
+            ToolbarFacetFilterItem::Kind,
+        ];
+        let mut persisted = settings.clone();
+        persisted.stash_toolbar_name_filter_for_persist();
+        let json = serde_json::to_value(&persisted).unwrap();
+
+        assert_eq!(
+            json["toolbar_facet_filter_items"],
+            serde_json::json!(["Ext", "Kind"])
+        );
+        assert_eq!(json["toolbar_facet_name_filter_index_stash"], 1);
+
+        #[derive(serde::Deserialize, Debug, PartialEq, Eq)]
+        enum PreviousToolbarFacetFilterItem {
+            Kind,
+            Ext,
+        }
+        let previous: Vec<PreviousToolbarFacetFilterItem> =
+            serde_json::from_value(json["toolbar_facet_filter_items"].clone()).unwrap();
+        assert_eq!(
+            previous,
+            vec![
+                PreviousToolbarFacetFilterItem::Ext,
+                PreviousToolbarFacetFilterItem::Kind,
+            ]
+        );
+
+        let mut loaded: Settings = serde_json::from_value(json).unwrap();
+        loaded.sanitize();
+        assert_eq!(
+            loaded.toolbar_facet_filter_items,
+            settings.toolbar_facet_filter_items
+        );
+        assert!(loaded.toolbar_facet_name_filter_index_stash.is_none());
+
+        let mut hidden = Settings::default();
+        hidden
+            .toolbar_facet_filter_items
+            .retain(|item| *item != ToolbarFacetFilterItem::NameFilter);
+        let mut hidden_persisted = hidden.clone();
+        hidden_persisted.stash_toolbar_name_filter_for_persist();
+        assert_eq!(
+            hidden_persisted.toolbar_facet_name_filter_index_stash,
+            Some(TOOLBAR_NAME_FILTER_HIDDEN_STASH)
+        );
+        hidden_persisted.sanitize();
+        assert_eq!(
+            hidden_persisted.toolbar_facet_filter_items,
+            hidden.toolbar_facet_filter_items
+        );
+
+        let mut legacy: Settings = serde_json::from_value(serde_json::json!({
+            "toolbar_facet_filter_items": ["Ext", "Kind"]
+        }))
+        .unwrap();
+        legacy.sanitize();
+        assert_eq!(
+            legacy.toolbar_facet_filter_items,
+            vec![
+                ToolbarFacetFilterItem::Ext,
+                ToolbarFacetFilterItem::Kind,
+                ToolbarFacetFilterItem::NameFilter,
+            ],
+            "the previously-always-visible input must stay visible after upgrading"
+        );
+    }
+
+    #[test]
+    fn post_filter_stash_keeps_persisted_presets_v211_compatible() {
+        use crate::adjustment::{PostFilter, PresetSlot};
+
+        let mut settings = Settings::default();
+        settings.global_preset.post_filter = PostFilter::UpscaleAnime;
+        settings.preset_slots.slots[0] = Some(PresetSlot {
+            name: "sharp".to_owned(),
+            params: crate::adjustment::AdjustParams {
+                post_filter: PostFilter::UpscaleSharp,
+                ..Default::default()
+            },
+        });
+        settings.preset_slots.slots[1] = Some(PresetSlot {
+            name: "legacy".to_owned(),
+            params: crate::adjustment::AdjustParams {
+                post_filter: PostFilter::Sepia,
+                ..Default::default()
+            },
+        });
+
+        let mut persisted = settings.clone();
+        persisted.stash_post_filter_variants_for_persist();
+        let json = serde_json::to_value(&persisted).unwrap();
+
+        assert_eq!(json["global_preset"]["post_filter"], "none");
+        assert_eq!(
+            json["preset_slots"]["slots"][0]["params"]["post_filter"],
+            "none"
+        );
+        assert_eq!(
+            json["preset_slots"]["slots"][1]["params"]["post_filter"],
+            "sepia"
+        );
+        assert_eq!(
+            json["post_filter_global_preset_stash"]["sharp_upscale"],
+            false
+        );
+        assert_eq!(
+            json["post_filter_global_preset_stash"]["anime_upscale"],
+            true
+        );
+        assert_eq!(
+            json["post_filter_preset_slot_stashes"][0]["sharp_upscale"],
+            true
+        );
+        assert!(
+            !json.to_string().contains("upscale_sharp")
+                && !json.to_string().contains("upscale_anime"),
+            "v2.11.0-visible enum fields must contain neither new variant"
+        );
+
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum V211PostFilter {
+            None,
+            Sepia,
+        }
+        #[derive(serde::Deserialize)]
+        struct V211AdjustParams {
+            post_filter: V211PostFilter,
+        }
+        #[derive(serde::Deserialize)]
+        struct V211PresetSlot {
+            params: V211AdjustParams,
+        }
+        #[derive(serde::Deserialize)]
+        struct V211PresetSlots {
+            slots: [Option<V211PresetSlot>; 10],
+        }
+        #[derive(serde::Deserialize)]
+        struct V211Settings {
+            global_preset: V211AdjustParams,
+            preset_slots: V211PresetSlots,
+        }
+
+        let old: V211Settings = serde_json::from_value(json.clone())
+            .expect("v2.11.0 shape must ignore the additive carrier fields");
+        assert_eq!(old.global_preset.post_filter, V211PostFilter::None);
+        assert_eq!(
+            old.preset_slots.slots[0]
+                .as_ref()
+                .unwrap()
+                .params
+                .post_filter,
+            V211PostFilter::None
+        );
+        assert_eq!(
+            old.preset_slots.slots[1]
+                .as_ref()
+                .unwrap()
+                .params
+                .post_filter,
+            V211PostFilter::Sepia
+        );
+
+        let mut loaded: Settings = serde_json::from_value(json).unwrap();
+        loaded.sanitize();
+        assert_eq!(loaded.global_preset.post_filter, PostFilter::UpscaleAnime);
+        assert_eq!(
+            loaded.preset_slots.slots[0]
+                .as_ref()
+                .unwrap()
+                .params
+                .post_filter,
+            PostFilter::UpscaleSharp
+        );
+        assert_eq!(
+            loaded.preset_slots.slots[1]
+                .as_ref()
+                .unwrap()
+                .params
+                .post_filter,
+            PostFilter::Sepia
+        );
+        assert!(!loaded.post_filter_global_preset_stash.sharp_upscale);
+        assert!(!loaded.post_filter_global_preset_stash.anime_upscale);
+        assert!(
+            loaded
+                .post_filter_preset_slot_stashes
+                .iter()
+                .all(|stash| !stash.sharp_upscale && !stash.anime_upscale)
+        );
+    }
+
+    #[test]
+    fn post_filter_stash_restores_each_new_variant_independently() {
+        use crate::adjustment::{AdjustParams, PostFilter};
+
+        for variant in [PostFilter::UpscaleSharp, PostFilter::UpscaleAnime] {
+            let mut params = AdjustParams {
+                post_filter: variant,
+                ..Default::default()
+            };
+            let mut stash = PostFilterDowngradeStash::default();
+            stash.stash_for_persist(&mut params);
+            assert_eq!(params.post_filter, PostFilter::None);
+            stash.restore_after_load(&mut params);
+            assert_eq!(params.post_filter, variant);
+            assert!(!stash.sharp_upscale && !stash.anime_upscale);
+        }
+    }
+
+    #[test]
+    fn anime_upscale_source_limit_defaults_to_4096_and_roundtrips() {
+        let settings = Settings::default();
+        assert_eq!(
+            settings.anime_upscale_source_limit,
+            AnimeUpscaleSourceLimit::Px4096
+        );
+        assert_eq!(
+            serde_json::to_value(AnimeUpscaleSourceLimit::Px2048).unwrap(),
+            serde_json::Value::String("px2048".to_owned())
+        );
+        assert_eq!(
+            serde_json::from_value::<AnimeUpscaleSourceLimit>(serde_json::Value::String(
+                "unlimited".to_owned(),
+            ))
+            .unwrap(),
+            AnimeUpscaleSourceLimit::Unlimited
+        );
+    }
+
+    #[test]
     fn removed_separator_facet_kind_deserializes_as_unknown() {
         // v2.5.0 で FacetItemKind::Separator を撤去した後も、旧 settings に残った
         // 文字列は設定全体を破損扱いにせず、未知の種類として安全に読み込む。
         let kind: FacetItemKind = serde_json::from_str(r#""Separator""#).unwrap();
         assert_eq!(kind, FacetItemKind::Unknown);
+    }
+
+    #[test]
+    fn facet_name_query_is_session_only() {
+        let mut filter = FacetFilter::default();
+        filter.name_query = "temporary".to_owned();
+
+        let json = serde_json::to_value(&filter).unwrap();
+        assert!(json.get("name_query").is_none());
+
+        let loaded: FacetFilter = serde_json::from_value(serde_json::json!({
+            "name_query": "stale"
+        }))
+        .unwrap();
+        assert!(loaded.name_query.is_empty());
     }
 
     /// 種類フィルタの Audio は保存時に kinds から `kind_audio_stash` へ退避され、
@@ -7765,6 +8628,63 @@ mod tests {
     }
 
     #[test]
+    fn facet_extended_size_stash_keeps_persisted_form_compatible() {
+        let range = FacetSizePreset::Range {
+            min: Some(FacetSizeValue::new(100, FacetSizeUnit::KB)),
+            max: Some(FacetSizeValue::new(2, FacetSizeUnit::MB)),
+        };
+        let mut facet = FacetFilter {
+            size_preset: Some(range),
+            ..FacetFilter::default()
+        };
+        let original = facet.clone();
+        facet.stash_extended_size_for_persist();
+        let json = serde_json::to_value(&facet).unwrap();
+        assert!(json["size_preset"].is_null());
+        assert!(!json["size_extended_stash"].is_null());
+
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        enum LegacySizePreset {
+            Under1MiB,
+            MiB1To10,
+            MiB10To100,
+            Over100MiB,
+        }
+        #[derive(serde::Deserialize)]
+        struct LegacyFacetFilter {
+            #[serde(default)]
+            size_preset: Option<LegacySizePreset>,
+        }
+        let legacy: LegacyFacetFilter = serde_json::from_value(json.clone())
+            .expect("legacy shape must ignore the extended size carrier");
+        assert!(legacy.size_preset.is_none());
+
+        let mut loaded: FacetFilter = serde_json::from_value(json).unwrap();
+        loaded.restore_extended_size_after_load();
+        assert_eq!(loaded, original);
+
+        let mut old_choice = FacetFilter {
+            size_preset: Some(FacetSizePreset::MiB10To100),
+            ..FacetFilter::default()
+        };
+        old_choice.stash_extended_size_for_persist();
+        assert_eq!(old_choice.size_preset, Some(FacetSizePreset::MiB10To100));
+        assert!(old_choice.size_extended_stash.is_none());
+
+        let mut smart = SmartFolderFilter {
+            size_preset: Some(range),
+            ..SmartFolderFilter::default()
+        };
+        let smart_original = smart.clone();
+        smart.stash_extended_size_for_persist();
+        assert!(smart.size_preset.is_none());
+        assert_eq!(smart.size_extended_stash, Some(range));
+        smart.restore_extended_size_after_load();
+        assert_eq!(smart, smart_original);
+    }
+
+    #[test]
     fn page_count_details_stash_keeps_persisted_form_v25_compatible() {
         let mut settings = Settings::default();
         settings.details_sort_key = DetailsSortKey::PageCount;
@@ -7871,6 +8791,176 @@ mod tests {
         assert!(!loaded.details_page_count_sort_stash);
         assert!(loaded.details_page_count_column_index_stash.is_none());
         assert!(loaded.details_page_count_column_width_stash.is_none());
+    }
+
+    #[test]
+    fn place_details_stash_keeps_persisted_form_compatible() {
+        let mut settings = Settings::default();
+        settings.details_sort_key = DetailsSortKey::Place;
+        settings.details_column_order = vec![
+            DetailsColumnId::Preview,
+            DetailsColumnId::Name,
+            DetailsColumnId::Place,
+            DetailsColumnId::Size,
+        ];
+        settings.details_column_widths = vec![
+            DetailsColumnWidth {
+                column: DetailsColumnId::Place,
+                width: 180.0,
+            },
+            DetailsColumnWidth {
+                column: DetailsColumnId::Size,
+                width: 128.0,
+            },
+        ];
+        settings.details_selection_bar_column_order = vec![
+            DetailsColumnId::Preview,
+            DetailsColumnId::Name,
+            DetailsColumnId::Place,
+            DetailsColumnId::Kind,
+        ];
+        settings.details_selection_bar_column_widths = vec![DetailsColumnWidth {
+            column: DetailsColumnId::Place,
+            width: 220.0,
+        }];
+
+        let mut persisted = settings.clone();
+        persisted.stash_details_place_for_persist();
+        let json = serde_json::to_value(&persisted).unwrap();
+
+        #[derive(serde::Deserialize, Debug, PartialEq, Eq)]
+        enum PreviousDetailsSortKey {
+            Toolbar,
+            Name,
+            Rating,
+            Tags,
+            Kind,
+            PageCount,
+            Size,
+            Modified,
+            Created,
+            State,
+            ImageDimensions,
+            VideoDuration,
+            VideoDimensions,
+            VideoCodec,
+        }
+        #[derive(serde::Deserialize, Debug, PartialEq, Eq)]
+        enum PreviousDetailsColumnId {
+            Preview,
+            Name,
+            Rating,
+            Tags,
+            Kind,
+            PageCount,
+            Size,
+            Modified,
+            Created,
+            State,
+            ImageDimensions,
+            VideoDuration,
+            VideoDimensions,
+            VideoCodec,
+        }
+        #[derive(serde::Deserialize)]
+        struct PreviousDetailsColumnWidth {
+            column: PreviousDetailsColumnId,
+            width: f32,
+        }
+        #[derive(serde::Deserialize)]
+        struct PreviousSettings {
+            details_sort_key: PreviousDetailsSortKey,
+            details_column_order: Vec<PreviousDetailsColumnId>,
+            details_column_widths: Vec<PreviousDetailsColumnWidth>,
+            details_selection_bar_column_order: Vec<PreviousDetailsColumnId>,
+            details_selection_bar_column_widths: Vec<PreviousDetailsColumnWidth>,
+        }
+
+        let previous: PreviousSettings = serde_json::from_value(json.clone())
+            .expect("previous shape must ignore the place-column carriers");
+        assert_eq!(previous.details_sort_key, PreviousDetailsSortKey::Toolbar);
+        assert_eq!(
+            previous.details_column_order,
+            vec![
+                PreviousDetailsColumnId::Preview,
+                PreviousDetailsColumnId::Name,
+                PreviousDetailsColumnId::Size,
+            ]
+        );
+        assert_eq!(
+            previous.details_selection_bar_column_order,
+            vec![
+                PreviousDetailsColumnId::Preview,
+                PreviousDetailsColumnId::Name,
+                PreviousDetailsColumnId::Kind,
+            ]
+        );
+        assert_eq!(previous.details_column_widths.len(), 1);
+        assert_eq!(
+            previous.details_column_widths[0].column,
+            PreviousDetailsColumnId::Size
+        );
+        assert!((previous.details_column_widths[0].width - 128.0).abs() < 0.1);
+        assert!(previous.details_selection_bar_column_widths.is_empty());
+
+        let mut loaded: Settings = serde_json::from_value(json).unwrap();
+        loaded.sanitize();
+        assert_eq!(loaded.details_sort_key, DetailsSortKey::Place);
+        assert_eq!(
+            loaded
+                .details_column_order
+                .iter()
+                .position(|column| *column == DetailsColumnId::Place),
+            Some(2)
+        );
+        assert!(loaded.details_column_widths.iter().any(|entry| {
+            entry.column == DetailsColumnId::Place && (entry.width - 180.0).abs() < 0.1
+        }));
+        assert_eq!(
+            loaded
+                .details_selection_bar_column_order
+                .iter()
+                .position(|column| *column == DetailsColumnId::Place),
+            Some(2)
+        );
+        assert!(
+            loaded
+                .details_selection_bar_column_widths
+                .iter()
+                .any(|entry| {
+                    entry.column == DetailsColumnId::Place && (entry.width - 220.0).abs() < 0.1
+                })
+        );
+        assert!(!loaded.details_place_sort_stash);
+        assert!(loaded.details_place_column_index_stash.is_none());
+        assert!(loaded.details_place_column_width_stash.is_none());
+        assert!(
+            loaded
+                .details_selection_bar_place_column_index_stash
+                .is_none()
+        );
+        assert!(
+            loaded
+                .details_selection_bar_place_column_width_stash
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extended_details_column_stashes_preserve_relative_order() {
+        let mut settings = Settings::default();
+        settings.details_column_order = DetailsColumnId::default_order().to_vec();
+        let expected = settings.details_column_order.clone();
+
+        let mut persisted = settings.clone();
+        // sanitize restores PageCount before Place, so persistence removes them in reverse.
+        persisted.stash_details_place_for_persist();
+        persisted.stash_details_page_count_for_persist();
+        let json = serde_json::to_string(&persisted).unwrap();
+
+        let mut loaded: Settings = serde_json::from_str(&json).unwrap();
+        loaded.sanitize();
+        assert_eq!(loaded.details_column_order, expected);
     }
 
     #[test]
@@ -8084,6 +9174,13 @@ mod tests {
         assert!(!s.show_hidden_files);
         assert_eq!(s.sort_order, SortOrder::FileName);
         assert_eq!(s.subfolder_expansion_order, SubfolderExpansionOrder::Flat);
+        assert_eq!(
+            s.subfolder_expansion_max_depth,
+            SUBFOLDER_EXPANSION_MAX_DEPTH_DEFAULT
+        );
+        assert!(s.subfolder_expansion_filter_kinds.is_empty());
+        assert!(s.subfolder_expansion_filter_date_preset.is_none());
+        assert!(s.subfolder_expansion_filter_size_preset.is_none());
         assert_eq!(s.thumb_px, 512);
         assert_eq!(s.thumb_quality, 75);
         assert_eq!(s.cache_policy, CachePolicy::Auto);
@@ -8126,6 +9223,15 @@ mod tests {
         );
         assert!(s.fullscreen_page_number_overlay);
         assert!(!s.fullscreen_keep_on_app_switch);
+        assert!(!s.fullscreen_navigator_visible);
+        assert_eq!(
+            s.fullscreen_navigator_corner,
+            FullscreenNavigatorCorner::BottomRight
+        );
+        assert_eq!(
+            s.fullscreen_navigator_size,
+            FULLSCREEN_NAVIGATOR_SIZE_DEFAULT
+        );
         assert_eq!(
             s.fullscreen_cursor_hide_delay_secs,
             FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS
@@ -8960,6 +10066,7 @@ mod tests {
         s.fullscreen_jump_percent = 999;
         s.fullscreen_fixed_jump_count = 999;
         s.fullscreen_cursor_hide_delay_secs = 99.0;
+        s.fullscreen_navigator_size = 9999.0;
         s.retained_final_ai_cache_max_entries = 999;
         s.retained_final_ai_cache_max_mib = 999_999;
         s.downscale_smoothing_percent = 99;
@@ -8983,6 +10090,7 @@ mod tests {
             s.fullscreen_cursor_hide_delay_secs,
             FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS
         );
+        assert_eq!(s.fullscreen_navigator_size, FULLSCREEN_NAVIGATOR_SIZE_MAX);
         assert_eq!(
             s.retained_final_ai_cache_max_entries,
             RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MAX
@@ -9008,10 +10116,15 @@ mod tests {
         assert_eq!(s.retained_final_ai_cache_max_mib, 0);
 
         s.fullscreen_cursor_hide_delay_secs = f32::NAN;
+        s.fullscreen_navigator_size = f32::NAN;
         s.sanitize();
         assert_eq!(
             s.fullscreen_cursor_hide_delay_secs,
             FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS
+        );
+        assert_eq!(
+            s.fullscreen_navigator_size,
+            FULLSCREEN_NAVIGATOR_SIZE_DEFAULT
         );
     }
 
@@ -9684,6 +10797,66 @@ mod tests {
             }
             .matches_mtime(now, now)
         );
+    }
+
+    #[test]
+    fn facet_size_ranges_convert_units_and_keep_existing_boundaries() {
+        const KIB: u64 = 1024;
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        assert_eq!(FacetSizeValue::new(7, FacetSizeUnit::KB).bytes(), 7 * KIB);
+        assert_eq!(FacetSizeValue::new(7, FacetSizeUnit::MB).bytes(), 7 * MIB);
+        assert_eq!(FacetSizeValue::new(7, FacetSizeUnit::GB).bytes(), 7 * GIB);
+
+        assert_eq!(
+            FacetSizePreset::Range {
+                min: Some(FacetSizeValue::new(100, FacetSizeUnit::KB)),
+                max: None,
+            }
+            .range_bytes(),
+            (100 * KIB, None)
+        );
+        assert_eq!(
+            FacetSizePreset::Range {
+                min: None,
+                max: Some(FacetSizeValue::new(2, FacetSizeUnit::MB)),
+            }
+            .range_bytes(),
+            (0, Some(2 * MIB))
+        );
+        assert_eq!(
+            FacetSizePreset::Range {
+                min: Some(FacetSizeValue::new(100, FacetSizeUnit::KB)),
+                max: Some(FacetSizeValue::new(2, FacetSizeUnit::MB)),
+            }
+            .range_bytes(),
+            (100 * KIB, Some(2 * MIB))
+        );
+
+        let reversed = FacetSizePreset::Range {
+            min: Some(FacetSizeValue::new(2, FacetSizeUnit::GB)),
+            max: Some(FacetSizeValue::new(512, FacetSizeUnit::MB)),
+        };
+        assert_eq!(reversed.range_bytes(), (512 * MIB, Some(2 * GIB)));
+        assert_eq!(
+            reversed.sanitized(),
+            FacetSizePreset::Range {
+                min: Some(FacetSizeValue::new(512, FacetSizeUnit::MB)),
+                max: Some(FacetSizeValue::new(2, FacetSizeUnit::GB)),
+            }
+        );
+
+        assert_eq!(FacetSizePreset::Under1MiB.range_bytes(), (0, Some(MIB)));
+        assert_eq!(
+            FacetSizePreset::MiB1To10.range_bytes(),
+            (MIB, Some(10 * MIB))
+        );
+        assert_eq!(
+            FacetSizePreset::MiB10To100.range_bytes(),
+            (10 * MIB, Some(100 * MIB))
+        );
+        assert_eq!(FacetSizePreset::Over100MiB.range_bytes(), (100 * MIB, None));
     }
 
     #[test]
@@ -10565,6 +11738,55 @@ mod tests {
         }
 
         #[test]
+        fn subfolder_expansion_scan_settings_db_roundtrip() {
+            let missing: Settings = serde_json::from_str("{}").unwrap();
+            assert_eq!(
+                missing.subfolder_expansion_max_depth,
+                SUBFOLDER_EXPANSION_MAX_DEPTH_DEFAULT
+            );
+            assert!(missing.subfolder_expansion_filter_kinds.is_empty());
+            assert!(missing.subfolder_expansion_filter_date_preset.is_none());
+            assert!(missing.subfolder_expansion_filter_size_preset.is_none());
+
+            let env = setup_backup_env();
+            let _initial = Settings::load();
+            assert!(data_db_path(&env).exists());
+
+            let mut settings = Settings::default();
+            settings.subfolder_expansion_max_depth = 2;
+            settings
+                .subfolder_expansion_filter_kinds
+                .insert(FacetItemKind::Image);
+            settings
+                .subfolder_expansion_filter_kinds
+                .insert(FacetItemKind::Pdf);
+            settings.subfolder_expansion_filter_date_preset = Some(FacetDatePreset::CustomDays(45));
+            settings.subfolder_expansion_filter_size_preset = Some(FacetSizePreset::Range {
+                min: Some(FacetSizeValue::new(100, FacetSizeUnit::KB)),
+                max: Some(FacetSizeValue::new(2, FacetSizeUnit::MB)),
+            });
+            settings.save();
+
+            reset_backup_state_for_test();
+            let loaded = Settings::load();
+            assert_eq!(loaded.subfolder_expansion_max_depth, 2);
+            assert_eq!(
+                loaded.subfolder_expansion_filter_kinds,
+                settings.subfolder_expansion_filter_kinds
+            );
+            assert_eq!(
+                loaded.subfolder_expansion_filter_date_preset,
+                Some(FacetDatePreset::CustomDays(45))
+            );
+            assert_eq!(
+                loaded.subfolder_expansion_filter_size_preset,
+                Some(FacetSizePreset::Range {
+                    min: Some(FacetSizeValue::new(100, FacetSizeUnit::KB)),
+                    max: Some(FacetSizeValue::new(2, FacetSizeUnit::MB)),
+                })
+            );
+        }
+        #[test]
         fn details_selection_bar_settings_db_roundtrip() {
             let env = setup_backup_env();
             let _initial = Settings::load();
@@ -10676,7 +11898,10 @@ mod tests {
             s.facet_filter.include_untagged = true;
             s.facet_filter.tag_mode = FacetTagMode::All;
             s.facet_filter.date_preset = Some(FacetDatePreset::Last30Days);
-            s.facet_filter.size_preset = Some(FacetSizePreset::MiB10To100);
+            s.facet_filter.size_preset = Some(FacetSizePreset::Range {
+                min: Some(FacetSizeValue::new(100, FacetSizeUnit::KB)),
+                max: Some(FacetSizeValue::new(2, FacetSizeUnit::MB)),
+            });
             s.facet_filter.edits.insert(FacetEditFlag::Tagged);
             s.facet_filter.edit_include_descendants = true;
             s.thumb_aspect_auto = true;
@@ -10905,7 +12130,10 @@ mod tests {
             );
             assert_eq!(
                 loaded.facet_filter.size_preset,
-                Some(FacetSizePreset::MiB10To100),
+                Some(FacetSizePreset::Range {
+                    min: Some(FacetSizeValue::new(100, FacetSizeUnit::KB)),
+                    max: Some(FacetSizeValue::new(2, FacetSizeUnit::MB)),
+                }),
                 "facet_filter size preset should survive roundtrip"
             );
             assert!(

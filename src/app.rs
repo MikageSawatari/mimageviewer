@@ -101,6 +101,7 @@ mod cache_ops;
 mod color_filter;
 #[cfg(windows)]
 mod detached_window_manager;
+mod facet_name_filter;
 pub(crate) mod folder_scan;
 mod gamepad_input;
 mod grid_paint;
@@ -116,6 +117,9 @@ pub(crate) mod smart_folder;
 mod snapshot_ops;
 mod startup_ops;
 mod subfolder_expansion;
+pub(crate) use subfolder_expansion::{
+    SUBFOLDER_EXPANSION_FILTER_KINDS, SubfolderExpansionDepthChoice, SubfolderExpansionScanFilter,
+};
 pub(crate) mod top_level_grid_view;
 #[cfg(windows)]
 mod viewer_session;
@@ -2050,6 +2054,16 @@ struct ViewerContextBundle {
     stack_script_error: Option<String>,
     stack_toggle_select_path: Option<PathBuf>,
     items: Vec<GridItem>,
+    items_generation: u64,
+    visible_indices: Vec<usize>,
+    /// `items` と同じ添字の正規化済み basename と、その worker lifecycle。
+    /// query / tokens / debounce は App 全体で同じ絞り込み条件を使うため swap しないが、
+    /// 導出 cache は generation 空間を共有しない viewer context と一緒に所有する。
+    /// failed generation も別 context の同値 generation の build を抑止しないようここに含める。
+    facet_name_cache: Vec<Box<str>>,
+    facet_name_cache_generation: Option<u64>,
+    facet_name_cache_pending: Option<facet_name_filter::FacetNameCachePending>,
+    facet_name_cache_failed_generation: Option<u64>,
     thumbnails: Vec<ThumbnailState>,
     image_metas: Vec<Option<(i64, i64)>>,
     video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
@@ -2068,7 +2082,6 @@ struct ViewerContextBundle {
     details_hover_thumb_idx: Option<usize>,
     details_hover_thumb_viewport_open: bool,
     texture_backlog: Vec<crate::thumb_loader::ThumbMsg>,
-    visible_indices: Vec<usize>,
     details_order: Vec<usize>,
     details_order_revision: u64,
     details_cell_content_revisions: DetailsCellContentRevisions,
@@ -2178,7 +2191,6 @@ struct ViewerContextBundle {
     fs_pdf_display_target: Option<crate::pdf_loader::PdfDisplayTarget>,
     fs_early_dims: std::collections::HashMap<usize, [usize; 2]>,
     fs_upload_backlog: Vec<(usize, FsLoadResult, u64)>,
-    items_generation: u64,
     top_level_grid_view: top_level_grid_view::TopLevelGridView,
     items_are_global_search_view: bool,
     items_are_tag_view: bool,
@@ -2361,6 +2373,12 @@ impl ViewerContextBundle {
             stack_script_error: None,
             stack_toggle_select_path: None,
             items: Vec::new(),
+            items_generation: 0,
+            visible_indices: Vec::new(),
+            facet_name_cache: Vec::new(),
+            facet_name_cache_generation: None,
+            facet_name_cache_pending: None,
+            facet_name_cache_failed_generation: None,
             thumbnails: Vec::new(),
             image_metas: Vec::new(),
             video_thumb_overrides: std::collections::HashMap::new(),
@@ -2379,7 +2397,6 @@ impl ViewerContextBundle {
             details_hover_thumb_idx: None,
             details_hover_thumb_viewport_open: false,
             texture_backlog: Vec::new(),
-            visible_indices: Vec::new(),
             details_order: Vec::new(),
             details_order_revision: 0,
             details_cell_content_revisions: DetailsCellContentRevisions::default(),
@@ -2463,7 +2480,6 @@ impl ViewerContextBundle {
             fs_pdf_display_target: None,
             fs_early_dims: std::collections::HashMap::new(),
             fs_upload_backlog: Vec::new(),
-            items_generation: 0,
             top_level_grid_view: top_level_grid_view::TopLevelGridView::default(),
             items_are_global_search_view: false,
             items_are_tag_view: false,
@@ -9121,6 +9137,20 @@ pub struct App {
     /// anchor 配下へ入ると現在の filter を退避して内側は filter なしで始め、
     /// 内側で新しい filter を設定できる。anchor 外へ戻ると退避した filter を復元する。
     pub(crate) facet_filter_suppression_stack: Vec<FacetFilterSuppression>,
+    /// 絞り込みバーで編集中のファイル名。適用済み query とは debounce 境界で分ける。
+    pub(crate) facet_name_input: String,
+    /// ファイル名欄がフォーカス中なら grid shortcut を抑止する。
+    pub(crate) facet_name_has_focus: bool,
+    /// 適用済み query の解析結果。各 item の照合では再 parse しない。
+    pub(crate) facet_name_tokens: Vec<crate::search_query::Token>,
+    pub(crate) facet_name_debounce_deadline: Option<std::time::Instant>,
+    /// 現在 mount 中の viewer context が所有する、`items` と同じ添字の正規化済み basename。
+    /// 入力 / query / tokens / debounce は App-global の条件だが、以下の cache lifecycle は
+    /// `ViewerContextBundle` と swap して context ごとの `items` / generation に追従する。
+    pub(crate) facet_name_cache: Vec<Box<str>>,
+    pub(crate) facet_name_cache_generation: Option<u64>,
+    facet_name_cache_pending: Option<facet_name_filter::FacetNameCachePending>,
+    facet_name_cache_failed_generation: Option<u64>,
     /// facet タグメニュー内の一時検索文字列。設定には保存しない。
     pub(crate) facet_tag_search_query: String,
     /// 色フィルタの一時状態。Settings へ保存しないオンデマンド絞り込み。
@@ -9863,6 +9893,8 @@ pub struct App {
     /// snapshot を prepare worker と共有中に削除された実パス。巨大 Arc を UI
     /// スレッドで copy-on-write せず、以後の再構築で除外する tombstone。
     pub(crate) subfolder_expansion_removed_paths: std::collections::HashSet<String>,
+    /// OFF 状態のサブ展開ボタンから開く走査階層設定ダイアログ。
+    pub(crate) show_subfolder_expansion_dialog: bool,
     /// サブ展開 worker の進行中状態。
     pub(crate) subfolder_expansion_pending: Option<subfolder_expansion::SubfolderExpansionPending>,
     /// サブ展開 worker 完了後、ソート・一覧構築・メタ DB 読み込みを行う非同期準備。
@@ -10529,7 +10561,7 @@ pub struct App {
     pub(crate) erase_paint_mode: bool,
     /// inpaint 適用前の表示入力キャッシュ: item_idx → ピクセルデータ。
     /// raw 固定ではなく、補正 / AI 済みの pre-erase 入力が入ることがある。
-    /// 右 Ctrl の元画像プレビューには使わず、raw 表示は `fs_cache` だけを参照する。
+    /// 元画像プレビューには使わず、raw 表示は `fs_cache` だけを参照する。
     pub(crate) erase_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
     /// マスク永続化 DB
     pub(crate) mask_db: Option<crate::mask_db::MaskDb>,
@@ -11368,6 +11400,8 @@ impl App {
         let settings_boot_problem_source = settings_boot_problem_source(load_meta.boot_source);
         let show_mouse_nav_migration_prompt =
             Self::should_show_mouse_nav_migration_prompt(&settings, &load_meta);
+        let facet_name_input = settings.facet_filter.name_query.clone();
+        let facet_name_tokens = crate::search_query::parse(&facet_name_input);
         // 更新後 初回起動の「重要な変更点」(version_highlights ④)。
         // 開発用 `--whatsnew-from <ver>` で任意の前バージョンから強制表示できる
         // (再インストール不要でまたぎ表示を目視確認するため。docs/version-highlights-plan.md §5)。
@@ -12058,6 +12092,14 @@ impl App {
             ai_model_facet_requested: false,
             facet_filter_scope: None,
             facet_filter_suppression_stack: Vec::new(),
+            facet_name_input,
+            facet_name_has_focus: false,
+            facet_name_tokens,
+            facet_name_debounce_deadline: None,
+            facet_name_cache: Vec::new(),
+            facet_name_cache_generation: None,
+            facet_name_cache_pending: None,
+            facet_name_cache_failed_generation: None,
             facet_tag_search_query: String::new(),
             color_filter: crate::color_search::ColorFilterState::default(),
             color_filter_scope_refresh_pending: false,
@@ -12320,6 +12362,7 @@ impl App {
             subfolder_expansion_saved_folder: None,
             subfolder_expansion_snapshot: None,
             subfolder_expansion_removed_paths: std::collections::HashSet::new(),
+            show_subfolder_expansion_dialog: false,
             subfolder_expansion_pending: None,
             subfolder_expansion_install_pending: None,
             subfolder_expansion_confirm_pending: None,
@@ -13278,6 +13321,7 @@ impl App {
         let idx = self.items.len();
         self.items.push(item);
         self.thumbnails.push(ThumbnailState::Pending);
+        self.invalidate_facet_name_cache();
         idx
     }
 
@@ -13578,6 +13622,7 @@ impl App {
         let tracked_text_input_focused = is_root
             && (self.address_has_focus
                 || self.search_has_focus
+                || self.facet_name_has_focus
                 || self.favsearch.has_focus
                 || self.global_search.has_focus
                 || self.tag_view.has_focus
@@ -13722,6 +13767,7 @@ impl App {
             || self.fullscreen_tag_picker_open
             || self.show_fav_add_dialog
             || self.show_open_folder_dialog
+            || self.show_subfolder_expansion_dialog
             // Native name dialogs stop App::update while their OS modal loop is
             // active. Keep only the queued-launch flags here so the triggering
             // frame cannot leak input to the grid. Their async workers are not
@@ -13883,6 +13929,12 @@ impl App {
             stack_script_error,
             stack_toggle_select_path,
             items,
+            items_generation,
+            visible_indices,
+            facet_name_cache,
+            facet_name_cache_generation,
+            facet_name_cache_pending,
+            facet_name_cache_failed_generation,
             thumbnails,
             image_metas,
             video_thumb_overrides,
@@ -13901,7 +13953,6 @@ impl App {
             details_hover_thumb_idx,
             details_hover_thumb_viewport_open,
             texture_backlog,
-            visible_indices,
             details_order,
             details_order_revision,
             details_cell_content_revisions,
@@ -13985,7 +14036,6 @@ impl App {
             fs_pdf_display_target,
             fs_early_dims,
             fs_upload_backlog,
-            items_generation,
             top_level_grid_view,
             items_are_global_search_view,
             items_are_tag_view,
@@ -14099,6 +14149,12 @@ impl App {
         swap_field!(stack_script_error);
         swap_field!(stack_toggle_select_path);
         swap_field!(items);
+        swap_field!(items_generation);
+        swap_field!(visible_indices);
+        swap_field!(facet_name_cache);
+        swap_field!(facet_name_cache_generation);
+        swap_field!(facet_name_cache_pending);
+        swap_field!(facet_name_cache_failed_generation);
         swap_field!(thumbnails);
         swap_field!(image_metas);
         swap_field!(video_thumb_overrides);
@@ -14117,7 +14173,6 @@ impl App {
         swap_field!(details_hover_thumb_idx);
         swap_field!(details_hover_thumb_viewport_open);
         swap_field!(texture_backlog);
-        swap_field!(visible_indices);
         swap_field!(details_order);
         swap_field!(details_order_revision);
         swap_field!(details_cell_content_revisions);
@@ -14212,7 +14267,6 @@ impl App {
         swap_field!(fs_pdf_display_target);
         swap_field!(fs_early_dims);
         swap_field!(fs_upload_backlog);
-        swap_field!(items_generation);
         swap_field!(top_level_grid_view);
         swap_field!(items_are_global_search_view);
         swap_field!(items_are_tag_view);
@@ -17503,6 +17557,7 @@ impl App {
                     self.image_metas.push(None);
                     self.thumbnails.push(ThumbnailState::Pending);
                     self.items_generation = self.items_generation.wrapping_add(1);
+                    self.invalidate_facet_name_cache();
                     self.visible_indices.push(idx);
                     idx
                 });
@@ -19457,6 +19512,7 @@ impl App {
         self.items.clear();
         self.thumbnails.clear();
         self.image_metas.clear();
+        self.invalidate_facet_name_cache();
         self.visible_indices.clear();
         self.details_order.clear();
         self.details_tag_prewarm_indices.clear();
@@ -22286,6 +22342,7 @@ impl App {
             })
             .collect();
         self.items_generation = self.items_generation.wrapping_add(1);
+        self.invalidate_facet_name_cache();
         // 一覧全体の差し替えでは同じ index が別アイテムを指し得るため、クリック範囲選択の
         // 起点を失効させる。Ctrl+G streaming のように内容 identity で追従できる経路だけ、
         // 呼び出し側が旧 key を保存して新世代へ明示的に再マップする。
@@ -23702,6 +23759,7 @@ impl App {
     pub(crate) fn invalidate_idx_state_and_queues(&mut self) {
         use std::sync::atomic::Ordering;
 
+        self.invalidate_facet_name_cache();
         self.requested.clear();
         // items / thumbnails are replaced by several synthetic-view paths without going
         // through install_new_items.  The memo is idx-keyed, so retaining it would make an
@@ -37622,6 +37680,10 @@ impl App {
                 app.poll_metadata_load();
                 app.poll_tag_prewarm_results();
                 app.poll_tag_legacy_seed_results();
+                // 名前 facet の正規化結果も items と同じ bundle が所有する。active detached
+                // を mount したこの境界で pending を回収し、main の cache へ混入させない。
+                // 入力の debounce (App 全体の状態) は main を mount した本流だけが進める。
+                app.poll_facet_name_cache(ctx);
                 app.poll_ai_upscale(ctx);
                 app.poll_final_ai(ctx);
                 app.poll_erase_inpaint(ctx);
@@ -37917,9 +37979,48 @@ impl App {
         };
         let logical_scale = (image_rect_norm.width() * placement.w / rotated_size.x.max(1.0))
             .min(image_rect_norm.height() * placement.h / rotated_size.y.max(1.0));
+        let snapshot_rect = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
+        );
+        let image_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                image_rect_norm.min.x * snapshot_rect.width(),
+                image_rect_norm.min.y * snapshot_rect.height(),
+            ),
+            egui::pos2(
+                image_rect_norm.max.x * snapshot_rect.width(),
+                image_rect_norm.max.y * snapshot_rect.height(),
+            ),
+        );
+        let visible_source_uv_rect =
+            crate::displayed_image_transform::DisplayedImageTransform::from_resolved_rect(
+                crate::displayed_image_transform::DisplayedImageTransformInput {
+                    page_idx: idx,
+                    viewport_rect: snapshot_rect,
+                    source_size: texture_size,
+                    texture_size,
+                    rotation,
+                    free_rotation_rad: free_rotation,
+                    content_bbox: image_content_bbox,
+                    fit_mode: crate::settings::FullscreenFitMode::Page,
+                    fit_scale_limits:
+                        crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                    pixels_per_point,
+                    placement: crate::displayed_image_transform::ResolvedDisplayPlacement::Normal {
+                        zoom_pan: None,
+                    },
+                },
+                image_rect,
+            )
+            .and_then(|transform| transform.visible_source_uv_rect(snapshot_rect));
         let texture = self.fullscreen_paint_resource_for_texture(idx, texture);
-        let texture =
-            self.prepare_fullscreen_paint_resource(&texture, logical_scale, pixels_per_point);
+        let texture = self.prepare_fullscreen_paint_resource(
+            &texture,
+            logical_scale,
+            pixels_per_point,
+            visible_source_uv_rect,
+        );
         let frozen_continuous_pages = ctx
             .map(|ctx| self.detached_frozen_pages_for_snapshot(ctx, id, idx, placement))
             .unwrap_or_default();
@@ -38121,6 +38222,12 @@ impl App {
             stack_script_error,
             stack_toggle_select_path,
             items,
+            items_generation,
+            visible_indices,
+            facet_name_cache,
+            facet_name_cache_generation,
+            facet_name_cache_pending,
+            facet_name_cache_failed_generation,
             thumbnails,
             image_metas,
             video_thumb_overrides,
@@ -38140,7 +38247,6 @@ impl App {
             details_hover_thumb_idx,
             details_hover_thumb_viewport_open,
             texture_backlog,
-            visible_indices,
             details_order,
             details_order_revision,
             details_cell_content_revisions,
@@ -38223,7 +38329,6 @@ impl App {
             fs_pdf_display_target,
             fs_early_dims,
             fs_upload_backlog,
-            items_generation,
             top_level_grid_view,
             items_are_global_search_view,
             items_are_tag_view,
@@ -38338,6 +38443,11 @@ impl App {
             stack_script_error,
             stack_toggle_select_path,
             items,
+            items_generation,
+            visible_indices,
+            facet_name_cache,
+            facet_name_cache_generation,
+            facet_name_cache_failed_generation,
             thumbnails,
             image_metas,
             auto_aspect,
@@ -38349,7 +38459,6 @@ impl App {
             keep_range,
             keep_set,
             thumbnail_eviction_generation,
-            visible_indices,
             details_order,
             details_order_revision,
             details_cell_content_revisions,
@@ -38363,7 +38472,6 @@ impl App {
             tags_cache,
             current_folder_last_mtime,
             current_folder_signature,
-            items_generation,
             top_level_grid_view,
             items_are_global_search_view,
             items_are_tag_view,
@@ -38458,6 +38566,9 @@ impl App {
         // main が原本を保持する。parked メディア窓はこれらを駆動しないので empty のままでよい。
         keep_in_main!(
             navigation_scope,
+            // 新しい parked context は複製済み items/cache の独立 owner になる。進行中の
+            // receiver だけは複製できないため、元の main context に残す。
+            facet_name_cache_pending,
             requested,
             metadata_import_refresh_index,
             idle_upgrade_cache_bypass_ineligible,
@@ -42594,6 +42705,11 @@ impl App {
         } else {
             None
         };
+        let facet_name_filter_t0 = (crate::perf::is_enabled()
+            && !self.facet_name_tokens.is_empty()
+            && self.facet_name_cache_generation == Some(self.items_generation)
+            && self.facet_name_cache.len() == self.items.len())
+        .then(std::time::Instant::now);
         // 表示集合が変わると facet 件数も変わる (ui_main::facet_*_counts)。
         self.facet_tag_counts_cache = None;
         self.facet_place_counts_cache = None;
@@ -42648,6 +42764,29 @@ impl App {
             result.push(i);
         }
         self.visible_indices = result;
+        if let Some(t0) = facet_name_filter_t0 {
+            crate::perf::event(
+                "facet_name",
+                "filter_apply",
+                None,
+                0,
+                &[
+                    ("items", serde_json::Value::from(n)),
+                    (
+                        "visible",
+                        serde_json::Value::from(self.visible_indices.len()),
+                    ),
+                    (
+                        "tokens",
+                        serde_json::Value::from(self.facet_name_tokens.len()),
+                    ),
+                    (
+                        "ms",
+                        serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                ],
+            );
+        }
         if let (Some(t0), Some(scope_signature)) = (color_filter_t0, color_scope_signature) {
             crate::perf::event(
                 "color",
@@ -42866,6 +43005,12 @@ impl App {
     }
 
     pub(crate) fn facet_place_label_for_path(&self, path: &Path) -> String {
+        if self.items_are_subfolder_expansion_view
+            && let Some(root) = self.subfolder_expansion_root.as_deref()
+            && let Some(label) = subfolder_expansion::relative_place_label(root, path)
+        {
+            return label;
+        }
         self.book_address_label_for_path(path)
             .unwrap_or_else(|| path.display().to_string())
     }
@@ -43302,6 +43447,9 @@ impl App {
         if !self.facet_filter_effectively_active() {
             return true;
         }
+        if ignore != Some(FacetField::Name) && !self.passes_facet_name_filter(idx) {
+            return false;
+        }
         let Some(item) = self.items.get(idx).cloned() else {
             return false;
         };
@@ -43616,6 +43764,7 @@ impl App {
             DetailsSortKey::Tags => self.settings.details_show_tags,
             DetailsSortKey::Kind => self.settings.details_show_kind,
             DetailsSortKey::PageCount => self.settings.details_show_page_count,
+            DetailsSortKey::Place => self.settings.details_show_place,
             DetailsSortKey::Size => self.settings.details_show_size,
             DetailsSortKey::Modified => self.settings.details_show_modified,
             DetailsSortKey::Created => self.settings.details_show_created,
@@ -43745,6 +43894,11 @@ impl App {
             DetailsSortKey::PageCount => {
                 DetailsSortPrimary::U64(self.details_page_count_sort_value(idx))
             }
+            DetailsSortKey::Place => DetailsSortPrimary::Text(
+                self.facet_place_path_for_idx(idx)
+                    .map(|path| self.facet_place_label_for_path(&path))
+                    .unwrap_or_default(),
+            ),
             DetailsSortKey::Size => {
                 DetailsSortPrimary::I64(self.details_meta_value(idx).map(|(_, size)| size))
             }
@@ -44974,6 +45128,7 @@ impl App {
             return;
         }
         let saved_filter = std::mem::take(&mut self.settings.facet_filter);
+        self.sync_facet_name_runtime_from_filter();
         self.facet_filter_suppression_stack
             .push(FacetFilterSuppression {
                 anchor,
@@ -45040,6 +45195,7 @@ impl App {
     pub(crate) fn restore_facet_filter_suppression(&mut self) -> bool {
         if let Some(suppression) = self.facet_filter_suppression_stack.pop() {
             self.settings.facet_filter = suppression.saved_filter;
+            self.sync_facet_name_runtime_from_filter();
             self.settings.save();
             true
         } else {
@@ -61897,6 +62053,8 @@ impl eframe::App for App {
         self.poll_local_adjust_lut_load(ctx);
         self.poll_local_adjust_segmentation(ctx);
         self.poll_search(ctx);
+        self.poll_facet_name_debounce(ctx);
+        self.poll_facet_name_cache(ctx);
         self.poll_color_scan(ctx);
         self.poll_favsearch();
         self.poll_tag_view();
@@ -62477,6 +62635,7 @@ impl eframe::App for App {
         self.show_tag_apply_dialog(ctx);
         self.show_fav_add_dialog_window(ctx);
         let open_folder_nav = self.show_open_folder_dialog_window(ctx);
+        self.show_subfolder_expansion_dialog_window(ctx);
         self.show_new_folder_dialog_window(ctx);
         self.show_rename_dialog_window(ctx);
         self.draw_book_manager(ctx);

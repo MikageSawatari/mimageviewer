@@ -137,10 +137,15 @@ pub fn matches(tokens: &[Token], hay: &str) -> bool {
 /// include が 0 個 + exclude のみ + OR モードの場合、「exclude を含まない」だけで一致扱い
 /// にする (AND モードと同じ振る舞い、NOT-only は UI 側で拒否される)。
 pub fn matches_with_mode(tokens: &[Token], hay: &str, mode: MatchMode) -> bool {
+    let hay_lower = hay.to_lowercase();
+    matches_lowercased_with_mode(tokens, &hay_lower, mode)
+}
+
+/// 小文字化済みの `hay_lower` に対する照合。
+pub fn matches_lowercased_with_mode(tokens: &[Token], hay_lower: &str, mode: MatchMode) -> bool {
     if tokens.is_empty() {
         return true;
     }
-    let hay_lower = hay.to_lowercase();
     let mut any_include = false;
     let mut include_hit = false;
     for t in tokens {
@@ -532,6 +537,35 @@ mod tests {
         let t = parse("foo bar");
         assert!(matches(&t, "foo and bar"));
         assert!(!matches(&t, "only foo"));
+    }
+
+    #[test]
+    fn lowercased_matcher_preserves_filename_query_rules() {
+        assert!(matches_lowercased_with_mode(
+            &parse(""),
+            "anything.jpg",
+            MatchMode::And
+        ));
+        assert!(matches_lowercased_with_mode(
+            &parse("PHOTO"),
+            "summer_photo.jpg",
+            MatchMode::And
+        ));
+        assert!(matches_lowercased_with_mode(
+            &parse("summer photo"),
+            "summer_photo.jpg",
+            MatchMode::And
+        ));
+        assert!(!matches_lowercased_with_mode(
+            &parse("summer -draft"),
+            "summer_draft.jpg",
+            MatchMode::And
+        ));
+        assert!(matches_lowercased_with_mode(
+            &parse("summer -draft"),
+            "summer_final.jpg",
+            MatchMode::And
+        ));
     }
 
     #[test]

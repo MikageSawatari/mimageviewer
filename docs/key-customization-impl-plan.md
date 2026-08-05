@@ -135,12 +135,14 @@ pub enum KeyTrigger { Press, ModifierHold, KeyHold }
 
 /// 1 つのキー組み合わせ。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Chord {
-    pub ctrl: bool,
-    pub shift: bool,
-    pub alt: bool,
-    pub key: Option<KeySlot>,   // None = 修飾単独 (ModifierHold 用)
+pub enum Chord {
+    Key { ctrl: bool, shift: bool, alt: bool, key: KeySlot },
+    Modifier(ModKind),
 }
+
+/// Ctrl / Shift / Alt は左右不問、RightCtrl / RightShift / RightAlt は右側限定。
+/// 左側限定は用途がないため定義しない。
+pub enum ModKind { Ctrl, Shift, Alt, RightCtrl, RightShift, RightAlt }
 
 /// テキスト名で持つ物理キー。Win32 VK / scan code を正本にし、egui は fallback として使う。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -182,7 +184,9 @@ pub struct Keymap {
 # FsCapture = none            ; 明示的に無効化する例
 
 [FsImage.hold]
+# FsNavigatorHold = Shift      ; ナビゲータ保持の修飾を Alt → Shift (ModifierHold = 修飾のみ)
 # FsLoupeHold = Ctrl          ; ルーペ保持の修飾を Shift → Ctrl (ModifierHold = 修飾のみ)
+# FsOriginalPreviewHold = none ; 元画像表示保持を無効化
 
 [Erase]
 # EraseToolSelect = A
@@ -195,8 +199,9 @@ pub struct Keymap {
 パース規則:
 - 行 = `Action = <chord>` または `Action.<番号> = <chord>`。番号は 1..3 のみ。
   末尾数字ではなく `.` で分けることで、`RatingItem1` / `FsAdjustSlot1` のような Action 名と衝突させない。
-- chord = `+` 区切り。`Ctrl`/`Shift`/`Alt` を修飾として拾い、残り 1 トークンを `KeyName::parse`。
-  修飾単独 (キーなし) は ModifierHold 専用。
+- chord = `+` 区切り。`Ctrl`/`Shift`/`Alt` を通常 chord の修飾として拾い、残り 1 トークンを
+  `KeyName::parse`。修飾単独は ModifierHold 専用で、左右不問の 3 種に加えて右側限定の
+  `RightCtrl` / `RightShift` / `RightAlt` を受理する。
 - `none` / `None` / 空値はその Action を明示的に無効化する。`Action.1 = none` と
   `Action = none` は同じ意味で、ほかの番号行と混在させない。
 - **検証 (該当行だけ警告して無視、他は生かす)**:
@@ -237,7 +242,7 @@ impl Keymap {
                                      key: &crate::video::native_window::NativeVideoKeyEvent)
                                      -> bool;
 
-    /// (D-1) ModifierHold: 解決済み修飾を i.modifiers から読む (ルーペ)。
+    /// (D-1) ModifierHold: 解決済み修飾を読む (ナビゲータ / ルーペ / 元画像表示)。
     pub fn modifier_held(&self, ctx: &egui::Context, action: KeyAction,
                          def: ModKind) -> bool;
 
@@ -330,7 +335,7 @@ if !key.repeat && self.keymap.matches_vk(KeyAction::VideoMute, &key, 0x4D, false
 | **3** | **編集モード配線** (全て consume 経路・自己完結): Erase / Conceal / Crop / Text / LocalAdjust | ui_erase.rs(34) / ui_conceal.rs(30) / ui_crop.rs / ui_text.rs / ui_fullscreen.rs(la ブロック) | 大 | 各モードを 1 巡 |
 | **4** | **Grid 配線** (key_pressed 経路、非消費 = 衝突で両発火に注意)。Ctrl+A/D/Shift+A など純粋キー操作は候補、OS クリップボード / D&D は固定扱い | app.rs `handle_keyboard`(≈47) | 中 | グリッドナビ + 衝突仕様の確認 |
 | **5** | **FsVideo 配線** (VK 経路。§4.6 画像との重なり要注意) + FsCommon。`native_video_fullscreen_shortcut_key` の静的ホワイトリストも keymap 連動にする | app/native_video.rs(≈50) / ui_fullscreen.rs(共通分) / video/native_presenter/mod.rs | 大 | 動画節を 1 巡 + Shift+↑↓ 音量等の回帰 |
-| **6** | **hold 系の上書き対応**: ModifierHold (loupe) / KeyHold (Space パン) を `modifier_held`/`key_held` 経由に。Shift→Ctrl、Space→P のような同種差し替えを確認 | ui_fullscreen.rs(7340) / ui_erase.rs(1214) / ui_conceal.rs(987) | 小 | ルーペ修飾差し替え / パンキー差し替え |
+| **6** | **hold 系の上書き対応**: ModifierHold (navigator / loupe / original preview) / KeyHold (Space パン) を `modifier_held`/`key_held` 経由に。Alt→Shift、Shift→Ctrl、RightCtrl→none、Space→P のような同種差し替えを確認 | ui_fullscreen.rs / ui_erase.rs / ui_conceal.rs | 小 | ナビゲータ / ルーペ / 元画像表示の修飾差し替え・解除 / パンキー差し替え |
 | **7** | 仕上げ: 標準 keymap.ini.default 配布、docs 更新、glyph lint、`cargo fmt`、追加 unit/snapshot | docs / htdocs | 小 | §9 |
 
 - **段階出荷可**: 各フェーズ完了時点でビルド通過 & 既存挙動維持 (未移行サイトはデフォルト動作)。
@@ -382,8 +387,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
    `RatingContainer1..5/Clear` に集約する。グリッド / 画像フルスクリーン / native 動画の
    入口は `Keymap::consume_rating_action` / `native_video_rating_action` を使い、保存処理は既存の
    `set_rating` / `set_current_folder_rating` 経路を共有する。
-12. **生 Event::Key / OS 状態参照経路** (pipeline debug=pipeline_debug.rs:104、
-    右 Ctrl の original/source preview 系など) は特殊。MVP では keymap 対象外の固定操作。
+12. **生 Event::Key / OS 状態参照経路** (pipeline debug=pipeline_debug.rs:104 など) は特殊。
+    元画像表示は `FsOriginalPreviewHold` へ昇格し、Windows では割り当てた修飾キーの OS 状態を読む。
     旧 F11 window mode 経路は `FsToggleWindowMode` へ昇格済みで、native 動画 presenter も
     global shortcut snapshot 経由で同じ effective chord を使う。
 13. **ゲームパッドは固定**: `src/app/gamepad_input.rs` は閲覧専用の物理ボタン/軸入力として扱い、
@@ -543,7 +548,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsSpreadShiftLeft/Right `Ctrl+←/→` (P)
 - FsSlideshow `S` ★ / FsSpaceCheck `Space` (スライドショー停止またはチェックトグル) ★
 - FsRotateCw `R` ★ / FsRotateCcw `L` ★ / FsImageAnalysis `Shift+Z` ★ / FsPanorama `V` ★ / FsPixelGrid `G` ★ (旧 `FsAnalysis = Z` を v2.0.0 で改名・既定変更)
+- FsNavigatorToggle `Alt+N` (P) / FsNavigatorHold `Alt` (MH。修飾↔修飾のみ)
 - FsLoupeLockToggle `M` (P) ★ / FsLoupeHold `Shift` (MH, Ph6。修飾↔修飾のみ)
+- FsOriginalPreviewHold `RightCtrl` (MH。Windows は右側限定、egui fallback は Ctrl に縮退)
 - FsEraseMode `E` ★ / FsLocalAdjustMode `Ctrl+G` ★ / FsConcealMode `Ctrl+M` ★ / FsBgCycle `B` ★
 - FsExport `Ctrl+E` ★ / FsCapture `Ctrl+S` ★
 - FsCompareToggle `X` ★ / FsCompareCycle `C` ★ / FsCompareWipe `Shift+C` ★ / FsCompareDiff `Alt+C` ★
@@ -556,7 +563,6 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   (family・予約候補)
 - FsMetaUndo/Redo (handle_meta_undo_keys、family・実コード確認) /
   FsPipelineDebug `Ctrl+Alt+Shift+D` (固定)
-- FsOriginalPreviewHold `RightCtrl` (Windows) / `Num0` (非 Windows fallback) は OS 状態参照のため固定。
 
 ### FsVideo (Ph5、VK 経路)
 - VideoPlayPause `Space`,`Enter` / VideoExternalPlayer `Shift+Enter` /
@@ -614,7 +620,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   右ドラッグ、戻る/進むは `Settings.ring_shortcuts` で限定カスタマイズ。
 - Clipboard/delete files: `Event::Copy` / `Event::Cut`、Win32 クリップボード paste、
   ファイル削除ワーカー起動。
-- OS 状態参照: RightCtrl original preview、native presenter の一部 routing。
+- OS 状態参照: native presenter の一部 routing。元画像表示の OS 状態参照は
+  `FsOriginalPreviewHold` の ModifierHold helper 内で扱う。
 
 > 上記は実装開始前の棚卸し版。**実際の variant 名・デフォルト chord・customizable は、各
 > フェーズで対象ファイルを開いて確定する**。`docs/keymap-spec.md` とコードの差異は、配線する
@@ -642,4 +649,5 @@ KeyHold も Win32 edge の extended bit を正本にする。KeyHold の押下�
 `WM_KEYDOWN/WM_KEYUP` からラッチし、`GetAsyncKeyState(VK_RETURN)` や egui の
 `physical_key = Enter` へフォールバックしない。
 
-修飾: Ctrl/Shift/Alt のみ。Win キー・AltGr は対象外。
+修飾: Ctrl/Shift/Alt (左右不問) と RightCtrl/RightShift/RightAlt (右側限定)。
+Win キーは対象外。右 Alt は RightAlt として指定できる。

@@ -82,11 +82,13 @@ impl App {
         });
         let hover_mode = self.settings.fullscreen_side_panel_mode.normalized()
             == crate::settings::FsSidePanelMode::Hover;
+        let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
         let hover_visible = hover_mode
             && crate::ui_fullscreen::metadata_panel_hover_active_at(
                 full_rect,
                 pointer_pos,
                 self.metadata_panel_hover_active,
+                navigator_exclusion,
             );
         let explicit = self.metadata_panel_click_shown();
         self.metadata_panel_hover_active = !explicit && hover_visible;

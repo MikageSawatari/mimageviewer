@@ -3485,6 +3485,7 @@ impl App {
                 color_cache_map: self.current_color_cache_map.take(),
                 color_catalog: self.current_color_catalog.take(),
             });
+            self.invalidate_facet_name_cache();
         }
         self.top_level_grid_view
             .install_smart_folder_session(session);

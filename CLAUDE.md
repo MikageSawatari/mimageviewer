@@ -908,12 +908,18 @@ APPDATA の DLL ファイルとして展開されるので動的リンクとし�
 1. **ソフトウェア情報 (環境設定 → ヘルプ)** に LGPL 通知を追記。
    通知文面の canonical 版は `docs/ffmpeg-lgpl-source-distribution.md` の
    "Notice Template" を参照する。
-2. **mikage.to に LGPL 対応ソース tarball を配置**: BtbN がビルドに使った FFmpeg の
-   ソース tarball ([ffmpeg.org の Old Releases](https://ffmpeg.org/releases/)) を
-   `htdocs/mimageviewer/ffmpeg-<VERSION>-source.tar.xz` として転載。
-   現行 BtbN build は外部ライブラリを DLL 内に含むため、詳細は
-   `docs/ffmpeg-lgpl-source-distribution.md` と
+2. **mikage.to に LGPL 対応ソース tarball を配置**: BtbN はリリースタグではなく
+   **特定 commit** からビルドするので、タグの tarball では対応ソースにならない。
+   `vendor/ffmpeg/VERSION` の `g<hash>` から GitHub の commit アーカイブを取得し、
+   `htdocs/mimageviewer/ffmpeg-<BUILD-ID>-source.tar.gz` として転載する
+   (手順と検証は `docs/ffmpeg-lgpl-source-distribution.md` の "Corresponding Source")。
+   現行 BtbN build は外部ライブラリを DLL 内に含むため、詳細は同ドキュメントと
    `scripts/collect-ffmpeg-lgpl-info.ps1` の出力で確認する。
+2.5. **製品ページの FFmpeg 節を同時に更新**: `htdocs/mimageviewer/index.html` の
+   「サードパーティ ソフトウェア（FFmpeg / LGPL）」は手書きなので自動追随しない。
+   バージョン・対応ソースリンクを新 BUILD-ID に更新し、旧版は「以前のバージョン向けの
+   対応ソース」へ移す。アプリ内表記は `build.rs` が `vendor/ffmpeg/VERSION` から
+   焼き込むので手当て不要 (2 箇所で運用が違う点に注意)。
 3. **DLL ファイル名を改変しない**: `avcodec-61.dll` 等のオリジナル名のまま展開する。
 4. **`installer/readme.txt` (Vector 同梱用)** にも LGPL 注記を 1 行追加。
 5. **GPL build を絶対に使わない**: BtbN の `*-gpl-shared-*` や gyan.dev の

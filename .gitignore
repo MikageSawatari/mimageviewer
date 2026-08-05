@@ -78,3 +78,15 @@ tests/snapshots/*.old.png
 # remote-web (PoC) console logs
 /remote-web-console.log
 /remote-web-console.err.log
+
+# FFmpeg の LGPL 対応ソース tarball。
+# サイトへ置く配布物であって、このリポジトリのソースではない。1 本 16MB あり、
+# FFmpeg を上げるたび履歴へ恒久的に積み上がるため追跡しない。
+# 再取得できる: commit hash は vendor/ffmpeg/VERSION と
+# docs/ffmpeg-lgpl-current-report.txt にあり、
+# https://github.com/FFmpeg/FFmpeg/archive/<hash>.tar.gz から取れる。
+# ただし GitHub の commit アーカイブはバイト単位では安定しない (圧縮方式の変更前例あり)
+# ので、**公開した実物は C:\home\mimageviewer_vendor_backup\ffmpeg-lgpl-source\ にも置く**。
+# .sha256 は「何を公開したか」の記録なので追跡する (数十バイト)。
+/htdocs/mimageviewer/ffmpeg-*-source.tar.*
+!/htdocs/mimageviewer/ffmpeg-*-source.tar.*.sha256
