@@ -950,6 +950,16 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 見開き / 連結読みのページ配置計算は引き続き `ui_fullscreen.rs` が担当し、その結果を
 `DisplayedImageTransform::from_resolved_rect` で共通レイアウトへ登録する。
 
+フルスクリーンのナビゲータも、このフレームで描画済みの `FullscreenPageLayout` を正本にする。
+単ページ / 見開きの各 `DisplayedImageTransform` を同じ比率で縮小した座標空間へ写し、
+現在範囲は `visible_source_uv_rect(clip_rect)` の UV をその縮小 transform へ戻して描く。
+ナビゲータ上の位置は `screen_to_source_normalized` で UV へ変換し、
+`pan_to_center_source_normalized` で倍率を変えずに画面中央へ置く `fs_pan` を求める。
+このためフィット、表示トリム、90度回転、見開きの配置をナビゲータ側で再計算しない。
+縮小画像は既存のサムネイルカタログを使い、UI スレッドで画像読み込みやデコードを行わない。
+`FullscreenPageLayoutKind::Continuous` は全体図が極端に細長くなるため対象外とし、
+360度パノラマも平面とは輪郭計算が異なるため現段階では対象外とする。
+
 ### 2.4.1 フルスクリーン静止画の GPU Lanczos3 縮小・標準拡大と選択式拡大
 
 通常静止画は、上記の表示優先順位と

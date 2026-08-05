@@ -660,6 +660,39 @@ impl FsSidePanelMode {
 }
 
 // -----------------------------------------------------------------------
+// Fullscreen navigator placement
+// -----------------------------------------------------------------------
+
+/// Corner used by the fullscreen overview navigator.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FullscreenNavigatorCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    #[default]
+    BottomRight,
+    #[serde(other)]
+    Unknown,
+}
+
+impl FullscreenNavigatorCorner {
+    pub const ALL: &'static [Self] = &[
+        Self::TopLeft,
+        Self::TopRight,
+        Self::BottomLeft,
+        Self::BottomRight,
+    ];
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::BottomRight,
+            corner => corner,
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // 詳細表示ソート
 // -----------------------------------------------------------------------
 
@@ -3674,6 +3707,15 @@ pub struct Settings {
     /// フルスクリーン左右パネルを呼び出す方法。
     #[serde(default)]
     pub fullscreen_side_panel_mode: FsSidePanelMode,
+    /// Show the overview navigator while only part of a flat image is visible.
+    #[serde(default)]
+    pub fullscreen_navigator_visible: bool,
+    /// Screen corner used by the fullscreen navigator.
+    #[serde(default)]
+    pub fullscreen_navigator_corner: FullscreenNavigatorCorner,
+    /// Length of one side of the navigator canvas in logical points.
+    #[serde(default = "default_fullscreen_navigator_size")]
+    pub fullscreen_navigator_size: f32,
     /// 静止画フルスクリーン下部のページシークバーを常時表示し、画像領域から除外する。
     #[serde(default)]
     pub fullscreen_seek_bar_locked: bool,
@@ -4655,6 +4697,9 @@ pub const FULLSCREEN_FIXED_JUMP_DEFAULT: usize = 10;
 pub const FULLSCREEN_CURSOR_HIDE_DELAY_MIN_SECS: f32 = 0.1;
 pub const FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS: f32 = 5.0;
 pub const FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS: f32 = 1.0;
+pub const FULLSCREEN_NAVIGATOR_SIZE_MIN: f32 = 160.0;
+pub const FULLSCREEN_NAVIGATOR_SIZE_MAX: f32 = 520.0;
+pub const FULLSCREEN_NAVIGATOR_SIZE_DEFAULT: f32 = 260.0;
 pub const RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MIN: usize = 0;
 pub const RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MAX: usize = 20;
 pub const RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_DEFAULT: usize = 10;
@@ -4724,6 +4769,10 @@ fn default_quick_folder_drive_current_dirs() -> [BTreeMap<String, PathBuf>; 2] {
 }
 fn default_fullscreen_cursor_hide_delay_secs() -> f32 {
     FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS
+}
+
+fn default_fullscreen_navigator_size() -> f32 {
+    FULLSCREEN_NAVIGATOR_SIZE_DEFAULT
 }
 pub(crate) fn default_folder_tree_pane_width_ratio() -> f32 {
     0.22
@@ -5070,6 +5119,9 @@ impl Default for Settings {
             adjustment_settings_tab: AdjustmentSettingsTab::default(),
             creative_luts: crate::creative_lut::builtin_creative_lut_entries(),
             fullscreen_side_panel_mode: FsSidePanelMode::default(),
+            fullscreen_navigator_visible: false,
+            fullscreen_navigator_corner: FullscreenNavigatorCorner::default(),
+            fullscreen_navigator_size: FULLSCREEN_NAVIGATOR_SIZE_DEFAULT,
             fullscreen_seek_bar_locked: false,
             fullscreen_top_bar_locked: false,
             fullscreen_seek_direction: FullscreenSeekDirection::default(),
@@ -6648,6 +6700,13 @@ impl Settings {
             .clamp(1, crate::reading_history_db::READING_HISTORY_LIMIT_MAX);
         self.fullscreen_cursor_hide_delay_secs =
             clamp_fullscreen_cursor_hide_delay_secs(self.fullscreen_cursor_hide_delay_secs);
+        self.fullscreen_navigator_corner = self.fullscreen_navigator_corner.normalized();
+        self.fullscreen_navigator_size = if self.fullscreen_navigator_size.is_finite() {
+            self.fullscreen_navigator_size
+                .clamp(FULLSCREEN_NAVIGATOR_SIZE_MIN, FULLSCREEN_NAVIGATOR_SIZE_MAX)
+        } else {
+            FULLSCREEN_NAVIGATOR_SIZE_DEFAULT
+        };
         self.retained_final_ai_cache_max_entries = self.retained_final_ai_cache_max_entries.clamp(
             RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MIN,
             RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MAX,
@@ -8831,6 +8890,15 @@ mod tests {
         );
         assert!(s.fullscreen_page_number_overlay);
         assert!(!s.fullscreen_keep_on_app_switch);
+        assert!(!s.fullscreen_navigator_visible);
+        assert_eq!(
+            s.fullscreen_navigator_corner,
+            FullscreenNavigatorCorner::BottomRight
+        );
+        assert_eq!(
+            s.fullscreen_navigator_size,
+            FULLSCREEN_NAVIGATOR_SIZE_DEFAULT
+        );
         assert_eq!(
             s.fullscreen_cursor_hide_delay_secs,
             FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS
@@ -9665,6 +9733,7 @@ mod tests {
         s.fullscreen_jump_percent = 999;
         s.fullscreen_fixed_jump_count = 999;
         s.fullscreen_cursor_hide_delay_secs = 99.0;
+        s.fullscreen_navigator_size = 9999.0;
         s.retained_final_ai_cache_max_entries = 999;
         s.retained_final_ai_cache_max_mib = 999_999;
         s.downscale_smoothing_percent = 99;
@@ -9688,6 +9757,7 @@ mod tests {
             s.fullscreen_cursor_hide_delay_secs,
             FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS
         );
+        assert_eq!(s.fullscreen_navigator_size, FULLSCREEN_NAVIGATOR_SIZE_MAX);
         assert_eq!(
             s.retained_final_ai_cache_max_entries,
             RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MAX
@@ -9713,10 +9783,15 @@ mod tests {
         assert_eq!(s.retained_final_ai_cache_max_mib, 0);
 
         s.fullscreen_cursor_hide_delay_secs = f32::NAN;
+        s.fullscreen_navigator_size = f32::NAN;
         s.sanitize();
         assert_eq!(
             s.fullscreen_cursor_hide_delay_secs,
             FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS
+        );
+        assert_eq!(
+            s.fullscreen_navigator_size,
+            FULLSCREEN_NAVIGATOR_SIZE_DEFAULT
         );
     }
 

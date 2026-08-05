@@ -1526,6 +1526,9 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `fullscreen_fit_mode` | FullscreenFitMode | Page | フルスクリーンのズーム/フィット基準。ページ全体 / 横幅 / 縦幅 / 100%原寸。旧ページ全体+余白カットは表示トリムの自動余白カットへ移行する |
 | `fullscreen_fit_no_upscale` | bool | false | 自動フィット時に 100% を超える拡大をしない。手動ズームは制限しない |
 | `fullscreen_fit_no_downscale` | bool | false | 自動フィット時に 100% 未満へ縮小しない。ON の場合、画像が画面外へはみ出す表示でもパンできる |
+| `fullscreen_navigator_visible` | bool | false | 単ページ / 見開きの拡大中に、縮小画像と現在の表示範囲を示すナビゲータを表示する。全体表示中、連結読み、360度パノラマ、動画、比較、編集 / 分析モードでは実効的に非表示 |
+| `fullscreen_navigator_corner` | FullscreenNavigatorCorner | BottomRight | ナビゲータの配置。TopLeft / TopRight / BottomLeft / BottomRight。未知値は BottomRight へ正規化 |
+| `fullscreen_navigator_size` | f32 | 260.0 | ナビゲータの縮小画像領域の一辺（logical point）。160〜520 に正規化し、画面内へ収まる大きさに描画する |
 | `downscale_smoothing_percent` | u32 | 0 | 通常静止画の「縮小時のなめらかさ」。0〜100・10刻みに正規化し、Lanczos3 の blur 1.00〜1.30 へ対応させる。全画像・全ウィンドウ共通 |
 | `anime_upscale_source_limit` | AnimeUpscaleSourceLimit | Px4096 | 「アニメ塗り拡大」を適用する可視元領域の長辺上限。2048px / 4096px / 制限なし。上限ちょうどは処理し、超過時は標準拡大へフォールバックする |
 | `fullscreen_seek_bar_locked` | bool | false | 静止画フルスクリーンの下部ページシークバーを固定表示する。ON のときは下端のバー領域を画像フィット範囲から除外する |

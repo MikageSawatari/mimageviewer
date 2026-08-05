@@ -1394,6 +1394,7 @@ pub enum KeyAction {
     FsImageAnalysis,
     FsZoomMode,
     FsPanorama,
+    FsNavigatorToggle,
     FsPixelGrid,
     FsLoupeLockToggle,
     FsLoupeHold,
@@ -1816,6 +1817,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsImageAnalysis,
     KeyAction::FsZoomMode,
     KeyAction::FsPanorama,
+    KeyAction::FsNavigatorToggle,
     KeyAction::FsPixelGrid,
     KeyAction::FsLoupeLockToggle,
     KeyAction::FsLoupeHold,
@@ -3301,6 +3303,7 @@ impl KeyAction {
             FsImageAnalysis => "FsImageAnalysis",
             FsZoomMode => "FsZoomMode",
             FsPanorama => "FsPanorama",
+            FsNavigatorToggle => "FsNavigatorToggle",
             FsPixelGrid => "FsPixelGrid",
             FsLoupeLockToggle => "FsLoupeLockToggle",
             FsLoupeHold => "FsLoupeHold",
@@ -3845,6 +3848,7 @@ impl KeyAction {
             FsImageAnalysis => "画像分析モードを開く",
             FsZoomMode => "全画面ズームモード (押している間ズーム範囲を指定)",
             FsPanorama => "360度パノラマモードを切り替える",
+            FsNavigatorToggle => "ナビゲータの表示を切り替える",
             FsPixelGrid => "ピクセルグリッド表示を切り替える",
             FsLoupeLockToggle => "ルーペの固定表示を切り替える",
             FsLoupeHold => "押している間だけルーペを表示する",
@@ -4254,6 +4258,7 @@ impl KeyAction {
             | FsImageAnalysis
             | FsZoomMode
             | FsPanorama
+            | FsNavigatorToggle
             | FsPixelGrid
             | FsLoupeLockToggle
             | FsLoupeHold
@@ -4650,6 +4655,7 @@ impl KeyAction {
             | FsRotateCcw
             | FsImageAnalysis
             | FsPanorama
+            | FsNavigatorToggle
             | FsPixelGrid
             | FsLoupeLockToggle
             | FsEraseMode
@@ -5080,6 +5086,7 @@ impl KeyAction {
             FsImageAnalysis => ChordList::one(Chord::shift(Z)),
             FsZoomMode => ChordList::one(Chord::key(Z)),
             FsPanorama => ChordList::one(Chord::key(V)),
+            FsNavigatorToggle => ChordList::one(Chord::alt(N)),
             FsPixelGrid => ChordList::one(Chord::key(G)),
             FsLoupeLockToggle => ChordList::one(Chord::key(M)),
             FsLoupeHold => ChordList::one(Chord::modifier(ModKind::Shift)),
@@ -8848,6 +8855,25 @@ mod tests {
         assert_eq!(
             KeyAction::FsImageAnalysis.default_chords().iter().next(),
             Some(Chord::shift(KeyName::Z))
+        );
+    }
+
+    #[test]
+    fn navigator_uses_free_alt_n_image_fullscreen_chord() {
+        let navigator = KeyAction::FsNavigatorToggle;
+        let chord = Chord::alt(KeyName::N);
+        assert_eq!(navigator.context(), KeyContext::FsImage);
+        assert_eq!(navigator.trigger(), KeyTrigger::Press);
+        assert_eq!(navigator.default_chords().iter().next(), Some(chord));
+        assert!(
+            KeyAction::all()
+                .iter()
+                .copied()
+                .filter(|action| *action != navigator && action.context() == KeyContext::FsImage)
+                .all(|action| !action
+                    .default_chords()
+                    .iter()
+                    .any(|candidate| candidate == chord))
         );
     }
 

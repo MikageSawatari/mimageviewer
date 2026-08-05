@@ -251,6 +251,19 @@ impl DisplayedImageTransform {
         rotate_about(p, self.full_image_rect.center(), self.free_rotation_rad)
     }
 
+    /// Returns the shared fullscreen pan that places `source` at the viewport center.
+    ///
+    /// The resolved transform already owns every fit, trim, and rotation decision. Changing
+    /// pan only translates that resolved geometry, so the inverse is the current pan plus the
+    /// screen-space delta from the source point to the viewport center.
+    pub(crate) fn pan_to_center_source_normalized(
+        &self,
+        source: egui::Pos2,
+        current_pan: egui::Vec2,
+    ) -> egui::Vec2 {
+        current_pan + (self.viewport_rect.center() - self.source_normalized_to_screen(source))
+    }
+
     pub(crate) fn contains_screen(&self, screen: egui::Pos2) -> bool {
         self.viewport_rect.contains(screen)
             && self.hit_rect.contains(screen)
@@ -1182,6 +1195,93 @@ mod tests {
             visible,
             egui::Rect::from_min_max(egui::pos2(0.25, 0.50), egui::pos2(0.75, 1.0)),
         );
+    }
+
+    fn assert_pan_inverse_round_trip(mut value: DisplayedImageTransformInput, target: egui::Pos2) {
+        let start_pan = egui::vec2(81.0, -47.0);
+        let zoom = 3.25;
+        value.placement = ResolvedDisplayPlacement::Normal {
+            zoom_pan: Some((zoom, start_pan)),
+        };
+        let transform = DisplayedImageTransform::resolve(value).unwrap();
+        let centered_pan = transform.pan_to_center_source_normalized(target, start_pan);
+
+        value.placement = ResolvedDisplayPlacement::Normal {
+            zoom_pan: Some((zoom, centered_pan)),
+        };
+        let centered = DisplayedImageTransform::resolve(value).unwrap();
+        let visible = centered
+            .visible_source_uv_rect(value.viewport_rect)
+            .unwrap();
+        close(visible.center().x, target.x);
+        close(visible.center().y, target.y);
+    }
+
+    #[test]
+    fn pan_inverse_round_trips_single_rotation_and_trim() {
+        assert_pan_inverse_round_trip(
+            input(FullscreenFitMode::Page, Rotation::None, None),
+            egui::pos2(0.43, 0.58),
+        );
+        assert_pan_inverse_round_trip(
+            input(FullscreenFitMode::Page, Rotation::Cw90, None),
+            egui::pos2(0.61, 0.47),
+        );
+
+        let trim = egui::Rect::from_min_max(egui::pos2(0.18, 0.12), egui::pos2(0.86, 0.91));
+        assert_pan_inverse_round_trip(
+            input(FullscreenFitMode::Page, Rotation::None, Some(trim)),
+            egui::pos2(0.52, 0.55),
+        );
+    }
+
+    #[test]
+    fn pan_inverse_round_trips_spread_page_with_shared_pan() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+        let left_rect =
+            egui::Rect::from_min_max(egui::pos2(-1100.0, -600.0), egui::pos2(400.0, 1200.0));
+        let right_rect =
+            egui::Rect::from_min_max(egui::pos2(420.0, -600.0), egui::pos2(1920.0, 1200.0));
+        let start_pan = egui::vec2(43.0, -29.0);
+        let page_input = |page_idx| DisplayedImageTransformInput {
+            page_idx,
+            viewport_rect: viewport,
+            source_size: egui::vec2(1000.0, 1200.0),
+            texture_size: egui::vec2(1000.0, 1200.0),
+            rotation: Rotation::None,
+            free_rotation_rad: 0.0,
+            content_bbox: None,
+            fit_mode: FullscreenFitMode::Page,
+            fit_scale_limits: FullscreenFitScaleLimits::default(),
+            pixels_per_point: 1.0,
+            placement: ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((3.0, start_pan)),
+            },
+        };
+        let right = DisplayedImageTransform::from_resolved_rect(page_input(2), right_rect).unwrap();
+        let target = egui::pos2(0.35, 0.45);
+        let centered_pan = right.pan_to_center_source_normalized(target, start_pan);
+        let translation = centered_pan - start_pan;
+
+        let mut centered_layout = FullscreenPageLayout::default();
+        centered_layout.begin(FullscreenPageLayoutKind::Spread);
+        for (page_idx, rect) in [(1, left_rect), (2, right_rect)] {
+            centered_layout.push(
+                DisplayedImageTransform::from_resolved_rect(
+                    page_input(page_idx),
+                    rect.translate(translation),
+                )
+                .unwrap(),
+            );
+        }
+        let visible = centered_layout
+            .page_by_idx(2)
+            .unwrap()
+            .transform
+            .visible_source_uv_rect(viewport)
+            .unwrap();
+        close(visible.center().x, target.x);
+        close(visible.center().y, target.y);
     }
 
     #[test]
