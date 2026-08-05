@@ -8870,6 +8870,9 @@ impl App {
                             facet_items.push(FI::Place);
                         }
                     }
+                    if !facet_items.contains(&FI::NameFilter) {
+                        facet_name_changed |= self.clear_facet_name_filter_state();
+                    }
                 }
                 if facet_items.is_empty() {
                     ui.label(egui::RichText::new("(右クリックでボタンを選択)").weak());
@@ -8928,40 +8931,46 @@ impl App {
                                 color_changed |= self.draw_facet_color_menu(ui);
                             }
                         }
+                        FI::NameFilter => {
+                            ui.separator();
+                            let mut output = crate::ime_focus::show_singleline(
+                                ui,
+                                &mut self.facet_name_input,
+                                None,
+                                |edit| {
+                                    edit.hint_text("ファイル名").desired_width(
+                                        self.settings.facet_name_filter_width.width(),
+                                    )
+                                },
+                            );
+                            let response_changed = output.response.changed();
+                            let menu_changed =
+                                crate::ui_helpers::singleline_text_edit_context_menu(
+                                    ui,
+                                    &mut output,
+                                    &mut self.facet_name_input,
+                                );
+                            let response = output
+                                .response
+                                .clone()
+                                .on_hover_text("表示中の一覧をファイル名で絞り込みます");
+                            self.facet_name_has_focus |= response.has_focus();
+                            if response_changed || menu_changed {
+                                self.schedule_facet_name_filter_update();
+                            }
+                            if ui
+                                .add_enabled(
+                                    !self.facet_name_input.is_empty(),
+                                    egui::Button::new("×").small(),
+                                )
+                                .hover_tip("ファイル名フィルターを解除")
+                                .clicked()
+                            {
+                                facet_name_changed |= self.clear_facet_name_filter_state();
+                            }
+                        }
                         FI::Unknown => {}
                     }
-                }
-
-                ui.separator();
-                let mut output = crate::ime_focus::show_singleline(
-                    ui,
-                    &mut self.facet_name_input,
-                    None,
-                    |edit| edit.hint_text("ファイル名").desired_width(160.0),
-                );
-                let response_changed = output.response.changed();
-                let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
-                    ui,
-                    &mut output,
-                    &mut self.facet_name_input,
-                );
-                let response = output
-                    .response
-                    .clone()
-                    .on_hover_text("表示中の一覧をファイル名で絞り込みます");
-                self.facet_name_has_focus |= response.has_focus();
-                if response_changed || menu_changed {
-                    self.schedule_facet_name_filter_update();
-                }
-                if ui
-                    .add_enabled(
-                        !self.facet_name_input.is_empty(),
-                        egui::Button::new("×").small(),
-                    )
-                    .hover_tip("ファイル名フィルターを解除")
-                    .clicked()
-                {
-                    facet_name_changed |= self.clear_facet_name_filter_state();
                 }
 
                 if self.facet_filter_suppressed() {
@@ -8996,9 +9005,7 @@ impl App {
                     || reading_history_filter_active
                 {
                     ui.separator();
-                    if self.draw_facet_active_chips(ui) {
-                        facet_name_changed |= self.clear_facet_name_filter_state();
-                    }
+                    self.draw_facet_active_chips(ui);
                     self.draw_color_filter_active_chip(ui);
                     if ui.small_button("全解除").clicked() {
                         if self.facet_filter_active() {
@@ -9152,7 +9159,7 @@ impl App {
 
         draw_sticky_settings_menu_header(ui, "絞り込みバー", true);
         ui.separator();
-        ui.label("表示するボタン:");
+        ui.label("表示する項目:");
         let mut changed = false;
         for &item in FI::all() {
             let mut checked = self.settings.toolbar_facet_filter_items.contains(&item);
@@ -9170,6 +9177,20 @@ impl App {
                 changed = true;
             }
         }
+
+        ui.separator();
+        ui.label("ファイル名欄の幅:");
+        ui.horizontal(|ui| {
+            for &width in crate::settings::FacetNameFilterWidth::all() {
+                changed |= ui
+                    .selectable_value(
+                        &mut self.settings.facet_name_filter_width,
+                        width,
+                        width.label(),
+                    )
+                    .changed();
+            }
+        });
 
         ui.separator();
         if ui
@@ -10259,15 +10280,8 @@ impl App {
         true
     }
 
-    fn draw_facet_active_chips(&self, ui: &mut egui::Ui) -> bool {
+    fn draw_facet_active_chips(&self, ui: &mut egui::Ui) {
         let filter = &self.settings.facet_filter;
-        let clear_name = if filter.name_query.is_empty() {
-            false
-        } else {
-            ui.small_button(format!("ファイル名:{} ×", filter.name_query))
-                .hover_tip("ファイル名フィルターを解除")
-                .clicked()
-        };
         if !filter.kinds.is_empty() {
             facet_chip(ui, format!("種類:{}", filter.kinds.len()));
         }
@@ -10370,7 +10384,6 @@ impl App {
             let values = values.join(",");
             facet_chip(ui, format!("状態:{values}"));
         }
-        clear_name
     }
 
     fn draw_color_filter_active_chip(&self, ui: &mut egui::Ui) {
@@ -15134,6 +15147,7 @@ mod facet_filter_bar_tests {
             crate::settings::ToolbarFacetFilterItem::Kind,
             crate::settings::ToolbarFacetFilterItem::Ext,
             crate::settings::ToolbarFacetFilterItem::Place,
+            crate::settings::ToolbarFacetFilterItem::NameFilter,
         ];
         app.items = vec![GridItem::Video(std::path::PathBuf::from(
             "c:/media/movie.mp4",
@@ -15177,6 +15191,73 @@ mod facet_filter_bar_tests {
             assert!(bookmark.contains(label), "missing {label}: {bookmark}");
         }
         assert!(bookmark.contains("ファイル名"), "{bookmark}");
+    }
+
+    #[test]
+    fn hidden_name_filter_is_not_drawn_and_clears_invisible_condition() {
+        let mut app = setup_app_for_test();
+        app.settings.show_toolbar_facet_filter = true;
+        app.settings.toolbar_facet_filter_items =
+            vec![crate::settings::ToolbarFacetFilterItem::Kind];
+        app.settings.facet_filter.name_query = "needle".to_owned();
+        app.facet_name_input = "needle".to_owned();
+        app.items = vec![GridItem::Image(std::path::PathBuf::from(
+            "c:/media/needle.jpg",
+        ))];
+        app.visible_indices = vec![0];
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 200.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render_facet_filter_bar(ctx),
+        );
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            collect_shape_text(&clipped.shape, &mut text);
+        }
+
+        assert!(!text.contains("ファイル名"), "{text}");
+        assert!(app.facet_name_input.is_empty());
+        assert!(app.settings.facet_filter.name_query.is_empty());
+    }
+
+    #[test]
+    fn active_name_filter_uses_input_only_without_duplicate_chip() {
+        let mut app = setup_app_for_test();
+        app.settings.show_toolbar_facet_filter = true;
+        app.settings.toolbar_facet_filter_items =
+            vec![crate::settings::ToolbarFacetFilterItem::NameFilter];
+        app.settings.facet_filter.name_query = "needle".to_owned();
+        app.facet_name_input = "needle".to_owned();
+        app.items = vec![GridItem::Image(std::path::PathBuf::from(
+            "c:/media/needle.jpg",
+        ))];
+        app.visible_indices = vec![0];
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 200.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render_facet_filter_bar(ctx),
+        );
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            collect_shape_text(&clipped.shape, &mut text);
+        }
+
+        assert!(text.contains("needle"), "{text}");
+        assert!(!text.contains("ファイル名:needle"), "{text}");
     }
 }
 

@@ -55,6 +55,9 @@ const FS_NAVIGATOR_HEADER_HEIGHT: f32 = 26.0;
 const FS_NAVIGATOR_MARGIN: f32 = 12.0;
 const FS_NAVIGATOR_WHEEL_STEP: f32 = 20.0;
 const FS_NAVIGATOR_MIN_SELECTION: f32 = 8.0;
+/// Keep roughly one standard touch target visible so a dragged image always has an obvious
+/// recovery area. On an image or viewport smaller than this, the whole shorter axis is required.
+const FS_PAN_MIN_VISIBLE_PX: f32 = 48.0;
 const PANORAMA_NAVIGATOR_EDGE_SAMPLES: usize = 24;
 
 #[derive(Clone, Copy)]
@@ -249,6 +252,76 @@ fn flat_navigator_main_pages(
     }
 }
 
+fn normal_zoom_pan(transform: DisplayedImageTransform) -> Option<(f32, egui::Vec2)> {
+    match transform.placement {
+        ResolvedDisplayPlacement::Normal { zoom_pan } => {
+            Some(zoom_pan.unwrap_or((1.0, egui::Vec2::ZERO)))
+        }
+        ResolvedDisplayPlacement::Z { .. } => None,
+    }
+}
+
+fn pan_correction_for_minimum_overlap(
+    image_rect: egui::Rect,
+    viewport_rect: egui::Rect,
+) -> egui::Vec2 {
+    let overlap_x = FS_PAN_MIN_VISIBLE_PX
+        .min(image_rect.width())
+        .min(viewport_rect.width());
+    let overlap_y = FS_PAN_MIN_VISIBLE_PX
+        .min(image_rect.height())
+        .min(viewport_rect.height());
+    let min_x = viewport_rect.left() + overlap_x - image_rect.right();
+    let max_x = viewport_rect.right() - overlap_x - image_rect.left();
+    let min_y = viewport_rect.top() + overlap_y - image_rect.bottom();
+    let max_y = viewport_rect.bottom() - overlap_y - image_rect.top();
+    egui::vec2(0.0_f32.clamp(min_x, max_x), 0.0_f32.clamp(min_y, max_y))
+}
+
+/// Clamp a proposed normal-view pan against the resolved page geometry from the previous frame.
+///
+/// Each normal transform stores the zoom/pan that produced it, so zoom changes can project the
+/// current drawn rectangles to the proposed state without duplicating fit/trim/spread layout.
+/// Continuous reading and Z transforms deliberately return the proposed value unchanged because
+/// those modes own their scroll/pan constraints separately.
+fn clamp_fullscreen_pan_from_layout(
+    layout: &FullscreenPageLayout,
+    proposed_zoom: f32,
+    proposed_pan: egui::Vec2,
+) -> egui::Vec2 {
+    if !proposed_zoom.is_finite()
+        || proposed_zoom <= 0.0
+        || !proposed_pan.x.is_finite()
+        || !proposed_pan.y.is_finite()
+    {
+        return proposed_pan;
+    }
+    let Some(pages) = flat_navigator_main_pages(layout) else {
+        return proposed_pan;
+    };
+
+    pages
+        .into_iter()
+        .filter_map(|page| {
+            let (base_zoom, base_pan) = normal_zoom_pan(page)?;
+            if !base_zoom.is_finite() || base_zoom <= 0.0 {
+                return None;
+            }
+            let ratio = proposed_zoom / base_zoom;
+            let current_anchor = page.viewport_rect.center() + base_pan;
+            let proposed_anchor = page.viewport_rect.center() + proposed_pan;
+            let drawn_rect = fs_navigator_source_rect_aabb(&page, page.uv_rect);
+            let projected_rect = egui::Rect::from_min_max(
+                proposed_anchor + (drawn_rect.min - current_anchor) * ratio,
+                proposed_anchor + (drawn_rect.max - current_anchor) * ratio,
+            );
+            let correction = pan_correction_for_minimum_overlap(projected_rect, page.viewport_rect);
+            Some((correction.length_sq(), proposed_pan + correction))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map_or(proposed_pan, |(_, pan)| pan)
+}
+
 fn fs_navigator_panel_rect(
     host_rect: egui::Rect,
     requested_size: f32,
@@ -290,6 +363,34 @@ fn fs_navigator_panel_rect(
         egui::vec2(canvas_size, canvas_size),
     );
     Some((panel_rect, header_rect, canvas_rect))
+}
+
+fn fs_navigator_edge_exclusion_rect(
+    host_rect: egui::Rect,
+    panel_rect: egui::Rect,
+    corner: FullscreenNavigatorCorner,
+) -> egui::Rect {
+    match corner.normalized() {
+        FullscreenNavigatorCorner::TopLeft => {
+            egui::Rect::from_min_max(host_rect.left_top(), panel_rect.right_bottom())
+        }
+        FullscreenNavigatorCorner::TopRight => egui::Rect::from_min_max(
+            egui::pos2(panel_rect.left(), host_rect.top()),
+            egui::pos2(host_rect.right(), panel_rect.bottom()),
+        ),
+        FullscreenNavigatorCorner::BottomLeft => egui::Rect::from_min_max(
+            egui::pos2(host_rect.left(), panel_rect.top()),
+            egui::pos2(panel_rect.right(), host_rect.bottom()),
+        ),
+        FullscreenNavigatorCorner::BottomRight => {
+            egui::Rect::from_min_max(panel_rect.left_top(), host_rect.right_bottom())
+        }
+        FullscreenNavigatorCorner::Unknown => unreachable!("normalized navigator corner"),
+    }
+}
+
+fn fullscreen_edge_hover_allowed(pos: egui::Pos2, navigator_exclusion: Option<egui::Rect>) -> bool {
+    !navigator_exclusion.is_some_and(|rect| rect.contains(pos))
 }
 
 fn build_flat_navigator_layout(
@@ -936,8 +1037,9 @@ fn fullscreen_side_panel_contains_pointer(
     mode: crate::settings::FsSidePanelMode,
     right_panel_visible: bool,
     left_panel_visible: bool,
+    navigator_exclusion: Option<egui::Rect>,
 ) -> bool {
-    if !chrome_enabled {
+    if !chrome_enabled || !fullscreen_edge_hover_allowed(pos, navigator_exclusion) {
         return false;
     }
     let click_mode = mode.normalized() == crate::settings::FsSidePanelMode::ClickToShow;
@@ -1064,12 +1166,15 @@ pub(crate) fn metadata_panel_hover_active_at(
     full_rect: egui::Rect,
     pointer_pos: Option<egui::Pos2>,
     was_active: bool,
+    navigator_exclusion: Option<egui::Rect>,
 ) -> bool {
     let activation_rect = metadata_panel_hover_activation_rect(full_rect);
     let sustain_rect = metadata_panel_rect(full_rect)
         .expand(crate::ui_helpers::panel_hover_sustain_px(full_rect.width()));
-    pointer_pos
-        .is_some_and(|p| activation_rect.contains(p) || (was_active && sustain_rect.contains(p)))
+    pointer_pos.is_some_and(|p| {
+        fullscreen_edge_hover_allowed(p, navigator_exclusion)
+            && (activation_rect.contains(p) || (was_active && sustain_rect.contains(p)))
+    })
 }
 
 /// 画像用左パネルの端ホバーラッチを現在座標から更新する。
@@ -1079,6 +1184,7 @@ fn adjustment_panel_hover_active_at(
     full_rect: egui::Rect,
     pointer_pos: Option<egui::Pos2>,
     was_active: bool,
+    navigator_exclusion: Option<egui::Rect>,
 ) -> bool {
     let strip =
         crate::ui_helpers::panel_edge_trigger_px(full_rect.width()).min(full_rect.width().max(0.0));
@@ -1089,7 +1195,8 @@ fn adjustment_panel_hover_active_at(
     let sustain_rect = adjustment_panel_rect(full_rect)
         .expand(crate::ui_helpers::panel_hover_sustain_px(full_rect.width()));
     pointer_pos.is_some_and(|pos| {
-        activation_rect.contains(pos) || (was_active && sustain_rect.contains(pos))
+        fullscreen_edge_hover_allowed(pos, navigator_exclusion)
+            && (activation_rect.contains(pos) || (was_active && sustain_rect.contains(pos)))
     })
 }
 
@@ -2639,8 +2746,9 @@ impl App {
         if self.analysis_mode {
             // 分析→通常: ズーム/パンを引き継ぐ
             self.fs_zoom = self.analysis_zoom;
-            self.fs_pan = self.analysis_pan;
+            let proposed_pan = self.analysis_pan;
             self.reset_analysis_mode();
+            self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
         } else {
             // 通常→分析: ズーム/パンを引き継ぐ
             self.analysis_zoom = self.fs_zoom;
@@ -3902,6 +4010,21 @@ impl App {
         Some(transform)
     }
 
+    /// 利用者入力から通常表示の pan を変更する唯一の入口。
+    ///
+    /// Z ズームと連結読みはそれぞれ専用制約を持つため、このクランプを適用しない。
+    fn set_fs_pan_from_input(&mut self, proposed_zoom: f32, proposed_pan: egui::Vec2) {
+        self.fs_pan = if self.fs_zoom_mode_engaged() {
+            proposed_pan
+        } else {
+            clamp_fullscreen_pan_from_layout(
+                &self.fullscreen_page_layout,
+                proposed_zoom,
+                proposed_pan,
+            )
+        };
+    }
+
     /// 中ボタンドラッグズームを処理する。
     ///
     /// ホイール押し込み + 上下ドラッグで fs_zoom / analysis_zoom を連続的に変える。
@@ -3977,7 +4100,7 @@ impl App {
                     self.analysis_pan = new_pan;
                 } else {
                     self.fs_zoom = new_zoom;
-                    self.fs_pan = new_pan;
+                    self.set_fs_pan_from_input(new_zoom, new_pan);
                 }
                 return true;
             }
@@ -4075,7 +4198,7 @@ impl App {
         } else if primary_down
             && let (Some((start_pos, start_pan)), Some(pos)) = (self.fs_pan_drag_start, pointer_pos)
         {
-            self.fs_pan = start_pan + (pos - start_pos);
+            self.set_fs_pan_from_input(self.fs_zoom, start_pan + (pos - start_pos));
         }
         if primary_released {
             self.fs_pan_drag_start = None;
@@ -4126,6 +4249,7 @@ impl App {
         if (self.fs_zoom - old_zoom).abs() <= f32::EPSILON {
             return false;
         }
+        self.set_fs_pan_from_input(self.fs_zoom, self.fs_pan);
         self.maybe_rerender_pdf(self.fs_zoom);
         true
     }
@@ -4138,7 +4262,7 @@ impl App {
         {
             return false;
         }
-        self.fs_pan += delta;
+        self.set_fs_pan_from_input(self.fs_zoom, self.fs_pan + delta);
         true
     }
 }
@@ -7944,10 +8068,11 @@ impl App {
             egui::pos2(full_rect.left(), full_rect.bottom() - SEEK_HOVER_HEIGHT),
             full_rect.right_bottom(),
         );
+        let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
         let bottom_hover = ctx.input(|i| {
-            i.pointer
-                .hover_pos()
-                .is_some_and(|pos| bottom_band.contains(pos))
+            i.pointer.hover_pos().is_some_and(|pos| {
+                bottom_band.contains(pos) && fullscreen_edge_hover_allowed(pos, navigator_exclusion)
+            })
         });
         // 可視判定 (O(1)) を info 構築より先に行う: 非表示フレームで全 items の
         // filter+collect を毎フレーム回さない (10k ページ級アーカイブの hot path)。
@@ -10309,11 +10434,19 @@ impl App {
                             let mut bar_analysis_pressed = false;
                             let mut side_panel_mode_pressed = false;
                             let mut top_bar_lock_pressed = false;
+                            let navigator_exclusion =
+                                self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
                             let hover_in_top = ctx.input(|i| {
                                 !self.cursor_hidden
                                     && i.pointer
                                         .hover_pos()
-                                        .is_some_and(|p| p.y < TOP_BAR_HOVER_Y)
+                                        .is_some_and(|p| {
+                                            p.y < TOP_BAR_HOVER_Y
+                                                && fullscreen_edge_hover_allowed(
+                                                    p,
+                                                    navigator_exclusion,
+                                                )
+                                        })
                             });
                             let top_bar_visible = still_top_bar_visible_from_inputs(
                                 StillTopBarVisibilityInputs {
@@ -10404,6 +10537,7 @@ impl App {
                                 self.settings.fullscreen_top_bar_locked,
                                 &mut top_bar_lock_pressed,
                                 self.cursor_hidden,
+                                navigator_exclusion,
                             );
                             if top_bar_lock_pressed {
                                 self.settings.fullscreen_top_bar_locked =
@@ -14303,6 +14437,29 @@ impl App {
         )
     }
 
+    pub(crate) fn fullscreen_navigator_edge_exclusion(
+        &self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+    ) -> Option<egui::Rect> {
+        let fs_idx = self.fullscreen_idx?;
+        if !self.fs_navigator_allowed(ctx, fs_idx) {
+            return None;
+        }
+        let image_rect = self.fullscreen_media_rect(full_rect, fs_idx, false);
+        let panel_rect = if self.is_panorama_mode_active(fs_idx) {
+            self.panorama_navigator_layout(image_rect, fs_idx)?
+                .panel_rect
+        } else {
+            self.fs_navigator_layout(image_rect)?.panel_rect
+        };
+        Some(fs_navigator_edge_exclusion_rect(
+            image_rect,
+            panel_rect,
+            self.settings.fullscreen_navigator_corner,
+        ))
+    }
+
     fn panorama_navigator_layout(
         &self,
         image_rect: egui::Rect,
@@ -14404,8 +14561,8 @@ impl App {
             return false;
         }
         self.fs_zoom = self.fs_navigator_current_manual_zoom(layout, image_rect);
-        self.fs_pan = egui::Vec2::ZERO;
         self.fs_zoom_reset();
+        self.set_fs_pan_from_input(self.fs_zoom, egui::Vec2::ZERO);
         true
     }
 
@@ -14778,9 +14935,10 @@ impl App {
         {
             let source_uv = page.navigator.screen_to_source_normalized(source_pos);
             let transitioned = self.fs_navigator_adopt_manual_zoom(&layout, image_rect);
-            self.fs_pan = page
+            let proposed_pan = page
                 .main
                 .pan_to_center_source_normalized(source_uv, self.fs_pan);
+            self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
             if transitioned {
                 ctx.data_mut(|data| {
                     data.insert_temp(
@@ -14845,7 +15003,7 @@ impl App {
                     .min(image_rect.height() / selected_screen_size.y.max(1.0));
                 let new_zoom = (old_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
                 let target_screen = page.main.source_normalized_to_screen(source_uv);
-                self.fs_pan = zoom_preserve_pivot(
+                let proposed_pan = zoom_preserve_pivot(
                     target_screen,
                     image_rect.center(),
                     self.fs_pan,
@@ -14853,6 +15011,7 @@ impl App {
                     new_zoom,
                 ) + (image_rect.center() - target_screen);
                 self.fs_zoom = new_zoom;
+                self.set_fs_pan_from_input(new_zoom, proposed_pan);
                 self.maybe_rerender_pdf(new_zoom);
                 ctx.data_mut(|data| {
                     data.insert_temp(
@@ -14912,7 +15071,8 @@ impl App {
                 screen_scale,
             }) = interaction
         {
-            self.fs_pan = start_pan - (pos - start) / screen_scale.max(f32::EPSILON);
+            let proposed_pan = start_pan - (pos - start) / screen_scale.max(f32::EPSILON);
+            self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
             ctx.request_repaint();
         }
         if secondary_released
@@ -15092,9 +15252,10 @@ impl App {
                     .iter()
                     .find(|page| page.main.page_idx == page_idx)
                 {
-                    self.fs_pan = page
+                    let proposed_pan = page
                         .main
                         .pan_to_center_source_normalized(source_uv, self.fs_pan);
+                    self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
                     ctx.request_repaint();
                 }
                 ctx.data_mut(|data| {
@@ -15111,9 +15272,10 @@ impl App {
                     .iter()
                     .find(|page| page.main.page_idx == page_idx)
                 {
-                    self.fs_pan = page
+                    let proposed_pan = page
                         .main
                         .pan_to_center_source_normalized(source_uv, self.fs_pan);
+                    self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
                     if ctx.input(|input| input.pointer.secondary_down()) {
                         ctx.data_mut(|data| {
                             data.insert_temp(
@@ -15285,6 +15447,7 @@ impl App {
             .fullscreen_idx
             .map(|idx| self.fullscreen_media_rect(full_rect, idx, state.is_video))
             .unwrap_or(full_rect);
+        let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
         if let Some(navigator_idx) = self.fullscreen_idx
             && self.handle_fs_navigator_input(ui, ctx, default_image_rect, navigator_idx)
         {
@@ -15454,6 +15617,7 @@ impl App {
                             self.settings.fullscreen_side_panel_mode,
                             has_right_panel,
                             self.adjustment_mode,
+                            navigator_exclusion,
                         );
                         let in_music_side_panel = music_side_panel_contains_pointer(
                             full_rect,
@@ -15584,6 +15748,7 @@ impl App {
                     full_rect,
                     ctx.input(|input| input.pointer.hover_pos()),
                     self.adjustment_mode,
+                    navigator_exclusion,
                 );
             if left_panel_hover_active || bookmark_title_focused {
                 self.adjustment_mode = true;
@@ -15818,14 +15983,18 @@ impl App {
                     // ズームへ割り当てる。パネル上は cursor_in_panel でここへ来ないため
                     // パネルスクロールを維持できる。
                     let mouse = ctx.input(|i| i.pointer.hover_pos());
+                    let mut proposed_zoom = self.fs_zoom;
+                    let mut proposed_pan = self.fs_pan;
                     let changed = Self::apply_wheel_zoom(
-                        &mut self.fs_zoom,
-                        &mut self.fs_pan,
+                        &mut proposed_zoom,
+                        &mut proposed_pan,
                         wheel_y,
                         mouse,
                         default_image_rect.center(),
                     );
                     if changed {
+                        self.fs_zoom = proposed_zoom;
+                        self.set_fs_pan_from_input(proposed_zoom, proposed_pan);
                         self.maybe_rerender_pdf(self.fs_zoom);
                     }
                 } else {
@@ -15941,7 +16110,7 @@ impl App {
                 } else if primary_down {
                     if let Some((start_pos, start_pan)) = self.fs_pan_drag_start {
                         if let Some(pos) = pointer_pos {
-                            self.fs_pan = start_pan + (pos - start_pos);
+                            self.set_fs_pan_from_input(self.fs_zoom, start_pan + (pos - start_pos));
                         }
                     }
                 }
@@ -16017,6 +16186,7 @@ impl App {
                                     self.settings.fullscreen_side_panel_mode,
                                     has_right_panel,
                                     self.adjustment_mode,
+                                    navigator_exclusion,
                                 );
                                 let in_seek_panel =
                                     seek_panel_interactive && seek_panel_rect.contains(pos);
@@ -19220,6 +19390,7 @@ impl App {
                 allow_thumbnail,
                 page.content_bbox,
                 ctx.pixels_per_point(),
+                ResolvedDisplayPlacement::Normal { zoom_pan: None },
             ) {
                 if crate::perf::is_enabled()
                     && let Some(handle) = display_tex.as_ref()
@@ -21156,6 +21327,17 @@ impl App {
                 None => (fit_scale, image_rect.center()),
             };
             let center = base_center - geometry.content_center_offset * total_scale;
+            let resolved_placement = if zip_input.is_some() {
+                ResolvedDisplayPlacement::Z {
+                    active: self.fs_zoom_active,
+                    factor: self.fs_zoom_factor,
+                    zoom_pan: resolved_zoom_pan,
+                }
+            } else {
+                ResolvedDisplayPlacement::Normal {
+                    zoom_pan: resolved_zoom_pan,
+                }
+            };
 
             // ZipPla ズーム確定中は gap も合成ページと同率 (total_scale / fit_scale = zoom) で拡大し、
             // composite に含めた gap_page と整合させる (Codex P3: 照準枠 ↔ 確定の表示範囲を一致)。
@@ -21224,6 +21406,7 @@ impl App {
                     allow_thumbnail,
                     content_bbox,
                     pixels_per_point,
+                    resolved_placement,
                 ) {
                     self.fullscreen_page_layout.push(transform);
                 }
@@ -21301,6 +21484,7 @@ impl App {
                     allow_thumbnail,
                     content_bbox,
                     pixels_per_point,
+                    ResolvedDisplayPlacement::Normal { zoom_pan: None },
                 );
             }
             // フォールバック分岐: サイズ未確定でアスペクト比が崩れる可能性があるため、
@@ -21360,6 +21544,7 @@ impl App {
         allow_thumbnail: bool,
         content_bbox: Option<egui::Rect>,
         pixels_per_point: f32,
+        placement: ResolvedDisplayPlacement,
     ) -> Option<DisplayedImageTransform> {
         let thumb_tex = if allow_thumbnail {
             match self.thumbnails.get(idx) {
@@ -21397,7 +21582,7 @@ impl App {
                         ..FullscreenFitScaleLimits::default()
                     },
                     pixels_per_point,
-                    placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                    placement,
                 },
                 img_rect,
             )?;
@@ -21462,7 +21647,11 @@ impl App {
         // event arrives. Do not let that passive position keep hover UI "visible" and
         // immediately revive the OS cursor after slideshow advances.
         let passive_hover_enabled = !self.cursor_hidden;
-        let in_top = passive_hover_enabled && pointer.is_some_and(|p| p.y < TOP_BAR_HOVER_Y);
+        let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
+        let in_top = passive_hover_enabled
+            && pointer.is_some_and(|p| {
+                p.y < TOP_BAR_HOVER_Y && fullscreen_edge_hover_allowed(p, navigator_exclusion)
+            });
         let click_mode = self.settings.fullscreen_side_panel_mode.normalized()
             == crate::settings::FsSidePanelMode::ClickToShow;
         let in_right = passive_hover_enabled
@@ -21472,12 +21661,13 @@ impl App {
                 } else {
                     metadata_panel_hover_activation_rect(full_rect)
                 };
-                rect.contains(p)
+                rect.contains(p) && fullscreen_edge_hover_allowed(p, navigator_exclusion)
             });
         let in_left_callout = passive_hover_enabled
             && click_mode
             && pointer.is_some_and(|p| {
                 panel_callout_edge_rect(full_rect, crate::ui_helpers::PanelEdge::Left).contains(p)
+                    && fullscreen_edge_hover_allowed(p, navigator_exclusion)
             });
         // 動画再生中の HUD / speed popup は native presenter overlay 側で管理されるため
         // egui main window のカーソル可視判定からは除外する (= 旧 egui HUD は撤去済)。
@@ -21582,12 +21772,16 @@ impl App {
         top_bar_locked: bool,
         top_bar_lock_pressed: &mut bool,
         cursor_hidden: bool,
+        navigator_exclusion: Option<egui::Rect>,
     ) {
         let hover_in_top = ctx.input(|i| {
             !cursor_hidden
                 && i.pointer
                     .hover_pos()
-                    .map(|p| p.y < TOP_BAR_HOVER_Y)
+                    .map(|p| {
+                        p.y < TOP_BAR_HOVER_Y
+                            && fullscreen_edge_hover_allowed(p, navigator_exclusion)
+                    })
                     .unwrap_or(false)
         });
         if !still_top_bar_visible_from_inputs(StillTopBarVisibilityInputs {
@@ -26950,6 +27144,22 @@ mod tests {
         viewport_rect: egui::Rect,
         full_image_rect: egui::Rect,
     ) -> DisplayedImageTransform {
+        navigator_test_transform_from_rect_with_placement(
+            page_idx,
+            viewport_rect,
+            full_image_rect,
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((2.0, egui::Vec2::ZERO)),
+            },
+        )
+    }
+
+    fn navigator_test_transform_from_rect_with_placement(
+        page_idx: usize,
+        viewport_rect: egui::Rect,
+        full_image_rect: egui::Rect,
+        placement: ResolvedDisplayPlacement,
+    ) -> DisplayedImageTransform {
         DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
                 page_idx,
@@ -26962,9 +27172,7 @@ mod tests {
                 fit_mode: FullscreenFitMode::Page,
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 pixels_per_point: 1.0,
-                placement: ResolvedDisplayPlacement::Normal {
-                    zoom_pan: Some((2.0, egui::Vec2::ZERO)),
-                },
+                placement,
             },
             full_image_rect,
         )
@@ -26988,6 +27196,227 @@ mod tests {
     fn navigator_is_not_requested_when_fixed_setting_and_hold_are_off() {
         assert!(!fs_navigator_visibility_requested(
             false, false, true, false
+        ));
+    }
+
+    fn single_page_layout_with_pan(zoom: f32, pan: egui::Vec2) -> FullscreenPageLayout {
+        let mut layout = FullscreenPageLayout::default();
+        layout.begin(FullscreenPageLayoutKind::Single);
+        layout.push(navigator_test_transform(
+            1,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((zoom, pan)),
+            },
+        ));
+        layout
+    }
+
+    #[test]
+    fn navigator_pan_clamp_keeps_visible_source_and_navigator_available() {
+        let zoom = 3.0;
+        let layout = single_page_layout_with_pan(zoom, egui::Vec2::ZERO);
+        let pan =
+            clamp_fullscreen_pan_from_layout(&layout, zoom, egui::vec2(100_000.0, -100_000.0));
+        let moved = single_page_layout_with_pan(zoom, pan);
+        let page = moved.single_page().unwrap().transform;
+
+        assert!(page.visible_source_uv_rect(page.viewport_rect).is_some());
+        assert!(
+            build_flat_navigator_layout(
+                &moved,
+                page.viewport_rect,
+                page.viewport_rect,
+                260.0,
+                FullscreenNavigatorCorner::BottomRight,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn repeated_space_style_pan_cannot_move_image_fully_outside() {
+        let zoom = 2.5;
+        let mut pan = egui::Vec2::ZERO;
+        for delta in [
+            egui::vec2(50_000.0, 0.0),
+            egui::vec2(0.0, 50_000.0),
+            egui::vec2(-100_000.0, 0.0),
+            egui::vec2(0.0, -100_000.0),
+        ] {
+            let layout = single_page_layout_with_pan(zoom, pan);
+            pan = clamp_fullscreen_pan_from_layout(&layout, zoom, pan + delta);
+            let moved = single_page_layout_with_pan(zoom, pan);
+            let page = moved.single_page().unwrap().transform;
+            assert!(page.visible_source_uv_rect(page.viewport_rect).is_some());
+        }
+    }
+
+    #[test]
+    fn pan_inside_allowed_range_is_unchanged() {
+        let zoom = 3.0;
+        let layout = single_page_layout_with_pan(zoom, egui::Vec2::ZERO);
+        let proposed = egui::vec2(37.0, -29.0);
+        assert_eq!(
+            clamp_fullscreen_pan_from_layout(&layout, zoom, proposed),
+            proposed
+        );
+    }
+
+    #[test]
+    fn spread_pan_clamp_uses_resolved_zoom_pan_and_keeps_a_page_visible() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(1000.0, 640.0));
+        let zoom = 3.0;
+        let base_pan = egui::vec2(120.0, 0.0);
+        let placement = ResolvedDisplayPlacement::Normal {
+            zoom_pan: Some((zoom, base_pan)),
+        };
+        let left_rect =
+            egui::Rect::from_min_size(egui::pos2(-560.0, -100.0), egui::vec2(1200.0, 900.0));
+        let right_rect =
+            egui::Rect::from_min_size(egui::pos2(640.0, -100.0), egui::vec2(1200.0, 900.0));
+        let mut layout = FullscreenPageLayout::default();
+        layout.begin(FullscreenPageLayoutKind::Spread);
+        layout.push(navigator_test_transform_from_rect_with_placement(
+            1, viewport, left_rect, placement,
+        ));
+        layout.push(navigator_test_transform_from_rect_with_placement(
+            2, viewport, right_rect, placement,
+        ));
+
+        let pan =
+            clamp_fullscreen_pan_from_layout(&layout, zoom, egui::vec2(100_000.0, -100_000.0));
+        let delta = pan - base_pan;
+        let moved_rect =
+            |rect: egui::Rect| egui::Rect::from_min_max(rect.min + delta, rect.max + delta);
+        let moved = [left_rect, right_rect]
+            .into_iter()
+            .enumerate()
+            .map(|(index, rect)| {
+                navigator_test_transform_from_rect_with_placement(
+                    index + 1,
+                    viewport,
+                    moved_rect(rect),
+                    ResolvedDisplayPlacement::Normal {
+                        zoom_pan: Some((zoom, pan)),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            moved
+                .iter()
+                .any(|page| page.visible_source_uv_rect(viewport).is_some()),
+            "at least one spread page must remain recoverable"
+        );
+    }
+
+    #[test]
+    fn z_zoom_and_continuous_layouts_keep_their_existing_pan_owners() {
+        let proposed = egui::vec2(100_000.0, -100_000.0);
+        let mut z_layout = FullscreenPageLayout::default();
+        z_layout.begin(FullscreenPageLayoutKind::Single);
+        z_layout.push(navigator_test_transform(
+            1,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Z {
+                active: true,
+                factor: 3.0,
+                zoom_pan: Some((3.0, egui::Vec2::ZERO)),
+            },
+        ));
+        assert_eq!(
+            clamp_fullscreen_pan_from_layout(&z_layout, 3.0, proposed),
+            proposed
+        );
+
+        let mut continuous = FullscreenPageLayout::default();
+        continuous.begin(FullscreenPageLayoutKind::Continuous);
+        continuous.push(navigator_test_transform(
+            1,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((3.0, egui::Vec2::ZERO)),
+            },
+        ));
+        assert_eq!(
+            clamp_fullscreen_pan_from_layout(&continuous, 3.0, proposed),
+            proposed
+        );
+    }
+
+    #[test]
+    fn navigator_exclusion_reaches_only_its_adjacent_edges() {
+        let host = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        for corner in [
+            FullscreenNavigatorCorner::TopLeft,
+            FullscreenNavigatorCorner::TopRight,
+            FullscreenNavigatorCorner::BottomLeft,
+            FullscreenNavigatorCorner::BottomRight,
+        ] {
+            let (panel, _, _) = fs_navigator_panel_rect(host, 260.0, corner).unwrap();
+            let exclusion = fs_navigator_edge_exclusion_rect(host, panel, corner);
+            let left = egui::pos2(host.left() + 1.0, panel.center().y);
+            let right = egui::pos2(host.right() - 1.0, panel.center().y);
+            let top = egui::pos2(panel.center().x, host.top() + 1.0);
+            let bottom = egui::pos2(panel.center().x, host.bottom() - 1.0);
+            let on_left = matches!(
+                corner,
+                FullscreenNavigatorCorner::TopLeft | FullscreenNavigatorCorner::BottomLeft
+            );
+            let on_top = matches!(
+                corner,
+                FullscreenNavigatorCorner::TopLeft | FullscreenNavigatorCorner::TopRight
+            );
+
+            assert_eq!(
+                fullscreen_edge_hover_allowed(left, Some(exclusion)),
+                !on_left
+            );
+            assert_eq!(
+                fullscreen_edge_hover_allowed(right, Some(exclusion)),
+                on_left
+            );
+            assert_eq!(fullscreen_edge_hover_allowed(top, Some(exclusion)), !on_top);
+            assert_eq!(
+                fullscreen_edge_hover_allowed(bottom, Some(exclusion)),
+                on_top
+            );
+        }
+    }
+
+    #[test]
+    fn navigator_exclusion_blocks_same_side_panel_but_not_opposite_or_hidden() {
+        let host = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let (panel, _, _) =
+            fs_navigator_panel_rect(host, 260.0, FullscreenNavigatorCorner::BottomRight).unwrap();
+        let exclusion =
+            fs_navigator_edge_exclusion_rect(host, panel, FullscreenNavigatorCorner::BottomRight);
+        let right = egui::pos2(host.right() - 1.0, panel.center().y);
+        let left = egui::pos2(host.left() + 1.0, panel.center().y);
+        let mode = crate::settings::FsSidePanelMode::Hover;
+
+        assert!(!fullscreen_side_panel_contains_pointer(
+            host,
+            right,
+            true,
+            mode,
+            false,
+            false,
+            Some(exclusion),
+        ));
+        assert!(fullscreen_side_panel_contains_pointer(
+            host,
+            left,
+            true,
+            mode,
+            false,
+            true,
+            Some(exclusion),
+        ));
+        assert!(fullscreen_side_panel_contains_pointer(
+            host, right, true, mode, false, false, None,
         ));
     }
 
@@ -28136,6 +28565,7 @@ mod tests {
                 crate::settings::FsSidePanelMode::ClickToShow,
                 true,
                 true,
+                None,
             ));
         }
         assert!(fullscreen_side_panel_contains_pointer(
@@ -28145,6 +28575,7 @@ mod tests {
             crate::settings::FsSidePanelMode::ClickToShow,
             false,
             false,
+            None,
         ));
     }
 
@@ -28257,16 +28688,19 @@ mod tests {
             viewport,
             Some(egui::pos2(viewport.right() - 1.0, panel.center().y)),
             false,
+            None,
         ));
         assert!(metadata_panel_hover_active_at(
             viewport,
             Some(inside_left),
-            true
+            true,
+            None,
         ));
         assert!(!metadata_panel_hover_active_at(
             viewport,
             Some(inside_left),
-            false
+            false,
+            None,
         ));
     }
 
@@ -28280,6 +28714,7 @@ mod tests {
             viewport,
             Some(egui::pos2(viewport.left() + 1.0, viewport.center().y)),
             false,
+            None,
         ));
 
         // 左端からタブへ斜めに移動するとき、パネル上端の少し上を通っても維持する。
@@ -28288,19 +28723,24 @@ mod tests {
             viewport,
             Some(above_tab_path),
             true,
+            None,
         ));
         assert!(!adjustment_panel_hover_active_at(
             viewport,
             Some(above_tab_path),
             false,
+            None,
         ));
 
         assert!(!adjustment_panel_hover_active_at(
             viewport,
             Some(egui::pos2(panel.right() + sustain + 1.0, panel.center().y,)),
             true,
+            None,
         ));
-        assert!(!adjustment_panel_hover_active_at(viewport, None, true));
+        assert!(!adjustment_panel_hover_active_at(
+            viewport, None, true, None
+        ));
     }
 
     #[test]
@@ -28337,6 +28777,7 @@ mod tests {
             mode,
             false,
             true,
+            None,
         ));
         assert!(!fullscreen_side_panel_contains_pointer(
             viewport,
@@ -28345,6 +28786,7 @@ mod tests {
             mode,
             false,
             true,
+            None,
         ));
     }
 

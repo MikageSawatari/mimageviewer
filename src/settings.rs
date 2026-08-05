@@ -1656,6 +1656,7 @@ pub enum ToolbarFacetFilterItem {
     Size,
     Edit,
     Color,
+    NameFilter,
     /// 未知のボタン (将来バージョンが書いた変種を旧バイナリが読んだ場合)。
     #[serde(other)]
     Unknown,
@@ -1675,6 +1676,7 @@ impl ToolbarFacetFilterItem {
             Self::Size,
             Self::Edit,
             Self::Color,
+            Self::NameFilter,
         ]
     }
 
@@ -1691,6 +1693,7 @@ impl ToolbarFacetFilterItem {
             Self::Size => "サイズ",
             Self::Edit => "状態",
             Self::Color => "画像色",
+            Self::NameFilter => "ファイル名",
             Self::Unknown => "不明",
         }
     }
@@ -1715,6 +1718,54 @@ impl ToolbarFacetFilterItem {
                 .position(|candidate| candidate == item)
                 .unwrap_or(usize::MAX)
         });
+    }
+}
+
+pub const FACET_NAME_FILTER_WIDTH_SMALL: f32 = 90.0;
+pub const FACET_NAME_FILTER_WIDTH_MEDIUM: f32 = 140.0;
+pub const FACET_NAME_FILTER_WIDTH_LARGE: f32 = 200.0;
+/// The stash field predates neither the item nor an explicit visibility bit. Reserve the maximum
+/// index to distinguish “hidden by the user” from a legacy settings file where the field is absent.
+const TOOLBAR_NAME_FILTER_HIDDEN_STASH: usize = usize::MAX;
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FacetNameFilterWidth {
+    Small,
+    #[default]
+    Medium,
+    Large,
+    #[serde(other)]
+    Unknown,
+}
+
+impl FacetNameFilterWidth {
+    pub fn all() -> &'static [Self] {
+        &[Self::Small, Self::Medium, Self::Large]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Small => "小",
+            Self::Medium => "中",
+            Self::Large => "大",
+            Self::Unknown => "中",
+        }
+    }
+
+    pub fn width(self) -> f32 {
+        match self.normalized() {
+            Self::Small => FACET_NAME_FILTER_WIDTH_SMALL,
+            Self::Medium => FACET_NAME_FILTER_WIDTH_MEDIUM,
+            Self::Large => FACET_NAME_FILTER_WIDTH_LARGE,
+            Self::Unknown => unreachable!("normalized facet name filter width"),
+        }
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::Medium,
+            value => value,
+        }
     }
 }
 
@@ -3855,6 +3906,14 @@ pub struct Settings {
     /// 空 Vec は「ボタンを全部隠す」。アクティブ条件のチップと全解除は引き続き表示する。
     #[serde(default = "default_toolbar_facet_filter_items")]
     pub toolbar_facet_filter_items: Vec<ToolbarFacetFilterItem>,
+    /// `NameFilter` の位置を旧版が無視できる追加フィールドへ退避する保存用キャリア。
+    /// `usize::MAX` は明示的な非表示、`None` はこの項目が無かった旧設定を表す。
+    /// 実行時の正は `toolbar_facet_filter_items` 側で、保存用 clone だけがこの値を持つ。
+    #[serde(default)]
+    pub toolbar_facet_name_filter_index_stash: Option<usize>,
+    /// 絞り込みバーのファイル名入力欄の幅。
+    #[serde(default)]
+    pub facet_name_filter_width: FacetNameFilterWidth,
     /// ツールバーのセクション並び順 (v2.0.0)。空 = 既定順。
     /// `ToolbarSectionId::ordered_with_fallback` で未登録セクションを補完する。
     #[serde(default)]
@@ -5206,6 +5265,8 @@ impl Default for Settings {
             toolbar_bookshelf_collapsed: false,
             toolbar_sort_items: default_toolbar_sort_items(),
             toolbar_facet_filter_items: default_toolbar_facet_filter_items(),
+            toolbar_facet_name_filter_index_stash: None,
+            facet_name_filter_width: FacetNameFilterWidth::default(),
             toolbar_section_order: Vec::new(),
             show_toolbar_cols: true,
             show_toolbar_aspect: true,
@@ -6389,6 +6450,41 @@ impl Settings {
         }
     }
 
+    /// `NameFilter` を知らない旧版が既存 enum 配列を安全に読める形へ退避する。
+    /// live state ではなく、永続化用 clone にだけ適用する。
+    pub(crate) fn stash_toolbar_name_filter_for_persist(&mut self) {
+        self.toolbar_facet_name_filter_index_stash = Some(
+            self.toolbar_facet_filter_items
+                .iter()
+                .position(|item| *item == ToolbarFacetFilterItem::NameFilter)
+                .unwrap_or(TOOLBAR_NAME_FILTER_HIDDEN_STASH),
+        );
+        self.toolbar_facet_filter_items
+            .retain(|item| *item != ToolbarFacetFilterItem::NameFilter);
+    }
+
+    fn restore_toolbar_name_filter_after_load(&mut self) {
+        let stashed = self.toolbar_facet_name_filter_index_stash.take();
+        if self
+            .toolbar_facet_filter_items
+            .contains(&ToolbarFacetFilterItem::NameFilter)
+        {
+            return;
+        }
+        match stashed {
+            Some(TOOLBAR_NAME_FILTER_HIDDEN_STASH) => {}
+            Some(index) => self.toolbar_facet_filter_items.insert(
+                index.min(self.toolbar_facet_filter_items.len()),
+                ToolbarFacetFilterItem::NameFilter,
+            ),
+            // Existing settings predate both NameFilter and its carrier. The input was previously
+            // always visible, so preserve that behavior on the first load after upgrading.
+            None => self
+                .toolbar_facet_filter_items
+                .push(ToolbarFacetFilterItem::NameFilter),
+        }
+    }
+
     fn restore_post_filter_variants_after_load(&mut self) {
         self.post_filter_global_preset_stash
             .restore_after_load(&mut self.global_preset);
@@ -6581,6 +6677,7 @@ impl Settings {
     /// お気に入りの UUID マイグレーションもここで行う。
     fn sanitize(&mut self) {
         self.restore_post_filter_variants_after_load();
+        self.restore_toolbar_name_filter_after_load();
         self.text_contrast = self.text_contrast.normalized();
         self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
         self.ui_font.sanitize();
@@ -6802,6 +6899,7 @@ impl Settings {
         sanitize_details_column_widths(&mut self.details_selection_bar_column_widths);
         self.toolbar_facet_filter_items =
             ToolbarFacetFilterItem::visible_order(&self.toolbar_facet_filter_items);
+        self.facet_name_filter_width = self.facet_name_filter_width.normalized();
         self.grid_click_selection_mode = self.grid_click_selection_mode.normalized();
         // grid_cursor_wrap は bool のため不正値を持たない。旧設定の欠落は serde default で
         // false に補い、sanitize では読み込んだ ON/OFF をそのまま維持する。
@@ -6994,6 +7092,9 @@ impl Settings {
         self.toolbar_aspect_auto_visible = src.toolbar_aspect_auto_visible;
         self.toolbar_sort_items = std::mem::take(&mut src.toolbar_sort_items);
         self.toolbar_facet_filter_items = std::mem::take(&mut src.toolbar_facet_filter_items);
+        self.toolbar_facet_name_filter_index_stash =
+            src.toolbar_facet_name_filter_index_stash.take();
+        self.facet_name_filter_width = src.facet_name_filter_width;
         self.toolbar_section_order = std::mem::take(&mut src.toolbar_section_order);
         self.toolbar_section_new_row = std::mem::take(&mut src.toolbar_section_new_row);
         self.toolbar_section_drag_enabled = src.toolbar_section_drag_enabled;
@@ -7968,6 +8069,93 @@ mod tests {
         assert!(
             ToolbarFacetFilterItem::visible_order(&[]).is_empty(),
             "空 Vec は「全部隠す」として保持する"
+        );
+    }
+
+    #[test]
+    fn facet_name_filter_width_roundtrips_all_choices() {
+        for &width in FacetNameFilterWidth::all() {
+            let mut settings = Settings::default();
+            settings.facet_name_filter_width = width;
+            let json = serde_json::to_string(&settings).unwrap();
+            let loaded: Settings = serde_json::from_str(&json).unwrap();
+            assert_eq!(loaded.facet_name_filter_width, width);
+        }
+        assert_eq!(FacetNameFilterWidth::Small.width(), 90.0);
+        assert_eq!(FacetNameFilterWidth::Medium.width(), 140.0);
+        assert_eq!(FacetNameFilterWidth::Large.width(), 200.0);
+    }
+
+    #[test]
+    fn toolbar_name_filter_stash_preserves_order_and_old_enum_shape() {
+        let mut settings = Settings::default();
+        settings.toolbar_facet_filter_items = vec![
+            ToolbarFacetFilterItem::Ext,
+            ToolbarFacetFilterItem::NameFilter,
+            ToolbarFacetFilterItem::Kind,
+        ];
+        let mut persisted = settings.clone();
+        persisted.stash_toolbar_name_filter_for_persist();
+        let json = serde_json::to_value(&persisted).unwrap();
+
+        assert_eq!(
+            json["toolbar_facet_filter_items"],
+            serde_json::json!(["Ext", "Kind"])
+        );
+        assert_eq!(json["toolbar_facet_name_filter_index_stash"], 1);
+
+        #[derive(serde::Deserialize, Debug, PartialEq, Eq)]
+        enum PreviousToolbarFacetFilterItem {
+            Kind,
+            Ext,
+        }
+        let previous: Vec<PreviousToolbarFacetFilterItem> =
+            serde_json::from_value(json["toolbar_facet_filter_items"].clone()).unwrap();
+        assert_eq!(
+            previous,
+            vec![
+                PreviousToolbarFacetFilterItem::Ext,
+                PreviousToolbarFacetFilterItem::Kind,
+            ]
+        );
+
+        let mut loaded: Settings = serde_json::from_value(json).unwrap();
+        loaded.sanitize();
+        assert_eq!(
+            loaded.toolbar_facet_filter_items,
+            settings.toolbar_facet_filter_items
+        );
+        assert!(loaded.toolbar_facet_name_filter_index_stash.is_none());
+
+        let mut hidden = Settings::default();
+        hidden
+            .toolbar_facet_filter_items
+            .retain(|item| *item != ToolbarFacetFilterItem::NameFilter);
+        let mut hidden_persisted = hidden.clone();
+        hidden_persisted.stash_toolbar_name_filter_for_persist();
+        assert_eq!(
+            hidden_persisted.toolbar_facet_name_filter_index_stash,
+            Some(TOOLBAR_NAME_FILTER_HIDDEN_STASH)
+        );
+        hidden_persisted.sanitize();
+        assert_eq!(
+            hidden_persisted.toolbar_facet_filter_items,
+            hidden.toolbar_facet_filter_items
+        );
+
+        let mut legacy: Settings = serde_json::from_value(serde_json::json!({
+            "toolbar_facet_filter_items": ["Ext", "Kind"]
+        }))
+        .unwrap();
+        legacy.sanitize();
+        assert_eq!(
+            legacy.toolbar_facet_filter_items,
+            vec![
+                ToolbarFacetFilterItem::Ext,
+                ToolbarFacetFilterItem::Kind,
+                ToolbarFacetFilterItem::NameFilter,
+            ],
+            "the previously-always-visible input must stay visible after upgrading"
         );
     }
 
