@@ -309,6 +309,62 @@ impl ViewTrimBookState {
     }
 }
 
+/// 保存値を本単位の基底モードへ正規化する。
+/// `Page` は enabled なページ個別行からだけ導出され、本単位では保持しない。
+pub fn view_trim_base_apply_mode(stored: ViewTrimApplyMode) -> ViewTrimApplyMode {
+    match stored {
+        ViewTrimApplyMode::Page => ViewTrimApplyMode::None,
+        mode => mode,
+    }
+}
+
+/// 本体表示と remote 表示が共有する旧 margin-fit 互換の基底モード解決。
+pub fn effective_view_trim_base_apply_mode(
+    stored: ViewTrimApplyMode,
+    legacy_margin_fit_active: bool,
+) -> ViewTrimApplyMode {
+    let mode = view_trim_base_apply_mode(stored);
+    if matches!(mode, ViewTrimApplyMode::None) && legacy_margin_fit_active {
+        ViewTrimApplyMode::Auto
+    } else {
+        mode
+    }
+}
+
+/// 基底が `Book` のときだけ、enabled なページ個別行を `Page` へ昇格させる。
+pub fn effective_view_trim_apply_mode(
+    base_mode: ViewTrimApplyMode,
+    page_override: Option<ViewTrimPageOverride>,
+) -> ViewTrimApplyMode {
+    match base_mode {
+        ViewTrimApplyMode::Book if page_override.is_some_and(|value| value.enabled) => {
+            ViewTrimApplyMode::Page
+        }
+        mode => mode,
+    }
+}
+
+/// `None` / `Book` / `Page` の保存値から表示 bbox を解決する。
+/// `Auto` は画素走査を必要とするため、呼び出し側が別途解決する。
+pub fn stored_view_trim_bbox(
+    mode: ViewTrimApplyMode,
+    book_settings: ViewTrimBookSettings,
+    page_override: Option<ViewTrimPageOverride>,
+    spread_side: Option<ViewTrimSpreadSide>,
+) -> Option<egui::Rect> {
+    match mode {
+        ViewTrimApplyMode::Book => match spread_side {
+            Some(side) => book_settings.spread_bbox(side),
+            None => book_settings.single_bbox(),
+        },
+        ViewTrimApplyMode::Page => page_override.and_then(|value| match spread_side {
+            Some(side) => value.spread_bbox(side),
+            None => value.bbox(),
+        }),
+        ViewTrimApplyMode::None | ViewTrimApplyMode::Auto => None,
+    }
+}
+
 fn clamp_margin(v: f32) -> f32 {
     if v.is_finite() {
         v.clamp(0.0, MAX_VIEW_TRIM_MARGIN)
@@ -472,6 +528,108 @@ mod tests {
         assert_eq!(as_right.right, 0.08);
         assert_eq!(as_right.top, 0.01);
         assert_eq!(as_right.bottom, 0.02);
+    }
+
+    #[test]
+    fn effective_mode_normalizes_saved_page_and_promotes_legacy_none_to_auto() {
+        assert_eq!(
+            effective_view_trim_base_apply_mode(ViewTrimApplyMode::Page, false),
+            ViewTrimApplyMode::None
+        );
+        assert_eq!(
+            effective_view_trim_base_apply_mode(ViewTrimApplyMode::None, true),
+            ViewTrimApplyMode::Auto
+        );
+        assert_eq!(
+            effective_view_trim_base_apply_mode(ViewTrimApplyMode::Book, true),
+            ViewTrimApplyMode::Book
+        );
+    }
+
+    #[test]
+    fn effective_book_mode_promotes_only_enabled_page_override() {
+        let disabled = ViewTrimPageOverride {
+            enabled: false,
+            ..Default::default()
+        };
+        let enabled = ViewTrimPageOverride::from_margins(ViewTrimMargins {
+            left: 0.03,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            effective_view_trim_apply_mode(ViewTrimApplyMode::Book, Some(disabled)),
+            ViewTrimApplyMode::Book
+        );
+        assert_eq!(
+            effective_view_trim_apply_mode(ViewTrimApplyMode::Book, Some(enabled)),
+            ViewTrimApplyMode::Page
+        );
+        assert_eq!(
+            effective_view_trim_apply_mode(ViewTrimApplyMode::Auto, Some(enabled)),
+            ViewTrimApplyMode::Auto
+        );
+    }
+
+    #[test]
+    fn stored_page_bbox_converts_authored_spread_side() {
+        let page_override = ViewTrimPageOverride::from_spread_margins(
+            ViewTrimMargins {
+                left: 0.03,
+                top: 0.01,
+                right: 0.08,
+                bottom: 0.02,
+            },
+            ViewTrimSpreadSide::Left,
+        );
+        let bbox = stored_view_trim_bbox(
+            ViewTrimApplyMode::Page,
+            ViewTrimBookSettings::default(),
+            Some(page_override),
+            Some(ViewTrimSpreadSide::Right),
+        )
+        .unwrap();
+        let margins = ViewTrimMargins::from_bbox(bbox);
+
+        assert!((margins.left - 0.08).abs() < 1e-6);
+        assert!((margins.right - 0.03).abs() < 1e-6);
+        assert!((margins.top - 0.01).abs() < 1e-6);
+        assert!((margins.bottom - 0.02).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stored_book_bbox_uses_single_or_requested_spread_side_and_none_disables_it() {
+        let book = ViewTrimBookSettings {
+            enabled: true,
+            single: ViewTrimMargins {
+                top: 0.04,
+                ..Default::default()
+            },
+            spread_linked: ViewTrimLinkedMargins {
+                inner: 0.08,
+                outer: 0.02,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let single = ViewTrimMargins::from_bbox(
+            stored_view_trim_bbox(ViewTrimApplyMode::Book, book, None, None).unwrap(),
+        );
+        let right = ViewTrimMargins::from_bbox(
+            stored_view_trim_bbox(
+                ViewTrimApplyMode::Book,
+                book,
+                None,
+                Some(ViewTrimSpreadSide::Right),
+            )
+            .unwrap(),
+        );
+
+        assert!((single.top - 0.04).abs() < 1e-6);
+        assert!((right.left - 0.08).abs() < 1e-6);
+        assert!((right.right - 0.02).abs() < 1e-6);
+        assert!(stored_view_trim_bbox(ViewTrimApplyMode::None, book, None, None).is_none());
     }
 
     #[test]

@@ -14,15 +14,15 @@ use mimageviewer_ipc::{
     PageRequest, PageResponse, REMOTE_AI_START_ACCEPT_BUDGET, RemoteAddress,
     RemoteAiCancelResponse, RemoteAiJobError, RemoteAiJobSnapshot, RemoteAiRecoverableResponse,
     RemoteAiResultResponse, RemoteAiStartRequest, RemoteAiStartResponse, RemoteAiStateResponse,
-    RemoteWebConnectionInfo, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest,
-    RemoteWriteResponse, RemoteWriteResult, RequestId, ServerMessage, SessionAcquireRequest,
-    SessionPeerInfo, SessionPingRequest, SessionResponse, SessionStatus, ThumbnailError,
-    ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse, VIDEO_STREAM_START_BUDGET,
-    VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode, VideoStreamJumpListPayload,
-    VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind, VideoStreamPlaylistPayload,
-    VideoStreamQuality, VideoStreamResult, VideoStreamSeekPayload, VideoStreamSegmentIndex,
-    VideoStreamSegmentPayload, VideoStreamStartPayload, VideoStreamStatePayload,
-    VideoStreamThumbnailPayload, read_frame, write_frame,
+    RemotePageRenderContext, RemoteWebConnectionInfo, RemoteWriteError, RemoteWriteErrorCode,
+    RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult, RequestId, ServerMessage,
+    SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionResponse, SessionStatus,
+    ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse,
+    VIDEO_STREAM_START_BUDGET, VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode,
+    VideoStreamJumpListPayload, VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind,
+    VideoStreamPlaylistPayload, VideoStreamQuality, VideoStreamResult, VideoStreamSeekPayload,
+    VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamStartPayload,
+    VideoStreamStatePayload, VideoStreamThumbnailPayload, read_frame, write_frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -624,6 +624,7 @@ impl ThumbnailClient {
         address: RemoteAddress,
         target_px: u32,
         priority: PagePriority,
+        render_context: Option<RemotePageRenderContext>,
         adjustment_preview: Option<mimageviewer_ipc::RemoteAdjustmentPreview>,
     ) -> Result<IpcSuccess<PagePayload>, ClientFailure> {
         self.collection_request(|id| ClientMessage::Page {
@@ -633,6 +634,7 @@ impl ThumbnailClient {
                 address: address.clone(),
                 target_px,
                 priority,
+                render_context: render_context.clone(),
                 adjustment_preview: adjustment_preview.clone(),
             },
         })
@@ -2038,6 +2040,7 @@ mod tests {
                 address: RemoteAddress::file("00000000-0000-0000-0000-000000000000", "image.png"),
                 target_px: 2048,
                 priority: PagePriority::Foreground,
+                render_context: None,
                 adjustment_preview: None,
             },
         };

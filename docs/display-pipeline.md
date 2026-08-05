@@ -1235,6 +1235,15 @@ enabled 行も、新仕様では該当ページを表示した時点で自動適
 `Auto` は「モード」だけ保存し、検出 bbox は保存しない。スライダードラッグ中はメモリだけ更新し、
 マウスを離したフレームで本設定と表示中ページの個別値をまとめて SQLite へ書き込む。
 
+mIV Remote のページ描画は protocol v28 で現在の container address と画面上の
+`single / spread_left / spread_right` を Page 要求へ添え、本体と同じ本キー・ページキー・
+左右 semantics で `None` / `Book` / enabled な `Page` を解決する。remote 側の
+`ViewTrimDb` は既存 `view_trim.db` を `SQLITE_OPEN_READ_ONLY` だけで開き、DB が無い場合も
+作成・DDL・migration は行わない。表示 crop は committed な最終合成（加工用 crop を含む）の
+後、端末用 resize / JPEG encode の直前だけに適用するため、補正 / AI の materialized pixels と
+その cache は表示トリム前のまま保持する。`Auto` の画素走査と見開き調停は段 2b-2b の範囲で、
+現段階の remote では crop しない。端末からのモード変更も別段とし、remote は設定を書き込まない。
+
 Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread_pair` で左右の idx と配置
 (LTR/RTL/Cover) を決め、両ページを「1 枚の合成画像」とみなしてレイアウトする。
 

@@ -846,6 +846,7 @@ mod tests {
                     "image.png",
                 ),
                 target_px: 1024,
+                render_context: None,
             }],
         }
     }
@@ -1078,6 +1079,7 @@ mod tests {
                     "vector.pdf",
                 ),
                 target_px: 1024,
+                render_context: None,
             });
         let job = start_with_request(&session, &registry, mixed_request);
         calls

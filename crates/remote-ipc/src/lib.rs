@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 27;
+pub const PROTOCOL_VERSION: u32 = 28;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -705,9 +705,27 @@ pub struct PageRequest {
     /// 表示用ラスタの長辺上限。
     pub target_px: u32,
     pub priority: PagePriority,
+    /// 表示トリムの本キーと、見開き左右 semantics を解決する表示コンテキスト。
+    #[serde(default)]
+    pub render_context: Option<RemotePageRenderContext>,
     /// 未確定の画像補正プレビュー。永続化せず、この応答の合成だけへ適用する。
     #[serde(default)]
     pub adjustment_preview: Option<RemoteAdjustmentPreview>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemotePageRenderContext {
+    pub context_address: RemoteAddress,
+    pub display_slot: RemotePageDisplaySlot,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePageDisplaySlot {
+    #[default]
+    Single,
+    SpreadLeft,
+    SpreadRight,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1163,6 +1181,9 @@ pub struct VideoStreamError {
 pub struct RemoteAiPageRequest {
     pub address: RemoteAddress,
     pub target_px: u32,
+    /// 通常 Page と同じ表示トリム解決コンテキスト。
+    #[serde(default)]
+    pub render_context: Option<RemotePageRenderContext>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1891,6 +1912,13 @@ mod tests {
                 },
                 target_px: 1805,
                 priority: PagePriority::Prefetch,
+                render_context: Some(RemotePageRenderContext {
+                    context_address: RemoteAddress::file(
+                        "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+                        "books/volume.pdf",
+                    ),
+                    display_slot: RemotePageDisplaySlot::SpreadRight,
+                }),
                 adjustment_preview: Some(RemoteAdjustmentPreview {
                     scope: RemoteAdjustmentScope::Page,
                     values: RemoteAdjustmentValues {
@@ -1960,8 +1988,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v27_video_pull_jump_thumbnail_end_behavior_and_audio_status_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 27);
+    fn protocol_v28_page_render_context_video_and_audio_status_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 28);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -2503,6 +2531,7 @@ mod tests {
             pages: vec![RemoteAiPageRequest {
                 address,
                 target_px: 1600,
+                render_context: None,
             }],
         };
         let client_messages = vec![

@@ -51,6 +51,7 @@ import {
   shouldShowKeyboardShortcuts,
   sessionOwnerBadge,
   viewerImageLayout,
+  viewerPageDisplaySlot,
   viewerBoundaryMessage,
   viewerGestureDecision,
   viewerPanelGestureAction,
@@ -785,6 +786,13 @@ test("spread layout fits the combined pages and preserves the configured gap", (
     spreadNearSquareRequest.pages[0].requestWidth <
       singleNearSquareRequest.pages[0].requestWidth * 0.51
   );
+});
+
+test("page display slots follow the physical left-to-right group order", () => {
+  assert.equal(viewerPageDisplaySlot(1, 0), "single");
+  assert.equal(viewerPageDisplaySlot(2, 0), "spread_left");
+  assert.equal(viewerPageDisplaySlot(2, 1), "spread_right");
+  assert.equal(viewerPageDisplaySlot(2, 2), "single");
 });
 
 test("page edge messages distinguish start, end and RTL guidance", () => {

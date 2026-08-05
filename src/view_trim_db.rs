@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::view_trim::{ViewTrimBookState, ViewTrimPageOverride};
+use rusqlite::OpenFlags;
 
 #[derive(Clone, Debug, Default)]
 pub struct ViewTrimWriteBatch {
@@ -42,6 +43,15 @@ impl ViewTrimDb {
              );",
         )?;
         Ok(Self { conn })
+    }
+
+    /// 既存 DB を read-only で開く。remote 表示からの参照用で、schema 作成や更新は行わない。
+    pub fn open_existing_read_only_at(path: &Path) -> Result<Option<Self>, rusqlite::Error> {
+        if !path.try_exists().unwrap_or(false) {
+            return Ok(None);
+        }
+        let conn = rusqlite::Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Some(Self { conn }))
     }
 
     fn db_path() -> PathBuf {
@@ -96,6 +106,15 @@ impl ViewTrimDb {
             rusqlite::params![page_key, json],
         )?;
         Ok(())
+    }
+
+    pub fn get_page_override(&self, page_key: &str) -> Option<ViewTrimPageOverride> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT override_json FROM view_trim_pages WHERE page_path = ?1")
+            .ok()?;
+        let json: String = stmt.query_row([page_key], |row| row.get(0)).ok()?;
+        serde_json::from_str(&json).ok()
     }
 
     pub fn remove_page_override(&self, page_key: &str) -> Result<(), rusqlite::Error> {
@@ -321,6 +340,65 @@ mod tests {
             db.load_page_overrides_many(&["c:/books/vol2/page.jpg"])
                 .get("c:/books/vol2/page.jpg"),
             Some(&page_state)
+        );
+    }
+
+    #[test]
+    fn read_only_open_never_creates_a_missing_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("missing").join("view_trim.db");
+
+        assert!(
+            ViewTrimDb::open_existing_read_only_at(&path)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn read_only_open_reads_existing_rows_but_rejects_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("view_trim.db");
+        let writable = ViewTrimDb::open_at(&path).unwrap();
+        let book = Path::new(r"C:\Books\ReadOnly");
+        let state = ViewTrimBookState {
+            apply_mode: ViewTrimApplyMode::Book,
+            book_settings: ViewTrimBookSettings {
+                enabled: true,
+                single: ViewTrimMargins {
+                    left: 0.05,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        writable.set_book_state(book, state).unwrap();
+        writable
+            .set_page_override(
+                "c:/books/readonly/page.jpg",
+                ViewTrimPageOverride::from_margins(ViewTrimMargins {
+                    right: 0.04,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        drop(writable);
+
+        let read_only = ViewTrimDb::open_existing_read_only_at(&path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_only.get_book_state(book), Some(state));
+        assert!(
+            read_only
+                .get_page_override("c:/books/readonly/page.jpg")
+                .is_some()
+        );
+        assert!(
+            read_only
+                .set_book_state(book, ViewTrimBookState::default())
+                .is_err()
         );
     }
 }

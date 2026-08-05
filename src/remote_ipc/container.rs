@@ -10,9 +10,10 @@ use mimageviewer_ipc::{
     FolderListResponse, MediaError, MediaErrorCode, PageGroup, PagePayload, PagePriority,
     PageRequest, PageResponse, RemoteAddress, RemoteAiProgressPhase, RemoteAiStartRequest,
     RemoteAiTerminalCode, RemoteBookBookmarkList, RemoteBookBookmarkRow, RemoteBookBookmarkTarget,
-    RemoteEntryKind, RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource, RemoteWriteError,
-    RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult,
-    ThumbnailError, ThumbnailErrorCode, ThumbnailResponse,
+    RemoteEntryKind, RemotePageDisplaySlot, RemotePageRenderContext, RemoteReadingDirection,
+    RemoteSpreadMode, RemoteSubresource, RemoteWriteError, RemoteWriteErrorCode,
+    RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult, ThumbnailError, ThumbnailErrorCode,
+    ThumbnailResponse,
 };
 
 use super::path_guard::{ResolveError, ResolvedFavoritePath, resolve_existing};
@@ -31,7 +32,23 @@ const REMOTE_AI_PIPELINE_SCHEMA: u32 = 1;
 fn encode_remote_page_jpeg(
     image: &image::DynamicImage,
     long_side: u32,
+    view_trim_bbox: Option<egui::Rect>,
 ) -> Option<(Vec<u8>, u32, u32)> {
+    let cropped;
+    let image = if let Some(bbox) = view_trim_bbox {
+        let rect = crate::export_crop::CropRect {
+            min_x: bbox.min.x * image.width() as f32,
+            min_y: bbox.min.y * image.height() as f32,
+            max_x: bbox.max.x * image.width() as f32,
+            max_y: bbox.max.y * image.height() as f32,
+        };
+        let (x, y, width, height) =
+            rect.pixel_bounds(image.width() as usize, image.height() as usize);
+        cropped = image.crop_imm(x as u32, y as u32, width as u32, height as u32);
+        &cropped
+    } else {
+        image
+    };
     let resized = crate::fast_resize::resize_dynamic_fit(
         image,
         long_side,
@@ -51,6 +68,7 @@ pub(super) struct ContainerEngine {
     pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
     pdf_page_counts: Mutex<HashMap<PdfIdentity, u32>>,
     spread_db: Mutex<Option<crate::spread_db::SpreadDb>>,
+    view_trim_db: Mutex<Option<crate::view_trim_db::ViewTrimDb>>,
     resume_reader: Option<ResumeReader>,
     adjustment_settings: AdjustmentSettingsSource,
     creative_lut_cache: Mutex<RemoteCreativeLutCache>,
@@ -425,12 +443,24 @@ impl ContainerEngine {
                     None
                 }
             };
+        let view_trim_db_path = crate::data_dir::get().join("view_trim.db");
+        let view_trim_db =
+            match crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&view_trim_db_path) {
+                Ok(db) => db,
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "remote_ipc: view trim DB read-only open failed: {error}"
+                    ));
+                    None
+                }
+            };
         Self {
             settings: Arc::new(settings),
             stats: Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
             pdf_passwords: crate::pdf_passwords::PdfPasswordStore::load(),
             pdf_page_counts: Mutex::new(HashMap::new()),
             spread_db: Mutex::new(spread_db),
+            view_trim_db: Mutex::new(view_trim_db),
             resume_reader,
             adjustment_settings,
             creative_lut_cache: Mutex::new(RemoteCreativeLutCache::default()),
@@ -1737,17 +1767,27 @@ impl ContainerEngine {
             Some(&cancel),
             request.adjustment_preview.as_ref(),
         ) {
-            Ok(loaded) => match encode_remote_page_jpeg(&loaded.image, request.target_px) {
-                Some((bytes, width, height)) => PageResponse::Success(PagePayload {
-                    bytes,
-                    content_type: "image/jpeg".to_owned(),
-                    width,
-                    height,
-                }),
-                None => PageResponse::Error(media_error(
-                    MediaErrorCode::RenderFailed,
-                    "JPEG エンコードに失敗しました",
-                )),
+            Ok(loaded) => match self.remote_view_trim_bbox(
+                &request.address,
+                &resolved,
+                request.render_context.as_ref(),
+            ) {
+                Ok(view_trim_bbox) => {
+                    match encode_remote_page_jpeg(&loaded.image, request.target_px, view_trim_bbox)
+                    {
+                        Some((bytes, width, height)) => PageResponse::Success(PagePayload {
+                            bytes,
+                            content_type: "image/jpeg".to_owned(),
+                            width,
+                            height,
+                        }),
+                        None => PageResponse::Error(media_error(
+                            MediaErrorCode::RenderFailed,
+                            "JPEG エンコードに失敗しました",
+                        )),
+                    }
+                }
+                Err(error) => PageResponse::Error(error),
             },
             Err(error) => PageResponse::Error(error),
         };
@@ -2076,8 +2116,16 @@ impl ContainerEngine {
                 );
             }
             let image = loaded_image_from_color_image(&pixels).map_err(remote_ai_media_error)?;
-            let (bytes, width, height) = encode_remote_page_jpeg(&image.image, page.target_px)
-                .ok_or_else(|| RemoteAiRunError::Failed("JPEG encoding failed".to_owned()))?;
+            let view_trim_bbox = self
+                .remote_view_trim_bbox(
+                    &page.address,
+                    &resolved,
+                    page.render_context.as_ref(),
+                )
+                .map_err(remote_ai_media_error)?;
+            let (bytes, width, height) =
+                encode_remote_page_jpeg(&image.image, page.target_px, view_trim_bbox)
+                    .ok_or_else(|| RemoteAiRunError::Failed("JPEG encoding failed".to_owned()))?;
             Ok((
                 PagePayload {
                     bytes,
@@ -2630,6 +2678,131 @@ impl ContainerEngine {
             .map(|db| db.get_state_with_fallback(key, fallback))
             .unwrap_or_default();
         (stored.mode, stored.direction)
+    }
+
+    fn remote_view_trim_bbox(
+        &self,
+        page_address: &RemoteAddress,
+        resolved: &ResolvedFavoritePath,
+        render_context: Option<&RemotePageRenderContext>,
+    ) -> Result<Option<egui::Rect>, MediaError> {
+        let keys = self.remote_view_trim_keys(page_address, resolved, render_context)?;
+        let page_key = crate::edit_source::page_key_for_remote(
+            &resolved.logical,
+            &page_address.subresource,
+        )
+        .ok_or_else(|| media_error(MediaErrorCode::BadRequest, "表示トリム対象が不正です"))?;
+        let db = self
+            .view_trim_db
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let state = db
+            .as_ref()
+            .and_then(|db| db.get_book_state(&keys.exact))
+            .or_else(|| {
+                keys.fallback
+                    .as_deref()
+                    .and_then(|fallback| db.as_ref().and_then(|db| db.get_book_state(fallback)))
+            })
+            .unwrap_or_default();
+        let page_override = db.as_ref().and_then(|db| db.get_page_override(&page_key));
+        let legacy_margin_fit = matches!(
+            self.settings.fullscreen_fit_mode,
+            crate::settings::FullscreenFitMode::MarginFit
+        ) || self.settings.margin_fit_enabled;
+        let base_mode = crate::view_trim::effective_view_trim_base_apply_mode(
+            state.apply_mode,
+            legacy_margin_fit,
+        );
+        let mode = crate::view_trim::effective_view_trim_apply_mode(base_mode, page_override);
+        let spread_side = render_context.and_then(|context| match context.display_slot {
+            RemotePageDisplaySlot::Single => None,
+            RemotePageDisplaySlot::SpreadLeft => Some(crate::view_trim::ViewTrimSpreadSide::Left),
+            RemotePageDisplaySlot::SpreadRight => Some(crate::view_trim::ViewTrimSpreadSide::Right),
+        });
+        Ok(crate::view_trim::stored_view_trim_bbox(
+            mode,
+            state.book_settings,
+            page_override,
+            spread_side,
+        ))
+    }
+
+    fn remote_view_trim_keys(
+        &self,
+        page_address: &RemoteAddress,
+        resolved: &ResolvedFavoritePath,
+        render_context: Option<&RemotePageRenderContext>,
+    ) -> Result<crate::spread_db::SpreadContainerKey, MediaError> {
+        let Some(render_context) = render_context else {
+            let root = match page_address.subresource {
+                RemoteSubresource::File => resolved.logical.parent().ok_or_else(|| {
+                    media_error(MediaErrorCode::PathRejected, "本の場所を解決できません")
+                })?,
+                RemoteSubresource::ZipEntry { .. } | RemoteSubresource::PdfPage { .. } => {
+                    resolved.logical.as_path()
+                }
+                RemoteSubresource::ZipDirectory { .. } => {
+                    return Err(media_error(
+                        MediaErrorCode::BadRequest,
+                        "コンテナ自体は表示トリム対象ではありません",
+                    ));
+                }
+            };
+            return Ok(crate::spread_db::container_key_with_fallback(root, &[]));
+        };
+        let context_address = &render_context.context_address;
+        if page_address.favorite_id != context_address.favorite_id {
+            return Err(media_error(
+                MediaErrorCode::BadRequest,
+                "ページと表示コンテキストが一致しません",
+            ));
+        }
+        let context = self.resolve(context_address)?;
+        match (&page_address.subresource, &context_address.subresource) {
+            (RemoteSubresource::File, RemoteSubresource::File)
+                if std::fs::metadata(&context.canonical)
+                    .is_ok_and(|metadata| metadata.is_dir())
+                    && resolved.canonical.parent() == Some(context.canonical.as_path()) =>
+            {
+                Ok(crate::spread_db::container_key_with_fallback(
+                    &context.logical,
+                    &[],
+                ))
+            }
+            (
+                RemoteSubresource::ZipEntry { entry_name },
+                RemoteSubresource::File | RemoteSubresource::ZipDirectory { .. },
+            ) if resolved.canonical == context.canonical => {
+                let segments = match &context_address.subresource {
+                    RemoteSubresource::ZipDirectory { prefix } => zip_prefix_segments(prefix),
+                    _ => Vec::new(),
+                };
+                let effective_prefix = zip_prefix(&segments);
+                if !effective_prefix.is_empty() && !entry_name.starts_with(&effective_prefix) {
+                    return Err(media_error(
+                        MediaErrorCode::BadRequest,
+                        "ZIP ページと表示コンテキストが一致しません",
+                    ));
+                }
+                Ok(crate::spread_db::container_key_with_fallback(
+                    &resolved.logical,
+                    &segments,
+                ))
+            }
+            (RemoteSubresource::PdfPage { .. }, RemoteSubresource::File)
+                if resolved.canonical == context.canonical =>
+            {
+                Ok(crate::spread_db::container_key_with_fallback(
+                    &resolved.logical,
+                    &[],
+                ))
+            }
+            _ => Err(media_error(
+                MediaErrorCode::BadRequest,
+                "ページと表示コンテキストが一致しません",
+            )),
+        }
     }
 
     fn cached_landscape_flags(
@@ -3871,17 +4044,116 @@ mod tests {
         }));
 
         let (resized_bytes, resized_width, resized_height) =
-            encode_remote_page_jpeg(&image, 10).expect("JPEG encode");
+            encode_remote_page_jpeg(&image, 10, None).expect("JPEG encode");
         assert_eq!((resized_width, resized_height), (10, 5));
         assert_eq!(&resized_bytes[..2], &[0xff, 0xd8]);
         let resized = image::load_from_memory(&resized_bytes).expect("JPEG decode");
         assert_eq!((resized.width(), resized.height()), (10, 5));
 
         let (native_bytes, native_width, native_height) =
-            encode_remote_page_jpeg(&image, 8192).expect("JPEG encode");
+            encode_remote_page_jpeg(&image, 8192, None).expect("JPEG encode");
         assert_eq!((native_width, native_height), (40, 20));
         let native = image::load_from_memory(&native_bytes).expect("JPEG decode");
         assert_eq!((native.width(), native.height()), (40, 20));
+    }
+
+    #[test]
+    fn remote_page_jpeg_encoder_crops_before_resizing() {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            40,
+            20,
+            image::Rgba([10, 20, 30, 255]),
+        ));
+        let bbox = egui::Rect::from_min_max(egui::pos2(0.25, 0.0), egui::pos2(0.75, 1.0));
+
+        let (native_bytes, native_width, native_height) =
+            encode_remote_page_jpeg(&image, 8192, Some(bbox)).expect("JPEG encode");
+        assert_eq!((native_width, native_height), (20, 20));
+        let native = image::load_from_memory(&native_bytes).expect("JPEG decode");
+        assert_eq!((native.width(), native.height()), (20, 20));
+
+        let (_, resized_width, resized_height) =
+            encode_remote_page_jpeg(&image, 10, Some(bbox)).expect("JPEG encode");
+        assert_eq!((resized_width, resized_height), (10, 10));
+    }
+
+    #[test]
+    fn remote_view_trim_resolves_book_and_page_rows_for_spread_side() {
+        let temp = tempfile::tempdir().unwrap();
+        let book = temp.path().join("book");
+        std::fs::create_dir(&book).unwrap();
+        let page_override_path = book.join("override.png");
+        let page_book_path = book.join("book.png");
+        std::fs::write(&page_override_path, b"page").unwrap();
+        std::fs::write(&page_book_path, b"page").unwrap();
+        let db_path = temp.path().join("view_trim.db");
+        let db = crate::view_trim_db::ViewTrimDb::open_at(&db_path).unwrap();
+        db.set_book_state(
+            &book,
+            crate::view_trim::ViewTrimBookState {
+                apply_mode: crate::view_trim::ViewTrimApplyMode::Book,
+                book_settings: crate::view_trim::ViewTrimBookSettings {
+                    enabled: true,
+                    spread_linked: crate::view_trim::ViewTrimLinkedMargins {
+                        inner: 0.08,
+                        outer: 0.02,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+        db.set_page_override(
+            &crate::adjustment_db::normalize_path(&page_override_path),
+            crate::view_trim::ViewTrimPageOverride::from_spread_margins(
+                crate::view_trim::ViewTrimMargins {
+                    left: 0.03,
+                    right: 0.09,
+                    ..Default::default()
+                },
+                crate::view_trim::ViewTrimSpreadSide::Left,
+            ),
+        )
+        .unwrap();
+        drop(db);
+
+        let favorite = FavoriteEntry::new("test".to_owned(), temp.path().to_path_buf());
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            ..Default::default()
+        });
+        *engine
+            .view_trim_db
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path).unwrap();
+        let context = RemotePageRenderContext {
+            context_address: RemoteAddress::file(favorite.id.to_string(), "book"),
+            display_slot: RemotePageDisplaySlot::SpreadRight,
+        };
+
+        let override_address = RemoteAddress::file(favorite.id.to_string(), "book/override.png");
+        let override_resolved = engine.resolve(&override_address).unwrap();
+        let override_margins = crate::view_trim::ViewTrimMargins::from_bbox(
+            engine
+                .remote_view_trim_bbox(&override_address, &override_resolved, Some(&context))
+                .unwrap()
+                .unwrap(),
+        );
+        assert!((override_margins.left - 0.09).abs() < 1e-6);
+        assert!((override_margins.right - 0.03).abs() < 1e-6);
+
+        let book_address = RemoteAddress::file(favorite.id.to_string(), "book/book.png");
+        let book_resolved = engine.resolve(&book_address).unwrap();
+        let book_margins = crate::view_trim::ViewTrimMargins::from_bbox(
+            engine
+                .remote_view_trim_bbox(&book_address, &book_resolved, Some(&context))
+                .unwrap()
+                .unwrap(),
+        );
+        assert!((book_margins.left - 0.08).abs() < 1e-6);
+        assert!((book_margins.right - 0.02).abs() < 1e-6);
     }
 
     fn remote_ai_test_zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -3909,6 +4181,7 @@ mod tests {
             pages: vec![mimageviewer_ipc::RemoteAiPageRequest {
                 address,
                 target_px: 1024,
+                render_context: None,
             }],
         }
     }
@@ -4109,6 +4382,7 @@ mod tests {
         mixed.pages.push(mimageviewer_ipc::RemoteAiPageRequest {
             address: RemoteAddress::file(favorite.id.to_string(), "large.png"),
             target_px: 1024,
+            render_context: None,
         });
         let outcomes = engine
             .execute_remote_ai_inner_with(

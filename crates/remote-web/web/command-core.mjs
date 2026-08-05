@@ -537,6 +537,14 @@ export function viewerSpreadLayout({
   };
 }
 
+// PageGroup.pages is supplied in physical left-to-right order, including RTL books.
+export function viewerPageDisplaySlot(pageCount, pageIndex) {
+  const count = Math.max(0, Math.floor(Number(pageCount) || 0));
+  const index = Math.floor(Number(pageIndex));
+  if (count !== 2 || (index !== 0 && index !== 1)) return "single";
+  return index === 0 ? "spread_left" : "spread_right";
+}
+
 export function viewerBoundaryMessage({
   currentIndex,
   count,

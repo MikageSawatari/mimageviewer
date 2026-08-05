@@ -815,21 +815,11 @@ impl App {
         ) || self.settings.margin_fit_enabled
     }
 
-    fn view_trim_base_apply_mode(&self) -> ViewTrimApplyMode {
-        match self.view_trim_apply_mode {
-            ViewTrimApplyMode::Page => ViewTrimApplyMode::None,
-            mode => mode,
-        }
-    }
-
     fn effective_view_trim_base_apply_mode(&self) -> ViewTrimApplyMode {
-        let mode = self.view_trim_base_apply_mode();
-        if matches!(mode, ViewTrimApplyMode::None) && self.legacy_margin_fit_active_for_view_trim()
-        {
-            ViewTrimApplyMode::Auto
-        } else {
-            mode
-        }
+        crate::view_trim::effective_view_trim_base_apply_mode(
+            self.view_trim_apply_mode,
+            self.legacy_margin_fit_active_for_view_trim(),
+        )
     }
 
     pub(crate) fn effective_view_trim_apply_mode_for_idx(&self, idx: usize) -> ViewTrimApplyMode {
@@ -839,27 +829,14 @@ impl App {
         // (表示トリム実装時の見落とし。2026-07-28 修正)。
         // view_trim_pages はリリース済みデータなので削除・移行はしない。旧実装では
         // 「チェックしている間だけ効く」値だった行が、以後は常に効くようになる。
-        match self.effective_view_trim_base_apply_mode() {
-            ViewTrimApplyMode::Book
-                if enabled_page_override(self.view_trim_page_overrides.get(&idx).copied())
-                    .is_some() =>
-            {
-                ViewTrimApplyMode::Page
-            }
-            mode => mode,
-        }
+        crate::view_trim::effective_view_trim_apply_mode(
+            self.effective_view_trim_base_apply_mode(),
+            self.view_trim_page_overrides.get(&idx).copied(),
+        )
     }
 
     pub(crate) fn view_trim_single_bbox(&self, idx: usize) -> Option<egui::Rect> {
-        match self.effective_view_trim_apply_mode_for_idx(idx) {
-            ViewTrimApplyMode::Book => self.view_trim_book_settings.single_bbox(),
-            ViewTrimApplyMode::Page => self
-                .view_trim_page_overrides
-                .get(&idx)
-                .copied()
-                .and_then(ViewTrimPageOverride::bbox),
-            ViewTrimApplyMode::None | ViewTrimApplyMode::Auto => None,
-        }
+        self.stored_view_trim_bbox_for_idx(idx, None)
     }
 
     pub(crate) fn view_trim_spread_bbox(
@@ -867,15 +844,23 @@ impl App {
         idx: usize,
         side: ViewTrimSpreadSide,
     ) -> Option<egui::Rect> {
-        match self.effective_view_trim_apply_mode_for_idx(idx) {
-            ViewTrimApplyMode::Book => self.view_trim_book_settings.spread_bbox(side),
-            ViewTrimApplyMode::Page => self
-                .view_trim_page_overrides
-                .get(&idx)
-                .copied()
-                .and_then(|p| p.spread_bbox(side)),
-            ViewTrimApplyMode::None | ViewTrimApplyMode::Auto => None,
-        }
+        self.stored_view_trim_bbox_for_idx(idx, Some(side))
+    }
+
+    /// 保存値からの bbox 解決は remote 表示と共有する。ここに本体専用の枝を足すと
+    /// 端末側だけ違う位置で切れるので、優先順位は `view_trim::stored_view_trim_bbox`
+    /// 側だけで持つ。
+    fn stored_view_trim_bbox_for_idx(
+        &self,
+        idx: usize,
+        side: Option<ViewTrimSpreadSide>,
+    ) -> Option<egui::Rect> {
+        crate::view_trim::stored_view_trim_bbox(
+            self.effective_view_trim_apply_mode_for_idx(idx),
+            self.view_trim_book_settings,
+            self.view_trim_page_overrides.get(&idx).copied(),
+            side,
+        )
     }
 
     pub(crate) fn view_trim_single_content_bbox(&mut self, idx: usize) -> Option<egui::Rect> {

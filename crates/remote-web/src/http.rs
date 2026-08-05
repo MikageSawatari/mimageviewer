@@ -9,11 +9,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mimageviewer_ipc::{
     CollectionErrorCode, CollectionKind, MediaErrorCode, PagePriority, RemoteAddress,
     RemoteAiJobError, RemoteAiJobErrorCode, RemoteAiStartRequest, RemoteEntryKind,
-    RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource, RemoteWriteErrorCode,
-    RemoteWriteRequest, SessionResponse, SessionStatus, VideoStreamControlAction,
-    VideoStreamErrorCode, VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind,
-    VideoStreamQuality, VideoStreamSegmentIndex, VideoStreamSegmentPayload,
-    VideoStreamThumbnailPayload,
+    RemotePageRenderContext, RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource,
+    RemoteWriteErrorCode, RemoteWriteRequest, SessionResponse, SessionStatus,
+    VideoStreamControlAction, VideoStreamErrorCode, VideoStreamJumpThumbnailPayload,
+    VideoStreamPlaylistKind, VideoStreamQuality, VideoStreamSegmentIndex,
+    VideoStreamSegmentPayload, VideoStreamThumbnailPayload,
 };
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::Deserialize;
@@ -637,6 +637,13 @@ fn api_ai_job_start(request: &mut Request, state: &AppState, client_id: &str) ->
     };
     for page in &request.pages {
         if let Err(error) = state.library.validate_remote_address(&page.address) {
+            return store_error_response(error).with_header("Cache-Control", "no-store");
+        }
+        if let Some(render_context) = page.render_context.as_ref()
+            && let Err(error) = state
+                .library
+                .validate_remote_address(&render_context.context_address)
+        {
             return store_error_response(error).with_header("Cache-Control", "no-store");
         }
     }
@@ -2335,6 +2342,21 @@ fn api_page(state: &AppState, query: &[(String, String)], client_id: &str) -> Ht
         },
         Err(()) => return HttpResponse::text(400, "Bad Request"),
     };
+    let render_context = match query_value(query, "render_context") {
+        Ok(None) => None,
+        Ok(Some(value)) => match serde_json::from_str::<RemotePageRenderContext>(value) {
+            Ok(context) => Some(context),
+            Err(_) => return HttpResponse::text(400, "Bad Request"),
+        },
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
+    if let Some(render_context) = render_context.as_ref()
+        && let Err(error) = state
+            .library
+            .validate_remote_address(&render_context.context_address)
+    {
+        return store_error_response(error);
+    }
     let ipc_class = if priority == PagePriority::Prefetch {
         IpcClass::Prefetch
     } else {
@@ -2347,6 +2369,7 @@ fn api_page(state: &AppState, query: &[(String, String)], client_id: &str) -> Ht
             address.clone(),
             target_px,
             priority,
+            render_context.clone(),
             adjustment_preview.clone(),
         )
     }) {

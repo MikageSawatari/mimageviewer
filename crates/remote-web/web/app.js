@@ -51,6 +51,7 @@ import {
   viewerTapCommand,
   viewerTapSequenceTransition,
   viewerImageLayout,
+  viewerPageDisplaySlot,
   viewerBoundaryMessage,
   viewerSeekGroupIndex,
   viewerSeekState,
@@ -2018,6 +2019,21 @@ function pageGroupIndexForEntry(entry) {
   );
 }
 
+function pageRenderContextForEntry(entry) {
+  const contextAddress = state.container?.address;
+  const groupIndex = pageGroupIndexForEntry(entry);
+  const group = state.pageGroups[groupIndex];
+  if (!contextAddress || !group) return null;
+  const pageIndex = group.entries.findIndex(
+    (page) => entryIdentity(page) === entryIdentity(entry)
+  );
+  if (pageIndex < 0) return null;
+  return {
+    context_address: contextAddress,
+    display_slot: viewerPageDisplaySlot(group.entries.length, pageIndex),
+  };
+}
+
 function currentPageGroup() {
   return state.pageGroups[state.pageGroupIndex] ?? null;
 }
@@ -3297,6 +3313,7 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
     pages.map(({ entry, request }) => ({
       address: entryAddress(entry),
       target_px: request.width,
+      render_context: request.renderContext,
       name: entry.name,
     }))
   ).catch((error) => state.remoteAiController?.showRequestError(error));
@@ -3379,6 +3396,7 @@ function imageRequest(
 ) {
   const dpr = window.devicePixelRatio || 1;
   if (entry.address) {
+    const renderContext = pageRenderContextForEntry(entry);
     const resolvedLayout = layout ?? viewerImageLayout({
         mode: state.fitMode,
         sourceWidth: info.width,
@@ -3398,6 +3416,9 @@ function imageRequest(
           w: targetPx,
           ...(prefetch ? { prefetch: 1 } : {}),
           rev: previewRevision ?? state.pageRenderRevision,
+          ...(renderContext
+            ? { render_context: JSON.stringify(renderContext) }
+            : {}),
           ...(adjustmentPreview
             ? { adjustment_preview: JSON.stringify(adjustmentPreview) }
             : {}),
@@ -3405,7 +3426,7 @@ function imageRequest(
       ),
       cacheKey: adjustmentPreview
         ? null
-        : `${infoCacheKey}\n${targetPx}\n${state.pageRenderRevision}`,
+        : `${infoCacheKey}\n${targetPx}\n${state.pageRenderRevision}\n${JSON.stringify(renderContext)}`,
       width: targetPx,
       cssWidth: resolvedLayout.cssWidth,
       dpr,
@@ -3414,6 +3435,7 @@ function imageRequest(
       dynamicInfo: true,
       infoCacheKey,
       containerInfoKey: mediaContainerInfoKey(entry.address),
+      renderContext,
       prefetch,
     };
   }
@@ -6592,7 +6614,7 @@ export function remoteAiPollingDelay({ visibilityState, terminal, failureCount =
 
 function remoteAiGroupHash(pages, revision = state.pageRenderRevision) {
   const source = `${revision}\n${pages.map((page) =>
-    `${addressIdentity(page.address)}\n${Math.max(1, Number(page.target_px) || 1)}`
+    `${addressIdentity(page.address)}\n${Math.max(1, Number(page.target_px) || 1)}\n${JSON.stringify(page.render_context ?? null)}`
   ).join("\n---\n")}`;
   let first = 0x811c9dc5;
   let second = 0x9e3779b9;
@@ -6664,6 +6686,7 @@ export class RemoteAiController {
       .map((page) => ({
         address: page.address,
         target_px: Math.max(1, Math.round(Number(page.target_px) || 1)),
+        render_context: page.render_context ?? null,
         name: String(page.name || "画像"),
       }));
     if (!normalized.length || normalized.length > 2) return;
@@ -6704,7 +6727,11 @@ export class RemoteAiController {
     this.show("準備しています", { cancellable: true });
     const snapshot = await apiPostJson("/api/ai/jobs", {
       request_id: this.requestId,
-      pages: this.pages.map(({ address, target_px }) => ({ address, target_px })),
+      pages: this.pages.map(({ address, target_px, render_context }) => ({
+        address,
+        target_px,
+        render_context,
+      })),
     });
     if (!this.isCurrent(generation)) return;
     await this.handleSnapshot(snapshot, generation);
