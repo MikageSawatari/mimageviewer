@@ -55,6 +55,7 @@ const FS_NAVIGATOR_HEADER_HEIGHT: f32 = 26.0;
 const FS_NAVIGATOR_MARGIN: f32 = 12.0;
 const FS_NAVIGATOR_WHEEL_STEP: f32 = 20.0;
 const FS_NAVIGATOR_MIN_SELECTION: f32 = 8.0;
+const PANORAMA_NAVIGATOR_EDGE_SAMPLES: usize = 24;
 
 #[derive(Clone, Copy)]
 struct FlatNavigatorPage {
@@ -71,6 +72,15 @@ struct FlatNavigatorLayout {
     visible_rect: egui::Rect,
     screen_scale: f32,
     pages: Vec<FlatNavigatorPage>,
+}
+
+#[derive(Clone)]
+struct PanoramaNavigatorLayout {
+    panel_rect: egui::Rect,
+    header_rect: egui::Rect,
+    canvas_rect: egui::Rect,
+    content_rect: egui::Rect,
+    outline_segments: Vec<Vec<egui::Pos2>>,
 }
 
 impl FlatNavigatorLayout {
@@ -121,8 +131,27 @@ enum FsNavigatorInteraction {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+enum PanoramaNavigatorInteraction {
+    #[default]
+    Idle,
+    Select {
+        start: egui::Pos2,
+        current: egui::Pos2,
+    },
+    Pan {
+        start_uv: egui::Pos2,
+        start_yaw: f32,
+        start_pitch: f32,
+    },
+}
+
 fn fs_navigator_interaction_id() -> egui::Id {
     egui::Id::new("fs_navigator_interaction")
+}
+
+fn panorama_navigator_interaction_id() -> egui::Id {
+    egui::Id::new("panorama_navigator_interaction")
 }
 
 fn fs_navigator_rect_is_valid(rect: egui::Rect) -> bool {
@@ -322,6 +351,138 @@ fn build_flat_navigator_layout(
         visible_rect: visible_rect?.intersect(canvas_rect),
         screen_scale,
         pages,
+    })
+}
+
+fn panorama_navigator_screen_to_uv(content_rect: egui::Rect, pos: egui::Pos2) -> egui::Pos2 {
+    let pos = pos.clamp(content_rect.min, content_rect.max);
+    egui::pos2(
+        ((pos.x - content_rect.left()) / content_rect.width().max(f32::EPSILON)).clamp(0.0, 1.0),
+        ((pos.y - content_rect.top()) / content_rect.height().max(f32::EPSILON)).clamp(0.0, 1.0),
+    )
+}
+
+fn panorama_navigator_uv_to_yaw_pitch(uv: egui::Pos2) -> (f32, f32) {
+    // `ndc_to_equirect_uv` and the WGSL renderer use a camera-yaw convention
+    // whose center longitude is `-yaw`, so the inverse must negate the usual
+    // equirect longitude expression to round-trip the actually drawn view.
+    let yaw = -(uv.x.clamp(0.0, 1.0) - 0.5) * std::f32::consts::TAU;
+    let pitch = ((0.5 - uv.y.clamp(0.0, 1.0)) * std::f32::consts::PI)
+        .clamp(-crate::panorama::PITCH_LIMIT, crate::panorama::PITCH_LIMIT);
+    (yaw, pitch)
+}
+
+fn panorama_navigator_wrap_yaw(yaw: f32) -> f32 {
+    (yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+}
+
+fn panorama_navigator_fov_from_height(selection_height: f32, content_height: f32) -> f32 {
+    let fov_y = selection_height.abs() / content_height.max(f32::EPSILON) * std::f32::consts::PI;
+    if fov_y.is_finite() {
+        fov_y.clamp(crate::panorama::FOV_MIN, crate::panorama::FOV_MAX)
+    } else {
+        crate::panorama::FOV_MAX
+    }
+}
+
+fn panorama_navigator_outline_segments(
+    content_rect: egui::Rect,
+    viewport_rect: egui::Rect,
+    yaw: f32,
+    pitch: f32,
+    fov_y: f32,
+) -> Vec<Vec<egui::Pos2>> {
+    let aspect = if viewport_rect.height() > 0.0 {
+        viewport_rect.width() / viewport_rect.height()
+    } else {
+        1.0
+    };
+    // Keep these derivations identical to `try_paint_panorama` and
+    // `panorama_wgpu`: aspect = viewport_w / viewport_h and
+    // tan_half = tan(fov_y / 2).
+    let tan_half = (fov_y.clamp(crate::panorama::FOV_MIN, crate::panorama::FOV_MAX) * 0.5).tan();
+    let samples = PANORAMA_NAVIGATOR_EDGE_SAMPLES;
+    let mut ndc_points = Vec::with_capacity(samples * 4 + 1);
+    for step in 0..=samples {
+        let t = step as f32 / samples as f32;
+        ndc_points.push((-1.0 + t * 2.0, 1.0));
+    }
+    for step in 1..=samples {
+        let t = step as f32 / samples as f32;
+        ndc_points.push((1.0, 1.0 - t * 2.0));
+    }
+    for step in 1..=samples {
+        let t = step as f32 / samples as f32;
+        ndc_points.push((1.0 - t * 2.0, -1.0));
+    }
+    for step in 1..=samples {
+        let t = step as f32 / samples as f32;
+        ndc_points.push((-1.0, -1.0 + t * 2.0));
+    }
+
+    let mut segments = Vec::new();
+    let mut current = Vec::new();
+    let mut previous_u: Option<f32> = None;
+    for (u_ndc, v_ndc) in ndc_points {
+        let (u, v) =
+            crate::panorama::ndc_to_equirect_uv(u_ndc, v_ndc, aspect, tan_half, yaw, pitch);
+        // The equirect seam wraps from u=1 to u=0. Splitting adjacent samples
+        // whose U jump exceeds half the texture prevents a false line across
+        // the complete overview.
+        if previous_u.is_some_and(|previous| (u - previous).abs() > 0.5) {
+            if current.len() >= 2 {
+                segments.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+        }
+        current.push(egui::pos2(
+            content_rect.left() + u * content_rect.width(),
+            content_rect.top() + v * content_rect.height(),
+        ));
+        previous_u = Some(u);
+    }
+    if current.len() >= 2 {
+        segments.push(current);
+    }
+    // Near a pole with a broad FOV, the projected outline may encircle the
+    // pole. This sampled and seam-split approximation is intentionally only
+    // directionally accurate: the navigator is an orientation aid, not a
+    // spherical selection editor.
+    segments
+}
+
+fn build_panorama_navigator_layout(
+    source_size: egui::Vec2,
+    viewport_rect: egui::Rect,
+    host_rect: egui::Rect,
+    requested_size: f32,
+    corner: FullscreenNavigatorCorner,
+    yaw: f32,
+    pitch: f32,
+    fov_y: f32,
+) -> Option<PanoramaNavigatorLayout> {
+    if !source_size.x.is_finite()
+        || !source_size.y.is_finite()
+        || source_size.x <= 0.0
+        || source_size.y <= 0.0
+    {
+        return None;
+    }
+    let (panel_rect, header_rect, canvas_rect) =
+        fs_navigator_panel_rect(host_rect, requested_size, corner)?;
+    let content_rect = fit_display_size_in_rect(canvas_rect, source_size);
+    let outline_segments =
+        panorama_navigator_outline_segments(content_rect, viewport_rect, yaw, pitch, fov_y);
+    // Unlike a flat page, even FOV_MAX cannot show the whole sphere at once.
+    // Once the user enables the navigator, panorama mode therefore never
+    // applies the flat layout's whole-image auto-hide rule.
+    Some(PanoramaNavigatorLayout {
+        panel_rect,
+        header_rect,
+        canvas_rect,
+        content_rect,
+        outline_segments,
     })
 }
 
@@ -14084,7 +14245,6 @@ impl App {
     /// ホイールとクリックを処理し、(page_nav, close) を返す。
     fn fs_navigator_allowed(&self, fs_idx: usize) -> bool {
         self.settings.fullscreen_navigator_visible
-            && !self.is_panorama_mode_active(fs_idx)
             && !self.analysis_mode
             && !self.adjustment_mode
             && !self.is_overlay_edit_mode_active()
@@ -14106,6 +14266,25 @@ impl App {
             image_rect,
             self.settings.fullscreen_navigator_size,
             self.settings.fullscreen_navigator_corner,
+        )
+    }
+
+    fn panorama_navigator_layout(
+        &self,
+        image_rect: egui::Rect,
+        fs_idx: usize,
+    ) -> Option<PanoramaNavigatorLayout> {
+        let pano = self.panorama_state.as_ref()?;
+        let (source_w, source_h) = self.source_dims_for_idx(fs_idx)?;
+        build_panorama_navigator_layout(
+            egui::vec2(source_w, source_h),
+            image_rect,
+            image_rect,
+            self.settings.fullscreen_navigator_size,
+            self.settings.fullscreen_navigator_corner,
+            pano.yaw,
+            pano.pitch,
+            pano.fov_y,
         )
     }
 
@@ -14196,6 +14375,241 @@ impl App {
         true
     }
 
+    fn handle_panorama_navigator_input(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        fs_idx: usize,
+    ) -> bool {
+        let Some(layout) = self.panorama_navigator_layout(image_rect, fs_idx) else {
+            ctx.data_mut(|data| {
+                data.remove_temp::<PanoramaNavigatorInteraction>(
+                    panorama_navigator_interaction_id(),
+                )
+            });
+            return false;
+        };
+        let interaction = ctx.data(|data| {
+            data.get_temp::<PanoramaNavigatorInteraction>(panorama_navigator_interaction_id())
+        });
+        let pointer_pos = ctx.input(|input| input.pointer.interact_pos());
+        let drag_active = matches!(
+            interaction,
+            Some(
+                PanoramaNavigatorInteraction::Select { .. }
+                    | PanoramaNavigatorInteraction::Pan { .. }
+            )
+        );
+        if !drag_active && !pointer_pos.is_some_and(|pos| layout.panel_rect.contains(pos)) {
+            return false;
+        }
+
+        let wheel_y = ctx.input(|input| input.raw_scroll_delta.y);
+        if wheel_y.abs() > 0.5 && pointer_pos.is_some_and(|pos| layout.panel_rect.contains(pos)) {
+            let old_size = self.settings.fullscreen_navigator_size;
+            self.settings.fullscreen_navigator_size = (old_size
+                + wheel_y.signum() * FS_NAVIGATOR_WHEEL_STEP)
+                .clamp(FULLSCREEN_NAVIGATOR_SIZE_MIN, FULLSCREEN_NAVIGATOR_SIZE_MAX);
+            if self.settings.fullscreen_navigator_size != old_size {
+                self.settings.save();
+                ctx.request_repaint();
+            }
+            ctx.input_mut(|input| {
+                input.raw_scroll_delta = egui::Vec2::ZERO;
+                input.smooth_scroll_delta = egui::Vec2::ZERO;
+                input
+                    .events
+                    .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
+            });
+        }
+
+        for (index, &corner) in FullscreenNavigatorCorner::ALL.iter().enumerate() {
+            let rect = fs_navigator_corner_button_rect(layout.header_rect, index);
+            let tooltip = match corner {
+                FullscreenNavigatorCorner::TopLeft => "左上に移動",
+                FullscreenNavigatorCorner::TopRight => "右上に移動",
+                FullscreenNavigatorCorner::BottomLeft => "左下に移動",
+                FullscreenNavigatorCorner::BottomRight => "右下に移動",
+                FullscreenNavigatorCorner::Unknown => unreachable!("known navigator corner"),
+            };
+            if ui
+                .interact(
+                    rect,
+                    egui::Id::new("panorama_navigator_corner").with(index),
+                    egui::Sense::click(),
+                )
+                .on_hover_text(tooltip)
+                .clicked()
+            {
+                self.settings.fullscreen_navigator_corner = corner;
+                self.settings.save();
+                ctx.request_repaint();
+                return true;
+            }
+        }
+
+        let response = ui
+            .interact(
+                layout.canvas_rect,
+                egui::Id::new("panorama_navigator_canvas"),
+                egui::Sense::click_and_drag(),
+            )
+            .on_hover_text(
+                "左ドラッグ: 範囲を拡大 / 右ドラッグ: 表示位置を移動 / ダブルクリック: 中央へ移動 / ホイール: サイズ変更",
+            );
+        let clamp_to_canvas = |pos: egui::Pos2| {
+            egui::pos2(
+                pos.x
+                    .clamp(layout.canvas_rect.left(), layout.canvas_rect.right()),
+                pos.y
+                    .clamp(layout.canvas_rect.top(), layout.canvas_rect.bottom()),
+            )
+        };
+        let pointer_pos = pointer_pos.map(clamp_to_canvas);
+        let (
+            primary_pressed,
+            primary_down,
+            primary_released,
+            secondary_pressed,
+            secondary_down,
+            secondary_released,
+        ) = ctx.input(|input| {
+            (
+                input.pointer.button_pressed(egui::PointerButton::Primary),
+                input.pointer.button_down(egui::PointerButton::Primary),
+                input.pointer.button_released(egui::PointerButton::Primary),
+                input.pointer.button_pressed(egui::PointerButton::Secondary),
+                input.pointer.button_down(egui::PointerButton::Secondary),
+                input
+                    .pointer
+                    .button_released(egui::PointerButton::Secondary),
+            )
+        });
+
+        if response.double_clicked()
+            && let Some(pos) = pointer_pos
+        {
+            let uv = panorama_navigator_screen_to_uv(layout.content_rect, pos);
+            let (yaw, pitch) = panorama_navigator_uv_to_yaw_pitch(uv);
+            if let Some(pano) = self.panorama_state.as_mut() {
+                pano.yaw = yaw;
+                pano.pitch = pitch;
+                pano.sanitize();
+            }
+            ctx.data_mut(|data| {
+                data.remove_temp::<PanoramaNavigatorInteraction>(
+                    panorama_navigator_interaction_id(),
+                )
+            });
+            ctx.request_repaint();
+            return true;
+        }
+
+        if primary_pressed
+            && let Some(pos) = pointer_pos
+            && layout.canvas_rect.contains(pos)
+        {
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    panorama_navigator_interaction_id(),
+                    PanoramaNavigatorInteraction::Select {
+                        start: pos,
+                        current: pos,
+                    },
+                )
+            });
+        } else if primary_down
+            && let Some(pos) = pointer_pos
+            && let Some(PanoramaNavigatorInteraction::Select { start, .. }) = interaction
+        {
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    panorama_navigator_interaction_id(),
+                    PanoramaNavigatorInteraction::Select {
+                        start,
+                        current: pos,
+                    },
+                )
+            });
+            ctx.request_repaint();
+        }
+
+        if primary_released
+            && let Some(PanoramaNavigatorInteraction::Select { start, current }) = interaction
+        {
+            let selection = egui::Rect::from_two_pos(start, current).intersect(layout.content_rect);
+            if selection.width() >= FS_NAVIGATOR_MIN_SELECTION
+                && selection.height() >= FS_NAVIGATOR_MIN_SELECTION
+            {
+                let uv = panorama_navigator_screen_to_uv(layout.content_rect, selection.center());
+                let (yaw, pitch) = panorama_navigator_uv_to_yaw_pitch(uv);
+                let fov_y = panorama_navigator_fov_from_height(
+                    selection.height(),
+                    layout.content_rect.height(),
+                );
+                if let Some(pano) = self.panorama_state.as_mut() {
+                    pano.yaw = yaw;
+                    pano.pitch = pitch;
+                    pano.fov_y = fov_y;
+                    pano.sanitize();
+                }
+                ctx.request_repaint();
+            }
+            ctx.data_mut(|data| {
+                data.remove_temp::<PanoramaNavigatorInteraction>(
+                    panorama_navigator_interaction_id(),
+                )
+            });
+        }
+
+        if secondary_pressed
+            && let Some(pos) = pointer_pos
+            && layout.canvas_rect.contains(pos)
+            && let Some(pano) = self.panorama_state.as_ref()
+        {
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    panorama_navigator_interaction_id(),
+                    PanoramaNavigatorInteraction::Pan {
+                        start_uv: panorama_navigator_screen_to_uv(layout.content_rect, pos),
+                        start_yaw: pano.yaw,
+                        start_pitch: pano.pitch,
+                    },
+                )
+            });
+        } else if secondary_down
+            && let Some(pos) = pointer_pos
+            && let Some(PanoramaNavigatorInteraction::Pan {
+                start_uv,
+                start_yaw,
+                start_pitch,
+            }) = interaction
+        {
+            let current_uv = panorama_navigator_screen_to_uv(layout.content_rect, pos);
+            let delta_uv = current_uv - start_uv;
+            if let Some(pano) = self.panorama_state.as_mut() {
+                pano.yaw =
+                    panorama_navigator_wrap_yaw(start_yaw - delta_uv.x * std::f32::consts::TAU);
+                pano.pitch = (start_pitch - delta_uv.y * std::f32::consts::PI)
+                    .clamp(-crate::panorama::PITCH_LIMIT, crate::panorama::PITCH_LIMIT);
+                pano.sanitize();
+            }
+            ctx.request_repaint();
+        }
+        if secondary_released
+            && matches!(interaction, Some(PanoramaNavigatorInteraction::Pan { .. }))
+        {
+            ctx.data_mut(|data| {
+                data.remove_temp::<PanoramaNavigatorInteraction>(
+                    panorama_navigator_interaction_id(),
+                )
+            });
+        }
+
+        true
+    }
+
     fn handle_fs_navigator_input(
         &mut self,
         ui: &mut egui::Ui,
@@ -14205,10 +14619,22 @@ impl App {
     ) -> bool {
         if !self.fs_navigator_allowed(fs_idx) {
             ctx.data_mut(|data| {
-                data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
+                data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id());
+                data.remove_temp::<PanoramaNavigatorInteraction>(
+                    panorama_navigator_interaction_id(),
+                );
             });
             return false;
         }
+        if self.is_panorama_mode_active(fs_idx) {
+            ctx.data_mut(|data| {
+                data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
+            });
+            return self.handle_panorama_navigator_input(ui, ctx, image_rect, fs_idx);
+        }
+        ctx.data_mut(|data| {
+            data.remove_temp::<PanoramaNavigatorInteraction>(panorama_navigator_interaction_id())
+        });
         let Some(layout) = self.fs_navigator_layout(image_rect) else {
             ctx.data_mut(|data| {
                 data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
@@ -14472,6 +14898,136 @@ impl App {
         true
     }
 
+    fn draw_panorama_navigator(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        fs_idx: usize,
+    ) {
+        let Some(layout) = self.panorama_navigator_layout(image_rect, fs_idx) else {
+            return;
+        };
+        let interaction = ctx.data(|data| {
+            data.get_temp::<PanoramaNavigatorInteraction>(panorama_navigator_interaction_id())
+        });
+
+        let painter = ui.painter();
+        painter.rect_filled(
+            layout.panel_rect,
+            5.0,
+            egui::Color32::from_rgba_unmultiplied(16, 18, 22, 232),
+        );
+        painter.rect_filled(
+            layout.header_rect,
+            5.0,
+            egui::Color32::from_rgba_unmultiplied(34, 38, 46, 245),
+        );
+        painter.text(
+            layout.header_rect.left_center() + egui::vec2(8.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            "ナビゲータ",
+            egui::FontId::proportional(12.0),
+            egui::Color32::WHITE,
+        );
+        for (index, &corner) in FullscreenNavigatorCorner::ALL.iter().enumerate() {
+            let button = fs_navigator_corner_button_rect(layout.header_rect, index);
+            let selected = corner == self.settings.fullscreen_navigator_corner.normalized();
+            painter.rect_filled(
+                button,
+                2.0,
+                if selected {
+                    egui::Color32::from_rgb(64, 112, 172)
+                } else {
+                    egui::Color32::from_gray(54)
+                },
+            );
+            painter.rect_stroke(
+                button,
+                2.0,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(142)),
+                egui::StrokeKind::Inside,
+            );
+            let marker_center = match corner {
+                FullscreenNavigatorCorner::TopLeft => button.left_top() + egui::vec2(4.0, 4.0),
+                FullscreenNavigatorCorner::TopRight => button.right_top() + egui::vec2(-4.0, 4.0),
+                FullscreenNavigatorCorner::BottomLeft => {
+                    button.left_bottom() + egui::vec2(4.0, -4.0)
+                }
+                FullscreenNavigatorCorner::BottomRight => {
+                    button.right_bottom() + egui::vec2(-4.0, -4.0)
+                }
+                FullscreenNavigatorCorner::Unknown => unreachable!("known navigator corner"),
+            };
+            painter.circle_filled(marker_center, 2.0, egui::Color32::WHITE);
+        }
+
+        let canvas_painter = painter.with_clip_rect(layout.canvas_rect);
+        canvas_painter.rect_filled(layout.canvas_rect, 0.0, egui::Color32::BLACK);
+        if let Some(ThumbnailState::Loaded { tex, .. }) = self.thumbnails.get(fs_idx) {
+            canvas_painter.image(
+                tex.id(),
+                layout.content_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            canvas_painter.rect_filled(layout.content_rect, 0.0, egui::Color32::from_gray(42));
+        }
+        canvas_painter.rect_stroke(
+            layout.content_rect,
+            0.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(96)),
+            egui::StrokeKind::Inside,
+        );
+        for segment in &layout.outline_segments {
+            canvas_painter.add(egui::Shape::line(
+                segment.clone(),
+                egui::Stroke::new(4.0, egui::Color32::from_black_alpha(220)),
+            ));
+        }
+        for segment in &layout.outline_segments {
+            canvas_painter.add(egui::Shape::line(
+                segment.clone(),
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 218, 76)),
+            ));
+        }
+        if let Some(PanoramaNavigatorInteraction::Select { start, current }) = interaction {
+            let selection = egui::Rect::from_two_pos(start, current).intersect(layout.content_rect);
+            canvas_painter.rect_filled(
+                selection,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(70, 135, 210, 54),
+            );
+            canvas_painter.rect_stroke(
+                selection,
+                0.0,
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(110, 184, 255)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        painter.rect_stroke(
+            layout.panel_rect,
+            5.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(126)),
+            egui::StrokeKind::Inside,
+        );
+
+        if ctx.input(|input| {
+            input
+                .pointer
+                .hover_pos()
+                .is_some_and(|pos| layout.canvas_rect.contains(pos))
+        }) {
+            let secondary_down = ctx.input(|input| input.pointer.secondary_down());
+            ctx.set_cursor_icon(if secondary_down {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Crosshair
+            });
+        }
+    }
+
     fn draw_fs_navigator(
         &mut self,
         ui: &mut egui::Ui,
@@ -14480,6 +15036,10 @@ impl App {
         fs_idx: usize,
     ) {
         if !self.fs_navigator_allowed(fs_idx) {
+            return;
+        }
+        if self.is_panorama_mode_active(fs_idx) {
+            self.draw_panorama_navigator(ui, ctx, image_rect, fs_idx);
             return;
         }
         let Some(layout) = self.fs_navigator_layout(image_rect) else {
@@ -26579,6 +27139,74 @@ mod tests {
 
         assert!((visible.center().x - target_uv.x).abs() < 1.0e-4);
         assert!((visible.center().y - target_uv.y).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn panorama_navigator_outline_splits_only_at_equirect_seam() {
+        let content = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0));
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let away_from_seam = panorama_navigator_outline_segments(content, viewport, 0.0, 0.0, 0.8);
+        let across_seam = panorama_navigator_outline_segments(
+            content,
+            viewport,
+            std::f32::consts::PI - 0.05,
+            0.0,
+            0.8,
+        );
+
+        assert_eq!(away_from_seam.len(), 1);
+        assert!(across_seam.len() > 1);
+    }
+
+    #[test]
+    fn panorama_navigator_click_uv_round_trips_yaw_and_pitch() {
+        let expected_yaw = 0.73;
+        let expected_pitch = -0.41;
+        let (u, v) = crate::panorama::ndc_to_equirect_uv(
+            0.0,
+            0.0,
+            16.0 / 9.0,
+            (1.2_f32 * 0.5).tan(),
+            expected_yaw,
+            expected_pitch,
+        );
+        let (actual_yaw, actual_pitch) = panorama_navigator_uv_to_yaw_pitch(egui::pos2(u, v));
+
+        assert!((actual_yaw - expected_yaw).abs() < 1.0e-4);
+        assert!((actual_pitch - expected_pitch).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn panorama_navigator_selection_height_clamps_fov() {
+        let content_height = 200.0;
+        assert_eq!(
+            panorama_navigator_fov_from_height(0.0, content_height),
+            crate::panorama::FOV_MIN
+        );
+        assert_eq!(
+            panorama_navigator_fov_from_height(content_height, content_height),
+            crate::panorama::FOV_MAX
+        );
+        let middle = panorama_navigator_fov_from_height(50.0, content_height);
+        assert!((crate::panorama::FOV_MIN..=crate::panorama::FOV_MAX).contains(&middle));
+        assert!((middle - std::f32::consts::FRAC_PI_4).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn panorama_navigator_remains_visible_at_max_fov() {
+        let host = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let layout = build_panorama_navigator_layout(
+            egui::vec2(4000.0, 2000.0),
+            host,
+            host,
+            260.0,
+            FullscreenNavigatorCorner::BottomRight,
+            0.0,
+            0.0,
+            crate::panorama::FOV_MAX,
+        );
+
+        assert!(layout.is_some());
     }
 
     #[test]

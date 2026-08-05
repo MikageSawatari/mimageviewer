@@ -957,8 +957,14 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 `pan_to_center_source_normalized` で倍率を変えずに画面中央へ置く `fs_pan` を求める。
 このためフィット、表示トリム、90度回転、見開きの配置をナビゲータ側で再計算しない。
 縮小画像は既存のサムネイルカタログを使い、UI スレッドで画像読み込みやデコードを行わない。
-`FullscreenPageLayoutKind::Continuous` は全体図が極端に細長くなるため対象外とし、
-360度パノラマも平面とは輪郭計算が異なるため現段階では対象外とする。
+360度パノラマでは `FullscreenPageLayout` を使わず、equirect の元画像をレターボックス表示する。
+現在範囲は viewport の NDC 外周を `panorama::ndc_to_equirect_uv` へ通した折れ線とし、
+`aspect = viewport_w / viewport_h` と `tan_half = tan(fov_y / 2)` は `panorama_wgpu` と同じ導出を使う。
+yaw の継ぎ目では隣接点の U 差が 0.5 を超える線分を分割する。クリック / ドラッグは
+`PanoramaState` の yaw / pitch / fov_y だけを更新し、GPU 描画経路には介入しない。
+平面は全体が見えると自動非表示になるが、パノラマは `FOV_MAX` でも全球を表示できないため
+設定が ON の間は常に表示する。`FullscreenPageLayoutKind::Continuous` は全体図が極端に
+細長くなるため引き続き対象外とする。
 
 ### 2.4.1 フルスクリーン静止画の GPU Lanczos3 縮小・標準拡大と選択式拡大
 
