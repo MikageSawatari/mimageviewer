@@ -1235,14 +1235,27 @@ enabled 行も、新仕様では該当ページを表示した時点で自動適
 `Auto` は「モード」だけ保存し、検出 bbox は保存しない。スライダードラッグ中はメモリだけ更新し、
 マウスを離したフレームで本設定と表示中ページの個別値をまとめて SQLite へ書き込む。
 
-mIV Remote のページ描画は protocol v28 で現在の container address と画面上の
-`single / spread_left / spread_right` を Page 要求へ添え、本体と同じ本キー・ページキー・
+mIV Remote のページ描画は protocol v29 で現在の container address、画面上の
+`single / spread_left / spread_right`、見開き相手 address を Page 要求へ添え、本体と同じ本キー・ページキー・
 左右 semantics で `None` / `Book` / enabled な `Page` を解決する。remote 側の
 `ViewTrimDb` は既存 `view_trim.db` を `SQLITE_OPEN_READ_ONLY` だけで開き、DB が無い場合も
 作成・DDL・migration は行わない。表示 crop は committed な最終合成（加工用 crop を含む）の
 後、端末用 resize / JPEG encode の直前だけに適用するため、補正 / AI の materialized pixels と
-その cache は表示トリム前のまま保持する。`Auto` の画素走査と見開き調停は段 2b-2b の範囲で、
-現段階の remote では crop しない。端末からのモード変更も別段とし、remote は設定を書き込まない。
+その cache は表示トリム前のまま保持する。`Auto` は本体と同じく補正前の raw raster を
+`detect_content_bbox` へ通す。見開き request は自ページの bbox を先に小さな LRU へ公開し、
+相手 bbox が未検出なら相手 request を待たず、同じ worker / cancel token で相手 raw raster だけを
+復号する。これにより heavy worker が 1 本でも deadlock せず、2 本なら並行 request が互いの結果を
+再利用できる。LRU key は `page_key + source mtime/size + target_px` で、補正・AI・表示トリム設定を
+含めない。本体の `(load_seq, pixels_ptr)` と owner / 無効化条件は同一ではなく、remote は既存の
+decode / composite cache と同じ source stamp または decode 上限が変わった時に再検出する。同一 size / mtime
+を保った source 差し替えは既存 remote cache と同じ制約を持つ。端末からのモード変更は別段とし、remote は
+設定を書き込まない。
+
+本体側だけで表示トリム設定を変更した直後は、端末の `PageResourceCache` と HTTP の
+`private, max-age=60` が既存 JPEG を返し得る。この既存制約は Auto でも同じで、response cache hit
+では IPC と bbox 検出自体が走らない。IPC まで到達した要求は最新の read-only DB 状態を読み、raw bbox
+LRU は設定値を保持しないため stale 期間を延長しない。即時反映には、本体の設定 revision を remote / SPA
+へ通知して page render revision を進める別の無効化経路が必要になる。
 
 Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread_pair` で左右の idx と配置
 (LTR/RTL/Cover) を決め、両ページを「1 枚の合成画像」とみなしてレイアウトする。

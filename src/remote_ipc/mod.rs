@@ -1,6 +1,7 @@
 mod ai_job;
 mod collections;
 mod container;
+mod live_favorites;
 mod path_guard;
 mod service;
 mod thumbnail;

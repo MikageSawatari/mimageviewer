@@ -68,6 +68,55 @@ export const ReadingDirection = Object.freeze({
   RTL: "rtl",
 });
 
+export function remoteStateGenerationTransition(current, observed) {
+  const previous = String(current ?? "");
+  const generation = String(observed ?? "");
+  if (!generation) {
+    return { generation: previous, changed: false, initialized: Boolean(previous) };
+  }
+  const previousSeparator = previous.lastIndexOf("-");
+  const generationSeparator = generation.lastIndexOf("-");
+  if (
+    previousSeparator > 0 &&
+    generationSeparator > 0 &&
+    previous.slice(0, previousSeparator) === generation.slice(0, generationSeparator)
+  ) {
+    const previousCounter = Number(previous.slice(previousSeparator + 1));
+    const generationCounter = Number(generation.slice(generationSeparator + 1));
+    if (
+      Number.isSafeInteger(previousCounter) &&
+      Number.isSafeInteger(generationCounter) &&
+      generationCounter < previousCounter
+    ) {
+      return { generation: previous, changed: false, initialized: true };
+    }
+  }
+  return {
+    generation,
+    changed: Boolean(previous) && previous !== generation,
+    initialized: true,
+  };
+}
+
+export function pageResponseGenerationAttestation(requestedGeneration, responseGeneration) {
+  const requested = String(requestedGeneration ?? "");
+  const observed = String(responseGeneration ?? "");
+  return {
+    requested,
+    observed,
+    matches: Boolean(requested) && requested === observed,
+  };
+}
+
+export function viewerPageGroupGenerationSnapshot(generation, pageCount) {
+  const value = String(generation ?? "");
+  const count = Math.max(0, Math.floor(Number(pageCount) || 0));
+  return {
+    generation: value,
+    pages: Array.from({ length: count }, () => value),
+  };
+}
+
 export const ViewerGesture = Object.freeze({
   TAP: "tap",
   SWIPE_LEFT: "swipe_left",
@@ -545,6 +594,13 @@ export function viewerPageDisplaySlot(pageCount, pageIndex) {
   return index === 0 ? "spread_left" : "spread_right";
 }
 
+export function viewerSpreadPartnerIndex(pageCount, pageIndex) {
+  const count = Math.max(0, Math.floor(Number(pageCount) || 0));
+  const index = Math.floor(Number(pageIndex));
+  if (count !== 2 || (index !== 0 && index !== 1)) return null;
+  return index === 0 ? 1 : 0;
+}
+
 export function viewerBoundaryMessage({
   currentIndex,
   count,
@@ -945,14 +1001,43 @@ export function adjustmentResetVisible({
   return Math.abs(current - baseline) > Math.max(0, Number(epsilon) || 0);
 }
 
-export function viewerSeekGroupIndex(physicalValue, groupCount, rtl = false) {
+export function viewerSeekGroupIndex(controlValue, groupCount) {
   const count = Math.max(0, Math.floor(Number(groupCount) || 0));
   if (!count) return -1;
-  const physicalIndex = Math.max(
+  return Math.max(
     0,
-    Math.min(count - 1, Math.round(Number(physicalValue) || 0))
+    Math.min(count - 1, Math.round(Number(controlValue) || 0))
   );
-  return rtl ? count - 1 - physicalIndex : physicalIndex;
+}
+
+/// Maps relative horizontal travel to the seek range's logical group index.
+/// The native range and pointer drag share ReadingDirection, so RTL geometry is
+/// decided in one place while logical indexes continue to increase in book order.
+export function viewerSeekRelativeDragValue({
+  startGroupIndex,
+  startClientX,
+  currentClientX,
+  trackWidth,
+  groupCount,
+  direction = ReadingDirection.LTR,
+}) {
+  const count = Math.max(0, Math.floor(Number(groupCount) || 0));
+  if (!count) return -1;
+  const startX = Number(startClientX);
+  const currentX = Number(currentClientX);
+  const physicalDelta = currentX - startX;
+  const logicalDelta = direction === ReadingDirection.RTL
+    ? -physicalDelta
+    : physicalDelta;
+  return viewerSeekGroupIndex(relativeRangeDragValue({
+    startValue: startGroupIndex,
+    startClientX: startX,
+    currentClientX: startX + logicalDelta,
+    trackWidth,
+    min: 0,
+    max: count - 1,
+    step: 1,
+  }), count);
 }
 
 export function viewerSeekState({
@@ -970,6 +1055,7 @@ export function viewerSeekState({
       max: 0,
       value: 0,
       groupIndex: -1,
+      direction: rtl ? ReadingDirection.RTL : ReadingDirection.LTR,
       label: total ? `1 / ${total}` : "0 / 0",
     };
   }
@@ -993,8 +1079,9 @@ export function viewerSeekState({
     visible: total > 1,
     min: 0,
     max: groups.length - 1,
-    value: rtl ? groups.length - 1 - groupIndex : groupIndex,
+    value: groupIndex,
     groupIndex,
+    direction: rtl ? ReadingDirection.RTL : ReadingDirection.LTR,
     label: `${pageLabel || groupIndex + 1} / ${total}`,
   };
 }

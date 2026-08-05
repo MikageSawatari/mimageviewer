@@ -88,6 +88,7 @@ const imageFetch = async () => new Response(new Blob([new Uint8Array([1, 2, 3])]
     "X-mIV-Request-Id": "runtime-test",
     "X-mIV-Image-Width": "1200",
     "X-mIV-Image-Height": "1800",
+    "X-mIV-Remote-State-Generation": "test-1",
   },
 });
 globalThis.fetch = imageFetch;
@@ -108,6 +109,7 @@ const {
   normalizeRemoteColorizeParams,
   parentContainerAddress,
   reloadApplication,
+  remoteAiCompletionMessage,
   remoteAiProgressText,
   remoteAiPollingDelay,
   remoteBookBookmarkDisplayPage,
@@ -469,6 +471,21 @@ test("AI polling stops in background and uses the agreed foreground backoff", ()
   );
 });
 
+test("automatic AI completion stays silent only when every page is not applicable", () => {
+  assert.equal(remoteAiCompletionMessage({
+    readyCount: 0,
+    notApplicableCount: 1,
+  }), null);
+  assert.equal(remoteAiCompletionMessage({
+    readyCount: 1,
+    notApplicableCount: 0,
+  }), "AI 処理が完了しました。");
+  assert.equal(remoteAiCompletionMessage({
+    readyCount: 1,
+    notApplicableCount: 1,
+  }), "AI 処理が完了しました。一部のページは元の表示です。");
+});
+
 test("remote colorize normalization preserves custom points and clamps desktop ranges", () => {
   const colorize = normalizeRemoteColorizeParams({
     mode: "monochrome_only",
@@ -554,6 +571,44 @@ test("tapping a video grid tile preserves the video route", () => {
   assert.equal(resolveMediaOpenRoute("video", { kind: "image", address }, 0), null);
 });
 
+test("image viewer applies seek direction to the native range control", () => {
+  const seekInput = new FakeElement("input");
+  const viewer = new ImageViewer({
+    root: new FakeElement("section"),
+    stage: new FakeElement("div"),
+    image: new FakeElement("img"),
+    title: new FakeElement("div"),
+    counter: new FakeElement("output"),
+    seek: new FakeElement("div"),
+    seekInput,
+    previous: new FakeElement("button"),
+    next: new FakeElement("button"),
+    loadingIndicator: new FakeElement("div"),
+  });
+
+  viewer.setSeekState({
+    visible: true,
+    min: 0,
+    max: 2,
+    value: 0,
+    direction: "rtl",
+    label: "1 / 3",
+  });
+  assert.equal(seekInput.dir, "rtl");
+  assert.equal(seekInput.value, "0");
+
+  viewer.setSeekState({
+    visible: true,
+    min: 0,
+    max: 2,
+    value: 2,
+    direction: "ltr",
+    label: "3 / 3",
+  });
+  assert.equal(seekInput.dir, "ltr");
+  assert.equal(seekInput.value, "2");
+});
+
 test("viewer load executes fetch, decode, layout and atomic replacement", async () => {
   const stage = new FakeElement("div");
   const initialImage = new FakeElement("img");
@@ -574,6 +629,7 @@ test("viewer load executes fetch, decode, layout and atomic replacement", async 
     request: {
       url: "/api/page?test=1",
       cacheKey: "page-1@1800",
+      remoteStateGeneration: "test-1",
       width: 1800,
       cssWidth: 430,
       dpr: 2,
@@ -619,6 +675,58 @@ test("viewer load executes fetch, decode, layout and atomic replacement", async 
   viewer.destroy();
 });
 
+test("viewer refuses a page response without a generation attestation", async () => {
+  const initialImage = new FakeElement("img");
+  const title = new FakeElement("div");
+  const viewer = new ImageViewer({
+    root: new FakeElement("section"),
+    stage: new FakeElement("div"),
+    image: initialImage,
+    title,
+    counter: new FakeElement("span"),
+    previous: new FakeElement("button"),
+    next: new FakeElement("button"),
+    loadingIndicator: new FakeElement("div"),
+  });
+  globalThis.fetch = async () => new Response(new Blob([new Uint8Array([1, 2, 3])]), {
+    status: 200,
+    headers: {
+      "Content-Type": "image/jpeg",
+      "X-mIV-Image-Width": "1200",
+      "X-mIV-Image-Height": "1800",
+    },
+  });
+  try {
+    const displayed = await viewer.load({
+      name: "Unattested page",
+      request: {
+        url: "/api/page?test=unattested",
+        cacheKey: "page-unattested@1800",
+        remoteStateGeneration: "test-1",
+        width: 1800,
+        cssWidth: 430,
+        dpr: 2,
+        layout: { cssWidth: 430 },
+        fitMode: "page",
+        dynamicInfo: true,
+        infoCacheKey: "page-unattested",
+        containerInfoKey: "book-1",
+      },
+      info: { width: 1200, height: 1800 },
+      fitMode: "page",
+      index: 0,
+      count: 1,
+      interactionStartedAt: performance.now(),
+    });
+    assert.equal(displayed, false);
+    assert.equal(viewer.pageLayer.children[0], initialImage);
+    assert.match(title.textContent, /状態版/);
+  } finally {
+    globalThis.fetch = imageFetch;
+    viewer.destroy();
+  }
+});
+
 test("spread waits for both pages and atomically replaces the page layer", async () => {
   const stage = new FakeElement("div");
   stage.clientWidth = 1600;
@@ -643,6 +751,7 @@ test("spread waits for both pages and atomically replaces the page layer", async
     request: {
       url: `/api/page?test=${number}`,
       cacheKey: `page-${number}@1334`,
+      remoteStateGeneration: "test-1",
       width: 1334,
       cssWidth: 667,
       dpr: 2,

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use image::GenericImageView;
@@ -18,7 +19,9 @@ const IMAGE_WEBP_QUALITY: f32 = 82.0;
 #[derive(Debug)]
 pub enum StoreError {
     BadRequest,
+    Busy,
     NotFound,
+    StaleGeneration(String),
     Io(std::io::Error),
     Db(rusqlite::Error),
     Decode,
@@ -45,7 +48,7 @@ impl From<ResolveError> for StoreError {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct FavoriteRoot {
     id: Uuid,
     name: String,
@@ -55,6 +58,12 @@ struct FavoriteRoot {
 #[derive(Serialize)]
 pub struct FavoritesResponse {
     favorites: Vec<FavoriteSummary>,
+    remote_state_generation: String,
+}
+
+#[derive(Serialize)]
+pub struct RemoteStateResponse {
+    pub remote_state_generation: String,
 }
 
 #[derive(Serialize)]
@@ -101,70 +110,96 @@ pub struct ImageMetrics {
     pub passthrough: bool,
 }
 
-pub struct Library {
+#[derive(Clone)]
+struct LibrarySnapshot {
     favorites: Vec<FavoriteRoot>,
     by_id: HashMap<Uuid, usize>,
+}
+
+struct ObservedDatabase {
+    connection: Connection,
+    data_version: i64,
+}
+
+struct LibraryState {
+    snapshot: Arc<LibrarySnapshot>,
+    settings: Option<ObservedDatabase>,
+    view_trim: Option<ObservedDatabase>,
+    generation_counter: u64,
+    generation: String,
+}
+
+pub struct Library {
+    state: Mutex<LibraryState>,
+    generation_prefix: String,
+    settings_path: Option<PathBuf>,
+    view_trim_path: Option<PathBuf>,
 }
 
 impl Library {
     #[cfg(test)]
     pub fn empty_for_test(_cache_dir: PathBuf) -> Self {
-        Self {
-            favorites: Vec::new(),
-            by_id: HashMap::new(),
-        }
+        Self::from_test_favorites(Vec::new())
     }
 
     #[cfg(test)]
     pub fn with_favorite_for_test(id: Uuid, path: PathBuf) -> Self {
+        Self::from_test_favorites(vec![FavoriteRoot {
+            id,
+            name: "Fixture".to_owned(),
+            path,
+        }])
+    }
+
+    #[cfg(test)]
+    fn from_test_favorites(favorites: Vec<FavoriteRoot>) -> Self {
+        let prefix = "test".to_owned();
         Self {
-            favorites: vec![FavoriteRoot {
-                id,
-                name: "Fixture".to_owned(),
-                path,
-            }],
-            by_id: HashMap::from([(id, 0)]),
+            state: Mutex::new(LibraryState {
+                snapshot: Arc::new(library_snapshot(favorites)),
+                settings: None,
+                view_trim: None,
+                generation_counter: 1,
+                generation: format!("{prefix}-1"),
+            }),
+            generation_prefix: prefix,
+            settings_path: None,
+            view_trim_path: None,
         }
     }
 
     pub fn load(data_dir: &Path) -> Result<Self, StoreError> {
         let settings_path = data_dir.join("settings.db");
-        let conn = open_read_only(&settings_path)?;
-
-        let mut stmt = conn.prepare(
-            "SELECT id, name, path
-             FROM favorites
-             ORDER BY sort_index ASC",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            let id: Vec<u8> = row.get(0)?;
-            let name: String = row.get(1)?;
-            let path: String = row.get(2)?;
-            Ok((id, name, path))
+        let mut settings = open_observed_database(&settings_path)?.ok_or(StoreError::NotFound)?;
+        let (data_version, favorites) = read_stable_favorite_roots(&settings.connection)?;
+        settings.data_version = data_version;
+        let view_trim_path = data_dir.join("view_trim.db");
+        let view_trim = open_observed_database(&view_trim_path)?;
+        let mut generation_seed = [0_u8; 16];
+        getrandom::fill(&mut generation_seed).map_err(|error| {
+            StoreError::Io(std::io::Error::other(format!(
+                "remote state generation seed failed: {error}"
+            )))
         })?;
-
-        let mut favorites = Vec::new();
-        for row in rows {
-            let (id, name, path) = row?;
-            let id = Uuid::from_slice(&id).map_err(|_| StoreError::BadRequest)?;
-            favorites.push(FavoriteRoot {
-                id,
-                name,
-                path: PathBuf::from(path),
-            });
-        }
-        let by_id = favorites
-            .iter()
-            .enumerate()
-            .map(|(idx, favorite)| (favorite.id, idx))
-            .collect();
-
-        Ok(Self { favorites, by_id })
+        let generation_prefix = Uuid::from_bytes(generation_seed).simple().to_string();
+        Ok(Self {
+            state: Mutex::new(LibraryState {
+                snapshot: Arc::new(library_snapshot(favorites)),
+                settings: Some(settings),
+                view_trim,
+                generation_counter: 1,
+                generation: format!("{generation_prefix}-1"),
+            }),
+            generation_prefix,
+            settings_path: Some(settings_path),
+            view_trim_path: Some(view_trim_path),
+        })
     }
 
-    pub fn favorites(&self) -> FavoritesResponse {
-        FavoritesResponse {
-            favorites: self
+    pub fn favorites(&self) -> Result<FavoritesResponse, StoreError> {
+        let (snapshot, generation) = self.snapshot(false)?;
+        Ok(FavoritesResponse {
+            favorites: snapshot
                 .favorites
                 .iter()
                 .map(|favorite| FavoriteSummary {
@@ -172,17 +207,38 @@ impl Library {
                     name: favorite.name.clone(),
                 })
                 .collect(),
+            remote_state_generation: generation,
+        })
+    }
+
+    pub fn remote_state(&self) -> Result<RemoteStateResponse, StoreError> {
+        let (_, remote_state_generation) = self.snapshot(true)?;
+        Ok(RemoteStateResponse {
+            remote_state_generation,
+        })
+    }
+
+    pub fn require_remote_state_generation(&self, expected: &str) -> Result<String, StoreError> {
+        let (_, current) = self.snapshot(true)?;
+        if expected == current {
+            Ok(current)
+        } else {
+            Err(StoreError::StaleGeneration(current))
         }
     }
 
     /// 本体 IPC の応答にも remote-web 側の同じ allowlist を重ねる多重防御。
     /// UUID 不明、絶対 / traversal path、または junction による root 外脱出を除外する。
     pub fn retain_allowed_remote_entries(&self, entries: &mut Vec<RemoteEntry>) {
+        let Ok((snapshot, _)) = self.snapshot(false) else {
+            entries.clear();
+            return;
+        };
         entries.retain(|entry| {
             let Ok(id) = Uuid::parse_str(&entry.favorite_id) else {
                 return false;
             };
-            let Ok(favorite) = self.favorite(id) else {
+            let Some(favorite) = favorite_from_snapshot(&snapshot, id) else {
                 return false;
             };
             resolve_existing(&favorite.path, &entry.relative_path).is_ok()
@@ -191,25 +247,22 @@ impl Library {
 
     /// FolderList はセル本体とサムネイル出所の両方を外側の境界で再検証する。
     pub fn retain_allowed_folder_list_entries(&self, entries: &mut Vec<FolderListEntry>) {
+        let Ok((snapshot, _)) = self.snapshot(false) else {
+            entries.clear();
+            return;
+        };
         entries.retain(|entry| {
-            if self.validate_remote_address(&entry.address).is_err() {
+            if validate_remote_address_in(&snapshot, &entry.address).is_err() {
                 return false;
             }
             entry.thumbnail_address == entry.address
-                || self
-                    .validate_remote_address(&entry.thumbnail_address)
-                    .is_ok()
+                || validate_remote_address_in(&snapshot, &entry.thumbnail_address).is_ok()
         });
     }
 
     pub fn validate_remote_address(&self, address: &RemoteAddress) -> Result<(), StoreError> {
-        address
-            .validate_syntax()
-            .map_err(|_| StoreError::BadRequest)?;
-        let id = Uuid::parse_str(&address.favorite_id).map_err(|_| StoreError::BadRequest)?;
-        let favorite = self.favorite(id)?;
-        resolve_existing(&favorite.path, &address.relative_path)?;
-        Ok(())
+        let (snapshot, _) = self.snapshot(false)?;
+        validate_remote_address_in(&snapshot, address)
     }
 
     pub(crate) fn validate_remote_file_image(
@@ -257,7 +310,11 @@ impl Library {
     }
 
     pub fn retain_allowed_container_entries(&self, entries: &mut Vec<ContainerEntry>) {
-        entries.retain(|entry| self.validate_remote_address(&entry.address).is_ok());
+        let Ok((snapshot, _)) = self.snapshot(false) else {
+            entries.clear();
+            return;
+        };
+        entries.retain(|entry| validate_remote_address_in(&snapshot, &entry.address).is_ok());
     }
 
     pub fn image(
@@ -347,12 +404,164 @@ impl Library {
         Ok(ImageInfoResponse { width, height })
     }
 
-    fn favorite(&self, id: Uuid) -> Result<&FavoriteRoot, StoreError> {
-        self.by_id
-            .get(&id)
-            .and_then(|idx| self.favorites.get(*idx))
+    fn favorite(&self, id: Uuid) -> Result<FavoriteRoot, StoreError> {
+        let (snapshot, _) = self.snapshot(false)?;
+        favorite_from_snapshot(&snapshot, id)
+            .cloned()
             .ok_or(StoreError::NotFound)
     }
+
+    fn snapshot(
+        &self,
+        include_view_trim: bool,
+    ) -> Result<(Arc<LibrarySnapshot>, String), StoreError> {
+        let mut state = self.state.lock().map_err(|_| StoreError::BadRequest)?;
+        let mut changed = refresh_settings_snapshot(&mut state, self.settings_path.as_deref())?;
+        if include_view_trim {
+            changed |=
+                refresh_observed_database(&mut state.view_trim, self.view_trim_path.as_deref())?;
+        }
+        if changed {
+            state.generation_counter = state.generation_counter.saturating_add(1);
+            state.generation = format!("{}-{}", self.generation_prefix, state.generation_counter);
+        }
+        Ok((Arc::clone(&state.snapshot), state.generation.clone()))
+    }
+}
+
+fn library_snapshot(favorites: Vec<FavoriteRoot>) -> LibrarySnapshot {
+    let by_id = favorites
+        .iter()
+        .enumerate()
+        .map(|(idx, favorite)| (favorite.id, idx))
+        .collect();
+    LibrarySnapshot { favorites, by_id }
+}
+
+fn favorite_from_snapshot(snapshot: &LibrarySnapshot, id: Uuid) -> Option<&FavoriteRoot> {
+    snapshot
+        .by_id
+        .get(&id)
+        .and_then(|idx| snapshot.favorites.get(*idx))
+}
+
+fn validate_remote_address_in(
+    snapshot: &LibrarySnapshot,
+    address: &RemoteAddress,
+) -> Result<(), StoreError> {
+    address
+        .validate_syntax()
+        .map_err(|_| StoreError::BadRequest)?;
+    let id = Uuid::parse_str(&address.favorite_id).map_err(|_| StoreError::BadRequest)?;
+    let favorite = favorite_from_snapshot(snapshot, id).ok_or(StoreError::NotFound)?;
+    resolve_existing(&favorite.path, &address.relative_path)?;
+    Ok(())
+}
+
+fn refresh_settings_snapshot(
+    state: &mut LibraryState,
+    path: Option<&Path>,
+) -> Result<bool, StoreError> {
+    if state.settings.is_none() {
+        let Some(path) = path else {
+            return Ok(false);
+        };
+        state.settings = open_observed_database(path)?;
+        if state.settings.is_none() {
+            return Err(StoreError::NotFound);
+        }
+    }
+    let settings = state
+        .settings
+        .as_mut()
+        .expect("settings observer initialized");
+    let current = sqlite_data_version(&settings.connection)?;
+    if current == settings.data_version {
+        return Ok(false);
+    }
+    let (data_version, favorites) = read_stable_favorite_roots(&settings.connection)?;
+    settings.data_version = data_version;
+    if favorites == state.snapshot.favorites {
+        return Ok(false);
+    }
+    state.snapshot = Arc::new(library_snapshot(favorites));
+    Ok(true)
+}
+
+fn refresh_observed_database(
+    observed: &mut Option<ObservedDatabase>,
+    path: Option<&Path>,
+) -> Result<bool, StoreError> {
+    if let Some(database) = observed.as_mut() {
+        let current = sqlite_data_version(&database.connection)?;
+        if current == database.data_version {
+            return Ok(false);
+        }
+        database.data_version = current;
+        return Ok(true);
+    }
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    let opened = open_observed_database(path)?;
+    let changed = opened.is_some();
+    *observed = opened;
+    Ok(changed)
+}
+
+fn open_observed_database(path: &Path) -> Result<Option<ObservedDatabase>, StoreError> {
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let connection = open_read_only(path)?;
+    let data_version = sqlite_data_version(&connection)?;
+    Ok(Some(ObservedDatabase {
+        connection,
+        data_version,
+    }))
+}
+
+fn sqlite_data_version(connection: &Connection) -> rusqlite::Result<i64> {
+    connection.query_row("PRAGMA data_version", [], |row| row.get(0))
+}
+
+fn read_favorite_roots(connection: &Connection) -> Result<Vec<FavoriteRoot>, StoreError> {
+    let mut stmt = connection.prepare(
+        "SELECT id, name, path
+         FROM favorites
+         ORDER BY sort_index ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let id: Vec<u8> = row.get(0)?;
+        let name: String = row.get(1)?;
+        let path: String = row.get(2)?;
+        Ok((id, name, path))
+    })?;
+    let mut favorites = Vec::new();
+    for row in rows {
+        let (id, name, path) = row?;
+        let id = Uuid::from_slice(&id).map_err(|_| StoreError::BadRequest)?;
+        favorites.push(FavoriteRoot {
+            id,
+            name,
+            path: PathBuf::from(path),
+        });
+    }
+    Ok(favorites)
+}
+
+fn read_stable_favorite_roots(
+    connection: &Connection,
+) -> Result<(i64, Vec<FavoriteRoot>), StoreError> {
+    for _ in 0..3 {
+        let before = sqlite_data_version(connection)?;
+        let favorites = read_favorite_roots(connection)?;
+        let after = sqlite_data_version(connection)?;
+        if before == after {
+            return Ok((after, favorites));
+        }
+    }
+    Err(StoreError::Busy)
 }
 
 fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
@@ -476,15 +685,12 @@ mod tests {
     #[test]
     fn favorites_json_never_contains_configured_root_paths() {
         let id = Uuid::from_u128(0x1234567890abcdef1234567890abcdef);
-        let library = Library {
-            favorites: vec![FavoriteRoot {
-                id,
-                name: "Private library".to_owned(),
-                path: PathBuf::from("C:/Users/example/Private"),
-            }],
-            by_id: HashMap::from([(id, 0)]),
-        };
-        let json = serde_json::to_string(&library.favorites()).unwrap();
+        let library = Library::from_test_favorites(vec![FavoriteRoot {
+            id,
+            name: "Private library".to_owned(),
+            path: PathBuf::from("C:/Users/example/Private"),
+        }]);
+        let json = serde_json::to_string(&library.favorites().unwrap()).unwrap();
         assert!(json.contains(&id.to_string()));
         assert!(json.contains("Private library"));
         assert!(!json.contains("C:/"));
@@ -579,7 +785,7 @@ mod tests {
         let settings_before = std::fs::read(&settings_path).unwrap();
         let library = Library::load(&data_dir).unwrap();
 
-        let favorites_json = serde_json::to_string(&library.favorites()).unwrap();
+        let favorites_json = serde_json::to_string(&library.favorites().unwrap()).unwrap();
         assert!(favorites_json.contains("Fixture"));
         assert!(!favorites_json.contains(&favorite_root.to_string_lossy().to_string()));
         let traversal = RemoteAddress {
@@ -607,6 +813,162 @@ mod tests {
         assert_eq!(passthrough.metrics.webp_encode_ms, 0.0);
 
         assert_eq!(std::fs::read(&settings_path).unwrap(), settings_before);
+    }
+
+    #[test]
+    fn live_library_refreshes_add_rename_order_and_rejects_removed_favorites() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let first_root = temp.path().join("first");
+        let second_root = temp.path().join("second");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&first_root).unwrap();
+        std::fs::create_dir_all(&second_root).unwrap();
+        std::fs::write(first_root.join("page.jpg"), b"first").unwrap();
+        std::fs::write(second_root.join("page.jpg"), b"second").unwrap();
+        let first_id = Uuid::from_u128(1);
+        let second_id = Uuid::from_u128(2);
+        let settings_path = data_dir.join("settings.db");
+        let writer = Connection::open(&settings_path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE favorites (
+                    id BLOB PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    sort_index INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        writer
+            .execute(
+                "INSERT INTO favorites VALUES (?1, 'First', ?2, 0)",
+                rusqlite::params![
+                    first_id.as_bytes().as_slice(),
+                    first_root.to_string_lossy().as_ref()
+                ],
+            )
+            .unwrap();
+
+        let library = Library::load(&data_dir).unwrap();
+        let initial = library.favorites().unwrap();
+        assert_eq!(initial.favorites[0].name, "First");
+
+        writer
+            .execute(
+                "INSERT INTO favorites VALUES (?1, 'Second renamed', ?2, 0)",
+                rusqlite::params![
+                    second_id.as_bytes().as_slice(),
+                    second_root.to_string_lossy().as_ref()
+                ],
+            )
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE favorites SET name = 'First renamed', sort_index = 1 WHERE id = ?1",
+                [first_id.as_bytes().as_slice()],
+            )
+            .unwrap();
+        let refreshed = library.favorites().unwrap();
+        assert_ne!(
+            refreshed.remote_state_generation,
+            initial.remote_state_generation
+        );
+        assert_eq!(
+            refreshed
+                .favorites
+                .iter()
+                .map(|favorite| favorite.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Second renamed", "First renamed"]
+        );
+        assert!(
+            library
+                .validate_remote_address(&RemoteAddress::file(second_id.to_string(), "page.jpg"))
+                .is_ok()
+        );
+
+        writer
+            .execute(
+                "DELETE FROM favorites WHERE id = ?1",
+                [first_id.as_bytes().as_slice()],
+            )
+            .unwrap();
+        assert!(matches!(
+            library.validate_remote_address(&RemoteAddress::file(first_id.to_string(), "page.jpg")),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn one_generation_observes_favorites_and_view_trim_but_ignores_unrelated_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        let settings_path = data_dir.join("settings.db");
+        let settings_writer = Connection::open(&settings_path).unwrap();
+        settings_writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE favorites (
+                    id BLOB PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    sort_index INTEGER NOT NULL
+                 );
+                 CREATE TABLE unrelated (value INTEGER NOT NULL);",
+            )
+            .unwrap();
+        let favorite_id = Uuid::from_u128(1);
+        settings_writer
+            .execute(
+                "INSERT INTO favorites VALUES (?1, 'First', ?2, 0)",
+                rusqlite::params![
+                    favorite_id.as_bytes().as_slice(),
+                    data_dir.to_string_lossy()
+                ],
+            )
+            .unwrap();
+
+        let view_trim_path = data_dir.join("view_trim.db");
+        let view_trim_writer = Connection::open(&view_trim_path).unwrap();
+        view_trim_writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE view_trim_state (value INTEGER NOT NULL);",
+            )
+            .unwrap();
+
+        let library = Library::load(data_dir).unwrap();
+        let initial = library.remote_state().unwrap().remote_state_generation;
+
+        settings_writer
+            .execute("INSERT INTO unrelated VALUES (1)", [])
+            .unwrap();
+        assert_eq!(
+            library.remote_state().unwrap().remote_state_generation,
+            initial,
+            "unrelated settings writes must not invalidate page resources"
+        );
+
+        view_trim_writer
+            .execute("INSERT INTO view_trim_state VALUES (1)", [])
+            .unwrap();
+        let after_trim = library.remote_state().unwrap().remote_state_generation;
+        assert_ne!(after_trim, initial);
+        assert!(matches!(
+            library.require_remote_state_generation(&initial),
+            Err(StoreError::StaleGeneration(current)) if current == after_trim
+        ));
+
+        settings_writer
+            .execute(
+                "UPDATE favorites SET name = 'Renamed' WHERE id = ?1",
+                [favorite_id.as_bytes().as_slice()],
+            )
+            .unwrap();
+        let after_favorite = library.remote_state().unwrap().remote_state_generation;
+        assert_ne!(after_favorite, after_trim);
     }
 
     #[cfg(windows)]

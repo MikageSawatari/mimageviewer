@@ -22,6 +22,7 @@ use super::thumbnail::WorkerContext;
 const CONTAINER_ENTRY_LIMIT: usize = 1000;
 const REMOTE_COMPOSITE_CACHE_ENTRIES: usize = 8;
 const REMOTE_COMPOSITE_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const REMOTE_AUTO_TRIM_CACHE_ENTRIES: usize = 64;
 const REMOTE_LUT_CACHE_ENTRIES: usize = 16;
 const MAX_PAGE_RENDER_PX: u32 = crate::pdf_loader::PDF_RENDER_MAX_LONG_PX;
 const PAGE_JPEG_QUALITY: i32 = 85;
@@ -62,8 +63,44 @@ fn encode_remote_page_jpeg(
     Some((bytes.to_vec(), width, height))
 }
 
+fn harmonized_remote_auto_bbox(
+    side: crate::view_trim::ViewTrimSpreadSide,
+    current: Option<egui::Rect>,
+    partner: Option<egui::Rect>,
+) -> Option<egui::Rect> {
+    let (left, right) = match side {
+        crate::view_trim::ViewTrimSpreadSide::Left => {
+            crate::view_trim::harmonize_spread_auto_bboxes(current, partner)
+        }
+        crate::view_trim::ViewTrimSpreadSide::Right => {
+            crate::view_trim::harmonize_spread_auto_bboxes(partner, current)
+        }
+    };
+    match side {
+        crate::view_trim::ViewTrimSpreadSide::Left => left,
+        crate::view_trim::ViewTrimSpreadSide::Right => right,
+    }
+}
+
+fn remote_auto_trim_cache_key(
+    address: &RemoteAddress,
+    resolved: &ResolvedFavoritePath,
+    mtime: i64,
+    file_size: i64,
+    target_px: u32,
+) -> Result<RemoteAutoTrimCacheKey, MediaError> {
+    Ok(RemoteAutoTrimCacheKey {
+        page_key: crate::edit_source::page_key_for_remote(&resolved.logical, &address.subresource)
+            .ok_or_else(|| media_error(MediaErrorCode::BadRequest, "表示トリム対象が不正です"))?,
+        mtime,
+        file_size,
+        target_px,
+    })
+}
+
 pub(super) struct ContainerEngine {
     settings: Arc<crate::settings::Settings>,
+    favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
     pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
     pdf_page_counts: Mutex<HashMap<PdfIdentity, u32>>,
@@ -73,6 +110,7 @@ pub(super) struct ContainerEngine {
     adjustment_settings: AdjustmentSettingsSource,
     creative_lut_cache: Mutex<RemoteCreativeLutCache>,
     page_composite_cache: Mutex<RemoteCompositeCache>,
+    auto_trim_bbox_cache: Mutex<RemoteAutoTrimCache>,
     remote_ai_native_cache: Mutex<RemoteAiNativeCache>,
     comic_stamp_cache: Mutex<HashMap<String, Option<Arc<comic_core::RgbaOverlay>>>>,
     session: Option<super::session::SessionHandle>,
@@ -136,6 +174,22 @@ struct RemoteCompositeCacheEntry {
     key: RemoteCompositeCacheKey,
     pixels: Arc<egui::ColorImage>,
     bytes: usize,
+}
+
+/// 本体の `(load_seq, pixels_ptr)` に相当する remote raw-raster identity。
+/// remote は page slot を保持しないため、既存 decode/composite cache と同じ source stamp と
+/// decode 上限で、同じ元 raster の再要求だけを再利用する。
+#[derive(Clone, PartialEq, Eq)]
+struct RemoteAutoTrimCacheKey {
+    page_key: String,
+    mtime: i64,
+    file_size: i64,
+    target_px: u32,
+}
+
+struct RemoteAutoTrimCacheEntry {
+    key: RemoteAutoTrimCacheKey,
+    bbox: Option<egui::Rect>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -293,6 +347,33 @@ impl RemoteCompositeCache {
 }
 
 #[derive(Default)]
+struct RemoteAutoTrimCache {
+    entries: VecDeque<RemoteAutoTrimCacheEntry>,
+}
+
+impl RemoteAutoTrimCache {
+    /// 外側の `Option` は cache hit、内側は「余白なし」という有効な検出結果を表す。
+    fn get(&mut self, key: &RemoteAutoTrimCacheKey) -> Option<Option<egui::Rect>> {
+        let position = self.entries.iter().position(|entry| entry.key == *key)?;
+        let entry = self.entries.remove(position)?;
+        let bbox = entry.bbox;
+        self.entries.push_back(entry);
+        Some(bbox)
+    }
+
+    fn insert(&mut self, key: RemoteAutoTrimCacheKey, bbox: Option<egui::Rect>) {
+        if let Some(position) = self.entries.iter().position(|entry| entry.key == key) {
+            self.entries.remove(position);
+        }
+        self.entries
+            .push_back(RemoteAutoTrimCacheEntry { key, bbox });
+        while self.entries.len() > REMOTE_AUTO_TRIM_CACHE_ENTRIES {
+            self.entries.pop_front();
+        }
+    }
+}
+
+#[derive(Default)]
 struct RemoteCreativeLutCache {
     entries: VecDeque<(
         crate::creative_lut::CreativeLutEntry,
@@ -346,6 +427,50 @@ struct PdfIdentity {
 
 struct LoadedImage {
     image: image::DynamicImage,
+    auto_trim_bbox: Option<egui::Rect>,
+}
+
+#[derive(Clone, Copy)]
+enum RemoteImageLoadKind {
+    Thumbnail,
+    CompositedPage,
+    CompositedPageWithAutoTrim,
+    AutoTrimReference,
+}
+
+impl RemoteImageLoadKind {
+    fn full_page(self) -> bool {
+        !matches!(self, Self::Thumbnail)
+    }
+
+    fn composes_page(self) -> bool {
+        matches!(
+            self,
+            Self::CompositedPage | Self::CompositedPageWithAutoTrim
+        )
+    }
+
+    fn detects_auto_trim(self) -> bool {
+        matches!(
+            self,
+            Self::CompositedPageWithAutoTrim | Self::AutoTrimReference
+        )
+    }
+}
+
+enum RemoteViewTrimPlan {
+    Stored(Option<egui::Rect>),
+    AutoSingle,
+    AutoSpread {
+        side: crate::view_trim::ViewTrimSpreadSide,
+        partner: RemoteAddress,
+    },
+}
+
+impl RemoteViewTrimPlan {
+    fn requires_auto_detection(&self) -> bool {
+        matches!(self, Self::AutoSingle | Self::AutoSpread { .. })
+    }
 }
 
 struct SpreadPayload {
@@ -395,15 +520,19 @@ impl ContainerEngine {
         let adjustment_settings = AdjustmentSettingsSource::Snapshot(
             crate::settings_db::AdjustmentRenderSettings::from_settings(&settings),
         );
-        Self::new_inner(settings, None, None, adjustment_settings)
+        let favorite_roots =
+            super::live_favorites::RemoteFavoriteRoots::snapshot(settings.favorites.clone());
+        Self::new_inner(settings, favorite_roots, None, None, adjustment_settings)
     }
 
     pub(super) fn new_with_session(
         settings: crate::settings::Settings,
         session: super::session::SessionHandle,
+        favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
     ) -> Self {
         Self::new_inner(
             settings,
+            favorite_roots,
             Some(ResumeReader::Session(session.clone())),
             Some(session),
             AdjustmentSettingsSource::Live,
@@ -418,8 +547,11 @@ impl ContainerEngine {
         let adjustment_settings = AdjustmentSettingsSource::Snapshot(
             crate::settings_db::AdjustmentRenderSettings::from_settings(&settings),
         );
+        let favorite_roots =
+            super::live_favorites::RemoteFavoriteRoots::snapshot(settings.favorites.clone());
         Self::new_inner(
             settings,
+            favorite_roots,
             Some(ResumeReader::Error(error)),
             None,
             adjustment_settings,
@@ -428,6 +560,7 @@ impl ContainerEngine {
 
     fn new_inner(
         settings: crate::settings::Settings,
+        favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
         resume_reader: Option<ResumeReader>,
         session: Option<super::session::SessionHandle>,
         adjustment_settings: AdjustmentSettingsSource,
@@ -456,6 +589,7 @@ impl ContainerEngine {
             };
         Self {
             settings: Arc::new(settings),
+            favorite_roots,
             stats: Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
             pdf_passwords: crate::pdf_passwords::PdfPasswordStore::load(),
             pdf_page_counts: Mutex::new(HashMap::new()),
@@ -465,6 +599,7 @@ impl ContainerEngine {
             adjustment_settings,
             creative_lut_cache: Mutex::new(RemoteCreativeLutCache::default()),
             page_composite_cache: Mutex::new(RemoteCompositeCache::default()),
+            auto_trim_bbox_cache: Mutex::new(RemoteAutoTrimCache::default()),
             remote_ai_native_cache: Mutex::new(RemoteAiNativeCache::default()),
             comic_stamp_cache: Mutex::new(HashMap::new()),
             session,
@@ -1689,7 +1824,7 @@ impl ContainerEngine {
             &request.address,
             &resolved,
             request.target_px,
-            false,
+            RemoteImageLoadKind::Thumbnail,
             false,
             context,
             None,
@@ -1756,21 +1891,37 @@ impl ContainerEngine {
             Ok(resolved) => resolved,
             Err(error) => return PageResponse::Error(error),
         };
+        let view_trim_plan = match self.remote_view_trim_plan(
+            &request.address,
+            &resolved,
+            request.render_context.as_ref(),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return PageResponse::Error(error),
+        };
         let cancel = self.begin_page_render(priority, session_cancel);
+        let load_kind = if view_trim_plan.requires_auto_detection() {
+            RemoteImageLoadKind::CompositedPageWithAutoTrim
+        } else {
+            RemoteImageLoadKind::CompositedPage
+        };
         let response = match self.load_image(
             &request.address,
             &resolved,
             request.target_px,
-            true,
+            load_kind,
             priority == PagePriority::Foreground,
             context,
             Some(&cancel),
             request.adjustment_preview.as_ref(),
         ) {
-            Ok(loaded) => match self.remote_view_trim_bbox(
-                &request.address,
-                &resolved,
-                request.render_context.as_ref(),
+            Ok(loaded) => match self.complete_remote_view_trim_bbox(
+                &view_trim_plan,
+                loaded.auto_trim_bbox,
+                request.target_px,
+                priority == PagePriority::Foreground,
+                context,
+                &cancel,
             ) {
                 Ok(view_trim_bbox) => {
                     match encode_remote_page_jpeg(&loaded.image, request.target_px, view_trim_bbox)
@@ -1812,12 +1963,15 @@ impl ContainerEngine {
         address
             .validate_syntax()
             .map_err(|_| media_error(MediaErrorCode::BadRequest, "コンテンツアドレスが不正です"))?;
-        resolve_existing(
-            &self.settings.favorites,
-            &address.favorite_id,
-            &address.relative_path,
-        )
-        .map_err(resolve_media_error)
+        let favorites = self.favorite_roots.current().map_err(|error| {
+            crate::logger::log(format!("remote_ipc: {error}"));
+            media_error(
+                MediaErrorCode::Internal,
+                "最新のお気に入りを読み込めませんでした",
+            )
+        })?;
+        resolve_existing(&favorites, &address.favorite_id, &address.relative_path)
+            .map_err(resolve_media_error)
     }
 
     pub(super) fn execute_remote_ai(
@@ -2115,12 +2269,37 @@ impl ContainerEngine {
                         .map_err(|error| RemoteAiRunError::Failed(error.to_string()))?,
                 );
             }
-            let image = loaded_image_from_color_image(&pixels).map_err(remote_ai_media_error)?;
-            let view_trim_bbox = self
-                .remote_view_trim_bbox(
+            let image = loaded_image_from_color_image(&pixels, None).map_err(remote_ai_media_error)?;
+            let view_trim_plan = self
+                .remote_view_trim_plan(
                     &page.address,
                     &resolved,
                     page.render_context.as_ref(),
+                )
+                .map_err(remote_ai_media_error)?;
+            // Auto は AI 出力ではなく本体と同じ元ページ raster から検出する。bbox cache を
+            // 参照することで、AI result へ切り替えても表示 bbox を変えない。
+            let auto_trim_bbox = if view_trim_plan.requires_auto_detection() {
+                self.remote_auto_trim_bbox(
+                    &page.address,
+                    &resolved,
+                    page.target_px,
+                    true,
+                    &context,
+                    cancel,
+                )
+                .map_err(remote_ai_media_error)?
+            } else {
+                None
+            };
+            let view_trim_bbox = self
+                .complete_remote_view_trim_bbox(
+                    &view_trim_plan,
+                    auto_trim_bbox,
+                    page.target_px,
+                    true,
+                    &context,
+                    cancel,
                 )
                 .map_err(remote_ai_media_error)?;
             let (bytes, width, height) =
@@ -2680,12 +2859,12 @@ impl ContainerEngine {
         (stored.mode, stored.direction)
     }
 
-    fn remote_view_trim_bbox(
+    fn remote_view_trim_plan(
         &self,
         page_address: &RemoteAddress,
         resolved: &ResolvedFavoritePath,
         render_context: Option<&RemotePageRenderContext>,
-    ) -> Result<Option<egui::Rect>, MediaError> {
+    ) -> Result<RemoteViewTrimPlan, MediaError> {
         let keys = self.remote_view_trim_keys(page_address, resolved, render_context)?;
         let page_key = crate::edit_source::page_key_for_remote(
             &resolved.logical,
@@ -2706,6 +2885,7 @@ impl ContainerEngine {
             })
             .unwrap_or_default();
         let page_override = db.as_ref().and_then(|db| db.get_page_override(&page_key));
+        drop(db);
         let legacy_margin_fit = matches!(
             self.settings.fullscreen_fit_mode,
             crate::settings::FullscreenFitMode::MarginFit
@@ -2720,12 +2900,117 @@ impl ContainerEngine {
             RemotePageDisplaySlot::SpreadLeft => Some(crate::view_trim::ViewTrimSpreadSide::Left),
             RemotePageDisplaySlot::SpreadRight => Some(crate::view_trim::ViewTrimSpreadSide::Right),
         });
-        Ok(crate::view_trim::stored_view_trim_bbox(
-            mode,
-            state.book_settings,
-            page_override,
-            spread_side,
+        if matches!(mode, crate::view_trim::ViewTrimApplyMode::Auto) {
+            let Some(side) = spread_side else {
+                return Ok(RemoteViewTrimPlan::AutoSingle);
+            };
+            let Some(partner) = render_context.and_then(|context| context.spread_partner.clone())
+            else {
+                return Ok(RemoteViewTrimPlan::AutoSingle);
+            };
+            if partner == *page_address {
+                return Err(media_error(
+                    MediaErrorCode::BadRequest,
+                    "見開き Auto の相手ページが現在ページと同じです",
+                ));
+            }
+            let partner_resolved = self.resolve(&partner)?;
+            self.remote_view_trim_keys(&partner, &partner_resolved, render_context)?;
+            return Ok(RemoteViewTrimPlan::AutoSpread { side, partner });
+        }
+        Ok(RemoteViewTrimPlan::Stored(
+            crate::view_trim::stored_view_trim_bbox(
+                mode,
+                state.book_settings,
+                page_override,
+                spread_side,
+            ),
         ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_remote_view_trim_bbox(
+        &self,
+        plan: &RemoteViewTrimPlan,
+        current_auto_trim_bbox: Option<egui::Rect>,
+        target_px: u32,
+        foreground: bool,
+        context: &WorkerContext,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<Option<egui::Rect>, MediaError> {
+        match plan {
+            RemoteViewTrimPlan::Stored(bbox) => Ok(*bbox),
+            RemoteViewTrimPlan::AutoSingle => Ok(current_auto_trim_bbox),
+            RemoteViewTrimPlan::AutoSpread { side, partner } => {
+                // 相手 request を待たない。heavy worker が 1 本でも進められるよう、cache miss
+                // なら現在の worker が同じ cancel token で相手 raw raster を解決する。
+                let partner_resolved = self.resolve(partner)?;
+                let partner_auto_trim_bbox = self.remote_auto_trim_bbox(
+                    partner,
+                    &partner_resolved,
+                    target_px,
+                    foreground,
+                    context,
+                    cancel,
+                )?;
+                Ok(harmonized_remote_auto_bbox(
+                    *side,
+                    current_auto_trim_bbox,
+                    partner_auto_trim_bbox,
+                ))
+            }
+        }
+    }
+
+    fn remote_auto_trim_bbox(
+        &self,
+        address: &RemoteAddress,
+        resolved: &ResolvedFavoritePath,
+        target_px: u32,
+        foreground: bool,
+        context: &WorkerContext,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<Option<egui::Rect>, MediaError> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(media_error(
+                MediaErrorCode::Busy,
+                "ページ要求は新しい処理に置き換えられました",
+            ));
+        }
+        let metadata = std::fs::metadata(&resolved.canonical)
+            .map_err(|_| media_error(MediaErrorCode::NotFound, "コンテナが見つかりません"))?;
+        if !metadata.is_file() {
+            return Err(media_error(
+                MediaErrorCode::Unsupported,
+                "対象はコンテナファイルではありません",
+            ));
+        }
+        let key = remote_auto_trim_cache_key(
+            address,
+            resolved,
+            crate::ui_helpers::mtime_secs(&metadata),
+            i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+            target_px,
+        )?;
+        if let Some(bbox) = self
+            .auto_trim_bbox_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&key)
+        {
+            return Ok(bbox);
+        }
+        self.load_image(
+            address,
+            resolved,
+            target_px,
+            RemoteImageLoadKind::AutoTrimReference,
+            foreground,
+            context,
+            Some(cancel),
+            None,
+        )
+        .map(|loaded| loaded.auto_trim_bbox)
     }
 
     fn remote_view_trim_keys(
@@ -2850,12 +3135,15 @@ impl ContainerEngine {
         address: &RemoteAddress,
         resolved: &ResolvedFavoritePath,
         target_px: u32,
-        full_page: bool,
+        load_kind: RemoteImageLoadKind,
         foreground: bool,
         context: &WorkerContext,
         external_cancel: Option<&Arc<AtomicBool>>,
         adjustment_preview: Option<&mimageviewer_ipc::RemoteAdjustmentPreview>,
     ) -> Result<LoadedImage, MediaError> {
+        let full_page = load_kind.full_page();
+        let compose_full_page = load_kind.composes_page();
+        let detect_auto_trim = load_kind.detects_auto_trim();
         if target_px == 0 || target_px > MAX_PAGE_RENDER_PX {
             return Err(media_error(
                 MediaErrorCode::BadRequest,
@@ -2940,7 +3228,7 @@ impl ContainerEngine {
             }
         };
 
-        let prepared_composite = if full_page {
+        let prepared_composite = if compose_full_page {
             self.prepare_remote_composite(
                 address,
                 &resolved.logical,
@@ -2953,6 +3241,20 @@ impl ContainerEngine {
         } else {
             None
         };
+        let auto_trim_key = if detect_auto_trim {
+            Some(remote_auto_trim_cache_key(
+                address, resolved, mtime, file_size, target_px,
+            )?)
+        } else {
+            None
+        };
+        let cached_auto_trim_bbox = auto_trim_key.as_ref().and_then(|key| {
+            self.auto_trim_bbox_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(key)
+        });
+        let mut cached_composite_pixels = None;
         if let Some(prepared) = prepared_composite.as_ref()
             && let Some(pixels) = self
                 .page_composite_cache
@@ -2970,7 +3272,12 @@ impl ContainerEngine {
                 "remote_ipc: final_composite cache=hit key={}",
                 prepared.key.page_key
             ));
-            return loaded_image_from_color_image(&pixels);
+            if !detect_auto_trim || cached_auto_trim_bbox.is_some() {
+                return loaded_image_from_color_image(&pixels, cached_auto_trim_bbox.flatten());
+            }
+            // Auto bbox だけが未計算なら raw raster を復号するが、補正済み pixels は保持し、
+            // 後段の edit / final composite は再実行しない。
+            cached_composite_pixels = Some(pixels);
         }
 
         let catalog = Arc::new(
@@ -3052,6 +3359,26 @@ impl ContainerEngine {
         let source_dims = decoded_source_dims
             .map(|(width, height)| [width as usize, height as usize])
             .unwrap_or(color_image.size);
+        let auto_trim_bbox = match cached_auto_trim_bbox {
+            Some(bbox) => bbox,
+            None if detect_auto_trim => {
+                let bbox = crate::margin_fit::detect_content_bbox(
+                    &color_image,
+                    crate::margin_fit::DEFAULT_TOLERANCE,
+                );
+                if let Some(key) = auto_trim_key {
+                    self.auto_trim_bbox_cache
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert(key, bbox);
+                }
+                bbox
+            }
+            None => None,
+        };
+        if let Some(pixels) = cached_composite_pixels {
+            return loaded_image_from_color_image(&pixels, auto_trim_bbox);
+        }
         let mut pixels = Arc::new(color_image);
         if let Some(prepared) = prepared_composite {
             let edit_started = Instant::now();
@@ -3104,7 +3431,7 @@ impl ContainerEngine {
                 prepared.key.page_key
             ));
         }
-        loaded_image_from_color_image(&pixels)
+        loaded_image_from_color_image(&pixels, auto_trim_bbox)
     }
 
     fn ensure_pdf_page_in_range(
@@ -3626,7 +3953,10 @@ fn decode_remote_ai_canonical(
     }
 }
 
-fn loaded_image_from_color_image(pixels: &egui::ColorImage) -> Result<LoadedImage, MediaError> {
+fn loaded_image_from_color_image(
+    pixels: &egui::ColorImage,
+    auto_trim_bbox: Option<egui::Rect>,
+) -> Result<LoadedImage, MediaError> {
     let width = u32::try_from(pixels.size[0])
         .map_err(|_| media_error(MediaErrorCode::RenderFailed, "画像の幅が範囲外です"))?;
     let height = u32::try_from(pixels.size[1])
@@ -3640,7 +3970,10 @@ fn loaded_image_from_color_image(pixels: &egui::ColorImage) -> Result<LoadedImag
                 "ページ画像を WebP エンコード用の形式へ変換できませんでした",
             )
         })?;
-    Ok(LoadedImage { image })
+    Ok(LoadedImage {
+        image,
+        auto_trim_bbox,
+    })
 }
 
 fn remote_adjustment_read_error(scope: &str, error: String) -> MediaError {
@@ -4077,6 +4410,86 @@ mod tests {
         assert_eq!((resized_width, resized_height), (10, 10));
     }
 
+    fn auto_trim_test_page(top: usize, bottom: usize) -> egui::ColorImage {
+        let mut image = egui::ColorImage::new([200, 200], vec![egui::Color32::WHITE; 200 * 200]);
+        for y in top..(200 - bottom) {
+            for x in 20..180 {
+                image.pixels[y * 200 + x] = egui::Color32::BLACK;
+            }
+        }
+        image
+    }
+
+    fn write_auto_trim_test_page(path: &Path, top: u32, bottom: u32) {
+        let image = image::RgbaImage::from_fn(200, 200, |x, y| {
+            if (20..180).contains(&x) && y >= top && y < 200 - bottom {
+                image::Rgba([0, 0, 0, 255])
+            } else {
+                image::Rgba([255, 255, 255, 255])
+            }
+        });
+        image::DynamicImage::ImageRgba8(image)
+            .save_with_format(path, image::ImageFormat::Png)
+            .unwrap();
+    }
+
+    #[test]
+    fn remote_auto_trim_detects_raw_pages_and_harmonizes_spread_top_and_bottom() {
+        let left = auto_trim_test_page(40, 20);
+        let right = auto_trim_test_page(20, 40);
+        let left_bbox =
+            crate::margin_fit::detect_content_bbox(&left, crate::margin_fit::DEFAULT_TOLERANCE)
+                .unwrap();
+        let right_bbox =
+            crate::margin_fit::detect_content_bbox(&right, crate::margin_fit::DEFAULT_TOLERANCE)
+                .unwrap();
+
+        let harmonized_left = harmonized_remote_auto_bbox(
+            crate::view_trim::ViewTrimSpreadSide::Left,
+            Some(left_bbox),
+            Some(right_bbox),
+        )
+        .unwrap();
+        let harmonized_right = harmonized_remote_auto_bbox(
+            crate::view_trim::ViewTrimSpreadSide::Right,
+            Some(right_bbox),
+            Some(left_bbox),
+        )
+        .unwrap();
+
+        assert!((harmonized_left.min.y - right_bbox.min.y).abs() < 1e-6);
+        assert!((harmonized_left.max.y - left_bbox.max.y).abs() < 1e-6);
+        assert!((harmonized_right.min.y - right_bbox.min.y).abs() < 1e-6);
+        assert!((harmonized_right.max.y - left_bbox.max.y).abs() < 1e-6);
+        assert!((harmonized_left.min.x - left_bbox.min.x).abs() < 1e-6);
+        assert!((harmonized_right.min.x - right_bbox.min.x).abs() < 1e-6);
+    }
+
+    #[test]
+    fn remote_auto_trim_cache_keeps_none_and_invalidates_on_source_or_decode_change() {
+        let key = RemoteAutoTrimCacheKey {
+            page_key: "book/page.png".to_owned(),
+            mtime: 10,
+            file_size: 20,
+            target_px: 4096,
+        };
+        let mut cache = RemoteAutoTrimCache::default();
+        cache.insert(key.clone(), None);
+        assert_eq!(cache.get(&key), Some(None));
+
+        let mut changed_source = key.clone();
+        changed_source.mtime += 1;
+        assert_eq!(cache.get(&changed_source), None);
+
+        let mut changed_size = key.clone();
+        changed_size.file_size += 1;
+        assert_eq!(cache.get(&changed_size), None);
+
+        let mut changed_decode = key;
+        changed_decode.target_px = 2048;
+        assert_eq!(cache.get(&changed_decode), None);
+    }
+
     #[test]
     fn remote_view_trim_resolves_book_and_page_rows_for_spread_side() {
         let temp = tempfile::tempdir().unwrap();
@@ -4131,29 +4544,226 @@ mod tests {
         let context = RemotePageRenderContext {
             context_address: RemoteAddress::file(favorite.id.to_string(), "book"),
             display_slot: RemotePageDisplaySlot::SpreadRight,
+            spread_partner: None,
         };
 
         let override_address = RemoteAddress::file(favorite.id.to_string(), "book/override.png");
         let override_resolved = engine.resolve(&override_address).unwrap();
-        let override_margins = crate::view_trim::ViewTrimMargins::from_bbox(
-            engine
-                .remote_view_trim_bbox(&override_address, &override_resolved, Some(&context))
-                .unwrap()
-                .unwrap(),
-        );
+        let override_bbox = match engine
+            .remote_view_trim_plan(&override_address, &override_resolved, Some(&context))
+            .unwrap()
+        {
+            RemoteViewTrimPlan::Stored(Some(bbox)) => bbox,
+            _ => panic!("expected stored page bbox"),
+        };
+        let override_margins = crate::view_trim::ViewTrimMargins::from_bbox(override_bbox);
         assert!((override_margins.left - 0.09).abs() < 1e-6);
         assert!((override_margins.right - 0.03).abs() < 1e-6);
 
         let book_address = RemoteAddress::file(favorite.id.to_string(), "book/book.png");
         let book_resolved = engine.resolve(&book_address).unwrap();
-        let book_margins = crate::view_trim::ViewTrimMargins::from_bbox(
-            engine
-                .remote_view_trim_bbox(&book_address, &book_resolved, Some(&context))
-                .unwrap()
-                .unwrap(),
-        );
+        let book_bbox = match engine
+            .remote_view_trim_plan(&book_address, &book_resolved, Some(&context))
+            .unwrap()
+        {
+            RemoteViewTrimPlan::Stored(Some(bbox)) => bbox,
+            _ => panic!("expected stored book bbox"),
+        };
+        let book_margins = crate::view_trim::ViewTrimMargins::from_bbox(book_bbox);
         assert!((book_margins.left - 0.08).abs() < 1e-6);
         assert!((book_margins.right - 0.02).abs() < 1e-6);
+    }
+
+    #[test]
+    fn remote_auto_trim_plan_falls_back_without_and_validates_a_present_spread_partner() {
+        let temp = tempfile::tempdir().unwrap();
+        let book = temp.path().join("book");
+        std::fs::create_dir(&book).unwrap();
+        std::fs::write(book.join("left.png"), b"page").unwrap();
+        std::fs::write(book.join("right.png"), b"page").unwrap();
+        let db_path = temp.path().join("view_trim.db");
+        let db = crate::view_trim_db::ViewTrimDb::open_at(&db_path).unwrap();
+        db.set_book_state(
+            &book,
+            crate::view_trim::ViewTrimBookState {
+                apply_mode: crate::view_trim::ViewTrimApplyMode::Auto,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(db);
+
+        let favorite = FavoriteEntry::new("test".to_owned(), temp.path().to_path_buf());
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            ..Default::default()
+        });
+        *engine
+            .view_trim_db
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path).unwrap();
+        let left = RemoteAddress::file(favorite.id.to_string(), "book/left.png");
+        let right = RemoteAddress::file(favorite.id.to_string(), "book/right.png");
+        let resolved = engine.resolve(&left).unwrap();
+        let context_address = RemoteAddress::file(favorite.id.to_string(), "book");
+
+        let missing_partner = RemotePageRenderContext {
+            context_address: context_address.clone(),
+            display_slot: RemotePageDisplaySlot::SpreadLeft,
+            spread_partner: None,
+        };
+        assert!(matches!(
+            engine
+                .remote_view_trim_plan(&left, &resolved, Some(&missing_partner))
+                .unwrap(),
+            RemoteViewTrimPlan::AutoSingle
+        ));
+
+        let spread = RemotePageRenderContext {
+            context_address: context_address.clone(),
+            display_slot: RemotePageDisplaySlot::SpreadLeft,
+            spread_partner: Some(right.clone()),
+        };
+        assert!(matches!(
+            engine
+                .remote_view_trim_plan(&left, &resolved, Some(&spread))
+                .unwrap(),
+            RemoteViewTrimPlan::AutoSpread {
+                side: crate::view_trim::ViewTrimSpreadSide::Left,
+                partner
+            } if partner == right
+        ));
+
+        let single = RemotePageRenderContext {
+            context_address,
+            display_slot: RemotePageDisplaySlot::Single,
+            spread_partner: None,
+        };
+        assert!(matches!(
+            engine
+                .remote_view_trim_plan(&left, &resolved, Some(&single))
+                .unwrap(),
+            RemoteViewTrimPlan::AutoSingle
+        ));
+    }
+
+    #[test]
+    fn remote_auto_trim_page_responses_share_the_harmonized_spread_height() {
+        let temp = tempfile::tempdir().unwrap();
+        let book = temp.path().join("book");
+        std::fs::create_dir(&book).unwrap();
+        write_auto_trim_test_page(&book.join("left.png"), 40, 20);
+        write_auto_trim_test_page(&book.join("right.png"), 20, 40);
+        let db_path = temp.path().join("view_trim.db");
+        let db = crate::view_trim_db::ViewTrimDb::open_at(&db_path).unwrap();
+        db.set_book_state(
+            &book,
+            crate::view_trim::ViewTrimBookState {
+                apply_mode: crate::view_trim::ViewTrimApplyMode::Auto,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(db);
+
+        let favorite = FavoriteEntry::new("test".to_owned(), temp.path().to_path_buf());
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            ..Default::default()
+        });
+        *engine
+            .view_trim_db
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path).unwrap();
+        let left = RemoteAddress::file(favorite.id.to_string(), "book/left.png");
+        let right = RemoteAddress::file(favorite.id.to_string(), "book/right.png");
+        let context_address = RemoteAddress::file(favorite.id.to_string(), "book");
+        let worker = WorkerContext::open();
+        let render = |address: RemoteAddress,
+                      display_slot: RemotePageDisplaySlot,
+                      partner: RemoteAddress| {
+            let resolved = engine.resolve(&address).unwrap();
+            let render_context = RemotePageRenderContext {
+                context_address: context_address.clone(),
+                display_slot,
+                spread_partner: Some(partner),
+            };
+            let plan = engine
+                .remote_view_trim_plan(&address, &resolved, Some(&render_context))
+                .unwrap();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let loaded = engine
+                .load_image(
+                    &address,
+                    &resolved,
+                    1024,
+                    RemoteImageLoadKind::AutoTrimReference,
+                    true,
+                    &worker,
+                    Some(&cancel),
+                    None,
+                )
+                .unwrap();
+            let bbox = engine
+                .complete_remote_view_trim_bbox(
+                    &plan,
+                    loaded.auto_trim_bbox,
+                    1024,
+                    true,
+                    &worker,
+                    &cancel,
+                )
+                .unwrap();
+            encode_remote_page_jpeg(&loaded.image, 1024, bbox).unwrap()
+        };
+
+        let left_payload = render(
+            left.clone(),
+            RemotePageDisplaySlot::SpreadLeft,
+            right.clone(),
+        );
+        let right_payload = render(
+            right.clone(),
+            RemotePageDisplaySlot::SpreadRight,
+            left.clone(),
+        );
+        assert_eq!(left_payload.2, right_payload.2);
+        assert_eq!(left_payload.1, right_payload.1);
+        assert!(left_payload.2 > 140);
+        assert_eq!(
+            engine
+                .auto_trim_bbox_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .entries
+                .len(),
+            2
+        );
+
+        let decode_count_before = engine
+            .stats
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .count_png;
+        let right_resolved = engine.resolve(&right).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(
+            engine
+                .remote_auto_trim_bbox(&right, &right_resolved, 1024, true, &worker, &cancel,)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            engine
+                .stats
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .count_png,
+            decode_count_before,
+            "bbox cache hit must not decode the spread partner again"
+        );
     }
 
     fn remote_ai_test_zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {

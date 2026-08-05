@@ -195,6 +195,16 @@ test("adjustment ranges keep normalized handles and expose their actual values",
   assert.match(app, /control\.input\.setAttribute\("aria-valuetext",\s*valueText\)/);
 });
 
+test("page navigation learns cache generation from session ownership without a preflight", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  assert.doesNotMatch(app, /["']\/api\/remote-state["']/);
+  assert.match(
+    app,
+    /acquireRemoteSession[\s\S]*applyRemoteStateGeneration\(result\.remote_state_generation,\s*\{\s*reloadViewer:\s*true\s*\}\)/
+  );
+  assert.match(app, /commitSeekGroup[\s\S]*acquireRemoteSession\(reason\)/);
+});
+
 test("colorize controls use the adjustment preview and commit path without losing custom points", async () => {
   const app = await readFile(new URL("app.js", here), "utf8");
   assert.match(app, /normalizeRemoteColorizeParams\(source\.colorize\)/);

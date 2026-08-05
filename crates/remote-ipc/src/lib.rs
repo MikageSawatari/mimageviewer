@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 28;
+pub const PROTOCOL_VERSION: u32 = 29;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -717,6 +717,9 @@ pub struct PageRequest {
 pub struct RemotePageRenderContext {
     pub context_address: RemoteAddress,
     pub display_slot: RemotePageDisplaySlot,
+    /// 見開き Auto の上下調停に使う反対側ページ。単ページでは `None`。
+    #[serde(default)]
+    pub spread_partner: Option<RemoteAddress>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -1918,6 +1921,11 @@ mod tests {
                         "books/volume.pdf",
                     ),
                     display_slot: RemotePageDisplaySlot::SpreadRight,
+                    spread_partner: Some(RemoteAddress {
+                        favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
+                        relative_path: "books/volume.pdf".to_owned(),
+                        subresource: RemoteSubresource::PdfPage { page_number: 11 },
+                    }),
                 }),
                 adjustment_preview: Some(RemoteAdjustmentPreview {
                     scope: RemoteAdjustmentScope::Page,
@@ -1988,8 +1996,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v28_page_render_context_video_and_audio_status_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 28);
+    fn protocol_v29_auto_trim_partner_video_and_audio_status_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 29);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,

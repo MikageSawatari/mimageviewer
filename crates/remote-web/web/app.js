@@ -24,9 +24,11 @@ import {
   isRtlReadingDirection,
   nextFitMode,
   nextSpreadMode,
+  pageResponseGenerationAttestation,
   pagePrefetchPlan,
   planSpreadIntent,
   reduceViewerTransform,
+  remoteStateGenerationTransition,
   readingProgressBatchTransition,
   rangeValueFromNormalized,
   rangeValueToNormalized,
@@ -52,8 +54,11 @@ import {
   viewerTapSequenceTransition,
   viewerImageLayout,
   viewerPageDisplaySlot,
+  viewerPageGroupGenerationSnapshot,
+  viewerSpreadPartnerIndex,
   viewerBoundaryMessage,
   viewerSeekGroupIndex,
+  viewerSeekRelativeDragValue,
   viewerSeekState,
   viewerSpreadLayout,
   viewerWheelCommand,
@@ -404,6 +409,7 @@ const state = {
   viewerItemState: null,
   viewerItemStateSequence: 0,
   pageRenderRevision: 0,
+  remoteStateGeneration: "",
   gridViewportMemory: new GridViewportMemory(),
   appAssetToken: "",
   appUpdateDismissedToken: null,
@@ -486,6 +492,7 @@ async function enterAuthenticatedApp() {
   startAppUpdateWatch().catch(() => {});
   renderLoading("お気に入りを読み込んでいます");
   const data = await apiJson("/api/favorites");
+  applyRemoteStateGeneration(data.remote_state_generation, { reloadViewer: false });
   state.favorites = data.favorites ?? [];
   try {
     state.home = await apiJson("/api/home");
@@ -523,6 +530,7 @@ async function acquireRemoteSession(reason = "operation") {
       if (!response.ok || result.status !== "active") {
         throw new Error(result.message || `操作権を取得できません (HTTP ${response.status})。`);
       }
+      applyRemoteStateGeneration(result.remote_state_generation, { reloadViewer: true });
       setRemoteSessionStatus("active", "");
       state.remoteSessionUserActive = false;
       enqueueTelemetry({ type: "remote_session", action: "acquire", reason });
@@ -634,12 +642,52 @@ async function pingRemoteSession() {
     return;
   }
   const result = await response.json().catch(() => ({}));
+  applyRemoteStateGeneration(result.remote_state_generation, { reloadViewer: true });
   if (!response.ok || result.status !== "active") {
     setRemoteSessionStatus(
       sessionStatusFromResponse(result.status, response.status),
       result.message || "リモートセッションが切断されました。操作すると再接続します。"
     );
   }
+}
+
+let remoteFavoritesRefreshPromise = null;
+
+function applyRemoteStateGeneration(observed, { reloadViewer = false } = {}) {
+  const transition = remoteStateGenerationTransition(
+    state.remoteStateGeneration,
+    observed
+  );
+  if (!transition.initialized) return transition.generation;
+  state.remoteStateGeneration = transition.generation;
+  if (!transition.changed) return transition.generation;
+
+  pageResourceCache.clear();
+  state.imageInfoCache.clear();
+  state.containerImageInfoHints.clear();
+  refreshRemoteFavorites().catch(() => {});
+  if (reloadViewer && state.viewer) {
+    const viewer = state.viewer;
+    queueMicrotask(() => {
+      if (state.viewer === viewer) updateViewerImage(performance.now()).catch(renderError);
+    });
+  }
+  return transition.generation;
+}
+
+async function refreshRemoteFavorites() {
+  if (!remoteFavoritesRefreshPromise) {
+    remoteFavoritesRefreshPromise = apiJson("/api/favorites").finally(() => {
+      remoteFavoritesRefreshPromise = null;
+    });
+  }
+  const data = await remoteFavoritesRefreshPromise;
+  applyRemoteStateGeneration(data.remote_state_generation, { reloadViewer: false });
+  state.favorites = data.favorites ?? [];
+  if (state.screenContext === "home" && state.homeTab === "favorites") {
+    renderHome("favorites");
+  }
+  return state.favorites;
 }
 
 function setRemoteSessionStatus(status, message) {
@@ -2028,9 +2076,14 @@ function pageRenderContextForEntry(entry) {
     (page) => entryIdentity(page) === entryIdentity(entry)
   );
   if (pageIndex < 0) return null;
+  const partnerIndex = viewerSpreadPartnerIndex(group.entries.length, pageIndex);
+  const spreadPartner = partnerIndex === null
+    ? null
+    : entryAddress(group.entries[partnerIndex]);
   return {
     context_address: contextAddress,
     display_slot: viewerPageDisplaySlot(group.entries.length, pageIndex),
+    spread_partner: spreadPartner,
   };
 }
 
@@ -3192,25 +3245,102 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
       detail: "toolbar",
     });
   });
+  let seekPointerDrag = null;
+  let seekCommitSequence = 0;
+  const previewSeekGroup = (rawGroupIndex) => {
+    const groupIndex = viewerSeekGroupIndex(rawGroupIndex, state.pageGroups.length);
+    state.viewer?.setSeekState(viewerSeekSnapshot(groupIndex));
+    return groupIndex;
+  };
+  const commitSeekGroup = (groupIndex, reason) => {
+    const viewer = state.viewer;
+    const sequence = ++seekCommitSequence;
+    acquireRemoteSession(reason).then(() => {
+      if (sequence !== seekCommitSequence || state.viewer !== viewer) return;
+      if (!changeImageTo(groupIndex)) {
+        state.viewer?.setSeekState(viewerSeekSnapshot());
+      }
+    }).catch(() => {
+      if (sequence === seekCommitSequence && state.viewer === viewer) {
+        state.viewer?.setSeekState(viewerSeekSnapshot());
+      }
+    });
+  };
   seekInput.addEventListener("input", (event) => {
     event.stopPropagation();
-    const groupIndex = viewerSeekGroupIndex(
-      seekInput.value,
-      state.pageGroups.length,
-      isRtlReadingDirection(state.readingDirection)
-    );
-    state.viewer?.setSeekState(viewerSeekSnapshot(groupIndex));
+    if (seekPointerDrag) {
+      state.viewer?.setSeekState(viewerSeekSnapshot(seekPointerDrag.groupIndex));
+      return;
+    }
+    previewSeekGroup(seekInput.value);
   });
   seekInput.addEventListener("change", (event) => {
     event.stopPropagation();
-    const groupIndex = viewerSeekGroupIndex(
-      seekInput.value,
-      state.pageGroups.length,
-      isRtlReadingDirection(state.readingDirection)
+    if (seekPointerDrag) return;
+    commitSeekGroup(
+      viewerSeekGroupIndex(seekInput.value, state.pageGroups.length),
+      "viewer_seek_native"
     );
-    if (!changeImageTo(groupIndex)) {
-      state.viewer?.setSeekState(viewerSeekSnapshot());
+  });
+  seekInput.addEventListener("pointerdown", (event) => {
+    event.stopPropagation();
+    if (seekInput.disabled || event.isPrimary === false) return;
+    if (typeof event.button === "number" && event.button !== 0) return;
+    if (event.cancelable) event.preventDefault();
+    const seekState = viewerSeekSnapshot();
+    seekPointerDrag = {
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startGroupIndex: seekState.groupIndex,
+      groupIndex: seekState.groupIndex,
+      groupCount: state.pageGroups.length,
+      trackWidth: seekInput.getBoundingClientRect().width,
+      direction: seekState.direction,
+    };
+    seekInput.focus({ preventScroll: true });
+    try {
+      seekInput.setPointerCapture(event.pointerId);
+    } catch (_error) {
+      // Touch input generally has implicit capture; explicit capture may already be gone.
     }
+  });
+  seekInput.addEventListener("pointermove", (event) => {
+    if (!seekPointerDrag || seekPointerDrag.pointerId !== event.pointerId) return;
+    event.stopPropagation();
+    if (event.cancelable) event.preventDefault();
+    seekPointerDrag.groupIndex = previewSeekGroup(viewerSeekRelativeDragValue({
+      startGroupIndex: seekPointerDrag.startGroupIndex,
+      startClientX: seekPointerDrag.startClientX,
+      currentClientX: event.clientX,
+      trackWidth: seekPointerDrag.trackWidth,
+      groupCount: seekPointerDrag.groupCount,
+      direction: seekPointerDrag.direction,
+    }));
+  });
+  const finishSeekPointer = (event, cancelled) => {
+    if (!seekPointerDrag || seekPointerDrag.pointerId !== event.pointerId) return;
+    event.stopPropagation();
+    if (event.cancelable) event.preventDefault();
+    const drag = seekPointerDrag;
+    try {
+      if (seekInput.hasPointerCapture(event.pointerId)) {
+        seekInput.releasePointerCapture(event.pointerId);
+      }
+    } catch (_error) {
+      // The browser may implicitly release capture before pointercancel.
+    }
+    seekPointerDrag = null;
+    if (cancelled) {
+      state.viewer?.setSeekState(viewerSeekSnapshot());
+    } else {
+      commitSeekGroup(drag.groupIndex, "viewer_seek_drag");
+    }
+  };
+  seekInput.addEventListener("pointerup", (event) => finishSeekPointer(event, false));
+  seekInput.addEventListener("pointercancel", (event) => finishSeekPointer(event, true));
+  seekInput.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
   });
   const viewer = state.viewer;
   updateViewerImage(interactionStartedAt).then(() => {
@@ -3275,6 +3405,10 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
   const viewer = state.viewer;
   if (!group || !viewer) return;
   const identity = group.entries.map(entryIdentity).join("\n");
+  const generationSnapshot = viewerPageGroupGenerationSnapshot(
+    state.remoteStateGeneration,
+    group.entries.length
+  );
   const infos = await Promise.all(group.entries.map(imageInfo));
   if (
     state.viewer !== viewer ||
@@ -3295,6 +3429,7 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
     info: infos[pageIndex],
     request: imageRequest(entry, infos[pageIndex], viewer.stage, {
       layout: layout.pages[pageIndex],
+      remoteStateGeneration: generationSnapshot.pages[pageIndex],
     }),
   }));
   document.title = `${group.anchor.name} — mIV Remote`;
@@ -3392,6 +3527,7 @@ function imageRequest(
     targetPxOverride = null,
     adjustmentPreview = null,
     previewRevision = null,
+    remoteStateGeneration = state.remoteStateGeneration,
   } = {}
 ) {
   const dpr = window.devicePixelRatio || 1;
@@ -3414,6 +3550,7 @@ function imageRequest(
         "/api/page",
         addressQueryParams(entry.address, {
           w: targetPx,
+          generation: remoteStateGeneration,
           ...(prefetch ? { prefetch: 1 } : {}),
           rev: previewRevision ?? state.pageRenderRevision,
           ...(renderContext
@@ -3426,7 +3563,8 @@ function imageRequest(
       ),
       cacheKey: adjustmentPreview
         ? null
-        : `${infoCacheKey}\n${targetPx}\n${state.pageRenderRevision}\n${JSON.stringify(renderContext)}`,
+        : `${infoCacheKey}\n${targetPx}\n${state.pageRenderRevision}\n${remoteStateGeneration}\n${JSON.stringify(renderContext)}`,
+      remoteStateGeneration,
       width: targetPx,
       cssWidth: resolvedLayout.cssWidth,
       dpr,
@@ -5386,6 +5524,7 @@ class ViewerAdjustmentPanel {
       const detail = await response.clone().json().catch(() => ({}));
       throw new Error(detail.message || `補正プレビューに失敗しました (HTTP ${response.status})。`);
     }
+    requirePageResponseGeneration(request, response);
     const blob = await response.blob();
     if (
       job.epoch !== this.previewEpoch ||
@@ -6612,6 +6751,14 @@ export function remoteAiPollingDelay({ visibilityState, terminal, failureCount =
   ];
 }
 
+export function remoteAiCompletionMessage({ readyCount, notApplicableCount }) {
+  const ready = Math.max(0, Math.floor(Number(readyCount) || 0));
+  if (!ready) return null;
+  return Math.max(0, Math.floor(Number(notApplicableCount) || 0)) > 0
+    ? "AI 処理が完了しました。一部のページは元の表示です。"
+    : "AI 処理が完了しました。";
+}
+
 function remoteAiGroupHash(pages, revision = state.pageRenderRevision) {
   const source = `${revision}\n${pages.map((page) =>
     `${addressIdentity(page.address)}\n${Math.max(1, Number(page.target_px) || 1)}\n${JSON.stringify(page.render_context ?? null)}`
@@ -6816,20 +6963,17 @@ export class RemoteAiController {
       .filter((index) => Number.isInteger(index) && index >= 0 && index < this.pages.length);
     const notApplicable = (snapshot.page_outcomes ?? [])
       .filter((outcome) => outcome.state === "not_applicable");
-    if (!ready.length) {
-      const details = notApplicable
-        .map((outcome) => outcome.terminal?.message)
-        .filter(Boolean);
-      this.show(details.join(" / ") || "この画像では AI 処理を使いません。", {
-        cancellable: false,
-      });
+    const completionMessage = remoteAiCompletionMessage({
+      readyCount: ready.length,
+      notApplicableCount: notApplicable.length,
+    });
+    if (!completionMessage) {
+      this.hide();
       return;
     }
     const appliedIdentity = `${snapshot.job_id}:${this.displayVersion}`;
     if (this.appliedIdentity === appliedIdentity) {
-      this.show(notApplicable.length
-        ? "AI 処理が完了しました。一部のページは元の表示です。"
-        : "AI 処理が完了しました。", { cancellable: false, hideAfterMs: 2400 });
+      this.show(completionMessage, { cancellable: false, hideAfterMs: 2400 });
       return;
     }
     this.show("表示を整えています", { cancellable: false });
@@ -6852,9 +6996,7 @@ export class RemoteAiController {
     const replaced = await this.viewer.replacePageBlobs(replacements);
     if (!replaced || !this.isCurrent(generation)) return;
     this.appliedIdentity = appliedIdentity;
-    this.show(notApplicable.length
-      ? "AI 処理が完了しました。一部のページは元の表示です。"
-      : "AI 処理が完了しました。", { cancellable: false, hideAfterMs: 2400 });
+    this.show(completionMessage, { cancellable: false, hideAfterMs: 2400 });
   }
 
   async cancel() {
@@ -7000,18 +7142,22 @@ export class ImageViewer {
     };
     this.resize = () => {
       clearTimeout(this.resizeTimer);
+      const viewer = this;
       this.resizeTimer = setTimeout(() => {
-        const forceSinglePage = shouldForceSinglePageForViewport();
-        const plan = viewerResizePlan({
-          hasContainer: Boolean(state.container),
-          forceSinglePageChanged: forceSinglePage !== state.forceSinglePage,
-          panelOpen: Boolean(state.commandMenu?.isOpen()),
-        });
-        if (plan.refreshContainer) {
-          refreshContainerSpread(forceSinglePage).catch(renderError);
-          return;
-        }
-        updateViewerImage(performance.now()).catch(renderError);
+        acquireRemoteSession("viewer_resize").then(() => {
+          if (state.viewer !== viewer) return;
+          const forceSinglePage = shouldForceSinglePageForViewport();
+          const plan = viewerResizePlan({
+            hasContainer: Boolean(state.container),
+            forceSinglePageChanged: forceSinglePage !== state.forceSinglePage,
+            panelOpen: Boolean(state.commandMenu?.isOpen()),
+          });
+          if (plan.refreshContainer) {
+            refreshContainerSpread(forceSinglePage).catch(renderError);
+            return;
+          }
+          updateViewerImage(performance.now()).catch(renderError);
+        }).catch(() => {});
       }, 180);
     };
 
@@ -7093,6 +7239,9 @@ export class ImageViewer {
     this.seekInput.hidden = !seekState.visible;
     this.seekInput.min = String(seekState.min);
     this.seekInput.max = String(seekState.max);
+    this.seekInput.dir = seekState.direction === ReadingDirection.RTL
+      ? ReadingDirection.RTL
+      : ReadingDirection.LTR;
     this.seekInput.value = String(seekState.value);
     this.seekInput.disabled = seekState.max <= seekState.min;
     this.seekInput.setAttribute("aria-valuetext", seekState.label);
@@ -7228,11 +7377,10 @@ export class ImageViewer {
           credentials: "same-origin",
         });
         if (!response.ok) {
-          const detail = await response.clone().json().catch(() => ({}));
-          throw new Error(
-            detail.message ||
-              `画像取得に失敗しました (HTTP ${response.status})。`
-          );
+          throw await pageResourceResponseError(response);
+        }
+        if (request.remoteStateGeneration != null) {
+          requirePageResponseGeneration(request, response);
         }
         resource = {
           blob: await response.blob(),
@@ -7346,8 +7494,10 @@ export class ImageViewer {
           credentials: "same-origin",
         });
         if (!response.ok) {
-          const detail = await response.clone().json().catch(() => ({}));
-          throw new Error(detail.message || `画像取得に失敗しました (HTTP ${response.status})。`);
+          throw await pageResourceResponseError(response);
+        }
+        if (request.remoteStateGeneration != null) {
+          requirePageResponseGeneration(request, response);
         }
         return {
           blob: await response.blob(),
@@ -8030,12 +8180,17 @@ async function observedFetch(url, options = {}) {
     throw error;
   }
   if (!response.ok) {
+    const detail = await response.clone().json().catch(() => ({}));
+    if (detail.error === "remote_state_generation_mismatch") {
+      applyRemoteStateGeneration(detail.remote_state_generation, { reloadViewer: true });
+    }
     if (response.status === 409 || response.status === 428) {
-      const detail = await response.clone().json().catch(() => ({}));
-      setRemoteSessionStatus(
-        sessionStatusFromResponse(detail.status, response.status),
-        detail.message || "操作権がありません。次の操作時に再接続します。"
-      );
+      if (detail.error !== "remote_state_generation_mismatch") {
+        setRemoteSessionStatus(
+          sessionStatusFromResponse(detail.status, response.status),
+          detail.message || "操作権がありません。次の操作時に再接続します。"
+        );
+      }
     }
     recordClientError(
       "fetch_non_2xx",
@@ -8061,14 +8216,9 @@ async function fetchPageResource(request, signal, prefetch) {
     ? await fetch(request.url, options)
     : await observedFetch(request.url, options);
   if (!response.ok) {
-    const detail = await response.clone().json().catch(() => ({}));
-    const error = new Error(
-      detail.message || `画像取得に失敗しました (HTTP ${response.status})。`
-    );
-    error.status = response.status;
-    error.code = detail.error;
-    throw error;
+    throw await pageResourceResponseError(response);
   }
+  requirePageResponseGeneration(request, response);
   const width = Number(response.headers.get("X-mIV-Image-Width"));
   const height = Number(response.headers.get("X-mIV-Image-Height"));
   return {
@@ -8080,6 +8230,36 @@ async function fetchPageResource(request, signal, prefetch) {
         ? { width, height }
         : null,
   };
+}
+
+function requirePageResponseGeneration(request, response) {
+  const generationAttestation = pageResponseGenerationAttestation(
+    request.remoteStateGeneration,
+    response.headers.get("X-mIV-Remote-State-Generation")
+  );
+  if (generationAttestation.observed) {
+    applyRemoteStateGeneration(generationAttestation.observed, { reloadViewer: true });
+  }
+  if (!generationAttestation.matches) {
+    const error = new Error(
+      "ページ画像の状態版を確認できなかったため、古い画像の表示を中止しました。"
+    );
+    error.code = "remote_state_generation_unattested";
+    throw error;
+  }
+}
+
+async function pageResourceResponseError(response) {
+  const detail = await response.clone().json().catch(() => ({}));
+  if (detail.error === "remote_state_generation_mismatch") {
+    applyRemoteStateGeneration(detail.remote_state_generation, { reloadViewer: true });
+  }
+  const error = new Error(
+    detail.message || `画像取得に失敗しました (HTTP ${response.status})。`
+  );
+  error.status = response.status;
+  error.code = detail.error;
+  return error;
 }
 
 function remoteHeaders(initial = {}) {

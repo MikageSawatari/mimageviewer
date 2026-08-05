@@ -30,7 +30,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
@@ -1523,6 +1523,88 @@ fn read_favorites(conn: &Connection) -> Result<Vec<FavoriteEntry>, SettingsDbErr
         });
     }
     Ok(out)
+}
+
+/// Remote の favorite allowlist 用 read-only reader。
+///
+/// hot path は `PRAGMA data_version` だけを読み、別 connection の commit を観測した時だけ
+/// favorites 全件を読み直す。書き込み connection と snapshot を共有しないため、本体 UI の
+/// favorites 追加・削除を再起動なしで検出できる。
+pub(crate) struct SettingsFavoritesReader {
+    conn: Connection,
+    data_version: i64,
+    favorites: Arc<Vec<FavoriteEntry>>,
+}
+
+impl SettingsFavoritesReader {
+    pub(crate) fn open_existing_read_only_at(
+        path: &Path,
+        initial: Vec<FavoriteEntry>,
+    ) -> Result<Self, SettingsDbError> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.execute_batch("PRAGMA query_only=ON; PRAGMA busy_timeout=5000;")?;
+        let (data_version, favorites) = read_stable_favorites(&conn)?;
+        let favorites = if favorite_entries_equal(&favorites, &initial) {
+            initial
+        } else {
+            favorites
+        };
+        Ok(Self {
+            conn,
+            data_version,
+            favorites: Arc::new(favorites),
+        })
+    }
+
+    pub(crate) fn current(&mut self) -> Result<Arc<Vec<FavoriteEntry>>, SettingsDbError> {
+        let current = sqlite_data_version(&self.conn)?;
+        if current == self.data_version {
+            return Ok(Arc::clone(&self.favorites));
+        }
+        let (data_version, favorites) = read_stable_favorites(&self.conn)?;
+        self.data_version = data_version;
+        if !favorite_entries_equal(&favorites, &self.favorites) {
+            self.favorites = Arc::new(favorites);
+        }
+        Ok(Arc::clone(&self.favorites))
+    }
+}
+
+fn read_stable_favorites(conn: &Connection) -> Result<(i64, Vec<FavoriteEntry>), SettingsDbError> {
+    for _ in 0..3 {
+        let before = sqlite_data_version(conn)?;
+        let favorites = read_favorites(conn)?;
+        let after = sqlite_data_version(conn)?;
+        if before == after {
+            return Ok((after, favorites));
+        }
+    }
+    Err(SettingsDbError::Transient(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::DatabaseBusy,
+            extended_code: 0,
+        },
+        Some("favorites changed repeatedly while reading".to_owned()),
+    )))
+}
+
+fn sqlite_data_version(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("PRAGMA data_version", [], |row| row.get(0))
+}
+
+fn favorite_entries_equal(left: &[FavoriteEntry], right: &[FavoriteEntry]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.id == right.id
+                && left.name == right.name
+                && left.path == right.path
+                && left.auto_index_structure == right.auto_index_structure
+                && left.auto_index_metadata == right.auto_index_metadata
+                && left.auto_index_thumbs == right.auto_index_thumbs
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -3220,6 +3302,40 @@ mod tests {
             second.conceal_preset,
             crate::conceal::ConcealPreset::from_settings(&settings)
         );
+    }
+
+    #[test]
+    fn favorites_reader_observes_committed_add_rename_order_and_delete() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        let first = FavoriteEntry::new("first".to_owned(), PathBuf::from(r"C:\first"));
+        let second = FavoriteEntry::new("second".to_owned(), PathBuf::from(r"C:\second"));
+        settings.favorites = vec![first.clone()];
+        db.save_full(&settings).unwrap();
+
+        let mut reader = SettingsFavoritesReader::open_existing_read_only_at(
+            &settings_db_path(dir.path()),
+            settings.favorites.clone(),
+        )
+        .unwrap();
+        assert_eq!(reader.current().unwrap()[0].id, first.id);
+
+        let mut renamed = first.clone();
+        renamed.name = "renamed".to_owned();
+        settings.favorites = vec![second.clone(), renamed];
+        db.save_full(&settings).unwrap();
+
+        let refreshed = reader.current().unwrap();
+        assert_eq!(refreshed.len(), 2);
+        assert_eq!(refreshed[0].id, second.id);
+        assert_eq!(refreshed[1].name, "renamed");
+
+        settings.favorites = vec![second];
+        db.save_full(&settings).unwrap();
+        let refreshed = reader.current().unwrap();
+        assert_eq!(refreshed.len(), 1);
+        assert_ne!(refreshed[0].id, first.id);
     }
 
     #[test]

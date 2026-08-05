@@ -535,6 +535,7 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             api_session_acquire(request, state, &remote_client_id)
         }
         (Method::Post, "/api/session/ping") => api_session_ping(request, state, &remote_client_id),
+        (Method::Get, "/api/remote-state") => api_remote_state(state),
         (Method::Get, "/api/favorites") => {
             with_session_activity(state, &remote_client_id, || api_favorites(state))
         }
@@ -643,6 +644,14 @@ fn api_ai_job_start(request: &mut Request, state: &AppState, client_id: &str) ->
             && let Err(error) = state
                 .library
                 .validate_remote_address(&render_context.context_address)
+        {
+            return store_error_response(error).with_header("Cache-Control", "no-store");
+        }
+        if let Some(spread_partner) = page
+            .render_context
+            .as_ref()
+            .and_then(|context| context.spread_partner.as_ref())
+            && let Err(error) = state.library.validate_remote_address(spread_partner)
         {
             return store_error_response(error).with_header("Cache-Control", "no-store");
         }
@@ -954,7 +963,7 @@ fn api_video_control(request: &mut Request, state: &AppState, client_id: &str) -
         Err(busy) => return video_admission_busy_response(busy),
     };
     match result {
-        Ok(success) => session_response_http(success.value),
+        Ok(success) => session_response_http(success.value, state),
         Err(failure) => video_ipc_error_response(failure),
     }
 }
@@ -1563,8 +1572,8 @@ fn api_session_acquire(request: &Request, state: &AppState, client_id: &str) -> 
         })
         .unwrap_or_else(|| crate::connection_url::detect_peer_info(None));
     match state.thumbnail_client.session_acquire(client_id, peer) {
-        Ok(response) => session_response_http(response),
-        Err(failure) => session_failure_response(failure),
+        Ok(response) => session_response_http(response, state),
+        Err(failure) => session_failure_response(failure, state),
     }
 }
 
@@ -1582,8 +1591,8 @@ fn api_session_ping(request: &mut Request, state: &AppState, client_id: &str) ->
         .thumbnail_client
         .session_ping(client_id, body.user_active, body.media_playing)
     {
-        Ok(response) => session_response_http(response),
-        Err(failure) => session_failure_response(failure),
+        Ok(response) => session_response_http(response, state),
+        Err(failure) => session_failure_response(failure, state),
     }
 }
 
@@ -1596,14 +1605,20 @@ fn with_session_activity(
     operation()
 }
 
-fn session_response_http(response: SessionResponse) -> HttpResponse {
+fn session_response_http(response: SessionResponse, state: &AppState) -> HttpResponse {
     let status = session_http_status(response.status);
+    let remote_state_generation = state
+        .library
+        .remote_state()
+        .ok()
+        .map(|state| state.remote_state_generation);
     HttpResponse::bytes(
         status,
         "application/json; charset=utf-8",
         serde_json::to_vec(&json!({
             "status": response.status,
             "message": response.message,
+            "remote_state_generation": remote_state_generation,
         }))
         .unwrap_or_default(),
     )
@@ -1621,9 +1636,12 @@ fn session_http_status(status: SessionStatus) -> u16 {
     }
 }
 
-fn session_failure_response(failure: crate::ipc_client::ClientFailure) -> HttpResponse {
+fn session_failure_response(
+    failure: crate::ipc_client::ClientFailure,
+    state: &AppState,
+) -> HttpResponse {
     match failure.error {
-        IpcClientError::SessionRemote(response) => session_response_http(response),
+        IpcClientError::SessionRemote(response) => session_response_http(response, state),
         IpcClientError::Unavailable(_) => HttpResponse::bytes(
             503,
             "application/json; charset=utf-8",
@@ -1813,12 +1831,25 @@ fn api_auth_pin(request: &mut Request, state: &AppState) -> HttpResponse {
 }
 
 fn api_favorites(state: &AppState) -> HttpResponse {
-    match HttpResponse::json(&state.library.favorites()) {
+    let favorites = match state.library.favorites() {
+        Ok(favorites) => favorites,
+        Err(error) => return store_error_response(error),
+    };
+    match HttpResponse::json(&favorites) {
         Ok(response) => response.with_header("Cache-Control", "no-store"),
         Err(error) => {
             eprintln!("remote-web: favorites JSON encoding failed: {error}");
             HttpResponse::text(500, "Internal Server Error")
         }
+    }
+}
+
+fn api_remote_state(state: &AppState) -> HttpResponse {
+    match state.library.remote_state() {
+        Ok(remote_state) => HttpResponse::json(&remote_state)
+            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+            .with_header("Cache-Control", "no-store"),
+        Err(error) => store_error_response(error),
     }
 }
 
@@ -2318,6 +2349,23 @@ fn api_thumb(state: &AppState, query: &[(String, String)], client_id: &str) -> H
 }
 
 fn api_page(state: &AppState, query: &[(String, String)], client_id: &str) -> HttpResponse {
+    let remote_state_generation = match query_value(query, "generation") {
+        Ok(Some(value))
+            if (1..=128).contains(&value.len())
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') =>
+        {
+            value.to_owned()
+        }
+        _ => return HttpResponse::text(400, "Bad Request"),
+    };
+    if let Err(error) = state
+        .library
+        .require_remote_state_generation(&remote_state_generation)
+    {
+        return store_error_response(error);
+    }
     let address = match remote_address_from_query(query) {
         Ok(address) => address,
         _ => return HttpResponse::text(400, "Bad Request"),
@@ -2357,6 +2405,13 @@ fn api_page(state: &AppState, query: &[(String, String)], client_id: &str) -> Ht
     {
         return store_error_response(error);
     }
+    if let Some(spread_partner) = render_context
+        .as_ref()
+        .and_then(|context| context.spread_partner.as_ref())
+        && let Err(error) = state.library.validate_remote_address(spread_partner)
+    {
+        return store_error_response(error);
+    }
     let ipc_class = if priority == PagePriority::Prefetch {
         IpcClass::Prefetch
     } else {
@@ -2376,6 +2431,12 @@ fn api_page(state: &AppState, query: &[(String, String)], client_id: &str) -> Ht
         Ok(result) => result,
         Err(busy) => return media_admission_busy_response(busy, "page"),
     };
+    if let Err(error) = state
+        .library
+        .require_remote_state_generation(&remote_state_generation)
+    {
+        return store_error_response(error);
+    }
     match result {
         Ok(result) => {
             let payload = result.value;
@@ -2394,6 +2455,7 @@ fn api_page(state: &AppState, query: &[(String, String)], client_id: &str) -> Ht
                 )
                 .with_header("X-mIV-Image-Width", payload.width.to_string())
                 .with_header("X-mIV-Image-Height", payload.height.to_string())
+                .with_header("X-mIV-Remote-State-Generation", remote_state_generation)
                 .with_log_details(json!({
                     "page": {
                         "ipc_status": "ok",
@@ -3004,7 +3066,21 @@ fn static_file(state: &AppState, name: &str, content_type: &'static str) -> Http
 fn store_error_response(error: StoreError) -> HttpResponse {
     match error {
         StoreError::BadRequest => HttpResponse::text(400, "Bad Request"),
+        StoreError::Busy => HttpResponse::text(503, "Service Unavailable")
+            .with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string())
+            .with_header("Cache-Control", "no-store"),
         StoreError::NotFound => HttpResponse::text(404, "Not Found"),
+        StoreError::StaleGeneration(remote_state_generation) => HttpResponse::bytes(
+            409,
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&json!({
+                "error": "remote_state_generation_mismatch",
+                "message": "本体の状態が変わりました。ページを読み直します。",
+                "remote_state_generation": remote_state_generation,
+            }))
+            .unwrap_or_default(),
+        )
+        .with_header("Cache-Control", "no-store"),
         StoreError::Decode => HttpResponse::text(415, "Unsupported Media Type"),
         StoreError::Io(error) => {
             eprintln!("remote-web: filesystem request failed: {error}");

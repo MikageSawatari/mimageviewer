@@ -16,6 +16,7 @@ use super::path_guard::{
 
 pub(super) struct ThumbnailEngine {
     settings: Arc<crate::settings::Settings>,
+    favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
     inflight: Mutex<HashMap<RequestKey, Arc<Flight>>>,
 }
@@ -80,9 +81,13 @@ struct Flight {
 }
 
 impl ThumbnailEngine {
-    pub(super) fn new(settings: crate::settings::Settings) -> Self {
+    pub(super) fn new_with_favorite_roots(
+        settings: crate::settings::Settings,
+        favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
+    ) -> Self {
         Self {
             settings: Arc::new(settings),
+            favorite_roots,
             stats: Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
             inflight: Mutex::new(HashMap::new()),
         }
@@ -171,8 +176,18 @@ impl ThumbnailEngine {
         {
             return container_engine.thumbnail(request, context);
         }
+        let favorites = match self.favorite_roots.current() {
+            Ok(favorites) => favorites,
+            Err(error) => {
+                crate::logger::log(format!("remote_ipc: {error}"));
+                return error_response(
+                    ThumbnailErrorCode::Internal,
+                    "最新のお気に入りを読み込めませんでした",
+                );
+            }
+        };
         let resolved = match resolve_existing(
-            &self.settings.favorites,
+            &favorites,
             &request.address.favorite_id,
             &request.address.relative_path,
         ) {

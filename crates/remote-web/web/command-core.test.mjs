@@ -32,6 +32,7 @@ import {
   nextSpreadMode,
   readingDirectionForSpreadMode,
   readingProgressBatchTransition,
+  remoteStateGenerationTransition,
   reduceViewerTransform,
   resolveGridReturnViewport,
   togglePageOriginalFitMode,
@@ -40,6 +41,7 @@ import {
   viewerTapZone,
   nextFitMode,
   pagePrefetchPlan,
+  pageResponseGenerationAttestation,
   planSpreadIntent,
   snappedGridOffset,
   thumbnailBindingMatches,
@@ -52,6 +54,8 @@ import {
   sessionOwnerBadge,
   viewerImageLayout,
   viewerPageDisplaySlot,
+  viewerPageGroupGenerationSnapshot,
+  viewerSpreadPartnerIndex,
   viewerBoundaryMessage,
   viewerGestureDecision,
   viewerPanelGestureAction,
@@ -61,6 +65,7 @@ import {
   viewerResizePlan,
   viewerVerticalScrollDecision,
   viewerSeekGroupIndex,
+  viewerSeekRelativeDragValue,
   viewerSeekState,
   viewerSpreadLayout,
   viewerWheelCommand,
@@ -793,6 +798,45 @@ test("page display slots follow the physical left-to-right group order", () => {
   assert.equal(viewerPageDisplaySlot(2, 0), "spread_left");
   assert.equal(viewerPageDisplaySlot(2, 1), "spread_right");
   assert.equal(viewerPageDisplaySlot(2, 2), "single");
+  assert.equal(viewerSpreadPartnerIndex(1, 0), null);
+  assert.equal(viewerSpreadPartnerIndex(2, 0), 1);
+  assert.equal(viewerSpreadPartnerIndex(2, 1), 0);
+  assert.equal(viewerSpreadPartnerIndex(2, 2), null);
+});
+
+test("remote state generation ignores stale observations and changes only after initialization", () => {
+  assert.deepEqual(remoteStateGenerationTransition("", "boot-4"), {
+    generation: "boot-4",
+    changed: false,
+    initialized: true,
+  });
+  assert.deepEqual(remoteStateGenerationTransition("boot-4", "boot-5"), {
+    generation: "boot-5",
+    changed: true,
+    initialized: true,
+  });
+  assert.deepEqual(remoteStateGenerationTransition("boot-5", "boot-4"), {
+    generation: "boot-5",
+    changed: false,
+    initialized: true,
+  });
+});
+
+test("a page response attests exactly the generation requested by its viewer group", () => {
+  assert.deepEqual(pageResponseGenerationAttestation("boot-7", "boot-7"), {
+    requested: "boot-7",
+    observed: "boot-7",
+    matches: true,
+  });
+  assert.equal(pageResponseGenerationAttestation("boot-7", "").matches, false);
+  assert.equal(pageResponseGenerationAttestation("boot-7", "boot-8").matches, false);
+});
+
+test("every page in one viewer group snapshots the same remote state generation", () => {
+  assert.deepEqual(viewerPageGroupGenerationSnapshot("boot-7", 2), {
+    generation: "boot-7",
+    pages: ["boot-7", "boot-7"],
+  });
 });
 
 test("page edge messages distinguish start, end and RTL guidance", () => {
@@ -877,6 +921,7 @@ test("viewer seek uses one physical tick per page group and real page labels", (
       max: 2,
       value: 1,
       groupIndex: 1,
+      direction: ReadingDirection.LTR,
       label: "2 / 3",
     }
   );
@@ -892,29 +937,51 @@ test("viewer seek uses one physical tick per page group and real page labels", (
       max: 2,
       value: 1,
       groupIndex: 1,
+      direction: ReadingDirection.LTR,
       label: "2-3 / 5",
     }
   );
 });
 
-test("viewer seek reverses its physical endpoints for RTL books", () => {
+test("viewer seek keeps logical values and delegates RTL geometry to the native range", () => {
   const groups = [[0], [1, 2], [3, 4]];
-  assert.equal(viewerSeekState({
+  const start = viewerSeekState({
     groupPageIndexes: groups,
     currentGroupIndex: 0,
     pageCount: 5,
     rtl: true,
-  }).value, 2);
-  assert.equal(viewerSeekState({
+  });
+  assert.equal(start.value, 0);
+  assert.equal(start.direction, ReadingDirection.RTL);
+  const end = viewerSeekState({
     groupPageIndexes: groups,
     currentGroupIndex: 2,
     pageCount: 5,
     rtl: true,
-  }).value, 0);
-  assert.equal(viewerSeekGroupIndex(0, groups.length, true), 2);
-  assert.equal(viewerSeekGroupIndex(2, groups.length, true), 0);
-  assert.equal(viewerSeekGroupIndex(0, groups.length, false), 0);
-  assert.equal(viewerSeekGroupIndex(99, groups.length, false), 2);
+  });
+  assert.equal(end.value, 2);
+  assert.equal(end.direction, ReadingDirection.RTL);
+  assert.equal(viewerSeekGroupIndex(0, groups.length), 0);
+  assert.equal(viewerSeekGroupIndex(2, groups.length), 2);
+  assert.equal(viewerSeekGroupIndex(99, groups.length), 2);
+});
+
+test("viewer seek relative drag mirrors physical RTL travel", () => {
+  const drag = (direction, currentClientX, groupCount = 31) => viewerSeekRelativeDragValue({
+    startGroupIndex: 15,
+    startClientX: 100,
+    currentClientX,
+    trackWidth: 300,
+    groupCount,
+    direction,
+  });
+  assert.equal(drag(ReadingDirection.LTR, 200), 25);
+  assert.equal(drag(ReadingDirection.LTR, 0), 5);
+  assert.equal(drag(ReadingDirection.RTL, 200), 5);
+  assert.equal(drag(ReadingDirection.RTL, 0), 25);
+  assert.equal(drag(ReadingDirection.LTR, 140, 300), 55);
+  assert.equal(drag(ReadingDirection.RTL, 140, 300), 0);
+  assert.equal(drag(ReadingDirection.LTR, 100, 0), -1);
 });
 
 test("viewer seek hides only its range for a one-image sequence", () => {
@@ -930,6 +997,7 @@ test("viewer seek hides only its range for a one-image sequence", () => {
       max: 0,
       value: 0,
       groupIndex: 0,
+      direction: ReadingDirection.LTR,
       label: "1 / 1",
     }
   );

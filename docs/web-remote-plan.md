@@ -992,12 +992,17 @@ fallback がある本で既定 mode を明示した場合も継承を上書き�
 
 下バーの range は通常フォルダと ZIP / PDF のどちらも `pageGroups` を入力にする。Single では
 1目盛り1ページ、見開きでは1目盛り1グループ（1見開き）とし、ラベルはグループ数でなく
-`state.images` 上の実ページ番号を `12-13 / 240` の形式で出す。LTR は物理左端を先頭グループ、
-RTL は range の物理値と読み順 group index の対応を反転して、物理左端を最終グループにする。
-range の `input` 中は thumb とラベルだけを更新し、`change` で確定した1回だけ
-`changeImageTo` を呼ぶため、ドラッグ途中の画像 fetch / decode は発生しない。実ページが1枚だけなら
-range だけを隠し、`1 / 1` の位置表示は維持する。位置、実ページラベル、LTR / RTL の物理値変換は
-`command-core.mjs` の純粋関数でテストする。
+`state.images` 上の実ページ番号を `12-13 / 240` の形式で出す。range の値は綴じ方向にかかわらず
+読み順 group index と一致させ、LTR は native range の `dir=ltr`、RTL は `dir=rtl` を使う。これにより
+RTL では最小値が物理右端、最大値が物理左端となり、thumb と塗りの向きを native control 内で揃える。
+range は keyboard / ARIA の owner として残す一方、pointer は押下位置の絶対値を採らず、押下時の group
+index からの相対移動を使う。トラック全幅の移動を全 group 範囲へ正規化して step 1 で丸め、LTR は
+右移動、RTL は `dir` と同じ direction を使った左移動で index を増やす。pointer capture と既存の
+`touch-action: none` により thumb 外から始めた touch も追跡する。
+range の `input` または pointer move 中は thumb とラベルだけを更新し、native `change` / pointerup で
+session acquire を確認してから確定した1回だけ `changeImageTo` を呼ぶため、ドラッグ途中の画像 fetch /
+decode は発生しない。実ページが1枚だけなら range だけを隠し、`1 / 1` の位置表示は維持する。位置、
+相対移動量、実ページラベル、LTR / RTL の direction は `command-core.mjs` の純粋関数でテストする。
 
 上下左右 swipe は同じ純粋判定を使う。開始点から主軸が **52 CSS px を超え**、かつ直交軸の
 **1.25倍を超えた**場合だけ成立する。左端32pxの browser edge gesture guard も従来どおり適用する。
@@ -1277,6 +1282,44 @@ open command telemetry は全試行を記録し、nested payload.kind、mediaKin
 open_route、handled を含める。成功 route も folder_container_image / media_image /
 media_video 等で記録するため、media_open_route_rejected /
 video_viewer_entry_rejected が 0 件でも、その手前のどの route が実際に使われたかを判断できる。
+
+### 12.16 本体状態の共有 generation とリモート cache 整合性 (2026-08-05)
+
+本体が正本である favorites と view-trim の更新は、remote-web が持つ 1 個の
+`remote_state_generation` で端末へ公開する。値は remote-web 起動ごとの乱数 prefix と単調 counter
+から成り、`settings.db` と `view_trim.db` の専用 read-only connection で
+`PRAGMA data_version` を観測する。settings の版が変わった場合だけ favorites を全件再読込し、内容が
+同一なら generation を進めない。view-trim の版変更と favorites の追加・削除・改名・並べ替えは同じ
+generation を進める。
+
+端末は session acquire / ping の応答で同じ generation を受け取る。ブラウザの全 command は既存の
+「後から操作した owner が勝つ」規則により active 中も acquire を先に送るため、ページ送りはこの既存
+ownership RTT で generation も観測し、ページ group ごとの `GET /api/remote-state` pre-flight は送らない。
+シーク確定と viewer resize も cache-only の迂回路にせず acquire 後に描画する。generation が変わった
+場合だけ `PageResourceCache`、画像寸法 hint、表示中 group を破棄・再読込する。`GET /api/remote-state`
+自体は no-store の状態確認 API として残すが、通常のページ表示経路からは使用しない。
+
+`/api/page` の URL と `PageResourceCache` key には group 開始時に snapshot した generation を入れる。
+server はその期待値を IPC の前後で確認し、途中で版が変われば
+`409 remote_state_generation_mismatch`（no-store）を返す。見開きは 2 request を同じ snapshot で
+並行取得し、既存の両 page decode 完了後の atomic replacement だけを表示経路にするため、旧版と新版の
+混在は DOM に到達しない。generation 変更時は group cache を破棄して両 page を取り直す。
+HTTP の `private, max-age=60` は維持するが、版変更時は URL 自体が変わるため自然失効待ちには依存しない。
+page response の `X-mIV-Remote-State-Generation` は request の group snapshot と一致することを端末でも
+検証し、欠落・不一致なら画像を表示しない。この header は画像を生成した版の証明であり、HTTP cache
+hit 時点の最新性そのものは証明しない。現在版は先行する ownership acquire / 定期 ping / visibility
+復帰時 acquire から学び、request が server に届く場合は前後検証と 409 でも自己修復する。端末が既存
+session と既存表示を保ったまま本体 DB だけが変わり、次の acquire / ping / page request が一度も
+発生しない間は表示中画像を自発更新しない、という採用済みの鮮度境界は残る。
+
+favorites の経路 allowlist は remote-web と本体 IPC の両境界で同じ鮮度規則を使う。それぞれ persistent
+read-only connection の `data_version` を request ごとに確認し、変化時だけ cached roots を差し替える。
+500 favorites の warm 計測では `data_version` が p50 2.10 µs / p95 2.40 µs、全件読込が
+p50 239.20 µs / p95 315.30 µs（p50 約 114 倍）だったため、サムネイルごとの全件読込や WAL を考慮しにくい
+mtime 観測は採らない。削除済み favorite id は両境界で直ちに拒否する。
+
+Auto trim の見開き slot に相手 address が無い場合は、上下 harmonize だけを諦めて
+`AutoSingle` としてページ自体は描画する。相手が指定されている場合の address・slot 検証は維持する。
 
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 

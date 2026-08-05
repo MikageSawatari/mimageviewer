@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mimageviewer_ipc::{
@@ -96,12 +97,20 @@ impl VideoStreamStartBudget {
     }
 }
 pub(super) struct VideoStreamEngine {
-    settings: crate::settings::Settings,
+    favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
 }
 
 impl VideoStreamEngine {
     pub(super) fn new(settings: crate::settings::Settings) -> Self {
-        Self { settings }
+        let favorite_roots =
+            super::live_favorites::RemoteFavoriteRoots::snapshot(settings.favorites.clone());
+        Self::new_with_favorite_roots(favorite_roots)
+    }
+
+    pub(super) fn new_with_favorite_roots(
+        favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
+    ) -> Self {
+        Self { favorite_roots }
     }
 
     pub(super) fn resolve_start_address(
@@ -120,12 +129,15 @@ impl VideoStreamEngine {
                 "動画ストリーミングは実ファイルだけを受け付けます",
             ));
         }
-        let resolved = resolve_existing(
-            &self.settings.favorites,
-            &address.favorite_id,
-            &address.relative_path,
-        )
-        .map_err(resolve_error)?;
+        let favorites = self.favorite_roots.current().map_err(|error| {
+            crate::logger::log(format!("remote_ipc: {error}"));
+            video_error(
+                VideoStreamErrorCode::Internal,
+                "最新のお気に入りを読み込めませんでした",
+            )
+        })?;
+        let resolved = resolve_existing(&favorites, &address.favorite_id, &address.relative_path)
+            .map_err(resolve_error)?;
         if !resolved
             .canonical
             .extension()

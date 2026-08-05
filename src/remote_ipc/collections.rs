@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use mimageviewer_ipc::{
     CollectionError, CollectionErrorCode, CollectionKind, CollectionPayload, CollectionRequest,
@@ -15,6 +16,7 @@ const MAX_REMOTE_COLLECTION_ENTRIES: usize = 1000;
 
 pub(super) struct CollectionEngine {
     settings: Settings,
+    favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
 }
 
 #[derive(Clone)]
@@ -30,7 +32,19 @@ struct CandidateEntry {
 
 impl CollectionEngine {
     pub(super) fn new(settings: Settings) -> Self {
-        Self { settings }
+        let favorite_roots =
+            super::live_favorites::RemoteFavoriteRoots::snapshot(settings.favorites.clone());
+        Self::new_with_favorite_roots(settings, favorite_roots)
+    }
+
+    pub(super) fn new_with_favorite_roots(
+        settings: Settings,
+        favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
+    ) -> Self {
+        Self {
+            settings,
+            favorite_roots,
+        }
     }
 
     pub(super) fn home(&self) -> HomeResponse {
@@ -77,7 +91,7 @@ impl CollectionEngine {
             .into_iter()
             .map(candidate_from_reading_history_entry)
             .collect();
-        Ok(self.payload("閲覧履歴", candidates))
+        self.payload("閲覧履歴", candidates)
     }
 
     fn rating(&self, stars: u8) -> Result<CollectionPayload, CollectionError> {
@@ -104,7 +118,7 @@ impl CollectionEngine {
             .into_iter()
             .filter_map(|row| candidate_from_grid_item(row.item, None, Some(stars)))
             .collect();
-        Ok(self.payload(&format!("レーティング ★{stars}"), candidates))
+        self.payload(&format!("レーティング ★{stars}"), candidates)
     }
 
     fn bookmarks(&self) -> Result<CollectionPayload, CollectionError> {
@@ -153,7 +167,7 @@ impl CollectionEngine {
                 }
             })
             .collect();
-        Ok(self.payload("ブックマーク", candidates))
+        self.payload("ブックマーク", candidates)
     }
 
     fn bookshelf(&self) -> Result<CollectionPayload, CollectionError> {
@@ -171,7 +185,7 @@ impl CollectionEngine {
                 rating: None,
             })
             .collect();
-        Ok(self.payload("本棚", candidates))
+        self.payload("本棚", candidates)
     }
 
     fn smart_folder(&self, definition_id: &str) -> Result<CollectionPayload, CollectionError> {
@@ -218,19 +232,30 @@ impl CollectionEngine {
                 rating: entry.rating,
             })
             .collect();
-        Ok(self.payload(&title, candidates))
+        self.payload(&title, candidates)
     }
 
-    fn payload(&self, title: &str, candidates: Vec<CandidateEntry>) -> CollectionPayload {
-        let entries = to_remote_entries(&self.settings.favorites, candidates);
+    fn payload(
+        &self,
+        title: &str,
+        candidates: Vec<CandidateEntry>,
+    ) -> Result<CollectionPayload, CollectionError> {
+        let favorites = self.favorite_roots.current().map_err(|error| {
+            crate::logger::log(format!("remote_ipc: {error}"));
+            CollectionError::new(
+                CollectionErrorCode::Internal,
+                "最新のお気に入りを読み込めませんでした",
+            )
+        })?;
+        let entries = to_remote_entries(&favorites, candidates);
         let (entries, truncated) = bound_remote_entries(entries);
-        CollectionPayload {
+        Ok(CollectionPayload {
             title: title.to_owned(),
             thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(&self.settings),
             entries,
             entry_limit: MAX_REMOTE_COLLECTION_ENTRIES,
             truncated,
-        }
+        })
     }
 }
 

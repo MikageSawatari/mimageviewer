@@ -449,7 +449,9 @@ foreground では 500 ms、通信失敗時は 1 s → 2 s → 5 s で state を�
 timer を停止し、復帰時は session 再取得後に recoverable を先に照会する。進捗は phase と server の
 page / stage / tile counter だけを表示し、percent は合成しない。aggregate `Ready` の page outcome が
 `Ready` のページだけ result を取得し、全 result を decode 後に見開き DOM を一度だけ更新する。
-`NotApplicable` は元画像を保ち、失敗表示にしない。
+`NotApplicable` は元画像を保ち、失敗表示にしない。全ページが `NotApplicable` なら自動処理の進捗表示を
+そのまま閉じ、完了通知は出さない。1ページ以上が `Ready` なら、全成功・一部 `NotApplicable` のどちらも
+完了通知を2.4秒で自動的に閉じる。
 
 **転送画質追補 (2026-08-04):** viewer の通常ページと AI result は、サムネイル用 WebP とは分け、
 turbojpeg q85 の JPEG で返す。画質は端末別に「高品質 8192 / 標準 4096 / 軽量 2048 /
