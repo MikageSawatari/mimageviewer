@@ -48578,8 +48578,9 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
     );
 
     // 内訳が取れるだけでは足りない。利用者が探しているのは画面上のチップなので、
-    // 実際の絞り込みバー描画にラベルが出るところまで固定する。
-    app.settings.show_toolbar_facet_filter = true;
+    // 実際のフォルダバー描画にラベルが出るところまで固定する。絞り込みバーは
+    // 利用者が手で足す条件のバーなので、既定動作による非表示はこちらが定位置。
+    assert!(app.settings.show_address_bar_omitted_entries);
     let ctx = egui::Context::default();
     let output = ctx.run(
         egui::RawInput {
@@ -48589,7 +48590,9 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
             )),
             ..Default::default()
         },
-        |ctx| app.render_facet_filter_bar(ctx),
+        |ctx| {
+            app.render_address_bar(ctx);
+        },
     );
     let mut drawn = String::new();
     let mut stack: Vec<&egui::epaint::Shape> = output.shapes.iter().map(|c| &c.shape).collect();
@@ -48602,6 +48605,31 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
     }
     assert!(
         drawn.contains("非表示 6 件"),
-        "絞り込みバーにチップが描かれていない: {drawn}"
+        "フォルダバーにチップが描かれていない: {drawn}"
     );
+
+    // フォルダバー右クリックの設定で消せること。
+    app.settings.show_address_bar_omitted_entries = false;
+    let hidden = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 240.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            app.render_address_bar(ctx);
+        },
+    );
+    let mut drawn_off = String::new();
+    let mut stack: Vec<&egui::epaint::Shape> = hidden.shapes.iter().map(|c| &c.shape).collect();
+    while let Some(shape) = stack.pop() {
+        match shape {
+            egui::epaint::Shape::Text(text) => drawn_off.push_str(text.galley.text()),
+            egui::epaint::Shape::Vec(shapes) => stack.extend(shapes.iter()),
+            _ => {}
+        }
+    }
+    assert!(!drawn_off.contains("非表示"), "OFF にしたら出さない");
 }

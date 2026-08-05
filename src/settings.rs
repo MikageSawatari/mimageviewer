@@ -3553,6 +3553,10 @@ pub struct Settings {
     /// 画像を 1 つに畳む集約表示の ON/OFF。既定 true。
     #[serde(default = "default_true")]
     pub show_address_bar_stack_toggle: bool,
+    /// フォルダバーに「非表示 N 件」チップを表示する。一覧へ出していない項目があることを
+    /// 常時知らせる。既定 true。
+    #[serde(default = "default_true")]
+    pub show_address_bar_omitted_entries: bool,
     /// フォルダバーの「場所▼」に仮想ドライブ一覧を表示する。
     #[serde(default = "default_true")]
     pub show_location_drive_list: bool,
@@ -5239,6 +5243,7 @@ impl Default for Settings {
             show_address_bar_history_menu: true,
             show_address_bar_folder_pin: true,
             show_address_bar_stack_toggle: true,
+            show_address_bar_omitted_entries: true,
             show_location_drive_list: true,
             show_location_reading_history: true,
             show_location_rating: true,
@@ -7126,6 +7131,7 @@ impl Settings {
         self.show_address_bar_history_menu = src.show_address_bar_history_menu;
         self.show_address_bar_folder_pin = src.show_address_bar_folder_pin;
         self.show_address_bar_stack_toggle = src.show_address_bar_stack_toggle;
+        self.show_address_bar_omitted_entries = src.show_address_bar_omitted_entries;
         self.show_location_drive_list = src.show_location_drive_list;
         self.show_location_reading_history = src.show_location_reading_history;
         self.show_location_rating = src.show_location_rating;
@@ -9152,6 +9158,7 @@ mod tests {
         assert!(s.show_address_bar_history_menu);
         assert!(s.show_address_bar_folder_pin);
         assert!(s.show_address_bar_stack_toggle);
+        assert!(s.show_address_bar_omitted_entries);
         assert!(s.show_location_drive_list);
         assert!(s.show_location_reading_history);
         assert!(s.show_location_rating);

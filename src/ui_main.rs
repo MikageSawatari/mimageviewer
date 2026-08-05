@@ -8612,6 +8612,16 @@ impl App {
             )
             .on_hover_text("似たファイルを自動で分類して 1 つに畳んで表示するトグルボタン")
             .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.show_address_bar_omitted_entries,
+                "非表示 N 件",
+            )
+            .on_hover_text(
+                "同名でまとめた分・隠れている項目・開けない形式など、\
+                 一覧に出していないファイルの件数",
+            )
+            .changed();
 
         ui.separator();
         ui.label("場所▼に出す項目:");
@@ -8800,11 +8810,7 @@ impl App {
         if !self.settings.show_toolbar_facet_filter {
             return;
         }
-        let omitted_counts = self.current_normal_folder_omitted_counts();
-        let omitted_chip_visible = omitted_counts
-            .and_then(omitted_entries_chip_label)
-            .is_some();
-        if (self.items.is_empty() && !omitted_chip_visible) || self.items_are_drive_list {
+        if self.items.is_empty() || self.items_are_drive_list {
             return;
         }
 
@@ -8816,7 +8822,6 @@ impl App {
         let mut facet_name_changed = false;
         let mut bookmark_filter_changed = false;
         let mut reading_history_filter_changed = false;
-        let mut open_duplicate_settings = false;
         egui::TopBottomPanel::top("facet_filter_bar").show(ctx, |ui| {
             ui.add_space(1.0);
             ui.horizontal_wrapped(|ui| {
@@ -8827,12 +8832,6 @@ impl App {
                 show_sticky_context_menu(&filter_label_response, |ui| {
                     self.draw_facet_filter_bar_settings_menu(ui);
                 });
-                // これは削除判断にも関わる常設の可視性シグナルなので、個別に隠せる
-                // ToolbarFacetFilterItem にはしない。リリース済み enum の退避 carrier を
-                // 追加する手間以上に、誤って消せることの安全上の不利益が大きい。
-                if let Some(counts) = omitted_counts {
-                    open_duplicate_settings |= draw_omitted_entries_chip(ui, counts);
-                }
                 if self.items_are_reading_history_view {
                     egui::ComboBox::from_id_salt("reading_history_grid_media_filter")
                         .selected_text(format!(
@@ -9105,12 +9104,6 @@ impl App {
             });
             ui.add_space(1.0);
         });
-
-        if open_duplicate_settings {
-            self.open_preferences_page(
-                crate::ui_dialogs::preferences::PreferencesPage::DuplicateFiles,
-            );
-        }
 
         if rating_changed {
             self.drop_rating_filter_suppression_on_user_edit();
@@ -10736,7 +10729,11 @@ impl App {
         let subfolder_expansion_available = subfolder_expansion_on
             || subfolder_expansion_pending
             || self.subfolder_expansion_available();
-        let omitted_counts = (!self.settings.show_toolbar_facet_filter)
+        // 一覧から落ちるのは絞り込み条件ではなくフォルダそのものの既定動作なので、
+        // 利用者が手で条件を足す絞り込みバーではなくフォルダバーが定位置。
+        let omitted_counts = self
+            .settings
+            .show_address_bar_omitted_entries
             .then(|| self.current_normal_folder_omitted_counts())
             .flatten();
         let mut open_duplicate_settings = false;
