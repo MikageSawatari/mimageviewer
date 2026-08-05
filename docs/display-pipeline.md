@@ -949,7 +949,7 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 見開き / 連結読みのページ配置計算は引き続き `ui_fullscreen.rs` が担当し、その結果を
 `DisplayedImageTransform::from_resolved_rect` で共通レイアウトへ登録する。
 
-### 2.4.1 フルスクリーン静止画の GPU Lanczos3 縮小・標準拡大と NIS シャープ拡大
+### 2.4.1 フルスクリーン静止画の GPU Lanczos3 縮小・標準拡大と選択式拡大
 
 通常静止画は、上記の表示優先順位と
 `edit -> color -> final AI -> smart sharpen -> post_filter` の合成をすべて解決した**後**に、
@@ -958,9 +958,9 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 
 `FullscreenPaintResource` は `Direct / Resampleable / Lanczos` の typed state で、全 variant が
 元の `TextureHandle` を保持する。レイアウト、trim UV、回転、hit-test、pixel grid は元ハンドルの
-`size_vec2()` から従来どおり `DisplayedImageTransform` が解決する。縮小時、標準拡大時、シャープ拡大時だけ
+`size_vec2()` から従来どおり `DisplayedImageTransform` が解決する。縮小時、標準拡大時、シャープ拡大時、アニメ塗り拡大時だけ
 GPU resampler の native texture を別所有する (C-1)。`Lanczos` という resource variant 名はこの
-共有出力の既存所有境界を示し、実際の shader は `scale_branch` で Lanczos3 / NIS を区別する。縮小出力は従来どおり `TextureId` だけを
+共有出力の既存所有境界を示し、実際の shader は `scale_branch` で Lanczos3 / NIS / Anime4K を区別する。縮小出力は従来どおり `TextureId` だけを
 差し替え、拡大出力はその texture が表す元画像 UV も typed resource に保持して同じ
 `DisplayedImageTransform` 上の対応位置へ描く。level 0 の `Rgba8Unorm` source を vertical
 `Rgba16Float`、horizontal `Rgba8Unorm` の 2 pass で直接リサンプルする。box mip 前縮小、
@@ -983,12 +983,17 @@ GPU resampler の native texture を別所有する (C-1)。`Lanczos` という 
   NVIDIA Image Scaling で生成する。公式 SDK の 64 位相係数と 6×6 support を 1 pass fragment
   shader へ移植し、倍率上限は持たない。alpha は bilinear のまま USM の対象外とし、
   premultiplied RGB を alpha 以下に保つ。
+- 1.0 超かつ `PostFilter::UpscaleAnime`: 同じ可視 source 領域と目標寸法を、17 枚の
+  `RGBA16Float` 中間 texture を使う x2 VL 多段処理で生成する。alpha は bilinear のまま保ち、
+  premultiplied RGB を alpha 以下に保つ。可視 source 領域の長辺が設定上限（2048px /
+  4096px / 制限なし、既定 4096px）を超える場合は、中間 texture を確保する前に同じ領域の
+  `UpscaleLanczos` へ切り替える。上限ちょうどは処理対象とする。
 - 1.0 超かつ CRT / レトロ / セピア等の効果 post-filter: 元 `TextureId` を直接 paint し、
   従来の LINEAR を維持。拡大方式と効果は独立選択にしない。
 
 拡大出力は一辺 8192px、総画素 4096×4096 相当までとし、いずれかを超える場合は
 resampler texture を生成せず従来の LINEAR 表示へ戻す。フォールバックは同じ source generation
-と branch につき一度 `gpu/lanczos_upscale_limit_fallback` へ記録し、標準とシャープ拡大は
+と branch につき一度 `gpu/lanczos_upscale_limit_fallback` へ記録し、3 種の拡大は
 `scale_branch` フィールドで区別する。
 
 単ページ、見開きの各ページ、縦 / 横連結読み、page transition、nav / colorize holdover、
@@ -1010,8 +1015,9 @@ fullscreen close / invalidation / context park・swap / 連結読み keep-set �
 総画素 4096×4096 相当の 2 枚分を追加上限として古い entry を落とし、縮小 cache の保持規則は変えない。
 perf log の
 `gpu/lanczos_regenerate` に source / target、smoothing percent / blur、推定 fetch 数、
-encode + submit CPU 時間、累積再生成回数、拡大 / 縮小の別を記録する。Lanczos3 と NIS は
-event 名を共用し、`scale_branch` (`upscale` / `upscale_nis`) で区別する。拡大時はさらに、
+encode + submit CPU 時間、累積再生成回数、拡大 / 縮小の別を記録する。Lanczos3 / NIS /
+Anime4K は event 名を共用し、`scale_branch` (`upscale` / `upscale_nis` / `upscale_anime`)
+で区別する。拡大時はさらに、
 生成元となった source pixel 領域の x / y / width / height を記録する。
 
 静止画の最終フィット矩形は `fullscreen_media_rect` が所有する。下部ページシークバー固定時は

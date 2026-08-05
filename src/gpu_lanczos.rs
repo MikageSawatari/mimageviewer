@@ -13,6 +13,10 @@ use std::{
 use wgpu::util::DeviceExt as _;
 
 use crate::{adjustment::PostFilter, displayed_image_transform::physical_scale_is_near_integer};
+use crate::{
+    gpu_anime4k::{Anime4kJob, Anime4kPlan, Anime4kResampler},
+    settings::AnimeUpscaleSourceLimit,
+};
 
 const LANCZOS3_SHADER: &str = include_str!("gpu_lanczos_spike.wgsl");
 const VISIBLE_UPSCALE_LANCZOS3_SHADER: &str = include_str!("gpu_lanczos_visible_upscale.wgsl");
@@ -37,6 +41,7 @@ pub(crate) enum FullscreenPaintScaleBranch {
     OriginalOneToOne,
     UpscaleLanczos,
     UpscaleNis,
+    UpscaleAnime,
     OriginalUpscale,
 }
 
@@ -44,7 +49,7 @@ impl FullscreenPaintScaleBranch {
     fn uses_resampler(self) -> bool {
         matches!(
             self,
-            Self::DownscaleLanczos | Self::UpscaleLanczos | Self::UpscaleNis
+            Self::DownscaleLanczos | Self::UpscaleLanczos | Self::UpscaleNis | Self::UpscaleAnime
         )
     }
 
@@ -54,6 +59,7 @@ impl FullscreenPaintScaleBranch {
             Self::OriginalOneToOne => "one_to_one",
             Self::UpscaleLanczos => "upscale",
             Self::UpscaleNis => "upscale_nis",
+            Self::UpscaleAnime => "upscale_anime",
             Self::OriginalUpscale => "original_upscale",
         }
     }
@@ -75,6 +81,7 @@ pub(crate) fn fullscreen_paint_scale_branch(
         match post_filter {
             PostFilter::None => FullscreenPaintScaleBranch::UpscaleLanczos,
             PostFilter::UpscaleSharp => FullscreenPaintScaleBranch::UpscaleNis,
+            PostFilter::UpscaleAnime => FullscreenPaintScaleBranch::UpscaleAnime,
             _ => FullscreenPaintScaleBranch::OriginalUpscale,
         }
     }
@@ -338,6 +345,7 @@ enum LanczosTargetDecision {
 #[derive(Default)]
 pub(crate) struct GpuLanczosCache {
     resampler: Option<Lanczos3Resampler>,
+    anime_resampler: Option<Anime4kResampler>,
     entries: HashMap<LanczosCacheKey, LanczosCacheEntry>,
     use_clock: u64,
     regeneration_count: u64,
@@ -355,11 +363,12 @@ impl GpuLanczosCache {
         visible_source_uv_rect: Option<egui::Rect>,
         post_filter: PostFilter,
         smoothing_percent: u32,
+        anime_source_limit: AnimeUpscaleSourceLimit,
     ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
         let smoothing_percent =
             crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
         self.sync_smoothing_percent(smoothing_percent);
-        let scale_branch =
+        let mut scale_branch =
             fullscreen_paint_scale_branch(logical_scale, pixels_per_point, post_filter);
         if resource.resampleable_parts().is_none() || !scale_branch.uses_resampler() {
             return (resource.original_resampleable(), None);
@@ -378,6 +387,12 @@ impl GpuLanczosCache {
         ) else {
             return (resource.original_resampleable(), None);
         };
+        scale_branch = scale_branch_with_anime_source_limit(
+            scale_branch,
+            source_size,
+            source_region,
+            anime_source_limit,
+        );
         if source_region == LanczosSourceRegionKey::Full && target_size == source_size {
             return (resource.original_resampleable(), None);
         }
@@ -474,19 +489,29 @@ impl GpuLanczosCache {
         else {
             return (resource.original_resampleable(), None);
         };
-        let resampler = self
-            .resampler
-            .get_or_insert_with(|| Lanczos3Resampler::new(&render_state.device));
         let job = match plan {
-            LanczosWorkPlan::Full(plan) => resampler
+            LanczosWorkPlan::AnimeUpscale(plan) => self
+                .anime_resampler
+                .get_or_insert_with(|| Anime4kResampler::new(&render_state.device))
                 .prepare_job(&render_state.device, source_texture, plan)
-                .map(LanczosWorkJob::Full),
-            LanczosWorkPlan::VisibleUpscale(plan) => resampler
-                .prepare_visible_upscale_job(&render_state.device, source_texture, plan)
-                .map(LanczosWorkJob::VisibleUpscale),
-            LanczosWorkPlan::NisUpscale(plan) => resampler
-                .prepare_nis_upscale_job(&render_state.device, source_texture, plan)
-                .map(LanczosWorkJob::NisUpscale),
+                .map(LanczosWorkJob::AnimeUpscale),
+            plan => {
+                let resampler = self
+                    .resampler
+                    .get_or_insert_with(|| Lanczos3Resampler::new(&render_state.device));
+                match plan {
+                    LanczosWorkPlan::Full(plan) => resampler
+                        .prepare_job(&render_state.device, source_texture, plan)
+                        .map(LanczosWorkJob::Full),
+                    LanczosWorkPlan::VisibleUpscale(plan) => resampler
+                        .prepare_visible_upscale_job(&render_state.device, source_texture, plan)
+                        .map(LanczosWorkJob::VisibleUpscale),
+                    LanczosWorkPlan::NisUpscale(plan) => resampler
+                        .prepare_nis_upscale_job(&render_state.device, source_texture, plan)
+                        .map(LanczosWorkJob::NisUpscale),
+                    LanczosWorkPlan::AnimeUpscale(_) => unreachable!(),
+                }
+            }
         };
         let job = match job {
             Ok(job) => job,
@@ -542,6 +567,12 @@ impl GpuLanczosCache {
                     .as_ref()
                     .unwrap()
                     .encode_nis_upscale(&mut encoder, job);
+            }
+            LanczosWorkJob::AnimeUpscale(job) => {
+                self.anime_resampler
+                    .as_ref()
+                    .unwrap()
+                    .encode(&mut encoder, job);
             }
         }
         rs.queue.submit(Some(encoder.finish()));
@@ -664,6 +695,7 @@ impl GpuLanczosCache {
                         key.scale_branch,
                         FullscreenPaintScaleBranch::UpscaleLanczos
                             | FullscreenPaintScaleBranch::UpscaleNis
+                            | FullscreenPaintScaleBranch::UpscaleAnime
                     )
                 })
                 .fold(0_u64, |pixels, (key, _)| {
@@ -680,6 +712,7 @@ impl GpuLanczosCache {
                         key.scale_branch,
                         FullscreenPaintScaleBranch::UpscaleLanczos
                             | FullscreenPaintScaleBranch::UpscaleNis
+                            | FullscreenPaintScaleBranch::UpscaleAnime
                     )
                 })
                 .min_by_key(|(_, entry)| entry.last_used)
@@ -895,10 +928,17 @@ enum LanczosWorkPlan {
     Full(LanczosPlan),
     VisibleUpscale(VisibleUpscalePlan),
     NisUpscale(NisUpscalePlan),
+    AnimeUpscale(Anime4kPlan),
 }
 
 fn work_plan_for_key(source_size: [u32; 2], key: LanczosCacheKey) -> Result<LanczosWorkPlan, ()> {
     match (key.scale_branch, key.source_region) {
+        (FullscreenPaintScaleBranch::UpscaleAnime, source_region) => {
+            let source_uv_rect = source_region.visible_rect().ok_or(())?;
+            let source_region_px = source_region_pixels(source_size, source_uv_rect)?;
+            Anime4kPlan::new(source_size, key.target_size, source_region_px)
+                .map(LanczosWorkPlan::AnimeUpscale)
+        }
         (FullscreenPaintScaleBranch::UpscaleNis, source_region) => {
             let source_uv_rect = source_region.visible_rect().unwrap_or_else(|| {
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
@@ -925,6 +965,7 @@ impl LanczosWorkPlan {
             Self::Full(plan) => plan.source_size,
             Self::VisibleUpscale(plan) => plan.source_size,
             Self::NisUpscale(plan) => plan.source_size,
+            Self::AnimeUpscale(plan) => plan.source_size,
         }
     }
 
@@ -933,20 +974,21 @@ impl LanczosWorkPlan {
             Self::Full(plan) => plan.target_size,
             Self::VisibleUpscale(plan) => plan.target_size,
             Self::NisUpscale(plan) => plan.target_size,
+            Self::AnimeUpscale(plan) => plan.target_size,
         }
     }
 
     fn smoothing_percent(self) -> u32 {
         match self {
             Self::Full(plan) => plan.smoothing_percent,
-            Self::VisibleUpscale(_) | Self::NisUpscale(_) => 0,
+            Self::VisibleUpscale(_) | Self::NisUpscale(_) | Self::AnimeUpscale(_) => 0,
         }
     }
 
     fn blur_factor(self) -> f32 {
         match self {
             Self::Full(plan) => plan.blur_factor,
-            Self::VisibleUpscale(_) | Self::NisUpscale(_) => 1.0,
+            Self::VisibleUpscale(_) | Self::NisUpscale(_) | Self::AnimeUpscale(_) => 1.0,
         }
     }
 
@@ -955,6 +997,7 @@ impl LanczosWorkPlan {
             Self::Full(plan) => plan.texture_fetches,
             Self::VisibleUpscale(plan) => plan.texture_fetches,
             Self::NisUpscale(plan) => plan.texture_fetches,
+            Self::AnimeUpscale(plan) => plan.texture_fetches,
         }
     }
 
@@ -963,6 +1006,7 @@ impl LanczosWorkPlan {
             Self::Full(_) => None,
             Self::VisibleUpscale(plan) => Some(plan.source_region_px),
             Self::NisUpscale(plan) => Some(plan.source_region_px),
+            Self::AnimeUpscale(plan) => Some(plan.source_region_px),
         }
     }
 }
@@ -996,7 +1040,9 @@ fn target_and_source_region_for_branch(
             quantized_target_size(source_size, physical_scale, TARGET_SIZE_QUANTUM),
             LanczosSourceRegionKey::Full,
         )),
-        FullscreenPaintScaleBranch::UpscaleLanczos | FullscreenPaintScaleBranch::UpscaleNis => {
+        FullscreenPaintScaleBranch::UpscaleLanczos
+        | FullscreenPaintScaleBranch::UpscaleNis
+        | FullscreenPaintScaleBranch::UpscaleAnime => {
             let visible = sanitize_visible_source_rect(visible_source_uv_rect?)?;
             let source_region_px = source_region_pixels(source_size, visible).ok()?;
             let target_size = [
@@ -1049,6 +1095,44 @@ fn source_region_pixels(source_size: [u32; 2], source_uv_rect: egui::Rect) -> Re
     Ok([min_x, min_y, width, height])
 }
 
+pub(crate) fn anime_source_region_dimensions(
+    source_size: [u32; 2],
+    source_uv_rect: egui::Rect,
+) -> Option<[u32; 2]> {
+    let region = source_region_pixels(source_size, source_uv_rect).ok()?;
+    Some([region[2].ceil() as u32, region[3].ceil() as u32])
+}
+
+fn anime_source_region_within_limit(
+    source_size: [u32; 2],
+    source_region: LanczosSourceRegionKey,
+    limit: AnimeUpscaleSourceLimit,
+) -> bool {
+    let Some(max_long_edge) = limit.max_long_edge() else {
+        return true;
+    };
+    let dimensions = match source_region.visible_rect() {
+        Some(rect) => anime_source_region_dimensions(source_size, rect),
+        None => Some(source_size),
+    };
+    dimensions.is_some_and(|size| size[0].max(size[1]) <= max_long_edge)
+}
+
+fn scale_branch_with_anime_source_limit(
+    branch: FullscreenPaintScaleBranch,
+    source_size: [u32; 2],
+    source_region: LanczosSourceRegionKey,
+    limit: AnimeUpscaleSourceLimit,
+) -> FullscreenPaintScaleBranch {
+    if branch == FullscreenPaintScaleBranch::UpscaleAnime
+        && !anime_source_region_within_limit(source_size, source_region, limit)
+    {
+        FullscreenPaintScaleBranch::UpscaleLanczos
+    } else {
+        branch
+    }
+}
+
 fn target_pixels(size: [u32; 2]) -> u64 {
     u64::from(size[0]).saturating_mul(u64::from(size[1]))
 }
@@ -1065,7 +1149,9 @@ fn lanczos_target_decision(
 ) -> LanczosTargetDecision {
     if matches!(
         scale_branch,
-        FullscreenPaintScaleBranch::UpscaleLanczos | FullscreenPaintScaleBranch::UpscaleNis
+        FullscreenPaintScaleBranch::UpscaleLanczos
+            | FullscreenPaintScaleBranch::UpscaleNis
+            | FullscreenPaintScaleBranch::UpscaleAnime
     ) && !upscale_target_within_limits(target_size)
     {
         LanczosTargetDecision::OriginalFallback
@@ -1457,6 +1543,7 @@ enum LanczosWorkJob {
     Full(LanczosJob),
     VisibleUpscale(LanczosJob),
     NisUpscale(NisJob),
+    AnimeUpscale(Anime4kJob),
 }
 
 impl LanczosWorkJob {
@@ -1464,6 +1551,7 @@ impl LanczosWorkJob {
         match self {
             Self::Full(job) | Self::VisibleUpscale(job) => &job.output_view,
             Self::NisUpscale(job) => &job.output_view,
+            Self::AnimeUpscale(job) => job.output_view(),
         }
     }
 
@@ -1471,6 +1559,7 @@ impl LanczosWorkJob {
         match self {
             Self::Full(job) | Self::VisibleUpscale(job) => job.output_texture,
             Self::NisUpscale(job) => job.output_texture,
+            Self::AnimeUpscale(job) => job.into_output_texture(),
         }
     }
 }
@@ -1642,11 +1731,23 @@ mod tests {
             FullscreenPaintScaleBranch::UpscaleNis
         );
         assert_eq!(
+            fullscreen_paint_scale_branch(2.0, 1.0, PostFilter::UpscaleAnime),
+            FullscreenPaintScaleBranch::UpscaleAnime
+        );
+        assert_eq!(
             fullscreen_paint_scale_branch(0.75, 1.0, PostFilter::UpscaleSharp),
             FullscreenPaintScaleBranch::DownscaleLanczos
         );
         assert_eq!(
             fullscreen_paint_scale_branch(1.0, 1.0, PostFilter::UpscaleSharp),
+            FullscreenPaintScaleBranch::OriginalOneToOne
+        );
+        assert_eq!(
+            fullscreen_paint_scale_branch(0.75, 1.0, PostFilter::UpscaleAnime),
+            FullscreenPaintScaleBranch::DownscaleLanczos
+        );
+        assert_eq!(
+            fullscreen_paint_scale_branch(1.0, 1.0, PostFilter::UpscaleAnime),
             FullscreenPaintScaleBranch::OriginalOneToOne
         );
         assert_eq!(
@@ -1756,6 +1857,58 @@ mod tests {
             Some(visible),
         );
         assert_eq!(nis, lanczos);
+        let anime = target_and_source_region_for_branch(
+            source,
+            2.5,
+            FullscreenPaintScaleBranch::UpscaleAnime,
+            Some(visible),
+        );
+        assert_eq!(anime, lanczos);
+    }
+
+    #[test]
+    fn anime_source_long_edge_limit_allows_boundary_and_falls_back_above_it() {
+        let exact = LanczosSourceRegionKey::from_visible_rect(egui::Rect::from_min_max(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(0.5, 1.0),
+        ));
+        assert!(anime_source_region_within_limit(
+            [4096, 4096],
+            exact,
+            AnimeUpscaleSourceLimit::Px4096,
+        ));
+        let over = LanczosSourceRegionKey::from_visible_rect(egui::Rect::from_min_max(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(1.0, 1.0),
+        ));
+        assert!(!anime_source_region_within_limit(
+            [4097, 2048],
+            over,
+            AnimeUpscaleSourceLimit::Px4096,
+        ));
+        assert_eq!(
+            scale_branch_with_anime_source_limit(
+                FullscreenPaintScaleBranch::UpscaleAnime,
+                [4097, 2048],
+                over,
+                AnimeUpscaleSourceLimit::Px4096,
+            ),
+            FullscreenPaintScaleBranch::UpscaleLanczos,
+        );
+        assert_eq!(
+            scale_branch_with_anime_source_limit(
+                FullscreenPaintScaleBranch::UpscaleAnime,
+                [4096, 4096],
+                exact,
+                AnimeUpscaleSourceLimit::Px4096,
+            ),
+            FullscreenPaintScaleBranch::UpscaleAnime,
+        );
+        assert!(anime_source_region_within_limit(
+            [10000, 10000],
+            over,
+            AnimeUpscaleSourceLimit::Unlimited,
+        ));
     }
 
     #[test]
@@ -1878,6 +2031,28 @@ mod tests {
     }
 
     #[test]
+    fn anime_work_plan_keeps_all_intermediates_at_expanded_source_resolution() {
+        let visible = egui::Rect::from_min_max(egui::pos2(0.25, 0.25), egui::pos2(0.75, 0.75));
+        let key = LanczosCacheKey {
+            page_idx: 0,
+            source_texture_id: egui::TextureId::Managed(2),
+            generation: FullscreenPaintSourceGeneration { items: 1, input: 1 },
+            target_size: [2048, 2048],
+            smoothing_percent: 0,
+            scale_branch: FullscreenPaintScaleBranch::UpscaleAnime,
+            source_region: LanczosSourceRegionKey::from_visible_rect(visible),
+        };
+        let LanczosWorkPlan::AnimeUpscale(plan) = work_plan_for_key([2048, 2048], key).unwrap()
+        else {
+            panic!("anime upscale must use its dedicated work plan");
+        };
+        assert_eq!(plan.source_region_px, [512.0, 512.0, 1024.0, 1024.0]);
+        assert_eq!(plan.process_origin, [504, 504]);
+        assert_eq!(plan.process_size, [1040, 1040]);
+        assert!(plan.texture_fetches > 0);
+    }
+
+    #[test]
     fn source_generation_is_cache_identity() {
         let base = LanczosCacheKey {
             page_idx: 3,
@@ -1908,6 +2083,12 @@ mod tests {
             ..base
         };
         assert_ne!(branch_changed, nis_branch);
+        let anime_branch = LanczosCacheKey {
+            scale_branch: FullscreenPaintScaleBranch::UpscaleAnime,
+            ..base
+        };
+        assert_ne!(branch_changed, anime_branch);
+        assert_ne!(nis_branch, anime_branch);
         let lanczos_fallback = LanczosFallbackSourceKey {
             page_idx: base.page_idx,
             source_texture_id: base.source_texture_id,
@@ -1919,6 +2100,11 @@ mod tests {
             ..lanczos_fallback
         };
         assert_ne!(lanczos_fallback, nis_fallback);
+        let anime_fallback = LanczosFallbackSourceKey {
+            scale_branch: FullscreenPaintScaleBranch::UpscaleAnime,
+            ..lanczos_fallback
+        };
+        assert_ne!(nis_fallback, anime_fallback);
         let source_region_changed = LanczosCacheKey {
             source_region: LanczosSourceRegionKey::from_visible_rect(egui::Rect::from_min_max(
                 egui::pos2(0.0, 0.0),
@@ -2050,6 +2236,15 @@ mod tests {
             wgpu::naga::valid::Capabilities::all(),
         )
         .validate(&nis_module)
+        .unwrap();
+
+        let anime_module =
+            wgpu::naga::front::wgsl::parse_str(crate::gpu_anime4k::ANIME4K_SHADER).unwrap();
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&anime_module)
         .unwrap();
     }
 }

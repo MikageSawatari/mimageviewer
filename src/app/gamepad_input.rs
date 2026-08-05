@@ -158,6 +158,7 @@ const POST_FILTER_GROUP_BASIC: &[PostFilter] = &[
     PostFilter::None,
     PostFilter::Nearest,
     PostFilter::UpscaleSharp,
+    PostFilter::UpscaleAnime,
 ];
 const POST_FILTER_GROUP_CRT: &[PostFilter] = &[
     PostFilter::CrtSimple,

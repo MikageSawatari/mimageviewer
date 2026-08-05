@@ -208,6 +208,10 @@ const FS_POST_FILTER_DIRECT_ACTIONS: &[(KeyAction, PostFilter)] = &[
         KeyAction::FsPostFilterUpscaleSharp,
         PostFilter::UpscaleSharp,
     ),
+    (
+        KeyAction::FsPostFilterUpscaleAnime,
+        PostFilter::UpscaleAnime,
+    ),
     (KeyAction::FsPostFilterCrtSimple, PostFilter::CrtSimple),
     (KeyAction::FsPostFilterCrtFull, PostFilter::CrtFull),
     (KeyAction::FsPostFilterCrtArcade, PostFilter::CrtArcade),
@@ -2295,6 +2299,7 @@ impl App {
             visible_source_uv_rect,
             post_filter,
             self.settings.downscale_smoothing_percent,
+            self.settings.anime_upscale_source_limit,
         );
         if let Some(perf_event) = perf_event
             && crate::perf::is_enabled()
@@ -11614,9 +11619,12 @@ impl App {
             let h = pixels.size[1] as u32;
             let limit = self.settings.ai_upscale_limit();
             if !crate::ai::upscale::should_process_rect(w, h, limit) {
-                toast.push_str(&format!(
-                    "\n(解像度が高いためアップスケール処理無効: {w}×{h} は上限 {} 未満の範囲外)",
-                    limit.label()
+                toast.push('\n');
+                toast.push_str(&crate::ui_helpers::processing_size_disabled_toast_line(
+                    "アップスケール",
+                    w,
+                    h,
+                    &format!("{} 未満", limit.label()),
                 ));
             }
         }
@@ -11627,29 +11635,62 @@ impl App {
         });
     }
 
+    pub(crate) fn anime_upscale_limit_warning(
+        &self,
+        fs_idx: usize,
+        pixels_per_point: f32,
+    ) -> Option<([u32; 2], u32)> {
+        let limit = self.settings.anime_upscale_source_limit.max_long_edge()?;
+        let transform = self.fullscreen_page_layout.page_by_idx(fs_idx)?.transform;
+        if crate::gpu_lanczos::fullscreen_paint_scale_branch(
+            transform.total_scale,
+            pixels_per_point,
+            PostFilter::UpscaleAnime,
+        ) != crate::gpu_lanczos::FullscreenPaintScaleBranch::UpscaleAnime
+        {
+            return None;
+        }
+        let visible = transform.visible_source_uv_rect(transform.viewport_rect)?;
+        let source_size = [
+            transform.texture_size.x.round().max(1.0) as u32,
+            transform.texture_size.y.round().max(1.0) as u32,
+        ];
+        let size = crate::gpu_lanczos::anime_source_region_dimensions(source_size, visible)?;
+        (size[0].max(size[1]) > limit).then_some((size, limit))
+    }
+
     fn apply_fullscreen_post_filter_selection(
         &mut self,
         fs_idx: usize,
         next: PostFilter,
         shortcut_label: &'static str,
+        pixels_per_point: f32,
     ) {
         let scope = self.resolve_adjust_scope(fs_idx);
         let old_params = self.effective_params(fs_idx).clone();
-        if old_params.post_filter == next {
-            self.show_feedback_toast(format!(
-                "[{shortcut_label}: {} / {}]",
-                scope.label(),
-                next.display_label()
+        let mut toast = format!(
+            "[{shortcut_label}: {} / {}]",
+            scope.label(),
+            next.display_label()
+        );
+        if next == PostFilter::UpscaleAnime
+            && let Some((size, limit)) = self.anime_upscale_limit_warning(fs_idx, pixels_per_point)
+        {
+            toast.push('\n');
+            toast.push_str(&crate::ui_helpers::processing_size_disabled_toast_line(
+                "アニメ塗り拡大",
+                size[0],
+                size[1],
+                &format!("長辺 {limit}px 以下"),
             ));
+        }
+        if old_params.post_filter == next {
+            self.show_feedback_toast(toast);
             return;
         }
         let mut params = old_params.clone();
         params.post_filter = next;
-        self.show_feedback_toast(format!(
-            "[{shortcut_label}: {} / {}]",
-            scope.label(),
-            next.display_label()
-        ));
+        self.show_feedback_toast(toast);
         self.capture_adjust_full(
             format!("ポストフィルタ: {}", next.display_label()),
             |app| {
@@ -13129,7 +13170,12 @@ impl App {
         if let Some(palette) = colorize_direct {
             self.apply_fullscreen_colorize_selection(fs_idx, palette, "カラー化");
         } else if let Some(filter) = post_filter_direct {
-            self.apply_fullscreen_post_filter_selection(fs_idx, filter, "PF");
+            self.apply_fullscreen_post_filter_selection(
+                fs_idx,
+                filter,
+                "PF",
+                ctx.pixels_per_point(),
+            );
         } else if key_t || key_t_shift || key_t_alt {
             let all = PostFilter::ALL;
             let cur = all
@@ -13144,7 +13190,7 @@ impl App {
                 (cur + 1) % all.len()
             };
             let next = all[next_idx];
-            self.apply_fullscreen_post_filter_selection(fs_idx, next, "T");
+            self.apply_fullscreen_post_filter_selection(fs_idx, next, "T", ctx.pixels_per_point());
         }
 
         // Ctrl+数字キー: 保存スロットを現在ページに適用 (= ページ個別化)
@@ -25658,7 +25704,7 @@ mod tests {
             Some(model.as_str())
         );
 
-        app.apply_fullscreen_post_filter_selection(idx, PostFilter::Sepia, "T");
+        app.apply_fullscreen_post_filter_selection(idx, PostFilter::Sepia, "T", 1.0);
         assert_eq!(app.effective_params(idx).post_filter, PostFilter::Sepia);
 
         app.apply_fullscreen_colorize_selection(

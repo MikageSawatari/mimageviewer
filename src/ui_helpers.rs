@@ -21,6 +21,19 @@ pub(crate) const ERROR_TEXT_COLOR: eframe::egui::Color32 =
 #[allow(dead_code)]
 pub(crate) const ERROR_TEXT_SIZE: f32 = 13.0;
 
+pub(crate) fn processing_size_outside_note(bound: &str) -> String {
+    format!("（この画像は処理対象サイズ {bound}の範囲外なので実行されません）")
+}
+
+pub(crate) fn processing_size_disabled_toast_line(
+    process: &str,
+    width: u32,
+    height: u32,
+    bound: &str,
+) -> String {
+    format!("(解像度が高いため{process}処理無効: {width}×{height} は上限 {bound}の範囲外)")
+}
+
 /// 進捗バーのラベル色（グリッド/フルスクリーン共通）。
 ///
 /// `#[allow(dead_code)]` は lib クレート側で使用者が見えないため。実体は
@@ -1534,6 +1547,18 @@ pub fn draw_centered_elided_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn processing_size_messages_share_the_ai_wording() {
+        assert_eq!(
+            processing_size_outside_note("4096×4096 未満"),
+            "（この画像は処理対象サイズ 4096×4096 未満の範囲外なので実行されません）"
+        );
+        assert_eq!(
+            processing_size_disabled_toast_line("アニメ塗り拡大", 4097, 2048, "長辺 4096px 以下",),
+            "(解像度が高いためアニメ塗り拡大処理無効: 4097×2048 は上限 長辺 4096px 以下の範囲外)"
+        );
+    }
 
     #[test]
     fn manual_url_places_fragment_after_version_query() {

@@ -8191,6 +8191,7 @@ fn draw_sliders(
     ai_feature_mode: crate::settings::AiFeatureMode,
     ai_denoise_disabled_limit: Option<crate::ai::upscale::AiProcessSizeLimit>,
     ai_upscale_disabled_limit: Option<crate::ai::upscale::AiProcessSizeLimit>,
+    anime_upscale_disabled_limit: Option<([u32; 2], u32)>,
 ) -> (bool, bool, bool) {
     let mut changed = false;
     let mut dragging = false;
@@ -8432,10 +8433,10 @@ fn draw_sliders(
         );
         if let Some(limit) = ai_denoise_disabled_limit {
             ui.label(
-                egui::RichText::new(format!(
-                    "（この画像は処理対象サイズ {} 未満の範囲外なので実行されません）",
+                egui::RichText::new(crate::ui_helpers::processing_size_outside_note(&format!(
+                    "{} 未満",
                     limit.label()
-                ))
+                )))
                 .size(SECTION_FONT - 1.0)
                 .weak()
                 .italics(),
@@ -8488,10 +8489,10 @@ fn draw_sliders(
         );
         if let Some(limit) = ai_upscale_disabled_limit {
             ui.label(
-                egui::RichText::new(format!(
-                    "（この画像は処理対象サイズ {} 未満の範囲外なので実行されません）",
+                egui::RichText::new(crate::ui_helpers::processing_size_outside_note(&format!(
+                    "{} 未満",
                     limit.label()
-                ))
+                )))
                 .size(SECTION_FONT - 1.0)
                 .weak()
                 .italics(),
@@ -8718,6 +8719,23 @@ fn draw_sliders(
                 PostFilter::UpscaleSharp,
                 PostFilter::UpscaleSharp.display_label(),
             );
+            ui.radio_value(
+                &mut params.post_filter,
+                PostFilter::UpscaleAnime,
+                PostFilter::UpscaleAnime.display_label(),
+            );
+            if params.post_filter == PostFilter::UpscaleAnime
+                && let Some((_, limit)) = anime_upscale_disabled_limit
+            {
+                ui.label(
+                    egui::RichText::new(crate::ui_helpers::processing_size_outside_note(&format!(
+                        "長辺 {limit}px 以下"
+                    )))
+                    .size(SECTION_FONT - 1.0)
+                    .weak()
+                    .italics(),
+                );
+            }
             ui.separator();
             group_heading(ui, "── CRT ──");
             ui.radio_value(
@@ -13864,6 +13882,8 @@ impl App {
             }
             _ => None,
         };
+        let anime_upscale_disabled_limit =
+            self.anime_upscale_limit_warning(fs_idx, body_child.ctx().pixels_per_point());
 
         let scroll_output = body_child.allocate_ui_with_layout(
             egui::vec2(body_width, body_height),
@@ -14036,6 +14056,7 @@ impl App {
                             self.settings.ai_feature_mode,
                             ai_denoise_disabled_limit,
                             ai_upscale_disabled_limit,
+                            anime_upscale_disabled_limit,
                         );
 
                         // ── 全タブ共通操作 ──

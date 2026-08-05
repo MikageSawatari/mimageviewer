@@ -1427,6 +1427,7 @@ pub enum KeyAction {
     FsPostFilterReset,
     FsPostFilterNearest,
     FsPostFilterUpscaleSharp,
+    FsPostFilterUpscaleAnime,
     FsPostFilterCrtSimple,
     FsPostFilterCrtFull,
     FsPostFilterCrtArcade,
@@ -1848,6 +1849,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsPostFilterReset,
     KeyAction::FsPostFilterNearest,
     KeyAction::FsPostFilterUpscaleSharp,
+    KeyAction::FsPostFilterUpscaleAnime,
     KeyAction::FsPostFilterCrtSimple,
     KeyAction::FsPostFilterCrtFull,
     KeyAction::FsPostFilterCrtArcade,
@@ -3332,6 +3334,7 @@ impl KeyAction {
             FsPostFilterReset => "FsPostFilterReset",
             FsPostFilterNearest => "FsPostFilterNearest",
             FsPostFilterUpscaleSharp => "FsPostFilterUpscaleSharp",
+            FsPostFilterUpscaleAnime => "FsPostFilterUpscaleAnime",
             FsPostFilterCrtSimple => "FsPostFilterCrtSimple",
             FsPostFilterCrtFull => "FsPostFilterCrtFull",
             FsPostFilterCrtArcade => "FsPostFilterCrtArcade",
@@ -3875,6 +3878,7 @@ impl KeyAction {
             FsPostFilterReset => "ポストフィルタを標準に戻す",
             FsPostFilterNearest => "ポストフィルタをニアレスト（補間なし）にする",
             FsPostFilterUpscaleSharp => "ポストフィルタをシャープ拡大にする",
+            FsPostFilterUpscaleAnime => "ポストフィルタをアニメ塗り拡大にする",
             FsPostFilterCrtSimple => "ポストフィルタをCRT シンプル（控えめ）にする",
             FsPostFilterCrtFull => "ポストフィルタをCRT フル（歪み+強グロー）にする",
             FsPostFilterCrtArcade => "ポストフィルタをCRT アーケード（高コントラスト）にする",
@@ -4283,6 +4287,7 @@ impl KeyAction {
             | FsPostFilterReset
             | FsPostFilterNearest
             | FsPostFilterUpscaleSharp
+            | FsPostFilterUpscaleAnime
             | FsPostFilterCrtSimple
             | FsPostFilterCrtFull
             | FsPostFilterCrtArcade
@@ -4677,6 +4682,7 @@ impl KeyAction {
             | FsPostFilterReset
             | FsPostFilterNearest
             | FsPostFilterUpscaleSharp
+            | FsPostFilterUpscaleAnime
             | FsPostFilterCrtSimple
             | FsPostFilterCrtFull
             | FsPostFilterCrtArcade
@@ -5107,6 +5113,7 @@ impl KeyAction {
             FsPostFilterReset => ChordList::one(Chord::alt(T)),
             FsPostFilterNearest
             | FsPostFilterUpscaleSharp
+            | FsPostFilterUpscaleAnime
             | FsPostFilterCrtSimple
             | FsPostFilterCrtFull
             | FsPostFilterCrtArcade
@@ -8641,6 +8648,7 @@ mod tests {
             KeyAction::FsAiModelRealEsrGeneralV3,
             KeyAction::FsPostFilterNearest,
             KeyAction::FsPostFilterUpscaleSharp,
+            KeyAction::FsPostFilterUpscaleAnime,
             KeyAction::FsPostFilterCrtSimple,
             KeyAction::FsPostFilterCrtFull,
             KeyAction::FsPostFilterCrtArcade,

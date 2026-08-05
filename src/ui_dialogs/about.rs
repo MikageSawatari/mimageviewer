@@ -72,6 +72,10 @@ impl App {
                         ui.label("MIT — NVIDIA CORPORATION & AFFILIATES");
                         ui.end_row();
 
+                        ui.label("Anime4K");
+                        ui.label("MIT — bloc97");
+                        ui.end_row();
+
                         ui.label("4x-NMKD-Siax-200k");
                         ui.label("WTFPL — Nmkd");
                         ui.end_row();

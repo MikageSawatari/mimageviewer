@@ -1,6 +1,6 @@
 # 静止画 拡大アルゴリズムの選定
 
-ステータス: **比較完了。標準拡大へ Lanczos3、選択式のシャープ拡大へ NIS を実装済み**
+ステータス: **比較完了。標準 Lanczos3、選択式の NIS / アニメ塗り拡大を実装済み**
 対象: [next-release-backlog.md](next-release-backlog.md) §1.46 (静止画の拡大)
 関連: [dot-by-dot-and-downscale-plan.md](dot-by-dot-and-downscale-plan.md) (縮小側の正本) /
 [display-pipeline.md](display-pipeline.md)
@@ -325,4 +325,18 @@ NVIDIA Image Scaling を使う。`PostFilter::None` の Lanczos3 は既定のま
 - 物理 1.0 倍は元 texture、1.0 未満は既存 `DownscaleLanczos` のまま。`UpscaleSharp` を選んでも
   縮小シェーダ・なめらかさ・cache identity は変更しない
 
-Anime4K（線画・イラスト）は引き続き後続候補であり、この実装には含めない。
+さらに `PostFilter::UpscaleAnime`（アニメ塗り拡大）を選んだ物理 1.0 倍超の表示には、
+Anime4K x2 VL を WGSL へ生成変換した多段処理を使う。
+
+- 17 個の畳み込み出力を元 source 領域解像度の `RGBA16Float` に保持し、最後の
+  Depth-to-Space 相当を任意の表示目標寸法へ直接解決する。CReLU の正負特徴と最終 14 枚の
+  同時入力を維持するため、中間 texture の使い回しはしない
+- alpha はネットワークへ入れず bilinear のまま保ち、補正後の premultiplied RGB を alpha
+  以下へ clamp する
+- 可視 source 領域、目標寸法、出力上限、context 別 cache / LRU、perf event 名は標準拡大・
+  シャープ拡大と共通にし、cache / perf の `scale_branch=upscale_anime` で結果を分離する
+- 中間 texture の負荷を制限するため、可視 source 領域の長辺上限を 2048px / 4096px /
+  制限なしから選べる（既定 4096px）。境界値は処理し、超過時は同じ可視領域・目標寸法の
+  `UpscaleLanczos` へ、専用 texture を確保する前にフォールバックする
+- §4.5 のとおり網点へ低周波のうねりを作る欠点があるため、線画・ベタ塗り向けの選択肢に
+  留め、**既定にはしない**。既定の `PostFilter::None` は Lanczos3 のまま変更しない

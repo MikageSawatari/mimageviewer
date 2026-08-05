@@ -2971,6 +2971,35 @@ pub fn downscale_smoothing_blur_factor(percent: u32) -> f32 {
     1.0 + sanitize_downscale_smoothing_percent(percent) as f32 * 0.003
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnimeUpscaleSourceLimit {
+    Px2048,
+    #[default]
+    Px4096,
+    Unlimited,
+}
+
+impl AnimeUpscaleSourceLimit {
+    pub const ALL: [Self; 3] = [Self::Px2048, Self::Px4096, Self::Unlimited];
+
+    pub fn max_long_edge(self) -> Option<u32> {
+        match self {
+            Self::Px2048 => Some(2048),
+            Self::Px4096 => Some(4096),
+            Self::Unlimited => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Px2048 => "2048px",
+            Self::Px4096 => "4096px",
+            Self::Unlimited => "制限なし",
+        }
+    }
+}
+
 /// Carrier for post-filter variants that released builds cannot deserialize.
 ///
 /// Settings persistence writes only old variants into `AdjustParams::post_filter` and records
@@ -2980,6 +3009,8 @@ pub fn downscale_smoothing_blur_factor(percent: u32) -> f32 {
 pub(crate) struct PostFilterDowngradeStash {
     #[serde(default)]
     sharp_upscale: bool,
+    #[serde(default)]
+    anime_upscale: bool,
 }
 
 impl PostFilterDowngradeStash {
@@ -2988,13 +3019,20 @@ impl PostFilterDowngradeStash {
             params.post_filter,
             crate::adjustment::PostFilter::UpscaleSharp
         );
-        if self.sharp_upscale {
+        self.anime_upscale = matches!(
+            params.post_filter,
+            crate::adjustment::PostFilter::UpscaleAnime
+        );
+        if self.sharp_upscale || self.anime_upscale {
             params.post_filter = crate::adjustment::PostFilter::None;
         }
     }
 
     fn restore_after_load(&mut self, params: &mut crate::adjustment::AdjustParams) {
-        if std::mem::take(&mut self.sharp_upscale) {
+        if std::mem::take(&mut self.anime_upscale) {
+            self.sharp_upscale = false;
+            params.post_filter = crate::adjustment::PostFilter::UpscaleAnime;
+        } else if std::mem::take(&mut self.sharp_upscale) {
             params.post_filter = crate::adjustment::PostFilter::UpscaleSharp;
         }
     }
@@ -3620,6 +3658,9 @@ pub struct Settings {
     /// 通常の縮小表示で使う Lanczos3 の支持幅調整 (0..=100、10刻み)。
     #[serde(default)]
     pub downscale_smoothing_percent: u32,
+    /// Long-edge cap for the visible source region processed by illustration upscaling.
+    #[serde(default)]
+    pub anime_upscale_source_limit: AnimeUpscaleSourceLimit,
     /// フルスクリーン左ホバーパネルで最後に開いていたタブ。
     #[serde(default)]
     pub fullscreen_left_panel_tab: FullscreenLeftPanelTab,
@@ -5024,6 +5065,7 @@ impl Default for Settings {
             fullscreen_fit_no_upscale: false,
             fullscreen_fit_no_downscale: false,
             downscale_smoothing_percent: DOWNSCALE_SMOOTHING_PERCENT_MIN,
+            anime_upscale_source_limit: AnimeUpscaleSourceLimit::default(),
             fullscreen_left_panel_tab: FullscreenLeftPanelTab::default(),
             adjustment_settings_tab: AdjustmentSettingsTab::default(),
             creative_luts: crate::creative_lut::builtin_creative_lut_entries(),
@@ -7870,7 +7912,7 @@ mod tests {
         use crate::adjustment::{PostFilter, PresetSlot};
 
         let mut settings = Settings::default();
-        settings.global_preset.post_filter = PostFilter::UpscaleSharp;
+        settings.global_preset.post_filter = PostFilter::UpscaleAnime;
         settings.preset_slots.slots[0] = Some(PresetSlot {
             name: "sharp".to_owned(),
             params: crate::adjustment::AdjustParams {
@@ -7901,6 +7943,10 @@ mod tests {
         );
         assert_eq!(
             json["post_filter_global_preset_stash"]["sharp_upscale"],
+            false
+        );
+        assert_eq!(
+            json["post_filter_global_preset_stash"]["anime_upscale"],
             true
         );
         assert_eq!(
@@ -7908,8 +7954,9 @@ mod tests {
             true
         );
         assert!(
-            !json.to_string().contains("upscale_sharp"),
-            "v2.11.0-visible enum fields must not contain the new variant"
+            !json.to_string().contains("upscale_sharp")
+                && !json.to_string().contains("upscale_anime"),
+            "v2.11.0-visible enum fields must contain neither new variant"
         );
 
         #[derive(Debug, PartialEq, serde::Deserialize)]
@@ -7958,7 +8005,7 @@ mod tests {
 
         let mut loaded: Settings = serde_json::from_value(json).unwrap();
         loaded.sanitize();
-        assert_eq!(loaded.global_preset.post_filter, PostFilter::UpscaleSharp);
+        assert_eq!(loaded.global_preset.post_filter, PostFilter::UpscaleAnime);
         assert_eq!(
             loaded.preset_slots.slots[0]
                 .as_ref()
@@ -7976,11 +8023,50 @@ mod tests {
             PostFilter::Sepia
         );
         assert!(!loaded.post_filter_global_preset_stash.sharp_upscale);
+        assert!(!loaded.post_filter_global_preset_stash.anime_upscale);
         assert!(
             loaded
                 .post_filter_preset_slot_stashes
                 .iter()
-                .all(|stash| !stash.sharp_upscale)
+                .all(|stash| !stash.sharp_upscale && !stash.anime_upscale)
+        );
+    }
+
+    #[test]
+    fn post_filter_stash_restores_each_new_variant_independently() {
+        use crate::adjustment::{AdjustParams, PostFilter};
+
+        for variant in [PostFilter::UpscaleSharp, PostFilter::UpscaleAnime] {
+            let mut params = AdjustParams {
+                post_filter: variant,
+                ..Default::default()
+            };
+            let mut stash = PostFilterDowngradeStash::default();
+            stash.stash_for_persist(&mut params);
+            assert_eq!(params.post_filter, PostFilter::None);
+            stash.restore_after_load(&mut params);
+            assert_eq!(params.post_filter, variant);
+            assert!(!stash.sharp_upscale && !stash.anime_upscale);
+        }
+    }
+
+    #[test]
+    fn anime_upscale_source_limit_defaults_to_4096_and_roundtrips() {
+        let settings = Settings::default();
+        assert_eq!(
+            settings.anime_upscale_source_limit,
+            AnimeUpscaleSourceLimit::Px4096
+        );
+        assert_eq!(
+            serde_json::to_value(AnimeUpscaleSourceLimit::Px2048).unwrap(),
+            serde_json::Value::String("px2048".to_owned())
+        );
+        assert_eq!(
+            serde_json::from_value::<AnimeUpscaleSourceLimit>(serde_json::Value::String(
+                "unlimited".to_owned(),
+            ))
+            .unwrap(),
+            AnimeUpscaleSourceLimit::Unlimited
         );
     }
 

@@ -7003,6 +7003,17 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         ui.checkbox(&mut s.fullscreen_fit_no_downscale, "縮小しない");
     });
     ui.small("自動フィット時の倍率制限。ホイールなどの手動ズームは制限しません。");
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("アニメ塗り拡大のサイズ上限").strong());
+    ui.small("画面に表示されている元画像範囲の長辺が上限を超える場合は、標準の拡大で表示します。");
+    egui::ComboBox::from_label("元画像範囲の長辺")
+        .selected_text(s.anime_upscale_source_limit.label())
+        .show_ui(ui, |ui| {
+            for limit in crate::settings::AnimeUpscaleSourceLimit::ALL {
+                ui.selectable_value(&mut s.anime_upscale_source_limit, limit, limit.label());
+            }
+        });
+    ui.add_space(8.0);
     ui.checkbox(
         &mut s.fullscreen_seek_bar_locked,
         "下部ページシークバーを固定表示",
