@@ -747,6 +747,20 @@ impl KeySlot {
         }
     }
 
+    /// Win32 edge を消費したときに、同じ物理押下から egui が生成した双子イベントを
+    /// 一緒に claim するための egui Key。
+    ///
+    /// `to_egui` は「**照合に使ってよいか**」を表すので `NumpadEnter` は `None` になる
+    /// (egui は本体 Enter と同じ `Key::Enter` へ畳むため、照合に使うと取り違える)。
+    /// claim では逆に**畳まれた先を知る必要がある**: その押下は確かに `Key::Enter` を
+    /// 生んでいるので、残すと後続の Enter 割り当て (`FsClose` 等) がそれを拾ってしまう。
+    fn egui_twin_key_for_claim(self) -> Option<egui::Key> {
+        self.to_egui().or(match self {
+            KeyName::NumpadEnter => Some(egui::Key::Enter),
+            _ => None,
+        })
+    }
+
     /// KeyHold の同フレーム押下+離し (fast-tap) 救済に使う egui Key。
     /// `to_egui` が**別の物理キーへ畳む**もの (Numpad0-9 → 上段 Num0-9) は None を返し、
     /// テンキー割当なのに上段数字キーのイベントを消費 / 誤発火させない
@@ -6362,7 +6376,7 @@ impl Keymap {
             } else {
                 action.default_chords().iter().collect()
             };
-            return crate::key_input::consume_key_edges(ctx.viewport_id(), |edge| {
+            let edges = crate::key_input::consume_key_edges(ctx.viewport_id(), |edge| {
                 chords.iter().copied().any(|chord| {
                     let physical_match = chord.key_name().is_some_and(|name| {
                         name.matches_win32(edge.virtual_key, edge.scan_code, edge.extended)
@@ -6373,6 +6387,15 @@ impl Keymap {
                     physical_match && (!edge.pressed || chord.matches_key_edge(edge))
                 })
             });
+            if edges.0 || edges.1 {
+                // 2 つのキューは同じ物理押下を表すので、片方だけ消費すると egui 側の双子が
+                // 残り、次の読み手がそれを拾う。`consume_chord_inner` は Win32 経路で
+                // 同じ claim をしている ("Claim both at this ownership boundary")。
+                // ここが抜けていたため、NumpadEnter を KeyHold に割り当てると、残った
+                // `Key::Enter` を `FsClose` が egui 経路で拾って表示が閉じていた。
+                Self::claim_egui_twin_key_events(ctx, &chords);
+            }
+            return edges;
         }
         // Numpad0-9 は to_egui が上段 Num0-9 へ畳むため、ここで使うと「テンキー割当なのに
         // 上段数字キーのイベントを消費 / fast-tap 誤発火」になる。fast-tap 救済から除外し、
@@ -6884,6 +6907,25 @@ impl Keymap {
         if chord.key_name() == Some(KeyName::Tab) {
             crate::egui_focus_policy::cancel_tab_focus_traversal(ctx);
         }
+    }
+
+    /// Win32 edge を消費した KeyHold の chord について、同じ物理押下から egui が生成した
+    /// イベントを押下 / 離しとも取り除く。物理スロットの所有はこのフレームで確定しており、
+    /// 修飾の一致は Win32 側の照合で済んでいる。
+    fn claim_egui_twin_key_events(ctx: &egui::Context, chords: &[Chord]) {
+        let twins: Vec<egui::Key> = chords
+            .iter()
+            .filter_map(|chord| chord.key_name())
+            .filter_map(KeyName::egui_twin_key_for_claim)
+            .collect();
+        if twins.is_empty() {
+            return;
+        }
+        ctx.input_mut(|i| {
+            i.events.retain(
+                |event| !matches!(event, egui::Event::Key { key, .. } if twins.contains(key)),
+            );
+        });
     }
 
     fn remove_matching_egui_key_presses(ctx: &egui::Context, chord: Chord, allow_repeat: bool) {
@@ -7666,6 +7708,54 @@ mod tests {
             shared, expected,
             "a new shared VK needs a source-routed hold decision like the Enter pair"
         );
+    }
+
+    /// 利用者報告 (2026-08-05): `FsZoomMode = Z, NumpadEnter` でテンキー Enter を押すと
+    /// ズームに入らず、閲覧中のファイルが閉じた。KeyHold が Win32 edge だけを消費して
+    /// egui 側の双子 `Key::Enter` を残していたため、後続の `FsClose` (既定 Enter) が
+    /// egui 経路でそれを拾っていた。
+    #[cfg(windows)]
+    #[test]
+    fn numpad_enter_hold_claims_its_egui_twin_so_enter_close_does_not_fire() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+
+        let mut settings = KeymapSettings::default();
+        settings.set_override_chords(
+            KeyAction::FsZoomMode,
+            vec![Chord::key(KeyName::Z), Chord::key(KeyName::NumpadEnter)],
+        );
+        let keymap = Keymap::from_settings(&settings);
+
+        let ctx = egui::Context::default();
+        let viewport = ctx.viewport_id();
+        let numpad_press = crate::key_input::KeyEdge {
+            source_hwnd: 1,
+            source_viewport: viewport,
+            virtual_key: 0x0D,
+            scan_code: 0x1C,
+            extended: true,
+            pressed: true,
+            repeat: false,
+            ctrl: false,
+            shift: false,
+            alt: false,
+        };
+
+        // Windows は本体 / テンキーどちらの Enter でも同じ egui イベントを出す。
+        ctx.begin_pass(egui::RawInput {
+            events: vec![key_event(egui::Key::Enter, egui::Modifiers::NONE)],
+            ..Default::default()
+        });
+        cache_test_keyboard_owner(&ctx);
+        crate::key_input::set_test_frame_for_viewport(viewport, vec![numpad_press]);
+
+        let hold = keymap.take_key_hold_edges(&ctx, KeyAction::FsZoomMode);
+        let close = keymap.consume_action(&ctx, KeyAction::FsClose);
+        let _ = ctx.end_pass();
+
+        assert_eq!(hold, (true, false), "テンキー Enter で hold の押下が立つ");
+        assert!(!close, "同じ押下で Enter 割り当ての FsClose を発火させない");
     }
 
     #[cfg(windows)]

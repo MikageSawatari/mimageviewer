@@ -617,6 +617,14 @@
   **false** とし、`GetAsyncKeyState(VK_RETURN)` へフォールバックしない。その他の KeyHold は
   既存の VK ベース判定を維持する。既定 keymap、登録後のラッチ、本体 / テンキー Enter の分離、
   既定 Z のズーム操作は変更していない。
+- 追加修正 (2026-08-05、実機確認で判明): `FsZoomMode = Z, NumpadEnter` でテンキー Enter を
+  押すとズームに入らず**表示が閉じた**。`take_key_hold_edges` は Win32 edge を消費するが、
+  同じ物理押下から egui が生成した双子イベントを claim していなかった。egui は本体 /
+  テンキーの Enter をどちらも `Key::Enter` へ畳むため、残った event を後続の `FsClose`
+  (既定 Enter) が egui 経路で拾っていた。`consume_chord_inner` の Win32 経路は同じ claim を
+  既にしており ("Claim both at this ownership boundary")、KeyHold 側だけが抜けていた。
+  照合用の `to_egui` (NumpadEnter は取り違え防止で `None`) とは別に、claim 用の
+  「畳まれた先」を返す `egui_twin_key_for_claim` を追加して塞いだ。
 - 残件 (P3): 検収で追加した `shared_virtual_keys_stay_limited_to_the_known_pairs` が、
   **`Backslash` / `IntlYen` も `0xDC` を共有している**ことを検出した。Enter ペアと違って
   extended bit ではなく scan code でしか分かれず、対応する per-HWND ラッチが無いため、
@@ -1084,8 +1092,9 @@ v2.12.0 サイクルの最初の作業として取り込んだ。
 (v2.11.0 出荷時の `pdfium` / `ffmpeg` をそのまま複製)。実機確認で問題が出たらここへ戻す。
 `setup-pdfium.sh` は常に最新を取るのでバージョン指定の再取得手段が無い。
 
-**⚠ 未確認 (実機)**: PDFium は MAJOR が 152 → 153 に上がっている。通常 / パスワード付き
-PDF の表示とページ数、動画 / 音声の再生は実機確認が要る。
+**実機確認済み (2026-08-05)**: PDFium MAJOR 152 → 153 で、通常 PDF の表示 / ページ数 /
+ページ送り、パスワード付き PDF の解錠と保存済みパスワードの復元、FFmpeg 更新後の
+動画 / 音声再生をいずれも確認した。rollback は不要。
 
 ### 5.1 ネイティブ依存
 

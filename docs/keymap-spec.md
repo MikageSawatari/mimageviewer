@@ -28,6 +28,10 @@ OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対
 正本にする。egui 0.33 の `physical_key` は両者を同じ `egui::Key::Enter` へ畳むため、
 この 2 スロットの照合には使わない。旧 `keymap.ini` と現行設定の表記は従来どおり
 `Enter` / `NumpadEnter` で、migration や破壊的な表記変更は行わない。
+KeyHold が Win32 edge を消費したときは、同じ物理押下から egui が生成したイベントも同時に
+claim する。2 つのキューは同じ押下を表すので、片方だけ消費すると残ったほうを次の読み手が拾う
+(`NumpadEnter` を KeyHold へ割り当てると、egui が畳んだ `Key::Enter` を `FsClose` が拾って
+表示が閉じていた)。照合に使う egui Key (`to_egui`) と、claim に使う「畳まれた先」は別物として扱う。
 KeyHold の押下中状態も viewport に対応付いた Win32 ラッチだけを正本にする。新規 viewport の
 subclass 登録前など、対象 viewport の送信元付きラッチを確認できないフレームでは、
 `Enter` / `NumpadEnter` を未押下として扱い、物理種別と送信元 HWND を失う
