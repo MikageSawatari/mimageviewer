@@ -892,10 +892,15 @@ fn omitted_entries_chip_label(counts: crate::app::OmittedFolderEntryCounts) -> O
 }
 
 fn omitted_entries_breakdown_label(counts: crate::app::OmittedFolderEntryCounts) -> String {
-    format!(
+    let mut label = format!(
         "同名など {} / 隠し項目 {} / 対象外 {}",
         counts.same_name, counts.hidden, counts.unsupported
-    )
+    );
+    if counts.system > 0 {
+        // システムファイルは主数字に入れないので、内訳でも別立てにして誤解を防ぐ。
+        label.push_str(&format!(" / システム {}", counts.system));
+    }
+    label
 }
 
 /// 走査時に確定した内訳だけを描画する。ここからファイルシステムを再走査しない。
@@ -913,9 +918,11 @@ fn draw_omitted_entries_chip(
         ui.set_min_width(300.0);
         ui.label(omitted_entries_breakdown_label(counts));
         ui.label(
-            egui::RichText::new("チップの件数には「対象外」を含みません。")
-                .small()
-                .weak(),
+            egui::RichText::new(
+                "「システム」は Thumbs.db など自動で作られるファイルです。件数には含めません。",
+            )
+            .small()
+            .weak(),
         );
         ui.separator();
         if ui.link("同名ファイル設定を開く").clicked() {
@@ -15201,27 +15208,46 @@ mod facet_filter_bar_tests {
     use crate::app::setup_app_for_test;
 
     #[test]
-    fn omitted_chip_uses_same_name_plus_hidden_and_keeps_unsupported_in_breakdown() {
+    fn omitted_chip_counts_every_user_file_and_leaves_system_files_out() {
         let counts = crate::app::OmittedFolderEntryCounts {
             same_name: 3,
             hidden: 2,
             unsupported: 5,
+            system: 4,
         };
         assert_eq!(
             omitted_entries_chip_label(counts).as_deref(),
-            Some("非表示 5 件")
+            Some("非表示 10 件")
         );
         assert_eq!(
             omitted_entries_breakdown_label(counts),
-            "同名など 3 / 隠し項目 2 / 対象外 5"
+            "同名など 3 / 隠し項目 2 / 対象外 5 / システム 4"
         );
 
         let unsupported_only = crate::app::OmittedFolderEntryCounts {
             same_name: 0,
             hidden: 0,
             unsupported: 5,
+            system: 0,
         };
-        assert_eq!(omitted_entries_chip_label(unsupported_only), None);
+        assert_eq!(
+            omitted_entries_chip_label(unsupported_only).as_deref(),
+            Some("非表示 5 件"),
+            "対象外拡張子だけでもチップを出す"
+        );
+        assert_eq!(
+            omitted_entries_breakdown_label(unsupported_only),
+            "同名など 0 / 隠し項目 0 / 対象外 5",
+            "システム 0 件のときは内訳から省く"
+        );
+
+        let system_only = crate::app::OmittedFolderEntryCounts {
+            same_name: 0,
+            hidden: 0,
+            unsupported: 0,
+            system: 9,
+        };
+        assert_eq!(omitted_entries_chip_label(system_only), None);
         assert_eq!(
             omitted_entries_chip_label(Default::default()),
             None,
@@ -15237,6 +15263,7 @@ mod facet_filter_bar_tests {
             same_name: 3,
             hidden: 2,
             unsupported: 5,
+            system: 0,
         };
         let mut harness = Harness::builder()
             .with_size(egui::vec2(640.0, 240.0))
@@ -15246,7 +15273,7 @@ mod facet_filter_bar_tests {
                 });
             });
         harness.run();
-        harness.get_by_label("非表示 5 件").click();
+        harness.get_by_label("非表示 10 件").click();
         harness.run();
 
         assert!(

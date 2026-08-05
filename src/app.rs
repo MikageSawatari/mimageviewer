@@ -17146,6 +17146,21 @@ impl App {
                 counts: omitted_entries,
             });
         }
+        if omitted_entries != folder_scan::OmittedFolderEntryCounts::default() {
+            // チップが出ない / 数が合わないという報告を、推測でなくログで切り分けるための 1 行。
+            // 走査済みの値を書くだけで追加の I/O は無い。
+            crate::logger::log(format!(
+                "omitted entries: same_name={} hidden={} unsupported={} system={} chip={} \
+                 published={} surface={:?}",
+                omitted_entries.same_name,
+                omitted_entries.hidden,
+                omitted_entries.unsupported,
+                omitted_entries.system,
+                omitted_entries.primary_count(),
+                !detached_physical,
+                self.top_level_grid_view.surface(),
+            ));
+        }
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",

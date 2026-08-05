@@ -1918,6 +1918,7 @@ fn omitted_entries_are_exposed_only_for_the_normal_folder_surface() {
         same_name: 3,
         hidden: 2,
         unsupported: 5,
+        system: 1,
     };
     app.current_folder = Some(folder.clone());
     app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries { folder, counts });
@@ -48544,4 +48545,63 @@ mod rating_write_failure_tests {
             HistoryTrigger::UserChosen
         );
     }
+}
+
+/// 利用者報告 (2026-08-05) の再現: 同名ステムの画像 3 種 + 非対応 2 件のフォルダ。
+/// 一覧は 2 件に畳まれるので、`load_folder` 後にチップの内訳が取れなければならない。
+#[test]
+fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
+    let mut app = phase_c_support::setup_app();
+    let folder = app.tmp.path().join("同名テスト");
+    std::fs::create_dir(&folder).unwrap();
+    for stem in ["C165", "C206"] {
+        for ext in ["BMP", "PNG", "JPG"] {
+            std::fs::write(folder.join(format!("{stem}.{ext}")), b"dummy").unwrap();
+        }
+    }
+    std::fs::write(folder.join("C165_206.HED"), b"dummy").unwrap();
+    std::fs::write(folder.join("C165_206.TXT"), b"dummy").unwrap();
+    app.settings.skip_duplicate_images = true;
+
+    app.load_folder(folder.clone());
+
+    assert_eq!(app.items.len(), 2, "同名ステムは 1 件ずつに畳まれる");
+    let counts = app
+        .current_normal_folder_omitted_counts()
+        .expect("通常フォルダなので内訳が取れる");
+    assert_eq!(counts.same_name, 4);
+    assert_eq!(counts.unsupported, 2, "HED / TXT は一覧に出ない実ファイル");
+    assert_eq!(
+        counts.primary_count(),
+        6,
+        "利用者が数えた 8 - 表示 2 と一致する"
+    );
+
+    // 内訳が取れるだけでは足りない。利用者が探しているのは画面上のチップなので、
+    // 実際の絞り込みバー描画にラベルが出るところまで固定する。
+    app.settings.show_toolbar_facet_filter = true;
+    let ctx = egui::Context::default();
+    let output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 240.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| app.render_facet_filter_bar(ctx),
+    );
+    let mut drawn = String::new();
+    let mut stack: Vec<&egui::epaint::Shape> = output.shapes.iter().map(|c| &c.shape).collect();
+    while let Some(shape) = stack.pop() {
+        match shape {
+            egui::epaint::Shape::Text(text) => drawn.push_str(text.galley.text()),
+            egui::epaint::Shape::Vec(shapes) => stack.extend(shapes.iter()),
+            _ => {}
+        }
+    }
+    assert!(
+        drawn.contains("非表示 6 件"),
+        "絞り込みバーにチップが描かれていない: {drawn}"
+    );
 }

@@ -14,19 +14,40 @@ pub(crate) enum ScanMediaKind {
 
 /// 通常フォルダ一覧を作るときに、物理フォルダ内には存在するが一覧へ出さなかった項目数。
 ///
-/// `hidden` / `unsupported` は既存の `read_dir` ループ内で分類し、`same_name` は同名設定の
-/// filter が実際に除いた差分を加算する。件数表示のための追加走査や metadata I/O は行わない。
+/// `hidden` / `unsupported` / `system` は既存の `read_dir` ループ内で分類し、`same_name` は
+/// 同名設定の filter が実際に除いた差分を加算する。件数表示のための追加走査や metadata I/O は
+/// 行わない。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OmittedFolderEntryCounts {
     pub(crate) same_name: usize,
     pub(crate) hidden: usize,
     pub(crate) unsupported: usize,
+    /// OS / エクスプローラーが勝手に作る付随ファイル。利用者の持ち物ではないので主数字から外す。
+    pub(crate) system: usize,
 }
 
 impl OmittedFolderEntryCounts {
+    /// チップに出す主数字。**利用者のファイルは種類を問わず全部数える。**
+    ///
+    /// 当初は「対象外拡張子」を除いていたが、除外の動機だった Thumbs.db / desktop.ini は
+    /// hidden 属性を持つので `hidden` 側へ入り、除外しても静かにならない。一方で `.txt` や
+    /// 未対応形式という「消えたら困るかもしれない実ファイル」の signal を落としていた。
+    /// ノイズ源を名前で `system` に分離し、それ以外は全部数えるほうが目的に合う。
     pub(crate) fn primary_count(self) -> usize {
-        self.same_name.saturating_add(self.hidden)
+        self.same_name
+            .saturating_add(self.hidden)
+            .saturating_add(self.unsupported)
     }
+}
+
+/// OS / エクスプローラーが自動生成する付随ファイルか。
+///
+/// これらはフォルダを開いただけで現れ、利用者が意識して置いたものではない。主数字に混ぜると
+/// チップが常時点灯して意味を失うので、内訳だけに出す。
+pub(crate) fn is_system_metadata_name(name: &str) -> bool {
+    const SYSTEM_FILES: &[&str] = &["thumbs.db", "ehthumbs.db", "desktop.ini", ".ds_store"];
+    // AppleDouble (`._*`) は macOS / iPhone からのコピーで大量に付いてくる同種のもの。
+    name.starts_with("._") || SYSTEM_FILES.contains(&name.to_lowercase().as_str())
 }
 
 /// ディレクトリ走査結果 (read_dir + 各エントリ metadata 取得の成果物)。
@@ -209,9 +230,17 @@ where
             .file_type()
             .map(|ft| crate::fs_entry::classify_dir_entry(&entry, &ft))
             .unwrap_or(crate::fs_entry::DirEntryKind::Other);
-        entry_file_names_ci.insert(entry.file_name().to_string_lossy().to_lowercase());
+        let entry_name = entry.file_name().to_string_lossy().to_lowercase();
+        // OS 由来の付随ファイルはどの経路で落ちても `system` に寄せる。分類だけで、
+        // 一覧へ出す / 出さないの判定は一切変えない。
+        let is_system_file = is_system_metadata_name(&entry_name);
+        entry_file_names_ci.insert(entry_name);
         if crate::fs_entry::should_hide_fs_entry(&entry, show_hidden_files) {
-            omitted.hidden = omitted.hidden.saturating_add(1);
+            if is_system_file {
+                omitted.system = omitted.system.saturating_add(1);
+            } else {
+                omitted.hidden = omitted.hidden.saturating_add(1);
+            }
             continue;
         }
         let p = entry.path();
@@ -226,7 +255,7 @@ where
             folders.push((GridItem::Folder(p), Some((mtime, 0))));
         } else if crate::folder_tree::is_apple_double(&p) {
             // macOS/iPhone AppleDouble メタデータ - スキップ
-            omitted.hidden = omitted.hidden.saturating_add(1);
+            omitted.system = omitted.system.saturating_add(1);
         } else if kind.is_file()
             && let Some(ext) = p.extension().and_then(|e| e.to_str())
         {
@@ -257,12 +286,18 @@ where
                     },
                     Some((mtime, file_size)),
                 ));
+            } else if is_system_file {
+                omitted.system = omitted.system.saturating_add(1);
             } else {
                 omitted.unsupported = omitted.unsupported.saturating_add(1);
             }
         } else if kind.is_file() {
             // 拡張子のない通常ファイルも、一覧対象外のファイルとして内訳に含める。
-            omitted.unsupported = omitted.unsupported.saturating_add(1);
+            if is_system_file {
+                omitted.system = omitted.system.saturating_add(1);
+            } else {
+                omitted.unsupported = omitted.unsupported.saturating_add(1);
+            }
         }
     }
     filter_upscaled_video_pairs_fast(&mut all_media, &entry_file_names_ci);
@@ -651,13 +686,15 @@ mod page_count_tests {
     }
 
     #[test]
-    fn omitted_counts_reuse_scan_results_and_keep_unsupported_out_of_primary() {
+    fn omitted_counts_reuse_scan_results_and_separate_system_files() {
         let temp = tempfile::TempDir::new().unwrap();
         std::fs::write(temp.path().join("001.jpg"), b"jpg").unwrap();
         std::fs::write(temp.path().join("001.png"), b"png").unwrap();
         std::fs::write(temp.path().join("notes.txt"), b"text").unwrap();
         std::fs::write(temp.path().join("state"), b"extensionless").unwrap();
         std::fs::write(temp.path().join("._finder.jpg"), b"apple double").unwrap();
+        std::fs::write(temp.path().join("Thumbs.db"), b"explorer cache").unwrap();
+        std::fs::write(temp.path().join("desktop.ini"), b"explorer view").unwrap();
 
         // 内訳はこの既存 read_dir の結果から導出する。件数取得専用の再走査 API は持たない。
         let mut scan = scan_directory_with_convertible_archives(temp.path(), true, false).unwrap();
@@ -665,20 +702,61 @@ mod page_count_tests {
             filter_image_ext_duplicates(&mut scan.all_media, &["png".to_owned(), "jpg".to_owned()]);
 
         assert_eq!(scan.omitted.same_name, 1);
-        assert_eq!(scan.omitted.hidden, 1);
-        assert_eq!(scan.omitted.unsupported, 2);
-        assert_eq!(scan.omitted.primary_count(), 2);
+        assert_eq!(scan.omitted.hidden, 0);
+        assert_eq!(scan.omitted.unsupported, 2, "notes.txt と拡張子なし");
+        assert_eq!(
+            scan.omitted.system, 3,
+            "AppleDouble / Thumbs.db / desktop.ini"
+        );
+        // 利用者のファイルは種類を問わず数え、OS 由来の 3 件だけを主数字から外す。
+        assert_eq!(scan.omitted.primary_count(), 3);
         assert_eq!(scan.all_media.len(), 1);
     }
 
     #[test]
-    fn unsupported_only_does_not_create_a_primary_omitted_count() {
+    fn unsupported_files_are_counted_but_system_files_are_not() {
         let counts = OmittedFolderEntryCounts {
             same_name: 0,
             hidden: 0,
             unsupported: 5,
+            system: 0,
         };
-        assert_eq!(counts.primary_count(), 0);
+        assert_eq!(
+            counts.primary_count(),
+            5,
+            "見えていない実ファイルは対象外拡張子でも数える"
+        );
+
+        let system_only = OmittedFolderEntryCounts {
+            same_name: 0,
+            hidden: 0,
+            unsupported: 0,
+            system: 7,
+        };
+        assert_eq!(
+            system_only.primary_count(),
+            0,
+            "Thumbs.db だけのフォルダでチップを点けない"
+        );
+    }
+
+    #[test]
+    fn system_metadata_names_are_matched_case_insensitively() {
+        for name in [
+            "thumbs.db",
+            "Thumbs.db",
+            "DESKTOP.INI",
+            ".DS_Store",
+            "._img.jpg",
+        ] {
+            assert!(is_system_metadata_name(name), "{name} should be system");
+        }
+        for name in ["notes.txt", "001.jpg", "thumbs.jpg", "my_desktop.ini.txt"] {
+            assert!(
+                !is_system_metadata_name(name),
+                "{name} should not be system"
+            );
+        }
     }
 
     #[test]
