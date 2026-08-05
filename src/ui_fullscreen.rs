@@ -1162,6 +1162,8 @@ pub(crate) fn metadata_panel_hover_activation_rect(full_rect: egui::Rect) -> egu
 
 /// 右メタデータパネルの端ホバーラッチを現在座標から更新する。
 /// 開くときは右端トリガ、開いた後は実描画矩形 + sustain margin を使う。
+/// The primary call site now runs before navigator-consumed image input returns; panel drawing
+/// repeats the same idempotent update only for modal paths that bypass the general input handler.
 pub(crate) fn metadata_panel_hover_active_at(
     full_rect: egui::Rect,
     pointer_pos: Option<egui::Pos2>,
@@ -14615,6 +14617,7 @@ impl App {
             });
         }
 
+        let mut corner_clicked = false;
         for (index, &corner) in FullscreenNavigatorCorner::ALL.iter().enumerate() {
             let rect = fs_navigator_corner_button_rect(layout.header_rect, index);
             let tooltip = match corner {
@@ -14636,7 +14639,8 @@ impl App {
                 self.settings.fullscreen_navigator_corner = corner;
                 self.settings.save();
                 ctx.request_repaint();
-                return true;
+                corner_clicked = true;
+                break;
             }
         }
 
@@ -14657,7 +14661,10 @@ impl App {
                     .clamp(layout.canvas_rect.top(), layout.canvas_rect.bottom()),
             )
         };
-        let pointer_pos = pointer_pos.map(clamp_to_canvas);
+        // The raw position answers whether an interaction started on the canvas. The clamped
+        // position is only for drag geometry, so an in-progress drag can stop at the edge after
+        // leaving the canvas without turning header presses into canvas presses.
+        let canvas_pos = pointer_pos.map(clamp_to_canvas);
         let (
             primary_pressed,
             primary_down,
@@ -14679,7 +14686,7 @@ impl App {
         });
 
         if response.double_clicked()
-            && let Some(pos) = pointer_pos
+            && let Some(pos) = canvas_pos
         {
             let uv = panorama_navigator_screen_to_uv(layout.content_rect, pos);
             let (yaw, pitch) = panorama_navigator_uv_to_yaw_pitch(uv);
@@ -14698,8 +14705,8 @@ impl App {
         }
 
         if primary_pressed
-            && let Some(pos) = pointer_pos
-            && layout.canvas_rect.contains(pos)
+            && pointer_pos.is_some_and(|pos| layout.canvas_rect.contains(pos))
+            && let Some(pos) = canvas_pos
         {
             ctx.data_mut(|data| {
                 data.insert_temp(
@@ -14711,7 +14718,7 @@ impl App {
                 )
             });
         } else if primary_down
-            && let Some(pos) = pointer_pos
+            && let Some(pos) = canvas_pos
             && let Some(PanoramaNavigatorInteraction::Select { start, .. }) = interaction
         {
             ctx.data_mut(|data| {
@@ -14729,23 +14736,30 @@ impl App {
         if primary_released
             && let Some(PanoramaNavigatorInteraction::Select { start, current }) = interaction
         {
-            let selection = egui::Rect::from_two_pos(start, current).intersect(layout.content_rect);
-            if selection.width() >= FS_NAVIGATOR_MIN_SELECTION
-                && selection.height() >= FS_NAVIGATOR_MIN_SELECTION
-            {
-                let uv = panorama_navigator_screen_to_uv(layout.content_rect, selection.center());
-                let (yaw, pitch) = panorama_navigator_uv_to_yaw_pitch(uv);
-                let fov_y = panorama_navigator_fov_from_height(
-                    selection.height(),
-                    layout.content_rect.height(),
-                );
-                if let Some(pano) = self.panorama_state.as_mut() {
-                    pano.yaw = yaw;
-                    pano.pitch = pitch;
-                    pano.fov_y = fov_y;
-                    pano.sanitize();
+            // A corner click releases over the header, so any primary selection present here is
+            // stale and must be discarded rather than committed. Cleanup intentionally precedes
+            // the consumed-input return below.
+            if !corner_clicked {
+                let selection =
+                    egui::Rect::from_two_pos(start, current).intersect(layout.content_rect);
+                if selection.width() >= FS_NAVIGATOR_MIN_SELECTION
+                    && selection.height() >= FS_NAVIGATOR_MIN_SELECTION
+                {
+                    let uv =
+                        panorama_navigator_screen_to_uv(layout.content_rect, selection.center());
+                    let (yaw, pitch) = panorama_navigator_uv_to_yaw_pitch(uv);
+                    let fov_y = panorama_navigator_fov_from_height(
+                        selection.height(),
+                        layout.content_rect.height(),
+                    );
+                    if let Some(pano) = self.panorama_state.as_mut() {
+                        pano.yaw = yaw;
+                        pano.pitch = pitch;
+                        pano.fov_y = fov_y;
+                        pano.sanitize();
+                    }
+                    ctx.request_repaint();
                 }
-                ctx.request_repaint();
             }
             ctx.data_mut(|data| {
                 data.remove_temp::<PanoramaNavigatorInteraction>(
@@ -14754,9 +14768,13 @@ impl App {
             });
         }
 
+        if corner_clicked {
+            return true;
+        }
+
         if secondary_pressed
-            && let Some(pos) = pointer_pos
-            && layout.canvas_rect.contains(pos)
+            && pointer_pos.is_some_and(|pos| layout.canvas_rect.contains(pos))
+            && let Some(pos) = canvas_pos
             && let Some(pano) = self.panorama_state.as_ref()
         {
             ctx.data_mut(|data| {
@@ -14770,7 +14788,7 @@ impl App {
                 )
             });
         } else if secondary_down
-            && let Some(pos) = pointer_pos
+            && let Some(pos) = canvas_pos
             && let Some(PanoramaNavigatorInteraction::Pan {
                 start_uv,
                 start_yaw,
@@ -14835,6 +14853,7 @@ impl App {
         let interaction =
             ctx.data(|data| data.get_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id()));
         let pointer_pos = ctx.input(|input| input.pointer.interact_pos());
+        let mut corner_clicked = false;
         let drag_active = matches!(
             interaction,
             Some(
@@ -14887,7 +14906,8 @@ impl App {
                 self.settings.fullscreen_navigator_corner = corner;
                 self.settings.save();
                 ctx.request_repaint();
-                return true;
+                corner_clicked = true;
+                break;
             }
         }
 
@@ -14908,7 +14928,9 @@ impl App {
                     .clamp(layout.canvas_rect.top(), layout.canvas_rect.bottom()),
             )
         };
-        let pointer_pos = pointer_pos.map(clamp_to_canvas);
+        // Keep hit-testing in screen space. Only geometry for an interaction that already began
+        // on the canvas may use the clamped position while the pointer is outside the canvas.
+        let canvas_pos = pointer_pos.map(clamp_to_canvas);
         let (
             primary_pressed,
             primary_down,
@@ -14930,7 +14952,7 @@ impl App {
         });
 
         if response.double_clicked()
-            && let Some(pos) = pointer_pos
+            && let Some(pos) = canvas_pos
             && let Some((page, source_pos)) = layout.nearest_page_at(pos)
         {
             let source_uv = page.navigator.screen_to_source_normalized(source_pos);
@@ -14959,8 +14981,8 @@ impl App {
         }
 
         if primary_pressed
-            && let Some(pos) = pointer_pos
-            && layout.canvas_rect.contains(pos)
+            && pointer_pos.is_some_and(|pos| layout.canvas_rect.contains(pos))
+            && let Some(pos) = canvas_pos
         {
             ctx.data_mut(|data| {
                 data.insert_temp(
@@ -14972,7 +14994,7 @@ impl App {
                 )
             });
         } else if primary_down
-            && let Some(pos) = pointer_pos
+            && let Some(pos) = canvas_pos
             && let Some(FsNavigatorInteraction::Select { start, .. }) = interaction
         {
             ctx.data_mut(|data| {
@@ -14990,49 +15012,62 @@ impl App {
         if primary_released
             && let Some(FsNavigatorInteraction::Select { start, current }) = interaction
         {
-            let selection = egui::Rect::from_two_pos(start, current).intersect(layout.content_rect);
-            if selection.width() >= FS_NAVIGATOR_MIN_SELECTION
-                && selection.height() >= FS_NAVIGATOR_MIN_SELECTION
-                && let Some((page, source_pos)) = layout.nearest_page_at(selection.center())
-            {
-                let source_uv = page.navigator.screen_to_source_normalized(source_pos);
-                self.fs_navigator_adopt_manual_zoom(&layout, image_rect);
-                let old_zoom = self.fs_zoom.max(f32::EPSILON);
-                let selected_screen_size = selection.size() / layout.screen_scale;
-                let factor = (image_rect.width() / selected_screen_size.x.max(1.0))
-                    .min(image_rect.height() / selected_screen_size.y.max(1.0));
-                let new_zoom = (old_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
-                let target_screen = page.main.source_normalized_to_screen(source_uv);
-                let proposed_pan = zoom_preserve_pivot(
-                    target_screen,
-                    image_rect.center(),
-                    self.fs_pan,
-                    old_zoom,
-                    new_zoom,
-                ) + (image_rect.center() - target_screen);
-                self.fs_zoom = new_zoom;
-                self.set_fs_pan_from_input(new_zoom, proposed_pan);
-                self.maybe_rerender_pdf(new_zoom);
-                ctx.data_mut(|data| {
-                    data.insert_temp(
-                        fs_navigator_interaction_id(),
-                        FsNavigatorInteraction::PendingCenter {
-                            page_idx: page.main.page_idx,
-                            source_uv,
-                        },
-                    )
-                });
-                ctx.request_repaint();
-            } else {
+            // A click is reported on release. If this release belongs to a corner button,
+            // discard a stale selection and still run the normal release cleanup before returning.
+            if corner_clicked {
                 ctx.data_mut(|data| {
                     data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
                 });
+            } else {
+                let selection =
+                    egui::Rect::from_two_pos(start, current).intersect(layout.content_rect);
+                if selection.width() >= FS_NAVIGATOR_MIN_SELECTION
+                    && selection.height() >= FS_NAVIGATOR_MIN_SELECTION
+                    && let Some((page, source_pos)) = layout.nearest_page_at(selection.center())
+                {
+                    let source_uv = page.navigator.screen_to_source_normalized(source_pos);
+                    self.fs_navigator_adopt_manual_zoom(&layout, image_rect);
+                    let old_zoom = self.fs_zoom.max(f32::EPSILON);
+                    let selected_screen_size = selection.size() / layout.screen_scale;
+                    let factor = (image_rect.width() / selected_screen_size.x.max(1.0))
+                        .min(image_rect.height() / selected_screen_size.y.max(1.0));
+                    let new_zoom = (old_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+                    let target_screen = page.main.source_normalized_to_screen(source_uv);
+                    let proposed_pan = zoom_preserve_pivot(
+                        target_screen,
+                        image_rect.center(),
+                        self.fs_pan,
+                        old_zoom,
+                        new_zoom,
+                    ) + (image_rect.center() - target_screen);
+                    self.fs_zoom = new_zoom;
+                    self.set_fs_pan_from_input(new_zoom, proposed_pan);
+                    self.maybe_rerender_pdf(new_zoom);
+                    ctx.data_mut(|data| {
+                        data.insert_temp(
+                            fs_navigator_interaction_id(),
+                            FsNavigatorInteraction::PendingCenter {
+                                page_idx: page.main.page_idx,
+                                source_uv,
+                            },
+                        )
+                    });
+                    ctx.request_repaint();
+                } else {
+                    ctx.data_mut(|data| {
+                        data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
+                    });
+                }
             }
         }
 
+        if corner_clicked {
+            return true;
+        }
+
         if secondary_pressed
-            && let Some(pos) = pointer_pos
-            && layout.canvas_rect.contains(pos)
+            && pointer_pos.is_some_and(|pos| layout.canvas_rect.contains(pos))
+            && let Some(pos) = canvas_pos
         {
             if self.fs_zoom_mode_engaged() {
                 let current_view_pos = layout.visible_rect.center();
@@ -15064,7 +15099,7 @@ impl App {
                 });
             }
         } else if secondary_down
-            && let Some(pos) = pointer_pos
+            && let Some(pos) = canvas_pos
             && let Some(FsNavigatorInteraction::Pan {
                 start,
                 start_pan,
@@ -15447,12 +15482,12 @@ impl App {
             .fullscreen_idx
             .map(|idx| self.fullscreen_media_rect(full_rect, idx, state.is_video))
             .unwrap_or(full_rect);
+        let navigator_consumed = if let Some(navigator_idx) = self.fullscreen_idx {
+            self.handle_fs_navigator_input(ui, ctx, default_image_rect, navigator_idx)
+        } else {
+            false
+        };
         let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
-        if let Some(navigator_idx) = self.fullscreen_idx
-            && self.handle_fs_navigator_input(ui, ctx, default_image_rect, navigator_idx)
-        {
-            return (FsPageNav::None, false);
-        }
         if self.capture_region_selection.is_some() {
             return (FsPageNav::None, false);
         }
@@ -15485,7 +15520,7 @@ impl App {
                 .unwrap_or(false);
             (primary_event && in_fullscreen, focused)
         });
-        if fullscreen_primary_event {
+        if !navigator_consumed && fullscreen_primary_event {
             let target = native_window_under_cursor_focus_target();
             let previous_foreign_foreground = prev_foreground_hwnd != 0
                 && target.target_hwnd != 0
@@ -15568,6 +15603,12 @@ impl App {
                 zoom_active: self.fs_zoom_mode_engaged(),
                 animated: panel_fs_idx.is_some_and(|idx| self.fs_entry_is_animated(idx)),
             });
+        self.update_metadata_panel_hover_latch(
+            ctx,
+            full_rect,
+            side_panel_chrome_enabled,
+            navigator_exclusion,
+        );
 
         // ── ホイール ──
         // パネル領域内ではホイールナビゲーションを抑制
@@ -15766,6 +15807,14 @@ impl App {
                 self.persist_pending_view_trim_state();
                 self.adjustment_mode = false;
             }
+        }
+
+        // Navigator consumption suppresses page navigation, zoom, close, and other image actions,
+        // but the passive side-panel latches above are per-frame presentation state. Keeping this
+        // return below both latch updates prevents a captured navigator interaction from freezing
+        // either panel while preserving the existing panel-state dependencies for later input.
+        if navigator_consumed {
+            return (FsPageNav::None, false);
         }
 
         // Wipe のドラッグ基準は、白線 / clip / シェーダー合成境界と同じ「フィット後の実表示
@@ -27482,6 +27531,318 @@ mod tests {
         assert!(!fs_navigator_visibility_requested(
             false, true, false, false
         ));
+    }
+
+    fn setup_flat_navigator_input_test() -> (crate::app::AppTestEnvForTest, egui::Rect, usize) {
+        let mut app = crate::app::setup_app_for_test();
+        let fs_idx = app.items.len();
+        app.items.push(GridItem::Image(PathBuf::default()));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(fs_idx);
+        app.settings.fullscreen_navigator_visible = true;
+        app.settings.fullscreen_navigator_corner = FullscreenNavigatorCorner::BottomRight;
+        app.fs_zoom = 2.0;
+
+        let transform = navigator_test_transform(
+            fs_idx,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((2.0, egui::Vec2::ZERO)),
+            },
+        );
+        let image_rect = transform.viewport_rect;
+        app.fullscreen_page_layout
+            .begin(FullscreenPageLayoutKind::Single);
+        app.fullscreen_page_layout.push(transform);
+        (app, image_rect, fs_idx)
+    }
+
+    fn navigator_pointer_input(
+        pos: egui::Pos2,
+        button: Option<(egui::PointerButton, bool)>,
+        modifiers: egui::Modifiers,
+        time: f64,
+    ) -> egui::RawInput {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            time: Some(time),
+            modifiers,
+            events: vec![egui::Event::PointerMoved(pos)],
+            ..Default::default()
+        };
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .focused = Some(true);
+        if let Some((button, pressed)) = button {
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers,
+            });
+        }
+        input
+    }
+
+    fn run_flat_navigator_input_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        input: egui::RawInput,
+    ) -> bool {
+        let mut consumed = false;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    consumed = app.handle_fs_navigator_input(
+                        ui,
+                        ctx,
+                        image_rect,
+                        app.fullscreen_idx.unwrap(),
+                    );
+                });
+        });
+        consumed
+    }
+
+    #[test]
+    fn navigator_corner_press_never_starts_canvas_interaction_and_release_cleans_stale_state() {
+        let (mut app, image_rect, fs_idx) = setup_flat_navigator_input_test();
+        let ctx = egui::Context::default();
+        let layout = app.fs_navigator_layout(image_rect).unwrap();
+        let button_pos = fs_navigator_corner_button_rect(layout.header_rect, 2).center();
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+
+        assert!(run_flat_navigator_input_frame(
+            &mut app,
+            &ctx,
+            image_rect,
+            navigator_pointer_input(button_pos, None, alt, -0.1),
+        ));
+
+        assert!(run_flat_navigator_input_frame(
+            &mut app,
+            &ctx,
+            image_rect,
+            navigator_pointer_input(
+                button_pos,
+                Some((egui::PointerButton::Primary, true)),
+                alt,
+                0.0,
+            ),
+        ));
+        assert!(ctx.data(|data| {
+            data.get_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
+                .is_none()
+        }));
+
+        app.settings.fullscreen_navigator_visible = false;
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                fs_navigator_interaction_id(),
+                FsNavigatorInteraction::Select {
+                    start: layout.canvas_rect.center(),
+                    current: layout.canvas_rect.center(),
+                },
+            )
+        });
+        assert!(run_flat_navigator_input_frame(
+            &mut app,
+            &ctx,
+            image_rect,
+            navigator_pointer_input(
+                button_pos,
+                Some((egui::PointerButton::Primary, false)),
+                egui::Modifiers::default(),
+                0.1,
+            ),
+        ));
+
+        assert_eq!(
+            app.settings.fullscreen_navigator_corner.normalized(),
+            FullscreenNavigatorCorner::BottomLeft
+        );
+        assert!(!fs_navigator_interaction_active(&ctx));
+        assert!(!app.fs_navigator_allowed(&ctx, fs_idx));
+    }
+
+    #[test]
+    fn navigator_left_and_right_drags_keep_canvas_clamp_and_release_cleanup() {
+        let (mut app, image_rect, _) = setup_flat_navigator_input_test();
+        let ctx = egui::Context::default();
+        let layout = app.fs_navigator_layout(image_rect).unwrap();
+        let start = layout.content_rect.left_top() + egui::vec2(20.0, 20.0);
+        let outside = layout.canvas_rect.right_bottom() + egui::vec2(500.0, 500.0);
+        let finish = start + egui::vec2(30.0, 30.0);
+
+        assert!(run_flat_navigator_input_frame(
+            &mut app,
+            &ctx,
+            image_rect,
+            navigator_pointer_input(
+                start,
+                Some((egui::PointerButton::Primary, true)),
+                egui::Modifiers::default(),
+                0.0,
+            ),
+        ));
+        assert!(run_flat_navigator_input_frame(
+            &mut app,
+            &ctx,
+            image_rect,
+            navigator_pointer_input(outside, None, egui::Modifiers::default(), 0.1),
+        ));
+        assert!(ctx.data(|data| {
+            matches!(
+                data.get_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id()),
+                Some(FsNavigatorInteraction::Select { current, .. })
+                    if current == layout.canvas_rect.right_bottom()
+            )
+        }));
+        assert!(run_flat_navigator_input_frame(
+            &mut app,
+            &ctx,
+            image_rect,
+            navigator_pointer_input(finish, None, egui::Modifiers::default(), 0.15),
+        ));
+        assert!(run_flat_navigator_input_frame(
+            &mut app,
+            &ctx,
+            image_rect,
+            navigator_pointer_input(
+                finish,
+                Some((egui::PointerButton::Primary, false)),
+                egui::Modifiers::default(),
+                0.2,
+            ),
+        ));
+        assert_ne!(app.fs_zoom, 2.0);
+
+        ctx.data_mut(|data| {
+            data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
+        });
+        app.fs_pan = egui::Vec2::ZERO;
+        assert!(run_flat_navigator_input_frame(
+            &mut app,
+            &ctx,
+            image_rect,
+            navigator_pointer_input(
+                start,
+                Some((egui::PointerButton::Secondary, true)),
+                egui::Modifiers::default(),
+                1.0,
+            ),
+        ));
+        assert!(run_flat_navigator_input_frame(
+            &mut app,
+            &ctx,
+            image_rect,
+            navigator_pointer_input(outside, None, egui::Modifiers::default(), 1.1),
+        ));
+        let clamped_pan = app.fs_pan;
+        assert_ne!(clamped_pan, egui::Vec2::ZERO);
+        assert!(run_flat_navigator_input_frame(
+            &mut app,
+            &ctx,
+            image_rect,
+            navigator_pointer_input(
+                outside + egui::vec2(500.0, 500.0),
+                None,
+                egui::Modifiers::default(),
+                1.2,
+            ),
+        ));
+        assert_eq!(app.fs_pan, clamped_pan);
+        assert!(run_flat_navigator_input_frame(
+            &mut app,
+            &ctx,
+            image_rect,
+            navigator_pointer_input(
+                outside,
+                Some((egui::PointerButton::Secondary, false)),
+                egui::Modifiers::default(),
+                1.3,
+            ),
+        ));
+        assert!(!fs_navigator_interaction_active(&ctx));
+    }
+
+    #[test]
+    fn navigator_double_click_still_centers_the_selected_source_position() {
+        let (mut app, image_rect, _) = setup_flat_navigator_input_test();
+        let ctx = egui::Context::default();
+        let layout = app.fs_navigator_layout(image_rect).unwrap();
+        let pos = layout.content_rect.left_top() + egui::vec2(20.0, 20.0);
+
+        for (time, pressed) in [(0.0, true), (0.05, false), (0.1, true), (0.15, false)] {
+            assert!(run_flat_navigator_input_frame(
+                &mut app,
+                &ctx,
+                image_rect,
+                navigator_pointer_input(
+                    pos,
+                    Some((egui::PointerButton::Primary, pressed)),
+                    egui::Modifiers::default(),
+                    time,
+                ),
+            ));
+        }
+
+        assert_ne!(app.fs_pan, egui::Vec2::ZERO);
+        assert!(!fs_navigator_interaction_active(&ctx));
+    }
+
+    #[test]
+    fn navigator_consumption_still_updates_side_panel_hover_latches() {
+        let (mut app, image_rect, _) = setup_flat_navigator_input_test();
+        let ctx = egui::Context::default();
+        let layout = app.fs_navigator_layout(image_rect).unwrap();
+        app.metadata_panel_hover_active = true;
+        let state = FsFrameState {
+            is_video: false,
+            original_preview_active: false,
+            tex: None,
+            thumb_tex: None,
+            location_display: String::new(),
+            image_dims: None,
+            image_file_size: None,
+            image_downscaled: false,
+            is_loading: false,
+            vst3_waiting_for_video: false,
+            fs_load_failed: false,
+            pdf_content_type: None,
+        };
+        let mut result = (FsPageNav::Delta(1), true);
+
+        let _ = ctx.run(
+            navigator_pointer_input(
+                layout.canvas_rect.center(),
+                None,
+                egui::Modifiers::default(),
+                0.0,
+            ),
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        result =
+                            app.handle_fs_wheel_and_click(ui, ctx, image_rect, &state, false, 0);
+                    });
+            },
+        );
+
+        assert_eq!(result, (FsPageNav::None, false));
+        assert!(!app.metadata_panel_hover_active);
+        assert!(!app.adjustment_mode);
     }
 
     #[test]
