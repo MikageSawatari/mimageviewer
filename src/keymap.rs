@@ -761,6 +761,33 @@ impl KeySlot {
         })
     }
 
+    /// egui イベントだけでは、その物理スロットが押されたのか判断できないか。
+    ///
+    /// egui は `NumpadEnter` を `Key::Enter` へ、`Numpad0-9` を `Num0-9` へ畳む。畳まれた
+    /// **先**のスロット (`Enter` / `Num0-9`) は、egui の `Key::Enter` を見ても本体キーなのか
+    /// テンキーなのか区別できない。viewport が frame-active なら Win32 キューが正本なので、
+    /// これらのスロットは「該当 edge が無い = 押されていない」とし、egui へ落ちない。
+    ///
+    /// 実害 (2026-08-05): フルスクリーン中の NumpadEnter は fullscreen viewport の Win32 edge
+    /// になる一方、egui イベントは main viewport にも届く。main 側には対応する edge が無いので
+    /// egui へ落ち、`Key::Enter` を `FsClose` (既定 Enter) が拾って表示が閉じていた。
+    fn egui_event_cannot_identify_slot(self) -> bool {
+        matches!(
+            self,
+            KeyName::Enter
+                | KeyName::Num0
+                | KeyName::Num1
+                | KeyName::Num2
+                | KeyName::Num3
+                | KeyName::Num4
+                | KeyName::Num5
+                | KeyName::Num6
+                | KeyName::Num7
+                | KeyName::Num8
+                | KeyName::Num9
+        )
+    }
+
     /// KeyHold の同フレーム押下+離し (fast-tap) 救済に使う egui Key。
     /// `to_egui` が**別の物理キーへ畳む**もの (Numpad0-9 → 上段 Num0-9) は None を返し、
     /// テンキー割当なのに上段数字キーのイベントを消費 / 誤発火させない
@@ -6800,6 +6827,9 @@ impl Keymap {
                 }
                 return result.triggered_count > 0;
             }
+            if Self::frame_active_blocks_egui_fallback(chord) {
+                return false;
+            }
         }
         let (triggered, matched) = ctx.input_mut(|i| {
             let mut found = false;
@@ -6865,6 +6895,12 @@ impl Keymap {
             }
             return result.triggered_count;
         }
+        #[cfg(windows)]
+        if crate::key_input::is_frame_active(ctx.viewport_id())
+            && Self::frame_active_blocks_egui_fallback(chord)
+        {
+            return 0;
+        }
 
         let (physical_press_count, matched_repeat, matched) = ctx.input_mut(|i| {
             let mut physical_press_count = 0usize;
@@ -6912,6 +6948,17 @@ impl Keymap {
     /// Win32 edge を消費した KeyHold の chord について、同じ物理押下から egui が生成した
     /// イベントを押下 / 離しとも取り除く。物理スロットの所有はこのフレームで確定しており、
     /// 修飾の一致は Win32 側の照合で済んでいる。
+    /// frame-active な viewport で、この chord が egui フォールバックへ落ちてよいか。
+    ///
+    /// Win32 キューを持つ viewport では、そこに edge が無いことが「押されていない」の答え。
+    /// egui が畳んだイベントで代用すると、別 viewport / 別物理キーの押下を拾う。
+    #[cfg(windows)]
+    fn frame_active_blocks_egui_fallback(chord: Chord) -> bool {
+        chord
+            .key_name()
+            .is_some_and(KeyName::egui_event_cannot_identify_slot)
+    }
+
     fn claim_egui_twin_key_events(ctx: &egui::Context, chords: &[Chord]) {
         let twins: Vec<egui::Key> = chords
             .iter()
@@ -6984,6 +7031,9 @@ impl Keymap {
                 return crate::key_input::pressed_key_down(ctx.viewport_id(), |edge| {
                     chord.matches_key_edge(edge)
                 });
+            }
+            if Self::frame_active_blocks_egui_fallback(chord) {
+                return false;
             }
         }
         ctx.input(|i| {
@@ -7707,6 +7757,60 @@ mod tests {
         assert_eq!(
             shared, expected,
             "a new shared VK needs a source-routed hold decision like the Enter pair"
+        );
+    }
+
+    /// 利用者報告の続き (2026-08-05): 双子 claim だけでは閉じるのが止まらなかった。
+    /// ログが理由を示していた -- 同じ押下が **2 つの viewport** に届く。
+    ///
+    /// ```text
+    /// [fs-key] source=root       focused=false keys=Enter:up
+    /// [fs-key] source=fullscreen focused=true  keys=Enter:up
+    /// ```
+    ///
+    /// Win32 edge は fullscreen viewport にしか無いので、main 側は claim の対象外。
+    /// そこに残った egui `Key::Enter` を `FsClose` が拾っていた。frame-active な viewport は
+    /// Win32 キューが正本なので、egui へ落ちてはいけない。
+    #[cfg(windows)]
+    #[test]
+    fn frame_active_viewport_without_the_edge_does_not_match_enter_from_egui() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+
+        let keymap = Keymap::from_settings(&KeymapSettings::default());
+        let ctx = egui::Context::default();
+        let main_viewport = ctx.viewport_id();
+        let fullscreen_viewport = egui::ViewportId::from_hash_of(9_u64);
+
+        ctx.begin_pass(egui::RawInput {
+            events: vec![key_event(egui::Key::Enter, egui::Modifiers::NONE)],
+            ..Default::default()
+        });
+        cache_test_keyboard_owner(&ctx);
+        // edge は fullscreen viewport のもの。main も frame-active (subclass 登録済み)。
+        crate::key_input::set_test_frame_for_viewport(
+            fullscreen_viewport,
+            vec![crate::key_input::KeyEdge {
+                source_hwnd: 2,
+                source_viewport: fullscreen_viewport,
+                virtual_key: 0x0D,
+                scan_code: 0x1C,
+                extended: true,
+                pressed: true,
+                repeat: false,
+                ctrl: false,
+                shift: false,
+                alt: false,
+            }],
+        );
+        crate::key_input::add_test_frame_active_viewport(main_viewport);
+
+        let close = keymap.consume_action(&ctx, KeyAction::FsClose);
+        let _ = ctx.end_pass();
+
+        assert!(
+            !close,
+            "edge の無い viewport で egui の Enter を Enter 割り当てに使わない"
         );
     }
 

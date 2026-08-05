@@ -625,6 +625,15 @@
   既にしており ("Claim both at this ownership boundary")、KeyHold 側だけが抜けていた。
   照合用の `to_egui` (NumpadEnter は取り違え防止で `None`) とは別に、claim 用の
   「畳まれた先」を返す `egui_twin_key_for_claim` を追加して塞いだ。
+- 追加修正 2 (2026-08-05、実機再現とログで確定): 双子 claim だけでは閉じるのが止まらなかった。
+  `[fs-key] source=root` / `source=fullscreen` のログが示すとおり、**同じ押下の egui イベントは
+  main と fullscreen の両 viewport へ届く**一方、Win32 edge は届いた側 (fullscreen) にしか無い。
+  main 側は claim の対象外なので `Key::Enter` が残り、`FsClose` が egui フォールバックで拾っていた。
+  frame-active な viewport は Win32 キューが正本なので、**畳まれ先のスロット
+  (`Enter` / `Num0`-`Num9`) は egui フォールバックへ落とさない**ようにした
+  (`consume_chord_inner` / press count / pressed probe の 3 経路)。
+  なお本来は frame-active なら全スロットで egui フォールバックを止めるのが筋だが、出荷直前の
+  範囲としては曖昧なスロットに限定した。全面適用は次サイクルで判断する。
 - 残件 (P3): 検収で追加した `shared_virtual_keys_stay_limited_to_the_known_pairs` が、
   **`Backslash` / `IntlYen` も `0xDC` を共有している**ことを検出した。Enter ペアと違って
   extended bit ではなく scan code でしか分かれず、対応する per-HWND ラッチが無いため、

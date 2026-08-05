@@ -497,6 +497,16 @@ pub fn clear_test_frame() {
     }
 }
 
+/// 追加の viewport を frame-active に見せる (subclass 登録済みの兄弟 viewport 相当)。
+#[cfg(test)]
+pub fn add_test_frame_active_viewport(viewport: egui::ViewportId) {
+    if let Ok(mut guard) = state().lock()
+        && !guard.frame_active_viewports.contains(&viewport)
+    {
+        guard.frame_active_viewports.push(viewport);
+    }
+}
+
 #[cfg(test)]
 pub fn set_test_return_key_state(viewport: egui::ViewportId, main_down: bool, numpad_down: bool) {
     if let Ok(mut guard) = state().lock() {
