@@ -1490,6 +1490,10 @@ fn apply_continuous_spread_geometry(
     size.height = geometry.fit_size.y;
 }
 
+fn spread_should_match_page_heights(fit_mode: FullscreenFitMode) -> bool {
+    !matches!(fit_mode, FullscreenFitMode::Original)
+}
+
 fn continuous_spread_fit_width(
     page_count: usize,
     base_width: f32,
@@ -3901,7 +3905,6 @@ fn resolve_spread_zip_zoom(
     fit_scale: f32,
     factor: f32,
     active: bool,
-    forced_total_scale: Option<f32>,
 ) -> SpreadZipZoomResult {
     let gap_page = spread_gap / fit_scale.max(f32::EPSILON);
     let composite = egui::vec2(fit_size.x + gap_page, fit_size.y);
@@ -3914,21 +3917,14 @@ fn resolve_spread_zip_zoom(
     };
     let factor = factor.clamp(factor_min, 16.0);
     let cursor_comp = zip_cursor_image_px(pan_band, egui::Vec2::ZERO, composite, cursor);
-    let (zoom, pan, vis, center_comp) = match forced_total_scale {
-        Some(total_scale) => {
-            let (pan, vis, center) =
-                zip_spread_pan_for_total(image_rect.size(), composite, total_scale, cursor_comp);
-            (total_scale / fit_scale.max(f32::EPSILON), pan, vis, center)
-        }
-        None => zip_spread_zoom_pan(
-            image_rect.size(),
-            composite,
-            single_page_w,
-            factor,
-            fit_scale,
-            cursor_comp,
-        ),
-    };
+    let (zoom, pan, vis, center_comp) = zip_spread_zoom_pan(
+        image_rect.size(),
+        composite,
+        single_page_w,
+        factor,
+        fit_scale,
+        cursor_comp,
+    );
     if active {
         SpreadZipZoomResult {
             zoom_pan: Some((zoom, pan)),
@@ -5430,20 +5426,25 @@ impl App {
             self.settings.spread_page_gap_px.min(200) as f32,
             pixels_per_point,
         );
-        let matched_geometry =
-            spread_layout_geometry(left_size, right_size, left_bbox, right_bbox, true);
         let fit_mode = self.effective_fullscreen_fit_mode();
+        let geometry = spread_layout_geometry(
+            left_size,
+            right_size,
+            left_bbox,
+            right_bbox,
+            spread_should_match_page_heights(fit_mode),
+        );
         let fit_scale_limits = self.fullscreen_fit_scale_limits(pixels_per_point);
         let zoom_pan = self.fs_zoom_pan();
         let page_fit = || {
-            ((image_rect.width() - spread_gap).max(1.0) / matched_geometry.fit_size.x)
-                .min(image_rect.height() / matched_geometry.fit_size.y)
+            ((image_rect.width() - spread_gap).max(1.0) / geometry.fit_size.x)
+                .min(image_rect.height() / geometry.fit_size.y)
         };
         let fit_scale = match fit_mode {
             FullscreenFitMode::Width => {
-                (image_rect.width() - spread_gap).max(1.0) / matched_geometry.fit_size.x
+                (image_rect.width() - spread_gap).max(1.0) / geometry.fit_size.x
             }
-            FullscreenFitMode::Height => image_rect.height() / matched_geometry.fit_size.y,
+            FullscreenFitMode::Height => image_rect.height() / geometry.fit_size.y,
             FullscreenFitMode::Original => physical_pixel_scale(pixels_per_point),
             _ => page_fit(),
         };
@@ -5451,11 +5452,6 @@ impl App {
         let (total_scale, base_center) = match zoom_pan {
             Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
             None => (fit_scale, image_rect.center()),
-        };
-        let geometry = if physical_scale_is_near_integer(total_scale, pixels_per_point) {
-            spread_layout_geometry(left_size, right_size, left_bbox, right_bbox, false)
-        } else {
-            matched_geometry
         };
         let center = base_center - geometry.content_center_offset * total_scale;
         let rects = layout_spread_page_rects(
@@ -16978,10 +16974,9 @@ impl App {
         prefer_processed: bool,
         pixels_per_point: f32,
     ) -> ContinuousReadingUnitSize {
-        let raw_base = self.continuous_unit_base_size(unit, fallback, prefer_processed);
-        let mut base = raw_base.clone();
-        apply_continuous_spread_geometry(&mut base, true);
         let fit_mode = self.effective_fullscreen_fit_mode();
+        let mut base = self.continuous_unit_base_size(unit, fallback, prefer_processed);
+        apply_continuous_spread_geometry(&mut base, spread_should_match_page_heights(fit_mode));
         let spread_gap = quantize_points_to_physical_pixels(
             self.settings.spread_page_gap_px.min(200) as f32,
             pixels_per_point,
@@ -17028,10 +17023,6 @@ impl App {
                 scale_for(target_w, target_h)
             }
         };
-        if base.pages.len() == 2 && physical_scale_is_near_integer(scale, pixels_per_point) {
-            base = raw_base;
-            apply_continuous_spread_geometry(&mut base, false);
-        }
         let (layout_width, _) = continuous_spread_fit_width(
             base.pages.len(),
             base.width,
@@ -19606,9 +19597,15 @@ impl App {
             let left_bbox = content_left.unwrap_or(full_bbox);
             let right_bbox = content_right.unwrap_or(full_bbox);
             let content_active = content_left.is_some() || content_right.is_some();
-            let matched_geometry = spread_layout_geometry(ls, rs, left_bbox, right_bbox, true);
-            let fit_w = matched_geometry.fit_size.x;
-            let fit_h = matched_geometry.fit_size.y;
+            let geometry = spread_layout_geometry(
+                ls,
+                rs,
+                left_bbox,
+                right_bbox,
+                spread_should_match_page_heights(fit_mode),
+            );
+            let fit_w = geometry.fit_size.x;
+            let fit_h = geometry.fit_size.y;
             let page_fit = || {
                 ((image_rect.width() - spread_gap).max(1.0) / fit_w)
                     .min(image_rect.height() / fit_h)
@@ -19621,9 +19618,9 @@ impl App {
             };
             let fit_scale = fit_scale_limits.apply(fit_scale);
 
-            // ZipPla 風ズームの composite も最終的に選んだ見開き geometry から作る。
-            // 1:1 判定は zoom 後の total_scale で行うため、まず従来の高さ合わせ geometry で
-            // 候補倍率を解決し、1:1 ならページ固有寸法へ切り替えて同じ total_scale を保つ。
+            // Height matching now depends only on fit mode, so the geometry is final before the
+            // ZipPla solve. The old result-dependent geometry feedback loop is structurally gone,
+            // and zoom needs to be resolved only once.
             let zip_input = if self.fs_zoom_mode_engaged() {
                 let top_m = TOP_BAR_HOVER_Y.min(image_rect.height() * 0.25);
                 let bottom_m = (FS_SEEK_BAR_HEIGHT + 8.0).min(image_rect.height() * 0.25);
@@ -19638,38 +19635,8 @@ impl App {
             } else {
                 None
             };
-            let mut zip_result = zip_input.map(|(pan_band, cursor)| {
+            let zip_result = zip_input.map(|(pan_band, cursor)| {
                 resolve_spread_zip_zoom(
-                    image_rect,
-                    pan_band,
-                    cursor,
-                    matched_geometry.fit_size,
-                    spread_gap,
-                    fit_scale,
-                    self.fs_zoom_factor,
-                    self.fs_zoom_active,
-                    None,
-                )
-            });
-            if let Some(result) = zip_result {
-                self.fs_zoom_factor = result.factor;
-            }
-            let mut resolved_zoom_pan = zip_result
-                .and_then(|result| result.zoom_pan)
-                .or(zoom_pan.filter(|_| zip_input.is_none()));
-            let (candidate_total_scale, _) = match resolved_zoom_pan {
-                Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
-                None => (fit_scale, image_rect.center()),
-            };
-            let preserve_page_sizes =
-                physical_scale_is_near_integer(candidate_total_scale, pixels_per_point);
-            let geometry = if preserve_page_sizes {
-                spread_layout_geometry(ls, rs, left_bbox, right_bbox, false)
-            } else {
-                matched_geometry
-            };
-            if preserve_page_sizes && let Some((pan_band, cursor)) = zip_input {
-                let result = resolve_spread_zip_zoom(
                     image_rect,
                     pan_band,
                     cursor,
@@ -19678,14 +19645,14 @@ impl App {
                     fit_scale,
                     self.fs_zoom_factor,
                     self.fs_zoom_active,
-                    self.fs_zoom_active.then_some(candidate_total_scale),
-                );
-                // factor の owner は高さ合わせ geometry で解決した候補倍率。ここで固有寸法
-                // geometry 側の clamp を書き戻すと、次フレームの候補倍率が変わって両 geometry
-                // を往復し得る。選択後は total_scale だけを固定して composite/pan を再解決する。
-                resolved_zoom_pan = result.zoom_pan;
-                zip_result = Some(result);
+                )
+            });
+            if let Some(result) = zip_result {
+                self.fs_zoom_factor = result.factor;
             }
+            let resolved_zoom_pan = zip_result
+                .and_then(|result| result.zoom_pan)
+                .or(zoom_pan.filter(|_| zip_input.is_none()));
             let aim_frame = zip_result.and_then(|result| result.aim_frame);
             let (total_scale, base_center) = match resolved_zoom_pan {
                 Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
@@ -27529,6 +27496,123 @@ mod tests {
     }
 
     #[test]
+    fn spread_height_matching_depends_on_fit_mode_not_zoom_scale() {
+        let full_bbox = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        let left_size = egui::vec2(800.0, 1200.0);
+        let right_size = egui::vec2(600.0, 800.0);
+
+        for (fit_mode, expected_right_scale) in [
+            (FullscreenFitMode::Original, 1.0),
+            (FullscreenFitMode::Page, 1.5),
+            (FullscreenFitMode::MarginFit, 1.5),
+            (FullscreenFitMode::Width, 1.5),
+            (FullscreenFitMode::Height, 1.5),
+        ] {
+            for total_scale in [0.5, 1.0, 1.01, 2.0, 2.01] {
+                let geometry = spread_layout_geometry(
+                    left_size,
+                    right_size,
+                    full_bbox,
+                    full_bbox,
+                    spread_should_match_page_heights(fit_mode),
+                );
+                let rects = layout_spread_page_rects(
+                    egui::pos2(1000.0, 700.0),
+                    geometry,
+                    total_scale,
+                    4.0,
+                    1.0,
+                    full_bbox,
+                    full_bbox,
+                    false,
+                );
+
+                assert_f32_close(geometry.left.scale_factor, 1.0);
+                assert_f32_close(geometry.right.scale_factor, expected_right_scale);
+                assert_f32_close(rects.left_rect.height(), 1200.0 * total_scale);
+                assert_f32_close(
+                    rects.right_rect.height(),
+                    800.0 * expected_right_scale * total_scale,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn equal_height_spread_is_unchanged_for_every_fit_mode_and_zoom_scale() {
+        let full_bbox = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        let left_size = egui::vec2(800.0, 1200.0);
+        let right_size = egui::vec2(600.0, 1200.0);
+
+        for fit_mode in [
+            FullscreenFitMode::Original,
+            FullscreenFitMode::Page,
+            FullscreenFitMode::MarginFit,
+            FullscreenFitMode::Width,
+            FullscreenFitMode::Height,
+        ] {
+            for total_scale in [0.5, 1.0, 1.01, 2.0, 2.01] {
+                let geometry = spread_layout_geometry(
+                    left_size,
+                    right_size,
+                    full_bbox,
+                    full_bbox,
+                    spread_should_match_page_heights(fit_mode),
+                );
+                let rects = layout_spread_page_rects(
+                    egui::pos2(1000.0, 700.0),
+                    geometry,
+                    total_scale,
+                    4.0,
+                    1.0,
+                    full_bbox,
+                    full_bbox,
+                    false,
+                );
+
+                assert_f32_close(geometry.left.scale_factor, 1.0);
+                assert_f32_close(geometry.right.scale_factor, 1.0);
+                assert_f32_close(rects.left_rect.height(), 1200.0 * total_scale);
+                assert_f32_close(rects.right_rect.height(), 1200.0 * total_scale);
+            }
+        }
+    }
+
+    #[test]
+    fn spread_zip_zoom_for_non_original_fit_keeps_matched_geometry_zoom_and_pan() {
+        let full_bbox = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        let image_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let pan_band = egui::Rect::from_min_max(egui::pos2(0.0, 80.0), egui::pos2(1920.0, 1020.0));
+        let cursor = egui::pos2(430.0, 260.0);
+        let spread_gap = 4.0;
+        let fit_scale = 0.6;
+        let geometry = spread_layout_geometry(
+            egui::vec2(800.0, 1200.0),
+            egui::vec2(600.0, 800.0),
+            full_bbox,
+            full_bbox,
+            spread_should_match_page_heights(FullscreenFitMode::Page),
+        );
+        let result = resolve_spread_zip_zoom(
+            image_rect,
+            pan_band,
+            cursor,
+            geometry.fit_size,
+            spread_gap,
+            fit_scale,
+            1.25,
+            true,
+        );
+        let (zoom, pan) = result.zoom_pan.unwrap();
+
+        assert_f32_close(geometry.right.scale_factor, 1.5);
+        assert_f32_close(result.factor, 1.25);
+        assert_f32_close(zoom, 3.921_568_6);
+        assert_f32_close(pan.x, 1047.843_1);
+        assert_f32_close(pan.y, 871.088_87);
+    }
+
+    #[test]
     fn spread_non_integer_fit_keeps_height_matching_and_vertical_centering() {
         let full_bbox = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
         let geometry = spread_layout_geometry(
@@ -28439,6 +28523,42 @@ mod tests {
                 (rects[0].1.center().y - rects[1].1.center().y).abs() * pixels_per_point
                     <= 0.5 + 0.01
             );
+        }
+    }
+
+    #[test]
+    fn continuous_spread_height_matching_depends_on_fit_mode_not_zoom_scale() {
+        for (fit_mode, expected_right_scale) in [
+            (FullscreenFitMode::Original, 1.0),
+            (FullscreenFitMode::Page, 1.5),
+            (FullscreenFitMode::MarginFit, 1.5),
+            (FullscreenFitMode::Width, 1.5),
+            (FullscreenFitMode::Height, 1.5),
+        ] {
+            for total_scale in [0.5, 1.0, 1.01, 2.0, 2.01] {
+                let mut size = ContinuousReadingUnitSize {
+                    pages: vec![
+                        ContinuousReadingPageSize::full(1, 800.0, 1200.0),
+                        ContinuousReadingPageSize::full(2, 600.0, 800.0),
+                    ],
+                    width: 1.0,
+                    height: 1.0,
+                    page_gap: 0.0,
+                    logical_scale: 1.0,
+                };
+                apply_continuous_spread_geometry(
+                    &mut size,
+                    spread_should_match_page_heights(fit_mode),
+                );
+
+                assert_f32_close(size.pages[0].logical_scale, 1.0);
+                assert_f32_close(size.pages[1].logical_scale, expected_right_scale);
+                assert_f32_close(size.pages[0].height * total_scale, 1200.0 * total_scale);
+                assert_f32_close(
+                    size.pages[1].height * total_scale,
+                    800.0 * expected_right_scale * total_scale,
+                );
+            }
         }
     }
 
