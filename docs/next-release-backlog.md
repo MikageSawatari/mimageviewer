@@ -634,6 +634,8 @@
   (`consume_chord_inner` / press count / pressed probe の 3 経路)。
   なお本来は frame-active なら全スロットで egui フォールバックを止めるのが筋だが、出荷直前の
   範囲としては曖昧なスロットに限定した。全面適用は次サイクルで判断する。
+- 実機確認済み (2026-08-06): Enter 開閉でズームに入らない / NumpadEnter でズームに入り表示が
+  閉じない / 通常 Enter で閉じられる / 既定 Z / グリッドの Enter 起動、いずれも確認。
 - 残件 (P3): 検収で追加した `shared_virtual_keys_stay_limited_to_the_known_pairs` が、
   **`Backslash` / `IntlYen` も `0xDC` を共有している**ことを検出した。Enter ペアと違って
   extended bit ではなく scan code でしか分かれず、対応する per-HWND ラッチが無いため、
