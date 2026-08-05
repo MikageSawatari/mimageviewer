@@ -1,7 +1,7 @@
 use super::*;
 use crate::keymap::{
     BindingConflict, BindingConflictKind, Chord, KeyAction, KeyContext, KeyName, KeyTrigger,
-    Keymap, MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings, TopMenuId,
+    Keymap, MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings, ModKind, TopMenuId,
     menu_command_can_be_hidden, menu_command_spec, menu_commands_for_parent,
     parse_chord_for_action,
 };
@@ -3089,10 +3089,11 @@ fn command_slot_conflict_label(
 fn modifier_hold_command_editor(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label("長押しに使う修飾キー:");
     ui.horizontal_wrapped(|ui| {
-        for label in ["Ctrl", "Shift", "Alt"] {
-            let selected = modifier_hold_editor_choice(&state.command_chord_inputs) == Some(label);
+        for &kind in ModKind::all() {
+            let label = kind.display_name();
+            let selected = modifier_hold_editor_choice(&state.command_chord_inputs) == Some(kind);
             if ui.selectable_label(selected, label).clicked() {
-                set_single_command_chord_input(state, label);
+                set_single_command_chord_input(state, kind.settings_name());
             }
         }
         let disabled = modifier_hold_editor_choice(&state.command_chord_inputs).is_none();
@@ -3102,24 +3103,16 @@ fn modifier_hold_command_editor(ui: &mut egui::Ui, state: &mut PreferencesState)
             state.command_edit_error = None;
         }
     });
-    ui.small("Ctrl / Shift / Alt のいずれか、または割り当て解除を選んでから「適用して閉じる」を押します。");
+    ui.small("左右不問または右側限定の修飾キー、もしくは割り当て解除を選んでから「適用して閉じる」を押します。");
 }
 
-fn modifier_hold_editor_choice(inputs: &[String; 3]) -> Option<&'static str> {
+fn modifier_hold_editor_choice(inputs: &[String; 3]) -> Option<ModKind> {
     let mut labels = inputs.iter().map(|s| s.trim()).filter(|s| !s.is_empty());
     let first = labels.next()?;
     if labels.next().is_some() || first.eq_ignore_ascii_case("none") {
         return None;
     }
-    if first.eq_ignore_ascii_case("ctrl") || first.eq_ignore_ascii_case("control") {
-        Some("Ctrl")
-    } else if first.eq_ignore_ascii_case("shift") {
-        Some("Shift")
-    } else if first.eq_ignore_ascii_case("alt") {
-        Some("Alt")
-    } else {
-        None
-    }
+    ModKind::parse(first)
 }
 
 fn set_single_command_chord_input(state: &mut PreferencesState, label: &str) {
@@ -7496,9 +7489,12 @@ fn open_in_explorer(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{AI_SIZE_LIMIT_OPTIONS, natural_operation_label_cmp, ring_bindings_for_key_action};
+    use super::{
+        AI_SIZE_LIMIT_OPTIONS, modifier_hold_editor_choice, natural_operation_label_cmp,
+        ring_bindings_for_key_action,
+    };
     use crate::app::MAX_TEXTURE_DIM;
-    use crate::keymap::KeyAction;
+    use crate::keymap::{KeyAction, ModKind};
     use crate::ring_shortcut::{RingActionId, RingShortcutContext};
 
     /// AI サイズ上限プリセットの長辺は GPU テクスチャ上限 (8192) を超えてはならない。
@@ -7540,6 +7536,18 @@ mod tests {
                 "サムネイル列数を10列に",
             ]
         );
+    }
+
+    #[test]
+    fn modifier_hold_editor_accepts_every_mod_kind_choice() {
+        for &kind in ModKind::all() {
+            let inputs = [
+                kind.settings_name().to_string(),
+                String::new(),
+                String::new(),
+            ];
+            assert_eq!(modifier_hold_editor_choice(&inputs), Some(kind));
+        }
     }
 
     #[test]

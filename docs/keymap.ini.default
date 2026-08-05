@@ -21,7 +21,8 @@
 # - 行末の ; 以降は説明コメントです。コメント解除後も残してかまいません。
 # - 競合は拒否しません。競合時は先に判定された操作が有効になります。
 # - 通常の押下操作は Ctrl/Shift/Alt + 通常キーを指定できます。
-# - ModifierHold は Ctrl / Shift / Alt のいずれか 1 つだけ指定できます。
+# - ModifierHold は Ctrl / Shift / Alt / RightCtrl / RightShift / RightAlt の
+#   いずれか 1 つだけ指定できます。Right* は右側限定、それ以外は左右不問です。
 # - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。
 # - キー名の例: A..Z, 0..9, Numpad0..Numpad9, F1..F24, Left, Right, Up, Down,
 #   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete,
@@ -42,6 +43,7 @@
 # FsLoupeLockToggle = L  ; ルーペ固定表示のトグルを L に変更
 # FsNavigatorHold = Ctrl ; 押している間だけナビゲータ表示する修飾キーを Ctrl に変更
 # FsLoupeHold = Ctrl     ; 押している間だけルーペ表示する修飾キーを Ctrl に変更
+# FsOriginalPreviewHold = none ; 押している間だけ元画像表示する操作を無効化
 #
 # [Rating]
 # RatingItem1 = Ctrl+F1  ; 星1を付ける（アイテム）
@@ -307,6 +309,7 @@
 # FsPixelGrid = G ; ピクセルグリッド表示を切り替える
 # FsLoupeLockToggle = M ; ルーペの固定表示を切り替える
 # FsLoupeHold = Shift ; 押している間だけルーペを表示する
+# FsOriginalPreviewHold = RightCtrl ; 押している間だけ元画像を表示する
 # FsEraseMode = E ; 消しゴムモードを開始または確定する
 # FsLocalAdjustMode = Ctrl+G ; 補正レイヤーモードを開始する
 # FsConcealMode = Ctrl+M ; 隠蔽加工モードを開始または終了する

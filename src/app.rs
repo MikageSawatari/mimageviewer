@@ -10639,7 +10639,7 @@ pub struct App {
     pub(crate) erase_paint_mode: bool,
     /// inpaint 適用前の表示入力キャッシュ: item_idx → ピクセルデータ。
     /// raw 固定ではなく、補正 / AI 済みの pre-erase 入力が入ることがある。
-    /// 右 Ctrl の元画像プレビューには使わず、raw 表示は `fs_cache` だけを参照する。
+    /// 元画像プレビューには使わず、raw 表示は `fs_cache` だけを参照する。
     pub(crate) erase_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
     /// マスク永続化 DB
     pub(crate) mask_db: Option<crate::mask_db::MaskDb>,

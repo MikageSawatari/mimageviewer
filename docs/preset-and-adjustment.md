@@ -601,10 +601,10 @@ final composite の `params_hash` から `colorize` / `creative_lut` / `post_fil
 
 ### 2.5 元画像プレビュー
 
-右 Ctrl を押している間だけ、補正 / ポストフィルタ / AI アップスケール・デノイズ /
+元画像表示に割り当てた修飾キー (既定は右 Ctrl) を押している間だけ、補正 / ポストフィルタ / AI アップスケール・デノイズ /
 消しゴム補完結果 / 隠蔽加工を表示選択から外し、元画像を一時表示する。これは「比較用の描画 override」
 であり、`edit_result_cache` / final pipeline cache の無効化、DB 書き換え、AI ジョブの停止は
-行わない。表示元は常に raw 専用の `fs_cache` で、消しゴム補完済みページでも
+行わない。この操作は操作カスタマイズで変更または無効化できる。表示元は常に raw 専用の `fs_cache` で、消しゴム補完済みページでも
 `erase_base_cache` は参照しない。
 
 ### 2.6 Auto モード

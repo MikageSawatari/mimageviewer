@@ -1471,18 +1471,6 @@ fn current_foreground_hwnd() -> usize {
     0
 }
 
-#[cfg(windows)]
-fn original_preview_shortcut_held(_ctx: &egui::Context) -> bool {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_RCONTROL};
-
-    unsafe { GetAsyncKeyState(VK_RCONTROL.0 as i32) < 0 }
-}
-
-#[cfg(not(windows))]
-fn original_preview_shortcut_held(ctx: &egui::Context) -> bool {
-    ctx.input(|i| i.key_down(egui::Key::Num0))
-}
-
 /// 物理的な Ctrl キー押下を OS から直接読む。フルスクリーンビューポートでは
 /// `ctx.input(|i| i.modifiers.ctrl)` がキーフォーカス不在で stale (常に false) になり得る
 /// ため、Ctrl 依存の挙動 (ソースプレビュー / 補正レイヤー境界筆の通常筆切替) はこれを使う。
@@ -3219,8 +3207,8 @@ impl App {
         }
     }
 
-    /// 右 Ctrl ホールド中だけ、mIV 側の派生表示 (補正 / AI / 消しゴム補完) を
-    /// 迂回して raw decode の元画像テクスチャを選ぶ。
+    /// 元画像表示の ModifierHold が成立している間だけ、mIV 側の派生表示
+    /// (補正 / AI / 消しゴム補完) を迂回して raw decode の元画像テクスチャを選ぶ。
     ///
     /// フォーカスは `ctx.input(|i| i.viewport().focused)` ではなく
     /// `self.fs_prev_focused` で確認する: この関数の呼び出し元
@@ -3229,14 +3217,14 @@ impl App {
     /// OS フォーカスを持っている間は常に `Some(false)` を返してしまう。
     /// `fs_prev_focused` はフルスクリーン viewport closure 内で毎フレーム更新される
     /// ので、フルスクリーン側の前フレーム focus 状態を反映する。`GetAsyncKeyState`
-    /// 単体だと動画/アニメ駆動の repaint 中に他アプリの右Ctrl を拾うリスクがあるので、
+    /// 単体だと動画/アニメ駆動の repaint 中に他アプリの割り当てキーを拾うリスクがあるので、
     /// 必ずフォーカス gate と AND させる。
     ///
     /// Shift 検出も `ctx.input(|i| i.modifiers.shift)` ではなく OS API を使う。
     /// `prepare_fullscreen_state` は `show_viewport_immediate` の外側で呼ばれるため、
     /// ここでの ctx はメインビューポートのもの。フルスクリーンが OS フォーカスを
     /// 持っている間、メイン ctx の modifier event は届かない
-    /// (= `i.modifiers.shift` が常に false)。右Ctrl 検出と同じ理由。
+    /// (= `i.modifiers.shift` が常に false)。元画像表示の修飾キー検出と同じ理由。
     fn original_preview_active(&self, ctx: &egui::Context, idx: usize) -> bool {
         if !self.fs_prev_focused {
             return false;
@@ -3244,10 +3232,18 @@ impl App {
         if self.any_modal_dialog_open_for_fullscreen_keys() {
             return false;
         }
-        if !original_preview_shortcut_held(ctx) {
+        // この位置の ctx は main viewport のため、そこに残った FocusedUi/TextInput owner を
+        // 元画像表示の抑止条件にはできない。実際の fullscreen focus と modal は上で明示的に
+        // gate 済みなので、この呼び出しだけ keymap owner 判定を迂回して OS 状態を解決する。
+        if !self
+            .keymap
+            .modifier_held_action_for_external_viewport(ctx, KeyAction::FsOriginalPreviewHold)
+        {
             return false;
         }
-        if self.local_adjust_mode && shift_held_via_os() {
+        // 補正レイヤー固有の Ctrl+Shift バイパスだけを優先する。元画像表示を
+        // RightShift / Alt などへ変更した場合、Shift 単独で抑止してはならない。
+        if self.local_adjust_mode && ctrl_held_via_os() && shift_held_via_os() {
             return false;
         }
         matches!(
@@ -3260,7 +3256,7 @@ impl App {
 
     /// 現在の表示が final pipeline (補正 / AI / カラー化合成) を迂回するか。
     ///
-    /// 元画像表示 (右 Ctrl) と分析モードは raw `fs_cache` を直接描くため、
+    /// 元画像表示と分析モードは raw `fs_cache` を直接描くため、
     /// 描画側 (`resolve_fs_processed_texture`) と nav lock 解放側
     /// (`poll_fs_nav_lock`) は必ずこの述語を共有する。片方だけ更新すると
     /// 「表示は出ているのに lock が解放されない」型のデッドロックになる。
@@ -3325,7 +3321,7 @@ impl App {
             return self.current_animated_frame_texture(idx);
         }
         // Z 分析モードは AI / 補正 / 注釈 / 隠蔽 / 消しゴム / 局所補正をすべてバイパスして
-        // **raw 元画像**を表示する (右 Ctrl の original preview と同じ経路)。分析パネルの色取得・
+        // **raw 元画像**を表示する (original preview と同じ経路)。分析パネルの色取得・
         // ヒストグラム・グレースケール/拡大鏡オーバーレイは raw fs_cache を読むので、表示も raw に
         // 揃えることで「クリックした見た目の色 = 分析値」が一致する (Codex 指摘 + ユーザー要望)。
         if self.fs_display_bypasses_final_pipeline(original_preview_active) {
@@ -20682,14 +20678,14 @@ impl App {
         if !active {
             return;
         }
-        let label = if cfg!(windows) {
-            "元画像表示中: 右Ctrl"
-        } else {
-            "元画像表示中: 0"
-        };
+        let shortcut = self
+            .keymap
+            .chord_labels(KeyAction::FsOriginalPreviewHold)
+            .join(" / ");
+        let label = format!("元画像表示中: {shortcut}");
         let painter = ui.painter();
         let font = egui::FontId::proportional(14.0);
-        let galley = painter.layout_no_wrap(label.to_string(), font, egui::Color32::WHITE);
+        let galley = painter.layout_no_wrap(label, font, egui::Color32::WHITE);
         let pos = egui::pos2(content_rect.min.x + 16.0, content_rect.min.y + 12.0);
         let bg = egui::Rect::from_min_size(pos, galley.size()).expand(6.0);
         painter.rect_filled(bg, 4.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190));

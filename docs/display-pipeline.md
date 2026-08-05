@@ -795,7 +795,7 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 常に source 解像度・補正前の空間を保つ:
 
 ```
-0. 右 Ctrl ホールド中の元画像プレビュー (fs_cache の raw decode)
+0. 元画像表示の割り当てをホールド中 (既定は右 Ctrl。fs_cache の raw decode)
 1. erase / local_adjust / conceal の編集中プレビュー (各 UI の in-memory state)
 2. final_composite_cache[edit_key, params_hash, bg]
    (= edit_result_cache + 色調補正 + final AI + スマートシャープ + カラー化
@@ -849,7 +849,7 @@ generation と erase / local-adjust / conceal の各編集世代を含むため�
 
 Ctrl+↑↓ の nav lock 解放判定も、描画側と同じ
 `fs_display_bypasses_final_pipeline` を使う。通常表示でカラー化が有効なページは
-`complete=true` の final composite まで待つ一方、右 Ctrl の元画像表示と分析モードは
+`complete=true` の final composite まで待つ一方、元画像表示と分析モードは
 raw `fs_cache` を直接描くため、Static / Animated またはサムネイルの到着で解放する。
 この表示モード判定を描画側と lock 側へ別々に実装してはならない。表示だけ raw に
 切り替わって composite が生成されない場合、lock 側だけが完成を待ち続けるためである。
@@ -881,15 +881,15 @@ conceal は erase / raw を入力にして先へ合成せず `None` を返し、
 ピクセル出力段で焼き込む。補正レイヤーが有効だが `local_adjust_cache` がまだ無い場合、
 古い結果や下位画像は保存せず、完了後の再実行を促す。
 
-右 Ctrl ホールドの元画像プレビューは例外的な一時表示で、派生キャッシュは作り直さない。
+`FsOriginalPreviewHold` の元画像プレビューは例外的な一時表示で、派生キャッシュは作り直さない。
 通常の画像 / ZIP 内画像 / PDF ページだけを対象にし、動画には適用しない。表示元は常に
 `fs_cache` の生デコード結果で、補正 / AI / 消しゴム / 隠蔽の派生キャッシュは参照しない。
 補正レイヤーの派生キャッシュも同様に参照しない。ただし補正レイヤーモード中の
 `Ctrl+Shift` は「選択レイヤーをバイパスし他レイヤーを全て適用したプレビュー」に割り当てるため、
 元画像プレビューはこの組み合わせを捕まえず、`resolve_fs_processed_texture` の
-local_adjust 分岐に処理を譲る。`Ctrl` 単体は従来どおり元画像プレビューになる。
+local_adjust 分岐に処理を譲る。元画像表示の割り当て単体は従来どおり元画像プレビューになる。
 元画像プレビューの譲渡判定と layer bypass preview の modifier gate は、fullscreen viewport
-外側の main `ctx.input` では modifier が取れないため、右 Ctrl と同じく OS キー状態を
+外側の main `ctx.input` では modifier が取れないため、元画像表示と同じく OS キー状態を
 参照する。
 
 ### 2.3.1 デバッグ出力
@@ -1122,7 +1122,7 @@ AI アップスケール完了後は `final_composite_cache` の寸法で再レ�
 連結読みではスクロール中の配置ジャンプを避けるため、processed テクスチャが raw と同じ
 アスペクト比なら raw/source サイズをレイアウト基準として保つ。別の処理で processed 側の
 アスペクト比が変わった場合だけ processed 側のサイズを使う。crop は通常表示では暗転 overlay
-だけなので、レイアウト基準も描画 UV も変えない。右 Ctrl の元画像プレビューや分析モードでは
+だけなので、レイアウト基準も描画 UV も変えない。元画像プレビューや分析モードでは
 raw 表示に合わせるため、raw サイズを優先する。
 
 旧 **余白カットフィット** (`FullscreenFitMode::MarginFit`) は設定互換入口としてだけ残している。
@@ -1495,7 +1495,7 @@ colorize / Creative LUT / post-filter は意図的に飛ばすため、grid / fu
   dead code 化され、新版が未実装のまま 1 リリース過ごした。`App::update` の
   「フルスクリーン work セクション」(= `// AI 先読み (新パイプライン)` コメント) を
   消すと再発するため、リファクタ時は呼び出し元の存在を要確認。
-- **元画像プレビュー**: 右 Ctrl を押している間だけ描画時のテクスチャ選択を
+- **元画像プレビュー**: 割り当てた ModifierHold (既定は右 Ctrl) の間だけ描画時のテクスチャ選択を
   raw 専用の `fs_cache` に切り替える。DB・補正設定・AI queue は変更しない。
 - **何かを変えたら正しいキャッシュをクリア**:
   - 色調パラメータ / AI 変更 → `final_ai_cache` / `final_composite_cache` をクリア
