@@ -2048,6 +2048,16 @@ struct ViewerContextBundle {
     stack_script_error: Option<String>,
     stack_toggle_select_path: Option<PathBuf>,
     items: Vec<GridItem>,
+    items_generation: u64,
+    visible_indices: Vec<usize>,
+    /// `items` と同じ添字の正規化済み basename と、その worker lifecycle。
+    /// query / tokens / debounce は App 全体で同じ絞り込み条件を使うため swap しないが、
+    /// 導出 cache は generation 空間を共有しない viewer context と一緒に所有する。
+    /// failed generation も別 context の同値 generation の build を抑止しないようここに含める。
+    facet_name_cache: Vec<Box<str>>,
+    facet_name_cache_generation: Option<u64>,
+    facet_name_cache_pending: Option<facet_name_filter::FacetNameCachePending>,
+    facet_name_cache_failed_generation: Option<u64>,
     thumbnails: Vec<ThumbnailState>,
     image_metas: Vec<Option<(i64, i64)>>,
     video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
@@ -2066,7 +2076,6 @@ struct ViewerContextBundle {
     details_hover_thumb_idx: Option<usize>,
     details_hover_thumb_viewport_open: bool,
     texture_backlog: Vec<crate::thumb_loader::ThumbMsg>,
-    visible_indices: Vec<usize>,
     details_order: Vec<usize>,
     details_order_revision: u64,
     details_cell_content_revisions: DetailsCellContentRevisions,
@@ -2176,7 +2185,6 @@ struct ViewerContextBundle {
     fs_pdf_display_target: Option<crate::pdf_loader::PdfDisplayTarget>,
     fs_early_dims: std::collections::HashMap<usize, [usize; 2]>,
     fs_upload_backlog: Vec<(usize, FsLoadResult, u64)>,
-    items_generation: u64,
     top_level_grid_view: top_level_grid_view::TopLevelGridView,
     items_are_global_search_view: bool,
     items_are_tag_view: bool,
@@ -2359,6 +2367,12 @@ impl ViewerContextBundle {
             stack_script_error: None,
             stack_toggle_select_path: None,
             items: Vec::new(),
+            items_generation: 0,
+            visible_indices: Vec::new(),
+            facet_name_cache: Vec::new(),
+            facet_name_cache_generation: None,
+            facet_name_cache_pending: None,
+            facet_name_cache_failed_generation: None,
             thumbnails: Vec::new(),
             image_metas: Vec::new(),
             video_thumb_overrides: std::collections::HashMap::new(),
@@ -2377,7 +2391,6 @@ impl ViewerContextBundle {
             details_hover_thumb_idx: None,
             details_hover_thumb_viewport_open: false,
             texture_backlog: Vec::new(),
-            visible_indices: Vec::new(),
             details_order: Vec::new(),
             details_order_revision: 0,
             details_cell_content_revisions: DetailsCellContentRevisions::default(),
@@ -2461,7 +2474,6 @@ impl ViewerContextBundle {
             fs_pdf_display_target: None,
             fs_early_dims: std::collections::HashMap::new(),
             fs_upload_backlog: Vec::new(),
-            items_generation: 0,
             top_level_grid_view: top_level_grid_view::TopLevelGridView::default(),
             items_are_global_search_view: false,
             items_are_tag_view: false,
@@ -9213,7 +9225,9 @@ pub struct App {
     /// 適用済み query の解析結果。各 item の照合では再 parse しない。
     pub(crate) facet_name_tokens: Vec<crate::search_query::Token>,
     pub(crate) facet_name_debounce_deadline: Option<std::time::Instant>,
-    /// `items` と同じ添字の、小文字化済み basename。
+    /// 現在 mount 中の viewer context が所有する、`items` と同じ添字の正規化済み basename。
+    /// 入力 / query / tokens / debounce は App-global の条件だが、以下の cache lifecycle は
+    /// `ViewerContextBundle` と swap して context ごとの `items` / generation に追従する。
     pub(crate) facet_name_cache: Vec<Box<str>>,
     pub(crate) facet_name_cache_generation: Option<u64>,
     facet_name_cache_pending: Option<facet_name_filter::FacetNameCachePending>,
@@ -13989,6 +14003,12 @@ impl App {
             stack_script_error,
             stack_toggle_select_path,
             items,
+            items_generation,
+            visible_indices,
+            facet_name_cache,
+            facet_name_cache_generation,
+            facet_name_cache_pending,
+            facet_name_cache_failed_generation,
             thumbnails,
             image_metas,
             video_thumb_overrides,
@@ -14007,7 +14027,6 @@ impl App {
             details_hover_thumb_idx,
             details_hover_thumb_viewport_open,
             texture_backlog,
-            visible_indices,
             details_order,
             details_order_revision,
             details_cell_content_revisions,
@@ -14091,7 +14110,6 @@ impl App {
             fs_pdf_display_target,
             fs_early_dims,
             fs_upload_backlog,
-            items_generation,
             top_level_grid_view,
             items_are_global_search_view,
             items_are_tag_view,
@@ -14205,6 +14223,12 @@ impl App {
         swap_field!(stack_script_error);
         swap_field!(stack_toggle_select_path);
         swap_field!(items);
+        swap_field!(items_generation);
+        swap_field!(visible_indices);
+        swap_field!(facet_name_cache);
+        swap_field!(facet_name_cache_generation);
+        swap_field!(facet_name_cache_pending);
+        swap_field!(facet_name_cache_failed_generation);
         swap_field!(thumbnails);
         swap_field!(image_metas);
         swap_field!(video_thumb_overrides);
@@ -14223,7 +14247,6 @@ impl App {
         swap_field!(details_hover_thumb_idx);
         swap_field!(details_hover_thumb_viewport_open);
         swap_field!(texture_backlog);
-        swap_field!(visible_indices);
         swap_field!(details_order);
         swap_field!(details_order_revision);
         swap_field!(details_cell_content_revisions);
@@ -14318,7 +14341,6 @@ impl App {
         swap_field!(fs_pdf_display_target);
         swap_field!(fs_early_dims);
         swap_field!(fs_upload_backlog);
-        swap_field!(items_generation);
         swap_field!(top_level_grid_view);
         swap_field!(items_are_global_search_view);
         swap_field!(items_are_tag_view);
@@ -37685,6 +37707,10 @@ impl App {
                 app.poll_metadata_load();
                 app.poll_tag_prewarm_results();
                 app.poll_tag_legacy_seed_results();
+                // 名前 facet の正規化結果も items と同じ bundle が所有する。active detached
+                // を mount したこの境界で pending を回収し、main の cache へ混入させない。
+                // 入力の debounce (App 全体の状態) は main を mount した本流だけが進める。
+                app.poll_facet_name_cache(ctx);
                 app.poll_ai_upscale(ctx);
                 app.poll_final_ai(ctx);
                 app.poll_erase_inpaint(ctx);
@@ -38223,6 +38249,12 @@ impl App {
             stack_script_error,
             stack_toggle_select_path,
             items,
+            items_generation,
+            visible_indices,
+            facet_name_cache,
+            facet_name_cache_generation,
+            facet_name_cache_pending,
+            facet_name_cache_failed_generation,
             thumbnails,
             image_metas,
             video_thumb_overrides,
@@ -38242,7 +38274,6 @@ impl App {
             details_hover_thumb_idx,
             details_hover_thumb_viewport_open,
             texture_backlog,
-            visible_indices,
             details_order,
             details_order_revision,
             details_cell_content_revisions,
@@ -38325,7 +38356,6 @@ impl App {
             fs_pdf_display_target,
             fs_early_dims,
             fs_upload_backlog,
-            items_generation,
             top_level_grid_view,
             items_are_global_search_view,
             items_are_tag_view,
@@ -38440,6 +38470,11 @@ impl App {
             stack_script_error,
             stack_toggle_select_path,
             items,
+            items_generation,
+            visible_indices,
+            facet_name_cache,
+            facet_name_cache_generation,
+            facet_name_cache_failed_generation,
             thumbnails,
             image_metas,
             auto_aspect,
@@ -38451,7 +38486,6 @@ impl App {
             keep_range,
             keep_set,
             thumbnail_eviction_generation,
-            visible_indices,
             details_order,
             details_order_revision,
             details_cell_content_revisions,
@@ -38465,7 +38499,6 @@ impl App {
             tags_cache,
             current_folder_last_mtime,
             current_folder_signature,
-            items_generation,
             top_level_grid_view,
             items_are_global_search_view,
             items_are_tag_view,
@@ -38560,6 +38593,9 @@ impl App {
         // main が原本を保持する。parked メディア窓はこれらを駆動しないので empty のままでよい。
         keep_in_main!(
             navigation_scope,
+            // 新しい parked context は複製済み items/cache の独立 owner になる。進行中の
+            // receiver だけは複製できないため、元の main context に残す。
+            facet_name_cache_pending,
             requested,
             metadata_import_refresh_index,
             idle_upgrade_cache_bypass_ineligible,
@@ -61832,7 +61868,8 @@ impl eframe::App for App {
         self.poll_local_adjust_lut_load(ctx);
         self.poll_local_adjust_segmentation(ctx);
         self.poll_search(ctx);
-        self.poll_facet_name_filter(ctx);
+        self.poll_facet_name_debounce(ctx);
+        self.poll_facet_name_cache(ctx);
         self.poll_color_scan(ctx);
         self.poll_favsearch();
         self.poll_tag_view();

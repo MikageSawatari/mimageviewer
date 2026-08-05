@@ -130,7 +130,14 @@ impl App {
         }
     }
 
-    pub(super) fn poll_facet_name_filter(&mut self, ctx: &egui::Context) {
+    /// 入力欄の debounce を進め、静止したら適用する。
+    ///
+    /// 入力 / query / tokens / deadline は App 全体の状態だが、**適用は現在 mount 中の
+    /// context の一覧を作り直す**。そのため main context を mount している update の本流
+    /// からだけ呼ぶ。active detached を mount した scope から呼ぶと、その場で detached の
+    /// `visible_indices` だけが新しい query で作り直され、main は
+    /// `apply_facet_name_input` の同値 early-return に阻まれて古い絞り込みのまま残る。
+    pub(super) fn poll_facet_name_debounce(&mut self, ctx: &egui::Context) {
         let now = std::time::Instant::now();
         if let Some(deadline) = self.facet_name_debounce_deadline {
             if self.ime_input_active(ctx) {
@@ -145,7 +152,14 @@ impl App {
                 ctx.request_repaint_after(deadline.saturating_duration_since(now));
             }
         }
+    }
 
+    /// mount 中の context が所有する正規化 cache の lifecycle を進める。
+    ///
+    /// cache / generation / pending は `items` と同じ `ViewerContextBundle` の持ち物なので、
+    /// **その context を mount している間にしか回収できない**。main と active detached の
+    /// 双方から呼ぶ。
+    pub(super) fn poll_facet_name_cache(&mut self, ctx: &egui::Context) {
         if self.facet_name_cache_generation.is_some_and(|generation| {
             generation != self.items_generation || self.facet_name_cache.len() != self.items.len()
         }) {

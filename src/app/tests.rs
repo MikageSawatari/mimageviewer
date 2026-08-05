@@ -5660,7 +5660,10 @@ mod phase_c_folder_nav_history_tests {
 #[cfg(test)]
 mod phase_c_drill_nav_tests {
     use super::phase_c_support::setup_app;
-    use crate::app::{App, FacetField, subfolder_expansion_synthetic_path};
+    use crate::app::{
+        ActiveDetachedViewerContext, App, FacetField, ViewerContextBundle,
+        subfolder_expansion_synthetic_path,
+    };
     use crate::global_search::GlobalHit;
     use crate::global_search_ui::GlobalSearchView;
     use std::path::PathBuf;
@@ -6101,6 +6104,74 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
+    fn facet_name_cache_does_not_cross_equal_generation_viewer_bundles() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::Image(PathBuf::from("c:/main/alpha.jpg")),
+            GridItem::Image(PathBuf::from("c:/main/other.jpg")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![None; app.items.len()];
+        app.items_generation = 5;
+        install_ready_facet_name_cache(&mut app, "alpha");
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![0]);
+
+        let mut detached = ViewerContextBundle::empty();
+        detached.items = vec![
+            GridItem::Image(PathBuf::from("c:/detached/other.jpg")),
+            GridItem::Image(PathBuf::from("c:/detached/alpha.jpg")),
+        ];
+        detached.thumbnails = vec![ThumbnailState::Pending; detached.items.len()];
+        detached.image_metas = vec![None; detached.items.len()];
+        detached.items_generation = app.items_generation;
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: detached });
+
+        let (while_detached_cache_is_empty, after_detached_cache_is_ready) = app
+            .with_active_detached_viewer_context(|mounted| {
+                assert!(
+                    mounted.facet_name_cache.is_empty(),
+                    "detached bundle must not inherit main's equal-generation cache"
+                );
+                mounted.rebuild_visible_indices();
+                let while_cache_is_empty = mounted.visible_indices.clone();
+
+                install_ready_facet_name_cache(mounted, "alpha");
+                mounted.rebuild_visible_indices();
+                (while_cache_is_empty, mounted.visible_indices.clone())
+            })
+            .expect("detached bundle is present");
+
+        assert_eq!(
+            while_detached_cache_is_empty,
+            vec![0, 1],
+            "cache 準備前の detached 一覧を main の basename で絞り込まない"
+        );
+        assert_eq!(
+            after_detached_cache_is_ready,
+            vec![1],
+            "detached 自身の basename cache だけで絞り込む"
+        );
+
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.visible_indices,
+            vec![0],
+            "detached の cache 構築後も main bundle の cache を維持する"
+        );
+        assert_eq!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .expect("detached bundle remains parked")
+                .bundle
+                .facet_name_cache_generation,
+            Some(5)
+        );
+    }
+
+    #[test]
     fn facet_name_debounce_does_not_apply_during_ime_input() {
         let mut app = setup_app();
         app.facet_name_input = "未確定".to_owned();
@@ -6116,7 +6187,7 @@ mod phase_c_drill_nav_tests {
         });
         app.update_ime_state(&ctx);
 
-        app.poll_facet_name_filter(&ctx);
+        app.poll_facet_name_debounce(&ctx);
 
         assert!(app.settings.facet_filter.name_query.is_empty());
         assert!(
