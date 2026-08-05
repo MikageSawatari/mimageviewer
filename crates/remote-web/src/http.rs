@@ -11,10 +11,11 @@ use mimageviewer_ipc::{
     RemoteAiJobError, RemoteAiJobErrorCode, RemoteAiStartRequest, RemoteEntryKind,
     RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource, RemoteWriteErrorCode,
     RemoteWriteRequest, SessionResponse, SessionStatus, VideoStreamControlAction,
-    VideoStreamErrorCode, VideoStreamPlaylistKind, VideoStreamQuality, VideoStreamSegmentIndex,
-    VideoStreamSegmentPayload, VideoStreamThumbnailPayload,
+    VideoStreamErrorCode, VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind,
+    VideoStreamQuality, VideoStreamSegmentIndex, VideoStreamSegmentPayload,
+    VideoStreamThumbnailPayload,
 };
-use percent_encoding::percent_decode_str;
+use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tiny_http::{Header, Method, Request, Response, StatusCode};
@@ -522,6 +523,10 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             api_video_thumbnail(request, state, &remote_client_id)
         }
         (Method::Get, "/api/video/state") => api_video_state(state, &query, &remote_client_id),
+        (Method::Get, "/api/video/jumps") => api_video_jumps(state, &query, &remote_client_id),
+        (Method::Get, "/api/video/jump-thumbnail") => {
+            api_video_jump_thumbnail(state, &query, &remote_client_id)
+        }
         (Method::Post, "/api/video/stop") => api_video_stop(request, state, &remote_client_id),
         (Method::Get, path) if path.starts_with("/stream/") => {
             stream_resource(state, path, &remote_client_id)
@@ -1031,6 +1036,122 @@ fn video_thumbnail_http_response(payload: VideoStreamThumbnailPayload) -> HttpRe
             HttpResponse::bytes(204, "application/octet-stream", Vec::new())
                 .with_header("Cache-Control", "no-store")
         }
+    }
+}
+
+fn api_video_jumps(state: &AppState, query: &[(String, String)], client_id: &str) -> HttpResponse {
+    let session = match video_query_session(query) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    state.session_activity.note(client_id);
+    let result = match state.ipc_admission.run(IpcClass::Heavy, || {
+        state
+            .thumbnail_client
+            .video_stream_jump_list(client_id, session)
+    }) {
+        Ok(result) => result,
+        Err(busy) => return video_admission_busy_response(busy),
+    };
+    match result {
+        Ok(success) => {
+            let sections: Vec<_> = success
+                .value
+                .sections
+                .into_iter()
+                .map(|section| {
+                    let entries: Vec<_> = section
+                        .entries
+                        .into_iter()
+                        .map(|entry| {
+                            let thumbnail_url = entry.thumbnail_token.map(|token| {
+                                format!(
+                                    "/api/video/jump-thumbnail?session={session}&token={}",
+                                    utf8_percent_encode(&token, NON_ALPHANUMERIC)
+                                )
+                            });
+                            json!({
+                                "id": entry.id,
+                                "position_secs": entry.position_secs,
+                                "display_time": entry.display_time,
+                                "title": entry.title,
+                                "thumbnail_url": thumbnail_url,
+                            })
+                        })
+                        .collect();
+                    json!({
+                        "kind": section.kind,
+                        "label": section.label,
+                        "entries": entries,
+                    })
+                })
+                .collect();
+            HttpResponse::json(&json!({"session": session, "sections": sections}))
+                .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+                .with_header("Cache-Control", "no-store")
+        }
+        Err(failure) => video_ipc_error_response(failure),
+    }
+}
+
+fn api_video_jump_thumbnail(
+    state: &AppState,
+    query: &[(String, String)],
+    client_id: &str,
+) -> HttpResponse {
+    let session = match video_query_session(query) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let token = match required_query_value(query, "token") {
+        Ok(token) if !token.is_empty() && token.len() <= 256 => token,
+        _ => {
+            return video_request_error_response(
+                400,
+                "stream_bad_request",
+                "jump thumbnail token query is invalid",
+            );
+        }
+    };
+    state.session_activity.note(client_id);
+    let result = match state.ipc_admission.run(IpcClass::Heavy, || {
+        state
+            .thumbnail_client
+            .video_stream_jump_thumbnail(client_id, session, token)
+    }) {
+        Ok(result) => result,
+        Err(busy) => return video_admission_busy_response(busy),
+    };
+    match result {
+        Ok(success) => video_jump_thumbnail_http_response(success.value),
+        Err(failure) => video_ipc_error_response(failure),
+    }
+}
+
+fn video_query_session(query: &[(String, String)]) -> Result<u64, HttpResponse> {
+    required_query_value(query, "session")
+        .and_then(|value| value.parse::<u64>().map_err(|_| ()))
+        .map_err(|_| {
+            video_request_error_response(400, "stream_bad_request", "session query is required")
+        })
+}
+
+fn video_jump_thumbnail_http_response(payload: VideoStreamJumpThumbnailPayload) -> HttpResponse {
+    match payload {
+        VideoStreamJumpThumbnailPayload::Found { webp_bytes } => {
+            HttpResponse::bytes(200, "image/webp", webp_bytes)
+                .with_header("Cache-Control", "private, max-age=60")
+        }
+        VideoStreamJumpThumbnailPayload::Missing => HttpResponse::bytes(
+            404,
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&json!({
+                "error": "jump_thumbnail_not_found",
+                "message": "サムネイルが見つかりませんでした。",
+            }))
+            .unwrap_or_default(),
+        )
+        .with_header("Cache-Control", "no-store"),
     }
 }
 
@@ -3391,6 +3512,30 @@ mod tests {
     }
 
     #[test]
+    fn video_jump_thumbnail_is_private_for_60_seconds_and_missing_is_not_cached() {
+        let found = video_jump_thumbnail_http_response(VideoStreamJumpThumbnailPayload::Found {
+            webp_bytes: vec![4, 5, 6],
+        });
+        assert_eq!(found.status, 200);
+        assert_eq!(found.content_type, "image/webp");
+        assert_eq!(found.body, vec![4, 5, 6]);
+        assert!(
+            found.headers.iter().any(|(name, value)| {
+                *name == "Cache-Control" && value == "private, max-age=60"
+            })
+        );
+
+        let missing = video_jump_thumbnail_http_response(VideoStreamJumpThumbnailPayload::Missing);
+        assert_eq!(missing.status, 404);
+        assert!(
+            missing
+                .headers
+                .iter()
+                .any(|(name, value)| { *name == "Cache-Control" && value == "no-store" })
+        );
+    }
+
+    #[test]
     fn remote_page_and_ai_result_http_accept_only_the_jpeg_payload_contract() {
         assert_eq!(remote_page_content_type("image/jpeg"), Some("image/jpeg"));
         assert_eq!(remote_page_content_type("image/webp"), None);
@@ -3493,6 +3638,12 @@ mod tests {
                 r#"{"session":1,"position_secs":12.5}"#,
             ),
             (Method::Get, "/api/video/state?session=1", ""),
+            (Method::Get, "/api/video/jumps?session=1", ""),
+            (
+                Method::Get,
+                "/api/video/jump-thumbnail?session=1&token=v1%3Apin%3A1%3Aabc",
+                "",
+            ),
             (Method::Post, "/api/video/stop", r#"{"session":1}"#),
             (Method::Get, "/stream/1/1/index.m3u8", ""),
             (Method::Get, "/stream/1/1/media.m3u8", ""),

@@ -236,6 +236,7 @@ impl ServerGuard {
             let thumbnail_engine = Arc::clone(&thumbnail_engine);
             let container_engine = Arc::clone(&container_engine);
             let collection_engine = Arc::clone(&collection_engine);
+            let session = session_handle.clone();
             let worker_metrics = Arc::clone(&heavy_metrics);
             workers.push(
                 std::thread::Builder::new()
@@ -246,6 +247,7 @@ impl ServerGuard {
                             &thumbnail_engine,
                             &container_engine,
                             &collection_engine,
+                            &session,
                             &worker_metrics,
                             index,
                         )
@@ -407,6 +409,7 @@ fn worker_loop(
     thumbnail_engine: &ThumbnailEngine,
     container_engine: &ContainerEngine,
     collection_engine: &CollectionEngine,
+    session: &SessionHandle,
     metrics: &QueueMetrics,
     worker_index: usize,
 ) {
@@ -459,6 +462,38 @@ fn worker_loop(
                         id,
                         response: container_engine
                             .page_with_session_cancel(request, &context, cancel),
+                    },
+                    ClientMessage::VideoStreamJumpList {
+                        id,
+                        session: stream_session,
+                        ..
+                    } => ServerMessage::VideoStreamJumpList {
+                        id,
+                        response: match session.video_stream(stream_session) {
+                            Ok(stream) => VideoStreamResult::Success(stream.jump_catalog.list()),
+                            Err(error) => VideoStreamResult::Error(error),
+                        },
+                    },
+                    ClientMessage::VideoStreamJumpThumbnail {
+                        id,
+                        session: stream_session,
+                        token,
+                        ..
+                    } => ServerMessage::VideoStreamJumpThumbnail {
+                        id,
+                        response: if token.is_empty() || token.len() > 256 {
+                            VideoStreamResult::Error(VideoStreamError::new(
+                                VideoStreamErrorCode::BadRequest,
+                                "ジャンプサムネイル token が不正です",
+                            ))
+                        } else {
+                            match session.video_stream(stream_session) {
+                                Ok(stream) => VideoStreamResult::Success(
+                                    stream.jump_catalog.thumbnail(&token),
+                                ),
+                                Err(error) => VideoStreamResult::Error(error),
+                            }
+                        },
                     },
                     ClientMessage::Write { id, .. } => ServerMessage::Write {
                         id,
@@ -1015,6 +1050,8 @@ fn request_kind(message: &ClientMessage) -> &'static str {
         ClientMessage::VideoStreamControl { .. } => "video_stream_control",
         ClientMessage::VideoStreamSeek { .. } => "video_stream_seek",
         ClientMessage::VideoStreamThumbnail { .. } => "video_stream_thumbnail",
+        ClientMessage::VideoStreamJumpList { .. } => "video_stream_jump_list",
+        ClientMessage::VideoStreamJumpThumbnail { .. } => "video_stream_jump_thumbnail",
         ClientMessage::VideoStreamPlaylist { .. } => "video_stream_playlist",
         ClientMessage::VideoStreamSegment { .. } => "video_stream_segment",
         ClientMessage::VideoStreamState { .. } => "video_stream_state",
@@ -1034,6 +1071,8 @@ fn work_lane(message: &ClientMessage) -> WorkLane {
         | ClientMessage::VideoStreamSegment { .. }
         | ClientMessage::VideoStreamState { .. }
         | ClientMessage::VideoStreamStop { .. } => WorkLane::Stream,
+        ClientMessage::VideoStreamJumpList { .. }
+        | ClientMessage::VideoStreamJumpThumbnail { .. } => WorkLane::Heavy,
         ClientMessage::RemoteAiStart { .. }
         | ClientMessage::RemoteAiState { .. }
         | ClientMessage::RemoteAiRecoverable { .. }
@@ -1062,6 +1101,8 @@ fn message_client_id(message: &ClientMessage) -> Option<&str> {
         | ClientMessage::VideoStreamControl { client_id, .. }
         | ClientMessage::VideoStreamSeek { client_id, .. }
         | ClientMessage::VideoStreamThumbnail { client_id, .. }
+        | ClientMessage::VideoStreamJumpList { client_id, .. }
+        | ClientMessage::VideoStreamJumpThumbnail { client_id, .. }
         | ClientMessage::VideoStreamPlaylist { client_id, .. }
         | ClientMessage::VideoStreamSegment { client_id, .. }
         | ClientMessage::VideoStreamState { client_id, .. }
@@ -1116,6 +1157,10 @@ fn operation_description(message: &ClientMessage) -> String {
         ClientMessage::VideoStreamControl { .. } => "動画ストリーミングを操作中".to_owned(),
         ClientMessage::VideoStreamSeek { .. } => "動画ストリーミングをシーク中".to_owned(),
         ClientMessage::VideoStreamThumbnail { .. } => "動画シークプレビューを取得中".to_owned(),
+        ClientMessage::VideoStreamJumpList { .. } => "動画ジャンプ一覧を取得中".to_owned(),
+        ClientMessage::VideoStreamJumpThumbnail { .. } => {
+            "動画ジャンプサムネイルを取得中".to_owned()
+        }
         ClientMessage::VideoStreamPlaylist { .. } => "動画プレイリストを取得中".to_owned(),
         ClientMessage::VideoStreamSegment { .. } => "動画セグメントを取得中".to_owned(),
         ClientMessage::VideoStreamState { .. } => "動画ストリーミング状態を取得中".to_owned(),
@@ -1245,6 +1290,14 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
             response: VideoStreamResult::Success(_),
             ..
         }
+        | ServerMessage::VideoStreamJumpList {
+            response: VideoStreamResult::Success(_),
+            ..
+        }
+        | ServerMessage::VideoStreamJumpThumbnail {
+            response: VideoStreamResult::Success(_),
+            ..
+        }
         | ServerMessage::VideoStreamPlaylist {
             response: VideoStreamResult::Success(_),
             ..
@@ -1324,6 +1377,14 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
             ..
         }
         | ServerMessage::VideoStreamThumbnail {
+            response: VideoStreamResult::Error(_),
+            ..
+        }
+        | ServerMessage::VideoStreamJumpList {
+            response: VideoStreamResult::Error(_),
+            ..
+        }
+        | ServerMessage::VideoStreamJumpThumbnail {
             response: VideoStreamResult::Error(_),
             ..
         }
@@ -1895,6 +1956,16 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
             id: *id,
             response: stopped_video_response(),
         },
+        ClientMessage::VideoStreamJumpList { id, .. } => ServerMessage::VideoStreamJumpList {
+            id: *id,
+            response: stopped_video_response(),
+        },
+        ClientMessage::VideoStreamJumpThumbnail { id, .. } => {
+            ServerMessage::VideoStreamJumpThumbnail {
+                id: *id,
+                response: stopped_video_response(),
+            }
+        }
         ClientMessage::VideoStreamPlaylist { id, .. } => ServerMessage::VideoStreamPlaylist {
             id: *id,
             response: stopped_video_response(),
@@ -2017,6 +2088,16 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
             id: *id,
             response: busy_video_response(),
         },
+        ClientMessage::VideoStreamJumpList { id, .. } => ServerMessage::VideoStreamJumpList {
+            id: *id,
+            response: busy_video_response(),
+        },
+        ClientMessage::VideoStreamJumpThumbnail { id, .. } => {
+            ServerMessage::VideoStreamJumpThumbnail {
+                id: *id,
+                response: busy_video_response(),
+            }
+        }
         ClientMessage::VideoStreamPlaylist { id, .. } => ServerMessage::VideoStreamPlaylist {
             id: *id,
             response: busy_video_response(),
@@ -2487,8 +2568,14 @@ mod tests {
                 ),
             },
         };
+        let jump_list = ClientMessage::VideoStreamJumpList {
+            id: 84,
+            client_id: "test-client".to_owned(),
+            session: 1,
+        };
         assert_eq!(work_lane(&segment), WorkLane::Stream);
         assert_eq!(work_lane(&thumbnail), WorkLane::Heavy);
+        assert_eq!(work_lane(&jump_list), WorkLane::Heavy);
         assert_eq!(work_lane(&home), WorkLane::Home);
         assert_eq!(work_lane(&folder_list), WorkLane::Home);
 

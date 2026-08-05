@@ -3,9 +3,13 @@
 #
 # Output:
 #   target\dev-runtime\mimageviewer-core.exe
+#   target\dev-runtime\mimageviewer-remote.exe
 #   FFmpeg DLLs are staged beside it so the core can run without the release
 #   launcher. Other native assets, workers, and models use the same embedded
 #   extraction path as the regular application.
+#
+# Both executables are built together on purpose: the core spawns the remote
+# service from its own directory, and the two share PROTOCOL_VERSION.
 #
 # The dev-runtime Cargo profile only changes optimization/build-time settings.
 # The portable feature is intentionally NOT enabled, so an ordinary launch uses
@@ -21,6 +25,7 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $outputDir = Join-Path $repoRoot 'target\dev-runtime'
 $coreExe = Join-Path $outputDir 'mimageviewer-core.exe'
+$remoteExe = Join-Path $outputDir 'mimageviewer-remote.exe'
 $normalDataDir = if ($env:APPDATA) {
     Join-Path $env:APPDATA 'mimageviewer'
 } else {
@@ -45,6 +50,30 @@ function Ensure-LibclangPath {
             return
         }
     }
+}
+
+function Stop-StagedProcess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ExeName,
+        [Parameter(Mandatory = $true)]
+        [string] $ExePath,
+        [Parameter(Mandatory = $true)]
+        [string] $Label
+    )
+
+    if (-not (Test-Path $ExePath -PathType Leaf)) { return }
+    $fullPath = [System.IO.Path]::GetFullPath($ExePath)
+    Get-Process -Name $ExeName -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            $processPath = $null
+            try { $processPath = $_.Path } catch { $processPath = $null }
+            if ($processPath -and
+                [System.IO.Path]::GetFullPath($processPath) -eq $fullPath) {
+                Write-Host ("[build-dev] stopping development {0} (PID={1})" -f $Label, $_.Id)
+                Stop-Process -Id $_.Id -Force -ErrorAction Stop
+            }
+        }
 }
 
 function Copy-IfChanged {
@@ -82,20 +111,9 @@ function Copy-IfChanged {
 
 Push-Location $repoRoot
 try {
-    # Stop only the development-profile core when it locks the output file.
-    if (Test-Path $coreExe -PathType Leaf) {
-        $corePath = [System.IO.Path]::GetFullPath($coreExe)
-        Get-Process -Name 'mimageviewer-core' -ErrorAction SilentlyContinue |
-            ForEach-Object {
-                $processPath = $null
-                try { $processPath = $_.Path } catch { $processPath = $null }
-                if ($processPath -and
-                    [System.IO.Path]::GetFullPath($processPath) -eq $corePath) {
-                    Write-Host ("[build-dev] stopping development core (PID={0})" -f $_.Id)
-                    Stop-Process -Id $_.Id -Force -ErrorAction Stop
-                }
-            }
-    }
+    # Stop only the development-profile executables when they lock the output.
+    Stop-StagedProcess -ExeName 'mimageviewer-core' -ExePath $coreExe -Label 'core'
+    Stop-StagedProcess -ExeName 'mimageviewer-remote' -ExePath $remoteExe -Label 'remote service'
 
     Ensure-LibclangPath
     Write-Host '[build-dev] building normal-profile core with Cargo profile dev-runtime'
@@ -105,6 +123,18 @@ try {
     }
     if (-not (Test-Path $coreExe -PathType Leaf)) {
         throw "[build-dev] core executable was not produced: $coreExe"
+    }
+
+    # The core spawns the remote service from its own directory, and both sides
+    # carry the same PROTOCOL_VERSION. Building only the core leaves a stale
+    # service beside it, which fails the handshake instead of running.
+    Write-Host '[build-dev] building remote service with Cargo profile dev-runtime'
+    & cargo build --profile dev-runtime -p mimageviewer-remote --bin mimageviewer-remote
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+    if (-not (Test-Path $remoteExe -PathType Leaf)) {
+        throw "[build-dev] remote service was not produced: $remoteExe"
     }
 
     $copies = @(
@@ -125,6 +155,7 @@ try {
     Write-Host ''
     Write-Host '[build-dev] DONE'
     Write-Host ("  core: {0}" -f $coreExe)
+    Write-Host ("  remote service: {0}" -f $remoteExe)
     Write-Host ("  data (default): {0}" -f $normalDataDir)
     Write-Host ("  isolated override: --data-dir `"{0}`"" -f
         (Join-Path $outputDir 'data'))

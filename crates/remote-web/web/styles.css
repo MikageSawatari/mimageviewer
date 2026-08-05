@@ -1276,7 +1276,8 @@ button {
 
 .viewer-panel-tabs {
   display: grid;
-  grid-template-columns: repeat(4, minmax(max-content, 1fr));
+  grid-auto-columns: minmax(max-content, 1fr);
+  grid-auto-flow: column;
   overflow-x: auto;
   flex: 0 0 auto;
   margin-top: 10px;
@@ -1309,6 +1310,109 @@ button {
   flex: 1 1 auto;
   overscroll-behavior: contain;
   touch-action: pan-y;
+}
+
+.video-functions-panel[hidden],
+.video-jump-panel[hidden] {
+  display: none;
+}
+
+.video-jump-panel {
+  padding: 10px 0 4px;
+}
+
+.video-jump-status {
+  margin: 14px 4px;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.video-jump-section {
+  display: grid;
+  gap: 7px;
+  margin-bottom: 14px;
+}
+
+.video-jump-section-title {
+  margin: 2px 5px 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.video-jump-section[data-kind="pin"] .video-jump-section-title {
+  color: rgb(140 245 170);
+}
+
+.video-jump-section[data-kind="bookmark"] .video-jump-section-title {
+  color: rgb(255 220 82);
+}
+
+.video-jump-section[data-kind="chapter"] .video-jump-section-title {
+  color: rgb(115 210 255);
+}
+
+.video-jump-row {
+  display: grid;
+  width: 100%;
+  min-height: 76px;
+  grid-template-columns: 120px minmax(0, 1fr);
+  align-items: center;
+  gap: 11px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: inherit;
+  background: var(--surface-raised);
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.video-jump-thumbnail {
+  display: grid;
+  overflow: hidden;
+  width: 120px;
+  aspect-ratio: 16 / 9;
+  place-items: center;
+  border-radius: 7px;
+  background: rgb(10 12 16 / 88%);
+}
+
+.video-jump-thumbnail.is-empty::after {
+  color: var(--muted);
+  content: "…";
+}
+
+.video-jump-thumbnail img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.video-jump-copy {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.video-jump-time {
+  color: #f3f7ff;
+  font: 700 0.85rem/1.2 ui-monospace, "SFMono-Regular", Consolas, monospace;
+}
+
+/* 本体は題名を最大 5 行まで折り返して行を伸ばす (overlay_draw.rs の
+   draw_native_jump_row)。章題は情報量があるので 1 行で切らず、同じ 5 行で揃える。 */
+.video-jump-title {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 5;
+  line-clamp: 5;
 }
 
 .viewer-panel-placeholder {

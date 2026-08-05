@@ -4,6 +4,7 @@ mod container;
 mod path_guard;
 mod service;
 mod thumbnail;
+mod video_jump;
 mod video_stream;
 
 #[cfg(windows)]

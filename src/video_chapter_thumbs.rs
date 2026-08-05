@@ -29,6 +29,18 @@ impl VideoChapterThumbDb {
         Ok(Self { conn })
     }
 
+    /// 一覧生成 worker 用。起動時に初期化済みの DB を書き換えずに開く。
+    pub fn open_readonly() -> Result<Self, rusqlite::Error> {
+        let conn = rusqlite::Connection::open_with_flags(
+            Self::db_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(750))?;
+        Ok(Self { conn })
+    }
+
     fn init_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS video_chapter_thumbs (
@@ -46,7 +58,7 @@ impl VideoChapterThumbDb {
         )
     }
 
-    fn db_path() -> PathBuf {
+    pub fn db_path() -> PathBuf {
         crate::data_dir::get().join("video_chapter_thumbs.db")
     }
 

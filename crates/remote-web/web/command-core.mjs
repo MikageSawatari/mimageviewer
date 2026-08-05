@@ -87,6 +87,8 @@ export const ViewerPanelAction = Object.freeze({
   CLOSE: "close",
 });
 
+export const VIEWER_PANEL_ANIMATION_MS = 180;
+
 export const VIDEO_QUALITY_PRESETS = Object.freeze([
   Object.freeze({ id: "minimum", label: "最小", traffic: "約 210 MB / 時" }),
   Object.freeze({ id: "low", label: "低", traffic: "約 400 MB / 時" }),
@@ -330,8 +332,8 @@ export function viewerPanelLayout({ viewportWidth, viewportHeight, open = true }
   };
 }
 
-/// open / close / resize を 1 つの panel state transition として扱う。
-export function viewerPanelTransition(
+/// 静止画と動画で共有する panel shell の open / close / resize transition。
+export function viewerPanelShellTransition(
   current,
   { action = "resize", viewportWidth, viewportHeight } = {}
 ) {
@@ -349,7 +351,24 @@ export function viewerPanelTransition(
     open,
     orientation: layout.orientation,
     layout,
-    shouldRefit: openChanged || (open && orientationChanged),
+    layoutChanged: openChanged || (open && orientationChanged),
+  };
+}
+
+/// 静止画固有の refit 指示を shell transition に重ねる。
+export function viewerPanelTransition(
+  current,
+  { action = "resize", viewportWidth, viewportHeight } = {}
+) {
+  const { layoutChanged, ...next } = viewerPanelShellTransition(current, {
+    action,
+    viewportWidth,
+    viewportHeight,
+  });
+  const wasOpen = Boolean(current?.open);
+  return {
+    ...next,
+    shouldRefit: layoutChanged,
     resetTransform: action === ViewerPanelAction.OPEN && !wasOpen,
   };
 }

@@ -209,6 +209,7 @@ pub mod video;
 pub mod video_bookmarks;
 pub mod video_bookmarks_parser;
 pub mod video_chapter_thumbs;
+mod video_jump;
 pub mod video_pins;
 pub mod video_thumb;
 pub mod view_trim;

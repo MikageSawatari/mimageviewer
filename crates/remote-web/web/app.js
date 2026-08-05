@@ -6,6 +6,7 @@ import {
   SpreadMode,
   ViewerGesture,
   ViewerPanelAction,
+  VIEWER_PANEL_ANIMATION_MS,
   adjustmentResetVisible,
   command,
   commandFromKey,
@@ -73,7 +74,6 @@ const THUMBNAIL_MAX_CONCURRENCY = thumbnailRequestConcurrency(
 );
 const PAGE_LOADING_INDICATOR_DELAY_MS = 225;
 const PAGE_BOUNDARY_MESSAGE_DURATION_MS = 2400;
-const VIEWER_PANEL_ANIMATION_MS = 180;
 // 標準画質の実測約 1.2 MiB/ページなら、進行方向 3 ページで従来と同じ約 3.6 MiB。
 // 逆方向 1 ページは維持し、選択中の画質を先読みでもそのまま使う。
 // prefetch は直列かつ foreground が active request を abort するため表示要求を待たせない。
@@ -373,6 +373,7 @@ const state = {
   gestureHelpDialog: null,
   viewerBarsVisible: true,
   viewerPanelTab: "functions",
+  videoPanelTab: "functions",
   coarsePointer: Boolean(globalThis.matchMedia?.("(pointer: coarse)")?.matches),
   keyboardInputSeen: false,
   fitMode: FitMode.PAGE,
@@ -2937,6 +2938,8 @@ function renderVideoViewer(entry) {
       coarsePointer: state.coarsePointer,
       keyboardUsed: state.keyboardInputSeen,
     }),
+    getPanelTab: () => state.videoPanelTab,
+    setPanelTab: (tabId) => { state.videoPanelTab = tabId; },
   });
   if (!state.viewerBarsVisible) viewer.setBarsVisible(false);
   state.viewer = viewer;

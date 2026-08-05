@@ -18,10 +18,11 @@ use mimageviewer_ipc::{
     RemoteWriteResponse, RemoteWriteResult, RequestId, ServerMessage, SessionAcquireRequest,
     SessionPeerInfo, SessionPingRequest, SessionResponse, SessionStatus, ThumbnailError,
     ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse, VIDEO_STREAM_START_BUDGET,
-    VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode, VideoStreamPlaylistKind,
-    VideoStreamPlaylistPayload, VideoStreamQuality, VideoStreamResult, VideoStreamSeekPayload,
-    VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamStartPayload,
-    VideoStreamStatePayload, VideoStreamThumbnailPayload, read_frame, write_frame,
+    VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode, VideoStreamJumpListPayload,
+    VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind, VideoStreamPlaylistPayload,
+    VideoStreamQuality, VideoStreamResult, VideoStreamSeekPayload, VideoStreamSegmentIndex,
+    VideoStreamSegmentPayload, VideoStreamStartPayload, VideoStreamStatePayload,
+    VideoStreamThumbnailPayload, read_frame, write_frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -888,6 +889,44 @@ impl ThumbnailClient {
             },
             |message| match message {
                 ServerMessage::VideoStreamThumbnail { response, .. } => Some(response),
+                _ => None,
+            },
+        )
+    }
+
+    pub fn video_stream_jump_list(
+        &self,
+        client_id: &str,
+        session: u64,
+    ) -> Result<IpcSuccess<VideoStreamJumpListPayload>, ClientFailure> {
+        self.video_request(
+            |id| ClientMessage::VideoStreamJumpList {
+                id,
+                client_id: client_id.to_owned(),
+                session,
+            },
+            |message| match message {
+                ServerMessage::VideoStreamJumpList { response, .. } => Some(response),
+                _ => None,
+            },
+        )
+    }
+
+    pub fn video_stream_jump_thumbnail(
+        &self,
+        client_id: &str,
+        session: u64,
+        token: &str,
+    ) -> Result<IpcSuccess<VideoStreamJumpThumbnailPayload>, ClientFailure> {
+        self.video_request(
+            |id| ClientMessage::VideoStreamJumpThumbnail {
+                id,
+                client_id: client_id.to_owned(),
+                session,
+                token: token.to_owned(),
+            },
+            |message| match message {
+                ServerMessage::VideoStreamJumpThumbnail { response, .. } => Some(response),
                 _ => None,
             },
         )

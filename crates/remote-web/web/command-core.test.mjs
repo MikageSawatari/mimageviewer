@@ -52,6 +52,7 @@ import {
   viewerGestureDecision,
   viewerPanelGestureAction,
   viewerPanelLayout,
+  viewerPanelShellTransition,
   viewerPanelTransition,
   viewerResizePlan,
   viewerVerticalScrollDecision,
@@ -986,6 +987,26 @@ test("viewer panel open and close transitions request image refits", () => {
   });
   assert.equal(closedAgain.shouldRefit, true);
   assert.deepEqual(closedAgain.layout.image, { x: 0, y: 0, width: 390, height: 844 });
+});
+
+test("viewer panel shell transition shares open and orientation state without image policy", () => {
+  const opened = viewerPanelShellTransition(null, {
+    action: ViewerPanelAction.OPEN,
+    viewportWidth: 390,
+    viewportHeight: 844,
+  });
+  assert.equal(opened.open, true);
+  assert.equal(opened.orientation, ViewerPanelOrientation.PORTRAIT);
+  assert.equal(opened.layoutChanged, true);
+  assert.equal("shouldRefit" in opened, false);
+
+  const landscape = viewerPanelShellTransition(opened, {
+    viewportWidth: 844,
+    viewportHeight: 390,
+  });
+  assert.equal(landscape.open, true);
+  assert.equal(landscape.orientation, ViewerPanelOrientation.LANDSCAPE);
+  assert.equal(landscape.layoutChanged, true);
 });
 
 test("an open viewer panel changes side and refits when orientation changes", () => {

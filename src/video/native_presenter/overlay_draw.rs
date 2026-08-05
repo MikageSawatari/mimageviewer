@@ -5930,54 +5930,17 @@ pub(crate) fn draw_overlay_speed_control(
 }
 
 pub(super) fn format_overlay_time(secs: f64) -> String {
-    let total = finite_nonnegative(secs).round() as u64;
-    let h = total / 3600;
-    let m = (total % 3600) / 60;
-    let s = total % 60;
-    if h > 0 {
-        format!("{h}:{m:02}:{s:02}")
-    } else {
-        format!("{m}:{s:02}")
-    }
-}
-
-pub(super) fn format_overlay_time_millis(secs: f64) -> String {
-    let total_ms = (finite_nonnegative(secs) * 1000.0).round() as u64;
-    let total_secs = total_ms / 1000;
-    let ms = total_ms % 1000;
-    let h = total_secs / 3600;
-    let m = (total_secs % 3600) / 60;
-    let s = total_secs % 60;
-    if h > 0 {
-        format!("{h}:{m:02}:{s:02}.{ms:03}")
-    } else {
-        format!("{m}:{s:02}.{ms:03}")
-    }
-}
-
-fn overlay_time_rounded_second_key(secs: f64) -> u64 {
-    finite_nonnegative(secs).round() as u64
-}
-
-fn overlay_time_has_millis(secs: f64) -> bool {
-    ((finite_nonnegative(secs) * 1000.0).round() as u64) % 1000 != 0
+    crate::video_jump::format_time(secs)
 }
 
 pub(super) fn format_native_jump_entry_time(
     entry: &NativeOverlayJumpEntry,
     entries: &[NativeOverlayJumpEntry],
 ) -> String {
-    let second_key = overlay_time_rounded_second_key(entry.pts_secs);
-    let same_second_count = entries
-        .iter()
-        .filter(|other| overlay_time_rounded_second_key(other.pts_secs) == second_key)
-        .take(2)
-        .count();
-    if overlay_time_has_millis(entry.pts_secs) || same_second_count > 1 {
-        format_overlay_time_millis(entry.pts_secs)
-    } else {
-        format_overlay_time(entry.pts_secs)
-    }
+    crate::video_jump::format_jump_entry_time(
+        entry.pts_secs,
+        entries.iter().map(|other| other.pts_secs),
+    )
 }
 
 pub(super) fn format_tile_interval(secs: f64) -> String {

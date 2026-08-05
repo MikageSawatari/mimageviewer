@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   VideoGenerationSwitchOwner,
+  VIDEO_PANEL_TABS,
   VideoSeekPreviewOwner,
   hlsBufferConfig,
   preventVideoNativeZoom,
@@ -11,6 +12,13 @@ import {
   videoEndDecision,
   videoUserErrorMessage,
 } from "./video-stream.mjs";
+
+test("stage 4 video panel exposes functions and jump tabs in that order", () => {
+  assert.deepEqual(VIDEO_PANEL_TABS, [
+    { id: "functions", label: "機能" },
+    { id: "jump", label: "ジャンプ" },
+  ]);
+});
 
 test("VST3 processing failures remain visible while the video keeps a playable status", () => {
   assert.deepEqual(videoAudioProcessingPresentation({

@@ -1,7 +1,9 @@
 import {
   CommandName,
   VIDEO_QUALITY_PRESETS,
+  VIEWER_PANEL_ANIMATION_MS,
   ViewerGesture,
+  ViewerPanelAction,
   bufferingQualitySuggestion,
   command,
   videoAbsoluteSeekCommand,
@@ -16,6 +18,8 @@ import {
   videoTimelineAnchor,
   videoTimelinePosition,
   viewerGestureDecision,
+  viewerPanelGestureAction,
+  viewerPanelShellTransition,
 } from "./command-core.mjs";
 
 const HLS_MIME = "application/vnd.apple.mpegurl";
@@ -29,6 +33,11 @@ const PLAYLIST_RECOVERY_BACKOFF_MAX_MS = 2000;
 const SEEK_THUMBNAIL_POLL_MS = 120;
 const SEEK_THUMBNAIL_MATCH_TOLERANCE_SECS = 1.25;
 const VIDEO_LOOP_BOUNDARY_TOLERANCE_SECS = 0.020;
+
+export const VIDEO_PANEL_TABS = Object.freeze([
+  Object.freeze({ id: "functions", label: "機能" }),
+  Object.freeze({ id: "jump", label: "ジャンプ" }),
+]);
 
 let hlsScriptPromise = null;
 
@@ -642,23 +651,47 @@ export class VideoGenerationSwitchOwner {
 }
 
 class VideoStreamMenu {
-  constructor(host, dispatch, inputSource, mediaState) {
+  constructor(
+    host,
+    dispatch,
+    inputSource,
+    mediaState,
+    {
+      getSelectedTab = () => "functions",
+      setSelectedTab = () => {},
+      loadJumpList = async () => ({ sections: [] }),
+    } = {}
+  ) {
     this.host = host;
     this.dispatch = dispatch;
     this.inputSource = inputSource;
     this.mediaState = mediaState;
+    this.getSelectedTab = getSelectedTab;
+    this.setSelectedTab = setSelectedTab;
+    this.loadJumpList = loadJumpList;
     this.opened = false;
     this.previousFocus = null;
     this.keyboardElements = [];
-    this.root = element("div", "command-menu-layer");
+    this.panelState = null;
+    this.panelPointer = null;
+    this.panelMotionTimer = 0;
+    this.panelMotionListener = null;
+    this.suppressPanelClick = false;
+    this.tabButtons = new Map();
+    this.streamSession = null;
+    this.jumpLoadSession = null;
+    this.jumpLoadState = "idle";
+    this.jumpObserver = null;
+    this.jumpThumbnailLoader = null;
+    this.root = element("div", "command-menu-layer viewer-command-menu-layer");
     this.root.hidden = true;
 
     const scrim = element("button", "command-menu-scrim");
     scrim.type = "button";
     scrim.setAttribute("aria-label", "操作メニューを閉じる");
-    scrim.addEventListener("click", (event) => this.send(event, CommandName.TOGGLE_MENU));
+    scrim.addEventListener("click", () => this.close());
 
-    this.panel = element("section", "command-menu");
+    this.panel = element("section", "command-menu viewer-command-menu");
     this.panel.setAttribute("role", "dialog");
     this.panel.setAttribute("aria-modal", "true");
     const header = element("header", "command-menu-header");
@@ -674,10 +707,47 @@ class VideoStreamMenu {
     this.actions.setAttribute("role", "menu");
     this.shortcutTitle = textElement("h3", "有効なキー", "command-shortcut-title");
     this.shortcuts = element("dl", "command-shortcuts");
-    this.panel.append(header, this.actions, this.shortcutTitle, this.shortcuts);
+    const tabs = element("nav", "viewer-panel-tabs");
+    tabs.setAttribute("role", "tablist");
+    tabs.setAttribute("aria-label", "動画パネルのタブ");
+    for (const tab of VIDEO_PANEL_TABS) {
+      const button = textElement("button", tab.label, "viewer-panel-tab");
+      button.type = "button";
+      button.setAttribute("role", "tab");
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this.selectTab(tab.id);
+      });
+      this.tabButtons.set(tab.id, button);
+      tabs.append(button);
+    }
+    this.tabs = tabs;
+    this.panelBody = element("div", "viewer-command-menu-body");
+    this.functionsPanel = element("section", "video-functions-panel");
+    this.functionsPanel.append(this.actions, this.shortcutTitle, this.shortcuts);
+    this.jumpPanel = element("section", "video-jump-panel");
+    this.jumpPanel.hidden = true;
+    this.panelBody.append(this.functionsPanel, this.jumpPanel);
+    this.panel.append(header, tabs, this.panelBody);
     this.root.append(scrim, this.panel);
     host.append(this.root);
-    this.showPage("main");
+    this.panelPointerDown = (event) => this.onPanelPointerDown(event);
+    this.panelPointerUp = (event) => this.onPanelPointerUp(event, false);
+    this.panelPointerCancel = (event) => this.onPanelPointerUp(event, true);
+    this.panelClickCapture = (event) => {
+      if (!this.suppressPanelClick) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      this.suppressPanelClick = false;
+    };
+    this.viewportResize = () => this.updatePanelLayout();
+    this.root.addEventListener("pointerdown", this.panelPointerDown);
+    this.root.addEventListener("pointerup", this.panelPointerUp);
+    this.root.addEventListener("pointercancel", this.panelPointerCancel);
+    this.root.addEventListener("click", this.panelClickCapture, true);
+    window.addEventListener("resize", this.viewportResize);
+    this.updatePanelLayout();
+    this.selectTab(this.getSelectedTab());
   }
 
   send(event, name, payload = {}) {
@@ -734,7 +804,37 @@ class VideoStreamMenu {
     };
   }
 
+  selectTab(tabId) {
+    const tab = VIDEO_PANEL_TABS.find((candidate) => candidate.id === tabId) ??
+      VIDEO_PANEL_TABS[0];
+    this.setSelectedTab(tab.id);
+    this.syncTabButtons(tab.id);
+    if (tab.id === "functions") {
+      this.showPage("main");
+      return;
+    }
+    this.page = `tab:${tab.id}`;
+    this.title.textContent = tab.label;
+    this.panel.setAttribute("aria-label", tab.label);
+    this.functionsPanel.hidden = true;
+    this.jumpPanel.hidden = false;
+    this.ensureJumpList();
+  }
+
+  syncTabButtons(selectedId) {
+    for (const [id, button] of this.tabButtons) {
+      const selected = id === selectedId;
+      button.classList.toggle("is-selected", selected);
+      button.setAttribute("aria-selected", String(selected));
+      button.tabIndex = selected ? 0 : -1;
+    }
+  }
+
   showPage(page) {
+    this.setSelectedTab("functions");
+    this.syncTabButtons("functions");
+    this.functionsPanel.hidden = false;
+    this.jumpPanel.hidden = true;
     this.page = page;
     const definition = this.definition(page);
     this.title.textContent = definition.title;
@@ -811,6 +911,171 @@ class VideoStreamMenu {
     for (const target of this.keyboardElements) target.hidden = !available;
   }
 
+  setSession(session) {
+    const normalized = Number.isSafeInteger(Number(session)) && Number(session) > 0
+      ? Number(session)
+      : null;
+    if (normalized === this.streamSession) return;
+    this.streamSession = normalized;
+    this.resetJumpList();
+    if (this.getSelectedTab() === "jump") this.ensureJumpList();
+  }
+
+  resetJumpList() {
+    this.disconnectJumpObserver();
+    this.jumpLoadSession = null;
+    this.jumpLoadState = "idle";
+    this.jumpPanel.replaceChildren();
+  }
+
+  ensureJumpList() {
+    const session = this.streamSession;
+    if (!session) {
+      this.renderJumpStatus("動画の準備完了後に一覧を表示します。");
+      return;
+    }
+    if (this.jumpLoadSession === session && ["loading", "loaded"].includes(this.jumpLoadState)) {
+      return;
+    }
+    this.jumpLoadSession = session;
+    this.jumpLoadState = "loading";
+    this.renderJumpStatus("ジャンプ一覧を読み込んでいます…");
+    Promise.resolve(this.loadJumpList(session))
+      .then((payload) => {
+        if (this.streamSession !== session || this.jumpLoadSession !== session) return;
+        this.jumpLoadState = "loaded";
+        this.renderJumpList(payload);
+      })
+      .catch((error) => {
+        if (this.streamSession !== session || this.jumpLoadSession !== session) return;
+        if (error?.name === "AbortError") return;
+        this.jumpLoadState = "error";
+        this.renderJumpStatus(
+          error instanceof Error ? error.message : "ジャンプ一覧を取得できませんでした。"
+        );
+      });
+  }
+
+  renderJumpStatus(message) {
+    this.disconnectJumpObserver();
+    const status = textElement("p", message, "video-jump-status");
+    this.jumpPanel.replaceChildren(status);
+  }
+
+  renderJumpList(payload) {
+    this.disconnectJumpObserver();
+    const fragment = document.createDocumentFragment();
+    let rowCount = 0;
+    for (const section of payload?.sections ?? []) {
+      const rows = [];
+      for (const entry of section?.entries ?? []) {
+        const position = Number(entry?.position_secs);
+        if (!Number.isFinite(position) || position < 0) continue;
+        const row = element("button", "video-jump-row");
+        row.type = "button";
+        const thumbnail = element("span", "video-jump-thumbnail");
+        if (typeof entry.thumbnail_url === "string" && entry.thumbnail_url) {
+          const image = element("img");
+          image.alt = "";
+          image.dataset.src = entry.thumbnail_url;
+          thumbnail.append(image);
+        } else {
+          thumbnail.classList.add("is-empty");
+        }
+        const copy = element("span", "video-jump-copy");
+        copy.append(
+          textElement("span", String(entry.display_time ?? ""), "video-jump-time"),
+          textElement("span", String(entry.title ?? ""), "video-jump-title")
+        );
+        row.append(thumbnail, copy);
+        row.addEventListener("click", (event) => {
+          event.stopPropagation();
+          this.dispatch(videoAbsoluteSeekCommand(position), {
+            source: this.inputSource(event),
+            detail: "jump_list",
+          });
+        });
+        rows.push(row);
+        rowCount += 1;
+      }
+      if (!rows.length) continue;
+      const group = element("section", "video-jump-section");
+      group.dataset.kind = String(section.kind ?? "");
+      group.append(textElement("h3", String(section.label ?? ""), "video-jump-section-title"), ...rows);
+      fragment.append(group);
+    }
+    if (!rowCount) {
+      this.jumpPanel.replaceChildren(
+        textElement("p", "ピン・ブックマーク・チャプターはまだありません", "video-jump-status")
+      );
+      return;
+    }
+    this.jumpPanel.replaceChildren(fragment);
+    this.observeJumpThumbnails();
+  }
+
+  observeJumpThumbnails() {
+    const images = [...this.jumpPanel.querySelectorAll("img[data-src]")];
+    if (!images.length) return;
+    const loader = {
+      active: 0,
+      cancelled: false,
+      queue: [],
+    };
+    this.jumpThumbnailLoader = loader;
+    const drain = () => {
+      if (loader.cancelled) return;
+      while (loader.active < 2 && loader.queue.length) {
+        const image = loader.queue.shift();
+        if (!image?.dataset.src) continue;
+        loader.active += 1;
+        let finished = false;
+        const finish = (failed = false) => {
+          if (finished) return;
+          finished = true;
+          loader.active -= 1;
+          if (failed) {
+            image.parentElement?.classList.add("is-empty");
+            image.remove();
+          }
+          drain();
+        };
+        image.addEventListener("load", () => finish(), { once: true });
+        image.addEventListener("error", () => finish(true), { once: true });
+        image.src = image.dataset.src;
+        delete image.dataset.src;
+      }
+    };
+    const enqueue = (image) => {
+      if (!image?.dataset.src || loader.queue.includes(image)) return;
+      loader.queue.push(image);
+      drain();
+    };
+    if (typeof IntersectionObserver !== "function") {
+      for (const image of images) enqueue(image);
+      return;
+    }
+    this.jumpObserver = new IntersectionObserver((entries, observer) => {
+      for (const observed of entries) {
+        if (!observed.isIntersecting) continue;
+        const image = observed.target;
+        observer.unobserve(image);
+        enqueue(image);
+      }
+    }, { root: this.panelBody });
+    for (const image of images) this.jumpObserver.observe(image);
+  }
+
+  disconnectJumpObserver() {
+    this.jumpObserver?.disconnect();
+    this.jumpObserver = null;
+    if (this.jumpThumbnailLoader) {
+      this.jumpThumbnailLoader.cancelled = true;
+      this.jumpThumbnailLoader.queue.length = 0;
+      this.jumpThumbnailLoader = null;
+    }
+  }
+
   isOpen() { return this.opened; }
 
   toggle() {
@@ -821,17 +1086,30 @@ class VideoStreamMenu {
 
   open() {
     if (this.opened) return;
-    this.showPage("main");
+    this.cancelPanelMotion();
+    this.selectTab(this.getSelectedTab());
     this.opened = true;
     this.previousFocus = document.activeElement;
     this.root.hidden = false;
     this.host.classList.add("menu-open");
+    this.updatePanelLayout(ViewerPanelAction.OPEN);
+    this.startPanelMotion("opening");
     requestAnimationFrame(() => this.closeButton.focus());
   }
 
-  close(restoreFocus = true) {
+  close(restoreFocus = true, animate = true) {
     if (!this.opened) return;
     this.opened = false;
+    if (animate) {
+      this.startPanelMotion("closing", () => this.finishClose(restoreFocus));
+      return;
+    }
+    this.cancelPanelMotion();
+    this.finishClose(restoreFocus);
+  }
+
+  finishClose(restoreFocus) {
+    this.updatePanelLayout(ViewerPanelAction.CLOSE);
     this.root.hidden = true;
     this.host.classList.remove("menu-open");
     if (restoreFocus && this.previousFocus instanceof HTMLElement) {
@@ -839,8 +1117,100 @@ class VideoStreamMenu {
     }
   }
 
+  startPanelMotion(motion, onFinished = () => {}) {
+    this.cancelPanelMotion();
+    this.root.dataset.motion = motion;
+    let finished = false;
+    const finish = (event) => {
+      if (finished || (event?.target && event.target !== this.panel)) return;
+      finished = true;
+      if (this.panelMotionListener) {
+        this.panel.removeEventListener("animationend", this.panelMotionListener);
+      }
+      clearTimeout(this.panelMotionTimer);
+      this.panelMotionTimer = 0;
+      this.panelMotionListener = null;
+      if (this.root.dataset.motion === motion) delete this.root.dataset.motion;
+      onFinished();
+    };
+    this.panelMotionListener = finish;
+    this.panel.addEventListener("animationend", finish);
+    this.panelMotionTimer = setTimeout(finish, VIEWER_PANEL_ANIMATION_MS + 80);
+  }
+
+  cancelPanelMotion() {
+    if (this.panelMotionListener) {
+      this.panel.removeEventListener("animationend", this.panelMotionListener);
+    }
+    clearTimeout(this.panelMotionTimer);
+    this.panelMotionTimer = 0;
+    this.panelMotionListener = null;
+    delete this.root.dataset.motion;
+  }
+
+  updatePanelLayout(action = "resize") {
+    const next = viewerPanelShellTransition(this.panelState, {
+      action,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    });
+    this.panelState = next;
+    this.root.dataset.orientation = next.orientation;
+    this.host.classList.toggle("viewer-panel-open", next.open);
+    this.host.classList.toggle("viewer-panel-portrait", next.orientation === "portrait");
+    this.host.classList.toggle("viewer-panel-landscape", next.orientation === "landscape");
+  }
+
+  onPanelPointerDown(event) {
+    if (event.isPrimary === false) return;
+    if (["mouse", "pen"].includes(event.pointerType) && event.button !== 0) return;
+    this.panelPointer = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      startedAt: performance.now(),
+      scrollTop: this.panelBody.scrollTop,
+    };
+  }
+
+  onPanelPointerUp(event, cancelled) {
+    const pointer = this.panelPointer;
+    if (!pointer || pointer.pointerId !== event.pointerId) return;
+    this.panelPointer = null;
+    const contentScrolled = Math.abs(this.panelBody.scrollTop - pointer.scrollTop) > 0.5;
+    const gesture = viewerGestureDecision({
+      dx: event.clientX - pointer.startX,
+      dy: event.clientY - pointer.startY,
+      elapsedMs: performance.now() - pointer.startedAt,
+      moved: contentScrolled,
+      contentScrolled,
+      cancelled,
+    });
+    const action = viewerPanelGestureAction({
+      gesture,
+      panelOpen: true,
+      contentScrolled,
+    });
+    if (action !== ViewerPanelAction.CLOSE) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.suppressPanelClick = true;
+    this.close();
+    setTimeout(() => { this.suppressPanelClick = false; }, 0);
+  }
+
   destroy() {
-    this.close(false);
+    this.opened = false;
+    this.cancelPanelMotion();
+    this.updatePanelLayout(ViewerPanelAction.CLOSE);
+    this.root.hidden = true;
+    this.host.classList.remove("menu-open");
+    this.root.removeEventListener("pointerdown", this.panelPointerDown);
+    this.root.removeEventListener("pointerup", this.panelPointerUp);
+    this.root.removeEventListener("pointercancel", this.panelPointerCancel);
+    this.root.removeEventListener("click", this.panelClickCapture, true);
+    window.removeEventListener("resize", this.viewportResize);
+    this.disconnectJumpObserver();
     this.root.remove();
   }
 }
@@ -855,6 +1225,8 @@ export class VideoStreamViewer {
     apiPostJson,
     reportPlaybackIssue = () => {},
     keyboardAvailable = true,
+    getPanelTab = () => "functions",
+    setPanelTab = () => {},
   }) {
     this.isVideoStreamViewer = true;
     this.entry = entry;
@@ -975,7 +1347,16 @@ export class VideoStreamViewer {
       this.root,
       dispatch,
       inputSource,
-      () => this.menuState()
+      () => this.menuState(),
+      {
+        getSelectedTab: getPanelTab,
+        setSelectedTab: setPanelTab,
+        loadJumpList: (session) => this.apiJson(
+          "/api/video/jumps",
+          { session },
+          this.abortController.signal
+        ),
+      }
     );
     this.menu.setKeyboardAvailable(keyboardAvailable);
 
@@ -1115,6 +1496,7 @@ export class VideoStreamViewer {
     }
     if (this.destroyed) return;
     this.session = started.session;
+    this.menu.setSession(this.session);
     this.generation = started.generation;
     let playlistUrl = started.playlist;
     this.duration = Math.max(0, Number(started.duration_secs) || 0);
@@ -2065,6 +2447,7 @@ export class VideoStreamViewer {
     this.generationSwitch.cancel();
     this.stopPlaylistPlayback();
     this.session = null;
+    this.menu.setSession(null);
     this.generation = null;
     if (oldSession) {
       this.apiPostJson(
@@ -2315,10 +2698,26 @@ export class VideoStreamViewer {
       source: event.pointerType === "mouse" ? "mouse" : "touch",
       detail: "video_gesture",
     };
+    const stageBounds = this.stage.getBoundingClientRect?.() ?? {
+      top: 0,
+      bottom: this.stage.clientHeight || window.innerHeight,
+    };
+    const panelAction = viewerPanelGestureAction({
+      gesture,
+      panelOpen: false,
+      startY: single.startY,
+      contentTop: stageBounds.top,
+      contentBottom: stageBounds.bottom,
+    });
     if (gesture === ViewerGesture.SWIPE_LEFT) {
       this.dispatch(command(CommandName.NEXT_PAGE), meta);
     } else if (gesture === ViewerGesture.SWIPE_RIGHT) {
       this.dispatch(command(CommandName.PREV_PAGE), meta);
+    } else if (panelAction === ViewerPanelAction.OPEN) {
+      this.dispatch(command(CommandName.TOGGLE_MENU), {
+        ...meta,
+        detail: "swipe_up",
+      });
     } else if (gesture === ViewerGesture.TAP) {
       this.dispatch(videoTapCommand(event.clientX, this.root.clientWidth), meta);
     }
@@ -2376,6 +2775,7 @@ export class VideoStreamViewer {
     this.stage.removeEventListener("gesturechange", this.nativeGesture);
     this.stage.removeEventListener("gestureend", this.nativeGesture);
     this.stage.removeEventListener("dblclick", this.nativeGesture);
+    this.menu.destroy();
     if (this.session) {
       fetch("/api/video/stop", {
         method: "POST",

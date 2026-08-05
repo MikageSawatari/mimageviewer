@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 26;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -976,6 +976,50 @@ pub enum VideoStreamThumbnailPayload {
     Cleared,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoStreamJumpKind {
+    Pin,
+    Bookmark,
+    Chapter,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VideoStreamJumpEntryId {
+    Pin { position_us: i64 },
+    Bookmark { bookmark_id: i64 },
+    Chapter { start_us: i64 },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct VideoStreamJumpEntry {
+    pub id: VideoStreamJumpEntryId,
+    pub position_secs: f64,
+    pub display_time: String,
+    pub title: Option<String>,
+    pub thumbnail_token: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct VideoStreamJumpSection {
+    pub kind: VideoStreamJumpKind,
+    pub label: String,
+    pub entries: Vec<VideoStreamJumpEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct VideoStreamJumpListPayload {
+    pub sections: Vec<VideoStreamJumpSection>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum VideoStreamJumpThumbnailPayload {
+    Found { webp_bytes: Vec<u8> },
+    Missing,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct VideoStreamPlaylistPayload {
     pub body: String,
@@ -1346,6 +1390,17 @@ pub enum ClientMessage {
         session: u64,
         position_secs: Option<f64>,
     },
+    VideoStreamJumpList {
+        id: RequestId,
+        client_id: String,
+        session: u64,
+    },
+    VideoStreamJumpThumbnail {
+        id: RequestId,
+        client_id: String,
+        session: u64,
+        token: String,
+    },
     VideoStreamPlaylist {
         id: RequestId,
         client_id: String,
@@ -1395,6 +1450,8 @@ impl ClientMessage {
             | Self::VideoStreamControl { id, .. }
             | Self::VideoStreamSeek { id, .. }
             | Self::VideoStreamThumbnail { id, .. }
+            | Self::VideoStreamJumpList { id, .. }
+            | Self::VideoStreamJumpThumbnail { id, .. }
             | Self::VideoStreamPlaylist { id, .. }
             | Self::VideoStreamSegment { id, .. }
             | Self::VideoStreamState { id, .. }
@@ -1479,6 +1536,14 @@ pub enum ServerMessage {
         id: RequestId,
         response: VideoStreamResult<VideoStreamThumbnailPayload>,
     },
+    VideoStreamJumpList {
+        id: RequestId,
+        response: VideoStreamResult<VideoStreamJumpListPayload>,
+    },
+    VideoStreamJumpThumbnail {
+        id: RequestId,
+        response: VideoStreamResult<VideoStreamJumpThumbnailPayload>,
+    },
     VideoStreamPlaylist {
         id: RequestId,
         response: VideoStreamResult<VideoStreamPlaylistPayload>,
@@ -1518,6 +1583,8 @@ impl ServerMessage {
             | Self::VideoStreamControl { id, .. }
             | Self::VideoStreamSeek { id, .. }
             | Self::VideoStreamThumbnail { id, .. }
+            | Self::VideoStreamJumpList { id, .. }
+            | Self::VideoStreamJumpThumbnail { id, .. }
             | Self::VideoStreamPlaylist { id, .. }
             | Self::VideoStreamSegment { id, .. }
             | Self::VideoStreamState { id, .. }
@@ -1820,8 +1887,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v25_video_pull_seek_thumbnail_end_behavior_and_audio_status_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 25);
+    fn protocol_v26_video_pull_jump_thumbnail_end_behavior_and_audio_status_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 26);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -1851,6 +1918,17 @@ mod tests {
                 client_id: "test-client".to_owned(),
                 session: 7,
                 position_secs: Some(42.5),
+            },
+            ClientMessage::VideoStreamJumpList {
+                id: 54,
+                client_id: "test-client".to_owned(),
+                session: 7,
+            },
+            ClientMessage::VideoStreamJumpThumbnail {
+                id: 55,
+                client_id: "test-client".to_owned(),
+                session: 7,
+                token: "v1:bookmark:3:abc".to_owned(),
             },
         ];
         for expected in requests {
@@ -1903,6 +1981,28 @@ mod tests {
                     width: 320,
                     height: 180,
                     webp_bytes: vec![1, 2, 3],
+                }),
+            },
+            ServerMessage::VideoStreamJumpList {
+                id: 54,
+                response: VideoStreamResult::Success(VideoStreamJumpListPayload {
+                    sections: vec![VideoStreamJumpSection {
+                        kind: VideoStreamJumpKind::Bookmark,
+                        label: "ブックマーク".to_owned(),
+                        entries: vec![VideoStreamJumpEntry {
+                            id: VideoStreamJumpEntryId::Bookmark { bookmark_id: 3 },
+                            position_secs: 42.5,
+                            display_time: "0:42.500".to_owned(),
+                            title: Some("見どころ".to_owned()),
+                            thumbnail_token: Some("v1:bookmark:3:abc".to_owned()),
+                        }],
+                    }],
+                }),
+            },
+            ServerMessage::VideoStreamJumpThumbnail {
+                id: 55,
+                response: VideoStreamResult::Success(VideoStreamJumpThumbnailPayload::Found {
+                    webp_bytes: vec![4, 5, 6],
                 }),
             },
         ] {

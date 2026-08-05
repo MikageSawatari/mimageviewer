@@ -108,6 +108,7 @@ struct AppRemoteVideoStreaming {
     session: RemoteVideoStreamingSession,
     playback: std::sync::Arc<VideoStreamPlaybackState>,
     end_behavior: VideoStreamEndBehavior,
+    jump_catalog: std::sync::Arc<super::video_jump::VideoJumpCatalogSource>,
 }
 
 fn resolve_remote_video_end_behavior(
@@ -438,10 +439,11 @@ impl crate::app::App {
         if !crate::folder_tree::path_eq(player.path(), requested_path) {
             return Err("the requested video is not the remote session player".to_owned());
         }
-        let chapter_starts = player
+        let chapters = player
             .info()
-            .map(|info| crate::video::decoder::boundary_starts_from_chapters(&info.chapters))
+            .map(|info| info.chapters.clone())
             .unwrap_or_default();
+        let chapter_starts = crate::video::decoder::boundary_starts_from_chapters(&chapters);
         let bookmark_starts = if matches!(
             self.settings.video_loop_mode,
             crate::settings::VideoLoopMode::Bookmark
@@ -493,12 +495,17 @@ impl crate::app::App {
             player.volume(),
             true,
         ));
+        let jump_catalog = std::sync::Arc::new(super::video_jump::VideoJumpCatalogSource::new(
+            requested_path.to_path_buf(),
+            chapters,
+        ));
         Ok(AppRemoteVideoStreaming {
             requested_path: requested_path.to_path_buf(),
             player,
             session,
             playback,
             end_behavior,
+            jump_catalog,
         })
     }
 
@@ -712,6 +719,7 @@ impl crate::app::App {
                     playback: std::sync::Arc::clone(&starting.streaming.playback),
                     buffer_target_secs: starting.streaming.session.buffer_target_secs(),
                     end_behavior: starting.streaming.end_behavior.clone(),
+                    jump_catalog: std::sync::Arc::clone(&starting.streaming.jump_catalog),
                 };
                 if let Some(handle) = self.remote_session_ui.handle.as_ref() {
                     handle.publish_video_stream(published.clone());
@@ -1183,6 +1191,7 @@ impl crate::app::App {
                 playback: std::sync::Arc::clone(&streaming.playback),
                 buffer_target_secs: streaming.session.buffer_target_secs(),
                 end_behavior: streaming.end_behavior.clone(),
+                jump_catalog: std::sync::Arc::clone(&streaming.jump_catalog),
             });
         }
         self.remote_session_ui.video_stream = Some(AppRemoteVideoStreamState::Streaming(streaming));
@@ -1215,6 +1224,7 @@ impl crate::app::App {
                 playback: std::sync::Arc::clone(&streaming.playback),
                 buffer_target_secs: streaming.session.buffer_target_secs(),
                 end_behavior: streaming.end_behavior.clone(),
+                jump_catalog: std::sync::Arc::clone(&streaming.jump_catalog),
             });
         }
         self.remote_session_ui.video_stream = Some(AppRemoteVideoStreamState::Streaming(streaming));
