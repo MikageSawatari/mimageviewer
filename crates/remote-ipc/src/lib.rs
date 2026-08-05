@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 29;
+pub const PROTOCOL_VERSION: u32 = 30;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -942,9 +942,20 @@ pub struct SessionAcquireRequest {
     pub peer: SessionPeerInfo,
 }
 
+/// A single acquired remote-control lease.
+///
+/// `client_id` identifies the device across reconnects. `session_id` is minted by
+/// the core for each successful acquisition and must accompany every request that
+/// depends on remote-control ownership.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteSessionIdentity {
+    pub client_id: String,
+    pub session_id: String,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SessionPingRequest {
-    pub client_id: String,
+    pub owner: RemoteSessionIdentity,
     pub user_active: bool,
     pub media_playing: bool,
 }
@@ -963,13 +974,15 @@ pub enum SessionStatus {
 pub struct SessionResponse {
     pub status: SessionStatus,
     pub message: String,
+    pub session_id: Option<String>,
 }
 
 impl SessionResponse {
-    pub fn active() -> Self {
+    pub fn active(session_id: impl Into<String>) -> Self {
         Self {
             status: SessionStatus::Active,
             message: "remote session active".to_owned(),
+            session_id: Some(session_id.into()),
         }
     }
 }
@@ -1400,126 +1413,126 @@ pub enum ClientMessage {
     },
     SessionActivity {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
     },
     Thumbnail {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         request: ThumbnailRequest,
     },
     Home {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         request: HomeRequest,
     },
     Collection {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         request: CollectionRequest,
     },
     FolderList {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         request: FolderListRequest,
     },
     Container {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         request: ContainerRequest,
     },
     Page {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         request: PageRequest,
     },
     RemoteAiStart {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         request: RemoteAiStartRequest,
         accept_before_unix_ms: u64,
     },
     RemoteAiState {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         job_id: String,
     },
     RemoteAiRecoverable {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
     },
     RemoteAiCancel {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         job_id: String,
     },
     RemoteAiResult {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         job_id: String,
         page_index: u32,
     },
     Write {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         request: RemoteWriteRequest,
     },
     VideoStreamStart {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         address: RemoteAddress,
         quality: VideoStreamQuality,
     },
     VideoStreamControl {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         session: u64,
         action: VideoStreamControlAction,
     },
     VideoStreamSeek {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         session: u64,
         position_secs: f64,
     },
     VideoStreamThumbnail {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         session: u64,
         position_secs: Option<f64>,
     },
     VideoStreamJumpList {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         session: u64,
     },
     VideoStreamJumpThumbnail {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         session: u64,
         token: String,
     },
     VideoStreamPlaylist {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         session: u64,
         generation: u64,
         kind: VideoStreamPlaylistKind,
     },
     VideoStreamSegment {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         session: u64,
         generation: u64,
         index: VideoStreamSegmentIndex,
     },
     VideoStreamState {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         session: u64,
     },
     VideoStreamStop {
         id: RequestId,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         session: u64,
     },
 }
@@ -1786,6 +1799,13 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(
 mod tests {
     use super::*;
 
+    fn test_owner(client_id: &str) -> RemoteSessionIdentity {
+        RemoteSessionIdentity {
+            client_id: client_id.to_owned(),
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        }
+    }
+
     #[test]
     fn protocol_version_mismatch_is_rejected_and_reports_both_versions() {
         let client_version = PROTOCOL_VERSION + 1;
@@ -1886,7 +1906,7 @@ mod tests {
     fn thumbnail_message_round_trips_through_a_length_delimited_frame() {
         let expected = ClientMessage::Thumbnail {
             id: 42,
-            client_id: "test-client".to_owned(),
+            owner: test_owner("test-client"),
             request: ThumbnailRequest {
                 address: RemoteAddress::file(
                     "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
@@ -1906,7 +1926,7 @@ mod tests {
     fn page_priority_round_trips_with_the_request() {
         let expected = ClientMessage::Page {
             id: 43,
-            client_id: "test-client".to_owned(),
+            owner: test_owner("test-client"),
             request: PageRequest {
                 address: RemoteAddress {
                     favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
@@ -1958,7 +1978,7 @@ mod tests {
         let sidecar = RemoteAddress::file("favorite", "movies/sample.jpg");
         let request = ClientMessage::FolderList {
             id: 49,
-            client_id: "test-client".to_owned(),
+            owner: test_owner("test-client"),
             request: FolderListRequest {
                 address: RemoteAddress::file("favorite", "movies"),
             },
@@ -1996,12 +2016,12 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v29_auto_trim_partner_video_and_audio_status_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 29);
+    fn protocol_v30_session_epoch_auto_trim_partner_video_and_audio_status_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 30);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
-                client_id: "test-client".to_owned(),
+                owner: test_owner("test-client"),
                 address: RemoteAddress::file(
                     "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
                     "movies/sample.mp4",
@@ -2010,32 +2030,32 @@ mod tests {
             },
             ClientMessage::VideoStreamPlaylist {
                 id: 51,
-                client_id: "test-client".to_owned(),
+                owner: test_owner("test-client"),
                 session: 7,
                 generation: 9,
                 kind: VideoStreamPlaylistKind::Media,
             },
             ClientMessage::VideoStreamSegment {
                 id: 52,
-                client_id: "test-client".to_owned(),
+                owner: test_owner("test-client"),
                 session: 7,
                 generation: 9,
                 index: VideoStreamSegmentIndex::Media { sequence: 12 },
             },
             ClientMessage::VideoStreamThumbnail {
                 id: 53,
-                client_id: "test-client".to_owned(),
+                owner: test_owner("test-client"),
                 session: 7,
                 position_secs: Some(42.5),
             },
             ClientMessage::VideoStreamJumpList {
                 id: 54,
-                client_id: "test-client".to_owned(),
+                owner: test_owner("test-client"),
                 session: 7,
             },
             ClientMessage::VideoStreamJumpThumbnail {
                 id: 55,
-                client_id: "test-client".to_owned(),
+                owner: test_owner("test-client"),
                 session: 7,
                 token: "v1:bookmark:3:abc".to_owned(),
             },
@@ -2175,7 +2195,7 @@ mod tests {
     fn typed_write_request_round_trips() {
         let expected = ClientMessage::Write {
             id: 45,
-            client_id: "test-client".to_owned(),
+            owner: test_owner("test-client"),
             request: RemoteWriteRequest::SetSpread {
                 address: RemoteAddress::file(
                     "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
@@ -2545,27 +2565,27 @@ mod tests {
         let client_messages = vec![
             ClientMessage::RemoteAiStart {
                 id: 1,
-                client_id: "phone".to_owned(),
+                owner: test_owner("phone"),
                 request: start,
                 accept_before_unix_ms: 1_900_000_000_000,
             },
             ClientMessage::RemoteAiState {
                 id: 2,
-                client_id: "phone".to_owned(),
+                owner: test_owner("phone"),
                 job_id: "7-1".to_owned(),
             },
             ClientMessage::RemoteAiRecoverable {
                 id: 3,
-                client_id: "phone".to_owned(),
+                owner: test_owner("phone"),
             },
             ClientMessage::RemoteAiCancel {
                 id: 4,
-                client_id: "phone".to_owned(),
+                owner: test_owner("phone"),
                 job_id: "7-1".to_owned(),
             },
             ClientMessage::RemoteAiResult {
                 id: 5,
-                client_id: "phone".to_owned(),
+                owner: test_owner("phone"),
                 job_id: "7-1".to_owned(),
                 page_index: 0,
             },

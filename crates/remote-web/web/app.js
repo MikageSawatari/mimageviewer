@@ -30,6 +30,7 @@ import {
   reduceViewerTransform,
   remoteStateGenerationTransition,
   readingProgressBatchTransition,
+  remoteSessionAcquireDecision,
   rangeValueFromNormalized,
   rangeValueToNormalized,
   relativeRangeDragValue,
@@ -106,6 +107,7 @@ const REMOTE_CLIENT_ID = loadRemoteClientId();
 const LOCAL_SETTINGS_LOAD = loadLocalSettings();
 
 class AuthenticationRequiredError extends Error {}
+class RemoteSessionBlockedError extends Error {}
 
 class RequestLimiter {
   constructor(limit) {
@@ -404,6 +406,8 @@ const state = {
   remoteSessionOwner: null,
   remoteSessionMessage: "",
   remoteSessionAcquirePromise: null,
+  remoteSessionId: "",
+  remoteSessionCacheEpoch: "",
   remoteSessionUserActive: false,
   remoteSessionTimer: 0,
   viewerItemState: null,
@@ -425,9 +429,9 @@ if (!RUNTIME_TEST_MODE) {
   }
   updateKeyboardAvailability();
   window.addEventListener("popstate", () => {
-    acquireRemoteSession("browser_history")
-      .then(() => dispatchRoute())
-      .catch(() => {});
+    if (state.remoteSessionStatus === "active") {
+      dispatchRoute().catch(() => {});
+    }
   });
   window.addEventListener("keydown", onGlobalKeyDown);
   window.addEventListener(
@@ -449,16 +453,15 @@ if (!RUNTIME_TEST_MODE) {
   }
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") {
+      state.remoteSessionUserActive = false;
       state.remoteAiController?.suspend();
     } else if (state.authenticated) {
-      acquireRemoteSession("visibility_resume")
-        .then(() => {
-          if (state.viewer?.isVideoStreamViewer) {
-            return state.viewer.handleVisibilityResume();
-          }
-          return state.remoteAiController?.handleForegroundResume();
-        })
-        .catch(() => {});
+      if (state.remoteSessionStatus !== "active") return;
+      if (state.viewer?.isVideoStreamViewer) {
+        state.viewer.handleVisibilityResume().catch(() => {});
+      } else {
+        state.remoteAiController?.handleForegroundResume().catch(() => {});
+      }
     }
   });
   boot();
@@ -487,7 +490,7 @@ async function enterAuthenticatedApp() {
   state.authenticated = true;
   telemetryState.authenticated = true;
   renderLoading("リモートセッションを取得しています");
-  await acquireRemoteSession("authenticated");
+  await acquireRemoteSession("authenticated", "initial");
   startSessionPing();
   startAppUpdateWatch().catch(() => {});
   renderLoading("お気に入りを読み込んでいます");
@@ -510,26 +513,55 @@ async function enterAuthenticatedApp() {
   await dispatchRoute();
 }
 
-async function acquireRemoteSession(reason = "operation") {
-  if (state.remoteSessionAcquirePromise) return state.remoteSessionAcquirePromise;
-  if (state.remoteSessionStatus !== "active") {
-    setRemoteSessionStatus("acquiring", "操作権を取得しています…");
+async function acquireRemoteSession(reason = "operation", trigger = "user_operation") {
+  const decision = remoteSessionAcquireDecision(state.remoteSessionStatus, trigger);
+  if (decision === "use_current" && state.remoteSessionId) return true;
+  if (decision === "blocked") {
+    throw new RemoteSessionBlockedError(
+      state.remoteSessionMessage || "再接続するまでリモート操作は停止しています。"
+    );
   }
+  if (state.remoteSessionAcquirePromise) return state.remoteSessionAcquirePromise;
+  setRemoteSessionStatus("acquiring", "操作権を取得しています…");
   state.remoteSessionAcquirePromise = (async () => {
     try {
-      const response = await fetch("/api/session/acquire", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: remoteHeaders({ Accept: "application/json" }),
-      });
-      if (response.status === 401) {
-        renderPinLogin(0);
-        throw new AuthenticationRequiredError("PIN 認証が必要です。");
+      let response;
+      let result = {};
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        response = await fetch("/api/session/acquire", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: remoteHeaders({ Accept: "application/json" }),
+        });
+        if (response.status === 401) {
+          renderPinLogin(0);
+          throw new AuthenticationRequiredError("PIN 認証が必要です。");
+        }
+        result = await response.json().catch(() => ({}));
+        if (response.ok && result.status === "active") break;
+        // 別 owner の drain はこの取得要求が開始した遷移。同じ明示 intent の
+        // 完了待ちであり、切断後の自動再取得とは別物。
+        if (response.status === 409 && result.status === "local_in_use") {
+          await new Promise((resolve) => window.setTimeout(resolve, 250));
+          continue;
+        }
+        break;
       }
-      const result = await response.json().catch(() => ({}));
-      if (!response.ok || result.status !== "active") {
-        throw new Error(result.message || `操作権を取得できません (HTTP ${response.status})。`);
+      if (!response?.ok || result.status !== "active") {
+        const status = sessionStatusFromResponse(result.status, response?.status ?? 0);
+        setRemoteSessionStatus(
+          status,
+          result.message || `操作権を取得できません (HTTP ${response?.status ?? 0})。`
+        );
+        throw new RemoteSessionBlockedError(
+          result.message || "リモートセッションを取得できません。"
+        );
       }
+      const sessionId = String(result.session_id ?? "");
+      if (!/^[A-Fa-f0-9]{32}$/.test(sessionId)) {
+        throw new Error("取得したリモートセッション ID が不正です。");
+      }
+      applyRemoteSessionId(sessionId);
       applyRemoteStateGeneration(result.remote_state_generation, { reloadViewer: true });
       setRemoteSessionStatus("active", "");
       state.remoteSessionUserActive = false;
@@ -537,16 +569,38 @@ async function acquireRemoteSession(reason = "operation") {
       return true;
     } catch (error) {
       if (error instanceof AuthenticationRequiredError) throw error;
-      setRemoteSessionStatus(
-        "unavailable",
-        error instanceof Error ? error.message : "操作権を取得できません。"
-      );
+      if (!(error instanceof RemoteSessionBlockedError)) {
+        setRemoteSessionStatus(
+          "unavailable",
+          error instanceof Error ? error.message : "操作権を取得できません。"
+        );
+      }
       throw error;
     } finally {
       state.remoteSessionAcquirePromise = null;
     }
   })();
   return state.remoteSessionAcquirePromise;
+}
+
+function newRemoteSessionCacheEpoch() {
+  return (
+    globalThis.crypto?.randomUUID?.().replaceAll("-", "") ??
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+  );
+}
+
+function applyRemoteSessionId(sessionId) {
+  const next = String(sessionId ?? "");
+  if (state.remoteSessionId === next) return;
+  state.viewer?.invalidatePendingLoad();
+  state.remoteSessionId = next;
+  // session_id 自体は capability なので URL へ出さない。これに従属する非 secret nonce で
+  // header を付けられない <img> などの HTTP cache だけを分離する。
+  state.remoteSessionCacheEpoch = next ? newRemoteSessionCacheEpoch() : "";
+  pageResourceCache.clear();
+  state.imageInfoCache.clear();
+  state.containerImageInfoHints.clear();
 }
 
 const APP_UPDATE_POLL_INTERVAL_MS = 5 * 60 * 1000;
@@ -642,13 +696,21 @@ async function pingRemoteSession() {
     return;
   }
   const result = await response.json().catch(() => ({}));
-  applyRemoteStateGeneration(result.remote_state_generation, { reloadViewer: true });
   if (!response.ok || result.status !== "active") {
     setRemoteSessionStatus(
       sessionStatusFromResponse(result.status, response.status),
-      result.message || "リモートセッションが切断されました。操作すると再接続します。"
+      result.message || "リモートセッションが切断されました。再接続してください。"
     );
+    return;
   }
+  if (result.session_id !== state.remoteSessionId) {
+    setRemoteSessionStatus(
+      "other_device",
+      "リモートセッションが更新されました。再接続してください。"
+    );
+    return;
+  }
+  applyRemoteStateGeneration(result.remote_state_generation, { reloadViewer: true });
 }
 
 let remoteFavoritesRefreshPromise = null;
@@ -662,6 +724,7 @@ function applyRemoteStateGeneration(observed, { reloadViewer = false } = {}) {
   state.remoteStateGeneration = transition.generation;
   if (!transition.changed) return transition.generation;
 
+  state.viewer?.invalidatePendingLoad();
   pageResourceCache.clear();
   state.imageInfoCache.clear();
   state.containerImageInfoHints.clear();
@@ -693,6 +756,14 @@ async function refreshRemoteFavorites() {
 function setRemoteSessionStatus(status, message) {
   state.remoteSessionStatus = status;
   state.remoteSessionMessage = message;
+  if (
+    status === "local_in_use" ||
+    status === "other_device" ||
+    status === "expired" ||
+    status === "not_acquired"
+  ) {
+    applyRemoteSessionId("");
+  }
   if (status === "active" || status === "other_device") {
     state.remoteSessionOwner = status;
   }
@@ -706,7 +777,30 @@ function setRemoteSessionStatus(status, message) {
   }
   element.hidden = status === "active" || status === "inactive";
   element.dataset.status = status;
-  element.textContent = message;
+  element.replaceChildren(textElement("span", message));
+  if (
+    status === "local_in_use" ||
+    status === "other_device" ||
+    status === "expired" ||
+    status === "not_acquired" ||
+    status === "unavailable"
+  ) {
+    const reconnect = textElement(
+      "button",
+      "再接続",
+      "remote-session-reconnect"
+    );
+    reconnect.type = "button";
+    reconnect.addEventListener("click", () => {
+      reconnect.disabled = true;
+      acquireRemoteSession("explicit_reconnect", "explicit_reconnect")
+        .then(() => dispatchRoute())
+        .catch(() => {
+          reconnect.disabled = false;
+        });
+    });
+    element.append(reconnect);
+  }
 }
 
 function updateRemoteSessionOwnerBadge() {
@@ -726,13 +820,19 @@ function sessionStatusFromHttp(status) {
 
 function sessionStatusFromResponse(sessionStatus, httpStatus) {
   if (sessionStatus === "superseded") return "other_device";
+  if (sessionStatus === "local_in_use") return "local_in_use";
+  if (sessionStatus === "expired") return "expired";
+  if (sessionStatus === "not_acquired") return "not_acquired";
   return sessionStatusFromHttp(httpStatus);
 }
 
 function renderPinLogin(initialRemainingSeconds = 0) {
   cleanupScreen();
+  applyRemoteSessionId("");
   state.screenContext = "pin";
   state.authenticated = false;
+  state.remoteSessionStatus = "inactive";
+  state.remoteSessionMessage = "";
   state.remoteSessionOwner = null;
   telemetryState.authenticated = false;
   updateRemoteSessionOwnerBadge();
@@ -1073,11 +1173,20 @@ function dispatchCommand(requested, meta = {}) {
     return true;
   }
   state.remoteSessionUserActive = true;
-  if (meta.sessionRetry !== true) {
-    acquireRemoteSession("command")
-      .then(() => dispatchCommand(requested, { ...meta, sessionRetry: true }))
-      .catch(() => {});
-    return true;
+  if (meta.sessionChecked !== true) {
+    const decision = remoteSessionAcquireDecision(
+      state.remoteSessionStatus,
+      "user_operation"
+    );
+    if (decision === "acquire") {
+      acquireRemoteSession("command", "user_operation")
+        .then(() => dispatchCommand(requested, { ...meta, sessionChecked: true }))
+        .catch(() => {});
+      return true;
+    }
+    if (decision === "blocked" || !state.remoteSessionId) {
+      return true;
+    }
   }
   const context = state.screenContext;
   let handled = false;
@@ -3405,6 +3514,8 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
   const viewer = state.viewer;
   if (!group || !viewer) return;
   const identity = group.entries.map(entryIdentity).join("\n");
+  const remoteSessionIdSnapshot = state.remoteSessionId;
+  const remoteSessionCacheEpochSnapshot = state.remoteSessionCacheEpoch;
   const generationSnapshot = viewerPageGroupGenerationSnapshot(
     state.remoteStateGeneration,
     group.entries.length
@@ -3412,6 +3523,8 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
   const infos = await Promise.all(group.entries.map(imageInfo));
   if (
     state.viewer !== viewer ||
+    state.remoteSessionId !== remoteSessionIdSnapshot ||
+    state.remoteSessionCacheEpoch !== remoteSessionCacheEpochSnapshot ||
     currentPageGroup()?.entries.map(entryIdentity).join("\n") !== identity
   ) {
     return;
@@ -3430,6 +3543,8 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
     request: imageRequest(entry, infos[pageIndex], viewer.stage, {
       layout: layout.pages[pageIndex],
       remoteStateGeneration: generationSnapshot.pages[pageIndex],
+      remoteSessionId: remoteSessionIdSnapshot,
+      remoteSessionCacheEpoch: remoteSessionCacheEpochSnapshot,
     }),
   }));
   document.title = `${group.anchor.name} — mIV Remote`;
@@ -3528,6 +3643,8 @@ function imageRequest(
     adjustmentPreview = null,
     previewRevision = null,
     remoteStateGeneration = state.remoteStateGeneration,
+    remoteSessionId = state.remoteSessionId,
+    remoteSessionCacheEpoch = state.remoteSessionCacheEpoch,
   } = {}
 ) {
   const dpr = window.devicePixelRatio || 1;
@@ -3551,6 +3668,7 @@ function imageRequest(
         addressQueryParams(entry.address, {
           w: targetPx,
           generation: remoteStateGeneration,
+          epoch: remoteSessionCacheEpoch,
           ...(prefetch ? { prefetch: 1 } : {}),
           rev: previewRevision ?? state.pageRenderRevision,
           ...(renderContext
@@ -3563,8 +3681,9 @@ function imageRequest(
       ),
       cacheKey: adjustmentPreview
         ? null
-        : `${infoCacheKey}\n${targetPx}\n${state.pageRenderRevision}\n${remoteStateGeneration}\n${JSON.stringify(renderContext)}`,
+        : `${infoCacheKey}\n${targetPx}\n${state.pageRenderRevision}\n${remoteStateGeneration}\n${remoteSessionId}\n${JSON.stringify(renderContext)}`,
       remoteStateGeneration,
+      remoteSessionId,
       width: targetPx,
       cssWidth: resolvedLayout.cssWidth,
       dpr,
@@ -3590,6 +3709,7 @@ function imageRequest(
       fav: state.favoriteId,
       path: entry.path,
       w: resolvedLayout.requestWidth,
+      epoch: state.remoteSessionCacheEpoch,
     }),
     width: resolvedLayout.requestWidth,
     cssWidth: resolvedLayout.cssWidth,
@@ -3614,7 +3734,11 @@ function imageInfo(entry) {
   const path = entry.path;
   const key = `${state.favoriteId}\n${path}\n${entry?.mtime ?? ""}\n${entry?.size ?? ""}`;
   if (!state.imageInfoCache.has(key)) {
-    const pending = apiJson("/api/image-info", { fav: state.favoriteId, path }).catch(
+    const pending = apiJson("/api/image-info", {
+      fav: state.favoriteId,
+      path,
+      epoch: state.remoteSessionCacheEpoch,
+    }).catch(
       (error) => {
         state.imageInfoCache.delete(key);
         throw error;
@@ -3735,7 +3859,10 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
   const bindingKey = thumbnailBindingKey(entry);
   const url = apiUrl(
     "/api/thumb",
-    addressQueryParams(thumbnailAddressForEntry(entry), { w: targetPx })
+    addressQueryParams(thumbnailAddressForEntry(entry), {
+      w: targetPx,
+      epoch: state.remoteSessionCacheEpoch,
+    })
   );
   try {
     const result = await fetchThumbnailWithRetry(url, signal);
@@ -5876,7 +6003,10 @@ class ViewerBookmarkPanel {
       image.addEventListener("error", () => image.remove());
       image.src = apiUrl(
         "/api/thumb",
-        addressQueryParams(row.target.address, { w: 116 })
+        addressQueryParams(row.target.address, {
+          w: 116,
+          epoch: state.remoteSessionCacheEpoch,
+        })
       );
       thumbnail.append(image);
     }
@@ -7144,20 +7274,24 @@ export class ImageViewer {
       clearTimeout(this.resizeTimer);
       const viewer = this;
       this.resizeTimer = setTimeout(() => {
-        acquireRemoteSession("viewer_resize").then(() => {
-          if (state.viewer !== viewer) return;
-          const forceSinglePage = shouldForceSinglePageForViewport();
-          const plan = viewerResizePlan({
-            hasContainer: Boolean(state.container),
-            forceSinglePageChanged: forceSinglePage !== state.forceSinglePage,
-            panelOpen: Boolean(state.commandMenu?.isOpen()),
-          });
-          if (plan.refreshContainer) {
-            refreshContainerSpread(forceSinglePage).catch(renderError);
-            return;
-          }
-          updateViewerImage(performance.now()).catch(renderError);
-        }).catch(() => {});
+        if (
+          state.remoteSessionStatus !== "active" ||
+          !state.remoteSessionId ||
+          state.viewer !== viewer
+        ) {
+          return;
+        }
+        const forceSinglePage = shouldForceSinglePageForViewport();
+        const plan = viewerResizePlan({
+          hasContainer: Boolean(state.container),
+          forceSinglePageChanged: forceSinglePage !== state.forceSinglePage,
+          panelOpen: Boolean(state.commandMenu?.isOpen()),
+        });
+        if (plan.refreshContainer) {
+          refreshContainerSpread(forceSinglePage).catch(renderError);
+          return;
+        }
+        updateViewerImage(performance.now()).catch(renderError);
       }, 180);
     };
 
@@ -7191,6 +7325,15 @@ export class ImageViewer {
       label: `${index + 1} / ${count}`,
     });
     return this.loadMeasuredImage(request, interactionStartedAt, name, info);
+  }
+
+  invalidatePendingLoad() {
+    this.loadSequence += 1;
+    this.fetchController?.abort();
+    this.fetchController = null;
+    clearTimeout(this.loadingTimer);
+    this.loadingTimer = 0;
+    this.loadingIndicator.hidden = true;
   }
 
   loadGroup({
@@ -7375,6 +7518,7 @@ export class ImageViewer {
         const response = await observedFetch(request.url, {
           signal: controller.signal,
           credentials: "same-origin",
+          sessionEpochBound: true,
         });
         if (!response.ok) {
           throw await pageResourceResponseError(response);
@@ -7492,6 +7636,7 @@ export class ImageViewer {
         const response = await observedFetch(request.url, {
           signal: controller.signal,
           credentials: "same-origin",
+          sessionEpochBound: true,
         });
         if (!response.ok) {
           throw await pageResourceResponseError(response);
@@ -8166,11 +8311,15 @@ function installTelemetry() {
   }, 5000);
 }
 
-async function observedFetch(url, options = {}) {
-  options = { ...options, headers: remoteHeaders(options.headers) };
+async function observedFetch(url, options = {}, sessionRecoveryAttempted = false) {
+  const { sessionEpochBound = false, ...requestOptions } = options;
+  const fetchOptions = {
+    ...requestOptions,
+    headers: remoteHeaders(requestOptions.headers),
+  };
   let response;
   try {
-    response = await fetch(url, options);
+    response = await fetch(url, fetchOptions);
   } catch (error) {
     if (error?.name !== "AbortError") {
       recordClientError("fetch_error", error, {
@@ -8186,10 +8335,32 @@ async function observedFetch(url, options = {}) {
     }
     if (response.status === 409 || response.status === 428) {
       if (detail.error !== "remote_state_generation_mismatch") {
+        const sessionStatus = sessionStatusFromResponse(detail.status, response.status);
         setRemoteSessionStatus(
-          sessionStatusFromResponse(detail.status, response.status),
-          detail.message || "操作権がありません。次の操作時に再接続します。"
+          sessionStatus,
+          detail.message || "操作権がありません。再接続してください。"
         );
+        if (
+          !sessionRecoveryAttempted &&
+          state.remoteSessionUserActive &&
+          remoteSessionAcquireDecision(sessionStatus, "user_operation") === "acquire"
+        ) {
+          let recovered = false;
+          try {
+            await acquireRemoteSession("expired_operation", "user_operation");
+            recovered = true;
+          } catch {}
+          if (recovered && sessionEpochBound) {
+            const viewer = state.viewer;
+            queueMicrotask(() => {
+              if (viewer && state.viewer === viewer) {
+                updateViewerImage(performance.now()).catch(renderError);
+              }
+            });
+            throw new DOMException("リモートセッションを更新しました。", "AbortError");
+          }
+          if (recovered) return observedFetch(url, options, true);
+        }
       }
     }
     recordClientError(
@@ -8214,9 +8385,16 @@ async function fetchPageResource(request, signal, prefetch) {
   };
   const response = prefetch
     ? await fetch(request.url, options)
-    : await observedFetch(request.url, options);
+    : await observedFetch(request.url, { ...options, sessionEpochBound: true });
   if (!response.ok) {
     throw await pageResourceResponseError(response);
+  }
+  if (response.headers.get("X-mIV-Remote-Session") !== request.remoteSessionId) {
+    const error = new Error(
+      "ページ画像のリモートセッションを確認できなかったため、表示を中止しました。"
+    );
+    error.code = "remote_session_unattested";
+    throw error;
   }
   requirePageResponseGeneration(request, response);
   const width = Number(response.headers.get("X-mIV-Image-Width"));
@@ -8254,6 +8432,15 @@ async function pageResourceResponseError(response) {
   if (detail.error === "remote_state_generation_mismatch") {
     applyRemoteStateGeneration(detail.remote_state_generation, { reloadViewer: true });
   }
+  if (
+    (response.status === 409 || response.status === 428) &&
+    detail.error !== "remote_state_generation_mismatch"
+  ) {
+    setRemoteSessionStatus(
+      sessionStatusFromResponse(detail.status, response.status),
+      detail.message || "操作権がありません。再接続してください。"
+    );
+  }
   const error = new Error(
     detail.message || `画像取得に失敗しました (HTTP ${response.status})。`
   );
@@ -8265,6 +8452,9 @@ async function pageResourceResponseError(response) {
 function remoteHeaders(initial = {}) {
   const headers = new Headers(initial);
   headers.set("X-mIV-Remote-Client", REMOTE_CLIENT_ID);
+  if (state.remoteSessionId) {
+    headers.set("X-mIV-Remote-Session", state.remoteSessionId);
+  }
   return headers;
 }
 

@@ -207,6 +207,23 @@ payload が欠落していても最終遷移と `control_return_sequence` の一
 別 client の takeover も旧 owner の即時置換にはしない。旧 session の drain 中は新 client へ
 `session_closing` と retry hint を返し、final release 後に改めて acquire させる。
 
+#### Web クライアントの取得 identity と再取得方針
+
+Web クライアントの永続 `client_id` は端末 identity のみに使い、取得成功ごとに新しい
+`session_id` を発行する。取得後の API / stream IPC は両方の完全一致を admission 条件とし、
+同一端末による再取得も安全な drain を完了してから新しい ID を発行し、旧 `session_id` と
+その session 所有処理・配信を失効させる。
+`session_id` は Web 側ページキャッシュの epoch でもあり、変更時は見開き全体の generation
+snapshot とキャッシュをまとめて捨てる。capability である ID 自体は URL へ出さず、header を
+付けられない資源の URL cache には session 変更に従属する非 secret nonce を使う。お気に入り
+経路の `data_version` live 検証はこれと分離して request ごとに維持する。
+
+active 中の command は取得 POST を繰り返さず、既存の `session_id` を付けて直接送る。
+30 秒間隔の既存 ping は session の生存確認と remote-state generation 通知を兼ねる。
+`LocalInUse`（本体切断）と `Superseded`（別端末の取得）は passive event・履歴移動・通常操作で
+自動再取得せず、Web UI の明示的な再接続だけを許す。`NotAcquired` は初回接続で、`Expired` は
+次の明示的な利用者操作で自動取得できる。background 復帰そのものは取得理由にしない。
+
 ### 4.4 drain が長いとき
 
 PC の modal は閉じず、見出しを「リモート接続を終了しています」に変え、次を表示する。
@@ -446,7 +463,7 @@ source decoder から共有 canonical decoder へ到達することを focused t
 `AiFeatureMode` の選択可否を含む server-owned model catalog を追加した。旧 SPA の `ai` 欠落は
 AI 値を変更しない。SPA は `/api/page` の表示完了後に現在の 1〜2 ページだけを自動開始し、
 foreground では 500 ms、通信失敗時は 1 s → 2 s → 5 s で state を取得する。background では
-timer を停止し、復帰時は session 再取得後に recoverable を先に照会する。進捗は phase と server の
+timer を停止し、復帰時は有効な session に限って recoverable を先に照会する。進捗は phase と server の
 page / stage / tile counter だけを表示し、percent は合成しない。aggregate `Ready` の page outcome が
 `Ready` のページだけ result を取得し、全 result を decode 後に見開き DOM を一度だけ更新する。
 `NotApplicable` は元画像を保ち、失敗表示にしない。全ページが `NotApplicable` なら自動処理の進捗表示を

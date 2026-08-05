@@ -81,6 +81,7 @@ globalThis.requestAnimationFrame = (callback) => {
   return 1;
 };
 globalThis.cancelAnimationFrame = () => {};
+const TEST_SESSION_ID = "0123456789abcdef0123456789abcdef";
 const imageFetch = async () => new Response(new Blob([new Uint8Array([1, 2, 3])]), {
   status: 200,
   headers: {
@@ -89,6 +90,7 @@ const imageFetch = async () => new Response(new Blob([new Uint8Array([1, 2, 3])]
     "X-mIV-Image-Width": "1200",
     "X-mIV-Image-Height": "1800",
     "X-mIV-Remote-State-Generation": "test-1",
+    "X-mIV-Remote-Session": TEST_SESSION_ID,
   },
 });
 globalThis.fetch = imageFetch;
@@ -609,6 +611,31 @@ test("image viewer applies seek direction to the native range control", () => {
   assert.equal(seekInput.value, "2");
 });
 
+test("viewer generation invalidation cancels fetch and rejects a late decode replacement", () => {
+  const loadingIndicator = new FakeElement("div");
+  loadingIndicator.hidden = false;
+  const viewer = new ImageViewer({
+    root: new FakeElement("section"),
+    stage: new FakeElement("div"),
+    image: new FakeElement("img"),
+    title: new FakeElement("div"),
+    counter: new FakeElement("output"),
+    loadingIndicator,
+  });
+  let aborted = false;
+  viewer.fetchController = { abort() { aborted = true; } };
+  viewer.loadSequence = 7;
+  viewer.loadingTimer = setTimeout(() => {}, 1000);
+
+  viewer.invalidatePendingLoad();
+
+  assert.equal(viewer.loadSequence, 8);
+  assert.equal(aborted, true);
+  assert.equal(viewer.fetchController, null);
+  assert.equal(viewer.loadingTimer, 0);
+  assert.equal(loadingIndicator.hidden, true);
+});
+
 test("viewer load executes fetch, decode, layout and atomic replacement", async () => {
   const stage = new FakeElement("div");
   const initialImage = new FakeElement("img");
@@ -630,6 +657,7 @@ test("viewer load executes fetch, decode, layout and atomic replacement", async 
       url: "/api/page?test=1",
       cacheKey: "page-1@1800",
       remoteStateGeneration: "test-1",
+      remoteSessionId: TEST_SESSION_ID,
       width: 1800,
       cssWidth: 430,
       dpr: 2,
@@ -694,6 +722,7 @@ test("viewer refuses a page response without a generation attestation", async ()
       "Content-Type": "image/jpeg",
       "X-mIV-Image-Width": "1200",
       "X-mIV-Image-Height": "1800",
+      "X-mIV-Remote-Session": TEST_SESSION_ID,
     },
   });
   try {
@@ -703,6 +732,7 @@ test("viewer refuses a page response without a generation attestation", async ()
         url: "/api/page?test=unattested",
         cacheKey: "page-unattested@1800",
         remoteStateGeneration: "test-1",
+        remoteSessionId: TEST_SESSION_ID,
         width: 1800,
         cssWidth: 430,
         dpr: 2,
@@ -752,6 +782,7 @@ test("spread waits for both pages and atomically replaces the page layer", async
       url: `/api/page?test=${number}`,
       cacheKey: `page-${number}@1334`,
       remoteStateGeneration: "test-1",
+      remoteSessionId: TEST_SESSION_ID,
       width: 1334,
       cssWidth: 667,
       dpr: 2,

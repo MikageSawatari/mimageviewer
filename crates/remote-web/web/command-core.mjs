@@ -68,6 +68,21 @@ export const ReadingDirection = Object.freeze({
   RTL: "rtl",
 });
 
+export function remoteSessionAcquireDecision(status, trigger) {
+  if (status === "active") return "use_current";
+  if (trigger === "explicit_reconnect") return "acquire";
+  if (
+    (status === "inactive" || status === "not_acquired") &&
+    (trigger === "initial" || trigger === "user_operation")
+  ) {
+    return "acquire";
+  }
+  if (status === "expired" && trigger === "user_operation") {
+    return "acquire";
+  }
+  return "blocked";
+}
+
 export function remoteStateGenerationTransition(current, observed) {
   const previous = String(current ?? "");
   const generation = String(observed ?? "");
@@ -1593,7 +1608,7 @@ export function sessionOwnerBadge(status) {
   if (status === "other_device") {
     return {
       owner: "other_device",
-      label: "別の端末が操作中 (操作すると取得します)",
+      label: "別の端末が操作中",
     };
   }
   return { owner: "active", label: "操作中" };

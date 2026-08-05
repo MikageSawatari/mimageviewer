@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 use mimageviewer_ipc::{
     ClientHello, ClientMessage, CollectionError, CollectionErrorCode, CollectionResponse,
     ContainerResponse, FolderListResponse, HomeResponse, MAX_CONTROL_FRAME_BYTES, MediaError,
-    MediaErrorCode, PIPE_NAME, PROTOCOL_VERSION, PagePriority, PageResponse, RemoteWriteError,
-    RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, ServerMessage, SessionResponse,
-    SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse, VideoStreamError,
-    VideoStreamErrorCode, VideoStreamResult, VideoStreamThumbnailPayload, negotiate, read_frame,
-    write_frame,
+    MediaErrorCode, PIPE_NAME, PROTOCOL_VERSION, PagePriority, PageResponse, RemoteSessionIdentity,
+    RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, ServerMessage,
+    SessionResponse, SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse,
+    VideoStreamError, VideoStreamErrorCode, VideoStreamResult, VideoStreamThumbnailPayload,
+    negotiate, read_frame, write_frame,
 };
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
@@ -750,7 +750,7 @@ fn execute_video_stream_request(
     match message {
         ClientMessage::VideoStreamStart {
             id,
-            client_id,
+            owner,
             address,
             quality,
         } => {
@@ -765,7 +765,7 @@ fn execute_video_stream_request(
             match engine.resolve_start_address(&address) {
                 Ok(path) => match session.submit_video_stream(
                     VideoStreamUiRequest::Start {
-                        client_id,
+                        owner,
                         path,
                         quality,
                         budget,
@@ -1115,34 +1115,35 @@ fn work_lane(message: &ClientMessage) -> WorkLane {
     }
 }
 
-fn message_client_id(message: &ClientMessage) -> Option<&str> {
+fn message_owner(message: &ClientMessage) -> Option<&RemoteSessionIdentity> {
     match message {
-        ClientMessage::RemoteWebConnectionInfo { .. } => None,
-        ClientMessage::Thumbnail { client_id, .. }
-        | ClientMessage::Home { client_id, .. }
-        | ClientMessage::Collection { client_id, .. }
-        | ClientMessage::Container { client_id, .. }
-        | ClientMessage::FolderList { client_id, .. }
-        | ClientMessage::Page { client_id, .. }
-        | ClientMessage::RemoteAiStart { client_id, .. }
-        | ClientMessage::RemoteAiState { client_id, .. }
-        | ClientMessage::RemoteAiRecoverable { client_id, .. }
-        | ClientMessage::RemoteAiCancel { client_id, .. }
-        | ClientMessage::RemoteAiResult { client_id, .. }
-        | ClientMessage::Write { client_id, .. }
-        | ClientMessage::VideoStreamStart { client_id, .. }
-        | ClientMessage::VideoStreamControl { client_id, .. }
-        | ClientMessage::VideoStreamSeek { client_id, .. }
-        | ClientMessage::VideoStreamThumbnail { client_id, .. }
-        | ClientMessage::VideoStreamJumpList { client_id, .. }
-        | ClientMessage::VideoStreamJumpThumbnail { client_id, .. }
-        | ClientMessage::VideoStreamPlaylist { client_id, .. }
-        | ClientMessage::VideoStreamSegment { client_id, .. }
-        | ClientMessage::VideoStreamState { client_id, .. }
-        | ClientMessage::VideoStreamStop { client_id, .. }
-        | ClientMessage::SessionActivity { client_id, .. } => Some(client_id),
-        ClientMessage::SessionAcquire { request, .. } => Some(&request.client_id),
-        ClientMessage::SessionPing { request, .. } => Some(&request.client_id),
+        ClientMessage::RemoteWebConnectionInfo { .. } | ClientMessage::SessionAcquire { .. } => {
+            None
+        }
+        ClientMessage::SessionPing { request, .. } => Some(&request.owner),
+        ClientMessage::Thumbnail { owner, .. }
+        | ClientMessage::Home { owner, .. }
+        | ClientMessage::Collection { owner, .. }
+        | ClientMessage::Container { owner, .. }
+        | ClientMessage::FolderList { owner, .. }
+        | ClientMessage::Page { owner, .. }
+        | ClientMessage::RemoteAiStart { owner, .. }
+        | ClientMessage::RemoteAiState { owner, .. }
+        | ClientMessage::RemoteAiRecoverable { owner, .. }
+        | ClientMessage::RemoteAiCancel { owner, .. }
+        | ClientMessage::RemoteAiResult { owner, .. }
+        | ClientMessage::Write { owner, .. }
+        | ClientMessage::VideoStreamStart { owner, .. }
+        | ClientMessage::VideoStreamControl { owner, .. }
+        | ClientMessage::VideoStreamSeek { owner, .. }
+        | ClientMessage::VideoStreamThumbnail { owner, .. }
+        | ClientMessage::VideoStreamJumpList { owner, .. }
+        | ClientMessage::VideoStreamJumpThumbnail { owner, .. }
+        | ClientMessage::VideoStreamPlaylist { owner, .. }
+        | ClientMessage::VideoStreamSegment { owner, .. }
+        | ClientMessage::VideoStreamState { owner, .. }
+        | ClientMessage::VideoStreamStop { owner, .. }
+        | ClientMessage::SessionActivity { owner, .. } => Some(owner),
     }
 }
 
@@ -1211,6 +1212,7 @@ fn session_response(status: SessionStatus, message: impl Into<String>) -> Sessio
     SessionResponse {
         status,
         message: message.into(),
+        session_id: None,
     }
 }
 
@@ -1667,36 +1669,36 @@ fn handle_connection(
                 let _ = reply_tx.send(ServerMessage::Session { id: *id, response });
                 continue;
             }
-            ClientMessage::SessionActivity { id, client_id } => {
-                let response =
-                    match session.begin_operation(client_id, "API 要求を処理中".to_owned()) {
-                        Ok(operation) => match operation.wait_until_active() {
-                            Ok(()) => {
-                                operation.started();
-                                operation.finish(true);
-                                SessionResponse::active()
-                            }
-                            Err(response) => response,
-                        },
+            ClientMessage::SessionActivity { id, owner } => {
+                let response = match session.begin_operation(owner, "API 要求を処理中".to_owned())
+                {
+                    Ok(operation) => match operation.wait_until_active() {
+                        Ok(()) => {
+                            operation.started();
+                            let response = operation.ownership_response();
+                            operation.finish(true);
+                            response
+                        }
                         Err(response) => response,
-                    };
+                    },
+                    Err(response) => response,
+                };
                 let _ = reply_tx.send(ServerMessage::Session { id: *id, response });
                 continue;
             }
             ClientMessage::RemoteAiStart {
                 id,
-                client_id,
+                owner,
                 request,
                 accept_before_unix_ms,
             } => {
-                session.note_ai_client_seen(client_id);
-                let response = match session.begin_operation(client_id, "remote AI job".to_owned())
-                {
+                session.note_ai_client_seen(owner);
+                let response = match session.begin_operation(owner, "remote AI job".to_owned()) {
                     Ok(operation) => session
                         .ai_job_registry()
                         .map(|jobs| {
                             jobs.start(
-                                client_id.clone(),
+                                owner.client_id.clone(),
                                 request.clone(),
                                 *accept_before_unix_ms,
                                 operation,
@@ -1710,61 +1712,119 @@ fn handle_connection(
                 let _ = reply_tx.send(ServerMessage::RemoteAiStart { id: *id, response });
                 continue;
             }
-            ClientMessage::RemoteAiState {
-                id,
-                client_id,
-                job_id,
-            } => {
-                session.note_ai_client_seen(client_id);
-                let response = session
-                    .ai_job_registry()
-                    .map(|jobs| jobs.state(client_id, job_id))
-                    .unwrap_or_else(ai_state_stopped);
+            ClientMessage::RemoteAiState { id, owner, job_id } => {
+                let response = match session
+                    .begin_operation(owner, "remote AI job の状態を確認中".to_owned())
+                {
+                    Ok(operation) => match operation.wait_until_active() {
+                        Ok(()) => {
+                            operation.started();
+                            let response = session
+                                .ai_job_registry()
+                                .map(|jobs| jobs.state(&owner.client_id, job_id))
+                                .unwrap_or_else(ai_state_stopped);
+                            operation.finish(true);
+                            response
+                        }
+                        Err(response) => mimageviewer_ipc::RemoteAiStateResponse::Error(
+                            ai_session_error(response),
+                        ),
+                    },
+                    Err(response) => {
+                        mimageviewer_ipc::RemoteAiStateResponse::Error(ai_session_error(response))
+                    }
+                };
                 let _ = reply_tx.send(ServerMessage::RemoteAiState { id: *id, response });
                 continue;
             }
-            ClientMessage::RemoteAiRecoverable { id, client_id } => {
-                session.note_ai_client_seen(client_id);
-                let response = session
-                    .ai_job_registry()
-                    .map(|jobs| jobs.recoverable(client_id))
-                    .unwrap_or_else(ai_recoverable_stopped);
+            ClientMessage::RemoteAiRecoverable { id, owner } => {
+                let response = match session
+                    .begin_operation(owner, "復帰可能な remote AI job を確認中".to_owned())
+                {
+                    Ok(operation) => match operation.wait_until_active() {
+                        Ok(()) => {
+                            operation.started();
+                            let response = session
+                                .ai_job_registry()
+                                .map(|jobs| jobs.recoverable(&owner.client_id))
+                                .unwrap_or_else(ai_recoverable_stopped);
+                            operation.finish(true);
+                            response
+                        }
+                        Err(response) => mimageviewer_ipc::RemoteAiRecoverableResponse::Error(
+                            ai_session_error(response),
+                        ),
+                    },
+                    Err(response) => mimageviewer_ipc::RemoteAiRecoverableResponse::Error(
+                        ai_session_error(response),
+                    ),
+                };
                 let _ = reply_tx.send(ServerMessage::RemoteAiRecoverable { id: *id, response });
                 continue;
             }
-            ClientMessage::RemoteAiCancel {
-                id,
-                client_id,
-                job_id,
-            } => {
-                session.note_ai_client_seen(client_id);
-                let response = session
-                    .ai_job_registry()
-                    .map(|jobs| jobs.cancel(client_id, job_id))
-                    .unwrap_or_else(ai_cancel_stopped);
+            ClientMessage::RemoteAiCancel { id, owner, job_id } => {
+                let response = match session
+                    .begin_operation(owner, "remote AI job を取り消し中".to_owned())
+                {
+                    Ok(operation) => match operation.wait_until_active() {
+                        Ok(()) => {
+                            operation.started();
+                            let response = session
+                                .ai_job_registry()
+                                .map(|jobs| jobs.cancel(&owner.client_id, job_id))
+                                .unwrap_or_else(ai_cancel_stopped);
+                            operation.finish(true);
+                            response
+                        }
+                        Err(response) => mimageviewer_ipc::RemoteAiCancelResponse::Error(
+                            ai_session_error(response),
+                        ),
+                    },
+                    Err(response) => {
+                        mimageviewer_ipc::RemoteAiCancelResponse::Error(ai_session_error(response))
+                    }
+                };
                 let _ = reply_tx.send(ServerMessage::RemoteAiCancel { id: *id, response });
                 continue;
             }
             ClientMessage::RemoteAiResult {
                 id,
-                client_id,
+                owner,
                 job_id,
                 page_index,
             } => {
-                session.note_ai_client_seen(client_id);
-                let response = session
-                    .ai_job_registry()
-                    .map(|jobs| jobs.result(client_id, job_id, *page_index as usize))
-                    .unwrap_or_else(ai_result_stopped);
+                let response = match session
+                    .begin_operation(owner, "remote AI result を取得中".to_owned())
+                {
+                    Ok(operation) => match operation.wait_until_active() {
+                        Ok(()) => {
+                            operation.started();
+                            let response = session
+                                .ai_job_registry()
+                                .map(|jobs| {
+                                    jobs.result(&owner.client_id, job_id, *page_index as usize)
+                                })
+                                .unwrap_or_else(ai_result_stopped);
+                            operation.finish(true);
+                            response
+                        }
+                        Err(response) => mimageviewer_ipc::RemoteAiResultResponse::Error(
+                            ai_session_error(response),
+                        ),
+                    },
+                    Err(response) => {
+                        mimageviewer_ipc::RemoteAiResultResponse::Error(ai_session_error(response))
+                    }
+                };
                 let _ = reply_tx.send(ServerMessage::RemoteAiResult { id: *id, response });
                 continue;
             }
             _ => {}
         }
-        let client_id =
-            message_client_id(&message).expect("non-control remote IPC requests carry a client id");
+        let owner =
+            message_owner(&message).expect("non-control remote IPC requests carry an owner");
         let session_operation =
-            match session.begin_operation(client_id, operation_description(&message)) {
+            match session.begin_operation(owner, operation_description(&message)) {
                 Ok(operation) => operation,
                 Err(response) => {
                     let _ = reply_tx.send(ServerMessage::Session {
@@ -2466,6 +2526,13 @@ fn wide_nul(value: &str) -> Vec<u16> {
 mod tests {
     use super::*;
 
+    fn test_owner() -> RemoteSessionIdentity {
+        RemoteSessionIdentity {
+            client_id: "test-client".to_owned(),
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        }
+    }
+
     #[test]
     fn remote_pipe_dacl_has_one_current_user_ace() {
         let security = current_user_pipe_security().unwrap();
@@ -2509,15 +2576,16 @@ mod tests {
             },
         });
         assert!(session.finish_acquire(session.snapshot().generation));
+        let owner = session.owner_for_test("test-client");
         let session_operation = session
-            .begin_operation("test-client", "ホームを読み込み中".to_owned())
+            .begin_operation(&owner, "ホームを読み込み中".to_owned())
             .unwrap();
         enqueue_work(
             &work_tx,
             &metrics,
             ClientMessage::Home {
                 id: 73,
-                client_id: "test-client".to_owned(),
+                owner,
                 request: mimageviewer_ipc::HomeRequest,
             },
             reply_tx,
@@ -2573,14 +2641,14 @@ mod tests {
     fn full_stream_queue_does_not_consume_thumbnail_or_list_lanes() {
         let segment = ClientMessage::VideoStreamSegment {
             id: 80,
-            client_id: "test-client".to_owned(),
+            owner: test_owner(),
             session: 1,
             generation: 2,
             index: mimageviewer_ipc::VideoStreamSegmentIndex::Media { sequence: 3 },
         };
         let thumbnail = ClientMessage::Thumbnail {
             id: 81,
-            client_id: "test-client".to_owned(),
+            owner: test_owner(),
             request: mimageviewer_ipc::ThumbnailRequest {
                 address: mimageviewer_ipc::RemoteAddress::file(
                     "00000000-0000-0000-0000-000000000000",
@@ -2591,12 +2659,12 @@ mod tests {
         };
         let home = ClientMessage::Home {
             id: 82,
-            client_id: "test-client".to_owned(),
+            owner: test_owner(),
             request: mimageviewer_ipc::HomeRequest,
         };
         let folder_list = ClientMessage::FolderList {
             id: 83,
-            client_id: "test-client".to_owned(),
+            owner: test_owner(),
             request: mimageviewer_ipc::FolderListRequest {
                 address: mimageviewer_ipc::RemoteAddress::file(
                     "00000000-0000-0000-0000-000000000000",
@@ -2606,7 +2674,7 @@ mod tests {
         };
         let jump_list = ClientMessage::VideoStreamJumpList {
             id: 84,
-            client_id: "test-client".to_owned(),
+            owner: test_owner(),
             session: 1,
         };
         assert_eq!(work_lane(&segment), WorkLane::Stream);
@@ -2633,7 +2701,7 @@ mod tests {
     fn queue_full_is_an_explicit_retryable_response() {
         let message = ClientMessage::Thumbnail {
             id: 42,
-            client_id: "test-client".to_owned(),
+            owner: test_owner(),
             request: mimageviewer_ipc::ThumbnailRequest {
                 address: mimageviewer_ipc::RemoteAddress::file(
                     "00000000-0000-0000-0000-000000000000",

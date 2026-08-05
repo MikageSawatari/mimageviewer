@@ -9,8 +9,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mimageviewer_ipc::{
     CollectionErrorCode, CollectionKind, MediaErrorCode, PagePriority, RemoteAddress,
     RemoteAiJobError, RemoteAiJobErrorCode, RemoteAiStartRequest, RemoteEntryKind,
-    RemotePageRenderContext, RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource,
-    RemoteWriteErrorCode, RemoteWriteRequest, SessionResponse, SessionStatus,
+    RemotePageRenderContext, RemoteReadingDirection, RemoteSessionIdentity, RemoteSpreadMode,
+    RemoteSubresource, RemoteWriteErrorCode, RemoteWriteRequest, SessionResponse, SessionStatus,
     VideoStreamControlAction, VideoStreamErrorCode, VideoStreamJumpThumbnailPayload,
     VideoStreamPlaylistKind, VideoStreamQuality, VideoStreamSegmentIndex,
     VideoStreamSegmentPayload, VideoStreamThumbnailPayload,
@@ -59,8 +59,14 @@ pub struct AppState {
 
 #[derive(Default)]
 pub struct RemoteClientIdentities {
-    cookie_owners: Mutex<HashMap<AuthSessionIdentity, String>>,
+    cookie_owners: Mutex<HashMap<AuthSessionIdentity, RemoteCookieOwner>>,
     unidentified_sequence: AtomicU64,
+}
+
+#[derive(Clone)]
+struct RemoteCookieOwner {
+    client_id: String,
+    session_id: Option<String>,
 }
 
 impl RemoteClientIdentities {
@@ -72,12 +78,18 @@ impl RemoteClientIdentities {
                     return identity.fallback_client_id();
                 };
                 if let Some(owner) = owners.get(&identity) {
-                    return owner.clone();
+                    return owner.client_id.clone();
                 }
                 let owner = header_client_id
                     .map(str::to_owned)
                     .unwrap_or_else(|| identity.fallback_client_id());
-                owners.insert(identity, owner.clone());
+                owners.insert(
+                    identity,
+                    RemoteCookieOwner {
+                        client_id: owner.clone(),
+                        session_id: None,
+                    },
+                );
                 owner
             }
             AuthDecision::Authorized(AuthSource::Bearer) => {
@@ -93,30 +105,71 @@ impl RemoteClientIdentities {
             }
         }
     }
+
+    fn bind_session(&self, auth: AuthDecision, owner: &RemoteSessionIdentity) {
+        let AuthDecision::Authorized(AuthSource::SessionCookie(identity)) = auth else {
+            return;
+        };
+        if let Ok(mut owners) = self.cookie_owners.lock() {
+            owners.insert(
+                identity,
+                RemoteCookieOwner {
+                    client_id: owner.client_id.clone(),
+                    session_id: Some(owner.session_id.clone()),
+                },
+            );
+        }
+    }
+
+    fn resolve_session(
+        &self,
+        request: &Request,
+        auth: AuthDecision,
+        client_id: &str,
+    ) -> Option<RemoteSessionIdentity> {
+        if let Some(session_id) = remote_session_header(request) {
+            return Some(RemoteSessionIdentity {
+                client_id: client_id.to_owned(),
+                session_id: session_id.to_owned(),
+            });
+        }
+        let AuthDecision::Authorized(AuthSource::SessionCookie(identity)) = auth else {
+            return None;
+        };
+        let owners = self.cookie_owners.lock().ok()?;
+        let owner = owners.get(&identity)?;
+        (owner.client_id == client_id)
+            .then(|| owner.session_id.clone())
+            .flatten()
+            .map(|session_id| RemoteSessionIdentity {
+                client_id: client_id.to_owned(),
+                session_id,
+            })
+    }
 }
 
 pub struct SessionActivityNotifier {
-    tx: std::sync::mpsc::SyncSender<String>,
+    tx: std::sync::mpsc::SyncSender<RemoteSessionIdentity>,
 }
 
 impl SessionActivityNotifier {
     pub fn start(client: Arc<ThumbnailClient>) -> Result<Self, String> {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<RemoteSessionIdentity>(1);
         std::thread::Builder::new()
             .name("remote-session-activity".to_owned())
             .spawn(move || {
-                while let Ok(client_id) = rx.recv() {
-                    let _ = client.session_activity(&client_id);
+                while let Ok(owner) = rx.recv() {
+                    let _ = client.session_activity(&owner);
                 }
             })
             .map_err(|error| format!("session activity worker を開始できません: {error}"))?;
         Ok(Self { tx })
     }
 
-    fn note(&self, client_id: &str) {
+    fn note(&self, owner: &RemoteSessionIdentity) {
         // Cheap HTTP routes must never wait for IPC. One pending notification is enough because
         // all notifications mean the same monotonic "active now" transition.
-        let _ = self.tx.try_send(client_id.to_owned());
+        let _ = self.tx.try_send(owner.clone());
     }
 }
 
@@ -459,6 +512,24 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
     } else {
         String::new()
     };
+    let remote_owner =
+        state
+            .remote_client_identities
+            .resolve_session(request, auth, &remote_client_id);
+    if auth != AuthDecision::Unauthorized
+        && route_requires_remote_session(path)
+        && remote_owner.is_none()
+    {
+        return session_response_http(
+            SessionResponse {
+                status: SessionStatus::NotAcquired,
+                message: "リモートセッションを取得してください。".to_owned(),
+                session_id: None,
+            },
+            state,
+        );
+    }
+    let remote_owner = remote_owner.as_ref();
     let response = match (method, path) {
         (Method::Get, "/") => static_file(state, "index.html", "text/html; charset=utf-8"),
         (Method::Get, "/app.js") => static_file(state, "app.js", "text/javascript; charset=utf-8"),
@@ -514,64 +585,144 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
         }
         _ if auth == AuthDecision::Unauthorized => unauthorized(),
         (Method::Get, "/api/app-version") => api_app_version(state),
-        (Method::Post, "/api/video/start") => api_video_start(request, state, &remote_client_id),
-        (Method::Post, "/api/video/control") => {
-            api_video_control(request, state, &remote_client_id)
-        }
-        (Method::Post, "/api/video/seek") => api_video_seek(request, state, &remote_client_id),
-        (Method::Post, "/api/video/thumbnail") => {
-            api_video_thumbnail(request, state, &remote_client_id)
-        }
-        (Method::Get, "/api/video/state") => api_video_state(state, &query, &remote_client_id),
-        (Method::Get, "/api/video/jumps") => api_video_jumps(state, &query, &remote_client_id),
-        (Method::Get, "/api/video/jump-thumbnail") => {
-            api_video_jump_thumbnail(state, &query, &remote_client_id)
-        }
-        (Method::Post, "/api/video/stop") => api_video_stop(request, state, &remote_client_id),
-        (Method::Get, path) if path.starts_with("/stream/") => {
-            stream_resource(state, path, &remote_client_id)
-        }
+        (Method::Post, "/api/video/start") => api_video_start(
+            request,
+            state,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Post, "/api/video/control") => api_video_control(
+            request,
+            state,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Post, "/api/video/seek") => api_video_seek(
+            request,
+            state,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Post, "/api/video/thumbnail") => api_video_thumbnail(
+            request,
+            state,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Get, "/api/video/state") => api_video_state(
+            state,
+            &query,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Get, "/api/video/jumps") => api_video_jumps(
+            state,
+            &query,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Get, "/api/video/jump-thumbnail") => api_video_jump_thumbnail(
+            state,
+            &query,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Post, "/api/video/stop") => api_video_stop(
+            request,
+            state,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Get, path) if path.starts_with("/stream/") => stream_resource(
+            state,
+            path,
+            remote_owner.expect("route guard checked session"),
+        ),
         (Method::Post, "/api/session/acquire") => {
-            api_session_acquire(request, state, &remote_client_id)
+            api_session_acquire(request, state, auth, &remote_client_id)
         }
-        (Method::Post, "/api/session/ping") => api_session_ping(request, state, &remote_client_id),
-        (Method::Get, "/api/remote-state") => api_remote_state(state),
-        (Method::Get, "/api/favorites") => {
-            with_session_activity(state, &remote_client_id, || api_favorites(state))
+        (Method::Post, "/api/session/ping") => api_session_ping(
+            request,
+            state,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Get, "/api/remote-state") => with_session_activity(
+            state,
+            remote_owner.expect("route guard checked session"),
+            || api_remote_state(state),
+        ),
+        (Method::Get, "/api/favorites") => with_session_activity(
+            state,
+            remote_owner.expect("route guard checked session"),
+            || api_favorites(state),
+        ),
+        (Method::Get, "/api/home") => {
+            api_home(state, remote_owner.expect("route guard checked session"))
         }
-        (Method::Get, "/api/home") => api_home(state, &remote_client_id),
-        (Method::Get, "/api/collection") => api_collection(state, &query, &remote_client_id),
-        (Method::Get, "/api/list") => with_session_activity(state, &remote_client_id, || {
-            api_list(state, &query, &remote_client_id)
-        }),
-        (Method::Get, "/api/container") => api_container(state, &query, &remote_client_id),
-        (Method::Post, "/api/ai/jobs") => api_ai_job_start(request, state, &remote_client_id),
-        (Method::Get, "/api/ai/jobs") => api_ai_jobs_recoverable(state, &query, &remote_client_id),
+        (Method::Get, "/api/collection") => api_collection(
+            state,
+            &query,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Get, "/api/list") => with_session_activity(
+            state,
+            remote_owner.expect("route guard checked session"),
+            || {
+                api_list(
+                    state,
+                    &query,
+                    remote_owner.expect("route guard checked session"),
+                )
+            },
+        ),
+        (Method::Get, "/api/container") => api_container(
+            state,
+            &query,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Post, "/api/ai/jobs") => api_ai_job_start(
+            request,
+            state,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Get, "/api/ai/jobs") => api_ai_jobs_recoverable(
+            state,
+            &query,
+            remote_owner.expect("route guard checked session"),
+        ),
         (Method::Get, path) if ai_result_job_id(path).is_some() => api_ai_job_result(
             state,
             ai_result_job_id(path).expect("guard checked result route"),
             &query,
-            &remote_client_id,
+            remote_owner.expect("route guard checked session"),
         ),
         (Method::Get, path) if ai_state_job_id(path).is_some() => api_ai_job_state(
             state,
             ai_state_job_id(path).expect("guard checked state route"),
-            &remote_client_id,
+            remote_owner.expect("route guard checked session"),
         ),
         (Method::Delete, path) if ai_state_job_id(path).is_some() => api_ai_job_cancel(
             state,
             ai_state_job_id(path).expect("guard checked cancel route"),
-            &remote_client_id,
+            remote_owner.expect("route guard checked session"),
         ),
-        (Method::Post, "/api/write") => api_write(request, state, &remote_client_id),
-        (Method::Get, "/api/thumb") => api_thumb(state, &query, &remote_client_id),
-        (Method::Get, "/api/image-info") => {
-            with_session_activity(state, &remote_client_id, || api_image_info(state, &query))
-        }
-        (Method::Get, "/api/image") => {
-            with_session_activity(state, &remote_client_id, || api_image(state, &query))
-        }
-        (Method::Get, "/api/page") => api_page(state, &query, &remote_client_id),
+        (Method::Post, "/api/write") => api_write(
+            request,
+            state,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Get, "/api/thumb") => api_thumb(
+            state,
+            &query,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Get, "/api/image-info") => with_session_activity(
+            state,
+            remote_owner.expect("route guard checked session"),
+            || api_image_info(state, &query),
+        ),
+        (Method::Get, "/api/image") => with_session_activity(
+            state,
+            remote_owner.expect("route guard checked session"),
+            || api_image(state, &query),
+        ),
+        (Method::Get, "/api/page") => api_page(
+            state,
+            &query,
+            remote_owner.expect("route guard checked session"),
+        ),
         (Method::Post, "/api/telemetry") => api_telemetry(request, state),
         (Method::Get, _) => HttpResponse::text(404, "Not Found"),
         (_, path) if path.starts_with("/stream/") => HttpResponse::text(405, "Method Not Allowed")
@@ -626,7 +777,11 @@ fn ai_result_job_id(path: &str) -> Option<&str> {
     (!job_id.is_empty() && !job_id.contains('/')).then_some(job_id)
 }
 
-fn api_ai_job_start(request: &mut Request, state: &AppState, client_id: &str) -> HttpResponse {
+fn api_ai_job_start(
+    request: &mut Request,
+    state: &AppState,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     let body = match read_body_limited(request, MAX_AI_JOB_BODY_BYTES) {
         Ok(body) => body,
         Err(BodyReadError::TooLarge) => return HttpResponse::text(413, "Payload Too Large"),
@@ -657,7 +812,7 @@ fn api_ai_job_start(request: &mut Request, state: &AppState, client_id: &str) ->
         }
     }
     let result = match state.ipc_admission.run(IpcClass::Home, || {
-        state.thumbnail_client.remote_ai_start(client_id, request)
+        state.thumbnail_client.remote_ai_start(owner, request)
     }) {
         Ok(result) => result,
         Err(_) => return ai_admission_busy_response(),
@@ -676,13 +831,13 @@ fn api_ai_job_start(request: &mut Request, state: &AppState, client_id: &str) ->
 fn api_ai_jobs_recoverable(
     state: &AppState,
     query: &[(String, String)],
-    client_id: &str,
+    owner: &RemoteSessionIdentity,
 ) -> HttpResponse {
     if query_value(query, "recoverable") != Ok(Some("1")) {
         return HttpResponse::text(400, "Bad Request");
     }
     let result = match state.ipc_admission.run(IpcClass::Home, || {
-        state.thumbnail_client.remote_ai_recoverable(client_id)
+        state.thumbnail_client.remote_ai_recoverable(owner)
     }) {
         Ok(result) => result,
         Err(_) => return ai_admission_busy_response(),
@@ -695,9 +850,9 @@ fn api_ai_jobs_recoverable(
     }
 }
 
-fn api_ai_job_state(state: &AppState, job_id: &str, client_id: &str) -> HttpResponse {
+fn api_ai_job_state(state: &AppState, job_id: &str, owner: &RemoteSessionIdentity) -> HttpResponse {
     let result = match state.ipc_admission.run(IpcClass::Home, || {
-        state.thumbnail_client.remote_ai_state(client_id, job_id)
+        state.thumbnail_client.remote_ai_state(owner, job_id)
     }) {
         Ok(result) => result,
         Err(_) => return ai_admission_busy_response(),
@@ -710,9 +865,13 @@ fn api_ai_job_state(state: &AppState, job_id: &str, client_id: &str) -> HttpResp
     }
 }
 
-fn api_ai_job_cancel(state: &AppState, job_id: &str, client_id: &str) -> HttpResponse {
+fn api_ai_job_cancel(
+    state: &AppState,
+    job_id: &str,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     let result = match state.ipc_admission.run(IpcClass::Home, || {
-        state.thumbnail_client.remote_ai_cancel(client_id, job_id)
+        state.thumbnail_client.remote_ai_cancel(owner, job_id)
     }) {
         Ok(result) => result,
         Err(_) => return ai_admission_busy_response(),
@@ -740,7 +899,7 @@ fn api_ai_job_result(
     state: &AppState,
     job_id: &str,
     query: &[(String, String)],
-    client_id: &str,
+    owner: &RemoteSessionIdentity,
 ) -> HttpResponse {
     let page = match required_query_value(query, "page")
         .and_then(|value| value.parse::<u32>().map_err(|_| ()))
@@ -749,9 +908,7 @@ fn api_ai_job_result(
         Err(()) => return HttpResponse::text(400, "Bad Request"),
     };
     let result = match state.ipc_admission.run(IpcClass::Heavy, || {
-        state
-            .thumbnail_client
-            .remote_ai_result(client_id, job_id, page)
+        state.thumbnail_client.remote_ai_result(owner, job_id, page)
     }) {
         Ok(result) => result,
         Err(_) => return ai_admission_busy_response(),
@@ -907,7 +1064,11 @@ enum StreamRouteResource {
     Segment(VideoStreamSegmentIndex),
 }
 
-fn api_video_start(request: &mut Request, state: &AppState, client_id: &str) -> HttpResponse {
+fn api_video_start(
+    request: &mut Request,
+    state: &AppState,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     let body: VideoStartBody = match read_video_json(request) {
         Ok(body) => body,
         Err(response) => return response,
@@ -916,11 +1077,11 @@ fn api_video_start(request: &mut Request, state: &AppState, client_id: &str) -> 
     if let Err(error) = state.library.validate_remote_file_video(&address) {
         return store_error_response(error).with_header("Cache-Control", "no-store");
     }
-    state.session_activity.note(client_id);
+    state.session_activity.note(owner);
     let result = match state.ipc_admission.run(IpcClass::Stream, || {
         state
             .thumbnail_client
-            .video_stream_start(client_id, address, body.quality)
+            .video_stream_start(owner, address, body.quality)
     }) {
         Ok(result) => result,
         Err(busy) => return video_admission_busy_response(busy),
@@ -948,16 +1109,20 @@ fn api_video_start(request: &mut Request, state: &AppState, client_id: &str) -> 
     }
 }
 
-fn api_video_control(request: &mut Request, state: &AppState, client_id: &str) -> HttpResponse {
+fn api_video_control(
+    request: &mut Request,
+    state: &AppState,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     let body: VideoControlBody = match read_video_json(request) {
         Ok(body) => body,
         Err(response) => return response,
     };
-    state.session_activity.note(client_id);
+    state.session_activity.note(owner);
     let result = match state.ipc_admission.run(IpcClass::Stream, || {
         state
             .thumbnail_client
-            .video_stream_control(client_id, body.session, body.action)
+            .video_stream_control(owner, body.session, body.action)
     }) {
         Ok(result) => result,
         Err(busy) => return video_admission_busy_response(busy),
@@ -968,7 +1133,11 @@ fn api_video_control(request: &mut Request, state: &AppState, client_id: &str) -
     }
 }
 
-fn api_video_seek(request: &mut Request, state: &AppState, client_id: &str) -> HttpResponse {
+fn api_video_seek(
+    request: &mut Request,
+    state: &AppState,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     let body: VideoSeekBody = match read_video_json(request) {
         Ok(body) => body,
         Err(response) => return response,
@@ -980,11 +1149,11 @@ fn api_video_seek(request: &mut Request, state: &AppState, client_id: &str) -> H
             "position_secs must be finite and non-negative",
         );
     }
-    state.session_activity.note(client_id);
+    state.session_activity.note(owner);
     let result = match state.ipc_admission.run(IpcClass::Stream, || {
         state
             .thumbnail_client
-            .video_stream_seek(client_id, body.session, body.position_secs)
+            .video_stream_seek(owner, body.session, body.position_secs)
     }) {
         Ok(result) => result,
         Err(busy) => return video_admission_busy_response(busy),
@@ -1000,7 +1169,11 @@ fn api_video_seek(request: &mut Request, state: &AppState, client_id: &str) -> H
     }
 }
 
-fn api_video_thumbnail(request: &mut Request, state: &AppState, client_id: &str) -> HttpResponse {
+fn api_video_thumbnail(
+    request: &mut Request,
+    state: &AppState,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     let body: VideoThumbnailBody = match read_video_json(request) {
         Ok(body) => body,
         Err(response) => return response,
@@ -1015,11 +1188,11 @@ fn api_video_thumbnail(request: &mut Request, state: &AppState, client_id: &str)
             "thumbnail position_secs must be finite and non-negative",
         );
     }
-    state.session_activity.note(client_id);
+    state.session_activity.note(owner);
     let result = match state.ipc_admission.run(IpcClass::Stream, || {
         state
             .thumbnail_client
-            .video_stream_thumbnail(client_id, body.session, body.position_secs)
+            .video_stream_thumbnail(owner, body.session, body.position_secs)
     }) {
         Ok(result) => result,
         Err(busy) => return video_admission_busy_response(busy),
@@ -1055,16 +1228,20 @@ fn video_thumbnail_http_response(payload: VideoStreamThumbnailPayload) -> HttpRe
     }
 }
 
-fn api_video_jumps(state: &AppState, query: &[(String, String)], client_id: &str) -> HttpResponse {
+fn api_video_jumps(
+    state: &AppState,
+    query: &[(String, String)],
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     let session = match video_query_session(query) {
         Ok(session) => session,
         Err(response) => return response,
     };
-    state.session_activity.note(client_id);
+    state.session_activity.note(owner);
     let result = match state.ipc_admission.run(IpcClass::Heavy, || {
         state
             .thumbnail_client
-            .video_stream_jump_list(client_id, session)
+            .video_stream_jump_list(owner, session)
     }) {
         Ok(result) => result,
         Err(busy) => return video_admission_busy_response(busy),
@@ -1113,7 +1290,7 @@ fn api_video_jumps(state: &AppState, query: &[(String, String)], client_id: &str
 fn api_video_jump_thumbnail(
     state: &AppState,
     query: &[(String, String)],
-    client_id: &str,
+    owner: &RemoteSessionIdentity,
 ) -> HttpResponse {
     let session = match video_query_session(query) {
         Ok(session) => session,
@@ -1129,11 +1306,11 @@ fn api_video_jump_thumbnail(
             );
         }
     };
-    state.session_activity.note(client_id);
+    state.session_activity.note(owner);
     let result = match state.ipc_admission.run(IpcClass::Heavy, || {
         state
             .thumbnail_client
-            .video_stream_jump_thumbnail(client_id, session, token)
+            .video_stream_jump_thumbnail(owner, session, token)
     }) {
         Ok(result) => result,
         Err(busy) => return video_admission_busy_response(busy),
@@ -1171,7 +1348,11 @@ fn video_jump_thumbnail_http_response(payload: VideoStreamJumpThumbnailPayload) 
     }
 }
 
-fn api_video_state(state: &AppState, query: &[(String, String)], client_id: &str) -> HttpResponse {
+fn api_video_state(
+    state: &AppState,
+    query: &[(String, String)],
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     let session = match required_query_value(query, "session")
         .and_then(|value| value.parse::<u64>().map_err(|_| ()))
     {
@@ -1184,11 +1365,9 @@ fn api_video_state(state: &AppState, query: &[(String, String)], client_id: &str
             );
         }
     };
-    state.session_activity.note(client_id);
+    state.session_activity.note(owner);
     let result = match state.ipc_admission.run(IpcClass::Stream, || {
-        state
-            .thumbnail_client
-            .video_stream_state(client_id, session)
+        state.thumbnail_client.video_stream_state(owner, session)
     }) {
         Ok(result) => result,
         Err(busy) => return video_admission_busy_response(busy),
@@ -1201,16 +1380,20 @@ fn api_video_state(state: &AppState, query: &[(String, String)], client_id: &str
     }
 }
 
-fn api_video_stop(request: &mut Request, state: &AppState, client_id: &str) -> HttpResponse {
+fn api_video_stop(
+    request: &mut Request,
+    state: &AppState,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     let body: VideoStopBody = match read_video_json(request) {
         Ok(body) => body,
         Err(response) => return response,
     };
-    state.session_activity.note(client_id);
+    state.session_activity.note(owner);
     let result = match state.ipc_admission.run(IpcClass::Stream, || {
         state
             .thumbnail_client
-            .video_stream_stop(client_id, body.session)
+            .video_stream_stop(owner, body.session)
     }) {
         Ok(result) => result,
         Err(busy) => return video_admission_busy_response(busy),
@@ -1223,18 +1406,18 @@ fn api_video_stop(request: &mut Request, state: &AppState, client_id: &str) -> H
     }
 }
 
-fn stream_resource(state: &AppState, path: &str, client_id: &str) -> HttpResponse {
+fn stream_resource(state: &AppState, path: &str, owner: &RemoteSessionIdentity) -> HttpResponse {
     let (session, generation, resource) = match parse_stream_path(path) {
         Ok(parsed) => parsed,
         Err(()) => return HttpResponse::text(404, "Not Found"),
     };
-    state.session_activity.note(client_id);
+    state.session_activity.note(owner);
     match resource {
         StreamRouteResource::Playlist(kind) => {
             let result = match state.ipc_admission.run(IpcClass::Stream, || {
                 state
                     .thumbnail_client
-                    .video_stream_playlist(client_id, session, generation, kind)
+                    .video_stream_playlist(owner, session, generation, kind)
             }) {
                 Ok(result) => result,
                 Err(busy) => return video_admission_busy_response(busy),
@@ -1248,7 +1431,7 @@ fn stream_resource(state: &AppState, path: &str, client_id: &str) -> HttpRespons
             let result = match state.ipc_admission.run(IpcClass::Stream, || {
                 state
                     .thumbnail_client
-                    .video_stream_segment(client_id, session, generation, index)
+                    .video_stream_segment(owner, session, generation, index)
             }) {
                 Ok(result) => result,
                 Err(busy) => return video_admission_busy_response(busy),
@@ -1552,7 +1735,12 @@ fn video_ipc_error_response(failure: crate::ipc_client::ClientFailure) -> HttpRe
     response.with_body_error_code_log()
 }
 
-fn api_session_acquire(request: &Request, state: &AppState, client_id: &str) -> HttpResponse {
+fn api_session_acquire(
+    request: &Request,
+    state: &AppState,
+    auth: AuthDecision,
+    client_id: &str,
+) -> HttpResponse {
     let source_ip =
         forwarded_source_ip(request).or_else(|| request.remote_addr().map(|address| address.ip()));
     let peer = source_ip
@@ -1572,12 +1760,29 @@ fn api_session_acquire(request: &Request, state: &AppState, client_id: &str) -> 
         })
         .unwrap_or_else(|| crate::connection_url::detect_peer_info(None));
     match state.thumbnail_client.session_acquire(client_id, peer) {
-        Ok(response) => session_response_http(response, state),
+        Ok(response) => {
+            if response.status == SessionStatus::Active
+                && let Some(session_id) = response.session_id.as_ref()
+            {
+                state.remote_client_identities.bind_session(
+                    auth,
+                    &RemoteSessionIdentity {
+                        client_id: client_id.to_owned(),
+                        session_id: session_id.clone(),
+                    },
+                );
+            }
+            session_response_http(response, state)
+        }
         Err(failure) => session_failure_response(failure, state),
     }
 }
 
-fn api_session_ping(request: &mut Request, state: &AppState, client_id: &str) -> HttpResponse {
+fn api_session_ping(
+    request: &mut Request,
+    state: &AppState,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     let body = match read_body_limited(request, MAX_PIN_BODY_BYTES) {
         Ok(body) => body,
         Err(BodyReadError::TooLarge) => return HttpResponse::text(413, "Payload Too Large"),
@@ -1589,7 +1794,7 @@ fn api_session_ping(request: &mut Request, state: &AppState, client_id: &str) ->
     };
     match state
         .thumbnail_client
-        .session_ping(client_id, body.user_active, body.media_playing)
+        .session_ping(owner, body.user_active, body.media_playing)
     {
         Ok(response) => session_response_http(response, state),
         Err(failure) => session_failure_response(failure, state),
@@ -1598,11 +1803,14 @@ fn api_session_ping(request: &mut Request, state: &AppState, client_id: &str) ->
 
 fn with_session_activity(
     state: &AppState,
-    client_id: &str,
+    owner: &RemoteSessionIdentity,
     operation: impl FnOnce() -> HttpResponse,
 ) -> HttpResponse {
-    state.session_activity.note(client_id);
-    operation()
+    match state.thumbnail_client.session_activity(owner) {
+        Ok(response) if response.status == SessionStatus::Active => operation(),
+        Ok(response) => session_response_http(response, state),
+        Err(failure) => session_failure_response(failure, state),
+    }
 }
 
 fn session_response_http(response: SessionResponse, state: &AppState) -> HttpResponse {
@@ -1618,6 +1826,7 @@ fn session_response_http(response: SessionResponse, state: &AppState) -> HttpRes
         serde_json::to_vec(&json!({
             "status": response.status,
             "message": response.message,
+            "session_id": response.session_id,
             "remote_state_generation": remote_state_generation,
         }))
         .unwrap_or_default(),
@@ -1853,11 +2062,11 @@ fn api_remote_state(state: &AppState) -> HttpResponse {
     }
 }
 
-fn api_home(state: &AppState, client_id: &str) -> HttpResponse {
+fn api_home(state: &AppState, owner: &RemoteSessionIdentity) -> HttpResponse {
     let started = Instant::now();
     let result = match state
         .ipc_admission
-        .run(IpcClass::Home, || state.thumbnail_client.home(client_id))
+        .run(IpcClass::Home, || state.thumbnail_client.home(owner))
     {
         Ok(result) => result,
         Err(busy) => return collection_admission_busy_response(busy, "home"),
@@ -1880,7 +2089,11 @@ fn api_home(state: &AppState, client_id: &str) -> HttpResponse {
     }
 }
 
-fn api_collection(state: &AppState, query: &[(String, String)], client_id: &str) -> HttpResponse {
+fn api_collection(
+    state: &AppState,
+    query: &[(String, String)],
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     let kind_name = match required_query_value(query, "kind") {
         Ok(value) => value,
         Err(()) => return HttpResponse::text(400, "Bad Request"),
@@ -1909,7 +2122,7 @@ fn api_collection(state: &AppState, query: &[(String, String)], client_id: &str)
     };
     let started = Instant::now();
     let result = match state.ipc_admission.run(IpcClass::Heavy, || {
-        state.thumbnail_client.collection(client_id, kind)
+        state.thumbnail_client.collection(owner, kind)
     }) {
         Ok(result) => result,
         Err(busy) => return collection_admission_busy_response(busy, kind_name),
@@ -2051,7 +2264,11 @@ fn collection_ipc_error_response(
     }))
 }
 
-fn api_list(state: &AppState, query: &[(String, String)], client_id: &str) -> HttpResponse {
+fn api_list(
+    state: &AppState,
+    query: &[(String, String)],
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     let Some((favorite, path)) = favorite_and_path(query) else {
         return HttpResponse::text(400, "Bad Request");
     };
@@ -2061,7 +2278,7 @@ fn api_list(state: &AppState, query: &[(String, String)], client_id: &str) -> Ht
     }
     let started = Instant::now();
     let result = match state.ipc_admission.run(IpcClass::Browse, || {
-        state.thumbnail_client.folder_list(client_id, address)
+        state.thumbnail_client.folder_list(owner, address)
     }) {
         Ok(result) => result,
         Err(busy) => return media_admission_busy_response(busy, "list"),
@@ -2153,7 +2370,11 @@ fn folder_list_entry_kind(kind: RemoteEntryKind) -> &'static str {
     }
 }
 
-fn api_container(state: &AppState, query: &[(String, String)], client_id: &str) -> HttpResponse {
+fn api_container(
+    state: &AppState,
+    query: &[(String, String)],
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     let address = match remote_address_from_query(query) {
         Ok(address)
             if matches!(
@@ -2183,7 +2404,7 @@ fn api_container(state: &AppState, query: &[(String, String)], client_id: &str) 
     let started = Instant::now();
     let result = match state.ipc_admission.run(IpcClass::Heavy, || {
         state.thumbnail_client.container(
-            client_id,
+            owner,
             address.clone(),
             spread_mode,
             reading_direction,
@@ -2242,7 +2463,11 @@ fn api_container(state: &AppState, query: &[(String, String)], client_id: &str) 
     }
 }
 
-fn api_write(request: &mut Request, state: &AppState, client_id: &str) -> HttpResponse {
+fn api_write(
+    request: &mut Request,
+    state: &AppState,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     let body = match read_body_limited(request, MAX_WRITE_BODY_BYTES) {
         Ok(body) => body,
         Err(BodyReadError::TooLarge) => return HttpResponse::text(413, "Payload Too Large"),
@@ -2266,7 +2491,7 @@ fn api_write(request: &mut Request, state: &AppState, client_id: &str) -> HttpRe
     let write_kind = write_request.kind_name();
     let started = Instant::now();
     let result = match state.ipc_admission.run(IpcClass::Home, || {
-        state.thumbnail_client.write(client_id, write_request)
+        state.thumbnail_client.write(owner, write_request)
     }) {
         Ok(result) => result,
         Err(busy) => return write_admission_busy_response(busy, write_kind),
@@ -2292,7 +2517,11 @@ fn api_write(request: &mut Request, state: &AppState, client_id: &str) -> HttpRe
     }
 }
 
-fn api_thumb(state: &AppState, query: &[(String, String)], client_id: &str) -> HttpResponse {
+fn api_thumb(
+    state: &AppState,
+    query: &[(String, String)],
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     let address = match remote_address_from_query(query) {
         Ok(address) => address,
         Err(()) => return HttpResponse::text(400, "Bad Request"),
@@ -2309,7 +2538,7 @@ fn api_thumb(state: &AppState, query: &[(String, String)], client_id: &str) -> H
     let result = match state.ipc_admission.run(IpcClass::Heavy, || {
         state
             .thumbnail_client
-            .thumbnail_address(client_id, address.clone(), target_px)
+            .thumbnail_address(owner, address.clone(), target_px)
     }) {
         Ok(result) => result,
         Err(busy) => {
@@ -2348,7 +2577,11 @@ fn api_thumb(state: &AppState, query: &[(String, String)], client_id: &str) -> H
     }
 }
 
-fn api_page(state: &AppState, query: &[(String, String)], client_id: &str) -> HttpResponse {
+fn api_page(
+    state: &AppState,
+    query: &[(String, String)],
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     let remote_state_generation = match query_value(query, "generation") {
         Ok(Some(value))
             if (1..=128).contains(&value.len())
@@ -2420,7 +2653,7 @@ fn api_page(state: &AppState, query: &[(String, String)], client_id: &str) -> Ht
     let started = Instant::now();
     let result = match state.ipc_admission.run(ipc_class, || {
         state.thumbnail_client.page(
-            client_id,
+            owner,
             address.clone(),
             target_px,
             priority,
@@ -2456,6 +2689,8 @@ fn api_page(state: &AppState, query: &[(String, String)], client_id: &str) -> Ht
                 .with_header("X-mIV-Image-Width", payload.width.to_string())
                 .with_header("X-mIV-Image-Height", payload.height.to_string())
                 .with_header("X-mIV-Remote-State-Generation", remote_state_generation)
+                .with_header("X-mIV-Remote-Session", owner.session_id.clone())
+                .with_header("Vary", "X-mIV-Remote-Session")
                 .with_log_details(json!({
                     "page": {
                         "ipc_status": "ok",
@@ -3125,6 +3360,20 @@ fn remote_client_header(request: &Request) -> Option<&str> {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     })
+}
+
+fn remote_session_header(request: &Request) -> Option<&str> {
+    header_value(request, "X-mIV-Remote-Session")
+        .filter(|value| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn route_requires_remote_session(path: &str) -> bool {
+    (path.starts_with("/api/") || path.starts_with("/stream/"))
+        && !path.starts_with("/api/auth/")
+        && !matches!(
+            path,
+            "/api/session/acquire" | "/api/app-version" | "/api/telemetry"
+        )
 }
 
 fn request_is_https(request: &Request) -> bool {
@@ -3797,6 +4046,13 @@ mod tests {
                 .resolve(&start_request, start_auth),
             "browser-client-1234"
         );
+        let owner = RemoteSessionIdentity {
+            client_id: "browser-client-1234".to_owned(),
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        };
+        state
+            .remote_client_identities
+            .bind_session(start_auth, &owner);
 
         let stream_request: Request = TestRequest::new()
             .with_method(Method::Get)
@@ -3813,6 +4069,29 @@ mod tests {
                 .resolve(&stream_request, stream_auth),
             "browser-client-1234"
         );
+        assert_eq!(
+            state.remote_client_identities.resolve_session(
+                &stream_request,
+                stream_auth,
+                "browser-client-1234",
+            ),
+            Some(owner)
+        );
+    }
+
+    #[test]
+    fn authenticated_dynamic_request_without_acquisition_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let mut request: Request = TestRequest::new()
+            .with_method(Method::Get)
+            .with_path("/api/favorites")
+            .with_header(cookie_header(&state))
+            .into();
+        let response = route(&mut request, &state);
+        assert_eq!(response.status, 428);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["status"], "not_acquired");
     }
 
     #[test]
@@ -4166,7 +4445,7 @@ mod tests {
 
         let mut request: Request = TestRequest::new()
             .with_method(Method::Get)
-            .with_path("/api/favorites")
+            .with_path("/api/app-version")
             .with_header(cookie_header(&state))
             .into();
         let started = Instant::now();

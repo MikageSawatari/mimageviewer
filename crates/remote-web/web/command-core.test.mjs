@@ -32,6 +32,7 @@ import {
   nextSpreadMode,
   readingDirectionForSpreadMode,
   readingProgressBatchTransition,
+  remoteSessionAcquireDecision,
   remoteStateGenerationTransition,
   reduceViewerTransform,
   resolveGridReturnViewport,
@@ -166,14 +167,26 @@ test("adjustment reset visibility follows defaults, epsilon, and disabled state"
   assert.equal(adjustmentResetVisible({ value: 1.002, defaultValue: 1, epsilon: 0.001 }), true);
 });
 
-test("session owner badge keeps the two non-blocking ownership states explicit", () => {
+test("session acquisition policy separates passive detection from explicit recovery", () => {
+  assert.equal(remoteSessionAcquireDecision("active", "user_operation"), "use_current");
+  assert.equal(remoteSessionAcquireDecision("inactive", "initial"), "acquire");
+  assert.equal(remoteSessionAcquireDecision("not_acquired", "user_operation"), "acquire");
+  assert.equal(remoteSessionAcquireDecision("expired", "user_operation"), "acquire");
+  assert.equal(remoteSessionAcquireDecision("expired", "passive"), "blocked");
+  assert.equal(remoteSessionAcquireDecision("local_in_use", "user_operation"), "blocked");
+  assert.equal(remoteSessionAcquireDecision("other_device", "user_operation"), "blocked");
+  assert.equal(remoteSessionAcquireDecision("local_in_use", "explicit_reconnect"), "acquire");
+  assert.equal(remoteSessionAcquireDecision("other_device", "explicit_reconnect"), "acquire");
+});
+
+test("session owner badge keeps active and superseded ownership explicit", () => {
   assert.deepEqual(sessionOwnerBadge("active"), {
     owner: "active",
     label: "操作中",
   });
   assert.deepEqual(sessionOwnerBadge("other_device"), {
     owner: "other_device",
-    label: "別の端末が操作中 (操作すると取得します)",
+    label: "別の端末が操作中",
   });
   assert.deepEqual(sessionOwnerBadge("acquiring"), sessionOwnerBadge("active"));
 });

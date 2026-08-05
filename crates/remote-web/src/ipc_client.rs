@@ -14,10 +14,10 @@ use mimageviewer_ipc::{
     PageRequest, PageResponse, REMOTE_AI_START_ACCEPT_BUDGET, RemoteAddress,
     RemoteAiCancelResponse, RemoteAiJobError, RemoteAiJobSnapshot, RemoteAiRecoverableResponse,
     RemoteAiResultResponse, RemoteAiStartRequest, RemoteAiStartResponse, RemoteAiStateResponse,
-    RemotePageRenderContext, RemoteWebConnectionInfo, RemoteWriteError, RemoteWriteErrorCode,
-    RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult, RequestId, ServerMessage,
-    SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionResponse, SessionStatus,
-    ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse,
+    RemotePageRenderContext, RemoteSessionIdentity, RemoteWebConnectionInfo, RemoteWriteError,
+    RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult, RequestId,
+    ServerMessage, SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionResponse,
+    SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse,
     VIDEO_STREAM_START_BUDGET, VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode,
     VideoStreamJumpListPayload, VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind,
     VideoStreamPlaylistPayload, VideoStreamQuality, VideoStreamResult, VideoStreamSeekPayload,
@@ -343,24 +343,27 @@ impl ThumbnailClient {
 
     pub fn session_ping(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         user_active: bool,
         media_playing: bool,
     ) -> Result<SessionResponse, ClientFailure> {
         self.session_request(|id| ClientMessage::SessionPing {
             id,
             request: SessionPingRequest {
-                client_id: client_id.to_owned(),
+                owner: owner.clone(),
                 user_active,
                 media_playing,
             },
         })
     }
 
-    pub fn session_activity(&self, client_id: &str) -> Result<SessionResponse, ClientFailure> {
+    pub fn session_activity(
+        &self,
+        owner: &RemoteSessionIdentity,
+    ) -> Result<SessionResponse, ClientFailure> {
         self.session_request(|id| ClientMessage::SessionActivity {
             id,
-            client_id: client_id.to_owned(),
+            owner: owner.clone(),
         })
     }
 
@@ -390,7 +393,7 @@ impl ThumbnailClient {
 
     pub fn thumbnail_address(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         address: RemoteAddress,
         target_px: u32,
     ) -> Result<ThumbnailSuccess, ClientFailure> {
@@ -403,7 +406,7 @@ impl ThumbnailClient {
                 id,
                 ClientMessage::Thumbnail {
                     id,
-                    client_id: client_id.to_owned(),
+                    owner: owner.clone(),
                     request: request.clone(),
                 },
             ) {
@@ -449,10 +452,13 @@ impl ThumbnailClient {
         })
     }
 
-    pub fn home(&self, client_id: &str) -> Result<IpcSuccess<HomePayload>, ClientFailure> {
+    pub fn home(
+        &self,
+        owner: &RemoteSessionIdentity,
+    ) -> Result<IpcSuccess<HomePayload>, ClientFailure> {
         self.collection_request(|id| ClientMessage::Home {
             id,
-            client_id: client_id.to_owned(),
+            owner: owner.clone(),
             request: HomeRequest,
         })
         .and_then(|success| match success.value {
@@ -488,12 +494,12 @@ impl ThumbnailClient {
 
     pub fn collection(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         kind: CollectionKind,
     ) -> Result<IpcSuccess<CollectionPayload>, ClientFailure> {
         self.collection_request(|id| ClientMessage::Collection {
             id,
-            client_id: client_id.to_owned(),
+            owner: owner.clone(),
             request: CollectionRequest { kind: kind.clone() },
         })
         .and_then(|success| match success.value {
@@ -528,12 +534,12 @@ impl ThumbnailClient {
     }
     pub fn folder_list(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         address: RemoteAddress,
     ) -> Result<IpcSuccess<FolderListPayload>, ClientFailure> {
         self.collection_request(|id| ClientMessage::FolderList {
             id,
-            client_id: client_id.to_owned(),
+            owner: owner.clone(),
             request: FolderListRequest {
                 address: address.clone(),
             },
@@ -571,7 +577,7 @@ impl ThumbnailClient {
 
     pub fn container(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         address: RemoteAddress,
         spread_mode: Option<mimageviewer_ipc::RemoteSpreadMode>,
         reading_direction: Option<mimageviewer_ipc::RemoteReadingDirection>,
@@ -579,7 +585,7 @@ impl ThumbnailClient {
     ) -> Result<IpcSuccess<ContainerPayload>, ClientFailure> {
         self.collection_request(|id| ClientMessage::Container {
             id,
-            client_id: client_id.to_owned(),
+            owner: owner.clone(),
             request: ContainerRequest {
                 address: address.clone(),
                 spread_mode,
@@ -620,7 +626,7 @@ impl ThumbnailClient {
 
     pub fn page(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         address: RemoteAddress,
         target_px: u32,
         priority: PagePriority,
@@ -629,7 +635,7 @@ impl ThumbnailClient {
     ) -> Result<IpcSuccess<PagePayload>, ClientFailure> {
         self.collection_request(|id| ClientMessage::Page {
             id,
-            client_id: client_id.to_owned(),
+            owner: owner.clone(),
             request: PageRequest {
                 address: address.clone(),
                 target_px,
@@ -671,7 +677,7 @@ impl ThumbnailClient {
 
     pub fn remote_ai_start(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         request: RemoteAiStartRequest,
     ) -> Result<IpcSuccess<RemoteAiJobSnapshot>, ClientFailure> {
         let accept_before_unix_ms = SystemTime::now()
@@ -684,7 +690,7 @@ impl ThumbnailClient {
         self.remote_ai_request(
             |id| ClientMessage::RemoteAiStart {
                 id,
-                client_id: client_id.to_owned(),
+                owner: owner.clone(),
                 request: request.clone(),
                 accept_before_unix_ms,
             },
@@ -700,13 +706,13 @@ impl ThumbnailClient {
 
     pub fn remote_ai_state(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         job_id: &str,
     ) -> Result<IpcSuccess<RemoteAiJobSnapshot>, ClientFailure> {
         self.remote_ai_request(
             |id| ClientMessage::RemoteAiState {
                 id,
-                client_id: client_id.to_owned(),
+                owner: owner.clone(),
                 job_id: job_id.to_owned(),
             },
             |message| match message {
@@ -721,12 +727,12 @@ impl ThumbnailClient {
 
     pub fn remote_ai_recoverable(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
     ) -> Result<IpcSuccess<Vec<RemoteAiJobSnapshot>>, ClientFailure> {
         self.remote_ai_request(
             |id| ClientMessage::RemoteAiRecoverable {
                 id,
-                client_id: client_id.to_owned(),
+                owner: owner.clone(),
             },
             |message| match message {
                 ServerMessage::RemoteAiRecoverable { response, .. } => Some(match response {
@@ -740,13 +746,13 @@ impl ThumbnailClient {
 
     pub fn remote_ai_cancel(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         job_id: &str,
     ) -> Result<IpcSuccess<RemoteAiJobSnapshot>, ClientFailure> {
         self.remote_ai_request(
             |id| ClientMessage::RemoteAiCancel {
                 id,
-                client_id: client_id.to_owned(),
+                owner: owner.clone(),
                 job_id: job_id.to_owned(),
             },
             |message| match message {
@@ -761,14 +767,14 @@ impl ThumbnailClient {
 
     pub fn remote_ai_result(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         job_id: &str,
         page_index: u32,
     ) -> Result<IpcSuccess<PagePayload>, ClientFailure> {
         self.remote_ai_request(
             |id| ClientMessage::RemoteAiResult {
                 id,
-                client_id: client_id.to_owned(),
+                owner: owner.clone(),
                 job_id: job_id.to_owned(),
                 page_index,
             },
@@ -818,14 +824,14 @@ impl ThumbnailClient {
 
     pub fn video_stream_start(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         address: RemoteAddress,
         quality: VideoStreamQuality,
     ) -> Result<IpcSuccess<VideoStreamStartPayload>, ClientFailure> {
         self.video_request(
             |id| ClientMessage::VideoStreamStart {
                 id,
-                client_id: client_id.to_owned(),
+                owner: owner.clone(),
                 address: address.clone(),
                 quality,
             },
@@ -838,14 +844,14 @@ impl ThumbnailClient {
 
     pub fn video_stream_control(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         session: u64,
         action: VideoStreamControlAction,
     ) -> Result<IpcSuccess<SessionResponse>, ClientFailure> {
         self.video_request(
             |id| ClientMessage::VideoStreamControl {
                 id,
-                client_id: client_id.to_owned(),
+                owner: owner.clone(),
                 session,
                 action: action.clone(),
             },
@@ -858,14 +864,14 @@ impl ThumbnailClient {
 
     pub fn video_stream_seek(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         session: u64,
         position_secs: f64,
     ) -> Result<IpcSuccess<VideoStreamSeekPayload>, ClientFailure> {
         self.video_request(
             |id| ClientMessage::VideoStreamSeek {
                 id,
-                client_id: client_id.to_owned(),
+                owner: owner.clone(),
                 session,
                 position_secs,
             },
@@ -878,14 +884,14 @@ impl ThumbnailClient {
 
     pub fn video_stream_thumbnail(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         session: u64,
         position_secs: Option<f64>,
     ) -> Result<IpcSuccess<VideoStreamThumbnailPayload>, ClientFailure> {
         self.video_request(
             |id| ClientMessage::VideoStreamThumbnail {
                 id,
-                client_id: client_id.to_owned(),
+                owner: owner.clone(),
                 session,
                 position_secs,
             },
@@ -898,13 +904,13 @@ impl ThumbnailClient {
 
     pub fn video_stream_jump_list(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         session: u64,
     ) -> Result<IpcSuccess<VideoStreamJumpListPayload>, ClientFailure> {
         self.video_request(
             |id| ClientMessage::VideoStreamJumpList {
                 id,
-                client_id: client_id.to_owned(),
+                owner: owner.clone(),
                 session,
             },
             |message| match message {
@@ -916,14 +922,14 @@ impl ThumbnailClient {
 
     pub fn video_stream_jump_thumbnail(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         session: u64,
         token: &str,
     ) -> Result<IpcSuccess<VideoStreamJumpThumbnailPayload>, ClientFailure> {
         self.video_request(
             |id| ClientMessage::VideoStreamJumpThumbnail {
                 id,
-                client_id: client_id.to_owned(),
+                owner: owner.clone(),
                 session,
                 token: token.to_owned(),
             },
@@ -936,7 +942,7 @@ impl ThumbnailClient {
 
     pub fn video_stream_playlist(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         session: u64,
         generation: u64,
         kind: VideoStreamPlaylistKind,
@@ -944,7 +950,7 @@ impl ThumbnailClient {
         self.video_request(
             |id| ClientMessage::VideoStreamPlaylist {
                 id,
-                client_id: client_id.to_owned(),
+                owner: owner.clone(),
                 session,
                 generation,
                 kind,
@@ -958,7 +964,7 @@ impl ThumbnailClient {
 
     pub fn video_stream_segment(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         session: u64,
         generation: u64,
         index: VideoStreamSegmentIndex,
@@ -966,7 +972,7 @@ impl ThumbnailClient {
         self.video_request(
             |id| ClientMessage::VideoStreamSegment {
                 id,
-                client_id: client_id.to_owned(),
+                owner: owner.clone(),
                 session,
                 generation,
                 index,
@@ -980,13 +986,13 @@ impl ThumbnailClient {
 
     pub fn video_stream_state(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         session: u64,
     ) -> Result<IpcSuccess<VideoStreamStatePayload>, ClientFailure> {
         self.video_request(
             |id| ClientMessage::VideoStreamState {
                 id,
-                client_id: client_id.to_owned(),
+                owner: owner.clone(),
                 session,
             },
             |message| match message {
@@ -998,13 +1004,13 @@ impl ThumbnailClient {
 
     pub fn video_stream_stop(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         session: u64,
     ) -> Result<IpcSuccess<()>, ClientFailure> {
         self.video_request(
             |id| ClientMessage::VideoStreamStop {
                 id,
-                client_id: client_id.to_owned(),
+                owner: owner.clone(),
                 session,
             },
             |message| match message {
@@ -1051,7 +1057,7 @@ impl ThumbnailClient {
     /// 書き込みは適用済み応答を失った場合の重複実行を避けるため自動 retry しない。
     pub fn write(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         request: RemoteWriteRequest,
     ) -> Result<IpcSuccess<RemoteWriteResult>, ClientFailure> {
         let result = (|| {
@@ -1062,7 +1068,7 @@ impl ThumbnailClient {
                 id,
                 ClientMessage::Write {
                     id,
-                    client_id: client_id.to_owned(),
+                    owner: owner.clone(),
                     request,
                 },
             );
@@ -1805,6 +1811,13 @@ mod tests {
 
     use super::*;
 
+    fn test_owner() -> RemoteSessionIdentity {
+        RemoteSessionIdentity {
+            client_id: "client".to_owned(),
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        }
+    }
+
     #[test]
     fn maintainer_connects_after_server_start_and_reannounces_after_disconnect() {
         #[derive(Clone, Copy)]
@@ -1994,7 +2007,7 @@ mod tests {
     fn video_start_transport_timeout_outlives_the_core_start_budget() {
         let request = ClientMessage::VideoStreamStart {
             id: 1,
-            client_id: "client".to_owned(),
+            owner: test_owner(),
             address: RemoteAddress::file("00000000-0000-0000-0000-000000000000", "movie.mp4"),
             quality: VideoStreamQuality::Standard,
         };
@@ -2035,7 +2048,7 @@ mod tests {
     fn page_transport_timeout_allows_full_page_composition() {
         let request = ClientMessage::Page {
             id: 1,
-            client_id: "client".to_owned(),
+            owner: test_owner(),
             request: PageRequest {
                 address: RemoteAddress::file("00000000-0000-0000-0000-000000000000", "image.png"),
                 target_px: 2048,
@@ -2211,7 +2224,7 @@ mod tests {
         let first = std::thread::spawn(move || {
             first_client
                 .thumbnail_address(
-                    "test-client",
+                    &test_owner(),
                     RemoteAddress::file("00000000-0000-0000-0000-000000000000", "a.jpg"),
                     128,
                 )
@@ -2222,7 +2235,7 @@ mod tests {
         let second = std::thread::spawn(move || {
             second_client
                 .thumbnail_address(
-                    "test-client",
+                    &test_owner(),
                     RemoteAddress::file("00000000-0000-0000-0000-000000000000", "b.jpg"),
                     128,
                 )

@@ -1,10 +1,10 @@
 use mimageviewer_ipc::{
     RemoteAdjustmentReadOnlyState, RemoteAdjustmentScope, RemoteAdjustmentState,
     RemoteAiModelCatalog, RemoteAiModelOption, RemoteItemState, RemoteReadingDirection,
-    RemoteSpreadMode, RemoteSubresource, RemoteWebFeatureStatus, RemoteWriteError,
-    RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult,
-    SessionConnectionKind, SessionResponse, SessionStatus, VideoStreamControlAction,
-    VideoStreamEndBehavior, VideoStreamError, VideoStreamErrorCode,
+    RemoteSessionIdentity, RemoteSpreadMode, RemoteSubresource, RemoteWebFeatureStatus,
+    RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse,
+    RemoteWriteResult, SessionConnectionKind, SessionResponse, SessionStatus,
+    VideoStreamControlAction, VideoStreamEndBehavior, VideoStreamError, VideoStreamErrorCode,
 };
 use qrcode::{Color, QrCode};
 
@@ -95,7 +95,7 @@ enum AppRemoteVideoStreamState {
 
 struct AppRemoteVideoOpening {
     claimed: ClaimedVideoStreamUiRequest,
-    client_id: String,
+    owner: RemoteSessionIdentity,
     requested_path: std::path::PathBuf,
     quality: crate::video::stream::quality::QualityPreset,
     player: Option<Box<crate::video::VideoPlayer>>,
@@ -427,7 +427,7 @@ impl crate::app::App {
 
     fn create_remote_video_streaming(
         &mut self,
-        client_id: &str,
+        session_owner: &RemoteSessionIdentity,
         requested_path: &std::path::Path,
         quality: crate::video::stream::quality::QualityPreset,
         start_inputs: crate::video::RemoteStreamStartInputs,
@@ -442,7 +442,7 @@ impl crate::app::App {
             .handle
             .as_ref()
             .ok_or_else(|| "remote session service is unavailable".to_owned())?
-            .streaming_owner(client_id)
+            .streaming_owner(session_owner)
             .map_err(|response| response.message)?;
         let encoder = self.settings.remote_video_encoder.into();
         let segment_capacity = self.settings.remote_video_segment_window;
@@ -835,7 +835,7 @@ impl crate::app::App {
                     .take()
                     .expect("ready remote video opening must own a player");
                 let result = self.create_remote_video_streaming(
-                    &opening.client_id,
+                    &opening.owner,
                     &opening.requested_path,
                     opening.quality,
                     start_inputs,
@@ -1055,12 +1055,12 @@ impl crate::app::App {
         }
         let outcome = match request {
             VideoStreamUiRequest::Start {
-                client_id,
+                owner,
                 path,
                 quality,
                 budget,
             } => {
-                self.begin_remote_video_start(pending, client_id, path, quality.into(), budget);
+                self.begin_remote_video_start(pending, owner, path, quality.into(), budget);
                 return;
             }
             VideoStreamUiRequest::Control { session, action } => {
@@ -1082,7 +1082,7 @@ impl crate::app::App {
     fn begin_remote_video_start(
         &mut self,
         claimed: ClaimedVideoStreamUiRequest,
-        client_id: String,
+        owner: RemoteSessionIdentity,
         requested_path: std::path::PathBuf,
         quality: crate::video::stream::quality::QualityPreset,
         budget: VideoStreamStartBudget,
@@ -1104,7 +1104,7 @@ impl crate::app::App {
             .ok_or_else(|| "remote session service is unavailable".to_owned())
             .and_then(|handle| {
                 handle
-                    .streaming_owner(&client_id)
+                    .streaming_owner(&owner)
                     .map(|_| ())
                     .map_err(|response| response.message)
             });
@@ -1127,7 +1127,7 @@ impl crate::app::App {
         self.remote_session_ui.video_stream =
             Some(AppRemoteVideoStreamState::Opening(AppRemoteVideoOpening {
                 claimed,
-                client_id,
+                owner,
                 requested_path,
                 quality,
                 player,
@@ -1206,7 +1206,11 @@ impl crate::app::App {
         }
         self.remote_session_ui.video_stream = Some(AppRemoteVideoStreamState::Streaming(streaming));
         match result {
-            Ok(()) => VideoStreamUiOutcome::Controlled(SessionResponse::active()),
+            Ok(()) => VideoStreamUiOutcome::Controlled(SessionResponse {
+                status: SessionStatus::Active,
+                message: "remote session active".to_owned(),
+                session_id: None,
+            }),
             Err(error) => video_stream_ui_failure(error),
         }
     }

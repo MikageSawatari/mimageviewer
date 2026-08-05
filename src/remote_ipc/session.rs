@@ -5,11 +5,12 @@ use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimageviewer_ipc::{
-    RemoteWebConnectionInfo, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest,
-    RemoteWriteResponse, SessionAcquireRequest, SessionPeerInfo, SessionPingRequest,
-    SessionResponse, SessionStatus, VideoStreamControlAction, VideoStreamError,
+    RemoteSessionIdentity, RemoteWebConnectionInfo, RemoteWriteError, RemoteWriteErrorCode,
+    RemoteWriteRequest, RemoteWriteResponse, SessionAcquireRequest, SessionPeerInfo,
+    SessionPingRequest, SessionResponse, SessionStatus, VideoStreamControlAction, VideoStreamError,
     VideoStreamErrorCode, VideoStreamQuality,
 };
+use uuid::Uuid;
 
 use crate::video::stream::session::{
     StreamingGeneration, StreamingGenerationAccess, StreamingSessionId,
@@ -131,6 +132,7 @@ struct OperationState {
 #[derive(Clone, Debug)]
 struct ActiveSession {
     client_id: String,
+    session_id: String,
     peer: SessionPeerInfo,
     connected_unix_ms: u64,
     pub(crate) connected_at: Duration,
@@ -200,19 +202,6 @@ impl SessionStateMachine {
         connected_unix_ms: u64,
         request: SessionAcquireRequest,
     ) -> SessionResponse {
-        if let Some(active) = self.active.as_mut()
-            && active.client_id == request.client_id
-        {
-            if self.lifecycle.phase == RemoteControlPhase::DrainingRemote {
-                return session_closing_response();
-            }
-            active.last_ping = now;
-            active.last_activity = now;
-            active.presence = RemoteClientPresence::Foreground;
-            active.peer = request.peer;
-            return SessionResponse::active();
-        }
-
         if self.active.is_some() {
             self.begin_drain(ReleaseReason::Superseded);
             return session_closing_response();
@@ -232,6 +221,7 @@ impl SessionStateMachine {
         self.app_drain_complete = false;
         self.active = Some(ActiveSession {
             client_id: request.client_id,
+            session_id: new_session_id(),
             peer: request.peer,
             connected_unix_ms,
             connected_at: now,
@@ -245,7 +235,13 @@ impl SessionStateMachine {
             failed_count: 0,
             operations: BTreeMap::new(),
         });
-        SessionResponse::active()
+        SessionResponse::active(
+            self.active
+                .as_ref()
+                .expect("active session was just installed")
+                .session_id
+                .clone(),
+        )
     }
 
     fn finish_acquire(&mut self, generation: u64) -> bool {
@@ -259,32 +255,39 @@ impl SessionStateMachine {
 
     fn ping(&mut self, now: Duration, request: &SessionPingRequest) -> SessionResponse {
         self.expire(now);
-        let Some(active) = self.active.as_mut() else {
-            return self.inactive_response(&request.client_id);
+        let Some(active) = self.active.as_ref() else {
+            return self.inactive_response(&request.owner.client_id);
         };
-        if active.client_id != request.client_id {
+        if active.client_id != request.owner.client_id
+            || active.session_id != request.owner.session_id
+        {
             return status_response(
                 SessionStatus::Superseded,
-                "別の端末で使用中です。操作すると操作権を取得します。",
+                "この接続の操作権は無効です。再接続してください。",
             );
         }
         if self.lifecycle.phase == RemoteControlPhase::DrainingRemote {
-            return session_closing_response();
+            return self.draining_owner_response();
         }
+        let active = self
+            .active
+            .as_mut()
+            .expect("active session was just checked");
         active.last_ping = now;
         active.presence = RemoteClientPresence::Foreground;
         active.media_playing = request.media_playing;
         if request.user_active {
             active.last_activity = now;
         }
-        SessionResponse::active()
+        SessionResponse::active(active.session_id.clone())
     }
 
-    fn note_ai_client_seen(&mut self, now: Duration, client_id: &str) -> bool {
+    fn note_ai_client_seen(&mut self, now: Duration, owner: &RemoteSessionIdentity) -> bool {
         let Some(active) = self.active.as_mut() else {
             return false;
         };
-        if active.client_id != client_id
+        if active.client_id != owner.client_id
+            || active.session_id != owner.session_id
             || self.lifecycle.phase == RemoteControlPhase::DrainingRemote
         {
             return false;
@@ -298,22 +301,26 @@ impl SessionStateMachine {
     fn begin_operation(
         &mut self,
         now: Duration,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         description: String,
     ) -> Result<(u64, u64, Arc<AtomicBool>), SessionResponse> {
         self.expire(now);
-        if self.lifecycle.phase == RemoteControlPhase::DrainingRemote {
-            return Err(session_closing_response());
-        }
-        let Some(active) = self.active.as_mut() else {
-            return Err(self.inactive_response(client_id));
+        let Some(active) = self.active.as_ref() else {
+            return Err(self.inactive_response(&owner.client_id));
         };
-        if active.client_id != client_id {
+        if active.client_id != owner.client_id || active.session_id != owner.session_id {
             return Err(status_response(
                 SessionStatus::Superseded,
-                "別の端末で使用中です。操作すると操作権を取得します。",
+                "この接続の操作権は無効です。再接続してください。",
             ));
         }
+        if self.lifecycle.phase == RemoteControlPhase::DrainingRemote {
+            return Err(self.draining_owner_response());
+        }
+        let active = self
+            .active
+            .as_mut()
+            .expect("active session was just checked");
         active.last_ping = now;
         active.last_activity = now;
         active.presence = RemoteClientPresence::Foreground;
@@ -332,20 +339,28 @@ impl SessionStateMachine {
         Ok((self.generation, token, cancel))
     }
 
-    fn streaming_owner(&mut self, now: Duration, client_id: &str) -> Result<u64, SessionResponse> {
+    fn streaming_owner(
+        &mut self,
+        now: Duration,
+        owner: &RemoteSessionIdentity,
+    ) -> Result<u64, SessionResponse> {
         self.expire(now);
-        if !self.lifecycle.phase.accepts_remote_work() {
-            return Err(session_closing_response());
-        }
-        let Some(active) = self.active.as_mut() else {
-            return Err(self.inactive_response(client_id));
+        let Some(active) = self.active.as_ref() else {
+            return Err(self.inactive_response(&owner.client_id));
         };
-        if active.client_id != client_id {
+        if active.client_id != owner.client_id || active.session_id != owner.session_id {
             return Err(status_response(
                 SessionStatus::Superseded,
-                "別の端末で使用中です。操作すると操作権を取得します。",
+                "この接続の操作権は無効です。再接続してください。",
             ));
         }
+        if !self.lifecycle.phase.accepts_remote_work() {
+            return Err(self.draining_owner_response());
+        }
+        let active = self
+            .active
+            .as_mut()
+            .expect("active session was just checked");
         active.last_ping = now;
         active.last_activity = now;
         Ok(self.generation)
@@ -360,7 +375,7 @@ impl SessionStateMachine {
     ) -> Result<u64, SessionResponse> {
         self.expire(now);
         if !self.lifecycle.phase.accepts_remote_work() {
-            return Err(session_closing_response());
+            return Err(self.draining_owner_response());
         }
         let Some(active) = self.active.as_mut() else {
             return Err(self.inactive_response(client_id));
@@ -609,6 +624,11 @@ impl SessionStateMachine {
         )
     }
 
+    fn draining_owner_response(&self) -> SessionResponse {
+        let reason = self.drain_reason.unwrap_or(ReleaseReason::Local);
+        status_response(reason.status(), release_message(reason))
+    }
+
     fn snapshot(&self) -> SessionSnapshot {
         let active = self.active.as_ref().map(|active| ActiveSessionSnapshot {
             peer: active.peer.clone(),
@@ -656,7 +676,12 @@ fn status_response(status: SessionStatus, message: impl Into<String>) -> Session
     SessionResponse {
         status,
         message: message.into(),
+        session_id: None,
     }
+}
+
+fn new_session_id() -> String {
+    Uuid::new_v4().simple().to_string()
 }
 
 fn session_closing_response() -> SessionResponse {
@@ -668,13 +693,13 @@ fn session_closing_response() -> SessionResponse {
 
 fn release_message(reason: ReleaseReason) -> &'static str {
     match reason {
-        ReleaseReason::Local => "ローカルで使用中です。操作すると再接続します。",
+        ReleaseReason::Local => "本体で切断されました。再接続してください。",
         ReleaseReason::LivenessTimeout => "接続の生存確認が途絶えました。再接続してください。",
         ReleaseReason::IdleTimeout => "放置時間を超えたため切断されました。再接続してください。",
         ReleaseReason::BackgroundExpired => {
             "バックグラウンド保持時間を超えたため切断されました。再接続してください。"
         }
-        ReleaseReason::Superseded => "別の端末で使用中です。操作すると操作権を取得します。",
+        ReleaseReason::Superseded => "別の端末で使用中です。再接続してください。",
     }
 }
 
@@ -776,7 +801,7 @@ impl PublishedVideoStream {
 #[derive(Clone)]
 pub(crate) enum VideoStreamUiRequest {
     Start {
-        client_id: String,
+        owner: RemoteSessionIdentity,
         path: PathBuf,
         quality: VideoStreamQuality,
         budget: VideoStreamStartBudget,
@@ -801,12 +826,12 @@ pub(crate) enum VideoStreamUiRequest {
 impl VideoStreamUiRequest {
     #[cfg(test)]
     pub(crate) fn start_for_test(
-        client_id: String,
+        owner: RemoteSessionIdentity,
         path: PathBuf,
         quality: VideoStreamQuality,
     ) -> Self {
         Self::Start {
-            client_id,
+            owner,
             path,
             quality,
             budget: VideoStreamStartBudget::from_enqueued_at(Instant::now()),
@@ -1117,6 +1142,12 @@ impl ClaimedVideoStreamUiRequest {
     }
 
     pub(crate) fn complete(self, outcome: VideoStreamUiOutcome) {
+        let outcome = match outcome {
+            VideoStreamUiOutcome::Controlled(_) => {
+                VideoStreamUiOutcome::Controlled(self.operation.ownership_response())
+            }
+            outcome => outcome,
+        };
         let success = !matches!(outcome, VideoStreamUiOutcome::Error(_));
         self.operation.finish(success);
         let _ = self.reply.send(outcome);
@@ -1177,19 +1208,21 @@ impl SessionHandle {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
-        let (response, phase_changed, drain_reason) = {
+        let (response, phase_changed, generation_changed, drain_reason) = {
             let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             let phase = state.lifecycle.phase;
+            let generation = state.generation;
             let response = state.acquire(self.now(), connected_unix_ms, request);
             (
                 response,
                 state.lifecycle.phase != phase,
+                state.generation != generation,
                 (state.lifecycle.phase == RemoteControlPhase::DrainingRemote)
                     .then_some(state.drain_reason)
                     .flatten(),
             )
         };
-        if phase_changed {
+        if phase_changed || generation_changed {
             self.clear_video_stream(None);
             self.notify_phase_changed();
         }
@@ -1210,7 +1243,7 @@ impl SessionHandle {
         let (response, phase_changed) = {
             let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             if has_nonterminal_ai {
-                state.note_ai_client_seen(self.now(), &request.client_id);
+                state.note_ai_client_seen(self.now(), &request.owner);
             }
             let phase = state.lifecycle.phase;
             let response = state.ping(self.now(), request);
@@ -1226,7 +1259,7 @@ impl SessionHandle {
 
     pub(crate) fn begin_operation(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
         description: String,
     ) -> Result<SessionOperation, SessionResponse> {
         let has_nonterminal_ai = self
@@ -1235,10 +1268,10 @@ impl SessionHandle {
         let (result, phase_changed) = {
             let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             if has_nonterminal_ai {
-                state.note_ai_client_seen(self.now(), client_id);
+                state.note_ai_client_seen(self.now(), owner);
             }
             let phase = state.lifecycle.phase;
-            let result = state.begin_operation(self.now(), client_id, description);
+            let result = state.begin_operation(self.now(), owner, description);
             (result, state.lifecycle.phase != phase)
         };
         if phase_changed {
@@ -1251,7 +1284,7 @@ impl SessionHandle {
             handle: self.clone(),
             generation,
             token,
-            client_id: client_id.to_owned(),
+            owner: owner.clone(),
             cancel,
             finished: false,
         })
@@ -1288,17 +1321,17 @@ impl SessionHandle {
     /// IPC の start 要求は通常の client_id 検証後、この token だけを UI へ渡す。
     pub(crate) fn streaming_owner(
         &self,
-        client_id: &str,
+        owner: &RemoteSessionIdentity,
     ) -> Result<RemoteSessionOwner, SessionResponse> {
         let generation = self
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .streaming_owner(self.now(), client_id)?;
+            .streaming_owner(self.now(), owner)?;
         Ok(RemoteSessionOwner {
             handle: self.clone(),
             generation,
-            client_id: client_id.to_owned(),
+            client_id: owner.client_id.clone(),
         })
     }
 
@@ -1321,6 +1354,20 @@ impl SessionHandle {
             .rev()
             .find_map(|(_, info)| info.clone());
         snapshot
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_for_test(&self, client_id: &str) -> RemoteSessionIdentity {
+        let state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let active = state
+            .active
+            .as_ref()
+            .filter(|active| active.client_id == client_id)
+            .expect("test client owns the active remote session");
+        RemoteSessionIdentity {
+            client_id: active.client_id.clone(),
+            session_id: active.session_id.clone(),
+        }
     }
 
     pub(crate) fn install_ai_bridge(&self, bridge: RemoteAiExecutionBridge) {
@@ -1397,12 +1444,12 @@ impl SessionHandle {
         }
     }
 
-    pub(crate) fn note_ai_client_seen(&self, client_id: &str) {
+    pub(crate) fn note_ai_client_seen(&self, owner: &RemoteSessionIdentity) {
         let changed = self
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .note_ai_client_seen(self.now(), client_id);
+            .note_ai_client_seen(self.now(), owner);
         if changed {
             self.notify_ui();
         }
@@ -1863,7 +1910,7 @@ pub(crate) struct SessionOperation {
     handle: SessionHandle,
     generation: u64,
     token: u64,
-    client_id: String,
+    owner: RemoteSessionIdentity,
     cancel: Arc<AtomicBool>,
     finished: bool,
 }
@@ -1884,17 +1931,17 @@ impl SessionOperation {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
                 if state.generation != self.generation
-                    || !state
-                        .active
-                        .as_ref()
-                        .is_some_and(|active| active.client_id == self.client_id)
+                    || !state.active.as_ref().is_some_and(|active| {
+                        active.client_id == self.owner.client_id
+                            && active.session_id == self.owner.session_id
+                    })
                 {
-                    Some(Err(state.inactive_response(&self.client_id)))
+                    Some(Err(state.inactive_response(&self.owner.client_id)))
                 } else {
                     match state.lifecycle.phase {
                         RemoteControlPhase::RemoteActive => Some(Ok(())),
                         RemoteControlPhase::DrainingRemote | RemoteControlPhase::Local => {
-                            Some(Err(session_closing_response()))
+                            Some(Err(state.draining_owner_response()))
                         }
                         RemoteControlPhase::AcquiringRemote => None,
                     }
@@ -1947,21 +1994,24 @@ impl SessionOperation {
         match state.active.as_ref() {
             Some(active)
                 if state.generation == self.generation
-                    && active.client_id == self.client_id
+                    && active.client_id == self.owner.client_id
+                    && active.session_id == self.owner.session_id
                     && state.lifecycle.phase != RemoteControlPhase::DrainingRemote =>
             {
-                SessionResponse::active()
+                SessionResponse::active(active.session_id.clone())
             }
             Some(active)
-                if state.generation == self.generation && active.client_id == self.client_id =>
+                if state.generation == self.generation
+                    && active.client_id == self.owner.client_id
+                    && active.session_id == self.owner.session_id =>
             {
-                session_closing_response()
+                state.draining_owner_response()
             }
             Some(_) => status_response(
                 SessionStatus::Superseded,
                 "別のリモート接続が操作権を取得しました。",
             ),
-            None => state.inactive_response(&self.client_id),
+            None => state.inactive_response(&self.owner.client_id),
         }
     }
 }
@@ -2156,6 +2206,25 @@ mod tests {
         }
     }
 
+    fn state_owner(state: &SessionStateMachine, client_id: &str) -> RemoteSessionIdentity {
+        let active = state
+            .active
+            .as_ref()
+            .filter(|active| active.client_id == client_id)
+            .expect("test client owns the active session");
+        RemoteSessionIdentity {
+            client_id: active.client_id.clone(),
+            session_id: active.session_id.clone(),
+        }
+    }
+
+    fn missing_owner(client_id: &str) -> RemoteSessionIdentity {
+        RemoteSessionIdentity {
+            client_id: client_id.to_owned(),
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        }
+    }
+
     fn acquire(state: &mut SessionStateMachine, now: Duration) {
         assert_eq!(
             state
@@ -2276,7 +2345,8 @@ mod tests {
             Some(RemoteClientPresence::Detached { .. })
         ));
 
-        assert!(state.note_ai_client_seen(LIVENESS_TIMEOUT + Duration::from_secs(1), "client"));
+        let owner = state_owner(&state, "client");
+        assert!(state.note_ai_client_seen(LIVENESS_TIMEOUT + Duration::from_secs(1), &owner));
         assert!(matches!(
             state.active.as_ref().map(|active| active.presence),
             Some(RemoteClientPresence::Foreground)
@@ -2353,9 +2423,8 @@ mod tests {
             peer: peer(),
         });
         let generation = handle.snapshot().generation;
-        let operation = handle
-            .begin_operation("client", "queued".to_owned())
-            .unwrap();
+        let owner = handle.owner_for_test("client");
+        let operation = handle.begin_operation(&owner, "queued".to_owned()).unwrap();
         let (tx, rx) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             let result = operation.wait_until_active();
@@ -2376,11 +2445,22 @@ mod tests {
     fn liveness_timeout_releases_session() {
         let mut state = SessionStateMachine::default();
         acquire(&mut state, Duration::ZERO);
+        let owner = state_owner(&state, "client");
         assert_eq!(
-            state.expire(LIVENESS_TIMEOUT),
-            Some(ReleaseReason::LivenessTimeout)
+            state
+                .ping(
+                    LIVENESS_TIMEOUT,
+                    &SessionPingRequest {
+                        owner,
+                        user_active: false,
+                        media_playing: false,
+                    },
+                )
+                .status,
+            SessionStatus::Expired
         );
         assert_eq!(state.lifecycle.phase, RemoteControlPhase::DrainingRemote);
+        assert_eq!(state.drain_reason, Some(ReleaseReason::LivenessTimeout));
         assert!(state.active.is_some());
         assert!(state.complete_app_drain(state.generation));
         assert!(state.active.is_none());
@@ -2397,7 +2477,7 @@ mod tests {
             let response = state.ping(
                 now,
                 &SessionPingRequest {
-                    client_id: "client".to_owned(),
+                    owner: state_owner(&state, "client"),
                     user_active: false,
                     media_playing: true,
                 },
@@ -2408,7 +2488,7 @@ mod tests {
         state.ping(
             now,
             &SessionPingRequest {
-                client_id: "client".to_owned(),
+                owner: state_owner(&state, "client"),
                 user_active: false,
                 media_playing: false,
             },
@@ -2420,7 +2500,8 @@ mod tests {
         state: &mut SessionStateMachine,
         now: Duration,
     ) -> (u64, u64, Arc<AtomicBool>) {
-        let generation = state.streaming_owner(now, "client").unwrap();
+        let owner = state_owner(state, "client");
+        let generation = state.streaming_owner(now, &owner).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let registration = state
             .register_streaming(now, generation, "client", Arc::clone(&cancel))
@@ -2517,7 +2598,7 @@ mod tests {
                     .ping(
                         Duration::from_secs(seconds),
                         &SessionPingRequest {
-                            client_id: "client".to_owned(),
+                            owner: state_owner(&state, "client"),
                             user_active: false,
                             media_playing: false,
                         },
@@ -2526,8 +2607,9 @@ mod tests {
                 SessionStatus::Active
             );
         }
+        let owner = state_owner(&state, "client");
         let (generation, token, _cancel) = state
-            .begin_operation(now, "client", "一覧を取得中".to_owned())
+            .begin_operation(now, &owner, "一覧を取得中".to_owned())
             .unwrap();
         state.finish_operation(generation, token, true);
         assert_eq!(state.expire(now + Duration::from_secs(2)), None);
@@ -2538,18 +2620,20 @@ mod tests {
         let mut state = SessionStateMachine::default();
         acquire(&mut state, Duration::ZERO);
         state.local_disconnect();
+        let owner = state_owner(&state, "client");
         assert_eq!(
             state
-                .begin_operation(Duration::from_secs(1), "client", "test".to_owned())
+                .begin_operation(Duration::from_secs(1), &owner, "test".to_owned())
                 .unwrap_err()
                 .status,
             SessionStatus::LocalInUse
         );
         assert!(state.complete_app_drain(state.generation));
         acquire(&mut state, Duration::from_secs(2));
+        let owner = state_owner(&state, "client");
         assert!(
             state
-                .begin_operation(Duration::from_secs(3), "client", "test".to_owned())
+                .begin_operation(Duration::from_secs(3), &owner, "test".to_owned())
                 .is_ok()
         );
     }
@@ -2558,8 +2642,9 @@ mod tests {
     fn write_without_session_is_rejected_before_ui_queue() {
         for request in write_requests() {
             let handle = SessionHandle::new();
+            let owner = missing_owner("client");
             let response = match handle
-                .begin_operation("client", format!("{} を適用中", request.kind_name()))
+                .begin_operation(&owner, format!("{} を適用中", request.kind_name()))
             {
                 Ok(_) => panic!(
                     "{} unexpectedly acquired a missing session",
@@ -2588,8 +2673,9 @@ mod tests {
             });
             let worker_handle = handle.clone();
             let worker = std::thread::spawn(move || {
+                let owner = worker_handle.owner_for_test("client");
                 let operation = worker_handle
-                    .begin_operation("client", format!("{kind} を適用中"))
+                    .begin_operation(&owner, format!("{kind} を適用中"))
                     .unwrap();
                 worker_handle.submit_write(request, operation)
             });
@@ -2650,8 +2736,9 @@ mod tests {
             });
             let worker_handle = handle.clone();
             let worker = std::thread::spawn(move || {
+                let owner = worker_handle.owner_for_test("client");
                 let operation = worker_handle
-                    .begin_operation("client", format!("{kind} を適用中"))
+                    .begin_operation(&owner, format!("{kind} を適用中"))
                     .unwrap();
                 worker_handle.submit_write(request, operation)
             });
@@ -2686,8 +2773,9 @@ mod tests {
         });
         let worker_handle = handle.clone();
         let worker = std::thread::spawn(move || {
+            let owner = worker_handle.owner_for_test("client");
             let operation = worker_handle
-                .begin_operation("client", "見開き設定を書き込み中".to_owned())
+                .begin_operation(&owner, "見開き設定を書き込み中".to_owned())
                 .unwrap();
             worker_handle.submit_write(write_request(), operation)
         });
@@ -2716,8 +2804,9 @@ mod tests {
             client_id: "client".to_owned(),
             peer: peer(),
         });
+        let owner = handle.owner_for_test("client");
         let operation = handle
-            .begin_operation("client", "見開き設定を書き込み中".to_owned())
+            .begin_operation(&owner, "見開き設定を書き込み中".to_owned())
             .unwrap();
         let outcome =
             handle.submit_write_with_timeout(write_request(), operation, Duration::from_millis(10));
@@ -2739,7 +2828,8 @@ mod tests {
             peer: peer(),
         });
         let generation = handle.snapshot().generation;
-        let operation = handle.begin_operation("client", "test".to_owned()).unwrap();
+        let owner = handle.owner_for_test("client");
+        let operation = handle.begin_operation(&owner, "test".to_owned()).unwrap();
         let cancel = operation.cancel_flag();
         handle.local_disconnect();
         assert_eq!(handle.snapshot().phase, RemoteControlPhase::DrainingRemote);
@@ -2765,9 +2855,8 @@ mod tests {
             peer: peer(),
         });
         let generation = handle.snapshot().generation;
-        let old_operation = handle
-            .begin_operation("client-a", "old".to_owned())
-            .unwrap();
+        let owner_a = handle.owner_for_test("client-a");
+        let old_operation = handle.begin_operation(&owner_a, "old".to_owned()).unwrap();
         let takeover = handle.acquire(SessionAcquireRequest {
             client_id: "client-b".to_owned(),
             peer: peer(),
@@ -2775,11 +2864,11 @@ mod tests {
         assert_eq!(takeover.status, SessionStatus::LocalInUse);
         assert_eq!(
             old_operation.ownership_response().status,
-            SessionStatus::LocalInUse
+            SessionStatus::Superseded
         );
         assert!(
             handle
-                .begin_operation("client-b", "new".to_owned())
+                .begin_operation(&missing_owner("client-b"), "new".to_owned())
                 .is_err()
         );
         old_operation.finish(false);
@@ -2796,31 +2885,73 @@ mod tests {
     }
 
     #[test]
-    fn acquisition_sequence_changes_only_when_the_owner_changes() {
+    fn acquisition_sequence_changes_for_every_completed_acquisition() {
         let handle = SessionHandle::new();
         let request = |client_id: &str| SessionAcquireRequest {
             client_id: client_id.to_owned(),
             peer: peer(),
         };
         handle.acquire(request("client-a"));
+        assert!(handle.finish_acquire(handle.snapshot().generation));
         let first = handle.snapshot().acquisition_sequence;
-        handle.acquire(request("client-a"));
-        assert_eq!(handle.snapshot().acquisition_sequence, first);
-        handle.acquire(request("client-b"));
-        let draining = handle.snapshot();
-        assert_eq!(draining.acquisition_sequence, first);
-        assert!(handle.complete_app_drain(draining.generation));
-        handle.acquire(request("client-b"));
-        assert_eq!(handle.snapshot().acquisition_sequence, first + 1);
+        let first_session_id = handle.owner_for_test("client-a").session_id;
         assert_eq!(
+            handle.acquire(request("client-a")).status,
+            SessionStatus::LocalInUse
+        );
+        let draining = handle.snapshot();
+        assert_eq!(handle.snapshot().acquisition_sequence, first);
+        assert!(handle.complete_app_drain(draining.generation));
+        handle.acquire(request("client-a"));
+        assert_eq!(handle.snapshot().acquisition_sequence, first + 1);
+        assert_ne!(
+            handle.owner_for_test("client-a").session_id,
+            first_session_id,
+            "every successful acquisition rotates the lease identity"
+        );
+    }
+
+    #[test]
+    fn reacquiring_the_same_device_invalidates_its_previous_session_id() {
+        let handle = SessionHandle::new();
+        let request = SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        };
+        handle.acquire(request.clone());
+        assert!(handle.finish_acquire(handle.snapshot().generation));
+        let generation = handle.snapshot().generation;
+        let previous = handle.owner_for_test("client");
+        let operation = handle
+            .begin_operation(&previous, "old request".to_owned())
+            .unwrap();
+        let cancel = operation.cancel_flag();
+
+        assert_eq!(
+            handle.acquire(request.clone()).status,
+            SessionStatus::LocalInUse
+        );
+        assert!(cancel.load(Ordering::Acquire));
+        operation.finish(false);
+        assert!(handle.complete_app_drain(generation));
+
+        let response = handle.acquire(request);
+        let current = handle.owner_for_test("client");
+        assert_eq!(
+            response.session_id.as_deref(),
+            Some(current.session_id.as_str())
+        );
+        assert_ne!(previous.session_id, current.session_id);
+        let stale = match handle.begin_operation(&previous, "stale request".to_owned()) {
+            Ok(_) => panic!("the previous session id remained valid"),
+            Err(response) => response,
+        };
+        assert_eq!(stale.status, SessionStatus::Superseded);
+        assert!(handle.finish_acquire(handle.snapshot().generation));
+        assert!(
             handle
-                .ping(&SessionPingRequest {
-                    client_id: "client-a".to_owned(),
-                    user_active: true,
-                    media_playing: false,
-                })
-                .status,
-            SessionStatus::Superseded
+                .begin_operation(&current, "current request".to_owned())
+                .is_ok()
         );
     }
 

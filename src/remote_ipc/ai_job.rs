@@ -887,8 +887,9 @@ mod tests {
         registry: &Arc<RemoteAiJobRegistry>,
         request: RemoteAiStartRequest,
     ) -> RemoteAiJobSnapshot {
+        let owner = session.owner_for_test("client");
         let operation = session
-            .begin_operation("client", "remote AI test".to_owned())
+            .begin_operation(&owner, "remote AI test".to_owned())
             .unwrap();
         match registry.start("client".to_owned(), request, u64::MAX, operation) {
             RemoteAiStartResponse::Accepted(snapshot) => snapshot,
@@ -1140,8 +1141,9 @@ mod tests {
     #[test]
     fn expired_start_is_rejected_before_registry_insert_or_executor_dispatch() {
         let (session, registry, calls) = fixture();
+        let owner = session.owner_for_test("client");
         let operation = session
-            .begin_operation("client", "expired remote AI test".to_owned())
+            .begin_operation(&owner, "expired remote AI test".to_owned())
             .unwrap();
         assert!(matches!(
             registry.start("client".to_owned(), request("expired"), 0, operation),

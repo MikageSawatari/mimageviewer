@@ -52,11 +52,27 @@ body {
   color: #fff;
   box-shadow: 0 4px 20px #0008;
   text-align: center;
-  pointer-events: none;
+  pointer-events: auto;
 }
 
 .remote-session-status[data-status="acquiring"] {
   border-color: #d6a94c;
+  pointer-events: none;
+}
+
+.remote-session-reconnect {
+  margin-left: 12px;
+  padding: 6px 12px;
+  border: 1px solid rgb(124 196 255 / 60%);
+  border-radius: 8px;
+  background: #243c55;
+  color: #fff;
+  cursor: pointer;
+}
+
+.remote-session-reconnect:disabled {
+  cursor: wait;
+  opacity: 0.6;
 }
 
 #remote-session-owner-badge {

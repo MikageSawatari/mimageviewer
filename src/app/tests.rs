@@ -1312,12 +1312,13 @@ fn remote_video_opening_accepts_paused_metadata_player_with_clock_seek_pending()
     let request_handle = handle.clone();
     let request_path = video.clone();
     let request_thread = std::thread::spawn(move || {
+        let owner = request_handle.owner_for_test("phone");
         let operation = request_handle
-            .begin_operation("phone", "Starting remote video stream".to_owned())
+            .begin_operation(&owner, "Starting remote video stream".to_owned())
             .unwrap();
         request_handle.submit_video_stream(
             crate::remote_ipc::session::VideoStreamUiRequest::start_for_test(
-                "phone".to_owned(),
+                owner,
                 request_path,
                 mimageviewer_ipc::VideoStreamQuality::Standard,
             ),
@@ -1454,12 +1455,13 @@ fn remote_video_stream_keeps_remote_dialog_without_entering_fullscreen() {
     let request_handle = handle.clone();
     let request_path = video.clone();
     let request_thread = std::thread::spawn(move || {
+        let owner = request_handle.owner_for_test("phone");
         let operation = request_handle
-            .begin_operation("phone", "動画ストリーミングを開始中".to_owned())
+            .begin_operation(&owner, "動画ストリーミングを開始中".to_owned())
             .unwrap();
         request_handle.submit_video_stream(
             crate::remote_ipc::session::VideoStreamUiRequest::start_for_test(
-                "phone".to_owned(),
+                owner,
                 request_path,
                 mimageviewer_ipc::VideoStreamQuality::Standard,
             ),
@@ -1575,8 +1577,9 @@ fn remote_video_stream_keeps_remote_dialog_without_entering_fullscreen() {
 
     let unknown_stop_handle = handle.clone();
     let unknown_stop = std::thread::spawn(move || {
+        let owner = unknown_stop_handle.owner_for_test("phone");
         let operation = unknown_stop_handle
-            .begin_operation("phone", "動画ストリーミングを停止中".to_owned())
+            .begin_operation(&owner, "動画ストリーミングを停止中".to_owned())
             .unwrap();
         unknown_stop_handle.submit_video_stream(
             crate::remote_ipc::session::VideoStreamUiRequest::Stop {
@@ -1599,8 +1602,9 @@ fn remote_video_stream_keeps_remote_dialog_without_entering_fullscreen() {
     for _ in 0..2 {
         let stop_handle = handle.clone();
         let stop = std::thread::spawn(move || {
+            let owner = stop_handle.owner_for_test("phone");
             let operation = stop_handle
-                .begin_operation("phone", "動画ストリーミングを停止中".to_owned())
+                .begin_operation(&owner, "動画ストリーミングを停止中".to_owned())
                 .unwrap();
             stop_handle.submit_video_stream(
                 crate::remote_ipc::session::VideoStreamUiRequest::Stop { session },
