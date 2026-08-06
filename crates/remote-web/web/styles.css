@@ -43,6 +43,11 @@ body {
   right: max(12px, env(safe-area-inset-right));
   bottom: max(12px, env(safe-area-inset-bottom));
   left: max(12px, env(safe-area-inset-left));
+  pointer-events: none;
+  text-align: center;
+}
+
+.remote-session-status-card {
   max-width: 34rem;
   margin-inline: auto;
   padding: 10px 14px;
@@ -51,12 +56,32 @@ body {
   background: color-mix(in srgb, #111 88%, transparent);
   color: #fff;
   box-shadow: 0 4px 20px #0008;
-  text-align: center;
   pointer-events: auto;
 }
 
-.remote-session-status[data-status="acquiring"] {
+.remote-session-status.is-modal {
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding:
+    max(18px, env(safe-area-inset-top))
+    max(18px, env(safe-area-inset-right))
+    max(18px, env(safe-area-inset-bottom))
+    max(18px, env(safe-area-inset-left));
+  background: rgb(0 0 0 / 68%);
+  pointer-events: auto;
+  backdrop-filter: blur(4px);
+}
+
+.remote-session-status.is-modal .remote-session-status-card {
+  width: min(100%, 34rem);
+}
+
+.remote-session-status[data-status="acquiring"] .remote-session-status-card {
   border-color: #d6a94c;
+}
+
+.remote-session-status[data-status="acquiring"]:not(.is-modal) .remote-session-status-card {
   pointer-events: none;
 }
 

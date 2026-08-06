@@ -33,6 +33,8 @@ import {
   readingDirectionForSpreadMode,
   readingProgressBatchTransition,
   remoteSessionAcquireDecision,
+  remoteSessionControlTransition,
+  remoteSessionFailureStatus,
   remoteStateGenerationTransition,
   reduceViewerTransform,
   resolveGridReturnViewport,
@@ -177,6 +179,96 @@ test("session acquisition policy separates passive detection from explicit recov
   assert.equal(remoteSessionAcquireDecision("other_device", "user_operation"), "blocked");
   assert.equal(remoteSessionAcquireDecision("local_in_use", "explicit_reconnect"), "acquire");
   assert.equal(remoteSessionAcquireDecision("other_device", "explicit_reconnect"), "acquire");
+});
+
+test("session control blocks only explicit ownership revocation", () => {
+  const active = remoteSessionControlTransition(null, "active", "");
+  const localDisconnect = remoteSessionControlTransition(
+    active,
+    "local_in_use",
+    "本体が操作を取り戻しました。"
+  );
+  assert.deepEqual(localDisconnect, {
+    status: "local_in_use",
+    message: "本体が操作を取り戻しました。",
+    phase: "disconnected",
+    blocksInteraction: true,
+    disconnectReason: "local_in_use",
+  });
+  assert.equal(
+    remoteSessionControlTransition(active, "other_device", "").blocksInteraction,
+    true
+  );
+  assert.equal(
+    remoteSessionControlTransition(active, "expired", "").blocksInteraction,
+    false
+  );
+  assert.equal(
+    remoteSessionControlTransition(active, "not_acquired", "").blocksInteraction,
+    false
+  );
+  assert.equal(
+    remoteSessionControlTransition(active, "unavailable", "").blocksInteraction,
+    false
+  );
+});
+
+test("session failure detection ignores feature-level 409 responses", () => {
+  assert.equal(remoteSessionFailureStatus({
+    sessionStatus: "superseded",
+    httpStatus: 409,
+  }), "other_device");
+  assert.equal(remoteSessionFailureStatus({
+    errorCode: "session_required",
+    httpStatus: 409,
+  }), "local_in_use");
+  assert.equal(remoteSessionFailureStatus({
+    errorCode: "session_required",
+    httpStatus: 428,
+  }), "expired");
+  assert.equal(remoteSessionFailureStatus({
+    errorCode: "stream_session_mismatch",
+    httpStatus: 409,
+  }), null);
+  assert.equal(remoteSessionFailureStatus({
+    errorCode: "not_ready",
+    httpStatus: 409,
+  }), null);
+  assert.equal(remoteSessionFailureStatus({
+    errorCode: "session_closing",
+    httpStatus: 409,
+  }), null);
+});
+
+test("session control remains modal through reconnect until acquisition succeeds", () => {
+  const disconnected = remoteSessionControlTransition(
+    null,
+    "other_device",
+    "別の端末が接続しました。"
+  );
+  const reconnecting = remoteSessionControlTransition(
+    disconnected,
+    "acquiring",
+    "操作権を取得しています…"
+  );
+  assert.deepEqual(reconnecting, {
+    status: "acquiring",
+    message: "操作権を取得しています…",
+    phase: "reconnecting",
+    blocksInteraction: true,
+    disconnectReason: "other_device",
+  });
+  const failed = remoteSessionControlTransition(
+    reconnecting,
+    "unavailable",
+    "通信できません。"
+  );
+  assert.equal(failed.blocksInteraction, true);
+  assert.equal(failed.disconnectReason, "other_device");
+  assert.equal(
+    remoteSessionControlTransition(failed, "active", "").blocksInteraction,
+    false
+  );
 });
 
 test("session owner badge keeps active and superseded ownership explicit", () => {

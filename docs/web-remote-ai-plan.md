@@ -224,6 +224,13 @@ active 中の command は取得 POST を繰り返さず、既存の `session_id`
 自動再取得せず、Web UI の明示的な再接続だけを許す。`NotAcquired` は初回接続で、`Expired` は
 次の明示的な利用者操作で自動取得できる。background 復帰そのものは取得理由にしない。
 
+Web 側の切断表示と操作可否は、共通 HTTP 境界が更新する一つの typed control state を正本にする。
+LocalInUse / Superseded だけが modal で操作を塞ぎ、再接続の acquiring とその通信失敗中も
+取得成功まで modal を維持する。Expired / NotAcquired と単なる通信失敗は recoverable の
+ままで、放置復帰を modal にしない。動画・remote AI などの subsystem は HTTP status を再解釈せず、
+この control state を購読する。blocked への遷移で動画は HLS と state poll を同期的に停止し、
+再接続成功後は切断直前の再生位置と play intent から新しい stream session を開始する。
+
 ### 4.4 drain が長いとき
 
 PC の modal は閉じず、見出しを「リモート接続を終了しています」に変え、次を表示する。

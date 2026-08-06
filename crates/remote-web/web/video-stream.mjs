@@ -1223,6 +1223,7 @@ export class VideoStreamViewer {
     inputSource,
     apiJson,
     apiPostJson,
+    subscribeRemoteSessionState = () => () => {},
     reportPlaybackIssue = () => {},
     keyboardAvailable = true,
     getPanelTab = () => "functions",
@@ -1271,6 +1272,9 @@ export class VideoStreamViewer {
     this.endBehavior = { kind: "stop" };
     this.endPositionSample = null;
     this.endTransitionPending = false;
+    this.remoteSessionState = { blocksInteraction: false };
+    this.remoteSessionResume = null;
+    this.unsubscribeRemoteSessionState = () => {};
 
     this.root = element("section", "image-viewer video-stream-viewer");
     this.stage = element("div", "viewer-stage video-stream-stage");
@@ -1413,7 +1417,12 @@ export class VideoStreamViewer {
     this.onWaiting = () => this.beginWaiting();
     this.onEnded = () => this.handlePlaybackBoundary(true);
     this.onNativeError = () => {
-      if (!this.destroyed && !this.hls && !this.generationSwitch.isSwitching()) {
+      if (
+        !this.destroyed &&
+        !this.remoteSessionState.blocksInteraction &&
+        !this.hls &&
+        !this.generationSwitch.isSwitching()
+      ) {
         const startup = this.startupWatch;
         this.clearPlaybackStartupWatch();
         this.recordPlaybackIssue(
@@ -1458,6 +1467,33 @@ export class VideoStreamViewer {
     this.stage.addEventListener("gesturechange", this.nativeGesture, { passive: false });
     this.stage.addEventListener("gestureend", this.nativeGesture, { passive: false });
     this.stage.addEventListener("dblclick", this.nativeGesture);
+    this.unsubscribeRemoteSessionState = subscribeRemoteSessionState(
+      (snapshot) => this.applyRemoteSessionState(snapshot)
+    );
+  }
+
+  applyRemoteSessionState(snapshot) {
+    const wasBlocked = this.remoteSessionState.blocksInteraction;
+    this.remoteSessionState = snapshot ?? { blocksInteraction: false };
+    if (!this.remoteSessionState.blocksInteraction || this.destroyed) return;
+    if (wasBlocked) return;
+    this.remoteSessionResume = {
+      positionSecs: this.currentPosition(),
+      restorePlaying: this.playRequested,
+    };
+    this.clearPoll();
+    this.generationSwitch.cancel();
+    this.seekThumbnailAbort?.abort();
+    this.clearWaiting();
+    this.stopPlaylistPlayback();
+  }
+
+  async resumeAfterRemoteSessionReconnect() {
+    const resume = this.remoteSessionResume;
+    if (!resume || this.destroyed || this.remoteSessionState.blocksInteraction) return false;
+    this.remoteSessionResume = null;
+    await this.restartAt(resume.positionSecs, resume.restorePlaying);
+    return true;
   }
 
   menuState() {
@@ -1965,7 +2001,12 @@ export class VideoStreamViewer {
   }
 
   async playIfRequested() {
-    if (!this.playRequested || this.destroyed || !this.video.src && !this.hls) return;
+    if (
+      !this.playRequested ||
+      this.destroyed ||
+      this.remoteSessionState.blocksInteraction ||
+      !this.video.src && !this.hls
+    ) return;
     try {
       await this.video.play();
       if (["autoplay", "waiting"].includes(this.noticeKind)) this.hideNotice();
@@ -2324,11 +2365,15 @@ export class VideoStreamViewer {
 
   schedulePoll(delayMs = VIDEO_STATE_POLL_MS) {
     this.clearPoll();
-    if (this.destroyed || !this.session) return;
+    if (this.destroyed || this.remoteSessionState.blocksInteraction || !this.session) return;
     this.pollTimer = setTimeout(() => {
       this.pollTimer = 0;
       this.pollState().catch((error) => {
-        if (error?.name !== "AbortError" && !this.destroyed) {
+        if (
+          error?.name !== "AbortError" &&
+          !this.destroyed &&
+          !this.remoteSessionState.blocksInteraction
+        ) {
           this.showOperationalError(error, "動画の状態を確認できませんでした");
           this.schedulePoll();
         }
@@ -2391,7 +2436,7 @@ export class VideoStreamViewer {
   }
 
   async handleVisibilityResume() {
-    if (!this.session || this.destroyed) return;
+    if (!this.session || this.destroyed || this.remoteSessionState.blocksInteraction) return;
     const position = this.currentPosition();
     const restorePlaying = this.playRequested;
     try {
@@ -2438,10 +2483,9 @@ export class VideoStreamViewer {
     }
   }
 
-  async restartAt(positionSecs) {
+  async restartAt(positionSecs, restorePlaying = this.playRequested) {
     if (this.restarting || this.destroyed) return;
     this.restarting = true;
-    const restorePlaying = this.playRequested;
     const oldSession = this.session;
     this.clearPoll();
     this.generationSwitch.cancel();
@@ -2623,6 +2667,7 @@ export class VideoStreamViewer {
   }
 
   showStartFailure(error) {
+    if (this.remoteSessionState.blocksInteraction) return;
     const preset = videoQualityPreset(this.quality);
     this.diagnostics.textContent = `画質 ${preset.label} (${preset.traffic})`;
     this.showNotice(
@@ -2637,7 +2682,11 @@ export class VideoStreamViewer {
   }
 
   showOperationalError(error, prefix) {
-    if (error?.name === "AbortError" || this.destroyed) return;
+    if (
+      error?.name === "AbortError" ||
+      this.destroyed ||
+      this.remoteSessionState.blocksInteraction
+    ) return;
     this.showNotice(videoUserErrorMessage(error, prefix), "error");
   }
 
@@ -2749,6 +2798,7 @@ export class VideoStreamViewer {
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.unsubscribeRemoteSessionState();
     this.abortController.abort();
     this.seekThumbnailAbort?.abort();
     this.seekThumbnailAbort = null;

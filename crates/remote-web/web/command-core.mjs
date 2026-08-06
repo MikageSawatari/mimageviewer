@@ -83,6 +83,74 @@ export function remoteSessionAcquireDecision(status, trigger) {
   return "blocked";
 }
 
+export function remoteSessionControlTransition(current, status, message = "") {
+  const previous = current ?? {
+    status: "inactive",
+    message: "",
+    phase: "inactive",
+    blocksInteraction: false,
+    disconnectReason: null,
+  };
+  const nextStatus = String(status || "unavailable");
+  const nextMessage = String(message || "");
+
+  if (nextStatus === "active" || nextStatus === "inactive") {
+    return {
+      status: nextStatus,
+      message: nextMessage,
+      phase: nextStatus,
+      blocksInteraction: false,
+      disconnectReason: null,
+    };
+  }
+
+  if (nextStatus === "local_in_use" || nextStatus === "other_device") {
+    return {
+      status: nextStatus,
+      message: nextMessage,
+      phase: "disconnected",
+      blocksInteraction: true,
+      disconnectReason: nextStatus,
+    };
+  }
+
+  // Once the server has explicitly revoked ownership, only a successful acquire
+  // may expose the application again. In particular, a reconnect attempt and a
+  // transient failure during that attempt must keep the existing modal boundary.
+  if (previous.blocksInteraction) {
+    return {
+      status: nextStatus,
+      message: nextMessage,
+      phase: nextStatus === "acquiring" ? "reconnecting" : "disconnected",
+      blocksInteraction: true,
+      disconnectReason: previous.disconnectReason,
+    };
+  }
+
+  return {
+    status: nextStatus,
+    message: nextMessage,
+    phase: "recoverable",
+    blocksInteraction: false,
+    disconnectReason: null,
+  };
+}
+
+export function remoteSessionFailureStatus({
+  sessionStatus,
+  httpStatus,
+  errorCode,
+} = {}) {
+  if (sessionStatus === "superseded") return "other_device";
+  if (sessionStatus === "local_in_use") return "local_in_use";
+  if (sessionStatus === "expired") return "expired";
+  if (sessionStatus === "not_acquired") return "not_acquired";
+  if (errorCode !== "session_required") return null;
+  if (Number(httpStatus) === 409) return "local_in_use";
+  if (Number(httpStatus) === 428) return "expired";
+  return null;
+}
+
 export function remoteStateGenerationTransition(current, observed) {
   const previous = String(current ?? "");
   const generation = String(observed ?? "");

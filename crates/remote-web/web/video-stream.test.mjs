@@ -5,6 +5,7 @@ import {
   VideoGenerationSwitchOwner,
   VIDEO_PANEL_TABS,
   VideoSeekPreviewOwner,
+  VideoStreamViewer,
   hlsBufferConfig,
   preventVideoNativeZoom,
   resolveVideoPlaylist,
@@ -12,6 +13,65 @@ import {
   videoEndDecision,
   videoUserErrorMessage,
 } from "./video-stream.mjs";
+
+test("blocked remote session stops playback once and prevents another poll", () => {
+  const calls = [];
+  const viewer = {
+    remoteSessionState: { blocksInteraction: false },
+    remoteSessionResume: null,
+    destroyed: false,
+    playRequested: true,
+    currentPosition: () => 42.5,
+    clearPoll: () => calls.push("clear_poll"),
+    generationSwitch: { cancel: () => calls.push("cancel_switch") },
+    seekThumbnailAbort: { abort: () => calls.push("abort_thumbnail") },
+    clearWaiting: () => calls.push("clear_waiting"),
+    stopPlaylistPlayback: () => calls.push("stop_playback"),
+  };
+  VideoStreamViewer.prototype.applyRemoteSessionState.call(viewer, {
+    blocksInteraction: true,
+  });
+  assert.deepEqual(viewer.remoteSessionResume, {
+    positionSecs: 42.5,
+    restorePlaying: true,
+  });
+  assert.deepEqual(calls, [
+    "clear_poll",
+    "cancel_switch",
+    "abort_thumbnail",
+    "clear_waiting",
+    "stop_playback",
+  ]);
+  VideoStreamViewer.prototype.applyRemoteSessionState.call(viewer, {
+    blocksInteraction: true,
+  });
+  assert.equal(calls.length, 5);
+
+  let cleared = false;
+  VideoStreamViewer.prototype.schedulePoll.call({
+    clearPoll: () => { cleared = true; },
+    destroyed: false,
+    remoteSessionState: { blocksInteraction: true },
+    session: 7,
+  });
+  assert.equal(cleared, true);
+});
+
+test("video reconnect resumes the captured position and play intent", async () => {
+  const restarted = [];
+  const viewer = {
+    remoteSessionResume: { positionSecs: 42.5, restorePlaying: false },
+    remoteSessionState: { blocksInteraction: false },
+    destroyed: false,
+    restartAt: async (...args) => restarted.push(args),
+  };
+  assert.equal(
+    await VideoStreamViewer.prototype.resumeAfterRemoteSessionReconnect.call(viewer),
+    true
+  );
+  assert.deepEqual(restarted, [[42.5, false]]);
+  assert.equal(viewer.remoteSessionResume, null);
+});
 
 test("stage 4 video panel exposes functions and jump tabs in that order", () => {
   assert.deepEqual(VIDEO_PANEL_TABS, [

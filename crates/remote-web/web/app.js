@@ -31,6 +31,8 @@ import {
   remoteStateGenerationTransition,
   readingProgressBatchTransition,
   remoteSessionAcquireDecision,
+  remoteSessionControlTransition,
+  remoteSessionFailureStatus,
   rangeValueFromNormalized,
   rangeValueToNormalized,
   relativeRangeDragValue,
@@ -352,6 +354,33 @@ const hudState = {
   errors: [],
 };
 
+class RemoteSessionControlOwner {
+  constructor() {
+    this.snapshot = remoteSessionControlTransition(null, "inactive", "");
+    this.listeners = new Set();
+  }
+
+  transition(status, message) {
+    this.snapshot = remoteSessionControlTransition(this.snapshot, status, message);
+    for (const listener of this.listeners) {
+      try {
+        listener(this.snapshot);
+      } catch {}
+    }
+    return this.snapshot;
+  }
+
+  subscribe(listener) {
+    this.listeners.add(listener);
+    try {
+      listener(this.snapshot);
+    } catch {}
+    return () => this.listeners.delete(listener);
+  }
+}
+
+const remoteSessionControlOwner = new RemoteSessionControlOwner();
+
 const state = {
   authenticated: false,
   favorites: [],
@@ -402,9 +431,7 @@ const state = {
   screenContext: "loading",
   gridIndex: 0,
   authCountdownTimer: 0,
-  remoteSessionStatus: "inactive",
   remoteSessionOwner: null,
-  remoteSessionMessage: "",
   remoteSessionAcquirePromise: null,
   remoteSessionId: "",
   remoteSessionCacheEpoch: "",
@@ -429,7 +456,7 @@ if (!RUNTIME_TEST_MODE) {
   }
   updateKeyboardAvailability();
   window.addEventListener("popstate", () => {
-    if (state.remoteSessionStatus === "active") {
+    if (remoteSessionControlOwner.snapshot.status === "active") {
       dispatchRoute().catch(() => {});
     }
   });
@@ -456,7 +483,7 @@ if (!RUNTIME_TEST_MODE) {
       state.remoteSessionUserActive = false;
       state.remoteAiController?.suspend();
     } else if (state.authenticated) {
-      if (state.remoteSessionStatus !== "active") return;
+      if (remoteSessionControlOwner.snapshot.status !== "active") return;
       if (state.viewer?.isVideoStreamViewer) {
         state.viewer.handleVisibilityResume().catch(() => {});
       } else {
@@ -514,11 +541,12 @@ async function enterAuthenticatedApp() {
 }
 
 async function acquireRemoteSession(reason = "operation", trigger = "user_operation") {
-  const decision = remoteSessionAcquireDecision(state.remoteSessionStatus, trigger);
+  const sessionControl = remoteSessionControlOwner.snapshot;
+  const decision = remoteSessionAcquireDecision(sessionControl.status, trigger);
   if (decision === "use_current" && state.remoteSessionId) return true;
   if (decision === "blocked") {
     throw new RemoteSessionBlockedError(
-      state.remoteSessionMessage || "再接続するまでリモート操作は停止しています。"
+      sessionControl.message || "再接続するまでリモート操作は停止しています。"
     );
   }
   if (state.remoteSessionAcquirePromise) return state.remoteSessionAcquirePromise;
@@ -675,7 +703,7 @@ function startSessionPing() {
 async function pingRemoteSession() {
   if (
     !state.authenticated ||
-    state.remoteSessionStatus !== "active" ||
+    remoteSessionControlOwner.snapshot.status !== "active" ||
     document.visibilityState === "hidden"
   ) {
     return;
@@ -754,8 +782,7 @@ async function refreshRemoteFavorites() {
 }
 
 function setRemoteSessionStatus(status, message) {
-  state.remoteSessionStatus = status;
-  state.remoteSessionMessage = message;
+  const sessionControl = remoteSessionControlOwner.transition(status, message);
   if (
     status === "local_in_use" ||
     status === "other_device" ||
@@ -773,17 +800,33 @@ function setRemoteSessionStatus(status, message) {
     element = document.createElement("div");
     element.id = "remote-session-status";
     element.className = "remote-session-status";
+    const card = document.createElement("div");
+    card.className = "remote-session-status-card";
+    element.append(card);
     document.body.append(element);
   }
-  element.hidden = status === "active" || status === "inactive";
-  element.dataset.status = status;
-  element.replaceChildren(textElement("span", message));
+  const card = element.querySelector(".remote-session-status-card");
+  const statusMessage = textElement("span", sessionControl.message);
+  statusMessage.id = "remote-session-status-message";
+  card.replaceChildren(statusMessage);
+  element.hidden = sessionControl.status === "active" || sessionControl.status === "inactive";
+  element.dataset.status = sessionControl.status;
+  element.classList.toggle("is-modal", sessionControl.blocksInteraction);
+  element.setAttribute("role", sessionControl.blocksInteraction ? "dialog" : "status");
+  if (sessionControl.blocksInteraction) {
+    element.setAttribute("aria-modal", "true");
+    element.setAttribute("aria-labelledby", statusMessage.id);
+  } else {
+    element.removeAttribute("aria-modal");
+    element.removeAttribute("aria-labelledby");
+  }
+  app.inert = sessionControl.blocksInteraction;
   if (
-    status === "local_in_use" ||
-    status === "other_device" ||
-    status === "expired" ||
-    status === "not_acquired" ||
-    status === "unavailable"
+    sessionControl.status === "local_in_use" ||
+    sessionControl.status === "other_device" ||
+    sessionControl.status === "expired" ||
+    sessionControl.status === "not_acquired" ||
+    sessionControl.status === "unavailable"
   ) {
     const reconnect = textElement(
       "button",
@@ -794,12 +837,23 @@ function setRemoteSessionStatus(status, message) {
     reconnect.addEventListener("click", () => {
       reconnect.disabled = true;
       acquireRemoteSession("explicit_reconnect", "explicit_reconnect")
-        .then(() => dispatchRoute())
+        .then(async () => {
+          const viewer = state.viewer;
+          if (await viewer?.resumeAfterRemoteSessionReconnect?.()) return;
+          await dispatchRoute();
+        })
         .catch(() => {
           reconnect.disabled = false;
         });
     });
-    element.append(reconnect);
+    card.append(reconnect);
+    if (sessionControl.blocksInteraction) {
+      queueMicrotask(() => {
+        if (!element.hidden && sessionControl === remoteSessionControlOwner.snapshot) {
+          reconnect.focus();
+        }
+      });
+    }
   }
 }
 
@@ -831,8 +885,7 @@ function renderPinLogin(initialRemainingSeconds = 0) {
   applyRemoteSessionId("");
   state.screenContext = "pin";
   state.authenticated = false;
-  state.remoteSessionStatus = "inactive";
-  state.remoteSessionMessage = "";
+  setRemoteSessionStatus("inactive", "");
   state.remoteSessionOwner = null;
   telemetryState.authenticated = false;
   updateRemoteSessionOwnerBadge();
@@ -1151,6 +1204,7 @@ export function commandTelemetryEvent(requested, meta, source, context, handled 
 
 function dispatchCommand(requested, meta = {}) {
   if (!requested?.name || !state.authenticated) return false;
+  if (remoteSessionControlOwner.snapshot.blocksInteraction) return true;
   const source = meta.source ?? "mouse";
   if (
     requested.name === CommandName.OPEN_LOCAL_SETTINGS ||
@@ -1175,7 +1229,7 @@ function dispatchCommand(requested, meta = {}) {
   state.remoteSessionUserActive = true;
   if (meta.sessionChecked !== true) {
     const decision = remoteSessionAcquireDecision(
-      state.remoteSessionStatus,
+      remoteSessionControlOwner.snapshot.status,
       "user_operation"
     );
     if (decision === "acquire") {
@@ -3180,6 +3234,8 @@ function renderVideoViewer(entry) {
     inputSource: inputSourceFromEvent,
     apiJson,
     apiPostJson,
+    subscribeRemoteSessionState: (listener) =>
+      remoteSessionControlOwner.subscribe(listener),
     reportPlaybackIssue: ({ category, internalReason, ...details }) => {
       recordClientError(category, internalReason, {
         internal_reason: internalReason,
@@ -3328,7 +3384,11 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
     loadingIndicator,
     boundaryMessage,
   });
-  state.remoteAiController = new RemoteAiController(state.viewer, stage);
+  state.remoteAiController = new RemoteAiController(
+    state.viewer,
+    stage,
+    (listener) => remoteSessionControlOwner.subscribe(listener)
+  );
   close.addEventListener("click", (event) => {
     event.stopPropagation();
     dispatchCommand(command(CommandName.BACK), {
@@ -6927,7 +6987,7 @@ function createRemoteAiRequestId(groupHash) {
 }
 
 export class RemoteAiController {
-  constructor(viewer, stage) {
+  constructor(viewer, stage, subscribeRemoteSessionState = () => () => {}) {
     this.viewer = viewer;
     this.stage = stage;
     this.pages = [];
@@ -6941,6 +7001,8 @@ export class RemoteAiController {
     this.hideTimer = 0;
     this.retryIndex = 0;
     this.destroyed = false;
+    this.remoteSessionState = { blocksInteraction: false };
+    this.unsubscribeRemoteSessionState = () => {};
 
     this.root = element("div", "viewer-ai-status");
     this.root.hidden = true;
@@ -6955,6 +7017,10 @@ export class RemoteAiController {
     });
     this.root.append(this.message, this.cancelButton);
     viewer.root.append(this.root);
+    this.unsubscribeRemoteSessionState = subscribeRemoteSessionState((snapshot) => {
+      this.remoteSessionState = snapshot ?? { blocksInteraction: false };
+      if (this.remoteSessionState.blocksInteraction) this.clearPoll();
+    });
   }
 
   async displayGroup(pages) {
@@ -7053,7 +7119,10 @@ export class RemoteAiController {
   }
 
   retryAfterFailure(error, generation) {
-    if (error instanceof AuthenticationRequiredError) return;
+    if (
+      error instanceof AuthenticationRequiredError ||
+      this.remoteSessionState.blocksInteraction
+    ) return;
     this.show("接続を確認しています", { cancellable: Boolean(this.job) });
     const delay = remoteAiPollingDelay({
       visibilityState: document.visibilityState,
@@ -7169,7 +7238,11 @@ export class RemoteAiController {
 
   schedulePoll(delay, generation) {
     this.clearPoll();
-    if (document.visibilityState === "hidden" || !this.isCurrent(generation)) return;
+    if (
+      document.visibilityState === "hidden" ||
+      this.remoteSessionState.blocksInteraction ||
+      !this.isCurrent(generation)
+    ) return;
     this.pollTimer = window.setTimeout(() => {
       this.pollTimer = 0;
       this.poll(generation);
@@ -7191,6 +7264,7 @@ export class RemoteAiController {
       ? this.job.job_id
       : null;
     this.destroyed = true;
+    this.unsubscribeRemoteSessionState();
     this.generation += 1;
     this.clearPoll();
     clearTimeout(this.hideTimer);
@@ -7275,7 +7349,7 @@ export class ImageViewer {
       const viewer = this;
       this.resizeTimer = setTimeout(() => {
         if (
-          state.remoteSessionStatus !== "active" ||
+          remoteSessionControlOwner.snapshot.status !== "active" ||
           !state.remoteSessionId ||
           state.viewer !== viewer
         ) {
@@ -8335,31 +8409,37 @@ async function observedFetch(url, options = {}, sessionRecoveryAttempted = false
     }
     if (response.status === 409 || response.status === 428) {
       if (detail.error !== "remote_state_generation_mismatch") {
-        const sessionStatus = sessionStatusFromResponse(detail.status, response.status);
-        setRemoteSessionStatus(
-          sessionStatus,
-          detail.message || "操作権がありません。再接続してください。"
-        );
-        if (
-          !sessionRecoveryAttempted &&
-          state.remoteSessionUserActive &&
-          remoteSessionAcquireDecision(sessionStatus, "user_operation") === "acquire"
-        ) {
-          let recovered = false;
-          try {
-            await acquireRemoteSession("expired_operation", "user_operation");
-            recovered = true;
-          } catch {}
-          if (recovered && sessionEpochBound) {
-            const viewer = state.viewer;
-            queueMicrotask(() => {
-              if (viewer && state.viewer === viewer) {
-                updateViewerImage(performance.now()).catch(renderError);
-              }
-            });
-            throw new DOMException("リモートセッションを更新しました。", "AbortError");
+        const sessionStatus = remoteSessionFailureStatus({
+          sessionStatus: detail.status,
+          httpStatus: response.status,
+          errorCode: detail.error,
+        });
+        if (sessionStatus) {
+          setRemoteSessionStatus(
+            sessionStatus,
+            detail.message || "操作権がありません。再接続してください。"
+          );
+          if (
+            !sessionRecoveryAttempted &&
+            state.remoteSessionUserActive &&
+            remoteSessionAcquireDecision(sessionStatus, "user_operation") === "acquire"
+          ) {
+            let recovered = false;
+            try {
+              await acquireRemoteSession("expired_operation", "user_operation");
+              recovered = true;
+            } catch {}
+            if (recovered && sessionEpochBound) {
+              const viewer = state.viewer;
+              queueMicrotask(() => {
+                if (viewer && state.viewer === viewer) {
+                  updateViewerImage(performance.now()).catch(renderError);
+                }
+              });
+              throw new DOMException("リモートセッションを更新しました。", "AbortError");
+            }
+            if (recovered) return observedFetch(url, options, true);
           }
-          if (recovered) return observedFetch(url, options, true);
         }
       }
     }
@@ -8436,10 +8516,17 @@ async function pageResourceResponseError(response) {
     (response.status === 409 || response.status === 428) &&
     detail.error !== "remote_state_generation_mismatch"
   ) {
-    setRemoteSessionStatus(
-      sessionStatusFromResponse(detail.status, response.status),
-      detail.message || "操作権がありません。再接続してください。"
-    );
+    const sessionStatus = remoteSessionFailureStatus({
+      sessionStatus: detail.status,
+      httpStatus: response.status,
+      errorCode: detail.error,
+    });
+    if (sessionStatus) {
+      setRemoteSessionStatus(
+        sessionStatus,
+        detail.message || "操作権がありません。再接続してください。"
+      );
+    }
   }
   const error = new Error(
     detail.message || `画像取得に失敗しました (HTTP ${response.status})。`
