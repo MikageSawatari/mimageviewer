@@ -669,6 +669,10 @@ guard で、動画処理開始後の timeout 9 個には数えない。
   registration を外すまで final release を待つ。join 自体は UI thread で行わず worker 側の
   registration lifetime を drain accounting に使う。これにより旧 worker が process-wide
   generation resource lease を持つ間に次 owner の acquire / start が成功することを防ぐ
+- 端末の一度の再接続操作は、この final release が済むまで同じ acquire intent として待つ。
+  streaming worker の終了には固定の wall-clock 上限がないため、取得待ちを任意の総時間で
+  打ち切らない。これは状態を作る `/api/video/start` の無期限再送とは分離し、session ID の
+  発行前だけを backoff 付きで再照会する
 
 ### 6.4 画質プリセット
 

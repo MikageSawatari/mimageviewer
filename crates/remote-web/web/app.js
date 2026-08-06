@@ -31,6 +31,7 @@ import {
   remoteStateGenerationTransition,
   readingProgressBatchTransition,
   remoteSessionAcquireDecision,
+  remoteSessionAcquireRetryDelay,
   remoteSessionControlTransition,
   remoteSessionFailureStatus,
   rangeValueFromNormalized,
@@ -555,7 +556,7 @@ async function acquireRemoteSession(reason = "operation", trigger = "user_operat
     try {
       let response;
       let result = {};
-      for (let attempt = 0; attempt < 80; attempt += 1) {
+      for (let attempt = 0; ; attempt += 1) {
         response = await fetch("/api/session/acquire", {
           method: "POST",
           credentials: "same-origin",
@@ -567,10 +568,22 @@ async function acquireRemoteSession(reason = "operation", trigger = "user_operat
         }
         result = await response.json().catch(() => ({}));
         if (response.ok && result.status === "active") break;
-        // 別 owner の drain はこの取得要求が開始した遷移。同じ明示 intent の
-        // 完了待ちであり、切断後の自動再取得とは別物。
-        if (response.status === 409 && result.status === "local_in_use") {
-          await new Promise((resolve) => window.setTimeout(resolve, 250));
+        const retryDelayMs = remoteSessionAcquireRetryDelay(
+          response.status,
+          result.status,
+          attempt
+        );
+        // 別 owner または直前の動画 worker の drain は、この取得 intent より前の
+        // 所有権を安全に返す遷移。任意の wall-clock 期限で intent を捨てず、final
+        // release 後に同じ取得を成立させる。切断後の自動再取得とは別物。
+        if (retryDelayMs !== null) {
+          if (attempt === 0) {
+            setRemoteSessionStatus(
+              "acquiring",
+              "前のリモート処理が安全に終了するのを待っています…"
+            );
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, retryDelayMs));
           continue;
         }
         break;

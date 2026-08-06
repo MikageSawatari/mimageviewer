@@ -33030,6 +33030,132 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn streaming_drain_and_reacquire_between_frames_do_not_restore_local_view() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_image(&mut app, "coalesced-reacquire.png");
+        app.fullscreen_idx = Some(image);
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".to_owned(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: Some("phone".to_owned()),
+            },
+        });
+        app.poll_remote_session(&ctx);
+        assert_eq!(
+            handle.snapshot().phase,
+            crate::remote_ipc::session::RemoteControlPhase::RemoteActive
+        );
+
+        let owner = handle.owner_for_test("phone");
+        let registration = handle
+            .streaming_owner(&owner)
+            .unwrap()
+            .register_streaming()
+            .unwrap();
+        handle.local_disconnect();
+        app.poll_remote_session(&ctx);
+        assert_eq!(
+            handle.snapshot().phase,
+            crate::remote_ipc::session::RemoteControlPhase::DrainingRemote,
+            "the app drain must wait for the streaming worker lease"
+        );
+
+        drop(registration);
+        assert_eq!(
+            handle.snapshot().phase,
+            crate::remote_ipc::session::RemoteControlPhase::Local
+        );
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".to_owned(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: Some("phone".to_owned()),
+            },
+        });
+
+        app.poll_remote_session(&ctx);
+
+        assert_eq!(
+            handle.snapshot().phase,
+            crate::remote_ipc::session::RemoteControlPhase::RemoteActive
+        );
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(image),
+            "a control return that was never visible must not enqueue the old local restore"
+        );
+    }
+
+    #[test]
+    fn local_ai_remote_barrier_snapshot_names_every_closed_condition() {
+        let snapshot = LocalAiRemoteBarrierSnapshot {
+            mounted: MountedAiRemoteBarrierSnapshot {
+                final_ai_pending: 2,
+                erase_inpaint_pending: 1,
+            },
+            detached: Some(MountedAiRemoteBarrierSnapshot {
+                final_ai_pending: 1,
+                erase_inpaint_pending: 0,
+            }),
+            ai_upscale_pending: 3,
+            retained_final_ai_orphans: 4,
+            local_adjust_segmentation_pending: true,
+            book_op_pending: true,
+            local_ai_activity: 5,
+            trt_restart_in_flight: true,
+            video_upscale: Some(VideoUpscaleRemoteBarrierSnapshot {
+                queue_paused: false,
+                pause_requested: true,
+                paused_idle: false,
+            }),
+        };
+
+        assert!(!snapshot.is_quiesced());
+        let blockers = snapshot.blocker_summary();
+        for expected in [
+            "mounted(final_ai_pending=2,erase_inpaint_pending=1)",
+            "detached(final_ai_pending=1,erase_inpaint_pending=0)",
+            "ai_upscale_pending=3",
+            "retained_final_ai_orphans=4",
+            "local_adjust_segmentation_pending",
+            "book_op_pending",
+            "local_ai_activity=5",
+            "trt_restart_in_flight",
+            "video_upscale(queue_paused=false,pause_requested=true,paused_idle=false)",
+        ] {
+            assert!(
+                blockers.contains(expected),
+                "missing {expected}: {blockers}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_legacy_ai_still_reaps_cancelled_pending_worker() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.ai_upscale_enabled = false;
+        app.ai_denoise_model = None;
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        app.ai_upscale_pending.insert((1, 0), (cancel, rx));
+
+        app.poll_ai_upscale(&ctx);
+
+        assert!(app.ai_upscale_pending.is_empty());
+        assert!(
+            !app.ai_upscale_failed.contains(&(1, 0)),
+            "barrier cancellation is not a processing failure"
+        );
+    }
+
+    #[test]
     #[cfg(windows)]
     fn remote_session_acquire_pauses_mounted_active_and_parked_live_media_at_position() {
         let mut app = setup_app();

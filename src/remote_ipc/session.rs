@@ -28,6 +28,7 @@ const UI_REQUEST_CANCELLED: u8 = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReleaseReason {
     Local,
+    AcquireBarrierTimeout,
     LivenessTimeout,
     IdleTimeout,
     BackgroundExpired,
@@ -113,7 +114,7 @@ impl RemoteControlLifecycle {
 impl ReleaseReason {
     fn status(self) -> SessionStatus {
         match self {
-            Self::Local => SessionStatus::LocalInUse,
+            Self::Local | Self::AcquireBarrierTimeout => SessionStatus::LocalInUse,
             Self::LivenessTimeout | Self::IdleTimeout | Self::BackgroundExpired => {
                 SessionStatus::Expired
             }
@@ -202,8 +203,21 @@ impl SessionStateMachine {
         connected_unix_ms: u64,
         request: SessionAcquireRequest,
     ) -> SessionResponse {
+        match self.lifecycle.phase {
+            // The previous owner's resources still belong to that drain. A new acquire is a
+            // waiter, not a second BeginDrain transition, and must not replace its reason.
+            RemoteControlPhase::DrainingRemote => return session_closing_response(),
+            RemoteControlPhase::AcquiringRemote | RemoteControlPhase::RemoteActive => {
+                self.begin_drain(ReleaseReason::Superseded);
+                return session_closing_response();
+            }
+            RemoteControlPhase::Local => {}
+        }
         if self.active.is_some() {
-            self.begin_drain(ReleaseReason::Superseded);
+            crate::logger::log(
+                "remote_ipc: lifecycle invariant violation: local phase has active session payload"
+                    .to_owned(),
+            );
             return session_closing_response();
         }
         if self
@@ -251,6 +265,15 @@ impl SessionStateMachine {
                 .lifecycle
                 .transition(RemoteControlTransition::FinishAcquire)
                 .is_ok()
+    }
+
+    fn abort_acquire_barrier(&mut self, generation: u64) -> bool {
+        if generation != self.generation
+            || self.lifecycle.phase != RemoteControlPhase::AcquiringRemote
+        {
+            return false;
+        }
+        self.begin_drain(ReleaseReason::AcquireBarrierTimeout)
     }
 
     fn ping(&mut self, now: Duration, request: &SessionPingRequest) -> SessionResponse {
@@ -696,6 +719,9 @@ fn session_closing_response() -> SessionResponse {
 fn release_message(reason: ReleaseReason) -> &'static str {
     match reason {
         ReleaseReason::Local => "本体で切断されました。再接続してください。",
+        ReleaseReason::AcquireBarrierTimeout => {
+            "本体の処理を安全に停止できなかったため接続を中止しました。処理の終了後に再接続してください。"
+        }
         ReleaseReason::LivenessTimeout => "接続の生存確認が途絶えました。再接続してください。",
         ReleaseReason::IdleTimeout => "放置時間を超えたため切断されました。再接続してください。",
         ReleaseReason::BackgroundExpired => {
@@ -1215,11 +1241,12 @@ impl SessionHandle {
             let phase = state.lifecycle.phase;
             let generation = state.generation;
             let response = state.acquire(self.now(), connected_unix_ms, request);
+            let next_phase = state.lifecycle.phase;
             (
                 response,
-                state.lifecycle.phase != phase,
+                next_phase != phase,
                 state.generation != generation,
-                (state.lifecycle.phase == RemoteControlPhase::DrainingRemote)
+                (next_phase != phase && next_phase == RemoteControlPhase::DrainingRemote)
                     .then_some(state.drain_reason)
                     .flatten(),
             )
@@ -1231,9 +1258,16 @@ impl SessionHandle {
         if let Some(reason) = drain_reason {
             self.notify_ai_drain(reason);
         }
-        crate::logger::log(format!(
-            "remote_ipc: session_acquired connection_kind={peer_kind:?} peer={peer_name}"
-        ));
+        if response.status == SessionStatus::Active {
+            crate::logger::log(format!(
+                "remote_ipc: session_acquired connection_kind={peer_kind:?} peer={peer_name}"
+            ));
+        } else if phase_changed {
+            crate::logger::log(format!(
+                "remote_ipc: session_acquire_deferred status={:?} connection_kind={peer_kind:?} peer={peer_name}",
+                response.status
+            ));
+        }
         self.notify_ui();
         response
     }
@@ -1300,6 +1334,24 @@ impl SessionHandle {
             .finish_acquire(generation);
         if changed {
             self.notify_phase_changed();
+            self.notify_ui();
+        }
+        changed
+    }
+
+    pub(crate) fn abort_acquire_barrier(&self, generation: u64) -> bool {
+        let changed = self
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .abort_acquire_barrier(generation);
+        if changed {
+            self.notify_ai_drain(ReleaseReason::AcquireBarrierTimeout);
+            self.clear_video_stream(None);
+            self.notify_phase_changed();
+            crate::logger::log(
+                "remote_ipc: session_drain_started reason=acquire_barrier_timeout".to_owned(),
+            );
             self.notify_ui();
         }
         changed
@@ -1462,7 +1514,9 @@ impl SessionHandle {
             return;
         };
         let cause = match reason {
-            ReleaseReason::Local => super::ai_job::RemoteAiDrainCause::DiscardedByHost,
+            ReleaseReason::Local | ReleaseReason::AcquireBarrierTimeout => {
+                super::ai_job::RemoteAiDrainCause::DiscardedByHost
+            }
             ReleaseReason::BackgroundExpired => {
                 super::ai_job::RemoteAiDrainCause::BackgroundExpired
             }
@@ -2124,6 +2178,7 @@ fn session_watchdog(handle: SessionHandle, stop: Arc<AtomicBool>) {
                     ReleaseReason::IdleTimeout => "idle_timeout",
                     ReleaseReason::BackgroundExpired => "background_expired",
                     ReleaseReason::Local => "local",
+                    ReleaseReason::AcquireBarrierTimeout => "acquire_barrier_timeout",
                     ReleaseReason::Superseded => "superseded",
                 }
             ));
@@ -2515,6 +2570,31 @@ mod tests {
     }
 
     #[test]
+    fn acquire_barrier_timeout_drains_instead_of_forcing_remote_active() {
+        let handle = SessionHandle::new();
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        let generation = handle.snapshot().generation;
+        let owner = handle.owner_for_test("client");
+
+        assert!(handle.abort_acquire_barrier(generation));
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::DrainingRemote);
+        assert!(!handle.finish_acquire(generation));
+        assert!(handle.complete_app_drain(generation));
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::Local);
+
+        let response = handle.ping(&SessionPingRequest {
+            owner,
+            user_active: false,
+            media_playing: false,
+        });
+        assert_eq!(response.status, SessionStatus::LocalInUse);
+        assert!(response.message.contains("安全に停止できなかった"));
+    }
+
+    #[test]
     fn liveness_timeout_releases_session() {
         let mut state = SessionStateMachine::default();
         acquire(&mut state, Duration::ZERO);
@@ -2622,6 +2702,7 @@ mod tests {
     fn next_owner_cannot_start_streaming_before_previous_worker_unregisters() {
         let mut state = SessionStateMachine::default();
         acquire(&mut state, Duration::ZERO);
+        let old_owner = state_owner(&state, "client");
         let (old_generation, old_registration, old_cancel) =
             register_test_stream(&mut state, Duration::ZERO);
 
@@ -2641,6 +2722,17 @@ mod tests {
                 .status,
             SessionStatus::LocalInUse
         );
+        assert_eq!(state.drain_reason, Some(ReleaseReason::Local));
+        let old_owner_status = state.ping(
+            Duration::from_secs(1),
+            &SessionPingRequest {
+                owner: old_owner,
+                user_active: false,
+                media_playing: false,
+            },
+        );
+        assert_eq!(old_owner_status.status, SessionStatus::LocalInUse);
+        assert!(old_owner_status.message.contains("本体で切断"));
 
         assert!(state.unregister_streaming(old_generation, old_registration));
         assert_eq!(state.lifecycle.phase, RemoteControlPhase::Local);

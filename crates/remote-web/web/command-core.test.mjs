@@ -33,6 +33,7 @@ import {
   readingDirectionForSpreadMode,
   readingProgressBatchTransition,
   remoteSessionAcquireDecision,
+  remoteSessionAcquireRetryDelay,
   remoteSessionControlTransition,
   remoteSessionFailureStatus,
   remoteStateGenerationTransition,
@@ -179,6 +180,15 @@ test("session acquisition policy separates passive detection from explicit recov
   assert.equal(remoteSessionAcquireDecision("other_device", "user_operation"), "blocked");
   assert.equal(remoteSessionAcquireDecision("local_in_use", "explicit_reconnect"), "acquire");
   assert.equal(remoteSessionAcquireDecision("other_device", "explicit_reconnect"), "acquire");
+});
+
+test("one acquisition intent keeps waiting for a draining owner without a fixed deadline", () => {
+  assert.equal(remoteSessionAcquireRetryDelay(409, "local_in_use", 0), 250);
+  assert.equal(remoteSessionAcquireRetryDelay(409, "local_in_use", 8), 500);
+  assert.equal(remoteSessionAcquireRetryDelay(409, "local_in_use", 16), 1000);
+  assert.equal(remoteSessionAcquireRetryDelay(409, "local_in_use", 80), 1000);
+  assert.equal(remoteSessionAcquireRetryDelay(409, "superseded", 0), null);
+  assert.equal(remoteSessionAcquireRetryDelay(428, "local_in_use", 0), null);
 });
 
 test("session control blocks only explicit ownership revocation", () => {

@@ -211,6 +211,8 @@ test("session epoch removes page preflight and repeated active acquisition", asy
     /pingRemoteSession[\s\S]*applyRemoteStateGeneration\(result\.remote_state_generation,\s*\{\s*reloadViewer:\s*true\s*\}\)/
   );
   assert.match(app, /commitSeekGroup[\s\S]*acquireRemoteSession\(reason\)/);
+  assert.match(app, /for \(let attempt = 0; ; attempt \+= 1\)/);
+  assert.doesNotMatch(app, /attempt < 80/);
 });
 
 test("colorize controls use the adjustment preview and commit path without losing custom points", async () => {

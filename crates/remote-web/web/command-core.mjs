@@ -83,6 +83,19 @@ export function remoteSessionAcquireDecision(status, trigger) {
   return "blocked";
 }
 
+// A 409/local_in_use response from the acquire endpoint means that the previous
+// owner is still draining. Keep the same user acquisition intent alive until
+// that drain completes; there is no safe wall-clock deadline for releasing a
+// streaming worker. Back off after the fast path so a long drain does not poll
+// the core four times per second indefinitely.
+export function remoteSessionAcquireRetryDelay(httpStatus, sessionStatus, attempt = 0) {
+  if (Number(httpStatus) !== 409 || sessionStatus !== "local_in_use") return null;
+  const retry = Math.max(0, Math.trunc(Number(attempt) || 0));
+  if (retry < 8) return 250;
+  if (retry < 16) return 500;
+  return 1000;
+}
+
 export function remoteSessionControlTransition(current, status, message = "") {
   const previous = current ?? {
     status: "inactive",

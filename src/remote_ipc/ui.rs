@@ -20,6 +20,10 @@ use super::session::{
 };
 use super::video_stream::{VideoStreamStartBudget, VideoStreamStartStage};
 
+const REMOTE_ACQUIRE_BARRIER_LOG_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+const REMOTE_ACQUIRE_BARRIER_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const REMOTE_ACQUIRE_BARRIER_ABORT_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Default)]
 pub(crate) struct RemoteSessionUiState {
     handle: Option<SessionHandle>,
@@ -33,6 +37,7 @@ pub(crate) struct RemoteSessionUiState {
     connection_dialog: Option<RemoteConnectionDialogState>,
     video_stream: Option<AppRemoteVideoStreamState>,
     local_ai_lease: Option<RemoteLocalAiLease>,
+    acquire_barrier_diagnostics: RemoteAcquireBarrierDiagnostics,
 }
 
 #[derive(Clone, Copy)]
@@ -82,9 +87,53 @@ fn remote_client_state_label(active: bool) -> &'static str {
     if active { "操作中" } else { "なし" }
 }
 
-#[derive(Default)]
 struct RemoteLocalAiLease {
+    acquisition_sequence: u64,
     resume_video_upscale: bool,
+}
+
+struct RemoteAcquireBarrierDiagnostics {
+    generation: u64,
+    next_log_after: std::time::Duration,
+}
+
+impl Default for RemoteAcquireBarrierDiagnostics {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            next_log_after: REMOTE_ACQUIRE_BARRIER_LOG_AFTER,
+        }
+    }
+}
+
+impl RemoteAcquireBarrierDiagnostics {
+    fn begin(&mut self, generation: u64) {
+        self.generation = generation;
+        self.next_log_after = REMOTE_ACQUIRE_BARRIER_LOG_AFTER;
+    }
+
+    fn should_log(&mut self, generation: u64, elapsed: std::time::Duration) -> bool {
+        if self.generation != generation {
+            self.begin(generation);
+        }
+        if elapsed < self.next_log_after {
+            return false;
+        }
+        while self.next_log_after <= elapsed {
+            self.next_log_after = self
+                .next_log_after
+                .saturating_add(REMOTE_ACQUIRE_BARRIER_LOG_INTERVAL);
+        }
+        true
+    }
+}
+
+fn coalesced_remote_reacquire(
+    phase: super::session::RemoteControlPhase,
+    acquisition_changed: bool,
+    control_returned: bool,
+) -> bool {
+    phase.blocks_local_control() && acquisition_changed && control_returned
 }
 
 enum AppRemoteVideoStreamState {
@@ -357,6 +406,27 @@ impl crate::app::App {
                 "リモートセッションの操作権が移動しました",
             );
         }
+        let coalesced_reacquire =
+            coalesced_remote_reacquire(remote_phase, acquisition_changed, control_returned);
+        if let Some(snapshot) = snapshot.as_ref()
+            && control_returned
+        {
+            self.remote_session_ui.last_control_return_sequence = snapshot.control_return_sequence;
+            if coalesced_reacquire {
+                // The old worker may finish its drain and a new client may acquire between UI
+                // frames. In that case local control was never observable: keep the singleton AI
+                // barrier held and do not enqueue a stale local-view reload under the new owner.
+                crate::logger::log(format!(
+                    "remote_ipc: coalesced control return into reacquire generation={} acquisition_sequence={}",
+                    snapshot.generation, snapshot.acquisition_sequence
+                ));
+            } else {
+                if let Some(lease) = self.remote_session_ui.local_ai_lease.take() {
+                    self.release_local_ai_remote_barrier(lease.resume_video_upscale);
+                }
+                self.reload_after_remote_session_release();
+            }
+        }
         if let Some(snapshot) = snapshot.as_ref()
             && acquisition_changed
         {
@@ -366,25 +436,55 @@ impl crate::app::App {
             crate::logger::log(format!(
                 "remote_ipc: local playback paused on session acquire media={media} slideshow={slideshow} animations={animations} continuous_pending={continuous}"
             ));
-            let resume_video_upscale = self.begin_local_ai_remote_barrier();
+            let mut resume_video_upscale = self.begin_local_ai_remote_barrier();
+            if let Some(previous) = self.remote_session_ui.local_ai_lease.take() {
+                resume_video_upscale |= previous.resume_video_upscale;
+                crate::logger::log(format!(
+                    "remote_ipc: local AI barrier carried across reacquire old_acquisition_sequence={} new_acquisition_sequence={}",
+                    previous.acquisition_sequence, snapshot.acquisition_sequence
+                ));
+            }
             self.remote_session_ui.local_ai_lease = Some(RemoteLocalAiLease {
+                acquisition_sequence: snapshot.acquisition_sequence,
                 resume_video_upscale,
             });
+            self.remote_session_ui
+                .acquire_barrier_diagnostics
+                .begin(snapshot.generation);
         }
         if remote_phase == super::session::RemoteControlPhase::AcquiringRemote
-            && self.local_ai_remote_barrier_quiesced()
             && let (Some(handle), Some(snapshot)) = (handle.as_ref(), snapshot.as_ref())
         {
-            handle.finish_acquire(snapshot.generation);
-        }
-        if let Some(snapshot) = snapshot.as_ref()
-            && control_returned
-        {
-            self.remote_session_ui.last_control_return_sequence = snapshot.control_return_sequence;
-            if let Some(lease) = self.remote_session_ui.local_ai_lease.take() {
-                self.release_local_ai_remote_barrier(lease.resume_video_upscale);
+            let barrier = self.local_ai_remote_barrier_snapshot();
+            if barrier.is_quiesced() {
+                handle.finish_acquire(snapshot.generation);
+            } else {
+                let elapsed = snapshot
+                    .active
+                    .as_ref()
+                    .map_or(std::time::Duration::ZERO, |active| active.elapsed);
+                if self
+                    .remote_session_ui
+                    .acquire_barrier_diagnostics
+                    .should_log(snapshot.generation, elapsed)
+                {
+                    crate::logger::log(format!(
+                        "remote_ipc: acquire_barrier_wait generation={} elapsed_ms={} blockers={}",
+                        snapshot.generation,
+                        elapsed.as_millis(),
+                        barrier.blocker_summary()
+                    ));
+                }
+                if elapsed >= REMOTE_ACQUIRE_BARRIER_ABORT_AFTER {
+                    crate::logger::log(format!(
+                        "remote_ipc: acquire_barrier_timeout generation={} elapsed_ms={} blockers={}",
+                        snapshot.generation,
+                        elapsed.as_millis(),
+                        barrier.blocker_summary()
+                    ));
+                    handle.abort_acquire_barrier(snapshot.generation);
+                }
             }
-            self.reload_after_remote_session_release();
         }
         if remote_phase == super::session::RemoteControlPhase::DrainingRemote {
             self.cancel_remote_video_stream_state(
@@ -2682,6 +2782,45 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acquire_barrier_diagnostics_logs_after_grace_and_then_throttles() {
+        let mut diagnostics = RemoteAcquireBarrierDiagnostics::default();
+        diagnostics.begin(7);
+
+        assert!(!diagnostics.should_log(7, std::time::Duration::from_secs(2)));
+        assert!(diagnostics.should_log(7, std::time::Duration::from_secs(3)));
+        assert!(!diagnostics.should_log(7, std::time::Duration::from_secs(12)));
+        assert!(diagnostics.should_log(7, std::time::Duration::from_secs(13)));
+        assert!(
+            !diagnostics.should_log(8, std::time::Duration::from_secs(2)),
+            "a new acquisition gets its own grace period"
+        );
+    }
+
+    #[test]
+    fn only_a_new_acquire_coalesced_with_control_return_keeps_the_barrier_held() {
+        assert!(coalesced_remote_reacquire(
+            super::super::session::RemoteControlPhase::AcquiringRemote,
+            true,
+            true
+        ));
+        assert!(!coalesced_remote_reacquire(
+            super::super::session::RemoteControlPhase::Local,
+            true,
+            true
+        ));
+        assert!(coalesced_remote_reacquire(
+            super::super::session::RemoteControlPhase::DrainingRemote,
+            true,
+            true
+        ));
+        assert!(!coalesced_remote_reacquire(
+            super::super::session::RemoteControlPhase::AcquiringRemote,
+            true,
+            false
+        ));
+    }
 
     #[test]
     fn remote_connection_dialog_applies_only_ok_and_discards_cancel() {

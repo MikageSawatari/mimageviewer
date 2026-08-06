@@ -112,7 +112,7 @@ remote は現在の page group 一つだけを持ち、新しい group / 設定�
 | producer / consumer | owner と pending | 3b-0 barrier |
 | --- | --- | --- |
 | final upscale / denoise | App-global AiJobQueue、viewer-context 別 final_ai_pending、App-global retained orphan | queue 内 token と main / active-detached の pending token を cancel。job が App-global activity lease を終端まで保持するため、park 済み bundle から pending が外れた worker も含めて待つ。Display LIFO / Prefetch FIFO 自体は変更しない |
-| legacy upscale / denoise | App-global ai_upscale_pending（段階削除待ちの旧経路） | producer gate、全 token cancel、pending 0 待ち |
+| legacy upscale / denoise | App-global ai_upscale_pending（段階削除待ちの旧経路） | producer gate、全 token cancel、pending 0 待ち。機能 OFF は新規 admission だけを止め、既存 receiver の terminal cleanup は継続する |
 | erase MI-GAN preview / commit | viewer-context 別 erase_inpaint_pending | producer gate、main / active-detached の token cancel。worker activity lease により park 時に pending map から外れた job も終端まで待つ |
 | 保存済み erase を含む製本 composite | App-global book_op_pending が BookEraseRunner 内で Runtime を使い得る | cancel 単位が無いため worker の terminal result まで待つ |
 | local-adjust subject segmentation (BiRefNet) | App-global local_adjust_segmentation_pending | 新規起動を gate。現行 worker に cancel token が無いため terminal result まで待つ。region segmentation は同じ pending slot だが CPU-only |
@@ -174,7 +174,20 @@ remote client が操作権を取得したら、次の順で remote AI を開始�
 `AcquiringRemote` 中の POST は job 登録まで受け付け、`WaitingForLocalDrain` /
 「PC 側で開始済みの AI 処理の終了を待っています」と表示する。
 ここで待つのは接続時の一回だけであり、接続中の PC 優先 scheduling ではない。
-取消不能な model load や inference call はその一回が完了するまで待つ。
+barrier 判定は各 pending 件数、App-global activity、TRT restart、video upscale の
+pause acknowledgment を持つ一つの snapshot を正本にする。3 秒以上閉じている場合は
+同じ snapshot から blocker 名と件数をログへ出し、10 秒間隔で継続状態も観測できるようにする。
+
+取消不能な model load や inference call 自体は強制終了しない。ただし 30 秒たっても
+barrier が開かなければ、`RemoteActive` へ強行せず、その acquire を
+`DrainingRemote -> Local` で明示的に中止する。端末には `LocalInUse` と中止理由を返し、
+local worker の自然終了後に利用者が再接続できる形にする。これにより singleton Runtime の
+排他条件を緩めず、壊れた acknowledgment が PC と端末を無期限に塞ぐことも避ける。
+
+streaming worker の drain 完了と次 owner の acquire が UI の一フレーム間に収まる場合、
+`control_return_sequence` と `acquisition_sequence` は同時に進んで観測される。この coalesced
+reacquire ではローカル操作権は画面に現れていないため、旧 release 用の view reload と
+video-upscale resume は実行せず、AI barrier lease を次 acquisition へ引き継ぐ。
 
 ### 4.3 切断 barrier
 
@@ -206,6 +219,12 @@ payload が欠落していても最終遷移と `control_return_sequence` の一
 
 別 client の takeover も旧 owner の即時置換にはしない。旧 session の drain 中は新 client へ
 `session_closing` と retry hint を返し、final release 後に改めて acquire させる。
+取得側は一度の明示 intent を任意の総時間で打ち切らず、短い初期待機から最大 1 秒まで
+backoff しながら同じ acquire を継続する。動画 worker の resource lifetime は wall-clock 上限を
+持たないため、固定期限を置くと streaming registration を持つ動画だけが再接続に失敗する。
+これは `/api/video/start` の再送ではなく、新しい session ID をまだ発行していない所有権取得の
+待機である。`DrainingRemote` 中の acquire は既存 drain の waiter として扱い、`BeginDrain` を
+再実行したり `Local` / `Superseded` など既存 owner の解放理由を書き換えたりしない。
 
 #### Web クライアントの取得 identity と再取得方針
 

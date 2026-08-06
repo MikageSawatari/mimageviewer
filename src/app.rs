@@ -5555,6 +5555,108 @@ pub(crate) struct LocalAiActivityLease {
     active: Arc<AtomicUsize>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MountedAiRemoteBarrierSnapshot {
+    final_ai_pending: usize,
+    erase_inpaint_pending: usize,
+}
+
+impl MountedAiRemoteBarrierSnapshot {
+    fn is_quiesced(self) -> bool {
+        self.final_ai_pending == 0 && self.erase_inpaint_pending == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VideoUpscaleRemoteBarrierSnapshot {
+    queue_paused: bool,
+    pause_requested: bool,
+    paused_idle: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LocalAiRemoteBarrierSnapshot {
+    mounted: MountedAiRemoteBarrierSnapshot,
+    detached: Option<MountedAiRemoteBarrierSnapshot>,
+    ai_upscale_pending: usize,
+    retained_final_ai_orphans: usize,
+    local_adjust_segmentation_pending: bool,
+    book_op_pending: bool,
+    local_ai_activity: usize,
+    trt_restart_in_flight: bool,
+    video_upscale: Option<VideoUpscaleRemoteBarrierSnapshot>,
+}
+
+impl LocalAiRemoteBarrierSnapshot {
+    pub(crate) fn is_quiesced(self) -> bool {
+        self.mounted.is_quiesced()
+            && self.detached.is_none_or(|detached| detached.is_quiesced())
+            && self.ai_upscale_pending == 0
+            && self.retained_final_ai_orphans == 0
+            && !self.local_adjust_segmentation_pending
+            && !self.book_op_pending
+            && self.local_ai_activity == 0
+            && !self.trt_restart_in_flight
+            && self
+                .video_upscale
+                .is_none_or(|video_upscale| video_upscale.paused_idle)
+    }
+
+    pub(crate) fn blocker_summary(self) -> String {
+        let mut blockers = Vec::new();
+        if !self.mounted.is_quiesced() {
+            blockers.push(format!(
+                "mounted(final_ai_pending={},erase_inpaint_pending={})",
+                self.mounted.final_ai_pending, self.mounted.erase_inpaint_pending
+            ));
+        }
+        if let Some(detached) = self.detached
+            && !detached.is_quiesced()
+        {
+            blockers.push(format!(
+                "detached(final_ai_pending={},erase_inpaint_pending={})",
+                detached.final_ai_pending, detached.erase_inpaint_pending
+            ));
+        }
+        if self.ai_upscale_pending != 0 {
+            blockers.push(format!("ai_upscale_pending={}", self.ai_upscale_pending));
+        }
+        if self.retained_final_ai_orphans != 0 {
+            blockers.push(format!(
+                "retained_final_ai_orphans={}",
+                self.retained_final_ai_orphans
+            ));
+        }
+        if self.local_adjust_segmentation_pending {
+            blockers.push("local_adjust_segmentation_pending".to_owned());
+        }
+        if self.book_op_pending {
+            blockers.push("book_op_pending".to_owned());
+        }
+        if self.local_ai_activity != 0 {
+            blockers.push(format!("local_ai_activity={}", self.local_ai_activity));
+        }
+        if self.trt_restart_in_flight {
+            blockers.push("trt_restart_in_flight".to_owned());
+        }
+        if let Some(video_upscale) = self.video_upscale
+            && !video_upscale.paused_idle
+        {
+            blockers.push(format!(
+                "video_upscale(queue_paused={},pause_requested={},paused_idle={})",
+                video_upscale.queue_paused,
+                video_upscale.pause_requested,
+                video_upscale.paused_idle
+            ));
+        }
+        if blockers.is_empty() {
+            "none".to_owned()
+        } else {
+            blockers.join(",")
+        }
+    }
+}
+
 impl LocalAiActivityLease {
     fn new(active: Arc<AtomicUsize>) -> Self {
         active.fetch_add(1, Ordering::AcqRel);
@@ -48981,8 +49083,11 @@ impl App {
         }
     }
 
-    fn mounted_context_ai_quiesced_for_remote_barrier(&self) -> bool {
-        self.final_ai_pending.is_empty() && self.erase_inpaint_pending.is_empty()
+    fn mounted_context_ai_remote_barrier_snapshot(&self) -> MountedAiRemoteBarrierSnapshot {
+        MountedAiRemoteBarrierSnapshot {
+            final_ai_pending: self.final_ai_pending.len(),
+            erase_inpaint_pending: self.erase_inpaint_pending.len(),
+        }
     }
 
     pub(crate) fn begin_local_ai_remote_barrier(&mut self) -> bool {
@@ -49014,29 +49119,33 @@ impl App {
         LocalAiActivityLease::new(Arc::clone(&self.local_ai_activity))
     }
 
-    pub(crate) fn local_ai_remote_barrier_quiesced(&mut self) -> bool {
-        let mounted_quiesced = self.mounted_context_ai_quiesced_for_remote_barrier();
+    pub(crate) fn local_ai_remote_barrier_snapshot(&mut self) -> LocalAiRemoteBarrierSnapshot {
+        let mounted = self.mounted_context_ai_remote_barrier_snapshot();
         #[cfg(windows)]
-        let detached_quiesced = self
-            .with_active_detached_viewer_context(|app| {
-                app.mounted_context_ai_quiesced_for_remote_barrier()
-            })
-            .unwrap_or(true);
+        let detached = self.with_active_detached_viewer_context(|app| {
+            app.mounted_context_ai_remote_barrier_snapshot()
+        });
         #[cfg(not(windows))]
-        let detached_quiesced = true;
-        let video_quiesced = self
-            .video_upscale_running
-            .as_ref()
-            .is_none_or(|running| running.paused_idle.load(Ordering::Acquire));
-        mounted_quiesced
-            && detached_quiesced
-            && self.ai_upscale_pending.is_empty()
-            && self.retained_final_ai_orphans.is_empty()
-            && self.local_adjust_segmentation_pending.is_none()
-            && self.book_op_pending.is_none()
-            && self.local_ai_activity.load(Ordering::Acquire) == 0
-            && !self.trt_restart_in_flight.load(Ordering::Acquire)
-            && video_quiesced
+        let detached = None;
+        let video_upscale =
+            self.video_upscale_running
+                .as_ref()
+                .map(|running| VideoUpscaleRemoteBarrierSnapshot {
+                    queue_paused: self.video_upscale_queue.paused,
+                    pause_requested: running.pause.load(Ordering::Acquire),
+                    paused_idle: running.paused_idle.load(Ordering::Acquire),
+                });
+        LocalAiRemoteBarrierSnapshot {
+            mounted,
+            detached,
+            ai_upscale_pending: self.ai_upscale_pending.len(),
+            retained_final_ai_orphans: self.retained_final_ai_orphans.len(),
+            local_adjust_segmentation_pending: self.local_adjust_segmentation_pending.is_some(),
+            book_op_pending: self.book_op_pending.is_some(),
+            local_ai_activity: self.local_ai_activity.load(Ordering::Acquire),
+            trt_restart_in_flight: self.trt_restart_in_flight.load(Ordering::Acquire),
+            video_upscale,
+        }
     }
 
     pub(crate) fn release_local_ai_remote_barrier(&mut self, resume_video_upscale: bool) {
@@ -49233,7 +49342,13 @@ impl App {
 
     /// AI アップスケールの完了をポーリングし、テクスチャに変換してキャッシュする。
     pub(crate) fn poll_ai_upscale(&mut self, ctx: &egui::Context) {
-        if !self.ai_upscale_enabled && self.ai_denoise_model.is_none() {
+        // Feature admission may be turned off after a worker was started. Existing receivers
+        // still own terminal cleanup (including the remote acquire barrier), so only skip when
+        // there is no pending work left to reap.
+        if !self.ai_upscale_enabled
+            && self.ai_denoise_model.is_none()
+            && self.ai_upscale_pending.is_empty()
+        {
             return;
         }
 
