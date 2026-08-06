@@ -5,7 +5,9 @@
 //! labels primary pointer events as touch-derived when the exact
 //! egui-winit 0.33.3 synthetic-pointer signature is present.
 
-use crate::touch_input::{TapZoneGeometry, TouchCommand, TouchPhase, TouchRecognizer, TouchSample};
+use crate::touch_input::{
+    TapZoneGeometry, TouchCommand, TouchOwner, TouchPhase, TouchRecognizer, TouchSample,
+};
 use egui::{Event, PointerButton, Pos2, Response, TouchDeviceId, TouchId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -23,6 +25,9 @@ pub(crate) enum TouchSurface {
 pub(crate) struct TouchFrame {
     commands: Vec<TouchCommand>,
     primary_events: Vec<CorrelatedPrimary>,
+    owner: TouchOwner,
+    active: bool,
+    touch_cancelled: bool,
 }
 
 impl TouchFrame {
@@ -32,6 +37,18 @@ impl TouchFrame {
 
     pub(crate) fn into_commands(self) -> Vec<TouchCommand> {
         self.commands
+    }
+
+    pub(crate) fn owner(&self) -> TouchOwner {
+        self.owner
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub(crate) fn touch_cancelled(&self) -> bool {
+        self.touch_cancelled
     }
 
     /// Returns true only after the primary event has first been correlated to
@@ -161,7 +178,7 @@ enum PendingSignature {
     EndGone,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct TouchCorrelationState {
     recognizer: TouchRecognizer,
     /// Mirrors egui-winit's `pointer_touch_id`: only this contact receives the
@@ -171,15 +188,27 @@ struct TouchCorrelationState {
     last_frame: TouchFrame,
 }
 
+impl Default for TouchCorrelationState {
+    fn default() -> Self {
+        Self {
+            recognizer: TouchRecognizer::new(),
+            pointer_touch: None,
+            pending: None,
+            last_frame: TouchFrame::default(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct FrameBuilder {
     commands: Vec<TouchCommand>,
     primary_events: Vec<CorrelatedPrimary>,
     ambiguous: bool,
+    touch_cancelled: bool,
 }
 
 impl FrameBuilder {
-    fn finish(mut self) -> TouchFrame {
+    fn finish(mut self, owner: TouchOwner, active: bool) -> TouchFrame {
         if self.ambiguous {
             // Suppression is useful only together with a replacement command.
             // A mixed or malformed primary stream therefore falls back in
@@ -190,6 +219,9 @@ impl FrameBuilder {
         TouchFrame {
             commands: self.commands,
             primary_events: self.primary_events,
+            owner,
+            active,
+            touch_cancelled: self.touch_cancelled,
         }
     }
 }
@@ -203,15 +235,19 @@ impl TouchCorrelationState {
         disabled: bool,
     ) -> TouchFrame {
         if disabled {
+            let touch_cancelled = self.recognizer.is_active();
             *self = Self::default();
-            return TouchFrame::default();
+            return TouchFrame {
+                touch_cancelled,
+                ..TouchFrame::default()
+            };
         }
 
         let mut frame = FrameBuilder::default();
         for event in events {
             self.process_event(geometry, event, now_ms, &mut frame);
         }
-        frame.finish()
+        frame.finish(self.recognizer.owner(), self.recognizer.is_active())
     }
 
     fn process_event(
@@ -240,17 +276,20 @@ impl TouchCorrelationState {
                 phase,
                 pos,
                 ..
-            } => self.handle_touch(
-                geometry,
-                TouchKey {
-                    device_id: *device_id,
-                    id: *id,
-                },
-                *phase,
-                *pos,
-                now_ms,
-                frame,
-            ),
+            } => {
+                frame.touch_cancelled |= *phase == egui::TouchPhase::Cancel;
+                self.handle_touch(
+                    geometry,
+                    TouchKey {
+                        device_id: *device_id,
+                        id: *id,
+                    },
+                    *phase,
+                    *pos,
+                    now_ms,
+                    frame,
+                )
+            }
             Event::PointerButton {
                 button: PointerButton::Primary,
                 ..
@@ -304,8 +343,13 @@ impl TouchCorrelationState {
             return;
         }
 
-        let receives_synthetic_pointer =
-            self.pointer_touch.is_none() || self.pointer_touch.is_some_and(|active| active == key);
+        let receives_synthetic_pointer = match phase {
+            TouchPhase::Start => self.pointer_touch.is_none(),
+            TouchPhase::Move | TouchPhase::End => {
+                self.pointer_touch.is_some_and(|active| active == key)
+            }
+            TouchPhase::Cancel => unreachable!(),
+        };
         let commands = self.recognizer.handle_sample(geometry, sample);
         let pending = PendingTouch {
             pos,
@@ -386,8 +430,15 @@ pub(crate) fn drive_egui_touch_input(
     surface: TouchSurface,
     geometry: TapZoneGeometry,
     frame: u64,
+    enabled: bool,
 ) -> TouchFrame {
-    drive_egui_touch_input_inner(ctx, surface, geometry, frame, touch_gestures_disabled())
+    drive_egui_touch_input_inner(
+        ctx,
+        surface,
+        geometry,
+        frame,
+        touch_gestures_disabled() || !enabled,
+    )
 }
 
 fn drive_egui_touch_input_inner(
@@ -531,6 +582,43 @@ mod tests {
         let pos = pos2(500.0, 400.0);
         let frame = process(&mut state, &mouse_click(pos), 100);
 
+        assert!(frame.commands().is_empty());
+        assert!(frame.primary_events.is_empty());
+        assert!(!frame.should_suppress_primary(pos, true));
+        assert!(!frame.should_suppress_primary(pos, false));
+    }
+
+    #[test]
+    fn existing_mouse_button_and_ctrl_wheel_paths_never_emit_touch_actions() {
+        let mut state = TouchCorrelationState::default();
+        let pos = pos2(500.0, 400.0);
+        let mut events = Vec::new();
+        for button in [
+            PointerButton::Secondary,
+            PointerButton::Middle,
+            PointerButton::Extra1,
+            PointerButton::Extra2,
+        ] {
+            events.push(Event::PointerButton {
+                pos,
+                button,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            });
+            events.push(Event::PointerButton {
+                pos,
+                button,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            });
+        }
+        events.push(Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 1.0),
+            modifiers: Modifiers::CTRL,
+        });
+
+        let frame = process(&mut state, &events, 100);
         assert!(frame.commands().is_empty());
         assert!(frame.primary_events.is_empty());
         assert!(!frame.should_suppress_primary(pos, true));
@@ -730,6 +818,7 @@ mod tests {
         let frame = state.process_frame(&geometry(), &tap_events(2, pos), 200, true);
         assert!(frame.commands().is_empty());
         assert!(frame.primary_events.is_empty());
+        assert!(frame.touch_cancelled());
         assert!(!state.recognizer.is_active());
         assert!(state.pointer_touch.is_none());
         assert!(state.pending.is_none());
@@ -754,6 +843,7 @@ mod tests {
         assert!(frame.primary_events.is_empty());
         assert!(!state.recognizer.is_active());
         assert_eq!(state.recognizer.owner(), TouchOwner::Cancelled);
+        assert!(frame.touch_cancelled());
         assert!(state.pointer_touch.is_none());
         assert!(state.pending.is_none());
     }
@@ -820,7 +910,31 @@ mod tests {
             Event::PointerGone,
         ];
         let frame = process(&mut state, &events, 100);
-        assert_eq!(frame.commands().len(), 2);
+        assert_eq!(frame.commands().len(), 3);
+        assert_eq!(frame.commands().last(), Some(&TouchCommand::PinchEnd));
         assert!(frame.should_suppress_primary(first, false));
+    }
+
+    #[test]
+    fn secondary_contact_stays_direct_after_synthetic_primary_ends() {
+        let mut state = TouchCorrelationState::default();
+        let first = pos2(200.0, 400.0);
+        let second = pos2(800.0, 400.0);
+        let events = vec![
+            touch(1, egui::TouchPhase::Start, first),
+            Event::PointerMoved(first),
+            primary(first, true),
+            touch(2, egui::TouchPhase::Start, second),
+            touch(1, egui::TouchPhase::End, first),
+            primary(first, false),
+            Event::PointerGone,
+            touch(2, egui::TouchPhase::End, second),
+        ];
+
+        let frame = process(&mut state, &events, 100);
+        assert_eq!(frame.commands().last(), Some(&TouchCommand::PinchEnd));
+        assert!(frame.should_suppress_primary(first, false));
+        assert!(state.pending.is_none());
+        assert!(state.pointer_touch.is_none());
     }
 }

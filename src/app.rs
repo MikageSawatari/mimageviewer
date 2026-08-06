@@ -34135,6 +34135,10 @@ impl App {
         self.fullscreen_idx.is_some() && !self.current_viewer_session_is_detached_or_switching()
     }
 
+    pub(crate) fn fullscreen_opened_at(&self) -> Option<std::time::Instant> {
+        self.fs_opened_at
+    }
+
     fn reconcile_fullscreen_after_main_focus(
         &mut self,
         ctx: &egui::Context,

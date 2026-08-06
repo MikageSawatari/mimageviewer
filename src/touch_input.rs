@@ -109,6 +109,12 @@ pub(crate) enum TouchOwner {
     Cancelled,
 }
 
+impl Default for TouchOwner {
+    fn default() -> Self {
+        Self::Undecided
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum TouchCommand {
     ToggleChrome,
@@ -126,6 +132,10 @@ pub(crate) enum TouchCommand {
     Pan {
         delta: Vec2,
     },
+    /// The last contact participating in a pinch has ended. Consumers use
+    /// this boundary for work that must not run for every gesture sample,
+    /// such as a PDF rerender.
+    PinchEnd,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -333,6 +343,9 @@ impl TouchRecognizer {
         self.contacts.remove(index);
         if self.owner == TouchOwner::Pinch {
             self.rebase_pinch();
+            if self.contacts.is_empty() {
+                commands.push(TouchCommand::PinchEnd);
+            }
         }
         commands
     }
@@ -562,10 +575,9 @@ mod tests {
         );
         assert!(recognizer.is_active());
         assert_eq!(recognizer.owner(), TouchOwner::Pinch);
-        assert!(
-            recognizer
-                .handle_sample(&geometry, sample(57, 800.0, 400.0, TouchPhase::End, 30))
-                .is_empty()
+        assert_eq!(
+            recognizer.handle_sample(&geometry, sample(57, 800.0, 400.0, TouchPhase::End, 30)),
+            vec![TouchCommand::PinchEnd]
         );
         assert!(!recognizer.is_active());
         assert_eq!(recognizer.owner(), TouchOwner::Pinch);
@@ -721,10 +733,9 @@ mod tests {
 
         recognizer.handle_sample(&geometry, sample(900, 120.0, 200.0, TouchPhase::End, 3));
         assert_eq!(recognizer.owner(), TouchOwner::Pinch);
-        assert!(
-            recognizer
-                .handle_sample(&geometry, sample(100, 100.0, 200.0, TouchPhase::End, 4))
-                .is_empty()
+        assert_eq!(
+            recognizer.handle_sample(&geometry, sample(100, 100.0, 200.0, TouchPhase::End, 4)),
+            vec![TouchCommand::PinchEnd]
         );
         assert_eq!(recognizer.owner(), TouchOwner::Pinch);
     }

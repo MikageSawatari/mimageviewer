@@ -14300,6 +14300,7 @@ impl App {
                         excluded: Vec::new(),
                     },
                     self.frame_counter,
+                    true,
                 );
                 let global_searching =
                     self.items_are_global_search_view && self.global_search.is_searching();
