@@ -47,6 +47,8 @@ import {
   thumbnailRequestStartCount,
   thumbnailRetryDecision,
   telemetryDeliveryMode,
+  telemetryEventForTier,
+  telemetrySessionCorrelation,
   togglePageOriginalFitMode,
   shouldShowGridCursor,
   shouldShowLoadingIndicator,
@@ -354,6 +356,7 @@ const telemetryState = {
 const hudState = {
   lastImage: null,
   lastGrid: null,
+  video: null,
   displayDurations: [],
   errors: [],
 };
@@ -438,6 +441,7 @@ const state = {
   remoteSessionOwner: null,
   remoteSessionAcquirePromise: null,
   remoteSessionId: "",
+  remoteSessionCorrelation: "",
   remoteSessionCacheEpoch: "",
   remoteSessionUserActive: false,
   remoteSessionTimer: 0,
@@ -668,6 +672,14 @@ function applyRemoteSessionId(sessionId) {
   // Identity is the admission boundary. Publish its revocation before invoking an optional
   // image-viewer hook; video owns no pending page fetch and intentionally has no such method.
   state.remoteSessionId = next;
+  state.remoteSessionCorrelation = "";
+  if (next) {
+    telemetrySessionCorrelation(next).then((correlation) => {
+      if (state.remoteSessionId !== next) return;
+      state.remoteSessionCorrelation = correlation;
+      updateHud();
+    });
+  }
   // session_id 自体は capability なので URL へ出さない。これに従属する非 secret nonce で
   // header を付けられない <img> などの HTTP cache だけを分離する。
   state.remoteSessionCacheEpoch = next ? newRemoteSessionCacheEpoch() : "";
@@ -3310,6 +3322,14 @@ function renderVideoViewer(entry) {
         ...details,
       });
     },
+    publishVideoHealth: (snapshot, { telemetry = false } = {}) => {
+      hudState.video = snapshot;
+      updateHud();
+      if (telemetry && snapshot) enqueueTelemetry(snapshot);
+    },
+    getTelemetryDebugContext: () => ({
+      enabled: state.localSettings.telemetryDebugDetails,
+    }),
     keyboardAvailable: shouldShowKeyboardShortcuts({
       coarsePointer: state.coarsePointer,
       keyboardUsed: state.keyboardInputSeen,
@@ -6916,6 +6936,25 @@ class LocalSettingsDialog {
       qualityGroup.append(qualityOption);
     }
 
+    const telemetryGroup = element("fieldset", "local-settings-group");
+    telemetryGroup.append(
+      textElement("legend", "診断記録", "local-settings-group-title")
+    );
+    const telemetryOption = element("label", "local-settings-option");
+    const telemetryCheckbox = element("input");
+    telemetryCheckbox.type = "checkbox";
+    telemetryCheckbox.checked = state.localSettings.telemetryDebugDetails;
+    const telemetryCopy = element("span", "local-settings-copy");
+    telemetryCopy.append(
+      textElement("strong", "詳細記録を有効にする"),
+      textElement(
+        "small",
+        "調査時だけ使用します。ファイルの相対パス・remote address・端末 ID・サーバーメッセージを記録します。PIN、認証 token、remote session ID の生値は記録しません。"
+      )
+    );
+    telemetryOption.append(telemetryCheckbox, telemetryCopy);
+    telemetryGroup.append(telemetryOption);
+
     this.status = textElement("p", "", "local-settings-status");
     this.updateStorageStatus();
     checkbox.addEventListener("change", () => {
@@ -6935,8 +6974,20 @@ class LocalSettingsDialog {
         });
       }
     });
+    telemetryCheckbox.addEventListener("change", () => {
+      const saved = saveLocalSettings({
+        ...state.localSettings,
+        telemetryDebugDetails: telemetryCheckbox.checked,
+      });
+      state.localSettings = saved.settings;
+      state.localSettingsStorageAvailable = saved.saved;
+      hudElement.hidden = false;
+      state.viewer?.captureVideoHealth?.("hud");
+      updateHud();
+      this.updateStorageStatus();
+    });
 
-    panel.append(header, option, qualityGroup, this.status);
+    panel.append(header, option, qualityGroup, telemetryGroup, this.status);
     this.root.append(scrim, panel);
     this.root.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
@@ -8289,6 +8340,7 @@ async function apiJson(path, params = {}, signal) {
     );
     error.status = response.status;
     error.code = detail.error;
+    error.serverMessage = typeof detail.message === "string" ? detail.message : "";
     error.retryAfterSeconds = Number(response.headers.get("Retry-After")) || 1;
     throw error;
   }
@@ -8319,6 +8371,7 @@ async function apiPostJson(path, body, signal) {
     );
     error.status = response.status;
     error.code = detail.error;
+    error.serverMessage = typeof detail.message === "string" ? detail.message : "";
     error.retryAfterSeconds = Number(response.headers.get("Retry-After")) || 1;
     throw error;
   }
@@ -8419,7 +8472,11 @@ export function reloadApplication() {
 function installTelemetry() {
   hudElement.hidden = false;
   hudElement.addEventListener("click", () => {
-    hudElement.hidden = true;
+    if (state.localSettings.telemetryDebugDetails) {
+      openLocalSettingsDialog();
+    } else {
+      hudElement.hidden = true;
+    }
   });
   updateHud();
 
@@ -8655,8 +8712,14 @@ function loadRemoteClientId() {
 
 function enqueueTelemetry(event) {
   if (!TELEMETRY_ENABLED || !telemetryState.authenticated) return;
+  const tieredEvent = telemetryEventForTier(event, {
+    detailed: state.localSettings.telemetryDebugDetails,
+    clientId: REMOTE_CLIENT_ID,
+    sessionCorrelation: state.remoteSessionCorrelation,
+    sensitiveValues: [state.remoteSessionId],
+  });
   const stampedEvent = {
-    ...event,
+    ...tieredEvent,
     client_event_timestamp_ms: Date.now(),
     client_event_sequence: telemetryState.nextSequence++,
   };
@@ -8839,29 +8902,63 @@ function updateHud() {
     hudElement.hidden = true;
     return;
   }
+  const debugDetails = state.localSettings.telemetryDebugDetails;
+  if (debugDetails && state.authenticated) hudElement.hidden = false;
+  hudElement.dataset.telemetryTier = debugDetails ? "debug" : "normal";
   trimHudErrors();
   const image = hudState.lastImage;
   const grid = hudState.lastGrid;
+  const video = hudState.video;
   const recent = hudState.displayDurations.slice(-7);
-  const lines = ["mIV PoC 計測"];
+  const lines = [debugDetails ? "mIV PoC 計測 · 詳細記録 ON" : "mIV PoC 計測"];
+  if (video) {
+    const dropped = Number.isFinite(video.dropped_video_frames)
+      ? `${video.dropped_video_frames}/${video.total_video_frames ?? "—"}`
+      : "—";
+    lines.push(
+      `動画 pos ${formatHealthSeconds(video.current_time_secs)} · buf ${formatHealthSeconds(video.buffer_ahead_secs)}`
+    );
+    lines.push(`ready ${video.ready_state} · drop ${dropped}`);
+    const transport = [];
+    if (Number.isFinite(video.hls_bandwidth_bps)) {
+      transport.push(`bw ${(video.hls_bandwidth_bps / 1_000_000).toFixed(1)}Mbps`);
+    }
+    if (Number.isFinite(video.last_fragment_load_ms)) {
+      transport.push(`seg ${formatMs(video.last_fragment_load_ms)}`);
+    }
+    if (video.connection_effective_type) transport.push(video.connection_effective_type);
+    if (Number.isFinite(video.connection_rtt_ms)) {
+      transport.push(`rtt ${Math.round(video.connection_rtt_ms)}ms`);
+    }
+    lines.push(transport.length ? transport.join(" · ") : "bw — · seg —");
+  } else {
+    lines.push(
+      image
+        ? `画像 fetch ${formatMs(image.fetch_ms)} / ${formatBytes(image.bytes)}`
+        : "画像 fetch — / —"
+    );
+    lines.push(image ? `decode ${formatMs(image.decode_ms)}` : "decode —");
+    lines.push(
+      grid
+        ? `一覧 ${formatMs(grid.duration_ms)} (${grid.rendered_count}件)`
+        : "一覧 —"
+    );
+    lines.push(
+      recent.length
+        ? `表示中央値(${recent.length}) ${formatMs(median(recent))}`
+        : "表示中央値 —"
+    );
+  }
   lines.push(
-    image
-      ? `画像 fetch ${formatMs(image.fetch_ms)} / ${formatBytes(image.bytes)}`
-      : "画像 fetch — / —"
+    `error(60s) ${hudState.errors.length}  · ${debugDetails ? "tapで設定" : "tapで隠す"}`
   );
-  lines.push(image ? `decode ${formatMs(image.decode_ms)}` : "decode —");
-  lines.push(
-    grid
-      ? `一覧 ${formatMs(grid.duration_ms)} (${grid.rendered_count}件)`
-      : "一覧 —"
-  );
-  lines.push(
-    recent.length
-      ? `表示中央値(${recent.length}) ${formatMs(median(recent))}`
-      : "表示中央値 —"
-  );
-  lines.push(`error(60s) ${hudState.errors.length}  · tapで隠す`);
   hudElement.textContent = lines.join("\n");
+}
+
+function formatHealthSeconds(value) {
+  return value !== null && value !== undefined && Number.isFinite(Number(value))
+    ? `${Number(value).toFixed(1)}s`
+    : "—";
 }
 
 function safeResourcePath(value) {

@@ -837,6 +837,32 @@ guard で、動画処理開始後の timeout 9 個には数えない。
   switch 競合ではない。fatal の具体的 `type/details` は旧 telemetry には無く、上記計測で次回
   再現時に確定する。buffer量の設定変更はこの是正には含めない
 
+#### 動画健全度 HUD / 定期 telemetry / 2 段階記録 (2026-08-06)
+
+- 動画 viewer は `video_health` snapshot を一つの builder で作る。`currentTime` と全体動画位置、
+  buffered ahead / range 数、ready/network/media error、play intent / paused / waiting、frame drop、
+  hls.js bandwidth estimate / loading state、直近 fragment load 時間・sequence、利用可能な場合だけ
+  Network Information API の effective type / RTT / downlink を含む。URL は snapshot の通常 fields に
+  コピーしない。`getVideoPlaybackQuality` / Network Information API が無い場合は `null` とする
+- HUD は動画 viewer が存在する間だけ画像/一覧行を動画行へ差し替え、位置、先読み秒、readyState、
+  dropped/total frames、帯域推定、segment 時間、回線情報を小さい 3 行にまとめる。viewer の destroy で
+  snapshot を解除し、従来の画像/一覧 HUD へ戻す
+- stream session があり、play intent が ON、session block 外なら、再生時刻の進行とは独立した timer で
+  10 秒ごとに `trigger=periodic` を送る。hls.js が止まり currentTime が変わらなくても timer は継続する。
+  意図的 pause、viewer destroy、session block では止める。3 秒 waiting 表示時、15 秒 stall terminal、
+  hls fatal、video element error は周期を待たず health snapshot を即時送信する
+- telemetry は queue へ入れる直前に `normal` / `debug` の 2 段へ正規化する。通常段は既定で、
+  数値・boolean・固定列挙を残し、path/address/resource、message/stack、client/session 識別子を再帰的に
+  除く。これにより既存の window/fetch/image event も通常段では同じ境界に従う。詳細段だけ remote
+  address (favorite ID + relative path + subresource)、server/diagnostic message、端末 ID を残す
+- 詳細段の ON/OFF は端末 local setting `telemetryDebugDetails` (version 1 への後方互換な加法、既定
+  `false`) が所有する。ON 中は HUD を隠せず「詳細記録 ON」と橙色枠を常時表示し、tap で端末設定へ
+  戻る。端末は PC の絶対 path を持たないため新たに公開せず、remote address と本体 perf log を相関する
+- remote session ID はどちらの段にも生値を出さない。Web Crypto の SHA-256 を 96 bit に短縮した
+  `remote_session_correlation` だけを詳細段へ付け、Web Crypto 非対応時は省略する。client 側でも既知の
+  session 生値を置換し、disk 書き込みは従来どおり `permanent_log_secrets` と
+  `redact_serialized_secret` を通る。PIN / Bearer token の例外段は作らない
+
 #### 実機待ち時間是正 A: seek preview (2026-08-03)
 
 - protocol v18 の thumbnail request は UI thread で既存 worker の要求と cache snapshot だけを

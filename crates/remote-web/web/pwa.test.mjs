@@ -248,6 +248,17 @@ test("critical telemetry is submitted before session-transition UI side effects"
   assert.match(app, /path === "\/api\/video\/state"\) return "video_poll"/);
 });
 
+test("video health HUD and persistent debug-tier warning stay wired", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  const css = await readFile(new URL("styles.css", here), "utf8");
+  assert.match(app, /publishVideoHealth:[\s\S]*hudState\.video = snapshot/);
+  assert.match(app, /buffer_ahead_secs/);
+  assert.match(app, /dropped_video_frames/);
+  assert.match(app, /詳細記録 ON/);
+  assert.match(app, /telemetryDebugDetails[\s\S]*openLocalSettingsDialog\(\)/);
+  assert.match(css, /#telemetry-hud\[data-telemetry-tier="debug"\]/);
+});
+
 test("colorize controls use the adjustment preview and commit path without losing custom points", async () => {
   const app = await readFile(new URL("app.js", here), "utf8");
   assert.match(app, /normalizeRemoteColorizeParams\(source\.colorize\)/);

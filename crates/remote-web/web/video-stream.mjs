@@ -25,6 +25,7 @@ import {
 const HLS_MIME = "application/vnd.apple.mpegurl";
 const HLS_SCRIPT_PATH = "/vendor/hls.min.js";
 const VIDEO_STATE_POLL_MS = 1000;
+const VIDEO_HEALTH_TELEMETRY_MS = 10000;
 const WAITING_SUGGESTION_MS = 3000;
 const PLAYBACK_STALL_TIMEOUT_MS = 15000;
 const STARTUP_MEDIA_SEGMENT_TIMEOUT_MS = 15000;
@@ -210,6 +211,15 @@ function hlsHttpErrorCode(data) {
   return typeof body?.error === "string" ? body.error : "";
 }
 
+function hlsHttpMessage(data) {
+  let body = data?.response?.data;
+  if (body instanceof Uint8Array) body = new TextDecoder().decode(body);
+  if (typeof body === "string") {
+    try { body = JSON.parse(body); } catch { return ""; }
+  }
+  return typeof body?.message === "string" ? body.message : "";
+}
+
 function boundedTelemetryEnum(value, fallback = "unknown") {
   const normalized = String(value ?? "");
   return /^[A-Za-z0-9_.:-]{1,120}$/.test(normalized) ? normalized : fallback;
@@ -234,6 +244,131 @@ function mediaRangeMetrics(ranges, currentTimeSecs) {
     count,
     aheadSecs: Math.round(ahead * 1000) / 1000,
   };
+}
+
+function finiteTelemetryNumber(value, digits = 3) {
+  if (value === null || value === undefined || value === "") return null;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  const scale = 10 ** digits;
+  return Math.round(numeric * scale) / scale;
+}
+
+function boundedTelemetryText(value, maxLength = 800) {
+  const text = String(value ?? "");
+  return text.length <= maxLength ? text : `${text.slice(0, maxLength)}…`;
+}
+
+function detailedRemoteAddress(address) {
+  if (!address || typeof address !== "object") return null;
+  const subresource = address.subresource ?? {};
+  const kind = boundedTelemetryEnum(subresource.kind, "file");
+  const detail = { kind };
+  if (typeof subresource.entry_name === "string") {
+    detail.entry_name = boundedTelemetryText(subresource.entry_name, 600);
+  }
+  if (typeof subresource.prefix === "string") {
+    detail.prefix = boundedTelemetryText(subresource.prefix, 600);
+  }
+  const pageNumber = Number(subresource.page_number);
+  if (Number.isSafeInteger(pageNumber) && pageNumber >= 0) detail.page_number = pageNumber;
+  return {
+    favorite_id: boundedTelemetryText(address.favorite_id, 128),
+    relative_path: boundedTelemetryText(address.relative_path, 600),
+    subresource: detail,
+  };
+}
+
+function videoTelemetryDetailedFields(context) {
+  if (!context?.enabled) return {};
+  const result = {};
+  const remoteAddress = detailedRemoteAddress(context.address);
+  if (remoteAddress) result.remote_address = remoteAddress;
+  if (context.serverMessage) {
+    result.server_message = boundedTelemetryText(context.serverMessage);
+  }
+  if (context.diagnosticMessage) {
+    result.diagnostic_message = boundedTelemetryText(context.diagnosticMessage);
+  }
+  return result;
+}
+
+export function hlsFragmentLoadMetrics(data = {}) {
+  const start = Number(data?.stats?.loading?.start);
+  const end = Number(data?.stats?.loading?.end);
+  const sequence = Number(data?.frag?.sn);
+  return {
+    load_ms:
+      Number.isFinite(start) && Number.isFinite(end) && end >= start
+        ? finiteTelemetryNumber(end - start, 1)
+        : null,
+    sequence: Number.isFinite(sequence) ? sequence : null,
+  };
+}
+
+export function videoHealthSamplingDecision({
+  destroyed = false,
+  session = null,
+  playRequested = false,
+  blocked = false,
+} = {}) {
+  return !destroyed && session !== null && session !== undefined && Boolean(playRequested) && !blocked;
+}
+
+export function videoHealthSample({
+  trigger = "hud",
+  video = {},
+  sourcePositionSecs = 0,
+  playRequested = false,
+  playbackMode = "native",
+  generation = null,
+  hls = null,
+  fragment = null,
+  connection = null,
+  waiting = false,
+  detailedContext = null,
+} = {}) {
+  const currentTimeSecs = Math.max(0, Number(video.currentTime) || 0);
+  const buffered = mediaRangeMetrics(video.buffered, currentTimeSecs);
+  const quality = video.playbackQuality ?? null;
+  const droppedFrames = Number(quality?.droppedVideoFrames);
+  const totalFrames = Number(quality?.totalVideoFrames);
+  const bandwidth = Number(hls?.bandwidthEstimate);
+  const generationNumber = generation === null || generation === undefined
+    ? Number.NaN
+    : Number(generation);
+  const result = {
+    type: "video_health",
+    trigger: boundedTelemetryEnum(trigger),
+    current_time_secs: finiteTelemetryNumber(currentTimeSecs),
+    source_position_secs: finiteTelemetryNumber(Math.max(0, Number(sourcePositionSecs) || 0)),
+    buffer_ahead_secs: buffered.aheadSecs,
+    buffered_range_count: buffered.count,
+    ready_state: Math.max(0, Number(video.readyState) || 0),
+    network_state: Math.max(0, Number(video.networkState) || 0),
+    media_error_code: Math.max(0, Number(video.errorCode) || 0),
+    paused: Boolean(video.paused),
+    ended: Boolean(video.ended),
+    play_requested: Boolean(playRequested),
+    waiting: Boolean(waiting),
+    playback_mode: boundedTelemetryEnum(playbackMode),
+    generation: Number.isFinite(generationNumber) ? generationNumber : null,
+    dropped_video_frames: Number.isFinite(droppedFrames) ? droppedFrames : null,
+    total_video_frames: Number.isFinite(totalFrames) ? totalFrames : null,
+    hls_bandwidth_bps: Number.isFinite(bandwidth) ? Math.max(0, Math.round(bandwidth)) : null,
+    hls_loading_enabled: hls ? Boolean(hls.loadingEnabled) : null,
+    hls_buffering_enabled: hls ? Boolean(hls.bufferingEnabled) : null,
+    last_fragment_load_ms: finiteTelemetryNumber(fragment?.load_ms, 1),
+    last_fragment_sequence: Number.isFinite(Number(fragment?.sequence))
+      ? Number(fragment.sequence)
+      : null,
+    connection_effective_type: connection?.effectiveType
+      ? boundedTelemetryEnum(connection.effectiveType, "unknown")
+      : null,
+    connection_rtt_ms: finiteTelemetryNumber(connection?.rtt, 0),
+    connection_downlink_mbps: finiteTelemetryNumber(connection?.downlink, 2),
+  };
+  return { ...result, ...videoTelemetryDetailedFields(detailedContext) };
 }
 
 /// Keep hls.js diagnostics useful without copying URLs, response bodies or exception text.
@@ -1300,6 +1435,8 @@ export class VideoStreamViewer {
     apiPostJson,
     subscribeRemoteSessionState = () => () => {},
     reportPlaybackIssue = () => {},
+    publishVideoHealth = () => {},
+    getTelemetryDebugContext = () => ({ enabled: false }),
     keyboardAvailable = true,
     getPanelTab = () => "functions",
     setPanelTab = () => {},
@@ -1312,6 +1449,8 @@ export class VideoStreamViewer {
     this.apiJson = apiJson;
     this.apiPostJson = apiPostJson;
     this.reportPlaybackIssue = reportPlaybackIssue;
+    this.publishVideoHealth = publishVideoHealth;
+    this.getTelemetryDebugContext = getTelemetryDebugContext;
     this.quality = "standard";
     this.volume = 1;
     this.duration = 0;
@@ -1332,6 +1471,10 @@ export class VideoStreamViewer {
     this.draggingSeek = false;
     this.hls = null;
     this.pollTimer = 0;
+    this.healthTelemetryTimer = 0;
+    this.lastFragmentHealth = null;
+    this.lastServerMessage = "";
+    this.lastDiagnosticMessage = "";
     this.playbackStallWatch = null;
     this.hlsErrorTelemetryAt = new Map();
     this.startupWatch = null;
@@ -1481,6 +1624,7 @@ export class VideoStreamViewer {
       this.checkPlaybackStartupProgress();
       this.clearWaiting();
       this.finishSeekPreviewForAttachedGeneration();
+      this.captureVideoHealth("hud");
     };
     this.onCanPlay = () => {
       this.checkPlaybackStartupProgress();
@@ -1498,6 +1642,7 @@ export class VideoStreamViewer {
         "media_element_stalled",
         this.playbackLayerDiagnostics()
       );
+      this.captureVideoHealth("hud");
       this.beginWaiting("stalled");
     };
     this.onEnded = () => this.handlePlaybackBoundary(true);
@@ -1508,6 +1653,8 @@ export class VideoStreamViewer {
         this.generationSwitch.isSwitching()
       ) return;
       const startup = this.startupWatch;
+      this.rememberPlaybackError(this.video.error);
+      this.captureVideoHealth("media_error", { telemetry: true });
       this.recordPlaybackIssue(
         "video_stream_media_element_error",
         "media_element_error",
@@ -1565,6 +1712,7 @@ export class VideoStreamViewer {
       restorePlaying: this.playRequested,
     };
     this.clearPoll();
+    this.clearHealthTelemetry();
     this.generationSwitch.cancel();
     this.seekThumbnailAbort?.abort();
     this.clearWaiting();
@@ -1596,6 +1744,10 @@ export class VideoStreamViewer {
   async start(positionSecs = null, restorePlaying = true) {
     this.playRequested = restorePlaying;
     this.clearPoll();
+    this.clearHealthTelemetry();
+    this.lastFragmentHealth = null;
+    this.lastServerMessage = "";
+    this.lastDiagnosticMessage = "";
     this.showNotice("動画を準備しています。", "waiting");
     let started;
     try {
@@ -1614,6 +1766,7 @@ export class VideoStreamViewer {
       );
     } catch (error) {
       if (error?.name === "AbortError" || this.destroyed) return;
+      this.rememberPlaybackError(error);
       this.showStartFailure(error);
       return;
     }
@@ -1674,6 +1827,8 @@ export class VideoStreamViewer {
       this.playIfRequested();
     }
     this.schedulePoll(0);
+    this.syncHealthTelemetry();
+    this.captureVideoHealth("hud");
   }
 
   async requestWithWaiting(operation) {
@@ -1682,6 +1837,7 @@ export class VideoStreamViewer {
         return await operation();
       } catch (error) {
         if (error?.name === "AbortError") throw error;
+        this.rememberPlaybackError(error);
         const decision = videoHttpStatusDecision(
           error?.status,
           error?.retryAfterSeconds,
@@ -1857,10 +2013,10 @@ export class VideoStreamViewer {
       try {
         Hls = await loadHlsJs();
       } catch (error) {
+        this.rememberPlaybackError(error);
         this.recordPlaybackIssue(
           "video_stream_hls_js_load_failed",
-          "hls_js_script_load_failed",
-          { load_error_message: String(error?.message ?? error) }
+          "hls_js_script_load_failed"
         );
       }
     }
@@ -1901,7 +2057,9 @@ export class VideoStreamViewer {
     hls.on(Hls.Events.ERROR, (_event, data) => this.onHlsError(hls, data));
     hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
       if (data?.frag && data.frag.sn !== "initSegment") {
+        this.lastFragmentHealth = hlsFragmentLoadMetrics(data);
         this.markPlaybackMediaSegmentLoaded();
+        this.captureVideoHealth("hud");
       }
     });
     this.beginPlaybackStartupWatch("hls_js");
@@ -1912,6 +2070,9 @@ export class VideoStreamViewer {
 
   onHlsError(source, data) {
     if (this.destroyed || this.hls !== source) return;
+    const serverMessage = hlsHttpMessage(data);
+    if (serverMessage) this.lastServerMessage = serverMessage;
+    if (data?.error) this.rememberPlaybackError(data.error);
     const status = hlsHttpStatus(data);
     const telemetryDetails = {
       ...hlsErrorTelemetryDetails(data, this.video),
@@ -1933,6 +2094,7 @@ export class VideoStreamViewer {
         telemetryDetails
       );
     }
+    if (data?.fatal) this.captureVideoHealth("hls_fatal", { telemetry: true });
     if (status) {
       const decision = videoHttpStatusDecision(
         status,
@@ -2046,6 +2208,7 @@ export class VideoStreamViewer {
 
   async setPlaying(playing) {
     this.playRequested = Boolean(playing);
+    this.syncHealthTelemetry();
     if (this.session && Boolean(this.lastState?.play_intent) !== this.playRequested) {
       await this.apiPostJson(
         "/api/video/control",
@@ -2058,6 +2221,7 @@ export class VideoStreamViewer {
     else {
       this.clearWaiting();
       this.video.pause();
+      this.captureVideoHealth("hud");
     }
   }
 
@@ -2160,10 +2324,10 @@ export class VideoStreamViewer {
       .then(() => this.pollSeekThumbnail(request, controller))
       .catch((error) => {
         if (error?.name !== "AbortError" && !this.destroyed) {
+          this.rememberPlaybackError(error);
           this.recordPlaybackIssue(
             "video_seek_thumbnail_failed",
-            "seek_thumbnail_request_failed",
-            { error_message: String(error?.message ?? error) }
+            "seek_thumbnail_request_failed"
           );
         }
       });
@@ -2393,6 +2557,7 @@ export class VideoStreamViewer {
     this.updateAudioProcessing(mediaState.audio_processing, true);
     this.playRequested = Boolean(mediaState.play_intent);
     if (!this.playRequested) this.clearWaiting();
+    this.syncHealthTelemetry();
     this.seekInput.max = String(this.duration);
     if (
       shouldReanchorVideoTimeline({
@@ -2472,6 +2637,100 @@ export class VideoStreamViewer {
     this.diagnostics.classList.toggle("is-warning", Boolean(this.audioProcessing.warning));
   }
 
+  telemetryDebugContext() {
+    let context = {};
+    try {
+      context = this.getTelemetryDebugContext?.() ?? {};
+    } catch {}
+    return {
+      ...context,
+      address: this.address,
+      serverMessage: this.lastServerMessage,
+      diagnosticMessage: this.lastDiagnosticMessage,
+    };
+  }
+
+  rememberPlaybackError(error) {
+    const serverMessage = String(error?.serverMessage ?? "");
+    if (serverMessage) this.lastServerMessage = serverMessage;
+    const diagnosticMessage = String(error?.message ?? "");
+    if (diagnosticMessage && diagnosticMessage !== serverMessage) {
+      this.lastDiagnosticMessage = diagnosticMessage;
+    }
+  }
+
+  captureVideoHealth(trigger = "hud", { telemetry = false } = {}) {
+    if (this.destroyed) return null;
+    let playbackQuality = null;
+    try {
+      playbackQuality = this.video.getVideoPlaybackQuality?.() ?? null;
+    } catch {}
+    const connection =
+      globalThis.navigator?.connection ??
+      globalThis.navigator?.mozConnection ??
+      globalThis.navigator?.webkitConnection ??
+      null;
+    const snapshot = videoHealthSample({
+      trigger,
+      video: {
+        currentTime: this.video.currentTime,
+        readyState: this.video.readyState,
+        networkState: this.video.networkState,
+        errorCode: this.video.error?.code,
+        paused: this.video.paused,
+        ended: this.video.ended,
+        buffered: this.video.buffered,
+        playbackQuality,
+      },
+      sourcePositionSecs: this.currentPosition(),
+      playRequested: this.playRequested,
+      playbackMode: this.hls ? "hls_js" : "native",
+      generation: this.generation,
+      hls: this.hls,
+      fragment: this.lastFragmentHealth,
+      connection,
+      waiting: this.playbackStallWatch !== null,
+      detailedContext: this.telemetryDebugContext(),
+    });
+    try {
+      this.publishVideoHealth(snapshot, { telemetry });
+    } catch {}
+    return snapshot;
+  }
+
+  syncHealthTelemetry() {
+    const eligible = videoHealthSamplingDecision({
+      destroyed: this.destroyed,
+      session: this.session,
+      playRequested: this.playRequested,
+      blocked: this.remoteSessionState.blocksInteraction,
+    });
+    if (!eligible) {
+      this.clearHealthTelemetry();
+      return;
+    }
+    if (this.healthTelemetryTimer) return;
+    this.healthTelemetryTimer = setTimeout(() => {
+      this.healthTelemetryTimer = 0;
+      if (!videoHealthSamplingDecision({
+        destroyed: this.destroyed,
+        session: this.session,
+        playRequested: this.playRequested,
+        blocked: this.remoteSessionState.blocksInteraction,
+      })) return;
+      this.captureVideoHealth("periodic", { telemetry: true });
+      this.syncHealthTelemetry();
+    }, VIDEO_HEALTH_TELEMETRY_MS);
+  }
+
+  clearHealthTelemetry({ clearHud = false } = {}) {
+    clearTimeout(this.healthTelemetryTimer);
+    this.healthTelemetryTimer = 0;
+    if (clearHud) {
+      try { this.publishVideoHealth(null); } catch {}
+    }
+  }
+
   schedulePoll(delayMs = VIDEO_STATE_POLL_MS) {
     this.clearPoll();
     if (this.destroyed || this.remoteSessionState.blocksInteraction || !this.session) return;
@@ -2517,9 +2776,11 @@ export class VideoStreamViewer {
           url: `/stream/${this.session}/${mediaState.generation}/index.m3u8`,
         });
       }
+      this.captureVideoHealth("hud");
       this.schedulePoll();
     } catch (error) {
       if (error?.name === "AbortError") throw error;
+      this.rememberPlaybackError(error);
       const decision = videoHttpStatusDecision(
         error?.status,
         error?.retryAfterSeconds,
@@ -2573,6 +2834,7 @@ export class VideoStreamViewer {
       this.schedulePoll();
     } catch (error) {
       if (error?.name === "AbortError") return;
+      this.rememberPlaybackError(error);
       if ([404, 409, 410].includes(Number(error?.status))) {
         this.playRequested = restorePlaying;
         await this.restartAt(position);
@@ -2597,6 +2859,7 @@ export class VideoStreamViewer {
     this.restarting = true;
     const oldSession = this.session;
     this.clearPoll();
+    this.clearHealthTelemetry();
     this.generationSwitch.cancel();
     this.stopPlaylistPlayback();
     this.session = null;
@@ -2669,6 +2932,7 @@ export class VideoStreamViewer {
           elapsed_ms: Math.round(performance.now() - watch.startedAt),
         }
       );
+      this.captureVideoHealth("waiting_threshold", { telemetry: true });
       const suggested = bufferingQualitySuggestion({
         waitingSinceMs: watch.startedAt,
         nowMs: performance.now(),
@@ -2748,6 +3012,7 @@ export class VideoStreamViewer {
         elapsed_since_progress_ms: Math.round(now - watch.lastProgressAt),
       }
     );
+    this.captureVideoHealth("stall_terminal", { telemetry: true });
     this.finishPlaybackLayerFailure(
       "動画の再生が停止しました。現在位置から再接続できます。"
     );
@@ -2856,6 +3121,7 @@ export class VideoStreamViewer {
         internalReason,
         generation: this.generation,
         ...details,
+        ...videoTelemetryDetailedFields(this.telemetryDebugContext?.()),
       });
     } catch {}
   }
@@ -2902,6 +3168,7 @@ export class VideoStreamViewer {
 
   showStartFailure(error) {
     if (this.remoteSessionState.blocksInteraction) return;
+    this.rememberPlaybackError(error);
     const preset = videoQualityPreset(this.quality);
     this.diagnostics.textContent = `画質 ${preset.label} (${preset.traffic})`;
     this.showNotice(
@@ -2921,6 +3188,7 @@ export class VideoStreamViewer {
       this.destroyed ||
       this.remoteSessionState.blocksInteraction
     ) return;
+    this.rememberPlaybackError(error);
     this.showNotice(videoUserErrorMessage(error, prefix), "error");
   }
 
@@ -3039,6 +3307,7 @@ export class VideoStreamViewer {
     this.clearSeekThumbnailObjectUrl();
     this.generationSwitch.cancel();
     this.clearPoll();
+    this.clearHealthTelemetry({ clearHud: true });
     this.clearWaiting();
     for (const timer of this.pendingTimers) clearTimeout(timer);
     this.pendingTimers.clear();

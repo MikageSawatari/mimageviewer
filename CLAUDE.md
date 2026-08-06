@@ -640,7 +640,7 @@ core が service を spawn するとき `--log` を渡していないので、**
 
 `/api/telemetry` に届いたクライアント側のイベントが、HTTP 応答ログの
 `details.telemetry.events[]` として入る。種類は `remote_session` / `error` /
-`command` / `page_prefetch` / `image` / `thumbnail_grid` / `folder_list` など。
+`command` / `page_prefetch` / `image` / `thumbnail_grid` / `folder_list` / `video_health` など。
 
 `type: "error"` のイベントは `category` で分かれる
 (`fetch_non_2xx` / `fetch_error` / `image_load_error` / `window_error` /
@@ -672,6 +672,14 @@ print(c.most_common())
   `remote_session` の `control_transition` は、その JS turn で `sendBeacon`
   (非対応時は keepalive fetch) へ渡す。各 event の
   `client_event_sequence` で、別リクエストになった transition と例外の前後を復元できる
+- `video_health` は play intent 中に10秒周期で、current time / 全体位置、buffered ahead、ready state、
+  frame drop、hls.js bandwidth / fragment load、利用可能なら回線種別 / RTT を残す。current time が
+  停止しても周期は止まらない。`waiting_threshold` / `stall_terminal` / `hls_fatal` / `media_error` は即時
+- telemetry は enqueue 前に `normal` (既定) / `debug` へ段階化される。normal は数値・固定列挙を残し、
+  path/address/resource、message/stack、client/session 識別子を除く。debug は端末設定の明示 ON 時だけ
+  remote address、message、client ID、SHA-256 短縮 session 相関値を残す。ON 中は HUD の
+  「詳細記録 ON」が常時見える。remote session 生値、PIN、Bearer token はどちらにも出さず、server の
+  `permanent_log_secrets` / `redact_serialized_secret` を最終境界として維持する
 - セッション transition は `observer` (`ping` / `video_poll` / `acquire` など)、
   `observed_status` / `http_status`、遷移前後の status / phase /
   `blocks_interaction` を持つ。server message、URL、client/session ID は載せない

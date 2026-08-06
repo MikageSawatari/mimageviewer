@@ -54,6 +54,8 @@ import {
   thumbnailRequestStartCount,
   thumbnailRetryDecision,
   telemetryDeliveryMode,
+  telemetryEventForTier,
+  telemetrySessionCorrelation,
   shouldShowGridCursor,
   shouldShowLoadingIndicator,
   shouldShowKeyboardShortcuts,
@@ -334,6 +336,76 @@ test("uncaught JS, terminal playback failures and session transitions are immedi
     type: "remote_session",
     action: "acquire",
   }), "batch");
+  assert.equal(telemetryDeliveryMode({
+    type: "video_health",
+    trigger: "periodic",
+  }), "batch");
+  assert.equal(telemetryDeliveryMode({
+    type: "video_health",
+    trigger: "waiting_threshold",
+  }), "immediate");
+});
+
+test("normal telemetry keeps health facts but removes path, message and identity fields", () => {
+  const event = telemetryEventForTier({
+    type: "video_health",
+    trigger: "periodic",
+    current_time_secs: 42.5,
+    buffer_ahead_secs: 8.25,
+    ready_state: 2,
+    message: "server message C:/private/movie.mp4",
+    stack: "at C:/private/app.js:10",
+    resource: "/private/movie.mp4",
+    remote_address: { favorite_id: "fav", relative_path: "private/movie.mp4" },
+    client_id: "browser-client-secret",
+    remote_session_correlation: "0123456789abcdef01234567",
+  });
+
+  assert.deepEqual(event, {
+    type: "video_health",
+    trigger: "periodic",
+    current_time_secs: 42.5,
+    buffer_ahead_secs: 8.25,
+    ready_state: 2,
+    telemetry_tier: "normal",
+  });
+});
+
+test("debug telemetry keeps diagnostic context but redacts the live session capability", () => {
+  const rawSession = "0123456789abcdef0123456789abcdef";
+  const event = telemetryEventForTier({
+    type: "video_health",
+    trigger: "periodic",
+    remote_address: { favorite_id: "fav", relative_path: "movie.mp4" },
+    server_message: `session ${rawSession} failed`,
+  }, {
+    detailed: true,
+    clientId: "browser-client-1234",
+    sessionCorrelation: "00112233445566778899aabb",
+    sensitiveValues: [rawSession],
+  });
+
+  assert.equal(event.telemetry_tier, "debug");
+  assert.equal(event.client_id, "browser-client-1234");
+  assert.equal(event.remote_session_correlation, "00112233445566778899aabb");
+  assert.equal(event.remote_address.relative_path, "movie.mp4");
+  assert.equal(event.server_message, "session [redacted-secret] failed");
+  assert.doesNotMatch(JSON.stringify(event), new RegExp(rawSession));
+});
+
+test("remote session correlation is a stable truncated SHA-256 derivative", async () => {
+  const subtle = {
+    async digest(algorithm, bytes) {
+      assert.equal(algorithm, "SHA-256");
+      assert.equal(new TextDecoder().decode(bytes), "remote-session");
+      return Uint8Array.from({ length: 32 }, (_, index) => index).buffer;
+    },
+  };
+  assert.equal(
+    await telemetrySessionCorrelation("remote-session", subtle),
+    "000102030405060708090a0b"
+  );
+  assert.equal(await telemetrySessionCorrelation("remote-session", null), "");
 });
 
 test("session failure detection ignores feature-level 409 responses", () => {

@@ -173,6 +173,11 @@ button {
   display: none;
 }
 
+#telemetry-hud[data-telemetry-tier="debug"] {
+  border-color: rgb(255 186 74 / 72%);
+  color: #fff0cd;
+}
+
 .pin-screen {
   display: grid;
   width: 100%;

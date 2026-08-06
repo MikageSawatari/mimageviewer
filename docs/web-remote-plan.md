@@ -976,12 +976,15 @@ fallback がある本で既定 mode を明示した場合も継承を上書き�
 
 端末ごとの設定は server へ送らず、localStorage の単一 key
 `miv-remote-local-settings` に JSON
-`{"version":1,"portraitSinglePage":boolean,"gestureHelpDismissed":boolean}` として保存する。
+`{"version":1,...}` aggregate として保存する。`portraitSinglePage` / `gestureHelpDismissed` / 画像画質 /
+grid 列数に加え、診断の詳細段を端末ごとに明示 opt-in する `telemetryDebugDetails` を持つ。
 既定は `portraitSinglePage=true`。☰ の「端末の設定」で OFF にすると縦持ちでも保存済み見開きを
 維持する。parse / normalize / serialize は純粋関数とし、未知 version、壊れた JSON、型不正は
 安全な既定値へ戻す。localStorage の取得・保存例外は wrapper で捕捉し、そのタブ内のメモリ値で
 動作を継続する。項目追加時は version 方針を決め、`defaultLocalSettings`、
 `normalizeLocalSettings`、設定画面、round-trip / 不正値テストを同じ aggregate objectへ追加する。
+`telemetryDebugDetails` は version 1 への後方互換な加法で既定 OFF とし、ON 中は右下 HUD が
+「詳細記録 ON」を常時表示して tap で設定へ戻る。
 
 ### 12.9 閲覧中の操作 UI (2026-08-01)
 

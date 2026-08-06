@@ -11,6 +11,7 @@ export function defaultLocalSettings() {
     gestureHelpDismissed: false,
     gridColumnsPortrait: 0,
     gridColumnsLandscape: 0,
+    telemetryDebugDetails: false,
   };
 }
 
@@ -45,6 +46,10 @@ export function normalizeLocalSettings(value) {
       value.gridColumnsLandscape,
       defaults.gridColumnsLandscape
     ),
+    telemetryDebugDetails:
+      typeof value.telemetryDebugDetails === "boolean"
+        ? value.telemetryDebugDetails
+        : defaults.telemetryDebugDetails,
   };
 }
 

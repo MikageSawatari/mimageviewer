@@ -8,11 +8,14 @@ import {
   VideoStreamViewer,
   hlsBufferConfig,
   hlsErrorTelemetryDetails,
+  hlsFragmentLoadMetrics,
   preventVideoNativeZoom,
   resolveVideoPlaylist,
   videoAudioProcessingPresentation,
   videoEndDecision,
   videoPlaybackStallDecision,
+  videoHealthSample,
+  videoHealthSamplingDecision,
   videoUserErrorMessage,
 } from "./video-stream.mjs";
 
@@ -25,6 +28,7 @@ test("blocked remote session stops playback once and prevents another poll", () 
     playRequested: true,
     currentPosition: () => 42.5,
     clearPoll: () => calls.push("clear_poll"),
+    clearHealthTelemetry: () => calls.push("clear_health"),
     generationSwitch: { cancel: () => calls.push("cancel_switch") },
     seekThumbnailAbort: { abort: () => calls.push("abort_thumbnail") },
     clearWaiting: () => calls.push("clear_waiting"),
@@ -39,6 +43,7 @@ test("blocked remote session stops playback once and prevents another poll", () 
   });
   assert.deepEqual(calls, [
     "clear_poll",
+    "clear_health",
     "cancel_switch",
     "abort_thumbnail",
     "clear_waiting",
@@ -47,7 +52,7 @@ test("blocked remote session stops playback once and prevents another poll", () 
   VideoStreamViewer.prototype.applyRemoteSessionState.call(viewer, {
     blocksInteraction: true,
   });
-  assert.equal(calls.length, 5);
+  assert.equal(calls.length, 6);
 
   let cleared = false;
   VideoStreamViewer.prototype.schedulePoll.call({
@@ -90,6 +95,8 @@ test("video start ends a busy attempt visibly instead of retrying forever", asyn
     quality: "standard",
     abortController: { signal: new AbortController().signal },
     clearPoll: () => {},
+    clearHealthTelemetry: () => {},
+    rememberPlaybackError: () => {},
     showNotice: (...args) => notices.push(args),
     apiPostJson: async () => {
       startRequests += 1;
@@ -262,6 +269,157 @@ test("playback issue reports omit the remote session credential", () => {
   assert.doesNotMatch(JSON.stringify(reports), /remote-session-secret/);
 });
 
+test("video health samples distinguish buffer starvation from a stopped playback layer", () => {
+  const ranges = {
+    length: 2,
+    start: (index) => index === 0 ? 10 : 80,
+    end: (index) => index === 0 ? 54.25 : 90,
+  };
+  const sample = videoHealthSample({
+    trigger: "periodic",
+    video: {
+      currentTime: 50,
+      readyState: 2,
+      networkState: 2,
+      errorCode: 0,
+      paused: false,
+      ended: false,
+      buffered: ranges,
+      playbackQuality: { droppedVideoFrames: 7, totalVideoFrames: 1200 },
+    },
+    sourcePositionSecs: 350,
+    playRequested: true,
+    playbackMode: "hls_js",
+    generation: 6,
+    hls: {
+      bandwidthEstimate: 5_432_100,
+      loadingEnabled: false,
+      bufferingEnabled: false,
+    },
+    fragment: { load_ms: 82.34, sequence: 117 },
+    connection: { effectiveType: "4g", rtt: 51, downlink: 8.25 },
+    waiting: true,
+  });
+
+  assert.deepEqual(sample, {
+    type: "video_health",
+    trigger: "periodic",
+    current_time_secs: 50,
+    source_position_secs: 350,
+    buffer_ahead_secs: 4.25,
+    buffered_range_count: 2,
+    ready_state: 2,
+    network_state: 2,
+    media_error_code: 0,
+    paused: false,
+    ended: false,
+    play_requested: true,
+    waiting: true,
+    playback_mode: "hls_js",
+    generation: 6,
+    dropped_video_frames: 7,
+    total_video_frames: 1200,
+    hls_bandwidth_bps: 5_432_100,
+    hls_loading_enabled: false,
+    hls_buffering_enabled: false,
+    last_fragment_load_ms: 82.3,
+    last_fragment_sequence: 117,
+    connection_effective_type: "4g",
+    connection_rtt_ms: 51,
+    connection_downlink_mbps: 8.25,
+  });
+});
+
+test("video health normal tier has no path while debug context adds a bounded remote address", () => {
+  const base = {
+    video: { buffered: { length: 0 } },
+    detailedContext: {
+      enabled: true,
+      address: {
+        favorite_id: "favorite-1",
+        relative_path: "private/movie.mp4",
+        subresource: { kind: "file" },
+      },
+      serverMessage: "server detail",
+      diagnosticMessage: "decoder detail",
+    },
+  };
+  const detailed = videoHealthSample(base);
+  assert.equal(detailed.remote_address.relative_path, "private/movie.mp4");
+  assert.equal(detailed.server_message, "server detail");
+  assert.equal(detailed.diagnostic_message, "decoder detail");
+  const normal = videoHealthSample({
+    ...base,
+    detailedContext: { ...base.detailedContext, enabled: false },
+  });
+  assert.equal(normal.remote_address, undefined);
+  assert.equal(normal.server_message, undefined);
+  assert.doesNotMatch(JSON.stringify(normal), /private|server detail|decoder detail/);
+});
+
+test("video health periodic eligibility follows play intent, not media time progress", () => {
+  assert.equal(videoHealthSamplingDecision({
+    session: 6,
+    playRequested: true,
+  }), true);
+  assert.equal(videoHealthSamplingDecision({
+    session: 6,
+    playRequested: true,
+    blocked: true,
+  }), false);
+  assert.equal(videoHealthSamplingDecision({
+    session: 6,
+    playRequested: false,
+  }), false);
+  assert.equal(videoHealthSamplingDecision({
+    session: null,
+    playRequested: true,
+  }), false);
+});
+
+test("video health timer emits every ten seconds even when playback time is unchanged", () => {
+  const scheduled = [];
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  globalThis.setTimeout = (callback, delay) => {
+    scheduled.push({ callback, delay });
+    return scheduled.length;
+  };
+  globalThis.clearTimeout = () => {};
+  try {
+    const captures = [];
+    const viewer = {
+      destroyed: false,
+      session: 6,
+      playRequested: true,
+      remoteSessionState: { blocksInteraction: false },
+      healthTelemetryTimer: 0,
+      clearHealthTelemetry: () => { viewer.healthTelemetryTimer = 0; },
+      captureVideoHealth: (...args) => captures.push(args),
+    };
+    viewer.syncHealthTelemetry = () =>
+      VideoStreamViewer.prototype.syncHealthTelemetry.call(viewer);
+
+    viewer.syncHealthTelemetry();
+    assert.equal(scheduled[0].delay, 10_000);
+    scheduled[0].callback();
+    assert.deepEqual(captures, [["periodic", { telemetry: true }]]);
+    assert.equal(scheduled[1].delay, 10_000, "unchanged playback must schedule the next sample");
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+  }
+});
+
+test("fragment load metrics use hls loading timestamps without copying its URL", () => {
+  const metrics = hlsFragmentLoadMetrics({
+    frag: { sn: 117, url: "https://example.test/private/117.m4s" },
+    stats: { loading: { start: 100.25, end: 184.75 } },
+  });
+  assert.deepEqual(metrics, { load_ms: 84.5, sequence: 117 });
+  assert.doesNotMatch(JSON.stringify(metrics), /example|private/);
+});
+
 test("runtime waiting has one bounded terminal instead of an infinite buffering notice", () => {
   assert.deepEqual(videoPlaybackStallDecision({
     active: true,
@@ -345,6 +503,8 @@ test("fatal hls errors are recorded before entering the reconnect terminal", () 
     },
     hlsErrorTelemetryAt: new Map(),
     playbackLayerDiagnostics: () => ({ hls_loading_enabled: false }),
+    rememberPlaybackError: () => {},
+    captureVideoHealth: (...args) => calls.push(["health", ...args]),
     recordPlaybackIssue: (...args) => calls.push(["telemetry", ...args]),
     clearPlaybackStartupWatch: () => calls.push(["clear_startup"]),
     finishPlaybackLayerFailure: (message) => calls.push(["terminal", message]),
@@ -361,6 +521,7 @@ test("fatal hls errors are recorded before entering the reconnect terminal", () 
   assert.equal(calls[0][1], "video_stream_hls_fatal");
   assert.equal(calls[0][3].hls_error_details, "bufferAppendError");
   assert.deepEqual(calls.slice(1), [
+    ["health", "hls_fatal", { telemetry: true }],
     ["clear_startup"],
     ["terminal", "動画を再生できませんでした。もう一度お試しください。"],
   ]);
@@ -386,6 +547,7 @@ test("an attached visible playback with no progress reaches the reconnect termin
     generationSwitch: { isSwitching: () => false },
     playbackLayerDiagnostics: () => ({ hls_loading_enabled: false }),
     recordPlaybackIssue: (...args) => calls.push(["telemetry", ...args]),
+    captureVideoHealth: (...args) => calls.push(["health", ...args]),
     finishPlaybackLayerFailure: (message) => calls.push(["terminal", message]),
   };
 
@@ -395,7 +557,8 @@ test("an attached visible playback with no progress reaches the reconnect termin
   assert.equal(calls[0][1], "video_stream_playback_stalled");
   assert.equal(calls[0][2], "playback_progress_timeout");
   assert.equal(calls[0][3].hls_loading_enabled, false);
-  assert.deepEqual(calls[1], [
+  assert.deepEqual(calls[1], ["health", "stall_terminal", { telemetry: true }]);
+  assert.deepEqual(calls[2], [
     "terminal",
     "動画の再生が停止しました。現在位置から再接続できます。",
   ]);

@@ -18,6 +18,7 @@ test("local settings use the current defaults when no value exists", () => {
     gestureHelpDismissed: false,
     gridColumnsPortrait: 0,
     gridColumnsLandscape: 0,
+    telemetryDebugDetails: false,
   });
 });
 
@@ -41,6 +42,7 @@ test("local settings serialize and restore as one versioned value", () => {
     gestureHelpDismissed: true,
     gridColumnsPortrait: 3,
     gridColumnsLandscape: 7,
+    telemetryDebugDetails: true,
   };
   assert.deepEqual(parseLocalSettings(serializeLocalSettings(settings)), settings);
 });
@@ -61,6 +63,7 @@ test("storage failures use in-memory defaults and never escape", () => {
     gestureHelpDismissed: true,
     gridColumnsPortrait: 4,
     gridColumnsLandscape: 6,
+    telemetryDebugDetails: true,
   }, unavailable), {
     settings: {
       version: 1,
@@ -69,6 +72,7 @@ test("storage failures use in-memory defaults and never escape", () => {
       gestureHelpDismissed: true,
       gridColumnsPortrait: 4,
       gridColumnsLandscape: 6,
+      telemetryDebugDetails: true,
     },
     saved: false,
   });
@@ -87,6 +91,7 @@ test("storage helpers use one aggregate key", () => {
     gestureHelpDismissed: true,
     gridColumnsPortrait: 2,
     gridColumnsLandscape: 8,
+    telemetryDebugDetails: false,
   }, storage);
   assert.equal(saved.saved, true);
   assert.equal(values.size, 1);
@@ -104,6 +109,7 @@ test("older version-one values add the gesture help default", () => {
       gestureHelpDismissed: false,
       gridColumnsPortrait: 0,
       gridColumnsLandscape: 0,
+      telemetryDebugDetails: false,
     }
   );
 });
@@ -124,6 +130,7 @@ test("grid column settings clamp per field without replacing existing values", (
       gestureHelpDismissed: true,
       gridColumnsPortrait: 2,
       gridColumnsLandscape: 8,
+      telemetryDebugDetails: false,
     }
   );
   assert.deepEqual(
@@ -141,6 +148,7 @@ test("grid column settings clamp per field without replacing existing values", (
       gestureHelpDismissed: true,
       gridColumnsPortrait: 0,
       gridColumnsLandscape: 0,
+      telemetryDebugDetails: false,
     }
   );
 });

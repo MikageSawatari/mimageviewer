@@ -237,7 +237,112 @@ export function telemetryDeliveryMode(event) {
   ) {
     return "immediate";
   }
+  if (
+    event?.type === "video_health" &&
+    ["waiting_threshold", "stall_terminal", "hls_fatal", "media_error"].includes(
+      event?.trigger
+    )
+  ) {
+    return "immediate";
+  }
   return "batch";
+}
+
+const NORMAL_TELEMETRY_OMIT_KEYS = new Set([
+  "address",
+  "client_id",
+  "device_id",
+  "diagnostic_message",
+  "entry_name",
+  "favorite_id",
+  "filename",
+  "load_error_message",
+  "message",
+  "name",
+  "path",
+  "relative_path",
+  "remote_address",
+  "remote_client_id",
+  "remote_session_correlation",
+  "remote_session_id",
+  "resource",
+  "server_message",
+  "session",
+  "session_correlation",
+  "session_id",
+  "stack",
+  "stream_session",
+  "url",
+]);
+
+function redactTelemetryValue(value, secrets) {
+  if (typeof value === "string") {
+    let redacted = value;
+    for (const secret of secrets) {
+      if (secret) redacted = redacted.replaceAll(secret, "[redacted-secret]");
+    }
+    return redacted;
+  }
+  if (Array.isArray(value)) return value.map((item) => redactTelemetryValue(item, secrets));
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [key, redactTelemetryValue(item, secrets)])
+  );
+}
+
+function normalTelemetryValue(value) {
+  if (Array.isArray(value)) return value.map(normalTelemetryValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => !NORMAL_TELEMETRY_OMIT_KEYS.has(key))
+      .map(([key, item]) => [key, normalTelemetryValue(item)])
+  );
+}
+
+/// Apply the collection tier before an event enters either the immediate or batched queue.
+/// The server logger still performs its permanent-secret redaction as the final disk boundary.
+export function telemetryEventForTier(event, {
+  detailed = false,
+  clientId = "",
+  sessionCorrelation = "",
+  sensitiveValues = [],
+} = {}) {
+  const secrets = Array.from(sensitiveValues, (value) => String(value ?? ""))
+    .filter(Boolean);
+  const source = redactTelemetryValue(event ?? {}, secrets);
+  if (!detailed) {
+    return {
+      ...normalTelemetryValue(source),
+      telemetry_tier: "normal",
+    };
+  }
+  const result = {
+    ...source,
+    telemetry_tier: "debug",
+  };
+  const normalizedClientId = String(clientId ?? "");
+  if (/^[A-Za-z0-9_-]{8,128}$/.test(normalizedClientId)) {
+    result.client_id = normalizedClientId;
+  }
+  const normalizedCorrelation = String(sessionCorrelation ?? "");
+  if (/^[a-f0-9]{24}$/.test(normalizedCorrelation)) {
+    result.remote_session_correlation = normalizedCorrelation;
+  }
+  return result;
+}
+
+export async function telemetrySessionCorrelation(sessionId, subtle = globalThis.crypto?.subtle) {
+  const value = String(sessionId ?? "");
+  if (!value || !subtle?.digest || typeof TextEncoder !== "function") return "";
+  try {
+    const digest = await subtle.digest("SHA-256", new TextEncoder().encode(value));
+    return Array.from(new Uint8Array(digest).slice(0, 12), (byte) =>
+      byte.toString(16).padStart(2, "0")
+    ).join("");
+  } catch {
+    return "";
+  }
 }
 
 export function remoteSessionFailureStatus({
