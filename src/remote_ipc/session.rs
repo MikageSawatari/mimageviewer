@@ -142,6 +142,7 @@ struct ActiveSession {
     presence: RemoteClientPresence,
     media_playing: bool,
     streaming: Option<StreamingRegistration>,
+    streaming_workers: BTreeMap<u64, Arc<AtomicBool>>,
     request_count: u64,
     completed_count: u64,
     failed_count: u64,
@@ -152,14 +153,27 @@ struct ActiveSession {
 struct StreamingRegistration {
     id: u64,
     playing: bool,
-    cancel: Arc<AtomicBool>,
 }
 
 impl ActiveSession {
     fn cancel_streaming(&mut self) {
-        if let Some(streaming) = self.streaming.as_ref() {
-            streaming.cancel.store(true, Ordering::Release);
+        for cancel in self.streaming_workers.values() {
+            cancel.store(true, Ordering::Release);
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteStreamingControlError {
+    SessionMissing,
+    SessionGenerationMismatch,
+    RegistrationMissing,
+    RegistrationMismatch,
+}
+
+impl RemoteStreamingControlError {
+    pub(crate) fn is_session_mismatch(self) -> bool {
+        matches!(self, Self::SessionMissing | Self::SessionGenerationMismatch)
     }
 }
 
@@ -244,6 +258,7 @@ impl SessionStateMachine {
             presence: RemoteClientPresence::Foreground,
             media_playing: false,
             streaming: None,
+            streaming_workers: BTreeMap::new(),
             request_count: 0,
             completed_count: 0,
             failed_count: 0,
@@ -412,11 +427,8 @@ impl SessionStateMachine {
         active.cancel_streaming();
         let id = self.next_streaming_registration;
         self.next_streaming_registration = self.next_streaming_registration.wrapping_add(1).max(1);
-        active.streaming = Some(StreamingRegistration {
-            id,
-            playing: true,
-            cancel,
-        });
+        active.streaming = Some(StreamingRegistration { id, playing: true });
+        active.streaming_workers.insert(id, cancel);
         active.last_ping = now;
         active.last_activity = now;
         Ok(id)
@@ -427,18 +439,21 @@ impl SessionStateMachine {
         generation: u64,
         registration_id: u64,
         playing: bool,
-    ) -> bool {
-        let Some(streaming) = self
-            .active
-            .as_mut()
-            .filter(|_| self.generation == generation)
-            .and_then(|active| active.streaming.as_mut())
-            .filter(|streaming| streaming.id == registration_id)
-        else {
-            return false;
+    ) -> Result<(), RemoteStreamingControlError> {
+        let Some(active) = self.active.as_mut() else {
+            return Err(RemoteStreamingControlError::SessionMissing);
         };
+        if self.generation != generation {
+            return Err(RemoteStreamingControlError::SessionGenerationMismatch);
+        }
+        let Some(streaming) = active.streaming.as_mut() else {
+            return Err(RemoteStreamingControlError::RegistrationMissing);
+        };
+        if streaming.id != registration_id {
+            return Err(RemoteStreamingControlError::RegistrationMismatch);
+        }
         streaming.playing = playing;
-        true
+        Ok(())
     }
 
     fn note_segment_fetch(&mut self, now: Duration, generation: u64, registration_id: u64) -> bool {
@@ -477,6 +492,18 @@ impl SessionStateMachine {
             return self.try_finish_drain();
         }
         false
+    }
+
+    fn finish_streaming_worker(&mut self, generation: u64, registration_id: u64) -> bool {
+        let Some(active) = self
+            .active
+            .as_mut()
+            .filter(|_| self.generation == generation)
+        else {
+            return false;
+        };
+        active.streaming_workers.remove(&registration_id);
+        self.try_finish_drain()
     }
 
     fn start_operation(&mut self, generation: u64, token: u64) -> bool {
@@ -594,10 +621,9 @@ impl SessionStateMachine {
     fn try_finish_drain(&mut self) -> bool {
         if self.lifecycle.phase != RemoteControlPhase::DrainingRemote
             || !self.app_drain_complete
-            || self
-                .active
-                .as_ref()
-                .is_some_and(|active| !active.operations.is_empty() || active.streaming.is_some())
+            || self.active.as_ref().is_some_and(|active| {
+                !active.operations.is_empty() || !active.streaming_workers.is_empty()
+            })
         {
             return false;
         }
@@ -1854,6 +1880,13 @@ impl RemoteSessionOwner {
                 registration_id,
             },
             cancel,
+            worker_lease: Some(RemoteStreamingWorkerLease {
+                activity: RemoteStreamingActivity {
+                    handle: self.handle.clone(),
+                    generation: self.generation,
+                    registration_id,
+                },
+            }),
         })
     }
 }
@@ -1861,6 +1894,7 @@ impl RemoteSessionOwner {
 pub(crate) struct RemoteStreamingRegistration {
     activity: RemoteStreamingActivity,
     cancel: Arc<AtomicBool>,
+    worker_lease: Option<RemoteStreamingWorkerLease>,
 }
 
 impl RemoteStreamingRegistration {
@@ -1870,6 +1904,12 @@ impl RemoteStreamingRegistration {
 
     pub(crate) fn activity(&self) -> RemoteStreamingActivity {
         self.activity.clone()
+    }
+
+    pub(crate) fn take_worker_lease(&mut self) -> RemoteStreamingWorkerLease {
+        self.worker_lease
+            .take()
+            .expect("streaming registration worker lease was already taken")
     }
 }
 
@@ -1891,6 +1931,27 @@ impl Drop for RemoteStreamingRegistration {
     }
 }
 
+pub(crate) struct RemoteStreamingWorkerLease {
+    activity: RemoteStreamingActivity,
+}
+
+impl Drop for RemoteStreamingWorkerLease {
+    fn drop(&mut self) {
+        let released = self
+            .activity
+            .handle
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .finish_streaming_worker(self.activity.generation, self.activity.registration_id);
+        if released {
+            self.activity.handle.clear_video_stream(None);
+            self.activity.handle.notify_phase_changed();
+            self.activity.handle.notify_ui();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RemoteStreamingActivity {
     handle: SessionHandle,
@@ -1899,7 +1960,7 @@ pub(crate) struct RemoteStreamingActivity {
 }
 
 impl RemoteStreamingActivity {
-    pub(crate) fn set_playing(&self, playing: bool) -> bool {
+    pub(crate) fn set_playing(&self, playing: bool) -> Result<(), RemoteStreamingControlError> {
         self.handle
             .inner
             .lock()
@@ -2693,7 +2754,8 @@ mod tests {
         assert!(state.active.is_some());
         assert!(!state.complete_app_drain(state.generation));
         assert_eq!(state.lifecycle.phase, RemoteControlPhase::DrainingRemote);
-        assert!(state.unregister_streaming(generation, registration));
+        assert!(!state.unregister_streaming(generation, registration));
+        assert!(state.finish_streaming_worker(generation, registration));
         assert!(state.active.is_none());
         assert_eq!(state.last_release_reason, Some(ReleaseReason::Local));
     }
@@ -2734,7 +2796,8 @@ mod tests {
         assert_eq!(old_owner_status.status, SessionStatus::LocalInUse);
         assert!(old_owner_status.message.contains("本体で切断"));
 
-        assert!(state.unregister_streaming(old_generation, old_registration));
+        assert!(!state.unregister_streaming(old_generation, old_registration));
+        assert!(state.finish_streaming_worker(old_generation, old_registration));
         assert_eq!(state.lifecycle.phase, RemoteControlPhase::Local);
         assert_eq!(
             state
@@ -2785,7 +2848,10 @@ mod tests {
         let mut state = SessionStateMachine::default();
         acquire(&mut state, Duration::ZERO);
         let (generation, registration, cancel) = register_test_stream(&mut state, Duration::ZERO);
-        assert!(state.set_streaming_playing(generation, registration, false));
+        assert_eq!(
+            state.set_streaming_playing(generation, registration, false),
+            Ok(())
+        );
 
         let mut now = Duration::from_secs(30);
         while now < IDLE_TIMEOUT {
@@ -2809,6 +2875,46 @@ mod tests {
             now += Duration::from_secs(30);
         }
         assert!(!cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn completed_worker_keeps_the_stream_control_registration() {
+        let mut state = SessionStateMachine::default();
+        acquire(&mut state, Duration::ZERO);
+        let (generation, registration, _) = register_test_stream(&mut state, Duration::ZERO);
+
+        assert!(!state.finish_streaming_worker(generation, registration));
+        assert_eq!(
+            state.set_streaming_playing(generation, registration, false),
+            Ok(())
+        );
+        assert!(state.note_segment_fetch(Duration::from_secs(1), generation, registration));
+        assert!(state.snapshot().active.unwrap().streaming);
+    }
+
+    #[test]
+    fn stream_control_failures_identify_the_broken_ownership_boundary() {
+        let mut state = SessionStateMachine::default();
+        assert_eq!(
+            state.set_streaming_playing(0, 1, false),
+            Err(RemoteStreamingControlError::SessionMissing)
+        );
+
+        acquire(&mut state, Duration::ZERO);
+        let (generation, registration, _) = register_test_stream(&mut state, Duration::ZERO);
+        assert_eq!(
+            state.set_streaming_playing(generation.wrapping_add(1), registration, false),
+            Err(RemoteStreamingControlError::SessionGenerationMismatch)
+        );
+        assert_eq!(
+            state.set_streaming_playing(generation, registration.wrapping_add(1), false),
+            Err(RemoteStreamingControlError::RegistrationMismatch)
+        );
+        assert!(!state.unregister_streaming(generation, registration));
+        assert_eq!(
+            state.set_streaming_playing(generation, registration, false),
+            Err(RemoteStreamingControlError::RegistrationMissing)
+        );
     }
 
     #[test]
@@ -3072,7 +3178,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_registration_drop_completes_an_app_drained_session() {
+    fn streaming_worker_lease_drop_completes_an_app_drained_session() {
         let handle = SessionHandle::new();
         handle.acquire(SessionAcquireRequest {
             client_id: "client".to_owned(),
@@ -3081,7 +3187,8 @@ mod tests {
         assert!(handle.finish_acquire(handle.snapshot().generation));
         let owner = handle.owner_for_test("client");
         let streaming_owner = handle.streaming_owner(&owner).unwrap();
-        let registration = streaming_owner.register_streaming().unwrap();
+        let mut registration = streaming_owner.register_streaming().unwrap();
+        let worker_lease = registration.take_worker_lease();
         let generation = handle.snapshot().generation;
 
         handle.local_disconnect();
@@ -3089,6 +3196,12 @@ mod tests {
         assert_eq!(handle.snapshot().phase, RemoteControlPhase::DrainingRemote);
 
         drop(registration);
+        assert_eq!(
+            handle.snapshot().phase,
+            RemoteControlPhase::DrainingRemote,
+            "dropping the control registration must not stand in for worker completion"
+        );
+        drop(worker_lease);
         let released = handle.snapshot();
         assert_eq!(released.phase, RemoteControlPhase::Local);
         assert!(released.active.is_none());

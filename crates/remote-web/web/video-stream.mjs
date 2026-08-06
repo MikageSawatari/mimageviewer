@@ -417,6 +417,7 @@ export function hlsErrorTelemetryDetails(data = {}, media = {}) {
 export function videoPlaybackStallDecision({
   active = false,
   playRequested = false,
+  awaitingUserActivation = false,
   ended = false,
   blocked = false,
   hidden = false,
@@ -426,7 +427,9 @@ export function videoPlaybackStallDecision({
   elapsedSinceProgressMs = 0,
   timeoutMs = PLAYBACK_STALL_TIMEOUT_MS,
 } = {}) {
-  if (!active || !playRequested || ended || blocked) return { kind: "cancel" };
+  if (!active || !playRequested || awaitingUserActivation || ended || blocked) {
+    return { kind: "cancel" };
+  }
   const recoveryThreshold = Math.max(0.01, Number(recoveryThresholdSecs) || 0.01);
   if (Math.max(0, Number(progressedMediaSecs) || 0) >= recoveryThreshold) {
     return { kind: "resolved" };
@@ -442,6 +445,17 @@ export function videoPlaybackStallDecision({
     internalReason: "playback_progress_timeout",
     timeoutMs: timeout,
   };
+}
+
+export function videoPlayRejectionDecision(errorName = "") {
+  switch (String(errorName ?? "")) {
+    case "NotAllowedError":
+      return { kind: "user_activation_required" };
+    case "AbortError":
+      return { kind: "interrupted" };
+    default:
+      return { kind: "failed" };
+  }
 }
 
 function formatVideoTime(value) {
@@ -1501,6 +1515,7 @@ export class VideoStreamViewer {
     this.lastServerMessage = "";
     this.lastDiagnosticMessage = "";
     this.playbackAttempts = newPlaybackAttemptStats();
+    this.playbackGate = "ready";
     this.playbackStallWatch = null;
     this.hlsErrorTelemetryAt = new Map();
     this.startupWatch = null;
@@ -1647,6 +1662,8 @@ export class VideoStreamViewer {
       this.handlePlaybackBoundary(false);
     };
     this.onPlaying = () => {
+      this.playbackGate = "ready";
+      if (this.noticeKind === "autoplay") this.hideNotice();
       this.checkPlaybackStartupProgress();
       this.clearWaiting();
       this.finishSeekPreviewForAttachedGeneration();
@@ -1775,6 +1792,7 @@ export class VideoStreamViewer {
     this.lastServerMessage = "";
     this.lastDiagnosticMessage = "";
     this.playbackAttempts = newPlaybackAttemptStats();
+    this.playbackGate = "ready";
     this.showNotice("動画を準備しています。", "waiting");
     let started;
     try {
@@ -2246,6 +2264,8 @@ export class VideoStreamViewer {
     if (this.lastState) this.lastState.play_intent = this.playRequested;
     if (this.playRequested) await this.playIfRequested();
     else {
+      this.playbackGate = "ready";
+      if (this.noticeKind === "autoplay") this.hideNotice();
       this.clearWaiting();
       this.video.pause();
       this.captureVideoHealth("hud");
@@ -2299,12 +2319,14 @@ export class VideoStreamViewer {
       });
   }
 
-  async playIfRequested() {
+  async playIfRequested({ userInitiated = false } = {}) {
     if (
       !this.playRequested ||
       this.destroyed ||
       this.remoteSessionState.blocksInteraction ||
-      !this.video.src && !this.hls
+      !this.video.src && !this.hls ||
+      this.playbackAttempts.pending > 0 ||
+      this.playbackGate === "user_activation_required" && !userInitiated
     ) return;
     const playbackAttempts = this.playbackAttempts;
     const attemptSequence = playbackAttempts.attempts + 1;
@@ -2327,6 +2349,7 @@ export class VideoStreamViewer {
       this.playbackAttempts !== playbackAttempts
     ) return;
     if (!rejection) {
+      this.playbackGate = "ready";
       if (["autoplay", "waiting"].includes(this.noticeKind)) this.hideNotice();
       this.captureVideoHealth("hud");
       return;
@@ -2346,7 +2369,21 @@ export class VideoStreamViewer {
       }
     );
     this.captureVideoHealth("play_rejected", { telemetry: true });
-    this.showNotice("中央をタップして再生してください。", "autoplay");
+    const decision = videoPlayRejectionDecision(rejection?.name);
+    if (decision.kind === "user_activation_required") {
+      this.playbackGate = "user_activation_required";
+      this.clearWaiting();
+      this.showNotice(
+        "自動再生が制限されています。",
+        "autoplay",
+        "タップして再生",
+        () => this.playIfRequested({ userInitiated: true })
+      );
+    } else if (decision.kind === "failed") {
+      this.finishPlaybackLayerFailure(
+        "動画を再生できませんでした。現在位置から再接続できます。"
+      );
+    }
   }
 
   currentPosition() {
@@ -2975,6 +3012,7 @@ export class VideoStreamViewer {
     const initialDecision = videoPlaybackStallDecision({
       active: true,
       playRequested: this.playRequested,
+      awaitingUserActivation: this.playbackGate === "user_activation_required",
       ended: this.video.ended,
       blocked: this.remoteSessionState.blocksInteraction,
     });
@@ -3068,6 +3106,7 @@ export class VideoStreamViewer {
     const decision = videoPlaybackStallDecision({
       active: true,
       playRequested: this.playRequested,
+      awaitingUserActivation: this.playbackGate === "user_activation_required",
       ended: this.video.ended,
       blocked: this.remoteSessionState.blocksInteraction,
       hidden: globalThis.document?.visibilityState === "hidden",

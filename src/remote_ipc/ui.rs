@@ -15,8 +15,8 @@ use crate::video::stream::session::{
 use super::path_guard::logical_favorite_path;
 use super::session::{
     ActiveSessionSnapshot, ClaimedRemoteUiRequest, ClaimedRemoteWrite, ClaimedVideoStreamUiRequest,
-    PublishedVideoStream, SessionHandle, UiWriteOutcome, VideoStreamPlaybackState,
-    VideoStreamUiOutcome, VideoStreamUiRequest,
+    PublishedVideoStream, RemoteStreamingControlError, SessionHandle, UiWriteOutcome,
+    VideoStreamPlaybackState, VideoStreamUiOutcome, VideoStreamUiRequest,
 };
 use super::video_stream::{VideoStreamStartBudget, VideoStreamStartStage};
 
@@ -252,6 +252,20 @@ fn video_stream_session_mismatch() -> VideoStreamUiOutcome {
         VideoStreamErrorCode::SessionMismatch,
         "動画ストリーミングセッションが一致しません",
     ))
+}
+
+fn remote_streaming_control_error(error: RemoteStreamingControlError) -> VideoStreamError {
+    if error.is_session_mismatch() {
+        VideoStreamError::new(
+            VideoStreamErrorCode::SessionMismatch,
+            "remote session ownership was lost",
+        )
+    } else {
+        VideoStreamError::new(
+            VideoStreamErrorCode::Failed,
+            format!("streaming control registration is not current: {error:?}"),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1088,10 +1102,10 @@ impl crate::app::App {
                 AppRemoteVideoStreamState::Starting(_) => false,
                 AppRemoteVideoStreamState::Streaming(streaming) => {
                     let accepted = streaming.session.set_playing(playing);
-                    if accepted {
+                    if accepted.is_ok() {
                         streaming.playback.set_play_intent(playing);
                     }
-                    accepted
+                    accepted.is_ok()
                 }
             })
     }
@@ -1249,22 +1263,16 @@ impl crate::app::App {
             return video_stream_session_mismatch();
         }
         let result = match action {
-            VideoStreamControlAction::Play => {
-                streaming.playback.set_play_intent(true);
-                streaming
-                    .session
-                    .set_playing(true)
-                    .then_some(())
-                    .ok_or_else(|| "remote session ownership was lost".to_owned())
-            }
-            VideoStreamControlAction::Pause => {
-                streaming.playback.set_play_intent(false);
-                streaming
-                    .session
-                    .set_playing(false)
-                    .then_some(())
-                    .ok_or_else(|| "remote session ownership was lost".to_owned())
-            }
+            VideoStreamControlAction::Play => streaming
+                .session
+                .set_playing(true)
+                .map(|()| streaming.playback.set_play_intent(true))
+                .map_err(remote_streaming_control_error),
+            VideoStreamControlAction::Pause => streaming
+                .session
+                .set_playing(false)
+                .map(|()| streaming.playback.set_play_intent(false))
+                .map_err(remote_streaming_control_error),
             VideoStreamControlAction::Volume { volume }
                 if volume.is_finite() && (0.0..=1.0).contains(&volume) =>
             {
@@ -1272,19 +1280,22 @@ impl crate::app::App {
                 streaming.playback.set_volume(volume);
                 Ok(())
             }
-            VideoStreamControlAction::Volume { .. } => {
-                Err("volume must be finite and between 0 and 1".to_owned())
-            }
+            VideoStreamControlAction::Volume { .. } => Err(VideoStreamError::new(
+                VideoStreamErrorCode::Failed,
+                "volume must be finite and between 0 and 1",
+            )),
             VideoStreamControlAction::Quality {
                 quality,
                 position_secs,
             } if position_secs.is_finite() && position_secs >= 0.0 => streaming
                 .session
                 .change_quality(quality.into(), position_secs)
-                .map(|_| ()),
-            VideoStreamControlAction::Quality { .. } => {
-                Err("quality position must be finite and non-negative".to_owned())
-            }
+                .map(|_| ())
+                .map_err(|error| VideoStreamError::new(VideoStreamErrorCode::Failed, error)),
+            VideoStreamControlAction::Quality { .. } => Err(VideoStreamError::new(
+                VideoStreamErrorCode::Failed,
+                "quality position must be finite and non-negative",
+            )),
         };
         let snapshot = streaming.playback.snapshot();
         streaming.playback.update(
@@ -1311,7 +1322,7 @@ impl crate::app::App {
                 message: "remote session active".to_owned(),
                 session_id: None,
             }),
-            Err(error) => video_stream_ui_failure(error),
+            Err(error) => VideoStreamUiOutcome::Error(error),
         }
     }
 
@@ -2782,6 +2793,28 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_control_errors_separate_session_loss_from_registration_invariants() {
+        for error in [
+            RemoteStreamingControlError::SessionMissing,
+            RemoteStreamingControlError::SessionGenerationMismatch,
+        ] {
+            assert_eq!(
+                remote_streaming_control_error(error).code,
+                VideoStreamErrorCode::SessionMismatch
+            );
+        }
+        for error in [
+            RemoteStreamingControlError::RegistrationMissing,
+            RemoteStreamingControlError::RegistrationMismatch,
+        ] {
+            assert_eq!(
+                remote_streaming_control_error(error).code,
+                VideoStreamErrorCode::Failed
+            );
+        }
+    }
 
     #[test]
     fn acquire_barrier_diagnostics_logs_after_grace_and_then_throttles() {

@@ -665,10 +665,13 @@ guard で、動画処理開始後の timeout 9 個には数えない。
 - 放置タイムアウト (10 分) の抑止条件である「再生中」にストリーミング中を含める
 - ストリーミング中は生存タイムアウト (60 秒) の判定にセグメント取得も活動として数える
 - `DrainingRemote` は UI の stream handle を外した時点では完了しない。cancel 済み generation
-  worker が返り、stack 所有の FFmpeg / D3D11 / encoder resource を破棄して streaming
-  registration を外すまで final release を待つ。join 自体は UI thread で行わず worker 側の
-  registration lifetime を drain accounting に使う。これにより旧 worker が process-wide
-  generation resource lease を持つ間に次 owner の acquire / start が成功することを防ぐ
+  worker が返り、stack 所有の FFmpeg / D3D11 / encoder resource を破棄して worker lease を
+  外すまで final release を待つ。join 自体は UI thread で行わず worker 側の lease lifetime を
+  drain accounting に使う。再生制御用 registration は generation handle が別に所有し、worker が
+  EOF まで生成し終えた後も、端末が公開済みの末尾バッファを消費する間の play / pause と
+  segment activity を受け付ける。これにより旧 worker が process-wide generation resource lease を
+  持つ間に次 owner の acquire / start が成功することを防ぎつつ、worker 完了を session 切断と
+  誤分類しない
 - 端末の一度の再接続操作は、この final release が済むまで同じ acquire intent として待つ。
   streaming worker の終了には固定の wall-clock 上限がないため、取得待ちを任意の総時間で
   打ち切らない。これは状態を作る `/api/video/start` の無期限再送とは分離し、session ID の
@@ -868,6 +871,23 @@ guard で、動画処理開始後の timeout 9 個には数えない。
   `remote_session_correlation` だけを詳細段へ付け、Web Crypto 非対応時は省略する。client 側でも既知の
   session 生値を置換し、disk 書き込みは従来どおり `permanent_log_secrets` と
   `redact_serialized_secret` を通る。PIN / Bearer token の例外段は作らない
+
+#### iOS autoplay / EOF 後の再生制御是正 (2026-08-07)
+
+- `video.play()` の `NotAllowedError` は通信待ちや再生層停止ではなく
+  `user_activation_required` gate として所有する。この間は waiting/stall watch を解除し、canplay、
+  playlist attach、visibility 復帰などの自動経路から `play()` を再発行しない。notice 自体に
+  「タップして再生」ボタンを置き、その click handler が user activation を失う await より前に
+  `play()` を 1 回だけ呼ぶ。成功時だけ gate を通常状態へ戻す
+- `AbortError` は source 交換や pause により play 要求の owner が中断した状態であり、autoplay
+  案内へ写像しない。それ以外の play promise rejection は再生層失敗として明示的な terminal へ
+  終える。拒否名の分類と、activation 待ち中に stall 判定を開始しない条件を純関数テストで固定する
+- clockless worker は動画末尾まで生成すると正常終了するが、公開済み HLS resource と playback
+  session はその後も Active である。worker が持っていた streaming registration まで終了時に
+  drop していたため、末尾バッファ再生中の Pause だけが `active.streaming == None` で 422 になった。
+  worker drain lease と control registration を分離し、前者は実 worker 終了、後者は generation
+  handle の寿命へ一致させる。session payload / generation の喪失は `SessionMismatch`、registration
+  欠落・不一致は内部 lifecycle invariant failure として型で区別する
 
 #### 実機待ち時間是正 A: seek preview (2026-08-03)
 

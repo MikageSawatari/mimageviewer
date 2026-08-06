@@ -6,7 +6,10 @@ use std::time::{Duration, Instant};
 
 use super::encoder::{EncoderPreference, H264EncoderKind, SEGMENT_DURATION_SECS};
 use super::quality::{OutputDimensions, QualityPreset};
-use crate::remote_ipc::session::{RemoteSessionOwner, RemoteStreamingActivity};
+use crate::remote_ipc::session::{
+    RemoteSessionOwner, RemoteStreamingActivity, RemoteStreamingControlError,
+    RemoteStreamingRegistration,
+};
 use crate::video::clockless_transcode::{
     ClocklessAudioProcessing, ClocklessOutputInfo, ClocklessSegmentBytes, ClocklessStreamOutput,
     ClocklessTranscodeControl, ClocklessTranscodeOptions, ClocklessVstStatus,
@@ -205,6 +208,7 @@ pub(crate) struct StreamingGenerationHandle {
     control: ClocklessTranscodeControl,
     activity: RemoteStreamingActivity,
     audio_status: ClocklessVstStatus,
+    _registration: RemoteStreamingRegistration,
     cancel: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -221,11 +225,6 @@ impl StreamingGenerationHandle {
         hw_decode: bool,
         audio_processing: ClocklessAudioProcessing,
     ) -> Result<Self, String> {
-        let registration = owner
-            .register_streaming()
-            .map_err(|response| response.message)?;
-        let activity = registration.activity();
-        let cancel = registration.cancel_flag();
         let config = GenerationConfig {
             generation,
             path: source_path,
@@ -239,6 +238,12 @@ impl StreamingGenerationHandle {
         let audio_status = config.audio_processing.vst3_status();
         let output = ClocklessStreamOutput::new(segment_capacity, source_origin_secs)?;
         let control = ClocklessTranscodeControl::manual(segment_capacity)?;
+        let mut registration = owner
+            .register_streaming()
+            .map_err(|response| response.message)?;
+        let activity = registration.activity();
+        let cancel = registration.cancel_flag();
+        let worker_lease = registration.take_worker_lease();
         control.bind_cancel_flag(Arc::clone(&cancel));
         let status = Arc::new((Mutex::new(StreamGenerationStatus::Opening), Condvar::new()));
         let worker_status = Arc::clone(&status);
@@ -268,10 +273,10 @@ impl StreamingGenerationHandle {
                     &worker_status,
                     &worker_output,
                 );
-                // The remote-session drain owns the actual FFmpeg/GPU worker lifetime, not just
-                // the UI handle lifetime. Releasing this registration is what may return control
-                // to the PC or allow the next remote owner to acquire the session.
-                drop(registration);
+                // The drain lease follows the actual FFmpeg/GPU worker. The control registration
+                // remains with the generation handle so an already-encoded stream can still be
+                // paused while the browser consumes its buffered tail.
+                drop(worker_lease);
             })
             .map_err(|error| format!("failed to spawn streaming worker: {error}"))?;
         Ok(Self {
@@ -281,6 +286,7 @@ impl StreamingGenerationHandle {
             control,
             activity,
             audio_status,
+            _registration: registration,
             cancel,
             worker: Some(worker),
         })
@@ -290,7 +296,7 @@ impl StreamingGenerationHandle {
         generation_status(&self.status)
     }
 
-    pub(crate) fn set_playing(&self, playing: bool) -> bool {
+    pub(crate) fn set_playing(&self, playing: bool) -> Result<(), RemoteStreamingControlError> {
         self.activity.set_playing(playing)
     }
 
@@ -529,7 +535,7 @@ impl RemoteVideoStreamingSession {
         self.segment_capacity as f64 * f64::from(SEGMENT_DURATION_SECS)
     }
 
-    pub(crate) fn set_playing(&self, playing: bool) -> bool {
+    pub(crate) fn set_playing(&self, playing: bool) -> Result<(), RemoteStreamingControlError> {
         self.current.set_playing(playing)
     }
 

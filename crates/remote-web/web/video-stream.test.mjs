@@ -13,6 +13,7 @@ import {
   resolveVideoPlaylist,
   videoAudioProcessingPresentation,
   videoEndDecision,
+  videoPlayRejectionDecision,
   videoPlaybackStallDecision,
   videoHealthSample,
   videoHealthSamplingDecision,
@@ -467,6 +468,12 @@ test("runtime waiting has one bounded terminal instead of an infinite buffering 
   assert.equal(videoPlaybackStallDecision({
     active: true,
     playRequested: true,
+    awaitingUserActivation: true,
+    elapsedSinceProgressMs: 20000,
+  }).kind, "cancel");
+  assert.equal(videoPlaybackStallDecision({
+    active: true,
+    playRequested: true,
     hidden: true,
     elapsedSinceProgressMs: 20000,
   }).kind, "defer");
@@ -476,6 +483,18 @@ test("runtime waiting has one bounded terminal instead of an infinite buffering 
     switching: true,
     elapsedSinceProgressMs: 20000,
   }).kind, "defer");
+});
+
+test("media play rejection names have distinct recovery owners", () => {
+  assert.deepEqual(videoPlayRejectionDecision("NotAllowedError"), {
+    kind: "user_activation_required",
+  });
+  assert.deepEqual(videoPlayRejectionDecision("AbortError"), {
+    kind: "interrupted",
+  });
+  assert.deepEqual(videoPlayRejectionDecision("NotSupportedError"), {
+    kind: "failed",
+  });
 });
 
 test("a paused stalled event cannot create a waiting owner without play intent", () => {
@@ -534,10 +553,12 @@ test("stable playback progress resolves the waiting owner and its notice", () =>
   assert.equal(viewer.playbackStallWatch, null);
 });
 
-test("a rejected media play promise is recorded once without automatic retry", async () => {
+test("an autoplay rejection waits for one explicit tap and leaves stall monitoring", async () => {
   const rejection = new Error("gesture required");
   rejection.name = "NotAllowedError";
   const calls = [];
+  let noticeAction;
+  let allowPlayback = false;
   const viewer = {
     playRequested: true,
     destroyed: false,
@@ -547,10 +568,11 @@ test("a rejected media play promise is recorded once without automatic retry", a
       paused: true,
       play: () => {
         calls.push("play");
-        return Promise.reject(rejection);
+        return allowPlayback ? Promise.resolve() : Promise.reject(rejection);
       },
     },
     hls: null,
+    playbackGate: "ready",
     playbackAttempts: {
       attempts: 0,
       successes: 0,
@@ -562,8 +584,16 @@ test("a rejected media play promise is recorded once without automatic retry", a
     playbackLayerDiagnostics: () => ({ paused: true, ready_state: 4 }),
     recordPlaybackIssue: (...args) => calls.push(["issue", ...args]),
     captureVideoHealth: (...args) => calls.push(["health", ...args]),
-    showNotice: (...args) => calls.push(["notice", ...args]),
+    clearWaiting: () => calls.push("clear_waiting"),
+    showNotice: (message, kind, actionLabel, action) => {
+      calls.push(["notice", message, kind, actionLabel]);
+      noticeAction = action;
+    },
+    hideNotice: () => calls.push("hide_notice"),
+    noticeKind: "autoplay",
   };
+  viewer.playIfRequested = (options) =>
+    VideoStreamViewer.prototype.playIfRequested.call(viewer, options);
 
   await VideoStreamViewer.prototype.playIfRequested.call(viewer);
 
@@ -575,8 +605,58 @@ test("a rejected media play promise is recorded once without automatic retry", a
     pending: 0,
     lastRejectionName: "NotAllowedError",
   });
-  assert.deepEqual(calls.at(-2), ["health", "play_rejected", { telemetry: true }]);
-  assert.deepEqual(calls.at(-1), ["notice", "中央をタップして再生してください。", "autoplay"]);
+  assert.equal(viewer.playbackGate, "user_activation_required");
+  assert.deepEqual(calls.slice(-3), [
+    ["health", "play_rejected", { telemetry: true }],
+    "clear_waiting",
+    ["notice", "自動再生が制限されています。", "autoplay", "タップして再生"],
+  ]);
+
+  await VideoStreamViewer.prototype.playIfRequested.call(viewer);
+  assert.equal(calls.filter((entry) => entry === "play").length, 1);
+
+  allowPlayback = true;
+  await noticeAction();
+  assert.equal(calls.filter((entry) => entry === "play").length, 2);
+  assert.equal(viewer.playbackGate, "ready");
+  assert.equal(viewer.playbackAttempts.successes, 1);
+  assert.equal(calls.at(-2), "hide_notice");
+  assert.deepEqual(calls.at(-1), ["health", "hud"]);
+});
+
+test("an interrupted play promise does not masquerade as an autoplay block", async () => {
+  const rejection = new Error("source changed");
+  rejection.name = "AbortError";
+  const calls = [];
+  const viewer = {
+    playRequested: true,
+    destroyed: false,
+    remoteSessionState: { blocksInteraction: false },
+    video: {
+      src: "blob:stream",
+      play: () => Promise.reject(rejection),
+    },
+    hls: null,
+    playbackGate: "ready",
+    playbackAttempts: {
+      attempts: 0,
+      successes: 0,
+      rejections: 0,
+      pending: 0,
+      lastRejectionName: "",
+    },
+    rememberPlaybackError: () => {},
+    playbackLayerDiagnostics: () => ({}),
+    recordPlaybackIssue: () => {},
+    captureVideoHealth: () => {},
+    showNotice: () => calls.push("notice"),
+    finishPlaybackLayerFailure: () => calls.push("terminal"),
+  };
+
+  await VideoStreamViewer.prototype.playIfRequested.call(viewer);
+
+  assert.equal(viewer.playbackGate, "ready");
+  assert.deepEqual(calls, []);
 });
 
 test("terminal playback failure clears the waiting owner before showing reconnect", () => {

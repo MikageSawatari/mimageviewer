@@ -33101,11 +33101,12 @@ mod still_window_mode_key_tests {
         );
 
         let owner = handle.owner_for_test("phone");
-        let registration = handle
+        let mut registration = handle
             .streaming_owner(&owner)
             .unwrap()
             .register_streaming()
             .unwrap();
+        let worker_lease = registration.take_worker_lease();
         handle.local_disconnect();
         app.poll_remote_session(&ctx);
         assert_eq!(
@@ -33115,6 +33116,12 @@ mod still_window_mode_key_tests {
         );
 
         drop(registration);
+        assert_eq!(
+            handle.snapshot().phase,
+            crate::remote_ipc::session::RemoteControlPhase::DrainingRemote,
+            "the control registration is not the worker drain lease"
+        );
+        drop(worker_lease);
         assert_eq!(
             handle.snapshot().phase,
             crate::remote_ipc::session::RemoteControlPhase::Local
