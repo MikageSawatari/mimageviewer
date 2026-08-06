@@ -623,6 +623,62 @@ UI 同期なら、worker 化・キャンセル・結果適用時の世代/idx �
 ユーザーが「perf-log 取りました」とだけ伝えてきたらこのディレクトリの最新
 `perf_*.jsonl` をそのまま `analyze_perf.py` に食わせる。パスを毎回聞かない。
 
+## mIV Remote の不具合調査は、まずサーバ側ログを見る ⚠️
+
+**端末 (スマホ / タブレット) 側の挙動は、既にサーバへ送られて記録されている。**
+リモートの不具合を調べるとき、**推測する前にこのログを開くこと。**
+
+```
+<remote-web の作業ディレクトリ>\remote-web-log.jsonl
+```
+
+既定は相対パス `remote-web-log.jsonl` (`crates/remote-web/src/config.rs`)。
+core が service を spawn するとき `--log` を渡していないので、**リポジトリ
+ルート直下**に出ることが多い (`--log <path>` で変更可)。JSON Lines 形式。
+
+### 何が入っているか
+
+`/api/telemetry` に届いたクライアント側のイベントが、HTTP 応答ログの
+`details.telemetry.events[]` として入る。種類は `remote_session` / `error` /
+`command` / `page_prefetch` / `image` / `thumbnail_grid` / `folder_list` など。
+
+`type: "error"` のイベントは `category` で分かれる
+(`fetch_non_2xx` / `fetch_error` / `image_load_error` / `window_error` /
+`spread_load_error` など)。**`window_error` と `unhandled_rejection` は
+クライアントの未捕捉例外**で、`window.addEventListener` から拾っている。
+
+### 読み方の例
+
+```python
+import json, io, collections
+c = collections.Counter()
+for line in io.open('remote-web-log.jsonl', encoding='utf-8'):
+    if not line.strip():
+        continue
+    events = ((json.loads(line).get('details') or {}).get('telemetry') or {}).get('events') or []
+    for e in events:
+        if e.get('type') == 'error':
+            c[e.get('category', '?')] += 1
+print(c.most_common())
+```
+
+### 重要な性質
+
+- **`/api/telemetry` はセッション取得を要求しない** (`route_requires_remote_session`
+  の除外)。**本体が切断した後でも端末のログは届く。** 切断まわりの調査に使える
+- ただし telemetry は**間隔でまとめて送る**ので、例外の直後に端末が操作不能に
+  なるとバッファごと失われることがある。ログに無いことを「起きていない」証拠に
+  しない
+- `window.onerror` はスクリプトが cross-origin 扱いだと内容が落ち、
+  `"Script error."` になる
+
+### 経緯
+
+2026-08、切断まわりの不具合調査で、私 (ClaudeCode) は 3 回続けて原因を推測し
+3 回とも外した。その間ずっとこのログが手元にあり、開いていなかった。
+実際の原因 (静止画専用メソッドを動画ビューアに対して呼んだ TypeError) は、
+未捕捉例外として記録され得るものだった。**推測の前にログを見る。**
+
 ## Supported Image Formats
 
 - **内蔵**: JPEG, PNG, GIF, WebP, BMP
