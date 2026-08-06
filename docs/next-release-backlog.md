@@ -707,24 +707,49 @@ NIS の「シャープ」と Anime4K の「アニメ塗り」は選択式とし�
 Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、branch key で結果を分離する。
 これで §1.46 の静止画拡大候補は完了とし、動画は §1.47 の別構造として扱う。
 
-### 1.47 動画の拡大に高品質リサンプルを入れる — コストではなく構造の問題
+### 1.47 動画の拡大縮小を mIV のシェーダで行う — 設計確定 / 未実装
 
-§1.46 の動画版。**GPU 性能ではなく動画表示の構造が障害**なので、別案件として扱う。
+**正本は [video-upscale-shader-plan.md](video-upscale-shader-plan.md)。** 本項は要約と着手判断のみ。
 
-- native presenter は **swap chain を動画解像度で作り**、フレームを `CopySubresourceRegion`
-  で 1:1 コピーし、**`IDCompositionVisual::SetTransform2` で拡大している**
-  ([render_core.rs](../src/video/native_presenter/render_core.rs) の
-  `compute_video_visual_transform`)。つまり**拡大しているのは mIV ではなく DWM / DComp**。
-  mIV のシェーダは通っていない (色補正が identity でないときだけ grade シェーダが走るが、
-  それも動画解像度で動く)
-- 入れるには ①swap chain をウィンドウ解像度にする ②grade シェーダを常時通す
-  ③visual transform を SAR 補正だけにする、の 3 点が要る。keyed mutex / swap chain 世代 /
-  MPO cover / DComp commit のタイミングという**最も壊れやすい箇所**に触る
+§1.46 の動画版。**GPU 性能ではなく動画表示の構造が障害**だったので別案件として扱ってきたが、
+2026-08-07 に構造・測定方式・UI まで設計を確定した。
+
+- 現状: native presenter は **swap chain を動画解像度で作り**、`CopySubresourceRegion` で 1:1
+  コピーし、**`IDCompositionVisual::SetTransform2` で拡大縮小している**。つまり拡大しているのは
+  mIV ではなく DWM / DComp で、mIV のシェーダは通っていない (色補正が identity でないときだけ
+  grade シェーダが走るが、それも動画解像度で動く)
+- 採る構造: **swap chain を「映像の表示矩形の物理ピクセルサイズ」にし、シェーダでソース解像度
+  から表示解像度へ直接解決する**。`compute_video_visual_transform` はサーフェスサイズを引数に
+  取る作りなので**無改造で正しい**。リサイズ中は差し替えず既存サーフェスを DComp に伸ばさせ、
+  静止後に 1 回だけ差し替える (= 全画面再生では差し替えが一度も起きない)
+  - 当初案の「swap chain をウィンドウ解像度にする」は黒帯まで描くので上位互換の表示矩形サイズを
+    採る。「動画解像度 × 2 の整数倍」も却下 (mIV の Anime4K / NIS は任意倍率へ直接解決できるため、
+    整数倍に縛ると 1〜2 倍の中間倍率で情報を捨てる)
+- **Phase A (標準 Lanczos3 / シャープ NIS / ニアレスト + 縮小)** と
+  **Phase B (Anime4K)** に分ける。Phase A は 4K 出力で +0.4〜0.9ms と実質タダで全解像度に使え、
+  **4K 動画をウィンドウで見たときの縮小モアレも同時に直る**。重いのは Anime4K だけ
+- Phase B は変種 (S/M/L/VL/UL) を扱うため、**現行の VL 専用ハードコードを表駆動へ一般化**する
+  必要がある ([gpu_anime4k.rs](../src/gpu_anime4k.rs) と
+  [convert_anime4k_glsl_to_wgsl.py](../scripts/convert_anime4k_glsl_to_wgsl.py))。一般化すれば
+  静止画側にも同じ選択肢が生える
+- モデル選択は **利用者が Anime4K を選んだ瞬間にモデル × ソースサイズを実測して表を作り、
+  以後は表引きで決める**。GPU 性能は 4090 とノート iGPU で 10 倍以上違い、解像度やフレーム
+  レートからの固定しきい値では当てられないため。測定結果は GPU + ドライバ版をキーに永続化し、
+  回復手段は再測定ボタン。**再生中はモデルを変えない** (自動昇降格はハンチングし、切替のたびに
+  リソース再構築が走るため)
+- 最重要の不変条件: **切り替えの瞬間にシェーダのコンパイルもテクスチャ確保も一切しない**。
+  現行 grade pipeline はレンダースレッドで同期 `D3DCompile` しており、同じ作りで Anime4K UL
+  (25 本 + 中間 24 枚) をやると設定を触った瞬間に数百 ms〜秒単位で固まる
+- UI は動画左パネル →「画像補正」→「フィルタ」タブに置く (Creative LUT の隣)。制限で実行され
+  ない場合は静止画と同じ `processing_size_outside_note` の書式で選択肢直下に出す
 - VSR は [video-architecture.md](video-architecture.md) で**スコープ外と決定済み**なので、
   先例として使えるものが無い
-- 毎フレーム走るので実測必須。4K 出力で概算 1〜2ms (RTX 4090) / 3〜6ms (ミドルレンジ)。
-  60fps の予算 16.7ms に対し 6〜36%。デコードと競合する。静止画と違いキャッシュが効かない
-- 規模 / 優先度: Large / P3。単独リリースで実機検証を厚く取る規模。**§1.46 の後**。
+- 性能の数字は**すべて静止画実測からの外挿**であり、これを根拠に既定値やしきい値を決めない。
+  測定機構自体が「1080p VL が現実的か」を利用者ごとに答えるためのものである
+- 規模 / 優先度: **Phase A = Large / P3 (約 2 週間、測定を待たずに着手可)**、
+  **Phase B = Large / P3 (約 2 週間、Phase A の後)**。いずれも単独リリースで実機検証を厚く取る
+  規模。detached リワーク ([detached-rework-plan.md](detached-rework-plan.md)) と presenter を
+  共有するので、着手時期はリワークの進捗と調整する
 
 ### 1.48 対応済み: 5ch #171 画像フォルダの見開き案内と固定バー / 設定画面 / 操作カスタマイズの小修正
 

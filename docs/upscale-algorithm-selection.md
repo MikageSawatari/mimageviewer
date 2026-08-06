@@ -6,7 +6,8 @@
 [display-pipeline.md](display-pipeline.md)
 
 動画の拡大 (§1.47) は**構造が別問題**なのでこの文書の対象外。native presenter は
-DWM / DComp が拡大しており mIV のシェーダを通らない。
+DWM / DComp が拡大しており mIV のシェーダを通らない。動画側の設計は
+[video-upscale-shader-plan.md](video-upscale-shader-plan.md) が正本 (2026-08-07 設計確定 / 未実装)。
 
 ---
 
