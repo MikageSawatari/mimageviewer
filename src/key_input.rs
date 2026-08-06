@@ -268,6 +268,12 @@ impl KeyInputState {
         }
         (edge, should_log)
     }
+
+    fn routed_return_key_held(&self, viewport: egui::ViewportId, extended: bool) -> Option<bool> {
+        self.frame_active_viewports
+            .contains(&viewport)
+            .then(|| self.return_keys.is_down(viewport, extended))
+    }
 }
 
 fn state() -> &'static Mutex<KeyInputState> {
@@ -487,6 +493,42 @@ pub fn clear_test_frame() {
     if let Ok(mut guard) = state().lock() {
         guard.frame.clear();
         guard.frame_active_viewports.clear();
+        guard.return_keys.clear();
+    }
+}
+
+/// 追加の viewport を frame-active に見せる (subclass 登録済みの兄弟 viewport 相当)。
+#[cfg(test)]
+pub fn add_test_frame_active_viewport(viewport: egui::ViewportId) {
+    if let Ok(mut guard) = state().lock()
+        && !guard.frame_active_viewports.contains(&viewport)
+    {
+        guard.frame_active_viewports.push(viewport);
+    }
+}
+
+#[cfg(test)]
+pub fn set_test_return_key_state(viewport: egui::ViewportId, main_down: bool, numpad_down: bool) {
+    if let Ok(mut guard) = state().lock() {
+        guard.return_keys.clear_viewport(viewport);
+        for (extended, pressed) in [(false, main_down), (true, numpad_down)] {
+            if !pressed {
+                continue;
+            }
+            let edge = KeyEdge {
+                source_hwnd: 1,
+                source_viewport: viewport,
+                virtual_key: 0x0D,
+                scan_code: 0x1C,
+                extended,
+                pressed: true,
+                repeat: false,
+                ctrl: false,
+                shift: false,
+                alt: false,
+            };
+            guard.return_keys.apply_edge(viewport, &edge);
+        }
     }
 }
 
@@ -543,13 +585,17 @@ where
         .unwrap_or((false, false))
 }
 
-/// Return the physical held state for VK_RETURN, split by the WM_KEY* extended
-/// bit (`false` = main Enter, `true` = numpad Enter).
-pub fn return_key_held(viewport: egui::ViewportId, extended: bool) -> bool {
+/// Return the source-routed physical held state for VK_RETURN, split by the
+/// WM_KEY* extended bit (`false` = main Enter, `true` = numpad Enter).
+///
+/// `None` means this viewport has no subclass-routed input source in the
+/// current frame, so callers must not infer a held key from process-global OS
+/// state.
+pub fn routed_return_key_held(viewport: egui::ViewportId, extended: bool) -> Option<bool> {
     state()
         .lock()
-        .map(|guard| guard.return_keys.is_down(viewport, extended))
-        .unwrap_or(false)
+        .ok()
+        .and_then(|guard| guard.routed_return_key_held(viewport, extended))
 }
 
 fn push_edge(hwnd_raw: u64, raw: RawKeyEdge) {
@@ -683,6 +729,23 @@ mod tests {
 
         assert!(!state.is_down(false));
         assert!(!state.is_down(true));
+    }
+
+    #[test]
+    fn routed_return_key_hold_requires_the_source_viewport_to_be_active() {
+        let mut input = KeyInputState::default();
+        let source = egui::ViewportId::from_hash_of(3_u64);
+        let sibling = egui::ViewportId::from_hash_of(4_u64);
+        let mut edge = return_edge(false, true);
+        edge.source_viewport = source;
+        input.return_keys.apply_edge(source, &edge);
+
+        assert_eq!(input.routed_return_key_held(source, false), None);
+
+        input.frame_active_viewports.push(source);
+        assert_eq!(input.routed_return_key_held(source, false), Some(true));
+        assert_eq!(input.routed_return_key_held(source, true), Some(false));
+        assert_eq!(input.routed_return_key_held(sibling, false), None);
     }
 
     #[test]

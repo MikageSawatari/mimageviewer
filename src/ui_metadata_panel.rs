@@ -45,6 +45,37 @@ impl TagPanelRow {
 }
 
 impl App {
+    /// Update the transient right-panel hover latch for the current fullscreen frame.
+    /// Rendering reads this value but does not own its lifetime, so navigator-consumed image
+    /// input cannot freeze the panel at the previous frame's state.
+    pub(crate) fn update_metadata_panel_hover_latch(
+        &mut self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        chrome_enabled: bool,
+        navigator_exclusion: Option<egui::Rect>,
+    ) {
+        let pointer_pos = ctx.input(|i| {
+            if self.cursor_hidden {
+                None
+            } else {
+                i.pointer.hover_pos()
+            }
+        });
+        let hover_mode = self.settings.fullscreen_side_panel_mode.normalized()
+            == crate::settings::FsSidePanelMode::Hover;
+        let explicit = self.metadata_panel_click_shown();
+        let hover_visible = chrome_enabled
+            && hover_mode
+            && crate::ui_fullscreen::metadata_panel_hover_active_at(
+                full_rect,
+                pointer_pos,
+                self.metadata_panel_hover_active,
+                navigator_exclusion,
+            );
+        self.metadata_panel_hover_active = !explicit && hover_visible;
+    }
+
     /// フルスクリーンでメタデータパネルをオーバーレイ描画する。
     /// 画像は常に `full_rect` 全体に表示し、パネルは画像の上に重ねる。
     ///
@@ -73,25 +104,13 @@ impl App {
     ) -> bool {
         let panel_rect = crate::ui_fullscreen::metadata_panel_rect(full_rect);
 
-        let pointer_pos = ctx.input(|i| {
-            if self.cursor_hidden {
-                None
-            } else {
-                i.pointer.hover_pos()
-            }
-        });
-        let hover_mode = self.settings.fullscreen_side_panel_mode.normalized()
-            == crate::settings::FsSidePanelMode::Hover;
+        // Most frames update this before image-input consumption in ui_fullscreen. Keep the draw
+        // boundary idempotently current as well because capture-selection and other modal paths
+        // can bypass the general image-input handler while this panel is still rendered.
         let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
-        let hover_visible = hover_mode
-            && crate::ui_fullscreen::metadata_panel_hover_active_at(
-                full_rect,
-                pointer_pos,
-                self.metadata_panel_hover_active,
-                navigator_exclusion,
-            );
+        self.update_metadata_panel_hover_latch(ctx, full_rect, true, navigator_exclusion);
+        let hover_visible = self.metadata_panel_hover_active;
         let explicit = self.metadata_panel_click_shown();
-        self.metadata_panel_hover_active = !explicit && hover_visible;
 
         let visible = explicit || self.fullscreen_tag_picker_open || hover_visible;
         if !visible {

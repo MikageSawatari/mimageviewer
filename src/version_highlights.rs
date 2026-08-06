@@ -550,6 +550,33 @@ const TABLE: &[VersionHighlights] = &[
         ],
         highlights: &[],
     },
+    VersionHighlights {
+        version: "2.12.0",
+        must_read: &[
+            HighlightItem {
+                title: "拡大表示の画質が上がりました",
+                body: "画像を拡大したときの画質を、縮小と同じ高品質な方法へ変えました。これまでより輪郭がはっきりします。画像補正パネルの「フィルタ」から「シャープ拡大」「アニメ塗り拡大」も選べます。",
+            },
+            HighlightItem {
+                title: "サブ展開は確認画面が開くようになりました",
+                body: "「サブ展開」を押すと、たどる階層と集める項目を選ぶ画面が開きます。これまでどおり全部たどるには「無制限」を選んでください。選んだ条件は次回も引き継がれます。",
+            },
+        ],
+        highlights: &[
+            HighlightItem {
+                title: "拡大中の位置を示すナビゲータ",
+                body: "拡大表示中に Alt を押しているあいだ、画面の隅に全体の縮小画像といま見えている範囲の枠が出ます。枠をドラッグして表示位置を動かせます。360度パノラマにも対応しています。",
+            },
+            HighlightItem {
+                title: "ファイル名での絞り込み",
+                body: "絞り込みバーの「ファイル名」欄で、今表示している一覧をファイル名で絞り込めます。先頭に - を付けた語は、含まないものが残ります。",
+            },
+            HighlightItem {
+                title: "一覧に出していないファイルのお知らせ",
+                body: "同じ名前でまとめた分・隠れている項目・開けない形式のファイルがあると、フォルダバーに「非表示 N 件」と出ます。フォルダを削除するときは、見えていないファイルも消えることを確認画面で案内します。",
+            },
+        ],
+    },
 ];
 
 #[cfg(test)]
@@ -831,6 +858,44 @@ mod tests {
             .expect("クリック表示モードの highlights がある");
         assert!(click_to_show.body.contains("別のファイルへ移動すると"));
         assert!(!click_to_show.body.contains("入り直したりしても維持"));
+    }
+
+    /// 本文は egui が折り返すので、文字列自体に連続空白があってはならない。
+    ///
+    /// v2.12.0 追加時に行継続のバックスラッシュが失われ、ソースのインデント 23 個が
+    /// そのまま本文へ焼き込まれて、実機のダイアログで改行位置が崩れた。表示を目で見ないと
+    /// 分からない壊れ方なので、テーブル全体を機械的に検査する。
+    #[test]
+    fn highlight_text_has_no_baked_in_whitespace_runs() {
+        for entry in table() {
+            for item in entry.must_read.iter().chain(entry.highlights.iter()) {
+                for (label, text) in [("title", item.title), ("body", item.body)] {
+                    assert!(
+                        !text.contains("  "),
+                        "v{} の {label} に連続空白がある (行継続の抜け): {text:?}",
+                        entry.version
+                    );
+                    assert!(
+                        !text.chars().any(char::is_control),
+                        "v{} の {label} に制御文字がある: {text:?}",
+                        entry.version
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn embedded_table_contains_v2_12_0_entries() {
+        let entries = for_version("2.12.0", table());
+        assert_eq!(versions(&entries), ["2.12.0"]);
+        let entry = entries[0];
+        // 既定と操作が変わったものだけを必読へ置き、新機能は下段に分ける。
+        assert_eq!(entry.must_read.len(), 2);
+        assert!(entry.must_read[0].body.contains("シャープ拡大"));
+        assert!(entry.must_read[1].body.contains("無制限"));
+        assert_eq!(entry.highlights.len(), 3);
+        assert!(entry.highlights[0].body.contains("Alt"));
     }
 
     #[test]

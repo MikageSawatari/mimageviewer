@@ -886,6 +886,55 @@ fn facet_chip(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.label(egui::RichText::new(text.into()).small().strong());
 }
 
+fn omitted_entries_chip_label(counts: crate::app::OmittedFolderEntryCounts) -> Option<String> {
+    let primary = counts.primary_count();
+    (primary > 0).then(|| format!("非表示 {primary} 件"))
+}
+
+fn omitted_entries_breakdown_label(counts: crate::app::OmittedFolderEntryCounts) -> String {
+    let mut label = format!(
+        "同名など {} / 隠し項目 {} / 対象外 {}",
+        counts.same_name, counts.hidden, counts.unsupported
+    );
+    if counts.system > 0 {
+        // システムファイルは主数字に入れないので、内訳でも別立てにして誤解を防ぐ。
+        label.push_str(&format!(" / システム {}", counts.system));
+    }
+    label
+}
+
+/// 走査時に確定した内訳だけを描画する。ここからファイルシステムを再走査しない。
+/// 戻り値は「同名ファイル設定を開く」が押されたかどうか。
+fn draw_omitted_entries_chip(
+    ui: &mut egui::Ui,
+    counts: crate::app::OmittedFolderEntryCounts,
+) -> bool {
+    let Some(label) = omitted_entries_chip_label(counts) else {
+        return false;
+    };
+    let mut open_settings = false;
+    let button_label = egui::RichText::new(label).small().strong();
+    let (response, _) = egui::containers::menu::MenuButton::new(button_label).ui(ui, |ui| {
+        ui.set_min_width(300.0);
+        ui.label(omitted_entries_breakdown_label(counts));
+        ui.label(
+            egui::RichText::new(
+                "「システム」は Thumbs.db など自動で作られるファイルです。件数には含めません。",
+            )
+            .small()
+            .weak(),
+        );
+        ui.separator();
+        if ui.link("同名ファイル設定を開く").clicked() {
+            open_settings = true;
+            ui.close();
+        }
+    });
+    let response = response.hover_tip("一覧に表示していない項目の内訳を表示");
+    suppress_menu_button_wheel_passthrough(ui.ctx(), &response);
+    open_settings
+}
+
 /// ★フィルタのボタン 1 個を描画し、状態が変わったら true を返す。
 /// `enabled = false` の間はクリックを無視し、見た目も disabled スタイルで描画する。
 ///
@@ -8576,6 +8625,16 @@ impl App {
             )
             .on_hover_text("似たファイルを自動で分類して 1 つに畳んで表示するトグルボタン")
             .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.show_address_bar_omitted_entries,
+                "非表示 N 件",
+            )
+            .on_hover_text(
+                "同名でまとめた分・隠れている項目・開けない形式など、\
+                 一覧に出していないファイルの件数",
+            )
+            .changed();
 
         ui.separator();
         ui.label("場所▼に出す項目:");
@@ -10683,7 +10742,15 @@ impl App {
         let subfolder_expansion_available = subfolder_expansion_on
             || subfolder_expansion_pending
             || self.subfolder_expansion_available();
-        egui::TopBottomPanel::top("address_bar")
+        // 一覧から落ちるのは絞り込み条件ではなくフォルダそのものの既定動作なので、
+        // 利用者が手で条件を足す絞り込みバーではなくフォルダバーが定位置。
+        let omitted_counts = self
+            .settings
+            .show_address_bar_omitted_entries
+            .then(|| self.current_normal_folder_omitted_counts())
+            .flatten();
+        let mut open_duplicate_settings = false;
+        let result = egui::TopBottomPanel::top("address_bar")
             .show(ctx, |ui| -> Option<AddressBarNav> {
                 ui.add_space(3.0);
                 let mut result = None;
@@ -11083,6 +11150,12 @@ impl App {
                     // right_to_left レイアウトで ★ → TextEdit の順に追加すると、
                     // TextEdit は available width いっぱいに広がる。
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(counts) = omitted_counts {
+                            open_duplicate_settings |= draw_omitted_entries_chip(ui, counts);
+                            if omitted_entries_chip_label(counts).is_some() {
+                                ui.add_space(4.0);
+                            }
+                        }
                         if folder_rating >= 1 && folder_rating <= 5 {
                             let stars = "★".repeat(folder_rating as usize);
                             ui.label(
@@ -11370,7 +11443,13 @@ impl App {
                 }
                 result
             })
-            .inner
+            .inner;
+        if open_duplicate_settings {
+            self.open_preferences_page(
+                crate::ui_dialogs::preferences::PreferencesPage::DuplicateFiles,
+            );
+        }
+        result
     }
 
     // ── 検索バー ─────────────────────────────────────────────────────
@@ -15137,6 +15216,83 @@ impl App {
 mod facet_filter_bar_tests {
     use super::*;
     use crate::app::setup_app_for_test;
+
+    #[test]
+    fn omitted_chip_counts_every_user_file_and_leaves_system_files_out() {
+        let counts = crate::app::OmittedFolderEntryCounts {
+            same_name: 3,
+            hidden: 2,
+            unsupported: 5,
+            system: 4,
+        };
+        assert_eq!(
+            omitted_entries_chip_label(counts).as_deref(),
+            Some("非表示 10 件")
+        );
+        assert_eq!(
+            omitted_entries_breakdown_label(counts),
+            "同名など 3 / 隠し項目 2 / 対象外 5 / システム 4"
+        );
+
+        let unsupported_only = crate::app::OmittedFolderEntryCounts {
+            same_name: 0,
+            hidden: 0,
+            unsupported: 5,
+            system: 0,
+        };
+        assert_eq!(
+            omitted_entries_chip_label(unsupported_only).as_deref(),
+            Some("非表示 5 件"),
+            "対象外拡張子だけでもチップを出す"
+        );
+        assert_eq!(
+            omitted_entries_breakdown_label(unsupported_only),
+            "同名など 0 / 隠し項目 0 / 対象外 5",
+            "システム 0 件のときは内訳から省く"
+        );
+
+        let system_only = crate::app::OmittedFolderEntryCounts {
+            same_name: 0,
+            hidden: 0,
+            unsupported: 0,
+            system: 9,
+        };
+        assert_eq!(omitted_entries_chip_label(system_only), None);
+        assert_eq!(
+            omitted_entries_chip_label(Default::default()),
+            None,
+            "主数字が 0 件ならチップを出さない"
+        );
+    }
+
+    #[test]
+    fn omitted_chip_opens_breakdown_and_same_name_settings_link() {
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let counts = crate::app::OmittedFolderEntryCounts {
+            same_name: 3,
+            hidden: 2,
+            unsupported: 5,
+            system: 0,
+        };
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(640.0, 240.0))
+            .build(move |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = draw_omitted_entries_chip(ui, counts);
+                });
+            });
+        harness.run();
+        harness.get_by_label("非表示 10 件").click();
+        harness.run();
+
+        assert!(
+            harness
+                .query_by_label("同名など 3 / 隠し項目 2 / 対象外 5")
+                .is_some()
+        );
+        assert!(harness.query_by_label("同名ファイル設定を開く").is_some());
+    }
 
     fn collect_shape_text(shape: &egui::epaint::Shape, text: &mut String) {
         match shape {

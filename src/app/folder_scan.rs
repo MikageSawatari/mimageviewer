@@ -12,6 +12,44 @@ pub(crate) enum ScanMediaKind {
     Audio,
 }
 
+/// 通常フォルダ一覧を作るときに、物理フォルダ内には存在するが一覧へ出さなかった項目数。
+///
+/// `hidden` / `unsupported` / `system` は既存の `read_dir` ループ内で分類し、`same_name` は
+/// 同名設定の filter が実際に除いた差分を加算する。件数表示のための追加走査や metadata I/O は
+/// 行わない。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OmittedFolderEntryCounts {
+    pub(crate) same_name: usize,
+    pub(crate) hidden: usize,
+    pub(crate) unsupported: usize,
+    /// OS / エクスプローラーが勝手に作る付随ファイル。利用者の持ち物ではないので主数字から外す。
+    pub(crate) system: usize,
+}
+
+impl OmittedFolderEntryCounts {
+    /// チップに出す主数字。**利用者のファイルは種類を問わず全部数える。**
+    ///
+    /// 当初は「対象外拡張子」を除いていたが、除外の動機だった Thumbs.db / desktop.ini は
+    /// hidden 属性を持つので `hidden` 側へ入り、除外しても静かにならない。一方で `.txt` や
+    /// 未対応形式という「消えたら困るかもしれない実ファイル」の signal を落としていた。
+    /// ノイズ源を名前で `system` に分離し、それ以外は全部数えるほうが目的に合う。
+    pub(crate) fn primary_count(self) -> usize {
+        self.same_name
+            .saturating_add(self.hidden)
+            .saturating_add(self.unsupported)
+    }
+}
+
+/// OS / エクスプローラーが自動生成する付随ファイルか。
+///
+/// これらはフォルダを開いただけで現れ、利用者が意識して置いたものではない。主数字に混ぜると
+/// チップが常時点灯して意味を失うので、内訳だけに出す。
+pub(crate) fn is_system_metadata_name(name: &str) -> bool {
+    const SYSTEM_FILES: &[&str] = &["thumbs.db", "ehthumbs.db", "desktop.ini", ".ds_store"];
+    // AppleDouble (`._*`) は macOS / iPhone からのコピーで大量に付いてくる同種のもの。
+    name.starts_with("._") || SYSTEM_FILES.contains(&name.to_lowercase().as_str())
+}
+
 /// ディレクトリ走査結果 (read_dir + 各エントリ metadata 取得の成果物)。
 ///
 /// Ctrl+↑↓ 移動時は DFS スレッドで事前に走査しておき、UI スレッドの
@@ -26,6 +64,8 @@ pub(crate) struct ScannedDir {
     /// (path, kind, mtime, file_size) のタプル。load_folder 内で sort_order
     /// 設定に基づいてソートされる。
     pub all_media: Vec<(PathBuf, ScanMediaKind, i64, i64)>,
+    /// 走査時点で一覧へ出さなかった項目。`same_name` は後段の同名 filter 適用時に入る。
+    pub omitted: OmittedFolderEntryCounts,
 }
 
 /// App::load_folder が走査結果から実際の一覧を組み立てた結果。
@@ -36,6 +76,10 @@ pub(crate) struct ScannedDir {
 pub(crate) struct MaterializedFolderListing {
     pub(crate) items: Vec<GridItem>,
     pub(crate) metas: Vec<Option<(i64, i64)>>,
+    /// 走査時の除外に、ここで適用した同名 filter の件数を足した最終内訳。
+    /// 走査側と filter 側の両方を見られるのはこの関数だけなので、集計者もここに置く。
+    /// 呼び出し側で数え直すと本体一覧と remote 一覧で違う数が出る。
+    pub(crate) omitted: OmittedFolderEntryCounts,
     pub(crate) video_thumb_overrides: Vec<(PathBuf, PathBuf)>,
     pub(crate) folder_count: usize,
     pub(crate) media_count: usize,
@@ -49,6 +93,7 @@ pub(crate) fn materialize_local_folder_listing(
     scan: ScannedDir,
     settings: &crate::settings::Settings,
 ) -> MaterializedFolderListing {
+    let mut omitted = scan.omitted;
     let (mut folders, mut metas): (Vec<_>, Vec<_>) = scan.folders.into_iter().unzip();
     let mut all_media = scan.all_media;
     let compiled = crate::books::is_direct_book_folder(&settings.books_root_path(), path);
@@ -98,20 +143,32 @@ pub(crate) fn materialize_local_folder_listing(
     let sort_ms = sort_started.elapsed().as_secs_f64() * 1000.0;
 
     let duplicate_started = std::time::Instant::now();
+    let mut same_name = 0usize;
     if settings.skip_zip_if_folder_exists {
-        filter_virtual_folder_duplicates(&mut folders, &mut metas);
+        same_name =
+            same_name.saturating_add(filter_virtual_folder_duplicates(&mut folders, &mut metas));
     }
     if settings.skip_archive_if_zip_exists {
-        filter_convertible_archive_duplicates(&mut folders, &mut metas);
+        same_name = same_name.saturating_add(filter_convertible_archive_duplicates(
+            &mut folders,
+            &mut metas,
+        ));
     }
     let video_thumb_overrides = if settings.skip_image_if_video_exists {
-        filter_video_image_duplicates(&mut all_media, settings.video_thumb_use_sidecar_image)
+        let filtered =
+            filter_video_image_duplicates(&mut all_media, settings.video_thumb_use_sidecar_image);
+        same_name = same_name.saturating_add(filtered.omitted);
+        filtered.sidecars
     } else {
         Vec::new()
     };
     if settings.skip_duplicate_images {
-        filter_image_ext_duplicates(&mut all_media, &settings.image_ext_priority);
+        same_name = same_name.saturating_add(filter_image_ext_duplicates(
+            &mut all_media,
+            &settings.image_ext_priority,
+        ));
     }
+    omitted.same_name = same_name;
     let duplicate_filter_ms = duplicate_started.elapsed().as_secs_f64() * 1000.0;
 
     let mut items = folders;
@@ -133,6 +190,7 @@ pub(crate) fn materialize_local_folder_listing(
     MaterializedFolderListing {
         items,
         metas,
+        omitted,
         video_thumb_overrides,
         folder_count,
         media_count,
@@ -252,6 +310,7 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     scan_directory_with_convertible_archives(path, true, false).unwrap_or_else(|_| ScannedDir {
         folders: Vec::new(),
         all_media: Vec::new(),
+        omitted: OmittedFolderEntryCounts::default(),
     })
 }
 
@@ -285,6 +344,7 @@ where
 {
     let mut folders: Vec<(GridItem, Option<(i64, i64)>)> = Vec::new();
     let mut all_media: Vec<(PathBuf, ScanMediaKind, i64, i64)> = Vec::new();
+    let mut omitted = OmittedFolderEntryCounts::default();
     let mut entry_file_names_ci: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for entry in entries {
@@ -302,8 +362,17 @@ where
             .file_type()
             .map(|ft| crate::fs_entry::classify_dir_entry(&entry, &ft))
             .unwrap_or(crate::fs_entry::DirEntryKind::Other);
-        entry_file_names_ci.insert(entry.file_name().to_string_lossy().to_lowercase());
+        let entry_name = entry.file_name().to_string_lossy().to_lowercase();
+        // OS 由来の付随ファイルはどの経路で落ちても `system` に寄せる。分類だけで、
+        // 一覧へ出す / 出さないの判定は一切変えない。
+        let is_system_file = is_system_metadata_name(&entry_name);
+        entry_file_names_ci.insert(entry_name);
         if crate::fs_entry::should_hide_fs_entry(&entry, show_hidden_files) {
+            if is_system_file {
+                omitted.system = omitted.system.saturating_add(1);
+            } else {
+                omitted.hidden = omitted.hidden.saturating_add(1);
+            }
             continue;
         }
         let p = entry.path();
@@ -318,6 +387,7 @@ where
             folders.push((GridItem::Folder(p), Some((mtime, 0))));
         } else if crate::folder_tree::is_apple_double(&p) {
             // macOS/iPhone AppleDouble メタデータ - スキップ
+            omitted.system = omitted.system.saturating_add(1);
         } else if kind.is_file()
             && let Some(ext) = p.extension().and_then(|e| e.to_str())
         {
@@ -348,11 +418,32 @@ where
                     },
                     Some((mtime, file_size)),
                 ));
+            } else if is_system_file {
+                omitted.system = omitted.system.saturating_add(1);
+            } else {
+                omitted.unsupported = omitted.unsupported.saturating_add(1);
+            }
+        } else if kind.is_file() {
+            // 拡張子のない通常ファイルも、一覧対象外のファイルとして内訳に含める。
+            if is_system_file {
+                omitted.system = omitted.system.saturating_add(1);
+            } else {
+                omitted.unsupported = omitted.unsupported.saturating_add(1);
             }
         }
     }
     filter_upscaled_video_pairs_fast(&mut all_media, &entry_file_names_ci);
-    Ok(ScannedDir { folders, all_media })
+    Ok(ScannedDir {
+        folders,
+        all_media,
+        omitted,
+    })
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct VideoImageDuplicateFilterResult {
+    pub(crate) sidecars: Vec<(PathBuf, PathBuf)>,
+    pub(crate) omitted: usize,
 }
 
 pub(super) fn filter_upscaled_video_pairs_fast(
@@ -405,7 +496,7 @@ pub(super) fn filter_upscaled_video_pairs_fast(
 pub(crate) fn filter_video_image_duplicates(
     media: &mut Vec<(PathBuf, ScanMediaKind, i64, i64)>,
     use_sidecar: bool,
-) -> Vec<(PathBuf, PathBuf)> {
+) -> VideoImageDuplicateFilterResult {
     let mut videos_by_stem: std::collections::HashMap<String, Vec<PathBuf>> =
         std::collections::HashMap::new();
     for (path, kind, _, _) in media.iter() {
@@ -417,7 +508,7 @@ pub(crate) fn filter_video_image_duplicates(
         }
     }
     if videos_by_stem.is_empty() {
-        return Vec::new();
+        return VideoImageDuplicateFilterResult::default();
     }
 
     let mut sidecars = Vec::new();
@@ -432,17 +523,21 @@ pub(crate) fn filter_video_image_duplicates(
         }
     }
 
+    let before = media.len();
     media.retain(|(path, kind, _, _)| {
         *kind != ScanMediaKind::Image || !videos_by_stem.contains_key(&super::stem_lower(path))
     });
-    sidecars
+    VideoImageDuplicateFilterResult {
+        sidecars,
+        omitted: before.saturating_sub(media.len()),
+    }
 }
 
 /// ZIP/PDF/対応アーカイブと同名の実フォルダがあれば、実フォルダを一覧の正本にする。
 pub(crate) fn filter_virtual_folder_duplicates(
     folders: &mut Vec<GridItem>,
     folder_metas: &mut Vec<Option<(i64, i64)>>,
-) {
+) -> usize {
     let real_folder_names: std::collections::HashSet<String> = folders
         .iter()
         .filter_map(|item| match item {
@@ -468,13 +563,14 @@ pub(crate) fn filter_virtual_folder_duplicates(
     folders.retain(|_| *iter.next().unwrap());
     let mut iter = keep.iter();
     folder_metas.retain(|_| *iter.next().unwrap());
+    keep.iter().filter(|keep| !**keep).count()
 }
 
 /// 同名の ZIP/CBZ があれば、変換元になる RAR/7z/LZH 等を一覧から除外する。
 pub(crate) fn filter_convertible_archive_duplicates(
     folders: &mut Vec<GridItem>,
     folder_metas: &mut Vec<Option<(i64, i64)>>,
-) {
+) -> usize {
     let zip_stems: std::collections::HashSet<String> = folders
         .iter()
         .filter_map(|item| match item {
@@ -483,7 +579,7 @@ pub(crate) fn filter_convertible_archive_duplicates(
         })
         .collect();
     if zip_stems.is_empty() {
-        return;
+        return 0;
     }
     let keep: Vec<bool> = folders
         .iter()
@@ -498,13 +594,14 @@ pub(crate) fn filter_convertible_archive_duplicates(
     folders.retain(|_| *iter.next().unwrap());
     let mut iter = keep.iter();
     folder_metas.retain(|_| *iter.next().unwrap());
+    keep.iter().filter(|keep| !**keep).count()
 }
 
 /// 同名ステムの画像を拡張子優先順で 1 件へ絞る。一覧と画像フォルダのページ数で共有する。
 pub(crate) fn filter_image_ext_duplicates(
     all_media: &mut Vec<(PathBuf, ScanMediaKind, i64, i64)>,
     priority: &[String],
-) {
+) -> usize {
     let mut best: std::collections::HashMap<String, (usize, usize)> =
         std::collections::HashMap::new();
     for (index, (path, kind, _, _)) in all_media.iter().enumerate() {
@@ -542,8 +639,9 @@ pub(crate) fn filter_image_ext_duplicates(
         .map(|(_, &(_, index))| index)
         .collect();
     if keep_indices.is_empty() {
-        return;
+        return 0;
     }
+    let before = all_media.len();
     let mut index = 0usize;
     all_media.retain(|(path, kind, _, _)| {
         let current = index;
@@ -554,6 +652,7 @@ pub(crate) fn filter_image_ext_duplicates(
         let stem = super::stem_lower(path);
         stem_counts.get(&stem).copied().unwrap_or(0) <= 1 || keep_indices.contains(&current)
     });
+    before.saturating_sub(all_media.len())
 }
 
 pub(super) fn is_miv_upscaled_derivative(path: &std::path::Path) -> bool {
@@ -621,6 +720,12 @@ pub(crate) fn signature_from_scan(scan: &ScannedDir) -> u64 {
     entries.sort();
     let mut hasher = DefaultHasher::new();
     entries.len().hash(&mut hasher);
+    // `omitted` は意図的に含めない。この signature は「一覧を差し替える必要があるか」を
+    // 判定するもので、`hidden` / `unsupported` には Explorer が書く Thumbs.db / desktop.ini
+    // (どちらも hidden 属性) が入る。これを含めるとサムネイルキャッシュが書かれるたびに
+    // items 差し替えと AI / PDF キャッシュ破棄が走り、この signature が防いでいるはずの
+    // ちらつきを自ら起こす。チップは一覧を作った同じ走査から導出するので、表示中の一覧とは
+    // 常に整合しており、実際に一覧が変わったときの再ロードで更新される。
     for e in &entries {
         e.hash(&mut hasher);
     }
@@ -710,6 +815,134 @@ mod page_count_tests {
             image_folder_page_count(temp.path(), &options(true)).unwrap(),
             Some(2)
         );
+    }
+
+    #[test]
+    fn omitted_counts_reuse_scan_results_and_separate_system_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("001.jpg"), b"jpg").unwrap();
+        std::fs::write(temp.path().join("001.png"), b"png").unwrap();
+        std::fs::write(temp.path().join("notes.txt"), b"text").unwrap();
+        std::fs::write(temp.path().join("state"), b"extensionless").unwrap();
+        std::fs::write(temp.path().join("._finder.jpg"), b"apple double").unwrap();
+        std::fs::write(temp.path().join("Thumbs.db"), b"explorer cache").unwrap();
+        std::fs::write(temp.path().join("desktop.ini"), b"explorer view").unwrap();
+
+        // 内訳はこの既存 read_dir の結果から導出する。件数取得専用の再走査 API は持たない。
+        let mut scan = scan_directory_with_convertible_archives(temp.path(), true, false).unwrap();
+        scan.omitted.same_name =
+            filter_image_ext_duplicates(&mut scan.all_media, &["png".to_owned(), "jpg".to_owned()]);
+
+        assert_eq!(scan.omitted.same_name, 1);
+        assert_eq!(scan.omitted.hidden, 0);
+        assert_eq!(scan.omitted.unsupported, 2, "notes.txt と拡張子なし");
+        assert_eq!(
+            scan.omitted.system, 3,
+            "AppleDouble / Thumbs.db / desktop.ini"
+        );
+        // 利用者のファイルは種類を問わず数え、OS 由来の 3 件だけを主数字から外す。
+        assert_eq!(scan.omitted.primary_count(), 3);
+        assert_eq!(scan.all_media.len(), 1);
+    }
+
+    #[test]
+    fn materialized_listing_reports_scan_and_same_name_omissions_together() {
+        // チップの数字は走査時の除外と同名 filter の両方から出る。両方を見られるのは
+        // `materialize_local_folder_listing` だけなので、集計もここが持つ。呼び出し側で
+        // 数え直すと本体一覧と remote 一覧で違う数字が出る (v2.12.0 取り込み時の実害)。
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("001.jpg"), b"jpg").unwrap();
+        std::fs::write(temp.path().join("001.png"), b"png").unwrap();
+        std::fs::write(temp.path().join("notes.txt"), b"text").unwrap();
+        std::fs::write(temp.path().join("Thumbs.db"), b"explorer cache").unwrap();
+
+        let scan = scan_directory_with_convertible_archives(temp.path(), true, false).unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.skip_duplicate_images = true;
+        settings.image_ext_priority = vec!["png".to_owned(), "jpg".to_owned()];
+
+        let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+
+        assert_eq!(listing.omitted.same_name, 1, "001.jpg が png に負ける");
+        assert_eq!(listing.omitted.unsupported, 1, "notes.txt");
+        assert_eq!(listing.omitted.system, 1, "Thumbs.db");
+        assert_eq!(listing.items.len(), 1, "残るのは 001.png だけ");
+    }
+
+    #[test]
+    fn unsupported_files_are_counted_but_system_files_are_not() {
+        let counts = OmittedFolderEntryCounts {
+            same_name: 0,
+            hidden: 0,
+            unsupported: 5,
+            system: 0,
+        };
+        assert_eq!(
+            counts.primary_count(),
+            5,
+            "見えていない実ファイルは対象外拡張子でも数える"
+        );
+
+        let system_only = OmittedFolderEntryCounts {
+            same_name: 0,
+            hidden: 0,
+            unsupported: 0,
+            system: 7,
+        };
+        assert_eq!(
+            system_only.primary_count(),
+            0,
+            "Thumbs.db だけのフォルダでチップを点けない"
+        );
+    }
+
+    #[test]
+    fn system_metadata_names_are_matched_case_insensitively() {
+        for name in [
+            "thumbs.db",
+            "Thumbs.db",
+            "DESKTOP.INI",
+            ".DS_Store",
+            "._img.jpg",
+        ] {
+            assert!(is_system_metadata_name(name), "{name} should be system");
+        }
+        for name in ["notes.txt", "001.jpg", "thumbs.jpg", "my_desktop.ini.txt"] {
+            assert!(
+                !is_system_metadata_name(name),
+                "{name} should not be system"
+            );
+        }
+    }
+
+    #[test]
+    fn video_image_filter_returns_the_actual_folded_difference() {
+        let mut media = vec![
+            (
+                PathBuf::from(r"C:\media\clip.mp4"),
+                ScanMediaKind::Video,
+                0,
+                0,
+            ),
+            (
+                PathBuf::from(r"C:\media\clip.jpg"),
+                ScanMediaKind::Image,
+                0,
+                0,
+            ),
+            (
+                PathBuf::from(r"C:\media\other.jpg"),
+                ScanMediaKind::Image,
+                0,
+                0,
+            ),
+        ];
+
+        let filtered = filter_video_image_duplicates(&mut media, false);
+
+        assert_eq!(filtered.omitted, 1);
+        assert!(filtered.sidecars.is_empty());
+        assert_eq!(media.len(), 2);
     }
 
     #[test]

@@ -647,7 +647,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 `Enter` / `NumpadEnter` は `VK_RETURN` を共有するため、Press、キャプチャ、native 動画だけでなく
 KeyHold も Win32 edge の extended bit を正本にする。KeyHold の押下中状態は main / numpad 別に
 `WM_KEYDOWN/WM_KEYUP` からラッチし、`GetAsyncKeyState(VK_RETURN)` や egui の
-`physical_key = Enter` へフォールバックしない。
+`physical_key = Enter` へフォールバックしない。対象 viewport の subclass 登録前など、送信元付き
+ラッチを利用できないフレームは両方とも未押下として扱う。
 
 修飾: Ctrl/Shift/Alt (左右不問) と RightCtrl/RightShift/RightAlt (右側限定)。
 Win キーは対象外。右 Alt は RightAlt として指定できる。

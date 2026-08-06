@@ -28,6 +28,20 @@ OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対
 正本にする。egui 0.33 の `physical_key` は両者を同じ `egui::Key::Enter` へ畳むため、
 この 2 スロットの照合には使わない。旧 `keymap.ini` と現行設定の表記は従来どおり
 `Enter` / `NumpadEnter` で、migration や破壊的な表記変更は行わない。
+frame-active な viewport (subclass 登録済み = Win32 キューを持つ) では、そのキューに該当 edge が
+無いことが「押されていない」の答えになる。egui が畳んだイベントで代用しない。同じ物理押下の
+egui イベントは main と fullscreen の両 viewport へ届く一方、Win32 edge は届いた側にしか無いため、
+フォールバックすると edge の無い viewport が別スロットの押下を拾う (NumpadEnter でフルスクリーンが
+閉じた)。対象は畳まれ先のスロット (`Enter` / `Num0`-`Num9`) に限る。
+KeyHold が Win32 edge を消費したときは、同じ物理押下から egui が生成したイベントも同時に
+claim する。2 つのキューは同じ押下を表すので、片方だけ消費すると残ったほうを次の読み手が拾う
+(`NumpadEnter` を KeyHold へ割り当てると、egui が畳んだ `Key::Enter` を `FsClose` が拾って
+表示が閉じていた)。照合に使う egui Key (`to_egui`) と、claim に使う「畳まれた先」は別物として扱う。
+KeyHold の押下中状態も viewport に対応付いた Win32 ラッチだけを正本にする。新規 viewport の
+subclass 登録前など、対象 viewport の送信元付きラッチを確認できないフレームでは、
+`Enter` / `NumpadEnter` を未押下として扱い、物理種別と送信元 HWND を失う
+`GetAsyncKeyState(VK_RETURN)` へフォールバックしない。固有 VK をそのまま識別に使える
+その他の KeyHold は従来の OS 状態参照を維持する。
 OS 予約ショートカット (例: Alt+F4 / Alt+Tab / Win キー系) は keymap では上書きできない。
 `Esc` と修飾なし矢印ナビゲーションは、モード脱出と閲覧の最低限の固定入力として keymap 対象外にする。
 Enter / Backspace / Home / End / PageUp / PageDown などの閲覧操作は文脈ごとの `KeyAction`

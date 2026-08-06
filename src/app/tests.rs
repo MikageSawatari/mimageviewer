@@ -2204,7 +2204,7 @@ fn filter_virtual_folder_skips_archive_matching_folder() {
     ];
     let mut folder_metas: Vec<Option<(i64, i64)>> = vec![None, None, None, None, None, None, None];
 
-    App::filter_virtual_folder_duplicates(&mut folders, &mut folder_metas);
+    let omitted = App::filter_virtual_folder_duplicates(&mut folders, &mut folder_metas);
 
     let remaining_names: Vec<String> = folders
         .iter()
@@ -2225,6 +2225,7 @@ fn filter_virtual_folder_skips_archive_matching_folder() {
         "同名フォルダ vol01 があるアーカイブ 4 件は消え、他は残る",
     );
     assert_eq!(folders.len(), folder_metas.len(), "metas も同期して削除");
+    assert_eq!(omitted, 4, "実際に一覧から畳んだ差分を返す");
 }
 
 /// 大文字小文字は無視して同名判定する (Windows 文化圏での実運用に合わせる)。
@@ -2239,9 +2240,50 @@ fn filter_virtual_folder_case_insensitive() {
     ];
     let mut folder_metas: Vec<Option<(i64, i64)>> = vec![None, None];
 
-    App::filter_virtual_folder_duplicates(&mut folders, &mut folder_metas);
+    let omitted = App::filter_virtual_folder_duplicates(&mut folders, &mut folder_metas);
 
     assert_eq!(folders.len(), 1, "大文字小文字違いでも一致扱い");
+    assert_eq!(omitted, 1);
+}
+
+#[test]
+fn omitted_entries_are_exposed_only_for_the_normal_folder_surface() {
+    use crate::app::top_level_grid_view::{
+        SmartFolderViewState, TopLevelGridSurface, TopLevelSearchView,
+    };
+
+    let mut app = setup_app_for_test();
+    let folder = PathBuf::from(r"C:\pictures");
+    let counts = crate::app::folder_scan::OmittedFolderEntryCounts {
+        same_name: 3,
+        hidden: 2,
+        unsupported: 5,
+        system: 1,
+    };
+    app.current_folder = Some(folder.clone());
+    app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries { folder, counts });
+    assert_eq!(app.current_normal_folder_omitted_counts(), Some(counts));
+
+    for surface in [
+        TopLevelGridSurface::SubfolderExpansion,
+        TopLevelGridSurface::Search(TopLevelSearchView::Global),
+        TopLevelGridSurface::SmartFolder(SmartFolderViewState::root(uuid::Uuid::nil(), Vec::new())),
+    ] {
+        app.top_level_grid_view.replace_surface(surface);
+        assert_eq!(
+            app.current_normal_folder_omitted_counts(),
+            None,
+            "後追い対象のビューには通常フォルダの内訳を漏らさない"
+        );
+    }
+
+    app.top_level_grid_view
+        .replace_surface(TopLevelGridSurface::Folder);
+    app.search_filter = Some(std::collections::HashSet::new());
+    assert_eq!(app.current_normal_folder_omitted_counts(), None);
+    app.search_filter = None;
+    app.stack_mode_requested = true;
+    assert_eq!(app.current_normal_folder_omitted_counts(), None);
 }
 
 /// `clamp_dynamic_for_gpu` は 8192 以内の画像には触れず、超えるときだけ
@@ -2407,6 +2449,11 @@ pub(crate) mod phase_c_support {
         };
         let mut app = App::new_for_test(config);
         app.settings.first_setup_completed = true;
+        // `data_dir` の差し替えだけでは製本ルートは隔離されない。`book_root` が None のままだと
+        // `settings_books_root` が既定 (= 利用者の実ピクチャフォルダ) を返し、そこへ本フォルダを
+        // 作るテストが実データを書き換える。テストが実利用のフォルダへ触れないよう、ここで
+        // 一緒に temp dir へ向ける。
+        app.settings.book_root = Some(tmp.path().join("books"));
         AppTestEnv {
             app,
             _guard: guard,
@@ -3727,7 +3774,7 @@ mod same_name_zip_preference_tests {
             },
         ];
         let mut metas = vec![Some((1, 10)), Some((2, 20)), Some((3, 30))];
-        App::filter_convertible_archive_duplicates(&mut items, &mut metas);
+        let omitted = App::filter_convertible_archive_duplicates(&mut items, &mut metas);
 
         assert_eq!(items.len(), 2);
         assert!(matches!(items[0], GridItem::ZipFile(_)));
@@ -3739,6 +3786,7 @@ mod same_name_zip_preference_tests {
             }
         ));
         assert_eq!(metas, vec![Some((1, 10)), Some((3, 30))]);
+        assert_eq!(omitted, 1);
     }
 }
 
@@ -4441,6 +4489,7 @@ mod folder_pane_open_nav_tests {
         ScannedDir {
             folders: Vec::new(),
             all_media: Vec::new(),
+            omitted: crate::app::folder_scan::OmittedFolderEntryCounts::default(),
         }
     }
 
@@ -49411,4 +49460,91 @@ mod rating_write_failure_tests {
             HistoryTrigger::UserChosen
         );
     }
+}
+
+/// 利用者報告 (2026-08-05) の再現: 同名ステムの画像 3 種 + 非対応 2 件のフォルダ。
+/// 一覧は 2 件に畳まれるので、`load_folder` 後にチップの内訳が取れなければならない。
+#[test]
+fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
+    let mut app = phase_c_support::setup_app();
+    let folder = app.tmp.path().join("同名テスト");
+    std::fs::create_dir(&folder).unwrap();
+    for stem in ["C165", "C206"] {
+        for ext in ["BMP", "PNG", "JPG"] {
+            std::fs::write(folder.join(format!("{stem}.{ext}")), b"dummy").unwrap();
+        }
+    }
+    std::fs::write(folder.join("C165_206.HED"), b"dummy").unwrap();
+    std::fs::write(folder.join("C165_206.TXT"), b"dummy").unwrap();
+    app.settings.skip_duplicate_images = true;
+
+    app.load_folder(folder.clone());
+
+    assert_eq!(app.items.len(), 2, "同名ステムは 1 件ずつに畳まれる");
+    let counts = app
+        .current_normal_folder_omitted_counts()
+        .expect("通常フォルダなので内訳が取れる");
+    assert_eq!(counts.same_name, 4);
+    assert_eq!(counts.unsupported, 2, "HED / TXT は一覧に出ない実ファイル");
+    assert_eq!(
+        counts.primary_count(),
+        6,
+        "利用者が数えた 8 - 表示 2 と一致する"
+    );
+
+    // 内訳が取れるだけでは足りない。利用者が探しているのは画面上のチップなので、
+    // 実際のフォルダバー描画にラベルが出るところまで固定する。絞り込みバーは
+    // 利用者が手で足す条件のバーなので、既定動作による非表示はこちらが定位置。
+    assert!(app.settings.show_address_bar_omitted_entries);
+    let ctx = egui::Context::default();
+    let output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 240.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            app.render_address_bar(ctx);
+        },
+    );
+    let mut drawn = String::new();
+    let mut stack: Vec<&egui::epaint::Shape> = output.shapes.iter().map(|c| &c.shape).collect();
+    while let Some(shape) = stack.pop() {
+        match shape {
+            egui::epaint::Shape::Text(text) => drawn.push_str(text.galley.text()),
+            egui::epaint::Shape::Vec(shapes) => stack.extend(shapes.iter()),
+            _ => {}
+        }
+    }
+    assert!(
+        drawn.contains("非表示 6 件"),
+        "フォルダバーにチップが描かれていない: {drawn}"
+    );
+
+    // フォルダバー右クリックの設定で消せること。
+    app.settings.show_address_bar_omitted_entries = false;
+    let hidden = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 240.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            app.render_address_bar(ctx);
+        },
+    );
+    let mut drawn_off = String::new();
+    let mut stack: Vec<&egui::epaint::Shape> = hidden.shapes.iter().map(|c| &c.shape).collect();
+    while let Some(shape) = stack.pop() {
+        match shape {
+            egui::epaint::Shape::Text(text) => drawn_off.push_str(text.galley.text()),
+            egui::epaint::Shape::Vec(shapes) => stack.extend(shapes.iter()),
+            _ => {}
+        }
+    }
+    assert!(!drawn_off.contains("非表示"), "OFF にしたら出さない");
 }

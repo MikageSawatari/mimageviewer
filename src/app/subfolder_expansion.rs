@@ -811,10 +811,11 @@ fn apply_duplicate_filters_to_media(
     video_thumb_overrides: &mut HashMap<String, PathBuf>,
 ) {
     if options.skip_image_if_video_exists {
-        for (video, image) in super::folder_scan::filter_video_image_duplicates(
+        let filtered = super::folder_scan::filter_video_image_duplicates(
             media,
             options.video_thumb_use_sidecar_image,
-        ) {
+        );
+        for (video, image) in filtered.sidecars {
             video_thumb_overrides.insert(crate::path_key::normalize_keep_drive(&video), image);
         }
     }

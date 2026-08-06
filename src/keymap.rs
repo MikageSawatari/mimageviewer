@@ -732,6 +732,62 @@ impl KeySlot {
         }
     }
 
+    /// Extended-bit discriminator for KeyHold slots whose physical identity
+    /// cannot be recovered from `GetAsyncKeyState(to_vk())` alone.
+    ///
+    /// Main Enter and numpad Enter intentionally share VK_RETURN and already
+    /// have a per-HWND held latch that preserves the extended bit. Other slots
+    /// keep their existing VK fallback; this fix does not broaden that boundary.
+    #[cfg(windows)]
+    const fn routed_hold_extended(self) -> Option<bool> {
+        match self {
+            KeyName::Enter => Some(false),
+            KeyName::NumpadEnter => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Win32 edge を消費したときに、同じ物理押下から egui が生成した双子イベントを
+    /// 一緒に claim するための egui Key。
+    ///
+    /// `to_egui` は「**照合に使ってよいか**」を表すので `NumpadEnter` は `None` になる
+    /// (egui は本体 Enter と同じ `Key::Enter` へ畳むため、照合に使うと取り違える)。
+    /// claim では逆に**畳まれた先を知る必要がある**: その押下は確かに `Key::Enter` を
+    /// 生んでいるので、残すと後続の Enter 割り当て (`FsClose` 等) がそれを拾ってしまう。
+    fn egui_twin_key_for_claim(self) -> Option<egui::Key> {
+        self.to_egui().or(match self {
+            KeyName::NumpadEnter => Some(egui::Key::Enter),
+            _ => None,
+        })
+    }
+
+    /// egui イベントだけでは、その物理スロットが押されたのか判断できないか。
+    ///
+    /// egui は `NumpadEnter` を `Key::Enter` へ、`Numpad0-9` を `Num0-9` へ畳む。畳まれた
+    /// **先**のスロット (`Enter` / `Num0-9`) は、egui の `Key::Enter` を見ても本体キーなのか
+    /// テンキーなのか区別できない。viewport が frame-active なら Win32 キューが正本なので、
+    /// これらのスロットは「該当 edge が無い = 押されていない」とし、egui へ落ちない。
+    ///
+    /// 実害 (2026-08-05): フルスクリーン中の NumpadEnter は fullscreen viewport の Win32 edge
+    /// になる一方、egui イベントは main viewport にも届く。main 側には対応する edge が無いので
+    /// egui へ落ち、`Key::Enter` を `FsClose` (既定 Enter) が拾って表示が閉じていた。
+    fn egui_event_cannot_identify_slot(self) -> bool {
+        matches!(
+            self,
+            KeyName::Enter
+                | KeyName::Num0
+                | KeyName::Num1
+                | KeyName::Num2
+                | KeyName::Num3
+                | KeyName::Num4
+                | KeyName::Num5
+                | KeyName::Num6
+                | KeyName::Num7
+                | KeyName::Num8
+                | KeyName::Num9
+        )
+    }
+
     /// KeyHold の同フレーム押下+離し (fast-tap) 救済に使う egui Key。
     /// `to_egui` が**別の物理キーへ畳む**もの (Numpad0-9 → 上段 Num0-9) は None を返し、
     /// テンキー割当なのに上段数字キーのイベントを消費 / 誤発火させない
@@ -6357,7 +6413,7 @@ impl Keymap {
             } else {
                 action.default_chords().iter().collect()
             };
-            return crate::key_input::consume_key_edges(ctx.viewport_id(), |edge| {
+            let edges = crate::key_input::consume_key_edges(ctx.viewport_id(), |edge| {
                 chords.iter().copied().any(|chord| {
                     let physical_match = chord.key_name().is_some_and(|name| {
                         name.matches_win32(edge.virtual_key, edge.scan_code, edge.extended)
@@ -6368,6 +6424,15 @@ impl Keymap {
                     physical_match && (!edge.pressed || chord.matches_key_edge(edge))
                 })
             });
+            if edges.0 || edges.1 {
+                // 2 つのキューは同じ物理押下を表すので、片方だけ消費すると egui 側の双子が
+                // 残り、次の読み手がそれを拾う。`consume_chord_inner` は Win32 経路で
+                // 同じ claim をしている ("Claim both at this ownership boundary")。
+                // ここが抜けていたため、NumpadEnter を KeyHold に割り当てると、残った
+                // `Key::Enter` を `FsClose` が egui 経路で拾って表示が閉じていた。
+                Self::claim_egui_twin_key_events(ctx, &chords);
+            }
+            return edges;
         }
         // Numpad0-9 は to_egui が上段 Num0-9 へ畳むため、ここで使うと「テンキー割当なのに
         // 上段数字キーのイベントを消費 / fast-tap 誤発火」になる。fast-tap 救済から除外し、
@@ -6772,6 +6837,9 @@ impl Keymap {
                 }
                 return result.triggered_count > 0;
             }
+            if Self::frame_active_blocks_egui_fallback(chord) {
+                return false;
+            }
         }
         let (triggered, matched) = ctx.input_mut(|i| {
             let mut found = false;
@@ -6837,6 +6905,12 @@ impl Keymap {
             }
             return result.triggered_count;
         }
+        #[cfg(windows)]
+        if crate::key_input::is_frame_active(ctx.viewport_id())
+            && Self::frame_active_blocks_egui_fallback(chord)
+        {
+            return 0;
+        }
 
         let (physical_press_count, matched_repeat, matched) = ctx.input_mut(|i| {
             let mut physical_press_count = 0usize;
@@ -6879,6 +6953,36 @@ impl Keymap {
         if chord.key_name() == Some(KeyName::Tab) {
             crate::egui_focus_policy::cancel_tab_focus_traversal(ctx);
         }
+    }
+
+    /// Win32 edge を消費した KeyHold の chord について、同じ物理押下から egui が生成した
+    /// イベントを押下 / 離しとも取り除く。物理スロットの所有はこのフレームで確定しており、
+    /// 修飾の一致は Win32 側の照合で済んでいる。
+    /// frame-active な viewport で、この chord が egui フォールバックへ落ちてよいか。
+    ///
+    /// Win32 キューを持つ viewport では、そこに edge が無いことが「押されていない」の答え。
+    /// egui が畳んだイベントで代用すると、別 viewport / 別物理キーの押下を拾う。
+    #[cfg(windows)]
+    fn frame_active_blocks_egui_fallback(chord: Chord) -> bool {
+        chord
+            .key_name()
+            .is_some_and(KeyName::egui_event_cannot_identify_slot)
+    }
+
+    fn claim_egui_twin_key_events(ctx: &egui::Context, chords: &[Chord]) {
+        let twins: Vec<egui::Key> = chords
+            .iter()
+            .filter_map(|chord| chord.key_name())
+            .filter_map(KeyName::egui_twin_key_for_claim)
+            .collect();
+        if twins.is_empty() {
+            return;
+        }
+        ctx.input_mut(|i| {
+            i.events.retain(
+                |event| !matches!(event, egui::Event::Key { key, .. } if twins.contains(key)),
+            );
+        });
     }
 
     fn remove_matching_egui_key_presses(ctx: &egui::Context, chord: Chord, allow_repeat: bool) {
@@ -6937,6 +7041,9 @@ impl Keymap {
                 return crate::key_input::pressed_key_down(ctx.viewport_id(), |edge| {
                     chord.matches_key_edge(edge)
                 });
+            }
+            if Self::frame_active_blocks_egui_fallback(chord) {
+                return false;
             }
         }
         ctx.input(|i| {
@@ -7132,14 +7239,28 @@ impl KeymapSettings {
 fn key_held_via_os(viewport: egui::ViewportId, key: KeyName) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
-    if crate::key_input::is_frame_active(viewport) {
-        match key {
-            KeyName::Enter => return crate::key_input::return_key_held(viewport, false),
-            KeyName::NumpadEnter => return crate::key_input::return_key_held(viewport, true),
-            _ => {}
-        }
+    let routed_physical_state = key
+        .routed_hold_extended()
+        .and_then(|extended| crate::key_input::routed_return_key_held(viewport, extended));
+    key_held_from_os_sources(key, routed_physical_state, |virtual_key| unsafe {
+        GetAsyncKeyState(virtual_key as i32) < 0
+    })
+}
+
+#[cfg(windows)]
+fn key_held_from_os_sources(
+    key: KeyName,
+    routed_physical_state: Option<bool>,
+    async_key_state: impl FnOnce(u32) -> bool,
+) -> bool {
+    if key.routed_hold_extended().is_some() {
+        // These slots share a VK with another physical key. Without a
+        // source-routed viewport latch, process-global async state cannot tell
+        // which HWND or physical slot owns the hold, so the only safe result
+        // is not-held. Other slots keep their existing async fallback.
+        return routed_physical_state.unwrap_or(false);
     }
-    unsafe { GetAsyncKeyState(key.to_vk() as i32) < 0 }
+    async_key_state(key.to_vk())
 }
 
 #[cfg(windows)]
@@ -7585,6 +7706,232 @@ mod tests {
         fn drop(&mut self) {
             crate::key_input::clear_test_frame();
         }
+    }
+
+    /// VK を共有するスロットは `GetAsyncKeyState` だけでは物理的にどちらか判別できない。
+    /// `key_held_from_os_sources` はそのうち **送信元付きラッチを持つ Enter ペアだけ**を
+    /// routed 必須にしているので、共有ペアが増えたら境界の見直しが要る。増えたことに
+    /// 気付けるよう、既知の共有をここで固定する。
+    ///
+    /// `Backslash` / `IntlYen` (0xDC) も共有だが、extended bit で分かれる Enter と違って
+    /// scan code でしか分かれず、対応するラッチが無い。KeyHold へ割り当てたときの
+    /// 取り違えは残る (§1.43 の後続、実害は Enter と違って「開いた瞬間に押されている」
+    /// 状況が無いので小さい)。
+    #[test]
+    fn shared_virtual_keys_stay_limited_to_the_known_pairs() {
+        let source = include_str!("keymap.rs");
+        let body = source
+            .split_once("pub fn to_vk(self) -> u32 {")
+            .expect("to_vk exists")
+            .1
+            .split_once(
+                "
+    }",
+            )
+            .expect("to_vk ends")
+            .0;
+
+        let mut by_vk: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for line in body.lines() {
+            let Some((slot, vk)) = line.trim().trim_end_matches(',').split_once("=> ") else {
+                continue;
+            };
+            let Some(slot) = slot.trim().strip_prefix("KeyName::") else {
+                continue;
+            };
+            if !vk.starts_with("0x") {
+                continue;
+            }
+            by_vk
+                .entry(vk.to_string())
+                .or_default()
+                .push(slot.to_string());
+        }
+        assert!(by_vk.len() > 50, "to_vk arms were not parsed: {by_vk:?}");
+
+        let shared: Vec<(String, Vec<String>)> = by_vk
+            .into_iter()
+            .filter(|(_, slots)| slots.len() > 1)
+            .collect();
+        let expected = vec![
+            (
+                "0x0D".to_string(),
+                vec!["Enter".to_string(), "NumpadEnter".to_string()],
+            ),
+            (
+                "0xDC".to_string(),
+                vec!["Backslash".to_string(), "IntlYen".to_string()],
+            ),
+        ];
+        assert_eq!(
+            shared, expected,
+            "a new shared VK needs a source-routed hold decision like the Enter pair"
+        );
+    }
+
+    /// 利用者報告の続き (2026-08-05): 双子 claim だけでは閉じるのが止まらなかった。
+    /// ログが理由を示していた -- 同じ押下が **2 つの viewport** に届く。
+    ///
+    /// ```text
+    /// [fs-key] source=root       focused=false keys=Enter:up
+    /// [fs-key] source=fullscreen focused=true  keys=Enter:up
+    /// ```
+    ///
+    /// Win32 edge は fullscreen viewport にしか無いので、main 側は claim の対象外。
+    /// そこに残った egui `Key::Enter` を `FsClose` が拾っていた。frame-active な viewport は
+    /// Win32 キューが正本なので、egui へ落ちてはいけない。
+    #[cfg(windows)]
+    #[test]
+    fn frame_active_viewport_without_the_edge_does_not_match_enter_from_egui() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+
+        let keymap = Keymap::from_settings(&KeymapSettings::default());
+        let ctx = egui::Context::default();
+        let main_viewport = ctx.viewport_id();
+        let fullscreen_viewport = egui::ViewportId::from_hash_of(9_u64);
+
+        ctx.begin_pass(egui::RawInput {
+            events: vec![key_event(egui::Key::Enter, egui::Modifiers::NONE)],
+            ..Default::default()
+        });
+        cache_test_keyboard_owner(&ctx);
+        // edge は fullscreen viewport のもの。main も frame-active (subclass 登録済み)。
+        crate::key_input::set_test_frame_for_viewport(
+            fullscreen_viewport,
+            vec![crate::key_input::KeyEdge {
+                source_hwnd: 2,
+                source_viewport: fullscreen_viewport,
+                virtual_key: 0x0D,
+                scan_code: 0x1C,
+                extended: true,
+                pressed: true,
+                repeat: false,
+                ctrl: false,
+                shift: false,
+                alt: false,
+            }],
+        );
+        crate::key_input::add_test_frame_active_viewport(main_viewport);
+
+        let close = keymap.consume_action(&ctx, KeyAction::FsClose);
+        let _ = ctx.end_pass();
+
+        assert!(
+            !close,
+            "edge の無い viewport で egui の Enter を Enter 割り当てに使わない"
+        );
+    }
+
+    /// 利用者報告 (2026-08-05): `FsZoomMode = Z, NumpadEnter` でテンキー Enter を押すと
+    /// ズームに入らず、閲覧中のファイルが閉じた。KeyHold が Win32 edge だけを消費して
+    /// egui 側の双子 `Key::Enter` を残していたため、後続の `FsClose` (既定 Enter) が
+    /// egui 経路でそれを拾っていた。
+    #[cfg(windows)]
+    #[test]
+    fn numpad_enter_hold_claims_its_egui_twin_so_enter_close_does_not_fire() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+
+        let mut settings = KeymapSettings::default();
+        settings.set_override_chords(
+            KeyAction::FsZoomMode,
+            vec![Chord::key(KeyName::Z), Chord::key(KeyName::NumpadEnter)],
+        );
+        let keymap = Keymap::from_settings(&settings);
+
+        let ctx = egui::Context::default();
+        let viewport = ctx.viewport_id();
+        let numpad_press = crate::key_input::KeyEdge {
+            source_hwnd: 1,
+            source_viewport: viewport,
+            virtual_key: 0x0D,
+            scan_code: 0x1C,
+            extended: true,
+            pressed: true,
+            repeat: false,
+            ctrl: false,
+            shift: false,
+            alt: false,
+        };
+
+        // Windows は本体 / テンキーどちらの Enter でも同じ egui イベントを出す。
+        ctx.begin_pass(egui::RawInput {
+            events: vec![key_event(egui::Key::Enter, egui::Modifiers::NONE)],
+            ..Default::default()
+        });
+        cache_test_keyboard_owner(&ctx);
+        crate::key_input::set_test_frame_for_viewport(viewport, vec![numpad_press]);
+
+        let hold = keymap.take_key_hold_edges(&ctx, KeyAction::FsZoomMode);
+        let close = keymap.consume_action(&ctx, KeyAction::FsClose);
+        let _ = ctx.end_pass();
+
+        assert_eq!(hold, (true, false), "テンキー Enter で hold の押下が立つ");
+        assert!(!close, "同じ押下で Enter 割り当ての FsClose を発火させない");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fs_zoom_numpad_enter_does_not_use_unrouted_vk_return_hold() {
+        let mut settings = KeymapSettings::default();
+        settings.set_override_chords(
+            KeyAction::FsZoomMode,
+            vec![Chord::key(KeyName::NumpadEnter)],
+        );
+        let keymap = Keymap::from_settings(&settings);
+        let chords = keymap.override_chords(KeyAction::FsZoomMode).unwrap();
+        let key = chords[0].key_name().unwrap();
+
+        assert_eq!(key, KeyName::NumpadEnter);
+        assert!(!key_held_from_os_sources(key, None, |_| unreachable!()));
+        assert!(key_held_from_os_sources(KeyName::Z, None, |virtual_key| {
+            assert_eq!(virtual_key, 0x5A);
+            true
+        }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn enter_hold_stays_false_before_and_after_viewport_routing_without_owned_input() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let viewport = egui::ViewportId::from_hash_of(1_u64);
+        crate::key_input::clear_test_frame();
+
+        let before_registration = key_held_from_os_sources(
+            KeyName::Enter,
+            crate::key_input::routed_return_key_held(viewport, false),
+            |_| true,
+        );
+
+        crate::key_input::set_test_frame_for_viewport(viewport, Vec::new());
+        crate::key_input::set_test_return_key_state(viewport, false, false);
+        let after_registration = key_held_from_os_sources(
+            KeyName::Enter,
+            crate::key_input::routed_return_key_held(viewport, false),
+            |_| true,
+        );
+
+        assert_eq!((before_registration, after_registration), (false, false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn key_hold_state_distinguishes_both_enter_directions() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let viewport = egui::ViewportId::from_hash_of(2_u64);
+        crate::key_input::set_test_frame_for_viewport(viewport, Vec::new());
+
+        crate::key_input::set_test_return_key_state(viewport, true, false);
+        assert!(key_held_via_os(viewport, KeyName::Enter));
+        assert!(!key_held_via_os(viewport, KeyName::NumpadEnter));
+
+        crate::key_input::set_test_return_key_state(viewport, false, true);
+        assert!(!key_held_via_os(viewport, KeyName::Enter));
+        assert!(key_held_via_os(viewport, KeyName::NumpadEnter));
     }
 
     fn key_action_enum_names_from_source() -> std::collections::BTreeSet<String> {

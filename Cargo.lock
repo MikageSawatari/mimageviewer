@@ -3927,7 +3927,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "ab_glyph",
  "base64",
@@ -3997,7 +3997,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-ipc"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4005,7 +4005,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-launcher"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "sha2",
  "windows 0.61.3",
@@ -4014,7 +4014,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-remote"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "argon2",
  "fast_image_resize",

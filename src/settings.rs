@@ -3553,6 +3553,10 @@ pub struct Settings {
     /// 画像を 1 つに畳む集約表示の ON/OFF。既定 true。
     #[serde(default = "default_true")]
     pub show_address_bar_stack_toggle: bool,
+    /// フォルダバーに「非表示 N 件」チップを表示する。一覧へ出していない項目があることを
+    /// 常時知らせる。既定 true。
+    #[serde(default = "default_true")]
+    pub show_address_bar_omitted_entries: bool,
     /// フォルダバーの「場所▼」に仮想ドライブ一覧を表示する。
     #[serde(default = "default_true")]
     pub show_location_drive_list: bool,
@@ -3778,6 +3782,12 @@ pub struct Settings {
     /// 静止画フルスクリーン上部 HUD を常時表示し、画像領域から除外する。
     #[serde(default)]
     pub fullscreen_top_bar_locked: bool,
+    /// 固定表示した上部 / 下部バーと画像領域の間隔 (画面 px)。
+    ///
+    /// 上下を共通にするのは、同じフルスクリーンクロームの余白を揃えつつ、用途の薄い
+    /// 上下別 2 項目で環境設定を増やさないため。加法フィールドなので旧版向け carrier は不要。
+    #[serde(default)]
+    pub fullscreen_fixed_bar_gap_px: u32,
     /// 静止画フルスクリーン下部のページシークバーの左右方向。
     #[serde(default)]
     pub fullscreen_seek_direction: FullscreenSeekDirection,
@@ -4820,6 +4830,7 @@ pub const MAX_GRID_COLS: usize = 10;
 pub const FULLSCREEN_JUMP_PERCENT_MIN: u32 = 1;
 pub const FULLSCREEN_JUMP_PERCENT_MAX: u32 = 100;
 pub const FULLSCREEN_JUMP_PERCENT_DEFAULT: u32 = 10;
+pub const FULLSCREEN_FIXED_BAR_GAP_MAX_PX: u32 = 100;
 pub const FULLSCREEN_FIXED_JUMP_MIN: usize = 1;
 pub const FULLSCREEN_FIXED_JUMP_MAX: usize = 100;
 pub const FULLSCREEN_FIXED_JUMP_DEFAULT: usize = 10;
@@ -5280,6 +5291,7 @@ impl Default for Settings {
             fullscreen_navigator_size: FULLSCREEN_NAVIGATOR_SIZE_DEFAULT,
             fullscreen_seek_bar_locked: false,
             fullscreen_top_bar_locked: false,
+            fullscreen_fixed_bar_gap_px: 0,
             fullscreen_seek_direction: FullscreenSeekDirection::default(),
             fullscreen_horizontal_cursor_direction: FullscreenHorizontalCursorDirection::default(),
             fullscreen_page_number_overlay: true,
@@ -5323,6 +5335,7 @@ impl Default for Settings {
             show_address_bar_history_menu: true,
             show_address_bar_folder_pin: true,
             show_address_bar_stack_toggle: true,
+            show_address_bar_omitted_entries: true,
             show_location_drive_list: true,
             show_location_reading_history: true,
             show_location_rating: true,
@@ -6884,6 +6897,9 @@ impl Settings {
             self.slideshow_continuous_scroll_percent.clamp(1, 100);
         self.spread_page_gap_px = self.spread_page_gap_px.min(200);
         self.continuous_reading_gap_px = self.continuous_reading_gap_px.min(200);
+        self.fullscreen_fixed_bar_gap_px = self
+            .fullscreen_fixed_bar_gap_px
+            .min(FULLSCREEN_FIXED_BAR_GAP_MAX_PX);
         self.continuous_reading_wheel_scroll_percent =
             self.continuous_reading_wheel_scroll_percent.clamp(1, 100);
         self.continuous_reading_key_scroll_percent =
@@ -7217,6 +7233,7 @@ impl Settings {
         self.show_address_bar_history_menu = src.show_address_bar_history_menu;
         self.show_address_bar_folder_pin = src.show_address_bar_folder_pin;
         self.show_address_bar_stack_toggle = src.show_address_bar_stack_toggle;
+        self.show_address_bar_omitted_entries = src.show_address_bar_omitted_entries;
         self.show_location_drive_list = src.show_location_drive_list;
         self.show_location_reading_history = src.show_location_reading_history;
         self.show_location_rating = src.show_location_rating;
@@ -9213,6 +9230,7 @@ mod tests {
         );
         assert!(!s.fullscreen_seek_bar_locked);
         assert!(!s.fullscreen_top_bar_locked);
+        assert_eq!(s.fullscreen_fixed_bar_gap_px, 0);
         assert_eq!(
             s.fullscreen_seek_direction,
             FullscreenSeekDirection::FollowReading
@@ -9265,6 +9283,7 @@ mod tests {
         assert!(s.show_address_bar_history_menu);
         assert!(s.show_address_bar_folder_pin);
         assert!(s.show_address_bar_stack_toggle);
+        assert!(s.show_address_bar_omitted_entries);
         assert!(s.show_location_drive_list);
         assert!(s.show_location_reading_history);
         assert!(s.show_location_rating);
@@ -10056,6 +10075,7 @@ mod tests {
         let mut s = Settings::default();
         s.spread_page_gap_px = 999;
         s.continuous_reading_gap_px = 999;
+        s.fullscreen_fixed_bar_gap_px = 999;
         s.continuous_reading_wheel_scroll_percent = 0;
         s.continuous_reading_key_scroll_percent = 999;
         s.continuous_reading_gamepad_scroll_percent_per_sec = 999;
@@ -10073,6 +10093,10 @@ mod tests {
         s.sanitize();
         assert_eq!(s.spread_page_gap_px, 200);
         assert_eq!(s.continuous_reading_gap_px, 200);
+        assert_eq!(
+            s.fullscreen_fixed_bar_gap_px,
+            FULLSCREEN_FIXED_BAR_GAP_MAX_PX
+        );
         assert_eq!(s.continuous_reading_wheel_scroll_percent, 1);
         assert_eq!(
             s.downscale_smoothing_percent,

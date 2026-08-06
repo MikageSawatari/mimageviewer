@@ -816,10 +816,11 @@ fn normalize_smart_folder_candidates(
     super::folder_scan::filter_upscaled_video_pairs_fast(&mut media, entry_file_names_ci);
     let mut video_thumb_overrides = HashMap::new();
     if options.skip_image_if_video_exists {
-        for (video, image) in super::folder_scan::filter_video_image_duplicates(
+        let filtered = super::folder_scan::filter_video_image_duplicates(
             &mut media,
             options.video_thumb_use_sidecar_image,
-        ) {
+        );
+        for (video, image) in filtered.sidecars {
             video_thumb_overrides.insert(crate::path_key::normalize_keep_drive(&video), image);
         }
     }

@@ -103,6 +103,7 @@ mod color_filter;
 mod detached_window_manager;
 mod facet_name_filter;
 pub(crate) mod folder_scan;
+pub(crate) use folder_scan::OmittedFolderEntryCounts;
 mod gamepad_input;
 mod grid_paint;
 pub(crate) mod metadata_import_refresh;
@@ -8154,10 +8155,21 @@ pub(crate) enum MetadataTransferTagDbReleaseState {
     },
 }
 
+/// main の通常フォルダ一覧に対応する、走査時点の「一覧へ出さなかった項目」キャッシュ。
+///
+/// detached / サブ展開 / スマートフォルダ / 検索結果はこのキャッシュを更新せず、UI 側も
+/// `TopLevelGridSurface::Folder` と path の一致を確認してから表示する。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NormalFolderOmittedEntries {
+    pub(crate) folder: PathBuf,
+    pub(crate) counts: folder_scan::OmittedFolderEntryCounts,
+}
+
 pub struct App {
     pub(crate) remote_session_ui: crate::remote_ipc::ui::RemoteSessionUiState,
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
+    pub(crate) normal_folder_omitted_entries: Option<NormalFolderOmittedEntries>,
     pub(crate) navigation_scope: ViewerNavigationScope,
     pub(crate) items: Vec<GridItem>,
     pub(crate) thumbnails: Vec<ThumbnailState>,
@@ -8758,6 +8770,12 @@ pub struct App {
 
     // ── 統合環境設定ダイアログ ─────────────────────────────────────
     pub(crate) show_preferences: bool,
+    /// 前フレームの環境設定可視フラグ。false -> true の open edge だけを検出する。
+    pub(crate) preferences_open_last_frame: bool,
+    /// 右ペイン ScrollArea の id に使う、ダイアログを閉じても保持する単調増加値。
+    pub(crate) preferences_right_panel_scroll_sequence: u64,
+    /// 一覧内の導線などから、環境設定を特定ページで開く one-shot request。
+    pub(crate) preferences_requested_page: Option<crate::ui_dialogs::preferences::PreferencesPage>,
     /// 統合環境設定の一時編集状態
     pub(crate) pref_state: Option<crate::ui_dialogs::preferences::PreferencesState>,
     pub(crate) show_preferences_discard_confirm: bool,
@@ -11790,6 +11808,7 @@ impl App {
         let app = Self {
             address: String::new(),
             current_folder: None,
+            normal_folder_omitted_entries: None,
             navigation_scope: ViewerNavigationScope::Main,
             items: Vec::new(),
             thumbnails: Vec::new(),
@@ -12005,6 +12024,9 @@ impl App {
             #[cfg(test)]
             rename_migration_data_dir_override: None,
             show_preferences: false,
+            preferences_open_last_frame: false,
+            preferences_right_panel_scroll_sequence: 0,
+            preferences_requested_page: None,
             show_preferences_discard_confirm: false,
             show_operation_customize: false,
             show_operation_customize_discard_confirm: false,
@@ -17092,6 +17114,39 @@ impl App {
                     serde_json::Value::from(materialized.duplicate_filter_ms),
                 )],
             );
+        }
+
+        // 除外件数は走査と重複フィルタの両方から出るので、両方を持つ
+        // `materialize_local_folder_listing` が唯一の集計者。ここで数え直すと
+        // remote 一覧と本体一覧で違う数が出る。
+        let omitted_entries = materialized.omitted;
+        if !detached_physical
+            && matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Folder
+            )
+        {
+            // main の通常フォルダだけがこの常設チップの対象。サブ展開・スマートフォルダ・
+            // 検索結果は後追い範囲なので、同じ filter を共有していてもここへ公開しない。
+            self.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+                folder: path.clone(),
+                counts: omitted_entries,
+            });
+        }
+        if omitted_entries != folder_scan::OmittedFolderEntryCounts::default() {
+            // チップが出ない / 数が合わないという報告を、推測でなくログで切り分けるための 1 行。
+            // 走査済みの値を書くだけで追加の I/O は無い。
+            crate::logger::log(format!(
+                "omitted entries: same_name={} hidden={} unsupported={} system={} chip={} \
+                 published={} surface={:?}",
+                omitted_entries.same_name,
+                omitted_entries.hidden,
+                omitted_entries.unsupported,
+                omitted_entries.system,
+                omitted_entries.primary_count(),
+                !detached_physical,
+                self.top_level_grid_view.surface(),
+            ));
         }
 
         let folder_sort = materialized.folder_sort;
@@ -42732,6 +42787,30 @@ impl App {
         }
     }
 
+    /// 現在の main surface が通常フォルダで、走査キャッシュも同じ場所なら内訳を返す。
+    pub(crate) fn current_normal_folder_omitted_counts(
+        &self,
+    ) -> Option<folder_scan::OmittedFolderEntryCounts> {
+        if self.navigation_scope.is_detached_physical()
+            || self.search_filter.is_some()
+            || self.search_pending.is_some()
+            || self.stack_mode_requested
+            || !matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Folder
+            )
+        {
+            // サブ展開・スマートフォルダ・検索結果・スタックは後追い範囲。物理フォルダの
+            // scan/filter を共有していても、素の通常フォルダ一覧以外にはチップを出さない。
+            return None;
+        }
+        let current = self.current_folder.as_deref()?;
+        self.normal_folder_omitted_entries
+            .as_ref()
+            .filter(|entries| crate::folder_tree::path_eq(&entries.folder, current))
+            .map(|entries| entries.counts)
+    }
+
     /// ZIP/PDF + フォルダの重複: 同名フォルダがあれば ZIP/PDF エントリをスキップ。
     /// folders と folder_metas は同じ順序で対応しているため、同期して削除する。
     ///
@@ -42742,8 +42821,8 @@ impl App {
     fn filter_virtual_folder_duplicates(
         folders: &mut Vec<GridItem>,
         folder_metas: &mut Vec<Option<(i64, i64)>>,
-    ) {
-        crate::app::folder_scan::filter_virtual_folder_duplicates(folders, folder_metas);
+    ) -> usize {
+        crate::app::folder_scan::filter_virtual_folder_duplicates(folders, folder_metas)
     }
 
     /// Prefer native ZIP/CBZ over a same-stem RAR/7z/LZH archive.
@@ -42751,8 +42830,8 @@ impl App {
     fn filter_convertible_archive_duplicates(
         folders: &mut Vec<GridItem>,
         folder_metas: &mut Vec<Option<(i64, i64)>>,
-    ) {
-        crate::app::folder_scan::filter_convertible_archive_duplicates(folders, folder_metas);
+    ) -> usize {
+        crate::app::folder_scan::filter_convertible_archive_duplicates(folders, folder_metas)
     }
 
     /// `search_filter` とレーティングフィルタに基づいて `visible_indices` を再計算する。
