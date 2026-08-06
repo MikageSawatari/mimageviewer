@@ -94,6 +94,8 @@
           <ul>
             <li><a href="#ai-upscale-retro">AI アップスケールでレトロ CG を鑑賞したい</a></li>
             <li><a href="#loupe">ルーペ機能の使い方は？</a></li>
+            <li><a href="#navigator">拡大中に画像のどこを見ているか知りたい</a></li>
+            <li><a href="#hold-keys-off">Alt / Shift / 右Ctrl の押しっぱなし表示をやめたい</a></li>
             <li><a href="#transparent-bg">透過画像の背景色を変えたい</a></li>
             <li><a href="#theme">ダークモードに切り替えたい</a></li>
             <li><a href="#export-edited-image">編集結果を別ファイルに保存するには？</a></li>
@@ -223,6 +225,36 @@
       <li><kbd>M</kbd> キー — ルーペのトグル（長時間の精密作業向け）</li>
     </ul>
     <p>消しゴムモード中は併用できます。画像分析・補正レイヤー・360 度パノラマ・動画・テキスト注釈モード中は表示されず、テキスト注釈モードを終了すると以前のトグル状態に応じて再び表示されます。倍率や表示サイズは環境設定で調整できます。</p>
+    <p><kbd>Shift</kbd> の押しっぱなしは「操作カスタマイズ」で別のキーに変更したり、無効にしたりできます（<a href="#hold-keys-off">押しっぱなし表示をやめたい</a>）。</p>
+
+    <h3 id="navigator">拡大中に画像のどこを見ているか知りたい</h3>
+    <p>拡大表示中に <kbd>Alt</kbd> を押しているあいだ、画面の隅に全体の縮小画像と、いま見えている範囲を示す枠が表示されます。360 度パノラマにも対応しています。</p>
+    <ul>
+      <li><strong>左ドラッグ</strong> — 囲んだ範囲を画面いっぱいに拡大</li>
+      <li><strong>右ドラッグ</strong> — 現在の表示位置を移動</li>
+      <li><strong>ダブルクリック</strong> — その位置を画面中央へ</li>
+      <li><strong>ホイール</strong> — ナビゲータ自体の大きさを変更</li>
+      <li><kbd>Alt</kbd>+<kbd>N</kbd> — 押しっぱなしにせず出したままにする</li>
+    </ul>
+    <p>置く隅は上部の四隅ボタンで選べます。全体が見えているときは枠が全体と同じになるため自動的に隠れます。詳しくは<a href="fullscreen.html#navigator">フルスクリーン表示 → 拡大位置ナビゲータ</a>をご覧ください。</p>
+    <p><kbd>Alt</kbd> の押しっぱなしは「操作カスタマイズ」で別のキーに変更したり、無効にしたりできます（<a href="#hold-keys-off">押しっぱなし表示をやめたい</a>）。</p>
+
+    <h3 id="hold-keys-off">Alt / Shift / 右Ctrl の押しっぱなし表示をやめたい</h3>
+    <p>フルスクリーン表示中には、キーを押しているあいだだけ何かを表示する操作が 3 つあります。いずれも「設定」→「操作カスタマイズ…」から<strong>別のキーへ変更、または無効に</strong>できます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>既定のキー</th><th>押しているあいだの動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Alt</kbd></td><td>拡大位置ナビゲータを表示します</td></tr>
+          <tr><td><kbd>Shift</kbd></td><td>ルーペを表示します</td></tr>
+          <tr><td><kbd>右Ctrl</kbd></td><td>補正・AI 処理・注釈などを外した元画像を表示します</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>「コマンド一覧」タブで、説明が「押している間だけ〜を表示する」となっている操作を探して「編集」を押します。別のキーを割り当てるか、<strong>割り当て解除</strong>を選ぶとその操作は働かなくなります。ほかのキー割り当てには影響しません。</p>
+    <p>これらは <kbd>Ctrl</kbd> / <kbd>Shift</kbd> / <kbd>Alt</kbd> / <kbd>右Ctrl</kbd> / <kbd>右Shift</kbd> / <kbd>右Alt</kbd> から選べます。右側限定のキーを選ぶと、左側を押したときには反応しません。</p>
 
     <h3 id="transparent-bg">透過画像の背景色を変えたい</h3>
     <p>透過 PNG / WebP / GIF をフルスクリーンで開いているとき、<kbd>Shift</kbd>+<kbd>B</kbd> キーで背景を循環できます。
