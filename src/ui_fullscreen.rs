@@ -35,6 +35,7 @@ use crate::displayed_image_transform::{
     quantize_points_to_physical_pixels,
 };
 use crate::fs_animation::FsCacheEntry;
+use crate::gpu_lanczos::FullscreenPaintResource;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::{
     Chord, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES, KeyAction, KeyName,
@@ -75,6 +76,62 @@ struct FlatNavigatorLayout {
     visible_rect: egui::Rect,
     screen_scale: f32,
     pages: Vec<FlatNavigatorPage>,
+}
+
+/// Processed full-image resources already resolved by the page draw path for this frame.
+/// Missing entries deliberately fall back to the catalog thumbnail in `draw_fs_navigator`.
+#[derive(Default)]
+struct FsNavigatorTextureSources {
+    pages: Vec<(usize, FullscreenPaintResource)>,
+}
+
+impl FsNavigatorTextureSources {
+    fn single(page_idx: usize, texture: Option<FullscreenPaintResource>) -> Self {
+        Self {
+            pages: texture
+                .into_iter()
+                .map(|texture| (page_idx, texture))
+                .collect(),
+        }
+    }
+
+    fn spread(
+        left_idx: usize,
+        left: Option<FullscreenPaintResource>,
+        right_idx: usize,
+        right: Option<FullscreenPaintResource>,
+    ) -> Self {
+        let mut pages = Vec::with_capacity(2);
+        if let Some(texture) = left {
+            pages.push((left_idx, texture));
+        }
+        if let Some(texture) = right {
+            pages.push((right_idx, texture));
+        }
+        Self { pages }
+    }
+
+    /// A display-unit holdover is painted after the live pages, so its resources must replace
+    /// the live map as a unit even when the capture-time idx equals the new page idx.
+    fn replace_with_display_unit(&mut self, unit: &FsDisplayUnitHoldover) {
+        self.pages = unit
+            .pages
+            .iter()
+            .map(|page| (page.idx, page.texture.clone()))
+            .collect();
+    }
+
+    fn texture_for_page<'a>(
+        &'a self,
+        page_idx: usize,
+        thumbnail: Option<&'a egui::TextureHandle>,
+    ) -> Option<&'a egui::TextureHandle> {
+        self.pages
+            .iter()
+            .find(|(idx, _)| *idx == page_idx)
+            .map(|(_, resource)| resource.source_texture())
+            .or(thumbnail)
+    }
 }
 
 #[derive(Clone)]
@@ -9595,6 +9652,16 @@ impl App {
                         let media_t0 = std::time::Instant::now();
                         self.fullscreen_page_layout.clear();
                         let mut single_transform: Option<DisplayedImageTransform> = None;
+                        let mut navigator_texture_sources = if spread_pair == SpreadPair::Single {
+                            FsNavigatorTextureSources::single(
+                                fs_idx,
+                                state.tex.clone().map(|texture| {
+                                    self.fullscreen_paint_resource_for_texture(fs_idx, texture)
+                                }),
+                            )
+                        } else {
+                            FsNavigatorTextureSources::default()
+                        };
                         if self.continuous_reading_active_for_idx(fs_idx) {
                             self.draw_fs_continuous_reading(
                                 ui,
@@ -9912,7 +9979,7 @@ impl App {
                                         } else {
                                             None
                                         };
-                                        self.draw_fs_spread(
+                                        navigator_texture_sources = self.draw_fs_spread(
                                             ui,
                                             ctx,
                                             image_rect,
@@ -10139,6 +10206,7 @@ impl App {
                                 image_rect,
                                 &unit,
                             );
+                            navigator_texture_sources.replace_with_display_unit(&unit);
                         }
 
                         // ページ単位の編集オーバーレイより後に描く。holdover はビュー単位の状態なので、
@@ -10158,11 +10226,19 @@ impl App {
                                 image_rect,
                                 &unit,
                             );
+                            navigator_texture_sources.replace_with_display_unit(&unit);
                         }
 
                         // Keep the fixed overview above transient display-unit holdovers. The
-                        // navigator stays absent until the target frame has a resolved page layout.
-                        self.draw_fs_navigator(ui, ctx, image_rect, fs_idx);
+                        // navigator uses the same display unit and stays absent until that unit has
+                        // a resolved page layout.
+                        self.draw_fs_navigator(
+                            ui,
+                            ctx,
+                            image_rect,
+                            fs_idx,
+                            &navigator_texture_sources,
+                        );
 
                         // 透過背景 (Shift+B) の変更通知は共通トーストが担う。同じ文言・同じ
                         // 表示時間の専用インジケータを並べると右上で重なるため持たない。
@@ -15290,6 +15366,7 @@ impl App {
         ctx: &egui::Context,
         image_rect: egui::Rect,
         fs_idx: usize,
+        texture_sources: &FsNavigatorTextureSources,
     ) {
         if !self.fs_navigator_allowed(ctx, fs_idx) {
             return;
@@ -15420,9 +15497,11 @@ impl App {
         let canvas_painter = painter.with_clip_rect(layout.canvas_rect);
         canvas_painter.rect_filled(layout.canvas_rect, 0.0, egui::Color32::BLACK);
         for page in &layout.pages {
-            if let Some(ThumbnailState::Loaded { tex, .. }) =
-                self.thumbnails.get(page.main.page_idx)
-            {
+            let thumbnail = match self.thumbnails.get(page.main.page_idx) {
+                Some(ThumbnailState::Loaded { tex, .. }) => Some(tex),
+                _ => None,
+            };
+            if let Some(tex) = texture_sources.texture_for_page(page.main.page_idx, thumbnail) {
                 page.navigator
                     .paint_texture(&canvas_painter, tex.id(), egui::Color32::WHITE);
             } else {
@@ -21186,15 +21265,17 @@ impl App {
                     self.fullscreen_page_layout.push(transform);
                 }
             }
-            [left, right] => self.draw_fs_spread(
-                ui,
-                ctx,
-                image_rect,
-                left.idx,
-                right.idx,
-                false,
-                Some((left, right)),
-            ),
+            [left, right] => {
+                let _ = self.draw_fs_spread(
+                    ui,
+                    ctx,
+                    image_rect,
+                    left.idx,
+                    right.idx,
+                    false,
+                    Some((left, right)),
+                );
+            }
             _ => debug_assert!(false, "display unit must contain one or two pages"),
         }
     }
@@ -21210,7 +21291,7 @@ impl App {
         right_idx: usize,
         original_preview_active: bool,
         display_override: Option<(&FsDisplayUnitHoldoverPage, &FsDisplayUnitHoldoverPage)>,
-    ) {
+    ) -> FsNavigatorTextureSources {
         self.fullscreen_page_layout.clear();
         let zoom_pan = self.fs_zoom_pan();
         let fit_mode = self.effective_fullscreen_fit_mode();
@@ -21567,6 +21648,8 @@ impl App {
             // ルーペ用レイアウトには書かない (ルーペは非見開きパスのロジックで描画しない)。
             self.fullscreen_page_layout.clear();
         }
+
+        FsNavigatorTextureSources::spread(left_idx, left_display_tex, right_idx, right_display_tex)
     }
 
     /// テクスチャの表示サイズ（回転考慮）を返す。テクスチャ未取得なら None。
@@ -27276,6 +27359,75 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn navigator_uses_processed_source_per_page_and_thumbnail_fallback() {
+        let ctx = egui::Context::default();
+        let processed = ctx.load_texture(
+            "navigator_processed",
+            egui::ColorImage::filled([2, 2], egui::Color32::RED),
+            egui::TextureOptions::LINEAR,
+        );
+        let thumbnail = ctx.load_texture(
+            "navigator_thumbnail",
+            egui::ColorImage::filled([1, 1], egui::Color32::BLUE),
+            egui::TextureOptions::LINEAR,
+        );
+        let sources = FsNavigatorTextureSources::spread(
+            11,
+            Some(FullscreenPaintResource::resampleable(
+                11,
+                processed.clone(),
+                crate::gpu_lanczos::FullscreenPaintSourceGeneration { items: 3, input: 7 },
+            )),
+            10,
+            None,
+        );
+
+        assert_eq!(
+            sources.texture_for_page(11, Some(&thumbnail)).unwrap().id(),
+            processed.id()
+        );
+        assert_eq!(
+            sources.texture_for_page(10, Some(&thumbnail)).unwrap().id(),
+            thumbnail.id()
+        );
+    }
+
+    #[test]
+    fn navigator_holdover_replaces_live_texture_even_when_page_idx_matches() {
+        let ctx = egui::Context::default();
+        let live = ctx.load_texture(
+            "navigator_live",
+            egui::ColorImage::filled([2, 2], egui::Color32::GREEN),
+            egui::TextureOptions::LINEAR,
+        );
+        let held = ctx.load_texture(
+            "navigator_holdover",
+            egui::ColorImage::filled([2, 2], egui::Color32::YELLOW),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut sources = FsNavigatorTextureSources::single(
+            4,
+            Some(FullscreenPaintResource::direct(live.clone())),
+        );
+        let holdover = FsDisplayUnitHoldover {
+            pages: vec![FsDisplayUnitHoldoverPage {
+                idx: 4,
+                texture: FullscreenPaintResource::direct(held.clone()),
+                rotation: crate::rotation_db::Rotation::None,
+                source_size: None,
+                content_bbox: None,
+            }],
+        };
+
+        sources.replace_with_display_unit(&holdover);
+
+        assert_eq!(
+            sources.texture_for_page(4, Some(&live)).unwrap().id(),
+            held.id()
+        );
+    }
+
     fn single_page_layout_with_pan(zoom: f32, pan: egui::Vec2) -> FullscreenPageLayout {
         let mut layout = FullscreenPageLayout::default();
         layout.begin(FullscreenPageLayoutKind::Single);
@@ -27903,7 +28055,7 @@ mod tests {
     }
 
     #[test]
-    fn flat_navigator_keeps_catalog_thumbnail_full_when_view_is_trimmed() {
+    fn flat_navigator_keeps_full_image_overview_when_view_is_trimmed() {
         let trim = egui::Rect::from_min_max(egui::pos2(0.15, 0.10), egui::pos2(0.82, 0.91));
         let main = navigator_test_transform_with_content(
             4,

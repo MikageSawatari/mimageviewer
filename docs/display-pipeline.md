@@ -956,7 +956,13 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 ナビゲータ上の位置は `screen_to_source_normalized` で UV へ変換し、
 `pan_to_center_source_normalized` で倍率を変えずに画面中央へ置く `fs_pan` を求める。
 このためフィット、表示トリム、90度回転、見開きの配置をナビゲータ側で再計算しない。
-縮小画像は既存のサムネイルカタログを使い、UI スレッドで画像読み込みやデコードを行わない。
+縮小画像は、そのフレームの単ページ / 見開き描画が解決済みの
+`FullscreenPaintResource::source_texture()` を使う。これは加工済みの full-image texture であり、
+ズーム中に可視 source 領域だけを持つ Lanczos 拡大出力 (`paint_texture_id()`) は使わない。
+加工済み composite が未準備のページだけは既存のサムネイルカタログへフォールバックし、黒や
+点滅を挟まない。nav / colorize holdover を重ねたフレームは、ナビゲータへ渡す idx → resource も
+その display unit 全体へ置き換え、本文とナビゲータが新旧ページで食い違わないようにする。
+ナビゲータ自身は texture producer を呼ばず、UI スレッドで画像読み込みやデコードも行わない。
 通常の単ページ / 見開きで利用者入力から `fs_pan` を更新するときは、直前の
 `FullscreenPageLayout` に記録された実表示矩形を使い、少なくとも 1 ページが viewport と
 各軸 48 logical point（ページまたは viewport がそれより小さい軸では、その小さい方の全幅）
