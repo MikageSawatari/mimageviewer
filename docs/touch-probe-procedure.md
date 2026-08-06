@@ -5,38 +5,47 @@
 
 ## 1. セッション前の準備
 
-インストール済み、またはトレイ常駐中の mImageViewer を先に終了してください。検証用 core と
-single-instance mutex を共有するため、残っていると検証用 core を起動できません。
+**ポータブル版を使ってください** (推奨)。ポータブル版はデータ保存先が展開先フォルダ配下で
+完結し、`%APPDATA%` を触らず、single-instance mutex もインストール版と分離されているため、
+**インストール版を常駐させたままでも並行して起動できます**。設定を汚さずに ClickToShow 等の
+設定変更も試せます。
 
-PowerShell でリポジトリのルートへ移動し、既存ログを日時付きで退避します。
+`mImageViewer_portable_v2.13.0.zip` を**書き込み可能なフォルダ**へ展開します
+(`Program Files` 配下や読み取り専用メディアは不可。書けない場所だと起動時にエラーで止まります)。
+
+診断ログの出力先は展開先フォルダの中です。
+
+```text
+<展開先>\data\logs\mimageviewer.log
+```
+
+初回起動前は `data` フォルダごと存在しないので、ログの事前退避は不要です。2 回目以降に
+やり直す場合は、展開先で PowerShell を開いて退避してください。
 
 ```powershell
-$log = Join-Path $env:APPDATA 'mimageviewer\logs\mimageviewer.log'
+$log = '.\data\logs\mimageviewer.log'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 if (Test-Path -LiteralPath $log) {
     Copy-Item -LiteralPath $log -Destination "$log.pre-touch-probe-$stamp"
 }
 ```
 
-診断ログの出力先は次のファイルです。
-
-```text
-%APPDATA%\mimageviewer\logs\mimageviewer.log
-```
-
-検証用 core は通常の `%APPDATA%\mimageviewer` プロファイルを使うため、実際の設定やデータを
-更新する可能性があります。
+> インストール版と同じ環境で確認したい場合に限り、`target\dev-runtime\mimageviewer-core.exe`
+> でも同じ診断が取れます。その場合はログが `%APPDATA%\mimageviewer\logs\mimageviewer.log` に
+> なり、**実利用中の設定・キャッシュを更新し得る**ので、先にインストール版・常駐トレイ版を
+> 終了してください (single-instance mutex を共有します)。
 
 ## 2. 診断プローブを有効にして起動
 
-同じ PowerShell で環境変数を設定してから起動します。
+展開先フォルダで PowerShell を開き、環境変数を設定してから起動します。
 
 ```powershell
 $env:MIV_TOUCH_DEBUG = '1'
-Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+Start-Process -FilePath .\mimageviewer.exe
 Remove-Item Env:MIV_TOUCH_DEBUG
 ```
 
+`Start-Process` は現在の環境変数を引き継ぐので、起動後に `Remove-Item` しても問題ありません。
 `MIV_TOUCH_DEBUG` を設定しない通常起動では、この手順で追加した診断ログは出ません。
 
 ## 3. 操作シナリオ
@@ -100,16 +109,19 @@ HUD が消えている状態で、映像の上を長押しします。長押し�
 
 ## 4. 終了とログの受け渡し
 
-mImageViewer を終了してログの書き込みを完了させます。PowerShell でログを日時付きファイルとして
-デスクトップへコピーします。
+mImageViewer を終了してログの書き込みを完了させます。展開先フォルダの PowerShell で、ログを
+日時付きファイルとしてデスクトップへコピーします。
 
 ```powershell
-$log = Join-Path $env:APPDATA 'mimageviewer\logs\mimageviewer.log'
+$log = '.\data\logs\mimageviewer.log'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $out = Join-Path ([Environment]::GetFolderPath('Desktop')) "mimageviewer-touch-probe-$stamp.log"
 Copy-Item -LiteralPath $log -Destination $out
 $out
 ```
+
+(`target\dev-runtime` の core で確認した場合は、`$log` を
+`Join-Path $env:APPDATA 'mimageviewer\logs\mimageviewer.log'` に読み替えてください。)
 
 表示された `.log` ファイルを担当者へ渡してください。あわせて、次の目視結果を短く添えてください。
 
@@ -120,5 +132,6 @@ $out
 - f の呼び出しバーを押せたか
 - g を実施した場合、ペン hover でツールチップまたはハイライトが出たか
 
-機種によってデジタイザの挙動が変わるため、**タブレットの機種名と Windows のバージョン**も
-1 行添えてください。
+機種によってデジタイザの挙動が変わるため、**確認に使った機種 (タッチディスプレイの型番など) と
+Windows のバージョン**も 1 行添えてください。タブレット PC とタッチディスプレイ付き PC では
+デジタイザのドライバが異なることがあるため、後で結果を読み解くときに必要になります。
