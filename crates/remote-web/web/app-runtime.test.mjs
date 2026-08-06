@@ -105,6 +105,7 @@ const {
   containerInitialImageIndex,
   createGridTile,
   gridReturnItemIdentity,
+  invalidateViewerPendingLoad,
   loadFolder,
   normalizeRemoteAdjustmentValues,
   normalizeRemoteBookBookmarkList,
@@ -123,6 +124,16 @@ const {
   videoFileTargetIndex,
   viewerMenuDefinitions,
 } = await import("./app.js");
+
+test("session identity revocation tolerates a video viewer without page-load invalidation", () => {
+  assert.doesNotThrow(() => invalidateViewerPendingLoad({ isVideoStreamViewer: true }));
+
+  let invalidations = 0;
+  invalidateViewerPendingLoad({
+    invalidatePendingLoad() { invalidations += 1; },
+  });
+  assert.equal(invalidations, 1);
+});
 
 test("continuous video navigation stops at the end or wraps to the first video", () => {
   assert.equal(videoFileTargetIndex(0, 3, 1, false), 1);

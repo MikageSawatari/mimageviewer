@@ -223,6 +223,24 @@ test("session control blocks only explicit ownership revocation", () => {
   );
 });
 
+test("a host-disconnect response becomes one blocking control transition", () => {
+  const active = remoteSessionControlTransition(null, "active", "");
+  const status = remoteSessionFailureStatus({
+    sessionStatus: "local_in_use",
+    httpStatus: 409,
+  });
+  const disconnected = remoteSessionControlTransition(
+    active,
+    status,
+    "本体で切断されました。再接続してください。"
+  );
+
+  assert.equal(status, "local_in_use");
+  assert.equal(disconnected.status, "local_in_use");
+  assert.equal(disconnected.blocksInteraction, true);
+  assert.equal(disconnected.disconnectReason, "local_in_use");
+});
+
 test("session failure detection ignores feature-level 409 responses", () => {
   assert.equal(remoteSessionFailureStatus({
     sessionStatus: "superseded",

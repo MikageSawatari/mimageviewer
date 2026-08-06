@@ -631,14 +631,22 @@ function newRemoteSessionCacheEpoch() {
   );
 }
 
+export function invalidateViewerPendingLoad(viewer) {
+  if (typeof viewer?.invalidatePendingLoad === "function") {
+    viewer.invalidatePendingLoad();
+  }
+}
+
 function applyRemoteSessionId(sessionId) {
   const next = String(sessionId ?? "");
   if (state.remoteSessionId === next) return;
-  state.viewer?.invalidatePendingLoad();
+  // Identity is the admission boundary. Publish its revocation before invoking an optional
+  // image-viewer hook; video owns no pending page fetch and intentionally has no such method.
   state.remoteSessionId = next;
   // session_id 自体は capability なので URL へ出さない。これに従属する非 secret nonce で
   // header を付けられない <img> などの HTTP cache だけを分離する。
   state.remoteSessionCacheEpoch = next ? newRemoteSessionCacheEpoch() : "";
+  invalidateViewerPendingLoad(state.viewer);
   pageResourceCache.clear();
   state.imageInfoCache.clear();
   state.containerImageInfoHints.clear();
@@ -765,7 +773,7 @@ function applyRemoteStateGeneration(observed, { reloadViewer = false } = {}) {
   state.remoteStateGeneration = transition.generation;
   if (!transition.changed) return transition.generation;
 
-  state.viewer?.invalidatePendingLoad();
+  invalidateViewerPendingLoad(state.viewer);
   pageResourceCache.clear();
   state.imageInfoCache.clear();
   state.containerImageInfoHints.clear();

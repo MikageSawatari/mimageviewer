@@ -213,6 +213,11 @@ test("session epoch removes page preflight and repeated active acquisition", asy
   assert.match(app, /commitSeekGroup[\s\S]*acquireRemoteSession\(reason\)/);
   assert.match(app, /for \(let attempt = 0; ; attempt \+= 1\)/);
   assert.doesNotMatch(app, /attempt < 80/);
+  assert.match(
+    app,
+    /function applyRemoteSessionId[\s\S]*invalidateViewerPendingLoad\(state\.viewer\)/
+  );
+  assert.doesNotMatch(app, /state\.viewer\?\.invalidatePendingLoad\(\)/);
 });
 
 test("colorize controls use the adjustment preview and commit path without losing custom points", async () => {

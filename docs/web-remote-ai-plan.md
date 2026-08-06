@@ -249,6 +249,9 @@ LocalInUse / Superseded だけが modal で操作を塞ぎ、再接続の acquir
 ままで、放置復帰を modal にしない。動画・remote AI などの subsystem は HTTP status を再解釈せず、
 この control state を購読する。blocked への遷移で動画は HLS と state poll を同期的に停止し、
 再接続成功後は切断直前の再生位置と play intent から新しい stream session を開始する。
+session identity の失効は viewer 種別より先に確定し、page fetch の取消は静止画 viewer だけが持つ
+optional capability として呼ぶ。動画 viewer に静止画専用 hook がないことを、modal 描画を中断する
+例外にしてはならない。
 
 ### 4.4 drain が長いとき
 
