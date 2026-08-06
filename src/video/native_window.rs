@@ -39,6 +39,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::w;
 
+use crate::touch_debug::{TouchDebugWindow, log_win32_message};
+
 #[derive(Clone, Copy, Debug)]
 pub struct NativeVideoKeyEvent {
     pub virtual_key: u32,
@@ -1114,6 +1116,7 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    log_win32_message(TouchDebugWindow::Presenter, hwnd, msg, wparam, lparam);
     match msg {
         WM_NCCREATE => {
             let createstruct = lparam.0 as *const CREATESTRUCTW;

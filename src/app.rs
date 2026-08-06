@@ -61771,6 +61771,7 @@ impl eframe::App for App {
         // メインビューポートの IME 状態を更新 (ここで Ime イベントを拾う)。
         // フルスクリーンビューポートは別イベントキューなので render_fullscreen_viewport 内で別途呼ぶ。
         self.update_ime_state(ctx);
+        crate::touch_debug::log_egui_touch_events(ctx, self.frame_counter);
 
         // エクスプローラ等から mIV へドロップされたファイル / フォルダを現在のフォルダへコピーする
         // (mIV → 外部 のドラッグ送出と対称の受け取り方向)。毎フレーム走るので、

@@ -9122,6 +9122,7 @@ impl App {
                 // 既に更新済みなので二重処理しない。
                 if !embedded {
                     self.update_ime_state(ctx);
+                    crate::touch_debug::log_egui_touch_events(ctx, self.frame_counter);
                 }
                 #[cfg(windows)]
                 if !embedded {

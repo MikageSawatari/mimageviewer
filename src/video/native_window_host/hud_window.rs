@@ -77,6 +77,7 @@ use windows::Win32::UI::WindowsAndMessaging::{IDC_ARROW, LoadCursorW};
 use windows::core::PCWSTR;
 use windows::core::w;
 
+use crate::touch_debug::{TouchDebugWindow, log_win32_message};
 use crate::video::native_window::{
     NativeCursorOwnershipEdge, NativeVideoKeyEvent, NativeVideoMouseButton,
     NativeVideoMouseButtonEvent, NativeVideoMouseEvent, NativeVideoMouseWheelEvent,
@@ -664,6 +665,7 @@ unsafe extern "system" fn hud_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    log_win32_message(TouchDebugWindow::Hud, hwnd, msg, wparam, lparam);
     match msg {
         WM_NCCREATE => {
             let createstruct = lparam.0 as *const CREATESTRUCTW;
