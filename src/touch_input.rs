@@ -173,7 +173,7 @@ struct PinchFrame {
 ///
 /// Completed ownership is retained until the next `Start`, allowing the input
 /// adapter to query suppression after processing the final `End` in a frame.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct TouchRecognizer {
     contacts: Vec<Contact>,
     owner: TouchOwner,

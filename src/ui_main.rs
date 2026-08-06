@@ -14290,6 +14290,17 @@ impl App {
 
         egui::CentralPanel::default()
             .show(ctx, |ui| -> Option<PathBuf> {
+                // Sole MainGrid driver. Embedded still fullscreen returns
+                // before render_grid, preventing a double feed on main ctx.
+                let _ = crate::touch_correlation::drive_egui_touch_input(
+                    ctx,
+                    crate::touch_correlation::TouchSurface::MainGrid,
+                    crate::touch_input::TapZoneGeometry {
+                        surface: ui.max_rect(),
+                        excluded: Vec::new(),
+                    },
+                    self.frame_counter,
+                );
                 let global_searching =
                     self.items_are_global_search_view && self.global_search.is_searching();
                 if self.items.is_empty() {

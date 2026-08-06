@@ -9400,6 +9400,19 @@ impl App {
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                     .show(ctx, |ui| {
                         let full_rect = ui.max_rect();
+                        // Sole still-image driver for embedded and separate
+                        // viewports. Native video/music adapters come later.
+                        if !state.is_video && !self.fs_music_view_active(fs_idx) {
+                            let _ = crate::touch_correlation::drive_egui_touch_input(
+                                ctx,
+                                crate::touch_correlation::TouchSurface::StillFullscreen,
+                                crate::touch_input::TapZoneGeometry {
+                                    surface: full_rect,
+                                    excluded: Vec::new(),
+                                },
+                                self.frame_counter,
+                            );
+                        }
                         // 初回 PDF raster は描画先の実 inner rect と、この ctx 固有の
                         // effective ppp が揃ってから開始する。これで fullscreen viewport、
                         // detached window、in-window のいずれも OS DPI + UI scale を含む。
