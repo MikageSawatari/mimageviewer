@@ -72,6 +72,10 @@ test("HTML advertises the PWA and iOS standalone metadata", async () => {
     html,
     /rel="apple-touch-icon" sizes="180x180" href="\/icons\/icon-180\.png"/
   );
+  assert.match(
+    html,
+    /name="miv-remote-asset-token" content="__MIV_REMOTE_ASSET_TOKEN__"/
+  );
 });
 
 test("the shell registers a root-scoped service worker without script caching", async () => {
@@ -218,6 +222,22 @@ test("session epoch removes page preflight and repeated active acquisition", asy
     /function applyRemoteSessionId[\s\S]*invalidateViewerPendingLoad\(state\.viewer\)/
   );
   assert.doesNotMatch(app, /state\.viewer\?\.invalidatePendingLoad\(\)/);
+});
+
+test("the running app version comes from the shell and acquisition can reload only once", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  assert.match(
+    app,
+    /querySelector\('meta\[name="miv-remote-asset-token"\]'\)\?\.content/
+  );
+  assert.match(
+    app,
+    /reconcileAppVersionAfterSessionAcquire\(result\.asset_token\)/
+  );
+  assert.match(
+    app,
+    /sessionStorage\?\.setItem\(APP_UPDATE_RELOAD_ATTEMPT_KEY,[\s\S]*sessionStorage\?\.getItem\(APP_UPDATE_RELOAD_ATTEMPT_KEY\) === attempt/
+  );
 });
 
 test("critical telemetry is submitted before session-transition UI side effects", async () => {

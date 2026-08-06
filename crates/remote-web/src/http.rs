@@ -531,7 +531,7 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
     }
     let remote_owner = remote_owner.as_ref();
     let response = match (method, path) {
-        (Method::Get, "/") => static_file(state, "index.html", "text/html; charset=utf-8"),
+        (Method::Get, "/") => static_index(state),
         (Method::Get, "/app.js") => static_file(state, "app.js", "text/javascript; charset=utf-8"),
         (Method::Get, "/command-core.mjs") => {
             static_file(state, "command-core.mjs", "text/javascript; charset=utf-8")
@@ -1772,7 +1772,7 @@ fn api_session_acquire(
                     },
                 );
             }
-            session_response_http(response, state)
+            session_acquire_response_http(response, state)
         }
         Err(failure) => session_failure_response(failure, state),
     }
@@ -1814,22 +1814,39 @@ fn with_session_activity(
 }
 
 fn session_response_http(response: SessionResponse, state: &AppState) -> HttpResponse {
+    session_response_http_inner(response, state, None)
+}
+
+fn session_acquire_response_http(response: SessionResponse, state: &AppState) -> HttpResponse {
+    session_response_http_inner(response, state, Some(web_asset_token(&state.web_root)))
+}
+
+fn session_response_http_inner(
+    response: SessionResponse,
+    state: &AppState,
+    asset_token: Option<String>,
+) -> HttpResponse {
     let status = session_http_status(response.status);
     let remote_state_generation = state
         .library
         .remote_state()
         .ok()
         .map(|state| state.remote_state_generation);
+    let mut body = json!({
+        "status": response.status,
+        "message": response.message,
+        "session_id": response.session_id,
+        "remote_state_generation": remote_state_generation,
+    });
+    if let Some(asset_token) = asset_token
+        && let Some(body) = body.as_object_mut()
+    {
+        body.insert("asset_token".to_owned(), json!(asset_token));
+    }
     HttpResponse::bytes(
         status,
         "application/json; charset=utf-8",
-        serde_json::to_vec(&json!({
-            "status": response.status,
-            "message": response.message,
-            "session_id": response.session_id,
-            "remote_state_generation": remote_state_generation,
-        }))
-        .unwrap_or_default(),
+        serde_json::to_vec(&body).unwrap_or_default(),
     )
     .with_header("Cache-Control", "no-store")
     .with_log_details(json!({
@@ -3298,6 +3315,39 @@ fn static_file(state: &AppState, name: &str, content_type: &'static str) -> Http
     }
 }
 
+const WEB_ASSET_TOKEN_PLACEHOLDER: &str = "__MIV_REMOTE_ASSET_TOKEN__";
+
+/// Bind the shell to the asset tree from which it was loaded. The app-version endpoint describes
+/// the tree currently on disk and therefore cannot identify an already-running script after a
+/// deploy.
+fn static_index(state: &AppState) -> HttpResponse {
+    let path = state.web_root.join("index.html");
+    match fs::read_to_string(&path) {
+        Ok(source) => {
+            let asset_token = web_asset_token(&state.web_root);
+            if asset_token.is_empty() || !source.contains(WEB_ASSET_TOKEN_PLACEHOLDER) {
+                eprintln!(
+                    "remote-web: index shell has no usable asset token placeholder: {}",
+                    path.display()
+                );
+                return HttpResponse::text(500, "Internal Server Error");
+            }
+            HttpResponse::bytes(
+                200,
+                "text/html; charset=utf-8",
+                source
+                    .replacen(WEB_ASSET_TOKEN_PLACEHOLDER, &asset_token, 1)
+                    .into_bytes(),
+            )
+            .with_header("Cache-Control", "no-cache")
+        }
+        Err(error) => {
+            eprintln!("remote-web: static asset index.html could not be read: {error}");
+            HttpResponse::text(500, "Internal Server Error")
+        }
+    }
+}
+
 fn store_error_response(error: StoreError) -> HttpResponse {
     match error {
         StoreError::BadRequest => HttpResponse::text(400, "Bad Request"),
@@ -3935,6 +3985,13 @@ mod tests {
     fn the_asset_token_changes_when_an_asset_changes_and_needs_authentication() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_state(&temp);
+        std::fs::write(
+            state.web_root.join("index.html"),
+            format!(
+                r#"<!doctype html><meta name="miv-remote-asset-token" content="{WEB_ASSET_TOKEN_PLACEHOLDER}">"#
+            ),
+        )
+        .unwrap();
         std::fs::write(state.web_root.join("app.js"), b"const build = 1;").unwrap();
         let before = web_asset_token(&state.web_root);
         assert!(!before.is_empty());
@@ -3953,6 +4010,43 @@ mod tests {
             before,
             "a new asset counts as a deploy too"
         );
+
+        let expected_shell_token = web_asset_token(&state.web_root);
+        let acquire_response = session_acquire_response_http(
+            SessionResponse {
+                status: SessionStatus::Active,
+                message: String::new(),
+                session_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
+            },
+            &state,
+        );
+        let acquire_body: serde_json::Value =
+            serde_json::from_slice(&acquire_response.body).unwrap();
+        assert_eq!(acquire_body["asset_token"], expected_shell_token);
+        let ordinary_response = session_response_http(
+            SessionResponse {
+                status: SessionStatus::Active,
+                message: String::new(),
+                session_id: None,
+            },
+            &state,
+        );
+        let ordinary_body: serde_json::Value =
+            serde_json::from_slice(&ordinary_response.body).unwrap();
+        assert!(
+            ordinary_body.get("asset_token").is_none(),
+            "asset metadata reads belong to acquisition, not every video/session response"
+        );
+
+        let mut shell_request: Request = TestRequest::new()
+            .with_method(Method::Get)
+            .with_path("/")
+            .into();
+        let shell_response = route(&mut shell_request, &state);
+        let shell = String::from_utf8(shell_response.body).unwrap();
+        assert_eq!(shell_response.status, 200);
+        assert!(shell.contains(&format!(r#"content="{expected_shell_token}""#)));
+        assert!(!shell.contains(WEB_ASSET_TOKEN_PLACEHOLDER));
 
         let mut request: Request = TestRequest::new()
             .with_method(Method::Get)

@@ -109,6 +109,8 @@ const AI_TERMINAL_STATES = new Set([
   "background_expired",
   "failed",
 ]);
+const APP_ASSET_TOKEN_PATTERN = /^[a-f0-9]{16}$/;
+const APP_UPDATE_RELOAD_ATTEMPT_KEY = "miv-remote-app-update-reload-attempt";
 const RUNTIME_TEST_MODE = globalThis.__MIV_RUNTIME_TEST_MODE__ === true;
 const REMOTE_CLIENT_ID = loadRemoteClientId();
 const LOCAL_SETTINGS_LOAD = loadLocalSettings();
@@ -450,9 +452,11 @@ const state = {
   pageRenderRevision: 0,
   remoteStateGeneration: "",
   gridViewportMemory: new GridViewportMemory(),
-  appAssetToken: "",
+  appAssetToken: readRunningAssetToken(),
   appUpdateDismissedToken: null,
   appUpdateBanner: null,
+  appUpdateWatchStarted: false,
+  appVersionReportedPair: "",
 };
 
 let recentPointerSource = { source: "mouse", at: 0 };
@@ -525,7 +529,7 @@ async function enterAuthenticatedApp() {
   state.authenticated = true;
   telemetryState.authenticated = true;
   renderLoading("リモートセッションを取得しています");
-  await acquireRemoteSession("authenticated", "initial");
+  if (!await acquireRemoteSession("authenticated", "initial")) return;
   startSessionPing();
   startAppUpdateWatch().catch(() => {});
   renderLoading("お気に入りを読み込んでいます");
@@ -631,7 +635,7 @@ async function acquireRemoteSession(reason = "operation", trigger = "user_operat
       });
       state.remoteSessionUserActive = false;
       enqueueTelemetry({ type: "remote_session", action: "acquire", reason });
-      return true;
+      return reconcileAppVersionAfterSessionAcquire(result.asset_token);
     } catch (error) {
       if (error instanceof AuthenticationRequiredError) throw error;
       if (!(error instanceof RemoteSessionBlockedError)) {
@@ -691,22 +695,63 @@ function applyRemoteSessionId(sessionId) {
 
 const APP_UPDATE_POLL_INTERVAL_MS = 5 * 60 * 1000;
 
+function normalizeAppAssetToken(value) {
+  const token = String(value ?? "");
+  return APP_ASSET_TOKEN_PATTERN.test(token) ? token : "";
+}
+
+/// /api/app-version は「今なら配る版」であり、既に走っている script の版ではない。
+/// navigation 応答へ固定された meta だけを、この page 自身の版として使う。
+function readRunningAssetToken() {
+  return normalizeAppAssetToken(
+    document.querySelector('meta[name="miv-remote-asset-token"]')?.content
+  );
+}
+
+function readAppUpdateReloadAttempt() {
+  try {
+    const parsed = JSON.parse(
+      globalThis.sessionStorage?.getItem(APP_UPDATE_RELOAD_ATTEMPT_KEY) ?? "null"
+    );
+    const runningToken = normalizeAppAssetToken(parsed?.runningToken);
+    const servedToken = normalizeAppAssetToken(parsed?.servedToken);
+    return runningToken && servedToken ? { runningToken, servedToken } : null;
+  } catch {
+    return null;
+  }
+}
+
+/// Reload is allowed only after the loop guard survives a storage round trip. If sessionStorage
+/// is unavailable (private-mode restrictions, quota, etc.), keeping the banner is safer than
+/// risking an unbounded reload loop on a phone.
+function rememberAppUpdateReloadAttempt(runningToken, servedToken) {
+  const attempt = JSON.stringify({ runningToken, servedToken });
+  try {
+    globalThis.sessionStorage?.setItem(APP_UPDATE_RELOAD_ATTEMPT_KEY, attempt);
+    return globalThis.sessionStorage?.getItem(APP_UPDATE_RELOAD_ATTEMPT_KEY) === attempt;
+  } catch {
+    return false;
+  }
+}
+
+function clearAppUpdateReloadAttempt() {
+  try {
+    globalThis.sessionStorage?.removeItem(APP_UPDATE_RELOAD_ATTEMPT_KEY);
+  } catch {}
+}
+
 /// 走っている版と配信されている版を突き合わせる。
 ///
 /// 画面遷移がハッシュ変更なので、開きっぱなしのタブは自分の script を二度と取りに行かない。
 /// 見ている物が古いことは中からは分からないので、こちらから知らせる。
 async function readServedAssetToken() {
   const data = await apiJson("/api/app-version");
-  return String(data.asset_token ?? "");
+  return normalizeAppAssetToken(data.asset_token);
 }
 
 async function startAppUpdateWatch() {
-  try {
-    state.appAssetToken = await readServedAssetToken();
-  } catch {
-    // 起動時に取れなくても本題ではない。次の巡回で拾う。
-    return;
-  }
+  if (state.appUpdateWatchStarted) return;
+  state.appUpdateWatchStarted = true;
   window.setInterval(() => {
     checkForAppUpdate().catch(() => {});
   }, APP_UPDATE_POLL_INTERVAL_MS);
@@ -718,19 +763,76 @@ async function startAppUpdateWatch() {
   });
 }
 
-async function checkForAppUpdate() {
-  if (!state.authenticated) return;
+function recordAppVersion(servedToken, trigger, updateOutcome, { force = false } = {}) {
+  const runningToken = state.appAssetToken;
+  const normalizedServed = normalizeAppAssetToken(servedToken);
+  const pair = `${runningToken}:${normalizedServed}`;
+  if (!force && pair === state.appVersionReportedPair) return;
+  state.appVersionReportedPair = pair;
+  enqueueTelemetry({
+    type: "app_version",
+    action: trigger === "session_acquire" ? "session_acquire" : "version_check",
+    running_asset_token: runningToken,
+    served_asset_token: normalizedServed,
+    versions_match:
+      runningToken && normalizedServed ? runningToken === normalizedServed : null,
+    update_outcome: updateOutcome,
+  });
+}
+
+function reconcileAppVersionAfterSessionAcquire(servedToken) {
+  const served = normalizeAppAssetToken(servedToken);
   const notice = appUpdateNotice({
     runningToken: state.appAssetToken,
-    servedToken: await readServedAssetToken(),
+    servedToken: served,
+    trigger: "session_acquired",
+    reloadAttempt: readAppUpdateReloadAttempt(),
+  });
+  if (notice.kind === "current") {
+    const outcome =
+      state.appAssetToken && served ? "current" : "version_unavailable";
+    if (outcome === "current") clearAppUpdateReloadAttempt();
+    recordAppVersion(served, "session_acquire", outcome, { force: true });
+    return true;
+  }
+  if (notice.kind === "reload_required") {
+    if (rememberAppUpdateReloadAttempt(state.appAssetToken, notice.servedToken)) {
+      recordAppVersion(served, "session_acquire", "automatic_reload", { force: true });
+      reloadApplication();
+      return false;
+    }
+    recordAppVersion(served, "session_acquire", "banner_storage_unavailable", {
+      force: true,
+    });
+    showAppUpdateBanner(notice.servedToken);
+    return true;
+  }
+  recordAppVersion(served, "session_acquire", "banner_reload_already_attempted", {
+    force: true,
+  });
+  showAppUpdateBanner(notice.servedToken);
+  return true;
+}
+
+async function checkForAppUpdate() {
+  if (!state.authenticated) return;
+  const servedToken = await readServedAssetToken();
+  const notice = appUpdateNotice({
+    runningToken: state.appAssetToken,
+    servedToken,
     dismissedToken: state.appUpdateDismissedToken,
   });
+  recordAppVersion(
+    servedToken,
+    "watch",
+    notice.kind === "update_available" ? "banner" : notice.kind
+  );
   if (notice.kind !== "update_available") return;
   showAppUpdateBanner(notice.servedToken);
 }
 
-/// 勝手に再読み込みはしない。動画や読書の途中で画面が飛ぶ方が害が大きいので、
-/// 踏むかどうかは利用者が決める。
+/// 稼働中の照合は、開発中の in-place 配布でも起きる。動画や読書を中断せず、
+/// 自動再読込は session 取得直後に限定して、ここでは利用者へ選択を残す。
 function showAppUpdateBanner(servedToken) {
   if (state.appUpdateBanner) return;
   const banner = element("div", "app-update-banner");
@@ -914,7 +1016,8 @@ function setRemoteSessionStatus(status, message, observation = {}) {
     reconnect.addEventListener("click", () => {
       reconnect.disabled = true;
       acquireRemoteSession("explicit_reconnect", "explicit_reconnect")
-        .then(async () => {
+        .then(async (acquired) => {
+          if (!acquired) return;
           const viewer = state.viewer;
           if (await viewer?.resumeAfterRemoteSessionReconnect?.()) return;
           await dispatchRoute();
@@ -1314,7 +1417,9 @@ function dispatchCommand(requested, meta = {}) {
     );
     if (decision === "acquire") {
       acquireRemoteSession("command", "user_operation")
-        .then(() => dispatchCommand(requested, { ...meta, sessionChecked: true }))
+        .then((acquired) => {
+          if (acquired) dispatchCommand(requested, { ...meta, sessionChecked: true });
+        })
         .catch(() => {});
       return true;
     }
@@ -3513,7 +3618,8 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   const commitSeekGroup = (groupIndex, reason) => {
     const viewer = state.viewer;
     const sequence = ++seekCommitSequence;
-    acquireRemoteSession(reason).then(() => {
+    acquireRemoteSession(reason).then((acquired) => {
+      if (!acquired) return;
       if (sequence !== seekCommitSequence || state.viewer !== viewer) return;
       if (!changeImageTo(groupIndex)) {
         state.viewer?.setSeekState(viewerSeekSnapshot());
@@ -8561,8 +8667,10 @@ async function observedFetch(url, options = {}, sessionRecoveryAttempted = false
           ) {
             let recovered = false;
             try {
-              await acquireRemoteSession("expired_operation", "user_operation");
-              recovered = true;
+              recovered = await acquireRemoteSession(
+                "expired_operation",
+                "user_operation"
+              );
             } catch {}
             if (recovered && sessionEpochBound) {
               const viewer = state.viewer;

@@ -1164,8 +1164,9 @@ Service Worker は接続不能時の案内だけを担当する。保存する�
 `app.js` / CSS / manifest / icon は Cache API へ保存せず、通常どおり network から読む。
 fetch handler は navigation 以外へ介入しないため、認証応答、`/api/page`、
 `/api/ai/jobs/*/result`、thumbnail を含む全 API / 利用者画像は端末の offline cache に
-入らない。Service Worker script は `updateViaCache: "none"` で確認し、asset token による
-既存の「新しい版があります」通知だけを更新案内の正本とする。
+入らない。Service Worker script は `updateViaCache: "none"` で確認する。asset token の照合は
+session acquire 直後だけ一度の自動再読込を許し、稼働中の定期・foreground 復帰時は
+「新しい版があります」通知を更新案内の正本とする (§12.17)。
 
 初回の成功した読み込みより前は Service Worker 自体が端末に存在しないため案内不能である。
 特に iOS のホーム画面版は、一度 online で起動して登録と activate を完了した後の
@@ -1323,6 +1324,30 @@ mtime 観測は採らない。削除済み favorite id は両境界で直ちに�
 
 Auto trim の見開き slot に相手 address が無い場合は、上下 harmonize だけを諦めて
 `AutoSingle` としてページ自体は描画する。相手が指定されている場合の address・slot 検証は維持する。
+
+### 12.17 端末版の記録と接続時の更新 (2026-08-07)
+
+端末が走らせている版は、後から `/api/app-version` を読んだ値ではない。navigation で返す
+`index.html` の固定 placeholder へ、その時点の `web_asset_token` を埋めた
+`miv-remote-asset-token` meta を正本とする。これにより、古い script が走ったまま配信資産だけ
+新しくなった場合も、端末版を新しい版と誤記録しない。session acquire の成功応答には同時点の
+配信 asset token を載せ、追加 RTT なしで照合する。通常段の `app_version` telemetry は
+`running_asset_token` / `served_asset_token` / `versions_match` / `update_outcome` を持つ。
+これらは秘密ではなく、生の client ID / session ID、PIN、Bearer token は含めない。稼働中の照合で
+新しい組合せを観測した場合も一度記録し、配信差し替え後の調査に残す。
+
+取得直後に両 token が違う場合は自動再読込する。ただしタブ単位の `sessionStorage` に
+再読込前の端末 token と対象の配信 token を保存し、書込み後の読戻しまで成功した場合だけ実行する。
+現行版との一致を確認するまで自動再読込は一回に限定し、再読込後も古い場合、対象版がさらに変わった
+場合、または storage を利用できない場合は二度目を踏まず既存バナーへ落とす。稼働中の5分巡回と
+`visibilitychange` 復帰時は、開発中に本体と session を生かしたまま資産を差し替える経路があるため、
+従来どおりバナーだけを出す。
+
+「asset token が変わった = 本体が再起動した」は厳密には成り立たない。外部起動の remote service は
+本体の再起動を越えて待機でき、開発時の web root は本体を生かしたまま変更できる。一方、remote session
+と video stream の所有者は本体プロセス内の `SessionHandle` なので、本体終了を越えて旧状態が生きる
+経路はない。通常の managed service も本体終了時に子 process が終了する。この境界から、更新の自動化は
+新しい session の取得成功直後だけに限定する。
 
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 

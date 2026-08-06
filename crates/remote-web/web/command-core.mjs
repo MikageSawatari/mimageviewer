@@ -220,6 +220,13 @@ export function remoteSessionTransitionTelemetry(previous, next, observation = {
 /// five-second batch. Expected HTTP/image failures remain batched.
 export function telemetryDeliveryMode(event) {
   if (
+    event?.type === "app_version" &&
+    event?.action === "session_acquire" &&
+    event?.update_outcome === "automatic_reload"
+  ) {
+    return "immediate";
+  }
+  if (
     event?.type === "remote_session" &&
     event?.action === "control_transition"
   ) {
@@ -984,17 +991,31 @@ export function videoStartupDecision({
 /// 画面遷移がハッシュ変更なので、開きっぱなしのタブは自分の script を二度と取りに行かない。
 /// 中からは見分けが付かず、実際に「修正が入っていないコードで確認していた」往復が 1 度起きた。
 ///
-/// 勝手に再読み込みはしない。動画の途中や読書の途中で画面が飛ぶ方が害が大きいので、
-/// 知らせるところまでを担当し、踏むかどうかは利用者が決める。一度知らせた token は
-/// 覚えておき、同じ更新で何度も出さない。
+/// セッション取得直後だけは、以前の本体が持っていた session / stream を引き継げないため
+/// 自動再読込できる。視聴中の巡回は従来どおり通知に留める。自動再読込を一度試したタブは、
+/// 現行版を実際に読み込めるまで二度目を踏まず、経路上の古い応答による loop を防ぐ。
 export function appUpdateNotice({
   runningToken,
   servedToken,
   dismissedToken = null,
+  trigger = "watch",
+  reloadAttempt = null,
 }) {
   const running = String(runningToken ?? "");
   const served = String(servedToken ?? "");
   if (!running || !served || running === served) return { kind: "current" };
+  if (trigger === "session_acquired") {
+    const attemptedRunning = String(reloadAttempt?.runningToken ?? "");
+    const attemptedServed = String(reloadAttempt?.servedToken ?? "");
+    if (attemptedRunning && attemptedServed) {
+      return {
+        kind: "update_available",
+        servedToken: served,
+        reason: "reload_already_attempted",
+      };
+    }
+    return { kind: "reload_required", servedToken: served };
+  }
   if (dismissedToken != null && String(dismissedToken) === served) {
     return { kind: "dismissed" };
   }

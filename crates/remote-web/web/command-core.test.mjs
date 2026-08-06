@@ -302,6 +302,16 @@ test("session transition telemetry rejects unbounded observation values", () => 
 
 test("uncaught JS, terminal playback failures and session transitions are immediate", () => {
   assert.equal(telemetryDeliveryMode({
+    type: "app_version",
+    action: "session_acquire",
+    update_outcome: "automatic_reload",
+  }), "immediate");
+  assert.equal(telemetryDeliveryMode({
+    type: "app_version",
+    action: "session_acquire",
+    update_outcome: "current",
+  }), "batch");
+  assert.equal(telemetryDeliveryMode({
     type: "error",
     category: "window_error",
   }), "immediate");
@@ -371,6 +381,28 @@ test("normal telemetry keeps health facts but removes path, message and identity
     current_time_secs: 42.5,
     buffer_ahead_secs: 8.25,
     ready_state: 2,
+    telemetry_tier: "normal",
+  });
+});
+
+test("normal telemetry keeps the running and served app versions without session identity", () => {
+  const event = telemetryEventForTier({
+    type: "app_version",
+    action: "session_acquire",
+    running_asset_token: "1111111111111111",
+    served_asset_token: "2222222222222222",
+    versions_match: false,
+    update_outcome: "automatic_reload",
+    session_id: "0123456789abcdef0123456789abcdef",
+  });
+
+  assert.deepEqual(event, {
+    type: "app_version",
+    action: "session_acquire",
+    running_asset_token: "1111111111111111",
+    served_asset_token: "2222222222222222",
+    versions_match: false,
+    update_outcome: "automatic_reload",
     telemetry_tier: "normal",
   });
 });
@@ -596,28 +628,69 @@ test("startup detects a deadline with no fetched media segment", () => {
   }), { kind: "started" });
 });
 
-test("a newer build is announced once, and never interrupts on its own", () => {
+test("a newer build reloads once on acquisition and stays a banner while active", () => {
+  const running = "1111111111111111";
+  const served = "2222222222222222";
+  const later = "3333333333333333";
   assert.deepEqual(
-    appUpdateNotice({ runningToken: "a", servedToken: "a" }),
+    appUpdateNotice({ runningToken: running, servedToken: running }),
     { kind: "current" }
   );
   assert.deepEqual(
-    appUpdateNotice({ runningToken: "a", servedToken: "b" }),
-    { kind: "update_available", servedToken: "b" }
+    appUpdateNotice({ runningToken: running, servedToken: served }),
+    { kind: "update_available", servedToken: served },
+    "稼働中の巡回は視聴を中断せずバナーに留める"
   );
   assert.deepEqual(
-    appUpdateNotice({ runningToken: "a", servedToken: "b", dismissedToken: "b" }),
+    appUpdateNotice({
+      runningToken: running,
+      servedToken: served,
+      trigger: "session_acquired",
+    }),
+    { kind: "reload_required", servedToken: served },
+    "新しい session の取得直後だけは自動再読込する"
+  );
+  assert.deepEqual(
+    appUpdateNotice({
+      runningToken: running,
+      servedToken: served,
+      trigger: "session_acquired",
+      reloadAttempt: { runningToken: running, servedToken: served },
+    }),
+    {
+      kind: "update_available",
+      servedToken: served,
+      reason: "reload_already_attempted",
+    },
+    "再読込後も古い版なら二度目を踏まずバナーへ落とす"
+  );
+  assert.deepEqual(
+    appUpdateNotice({
+      runningToken: running,
+      servedToken: later,
+      trigger: "session_acquired",
+      reloadAttempt: { runningToken: running, servedToken: served },
+    }),
+    {
+      kind: "update_available",
+      servedToken: later,
+      reason: "reload_already_attempted",
+    },
+    "配信版が再度変わっても現行版を一度読むまでは loop しない"
+  );
+  assert.deepEqual(
+    appUpdateNotice({ runningToken: running, servedToken: served, dismissedToken: served }),
     { kind: "dismissed" },
     "同じ更新を閉じたら黙る"
   );
   assert.deepEqual(
-    appUpdateNotice({ runningToken: "a", servedToken: "c", dismissedToken: "b" }),
-    { kind: "update_available", servedToken: "c" },
+    appUpdateNotice({ runningToken: running, servedToken: later, dismissedToken: served }),
+    { kind: "update_available", servedToken: later },
     "さらに新しい版が出たら改めて知らせる"
   );
   // token が取れないとき (回線断・起動直後) に更新扱いしない。
-  assert.deepEqual(appUpdateNotice({ runningToken: "", servedToken: "b" }), { kind: "current" });
-  assert.deepEqual(appUpdateNotice({ runningToken: "a", servedToken: "" }), { kind: "current" });
+  assert.deepEqual(appUpdateNotice({ runningToken: "", servedToken: served }), { kind: "current" });
+  assert.deepEqual(appUpdateNotice({ runningToken: running, servedToken: "" }), { kind: "current" });
 });
 
 test("the timeline is anchored once per generation, not on every state poll", () => {
