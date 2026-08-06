@@ -6,9 +6,7 @@ use std::time::{Duration, Instant};
 
 use super::encoder::{EncoderPreference, H264EncoderKind, SEGMENT_DURATION_SECS};
 use super::quality::{OutputDimensions, QualityPreset};
-use crate::remote_ipc::session::{
-    RemoteSessionOwner, RemoteStreamingActivity, RemoteStreamingRegistration,
-};
+use crate::remote_ipc::session::{RemoteSessionOwner, RemoteStreamingActivity};
 use crate::video::clockless_transcode::{
     ClocklessAudioProcessing, ClocklessOutputInfo, ClocklessSegmentBytes, ClocklessStreamOutput,
     ClocklessTranscodeControl, ClocklessTranscodeOptions, ClocklessVstStatus,
@@ -207,7 +205,6 @@ pub(crate) struct StreamingGenerationHandle {
     control: ClocklessTranscodeControl,
     activity: RemoteStreamingActivity,
     audio_status: ClocklessVstStatus,
-    _registration: RemoteStreamingRegistration,
     cancel: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -271,6 +268,10 @@ impl StreamingGenerationHandle {
                     &worker_status,
                     &worker_output,
                 );
+                // The remote-session drain owns the actual FFmpeg/GPU worker lifetime, not just
+                // the UI handle lifetime. Releasing this registration is what may return control
+                // to the PC or allow the next remote owner to acquire the session.
+                drop(registration);
             })
             .map_err(|error| format!("failed to spawn streaming worker: {error}"))?;
         Ok(Self {
@@ -280,7 +281,6 @@ impl StreamingGenerationHandle {
             control,
             activity,
             audio_status,
-            _registration: registration,
             cancel,
             worker: Some(worker),
         })

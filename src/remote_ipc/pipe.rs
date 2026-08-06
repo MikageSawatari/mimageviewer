@@ -718,14 +718,38 @@ fn stream_worker_loop(
             enqueued_at.elapsed().as_secs_f64() * 1000.0
         ));
         let started_at = Instant::now();
-        let response = if let Err(response) = session_operation.wait_until_active() {
-            ServerMessage::Session {
+        let start_budget = matches!(&message, ClientMessage::VideoStreamStart { .. })
+            .then(|| VideoStreamStartBudget::from_enqueued_at(enqueued_at));
+        let activation = match start_budget {
+            Some(budget) => session_operation.wait_until_active_for(budget.remaining()),
+            None => session_operation.wait_until_active().map(|()| true),
+        };
+        let response = match activation {
+            Err(response) => ServerMessage::Session {
                 id: request_id,
                 response,
+            },
+            Ok(false) => {
+                session_operation.finish(false);
+                ServerMessage::VideoStreamStart {
+                    id: request_id,
+                    response: VideoStreamResult::Error(
+                        start_budget
+                            .expect("only video start has a bounded activation wait")
+                            .timeout_error(VideoStreamStartStage::Queue),
+                    ),
+                }
             }
-        } else {
-            session_operation.started();
-            execute_video_stream_request(message, engine, session, session_operation, enqueued_at)
+            Ok(true) => {
+                session_operation.started();
+                execute_video_stream_request(
+                    message,
+                    engine,
+                    session,
+                    session_operation,
+                    enqueued_at,
+                )
+            }
         };
         let outcome = response_outcome(&response);
         let reply_ok = reply.send(response).is_ok();

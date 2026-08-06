@@ -156,7 +156,7 @@ struct StreamingRegistration {
 
 impl ActiveSession {
     fn cancel_streaming(&mut self) {
-        if let Some(streaming) = self.streaming.take() {
+        if let Some(streaming) = self.streaming.as_ref() {
             streaming.cancel.store(true, Ordering::Release);
         }
     }
@@ -437,13 +437,13 @@ impl SessionStateMachine {
         true
     }
 
-    fn unregister_streaming(&mut self, generation: u64, registration_id: u64) {
+    fn unregister_streaming(&mut self, generation: u64, registration_id: u64) -> bool {
         let Some(active) = self
             .active
             .as_mut()
             .filter(|_| self.generation == generation)
         else {
-            return;
+            return false;
         };
         if active
             .streaming
@@ -451,7 +451,9 @@ impl SessionStateMachine {
             .is_some_and(|streaming| streaming.id == registration_id)
         {
             active.streaming = None;
+            return self.try_finish_drain();
         }
+        false
     }
 
     fn start_operation(&mut self, generation: u64, token: u64) -> bool {
@@ -572,7 +574,7 @@ impl SessionStateMachine {
             || self
                 .active
                 .as_ref()
-                .is_some_and(|active| !active.operations.is_empty())
+                .is_some_and(|active| !active.operations.is_empty() || active.streaming.is_some())
         {
             return false;
         }
@@ -1820,12 +1822,18 @@ impl RemoteStreamingRegistration {
 impl Drop for RemoteStreamingRegistration {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Release);
-        self.activity
+        let released = self
+            .activity
             .handle
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .unregister_streaming(self.activity.generation, self.activity.registration_id);
+        if released {
+            self.activity.handle.clear_video_stream(None);
+            self.activity.handle.notify_phase_changed();
+            self.activity.handle.notify_ui();
+        }
     }
 }
 
@@ -1951,6 +1959,50 @@ impl SessionOperation {
                 return response;
             }
             drop(wake.wait(epoch).unwrap_or_else(|error| error.into_inner()));
+        }
+    }
+
+    /// Wait for the acquisition barrier without outliving an operation-level budget.
+    /// `Ok(false)` means ownership is still valid but the barrier did not open in time.
+    pub(crate) fn wait_until_active_for(&self, timeout: Duration) -> Result<bool, SessionResponse> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let (epoch, wake) = &*self.handle.phase_wake;
+            let epoch = epoch.lock().unwrap_or_else(|error| error.into_inner());
+            let response = {
+                let state = self
+                    .handle
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if state.generation != self.generation
+                    || !state.active.as_ref().is_some_and(|active| {
+                        active.client_id == self.owner.client_id
+                            && active.session_id == self.owner.session_id
+                    })
+                {
+                    Some(Err(state.inactive_response(&self.owner.client_id)))
+                } else {
+                    match state.lifecycle.phase {
+                        RemoteControlPhase::RemoteActive => Some(Ok(true)),
+                        RemoteControlPhase::DrainingRemote | RemoteControlPhase::Local => {
+                            Some(Err(state.draining_owner_response()))
+                        }
+                        RemoteControlPhase::AcquiringRemote => None,
+                    }
+                }
+            };
+            if let Some(response) = response {
+                return response;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            let (epoch, _) = wake
+                .wait_timeout(epoch, remaining)
+                .unwrap_or_else(|error| error.into_inner());
+            drop(epoch);
         }
     }
 
@@ -2442,6 +2494,27 @@ mod tests {
     }
 
     #[test]
+    fn bounded_operation_wait_ends_while_acquire_barrier_remains_closed() {
+        let handle = SessionHandle::new();
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        let owner = handle.owner_for_test("client");
+        let operation = handle
+            .begin_operation(&owner, "queued start".to_owned())
+            .unwrap();
+
+        assert!(
+            !operation
+                .wait_until_active_for(Duration::from_millis(10))
+                .unwrap()
+        );
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::AcquiringRemote);
+        operation.finish(false);
+    }
+
+    #[test]
     fn liveness_timeout_releases_session() {
         let mut state = SessionStateMachine::default();
         acquire(&mut state, Duration::ZERO);
@@ -2531,16 +2604,75 @@ mod tests {
     fn local_control_return_cancels_registered_streaming() {
         let mut state = SessionStateMachine::default();
         acquire(&mut state, Duration::ZERO);
-        let (_, _, cancel) = register_test_stream(&mut state, Duration::ZERO);
+        let (generation, registration, cancel) = register_test_stream(&mut state, Duration::ZERO);
 
         state.local_disconnect();
 
         assert!(cancel.load(Ordering::Acquire));
         assert_eq!(state.lifecycle.phase, RemoteControlPhase::DrainingRemote);
         assert!(state.active.is_some());
-        assert!(state.complete_app_drain(state.generation));
+        assert!(!state.complete_app_drain(state.generation));
+        assert_eq!(state.lifecycle.phase, RemoteControlPhase::DrainingRemote);
+        assert!(state.unregister_streaming(generation, registration));
         assert!(state.active.is_none());
         assert_eq!(state.last_release_reason, Some(ReleaseReason::Local));
+    }
+
+    #[test]
+    fn next_owner_cannot_start_streaming_before_previous_worker_unregisters() {
+        let mut state = SessionStateMachine::default();
+        acquire(&mut state, Duration::ZERO);
+        let (old_generation, old_registration, old_cancel) =
+            register_test_stream(&mut state, Duration::ZERO);
+
+        state.local_disconnect();
+        assert!(old_cancel.load(Ordering::Acquire));
+        assert!(!state.complete_app_drain(old_generation));
+        assert_eq!(
+            state
+                .acquire(
+                    Duration::from_secs(1),
+                    2,
+                    SessionAcquireRequest {
+                        client_id: "next-client".to_owned(),
+                        peer: peer(),
+                    },
+                )
+                .status,
+            SessionStatus::LocalInUse
+        );
+
+        assert!(state.unregister_streaming(old_generation, old_registration));
+        assert_eq!(state.lifecycle.phase, RemoteControlPhase::Local);
+        assert_eq!(
+            state
+                .acquire(
+                    Duration::from_secs(2),
+                    3,
+                    SessionAcquireRequest {
+                        client_id: "next-client".to_owned(),
+                        peer: peer(),
+                    },
+                )
+                .status,
+            SessionStatus::Active
+        );
+        assert_eq!(state.lifecycle.phase, RemoteControlPhase::AcquiringRemote);
+        assert!(state.finish_acquire(state.generation));
+        let owner = state_owner(&state, "next-client");
+        let new_generation = state
+            .streaming_owner(Duration::from_secs(2), &owner)
+            .unwrap();
+        let new_cancel = Arc::new(AtomicBool::new(false));
+        state
+            .register_streaming(
+                Duration::from_secs(2),
+                new_generation,
+                "next-client",
+                Arc::clone(&new_cancel),
+            )
+            .unwrap();
+        assert!(!new_cancel.load(Ordering::Acquire));
     }
 
     #[test]
@@ -2841,6 +2973,30 @@ mod tests {
         );
         assert!(!handle.complete_app_drain(generation));
         operation.finish(false);
+        let released = handle.snapshot();
+        assert_eq!(released.phase, RemoteControlPhase::Local);
+        assert!(released.active.is_none());
+        assert_eq!(released.control_return_sequence, 1);
+    }
+
+    #[test]
+    fn streaming_registration_drop_completes_an_app_drained_session() {
+        let handle = SessionHandle::new();
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        assert!(handle.finish_acquire(handle.snapshot().generation));
+        let owner = handle.owner_for_test("client");
+        let streaming_owner = handle.streaming_owner(&owner).unwrap();
+        let registration = streaming_owner.register_streaming().unwrap();
+        let generation = handle.snapshot().generation;
+
+        handle.local_disconnect();
+        assert!(!handle.complete_app_drain(generation));
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::DrainingRemote);
+
+        drop(registration);
         let released = handle.snapshot();
         assert_eq!(released.phase, RemoteControlPhase::Local);
         assert!(released.active.is_none());

@@ -645,6 +645,12 @@ worker が停止した時に stream lane を占有し続けないための circu
 timeout message は要求種別 (master/media playlist、init/media segment、state) を含み、HTTP は
 `stream_resource_timeout` を `details.video_stream.error_code` へ記録する。
 
+start が `AcquiringRemote` の barrier 待ちに入った時間も core start budget の queue stage に
+含める。barrier が開かなければ `stream_start_queue_timeout` で終端し、claim 前の待機だけが
+15 秒の外に残ることを許さない。また `/api/video/start` は state を作る POST なので、Web 側は
+`503` を無期限に自動再送しない。1 回の試行を error と「再試行」で終え、playlist attach 後の
+generation recovery だけを従来どおり専用の 15 秒 owner で扱う。
+
 増分 5 の **6.0 秒**は wall-clock timeout ではなく、2 秒 GOP の 3 倍を許す source-timeline 上の
 unfinished fragment / interleave backlog 上限である。超過時は session を停止し、resource request
 の 2 秒や start の 15 秒とは合算しない。named-pipe connect 1 秒と reconnect backoff は接続基盤の
@@ -658,6 +664,11 @@ guard で、動画処理開始後の timeout 9 個には数えない。
   ([web-remote-plan.md](web-remote-plan.md) §2.2) がそのままストリーミングも止める
 - 放置タイムアウト (10 分) の抑止条件である「再生中」にストリーミング中を含める
 - ストリーミング中は生存タイムアウト (60 秒) の判定にセグメント取得も活動として数える
+- `DrainingRemote` は UI の stream handle を外した時点では完了しない。cancel 済み generation
+  worker が返り、stack 所有の FFmpeg / D3D11 / encoder resource を破棄して streaming
+  registration を外すまで final release を待つ。join 自体は UI thread で行わず worker 側の
+  registration lifetime を drain accounting に使う。これにより旧 worker が process-wide
+  generation resource lease を持つ間に次 owner の acquire / start が成功することを防ぐ
 
 ### 6.4 画質プリセット
 

@@ -73,6 +73,39 @@ test("video reconnect resumes the captured position and play intent", async () =
   assert.equal(viewer.remoteSessionResume, null);
 });
 
+test("video start ends a busy attempt visibly instead of retrying forever", async () => {
+  const notices = [];
+  const failures = [];
+  let startRequests = 0;
+  const busy = Object.assign(new Error("busy"), {
+    status: 503,
+    code: "stream_busy",
+  });
+  const viewer = {
+    playRequested: true,
+    destroyed: false,
+    address: { favorite_id: "favorite", relative_path: "movie.mp4" },
+    quality: "standard",
+    abortController: { signal: new AbortController().signal },
+    clearPoll: () => {},
+    showNotice: (...args) => notices.push(args),
+    apiPostJson: async () => {
+      startRequests += 1;
+      throw busy;
+    },
+    requestWithWaiting: () => {
+      throw new Error("start must not enter the unbounded waiting loop");
+    },
+    showStartFailure: (error) => failures.push(error),
+  };
+
+  await VideoStreamViewer.prototype.start.call(viewer);
+
+  assert.equal(startRequests, 1);
+  assert.deepEqual(notices, [["動画を準備しています。", "waiting"]]);
+  assert.deepEqual(failures, [busy]);
+});
+
 test("stage 4 video panel exposes functions and jump tabs in that order", () => {
   assert.deepEqual(VIDEO_PANEL_TABS, [
     { id: "functions", label: "機能" },

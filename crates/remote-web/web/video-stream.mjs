@@ -1516,7 +1516,11 @@ export class VideoStreamViewer {
     this.showNotice("動画を準備しています。", "waiting");
     let started;
     try {
-      started = await this.requestWithWaiting(() => this.apiPostJson(
+      // Start is a state-creating POST. A retryable 503 can be returned before the core admits
+      // it, but an HTTP timeout cannot prove that a prior attempt created no stream. End this
+      // attempt visibly and let the user retry instead of keeping the viewer in an unbounded
+      // "preparing" loop.
+      started = await this.apiPostJson(
         "/api/video/start",
         {
           fav: this.address.favorite_id,
@@ -1524,7 +1528,7 @@ export class VideoStreamViewer {
           quality: this.quality,
         },
         this.abortController.signal
-      ));
+      );
     } catch (error) {
       if (error?.name === "AbortError" || this.destroyed) return;
       this.showStartFailure(error);
