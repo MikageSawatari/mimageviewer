@@ -299,6 +299,13 @@ test("video health samples distinguish buffer starvation from a stopped playback
     fragment: { load_ms: 82.34, sequence: 117 },
     connection: { effectiveType: "4g", rtt: 51, downlink: 8.25 },
     waiting: true,
+    playbackAttempts: {
+      attempts: 2,
+      successes: 1,
+      rejections: 1,
+      pending: 0,
+      lastRejectionName: "NotAllowedError",
+    },
   });
 
   assert.deepEqual(sample, {
@@ -327,6 +334,11 @@ test("video health samples distinguish buffer starvation from a stopped playback
     connection_effective_type: "4g",
     connection_rtt_ms: 51,
     connection_downlink_mbps: 8.25,
+    play_attempt_count: 2,
+    play_success_count: 1,
+    play_rejection_count: 1,
+    play_pending_count: 0,
+    last_play_rejection_name: "NotAllowedError",
   });
 });
 
@@ -424,6 +436,16 @@ test("runtime waiting has one bounded terminal instead of an infinite buffering 
   assert.deepEqual(videoPlaybackStallDecision({
     active: true,
     playRequested: true,
+    progressedMediaSecs: 0.25,
+  }), { kind: "resolved" });
+  assert.equal(videoPlaybackStallDecision({
+    active: true,
+    playRequested: true,
+    progressedMediaSecs: 0.249,
+  }).kind, "waiting");
+  assert.deepEqual(videoPlaybackStallDecision({
+    active: true,
+    playRequested: true,
     elapsedSinceProgressMs: 14999,
     timeoutMs: 15000,
   }), { kind: "waiting", retryDelayMs: 1 });
@@ -454,6 +476,107 @@ test("runtime waiting has one bounded terminal instead of an infinite buffering 
     switching: true,
     elapsedSinceProgressMs: 20000,
   }).kind, "defer");
+});
+
+test("a paused stalled event cannot create a waiting owner without play intent", () => {
+  const viewer = {
+    destroyed: false,
+    playbackStallWatch: null,
+    playRequested: false,
+    generationSwitch: { isSwitching: () => false },
+    video: { currentTime: 0, ended: false, paused: true },
+    remoteSessionState: { blocksInteraction: false },
+  };
+
+  VideoStreamViewer.prototype.beginWaiting.call(viewer, "stalled");
+  assert.equal(viewer.playbackStallWatch, null);
+});
+
+test("stable playback progress resolves the waiting owner and its notice", () => {
+  const now = performance.now();
+  const watch = {
+    generation: 8,
+    startedAt: now - 1000,
+    lastProgressAt: now - 1000,
+    lastMediaTimeSecs: 10,
+    progressedMediaSecs: 0,
+    trigger: "waiting",
+    warningTimer: 1,
+    terminalTimer: 1,
+  };
+  const calls = [];
+  const viewer = {
+    destroyed: false,
+    playbackStallWatch: watch,
+    generation: 8,
+    playRequested: true,
+    video: { currentTime: 10.03, paused: false, ended: false },
+    remoteSessionState: { blocksInteraction: false },
+    generationSwitch: { isSwitching: () => false },
+    clearWaiting() {
+      calls.push("clear_waiting");
+      this.playbackStallWatch = null;
+    },
+    schedulePlaybackStallCheck: () => calls.push("schedule"),
+  };
+  viewer.advancePlaybackStallWatch = (owner) =>
+    VideoStreamViewer.prototype.advancePlaybackStallWatch.call(viewer, owner);
+
+  VideoStreamViewer.prototype.notePlaybackProgress.call(viewer);
+  assert.deepEqual(calls, []);
+  viewer.video.currentTime = 10.12;
+  VideoStreamViewer.prototype.notePlaybackProgress.call(viewer);
+  assert.deepEqual(calls, ["schedule"]);
+  viewer.video.currentTime = 10.27;
+  VideoStreamViewer.prototype.notePlaybackProgress.call(viewer);
+
+  assert.deepEqual(calls, ["schedule", "clear_waiting"]);
+  assert.equal(viewer.playbackStallWatch, null);
+});
+
+test("a rejected media play promise is recorded once without automatic retry", async () => {
+  const rejection = new Error("gesture required");
+  rejection.name = "NotAllowedError";
+  const calls = [];
+  const viewer = {
+    playRequested: true,
+    destroyed: false,
+    remoteSessionState: { blocksInteraction: false },
+    video: {
+      src: "blob:stream",
+      paused: true,
+      play: () => {
+        calls.push("play");
+        return Promise.reject(rejection);
+      },
+    },
+    hls: null,
+    playbackAttempts: {
+      attempts: 0,
+      successes: 0,
+      rejections: 0,
+      pending: 0,
+      lastRejectionName: "",
+    },
+    rememberPlaybackError: (error) => calls.push(["remember", error.name]),
+    playbackLayerDiagnostics: () => ({ paused: true, ready_state: 4 }),
+    recordPlaybackIssue: (...args) => calls.push(["issue", ...args]),
+    captureVideoHealth: (...args) => calls.push(["health", ...args]),
+    showNotice: (...args) => calls.push(["notice", ...args]),
+  };
+
+  await VideoStreamViewer.prototype.playIfRequested.call(viewer);
+
+  assert.equal(calls.filter((entry) => entry === "play").length, 1);
+  assert.deepEqual(viewer.playbackAttempts, {
+    attempts: 1,
+    successes: 0,
+    rejections: 1,
+    pending: 0,
+    lastRejectionName: "NotAllowedError",
+  });
+  assert.deepEqual(calls.at(-2), ["health", "play_rejected", { telemetry: true }]);
+  assert.deepEqual(calls.at(-1), ["notice", "中央をタップして再生してください。", "autoplay"]);
 });
 
 test("terminal playback failure clears the waiting owner before showing reconnect", () => {
@@ -550,6 +673,8 @@ test("an attached visible playback with no progress reaches the reconnect termin
     captureVideoHealth: (...args) => calls.push(["health", ...args]),
     finishPlaybackLayerFailure: (message) => calls.push(["terminal", message]),
   };
+  viewer.advancePlaybackStallWatch = (owner) =>
+    VideoStreamViewer.prototype.advancePlaybackStallWatch.call(viewer, owner);
 
   VideoStreamViewer.prototype.checkPlaybackStall.call(viewer, watch);
 

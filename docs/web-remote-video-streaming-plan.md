@@ -824,9 +824,11 @@ guard で、動画処理開始後の timeout 9 個には数えない。
 - video element の `error` / `stalled` も再生層の event として記録する。hls.js 使用中の
   media error は hls.js の typed `ERROR` が recovery authority、native HLS は video element が
   terminal authority となる
-- runtime `waiting` は `playbackStallWatch` が一つだけ所有する。3 秒で従来の画質提案と
-  waiting snapshot を出し、`timeupdate` で実再生時刻が進むたびに terminal deadline を更新する。
-  表示中・再生要求中で generation switch 外にもかかわらず 15 秒進まなければ、即時 telemetry を
+- runtime `waiting` は `playbackStallWatch` が一つだけ所有する。`timeupdate` の前進を watch 内で
+  累積し、0.25 秒以上の実再生進行を純関数の `resolved` として watch と waiting/buffering notice を
+  解除する。一瞬の 50ms 未満の揺れや paused 中の seek は復帰に数えない。3 秒の画質提案も同じ純関数を
+  通るため、play intent が消えた watch や既に復帰した watch は通知を出さない。表示中・再生要求中で
+  generation switch 外にもかかわらず 15 秒進まなければ、即時 telemetry を
   残して停止し、「現在位置から再接続」できる terminal 表示へ移る。hidden / generation switching
   中は判定を延期し、意図的 pause / session block / ended は watch を解除する
 - 従来は非 HTTP の fatal HLS error で `stopLoad()` しても waiting timer を解除せず、fatal の
@@ -845,12 +847,16 @@ guard で、動画処理開始後の timeout 9 個には数えない。
   Network Information API の effective type / RTT / downlink を含む。URL は snapshot の通常 fields に
   コピーしない。`getVideoPlaybackQuality` / Network Information API が無い場合は `null` とする
 - HUD は動画 viewer が存在する間だけ画像/一覧行を動画行へ差し替え、位置、先読み秒、readyState、
-  dropped/total frames、帯域推定、segment 時間、回線情報を小さい 3 行にまとめる。viewer の destroy で
-  snapshot を解除し、従来の画像/一覧 HUD へ戻す
+  dropped/total frames、帯域推定、segment 時間、回線情報を小さい 3 行にまとめる。動画中だけ下部の
+  前後ファイルボタンより上へ退避し、viewer の destroy で snapshot と位置指定を解除して従来の
+  画像/一覧 HUD へ戻す
 - stream session があり、play intent が ON、session block 外なら、再生時刻の進行とは独立した timer で
   10 秒ごとに `trigger=periodic` を送る。hls.js が止まり currentTime が変わらなくても timer は継続する。
   意図的 pause、viewer destroy、session block では止める。3 秒 waiting 表示時、15 秒 stall terminal、
-  hls fatal、video element error は周期を待たず health snapshot を即時送信する
+  hls fatal、video element error、`video.play()` rejection は周期を待たず health snapshot を即時送信する。
+  health は play attempt / success / rejection / pending の累計と直近 rejection 名も持つ。開始時に
+  `paused=true` のままになる症状は既存記録だけでは play 未呼び出しと Promise rejection を区別できない
+  ため、原因未確定の自動 retry は入れず、この計測で次回再現時に確定する
 - telemetry は queue へ入れる直前に `normal` / `debug` の 2 段へ正規化する。通常段は既定で、
   数値・boolean・固定列挙を残し、path/address/resource、message/stack、client/session 識別子を再帰的に
   除く。これにより既存の window/fetch/image event も通常段では同じ境界に従う。詳細段だけ remote

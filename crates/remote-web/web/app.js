@@ -3341,6 +3341,7 @@ function renderVideoViewer(entry) {
   state.viewer = viewer;
   state.commandMenu = viewer.menu;
   app.append(viewer.root);
+  viewer.captureVideoHealth("hud");
   viewer.start().catch((error) => {
     if (state.viewer === viewer) {
       viewer.showOperationalError(error, "動画を開始できませんでした");
@@ -8909,6 +8910,7 @@ function updateHud() {
   const image = hudState.lastImage;
   const grid = hudState.lastGrid;
   const video = hudState.video;
+  hudElement.dataset.viewerKind = video ? "video" : "default";
   const recent = hudState.displayDurations.slice(-7);
   const lines = [debugDetails ? "mIV PoC 計測 · 詳細記録 ON" : "mIV PoC 計測"];
   if (video) {

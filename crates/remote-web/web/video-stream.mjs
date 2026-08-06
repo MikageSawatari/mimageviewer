@@ -28,6 +28,7 @@ const VIDEO_STATE_POLL_MS = 1000;
 const VIDEO_HEALTH_TELEMETRY_MS = 10000;
 const WAITING_SUGGESTION_MS = 3000;
 const PLAYBACK_STALL_TIMEOUT_MS = 15000;
+const PLAYBACK_RESUME_PROGRESS_SECS = 0.25;
 const STARTUP_MEDIA_SEGMENT_TIMEOUT_MS = 15000;
 const PLAYLIST_RECOVERY_TIMEOUT_MS = 15000;
 const PLAYLIST_RECOVERY_BACKOFF_BASE_MS = 250;
@@ -315,6 +316,16 @@ export function videoHealthSamplingDecision({
   return !destroyed && session !== null && session !== undefined && Boolean(playRequested) && !blocked;
 }
 
+function newPlaybackAttemptStats() {
+  return {
+    attempts: 0,
+    successes: 0,
+    rejections: 0,
+    pending: 0,
+    lastRejectionName: "",
+  };
+}
+
 export function videoHealthSample({
   trigger = "hud",
   video = {},
@@ -326,6 +337,7 @@ export function videoHealthSample({
   fragment = null,
   connection = null,
   waiting = false,
+  playbackAttempts = null,
   detailedContext = null,
 } = {}) {
   const currentTimeSecs = Math.max(0, Number(video.currentTime) || 0);
@@ -367,6 +379,13 @@ export function videoHealthSample({
       : null,
     connection_rtt_ms: finiteTelemetryNumber(connection?.rtt, 0),
     connection_downlink_mbps: finiteTelemetryNumber(connection?.downlink, 2),
+    play_attempt_count: Math.max(0, Number(playbackAttempts?.attempts) || 0),
+    play_success_count: Math.max(0, Number(playbackAttempts?.successes) || 0),
+    play_rejection_count: Math.max(0, Number(playbackAttempts?.rejections) || 0),
+    play_pending_count: Math.max(0, Number(playbackAttempts?.pending) || 0),
+    last_play_rejection_name: playbackAttempts?.lastRejectionName
+      ? boundedTelemetryEnum(playbackAttempts.lastRejectionName)
+      : null,
   };
   return { ...result, ...videoTelemetryDetailedFields(detailedContext) };
 }
@@ -402,10 +421,16 @@ export function videoPlaybackStallDecision({
   blocked = false,
   hidden = false,
   switching = false,
+  progressedMediaSecs = 0,
+  recoveryThresholdSecs = PLAYBACK_RESUME_PROGRESS_SECS,
   elapsedSinceProgressMs = 0,
   timeoutMs = PLAYBACK_STALL_TIMEOUT_MS,
 } = {}) {
   if (!active || !playRequested || ended || blocked) return { kind: "cancel" };
+  const recoveryThreshold = Math.max(0.01, Number(recoveryThresholdSecs) || 0.01);
+  if (Math.max(0, Number(progressedMediaSecs) || 0) >= recoveryThreshold) {
+    return { kind: "resolved" };
+  }
   if (hidden || switching) return { kind: "defer", retryDelayMs: 1000 };
   const timeout = Math.max(1, Number(timeoutMs) || 1);
   const elapsed = Math.max(0, Number(elapsedSinceProgressMs) || 0);
@@ -1475,6 +1500,7 @@ export class VideoStreamViewer {
     this.lastFragmentHealth = null;
     this.lastServerMessage = "";
     this.lastDiagnosticMessage = "";
+    this.playbackAttempts = newPlaybackAttemptStats();
     this.playbackStallWatch = null;
     this.hlsErrorTelemetryAt = new Map();
     this.startupWatch = null;
@@ -1748,6 +1774,7 @@ export class VideoStreamViewer {
     this.lastFragmentHealth = null;
     this.lastServerMessage = "";
     this.lastDiagnosticMessage = "";
+    this.playbackAttempts = newPlaybackAttemptStats();
     this.showNotice("動画を準備しています。", "waiting");
     let started;
     try {
@@ -2279,12 +2306,47 @@ export class VideoStreamViewer {
       this.remoteSessionState.blocksInteraction ||
       !this.video.src && !this.hls
     ) return;
+    const playbackAttempts = this.playbackAttempts;
+    const attemptSequence = playbackAttempts.attempts + 1;
+    playbackAttempts.attempts = attemptSequence;
+    playbackAttempts.pending += 1;
+    let rejection = null;
     try {
       await this.video.play();
-      if (["autoplay", "waiting"].includes(this.noticeKind)) this.hideNotice();
-    } catch {
-      this.showNotice("中央をタップして再生してください。", "autoplay");
+      playbackAttempts.successes += 1;
+    } catch (error) {
+      rejection = error;
+      playbackAttempts.rejections += 1;
+      playbackAttempts.lastRejectionName = boundedTelemetryEnum(error?.name, "unknown");
+    } finally {
+      playbackAttempts.pending = Math.max(0, playbackAttempts.pending - 1);
     }
+    if (
+      this.destroyed ||
+      this.remoteSessionState.blocksInteraction ||
+      this.playbackAttempts !== playbackAttempts
+    ) return;
+    if (!rejection) {
+      if (["autoplay", "waiting"].includes(this.noticeKind)) this.hideNotice();
+      this.captureVideoHealth("hud");
+      return;
+    }
+    this.rememberPlaybackError(rejection);
+    this.recordPlaybackIssue(
+      "video_stream_play_rejected",
+      "media_play_promise_rejected",
+      {
+        ...this.playbackLayerDiagnostics(),
+        play_attempt_sequence: attemptSequence,
+        play_attempt_count: playbackAttempts.attempts,
+        play_success_count: playbackAttempts.successes,
+        play_rejection_count: playbackAttempts.rejections,
+        play_pending_count: playbackAttempts.pending,
+        play_rejection_name: playbackAttempts.lastRejectionName,
+      }
+    );
+    this.captureVideoHealth("play_rejected", { telemetry: true });
+    this.showNotice("中央をタップして再生してください。", "autoplay");
   }
 
   currentPosition() {
@@ -2690,6 +2752,7 @@ export class VideoStreamViewer {
       fragment: this.lastFragmentHealth,
       connection,
       waiting: this.playbackStallWatch !== null,
+      playbackAttempts: this.playbackAttempts,
       detailedContext: this.telemetryDebugContext(),
     });
     try {
@@ -2909,6 +2972,13 @@ export class VideoStreamViewer {
       this.playbackStallWatch !== null ||
       this.generationSwitch.isSwitching()
     ) return;
+    const initialDecision = videoPlaybackStallDecision({
+      active: true,
+      playRequested: this.playRequested,
+      ended: this.video.ended,
+      blocked: this.remoteSessionState.blocksInteraction,
+    });
+    if (initialDecision.kind === "cancel") return;
     const startedAt = performance.now();
     const watch = {
       trigger: boundedTelemetryEnum(trigger),
@@ -2916,13 +2986,14 @@ export class VideoStreamViewer {
       startedAt,
       lastProgressAt: startedAt,
       lastMediaTimeSecs: Math.max(0, Number(this.video.currentTime) || 0),
+      progressedMediaSecs: 0,
       warningTimer: 0,
       terminalTimer: 0,
     };
     this.playbackStallWatch = watch;
     watch.warningTimer = setTimeout(() => {
       watch.warningTimer = 0;
-      if (this.playbackStallWatch !== watch || this.destroyed) return;
+      if (this.advancePlaybackStallWatch(watch) !== "waiting") return;
       this.recordPlaybackIssue(
         "video_stream_playback_waiting",
         "playback_waiting_warning",
@@ -2960,10 +3031,17 @@ export class VideoStreamViewer {
     const watch = this.playbackStallWatch;
     if (!watch) return;
     const currentTimeSecs = Math.max(0, Number(this.video.currentTime) || 0);
-    if (Math.abs(currentTimeSecs - watch.lastMediaTimeSecs) < 0.05) return;
+    const deltaSecs = currentTimeSecs - watch.lastMediaTimeSecs;
+    if (this.video.paused || deltaSecs < -0.05) {
+      watch.lastMediaTimeSecs = currentTimeSecs;
+      if (deltaSecs < -0.05) watch.progressedMediaSecs = 0;
+      return;
+    }
+    if (deltaSecs < 0.05) return;
     watch.lastMediaTimeSecs = currentTimeSecs;
+    watch.progressedMediaSecs += deltaSecs;
     watch.lastProgressAt = performance.now();
-    this.schedulePlaybackStallCheck(watch, PLAYBACK_STALL_TIMEOUT_MS);
+    this.advancePlaybackStallWatch(watch);
   }
 
   schedulePlaybackStallCheck(watch, delayMs) {
@@ -2977,9 +3055,14 @@ export class VideoStreamViewer {
   checkPlaybackStall(watch) {
     if (this.destroyed || this.playbackStallWatch !== watch) return;
     watch.terminalTimer = 0;
+    this.advancePlaybackStallWatch(watch);
+  }
+
+  advancePlaybackStallWatch(watch) {
+    if (this.destroyed || this.playbackStallWatch !== watch) return "inactive";
     if (watch.generation !== this.generation) {
       this.clearWaiting();
-      return;
+      return "cancel";
     }
     const now = performance.now();
     const decision = videoPlaybackStallDecision({
@@ -2989,16 +3072,17 @@ export class VideoStreamViewer {
       blocked: this.remoteSessionState.blocksInteraction,
       hidden: globalThis.document?.visibilityState === "hidden",
       switching: this.generationSwitch.isSwitching(),
+      progressedMediaSecs: watch.progressedMediaSecs,
       elapsedSinceProgressMs: now - watch.lastProgressAt,
       timeoutMs: PLAYBACK_STALL_TIMEOUT_MS,
     });
-    if (decision.kind === "cancel") {
+    if (decision.kind === "cancel" || decision.kind === "resolved") {
       this.clearWaiting();
-      return;
+      return decision.kind;
     }
     if (decision.kind === "defer" || decision.kind === "waiting") {
       this.schedulePlaybackStallCheck(watch, decision.retryDelayMs);
-      return;
+      return decision.kind;
     }
 
     this.recordPlaybackIssue(
@@ -3016,6 +3100,7 @@ export class VideoStreamViewer {
     this.finishPlaybackLayerFailure(
       "動画の再生が停止しました。現在位置から再接続できます。"
     );
+    return decision.kind;
   }
 
   finishPlaybackLayerFailure(message) {

@@ -344,6 +344,10 @@ test("uncaught JS, terminal playback failures and session transitions are immedi
     type: "video_health",
     trigger: "waiting_threshold",
   }), "immediate");
+  assert.equal(telemetryDeliveryMode({
+    type: "video_health",
+    trigger: "play_rejected",
+  }), "immediate");
 });
 
 test("normal telemetry keeps health facts but removes path, message and identity fields", () => {

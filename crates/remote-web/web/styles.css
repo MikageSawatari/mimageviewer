@@ -178,6 +178,10 @@ button {
   color: #fff0cd;
 }
 
+#telemetry-hud[data-viewer-kind="video"] {
+  bottom: max(78px, calc(env(safe-area-inset-bottom) + 64px));
+}
+
 .pin-screen {
   display: grid;
   width: 100%;

@@ -239,7 +239,13 @@ export function telemetryDeliveryMode(event) {
   }
   if (
     event?.type === "video_health" &&
-    ["waiting_threshold", "stall_terminal", "hls_fatal", "media_error"].includes(
+    [
+      "waiting_threshold",
+      "stall_terminal",
+      "hls_fatal",
+      "media_error",
+      "play_rejected",
+    ].includes(
       event?.trigger
     )
   ) {

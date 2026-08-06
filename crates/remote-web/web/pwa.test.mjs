@@ -257,6 +257,8 @@ test("video health HUD and persistent debug-tier warning stay wired", async () =
   assert.match(app, /詳細記録 ON/);
   assert.match(app, /telemetryDebugDetails[\s\S]*openLocalSettingsDialog\(\)/);
   assert.match(css, /#telemetry-hud\[data-telemetry-tier="debug"\]/);
+  assert.match(app, /dataset\.viewerKind = video \? "video" : "default"/);
+  assert.match(css, /#telemetry-hud\[data-viewer-kind="video"\][\s\S]*bottom:/);
 });
 
 test("colorize controls use the adjustment preview and commit path without losing custom points", async () => {

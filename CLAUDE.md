@@ -673,8 +673,11 @@ print(c.most_common())
   (非対応時は keepalive fetch) へ渡す。各 event の
   `client_event_sequence` で、別リクエストになった transition と例外の前後を復元できる
 - `video_health` は play intent 中に10秒周期で、current time / 全体位置、buffered ahead、ready state、
-  frame drop、hls.js bandwidth / fragment load、利用可能なら回線種別 / RTT を残す。current time が
-  停止しても周期は止まらない。`waiting_threshold` / `stall_terminal` / `hls_fatal` / `media_error` は即時
+  frame drop、hls.js bandwidth / fragment load、play Promise の attempt / success / rejection / pending、
+  利用可能なら回線種別 / RTT を残す。current time が停止しても周期は止まらない。
+  `waiting_threshold` / `stall_terminal` / `hls_fatal` / `media_error` / `play_rejected` は即時
+- runtime waiting は 0.25 秒以上の実再生進行を `videoPlaybackStallDecision` の `resolved` として
+  単一 watch owner から解除する。3 秒警告も同じ判定を通し、意図的 pause の `stalled` は watch を作らない
 - telemetry は enqueue 前に `normal` (既定) / `debug` へ段階化される。normal は数値・固定列挙を残し、
   path/address/resource、message/stack、client/session 識別子を除く。debug は端末設定の明示 ON 時だけ
   remote address、message、client ID、SHA-256 短縮 session 相関値を残す。ON 中は HUD の
