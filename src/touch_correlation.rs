@@ -51,6 +51,19 @@ impl TouchFrame {
         self.touch_cancelled
     }
 
+    /// Positions of primary releases whose exact egui-winit synthetic-pointer
+    /// signature was correlated to raw touch input in this pass.
+    ///
+    /// Callers must still apply their normal click/tap classification. This
+    /// method proves provenance only; it never turns an arbitrary touch release
+    /// into a click.
+    pub(crate) fn correlated_primary_release_positions(&self) -> impl Iterator<Item = Pos2> + '_ {
+        self.primary_events
+            .iter()
+            .filter(|event| !event.pressed)
+            .map(|event| event.pos)
+    }
+
     /// Returns true only after the primary event has first been correlated to
     /// an exact touch signature and the recognizer then requested suppression.
     pub(crate) fn should_suppress_primary(&self, pos: Pos2, pressed: bool) -> bool {
@@ -584,8 +597,23 @@ mod tests {
 
         assert!(frame.commands().is_empty());
         assert!(frame.primary_events.is_empty());
+        assert_eq!(frame.correlated_primary_release_positions().count(), 0);
         assert!(!frame.should_suppress_primary(pos, true));
         assert!(!frame.should_suppress_primary(pos, false));
+    }
+
+    #[test]
+    fn correlated_touch_release_exposes_its_exact_position() {
+        let mut state = TouchCorrelationState::default();
+        let pos = pos2(500.0, 400.0);
+        let frame = process(&mut state, &tap_events(1, pos), 100);
+
+        assert_eq!(
+            frame
+                .correlated_primary_release_positions()
+                .collect::<Vec<_>>(),
+            vec![pos]
+        );
     }
 
     #[test]

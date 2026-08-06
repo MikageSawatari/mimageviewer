@@ -25,7 +25,7 @@
 | [top-level-grid-view.md](top-level-grid-view.md) | 検索・★固定・サブ展開・スマートフォルダ等の最上位一覧 ownership / 復元 snapshot と、スマートフォルダ root / scoped drill の不変条件 |
 | [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md) | フルスクリーン / 検索結果 / 動画タイルをまたぐ Ctrl+↑↓・境界ヒント・前後移動の統一仕様メモ |
 | [keymap-spec.md](keymap-spec.md) + [key-customization-impl-plan.md](key-customization-impl-plan.md) + [key-command-catalog-plan.md](key-command-catalog-plan.md) | キーボード操作 / ショートカット / `consume_key` / `key_pressed` / native VK 判定 / コマンドカタログ化を触るとき。新しいキー操作は keymap 対応要否を必ず確認 |
-| [touch-support-plan.md](touch-support-plan.md) | **仕様確定 / Phase 1 Step 3 まで実装済み**。タブレット PC のタッチ操作対応。静止画フルスクリーンは左右タップのページ送り、中央タップの上下クローム、2 本指ズーム / パンを配線済み。左右パネルのタッチ導線は Step 3b、一覧操作は Phase 2。3 領域タップ + 中央クローム + anchor-fraction スクロール + ピンチの設計とフェーズ別工数。タッチ / ポインタ入力を触るときに読む |
+| [touch-support-plan.md](touch-support-plan.md) | **仕様確定 / Phase 1 Step 3c まで実装済み**。タブレット PC のタッチ操作対応。静止画フルスクリーンは左右タップのページ送り、中央タップの上下クローム、2 本指ズーム / パン、上バーのタッチ専用 hit resolver を配線済み。左右パネルのタッチ導線は Step 3b、一覧操作は Phase 2。3 領域タップ + 中央クローム + anchor-fraction スクロール + ピンチの設計とフェーズ別工数。タッチ / ポインタ入力を触るときに読む |
 
 ## 仕様・機能
 

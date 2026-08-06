@@ -10810,6 +10810,7 @@ impl App {
                                 self.cursor_hidden,
                                 navigator_exclusion,
                                 touch_chrome_latched,
+                                self.frame_counter,
                             );
                             if top_bar_lock_pressed {
                                 self.settings.fullscreen_top_bar_locked =
@@ -16196,6 +16197,13 @@ impl App {
             self.frame_counter,
             touch_input_enabled,
         );
+        let touch_bar_tap = top_bar_visible
+            && prepare_bar_button_touch_targets(
+                ctx,
+                self.frame_counter,
+                fullscreen_top_bar_rect(full_rect),
+                &touch_frame,
+            );
         let touch_owner = touch_frame.owner();
         let touch_active = touch_frame.is_active();
         let touch_has_replacement = touch_frame.commands().iter().any(|command| {
@@ -16244,7 +16252,10 @@ impl App {
                 }
             }
         }
-        if touch_has_replacement || touch_owner == crate::touch_input::TouchOwner::Pinch {
+        if touch_bar_tap
+            || touch_has_replacement
+            || touch_owner == crate::touch_input::TouchOwner::Pinch
+        {
             self.fs_suppress_primary_until_release = true;
         }
 
@@ -22275,6 +22286,7 @@ impl App {
         cursor_hidden: bool,
         navigator_exclusion: Option<egui::Rect>,
         touch_chrome_latched: bool,
+        touch_target_frame: u64,
     ) {
         let hover_in_top = ctx.input(|i| {
             !cursor_hidden
@@ -22302,6 +22314,7 @@ impl App {
 
         crate::os_theme::apply_dark_ui(ui);
         let bar_rect = fullscreen_top_bar_rect(full_rect);
+        record_bar_button_touch_frame(ctx, touch_target_frame, bar_rect);
         ui.painter().rect_filled(
             bar_rect,
             0.0,

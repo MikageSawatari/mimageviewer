@@ -7,6 +7,221 @@ use crate::ui_helpers::format_bytes_small;
 
 use super::{BAR_BUTTON_SIZE, CHECKMARK_MARGIN, CHECKMARK_RADIUS};
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BarButtonTouchTarget {
+    id: egui::Id,
+    rect: egui::Rect,
+}
+
+/// Previous/current-pass button geometry for one fullscreen viewport.
+///
+/// The registry lives in `Context::data_temp`; it deliberately does not add
+/// another lifetime or input flag to `App`. `previous` is the last consecutive
+/// app frame in which the same bar rectangle was drawn. `current` is populated
+/// only through `draw_bar_button`, keeping that helper as the single geometry
+/// seam for every button in the bar.
+#[derive(Clone, Debug, Default)]
+struct BarButtonTouchState {
+    frame: Option<u64>,
+    prepared_pass: Option<u64>,
+    bar_rect: Option<egui::Rect>,
+    previous: Vec<BarButtonTouchTarget>,
+    current: Vec<BarButtonTouchTarget>,
+    resolved_ids: Vec<egui::Id>,
+}
+
+fn bar_button_touch_state_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::new((module_path!(), ctx.viewport_id(), line!()))
+}
+
+fn begin_bar_button_touch_frame(
+    state: &mut BarButtonTouchState,
+    frame: u64,
+    pass: u64,
+    bar_rect: egui::Rect,
+) {
+    if state.frame != Some(frame) {
+        let consecutive = state
+            .frame
+            .is_some_and(|previous| previous.checked_add(1) == Some(frame));
+        if consecutive && state.bar_rect == Some(bar_rect) {
+            state.previous = std::mem::take(&mut state.current);
+        } else {
+            state.previous.clear();
+            state.current.clear();
+        }
+        state.resolved_ids.clear();
+        state.frame = Some(frame);
+    } else if state.bar_rect != Some(bar_rect) {
+        // A resize/UI-scale transition invalidates the old Voronoi cells. Wait
+        // for one freshly recorded frame rather than resolving against stale
+        // geometry.
+        state.previous.clear();
+        state.current.clear();
+        state.resolved_ids.clear();
+    }
+
+    state.prepared_pass = Some(pass);
+    state.bar_rect = Some(bar_rect);
+}
+
+/// Resolve a tap to the horizontal Voronoi cell of the nearest button.
+///
+/// Vertically every cell spans the full bar. Horizontally, cells start at the
+/// left edge of the leftmost button, meet at adjacent center midpoints, and the
+/// rightmost cell reaches the bar's right edge. Midpoints belong to the button
+/// on their right, so adjacent cells never overlap. The unused area to the left
+/// of the leftmost button intentionally remains inert.
+fn resolve_bar_touch_target(
+    targets: &[BarButtonTouchTarget],
+    bar_rect: egui::Rect,
+    pos: egui::Pos2,
+) -> Option<egui::Id> {
+    if targets.is_empty() || !bar_rect.contains(pos) {
+        return None;
+    }
+
+    let mut ordered: Vec<&BarButtonTouchTarget> = targets.iter().collect();
+    ordered.sort_by(|a, b| a.rect.center().x.total_cmp(&b.rect.center().x));
+    if pos.x < ordered[0].rect.left() {
+        return None;
+    }
+
+    for (index, target) in ordered.iter().enumerate() {
+        let left = if index == 0 {
+            target.rect.left()
+        } else {
+            (ordered[index - 1].rect.center().x + target.rect.center().x) * 0.5
+        };
+        let right = if index + 1 == ordered.len() {
+            bar_rect.right()
+        } else {
+            (target.rect.center().x + ordered[index + 1].rect.center().x) * 0.5
+        };
+        let contains_x = pos.x >= left
+            && if index + 1 == ordered.len() {
+                pos.x <= right
+            } else {
+                pos.x < right
+            };
+        if contains_x {
+            return Some(target.id);
+        }
+    }
+
+    None
+}
+
+/// Prepare the current frame's touch-only bar resolution before the fullscreen
+/// background click handler runs. Returns true for any correlated primary tap
+/// inside the bar, including inert space, so that it cannot leak through to the
+/// fullscreen page-navigation response.
+pub(super) fn prepare_bar_button_touch_targets(
+    ctx: &egui::Context,
+    frame: u64,
+    bar_rect: egui::Rect,
+    touch_frame: &crate::touch_correlation::TouchFrame,
+) -> bool {
+    let pass = ctx.cumulative_pass_nr();
+    let primary_clicked =
+        ctx.input(|input| input.pointer.button_clicked(egui::PointerButton::Primary));
+    let release_positions = if primary_clicked {
+        touch_frame
+            .correlated_primary_release_positions()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let tap_in_bar = release_positions.iter().any(|pos| bar_rect.contains(*pos));
+    let id = bar_button_touch_state_id(ctx);
+
+    ctx.data_mut(|data| {
+        let mut state = data.get_temp::<BarButtonTouchState>(id).unwrap_or_default();
+        begin_bar_button_touch_frame(&mut state, frame, pass, bar_rect);
+        state.resolved_ids = release_positions
+            .iter()
+            .filter_map(|pos| resolve_bar_touch_target(&state.previous, bar_rect, *pos))
+            .collect();
+        data.insert_temp(id, state);
+    });
+
+    tap_in_bar
+}
+
+/// Ensure that a newly summoned bar records its first geometry pass even when
+/// it became visible after the input handler computed its visibility snapshot.
+pub(super) fn record_bar_button_touch_frame(ctx: &egui::Context, frame: u64, bar_rect: egui::Rect) {
+    let pass = ctx.cumulative_pass_nr();
+    let id = bar_button_touch_state_id(ctx);
+    ctx.data_mut(|data| {
+        let mut state = data.get_temp::<BarButtonTouchState>(id).unwrap_or_default();
+        begin_bar_button_touch_frame(&mut state, frame, pass, bar_rect);
+        data.insert_temp(id, state);
+    });
+}
+
+fn record_bar_button_and_resolve_touch(
+    ctx: &egui::Context,
+    id: egui::Id,
+    rect: egui::Rect,
+) -> bool {
+    let pass = ctx.cumulative_pass_nr();
+    let state_id = bar_button_touch_state_id(ctx);
+    ctx.data_mut(|data| {
+        let Some(mut state) = data.get_temp::<BarButtonTouchState>(state_id) else {
+            return false;
+        };
+        let belongs_to_prepared_bar = state.prepared_pass == Some(pass)
+            && state
+                .bar_rect
+                .is_some_and(|bar_rect| bar_rect.contains(rect.min) && bar_rect.contains(rect.max));
+        if !belongs_to_prepared_bar {
+            return false;
+        }
+
+        if let Some(target) = state.current.iter_mut().find(|target| target.id == id) {
+            target.rect = rect;
+        } else {
+            state.current.push(BarButtonTouchTarget { id, rect });
+        }
+        let touch_clicked = state.resolved_ids.contains(&id);
+        data.insert_temp(state_id, state);
+        touch_clicked
+    })
+}
+
+/// `egui::Response` plus a touch-only logical click resolved from the fixed
+/// visual widget's previous-frame bar geometry.
+///
+/// Dereferencing retains the exact original response rectangle, hover state,
+/// and mouse interaction. Only `clicked()` is widened, and only after positive
+/// raw-touch correlation.
+pub(super) struct BarButtonResponse {
+    response: egui::Response,
+    touch_clicked: bool,
+}
+
+impl BarButtonResponse {
+    pub(super) fn clicked(&self) -> bool {
+        self.touch_clicked || self.response.clicked()
+    }
+
+    pub(super) fn hover_tip_dark(self, text: impl Into<egui::WidgetText>) -> Self {
+        Self {
+            response: crate::ui_helpers::HoverTipExt::hover_tip_dark(self.response, text),
+            touch_clicked: self.touch_clicked,
+        }
+    }
+}
+
+impl std::ops::Deref for BarButtonResponse {
+    type Target = egui::Response;
+
+    fn deref(&self) -> &Self::Target {
+        &self.response
+    }
+}
+
 // ── ホバーバーのアイコン描画関数 ────────────────────────────────────────
 
 /// バーボタンの標準背景色を返す。
@@ -29,17 +244,162 @@ pub(super) fn draw_bar_button(
     bg_fn: impl FnOnce(bool) -> egui::Color32,
     _active: bool,
     icon_fn: impl FnOnce(&egui::Painter, egui::Pos2, f32),
-) -> egui::Response {
+) -> BarButtonResponse {
     let rect = egui::Rect::from_min_size(
         egui::pos2(x, y),
         egui::vec2(BAR_BUTTON_SIZE, BAR_BUTTON_SIZE),
     );
-    let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+    let id = egui::Id::new(id);
+    let resp = ui.interact(rect, id, egui::Sense::click());
     let bg = bg_fn(resp.hovered());
     ui.painter().rect_filled(rect, 4.0, bg);
     let r = BAR_BUTTON_SIZE * 0.28;
     icon_fn(ui.painter(), rect.center(), r);
-    resp
+    let touch_clicked = record_bar_button_and_resolve_touch(ui.ctx(), id, rect);
+    BarButtonResponse {
+        response: resp,
+        touch_clicked,
+    }
+}
+
+#[cfg(test)]
+mod bar_button_touch_tests {
+    use super::*;
+
+    fn target(id: u64, left: f32) -> BarButtonTouchTarget {
+        BarButtonTouchTarget {
+            id: egui::Id::new(id),
+            rect: egui::Rect::from_min_size(
+                egui::pos2(left, 6.0),
+                egui::vec2(BAR_BUTTON_SIZE, BAR_BUTTON_SIZE),
+            ),
+        }
+    }
+
+    #[test]
+    fn adjacent_button_midpoints_are_disjoint_and_choose_the_right_cell() {
+        let bar = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(300.0, 44.0));
+        let targets = [target(1, 100.0), target(2, 136.0)];
+        let midpoint = (targets[0].rect.center().x + targets[1].rect.center().x) * 0.5;
+
+        assert_eq!(
+            resolve_bar_touch_target(&targets, bar, egui::pos2(midpoint - 0.001, 22.0)),
+            Some(targets[0].id)
+        );
+        assert_eq!(
+            resolve_bar_touch_target(&targets, bar, egui::pos2(midpoint, 22.0)),
+            Some(targets[1].id)
+        );
+    }
+
+    #[test]
+    fn rightmost_cell_reaches_top_and_right_screen_edges() {
+        let bar = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(300.0, 44.0));
+        let targets = [target(1, 100.0), target(2, 136.0)];
+
+        assert_eq!(
+            resolve_bar_touch_target(&targets, bar, egui::pos2(300.0, 0.0)),
+            Some(targets[1].id)
+        );
+        assert_eq!(
+            resolve_bar_touch_target(&targets, bar, egui::pos2(299.0, 44.0)),
+            Some(targets[1].id)
+        );
+    }
+
+    #[test]
+    fn inert_bar_space_and_points_outside_the_bar_resolve_to_nothing() {
+        let bar = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(300.0, 44.0));
+        let targets = [target(1, 100.0), target(2, 136.0)];
+
+        assert_eq!(
+            resolve_bar_touch_target(&targets, bar, egui::pos2(99.999, 22.0)),
+            None
+        );
+        assert_eq!(
+            resolve_bar_touch_target(&targets, bar, egui::pos2(150.0, 44.001)),
+            None
+        );
+    }
+
+    #[test]
+    fn zero_and_one_button_bars_are_well_defined() {
+        let bar = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(300.0, 44.0));
+        assert_eq!(
+            resolve_bar_touch_target(&[], bar, egui::pos2(300.0, 0.0)),
+            None
+        );
+
+        let only = target(1, 136.0);
+        assert_eq!(
+            resolve_bar_touch_target(&[only], bar, egui::pos2(300.0, 0.0)),
+            Some(only.id)
+        );
+        assert_eq!(
+            resolve_bar_touch_target(&[only], bar, egui::pos2(135.999, 22.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn uncorrelated_mouse_click_never_arms_the_wide_target() {
+        let ctx = egui::Context::default();
+        let bar = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(300.0, 44.0));
+        let close = target(1, 136.0);
+        let corner = egui::pos2(300.0, 0.0);
+        assert_eq!(
+            resolve_bar_touch_target(&[close], bar, corner),
+            Some(close.id)
+        );
+
+        let raw = egui::RawInput {
+            screen_rect: Some(bar),
+            events: vec![
+                egui::Event::PointerMoved(corner),
+                egui::Event::PointerButton {
+                    pos: corner,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: corner,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            let state_id = bar_button_touch_state_id(ctx);
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    state_id,
+                    BarButtonTouchState {
+                        frame: Some(0),
+                        bar_rect: Some(bar),
+                        current: vec![close],
+                        ..Default::default()
+                    },
+                );
+            });
+
+            assert!(
+                ctx.input(|input| { input.pointer.button_clicked(egui::PointerButton::Primary) })
+            );
+            assert!(!prepare_bar_button_touch_targets(
+                ctx,
+                1,
+                bar,
+                &crate::touch_correlation::TouchFrame::default(),
+            ));
+            let state = ctx
+                .data(|data| data.get_temp::<BarButtonTouchState>(state_id))
+                .unwrap();
+            assert!(state.resolved_ids.is_empty());
+        });
+    }
 }
 
 /// "VST" ラベルを線分で自前描画する (= ホバーバーの VST3 管理ボタン用アイコン)。
