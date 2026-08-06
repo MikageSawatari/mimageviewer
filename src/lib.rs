@@ -173,6 +173,7 @@ pub mod tags_db;
 pub mod thumb_loader;
 pub mod thumb_overlay_layout;
 mod touch_debug;
+pub(crate) mod touch_input;
 pub mod tray;
 mod tray_integration;
 mod ui_adjustment_panel;
