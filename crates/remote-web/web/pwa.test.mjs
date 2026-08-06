@@ -220,6 +220,34 @@ test("session epoch removes page preflight and repeated active acquisition", asy
   assert.doesNotMatch(app, /state\.viewer\?\.invalidatePendingLoad\(\)/);
 });
 
+test("critical telemetry is submitted before session-transition UI side effects", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  const statusOwner = app.match(
+    /function setRemoteSessionStatus[\s\S]*?\n}\n\nfunction updateRemoteSessionOwnerBadge/
+  )?.[0] ?? "";
+  assert.match(statusOwner, /remoteSessionTransitionTelemetry\(/);
+  assert.match(statusOwner, /if \(transitionEvent\) enqueueTelemetry\(transitionEvent\)/);
+  assert.ok(
+    statusOwner.indexOf("enqueueTelemetry(transitionEvent)") <
+      statusOwner.indexOf("applyRemoteSessionId"),
+    "the transition beacon must be queued before cache/viewer invalidation can throw"
+  );
+  assert.ok(
+    statusOwner.indexOf("enqueueTelemetry(transitionEvent)") <
+      statusOwner.indexOf('document.querySelector("#remote-session-status")'),
+    "the transition beacon must be queued before modal rendering can throw"
+  );
+  assert.match(
+    app,
+    /telemetryDeliveryMode\(stampedEvent\) === "immediate"[\s\S]*sendImmediateTelemetry\(stampedEvent\)/
+  );
+  assert.match(app, /navigator\.sendBeacon\([\s\S]*"\/api\/telemetry"/);
+  assert.match(app, /client_event_sequence:\s*telemetryState\.nextSequence\+\+/);
+  assert.match(app, /observer:\s*"ping"/);
+  assert.match(app, /observer:\s*"acquire"/);
+  assert.match(app, /path === "\/api\/video\/state"\) return "video_poll"/);
+});
+
 test("colorize controls use the adjustment preview and commit path without losing custom points", async () => {
   const app = await readFile(new URL("app.js", here), "utf8");
   assert.match(app, /normalizeRemoteColorizeParams\(source\.colorize\)/);

@@ -666,11 +666,17 @@ print(c.most_common())
 
 - **`/api/telemetry` はセッション取得を要求しない** (`route_requires_remote_session`
   の除外)。**本体が切断した後でも端末のログは届く。** 切断まわりの調査に使える
-- ただし telemetry は**間隔でまとめて送る**ので、例外の直後に端末が操作不能に
-  なるとバッファごと失われることがある。ログに無いことを「起きていない」証拠に
-  しない
+- 通常の telemetry は間隔でまとめて送る。一方、`window_error` /
+  `unhandled_rejection` と `remote_session` の `control_transition` は、その JS turn
+  で `sendBeacon` (非対応時は keepalive fetch) へ渡す。各 event の
+  `client_event_sequence` で、別リクエストになった transition と例外の前後を復元できる
+- セッション transition は `observer` (`ping` / `video_poll` / `acquire` など)、
+  `observed_status` / `http_status`、遷移前後の status / phase /
+  `blocks_interaction` を持つ。server message、URL、client/session ID は載せない
 - `window.onerror` はスクリプトが cross-origin 扱いだと内容が落ち、
-  `"Script error."` になる
+  `"Script error."` になる。ただし製品の `app.js` と同梱 `hls.min.js` は同一 origin
+  配信で、`app.js` は module script でもある。`"Script error."` が残る場合は、まず
+  ブラウザや拡張機能が注入した外部 script も疑う
 
 ### 経緯
 

@@ -149,6 +149,91 @@ export function remoteSessionControlTransition(current, status, message = "") {
   };
 }
 
+const REMOTE_SESSION_TELEMETRY_OBSERVERS = new Set([
+  "acquire",
+  "ping",
+  "video_poll",
+  "video_request",
+  "page_request",
+  "api_request",
+  "auth",
+  "client",
+]);
+
+const REMOTE_SESSION_OBSERVED_STATUSES = new Set([
+  "request_started",
+  "active",
+  "local_in_use",
+  "superseded",
+  "expired",
+  "not_acquired",
+  "unavailable",
+  "session_id_mismatch",
+  "network_error",
+  "pin_required",
+  "inactive",
+  "unknown",
+]);
+
+/// Build the privacy-bounded record for an actual control-state change. Server messages,
+/// resource URLs, client/session IDs and request bodies are deliberately excluded.
+export function remoteSessionTransitionTelemetry(previous, next, observation = {}) {
+  if (!previous || !next) return null;
+  const changed =
+    previous.status !== next.status ||
+    previous.phase !== next.phase ||
+    previous.blocksInteraction !== next.blocksInteraction ||
+    previous.disconnectReason !== next.disconnectReason;
+  if (!changed) return null;
+
+  const requestedObserver = String(observation.observer ?? "client");
+  const observer = REMOTE_SESSION_TELEMETRY_OBSERVERS.has(requestedObserver)
+    ? requestedObserver
+    : "client";
+  const requestedObservedStatus = String(observation.observedStatus ?? "unknown");
+  const observedStatus = REMOTE_SESSION_OBSERVED_STATUSES.has(requestedObservedStatus)
+    ? requestedObservedStatus
+    : "unknown";
+  const numericHttpStatus = Number(observation.httpStatus);
+  const httpStatus = Number.isInteger(numericHttpStatus) &&
+      numericHttpStatus >= 100 && numericHttpStatus <= 599
+    ? numericHttpStatus
+    : null;
+
+  return {
+    type: "remote_session",
+    action: "control_transition",
+    observer,
+    observed_status: observedStatus,
+    http_status: httpStatus,
+    from_status: previous.status,
+    from_phase: previous.phase,
+    from_blocks_interaction: previous.blocksInteraction,
+    to_status: next.status,
+    to_phase: next.phase,
+    to_blocks_interaction: next.blocksInteraction,
+    disconnect_reason: next.disconnectReason,
+  };
+}
+
+/// Only events whose diagnostic value is lost when the current JS turn fails bypass the
+/// five-second batch. Expected HTTP/image failures remain batched.
+export function telemetryDeliveryMode(event) {
+  if (
+    event?.type === "remote_session" &&
+    event?.action === "control_transition"
+  ) {
+    return "immediate";
+  }
+  if (
+    event?.type === "error" &&
+    (event?.category === "window_error" || event?.category === "unhandled_rejection")
+  ) {
+    return "immediate";
+  }
+  return "batch";
+}
+
 export function remoteSessionFailureStatus({
   sessionStatus,
   httpStatus,

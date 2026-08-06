@@ -34,6 +34,7 @@ import {
   remoteSessionAcquireRetryDelay,
   remoteSessionControlTransition,
   remoteSessionFailureStatus,
+  remoteSessionTransitionTelemetry,
   rangeValueFromNormalized,
   rangeValueToNormalized,
   relativeRangeDragValue,
@@ -45,6 +46,7 @@ import {
   thumbnailRequestConcurrency,
   thumbnailRequestStartCount,
   thumbnailRetryDecision,
+  telemetryDeliveryMode,
   togglePageOriginalFitMode,
   shouldShowGridCursor,
   shouldShowLoadingIndicator,
@@ -346,6 +348,7 @@ const telemetryState = {
   queue: [],
   flushing: false,
   authenticated: false,
+  nextSequence: 1,
 };
 
 const hudState = {
@@ -551,11 +554,14 @@ async function acquireRemoteSession(reason = "operation", trigger = "user_operat
     );
   }
   if (state.remoteSessionAcquirePromise) return state.remoteSessionAcquirePromise;
-  setRemoteSessionStatus("acquiring", "操作権を取得しています…");
+  setRemoteSessionStatus("acquiring", "操作権を取得しています…", {
+    observer: "acquire",
+    observedStatus: "request_started",
+  });
   state.remoteSessionAcquirePromise = (async () => {
+    let response;
+    let result = {};
     try {
-      let response;
-      let result = {};
       for (let attempt = 0; ; attempt += 1) {
         response = await fetch("/api/session/acquire", {
           method: "POST",
@@ -580,7 +586,12 @@ async function acquireRemoteSession(reason = "operation", trigger = "user_operat
           if (attempt === 0) {
             setRemoteSessionStatus(
               "acquiring",
-              "前のリモート処理が安全に終了するのを待っています…"
+              "前のリモート処理が安全に終了するのを待っています…",
+              {
+                observer: "acquire",
+                observedStatus: result.status,
+                httpStatus: response.status,
+              }
             );
           }
           await new Promise((resolve) => window.setTimeout(resolve, retryDelayMs));
@@ -592,7 +603,12 @@ async function acquireRemoteSession(reason = "operation", trigger = "user_operat
         const status = sessionStatusFromResponse(result.status, response?.status ?? 0);
         setRemoteSessionStatus(
           status,
-          result.message || `操作権を取得できません (HTTP ${response?.status ?? 0})。`
+          result.message || `操作権を取得できません (HTTP ${response?.status ?? 0})。`,
+          {
+            observer: "acquire",
+            observedStatus: result.status,
+            httpStatus: response?.status,
+          }
         );
         throw new RemoteSessionBlockedError(
           result.message || "リモートセッションを取得できません。"
@@ -604,7 +620,11 @@ async function acquireRemoteSession(reason = "operation", trigger = "user_operat
       }
       applyRemoteSessionId(sessionId);
       applyRemoteStateGeneration(result.remote_state_generation, { reloadViewer: true });
-      setRemoteSessionStatus("active", "");
+      setRemoteSessionStatus("active", "", {
+        observer: "acquire",
+        observedStatus: result.status,
+        httpStatus: response.status,
+      });
       state.remoteSessionUserActive = false;
       enqueueTelemetry({ type: "remote_session", action: "acquire", reason });
       return true;
@@ -613,7 +633,12 @@ async function acquireRemoteSession(reason = "operation", trigger = "user_operat
       if (!(error instanceof RemoteSessionBlockedError)) {
         setRemoteSessionStatus(
           "unavailable",
-          error instanceof Error ? error.message : "操作権を取得できません。"
+          error instanceof Error ? error.message : "操作権を取得できません。",
+          {
+            observer: "acquire",
+            observedStatus: response ? result.status : "network_error",
+            httpStatus: response?.status,
+          }
         );
       }
       throw error;
@@ -748,14 +773,24 @@ async function pingRemoteSession() {
   if (!response.ok || result.status !== "active") {
     setRemoteSessionStatus(
       sessionStatusFromResponse(result.status, response.status),
-      result.message || "リモートセッションが切断されました。再接続してください。"
+      result.message || "リモートセッションが切断されました。再接続してください。",
+      {
+        observer: "ping",
+        observedStatus: result.status,
+        httpStatus: response.status,
+      }
     );
     return;
   }
   if (result.session_id !== state.remoteSessionId) {
     setRemoteSessionStatus(
       "other_device",
-      "リモートセッションが更新されました。再接続してください。"
+      "リモートセッションが更新されました。再接続してください。",
+      {
+        observer: "ping",
+        observedStatus: "session_id_mismatch",
+        httpStatus: response.status,
+      }
     );
     return;
   }
@@ -802,8 +837,17 @@ async function refreshRemoteFavorites() {
   return state.favorites;
 }
 
-function setRemoteSessionStatus(status, message) {
+function setRemoteSessionStatus(status, message, observation = {}) {
+  const previousSessionControl = remoteSessionControlOwner.snapshot;
   const sessionControl = remoteSessionControlOwner.transition(status, message);
+  const transitionEvent = remoteSessionTransitionTelemetry(
+    previousSessionControl,
+    sessionControl,
+    observation
+  );
+  // Persist the typed transition before cache invalidation or modal rendering. If either
+  // downstream side effect throws, diagnostics can still distinguish it from detection loss.
+  if (transitionEvent) enqueueTelemetry(transitionEvent);
   if (
     status === "local_in_use" ||
     status === "other_device" ||
@@ -906,7 +950,10 @@ function renderPinLogin(initialRemainingSeconds = 0) {
   applyRemoteSessionId("");
   state.screenContext = "pin";
   state.authenticated = false;
-  setRemoteSessionStatus("inactive", "");
+  setRemoteSessionStatus("inactive", "", {
+    observer: "auth",
+    observedStatus: "pin_required",
+  });
   state.remoteSessionOwner = null;
   telemetryState.authenticated = false;
   updateRemoteSessionOwnerBadge();
@@ -8390,6 +8437,10 @@ function installTelemetry() {
         resource: safeResourcePath(event.filename),
         line: event.lineno,
         column: event.colno,
+        error_event_kind:
+          event.error == null && event.message === "Script error."
+            ? "opaque_script_error"
+            : "exception",
       });
     },
     true
@@ -8438,7 +8489,12 @@ async function observedFetch(url, options = {}, sessionRecoveryAttempted = false
         if (sessionStatus) {
           setRemoteSessionStatus(
             sessionStatus,
-            detail.message || "操作権がありません。再接続してください。"
+            detail.message || "操作権がありません。再接続してください。",
+            {
+              observer: remoteSessionObserverForRequest(url),
+              observedStatus: detail.status || sessionStatus,
+              httpStatus: response.status,
+            }
           );
           if (
             !sessionRecoveryAttempted &&
@@ -8545,7 +8601,12 @@ async function pageResourceResponseError(response) {
     if (sessionStatus) {
       setRemoteSessionStatus(
         sessionStatus,
-        detail.message || "操作権がありません。再接続してください。"
+        detail.message || "操作権がありません。再接続してください。",
+        {
+          observer: "page_request",
+          observedStatus: detail.status || sessionStatus,
+          httpStatus: response.status,
+        }
       );
     }
   }
@@ -8566,6 +8627,17 @@ function remoteHeaders(initial = {}) {
   return headers;
 }
 
+function remoteSessionObserverForRequest(value) {
+  let path = "";
+  try {
+    path = new URL(value, location.origin).pathname;
+  } catch {}
+  if (path === "/api/video/state") return "video_poll";
+  if (path.startsWith("/api/video/")) return "video_request";
+  if (path === "/api/page") return "page_request";
+  return "api_request";
+}
+
 function loadRemoteClientId() {
   const key = "miv-remote-client-id";
   try {
@@ -8583,12 +8655,65 @@ function loadRemoteClientId() {
 
 function enqueueTelemetry(event) {
   if (!TELEMETRY_ENABLED || !telemetryState.authenticated) return;
-  telemetryState.queue.push({
-    client_event_timestamp_ms: Date.now(),
+  const stampedEvent = {
     ...event,
-  });
+    client_event_timestamp_ms: Date.now(),
+    client_event_sequence: telemetryState.nextSequence++,
+  };
+  if (
+    telemetryDeliveryMode(stampedEvent) === "immediate" &&
+    sendImmediateTelemetry(stampedEvent)
+  ) {
+    return;
+  }
+  queueTelemetryEvent(stampedEvent);
+}
+
+function queueTelemetryEvent(event, { first = false } = {}) {
+  if (first) telemetryState.queue.unshift(event);
+  else telemetryState.queue.push(event);
   if (telemetryState.queue.length > 200) {
-    telemetryState.queue.splice(0, telemetryState.queue.length - 200);
+    if (first) telemetryState.queue.splice(200);
+    else telemetryState.queue.splice(0, telemetryState.queue.length - 200);
+  }
+}
+
+function sendImmediateTelemetry(event) {
+  const body = telemetryPayloadBody([event]);
+  try {
+    if (
+      typeof navigator.sendBeacon === "function" &&
+      navigator.sendBeacon(
+        "/api/telemetry",
+        new Blob([body], { type: "application/json" })
+      )
+    ) {
+      return true;
+    }
+  } catch {}
+
+  // sendBeacon is available on the target mobile browsers. Keepalive fetch is the fallback
+  // for restricted/test environments; a failed attempt returns the same stamped event to the
+  // normal queue without minting a second sequence number.
+  try {
+    Promise.resolve(fetch("/api/telemetry", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body,
+      keepalive: true,
+    })).then((response) => {
+      if (!response.ok && response.status !== 429) {
+        queueTelemetryEvent(event, { first: true });
+        noteHudError();
+      }
+    }).catch(() => {
+      queueTelemetryEvent(event, { first: true });
+      noteHudError();
+    });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -8638,19 +8763,22 @@ async function flushTelemetry(useBeacon) {
 
 function takeTelemetryPayload() {
   const events = telemetryState.queue.splice(0, Math.min(24, telemetryState.queue.length));
+  let body = telemetryPayloadBody(events);
+  while (new Blob([body]).size > 60 * 1024 && events.length > 1) {
+    telemetryState.queue.unshift(events.pop());
+    body = telemetryPayloadBody(events);
+  }
+  return { events, body };
+}
+
+function telemetryPayloadBody(events) {
   const payload = {
     client_timestamp_ms: Date.now(),
     events,
   };
   const connection = connectionInfo();
   if (connection) payload.connection = connection;
-
-  let body = JSON.stringify(payload);
-  while (new Blob([body]).size > 60 * 1024 && events.length > 1) {
-    telemetryState.queue.unshift(events.pop());
-    body = JSON.stringify(payload);
-  }
-  return { events, body };
+  return JSON.stringify(payload);
 }
 
 function connectionInfo() {
@@ -8670,6 +8798,7 @@ function recordClientError(category, error, extra = {}) {
   enqueueTelemetry({
     type: "error",
     category,
+    error_name: normalized.name,
     message: normalized.message,
     stack: normalized.stack,
     ...extra,
@@ -8682,6 +8811,7 @@ function normalizeError(error) {
     error instanceof Error ? error.message : typeof error === "string" ? error : String(error);
   const stack = error instanceof Error ? error.stack : "";
   return {
+    name: limitText(redactTokenQuery(error instanceof Error ? error.name : typeof error), 120),
     message: limitText(redactTokenQuery(message), 800),
     stack: limitText(
       redactTokenQuery(stack)

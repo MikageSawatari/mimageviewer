@@ -36,6 +36,7 @@ import {
   remoteSessionAcquireRetryDelay,
   remoteSessionControlTransition,
   remoteSessionFailureStatus,
+  remoteSessionTransitionTelemetry,
   remoteStateGenerationTransition,
   reduceViewerTransform,
   resolveGridReturnViewport,
@@ -52,6 +53,7 @@ import {
   thumbnailRequestConcurrency,
   thumbnailRequestStartCount,
   thumbnailRetryDecision,
+  telemetryDeliveryMode,
   shouldShowGridCursor,
   shouldShowLoadingIndicator,
   shouldShowKeyboardShortcuts,
@@ -239,6 +241,88 @@ test("a host-disconnect response becomes one blocking control transition", () =>
   assert.equal(disconnected.status, "local_in_use");
   assert.equal(disconnected.blocksInteraction, true);
   assert.equal(disconnected.disconnectReason, "local_in_use");
+});
+
+test("session transition telemetry records the observer before UI side effects", () => {
+  const active = remoteSessionControlTransition(null, "active", "");
+  const disconnected = remoteSessionControlTransition(
+    active,
+    "local_in_use",
+    "本体で切断されました。再接続してください。"
+  );
+  assert.deepEqual(
+    remoteSessionTransitionTelemetry(active, disconnected, {
+      observer: "video_poll",
+      observedStatus: "local_in_use",
+      httpStatus: 409,
+      message: "must not be copied",
+      sessionId: "must-not-be-copied",
+    }),
+    {
+      type: "remote_session",
+      action: "control_transition",
+      observer: "video_poll",
+      observed_status: "local_in_use",
+      http_status: 409,
+      from_status: "active",
+      from_phase: "active",
+      from_blocks_interaction: false,
+      to_status: "local_in_use",
+      to_phase: "disconnected",
+      to_blocks_interaction: true,
+      disconnect_reason: "local_in_use",
+    }
+  );
+  assert.equal(
+    remoteSessionTransitionTelemetry(disconnected, disconnected, {
+      observer: "video_poll",
+      observedStatus: "local_in_use",
+      httpStatus: 409,
+    }),
+    null,
+    "repeated poll failures must not create immediate telemetry traffic"
+  );
+});
+
+test("session transition telemetry rejects unbounded observation values", () => {
+  const inactive = remoteSessionControlTransition(null, "inactive", "");
+  const acquiring = remoteSessionControlTransition(inactive, "acquiring", "");
+  const event = remoteSessionTransitionTelemetry(inactive, acquiring, {
+    observer: "/api/private/path?token=secret",
+    observedStatus: "secret-status",
+    httpStatus: 999,
+  });
+  assert.equal(event.observer, "client");
+  assert.equal(event.observed_status, "unknown");
+  assert.equal(event.http_status, null);
+  assert.doesNotMatch(JSON.stringify(event), /private|secret|token/);
+});
+
+test("only uncaught JS failures and actual session transitions are immediate", () => {
+  assert.equal(telemetryDeliveryMode({
+    type: "error",
+    category: "window_error",
+  }), "immediate");
+  assert.equal(telemetryDeliveryMode({
+    type: "error",
+    category: "unhandled_rejection",
+  }), "immediate");
+  assert.equal(telemetryDeliveryMode({
+    type: "remote_session",
+    action: "control_transition",
+  }), "immediate");
+  assert.equal(telemetryDeliveryMode({
+    type: "error",
+    category: "fetch_non_2xx",
+  }), "batch");
+  assert.equal(telemetryDeliveryMode({
+    type: "error",
+    category: "image_load_error",
+  }), "batch");
+  assert.equal(telemetryDeliveryMode({
+    type: "remote_session",
+    action: "acquire",
+  }), "batch");
 });
 
 test("session failure detection ignores feature-level 409 responses", () => {
