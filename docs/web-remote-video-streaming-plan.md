@@ -815,6 +815,28 @@ guard で、動画処理開始後の timeout 9 個には数えない。
   dispatch に統合した。`<video controls>` は使わず、シークバー、音量、画質 UI は自前 DOM とした。
   visibility 復帰時に session が失効していれば、表示中の全体動画位置を保持して start + seek する
 
+#### 実機停止是正: playback layer telemetry / runtime stall terminal (2026-08-06)
+
+- hls.js `ERROR` は `type` / `details` / `fatal`、HTTP status、fragment sequence/type と
+  video element の ready/network/error、buffered ahead、`hls.loadingEnabled` を telemetry に残す。
+  URL、response body、例外 message、remote session ID は載せない。fatal と video element error は即時送信、
+  non-fatal は同じ signature を 5 秒以内に重複送信しない
+- video element の `error` / `stalled` も再生層の event として記録する。hls.js 使用中の
+  media error は hls.js の typed `ERROR` が recovery authority、native HLS は video element が
+  terminal authority となる
+- runtime `waiting` は `playbackStallWatch` が一つだけ所有する。3 秒で従来の画質提案と
+  waiting snapshot を出し、`timeupdate` で実再生時刻が進むたびに terminal deadline を更新する。
+  表示中・再生要求中で generation switch 外にもかかわらず 15 秒進まなければ、即時 telemetry を
+  残して停止し、「現在位置から再接続」できる terminal 表示へ移る。hidden / generation switching
+  中は判定を延期し、意図的 pause / session block / ended は watch を解除する
+- 従来は非 HTTP の fatal HLS error で `stopLoad()` しても waiting timer を解除せず、fatal の
+  再接続表示を 3 秒 notice が上書きできた。fatal / native terminal / stall terminal はすべて
+  waiting owner を先に解除してから再接続表示へ入る
+- 2026-08-06 の実機ログでは `/api/video/seek` を伴わず、同一 generation の `seekable` 内を
+  動く local MSE seek 後に playlist/segment 取得だけが停止した。したがってこの再現は generation
+  switch 競合ではない。fatal の具体的 `type/details` は旧 telemetry には無く、上記計測で次回
+  再現時に確定する。buffer量の設定変更はこの是正には含めない
+
 #### 実機待ち時間是正 A: seek preview (2026-08-03)
 
 - protocol v18 の thumbnail request は UI thread で既存 worker の要求と cache snapshot だけを

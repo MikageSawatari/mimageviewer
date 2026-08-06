@@ -298,7 +298,7 @@ test("session transition telemetry rejects unbounded observation values", () => 
   assert.doesNotMatch(JSON.stringify(event), /private|secret|token/);
 });
 
-test("only uncaught JS failures and actual session transitions are immediate", () => {
+test("uncaught JS, terminal playback failures and session transitions are immediate", () => {
   assert.equal(telemetryDeliveryMode({
     type: "error",
     category: "window_error",
@@ -311,6 +311,13 @@ test("only uncaught JS failures and actual session transitions are immediate", (
     type: "remote_session",
     action: "control_transition",
   }), "immediate");
+  for (const category of [
+    "video_stream_hls_fatal",
+    "video_stream_media_element_error",
+    "video_stream_playback_stalled",
+  ]) {
+    assert.equal(telemetryDeliveryMode({ type: "error", category }), "immediate");
+  }
   assert.equal(telemetryDeliveryMode({
     type: "error",
     category: "fetch_non_2xx",
@@ -318,6 +325,10 @@ test("only uncaught JS failures and actual session transitions are immediate", (
   assert.equal(telemetryDeliveryMode({
     type: "error",
     category: "image_load_error",
+  }), "batch");
+  assert.equal(telemetryDeliveryMode({
+    type: "error",
+    category: "video_stream_hls_error",
   }), "batch");
   assert.equal(telemetryDeliveryMode({
     type: "remote_session",

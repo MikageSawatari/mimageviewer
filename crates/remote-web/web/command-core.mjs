@@ -227,7 +227,13 @@ export function telemetryDeliveryMode(event) {
   }
   if (
     event?.type === "error" &&
-    (event?.category === "window_error" || event?.category === "unhandled_rejection")
+    (
+      event?.category === "window_error" ||
+      event?.category === "unhandled_rejection" ||
+      event?.category === "video_stream_hls_fatal" ||
+      event?.category === "video_stream_media_element_error" ||
+      event?.category === "video_stream_playback_stalled"
+    )
   ) {
     return "immediate";
   }

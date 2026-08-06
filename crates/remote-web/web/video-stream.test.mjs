@@ -7,10 +7,12 @@ import {
   VideoSeekPreviewOwner,
   VideoStreamViewer,
   hlsBufferConfig,
+  hlsErrorTelemetryDetails,
   preventVideoNativeZoom,
   resolveVideoPlaylist,
   videoAudioProcessingPresentation,
   videoEndDecision,
+  videoPlaybackStallDecision,
   videoUserErrorMessage,
 } from "./video-stream.mjs";
 
@@ -187,6 +189,216 @@ test("hls.js starts at the requested generation origin and uses every buffer lim
     startPosition: 0,
     startOnSegmentBoundary: true,
   });
+});
+
+test("hls error telemetry keeps typed playback facts and drops URLs and exception text", () => {
+  const ranges = {
+    length: 1,
+    start: () => 10,
+    end: () => 42.5,
+  };
+  const details = hlsErrorTelemetryDetails({
+    type: "mediaError",
+    details: "bufferAppendError",
+    fatal: true,
+    error: {
+      name: "QuotaExceededError",
+      message: "secret https://example.test/stream/session-id/media.m3u8?t=token",
+    },
+    frag: {
+      sn: 91,
+      type: "main",
+      url: "https://example.test/private/movie.m4s",
+    },
+  }, {
+    currentTime: 40,
+    readyState: 2,
+    networkState: 2,
+    error: { code: 3 },
+    buffered: ranges,
+    seekable: ranges,
+  });
+
+  assert.deepEqual(details, {
+    hls_error_type: "mediaError",
+    hls_error_details: "bufferAppendError",
+    fatal: true,
+    http_status: null,
+    error_name: "QuotaExceededError",
+    fragment_type: "main",
+    fragment_sequence: 91,
+    ready_state: 2,
+    network_state: 2,
+    media_error_code: 3,
+    current_time_secs: 40,
+    buffered_range_count: 1,
+    buffered_ahead_secs: 2.5,
+    seekable_range_count: 1,
+  });
+  assert.doesNotMatch(JSON.stringify(details), /example|private|secret|session-id|token/);
+});
+
+test("playback issue reports omit the remote session credential", () => {
+  const reports = [];
+  const viewer = {
+    session: "remote-session-secret",
+    generation: 6,
+    reportPlaybackIssue: (report) => reports.push(report),
+  };
+
+  VideoStreamViewer.prototype.recordPlaybackIssue.call(
+    viewer,
+    "video_stream_hls_fatal",
+    "hls_error_event",
+    { hls_error_details: "bufferAppendError" }
+  );
+
+  assert.deepEqual(reports, [{
+    category: "video_stream_hls_fatal",
+    internalReason: "hls_error_event",
+    generation: 6,
+    hls_error_details: "bufferAppendError",
+  }]);
+  assert.doesNotMatch(JSON.stringify(reports), /remote-session-secret/);
+});
+
+test("runtime waiting has one bounded terminal instead of an infinite buffering notice", () => {
+  assert.deepEqual(videoPlaybackStallDecision({
+    active: true,
+    playRequested: true,
+    elapsedSinceProgressMs: 14999,
+    timeoutMs: 15000,
+  }), { kind: "waiting", retryDelayMs: 1 });
+  assert.deepEqual(videoPlaybackStallDecision({
+    active: true,
+    playRequested: true,
+    elapsedSinceProgressMs: 15000,
+    timeoutMs: 15000,
+  }), {
+    kind: "stalled",
+    internalReason: "playback_progress_timeout",
+    timeoutMs: 15000,
+  });
+  assert.equal(videoPlaybackStallDecision({
+    active: true,
+    playRequested: false,
+    elapsedSinceProgressMs: 20000,
+  }).kind, "cancel");
+  assert.equal(videoPlaybackStallDecision({
+    active: true,
+    playRequested: true,
+    hidden: true,
+    elapsedSinceProgressMs: 20000,
+  }).kind, "defer");
+  assert.equal(videoPlaybackStallDecision({
+    active: true,
+    playRequested: true,
+    switching: true,
+    elapsedSinceProgressMs: 20000,
+  }).kind, "defer");
+});
+
+test("terminal playback failure clears the waiting owner before showing reconnect", () => {
+  const calls = [];
+  let reconnect;
+  const viewer = {
+    playRequested: true,
+    currentPosition: () => 42.5,
+    clearPlaybackStartupWatch: () => calls.push("clear_startup"),
+    clearWaiting: () => calls.push("clear_waiting"),
+    hls: { stopLoad: () => calls.push("stop_load") },
+    video: { pause: () => calls.push("pause") },
+    showNotice: (message, kind, actionLabel, action) => {
+      calls.push([message, kind, actionLabel]);
+      reconnect = action;
+    },
+    restartAt: (...args) => calls.push(["restart", ...args]),
+  };
+
+  VideoStreamViewer.prototype.finishPlaybackLayerFailure.call(
+    viewer,
+    "動画の再生が停止しました。"
+  );
+  assert.deepEqual(calls, [
+    "clear_startup",
+    "clear_waiting",
+    "stop_load",
+    "pause",
+    ["動画の再生が停止しました。", "error", "現在位置から再接続"],
+  ]);
+  reconnect();
+  assert.deepEqual(calls.at(-1), ["restart", 42.5, true]);
+});
+
+test("fatal hls errors are recorded before entering the reconnect terminal", () => {
+  const calls = [];
+  const source = {};
+  const viewer = {
+    destroyed: false,
+    hls: source,
+    video: {
+      currentTime: 42.5,
+      readyState: 2,
+      networkState: 2,
+      buffered: { length: 0 },
+      seekable: { length: 0 },
+    },
+    hlsErrorTelemetryAt: new Map(),
+    playbackLayerDiagnostics: () => ({ hls_loading_enabled: false }),
+    recordPlaybackIssue: (...args) => calls.push(["telemetry", ...args]),
+    clearPlaybackStartupWatch: () => calls.push(["clear_startup"]),
+    finishPlaybackLayerFailure: (message) => calls.push(["terminal", message]),
+  };
+
+  VideoStreamViewer.prototype.onHlsError.call(viewer, source, {
+    type: "mediaError",
+    details: "bufferAppendError",
+    fatal: true,
+    error: { name: "QuotaExceededError" },
+  });
+
+  assert.equal(calls[0][0], "telemetry");
+  assert.equal(calls[0][1], "video_stream_hls_fatal");
+  assert.equal(calls[0][3].hls_error_details, "bufferAppendError");
+  assert.deepEqual(calls.slice(1), [
+    ["clear_startup"],
+    ["terminal", "動画を再生できませんでした。もう一度お試しください。"],
+  ]);
+});
+
+test("an attached visible playback with no progress reaches the reconnect terminal", () => {
+  const now = performance.now();
+  const watch = {
+    generation: 8,
+    startedAt: now - 16000,
+    lastProgressAt: now - 15001,
+    trigger: "waiting",
+    terminalTimer: 1,
+  };
+  const calls = [];
+  const viewer = {
+    destroyed: false,
+    playbackStallWatch: watch,
+    generation: 8,
+    playRequested: true,
+    video: { ended: false },
+    remoteSessionState: { blocksInteraction: false },
+    generationSwitch: { isSwitching: () => false },
+    playbackLayerDiagnostics: () => ({ hls_loading_enabled: false }),
+    recordPlaybackIssue: (...args) => calls.push(["telemetry", ...args]),
+    finishPlaybackLayerFailure: (message) => calls.push(["terminal", message]),
+  };
+
+  VideoStreamViewer.prototype.checkPlaybackStall.call(viewer, watch);
+
+  assert.equal(calls[0][0], "telemetry");
+  assert.equal(calls[0][1], "video_stream_playback_stalled");
+  assert.equal(calls[0][2], "playback_progress_timeout");
+  assert.equal(calls[0][3].hls_loading_enabled, false);
+  assert.deepEqual(calls[1], [
+    "terminal",
+    "動画の再生が停止しました。現在位置から再接続できます。",
+  ]);
 });
 
 test("seek preview advances from seeking through decoded thumbnail to playback", () => {

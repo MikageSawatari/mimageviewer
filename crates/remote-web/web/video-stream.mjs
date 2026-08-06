@@ -26,6 +26,7 @@ const HLS_MIME = "application/vnd.apple.mpegurl";
 const HLS_SCRIPT_PATH = "/vendor/hls.min.js";
 const VIDEO_STATE_POLL_MS = 1000;
 const WAITING_SUGGESTION_MS = 3000;
+const PLAYBACK_STALL_TIMEOUT_MS = 15000;
 const STARTUP_MEDIA_SEGMENT_TIMEOUT_MS = 15000;
 const PLAYLIST_RECOVERY_TIMEOUT_MS = 15000;
 const PLAYLIST_RECOVERY_BACKOFF_BASE_MS = 250;
@@ -207,6 +208,80 @@ function hlsHttpErrorCode(data) {
     try { body = JSON.parse(body); } catch { return ""; }
   }
   return typeof body?.error === "string" ? body.error : "";
+}
+
+function boundedTelemetryEnum(value, fallback = "unknown") {
+  const normalized = String(value ?? "");
+  return /^[A-Za-z0-9_.:-]{1,120}$/.test(normalized) ? normalized : fallback;
+}
+
+function mediaRangeMetrics(ranges, currentTimeSecs) {
+  const current = Math.max(0, Number(currentTimeSecs) || 0);
+  let count = 0;
+  let ahead = 0;
+  try {
+    count = Math.max(0, Number(ranges?.length) || 0);
+    for (let index = 0; index < count; index += 1) {
+      const start = Number(ranges.start(index));
+      const end = Number(ranges.end(index));
+      if (Number.isFinite(start) && Number.isFinite(end) && current >= start && current <= end) {
+        ahead = Math.max(0, end - current);
+        break;
+      }
+    }
+  } catch {}
+  return {
+    count,
+    aheadSecs: Math.round(ahead * 1000) / 1000,
+  };
+}
+
+/// Keep hls.js diagnostics useful without copying URLs, response bodies or exception text.
+export function hlsErrorTelemetryDetails(data = {}, media = {}) {
+  const currentTimeSecs = Math.max(0, Number(media.currentTime) || 0);
+  const buffered = mediaRangeMetrics(media.buffered, currentTimeSecs);
+  const seekable = mediaRangeMetrics(media.seekable, currentTimeSecs);
+  const fragmentSequence = Number(data?.frag?.sn);
+  return {
+    hls_error_type: boundedTelemetryEnum(data?.type),
+    hls_error_details: boundedTelemetryEnum(data?.details),
+    fatal: Boolean(data?.fatal),
+    http_status: hlsHttpStatus(data) || null,
+    error_name: boundedTelemetryEnum(data?.error?.name, ""),
+    fragment_type: boundedTelemetryEnum(data?.frag?.type, ""),
+    fragment_sequence: Number.isFinite(fragmentSequence) ? fragmentSequence : null,
+    ready_state: Math.max(0, Number(media.readyState) || 0),
+    network_state: Math.max(0, Number(media.networkState) || 0),
+    media_error_code: Math.max(0, Number(media.error?.code) || 0),
+    current_time_secs: Math.round(currentTimeSecs * 1000) / 1000,
+    buffered_range_count: buffered.count,
+    buffered_ahead_secs: buffered.aheadSecs,
+    seekable_range_count: seekable.count,
+  };
+}
+
+export function videoPlaybackStallDecision({
+  active = false,
+  playRequested = false,
+  ended = false,
+  blocked = false,
+  hidden = false,
+  switching = false,
+  elapsedSinceProgressMs = 0,
+  timeoutMs = PLAYBACK_STALL_TIMEOUT_MS,
+} = {}) {
+  if (!active || !playRequested || ended || blocked) return { kind: "cancel" };
+  if (hidden || switching) return { kind: "defer", retryDelayMs: 1000 };
+  const timeout = Math.max(1, Number(timeoutMs) || 1);
+  const elapsed = Math.max(0, Number(elapsedSinceProgressMs) || 0);
+  if (elapsed < timeout) {
+    return { kind: "waiting", retryDelayMs: Math.max(1, timeout - elapsed) };
+  }
+  return {
+    kind: "stalled",
+    internalReason: "playback_progress_timeout",
+    timeoutMs: timeout,
+  };
 }
 
 function formatVideoTime(value) {
@@ -1257,8 +1332,8 @@ export class VideoStreamViewer {
     this.draggingSeek = false;
     this.hls = null;
     this.pollTimer = 0;
-    this.waitingTimer = 0;
-    this.waitingSince = null;
+    this.playbackStallWatch = null;
+    this.hlsErrorTelemetryAt = new Map();
     this.startupWatch = null;
     this.noticeKind = "";
     this.abortController = new AbortController();
@@ -1397,6 +1472,7 @@ export class VideoStreamViewer {
     });
 
     this.onTimeUpdate = () => {
+      this.notePlaybackProgress();
       this.checkPlaybackStartupProgress();
       this.updateProgress();
       this.handlePlaybackBoundary(false);
@@ -1414,32 +1490,38 @@ export class VideoStreamViewer {
       this.checkPlaybackStartupProgress();
       if (!this.playRequested) this.finishSeekPreviewForAttachedGeneration();
     };
-    this.onWaiting = () => this.beginWaiting();
+    this.onWaiting = () => this.beginWaiting("waiting");
+    this.onStalled = () => {
+      if (this.generationSwitch.isSwitching()) return;
+      this.recordPlaybackIssue(
+        "video_stream_media_stalled",
+        "media_element_stalled",
+        this.playbackLayerDiagnostics()
+      );
+      this.beginWaiting("stalled");
+    };
     this.onEnded = () => this.handlePlaybackBoundary(true);
-    this.onNativeError = () => {
+    this.onMediaError = () => {
       if (
-        !this.destroyed &&
-        !this.remoteSessionState.blocksInteraction &&
-        !this.hls &&
-        !this.generationSwitch.isSwitching()
-      ) {
-        const startup = this.startupWatch;
+        this.destroyed ||
+        this.remoteSessionState.blocksInteraction ||
+        this.generationSwitch.isSwitching()
+      ) return;
+      const startup = this.startupWatch;
+      this.recordPlaybackIssue(
+        "video_stream_media_element_error",
+        "media_element_error",
+        {
+          ...this.playbackLayerDiagnostics(),
+          playback_mode: startup?.mode ?? (this.hls ? "hls_js" : "native"),
+        }
+      );
+      // hls.js owns its MediaSource recovery and emits a typed ERROR event as the authority.
+      // Native HLS has no such owner, so the media element error is terminal here.
+      if (!this.hls && !this.generationSwitch.isSwitching()) {
         this.clearPlaybackStartupWatch();
-        this.recordPlaybackIssue(
-          "video_stream_native_playback_error",
-          "native_hls_media_error",
-          {
-            playback_mode: startup?.mode ?? "native",
-            ready_state: Number(this.video.readyState) || 0,
-            network_state: Number(this.video.networkState) || 0,
-            media_error_code: Number(this.video.error?.code) || 0,
-          }
-        );
-        this.showNotice(
-          "再生データを読み込めません。現在位置から再接続できます。",
-          "error",
-          "再接続",
-          () => this.restartAt(this.currentPosition())
+        this.finishPlaybackLayerFailure(
+          "再生データを読み込めません。現在位置から再接続できます。"
         );
       }
     };
@@ -1448,8 +1530,9 @@ export class VideoStreamViewer {
     this.video.addEventListener("canplay", this.onCanPlay);
     this.video.addEventListener("loadeddata", this.onLoadedData);
     this.video.addEventListener("waiting", this.onWaiting);
+    this.video.addEventListener("stalled", this.onStalled);
     this.video.addEventListener("ended", this.onEnded);
-    this.video.addEventListener("error", this.onNativeError);
+    this.video.addEventListener("error", this.onMediaError);
 
     this.pointerDown = (event) => this.onPointerDown(event);
     this.pointerMove = (event) => this.onPointerMove(event);
@@ -1814,6 +1897,7 @@ export class VideoStreamViewer {
       xhrSetup(xhr) { xhr.withCredentials = true; },
     });
     this.hls = hls;
+    this.hlsErrorTelemetryAt.clear();
     hls.on(Hls.Events.ERROR, (_event, data) => this.onHlsError(hls, data));
     hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
       if (data?.frag && data.frag.sn !== "initSegment") {
@@ -1829,6 +1913,26 @@ export class VideoStreamViewer {
   onHlsError(source, data) {
     if (this.destroyed || this.hls !== source) return;
     const status = hlsHttpStatus(data);
+    const telemetryDetails = {
+      ...hlsErrorTelemetryDetails(data, this.video),
+      ...this.playbackLayerDiagnostics(),
+    };
+    const signature = [
+      telemetryDetails.hls_error_type,
+      telemetryDetails.hls_error_details,
+      telemetryDetails.fatal,
+      telemetryDetails.http_status,
+    ].join(":");
+    const now = performance.now();
+    const lastReportedAt = this.hlsErrorTelemetryAt.get(signature) ?? -Infinity;
+    if (data?.fatal || now - lastReportedAt >= 5000) {
+      this.hlsErrorTelemetryAt.set(signature, now);
+      this.recordPlaybackIssue(
+        data?.fatal ? "video_stream_hls_fatal" : "video_stream_hls_error",
+        "hls_error_event",
+        telemetryDetails
+      );
+    }
     if (status) {
       const decision = videoHttpStatusDecision(
         status,
@@ -1857,6 +1961,7 @@ export class VideoStreamViewer {
       }
       if (decision.kind === "gone" || decision.kind === "not_found") {
         this.clearPlaybackStartupWatch();
+        this.clearWaiting();
         this.hls?.stopLoad();
         this.video.pause();
         this.showStatusDecision(decision);
@@ -1865,12 +1970,8 @@ export class VideoStreamViewer {
     }
     if (!data?.fatal) return;
     this.clearPlaybackStartupWatch();
-    this.hls?.stopLoad();
-    this.showNotice(
+    this.finishPlaybackLayerFailure(
       "動画を再生できませんでした。もう一度お試しください。",
-      "error",
-      "再接続",
-      () => this.restartAt(this.currentPosition())
     );
   }
 
@@ -1954,7 +2055,10 @@ export class VideoStreamViewer {
     }
     if (this.lastState) this.lastState.play_intent = this.playRequested;
     if (this.playRequested) await this.playIfRequested();
-    else this.video.pause();
+    else {
+      this.clearWaiting();
+      this.video.pause();
+    }
   }
 
   handlePlaybackBoundary(ended) {
@@ -2288,6 +2392,7 @@ export class VideoStreamViewer {
     this.codecs = String(mediaState.codecs ?? this.codecs);
     this.updateAudioProcessing(mediaState.audio_processing, true);
     this.playRequested = Boolean(mediaState.play_intent);
+    if (!this.playRequested) this.clearWaiting();
     this.seekInput.max = String(this.duration);
     if (
       shouldReanchorVideoTimeline({
@@ -2511,15 +2616,61 @@ export class VideoStreamViewer {
     }
   }
 
-  beginWaiting() {
-    if (this.destroyed || this.waitingSince !== null) return;
-    this.waitingSince = performance.now();
-    clearTimeout(this.waitingTimer);
-    this.waitingTimer = setTimeout(() => {
-      this.waitingTimer = 0;
-      if (this.waitingSince === null || this.destroyed) return;
+  playbackLayerDiagnostics() {
+    const currentTimeSecs = Math.max(0, Number(this.video.currentTime) || 0);
+    const buffered = mediaRangeMetrics(this.video.buffered, currentTimeSecs);
+    const seekable = mediaRangeMetrics(this.video.seekable, currentTimeSecs);
+    const numericLevel = (value) => Number.isFinite(Number(value)) ? Number(value) : null;
+    return {
+      playback_mode: this.hls ? "hls_js" : "native",
+      ready_state: Math.max(0, Number(this.video.readyState) || 0),
+      network_state: Math.max(0, Number(this.video.networkState) || 0),
+      media_error_code: Math.max(0, Number(this.video.error?.code) || 0),
+      paused: Boolean(this.video.paused),
+      ended: Boolean(this.video.ended),
+      current_time_secs: Math.round(currentTimeSecs * 1000) / 1000,
+      buffered_range_count: buffered.count,
+      buffered_ahead_secs: buffered.aheadSecs,
+      seekable_range_count: seekable.count,
+      hls_loading_enabled: this.hls ? Boolean(this.hls.loadingEnabled) : null,
+      hls_buffering_enabled: this.hls ? Boolean(this.hls.bufferingEnabled) : null,
+      hls_current_level: this.hls ? numericLevel(this.hls.currentLevel) : null,
+      hls_load_level: this.hls ? numericLevel(this.hls.loadLevel) : null,
+      generation_switching: this.generationSwitch.isSwitching(),
+    };
+  }
+
+  beginWaiting(trigger = "waiting") {
+    if (
+      this.destroyed ||
+      this.playbackStallWatch !== null ||
+      this.generationSwitch.isSwitching()
+    ) return;
+    const startedAt = performance.now();
+    const watch = {
+      trigger: boundedTelemetryEnum(trigger),
+      generation: this.generation,
+      startedAt,
+      lastProgressAt: startedAt,
+      lastMediaTimeSecs: Math.max(0, Number(this.video.currentTime) || 0),
+      warningTimer: 0,
+      terminalTimer: 0,
+    };
+    this.playbackStallWatch = watch;
+    watch.warningTimer = setTimeout(() => {
+      watch.warningTimer = 0;
+      if (this.playbackStallWatch !== watch || this.destroyed) return;
+      this.recordPlaybackIssue(
+        "video_stream_playback_waiting",
+        "playback_waiting_warning",
+        {
+          ...this.playbackLayerDiagnostics(),
+          waiting_trigger: watch.trigger,
+          elapsed_ms: Math.round(performance.now() - watch.startedAt),
+        }
+      );
       const suggested = bufferingQualitySuggestion({
-        waitingSinceMs: this.waitingSince,
+        waitingSinceMs: watch.startedAt,
         nowMs: performance.now(),
         quality: this.quality,
         thresholdMs: WAITING_SUGGESTION_MS,
@@ -2538,6 +2689,83 @@ export class VideoStreamViewer {
         this.showNotice("通信待ちが 3 秒続いています。", "buffering");
       }
     }, WAITING_SUGGESTION_MS);
+    this.schedulePlaybackStallCheck(watch, PLAYBACK_STALL_TIMEOUT_MS);
+  }
+
+  notePlaybackProgress() {
+    const watch = this.playbackStallWatch;
+    if (!watch) return;
+    const currentTimeSecs = Math.max(0, Number(this.video.currentTime) || 0);
+    if (Math.abs(currentTimeSecs - watch.lastMediaTimeSecs) < 0.05) return;
+    watch.lastMediaTimeSecs = currentTimeSecs;
+    watch.lastProgressAt = performance.now();
+    this.schedulePlaybackStallCheck(watch, PLAYBACK_STALL_TIMEOUT_MS);
+  }
+
+  schedulePlaybackStallCheck(watch, delayMs) {
+    clearTimeout(watch.terminalTimer);
+    watch.terminalTimer = setTimeout(
+      () => this.checkPlaybackStall(watch),
+      Math.max(1, Number(delayMs) || 1)
+    );
+  }
+
+  checkPlaybackStall(watch) {
+    if (this.destroyed || this.playbackStallWatch !== watch) return;
+    watch.terminalTimer = 0;
+    if (watch.generation !== this.generation) {
+      this.clearWaiting();
+      return;
+    }
+    const now = performance.now();
+    const decision = videoPlaybackStallDecision({
+      active: true,
+      playRequested: this.playRequested,
+      ended: this.video.ended,
+      blocked: this.remoteSessionState.blocksInteraction,
+      hidden: globalThis.document?.visibilityState === "hidden",
+      switching: this.generationSwitch.isSwitching(),
+      elapsedSinceProgressMs: now - watch.lastProgressAt,
+      timeoutMs: PLAYBACK_STALL_TIMEOUT_MS,
+    });
+    if (decision.kind === "cancel") {
+      this.clearWaiting();
+      return;
+    }
+    if (decision.kind === "defer" || decision.kind === "waiting") {
+      this.schedulePlaybackStallCheck(watch, decision.retryDelayMs);
+      return;
+    }
+
+    this.recordPlaybackIssue(
+      "video_stream_playback_stalled",
+      decision.internalReason,
+      {
+        ...this.playbackLayerDiagnostics(),
+        waiting_trigger: watch.trigger,
+        timeout_ms: decision.timeoutMs,
+        elapsed_ms: Math.round(now - watch.startedAt),
+        elapsed_since_progress_ms: Math.round(now - watch.lastProgressAt),
+      }
+    );
+    this.finishPlaybackLayerFailure(
+      "動画の再生が停止しました。現在位置から再接続できます。"
+    );
+  }
+
+  finishPlaybackLayerFailure(message) {
+    const positionSecs = this.currentPosition();
+    const restorePlaying = this.playRequested;
+    this.clearPlaybackStartupWatch();
+    this.clearWaiting();
+    this.hls?.stopLoad();
+    this.video.pause();
+    this.showNotice(
+      message,
+      "error",
+      "現在位置から再接続",
+      () => this.restartAt(positionSecs, restorePlaying)
+    );
   }
 
   beginPlaybackStartupWatch(mode) {
@@ -2626,7 +2854,6 @@ export class VideoStreamViewer {
       this.reportPlaybackIssue({
         category,
         internalReason,
-        session: this.session,
         generation: this.generation,
         ...details,
       });
@@ -2634,9 +2861,12 @@ export class VideoStreamViewer {
   }
 
   clearWaiting() {
-    clearTimeout(this.waitingTimer);
-    this.waitingTimer = 0;
-    this.waitingSince = null;
+    const watch = this.playbackStallWatch;
+    if (watch) {
+      clearTimeout(watch.warningTimer);
+      clearTimeout(watch.terminalTimer);
+    }
+    this.playbackStallWatch = null;
     if (this.noticeKind === "buffering" || this.noticeKind === "waiting") {
       this.hideNotice();
     }
@@ -2809,7 +3039,7 @@ export class VideoStreamViewer {
     this.clearSeekThumbnailObjectUrl();
     this.generationSwitch.cancel();
     this.clearPoll();
-    clearTimeout(this.waitingTimer);
+    this.clearWaiting();
     for (const timer of this.pendingTimers) clearTimeout(timer);
     this.pendingTimers.clear();
     this.stopPlaylistPlayback();
@@ -2818,8 +3048,9 @@ export class VideoStreamViewer {
     this.video.removeEventListener("canplay", this.onCanPlay);
     this.video.removeEventListener("loadeddata", this.onLoadedData);
     this.video.removeEventListener("waiting", this.onWaiting);
+    this.video.removeEventListener("stalled", this.onStalled);
     this.video.removeEventListener("ended", this.onEnded);
-    this.video.removeEventListener("error", this.onNativeError);
+    this.video.removeEventListener("error", this.onMediaError);
     this.stage.removeEventListener("pointerdown", this.pointerDown);
     this.stage.removeEventListener("pointermove", this.pointerMove);
     this.stage.removeEventListener("pointerup", this.pointerUp);

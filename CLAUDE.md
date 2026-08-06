@@ -667,8 +667,10 @@ print(c.most_common())
 - **`/api/telemetry` はセッション取得を要求しない** (`route_requires_remote_session`
   の除外)。**本体が切断した後でも端末のログは届く。** 切断まわりの調査に使える
 - 通常の telemetry は間隔でまとめて送る。一方、`window_error` /
-  `unhandled_rejection` と `remote_session` の `control_transition` は、その JS turn
-  で `sendBeacon` (非対応時は keepalive fetch) へ渡す。各 event の
+  `unhandled_rejection`、terminal な動画再生層 error (`video_stream_hls_fatal` /
+  `video_stream_media_element_error` / `video_stream_playback_stalled`) と
+  `remote_session` の `control_transition` は、その JS turn で `sendBeacon`
+  (非対応時は keepalive fetch) へ渡す。各 event の
   `client_event_sequence` で、別リクエストになった transition と例外の前後を復元できる
 - セッション transition は `observer` (`ping` / `video_poll` / `acquire` など)、
   `observed_status` / `http_status`、遷移前後の status / phase /
