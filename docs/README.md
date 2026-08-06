@@ -25,6 +25,7 @@
 | [top-level-grid-view.md](top-level-grid-view.md) | 検索・★固定・サブ展開・スマートフォルダ等の最上位一覧 ownership / 復元 snapshot と、スマートフォルダ root / scoped drill の不変条件 |
 | [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md) | フルスクリーン / 検索結果 / 動画タイルをまたぐ Ctrl+↑↓・境界ヒント・前後移動の統一仕様メモ |
 | [keymap-spec.md](keymap-spec.md) + [key-customization-impl-plan.md](key-customization-impl-plan.md) + [key-command-catalog-plan.md](key-command-catalog-plan.md) | キーボード操作 / ショートカット / `consume_key` / `key_pressed` / native VK 判定 / コマンドカタログ化を触るとき。新しいキー操作は keymap 対応要否を必ず確認 |
+| [touch-support-plan.md](touch-support-plan.md) | **調査完了・設計検討中 / 未実装**。タブレット PC のタッチ操作対応。タッチ入力が winit / egui-winit のどこまで届いているか、ホバー依存 UI の棚卸し、競合 NeeView の方式、3 領域タップ + 中央クローム + anchor-fraction スクロール + ピンチの設計案とフェーズ別工数。タッチ / ポインタ入力を触るときに読む |
 
 ## 仕様・機能
 
