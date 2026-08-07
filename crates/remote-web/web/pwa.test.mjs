@@ -426,6 +426,20 @@ test("video owns repeated taps and pinch without allowing native page zoom", asy
   assert.match(video, /removeEventListener\("dblclick", this\.nativeGesture\)/);
 });
 
+test("video relative seek keeps native range semantics and a full touch hit area", async () => {
+  const css = await readFile(new URL("styles.css", here), "utf8");
+  const video = await readFile(new URL("video-stream.mjs", here), "utf8");
+  assert.match(video, /this\.seekInput\.type = "range"/);
+  assert.match(video, /this\.seekInput\.setAttribute\("aria-label", "動画の再生位置"\)/);
+  assert.match(video, /this\.seekInput\.setAttribute\("aria-valuetext", this\.counter\.value\)/);
+  assert.match(video, /addEventListener\("pointerdown", this\.onSeekPointerDown\)/);
+  assert.match(video, /removeEventListener\("pointerdown", this\.onSeekPointerDown\)/);
+  assert.match(
+    css,
+    /\.video-stream-seek \.viewer-seek-input\s*\{[^}]*height:\s*44px/
+  );
+});
+
 async function pngDimensions(relativePath) {
   const bytes = await readFile(new URL(relativePath, here));
   assert.deepEqual(

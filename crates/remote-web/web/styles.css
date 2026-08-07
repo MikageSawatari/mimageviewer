@@ -1142,6 +1142,10 @@ button {
   touch-action: none;
 }
 
+.video-stream-seek .viewer-seek-input {
+  height: 44px;
+}
+
 .viewer-seek-input[hidden] {
   display: none;
 }

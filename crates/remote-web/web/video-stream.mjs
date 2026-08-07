@@ -6,6 +6,7 @@ import {
   ViewerPanelAction,
   bufferingQualitySuggestion,
   command,
+  relativeRangeDragValue,
   videoAbsoluteSeekCommand,
   videoHttpStatusDecision,
   videoPlaybackDecision,
@@ -80,6 +81,25 @@ export function preventVideoNativeZoom(event) {
   if (!event?.cancelable) return false;
   event.preventDefault?.();
   return true;
+}
+
+export function videoSeekRelativeDragValue({
+  startPositionSecs = 0,
+  startClientX = 0,
+  currentClientX = 0,
+  trackWidth = 0,
+  durationSecs = 0,
+  stepSecs = 0.1,
+} = {}) {
+  return relativeRangeDragValue({
+    startValue: startPositionSecs,
+    startClientX,
+    currentClientX,
+    trackWidth,
+    min: 0,
+    max: Math.max(0, Number(durationSecs) || 0),
+    step: Math.max(0.001, Number(stepSecs) || 0.1),
+  });
 }
 
 function normalizedVideoLoopBoundaries(behavior) {
@@ -1564,7 +1584,7 @@ export class VideoStreamViewer {
     this.barsVisible = true;
     this.destroyed = false;
     this.restarting = false;
-    this.draggingSeek = false;
+    this.seekDragState = { kind: "idle" };
     this.hls = null;
     this.pollTimer = 0;
     this.healthTelemetryTimer = 0;
@@ -1695,21 +1715,23 @@ export class VideoStreamViewer {
     next.addEventListener("click", (event) => {
       send(event, command(CommandName.NEXT_PAGE), "toolbar");
     });
-    this.seekInput.addEventListener("input", () => {
-      this.draggingSeek = true;
-      const target = Number(this.seekInput.value);
-      this.updateCounter(target);
-      this.beginSeekPreview(target, "移動先を確認中");
-    });
-    this.seekInput.addEventListener("change", (event) => {
-      const target = Number(this.seekInput.value);
-      this.draggingSeek = false;
-      send(
-        event,
-        videoAbsoluteSeekCommand(target),
-        "seek_bar"
-      );
-    });
+    this.onSeekInput = (event) => this.handleSeekInput(event);
+    this.onSeekChange = (event) => this.handleSeekChange(event);
+    this.onSeekPointerDown = (event) => this.beginSeekPointerDrag(event);
+    this.onSeekPointerMove = (event) => this.updateSeekPointerDrag(event);
+    this.onSeekPointerUp = (event) => this.finishSeekPointerDrag(event, false);
+    this.onSeekPointerCancel = (event) => this.finishSeekPointerDrag(event, true);
+    this.onSeekClick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    this.seekInput.addEventListener("input", this.onSeekInput);
+    this.seekInput.addEventListener("change", this.onSeekChange);
+    this.seekInput.addEventListener("pointerdown", this.onSeekPointerDown);
+    this.seekInput.addEventListener("pointermove", this.onSeekPointerMove);
+    this.seekInput.addEventListener("pointerup", this.onSeekPointerUp);
+    this.seekInput.addEventListener("pointercancel", this.onSeekPointerCancel);
+    this.seekInput.addEventListener("click", this.onSeekClick);
 
     this.onTimeUpdate = () => {
       this.notePlaybackProgress();
@@ -1821,6 +1843,127 @@ export class VideoStreamViewer {
     this.captureVideoHealth("hud");
   }
 
+  get draggingSeek() {
+    return this.seekDragState.kind !== "idle";
+  }
+
+  handleSeekInput(event) {
+    event.stopPropagation();
+    const pointerDrag = this.seekDragState.kind === "pointer"
+      ? this.seekDragState
+      : null;
+    if (pointerDrag) {
+      this.seekInput.value = String(pointerDrag.targetPositionSecs);
+      this.updateCounter(pointerDrag.targetPositionSecs);
+      return;
+    }
+    this.seekDragState = { kind: "native" };
+    const target = Number(this.seekInput.value);
+    this.updateCounter(target);
+    this.beginSeekPreview(target, "移動先を確認中");
+  }
+
+  handleSeekChange(event) {
+    event.stopPropagation();
+    if (this.seekDragState.kind === "pointer") return;
+    const target = Number(this.seekInput.value);
+    this.seekDragState = { kind: "idle" };
+    this.dispatch(videoAbsoluteSeekCommand(target), {
+      source: this.inputSource(event),
+      detail: "seek_bar",
+    });
+  }
+
+  beginSeekPointerDrag(event) {
+    event.stopPropagation();
+    if (this.seekInput.disabled || event.isPrimary === false) return;
+    if (typeof event.button === "number" && event.button !== 0) return;
+    if (event.cancelable) event.preventDefault();
+    const trackWidth = this.seekInput.getBoundingClientRect().width;
+    const startPositionSecs = videoSeekRelativeDragValue({
+      startPositionSecs: Number(this.seekInput.value),
+      startClientX: event.clientX,
+      currentClientX: event.clientX,
+      trackWidth,
+      durationSecs: this.duration,
+      stepSecs: Number(this.seekInput.step),
+    });
+    this.seekDragState = {
+      kind: "pointer",
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startPositionSecs,
+      targetPositionSecs: startPositionSecs,
+      trackWidth,
+      durationSecs: this.duration,
+      stepSecs: Number(this.seekInput.step),
+      moved: false,
+      previewRequest: null,
+    };
+    this.seekInput.focus({ preventScroll: true });
+    try {
+      this.seekInput.setPointerCapture(event.pointerId);
+    } catch (_error) {
+      // Touch input generally has implicit capture; explicit capture may already be gone.
+    }
+  }
+
+  updateSeekPointerDrag(event) {
+    const drag = this.seekDragState.kind === "pointer"
+      ? this.seekDragState
+      : null;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.stopPropagation();
+    if (event.cancelable) event.preventDefault();
+    const targetPositionSecs = videoSeekRelativeDragValue({
+      startPositionSecs: drag.startPositionSecs,
+      startClientX: drag.startClientX,
+      currentClientX: event.clientX,
+      trackWidth: drag.trackWidth,
+      durationSecs: drag.durationSecs,
+      stepSecs: drag.stepSecs,
+    });
+    if (targetPositionSecs === drag.targetPositionSecs) return;
+    drag.targetPositionSecs = targetPositionSecs;
+    drag.moved = true;
+    this.seekInput.value = String(targetPositionSecs);
+    this.updateCounter(targetPositionSecs);
+    drag.previewRequest = this.beginSeekPreview(
+      targetPositionSecs,
+      "移動先を確認中"
+    );
+  }
+
+  finishSeekPointerDrag(event, cancelled) {
+    const drag = this.seekDragState.kind === "pointer"
+      ? this.seekDragState
+      : null;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.stopPropagation();
+    if (event.cancelable) event.preventDefault();
+    try {
+      if (this.seekInput.hasPointerCapture(event.pointerId)) {
+        this.seekInput.releasePointerCapture(event.pointerId);
+      }
+    } catch (_error) {
+      // The browser may implicitly release capture before pointercancel.
+    }
+    this.seekDragState = { kind: "idle" };
+    if (cancelled) {
+      if (drag.previewRequest) this.cancelSeekPreview(drag.previewRequest);
+      else this.updateProgress();
+      return;
+    }
+    if (!drag.moved) {
+      this.updateProgress();
+      return;
+    }
+    this.dispatch(videoAbsoluteSeekCommand(drag.targetPositionSecs), {
+      source: this.inputSource(event),
+      detail: "seek_bar",
+    });
+  }
+
   applyRemoteSessionState(snapshot) {
     const wasBlocked = this.remoteSessionState.blocksInteraction;
     this.remoteSessionState = snapshot ?? { blocksInteraction: false };
@@ -1861,6 +2004,7 @@ export class VideoStreamViewer {
   }
 
   async start(positionSecs = null, restorePlaying = true) {
+    this.seekDragState = { kind: "idle" };
     this.transitionPlaybackControl({
       type: "reset",
       playRequested: Boolean(restorePlaying),
@@ -3536,6 +3680,14 @@ export class VideoStreamViewer {
     this.video.removeEventListener("stalled", this.onStalled);
     this.video.removeEventListener("ended", this.onEnded);
     this.video.removeEventListener("error", this.onMediaError);
+    this.seekInput.removeEventListener("input", this.onSeekInput);
+    this.seekInput.removeEventListener("change", this.onSeekChange);
+    this.seekInput.removeEventListener("pointerdown", this.onSeekPointerDown);
+    this.seekInput.removeEventListener("pointermove", this.onSeekPointerMove);
+    this.seekInput.removeEventListener("pointerup", this.onSeekPointerUp);
+    this.seekInput.removeEventListener("pointercancel", this.onSeekPointerCancel);
+    this.seekInput.removeEventListener("click", this.onSeekClick);
+    this.seekDragState = { kind: "idle" };
     this.stage.removeEventListener("pointerdown", this.pointerDown);
     this.stage.removeEventListener("pointermove", this.pointerMove);
     this.stage.removeEventListener("pointerup", this.pointerUp);

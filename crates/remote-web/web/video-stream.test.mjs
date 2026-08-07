@@ -19,6 +19,7 @@ import {
   videoPlaybackStallDecision,
   videoHealthSample,
   videoHealthSamplingDecision,
+  videoSeekRelativeDragValue,
   videoUserErrorMessage,
 } from "./video-stream.mjs";
 
@@ -859,6 +860,91 @@ test("an attached visible playback with no progress reaches the reconnect termin
   assert.deepEqual(calls[2], [
     "terminal",
     "動画の再生が停止しました。現在位置から再接続できます。",
+  ]);
+});
+
+test("video seek drag maps pointer travel to the visible timeline scale", () => {
+  const drag = (startClientX, currentClientX) => videoSeekRelativeDragValue({
+    startPositionSecs: 120,
+    startClientX,
+    currentClientX,
+    trackWidth: 300,
+    durationSecs: 600,
+    stepSecs: 0.1,
+  });
+  assert.equal(drag(20, 20), 120);
+  assert.equal(drag(20, 80), 240);
+  assert.equal(drag(220, 280), 240);
+  assert.equal(drag(100, 400), 600);
+  assert.equal(drag(100, -200), 0);
+});
+
+test("video seek pointer starts anywhere without jumping and commits only after travel", () => {
+  const calls = [];
+  let capturedPointer = null;
+  const seekInput = {
+    disabled: false,
+    value: "120",
+    step: "0.1",
+    getBoundingClientRect: () => ({ width: 300 }),
+    focus: () => calls.push("focus"),
+    setPointerCapture: (pointerId) => {
+      capturedPointer = pointerId;
+      calls.push(["capture", pointerId]);
+    },
+    hasPointerCapture: (pointerId) => capturedPointer === pointerId,
+    releasePointerCapture: (pointerId) => {
+      capturedPointer = null;
+      calls.push(["release", pointerId]);
+    },
+  };
+  const viewer = {
+    seekInput,
+    seekDragState: { kind: "idle" },
+    duration: 600,
+    inputSource: () => "touch",
+    updateCounter: (target) => calls.push(["counter", target]),
+    beginSeekPreview: (target, label) => {
+      const request = { revision: target };
+      calls.push(["preview", target, label]);
+      return request;
+    },
+    cancelSeekPreview: (request) => calls.push(["cancel", request.revision]),
+    updateProgress: () => calls.push("update_progress"),
+    dispatch: (requested, detail) => calls.push(["dispatch", requested, detail]),
+  };
+  const pointer = (clientX) => ({
+    pointerId: 7,
+    clientX,
+    button: 0,
+    isPrimary: true,
+    cancelable: true,
+    stopPropagation() {},
+    preventDefault() {},
+  });
+  const draggingSeek = Object.getOwnPropertyDescriptor(
+    VideoStreamViewer.prototype,
+    "draggingSeek"
+  ).get;
+
+  VideoStreamViewer.prototype.beginSeekPointerDrag.call(viewer, pointer(250));
+  assert.equal(draggingSeek.call(viewer), true);
+  assert.equal(seekInput.value, "120");
+  assert.equal(viewer.seekDragState.targetPositionSecs, 120);
+  assert.equal(calls.some((entry) => Array.isArray(entry) && entry[0] === "preview"), false);
+  VideoStreamViewer.prototype.finishSeekPointerDrag.call(viewer, pointer(250), false);
+  assert.equal(draggingSeek.call(viewer), false);
+  assert.equal(calls.some((entry) => Array.isArray(entry) && entry[0] === "dispatch"), false);
+
+  calls.length = 0;
+  VideoStreamViewer.prototype.beginSeekPointerDrag.call(viewer, pointer(20));
+  VideoStreamViewer.prototype.updateSeekPointerDrag.call(viewer, pointer(80));
+  assert.equal(seekInput.value, "240");
+  VideoStreamViewer.prototype.finishSeekPointerDrag.call(viewer, pointer(80), false);
+  assert.deepEqual(calls.at(-1), [
+    "dispatch",
+    { name: "media_seek_absolute", payload: { positionSecs: 240 } },
+    { source: "touch", detail: "seek_bar" },
   ]);
 });
 
