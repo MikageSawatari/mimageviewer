@@ -866,6 +866,77 @@ test("viewer load executes fetch, decode, layout and atomic replacement", async 
   viewer.destroy();
 });
 
+test("rapid page loads finish the active request and start only the latest pending request", async () => {
+  const viewer = new ImageViewer({
+    root: new FakeElement("section"),
+    stage: new FakeElement("div"),
+    image: new FakeElement("img"),
+    title: new FakeElement("div"),
+    counter: new FakeElement("span"),
+    previous: new FakeElement("button"),
+    next: new FakeElement("button"),
+    loadingIndicator: new FakeElement("div"),
+  });
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const requested = [];
+  let activeFetches = 0;
+  let maximumActiveFetches = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(input, testLocation.origin);
+    const page = Number(url.searchParams.get("rapid"));
+    requested.push(page);
+    activeFetches += 1;
+    maximumActiveFetches = Math.max(maximumActiveFetches, activeFetches);
+    if (page === 1) await firstGate;
+    activeFetches -= 1;
+    return new Response(new Blob([new Uint8Array([page])]), {
+      status: 200,
+      headers: {
+        "Content-Type": "image/jpeg",
+        "X-mIV-Request-Id": `rapid-${page}`,
+        "X-mIV-Image-Width": "1200",
+        "X-mIV-Image-Height": "1800",
+        "X-mIV-Remote-State-Generation": "test-1",
+        "X-mIV-Remote-Session": TEST_SESSION_ID,
+      },
+    });
+  };
+  const load = (page) => viewer.load({
+    name: `Page ${page}`,
+    request: {
+      url: `/api/page?rapid=${page}`,
+      remoteStateGeneration: "test-1",
+      remoteSessionId: TEST_SESSION_ID,
+      width: 1800,
+      cssWidth: 430,
+      dpr: 2,
+      layout: { cssWidth: 430 },
+      fitMode: "page",
+    },
+    info: { width: 1200, height: 1800 },
+    fitMode: "page",
+    index: page - 1,
+    count: 3,
+    interactionStartedAt: performance.now(),
+  });
+
+  try {
+    const first = load(1);
+    const second = load(2);
+    const third = load(3);
+    assert.deepEqual(requested, [1]);
+    releaseFirst();
+    assert.deepEqual(await Promise.all([first, second, third]), [false, false, true]);
+    assert.deepEqual(requested, [1, 3]);
+    assert.equal(maximumActiveFetches, 1);
+    assert.equal(viewer.title.textContent, "Page 3");
+  } finally {
+    globalThis.fetch = imageFetch;
+    viewer.destroy();
+  }
+});
+
 test("viewer refuses a page response without a generation attestation", async () => {
   const initialImage = new FakeElement("img");
   const title = new FakeElement("div");

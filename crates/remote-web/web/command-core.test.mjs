@@ -29,6 +29,7 @@ import {
   isRtlReadingDirection,
   isRtlSpread,
   imageQualityPreset,
+  latestPageLoadRequestPlan,
   nextSpreadMode,
   normalizeVisualViewportScale,
   readingDirectionForSpreadMode,
@@ -64,6 +65,7 @@ import {
   viewerImageLayout,
   viewerPageDisplaySlot,
   viewerPageGroupGenerationSnapshot,
+  viewerPostDisplayRefreshPlan,
   viewerSpreadPartnerIndex,
   viewerBoundaryMessage,
   viewerGestureDecision,
@@ -77,6 +79,7 @@ import {
   viewerSeekRelativeDragValue,
   viewerSeekState,
   viewerSpreadLayout,
+  viewerTransformTelemetry,
   viewerWheelCommand,
   videoAbsoluteSeekCommand,
   videoHttpStatusDecision,
@@ -438,6 +441,10 @@ test("visual viewport scale telemetry is normalized and emitted only after a mat
   assert.equal(normalizeVisualViewportScale("1.23456"), 1.235);
   assert.equal(normalizeVisualViewportScale(0), null);
   assert.equal(normalizeVisualViewportScale(Number.NaN), null);
+  assert.deepEqual(viewerTransformTelemetry("1.23456", "1.0114"), {
+    viewer_scale: 1.235,
+    visual_viewport_scale: 1.011,
+  });
 
   const initial = visualViewportScaleTransition(null, 1);
   assert.deepEqual(initial, { nextScale: 1, event: null });
@@ -1308,6 +1315,43 @@ test("every page in one viewer group snapshots the same remote state generation"
     generation: "boot-7",
     pages: ["boot-7", "boot-7"],
   });
+});
+
+test("foreground page loading keeps one active group and replaces the pending group", () => {
+  const first = { id: 1 };
+  assert.deepEqual(latestPageLoadRequestPlan({}, first), {
+    start: first,
+    pending: null,
+    supersedeActive: false,
+    supersededPending: null,
+  });
+
+  const active = { id: 1 };
+  const pending = { id: 2 };
+  const latest = { id: 3 };
+  assert.deepEqual(
+    latestPageLoadRequestPlan({ active, pending }, latest),
+    {
+      start: null,
+      pending: latest,
+      supersedeActive: true,
+      supersededPending: pending,
+    }
+  );
+});
+
+test("an adjustment commit skips only its redundant adjustment refresh", () => {
+  assert.deepEqual(viewerPostDisplayRefreshPlan(), {
+    adjustment: true,
+    bookmarks: true,
+  });
+  assert.deepEqual(
+    viewerPostDisplayRefreshPlan({ adjustmentStateCurrent: true }),
+    {
+      adjustment: false,
+      bookmarks: true,
+    }
+  );
 });
 
 test("page edge messages distinguish start, end and RTL guidance", () => {

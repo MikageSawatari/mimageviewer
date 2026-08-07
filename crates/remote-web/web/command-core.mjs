@@ -267,6 +267,13 @@ export function normalizeVisualViewportScale(value) {
   return Math.round(scale * 1000) / 1000;
 }
 
+export function viewerTransformTelemetry(viewerScale, visualViewportScale) {
+  return {
+    viewer_scale: normalizeVisualViewportScale(viewerScale),
+    visual_viewport_scale: normalizeVisualViewportScale(visualViewportScale),
+  };
+}
+
 /// visualViewport fires resize repeatedly while browser zoom animates. Keep the last
 /// reported value as the comparison baseline so sub-threshold steps accumulate, and
 /// only create telemetry once the scale has materially changed.
@@ -452,6 +459,29 @@ export function viewerPageGroupGenerationSnapshot(generation, pageCount) {
   return {
     generation: value,
     pages: Array.from({ length: count }, () => value),
+  };
+}
+
+/// Foreground page rendering owns one server request group at a time. A newer
+/// intent invalidates the displayed result of the active group and replaces the
+/// single pending slot; it does not abort IPC which has already reached core.
+export function latestPageLoadRequestPlan(
+  { active = null, pending = null } = {},
+  incoming
+) {
+  if (active === null) {
+    return {
+      start: incoming,
+      pending: null,
+      supersedeActive: false,
+      supersededPending: null,
+    };
+  }
+  return {
+    start: null,
+    pending: incoming,
+    supersedeActive: true,
+    supersededPending: pending,
   };
 }
 
@@ -772,6 +802,13 @@ export function viewerResizePlan({
     refreshContainer,
     rebuildViewer: false,
     keepPanelOpen: Boolean(panelOpen),
+  };
+}
+
+export function viewerPostDisplayRefreshPlan({ adjustmentStateCurrent = false } = {}) {
+  return {
+    adjustment: !Boolean(adjustmentStateCurrent),
+    bookmarks: true,
   };
 }
 

@@ -391,14 +391,18 @@ test("image fit transforms only the page layer while controls stay its siblings"
   assert.match(css, /\.viewer-ui\s*\{[^}]*position:\s*absolute/);
 });
 
-test("visual viewport telemetry is settled and attached to image and double-tap events", async () => {
+test("browser and viewer scales are settled and attached to image and gesture events", async () => {
   const app = await readFile(new URL("app.js", here), "utf8");
   assert.match(app, /visualViewport\?\.addEventListener\?\.\("resize"/);
   assert.match(app, /visualViewportScaleTransition\(/);
   assert.match(app, /\}, 250\);/);
-  assert.match(app, /fit_mode:\s*request\.fitMode,\s*visual_viewport_scale:/);
+  assert.match(
+    app,
+    /fit_mode:\s*request\.fitMode,\s*\.\.\.viewerTransformTelemetry\(this\.scale,/
+  );
   assert.match(app, /detail:\s*"double_tap_fit",[\s\S]*?visualViewportScale:/);
   assert.match(app, /action:\s*"double_tap_candidate_rejected"/);
+  assert.match(app, /action:\s*"pinch_end"/);
 });
 
 test("image tiles preserve portrait and landscape shape below a separate label row", async () => {

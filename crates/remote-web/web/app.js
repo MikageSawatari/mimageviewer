@@ -22,6 +22,7 @@ import {
   gridIndexForCommand,
   imageQualityPreset,
   isRtlReadingDirection,
+  latestPageLoadRequestPlan,
   nextFitMode,
   nextSpreadMode,
   normalizeVisualViewportScale,
@@ -66,12 +67,14 @@ import {
   viewerImageLayout,
   viewerPageDisplaySlot,
   viewerPageGroupGenerationSnapshot,
+  viewerPostDisplayRefreshPlan,
   viewerSpreadPartnerIndex,
   viewerBoundaryMessage,
   viewerSeekGroupIndex,
   viewerSeekRelativeDragValue,
   viewerSeekState,
   viewerSpreadLayout,
+  viewerTransformTelemetry,
   viewerWheelCommand,
   visualViewportScaleTransition,
 } from "./command-core.mjs";
@@ -207,6 +210,61 @@ export class LatestOnlyTaskQueue {
     } finally {
       this.running = false;
       if (this.latest !== null) this.pump();
+    }
+  }
+}
+
+/// 前景ページ描画専用。実行中の core IPC は完了させ、待機中は最新のページ群だけを残す。
+export class LatestPageLoadQueue {
+  constructor(run, onSupersede = () => {}) {
+    this.run = run;
+    this.onSupersede = onSupersede;
+    this.active = null;
+    this.pending = null;
+  }
+
+  request(value) {
+    return new Promise((resolve, reject) => {
+      const incoming = { value, resolve, reject, superseded: false };
+      const plan = latestPageLoadRequestPlan(
+        { active: this.active, pending: this.pending },
+        incoming
+      );
+      if (plan.supersededPending) {
+        plan.supersededPending.superseded = true;
+        plan.supersededPending.resolve(false);
+      }
+      this.pending = plan.pending;
+      if (plan.supersedeActive) {
+        this.active.superseded = true;
+        this.onSupersede();
+      }
+      if (plan.start) this.start(plan.start);
+    });
+  }
+
+  clear() {
+    if (this.pending) {
+      this.pending.superseded = true;
+      this.pending.resolve(false);
+      this.pending = null;
+    }
+    if (this.active) this.active.superseded = true;
+  }
+
+  async start(ticket) {
+    this.active = ticket;
+    try {
+      const result = await this.run(ticket.value);
+      ticket.resolve(ticket.superseded ? false : result);
+    } catch (error) {
+      if (ticket.superseded) ticket.resolve(false);
+      else ticket.reject(error);
+    } finally {
+      if (this.active === ticket) this.active = null;
+      const next = this.pending;
+      this.pending = null;
+      if (next) this.start(next);
     }
   }
 }
@@ -1395,9 +1453,9 @@ export function commandTelemetryEvent(requested, meta, source, context, handled 
   }
   if (meta.detail === "double_tap_fit") {
     event.fit_mode_before = meta.fitMode ?? null;
-    event.viewer_scale = normalizeVisualViewportScale(meta.viewerScale);
-    event.visual_viewport_scale = normalizeVisualViewportScale(
-      meta.visualViewportScale
+    Object.assign(
+      event,
+      viewerTransformTelemetry(meta.viewerScale, meta.visualViewportScale)
     );
   }
   return event;
@@ -3822,7 +3880,10 @@ function changeImageTo(nextGroupIndex) {
   return true;
 }
 
-async function updateViewerImage(interactionStartedAt = performance.now()) {
+async function updateViewerImage(
+  interactionStartedAt = performance.now(),
+  { adjustmentStateCurrent = false } = {}
+) {
   const group = currentPageGroup();
   const viewer = state.viewer;
   if (!group || !viewer) return;
@@ -3880,8 +3941,9 @@ async function updateViewerImage(interactionStartedAt = performance.now()) {
       name: entry.name,
     }))
   ).catch((error) => state.remoteAiController?.showRequestError(error));
-  state.commandMenu?.refreshAdjustment();
-  state.commandMenu?.refreshBookmarks();
+  const refreshPlan = viewerPostDisplayRefreshPlan({ adjustmentStateCurrent });
+  if (refreshPlan.adjustment) state.commandMenu?.refreshAdjustment();
+  if (refreshPlan.bookmarks) state.commandMenu?.refreshBookmarks();
   observeReadingProgress();
   if (group.entries.every((entry) => entry.address)) {
     schedulePagePrefetch(viewer).catch(() => {});
@@ -6121,7 +6183,7 @@ export class ViewerAdjustmentPanel {
       this.applyServerState(response.adjustment_state);
       state.pageRenderRevision += 1;
       pageResourceCache.clear();
-      await updateViewerImage(performance.now());
+      await updateViewerImage(performance.now(), { adjustmentStateCurrent: true });
       if (commitId === this.commitSequence) this.status.textContent = "保存しました。";
     }).catch((error) => {
       if (commitId === this.commitSequence) this.showError(error);
@@ -7736,6 +7798,22 @@ export class ImageViewer {
     this.loadingTimer = 0;
     this.boundaryMessageTimer = 0;
     this.centerTapTimer = 0;
+    this.pageLoadQueue = new LatestPageLoadQueue(
+      (job) => job.kind === "spread"
+        ? this.loadMeasuredSpread(
+          job.pages,
+          job.fitMode,
+          job.gap,
+          job.interactionStartedAt
+        )
+        : this.loadMeasuredImage(
+          job.request,
+          job.interactionStartedAt,
+          job.name,
+          job.info
+        ),
+      () => this.supersedeActiveLoad()
+    );
 
     this.pointerDown = (event) => this.onPointerDown(event);
     this.pointerMove = (event) => this.onPointerMove(event);
@@ -7803,16 +7881,27 @@ export class ImageViewer {
       value: index,
       label: `${index + 1} / ${count}`,
     });
-    return this.loadMeasuredImage(request, interactionStartedAt, name, info);
+    return this.pageLoadQueue.request({
+      kind: "single",
+      request,
+      interactionStartedAt,
+      name,
+      info,
+    });
   }
 
-  invalidatePendingLoad() {
+  supersedeActiveLoad() {
     this.loadSequence += 1;
-    this.fetchController?.abort();
-    this.fetchController = null;
     clearTimeout(this.loadingTimer);
     this.loadingTimer = 0;
     this.loadingIndicator.hidden = true;
+  }
+
+  invalidatePendingLoad() {
+    this.pageLoadQueue.clear();
+    this.supersedeActiveLoad();
+    this.fetchController?.abort();
+    this.fetchController = null;
   }
 
   loadGroup({
@@ -7846,7 +7935,13 @@ export class ImageViewer {
       value: index,
       label: `${index + 1} / ${count}`,
     });
-    return this.loadMeasuredSpread(pages, fitMode, gap, interactionStartedAt);
+    return this.pageLoadQueue.request({
+      kind: "spread",
+      pages,
+      fitMode,
+      gap,
+      interactionStartedAt,
+    });
   }
 
   setBarsVisible(visible) {
@@ -8075,7 +8170,7 @@ export class ImageViewer {
         css_width: roundMs(request.cssWidth),
         device_pixel_ratio: roundMs(request.dpr),
         fit_mode: request.fitMode,
-        visual_viewport_scale: currentVisualViewportScale(),
+        ...viewerTransformTelemetry(this.scale, currentVisualViewportScale()),
         prefetch_status: resource.prefetchStatus,
       };
       enqueueTelemetry(event);
@@ -8209,7 +8304,7 @@ export class ImageViewer {
           css_width: roundMs(request.cssWidth),
           device_pixel_ratio: roundMs(request.dpr),
           fit_mode: request.fitMode,
-          visual_viewport_scale: currentVisualViewportScale(),
+          ...viewerTransformTelemetry(this.scale, currentVisualViewportScale()),
           prefetch_status: resource.prefetchStatus,
           spread_pages: pages.length,
         };
@@ -8554,6 +8649,13 @@ export class ImageViewer {
         this.commitPendingCenterTap();
       }
     } else if (this.pinched) {
+      enqueueTelemetry({
+        type: "viewer_gesture",
+        action: "pinch_end",
+        cancelled: Boolean(cancelled),
+        fit_mode: this.fitMode ?? state.fitMode,
+        ...viewerTransformTelemetry(this.scale, currentVisualViewportScale()),
+      });
       this.recordDoubleTapCandidateRejection(
         cancelled ? "pointer_cancelled_during_pinch" : "pinch"
       );
@@ -8581,8 +8683,7 @@ export class ImageViewer {
       action: "double_tap_candidate_rejected",
       decision,
       fit_mode: this.fitMode ?? state.fitMode,
-      viewer_scale: normalizeVisualViewportScale(this.scale),
-      visual_viewport_scale: currentVisualViewportScale(),
+      ...viewerTransformTelemetry(this.scale, currentVisualViewportScale()),
       ...diagnostic,
     });
   }
@@ -8632,6 +8733,7 @@ export class ImageViewer {
     this.centerTapTimer = 0;
     this.loadingIndicator.hidden = true;
     this.boundaryMessage.hidden = true;
+    this.pageLoadQueue.clear();
     this.loadSequence += 1;
     this.fetchController?.abort();
     if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
