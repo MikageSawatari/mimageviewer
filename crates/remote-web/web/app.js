@@ -65,6 +65,7 @@ import {
   viewerTapCommand,
   viewerTapSequenceTransition,
   viewerImageLayout,
+  viewerLayoutTelemetry,
   viewerPageDisplaySlot,
   viewerPageGroupGenerationSnapshot,
   viewerPostDisplayRefreshPlan,
@@ -1642,7 +1643,9 @@ function dispatchCommand(requested, meta = {}) {
       }
       if (fitMode) {
         state.fitMode = fitMode;
-        updateViewerImage(performance.now()).catch(renderError);
+        updateViewerImage(performance.now(), {
+          renderTrigger: "fit_mode",
+        }).catch(renderError);
         handled = true;
       } else {
         handled = Boolean(state.viewer?.execute(requested));
@@ -2762,7 +2765,6 @@ async function openRemoteBookBookmarkTarget(target) {
   updateGridReturnTargetItem(group.anchor);
   viewer.hideBoundaryMessage();
   viewer.cancelPendingCenterTap();
-  viewer.setSeekState(viewerSeekSnapshot(groupIndex));
   const viewerDepth = (Number(history.state?.viewerDepth) || 0) + 1;
   history.pushState(
     {
@@ -2858,7 +2860,8 @@ function requestSpreadMode(mode) {
 }
 
 async function refreshContainerSpread(
-  forceSinglePage = shouldForceSinglePageForViewport()
+  forceSinglePage = shouldForceSinglePageForViewport(),
+  renderTrigger = "spread_refresh"
 ) {
   if (!state.container) return;
   const viewer = state.viewer;
@@ -2882,8 +2885,7 @@ async function refreshContainerSpread(
   );
   updateGridReturnTargetItem(group.anchor);
   viewer.cancelPendingCenterTap();
-  viewer.setSeekState(viewerSeekSnapshot());
-  await updateViewerImage(performance.now());
+  await updateViewerImage(performance.now(), { renderTrigger });
 }
 
 export async function loadFolder(
@@ -3693,16 +3695,17 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   };
   const commitSeekGroup = (groupIndex, reason) => {
     const viewer = state.viewer;
+    viewer?.restoreDisplayedSeekState();
     const sequence = ++seekCommitSequence;
     acquireRemoteSession(reason).then((acquired) => {
       if (!acquired) return;
       if (sequence !== seekCommitSequence || state.viewer !== viewer) return;
       if (!changeImageTo(groupIndex)) {
-        state.viewer?.setSeekState(viewerSeekSnapshot());
+        state.viewer?.restoreDisplayedSeekState();
       }
     }).catch(() => {
       if (sequence === seekCommitSequence && state.viewer === viewer) {
-        state.viewer?.setSeekState(viewerSeekSnapshot());
+        state.viewer?.restoreDisplayedSeekState();
       }
     });
   };
@@ -3792,7 +3795,7 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
     }
     seekPointerDrag = null;
     if (gesture.kind === "cancel") {
-      state.viewer?.setSeekState(viewerSeekSnapshot());
+      state.viewer?.restoreDisplayedSeekState();
     } else if (gesture.kind === "tap") {
       const groupIndex = previewSeekGroup(seekRangeAbsoluteValue({
         clientX: drag.startClientX,
@@ -3856,7 +3859,6 @@ function changeImageTo(nextGroupIndex) {
   state.viewer?.hideBoundaryMessage();
   state.pageDirection = nextGroupIndex > state.pageGroupIndex ? 1 : -1;
   state.pageGroupIndex = nextGroupIndex;
-  state.viewer?.setSeekState(viewerSeekSnapshot(nextGroupIndex));
   const entry = state.pageGroups[nextGroupIndex].anchor;
   updateGridReturnTargetItem(entry);
   state.imageIndex = state.images.findIndex(
@@ -3882,7 +3884,10 @@ function changeImageTo(nextGroupIndex) {
 
 async function updateViewerImage(
   interactionStartedAt = performance.now(),
-  { adjustmentStateCurrent = false } = {}
+  {
+    adjustmentStateCurrent = false,
+    renderTrigger = "page_request",
+  } = {}
 ) {
   const group = currentPageGroup();
   const viewer = state.viewer;
@@ -3921,7 +3926,6 @@ async function updateViewerImage(
       remoteSessionCacheEpoch: remoteSessionCacheEpochSnapshot,
     }),
   }));
-  document.title = `${group.anchor.name} — mIV Remote`;
   const displayed = await viewer.loadGroup({
     pages,
     name: group.entries.map((entry) => entry.name).join(" / "),
@@ -3931,8 +3935,10 @@ async function updateViewerImage(
     count: state.pageGroups.length,
     seekState: viewerSeekSnapshot(),
     interactionStartedAt,
+    renderTrigger,
   });
   if (!displayed || state.viewer !== viewer) return;
+  document.title = `${group.anchor.name} — mIV Remote`;
   state.remoteAiController?.displayGroup(
     pages.map(({ entry, request }) => ({
       address: entryAddress(entry),
@@ -6183,7 +6189,10 @@ export class ViewerAdjustmentPanel {
       this.applyServerState(response.adjustment_state);
       state.pageRenderRevision += 1;
       pageResourceCache.clear();
-      await updateViewerImage(performance.now(), { adjustmentStateCurrent: true });
+      await updateViewerImage(performance.now(), {
+        adjustmentStateCurrent: true,
+        renderTrigger: "adjustment_commit",
+      });
       if (commitId === this.commitSequence) this.status.textContent = "保存しました。";
     }).catch((error) => {
       if (commitId === this.commitSequence) this.showError(error);
@@ -7062,7 +7071,10 @@ class CommandMenu {
     if (state.commandMenu !== this || this.opened !== next.open) return;
     state.viewer?.refitVisibleContent(
       next.open ? FitMode.PAGE : state.fitMode,
-      { resetTransform: true }
+      {
+        resetTransform: true,
+        reason: `panel_${action}`,
+      }
     );
   }
 
@@ -7798,19 +7810,24 @@ export class ImageViewer {
     this.loadingTimer = 0;
     this.boundaryMessageTimer = 0;
     this.centerTapTimer = 0;
+    this.displayedSeekState = null;
     this.pageLoadQueue = new LatestPageLoadQueue(
       (job) => job.kind === "spread"
         ? this.loadMeasuredSpread(
           job.pages,
           job.fitMode,
           job.gap,
-          job.interactionStartedAt
+          job.interactionStartedAt,
+          job.presentation,
+          job.renderTrigger
         )
         : this.loadMeasuredImage(
           job.request,
           job.interactionStartedAt,
           job.name,
-          job.info
+          job.info,
+          job.presentation,
+          job.renderTrigger
         ),
       () => this.supersedeActiveLoad()
     );
@@ -7845,10 +7862,12 @@ export class ImageViewer {
           panelOpen: Boolean(state.commandMenu?.isOpen()),
         });
         if (plan.refreshContainer) {
-          refreshContainerSpread(forceSinglePage).catch(renderError);
+          refreshContainerSpread(forceSinglePage, "viewport_resize").catch(renderError);
           return;
         }
-        updateViewerImage(performance.now()).catch(renderError);
+        updateViewerImage(performance.now(), {
+          renderTrigger: "viewport_resize",
+        }).catch(renderError);
       }, 180);
     };
 
@@ -7870,23 +7889,23 @@ export class ImageViewer {
     count,
     seekState,
     interactionStartedAt,
+    renderTrigger,
   }) {
-    this.resetTransform();
-    this.title.textContent = name;
-    this.image.alt = name;
-    this.setSeekState(seekState ?? {
+    const resolvedSeekState = seekState ?? {
       visible: count > 1,
       min: 0,
       max: Math.max(0, count - 1),
       value: index,
       label: `${index + 1} / ${count}`,
-    });
+    };
     return this.pageLoadQueue.request({
       kind: "single",
       request,
       interactionStartedAt,
       name,
       info,
+      presentation: { name, seekState: resolvedSeekState },
+      renderTrigger,
     });
   }
 
@@ -7913,6 +7932,7 @@ export class ImageViewer {
     count,
     seekState,
     interactionStartedAt,
+    renderTrigger,
   }) {
     if (pages.length === 1) {
       return this.load({
@@ -7924,23 +7944,24 @@ export class ImageViewer {
         count,
         seekState,
         interactionStartedAt,
+        renderTrigger,
       });
     }
-    this.resetTransform();
-    this.title.textContent = name;
-    this.setSeekState(seekState ?? {
+    const resolvedSeekState = seekState ?? {
       visible: count > 1,
       min: 0,
       max: Math.max(0, count - 1),
       value: index,
       label: `${index + 1} / ${count}`,
-    });
+    };
     return this.pageLoadQueue.request({
       kind: "spread",
       pages,
       fitMode,
       gap,
       interactionStartedAt,
+      presentation: { name, seekState: resolvedSeekState },
+      renderTrigger,
     });
   }
 
@@ -7964,6 +7985,29 @@ export class ImageViewer {
     this.seekInput.setAttribute("aria-valuetext", seekState.label);
   }
 
+  commitPagePresentation({ name, seekState } = {}) {
+    this.title.textContent = name ?? "";
+    this.displayedSeekState = seekState ? { ...seekState } : null;
+    this.setSeekState(this.displayedSeekState);
+  }
+
+  restoreDisplayedSeekState() {
+    if (this.displayedSeekState) this.setSeekState(this.displayedSeekState);
+  }
+
+  layoutTelemetry() {
+    return viewerLayoutTelemetry({
+      stageWidth: this.stage.clientWidth,
+      stageHeight: this.stage.clientHeight,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+      visualViewportWidth: window.visualViewport?.width,
+      visualViewportHeight: window.visualViewport?.height,
+      panelOpen: this.root.classList.contains("viewer-panel-open"),
+      barsVisible: !this.root.classList.contains("viewer-bars-hidden"),
+    });
+  }
+
   setLayout(fitMode, layout, info, image = this.image) {
     this.fitMode = fitMode;
     this.stage.dataset.fitMode = fitMode;
@@ -7984,7 +8028,12 @@ export class ImageViewer {
     this.pageLayer.style.height = `${Math.max(1, Number(height) || 1)}px`;
   }
 
-  refitVisibleContent(fitMode = FitMode.PAGE, { resetTransform = true } = {}) {
+  refitVisibleContent(
+    fitMode = FitMode.PAGE,
+    { resetTransform = true, reason = "explicit_refit" } = {}
+  ) {
+    const previousCssWidth = Number.parseFloat(this.pageLayer.style.width);
+    const previousCssHeight = Number.parseFloat(this.pageLayer.style.height);
     const sources = this.images.map((image) => ({
       width: Number(image.dataset.sourceWidth) || image.naturalWidth,
       height: Number(image.dataset.sourceHeight) || image.naturalHeight,
@@ -8017,6 +8066,23 @@ export class ImageViewer {
       this.panY = 0;
     }
     this.applyTransform();
+    enqueueTelemetry({
+      type: "viewer_layout",
+      action: "refit",
+      reason,
+      fit_mode: fitMode,
+      previous_css_width: Number.isFinite(previousCssWidth)
+        ? roundMs(previousCssWidth)
+        : null,
+      previous_css_height: Number.isFinite(previousCssHeight)
+        ? roundMs(previousCssHeight)
+        : null,
+      css_width: roundMs(layout.cssWidth),
+      css_height: roundMs(layout.cssHeight),
+      spread_pages: this.images.length,
+      ...viewerTransformTelemetry(this.scale, currentVisualViewportScale()),
+      ...this.layoutTelemetry(),
+    });
     return true;
   }
 
@@ -8076,7 +8142,14 @@ export class ImageViewer {
     return true;
   }
 
-  async loadMeasuredImage(request, interactionStartedAt, name, info) {
+  async loadMeasuredImage(
+    request,
+    interactionStartedAt,
+    name,
+    info,
+    presentation,
+    renderTrigger
+  ) {
     const sequence = ++this.loadSequence;
     this.fetchController?.abort();
     const controller = new AbortController();
@@ -8144,12 +8217,14 @@ export class ImageViewer {
         URL.revokeObjectURL(pendingObjectUrl);
         return;
       }
+      this.resetTransform();
       this.setLayout(request.fitMode, resolvedLayout, resolvedInfo, decodedImage);
       decodedImage.style.transform = "none";
       const previousUrls = this.objectUrls.slice();
       this.pageLayer.replaceChildren(decodedImage);
       this.image = decodedImage;
       this.images = [decodedImage];
+      this.commitPagePresentation(presentation);
       this.objectUrl = pendingObjectUrl;
       this.objectUrls = [pendingObjectUrl];
       pendingObjectUrl = null;
@@ -8168,9 +8243,12 @@ export class ImageViewer {
         tap_to_display_ms: roundMs(performance.now() - interactionStartedAt),
         requested_width: request.width,
         css_width: roundMs(request.cssWidth),
+        css_height: roundMs(resolvedLayout.cssHeight),
         device_pixel_ratio: roundMs(request.dpr),
         fit_mode: request.fitMode,
+        render_trigger: renderTrigger,
         ...viewerTransformTelemetry(this.scale, currentVisualViewportScale()),
+        ...this.layoutTelemetry(),
         prefetch_status: resource.prefetchStatus,
       };
       enqueueTelemetry(event);
@@ -8194,7 +8272,14 @@ export class ImageViewer {
     }
   }
 
-  async loadMeasuredSpread(pages, fitMode, gap, interactionStartedAt) {
+  async loadMeasuredSpread(
+    pages,
+    fitMode,
+    gap,
+    interactionStartedAt,
+    presentation,
+    renderTrigger
+  ) {
     const sequence = ++this.loadSequence;
     this.fetchController?.abort();
     const controller = new AbortController();
@@ -8259,6 +8344,7 @@ export class ImageViewer {
         devicePixelRatio: window.devicePixelRatio || 1,
         gap,
       });
+      this.resetTransform();
       this.fitMode = fitMode;
       this.stage.dataset.fitMode = fitMode;
       this.pageLayer.style.gap = `${resolvedLayout.gap}px`;
@@ -8281,6 +8367,7 @@ export class ImageViewer {
       this.pageLayer.replaceChildren(...decodedImages.map((decoded) => decoded.image));
       this.images = decodedImages.map((decoded) => decoded.image);
       this.image = this.images[0];
+      this.commitPagePresentation(presentation);
       this.objectUrls = pendingUrls.slice();
       this.objectUrl = null;
       previousUrls.forEach((url) => URL.revokeObjectURL(url));
@@ -8302,9 +8389,12 @@ export class ImageViewer {
           tap_to_display_ms: roundMs(performance.now() - interactionStartedAt),
           requested_width: request.width,
           css_width: roundMs(request.cssWidth),
+          css_height: roundMs(resolvedLayout.pages[index].cssHeight),
           device_pixel_ratio: roundMs(request.dpr),
           fit_mode: request.fitMode,
+          render_trigger: renderTrigger,
           ...viewerTransformTelemetry(this.scale, currentVisualViewportScale()),
+          ...this.layoutTelemetry(),
           prefetch_status: resource.prefetchStatus,
           spread_pages: pages.length,
         };

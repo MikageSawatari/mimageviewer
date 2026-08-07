@@ -1144,6 +1144,16 @@ button {
   touch-action: none;
 }
 
+.viewer-seek-input:focus:not(:focus-visible) {
+  outline: none;
+  box-shadow: none;
+}
+
+.viewer-seek-input:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .video-stream-seek .viewer-seek-input {
   height: 44px;
 }

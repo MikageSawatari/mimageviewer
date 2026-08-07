@@ -391,18 +391,37 @@ test("image fit transforms only the page layer while controls stay its siblings"
   assert.match(css, /\.viewer-ui\s*\{[^}]*position:\s*absolute/);
 });
 
-test("browser and viewer scales are settled and attached to image and gesture events", async () => {
+test("browser, viewer, and layout geometry are attached to image and refit events", async () => {
   const app = await readFile(new URL("app.js", here), "utf8");
   assert.match(app, /visualViewport\?\.addEventListener\?\.\("resize"/);
   assert.match(app, /visualViewportScaleTransition\(/);
   assert.match(app, /\}, 250\);/);
   assert.match(
     app,
-    /fit_mode:\s*request\.fitMode,\s*\.\.\.viewerTransformTelemetry\(this\.scale,/
+    /fit_mode:\s*request\.fitMode,[\s\S]*?\.\.\.viewerTransformTelemetry\(this\.scale,/
   );
   assert.match(app, /detail:\s*"double_tap_fit",[\s\S]*?visualViewportScale:/);
   assert.match(app, /action:\s*"double_tap_candidate_rejected"/);
   assert.match(app, /action:\s*"pinch_end"/);
+  assert.match(app, /type:\s*"viewer_layout",[\s\S]*?action:\s*"refit"/);
+  assert.match(app, /renderTrigger:\s*"viewport_resize"/);
+});
+
+test("page position is committed at image replacement instead of navigation intent", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  const navigation = app.slice(
+    app.indexOf("function changeImageTo("),
+    app.indexOf("async function updateViewerImage(")
+  );
+  assert.doesNotMatch(navigation, /setSeekState\(/);
+  assert.match(
+    app,
+    /this\.pageLayer\.replaceChildren\(decodedImage\);[\s\S]*?this\.commitPagePresentation\(presentation\);/
+  );
+  assert.match(
+    app,
+    /this\.pageLayer\.replaceChildren\(\.\.\.decodedImages[\s\S]*?this\.commitPagePresentation\(presentation\);/
+  );
 });
 
 test("image tiles preserve portrait and landscape shape below a separate label row", async () => {
@@ -484,6 +503,14 @@ test("image and video seek share tap-or-relative-drag handling without replacing
   assert.match(
     css,
     /\.video-stream-seek \.viewer-seek-input\s*\{[^}]*height:\s*44px/
+  );
+  assert.match(
+    css,
+    /\.viewer-seek-input:focus:not\(:focus-visible\)\s*\{[^}]*outline:\s*none/
+  );
+  assert.match(
+    css,
+    /\.viewer-seek-input:focus-visible\s*\{[^}]*outline:\s*3px solid var\(--accent\)/
   );
 });
 

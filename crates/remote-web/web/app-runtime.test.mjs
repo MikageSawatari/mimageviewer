@@ -867,12 +867,16 @@ test("viewer load executes fetch, decode, layout and atomic replacement", async 
 });
 
 test("rapid page loads finish the active request and start only the latest pending request", async () => {
+  const title = new FakeElement("div");
+  title.textContent = "Displayed page";
+  const counter = new FakeElement("span");
+  counter.textContent = "0 / 3";
   const viewer = new ImageViewer({
     root: new FakeElement("section"),
     stage: new FakeElement("div"),
     image: new FakeElement("img"),
-    title: new FakeElement("div"),
-    counter: new FakeElement("span"),
+    title,
+    counter,
     previous: new FakeElement("button"),
     next: new FakeElement("button"),
     loadingIndicator: new FakeElement("div"),
@@ -926,11 +930,14 @@ test("rapid page loads finish the active request and start only the latest pendi
     const second = load(2);
     const third = load(3);
     assert.deepEqual(requested, [1]);
+    assert.equal(title.textContent, "Displayed page");
+    assert.equal(counter.textContent, "0 / 3");
     releaseFirst();
     assert.deepEqual(await Promise.all([first, second, third]), [false, false, true]);
     assert.deepEqual(requested, [1, 3]);
     assert.equal(maximumActiveFetches, 1);
-    assert.equal(viewer.title.textContent, "Page 3");
+    assert.equal(title.textContent, "Page 3");
+    assert.equal(counter.textContent, "3 / 3");
   } finally {
     globalThis.fetch = imageFetch;
     viewer.destroy();

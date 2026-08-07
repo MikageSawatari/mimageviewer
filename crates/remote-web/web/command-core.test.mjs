@@ -63,6 +63,7 @@ import {
   shouldShowKeyboardShortcuts,
   sessionOwnerBadge,
   viewerImageLayout,
+  viewerLayoutTelemetry,
   viewerPageDisplaySlot,
   viewerPageGroupGenerationSnapshot,
   viewerPostDisplayRefreshPlan,
@@ -465,6 +466,28 @@ test("visual viewport scale telemetry is normalized and emitted only after a mat
   assert.deepEqual(telemetryEventForTier(changed.event), {
     ...changed.event,
     telemetry_tier: "normal",
+  });
+});
+
+test("viewer layout telemetry preserves bounded geometry without any content identity", () => {
+  assert.deepEqual(viewerLayoutTelemetry({
+    stageWidth: "429.94",
+    stageHeight: 799.96,
+    viewportWidth: 430,
+    viewportHeight: 800,
+    visualViewportWidth: 429.45,
+    visualViewportHeight: undefined,
+    panelOpen: true,
+    barsVisible: false,
+  }), {
+    stage_css_width: 429.9,
+    stage_css_height: 800,
+    window_inner_width: 430,
+    window_inner_height: 800,
+    visual_viewport_width: 429.5,
+    visual_viewport_height: null,
+    panel_open: true,
+    bars_visible: false,
   });
 });
 

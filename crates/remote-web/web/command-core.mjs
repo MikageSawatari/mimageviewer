@@ -274,6 +274,34 @@ export function viewerTransformTelemetry(viewerScale, visualViewportScale) {
   };
 }
 
+function normalizeViewerLayoutDimension(value) {
+  const dimension = Number(value);
+  if (!Number.isFinite(dimension) || dimension < 0) return null;
+  return Math.round(dimension * 10) / 10;
+}
+
+export function viewerLayoutTelemetry({
+  stageWidth,
+  stageHeight,
+  viewportWidth,
+  viewportHeight,
+  visualViewportWidth,
+  visualViewportHeight,
+  panelOpen = false,
+  barsVisible = true,
+} = {}) {
+  return {
+    stage_css_width: normalizeViewerLayoutDimension(stageWidth),
+    stage_css_height: normalizeViewerLayoutDimension(stageHeight),
+    window_inner_width: normalizeViewerLayoutDimension(viewportWidth),
+    window_inner_height: normalizeViewerLayoutDimension(viewportHeight),
+    visual_viewport_width: normalizeViewerLayoutDimension(visualViewportWidth),
+    visual_viewport_height: normalizeViewerLayoutDimension(visualViewportHeight),
+    panel_open: Boolean(panelOpen),
+    bars_visible: Boolean(barsVisible),
+  };
+}
+
 /// visualViewport fires resize repeatedly while browser zoom animates. Keep the last
 /// reported value as the comparison baseline so sub-threshold steps accumulate, and
 /// only create telemetry once the scale has materially changed.
