@@ -988,10 +988,10 @@ test("AI status stays compact until tapped and keeps errors readable", () => {
     new FakeElement("div"),
     () => () => {}
   );
-  controller.show("拡大しています · 進み具合 3 / 8", { cancellable: true });
-  assert.equal(controller.toggleButton.textContent, "AI 処理中");
+  controller.show("拡大しています · 進み具合 3 / 8");
+  assert.equal(controller.shortLabel.textContent, "AI 処理中");
   assert.equal(controller.details.hidden, true);
-  assert.equal(controller.cancelButton.hidden, false);
+  assert.equal(controller.spinner.hidden, false);
 
   controller.toggleButton.dispatchEvent({
     type: "click",
@@ -1003,8 +1003,25 @@ test("AI status stays compact until tapped and keeps errors readable", () => {
   controller.showRequestError(new Error("network"));
   assert.equal(controller.root.classList.contains("is-error"), true);
   assert.equal(controller.toggleButton.hidden, true);
+  assert.equal(controller.spinner.hidden, true);
   assert.equal(controller.details.hidden, false);
   assert.equal(controller.message.textContent, "AI 処理を開始できませんでした。");
+});
+
+test("the AI status offers no cancel control, matching the desktop viewer", () => {
+  const controller = new RemoteAiController(
+    { root: new FakeElement("section") },
+    new FakeElement("div"),
+    () => () => {}
+  );
+  assert.equal(controller.cancel, undefined);
+  assert.equal(controller.cancelButton, undefined);
+  controller.show("拡大しています");
+  controller.setExpanded(true);
+  assert.deepEqual(
+    controller.details.children.map((child) => child.tagName.toLowerCase()),
+    ["span"]
+  );
 });
 
 test("viewer refuses a page response without a generation attestation", async () => {

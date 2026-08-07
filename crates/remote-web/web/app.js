@@ -594,7 +594,51 @@ if (!RUNTIME_TEST_MODE) {
       }
     }
   });
+  recordRestoredFocusOnLoad();
   boot();
+}
+
+/// 再読み込み直後のシークバーに青枠が出るという報告の切り分け用。
+/// 誰も focus を当てていないので、ブラウザが復元した focus が
+/// `:focus-visible` として扱われている可能性がある。挙動は変えず、
+/// 読み込み直後に実際に focus を持つ要素だけを記録する。
+function recordRestoredFocusOnLoad() {
+  const probe = () => {
+    const active = document.activeElement;
+    const isBody = !active || active === document.body;
+    pendingLoadFocusEvent = {
+      type: "load_focus",
+      followed_in_app_reload: readAppUpdateReloadAttempt() !== null,
+      focused: !isBody,
+      tag: isBody ? null : active.tagName.toLowerCase(),
+      input_type: isBody ? null : active.getAttribute?.("type") ?? null,
+      class_name: isBody ? null : limitText(active.className ?? "", 120),
+      focus_visible: isBody ? null : safeMatches(active, ":focus-visible"),
+    };
+    flushLoadFocusEvent();
+  };
+  // 観測は読み込み直後に取り、送信は telemetry が認証されてからにする。
+  // 認証前に enqueue しても捨てられるため、記録が残らない。
+  requestAnimationFrame(() => requestAnimationFrame(probe));
+}
+
+let pendingLoadFocusEvent = null;
+
+/// 観測と認証はどちらが先に済むか決まらないので、両方から呼んで
+/// 揃った側で 1 度だけ送る。
+function flushLoadFocusEvent() {
+  if (!pendingLoadFocusEvent || !telemetryState.authenticated) return;
+  const event = pendingLoadFocusEvent;
+  pendingLoadFocusEvent = null;
+  enqueueTelemetry(event);
+}
+
+function safeMatches(element, selector) {
+  try {
+    return Boolean(element.matches?.(selector));
+  } catch {
+    return null;
+  }
 }
 
 async function boot() {
@@ -619,6 +663,7 @@ async function boot() {
 async function enterAuthenticatedApp() {
   state.authenticated = true;
   telemetryState.authenticated = true;
+  flushLoadFocusEvent();
   renderLoading("リモートセッションを取得しています");
   if (!await acquireRemoteSession("authenticated", "initial")) return;
   startSessionPing();
@@ -7498,7 +7543,6 @@ const REMOTE_AI_PHASE_LABELS = Object.freeze({
 export const RemoteAiShortLabel = Object.freeze({
   WORKING: "AI 処理中",
   CONNECTING: "AI 接続確認中",
-  CANCELLING: "AI 取消中",
   DONE: "AI 完了",
 });
 
@@ -7596,12 +7640,11 @@ export class RemoteAiController {
     this.root.hidden = true;
     this.root.setAttribute("role", "status");
     this.root.setAttribute("aria-live", "polite");
-    this.toggleButton = textElement(
-      "button",
-      "AI 処理中",
-      "viewer-ai-status-toggle"
-    );
+    this.toggleButton = element("button", "viewer-ai-status-toggle");
     this.toggleButton.type = "button";
+    this.spinner = element("span", "viewer-ai-status-spinner");
+    this.shortLabel = textElement("span", RemoteAiShortLabel.WORKING);
+    this.toggleButton.append(this.spinner, this.shortLabel);
     this.toggleButton.setAttribute("aria-label", "AI 処理の詳細を表示");
     this.toggleButton.setAttribute("aria-expanded", "false");
     this.toggleButton.addEventListener("click", (event) => {
@@ -7611,13 +7654,7 @@ export class RemoteAiController {
     this.details = element("div", "viewer-ai-status-details");
     this.details.hidden = true;
     this.message = textElement("span", "", "viewer-ai-status-message");
-    this.cancelButton = textElement("button", "取り消す");
-    this.cancelButton.type = "button";
-    this.cancelButton.addEventListener("click", (event) => {
-      event.stopPropagation();
-      this.cancel().catch((error) => this.showRequestError(error));
-    });
-    this.details.append(this.message, this.cancelButton);
+    this.details.append(this.message);
     this.root.append(this.toggleButton, this.details);
     viewer.root.append(this.root);
     this.unsubscribeRemoteSessionState = subscribeRemoteSessionState((snapshot) => {
@@ -7670,7 +7707,7 @@ export class RemoteAiController {
       return;
     }
     this.requestId = createRemoteAiRequestId(this.groupHash);
-    this.show("準備しています", { cancellable: true });
+    this.show("準備しています");
     const snapshot = await apiPostJson("/api/ai/jobs", {
       request_id: this.requestId,
       pages: this.pages.map(({ address, target_px, render_context }) => ({
@@ -7727,7 +7764,6 @@ export class RemoteAiController {
       this.remoteSessionState.blocksInteraction
     ) return;
     this.show("接続を確認しています", {
-      cancellable: Boolean(this.job),
       shortLabel: RemoteAiShortLabel.CONNECTING,
     });
     const delay = remoteAiPollingDelay({
@@ -7744,7 +7780,7 @@ export class RemoteAiController {
     this.job = snapshot;
     this.requestId = snapshot.request_id;
     if (!AI_TERMINAL_STATES.has(snapshot.state)) {
-      this.show(remoteAiProgressText(snapshot), { cancellable: snapshot.state !== "cancelling" });
+      this.show(remoteAiProgressText(snapshot));
       const delay = remoteAiPollingDelay({
         visibilityState: document.visibilityState,
         terminal: false,
@@ -7760,7 +7796,6 @@ export class RemoteAiController {
     const message = snapshot.terminal?.message || "AI 処理を完了できませんでした。";
     this.show(message, {
       error: snapshot.state === "failed",
-      cancellable: false,
       shortLabel: RemoteAiShortLabel.DONE,
     });
   }
@@ -7783,13 +7818,12 @@ export class RemoteAiController {
     const appliedIdentity = `${snapshot.job_id}:${this.displayVersion}`;
     if (this.appliedIdentity === appliedIdentity) {
       this.show(completionMessage, {
-        cancellable: false,
         hideAfterMs: 2400,
         shortLabel: RemoteAiShortLabel.DONE,
       });
       return;
     }
-    this.show("表示を整えています", { cancellable: false });
+    this.show("表示を整えています");
     const replacements = await Promise.all(ready.map(async (pageIndex) => {
       const response = await observedFetch(
         `/api/ai/jobs/${encodeURIComponent(snapshot.job_id)}/result?page=${pageIndex}`,
@@ -7810,39 +7844,19 @@ export class RemoteAiController {
     if (!replaced || !this.isCurrent(generation)) return;
     this.appliedIdentity = appliedIdentity;
     this.show(completionMessage, {
-        cancellable: false,
         hideAfterMs: 2400,
         shortLabel: RemoteAiShortLabel.DONE,
       });
   }
 
-  async cancel() {
-    const job = this.job;
-    if (!job || AI_TERMINAL_STATES.has(job.state)) return;
-    this.show("取り消しています", {
-      cancellable: false,
-      shortLabel: RemoteAiShortLabel.CANCELLING,
-    });
-    const response = await observedFetch(
-      `/api/ai/jobs/${encodeURIComponent(job.job_id)}`,
-      { method: "DELETE", credentials: "same-origin", headers: { Accept: "application/json" } }
-    );
-    if (!response.ok) {
-      const detail = await response.clone().json().catch(() => ({}));
-      throw new Error(detail.message || "AI 処理を取り消せませんでした。");
-    }
-    await this.handleSnapshot(await response.json(), this.generation);
-  }
-
   showRequestError(_error) {
-    this.show("AI 処理を開始できませんでした。", { error: true, cancellable: false });
+    this.show("AI 処理を開始できませんでした。", { error: true });
   }
 
   show(
     message,
     {
       error = false,
-      cancellable = false,
       hideAfterMs = 0,
       shortLabel = RemoteAiShortLabel.WORKING,
     } = {}
@@ -7853,10 +7867,10 @@ export class RemoteAiController {
     this.message.textContent = message;
     this.root.setAttribute("aria-label", message);
     this.root.classList.toggle("is-error", error);
-    this.cancelButton.hidden = !cancellable;
     // 縮小表示のラベルは呼び出し側が渡す。詳細文言との文字列一致で決めると、
     // 文言を書き換えたときに黙って既定へ落ちる。
-    this.toggleButton.textContent = shortLabel;
+    this.shortLabel.textContent = shortLabel;
+    this.spinner.hidden = error || hideAfterMs > 0;
     this.toggleButton.hidden = error;
     if (error) this.setExpanded(true);
     else if (wasError || hideAfterMs > 0) this.setExpanded(false);

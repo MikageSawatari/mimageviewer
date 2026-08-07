@@ -1029,8 +1029,11 @@ button {
 }
 
 .viewer-ai-status-toggle {
+  display: flex;
   flex: 0 0 auto;
   min-height: 32px;
+  align-items: center;
+  gap: 7px;
   padding: 5px 11px;
   border: 0;
   border-radius: 999px;
@@ -1061,14 +1064,25 @@ button {
   min-width: 0;
 }
 
-.viewer-ai-status-details button {
+.viewer-ai-status-spinner {
+  display: block;
   flex: 0 0 auto;
-  min-height: 32px;
-  padding: 5px 10px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  color: inherit;
-  background: rgb(255 255 255 / 8%);
+  width: 11px;
+  height: 11px;
+  border: 2px solid rgb(216 229 255 / 34%);
+  border-top-color: rgb(216 229 255 / 92%);
+  border-radius: 50%;
+  animation: viewer-ai-status-spin 0.9s linear infinite;
+}
+
+.viewer-ai-status-spinner[hidden] {
+  display: none;
+}
+
+@keyframes viewer-ai-status-spin {
+  to {
+    transform: rotate(1turn);
+  }
 }
 
 @keyframes viewer-loading-slide {
