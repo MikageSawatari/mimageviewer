@@ -279,6 +279,13 @@ const GRID_TOUCH_REMAINDER_EPSILON: f32 = 0.01;
 /// started drag without allowing the half-row reversal seen with nearest-row
 /// snapping; keep it centralized for real-device tuning.
 const GRID_TOUCH_SETTLE_REVERSAL_TOLERANCE: f32 = 0.15;
+/// Snap travel below 20% of a row remains instant because easing a few pixels
+/// felt sluggish on the real touch display. Longer travel uses a short 130 ms
+/// ease-out so a direction-of-travel snap covering most of a row reads as
+/// continuous motion rather than a jump. Keep both values together for
+/// real-device tuning.
+const GRID_TOUCH_SNAP_GLIDE_MIN_TRAVEL_RATIO: f32 = 0.20;
+const GRID_TOUCH_SNAP_GLIDE_DURATION: std::time::Duration = std::time::Duration::from_millis(130);
 /// A list pinch must accumulate a 25% scale change before moving one column.
 /// Its reciprocal (0.8) is the contraction threshold, so small sample noise
 /// cancels around 1.0 instead of making the discrete column count oscillate.
@@ -304,9 +311,49 @@ enum GridTouchScrollDirection {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct GridTouchScrollState {
+    anchor_y: f32,
     remainder_y: f32,
     row_h: f32,
-    direction: Option<GridTouchScrollDirection>,
+    items_generation: u64,
+    phase: GridTouchScrollPhase,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GridTouchScrollPhase {
+    Contact {
+        direction: Option<GridTouchScrollDirection>,
+    },
+    Glide {
+        animation: GridTouchSnapAnimation,
+        started_at: std::time::Instant,
+    },
+}
+
+impl Default for GridTouchScrollPhase {
+    fn default() -> Self {
+        Self::Contact { direction: None }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GridTouchSnapAnimation {
+    start: GridTouchScrollPosition,
+    target: GridTouchScrollPosition,
+    row_h: f32,
+}
+
+impl GridTouchSnapAnimation {
+    fn travel_y(self) -> f32 {
+        ((self.target.anchor_y + self.target.remainder_y)
+            - (self.start.anchor_y + self.start.remainder_y))
+            .abs()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GridTouchSnapPlan {
+    Immediate(GridTouchScrollPosition),
+    Glide(GridTouchSnapAnimation),
 }
 
 /// Applies incremental finger motion without ever making the canonical grid
@@ -398,6 +445,68 @@ fn settle_grid_touch_scroll(
     }
 }
 
+/// Chooses between an immediate release commit and a short remainder-only
+/// glide. The returned animation keeps start.anchor_y unchanged until its
+/// terminal frame; only that frame publishes the row-aligned target anchor.
+fn plan_grid_touch_snap(
+    anchor_y: f32,
+    remainder_y: f32,
+    row_h: f32,
+    max_offset: f32,
+    direction: Option<GridTouchScrollDirection>,
+) -> GridTouchSnapPlan {
+    let row_h = row_h.max(1.0);
+    let start = apply_grid_touch_scroll_delta(anchor_y, remainder_y, 0.0, row_h, max_offset);
+    let target = settle_grid_touch_scroll(
+        start.anchor_y,
+        start.remainder_y,
+        row_h,
+        max_offset,
+        direction,
+    );
+    let animation = GridTouchSnapAnimation {
+        start,
+        target,
+        row_h,
+    };
+    if animation.travel_y() < row_h * GRID_TOUCH_SNAP_GLIDE_MIN_TRAVEL_RATIO {
+        GridTouchSnapPlan::Immediate(target)
+    } else {
+        GridTouchSnapPlan::Glide(animation)
+    }
+}
+
+/// Pure cubic ease-out progression for a grid snap glide.
+///
+/// Before completion the canonical anchor is exactly the starting row and the
+/// interpolated motion lives only in remainder_y. At or beyond 130 ms the
+/// exact row-aligned target is returned, which is the glide's sole anchor
+/// commit.
+fn grid_touch_snap_position_at(
+    animation: GridTouchSnapAnimation,
+    elapsed: std::time::Duration,
+) -> GridTouchScrollPosition {
+    if elapsed >= GRID_TOUCH_SNAP_GLIDE_DURATION {
+        return animation.target;
+    }
+
+    let linear = elapsed.as_secs_f32() / GRID_TOUCH_SNAP_GLIDE_DURATION.as_secs_f32();
+    let eased = 1.0 - (1.0 - linear.clamp(0.0, 1.0)).powi(3);
+    let start_y = animation.start.anchor_y + animation.start.remainder_y;
+    let target_y = animation.target.anchor_y + animation.target.remainder_y;
+    GridTouchScrollPosition {
+        anchor_y: animation.start.anchor_y,
+        remainder_y: (start_y + (target_y - start_y) * eased - animation.start.anchor_y).clamp(
+            GRID_TOUCH_REMAINDER_EPSILON,
+            animation.row_h - GRID_TOUCH_REMAINDER_EPSILON,
+        ),
+    }
+}
+
+fn grid_touch_snap_needs_animation_repaint(phase: GridTouchScrollPhase) -> bool {
+    matches!(phase, GridTouchScrollPhase::Glide { .. })
+}
+
 /// A fractional viewport reveals the next row at the bottom. Extend both the
 /// strict visible end and the retention end by exactly one row while it is
 /// present.
@@ -418,26 +527,44 @@ fn grid_touch_scroll_state_id(ctx: &egui::Context) -> egui::Id {
     egui::Id::new(("miv_grid_touch_scroll_fraction", ctx.viewport_id()))
 }
 
-fn grid_touch_scroll_state(ctx: &egui::Context, row_h: f32) -> GridTouchScrollState {
+fn grid_touch_scroll_state(
+    ctx: &egui::Context,
+    anchor_y: f32,
+    row_h: f32,
+    items_generation: u64,
+) -> GridTouchScrollState {
     let id = grid_touch_scroll_state_id(ctx);
     ctx.data(|data| data.get_temp::<GridTouchScrollState>(id))
-        .filter(|state| (state.row_h - row_h).abs() <= 0.5)
+        .filter(|state| {
+            state.items_generation == items_generation
+                && (state.anchor_y - anchor_y).abs() <= GRID_TOUCH_REMAINDER_EPSILON
+                && (state.row_h - row_h).abs() <= 0.5
+        })
         .unwrap_or(GridTouchScrollState {
+            anchor_y,
             remainder_y: 0.0,
             row_h,
-            direction: None,
+            items_generation,
+            phase: GridTouchScrollPhase::Contact { direction: None },
         })
 }
 
-pub(crate) fn grid_touch_scroll_remainder(ctx: &egui::Context, row_h: f32) -> f32 {
-    grid_touch_scroll_state(ctx, row_h).remainder_y
+pub(crate) fn grid_touch_scroll_remainder(
+    ctx: &egui::Context,
+    anchor_y: f32,
+    row_h: f32,
+    items_generation: u64,
+) -> f32 {
+    grid_touch_scroll_state(ctx, anchor_y, row_h, items_generation).remainder_y
 }
 
 fn set_grid_touch_scroll_state(
     ctx: &egui::Context,
+    anchor_y: f32,
     row_h: f32,
+    items_generation: u64,
     remainder_y: f32,
-    direction: Option<GridTouchScrollDirection>,
+    phase: GridTouchScrollPhase,
 ) {
     let id = grid_touch_scroll_state_id(ctx);
     ctx.data_mut(|data| {
@@ -445,9 +572,11 @@ fn set_grid_touch_scroll_state(
             data.insert_temp(
                 id,
                 GridTouchScrollState {
+                    anchor_y,
                     remainder_y,
                     row_h,
-                    direction,
+                    items_generation,
+                    phase,
                 },
             );
         } else {
@@ -14644,8 +14773,10 @@ impl App {
                     self.frame_counter,
                     touch_scroll_enabled,
                 );
-                if !touch_scroll_enabled && touch_frame.touch_cancelled() {
+                if !touch_scroll_enabled {
                     clear_grid_touch_scroll_remainder(ctx);
+                }
+                if !touch_scroll_enabled && touch_frame.touch_cancelled() {
                     finish_grid_pinch_column_gesture(self, ctx, "cancel_disabled");
                 }
                 let touch_derived_pointer_activity =
@@ -14834,13 +14965,53 @@ impl App {
                 self.scroll_offset_y =
                     resolve_grid_scroll_offset(self.scroll_offset_y, max_offset, pending_scroll);
 
-                let scroll_state = grid_touch_scroll_state(ctx, cell_h);
+                let scroll_state = grid_touch_scroll_state(
+                    ctx,
+                    self.scroll_offset_y,
+                    cell_h,
+                    self.items_generation,
+                );
                 let mut fractional_drag_y = scroll_state.remainder_y;
-                let mut touch_scroll_direction = scroll_state.direction;
-                let mut touch_scroll_changed = false;
+                let mut touch_scroll_phase = scroll_state.phase;
+                let mut touch_input_changed = false;
+                let mut glide_advanced = false;
+                let snap_now = std::time::Instant::now();
+                if let GridTouchScrollPhase::Glide {
+                    animation,
+                    started_at,
+                } = touch_scroll_phase
+                {
+                    let elapsed = snap_now.saturating_duration_since(started_at);
+                    let position = grid_touch_snap_position_at(animation, elapsed);
+                    self.scroll_offset_y = position.anchor_y;
+                    fractional_drag_y = position.remainder_y;
+                    glide_advanced = true;
+                    if elapsed >= GRID_TOUCH_SNAP_GLIDE_DURATION {
+                        touch_scroll_phase =
+                            GridTouchScrollPhase::Contact { direction: None };
+                        if crate::touch_debug::touch_debug_enabled() {
+                            crate::logger::log(format!(
+                                "[TOUCH-DEBUG] grid_scroll_glide_finish anchor={:.2} remainder={:.2}",
+                                position.anchor_y, position.remainder_y
+                            ));
+                        }
+                    }
+                }
                 for command in touch_frame.commands().iter().copied() {
                     match command {
                         crate::touch_input::TouchCommand::ScrollGrid { delta_y } => {
+                            let previous_direction = match touch_scroll_phase {
+                                GridTouchScrollPhase::Contact { direction } => direction,
+                                GridTouchScrollPhase::Glide { .. } => None,
+                            };
+                            if matches!(touch_scroll_phase, GridTouchScrollPhase::Glide { .. })
+                                && crate::touch_debug::touch_debug_enabled()
+                            {
+                                crate::logger::log(format!(
+                                    "[TOUCH-DEBUG] grid_scroll_glide_interrupt cause=scroll anchor={:.2} remainder={fractional_drag_y:.2}",
+                                    self.scroll_offset_y
+                                ));
+                            }
                             let before_y = self.scroll_offset_y + fractional_drag_y;
                             let position = apply_grid_touch_scroll_delta(
                                 self.scroll_offset_y,
@@ -14850,36 +15021,64 @@ impl App {
                                 max_offset,
                             );
                             let after_y = position.anchor_y + position.remainder_y;
-                            touch_scroll_direction = grid_touch_direction_after_move(
+                            let direction = grid_touch_direction_after_move(
                                 before_y,
                                 after_y,
-                                touch_scroll_direction,
+                                previous_direction,
                             );
                             self.scroll_offset_y = position.anchor_y;
                             fractional_drag_y = position.remainder_y;
-                            touch_scroll_changed = true;
+                            touch_scroll_phase =
+                                GridTouchScrollPhase::Contact { direction };
+                            touch_input_changed = true;
                         }
                         crate::touch_input::TouchCommand::ScrollGridEnd => {
                             let before_y = self.scroll_offset_y + fractional_drag_y;
-                            let position = settle_grid_touch_scroll(
+                            let direction = match touch_scroll_phase {
+                                GridTouchScrollPhase::Contact { direction } => direction,
+                                GridTouchScrollPhase::Glide { .. } => None,
+                            };
+                            let plan = plan_grid_touch_snap(
                                 self.scroll_offset_y,
                                 fractional_drag_y,
                                 cell_h,
                                 max_offset,
-                                touch_scroll_direction,
+                                direction,
                             );
-                            if crate::touch_debug::touch_debug_enabled() {
-                                crate::logger::log(format!(
-                                    "[TOUCH-DEBUG] grid_scroll_settle direction={:?} before={before_y:.2} after={:.2} tolerance={:.2}",
-                                    touch_scroll_direction,
-                                    position.anchor_y,
-                                    cell_h * GRID_TOUCH_SETTLE_REVERSAL_TOLERANCE
-                                ));
+                            match plan {
+                                GridTouchSnapPlan::Immediate(position) => {
+                                    if crate::touch_debug::touch_debug_enabled() {
+                                        crate::logger::log(format!(
+                                            "[TOUCH-DEBUG] grid_scroll_settle mode=instant direction={direction:?} before={before_y:.2} after={:.2} travel={:.2} threshold={:.2}",
+                                            position.anchor_y,
+                                            (position.anchor_y - before_y).abs(),
+                                            cell_h * GRID_TOUCH_SNAP_GLIDE_MIN_TRAVEL_RATIO
+                                        ));
+                                    }
+                                    self.scroll_offset_y = position.anchor_y;
+                                    fractional_drag_y = position.remainder_y;
+                                    touch_scroll_phase =
+                                        GridTouchScrollPhase::Contact { direction: None };
+                                }
+                                GridTouchSnapPlan::Glide(animation) => {
+                                    if crate::touch_debug::touch_debug_enabled() {
+                                        crate::logger::log(format!(
+                                            "[TOUCH-DEBUG] grid_scroll_settle mode=glide direction={direction:?} before={before_y:.2} target={:.2} travel={:.2} threshold={:.2} duration_ms={}",
+                                            animation.target.anchor_y,
+                                            animation.travel_y(),
+                                            cell_h * GRID_TOUCH_SNAP_GLIDE_MIN_TRAVEL_RATIO,
+                                            GRID_TOUCH_SNAP_GLIDE_DURATION.as_millis()
+                                        ));
+                                    }
+                                    self.scroll_offset_y = animation.start.anchor_y;
+                                    fractional_drag_y = animation.start.remainder_y;
+                                    touch_scroll_phase = GridTouchScrollPhase::Glide {
+                                        animation,
+                                        started_at: snap_now,
+                                    };
+                                }
                             }
-                            self.scroll_offset_y = position.anchor_y;
-                            fractional_drag_y = position.remainder_y;
-                            touch_scroll_direction = None;
-                            touch_scroll_changed = true;
+                            touch_input_changed = true;
                         }
                         crate::touch_input::TouchCommand::Zoom { factor, .. } => {
                             let old_cols = self.settings.grid_cols;
@@ -14913,39 +15112,111 @@ impl App {
                         | crate::touch_input::TouchCommand::OpenSidePanel { .. } => {}
                     }
                 }
+                if let GridTouchScrollPhase::Glide {
+                    animation,
+                    started_at,
+                } = touch_scroll_phase
+                    && touch_frame.is_active()
+                {
+                    let position = grid_touch_snap_position_at(
+                        animation,
+                        snap_now.saturating_duration_since(started_at),
+                    );
+                    self.scroll_offset_y = position.anchor_y;
+                    fractional_drag_y = position.remainder_y;
+                    touch_scroll_phase = GridTouchScrollPhase::Contact { direction: None };
+                    touch_input_changed = true;
+                    if crate::touch_debug::touch_debug_enabled() {
+                        crate::logger::log(format!(
+                            "[TOUCH-DEBUG] grid_scroll_glide_interrupt cause=touch owner={:?} anchor={:.2} remainder={:.2}",
+                            touch_frame.owner(),
+                            position.anchor_y,
+                            position.remainder_y
+                        ));
+                    }
+                }
                 if (touch_frame.touch_cancelled()
                     || touch_frame.owner() == crate::touch_input::TouchOwner::Cancelled)
                     && fractional_drag_y > GRID_TOUCH_REMAINDER_EPSILON
                 {
+                    let direction = match touch_scroll_phase {
+                        GridTouchScrollPhase::Contact { direction } => direction,
+                        GridTouchScrollPhase::Glide { .. } => None,
+                    };
                     let position = settle_grid_touch_scroll(
                         self.scroll_offset_y,
                         fractional_drag_y,
                         cell_h,
                         max_offset,
-                        touch_scroll_direction,
+                        direction,
                     );
                     self.scroll_offset_y = position.anchor_y;
                     fractional_drag_y = position.remainder_y;
-                    touch_scroll_direction = None;
-                    touch_scroll_changed = true;
+                    touch_scroll_phase = GridTouchScrollPhase::Contact { direction: None };
+                    touch_input_changed = true;
                 }
                 if touch_frame.touch_cancelled()
                     || touch_frame.owner() == crate::touch_input::TouchOwner::Cancelled
                 {
                     finish_grid_pinch_column_gesture(self, ctx, "cancel");
                 }
+                // A touch that interrupted a glide may remain a tap rather
+                // than becoming GridScroll. Once that contact leaves, settle
+                // the inherited remainder instead of stranding a fractional
+                // viewport indefinitely.
+                if let GridTouchScrollPhase::Contact { direction } = touch_scroll_phase
+                    && !touch_frame.is_active()
+                    && fractional_drag_y > GRID_TOUCH_REMAINDER_EPSILON
+                {
+                    match plan_grid_touch_snap(
+                        self.scroll_offset_y,
+                        fractional_drag_y,
+                        cell_h,
+                        max_offset,
+                        direction,
+                    ) {
+                        GridTouchSnapPlan::Immediate(position) => {
+                            self.scroll_offset_y = position.anchor_y;
+                            fractional_drag_y = position.remainder_y;
+                            touch_scroll_phase =
+                                GridTouchScrollPhase::Contact { direction: None };
+                        }
+                        GridTouchSnapPlan::Glide(animation) => {
+                            self.scroll_offset_y = animation.start.anchor_y;
+                            fractional_drag_y = animation.start.remainder_y;
+                            touch_scroll_phase = GridTouchScrollPhase::Glide {
+                                animation,
+                                started_at: snap_now,
+                            };
+                        }
+                    }
+                    touch_input_changed = true;
+                }
                 set_grid_touch_scroll_state(
                     ctx,
+                    self.scroll_offset_y,
                     cell_h,
+                    self.items_generation,
                     fractional_drag_y,
-                    touch_scroll_direction,
+                    touch_scroll_phase,
                 );
                 let touch_scroll_active = touch_frame.is_active()
                     && touch_frame.owner() == crate::touch_input::TouchOwner::GridScroll;
-                if touch_scroll_changed || touch_scroll_active {
+                let snap_glide_active =
+                    grid_touch_snap_needs_animation_repaint(touch_scroll_phase);
+                if touch_input_changed
+                    || touch_scroll_active
+                    || snap_glide_active
+                    || glide_advanced
+                {
                     self.note_grid_touch_scroll_activity();
                 }
-                if touch_scroll_changed {
+                // The glide is the only animation repaint producer. Its
+                // terminal frame changes the phase before this branch, so an
+                // absent Glide state cannot keep requesting animation frames.
+                if snap_glide_active {
+                    ctx.request_repaint();
+                } else if touch_input_changed {
                     ctx.request_repaint();
                 }
                 let display_scroll_offset_y = self.scroll_offset_y + fractional_drag_y;
@@ -19399,6 +19670,169 @@ mod compute_cell_size_tests {
         assert_eq!(bottom.anchor_y, 500.0);
         assert_touch_anchor_is_row_snapped(top, 100.0);
         assert_touch_anchor_is_row_snapped(bottom, 100.0);
+    }
+
+    #[test]
+    fn grid_touch_snap_below_travel_threshold_stays_instant() {
+        let instant = plan_grid_touch_snap(
+            200.0,
+            81.0,
+            100.0,
+            500.0,
+            Some(GridTouchScrollDirection::Increasing),
+        );
+        assert_eq!(
+            instant,
+            GridTouchSnapPlan::Immediate(GridTouchScrollPosition {
+                anchor_y: 300.0,
+                remainder_y: 0.0,
+            })
+        );
+
+        let boundary = plan_grid_touch_snap(
+            200.0,
+            80.0,
+            100.0,
+            500.0,
+            Some(GridTouchScrollDirection::Increasing),
+        );
+        assert!(matches!(boundary, GridTouchSnapPlan::Glide(_)));
+    }
+
+    #[test]
+    fn grid_touch_snap_progress_is_exact_and_ease_out() {
+        let GridTouchSnapPlan::Glide(animation) = plan_grid_touch_snap(
+            200.0,
+            20.0,
+            100.0,
+            500.0,
+            Some(GridTouchScrollDirection::Increasing),
+        ) else {
+            panic!();
+        };
+
+        let start = grid_touch_snap_position_at(animation, std::time::Duration::ZERO);
+        let midpoint = grid_touch_snap_position_at(animation, std::time::Duration::from_millis(65));
+        let finish = grid_touch_snap_position_at(animation, GRID_TOUCH_SNAP_GLIDE_DURATION);
+        let after = grid_touch_snap_position_at(
+            animation,
+            GRID_TOUCH_SNAP_GLIDE_DURATION + std::time::Duration::from_secs(1),
+        );
+
+        assert_eq!(start, animation.start);
+        let start_y = start.anchor_y + start.remainder_y;
+        let target_y = animation.target.anchor_y + animation.target.remainder_y;
+        let midpoint_y = midpoint.anchor_y + midpoint.remainder_y;
+        assert!(midpoint_y > start_y + (target_y - start_y) * 0.5);
+        assert!(midpoint_y < target_y);
+        assert_eq!(finish, animation.target);
+        assert_eq!(after, animation.target);
+        assert_touch_anchor_is_row_snapped(start, animation.row_h);
+        assert_touch_anchor_is_row_snapped(midpoint, animation.row_h);
+        assert_touch_anchor_is_row_snapped(finish, animation.row_h);
+    }
+
+    #[test]
+    fn grid_touch_snap_repaint_requires_glide_state() {
+        assert!(!grid_touch_snap_needs_animation_repaint(
+            GridTouchScrollPhase::Contact { direction: None }
+        ));
+
+        let GridTouchSnapPlan::Glide(animation) = plan_grid_touch_snap(
+            200.0,
+            20.0,
+            100.0,
+            500.0,
+            Some(GridTouchScrollDirection::Increasing),
+        ) else {
+            panic!();
+        };
+        assert!(grid_touch_snap_needs_animation_repaint(
+            GridTouchScrollPhase::Glide {
+                animation,
+                started_at: std::time::Instant::now(),
+            }
+        ));
+    }
+
+    #[test]
+    fn grid_touch_snap_interruption_keeps_anchor_and_inherits_remainder() {
+        let GridTouchSnapPlan::Glide(animation) = plan_grid_touch_snap(
+            200.0,
+            20.0,
+            100.0,
+            500.0,
+            Some(GridTouchScrollDirection::Increasing),
+        ) else {
+            panic!();
+        };
+
+        let interrupted =
+            grid_touch_snap_position_at(animation, std::time::Duration::from_millis(50));
+        assert_eq!(interrupted.anchor_y, animation.start.anchor_y);
+        assert!(interrupted.remainder_y > animation.start.remainder_y);
+        assert!(interrupted.remainder_y < animation.row_h);
+        assert_touch_anchor_is_row_snapped(interrupted, animation.row_h);
+
+        let continued = apply_grid_touch_scroll_delta(
+            interrupted.anchor_y,
+            interrupted.remainder_y,
+            -5.0,
+            animation.row_h,
+            500.0,
+        );
+        let inherited_y = interrupted.anchor_y + interrupted.remainder_y;
+        let continued_y = continued.anchor_y + continued.remainder_y;
+        assert!((continued_y - (inherited_y + 5.0)).abs() < 0.001);
+        assert_touch_anchor_is_row_snapped(continued, animation.row_h);
+    }
+
+    #[test]
+    fn grid_touch_snap_completion_and_end_clamps_keep_row_anchor() {
+        let GridTouchSnapPlan::Glide(animation) = plan_grid_touch_snap(
+            400.0,
+            80.0,
+            100.0,
+            500.0,
+            Some(GridTouchScrollDirection::Increasing),
+        ) else {
+            panic!();
+        };
+        let finish = grid_touch_snap_position_at(animation, GRID_TOUCH_SNAP_GLIDE_DURATION);
+        assert_eq!(
+            finish,
+            GridTouchScrollPosition {
+                anchor_y: 500.0,
+                remainder_y: 0.0,
+            }
+        );
+        assert_touch_anchor_is_row_snapped(finish, 100.0);
+
+        let top = plan_grid_touch_snap(
+            0.0,
+            10.0,
+            100.0,
+            500.0,
+            Some(GridTouchScrollDirection::Decreasing),
+        );
+        let bottom = plan_grid_touch_snap(
+            500.0,
+            90.0,
+            100.0,
+            500.0,
+            Some(GridTouchScrollDirection::Increasing),
+        );
+        assert_eq!(
+            top,
+            GridTouchSnapPlan::Immediate(GridTouchScrollPosition::default())
+        );
+        assert_eq!(
+            bottom,
+            GridTouchSnapPlan::Immediate(GridTouchScrollPosition {
+                anchor_y: 500.0,
+                remainder_y: 0.0,
+            })
+        );
     }
 
     #[test]

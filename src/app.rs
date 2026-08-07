@@ -30132,7 +30132,12 @@ impl App {
             grid_vis_first,
             self.fullscreen_idx,
         );
-        let fractional_drag_y = crate::ui_main::grid_touch_scroll_remainder(ctx, cell_h);
+        let fractional_drag_y = crate::ui_main::grid_touch_scroll_remainder(
+            ctx,
+            self.scroll_offset_y,
+            cell_h,
+            self.items_generation,
+        );
         let strict_visible_end = crate::ui_main::extend_grid_end_for_touch_fraction(
             vis_first.saturating_add(items_per_page),
             cols,

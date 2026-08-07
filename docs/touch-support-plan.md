@@ -449,14 +449,24 @@ pinch へ昇格し、一覧側が連続倍率を列数変更へ解釈する。
 吸収するため、端数が行高の 15% 以内なら逆方向への確定を許す。方向不明時だけ最寄り行へ
 フォールバックする。これにより release 時の逆走量は上下どちらも最大 15% となる。
 
+release から確定先までの移動量が行高の 20% 未満なら従来どおり即時確定し、それ以上なら
+130ms の cubic ease-out で補間する。補間中に動かすのは `fractional_drag_y` だけで、
+`scroll_offset_y` (anchor) は開始行の境界に保ち、完了 frame で確定先の行境界へ 1 回だけ
+更新して端数を 0 にする。新しい touch が始まった場合は、その frame まで進んだ端数を引き継いで
+補間を中断する。元の位置へ戻したり、補間完了を待ったりしない。
+
 付随して必要な改修:
 
 - 端数表示中は可視範囲の**末尾を追加で 1 行保持**する (でないと下端が欠ける)
-- touch move ごとに「スクロール中」を明示的に通知する
+- touch move / release と snap 補間の各 frame で「スクロール中」を明示的に通知する
   — `last_prefetch_scroll_at` / `last_scroll_event_at` / idle-upgrade の時刻を更新し、
-  指を離すまで scroll settle を発火させない。
+  snap 補間がある場合は完了まで scroll settle を発火させない。release frame は raw Touch End も
+  early intent として記録し、補間状態を作る前に prefetch gate が一瞬開くことを防ぐ。
   現在の scroll 検出はオフセット変化の fallback に頼っており (`app/runtime_ops.rs:13-31`)、
   **端数だけ動いたフレームは検出できない**
+- snap 補間中だけ `ctx.request_repaint()` を要求する。補間の terminal frame で状態を
+  `Contact` に戻してから repaint 条件を評価し、補間状態が無い frame から animation
+  repaint を出さない
 - **タッチ由来のポインタストリームでは native file D&D を無効にする** (`ui_main.rs:12325`)。
   マウス D&D は維持する
 - 一覧 pinch は recognizer の `Zoom { factor, pivot }` をそのまま受け、一覧側だけが列数へ
@@ -469,7 +479,9 @@ pinch へ昇格し、一覧側が連続倍率を列数変更へ解釈する。
   保持し、`PinchEnd` または cancel で状態を consume した 1 回だけ保存する。
   Ctrl+ホイールは従来どおり 1 step ごとに即時保存する
 
-**慣性は初期版では入れない**。「指に追従して動く + 離したら行スナップ」だけでも現状より大幅に改善する。
+**慣性は入れない**。「指に追従して動く + 離したら行スナップ」だけでも現状より大幅に改善する。
+上記 130ms は release 時点で既に決まっている snap 先までの短い補間であり、速度から到達行を
+増やす慣性ではない。
 無制限の物理スクロールは PDF 先読み・eviction・idle upgrade との調整コストに見合わない。
 実機評価後に必要なら、速度から最終到達行を決める限定形 (最大数画面・慣性中は prefetch 抑止・
 最後は必ず行スナップ) だけを追加する。

@@ -183,12 +183,13 @@ gate 解放後 update_keep_range_and_requests が再走したときに新規 enq
 
 `last_prefetch_scroll_at` は:
 - `App::update` 冒頭の input intent detection (= ctx.input ベース。thumbnail grid の
-  raw Touch Move も含む) で prefetch 用 timestamp を set
+  raw Touch Move / End も含む) で prefetch 用 timestamp を set。End を含めるのは、
+  指を止めてから離した frame に snap 補間開始前の gate が開くことを防ぐため
 - `update_scroll_settle_state` の offset 変化検出でも fallback として set
   (= scrollbar drag などキー以外の経路の保険)
 - 一覧の touch drag は `scroll_offset_y` を行境界に保ったまま描画端数だけ動くため、
-  touch command 適用境界から move / hold / release ごとに prefetch / settle / idle-upgrade の
-  各 timestamp を明示的に set
+  touch command 適用境界から move / hold / release と snap 補間の各 frame で prefetch /
+  settle / idle-upgrade の各 timestamp を明示的に set。snap 補間完了までは scroll 中として扱う
 - **clear しない**。backstop 3 秒は前回の scroll から経った時間で判定する
 - folder 切替 (= `start_loading_items`) では `None` ではなく **`Some(now)`** にリセット
   (= 「直前にスクロールしたのと同じ扱い」で新コンテキストでも gate を効かせる、Codex R4 確認)

@@ -3,8 +3,9 @@ use super::*;
 // scroll_settle 計装の helper 群は inherent impl (trait method ではない)
 impl App {
     /// `App::update` 冒頭で 1 回呼ぶ。同フレーム内の wheel / arrow keys / Page / Home / End と
-    /// thumbnail grid 上で解釈され得る Touch Move を ctx.input から拾い、prefetch 用 timestamp を
-    /// 即時更新する。
+    /// thumbnail grid 上で解釈され得る Touch Move / End を ctx.input から拾い、prefetch 用
+    /// timestamp を即時更新する。End も対象にすることで、指を止めてから離した frame に
+    /// snap glide が始まる前の gate が一瞬開くことを防ぐ。
     ///
     /// なぜ早期検出か: `update_keep_range_and_requests` の gate 判定 (line 18204 付近) は
     /// 同フレーム内の `process_scroll` / `handle_keyboard` の `scroll_offset_y` mutate より前に
@@ -16,7 +17,7 @@ impl App {
     /// settle / idle を止めるため認識器の command 適用境界から
     /// `note_grid_touch_scroll_activity` を明示的に呼ぶ。
     pub(super) fn detect_scroll_input_intent(&mut self, ctx: &egui::Context) {
-        let grid_touch_move = !crate::touch_correlation::touch_gestures_disabled()
+        let grid_touch_scroll_intent = !crate::touch_correlation::touch_gestures_disabled()
             && self.settings.grid_view_mode != crate::settings::GridViewMode::Details
             && !self.viewer_session_blocks_main_window()
             && !self.any_dialog_open()
@@ -25,13 +26,13 @@ impl App {
                     matches!(
                         event,
                         egui::Event::Touch {
-                            phase: egui::TouchPhase::Move,
+                            phase: egui::TouchPhase::Move | egui::TouchPhase::End,
                             ..
                         }
                     )
                 })
             });
-        let scrolling = grid_touch_move
+        let scrolling = grid_touch_scroll_intent
             || ctx.input(|i| {
                 i.raw_scroll_delta.length() > 0.1
                     || i.key_pressed(egui::Key::ArrowDown)
