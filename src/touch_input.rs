@@ -262,16 +262,26 @@ impl TouchRecognizer {
 
         if self.contacts.len() >= PINCH_CONTACT_COUNT {
             match self.owner {
-                TouchOwner::Undecided => {
-                    self.owner = TouchOwner::Pinch;
-                    self.suppress_primary = true;
-                    self.rebase_pinch();
+                TouchOwner::Undecided | TouchOwner::ViewerPointerPassthrough => self.begin_pinch(),
+                TouchOwner::EdgeSwipe { .. } => {
+                    // Step 3 does not dispatch OpenSidePanel yet, so an added
+                    // contact may still claim pinch. Revisit this ownership
+                    // choice when Step 3b wires the edge-swipe action.
+                    self.begin_pinch();
                 }
                 TouchOwner::Pinch => self.rebase_pinch(),
-                _ => {}
+                TouchOwner::WidgetPassthrough
+                | TouchOwner::ViewerTapZone
+                | TouchOwner::Cancelled => {}
             }
         }
         Vec::new()
+    }
+
+    fn begin_pinch(&mut self) {
+        self.owner = TouchOwner::Pinch;
+        self.suppress_primary = true;
+        self.rebase_pinch();
     }
 
     fn handle_move(&mut self, sample: TouchSample) -> Vec<TouchCommand> {
@@ -585,13 +595,35 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_pointer_pan_does_not_switch_owner() {
+    fn confirmed_pointer_pan_upgrades_to_rebased_pinch_when_contact_is_added() {
         let geometry = geom();
         let mut recognizer = TouchRecognizer::new();
-        recognizer.handle_sample(&geometry, sample(1, 500.0, 400.0, TouchPhase::Start, 0));
-        recognizer.handle_sample(&geometry, sample(1, 520.0, 400.0, TouchPhase::Move, 1));
-        recognizer.handle_sample(&geometry, sample(2, 700.0, 400.0, TouchPhase::Start, 2));
+        recognizer.handle_sample(&geometry, sample(1, 200.0, 400.0, TouchPhase::Start, 0));
+        recognizer.handle_sample(&geometry, sample(1, 600.0, 400.0, TouchPhase::Move, 1));
         assert_eq!(recognizer.owner(), TouchOwner::ViewerPointerPassthrough);
+
+        assert!(
+            recognizer
+                .handle_sample(&geometry, sample(2, 700.0, 400.0, TouchPhase::Start, 2))
+                .is_empty()
+        );
+        assert_eq!(recognizer.owner(), TouchOwner::Pinch);
+        assert!(recognizer.should_suppress_primary());
+
+        // The 400 pt single-finger pan must not participate in the pinch
+        // delta. The first pinch sample is incremental from the upgrade.
+        assert_eq!(
+            recognizer.handle_sample(&geometry, sample(1, 601.0, 400.0, TouchPhase::Move, 3)),
+            vec![
+                TouchCommand::Zoom {
+                    factor: 0.99,
+                    pivot: pos2(650.5, 400.0),
+                },
+                TouchCommand::Pan {
+                    delta: vec2(0.5, 0.0),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -694,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn excluded_start_stays_widget_passthrough() {
+    fn excluded_start_stays_widget_passthrough_when_contact_is_added() {
         let mut geometry = geom();
         geometry
             .excluded
@@ -704,9 +736,70 @@ mod tests {
         assert_eq!(recognizer.owner(), TouchOwner::WidgetPassthrough);
         assert!(
             recognizer
+                .handle_sample(&geometry, sample(2, 700.0, 400.0, TouchPhase::Start, 1))
+                .is_empty()
+        );
+        assert_eq!(recognizer.owner(), TouchOwner::WidgetPassthrough);
+        assert!(
+            recognizer
+                .handle_sample(&geometry, sample(2, 800.0, 400.0, TouchPhase::Move, 2))
+                .is_empty()
+        );
+        assert!(!recognizer.should_suppress_primary());
+        assert!(
+            recognizer
                 .handle_sample(&geometry, sample(1, 500.0, 400.0, TouchPhase::End, 10))
                 .is_empty()
         );
+        assert!(!recognizer.should_suppress_primary());
+    }
+
+    #[test]
+    fn unwired_edge_swipe_upgrades_to_pinch_when_contact_is_added() {
+        let geometry = geom();
+        let mut recognizer = TouchRecognizer::new();
+        recognizer.handle_sample(&geometry, sample(1, 28.0, 400.0, TouchPhase::Start, 0));
+        assert_eq!(
+            recognizer.handle_sample(&geometry, sample(1, 68.0, 400.0, TouchPhase::Move, 1)),
+            vec![TouchCommand::OpenSidePanel { left: true }]
+        );
+        assert_eq!(recognizer.owner(), TouchOwner::EdgeSwipe { left: true });
+
+        recognizer.handle_sample(&geometry, sample(2, 700.0, 400.0, TouchPhase::Start, 2));
+        assert_eq!(recognizer.owner(), TouchOwner::Pinch);
+        assert!(recognizer.should_suppress_primary());
+    }
+
+    #[test]
+    fn upgraded_pinch_does_not_downgrade_and_next_stream_resets() {
+        let geometry = geom();
+        let mut recognizer = TouchRecognizer::new();
+        recognizer.handle_sample(&geometry, sample(1, 200.0, 400.0, TouchPhase::Start, 0));
+        recognizer.handle_sample(&geometry, sample(1, 400.0, 400.0, TouchPhase::Move, 1));
+        recognizer.handle_sample(&geometry, sample(2, 700.0, 400.0, TouchPhase::Start, 2));
+        assert_eq!(recognizer.owner(), TouchOwner::Pinch);
+
+        assert!(
+            recognizer
+                .handle_sample(&geometry, sample(2, 700.0, 400.0, TouchPhase::End, 3))
+                .is_empty()
+        );
+        assert!(recognizer.is_active());
+        assert_eq!(recognizer.owner(), TouchOwner::Pinch);
+        assert!(
+            recognizer
+                .handle_sample(&geometry, sample(1, 450.0, 400.0, TouchPhase::Move, 4))
+                .is_empty()
+        );
+        assert_eq!(recognizer.owner(), TouchOwner::Pinch);
+        assert_eq!(
+            recognizer.handle_sample(&geometry, sample(1, 450.0, 400.0, TouchPhase::End, 5)),
+            vec![TouchCommand::PinchEnd]
+        );
+        assert!(!recognizer.is_active());
+
+        recognizer.handle_sample(&geometry, sample(3, 500.0, 400.0, TouchPhase::Start, 6));
+        assert_eq!(recognizer.owner(), TouchOwner::Undecided);
         assert!(!recognizer.should_suppress_primary());
     }
 

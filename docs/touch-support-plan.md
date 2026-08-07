@@ -359,7 +359,11 @@ egui-winit 0.33.3 の実装契約**なので、**依存更新時のイベント�
 
 **2 本目が入った時点で pending の single tap を取り消し**、最初の指が先に離れても
 tap / ページ送りを発火させないことが重要。
-一度 pan / pinch / scroll に確定した stream は、**全接点が離れるまで別 action へ移さない**。
+一度 pan / pinch / scroll に確定した解釈を、**同じ接点集合のまま別 action へ移さない**。
+これは同じ接点の解釈が行き来することを禁じる規約であり、接点集合が増えた場合の昇格は
+禁じない。**接点が増えたときに限り、単指 pan から pinch へ昇格してよい**。昇格時は
+現在の接点位置から pinch の基準を取り直す。逆方向の pinch → 単指 pan への降格は行わず、
+2 本目が離れても全接点が離れるまで `Pinch` ownership を保持する。
 
 #### Cancel の穴 (実機確認要)
 
@@ -900,6 +904,12 @@ TouchOwner
 
 - 同じ release の `fs_response.clicked()` は抑止する
 - **全接点が離れるまで primary 抑止を維持**する
+- 確定済み owner を**同じ接点集合のまま**別 action へ移さない。ただし接点追加時は
+  `ViewerPointerPassthrough` から `Pinch` へ昇格し、現在位置で pinch 基準を取り直す
+- Step 3 で未配線の `EdgeSwipe` も現時点では接点追加時に `Pinch` へ昇格してよい。
+  Step 3b で `OpenSidePanel` を配線するときに ownership を再検討する
+- `WidgetPassthrough` / `ViewerTapZone` / `Cancelled` からは昇格しない。
+  `Pinch` は接点が 1 本に戻っても単指 pan へ降格せず、全接点解放まで保持する
 - グリッドでは、スクロール認識のしきい値と egui の drag 開始しきい値を競争させない。
   **タッチ由来なら D&D 自体を無効にする**方が確実
 
