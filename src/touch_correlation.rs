@@ -16,11 +16,11 @@ pub(crate) enum TouchSurface {
     StillFullscreen,
 }
 
-/// Read-only classification produced for one egui input pass.
+/// Read-only classification produced for one app-frame drive.
 ///
-/// Step 2 deliberately does not apply either the commands or the suppression
-/// decisions. Step 3 can consume `commands` and consult suppression only for a
-/// `Response` or primary event that this value has positively correlated.
+/// Commands are returned only by the first drive for an app frame because
+/// executing them mutates application state. Later egui passes receive the
+/// same correlation and suppression answers with an empty command list.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct TouchFrame {
     commands: Vec<TouchCommand>,
@@ -31,6 +31,16 @@ pub(crate) struct TouchFrame {
 }
 
 impl TouchFrame {
+    fn replay_for_later_passes(&self) -> Self {
+        Self {
+            commands: Vec::new(),
+            primary_events: self.primary_events.clone(),
+            owner: self.owner,
+            active: self.active,
+            touch_cancelled: self.touch_cancelled,
+        }
+    }
+
     pub(crate) fn commands(&self) -> &[TouchCommand] {
         &self.commands
     }
@@ -198,7 +208,9 @@ struct TouchCorrelationState {
     /// synthetic primary stream while it is active.
     pointer_touch: Option<TouchKey>,
     pending: Option<PendingSignature>,
-    last_frame: TouchFrame,
+    /// Replay-safe result for later egui passes in the same app frame.
+    /// Commands are deliberately removed before this value is stored.
+    repeatable_frame: TouchFrame,
 }
 
 impl Default for TouchCorrelationState {
@@ -207,7 +219,7 @@ impl Default for TouchCorrelationState {
             recognizer: TouchRecognizer::new(),
             pointer_touch: None,
             pending: None,
-            last_frame: TouchFrame::default(),
+            repeatable_frame: TouchFrame::default(),
         }
     }
 }
@@ -434,6 +446,8 @@ struct DrivenSurface {
 /// fullscreen returns before grid rendering, and a separate fullscreen window
 /// has a different `ViewportId`. The frame marker is a fail-closed backstop,
 /// including when egui performs more than one pass for the same app frame.
+/// The first drive may return commands; repeated drives replay correlation and
+/// suppression state with an empty command list.
 ///
 /// This only clones events and writes `ctx.data_temp`: it never consumes input,
 /// mutates pointer state, requests repaint, executes commands, or suppresses a
@@ -511,7 +525,7 @@ fn repeated_drive_result(
         return TouchFrame::default();
     }
     data.get_temp::<TouchCorrelationState>(state_id(viewport, surface))
-        .map_or_else(TouchFrame::default, |state| state.last_frame)
+        .map_or_else(TouchFrame::default, |state| state.repeatable_frame)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -529,7 +543,7 @@ fn process_surface_state(
         .get_temp::<TouchCorrelationState>(id)
         .unwrap_or_default();
     let frame = state.process_frame(geometry, events, now_ms, disabled);
-    state.last_frame = frame.clone();
+    state.repeatable_frame = frame.replay_for_later_passes();
     data.insert_temp(id, state);
     frame
 }
@@ -587,6 +601,41 @@ mod tests {
 
     fn process(state: &mut TouchCorrelationState, events: &[Event], now_ms: u64) -> TouchFrame {
         state.process_frame(&geometry(), events, now_ms, false)
+    }
+
+    fn drive_twice_in_app_frame(
+        ctx: &egui::Context,
+        geometry: &TapZoneGeometry,
+        frame: u64,
+        time: f64,
+        events: Vec<Event>,
+    ) -> (TouchFrame, TouchFrame) {
+        let raw = egui::RawInput {
+            screen_rect: Some(geometry.surface),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let mut frames = None;
+        let _ = ctx.run(raw, |ctx| {
+            frames = Some((
+                drive_egui_touch_input_inner(
+                    ctx,
+                    TouchSurface::StillFullscreen,
+                    geometry.clone(),
+                    frame,
+                    false,
+                ),
+                drive_egui_touch_input_inner(
+                    ctx,
+                    TouchSurface::StillFullscreen,
+                    geometry.clone(),
+                    frame,
+                    false,
+                ),
+            ));
+        });
+        frames.unwrap()
     }
 
     #[test]
@@ -907,7 +956,14 @@ mod tests {
                     9,
                     false,
                 );
-                assert_eq!(repeated.commands().len(), 1);
+                assert!(repeated.commands().is_empty());
+                assert!(repeated.should_suppress_response(&response));
+                assert_eq!(
+                    repeated
+                        .correlated_primary_release_positions()
+                        .collect::<Vec<_>>(),
+                    vec![pos2(500.0, 400.0)]
+                );
                 let conflicting = drive_egui_touch_input_inner(
                     ctx,
                     TouchSurface::StillFullscreen,
@@ -918,6 +974,42 @@ mod tests {
                 assert!(conflicting.commands().is_empty());
             });
         });
+    }
+
+    #[test]
+    fn commands_are_delivered_once_per_app_frame_and_resume_next_frame() {
+        let ctx = egui::Context::default();
+        let geometry = geometry();
+        let center = pos2(500.0, 400.0);
+        let (first, repeated) =
+            drive_twice_in_app_frame(&ctx, &geometry, 20, 0.1, tap_events(1, center));
+        let toggle_count = first
+            .commands()
+            .iter()
+            .chain(repeated.commands())
+            .filter(|command| **command == TouchCommand::ToggleChrome)
+            .count();
+        let mut chrome_visible = false;
+        for _ in 0..toggle_count {
+            chrome_visible = !chrome_visible;
+        }
+        assert_eq!(toggle_count, 1);
+        assert!(chrome_visible);
+        assert!(repeated.commands().is_empty());
+        assert!(repeated.should_suppress_primary(center, false));
+
+        let left = pos2(100.0, 400.0);
+        let (next, next_repeated) =
+            drive_twice_in_app_frame(&ctx, &geometry, 21, 0.2, tap_events(2, left));
+        let page_moves = next
+            .commands()
+            .iter()
+            .chain(next_repeated.commands())
+            .filter(|command| **command == TouchCommand::PageSide { left: true })
+            .count();
+        assert_eq!(page_moves, 1);
+        assert!(next_repeated.commands().is_empty());
+        assert!(next_repeated.should_suppress_primary(left, false));
     }
 
     #[test]
