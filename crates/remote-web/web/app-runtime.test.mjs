@@ -96,8 +96,10 @@ const imageFetch = async () => new Response(new Blob([new Uint8Array([1, 2, 3])]
 globalThis.fetch = imageFetch;
 
 const {
+  ADJUSTMENT_PANEL_TABS,
   ImageViewer,
   LatestOnlyTaskQueue,
+  ViewerAdjustmentPanel,
   VIEWER_MENU_MAX_ACTIONS,
   VIEWER_PANEL_TABS,
   activateFolderContainerForImage,
@@ -357,6 +359,47 @@ test("still-image panel exposes the agreed tabs in desktop order", () => {
       ["bookmarks", "ブックマーク"],
     ]
   );
+});
+
+test("adjustment panel exposes only implemented sections in desktop order", () => {
+  assert.deepEqual(
+    ADJUSTMENT_PANEL_TABS.map(({ id, label }) => [id, label]),
+    [
+      ["color_tone", "色調"],
+      ["ai", "AI"],
+      ["colorize", "カラー化"],
+    ]
+  );
+});
+
+test("adjustment tabs keep shared actions outside and preserve range pointer handlers", () => {
+  const panel = new ViewerAdjustmentPanel();
+  assert.deepEqual(panel.root.children, [
+    panel.targetRow,
+    panel.scopeFieldset,
+    panel.tabList,
+    panel.colorTonePanel,
+    panel.aiSection,
+    panel.colorizeSection,
+    panel.resetButton,
+    panel.status,
+  ]);
+  assert.equal(panel.selectedTab, "color_tone");
+  assert.equal(panel.colorTonePanel.hidden, false);
+  assert.equal(panel.aiSection.hidden, true);
+  assert.equal(panel.colorizeSection.hidden, true);
+
+  panel.selectTab("ai");
+  assert.equal(panel.colorTonePanel.hidden, true);
+  assert.equal(panel.aiSection.hidden, false);
+  assert.equal(panel.colorizeSection.hidden, true);
+  for (const controls of [panel.controls, panel.colorizeControls]) {
+    for (const { input } of controls.values()) {
+      assert.ok(input.listeners.has("pointerdown"));
+      assert.ok(input.listeners.has("pointermove"));
+      assert.ok(input.listeners.has("pointerup"));
+    }
+  }
 });
 
 test("adjustment preview keeps one request in flight and coalesces to the latest value", async () => {

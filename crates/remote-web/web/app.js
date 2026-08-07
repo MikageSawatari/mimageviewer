@@ -74,10 +74,13 @@ import {
   viewerWheelCommand,
 } from "./command-core.mjs";
 import {
+  ADJUSTMENT_PANEL_TABS,
   loadLocalSettings,
   saveLocalSettings,
 } from "./local-settings.mjs";
 import { VideoStreamViewer } from "./video-stream.mjs";
+
+export { ADJUSTMENT_PANEL_TABS };
 
 const app = document.querySelector("#app");
 const hudElement = document.querySelector("#telemetry-hud");
@@ -5147,7 +5150,7 @@ export function normalizeRemoteAdjustmentValues(values = {}) {
   };
 }
 
-class ViewerAdjustmentPanel {
+export class ViewerAdjustmentPanel {
   constructor() {
     this.root = element("div", "viewer-adjustment-panel");
     this.targetIndex = 0;
@@ -5209,11 +5212,11 @@ class ViewerAdjustmentPanel {
     }
 
     const autoRow = element("label", "adjustment-auto-row");
-    autoRow.append(textElement("span", "自動補正"));
+    autoRow.append(textElement("span", "補正モード"));
     this.autoSelect = document.createElement("select");
     for (const [value, label] of [
-      ["", "なし"],
-      ["auto", "自動レベル"],
+      ["", "手動"],
+      ["auto", "自動補正"],
       ["manga_cleanup", "モノクロ漫画補正"],
     ]) {
       const option = document.createElement("option");
@@ -5428,8 +5431,14 @@ class ViewerAdjustmentPanel {
       });
     }
 
+    this.colorTonePanel = element(
+      "section",
+      "adjustment-tab-panel adjustment-color-tone"
+    );
+    this.colorTonePanel.append(autoRow, this.sliderList);
+
     this.colorizeSection = element("section", "adjustment-colorize");
-    this.colorizeSection.append(textElement("h3", "カラー化"));
+    this.colorizeSection.classList.add("adjustment-tab-panel");
 
     const modeRow = element("label", "adjustment-option-row");
     modeRow.append(textElement("span", "適用対象"));
@@ -5588,7 +5597,7 @@ class ViewerAdjustmentPanel {
     this.colorizeSection.append(this.colorizePresetSection);
 
     this.aiSection = element("section", "adjustment-ai");
-    this.aiSection.append(textElement("h3", "AI 処理"));
+    this.aiSection.classList.add("adjustment-tab-panel");
     this.aiSelects = new Map();
     for (const [key, label] of [
       ["upscale_model", "AI アップスケール"],
@@ -5608,7 +5617,37 @@ class ViewerAdjustmentPanel {
     }
     this.aiAvailability = textElement("p", "", "adjustment-colorize-note");
     this.aiSection.append(this.aiAvailability);
-    this.resetButton = textElement("button", "即時補正をリセット", "adjustment-reset");
+
+    this.selectedTab = state.localSettings.adjustmentTab;
+    this.tabList = element("nav", "adjustment-tabs");
+    this.tabList.setAttribute("role", "tablist");
+    this.tabList.setAttribute("aria-label", "画像補正のタブ");
+    this.tabButtons = new Map();
+    this.tabPanels = new Map([
+      ["color_tone", this.colorTonePanel],
+      ["ai", this.aiSection],
+      ["colorize", this.colorizeSection],
+    ]);
+    const tabGroupId = `remote-adjustment-tab-${Math.random().toString(36).slice(2)}`;
+    for (const tab of ADJUSTMENT_PANEL_TABS) {
+      const button = textElement("button", tab.label, "adjustment-tab");
+      const panel = this.tabPanels.get(tab.id);
+      button.type = "button";
+      button.id = `${tabGroupId}-${tab.id}`;
+      panel.id = `${button.id}-panel`;
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-controls", panel.id);
+      panel.setAttribute("role", "tabpanel");
+      panel.setAttribute("aria-labelledby", button.id);
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this.selectTab(tab.id);
+      });
+      this.tabList.append(button);
+      this.tabButtons.set(tab.id, button);
+    }
+
+    this.resetButton = textElement("button", "色調をリセット", "adjustment-reset");
     this.resetButton.type = "button";
     this.resetButton.addEventListener("click", () => {
       const colorize = this.values.colorize;
@@ -5626,15 +5665,42 @@ class ViewerAdjustmentPanel {
     this.root.append(
       this.targetRow,
       this.scopeFieldset,
-      autoRow,
-      this.sliderList,
-      this.colorizeSection,
+      this.tabList,
+      this.colorTonePanel,
       this.aiSection,
+      this.colorizeSection,
       this.resetButton,
       this.status
     );
+    this.syncTabVisibility();
     this.syncControls();
     this.setDisabled(false);
+  }
+
+  selectTab(tabId) {
+    const selected = ADJUSTMENT_PANEL_TABS.find((tab) => tab.id === tabId) ??
+      ADJUSTMENT_PANEL_TABS[0];
+    if (this.selectedTab === selected.id) return;
+    const saved = saveLocalSettings({
+      ...state.localSettings,
+      adjustmentTab: selected.id,
+    });
+    state.localSettings = saved.settings;
+    state.localSettingsStorageAvailable = saved.saved;
+    this.selectedTab = state.localSettings.adjustmentTab;
+    this.syncTabVisibility();
+  }
+
+  syncTabVisibility() {
+    for (const tab of ADJUSTMENT_PANEL_TABS) {
+      const selected = tab.id === this.selectedTab;
+      const button = this.tabButtons.get(tab.id);
+      const panel = this.tabPanels.get(tab.id);
+      button.classList.toggle("is-selected", selected);
+      button.setAttribute("aria-selected", selected ? "true" : "false");
+      button.tabIndex = selected ? 0 : -1;
+      panel.hidden = !selected;
+    }
   }
 
   addColorizeSlider(parent, key, label, min, max, step, visibleWhen = () => true) {

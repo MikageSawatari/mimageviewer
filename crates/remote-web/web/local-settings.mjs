@@ -2,6 +2,17 @@ import { imageQualityPreset } from "./command-core.mjs";
 
 export const LOCAL_SETTINGS_STORAGE_KEY = "miv-remote-local-settings";
 export const LOCAL_SETTINGS_VERSION = 1;
+export const ADJUSTMENT_PANEL_TABS = Object.freeze([
+  Object.freeze({ id: "color_tone", label: "色調" }),
+  Object.freeze({ id: "ai", label: "AI" }),
+  Object.freeze({ id: "colorize", label: "カラー化" }),
+]);
+
+export function normalizeAdjustmentTab(value) {
+  return ADJUSTMENT_PANEL_TABS.some((tab) => tab.id === value)
+    ? value
+    : ADJUSTMENT_PANEL_TABS[0].id;
+}
 
 export function defaultLocalSettings() {
   return {
@@ -12,6 +23,7 @@ export function defaultLocalSettings() {
     gridColumnsPortrait: 0,
     gridColumnsLandscape: 0,
     telemetryDebugDetails: false,
+    adjustmentTab: ADJUSTMENT_PANEL_TABS[0].id,
   };
 }
 
@@ -50,6 +62,7 @@ export function normalizeLocalSettings(value) {
       typeof value.telemetryDebugDetails === "boolean"
         ? value.telemetryDebugDetails
         : defaults.telemetryDebugDetails,
+    adjustmentTab: normalizeAdjustmentTab(value.adjustmentTab),
   };
 }
 

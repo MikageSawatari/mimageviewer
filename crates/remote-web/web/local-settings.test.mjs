@@ -2,9 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  ADJUSTMENT_PANEL_TABS,
   LOCAL_SETTINGS_STORAGE_KEY,
   defaultLocalSettings,
   loadLocalSettings,
+  normalizeAdjustmentTab,
   parseLocalSettings,
   saveLocalSettings,
   serializeLocalSettings,
@@ -19,6 +21,7 @@ test("local settings use the current defaults when no value exists", () => {
     gridColumnsPortrait: 0,
     gridColumnsLandscape: 0,
     telemetryDebugDetails: false,
+    adjustmentTab: "color_tone",
   });
 });
 
@@ -43,6 +46,7 @@ test("local settings serialize and restore as one versioned value", () => {
     gridColumnsPortrait: 3,
     gridColumnsLandscape: 7,
     telemetryDebugDetails: true,
+    adjustmentTab: "colorize",
   };
   assert.deepEqual(parseLocalSettings(serializeLocalSettings(settings)), settings);
 });
@@ -64,6 +68,7 @@ test("storage failures use in-memory defaults and never escape", () => {
     gridColumnsPortrait: 4,
     gridColumnsLandscape: 6,
     telemetryDebugDetails: true,
+    adjustmentTab: "ai",
   }, unavailable), {
     settings: {
       version: 1,
@@ -73,6 +78,7 @@ test("storage failures use in-memory defaults and never escape", () => {
       gridColumnsPortrait: 4,
       gridColumnsLandscape: 6,
       telemetryDebugDetails: true,
+      adjustmentTab: "ai",
     },
     saved: false,
   });
@@ -92,6 +98,7 @@ test("storage helpers use one aggregate key", () => {
     gridColumnsPortrait: 2,
     gridColumnsLandscape: 8,
     telemetryDebugDetails: false,
+    adjustmentTab: "color_tone",
   }, storage);
   assert.equal(saved.saved, true);
   assert.equal(values.size, 1);
@@ -110,6 +117,7 @@ test("older version-one values add the gesture help default", () => {
       gridColumnsPortrait: 0,
       gridColumnsLandscape: 0,
       telemetryDebugDetails: false,
+      adjustmentTab: "color_tone",
     }
   );
 });
@@ -131,6 +139,7 @@ test("grid column settings clamp per field without replacing existing values", (
       gridColumnsPortrait: 2,
       gridColumnsLandscape: 8,
       telemetryDebugDetails: false,
+      adjustmentTab: "color_tone",
     }
   );
   assert.deepEqual(
@@ -149,6 +158,7 @@ test("grid column settings clamp per field without replacing existing values", (
       gridColumnsPortrait: 0,
       gridColumnsLandscape: 0,
       telemetryDebugDetails: false,
+      adjustmentTab: "color_tone",
     }
   );
 });
@@ -168,5 +178,29 @@ test("image quality defaults to standard and rejects unknown values", () => {
   assert.equal(
     parseLocalSettings(JSON.stringify({ version: 1, imageQuality: "unexpected" })).imageQuality,
     "standard"
+  );
+});
+
+test("adjustment tab order and normalization follow the available desktop sections", () => {
+  assert.deepEqual(
+    ADJUSTMENT_PANEL_TABS.map(({ id, label }) => [id, label]),
+    [
+      ["color_tone", "色調"],
+      ["ai", "AI"],
+      ["colorize", "カラー化"],
+    ]
+  );
+  for (const { id } of ADJUSTMENT_PANEL_TABS) {
+    assert.equal(normalizeAdjustmentTab(id), id);
+  }
+  assert.equal(normalizeAdjustmentTab("post_filter"), "color_tone");
+  assert.equal(normalizeAdjustmentTab(null), "color_tone");
+  assert.equal(
+    parseLocalSettings(JSON.stringify({ version: 1, adjustmentTab: "ai" })).adjustmentTab,
+    "ai"
+  );
+  assert.equal(
+    parseLocalSettings(JSON.stringify({ version: 1, adjustmentTab: "unknown" })).adjustmentTab,
+    "color_tone"
   );
 });
