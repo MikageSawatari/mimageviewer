@@ -10,9 +10,9 @@
 # Steps:
 #   1. complete Rust test gate (scripts\test-full.ps1)
 #   2. idle-health analyzer regression tests
-#   3. cargo clean --release -p mimageviewer -p mimageviewer-launcher
-#      (+ the portable target dir's mimageviewer package)
-#   4. build-release.ps1   -> target\release\mimageviewer.exe (launcher) + core
+#   3. cargo clean --release -p mimageviewer -p mimageviewer-remote -p mimageviewer-launcher
+#      (+ the portable target dir's mimageviewer + remote packages)
+#   4. build-release.ps1   -> target\release\mimageviewer.exe (launcher) + core + remote
 #   5. ISCC                -> installer\Output\mImageViewer_setup.exe
 #   6. build-portable.ps1  -> dist\mImageViewer_portable_v<ver>.zip (target-portable)
 #
@@ -75,14 +75,14 @@ if ($LASTEXITCODE -ne 0) { throw ("[build-dist] idle-health analyzer tests faile
 # exit in PowerShell 5.1, so check $LASTEXITCODE explicitly. A silently-failed
 # clean would let the build reuse a stale fingerprint -- the exact bug this script
 # exists to prevent.
-Write-Host "[build-dist] (3/6) cargo clean --release -p mimageviewer -p mimageviewer-launcher"
-& cargo clean --release -p mimageviewer -p mimageviewer-launcher
+Write-Host "[build-dist] (3/6) cargo clean --release -p mimageviewer -p mimageviewer-remote -p mimageviewer-launcher"
+& cargo clean --release -p mimageviewer -p mimageviewer-remote -p mimageviewer-launcher
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] cargo clean (workspace) failed (exit {0})" -f $LASTEXITCODE) }
-Write-Host "[build-dist]       cargo clean --release --target-dir target-portable -p mimageviewer"
-& cargo clean --release --target-dir $portableTargetDir -p mimageviewer
+Write-Host "[build-dist]       cargo clean --release --target-dir target-portable -p mimageviewer -p mimageviewer-remote"
+& cargo clean --release --target-dir $portableTargetDir -p mimageviewer -p mimageviewer-remote
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] cargo clean (portable) failed (exit {0})" -f $LASTEXITCODE) }
 
-# --- 2. Core + launcher (fresh, since cleaned above) ---
+# --- 2. Core + remote + launcher (fresh, since cleaned above) ---
 $releaseArgs = @()
 if ($SkipVst3Bridge) { $releaseArgs += '-SkipVst3Bridge' }
 if ($sign) { $releaseArgs += '-Sign' }

@@ -7,7 +7,7 @@
 #   1. 実行中の mimageviewer.exe / mimageviewer-susie32.exe を `taskkill` で停止
 #   2. ファイルハンドル解放を待つ
 #   3. VST3 C++ bridge を再ビルド (core が include_bytes! で内包するため)
-#   4. core → launcher の 2 段階 cargo build (CARGO_INCREMENTAL=0)
+#   4. core → remote → launcher の 3 段階 cargo build (CARGO_INCREMENTAL=0)
 #   5. APPDATA 上の stale VST3 bridge cache を削除 (次回起動時に再展開させる)
 # を順に実行する。
 #
@@ -23,7 +23,7 @@
 
 set -euo pipefail
 
-targets=("mimageviewer.exe" "mimageviewer-susie32.exe" "mimageviewer-core.exe" "mimageviewer-vst3-host.exe")
+targets=("mimageviewer.exe" "mimageviewer-susie32.exe" "mimageviewer-core.exe" "mimageviewer-remote.exe" "mimageviewer-vst3-host.exe")
 killed=0
 for name in "${targets[@]}"; do
     # tasklist は exit 0 で「該当なし」を返す系統と stderr に書く系統があるため、
@@ -61,7 +61,7 @@ if [ "$SKIP_VST3" != "1" ]; then
                 echo "[build-release] configuring VST3 bridge (cmake)"
                 cmake -S crates/vst3-host -B "$VST3_BUILD_DIR" -G "Visual Studio 18 2026" -A x64
             fi
-            echo "[build-release] (1/3) cmake --build $VST3_BUILD_DIR --config Release"
+            echo "[build-release] (1/4) cmake --build $VST3_BUILD_DIR --config Release"
             cmake --build "$VST3_BUILD_DIR" --config Release
             if [ ! -f "$VST3_VENDOR_EXE" ]; then
                 echo "[build-release] ERROR: cmake build did not produce $VST3_VENDOR_EXE" >&2
@@ -80,16 +80,20 @@ else
     echo "[build-release] SKIP_VST3_BRIDGE=1 — skipping VST3 bridge rebuild"
 fi
 
-# 2 段階ビルド (ランチャー方式):
+# 3 段階ビルド (ランチャー方式):
 #   1. core (本体、FFmpeg DLL に静的依存) を `mimageviewer-core.exe` として生成
-#   2. launcher (FFmpeg 非依存、core + FFmpeg DLL を include_bytes! で内包) を
+#   2. remote service (core と protocol version を共有) を `mimageviewer-remote.exe` として生成
+#   3. launcher (FFmpeg 非依存、core + remote + FFmpeg DLL を include_bytes! で内包) を
 #      `mimageviewer.exe` として生成。配布する単体 exe はこちら。
 #
-# cargo は同一ワークスペース内 bin の依存順序を表現できないため、明示的に 2 回呼ぶ。
-echo "[build-release] (2/3) CARGO_INCREMENTAL=0 cargo build --release --bin mimageviewer-core $*"
+# cargo は同一ワークスペース内 bin の依存順序を表現できないため、明示的に 3 回呼ぶ。
+echo "[build-release] (2/4) CARGO_INCREMENTAL=0 cargo build --release --bin mimageviewer-core $*"
 CARGO_INCREMENTAL=0 cargo build --release --bin mimageviewer-core "$@"
 
-echo "[build-release] (3/3) CARGO_INCREMENTAL=0 cargo build --release -p mimageviewer-launcher --bin mimageviewer $*"
+echo "[build-release] (3/4) CARGO_INCREMENTAL=0 cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets $*"
+CARGO_INCREMENTAL=0 cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets "$@"
+
+echo "[build-release] (4/4) CARGO_INCREMENTAL=0 cargo build --release -p mimageviewer-launcher --bin mimageviewer $*"
 CARGO_INCREMENTAL=0 cargo build --release -p mimageviewer-launcher --bin mimageviewer "$@"
 
 # T56: APPDATA 上の展開済み VST3 bridge cache を削除して、次回起動時に新 bridge を

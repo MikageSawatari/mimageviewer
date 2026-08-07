@@ -4008,6 +4008,7 @@ name = "mimageviewer-launcher"
 version = "2.12.0"
 dependencies = [
  "sha2",
+ "tempfile",
  "windows 0.61.3",
  "winresource",
 ]

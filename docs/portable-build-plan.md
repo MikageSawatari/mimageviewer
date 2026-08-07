@@ -36,11 +36,13 @@
 
 ## 2. 現状アーキテクチャの整理
 
-### 2 段構成 (launcher + core)
+### launcher + core + remote service
 
 配布 `mimageviewer.exe` は **ランチャー** ([crates/launcher/src/main.rs](../crates/launcher/src/main.rs))。
-起動時に `mimageviewer-core.exe` + FFmpeg 6 DLL を `%APPDATA%\mimageviewer\runtime\<version>\` へ
-展開して core を spawn する。ランチャーが存在する唯一の理由は **FFmpeg がロード時リンク**で、
+起動時に `mimageviewer-core.exe` + `mimageviewer-remote.exe` + FFmpeg 6 DLL を
+`%APPDATA%\mimageviewer\runtime\<version>\` へ展開して core を spawn する。remote service は
+core が自分の隣から起動し、両者は同じ remote-ipc protocol source からビルドされる。
+ランチャーが存在する主な理由は **FFmpeg がロード時リンク**で、
 Rust コードが走る前に Windows ローダが DLL を解決する必要があるため
 ([build.rs:9-26](../build.rs)、[src/video/ffmpeg_loader.rs](../src/video/ffmpeg_loader.rs))。
 
@@ -98,8 +100,8 @@ fn main():
 3. **native 依存の解決を 1 つのモジュール (`native_assets`) に集約**する。各呼び出し箇所は
    そのモジュールを呼ぶだけにし、cfg 分岐をそこ 1 箇所に閉じる。新しい native 依存を足すときも
    ここ + パッケージング一覧の 2 箇所だけ。
-4. **ポータブル版は launcher を使わない**。core を `mimageviewer.exe` にリネームして配布し、
-   FFmpeg DLL を含む全 native 依存を loose 同梱する。
+4. **ポータブル版は launcher を使わない**。core を `mimageviewer.exe` にリネームし、
+   remote service と FFmpeg DLL を含む native 依存をその隣へ loose 同梱する。
 5. **CI に `cargo check --features portable` を 1 行**足し、portable 分岐の腐りを機械的に防ぐ。
 
 ## 4. 具体設計
@@ -313,7 +315,9 @@ portable は launcher を使わないので影響しないが、抽出ロジッ�
 
 `build-release.ps1` を参考にした専用スクリプト。手順:
 
-1. `cargo build --release --bin mimageviewer-core --features portable` で core を生成。
+1. `cargo build --release --bin mimageviewer-core --features portable` で core を生成し、
+   `cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets`
+   で同じ source tree の Web UI 資産内包 remote service を生成。
    - launcher (`-p mimageviewer-launcher`) は**ビルドしない**。
    - VST3 bridge (`mimageviewer-vst3-host.exe`) は **同梱しない** (下記の注を参照)。
 2. 配布フォルダ `dist/portable/` を組み立て:
@@ -321,6 +325,7 @@ portable は launcher を使わないので影響しないが、抽出ロジッ�
 ```
 mImageViewer_portable/
 ├─ mimageviewer.exe                  (= mimageviewer-core.exe をリネーム)
+├─ mimageviewer-remote.exe           (= core が同じディレクトリから起動)
 ├─ avcodec-61.dll  avformat-61.dll  avutil-59.dll
 ├─ avfilter-10.dll  swscale-8.dll  swresample-5.dll
 ├─ pdfium.dll
@@ -415,6 +420,7 @@ mImageViewer_portable/
 - [ ] 起動後、`<exe_dir>\data\` に settings.db / logs が作られる。APPDATA は触られない。
 - [ ] PDF を開いてページが描画される (pdfium.dll loose 解決)。
 - [ ] 動画を再生できる (FFmpeg DLL loose 解決、launcher 不在でロード成功)。
+- [ ] リモート接続を開始できる (core と同じディレクトリの remote service を起動、protocol 一致)。
 - [ ] AI アップスケール / デノイズが動く (onnxruntime + models loose 解決)。
 - [ ] Susie プラグインが読める (susie32 worker loose 解決 + spawn)。
 - [ ] VST3 が**自動無効化**されている (環境設定→動画タブで「VST3 プラグイン処理」が選択不可・

@@ -1,9 +1,9 @@
 //! Small launcher for the distributable `mimageviewer.exe`.
 //!
 //! The real application binary (`mimageviewer-core.exe`) imports FFmpeg DLLs at
-//! process load time. The launcher therefore extracts the core exe and FFmpeg
-//! DLLs into `%APPDATA%/mimageviewer/runtime/<version>/` first, then spawns the
-//! core from that directory.
+//! process load time and starts `mimageviewer-remote.exe` from its own directory.
+//! The launcher therefore extracts both executables and the FFmpeg DLLs into
+//! `%APPDATA%/mimageviewer/runtime/<version>/` first, then spawns the core there.
 
 #![windows_subsystem = "windows"]
 
@@ -20,6 +20,7 @@ mod build_const_parser;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static CORE_EXE: &[u8] = include_bytes!(env!("MIMV_CORE_EXE"));
+static REMOTE_EXE: &[u8] = include_bytes!(env!("MIMV_REMOTE_EXE"));
 static AVCODEC_DLL: &[u8] = include_bytes!(env!("MIMV_AVCODEC_DLL"));
 static AVFORMAT_DLL: &[u8] = include_bytes!(env!("MIMV_AVFORMAT_DLL"));
 static AVUTIL_DLL: &[u8] = include_bytes!(env!("MIMV_AVUTIL_DLL"));
@@ -59,6 +60,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
         CORE_EXE,
         env!("MIMV_CORE_EXE_SHA256"),
     ),
+    (
+        "mimageviewer-remote.exe",
+        REMOTE_EXE,
+        env!("MIMV_REMOTE_EXE_SHA256"),
+    ),
 ];
 
 fn main() {
@@ -88,16 +94,7 @@ fn run() -> Result<(), String> {
     std::fs::create_dir_all(&runtime_dir)
         .map_err(|e| format!("create runtime dir failed ({}): {e}", runtime_dir.display()))?;
 
-    for (name, bytes, expected_hash) in ASSETS {
-        let path = runtime_dir.join(name);
-        ensure_asset(&path, bytes, expected_hash).map_err(|e| {
-            format!(
-                "extract {} failed: {e}\n(runtime dir: {})",
-                name,
-                runtime_dir.display()
-            )
-        })?;
-    }
+    extract_assets(&runtime_dir)?;
 
     let core_path = runtime_dir.join("mimageviewer-core.exe");
     let launcher_path = std::env::current_exe().ok();
@@ -111,6 +108,24 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("spawn core failed ({}): {e}", core_path.display()))?;
 
     Ok(())
+}
+
+fn extract_assets(runtime_dir: &Path) -> Result<(), String> {
+    for asset in ASSETS {
+        extract_asset(runtime_dir, asset)?;
+    }
+    Ok(())
+}
+
+fn extract_asset(runtime_dir: &Path, asset: &(&str, &[u8], &str)) -> Result<(), String> {
+    let (name, bytes, expected_hash) = *asset;
+    let path = runtime_dir.join(name);
+    ensure_asset(&path, bytes, expected_hash).map_err(|e| {
+        format!(
+            "extract {name} failed: {e}\n(runtime dir: {})",
+            runtime_dir.display()
+        )
+    })
 }
 
 fn has_data_dir_option(args: &[OsString]) -> bool {
@@ -513,6 +528,34 @@ mod tests {
         assert_eq!(
             env!("MIMV_OPEN_PATH_PIPE_NAME"),
             r"\\.\pipe\mImageViewerOpenPath_v1"
+        );
+    }
+
+    #[test]
+    fn embedded_remote_extracts_into_the_versioned_core_runtime_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path().join("runtime").join(super::VERSION);
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let remote = super::ASSETS
+            .iter()
+            .find(|(name, _, _)| *name == "mimageviewer-remote.exe")
+            .expect("remote executable must be embedded");
+        assert!(
+            super::ASSETS
+                .iter()
+                .any(|(name, _, _)| *name == "mimageviewer-core.exe")
+        );
+
+        super::extract_asset(&runtime_dir, remote).unwrap();
+
+        let extracted = runtime_dir.join("mimageviewer-remote.exe");
+        assert!(extracted.is_file());
+        assert_eq!(extracted.parent(), Some(runtime_dir.as_path()));
+        assert!(extracted.metadata().unwrap().len() > 0);
+        assert_eq!(
+            super::sha256_file_hex(&extracted).unwrap(),
+            remote.2,
+            "the versioned runtime copy must match the bytes embedded by the launcher"
         );
     }
 }

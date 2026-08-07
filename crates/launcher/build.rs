@@ -1,8 +1,8 @@
 //! ランチャークレートのビルドスクリプト。
 //!
-//! - 内包する `mimageviewer-core.exe` と FFmpeg DLL のパスを `MIMV_*` 環境変数
+//! - 内包する `mimageviewer-core.exe`、`mimageviewer-remote.exe` と FFmpeg DLL のパスを `MIMV_*` 環境変数
 //!   経由でソースに渡す (`include_bytes!(env!("..."))` で参照)。
-//! - core が先にビルドされていることを確認し、未ビルドなら明確なエラーで止める。
+//! - core と remote が先にビルドされていることを確認し、未ビルドなら明確なエラーで止める。
 //! - exe アイコンを埋め込む (本体と同じアイコン)。
 
 use std::path::PathBuf;
@@ -29,17 +29,33 @@ fn main() {
         .unwrap_or_else(|| workspace_root.join("target"));
 
     let core_exe = target_dir.join("release").join("mimageviewer-core.exe");
+    let remote_exe = target_dir.join("release").join("mimageviewer-remote.exe");
 
-    if !core_exe.exists() {
+    let missing = [
+        (
+            &core_exe,
+            "mimageviewer-core.exe",
+            "cargo build --release --bin mimageviewer-core",
+        ),
+        (
+            &remote_exe,
+            "mimageviewer-remote.exe",
+            "cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets",
+        ),
+    ]
+    .into_iter()
+    .filter(|(path, _, _)| !path.exists())
+    .collect::<Vec<_>>();
+    if !missing.is_empty() {
         eprintln!();
         eprintln!("================================================================");
-        eprintln!(" mimageviewer-core.exe not found:");
-        eprintln!("   {}", core_exe.display());
+        eprintln!(" Launcher input executable(s) not found:");
+        for (path, name, command) in missing {
+            eprintln!("   {name}: {}", path.display());
+            eprintln!("     build with: {command}");
+        }
         eprintln!();
-        eprintln!(" 先に core をビルドしてください:");
-        eprintln!("   cargo build --release --bin mimageviewer-core");
-        eprintln!();
-        eprintln!(" もしくは 2 段階ビルドのラッパースクリプト:");
+        eprintln!(" Build core and remote before the launcher, or use the wrapper:");
         eprintln!("   bash scripts/build-release.sh        (Git Bash)");
         eprintln!("   .\\scripts\\build-release.ps1         (PowerShell)");
         eprintln!("================================================================");
@@ -75,6 +91,12 @@ fn main() {
         sha256_file_hex(&core_exe)
     );
     println!("cargo:rerun-if-changed={}", core_exe.display());
+    println!("cargo:rustc-env=MIMV_REMOTE_EXE={}", remote_exe.display());
+    println!(
+        "cargo:rustc-env=MIMV_REMOTE_EXE_SHA256={}",
+        sha256_file_hex(&remote_exe)
+    );
+    println!("cargo:rerun-if-changed={}", remote_exe.display());
 
     // Single-instance 用の Mutex / Event 名を core 側のソースから取り出して
     // 環境変数経由で渡す。core 側を変えると次のビルドで自動反映される。

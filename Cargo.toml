@@ -20,10 +20,11 @@ exclude = ["crates/unrar-patched", "vendor/eframe", "vendor/egui-wgpu"]
 eframe = { path = "vendor/eframe" }
 egui-wgpu = { path = "vendor/egui-wgpu" }
 
-# 配布バイナリ (本体 = `mimageviewer-core.exe` + launcher = `mimageviewer.exe`) の
+# 配布バイナリ (本体 = `mimageviewer-core.exe` + remote service +
+# launcher = `mimageviewer.exe`) の
 # バージョンは workspace 経由で 1 箇所で管理する。launcher は `%APPDATA%/mimageviewer/
-# runtime/<version>/` を抽出先に使うので、本体とランチャーの version が乖離すると
-# 旧バージョンの runtime dir に新本体を上書きしてしまう。susie-worker / vst3-host-tester
+# runtime/<version>/` を抽出先に使うので、core / remote / launcher の version が乖離すると
+# 旧バージョンの runtime dir に新しい実行ファイルを上書きしてしまう。susie-worker / vst3-host-tester
 # / png2mag は独立した内部ヘルパーなので workspace inherit せず個別管理。
 [workspace.package]
 version = "2.12.0"
@@ -56,7 +57,7 @@ portable = []
 
 # 本体 exe のバイナリ名は `mimageviewer-core` (= 内部実体)。
 # 配布する `mimageviewer.exe` は別途 `crates/launcher/` のランチャーが生成する。
-# ランチャーは初回起動時に core と FFmpeg DLL を %APPDATA% に展開して core を spawn する
+# ランチャーは初回起動時に core、remote service と FFmpeg DLL を %APPDATA% に展開して core を spawn する
 # (詳細は CLAUDE.md「FFmpeg LGPL DLL 管理」節を参照)。
 [[bin]]
 name = "mimageviewer-core"
@@ -345,7 +346,7 @@ semver = "1"
 # 動画インライン再生 (フルスクリーンで MP4/MKV/MOV/AVI/WMV/MPG/MPEG を再生)。
 # BtbN の FFmpeg LGPL shared build を vendor/ffmpeg/ に置き、FFMPEG_DIR で参照する
 # (.cargo/config.toml に env で指定済み)。本体 (`mimageviewer-core.exe`) は通常リンク
-# だが、配布時は launcher (`mimageviewer.exe`) が 6 DLL (avcodec / avformat / avutil /
+# だが、配布時は launcher (`mimageviewer.exe`) が core、remote service と 6 DLL (avcodec / avformat / avutil /
 # avfilter / swscale / swresample) を include_bytes! で内包し、起動時に
 # `%APPDATA%/mimageviewer/runtime/<version>/` へ展開してから core を spawn する。
 # *-sys のビルドに libclang (LLVM/Clang) が必要。詳細は CLAUDE.md の

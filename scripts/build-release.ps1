@@ -6,7 +6,7 @@
 #   1. Stops mimageviewer-* processes started from this repo or extracted to APPDATA
 #   2. Polls for file-handle release (up to 10 seconds)
 #   3. Rebuilds the VST3 C++ bridge before core embeds it
-#   4. Builds release core + launcher with CARGO_INCREMENTAL=0 (extra cargo args are passed through)
+#   4. Builds release core + remote + launcher with CARGO_INCREMENTAL=0 (extra cargo args are passed through)
 #   5. Clears the extracted VST3 bridge cache so next launch re-extracts it
 #
 # Usage:
@@ -102,11 +102,13 @@ $repoRoot = (Get-Location).Path
 $repoRootPrefix = $repoRoot.TrimEnd('\') + '\'
 $repoRootPrefixLower = $repoRootPrefix.ToLower()
 $releaseExe = Join-Path -Path $repoRoot -ChildPath 'target\release\mimageviewer.exe'
+$releaseRemoteExe = Join-Path -Path $repoRoot -ChildPath 'target\release\mimageviewer-remote.exe'
 $appDataRoot = Join-Path -Path $env:APPDATA -ChildPath 'mimageviewer'
 $appDataRootPrefix = $appDataRoot.TrimEnd('\') + '\'
 $appDataRootPrefixLower = $appDataRootPrefix.ToLower()
 $appDataProcessNames = @(
     'mimageviewer-core',
+    'mimageviewer-remote',
     'mimageviewer-vst3-host',
     'mimageviewer-susie32'
 )
@@ -117,6 +119,7 @@ $appDataProcessNames = @(
 $stoppableProcessNames = @(
     'mimageviewer',
     'mimageviewer-core',
+    'mimageviewer-remote',
     'mimageviewer-vst3-host',
     'mimageviewer-susie32'
 )
@@ -243,14 +246,15 @@ if (Test-Path $releaseExe) {
     }
 }
 
-# Two-stage build (launcher scheme):
+# Three-stage Rust build (launcher scheme):
 #   1. core (the app, statically depends on FFmpeg DLLs) -> mimageviewer-core.exe
-#   2. launcher (FFmpeg-independent, embeds core + FFmpeg DLLs via include_bytes!)
+#   2. remote service (protocol-coupled to core) -> mimageviewer-remote.exe
+#   3. launcher (FFmpeg-independent, embeds core + remote + FFmpeg DLLs via include_bytes!)
 #      -> mimageviewer.exe. This is the distributed single exe.
 #
 # VST3 bridge is built first because mimageviewer-core embeds it with
-# include_bytes!. Cargo also cannot express the core -> launcher ordering, so
-# the two Rust binaries are built explicitly after the bridge.
+# include_bytes!. Cargo also cannot express the inner executables -> launcher
+# ordering, so the three Rust binaries are built explicitly after the bridge.
 
 if (-not $SkipVst3Bridge) {
     $cmakeExe = Get-Command cmake -ErrorAction SilentlyContinue
@@ -277,7 +281,7 @@ if (-not $SkipVst3Bridge) {
     }
 
     if (-not $SkipVst3Bridge) {
-        Write-Host "[build-release] (1/3) cmake --build crates/vst3-host/build --config Release"
+        Write-Host "[build-release] (1/4) cmake --build crates/vst3-host/build --config Release"
         & cmake --build $vst3BuildDir --config Release
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         if (-not (Test-Path $vst3VendorExe)) {
@@ -322,20 +326,38 @@ Ensure-LibclangPath
 
 $coreCmd = @('build', '--release', '--bin', 'mimageviewer-core')
 if ($CargoArgs) { $coreCmd += $CargoArgs }
-Write-Host ("[build-release] (2/3) CARGO_INCREMENTAL=0 cargo {0}" -f ($coreCmd -join ' '))
+Write-Host ("[build-release] (2/4) CARGO_INCREMENTAL=0 cargo {0}" -f ($coreCmd -join ' '))
 $coreExit = Invoke-ReleaseCargo -Args $coreCmd
 if ($coreExit -ne 0) { exit $coreExit }
 
+$remoteCmd = @(
+    'build', '--release',
+    '-p', 'mimageviewer-remote',
+    '--bin', 'mimageviewer-remote',
+    '--features', 'embedded-web-assets'
+)
+if ($CargoArgs) { $remoteCmd += $CargoArgs }
+Write-Host ("[build-release] (3/4) CARGO_INCREMENTAL=0 cargo {0}" -f ($remoteCmd -join ' '))
+$remoteExit = Invoke-ReleaseCargo -Args $remoteCmd
+if ($remoteExit -ne 0) { exit $remoteExit }
+if (-not (Test-Path $releaseRemoteExe -PathType Leaf)) {
+    throw "[build-release] remote service executable was not produced: $releaseRemoteExe"
+}
+
 if ($Sign) {
-    # Sign core BEFORE the launcher build, because the launcher embeds core.exe
-    # with include_bytes! (and extracts it to APPDATA at runtime).
-    Write-Host "[build-release] signing mimageviewer-core.exe (pre-launcher)"
-    Invoke-MivSign -Files @((Join-Path $repoRoot 'target\release\mimageviewer-core.exe'))
+    # Sign both inner executables BEFORE the launcher build, because the launcher
+    # embeds and later extracts both of them into the versioned APPDATA runtime.
+    $launcherEmbedExecutables = @(
+        (Join-Path $repoRoot 'target\release\mimageviewer-core.exe'),
+        $releaseRemoteExe
+    )
+    Write-Host "[build-release] signing core + remote (pre-launcher)"
+    Invoke-MivSign -Files $launcherEmbedExecutables
 }
 
 $launcherCmd = @('build', '--release', '-p', 'mimageviewer-launcher', '--bin', 'mimageviewer')
 if ($CargoArgs) { $launcherCmd += $CargoArgs }
-Write-Host ("[build-release] (3/3) CARGO_INCREMENTAL=0 cargo {0}" -f ($launcherCmd -join ' '))
+Write-Host ("[build-release] (4/4) CARGO_INCREMENTAL=0 cargo {0}" -f ($launcherCmd -join ' '))
 $launcherExit = Invoke-ReleaseCargo -Args $launcherCmd
 if ($launcherExit -ne 0) { exit $launcherExit }
 

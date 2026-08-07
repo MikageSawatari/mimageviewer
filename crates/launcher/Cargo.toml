@@ -11,7 +11,7 @@ rust-version.workspace = true
 # 配布する `mimageviewer.exe` を生成する小さなランチャークレート。
 #
 # 役割:
-#   - 本体 `mimageviewer-core.exe` と FFmpeg LGPL shared DLL 6 ファイルを
+#   - 本体 `mimageviewer-core.exe`、`mimageviewer-remote.exe` と FFmpeg LGPL shared DLL 6 ファイルを
 #     `include_bytes!` で内包する (本クレートの src/main.rs 参照)
 #   - 初回起動時に `%APPDATA%\mimageviewer\runtime\<version>\` へ展開
 #   - core を `std::process::Command::spawn` で起動 → ランチャー即終了
@@ -20,9 +20,9 @@ rust-version.workspace = true
 # 本体クレート (`mimageviewer-core.exe`) は ffmpeg-the-third を import library
 # 経由で使うが、それは展開後の同じディレクトリに 6 DLL があれば確実に解決される。
 #
-# ビルド前提: 本パッケージは `target/release/mimageviewer-core.exe` を
-# `include_bytes!` で参照するため、core を先にビルドしておく必要がある。
-# `scripts/build-release.{sh,ps1}` が 2 段階ビルドを行う。
+# ビルド前提: 本パッケージは `target/release` の core と remote を
+# `include_bytes!` で参照するため、両方を先にビルドしておく必要がある。
+# `scripts/build-release.{sh,ps1}` が core -> remote -> launcher の 3 段階ビルドを行う。
 
 [[bin]]
 name = "mimageviewer"
@@ -46,3 +46,6 @@ windows = { version = "0.61", features = [
 [build-dependencies]
 sha2 = "0.10"
 winresource = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

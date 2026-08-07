@@ -83,6 +83,9 @@ impl Config {
         }
 
         let data_dir = data_dir.unwrap_or_else(default_data_dir);
+        #[cfg(feature = "embedded-web-assets")]
+        let web_root = PathBuf::new();
+        #[cfg(not(feature = "embedded-web-assets"))]
         let web_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web");
         Ok(Self {
             bind,
@@ -142,5 +145,12 @@ mod tests {
                 .unwrap()
                 .managed_by_core
         );
+    }
+
+    #[cfg(feature = "embedded-web-assets")]
+    #[test]
+    fn distribution_has_no_source_tree_web_root_dependency() {
+        let config = Config::parse_args([]).unwrap();
+        assert!(config.web_root.as_os_str().is_empty());
     }
 }

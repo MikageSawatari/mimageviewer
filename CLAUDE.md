@@ -100,7 +100,7 @@ dual-window approach.
 - **Parallel loading**: `rayon` (dedicated thread pool per folder load)
 - **Thumbnail cache**: SQLite via `rusqlite` (bundled), WebP encoding via `webp` crate
 - **Video thumbnails**: Windows Shell API (IShellItemImageFactory)
-- **Video inline playback**: `ffmpeg-the-third` クレート + FFmpeg LGPL shared DLL (BtbN ビルド) + `cpal` (WASAPI Shared 音声出力)。フルスクリーンで動画を MP4 / MKV / MOV / AVI / WMV / MPG / MPEG / HEVC / AV1 として再生する。`avcodec / avformat / avutil / avfilter / swscale / swresample` の 6 DLL を launcher (`crates/launcher/`) が `include_bytes!` で内包し、初回起動時に `%APPDATA%/mimageviewer/runtime/<version>/` へ展開して本体 (`mimageviewer-core.exe`) を spawn する。本体側は exe と同じディレクトリの DLL を Windows ローダが解決するだけで個別ロード処理は持たない。ビルドに libclang (LLVM/Clang) が必要。詳細は「FFmpeg LGPL DLL 管理」節を参照
+- **Video inline playback**: `ffmpeg-the-third` クレート + FFmpeg LGPL shared DLL (BtbN ビルド) + `cpal` (WASAPI Shared 音声出力)。フルスクリーンで動画を MP4 / MKV / MOV / AVI / WMV / MPG / MPEG / HEVC / AV1 として再生する。`avcodec / avformat / avutil / avfilter / swscale / swresample` の 6 DLL を launcher (`crates/launcher/`) が core / remote service とともに `include_bytes!` で内包し、初回起動時に `%APPDATA%/mimageviewer/runtime/<version>/` へ展開して本体 (`mimageviewer-core.exe`) を spawn する。本体側は exe と同じディレクトリの DLL を Windows ローダが解決するだけで個別ロード処理は持たない。ビルドに libclang (LLVM/Clang) が必要。詳細は「FFmpeg LGPL DLL 管理」節を参照
 - **ZIP support**: `zip` crate
 - **PDF support**: `pdfium-render` crate + PDFium DLL (exe に埋め込み) + マルチプロセスワーカープール (5 プロセス並列レンダリング、1 つを Critical 予約)
 - **PDF password**: `windows-dpapi` crate (DPAPI 暗号化でパスワード永続保存)
@@ -858,19 +858,21 @@ HEVC / AV1 を再生する) のために、FFmpeg の **LGPL shared build** を 
 直接の本体には適用できない (ローダの解決タイミングに間に合わない)。`/DELAYLOAD` も
 rustc 経由の link.exe で機能しない (Delay Import Directory が空のまま、原因未解明)。
 
-そこで **ランチャー + 本体の 2 段構成** で「単体 exe 配布」を実現している:
+そこで **launcher が core・remote service・FFmpeg DLL を内包する構成**で「単体 exe 配布」を実現している:
 
 ```
 配布する mimageviewer.exe (= ランチャー、crates/launcher/ が生成)
 ├── include_bytes! で内包:
 │   ├── mimageviewer-core.exe   (本体、ffmpeg-the-third を import library リンク)
+│   ├── mimageviewer-remote.exe (本体と remote-ipc protocol version を共有、Web UI 資産も内包)
 │   ├── avcodec-61.dll
 │   ├── avformat-61.dll
 │   ├── avutil-59.dll
+│   ├── avfilter-10.dll
 │   ├── swscale-8.dll
 │   └── swresample-5.dll
 └── 起動時の動作:
-    1. %APPDATA%\mimageviewer\runtime\<version>\ に上記 6 ファイルを展開
+    1. %APPDATA%\mimageviewer\runtime\<version>\ に上記 8 ファイルを展開
        (サイズ一致チェックでスキップ、不一致なら .tmp → atomic rename)
     2. std::process::Command で mimageviewer-core.exe を spawn (引数 forward)
     3. ランチャー即終了 (GUI なので exit code を待たない)
@@ -881,26 +883,28 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 Windows の DLL 検索順 (exe 同居が最優先) で確実に解決される。
 
 **バージョン別 runtime ディレクトリ**: `runtime\<version>\` のように分けることで、
-古い core が走行中に新ランチャーが上書きしようとして file lock で失敗する事象を回避
+古い core / remote が走行中に新ランチャーが上書きしようとして file lock で失敗する事象を回避
 (Codex レビュー助言)。古いバージョンの runtime ディレクトリはユーザーが手動で
 削除可能 (将来的にランチャー側で「最新 N 世代だけ残す」掃除処理を追加するかも)。
 
 **ビルド順序**: cargo は同一ワークスペース内 bin の依存順序を表現できないので
-`scripts/build-release.{sh,ps1}` が 2 段階に分けて呼ぶ:
+`scripts/build-release.{sh,ps1}` が 3 段階に分けて呼ぶ:
 1. `cargo build --release --bin mimageviewer-core` → 本体生成 (package `mimageviewer` 内の bin なので `-p` 不要)
-2. `cargo build --release -p mimageviewer-launcher --bin mimageviewer` → ランチャー生成 (本体を include_bytes!)。**bare `cargo build --release --bin mimageviewer` は失敗する** (`no bin target named mimageviewer in default-run packages`。`mimageviewer` bin は package `mimageviewer-launcher` にあり workspace default-members 外なので `-p` 必須)
+2. `cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets`
+   → Web UI 資産を内包した remote service 生成
+3. `cargo build --release -p mimageviewer-launcher --bin mimageviewer` → ランチャー生成 (core + remote を include_bytes!)。**bare `cargo build --release --bin mimageviewer` は失敗する** (`no bin target named mimageviewer in default-run packages`。`mimageviewer` bin は package `mimageviewer-launcher` にあり workspace default-members 外なので `-p` 必須)
 
-ラッパーは両方の cargo 呼び出しで `CARGO_INCREMENTAL=0` を明示する。`Cargo.toml` の
+ラッパーは 3 つの cargo 呼び出しすべてで `CARGO_INCREMENTAL=0` を明示する。`Cargo.toml` の
 release profile はローカル rebuild 高速化のため `incremental = true` だが、ThinLTO +
 rust-lld で stale incremental object が残ると `fast_image_resize` などの SIMD symbol が
 release link 時に未解決になることがあるため、配布ビルドは安定優先で incremental を切る。
 
-`cargo build --release` を直接打つ場合は ① → ② の順で 2 回打つこと。
-ランチャー側 build.rs が `target/release/mimageviewer-core.exe` の存在をチェックし、
+`cargo build --release` を直接打つ場合は ① → ② → ③ の順で 3 回打つこと。
+ランチャー側 build.rs が `target/release` の core / remote 両方の存在をチェックし、
 無ければ復旧手順付きで止まる。
 
 **配布物**:
-- 単体 exe 版: `mimageviewer.exe` 1 ファイル (約 365MB、内包する core + DLL を含む)
+- 単体 exe 版: `mimageviewer.exe` 1 ファイル (内包する core + remote + DLL を含む)
 - インストーラ版: `mImageViewer_setup.exe` (Inno Setup が同じランチャーを配置)
 - どちらも初回起動時に APPDATA に展開、2 回目以降は展開済みなのでスキップして高速
 
@@ -1377,7 +1381,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 | 配布形態 | ファイル名 | 中身 / 性質 | data 保存先 | 管理者権限 |
 | --- | --- | --- | --- | --- |
-| **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + FFmpeg DLL を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
+| **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + remote service + FFmpeg DLL を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
 | **インストーラ版** | `mImageViewer_setup.exe` | Inno Setup 出力 | `%APPDATA%\mimageviewer` | **要 (UAC)** |
 | **ポータブル版** (v1.1.0 新) | `mImageViewer_portable_v<VER>.zip` | loose-deps。native 依存を埋め込まず exe 隣に同梱、展開ゼロ | `<exe_dir>\data` (APPDATA 不使用) | 不要 |
 
@@ -1389,7 +1393,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 - **Vector**: インストーラ (.exe) + `installer/readme.txt` (利用者向け説明書) を zip にまとめて申請。
   readme 同梱を Vector が要件化しているため、単体 exe やインストーラ単独での申請は不可。
 - **インストーラ**: Inno Setup 6（`installer/mimageviewer.iss`）
-- **配布ビルド**: `.\scripts\build-dist.ps1` (全体テスト → clean → core → launcher → ISCC → portable を 1 コマンド、
+- **配布ビルド**: `.\scripts\build-dist.ps1` (全体テスト → clean → core → remote → launcher → ISCC → portable を 1 コマンド、
   stale 配布物を構造的に防ぐ)。開発中の素早い反復だけ `.\scripts\build-release.ps1` 単体を使う
   (clean/ガードなしなので配布物には使わない)。
 - **出力**: `installer/Output/mImageViewer_setup.exe`
@@ -1399,11 +1403,13 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   readme の内容 (動作環境・連絡先・インストール手順・取り扱い種別) は Vector のファイル掲載基準
   (https://www.vector.co.jp/for_authors/upload/standard.html) を満たしていること。
 - **ポータブル版ビルド**: 配布時は build-dist.ps1 が内部で `.\scripts\build-portable.ps1` を呼ぶ。
-  `cargo build --release --bin mimageviewer-core --features portable --target-dir target-portable`
+  `cargo build --release --bin mimageviewer-core --features portable --target-dir target-portable` と
+  `cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets --target-dir target-portable`
   (非portable core を上書きしないよう専用 target dir に分離) → loose 同梱フォルダ +
   `dist\mImageViewer_portable_v<VER>.zip` を生成する。`portable` feature で native 依存
   (pdfium / onnxruntime / susie / vst3-host / モデル) を埋め込まず exe 隣から解決し、`data_dir` を
-  `<exe_dir>\data` に向ける。launcher は使わず core を `mimageviewer.exe` にリネームして同梱。
+  `<exe_dir>\data` に向ける。launcher は使わず core を `mimageviewer.exe` にリネームし、
+  remote service をその隣へ同梱。
   設計・保守方針 (CI guard 等) は [docs/portable-build-plan.md](docs/portable-build-plan.md)。
   `portable` feature の cfg 分岐は `.git/hooks/pre-push` の `cargo check --features portable` が番人。
 - **CRT 静的リンク**: `.cargo/config.toml` でメイン exe (x86_64) と Susie ワーカー (i686)
@@ -1687,17 +1693,19 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 ### Phase 3: ビルド・配布成果物
 
-10. **配布ビルドは `.\scripts\build-dist.ps1` を使う** (1 コマンドで全体テスト → clean → core → launcher → ISCC → portable)。
+10. **配布ビルドは `.\scripts\build-dist.ps1` を使う** (1 コマンドで全体テスト → clean → core → remote → launcher → ISCC → portable)。
     - build-dist.ps1 は Rust 全体テストを通してから
-      `cargo clean --release -p mimageviewer -p mimageviewer-launcher` (+ `target-portable` の
-      `-p mimageviewer`) してから実コンパイルするので、cargo の偽 up-to-date 由来の **stale 配布物を構造的に防ぐ**
+      `cargo clean --release -p mimageviewer -p mimageviewer-remote -p mimageviewer-launcher`
+      (+ `target-portable` の `-p mimageviewer -p mimageviewer-remote`) してから実コンパイルするので、
+      cargo の偽 up-to-date 由来の **stale 配布物を構造的に防ぐ**
       ([docs/release-operations.md](docs/release-operations.md) §2.1 参照)。内部で build-release.ps1 (常駐 mIV を自動停止して
       LNK1104 を回避) と build-portable.ps1 を子 PowerShell で呼び、各 `$LASTEXITCODE` を検査する。
     - VST3 bridge の C++ を変えていなければ `.\scripts\build-dist.ps1 -SkipVst3Bridge` (cmake 再ビルドを省く)。
     - **コード署名は build-dist.ps1 が既定で ON** (Certum Open Source Code Signing 証明書、SimplySign Desktop
       のクラウド鍵)。配布する全 PE に Authenticode 署名 + RFC3161 タイムスタンプを付ける: 単体exe (launcher) /
-      core / susie32 / vst3-host / pdfium / FFmpeg 6 DLL / `mImageViewer_setup.exe` / portable の各 loose PE。
-      **`include_bytes!` で埋め込む物は「埋め込み前」に署名する** (内側 vendor PE → core → launcher → setup.exe の順)。
+      core / remote / susie32 / vst3-host / pdfium / FFmpeg 6 DLL / `mImageViewer_setup.exe` / portable の各 loose PE。
+      **`include_bytes!` で埋め込む物は「埋め込み前」に署名する**
+      (内側 vendor PE → core + remote → launcher → setup.exe の順)。
       でないと APPDATA へ展開されたコピーが未署名になり、AV 誤検知
       ([docs/release-operations.md](docs/release-operations.md) §7) が
       再発する。`onnxruntime*.dll` は Microsoft 署名済みなので**再署名しない**、`*.onnx` は PE でないので対象外。
@@ -1706,7 +1714,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
       (証明書選択は既定 subject `/n "Open Source Developer Taku Sano"`。証明書更新で拇印を固定したいときは
       `$env:MIV_SIGN_SHA1`、TS 変更は `$env:MIV_SIGN_TS`)。ポータブルの vst3-host は署名対応後も当面**非同梱据え置き**。
     - **通常の開発反復は `.\scripts\build-dev.ps1`**。通常feature set（portableなし）を
-      `dev-runtime` profileで `target\dev-runtime` へcoreだけビルドし、launcherなしで必要な
+      `dev-runtime` profileで `target\dev-runtime` へ core + remote をビルドし、launcherなしで必要な
       FFmpeg DLLだけを変更時に配置する。引数なしの起動は通常版と同じ
       `%APPDATA%\mimageviewer` を使う。launcher／release最適化／埋め込みasset／変更したVST3
       bridgeまで含む実機確認は `.\scripts\build-release.ps1` (incremental・cleanなし、署名は
@@ -2075,15 +2083,15 @@ HWND owner・focus・z-order / IME の実挙動 / マルチモニター DPI な�
   `%APPDATA%\mimageviewer` を使う。`dev-runtime` はアプリのデータprofile名ではない。
 - **release構成依存の実行**: launcher、release-only cfg／最適化、exact release performance、
   埋め込みasset展開、変更したVST3 bridge、署名、packagingに依存する場合は
-  `.\scripts\build-release.ps1`。内部でcore → launcherの2段cargo buildを回し、常駐mIVを
+  `.\scripts\build-release.ps1`。内部で core → remote → launcher の3段cargo buildを回し、常駐mIVを
   自動停止してLNK1104を回避する。出力は `target\release\mimageviewer.exe` (launcher) と
-  `target\release\mimageviewer-core.exe` (本体)。
+  `target\release\mimageviewer-core.exe` (本体)、`target\release\mimageviewer-remote.exe`。
 - **配布ではないので `build-dist.ps1` は使わない**。配布物を作るときだけclean-firstの
   `build-dist.ps1`。
 - **⚠️ エージェントのツールから呼ぶときは `*>&1` を付けない**。PowerShell の `-ErrorAction Stop`
   下で cargo の stderr が terminating error 化して即失敗する
   ([docs/release-operations.md](docs/release-operations.md) §2.2)。PowerShell ツールは stderr を自前で拾うので、素の
-  `.\scripts\build-release.ps1` で呼ぶ。失敗する場合は core → launcher の 2 段 cargo build を
+  `.\scripts\build-release.ps1` で呼ぶ。失敗する場合は core → remote → launcher の 3 段 cargo build を
   直接叩く。
 - **依頼のしかた**: core検証なら
   `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`、release構成検証なら

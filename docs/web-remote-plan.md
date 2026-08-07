@@ -1349,6 +1349,26 @@ Auto trim の見開き slot に相手 address が無い場合は、上下 harmon
 経路はない。通常の managed service も本体終了時に子 process が終了する。この境界から、更新の自動化は
 新しい session の取得成功直後だけに限定する。
 
+### 12.18 配布物への remote service 統合 (2026-08-07)
+
+core の探索規則は従来どおり「自分と同じ directory の `mimageviewer-remote.exe`」だけとする。
+単体 exe / installer の launcher は release core、remote service、FFmpeg 6 DLL を
+`include_bytes!` で同じ `%APPDATA%\mimageviewer\runtime\<version>\` へ展開する。launcher の
+`build.rs` は core と remote の両方が先に存在しなければ停止し、それぞれの hash を埋め込む。
+版別 runtime と workspace 共通 version、同じ source tree の `mimageviewer-ipc` により、利用者が
+core と protocol 不一致の remote を組み合わせる経路を作らない。
+
+remote は従来、release でも `CARGO_MANIFEST_DIR/web` という開発 source tree の絶対 path から
+ブラウザ資産を読んでいた。配布用の `embedded-web-assets` feature では HTML / JS / CSS / HLS /
+PWA 資産とライセンスを remote exe に内包し、filesystem 上の web root を持たない。通常の
+dev-runtime と `restart-remote-web.ps1` は feature を付けず、従来どおり source tree を直接配信して
+フロント変更の hot reload を維持する。
+
+署名順は vendor PE → core + remote → launcher → installer。remote は launcher に埋め込む前に署名し、
+portable は `mimageviewer.exe` の隣へ Web 資産内包 remote を loose 配置して、package copy を署名する。
+distribution clean は通常 target / portable target の両方で `mimageviewer-remote` package も消し、
+古い protocol / Web 資産の remote を載せない。
+
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 
 この節は設計ではなく**開発手順**の記録。会話ログにしか残らない知識を失わないために書く。
@@ -1380,7 +1400,7 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
   Bearer) は `remote-web-console.log` へ落ちる
 - **`.ps1` は ASCII のみで書く。** 日本語コメントを入れると Windows PowerShell 5.1 が
   BOM 無しスクリプトを ANSI として読み、パースエラーになる
-- `crates/remote-web/web/` はディスクから直接配信される。**フロントだけの変更なら
+- 開発用 remote の `crates/remote-web/web/` はディスクから直接配信される。**フロントだけの変更なら
   ビルドも再起動も不要**で、ブラウザの再読み込みで反映される
 
 ### 13.3 テスト実行時の注意
@@ -1426,10 +1446,12 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 1. **動画・音声ストリーミングのフロント (増分 7)** — server / IPC は増分 6 で完了。
    正本は [web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md)
 2. **検索** (Ctrl+S / F / G 相当)、タグ
-3. 配布 (exe 埋め込み、接続診断ウィザード)
+3. **接続診断ウィザード**。配布への `mimageviewer-remote.exe` 組込みは 2026-08-07 に完了。
+   単体 exe / installer は launcher が core と同じ版別 runtime へ展開し、portable は core の隣へ
+   loose 同梱する
 
 ### 13.7 未消化の宿題
 
-- `cargo test -p mimageviewer-launcher` が未実行。launcher の `build.rs` が
-  `target/release/mimageviewer-core.exe` を要求するため、release core をビルドしてから流す。
-  §11 の single-instance 名前空間の変更が配布経路を壊していないかの最終確認になる
+- **完了 (2026-08-07)**: release の core → remote → launcher ビルド後に
+  `cargo test -p mimageviewer-launcher` を実行し、7 件すべて成功。single-instance 名前空間に加え、
+  埋め込んだ remote が core と同じ版別 runtime directory へ hash 一致で展開されることも固定した

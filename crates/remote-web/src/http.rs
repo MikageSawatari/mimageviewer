@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+#[cfg(not(feature = "embedded-web-assets"))]
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
@@ -42,6 +43,66 @@ pub const MAX_CONCURRENT_HEAVY_IPC: usize = 4;
 pub const MAX_CONCURRENT_PAGE_PREFETCH: usize = 1;
 pub const MAX_CONCURRENT_STREAM_IPC: usize = 4;
 const IPC_RETRY_AFTER_SECONDS: u64 = 1;
+
+#[cfg(feature = "embedded-web-assets")]
+static EMBEDDED_WEB_ASSETS: &[(&str, &[u8])] = &[
+    ("app.js", include_bytes!("../web/app.js")),
+    (
+        "command-core.mjs",
+        include_bytes!("../web/command-core.mjs"),
+    ),
+    (
+        "icons/icon-180.png",
+        include_bytes!("../web/icons/icon-180.png"),
+    ),
+    (
+        "icons/icon-192.png",
+        include_bytes!("../web/icons/icon-192.png"),
+    ),
+    (
+        "icons/icon-512.png",
+        include_bytes!("../web/icons/icon-512.png"),
+    ),
+    (
+        "icons/maskable-192.png",
+        include_bytes!("../web/icons/maskable-192.png"),
+    ),
+    (
+        "icons/maskable-512.png",
+        include_bytes!("../web/icons/maskable-512.png"),
+    ),
+    ("index.html", include_bytes!("../web/index.html")),
+    (
+        "local-settings.mjs",
+        include_bytes!("../web/local-settings.mjs"),
+    ),
+    (
+        "manifest.webmanifest",
+        include_bytes!("../web/manifest.webmanifest"),
+    ),
+    ("offline.html", include_bytes!("../web/offline.html")),
+    (
+        "service-worker.js",
+        include_bytes!("../web/service-worker.js"),
+    ),
+    ("styles.css", include_bytes!("../web/styles.css")),
+    (
+        "vendor/hls.LICENSE.txt",
+        include_bytes!("../web/vendor/hls.LICENSE.txt"),
+    ),
+    (
+        "vendor/hls.VERSION.txt",
+        include_bytes!("../web/vendor/hls.VERSION.txt"),
+    ),
+    (
+        "vendor/hls.min.js",
+        include_bytes!("../web/vendor/hls.min.js"),
+    ),
+    (
+        "video-stream.mjs",
+        include_bytes!("../web/video-stream.mjs"),
+    ),
+];
 
 pub struct AppState {
     pub auth: AuthService,
@@ -1896,7 +1957,7 @@ fn unauthorized() -> HttpResponse {
         .with_header("Cache-Control", "no-store")
 }
 
-/// Identify the web assets currently on disk.
+/// Identify the web assets currently served by this process.
 ///
 /// The app is a single page whose screens are hash changes, so a tab that is already open never
 /// re-fetches its own scripts. It keeps running the build it was loaded with until someone
@@ -1904,9 +1965,9 @@ fn unauthorized() -> HttpResponse {
 /// that was not in the running code. Assets are read per request and served `no-cache`, so the
 /// only missing piece is telling the page that what it is running is no longer what is served.
 ///
-/// Size and mtime are enough to notice a deploy and cost one `metadata` call per file; hashing
-/// the bytes would be exact but this is polled, and a rewrite that preserves both is not a case
-/// worth paying for on every poll.
+/// Development serves files from disk, where size and mtime cheaply detect a deploy. Distribution
+/// embeds immutable bytes, so its token hashes the embedded asset set and has no filesystem input.
+#[cfg(not(feature = "embedded-web-assets"))]
 fn web_asset_token(web_root: &std::path::Path) -> String {
     use std::hash::{Hash, Hasher};
     let Ok(entries) = fs::read_dir(web_root) else {
@@ -1933,6 +1994,14 @@ fn web_asset_token(web_root: &std::path::Path) -> String {
     files.sort();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     files.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+#[cfg(feature = "embedded-web-assets")]
+fn web_asset_token(_web_root: &std::path::Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    EMBEDDED_WEB_ASSETS.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -3303,8 +3372,21 @@ fn remote_source_kind(address: &RemoteAddress) -> &'static str {
     }
 }
 
+#[cfg(not(feature = "embedded-web-assets"))]
+fn load_web_asset(web_root: &std::path::Path, name: &str) -> Result<Vec<u8>, String> {
+    fs::read(web_root.join(name)).map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "embedded-web-assets")]
+fn load_web_asset(_web_root: &std::path::Path, name: &str) -> Result<Vec<u8>, String> {
+    EMBEDDED_WEB_ASSETS
+        .iter()
+        .find_map(|(asset_name, bytes)| (*asset_name == name).then(|| bytes.to_vec()))
+        .ok_or_else(|| format!("embedded asset is missing: {name}"))
+}
+
 fn static_file(state: &AppState, name: &str, content_type: &'static str) -> HttpResponse {
-    match fs::read(state.web_root.join(name)) {
+    match load_web_asset(&state.web_root, name) {
         Ok(bytes) => {
             HttpResponse::bytes(200, content_type, bytes).with_header("Cache-Control", "no-cache")
         }
@@ -3318,18 +3400,16 @@ fn static_file(state: &AppState, name: &str, content_type: &'static str) -> Http
 const WEB_ASSET_TOKEN_PLACEHOLDER: &str = "__MIV_REMOTE_ASSET_TOKEN__";
 
 /// Bind the shell to the asset tree from which it was loaded. The app-version endpoint describes
-/// the tree currently on disk and therefore cannot identify an already-running script after a
+/// the tree currently served and therefore cannot identify an already-running script after a
 /// deploy.
 fn static_index(state: &AppState) -> HttpResponse {
-    let path = state.web_root.join("index.html");
-    match fs::read_to_string(&path) {
+    match load_web_asset(&state.web_root, "index.html")
+        .and_then(|bytes| String::from_utf8(bytes).map_err(|error| error.to_string()))
+    {
         Ok(source) => {
             let asset_token = web_asset_token(&state.web_root);
             if asset_token.is_empty() || !source.contains(WEB_ASSET_TOKEN_PLACEHOLDER) {
-                eprintln!(
-                    "remote-web: index shell has no usable asset token placeholder: {}",
-                    path.display()
-                );
+                eprintln!("remote-web: index shell has no usable asset token placeholder");
                 return HttpResponse::text(500, "Internal Server Error");
             }
             HttpResponse::bytes(
@@ -3639,6 +3719,7 @@ mod tests {
         ));
     }
 
+    #[cfg(not(feature = "embedded-web-assets"))]
     #[test]
     fn command_core_module_is_public_for_the_pin_screen_bootstrap() {
         let temp = tempfile::tempdir().unwrap();
@@ -3653,6 +3734,7 @@ mod tests {
         assert_eq!(response.body, b"export {};");
     }
 
+    #[cfg(not(feature = "embedded-web-assets"))]
     #[test]
     fn local_settings_module_is_public_for_the_app_bootstrap() {
         let temp = tempfile::tempdir().unwrap();
@@ -3667,6 +3749,7 @@ mod tests {
         assert_eq!(response.body, b"export {};");
     }
 
+    #[cfg(not(feature = "embedded-web-assets"))]
     #[test]
     fn video_stream_modules_are_public_shell_assets_with_exact_routes() {
         let temp = tempfile::tempdir().unwrap();
@@ -3696,6 +3779,7 @@ mod tests {
         assert_eq!(route(&mut prefix_request, &state).status, 401);
     }
 
+    #[cfg(not(feature = "embedded-web-assets"))]
     #[test]
     fn pwa_shell_assets_are_public_before_and_after_authentication() {
         let temp = tempfile::tempdir().unwrap();
@@ -3792,6 +3876,59 @@ mod tests {
             .with_path("/api/favorites")
             .into();
         assert_eq!(route(&mut protected_request, &state).status, 401);
+    }
+
+    #[cfg(feature = "embedded-web-assets")]
+    #[test]
+    fn distribution_serves_the_complete_embedded_shell_without_a_web_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let routes = [
+            ("/", "text/html; charset=utf-8"),
+            ("/app.js", "text/javascript; charset=utf-8"),
+            ("/command-core.mjs", "text/javascript; charset=utf-8"),
+            ("/local-settings.mjs", "text/javascript; charset=utf-8"),
+            ("/video-stream.mjs", "text/javascript; charset=utf-8"),
+            ("/vendor/hls.min.js", "text/javascript; charset=utf-8"),
+            ("/styles.css", "text/css; charset=utf-8"),
+            ("/service-worker.js", "text/javascript; charset=utf-8"),
+            ("/offline.html", "text/html; charset=utf-8"),
+            (
+                "/manifest.webmanifest",
+                "application/manifest+json; charset=utf-8",
+            ),
+            ("/icons/icon-180.png", "image/png"),
+            ("/icons/icon-192.png", "image/png"),
+            ("/icons/icon-512.png", "image/png"),
+            ("/icons/maskable-192.png", "image/png"),
+            ("/icons/maskable-512.png", "image/png"),
+        ];
+        for (path, expected_content_type) in routes {
+            let mut request: Request = TestRequest::new()
+                .with_method(Method::Get)
+                .with_path(path)
+                .into();
+            let response = route(&mut request, &state);
+            assert_eq!(response.status, 200, "{path}");
+            assert_eq!(response.content_type, expected_content_type, "{path}");
+            assert!(!response.body.is_empty(), "{path}");
+        }
+
+        let token = web_asset_token(&state.web_root);
+        assert!(!token.is_empty());
+        let mut index_request: Request = TestRequest::new()
+            .with_method(Method::Get)
+            .with_path("/")
+            .into();
+        let index = route(&mut index_request, &state);
+        let index = String::from_utf8(index.body).unwrap();
+        assert!(index.contains(&format!(r#"content="{token}""#)));
+        assert!(!index.contains(WEB_ASSET_TOKEN_PLACEHOLDER));
+        assert!(
+            EMBEDDED_WEB_ASSETS
+                .iter()
+                .any(|(name, _)| *name == "vendor/hls.LICENSE.txt")
+        );
     }
 
     #[test]
@@ -3981,6 +4118,7 @@ mod tests {
         assert_eq!(response.body, b"Unauthorized");
     }
 
+    #[cfg(not(feature = "embedded-web-assets"))]
     #[test]
     fn the_asset_token_changes_when_an_asset_changes_and_needs_authentication() {
         let temp = tempfile::tempdir().unwrap();

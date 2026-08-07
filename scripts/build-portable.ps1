@@ -69,6 +69,7 @@ $repoPrefix = ($repoRoot.TrimEnd('\') + '\').ToLower()
 $stoppableProcessNames = @(
     'mimageviewer',
     'mimageviewer-core',
+    'mimageviewer-remote',
     'mimageviewer-vst3-host',
     'mimageviewer-susie32'
 )
@@ -93,13 +94,18 @@ Get-Process -ErrorAction SilentlyContinue |
 # ---------------------------------------------------------------------------
 $portableTargetDir = Join-Path $repoRoot 'target-portable'
 $coreExe = Join-Path $portableTargetDir 'release\mimageviewer-core.exe'
+$remoteExe = Join-Path $portableTargetDir 'release\mimageviewer-remote.exe'
 if (-not $SkipBuild) {
     Ensure-LibclangPath
     Write-Host "[portable] cargo build --release --bin mimageviewer-core --features portable --target-dir target-portable"
     & cargo build --release --bin mimageviewer-core --features portable --target-dir $portableTargetDir
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    Write-Host "[portable] cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets --target-dir target-portable"
+    & cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets --target-dir $portableTargetDir
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 if (-not (Test-Path $coreExe)) { throw "[portable] core exe not found: $coreExe" }
+if (-not (Test-Path $remoteExe)) { throw "[portable] remote service exe not found: $remoteExe" }
 
 # ---------------------------------------------------------------------------
 # Assemble the distribution folder.
@@ -114,6 +120,7 @@ New-Item -ItemType Directory -Path (Join-Path $pkgDir 'models') | Out-Null
 # (source relative to repo root, destination relative to pkgDir)
 $copies = @(
     @{ src = 'target-portable\release\mimageviewer-core.exe'; dst = 'mimageviewer.exe' }
+    @{ src = 'target-portable\release\mimageviewer-remote.exe'; dst = 'mimageviewer-remote.exe' }
     @{ src = 'vendor\ffmpeg\bin\avcodec-61.dll';     dst = 'avcodec-61.dll' }
     @{ src = 'vendor\ffmpeg\bin\avformat-61.dll';    dst = 'avformat-61.dll' }
     @{ src = 'vendor\ffmpeg\bin\avutil-59.dll';      dst = 'avutil-59.dll' }
@@ -191,6 +198,7 @@ Write-Host "[portable] portable core exe size: $exeSizeMb MB (embedded native de
 if ($Sign) {
     $portablePe = @(
         'mimageviewer.exe',
+        'mimageviewer-remote.exe',
         'pdfium.dll',
         'mimageviewer-susie32.exe',
         'avcodec-61.dll', 'avformat-61.dll', 'avutil-59.dll',
