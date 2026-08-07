@@ -879,6 +879,11 @@ guard で、動画処理開始後の timeout 9 個には数えない。
   playlist attach、visibility 復帰などの自動経路から `play()` を再発行しない。notice 自体に
   「タップして再生」ボタンを置き、その click handler が user activation を失う await より前に
   `play()` を 1 回だけ呼ぶ。成功時だけ gate を通常状態へ戻す
+- play intent と gate は `play_requested / stopped / user_activation_required` の単一状態で所有する。
+  native `playing` event は個々の `play()` Promise と相関せず、iOS では拒否後にも届きうるため、
+  許可成功の根拠にはしない。poll の play intent、`canplay`、非利用者起点の成功通知でも activation
+  待ちは維持し、明示タップから呼んだ `play()` の成功だけが `play_requested` へ戻して案内を消す。
+  拒否直後の `playing` で gate が落ち、続く `canplay` が 2 回目を発行していた経路も同じ遷移で閉じる
 - `AbortError` は source 交換や pause により play 要求の owner が中断した状態であり、autoplay
   案内へ写像しない。それ以外の play promise rejection は再生層失敗として明示的な terminal へ
   終える。拒否名の分類と、activation 待ち中に stall 判定を開始しない条件を純関数テストで固定する

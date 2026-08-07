@@ -326,6 +326,60 @@ function newPlaybackAttemptStats() {
   };
 }
 
+export const VideoPlaybackControlState = Object.freeze({
+  PLAY_REQUESTED: "play_requested",
+  STOPPED: "stopped",
+  USER_ACTIVATION_REQUIRED: "user_activation_required",
+});
+
+export function videoPlaybackControlTransition(currentState, event = {}) {
+  const current = Object.values(VideoPlaybackControlState).includes(currentState)
+    ? currentState
+    : VideoPlaybackControlState.STOPPED;
+  switch (event.type) {
+    case "reset":
+      return event.playRequested
+        ? VideoPlaybackControlState.PLAY_REQUESTED
+        : VideoPlaybackControlState.STOPPED;
+    case "synchronize_intent":
+      if (!event.playRequested) return VideoPlaybackControlState.STOPPED;
+      return current === VideoPlaybackControlState.USER_ACTIVATION_REQUIRED
+        ? current
+        : VideoPlaybackControlState.PLAY_REQUESTED;
+    case "request_play":
+      return current === VideoPlaybackControlState.USER_ACTIVATION_REQUIRED
+        ? current
+        : VideoPlaybackControlState.PLAY_REQUESTED;
+    case "request_pause":
+      return VideoPlaybackControlState.STOPPED;
+    case "play_rejected_user_activation":
+      return current === VideoPlaybackControlState.STOPPED
+        ? current
+        : VideoPlaybackControlState.USER_ACTIVATION_REQUIRED;
+    case "play_succeeded":
+      if (current === VideoPlaybackControlState.STOPPED) return current;
+      if (
+        current === VideoPlaybackControlState.USER_ACTIVATION_REQUIRED &&
+        !event.userInitiated
+      ) return current;
+      return VideoPlaybackControlState.PLAY_REQUESTED;
+    case "media_playing":
+    default:
+      // A media event is not correlated with a particular play() promise. In
+      // particular, WebKit can deliver a queued playing event after that
+      // promise was rejected, so it must never authorize playback by itself.
+      return current;
+  }
+}
+
+function videoPlaybackControlRequestsPlay(state) {
+  return state !== VideoPlaybackControlState.STOPPED;
+}
+
+function videoPlaybackControlAwaitsUserActivation(state) {
+  return state === VideoPlaybackControlState.USER_ACTIVATION_REQUIRED;
+}
+
 export function videoHealthSample({
   trigger = "hud",
   video = {},
@@ -1503,7 +1557,10 @@ export class VideoStreamViewer {
     this.lastState = null;
     this.timelineAnchor = { sourcePositionSecs: 0, mediaTimeSecs: 0 };
     this.timelineAnchorGeneration = null;
-    this.playRequested = true;
+    this.playbackControlState = videoPlaybackControlTransition(
+      VideoPlaybackControlState.STOPPED,
+      { type: "reset", playRequested: true }
+    );
     this.barsVisible = true;
     this.destroyed = false;
     this.restarting = false;
@@ -1515,7 +1572,6 @@ export class VideoStreamViewer {
     this.lastServerMessage = "";
     this.lastDiagnosticMessage = "";
     this.playbackAttempts = newPlaybackAttemptStats();
-    this.playbackGate = "ready";
     this.playbackStallWatch = null;
     this.hlsErrorTelemetryAt = new Map();
     this.startupWatch = null;
@@ -1661,14 +1717,7 @@ export class VideoStreamViewer {
       this.updateProgress();
       this.handlePlaybackBoundary(false);
     };
-    this.onPlaying = () => {
-      this.playbackGate = "ready";
-      if (this.noticeKind === "autoplay") this.hideNotice();
-      this.checkPlaybackStartupProgress();
-      this.clearWaiting();
-      this.finishSeekPreviewForAttachedGeneration();
-      this.captureVideoHealth("hud");
-    };
+    this.onPlaying = () => this.handleMediaPlaying();
     this.onCanPlay = () => {
       this.checkPlaybackStartupProgress();
       this.playIfRequested();
@@ -1745,6 +1794,33 @@ export class VideoStreamViewer {
     );
   }
 
+  get playRequested() {
+    return videoPlaybackControlRequestsPlay(this.playbackControlState);
+  }
+
+  get awaitingUserActivation() {
+    return videoPlaybackControlAwaitsUserActivation(this.playbackControlState);
+  }
+
+  transitionPlaybackControl(event) {
+    this.playbackControlState = videoPlaybackControlTransition(
+      this.playbackControlState,
+      event
+    );
+    return this.playbackControlState;
+  }
+
+  handleMediaPlaying() {
+    this.transitionPlaybackControl({ type: "media_playing" });
+    this.checkPlaybackStartupProgress();
+    if (!this.awaitingUserActivation) {
+      if (this.noticeKind === "autoplay") this.hideNotice();
+      this.clearWaiting();
+      this.finishSeekPreviewForAttachedGeneration();
+    }
+    this.captureVideoHealth("hud");
+  }
+
   applyRemoteSessionState(snapshot) {
     const wasBlocked = this.remoteSessionState.blocksInteraction;
     this.remoteSessionState = snapshot ?? { blocksInteraction: false };
@@ -1785,14 +1861,16 @@ export class VideoStreamViewer {
   }
 
   async start(positionSecs = null, restorePlaying = true) {
-    this.playRequested = restorePlaying;
+    this.transitionPlaybackControl({
+      type: "reset",
+      playRequested: Boolean(restorePlaying),
+    });
     this.clearPoll();
     this.clearHealthTelemetry();
     this.lastFragmentHealth = null;
     this.lastServerMessage = "";
     this.lastDiagnosticMessage = "";
     this.playbackAttempts = newPlaybackAttemptStats();
-    this.playbackGate = "ready";
     this.showNotice("動画を準備しています。", "waiting");
     let started;
     try {
@@ -2252,7 +2330,9 @@ export class VideoStreamViewer {
   }
 
   async setPlaying(playing) {
-    this.playRequested = Boolean(playing);
+    this.transitionPlaybackControl({
+      type: playing ? "request_play" : "request_pause",
+    });
     this.syncHealthTelemetry();
     if (this.session && Boolean(this.lastState?.play_intent) !== this.playRequested) {
       await this.apiPostJson(
@@ -2264,7 +2344,6 @@ export class VideoStreamViewer {
     if (this.lastState) this.lastState.play_intent = this.playRequested;
     if (this.playRequested) await this.playIfRequested();
     else {
-      this.playbackGate = "ready";
       if (this.noticeKind === "autoplay") this.hideNotice();
       this.clearWaiting();
       this.video.pause();
@@ -2309,7 +2388,7 @@ export class VideoStreamViewer {
       return;
     }
 
-    this.playRequested = true;
+    this.transitionPlaybackControl({ type: "request_play" });
     this.seekTo(decision.positionSecs)
       .then(() => this.playIfRequested())
       .catch((error) => this.showOperationalError(error, "ループ再生を続けられませんでした"))
@@ -2326,7 +2405,7 @@ export class VideoStreamViewer {
       this.remoteSessionState.blocksInteraction ||
       !this.video.src && !this.hls ||
       this.playbackAttempts.pending > 0 ||
-      this.playbackGate === "user_activation_required" && !userInitiated
+      this.awaitingUserActivation && !userInitiated
     ) return;
     const playbackAttempts = this.playbackAttempts;
     const attemptSequence = playbackAttempts.attempts + 1;
@@ -2349,8 +2428,11 @@ export class VideoStreamViewer {
       this.playbackAttempts !== playbackAttempts
     ) return;
     if (!rejection) {
-      this.playbackGate = "ready";
-      if (["autoplay", "waiting"].includes(this.noticeKind)) this.hideNotice();
+      this.transitionPlaybackControl({ type: "play_succeeded", userInitiated });
+      if (
+        !this.awaitingUserActivation &&
+        ["autoplay", "waiting"].includes(this.noticeKind)
+      ) this.hideNotice();
       this.captureVideoHealth("hud");
       return;
     }
@@ -2371,7 +2453,8 @@ export class VideoStreamViewer {
     this.captureVideoHealth("play_rejected", { telemetry: true });
     const decision = videoPlayRejectionDecision(rejection?.name);
     if (decision.kind === "user_activation_required") {
-      this.playbackGate = "user_activation_required";
+      this.transitionPlaybackControl({ type: "play_rejected_user_activation" });
+      if (!this.awaitingUserActivation) return;
       this.clearWaiting();
       this.showNotice(
         "自動再生が制限されています。",
@@ -2654,8 +2737,14 @@ export class VideoStreamViewer {
     this.encoder = String(mediaState.encoder ?? this.encoder);
     this.codecs = String(mediaState.codecs ?? this.codecs);
     this.updateAudioProcessing(mediaState.audio_processing, true);
-    this.playRequested = Boolean(mediaState.play_intent);
-    if (!this.playRequested) this.clearWaiting();
+    this.transitionPlaybackControl({
+      type: "synchronize_intent",
+      playRequested: Boolean(mediaState.play_intent),
+    });
+    if (!this.playRequested) {
+      if (this.noticeKind === "autoplay") this.hideNotice();
+      this.clearWaiting();
+    }
     this.syncHealthTelemetry();
     this.seekInput.max = String(this.duration);
     if (
@@ -2936,7 +3025,10 @@ export class VideoStreamViewer {
       if (error?.name === "AbortError") return;
       this.rememberPlaybackError(error);
       if ([404, 409, 410].includes(Number(error?.status))) {
-        this.playRequested = restorePlaying;
+        this.transitionPlaybackControl({
+          type: "synchronize_intent",
+          playRequested: restorePlaying,
+        });
         await this.restartAt(position);
         return;
       }
@@ -3012,7 +3104,7 @@ export class VideoStreamViewer {
     const initialDecision = videoPlaybackStallDecision({
       active: true,
       playRequested: this.playRequested,
-      awaitingUserActivation: this.playbackGate === "user_activation_required",
+      awaitingUserActivation: this.awaitingUserActivation,
       ended: this.video.ended,
       blocked: this.remoteSessionState.blocksInteraction,
     });
@@ -3106,7 +3198,7 @@ export class VideoStreamViewer {
     const decision = videoPlaybackStallDecision({
       active: true,
       playRequested: this.playRequested,
-      awaitingUserActivation: this.playbackGate === "user_activation_required",
+      awaitingUserActivation: this.awaitingUserActivation,
       ended: this.video.ended,
       blocked: this.remoteSessionState.blocksInteraction,
       hidden: globalThis.document?.visibilityState === "hidden",

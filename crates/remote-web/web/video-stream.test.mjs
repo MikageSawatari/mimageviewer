@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   VideoGenerationSwitchOwner,
   VIDEO_PANEL_TABS,
+  VideoPlaybackControlState,
   VideoSeekPreviewOwner,
   VideoStreamViewer,
   hlsBufferConfig,
@@ -14,6 +15,7 @@ import {
   videoAudioProcessingPresentation,
   videoEndDecision,
   videoPlayRejectionDecision,
+  videoPlaybackControlTransition,
   videoPlaybackStallDecision,
   videoHealthSample,
   videoHealthSamplingDecision,
@@ -90,7 +92,7 @@ test("video start ends a busy attempt visibly instead of retrying forever", asyn
     code: "stream_busy",
   });
   const viewer = {
-    playRequested: true,
+    playbackControlState: VideoPlaybackControlState.PLAY_REQUESTED,
     destroyed: false,
     address: { favorite_id: "favorite", relative_path: "movie.mp4" },
     quality: "standard",
@@ -107,6 +109,9 @@ test("video start ends a busy attempt visibly instead of retrying forever", asyn
       throw new Error("start must not enter the unbounded waiting loop");
     },
     showStartFailure: (error) => failures.push(error),
+    transitionPlaybackControl(event) {
+      return VideoStreamViewer.prototype.transitionPlaybackControl.call(this, event);
+    },
   };
 
   await VideoStreamViewer.prototype.start.call(viewer);
@@ -553,6 +558,65 @@ test("stable playback progress resolves the waiting owner and its notice", () =>
   assert.equal(viewer.playbackStallWatch, null);
 });
 
+test("autoplay wait survives playback observations until an explicit play succeeds", () => {
+  let state = videoPlaybackControlTransition(
+    VideoPlaybackControlState.PLAY_REQUESTED,
+    { type: "play_rejected_user_activation" }
+  );
+  assert.equal(state, VideoPlaybackControlState.USER_ACTIVATION_REQUIRED);
+
+  for (const event of [
+    { type: "media_playing" },
+    { type: "request_play" },
+    { type: "synchronize_intent", playRequested: true },
+    { type: "play_succeeded", userInitiated: false },
+  ]) {
+    state = videoPlaybackControlTransition(state, event);
+    assert.equal(state, VideoPlaybackControlState.USER_ACTIVATION_REQUIRED);
+  }
+
+  assert.equal(
+    videoPlaybackControlTransition(state, {
+      type: "play_succeeded",
+      userInitiated: true,
+    }),
+    VideoPlaybackControlState.PLAY_REQUESTED
+  );
+  assert.equal(
+    videoPlaybackControlTransition(state, { type: "request_pause" }),
+    VideoPlaybackControlState.STOPPED
+  );
+});
+
+test("a native playing event cannot dismiss the autoplay activation notice", () => {
+  const calls = [];
+  const viewer = {
+    playbackControlState: VideoPlaybackControlState.USER_ACTIVATION_REQUIRED,
+    noticeKind: "autoplay",
+    transitionPlaybackControl(event) {
+      return VideoStreamViewer.prototype.transitionPlaybackControl.call(this, event);
+    },
+    checkPlaybackStartupProgress: () => calls.push("check_startup"),
+    hideNotice: () => calls.push("hide_notice"),
+    clearWaiting: () => calls.push("clear_waiting"),
+    finishSeekPreviewForAttachedGeneration: () => calls.push("finish_preview"),
+    captureVideoHealth: (trigger) => calls.push(["health", trigger]),
+  };
+  Object.defineProperty(viewer, "awaitingUserActivation", {
+    get() {
+      return this.playbackControlState === VideoPlaybackControlState.USER_ACTIVATION_REQUIRED;
+    },
+  });
+
+  VideoStreamViewer.prototype.handleMediaPlaying.call(viewer);
+
+  assert.equal(
+    viewer.playbackControlState,
+    VideoPlaybackControlState.USER_ACTIVATION_REQUIRED
+  );
+  assert.deepEqual(calls, ["check_startup", ["health", "hud"]]);
+});
+
 test("an autoplay rejection waits for one explicit tap and leaves stall monitoring", async () => {
   const rejection = new Error("gesture required");
   rejection.name = "NotAllowedError";
@@ -560,7 +624,6 @@ test("an autoplay rejection waits for one explicit tap and leaves stall monitori
   let noticeAction;
   let allowPlayback = false;
   const viewer = {
-    playRequested: true,
     destroyed: false,
     remoteSessionState: { blocksInteraction: false },
     video: {
@@ -572,7 +635,7 @@ test("an autoplay rejection waits for one explicit tap and leaves stall monitori
       },
     },
     hls: null,
-    playbackGate: "ready",
+    playbackControlState: VideoPlaybackControlState.PLAY_REQUESTED,
     playbackAttempts: {
       attempts: 0,
       successes: 0,
@@ -592,6 +655,20 @@ test("an autoplay rejection waits for one explicit tap and leaves stall monitori
     hideNotice: () => calls.push("hide_notice"),
     noticeKind: "autoplay",
   };
+  Object.defineProperties(viewer, {
+    playRequested: {
+      get() {
+        return this.playbackControlState !== VideoPlaybackControlState.STOPPED;
+      },
+    },
+    awaitingUserActivation: {
+      get() {
+        return this.playbackControlState === VideoPlaybackControlState.USER_ACTIVATION_REQUIRED;
+      },
+    },
+  });
+  viewer.transitionPlaybackControl = (event) =>
+    VideoStreamViewer.prototype.transitionPlaybackControl.call(viewer, event);
   viewer.playIfRequested = (options) =>
     VideoStreamViewer.prototype.playIfRequested.call(viewer, options);
 
@@ -605,7 +682,10 @@ test("an autoplay rejection waits for one explicit tap and leaves stall monitori
     pending: 0,
     lastRejectionName: "NotAllowedError",
   });
-  assert.equal(viewer.playbackGate, "user_activation_required");
+  assert.equal(
+    viewer.playbackControlState,
+    VideoPlaybackControlState.USER_ACTIVATION_REQUIRED
+  );
   assert.deepEqual(calls.slice(-3), [
     ["health", "play_rejected", { telemetry: true }],
     "clear_waiting",
@@ -618,7 +698,7 @@ test("an autoplay rejection waits for one explicit tap and leaves stall monitori
   allowPlayback = true;
   await noticeAction();
   assert.equal(calls.filter((entry) => entry === "play").length, 2);
-  assert.equal(viewer.playbackGate, "ready");
+  assert.equal(viewer.playbackControlState, VideoPlaybackControlState.PLAY_REQUESTED);
   assert.equal(viewer.playbackAttempts.successes, 1);
   assert.equal(calls.at(-2), "hide_notice");
   assert.deepEqual(calls.at(-1), ["health", "hud"]);
@@ -629,7 +709,6 @@ test("an interrupted play promise does not masquerade as an autoplay block", asy
   rejection.name = "AbortError";
   const calls = [];
   const viewer = {
-    playRequested: true,
     destroyed: false,
     remoteSessionState: { blocksInteraction: false },
     video: {
@@ -637,7 +716,7 @@ test("an interrupted play promise does not masquerade as an autoplay block", asy
       play: () => Promise.reject(rejection),
     },
     hls: null,
-    playbackGate: "ready",
+    playbackControlState: VideoPlaybackControlState.PLAY_REQUESTED,
     playbackAttempts: {
       attempts: 0,
       successes: 0,
@@ -652,10 +731,24 @@ test("an interrupted play promise does not masquerade as an autoplay block", asy
     showNotice: () => calls.push("notice"),
     finishPlaybackLayerFailure: () => calls.push("terminal"),
   };
+  Object.defineProperties(viewer, {
+    playRequested: {
+      get() {
+        return this.playbackControlState !== VideoPlaybackControlState.STOPPED;
+      },
+    },
+    awaitingUserActivation: {
+      get() {
+        return this.playbackControlState === VideoPlaybackControlState.USER_ACTIVATION_REQUIRED;
+      },
+    },
+  });
+  viewer.transitionPlaybackControl = (event) =>
+    VideoStreamViewer.prototype.transitionPlaybackControl.call(viewer, event);
 
   await VideoStreamViewer.prototype.playIfRequested.call(viewer);
 
-  assert.equal(viewer.playbackGate, "ready");
+  assert.equal(viewer.playbackControlState, VideoPlaybackControlState.PLAY_REQUESTED);
   assert.deepEqual(calls, []);
 });
 
