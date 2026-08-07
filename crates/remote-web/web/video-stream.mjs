@@ -7,6 +7,8 @@ import {
   bufferingQualitySuggestion,
   command,
   relativeRangeDragValue,
+  seekRangeAbsoluteValue,
+  seekRangePointerGestureDecision,
   videoAbsoluteSeekCommand,
   videoHttpStatusDecision,
   videoPlaybackDecision,
@@ -1879,7 +1881,8 @@ export class VideoStreamViewer {
     if (this.seekInput.disabled || event.isPrimary === false) return;
     if (typeof event.button === "number" && event.button !== 0) return;
     if (event.cancelable) event.preventDefault();
-    const trackWidth = this.seekInput.getBoundingClientRect().width;
+    const trackRect = this.seekInput.getBoundingClientRect();
+    const trackWidth = trackRect.width;
     const startPositionSecs = videoSeekRelativeDragValue({
       startPositionSecs: Number(this.seekInput.value),
       startClientX: event.clientX,
@@ -1892,12 +1895,14 @@ export class VideoStreamViewer {
       kind: "pointer",
       pointerId: event.pointerId,
       startClientX: event.clientX,
+      startClientY: event.clientY,
       startPositionSecs,
       targetPositionSecs: startPositionSecs,
+      trackLeft: trackRect.left,
       trackWidth,
       durationSecs: this.duration,
       stepSecs: Number(this.seekInput.step),
-      moved: false,
+      maxDistancePx: 0,
       previewRequest: null,
     };
     this.seekInput.focus({ preventScroll: true });
@@ -1915,6 +1920,15 @@ export class VideoStreamViewer {
     if (!drag || drag.pointerId !== event.pointerId) return;
     event.stopPropagation();
     if (event.cancelable) event.preventDefault();
+    const gesture = seekRangePointerGestureDecision({
+      startClientX: drag.startClientX,
+      startClientY: drag.startClientY,
+      currentClientX: event.clientX,
+      currentClientY: event.clientY,
+      maxDistancePx: drag.maxDistancePx,
+    });
+    drag.maxDistancePx = gesture.maxDistancePx;
+    if (gesture.kind !== "drag") return;
     const targetPositionSecs = videoSeekRelativeDragValue({
       startPositionSecs: drag.startPositionSecs,
       startClientX: drag.startClientX,
@@ -1925,7 +1939,6 @@ export class VideoStreamViewer {
     });
     if (targetPositionSecs === drag.targetPositionSecs) return;
     drag.targetPositionSecs = targetPositionSecs;
-    drag.moved = true;
     this.seekInput.value = String(targetPositionSecs);
     this.updateCounter(targetPositionSecs);
     drag.previewRequest = this.beginSeekPreview(
@@ -1941,6 +1954,14 @@ export class VideoStreamViewer {
     if (!drag || drag.pointerId !== event.pointerId) return;
     event.stopPropagation();
     if (event.cancelable) event.preventDefault();
+    const gesture = seekRangePointerGestureDecision({
+      startClientX: drag.startClientX,
+      startClientY: drag.startClientY,
+      currentClientX: event.clientX,
+      currentClientY: event.clientY,
+      maxDistancePx: drag.maxDistancePx,
+      cancelled,
+    });
     try {
       if (this.seekInput.hasPointerCapture(event.pointerId)) {
         this.seekInput.releasePointerCapture(event.pointerId);
@@ -1949,12 +1970,49 @@ export class VideoStreamViewer {
       // The browser may implicitly release capture before pointercancel.
     }
     this.seekDragState = { kind: "idle" };
-    if (cancelled) {
+    if (gesture.kind === "cancel") {
       if (drag.previewRequest) this.cancelSeekPreview(drag.previewRequest);
       else this.updateProgress();
       return;
     }
-    if (!drag.moved) {
+    if (gesture.kind === "tap") {
+      drag.targetPositionSecs = seekRangeAbsoluteValue({
+        clientX: drag.startClientX,
+        trackLeft: drag.trackLeft,
+        trackWidth: drag.trackWidth,
+        min: 0,
+        max: drag.durationSecs,
+        step: drag.stepSecs,
+      });
+      this.seekInput.value = String(drag.targetPositionSecs);
+      this.updateCounter(drag.targetPositionSecs);
+      drag.previewRequest = this.beginSeekPreview(
+        drag.targetPositionSecs,
+        "移動先を確認中"
+      );
+    } else {
+      const targetPositionSecs = videoSeekRelativeDragValue({
+        startPositionSecs: drag.startPositionSecs,
+        startClientX: drag.startClientX,
+        currentClientX: event.clientX,
+        trackWidth: drag.trackWidth,
+        durationSecs: drag.durationSecs,
+        stepSecs: drag.stepSecs,
+      });
+      if (targetPositionSecs !== drag.targetPositionSecs) {
+        drag.targetPositionSecs = targetPositionSecs;
+        this.seekInput.value = String(targetPositionSecs);
+        this.updateCounter(targetPositionSecs);
+        drag.previewRequest = this.beginSeekPreview(
+          targetPositionSecs,
+          "移動先を確認中"
+        );
+      }
+    }
+    if (
+      gesture.kind === "drag" &&
+      drag.targetPositionSecs === drag.startPositionSecs
+    ) {
       this.updateProgress();
       return;
     }

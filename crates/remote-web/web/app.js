@@ -38,6 +38,8 @@ import {
   rangeValueFromNormalized,
   rangeValueToNormalized,
   relativeRangeDragValue,
+  seekRangeAbsoluteValue,
+  seekRangePointerGestureDecision,
   appUpdateNotice,
   resolveGridReturnViewport,
   sessionOwnerBadge,
@@ -3652,14 +3654,18 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
     if (typeof event.button === "number" && event.button !== 0) return;
     if (event.cancelable) event.preventDefault();
     const seekState = viewerSeekSnapshot();
+    const trackRect = seekInput.getBoundingClientRect();
     seekPointerDrag = {
       pointerId: event.pointerId,
       startClientX: event.clientX,
+      startClientY: event.clientY,
       startGroupIndex: seekState.groupIndex,
       groupIndex: seekState.groupIndex,
       groupCount: state.pageGroups.length,
-      trackWidth: seekInput.getBoundingClientRect().width,
+      trackLeft: trackRect.left,
+      trackWidth: trackRect.width,
       direction: seekState.direction,
+      maxDistancePx: 0,
     };
     seekInput.focus({ preventScroll: true });
     try {
@@ -3672,6 +3678,15 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
     if (!seekPointerDrag || seekPointerDrag.pointerId !== event.pointerId) return;
     event.stopPropagation();
     if (event.cancelable) event.preventDefault();
+    const gesture = seekRangePointerGestureDecision({
+      startClientX: seekPointerDrag.startClientX,
+      startClientY: seekPointerDrag.startClientY,
+      currentClientX: event.clientX,
+      currentClientY: event.clientY,
+      maxDistancePx: seekPointerDrag.maxDistancePx,
+    });
+    seekPointerDrag.maxDistancePx = gesture.maxDistancePx;
+    if (gesture.kind !== "drag") return;
     seekPointerDrag.groupIndex = previewSeekGroup(viewerSeekRelativeDragValue({
       startGroupIndex: seekPointerDrag.startGroupIndex,
       startClientX: seekPointerDrag.startClientX,
@@ -3686,6 +3701,14 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
     event.stopPropagation();
     if (event.cancelable) event.preventDefault();
     const drag = seekPointerDrag;
+    const gesture = seekRangePointerGestureDecision({
+      startClientX: drag.startClientX,
+      startClientY: drag.startClientY,
+      currentClientX: event.clientX,
+      currentClientY: event.clientY,
+      maxDistancePx: drag.maxDistancePx,
+      cancelled,
+    });
     try {
       if (seekInput.hasPointerCapture(event.pointerId)) {
         seekInput.releasePointerCapture(event.pointerId);
@@ -3694,10 +3717,29 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
       // The browser may implicitly release capture before pointercancel.
     }
     seekPointerDrag = null;
-    if (cancelled) {
+    if (gesture.kind === "cancel") {
       state.viewer?.setSeekState(viewerSeekSnapshot());
+    } else if (gesture.kind === "tap") {
+      const groupIndex = previewSeekGroup(seekRangeAbsoluteValue({
+        clientX: drag.startClientX,
+        trackLeft: drag.trackLeft,
+        trackWidth: drag.trackWidth,
+        min: 0,
+        max: drag.groupCount - 1,
+        step: 1,
+        direction: drag.direction,
+      }));
+      commitSeekGroup(groupIndex, "viewer_seek_tap");
     } else {
-      commitSeekGroup(drag.groupIndex, "viewer_seek_drag");
+      const groupIndex = previewSeekGroup(viewerSeekRelativeDragValue({
+        startGroupIndex: drag.startGroupIndex,
+        startClientX: drag.startClientX,
+        currentClientX: event.clientX,
+        trackWidth: drag.trackWidth,
+        groupCount: drag.groupCount,
+        direction: drag.direction,
+      }));
+      commitSeekGroup(groupIndex, "viewer_seek_drag");
     }
   };
   seekInput.addEventListener("pointerup", (event) => finishSeekPointer(event, false));

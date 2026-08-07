@@ -462,10 +462,12 @@ thumbnail を含めない。
   preview だけを playback 所有へ戻す。着地時も request revision と実際に attach 済みの
   generation が一致する場合だけ解除し、古い世代の失敗・再生開始で新しい連打位置を消さない
 - 動画 seek の native range は keyboard / accessibility の正本として残し、pointer 操作だけを
-  44px 高の全幅 hit area と pointer capture で所有する。pointer-down 位置から値を逆算せず、押下時の
-  表示位置へ `deltaX / track width * duration` を加えるため、どこから触っても値は飛ばず、バーの
-  見た目と同じ縮尺で相対移動する。preview は移動中、absolute seek command は pointer-up の 1 回だけ
-  発行する。画像 viewer は既存の離散 page-group / RTL owner を維持し、正規化された移動量計算だけを共有する
+  44px 高の全幅 hit area と pointer capture で所有する。画像・動画とも、pointer-down からの最大
+  2 次元距離が 6 CSS px 未満なら tap として押下位置へ absolute seek し、6 px 以上なら押下時の
+  表示位置へ `deltaX / track width * range` を加える relative drag とする。いったん閾値を越えた操作は
+  指が戻っても drag のままとし、離した位置への飛びを起こさない。画像 viewer は離散 page-group と
+  RTL の向きを維持し、判定と正規化された位置計算だけを動画と共有する。preview は移動中、seek command は
+  pointer-up の 1 回だけ発行する。設定値を選ぶ通常の slider はこの seek 固有の tap/drag owner の対象外とする
 - 先読み窓を埋めた有限素材では、次の frame/chunk の capacity 待ちが demux の EOF 観測より先に
   起き、未公開の終端を端末が取得して release することもできない循環があった。advertised target
   の外に公開可能な working fragment 1 本を有界に許可し、ring は target + working + terminal の

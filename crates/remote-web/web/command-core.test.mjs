@@ -90,6 +90,8 @@ import {
   rangeValueFromNormalized,
   rangeValueToNormalized,
   relativeRangeDragValue,
+  seekRangeAbsoluteValue,
+  seekRangePointerGestureDecision,
   shouldReanchorVideoTimeline,
   videoTimelineAnchor,
   videoTimelinePosition,
@@ -129,6 +131,51 @@ test("relative range drag follows travel, clamps, and snaps independently of pre
     max: 254,
     step: 1,
   }), 254);
+});
+
+test("seek range uses a drag-biased six-pixel tap threshold and remembers peak travel", () => {
+  assert.deepEqual(seekRangePointerGestureDecision({
+    startClientX: 10,
+    startClientY: 10,
+    currentClientX: 13,
+    currentClientY: 14,
+  }), { kind: "tap", maxDistancePx: 5 });
+  assert.equal(seekRangePointerGestureDecision({
+    startClientX: 10,
+    startClientY: 10,
+    currentClientX: 16,
+    currentClientY: 10,
+  }).kind, "drag");
+  assert.deepEqual(seekRangePointerGestureDecision({
+    startClientX: 10,
+    startClientY: 10,
+    currentClientX: 10,
+    currentClientY: 10,
+    maxDistancePx: 8,
+  }), { kind: "drag", maxDistancePx: 8 });
+  assert.equal(seekRangePointerGestureDecision({
+    maxDistancePx: 8,
+    cancelled: true,
+  }).kind, "cancel");
+});
+
+test("seek range tap maps its press position through LTR and RTL track geometry", () => {
+  const value = (clientX, direction = ReadingDirection.LTR) => seekRangeAbsoluteValue({
+    clientX,
+    trackLeft: 20,
+    trackWidth: 200,
+    min: 0,
+    max: 10,
+    step: 1,
+    direction,
+  });
+  assert.equal(value(20), 0);
+  assert.equal(value(120), 5);
+  assert.equal(value(220), 10);
+  assert.equal(value(20, ReadingDirection.RTL), 10);
+  assert.equal(value(220, ReadingDirection.RTL), 0);
+  assert.equal(value(-20), 0);
+  assert.equal(value(260), 10);
 });
 
 test("positive logarithmic adjustment ranges match egui normalized positions", () => {

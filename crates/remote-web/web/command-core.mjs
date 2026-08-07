@@ -1307,6 +1307,53 @@ export function relativeRangeDragValue({
   });
 }
 
+// Keep this below the viewer's general 12 px tap radius: misclassifying a drag
+// as a tap can seek across the whole range, so the seek control favors drag.
+export const SEEK_RANGE_DRAG_THRESHOLD_PX = 6;
+
+export function seekRangePointerGestureDecision({
+  startClientX = 0,
+  startClientY = 0,
+  currentClientX = 0,
+  currentClientY = 0,
+  maxDistancePx = 0,
+  cancelled = false,
+  dragThresholdPx = SEEK_RANGE_DRAG_THRESHOLD_PX,
+} = {}) {
+  const distance = Math.hypot(
+    Number(currentClientX) - Number(startClientX),
+    Number(currentClientY) - Number(startClientY)
+  );
+  const maximum = Math.max(
+    Math.max(0, Number(maxDistancePx) || 0),
+    Number.isFinite(distance) ? distance : 0
+  );
+  if (cancelled) return { kind: "cancel", maxDistancePx: maximum };
+  const threshold = Math.max(
+    0.01,
+    Number(dragThresholdPx) || SEEK_RANGE_DRAG_THRESHOLD_PX
+  );
+  return {
+    kind: maximum >= threshold ? "drag" : "tap",
+    maxDistancePx: maximum,
+  };
+}
+
+export function seekRangeAbsoluteValue({
+  clientX = 0,
+  trackLeft = 0,
+  trackWidth = 0,
+  min = 0,
+  max = 1,
+  step = 1,
+  direction = ReadingDirection.LTR,
+} = {}) {
+  const width = Math.max(1, Number(trackWidth) || 1);
+  let normalized = (Number(clientX) - Number(trackLeft)) / width;
+  if (direction === ReadingDirection.RTL) normalized = 1 - normalized;
+  return rangeValueFromNormalized({ normalized, min, max, step });
+}
+
 export function adjustmentResetVisible({
   value,
   defaultValue,

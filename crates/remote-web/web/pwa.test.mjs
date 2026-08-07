@@ -426,12 +426,19 @@ test("video owns repeated taps and pinch without allowing native page zoom", asy
   assert.match(video, /removeEventListener\("dblclick", this\.nativeGesture\)/);
 });
 
-test("video relative seek keeps native range semantics and a full touch hit area", async () => {
+test("image and video seek share tap-or-relative-drag handling without replacing native range semantics", async () => {
   const css = await readFile(new URL("styles.css", here), "utf8");
+  const app = await readFile(new URL("app.js", here), "utf8");
   const video = await readFile(new URL("video-stream.mjs", here), "utf8");
+  assert.match(app, /seekInput\.type = "range"/);
+  assert.match(app, /seekInput\.setAttribute\("aria-label", "ページ位置"\)/);
+  assert.match(app, /seekRangePointerGestureDecision\(\{/);
+  assert.match(app, /seekRangeAbsoluteValue\(\{/);
   assert.match(video, /this\.seekInput\.type = "range"/);
   assert.match(video, /this\.seekInput\.setAttribute\("aria-label", "動画の再生位置"\)/);
   assert.match(video, /this\.seekInput\.setAttribute\("aria-valuetext", this\.counter\.value\)/);
+  assert.match(video, /seekRangePointerGestureDecision\(\{/);
+  assert.match(video, /seekRangeAbsoluteValue\(\{/);
   assert.match(video, /addEventListener\("pointerdown", this\.onSeekPointerDown\)/);
   assert.match(video, /removeEventListener\("pointerdown", this\.onSeekPointerDown\)/);
   assert.match(

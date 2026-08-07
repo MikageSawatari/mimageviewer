@@ -879,14 +879,14 @@ test("video seek drag maps pointer travel to the visible timeline scale", () => 
   assert.equal(drag(100, -200), 0);
 });
 
-test("video seek pointer starts anywhere without jumping and commits only after travel", () => {
+test("video seek pointer maps micro travel to an absolute tap and threshold travel to a relative drag", () => {
   const calls = [];
   let capturedPointer = null;
   const seekInput = {
     disabled: false,
     value: "120",
     step: "0.1",
-    getBoundingClientRect: () => ({ width: 300 }),
+    getBoundingClientRect: () => ({ left: 0, width: 300 }),
     focus: () => calls.push("focus"),
     setPointerCapture: (pointerId) => {
       capturedPointer = pointerId;
@@ -913,9 +913,10 @@ test("video seek pointer starts anywhere without jumping and commits only after 
     updateProgress: () => calls.push("update_progress"),
     dispatch: (requested, detail) => calls.push(["dispatch", requested, detail]),
   };
-  const pointer = (clientX) => ({
+  const pointer = (clientX, clientY = 100) => ({
     pointerId: 7,
     clientX,
+    clientY,
     button: 0,
     isPrimary: true,
     cancelable: true,
@@ -927,25 +928,33 @@ test("video seek pointer starts anywhere without jumping and commits only after 
     "draggingSeek"
   ).get;
 
-  VideoStreamViewer.prototype.beginSeekPointerDrag.call(viewer, pointer(250));
+  VideoStreamViewer.prototype.beginSeekPointerDrag.call(viewer, pointer(250, 100));
   assert.equal(draggingSeek.call(viewer), true);
   assert.equal(seekInput.value, "120");
   assert.equal(viewer.seekDragState.targetPositionSecs, 120);
   assert.equal(calls.some((entry) => Array.isArray(entry) && entry[0] === "preview"), false);
-  VideoStreamViewer.prototype.finishSeekPointerDrag.call(viewer, pointer(250), false);
+  VideoStreamViewer.prototype.finishSeekPointerDrag.call(viewer, pointer(253, 104), false);
   assert.equal(draggingSeek.call(viewer), false);
-  assert.equal(calls.some((entry) => Array.isArray(entry) && entry[0] === "dispatch"), false);
+  assert.equal(seekInput.value, "500");
+  assert.deepEqual(calls.at(-1), [
+    "dispatch",
+    { name: "media_seek_absolute", payload: { positionSecs: 500 } },
+    { source: "touch", detail: "seek_bar" },
+  ]);
 
   calls.length = 0;
-  VideoStreamViewer.prototype.beginSeekPointerDrag.call(viewer, pointer(20));
-  VideoStreamViewer.prototype.updateSeekPointerDrag.call(viewer, pointer(80));
+  seekInput.value = "120";
+  VideoStreamViewer.prototype.beginSeekPointerDrag.call(viewer, pointer(20, 100));
+  VideoStreamViewer.prototype.updateSeekPointerDrag.call(viewer, pointer(80, 100));
   assert.equal(seekInput.value, "240");
-  VideoStreamViewer.prototype.finishSeekPointerDrag.call(viewer, pointer(80), false);
+  VideoStreamViewer.prototype.finishSeekPointerDrag.call(viewer, pointer(80, 100), false);
   assert.deepEqual(calls.at(-1), [
     "dispatch",
     { name: "media_seek_absolute", payload: { positionSecs: 240 } },
     { source: "touch", detail: "seek_bar" },
   ]);
+  assert.notEqual(seekInput.value, "40", "drag must not jump to its press position");
+  assert.notEqual(seekInput.value, "160", "drag must not jump to its release position");
 });
 
 test("seek preview advances from seeking through decoded thumbnail to playback", () => {
