@@ -5,6 +5,8 @@
 //! labels primary pointer events as touch-derived when the exact
 //! egui-winit 0.33.3 synthetic-pointer signature is present.
 
+use std::fmt::Write as _;
+
 use crate::touch_input::{
     TapZoneGeometry, TouchCommand, TouchOwner, TouchPhase, TouchRecognizer, TouchSample,
 };
@@ -201,6 +203,81 @@ enum PendingSignature {
     EndGone,
 }
 
+fn pending_signature_name(pending: Option<&PendingSignature>) -> &'static str {
+    match pending {
+        Some(PendingSignature::StartMoved(_)) => "StartMoved",
+        Some(PendingSignature::StartButton(_)) => "StartButton",
+        Some(PendingSignature::MoveMoved(_)) => "MoveMoved",
+        Some(PendingSignature::EndButton(_)) => "EndButton",
+        Some(PendingSignature::EndGone) => "EndGone",
+        None => "None",
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CorrelationStateSnapshot {
+    pending: &'static str,
+    pointer_touch: bool,
+    owner: TouchOwner,
+    contacts: usize,
+}
+
+impl CorrelationStateSnapshot {
+    fn capture(state: &TouchCorrelationState) -> Self {
+        Self {
+            pending: pending_signature_name(state.pending.as_ref()),
+            pointer_touch: state.pointer_touch.is_some(),
+            owner: state.recognizer.owner(),
+            contacts: state.recognizer.contact_count(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum AmbiguityCauseKind {
+    PendingMismatch { pending: &'static str },
+    UnmatchedPrimary,
+}
+
+#[derive(Clone, Debug)]
+struct AmbiguityCause {
+    kind: AmbiguityCauseKind,
+    event: Event,
+}
+
+#[derive(Clone, Debug)]
+struct CorrelationDiagnostics {
+    before: CorrelationStateSnapshot,
+    after: CorrelationStateSnapshot,
+    ambiguity_causes: Vec<AmbiguityCause>,
+    cancel_stream_calls: usize,
+}
+
+impl CorrelationDiagnostics {
+    fn new(state: &TouchCorrelationState) -> Self {
+        let snapshot = CorrelationStateSnapshot::capture(state);
+        Self {
+            before: snapshot,
+            after: snapshot,
+            ambiguity_causes: Vec::new(),
+            cancel_stream_calls: 0,
+        }
+    }
+
+    fn replay_for_later_passes(&self) -> Self {
+        Self {
+            before: self.after,
+            after: self.after,
+            ambiguity_causes: self.ambiguity_causes.clone(),
+            cancel_stream_calls: 0,
+        }
+    }
+
+    fn ambiguous(&self) -> bool {
+        !self.ambiguity_causes.is_empty()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct TouchCorrelationState {
     recognizer: TouchRecognizer,
@@ -211,6 +288,9 @@ struct TouchCorrelationState {
     /// Replay-safe result for later egui passes in the same app frame.
     /// Commands are deliberately removed before this value is stored.
     repeatable_frame: TouchFrame,
+    /// Diagnostics for the replay result. This is populated only under the
+    /// existing `MIV_TOUCH_DEBUG` gate.
+    repeatable_diagnostics: Option<CorrelationDiagnostics>,
 }
 
 impl Default for TouchCorrelationState {
@@ -220,6 +300,7 @@ impl Default for TouchCorrelationState {
             pointer_touch: None,
             pending: None,
             repeatable_frame: TouchFrame::default(),
+            repeatable_diagnostics: None,
         }
     }
 }
@@ -230,10 +311,47 @@ struct FrameBuilder {
     primary_events: Vec<CorrelatedPrimary>,
     ambiguous: bool,
     touch_cancelled: bool,
+    diagnostics: Option<CorrelationDiagnostics>,
 }
 
 impl FrameBuilder {
-    fn finish(mut self, owner: TouchOwner, active: bool) -> TouchFrame {
+    fn new(state: &TouchCorrelationState, diagnostics_enabled: bool) -> Self {
+        Self {
+            diagnostics: diagnostics_enabled.then(|| CorrelationDiagnostics::new(state)),
+            ..Self::default()
+        }
+    }
+
+    fn record_pending_mismatch(&mut self, pending: Option<&'static str>, event: &Event) {
+        if let (Some(diagnostics), Some(pending)) = (&mut self.diagnostics, pending) {
+            diagnostics.ambiguity_causes.push(AmbiguityCause {
+                kind: AmbiguityCauseKind::PendingMismatch { pending },
+                event: event.clone(),
+            });
+        }
+    }
+
+    fn record_unmatched_primary(&mut self, event: &Event) {
+        if let Some(diagnostics) = &mut self.diagnostics {
+            diagnostics.ambiguity_causes.push(AmbiguityCause {
+                kind: AmbiguityCauseKind::UnmatchedPrimary,
+                event: event.clone(),
+            });
+        }
+    }
+
+    fn record_cancel_stream_call(&mut self) {
+        if let Some(diagnostics) = &mut self.diagnostics {
+            diagnostics.cancel_stream_calls += 1;
+        }
+    }
+
+    fn finish(
+        mut self,
+        owner: TouchOwner,
+        active: bool,
+        after: CorrelationStateSnapshot,
+    ) -> (TouchFrame, Option<CorrelationDiagnostics>) {
         if self.ambiguous {
             // Suppression is useful only together with a replacement command.
             // A mixed or malformed primary stream therefore falls back in
@@ -241,17 +359,24 @@ impl FrameBuilder {
             self.commands.clear();
             self.primary_events.clear();
         }
-        TouchFrame {
-            commands: self.commands,
-            primary_events: self.primary_events,
-            owner,
-            active,
-            touch_cancelled: self.touch_cancelled,
+        if let Some(diagnostics) = &mut self.diagnostics {
+            diagnostics.after = after;
         }
+        (
+            TouchFrame {
+                commands: self.commands,
+                primary_events: self.primary_events,
+                owner,
+                active,
+                touch_cancelled: self.touch_cancelled,
+            },
+            self.diagnostics,
+        )
     }
 }
 
 impl TouchCorrelationState {
+    #[cfg(test)]
     fn process_frame(
         &mut self,
         geometry: &TapZoneGeometry,
@@ -259,20 +384,37 @@ impl TouchCorrelationState {
         now_ms: u64,
         disabled: bool,
     ) -> TouchFrame {
+        self.process_frame_with_diagnostics(geometry, events, now_ms, disabled, false)
+            .0
+    }
+
+    fn process_frame_with_diagnostics(
+        &mut self,
+        geometry: &TapZoneGeometry,
+        events: &[Event],
+        now_ms: u64,
+        disabled: bool,
+        diagnostics_enabled: bool,
+    ) -> (TouchFrame, Option<CorrelationDiagnostics>) {
+        let mut frame = FrameBuilder::new(self, diagnostics_enabled);
         if disabled {
-            let touch_cancelled = self.recognizer.is_active();
+            frame.touch_cancelled = self.recognizer.is_active();
             *self = Self::default();
-            return TouchFrame {
-                touch_cancelled,
-                ..TouchFrame::default()
-            };
+            return frame.finish(
+                self.recognizer.owner(),
+                self.recognizer.is_active(),
+                CorrelationStateSnapshot::capture(self),
+            );
         }
 
-        let mut frame = FrameBuilder::default();
         for event in events {
             self.process_event(geometry, event, now_ms, &mut frame);
         }
-        frame.finish(self.recognizer.owner(), self.recognizer.is_active())
+        frame.finish(
+            self.recognizer.owner(),
+            self.recognizer.is_active(),
+            CorrelationStateSnapshot::capture(self),
+        )
     }
 
     fn process_event(
@@ -283,6 +425,10 @@ impl TouchCorrelationState {
         frame: &mut FrameBuilder,
     ) {
         if self.pending.is_some() {
+            let pending = frame
+                .diagnostics
+                .as_ref()
+                .map(|_| pending_signature_name(self.pending.as_ref()));
             if self.advance_pending(event, frame) {
                 return;
             }
@@ -291,6 +437,8 @@ impl TouchCorrelationState {
             // the mismatching event after abandoning the ambiguous touch
             // stream so a later, independent exact sequence can still start.
             frame.ambiguous = true;
+            frame.record_pending_mismatch(pending, event);
+            frame.record_cancel_stream_call();
             self.cancel_stream(geometry, now_ms);
         }
 
@@ -323,6 +471,8 @@ impl TouchCorrelationState {
                 // existing mouse input. If touch input is also present in this
                 // pass, fail closed and cancel all touch-side action.
                 frame.ambiguous = true;
+                frame.record_unmatched_primary(event);
+                frame.record_cancel_stream_call();
                 self.cancel_stream(geometry, now_ms);
             }
             _ => {}
@@ -439,6 +589,21 @@ struct DrivenSurface {
     surface: TouchSurface,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiagnosticDriveKind {
+    Commands,
+    Replay,
+}
+
+impl DiagnosticDriveKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Commands => "commands",
+            Self::Replay => "replay",
+        }
+    }
+}
+
 /// Drive correlation once for the active surface and app frame.
 ///
 /// `MainGrid` is called only from the grid `CentralPanel`; `StillFullscreen`
@@ -500,19 +665,62 @@ fn process_in_temp_data(
     now_ms: u64,
     disabled: bool,
 ) -> TouchFrame {
-    ctx.data_mut(|data| {
+    let diagnostics_enabled = crate::touch_debug::touch_debug_enabled();
+    let pass = diagnostics_enabled.then(|| (ctx.cumulative_pass_nr(), ctx.current_pass_index()));
+    let contains_touch = diagnostics_enabled
+        && events
+            .iter()
+            .any(|event| matches!(event, Event::Touch { .. }));
+    let (touch_frame, diagnostics, drive_kind, surface_match) = ctx.data_mut(|data| {
         let marker_id = driven_surface_id(viewport);
         if let Some(marker) = data.get_temp::<DrivenSurface>(marker_id)
             && marker.frame == frame
         {
-            return repeated_drive_result(data, viewport, surface, marker);
+            let (touch_frame, diagnostics, surface_match) =
+                repeated_drive_result(data, viewport, surface, marker, diagnostics_enabled);
+            return (
+                touch_frame,
+                diagnostics,
+                DiagnosticDriveKind::Replay,
+                surface_match,
+            );
         }
         data.insert_temp(marker_id, DrivenSurface { frame, surface });
 
-        process_surface_state(
-            data, viewport, surface, &geometry, &events, now_ms, disabled,
+        let (touch_frame, diagnostics) = process_surface_state(
+            data,
+            viewport,
+            surface,
+            &geometry,
+            &events,
+            now_ms,
+            disabled,
+            diagnostics_enabled,
+        );
+        (
+            touch_frame,
+            diagnostics,
+            DiagnosticDriveKind::Commands,
+            true,
         )
-    })
+    });
+
+    if let (Some((egui_pass, pass_index)), Some(diagnostics)) = (pass, diagnostics)
+        && (contains_touch || diagnostics.ambiguous())
+    {
+        log_correlation_diagnostics(
+            viewport,
+            surface,
+            frame,
+            egui_pass,
+            pass_index,
+            drive_kind,
+            surface_match,
+            &touch_frame,
+            &diagnostics,
+        );
+    }
+    touch_frame
 }
 
 fn repeated_drive_result(
@@ -520,12 +728,26 @@ fn repeated_drive_result(
     viewport: egui::ViewportId,
     surface: TouchSurface,
     marker: DrivenSurface,
-) -> TouchFrame {
+    diagnostics_enabled: bool,
+) -> (TouchFrame, Option<CorrelationDiagnostics>, bool) {
     if marker.surface != surface {
-        return TouchFrame::default();
+        let diagnostics = diagnostics_enabled.then(|| {
+            let state = data
+                .get_temp::<TouchCorrelationState>(state_id(viewport, surface))
+                .unwrap_or_default();
+            CorrelationDiagnostics::new(&state)
+        });
+        return (TouchFrame::default(), diagnostics, false);
     }
     data.get_temp::<TouchCorrelationState>(state_id(viewport, surface))
-        .map_or_else(TouchFrame::default, |state| state.repeatable_frame)
+        .map_or_else(
+            || {
+                let diagnostics = diagnostics_enabled
+                    .then(|| CorrelationDiagnostics::new(&TouchCorrelationState::default()));
+                (TouchFrame::default(), diagnostics, true)
+            },
+            |state| (state.repeatable_frame, state.repeatable_diagnostics, true),
+        )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -537,15 +759,182 @@ fn process_surface_state(
     events: &[Event],
     now_ms: u64,
     disabled: bool,
-) -> TouchFrame {
+    diagnostics_enabled: bool,
+) -> (TouchFrame, Option<CorrelationDiagnostics>) {
     let id = state_id(viewport, surface);
     let mut state = data
         .get_temp::<TouchCorrelationState>(id)
         .unwrap_or_default();
-    let frame = state.process_frame(geometry, events, now_ms, disabled);
+    let (frame, diagnostics) = state.process_frame_with_diagnostics(
+        geometry,
+        events,
+        now_ms,
+        disabled,
+        diagnostics_enabled,
+    );
     state.repeatable_frame = frame.replay_for_later_passes();
+    state.repeatable_diagnostics = diagnostics
+        .as_ref()
+        .map(CorrelationDiagnostics::replay_for_later_passes);
     data.insert_temp(id, state);
-    frame
+    (frame, diagnostics)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_correlation_diagnostics(
+    viewport: egui::ViewportId,
+    surface: TouchSurface,
+    app_frame: u64,
+    egui_pass: u64,
+    pass_index: usize,
+    drive_kind: DiagnosticDriveKind,
+    surface_match: bool,
+    frame: &TouchFrame,
+    diagnostics: &CorrelationDiagnostics,
+) {
+    if !crate::touch_debug::touch_debug_enabled() {
+        return;
+    }
+    crate::logger::log(format_correlation_diagnostics(
+        viewport,
+        surface,
+        app_frame,
+        egui_pass,
+        pass_index,
+        drive_kind,
+        surface_match,
+        frame,
+        diagnostics,
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_correlation_diagnostics(
+    viewport: egui::ViewportId,
+    surface: TouchSurface,
+    app_frame: u64,
+    egui_pass: u64,
+    pass_index: usize,
+    drive_kind: DiagnosticDriveKind,
+    surface_match: bool,
+    frame: &TouchFrame,
+    diagnostics: &CorrelationDiagnostics,
+) -> String {
+    let mut ambiguity = String::new();
+    for (index, cause) in diagnostics.ambiguity_causes.iter().enumerate() {
+        if index != 0 {
+            ambiguity.push('|');
+        }
+        match cause.kind {
+            AmbiguityCauseKind::PendingMismatch { pending } => {
+                let _ = write!(ambiguity, "pending_mismatch(pending={pending},event=");
+            }
+            AmbiguityCauseKind::UnmatchedPrimary => {
+                ambiguity.push_str("unmatched_primary(event=");
+            }
+        }
+        write_diagnostic_event(&mut ambiguity, &cause.event);
+        ambiguity.push(')');
+    }
+    if ambiguity.is_empty() {
+        ambiguity.push_str("none");
+    }
+
+    let mut command_kinds = String::new();
+    for (index, command) in frame.commands().iter().enumerate() {
+        if index != 0 {
+            command_kinds.push(',');
+        }
+        command_kinds.push_str(touch_command_name(command));
+    }
+
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "[TOUCH-DEBUG] correlation viewport={viewport:?} surface={surface:?} app_frame={app_frame} egui_pass={egui_pass} pass_index={pass_index}"
+    );
+    let _ = write!(
+        out,
+        " drive={} surface_match={surface_match} ambiguous={} ambiguity=[{ambiguity}] cancel_stream_calls={}",
+        drive_kind.label(),
+        diagnostics.ambiguous(),
+        diagnostics.cancel_stream_calls,
+    );
+    let _ = write!(
+        out,
+        " pending={}->{} pointer_touch={}->{} owner={:?}->{:?}",
+        diagnostics.before.pending,
+        diagnostics.after.pending,
+        presence_name(diagnostics.before.pointer_touch),
+        presence_name(diagnostics.after.pointer_touch),
+        diagnostics.before.owner,
+        diagnostics.after.owner,
+    );
+    let _ = write!(
+        out,
+        " commands={}[{}] contacts={}->{}",
+        frame.commands().len(),
+        command_kinds,
+        diagnostics.before.contacts,
+        diagnostics.after.contacts,
+    );
+    out
+}
+
+fn presence_name(present: bool) -> &'static str {
+    if present { "present" } else { "absent" }
+}
+
+fn touch_command_name(command: &TouchCommand) -> &'static str {
+    match command {
+        TouchCommand::ToggleChrome => "ToggleChrome",
+        TouchCommand::PageSide { .. } => "PageSide",
+        TouchCommand::OpenSidePanel { .. } => "OpenSidePanel",
+        TouchCommand::Zoom { .. } => "Zoom",
+        TouchCommand::Pan { .. } => "Pan",
+        TouchCommand::PinchEnd => "PinchEnd",
+    }
+}
+
+fn write_diagnostic_event(out: &mut String, event: &Event) {
+    match event {
+        Event::Touch {
+            device_id,
+            id,
+            phase,
+            pos,
+            ..
+        } => {
+            let _ = write!(
+                out,
+                "Touch(device_id={} id={} phase={phase:?} pos=({:.1},{:.1}))",
+                device_id.0, id.0, pos.x, pos.y
+            );
+        }
+        Event::PointerMoved(pos) => {
+            let _ = write!(out, "PointerMoved(pos=({:.1},{:.1}))", pos.x, pos.y);
+        }
+        Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            ..
+        } => {
+            let _ = write!(
+                out,
+                "PointerButton(pos=({:.1},{:.1}) button={button:?} pressed={pressed})",
+                pos.x, pos.y
+            );
+        }
+        Event::PointerGone => out.push_str("PointerGone"),
+        _ => {
+            let event = format!("{event:?}")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push_str(&event);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -636,6 +1025,86 @@ mod tests {
             ));
         });
         frames.unwrap()
+    }
+
+    #[test]
+    fn correlation_diagnostic_line_carries_frame_state_and_command_kinds() {
+        let mut state = TouchCorrelationState::default();
+        let pos = pos2(500.0, 400.0);
+        let (frame, diagnostics) = state.process_frame_with_diagnostics(
+            &geometry(),
+            &tap_events(1, pos),
+            100,
+            false,
+            true,
+        );
+        let diagnostics = diagnostics.unwrap();
+        let line = format_correlation_diagnostics(
+            egui::ViewportId::ROOT,
+            TouchSurface::StillFullscreen,
+            42,
+            77,
+            1,
+            DiagnosticDriveKind::Commands,
+            true,
+            &frame,
+            &diagnostics,
+        );
+
+        assert!(line.contains("surface=StillFullscreen app_frame=42 egui_pass=77 pass_index=1"));
+        assert!(line.contains("drive=commands surface_match=true ambiguous=false"));
+        assert!(line.contains("ambiguity=[none] cancel_stream_calls=0"));
+        assert!(line.contains("pending=None->None pointer_touch=absent->absent"));
+        assert!(line.contains("owner=Undecided->ViewerTapZone"));
+        assert!(line.contains("commands=1[ToggleChrome] contacts=0->0"));
+        assert!(!line.contains('\r') && !line.contains('\n'));
+
+        let replay_frame = frame.replay_for_later_passes();
+        let replay_diagnostics = diagnostics.replay_for_later_passes();
+        let replay_line = format_correlation_diagnostics(
+            egui::ViewportId::ROOT,
+            TouchSurface::StillFullscreen,
+            42,
+            78,
+            2,
+            DiagnosticDriveKind::Replay,
+            true,
+            &replay_frame,
+            &replay_diagnostics,
+        );
+        assert!(replay_line.contains("drive=replay"));
+        assert!(replay_line.contains("commands=0[]"));
+        assert!(replay_line.contains("cancel_stream_calls=0"));
+    }
+
+    #[test]
+    fn correlation_diagnostic_names_both_fail_closed_causes() {
+        let mut state = TouchCorrelationState::default();
+        let pos = pos2(500.0, 400.0);
+        let events = [touch(1, egui::TouchPhase::Start, pos), primary(pos, true)];
+        let (frame, diagnostics) =
+            state.process_frame_with_diagnostics(&geometry(), &events, 100, false, true);
+        let line = format_correlation_diagnostics(
+            egui::ViewportId::ROOT,
+            TouchSurface::StillFullscreen,
+            43,
+            78,
+            0,
+            DiagnosticDriveKind::Commands,
+            true,
+            &frame,
+            &diagnostics.unwrap(),
+        );
+
+        assert!(frame.commands().is_empty());
+        assert!(line.contains("ambiguous=true"));
+        assert!(line.contains(
+            "pending_mismatch(pending=StartMoved,event=PointerButton(pos=(500.0,400.0) button=Primary pressed=true))"
+        ));
+        assert!(line.contains(
+            "unmatched_primary(event=PointerButton(pos=(500.0,400.0) button=Primary pressed=true))"
+        ));
+        assert!(line.contains("cancel_stream_calls=2"));
     }
 
     #[test]

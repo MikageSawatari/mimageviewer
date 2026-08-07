@@ -215,6 +215,10 @@ impl TouchRecognizer {
         !self.contacts.is_empty()
     }
 
+    pub(crate) fn contact_count(&self) -> usize {
+        self.contacts.len()
+    }
+
     /// Whether the correlated synthetic primary click must be suppressed for
     /// the current (or just-completed) touch stream.
     pub(crate) fn should_suppress_primary(&self) -> bool {
