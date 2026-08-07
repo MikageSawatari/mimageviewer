@@ -5,48 +5,52 @@
 
 ## 1. セッション前の準備
 
-**ポータブル版を使ってください** (推奨)。ポータブル版はデータ保存先が展開先フォルダ配下で
-完結し、`%APPDATA%` を触らず、single-instance mutex もインストール版と分離されているため、
-**インストール版を常駐させたままでも並行して起動できます**。設定を汚さずに ClickToShow 等の
-設定変更も試せます。
-
-`mImageViewer_portable_v2.13.0.zip` を**書き込み可能なフォルダ**へ展開します
-(`Program Files` 配下や読み取り専用メディアは不可。書けない場所だと起動時にエラーで止まります)。
-
-診断ログの出力先は展開先フォルダの中です。
-
-```text
-<展開先>\data\logs\mimageviewer.log
-```
-
-初回起動前は `data` フォルダごと存在しないので、ログの事前退避は不要です。2 回目以降に
-やり直す場合は、展開先で PowerShell を開いて退避してください。
+**開発機に接続したタッチパネルディスプレイで、通常の開発ビルドを使う** (2026-08-07 以降の運用)。
+リポジトリのルートで:
 
 ```powershell
-$log = '.\data\logs\mimageviewer.log'
+.\scripts\build-dev.ps1
+```
+
+**起動前にインストール版・常駐トレイ版の mImageViewer を終了してください。**
+single-instance mutex を共有するため、残っていると検証用 core を起動できません。
+
+⚠ このバイナリは引数なしで**実利用中の `%APPDATA%\mimageviewer` を開きます**。
+設定・キャッシュ・ログを更新し得ます。診断ログの出力先も同じ場所です。
+
+```text
+%APPDATA%\mimageviewer\logs\mimageviewer.log
+```
+
+セッション前に既存ログを退避しておくと、後で該当部分を探しやすくなります。
+
+```powershell
+$log = Join-Path $env:APPDATA 'mimageviewer\logs\mimageviewer.log'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 if (Test-Path -LiteralPath $log) {
     Copy-Item -LiteralPath $log -Destination "$log.pre-touch-probe-$stamp"
 }
 ```
 
-> インストール版と同じ環境で確認したい場合に限り、`target\dev-runtime\mimageviewer-core.exe`
-> でも同じ診断が取れます。その場合はログが `%APPDATA%\mimageviewer\logs\mimageviewer.log` に
-> なり、**実利用中の設定・キャッシュを更新し得る**ので、先にインストール版・常駐トレイ版を
-> 終了してください (single-instance mutex を共有します)。
+> 設定を汚さずに確認したい場合や、インストール版と並行して起動したい場合は、
+> ポータブル版 (`dist\mImageViewer_portable_v<VER>.zip`) を書き込み可能なフォルダへ展開して
+> 使う手もあります。その場合ログは `<展開先>\data\logs\mimageviewer.log` になります。
 
 ## 2. 診断プローブを有効にして起動
 
-展開先フォルダで PowerShell を開き、環境変数を設定してから起動します。
+リポジトリのルートで PowerShell を開き、環境変数を設定してから起動します。
 
 ```powershell
 $env:MIV_TOUCH_DEBUG = '1'
-Start-Process -FilePath .\mimageviewer.exe
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 Remove-Item Env:MIV_TOUCH_DEBUG
 ```
 
 `Start-Process` は現在の環境変数を引き継ぐので、起動後に `Remove-Item` しても問題ありません。
-`MIV_TOUCH_DEBUG` を設定しない通常起動では、この手順で追加した診断ログは出ません。
+`MIV_TOUCH_DEBUG` を設定しない通常起動では、この診断ログは出ません。
+
+タッチのジェスチャ自体を切り分けたいときは `MIV_DISABLE_TOUCH_GESTURES=1` を使う。
+タッチ対応で追加した動作だけが完全に無効になり、それ以前の挙動へ戻る。
 
 ## 3. 操作シナリオ
 
@@ -109,19 +113,25 @@ HUD が消えている状態で、映像の上を長押しします。長押し�
 
 ## 4. 終了とログの受け渡し
 
-mImageViewer を終了してログの書き込みを完了させます。展開先フォルダの PowerShell で、ログを
-日時付きファイルとしてデスクトップへコピーします。
+mImageViewer を終了してログの書き込みを完了させます。PowerShell で、ログを日時付きファイルとして
+コピーします。
 
 ```powershell
-$log = '.\data\logs\mimageviewer.log'
+$log = Join-Path $env:APPDATA 'mimageviewer\logs\mimageviewer.log'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $out = Join-Path ([Environment]::GetFolderPath('Desktop')) "mimageviewer-touch-probe-$stamp.log"
 Copy-Item -LiteralPath $log -Destination $out
 $out
 ```
 
-(`target\dev-runtime` の core で確認した場合は、`$log` を
-`Join-Path $env:APPDATA 'mimageviewer\logs\mimageviewer.log'` に読み替えてください。)
+(ポータブル版で確認した場合は、`$log` を `'.\data\logs\mimageviewer.log'` に読み替えてください。)
+
+⚠ **ログを渡す前に `TOUCH-DEBUG` 行が入っているか確認してください。** 0 件なら
+`MIV_TOUCH_DEBUG` が付かずに起動されています。
+
+```powershell
+(Select-String -Path $out -Pattern 'TOUCH-DEBUG' | Measure-Object).Count
+```
 
 表示された `.log` ファイルを担当者へ渡してください。あわせて、次の目視結果を短く添えてください。
 
