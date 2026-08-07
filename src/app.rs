@@ -30132,6 +30132,14 @@ impl App {
             grid_vis_first,
             self.fullscreen_idx,
         );
+        let fractional_drag_y = crate::ui_main::grid_touch_scroll_remainder(ctx, cell_h);
+        let strict_visible_end = crate::ui_main::extend_grid_end_for_touch_fraction(
+            vis_first.saturating_add(items_per_page),
+            cols,
+            vis_count,
+            fractional_drag_y,
+        );
+        let strict_visible_items = strict_visible_end.saturating_sub(vis_first);
 
         let prev_pages = self.settings.thumb_prev_pages as usize;
         let next_pages = self.settings.thumb_next_pages as usize;
@@ -30140,6 +30148,12 @@ impl App {
         let mut vis_keep_end = vis_first
             .saturating_add((1 + next_pages) * items_per_page)
             .min(vis_count);
+        vis_keep_end = crate::ui_main::extend_grid_end_for_touch_fraction(
+            vis_keep_end,
+            cols,
+            vis_count,
+            fractional_drag_y,
+        );
 
         // ── 共有 VRAM pool: サムネイル保持帯 ───────────────────────────
         // モード別のサムネイル配分を超えている場合だけ、実 texture 寸法と TextureId
@@ -30197,6 +30211,13 @@ impl App {
                 }
             }
         }
+        if crate::ui_main::grid_touch_fraction_is_visible(fractional_drag_y) {
+            // The fractional viewport exposes this whole extra row. Even when
+            // the VRAM band is capped, do not evict the row currently peeking
+            // in at the bottom of the touch-dragged grid.
+            vis_keep_start_capped = vis_keep_start_capped.min(vis_first);
+            vis_keep_end = vis_keep_end.max(strict_visible_end);
+        }
 
         // keep_set: prefetch / eviction / retain / idle upgrade がこれを使う。
         let keep_slice = self
@@ -30250,9 +30271,12 @@ impl App {
 
         // 可視範囲の raw index 範囲を計算 (1 ページ分 + 上下 1 行のマージン)
         let vis_visible_start = vis_first.saturating_sub(cols);
-        let vis_visible_end = vis_first
-            .saturating_add(items_per_page + cols)
-            .min(vis_count);
+        let vis_visible_end = crate::ui_main::extend_grid_end_for_touch_fraction(
+            vis_first.saturating_add(items_per_page + cols),
+            cols,
+            vis_count,
+            fractional_drag_y,
+        );
         let visible_raw_start = self
             .visible_indices
             .get(vis_visible_start)
@@ -30329,8 +30353,7 @@ impl App {
         // と誤報告してしまう (= ログ読解で「visible 全部 ready なのに何で遅延?」と混乱)。
         // docs/prefetch-suppression-during-scroll-plan.md 参照。
         let decision_now = std::time::Instant::now();
-        let visible_pending_now: usize = self.visible_indices
-            [vis_first..vis_first.saturating_add(items_per_page).min(vis_count)]
+        let visible_pending_now: usize = self.visible_indices[vis_first..strict_visible_end]
             .iter()
             .filter(|&&raw_idx| {
                 !matches!(
@@ -30744,7 +30767,8 @@ impl App {
         // pop して pdf_pool.normal に積んだ Job は priority=false のまま残る。
         // ここで現フレームの visible PDF を集めて pool に「HighNormal lane へ昇格」を依頼する。
         // (docs/scroll-visibility-priority-plan.md Phase 2)
-        let visible_keys = self.collect_visible_pdf_perf_keys(vis_first, items_per_page, vis_count);
+        let visible_keys =
+            self.collect_visible_pdf_perf_keys(vis_first, strict_visible_items, vis_count);
 
         // **Codex P2-2 対応**: dedup 過剰防止。
         // 単に「keys 一致」では、thumb worker が直後に同じ key を pool.normal へ enqueue
@@ -33532,11 +33556,12 @@ impl App {
                 }
             } else {
                 // 上スクロール(delta>0) → オフセット減、下スクロール(delta<0) → オフセット増
-                let direction = -scroll_delta_y.signum();
                 let prev_offset = self.scroll_offset_y;
-                self.scroll_offset_y = (self.scroll_offset_y + direction * cell_h).max(0.0);
-                // 行境界にスナップ
-                self.scroll_offset_y = (self.scroll_offset_y / cell_h).round() * cell_h;
+                self.scroll_offset_y = crate::ui_main::grid_wheel_scroll_offset(
+                    self.scroll_offset_y,
+                    scroll_delta_y,
+                    cell_h,
+                );
                 if (self.scroll_offset_y - prev_offset).abs() > 0.5 {
                     self.bump_input_seq(
                         "grid_wheel",

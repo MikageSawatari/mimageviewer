@@ -676,6 +676,10 @@ ScrollArea のドラッグスクロールに食われることはないはず。
 `drag_to_scroll` を無効化するか要検討 (デスクトップでは既定で大きな影響はないが、
 レビューで確認したい)。→ §8 Q5。
 
+タッチ対応 Phase 2 では、exact correlation 済みの touch-derived primary stream が存在する
+frame だけ `drag_started_by(Primary)` から native D&D を開始しない。認識しきい値の競争にはせず、
+touch start から release / cancel まで抑止する。mouse-only frame は従来の判定をそのまま通す。
+
 ### 6.7 eframe の present タイミング
 
 §5.5(b) は「`update()` 末尾でブロックすると、このフレームの絵はまだ present されておらず

@@ -273,6 +273,150 @@ fn snapped_scroll_extent(natural_h: f32, viewport_h: f32, row_h: f32) -> (f32, f
     (max_offset + viewport_h, max_offset)
 }
 
+const GRID_TOUCH_REMAINDER_EPSILON: f32 = 0.01;
+
+pub(crate) fn grid_touch_fraction_is_visible(remainder_y: f32) -> bool {
+    remainder_y > GRID_TOUCH_REMAINDER_EPSILON
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct GridTouchScrollPosition {
+    anchor_y: f32,
+    remainder_y: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct GridTouchScrollState {
+    remainder_y: f32,
+    row_h: f32,
+}
+
+/// Applies incremental finger motion without ever making the canonical grid
+/// offset fractional. `anchor_y` is reconstructed from an integer row on
+/// every return; only `remainder_y` may sit between rows.
+fn apply_grid_touch_scroll_delta(
+    anchor_y: f32,
+    remainder_y: f32,
+    finger_delta_y: f32,
+    row_h: f32,
+    max_offset: f32,
+) -> GridTouchScrollPosition {
+    let row_h = row_h.max(1.0);
+    let max_row = (max_offset.max(0.0) / row_h).round().max(0.0);
+    let max_anchor = max_row * row_h;
+    let anchor_row = (anchor_y / row_h).round().clamp(0.0, max_row);
+    let anchor_y = anchor_row * row_h;
+    let remainder_y = if remainder_y.is_finite() {
+        remainder_y.clamp(0.0, row_h - GRID_TOUCH_REMAINDER_EPSILON)
+    } else {
+        0.0
+    };
+    let finger_delta_y = if finger_delta_y.is_finite() {
+        finger_delta_y
+    } else {
+        0.0
+    };
+    let effective_y = (anchor_y + remainder_y - finger_delta_y).clamp(0.0, max_anchor);
+    let mut row = (effective_y / row_h).floor().clamp(0.0, max_row);
+    let mut remainder_y = effective_y - row * row_h;
+
+    if remainder_y <= GRID_TOUCH_REMAINDER_EPSILON {
+        remainder_y = 0.0;
+    } else if row < max_row && row_h - remainder_y <= GRID_TOUCH_REMAINDER_EPSILON {
+        row += 1.0;
+        remainder_y = 0.0;
+    }
+
+    GridTouchScrollPosition {
+        anchor_y: row * row_h,
+        remainder_y,
+    }
+}
+
+/// Commits the fractional drawing position to the nearest canonical row.
+fn settle_grid_touch_scroll(
+    anchor_y: f32,
+    remainder_y: f32,
+    row_h: f32,
+    max_offset: f32,
+) -> GridTouchScrollPosition {
+    let row_h = row_h.max(1.0);
+    let max_row = (max_offset.max(0.0) / row_h).round().max(0.0);
+    let mut row = (anchor_y / row_h).round().clamp(0.0, max_row);
+    if remainder_y.is_finite() && remainder_y >= row_h * 0.5 && row < max_row {
+        row += 1.0;
+    }
+    GridTouchScrollPosition {
+        anchor_y: row * row_h,
+        remainder_y: 0.0,
+    }
+}
+
+/// A fractional viewport reveals the next row at the bottom. Extend both the
+/// strict visible end and the retention end by exactly one row while it is
+/// present.
+pub(crate) fn extend_grid_end_for_touch_fraction(
+    base_end: usize,
+    cols: usize,
+    total: usize,
+    remainder_y: f32,
+) -> usize {
+    if grid_touch_fraction_is_visible(remainder_y) {
+        base_end.saturating_add(cols.max(1)).min(total)
+    } else {
+        base_end.min(total)
+    }
+}
+
+fn grid_touch_scroll_state_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::new(("miv_grid_touch_scroll_fraction", ctx.viewport_id()))
+}
+
+pub(crate) fn grid_touch_scroll_remainder(ctx: &egui::Context, row_h: f32) -> f32 {
+    let id = grid_touch_scroll_state_id(ctx);
+    ctx.data(|data| data.get_temp::<GridTouchScrollState>(id))
+        .filter(|state| (state.row_h - row_h).abs() <= 0.5)
+        .map(|state| state.remainder_y)
+        .unwrap_or(0.0)
+}
+
+fn set_grid_touch_scroll_remainder(ctx: &egui::Context, row_h: f32, remainder_y: f32) {
+    let id = grid_touch_scroll_state_id(ctx);
+    ctx.data_mut(|data| {
+        if grid_touch_fraction_is_visible(remainder_y) {
+            data.insert_temp(id, GridTouchScrollState { remainder_y, row_h });
+        } else {
+            data.remove_temp::<GridTouchScrollState>(id);
+        }
+    });
+}
+
+fn clear_grid_touch_scroll_remainder(ctx: &egui::Context) {
+    let id = grid_touch_scroll_state_id(ctx);
+    ctx.data_mut(|data| {
+        data.remove_temp::<GridTouchScrollState>(id);
+    });
+}
+
+pub(crate) fn grid_wheel_scroll_offset(current: f32, scroll_delta_y: f32, row_h: f32) -> f32 {
+    let row_h = row_h.max(1.0);
+    let direction = -scroll_delta_y.signum();
+    let offset = (current + direction * row_h).max(0.0);
+    (offset / row_h).round() * row_h
+}
+
+fn should_sync_grid_scrollbar(
+    touch_derived_pointer_activity: bool,
+    fractional_drag_y: f32,
+    egui_offset: f32,
+    anchor_y: f32,
+    row_h: f32,
+) -> bool {
+    !touch_derived_pointer_activity
+        && !grid_touch_fraction_is_visible(fractional_drag_y)
+        && (egui_offset - anchor_y).abs() > row_h * 0.5
+}
+
 fn resolve_grid_scroll_offset(
     current: f32,
     max_offset: f32,
@@ -1098,6 +1242,14 @@ fn draw_rating_filter_button(
 
 // ── native ファイル D&D (ドラッグでコピー送出) ───────────────────────
 // 設計: docs/file-drag-drop-design.md §5.4
+
+fn native_grid_drag_start_allowed(
+    items_are_drive_list: bool,
+    native_drag_just_finished: bool,
+    touch_derived_pointer_activity: bool,
+) -> bool {
+    !items_are_drive_list && !native_drag_just_finished && !touch_derived_pointer_activity
+}
 
 /// ドラッグ開始セルから「何をドラッグするか」を表す決定。
 pub(crate) enum DragDecision {
@@ -12034,6 +12186,7 @@ impl App {
         cell_rect: egui::Rect,
         idx: usize,
         overlay_layout: &crate::thumb_overlay_layout::ThumbnailOverlayLayout,
+        touch_derived_pointer_activity: bool,
     ) -> Option<PathBuf> {
         // click_and_drag: clicked() / double_clicked() / secondary_clicked() は従来通り
         // 発火しつつ、drag_started_by(Primary) で native ファイル D&D を開始できる。
@@ -12325,9 +12478,11 @@ impl App {
         // ── native ファイル D&D の開始検出 (docs/file-drag-drop-design.md §5.4) ──
         // primary (左) ボタンのドラッグだけを起点にする。native drag 直後の
         // 1 フレームは抑止 (幽霊ドラッグ防止の保険、§6.1)。
-        if !self.items_are_drive_list
-            && !self.native_drag_just_finished
-            && response.drag_started_by(egui::PointerButton::Primary)
+        if native_grid_drag_start_allowed(
+            self.items_are_drive_list,
+            self.native_drag_just_finished,
+            touch_derived_pointer_activity,
+        ) && response.drag_started_by(egui::PointerButton::Primary)
         {
             match decide_drag_payload(&self.items, &self.checked, idx) {
                 DragDecision::Start {
@@ -12671,6 +12826,7 @@ impl App {
                                 row_rect,
                                 idx,
                                 &no_thumbnail_overlays,
+                                false,
                             ) {
                                 nav = Some(n);
                             }
@@ -14292,16 +14448,24 @@ impl App {
             .show(ctx, |ui| -> Option<PathBuf> {
                 // Sole MainGrid driver. Embedded still fullscreen returns
                 // before render_grid, preventing a double feed on main ctx.
-                let _ = crate::touch_correlation::drive_egui_touch_input(
+                let touch_scroll_enabled =
+                    self.settings.grid_view_mode != GridViewMode::Details && !self.items.is_empty();
+                let touch_frame = crate::touch_correlation::drive_egui_touch_input(
                     ctx,
                     crate::touch_correlation::TouchSurface::MainGrid,
                     crate::touch_input::TapZoneGeometry {
                         surface: ui.max_rect(),
                         excluded: Vec::new(),
+                        behavior: crate::touch_input::TouchSurfaceBehavior::Grid,
                     },
                     self.frame_counter,
-                    true,
+                    touch_scroll_enabled,
                 );
+                if !touch_scroll_enabled && touch_frame.touch_cancelled() {
+                    clear_grid_touch_scroll_remainder(ctx);
+                }
+                let touch_derived_pointer_activity =
+                    touch_frame.has_touch_derived_pointer_activity();
                 let global_searching =
                     self.items_are_global_search_view && self.global_search.is_searching();
                 if self.items.is_empty() {
@@ -14460,6 +14624,7 @@ impl App {
                     || (cell_h - self.last_cell_h).abs() > 0.5
                 {
                     self.scroll_offset_y = (self.scroll_offset_y / cell_h).round() * cell_h;
+                    clear_grid_touch_scroll_remainder(ctx);
                     self.last_cell_size = cell_w;
                     self.last_cell_h = cell_h;
                 }
@@ -14485,6 +14650,61 @@ impl App {
                 self.scroll_offset_y =
                     resolve_grid_scroll_offset(self.scroll_offset_y, max_offset, pending_scroll);
 
+                let mut fractional_drag_y = grid_touch_scroll_remainder(ctx, cell_h);
+                let mut touch_scroll_changed = false;
+                for command in touch_frame.commands().iter().copied() {
+                    match command {
+                        crate::touch_input::TouchCommand::ScrollGrid { delta_y } => {
+                            let position = apply_grid_touch_scroll_delta(
+                                self.scroll_offset_y,
+                                fractional_drag_y,
+                                delta_y,
+                                cell_h,
+                                max_offset,
+                            );
+                            self.scroll_offset_y = position.anchor_y;
+                            fractional_drag_y = position.remainder_y;
+                            touch_scroll_changed = true;
+                        }
+                        crate::touch_input::TouchCommand::ScrollGridEnd => {
+                            let position = settle_grid_touch_scroll(
+                                self.scroll_offset_y,
+                                fractional_drag_y,
+                                cell_h,
+                                max_offset,
+                            );
+                            self.scroll_offset_y = position.anchor_y;
+                            fractional_drag_y = position.remainder_y;
+                            touch_scroll_changed = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if (touch_frame.touch_cancelled()
+                    || touch_frame.owner() == crate::touch_input::TouchOwner::Cancelled)
+                    && fractional_drag_y > GRID_TOUCH_REMAINDER_EPSILON
+                {
+                    let position = settle_grid_touch_scroll(
+                        self.scroll_offset_y,
+                        fractional_drag_y,
+                        cell_h,
+                        max_offset,
+                    );
+                    self.scroll_offset_y = position.anchor_y;
+                    fractional_drag_y = position.remainder_y;
+                    touch_scroll_changed = true;
+                }
+                set_grid_touch_scroll_remainder(ctx, cell_h, fractional_drag_y);
+                let touch_scroll_active = touch_frame.is_active()
+                    && touch_frame.owner() == crate::touch_input::TouchOwner::GridScroll;
+                if touch_scroll_changed || touch_scroll_active {
+                    self.note_grid_touch_scroll_activity();
+                }
+                if touch_scroll_changed {
+                    ctx.request_repaint();
+                }
+                let display_scroll_offset_y = self.scroll_offset_y + fractional_drag_y;
+
                 let mut nav: Option<PathBuf> = None;
                 let primary_click_pos = ctx.input(|i| {
                     i.pointer
@@ -14498,7 +14718,7 @@ impl App {
                 // ただしスクロールバードラッグ時は egui 側のオフセットを読み戻す。
                 let scroll_output = egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .vertical_scroll_offset(self.scroll_offset_y)
+                    .vertical_scroll_offset(display_scroll_offset_y)
                     .show_viewport(ui, |ui, viewport| {
                         // 実際のビューポート高さも記録する。リサイズ中の scroll extent
                         // 計算自体は上の `ui.available_height()` で同フレーム内に行う。
@@ -14510,7 +14730,11 @@ impl App {
                         );
 
                         let first_row = (viewport.min.y / cell_h) as usize;
-                        let last_row = ((viewport.max.y / cell_h) as usize + 2).min(total_rows);
+                        let fractional_extra_row =
+                            usize::from(fractional_drag_y > GRID_TOUCH_REMAINDER_EPSILON);
+                        let last_row =
+                            ((viewport.max.y / cell_h) as usize + 2 + fractional_extra_row)
+                                .min(total_rows);
 
                         // Phase 2b ワーカーへ現在の可視先頭/終端アイテムを通知
                         let vis_first_idx = self
@@ -14590,6 +14814,7 @@ impl App {
                                     cell_rect,
                                     idx,
                                     &overlay_layout,
+                                    touch_derived_pointer_activity,
                                 ) {
                                     nav = Some(n);
                                 }
@@ -14722,7 +14947,13 @@ impl App {
                 // ただし行スナップによる端数差分で毎フレーム振動するのを防ぐため、
                 // 1 行分 (cell_h) 以上ずれた場合のみ同期する。
                 let egui_offset = scroll_output.state.offset.y;
-                if (egui_offset - self.scroll_offset_y).abs() > cell_h * 0.5 {
+                if should_sync_grid_scrollbar(
+                    touch_derived_pointer_activity,
+                    fractional_drag_y,
+                    egui_offset,
+                    self.scroll_offset_y,
+                    cell_h,
+                ) {
                     self.scroll_offset_y = (egui_offset / cell_h).round() * cell_h;
                 }
 
@@ -18760,6 +18991,139 @@ mod compute_cell_size_tests {
 
         assert_eq!(total_h, 280.0);
         assert_eq!(max_offset, 0.0);
+    }
+
+    fn assert_touch_anchor_is_row_snapped(position: GridTouchScrollPosition, row_h: f32) {
+        let row = position.anchor_y / row_h;
+        assert!((row - row.round()).abs() < 0.0001);
+        assert!(position.remainder_y >= 0.0);
+        assert!(position.remainder_y < row_h);
+    }
+
+    #[test]
+    fn grid_touch_scroll_keeps_anchor_snapped_across_fraction_and_rows() {
+        let row_h = 100.0;
+        let max_offset = 1000.0;
+        let cases = [
+            (
+                apply_grid_touch_scroll_delta(100.0, 0.0, -25.0, row_h, max_offset),
+                GridTouchScrollPosition {
+                    anchor_y: 100.0,
+                    remainder_y: 25.0,
+                },
+            ),
+            (
+                apply_grid_touch_scroll_delta(100.0, 80.0, -30.0, row_h, max_offset),
+                GridTouchScrollPosition {
+                    anchor_y: 200.0,
+                    remainder_y: 10.0,
+                },
+            ),
+            (
+                apply_grid_touch_scroll_delta(0.0, 0.0, -250.0, row_h, max_offset),
+                GridTouchScrollPosition {
+                    anchor_y: 200.0,
+                    remainder_y: 50.0,
+                },
+            ),
+            (
+                apply_grid_touch_scroll_delta(200.0, 20.0, 70.0, row_h, max_offset),
+                GridTouchScrollPosition {
+                    anchor_y: 100.0,
+                    remainder_y: 50.0,
+                },
+            ),
+        ];
+
+        for (actual, expected) in cases {
+            assert_eq!(actual, expected);
+            assert_touch_anchor_is_row_snapped(actual, row_h);
+        }
+    }
+
+    #[test]
+    fn grid_touch_scroll_clamps_without_overshoot_at_both_ends() {
+        let top = apply_grid_touch_scroll_delta(0.0, 10.0, 50.0, 100.0, 300.0);
+        let bottom = apply_grid_touch_scroll_delta(200.0, 80.0, -50.0, 100.0, 300.0);
+
+        assert_eq!(top, GridTouchScrollPosition::default());
+        assert_eq!(
+            bottom,
+            GridTouchScrollPosition {
+                anchor_y: 300.0,
+                remainder_y: 0.0,
+            }
+        );
+        assert_touch_anchor_is_row_snapped(top, 100.0);
+        assert_touch_anchor_is_row_snapped(bottom, 100.0);
+    }
+
+    #[test]
+    fn grid_touch_scroll_release_commits_to_nearest_row() {
+        let before_half = settle_grid_touch_scroll(200.0, 49.9, 100.0, 500.0);
+        let at_half = settle_grid_touch_scroll(200.0, 50.0, 100.0, 500.0);
+        let at_bottom = settle_grid_touch_scroll(500.0, 80.0, 100.0, 500.0);
+
+        assert_eq!(before_half.anchor_y, 200.0);
+        assert_eq!(at_half.anchor_y, 300.0);
+        assert_eq!(at_bottom.anchor_y, 500.0);
+        for position in [before_half, at_half, at_bottom] {
+            assert_eq!(position.remainder_y, 0.0);
+            assert_touch_anchor_is_row_snapped(position, 100.0);
+        }
+    }
+
+    #[test]
+    fn fractional_grid_view_extends_visible_and_keep_ends_by_one_row() {
+        assert_eq!(extend_grid_end_for_touch_fraction(20, 4, 100, 0.0), 20);
+        assert_eq!(extend_grid_end_for_touch_fraction(20, 4, 100, 0.5), 24);
+        assert_eq!(extend_grid_end_for_touch_fraction(98, 4, 100, 0.5), 100);
+    }
+
+    #[test]
+    fn native_grid_drag_guard_changes_only_touch_derived_streams() {
+        assert!(native_grid_drag_start_allowed(false, false, false));
+        assert!(!native_grid_drag_start_allowed(false, false, true));
+        assert!(!native_grid_drag_start_allowed(true, false, false));
+        assert!(!native_grid_drag_start_allowed(false, true, false));
+    }
+
+    #[test]
+    fn mouse_wheel_still_moves_exactly_one_snapped_row() {
+        assert_eq!(grid_wheel_scroll_offset(300.0, -120.0, 100.0), 400.0);
+        assert_eq!(grid_wheel_scroll_offset(300.0, 120.0, 100.0), 200.0);
+        assert_eq!(grid_wheel_scroll_offset(0.0, 120.0, 100.0), 0.0);
+        for offset in [
+            grid_wheel_scroll_offset(300.0, -1.0, 100.0),
+            grid_wheel_scroll_offset(300.0, 1.0, 100.0),
+        ] {
+            assert_eq!((offset / 100.0).fract(), 0.0);
+        }
+    }
+
+    #[test]
+    fn scrollbar_sync_is_unchanged_for_mouse_and_paused_for_touch_fraction() {
+        assert!(should_sync_grid_scrollbar(false, 0.0, 200.0, 100.0, 100.0));
+        assert!(!should_sync_grid_scrollbar(false, 0.0, 140.0, 100.0, 100.0));
+        assert!(!should_sync_grid_scrollbar(true, 0.0, 200.0, 100.0, 100.0));
+        assert!(!should_sync_grid_scrollbar(
+            false, 25.0, 200.0, 100.0, 100.0
+        ));
+    }
+
+    #[test]
+    fn grid_touch_activity_updates_prefetch_settle_and_idle_clocks() {
+        let mut app = setup_app_for_test();
+        app.scroll_offset_y = 300.0;
+        let before = std::time::Instant::now();
+
+        app.note_grid_touch_scroll_activity();
+
+        assert!(app.last_prefetch_scroll_at.is_some_and(|at| at >= before));
+        assert!(app.last_scroll_event_at.is_some_and(|at| at >= before));
+        assert!(app.last_scroll_change_time >= before);
+        assert!(app.last_input_at.is_some_and(|at| at >= before));
+        assert_eq!(app.last_scroll_offset_y_tracked, 300.0);
     }
 
     #[test]

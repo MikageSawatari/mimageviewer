@@ -2,30 +2,62 @@ use super::*;
 
 // scroll_settle 計装の helper 群は inherent impl (trait method ではない)
 impl App {
-    /// `App::update` 冒頭で 1 回呼ぶ。同フレーム内の wheel / arrow keys / Page / Home / End
-    /// 等のスクロール入力意図を ctx.input から拾って `last_prefetch_scroll_at` を即時更新する。
+    /// `App::update` 冒頭で 1 回呼ぶ。同フレーム内の wheel / arrow keys / Page / Home / End と
+    /// thumbnail grid 上で解釈され得る Touch Move を ctx.input から拾い、prefetch 用 timestamp を
+    /// 即時更新する。
     ///
     /// なぜ早期検出か: `update_keep_range_and_requests` の gate 判定 (line 18204 付近) は
     /// 同フレーム内の `process_scroll` / `handle_keyboard` の `scroll_offset_y` mutate より前に
     /// 走るので、offset 変化ベースの検出 (= `update_scroll_settle_state`) では 1 フレ遅れる。
     /// → input intent ベースなら gate 判定時に既に立っている。
     ///
-    /// scrollbar drag / touch などキー以外の経路は `update_scroll_settle_state` の offset 変化
-    /// fallback で 1 フレ遅れて拾う。実害は 1 frame の prefetch 漏れ程度で、次フレ q.retain で
-    /// prune される。
+    /// scrollbar drag は `update_scroll_settle_state` の offset 変化 fallback で 1 フレ遅れて拾う。
+    /// grid touch はこの early intent で同フレームの prefetch を止め、端数だけ動くフレームでも
+    /// settle / idle を止めるため認識器の command 適用境界から
+    /// `note_grid_touch_scroll_activity` を明示的に呼ぶ。
     pub(super) fn detect_scroll_input_intent(&mut self, ctx: &egui::Context) {
-        let scrolling = ctx.input(|i| {
-            i.raw_scroll_delta.length() > 0.1
-                || i.key_pressed(egui::Key::ArrowDown)
-                || i.key_pressed(egui::Key::ArrowUp)
-                || i.key_pressed(egui::Key::PageDown)
-                || i.key_pressed(egui::Key::PageUp)
-                || i.key_pressed(egui::Key::Home)
-                || i.key_pressed(egui::Key::End)
-        });
+        let grid_touch_move = !crate::touch_correlation::touch_gestures_disabled()
+            && self.settings.grid_view_mode != crate::settings::GridViewMode::Details
+            && !self.viewer_session_blocks_main_window()
+            && !self.any_dialog_open()
+            && ctx.input(|input| {
+                input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Touch {
+                            phase: egui::TouchPhase::Move,
+                            ..
+                        }
+                    )
+                })
+            });
+        let scrolling = grid_touch_move
+            || ctx.input(|i| {
+                i.raw_scroll_delta.length() > 0.1
+                    || i.key_pressed(egui::Key::ArrowDown)
+                    || i.key_pressed(egui::Key::ArrowUp)
+                    || i.key_pressed(egui::Key::PageDown)
+                    || i.key_pressed(egui::Key::PageUp)
+                    || i.key_pressed(egui::Key::Home)
+                    || i.key_pressed(egui::Key::End)
+            });
         if scrolling {
             self.last_prefetch_scroll_at = Some(std::time::Instant::now());
         }
+    }
+
+    /// Records grid touch-scroll activity even when only the fractional
+    /// drawing remainder moved and the canonical row anchor stayed unchanged.
+    /// Keeping all scroll/idle clocks on this explicit boundary prevents
+    /// prefetch and idle upgrades from restarting while a finger is down.
+    pub(crate) fn note_grid_touch_scroll_activity(&mut self) {
+        let now = std::time::Instant::now();
+        self.last_prefetch_scroll_at = Some(now);
+        self.last_scroll_event_at = Some(now);
+        self.last_scroll_change_time = now;
+        self.last_scroll_offset_y_tracked = self.scroll_offset_y;
+        self.last_input_at = Some(now);
+        self.scroll_settle_state = None;
     }
 
     /// `update_scroll_settle_state`: scroll_offset_y の変化検出 + 300ms 経過後の
@@ -36,7 +68,7 @@ impl App {
         let cur_offset = self.scroll_offset_y;
         if (cur_offset - self.prev_scroll_offset_y).abs() > 0.5 {
             self.last_scroll_event_at = Some(now);
-            // prefetch gate にも fallback で書く (= scrollbar drag / touch 経路の保険)。
+            // prefetch gate にも fallback で書く (= scrollbar drag 等の保険)。
             // settle で clear されないので backstop の計時起点に使える。
             self.last_prefetch_scroll_at = Some(now);
             self.prev_scroll_offset_y = cur_offset;

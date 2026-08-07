@@ -57,6 +57,27 @@ pub(crate) struct TapZoneGeometry {
     pub surface: Rect,
     /// Chrome rectangles actually visible in the current frame.
     pub excluded: Vec<Rect>,
+    /// Gesture capabilities differ by surface: the grid owns one-finger
+    /// drags for scrolling and never upgrades them to pinch, while still
+    /// viewers keep their existing pointer-pan-to-pinch upgrade.
+    pub behavior: TouchSurfaceBehavior,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TouchSurfaceBehavior {
+    Grid,
+    Viewer { accepts_pinch: bool },
+}
+
+impl TouchSurfaceBehavior {
+    fn accepts_pinch(self) -> bool {
+        matches!(
+            self,
+            Self::Viewer {
+                accepts_pinch: true
+            }
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +123,7 @@ pub(crate) fn classify_tap(geom: &TapZoneGeometry, pos: Pos2) -> TapZone {
 pub(crate) enum TouchOwner {
     Undecided,
     WidgetPassthrough,
+    GridScroll,
     ViewerPointerPassthrough,
     ViewerTapZone,
     Pinch,
@@ -132,6 +154,14 @@ pub(crate) enum TouchCommand {
     Pan {
         delta: Vec2,
     },
+    /// Incremental vertical finger movement on the grid. The caller converts
+    /// this to a snapped anchor plus a fractional drawing remainder.
+    ScrollGrid {
+        delta_y: f32,
+    },
+    /// The last contact in a grid-scroll stream has ended. The caller snaps
+    /// the fractional drawing remainder to the nearest row at this boundary.
+    ScrollGridEnd,
     /// The last contact participating in a pinch has ended. Consumers use
     /// this boundary for work that must not run for every gesture sample,
     /// such as a PDF rerender.
@@ -188,6 +218,7 @@ pub(crate) struct TouchRecognizer {
     contacts: Vec<Contact>,
     owner: TouchOwner,
     pinch_frame: Option<PinchFrame>,
+    grid_scroll_contact_id: Option<u64>,
     suppress_primary: bool,
 }
 
@@ -197,6 +228,7 @@ impl Default for TouchRecognizer {
             contacts: Vec::new(),
             owner: TouchOwner::Undecided,
             pinch_frame: None,
+            grid_scroll_contact_id: None,
             suppress_primary: false,
         }
     }
@@ -233,6 +265,7 @@ impl TouchRecognizer {
         if sample.phase == TouchPhase::Cancel {
             self.contacts.clear();
             self.pinch_frame = None;
+            self.grid_scroll_contact_id = None;
             self.owner = TouchOwner::Cancelled;
             self.suppress_primary = true;
             return Vec::new();
@@ -240,7 +273,7 @@ impl TouchRecognizer {
 
         match sample.phase {
             TouchPhase::Start => self.handle_start(geom, sample),
-            TouchPhase::Move => self.handle_move(sample),
+            TouchPhase::Move => self.handle_move(geom, sample),
             TouchPhase::End => self.handle_end(geom, sample),
             TouchPhase::Cancel => unreachable!(),
         }
@@ -254,6 +287,7 @@ impl TouchRecognizer {
                 TouchOwner::Undecided
             };
             self.pinch_frame = None;
+            self.grid_scroll_contact_id = None;
             self.suppress_primary = false;
         }
 
@@ -264,7 +298,7 @@ impl TouchRecognizer {
         }
         self.contacts.push(Contact::new(sample, geom.surface));
 
-        if self.contacts.len() >= PINCH_CONTACT_COUNT {
+        if self.contacts.len() >= PINCH_CONTACT_COUNT && geom.behavior.accepts_pinch() {
             match self.owner {
                 TouchOwner::Undecided | TouchOwner::ViewerPointerPassthrough => self.begin_pinch(),
                 TouchOwner::EdgeSwipe { .. } => {
@@ -275,6 +309,7 @@ impl TouchRecognizer {
                 }
                 TouchOwner::Pinch => self.rebase_pinch(),
                 TouchOwner::WidgetPassthrough
+                | TouchOwner::GridScroll
                 | TouchOwner::ViewerTapZone
                 | TouchOwner::Cancelled => {}
             }
@@ -288,7 +323,7 @@ impl TouchRecognizer {
         self.rebase_pinch();
     }
 
-    fn handle_move(&mut self, sample: TouchSample) -> Vec<TouchCommand> {
+    fn handle_move(&mut self, geom: &TapZoneGeometry, sample: TouchSample) -> Vec<TouchCommand> {
         let Some(index) = self
             .contacts
             .iter()
@@ -296,13 +331,17 @@ impl TouchRecognizer {
         else {
             return Vec::new();
         };
+        let previous_pos = self.contacts[index].pos;
         self.contacts[index].update(sample.pos);
 
         if self.owner == TouchOwner::Pinch {
             return self.pinch_commands();
         }
+        if self.owner == TouchOwner::GridScroll {
+            return self.grid_scroll_command(sample.id, sample.pos.y - previous_pos.y);
+        }
         if self.owner == TouchOwner::Undecided && self.contacts.len() == 1 {
-            return self.single_motion_command(self.contacts[index]);
+            return self.single_motion_command(geom.behavior, self.contacts[index]);
         }
         Vec::new()
     }
@@ -315,12 +354,15 @@ impl TouchRecognizer {
         else {
             return Vec::new();
         };
+        let previous_pos = self.contacts[index].pos;
         self.contacts[index].update(sample.pos);
 
         let mut commands = if self.owner == TouchOwner::Pinch {
             self.pinch_commands()
+        } else if self.owner == TouchOwner::GridScroll {
+            self.grid_scroll_command(sample.id, sample.pos.y - previous_pos.y)
         } else if self.owner == TouchOwner::Undecided && self.contacts.len() == 1 {
-            self.single_motion_command(self.contacts[index])
+            self.single_motion_command(geom.behavior, self.contacts[index])
         } else {
             Vec::new()
         };
@@ -328,45 +370,87 @@ impl TouchRecognizer {
         if self.owner == TouchOwner::Undecided && self.contacts.len() == 1 {
             let contact = self.contacts[index];
             if contact.is_tap(sample.now_ms) {
-                match classify_tap(geom, contact.pos) {
-                    TapZone::Center => {
-                        self.owner = TouchOwner::ViewerTapZone;
-                        self.suppress_primary = true;
-                        commands.push(TouchCommand::ToggleChrome);
+                match geom.behavior {
+                    TouchSurfaceBehavior::Grid => {
+                        // Grid taps stay on egui's existing cell selection /
+                        // double-click path. Re-tap open is a separate step.
+                        self.owner = TouchOwner::WidgetPassthrough;
                     }
-                    TapZone::PageSide { left } => {
-                        self.owner = TouchOwner::ViewerTapZone;
-                        self.suppress_primary = true;
-                        commands.push(TouchCommand::PageSide { left });
-                    }
-                    TapZone::Excluded => {
-                        // The press began on the viewer, so do not pass its
-                        // release through to chrome reached during the tap.
-                        self.suppress_primary = true;
+                    TouchSurfaceBehavior::Viewer { .. } => {
+                        match classify_tap(geom, contact.pos) {
+                            TapZone::Center => {
+                                self.owner = TouchOwner::ViewerTapZone;
+                                self.suppress_primary = true;
+                                commands.push(TouchCommand::ToggleChrome);
+                            }
+                            TapZone::PageSide { left } => {
+                                self.owner = TouchOwner::ViewerTapZone;
+                                self.suppress_primary = true;
+                                commands.push(TouchCommand::PageSide { left });
+                            }
+                            TapZone::Excluded => {
+                                // The press began on the viewer, so do not pass its
+                                // release through to chrome reached during the tap.
+                                self.suppress_primary = true;
+                            }
+                        }
                     }
                 }
             } else if contact.max_distance_sq > TAP_MAX_DISTANCE_PT * TAP_MAX_DISTANCE_PT {
-                self.owner = TouchOwner::ViewerPointerPassthrough;
+                self.owner = match geom.behavior {
+                    TouchSurfaceBehavior::Grid => TouchOwner::GridScroll,
+                    TouchSurfaceBehavior::Viewer { .. } => TouchOwner::ViewerPointerPassthrough,
+                };
             } else {
-                // A stationary long press is not a tap, but its synthetic
-                // primary release must not become a page command.
-                self.suppress_primary = true;
+                match geom.behavior {
+                    TouchSurfaceBehavior::Grid => {
+                        self.owner = TouchOwner::WidgetPassthrough;
+                    }
+                    TouchSurfaceBehavior::Viewer { .. } => {
+                        // A stationary long press is not a tap, but its synthetic
+                        // primary release must not become a page command.
+                        self.suppress_primary = true;
+                    }
+                }
             }
         }
 
         self.contacts.remove(index);
-        if self.owner == TouchOwner::Pinch {
-            self.rebase_pinch();
-            if self.contacts.is_empty() {
-                commands.push(TouchCommand::PinchEnd);
+        match self.owner {
+            TouchOwner::Pinch => {
+                self.rebase_pinch();
+                if self.contacts.is_empty() {
+                    commands.push(TouchCommand::PinchEnd);
+                }
             }
+            TouchOwner::GridScroll if self.contacts.is_empty() => {
+                self.grid_scroll_contact_id = None;
+                commands.push(TouchCommand::ScrollGridEnd);
+            }
+            _ => {}
         }
         commands
     }
 
-    fn single_motion_command(&mut self, contact: Contact) -> Vec<TouchCommand> {
+    fn single_motion_command(
+        &mut self,
+        behavior: TouchSurfaceBehavior,
+        contact: Contact,
+    ) -> Vec<TouchCommand> {
         let delta = contact.pos - contact.start_pos;
         let moved_beyond_tap = contact.max_distance_sq > TAP_MAX_DISTANCE_PT * TAP_MAX_DISTANCE_PT;
+
+        if behavior == TouchSurfaceBehavior::Grid {
+            if moved_beyond_tap {
+                self.owner = TouchOwner::GridScroll;
+                self.grid_scroll_contact_id = Some(contact.id);
+                self.suppress_primary = true;
+                if delta.y != 0.0 {
+                    return vec![TouchCommand::ScrollGrid { delta_y: delta.y }];
+                }
+            }
+            return Vec::new();
+        }
 
         if let Some(left) = contact.edge_side {
             let inward = if left { delta.x } else { -delta.x };
@@ -389,6 +473,14 @@ impl TouchRecognizer {
             self.owner = TouchOwner::ViewerPointerPassthrough;
         }
         Vec::new()
+    }
+
+    fn grid_scroll_command(&self, contact_id: u64, delta_y: f32) -> Vec<TouchCommand> {
+        if self.grid_scroll_contact_id == Some(contact_id) && delta_y != 0.0 {
+            vec![TouchCommand::ScrollGrid { delta_y }]
+        } else {
+            Vec::new()
+        }
     }
 
     fn pinch_commands(&mut self) -> Vec<TouchCommand> {
@@ -471,6 +563,16 @@ mod tests {
         TapZoneGeometry {
             surface: Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 800.0)),
             excluded: Vec::new(),
+            behavior: TouchSurfaceBehavior::Viewer {
+                accepts_pinch: true,
+            },
+        }
+    }
+
+    fn grid_geom() -> TapZoneGeometry {
+        TapZoneGeometry {
+            behavior: TouchSurfaceBehavior::Grid,
+            ..geom()
         }
     }
 
@@ -543,6 +645,9 @@ mod tests {
             let geometry = TapZoneGeometry {
                 surface,
                 excluded: Vec::new(),
+                behavior: TouchSurfaceBehavior::Viewer {
+                    accepts_pinch: true,
+                },
             };
             assert_eq!(classify_tap(&geometry, surface.center()), TapZone::Center);
         }
@@ -835,5 +940,86 @@ mod tests {
             vec![TouchCommand::PinchEnd]
         );
         assert_eq!(recognizer.owner(), TouchOwner::Pinch);
+    }
+
+    #[test]
+    fn grid_tap_stays_on_the_existing_widget_path() {
+        let geometry = grid_geom();
+        let mut recognizer = TouchRecognizer::new();
+        recognizer.handle_sample(&geometry, sample(1, 500.0, 400.0, TouchPhase::Start, 0));
+
+        assert!(
+            recognizer
+                .handle_sample(&geometry, sample(1, 505.0, 404.0, TouchPhase::End, 100))
+                .is_empty()
+        );
+        assert_eq!(recognizer.owner(), TouchOwner::WidgetPassthrough);
+        assert!(!recognizer.should_suppress_primary());
+    }
+
+    #[test]
+    fn grid_drag_claims_after_tap_slop_and_emits_incremental_vertical_motion() {
+        let geometry = grid_geom();
+        let mut recognizer = TouchRecognizer::new();
+        recognizer.handle_sample(&geometry, sample(1, 500.0, 400.0, TouchPhase::Start, 0));
+
+        assert!(
+            recognizer
+                .handle_sample(&geometry, sample(1, 500.0, 412.0, TouchPhase::Move, 10))
+                .is_empty()
+        );
+        assert_eq!(recognizer.owner(), TouchOwner::Undecided);
+        assert_eq!(
+            recognizer.handle_sample(&geometry, sample(1, 500.0, 413.0, TouchPhase::Move, 20)),
+            vec![TouchCommand::ScrollGrid { delta_y: 13.0 }]
+        );
+        assert_eq!(recognizer.owner(), TouchOwner::GridScroll);
+        assert!(recognizer.should_suppress_primary());
+        assert_eq!(
+            recognizer.handle_sample(&geometry, sample(1, 500.0, 433.0, TouchPhase::Move, 30)),
+            vec![TouchCommand::ScrollGrid { delta_y: 20.0 }]
+        );
+        assert_eq!(
+            recognizer.handle_sample(&geometry, sample(1, 500.0, 438.0, TouchPhase::End, 40)),
+            vec![
+                TouchCommand::ScrollGrid { delta_y: 5.0 },
+                TouchCommand::ScrollGridEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn grid_scroll_never_upgrades_to_pinch_when_a_contact_is_added() {
+        let geometry = grid_geom();
+        let mut recognizer = TouchRecognizer::new();
+        recognizer.handle_sample(&geometry, sample(1, 500.0, 400.0, TouchPhase::Start, 0));
+        assert_eq!(
+            recognizer.handle_sample(&geometry, sample(1, 500.0, 380.0, TouchPhase::Move, 10)),
+            vec![TouchCommand::ScrollGrid { delta_y: -20.0 }]
+        );
+
+        assert!(
+            recognizer
+                .handle_sample(&geometry, sample(2, 600.0, 400.0, TouchPhase::Start, 20))
+                .is_empty()
+        );
+        assert_eq!(recognizer.owner(), TouchOwner::GridScroll);
+        assert!(
+            recognizer
+                .handle_sample(&geometry, sample(2, 600.0, 360.0, TouchPhase::Move, 30))
+                .is_empty()
+        );
+        assert_eq!(recognizer.owner(), TouchOwner::GridScroll);
+
+        assert!(
+            recognizer
+                .handle_sample(&geometry, sample(1, 500.0, 380.0, TouchPhase::End, 40))
+                .is_empty()
+        );
+        assert_eq!(recognizer.owner(), TouchOwner::GridScroll);
+        assert_eq!(
+            recognizer.handle_sample(&geometry, sample(2, 600.0, 360.0, TouchPhase::End, 50)),
+            vec![TouchCommand::ScrollGridEnd]
+        );
     }
 }

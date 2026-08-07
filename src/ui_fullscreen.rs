@@ -15769,6 +15769,9 @@ impl App {
                 crate::touch_input::TapZoneGeometry {
                     surface: full_rect,
                     excluded: Vec::new(),
+                    behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                        accepts_pinch: true,
+                    },
                 },
                 self.frame_counter,
                 false,
@@ -15877,6 +15880,9 @@ impl App {
                     crate::touch_input::TapZoneGeometry {
                         surface: full_rect,
                         excluded: Vec::new(),
+                        behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                            accepts_pinch: true,
+                        },
                     },
                     self.frame_counter,
                     false,
@@ -16121,6 +16127,9 @@ impl App {
                 crate::touch_input::TapZoneGeometry {
                     surface: full_rect,
                     excluded: Vec::new(),
+                    behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                        accepts_pinch: true,
+                    },
                 },
                 self.frame_counter,
                 false,
@@ -16193,6 +16202,9 @@ impl App {
             crate::touch_input::TapZoneGeometry {
                 surface: full_rect,
                 excluded: touch_excluded,
+                behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                    accepts_pinch: true,
+                },
             },
             self.frame_counter,
             touch_input_enabled,
@@ -16245,6 +16257,10 @@ impl App {
                     crate::touch_input::TouchCommand::PinchEnd => {
                         self.maybe_rerender_pdf(self.fs_zoom);
                     }
+                    // Grid-only commands cannot be produced by this viewer
+                    // surface profile.
+                    crate::touch_input::TouchCommand::ScrollGrid { .. }
+                    | crate::touch_input::TouchCommand::ScrollGridEnd => {}
                     // Step 3b owns both the side-panel command and its
                     // suppression. Leaving it untouched here preserves the
                     // existing drag/click behavior until the replacement UI exists.

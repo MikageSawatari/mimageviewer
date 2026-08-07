@@ -426,6 +426,12 @@ egui-winit は Touch Cancel 時に `PointerGone` を出すが、**primary releas
 
 ### 5.4 一覧スクロール — anchor + fraction 方式
 
+**実装済み (Phase 2 一覧スクロール)**。`scroll_offset_y` は行境界の anchor のまま維持し、
+1 行未満の描画端数は main viewport の一時データに分離した。端数表示中の可視 / keep 終端は
+1 行拡張し、touch move / hold / release から prefetch・settle・idle-upgrade の時刻を明示更新する。
+タッチ由来の primary stream だけ native file D&D を抑止し、一覧 surface は 2 本目追加でも
+pinch へ昇格しない。
+
 **太いスクロールバーやページ送りゾーンだけでは「タッチで快適」とは言えない**。
 指で一覧を直接動かせることは必須。ただし `scroll_offset_y` をドラッグ中だけ自由値にするのは避ける
 (行スナップは仮想表示・サムネイル保持の前提になっており、読み手が多い)。

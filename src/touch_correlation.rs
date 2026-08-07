@@ -63,6 +63,13 @@ impl TouchFrame {
         self.touch_cancelled
     }
 
+    /// Whether this drive contains an exactly correlated touch-derived
+    /// primary stream. Grid cells use this provenance-only answer to disable
+    /// native file D&D without changing mouse-only input.
+    pub(crate) fn has_touch_derived_pointer_activity(&self) -> bool {
+        self.active || !self.primary_events.is_empty() || self.touch_cancelled
+    }
+
     /// Positions of primary releases whose exact egui-winit synthetic-pointer
     /// signature was correlated to raw touch input in this pass.
     ///
@@ -546,7 +553,7 @@ fn primary_button_matches(event: &Event, pos: Pos2, pressed: bool) -> bool {
     )
 }
 
-fn touch_gestures_disabled() -> bool {
+pub(crate) fn touch_gestures_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED.get_or_init(|| std::env::var_os("MIV_DISABLE_TOUCH_GESTURES").is_some())
 }
@@ -868,6 +875,8 @@ fn touch_command_name(command: &TouchCommand) -> &'static str {
         TouchCommand::OpenSidePanel { .. } => "OpenSidePanel",
         TouchCommand::Zoom { .. } => "Zoom",
         TouchCommand::Pan { .. } => "Pan",
+        TouchCommand::ScrollGrid { .. } => "ScrollGrid",
+        TouchCommand::ScrollGridEnd => "ScrollGridEnd",
         TouchCommand::PinchEnd => "PinchEnd",
     }
 }
@@ -923,6 +932,9 @@ mod tests {
         TapZoneGeometry {
             surface: Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 800.0)),
             excluded: Vec::new(),
+            behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                accepts_pinch: true,
+            },
         }
     }
 
@@ -1094,6 +1106,7 @@ mod tests {
         assert_eq!(frame.correlated_primary_release_positions().count(), 0);
         assert!(!frame.should_suppress_primary(pos, true));
         assert!(!frame.should_suppress_primary(pos, false));
+        assert!(!frame.has_touch_derived_pointer_activity());
     }
 
     #[test]
@@ -1126,6 +1139,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![pos]
         );
+        assert!(frame.has_touch_derived_pointer_activity());
     }
 
     #[test]
