@@ -306,6 +306,28 @@ egui-winit 0.33.3 は 1 回の `on_touch()` 呼び出しの中で、次の順序
 終了: Touch(End)   → PointerButton(Primary, released) → PointerGone
 ```
 
+ただし合成 pointer 列を出すかどうかは、`on_touch` の次の gate で接点ごとに決まる:
+
+```rust
+pointer_touch_id.is_none() || pointer_touch_id == Some(id)
+```
+
+gate が真なら phase ごとのミラー遷移と合成列は次のとおり。偽なら raw `Touch` だけで、
+その接点に合成 pointer 列は一切ない。
+
+| phase | `pointer_touch_id` の遷移 | `Touch` 直後の合成 pointer 列 |
+| --- | --- | --- |
+| `Start` | `Some(id)` にする | `PointerMoved` → primary press |
+| `Move` | 変更しない | `PointerMoved` |
+| `End` | `None` にする | primary release → `PointerGone` |
+| `Cancel` | `None` にする | `PointerGone` のみ。primary release は出ない |
+
+したがって 2 本目の `Start` は、1 本目が `pointer_touch_id` を保持している間は合成 pointer を
+伴わない。一方、pointer 接点だった指が先に `End` すると id が `None` になって gate が再び開く。
+その後も画面上に残っている 2 本目の `Move` は `PointerMoved` を出し、続く `End` は、その接点が
+primary press を一度も出していなくても primary release → `PointerGone` を出す。mIV の相関層は
+この再開放を含めて gate と 1 対 1 でミラーし、release を正当な期待列として相関する。
+
 `InputState::events` は raw event 列を順序どおり clone している
 (`egui-0.33.3/src/input_state/mod.rs:574`) ので、mIV からこの並びを観測できる。
 
@@ -354,7 +376,10 @@ egui-winit 0.33.3 の実装契約**なので、**依存更新時のイベント�
 
 2 段階に分ける:
 
-- **合成 primary pointer の所有**: 最初の接点の Start から、その接点の End/Cancel まで
+- **egui-winit の `pointer_touch_id` 保持**: gate が開いた `Start` でその id を保持し、
+  同じ id の `End` / `Cancel` で解放する。ただし解放後は別接点がまだ画面上に残っていても
+  gate が再び開き、その接点の `Move` / `End` も合成 pointer 列を出し得る。したがって
+  「先頭 1 接点だけが pointer をエミュレートする」ではない
 - **マルチタッチジェスチャの所有**: 最初の接点から、参加した全接点が End/Cancel するまで
 
 **2 本目が入った時点で pending の single tap を取り消し**、最初の指が先に離れても
