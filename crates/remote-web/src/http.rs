@@ -44,65 +44,7 @@ pub const MAX_CONCURRENT_PAGE_PREFETCH: usize = 1;
 pub const MAX_CONCURRENT_STREAM_IPC: usize = 4;
 const IPC_RETRY_AFTER_SECONDS: u64 = 1;
 
-#[cfg(feature = "embedded-web-assets")]
-static EMBEDDED_WEB_ASSETS: &[(&str, &[u8])] = &[
-    ("app.js", include_bytes!("../web/app.js")),
-    (
-        "command-core.mjs",
-        include_bytes!("../web/command-core.mjs"),
-    ),
-    (
-        "icons/icon-180.png",
-        include_bytes!("../web/icons/icon-180.png"),
-    ),
-    (
-        "icons/icon-192.png",
-        include_bytes!("../web/icons/icon-192.png"),
-    ),
-    (
-        "icons/icon-512.png",
-        include_bytes!("../web/icons/icon-512.png"),
-    ),
-    (
-        "icons/maskable-192.png",
-        include_bytes!("../web/icons/maskable-192.png"),
-    ),
-    (
-        "icons/maskable-512.png",
-        include_bytes!("../web/icons/maskable-512.png"),
-    ),
-    ("index.html", include_bytes!("../web/index.html")),
-    (
-        "local-settings.mjs",
-        include_bytes!("../web/local-settings.mjs"),
-    ),
-    (
-        "manifest.webmanifest",
-        include_bytes!("../web/manifest.webmanifest"),
-    ),
-    ("offline.html", include_bytes!("../web/offline.html")),
-    (
-        "service-worker.js",
-        include_bytes!("../web/service-worker.js"),
-    ),
-    ("styles.css", include_bytes!("../web/styles.css")),
-    (
-        "vendor/hls.LICENSE.txt",
-        include_bytes!("../web/vendor/hls.LICENSE.txt"),
-    ),
-    (
-        "vendor/hls.VERSION.txt",
-        include_bytes!("../web/vendor/hls.VERSION.txt"),
-    ),
-    (
-        "vendor/hls.min.js",
-        include_bytes!("../web/vendor/hls.min.js"),
-    ),
-    (
-        "video-stream.mjs",
-        include_bytes!("../web/video-stream.mjs"),
-    ),
-];
+include!(concat!(env!("OUT_DIR"), "/embedded_web_assets.rs"));
 
 pub struct AppState {
     pub auth: AuthService,
@@ -591,54 +533,17 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
         );
     }
     let remote_owner = remote_owner.as_ref();
+    let web_asset = web_asset_route_name(path);
     let response = match (method, path) {
-        (Method::Get, "/") => static_index(state),
-        (Method::Get, "/app.js") => static_file(state, "app.js", "text/javascript; charset=utf-8"),
-        (Method::Get, "/command-core.mjs") => {
-            static_file(state, "command-core.mjs", "text/javascript; charset=utf-8")
-        }
-        (Method::Get, "/local-settings.mjs") => static_file(
-            state,
-            "local-settings.mjs",
-            "text/javascript; charset=utf-8",
-        ),
-        (Method::Get, "/video-stream.mjs") => {
-            static_file(state, "video-stream.mjs", "text/javascript; charset=utf-8")
-        }
-        (Method::Get, "/vendor/hls.min.js") => {
-            static_file(state, "vendor/hls.min.js", "text/javascript; charset=utf-8")
-        }
-        (Method::Get, "/styles.css") => static_file(state, "styles.css", "text/css; charset=utf-8"),
-        (Method::Get, "/service-worker.js") => {
-            static_file(state, "service-worker.js", "text/javascript; charset=utf-8")
-        }
-        (Method::Get, "/offline.html") => {
-            static_file(state, "offline.html", "text/html; charset=utf-8")
-        }
-        (Method::Get, "/manifest.webmanifest") => static_file(
-            state,
-            "manifest.webmanifest",
-            "application/manifest+json; charset=utf-8",
-        ),
-        (Method::Get, "/icons/icon-180.png") => {
-            static_file(state, "icons/icon-180.png", "image/png")
-        }
+        (Method::Get, "/" | "/index.html") => static_index(state),
         (Method::Get, "/apple-touch-icon.png" | "/apple-touch-icon-precomposed.png") => {
-            static_file(state, "icons/icon-180.png", "image/png")
-        }
-        (Method::Get, "/icons/icon-192.png") => {
-            static_file(state, "icons/icon-192.png", "image/png")
-        }
-        (Method::Get, "/icons/icon-512.png") => {
-            static_file(state, "icons/icon-512.png", "image/png")
-        }
-        (Method::Get, "/icons/maskable-192.png") => {
-            static_file(state, "icons/maskable-192.png", "image/png")
-        }
-        (Method::Get, "/icons/maskable-512.png") => {
-            static_file(state, "icons/maskable-512.png", "image/png")
+            static_file(state, "icons/icon-180.png")
         }
         (Method::Get, "/favicon.ico") => HttpResponse::bytes(204, "image/x-icon", Vec::new()),
+        (Method::Get, _) if web_asset.is_some() => static_file(
+            state,
+            web_asset.expect("match guard checked the generated manifest"),
+        ),
         (Method::Get, "/api/auth/status") => api_auth_status(state, auth),
         (Method::Post, "/api/auth/pin") => api_auth_pin(request, state),
         (_, "/api/auth/status" | "/api/auth/pin") => {
@@ -1970,28 +1875,20 @@ fn unauthorized() -> HttpResponse {
 #[cfg(not(feature = "embedded-web-assets"))]
 fn web_asset_token(web_root: &std::path::Path) -> String {
     use std::hash::{Hash, Hasher};
-    let Ok(entries) = fs::read_dir(web_root) else {
-        return String::new();
-    };
-    let mut files: Vec<(String, u64, i64)> = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-        .filter_map(|entry| {
-            let metadata = entry.metadata().ok()?;
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |delta| delta.as_millis() as i64);
-            Some((
-                entry.file_name().to_string_lossy().into_owned(),
-                metadata.len(),
-                modified,
-            ))
+    let files: Vec<(&str, Option<(u64, i64)>)> = WEB_ASSET_PATHS
+        .iter()
+        .map(|asset| {
+            let metadata = fs::metadata(web_root.join(asset)).ok().map(|metadata| {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |delta| delta.as_millis() as i64);
+                (metadata.len(), modified)
+            });
+            (*asset, metadata)
         })
         .collect();
-    // read_dir order is not defined, so fix it before hashing.
-    files.sort();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     files.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -3372,6 +3269,17 @@ fn remote_source_kind(address: &RemoteAddress) -> &'static str {
     }
 }
 
+fn web_asset_route_name(path: &str) -> Option<&'static str> {
+    let name = path.strip_prefix('/')?;
+    if !crate::web_assets::is_distribution_asset(name) {
+        return None;
+    }
+    WEB_ASSET_PATHS
+        .binary_search(&name)
+        .ok()
+        .map(|index| WEB_ASSET_PATHS[index])
+}
+
 #[cfg(not(feature = "embedded-web-assets"))]
 fn load_web_asset(web_root: &std::path::Path, name: &str) -> Result<Vec<u8>, String> {
     fs::read(web_root.join(name)).map_err(|error| error.to_string())
@@ -3385,7 +3293,11 @@ fn load_web_asset(_web_root: &std::path::Path, name: &str) -> Result<Vec<u8>, St
         .ok_or_else(|| format!("embedded asset is missing: {name}"))
 }
 
-fn static_file(state: &AppState, name: &str, content_type: &'static str) -> HttpResponse {
+fn static_file(state: &AppState, name: &str) -> HttpResponse {
+    let Some(content_type) = crate::web_assets::content_type(name) else {
+        eprintln!("remote-web: static asset {name} has no Content-Type mapping");
+        return HttpResponse::text(500, "Internal Server Error");
+    };
     match load_web_asset(&state.web_root, name) {
         Ok(bytes) => {
             HttpResponse::bytes(200, content_type, bytes).with_header("Cache-Control", "no-cache")
@@ -3781,87 +3693,36 @@ mod tests {
 
     #[cfg(not(feature = "embedded-web-assets"))]
     #[test]
-    fn pwa_shell_assets_are_public_before_and_after_authentication() {
+    fn generated_web_assets_are_public_before_and_after_authentication() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_state(&temp);
-        std::fs::create_dir_all(temp.path().join("icons")).unwrap();
-        let assets = [
-            (
-                "/service-worker.js",
-                "service-worker.js",
-                "text/javascript; charset=utf-8",
-                b"self.addEventListener('fetch', () => {});".as_slice(),
-            ),
-            (
-                "/offline.html",
-                "offline.html",
-                "text/html; charset=utf-8",
-                b"<!doctype html><title>offline</title>".as_slice(),
-            ),
-            (
-                "/manifest.webmanifest",
-                "manifest.webmanifest",
-                "application/manifest+json; charset=utf-8",
-                b"{\"name\":\"mIV Remote\"}".as_slice(),
-            ),
-            (
-                "/icons/icon-180.png",
-                "icons/icon-180.png",
-                "image/png",
-                b"png-180".as_slice(),
-            ),
-            (
-                "/apple-touch-icon.png",
-                "icons/icon-180.png",
-                "image/png",
-                b"png-180".as_slice(),
-            ),
-            (
-                "/apple-touch-icon-precomposed.png",
-                "icons/icon-180.png",
-                "image/png",
-                b"png-180".as_slice(),
-            ),
-            (
-                "/icons/icon-192.png",
-                "icons/icon-192.png",
-                "image/png",
-                b"png-192".as_slice(),
-            ),
-            (
-                "/icons/icon-512.png",
-                "icons/icon-512.png",
-                "image/png",
-                b"png-512".as_slice(),
-            ),
-            (
-                "/icons/maskable-192.png",
-                "icons/maskable-192.png",
-                "image/png",
-                b"maskable-192".as_slice(),
-            ),
-            (
-                "/icons/maskable-512.png",
-                "icons/maskable-512.png",
-                "image/png",
-                b"maskable-512".as_slice(),
-            ),
-        ];
-        for (_, file, _, body) in assets {
-            std::fs::write(temp.path().join(file), body).unwrap();
+        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web");
+        for asset in WEB_ASSET_PATHS {
+            let destination = temp.path().join(asset);
+            std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            std::fs::copy(source_root.join(asset), destination).unwrap();
         }
 
         for authenticated in [false, true] {
-            for (path, _, expected_content_type, expected_body) in assets {
-                let mut request = TestRequest::new().with_method(Method::Get).with_path(path);
+            for asset in WEB_ASSET_PATHS {
+                let path = if *asset == "index.html" {
+                    "/".to_owned()
+                } else {
+                    format!("/{asset}")
+                };
+                let mut request = TestRequest::new().with_method(Method::Get).with_path(&path);
                 if authenticated {
                     request = request.with_header(cookie_header(&state));
                 }
                 let mut request: Request = request.into();
                 let response = route(&mut request, &state);
                 assert_eq!(response.status, 200, "{path} authenticated={authenticated}");
-                assert_eq!(response.content_type, expected_content_type);
-                assert_eq!(response.body, expected_body);
+                assert_eq!(
+                    response.content_type,
+                    crate::web_assets::content_type(asset).unwrap(),
+                    "{path}"
+                );
+                assert!(!response.body.is_empty(), "{path}");
                 assert!(
                     response
                         .headers
@@ -3869,6 +3730,18 @@ mod tests {
                         .any(|(name, value)| { *name == "Cache-Control" && value == "no-cache" })
                 );
             }
+        }
+
+        for alias in [
+            "/index.html",
+            "/apple-touch-icon.png",
+            "/apple-touch-icon-precomposed.png",
+        ] {
+            let mut request: Request = TestRequest::new()
+                .with_method(Method::Get)
+                .with_path(alias)
+                .into();
+            assert_eq!(route(&mut request, &state).status, 200, "{alias}");
         }
 
         let mut protected_request: Request = TestRequest::new()
@@ -3883,34 +3756,30 @@ mod tests {
     fn distribution_serves_the_complete_embedded_shell_without_a_web_directory() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_state(&temp);
-        let routes = [
-            ("/", "text/html; charset=utf-8"),
-            ("/app.js", "text/javascript; charset=utf-8"),
-            ("/command-core.mjs", "text/javascript; charset=utf-8"),
-            ("/local-settings.mjs", "text/javascript; charset=utf-8"),
-            ("/video-stream.mjs", "text/javascript; charset=utf-8"),
-            ("/vendor/hls.min.js", "text/javascript; charset=utf-8"),
-            ("/styles.css", "text/css; charset=utf-8"),
-            ("/service-worker.js", "text/javascript; charset=utf-8"),
-            ("/offline.html", "text/html; charset=utf-8"),
-            (
-                "/manifest.webmanifest",
-                "application/manifest+json; charset=utf-8",
-            ),
-            ("/icons/icon-180.png", "image/png"),
-            ("/icons/icon-192.png", "image/png"),
-            ("/icons/icon-512.png", "image/png"),
-            ("/icons/maskable-192.png", "image/png"),
-            ("/icons/maskable-512.png", "image/png"),
-        ];
-        for (path, expected_content_type) in routes {
+        assert_eq!(
+            EMBEDDED_WEB_ASSETS
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            WEB_ASSET_PATHS
+        );
+        for asset in WEB_ASSET_PATHS {
+            let path = if *asset == "index.html" {
+                "/".to_owned()
+            } else {
+                format!("/{asset}")
+            };
             let mut request: Request = TestRequest::new()
                 .with_method(Method::Get)
-                .with_path(path)
+                .with_path(&path)
                 .into();
             let response = route(&mut request, &state);
             assert_eq!(response.status, 200, "{path}");
-            assert_eq!(response.content_type, expected_content_type, "{path}");
+            assert_eq!(
+                response.content_type,
+                crate::web_assets::content_type(asset).unwrap(),
+                "{path}"
+            );
             assert!(!response.body.is_empty(), "{path}");
         }
 
@@ -3924,11 +3793,6 @@ mod tests {
         let index = String::from_utf8(index.body).unwrap();
         assert!(index.contains(&format!(r#"content="{token}""#)));
         assert!(!index.contains(WEB_ASSET_TOKEN_PLACEHOLDER));
-        assert!(
-            EMBEDDED_WEB_ASSETS
-                .iter()
-                .any(|(name, _)| *name == "vendor/hls.LICENSE.txt")
-        );
     }
 
     #[test]
@@ -4140,13 +4004,19 @@ mod tests {
         );
 
         std::fs::write(state.web_root.join("app.js"), b"const build = 2222;").unwrap();
-        assert_ne!(before, web_asset_token(&state.web_root));
+        let after_top_level_change = web_asset_token(&state.web_root);
+        assert_ne!(before, after_top_level_change);
 
-        std::fs::write(state.web_root.join("later.mjs"), b"export {};").unwrap();
+        std::fs::create_dir(state.web_root.join("vendor")).unwrap();
+        std::fs::write(
+            state.web_root.join("vendor").join("hls.VERSION.txt"),
+            b"1.0",
+        )
+        .unwrap();
         assert_ne!(
             web_asset_token(&state.web_root),
-            before,
-            "a new asset counts as a deploy too"
+            after_top_level_change,
+            "a nested generated asset must participate in the running version"
         );
 
         let expected_shell_token = web_asset_token(&state.web_root);

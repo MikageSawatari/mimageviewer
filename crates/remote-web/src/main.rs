@@ -8,6 +8,7 @@ mod image_support;
 mod ipc_client;
 mod path_guard;
 mod store;
+mod web_assets;
 
 use std::io::Write as _;
 use std::net::SocketAddr;

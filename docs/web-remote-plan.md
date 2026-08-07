@@ -1364,6 +1364,14 @@ PWA 資産とライセンスを remote exe に内包し、filesystem 上の web 
 dev-runtime と `restart-remote-web.ps1` は feature を付けず、従来どおり source tree を直接配信して
 フロント変更の hot reload を維持する。
 
+内包一覧と公開静的 route の正本は `remote-web/build.rs` が `web/` を再帰走査して生成する。
+通常ファイルを対象に、Node テストの `*.test.mjs`、`package.json` / `package-lock.json`、
+開発専用 source map の `*.map` だけを除外する。HLS の LICENSE / VERSION は配布追跡情報として
+残す。生成 manifest は disk 配信、埋め込み配信、asset token の全てで共有し、Content-Type は
+`src/web_assets.rs` の拡張子表だけを正本とする。未知拡張子は build error にして暗黙の
+binary 配信を許さない。`cargo:rerun-if-changed=web` によりファイルの追加・削除・更新でも
+manifest と埋め込みを再生成する。
+
 署名順は vendor PE → core + remote → launcher → installer。remote は launcher に埋め込む前に署名し、
 portable は `mimageviewer.exe` の隣へ Web 資産内包 remote を loose 配置して、package copy を署名する。
 distribution clean は通常 target / portable target の両方で `mimageviewer-remote` package も消し、
