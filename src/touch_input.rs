@@ -58,8 +58,8 @@ pub(crate) struct TapZoneGeometry {
     /// Chrome rectangles actually visible in the current frame.
     pub excluded: Vec<Rect>,
     /// Gesture capabilities differ by surface: the grid owns one-finger
-    /// drags for scrolling and never upgrades them to pinch, while still
-    /// viewers keep their existing pointer-pan-to-pinch upgrade.
+    /// drags for scrolling but may upgrade them to pinch, while viewers can
+    /// independently opt in to their existing pointer-pan-to-pinch upgrade.
     pub behavior: TouchSurfaceBehavior,
 }
 
@@ -73,9 +73,10 @@ impl TouchSurfaceBehavior {
     fn accepts_pinch(self) -> bool {
         matches!(
             self,
-            Self::Viewer {
-                accepts_pinch: true
-            }
+            Self::Grid
+                | Self::Viewer {
+                    accepts_pinch: true
+                }
         )
     }
 }
@@ -159,8 +160,9 @@ pub(crate) enum TouchCommand {
     ScrollGrid {
         delta_y: f32,
     },
-    /// The last contact in a grid-scroll stream has ended. The caller snaps
-    /// the fractional drawing remainder to the nearest row at this boundary.
+    /// A grid-scroll stream ended because its last contact left or pinch took
+    /// ownership. The caller settles the fractional drawing remainder at this
+    /// boundary.
     ScrollGridEnd,
     /// The last contact participating in a pinch has ended. Consumers use
     /// this boundary for work that must not run for every gesture sample,
@@ -298,6 +300,7 @@ impl TouchRecognizer {
         }
         self.contacts.push(Contact::new(sample, geom.surface));
 
+        let mut commands = Vec::new();
         if self.contacts.len() >= PINCH_CONTACT_COUNT && geom.behavior.accepts_pinch() {
             match self.owner {
                 TouchOwner::Undecided | TouchOwner::ViewerPointerPassthrough => self.begin_pinch(),
@@ -307,18 +310,25 @@ impl TouchRecognizer {
                     // choice when Step 3b wires the edge-swipe action.
                     self.begin_pinch();
                 }
+                TouchOwner::GridScroll => {
+                    // Pinch takes exclusive ownership from this point. End the
+                    // fractional grid drag at the ownership boundary so the
+                    // caller can settle it before interpreting Zoom samples.
+                    self.begin_pinch();
+                    commands.push(TouchCommand::ScrollGridEnd);
+                }
                 TouchOwner::Pinch => self.rebase_pinch(),
                 TouchOwner::WidgetPassthrough
-                | TouchOwner::GridScroll
                 | TouchOwner::ViewerTapZone
                 | TouchOwner::Cancelled => {}
             }
         }
-        Vec::new()
+        commands
     }
 
     fn begin_pinch(&mut self) {
         self.owner = TouchOwner::Pinch;
+        self.grid_scroll_contact_id = None;
         self.suppress_primary = true;
         self.rebase_pinch();
     }
@@ -989,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn grid_scroll_never_upgrades_to_pinch_when_a_contact_is_added() {
+    fn grid_scroll_upgrades_to_pinch_and_stops_emitting_scroll() {
         let geometry = grid_geom();
         let mut recognizer = TouchRecognizer::new();
         recognizer.handle_sample(&geometry, sample(1, 500.0, 400.0, TouchPhase::Start, 0));
@@ -998,28 +1008,34 @@ mod tests {
             vec![TouchCommand::ScrollGrid { delta_y: -20.0 }]
         );
 
-        assert!(
-            recognizer
-                .handle_sample(&geometry, sample(2, 600.0, 400.0, TouchPhase::Start, 20))
-                .is_empty()
+        assert_eq!(
+            recognizer.handle_sample(&geometry, sample(2, 600.0, 400.0, TouchPhase::Start, 20)),
+            vec![TouchCommand::ScrollGridEnd]
         );
-        assert_eq!(recognizer.owner(), TouchOwner::GridScroll);
+        assert_eq!(recognizer.owner(), TouchOwner::Pinch);
+        let pinch_commands =
+            recognizer.handle_sample(&geometry, sample(2, 650.0, 360.0, TouchPhase::Move, 30));
         assert!(
-            recognizer
-                .handle_sample(&geometry, sample(2, 600.0, 360.0, TouchPhase::Move, 30))
-                .is_empty()
+            pinch_commands
+                .iter()
+                .any(|command| matches!(command, TouchCommand::Zoom { .. }))
         );
-        assert_eq!(recognizer.owner(), TouchOwner::GridScroll);
+        assert!(
+            pinch_commands
+                .iter()
+                .all(|command| !matches!(command, TouchCommand::ScrollGrid { .. }))
+        );
+        assert_eq!(recognizer.owner(), TouchOwner::Pinch);
 
         assert!(
             recognizer
                 .handle_sample(&geometry, sample(1, 500.0, 380.0, TouchPhase::End, 40))
                 .is_empty()
         );
-        assert_eq!(recognizer.owner(), TouchOwner::GridScroll);
+        assert_eq!(recognizer.owner(), TouchOwner::Pinch);
         assert_eq!(
-            recognizer.handle_sample(&geometry, sample(2, 600.0, 360.0, TouchPhase::End, 50)),
-            vec![TouchCommand::ScrollGridEnd]
+            recognizer.handle_sample(&geometry, sample(2, 650.0, 360.0, TouchPhase::End, 50)),
+            vec![TouchCommand::PinchEnd]
         );
     }
 }

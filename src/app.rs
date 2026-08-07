@@ -33510,6 +33510,23 @@ impl App {
         })
     }
 
+    /// Applies one discrete grid-column change without choosing a persistence
+    /// boundary. Mouse wheel saves immediately; touch pinch batches its save
+    /// until the recognizer reports the end of the gesture.
+    pub(crate) fn change_grid_cols_by(&mut self, delta: i32) -> bool {
+        let new_cols = (self.settings.grid_cols as i32 + delta).clamp(
+            crate::settings::MIN_GRID_COLS as i32,
+            crate::settings::MAX_GRID_COLS as i32,
+        ) as usize;
+        if new_cols == self.settings.grid_cols {
+            return false;
+        }
+
+        self.settings.grid_cols = new_cols;
+        self.bump_input_seq("grid_cols", None);
+        true
+    }
+
     fn process_scroll(&mut self, ctx: &egui::Context) {
         // ダイアログ / popup / フルスクリーン表示中はスクロールを消費しない
         // (ダイアログや ComboBox popup 内の ScrollArea が正しく動くようにする)。
@@ -33545,14 +33562,8 @@ impl App {
             if ctrl {
                 // Ctrl+ホイール: 列数を増減（1〜10 の範囲）
                 let delta = -scroll_delta_y.signum() as i32;
-                let new_cols = (self.settings.grid_cols as i32 + delta).clamp(
-                    crate::settings::MIN_GRID_COLS as i32,
-                    crate::settings::MAX_GRID_COLS as i32,
-                ) as usize;
-                if new_cols != self.settings.grid_cols {
-                    self.settings.grid_cols = new_cols;
+                if self.change_grid_cols_by(delta) {
                     self.settings.save();
-                    self.bump_input_seq("grid_cols", None);
                 }
             } else {
                 // 上スクロール(delta>0) → オフセット減、下スクロール(delta<0) → オフセット増
