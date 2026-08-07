@@ -513,6 +513,15 @@ export function latestPageLoadRequestPlan(
   };
 }
 
+export function pageLoadQueueBusyTransition(previousBusy, currentBusy) {
+  const previous = Boolean(previousBusy);
+  const current = Boolean(currentBusy);
+  return {
+    busy: current,
+    action: previous === current ? "unchanged" : current ? "start" : "stop",
+  };
+}
+
 export const ViewerGesture = Object.freeze({
   TAP: "tap",
   SWIPE_LEFT: "swipe_left",
@@ -1555,6 +1564,65 @@ export function viewerSeekState({
     groupIndex,
     direction: rtl ? ReadingDirection.RTL : ReadingDirection.LTR,
     label: `${pageLabel || groupIndex + 1} / ${total}`,
+  };
+}
+
+export const ViewerPagePositionEvent = Object.freeze({
+  REQUEST: "request",
+  DISPLAY: "display",
+  DISCARD: "discard",
+});
+
+/// Requested and displayed positions remain two concrete values. UI feedback is
+/// always derived from the requested position; only an explicit discard rewinds it.
+export function viewerPagePositionTransition(
+  { requestedGroupIndex, displayedGroupIndex },
+  { type, groupIndex } = {}
+) {
+  let requested = requestedGroupIndex;
+  let displayed = displayedGroupIndex;
+  if (!Number.isInteger(requested) || requested < 0) {
+    throw new RangeError("requestedGroupIndex must be a non-negative integer");
+  }
+  if (!Number.isInteger(displayed) || displayed < 0) {
+    throw new RangeError("displayedGroupIndex must be a non-negative integer");
+  }
+  if (type === ViewerPagePositionEvent.REQUEST) {
+    requested = groupIndex;
+  } else if (type === ViewerPagePositionEvent.DISPLAY) {
+    displayed = groupIndex;
+  } else if (type === ViewerPagePositionEvent.DISCARD) {
+    if (!Number.isInteger(groupIndex) || groupIndex < 0) {
+      throw new RangeError("discard groupIndex must be a non-negative integer");
+    }
+    if (requested === groupIndex) requested = displayed;
+  } else {
+    throw new TypeError("unknown viewer page position event");
+  }
+  if (!Number.isInteger(requested) || requested < 0) {
+    throw new RangeError("groupIndex must be a non-negative integer");
+  }
+  if (!Number.isInteger(displayed) || displayed < 0) {
+    throw new RangeError("groupIndex must be a non-negative integer");
+  }
+  return { requestedGroupIndex: requested, displayedGroupIndex: displayed };
+}
+
+export function viewerPagePositionFeedback({
+  requestedGroupIndex,
+  displayedGroupIndex,
+}) {
+  const requested = requestedGroupIndex;
+  const displayed = displayedGroupIndex;
+  if (!Number.isInteger(requested) || requested < 0) {
+    throw new RangeError("requestedGroupIndex must be a non-negative integer");
+  }
+  if (!Number.isInteger(displayed) || displayed < 0) {
+    throw new RangeError("displayedGroupIndex must be a non-negative integer");
+  }
+  return {
+    groupIndex: requested,
+    pending: requested !== displayed,
   };
 }
 

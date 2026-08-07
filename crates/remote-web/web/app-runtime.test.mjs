@@ -99,6 +99,8 @@ const {
   ADJUSTMENT_PANEL_TABS,
   ImageViewer,
   LatestOnlyTaskQueue,
+  LatestPageLoadQueue,
+  RemoteAiController,
   ViewerAdjustmentPanel,
   VIEWER_MENU_MAX_ACTIONS,
   VIEWER_PANEL_TABS,
@@ -541,6 +543,39 @@ test("adjustment preview keeps one request in flight and coalesces to the latest
   assert.equal(maxActive, 1);
 });
 
+test("page load queue emits one busy interval across pending replacements", async () => {
+  const started = [];
+  const busy = [];
+  const events = [];
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const queue = new LatestPageLoadQueue(
+    async (value) => {
+      started.push(value);
+      events.push(`run:${value}`);
+      if (value === 1) await firstGate;
+      return true;
+    },
+    () => {},
+    (value) => {
+      busy.push(value);
+      events.push(`busy:${value}`);
+    }
+  );
+
+  const first = queue.request(1);
+  const second = queue.request(2);
+  const third = queue.request(3);
+  assert.deepEqual(started, [1]);
+  assert.deepEqual(busy, [true]);
+  assert.deepEqual(events, ["busy:true", "run:1"]);
+  releaseFirst();
+  assert.deepEqual(await Promise.all([first, second, third]), [false, false, true]);
+  assert.deepEqual(started, [1, 3]);
+  assert.deepEqual(busy, [true, false]);
+  assert.deepEqual(events, ["busy:true", "run:1", "run:3", "busy:false"]);
+});
+
 test("remote adjustment normalization keeps valid local slider defaults and bounds", () => {
   assert.deepEqual(normalizeRemoteAdjustmentValues(), {
     brightness: 0,
@@ -930,18 +965,46 @@ test("rapid page loads finish the active request and start only the latest pendi
     const second = load(2);
     const third = load(3);
     assert.deepEqual(requested, [1]);
-    assert.equal(title.textContent, "Displayed page");
-    assert.equal(counter.textContent, "0 / 3");
+    assert.equal(title.textContent, "Page 3");
+    assert.equal(counter.textContent, "3 / 3");
+    assert.equal(counter.classList.contains("is-pending"), true);
     releaseFirst();
     assert.deepEqual(await Promise.all([first, second, third]), [false, false, true]);
     assert.deepEqual(requested, [1, 3]);
     assert.equal(maximumActiveFetches, 1);
     assert.equal(title.textContent, "Page 3");
     assert.equal(counter.textContent, "3 / 3");
+    assert.equal(counter.classList.contains("is-pending"), false);
   } finally {
     globalThis.fetch = imageFetch;
     viewer.destroy();
   }
+});
+
+test("AI status stays compact until tapped and keeps errors readable", () => {
+  const viewerRoot = new FakeElement("section");
+  const controller = new RemoteAiController(
+    { root: viewerRoot },
+    new FakeElement("div"),
+    () => () => {}
+  );
+  controller.show("拡大しています · 進み具合 3 / 8", { cancellable: true });
+  assert.equal(controller.toggleButton.textContent, "AI 処理中");
+  assert.equal(controller.details.hidden, true);
+  assert.equal(controller.cancelButton.hidden, false);
+
+  controller.toggleButton.dispatchEvent({
+    type: "click",
+    stopPropagation() {},
+  });
+  assert.equal(controller.details.hidden, false);
+  assert.equal(controller.message.textContent, "拡大しています · 進み具合 3 / 8");
+
+  controller.showRequestError(new Error("network"));
+  assert.equal(controller.root.classList.contains("is-error"), true);
+  assert.equal(controller.toggleButton.hidden, true);
+  assert.equal(controller.details.hidden, false);
+  assert.equal(controller.message.textContent, "AI 処理を開始できませんでした。");
 });
 
 test("viewer refuses a page response without a generation attestation", async () => {

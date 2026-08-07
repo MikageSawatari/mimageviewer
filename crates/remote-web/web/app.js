@@ -23,6 +23,7 @@ import {
   imageQualityPreset,
   isRtlReadingDirection,
   latestPageLoadRequestPlan,
+  pageLoadQueueBusyTransition,
   nextFitMode,
   nextSpreadMode,
   normalizeVisualViewportScale,
@@ -68,6 +69,9 @@ import {
   viewerLayoutTelemetry,
   viewerPageDisplaySlot,
   viewerPageGroupGenerationSnapshot,
+  ViewerPagePositionEvent,
+  viewerPagePositionFeedback,
+  viewerPagePositionTransition,
   viewerPostDisplayRefreshPlan,
   viewerSpreadPartnerIndex,
   viewerBoundaryMessage,
@@ -217,15 +221,26 @@ export class LatestOnlyTaskQueue {
 
 /// 前景ページ描画専用。実行中の core IPC は完了させ、待機中は最新のページ群だけを残す。
 export class LatestPageLoadQueue {
-  constructor(run, onSupersede = () => {}) {
+  constructor(run, onSupersede = () => {}, onBusyChange = () => {}) {
     this.run = run;
     this.onSupersede = onSupersede;
+    this.onBusyChange = onBusyChange;
     this.active = null;
     this.pending = null;
   }
 
+  isBusy() {
+    return this.active !== null || this.pending !== null;
+  }
+
+  notifyBusyTransition(previousBusy) {
+    const transition = pageLoadQueueBusyTransition(previousBusy, this.isBusy());
+    if (transition.action !== "unchanged") this.onBusyChange(transition.busy);
+  }
+
   request(value) {
     return new Promise((resolve, reject) => {
+      const wasBusy = this.isBusy();
       const incoming = { value, resolve, reject, superseded: false };
       const plan = latestPageLoadRequestPlan(
         { active: this.active, pending: this.pending },
@@ -240,21 +255,24 @@ export class LatestPageLoadQueue {
         this.active.superseded = true;
         this.onSupersede();
       }
-      if (plan.start) this.start(plan.start);
+      if (plan.start) this.active = plan.start;
+      this.notifyBusyTransition(wasBusy);
+      if (plan.start) this.runActive(plan.start);
     });
   }
 
   clear() {
+    const wasBusy = this.isBusy();
     if (this.pending) {
       this.pending.superseded = true;
       this.pending.resolve(false);
       this.pending = null;
     }
     if (this.active) this.active.superseded = true;
+    this.notifyBusyTransition(wasBusy);
   }
 
-  async start(ticket) {
-    this.active = ticket;
+  async runActive(ticket) {
     try {
       const result = await this.run(ticket.value);
       ticket.resolve(ticket.superseded ? false : result);
@@ -262,10 +280,13 @@ export class LatestPageLoadQueue {
       if (ticket.superseded) ticket.resolve(false);
       else ticket.reject(error);
     } finally {
+      const wasBusy = this.isBusy();
       if (this.active === ticket) this.active = null;
       const next = this.pending;
       this.pending = null;
-      if (next) this.start(next);
+      if (next) this.active = next;
+      this.notifyBusyTransition(wasBusy);
+      if (next) this.runActive(next);
     }
   }
 }
@@ -2527,6 +2548,78 @@ function viewerSeekSnapshot(groupIndex = state.pageGroupIndex) {
   });
 }
 
+function viewerPagePresentation(groupIndex = state.pageGroupIndex) {
+  const group = state.pageGroups[groupIndex];
+  if (!group) return null;
+  return {
+    name: group.entries.map((entry) => entry.name).join(" / "),
+    seekState: viewerSeekSnapshot(groupIndex),
+  };
+}
+
+function updateRequestedPageGroup(groupIndex) {
+  const viewer = state.viewer;
+  const group = state.pageGroups[groupIndex];
+  const displayedGroupIndex = viewer?.displayedGroupIndex();
+  if (!group || !Number.isInteger(displayedGroupIndex)) return false;
+  const position = viewerPagePositionTransition(
+    {
+      requestedGroupIndex: state.pageGroupIndex,
+      displayedGroupIndex,
+    },
+    { type: ViewerPagePositionEvent.REQUEST, groupIndex }
+  );
+  if (position.requestedGroupIndex === state.pageGroupIndex) {
+    viewer.restoreRequestedPagePresentation();
+    return false;
+  }
+  viewer.hideBoundaryMessage();
+  state.pageDirection =
+    position.requestedGroupIndex > state.pageGroupIndex ? 1 : -1;
+  state.pageGroupIndex = position.requestedGroupIndex;
+  const entry = group.anchor;
+  updateGridReturnTargetItem(entry);
+  state.imageIndex = state.images.findIndex(
+    (image) => entryIdentity(image) === entryIdentity(entry)
+  );
+  const presentation = viewerPagePresentation(position.requestedGroupIndex);
+  viewer.setRequestedPagePresentation(presentation);
+  document.title = `${entry.name} — mIV Remote`;
+  return true;
+}
+
+function discardRequestedPageGroup(viewer, requestedGroupIndex) {
+  if (
+    state.viewer !== viewer ||
+    state.pageGroupIndex !== requestedGroupIndex
+  ) return false;
+  const displayedGroupIndex = viewer.displayedGroupIndex();
+  if (!Number.isInteger(displayedGroupIndex)) return false;
+  const position = viewerPagePositionTransition(
+    {
+      requestedGroupIndex: state.pageGroupIndex,
+      displayedGroupIndex,
+    },
+    { type: ViewerPagePositionEvent.DISCARD, groupIndex: requestedGroupIndex }
+  );
+  if (!state.pageGroups[position.requestedGroupIndex]) return false;
+  if (position.requestedGroupIndex !== state.pageGroupIndex) {
+    state.pageDirection =
+      position.requestedGroupIndex > state.pageGroupIndex ? 1 : -1;
+    state.pageGroupIndex = position.requestedGroupIndex;
+    const entry = state.pageGroups[position.requestedGroupIndex].anchor;
+    updateGridReturnTargetItem(entry);
+    state.imageIndex = state.images.findIndex(
+      (image) => entryIdentity(image) === entryIdentity(entry)
+    );
+    document.title = `${entry.name} — mIV Remote`;
+  }
+  viewer.setRequestedPagePresentation(
+    viewerPagePresentation(position.requestedGroupIndex)
+  );
+  return true;
+}
+
 let spreadWriteTail = Promise.resolve();
 let spreadWriteSequence = 0;
 let readingProgressBatch = createReadingProgressBatch();
@@ -3656,6 +3749,7 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
     loadingIndicator,
     boundaryMessage,
   });
+  state.viewer.initializePagePresentation(viewerPagePresentation(groupIndex));
   state.remoteAiController = new RemoteAiController(
     state.viewer,
     stage,
@@ -3695,17 +3789,22 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   };
   const commitSeekGroup = (groupIndex, reason) => {
     const viewer = state.viewer;
-    viewer?.restoreDisplayedSeekState();
+    if (!viewer || !updateRequestedPageGroup(groupIndex)) return;
     const sequence = ++seekCommitSequence;
     acquireRemoteSession(reason).then((acquired) => {
-      if (!acquired) return;
+      if (!acquired) {
+        if (sequence === seekCommitSequence) {
+          discardRequestedPageGroup(viewer, groupIndex);
+        }
+        return;
+      }
       if (sequence !== seekCommitSequence || state.viewer !== viewer) return;
-      if (!changeImageTo(groupIndex)) {
-        state.viewer?.restoreDisplayedSeekState();
+      if (!commitRequestedPageGroup(groupIndex)) {
+        discardRequestedPageGroup(viewer, groupIndex);
       }
     }).catch(() => {
       if (sequence === seekCommitSequence && state.viewer === viewer) {
-        state.viewer?.restoreDisplayedSeekState();
+        discardRequestedPageGroup(viewer, groupIndex);
       }
     });
   };
@@ -3795,7 +3894,7 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
     }
     seekPointerDrag = null;
     if (gesture.kind === "cancel") {
-      state.viewer?.restoreDisplayedSeekState();
+      state.viewer?.restoreRequestedPagePresentation();
     } else if (gesture.kind === "tap") {
       const groupIndex = previewSeekGroup(seekRangeAbsoluteValue({
         clientX: drag.startClientX,
@@ -3857,13 +3956,14 @@ function changeImageTo(nextGroupIndex) {
   }
   if (nextGroupIndex === state.pageGroupIndex) return false;
   state.viewer?.hideBoundaryMessage();
-  state.pageDirection = nextGroupIndex > state.pageGroupIndex ? 1 : -1;
-  state.pageGroupIndex = nextGroupIndex;
-  const entry = state.pageGroups[nextGroupIndex].anchor;
-  updateGridReturnTargetItem(entry);
-  state.imageIndex = state.images.findIndex(
-    (image) => entryIdentity(image) === entryIdentity(entry)
-  );
+  if (!updateRequestedPageGroup(nextGroupIndex)) return false;
+  return commitRequestedPageGroup(nextGroupIndex);
+}
+
+function commitRequestedPageGroup(groupIndex) {
+  const group = state.pageGroups[groupIndex];
+  if (!group || state.pageGroupIndex !== groupIndex) return false;
+  const entry = group.anchor;
   const viewerDepth = (Number(history.state?.viewerDepth) || 0) + 1;
   const targetHash = entry.address
     ? mediaHash(entry.address)
@@ -7394,6 +7494,14 @@ const REMOTE_AI_PHASE_LABELS = Object.freeze({
   cancelling: "取り消しています",
 });
 
+/// 縮小表示の短いラベル。詳細文言とは別に持ち、呼び出し側が状態から選ぶ。
+export const RemoteAiShortLabel = Object.freeze({
+  WORKING: "AI 処理中",
+  CONNECTING: "AI 接続確認中",
+  CANCELLING: "AI 取消中",
+  DONE: "AI 完了",
+});
+
 export function remoteAiProgressText(snapshot) {
   const progress = snapshot?.progress;
   if (!progress) return "AI 処理を進めています";
@@ -7480,6 +7588,7 @@ export class RemoteAiController {
     this.hideTimer = 0;
     this.retryIndex = 0;
     this.destroyed = false;
+    this.expanded = false;
     this.remoteSessionState = { blocksInteraction: false };
     this.unsubscribeRemoteSessionState = () => {};
 
@@ -7487,14 +7596,29 @@ export class RemoteAiController {
     this.root.hidden = true;
     this.root.setAttribute("role", "status");
     this.root.setAttribute("aria-live", "polite");
-    this.message = textElement("span", "");
+    this.toggleButton = textElement(
+      "button",
+      "AI 処理中",
+      "viewer-ai-status-toggle"
+    );
+    this.toggleButton.type = "button";
+    this.toggleButton.setAttribute("aria-label", "AI 処理の詳細を表示");
+    this.toggleButton.setAttribute("aria-expanded", "false");
+    this.toggleButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      this.setExpanded(!this.expanded);
+    });
+    this.details = element("div", "viewer-ai-status-details");
+    this.details.hidden = true;
+    this.message = textElement("span", "", "viewer-ai-status-message");
     this.cancelButton = textElement("button", "取り消す");
     this.cancelButton.type = "button";
     this.cancelButton.addEventListener("click", (event) => {
       event.stopPropagation();
       this.cancel().catch((error) => this.showRequestError(error));
     });
-    this.root.append(this.message, this.cancelButton);
+    this.details.append(this.message, this.cancelButton);
+    this.root.append(this.toggleButton, this.details);
     viewer.root.append(this.root);
     this.unsubscribeRemoteSessionState = subscribeRemoteSessionState((snapshot) => {
       this.remoteSessionState = snapshot ?? { blocksInteraction: false };
@@ -7602,7 +7726,10 @@ export class RemoteAiController {
       error instanceof AuthenticationRequiredError ||
       this.remoteSessionState.blocksInteraction
     ) return;
-    this.show("接続を確認しています", { cancellable: Boolean(this.job) });
+    this.show("接続を確認しています", {
+      cancellable: Boolean(this.job),
+      shortLabel: RemoteAiShortLabel.CONNECTING,
+    });
     const delay = remoteAiPollingDelay({
       visibilityState: document.visibilityState,
       terminal: false,
@@ -7631,7 +7758,11 @@ export class RemoteAiController {
       return;
     }
     const message = snapshot.terminal?.message || "AI 処理を完了できませんでした。";
-    this.show(message, { error: snapshot.state === "failed", cancellable: false });
+    this.show(message, {
+      error: snapshot.state === "failed",
+      cancellable: false,
+      shortLabel: RemoteAiShortLabel.DONE,
+    });
   }
 
   async applyReady(snapshot, generation) {
@@ -7651,7 +7782,11 @@ export class RemoteAiController {
     }
     const appliedIdentity = `${snapshot.job_id}:${this.displayVersion}`;
     if (this.appliedIdentity === appliedIdentity) {
-      this.show(completionMessage, { cancellable: false, hideAfterMs: 2400 });
+      this.show(completionMessage, {
+        cancellable: false,
+        hideAfterMs: 2400,
+        shortLabel: RemoteAiShortLabel.DONE,
+      });
       return;
     }
     this.show("表示を整えています", { cancellable: false });
@@ -7674,13 +7809,20 @@ export class RemoteAiController {
     const replaced = await this.viewer.replacePageBlobs(replacements);
     if (!replaced || !this.isCurrent(generation)) return;
     this.appliedIdentity = appliedIdentity;
-    this.show(completionMessage, { cancellable: false, hideAfterMs: 2400 });
+    this.show(completionMessage, {
+        cancellable: false,
+        hideAfterMs: 2400,
+        shortLabel: RemoteAiShortLabel.DONE,
+      });
   }
 
   async cancel() {
     const job = this.job;
     if (!job || AI_TERMINAL_STATES.has(job.state)) return;
-    this.show("取り消しています", { cancellable: false });
+    this.show("取り消しています", {
+      cancellable: false,
+      shortLabel: RemoteAiShortLabel.CANCELLING,
+    });
     const response = await observedFetch(
       `/api/ai/jobs/${encodeURIComponent(job.job_id)}`,
       { method: "DELETE", credentials: "same-origin", headers: { Accept: "application/json" } }
@@ -7696,12 +7838,29 @@ export class RemoteAiController {
     this.show("AI 処理を開始できませんでした。", { error: true, cancellable: false });
   }
 
-  show(message, { error = false, cancellable = false, hideAfterMs = 0 } = {}) {
+  show(
+    message,
+    {
+      error = false,
+      cancellable = false,
+      hideAfterMs = 0,
+      shortLabel = RemoteAiShortLabel.WORKING,
+    } = {}
+  ) {
     clearTimeout(this.hideTimer);
     this.hideTimer = 0;
+    const wasError = this.root.classList.contains("is-error");
     this.message.textContent = message;
+    this.root.setAttribute("aria-label", message);
     this.root.classList.toggle("is-error", error);
     this.cancelButton.hidden = !cancellable;
+    // 縮小表示のラベルは呼び出し側が渡す。詳細文言との文字列一致で決めると、
+    // 文言を書き換えたときに黙って既定へ落ちる。
+    this.toggleButton.textContent = shortLabel;
+    this.toggleButton.hidden = error;
+    if (error) this.setExpanded(true);
+    else if (wasError || hideAfterMs > 0) this.setExpanded(false);
+    else this.setExpanded(this.expanded);
     this.root.hidden = false;
     if (hideAfterMs > 0) {
       this.hideTimer = window.setTimeout(() => this.hide(), hideAfterMs);
@@ -7713,6 +7872,19 @@ export class RemoteAiController {
     this.hideTimer = 0;
     this.root.hidden = true;
     this.root.classList.remove("is-error");
+    this.toggleButton.hidden = false;
+    this.setExpanded(false);
+  }
+
+  setExpanded(expanded) {
+    this.expanded = Boolean(expanded);
+    this.root.classList.toggle("is-expanded", this.expanded);
+    this.details.hidden = !this.expanded;
+    this.toggleButton.setAttribute("aria-expanded", String(this.expanded));
+    this.toggleButton.setAttribute(
+      "aria-label",
+      this.expanded ? "AI 処理の詳細を閉じる" : "AI 処理の詳細を表示"
+    );
   }
 
   schedulePoll(delay, generation) {
@@ -7810,6 +7982,9 @@ export class ImageViewer {
     this.loadingTimer = 0;
     this.boundaryMessageTimer = 0;
     this.centerTapTimer = 0;
+    this.destroyed = false;
+    this.pageLoadBusy = false;
+    this.requestedPagePresentation = null;
     this.displayedSeekState = null;
     this.pageLoadQueue = new LatestPageLoadQueue(
       (job) => job.kind === "spread"
@@ -7829,7 +8004,8 @@ export class ImageViewer {
           job.presentation,
           job.renderTrigger
         ),
-      () => this.supersedeActiveLoad()
+      () => this.supersedeActiveLoad(),
+      (busy) => this.setPageLoadBusy(busy)
     );
 
     this.pointerDown = (event) => this.onPointerDown(event);
@@ -7896,28 +8072,34 @@ export class ImageViewer {
       min: 0,
       max: Math.max(0, count - 1),
       value: index,
+      groupIndex: index,
+      direction: ReadingDirection.LTR,
       label: `${index + 1} / ${count}`,
     };
+    const presentation = { name, seekState: resolvedSeekState };
+    this.setRequestedPagePresentation(presentation);
     return this.pageLoadQueue.request({
       kind: "single",
       request,
       interactionStartedAt,
       name,
       info,
-      presentation: { name, seekState: resolvedSeekState },
+      presentation,
       renderTrigger,
     });
   }
 
   supersedeActiveLoad() {
     this.loadSequence += 1;
-    clearTimeout(this.loadingTimer);
-    this.loadingTimer = 0;
-    this.loadingIndicator.hidden = true;
   }
 
   invalidatePendingLoad() {
     this.pageLoadQueue.clear();
+    if (!this.pageLoadQueue.isBusy()) {
+      clearTimeout(this.loadingTimer);
+      this.loadingTimer = 0;
+      this.loadingIndicator.hidden = true;
+    }
     this.supersedeActiveLoad();
     this.fetchController?.abort();
     this.fetchController = null;
@@ -7952,15 +8134,19 @@ export class ImageViewer {
       min: 0,
       max: Math.max(0, count - 1),
       value: index,
+      groupIndex: index,
+      direction: ReadingDirection.LTR,
       label: `${index + 1} / ${count}`,
     };
+    const presentation = { name, seekState: resolvedSeekState };
+    this.setRequestedPagePresentation(presentation);
     return this.pageLoadQueue.request({
       kind: "spread",
       pages,
       fitMode,
       gap,
       interactionStartedAt,
-      presentation: { name, seekState: resolvedSeekState },
+      presentation,
       renderTrigger,
     });
   }
@@ -7985,14 +8171,69 @@ export class ImageViewer {
     this.seekInput.setAttribute("aria-valuetext", seekState.label);
   }
 
-  commitPagePresentation({ name, seekState } = {}) {
-    this.title.textContent = name ?? "";
-    this.displayedSeekState = seekState ? { ...seekState } : null;
-    this.setSeekState(this.displayedSeekState);
+  initializePagePresentation(presentation) {
+    if (!presentation?.seekState) return;
+    this.requestedPagePresentation = {
+      name: presentation.name ?? "",
+      seekState: { ...presentation.seekState },
+    };
+    this.displayedSeekState = { ...presentation.seekState };
+    this.syncPagePositionFeedback();
   }
 
-  restoreDisplayedSeekState() {
-    if (this.displayedSeekState) this.setSeekState(this.displayedSeekState);
+  setRequestedPagePresentation(presentation) {
+    if (!presentation?.seekState) return;
+    if (!this.displayedSeekState) {
+      this.initializePagePresentation(presentation);
+      return;
+    }
+    this.requestedPagePresentation = {
+      name: presentation.name ?? "",
+      seekState: { ...presentation.seekState },
+    };
+    this.syncPagePositionFeedback();
+  }
+
+  displayedGroupIndex() {
+    const groupIndex = Number(this.displayedSeekState?.groupIndex);
+    return Number.isInteger(groupIndex) && groupIndex >= 0 ? groupIndex : null;
+  }
+
+  syncPagePositionFeedback() {
+    const requested = this.requestedPagePresentation;
+    const displayedGroupIndex = this.displayedGroupIndex();
+    if (!requested?.seekState || !Number.isInteger(displayedGroupIndex)) return;
+    const feedback = viewerPagePositionFeedback({
+      requestedGroupIndex: requested.seekState.groupIndex,
+      displayedGroupIndex,
+    });
+    this.title.textContent = requested.name;
+    this.setSeekState(requested.seekState);
+    this.counter.classList.toggle("is-pending", feedback.pending);
+  }
+
+  commitPagePresentation({ name, seekState } = {}) {
+    if (!seekState) return;
+    if (!this.requestedPagePresentation || !this.displayedSeekState) {
+      this.initializePagePresentation({ name, seekState });
+      return;
+    }
+    const position = viewerPagePositionTransition(
+      {
+        requestedGroupIndex: this.requestedPagePresentation.seekState.groupIndex,
+        displayedGroupIndex: this.displayedSeekState.groupIndex,
+      },
+      { type: ViewerPagePositionEvent.DISPLAY, groupIndex: seekState.groupIndex }
+    );
+    this.displayedSeekState = {
+      ...seekState,
+      groupIndex: position.displayedGroupIndex,
+    };
+    this.syncPagePositionFeedback();
+  }
+
+  restoreRequestedPagePresentation() {
+    this.syncPagePositionFeedback();
   }
 
   layoutTelemetry() {
@@ -8155,7 +8396,6 @@ export class ImageViewer {
     const controller = new AbortController();
     this.fetchController = controller;
     const fetchStartedAt = performance.now();
-    this.beginLoadingIndicator(sequence, fetchStartedAt);
     let pendingObjectUrl = null;
     try {
       let resource;
@@ -8229,7 +8469,6 @@ export class ImageViewer {
       this.objectUrls = [pendingObjectUrl];
       pendingObjectUrl = null;
       previousUrls.forEach((url) => URL.revokeObjectURL(url));
-      this.endLoadingIndicator(sequence);
       await nextFrame();
       if (sequence !== this.loadSequence) return false;
 
@@ -8259,7 +8498,6 @@ export class ImageViewer {
       return true;
     } catch (error) {
       if (pendingObjectUrl) URL.revokeObjectURL(pendingObjectUrl);
-      this.endLoadingIndicator(sequence);
       if (sequence !== this.loadSequence) return false;
       if (error?.name === "AbortError") return false;
       this.title.textContent =
@@ -8285,7 +8523,6 @@ export class ImageViewer {
     const controller = new AbortController();
     this.fetchController = controller;
     const startedAt = performance.now();
-    this.beginLoadingIndicator(sequence, startedAt);
     const pendingUrls = [];
     try {
       const resources = await Promise.all(pages.map(async ({ request }) => {
@@ -8372,7 +8609,6 @@ export class ImageViewer {
       this.objectUrl = null;
       previousUrls.forEach((url) => URL.revokeObjectURL(url));
       this.applyTransform();
-      this.endLoadingIndicator(sequence);
       await nextFrame();
       if (sequence !== this.loadSequence) return false;
 
@@ -8407,7 +8643,6 @@ export class ImageViewer {
       return true;
     } catch (error) {
       pendingUrls.forEach((url) => URL.revokeObjectURL(url));
-      this.endLoadingIndicator(sequence);
       if (sequence !== this.loadSequence || error?.name === "AbortError") return false;
       this.title.textContent = error instanceof Error
         ? error.message
@@ -8418,14 +8653,24 @@ export class ImageViewer {
     }
   }
 
-  beginLoadingIndicator(sequence, startedAt) {
-    clearTimeout(this.loadingTimer);
+  setPageLoadBusy(busy) {
+    const nextBusy = Boolean(busy);
+    if (this.destroyed || nextBusy === this.pageLoadBusy) return;
+    this.pageLoadBusy = nextBusy;
+    if (!nextBusy) {
+      clearTimeout(this.loadingTimer);
+      this.loadingTimer = 0;
+      this.loadingIndicator.hidden = true;
+      return;
+    }
+    const startedAt = performance.now();
     this.loadingIndicator.hidden = true;
     this.loadingTimer = setTimeout(() => {
+      this.loadingTimer = 0;
       if (
-        sequence === this.loadSequence &&
+        !this.destroyed &&
         shouldShowLoadingIndicator(
-          true,
+          this.pageLoadBusy,
           performance.now() - startedAt,
           PAGE_LOADING_INDICATOR_DELAY_MS
         )
@@ -8433,13 +8678,6 @@ export class ImageViewer {
         this.loadingIndicator.hidden = false;
       }
     }, PAGE_LOADING_INDICATOR_DELAY_MS);
-  }
-
-  endLoadingIndicator(sequence) {
-    if (sequence !== this.loadSequence) return;
-    clearTimeout(this.loadingTimer);
-    this.loadingTimer = 0;
-    this.loadingIndicator.hidden = true;
   }
 
   showBoundaryMessage(message) {
@@ -8816,6 +9054,8 @@ export class ImageViewer {
   }
 
   destroy() {
+    this.destroyed = true;
+    this.pageLoadBusy = false;
     clearTimeout(this.resizeTimer);
     clearTimeout(this.loadingTimer);
     clearTimeout(this.boundaryMessageTimer);

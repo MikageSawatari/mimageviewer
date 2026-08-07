@@ -10,6 +10,7 @@ import {
   ReadingDirection,
   SpreadMode,
   ViewerGesture,
+  ViewerPagePositionEvent,
   ViewerPanelAction,
   ViewerPanelOrientation,
   IMAGE_QUALITY_PRESETS,
@@ -30,6 +31,7 @@ import {
   isRtlSpread,
   imageQualityPreset,
   latestPageLoadRequestPlan,
+  pageLoadQueueBusyTransition,
   nextSpreadMode,
   normalizeVisualViewportScale,
   readingDirectionForSpreadMode,
@@ -66,6 +68,8 @@ import {
   viewerLayoutTelemetry,
   viewerPageDisplaySlot,
   viewerPageGroupGenerationSnapshot,
+  viewerPagePositionFeedback,
+  viewerPagePositionTransition,
   viewerPostDisplayRefreshPlan,
   viewerSpreadPartnerIndex,
   viewerBoundaryMessage,
@@ -1363,6 +1367,21 @@ test("foreground page loading keeps one active group and replaces the pending gr
   );
 });
 
+test("page loading busy feedback spans the whole queue interval", () => {
+  assert.deepEqual(pageLoadQueueBusyTransition(false, true), {
+    busy: true,
+    action: "start",
+  });
+  assert.deepEqual(pageLoadQueueBusyTransition(true, true), {
+    busy: true,
+    action: "unchanged",
+  });
+  assert.deepEqual(pageLoadQueueBusyTransition(true, false), {
+    busy: false,
+    action: "stop",
+  });
+});
+
 test("an adjustment commit skips only its redundant adjustment refresh", () => {
   assert.deepEqual(viewerPostDisplayRefreshPlan(), {
     adjustment: true,
@@ -1502,6 +1521,59 @@ test("viewer seek keeps logical values and delegates RTL geometry to the native 
   assert.equal(viewerSeekGroupIndex(0, groups.length), 0);
   assert.equal(viewerSeekGroupIndex(2, groups.length), 2);
   assert.equal(viewerSeekGroupIndex(99, groups.length), 2);
+});
+
+test("viewer page feedback follows requests until display or explicit discard", () => {
+  let position = { requestedGroupIndex: 1, displayedGroupIndex: 1 };
+  position = viewerPagePositionTransition(position, {
+    type: ViewerPagePositionEvent.REQUEST,
+    groupIndex: 3,
+  });
+  assert.deepEqual(viewerPagePositionFeedback(position), {
+    groupIndex: 3,
+    pending: true,
+  });
+
+  position = viewerPagePositionTransition(position, {
+    type: ViewerPagePositionEvent.DISPLAY,
+    groupIndex: 3,
+  });
+  assert.deepEqual(viewerPagePositionFeedback(position), {
+    groupIndex: 3,
+    pending: false,
+  });
+
+  position = viewerPagePositionTransition(position, {
+    type: ViewerPagePositionEvent.REQUEST,
+    groupIndex: 4,
+  });
+  position = viewerPagePositionTransition(position, {
+    type: ViewerPagePositionEvent.REQUEST,
+    groupIndex: 5,
+  });
+  assert.deepEqual(position, {
+    requestedGroupIndex: 5,
+    displayedGroupIndex: 3,
+  });
+
+  position = viewerPagePositionTransition(position, {
+    type: ViewerPagePositionEvent.DISCARD,
+    groupIndex: 4,
+  });
+  assert.deepEqual(position, {
+    requestedGroupIndex: 5,
+    displayedGroupIndex: 3,
+  });
+
+  position = viewerPagePositionTransition(position, {
+    type: ViewerPagePositionEvent.DISCARD,
+    groupIndex: 5,
+  });
+  assert.deepEqual(position, {
+    requestedGroupIndex: 3,
+    displayedGroupIndex: 3,
+  });
+  assert.equal(viewerPagePositionFeedback(position).pending, false);
 });
 
 test("viewer seek relative drag mirrors physical RTL travel", () => {

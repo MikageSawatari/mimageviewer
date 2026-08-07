@@ -407,13 +407,15 @@ test("browser, viewer, and layout geometry are attached to image and refit event
   assert.match(app, /renderTrigger:\s*"viewport_resize"/);
 });
 
-test("page position is committed at image replacement instead of navigation intent", async () => {
+test("page request feedback precedes load while display position commits at replacement", async () => {
   const app = await readFile(new URL("app.js", here), "utf8");
   const navigation = app.slice(
     app.indexOf("function changeImageTo("),
     app.indexOf("async function updateViewerImage(")
   );
   assert.doesNotMatch(navigation, /setSeekState\(/);
+  assert.match(navigation, /updateRequestedPageGroup/);
+  assert.match(app, /viewer\.setRequestedPagePresentation/);
   assert.match(
     app,
     /this\.pageLayer\.replaceChildren\(decodedImage\);[\s\S]*?this\.commitPagePresentation\(presentation\);/

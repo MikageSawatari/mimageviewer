@@ -986,22 +986,21 @@ button {
 .viewer-ai-status {
   position: absolute;
   z-index: 4;
-  right: max(12px, env(safe-area-inset-right));
-  bottom: max(70px, calc(env(safe-area-inset-bottom) + 54px));
+  bottom: max(112px, calc(env(safe-area-inset-bottom) + 96px));
   left: max(12px, env(safe-area-inset-left));
   display: flex;
-  max-width: 680px;
-  min-height: 42px;
-  margin: 0 auto;
+  width: max-content;
+  max-width: calc(
+    100vw - env(safe-area-inset-left) - env(safe-area-inset-right) - 24px
+  );
+  min-height: 32px;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 9px 11px;
+  padding: 0;
   border: 1px solid rgb(139 167 211 / 52%);
-  border-radius: 11px;
+  border-radius: 999px;
   color: #eef4ff;
   background: rgb(19 27 40 / 90%);
-  box-shadow: 0 5px 18px rgb(0 0 0 / 38%);
+  box-shadow: 0 3px 12px rgb(0 0 0 / 36%);
   font-size: 0.78rem;
   line-height: 1.4;
 }
@@ -1011,13 +1010,60 @@ button {
 }
 
 .viewer-ai-status.is-error {
+  right: max(12px, env(safe-area-inset-right));
+  width: auto;
+  max-width: 680px;
+  padding: 9px 11px;
+  border-radius: 11px;
   border-color: rgb(226 122 113 / 70%);
   color: #ffd1cc;
 }
 
-.viewer-ai-status button {
+.viewer-ai-status.is-expanded:not(.is-error) {
+  max-width: min(
+    calc(100vw - env(safe-area-inset-left) - env(safe-area-inset-right) - 24px),
+    520px
+  );
+  padding: 5px;
+  border-radius: 11px;
+}
+
+.viewer-ai-status-toggle {
   flex: 0 0 auto;
-  min-height: 34px;
+  min-height: 32px;
+  padding: 5px 11px;
+  border: 0;
+  border-radius: 999px;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  white-space: nowrap;
+}
+
+.viewer-ai-status.is-expanded .viewer-ai-status-toggle {
+  border-radius: 8px;
+  background: rgb(255 255 255 / 8%);
+}
+
+.viewer-ai-status-details {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  padding: 0 2px 0 6px;
+}
+
+.viewer-ai-status-details[hidden] {
+  display: none;
+}
+
+.viewer-ai-status-message {
+  min-width: 0;
+}
+
+.viewer-ai-status-details button {
+  flex: 0 0 auto;
+  min-height: 32px;
   padding: 5px 10px;
   border: 1px solid var(--line);
   border-radius: 9px;
@@ -1108,6 +1154,10 @@ button {
   font-size: 0.82rem;
   text-align: center;
   text-shadow: 0 1px 4px #000;
+}
+
+.viewer-counter.is-pending {
+  opacity: 0.58;
 }
 
 .video-stream-diagnostics {
