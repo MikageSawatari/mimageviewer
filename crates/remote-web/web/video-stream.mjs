@@ -2333,8 +2333,9 @@ export class VideoStreamViewer {
       managedMediaSourceSupported:
         typeof globalThis.ManagedMediaSource === "function",
     };
+    const initialPlayback = videoPlaybackDecision(capabilities);
     let Hls = null;
-    if (capabilities.mediaSourceSupported || capabilities.managedMediaSourceSupported) {
+    if (initialPlayback.loadHlsJs) {
       try {
         Hls = await loadHlsJs();
       } catch (error) {

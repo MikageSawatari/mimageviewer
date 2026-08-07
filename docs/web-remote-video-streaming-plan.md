@@ -399,15 +399,17 @@ Android / PC は hls.js という広く使われた実装に委ねられる**。
 ### 5.2 クライアント分岐
 
 ```js
-const mse = typeof MediaSource === 'function' ||
-    typeof ManagedMediaSource === 'function';
-const Hls = mse ? await loadHlsJs() : null;
-if (Hls?.isSupported()) {
+const nativeHls = video.canPlayType('application/vnd.apple.mpegurl');
+const managedMse = typeof ManagedMediaSource === 'function';
+const mse = typeof MediaSource === 'function' || managedMse;
+if (managedMse && nativeHls) {
+    video.src = playlistUrl;          // iOS / iPadOS (native HLS)
+} else if (mse && (await loadHlsJs())?.isSupported()) {
     const hls = new Hls({ ... });     // Android Chrome / PC
     hls.loadSource(playlistUrl);
     hls.attachMedia(video);
-} else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    video.src = playlistUrl;          // iOS / iPadOS / macOS Safari
+} else if (nativeHls) {
+    video.src = playlistUrl;          // MSE が無い Safari
 } else {
     showUnsupportedPlayback();
 }
@@ -416,10 +418,9 @@ if (Hls?.isSupported()) {
 - hls.js は **Apache-2.0**。`dist/hls.min.js` 1 ファイルを `crates/remote-web/web/vendor/` へ
   置いて静的配信する。バンドラも TypeScript も導入しない
   ([web-remote-plan.md](web-remote-plan.md) §3.4 の「ビルドステップを導入しない」を維持)
-- MSE / ManagedMediaSource が利用可能なら `Hls.isSupported()` を先に評価し、hls.js を第一候補にする。
-  Chrome は native HLS を再生できなくても `canPlayType` が `maybe` を返すため、native 判定を
-  先にしてはいけない。MSE が無い iOS Safari だけ native HLS へ fallback し、両方無ければ
-  明示的な再生非対応とする
+- `ManagedMediaSource` と native HLS の両方がある WebKit では native HLS を選ぶ。通常の
+  `MediaSource` だけを持つ Chrome / Firefox は、native HLS を再生できなくても `canPlayType` が
+  `maybe` を返すことがあるため hls.js を第一候補にする。どちらも無ければ明示的な再生非対応とする
 - **MSE を mIV が実装するわけではない。** MSE はブラウザ側の API であり、それを駆動するのは
   hls.js である。mIV 側の成果物は上記の分岐と hls.js の静的配信だけで、サーバの HLS 出力は
   iOS 向けとまったく同一のものを使う
@@ -791,9 +792,10 @@ guard で、動画処理開始後の timeout 9 個には数えない。
 
 #### 増分 7 実装記録 (フロントエンド、2026-08-02。timeline anchor は段 2 で更新)
 
-- MSE / ManagedMediaSource がある端末は完全一致の public shell asset `/vendor/hls.min.js` を
-  遅延ロードして `Hls.isSupported()` を先に評価する。false の場合だけ native HLS を試し、両方
-  無ければ明示的な非対応表示にする。playlist / segment / video API は従来どおり認証 guard 下で、
+- native HLS もある `ManagedMediaSource` 端末は native HLS を使う。それ以外で MSE がある端末は
+  完全一致の public shell asset `/vendor/hls.min.js` を遅延ロードして `Hls.isSupported()` を評価し、
+  false の場合だけ native HLS を試す。両方無ければ明示的な非対応表示にする。playlist / segment /
+  video API は従来どおり認証 guard 下で、
   native video、playlist probe、hls.js XHR のすべてを同一 origin Cookie 経路にした
 - 初版の server position/live edge 差分 anchor は段 2 で廃止した。現在は generation の
   `source_origin_secs` と media time 0 を一度だけ anchor にし、対象を `seekable` へ逆写像できる

@@ -1076,6 +1076,132 @@ mod tests {
         open_aac_encoder(48_000, bitrate_bps, 0, StreamTimeline::new(0.0).unwrap()).unwrap()
     }
 
+    fn mp4_boxes(mut data: &[u8]) -> Vec<([u8; 4], &[u8])> {
+        let mut boxes = Vec::new();
+        while data.len() >= 8 {
+            let size32 = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
+            let kind = data[4..8].try_into().unwrap();
+            let (header_size, box_size) = match size32 {
+                0 => (8, data.len()),
+                1 if data.len() >= 16 => {
+                    let size64 = u64::from_be_bytes(data[8..16].try_into().unwrap());
+                    let Ok(size64) = usize::try_from(size64) else {
+                        break;
+                    };
+                    (16, size64)
+                }
+                1 => break,
+                size => (8, size),
+            };
+            if box_size < header_size || box_size > data.len() {
+                break;
+            }
+            boxes.push((kind, &data[header_size..box_size]));
+            data = &data[box_size..];
+        }
+        boxes
+    }
+
+    fn mp4_child(data: &[u8], wanted: [u8; 4]) -> Option<&[u8]> {
+        mp4_boxes(data)
+            .into_iter()
+            .find_map(|(kind, body)| (kind == wanted).then_some(body))
+    }
+
+    fn assert_avc_init_visual_dimensions(init: &[u8], expected_width: u32, expected_height: u32) {
+        let moov = mp4_child(init, *b"moov").expect("init has moov");
+        let video_trak = mp4_boxes(moov)
+            .into_iter()
+            .filter_map(|(kind, body)| (kind == *b"trak").then_some(body))
+            .find(|trak| {
+                let Some(mdia) = mp4_child(trak, *b"mdia") else {
+                    return false;
+                };
+                let Some(minf) = mp4_child(mdia, *b"minf") else {
+                    return false;
+                };
+                let Some(stbl) = mp4_child(minf, *b"stbl") else {
+                    return false;
+                };
+                let Some(stsd) = mp4_child(stbl, *b"stsd") else {
+                    return false;
+                };
+                stsd.len() >= 8 && mp4_child(&stsd[8..], *b"avc1").is_some()
+            })
+            .expect("init has an AVC video track");
+
+        let tkhd = mp4_child(video_trak, *b"tkhd").expect("video track has tkhd");
+        assert!(tkhd.len() >= 8);
+        let tkhd_width =
+            u32::from_be_bytes(tkhd[tkhd.len() - 8..tkhd.len() - 4].try_into().unwrap());
+        let tkhd_height = u32::from_be_bytes(tkhd[tkhd.len() - 4..].try_into().unwrap());
+        assert_eq!(tkhd_width, expected_width << 16);
+        assert_eq!(tkhd_height, expected_height << 16);
+
+        let mdia = mp4_child(video_trak, *b"mdia").unwrap();
+        let minf = mp4_child(mdia, *b"minf").unwrap();
+        let stbl = mp4_child(minf, *b"stbl").unwrap();
+        let stsd = mp4_child(stbl, *b"stsd").unwrap();
+        let avc1 = mp4_child(&stsd[8..], *b"avc1").unwrap();
+        // VisualSampleEntry fields before width/height occupy 24 bytes after the box header.
+        assert!(avc1.len() >= 28);
+        let sample_width = u16::from_be_bytes(avc1[24..26].try_into().unwrap());
+        let sample_height = u16::from_be_bytes(avc1[26..28].try_into().unwrap());
+        assert_eq!(u32::from(sample_width), expected_width);
+        assert_eq!(u32::from(sample_height), expected_height);
+    }
+
+    fn openh264_init_for_dimensions(width: u32, height: u32) -> (Vec<u8>, String) {
+        let frame_rate = FrameRate::new(30, 1).unwrap();
+        let output = StreamOutputParameters {
+            dimensions: OutputDimensions { width, height },
+            video_bitrate_bps: 400_000,
+            audio_bitrate_bps: 64_000,
+        };
+        let mut opened = open_h264_encoder(
+            EncoderPreference::Encoder(H264EncoderKind::OpenH264),
+            output,
+            frame_rate,
+        )
+        .unwrap();
+        let audio = open_test_audio(output.audio_bitrate_bps);
+        let mut segmenter =
+            Fmp4Segmenter::with_capacity(&opened.encoder, &audio.encoder, frame_rate, 2).unwrap();
+        let mut completed = Vec::new();
+        for index in 0..=frame_rate.keyint_frames() {
+            let mut frame = ffmpeg::util::frame::video::Video::new(
+                ffmpeg::format::Pixel::YUV420P,
+                width,
+                height,
+            );
+            fill_yuv420p(&mut frame, index as u8);
+            frame.set_pts(Some(i64::from(index)));
+            segmenter.prepare_video_frame(CfrTimelineFrameIndex::new(u64::from(index)), &mut frame);
+            opened.encoder.send_frame(&frame).unwrap();
+            drain_encoder(&mut opened.encoder, &mut segmenter, &mut completed);
+        }
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].0, 0);
+        (
+            segmenter
+                .init_segment()
+                .expect("first segment completed init")
+                .to_vec(),
+            segmenter
+                .master_playlist()
+                .expect("first segment completed master playlist"),
+        )
+    }
+
+    #[test]
+    fn fmp4_and_master_playlist_use_visual_dimensions_with_and_without_sps_cropping() {
+        for (width, height) in [(640, 360), (640, 368)] {
+            let (init, master) = openh264_init_for_dimensions(width, height);
+            assert_avc_init_visual_dimensions(&init, width, height);
+            assert!(master.contains(&format!("RESOLUTION={width}x{height}")));
+        }
+    }
+
     #[test]
     fn idr_detection_accepts_annex_b_and_avcc_packets() {
         assert!(packet_contains_idr(&[0, 0, 1, 0x65, 1, 2]));

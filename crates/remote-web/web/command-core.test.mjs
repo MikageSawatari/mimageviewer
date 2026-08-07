@@ -627,7 +627,7 @@ test("media keys and tap zones map to the existing media command layer", () => {
   assert.equal(videoTapCommand(280, 300).payload.seconds, 10);
 });
 
-test("MSE selects hls.js even when canPlayType reports maybe", () => {
+test("standard MSE selects hls.js even when canPlayType reports maybe", () => {
   assert.deepEqual(videoPlaybackDecision({
     nativeHlsCanPlayType: "maybe",
     mediaSourceSupported: true,
@@ -635,8 +635,26 @@ test("MSE selects hls.js even when canPlayType reports maybe", () => {
     mode: "hls_js",
     loadHlsJs: true,
   });
+});
+
+test("WebKit ManagedMediaSource keeps a supported HLS stream on the native path", () => {
   assert.deepEqual(videoPlaybackDecision({
     nativeHlsCanPlayType: "probably",
+    managedMediaSourceSupported: true,
+    mediaSourceSupported: true,
+  }), {
+    mode: "native",
+    loadHlsJs: false,
+  });
+  assert.deepEqual(videoPlaybackDecision({
+    nativeHlsCanPlayType: "maybe",
+    managedMediaSourceSupported: true,
+  }), {
+    mode: "native",
+    loadHlsJs: false,
+  });
+  assert.deepEqual(videoPlaybackDecision({
+    nativeHlsCanPlayType: "",
     managedMediaSourceSupported: true,
   }), {
     mode: "hls_js",

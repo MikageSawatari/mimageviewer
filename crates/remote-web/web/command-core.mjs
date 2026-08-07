@@ -984,13 +984,21 @@ export function videoPlaybackDecision({
   managedMediaSourceSupported = false,
   hlsJsSupported,
 } = {}) {
+  const nativeHls = ["maybe", "probably"].includes(
+    String(nativeHlsCanPlayType ?? "").toLowerCase()
+  );
+  // ManagedMediaSource is WebKit's constrained MSE path.  When that same
+  // browser exposes native HLS, keep the fMP4/CMAF stream on AVPlayer's native
+  // path instead of needlessly feeding it back through hls.js + MMS.  This is
+  // capability-based (not a user-agent check), and leaves normal MSE browsers
+  // such as Chrome/Firefox on hls.js.
+  if (managedMediaSourceSupported && nativeHls) {
+    return { mode: "native", loadHlsJs: false };
+  }
   const mseSupported = mediaSourceSupported || managedMediaSourceSupported;
   if (mseSupported && hlsJsSupported !== false) {
     return { mode: "hls_js", loadHlsJs: true };
   }
-  const nativeHls = ["maybe", "probably"].includes(
-    String(nativeHlsCanPlayType ?? "").toLowerCase()
-  );
   if (nativeHls) return { mode: "native", loadHlsJs: false };
   return {
     mode: "unsupported",
