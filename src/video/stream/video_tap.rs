@@ -371,6 +371,24 @@ impl VideoFrameScaler {
                 input_key.0, input_key.1, input_key.2
             )));
         }
+        if input_key
+            == (
+                self.output_format,
+                self.output_dimensions.width,
+                self.output_dimensions.height,
+            )
+        {
+            // D3D11VA readback is already NV12. Passing that same-size NV12 frame through
+            // libswscale's identity path copies Y but can leave the semi-planar UV plane
+            // untouched (observed as zero/stale chroma on FFmpeg 7.1). No conversion is needed;
+            // clone the software AVFrame reference so its buffers remain owned through
+            // avcodec_send_frame instead of manufacturing a damaged replacement frame.
+            return clone_avframe_ref(input).map_err(|error| {
+                VideoStreamEncoderError::new(format!(
+                    "remote video identity frame clone failed: {error}"
+                ))
+            });
+        }
         if self.context.is_none() || self.input_key != Some(input_key) {
             self.context = Some(
                 ScaleContext::get(
@@ -586,6 +604,65 @@ mod tests {
 
     fn software_tap_frame() -> SoftwareTapFrame {
         SoftwareTapFrame::try_new(Video::new(Pixel::YUV420P, 2, 2)).unwrap()
+    }
+
+    fn visible_plane_bytes(frame: &Video, plane: usize, row_bytes: usize, rows: usize) -> Vec<u8> {
+        let stride = frame.stride(plane);
+        let data = frame.data(plane);
+        let mut visible = Vec::with_capacity(row_bytes * rows);
+        for row in 0..rows {
+            let start = row * stride;
+            visible.extend_from_slice(&data[start..start + row_bytes]);
+        }
+        visible
+    }
+
+    #[test]
+    fn same_size_nv12_scaler_preserves_luma_and_chroma_after_source_drop() {
+        const WIDTH: usize = 640;
+        const HEIGHT: usize = 360;
+        let mut scaler = VideoFrameScaler::new(
+            H264InputFormat::Nv12,
+            OutputDimensions {
+                width: WIDTH as u32,
+                height: HEIGHT as u32,
+            },
+        );
+        let (expected_y, expected_uv, output) = {
+            let mut input = Video::new(Pixel::NV12, WIDTH as u32, HEIGHT as u32);
+            let y_stride = input.stride(0);
+            for (row_index, row) in input
+                .data_mut(0)
+                .chunks_mut(y_stride)
+                .take(HEIGHT)
+                .enumerate()
+            {
+                row[..WIDTH].fill(32_u8.wrapping_add(row_index as u8));
+            }
+            let uv_stride = input.stride(1);
+            for (row_index, row) in input
+                .data_mut(1)
+                .chunks_mut(uv_stride)
+                .take(HEIGHT / 2)
+                .enumerate()
+            {
+                for pair in row[..WIDTH].chunks_exact_mut(2) {
+                    pair[0] = 80_u8.wrapping_add(row_index as u8);
+                    pair[1] = 176_u8.wrapping_sub(row_index as u8);
+                }
+            }
+            let expected_y = visible_plane_bytes(&input, 0, WIDTH, HEIGHT);
+            let expected_uv = visible_plane_bytes(&input, 1, WIDTH, HEIGHT / 2);
+            let output = scaler.scale(&input).unwrap();
+            (expected_y, expected_uv, output)
+        };
+
+        assert_eq!(visible_plane_bytes(&output, 0, WIDTH, HEIGHT), expected_y);
+        assert_eq!(
+            visible_plane_bytes(&output, 1, WIDTH, HEIGHT / 2),
+            expected_uv,
+            "NV12 identity path must retain the interleaved UV plane"
+        );
     }
 
     struct FakeDecoderHwSurfaceRef<'a> {
