@@ -15,6 +15,46 @@ pub(crate) fn touch_debug_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("MIV_TOUCH_DEBUG").is_some())
 }
 
+#[cfg(windows)]
+pub(crate) fn log_native_touch_ownership(pointer_id: u32, owned: bool, reason: &str) {
+    if touch_debug_enabled() {
+        crate::logger::log(format!(
+            "[TOUCH-DEBUG] native presenter pointer_id={} ownership={} reason={}",
+            pointer_id,
+            if owned { "owned" } else { "passed" },
+            reason,
+        ));
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn log_native_touch_coordinates(pointer_id: u32, client: [i32; 2], points: egui::Pos2) {
+    if touch_debug_enabled() {
+        crate::logger::log(format!(
+            "[TOUCH-DEBUG] native presenter pointer_id={} client=({},{}) points=({:.2},{:.2})",
+            pointer_id, client[0], client[1], points.x, points.y,
+        ));
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn log_native_touch_command(command: &crate::touch_input::TouchCommand) {
+    if touch_debug_enabled() {
+        crate::logger::log(format!(
+            "[TOUCH-DEBUG] native presenter command={command:?}"
+        ));
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn log_native_touch_mouse_discard(msg: u32) {
+    if touch_debug_enabled() {
+        crate::logger::log(format!(
+            "[TOUCH-DEBUG] native presenter mouse_discarded msg=0x{msg:04x} source=IMDT_TOUCH"
+        ));
+    }
+}
+
 /// Log the ordered egui event list only when the current viewport frame
 /// contains at least one touch event. This function never mutates or consumes
 /// the input queue.

@@ -113,11 +113,20 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
   Fullscreen presenter HWND (= video frame + background)
 ```
 
-**入力 2 層化**:
+**入力 3 層化**:
 
 - **Mouse**: HUD wndproc が region 内で受けて bounded event route に enqueue する。region 外は `SetWindowRgn` で
   物理的に「存在しない」領域として穴を空けているので、OS が下層 (VST or presenter) に直接 mouse を
   配送する (= クロスプロセスでも安定)。`HTTRANSPARENT` のクロスプロセス透過には頼らない。
+- **Touch**: presenter wndproc が `WM_POINTERDOWN` の `GetPointerType` で `PT_TOUCH` と確定した
+  stream 全体だけを HWND ごとの bounded ownership set に登録し、UP / canceled flag /
+  `WM_POINTERCAPTURECHANGED` まで 0 を返して所有する。`POINTER_INFO.ptPixelLocation` は
+  `ScreenToClient(presenter_hwnd)` 後に mouse と共通の points 変換へ合流し、coalesce しない
+  `NativeVideoWindowEvent::Touch` として pump/render の両 route へ送る。render overlay の
+  `NativeTouchAdapter` は共通 `TouchRecognizer` を使い、先頭接点だけを egui pointer emulation
+  する。tap は session-only chrome latch に落とし、最初の所有 stream で activation/thread focus が
+  不足する場合だけ既存の typed `RequestFocusClaim` で foreground/focus を回復する。
+  HUD HWND は promoted mouse のままで、所有と emulation は Phase 3。
 - **Keyboard / IME**: HUD では受けない (`WS_EX_NOACTIVATE` で focus を取らない)。presenter HWND の
   既存 wndproc で受けて `NativeEguiOverlay` に流す。HUD 上の mouse-down で `claim_foreground(presenter_hwnd)`
   を発火することで、VST 操作後でも presenter HWND を foreground/focus に戻して keyboard/IME を維持。
@@ -447,6 +456,7 @@ src/video/
 ├── swscale_helpers.rs      # CPU pixel conversion 共通 helper
 ├── engine/                 # EngineActor / EngineState / MasterClock / audio bookkeeping
 ├── native_window.rs        # Win32 message loop + 入力イベント変換
+├── native_touch.rs         # presenter touch ownership + 共通認識器 adapter
 ├── native_presenter/       # DComp presenter、overlay、HUD window、grade pipeline
 ├── gpu_renderer/           # decoder + presenter の D3D11 共有基盤、unsafe 境界
 ├── dsp/                    # chain 単位 VST3 bridge / GUI / scanner / extract
@@ -1272,6 +1282,14 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 - `NativeVideoMouseButton` (L/M/R/X1/X2) / `NativeVideoMouseWheelEvent` 等の型は
   egui の Event との 1:1 翻訳を意図しており、`native_presenter/render_core.rs` 側で
   `egui::Event` に変換される
+- presenter の `PT_TOUCH` は DOWN で stream 単位の所有を決め、HWND ごとの
+  `WindowState.touch_ownership` に保持する。Touch は latest-value mailbox で coalesce せず、
+  Start / Move / End / Cancel を bounded lossless route へ全件送る。pointer type 取得失敗、
+  非 touch、DOWN を見ていない id、上限超過は stream 全体を `DefWindowProcW` へ渡す
+- touch DOWN は最初の所有 stream かつ activation/thread focus 不足時だけ既存の
+  `RequestFocusClaim` を送り、新しい focus 制御を増やさず pump/host の
+  `claim_foreground` に合流する。復帰 tap は既存 `WM_MOUSEACTIVATE` と同じ child/popup
+  判定を使い、認識器を Cancel 扱いにして activation だけに留める
 - 他アプリからフォーカスを戻すための左クリックは `WM_MOUSEACTIVATE` で
   `MA_ACTIVATEANDEAT` を返して破棄する。Windows がアクティブ化トリガとなった
   `WM_LBUTTONDOWN` を `wnd_proc` に dispatch しないので、再生 toggle (App 経路の
@@ -1293,6 +1311,22 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 
 責務は単一 (= 単純な入力 marshalling)。設計上の懸念はなし。
 
+#### `native_touch.rs` (`NativeTouchAdapter`)
+
+Win32 依存を持たない純粋部分を wndproc から分離する。bounded ownership state、
+screen/client/points の座標契約、promoted mouse の fail-open 判定、既存
+`crate::touch_input::TouchRecognizer` への sample 変換、先頭接点の egui pointer emulation、
+`ToggleChrome` / `PageSide` の chrome toggle 写像と source-session reset を持つ。
+`SwitchSource` は overlay を再利用するため、専用 `reset_overlay_source_session()` から
+この reset を必ず通して latch/接点状態を新ファイルへ持ち越さない。`touch_correlation.rs` は
+native では使わない。`TapZoneGeometry.excluded` は exact な描画 response rect ではなく
+`compute_hud_regions()` の HUD HWND input-claim region を Phase 1 の近似として使う。
+同関数は pointer-down + wants-input 時に全画面 capture region を返すため、Cancel は
+`PointerGone` だけで終えず、click 距離超過 Move → primary release → `PointerGone` で
+egui の down 状態を必ず解除する。動画は `Viewer { accepts_pinch: false }` とする。
+認識コマンドは destructive read なので、egui が同一フレームを複数 pass 実行しても
+後続 pass で再実行されない。
+
 #### `native_window_host` / `native_presenter` (`NativeWindowHost` + `NativeRenderCore`)
 
 Stage 2 (2026-07-29) で HWND ownership と GPU/DComp ownership を module/type で分離し、
@@ -1308,6 +1342,7 @@ intent だけで host と接続する。
 | `native_window_pump.rs` | bounded request/ack、window-host reducer、全 placement の create/pump/publish/destroy、observation/intent 適用、typed shutdown/quarantine | `NativeWindowPumpRenderClient`, `PumpLifecycleEvent`, `PumpPlacementRequest` |
 | `native_window_host.rs` | presenter/HUD topology、visibility/geometry/region/z-order/focus/IME/cursor mutation、thread affinity | `NativeWindowHost`, `NativeRenderTargets`, `NativeWindowIntent` |
 | `native_window_host/hud_window.rs` | HUD HWND RAII owner と wndproc/region mutation | `HudOverlayWindow` |
+| `native_touch.rs` | presenter `PT_TOUCH` stream の bounded ownership 純ロジック、共通 recognizer adapter、座標/command 写像 | `NativeTouchOwnership`, `NativeTouchAdapter` |
 | `native_presenter/mod.rs` | render facade と `overlay_draw` module 宣言 | — |
 | `native_presenter/render_core.rs` | D3D11/DXGI/DComp、swap chain、共有 texture/keyed mutex、動画 present、egui overlay state/input変換 | `NativeRenderConfig`, `NativeRenderCore`, `NativeEguiOverlay` |
 | `native_presenter/overlay_draw.rs` | overlay 描画関数群、panel 矩形計算、format helper、timeline marker/icon 描画 | `NativeOverlay*` 値型 |
@@ -1316,7 +1351,7 @@ intent だけで host と接続する。
 高頻度の mouse move、geometry/DPI、HUD raise、HUD visual/observation、App→render の HUD state は
 sequence 付き latest-value slot で coalesce する。wndproc の slot は atomic pointer swap、pump の
 visual/observation drain は non-blocking `try_lock` で、HWND owner から render への逆向き wait を作らない。
-close/key/text/IME、button/wheel/leave/destroy、
+close/key/text/IME、button/wheel/touch/leave/destroy、
 placement/source/action と pump lifecycle は bounded lossless channel で運び、満杯または切断時は
 silent drop せず session quarantine にする。placement switch は hidden staging host を作り、render
 の state/overlay/frame prime 後の `TargetReady(epoch)` で初めて publish する。失敗時は
@@ -2421,7 +2456,7 @@ overlay_draw.rs::draw_native_perf_overlay`) には:
 | `decoder.rs` | demux / video / audio の 3 worker、packet/control 分離は安定 | 3 worker の codec、HW、seek、pacing helper が同居し、責務分離点がファイル境界になっていない |
 | `video/mod.rs` | `VideoPlayer` API と native output lifecycle の owner | UI tick event drain、output loop、source swap、native presenter orchestration が集中する |
 | `native_window_pump` / `native_window_host` / `native_presenter/` | Stage 4 で全 HWND owner/pump と GPU/DComp render を別 thread に分離し、typed channel/reducer、二相 placement switch、typed shutdown/quarantine を production 接続。legacy eframe video path は撤去済み | Stage 5 の VST owner-applied ack/hidden anchor、Stage 6 の source/EOF 全 sequence、overlay state/input policy の細分化は後続負債 |
-| `native_window.rs` | presenter/HUD wndproc の decode/enqueue。RAII owner は `NativeWindowHost` の下位型、event は latest-value と bounded lossless に分類 | main child resize subclassは pump host request/reflowへ接続済み。health watchdog は Stage 7 |
+| `native_window.rs` / `native_touch.rs` | presenter/HUD wndproc の decode/enqueue。presenter touch は bounded stream ownership + 共通 recognizer adapter、event は latest-value と bounded lossless に分類。HUD touch ownership は未導入 | HUD ownership/emulation/target-size は touch Phase 3。main child resize subclassは pump host request/reflowへ接続済み。health watchdog は Stage 7 |
 | `gpu_renderer/` | D3D11/FFmpeg interop と unsafe 境界 | 境界は比較的明確。presenter/decoder との resource lifetime は引き続き横断監査が必要 |
 | `audio.rs` / `dsp/` | device-rate playback、stretch、chain bridge を統合 | pump、RT callback、VST IPC/back-pressure の ownership が近接し、DSP 側も chain/GUI/persistence/hot path が混在する |
 

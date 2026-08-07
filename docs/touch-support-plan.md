@@ -139,22 +139,20 @@ egui viewport で効いているのは、すべて egui-winit の「先頭接点
 
 ### 2.6 動画 native presenter は事情が逆
 
-動画の presenter HWND / HUD HWND は **mIV 自前の Win32 ウィンドウ**で、
-`RegisterTouchWindow` も `WM_TOUCH` / `WM_POINTER` / `WM_GESTURE` ハンドラも持たない
-(`src/video/native_window.rs:22-39`, `src/video/native_window_host/hud_window.rs:64-75`)。
-未処理メッセージは `DefWindowProcW` に流れる (`native_window.rs:1478`, `hud_window.rs:1027`)。
-
-→ ここでは **Windows の既定タッチ→マウス合成が効く**。結果:
+動画の presenter HWND / HUD HWND は **mIV 自前の Win32 ウィンドウ**である。
+Phase 1 の実機ゲート前は両方とも `WM_POINTER` を処理せず `DefWindowProcW` に流していたため、
+**Windows の既定タッチ→マウス合成が効いていた**。結果:
 
 - タップ → 左クリック合成 → 再生/一時停止等に入る
 - 長押し → 右クリック合成 → mIV の native 右ボタン処理へ入る
 - **ピンチ → Ctrl+wheel が来るが、動画のズームには繋がらない** (Ctrl+wheel はタイル表示の列数変更のみ、`render_core.rs:4244-4280`)
 - **パン → `WM_VSCROLL/WM_HSCROLL` ハンドラが無く、何も起きない**
 
-**潜在バグ (Codex Sol の推測、要実機確認)**: OS が長押し成立時点で短い `WM_RBUTTONDOWN/UP` を
-生成する環境では、mIV が測る押下時間が元のタッチ開始ではなく右ボタン down からになるため、
-**「短い右クリック」と誤分類されてフルスクリーンが閉じる**可能性がある
-(`src/app/native_video.rs:8829-8855, 8898-8911, 9039-9052`)。
+**実機で確認済みのバグ**: presenter 上の長押しでは `WM_POINTERUP` の後に同一ミリ秒で
+`WM_RBUTTONDOWN/UP` が合成され、mIV が「短い右クリック」と分類してフルスクリーンを閉じた。
+Phase 1 Step 4 では presenter の `PT_TOUCH` stream 全体を所有して `DefWindowProcW` へ渡さない
+構造へ変更したため、この合成経路自体を遮断している。**構造的な解消の確定は変更後ビルドの
+実機確認後**とする。HUD HWND は今回所有していないため、HUD 上の長押し合成は Phase 3 まで残る。
 
 ### 2.7 リングショートカットのタッチ対応は「設計上の表現だけ」
 
@@ -872,10 +870,11 @@ presenter HWND と HUD HWND は mIV 自前の Win32 ウィンドウで、egui-wi
 1. `RegisterTouchWindow` を呼ばない
 2. `EnableMouseInPointer` も呼ばない (これは**マウスにも** `WM_POINTER` を生成させる
    プロセス全体の設定で、「マウス無影響」の目的には逆効果)
-3. `WM_POINTERDOWN/UPDATE/UP` で `GetPointerType` を呼ぶ
+3. `WM_POINTERDOWN` で `GetPointerType` を呼び、その結果を stream の所有判断に固定する
 4. **`PT_TOUCH` と確定した stream は DOWN から UP/Cancel まで全メッセージを処理し、常に 0 を返す**
 5. `PT_PEN` その他は stream 全体を従来どおり `DefWindowProc` へ渡す
-6. touch stream から native overlay へ `Event::Touch` と先頭接点の pointer emulation を注入する
+6. touch stream を `NativeVideoWindowEvent::Touch` で native overlay の共通認識器へ渡し、
+   先頭接点だけを overlay の egui Context へ pointer emulation する
    → **egui 側と同じジェスチャ認識器を共有できる** (OS アダプタだけが別実装)
 7. `WM_POINTERCAPTURECHANGED` と `POINTER_FLAG_CANCELED` で必ず状態を解放する
 
@@ -886,6 +885,39 @@ Microsoft は **「一つの pointer stream の一部だけを消費し、残り
 さらに既存の `WM_MOUSE*` handler で `GetCurrentInputMessageSource()` を確認し、
 `IMDT_TOUCH` と確定した重複だけを捨てる安全網を置ける。
 **失敗または `IMDT_UNAVAILABLE` の場合は捨てず、従来の mouse handler へ流す**のが安全側。
+
+#### Phase 1 Step 4 実装結果 (presenter の薄い縦切り)
+
+- 出荷ゲートでは未登録のまま presenter HWND に `PT_TOUCH` 237 件、HUD HWND に 35 件が届き、
+  **案 C が成立することを実機確認済み**。
+- 今回所有するのは **presenter HWND だけ**。`WindowState` (HWND ごとの `GWLP_USERDATA`) に
+  上限付き pointer-id 集合を持ち、DOWN で所有した stream だけを UP / canceled flag /
+  `WM_POINTERCAPTURECHANGED` まで一貫して消費する。Touch event は latest-value slot に載せず、
+  pump/render の bounded lossless route へ全件送る。
+- `POINTER_INFO.ptPixelLocation` は `ScreenToClient(presenter_hwnd)` で物理 client pixels にし、
+  mouse と共通の client-pixels→egui-points 純関数へ合流する。マルチモニタでも変換基準は HWND。
+- presenter overlay は既存の `TouchRecognizer` をそのまま所有し、
+  `TouchSurfaceBehavior::Viewer { accepts_pinch: false }` で認識する。
+  `touch_correlation.rs` は通さない。先頭接点だけを pointer emulation し、
+  `should_suppress_primary()` が立った stream では click を完成させない。synthetic press が
+  既に生きている場合だけ、click 距離を十分超える `PointerMoved` → primary release →
+  `PointerGone` の順で egui の down 状態を確実に解除する。
+- `ToggleChrome` と `PageSide` はどちらも session-only chrome latch の toggle に写像する。
+  latch は hover 可視判定への OR 入力で、`SwitchSource` の専用 source-session reset で
+  ファイル移動時に解除し、fullscreen 終了時は overlay の破棄・再生成によって false に戻る。
+  永続設定は変更しない。
+- touch DOWN のうち、最初の所有 stream かつ presenter の activation または thread focus が
+  不足している場合だけ typed `RequestFocusClaim` を pump へ送り、既存
+  `claim_foreground` 経路へ合流する。既に foreground/focus を持つ tap と2本目以降では送らない。
+  復帰 tap の判定も既存 `WM_MOUSEACTIVATE` と揃え、
+  child は foreground が他プロセスのとき、top-level popup は presenter 自身が foreground でないときに
+  gesture を Cancel 扱いとして、従来の `MA_ACTIVATEANDEAT` と同様に「復帰だけ」にする。
+- **HUD HWND は意図的に対象外**。HUD は promoted mouse で既存ボタンを操作できており、所有へ
+  切り替えるには HUD 側の pointer emulation とターゲットサイズ調整を一緒に完成させる必要がある。
+  HUD の所有・emulation・ボタンサイズ調整は Phase 3 で行う。したがって
+  **HUD 上の長押し→右クリック合成は今回残り、presenter 側だけを構造的に修正した**。
+- `MIV_DISABLE_TOUCH_GESTURES=1` では所有と promoted-mouse filter を無効にし、従来経路へ戻す。
+  Cancel / capture loss は防御的に実装したが、実機では引き続き未観測。
 
 #### 案 D (フォールバック) の内容
 
@@ -1165,27 +1197,30 @@ NeeView は **ペンと指を区別していない**。リポジトリ全体で 
 
 ## 6. 未確定事項 / 実機確認が必要な項目
 
-1. **【最優先】`WM_POINTER*` が presenter HWND と HUD HWND の両方に期待どおり配送されるか**。
-   API 仕様上 touch-unregistered window にも届くことは確認できたが、mIV の実 HWND 構成
-   (hit-test region / DirectComposition / `WS_EX_NOACTIVATE` の HUD) で成立するかは未確認。
-   **Phase 1 の出荷ゲートにする** (崩れると §5.9 の設計を引き直す)。
-2. 動画 native presenter で、長押し→右クリック合成が「短い右クリック」と誤分類されて
-   フルスクリーンが閉じるか (§2.6 の潜在バグ)。**実機必須**。
-3. **egui-winit の Touch Cancel が primary release を出さない件**
+1. **【通過済み】`WM_POINTER*` 配送ゲート**。実機ログで presenter HWND に
+   `PT_TOUCH` 237 件、HUD HWND に 35 件を観測し、touch-unregistered の実 HWND 構成
+   (hit-test region / DirectComposition / `WS_EX_NOACTIVATE` の HUD) でも案 C が成立すると確定した。
+2. **【バグ観測済み・修正後の実機確認待ち】** 動画 native presenter の長押しでは、
+   `WM_POINTERUP` 後に合成された短い右クリックでフルスクリーンが閉じた。
+   presenter の `PT_TOUCH` stream 全体を所有し `DefWindowProcW` へ渡さない構造へ修正済み。
+   変更後ビルドで「長押ししても閉じない」ことを確認して解消確定とする。
+3. **【実装解決・Cancel 自体は実機未観測】egui-winit の Touch Cancel が primary release を出さない件**
    (`egui-winit-0.33.3/src/lib.rs:732-735`)。アプリ側の gesture state は Cancel で破棄できるが、
-   **egui widget 側に primary-down 状態が残らないか**。残る場合は入力アダプタ側で
-   release を補う必要があり、構造的な壁になる。
+   `PointerGone` 単独では egui の primary-down は解除されない。native adapter は
+   synthetic press が生きている Cancel / suppression 境界で、click 距離超過の
+   `PointerMoved` → primary release → `PointerGone` を注入し、click を成立させず down を解除する。
+   canceled flag / capture changed の実機観測は引き続きできていない。
 4. **ClickToShow の呼び出しバーがタッチで押せるか**。callout は端に `hover_pos()` が
    ある間だけ描かれる (`ui_fullscreen.rs:5422-5435`)。Touch End と同じ batch で
    `PointerGone` が来るため、**押下時に見えた callout が release フレームで消えて
    click completion に到達しない可能性が高い** (コード順序からの推測)。
-3. 「フォルダを開く」ダイアログはフルパス入力式で参照ボタンが無く
+5. 「フォルダを開く」ダイアログはフルパス入力式で参照ボタンが無く
    (`src/ui_dialogs/open_folder.rs:34-52, 81-106`)、OS タッチキーボードの自動表示も
    コードからは保証できない。タブレットでの実用性を実機確認する必要がある。
    なお「任意の場所へ移動」は `場所▼` / ドライブ一覧 / ピクチャ等の既存導線で到達できる
    (`ui_main.rs:10942, 11015`) ので、新しいフォルダピッカーは必須ではない。
-4. スクロールバーの実効的な掴みやすさ (DPI・UI 倍率・機種依存)。
-5. detached viewer で、root と別 viewport のタッチ状態が混ざらないこと。
+6. スクロールバーの実効的な掴みやすさ (DPI・UI 倍率・機種依存)。
+7. detached viewer で、root と別 viewport のタッチ状態が混ざらないこと。
    passive detached の「最初のクリックは復帰だけ」という既存挙動を、最初のタップが
    突き抜けて操作まで届かないかを実機確認する。
 
@@ -1198,8 +1233,7 @@ NeeView は **ペンと指を区別していない**。リポジトリ全体で 
 2. 仕様は §5.14 で**すべて確定済み**。着手前に決めるべきことは残っていない。
 3. **Phase 1**: 入力源分離と 2 つの backend の成立確認。
    静止画フルスクリーンのタッチ操作一式に加え、**動画 native の pointer adapter を
-   この段階で薄く通して実機検証する**。動画を出荷条件にする以上、
-   native HWND に `WM_POINTER` が期待どおり届くかの確認を最後まで先送りしない。
+   presenter HWND に薄く実装済み**。配送ゲートは通過し、長押し修正後の実機確認を残す。
 4. **Phase 2**: 一覧の直接スクロール + 方向スナップ + ピンチ列数変更 + 静止画・音楽パネル。
    ここまでで「静止画はタッチ対応」と言える。
 5. **Phase 3**: 動画 native の完成。ここまでで「mIV はタッチ対応」と表明できる。
@@ -1211,7 +1245,6 @@ NeeView は **ペンと指を区別していない**。リポジトリ全体で 
 なっているため。Phase 2 を先にすると、指でスクロールできるようになった利用者が
 サムネイルをタップしてフルスクリーンに入り、そこで詰む — という悪化した体験になる。
 
-**ただし動画 native の入力経路だけは Phase 1 で薄く通す**。ここは
-「`WM_POINTER` が presenter / HUD の実 HWND に期待どおり配送されるか」という
-**未確認の前提**の上に立っており、これが崩れると Phase 3 の設計ごと引き直しになる。
-Phase 1 の出荷ゲートに含める。
+**動画 native の入力経路は Phase 1 で presenter に薄く実装した**。
+`WM_POINTER` が presenter / HUD の実 HWND に届く出荷ゲートは通過済みで、案 C は成立する。
+HUD 側の stream 所有、pointer emulation、ターゲットサイズ調整は Phase 3 でまとめて完成させる。

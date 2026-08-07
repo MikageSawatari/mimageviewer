@@ -290,6 +290,7 @@ struct NativeEguiOverlay {
     last_text_input_focus_claim_at: Option<Instant>,
     started_at: Instant,
     pending_events: Vec<egui::Event>,
+    native_touch: crate::video::native_touch::NativeTouchAdapter,
     modifiers: egui::Modifiers,
     pointer_pos: Option<egui::Pos2>,
     event_count: u64,
@@ -1431,6 +1432,9 @@ impl NativeOverlayInputRouting {
             }
             // native viewer の close は App 側でセッション終了として扱う。
             NativeEvent::CloseRequested { .. } => true,
+            // Touch is consumed by the presenter-local recognizer and primary
+            // emulation. It must never re-enter the legacy App mouse path.
+            NativeEvent::Touch(_) => false,
             // 内部処理イベント (presenter thread が直接消費する)。UI 転送しない。
             NativeEvent::GeometryChanged { .. }
             | NativeEvent::DpiChanged { .. }
@@ -3012,12 +3016,17 @@ impl NativeRenderCore {
         }
     }
 
-    /// Source swap で presenter-local な左セッションと hover latch を閉じる。
+    /// Source swap で presenter-local な panel/touch session を閉じる。
     /// 右状態は App が新ファイルの false を別 command で同期する。
-    pub fn reset_overlay_side_panel_session(&mut self) {
+    pub fn reset_overlay_source_session(&mut self) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.reset_side_panel_session();
         }
+    }
+
+    /// Video/audio mode changes use the same session boundary as source swap.
+    pub fn reset_overlay_side_panel_session(&mut self) {
+        self.reset_overlay_source_session();
     }
 
     pub fn set_overlay_fallback_file_name(&mut self, file_name: String) {
@@ -3806,6 +3815,7 @@ impl NativeEguiOverlay {
             last_text_input_focus_claim_at: None,
             started_at: Instant::now(),
             pending_events: Vec::new(),
+            native_touch: crate::video::native_touch::NativeTouchAdapter::default(),
             modifiers: egui::Modifiers::default(),
             pointer_pos: None,
             event_count: 0,
@@ -3975,6 +3985,79 @@ impl NativeEguiOverlay {
         }
     }
 
+    /// Builds the Phase 1 touch exclusion approximation.
+    ///
+    /// `compute_hud_regions()` returns the HUD HWND input-claim regions, not
+    /// exact painted egui chrome response rects. In particular, its drag
+    /// capture path may return the full surface while egui reports a pointer
+    /// down. Native Cancel must therefore release synthetic primary-down state
+    /// before `PointerGone`, or this approximation would remain capture-all.
+    fn native_touch_geometry(&self) -> crate::touch_input::TapZoneGeometry {
+        let ppp = self.pixels_per_point;
+        let surface = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(self.width as f32 / ppp, self.height as f32 / ppp),
+        );
+        let excluded = self
+            .compute_hud_regions()
+            .into_iter()
+            .map(|rect| {
+                egui::Rect::from_min_max(
+                    crate::video::native_touch::native_client_pixels_to_points(
+                        [rect.left, rect.top],
+                        ppp,
+                    ),
+                    crate::video::native_touch::native_client_pixels_to_points(
+                        [rect.right, rect.bottom],
+                        ppp,
+                    ),
+                )
+            })
+            .collect();
+        crate::touch_input::TapZoneGeometry {
+            surface,
+            excluded,
+            behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                accepts_pinch: false,
+            },
+        }
+    }
+
+    fn push_native_touch_event(
+        &mut self,
+        touch: crate::video::native_window::NativeVideoTouchEvent,
+    ) {
+        let geometry = self.native_touch_geometry();
+        let now_ms = self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let output =
+            self.native_touch
+                .handle_event(touch, &geometry, now_ms, self.pixels_per_point);
+        crate::touch_debug::log_native_touch_coordinates(
+            touch.pointer_id,
+            [touch.x, touch.y],
+            output.pos,
+        );
+        self.enqueue_native_pointer_events(output.egui_events);
+        for command in self.native_touch.take_commands() {
+            crate::touch_debug::log_native_touch_command(&command);
+            if crate::video::native_touch::native_touch_command_toggles_chrome(command) {
+                self.native_touch.toggle_chrome();
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn enqueue_native_pointer_events(&mut self, events: Vec<egui::Event>) {
+        for event in &events {
+            match event {
+                egui::Event::PointerMoved(pos) => self.pointer_pos = Some(*pos),
+                egui::Event::PointerGone => self.pointer_pos = None,
+                _ => {}
+            }
+        }
+        self.pending_events.extend(events);
+    }
+
     fn hud_dimmed_suppresses_overlay_pointer_event(
         event: &crate::video::native_window::NativeVideoWindowEvent,
     ) -> bool {
@@ -4017,7 +4100,11 @@ impl NativeEguiOverlay {
         hover_pos: Option<egui::Pos2>,
         overlay_height_points: f32,
         external_drag_in_progress: bool,
+        touch_chrome_latched: bool,
     ) -> bool {
+        if touch_chrome_latched {
+            return true;
+        }
         if external_drag_in_progress {
             return false;
         }
@@ -4028,7 +4115,11 @@ impl NativeEguiOverlay {
         hover_pos: Option<egui::Pos2>,
         currently_visible: bool,
         external_drag_in_progress: bool,
+        touch_chrome_latched: bool,
     ) -> bool {
+        if touch_chrome_latched {
+            return true;
+        }
         if external_drag_in_progress {
             return false;
         }
@@ -4287,6 +4378,7 @@ impl NativeEguiOverlay {
                 self.pending_events.push(egui::Event::PointerGone);
                 self.dirty = true;
             }
+            NativeEvent::Touch(touch) => self.push_native_touch_event(touch),
             // viewer close は App 側に転送し、overlay には流さない。
             NativeEvent::CloseRequested { .. } => {}
             // 内部処理イベント (presenter thread が直接消費する)。overlay には流さない。
@@ -4380,10 +4472,7 @@ impl NativeEguiOverlay {
     }
 
     fn native_pos(&self, x: i32, y: i32) -> egui::Pos2 {
-        egui::pos2(
-            x as f32 / self.pixels_per_point,
-            y as f32 / self.pixels_per_point,
-        )
+        crate::video::native_touch::native_client_pixels_to_points([x, y], self.pixels_per_point)
     }
 
     fn set_perf_visible(&mut self, visible: bool) -> bool {
@@ -4539,9 +4628,13 @@ impl NativeEguiOverlay {
     }
 
     fn reset_side_panel_session(&mut self) {
+        let touch_reset = self.native_touch.reset_for_source_swap();
+        let touch_changed = touch_reset.changed;
+        self.enqueue_native_pointer_events(touch_reset.egui_events);
         let changed = self.left_session_open
             || self.right_panel_hover_latched
-            || self.jump_panel_hover_latched;
+            || self.jump_panel_hover_latched
+            || touch_changed;
         self.left_session_open = false;
         self.right_panel_hover_latched = false;
         self.jump_panel_hover_latched = false;
@@ -5597,6 +5690,7 @@ impl NativeEguiOverlay {
             self.visibility_hover_pos(),
             overlay_height_points,
             self.external_drag_in_progress,
+            self.native_touch.chrome_latched(),
         )
     }
 
@@ -5605,6 +5699,7 @@ impl NativeEguiOverlay {
             self.visibility_hover_pos(),
             self.top_bar_visible,
             self.external_drag_in_progress,
+            self.native_touch.chrome_latched(),
         )
     }
 
@@ -8538,16 +8633,27 @@ mod tests {
         let upper_hover = Some(egui::pos2(120.0, 100.0));
 
         assert!(
-            NativeEguiOverlay::native_hud_bottom_visible_from_hover(bottom_hover, 720.0, false),
+            NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+                bottom_hover,
+                720.0,
+                false,
+                false,
+            ),
             "raw hover near the bottom should show the dimmed HUD"
         );
         assert!(!NativeEguiOverlay::native_hud_bottom_visible_from_hover(
             upper_hover,
             720.0,
-            false
+            false,
+            false,
         ));
         assert!(
-            !NativeEguiOverlay::native_hud_bottom_visible_from_hover(bottom_hover, 720.0, true),
+            !NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+                bottom_hover,
+                720.0,
+                true,
+                false,
+            ),
             "external drag remains authoritative even for raw hover"
         );
         assert!(
@@ -8561,12 +8667,14 @@ mod tests {
         assert!(NativeEguiOverlay::native_hud_top_visible_from_hover(
             Some(egui::pos2(40.0, 20.0)),
             false,
-            false
+            false,
+            false,
         ));
         assert!(!NativeEguiOverlay::native_hud_top_visible_from_hover(
             Some(egui::pos2(40.0, 80.0)),
             false,
-            false
+            false,
+            false,
         ));
         assert!(
             NativeEguiOverlay::hud_dimmed_suppresses_overlay_pointer_event(
@@ -8592,7 +8700,30 @@ mod tests {
         assert!(NativeEguiOverlay::native_hud_bottom_visible_from_hover(
             pointer_pos,
             720.0,
-            false
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn touch_chrome_latch_reveals_bars_without_hover_and_preserves_hover_behavior() {
+        assert!(NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+            None, 720.0, false, true,
+        ));
+        assert!(NativeEguiOverlay::native_hud_top_visible_from_hover(
+            None, false, false, true,
+        ));
+        assert!(NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+            Some(egui::pos2(100.0, 650.0)),
+            720.0,
+            false,
+            false,
+        ));
+        assert!(!NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+            Some(egui::pos2(100.0, 100.0)),
+            720.0,
+            false,
+            false,
         ));
     }
 

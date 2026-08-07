@@ -3599,6 +3599,7 @@ impl App {
             crate::video::native_window::NativeVideoWindowEvent::DpiChanged { .. }
             | crate::video::native_window::NativeVideoWindowEvent::RequestRaiseHud
             | crate::video::native_window::NativeVideoWindowEvent::RequestFocusClaim
+            | crate::video::native_window::NativeVideoWindowEvent::Touch(_)
             | crate::video::native_window::NativeVideoWindowEvent::CursorOwnership(_)
             | crate::video::native_window::NativeVideoWindowEvent::Destroyed => {}
         }
