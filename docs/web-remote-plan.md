@@ -1383,7 +1383,8 @@ distribution clean は通常 target / portable target の両方で `mimageviewer
 補正モードと色調スライダーは `色調`、AI モデル選択は `AI`、カラー化の方式・プリセット・調整値は
 `カラー化` に置く。補正対象と適用スコープは本体と同じくタブより上に置き、現在リモートが提供する
 色調リセットと状態表示はタブより下に置く。これにより、タブを跨いで効く操作を特定タブの奥へ
-隠さない。色調スライダーの pointer 処理は移動せず、相対ドラッグと絶対位置タップを維持する。
+隠さない。色調・カラー化スライダーの pointer 処理は移動せず、押下位置に飛ばない相対ドラッグと
+native range のキーボード・支援技術対応を維持する。
 
 タブ選択は出力状態ではなく端末 UI の位置なので、本体の `AdjustmentSettingsTab` とは共有しない。
 既存の `miv-remote-local-settings` version 1 に後方互換な `adjustmentTab` を加え、未知値や旧保存値は
@@ -1393,6 +1394,27 @@ distribution clean は通常 target / portable target の両方で `mimageviewer
 本体値をそのまま保持する。操作不能な空タブは現在値を確認・変更できるように見せてしまうため出さない。
 PC と共有される post-filter を端末でも可視化・編集する必要は残っており、IPC、表示、書込みを一組で
 追加する別作業とする。
+
+### 12.20 補正スライダーの縦パン所有権 (2026-08-07)
+
+補正パネルは縦スクロールする文脈なので、色調・カラー化の range は `touch-action: pan-y` とする。
+ブラウザが縦パンを選んだ場合は `pointercancel` / `touchcancel` を通常の確定終了として扱わず、
+pointer 開始時の値へ戻す。cancel 前に横ブレの preview が発行済みなら、開始値の preview を最新要求として
+再投入し、永続書込みは行わない。touch の pointer event では viewport パンを
+`preventDefault()` で所有しようとせず、mouse / pen の native range 操作を抑える既存処理だけを残す。
+画像・動画の seek range はスクロール文脈にないため `touch-action: none` のままとする。
+
+太いスクロールバーは、range 上から縦パンできない根因を解消せず狭い画面の内容幅も減らすため追加しない。
+タブ分割と通常のスクロール位置で、下に内容が続くことは示す。
+
+静止画のダブルタップはブラウザ任せではない。画像または余白を hit した pointer event が
+`.viewer-stage` へ bubble し、remote 自身の `viewerTapSequenceTransition` が
+`fit_toggle_page_original` を発行する既存仕様である。実機 telemetry でも
+`double_tap_fit` の直後に `fit_mode: original` の画像を再取得している。
+`.image-viewer` と `.viewer-stage` はともに `touch-action: none` で、ブラウザの viewport 操作を
+許可せず remote が pinch と pan を所有する。`manipulation` への変更は browser pinch/pan と
+remote の gesture owner を競合させるため行わない。既存のダブルタップ機能を廃止するか、原寸表示中の
+UI 配置を別の不具合として直すかは、利用者仕様を確認してから扱う。
 
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 

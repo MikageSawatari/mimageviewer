@@ -1659,7 +1659,7 @@ button {
 .adjustment-slider-row input[type="range"] {
   width: 100%;
   min-height: 28px;
-  touch-action: none;
+  touch-action: pan-y;
 }
 
 .adjustment-colorize {

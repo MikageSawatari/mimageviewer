@@ -365,6 +365,19 @@ test("adjustment slider resets keep a stable reserved layout slot", async () => 
   assert.match(app, /resetButton\.hidden\s*=\s*!adjustmentResetVisible/);
 });
 
+test("adjustment ranges yield vertical pan without weakening viewer gesture owners", async () => {
+  const css = await readFile(new URL("styles.css", here), "utf8");
+  const html = await readFile(new URL("index.html", here), "utf8");
+  assert.match(
+    css,
+    /\.adjustment-slider-row input\[type="range"\]\s*\{[^}]*touch-action:\s*pan-y/
+  );
+  assert.match(css, /\.viewer-seek-input\s*\{[^}]*touch-action:\s*none/);
+  assert.match(css, /\.image-viewer\s*\{[^}]*touch-action:\s*none/);
+  assert.match(css, /\.viewer-stage\s*\{[^}]*touch-action:\s*none/);
+  assert.doesNotMatch(html, /maximum-scale|user-scalable/i);
+});
+
 test("image tiles preserve portrait and landscape shape below a separate label row", async () => {
   const css = await readFile(new URL("styles.css", here), "utf8");
   const app = await readFile(new URL("app.js", here), "utf8");

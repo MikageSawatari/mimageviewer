@@ -402,6 +402,97 @@ test("adjustment tabs keep shared actions outside and preserve range pointer han
   }
 });
 
+test("adjustment touch cancellation restores the starting value without committing", () => {
+  const panel = new ViewerAdjustmentPanel();
+  let previewCalls = 0;
+  let commitCalls = 0;
+  panel.queuePreview = () => { previewCalls += 1; };
+  panel.commitCurrent = async () => { commitCalls += 1; };
+
+  const cases = [
+    {
+      input: panel.controls.get("brightness").input,
+      read: () => panel.values.brightness,
+    },
+    {
+      input: panel.colorizeControls.get("mono_tolerance").input,
+      read: () => panel.values.colorize.mono_tolerance,
+    },
+  ];
+  let pointerId = 10;
+  for (const target of cases) {
+    const input = target.input;
+    input.disabled = false;
+    input.getBoundingClientRect = () => ({ width: 200 });
+    input.focus = () => {};
+    input.setPointerCapture = () => {};
+    input.hasPointerCapture = () => false;
+    input.releasePointerCapture = () => {};
+    const startingValue = target.read();
+    const previewsBefore = previewCalls;
+    let prevented = 0;
+    const pointerEvent = (type, clientX, cancelable = true) => ({
+      type,
+      pointerId,
+      pointerType: "touch",
+      isPrimary: true,
+      button: 0,
+      clientX,
+      cancelable,
+      preventDefault() { prevented += 1; },
+      stopPropagation() {},
+    });
+
+    input.dispatchEvent(pointerEvent("pointerdown", 80));
+    input.dispatchEvent(pointerEvent("pointermove", 120));
+    assert.notEqual(target.read(), startingValue);
+    input.dispatchEvent(pointerEvent("pointercancel", 120, false));
+
+    assert.equal(target.read(), startingValue);
+    assert.equal(panel.dirty, false);
+    assert.equal(previewCalls - previewsBefore, 2);
+    assert.equal(commitCalls, 0);
+    assert.equal(prevented, 0);
+    pointerId += 1;
+  }
+});
+
+test("adjustment horizontal touch drag still previews and commits", () => {
+  const panel = new ViewerAdjustmentPanel();
+  const input = panel.controls.get("brightness").input;
+  input.getBoundingClientRect = () => ({ width: 200 });
+  input.focus = () => {};
+  input.setPointerCapture = () => {};
+  input.hasPointerCapture = () => true;
+  input.releasePointerCapture = () => {};
+  let previewCalls = 0;
+  let commitCalls = 0;
+  let prevented = 0;
+  panel.queuePreview = () => { previewCalls += 1; };
+  panel.commitCurrent = async () => { commitCalls += 1; };
+  const pointerEvent = (type, clientX) => ({
+    type,
+    pointerId: 20,
+    pointerType: "touch",
+    isPrimary: true,
+    button: 0,
+    clientX,
+    cancelable: true,
+    preventDefault() { prevented += 1; },
+    stopPropagation() {},
+  });
+
+  input.dispatchEvent(pointerEvent("pointerdown", 80));
+  input.dispatchEvent(pointerEvent("pointermove", 120));
+  input.dispatchEvent(pointerEvent("pointerup", 120));
+
+  assert.notEqual(panel.values.brightness, 0);
+  assert.equal(panel.dirty, false);
+  assert.equal(previewCalls, 1);
+  assert.equal(commitCalls, 1);
+  assert.equal(prevented, 0);
+});
+
 test("adjustment preview keeps one request in flight and coalesces to the latest value", async () => {
   let releaseFirst;
   const firstGate = new Promise((resolve) => { releaseFirst = resolve; });

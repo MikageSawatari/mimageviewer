@@ -5361,11 +5361,12 @@ export class ViewerAdjustmentPanel {
         event.stopPropagation();
         if (input.disabled || event.isPrimary === false) return;
         if (typeof event.button === "number" && event.button !== 0) return;
-        if (event.cancelable) event.preventDefault();
+        if (event.pointerType !== "touch" && event.cancelable) event.preventDefault();
         pointerDrag = {
           pointerId: event.pointerId,
           startClientX: event.clientX,
           startValue: Number(this.values[key]),
+          startDirty: this.dirty,
           trackWidth: input.getBoundingClientRect().width,
         };
         input.focus({ preventScroll: true });
@@ -5378,7 +5379,7 @@ export class ViewerAdjustmentPanel {
       input.addEventListener("pointermove", (event) => {
         if (!pointerDrag || pointerDrag.pointerId !== event.pointerId) return;
         event.stopPropagation();
-        if (event.cancelable) event.preventDefault();
+        if (event.pointerType !== "touch" && event.cancelable) event.preventDefault();
         applyValue(relativeRangeDragValue({
           startValue: pointerDrag.startValue,
           startClientX: pointerDrag.startClientX,
@@ -5390,33 +5391,61 @@ export class ViewerAdjustmentPanel {
           logarithmic,
         }));
       });
+      const releasePointer = (event) => {
+        if (!pointerDrag) return null;
+        const activePointer = pointerDrag;
+        const pointerId = typeof event.pointerId === "number"
+          ? event.pointerId
+          : activePointer.pointerId;
+        try {
+          if (input.hasPointerCapture(pointerId)) {
+            input.releasePointerCapture(pointerId);
+          }
+        } catch (_error) {
+          // Direct manipulation may release capture before pointercancel.
+        }
+        pointerDrag = null;
+        return activePointer;
+      };
       const finishPointer = (event) => {
         if (pointerDrag && pointerDrag.pointerId !== event.pointerId) {
           event.stopPropagation();
           return;
         }
         if (pointerDrag) {
-          if (event.cancelable) event.preventDefault();
-          try {
-            if (input.hasPointerCapture(event.pointerId)) {
-              input.releasePointerCapture(event.pointerId);
-            }
-          } catch (_error) {
-            // The browser may release capture before dispatching pointercancel.
-          }
-          pointerDrag = null;
+          if (event.pointerType !== "touch" && event.cancelable) event.preventDefault();
+          releasePointer(event);
         }
         finish(event);
       };
+      const cancelPointer = (event) => {
+        if (
+          pointerDrag &&
+          typeof event.pointerId === "number" &&
+          pointerDrag.pointerId !== event.pointerId
+        ) {
+          event.stopPropagation();
+          return;
+        }
+        const cancelledDrag = releasePointer(event);
+        event.stopPropagation();
+        if (!cancelledDrag) return;
+        const changed = this.values[key] !== cancelledDrag.startValue;
+        this.values[key] = cancelledDrag.startValue;
+        this.dirty = cancelledDrag.startDirty;
+        this.syncControl(key);
+        if (changed) this.queuePreview();
+      };
       input.addEventListener("pointerup", finishPointer);
-      input.addEventListener("pointercancel", finishPointer);
+      input.addEventListener("pointercancel", cancelPointer);
       input.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
       });
-      for (const eventName of ["touchend", "touchcancel", "change"]) {
+      for (const eventName of ["touchend", "change"]) {
         input.addEventListener(eventName, finish);
       }
+      input.addEventListener("touchcancel", cancelPointer);
       row.append(heading, input);
       this.sliderList.append(row);
       this.controls.set(key, {
@@ -5828,11 +5857,12 @@ export class ViewerAdjustmentPanel {
       event.stopPropagation();
       if (input.disabled || event.isPrimary === false) return;
       if (typeof event.button === "number" && event.button !== 0) return;
-      if (event.cancelable) event.preventDefault();
+      if (event.pointerType !== "touch" && event.cancelable) event.preventDefault();
       pointerDrag = {
         pointerId: event.pointerId,
         startClientX: event.clientX,
         startValue: Number(this.values.colorize[key]),
+        startDirty: this.dirty,
         trackWidth: input.getBoundingClientRect().width,
       };
       input.focus({ preventScroll: true });
@@ -5845,7 +5875,7 @@ export class ViewerAdjustmentPanel {
     input.addEventListener("pointermove", (event) => {
       if (!pointerDrag || pointerDrag.pointerId !== event.pointerId) return;
       event.stopPropagation();
-      if (event.cancelable) event.preventDefault();
+      if (event.pointerType !== "touch" && event.cancelable) event.preventDefault();
       applyValue(relativeRangeDragValue({
         startValue: pointerDrag.startValue,
         startClientX: pointerDrag.startClientX,
@@ -5857,33 +5887,61 @@ export class ViewerAdjustmentPanel {
         logarithmic: false,
       }));
     });
+    const releasePointer = (event) => {
+      if (!pointerDrag) return null;
+      const activePointer = pointerDrag;
+      const pointerId = typeof event.pointerId === "number"
+        ? event.pointerId
+        : activePointer.pointerId;
+      try {
+        if (input.hasPointerCapture(pointerId)) {
+          input.releasePointerCapture(pointerId);
+        }
+      } catch (_error) {
+        // Direct manipulation may release capture before pointercancel.
+      }
+      pointerDrag = null;
+      return activePointer;
+    };
     const finishPointer = (event) => {
       if (pointerDrag && pointerDrag.pointerId !== event.pointerId) {
         event.stopPropagation();
         return;
       }
       if (pointerDrag) {
-        if (event.cancelable) event.preventDefault();
-        try {
-          if (input.hasPointerCapture(event.pointerId)) {
-            input.releasePointerCapture(event.pointerId);
-          }
-        } catch (_error) {
-          // The browser may release capture before dispatching pointercancel.
-        }
-        pointerDrag = null;
+        if (event.pointerType !== "touch" && event.cancelable) event.preventDefault();
+        releasePointer(event);
       }
       finish(event);
     };
+    const cancelPointer = (event) => {
+      if (
+        pointerDrag &&
+        typeof event.pointerId === "number" &&
+        pointerDrag.pointerId !== event.pointerId
+      ) {
+        event.stopPropagation();
+        return;
+      }
+      const cancelledDrag = releasePointer(event);
+      event.stopPropagation();
+      if (!cancelledDrag) return;
+      const changed = this.values.colorize[key] !== cancelledDrag.startValue;
+      this.values.colorize[key] = cancelledDrag.startValue;
+      this.dirty = cancelledDrag.startDirty;
+      this.syncColorizeControl(key);
+      if (changed) this.queuePreview();
+    };
     input.addEventListener("pointerup", finishPointer);
-    input.addEventListener("pointercancel", finishPointer);
+    input.addEventListener("pointercancel", cancelPointer);
     input.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
     });
-    for (const eventName of ["touchend", "touchcancel", "change"]) {
+    for (const eventName of ["touchend", "change"]) {
       input.addEventListener(eventName, finish);
     }
+    input.addEventListener("touchcancel", cancelPointer);
 
     row.append(heading, input);
     parent.append(row);
