@@ -41,6 +41,7 @@ import {
   remoteSessionControlTransition,
   remoteSessionFailureStatus,
   remoteSessionTransitionTelemetry,
+  remoteAddressIdentity,
   remoteStateGenerationTransition,
   reduceViewerTransform,
   resolveGridReturnViewport,
@@ -51,6 +52,7 @@ import {
   nextFitMode,
   pagePrefetchPlan,
   pageResponseGenerationAttestation,
+  pageResponseIdentityAttestation,
   planSpreadIntent,
   snappedGridOffset,
   thumbnailBindingMatches,
@@ -438,6 +440,76 @@ test("normal telemetry keeps health facts but removes path, message and identity
     current_time_secs: 42.5,
     buffer_ahead_secs: 8.25,
     ready_state: 2,
+    telemetry_tier: "normal",
+  });
+});
+
+test("page identity comparison distinguishes PDF documents, ZIP entries, and files", () => {
+  const pdf = (relativePath) => ({
+    favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+    relative_path: relativePath,
+    subresource: { kind: "pdf_page", page_number: 1 },
+  });
+  const encoded = (identity) => encodeURIComponent(JSON.stringify(identity));
+  assert.equal(
+    pageResponseIdentityAttestation(pdf("books/first.pdf"), encoded(pdf("books/first.pdf"))).matches,
+    true
+  );
+  assert.equal(
+    pageResponseIdentityAttestation(pdf("books/first.pdf"), encoded(pdf("books/other.pdf"))).matches,
+    false
+  );
+
+  const zipEntry = (entryName) => ({
+    favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+    relative_path: "books/first.zip",
+    subresource: { kind: "zip_entry", entry_name: entryName },
+  });
+  assert.notEqual(
+    remoteAddressIdentity(zipEntry("chapter/001.jpg")),
+    remoteAddressIdentity(zipEntry("chapter/002.jpg"))
+  );
+  assert.notEqual(
+    remoteAddressIdentity({
+      favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+      relative_path: "pages/001.jpg",
+      subresource: { kind: "file" },
+    }),
+    remoteAddressIdentity({
+      favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+      relative_path: "pages/002.jpg",
+      subresource: { kind: "file" },
+    })
+  );
+});
+
+test("normal mismatch telemetry retains only the two typed page identities", () => {
+  const requested = {
+    favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+    relative_path: "private/first.pdf",
+    subresource: { kind: "pdf_page", page_number: 1 },
+  };
+  const response = {
+    favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+    relative_path: "private/other.pdf",
+    subresource: { kind: "pdf_page", page_number: 1 },
+    session_id: "must-not-pass",
+  };
+  assert.deepEqual(telemetryEventForTier({
+    type: "error",
+    category: "page_identity_mismatch",
+    message: "must be omitted",
+    requested_page_identity: requested,
+    response_page_identity: response,
+  }), {
+    type: "error",
+    category: "page_identity_mismatch",
+    requested_page_identity: requested,
+    response_page_identity: {
+      favorite_id: response.favorite_id,
+      relative_path: response.relative_path,
+      subresource: response.subresource,
+    },
     telemetry_tier: "normal",
   });
 });

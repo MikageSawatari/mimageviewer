@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 30;
+pub const PROTOCOL_VERSION: u32 = 31;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -746,6 +746,9 @@ pub struct PagePayload {
     pub content_type: String,
     pub width: u32,
     pub height: u32,
+    /// 画素生成側が、解決済み logical path と実際に選んだ subresource から再構成した identity。
+    /// HTTP 要求値の echo ではなく、応答画像の取り違え検査に使用する。
+    pub identity: RemoteAddress,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -2016,8 +2019,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v30_session_epoch_auto_trim_partner_video_and_audio_status_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 30);
+    fn protocol_v31_page_identity_session_epoch_auto_trim_partner_video_and_audio_status_round_trip()
+     {
+        assert_eq!(PROTOCOL_VERSION, 31);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -2549,6 +2553,38 @@ mod tests {
             assert_eq!(decoded, address);
             assert!(!String::from_utf8(encoded).unwrap().contains("C:"));
         }
+    }
+
+    #[test]
+    fn page_payload_carries_the_rendered_identity_across_ipc() {
+        let identity = RemoteAddress {
+            favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
+            relative_path: "books/volume.pdf".to_owned(),
+            subresource: RemoteSubresource::PdfPage { page_number: 1 },
+        };
+        let expected = ServerMessage::Page {
+            id: 88,
+            response: PageResponse::Success(PagePayload {
+                bytes: vec![1, 2, 3],
+                content_type: "image/jpeg".to_owned(),
+                width: 1200,
+                height: 1800,
+                identity: identity.clone(),
+            }),
+        };
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &expected).unwrap();
+        let decoded: ServerMessage =
+            read_frame(&mut frame.as_slice(), MAX_RESPONSE_FRAME_BYTES).unwrap();
+        assert_eq!(decoded, expected);
+        let ServerMessage::Page {
+            response: PageResponse::Success(payload),
+            ..
+        } = decoded
+        else {
+            unreachable!();
+        };
+        assert_eq!(payload.identity, identity);
     }
 
     #[test]

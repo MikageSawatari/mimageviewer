@@ -28,6 +28,7 @@ import {
   nextSpreadMode,
   normalizeVisualViewportScale,
   pageResponseGenerationAttestation,
+  pageResponseIdentityAttestation,
   pagePrefetchPlan,
   planSpreadIntent,
   reduceViewerTransform,
@@ -38,6 +39,7 @@ import {
   remoteSessionControlTransition,
   remoteSessionFailureStatus,
   remoteSessionTransitionTelemetry,
+  remoteAddressIdentity,
   rangeValueFromNormalized,
   rangeValueToNormalized,
   relativeRangeDragValue,
@@ -127,6 +129,7 @@ const AI_TERMINAL_STATES = new Set([
 const APP_ASSET_TOKEN_PATTERN = /^[a-f0-9]{16}$/;
 const APP_UPDATE_RELOAD_ATTEMPT_KEY = "miv-remote-app-update-reload-attempt";
 const RUNTIME_TEST_MODE = globalThis.__MIV_RUNTIME_TEST_MODE__ === true;
+let runtimeTestErrorObserver = null;
 const REMOTE_CLIENT_ID = loadRemoteClientId();
 const LOCAL_SETTINGS_LOAD = loadLocalSettings();
 
@@ -3507,21 +3510,7 @@ function thumbnailBindingKey(entry) {
 
 
 function addressIdentity(address) {
-  const target = address?.subresource ?? {};
-  const inner =
-    target.kind === "zip_entry"
-      ? target.entry_name
-      : target.kind === "zip_directory"
-        ? target.prefix
-        : target.kind === "pdf_page"
-          ? String(target.page_number)
-          : "";
-  return [
-    address?.favorite_id ?? "",
-    address?.relative_path ?? "",
-    target.kind ?? "",
-    inner,
-  ].join("\n");
+  return remoteAddressIdentity(address);
 }
 
 function entryIdentity(entry) {
@@ -4210,6 +4199,7 @@ function imageRequest(
         : `${infoCacheKey}\n${targetPx}\n${state.pageRenderRevision}\n${remoteStateGeneration}\n${remoteSessionId}\n${JSON.stringify(renderContext)}`,
       remoteStateGeneration,
       remoteSessionId,
+      address: entry.address,
       width: targetPx,
       cssWidth: resolvedLayout.cssWidth,
       dpr,
@@ -6298,6 +6288,7 @@ export class ViewerAdjustmentPanel {
       const detail = await response.clone().json().catch(() => ({}));
       throw new Error(detail.message || `補正プレビューに失敗しました (HTTP ${response.status})。`);
     }
+    requirePageResponseIdentity(request.address, response);
     requirePageResponseGeneration(request, response);
     const blob = await response.blob();
     if (
@@ -7763,6 +7754,10 @@ export class RemoteAiController {
       error instanceof AuthenticationRequiredError ||
       this.remoteSessionState.blocksInteraction
     ) return;
+    if (error?.code === "page_identity_mismatch") {
+      this.show(error.message, { error: true, shortLabel: RemoteAiShortLabel.DONE });
+      return;
+    }
     this.show("接続を確認しています", {
       shortLabel: RemoteAiShortLabel.CONNECTING,
     });
@@ -7817,10 +7812,6 @@ export class RemoteAiController {
     }
     const appliedIdentity = `${snapshot.job_id}:${this.displayVersion}`;
     if (this.appliedIdentity === appliedIdentity) {
-      this.show(completionMessage, {
-        hideAfterMs: 2400,
-        shortLabel: RemoteAiShortLabel.DONE,
-      });
       return;
     }
     this.show("表示を整えています");
@@ -7832,6 +7823,15 @@ export class RemoteAiController {
       if (!response.ok) {
         const detail = await response.clone().json().catch(() => ({}));
         throw new Error(detail.message || "AI 処理後の画像を取得できませんでした。");
+      }
+      try {
+        requirePageResponseIdentity(this.pages[pageIndex]?.address, response);
+      } catch (error) {
+        if (error?.code === "page_identity_mismatch") {
+          // Any rejected page makes this exact job/display result terminal for application.
+          this.appliedIdentity = appliedIdentity;
+        }
+        throw error;
       }
       return {
         pageIndex,
@@ -7849,8 +7849,13 @@ export class RemoteAiController {
       });
   }
 
-  showRequestError(_error) {
-    this.show("AI 処理を開始できませんでした。", { error: true });
+  showRequestError(error) {
+    this.show(
+      error?.code === "page_identity_mismatch"
+        ? error.message
+        : "AI 処理を開始できませんでした。",
+      { error: true }
+    );
   }
 
   show(
@@ -8424,6 +8429,7 @@ export class ImageViewer {
         if (!response.ok) {
           throw await pageResourceResponseError(response);
         }
+        if (request.address) requirePageResponseIdentity(request.address, response);
         if (request.remoteStateGeneration != null) {
           requirePageResponseGeneration(request, response);
         }
@@ -8517,9 +8523,11 @@ export class ImageViewer {
       this.title.textContent =
         error instanceof Error ? error.message : "ページを表示できませんでした。";
       this.root.classList.remove("viewer-ui-hidden");
-      recordClientError("image_load_error", error, {
-        resource: safeResourcePath(request.url),
-      });
+      if (error?.code !== "page_identity_mismatch") {
+        recordClientError("image_load_error", error, {
+          resource: safeResourcePath(request.url),
+        });
+      }
       return false;
     }
   }
@@ -8552,6 +8560,7 @@ export class ImageViewer {
         if (!response.ok) {
           throw await pageResourceResponseError(response);
         }
+        if (request.address) requirePageResponseIdentity(request.address, response);
         if (request.remoteStateGeneration != null) {
           requirePageResponseGeneration(request, response);
         }
@@ -8662,7 +8671,9 @@ export class ImageViewer {
         ? error.message
         : "見開きを表示できませんでした。";
       this.root.classList.remove("viewer-ui-hidden");
-      recordClientError("spread_load_error", error);
+      if (error?.code !== "page_identity_mismatch") {
+        recordClientError("spread_load_error", error);
+      }
       return false;
     }
   }
@@ -9405,6 +9416,7 @@ async function fetchPageResource(request, signal, prefetch) {
     error.code = "remote_session_unattested";
     throw error;
   }
+  requirePageResponseIdentity(request.address, response);
   requirePageResponseGeneration(request, response);
   const width = Number(response.headers.get("X-mIV-Image-Width"));
   const height = Number(response.headers.get("X-mIV-Image-Height"));
@@ -9417,6 +9429,23 @@ async function fetchPageResource(request, signal, prefetch) {
         ? { width, height }
         : null,
   };
+}
+
+function requirePageResponseIdentity(requestedAddress, response) {
+  const attestation = pageResponseIdentityAttestation(
+    requestedAddress,
+    response.headers.get("X-mIV-Page-Identity")
+  );
+  if (attestation.matches) return;
+  const error = new Error(
+    "要求したページと応答画像の identity が一致しないため、表示を中止しました。"
+  );
+  error.code = "page_identity_mismatch";
+  recordClientError("page_identity_mismatch", error, {
+    requested_page_identity: attestation.requestedIdentity,
+    response_page_identity: attestation.responseIdentity,
+  });
+  throw error;
 }
 
 function requirePageResponseGeneration(request, response) {
@@ -9652,6 +9681,9 @@ function connectionInfo() {
 }
 
 function recordClientError(category, error, extra = {}) {
+  if (RUNTIME_TEST_MODE && typeof runtimeTestErrorObserver === "function") {
+    runtimeTestErrorObserver({ category, error, extra });
+  }
   const normalized = normalizeError(error);
   enqueueTelemetry({
     type: "error",
@@ -9662,6 +9694,11 @@ function recordClientError(category, error, extra = {}) {
     ...extra,
   });
   noteHudError();
+}
+
+export function setRuntimeTestErrorObserver(observer) {
+  if (!RUNTIME_TEST_MODE) return;
+  runtimeTestErrorObserver = typeof observer === "function" ? observer : null;
 }
 
 function normalizeError(error) {

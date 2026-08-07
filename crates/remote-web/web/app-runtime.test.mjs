@@ -46,6 +46,7 @@ class FakeElement {
   append(...nodes) { this.children.push(...nodes); }
   replaceChildren(...nodes) { this.children = nodes; }
   replaceWith(node) { this.replacedWith = node; }
+  remove() { this.removed = true; }
   async decode() { return FakeElement.decodeHook?.(this); }
 }
 
@@ -82,6 +83,12 @@ globalThis.requestAnimationFrame = (callback) => {
 };
 globalThis.cancelAnimationFrame = () => {};
 const TEST_SESSION_ID = "0123456789abcdef0123456789abcdef";
+const TEST_PAGE_ADDRESS = {
+  favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+  relative_path: "books/test.pdf",
+  subresource: { kind: "pdf_page", page_number: 0 },
+};
+const pageIdentityHeader = (address) => encodeURIComponent(JSON.stringify(address));
 const imageFetch = async () => new Response(new Blob([new Uint8Array([1, 2, 3])]), {
   status: 200,
   headers: {
@@ -91,6 +98,7 @@ const imageFetch = async () => new Response(new Blob([new Uint8Array([1, 2, 3])]
     "X-mIV-Image-Height": "1800",
     "X-mIV-Remote-State-Generation": "test-1",
     "X-mIV-Remote-Session": TEST_SESSION_ID,
+    "X-mIV-Page-Identity": pageIdentityHeader(TEST_PAGE_ADDRESS),
   },
 });
 globalThis.fetch = imageFetch;
@@ -124,6 +132,7 @@ const {
   resolveLegacyImageOpenRoute,
   resolveMediaOpenRoute,
   selectRecoverableRemoteAiJob,
+  setRuntimeTestErrorObserver,
   thumbnailAddressForEntry,
   videoFileTargetIndex,
   viewerMenuDefinitions,
@@ -856,6 +865,7 @@ test("viewer load executes fetch, decode, layout and atomic replacement", async 
       cacheKey: "page-1@1800",
       remoteStateGeneration: "test-1",
       remoteSessionId: TEST_SESSION_ID,
+      address: TEST_PAGE_ADDRESS,
       width: 1800,
       cssWidth: 430,
       dpr: 2,
@@ -938,6 +948,7 @@ test("rapid page loads finish the active request and start only the latest pendi
         "X-mIV-Image-Height": "1800",
         "X-mIV-Remote-State-Generation": "test-1",
         "X-mIV-Remote-Session": TEST_SESSION_ID,
+        "X-mIV-Page-Identity": pageIdentityHeader(TEST_PAGE_ADDRESS),
       },
     });
   };
@@ -947,6 +958,7 @@ test("rapid page loads finish the active request and start only the latest pendi
       url: `/api/page?rapid=${page}`,
       remoteStateGeneration: "test-1",
       remoteSessionId: TEST_SESSION_ID,
+      address: TEST_PAGE_ADDRESS,
       width: 1800,
       cssWidth: 430,
       dpr: 2,
@@ -1024,6 +1036,68 @@ test("the AI status offers no cancel control, matching the desktop viewer", () =
   );
 });
 
+test("AI result identity mismatch is not applied or automatically fetched again", async () => {
+  const requestedIdentity = {
+    favorite_id: TEST_PAGE_ADDRESS.favorite_id,
+    relative_path: "books/ai-source.pdf",
+    subresource: { kind: "pdf_page", page_number: 1 },
+  };
+  const responseIdentity = {
+    favorite_id: TEST_PAGE_ADDRESS.favorite_id,
+    relative_path: "books/other.pdf",
+    subresource: { kind: "pdf_page", page_number: 1 },
+  };
+  let replaceCalls = 0;
+  const controller = new RemoteAiController(
+    {
+      root: new FakeElement("section"),
+      async replacePageBlobs() {
+        replaceCalls += 1;
+        return true;
+      },
+    },
+    new FakeElement("div"),
+    () => () => {}
+  );
+  const snapshot = {
+    job_id: "identity-job",
+    state: "ready",
+    page_outcomes: [{ page_index: 0, state: "ready" }],
+  };
+  controller.pages = [{ address: requestedIdentity, target_px: 1800, name: "AI page" }];
+  controller.displayVersion = 1;
+  controller.job = snapshot;
+  let fetchCount = 0;
+  const errors = [];
+  setRuntimeTestErrorObserver((event) => errors.push(event));
+  globalThis.fetch = async () => {
+    fetchCount += 1;
+    return new Response(new Blob([new Uint8Array([1, 2, 3])]), {
+      status: 200,
+      headers: {
+        "Content-Type": "image/jpeg",
+        "X-mIV-Page-Identity": pageIdentityHeader(responseIdentity),
+      },
+    });
+  };
+  try {
+    await assert.rejects(
+      controller.applyReady(snapshot, controller.generation),
+      (error) => error?.code === "page_identity_mismatch"
+    );
+    await controller.applyReady(snapshot, controller.generation);
+    assert.equal(fetchCount, 1);
+    assert.equal(replaceCalls, 0);
+    assert.equal(errors.length, 1);
+    assert.deepEqual(errors[0].extra.requested_page_identity, requestedIdentity);
+    assert.deepEqual(errors[0].extra.response_page_identity, responseIdentity);
+  } finally {
+    setRuntimeTestErrorObserver(null);
+    globalThis.fetch = imageFetch;
+    controller.destroy();
+  }
+});
+
 test("viewer refuses a page response without a generation attestation", async () => {
   const initialImage = new FakeElement("img");
   const title = new FakeElement("div");
@@ -1044,6 +1118,7 @@ test("viewer refuses a page response without a generation attestation", async ()
       "X-mIV-Image-Width": "1200",
       "X-mIV-Image-Height": "1800",
       "X-mIV-Remote-Session": TEST_SESSION_ID,
+      "X-mIV-Page-Identity": pageIdentityHeader(TEST_PAGE_ADDRESS),
     },
   });
   try {
@@ -1054,6 +1129,7 @@ test("viewer refuses a page response without a generation attestation", async ()
         cacheKey: "page-unattested@1800",
         remoteStateGeneration: "test-1",
         remoteSessionId: TEST_SESSION_ID,
+        address: TEST_PAGE_ADDRESS,
         width: 1800,
         cssWidth: 430,
         dpr: 2,
@@ -1073,6 +1149,82 @@ test("viewer refuses a page response without a generation attestation", async ()
     assert.equal(viewer.pageLayer.children[0], initialImage);
     assert.match(title.textContent, /状態版/);
   } finally {
+    globalThis.fetch = imageFetch;
+    viewer.destroy();
+  }
+});
+
+test("viewer rejects a mismatched page identity without display or retry and reports both identities", async () => {
+  const requestedIdentity = {
+    favorite_id: TEST_PAGE_ADDRESS.favorite_id,
+    relative_path: "books/first.pdf",
+    subresource: { kind: "pdf_page", page_number: 1 },
+  };
+  const responseIdentity = {
+    favorite_id: TEST_PAGE_ADDRESS.favorite_id,
+    relative_path: "books/other.pdf",
+    subresource: { kind: "pdf_page", page_number: 1 },
+  };
+  const initialImage = new FakeElement("img");
+  const title = new FakeElement("div");
+  const viewer = new ImageViewer({
+    root: new FakeElement("section"),
+    stage: new FakeElement("div"),
+    image: initialImage,
+    title,
+    counter: new FakeElement("span"),
+    previous: new FakeElement("button"),
+    next: new FakeElement("button"),
+    loadingIndicator: new FakeElement("div"),
+  });
+  let fetchCount = 0;
+  const errors = [];
+  setRuntimeTestErrorObserver((event) => errors.push(event));
+  globalThis.fetch = async () => {
+    fetchCount += 1;
+    return new Response(new Blob([new Uint8Array([1, 2, 3])]), {
+      status: 200,
+      headers: {
+        "Content-Type": "image/jpeg",
+        "X-mIV-Image-Width": "1200",
+        "X-mIV-Image-Height": "1800",
+        "X-mIV-Remote-State-Generation": "test-1",
+        "X-mIV-Remote-Session": TEST_SESSION_ID,
+        "X-mIV-Page-Identity": pageIdentityHeader(responseIdentity),
+      },
+    });
+  };
+  try {
+    const displayed = await viewer.load({
+      name: "First PDF page 2",
+      request: {
+        url: "/api/page?test=identity-mismatch",
+        cacheKey: "page-identity-mismatch@1800",
+        remoteStateGeneration: "test-1",
+        remoteSessionId: TEST_SESSION_ID,
+        address: requestedIdentity,
+        width: 1800,
+        cssWidth: 430,
+        dpr: 2,
+        layout: { cssWidth: 430 },
+        fitMode: "page",
+      },
+      info: { width: 1200, height: 1800 },
+      fitMode: "page",
+      index: 0,
+      count: 1,
+      interactionStartedAt: performance.now(),
+    });
+    assert.equal(displayed, false);
+    assert.equal(fetchCount, 1);
+    assert.equal(viewer.pageLayer.children[0], initialImage);
+    assert.match(title.textContent, /identity/);
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].category, "page_identity_mismatch");
+    assert.deepEqual(errors[0].extra.requested_page_identity, requestedIdentity);
+    assert.deepEqual(errors[0].extra.response_page_identity, responseIdentity);
+  } finally {
+    setRuntimeTestErrorObserver(null);
     globalThis.fetch = imageFetch;
     viewer.destroy();
   }
@@ -1104,6 +1256,7 @@ test("spread waits for both pages and atomically replaces the page layer", async
       cacheKey: `page-${number}@1334`,
       remoteStateGeneration: "test-1",
       remoteSessionId: TEST_SESSION_ID,
+      address: TEST_PAGE_ADDRESS,
       width: 1334,
       cssWidth: 667,
       dpr: 2,
@@ -1170,6 +1323,89 @@ test("spread waits for both pages and atomically replaces the page layer", async
   viewer.hideBoundaryMessage();
   assert.equal(viewer.boundaryMessage.hidden, true);
   viewer.destroy();
+});
+
+test("spread rejects one mismatched page before replacing either side", async () => {
+  const requested = (pageNumber) => ({
+    favorite_id: TEST_PAGE_ADDRESS.favorite_id,
+    relative_path: "books/spread.pdf",
+    subresource: { kind: "pdf_page", page_number: pageNumber },
+  });
+  const initialImage = new FakeElement("img");
+  const pageLayer = new FakeElement("div");
+  pageLayer.append(initialImage);
+  const viewer = new ImageViewer({
+    root: new FakeElement("section"),
+    stage: new FakeElement("div"),
+    pageLayer,
+    image: initialImage,
+    title: new FakeElement("div"),
+    counter: new FakeElement("span"),
+    previous: new FakeElement("button"),
+    next: new FakeElement("button"),
+    loadingIndicator: new FakeElement("div"),
+  });
+  let fetchCount = 0;
+  const errors = [];
+  setRuntimeTestErrorObserver((event) => errors.push(event));
+  globalThis.fetch = async (input) => {
+    fetchCount += 1;
+    const pageNumber = Number(new URL(input, testLocation.origin).searchParams.get("spread-mismatch"));
+    const identity = pageNumber === 1
+      ? requested(0)
+      : {
+        favorite_id: TEST_PAGE_ADDRESS.favorite_id,
+        relative_path: "books/other.pdf",
+        subresource: { kind: "pdf_page", page_number: 1 },
+      };
+    return new Response(new Blob([new Uint8Array([pageNumber])]), {
+      status: 200,
+      headers: {
+        "Content-Type": "image/jpeg",
+        "X-mIV-Image-Width": "1200",
+        "X-mIV-Image-Height": "1800",
+        "X-mIV-Remote-State-Generation": "test-1",
+        "X-mIV-Remote-Session": TEST_SESSION_ID,
+        "X-mIV-Page-Identity": pageIdentityHeader(identity),
+      },
+    });
+  };
+  const page = (number) => ({
+    entry: { name: `Page ${number}` },
+    info: { width: 1200, height: 1800 },
+    request: {
+      url: `/api/page?spread-mismatch=${number}`,
+      cacheKey: `spread-identity-mismatch-${number}`,
+      remoteStateGeneration: "test-1",
+      remoteSessionId: TEST_SESSION_ID,
+      address: requested(number - 1),
+      width: 1334,
+      cssWidth: 667,
+      dpr: 2,
+      layout: { cssWidth: 667 },
+      fitMode: "page",
+    },
+  });
+  try {
+    const displayed = await viewer.loadGroup({
+      pages: [page(1), page(2)],
+      name: "Mismatched spread",
+      fitMode: "page",
+      gap: 12,
+      index: 0,
+      count: 1,
+      interactionStartedAt: performance.now(),
+    });
+    assert.equal(displayed, false);
+    assert.equal(fetchCount, 2);
+    assert.deepEqual(pageLayer.children, [initialImage]);
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].category, "page_identity_mismatch");
+  } finally {
+    setRuntimeTestErrorObserver(null);
+    globalThis.fetch = imageFetch;
+    viewer.destroy();
+  }
 });
 
 test("folder list becomes renderable before spread metadata and open waits for it", async () => {

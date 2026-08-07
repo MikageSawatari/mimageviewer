@@ -1,5 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
+use mimageviewer_ipc::{RemoteAddress, RemoteSubresource};
 use uuid::Uuid;
 
 use crate::settings::FavoriteEntry;
@@ -15,6 +16,10 @@ pub(super) enum ResolveError {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ResolvedFavoritePath {
+    /// 要求文字列ではなく、favorite allowlist で実際に一致した UUID。
+    pub favorite_id: String,
+    /// logical path を相対化する、設定上の favorite root。
+    pub logical_root: PathBuf,
     /// お気に入り境界。フォルダ代表の再帰先や pin もこの内側に限る。
     pub canonical_root: PathBuf,
     /// 実ファイルを開くための canonical path。
@@ -107,9 +112,33 @@ pub(super) fn resolve_existing(
     let logical = logical_favorite_path(&favorite.path, relative);
     let canonical = canonicalize_within(&canonical_root, &logical)?;
     Ok(ResolvedFavoritePath {
+        favorite_id: favorite.id.to_string(),
+        logical_root: favorite.path.clone(),
         canonical_root,
         canonical,
         logical,
+    })
+}
+
+/// 画素生成経路が使った解決済み logical path と subresource から、公開用 identity を再構成する。
+/// HTTP 要求の favorite/path をそのまま返さないため、この関数は `ResolvedFavoritePath` だけを入力にする。
+pub(super) fn page_identity_from_resolved(
+    resolved: &ResolvedFavoritePath,
+    subresource: &RemoteSubresource,
+) -> Option<RemoteAddress> {
+    let relative = components_after_root(&resolved.logical, &resolved.logical_root)?;
+    let mut segments = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(value) => segments.push(value.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => return None,
+        }
+    }
+    Some(RemoteAddress {
+        favorite_id: resolved.favorite_id.clone(),
+        relative_path: segments.join("/"),
+        subresource: subresource.clone(),
     })
 }
 
@@ -188,6 +217,64 @@ mod tests {
 
     fn favorite(root: &Path) -> FavoriteEntry {
         FavoriteEntry::new("test".to_owned(), root.to_path_buf())
+    }
+
+    fn resolved_for_identity(relative: &str) -> ResolvedFavoritePath {
+        let logical_root = PathBuf::from("favorite");
+        let logical = logical_favorite_path(&logical_root, relative);
+        ResolvedFavoritePath {
+            favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
+            logical_root: logical_root.clone(),
+            canonical_root: logical_root.clone(),
+            canonical: logical.clone(),
+            logical,
+        }
+    }
+
+    #[test]
+    fn page_identity_distinguishes_documents_entries_and_files() {
+        let pdf_page = RemoteSubresource::PdfPage { page_number: 1 };
+        let first_pdf =
+            page_identity_from_resolved(&resolved_for_identity("books/first.pdf"), &pdf_page)
+                .unwrap();
+        let same_pdf =
+            page_identity_from_resolved(&resolved_for_identity("books/first.pdf"), &pdf_page)
+                .unwrap();
+        let other_pdf =
+            page_identity_from_resolved(&resolved_for_identity("books/other.pdf"), &pdf_page)
+                .unwrap();
+        assert_eq!(first_pdf, same_pdf);
+        assert_ne!(first_pdf, other_pdf);
+
+        let archive = resolved_for_identity("books/first.zip");
+        let first_entry = page_identity_from_resolved(
+            &archive,
+            &RemoteSubresource::ZipEntry {
+                entry_name: "chapter/001.jpg".to_owned(),
+            },
+        )
+        .unwrap();
+        let other_entry = page_identity_from_resolved(
+            &archive,
+            &RemoteSubresource::ZipEntry {
+                entry_name: "chapter/002.jpg".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_ne!(first_entry, other_entry);
+
+        let first_file = page_identity_from_resolved(
+            &resolved_for_identity("pages/001.jpg"),
+            &RemoteSubresource::File,
+        )
+        .unwrap();
+        let other_file = page_identity_from_resolved(
+            &resolved_for_identity("pages/002.jpg"),
+            &RemoteSubresource::File,
+        )
+        .unwrap();
+        assert_ne!(first_file, other_file);
+        assert_eq!(first_file.relative_path, "pages/001.jpg");
     }
 
     #[test]

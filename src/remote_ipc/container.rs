@@ -428,6 +428,7 @@ struct PdfIdentity {
 struct LoadedImage {
     image: image::DynamicImage,
     auto_trim_bbox: Option<egui::Rect>,
+    identity: RemoteAddress,
 }
 
 #[derive(Clone, Copy)]
@@ -1931,6 +1932,7 @@ impl ContainerEngine {
                             content_type: "image/jpeg".to_owned(),
                             width,
                             height,
+                            identity: loaded.identity.clone(),
                         }),
                         None => PageResponse::Error(media_error(
                             MediaErrorCode::RenderFailed,
@@ -2269,7 +2271,15 @@ impl ContainerEngine {
                         .map_err(|error| RemoteAiRunError::Failed(error.to_string()))?,
                 );
             }
-            let image = loaded_image_from_color_image(&pixels, None).map_err(remote_ai_media_error)?;
+            let identity = super::path_guard::page_identity_from_resolved(
+                &resolved,
+                &page.address.subresource,
+            )
+            .ok_or_else(|| {
+                RemoteAiRunError::Failed("resolved page identity is invalid".to_owned())
+            })?;
+            let image = loaded_image_from_color_image(&pixels, None, identity)
+                .map_err(remote_ai_media_error)?;
             let view_trim_plan = self
                 .remote_view_trim_plan(
                     &page.address,
@@ -2311,9 +2321,10 @@ impl ContainerEngine {
                     content_type: "image/jpeg".to_owned(),
                     width,
                     height,
+                    identity: image.identity.clone(),
                 },
                 (
-                    page.address.clone(),
+                    image.identity,
                     page.target_px,
                     RemoteAiResultIdentity::from_prepared(&prepared, resources.background_mode),
                 ),
@@ -3227,6 +3238,16 @@ impl ContainerEngine {
                 ));
             }
         };
+        // identity は HTTP 要求値の echo ではなく、この描画要求が実際に使う
+        // resolved.logical と subresource から画素生成境界で再構成する。
+        let identity =
+            super::path_guard::page_identity_from_resolved(resolved, &address.subresource)
+                .ok_or_else(|| {
+                    media_error(
+                        MediaErrorCode::Internal,
+                        "解決済みページの identity を構成できませんでした",
+                    )
+                })?;
 
         let prepared_composite = if compose_full_page {
             self.prepare_remote_composite(
@@ -3273,7 +3294,11 @@ impl ContainerEngine {
                 prepared.key.page_key
             ));
             if !detect_auto_trim || cached_auto_trim_bbox.is_some() {
-                return loaded_image_from_color_image(&pixels, cached_auto_trim_bbox.flatten());
+                return loaded_image_from_color_image(
+                    &pixels,
+                    cached_auto_trim_bbox.flatten(),
+                    identity,
+                );
             }
             // Auto bbox だけが未計算なら raw raster を復号するが、補正済み pixels は保持し、
             // 後段の edit / final composite は再実行しない。
@@ -3377,7 +3402,7 @@ impl ContainerEngine {
             None => None,
         };
         if let Some(pixels) = cached_composite_pixels {
-            return loaded_image_from_color_image(&pixels, auto_trim_bbox);
+            return loaded_image_from_color_image(&pixels, auto_trim_bbox, identity);
         }
         let mut pixels = Arc::new(color_image);
         if let Some(prepared) = prepared_composite {
@@ -3431,7 +3456,7 @@ impl ContainerEngine {
                 prepared.key.page_key
             ));
         }
-        loaded_image_from_color_image(&pixels, auto_trim_bbox)
+        loaded_image_from_color_image(&pixels, auto_trim_bbox, identity)
     }
 
     fn ensure_pdf_page_in_range(
@@ -3956,6 +3981,7 @@ fn decode_remote_ai_canonical(
 fn loaded_image_from_color_image(
     pixels: &egui::ColorImage,
     auto_trim_bbox: Option<egui::Rect>,
+    identity: RemoteAddress,
 ) -> Result<LoadedImage, MediaError> {
     let width = u32::try_from(pixels.size[0])
         .map_err(|_| media_error(MediaErrorCode::RenderFailed, "画像の幅が範囲外です"))?;
@@ -3973,6 +3999,7 @@ fn loaded_image_from_color_image(
     Ok(LoadedImage {
         image,
         auto_trim_bbox,
+        identity,
     })
 }
 

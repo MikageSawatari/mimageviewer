@@ -1439,6 +1439,24 @@ remote 内部の原寸倍率では位置が変わらない。この構造を回�
 画像・動画 viewer の `none` は従来どおり独自 pinch / pan を所有し、縦スクロール領域の `pan-y` も
 そのまま維持する。viewport meta に `maximum-scale` / `user-scalable` は指定しない。
 
+### 12.22 ページ応答 identity の検査 (2026-08-08)
+
+`/api/page` と AI result の画像応答は、画素生成側が確定した `RemoteAddress` を
+`PagePayload.identity` として返す。identity は HTTP 要求値の echo ではない。core が favorite の
+実際の一致結果、解決済み logical path、実際に選んだ file / PDF page / archive entry から、画素を
+応答へ載せる境界で再構成する。IPC protocol v31 はこの identity を page payload の一部として運ぶ。
+
+remote-web は core から受けた identity を percent-encoded JSON にし、
+`X-mIV-Page-Identity` 応答ヘッダーへ載せる。SPA は単ページ、見開き、補正プレビュー、AI result の
+すべてで、blob 化・cache 格納・decode・DOM 差替えより前に要求 identity と完全一致するか検査する。
+欠落、decode 不能、構文不正、不一致はいずれも fail closed とし、要求外の画像を別ページとして表示しない。
+不一致時は専用エラーを表示し、通常段 telemetry に要求 identity と応答 identity の両方を記録するが、
+同じ応答の自動再取得は行わない。thumbnail はこの検査の対象外である。
+
+identity の型は favorite UUID、favorite 相対 path、file / PDF page / archive entry だけを含む。
+PIN、Bearer token、session id などの接続秘密・session 情報は IPC payload と HTTP header のどちらにも
+含めない。
+
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 
 この節は設計ではなく**開発手順**の記録。会話ログにしか残らない知識を失わないために書く。
@@ -1508,8 +1526,8 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-通常フォルダ一覧 IPC の v16 に、動画 start/resource の stage 別 timeout code を追加した
-2026-08-02 時点の現行版は **v17**。
+ページ画素生成側の response identity を `PagePayload` に追加した 2026-08-08 時点の現行版は
+**v31**。`/api/page` と AI result の表示前照合は両側が v31 であることを前提とする。
 
 ### 13.6 残タスク (2026-08-01 時点)
 

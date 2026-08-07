@@ -861,6 +861,13 @@ fn remote_page_content_type(content_type: &str) -> Option<&'static str> {
     }
 }
 
+/// UTF-8 の relative path を HTTP header の ASCII 範囲へ閉じ込める。
+/// 呼び出し側は core の `PagePayload.identity` だけを渡し、HTTP 要求値を echo しない。
+fn remote_page_identity_header_value(identity: &RemoteAddress) -> Option<String> {
+    let serialized = serde_json::to_string(identity).ok()?;
+    Some(utf8_percent_encode(&serialized, NON_ALPHANUMERIC).to_string())
+}
+
 fn api_ai_job_result(
     state: &AppState,
     job_id: &str,
@@ -881,12 +888,22 @@ fn api_ai_job_result(
     };
     match result {
         Ok(success) => {
-            let Some(content_type) = remote_page_content_type(&success.value.content_type) else {
+            let payload = success.value;
+            if payload.identity.validate_syntax().is_err() {
+                return HttpResponse::text(502, "Bad Gateway")
+                    .with_header("Cache-Control", "no-store");
+            }
+            let Some(identity) = remote_page_identity_header_value(&payload.identity) else {
                 return HttpResponse::text(502, "Bad Gateway")
                     .with_header("Cache-Control", "no-store");
             };
-            HttpResponse::bytes(200, content_type, success.value.bytes)
+            let Some(content_type) = remote_page_content_type(&payload.content_type) else {
+                return HttpResponse::text(502, "Bad Gateway")
+                    .with_header("Cache-Control", "no-store");
+            };
+            HttpResponse::bytes(200, content_type, payload.bytes)
                 .with_header("Cache-Control", "no-store")
+                .with_header("X-mIV-Page-Identity", identity)
         }
         Err(failure) => ai_ipc_error_response(failure),
     }
@@ -2657,6 +2674,12 @@ fn api_page(
         Ok(result) => {
             let payload = result.value;
             let blob_bytes = payload.bytes.len();
+            if payload.identity.validate_syntax().is_err() {
+                return HttpResponse::text(502, "Bad Gateway");
+            }
+            let Some(identity) = remote_page_identity_header_value(&payload.identity) else {
+                return HttpResponse::text(502, "Bad Gateway");
+            };
             let Some(content_type) = remote_page_content_type(&payload.content_type) else {
                 return HttpResponse::text(502, "Bad Gateway");
             };
@@ -2671,6 +2694,7 @@ fn api_page(
                 )
                 .with_header("X-mIV-Image-Width", payload.width.to_string())
                 .with_header("X-mIV-Image-Height", payload.height.to_string())
+                .with_header("X-mIV-Page-Identity", identity)
                 .with_header("X-mIV-Remote-State-Generation", remote_state_generation)
                 .with_header("X-mIV-Remote-Session", owner.session_id.clone())
                 .with_header("Vary", "X-mIV-Remote-Session")
@@ -3629,6 +3653,24 @@ mod tests {
             RemoteSubresource::ZipEntry { entry_name }
                 if entry_name == "chapter.zip/001.jpg"
         ));
+    }
+
+    #[test]
+    fn page_identity_header_is_ascii_and_round_trips_unicode_relative_paths() {
+        let identity = RemoteAddress {
+            favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
+            relative_path: "本棚/第一巻.pdf".to_owned(),
+            subresource: RemoteSubresource::PdfPage { page_number: 1 },
+        };
+        let header = remote_page_identity_header_value(&identity).unwrap();
+        assert!(header.is_ascii());
+        let decoded = percent_decode_str(&header).decode_utf8().unwrap();
+        assert_eq!(
+            serde_json::from_str::<RemoteAddress>(&decoded).unwrap(),
+            identity
+        );
+        assert!(!header.contains("session"));
+        assert!(!header.contains("token"));
     }
 
     #[cfg(not(feature = "embedded-web-assets"))]

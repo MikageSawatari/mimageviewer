@@ -329,6 +329,97 @@ export function visualViewportScaleTransition(
   };
 }
 
+function normalizedRemoteSubresource(value) {
+  if (!value || typeof value !== "object") return null;
+  if (value.kind === "file") return { kind: "file" };
+  if (
+    value.kind === "pdf_page" &&
+    Number.isInteger(value.page_number) &&
+    value.page_number >= 0 &&
+    value.page_number <= 0xffffffff
+  ) {
+    return { kind: "pdf_page", page_number: value.page_number };
+  }
+  if (
+    value.kind === "zip_entry" &&
+    typeof value.entry_name === "string" &&
+    value.entry_name.length <= 4096
+  ) {
+    return { kind: "zip_entry", entry_name: value.entry_name };
+  }
+  if (
+    value.kind === "zip_directory" &&
+    typeof value.prefix === "string" &&
+    value.prefix.length <= 4096
+  ) {
+    return { kind: "zip_directory", prefix: value.prefix };
+  }
+  return null;
+}
+
+export function normalizeRemotePageIdentity(value) {
+  if (!value || typeof value !== "object") return null;
+  if (
+    typeof value.favorite_id !== "string" ||
+    !value.favorite_id ||
+    value.favorite_id.length > 128 ||
+    typeof value.relative_path !== "string" ||
+    value.relative_path.length > 4096 ||
+    value.relative_path.includes("\0")
+  ) {
+    return null;
+  }
+  const subresource = normalizedRemoteSubresource(value.subresource);
+  if (!subresource) return null;
+  return {
+    favorite_id: value.favorite_id,
+    relative_path: value.relative_path,
+    subresource,
+  };
+}
+
+export function remoteAddressIdentity(address) {
+  const normalized = normalizeRemotePageIdentity(address);
+  if (!normalized) return "";
+  const target = normalized.subresource;
+  const inner = target.kind === "zip_entry"
+    ? target.entry_name
+    : target.kind === "zip_directory"
+      ? target.prefix
+      : target.kind === "pdf_page"
+        ? String(target.page_number)
+        : "";
+  return [
+    normalized.favorite_id,
+    normalized.relative_path,
+    target.kind,
+    inner,
+  ].join("\n");
+}
+
+/// The header is percent-encoded JSON so Unicode paths stay inside the ASCII header range.
+/// Missing or malformed attestation is fail-closed in the same way as a valid mismatch.
+export function pageResponseIdentityAttestation(requestedAddress, headerValue) {
+  const requestedIdentity = normalizeRemotePageIdentity(requestedAddress);
+  let responseIdentity = null;
+  if (typeof headerValue === "string" && headerValue.length <= 24 * 1024) {
+    try {
+      responseIdentity = normalizeRemotePageIdentity(
+        JSON.parse(decodeURIComponent(headerValue))
+      );
+    } catch {}
+  }
+  return {
+    matches: Boolean(
+      requestedIdentity &&
+      responseIdentity &&
+      remoteAddressIdentity(requestedIdentity) === remoteAddressIdentity(responseIdentity)
+    ),
+    requestedIdentity,
+    responseIdentity,
+  };
+}
+
 const NORMAL_TELEMETRY_OMIT_KEYS = new Set([
   "address",
   "client_id",
@@ -393,8 +484,20 @@ export function telemetryEventForTier(event, {
     .filter(Boolean);
   const source = redactTelemetryValue(event ?? {}, secrets);
   if (!detailed) {
+    const normalized = normalTelemetryValue(source);
+    if (source?.type === "error" && source?.category === "page_identity_mismatch") {
+      // This exact diagnostic is intentionally content-identifying: without both paths the
+      // next occurrence cannot distinguish renderer corruption from response misrouting.
+      // Keep the exception narrow and accept only the typed RemoteAddress shape.
+      normalized.requested_page_identity = normalizeRemotePageIdentity(
+        source.requested_page_identity
+      );
+      normalized.response_page_identity = normalizeRemotePageIdentity(
+        source.response_page_identity
+      );
+    }
     return {
-      ...normalTelemetryValue(source),
+      ...normalized,
       telemetry_tier: "normal",
     };
   }

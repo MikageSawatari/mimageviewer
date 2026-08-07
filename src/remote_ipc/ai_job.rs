@@ -827,6 +827,10 @@ mod tests {
             content_type: "image/jpeg".to_owned(),
             width: 1,
             height: 1,
+            identity: mimageviewer_ipc::RemoteAddress::file(
+                "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+                "image.png",
+            ),
         }
     }
 
