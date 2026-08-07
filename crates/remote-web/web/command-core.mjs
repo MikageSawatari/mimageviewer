@@ -261,6 +261,39 @@ export function telemetryDeliveryMode(event) {
   return "batch";
 }
 
+export function normalizeVisualViewportScale(value) {
+  const scale = Number(value);
+  if (!Number.isFinite(scale) || scale <= 0) return null;
+  return Math.round(scale * 1000) / 1000;
+}
+
+/// visualViewport fires resize repeatedly while browser zoom animates. Keep the last
+/// reported value as the comparison baseline so sub-threshold steps accumulate, and
+/// only create telemetry once the scale has materially changed.
+export function visualViewportScaleTransition(
+  previousScale,
+  currentScale,
+  { minimumDelta = 0.01 } = {}
+) {
+  const previous = normalizeVisualViewportScale(previousScale);
+  const current = normalizeVisualViewportScale(currentScale);
+  if (current === null) return { nextScale: previous, event: null };
+  if (previous === null) return { nextScale: current, event: null };
+  const threshold = Math.max(0.001, Number(minimumDelta) || 0.01);
+  if (Math.abs(current - previous) < threshold) {
+    return { nextScale: previous, event: null };
+  }
+  return {
+    nextScale: current,
+    event: {
+      type: "visual_viewport",
+      action: "scale_changed",
+      previous_scale: previous,
+      visual_viewport_scale: current,
+    },
+  };
+}
+
 const NORMAL_TELEMETRY_OMIT_KEYS = new Set([
   "address",
   "client_id",

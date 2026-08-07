@@ -1413,8 +1413,31 @@ pointer 開始時の値へ戻す。cancel 前に横ブレの preview が発行�
 `double_tap_fit` の直後に `fit_mode: original` の画像を再取得している。
 `.image-viewer` と `.viewer-stage` はともに `touch-action: none` で、ブラウザの viewport 操作を
 許可せず remote が pinch と pan を所有する。`manipulation` への変更は browser pinch/pan と
-remote の gesture owner を競合させるため行わない。既存のダブルタップ機能を廃止するか、原寸表示中の
-UI 配置を別の不具合として直すかは、利用者仕様を確認してから扱う。
+remote の gesture owner を競合させるため行わない。原寸切替と browser zoom の分離、およびアプリ外周の
+既定 touch action は §12.21 のとおりとする。
+
+### 12.21 原寸ダブルタップと browser zoom の分離 (2026-08-07)
+
+画像の原寸切替は `.viewer-pages` の寸法と transform、および `.viewer-stage` の overflow だけを変える。
+上端・下端の `.viewer-ui` は stage の兄弟であり、`.image-viewer` を基準に絶対配置されるため、
+remote 内部の原寸倍率では位置が変わらない。この構造を回帰テストで固定する。原寸表示後に UI まで
+拡大・見切れした観測は、この fit 経路だけでは説明できず、visual viewport の拡大と区別して調べる。
+
+原寸モードの remote 内部 scale は 1 である。1 本指 pan を優先するのは独自 pinch 後の scale が
+1.01 を超えた場合だけで、原寸だから pan がダブルタップを奪う経路はない。実機ログには原寸から page へ
+正常に戻る例のほか、二度目の操作が `double_tap_fit` にならず `tap_center` で終わった例があるが、
+既存記録だけでは時間・距離・PAN・cancel・pinch のどれかを特定できない。このため閾値は変えず、
+待機中の中央タップが次の入力で成立しなかった時だけ `double_tap_candidate_rejected` を通常段へ記録する。
+
+`visualViewport.scale` は原寸切替では変わらず、browser zoom なら 1 を超えるため、既存の image event と
+`double_tap_fit` command event に載せる。さらに visual viewport の resize が 250 ms 落ち着いた時点で、
+前回記録値から 0.01 以上変わった場合だけ `visual_viewport/scale_changed` を追加する。毎フレーム／全操作の
+記録にはせず、値は数値だけなので通常段で扱う。
+
+アプリ外周 (`html, body, #app`) の既定は `touch-action: manipulation` とし、browser の
+ダブルタップ zoom は全画面 UI のどこでも起動させない。`manipulation` は browser pinch を許可する。
+画像・動画 viewer の `none` は従来どおり独自 pinch / pan を所有し、縦スクロール領域の `pan-y` も
+そのまま維持する。viewport meta に `maximum-scale` / `user-scalable` は指定しない。
 
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 

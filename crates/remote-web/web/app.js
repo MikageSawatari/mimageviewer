@@ -24,6 +24,7 @@ import {
   isRtlReadingDirection,
   nextFitMode,
   nextSpreadMode,
+  normalizeVisualViewportScale,
   pageResponseGenerationAttestation,
   pagePrefetchPlan,
   planSpreadIntent,
@@ -72,6 +73,7 @@ import {
   viewerSeekState,
   viewerSpreadLayout,
   viewerWheelCommand,
+  visualViewportScaleTransition,
 } from "./command-core.mjs";
 import {
   ADJUSTMENT_PANEL_TABS,
@@ -358,6 +360,10 @@ const telemetryState = {
   flushing: false,
   authenticated: false,
   nextSequence: 1,
+  visualViewportScale: normalizeVisualViewportScale(
+    globalThis.window?.visualViewport?.scale
+  ),
+  visualViewportTimer: 0,
 };
 
 const hudState = {
@@ -1386,6 +1392,13 @@ export function commandTelemetryEvent(requested, meta, source, context, handled 
     event.mediaKind = requested.payload?.mediaKind ?? null;
     event.open_route = meta.openRoute ?? "not_reached";
     event.handled = Boolean(handled);
+  }
+  if (meta.detail === "double_tap_fit") {
+    event.fit_mode_before = meta.fitMode ?? null;
+    event.viewer_scale = normalizeVisualViewportScale(meta.viewerScale);
+    event.visual_viewport_scale = normalizeVisualViewportScale(
+      meta.visualViewportScale
+    );
   }
   return event;
 }
@@ -8062,6 +8075,7 @@ export class ImageViewer {
         css_width: roundMs(request.cssWidth),
         device_pixel_ratio: roundMs(request.dpr),
         fit_mode: request.fitMode,
+        visual_viewport_scale: currentVisualViewportScale(),
         prefetch_status: resource.prefetchStatus,
       };
       enqueueTelemetry(event);
@@ -8195,6 +8209,7 @@ export class ImageViewer {
           css_width: roundMs(request.cssWidth),
           device_pixel_ratio: roundMs(request.dpr),
           fit_mode: request.fitMode,
+          visual_viewport_scale: currentVisualViewportScale(),
           prefetch_status: resource.prefetchStatus,
           spread_pages: pages.length,
         };
@@ -8478,13 +8493,23 @@ export class ImageViewer {
         });
       } else if (gesture === ViewerGesture.TAP) {
         const tapAt = performance.now();
-        const transition = viewerTapSequenceTransition(state.viewerTapSequence, {
+        const pendingTap = state.viewerTapSequence;
+        const transition = viewerTapSequenceTransition(pendingTap, {
           x: event.clientX,
           y: event.clientY,
           atMs: tapAt,
           width: this.root.clientWidth,
           inputSource: source,
         });
+        if (transition.commitPrevious && pendingTap) {
+          this.recordDoubleTapCandidateRejection("tap_sequence_miss", {
+            candidate_gap_ms: roundMs(tapAt - pendingTap.atMs),
+            candidate_distance_px: roundMs(Math.hypot(
+              event.clientX - pendingTap.x,
+              event.clientY - pendingTap.y
+            )),
+          });
+        }
         if (transition.commitPrevious) this.commitPendingCenterTap();
         state.viewerTapSequence = transition.next;
         if (transition.action === "double_tap") {
@@ -8492,6 +8517,9 @@ export class ImageViewer {
           dispatchCommand(command(CommandName.FIT_TOGGLE_PAGE_ORIGINAL), {
             source,
             detail: "double_tap_fit",
+            fitMode: state.fitMode,
+            viewerScale: this.scale,
+            visualViewportScale: currentVisualViewportScale(),
           });
         } else if (transition.action === "pending_center_tap") {
           this.schedulePendingCenterTap(transition.next);
@@ -8513,21 +8541,50 @@ export class ImageViewer {
           detail: "pan",
         });
       }
-      if (gesture !== ViewerGesture.TAP) this.commitPendingCenterTap();
-    } else if (!cancelled && this.pinched) {
-      this.commitPendingCenterTap();
-      dispatchCommand(
-        command(CommandName.SET_TRANSFORM, {
-          scale: this.scale,
-          panX: this.panX,
-          panY: this.panY,
-        }),
-        { source, detail: "pinch" }
+      if (gesture !== ViewerGesture.TAP) {
+        this.recordDoubleTapCandidateRejection(
+          cancelled ? "pointer_cancelled" : gesture ?? "not_tap",
+          {
+            elapsed_ms: roundMs(elapsed),
+            travel_px: roundMs(Math.hypot(dx, dy)),
+            pointer_moved: Boolean(single.moved),
+            content_scrolled: Boolean(single.contentScrolled),
+          }
+        );
+        this.commitPendingCenterTap();
+      }
+    } else if (this.pinched) {
+      this.recordDoubleTapCandidateRejection(
+        cancelled ? "pointer_cancelled_during_pinch" : "pinch"
       );
+      if (!cancelled) {
+        this.commitPendingCenterTap();
+        dispatchCommand(
+          command(CommandName.SET_TRANSFORM, {
+            scale: this.scale,
+            panX: this.panX,
+            panY: this.panY,
+          }),
+          { source, detail: "pinch" }
+        );
+      }
     }
     this.single = null;
     this.pinch = null;
     this.pinched = false;
+  }
+
+  recordDoubleTapCandidateRejection(decision, diagnostic = {}) {
+    if (!state.viewerTapSequence) return;
+    enqueueTelemetry({
+      type: "viewer_gesture",
+      action: "double_tap_candidate_rejected",
+      decision,
+      fit_mode: this.fitMode ?? state.fitMode,
+      viewer_scale: normalizeVisualViewportScale(this.scale),
+      visual_viewport_scale: currentVisualViewportScale(),
+      ...diagnostic,
+    });
   }
 
   onWheel(event) {
@@ -8781,10 +8838,27 @@ function installTelemetry() {
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") flushTelemetry(true);
   });
+  const visualViewport = window.visualViewport;
+  visualViewport?.addEventListener?.("resize", () => {
+    clearTimeout(telemetryState.visualViewportTimer);
+    telemetryState.visualViewportTimer = setTimeout(() => {
+      telemetryState.visualViewportTimer = 0;
+      const transition = visualViewportScaleTransition(
+        telemetryState.visualViewportScale,
+        visualViewport.scale
+      );
+      telemetryState.visualViewportScale = transition.nextScale;
+      if (transition.event) enqueueTelemetry(transition.event);
+    }, 250);
+  }, { passive: true });
   window.setInterval(() => {
     flushTelemetry(false);
     updateHud();
   }, 5000);
+}
+
+function currentVisualViewportScale() {
+  return normalizeVisualViewportScale(window.visualViewport?.scale);
 }
 
 async function observedFetch(url, options = {}, sessionRecoveryAttempted = false) {

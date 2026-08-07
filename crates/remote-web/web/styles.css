@@ -28,6 +28,8 @@ body,
   height: 100%;
   margin: 0;
   overflow: hidden;
+  /* Keep browser pinch zoom, but never assign double-tap zoom to the app shell. */
+  touch-action: manipulation;
 }
 
 body {

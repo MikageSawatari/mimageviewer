@@ -172,6 +172,24 @@ test("open telemetry records the requested kind, media kind, and reached route",
   assert.equal(rejected.handled, false);
 });
 
+test("double-tap command telemetry correlates app fit with browser viewport scale", () => {
+  const event = commandTelemetryEvent(
+    { name: "fit_toggle_page_original" },
+    {
+      detail: "double_tap_fit",
+      fitMode: "original",
+      viewerScale: 1,
+      visualViewportScale: 1.2478,
+    },
+    "touch",
+    "viewer"
+  );
+
+  assert.equal(event.fit_mode_before, "original");
+  assert.equal(event.viewer_scale, 1);
+  assert.equal(event.visual_viewport_scale, 1.248);
+});
+
 test("legacy image telemetry resolves rejection and folder route without entryIndex", () => {
   assert.equal(
     resolveLegacyImageOpenRoute({ kind: "image", imageIndex: -1 }, 3, false),

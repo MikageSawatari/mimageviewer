@@ -375,7 +375,30 @@ test("adjustment ranges yield vertical pan without weakening viewer gesture owne
   assert.match(css, /\.viewer-seek-input\s*\{[^}]*touch-action:\s*none/);
   assert.match(css, /\.image-viewer\s*\{[^}]*touch-action:\s*none/);
   assert.match(css, /\.viewer-stage\s*\{[^}]*touch-action:\s*none/);
+  assert.match(
+    css,
+    /html,\s*body,\s*#app\s*\{[^}]*touch-action:\s*manipulation/
+  );
   assert.doesNotMatch(html, /maximum-scale|user-scalable/i);
+});
+
+test("image fit transforms only the page layer while controls stay its siblings", async () => {
+  const css = await readFile(new URL("styles.css", here), "utf8");
+  const app = await readFile(new URL("app.js", here), "utf8");
+  assert.match(app, /viewerRoot\.append\(stage, top, bottom\)/);
+  assert.match(app, /this\.pageLayer\.style\.transform\s*=/);
+  assert.doesNotMatch(app, /(?:top|bottom)\.style\.transform\s*=/);
+  assert.match(css, /\.viewer-ui\s*\{[^}]*position:\s*absolute/);
+});
+
+test("visual viewport telemetry is settled and attached to image and double-tap events", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  assert.match(app, /visualViewport\?\.addEventListener\?\.\("resize"/);
+  assert.match(app, /visualViewportScaleTransition\(/);
+  assert.match(app, /\}, 250\);/);
+  assert.match(app, /fit_mode:\s*request\.fitMode,\s*visual_viewport_scale:/);
+  assert.match(app, /detail:\s*"double_tap_fit",[\s\S]*?visualViewportScale:/);
+  assert.match(app, /action:\s*"double_tap_candidate_rejected"/);
 });
 
 test("image tiles preserve portrait and landscape shape below a separate label row", async () => {

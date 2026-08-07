@@ -30,6 +30,7 @@ import {
   isRtlSpread,
   imageQualityPreset,
   nextSpreadMode,
+  normalizeVisualViewportScale,
   readingDirectionForSpreadMode,
   readingProgressBatchTransition,
   remoteSessionAcquireDecision,
@@ -85,6 +86,7 @@ import {
   videoStartSeekTarget,
   videoStartupDecision,
   videoTapCommand,
+  visualViewportScaleTransition,
   appUpdateNotice,
   adjustmentResetVisible,
   rangeValueFromNormalized,
@@ -428,6 +430,33 @@ test("normal telemetry keeps health facts but removes path, message and identity
     current_time_secs: 42.5,
     buffer_ahead_secs: 8.25,
     ready_state: 2,
+    telemetry_tier: "normal",
+  });
+});
+
+test("visual viewport scale telemetry is normalized and emitted only after a material change", () => {
+  assert.equal(normalizeVisualViewportScale("1.23456"), 1.235);
+  assert.equal(normalizeVisualViewportScale(0), null);
+  assert.equal(normalizeVisualViewportScale(Number.NaN), null);
+
+  const initial = visualViewportScaleTransition(null, 1);
+  assert.deepEqual(initial, { nextScale: 1, event: null });
+
+  const noise = visualViewportScaleTransition(initial.nextScale, 1.009);
+  assert.deepEqual(noise, { nextScale: 1, event: null });
+
+  const changed = visualViewportScaleTransition(noise.nextScale, 1.011);
+  assert.deepEqual(changed, {
+    nextScale: 1.011,
+    event: {
+      type: "visual_viewport",
+      action: "scale_changed",
+      previous_scale: 1,
+      visual_viewport_scale: 1.011,
+    },
+  });
+  assert.deepEqual(telemetryEventForTier(changed.event), {
+    ...changed.event,
     telemetry_tier: "normal",
   });
 });
