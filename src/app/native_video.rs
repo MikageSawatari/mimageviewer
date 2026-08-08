@@ -3232,6 +3232,17 @@ impl App {
             crate::video::NativeVideoOutputEvent::Seek { target_secs } => {
                 self.handle_native_video_seek_command(ctx, fs_idx, target_secs);
             }
+            crate::video::NativeVideoOutputEvent::SeekRelative { delta_secs } => {
+                self.native_video_seek_relative_with_hint(fs_idx, delta_secs);
+            }
+            crate::video::NativeVideoOutputEvent::TouchChromeLearned => {
+                if !self.settings.touch_center_chrome_learned {
+                    self.settings.touch_center_chrome_learned = true;
+                    self.settings.save();
+                    self.sync_native_video_metadata(fs_idx);
+                }
+                ctx.request_repaint();
+            }
             crate::video::NativeVideoOutputEvent::TileSeek { target_secs } => {
                 self.handle_native_video_tile_seek_command(ctx, fs_idx, target_secs);
             }
@@ -5217,8 +5228,20 @@ impl App {
             })
             .collect();
 
+        let touch_rows = [
+            ("タップ", "HUD を表示 / 非表示"),
+            ("左 / 右をダブルタップ", "5 秒戻る / 進む"),
+        ]
+        .into_iter()
+        .map(|(keys, description)| NativeOverlayShortcutHelpRow {
+            keys: keys.to_string(),
+            description: description.to_string(),
+        })
+        .collect();
+
         NativeOverlayShortcutHelp {
             sections,
+            touch_rows,
             fixed_rows,
         }
     }
@@ -5255,6 +5278,7 @@ impl App {
         let shortcut_help = self.cached_native_overlay_shortcut_help();
         let side_panel_mode = self.settings.fullscreen_side_panel_mode;
         let info_panel_open = self.fs_info_panel_open;
+        let touch_center_chrome_learned = self.settings.touch_center_chrome_learned;
         // ★ レーティング (右パネル先頭。get_rating は &mut self なので player 借用より前に取る)。
         let rating = self.get_rating(fs_idx);
 
@@ -5306,6 +5330,7 @@ impl App {
                 last_present_path,
                 deinterlace_status,
                 interlace_detected,
+                touch_center_chrome_learned,
                 shortcuts,
                 shortcut_help: shortcut_help.clone(),
             }
@@ -5339,6 +5364,7 @@ impl App {
                 last_present_path: crate::video::decoder::PresentPathSnapshot::Pending,
                 deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot::Pending,
                 interlace_detected: false,
+                touch_center_chrome_learned,
                 shortcuts,
                 shortcut_help,
             }

@@ -69,6 +69,17 @@ const FS_IMAGE_TOUCH_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     },
 ];
 
+const FS_VIDEO_TOUCH_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
+    FixedShortcutRow {
+        keys: "タップ",
+        description: "HUD を表示 / 非表示にする",
+    },
+    FixedShortcutRow {
+        keys: "左 / 右をダブルタップ",
+        description: "5 秒戻る / 進む",
+    },
+];
+
 const FS_VIDEO_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     FixedShortcutRow {
         keys: "?",
@@ -299,9 +310,10 @@ impl ShortcutHelpContext {
         }
     }
 
-    fn touch_rows(self) -> &'static [FixedShortcutRow] {
+    fn touch_rows(self, video_touch_available: bool) -> &'static [FixedShortcutRow] {
         match self {
             Self::FsImage => FS_IMAGE_TOUCH_SHORTCUT_ROWS,
+            Self::FsVideo if video_touch_available => FS_VIDEO_TOUCH_SHORTCUT_ROWS,
             Self::Grid
             | Self::FsVideo
             | Self::Erase
@@ -340,6 +352,9 @@ impl App {
         }
 
         let help_context = self.current_shortcut_help_context();
+        let video_touch_available = self
+            .fullscreen_idx
+            .is_some_and(|fs_idx| matches!(self.items.get(fs_idx), Some(GridItem::Video(_))));
 
         let mut open = true;
         let escape_pressed = self.dialog_escape_pressed(ctx);
@@ -384,7 +399,7 @@ impl App {
                             &self.keymap,
                             help_context.supplemental_action_rows(),
                         );
-                        draw_touch_rows(ui, help_context.touch_rows());
+                        draw_touch_rows(ui, help_context.touch_rows(video_touch_available));
                         draw_fixed_rows(ui, &self.keymap, help_context.fixed_rows());
                     });
 
@@ -589,11 +604,14 @@ mod tests {
     }
 
     #[test]
-    fn touch_help_rows_are_limited_to_still_image_fullscreen() {
-        let rows = ShortcutHelpContext::FsImage.touch_rows();
+    fn touch_help_rows_cover_still_image_and_video_without_music() {
+        let rows = ShortcutHelpContext::FsImage.touch_rows(false);
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().any(|row| row.keys == "中央をタップ"));
-        assert!(ShortcutHelpContext::Grid.touch_rows().is_empty());
-        assert!(ShortcutHelpContext::FsVideo.touch_rows().is_empty());
+        assert!(ShortcutHelpContext::Grid.touch_rows(false).is_empty());
+        let video_rows = ShortcutHelpContext::FsVideo.touch_rows(true);
+        assert_eq!(video_rows.len(), 2);
+        assert!(video_rows.iter().any(|row| row.keys == "タップ"));
+        assert!(ShortcutHelpContext::FsVideo.touch_rows(false).is_empty());
     }
 }

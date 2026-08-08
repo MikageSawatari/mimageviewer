@@ -189,6 +189,7 @@ Enter-held の各 API は対象 `ViewportId` を必須引数にし、別 viewpor
 | 編集ツール内のドラッグ状態 | 消しゴム / 隠蔽加工 / 補正レイヤーの選択後の矢印 / <kbd>Ctrl</kbd>+矢印、<kbd>[</kbd> / <kbd>]</kbd>、<kbd>Ctrl</kbd>+<kbd>[</kbd> / <kbd>]</kbd>、ハンドル操作中の <kbd>Shift</kbd> / <kbd>Alt</kbd>、テキスト注釈の四隅ハンドルドラッグ中の <kbd>Ctrl</kbd> / <kbd>Shift</kbd>、切り取り / テキスト注釈のドラッグやホイールなど | 選択中オブジェクト、ドラッグ中の形状、パネルフォーカスに依存するモード内操作。テキスト注釈の <kbd>Ctrl</kbd>（中心対称）と <kbd>Shift</kbd>（縦横比固定）は離散ショートカットではなく、マウスドラッグ中だけ幾何制約を切り替える修飾なので keymap 対象外。フルスクリーンキャンバスでは egui の修飾状態が stale になり得るため、両方ともドラッグ中の各フレームで OS から直接読む。操作カスタマイズ画面では消しゴム / 隠蔽 / 切り取り / テキスト / 補正レイヤーの通常コマンドは「編集モード」としてまとめるが、これらの微調整キーは固定入力のまま |
 | 360 度パノラマ表示中 | 左ドラッグの yaw/pitch、ホイールの FOV、上バーの 360 解除ボタン | パノラマ表示中だけの連続操作。<kbd>V</kbd> の 360 度パノラマモード切替 (`FsPanorama`) は `KeyAction` であり、コマンド設定で変更できる |
 | 動画の修飾なし左右 | <kbd>←</kbd> / <kbd>→</kbd> の 5 秒シーク、およびタイル中の左右カーソル移動 | 修飾なし矢印は固定ナビゲーションとして残す。<kbd>Alt</kbd> 付き左右は固定シーク扱いにせず、割り当てた `KeyAction` を優先する。<kbd>Shift</kbd> / <kbd>Ctrl</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd> 付きの動画シーク / フレーム送りは `KeyAction` 化済み |
+| 動画のタッチシーク | 物理的な左 / 右の連続ダブルタップ = 5 秒戻る / 進む | 接点列と presenter / HUD の source ownership に依存する固定タッチジェスチャなので `TouchAction` を `KeyAction` に合流させず、実行時だけキーボードと同じ相対シーク helper を共有する |
 
 補足: 画像分析モード起動の既定 <kbd>Shift</kbd>+<kbd>Z</kbd> は `FsImageAnalysis`、ルーペの
 <kbd>Shift</kbd> 押しっぱなしは `FsLoupeHold`、元画像表示の右 <kbd>Ctrl</kbd> 押しっぱなしは

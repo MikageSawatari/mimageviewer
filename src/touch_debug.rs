@@ -56,7 +56,7 @@ pub(crate) fn log_native_touch_coordinates(
 #[cfg(windows)]
 pub(crate) fn log_native_touch_command(
     window: TouchDebugWindow,
-    command: &crate::touch_input::TouchCommand,
+    command: &crate::video::native_touch::NativeVideoTouchCommand,
 ) {
     if touch_debug_enabled() {
         crate::logger::log(format!(

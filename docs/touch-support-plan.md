@@ -666,15 +666,28 @@ mIV では次の 3 段で担保する:
   **下 HUD の [前ファイル] / [次ファイル] ボタンで足りる** (既存)
 - **音楽は中央タップの HUD だけ**。左右タップには何も割り当てない
 
-**未決: シーク量** (§5.14-6)。mIV の既存の刻みは
-素の左右キーが **±5 秒** (`native_video_seek_relative_with_hint(fs_idx, ±5.0)`,
-`src/app/native_video.rs:6754-6759`)、`VideoSeekBackSmall`/`ForwardSmall` が **±1 秒**、
-`...Large` が **±30 秒**。YouTube 等の慣習は ±10 秒。
+**シーク量は ±5 秒で確定** (§5.14-9)。素の左右キーと同じ
+`native_video_seek_relative_with_hint(fs_idx, ±5.0)` を通し、アプリ内の刻みと
+先頭 / 末尾のフィードバックを共有する。
 
-- **±5 秒案**: キーボードと同じ刻みになり**アプリ内の一貫性**が保てる。既存の seek hint もそのまま使える
-- **±10 秒案**: 他アプリからの**乗り換え時の予測しやすさ**を優先する
+#### Phase 3 Step 2 実装記録 (2026-08-08)
 
-どちらでも実装コストは同じ (`native_video_seek_relative_with_hint` に渡す値だけ)。
+- 連続タップは `src/video/native_touch.rs` の `NativeTouchAdapter` が
+  `Option<DoubleTapRun>` として所有する。run は物理的な左右、直前タップ時刻、直前位置を
+  1 つの typed 値にまとめ、次のタップで 500 ms / 48 pt の範囲外、反対側、中央、HUD source
+  を観測した時点で新しい run または `None` へ自分で遷移する。timer、repaint loop、解除待ちの
+  bool は追加していない
+- 同じ側で条件内の 2 回目以降は、3 回目・4 回目も含めて毎回 ±5 秒を累積する。
+  最初のタップは待たずに HUD を toggle し、2 回目以降のシークでは toggle しない。
+  左は常に負、右は常に正で、読み方向の解決を通さない
+- 初回案内は静止画と `Settings.touch_center_chrome_learned` を共有する。未学習の動画で最初の
+  touch contact が来たときだけ表示し、その接触列の release 後に来る任意位置タップを
+  学習 + HUD 表示へ畳む。案内中はシークを出さない。動画専用の永続フラグは追加していない
+- Win32 stream 所有や共通 `TouchRecognizer` は変えず、動画固有の run と案内状態だけを
+  `NativeTouchAdapter` の command 変換 seam に置いた。相対シークは absolute seek command を
+  作らず、App の既存 `native_video_seek_relative_with_hint` へ渡す
+- 対象は動画 presenter のみ。HUD source は既存の widget passthrough を維持し、音楽ビューと
+  音声専用 native shell にはダブルタップシークも初回案内も追加していない
 
 #### 忘れた人の再表示手段
 

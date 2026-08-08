@@ -1425,11 +1425,134 @@ pub(super) fn native_shortcut_help_dialog_size(
     (dialog_w, dialog_h)
 }
 
+fn native_video_touch_help_shows_scaling_hint(ui_scale: f32) -> bool {
+    (crate::settings::normalize_ui_scale_factor(ui_scale) - 1.0).abs() < f32::EPSILON
+}
+
+fn paint_native_video_touch_first_run_help(
+    painter: &egui::Painter,
+    full_rect: egui::Rect,
+    show_scaling_hint: bool,
+) {
+    let halves = [
+        egui::Rect::from_min_max(full_rect.min, full_rect.center_bottom()),
+        egui::Rect::from_min_max(full_rect.center_top(), full_rect.max),
+    ];
+    painter.rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(184));
+    for half in halves {
+        painter.rect_filled(
+            half,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(54, 100, 132, 62),
+        );
+    }
+    for (half, title, detail) in [
+        (halves[0], "左をダブルタップ", "5 秒戻る"),
+        (halves[1], "右をダブルタップ", "5 秒進む"),
+    ] {
+        paint_native_video_touch_side_label(painter, half, title, detail);
+    }
+    paint_native_video_touch_tap_panel(painter, full_rect);
+    if show_scaling_hint {
+        paint_native_video_touch_scaling_hint(painter, full_rect);
+    }
+}
+
+fn paint_native_video_touch_side_label(
+    painter: &egui::Painter,
+    half: egui::Rect,
+    title: &str,
+    detail: &str,
+) {
+    painter.text(
+        half.center() - egui::vec2(0.0, 18.0),
+        egui::Align2::CENTER_CENTER,
+        title,
+        egui::FontId::proportional(19.0),
+        egui::Color32::WHITE,
+    );
+    painter.text(
+        half.center() + egui::vec2(0.0, 12.0),
+        egui::Align2::CENTER_CENTER,
+        detail,
+        egui::FontId::proportional(14.0),
+        egui::Color32::from_gray(224),
+    );
+}
+
+fn paint_native_video_touch_tap_panel(painter: &egui::Painter, full_rect: egui::Rect) {
+    let tap_panel = egui::Rect::from_center_size(
+        egui::pos2(
+            full_rect.center().x,
+            full_rect.min.y + full_rect.height() * 0.30,
+        ),
+        egui::vec2(full_rect.width().min(360.0), 70.0),
+    );
+    painter.rect_filled(tap_panel, 8.0, egui::Color32::from_rgb(35, 92, 148));
+    painter.text(
+        tap_panel.center(),
+        egui::Align2::CENTER_CENTER,
+        "画面をタップ  /  HUD を表示",
+        egui::FontId::proportional(18.0),
+        egui::Color32::WHITE,
+    );
+}
+
+fn paint_native_video_touch_scaling_hint(painter: &egui::Painter, full_rect: egui::Rect) {
+    painter.text(
+        full_rect.center_bottom() - egui::vec2(0.0, 16.0),
+        egui::Align2::CENTER_BOTTOM,
+        "UI が小さい場合はメニューの「スケーリング」から変更できます",
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_gray(198),
+    );
+}
+
+pub(super) fn draw_native_video_touch_first_run_help(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    ui_scale: f32,
+) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("native_video_touch_first_run_help"),
+    ));
+    paint_native_video_touch_first_run_help(
+        &painter,
+        egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(overlay_width_points, overlay_height_points),
+        ),
+        native_video_touch_help_shows_scaling_hint(ui_scale),
+    );
+}
+
+/// Visual-only fixture for native-video first-run touch-help snapshots.
+#[doc(hidden)]
+pub fn draw_native_video_touch_first_run_help_snapshot_fixture(
+    ui: &mut egui::Ui,
+    learned: bool,
+    ui_scale: f32,
+) {
+    let full_rect = ui.max_rect();
+    ui.painter()
+        .rect_filled(full_rect, 0.0, egui::Color32::BLACK);
+    if !learned {
+        paint_native_video_touch_first_run_help(
+            ui.painter(),
+            full_rect,
+            native_video_touch_help_shows_scaling_hint(ui_scale),
+        );
+    }
+}
+
 pub(super) fn draw_native_shortcut_help_dialog(
     ctx: &egui::Context,
     overlay_width_points: f32,
     overlay_height_points: f32,
     help: &NativeOverlayShortcutHelp,
+    show_touch_rows: bool,
     open: &mut bool,
 ) -> Option<egui::Rect> {
     if !*open {
@@ -1515,6 +1638,27 @@ pub(super) fn draw_native_shortcut_help_dialog(
                                         ui.end_row();
                                     }
                                 });
+                            }
+
+                            if show_touch_rows && !help.touch_rows.is_empty() {
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new("タッチ操作")
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(232, 232, 236)),
+                                );
+                                ui.add_space(2.0);
+                                egui::Grid::new("native_video_shortcut_help_touch")
+                                    .num_columns(2)
+                                    .spacing([18.0, 4.0])
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        for row in &help.touch_rows {
+                                            ui.monospace(&row.keys);
+                                            ui.label(&row.description);
+                                            ui.end_row();
+                                        }
+                                    });
                             }
 
                             if !help.fixed_rows.is_empty() {

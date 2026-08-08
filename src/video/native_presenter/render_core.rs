@@ -705,6 +705,7 @@ pub struct NativeOverlayMetadata {
     pub deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot,
     /// 再生中に一度でもインターレースが検出されたか (latched、動的)。
     pub interlace_detected: bool,
+    pub touch_center_chrome_learned: bool,
     pub shortcuts: NativeOverlayShortcutLabels,
     pub shortcut_help: Arc<NativeOverlayShortcutHelp>,
 }
@@ -733,6 +734,7 @@ pub struct NativeOverlayShortcutLabels {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NativeOverlayShortcutHelp {
     pub sections: Vec<NativeOverlayShortcutHelpSection>,
+    pub touch_rows: Vec<NativeOverlayShortcutHelpRow>,
     pub fixed_rows: Vec<NativeOverlayShortcutHelpRow>,
 }
 
@@ -1235,6 +1237,10 @@ pub enum NativeOverlayCommand {
     Seek {
         target_secs: f64,
     },
+    SeekRelative {
+        delta_secs: f64,
+    },
+    TouchChromeLearned,
     TileSeek {
         target_secs: f64,
     },
@@ -2858,7 +2864,9 @@ impl NativeRenderCore {
 
     pub(crate) fn fullscreen_overlay_active(&self) -> bool {
         self.egui_overlay.as_ref().is_some_and(|overlay| {
-            overlay.navigation_preview.is_some() || overlay.tile_overlay.is_some()
+            overlay.navigation_preview.is_some()
+                || overlay.tile_overlay.is_some()
+                || overlay.native_touch.first_run_help_visible()
         })
     }
 
@@ -4054,8 +4062,21 @@ impl NativeEguiOverlay {
         self.enqueue_native_pointer_events(output.egui_events);
         for command in self.native_touch.take_commands() {
             crate::touch_debug::log_native_touch_command(debug_window, &command);
-            if crate::video::native_touch::native_touch_command_toggles_chrome(command) {
-                self.native_touch.toggle_chrome();
+            match command {
+                crate::video::native_touch::NativeVideoTouchCommand::ToggleChrome => {
+                    self.native_touch.toggle_chrome();
+                }
+                crate::video::native_touch::NativeVideoTouchCommand::SeekRelative {
+                    delta_secs,
+                } => {
+                    self.pending_overlay_commands
+                        .push(NativeOverlayCommand::SeekRelative { delta_secs });
+                }
+                crate::video::native_touch::NativeVideoTouchCommand::LearnAndShowChrome => {
+                    self.native_touch.show_chrome();
+                    self.pending_overlay_commands
+                        .push(NativeOverlayCommand::TouchChromeLearned);
+                }
             }
         }
         self.dirty = true;
@@ -4618,7 +4639,14 @@ impl NativeEguiOverlay {
     }
 
     fn set_metadata(&mut self, metadata: Option<NativeOverlayMetadata>) {
+        let learned_snapshot = metadata
+            .as_ref()
+            .map(|metadata| metadata.touch_center_chrome_learned);
+        let touch_changed = self
+            .native_touch
+            .configure_video_gestures(!self.audio_only, learned_snapshot);
         if self.video_metadata == metadata {
+            self.dirty |= touch_changed;
             return;
         }
         self.video_metadata = metadata;
@@ -4756,6 +4784,12 @@ impl NativeEguiOverlay {
             return;
         }
         self.audio_only = audio_only;
+        let learned_snapshot = self
+            .video_metadata
+            .as_ref()
+            .map(|metadata| metadata.touch_center_chrome_learned);
+        self.native_touch
+            .configure_video_gestures(!audio_only, learned_snapshot);
         self.dirty = true;
     }
 
@@ -5210,6 +5244,15 @@ impl NativeEguiOverlay {
         let ppp = self.pixels_per_point;
         let width_px = self.width.max(1) as i32;
         let height_px = self.height.max(1) as i32;
+
+        if self.native_touch.first_run_help_visible() {
+            return vec![RECT {
+                left: 0,
+                top: 0,
+                right: width_px,
+                bottom: height_px,
+            }];
+        }
 
         // capture_all: drag 中はクリックを HUD 経由で受け取りたいので region を画面全体に。
         let pointer_down = self.egui_ctx.input(|i| i.pointer.any_down());
@@ -5998,6 +6041,8 @@ impl NativeEguiOverlay {
         let perf_visible = self.perf_visible;
         let vst3_available = self.vst3_available;
         let audio_only = self.audio_only;
+        let ui_scale = self.ui_scale;
+        let touch_first_run_help_visible = self.native_touch.first_run_help_visible();
         let side_panel_mode = self.side_panel_mode;
         let vst3_panel_visible = vst3_panel.as_ref().is_some_and(|panel| panel.visible);
         let hud_dimmed = self.hud_dimmed;
@@ -6053,6 +6098,7 @@ impl NativeEguiOverlay {
             || ring_guide_visible
             || left_callout_visible
             || right_callout_visible
+            || touch_first_run_help_visible
             || normalize_scanning;
         // カーソル auto-hide の判定用: チェックマークのような「受動表示」(ユーザーが
         // 操作する対象ではなく単なる状態インジケータ) は countdown をブロックしない。
@@ -6085,6 +6131,7 @@ impl NativeEguiOverlay {
             || vst3_panel_visible
             || ring_picker_visible
             || ring_guide_visible
+            || touch_first_run_help_visible
             || normalize_scanning
             || in_top_activation_zone
             || in_bottom_activation_zone
@@ -6205,11 +6252,20 @@ impl NativeEguiOverlay {
                             overlay_width_points,
                             overlay_height_points,
                             metadata.shortcut_help.as_ref(),
+                            !audio_only,
                             &mut shortcut_help_open,
                         );
                     } else {
                         shortcut_help_open = false;
                     }
+                }
+                if touch_first_run_help_visible {
+                    draw_native_video_touch_first_run_help(
+                        ctx,
+                        overlay_width_points,
+                        overlay_height_points,
+                        ui_scale,
+                    );
                 }
                 return;
             }
@@ -6249,11 +6305,20 @@ impl NativeEguiOverlay {
                             overlay_width_points,
                             overlay_height_points,
                             metadata.shortcut_help.as_ref(),
+                            !audio_only,
                             &mut shortcut_help_open,
                         );
                     } else {
                         shortcut_help_open = false;
                     }
+                }
+                if touch_first_run_help_visible {
+                    draw_native_video_touch_first_run_help(
+                        ctx,
+                        overlay_width_points,
+                        overlay_height_points,
+                        ui_scale,
+                    );
                 }
                 return;
             }
@@ -6442,6 +6507,7 @@ impl NativeEguiOverlay {
                         overlay_width_points,
                         overlay_height_points,
                         metadata.shortcut_help.as_ref(),
+                        !audio_only,
                         &mut shortcut_help_open,
                     );
                 } else {
@@ -7721,6 +7787,14 @@ impl NativeEguiOverlay {
                         &mut commands,
                     );
                 }
+            }
+            if touch_first_run_help_visible {
+                draw_native_video_touch_first_run_help(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    ui_scale,
+                );
             }
         });
         let repaint_delay = full_output

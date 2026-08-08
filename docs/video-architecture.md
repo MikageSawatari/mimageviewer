@@ -1290,7 +1290,8 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 - touch DOWN は最初の所有 stream かつ activation/thread focus 不足時だけ既存の
   `RequestFocusClaim` を送り、新しい focus 制御を増やさず pump/host の
   `claim_foreground` に合流する。復帰 tap は既存 `WM_MOUSEACTIVATE` と同じ child/popup
-  判定を使い、認識器を Cancel 扱いにして activation だけに留める
+  判定を使うが、ジェスチャは通常どおり認識し、overlay control へ届き得る synthetic press
+  だけを抑止する
 - 他アプリからフォーカスを戻すための左クリックは `WM_MOUSEACTIVATE` で
   `MA_ACTIVATEANDEAT` を返して破棄する。Windows がアクティブ化トリガとなった
   `WM_LBUTTONDOWN` を `wnd_proc` に dispatch しないので、再生 toggle (App 経路の
@@ -1317,13 +1318,23 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 Win32 依存を持たない純粋部分を両 wndproc から分離する。bounded ownership state、
 screen/client/points の座標契約、promoted mouse の fail-open 判定、既存
 `crate::touch_input::TouchRecognizer` への sample 変換、先頭接点の egui pointer emulation、
-`ToggleChrome` / `PageSide` の chrome toggle 写像と source-session reset を持つ。
+`ToggleChrome` / `PageSide` の動画 command 写像と source-session reset を持つ。
+動画 presenter の `PageSide` は `Option<DoubleTapRun>` に物理 side・直前時刻・直前位置をまとめ、
+最初のタップを即時 chrome toggle、同じ側の 500 ms / 48 pt 内の 2 回目以降を毎回 ±5 秒の
+`SeekRelative` にする。反対側、中央、HUD source、時間 / 距離超過は次の入力だけで run を
+自己無効化し、timer や repaint loop は使わない。App は相対 command を既存
+`native_video_seek_relative_with_hint` へ流す。
 `SwitchSource` は overlay を再利用するため、専用 `reset_overlay_source_session()` から
 この reset を必ず通して latch/接点状態を新ファイルへ持ち越さない。`touch_correlation.rs` は
 native では使わない。`TapZoneGeometry.excluded` は exact な描画 response rect ではなく
 `compute_hud_regions()` の HUD HWND input-claim region を Phase 1 の近似として使う。
 この近似は presenter source だけに適用し、HUD source は OS hit-test 済みなので typed source の
 分岐 1 か所で `WidgetPassthrough` に固定し `classify_tap` を呼ばない。
+未学習 (`Settings.touch_center_chrome_learned == false`) の動画で最初の touch contact が来ると、
+adapter の 2 phase 状態が初回案内を所有する。最初の接触列を表示開始だけに使い、release 後の
+任意位置タップを `LearnAndShowChrome` に畳むため、案内中は相対シークを出さない。描画は
+native overlay の全画面 Tooltip layer、入力 region も表示中だけ全画面とする。音声専用 shell は
+adapter 設定で動画ジェスチャを無効にし、この状態とヘルプ行を使わない。
 同関数は pointer-down + wants-input 時に全画面 capture region を返すため、Cancel は
 `PointerGone` だけで終えず、click 距離超過 Move → primary release → `PointerGone` で
 egui の down 状態を必ず解除する。動画は `Viewer { accepts_pinch: false }` とする。
@@ -2459,7 +2470,7 @@ overlay_draw.rs::draw_native_perf_overlay`) には:
 | `decoder.rs` | demux / video / audio の 3 worker、packet/control 分離は安定 | 3 worker の codec、HW、seek、pacing helper が同居し、責務分離点がファイル境界になっていない |
 | `video/mod.rs` | `VideoPlayer` API と native output lifecycle の owner | UI tick event drain、output loop、source swap、native presenter orchestration が集中する |
 | `native_window_pump` / `native_window_host` / `native_presenter/` | Stage 4 で全 HWND owner/pump と GPU/DComp render を別 thread に分離し、typed channel/reducer、二相 placement switch、typed shutdown/quarantine を production 接続。legacy eframe video path は撤去済み | Stage 5 の VST owner-applied ack/hidden anchor、Stage 6 の source/EOF 全 sequence、overlay state/input policy の細分化は後続負債 |
-| `native_window.rs` / `native_touch.rs` | presenter/HUD wndproc の decode/enqueue。presenter touch は bounded stream ownership + 共通 recognizer adapter、event は latest-value と bounded lossless に分類。HUD touch ownership は未導入 | HUD ownership/emulation/target-size は touch Phase 3。main child resize subclassは pump host request/reflowへ接続済み。health watchdog は Stage 7 |
+| `native_window.rs` / `native_touch.rs` | presenter / HUD とも bounded `PT_TOUCH` stream ownership、typed source、共通 recognizer adapter を実装済み。動画の単発 HUD toggle、左右の連続ダブルタップ相対シーク、初回案内も adapter が所有し、touch event は bounded lossless 経路で運ぶ | HUD ボタンの target-size 調整は実機判断待ち。main child resize subclass は pump host request/reflow へ接続済み。health watchdog は Stage 7 |
 | `gpu_renderer/` | D3D11/FFmpeg interop と unsafe 境界 | 境界は比較的明確。presenter/decoder との resource lifetime は引き続き横断監査が必要 |
 | `audio.rs` / `dsp/` | device-rate playback、stretch、chain bridge を統合 | pump、RT callback、VST IPC/back-pressure の ownership が近接し、DSP 側も chain/GUI/persistence/hot path が混在する |
 

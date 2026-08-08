@@ -400,6 +400,10 @@ pub enum NativeVideoOutputEvent {
     Seek {
         target_secs: f64,
     },
+    SeekRelative {
+        delta_secs: f64,
+    },
+    TouchChromeLearned,
     TileSeek {
         target_secs: f64,
     },
@@ -2316,6 +2320,8 @@ fn send_native_overlay_command(
     use crate::video::native_presenter::NativeOverlayCommand as Command;
     let event = match command {
         Command::Seek { target_secs } => NativeVideoOutputEvent::Seek { target_secs },
+        Command::SeekRelative { delta_secs } => NativeVideoOutputEvent::SeekRelative { delta_secs },
+        Command::TouchChromeLearned => NativeVideoOutputEvent::TouchChromeLearned,
         Command::TileSeek { target_secs } => NativeVideoOutputEvent::TileSeek { target_secs },
         Command::NavigateItem { delta, via_wheel } => {
             NativeVideoOutputEvent::NavigateItem { delta, via_wheel }
@@ -3738,6 +3744,22 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::Seek { target_secs },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SeekRelative {
+                                delta_secs,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SeekRelative { delta_secs },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::TouchChromeLearned => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::TouchChromeLearned,
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::TileSeek {
