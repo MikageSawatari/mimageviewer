@@ -9247,6 +9247,16 @@ export class ImageViewer {
     this.boundaryMessage.hidden = true;
   }
 
+  /// 描画後の内容が表示領域から出ているか。倍率と CSS 寸法のどちらで大きくなっていても
+  /// 同じ答えになるよう、変換適用後の実寸で見る。
+  contentOverflowsStage() {
+    const content = this.pageLayer.getBoundingClientRect();
+    return (
+      content.width - this.stage.clientWidth > 1 ||
+      content.height - this.stage.clientHeight > 1
+    );
+  }
+
   resetTransform() {
     this.scale = 1;
     this.panX = 0;
@@ -9324,7 +9334,13 @@ export class ImageViewer {
       return;
     }
 
-    if (this.scale > 1.01 && this.single && previous) {
+    // 1 本指で動かせるかは「内容が画面からはみ出しているか」で決める。倍率で判定すると、
+    // 原寸のように倍率 1 のまま CSS 寸法だけ大きくなる経路が漏れ、はみ出しているのに
+    // 動かせなくなる。幅フィットのはみ出しは stage 側のスクロールが受け持つので渡す。
+    const canPanContent =
+      this.scale > 1.01 ||
+      (this.fitMode !== FitMode.WIDTH && this.contentOverflowsStage());
+    if (canPanContent && this.single && previous) {
       dispatchCommand(
         command(CommandName.PAN_BY, {
           dx: event.clientX - previous.x,

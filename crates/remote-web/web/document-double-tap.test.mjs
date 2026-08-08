@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 
 import {
   BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS,
-  doubleTapSequenceTransition,
+  BROWSER_DOUBLE_TAP_ZOOM_MAX_DISTANCE_PX,
+  browserDoubleTapZoomDecision,
 } from "./command-core.mjs";
 import {
   installDocumentDoubleTapOwner,
@@ -59,35 +60,41 @@ function dispatchTap(eventTarget, point, preventDefault, target = plainTarget) {
   }));
 }
 
-test("double-tap recognition accepts a nearby pair within the browser window", () => {
-  const first = doubleTapSequenceTransition(null, { x: 40, y: 80, atMs: 1_000 });
-  const second = doubleTapSequenceTransition(first.next, {
-    x: 48,
-    y: 86,
-    atMs: 1_240,
+test("the browser rule keeps every tap as a candidate and uses its own slop", () => {
+  const first = browserDoubleTapZoomDecision(null, { x: 40, y: 80, atMs: 1_000 });
+  assert.equal(first.zooms, false);
+  assert.deepEqual(first.next, { x: 40, y: 80, atMs: 1_000 });
+
+  // 実機で 148px 離れた 2 打が拡大した。アプリのジェスチャより広く取る。
+  const far = browserDoubleTapZoomDecision(first.next, { x: 190, y: 80, atMs: 1_150 });
+  assert.equal(far.zooms, true);
+  assert.ok(far.distancePx > 36 && far.distancePx <= BROWSER_DOUBLE_TAP_ZOOM_MAX_DISTANCE_PX);
+
+  const tooFar = browserDoubleTapZoomDecision(first.next, {
+    x: 40 + BROWSER_DOUBLE_TAP_ZOOM_MAX_DISTANCE_PX + 20,
+    y: 80,
+    atMs: 1_150,
   });
+  assert.equal(tooFar.zooms, false);
 
-  assert.equal(first.isDoubleTap, false);
-  assert.equal(second.isDoubleTap, true);
-  assert.equal(second.next, null);
-});
-
-test("double-tap recognition rejects late or distant taps and starts over after a pair", () => {
-  const first = doubleTapSequenceTransition(null, { x: 40, y: 80, atMs: 1_000 });
-  const late = doubleTapSequenceTransition(first.next, {
+  const late = browserDoubleTapZoomDecision(first.next, {
     x: 40,
     y: 80,
     atMs: 1_000 + BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS + 60,
   });
-  const distant = doubleTapSequenceTransition(first.next, { x: 100, y: 80, atMs: 1_200 });
-  const second = doubleTapSequenceTransition(first.next, { x: 44, y: 82, atMs: 1_200 });
-  const third = doubleTapSequenceTransition(second.next, { x: 45, y: 83, atMs: 1_300 });
+  assert.equal(late.zooms, false);
+});
 
-  assert.equal(late.isDoubleTap, false);
-  assert.equal(distant.isDoubleTap, false);
-  assert.equal(second.isDoubleTap, true);
-  assert.equal(third.isDoubleTap, false, "the third tap starts a fresh pair");
-  assert.deepEqual(third.next, { x: 45, y: 83, atMs: 1_300 });
+test("a suppressed pair does not consume its second tap", () => {
+  // 実機で、抑止した対の直後のタップが前のタップと組になって拡大した。ブラウザは
+  // こちらの「対を消費する」規則を知らないので、常に直前のタップと比べる。
+  const first = browserDoubleTapZoomDecision(null, { x: 50, y: 50, atMs: 1_000 });
+  const second = browserDoubleTapZoomDecision(first.next, { x: 52, y: 51, atMs: 1_150 });
+  assert.equal(second.zooms, true);
+  assert.deepEqual(second.next, { x: 52, y: 51, atMs: 1_150 });
+
+  const third = browserDoubleTapZoomDecision(second.next, { x: 53, y: 52, atMs: 1_300 });
+  assert.equal(third.zooms, true, "the third tap still pairs with the second");
 });
 
 test("document owner preserves the first touchend and prevents only the matching second tap", () => {

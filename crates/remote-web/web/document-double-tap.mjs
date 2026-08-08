@@ -1,7 +1,4 @@
-import {
-  BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS,
-  doubleTapSequenceTransition,
-} from "./command-core.mjs";
+import { browserDoubleTapZoomDecision } from "./command-core.mjs";
 
 const DOCUMENT_TAP_MAX_TRAVEL_PX = 12;
 
@@ -61,7 +58,6 @@ export function installDocumentDoubleTapOwner(
 ) {
   let gesture = null;
   let previousTap = null;
-  let previousObservedTap = null;
 
   // Keep this module independent from telemetry. The caller may observe the fixed, content-free
   // decision object, and an observer failure must never change browser gesture ownership.
@@ -75,15 +71,13 @@ export function installDocumentDoubleTapOwner(
   const rejectGesture = () => {
     gesture = null;
     previousTap = null;
-    previousObservedTap = null;
   };
 
   const onTouchStart = (event) => {
     if (event.touches?.length !== 1) {
       gesture = { multiTouch: true };
       previousTap = null;
-      previousObservedTap = null;
-      return;
+        return;
     }
     const touch = event.touches[0];
     const exclusionReason = defaultTapExclusionReason(event.target);
@@ -95,7 +89,8 @@ export function installDocumentDoubleTapOwner(
       exclusionReason,
       multiTouch: false,
     };
-    if (exclusionReason) previousTap = null;
+    // 除外は「この 1 打の既定動作を残す」だけの話で、履歴は捨てない。ブラウザは対象の
+    // 種類で対を作るかを変えないので、こちらも変えない。
   };
 
   const onTouchMove = (event) => {
@@ -103,8 +98,7 @@ export function installDocumentDoubleTapOwner(
     if (event.touches?.length !== 1) {
       gesture.multiTouch = true;
       previousTap = null;
-      previousObservedTap = null;
-      return;
+        return;
     }
     const touch = touchByIdentifier(event.touches, gesture.identifier);
     if (!touch) {
@@ -122,8 +116,7 @@ export function installDocumentDoubleTapOwner(
     if (gesture.multiTouch) {
       if (event.touches?.length === 0) gesture = null;
       previousTap = null;
-      previousObservedTap = null;
-      return;
+        return;
     }
     if (event.touches?.length !== 0 || event.changedTouches?.length !== 1) {
       rejectGesture();
@@ -144,25 +137,25 @@ export function installDocumentDoubleTapOwner(
       y: touch.clientY,
       atMs,
     };
-    const observedTransition = doubleTapSequenceTransition(
-      previousObservedTap,
-      currentTap
-    );
+    // 抑止の判定と記録は同じ 1 つの結果から出す。対を消費しなくなったので、観測用に
+    // 別の履歴を持つ理由も無くなった。
+    const decision = browserDoubleTapZoomDecision(previousTap, currentTap);
     if (gesture.exclusionReason) {
       notifyDecision({
         decision: "excluded_target",
         atMs,
-        elapsedMs: observedTransition.elapsedMs,
-        distancePx: observedTransition.distancePx,
-        isDoubleTap: observedTransition.isDoubleTap,
+        elapsedMs: decision.elapsedMs,
+        distancePx: decision.distancePx,
+        isDoubleTap: decision.zooms,
         suppressed: false,
         excluded: true,
         exclusionReason: gesture.exclusionReason,
         cancelable: eventCancelable,
       });
       gesture = null;
-      previousTap = null;
-      previousObservedTap = currentTap;
+      // 除外対象でも「タップが 1 回あった」ことは変わらない。ブラウザは次のタップと
+      // 組にして拡大するので、候補として残す。
+      previousTap = decision.next;
       return;
     }
     if (Math.max(gesture.maxTravelPx, endTravelPx) > maxTapTravelPx) {
@@ -181,27 +174,20 @@ export function installDocumentDoubleTapOwner(
       return;
     }
 
-    const transition = doubleTapSequenceTransition(
-      previousTap,
-      currentTap,
-      // アプリのジェスチャではなく、ブラウザが拡大と見なす窓に合わせる。
-      { maxDelayMs: BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS }
-    );
     gesture = null;
-    previousTap = transition.next;
-    previousObservedTap = currentTap;
-    const suppressed = transition.isDoubleTap && eventCancelable;
+    previousTap = decision.next;
+    const suppressed = decision.zooms && eventCancelable;
     if (suppressed) {
       event.preventDefault();
     }
     notifyDecision({
-      decision: transition.isDoubleTap
+      decision: decision.zooms
         ? (suppressed ? "pair_suppressed" : "pair_not_cancelable")
-        : (transition.elapsedMs === null ? "candidate_started" : "pair_rejected"),
+        : (decision.elapsedMs === null ? "candidate_started" : "pair_rejected"),
       atMs,
-      elapsedMs: observedTransition.elapsedMs,
-      distancePx: observedTransition.distancePx,
-      isDoubleTap: transition.isDoubleTap,
+      elapsedMs: decision.elapsedMs,
+      distancePx: decision.distancePx,
+      isDoubleTap: decision.zooms,
       suppressed,
       excluded: false,
       exclusionReason: null,

@@ -71,12 +71,17 @@ export const ReadingDirection = Object.freeze({
 /// ブラウザの挙動で決まる (実機で 320ms では足りなかった)。アプリ自身は double-tap に
 /// 操作を割り当てず、この定数は browser zoom の document-level 抑止だけが使う。
 export const BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS = 520;
-export const BROWSER_DOUBLE_TAP_ZOOM_MAX_DISTANCE_PX = 36;
+export const BROWSER_DOUBLE_TAP_ZOOM_MAX_DISTANCE_PX = 180;
 
-/// Pure recognition rule for the document-level browser zoom owner. A recognized pair is
-/// consumed as a pair, so the third tap starts a new candidate rather than overlapping it.
-export function doubleTapSequenceTransition(
-  previous,
+/// ブラウザが double-tap zoom を出すかだけを見る述語。アプリのジェスチャ判定とは規則が違う。
+///
+/// 実機の記録で分かったこと:
+/// - 148px 離れた 2 打でも拡大した。ジェスチャ用の 36px では届かない。
+/// - 抑止した対の直後のタップが、その前のタップと組になって拡大した。ブラウザはこちらの
+///   「対を成立させたら消費する」規則を知らないので、抑止側は対を消費せず、常に直前の
+///   タップと比べる。
+export function browserDoubleTapZoomDecision(
+  previousTap,
   { x, y, atMs },
   {
     maxDelayMs = BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS,
@@ -88,26 +93,22 @@ export function doubleTapSequenceTransition(
     y: Number(y) || 0,
     atMs: Number(atMs) || 0,
   };
-  const hasPrevious = Boolean(previous);
-  const elapsedMs = hasPrevious ? current.atMs - Number(previous.atMs) : null;
-  const distancePx = hasPrevious
-    ? Math.hypot(
-      current.x - (Number(previous.x) || 0),
-      current.y - (Number(previous.y) || 0)
-    )
-    : null;
-  const isDoubleTap = hasPrevious &&
-    elapsedMs >= 0 &&
-    elapsedMs <= maxDelayMs &&
-    distancePx <= maxDistancePx;
+  if (!previousTap) {
+    return { zooms: false, elapsedMs: null, distancePx: null, next: current };
+  }
+  const elapsedMs = current.atMs - (Number(previousTap.atMs) || 0);
+  const distancePx = Math.hypot(
+    current.x - (Number(previousTap.x) || 0),
+    current.y - (Number(previousTap.y) || 0)
+  );
   return {
-    isDoubleTap,
-    next: isDoubleTap ? null : current,
+    zooms:
+      elapsedMs >= 0 && elapsedMs <= maxDelayMs && distancePx <= maxDistancePx,
     elapsedMs,
     distancePx,
+    next: current,
   };
 }
-
 export function remoteSessionAcquireDecision(status, trigger) {
   if (status === "active") return "use_current";
   if (trigger === "explicit_reconnect") return "acquire";
