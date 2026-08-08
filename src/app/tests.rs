@@ -44057,7 +44057,10 @@ mod tag_view_navigation_tests {
         pinned.show_shortcut = true;
         let mut pinned_unused = crate::settings::TagDef::new("Unused".to_string());
         pinned_unused.show_shortcut = true;
-        app.settings.tags = vec![pinned.clone(), pinned_unused.clone()];
+        let mut renamed = crate::settings::TagDef::new("Display name".to_string());
+        renamed.tag_key = "tag00".to_string();
+        renamed.show_shortcut = false;
+        app.settings.tags = vec![pinned.clone(), pinned_unused.clone(), renamed];
 
         app.tag_view.summaries.push(crate::tags_db::TagSummary {
             tag: pinned.name.clone(),
@@ -44074,7 +44077,8 @@ mod tag_view_navigation_tests {
             });
         }
 
-        let (pinned_choices, recent, popular) = app.tag_view_menu_sections();
+        let (pinned_choices, recent, popular) =
+            crate::tag_view::tag_view_menu_sections(&app.tag_view.summaries, &app.settings.tags);
 
         assert_eq!(
             pinned_choices
@@ -44087,6 +44091,10 @@ mod tag_view_navigation_tests {
         assert_eq!(
             recent.first().map(|choice| choice.tag_key.as_str()),
             Some("tag00")
+        );
+        assert_eq!(
+            recent.first().map(|choice| choice.name.as_str()),
+            Some("Display name")
         );
         assert_eq!(
             recent.last().map(|choice| choice.tag_key.as_str()),

@@ -464,7 +464,7 @@ select {
 .home-tabs {
   display: grid;
   max-width: 720px;
-  grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(56px, 1fr));
   margin: 0 auto 18px;
   padding: 4px;
   border: 1px solid var(--line);
@@ -490,14 +490,16 @@ select {
   color: #fff;
 }
 
-.favorite-search-description {
+.favorite-search-description,
+.tag-count-note {
   max-width: 720px;
   margin: 0 auto 12px;
   color: var(--muted);
   line-height: 1.65;
 }
 
-.favorite-search-form {
+.favorite-search-form,
+.tag-browse-form {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(96px, auto) auto;
   max-width: 720px;
@@ -507,14 +509,19 @@ select {
 
 .favorite-search-input,
 .favorite-search-kind,
-.favorite-search-submit {
+.favorite-search-submit,
+.tag-filter-input,
+.tag-kind-select,
+.tag-search-submit {
   min-height: 46px;
   border: 1px solid var(--line);
   border-radius: 12px;
 }
 
 .favorite-search-input,
-.favorite-search-kind {
+.favorite-search-kind,
+.tag-filter-input,
+.tag-kind-select {
   min-width: 0;
   padding: 9px 11px;
   background: #171b23;
@@ -522,13 +529,75 @@ select {
   font-size: 16px;
 }
 
-.favorite-search-submit {
+.favorite-search-submit,
+.tag-search-submit {
   padding: 9px 16px;
   background: var(--accent-strong);
   color: #fff;
   font-size: 0.95rem;
   font-weight: 700;
   cursor: pointer;
+}
+
+.tag-browse-results {
+  display: grid;
+  max-width: 720px;
+  margin: 18px auto 0;
+  gap: 18px;
+}
+
+.tag-choice-section h2 {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.tag-choice-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.tag-choice {
+  display: flex;
+  min-width: 0;
+  min-height: 44px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 11px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-raised);
+  color: #f2f4f8;
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.tag-choice-name {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tag-choice-count {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.tag-choice-empty {
+  grid-column: 1 / -1;
+  margin: 4px 0;
+}
+
+.tag-truncated-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+  line-height: 1.55;
 }
 
 .place-list {

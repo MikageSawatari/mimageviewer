@@ -705,6 +705,14 @@ impl TagsDb {
         rows.flatten().collect()
     }
 
+    /// タグが 1 件でも存在するかを、集約せず先頭行だけで確認する。
+    pub fn has_any_tags(&self) -> Result<bool, rusqlite::Error> {
+        self.conn
+            .query_row("SELECT 1 FROM item_tags LIMIT 1", [], |_| Ok(()))
+            .optional()
+            .map(|row| row.is_some())
+    }
+
     pub fn find_by_prefix(&self, prefix: &str, limit: usize) -> Vec<TagSummary> {
         let key = normalize_tag_key(prefix);
         let escaped = escape_like_pattern(&key);
@@ -1237,6 +1245,17 @@ mod tests {
         let found = db.find_exact("#cat").unwrap();
         assert_eq!(found.tag_key, "cat");
         assert_eq!(found.count, 2);
+    }
+
+    #[test]
+    fn has_any_tags_checks_existence_without_building_summaries() {
+        let mut db = memory_db();
+        assert!(!db.has_any_tags().unwrap());
+
+        db.set_item_tags("c:/cat.jpg", ["cat"], source::EDIT)
+            .unwrap();
+
+        assert!(db.has_any_tags().unwrap());
     }
 
     #[test]

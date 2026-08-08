@@ -5,16 +5,21 @@ use mimageviewer_ipc::{
     CollectionError, CollectionErrorCode, CollectionKind, CollectionPayload, CollectionRequest,
     CollectionResponse, FavoriteSearchIndexState, FavoriteSearchKind, FavoriteSearchPayload,
     FavoriteSearchRequest, FavoriteSearchResponse, HomePayload, HomeResponse, PlaceKind,
-    PlaceSummary, RemoteEntry, RemoteEntryKind, SmartFolderSummary,
+    PlaceSummary, RemoteEntry, RemoteEntryKind, RemoteTagChoice, SmartFolderSummary,
+    TagBrowsePayload, TagBrowseRequest, TagBrowseResponse, TagIndexState, TagItemKind,
+    TagItemsPayload, TagItemsRequest, TagItemsResponse,
 };
 
 use crate::grid_item::GridItem;
 use crate::search_index_db::{IndexEntry, IndexKind, SEARCH_RESULT_LIMIT, SearchIndexDb};
 use crate::settings::{FavoriteEntry, Settings};
 
-use super::path_guard::{map_existing_to_resolved_favorite, resolve_existing_favorite_roots};
+use super::path_guard::{
+    ResolvedFavoriteRoot, map_existing_to_resolved_favorite, resolve_existing_favorite_roots,
+};
 
 const MAX_REMOTE_COLLECTION_ENTRIES: usize = 1000;
+const MAX_REMOTE_TAG_CHOICES: usize = 2000;
 
 pub(super) struct CollectionEngine {
     settings: Settings,
@@ -212,6 +217,119 @@ impl CollectionEngine {
     ) -> CollectionPayload {
         CollectionPayload {
             title: "検索結果".to_owned(),
+            thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(&self.settings),
+            sort_state: super::remote_grid_sort_state(
+                sort_order,
+                Some(super::FIXED_LIST_SORT_LOCK_REASON),
+            ),
+            entries,
+            entry_limit: MAX_REMOTE_COLLECTION_ENTRIES,
+            truncated,
+        }
+    }
+
+    pub(super) fn tag_browse(&self, _request: TagBrowseRequest) -> TagBrowseResponse {
+        TagBrowseResponse::Success(self.tag_browse_payload())
+    }
+
+    fn tag_browse_payload(&self) -> TagBrowsePayload {
+        let db_path = crate::tags_db::TagsDb::db_path();
+        if !db_path.try_exists().unwrap_or(false) {
+            return empty_tag_browse_payload(TagIndexState::Unavailable);
+        }
+        let db = match crate::tags_db::TagsDb::open_readonly(&db_path) {
+            Ok(db) => db,
+            Err(error) => {
+                crate::logger::log(format!("remote_ipc: tags index open failed: {error}"));
+                return empty_tag_browse_payload(TagIndexState::Unavailable);
+            }
+        };
+        tag_browse_payload_from_summaries(db.tag_summaries(), &self.settings.tags)
+    }
+
+    pub(super) fn tag_items(&self, request: TagItemsRequest) -> TagItemsResponse {
+        match self.tag_items_payload(request) {
+            Ok(payload) => TagItemsResponse::Success(payload),
+            Err(error) => TagItemsResponse::Error(error),
+        }
+    }
+
+    fn tag_items_payload(
+        &self,
+        request: TagItemsRequest,
+    ) -> Result<TagItemsPayload, CollectionError> {
+        validate_tag_items_request(&request)?;
+        let sort_order = self
+            .sort_settings
+            .load()
+            .map_err(|error| internal_error("最新の並び順を読み込めませんでした", error))?;
+        let db_path = crate::tags_db::TagsDb::db_path();
+        if !db_path.try_exists().unwrap_or(false) {
+            return Ok(self.tag_items_state_payload(sort_order, TagIndexState::Unavailable));
+        }
+        let db = match crate::tags_db::TagsDb::open_readonly(&db_path) {
+            Ok(db) => db,
+            Err(error) => {
+                crate::logger::log(format!("remote_ipc: tags index open failed: {error}"));
+                return Ok(self.tag_items_state_payload(sort_order, TagIndexState::Unavailable));
+            }
+        };
+        match db.has_any_tags() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(self.tag_items_state_payload(sort_order, TagIndexState::Empty));
+            }
+            Err(error) => {
+                crate::logger::log(format!("remote_ipc: tags index query failed: {error}"));
+                return Ok(self.tag_items_state_payload(sort_order, TagIndexState::Unavailable));
+            }
+        }
+        self.tag_items_from_db(&db, &request, sort_order)
+    }
+
+    fn tag_items_from_db(
+        &self,
+        db: &crate::tags_db::TagsDb,
+        request: &TagItemsRequest,
+        sort_order: crate::settings::SortOrder,
+    ) -> Result<TagItemsPayload, CollectionError> {
+        let favorites = self.favorite_roots.current().map_err(|error| {
+            crate::logger::log(format!("remote_ipc: {error}"));
+            CollectionError::new(
+                CollectionErrorCode::Internal,
+                "最新のお気に入りを読み込めませんでした",
+            )
+        })?;
+        let key_scan_limit = tag_item_key_scan_limit(request.kind);
+        let item_keys =
+            crate::tag_view::select_tag_view_item_keys(db, request.tag.trim(), key_scan_limit + 1);
+        let (entries, truncated) =
+            map_tag_item_keys(&favorites, item_keys, request.kind, key_scan_limit);
+        Ok(TagItemsPayload {
+            listing: self.tag_items_listing(sort_order, entries, truncated),
+            state: TagIndexState::Ready,
+        })
+    }
+
+    fn tag_items_state_payload(
+        &self,
+        sort_order: crate::settings::SortOrder,
+        state: TagIndexState,
+    ) -> TagItemsPayload {
+        TagItemsPayload {
+            listing: self.tag_items_listing(sort_order, Vec::new(), false),
+            state,
+        }
+    }
+
+    fn tag_items_listing(
+        &self,
+        sort_order: crate::settings::SortOrder,
+        entries: Vec<RemoteEntry>,
+        truncated: bool,
+    ) -> CollectionPayload {
+        CollectionPayload {
+            title: "タグの項目".to_owned(),
             thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(&self.settings),
             sort_state: super::remote_grid_sort_state(
                 sort_order,
@@ -448,6 +566,149 @@ impl CollectionEngine {
     }
 }
 
+fn empty_tag_browse_payload(state: TagIndexState) -> TagBrowsePayload {
+    TagBrowsePayload {
+        pinned: Vec::new(),
+        recent: Vec::new(),
+        popular: Vec::new(),
+        all: Vec::new(),
+        all_truncated: false,
+        state,
+    }
+}
+
+fn tag_browse_payload_from_summaries(
+    summaries: Vec<crate::tags_db::TagSummary>,
+    tag_defs: &[crate::settings::TagDef],
+) -> TagBrowsePayload {
+    if summaries.is_empty() {
+        return empty_tag_browse_payload(TagIndexState::Empty);
+    }
+    let (pinned, recent, popular) = crate::tag_view::tag_view_menu_sections(&summaries, tag_defs);
+    let all_truncated = summaries.len() > MAX_REMOTE_TAG_CHOICES;
+    TagBrowsePayload {
+        pinned: pinned.into_iter().map(remote_tag_choice).collect(),
+        recent: recent.into_iter().map(remote_tag_choice).collect(),
+        popular: popular.into_iter().map(remote_tag_choice).collect(),
+        all: summaries
+            .into_iter()
+            .take(MAX_REMOTE_TAG_CHOICES)
+            .map(|summary| RemoteTagChoice {
+                name: summary.tag,
+                count: summary.count,
+            })
+            .collect(),
+        all_truncated,
+        state: TagIndexState::Ready,
+    }
+}
+
+fn remote_tag_choice(choice: crate::tag_view::TagViewMenuChoice) -> RemoteTagChoice {
+    RemoteTagChoice {
+        name: choice.name,
+        count: choice.count,
+    }
+}
+
+fn validate_tag_items_request(request: &TagItemsRequest) -> Result<(), CollectionError> {
+    if request.tag.trim().is_empty() {
+        return Err(CollectionError::new(
+            CollectionErrorCode::BadRequest,
+            "タグを入力してください",
+        ));
+    }
+    if request.tag.chars().count() > 200 {
+        return Err(CollectionError::new(
+            CollectionErrorCode::BadRequest,
+            "タグは 200 文字以内で入力してください",
+        ));
+    }
+    Ok(())
+}
+
+fn candidate_from_tag_item_key(key: String, filter: TagItemKind) -> Option<CandidateEntry> {
+    let classified = match crate::tag_view::classify_tag_view_path(PathBuf::from(key)) {
+        crate::tag_view::ClassifiedTagViewPath::Existing(classified) => classified,
+        // missing は外付け切断 / NAS offline でも起きる。結果から隠すだけで、
+        // tags.db は変更しない。
+        crate::tag_view::ClassifiedTagViewPath::Missing => return None,
+    };
+    let remote_kind = if classified.is_directory {
+        RemoteEntryKind::Folder
+    } else {
+        match classified.entry.kind {
+            // 本体タグビューは未知拡張子を Folder へ倒す。リモートでは実フォルダと
+            // 区別し、開けないフォルダセルを作らない。
+            crate::tag_view::TagViewItemKind::Folder => RemoteEntryKind::Other,
+            crate::tag_view::TagViewItemKind::Image => RemoteEntryKind::Image,
+            crate::tag_view::TagViewItemKind::Video => RemoteEntryKind::Video,
+            crate::tag_view::TagViewItemKind::Audio => RemoteEntryKind::Audio,
+            crate::tag_view::TagViewItemKind::ZipFile => RemoteEntryKind::Zip,
+            crate::tag_view::TagViewItemKind::PdfFile => RemoteEntryKind::Pdf,
+            crate::tag_view::TagViewItemKind::Archive(_) => RemoteEntryKind::Archive,
+        }
+    };
+    if !tag_item_kind_matches(filter, remote_kind) {
+        return None;
+    }
+    let path = classified.entry.path;
+    Some(CandidateEntry {
+        name: file_name(&path),
+        path,
+        kind: remote_kind,
+        detail: None,
+        progress_current: None,
+        progress_total: None,
+        rating: None,
+    })
+}
+
+fn map_tag_item_keys(
+    favorites: &[FavoriteEntry],
+    item_keys: Vec<String>,
+    filter: TagItemKind,
+    key_scan_limit: usize,
+) -> (Vec<RemoteEntry>, bool) {
+    let key_limit_reached = item_keys.len() > key_scan_limit;
+    let roots = resolve_existing_favorite_roots(favorites);
+    let mut entries = Vec::with_capacity(MAX_REMOTE_COLLECTION_ENTRIES + 1);
+    for key in item_keys.into_iter().take(key_scan_limit) {
+        let Some(candidate) = candidate_from_tag_item_key(key, filter) else {
+            continue;
+        };
+        let Some(entry) = remote_entry_from_candidate(&roots, candidate) else {
+            continue;
+        };
+        entries.push(entry);
+        if entries.len() > MAX_REMOTE_COLLECTION_ENTRIES {
+            break;
+        }
+    }
+    let (entries, matched_truncated) = bound_remote_entries(entries);
+    (entries, matched_truncated || key_limit_reached)
+}
+
+fn tag_item_key_scan_limit(filter: TagItemKind) -> usize {
+    if filter == TagItemKind::All {
+        crate::tag_view::TAG_VIEW_RESULT_LIMIT
+    } else {
+        crate::tag_view::TAG_VIEW_FILTERED_KEY_SCAN_LIMIT
+    }
+}
+
+fn tag_item_kind_matches(filter: TagItemKind, kind: RemoteEntryKind) -> bool {
+    match filter {
+        TagItemKind::All => true,
+        TagItemKind::Folder => kind == RemoteEntryKind::Folder,
+        TagItemKind::Image => kind == RemoteEntryKind::Image,
+        TagItemKind::Video => kind == RemoteEntryKind::Video,
+        TagItemKind::Audio => kind == RemoteEntryKind::Audio,
+        TagItemKind::Zip => kind == RemoteEntryKind::Zip,
+        TagItemKind::Pdf => kind == RemoteEntryKind::Pdf,
+        TagItemKind::Archive => kind == RemoteEntryKind::Archive,
+    }
+}
+
 fn bound_remote_entries(mut entries: Vec<RemoteEntry>) -> (Vec<RemoteEntry>, bool) {
     let truncated = entries.len() > MAX_REMOTE_COLLECTION_ENTRIES;
     entries.truncate(MAX_REMOTE_COLLECTION_ENTRIES);
@@ -497,25 +758,30 @@ fn to_remote_entries_bounded(
     let roots = resolve_existing_favorite_roots(favorites);
     candidates
         .into_iter()
-        .filter_map(|candidate| {
-            let mapped = map_existing_to_resolved_favorite(&roots, &candidate.path)?;
-            Some(RemoteEntry {
-                favorite_id: mapped.favorite_id,
-                relative_path: mapped.relative_path,
-                name: if candidate.name.trim().is_empty() {
-                    file_name(&candidate.path)
-                } else {
-                    candidate.name
-                },
-                kind: candidate.kind,
-                detail: candidate.detail,
-                progress_current: candidate.progress_current,
-                progress_total: candidate.progress_total,
-                rating: candidate.rating,
-            })
-        })
+        .filter_map(|candidate| remote_entry_from_candidate(&roots, candidate))
         .take(mapped_limit)
         .collect()
+}
+
+fn remote_entry_from_candidate(
+    roots: &[ResolvedFavoriteRoot<'_>],
+    candidate: CandidateEntry,
+) -> Option<RemoteEntry> {
+    let mapped = map_existing_to_resolved_favorite(roots, &candidate.path)?;
+    Some(RemoteEntry {
+        favorite_id: mapped.favorite_id,
+        relative_path: mapped.relative_path,
+        name: if candidate.name.trim().is_empty() {
+            file_name(&candidate.path)
+        } else {
+            candidate.name
+        },
+        kind: candidate.kind,
+        detail: candidate.detail,
+        progress_current: candidate.progress_current,
+        progress_total: candidate.progress_total,
+        rating: candidate.rating,
+    })
 }
 
 fn map_favorite_search_entries(
@@ -819,6 +1085,221 @@ mod tests {
             FavoriteSearchResponse::Success(payload) => payload,
             FavoriteSearchResponse::Error(error) => panic!("unexpected search error: {error:?}"),
         }
+    }
+
+    fn tag_engine(root: PathBuf) -> CollectionEngine {
+        CollectionEngine::new(Settings {
+            favorites: vec![FavoriteEntry::new("favorite".to_owned(), root)],
+            ..Default::default()
+        })
+    }
+
+    fn tag_request(tag: impl Into<String>) -> TagItemsRequest {
+        TagItemsRequest {
+            tag: tag.into(),
+            kind: TagItemKind::All,
+        }
+    }
+
+    fn tag_browse_success(response: TagBrowseResponse) -> TagBrowsePayload {
+        match response {
+            TagBrowseResponse::Success(payload) => payload,
+            TagBrowseResponse::Error(error) => panic!("unexpected tag browse error: {error:?}"),
+        }
+    }
+
+    fn tag_items_success(response: TagItemsResponse) -> TagItemsPayload {
+        match response {
+            TagItemsResponse::Success(payload) => payload,
+            TagItemsResponse::Error(error) => panic!("unexpected tag items error: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_tags_db_is_unavailable_and_is_not_created() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = data_dir.path().join("favorite");
+        std::fs::create_dir(&root).unwrap();
+        let db_path = crate::tags_db::TagsDb::db_path();
+        assert!(!db_path.exists());
+
+        let payload = tag_browse_success(tag_engine(root).tag_browse(TagBrowseRequest));
+
+        assert_eq!(payload.state, TagIndexState::Unavailable);
+        assert!(payload.all.is_empty());
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn empty_tags_db_reports_empty_for_browse_and_items() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = data_dir.path().join("favorite");
+        std::fs::create_dir(&root).unwrap();
+        drop(crate::tags_db::TagsDb::open_at(&crate::tags_db::TagsDb::db_path()).unwrap());
+        let engine = tag_engine(root);
+
+        let browse = tag_browse_success(engine.tag_browse(TagBrowseRequest));
+        let items = tag_items_success(engine.tag_items(tag_request("cat")));
+
+        assert_eq!(browse.state, TagIndexState::Empty);
+        assert_eq!(items.state, TagIndexState::Empty);
+        assert!(items.listing.entries.is_empty());
+    }
+
+    #[test]
+    fn tag_items_reject_empty_and_overlong_queries() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = data_dir.path().join("favorite");
+        std::fs::create_dir(&root).unwrap();
+        let engine = tag_engine(root);
+        for tag in [String::new(), "   ".to_owned(), "あ".repeat(201)] {
+            let TagItemsResponse::Error(error) = engine.tag_items(tag_request(tag)) else {
+                panic!("invalid tag unexpectedly succeeded");
+            };
+            assert_eq!(error.code, CollectionErrorCode::BadRequest);
+        }
+    }
+
+    #[test]
+    fn tag_items_drop_outside_and_missing_paths_without_changing_tags_db() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = data_dir.path().join("favorite");
+        let inside = root.join("inside.jpg");
+        let outside = data_dir.path().join("outside.jpg");
+        let missing = root.join("missing.jpg");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&inside, b"inside").unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        let missing_key = crate::tags_db::item_key_for_path(&missing);
+        let mut db = crate::tags_db::TagsDb::open_at(&crate::tags_db::TagsDb::db_path()).unwrap();
+        for path in [&inside, &outside, &missing] {
+            db.set_item_tags(&crate::tags_db::item_key_for_path(path), ["cat"], "test")
+                .unwrap();
+        }
+        drop(db);
+
+        let payload = tag_items_success(tag_engine(root).tag_items(tag_request("cat")));
+
+        assert_eq!(payload.state, TagIndexState::Ready);
+        assert_eq!(payload.listing.entries.len(), 1);
+        assert_eq!(payload.listing.entries[0].relative_path, "inside.jpg");
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(!json.contains(&data_dir.path().to_string_lossy().to_string()));
+        let db = crate::tags_db::TagsDb::open_readonly(&crate::tags_db::TagsDb::db_path()).unwrap();
+        assert_eq!(db.display_tags_for_item(&missing_key), vec!["#cat"]);
+        assert!(db.has_item_state(&missing_key));
+    }
+
+    #[test]
+    fn tag_items_map_unknown_files_to_other_and_only_real_directories_to_folder() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = data_dir.path().join("favorite");
+        let unknown = root.join("notes.unknown-extension");
+        let folder = root.join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&unknown, b"unknown").unwrap();
+        let mut db = crate::tags_db::TagsDb::open_at(&crate::tags_db::TagsDb::db_path()).unwrap();
+        for path in [&unknown, &folder] {
+            db.set_item_tags(&crate::tags_db::item_key_for_path(path), ["cat"], "test")
+                .unwrap();
+        }
+        drop(db);
+        let engine = tag_engine(root);
+
+        let all = tag_items_success(engine.tag_items(tag_request("cat")));
+        assert_eq!(all.listing.entries.len(), 2);
+        assert_eq!(
+            all.listing
+                .entries
+                .iter()
+                .find(|entry| entry.relative_path == "notes.unknown-extension")
+                .map(|entry| entry.kind),
+            Some(RemoteEntryKind::Other)
+        );
+        let folders = tag_items_success(engine.tag_items(TagItemsRequest {
+            tag: "cat".to_owned(),
+            kind: TagItemKind::Folder,
+        }));
+        assert_eq!(folders.listing.entries.len(), 1);
+        assert_eq!(folders.listing.entries[0].relative_path, "folder");
+        assert_eq!(folders.listing.entries[0].kind, RemoteEntryKind::Folder);
+    }
+
+    #[test]
+    fn tag_item_mapping_stops_at_one_over_the_response_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        let image = root.join("image.jpg");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&image, b"image").unwrap();
+        let favorite = FavoriteEntry::new("favorite".to_owned(), root);
+        let item_key = crate::tags_db::item_key_for_path(&image);
+        let item_keys = vec![item_key; MAX_REMOTE_COLLECTION_ENTRIES + 1];
+
+        let (entries, truncated) = map_tag_item_keys(
+            std::slice::from_ref(&favorite),
+            item_keys,
+            TagItemKind::All,
+            crate::tag_view::TAG_VIEW_RESULT_LIMIT,
+        );
+
+        assert_eq!(entries.len(), MAX_REMOTE_COLLECTION_ENTRIES);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn tag_item_kind_filter_scans_past_the_first_response_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut item_keys = Vec::new();
+        for index in 0..=MAX_REMOTE_COLLECTION_ENTRIES {
+            let path = root.join(format!("{index:04}.mp4"));
+            std::fs::write(&path, b"video").unwrap();
+            item_keys.push(crate::tags_db::item_key_for_path(&path));
+        }
+        let image = root.join("zzzz.jpg");
+        std::fs::write(&image, b"image").unwrap();
+        item_keys.push(crate::tags_db::item_key_for_path(&image));
+        let favorite = FavoriteEntry::new("favorite".to_owned(), root);
+
+        let (entries, truncated) = map_tag_item_keys(
+            std::slice::from_ref(&favorite),
+            item_keys,
+            TagItemKind::Image,
+            crate::tag_view::TAG_VIEW_FILTERED_KEY_SCAN_LIMIT,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].relative_path, "zzzz.jpg");
+        assert_eq!(entries[0].kind, RemoteEntryKind::Image);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn tag_browse_bounds_the_name_ordered_all_list() {
+        let summaries = (0..=MAX_REMOTE_TAG_CHOICES)
+            .map(|index| crate::tags_db::TagSummary {
+                tag: format!("tag-{index:04}"),
+                tag_key: format!("tag-{index:04}"),
+                count: index,
+                last_applied_at: index as i64,
+            })
+            .collect();
+
+        let payload = tag_browse_payload_from_summaries(summaries, &[]);
+
+        assert_eq!(payload.state, TagIndexState::Ready);
+        assert_eq!(payload.all.len(), MAX_REMOTE_TAG_CHOICES);
+        assert!(payload.all_truncated);
+        assert_eq!(
+            payload.all.first().map(|choice| choice.name.as_str()),
+            Some("tag-0000")
+        );
+        assert_eq!(
+            payload.all.last().map(|choice| choice.name.as_str()),
+            Some("tag-1999")
+        );
     }
 
     #[test]

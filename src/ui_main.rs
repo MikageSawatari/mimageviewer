@@ -21,6 +21,7 @@ use crate::settings::{
     FacetItemKind, FacetSizePreset, FacetSizeUnit, FacetSizeValue, FacetTagMode,
     GridClickSelectionMode, GridViewMode,
 };
+use crate::tag_view::{TagViewMenuChoice, tag_view_menu_sections};
 // open_external_player はグリッドからは使わなくなった (動画はフルスクリーン化 →
 // インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
 
@@ -129,13 +130,6 @@ enum FavoriteButtonClick {
     None,
     Add,
     Edit,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TagViewMenuChoice {
-    pub name: String,
-    pub tag_key: String,
-    pub count: usize,
 }
 
 fn resolve_folder_bar_nav_path(path: &Path) -> Option<PathBuf> {
@@ -11815,97 +11809,6 @@ impl App {
         }
     }
 
-    pub(crate) fn tag_view_menu_sections(
-        &self,
-    ) -> (
-        Vec<TagViewMenuChoice>,
-        Vec<TagViewMenuChoice>,
-        Vec<TagViewMenuChoice>,
-    ) {
-        const RECENT_LIMIT: usize = 20;
-        const POPULAR_LIMIT: usize = 20;
-
-        let summary_by_key: HashMap<&str, &crate::tags_db::TagSummary> = self
-            .tag_view
-            .summaries
-            .iter()
-            .map(|summary| (summary.tag_key.as_str(), summary))
-            .collect();
-        let display_names: HashMap<&str, &str> = self
-            .settings
-            .tags
-            .iter()
-            .map(|tag| (tag.tag_key.as_str(), tag.name.as_str()))
-            .collect();
-        let mut excluded: HashSet<String> = HashSet::new();
-
-        let mut pinned = Vec::new();
-        for tag in self.settings.tags.iter().filter(|tag| tag.show_shortcut) {
-            if tag.tag_key.is_empty() || tag.name.trim().is_empty() {
-                continue;
-            }
-            let count = summary_by_key
-                .get(tag.tag_key.as_str())
-                .map_or(0, |summary| summary.count);
-            pinned.push(TagViewMenuChoice {
-                name: tag.name.clone(),
-                tag_key: tag.tag_key.clone(),
-                count,
-            });
-            excluded.insert(tag.tag_key.clone());
-        }
-        pinned.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-
-        let choice_for_summary = |summary: &crate::tags_db::TagSummary| -> TagViewMenuChoice {
-            let name = display_names
-                .get(summary.tag_key.as_str())
-                .copied()
-                .unwrap_or(summary.tag.as_str())
-                .to_string();
-            TagViewMenuChoice {
-                name,
-                tag_key: summary.tag_key.clone(),
-                count: summary.count,
-            }
-        };
-
-        let mut recent_source: Vec<_> = self.tag_view.summaries.iter().collect();
-        recent_source.sort_by(|a, b| {
-            b.last_applied_at
-                .cmp(&a.last_applied_at)
-                .then_with(|| a.tag.to_lowercase().cmp(&b.tag.to_lowercase()))
-        });
-        let mut recent = Vec::new();
-        for summary in recent_source {
-            if !excluded.insert(summary.tag_key.clone()) {
-                continue;
-            }
-            recent.push(choice_for_summary(summary));
-            if recent.len() >= RECENT_LIMIT {
-                break;
-            }
-        }
-
-        let mut popular_source: Vec<_> = self.tag_view.summaries.iter().collect();
-        popular_source.sort_by(|a, b| {
-            b.count
-                .cmp(&a.count)
-                .then_with(|| a.tag.to_lowercase().cmp(&b.tag.to_lowercase()))
-        });
-        let mut popular = Vec::new();
-        for summary in popular_source {
-            if !excluded.insert(summary.tag_key.clone()) {
-                continue;
-            }
-            popular.push(choice_for_summary(summary));
-            if popular.len() >= POPULAR_LIMIT {
-                break;
-            }
-        }
-
-        (pinned, recent, popular)
-    }
-
     /// タグビュー (Ctrl+T) の検索バーを描画する。
     pub(crate) fn render_tag_view_bar(&mut self, ctx: &egui::Context) {
         if !self.tag_view.active {
@@ -11946,7 +11849,8 @@ impl App {
                 if response.changed() || menu_changed {
                     query_changed = true;
                 }
-                let (pinned, recent, popular) = self.tag_view_menu_sections();
+                let (pinned, recent, popular) =
+                    tag_view_menu_sections(&self.tag_view.summaries, &self.settings.tags);
                 ui.menu_button("一覧▼", |ui| {
                     ui.set_min_width(260.0);
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);

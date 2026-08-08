@@ -9,8 +9,9 @@ use mimageviewer_ipc::{
     MAX_CONTROL_FRAME_BYTES, MediaError, MediaErrorCode, PIPE_NAME, PROTOCOL_VERSION, PagePriority,
     PageResponse, RemoteSessionIdentity, RemoteWriteError, RemoteWriteErrorCode,
     RemoteWriteRequest, RemoteWriteResponse, ServerMessage, SessionResponse, SessionStatus,
-    ThumbnailError, ThumbnailErrorCode, ThumbnailResponse, VideoStreamError, VideoStreamErrorCode,
-    VideoStreamResult, VideoStreamThumbnailPayload, negotiate, read_frame, write_frame,
+    TagBrowseResponse, TagItemsResponse, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse,
+    VideoStreamError, VideoStreamErrorCode, VideoStreamResult, VideoStreamThumbnailPayload,
+    negotiate, read_frame, write_frame,
 };
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
@@ -467,6 +468,14 @@ fn worker_loop(
                             response: collection_engine.favorite_search(request),
                         }
                     }
+                    ClientMessage::TagBrowse { id, request, .. } => ServerMessage::TagBrowse {
+                        id,
+                        response: collection_engine.tag_browse(request),
+                    },
+                    ClientMessage::TagItems { id, request, .. } => ServerMessage::TagItems {
+                        id,
+                        response: collection_engine.tag_items(request),
+                    },
                     ClientMessage::FolderList { id, request, .. } => ServerMessage::FolderList {
                         id,
                         response: container_engine.folder_list(request),
@@ -1098,6 +1107,8 @@ fn request_kind(message: &ClientMessage) -> &'static str {
         ClientMessage::Home { .. } => "home",
         ClientMessage::Collection { .. } => "collection",
         ClientMessage::FavoriteSearch { .. } => "favorite_search",
+        ClientMessage::TagBrowse { .. } => "tag_browse",
+        ClientMessage::TagItems { .. } => "tag_items",
         ClientMessage::FolderList { .. } => "folder_list",
         ClientMessage::Container { .. } => "container",
         ClientMessage::Page { request, .. } => match request.priority {
@@ -1156,6 +1167,8 @@ fn message_owner(message: &ClientMessage) -> Option<&RemoteSessionIdentity> {
         | ClientMessage::Home { owner, .. }
         | ClientMessage::Collection { owner, .. }
         | ClientMessage::FavoriteSearch { owner, .. }
+        | ClientMessage::TagBrowse { owner, .. }
+        | ClientMessage::TagItems { owner, .. }
         | ClientMessage::Container { owner, .. }
         | ClientMessage::FolderList { owner, .. }
         | ClientMessage::Page { owner, .. }
@@ -1194,6 +1207,8 @@ fn operation_description(message: &ClientMessage) -> String {
         ClientMessage::Home { .. } => "ホームを読み込み中".to_owned(),
         ClientMessage::Collection { .. } => "集約ビューを読み込み中".to_owned(),
         ClientMessage::FavoriteSearch { .. } => "お気に入りを検索中".to_owned(),
+        ClientMessage::TagBrowse { .. } => "タグ一覧を読み込み中".to_owned(),
+        ClientMessage::TagItems { .. } => "タグの項目を検索中".to_owned(),
         ClientMessage::Container { .. } => "コンテナを列挙中".to_owned(),
         ClientMessage::FolderList { .. } => "フォルダ一覧を読み込み中".to_owned(),
         ClientMessage::Page { request, .. } => match request.address.subresource {
@@ -1316,6 +1331,14 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
             response: FavoriteSearchResponse::Success(_),
             ..
         }
+        | ServerMessage::TagBrowse {
+            response: TagBrowseResponse::Success(_),
+            ..
+        }
+        | ServerMessage::TagItems {
+            response: TagItemsResponse::Success(_),
+            ..
+        }
         | ServerMessage::Container {
             response: ContainerResponse::Success(_),
             ..
@@ -1408,6 +1431,14 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
         }
         | ServerMessage::FavoriteSearch {
             response: FavoriteSearchResponse::Error(_),
+            ..
+        }
+        | ServerMessage::TagBrowse {
+            response: TagBrowseResponse::Error(_),
+            ..
+        }
+        | ServerMessage::TagItems {
+            response: TagItemsResponse::Error(_),
             ..
         }
         | ServerMessage::Container {
@@ -2039,6 +2070,20 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
                 "mIV 本体のお気に入り検索ワーカーが停止しています",
             )),
         },
+        ClientMessage::TagBrowse { id, .. } => ServerMessage::TagBrowse {
+            id: *id,
+            response: TagBrowseResponse::Error(CollectionError::new(
+                CollectionErrorCode::Internal,
+                "mIV 本体のタグ一覧ワーカーが停止しています",
+            )),
+        },
+        ClientMessage::TagItems { id, .. } => ServerMessage::TagItems {
+            id: *id,
+            response: TagItemsResponse::Error(CollectionError::new(
+                CollectionErrorCode::Internal,
+                "mIV 本体のタグ検索ワーカーが停止しています",
+            )),
+        },
         ClientMessage::Container { id, .. } => ServerMessage::Container {
             id: *id,
             response: ContainerResponse::Error(MediaError::new(
@@ -2176,6 +2221,20 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
             response: FavoriteSearchResponse::Error(CollectionError::new(
                 CollectionErrorCode::Busy,
                 "mIV 本体のお気に入り検索 queue が混み合っています",
+            )),
+        },
+        ClientMessage::TagBrowse { id, .. } => ServerMessage::TagBrowse {
+            id: *id,
+            response: TagBrowseResponse::Error(CollectionError::new(
+                CollectionErrorCode::Busy,
+                "mIV 本体のタグ一覧 queue が混み合っています",
+            )),
+        },
+        ClientMessage::TagItems { id, .. } => ServerMessage::TagItems {
+            id: *id,
+            response: TagItemsResponse::Error(CollectionError::new(
+                CollectionErrorCode::Busy,
+                "mIV 本体のタグ検索 queue が混み合っています",
             )),
         },
         ClientMessage::Container { id, .. } => ServerMessage::Container {

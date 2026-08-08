@@ -502,6 +502,9 @@ const state = {
   homeLoadError: "",
   homeTab: "places",
   favoriteSearch: { query: "", kind: "all" },
+  tagBrowse: null,
+  tagBrowseLoadError: "",
+  tagBrowseFilter: { query: "", kind: "all" },
   collection: null,
   container: null,
   gridSortState: null,
@@ -545,6 +548,7 @@ const state = {
   commandMenu: null,
   remoteAiController: null,
   thumbnailNotice: null,
+  gridActionNotice: null,
   screenContext: "loading",
   gridIndex: 0,
   authCountdownTimer: 0,
@@ -1366,6 +1370,10 @@ async function dispatchRoute() {
       await showFavoriteSearch(route);
       return;
     }
+    if (route.kind === "tag") {
+      await showTagItems(route);
+      return;
+    }
     if (route.kind === "folder") {
       await showFolder(route.favoriteId, route.path);
       return;
@@ -1453,7 +1461,7 @@ export function parseRoute(hash) {
   if (hash === "#favorites") {
     return { kind: "home", tab: "favorites" };
   }
-  const home = hash.match(/^#home\/(favorites|smart|places|search)$/);
+  const home = hash.match(/^#home\/(favorites|smart|places|search|tags)$/);
   if (home) {
     return { kind: "home", tab: home[1] };
   }
@@ -1477,6 +1485,20 @@ export function parseRoute(hash) {
       };
     } catch {
       return { kind: "home", tab: "search" };
+    }
+  }
+  const tag = hash.match(
+    /^#tag\/(all|folder|image|video|audio|zip|pdf|archive)\/(.*)$/
+  );
+  if (tag) {
+    try {
+      return {
+        kind: "tag",
+        tagKind: tag[1],
+        tag: decodeURIComponent(tag[2]),
+      };
+    } catch {
+      return { kind: "home", tab: "tags" };
     }
   }
   const addressed = hash.match(/^#(container|media)\/(.*)$/);
@@ -1512,6 +1534,10 @@ function collectionHash(kind, value = "") {
 
 export function favoriteSearchHash(query, kind = "all") {
   return `#search/${kind}/${encodeURIComponent(query)}`;
+}
+
+export function tagItemsHash(tag, kind = "all") {
+  return `#tag/${kind}/${encodeURIComponent(tag)}`;
 }
 
 function folderHash(favoriteId, path) {
@@ -1769,6 +1795,8 @@ function dispatchCommand(requested, meta = {}) {
       ? "smart"
       : state.collection?.kind === "favorite_search"
         ? "search"
+      : state.collection?.kind === "tag_items"
+        ? "tags"
       : state.favoriteId
         ? "favorites"
         : "places";
@@ -1879,6 +1907,20 @@ export function resolveMediaOpenRoute(requestedKind, addressedEntry, imageIndex)
   return requestedKind;
 }
 
+export function unsupportedRemoteEntryMessage(kind) {
+  if (kind === "audio") return "この端末では音声を再生できません。";
+  if (kind === "archive") return "この端末ではアーカイブを開けません。";
+  return "";
+}
+
+export function showUnsupportedRemoteEntryNotice(host, kind) {
+  const message = unsupportedRemoteEntryMessage(kind);
+  if (!host || !message) return false;
+  host.textContent = message;
+  host.hidden = false;
+  return true;
+}
+
 export function resolveLegacyImageOpenRoute(payload, imageCount, isCollection) {
   if (
     payload?.kind !== "image" ||
@@ -1902,6 +1944,13 @@ function executeOpenCommand(payload, meta) {
   ) {
     state.gridIndex = payload.entryIndex;
     state.virtualGrid?.selectReturnAnchor(payload.entryIndex);
+  }
+  if (payload.kind === "unsupported") {
+    if (!showUnsupportedRemoteEntryNotice(state.gridActionNotice, payload.entryKind)) {
+      return false;
+    }
+    meta.openRoute = "unsupported_" + payload.entryKind;
+    return true;
   }
   if (payload.kind === "favorite" || payload.kind === "folder") {
     meta.openRoute = payload.kind;
@@ -2083,7 +2132,13 @@ function openGridEntry(index, meta) {
       meta
     );
   }
-  if (entry.kind === "zip" || entry.kind === "pdf") {
+  if (unsupportedRemoteEntryMessage(entry.kind)) {
+    return executeOpenCommand(
+      { kind: "unsupported", entryKind: entry.kind, entryIndex: index },
+      meta
+    );
+  }
+  if (["zip", "pdf"].includes(entry.kind)) {
     return executeOpenCommand(
       { kind: "container", address: entryAddress(entry), entryIndex: index },
       meta
@@ -2099,7 +2154,7 @@ function openGridEntry(index, meta) {
     return executeOpenCommand(
       {
         kind: "media",
-        mediaKind: "video",
+        mediaKind: entry.kind,
         address: entryAddress(entry),
         entryIndex: index,
       },
@@ -2288,6 +2343,7 @@ function cleanupScreen(preserveRequestController = null) {
   state.thumbnailTracker?.destroy();
   state.thumbnailTracker = null;
   state.thumbnailNotice = null;
+  state.gridActionNotice = null;
   state.commandMenu?.destroy();
   state.commandMenu = null;
   state.localSettingsDialog?.destroy();
@@ -2305,7 +2361,7 @@ function cleanupScreen(preserveRequestController = null) {
 function renderHome(tab = "places") {
   cleanupScreen();
   state.screenContext = "home";
-  state.homeTab = ["favorites", "smart", "places", "search"].includes(tab)
+  state.homeTab = ["favorites", "smart", "places", "search", "tags"].includes(tab)
     ? tab
     : "places";
   state.collection = null;
@@ -2329,6 +2385,7 @@ function renderHome(tab = "places") {
   if (state.homeTab === "favorites") renderFavoriteTab(content);
   else if (state.homeTab === "smart") renderSmartFolderTab(content);
   else if (state.homeTab === "search") renderFavoriteSearchTab(content);
+  else if (state.homeTab === "tags") renderTagBrowseTab(content);
   else renderPlacesTab(content);
   screen.append(content);
   state.commandMenu = new CommandMenu(screen, "home");
@@ -2343,6 +2400,7 @@ function createHomeTabs(active) {
     ["smart", "スマートフォルダ"],
     ["places", "場所"],
     ["search", "検索"],
+    ["tags", "タグ"],
   ]) {
     const button = textElement("button", label, "home-tab");
     button.type = "button";
@@ -2414,6 +2472,192 @@ export function createFavoriteSearchForm(initial, onSubmit) {
   });
   form.append(query, kind, submit);
   return { form, query, kind, submit };
+}
+
+const TAG_ITEM_KIND_CHOICES = [
+  ["all", "すべて"],
+  ["folder", "フォルダ"],
+  ["image", "画像"],
+  ["video", "動画"],
+  ["audio", "音声"],
+  ["zip", "ZIP"],
+  ["pdf", "PDF"],
+  ["archive", "アーカイブ"],
+];
+
+function normalizedTagFilterText(value) {
+  return String(value ?? "")
+    .trim()
+    .replace(/^#+/, "")
+    .normalize("NFKC")
+    .toLocaleLowerCase();
+}
+
+export function filterRemoteTags(tags, query) {
+  const needle = normalizedTagFilterText(query);
+  if (!needle) return Array.isArray(tags) ? [...tags] : [];
+  return (Array.isArray(tags) ? tags : []).filter((choice) =>
+    normalizedTagFilterText(choice?.name).includes(needle)
+  );
+}
+
+export function tagBrowsePresentation(payload, query) {
+  if (normalizedTagFilterText(query)) {
+    return {
+      mode: "flat",
+      sections: [{ title: "", choices: filterRemoteTags(payload?.all, query) }],
+    };
+  }
+  return {
+    mode: "sections",
+    sections: [
+      { title: "ピン留め", choices: payload?.pinned ?? [] },
+      { title: "最近", choices: payload?.recent ?? [] },
+      { title: "よく使う", choices: payload?.popular ?? [] },
+    ],
+  };
+}
+
+let tagBrowsePromise = null;
+
+function loadTagBrowseOnce() {
+  if (state.tagBrowse || state.tagBrowseLoadError || tagBrowsePromise) return;
+  tagBrowsePromise = apiJson("/api/tags")
+    .then((payload) => {
+      state.tagBrowse = payload;
+    })
+    .catch((error) => {
+      state.tagBrowseLoadError =
+        error instanceof Error ? error.message : "タグ一覧を読み込めませんでした。";
+    })
+    .finally(() => {
+      tagBrowsePromise = null;
+      if (state.screenContext === "home" && state.homeTab === "tags") {
+        renderHome("tags");
+      }
+    });
+}
+
+function renderTagBrowseTab(content) {
+  content.append(
+    textElement(
+      "p",
+      "件数は mIV 全体の数です。この端末から開けるのはお気に入りの中だけです。",
+      "tag-count-note"
+    )
+  );
+
+  const form = element("form", "tag-browse-form");
+  const query = element("input", "tag-filter-input");
+  query.type = "search";
+  query.placeholder = "タグ名で絞り込み / 直接入力";
+  query.autocomplete = "off";
+  query.maxLength = 200;
+  query.value = state.tagBrowseFilter.query;
+  query.setAttribute("aria-label", "タグ名の絞り込み");
+
+  const kind = element("select", "tag-kind-select");
+  kind.setAttribute("aria-label", "項目の種類");
+  for (const [value, label] of TAG_ITEM_KIND_CHOICES) {
+    const option = textElement("option", label);
+    option.value = value;
+    option.selected = value === state.tagBrowseFilter.kind;
+    kind.append(option);
+  }
+  kind.value = TAG_ITEM_KIND_CHOICES.some(([value]) => value === state.tagBrowseFilter.kind)
+    ? state.tagBrowseFilter.kind
+    : "all";
+  const submit = textElement("button", "実行", "tag-search-submit");
+  submit.type = "submit";
+  form.append(query, kind, submit);
+
+  const results = element("div", "tag-browse-results");
+  const refreshResults = () => renderTagBrowseChoices(results, query.value, kind.value);
+  query.addEventListener("input", () => {
+    state.tagBrowseFilter.query = query.value;
+    refreshResults();
+  });
+  kind.addEventListener("change", () => {
+    state.tagBrowseFilter.kind = kind.value;
+  });
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const tag = query.value.trim();
+    if (!tag) {
+      query.focus();
+      return;
+    }
+    state.tagBrowseFilter = { query: query.value, kind: kind.value };
+    navigate(tagItemsHash(tag, kind.value), { returnHash: homeHash("tags") });
+  });
+  content.append(form, results);
+
+  if (!state.tagBrowse && !state.tagBrowseLoadError) {
+    results.append(textElement("p", "タグ一覧を読み込んでいます…", "empty-state"));
+    loadTagBrowseOnce();
+    return;
+  }
+  refreshResults();
+}
+
+function renderTagBrowseChoices(host, query, kind) {
+  host.replaceChildren();
+  if (state.tagBrowseLoadError) {
+    host.append(textElement("p", state.tagBrowseLoadError, "empty-state"));
+    return;
+  }
+  const payload = state.tagBrowse;
+  if (!payload) return;
+  if (payload.state === "unavailable") {
+    host.append(textElement("p", "タグをまだ利用できません。", "empty-state"));
+    return;
+  }
+  if (payload.state === "empty") {
+    host.append(textElement("p", "タグはまだ 1 つもありません。", "empty-state"));
+    return;
+  }
+
+  const presentation = tagBrowsePresentation(payload, query);
+  for (const section of presentation.sections) {
+    const group = element("section", "tag-choice-section");
+    if (section.title) group.append(textElement("h2", section.title));
+    const list = element("div", "tag-choice-list");
+    for (const choice of section.choices) {
+      const button = element("button", "tag-choice");
+      button.type = "button";
+      button.append(
+        textElement("span", `#${choice.name}`, "tag-choice-name"),
+        textElement("span", String(choice.count), "tag-choice-count")
+      );
+      button.addEventListener("click", () => {
+        state.tagBrowseFilter.kind = kind;
+        navigate(tagItemsHash(choice.name, kind), { returnHash: homeHash("tags") });
+      });
+      list.append(button);
+    }
+    if (!section.choices.length) {
+      list.append(
+        textElement(
+          "p",
+          presentation.mode === "flat"
+            ? "一致するタグはありません。入力した語句はそのまま実行できます。"
+            : "該当するタグはありません。",
+          "empty-state tag-choice-empty"
+        )
+      );
+    }
+    group.append(list);
+    host.append(group);
+  }
+  if (payload.all_truncated) {
+    host.append(
+      textElement(
+        "p",
+        "全タグの一覧は先頭 2000 件までです。一覧にないタグは入力欄から直接実行できます。",
+        "tag-truncated-note"
+      )
+    );
+  }
 }
 
 function renderFavoriteTab(content) {
@@ -2601,6 +2845,44 @@ async function showFavoriteSearch(route) {
   renderFolder();
 }
 
+async function showTagItems(route) {
+  state.tagBrowseFilter = { query: route.tag, kind: route.tagKind };
+  renderLoading("タグの項目を検索しています");
+  const data = await apiJson("/api/tags/items", {
+    tag: route.tag,
+    kind: route.tagKind,
+  });
+  const listing = data.listing ?? {};
+  const entries = listing.entries ?? [];
+  const title = tagItemsResultTitle(route.tag, listing.title);
+  state.collection = {
+    kind: "tag_items",
+    value: route.tagKind,
+    title,
+    truncated: Boolean(listing.truncated),
+    entryLimit: Number(listing.entry_limit) || 0,
+    emptyMessage: tagItemsEmptyMessage(data.state, entries.length),
+  };
+  state.gridSortState = normalizeRemoteGridSortState(listing.sort_state);
+  state.gridSortScope = null;
+  state.container = null;
+  state.gridReturnHash = homeHash("tags");
+  state.favoriteId = null;
+  state.gridHash = location.hash;
+  state.favoriteName = title;
+  state.folderPath = "";
+  state.thumbAspectHeightRatio =
+    Number.isFinite(Number(listing.thumb_aspect_height_ratio)) &&
+    Number(listing.thumb_aspect_height_ratio) > 0
+      ? Number(listing.thumb_aspect_height_ratio)
+      : 1;
+  state.entries = entries;
+  state.images = state.entries.filter((entry) => entry.kind === "image");
+  setSinglePageGroups();
+  state.gridIndex = 0;
+  renderFolder();
+}
+
 const FAVORITE_SEARCH_TITLE_MAX_CHARS = 30;
 
 /// 結果画面の題。長い語句はパンくずを押し出すので表示だけ丸めるが、丸めるのは見た目に
@@ -2625,6 +2907,25 @@ export function favoriteSearchEmptyMessage(indexState, entryCount = 0) {
     return "コンテナ索引をまだ利用できません。しばらくしてからもう一度検索してください。";
   }
   return "一致するフォルダ・ZIP・PDF はありませんでした。";
+}
+
+export function tagItemsResultTitle(tag, fallback = "タグの項目") {
+  const trimmed = String(tag ?? "").trim().replace(/^#+/, "");
+  if (!trimmed) return fallback;
+  const displayTag = `#${trimmed}`;
+  const characters = Array.from(displayTag);
+  const shown =
+    characters.length > FAVORITE_SEARCH_TITLE_MAX_CHARS
+      ? `${characters.slice(0, FAVORITE_SEARCH_TITLE_MAX_CHARS).join("")}…`
+      : displayTag;
+  return `「${shown}」の項目`;
+}
+
+export function tagItemsEmptyMessage(indexState, entryCount = 0) {
+  if (entryCount > 0) return "";
+  if (indexState === "empty") return "タグはまだ 1 つもありません。";
+  if (indexState === "unavailable") return "タグをまだ利用できません。";
+  return "このタグの項目は見つかりませんでした。";
 }
 
 function collectionRequestParams(route) {
@@ -3481,6 +3782,15 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
   const thumbnailNotice = textElement("p", "", "thumbnail-service-notice");
   thumbnailNotice.hidden = true;
   state.thumbnailNotice = thumbnailNotice;
+  const gridActionNotice = textElement(
+    "p",
+    "",
+    "thumbnail-service-notice grid-action-notice"
+  );
+  gridActionNotice.hidden = true;
+  gridActionNotice.setAttribute("role", "status");
+  gridActionNotice.setAttribute("aria-live", "polite");
+  state.gridActionNotice = gridActionNotice;
   const collectionLimitNotice = textElement(
     "p",
     (state.collection ?? state.container)?.truncated
@@ -3495,7 +3805,14 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
   const windowElement = element("div", "virtual-window");
   space.append(windowElement);
   scroll.append(space);
-  screen.append(topbar, sortBar, collectionLimitNotice, thumbnailNotice, scroll);
+  screen.append(
+    topbar,
+    sortBar,
+    collectionLimitNotice,
+    gridActionNotice,
+    thumbnailNotice,
+    scroll
+  );
   screen.addEventListener("contextmenu", (event) => {
     event.preventDefault();
     dispatchCommand(command(CommandName.TOGGLE_MENU), {
@@ -3844,7 +4161,7 @@ export function createGridTile(
       tile.addEventListener("click", (event) => {
         commandDispatcher(command(CommandName.OPEN, {
           kind: "media",
-          mediaKind: "video",
+          mediaKind: entry.kind,
           address: entryAddress(entry),
           entryIndex,
         }), {
@@ -3852,6 +4169,21 @@ export function createGridTile(
           detail: "grid_tile",
           at: performance.now(),
         });
+      });
+    } else if (unsupportedRemoteEntryMessage(entry.kind)) {
+      tile.addEventListener("click", (event) => {
+        commandDispatcher(
+          command(CommandName.OPEN, {
+            kind: "unsupported",
+            entryKind: entry.kind,
+            entryIndex,
+          }),
+          {
+            source: inputSourceFromEvent(event),
+            detail: "grid_tile",
+            at: performance.now(),
+          }
+        );
       });
     } else if (["zip", "pdf", "directory"].includes(entry.kind)) {
       tile.addEventListener("click", (event) => {
@@ -3999,7 +4331,7 @@ function entryTypeLabel(kind) {
 
 function renderVideoViewer(entry) {
   if (!entry || entry.kind !== "video") {
-    recordClientError("video_viewer_entry_rejected", "動画ビューアに動画以外が渡されました", {
+    recordClientError("video_viewer_entry_rejected", "メディアビューアに未対応の項目が渡されました", {
       entry_found: Boolean(entry),
       resolved_kind: entry?.kind ?? "missing",
       screen_context: state.screenContext,

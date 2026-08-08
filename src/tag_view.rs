@@ -3,16 +3,115 @@
 //! `tags.db` の検索と `fs::metadata` によるパス種別判定は worker 側で行い、
 //! UI スレッドでは結果を通常グリッドへ反映するだけにする。
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use crate::archive_converter::ArchiveFormat;
+use crate::settings::TagDef;
 use crate::tags_db::TagSummary;
 
 pub const TAG_VIEW_RESULT_LIMIT: usize = 10_000;
-const TAG_VIEW_FILTERED_KEY_SCAN_LIMIT: usize = 50_000;
+pub(crate) const TAG_VIEW_FILTERED_KEY_SCAN_LIMIT: usize = 50_000;
+const TAG_VIEW_RECENT_LIMIT: usize = 20;
+const TAG_VIEW_POPULAR_LIMIT: usize = 20;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TagViewMenuChoice {
+    pub name: String,
+    pub tag_key: String,
+    pub count: usize,
+}
+
+/// 本体タグビューとリモート閲覧で共有するタグブラウザ 3 区画の正本。
+///
+/// 入力はタグ一覧と設定上のタグ定義だけで、App の他状態には依存しない。
+pub(crate) fn tag_view_menu_sections(
+    summaries: &[TagSummary],
+    tag_defs: &[TagDef],
+) -> (
+    Vec<TagViewMenuChoice>,
+    Vec<TagViewMenuChoice>,
+    Vec<TagViewMenuChoice>,
+) {
+    let summary_by_key: HashMap<&str, &TagSummary> = summaries
+        .iter()
+        .map(|summary| (summary.tag_key.as_str(), summary))
+        .collect();
+    let display_names: HashMap<&str, &str> = tag_defs
+        .iter()
+        .map(|tag| (tag.tag_key.as_str(), tag.name.as_str()))
+        .collect();
+    let mut excluded: HashSet<String> = HashSet::new();
+
+    let mut pinned = Vec::new();
+    for tag in tag_defs.iter().filter(|tag| tag.show_shortcut) {
+        if tag.tag_key.is_empty() || tag.name.trim().is_empty() {
+            continue;
+        }
+        let count = summary_by_key
+            .get(tag.tag_key.as_str())
+            .map_or(0, |summary| summary.count);
+        pinned.push(TagViewMenuChoice {
+            name: tag.name.clone(),
+            tag_key: tag.tag_key.clone(),
+            count,
+        });
+        excluded.insert(tag.tag_key.clone());
+    }
+    pinned.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+    let choice_for_summary = |summary: &TagSummary| -> TagViewMenuChoice {
+        let name = display_names
+            .get(summary.tag_key.as_str())
+            .copied()
+            .unwrap_or(summary.tag.as_str())
+            .to_string();
+        TagViewMenuChoice {
+            name,
+            tag_key: summary.tag_key.clone(),
+            count: summary.count,
+        }
+    };
+
+    let mut recent_source: Vec<_> = summaries.iter().collect();
+    recent_source.sort_by(|a, b| {
+        b.last_applied_at
+            .cmp(&a.last_applied_at)
+            .then_with(|| a.tag.to_lowercase().cmp(&b.tag.to_lowercase()))
+    });
+    let mut recent = Vec::new();
+    for summary in recent_source {
+        if !excluded.insert(summary.tag_key.clone()) {
+            continue;
+        }
+        recent.push(choice_for_summary(summary));
+        if recent.len() >= TAG_VIEW_RECENT_LIMIT {
+            break;
+        }
+    }
+
+    let mut popular_source: Vec<_> = summaries.iter().collect();
+    popular_source.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.tag.to_lowercase().cmp(&b.tag.to_lowercase()))
+    });
+    let mut popular = Vec::new();
+    for summary in popular_source {
+        if !excluded.insert(summary.tag_key.clone()) {
+            continue;
+        }
+        popular.push(choice_for_summary(summary));
+        if popular.len() >= TAG_VIEW_POPULAR_LIMIT {
+            break;
+        }
+    }
+
+    (pinned, recent, popular)
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum TagViewKindFilter {
@@ -190,15 +289,7 @@ fn run_tag_view_search(
     } else {
         TAG_VIEW_FILTERED_KEY_SCAN_LIMIT
     };
-    let terms = parse_tag_view_query_terms(trimmed);
-    let exact_keys = db.item_keys_by_tag_exact(trimmed, scan_limit + 1);
-    let keys = if terms.len() > 1 && exact_keys.is_empty() {
-        db.item_keys_by_tag_terms_and(&terms, scan_limit + 1)
-    } else if exact_keys.is_empty() {
-        db.item_keys_by_tag_prefix(trimmed, scan_limit + 1)
-    } else {
-        exact_keys
-    };
+    let keys = select_tag_view_item_keys(&db, trimmed, scan_limit + 1);
     let scan_truncated = keys.len() > scan_limit;
     let mut truncated = false;
     let mut entries = Vec::with_capacity(keys.len().min(TAG_VIEW_RESULT_LIMIT));
@@ -214,7 +305,8 @@ fn run_tag_view_search(
         }
         let path = PathBuf::from(&key);
         match classify_tag_view_path(path) {
-            ClassifiedTagViewPath::Existing(entry) => {
+            ClassifiedTagViewPath::Existing(classified) => {
+                let entry = classified.entry;
                 if kind_filter.matches(entry.kind) {
                     if entries.len() >= TAG_VIEW_RESULT_LIMIT {
                         truncated = true;
@@ -241,6 +333,25 @@ fn run_tag_view_search(
     })
 }
 
+/// 本体タグビューとリモート閲覧で共有する item_key 選択規則の正本。
+///
+/// 完全一致を優先し、複数語かつ完全一致なしなら語の AND、最後に接頭辞へ進む。
+pub(crate) fn select_tag_view_item_keys(
+    db: &crate::tags_db::TagsDb,
+    query: &str,
+    limit: usize,
+) -> Vec<String> {
+    let terms = parse_tag_view_query_terms(query);
+    let exact_keys = db.item_keys_by_tag_exact(query, limit);
+    if terms.len() > 1 && exact_keys.is_empty() {
+        db.item_keys_by_tag_terms_and(&terms, limit)
+    } else if exact_keys.is_empty() {
+        db.item_keys_by_tag_prefix(query, limit)
+    } else {
+        exact_keys
+    }
+}
+
 fn parse_tag_view_query_terms(query: &str) -> Vec<String> {
     dedup_tag_terms(
         query
@@ -264,12 +375,18 @@ fn dedup_tag_terms(terms: Vec<String>) -> Vec<String> {
     out
 }
 
-enum ClassifiedTagViewPath {
-    Existing(TagViewEntry),
+pub(crate) struct ClassifiedTagViewEntry {
+    pub entry: TagViewEntry,
+    /// `TagViewItemKind::Folder` の既存 fallback と実フォルダを区別する。
+    pub is_directory: bool,
+}
+
+pub(crate) enum ClassifiedTagViewPath {
+    Existing(ClassifiedTagViewEntry),
     Missing,
 }
 
-fn classify_tag_view_path(path: PathBuf) -> ClassifiedTagViewPath {
+pub(crate) fn classify_tag_view_path(path: PathBuf) -> ClassifiedTagViewPath {
     match std::fs::metadata(&path) {
         Ok(meta) => existing_tag_view_entry(restore_real_casing(path), meta),
         Err(_) => {
@@ -291,16 +408,20 @@ fn classify_tag_view_path(path: PathBuf) -> ClassifiedTagViewPath {
 fn existing_tag_view_entry(path: PathBuf, meta: std::fs::Metadata) -> ClassifiedTagViewPath {
     let mtime = crate::ui_helpers::mtime_secs(&meta);
     let file_size = if meta.is_file() { meta.len() as i64 } else { 0 };
-    let kind = if meta.is_dir() {
+    let is_directory = meta.is_dir();
+    let kind = if is_directory {
         TagViewItemKind::Folder
     } else {
         classify_file_kind(&path)
     };
-    ClassifiedTagViewPath::Existing(TagViewEntry {
-        path,
-        kind,
-        mtime,
-        file_size,
+    ClassifiedTagViewPath::Existing(ClassifiedTagViewEntry {
+        entry: TagViewEntry {
+            path,
+            kind,
+            mtime,
+            file_size,
+        },
+        is_directory,
     })
 }
 
@@ -522,6 +643,38 @@ mod tests {
         assert_eq!(
             parse_tag_view_query_terms("cat cat #dog"),
             vec!["cat".to_string(), "dog".to_string()]
+        );
+    }
+
+    #[test]
+    fn item_key_selection_keeps_exact_then_and_then_prefix_precedence() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = crate::tags_db::TagsDb::open_at(&temp.path().join("tags.db")).unwrap();
+        db.set_item_tags("exact", ["cat"], "test").unwrap();
+        db.set_item_tags("prefix", ["catnap"], "test").unwrap();
+        db.set_item_tags("and", ["cat", "dog"], "test").unwrap();
+        db.set_item_tags("and-prefix", ["cat", "dognap"], "test")
+            .unwrap();
+
+        assert_eq!(
+            select_tag_view_item_keys(&db, "#cat", 20),
+            vec![
+                "and".to_owned(),
+                "and-prefix".to_owned(),
+                "exact".to_owned()
+            ]
+        );
+        assert_eq!(
+            select_tag_view_item_keys(&db, "#cat #dog", 20),
+            vec!["and".to_owned()]
+        );
+        assert_eq!(
+            select_tag_view_item_keys(&db, "#cat #do", 20),
+            vec!["and".to_owned(), "and-prefix".to_owned()]
+        );
+        assert_eq!(
+            select_tag_view_item_keys(&db, "#catn", 20),
+            vec!["prefix".to_owned()]
         );
     }
 

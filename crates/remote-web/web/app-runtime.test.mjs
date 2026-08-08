@@ -118,6 +118,7 @@ const {
   containerInitialImageIndex,
   createFavoriteSearchForm,
   createGridTile,
+  filterRemoteTags,
   favoriteSearchEmptyMessage,
   favoriteSearchHash,
   favoriteSearchResultTitle,
@@ -142,7 +143,13 @@ const {
   selectRecoverableRemoteAiJob,
   setViewTrimSpreadSeparate,
   setRuntimeTestErrorObserver,
+  showUnsupportedRemoteEntryNotice,
+  tagBrowsePresentation,
+  tagItemsEmptyMessage,
+  tagItemsHash,
+  tagItemsResultTitle,
   thumbnailAddressForEntry,
+  unsupportedRemoteEntryMessage,
   videoFileTargetIndex,
   viewTrimSpreadControlKeys,
   viewerMenuDefinitions,
@@ -317,6 +324,71 @@ test("favorite search runs only when the form is submitted", () => {
   });
   assert.equal(prevented, 1);
   assert.deepEqual(submissions, [{ query: "次の語句", kind: "pdf" }]);
+});
+
+test("tag route preserves encoded tag and every item kind", () => {
+  for (const kind of [
+    "all",
+    "folder",
+    "image",
+    "video",
+    "audio",
+    "zip",
+    "pdf",
+    "archive",
+  ]) {
+    const tag = "表紙 / 仕上げ% #候補";
+    assert.deepEqual(parseRoute(tagItemsHash(tag, kind)), {
+      kind: "tag",
+      tagKind: kind,
+      tag,
+    });
+  }
+});
+
+test("tag filtering is local partial matching and switches to one flat section", () => {
+  const all = [
+    { name: "Landscape", count: 2 },
+    { name: "夜景", count: 4 },
+    { name: "風景", count: 6 },
+  ];
+  assert.deepEqual(filterRemoteTags(all, "景"), [all[1], all[2]]);
+  assert.deepEqual(filterRemoteTags(all, "ｌａｎｄ"), [all[0]]);
+
+  const filtered = tagBrowsePresentation({ all }, "景");
+  assert.equal(filtered.mode, "flat");
+  assert.equal(filtered.sections.length, 1);
+  assert.deepEqual(filtered.sections[0].choices, [all[1], all[2]]);
+
+  const sections = tagBrowsePresentation({
+    pinned: [all[0]],
+    recent: [all[1]],
+    popular: [all[2]],
+    all,
+  }, "");
+  assert.equal(sections.mode, "sections");
+  assert.deepEqual(sections.sections.map((section) => section.title), [
+    "ピン留め",
+    "最近",
+    "よく使う",
+  ]);
+});
+
+test("tag item states and title keep the requested tag visible", () => {
+  assert.equal(
+    tagItemsEmptyMessage("ready", 0),
+    "このタグの項目は見つかりませんでした。"
+  );
+  assert.equal(tagItemsEmptyMessage("empty", 0), "タグはまだ 1 つもありません。");
+  assert.equal(tagItemsEmptyMessage("unavailable", 0), "タグをまだ利用できません。");
+  assert.equal(tagItemsEmptyMessage("unavailable", 1), "");
+  assert.equal(tagItemsResultTitle("風景"), "「#風景」の項目");
+  assert.equal(tagItemsResultTitle("#風景"), "「#風景」の項目");
+  const long = "あ".repeat(40);
+  assert.equal(
+    tagItemsResultTitle(long),
+    `「#${"あ".repeat(29)}…」の項目`
+  );
 });
 
 test("legacy image telemetry resolves rejection and folder route without entryIndex", () => {
@@ -896,6 +968,77 @@ test("tapping a video grid tile preserves the video route", () => {
     "video"
   );
   assert.equal(resolveMediaOpenRoute("video", { kind: "image", address }, 0), null);
+});
+
+test("tapping an audio grid tile shows the shared unsupported notice route", () => {
+  const address = {
+    favorite_id: "favorite",
+    relative_path: "music/track.flac",
+    subresource: { kind: "file" },
+  };
+  const dispatched = [];
+  const tile = createGridTile(
+    { kind: "audio", name: "track.flac", address },
+    2,
+    new Map(),
+    null,
+    180,
+    (requested, meta) => dispatched.push({ requested, meta })
+  );
+
+  tile.dispatchEvent({ type: "click", detail: 1, pointerType: "touch" });
+
+  assert.equal(dispatched.length, 1);
+  assert.deepEqual(dispatched[0].requested.payload, {
+    kind: "unsupported",
+    entryKind: "audio",
+    entryIndex: 2,
+  });
+  assert.equal(
+    unsupportedRemoteEntryMessage("audio"),
+    "この端末では音声を再生できません。"
+  );
+  const notice = new FakeElement("p");
+  notice.hidden = true;
+  assert.equal(showUnsupportedRemoteEntryNotice(notice, "audio"), true);
+  assert.equal(notice.hidden, false);
+  assert.equal(notice.textContent, "この端末では音声を再生できません。");
+  assert.equal(resolveMediaOpenRoute("audio", { kind: "audio", address }, -1), null);
+});
+
+test("tapping an archive grid tile shows the same shared unsupported notice route", () => {
+  const address = {
+    favorite_id: "favorite",
+    relative_path: "books/book.rar",
+    subresource: { kind: "file" },
+  };
+  const dispatched = [];
+  const tile = createGridTile(
+    { kind: "archive", name: "book.rar", address },
+    3,
+    new Map(),
+    null,
+    180,
+    (requested, meta) => dispatched.push({ requested, meta })
+  );
+
+  tile.dispatchEvent({ type: "click", detail: 1, pointerType: "touch" });
+
+  assert.equal(dispatched.length, 1);
+  assert.deepEqual(dispatched[0].requested.payload, {
+    kind: "unsupported",
+    entryKind: "archive",
+    entryIndex: 3,
+  });
+  assert.equal(
+    unsupportedRemoteEntryMessage("archive"),
+    "この端末ではアーカイブを開けません。"
+  );
+  const notice = new FakeElement("p");
+  notice.hidden = true;
+  assert.equal(showUnsupportedRemoteEntryNotice(notice, "archive"), true);
+  assert.equal(notice.hidden, false);
+  assert.equal(notice.textContent, "この端末ではアーカイブを開けません。");
 });
 
 test("image viewer applies seek direction to the native range control", () => {

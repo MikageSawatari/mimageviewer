@@ -12,10 +12,10 @@ use mimageviewer_ipc::{
     FavoriteSearchRequest, MediaErrorCode, PagePriority, RemoteAddress, RemoteAiJobError,
     RemoteAiJobErrorCode, RemoteAiStartRequest, RemoteEntryKind, RemotePageRenderContext,
     RemoteReadingDirection, RemoteSessionIdentity, RemoteSpreadMode, RemoteSubresource,
-    RemoteWriteErrorCode, RemoteWriteRequest, SessionResponse, SessionStatus,
-    VideoStreamControlAction, VideoStreamErrorCode, VideoStreamJumpThumbnailPayload,
-    VideoStreamPlaylistKind, VideoStreamQuality, VideoStreamSegmentIndex,
-    VideoStreamSegmentPayload, VideoStreamThumbnailPayload,
+    RemoteWriteErrorCode, RemoteWriteRequest, SessionResponse, SessionStatus, TagIndexState,
+    TagItemKind, TagItemsRequest, VideoStreamControlAction, VideoStreamErrorCode,
+    VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind, VideoStreamQuality,
+    VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamThumbnailPayload,
 };
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::Deserialize;
@@ -626,6 +626,14 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             remote_owner.expect("route guard checked session"),
         ),
         (Method::Get, "/api/search/favorites") => api_favorite_search(
+            state,
+            &query,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Get, "/api/tags") => {
+            api_tag_browse(state, remote_owner.expect("route guard checked session"))
+        }
+        (Method::Get, "/api/tags/items") => api_tag_items(
             state,
             &query,
             remote_owner.expect("route guard checked session"),
@@ -2231,6 +2239,118 @@ fn api_favorite_search(
         Err(failure) => {
             collection_ipc_error_response(failure, started.elapsed(), "favorite_search")
         }
+    }
+}
+
+fn api_tag_browse(state: &AppState, owner: &RemoteSessionIdentity) -> HttpResponse {
+    let started = Instant::now();
+    let result = match state
+        .ipc_admission
+        .run(IpcClass::Heavy, || state.thumbnail_client.tag_browse(owner))
+    {
+        Ok(result) => result,
+        Err(busy) => return collection_admission_busy_response(busy, "tag_browse"),
+    };
+    match result {
+        Ok(result) => {
+            let index_state = tag_index_state_name(result.value.state);
+            let all_count = result.value.all.len();
+            HttpResponse::json(&result.value)
+                .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+                .with_header("Cache-Control", "no-store")
+                .with_log_details(json!({
+                    "tag_browse": {
+                        "all_count": all_count,
+                        "index_state": index_state,
+                        "ipc_status": "ok",
+                        "ipc_ms": crate::diagnostics::duration_ms(started.elapsed()),
+                        "ipc_retry_count": result.retry_count,
+                        "ipc_retry_statuses": result.retry_statuses,
+                        "ipc_connection_id": result.connection_id,
+                    }
+                }))
+        }
+        Err(failure) => collection_ipc_error_response(failure, started.elapsed(), "tag_browse"),
+    }
+}
+
+fn api_tag_items(
+    state: &AppState,
+    query: &[(String, String)],
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
+    let tag = match required_query_value(query, "tag") {
+        Ok(value) => value,
+        Err(()) => {
+            return HttpResponse::text(400, "Bad Request").with_header("Cache-Control", "no-store");
+        }
+    };
+    let kind_name = match required_query_value(query, "kind") {
+        Ok(value) => value,
+        Err(()) => {
+            return HttpResponse::text(400, "Bad Request").with_header("Cache-Control", "no-store");
+        }
+    };
+    let kind = match kind_name {
+        "all" => TagItemKind::All,
+        "folder" => TagItemKind::Folder,
+        "image" => TagItemKind::Image,
+        "video" => TagItemKind::Video,
+        "audio" => TagItemKind::Audio,
+        "zip" => TagItemKind::Zip,
+        "pdf" => TagItemKind::Pdf,
+        "archive" => TagItemKind::Archive,
+        _ => {
+            return HttpResponse::text(400, "Bad Request").with_header("Cache-Control", "no-store");
+        }
+    };
+    let tag_length = tag.chars().count();
+    let started = Instant::now();
+    let result = match state.ipc_admission.run(IpcClass::Heavy, || {
+        state.thumbnail_client.tag_items(
+            owner,
+            TagItemsRequest {
+                tag: tag.to_owned(),
+                kind,
+            },
+        )
+    }) {
+        Ok(result) => result,
+        Err(busy) => return collection_admission_busy_response(busy, "tag_items"),
+    };
+    match result {
+        Ok(mut result) => {
+            state
+                .library
+                .retain_allowed_remote_entries(&mut result.value.listing.entries);
+            let entry_count = result.value.listing.entries.len();
+            let index_state = tag_index_state_name(result.value.state);
+            HttpResponse::json(&result.value)
+                .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+                .with_header("Cache-Control", "no-store")
+                .with_log_details(json!({
+                    "tag_items": {
+                        "tag_length": tag_length,
+                        "kind": kind_name,
+                        "entry_count": entry_count,
+                        "index_state": index_state,
+                        "ipc_status": "ok",
+                        "ipc_ms": crate::diagnostics::duration_ms(started.elapsed()),
+                        "ipc_retry_count": result.retry_count,
+                        "ipc_retry_statuses": result.retry_statuses,
+                        "ipc_connection_id": result.connection_id,
+                    }
+                }))
+        }
+        Err(failure) => collection_ipc_error_response(failure, started.elapsed(), "tag_items"),
+    }
+}
+
+fn tag_index_state_name(state: TagIndexState) -> &'static str {
+    match state {
+        TagIndexState::Ready => "ready",
+        TagIndexState::Empty => "empty",
+        TagIndexState::Unavailable => "unavailable",
     }
 }
 

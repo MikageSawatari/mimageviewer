@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 33;
+pub const PROTOCOL_VERSION: u32 = 34;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -1003,6 +1003,73 @@ pub enum FavoriteSearchResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TagBrowseRequest;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteTagChoice {
+    /// 表示名。画面上の `#` はクライアントが付ける。
+    pub name: String,
+    /// mIV 全体でこのタグが付いた項目数。
+    pub count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TagBrowsePayload {
+    pub pinned: Vec<RemoteTagChoice>,
+    pub recent: Vec<RemoteTagChoice>,
+    pub popular: Vec<RemoteTagChoice>,
+    /// 名前順の全タグ。端末内の絞り込みに使う。
+    pub all: Vec<RemoteTagChoice>,
+    pub all_truncated: bool,
+    pub state: TagIndexState,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TagIndexState {
+    Ready,
+    Empty,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum TagBrowseResponse {
+    Success(TagBrowsePayload),
+    Error(CollectionError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TagItemsRequest {
+    pub tag: String,
+    pub kind: TagItemKind,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TagItemKind {
+    All,
+    Folder,
+    Image,
+    Video,
+    Audio,
+    Zip,
+    Pdf,
+    Archive,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct TagItemsPayload {
+    pub listing: CollectionPayload,
+    pub state: TagIndexState,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum TagItemsResponse {
+    Success(TagItemsPayload),
+    Error(CollectionError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CollectionError {
     pub code: CollectionErrorCode,
     pub message: String,
@@ -1560,6 +1627,16 @@ pub enum ClientMessage {
         owner: RemoteSessionIdentity,
         request: FavoriteSearchRequest,
     },
+    TagBrowse {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+        request: TagBrowseRequest,
+    },
+    TagItems {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+        request: TagItemsRequest,
+    },
     FolderList {
         id: RequestId,
         owner: RemoteSessionIdentity,
@@ -1678,6 +1755,8 @@ impl ClientMessage {
             | Self::Home { id, .. }
             | Self::Collection { id, .. }
             | Self::FavoriteSearch { id, .. }
+            | Self::TagBrowse { id, .. }
+            | Self::TagItems { id, .. }
             | Self::FolderList { id, .. }
             | Self::Container { id, .. }
             | Self::Page { id, .. }
@@ -1728,6 +1807,14 @@ pub enum ServerMessage {
     FavoriteSearch {
         id: RequestId,
         response: FavoriteSearchResponse,
+    },
+    TagBrowse {
+        id: RequestId,
+        response: TagBrowseResponse,
+    },
+    TagItems {
+        id: RequestId,
+        response: TagItemsResponse,
     },
     FolderList {
         id: RequestId,
@@ -1816,6 +1903,8 @@ impl ServerMessage {
             | Self::Home { id, .. }
             | Self::Collection { id, .. }
             | Self::FavoriteSearch { id, .. }
+            | Self::TagBrowse { id, .. }
+            | Self::TagItems { id, .. }
             | Self::Container { id, .. }
             | Self::FolderList { id, .. }
             | Self::Page { id, .. }
@@ -2165,9 +2254,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v33_page_identity_session_epoch_auto_trim_partner_video_and_audio_status_round_trip()
+    fn protocol_v34_page_identity_session_epoch_auto_trim_partner_video_and_audio_status_round_trip()
      {
-        assert_eq!(PROTOCOL_VERSION, 33);
+        assert_eq!(PROTOCOL_VERSION, 34);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -2676,6 +2765,69 @@ mod tests {
         let decoded_response: ServerMessage =
             read_frame(&mut response_bytes.as_slice(), MAX_RESPONSE_FRAME_BYTES).unwrap();
         assert_eq!(decoded_response, response);
+    }
+
+    #[test]
+    fn tag_browse_and_items_messages_round_trip() {
+        let browse = ClientMessage::TagBrowse {
+            id: 79,
+            owner: test_owner("test-client"),
+            request: TagBrowseRequest,
+        };
+        let items = ClientMessage::TagItems {
+            id: 80,
+            owner: test_owner("test-client"),
+            request: TagItemsRequest {
+                tag: "風景".to_owned(),
+                kind: TagItemKind::Image,
+            },
+        };
+        let browse_response = ServerMessage::TagBrowse {
+            id: 79,
+            response: TagBrowseResponse::Success(TagBrowsePayload {
+                pinned: vec![RemoteTagChoice {
+                    name: "風景".to_owned(),
+                    count: 3,
+                }],
+                recent: Vec::new(),
+                popular: Vec::new(),
+                all: vec![RemoteTagChoice {
+                    name: "風景".to_owned(),
+                    count: 3,
+                }],
+                all_truncated: false,
+                state: TagIndexState::Ready,
+            }),
+        };
+        let items_response = ServerMessage::TagItems {
+            id: 80,
+            response: TagItemsResponse::Success(TagItemsPayload {
+                listing: CollectionPayload {
+                    title: "タグの項目".to_owned(),
+                    thumb_aspect_height_ratio: 1.0,
+                    sort_state: test_sort_state(Some("この一覧では並び順が固定されています")),
+                    entries: Vec::new(),
+                    entry_limit: 1000,
+                    truncated: false,
+                },
+                state: TagIndexState::Ready,
+            }),
+        };
+
+        for request in [browse, items] {
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &request).unwrap();
+            let decoded: ClientMessage =
+                read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
+            assert_eq!(decoded, request);
+        }
+        for response in [browse_response, items_response] {
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &response).unwrap();
+            let decoded: ServerMessage =
+                read_frame(&mut bytes.as_slice(), MAX_RESPONSE_FRAME_BYTES).unwrap();
+            assert_eq!(decoded, response);
+        }
     }
 
     #[test]

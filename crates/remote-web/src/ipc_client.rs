@@ -17,13 +17,14 @@ use mimageviewer_ipc::{
     RemoteAiStartResponse, RemoteAiStateResponse, RemotePageRenderContext, RemoteSessionIdentity,
     RemoteWebConnectionInfo, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest,
     RemoteWriteResponse, RemoteWriteResult, RequestId, ServerMessage, SessionAcquireRequest,
-    SessionPeerInfo, SessionPingRequest, SessionResponse, SessionStatus, ThumbnailError,
-    ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse, VIDEO_STREAM_START_BUDGET,
-    VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode, VideoStreamJumpListPayload,
-    VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind, VideoStreamPlaylistPayload,
-    VideoStreamQuality, VideoStreamResult, VideoStreamSeekPayload, VideoStreamSegmentIndex,
-    VideoStreamSegmentPayload, VideoStreamStartPayload, VideoStreamStatePayload,
-    VideoStreamThumbnailPayload, read_frame, write_frame,
+    SessionPeerInfo, SessionPingRequest, SessionResponse, SessionStatus, TagBrowsePayload,
+    TagBrowseRequest, TagBrowseResponse, TagItemsPayload, TagItemsRequest, TagItemsResponse,
+    ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse,
+    VIDEO_STREAM_START_BUDGET, VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode,
+    VideoStreamJumpListPayload, VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind,
+    VideoStreamPlaylistPayload, VideoStreamQuality, VideoStreamResult, VideoStreamSeekPayload,
+    VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamStartPayload,
+    VideoStreamStatePayload, VideoStreamThumbnailPayload, read_frame, write_frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -568,6 +569,87 @@ impl ThumbnailClient {
                     "response_type_mismatch",
                     None,
                     "favorite search request received another response type",
+                )),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+        })
+    }
+
+    pub fn tag_browse(
+        &self,
+        owner: &RemoteSessionIdentity,
+    ) -> Result<IpcSuccess<TagBrowsePayload>, ClientFailure> {
+        self.collection_request(|id| ClientMessage::TagBrowse {
+            id,
+            owner: owner.clone(),
+            request: TagBrowseRequest,
+        })
+        .and_then(|success| match success.value {
+            ServerMessage::TagBrowse {
+                response: TagBrowseResponse::Success(payload),
+                ..
+            } => Ok(IpcSuccess {
+                value: payload,
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+                connection_id: success.connection_id,
+            }),
+            ServerMessage::TagBrowse {
+                response: TagBrowseResponse::Error(error),
+                ..
+            } => Err(ClientFailure {
+                error: ClientError::CollectionRemote(error),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+            _ => Err(ClientFailure {
+                error: ClientError::Protocol(protocol_failure(
+                    "response_route",
+                    "response_type_mismatch",
+                    None,
+                    "tag browse request received another response type",
+                )),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+        })
+    }
+
+    pub fn tag_items(
+        &self,
+        owner: &RemoteSessionIdentity,
+        request: TagItemsRequest,
+    ) -> Result<IpcSuccess<TagItemsPayload>, ClientFailure> {
+        self.collection_request(|id| ClientMessage::TagItems {
+            id,
+            owner: owner.clone(),
+            request: request.clone(),
+        })
+        .and_then(|success| match success.value {
+            ServerMessage::TagItems {
+                response: TagItemsResponse::Success(payload),
+                ..
+            } => Ok(IpcSuccess {
+                value: payload,
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+                connection_id: success.connection_id,
+            }),
+            ServerMessage::TagItems {
+                response: TagItemsResponse::Error(error),
+                ..
+            } => Err(ClientFailure {
+                error: ClientError::CollectionRemote(error),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+            _ => Err(ClientFailure {
+                error: ClientError::Protocol(protocol_failure(
+                    "response_route",
+                    "response_type_mismatch",
+                    None,
+                    "tag items request received another response type",
                 )),
                 retry_count: success.retry_count,
                 retry_statuses: success.retry_statuses,
