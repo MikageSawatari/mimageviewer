@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 
 import {
   BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS,
-  DOUBLE_TAP_MAX_DELAY_MS,
   doubleTapSequenceTransition,
 } from "./command-core.mjs";
 import {
@@ -34,7 +33,11 @@ class FakeEventTarget {
 }
 
 const plainTarget = { closest: () => null };
-const textInputTarget = { closest: () => ({ tagName: "INPUT" }) };
+const textInputTarget = {
+  closest: (selector) => selector.startsWith("input:not")
+    ? { tagName: "INPUT" }
+    : null,
+};
 const touch = (identifier, clientX, clientY) => ({ identifier, clientX, clientY });
 
 function touchEvent({
@@ -56,7 +59,7 @@ function dispatchTap(eventTarget, point, preventDefault, target = plainTarget) {
   }));
 }
 
-test("double-tap recognition accepts a nearby pair within the shared window", () => {
+test("double-tap recognition accepts a nearby pair within the browser window", () => {
   const first = doubleTapSequenceTransition(null, { x: 40, y: 80, atMs: 1_000 });
   const second = doubleTapSequenceTransition(first.next, {
     x: 48,
@@ -71,7 +74,11 @@ test("double-tap recognition accepts a nearby pair within the shared window", ()
 
 test("double-tap recognition rejects late or distant taps and starts over after a pair", () => {
   const first = doubleTapSequenceTransition(null, { x: 40, y: 80, atMs: 1_000 });
-  const late = doubleTapSequenceTransition(first.next, { x: 40, y: 80, atMs: 1_500 });
+  const late = doubleTapSequenceTransition(first.next, {
+    x: 40,
+    y: 80,
+    atMs: 1_000 + BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS + 60,
+  });
   const distant = doubleTapSequenceTransition(first.next, { x: 100, y: 80, atMs: 1_200 });
   const second = doubleTapSequenceTransition(first.next, { x: 44, y: 82, atMs: 1_200 });
   const third = doubleTapSequenceTransition(second.next, { x: 45, y: 83, atMs: 1_300 });
@@ -87,14 +94,40 @@ test("document owner preserves the first touchend and prevents only the matching
   const eventTarget = new FakeEventTarget();
   let nowMs = 1_000;
   let prevented = 0;
-  const owner = installDocumentDoubleTapOwner(eventTarget, { now: () => nowMs });
+  const decisions = [];
+  const owner = installDocumentDoubleTapOwner(eventTarget, {
+    now: () => nowMs,
+    onDecision: (decision) => decisions.push(decision),
+  });
 
   dispatchTap(eventTarget, touch(1, 40, 80), () => { prevented += 1; });
   assert.equal(prevented, 0, "the first synthetic click must remain available");
+  assert.deepEqual(decisions.at(-1), {
+    decision: "candidate_started",
+    atMs: 1_000,
+    elapsedMs: null,
+    distancePx: null,
+    isDoubleTap: false,
+    suppressed: false,
+    excluded: false,
+    exclusionReason: null,
+    cancelable: true,
+  });
 
   nowMs = 1_220;
   dispatchTap(eventTarget, touch(2, 44, 84), () => { prevented += 1; });
   assert.equal(prevented, 1);
+  assert.deepEqual(decisions.at(-1), {
+    decision: "pair_suppressed",
+    atMs: 1_220,
+    elapsedMs: 220,
+    distancePx: Math.hypot(4, 4),
+    isDoubleTap: true,
+    suppressed: true,
+    excluded: false,
+    exclusionReason: null,
+    cancelable: true,
+  });
 
   // 窓の外であることを定数から決める。数値で書くと、窓を広げたときに黙って意味が変わる。
   nowMs = 2_000;
@@ -112,6 +145,22 @@ test("document owner preserves the first touchend and prevents only the matching
   nowMs = 3_100;
   dispatchTap(eventTarget, touch(6, 142, 80), () => { prevented += 1; });
   assert.equal(prevented, 1, "a moved gesture must not seed a double-tap pair");
+
+  nowMs = 4_000;
+  dispatchTap(eventTarget, touch(7, 70, 90), () => { prevented += 1; });
+  nowMs = 4_180;
+  const nonCancelable = touch(8, 71, 91);
+  eventTarget.dispatch("touchstart", touchEvent({ touches: [nonCancelable] }));
+  eventTarget.dispatch("touchend", touchEvent({
+    changedTouches: [nonCancelable],
+    cancelable: false,
+    preventDefault: () => { prevented += 1; },
+  }));
+  assert.equal(prevented, 1);
+  assert.equal(decisions.at(-1).decision, "pair_not_cancelable");
+  assert.equal(decisions.at(-1).isDoubleTap, true);
+  assert.equal(decisions.at(-1).suppressed, false);
+  assert.equal(decisions.at(-1).cancelable, false);
   owner.destroy();
 });
 
@@ -119,7 +168,11 @@ test("document owner leaves pinch and text editing defaults untouched", () => {
   const eventTarget = new FakeEventTarget();
   let nowMs = 1_000;
   let prevented = 0;
-  const owner = installDocumentDoubleTapOwner(eventTarget, { now: () => nowMs });
+  const decisions = [];
+  const owner = installDocumentDoubleTapOwner(eventTarget, {
+    now: () => nowMs,
+    onDecision: (decision) => decisions.push(decision),
+  });
   const first = touch(1, 30, 60);
   const second = touch(2, 90, 60);
 
@@ -151,6 +204,8 @@ test("document owner leaves pinch and text editing defaults untouched", () => {
     textInputTarget
   );
   assert.equal(prevented, 0, "text inputs keep selection and caret defaults");
+  assert.equal(decisions.at(-1).exclusionReason, "text_input");
+  assert.equal(decisions.at(-1).isDoubleTap, true);
   owner.destroy();
 });
 
@@ -158,11 +213,15 @@ test("activatable targets keep both taps, because preventing one drops its click
   const eventTarget = new FakeEventTarget();
   let nowMs = 1_000;
   let prevented = 0;
+  const decisions = [];
   // 実際の closest と同じく、対象に一致する selector のときだけ要素を返す。
   const buttonTarget = {
     closest: (selector) => (selector.includes("button") ? { tagName: "BUTTON" } : null),
   };
-  const owner = installDocumentDoubleTapOwner(eventTarget, { now: () => nowMs });
+  const owner = installDocumentDoubleTapOwner(eventTarget, {
+    now: () => nowMs,
+    onDecision: (decision) => decisions.push(decision),
+  });
 
   dispatchTap(eventTarget, touch(1, 50, 90), () => { prevented += 1; }, buttonTarget);
   nowMs = 1_180;
@@ -172,6 +231,14 @@ test("activatable targets keep both taps, because preventing one drops its click
     0,
     "rapidly tapping a page button twice must activate it twice"
   );
+  assert.equal(decisions.length, 2);
+  assert.equal(decisions[0].excluded, true);
+  assert.equal(decisions[0].exclusionReason, "button");
+  assert.equal(decisions[1].exclusionReason, "button");
+  assert.equal(decisions[1].elapsedMs, 180);
+  assert.equal(decisions[1].distancePx, Math.hypot(1, 1));
+  assert.equal(decisions[1].isDoubleTap, true);
+  assert.equal(decisions[1].suppressed, false);
 
   // 操作部品でなければ、これまでどおり 2 打目だけ止める。
   nowMs = 3_000;
@@ -182,20 +249,16 @@ test("activatable targets keep both taps, because preventing one drops its click
   owner.destroy();
 });
 
-test("a slower pair is still the browser's double tap, even when it is not the app's", () => {
-  assert.ok(
-    BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS > DOUBLE_TAP_MAX_DELAY_MS,
-    "the browser keeps zooming after the app has stopped calling it one gesture"
-  );
+test("the document owner uses the browser suppression window", () => {
   const eventTarget = new FakeEventTarget();
   let nowMs = 1_000;
   let prevented = 0;
   const owner = installDocumentDoubleTapOwner(eventTarget, { now: () => nowMs });
 
   dispatchTap(eventTarget, touch(1, 60, 120), () => { prevented += 1; });
-  nowMs += DOUBLE_TAP_MAX_DELAY_MS + 60;
+  nowMs += BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS - 40;
   dispatchTap(eventTarget, touch(2, 61, 121), () => { prevented += 1; });
-  assert.equal(prevented, 1, "a slow pair must still lose the browser zoom");
+  assert.equal(prevented, 1, "a pair inside the browser window must lose browser zoom");
 
   // ブラウザの窓も越えたら、ただの 2 回のタップ。
   nowMs += BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS + 60;

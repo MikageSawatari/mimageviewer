@@ -1,6 +1,5 @@
 import {
   CommandName,
-  DOUBLE_TAP_MAX_DELAY_MS,
   FitMode,
   GridViewportAnchor,
   GridViewportMemory,
@@ -58,7 +57,6 @@ import {
   telemetryDeliveryMode,
   telemetryEventForTier,
   telemetrySessionCorrelation,
-  togglePageOriginalFitMode,
   shouldShowGridCursor,
   shouldShowLoadingIndicator,
   shouldShowKeyboardShortcuts,
@@ -68,7 +66,6 @@ import {
   viewerResizePlan,
   viewerVerticalScrollDecision,
   viewerTapCommand,
-  viewerTapSequenceTransition,
   viewerImageLayout,
   viewerLayoutTelemetry,
   viewerPageDisplaySlot,
@@ -454,6 +451,9 @@ const telemetryState = {
     globalThis.window?.visualViewport?.scale
   ),
   visualViewportTimer: 0,
+  visualViewportObservedAtMs: 0,
+  nextBrowserTapPairSequence: 1,
+  lastBrowserTapPair: null,
 };
 
 const hudState = {
@@ -529,7 +529,6 @@ const state = {
   coarsePointer: Boolean(globalThis.matchMedia?.("(pointer: coarse)")?.matches),
   keyboardInputSeen: false,
   fitMode: FitMode.PAGE,
-  viewerTapSequence: null,
   imageInfoCache: new Map(),
   containerImageInfoHints: new Map(),
   pageDirection: 1,
@@ -565,7 +564,9 @@ const state = {
 
 let recentPointerSource = { source: "mouse", at: 0 };
 if (!RUNTIME_TEST_MODE) {
-  installDocumentDoubleTapOwner(document);
+  installDocumentDoubleTapOwner(document, {
+    onDecision: recordBrowserDoubleTapDecision,
+  });
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker
       .register("/service-worker.js", { scope: "/", updateViaCache: "none" })
@@ -1535,6 +1536,103 @@ function navigate(hash, routeState = {}) {
   dispatchRoute();
 }
 
+function optionalTelemetryMeasurement(value) {
+  if (value === null || value === undefined) return null;
+  const measurement = Number(value);
+  return Number.isFinite(measurement) ? roundMs(measurement) : null;
+}
+
+const BROWSER_DOUBLE_TAP_DECISIONS = new Set([
+  "candidate_started",
+  "pair_rejected",
+  "pair_suppressed",
+  "pair_not_cancelable",
+  "excluded_target",
+  "travel_exceeded",
+]);
+const BROWSER_DOUBLE_TAP_EXCLUSIONS = new Set([
+  "button",
+  "link",
+  "textarea",
+  "contenteditable",
+  "role_button",
+  "role_link",
+  "role_tab",
+  "role_option",
+  "text_input",
+]);
+
+export function browserDoubleTapTelemetryEvent(decision, tapPairSequence = null) {
+  const sequence = Number(tapPairSequence);
+  const decisionName = String(decision?.decision || "unknown");
+  const exclusionReason = String(decision?.exclusionReason || "");
+  return {
+    type: "browser_double_tap",
+    action: "suppression_decision",
+    decision: BROWSER_DOUBLE_TAP_DECISIONS.has(decisionName)
+      ? decisionName
+      : "unknown",
+    tap_pair_sequence:
+      Number.isInteger(sequence) && sequence > 0 ? sequence : null,
+    previous_tap_elapsed_ms: optionalTelemetryMeasurement(decision?.elapsedMs),
+    previous_tap_distance_px: optionalTelemetryMeasurement(decision?.distancePx),
+    recognized_double_tap: Boolean(decision?.isDoubleTap),
+    suppressed: Boolean(decision?.suppressed),
+    excluded: Boolean(decision?.excluded),
+    exclusion_reason: BROWSER_DOUBLE_TAP_EXCLUSIONS.has(exclusionReason)
+      ? exclusionReason
+      : null,
+    event_cancelable: Boolean(decision?.cancelable),
+  };
+}
+
+function recordBrowserDoubleTapDecision(decision) {
+  const elapsedMs = optionalTelemetryMeasurement(decision?.elapsedMs);
+  const distancePx = optionalTelemetryMeasurement(decision?.distancePx);
+  const hasPair = elapsedMs !== null && distancePx !== null;
+  const tapPairSequence = hasPair
+    ? telemetryState.nextBrowserTapPairSequence++
+    : null;
+  const event = browserDoubleTapTelemetryEvent(decision, tapPairSequence);
+  if (tapPairSequence !== null) {
+    telemetryState.lastBrowserTapPair = {
+      sequence: tapPairSequence,
+      atMs: Number.isFinite(Number(decision?.atMs))
+        ? Number(decision.atMs)
+        : performance.now(),
+      elapsedMs: event.previous_tap_elapsed_ms,
+      distancePx: event.previous_tap_distance_px,
+      recognized: event.recognized_double_tap,
+      suppressed: event.suppressed,
+      excluded: event.excluded,
+      exclusionReason: event.exclusion_reason,
+      cancelable: event.event_cancelable,
+    };
+  }
+  enqueueTelemetry(event);
+}
+
+function precedingBrowserTapPairTelemetry(observedAtMs) {
+  const pair = telemetryState.lastBrowserTapPair;
+  if (!pair) {
+    return {
+      preceding_tap_pair_sequence: null,
+      preceding_tap_pair_age_ms: null,
+    };
+  }
+  return {
+    preceding_tap_pair_sequence: pair.sequence,
+    preceding_tap_pair_age_ms: roundMs(Math.max(0, observedAtMs - pair.atMs)),
+    preceding_tap_pair_elapsed_ms: pair.elapsedMs,
+    preceding_tap_pair_distance_px: pair.distancePx,
+    preceding_tap_pair_recognized: pair.recognized,
+    preceding_tap_pair_suppressed: pair.suppressed,
+    preceding_tap_pair_excluded: pair.excluded,
+    preceding_tap_pair_exclusion_reason: pair.exclusionReason,
+    preceding_tap_pair_cancelable: pair.cancelable,
+  };
+}
+
 export function commandTelemetryEvent(requested, meta, source, context, handled = true) {
   const event = {
     type: "command",
@@ -1550,13 +1648,6 @@ export function commandTelemetryEvent(requested, meta, source, context, handled 
     event.mediaKind = requested.payload?.mediaKind ?? null;
     event.open_route = meta.openRoute ?? "not_reached";
     event.handled = Boolean(handled);
-  }
-  if (meta.detail === "double_tap_fit") {
-    event.fit_mode_before = meta.fitMode ?? null;
-    Object.assign(
-      event,
-      viewerTransformTelemetry(meta.viewerScale, meta.visualViewportScale)
-    );
   }
   return event;
 }
@@ -1735,10 +1826,6 @@ function dispatchCommand(requested, meta = {}) {
         fitMode = FitMode.WIDTH;
       } else if (requested.name === CommandName.FIT_ORIGINAL) {
         fitMode = FitMode.ORIGINAL;
-      } else if (requested.name === CommandName.FIT_TOGGLE_PAGE_ORIGINAL) {
-        fitMode = togglePageOriginalFitMode(state.fitMode, {
-          scale: state.viewer?.scale,
-        });
       }
       if (fitMode) {
         state.fitMode = fitMode;
@@ -2180,7 +2267,6 @@ function cleanupScreen(preserveRequestController = null) {
   state.localSettingsDialog = null;
   state.gestureHelpDialog?.destroy();
   state.gestureHelpDialog = null;
-  state.viewerTapSequence = null;
   state.remoteAiController?.destroy();
   state.remoteAiController = null;
   state.viewer?.destroy();
@@ -7740,7 +7826,7 @@ class GestureHelpDialog {
     );
     const note = textElement(
       "p",
-      "ダブルタップでページ全体と100%原寸を切り替えます。拡大中は1本指で画像を動かせます。",
+      "ピンチで拡大・縮小します。拡大中は1本指で画像を動かせます。",
       "gesture-help-note"
     );
     const done = textElement("button", "わかりました", "gesture-help-done");
@@ -8441,7 +8527,6 @@ export class ImageViewer {
     this.objectUrls = [];
     this.loadingTimer = 0;
     this.boundaryMessageTimer = 0;
-    this.centerTapTimer = 0;
     this.destroyed = false;
     this.pageLoadBusy = false;
     this.requestedPagePresentation = null;
@@ -9186,35 +9271,6 @@ export class ImageViewer {
     this.pageLayer.style.transform = `translate3d(${this.panX}px, ${this.panY}px, 0) scale(${this.scale})`;
   }
 
-  cancelPendingCenterTap() {
-    clearTimeout(this.centerTapTimer);
-    this.centerTapTimer = 0;
-    state.viewerTapSequence = null;
-  }
-
-  commitPendingCenterTap() {
-    const pending = state.viewerTapSequence;
-    if (!pending || pending.zone !== "center") return;
-    this.cancelPendingCenterTap();
-    dispatchCommand(command(CommandName.TOGGLE_VIEWER_BARS), {
-      source: pending.inputSource,
-      detail: "tap_center",
-    });
-  }
-
-  schedulePendingCenterTap(pending) {
-    clearTimeout(this.centerTapTimer);
-    this.centerTapTimer = setTimeout(() => {
-      this.centerTapTimer = 0;
-      if (state.viewerTapSequence !== pending) return;
-      state.viewerTapSequence = null;
-      dispatchCommand(command(CommandName.TOGGLE_VIEWER_BARS), {
-        source: pending.inputSource,
-        detail: "tap_center",
-      });
-    }, DOUBLE_TAP_MAX_DELAY_MS);
-  }
-
   onPointerDown(event) {
     if (["mouse", "pen"].includes(event.pointerType) && event.button !== 0) return;
     this.stage.setPointerCapture?.(event.pointerId);
@@ -9381,66 +9437,19 @@ export class ImageViewer {
           detail: "swipe_down",
         });
       } else if (gesture === ViewerGesture.TAP) {
-        const tapAt = performance.now();
-        const pendingTap = state.viewerTapSequence;
-        const transition = viewerTapSequenceTransition(pendingTap, {
-          x: event.clientX,
-          y: event.clientY,
-          atMs: tapAt,
-          width: this.root.clientWidth,
-          inputSource: source,
+        dispatchCommand(viewerTapCommand(
+          event.clientX,
+          this.root.clientWidth,
+          isRtlReadingDirection(state.readingDirection)
+        ), {
+          source,
+          detail: "tap_zone",
         });
-        if (transition.commitPrevious && pendingTap) {
-          this.recordDoubleTapCandidateRejection("tap_sequence_miss", {
-            candidate_gap_ms: roundMs(tapAt - pendingTap.atMs),
-            candidate_distance_px: roundMs(Math.hypot(
-              event.clientX - pendingTap.x,
-              event.clientY - pendingTap.y
-            )),
-          });
-        }
-        if (transition.commitPrevious) this.commitPendingCenterTap();
-        state.viewerTapSequence = transition.next;
-        if (transition.action === "double_tap") {
-          this.cancelPendingCenterTap();
-          dispatchCommand(command(CommandName.FIT_TOGGLE_PAGE_ORIGINAL), {
-            source,
-            detail: "double_tap_fit",
-            fitMode: state.fitMode,
-            viewerScale: this.scale,
-            visualViewportScale: currentVisualViewportScale(),
-          });
-        } else if (transition.action === "pending_center_tap") {
-          this.schedulePendingCenterTap(transition.next);
-        } else {
-          // Edge taps and non-touch taps are immediate. Only a touch in the center waits so the
-          // same two taps cannot also toggle the bars before changing magnification.
-          dispatchCommand(viewerTapCommand(
-            event.clientX,
-            this.root.clientWidth,
-            isRtlReadingDirection(state.readingDirection)
-          ), {
-            source,
-            detail: "tap_zone",
-          });
-        }
       } else if (gesture === ViewerGesture.PAN) {
         dispatchCommand(command(CommandName.PAN_BY, { dx: 0, dy: 0 }), {
           source,
           detail: "pan",
         });
-      }
-      if (gesture !== ViewerGesture.TAP) {
-        this.recordDoubleTapCandidateRejection(
-          cancelled ? "pointer_cancelled" : gesture ?? "not_tap",
-          {
-            elapsed_ms: roundMs(elapsed),
-            travel_px: roundMs(Math.hypot(dx, dy)),
-            pointer_moved: Boolean(single.moved),
-            content_scrolled: Boolean(single.contentScrolled),
-          }
-        );
-        this.commitPendingCenterTap();
       }
     } else if (this.pinched) {
       enqueueTelemetry({
@@ -9450,11 +9459,7 @@ export class ImageViewer {
         fit_mode: this.fitMode ?? state.fitMode,
         ...viewerTransformTelemetry(this.scale, currentVisualViewportScale()),
       });
-      this.recordDoubleTapCandidateRejection(
-        cancelled ? "pointer_cancelled_during_pinch" : "pinch"
-      );
       if (!cancelled) {
-        this.commitPendingCenterTap();
         dispatchCommand(
           command(CommandName.SET_TRANSFORM, {
             scale: this.scale,
@@ -9468,18 +9473,6 @@ export class ImageViewer {
     this.single = null;
     this.pinch = null;
     this.pinched = false;
-  }
-
-  recordDoubleTapCandidateRejection(decision, diagnostic = {}) {
-    if (!state.viewerTapSequence) return;
-    enqueueTelemetry({
-      type: "viewer_gesture",
-      action: "double_tap_candidate_rejected",
-      decision,
-      fit_mode: this.fitMode ?? state.fitMode,
-      ...viewerTransformTelemetry(this.scale, currentVisualViewportScale()),
-      ...diagnostic,
-    });
   }
 
   onWheel(event) {
@@ -9525,8 +9518,6 @@ export class ImageViewer {
     clearTimeout(this.resizeTimer);
     clearTimeout(this.loadingTimer);
     clearTimeout(this.boundaryMessageTimer);
-    clearTimeout(this.centerTapTimer);
-    this.centerTapTimer = 0;
     this.loadingIndicator.hidden = true;
     this.boundaryMessage.hidden = true;
     this.pageLoadQueue.clear();
@@ -9738,6 +9729,7 @@ function installTelemetry() {
   });
   const visualViewport = window.visualViewport;
   visualViewport?.addEventListener?.("resize", () => {
+    telemetryState.visualViewportObservedAtMs = performance.now();
     clearTimeout(telemetryState.visualViewportTimer);
     telemetryState.visualViewportTimer = setTimeout(() => {
       telemetryState.visualViewportTimer = 0;
@@ -9746,7 +9738,14 @@ function installTelemetry() {
         visualViewport.scale
       );
       telemetryState.visualViewportScale = transition.nextScale;
-      if (transition.event) enqueueTelemetry(transition.event);
+      if (transition.event) {
+        enqueueTelemetry({
+          ...transition.event,
+          ...precedingBrowserTapPairTelemetry(
+            telemetryState.visualViewportObservedAtMs
+          ),
+        });
+      }
     }, 250);
   }, { passive: true });
   window.setInterval(() => {

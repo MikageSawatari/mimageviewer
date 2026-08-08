@@ -369,7 +369,7 @@ telemetry には `input_source` (`touch` / `mouse` / `keyboard`) と入力の詳
 
 | 入力経路 | 直接操作 | 共通コマンド |
 |---|---|---|
-| touch / pen | 左右 34% の即時タップ、中央タップ、中央ダブルタップ、上下左右スワイプ、ピンチ、拡大中パン | 前 / 次、上下バー切替、全体表示 ⇔ 原寸、一覧 / メニュー / 前 / 次、ズーム、パン |
+| touch / pen | 左右 34% の即時タップ、中央の即時タップ、上下左右スワイプ、ピンチ、拡大中パン | 前 / 次、上下バー切替、一覧 / メニュー / 前 / 次、ズーム、パン |
 | mouse | 左右クリックゾーン、中央クリック、右クリック、通常ホイール、Ctrl/Cmd+ホイール | 前 / 次、上下バー切替、メニュー、前 / 次、ズーム |
 | keyboard | 上表の固定キー | 対応する同一コマンド |
 | 共通メニュー / ボタン | 各項目のクリックまたはタップ | 対応する同一コマンド |
@@ -1016,19 +1016,12 @@ decode は発生しない。実ページが1枚だけなら range だけを隠�
 縦 swipe の一覧 / メニュー操作へ渡す。drag 中に一度でも実スクロールした場合は同じ gesture の
 残りを pan とする。一方、幅フィット中の明確な横 swipe は従来のページ送りを維持する。
 
-静止画の**中央 32% だけ**のダブルタップは `Page` (見開きを含む全体が viewport に収まる倍率) と `Original`
-(100%) を往復する。`Width` は縦スクロールを伴う幅合わせで「画面に合わせる」ではないため
-往復対象にしないが、現在 `Width` の場合の最初のダブルタップは `Original` へ入る。ただし
-`scale > 1.01` のピンチ拡大中は、基底の fit mode が `Page` / `Width` / `Original` のどれでも
-最初のダブルタップを必ず `Page` とする。transform reset 後に基底 `Page` だけを見て `Original` を
-選ぶと、一瞬 Page 全体表示になってから 100% へ戻るためである。動画 viewer はこの判定を通らず、
-従来どおり再生 / ±10秒 tap zone と native zoom 抑止だけを持つ。
-
-左右 34% はダブルタップ候補を一切作らず、各 `pointerup` でページ送りを即時実行する。同じ端を
-素早く2回叩けば従来どおり2ページ進む。中央だけは最初の tap を最大 320 ms 保留し、36 CSS px
-以内の2打目ならバー切替を発火せず `fit_toggle_page_original`、2打目が無ければバー切替とする。
-したがって失うのは中央を素早く2回叩いたときのバー切替だけで、ページ送りには遅延を加えない。
-動画 viewer はこの sequence 判定そのものを通らず、拡大操作も追加しない。
+静止画は左右 34% の各 tap をページ送り、中央 32% の各 tap を上下バー切替として、gesture 判定が
+`TAP` を返した同じ `pointerup` 処理内で即時実行する。中央だけを待たせる timer や tap pair 状態は
+持たないため、中央を素早く2回叩いた場合もバー切替が2回起き、fit mode は変わらない。
+`Original` (100%) は操作メニュー → 表示の「原寸 (100%)」から選べる。拡大・縮小は独自 pinch、
+`scale > 1.01` の移動は1本指 pan を維持する。動画 viewer は従来どおり再生 / ±10秒 tap zone と
+native zoom 抑止だけを持つ。
 
 初回ヘルプは最初の画像表示完了後に modal で出し、左右 tap、中央 tap、上下 swipe と拡大中 pan を
 示す。閉じた時点で aggregate local setting の `gestureHelpDismissed=true` を保存する。この field は
@@ -1407,44 +1400,41 @@ pointer 開始時の値へ戻す。cancel 前に横ブレの preview が発行�
 太いスクロールバーは、range 上から縦パンできない根因を解消せず狭い画面の内容幅も減らすため追加しない。
 タブ分割と通常のスクロール位置で、下に内容が続くことは示す。
 
-静止画のダブルタップはブラウザ任せではない。画像または余白を hit した pointer event が
-`.viewer-stage` へ bubble し、remote 自身の `viewerTapSequenceTransition` が
-`fit_toggle_page_original` を発行する既存仕様である。実機 telemetry でも
-`double_tap_fit` の直後に `fit_mode: original` の画像を再取得している。
 `.image-viewer` と `.viewer-stage` はともに `touch-action: none` で、ブラウザの viewport 操作を
-許可せず remote が pinch と pan を所有する。`manipulation` への変更は browser pinch/pan と
-remote の gesture owner を競合させるため行わない。原寸切替と browser zoom の分離、およびアプリ外周の
-既定 touch action は §12.21 のとおりとする。
+許可せず remote が pinch と pan を所有する。この指定はアプリのダブルタップ操作のためではなく、
+独自 pinch / pan の ownership として維持する。`manipulation` への変更は browser pinch/pan と remote の
+gesture owner を競合させるため行わない。アプリ外周の browser zoom policy は §12.21 のとおりとする。
 
-### 12.21 原寸ダブルタップと browser zoom の分離 (2026-08-07)
+### 12.21 browser double-tap zoom の ownership と計測 (2026-08-07、2026-08-08 更新)
 
-画像の原寸切替は `.viewer-pages` の寸法と transform、および `.viewer-stage` の overflow だけを変える。
-上端・下端の `.viewer-ui` は stage の兄弟であり、`.image-viewer` を基準に絶対配置されるため、
-remote 内部の原寸倍率では位置が変わらない。この構造を回帰テストで固定する。原寸表示後に UI まで
-拡大・見切れした観測は、この fit 経路だけでは説明できず、visual viewport の拡大と区別して調べる。
+2026-08-08 の利用者判断により、静止画 viewer のダブルタップによる `Page` ⇔ `Original` 切替は廃止した。
+原寸表示は操作メニュー → 表示の「原寸 (100%)」に残す。これに伴い、中央 tap の pair 候補、320 ms の
+保留 timer、保留 tap の commit、原寸トグル専用 command と候補棄却 telemetry も撤去し、中央 tap は
+各 `pointerup` で即時に上下バーを切り替える。アプリ自身はダブルタップに意味を割り当てない。
 
-原寸モードの remote 内部 scale は 1 である。1 本指 pan を優先するのは独自 pinch 後の scale が
-1.01 を超えた場合だけで、原寸だから pan がダブルタップを奪う経路はない。実機ログには原寸から page へ
-正常に戻る例のほか、二度目の操作が `double_tap_fit` にならず `tap_center` で終わった例があるが、
-既存記録だけでは時間・距離・PAN・cancel・pinch のどれかを特定できない。このため閾値は変えず、
-待機中の中央タップが次の入力で成立しなかった時だけ `double_tap_candidate_rejected` を通常段へ記録する。
+一方、browser の double-tap zoom は独立して起こり得るため、document level の単一 owner は維持する。
+アプリ外周 (`html, body, #app`) の既定は `touch-action: manipulation` とし、2 回の単指 tap の時間差と
+距離を `doubleTapSequenceTransition` の純粋関数で判定する。browser default を止めるのは成立した2打目の
+`touchend` だけで、1打目、時間・距離が外れた tap、12 CSS px を超えて移動した gesture は
+`preventDefault()` しない。2接点以上は sequence を破棄し、browser pinch を維持する。文字入力や click を
+失う操作要素は固定 selector ごとの除外理由を持ち、2打目も止めない。
 
-`visualViewport.scale` は原寸切替では変わらず、browser zoom なら 1 を超えるため、既存の image event と
-`double_tap_fit` command event に載せる。さらに visual viewport の resize が 250 ms 落ち着いた時点で、
-前回記録値から 0.01 以上変わった場合だけ `visual_viewport/scale_changed` を追加する。毎フレーム／全操作の
-記録にはせず、値は数値だけなので通常段で扱う。
+`document-double-tap.mjs` は telemetry を知らず、任意 callback に固定形式の判定事実だけを返す。app は
+これを通常段の `browser_double_tap/suppression_decision` として、直前の実 tap からの経過 ms と距離 px、
+double-tap と認識したか、抑止したか、除外対象かと固定の除外理由、`event.cancelable` を記録する。抑止候補の
+消費状態とは別に診断用の直前 tap を保持するため、除外対象上の2打や、成立 pair 直後の3打目でも実際の
+直前 tap との差を失わない。pair には SPA の実行中に単調増加する数値だけの相関番号を付け、session ID、
+path、DOM target は記録しない。
 
-アプリ外周 (`html, body, #app`) の既定は `touch-action: manipulation` とする。ただし要素別の宣言を
-増やして非対話テキストや余白まで列挙せず、document level の単一 owner が touch sequence を監視する。
-2 回の単指 tap の時間差と距離は `doubleTapSequenceTransition` の共通純関数で判定し、browser default を
-止めるのは成立した 2 打目の `touchend` だけとする。1 打目、時間・距離が外れた tap、12 CSS px を超えて
-移動した gesture は `preventDefault()` しない。`input` / `textarea` / contenteditable は候補外として
-文字選択と caret 操作を維持する。
+`visualViewport` の resize は従来どおり 250 ms 落ち着いた時点で、前回記録値から scale が 0.01 以上
+変わった場合だけ `visual_viewport/scale_changed` を通常段へ送る。この event には直前の tap pair 相関番号、
+最後の resize 観測時点での pair からの経過 ms、pair の時間・距離・認識・抑止・除外理由・`cancelable` を
+併記し、browser zoom の発生と直前 pair を直接照合できるようにする。
 
-2 接点以上になった gesture は tap sequence を破棄し、touch event を一切抑止しないため browser pinch を
-維持する。画像・動画 viewer の `none` は従来どおり remote 独自 pinch / pan を所有し、縦スクロール領域の
-`pan-y` と既存要素の `manipulation` も browser hint として残すが、この対策のための要素別宣言は追加しない。
-viewport meta に `maximum-scale` / `user-scalable` は指定しない。
+この更新では browser 抑止の 520 ms 窓と距離を変更せず、要素別 `touch-action` を追加せず、viewport meta に
+`maximum-scale` / `user-scalable` を指定しない。原寸表示後に pan できず menu が開くという観測は、
+ダブルタップ経路の廃止で修正済みとは扱わない。操作メニューから原寸へ入った場合にも起こるかを別途確認し、
+必要なら独立した不具合として調査する。
 
 ### 12.22 ページ応答 identity の検査 (2026-08-08)
 

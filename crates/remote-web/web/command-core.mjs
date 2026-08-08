@@ -10,7 +10,6 @@ export const CommandName = Object.freeze({
   FIT_PAGE: "fit_page",
   FIT_WIDTH: "fit_width",
   FIT_ORIGINAL: "fit_original",
-  FIT_TOGGLE_PAGE_ORIGINAL: "fit_toggle_page_original",
   SPREAD_CYCLE: "spread_cycle",
   SPREAD_SINGLE: "spread_single",
   SPREAD_LTR: "spread_ltr",
@@ -68,23 +67,20 @@ export const ReadingDirection = Object.freeze({
   RTL: "rtl",
 });
 
-export const DOUBLE_TAP_MAX_DELAY_MS = 320;
-export const DOUBLE_TAP_MAX_DISTANCE_PX = 36;
-
 /// ブラウザが double-tap zoom と見なす窓。アプリのジェスチャ判定とは別物で、こちらは
-/// ブラウザの挙動で決まる。少しゆっくりめの 2 打がアプリでは別々のタップでも、ブラウザは
-/// まだ拡大するので、抑止側はアプリ側より広く取る必要がある (実機で 320ms では足りなかった)。
-/// 距離は現状同じで足りているため共有する。
+/// ブラウザの挙動で決まる (実機で 320ms では足りなかった)。アプリ自身は double-tap に
+/// 操作を割り当てず、この定数は browser zoom の document-level 抑止だけが使う。
 export const BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS = 520;
+export const BROWSER_DOUBLE_TAP_ZOOM_MAX_DISTANCE_PX = 36;
 
-/// Shared recognition rule for app-owned double taps. A recognized pair is consumed as a pair,
-/// so the third tap starts a new candidate rather than overlapping the preceding double tap.
+/// Pure recognition rule for the document-level browser zoom owner. A recognized pair is
+/// consumed as a pair, so the third tap starts a new candidate rather than overlapping it.
 export function doubleTapSequenceTransition(
   previous,
   { x, y, atMs },
   {
-    maxDelayMs = DOUBLE_TAP_MAX_DELAY_MS,
-    maxDistancePx = DOUBLE_TAP_MAX_DISTANCE_PX,
+    maxDelayMs = BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS,
+    maxDistancePx = BROWSER_DOUBLE_TAP_ZOOM_MAX_DISTANCE_PX,
   } = {}
 ) {
   const current = {
@@ -92,18 +88,23 @@ export function doubleTapSequenceTransition(
     y: Number(y) || 0,
     atMs: Number(atMs) || 0,
   };
-  const elapsed = current.atMs - Number(previous?.atMs);
-  const distance = Math.hypot(
-    current.x - (Number(previous?.x) || 0),
-    current.y - (Number(previous?.y) || 0)
-  );
-  const isDoubleTap = Boolean(previous) &&
-    elapsed >= 0 &&
-    elapsed <= maxDelayMs &&
-    distance <= maxDistancePx;
+  const hasPrevious = Boolean(previous);
+  const elapsedMs = hasPrevious ? current.atMs - Number(previous.atMs) : null;
+  const distancePx = hasPrevious
+    ? Math.hypot(
+      current.x - (Number(previous.x) || 0),
+      current.y - (Number(previous.y) || 0)
+    )
+    : null;
+  const isDoubleTap = hasPrevious &&
+    elapsedMs >= 0 &&
+    elapsedMs <= maxDelayMs &&
+    distancePx <= maxDistancePx;
   return {
     isDoubleTap,
     next: isDoubleTap ? null : current,
+    elapsedMs,
+    distancePx,
   };
 }
 
@@ -806,58 +807,11 @@ export function nextFitMode(mode) {
   return FitMode.PAGE;
 }
 
-export function togglePageOriginalFitMode(mode, { scale = 1 } = {}) {
-  if ((Number(scale) || 1) > 1.01) return FitMode.PAGE;
-  return mode === FitMode.ORIGINAL ? FitMode.PAGE : FitMode.ORIGINAL;
-}
-
 export function viewerTapZone(clientX, width) {
   const ratio = Math.max(0, Math.min(1, Number(clientX) / Math.max(1, Number(width) || 1)));
   if (ratio < 0.34) return "left";
   if (ratio > 0.66) return "right";
   return "center";
-}
-
-/// Only center touches participate in double-tap recognition. Edge taps are returned immediately
-/// and clear any center candidate, so page navigation never waits for the double-tap window.
-export function viewerTapSequenceTransition(
-  previous,
-  { x, y, atMs, width, inputSource = "touch" },
-  {
-    maxDelayMs = DOUBLE_TAP_MAX_DELAY_MS,
-    maxDistancePx = DOUBLE_TAP_MAX_DISTANCE_PX,
-  } = {}
-) {
-  const zone = viewerTapZone(x, width);
-  const current = {
-    x: Number(x) || 0,
-    y: Number(y) || 0,
-    atMs: Number(atMs) || 0,
-    inputSource,
-    zone,
-  };
-  if (inputSource !== "touch") {
-    return { action: "single_tap", next: null, commitPrevious: Boolean(previous) };
-  }
-  if (zone !== "center") {
-    return { action: "edge_tap", next: null, commitPrevious: Boolean(previous) };
-  }
-  const transition = doubleTapSequenceTransition(
-    (
-      previous?.inputSource === "touch" &&
-      previous?.zone === "center"
-    ) ? previous : null,
-    current,
-    { maxDelayMs, maxDistancePx }
-  );
-  if (transition.isDoubleTap) {
-    return { action: "double_tap", next: null, commitPrevious: false };
-  }
-  return {
-    action: "pending_center_tap",
-    next: current,
-    commitPrevious: Boolean(previous),
-  };
 }
 
 export function nextSpreadMode(mode) {

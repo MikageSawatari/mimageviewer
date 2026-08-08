@@ -113,6 +113,7 @@ const {
   VIEWER_MENU_MAX_ACTIONS,
   VIEWER_PANEL_TABS,
   activateFolderContainerForImage,
+  browserDoubleTapTelemetryEvent,
   commandTelemetryEvent,
   containerInitialImageIndex,
   createGridTile,
@@ -228,22 +229,31 @@ test("open telemetry records the requested kind, media kind, and reached route",
   assert.equal(rejected.handled, false);
 });
 
-test("double-tap command telemetry correlates app fit with browser viewport scale", () => {
-  const event = commandTelemetryEvent(
-    { name: "fit_toggle_page_original" },
-    {
-      detail: "double_tap_fit",
-      fitMode: "original",
-      viewerScale: 1,
-      visualViewportScale: 1.2478,
-    },
-    "touch",
-    "viewer"
-  );
+test("browser double-tap telemetry keeps the measured suppression decision", () => {
+  const event = browserDoubleTapTelemetryEvent({
+    decision: "pair_suppressed",
+    elapsedMs: 222.34,
+    distancePx: 5.678,
+    isDoubleTap: true,
+    suppressed: true,
+    excluded: false,
+    exclusionReason: null,
+    cancelable: true,
+  }, 7);
 
-  assert.equal(event.fit_mode_before, "original");
-  assert.equal(event.viewer_scale, 1);
-  assert.equal(event.visual_viewport_scale, 1.248);
+  assert.deepEqual(event, {
+    type: "browser_double_tap",
+    action: "suppression_decision",
+    decision: "pair_suppressed",
+    tap_pair_sequence: 7,
+    previous_tap_elapsed_ms: 222.3,
+    previous_tap_distance_px: 5.7,
+    recognized_double_tap: true,
+    suppressed: true,
+    excluded: false,
+    exclusion_reason: null,
+    event_cancelable: true,
+  });
 });
 
 test("legacy image telemetry resolves rejection and folder route without entryIndex", () => {

@@ -407,15 +407,30 @@ test("browser, viewer, and layout geometry are attached to image and refit event
   assert.match(app, /visualViewport\?\.addEventListener\?\.\("resize"/);
   assert.match(app, /visualViewportScaleTransition\(/);
   assert.match(app, /\}, 250\);/);
+  assert.match(app, /precedingBrowserTapPairTelemetry\(/);
+  assert.match(app, /onDecision:\s*recordBrowserDoubleTapDecision/);
   assert.match(
     app,
     /fit_mode:\s*request\.fitMode,[\s\S]*?\.\.\.viewerTransformTelemetry\(this\.scale,/
   );
-  assert.match(app, /detail:\s*"double_tap_fit",[\s\S]*?visualViewportScale:/);
-  assert.match(app, /action:\s*"double_tap_candidate_rejected"/);
+  assert.match(app, /type:\s*"browser_double_tap"/);
   assert.match(app, /action:\s*"pinch_end"/);
   assert.match(app, /type:\s*"viewer_layout",[\s\S]*?action:\s*"refit"/);
   assert.match(app, /renderTrigger:\s*"viewport_resize"/);
+});
+
+test("viewer taps dispatch immediately and have no application double-tap fit path", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  const tapBranch = app.slice(
+    app.indexOf("} else if (gesture === ViewerGesture.TAP)"),
+    app.indexOf("} else if (gesture === ViewerGesture.PAN)")
+  );
+  assert.match(tapBranch, /dispatchCommand\(viewerTapCommand\(/);
+  assert.doesNotMatch(tapBranch, /setTimeout|double_tap|FIT_/);
+  assert.doesNotMatch(
+    app,
+    /viewerTapSequence|pending_center_tap|centerTapTimer|fit_toggle_page_original/
+  );
 });
 
 test("page request feedback precedes load while display position commits at replacement", async () => {

@@ -21,61 +21,81 @@ function touchByIdentifier(touches, identifier) {
 /// `select` と `label` はここに入れない。以前「native の部品だからブラウザは拡大しない」
 /// として除外したが、実際には拡大する。どちらもこちらが click で処理しておらず、
 /// 止めて失うのは 2 打目の起動転送だけなので、拡大を許す理由にならない。
-const KEEPS_DEFAULT_TAP_BEHAVIOUR = [
-  "button",
-  "a[href]",
-  "textarea",
-  "[contenteditable]",
-  '[role="button"]',
-  '[role="link"]',
-  '[role="tab"]',
-  '[role="option"]',
+const DEFAULT_TAP_EXCLUSIONS = [
+  ["button", "button"],
+  ["link", "a[href]"],
+  ["textarea", "textarea"],
+  ["contenteditable", "[contenteditable]"],
+  ["role_button", '[role="button"]'],
+  ["role_link", '[role="link"]'],
+  ["role_tab", '[role="tab"]'],
+  ["role_option", '[role="option"]'],
   // range / checkbox / radio / button 系は文字入力ではなく、拡大だけが残る。
-  'input:not([type="range"]):not([type="checkbox"]):not([type="radio"])' +
-    ':not([type="button"]):not([type="submit"])',
-].join(", ");
+  [
+    "text_input",
+    'input:not([type="range"]):not([type="checkbox"]):not([type="radio"])' +
+      ':not([type="button"]):not([type="submit"])',
+  ],
+];
 
-function keepsDefaultTapBehaviour(target) {
-  return Boolean(target?.closest?.(KEEPS_DEFAULT_TAP_BEHAVIOUR));
+function defaultTapExclusionReason(target) {
+  for (const [reason, selector] of DEFAULT_TAP_EXCLUSIONS) {
+    if (target?.closest?.(selector)) return reason;
+  }
+  return null;
 }
 
 /// Own browser double-tap suppression once for the whole document. The first tap and every
 /// non-matching touchend keep their defaults; only the second tap of a recognized pair is
 /// prevented. Multi-touch gestures never enter the tap sequence, leaving browser pinch intact.
 /// Preventing a touchend also drops its synthesized click, so activatable targets are left
-/// alone (see KEEPS_DEFAULT_TAP_BEHAVIOUR).
+/// alone (see DEFAULT_TAP_EXCLUSIONS). An optional callback exposes only the fixed decision
+/// facts; the caller owns any logging or correlation policy.
 export function installDocumentDoubleTapOwner(
   eventTarget,
   {
     now = () => performance.now(),
     maxTapTravelPx = DOCUMENT_TAP_MAX_TRAVEL_PX,
+    onDecision = null,
   } = {}
 ) {
   let gesture = null;
   let previousTap = null;
+  let previousObservedTap = null;
+
+  // Keep this module independent from telemetry. The caller may observe the fixed, content-free
+  // decision object, and an observer failure must never change browser gesture ownership.
+  const notifyDecision = (decision) => {
+    if (typeof onDecision !== "function") return;
+    try {
+      onDecision(decision);
+    } catch {}
+  };
 
   const rejectGesture = () => {
     gesture = null;
     previousTap = null;
+    previousObservedTap = null;
   };
 
   const onTouchStart = (event) => {
     if (event.touches?.length !== 1) {
       gesture = { multiTouch: true };
       previousTap = null;
+      previousObservedTap = null;
       return;
     }
     const touch = event.touches[0];
-    const ignored = keepsDefaultTapBehaviour(event.target);
+    const exclusionReason = defaultTapExclusionReason(event.target);
     gesture = {
       identifier: touch.identifier,
       startX: touch.clientX,
       startY: touch.clientY,
       maxTravelPx: 0,
-      ignored,
+      exclusionReason,
       multiTouch: false,
     };
-    if (ignored) previousTap = null;
+    if (exclusionReason) previousTap = null;
   };
 
   const onTouchMove = (event) => {
@@ -83,6 +103,7 @@ export function installDocumentDoubleTapOwner(
     if (event.touches?.length !== 1) {
       gesture.multiTouch = true;
       previousTap = null;
+      previousObservedTap = null;
       return;
     }
     const touch = touchByIdentifier(event.touches, gesture.identifier);
@@ -101,6 +122,7 @@ export function installDocumentDoubleTapOwner(
     if (gesture.multiTouch) {
       if (event.touches?.length === 0) gesture = null;
       previousTap = null;
+      previousObservedTap = null;
       return;
     }
     if (event.touches?.length !== 0 || event.changedTouches?.length !== 1) {
@@ -111,30 +133,80 @@ export function installDocumentDoubleTapOwner(
     const endTravelPx = touch
       ? Math.hypot(touch.clientX - gesture.startX, touch.clientY - gesture.startY)
       : 0;
-    if (
-      !touch ||
-      gesture.ignored ||
-      Math.max(gesture.maxTravelPx, endTravelPx) > maxTapTravelPx
-    ) {
+    if (!touch) {
+      rejectGesture();
+      return;
+    }
+    const atMs = now();
+    const eventCancelable = Boolean(event.cancelable);
+    const currentTap = {
+      x: touch.clientX,
+      y: touch.clientY,
+      atMs,
+    };
+    const observedTransition = doubleTapSequenceTransition(
+      previousObservedTap,
+      currentTap
+    );
+    if (gesture.exclusionReason) {
+      notifyDecision({
+        decision: "excluded_target",
+        atMs,
+        elapsedMs: observedTransition.elapsedMs,
+        distancePx: observedTransition.distancePx,
+        isDoubleTap: observedTransition.isDoubleTap,
+        suppressed: false,
+        excluded: true,
+        exclusionReason: gesture.exclusionReason,
+        cancelable: eventCancelable,
+      });
+      gesture = null;
+      previousTap = null;
+      previousObservedTap = currentTap;
+      return;
+    }
+    if (Math.max(gesture.maxTravelPx, endTravelPx) > maxTapTravelPx) {
+      notifyDecision({
+        decision: "travel_exceeded",
+        atMs,
+        elapsedMs: null,
+        distancePx: null,
+        isDoubleTap: false,
+        suppressed: false,
+        excluded: false,
+        exclusionReason: null,
+        cancelable: eventCancelable,
+      });
       rejectGesture();
       return;
     }
 
     const transition = doubleTapSequenceTransition(
       previousTap,
-      {
-        x: touch.clientX,
-        y: touch.clientY,
-        atMs: now(),
-      },
+      currentTap,
       // アプリのジェスチャではなく、ブラウザが拡大と見なす窓に合わせる。
       { maxDelayMs: BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS }
     );
     gesture = null;
     previousTap = transition.next;
-    if (transition.isDoubleTap && event.cancelable !== false) {
+    previousObservedTap = currentTap;
+    const suppressed = transition.isDoubleTap && eventCancelable;
+    if (suppressed) {
       event.preventDefault();
     }
+    notifyDecision({
+      decision: transition.isDoubleTap
+        ? (suppressed ? "pair_suppressed" : "pair_not_cancelable")
+        : (transition.elapsedMs === null ? "candidate_started" : "pair_rejected"),
+      atMs,
+      elapsedMs: observedTransition.elapsedMs,
+      distancePx: observedTransition.distancePx,
+      isDoubleTap: transition.isDoubleTap,
+      suppressed,
+      excluded: false,
+      exclusionReason: null,
+      cancelable: eventCancelable,
+    });
   };
 
   const onTouchCancel = () => rejectGesture();
