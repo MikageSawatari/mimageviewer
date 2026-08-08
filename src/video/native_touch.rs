@@ -5,6 +5,16 @@ use crate::touch_input::{
 pub(crate) const MAX_OWNED_TOUCH_POINTERS: usize = 16;
 const PRIMARY_CANCEL_DISTANCE_POINTS: f32 = 1024.0;
 
+/// Native HWND that originated a video-overlay input stream.
+///
+/// This type lives in the platform-neutral adapter module so source-aware
+/// touch classification remains covered by non-Windows unit tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeVideoWindowSource {
+    Presenter,
+    Hud,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeVideoTouchPhase {
     Start,
@@ -26,10 +36,12 @@ impl From<NativeVideoTouchPhase> for TouchPhase {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeVideoTouchEvent {
+    pub(crate) source: NativeVideoWindowSource,
     pub pointer_id: u32,
-    /// Presenter client coordinate in physical pixels.
+    /// Source-HWND client coordinate in physical pixels. Presenter and HUD
+    /// mirror the same client geometry, so both join the existing conversion.
     pub x: i32,
-    /// Presenter client coordinate in physical pixels.
+    /// Source-HWND client coordinate in physical pixels.
     pub y: i32,
     pub phase: NativeVideoTouchPhase,
     /// This stream began while the presenter was not active, so it must not
@@ -76,10 +88,10 @@ pub(crate) enum NativeTouchOwnershipDecision {
 struct OwnedTouchPointer {
     id: u32,
     last_client_position: Option<[i32; 2]>,
-    activation_tap: bool,
+    suppress_widget_primary: bool,
 }
 
-/// Pure, bounded ownership state for one presenter HWND.
+/// Pure, bounded ownership state for one native input HWND.
 ///
 /// A pointer id can enter this set only at `WM_POINTERDOWN`. Follow-up
 /// messages never claim an unregistered id, preserving whole-stream Win32
@@ -133,7 +145,7 @@ impl NativeTouchOwnership {
         self.pointers.push(OwnedTouchPointer {
             id: pointer_id,
             last_client_position: None,
-            activation_tap: false,
+            suppress_widget_primary: false,
         });
         NativeTouchOwnershipDecision::Owned
     }
@@ -163,25 +175,27 @@ impl NativeTouchOwnership {
             .and_then(|pointer| pointer.last_client_position)
     }
 
-    pub(crate) fn mark_activation_tap(&mut self, pointer_id: u32) {
+    pub(crate) fn mark_suppress_widget_primary(&mut self, pointer_id: u32) {
         if let Some(pointer) = self
             .pointers
             .iter_mut()
             .find(|pointer| pointer.id == pointer_id)
         {
-            pointer.activation_tap = true;
+            pointer.suppress_widget_primary = true;
         }
     }
 
-    pub(crate) fn is_activation_tap(&self, pointer_id: u32) -> bool {
+    pub(crate) fn suppresses_widget_primary(&self, pointer_id: u32) -> bool {
         self.pointers
             .iter()
             .find(|pointer| pointer.id == pointer_id)
-            .is_some_and(|pointer| pointer.activation_tap)
+            .is_some_and(|pointer| pointer.suppress_widget_primary)
     }
 
-    pub(crate) fn has_activation_tap_stream(&self) -> bool {
-        self.pointers.iter().any(|pointer| pointer.activation_tap)
+    pub(crate) fn has_suppressed_widget_stream(&self) -> bool {
+        self.pointers
+            .iter()
+            .any(|pointer| pointer.suppress_widget_primary)
     }
 
     pub(crate) fn release(&mut self, pointer_id: u32) -> bool {
@@ -206,6 +220,10 @@ impl NativeTouchOwnership {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.pointers.is_empty()
+    }
+
+    pub(crate) fn first_pointer_id(&self) -> Option<u32> {
+        self.pointers.first().map(|pointer| pointer.id)
     }
 
     #[cfg(test)]
@@ -349,15 +367,21 @@ impl NativeTouchAdapter {
             self.primary_withholds_press = event.suppress_widget_primary;
         }
         let is_primary = self.primary_id == Some(event.pointer_id);
-        let commands = self.recognizer.handle_sample(
-            geometry,
-            TouchSample {
-                id: u64::from(event.pointer_id),
-                pos,
-                phase: event.phase.into(),
-                now_ms,
-            },
-        );
+        let sample = TouchSample {
+            id: u64::from(event.pointer_id),
+            pos,
+            phase: event.phase.into(),
+            now_ms,
+        };
+        // One typed choke point decides origin semantics. A pointer can reach
+        // the HUD HWND only after the OS hit-test selected its interactive
+        // region, so HUD starts bypass presenter geometry classification.
+        let commands = match event.source {
+            NativeVideoWindowSource::Presenter => self.recognizer.handle_sample(geometry, sample),
+            NativeVideoWindowSource::Hud => self
+                .recognizer
+                .handle_widget_passthrough_sample(geometry, sample),
+        };
         self.pending_commands.extend(commands);
 
         let suppress_primary = self.recognizer.should_suppress_primary();
@@ -513,6 +537,7 @@ mod tests {
         phase: NativeVideoTouchPhase,
     ) -> NativeVideoTouchEvent {
         NativeVideoTouchEvent {
+            source: NativeVideoWindowSource::Presenter,
             pointer_id,
             x,
             y,
@@ -529,6 +554,18 @@ mod tests {
     ) -> NativeVideoTouchEvent {
         NativeVideoTouchEvent {
             suppress_widget_primary: true,
+            ..event(pointer_id, x, y, phase)
+        }
+    }
+
+    fn hud_event(
+        pointer_id: u32,
+        x: i32,
+        y: i32,
+        phase: NativeVideoTouchPhase,
+    ) -> NativeVideoTouchEvent {
+        NativeVideoTouchEvent {
+            source: NativeVideoWindowSource::Hud,
             ..event(pointer_id, x, y, phase)
         }
     }
@@ -603,6 +640,19 @@ mod tests {
     }
 
     #[test]
+    fn followup_does_not_cross_per_hwnd_ownership_sets() {
+        let mut presenter = NativeTouchOwnership::default();
+        let hud = NativeTouchOwnership::default();
+        presenter.begin(77, true, NativePointerTypeProbe::Touch);
+
+        assert_eq!(presenter.followup(77), NativeTouchOwnershipDecision::Owned);
+        assert_eq!(
+            hud.followup(77),
+            NativeTouchOwnershipDecision::Passed(NativeTouchPassReason::UnregisteredPointerId)
+        );
+    }
+
+    #[test]
     fn ownership_has_a_hard_capacity() {
         let mut state = NativeTouchOwnership::with_capacity(2);
         state.begin(1, true, NativePointerTypeProbe::Touch);
@@ -628,15 +678,15 @@ mod tests {
     fn activation_tap_and_window_destroy_clear_are_per_hwnd_state() {
         let mut state = NativeTouchOwnership::default();
         state.begin(11, true, NativePointerTypeProbe::Touch);
-        state.mark_activation_tap(11);
-        assert!(state.is_activation_tap(11));
-        assert!(state.has_activation_tap_stream());
+        state.mark_suppress_widget_primary(11);
+        assert!(state.suppresses_widget_primary(11));
+        assert!(state.has_suppressed_widget_stream());
         state.begin(12, true, NativePointerTypeProbe::Touch);
-        state.mark_activation_tap(12);
+        state.mark_suppress_widget_primary(12);
         state.release(11);
-        assert!(state.has_activation_tap_stream());
+        assert!(state.has_suppressed_widget_stream());
         state.release(12);
-        assert!(!state.has_activation_tap_stream());
+        assert!(!state.has_suppressed_widget_stream());
         state.begin(13, true, NativePointerTypeProbe::Touch);
         state.clear();
         assert_eq!(state.len(), 0);
@@ -842,6 +892,108 @@ mod tests {
         assert!(has_primary_button(&start.egui_events, true));
         assert!(has_primary_button(&end.egui_events, false));
         assert!(adapter.take_commands().is_empty());
+    }
+
+    #[test]
+    fn hud_origin_is_widget_passthrough_without_presenter_exclusion_geometry() {
+        let mut adapter = NativeTouchAdapter::default();
+        let start = adapter.handle_event(
+            hud_event(1, 500, 400, NativeVideoTouchPhase::Start),
+            &geometry(),
+            0,
+            1.0,
+        );
+        let end = adapter.handle_event(
+            hud_event(1, 500, 400, NativeVideoTouchPhase::End),
+            &geometry(),
+            100,
+            1.0,
+        );
+
+        assert!(has_primary_button(&start.egui_events, true));
+        assert!(has_primary_button(&end.egui_events, false));
+        assert!(adapter.take_commands().is_empty());
+    }
+
+    #[test]
+    fn simultaneous_hud_and_presenter_contacts_have_one_primary_owner() {
+        let mut adapter = NativeTouchAdapter::default();
+        let outputs = [
+            (hud_event(1, 500, 400, NativeVideoTouchPhase::Start), 0),
+            (event(2, 600, 400, NativeVideoTouchPhase::Start), 10),
+            (event(2, 600, 400, NativeVideoTouchPhase::End), 20),
+            (hud_event(1, 500, 400, NativeVideoTouchPhase::End), 30),
+        ]
+        .into_iter()
+        .map(|(event, now_ms)| adapter.handle_event(event, &geometry(), now_ms, 1.0))
+        .collect::<Vec<_>>();
+
+        let presses = outputs
+            .iter()
+            .flat_map(|output| output.egui_events.iter())
+            .filter(|event| {
+                matches!(
+                    event,
+                    egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let releases = outputs
+            .iter()
+            .flat_map(|output| output.egui_events.iter())
+            .filter(|event| {
+                matches!(
+                    event,
+                    egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(presses, 1);
+        assert_eq!(releases, 1);
+        assert!(adapter.take_commands().is_empty());
+    }
+
+    #[test]
+    fn hud_capture_loss_cancel_releases_primary_before_pointer_gone() {
+        let mut adapter = NativeTouchAdapter::default();
+        let start = adapter.handle_event(
+            hud_event(1, 500, 400, NativeVideoTouchPhase::Start),
+            &geometry(),
+            0,
+            1.0,
+        );
+        assert!(has_primary_button(&start.egui_events, true));
+
+        let cancel = adapter.handle_event(
+            hud_event(1, 500, 400, NativeVideoTouchPhase::Cancel),
+            &geometry(),
+            10,
+            1.0,
+        );
+        let moved = cancel
+            .egui_events
+            .iter()
+            .position(|event| matches!(event, egui::Event::PointerMoved(pos) if pos.x >= 500.0 + PRIMARY_CANCEL_DISTANCE_POINTS))
+            .expect("capture loss must move beyond click distance");
+        let released = cancel
+            .egui_events
+            .iter()
+            .position(|event| has_primary_button(std::slice::from_ref(event), false))
+            .expect("capture loss must release the synthetic primary");
+        let gone = cancel
+            .egui_events
+            .iter()
+            .position(|event| matches!(event, egui::Event::PointerGone))
+            .expect("capture loss must end with PointerGone");
+        assert!(moved < released && released < gone);
     }
 
     #[test]

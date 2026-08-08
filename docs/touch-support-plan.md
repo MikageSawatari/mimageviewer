@@ -994,12 +994,32 @@ Microsoft は **「一つの pointer stream の一部だけを消費し、残り
   **ジェスチャは通常どおり認識し、overlay の control へ届き得る synthetic press だけを抑止**する。
   = 復帰タップでもクロームは出る。gesture ごと捨てると、前面状態次第で 1 タップ目の
   意味が変わり挙動が読めなくなるため、この形に固定した。
-- **HUD HWND は意図的に対象外**。HUD は promoted mouse で既存ボタンを操作できており、所有へ
-  切り替えるには HUD 側の pointer emulation とターゲットサイズ調整を一緒に完成させる必要がある。
-  HUD の所有・emulation・ボタンサイズ調整は Phase 3 で行う。したがって
-  **HUD 上の長押し→右クリック合成は今回残り、presenter 側だけを構造的に修正した**。
+- **Phase 1 Step 4 時点では HUD HWND を意図的に対象外にした**。HUD は promoted mouse で
+  既存ボタンを操作できていたため、当時は presenter 側だけを所有し、HUD 上の
+  長押し→右クリック合成を Phase 3 へ残した。現状は下記 Phase 3 Step 1 で解消済み。
 - `MIV_DISABLE_TOUCH_GESTURES=1` では所有と promoted-mouse filter を無効にし、従来経路へ戻す。
   Cancel / capture loss は防御的に実装したが、実機では引き続き未観測。
+
+#### Phase 3 Step 1 実装記録 (HUD HWND の所有)
+
+- HUD の HWND ごとの `WindowState` に presenter と同じ上限付き `NativeTouchOwnership` を持たせ、
+  `PT_TOUCH` と確定した DOWN だけを stream 単位で所有する。type probe、followup、座標変換、
+  canceled / UP / `WM_POINTERCAPTURECHANGED` の終端は両 wndproc で同じ Win32 helper を共有する。
+  未登録 pointer id、問い合わせ失敗、非 touch、上限超過は従来どおり `DefWindowProcW` へ渡す。
+- `NativeVideoTouchEvent.source: NativeVideoWindowSource` を正本に presenter / HUD の発生元を保持する。
+  overlay の `NativeTouchAdapter` は 1 つのままで、先頭接点だけが primary emulation を所有する。
+- **HUD HWND に届いた事実を OS の hit-test 結果として採用し、アプリ側で hit-test をやり直さない**。
+  HUD source は `TouchRecognizer::handle_widget_passthrough_sample` から開始 owner を直接
+  `WidgetPassthrough` にし、`classify_tap` と presenter の `compute_hud_regions()` 近似を通さない。
+  このため近似矩形がずれても HUD 操作が viewer tap / chrome toggle へ化けない。
+- 所有した HUD touch 由来の promoted mouse は全 mouse handler で
+  `GetCurrentInputMessageSource()==IMDT_TOUCH` と確定した場合だけ捨てる。問い合わせ失敗と
+  `IMDT_UNAVAILABLE` は fail-open、`MIV_DISABLE_TOUCH_GESTURES=1` は所有・filter とも無効。
+- HUD touch DOWN は既存 mouse-down と同じ `RequestFocusClaim` を送り、touch 用の `SetCapture` は
+  呼ばない。`WM_CAPTURECHANGED` / `WM_CANCELMODE` / `WM_DESTROY` / `WM_NCDESTROY` は mouse の
+  synthetic-up cleanup と同じ `emit_input_cleanup` で全 owned touch を Cancel して解放する。
+- `MIV_TOUCH_DEBUG=1` の ownership / 座標 / command / promoted-mouse discard ログに
+  `presenter` / `hud` の source を出す。自動テスト完了、実機での HUD ボタン操作と長押しは確認待ち。
 
 #### 案 D (フォールバック) の内容
 
@@ -1323,10 +1343,12 @@ NeeView は **ペンと指を区別していない**。リポジトリ全体で 
 1. **【通過済み】`WM_POINTER*` 配送ゲート**。実機ログで presenter HWND に
    `PT_TOUCH` 237 件、HUD HWND に 35 件を観測し、touch-unregistered の実 HWND 構成
    (hit-test region / DirectComposition / `WS_EX_NOACTIVATE` の HUD) でも案 C が成立すると確定した。
-2. **【バグ観測済み・修正後の実機確認待ち】** 動画 native presenter の長押しでは、
+2. **【presenter / HUD とも実装修正済み・実機確認待ち】** 動画 native presenter の長押しでは、
    `WM_POINTERUP` 後に合成された短い右クリックでフルスクリーンが閉じた。
    presenter の `PT_TOUCH` stream 全体を所有し `DefWindowProcW` へ渡さない構造へ修正済み。
-   変更後ビルドで「長押ししても閉じない」ことを確認して解消確定とする。
+   Phase 3 Step 1 で HUD HWND も同じ whole-stream 所有へ移し、HUD 上に残っていた
+   長押し→右クリック合成も構造上解消した。変更後ビルドで presenter / HUD の双方について
+   「長押ししても右クリック扱いにならず、フルスクリーンも閉じない」ことを確認して解消確定とする。
 3. **【実装解決・Cancel 自体は実機未観測】egui-winit の Touch Cancel が primary release を出さない件**
    (`egui-winit-0.33.3/src/lib.rs:732-735`)。アプリ側の gesture state は Cancel で破棄できるが、
    `PointerGone` 単独では egui の primary-down は解除されない。native adapter は
@@ -1373,4 +1395,5 @@ NeeView は **ペンと指を区別していない**。リポジトリ全体で 
 
 **動画 native の入力経路は Phase 1 で presenter に薄く実装した**。
 `WM_POINTER` が presenter / HUD の実 HWND に届く出荷ゲートは通過済みで、案 C は成立する。
-HUD 側の stream 所有、pointer emulation、ターゲットサイズ調整は Phase 3 でまとめて完成させる。
+HUD 側の stream 所有と pointer emulation は Phase 3 Step 1 で実装済み。
+ターゲットサイズ調整は実機判断を待つ後続 Step として残す。

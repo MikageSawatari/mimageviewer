@@ -16,10 +16,16 @@ pub(crate) fn touch_debug_enabled() -> bool {
 }
 
 #[cfg(windows)]
-pub(crate) fn log_native_touch_ownership(pointer_id: u32, owned: bool, reason: &str) {
+pub(crate) fn log_native_touch_ownership(
+    window: TouchDebugWindow,
+    pointer_id: u32,
+    owned: bool,
+    reason: &str,
+) {
     if touch_debug_enabled() {
         crate::logger::log(format!(
-            "[TOUCH-DEBUG] native presenter pointer_id={} ownership={} reason={}",
+            "[TOUCH-DEBUG] native {} pointer_id={} ownership={} reason={}",
+            window.label(),
             pointer_id,
             if owned { "owned" } else { "passed" },
             reason,
@@ -28,29 +34,44 @@ pub(crate) fn log_native_touch_ownership(pointer_id: u32, owned: bool, reason: &
 }
 
 #[cfg(windows)]
-pub(crate) fn log_native_touch_coordinates(pointer_id: u32, client: [i32; 2], points: egui::Pos2) {
+pub(crate) fn log_native_touch_coordinates(
+    window: TouchDebugWindow,
+    pointer_id: u32,
+    client: [i32; 2],
+    points: egui::Pos2,
+) {
     if touch_debug_enabled() {
         crate::logger::log(format!(
-            "[TOUCH-DEBUG] native presenter pointer_id={} client=({},{}) points=({:.2},{:.2})",
-            pointer_id, client[0], client[1], points.x, points.y,
+            "[TOUCH-DEBUG] native {} pointer_id={} client=({},{}) points=({:.2},{:.2})",
+            window.label(),
+            pointer_id,
+            client[0],
+            client[1],
+            points.x,
+            points.y,
         ));
     }
 }
 
 #[cfg(windows)]
-pub(crate) fn log_native_touch_command(command: &crate::touch_input::TouchCommand) {
+pub(crate) fn log_native_touch_command(
+    window: TouchDebugWindow,
+    command: &crate::touch_input::TouchCommand,
+) {
     if touch_debug_enabled() {
         crate::logger::log(format!(
-            "[TOUCH-DEBUG] native presenter command={command:?}"
+            "[TOUCH-DEBUG] native {} command={command:?}",
+            window.label(),
         ));
     }
 }
 
 #[cfg(windows)]
-pub(crate) fn log_native_touch_mouse_discard(msg: u32) {
+pub(crate) fn log_native_touch_mouse_discard(window: TouchDebugWindow, msg: u32) {
     if touch_debug_enabled() {
         crate::logger::log(format!(
-            "[TOUCH-DEBUG] native presenter mouse_discarded msg=0x{msg:04x} source=IMDT_TOUCH"
+            "[TOUCH-DEBUG] native {} mouse_discarded msg=0x{msg:04x} source=IMDT_TOUCH",
+            window.label(),
         ));
     }
 }

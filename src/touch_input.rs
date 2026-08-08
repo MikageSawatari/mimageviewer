@@ -234,6 +234,12 @@ impl Default for TouchRecognizer {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TouchStartPolicy {
+    ClassifyGeometry,
+    WidgetPassthrough,
+}
+
 impl TouchRecognizer {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -262,6 +268,30 @@ impl TouchRecognizer {
         geom: &TapZoneGeometry,
         sample: TouchSample,
     ) -> Vec<TouchCommand> {
+        self.handle_sample_with_start_policy(geom, sample, TouchStartPolicy::ClassifyGeometry)
+    }
+
+    /// Handles a contact delivered by a window whose OS hit-test has already
+    /// established widget ownership.
+    ///
+    /// Unlike [`Self::handle_sample`], the first contact bypasses
+    /// [`classify_tap`] entirely. This is used by the native video HUD HWND:
+    /// receiving the pointer there is itself the authoritative hit-test, so a
+    /// presenter-side approximation must not reclassify it as a viewer tap.
+    pub(crate) fn handle_widget_passthrough_sample(
+        &mut self,
+        geom: &TapZoneGeometry,
+        sample: TouchSample,
+    ) -> Vec<TouchCommand> {
+        self.handle_sample_with_start_policy(geom, sample, TouchStartPolicy::WidgetPassthrough)
+    }
+
+    fn handle_sample_with_start_policy(
+        &mut self,
+        geom: &TapZoneGeometry,
+        sample: TouchSample,
+        start_policy: TouchStartPolicy,
+    ) -> Vec<TouchCommand> {
         if sample.phase == TouchPhase::Cancel {
             self.contacts.clear();
             self.pinch_frame = None;
@@ -272,19 +302,29 @@ impl TouchRecognizer {
         }
 
         match sample.phase {
-            TouchPhase::Start => self.handle_start(geom, sample),
+            TouchPhase::Start => self.handle_start(geom, sample, start_policy),
             TouchPhase::Move => self.handle_move(geom, sample),
             TouchPhase::End => self.handle_end(geom, sample),
             TouchPhase::Cancel => unreachable!(),
         }
     }
 
-    fn handle_start(&mut self, geom: &TapZoneGeometry, sample: TouchSample) -> Vec<TouchCommand> {
+    fn handle_start(
+        &mut self,
+        geom: &TapZoneGeometry,
+        sample: TouchSample,
+        start_policy: TouchStartPolicy,
+    ) -> Vec<TouchCommand> {
         if self.contacts.is_empty() {
-            self.owner = if classify_tap(geom, sample.pos) == TapZone::Excluded {
-                TouchOwner::WidgetPassthrough
-            } else {
-                TouchOwner::Undecided
+            self.owner = match start_policy {
+                TouchStartPolicy::ClassifyGeometry => {
+                    if classify_tap(geom, sample.pos) == TapZone::Excluded {
+                        TouchOwner::WidgetPassthrough
+                    } else {
+                        TouchOwner::Undecided
+                    }
+                }
+                TouchStartPolicy::WidgetPassthrough => TouchOwner::WidgetPassthrough,
             };
             self.pinch_frame = None;
             self.grid_scroll_contact_id = None;

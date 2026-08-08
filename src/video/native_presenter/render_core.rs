@@ -4032,19 +4032,28 @@ impl NativeEguiOverlay {
         &mut self,
         touch: crate::video::native_window::NativeVideoTouchEvent,
     ) {
+        let debug_window = match touch.source {
+            crate::video::native_window::NativeVideoWindowSource::Presenter => {
+                crate::touch_debug::TouchDebugWindow::Presenter
+            }
+            crate::video::native_window::NativeVideoWindowSource::Hud => {
+                crate::touch_debug::TouchDebugWindow::Hud
+            }
+        };
         let geometry = self.native_touch_geometry();
         let now_ms = self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let output =
             self.native_touch
                 .handle_event(touch, &geometry, now_ms, self.pixels_per_point);
         crate::touch_debug::log_native_touch_coordinates(
+            debug_window,
             touch.pointer_id,
             [touch.x, touch.y],
             output.pos,
         );
         self.enqueue_native_pointer_events(output.egui_events);
         for command in self.native_touch.take_commands() {
-            crate::touch_debug::log_native_touch_command(&command);
+            crate::touch_debug::log_native_touch_command(debug_window, &command);
             if crate::video::native_touch::native_touch_command_toggles_chrome(command) {
                 self.native_touch.toggle_chrome();
             }

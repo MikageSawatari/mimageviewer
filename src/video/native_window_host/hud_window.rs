@@ -8,11 +8,13 @@
 //! 維持しつつ、VST z-order 操作後に `HWND_TOPMOST` で後勝ち再アサートすることで
 //! HUD を VST より前に出す。
 //!
-//! ## 入力モデル (2 層)
+//! ## 入力モデル (3 層)
 //!
 //! - **Mouse** は HUD wndproc が region 内で受けて bounded event route に流す。region 外は
 //!   `SetWindowRgn` で物理的に「存在しない」領域として穴を開けているので、OS が
 //!   下層 (VST or presenter) に直接 mouse を配送する (= クロスプロセスでも安定)。
+//! - **Touch** は HUD に届いた `PT_TOUCH` stream 全体を HWND ごとの bounded set で
+//!   所有し、同じ overlay adapter へ送る。OS hit-test 済みなので常に widget passthrough。
 //! - **Keyboard / IME** は HUD では受けない (`WS_EX_NOACTIVATE` で focus を取らない)。
 //!   presenter HWND の既存 wndproc で受けて `NativeEguiOverlay` に流す。
 //!
@@ -40,8 +42,8 @@
 //!      で egui の `pointer.any_down()` が stuck しないようにする
 //! - `WM_*BUTTONUP`: ReleaseCapture + held_buttons clear。
 //! - `WM_CAPTURECHANGED` / `WM_CANCELMODE` / `WM_DESTROY`: held_buttons に残っている
-//!   ボタンの synthetic up を補完してから DefWindowProc (= `pointer.any_down()` の
-//!   stuck を防ぐ)。
+//!   ボタンの synthetic up と、HUD が所有する touch stream の Cancel を補完してから
+//!   DefWindowProc (= `pointer.any_down()` の stuck を防ぐ)。
 //! - `WM_MOUSEACTIVATE`: `MA_NOACTIVATE` を返す。
 //! - `WM_NCHITTEST`: regions に含まれれば `HTCLIENT`、それ以外は `HTTRANSPARENT`
 //!   (region 外は `SetWindowRgn` で穴になっているため通常メッセージは来ないが念のため)。
@@ -78,10 +80,12 @@ use windows::core::PCWSTR;
 use windows::core::w;
 
 use crate::touch_debug::{TouchDebugWindow, log_win32_message};
+use crate::video::native_touch::NativeTouchOwnership;
 use crate::video::native_window::{
     NativeCursorOwnershipEdge, NativeVideoKeyEvent, NativeVideoMouseButton,
     NativeVideoMouseButtonEvent, NativeVideoMouseEvent, NativeVideoMouseWheelEvent,
-    NativeVideoWindowEvent, NativeVideoWindowEventSink,
+    NativeVideoWindowEvent, NativeVideoWindowEventSink, NativeVideoWindowSource,
+    cancel_hud_touch_streams, handle_hud_pointer_message, should_discard_promoted_touch_mouse,
 };
 
 /// HUD overlay HWND の生成設定。
@@ -168,6 +172,7 @@ impl HudOverlayWindow {
                 event_sink: cfg.event_sink,
                 regions: cfg.regions,
                 held_buttons: 0,
+                touch_ownership: NativeTouchOwnership::default(),
                 mouse_tracking: false,
                 last_mouse_move_log_at: None,
             });
@@ -389,6 +394,8 @@ struct WindowState {
     /// 現在押下中のマウスボタン (`BTN_*` の OR)。`WM_CAPTURECHANGED` 等で残っていたら
     /// synthetic up を補完する。
     held_buttons: u8,
+    /// Whole-stream `PT_TOUCH` ownership scoped to this HUD HWND.
+    touch_ownership: NativeTouchOwnership,
     /// `TrackMouseEvent(TME_LEAVE)` 登録済みフラグ。
     mouse_tracking: bool,
     /// CP9 実機 debug: HUD wndproc が WM_MOUSEMOVE を log した直近時刻。100ms 周期で
@@ -650,6 +657,20 @@ fn emit_synthetic_button_cleanup(state: &mut WindowState) {
     state.mouse_tracking = false;
 }
 
+/// Ends both input transports at the HUD HWND lifecycle boundary.
+///
+/// Mouse capture cleanup synthesizes missing button-up events; touch cleanup
+/// emits Cancel for every owned stream before releasing the per-HWND set.
+fn emit_input_cleanup(state: &mut WindowState) {
+    let WindowState {
+        event_sink,
+        touch_ownership,
+        ..
+    } = state;
+    cancel_hud_touch_streams(touch_ownership, event_sink);
+    emit_synthetic_button_cleanup(state);
+}
+
 fn window_state(hwnd: HWND) -> Option<&'static mut WindowState> {
     let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
     if ptr.is_null() {
@@ -666,6 +687,18 @@ unsafe extern "system" fn hud_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     log_win32_message(TouchDebugWindow::Hud, hwnd, msg, wparam, lparam);
+    if let Some(state) = window_state(hwnd) {
+        let WindowState {
+            event_sink,
+            touch_ownership,
+            ..
+        } = state;
+        if let Some(result) =
+            handle_hud_pointer_message(hwnd, msg, wparam, touch_ownership, event_sink)
+        {
+            return result;
+        }
+    }
     match msg {
         WM_NCCREATE => {
             let createstruct = lparam.0 as *const CREATESTRUCTW;
@@ -717,6 +750,9 @@ unsafe extern "system" fn hud_wnd_proc(
         }
 
         WM_MOUSEMOVE => {
+            if should_discard_promoted_touch_mouse(msg, NativeVideoWindowSource::Hud) {
+                return LRESULT(0);
+            }
             if let Some(state) = window_state(hwnd) {
                 // `WM_MOUSEMOVE` ではここで cursor を復帰しない。navigation preview の HUD
                 // 全画面化で「カーソル下の window」が presenter HWND ⇄ HUD HWND に切り替わると、
@@ -760,6 +796,9 @@ unsafe extern "system" fn hud_wnd_proc(
         }
 
         WM_MOUSEWHEEL => {
+            if should_discard_promoted_touch_mouse(msg, NativeVideoWindowSource::Hud) {
+                return LRESULT(0);
+            }
             if let Some(state) = window_state(hwnd) {
                 // WM_MOUSEWHEEL は screen coordinates。client に変換。
                 let mut pt = POINT {
@@ -785,13 +824,23 @@ unsafe extern "system" fn hud_wnd_proc(
         }
 
         WM_MOUSELEAVE => {
+            // Sending this message already consumed the HWND's `TME_LEAVE`
+            // registration, so the mirror must be cleared before any policy
+            // that can return early. `track_mouse_leave` skips re-registration
+            // while the flag is set, so a discarded leave would otherwise stop
+            // every later leave for the life of this HWND.
+            if let Some(state) = window_state(hwnd) {
+                state.mouse_tracking = false;
+            }
+            if should_discard_promoted_touch_mouse(msg, NativeVideoWindowSource::Hud) {
+                return LRESULT(0);
+            }
             if super::hud_debug_enabled() {
                 crate::logger::log(
                     "[HUD-DEBUG] WM_MOUSELEAVE (ignored, not forwarded)".to_string(),
                 );
             }
             if let Some(state) = window_state(hwnd) {
-                state.mouse_tracking = false;
                 state
                     .event_sink
                     .send(NativeVideoWindowEvent::CursorOwnership(
@@ -815,6 +864,9 @@ unsafe extern "system" fn hud_wnd_proc(
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONUP
         | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MBUTTONDBLCLK | WM_XBUTTONDOWN
         | WM_XBUTTONUP | WM_XBUTTONDBLCLK => {
+            if should_discard_promoted_touch_mouse(msg, NativeVideoWindowSource::Hud) {
+                return LRESULT(0);
+            }
             if let Some(state) = window_state(hwnd) {
                 let (button, bit) = button_bit_for_msg(msg, wparam);
                 let down = mouse_message_is_down(msg);
@@ -947,7 +999,7 @@ unsafe extern "system" fn hud_wnd_proc(
                     .send(NativeVideoWindowEvent::CursorOwnership(
                         NativeCursorOwnershipEdge::CaptureLost,
                     ));
-                emit_synthetic_button_cleanup(state);
+                emit_input_cleanup(state);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -1002,15 +1054,15 @@ unsafe extern "system" fn hud_wnd_proc(
         }
 
         WM_DESTROY => {
-            // capture 中だったボタンの synthetic up を補完してから state を残す
-            // (`WM_NCDESTROY` で Box drop)。
+            // capture 中だったボタンの synthetic up と touch Cancel を補完してから
+            // state を残す (`WM_NCDESTROY` で Box drop)。
             if let Some(state) = window_state(hwnd) {
                 state
                     .event_sink
                     .send(NativeVideoWindowEvent::CursorOwnership(
                         NativeCursorOwnershipEdge::Leave,
                     ));
-                emit_synthetic_button_cleanup(state);
+                emit_input_cleanup(state);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -1019,6 +1071,7 @@ unsafe extern "system" fn hud_wnd_proc(
             let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
             if !ptr.is_null() {
                 unsafe {
+                    emit_input_cleanup(&mut *ptr);
                     let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                     let _ = Box::from_raw(ptr);
                 }
