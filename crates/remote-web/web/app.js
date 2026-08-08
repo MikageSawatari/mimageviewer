@@ -8809,13 +8809,36 @@ export class ImageViewer {
     this.setPageLayerSize(layout.cssWidth, layout.cssHeight);
     image.dataset.sourceWidth = String(info.width);
     image.dataset.sourceHeight = String(info.height);
-    this.stage.scrollTop = 0;
-    this.stage.scrollLeft = 0;
+    // 始点を決めるのは placeInitialStageScroll の役目。ここで 0 に戻すと、原寸の
+    // 中央寄せを毎回打ち消す。
+    this.placeInitialStageScroll();
   }
 
   setPageLayerSize(width, height) {
     this.pageLayer.style.width = `${Math.max(1, Number(width) || 1)}px`;
     this.pageLayer.style.height = `${Math.max(1, Number(height) || 1)}px`;
+    this.placeInitialStageScroll();
+  }
+
+  /// 新しい配置を入れた直後に、どこから見せ始めるか。
+  ///
+  /// 原寸は内容が画面より大きいので、始点を決める必要がある。本体アプリはページ中央から
+  /// 見せるので合わせる。左上は余白であることが多く、実用でも中央のほうが良い。
+  /// 他のモードは従来どおり先頭から見せる (はみ出すのが縦だけなので始点の選択が要らない)。
+  placeInitialStageScroll() {
+    if (this.fitMode !== FitMode.ORIGINAL) {
+      this.stage.scrollTop = 0;
+      this.stage.scrollLeft = 0;
+      return;
+    }
+    this.stage.scrollLeft = Math.max(
+      0,
+      (this.stage.scrollWidth - this.stage.clientWidth) / 2
+    );
+    this.stage.scrollTop = Math.max(
+      0,
+      (this.stage.scrollHeight - this.stage.clientHeight) / 2
+    );
   }
 
   refitVisibleContent(
