@@ -161,6 +161,14 @@ textarea {
   font: inherit;
 }
 
+/* `#app` にも宣言してあるが、この repo の tap 対象は例外なく自分自身にも宣言している
+   (button / .grid-tile / .viewer-button …)。祖先の宣言だけでは double-tap zoom が
+   残るため、native の選択部品も同じ扱いにする。文字入力の選択操作とは事情が違うので
+   input / textarea へは広げない。 */
+select {
+  touch-action: manipulation;
+}
+
 #telemetry-hud {
   position: fixed;
   z-index: 100;
@@ -332,6 +340,7 @@ textarea {
   min-height: 46px;
   align-items: center;
   gap: 12px;
+  touch-action: manipulation;
   padding: 6px max(16px, env(safe-area-inset-right)) 6px
     max(16px, env(safe-area-inset-left));
   border-bottom: 1px solid rgb(255 255 255 / 8%);

@@ -559,6 +559,9 @@ test("sorting hands the bar back, and form controls keep the page typography", a
   );
   // iOS は 16px 未満のフォーム部品に focus すると画面全体を拡大する。
   assert.match(css, /(?:^|\n)select,\ninput,\ntextarea\s*\{[^}]*font:\s*inherit/);
+  // tap 対象は祖先だけでなく自分自身にも宣言する、というこの repo の決まりに従う。
+  assert.match(css, /(?:^|\n)select\s*\{[^}]*touch-action:\s*manipulation/);
+  assert.match(css, /\.grid-sort-bar\s*\{[^}]*touch-action:\s*manipulation/);
 });
 
 async function pngDimensions(relativePath) {
