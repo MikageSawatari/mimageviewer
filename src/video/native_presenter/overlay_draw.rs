@@ -1429,30 +1429,78 @@ fn native_video_touch_help_shows_scaling_hint(ui_scale: f32) -> bool {
     (crate::settings::normalize_ui_scale_factor(ui_scale) - 1.0).abs() < f32::EPSILON
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NativeVideoTouchFirstRunHelpLayout {
+    full_rect: egui::Rect,
+    left_half: egui::Rect,
+    right_half: egui::Rect,
+    center_tap_rect: egui::Rect,
+    /// Where each side label is centred. This is the middle of the strip the
+    /// label describes, not of the screen half: a half is centred at 25% / 75%
+    /// while the centre rectangle starts at 34%, so a label placed there runs
+    /// under the rectangle at ordinary widths.
+    left_label_x: f32,
+    right_label_x: f32,
+}
+
+fn native_video_touch_first_run_help_layout(
+    full_rect: egui::Rect,
+) -> NativeVideoTouchFirstRunHelpLayout {
+    let center_tap_rect = crate::touch_input::center_tap_rect(full_rect);
+    NativeVideoTouchFirstRunHelpLayout {
+        full_rect,
+        left_half: egui::Rect::from_min_max(
+            full_rect.min,
+            egui::pos2(full_rect.center().x, full_rect.max.y),
+        ),
+        right_half: egui::Rect::from_min_max(
+            egui::pos2(full_rect.center().x, full_rect.min.y),
+            full_rect.max,
+        ),
+        center_tap_rect,
+        left_label_x: (full_rect.min.x + center_tap_rect.min.x) * 0.5,
+        right_label_x: (center_tap_rect.max.x + full_rect.max.x) * 0.5,
+    }
+}
+
 fn paint_native_video_touch_first_run_help(
     painter: &egui::Painter,
     full_rect: egui::Rect,
     show_scaling_hint: bool,
 ) {
-    let halves = [
-        egui::Rect::from_min_max(full_rect.min, full_rect.center_bottom()),
-        egui::Rect::from_min_max(full_rect.center_top(), full_rect.max),
-    ];
-    painter.rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(184));
-    for half in halves {
+    let layout = native_video_touch_first_run_help_layout(full_rect);
+    painter.rect_filled(
+        layout.full_rect,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 178),
+    );
+    for side in [layout.left_half, layout.right_half] {
         painter.rect_filled(
-            half,
+            side,
             0.0,
-            egui::Color32::from_rgba_unmultiplied(54, 100, 132, 62),
+            egui::Color32::from_rgba_unmultiplied(54, 90, 132, 58),
         );
     }
-    for (half, title, detail) in [
-        (halves[0], "左をダブルタップ", "5 秒戻る"),
-        (halves[1], "右をダブルタップ", "5 秒進む"),
+    painter.rect_filled(
+        layout.center_tap_rect,
+        8.0,
+        egui::Color32::from_rgba_unmultiplied(45, 112, 185, 128),
+    );
+    painter.rect_stroke(
+        layout.center_tap_rect,
+        8.0,
+        egui::Stroke::new(3.0, egui::Color32::from_rgb(170, 218, 255)),
+        egui::StrokeKind::Inside,
+    );
+
+    let label_y = layout.center_tap_rect.center().y;
+    for (label_x, title, detail) in [
+        (layout.left_label_x, "左をタップ", "5 秒戻る"),
+        (layout.right_label_x, "右をタップ", "5 秒進む"),
     ] {
-        paint_native_video_touch_side_label(painter, half, title, detail);
+        paint_native_video_touch_side_label(painter, egui::pos2(label_x, label_y), title, detail);
     }
-    paint_native_video_touch_tap_panel(painter, full_rect);
+    paint_native_video_touch_center_label(painter, layout.center_tap_rect);
     if show_scaling_hint {
         paint_native_video_touch_scaling_hint(painter, full_rect);
     }
@@ -1460,19 +1508,19 @@ fn paint_native_video_touch_first_run_help(
 
 fn paint_native_video_touch_side_label(
     painter: &egui::Painter,
-    half: egui::Rect,
+    center: egui::Pos2,
     title: &str,
     detail: &str,
 ) {
     painter.text(
-        half.center() - egui::vec2(0.0, 18.0),
+        center - egui::vec2(0.0, 18.0),
         egui::Align2::CENTER_CENTER,
         title,
         egui::FontId::proportional(19.0),
         egui::Color32::WHITE,
     );
     painter.text(
-        half.center() + egui::vec2(0.0, 12.0),
+        center + egui::vec2(0.0, 12.0),
         egui::Align2::CENTER_CENTER,
         detail,
         egui::FontId::proportional(14.0),
@@ -1480,21 +1528,20 @@ fn paint_native_video_touch_side_label(
     );
 }
 
-fn paint_native_video_touch_tap_panel(painter: &egui::Painter, full_rect: egui::Rect) {
-    let tap_panel = egui::Rect::from_center_size(
-        egui::pos2(
-            full_rect.center().x,
-            full_rect.min.y + full_rect.height() * 0.30,
-        ),
-        egui::vec2(full_rect.width().min(360.0), 70.0),
-    );
-    painter.rect_filled(tap_panel, 8.0, egui::Color32::from_rgb(35, 92, 148));
+fn paint_native_video_touch_center_label(painter: &egui::Painter, center_rect: egui::Rect) {
     painter.text(
-        tap_panel.center(),
+        center_rect.center() - egui::vec2(0.0, 12.0),
         egui::Align2::CENTER_CENTER,
-        "画面をタップ  /  HUD を表示",
+        "中央をタップ",
         egui::FontId::proportional(18.0),
         egui::Color32::WHITE,
+    );
+    painter.text(
+        center_rect.center() + egui::vec2(0.0, 14.0),
+        egui::Align2::CENTER_CENTER,
+        "HUD を表示 / 非表示",
+        egui::FontId::proportional(14.0),
+        egui::Color32::from_gray(224),
     );
 }
 
@@ -3011,6 +3058,49 @@ mod ring_guide_tests {
 
         assert!((rect.center().x - 200.0).abs() < 0.01, "{rect:?}");
         assert!((rect.center().y - 100.0).abs() < 0.01, "{rect:?}");
+    }
+
+    #[test]
+    fn native_video_touch_help_uses_the_shared_center_tap_rectangle() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(1200.0, 800.0));
+        let layout = native_video_touch_first_run_help_layout(viewport);
+
+        assert_eq!(
+            layout.center_tap_rect,
+            crate::touch_input::center_tap_rect(viewport)
+        );
+    }
+
+    /// The side labels must sit in the strip they describe. Centring them in
+    /// the screen half puts them under the centre rectangle, because a half is
+    /// centred at 25% / 75% and the rectangle already starts at 34%.
+    #[test]
+    fn native_video_touch_help_side_labels_stay_clear_of_the_centre_rectangle() {
+        for width in [480.0_f32, 800.0, 1200.0, 3840.0] {
+            let viewport =
+                egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(width, 800.0));
+            let layout = native_video_touch_first_run_help_layout(viewport);
+
+            assert!(
+                layout.left_label_x < layout.center_tap_rect.min.x,
+                "left label at {} runs into the centre rect starting at {} (width {width})",
+                layout.left_label_x,
+                layout.center_tap_rect.min.x,
+            );
+            assert!(
+                layout.right_label_x > layout.center_tap_rect.max.x,
+                "right label at {} runs into the centre rect ending at {} (width {width})",
+                layout.right_label_x,
+                layout.center_tap_rect.max.x,
+            );
+            // Each label is the midpoint of its own strip, so it has the same
+            // room on both sides as the strip allows.
+            let left_room = layout.left_label_x - viewport.min.x;
+            assert!(
+                (left_room - (layout.center_tap_rect.min.x - layout.left_label_x)).abs() < 0.01,
+                "left label is not centred in its strip (width {width})",
+            );
+        }
     }
 }
 

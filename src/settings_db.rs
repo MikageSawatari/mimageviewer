@@ -3100,22 +3100,22 @@ mod tests {
     }
 
     #[test]
-    fn missing_touch_center_chrome_learned_does_not_quarantine() {
+    fn missing_touch_chrome_learned_flags_do_not_quarantine() {
         let guard = DataDirOverrideGuard::new();
         let db = SettingsDb::create_new(guard.path()).unwrap();
         db.save_full(&Settings::default()).unwrap();
         drop(db);
         let conn = Connection::open(guard.path().join("settings.db")).unwrap();
-        conn.execute(
-            "DELETE FROM settings_kv WHERE key = ?1",
-            ["touch_center_chrome_learned"],
-        )
-        .unwrap();
+        for key in ["touch_still_chrome_learned", "touch_video_chrome_learned"] {
+            conn.execute("DELETE FROM settings_kv WHERE key = ?1", [key])
+                .unwrap();
+        }
         drop(conn);
 
         let outcome = boot_settings_db(guard.path());
         assert_eq!(outcome.source, BootSource::LoadedExistingDb);
-        assert!(!outcome.settings.touch_center_chrome_learned);
+        assert!(!outcome.settings.touch_still_chrome_learned);
+        assert!(!outcome.settings.touch_video_chrome_learned);
         assert!(
             !std::fs::read_dir(guard.path())
                 .unwrap()
@@ -3125,13 +3125,23 @@ mod tests {
     }
 
     #[test]
-    fn touch_center_chrome_learned_roundtrips_through_settings_db() {
+    fn touch_chrome_learned_flags_roundtrip_independently() {
         let db = SettingsDb::open_in_memory_for_test().unwrap();
         let mut settings = Settings::default();
-        settings.touch_center_chrome_learned = true;
+        settings.touch_still_chrome_learned = true;
         db.save_full(&settings).unwrap();
 
-        assert!(db.load_into_settings().unwrap().touch_center_chrome_learned);
+        let loaded = db.load_into_settings().unwrap();
+        assert!(loaded.touch_still_chrome_learned);
+        assert!(!loaded.touch_video_chrome_learned);
+
+        settings.touch_still_chrome_learned = false;
+        settings.touch_video_chrome_learned = true;
+        db.save_full(&settings).unwrap();
+
+        let loaded = db.load_into_settings().unwrap();
+        assert!(!loaded.touch_still_chrome_learned);
+        assert!(loaded.touch_video_chrome_learned);
     }
 
     #[test]

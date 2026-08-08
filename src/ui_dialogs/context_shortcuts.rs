@@ -71,12 +71,16 @@ const FS_IMAGE_TOUCH_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
 
 const FS_VIDEO_TOUCH_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     FixedShortcutRow {
-        keys: "タップ",
+        keys: "中央をタップ",
         description: "HUD を表示 / 非表示にする",
     },
     FixedShortcutRow {
-        keys: "左 / 右をダブルタップ",
-        description: "5 秒戻る / 進む",
+        keys: "左をタップ",
+        description: "5 秒戻る",
+    },
+    FixedShortcutRow {
+        keys: "右をタップ",
+        description: "5 秒進む",
     },
 ];
 
@@ -610,8 +614,10 @@ mod tests {
         assert!(rows.iter().any(|row| row.keys == "中央をタップ"));
         assert!(ShortcutHelpContext::Grid.touch_rows(false).is_empty());
         let video_rows = ShortcutHelpContext::FsVideo.touch_rows(true);
-        assert_eq!(video_rows.len(), 2);
-        assert!(video_rows.iter().any(|row| row.keys == "タップ"));
+        assert_eq!(video_rows.len(), 3);
+        assert!(video_rows.iter().any(|row| row.keys == "中央をタップ"));
+        assert!(video_rows.iter().any(|row| row.keys == "左をタップ"));
+        assert!(video_rows.iter().any(|row| row.keys == "右をタップ"));
         assert!(ShortcutHelpContext::FsVideo.touch_rows(false).is_empty());
     }
 }

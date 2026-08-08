@@ -705,7 +705,7 @@ pub struct NativeOverlayMetadata {
     pub deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot,
     /// 再生中に一度でもインターレースが検出されたか (latched、動的)。
     pub interlace_detected: bool,
-    pub touch_center_chrome_learned: bool,
+    pub touch_video_chrome_learned: bool,
     pub shortcuts: NativeOverlayShortcutLabels,
     pub shortcut_help: Arc<NativeOverlayShortcutHelp>,
 }
@@ -4641,7 +4641,7 @@ impl NativeEguiOverlay {
     fn set_metadata(&mut self, metadata: Option<NativeOverlayMetadata>) {
         let learned_snapshot = metadata
             .as_ref()
-            .map(|metadata| metadata.touch_center_chrome_learned);
+            .map(|metadata| metadata.touch_video_chrome_learned);
         let touch_changed = self
             .native_touch
             .configure_video_gestures(!self.audio_only, learned_snapshot);
@@ -4787,7 +4787,7 @@ impl NativeEguiOverlay {
         let learned_snapshot = self
             .video_metadata
             .as_ref()
-            .map(|metadata| metadata.touch_center_chrome_learned);
+            .map(|metadata| metadata.touch_video_chrome_learned);
         self.native_touch
             .configure_video_gestures(!audio_only, learned_snapshot);
         self.dirty = true;

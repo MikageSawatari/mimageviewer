@@ -4,9 +4,7 @@ use crate::touch_input::{
 
 pub(crate) const MAX_OWNED_TOUCH_POINTERS: usize = 16;
 const PRIMARY_CANCEL_DISTANCE_POINTS: f32 = 1024.0;
-const VIDEO_DOUBLE_TAP_MAX_INTERVAL_MS: u64 = 500;
-const VIDEO_DOUBLE_TAP_MAX_DISTANCE_POINTS: f32 = 48.0;
-pub(crate) const VIDEO_DOUBLE_TAP_SEEK_SECS: f64 = 5.0;
+pub(crate) const VIDEO_TAP_SEEK_SECS: f64 = 5.0;
 
 /// Native HWND that originated a video-overlay input stream.
 ///
@@ -265,7 +263,9 @@ pub(crate) fn native_pointer_screen_pixels_to_points(
     )
 }
 
-pub(crate) fn native_touch_command_toggles_chrome(command: TouchCommand) -> bool {
+pub(crate) fn native_touch_command_toggles_chrome_without_video_gestures(
+    command: TouchCommand,
+) -> bool {
     matches!(
         command,
         TouchCommand::ToggleChrome | TouchCommand::PageSide { .. }
@@ -292,17 +292,10 @@ impl PhysicalTapSide {
 
     fn seek_delta_secs(self) -> f64 {
         match self {
-            Self::Left => -VIDEO_DOUBLE_TAP_SEEK_SECS,
-            Self::Right => VIDEO_DOUBLE_TAP_SEEK_SECS,
+            Self::Left => -VIDEO_TAP_SEEK_SECS,
+            Self::Right => VIDEO_TAP_SEEK_SECS,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct DoubleTapRun {
-    side: PhysicalTapSide,
-    last_tap_ms: u64,
-    last_pos: egui::Pos2,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -386,7 +379,6 @@ pub(crate) struct NativeTouchAdapter {
     pending_commands: Vec<NativeVideoTouchCommand>,
     chrome_latched: bool,
     video_gestures_enabled: bool,
-    double_tap_run: Option<DoubleTapRun>,
     learning_state: TouchLearningState,
     first_run_help_phase: Option<FirstRunHelpPhase>,
 }
@@ -402,7 +394,6 @@ impl Default for NativeTouchAdapter {
             pending_commands: Vec::new(),
             chrome_latched: false,
             video_gestures_enabled: true,
-            double_tap_run: None,
             learning_state: TouchLearningState::Unknown,
             first_run_help_phase: None,
         }
@@ -431,7 +422,6 @@ impl NativeTouchAdapter {
         let was_visible = self.first_run_help_visible();
         if self.video_gestures_enabled != enabled {
             self.video_gestures_enabled = enabled;
-            self.double_tap_run = None;
             self.first_run_help_phase = None;
         }
         if enabled {
@@ -458,16 +448,12 @@ impl NativeTouchAdapter {
     ) -> NativeTouchAdapterOutput {
         let pos = native_client_pixels_to_points([event.x, event.y], pixels_per_point);
         if event.phase == NativeVideoTouchPhase::Start {
-            if event.source == NativeVideoWindowSource::Hud {
-                self.double_tap_run = None;
-            }
             if self.video_gestures_enabled
                 && self.learning_state == TouchLearningState::Unlearned
                 && self.first_run_help_phase.is_none()
                 && !self.recognizer.is_active()
             {
                 self.first_run_help_phase = Some(FirstRunHelpPhase::AwaitingInitialRelease);
-                self.double_tap_run = None;
             }
         }
         if event.phase == NativeVideoTouchPhase::Start
@@ -503,7 +489,7 @@ impl NativeTouchAdapter {
                 .recognizer
                 .handle_widget_passthrough_sample(geometry, sample),
         };
-        self.consume_touch_commands(commands, pos, now_ms);
+        self.consume_touch_commands(commands);
 
         let suppress_primary = self.recognizer.should_suppress_primary();
         let mut egui_events = Vec::new();
@@ -565,12 +551,7 @@ impl NativeTouchAdapter {
         NativeTouchAdapterOutput { pos, egui_events }
     }
 
-    fn consume_touch_commands(
-        &mut self,
-        commands: Vec<TouchCommand>,
-        pos: egui::Pos2,
-        now_ms: u64,
-    ) {
+    fn consume_touch_commands(&mut self, commands: Vec<TouchCommand>) {
         if let Some(phase) = self.first_run_help_phase {
             if phase == FirstRunHelpPhase::Ready
                 && commands.iter().any(|command| {
@@ -582,7 +563,6 @@ impl NativeTouchAdapter {
             {
                 self.learning_state = TouchLearningState::Learned;
                 self.first_run_help_phase = None;
-                self.double_tap_run = None;
                 self.pending_commands
                     .push(NativeVideoTouchCommand::LearnAndShowChrome);
             } else if phase == FirstRunHelpPhase::AwaitingInitialRelease
@@ -597,40 +577,20 @@ impl NativeTouchAdapter {
             match command {
                 TouchCommand::PageSide { left } if self.video_gestures_enabled => {
                     let side = PhysicalTapSide::from_left(left);
-                    let continues_run = self.double_tap_run.is_some_and(|run| {
-                        run.side == side
-                            && now_ms.saturating_sub(run.last_tap_ms)
-                                <= VIDEO_DOUBLE_TAP_MAX_INTERVAL_MS
-                            && run.last_pos.distance(pos) <= VIDEO_DOUBLE_TAP_MAX_DISTANCE_POINTS
-                    });
-                    self.double_tap_run = Some(DoubleTapRun {
-                        side,
-                        last_tap_ms: now_ms,
-                        last_pos: pos,
-                    });
-                    if continues_run {
-                        self.pending_commands
-                            .push(NativeVideoTouchCommand::SeekRelative {
-                                delta_secs: side.seek_delta_secs(),
-                            });
-                    } else {
-                        self.pending_commands
-                            .push(NativeVideoTouchCommand::ToggleChrome);
-                    }
+                    self.pending_commands
+                        .push(NativeVideoTouchCommand::SeekRelative {
+                            delta_secs: side.seek_delta_secs(),
+                        });
                 }
                 TouchCommand::ToggleChrome => {
-                    self.double_tap_run = None;
                     self.pending_commands
                         .push(NativeVideoTouchCommand::ToggleChrome);
                 }
-                command if native_touch_command_toggles_chrome(command) => {
-                    self.double_tap_run = None;
+                command if native_touch_command_toggles_chrome_without_video_gestures(command) => {
                     self.pending_commands
                         .push(NativeVideoTouchCommand::ToggleChrome);
                 }
-                _ => {
-                    self.double_tap_run = None;
-                }
+                _ => {}
             }
         }
     }
@@ -693,7 +653,6 @@ impl NativeTouchAdapter {
             || self.primary_pressed
             || self.recognizer.is_active()
             || !self.pending_commands.is_empty()
-            || self.double_tap_run.is_some()
             || self.first_run_help_phase.is_some();
         let mut egui_events = Vec::new();
         self.cancel_primary_press(
@@ -992,11 +951,11 @@ mod tests {
     }
 
     #[test]
-    fn both_tap_commands_map_to_chrome_toggle() {
-        assert!(native_touch_command_toggles_chrome(
+    fn center_and_audio_only_side_commands_map_to_chrome_toggle() {
+        assert!(native_touch_command_toggles_chrome_without_video_gestures(
             TouchCommand::ToggleChrome
         ));
-        assert!(native_touch_command_toggles_chrome(
+        assert!(native_touch_command_toggles_chrome_without_video_gestures(
             TouchCommand::PageSide { left: true }
         ));
     }
@@ -1277,89 +1236,38 @@ mod tests {
     }
 
     #[test]
-    fn first_side_tap_toggles_immediately_and_second_nearby_tap_seeks() {
+    fn side_taps_seek_once_without_changing_chrome_latch() {
+        for chrome_visible in [false, true] {
+            for (x, delta_secs) in [(100, -VIDEO_TAP_SEEK_SECS), (900, VIDEO_TAP_SEEK_SECS)] {
+                let mut adapter = NativeTouchAdapter::default();
+                if chrome_visible {
+                    adapter.show_chrome();
+                }
+
+                assert_eq!(
+                    tap(&mut adapter, event, 1, x, 400, 0),
+                    vec![NativeVideoTouchCommand::SeekRelative { delta_secs }]
+                );
+                assert_eq!(adapter.chrome_latched(), chrome_visible);
+            }
+        }
+    }
+
+    #[test]
+    fn every_repeated_side_tap_emits_exactly_one_seek() {
         let mut adapter = NativeTouchAdapter::default();
-        assert_eq!(
-            tap(&mut adapter, event, 1, 100, 400, 0),
-            vec![NativeVideoTouchCommand::ToggleChrome]
-        );
-        assert_eq!(
-            tap(&mut adapter, event, 2, 110, 405, 200),
-            vec![NativeVideoTouchCommand::SeekRelative {
-                delta_secs: -VIDEO_DOUBLE_TAP_SEEK_SECS,
-            }]
-        );
+        for (index, start_ms) in [0, 150, 300, 450].into_iter().enumerate() {
+            assert_eq!(
+                tap(&mut adapter, event, index as u32 + 1, 900, 400, start_ms),
+                vec![NativeVideoTouchCommand::SeekRelative {
+                    delta_secs: VIDEO_TAP_SEEK_SECS,
+                }]
+            );
+        }
     }
 
     #[test]
-    fn same_side_tap_run_seeks_cumulatively_after_the_first_tap() {
-        let mut adapter = NativeTouchAdapter::default();
-        let commands = [0, 150, 300, 450]
-            .into_iter()
-            .enumerate()
-            .flat_map(|(index, start_ms)| {
-                tap(&mut adapter, event, index as u32 + 1, 900, 400, start_ms)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            commands,
-            vec![
-                NativeVideoTouchCommand::ToggleChrome,
-                NativeVideoTouchCommand::SeekRelative {
-                    delta_secs: VIDEO_DOUBLE_TAP_SEEK_SECS,
-                },
-                NativeVideoTouchCommand::SeekRelative {
-                    delta_secs: VIDEO_DOUBLE_TAP_SEEK_SECS,
-                },
-                NativeVideoTouchCommand::SeekRelative {
-                    delta_secs: VIDEO_DOUBLE_TAP_SEEK_SECS,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn opposite_side_breaks_the_run_and_starts_with_a_toggle() {
-        let mut adapter = NativeTouchAdapter::default();
-        tap(&mut adapter, event, 1, 100, 400, 0);
-        assert_eq!(
-            tap(&mut adapter, event, 2, 900, 400, 200),
-            vec![NativeVideoTouchCommand::ToggleChrome]
-        );
-        assert_eq!(
-            tap(&mut adapter, event, 3, 900, 400, 350),
-            vec![NativeVideoTouchCommand::SeekRelative {
-                delta_secs: VIDEO_DOUBLE_TAP_SEEK_SECS,
-            }]
-        );
-    }
-
-    #[test]
-    fn elapsed_or_distant_side_tap_starts_a_new_toggle_run() {
-        let mut elapsed = NativeTouchAdapter::default();
-        tap(&mut elapsed, event, 1, 100, 400, 0);
-        assert_eq!(
-            tap(
-                &mut elapsed,
-                event,
-                2,
-                100,
-                400,
-                VIDEO_DOUBLE_TAP_MAX_INTERVAL_MS + 100,
-            ),
-            vec![NativeVideoTouchCommand::ToggleChrome]
-        );
-
-        let mut distant = NativeTouchAdapter::default();
-        tap(&mut distant, event, 1, 50, 400, 0);
-        assert_eq!(
-            tap(&mut distant, event, 2, 150, 400, 200),
-            vec![NativeVideoTouchCommand::ToggleChrome]
-        );
-    }
-
-    #[test]
-    fn center_and_hud_tap_runs_never_seek() {
+    fn center_and_hud_taps_never_seek() {
         let mut center = NativeTouchAdapter::default();
         let center_commands = [0, 150, 300]
             .into_iter()
@@ -1389,6 +1297,17 @@ mod tests {
     }
 
     #[test]
+    fn audio_only_side_tap_maps_to_chrome_toggle() {
+        let mut adapter = NativeTouchAdapter::default();
+        adapter.configure_video_gestures(false, None);
+
+        assert_eq!(
+            tap(&mut adapter, event, 1, 100, 400, 0),
+            vec![NativeVideoTouchCommand::ToggleChrome]
+        );
+    }
+
+    #[test]
     fn first_run_help_consumes_discovery_then_learns_and_shows_chrome() {
         let mut adapter = NativeTouchAdapter::default();
         adapter.configure_video_gestures(true, Some(false));
@@ -1400,10 +1319,11 @@ mod tests {
             vec![NativeVideoTouchCommand::LearnAndShowChrome]
         );
         assert!(!adapter.first_run_help_visible());
-        assert!(
-            tap(&mut adapter, event, 3, 100, 400, 300)
-                .iter()
-                .all(|command| !matches!(command, NativeVideoTouchCommand::SeekRelative { .. }))
+        assert_eq!(
+            tap(&mut adapter, event, 3, 100, 400, 300),
+            vec![NativeVideoTouchCommand::SeekRelative {
+                delta_secs: -VIDEO_TAP_SEEK_SECS,
+            }]
         );
     }
 
@@ -1412,25 +1332,43 @@ mod tests {
         let mut adapter = NativeTouchAdapter::default();
         adapter.configure_video_gestures(true, Some(true));
         assert_eq!(
-            tap(&mut adapter, event, 1, 100, 400, 0),
+            tap(&mut adapter, event, 1, 500, 400, 0),
             vec![NativeVideoTouchCommand::ToggleChrome]
         );
         assert!(!adapter.first_run_help_visible());
     }
 
     #[test]
-    fn physical_left_is_negative_and_physical_right_is_positive() {
+    fn still_help_learning_does_not_suppress_video_help() {
+        let mut settings = crate::settings::Settings {
+            touch_still_chrome_learned: true,
+            ..Default::default()
+        };
+        assert!(!settings.touch_video_chrome_learned);
+
+        let mut adapter = NativeTouchAdapter::default();
+        adapter.configure_video_gestures(true, Some(settings.touch_video_chrome_learned));
+        assert!(tap(&mut adapter, event, 1, 100, 400, 0).is_empty());
+        assert!(adapter.first_run_help_visible());
+
+        settings.touch_video_chrome_learned = true;
+        adapter.configure_video_gestures(true, Some(settings.touch_video_chrome_learned));
+        assert!(!adapter.first_run_help_visible());
+    }
+
+    #[test]
+    fn physical_left_is_negative_and_physical_right_is_positive_without_reading_direction() {
+        // The native adapter consumes physical PageSide values directly. Reading direction is
+        // deliberately not an input to this mapping.
         let mut left = NativeTouchAdapter::default();
-        tap(&mut left, event, 1, 100, 400, 0);
         assert_eq!(
-            tap(&mut left, event, 2, 100, 400, 150),
+            tap(&mut left, event, 1, 100, 400, 0),
             vec![NativeVideoTouchCommand::SeekRelative { delta_secs: -5.0 }]
         );
 
         let mut right = NativeTouchAdapter::default();
-        tap(&mut right, event, 1, 900, 400, 0);
         assert_eq!(
-            tap(&mut right, event, 2, 900, 400, 150),
+            tap(&mut right, event, 1, 900, 400, 0),
             vec![NativeVideoTouchCommand::SeekRelative { delta_secs: 5.0 }]
         );
     }

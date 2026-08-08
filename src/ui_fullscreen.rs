@@ -16620,8 +16620,8 @@ impl App {
                         StillTouchForegroundReclaimAction::LearnAndShowChrome => {
                             set_still_touch_chrome_latch(ctx, scope, true);
                             clear_still_touch_first_run_help(ctx);
-                            if !self.settings.touch_center_chrome_learned {
-                                self.settings.touch_center_chrome_learned = true;
+                            if !self.settings.touch_still_chrome_learned {
+                                self.settings.touch_still_chrome_learned = true;
                                 self.settings.save();
                             }
                         }
@@ -16946,7 +16946,7 @@ impl App {
         });
         let mut touch_help_phase_before =
             touch_help_scope.and_then(|scope| still_touch_first_run_help_phase(ctx, scope));
-        if self.settings.touch_center_chrome_learned || !touch_input_enabled {
+        if self.settings.touch_still_chrome_learned || !touch_input_enabled {
             if touch_help_phase_before.is_some() {
                 clear_still_touch_first_run_help(ctx);
                 touch_help_phase_before = None;
@@ -16996,7 +16996,7 @@ impl App {
         let touch_help_started_this_frame = touch_help_phase_before.is_none()
             && touch_help_scope.is_some()
             && should_start_still_touch_first_run_help(StillTouchFirstRunHelpEligibility {
-                learned: self.settings.touch_center_chrome_learned,
+                learned: self.settings.touch_still_chrome_learned,
                 touch_activity,
                 gestures_disabled: crate::touch_correlation::touch_gestures_disabled(),
                 touch_input_enabled,
@@ -17042,8 +17042,8 @@ impl App {
                     {
                         set_still_touch_chrome_latch(ctx, scope, true);
                         clear_still_touch_first_run_help(ctx);
-                        if !self.settings.touch_center_chrome_learned {
-                            self.settings.touch_center_chrome_learned = true;
+                        if !self.settings.touch_still_chrome_learned {
+                            self.settings.touch_still_chrome_learned = true;
                             self.settings.save();
                         }
                         touch_help_learned_this_frame = true;
@@ -30495,7 +30495,7 @@ mod tests {
         app.items.push(GridItem::Image(PathBuf::default()));
         app.thumbnails.push(ThumbnailState::Pending);
         app.fullscreen_idx = Some(0);
-        app.settings.touch_center_chrome_learned = true;
+        app.settings.touch_still_chrome_learned = true;
         app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
         app.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
         app.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
@@ -31145,6 +31145,19 @@ mod tests {
             touch_input_enabled: true,
         };
         assert!(should_start_still_touch_first_run_help(visible));
+
+        let settings = crate::settings::Settings {
+            touch_video_chrome_learned: true,
+            ..Default::default()
+        };
+        assert!(!settings.touch_still_chrome_learned);
+        assert!(should_start_still_touch_first_run_help(
+            StillTouchFirstRunHelpEligibility {
+                learned: settings.touch_still_chrome_learned,
+                ..visible
+            }
+        ));
+
         for hidden in [
             StillTouchFirstRunHelpEligibility {
                 learned: true,
