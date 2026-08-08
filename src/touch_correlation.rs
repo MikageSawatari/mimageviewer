@@ -934,6 +934,7 @@ mod tests {
             excluded: Vec::new(),
             behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                 accepts_pinch: true,
+                accepts_edge_swipe: true,
             },
         }
     }

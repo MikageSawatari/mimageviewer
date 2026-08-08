@@ -710,7 +710,7 @@ impl App {
             crate::ui_helpers::open_url(&url);
         }
         if close_requested {
-            self.toggle_fullscreen_click_info_open();
+            self.close_fullscreen_info_panel();
         }
     }
 

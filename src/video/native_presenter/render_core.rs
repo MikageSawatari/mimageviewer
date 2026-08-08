@@ -423,8 +423,8 @@ struct NativeEguiOverlay {
     jump_panel_visible: bool,
     /// App settings から同期される、左右パネル共通の表示モード。
     side_panel_mode: FsSidePanelMode,
-    /// ClickToShow の右情報パネル状態。正本は App の現在ファイル用 runtime flag。
-    click_info_open: bool,
+    /// 右情報パネルの明示 open owner。正本は App の current-file typed state。
+    info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
     /// ClickToShow の左ジャンプパネル状態。動画ソース単位の presenter-local session。
     left_session_open: bool,
     /// 右パネル (情報/★/タグ) の端ホバー開閉ラッチ。画面右端 5% の細いトリガで開き、
@@ -1117,7 +1117,7 @@ struct NativeRightPanelVisibilityInputs {
     tag_picker_open: bool,
     pointer_in_hover_rect: bool,
     side_panel_mode: FsSidePanelMode,
-    click_info_open: bool,
+    info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
 }
 
 fn native_right_panel_visible_from_inputs(input: NativeRightPanelVisibilityInputs) -> bool {
@@ -1133,13 +1133,14 @@ fn native_right_panel_visible_from_inputs(input: NativeRightPanelVisibilityInput
     if input.video_speed_popup_open || input.hover_preview_active {
         return false;
     }
+    let explicit = crate::ui_helpers::metadata_panel_explicit_shown(
+        input.side_panel_mode,
+        input.info_panel_open,
+    );
     input.tag_picker_open
         || match input.side_panel_mode.normalized() {
-            FsSidePanelMode::Hover => input.pointer_in_hover_rect,
-            FsSidePanelMode::ClickToShow => crate::ui_helpers::metadata_panel_click_shown(
-                input.side_panel_mode,
-                input.click_info_open,
-            ),
+            FsSidePanelMode::Hover => input.pointer_in_hover_rect || explicit,
+            FsSidePanelMode::ClickToShow => explicit,
             FsSidePanelMode::Unknown => unreachable!("normalized side panel mode"),
         }
 }
@@ -3010,9 +3011,13 @@ impl NativeRenderCore {
         }
     }
 
-    pub fn set_overlay_side_panel_state(&mut self, mode: FsSidePanelMode, click_info_open: bool) {
+    pub(crate) fn set_overlay_side_panel_state(
+        &mut self,
+        mode: FsSidePanelMode,
+        info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
+    ) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
-            overlay.set_side_panel_state(mode, click_info_open);
+            overlay.set_side_panel_state(mode, info_panel_open);
         }
     }
 
@@ -3907,7 +3912,7 @@ impl NativeEguiOverlay {
             right_panel_visible: false,
             jump_panel_visible: false,
             side_panel_mode: FsSidePanelMode::Hover,
-            click_info_open: false,
+            info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
             left_session_open: false,
             right_panel_hover_latched: false,
             jump_panel_hover_latched: false,
@@ -4019,6 +4024,7 @@ impl NativeEguiOverlay {
             excluded,
             behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                 accepts_pinch: false,
+                accepts_edge_swipe: true,
             },
         }
     }
@@ -4196,11 +4202,11 @@ impl NativeEguiOverlay {
                     && key.virtual_key == 0x1B
                     && self.side_panel_mode.normalized() == FsSidePanelMode::ClickToShow
                     && !self.text_input_active()
-                    && (self.left_session_open || self.click_info_open)
+                    && (self.left_session_open || self.info_panel_open.is_open())
                 {
                     self.left_session_open = false;
                     self.tag_picker_open = false;
-                    if self.click_info_open {
+                    if self.info_panel_open.is_open() {
                         self.pending_overlay_commands
                             .push(NativeOverlayCommand::ToggleClickInfoOpen);
                     }
@@ -4611,14 +4617,18 @@ impl NativeEguiOverlay {
         self.dirty = true;
     }
 
-    fn set_side_panel_state(&mut self, mode: FsSidePanelMode, click_info_open: bool) {
+    fn set_side_panel_state(
+        &mut self,
+        mode: FsSidePanelMode,
+        info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
+    ) {
         let mode = mode.normalized();
         let mode_changed = self.side_panel_mode != mode;
-        if !mode_changed && self.click_info_open == click_info_open {
+        if !mode_changed && self.info_panel_open == info_panel_open {
             return;
         }
         self.side_panel_mode = mode;
-        self.click_info_open = click_info_open;
+        self.info_panel_open = info_panel_open;
         if mode_changed {
             self.left_session_open = false;
             self.right_panel_hover_latched = false;
@@ -5767,7 +5777,7 @@ impl NativeEguiOverlay {
             tag_picker_open: self.tag_picker_open,
             pointer_in_hover_rect: self.right_panel_hover_latched,
             side_panel_mode: self.side_panel_mode,
-            click_info_open: self.click_info_open,
+            info_panel_open: self.info_panel_open,
         })
     }
 
@@ -6389,7 +6399,10 @@ impl NativeEguiOverlay {
                     overlay_width_points,
                     overlay_height_points,
                     false,
-                    self.click_info_open,
+                    crate::ui_helpers::metadata_panel_explicit_shown(
+                        self.side_panel_mode,
+                        self.info_panel_open,
+                    ),
                 )
             {
                 self.tag_picker_open = false;
@@ -8739,9 +8752,23 @@ mod tests {
             tag_picker_open: false,
             pointer_in_hover_rect: true,
             side_panel_mode: FsSidePanelMode::Hover,
-            click_info_open: false,
+            info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
         };
         assert!(native_right_panel_visible_from_inputs(right_base));
+        assert!(!native_right_panel_visible_from_inputs(
+            NativeRightPanelVisibilityInputs {
+                pointer_in_hover_rect: false,
+                info_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByPointer,
+                ..right_base
+            }
+        ));
+        assert!(native_right_panel_visible_from_inputs(
+            NativeRightPanelVisibilityInputs {
+                pointer_in_hover_rect: false,
+                info_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle,
+                ..right_base
+            }
+        ));
         assert!(!native_right_panel_visible_from_inputs(
             NativeRightPanelVisibilityInputs {
                 shortcut_help_open: true,
@@ -8794,12 +8821,12 @@ mod tests {
             tag_picker_open: false,
             pointer_in_hover_rect: true,
             side_panel_mode: FsSidePanelMode::ClickToShow,
-            click_info_open: false,
+            info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
         };
         assert!(!native_right_panel_visible_from_inputs(right_base));
         assert!(native_right_panel_visible_from_inputs(
             NativeRightPanelVisibilityInputs {
-                click_info_open: true,
+                info_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByPointer,
                 pointer_in_hover_rect: false,
                 ..right_base
             }
@@ -8807,7 +8834,7 @@ mod tests {
         assert!(!native_right_panel_visible_from_inputs(
             NativeRightPanelVisibilityInputs {
                 metadata_available: false,
-                click_info_open: true,
+                info_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByPointer,
                 ..right_base
             }
         ));

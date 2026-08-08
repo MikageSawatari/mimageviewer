@@ -1,10 +1,10 @@
 # タブレット PC タッチ操作対応 — 調査と設計方針
 
-> 状態: **調査完了 / 仕様確定 / Phase 1 Step 3c まで実装済み**。2026-08-07。
+> 状態: **調査完了 / 仕様確定 / Phase 1 Step 3b / 3c まで実装済み**。2026-08-08。
 > Step 0 診断プローブ、Step 1 純ロジック認識器、Step 2 egui 入力源相関、
 > Step 3 静止画フルスクリーンの左右タップ / 中央クローム / ピンチズーム・パン / 相関済みクリック抑止、
-> Step 3c 上バーのタッチ専用 hit resolver、Phase 2 の一覧直接スクロール /
-> 方向スナップ / ピンチ列数変更まで完了。左右パネルのタッチ導線は Step 3b。
+> Step 3b 静止画フルスクリーンの左右パネル導線、Step 3c 上バーのタッチ専用 hit resolver、
+> Phase 2 の一覧直接スクロール / 方向スナップ / ピンチ列数変更まで完了。
 > きっかけ: 利用者からの「タブレット PC のタッチ操作に対応しているか」という質問。
 >
 > **仕様は確定済み (利用者判断 2026-08-06、2026-08-07 更新)。未決事項なし。§5.14 が決定一覧。**
@@ -511,6 +511,32 @@ release から確定先までの移動量が行高の 20% 未満なら従来ど�
 
 → 中央タップと `ClickToShow` は**衝突しない**。
 
+#### Step 3b 実装記録 (2026-08-08)
+
+- 静止画フルスクリーンの egui viewport に、`TouchChromeLatched` が ON の間だけ描く
+  **タッチ専用ハンドル**を追加した。既存 hover callout の表示条件・矩形・矢印・tooltip は変更せず、
+  タッチハンドルは `hover_pos()` に依存しない別 widget とした
+- ハンドル幅は `STILL_TOUCH_PANEL_HANDLE_WIDTH_PT = 48pt`。高さは viewport 高の 24% を
+  96--220pt に clamp し、さらに上バー 44pt と下シークバー 38pt の間へ clamp する。
+  極端に低い viewport で安全帯が無い場合は描画も hit test もしない
+- 左右ハンドルは物理的な左 / 右へ固定し、左は画像補正パネル、右はメタデータパネルを開閉する。
+  読み方向では反転しない。マウス callout とタッチハンドルは同じ意味 action を呼ぶ
+- `Hover` / `ClickToShow` の両モードでタッチハンドルを表示する。ハンドル矩形はタップ zone の
+  `excluded` へ加え、ハンドル操作がページ移動 / 中央クローム toggle と競合しないようにした
+- `OpenSidePanel { left }` の consumer を同じ意味 action へ配線した。edge swipe で左パネルを
+  開いた場合も hover 消失で即座に auto-close しないよう、タッチクロームを latch してから開く。
+  latch 中は pointer emulation による受動 hover を止め、既に hover で開いていても
+  `OpenSidePanel` が toggle-close しない idempotent な open とした
+- 右情報パネルの明示 open は `MetadataPanelOpenState::{Closed, ByPointer, ByTouchHandle}` を
+  単一の正本とする。全 surface の resolver は同じ state を読み、`ByTouchHandle` は mode に
+  関係なく表示、`ByPointer` は従来どおり `ClickToShow` でだけ表示する。mouse / native / music の
+  pointer writer は `Hover` で no-op のまま、タッチハンドル / edge swipe だけが専用 writer から
+  `ByTouchHandle` を生成する
+- `ByTouchHandle` はファイル / ページ移動とフルスクリーン退出で `Closed` へ戻す。
+  連結表示の再アンカーで従来維持していた `ByPointer` は維持し、touch owner だけを閉じる
+- `MIV_TOUCH_DEBUG=1` の既存 command / ownership 診断は維持した。初回オーバーレイヘルプ、
+  動画 native / 音楽、パネル内部の小 target 対応はこの Step 3b には含めない
+
 上バーの可視判定は既に純関数 `still_top_bar_visible_from_inputs` (`ui_fullscreen.rs:1018-1027`)
 なので、入力構造体に 1 フィールド足すだけで済む。テストも既存パターンに乗る。
 
@@ -727,13 +753,14 @@ PDF 再レンダリング (`ui_fullscreen.rs:4015, 4216`) はそのまま再利�
 
 #### (1) パネルを開く導線
 
-ここが本当の壁。上バーの `ℹ` ボタンは**右パネルを開くボタンではなく `Hover`/`ClickToShow` の
-モード切替**である (`ui_fullscreen.rs:22333-22360`)。また ClickToShow の呼び出しバー自体が
-端に `hover_pos()` がある間だけ描かれる (`ui_fullscreen.rs:5422-5435`) ため、
-**タッチでは押下時に見えた callout が release フレームで `PointerGone` により消え、
-click completion に到達しない可能性が高い** (§6-4、実機確認要)。
+Step 3b で静止画フルスクリーンの導線を実装した。中央タップでクロームを latch すると、
+`hover_pos()` に依存しない 48pt 幅の左右ハンドルが常時描画され、左右パネルを直接開閉できる。
+さらに左右エッジスワイプの `OpenSidePanel { left }` も同じ action へ配線した。
 
-→ **§5.5 の中央タップによるクローム表示が、パネル到達の前提条件**になる。
+既存の hover callout はマウス用として従来の表示条件と形状を維持する。タッチ用 widget は
+press / release フレームで同じ widget ID と矩形を保つため、release と同じ入力 batch に
+`PointerGone` が来ても click completion に到達することを kittest で確認した (§6-4)。
+初回オーバーレイヘルプによる発見可能性の補強は次ステップに残す。
 
 #### (2) パネル内スクロールは既に動く
 
@@ -988,8 +1015,8 @@ TouchOwner
 - **全接点が離れるまで primary 抑止を維持**する
 - 確定済み owner を**同じ接点集合のまま**別 action へ移さない。ただし接点追加時は
   `ViewerPointerPassthrough` から `Pinch` へ昇格し、現在位置で pinch 基準を取り直す
-- Step 3 で未配線の `EdgeSwipe` も現時点では接点追加時に `Pinch` へ昇格してよい。
-  Step 3b で `OpenSidePanel` を配線するときに ownership を再検討する
+- `EdgeSwipe` は `OpenSidePanel` を確定時に発火する owner なので、接点追加後も `Pinch` へ
+  昇格させない。確定済みのパネル action と zoom を同じ接点集合で重ねない
 - `WidgetPassthrough` / `ViewerTapZone` / `Cancelled` からは昇格しない。
   `Pinch` は接点が 1 本に戻っても単指 pan へ降格せず、全接点解放まで保持する
 - グリッドでは、スクロール認識のしきい値と egui の drag 開始しきい値を競争させない。
@@ -1112,6 +1139,11 @@ Codex Sol の指摘により、保証できる表現を次に限定する:
 
 > **タッチを行っていない mouse-only の入力列については、挙動を一切変更しない。**
 
+Step 3b の右情報パネルでは、この保証を writer と resolver の両方で固定した。
+`ByPointer` を生成する既存 mouse / native / music 経路は `ClickToShow` 以外で no-op、
+`Hover` でも永続表示できる `ByTouchHandle` はタッチ専用入口からだけ生成する。
+両 owner を bool へ分散せず `MetadataPanelOpenState` で型として区別する。
+
 同じ egui viewport 上でマウスとタッチを**完全に同時**操作した場合、egui の `PointerState` が
 1 つしかない以上、2 つを完全独立にする保証はできない。ここを絶対条件にすると
 egui-winit より下の入力層を大きく作り直す必要がある。実用上は
@@ -1217,10 +1249,11 @@ NeeView は **ペンと指を区別していない**。リポジトリ全体で 
    synthetic press が生きている Cancel / suppression 境界で、click 距離超過の
    `PointerMoved` → primary release → `PointerGone` を注入し、click を成立させず down を解除する。
    canceled flag / capture changed の実機観測は引き続きできていない。
-4. **ClickToShow の呼び出しバーがタッチで押せるか**。callout は端に `hover_pos()` が
-   ある間だけ描かれる (`ui_fullscreen.rs:5422-5435`)。Touch End と同じ batch で
-   `PointerGone` が来るため、**押下時に見えた callout が release フレームで消えて
-   click completion に到達しない可能性が高い** (コード順序からの推測)。
+4. **【実装解決・実機確認待ち】左右パネルのタッチハンドルが click completion へ到達するか**。
+   hover 依存の既存 callout はタッチ target にせず、クローム latch 中に widget ID と 48pt 幅の
+   矩形が継続する別ハンドルを実装した。Touch End と同じ batch に `PointerGone` を入れる
+   kittest で click completion と左右 action 発火を確認済み。実機では左右それぞれの tap と、
+   指を少し動かして離した場合を確認する。
 5. 「フォルダを開く」ダイアログはフルパス入力式で参照ボタンが無く
    (`src/ui_dialogs/open_folder.rs:34-52, 81-106`)、OS タッチキーボードの自動表示も
    コードからは保証できない。タブレットでの実用性を実機確認する必要がある。
@@ -1241,8 +1274,8 @@ NeeView は **ペンと指を区別していない**。リポジトリ全体で 
 3. **Phase 1**: 入力源分離と 2 つの backend の成立確認。
    静止画フルスクリーンのタッチ操作一式に加え、**動画 native の pointer adapter を
    presenter HWND に薄く実装済み**。配送ゲートは通過し、長押し修正後の実機確認を残す。
-4. **Phase 2**: 一覧の直接スクロール + 方向スナップ + ピンチ列数変更 + 静止画・音楽パネル。
-   ここまでで「静止画はタッチ対応」と言える。
+4. **Phase 2**: 一覧の直接スクロール + 方向スナップ + ピンチ列数変更を実装済み。
+   Step 3b で静止画パネルの open 導線も実装した。パネル内部の小 target 対応と音楽パネルは残る。
 5. **Phase 3**: 動画 native の完成。ここまでで「mIV はタッチ対応」と表明できる。
 6. 実機フィードバック後に**慣性の要否を判断**する。必要なら短距離・行単位の限定慣性だけ。
 7. リング / ルーペ / 5 領域カスタマイズ / ピンチ回転は**要望が出るまで保留**。

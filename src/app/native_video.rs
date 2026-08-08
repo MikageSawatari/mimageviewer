@@ -5254,7 +5254,7 @@ impl App {
         let shortcuts = self.native_overlay_shortcut_labels();
         let shortcut_help = self.cached_native_overlay_shortcut_help();
         let side_panel_mode = self.settings.fullscreen_side_panel_mode;
-        let click_info_open = self.fs_click_info_open;
+        let info_panel_open = self.fs_info_panel_open;
         // ★ レーティング (右パネル先頭。get_rating は &mut self なので player 借用より前に取る)。
         let rating = self.get_rating(fs_idx);
 
@@ -5344,7 +5344,7 @@ impl App {
             }
         };
         player.set_native_metadata(Some(metadata));
-        player.set_native_side_panel_state(side_panel_mode, click_info_open);
+        player.set_native_side_panel_state(side_panel_mode, info_panel_open);
     }
 
     #[cfg(windows)]

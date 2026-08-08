@@ -732,7 +732,7 @@ enum NativeVideoOutputCommand {
     },
     SetSidePanelState {
         mode: crate::settings::FsSidePanelMode,
-        click_info_open: bool,
+        info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
     },
     ResetSidePanelSession,
     SetLoopEnabled {
@@ -1504,12 +1504,16 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::SetMetadata { metadata });
     }
 
-    fn set_side_panel_state(&self, mode: crate::settings::FsSidePanelMode, click_info_open: bool) {
+    fn set_side_panel_state(
+        &self,
+        mode: crate::settings::FsSidePanelMode,
+        info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
+    ) {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetSidePanelState {
                 mode,
-                click_info_open,
+                info_panel_open,
             });
     }
 
@@ -3073,9 +3077,9 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::SetSidePanelState {
                     mode,
-                    click_info_open,
+                    info_panel_open,
                 } => {
-                    presenter.set_overlay_side_panel_state(mode, click_info_open);
+                    presenter.set_overlay_side_panel_state(mode, info_panel_open);
                 }
                 NativeVideoOutputCommand::ResetSidePanelSession => {
                     presenter.reset_overlay_side_panel_session();
@@ -6482,13 +6486,13 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
-    pub fn set_native_side_panel_state(
+    pub(crate) fn set_native_side_panel_state(
         &self,
         mode: crate::settings::FsSidePanelMode,
-        click_info_open: bool,
+        info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
     ) {
         if let Some(output) = self.native_output.as_ref() {
-            output.set_side_panel_state(mode, click_info_open);
+            output.set_side_panel_state(mode, info_panel_open);
         }
     }
 

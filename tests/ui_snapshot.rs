@@ -225,6 +225,39 @@ fn contrast_fixture(ui: &mut egui::Ui) {
 }
 
 #[test]
+fn still_touch_panel_handles_latched_dark() {
+    snapshot_with_theme(
+        "still_touch_panel_handles_latched_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            mimageviewer::draw_still_panel_reach_snapshot_fixture(ui, true, false);
+        },
+    );
+}
+
+#[test]
+fn still_touch_panel_handles_unlatched_dark() {
+    snapshot_with_theme(
+        "still_touch_panel_handles_unlatched_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            mimageviewer::draw_still_panel_reach_snapshot_fixture(ui, false, false);
+        },
+    );
+}
+
+#[test]
+fn still_mouse_panel_callout_dark() {
+    snapshot_with_theme(
+        "still_mouse_panel_callout_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            mimageviewer::draw_still_panel_reach_snapshot_fixture(ui, false, true);
+        },
+    );
+}
+
+#[test]
 fn text_contrast_strong_light() {
     snapshot_with_theme_and_contrast(
         "text_contrast_strong_light",

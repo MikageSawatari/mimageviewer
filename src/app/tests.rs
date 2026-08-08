@@ -46235,7 +46235,7 @@ fn fullscreen_side_panel_mode_persists_while_open_states_reset_on_exit() {
         .push(GridItem::Image(PathBuf::from("C:/photos/panel-mode.jpg")));
     app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
     app.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
-    app.fs_click_info_open = true;
+    app.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
     app.adjustment_mode = true;
 
     app.close_fullscreen();
@@ -46244,7 +46244,10 @@ fn fullscreen_side_panel_mode_persists_while_open_states_reset_on_exit() {
         app.settings.fullscreen_side_panel_mode,
         crate::settings::FsSidePanelMode::ClickToShow
     );
-    assert!(!app.fs_click_info_open);
+    assert_eq!(
+        app.fs_info_panel_open,
+        crate::ui_helpers::MetadataPanelOpenState::Closed
+    );
     assert!(!app.metadata_panel_click_shown());
     assert!(!app.adjustment_mode);
 
@@ -46264,13 +46267,75 @@ fn fullscreen_file_change_resets_left_and_right_click_panels() {
 
     app.open_fullscreen(first, crate::app::HistoryTrigger::UserChosen);
     app.adjustment_mode = true;
-    app.fs_click_info_open = true;
+    app.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
     assert!(app.metadata_panel_click_shown());
 
     app.open_fullscreen(second, crate::app::HistoryTrigger::UserChosen);
 
     assert!(!app.adjustment_mode);
-    assert!(!app.fs_click_info_open);
+    assert_eq!(
+        app.fs_info_panel_open,
+        crate::ui_helpers::MetadataPanelOpenState::Closed
+    );
+    assert!(!app.metadata_panel_click_shown());
+}
+
+#[test]
+fn fullscreen_info_panel_pointer_writer_remains_click_mode_only() {
+    use crate::ui_helpers::MetadataPanelOpenState::{ByPointer, ByTouchHandle, Closed};
+
+    let mut app = phase_c_support::setup_app();
+    app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+
+    app.toggle_fullscreen_click_info_open();
+    assert_eq!(app.fs_info_panel_open, Closed);
+    assert!(!app.metadata_panel_click_shown());
+
+    app.toggle_fullscreen_touch_info_open();
+    assert_eq!(app.fs_info_panel_open, ByTouchHandle);
+    assert!(app.metadata_panel_click_shown());
+
+    // A mouse/native pointer writer must remain a no-op in the default Hover mode,
+    // including while a touch-owned panel is visible.
+    app.toggle_fullscreen_click_info_open();
+    assert_eq!(app.fs_info_panel_open, ByTouchHandle);
+    assert!(app.metadata_panel_click_shown());
+
+    app.close_fullscreen_info_panel();
+    app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+    app.toggle_fullscreen_click_info_open();
+    assert_eq!(app.fs_info_panel_open, ByPointer);
+    assert!(app.metadata_panel_click_shown());
+}
+
+#[test]
+fn touch_owned_info_panel_closes_on_file_change_and_fullscreen_exit() {
+    use crate::ui_helpers::MetadataPanelOpenState::{ByTouchHandle, Closed};
+
+    let mut app = phase_c_support::setup_app();
+    let first = app.items.len();
+    app.items.push(GridItem::Image(PathBuf::from(
+        "C:/photos/touch-panel-a.jpg",
+    )));
+    let second = app.items.len();
+    app.items.push(GridItem::Image(PathBuf::from(
+        "C:/photos/touch-panel-b.jpg",
+    )));
+    app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+
+    app.open_fullscreen(first, crate::app::HistoryTrigger::UserChosen);
+    app.toggle_fullscreen_touch_info_open();
+    assert_eq!(app.fs_info_panel_open, ByTouchHandle);
+    assert!(app.metadata_panel_click_shown());
+
+    app.open_fullscreen(second, crate::app::HistoryTrigger::UserChosen);
+    assert_eq!(app.fs_info_panel_open, Closed);
+    assert!(!app.metadata_panel_click_shown());
+
+    app.toggle_fullscreen_touch_info_open();
+    assert_eq!(app.fs_info_panel_open, ByTouchHandle);
+    app.close_fullscreen();
+    assert_eq!(app.fs_info_panel_open, Closed);
     assert!(!app.metadata_panel_click_shown());
 }
 
@@ -46315,7 +46380,7 @@ fn continuous_reanchor_history_trigger_controls_recording() {
     );
 }
 #[test]
-fn continuous_reanchor_preserves_panels_and_page_trim_override() {
+fn continuous_reanchor_preserves_pointer_panels_and_page_trim_override() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
     let first = app.items.len();
@@ -46328,7 +46393,7 @@ fn continuous_reanchor_preserves_panels_and_page_trim_override() {
     app.reading_flow = crate::settings::ReadingFlow::Vertical;
     app.fullscreen_idx = Some(first);
     app.adjustment_mode = true;
-    app.fs_click_info_open = true;
+    app.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
     let page_override =
         crate::view_trim::ViewTrimPageOverride::from_margins(crate::view_trim::ViewTrimMargins {
             left: 0.07,
@@ -46349,7 +46414,10 @@ fn continuous_reanchor_preserves_panels_and_page_trim_override() {
     assert_eq!(app.fullscreen_idx, Some(second));
     assert_eq!(app.fs_vertical_scroll, 25.0);
     assert!(app.adjustment_mode);
-    assert!(app.fs_click_info_open);
+    assert_eq!(
+        app.fs_info_panel_open,
+        crate::ui_helpers::MetadataPanelOpenState::ByPointer
+    );
     assert!(app.metadata_panel_click_shown());
     // 旧仕様の一時スコープは移動時に消えたが、個別行はページへ戻るため保持する。
     assert_eq!(
@@ -46357,6 +46425,20 @@ fn continuous_reanchor_preserves_panels_and_page_trim_override() {
         Some(&page_override)
     );
     assert!(!app.view_trim_save_pending);
+
+    app.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
+    app.reanchor_continuous_reading_viewer(
+        &ctx,
+        &[0.0, 100.0],
+        0,
+        first,
+        crate::app::HistoryTrigger::UserChosen,
+    );
+    assert_eq!(
+        app.fs_info_panel_open,
+        crate::ui_helpers::MetadataPanelOpenState::Closed,
+        "touch-owned panel must close at a continuous page/file boundary"
+    );
 }
 
 #[test]
@@ -46578,7 +46660,7 @@ fn fullscreen_mode_change_resets_still_and_music_left_runtime_state() {
     app.music_left_panel_active = true;
     app.music_right_panel_active = true;
     app.music_left_click_open = true;
-    app.fs_click_info_open = true;
+    app.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
 
     app.reset_fs_side_panel_runtime_for_mode_change();
 
@@ -46587,7 +46669,10 @@ fn fullscreen_mode_change_resets_still_and_music_left_runtime_state() {
     assert!(!app.music_left_panel_active);
     assert!(!app.music_right_panel_active);
     assert!(!app.music_left_click_open);
-    assert!(!app.fs_click_info_open);
+    assert_eq!(
+        app.fs_info_panel_open,
+        crate::ui_helpers::MetadataPanelOpenState::Closed
+    );
 }
 
 fn fullscreen_tab_event(repeat: bool) -> egui::Event {
@@ -47233,7 +47318,7 @@ fn fullscreen_tab_round_trips_with_open_panels_on_all_egui_surfaces() {
             app.video_audio_mode = Some(idx);
         }
         app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
-        app.fs_click_info_open = true;
+        app.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
         if kind == 0 {
             app.adjustment_mode = true;
         } else {
@@ -47261,14 +47346,17 @@ fn video_audio_transition_resets_music_left_session_but_keeps_same_file_right_st
     app.music_left_panel_active = true;
     app.music_right_panel_active = true;
     app.music_left_click_open = true;
-    app.fs_click_info_open = true;
+    app.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
 
     app.reset_video_audio_side_panel_sessions(usize::MAX);
 
     assert!(!app.music_left_panel_active);
     assert!(!app.music_right_panel_active);
     assert!(!app.music_left_click_open);
-    assert!(app.fs_click_info_open);
+    assert_eq!(
+        app.fs_info_panel_open,
+        crate::ui_helpers::MetadataPanelOpenState::ByPointer
+    );
 }
 
 #[test]

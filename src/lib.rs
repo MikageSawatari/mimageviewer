@@ -187,6 +187,8 @@ mod ui_folder_pane;
 pub mod ui_font_catalog;
 pub mod ui_fonts;
 mod ui_fullscreen;
+#[doc(hidden)]
+pub use ui_fullscreen::draw_still_panel_reach_snapshot_fixture;
 pub mod ui_helpers;
 mod ui_main;
 mod ui_metadata_panel;

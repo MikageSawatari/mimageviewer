@@ -113,13 +113,72 @@ pub(crate) fn edge_summons_adjustment(
     mode.normalized() == crate::settings::FsSidePanelMode::Hover && edge == PanelEdge::Left
 }
 
-/// ClickToShow の右情報パネルが現在ファイルで明示的に開いているか。
-#[allow(dead_code)]
-pub(crate) fn metadata_panel_click_shown(
+/// 右情報パネルの明示 open を生成した入力 owner。
+///
+/// pointer 経路は従来どおり ClickToShow 専用、touch 経路だけは Hover でも
+/// 永続表示できる。複数の bool へ owner を分散させないため、この値を全 surface の
+/// resolver と lifecycle reset の正本にする。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MetadataPanelOpenState {
+    #[default]
+    Closed,
+    ByPointer,
+    ByTouchHandle,
+}
+
+impl MetadataPanelOpenState {
+    pub(crate) fn is_open(self) -> bool {
+        self != Self::Closed
+    }
+}
+
+/// 現在の mode と owner から、明示 open の右情報パネルを表示するか解決する。
+pub(crate) fn metadata_panel_explicit_shown(
     mode: crate::settings::FsSidePanelMode,
-    click_info_open: bool,
+    state: MetadataPanelOpenState,
 ) -> bool {
-    mode.normalized() == crate::settings::FsSidePanelMode::ClickToShow && click_info_open
+    match state {
+        MetadataPanelOpenState::Closed => false,
+        MetadataPanelOpenState::ByPointer => {
+            mode.normalized() == crate::settings::FsSidePanelMode::ClickToShow
+        }
+        MetadataPanelOpenState::ByTouchHandle => true,
+    }
+}
+
+/// 既存 mouse / native / music pointer 経路の toggle。Hover では必ず no-op。
+pub(crate) fn toggle_metadata_panel_by_pointer(
+    mode: crate::settings::FsSidePanelMode,
+    state: MetadataPanelOpenState,
+) -> MetadataPanelOpenState {
+    if mode.normalized() != crate::settings::FsSidePanelMode::ClickToShow {
+        return state;
+    }
+    if state.is_open() {
+        MetadataPanelOpenState::Closed
+    } else {
+        MetadataPanelOpenState::ByPointer
+    }
+}
+
+pub(crate) fn toggle_metadata_panel_by_touch(
+    state: MetadataPanelOpenState,
+) -> MetadataPanelOpenState {
+    if state.is_open() {
+        MetadataPanelOpenState::Closed
+    } else {
+        MetadataPanelOpenState::ByTouchHandle
+    }
+}
+
+pub(crate) fn open_metadata_panel_by_touch(
+    state: MetadataPanelOpenState,
+) -> MetadataPanelOpenState {
+    if state.is_open() {
+        state
+    } else {
+        MetadataPanelOpenState::ByTouchHandle
+    }
 }
 
 /// 一度開いた左右パネルを「維持」するヒステリシス余白 (px)。トリガと同じく **ビュー幅の 5%**。
@@ -2059,11 +2118,33 @@ mod tests {
     }
 
     #[test]
-    fn metadata_click_state_is_click_mode_only() {
+    fn metadata_panel_open_owner_preserves_pointer_gate_and_touch_visibility() {
         use crate::settings::FsSidePanelMode::{ClickToShow, Hover};
-        assert!(!metadata_panel_click_shown(Hover, false));
-        assert!(!metadata_panel_click_shown(Hover, true));
-        assert!(!metadata_panel_click_shown(ClickToShow, false));
-        assert!(metadata_panel_click_shown(ClickToShow, true));
+        use MetadataPanelOpenState::{ByPointer, ByTouchHandle, Closed};
+
+        assert!(!metadata_panel_explicit_shown(Hover, Closed));
+        assert!(!metadata_panel_explicit_shown(Hover, ByPointer));
+        assert!(metadata_panel_explicit_shown(Hover, ByTouchHandle));
+        assert!(!metadata_panel_explicit_shown(ClickToShow, Closed));
+        assert!(metadata_panel_explicit_shown(ClickToShow, ByPointer));
+        assert!(metadata_panel_explicit_shown(ClickToShow, ByTouchHandle));
+
+        assert_eq!(toggle_metadata_panel_by_pointer(Hover, Closed), Closed);
+        assert_eq!(
+            toggle_metadata_panel_by_pointer(Hover, ByTouchHandle),
+            ByTouchHandle
+        );
+        assert_eq!(
+            toggle_metadata_panel_by_pointer(ClickToShow, Closed),
+            ByPointer
+        );
+        assert_eq!(
+            toggle_metadata_panel_by_pointer(ClickToShow, ByPointer),
+            Closed
+        );
+        assert_eq!(toggle_metadata_panel_by_touch(Closed), ByTouchHandle);
+        assert_eq!(toggle_metadata_panel_by_touch(ByTouchHandle), Closed);
+        assert_eq!(open_metadata_panel_by_touch(Closed), ByTouchHandle);
+        assert_eq!(open_metadata_panel_by_touch(ByTouchHandle), ByTouchHandle);
     }
 }

@@ -9001,9 +9001,9 @@ pub struct App {
     pub(crate) show_metadata_panel: bool,
     /// 右端ホバーで開いたメタデータパネルを、カーソルがパネル内にいる間だけ維持する。
     pub(crate) metadata_panel_hover_active: bool,
-    /// ClickToShow で右情報パネルを開いているか。現在ファイルだけの transient 状態で、
-    /// ファイル移動またはフルスクリーン退出時に閉じる。
-    pub(crate) fs_click_info_open: bool,
+    /// 右情報パネルの明示 open owner。pointer は ClickToShow 専用、touch handle は
+    /// Hover でも表示する。現在ファイルだけの transient 状態。
+    pub(crate) fs_info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
     /// AI メタデータキャッシュ: 正規化キー → パース結果 (None = メタデータなし)
     /// キーは [`App::metadata_cache_key`] で生成 (ZIP エントリ・PDF ページごとに一意)。
     pub(crate) metadata_cache:
@@ -12120,7 +12120,7 @@ impl App {
             favsearch: FavSearchState::default(),
             show_metadata_panel: false,
             metadata_panel_hover_active: false,
-            fs_click_info_open: false,
+            fs_info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
             metadata_cache: std::collections::HashMap::new(),
             exif_cache: std::collections::HashMap::new(),
             xmp_cache: std::collections::HashMap::new(),
@@ -40791,8 +40791,8 @@ impl App {
         if self.fullscreen_idx.is_some() && self.fullscreen_idx != Some(idx) {
             self.cache_current_edit_preview_if_ready();
         }
-        // ClickToShow の左右パネルはファイル単位の一時状態。新規入場と viewer 内の
-        // ファイル移動が集約されるこの境界で、前ファイルの開状態を引き継がない。
+        // 明示 open の左右パネルはファイル単位の一時状態。新規入場と viewer 内の
+        // ファイル移動が集約されるこの境界で、前ファイルの owner を引き継がない。
         self.reset_fs_side_panel_runtime_for_file_change();
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
         // 別アイテムへナビ / 新規オープンする時点で、前アイテムの「動画→音声モード」(Inc 7) は
@@ -56001,9 +56001,9 @@ impl App {
     }
 
     pub(crate) fn metadata_panel_click_shown(&self) -> bool {
-        crate::ui_helpers::metadata_panel_click_shown(
+        crate::ui_helpers::metadata_panel_explicit_shown(
             self.settings.fullscreen_side_panel_mode,
-            self.fs_click_info_open,
+            self.fs_info_panel_open,
         )
     }
 
@@ -56021,7 +56021,7 @@ impl App {
         self.close_fs_side_panel_runtime();
     }
 
-    /// ClickToShow の左右パネルを現在ファイルの境界で閉じる。
+    /// 明示 open の左右パネルを現在ファイルの境界で閉じる。
     pub(crate) fn reset_fs_side_panel_runtime_for_file_change(&mut self) {
         // 表示トリムの保存責務はパネルが現在見えているかではなく、編集対象ファイルが
         // 変わるこの境界が持つ。Hover パネル外で mouse-up した場合や、同フレームに
@@ -56033,20 +56033,46 @@ impl App {
     fn close_fs_side_panel_runtime(&mut self) {
         self.metadata_panel_hover_active = false;
         self.adjustment_mode = false;
-        self.fs_click_info_open = false;
+        self.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.music_left_panel_active = false;
         self.music_right_panel_active = false;
         self.music_left_click_open = false;
     }
 
     pub(crate) fn toggle_fullscreen_click_info_open(&mut self) {
-        if self.settings.fullscreen_side_panel_mode.normalized()
-            != crate::settings::FsSidePanelMode::ClickToShow
-        {
-            return;
+        let next = crate::ui_helpers::toggle_metadata_panel_by_pointer(
+            self.settings.fullscreen_side_panel_mode,
+            self.fs_info_panel_open,
+        );
+        if next != self.fs_info_panel_open {
+            self.fs_info_panel_open = next;
+            self.metadata_panel_hover_active = false;
         }
-        self.fs_click_info_open = !self.fs_click_info_open;
+    }
+
+    pub(crate) fn toggle_fullscreen_touch_info_open(&mut self) {
+        self.fs_info_panel_open =
+            crate::ui_helpers::toggle_metadata_panel_by_touch(self.fs_info_panel_open);
         self.metadata_panel_hover_active = false;
+    }
+
+    pub(crate) fn open_fullscreen_touch_info_panel(&mut self) {
+        self.fs_info_panel_open =
+            crate::ui_helpers::open_metadata_panel_by_touch(self.fs_info_panel_open);
+        self.metadata_panel_hover_active = false;
+    }
+
+    pub(crate) fn close_fullscreen_info_panel(&mut self) {
+        self.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
+        self.metadata_panel_hover_active = false;
+    }
+
+    /// 連結表示の再アンカーは pointer-open を従来どおり維持するが、touch handle の
+    /// current-file state はページ移動境界で閉じる。
+    pub(crate) fn close_touch_info_panel_for_file_change(&mut self) {
+        if self.fs_info_panel_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle {
+            self.close_fullscreen_info_panel();
+        }
     }
 
     pub(crate) fn close_click_side_panels(&mut self) -> bool {
@@ -56055,7 +56081,7 @@ impl App {
         {
             return false;
         }
-        let close_right = self.fs_click_info_open;
+        let close_right = self.metadata_panel_click_shown();
         let close_music_left = self
             .fullscreen_idx
             .is_some_and(|idx| self.fs_music_view_active(idx))
@@ -56066,7 +56092,7 @@ impl App {
         }
         self.adjustment_mode = false;
         self.music_left_click_open = false;
-        self.fs_click_info_open = false;
+        self.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         closed
     }
 
