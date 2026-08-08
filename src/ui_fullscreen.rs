@@ -1369,6 +1369,44 @@ fn still_touch_first_run_help_tap_action(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StillTouchForegroundReclaimAction {
+    None,
+    ToggleChrome,
+    LearnAndShowChrome,
+    SetHelpReady,
+}
+
+fn still_touch_foreground_reclaim_action(
+    help_phase: Option<StillTouchFirstRunHelpPhase>,
+    touch_active: bool,
+    commands: &[crate::touch_input::TouchCommand],
+) -> StillTouchForegroundReclaimAction {
+    if let Some(help_phase) = help_phase {
+        if commands.iter().copied().any(|command| {
+            still_touch_first_run_help_tap_action(help_phase, command)
+                == StillTouchFirstRunHelpTapAction::LearnAndShowChrome
+        }) {
+            return StillTouchForegroundReclaimAction::LearnAndShowChrome;
+        }
+        if help_phase == StillTouchFirstRunHelpPhase::AwaitingInitialRelease && !touch_active {
+            return StillTouchForegroundReclaimAction::SetHelpReady;
+        }
+        return StillTouchForegroundReclaimAction::None;
+    }
+
+    if commands
+        .iter()
+        .any(|command| *command == crate::touch_input::TouchCommand::ToggleChrome)
+    {
+        StillTouchForegroundReclaimAction::ToggleChrome
+    } else {
+        // PageSide, pinch, pan, and all other commands are activation-only
+        // no-ops while the existing focus-reclaim early return is active.
+        StillTouchForegroundReclaimAction::None
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct StillTouchChromeLatch {
     fs_idx: usize,
@@ -16360,7 +16398,9 @@ impl App {
                 self.frame_counter,
                 false,
             );
-            if touch_frame.touch_cancelled() {
+            if touch_frame.touch_cancelled()
+                || (!touch_frame.is_active() && touch_frame.has_touch_derived_pointer_activity())
+            {
                 self.fs_suppress_primary_until_release = false;
             }
             return (FsPageNav::None, false);
@@ -16456,7 +16496,7 @@ impl App {
                 }
                 self.fs_focus_regained_at = Some(std::time::Instant::now());
                 self.fs_suppress_primary_until_release = true;
-                let _ = crate::touch_correlation::drive_egui_touch_input(
+                let touch_frame = crate::touch_correlation::drive_egui_touch_input(
                     ctx,
                     crate::touch_correlation::TouchSurface::StillFullscreen,
                     crate::touch_input::TapZoneGeometry {
@@ -16467,8 +16507,40 @@ impl App {
                         },
                     },
                     self.frame_counter,
-                    false,
+                    true,
                 );
+                if let Some(idx) = self.fullscreen_idx {
+                    let scope = StillTouchChromeLatch {
+                        fs_idx: idx,
+                        session_started_at: self.fullscreen_opened_at(),
+                    };
+                    let help_phase = still_touch_first_run_help_phase(ctx, scope);
+                    match still_touch_foreground_reclaim_action(
+                        help_phase,
+                        touch_frame.is_active(),
+                        touch_frame.commands(),
+                    ) {
+                        StillTouchForegroundReclaimAction::ToggleChrome => {
+                            toggle_still_touch_chrome_latch(ctx, idx, self.fullscreen_opened_at());
+                        }
+                        StillTouchForegroundReclaimAction::LearnAndShowChrome => {
+                            set_still_touch_chrome_latch(ctx, scope, true);
+                            clear_still_touch_first_run_help(ctx);
+                            if !self.settings.touch_center_chrome_learned {
+                                self.settings.touch_center_chrome_learned = true;
+                                self.settings.save();
+                            }
+                        }
+                        StillTouchForegroundReclaimAction::SetHelpReady => {
+                            set_still_touch_first_run_help_phase(
+                                ctx,
+                                scope,
+                                StillTouchFirstRunHelpPhase::Ready,
+                            );
+                        }
+                        StillTouchForegroundReclaimAction::None => {}
+                    }
+                }
                 return (FsPageNav::None, false);
             }
         }
@@ -16720,7 +16792,9 @@ impl App {
                 self.frame_counter,
                 false,
             );
-            if touch_frame.touch_cancelled() {
+            if touch_frame.touch_cancelled()
+                || (!touch_frame.is_active() && touch_frame.has_touch_derived_pointer_activity())
+            {
                 self.fs_suppress_primary_until_release = false;
             }
             return (FsPageNav::None, false);
@@ -16845,7 +16919,8 @@ impl App {
             touch_help_phase_before
         };
         let touch_help_intercepts = touch_help_phase_for_commands.is_some();
-        let touch_bar_tap = !touch_help_intercepts
+        let touch_bar_tap = touch_input_enabled
+            && !touch_help_intercepts
             && top_bar_visible
             && prepare_bar_button_touch_targets(
                 ctx,
@@ -16936,9 +17011,10 @@ impl App {
         {
             set_still_touch_first_run_help_phase(ctx, scope, StillTouchFirstRunHelpPhase::Ready);
         }
-        if touch_bar_tap
-            || touch_has_replacement
-            || touch_owner == crate::touch_input::TouchOwner::Pinch
+        if touch_input_enabled
+            && (touch_bar_tap
+                || touch_has_replacement
+                || touch_owner == crate::touch_input::TouchOwner::Pinch)
         {
             self.fs_suppress_primary_until_release = true;
         }
@@ -30891,6 +30967,62 @@ mod tests {
                 },
             ),
             StillTouchFirstRunHelpTapAction::Ignore
+        );
+    }
+
+    #[test]
+    fn foreground_reclaim_touch_allows_only_chrome_activation() {
+        use crate::touch_input::TouchCommand;
+
+        assert_eq!(
+            still_touch_foreground_reclaim_action(None, false, &[TouchCommand::ToggleChrome],),
+            StillTouchForegroundReclaimAction::ToggleChrome
+        );
+        for blocked in [
+            TouchCommand::PageSide { left: true },
+            TouchCommand::PageSide { left: false },
+            TouchCommand::Pan {
+                delta: egui::vec2(8.0, 0.0),
+            },
+            TouchCommand::PinchEnd,
+        ] {
+            assert_eq!(
+                still_touch_foreground_reclaim_action(None, false, &[blocked]),
+                StillTouchForegroundReclaimAction::None
+            );
+        }
+
+        // The modal first-run guide already treats either physical side as a
+        // learn-and-show-chrome tap. It still cannot become page navigation.
+        for tap in [
+            TouchCommand::ToggleChrome,
+            TouchCommand::PageSide { left: true },
+            TouchCommand::PageSide { left: false },
+        ] {
+            assert_eq!(
+                still_touch_foreground_reclaim_action(
+                    Some(StillTouchFirstRunHelpPhase::Ready),
+                    false,
+                    &[tap],
+                ),
+                StillTouchForegroundReclaimAction::LearnAndShowChrome
+            );
+        }
+        assert_eq!(
+            still_touch_foreground_reclaim_action(
+                Some(StillTouchFirstRunHelpPhase::AwaitingInitialRelease),
+                true,
+                &[],
+            ),
+            StillTouchForegroundReclaimAction::None
+        );
+        assert_eq!(
+            still_touch_foreground_reclaim_action(
+                Some(StillTouchFirstRunHelpPhase::AwaitingInitialRelease),
+                false,
+                &[],
+            ),
+            StillTouchForegroundReclaimAction::SetHelpReady
         );
     }
 

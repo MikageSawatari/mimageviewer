@@ -702,7 +702,9 @@ fn finish_grid_pinch_column_gesture(app: &mut App, ctx: &egui::Context, boundary
     if should_save {
         app.settings.save();
     }
-    if crate::touch_debug::touch_debug_enabled() {
+    // The disabled path calls this every frame, so a boundary with nothing
+    // pending must stay silent or it drowns the log we ask users to capture.
+    if should_save && crate::touch_debug::touch_debug_enabled() {
         crate::logger::log(format!(
             "[TOUCH-DEBUG] grid_pinch_columns boundary={boundary} saved={should_save} cols={}",
             app.settings.grid_cols
@@ -14775,9 +14777,10 @@ impl App {
                 );
                 if !touch_scroll_enabled {
                     clear_grid_touch_scroll_remainder(ctx);
-                }
-                if !touch_scroll_enabled && touch_frame.touch_cancelled() {
-                    finish_grid_pinch_column_gesture(self, ctx, "cancel_disabled");
+                    // The recognizer keeps observing contacts while command
+                    // execution is disabled, so caller-owned pinch persistence
+                    // must be closed explicitly instead of relying on a reset.
+                    finish_grid_pinch_column_gesture(self, ctx, "disabled");
                 }
                 let touch_derived_pointer_activity =
                     touch_frame.has_touch_derived_pointer_activity();
@@ -15199,7 +15202,8 @@ impl App {
                     fractional_drag_y,
                     touch_scroll_phase,
                 );
-                let touch_scroll_active = touch_frame.is_active()
+                let touch_scroll_active = touch_scroll_enabled
+                    && touch_frame.is_active()
                     && touch_frame.owner() == crate::touch_input::TouchOwner::GridScroll;
                 let snap_glide_active =
                     grid_touch_snap_needs_animation_repaint(touch_scroll_phase);

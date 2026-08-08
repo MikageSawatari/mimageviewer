@@ -326,6 +326,15 @@ gate が真なら phase ごとのミラー遷移と合成列は次のとおり�
 primary press を一度も出していなくても primary release → `PointerGone` を出す。mIV の相関層は
 この再開放を含めて gate と 1 対 1 でミラーし、release を正当な期待列として相関する。
 
+`drive_egui_touch_input(..., enabled)` の `enabled` は、**入力を観測するかではなく、
+認識結果を実行してよいか**を表す。通常の呼び出しでは値にかかわらず raw Touch を処理し、
+接点、pending signature、egui-winit の `pointer_touch_id` ミラーを常に進める。
+`enabled=false` では返却コマンドと primary 抑止勧告だけを落とし、相関済み provenance と
+active/contact 状態は caller が境界を安全に閉じるため保持する。これにより Start が範囲選択等の
+抑止中、End が解除後という並びでも、次の stream を stray tail と誤認せず 1 回で認識できる。
+診断用 `MIV_DISABLE_TOUCH_GESTURES=1` はこの引数とは別の process-wide hard disable であり、
+従来どおり touch action と promoted-pointer filter を無効にして legacy 経路へ戻す。
+
 `InputState::events` は raw event 列を順序どおり clone している
 (`egui-0.33.3/src/input_state/mod.rs:574`) ので、mIV からこの並びを観測できる。
 
@@ -1134,8 +1143,22 @@ anchor/remainder 計算・端数表示時の可視/keep 範囲・pointer stream 
 | 8 | **UI 倍率** | 案内は「おすすめ」に留め強制しない。**+ オーバーレイヘルプにスケーリングへの導線を添える** (下記) |
 | 9 | **動画のシーク量** | **±5 秒** (mIV のキーボードと同じ刻み。アプリ内の一貫性を優先) |
 | 10 | 動画の AI アップスケール / カラー化 | **静止画のみ対象**。動画再生中には元から機能が無く、タッチ対応で追加する話ではない |
-| 11 | **非アクティブな窓への最初のタップ** (2026-08-08) | **食べない**。ジェスチャは通常どおり動かし、overlay control へ届く synthetic press だけ抑止する。マウスは最初のクリックが再生/一時停止という副作用を持つので従来どおり食べる。§5.9 |
+| 11 | **非アクティブな窓への最初のタップ** (2026-08-08) | **食べない**。ジェスチャは通常どおり動かし、overlay control へ届く synthetic press だけ抑止する。静止画 egui 面では中央の `ToggleChrome` だけを通し、左右の `PageSide` は前面化だけにしてページを送らない。初回ヘルプ表示中の全域タップは既存どおり learn + chrome 表示へ写像する。マウスは最初のクリックが再生/一時停止という副作用を持つので従来どおり食べる。§5.9 |
 | 12 | **エッジスワイプ** (2026-08-08 実機) | **不採用・実装削除**。Windows 11 では上下左右すべてが OS 予約で安定配送されない。左右パネルは「中央タップ → ハンドル」の 1 経路にする。§5.5 |
+
+#### 11 の補足: v2.13.0 静止画 egui 面の実機バグ修正
+
+2026-08-08 の実機ログでは、他アプリが foreground の間も egui event 列には
+`Touch(Start) → PointerMoved → primary press` が届いていたが、focus reclaim の早期 return
+branch が `drive_egui_touch_input(..., false)` を呼んだため、相関ログは
+`commands=0[] contacts=0->0 pointer_touch=absent->absent` のままだった。11 回のタップが
+すべてこの形で捨てられ、初回ヘルプも閉じられなかった。
+
+原因は Step 3d の退行ではなく、タッチ対応以前からある「前面復帰クリックを操作に使わない」
+マウス向け branch が、`enabled=false` を観測停止として扱っていたことである。早期 return、
+foreground 奪還処理、`fs_suppress_primary_until_release` は維持し、branch 内で touch correlation
+だけを実行可能にした。返却結果は `ToggleChrome`（初回ヘルプ中の learn + chrome を含む）だけを
+採用し、`PageSide`、pinch、pan、widget への synthetic primary は採用しない。
 
 #### 8 の補足: オーバーレイヘルプにスケーリングへの導線を添える
 
@@ -1278,8 +1301,9 @@ NeeView は **ペンと指を区別していない**。リポジトリ全体で 
    (`ui_main.rs:10942, 11015`) ので、新しいフォルダピッカーは必須ではない。
 6. スクロールバーの実効的な掴みやすさ (DPI・UI 倍率・機種依存)。
 7. detached viewer で、root と別 viewport のタッチ状態が混ざらないこと。
-   passive detached の「最初のクリックは復帰だけ」という既存挙動を、最初のタップが
-   突き抜けて操作まで届かないかを実機確認する。
+   passive detached の最初の**マウスクリック**は従来どおり復帰だけ、最初の**中央タップ**は
+   chrome 表示まで届く一方、左右タップでページが動かず widget press にもならないことを
+   実機確認する。
 
 ---
 

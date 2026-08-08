@@ -43,6 +43,15 @@ impl TouchFrame {
         }
     }
 
+    /// Keep read-only observation results while removing everything that may
+    /// authorize a caller-side gesture action or primary-pointer suppression.
+    fn suppress_execution(&mut self) {
+        self.commands.clear();
+        for event in &mut self.primary_events {
+            event.should_suppress = false;
+        }
+    }
+
     pub(crate) fn commands(&self) -> &[TouchCommand] {
         &self.commands
     }
@@ -388,9 +397,9 @@ impl TouchCorrelationState {
         geometry: &TapZoneGeometry,
         events: &[Event],
         now_ms: u64,
-        disabled: bool,
+        execution_enabled: bool,
     ) -> TouchFrame {
-        self.process_frame_with_diagnostics(geometry, events, now_ms, disabled, false)
+        self.process_frame_with_diagnostics(geometry, events, now_ms, execution_enabled, false)
             .0
     }
 
@@ -399,23 +408,31 @@ impl TouchCorrelationState {
         geometry: &TapZoneGeometry,
         events: &[Event],
         now_ms: u64,
-        disabled: bool,
+        execution_enabled: bool,
         diagnostics_enabled: bool,
     ) -> (TouchFrame, Option<CorrelationDiagnostics>) {
         let mut frame = FrameBuilder::new(self, diagnostics_enabled);
-        if disabled {
-            frame.touch_cancelled = self.recognizer.is_active();
-            *self = Self::default();
-            return frame.finish(
-                self.recognizer.owner(),
-                self.recognizer.is_active(),
-                CorrelationStateSnapshot::capture(self),
-            );
-        }
-
         for event in events {
             self.process_event(geometry, event, now_ms, &mut frame);
         }
+        let (mut touch_frame, diagnostics) = frame.finish(
+            self.recognizer.owner(),
+            self.recognizer.is_active(),
+            CorrelationStateSnapshot::capture(self),
+        );
+        if !execution_enabled {
+            touch_frame.suppress_execution();
+        }
+        (touch_frame, diagnostics)
+    }
+
+    fn reset_for_global_disable(
+        &mut self,
+        diagnostics_enabled: bool,
+    ) -> (TouchFrame, Option<CorrelationDiagnostics>) {
+        let mut frame = FrameBuilder::new(self, diagnostics_enabled);
+        frame.touch_cancelled = self.recognizer.is_active();
+        *self = Self::default();
         frame.finish(
             self.recognizer.owner(),
             self.recognizer.is_active(),
@@ -596,6 +613,11 @@ impl DiagnosticDriveKind {
 /// including when egui performs more than one pass for the same app frame.
 /// The first drive may return commands; repeated drives replay correlation and
 /// suppression state with an empty command list.
+/// `enabled` gates only caller-side command execution and suppression advice.
+/// Raw touch events always advance the contact tracker, pending signature, and
+/// egui-winit `pointer_touch_id` mirror so a disabled interval cannot corrupt
+/// the next enabled stream. The process-wide diagnostic escape hatch
+/// `MIV_DISABLE_TOUCH_GESTURES` remains a separate hard-disable path.
 ///
 /// This only clones events and writes `ctx.data_temp`: it never consumes input,
 /// mutates pointer state, requests repaint, executes commands, or suppresses a
@@ -607,21 +629,34 @@ pub(crate) fn drive_egui_touch_input(
     frame: u64,
     enabled: bool,
 ) -> TouchFrame {
-    drive_egui_touch_input_inner(
+    drive_egui_touch_input_with_policy(
         ctx,
         surface,
         geometry,
         frame,
-        touch_gestures_disabled() || !enabled,
+        enabled,
+        touch_gestures_disabled(),
     )
 }
 
+#[cfg(test)]
 fn drive_egui_touch_input_inner(
     ctx: &egui::Context,
     surface: TouchSurface,
     geometry: TapZoneGeometry,
     frame: u64,
-    disabled: bool,
+    execution_enabled: bool,
+) -> TouchFrame {
+    drive_egui_touch_input_with_policy(ctx, surface, geometry, frame, execution_enabled, false)
+}
+
+fn drive_egui_touch_input_with_policy(
+    ctx: &egui::Context,
+    surface: TouchSurface,
+    geometry: TapZoneGeometry,
+    frame: u64,
+    execution_enabled: bool,
+    gestures_disabled: bool,
 ) -> TouchFrame {
     let viewport = ctx.viewport_id();
     let (events, now_ms) = ctx.input(|input| {
@@ -633,7 +668,15 @@ fn drive_egui_touch_input_inner(
         (input.events.clone(), millis)
     });
     process_in_temp_data(
-        ctx, viewport, frame, surface, geometry, events, now_ms, disabled,
+        ctx,
+        viewport,
+        frame,
+        surface,
+        geometry,
+        events,
+        now_ms,
+        execution_enabled,
+        gestures_disabled,
     )
 }
 
@@ -646,7 +689,8 @@ fn process_in_temp_data(
     geometry: TapZoneGeometry,
     events: Vec<Event>,
     now_ms: u64,
-    disabled: bool,
+    execution_enabled: bool,
+    gestures_disabled: bool,
 ) -> TouchFrame {
     let diagnostics_enabled = crate::touch_debug::touch_debug_enabled();
     let pass = diagnostics_enabled.then(|| (ctx.cumulative_pass_nr(), ctx.current_pass_index()));
@@ -677,7 +721,8 @@ fn process_in_temp_data(
             &geometry,
             &events,
             now_ms,
-            disabled,
+            execution_enabled,
+            gestures_disabled,
             diagnostics_enabled,
         );
         (
@@ -741,20 +786,25 @@ fn process_surface_state(
     geometry: &TapZoneGeometry,
     events: &[Event],
     now_ms: u64,
-    disabled: bool,
+    execution_enabled: bool,
+    gestures_disabled: bool,
     diagnostics_enabled: bool,
 ) -> (TouchFrame, Option<CorrelationDiagnostics>) {
     let id = state_id(viewport, surface);
     let mut state = data
         .get_temp::<TouchCorrelationState>(id)
         .unwrap_or_default();
-    let (frame, diagnostics) = state.process_frame_with_diagnostics(
-        geometry,
-        events,
-        now_ms,
-        disabled,
-        diagnostics_enabled,
-    );
+    let (frame, diagnostics) = if gestures_disabled {
+        state.reset_for_global_disable(diagnostics_enabled)
+    } else {
+        state.process_frame_with_diagnostics(
+            geometry,
+            events,
+            now_ms,
+            execution_enabled,
+            diagnostics_enabled,
+        )
+    };
     state.repeatable_frame = frame.replay_for_later_passes();
     state.repeatable_diagnostics = diagnostics
         .as_ref()
@@ -976,7 +1026,7 @@ mod tests {
     }
 
     fn process(state: &mut TouchCorrelationState, events: &[Event], now_ms: u64) -> TouchFrame {
-        state.process_frame(&geometry(), events, now_ms, false)
+        state.process_frame(&geometry(), events, now_ms, true)
     }
 
     fn drive_twice_in_app_frame(
@@ -1000,14 +1050,14 @@ mod tests {
                     TouchSurface::StillFullscreen,
                     geometry.clone(),
                     frame,
-                    false,
+                    true,
                 ),
                 drive_egui_touch_input_inner(
                     ctx,
                     TouchSurface::StillFullscreen,
                     geometry.clone(),
                     frame,
-                    false,
+                    true,
                 ),
             ));
         });
@@ -1018,13 +1068,8 @@ mod tests {
     fn correlation_diagnostic_line_carries_frame_state_and_command_kinds() {
         let mut state = TouchCorrelationState::default();
         let pos = pos2(500.0, 400.0);
-        let (frame, diagnostics) = state.process_frame_with_diagnostics(
-            &geometry(),
-            &tap_events(1, pos),
-            100,
-            false,
-            true,
-        );
+        let (frame, diagnostics) =
+            state.process_frame_with_diagnostics(&geometry(), &tap_events(1, pos), 100, true, true);
         let diagnostics = diagnostics.unwrap();
         let line = format_correlation_diagnostics(
             egui::ViewportId::ROOT,
@@ -1070,7 +1115,7 @@ mod tests {
         let pos = pos2(500.0, 400.0);
         let events = [touch(1, egui::TouchPhase::Start, pos), primary(pos, true)];
         let (frame, diagnostics) =
-            state.process_frame_with_diagnostics(&geometry(), &events, 100, false, true);
+            state.process_frame_with_diagnostics(&geometry(), &events, 100, true, true);
         let line = format_correlation_diagnostics(
             egui::ViewportId::ROOT,
             TouchSurface::StillFullscreen,
@@ -1116,7 +1161,7 @@ mod tests {
             &geometry(),
             &[primary(pos, false)],
             100,
-            false,
+            true,
             true,
         );
 
@@ -1294,7 +1339,7 @@ mod tests {
             Event::PointerGone,
         ];
         let (_, diagnostics) =
-            invalid_cancel.process_frame_with_diagnostics(&geometry(), &invalid, 301, false, true);
+            invalid_cancel.process_frame_with_diagnostics(&geometry(), &invalid, 301, true, true);
         assert!(diagnostics.unwrap().ambiguous());
     }
 
@@ -1415,7 +1460,46 @@ mod tests {
     }
 
     #[test]
-    fn disabled_gate_returns_nothing_and_discards_existing_state() {
+    fn execution_disabled_hides_actions_but_keeps_observation_state() {
+        let mut state = TouchCorrelationState::default();
+        let pos = pos2(500.0, 400.0);
+        let start = vec![
+            touch(1, egui::TouchPhase::Start, pos),
+            Event::PointerMoved(pos),
+            primary(pos, true),
+        ];
+        let disabled_start = state.process_frame(&geometry(), &start, 100, false);
+        assert!(disabled_start.commands().is_empty());
+        assert!(!disabled_start.should_suppress_primary(pos, true));
+        assert!(disabled_start.has_touch_derived_pointer_activity());
+        assert!(state.recognizer.is_active());
+        assert_eq!(state.recognizer.contact_count(), 1);
+        assert_eq!(state.pointer_touch, Some(TouchId(1)));
+        assert!(state.pending.is_none());
+
+        // Re-enable after the Start was observed while execution was blocked.
+        // The matching End must close the same mirrored stream, not a reset or
+        // a stray tail, and the following gesture must still work normally.
+        let end = vec![
+            touch(1, egui::TouchPhase::End, pos),
+            primary(pos, false),
+            Event::PointerGone,
+        ];
+        let reenabled_end = state.process_frame(&geometry(), &end, 200, true);
+        assert_eq!(reenabled_end.commands(), &[TouchCommand::ToggleChrome]);
+        assert!(reenabled_end.should_suppress_primary(pos, false));
+        assert!(!state.recognizer.is_active());
+        assert_eq!(state.recognizer.contact_count(), 0);
+        assert!(state.pointer_touch.is_none());
+        assert!(state.pending.is_none());
+
+        let next = state.process_frame(&geometry(), &tap_events(2, pos), 300, true);
+        assert_eq!(next.commands(), &[TouchCommand::ToggleChrome]);
+        assert!(next.should_suppress_primary(pos, false));
+    }
+
+    #[test]
+    fn global_gesture_disable_retains_the_legacy_hard_reset() {
         let mut state = TouchCorrelationState::default();
         let pos = pos2(500.0, 400.0);
         let start = vec![
@@ -1426,8 +1510,7 @@ mod tests {
         let _ = process(&mut state, &start, 100);
         assert!(state.recognizer.is_active());
 
-        // true is the production gate value when the environment variable is set.
-        let frame = state.process_frame(&geometry(), &tap_events(2, pos), 200, true);
+        let (frame, _) = state.reset_for_global_disable(false);
         assert!(frame.commands().is_empty());
         assert!(frame.primary_events.is_empty());
         assert!(frame.touch_cancelled());
@@ -1477,7 +1560,7 @@ mod tests {
                     TouchSurface::MainGrid,
                     geometry.clone(),
                     9,
-                    false,
+                    true,
                 );
                 let mut response = ui.allocate_rect(ui.max_rect(), egui::Sense::click());
                 response.interact_pointer_pos = Some(pos2(500.0, 400.0));
@@ -1489,7 +1572,7 @@ mod tests {
                     TouchSurface::MainGrid,
                     geometry.clone(),
                     9,
-                    false,
+                    true,
                 );
                 assert!(repeated.commands().is_empty());
                 assert!(repeated.should_suppress_response(&response));
@@ -1504,11 +1587,89 @@ mod tests {
                     TouchSurface::StillFullscreen,
                     geometry.clone(),
                     9,
-                    false,
+                    true,
                 );
                 assert!(conflicting.commands().is_empty());
             });
         });
+    }
+
+    #[test]
+    fn context_driver_observes_disabled_start_and_enabled_end() {
+        let ctx = egui::Context::default();
+        let geometry = geometry();
+        let pos = pos2(500.0, 400.0);
+        let mut disabled_frame = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(geometry.surface),
+                time: Some(0.1),
+                events: vec![
+                    touch(1, egui::TouchPhase::Start, pos),
+                    Event::PointerMoved(pos),
+                    primary(pos, true),
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                disabled_frame = Some(drive_egui_touch_input_inner(
+                    ctx,
+                    TouchSurface::StillFullscreen,
+                    geometry.clone(),
+                    20,
+                    false,
+                ));
+            },
+        );
+        let disabled_frame = disabled_frame.unwrap();
+        assert!(disabled_frame.commands().is_empty());
+        assert!(disabled_frame.has_touch_derived_pointer_activity());
+        assert!(!disabled_frame.should_suppress_primary(pos, true));
+        let disabled_state = ctx.data(|data| {
+            data.get_temp::<TouchCorrelationState>(state_id(
+                egui::ViewportId::ROOT,
+                TouchSurface::StillFullscreen,
+            ))
+            .unwrap()
+        });
+        assert_eq!(disabled_state.pointer_touch, Some(TouchId(1)));
+        assert_eq!(disabled_state.recognizer.contact_count(), 1);
+
+        let mut enabled_frame = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(geometry.surface),
+                time: Some(0.2),
+                events: vec![
+                    touch(1, egui::TouchPhase::End, pos),
+                    primary(pos, false),
+                    Event::PointerGone,
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                enabled_frame = Some(drive_egui_touch_input_inner(
+                    ctx,
+                    TouchSurface::StillFullscreen,
+                    geometry.clone(),
+                    21,
+                    true,
+                ));
+            },
+        );
+        let enabled_frame = enabled_frame.unwrap();
+        assert_eq!(enabled_frame.commands(), &[TouchCommand::ToggleChrome]);
+        assert!(enabled_frame.should_suppress_primary(pos, false));
+        let enabled_state = ctx.data(|data| {
+            data.get_temp::<TouchCorrelationState>(state_id(
+                egui::ViewportId::ROOT,
+                TouchSurface::StillFullscreen,
+            ))
+            .unwrap()
+        });
+        assert!(enabled_state.pointer_touch.is_none());
+        assert_eq!(enabled_state.recognizer.contact_count(), 0);
+        assert!(enabled_state.pending.is_none());
     }
 
     #[test]
@@ -1671,7 +1832,7 @@ mod tests {
             touch(4, egui::TouchPhase::Move, next_pinched),
         ];
         let (frame, diagnostics) =
-            state.process_frame_with_diagnostics(&geometry(), &shared_frame, 200, false, true);
+            state.process_frame_with_diagnostics(&geometry(), &shared_frame, 200, true, true);
 
         assert!(!diagnostics.unwrap().ambiguous());
         assert!(!frame.touch_cancelled());
