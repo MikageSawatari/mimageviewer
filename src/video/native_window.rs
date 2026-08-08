@@ -47,7 +47,7 @@ use windows::core::w;
 
 use super::native_touch::{
     NativePointerTypeProbe, NativeTouchOwnership, NativeTouchOwnershipDecision,
-    native_touch_focus_restore_only, native_touch_followup_phase,
+    native_touch_followup_phase, native_touch_is_activation_tap,
     native_touch_mouse_discard_decision, native_touch_should_request_focus_claim,
 };
 pub use super::native_touch::{NativeVideoTouchEvent, NativeVideoTouchPhase};
@@ -1180,6 +1180,7 @@ fn send_touch_event(
     pointer_id: u32,
     position: [i32; 2],
     phase: NativeVideoTouchPhase,
+    suppress_widget_primary: bool,
 ) {
     if let Some(sink) = sink {
         sink.send(NativeVideoWindowEvent::Touch(NativeVideoTouchEvent {
@@ -1187,6 +1188,7 @@ fn send_touch_event(
             x: position[0],
             y: position[1],
             phase,
+            suppress_widget_primary,
         }));
     }
 }
@@ -1238,8 +1240,8 @@ fn handle_presenter_pointer_message(hwnd: HWND, msg: u32, wparam: WPARAM) -> Opt
     let foreground_is_current_process = hwnd_belongs_to_current_process_strict(foreground);
     let presenter_is_foreground = foreground == hwnd;
     let presenter_has_thread_focus = unsafe { GetFocus() } == hwnd;
-    let focus_restore_only = state.touch_ownership.has_focus_restore_only_stream()
-        || native_touch_focus_restore_only(
+    let activation_tap = state.touch_ownership.has_activation_tap_stream()
+        || native_touch_is_activation_tap(
             is_child,
             foreground_is_current_process,
             presenter_is_foreground,
@@ -1251,15 +1253,15 @@ fn handle_presenter_pointer_message(hwnd: HWND, msg: u32, wparam: WPARAM) -> Opt
         presenter_is_foreground,
         presenter_has_thread_focus,
     );
-    if focus_restore_only {
-        state.touch_ownership.mark_focus_restore_only(pointer_id);
+    if activation_tap {
+        state.touch_ownership.mark_activation_tap(pointer_id);
     }
 
     if let Some(info) = pointer_client_info(hwnd, pointer_id) {
         state
             .touch_ownership
             .record_client_position(pointer_id, info.x, info.y);
-        let phase = if info.cancelled || focus_restore_only {
+        let phase = if info.cancelled {
             NativeVideoTouchPhase::Cancel
         } else {
             NativeVideoTouchPhase::Start
@@ -1269,6 +1271,7 @@ fn handle_presenter_pointer_message(hwnd: HWND, msg: u32, wparam: WPARAM) -> Opt
             pointer_id,
             [info.x, info.y],
             phase,
+            activation_tap,
         );
         if info.cancelled {
             state.touch_ownership.release(pointer_id);
@@ -1301,12 +1304,14 @@ fn handle_owned_pointer_followup(
     if msg == WM_POINTERCAPTURECHANGED {
         // No Cancel/capture-loss message was observed during the Phase 1
         // hardware gate. Keep this defensive path and its diagnostic live.
+        let activation_tap = state.touch_ownership.is_activation_tap(pointer_id);
         if let Some(position) = state.touch_ownership.last_client_position(pointer_id) {
             send_touch_event(
                 state.event_sink.as_ref(),
                 pointer_id,
                 position,
                 NativeVideoTouchPhase::Cancel,
+                activation_tap,
             );
         }
         state.touch_ownership.release(pointer_id);
@@ -1318,12 +1323,14 @@ fn handle_owned_pointer_followup(
 
     let Some(info) = pointer_client_info(hwnd, pointer_id) else {
         if msg == WM_POINTERUP {
+            let activation_tap = state.touch_ownership.is_activation_tap(pointer_id);
             if let Some(position) = state.touch_ownership.last_client_position(pointer_id) {
                 send_touch_event(
                     state.event_sink.as_ref(),
                     pointer_id,
                     position,
                     NativeVideoTouchPhase::Cancel,
+                    activation_tap,
                 );
             }
             state.touch_ownership.release(pointer_id);
@@ -1333,18 +1340,16 @@ fn handle_owned_pointer_followup(
     state
         .touch_ownership
         .record_client_position(pointer_id, info.x, info.y);
-    if state.touch_ownership.is_focus_restore_only(pointer_id) {
-        if info.cancelled || msg == WM_POINTERUP {
-            state.touch_ownership.release(pointer_id);
-        }
-        return Some(LRESULT(0));
-    }
+    // An activation tap is delivered like any other gesture; only its
+    // synthetic primary press is withheld downstream.
+    let activation_tap = state.touch_ownership.is_activation_tap(pointer_id);
     let phase = native_touch_followup_phase(info.cancelled, msg == WM_POINTERUP);
     send_touch_event(
         state.event_sink.as_ref(),
         pointer_id,
         [info.x, info.y],
         phase,
+        activation_tap,
     );
     if info.cancelled || msg == WM_POINTERUP {
         state.touch_ownership.release(pointer_id);
@@ -2077,6 +2082,7 @@ mod tests {
                 x: 100,
                 y: 200,
                 phase,
+                suppress_widget_primary: false,
             }));
         }
 

@@ -32,6 +32,10 @@ pub struct NativeVideoTouchEvent {
     /// Presenter client coordinate in physical pixels.
     pub y: i32,
     pub phase: NativeVideoTouchPhase,
+    /// This stream began while the presenter was not active, so it must not
+    /// reach an overlay control. The gesture itself is still recognized; see
+    /// `native_touch_is_activation_tap`.
+    pub suppress_widget_primary: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,7 +76,7 @@ pub(crate) enum NativeTouchOwnershipDecision {
 struct OwnedTouchPointer {
     id: u32,
     last_client_position: Option<[i32; 2]>,
-    focus_restore_only: bool,
+    activation_tap: bool,
 }
 
 /// Pure, bounded ownership state for one presenter HWND.
@@ -129,7 +133,7 @@ impl NativeTouchOwnership {
         self.pointers.push(OwnedTouchPointer {
             id: pointer_id,
             last_client_position: None,
-            focus_restore_only: false,
+            activation_tap: false,
         });
         NativeTouchOwnershipDecision::Owned
     }
@@ -159,27 +163,25 @@ impl NativeTouchOwnership {
             .and_then(|pointer| pointer.last_client_position)
     }
 
-    pub(crate) fn mark_focus_restore_only(&mut self, pointer_id: u32) {
+    pub(crate) fn mark_activation_tap(&mut self, pointer_id: u32) {
         if let Some(pointer) = self
             .pointers
             .iter_mut()
             .find(|pointer| pointer.id == pointer_id)
         {
-            pointer.focus_restore_only = true;
+            pointer.activation_tap = true;
         }
     }
 
-    pub(crate) fn is_focus_restore_only(&self, pointer_id: u32) -> bool {
+    pub(crate) fn is_activation_tap(&self, pointer_id: u32) -> bool {
         self.pointers
             .iter()
             .find(|pointer| pointer.id == pointer_id)
-            .is_some_and(|pointer| pointer.focus_restore_only)
+            .is_some_and(|pointer| pointer.activation_tap)
     }
 
-    pub(crate) fn has_focus_restore_only_stream(&self) -> bool {
-        self.pointers
-            .iter()
-            .any(|pointer| pointer.focus_restore_only)
+    pub(crate) fn has_activation_tap_stream(&self) -> bool {
+        self.pointers.iter().any(|pointer| pointer.activation_tap)
     }
 
     pub(crate) fn release(&mut self, pointer_id: u32) -> bool {
@@ -257,7 +259,15 @@ pub(crate) fn native_touch_mouse_discard_decision(
     gestures_enabled && source_query_succeeded && source_is_touch
 }
 
-pub(crate) fn native_touch_focus_restore_only(
+/// Whether this stream began while the presenter was not the active window.
+///
+/// Mouse eats the whole activating click (`MA_ACTIVATEANDEAT`) because the
+/// presenter body binds it to play/pause. Touch binds the presenter body only
+/// to revealing chrome, which has no side effect, and someone who tapped an
+/// inactive window plainly intends to operate it next. So the gesture is
+/// recognized normally and only the synthetic press that could reach an
+/// overlay control is withheld (2026-08-08, real-device judgement).
+pub(crate) fn native_touch_is_activation_tap(
     is_child_window: bool,
     foreground_is_current_process: bool,
     presenter_is_foreground: bool,
@@ -277,7 +287,7 @@ pub(crate) fn native_touch_should_request_focus_claim(
     presenter_has_thread_focus: bool,
 ) -> bool {
     first_owned_stream
-        && (native_touch_focus_restore_only(
+        && (native_touch_is_activation_tap(
             is_child_window,
             foreground_is_current_process,
             presenter_is_foreground,
@@ -303,6 +313,9 @@ pub(crate) struct NativeTouchAdapter {
     primary_id: Option<u32>,
     primary_start_pos: Option<egui::Pos2>,
     primary_pressed: bool,
+    /// The primary contact began on an inactive presenter, so no synthetic
+    /// press is emitted for it. The gesture still runs.
+    primary_withholds_press: bool,
     pending_commands: Vec<TouchCommand>,
     chrome_latched: bool,
 }
@@ -333,6 +346,7 @@ impl NativeTouchAdapter {
             self.primary_id = Some(event.pointer_id);
             self.primary_start_pos = Some(pos);
             self.primary_pressed = false;
+            self.primary_withholds_press = event.suppress_widget_primary;
         }
         let is_primary = self.primary_id == Some(event.pointer_id);
         let commands = self.recognizer.handle_sample(
@@ -354,7 +368,9 @@ impl NativeTouchAdapter {
         if is_primary && !cancelled_existing_press {
             match event.phase {
                 NativeVideoTouchPhase::Start => {
-                    if !suppress_primary && self.recognizer.owner() == TouchOwner::WidgetPassthrough
+                    if !suppress_primary
+                        && !self.primary_withholds_press
+                        && self.recognizer.owner() == TouchOwner::WidgetPassthrough
                     {
                         self.press_primary_at(pos, &mut egui_events);
                     } else {
@@ -363,6 +379,7 @@ impl NativeTouchAdapter {
                 }
                 NativeVideoTouchPhase::Move | NativeVideoTouchPhase::End => {
                     if !suppress_primary
+                        && !self.primary_withholds_press
                         && !self.primary_pressed
                         && matches!(
                             self.recognizer.owner(),
@@ -397,6 +414,7 @@ impl NativeTouchAdapter {
             self.primary_id = None;
             self.primary_start_pos = None;
             self.primary_pressed = false;
+            self.primary_withholds_press = false;
         }
 
         NativeTouchAdapterOutput { pos, egui_events }
@@ -499,6 +517,19 @@ mod tests {
             x,
             y,
             phase,
+            suppress_widget_primary: false,
+        }
+    }
+
+    fn activation_event(
+        pointer_id: u32,
+        x: i32,
+        y: i32,
+        phase: NativeVideoTouchPhase,
+    ) -> NativeVideoTouchEvent {
+        NativeVideoTouchEvent {
+            suppress_widget_primary: true,
+            ..event(pointer_id, x, y, phase)
         }
     }
 
@@ -594,18 +625,18 @@ mod tests {
     }
 
     #[test]
-    fn focus_restore_only_and_window_destroy_clear_are_per_hwnd_state() {
+    fn activation_tap_and_window_destroy_clear_are_per_hwnd_state() {
         let mut state = NativeTouchOwnership::default();
         state.begin(11, true, NativePointerTypeProbe::Touch);
-        state.mark_focus_restore_only(11);
-        assert!(state.is_focus_restore_only(11));
-        assert!(state.has_focus_restore_only_stream());
+        state.mark_activation_tap(11);
+        assert!(state.is_activation_tap(11));
+        assert!(state.has_activation_tap_stream());
         state.begin(12, true, NativePointerTypeProbe::Touch);
-        state.mark_focus_restore_only(12);
+        state.mark_activation_tap(12);
         state.release(11);
-        assert!(state.has_focus_restore_only_stream());
+        assert!(state.has_activation_tap_stream());
         state.release(12);
-        assert!(!state.has_focus_restore_only_stream());
+        assert!(!state.has_activation_tap_stream());
         state.begin(13, true, NativePointerTypeProbe::Touch);
         state.clear();
         assert_eq!(state.len(), 0);
@@ -620,12 +651,12 @@ mod tests {
     }
 
     #[test]
-    fn focus_restore_only_matches_existing_child_and_popup_activation_policy() {
-        assert!(!native_touch_focus_restore_only(true, true, false));
-        assert!(native_touch_focus_restore_only(true, false, false));
-        assert!(!native_touch_focus_restore_only(false, true, true));
-        assert!(native_touch_focus_restore_only(false, true, false));
-        assert!(native_touch_focus_restore_only(false, false, false));
+    fn activation_tap_matches_existing_child_and_popup_activation_policy() {
+        assert!(!native_touch_is_activation_tap(true, true, false));
+        assert!(native_touch_is_activation_tap(true, false, false));
+        assert!(!native_touch_is_activation_tap(false, true, true));
+        assert!(native_touch_is_activation_tap(false, true, false));
+        assert!(native_touch_is_activation_tap(false, false, false));
     }
 
     #[test]
@@ -718,6 +749,77 @@ mod tests {
         assert!(!has_primary_button(&end.egui_events, false));
         assert_eq!(adapter.take_commands(), vec![TouchCommand::ToggleChrome]);
         assert!(adapter.take_commands().is_empty());
+    }
+
+    #[test]
+    fn activation_tap_still_reveals_chrome() {
+        let mut adapter = NativeTouchAdapter::default();
+        adapter.handle_event(
+            activation_event(1, 500, 400, NativeVideoTouchPhase::Start),
+            &geometry(),
+            0,
+            1.0,
+        );
+        adapter.handle_event(
+            activation_event(1, 500, 400, NativeVideoTouchPhase::End),
+            &geometry(),
+            100,
+            1.0,
+        );
+        assert_eq!(adapter.take_commands(), vec![TouchCommand::ToggleChrome]);
+    }
+
+    #[test]
+    fn activation_tap_never_reaches_an_overlay_control() {
+        let mut geometry = geometry();
+        geometry.excluded.push(egui::Rect::from_min_max(
+            egui::Pos2::ZERO,
+            egui::pos2(200.0, 100.0),
+        ));
+        let mut adapter = NativeTouchAdapter::default();
+        let start = adapter.handle_event(
+            activation_event(1, 100, 50, NativeVideoTouchPhase::Start),
+            &geometry,
+            0,
+            1.0,
+        );
+        let end = adapter.handle_event(
+            activation_event(1, 100, 50, NativeVideoTouchPhase::End),
+            &geometry,
+            100,
+            1.0,
+        );
+        assert!(!has_primary_button(&start.egui_events, true));
+        assert!(!has_primary_button(&end.egui_events, false));
+    }
+
+    #[test]
+    fn press_withholding_does_not_leak_into_the_next_gesture() {
+        let mut geometry = geometry();
+        geometry.excluded.push(egui::Rect::from_min_max(
+            egui::Pos2::ZERO,
+            egui::pos2(200.0, 100.0),
+        ));
+        let mut adapter = NativeTouchAdapter::default();
+        adapter.handle_event(
+            activation_event(1, 100, 50, NativeVideoTouchPhase::Start),
+            &geometry,
+            0,
+            1.0,
+        );
+        adapter.handle_event(
+            activation_event(1, 100, 50, NativeVideoTouchPhase::End),
+            &geometry,
+            100,
+            1.0,
+        );
+        let start = adapter.handle_event(
+            event(2, 100, 50, NativeVideoTouchPhase::Start),
+            &geometry,
+            200,
+            1.0,
+        );
+        assert!(has_primary_button(&start.egui_events, true));
     }
 
     #[test]

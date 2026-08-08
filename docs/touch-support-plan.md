@@ -909,9 +909,15 @@ Microsoft は **「一つの pointer stream の一部だけを消費し、残り
 - touch DOWN のうち、最初の所有 stream かつ presenter の activation または thread focus が
   不足している場合だけ typed `RequestFocusClaim` を pump へ送り、既存
   `claim_foreground` 経路へ合流する。既に foreground/focus を持つ tap と2本目以降では送らない。
-  復帰 tap の判定も既存 `WM_MOUSEACTIVATE` と揃え、
-  child は foreground が他プロセスのとき、top-level popup は presenter 自身が foreground でないときに
-  gesture を Cancel 扱いとして、従来の `MA_ACTIVATEANDEAT` と同様に「復帰だけ」にする。
+  非アクティブ判定 (activation tap) は既存 `WM_MOUSEACTIVATE` と揃え、
+  child は foreground が他プロセスのとき、top-level popup は presenter 自身が foreground でないとき。
+- **activation tap の扱いはマウスと意図的に変える** (2026-08-08、実機判断)。
+  マウスはアクティブ化クリックを `MA_ACTIVATEANDEAT` で丸ごと食べる。presenter 本体の左クリックが
+  **再生 / 一時停止という副作用**を持つからである。タッチの presenter 本体はクロームを出すだけで
+  副作用が無く、非アクティブな窓をタップした人は次に操作する意図がある。したがって
+  **ジェスチャは通常どおり認識し、overlay の control へ届き得る synthetic press だけを抑止**する。
+  = 復帰タップでもクロームは出る。gesture ごと捨てると、前面状態次第で 1 タップ目の
+  意味が変わり挙動が読めなくなるため、この形に固定した。
 - **HUD HWND は意図的に対象外**。HUD は promoted mouse で既存ボタンを操作できており、所有へ
   切り替えるには HUD 側の pointer emulation とターゲットサイズ調整を一緒に完成させる必要がある。
   HUD の所有・emulation・ボタンサイズ調整は Phase 3 で行う。したがって
@@ -1086,6 +1092,7 @@ anchor/remainder 計算・端数表示時の可視/keep 範囲・pointer stream 
 | 8 | **UI 倍率** | 案内は「おすすめ」に留め強制しない。**+ オーバーレイヘルプにスケーリングへの導線を添える** (下記) |
 | 9 | **動画のシーク量** | **±5 秒** (mIV のキーボードと同じ刻み。アプリ内の一貫性を優先) |
 | 10 | 動画の AI アップスケール / カラー化 | **静止画のみ対象**。動画再生中には元から機能が無く、タッチ対応で追加する話ではない |
+| 11 | **非アクティブな窓への最初のタップ** (2026-08-08) | **食べない**。ジェスチャは通常どおり動かし、overlay control へ届く synthetic press だけ抑止する。マウスは最初のクリックが再生/一時停止という副作用を持つので従来どおり食べる。§5.9 |
 
 #### 8 の補足: オーバーレイヘルプにスケーリングへの導線を添える
 
