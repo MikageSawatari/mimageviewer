@@ -2283,21 +2283,16 @@ mod tests {
 
     fn write_request() -> RemoteWriteRequest {
         RemoteWriteRequest::SetSpread {
-            address: mimageviewer_ipc::RemoteAddress::file(
-                "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
-                "books/book.pdf",
-            ),
+            address: mimageviewer_ipc::RemoteAddress::file("C:/Books/book.pdf"),
             spread_mode: mimageviewer_ipc::RemoteSpreadMode::RtlCover,
             reading_direction: mimageviewer_ipc::RemoteReadingDirection::Rtl,
         }
     }
 
     fn write_requests() -> Vec<RemoteWriteRequest> {
-        let favorite = "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2";
-        let container = mimageviewer_ipc::RemoteAddress::file(favorite, "books/book.pdf");
+        let container = mimageviewer_ipc::RemoteAddress::file("C:/Books/book.pdf");
         let page = mimageviewer_ipc::RemoteAddress {
-            root_id: favorite.to_owned(),
-            relative_path: "books/book.pdf".to_owned(),
+            path: "C:/Books/book.pdf".to_owned(),
             subresource: mimageviewer_ipc::RemoteSubresource::PdfPage { page_number: 3 },
         };
         vec![

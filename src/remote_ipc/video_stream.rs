@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mimageviewer_ipc::{
@@ -96,18 +95,11 @@ impl VideoStreamStartBudget {
         )
     }
 }
-pub(super) struct VideoStreamEngine {
-    roots: Arc<super::live_favorites::RemoteRoots>,
-}
+pub(super) struct VideoStreamEngine;
 
 impl VideoStreamEngine {
-    pub(super) fn new(settings: crate::settings::Settings) -> Self {
-        let roots = super::live_favorites::RemoteRoots::snapshot(settings.favorites.clone());
-        Self::new_with_roots(roots)
-    }
-
-    pub(super) fn new_with_roots(roots: Arc<super::live_favorites::RemoteRoots>) -> Self {
-        Self { roots }
+    pub(super) fn new() -> Self {
+        Self
     }
 
     pub(super) fn resolve_start_address(
@@ -126,15 +118,7 @@ impl VideoStreamEngine {
                 "動画ストリーミングは実ファイルだけを受け付けます",
             ));
         }
-        let roots = self.roots.current().map_err(|error| {
-            crate::logger::log(format!("remote_ipc: {error}"));
-            video_error(
-                VideoStreamErrorCode::Internal,
-                "最新の閲覧起点を読み込めませんでした",
-            )
-        })?;
-        let resolved = resolve_existing(&roots, &address.root_id, &address.relative_path)
-            .map_err(resolve_error)?;
+        let resolved = resolve_existing(&address.path).map_err(resolve_error)?;
         if !resolved
             .canonical
             .extension()
@@ -459,21 +443,13 @@ fn audio_processing_payload(
 
 fn resolve_error(error: ResolveError) -> VideoStreamError {
     let (code, message) = match error {
-        ResolveError::InvalidRootId | ResolveError::InvalidRelativePath => (
+        ResolveError::InvalidPath => (
             VideoStreamErrorCode::BadRequest,
             "動画アドレスの形式が正しくありません",
-        ),
-        ResolveError::RootNotFound => (
-            VideoStreamErrorCode::FavoriteNotFound,
-            "お気に入りが見つかりません",
         ),
         ResolveError::Unavailable => (
             VideoStreamErrorCode::NotFound,
             "動画ファイルが見つかりません",
-        ),
-        ResolveError::EscapesRoot => (
-            VideoStreamErrorCode::PathRejected,
-            "お気に入りの外側は開けません",
         ),
     };
     video_error(code, message)
@@ -607,25 +583,42 @@ mod tests {
     }
 
     #[test]
-    fn start_address_is_revalidated_against_the_core_favorite_allowlist() {
+    fn start_address_accepts_any_existing_absolute_video_path() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("favorite");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("movie.mp4"), b"fixture").unwrap();
         std::fs::write(root.join("notes.txt"), b"fixture").unwrap();
-        let favorite = crate::settings::FavoriteEntry::new("fixture".to_owned(), root.clone());
-        let root_id = favorite.id.to_string();
-        let mut settings = crate::settings::Settings::default();
-        settings.favorites = vec![favorite];
-        let engine = VideoStreamEngine::new(settings);
+        let outside = temp.path().join("outside.mp4");
+        std::fs::write(&outside, b"fixture").unwrap();
+        let engine = VideoStreamEngine::new();
 
         let resolved = engine
-            .resolve_start_address(&RemoteAddress::file(&root_id, "movie.mp4"))
+            .resolve_start_address(&RemoteAddress::file(
+                root.join("movie.mp4").to_string_lossy().into_owned(),
+            ))
             .unwrap();
-        assert_eq!(resolved, root.join("movie.mp4"));
+        assert_eq!(
+            resolved,
+            super::super::path_guard::resolve_existing(
+                root.join("movie.mp4").to_string_lossy().as_ref(),
+            )
+            .unwrap()
+            .logical
+        );
         assert_eq!(
             engine
-                .resolve_start_address(&RemoteAddress::file(&root_id, "../movie.mp4"))
+                .resolve_start_address(
+                    &RemoteAddress::file(outside.to_string_lossy().into_owned(),)
+                )
+                .unwrap(),
+            super::super::path_guard::resolve_existing(outside.to_string_lossy().as_ref())
+                .unwrap()
+                .logical
+        );
+        assert_eq!(
+            engine
+                .resolve_start_address(&RemoteAddress::file("../movie.mp4"))
                 .unwrap_err()
                 .code,
             VideoStreamErrorCode::BadRequest
@@ -633,16 +626,8 @@ mod tests {
         assert_eq!(
             engine
                 .resolve_start_address(&RemoteAddress::file(
-                    "00000000-0000-0000-0000-000000000000",
-                    "movie.mp4",
+                    root.join("notes.txt").to_string_lossy().into_owned(),
                 ))
-                .unwrap_err()
-                .code,
-            VideoStreamErrorCode::FavoriteNotFound
-        );
-        assert_eq!(
-            engine
-                .resolve_start_address(&RemoteAddress::file(&root_id, "notes.txt"))
                 .unwrap_err()
                 .code,
             VideoStreamErrorCode::Unsupported

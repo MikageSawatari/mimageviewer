@@ -12,7 +12,6 @@ use crate::video::stream::session::{
     RemoteVideoStreamingSession, StreamGenerationStatus, StreamReconcile, StreamingGeneration,
 };
 
-use super::path_guard::logical_favorite_path;
 use super::session::{
     ActiveSessionSnapshot, ClaimedRemoteUiRequest, ClaimedRemoteWrite, ClaimedVideoStreamUiRequest,
     PublishedVideoStream, RemoteStreamingControlError, SessionHandle, UiWriteOutcome,
@@ -23,6 +22,18 @@ use super::video_stream::{VideoStreamStartBudget, VideoStreamStartStage};
 const REMOTE_ACQUIRE_BARRIER_LOG_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 const REMOTE_ACQUIRE_BARRIER_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 const REMOTE_ACQUIRE_BARRIER_ABORT_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+const REMOTE_ENABLE_WARNING_PREFIX: &str = "リモート閲覧を有効にすると、";
+const REMOTE_ENABLE_WARNING_EMPHASIS: &str = "mIV で閲覧できるすべてのファイル";
+const REMOTE_ENABLE_WARNING_SUFFIX: &str =
+    "が、この PC の Tailscale アドレスへ接続でき、PIN を知っている人から見えるようになります。";
+const REMOTE_ENABLE_WARNING_FIRST: &str = concat!(
+    "リモート閲覧を有効にすると、",
+    "mIV で閲覧できるすべてのファイル",
+    "が、この PC の Tailscale アドレスへ接続でき、PIN を知っている人から見えるようになります。"
+);
+const REMOTE_ENABLE_WARNING_SECOND: &str =
+    "対象はお気に入りの中だけではなく、mIV が開ける画像・動画・PDF すべてです。";
+const REMOTE_MANUAL_URL: &str = "https://mikage.to/mimageviewer/manual/tut-remote.html";
 
 #[derive(Default)]
 pub(crate) struct RemoteSessionUiState {
@@ -1646,7 +1657,7 @@ impl crate::app::App {
         spread_mode: RemoteSpreadMode,
         reading_direction: RemoteReadingDirection,
     ) -> RemoteWriteResponse {
-        let key = match remote_spread_key(&self.settings, address) {
+        let key = match remote_spread_key(address) {
             Ok(key) => key,
             Err(error) => return RemoteWriteResponse::Error(error),
         };
@@ -1701,7 +1712,7 @@ impl crate::app::App {
         record_resume: bool,
         record_history: bool,
     ) -> RemoteWriteResponse {
-        let target = match remote_reading_target(&self.settings, address, context_address) {
+        let target = match remote_reading_target(address, context_address) {
             Ok(target) => target,
             Err(error) => return RemoteWriteResponse::Error(error),
         };
@@ -1926,7 +1937,7 @@ impl crate::app::App {
         &self,
         context_address: &mimageviewer_ipc::RemoteAddress,
     ) -> RemoteWriteResponse {
-        let key = match remote_spread_key(&self.settings, context_address) {
+        let key = match remote_spread_key(context_address) {
             Ok(key) => key,
             Err(error) => return RemoteWriteResponse::Error(error),
         };
@@ -1976,7 +1987,7 @@ impl crate::app::App {
             Ok(state) => state,
             Err(message) => return write_error(RemoteWriteErrorCode::BadRequest, message),
         };
-        let key = match remote_spread_key(&self.settings, context_address) {
+        let key = match remote_spread_key(context_address) {
             Ok(key) => key,
             Err(error) => return RemoteWriteResponse::Error(error),
         };
@@ -2279,6 +2290,7 @@ impl crate::app::App {
             return;
         };
         let mut enabled = dialog.enabled;
+        let was_enabled = self.settings.remote_service_enabled;
         let snapshot = self
             .remote_session_ui
             .handle
@@ -2308,9 +2320,32 @@ impl crate::app::App {
             .id(egui::Id::new("remote_connection_dialog"))
             .collapsible(false)
             .resizable(false)
+            .default_width(560.0)
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.checkbox(&mut enabled, "この端末からリモート接続を利用する");
+                if remote_enable_warning_visible(was_enabled, enabled) {
+                    ui.add_space(6.0);
+                    let warning_color = ui.visuals().warn_fg_color;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.label(
+                            egui::RichText::new(REMOTE_ENABLE_WARNING_PREFIX).color(warning_color),
+                        );
+                        ui.label(
+                            egui::RichText::new(REMOTE_ENABLE_WARNING_EMPHASIS)
+                                .strong()
+                                .color(warning_color),
+                        );
+                        ui.label(
+                            egui::RichText::new(REMOTE_ENABLE_WARNING_SUFFIX).color(warning_color),
+                        );
+                    });
+                    ui.label(
+                        egui::RichText::new(REMOTE_ENABLE_WARNING_SECOND).color(warning_color),
+                    );
+                    ui.hyperlink_to("詳しい説明を既定のブラウザで開く", REMOTE_MANUAL_URL);
+                }
                 ui.separator();
                 let state_label = remote_connection_state_label(accepting, &service_diagnostic);
                 ui.horizontal(|ui| {
@@ -2495,29 +2530,9 @@ impl crate::app::App {
 }
 
 fn remote_spread_key(
-    settings: &crate::settings::Settings,
     address: &mimageviewer_ipc::RemoteAddress,
 ) -> Result<crate::spread_db::SpreadContainerKey, RemoteWriteError> {
-    address.validate_syntax().map_err(|_| {
-        RemoteWriteError::new(
-            RemoteWriteErrorCode::BadRequest,
-            "コンテンツアドレスが不正です",
-        )
-    })?;
-    let root_id = uuid::Uuid::parse_str(&address.root_id).map_err(|_| {
-        RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, "root_id が不正です")
-    })?;
-    let favorite = settings
-        .favorites
-        .iter()
-        .find(|favorite| favorite.id == root_id)
-        .ok_or_else(|| {
-            RemoteWriteError::new(
-                RemoteWriteErrorCode::FavoriteNotFound,
-                "お気に入りが登録されていません",
-            )
-        })?;
-    let root = logical_favorite_path(&favorite.path, &address.relative_path);
+    let root = remote_logical_path(address)?;
     let segments = match &address.subresource {
         RemoteSubresource::File => Vec::new(),
         RemoteSubresource::ZipDirectory { prefix } => prefix
@@ -2576,7 +2591,7 @@ fn remote_adjustment_target(
     settings: &crate::settings::Settings,
     address: &mimageviewer_ipc::RemoteAddress,
 ) -> Result<crate::app::PageAdjustmentTarget, RemoteWriteError> {
-    let logical = remote_logical_path(settings, address)?;
+    let logical = remote_logical_path(address)?;
     let page_key = crate::edit_source::page_key_for_remote(&logical, &address.subresource)
         .ok_or_else(|| {
             RemoteWriteError::new(
@@ -2660,7 +2675,7 @@ fn remote_rating_target(
 ) -> Result<RemoteRatingTarget, RemoteWriteError> {
     use crate::rating_db::{RatingItemKind, RatingMeta};
 
-    let root = remote_logical_path(settings, address)?;
+    let root = remote_logical_path(address)?;
     let (key, meta, xmp_target) = match &address.subresource {
         RemoteSubresource::File => {
             let meta = RatingMeta::new(RatingItemKind::Image).with_source_path(&root);
@@ -2713,11 +2728,10 @@ struct RemoteReadingTarget {
 }
 
 fn remote_reading_target(
-    settings: &crate::settings::Settings,
     address: &mimageviewer_ipc::RemoteAddress,
     context_address: &mimageviewer_ipc::RemoteAddress,
 ) -> Result<RemoteReadingTarget, RemoteWriteError> {
-    let container_path = remote_logical_path(settings, context_address)?;
+    let container_path = remote_logical_path(context_address)?;
     let history_kind = match (&address.subresource, &context_address.subresource) {
         (RemoteSubresource::File, RemoteSubresource::File) => {
             crate::reading_history_db::ReadingHistoryKind::Folder
@@ -2750,10 +2764,10 @@ fn remote_bookmark_draft(
 ) -> Result<crate::book_bookmarks::NewBookBookmark, RemoteWriteError> {
     use crate::book_bookmarks::{BookContainerKind, NewBookBookmark, PageIdentity};
 
-    let container_path = remote_logical_path(settings, context_address)?;
+    let container_path = remote_logical_path(context_address)?;
     let (container_kind, page_identity) = match &address.subresource {
         RemoteSubresource::File => {
-            let page_path = remote_logical_path(settings, address)?;
+            let page_path = remote_logical_path(address)?;
             let relative = page_path
                 .strip_prefix(&container_path)
                 .ok()
@@ -2805,7 +2819,6 @@ fn remote_bookmark_draft(
 }
 
 fn remote_logical_path(
-    settings: &crate::settings::Settings,
     address: &mimageviewer_ipc::RemoteAddress,
 ) -> Result<std::path::PathBuf, RemoteWriteError> {
     address.validate_syntax().map_err(|_| {
@@ -2814,23 +2827,21 @@ fn remote_logical_path(
             "コンテンツアドレスが不正です",
         )
     })?;
-    let root_id = uuid::Uuid::parse_str(&address.root_id).map_err(|_| {
-        RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, "root_id が不正です")
-    })?;
-    let favorite = settings
-        .favorites
-        .iter()
-        .find(|favorite| favorite.id == root_id)
-        .ok_or_else(|| {
-            RemoteWriteError::new(
-                RemoteWriteErrorCode::FavoriteNotFound,
-                "お気に入りが登録されていません",
-            )
-        })?;
-    Ok(logical_favorite_path(
-        &favorite.path,
-        &address.relative_path,
-    ))
+    super::path_guard::resolve_existing(&address.path)
+        .map(|resolved| resolved.logical)
+        .map_err(|error| match error {
+            super::path_guard::ResolveError::InvalidPath => RemoteWriteError::new(
+                RemoteWriteErrorCode::BadRequest,
+                "コンテンツアドレスが不正です",
+            ),
+            super::path_guard::ResolveError::Unavailable => {
+                RemoteWriteError::new(RemoteWriteErrorCode::NotFound, "対象が見つかりません")
+            }
+        })
+}
+
+fn remote_enable_warning_visible(was_enabled: bool, enabled: bool) -> bool {
+    !was_enabled && enabled
 }
 
 fn core_spread_mode(mode: RemoteSpreadMode) -> crate::settings::SpreadMode {
@@ -3018,6 +3029,35 @@ mod tests {
     }
 
     #[test]
+    fn remote_access_warning_is_shown_only_while_enabling() {
+        assert!(remote_enable_warning_visible(false, true));
+        assert!(!remote_enable_warning_visible(false, false));
+        assert!(!remote_enable_warning_visible(true, false));
+        assert!(!remote_enable_warning_visible(true, true));
+        assert_eq!(
+            REMOTE_ENABLE_WARNING_FIRST,
+            "リモート閲覧を有効にすると、mIV で閲覧できるすべてのファイルが、この PC の Tailscale アドレスへ接続でき、PIN を知っている人から見えるようになります。"
+        );
+        assert_eq!(
+            [
+                REMOTE_ENABLE_WARNING_PREFIX,
+                REMOTE_ENABLE_WARNING_EMPHASIS,
+                REMOTE_ENABLE_WARNING_SUFFIX,
+            ]
+            .concat(),
+            REMOTE_ENABLE_WARNING_FIRST
+        );
+        assert_eq!(
+            REMOTE_ENABLE_WARNING_SECOND,
+            "対象はお気に入りの中だけではなく、mIV が開ける画像・動画・PDF すべてです。"
+        );
+        assert_eq!(
+            REMOTE_MANUAL_URL,
+            "https://mikage.to/mimageviewer/manual/tut-remote.html"
+        );
+    }
+
+    #[test]
     fn remote_connection_labels_use_health_and_active_session_separately() {
         assert_eq!(
             remote_connection_state_label(
@@ -3148,49 +3188,99 @@ mod tests {
     }
 
     #[test]
-    fn remote_spread_key_matches_worker_logical_favorite_path() {
+    fn remote_spread_key_matches_worker_canonical_path() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("favorite");
         std::fs::create_dir_all(root.join("album")).unwrap();
         std::fs::write(root.join("album/book.zip"), b"zip").unwrap();
-        let favorite = crate::settings::FavoriteEntry::new("test".to_owned(), root);
-        let root_id = favorite.id.to_string();
-        let mut settings = crate::settings::Settings::default();
-        settings.favorites = vec![favorite.clone()];
-        let roots = crate::remote_ipc::live_favorites::AllowedRootsSnapshot {
-            favorites: std::sync::Arc::new(vec![favorite]),
-            registered: mimageviewer_registered_roots::RegisteredRootsSnapshot::empty(),
-        };
-
-        for relative in ["", "album/book.zip"] {
-            let address = mimageviewer_ipc::RemoteAddress::file(&root_id, relative);
-            let worker =
-                crate::remote_ipc::path_guard::resolve_existing(&roots, &root_id, relative)
-                    .unwrap();
-            let ui_key = remote_spread_key(&settings, &address).unwrap();
-            assert_eq!(ui_key.exact, worker.logical, "relative={relative:?}");
+        for path in [root.clone(), root.join("album/book.zip")] {
+            let address =
+                mimageviewer_ipc::RemoteAddress::file(path.to_string_lossy().into_owned());
+            let worker = crate::remote_ipc::path_guard::resolve_existing(&address.path).unwrap();
+            let ui_key = remote_spread_key(&address).unwrap();
+            assert_eq!(ui_key.exact, worker.logical, "path={path:?}");
         }
+    }
+
+    #[test]
+    fn remote_write_keys_canonicalize_aliases_and_reject_missing_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).unwrap();
+        let page = album.join("page.jpg");
+        std::fs::write(&page, b"image").unwrap();
+        let alias = album.join("..").join("album").join("page.jpg");
+        let canonical_address =
+            mimageviewer_ipc::RemoteAddress::file(page.to_string_lossy().into_owned());
+        let alias_address =
+            mimageviewer_ipc::RemoteAddress::file(alias.to_string_lossy().into_owned());
+        let settings = crate::settings::Settings::default();
+
+        assert_ne!(canonical_address.path, alias_address.path);
+        assert_eq!(
+            remote_logical_path(&canonical_address).unwrap(),
+            remote_logical_path(&alias_address).unwrap()
+        );
+        assert_eq!(
+            remote_rating_target(&settings, &canonical_address)
+                .unwrap()
+                .key,
+            remote_rating_target(&settings, &alias_address).unwrap().key
+        );
+
+        let canonical_folder =
+            mimageviewer_ipc::RemoteAddress::file(album.to_string_lossy().into_owned());
+        let alias_folder = mimageviewer_ipc::RemoteAddress::file(
+            album
+                .join("..")
+                .join("album")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        assert_eq!(
+            remote_spread_key(&canonical_folder).unwrap(),
+            remote_spread_key(&alias_folder).unwrap()
+        );
+
+        let missing = mimageviewer_ipc::RemoteAddress::file(
+            temp.path()
+                .join("missing.jpg")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        match remote_rating_target(&settings, &missing) {
+            Err(error) => assert_eq!(error.code, RemoteWriteErrorCode::NotFound),
+            Ok(_) => panic!("missing rating target must be rejected"),
+        }
+        assert_eq!(
+            remote_spread_key(&missing).unwrap_err().code,
+            RemoteWriteErrorCode::NotFound
+        );
     }
 
     #[test]
     fn remote_page_keys_match_local_rating_history_and_bookmark_rules() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("favorite");
-        let favorite = crate::settings::FavoriteEntry::new("test".to_owned(), root.clone());
-        let root_id = favorite.id.to_string();
-        let settings = crate::settings::Settings {
-            favorites: vec![favorite],
-            ..Default::default()
-        };
+        let settings = crate::settings::Settings::default();
 
-        let folder = mimageviewer_ipc::RemoteAddress::file(&root_id, "album");
-        let image = mimageviewer_ipc::RemoteAddress::file(&root_id, "album/page.jpg");
+        std::fs::create_dir_all(root.join("album")).unwrap();
+        std::fs::create_dir_all(root.join("books")).unwrap();
+        std::fs::write(root.join("album/page.jpg"), b"image").unwrap();
+        std::fs::write(root.join("books/book.cbz"), b"zip").unwrap();
+
+        let folder = mimageviewer_ipc::RemoteAddress::file(
+            root.join("album").to_string_lossy().into_owned(),
+        );
+        let image = mimageviewer_ipc::RemoteAddress::file(
+            root.join("album/page.jpg").to_string_lossy().into_owned(),
+        );
         let image_target = remote_rating_target(&settings, &image).unwrap();
         assert_eq!(
             image_target.key,
             crate::adjustment_db::normalize_path(&root.join("album/page.jpg"))
         );
-        let reading = remote_reading_target(&settings, &image, &folder).unwrap();
+        let reading = remote_reading_target(&image, &folder).unwrap();
         assert_eq!(reading.container_path, root.join("album"));
         assert_eq!(
             reading.history_kind,
@@ -3204,8 +3294,7 @@ mod tests {
         assert_eq!(bookmark.page_index_hint, 4);
 
         let zip_page = mimageviewer_ipc::RemoteAddress {
-            root_id,
-            relative_path: "books/book.cbz".to_owned(),
+            path: root.join("books/book.cbz").to_string_lossy().into_owned(),
             subresource: RemoteSubresource::ZipEntry {
                 entry_name: "chapter/001.png".to_owned(),
             },

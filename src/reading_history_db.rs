@@ -13,8 +13,7 @@ use rusqlite::OptionalExtension;
 use crate::archive_converter::ArchiveFormat;
 
 /// 閲覧履歴の保存件数上限。
-pub const READING_HISTORY_LIMIT_MAX: usize =
-    mimageviewer_registered_roots::READING_HISTORY_LIMIT_MAX;
+pub const READING_HISTORY_LIMIT_MAX: usize = 1_000;
 
 /// 閲覧履歴の保存件数デフォルト。
 pub const READING_HISTORY_LIMIT_DEFAULT: usize = READING_HISTORY_LIMIT_MAX;
@@ -734,11 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn retention_limit_is_the_remote_registered_root_contract() {
-        assert_eq!(
-            READING_HISTORY_LIMIT_MAX,
-            mimageviewer_registered_roots::READING_HISTORY_LIMIT_MAX
-        );
+    fn retention_limit_default_matches_the_local_maximum() {
         assert_eq!(READING_HISTORY_LIMIT_DEFAULT, READING_HISTORY_LIMIT_MAX);
     }
 }

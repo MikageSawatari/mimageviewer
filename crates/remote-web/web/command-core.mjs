@@ -407,22 +407,24 @@ function normalizedRemoteSubresource(value) {
 export function normalizeRemotePageIdentity(value) {
   if (!value || typeof value !== "object") return null;
   if (
-    typeof value.root_id !== "string" ||
-    !value.root_id ||
-    value.root_id.length > 128 ||
-    typeof value.relative_path !== "string" ||
-    value.relative_path.length > 4096 ||
-    value.relative_path.includes("\0")
+    typeof value.path !== "string" ||
+    value.path.length === 0 ||
+    value.path.length > 32768 ||
+    value.path.includes("\0") ||
+    !isAbsoluteRemotePath(value.path)
   ) {
     return null;
   }
   const subresource = normalizedRemoteSubresource(value.subresource);
   if (!subresource) return null;
   return {
-    root_id: value.root_id,
-    relative_path: value.relative_path,
+    path: value.path,
     subresource,
   };
+}
+
+function isAbsoluteRemotePath(path) {
+  return path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("\\\\");
 }
 
 export function remoteAddressIdentity(address) {
@@ -437,11 +439,55 @@ export function remoteAddressIdentity(address) {
         ? String(target.page_number)
         : "";
   return [
-    normalized.root_id,
-    normalized.relative_path,
+    normalized.path,
     target.kind,
     inner,
   ].join("\n");
+}
+
+function indexAddressPathsForHttp(value, paths) {
+  if (Array.isArray(value)) {
+    return value.map((item) => indexAddressPathsForHttp(item, paths));
+  }
+  if (!value || typeof value !== "object") return value;
+  const addressed = Object.prototype.hasOwnProperty.call(value, "path");
+  if (addressed) {
+    if (
+      typeof value.path !== "string" ||
+      !value.subresource ||
+      typeof value.subresource !== "object" ||
+      Object.prototype.hasOwnProperty.call(value, "path_query_index")
+    ) {
+      throw new TypeError("invalid HTTP remote address");
+    }
+  }
+  const result = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key === "path") continue;
+    result[key] = indexAddressPathsForHttp(item, paths);
+  }
+  if (addressed) {
+    result.path_query_index = paths.length;
+    paths.push(value.path);
+  }
+  return result;
+}
+
+/// Filesystem paths stay only in the query, which the request logger removes in full.
+/// JSON bodies retain an index for rebuilding each nested RemoteAddress on the server.
+export function addressedPostRequest(endpoint, payload) {
+  if (typeof endpoint !== "string" || !endpoint.startsWith("/") || endpoint.includes("?")) {
+    throw new TypeError("invalid addressed endpoint");
+  }
+  const paths = [];
+  const body = indexAddressPathsForHttp(payload, paths);
+  const query = paths
+    .map((path) => `path=${encodeURIComponent(path)}`)
+    .join("&");
+  return {
+    url: query ? `${endpoint}?${query}` : endpoint,
+    body,
+  };
 }
 
 /// The header is percent-encoded JSON so Unicode paths stay inside the ASCII header range.
@@ -473,13 +519,11 @@ const NORMAL_TELEMETRY_OMIT_KEYS = new Set([
   "device_id",
   "diagnostic_message",
   "entry_name",
-  "root_id",
   "filename",
   "load_error_message",
   "message",
   "name",
   "path",
-  "relative_path",
   "remote_address",
   "remote_client_id",
   "remote_session_correlation",
@@ -494,18 +538,38 @@ const NORMAL_TELEMETRY_OMIT_KEYS = new Set([
   "url",
 ]);
 
+function redactFilesystemPaths(value) {
+  return value
+    .replace(/[A-Za-z]:[\\/][^\r\n"'<>]*/g, "[redacted-path]")
+    .replace(/\\\\[^\\\s]+\\[^\r\n"'<>]*/g, "[redacted-path]")
+    .replace(
+      /(^|[\s(])\/(?!api(?:\/|$)|stream(?:\/|$))[^\r\n"'<>]*/g,
+      (_, prefix) => `${prefix}[redacted-path]`
+    );
+}
+
 function redactTelemetryValue(value, secrets) {
   if (typeof value === "string") {
     let redacted = value;
     for (const secret of secrets) {
       if (secret) redacted = redacted.replaceAll(secret, "[redacted-secret]");
     }
-    return redacted;
+    return redactFilesystemPaths(redacted);
   }
   if (Array.isArray(value)) return value.map((item) => redactTelemetryValue(item, secrets));
   if (!value || typeof value !== "object") return value;
   return Object.fromEntries(
     Object.entries(value).map(([key, item]) => [key, redactTelemetryValue(item, secrets)])
+  );
+}
+
+function telemetryWithoutPathFields(value) {
+  if (Array.isArray(value)) return value.map(telemetryWithoutPathFields);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => key !== "path")
+      .map(([key, item]) => [key, telemetryWithoutPathFields(item)])
   );
 }
 
@@ -529,20 +593,9 @@ export function telemetryEventForTier(event, {
 } = {}) {
   const secrets = Array.from(sensitiveValues, (value) => String(value ?? ""))
     .filter(Boolean);
-  const source = redactTelemetryValue(event ?? {}, secrets);
+  const source = telemetryWithoutPathFields(redactTelemetryValue(event ?? {}, secrets));
   if (!detailed) {
     const normalized = normalTelemetryValue(source);
-    if (source?.type === "error" && source?.category === "page_identity_mismatch") {
-      // This exact diagnostic is intentionally content-identifying: without both paths the
-      // next occurrence cannot distinguish renderer corruption from response misrouting.
-      // Keep the exception narrow and accept only the typed RemoteAddress shape.
-      normalized.requested_page_identity = normalizeRemotePageIdentity(
-        source.requested_page_identity
-      );
-      normalized.response_page_identity = normalizeRemotePageIdentity(
-        source.response_page_identity
-      );
-    }
     return {
       ...normalized,
       telemetry_tier: "normal",

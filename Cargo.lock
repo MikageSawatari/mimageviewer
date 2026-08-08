@@ -3950,7 +3950,6 @@ dependencies = [
  "local-adjust-core",
  "lopdf",
  "mimageviewer-ipc",
- "mimageviewer-registered-roots",
  "music-core",
  "ndarray",
  "notify",
@@ -4015,17 +4014,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mimageviewer-registered-roots"
-version = "2.12.0"
-dependencies = [
- "rusqlite",
- "serde_json",
- "tempfile",
- "uuid",
- "windows 0.61.3",
-]
-
-[[package]]
 name = "mimageviewer-remote"
 version = "2.12.0"
 dependencies = [
@@ -4035,7 +4023,6 @@ dependencies = [
  "hmac",
  "image",
  "mimageviewer-ipc",
- "mimageviewer-registered-roots",
  "percent-encoding",
  "qrcode",
  "rexif",
@@ -6010,12 +5997,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sha1_smol"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7330,7 +7311,6 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "serde_core",
- "sha1_smol",
  "wasm-bindgen",
 ]
 

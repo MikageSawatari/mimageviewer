@@ -95,7 +95,7 @@ test("video start ends a busy attempt visibly instead of retrying forever", asyn
   const viewer = {
     playbackControlState: VideoPlaybackControlState.PLAY_REQUESTED,
     destroyed: false,
-    address: { root_id: "favorite", relative_path: "movie.mp4" },
+    address: { path: "C:/Movies/movie.mp4", subresource: { kind: "file" } },
     quality: "standard",
     abortController: { signal: new AbortController().signal },
     clearPoll: () => {},
@@ -355,8 +355,7 @@ test("video health normal tier has no path while debug context adds a bounded re
     detailedContext: {
       enabled: true,
       address: {
-        root_id: "favorite-1",
-        relative_path: "private/movie.mp4",
+        path: "C:/private/movie.mp4",
         subresource: { kind: "file" },
       },
       serverMessage: "server detail",
@@ -364,7 +363,8 @@ test("video health normal tier has no path while debug context adds a bounded re
     },
   };
   const detailed = videoHealthSample(base);
-  assert.equal(detailed.remote_address.relative_path, "private/movie.mp4");
+  assert.equal(detailed.remote_address.path, undefined);
+  assert.equal(detailed.remote_address.subresource.kind, "file");
   assert.equal(detailed.server_message, "server detail");
   assert.equal(detailed.diagnostic_message, "decoder detail");
   const normal = videoHealthSample({

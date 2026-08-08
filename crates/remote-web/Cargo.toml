@@ -21,7 +21,6 @@ fast_image_resize = { version = "5", features = ["image"] }
 hmac = "0.12"
 image = { version = "0.25", features = ["jpeg", "png", "webp", "bmp", "gif"] }
 mimageviewer-ipc = { path = "../remote-ipc" }
-mimageviewer-registered-roots = { path = "../remote-registered-roots" }
 percent-encoding = "2"
 qrcode = { version = "0.14", default-features = false }
 rexif = "0.7"

@@ -281,6 +281,31 @@ mod tests {
     }
 
     #[test]
+    fn request_log_drops_absolute_path_query_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("request.jsonl");
+        let logger = DiagnosticsLogger::open(&output, &[], &[]).unwrap();
+        logger.log_request(RequestLog {
+            request_id: 43,
+            timestamp_unix_ms: 0,
+            method: "GET",
+            raw_url: "/api/image?path=C%3A%5CUsers%5CAlice%5Csecret.jpg&w=1200",
+            status: 200,
+            duration: Duration::from_millis(1),
+            response_bytes: 10,
+            response_write_ok: true,
+            details: None,
+            sensitive_values: Vec::new(),
+        });
+
+        let written = std::fs::read_to_string(output).unwrap();
+        assert!(written.contains("/api/image"));
+        assert!(!written.contains("Alice"));
+        assert!(!written.contains("secret.jpg"));
+        assert!(!written.contains("?path="));
+    }
+
+    #[test]
     fn log_path_beneath_miv_data_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let protected = temp.path().join("mimageviewer");

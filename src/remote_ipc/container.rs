@@ -16,7 +16,9 @@ use mimageviewer_ipc::{
     ThumbnailResponse,
 };
 
-use super::path_guard::{ResolveError, ResolvedRootPath, resolve_existing};
+use super::path_guard::{
+    ResolveError, ResolvedPath, page_identity_from_resolved, resolve_existing,
+};
 use super::thumbnail::WorkerContext;
 
 const CONTAINER_ENTRY_LIMIT: usize = 1000;
@@ -84,7 +86,7 @@ fn harmonized_remote_auto_bbox(
 
 fn remote_auto_trim_cache_key(
     address: &RemoteAddress,
-    resolved: &ResolvedRootPath,
+    resolved: &ResolvedPath,
     mtime: i64,
     file_size: i64,
     target_px: u32,
@@ -101,7 +103,6 @@ fn remote_auto_trim_cache_key(
 pub(super) struct ContainerEngine {
     settings: Arc<crate::settings::Settings>,
     sort_settings: super::RemoteSortSettingsSource,
-    roots: Arc<super::live_favorites::RemoteRoots>,
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
     pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
     pdf_page_counts: Mutex<HashMap<PdfIdentity, u32>>,
@@ -492,7 +493,7 @@ struct ValidatedPageContext {
 }
 
 struct PreparedZipBookmarkList {
-    resolved: ResolvedRootPath,
+    resolved: ResolvedPath,
     tree: crate::zip_tree::ZipTree,
 }
 
@@ -523,26 +524,16 @@ impl ContainerEngine {
         let adjustment_settings = AdjustmentSettingsSource::Snapshot(
             crate::settings_db::AdjustmentRenderSettings::from_settings(&settings),
         );
-        let roots = super::live_favorites::RemoteRoots::snapshot(settings.favorites.clone());
         let sort_settings = super::RemoteSortSettingsSource::Snapshot(settings.sort_order);
-        Self::new_inner(
-            settings,
-            roots,
-            None,
-            None,
-            adjustment_settings,
-            sort_settings,
-        )
+        Self::new_inner(settings, None, None, adjustment_settings, sort_settings)
     }
 
     pub(super) fn new_with_session(
         settings: crate::settings::Settings,
         session: super::session::SessionHandle,
-        roots: Arc<super::live_favorites::RemoteRoots>,
     ) -> Self {
         Self::new_inner(
             settings,
-            roots,
             Some(ResumeReader::Session(session.clone())),
             Some(session),
             AdjustmentSettingsSource::Live,
@@ -558,11 +549,9 @@ impl ContainerEngine {
         let adjustment_settings = AdjustmentSettingsSource::Snapshot(
             crate::settings_db::AdjustmentRenderSettings::from_settings(&settings),
         );
-        let roots = super::live_favorites::RemoteRoots::snapshot(settings.favorites.clone());
         let sort_settings = super::RemoteSortSettingsSource::Snapshot(settings.sort_order);
         Self::new_inner(
             settings,
-            roots,
             Some(ResumeReader::Error(error)),
             None,
             adjustment_settings,
@@ -572,7 +561,6 @@ impl ContainerEngine {
 
     fn new_inner(
         settings: crate::settings::Settings,
-        roots: Arc<super::live_favorites::RemoteRoots>,
         resume_reader: Option<ResumeReader>,
         session: Option<super::session::SessionHandle>,
         adjustment_settings: AdjustmentSettingsSource,
@@ -603,7 +591,6 @@ impl ContainerEngine {
         Self {
             settings: Arc::new(settings),
             sort_settings,
-            roots,
             stats: Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
             pdf_passwords: crate::pdf_passwords::PdfPasswordStore::load(),
             pdf_page_counts: Mutex::new(HashMap::new()),
@@ -1045,7 +1032,7 @@ impl ContainerEngine {
             .collect::<Vec<_>>();
         let response = FolderListResponse::Success(FolderListPayload {
             effective_address: request.address,
-            root_name: resolved.root_name,
+            root_name: absolute_root_name(&resolved.logical),
             thumb_aspect_height_ratio,
             sort_state: super::remote_grid_sort_state(
                 if sort_locked {
@@ -1076,6 +1063,12 @@ impl ContainerEngine {
         &self,
         request: &mut RemoteWriteRequest,
     ) -> Result<(), RemoteWriteError> {
+        if let Some(address) = request.address_mut() {
+            self.canonicalize_write_address(address)?;
+        }
+        if let Some(context_address) = request.context_address_mut() {
+            self.canonicalize_write_address(context_address)?;
+        }
         match request {
             RemoteWriteRequest::SetSpread { address, .. } => {
                 let resolved = self
@@ -1280,6 +1273,17 @@ impl ContainerEngine {
         }
     }
 
+    fn canonicalize_write_address(
+        &self,
+        address: &mut RemoteAddress,
+    ) -> Result<(), RemoteWriteError> {
+        let resolved = self
+            .resolve(address)
+            .map_err(remote_write_error_from_media)?;
+        address.path = resolved.logical.to_string_lossy().into_owned();
+        Ok(())
+    }
+
     /// 現在の本の一覧を write worker 上で組み立てる。DB 読み出しとコンテナ列挙は
     /// UI thread に渡さず、同じ write FIFO 内で先行する mutation の完了後に行う。
     pub(super) fn book_bookmarks(&self, request: &mut RemoteWriteRequest) -> RemoteWriteResponse {
@@ -1332,10 +1336,7 @@ impl ContainerEngine {
                     ));
                 }
             };
-        let container_address = RemoteAddress::file(
-            context_address.root_id.clone(),
-            context_address.relative_path.clone(),
-        );
+        let container_address = RemoteAddress::file(context_address.path.clone());
 
         let rows = if std::fs::metadata(&resolved.canonical).is_ok_and(|metadata| metadata.is_dir())
         {
@@ -1395,8 +1396,7 @@ impl ContainerEngine {
                                     zip_entry_address(&container_address, &target.entry_name);
                                 address.validate_syntax().ok()?;
                                 let context_address = RemoteAddress {
-                                    root_id: container_address.root_id.clone(),
-                                    relative_path: container_address.relative_path.clone(),
+                                    path: container_address.path.clone(),
                                     subresource: if target.effective_prefix.is_empty() {
                                         RemoteSubresource::File
                                     } else {
@@ -1442,8 +1442,7 @@ impl ContainerEngine {
                         {
                             Some(RemoteBookBookmarkTarget {
                                 address: RemoteAddress {
-                                    root_id: container_address.root_id.clone(),
-                                    relative_path: container_address.relative_path.clone(),
+                                    path: container_address.path.clone(),
                                     subresource: RemoteSubresource::PdfPage {
                                         page_number: *page_number,
                                     },
@@ -1501,12 +1500,6 @@ impl ContainerEngine {
                 "ブックマーク一覧要求の種別が一致しません",
             ));
         };
-        if address.root_id != context_address.root_id {
-            return Err(RemoteWriteError::new(
-                RemoteWriteErrorCode::BadRequest,
-                "ページと閲覧コンテキストが一致しません",
-            ));
-        }
         let RemoteSubresource::ZipEntry { entry_name } = &address.subresource else {
             unreachable!("ZIP bookmark list was checked above");
         };
@@ -1523,10 +1516,7 @@ impl ContainerEngine {
         *page_index = validated.page_index;
         *bookmark_supported = validated.bookmark_supported;
 
-        let container_address = RemoteAddress::file(
-            context_address.root_id.clone(),
-            context_address.relative_path.clone(),
-        );
+        let container_address = RemoteAddress::file(context_address.path.clone());
         let safe_entries = enumeration
             .entries
             .into_iter()
@@ -1602,12 +1592,6 @@ impl ContainerEngine {
         address: &RemoteAddress,
         context_address: &RemoteAddress,
     ) -> Result<ValidatedPageContext, RemoteWriteError> {
-        if address.root_id != context_address.root_id {
-            return Err(RemoteWriteError::new(
-                RemoteWriteErrorCode::BadRequest,
-                "ページと閲覧コンテキストが一致しません",
-            ));
-        }
         match &address.subresource {
             RemoteSubresource::File => self.validate_folder_page(address, context_address),
             RemoteSubresource::ZipEntry { entry_name } => {
@@ -1728,7 +1712,7 @@ impl ContainerEngine {
 
     fn folder_list_entry(
         &self,
-        container: &RemoteAddress,
+        _container: &RemoteAddress,
         item: &crate::grid_item::GridItem,
         meta: Option<(i64, i64)>,
         video_thumb_overrides: &[(std::path::PathBuf, std::path::PathBuf)],
@@ -1746,27 +1730,18 @@ impl ContainerEngine {
             _ => return None,
         };
         let address_for = |candidate: &Path| {
-            let name = candidate.file_name()?.to_str()?;
-            let parent = container.relative_path.trim_end_matches('/');
-            let relative_path = if parent.is_empty() {
-                name.to_owned()
-            } else {
-                format!("{parent}/{name}")
-            };
+            let resolved = resolve_existing(candidate.to_string_lossy().as_ref()).ok()?;
             Some(RemoteAddress::file(
-                container.root_id.clone(),
-                relative_path,
+                resolved.logical.to_string_lossy().into_owned(),
             ))
         };
         let address = address_for(path)?;
-        self.resolve(&address).ok()?;
         let thumbnail_address = if kind == RemoteEntryKind::Video {
             video_thumb_overrides
                 .iter()
                 .rev()
                 .find(|(video, _)| crate::path_key::eq_keep_drive(video, path))
                 .and_then(|(_, image)| address_for(image))
-                .filter(|candidate| self.resolve(candidate).is_ok())
                 .unwrap_or_else(|| address.clone())
         } else {
             address.clone()
@@ -1798,17 +1773,19 @@ impl ContainerEngine {
         &self,
         address: &RemoteAddress,
         context_address: &RemoteAddress,
-    ) -> Result<(ResolvedRootPath, String, crate::zip_loader::ZipEnumeration), RemoteWriteError>
-    {
-        if address.relative_path != context_address.relative_path {
+    ) -> Result<(ResolvedPath, String, crate::zip_loader::ZipEnumeration), RemoteWriteError> {
+        let context = self
+            .resolve(context_address)
+            .map_err(remote_write_error_from_media)?;
+        let resolved = self
+            .resolve(address)
+            .map_err(remote_write_error_from_media)?;
+        if resolved.canonical != context.canonical {
             return Err(RemoteWriteError::new(
                 RemoteWriteErrorCode::BadRequest,
                 "ZIP ページとコンテキストが一致しません",
             ));
         }
-        let resolved = self
-            .resolve(address)
-            .map_err(remote_write_error_from_media)?;
         if !is_zip_path(&resolved.logical) {
             return Err(RemoteWriteError::new(
                 RemoteWriteErrorCode::Unsupported,
@@ -1901,9 +1878,7 @@ impl ContainerEngine {
         context_address: &RemoteAddress,
         page_number: u32,
     ) -> Result<ValidatedPageContext, RemoteWriteError> {
-        if address.relative_path != context_address.relative_path
-            || !matches!(context_address.subresource, RemoteSubresource::File)
-        {
+        if !matches!(context_address.subresource, RemoteSubresource::File) {
             return Err(RemoteWriteError::new(
                 RemoteWriteErrorCode::BadRequest,
                 "PDF ページとコンテキストが一致しません",
@@ -1912,6 +1887,15 @@ impl ContainerEngine {
         let resolved = self
             .resolve(address)
             .map_err(remote_write_error_from_media)?;
+        let context = self
+            .resolve(context_address)
+            .map_err(remote_write_error_from_media)?;
+        if resolved.canonical != context.canonical {
+            return Err(RemoteWriteError::new(
+                RemoteWriteErrorCode::BadRequest,
+                "PDF ページとコンテキストが一致しません",
+            ));
+        }
         let metadata = std::fs::metadata(&resolved.canonical).map_err(|_| {
             RemoteWriteError::new(RemoteWriteErrorCode::NotFound, "PDF が見つかりません")
         })?;
@@ -2073,19 +2057,11 @@ impl ContainerEngine {
         response
     }
 
-    fn resolve(&self, address: &RemoteAddress) -> Result<ResolvedRootPath, MediaError> {
+    fn resolve(&self, address: &RemoteAddress) -> Result<ResolvedPath, MediaError> {
         address
             .validate_syntax()
             .map_err(|_| media_error(MediaErrorCode::BadRequest, "コンテンツアドレスが不正です"))?;
-        let roots = self.roots.current().map_err(|error| {
-            crate::logger::log(format!("remote_ipc: {error}"));
-            media_error(
-                MediaErrorCode::Internal,
-                "最新の閲覧起点を読み込めませんでした",
-            )
-        })?;
-        resolve_existing(&roots, &address.root_id, &address.relative_path)
-            .map_err(resolve_media_error)
+        resolve_existing(&address.path).map_err(resolve_media_error)
     }
 
     pub(super) fn execute_remote_ai(
@@ -2171,7 +2147,7 @@ impl ContainerEngine {
         decode_source: &dyn Fn(
             &Self,
             &RemoteAddress,
-            &ResolvedRootPath,
+            &ResolvedPath,
             &std::fs::Metadata,
             usize,
             &Arc<AtomicBool>,
@@ -2386,10 +2362,7 @@ impl ContainerEngine {
             let identity = super::path_guard::page_identity_from_resolved(
                 &resolved,
                 &page.address.subresource,
-            )
-            .ok_or_else(|| {
-                RemoteAiRunError::Failed("resolved page identity is invalid".to_owned())
-            })?;
+            );
             let image = loaded_image_from_color_image(&pixels, None, identity)
                 .map_err(remote_ai_media_error)?;
             let view_trim_plan = self
@@ -2504,7 +2477,7 @@ impl ContainerEngine {
     fn decode_remote_ai_source(
         &self,
         address: &RemoteAddress,
-        resolved: &ResolvedRootPath,
+        resolved: &ResolvedPath,
         metadata: &std::fs::Metadata,
         page_index: usize,
         cancel: &Arc<AtomicBool>,
@@ -2591,7 +2564,7 @@ impl ContainerEngine {
     fn enumerate(
         &self,
         request: &ContainerRequest,
-        resolved: &ResolvedRootPath,
+        resolved: &ResolvedPath,
     ) -> Result<ContainerPayload, MediaError> {
         let metadata = std::fs::metadata(&resolved.canonical)
             .map_err(|_| media_error(MediaErrorCode::NotFound, "コンテナが見つかりません"))?;
@@ -2664,7 +2637,7 @@ impl ContainerEngine {
     fn enumerate_folder(
         &self,
         request: &ContainerRequest,
-        resolved: &ResolvedRootPath,
+        resolved: &ResolvedPath,
     ) -> Result<ContainerPayload, MediaError> {
         if !matches!(request.address.subresource, RemoteSubresource::File) {
             return Err(media_error(
@@ -2672,11 +2645,12 @@ impl ContainerEngine {
                 "画像フォルダの一覧アドレスが不正です",
             ));
         }
+        let address = page_identity_from_resolved(resolved, &request.address.subresource);
         let listing = self
             .recompute_folder_listing(&resolved.logical)
             .map_err(media_error_from_remote_write)?;
         let resume_page =
-            self.resume_page_for_items(&request.address, &resolved.logical, &listing.items, true);
+            self.resume_page_for_items(&address, &resolved.logical, &listing.items, true);
         let total = listing
             .items
             .iter()
@@ -2693,7 +2667,7 @@ impl ContainerEngine {
             .iter()
             .filter_map(|item| {
                 Some(ContainerEntry {
-                    address: grid_item_address(&request.address, item)?,
+                    address: grid_item_address(&address, item)?,
                     name: item.name().into_owned(),
                     kind: ContainerEntryKind::Image,
                     page_count: None,
@@ -2703,9 +2677,9 @@ impl ContainerEngine {
         let spread = self.spread_payload(request, resolved, &items, None);
         Ok(ContainerPayload {
             title: container_title(&resolved.logical),
-            root_name: resolved.root_name.clone(),
+            root_name: absolute_root_name(&resolved.logical),
             kind: ContainerKind::Folder,
-            effective_address: request.address.clone(),
+            effective_address: address,
             entries,
             thumb_aspect_height_ratio: super::collections::aggregate_thumb_aspect_height_ratio(
                 &self.settings,
@@ -2729,9 +2703,9 @@ impl ContainerEngine {
     fn enumerate_zip(
         &self,
         request: &ContainerRequest,
-        resolved: &ResolvedRootPath,
+        resolved: &ResolvedPath,
     ) -> Result<ContainerPayload, MediaError> {
-        let address = &request.address;
+        let address = page_identity_from_resolved(resolved, &request.address.subresource);
         let requested_prefix = match &address.subresource {
             RemoteSubresource::File => String::new(),
             RemoteSubresource::ZipDirectory { prefix } => prefix.clone(),
@@ -2757,7 +2731,7 @@ impl ContainerEngine {
             .entries
             .into_iter()
             .filter(|entry| {
-                let safe = zip_entry_address(address, &entry.entry_name)
+                let safe = zip_entry_address(&address, &entry.entry_name)
                     .validate_syntax()
                     .is_ok();
                 if !safe {
@@ -2784,7 +2758,7 @@ impl ContainerEngine {
         let total = items.len();
         let at_resume_root = effective_segments == root_segments;
         let resume_page =
-            self.resume_page_for_items(address, &resolved.logical, &items, at_resume_root);
+            self.resume_page_for_items(&address, &resolved.logical, &items, at_resume_root);
         let items = items
             .into_iter()
             .take(CONTAINER_ENTRY_LIMIT)
@@ -2798,8 +2772,7 @@ impl ContainerEngine {
                         name,
                         page_count: tree.page_count_for_prefix_str(&dir_prefix),
                         address: RemoteAddress {
-                            root_id: address.root_id.clone(),
-                            relative_path: address.relative_path.clone(),
+                            path: address.path.clone(),
                             subresource: RemoteSubresource::ZipDirectory {
                                 prefix: dir_prefix.clone(),
                             },
@@ -2810,7 +2783,7 @@ impl ContainerEngine {
                         Some(ContainerEntry {
                             name,
                             page_count: None,
-                            address: zip_entry_address(address, entry_name),
+                            address: zip_entry_address(&address, entry_name),
                             kind: ContainerEntryKind::Image,
                         })
                     }
@@ -2826,11 +2799,10 @@ impl ContainerEngine {
         );
         Ok(ContainerPayload {
             title: container_title(&resolved.logical),
-            root_name: resolved.root_name.clone(),
+            root_name: absolute_root_name(&resolved.logical),
             kind: ContainerKind::Zip,
             effective_address: RemoteAddress {
-                root_id: address.root_id.clone(),
-                relative_path: address.relative_path.clone(),
+                path: address.path.clone(),
                 subresource: if effective_prefix.is_empty() {
                     RemoteSubresource::File
                 } else {
@@ -2864,10 +2836,10 @@ impl ContainerEngine {
     fn enumerate_pdf(
         &self,
         request: &ContainerRequest,
-        resolved: &ResolvedRootPath,
+        resolved: &ResolvedPath,
         metadata: &std::fs::Metadata,
     ) -> Result<ContainerPayload, MediaError> {
-        let address = &request.address;
+        let address = page_identity_from_resolved(resolved, &request.address.subresource);
         if !matches!(address.subresource, RemoteSubresource::File) {
             return Err(media_error(
                 MediaErrorCode::BadRequest,
@@ -2886,13 +2858,12 @@ impl ContainerEngine {
                 content_type: None,
             })
             .collect::<Vec<_>>();
-        let resume_page = self.resume_page_for_items(address, &resolved.logical, &items, true);
+        let resume_page = self.resume_page_for_items(&address, &resolved.logical, &items, true);
         let entries = page_numbers
             .into_iter()
             .map(|page_number| ContainerEntry {
                 address: RemoteAddress {
-                    root_id: address.root_id.clone(),
-                    relative_path: address.relative_path.clone(),
+                    path: address.path.clone(),
                     subresource: RemoteSubresource::PdfPage { page_number },
                 },
                 name: format!("Page {}", page_number + 1),
@@ -2903,9 +2874,9 @@ impl ContainerEngine {
         let spread = self.spread_payload(request, resolved, &items, None);
         Ok(ContainerPayload {
             title: container_title(&resolved.logical),
-            root_name: resolved.root_name.clone(),
+            root_name: absolute_root_name(&resolved.logical),
             kind: ContainerKind::Pdf,
-            effective_address: address.clone(),
+            effective_address: address,
             entries,
             thumb_aspect_height_ratio: super::collections::aggregate_thumb_aspect_height_ratio(
                 &self.settings,
@@ -2929,7 +2900,7 @@ impl ContainerEngine {
     fn spread_payload(
         &self,
         request: &ContainerRequest,
-        resolved: &ResolvedRootPath,
+        resolved: &ResolvedPath,
         items: &[crate::grid_item::GridItem],
         zip_context: Option<(&[String], &Path)>,
     ) -> SpreadPayload {
@@ -2958,9 +2929,11 @@ impl ContainerEngine {
         let groups = index_groups
             .into_iter()
             .filter_map(|indices| {
+                let container_address =
+                    page_identity_from_resolved(resolved, &request.address.subresource);
                 let pages = indices
                     .into_iter()
-                    .filter_map(|index| grid_item_address(&request.address, items.get(index)?))
+                    .filter_map(|index| grid_item_address(&container_address, items.get(index)?))
                     .collect::<Vec<_>>();
                 let anchor = if effective.is_rtl() && pages.len() == 2 {
                     pages.get(1).cloned()
@@ -3000,7 +2973,7 @@ impl ContainerEngine {
     fn remote_view_trim_plan(
         &self,
         page_address: &RemoteAddress,
-        resolved: &ResolvedRootPath,
+        resolved: &ResolvedPath,
         render_context: Option<&RemotePageRenderContext>,
     ) -> Result<RemoteViewTrimPlan, MediaError> {
         let keys = self.remote_view_trim_keys(page_address, resolved, render_context)?;
@@ -3103,7 +3076,7 @@ impl ContainerEngine {
     fn remote_auto_trim_bbox(
         &self,
         address: &RemoteAddress,
-        resolved: &ResolvedRootPath,
+        resolved: &ResolvedPath,
         target_px: u32,
         foreground: bool,
         context: &WorkerContext,
@@ -3154,7 +3127,7 @@ impl ContainerEngine {
     fn remote_view_trim_keys(
         &self,
         page_address: &RemoteAddress,
-        resolved: &ResolvedRootPath,
+        resolved: &ResolvedPath,
         render_context: Option<&RemotePageRenderContext>,
     ) -> Result<crate::spread_db::SpreadContainerKey, MediaError> {
         let Some(render_context) = render_context else {
@@ -3175,12 +3148,6 @@ impl ContainerEngine {
             return Ok(crate::spread_db::container_key_with_fallback(root, &[]));
         };
         let context_address = &render_context.context_address;
-        if page_address.root_id != context_address.root_id {
-            return Err(media_error(
-                MediaErrorCode::BadRequest,
-                "ページと表示コンテキストが一致しません",
-            ));
-        }
         let context = self.resolve(context_address)?;
         match (&page_address.subresource, &context_address.subresource) {
             (RemoteSubresource::File, RemoteSubresource::File)
@@ -3271,7 +3238,7 @@ impl ContainerEngine {
     fn load_image(
         &self,
         address: &RemoteAddress,
-        resolved: &ResolvedRootPath,
+        resolved: &ResolvedPath,
         target_px: u32,
         load_kind: RemoteImageLoadKind,
         foreground: bool,
@@ -3368,13 +3335,7 @@ impl ContainerEngine {
         // identity は HTTP 要求値の echo ではなく、この描画要求が実際に使う
         // resolved.logical と subresource から画素生成境界で再構成する。
         let identity =
-            super::path_guard::page_identity_from_resolved(resolved, &address.subresource)
-                .ok_or_else(|| {
-                    media_error(
-                        MediaErrorCode::Internal,
-                        "解決済みページの identity を構成できませんでした",
-                    )
-                })?;
+            super::path_guard::page_identity_from_resolved(resolved, &address.subresource);
 
         let prepared_composite = if compose_full_page {
             self.prepare_remote_composite(
@@ -3588,7 +3549,7 @@ impl ContainerEngine {
 
     fn ensure_pdf_page_in_range(
         &self,
-        resolved: &ResolvedRootPath,
+        resolved: &ResolvedPath,
         metadata: &std::fs::Metadata,
         page_number: u32,
     ) -> Result<(), MediaError> {
@@ -3600,7 +3561,7 @@ impl ContainerEngine {
     /// password_required も保持する専用テーブルが正本になる。
     fn pdf_page_count(
         &self,
-        resolved: &ResolvedRootPath,
+        resolved: &ResolvedPath,
         metadata: &std::fs::Metadata,
     ) -> Result<u32, MediaError> {
         let identity = PdfIdentity {
@@ -3883,8 +3844,7 @@ pub(crate) fn resolve_remote_effective_params_for_test(
     global: &crate::adjustment::AdjustParams,
 ) -> crate::adjustment::AdjustParams {
     let address = RemoteAddress {
-        root_id: String::new(),
-        relative_path: String::new(),
+        path: logical_path.to_string_lossy().into_owned(),
         subresource: subresource.clone(),
     };
     let identity = remote_adjustment_identity(&address, logical_path)
@@ -4193,8 +4153,7 @@ fn validate_page_number(page_number: u32, page_count: u32) -> Result<(), MediaEr
 
 fn zip_entry_address(container: &RemoteAddress, entry_name: &str) -> RemoteAddress {
     RemoteAddress {
-        root_id: container.root_id.clone(),
-        relative_path: container.relative_path.clone(),
+        path: container.path.clone(),
         subresource: RemoteSubresource::ZipEntry {
             entry_name: entry_name.to_owned(),
         },
@@ -4223,25 +4182,18 @@ fn grid_item_address(
     item: &crate::grid_item::GridItem,
 ) -> Option<RemoteAddress> {
     match item {
-        crate::grid_item::GridItem::Image(path) => {
-            let name = path.file_name()?.to_str()?;
-            let parent = container.relative_path.trim_end_matches('/');
-            let relative_path = if parent.is_empty() {
-                name.to_owned()
-            } else {
-                format!("{parent}/{name}")
-            };
-            Some(RemoteAddress::file(
-                container.root_id.clone(),
-                relative_path,
-            ))
-        }
+        crate::grid_item::GridItem::Image(path) => Some(RemoteAddress::file(
+            resolve_existing(path.to_string_lossy().as_ref())
+                .ok()?
+                .logical
+                .to_string_lossy()
+                .into_owned(),
+        )),
         crate::grid_item::GridItem::ZipImage { entry_name, .. } => {
             Some(zip_entry_address(container, entry_name))
         }
         crate::grid_item::GridItem::PdfPage { page_num, .. } => Some(RemoteAddress {
-            root_id: container.root_id.clone(),
-            relative_path: container.relative_path.clone(),
+            path: container.path.clone(),
             subresource: RemoteSubresource::PdfPage {
                 page_number: *page_num,
             },
@@ -4393,7 +4345,7 @@ fn media_source_kind(address: &RemoteAddress) -> &'static str {
         RemoteSubresource::ZipDirectory { .. } | RemoteSubresource::ZipEntry { .. } => "zip",
         RemoteSubresource::PdfPage { .. } => "pdf",
         RemoteSubresource::File => {
-            let path = Path::new(&address.relative_path);
+            let path = Path::new(&address.path);
             if is_zip_path(path) {
                 "zip"
             } else if is_pdf_path(path) {
@@ -4420,20 +4372,17 @@ fn pdf_error(error: std::io::Error) -> MediaError {
 
 fn resolve_media_error(error: ResolveError) -> MediaError {
     match error {
-        ResolveError::InvalidRootId | ResolveError::InvalidRelativePath => media_error(
-            MediaErrorCode::BadRequest,
-            "root_id または相対パスが不正です",
-        ),
-        ResolveError::RootNotFound => media_error(
-            MediaErrorCode::FavoriteNotFound,
-            "お気に入りが登録されていません",
-        ),
-        ResolveError::EscapesRoot => media_error(
-            MediaErrorCode::PathRejected,
-            "お気に入りの外へ出るパスは拒否されました",
-        ),
+        ResolveError::InvalidPath => media_error(MediaErrorCode::BadRequest, "絶対パスが不正です"),
         ResolveError::Unavailable => media_error(MediaErrorCode::NotFound, "対象が見つかりません"),
     }
+}
+
+fn absolute_root_name(path: &Path) -> String {
+    path.components()
+        .next()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 fn remote_write_error_from_media(error: MediaError) -> RemoteWriteError {
@@ -4496,6 +4445,14 @@ mod tests {
     use super::*;
     use crate::settings::FavoriteEntry;
     use std::io::{Cursor, Write};
+
+    fn favorite_address(favorite: &FavoriteEntry, relative: impl AsRef<Path>) -> RemoteAddress {
+        let path = favorite.path.join(relative);
+        let logical = super::super::path_guard::resolve_existing(path.to_string_lossy().as_ref())
+            .map(|resolved| resolved.logical)
+            .unwrap_or(path);
+        RemoteAddress::file(logical.to_string_lossy().into_owned())
+    }
 
     struct NoRemoteAiProgress;
 
@@ -4696,12 +4653,12 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner()) =
             crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path).unwrap();
         let context = RemotePageRenderContext {
-            context_address: RemoteAddress::file(favorite.id.to_string(), "book"),
+            context_address: favorite_address(&favorite, "book"),
             display_slot: RemotePageDisplaySlot::SpreadRight,
             spread_partner: None,
         };
 
-        let override_address = RemoteAddress::file(favorite.id.to_string(), "book/override.png");
+        let override_address = favorite_address(&favorite, "book/override.png");
         let override_resolved = engine.resolve(&override_address).unwrap();
         let override_bbox = match engine
             .remote_view_trim_plan(&override_address, &override_resolved, Some(&context))
@@ -4714,7 +4671,7 @@ mod tests {
         assert!((override_margins.left - 0.09).abs() < 1e-6);
         assert!((override_margins.right - 0.03).abs() < 1e-6);
 
-        let book_address = RemoteAddress::file(favorite.id.to_string(), "book/book.png");
+        let book_address = favorite_address(&favorite, "book/book.png");
         let book_resolved = engine.resolve(&book_address).unwrap();
         let book_bbox = match engine
             .remote_view_trim_plan(&book_address, &book_resolved, Some(&context))
@@ -4757,10 +4714,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) =
             crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path).unwrap();
-        let left = RemoteAddress::file(favorite.id.to_string(), "book/left.png");
-        let right = RemoteAddress::file(favorite.id.to_string(), "book/right.png");
+        let left = favorite_address(&favorite, "book/left.png");
+        let right = favorite_address(&favorite, "book/right.png");
         let resolved = engine.resolve(&left).unwrap();
-        let context_address = RemoteAddress::file(favorite.id.to_string(), "book");
+        let context_address = favorite_address(&favorite, "book");
 
         let missing_partner = RemotePageRenderContext {
             context_address: context_address.clone(),
@@ -4831,9 +4788,9 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) =
             crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path).unwrap();
-        let left = RemoteAddress::file(favorite.id.to_string(), "book/left.png");
-        let right = RemoteAddress::file(favorite.id.to_string(), "book/right.png");
-        let context_address = RemoteAddress::file(favorite.id.to_string(), "book");
+        let left = favorite_address(&favorite, "book/left.png");
+        let right = favorite_address(&favorite, "book/right.png");
+        let context_address = favorite_address(&favorite, "book");
         let worker = WorkerContext::open();
         let render = |address: RemoteAddress,
                       display_slot: RemotePageDisplaySlot,
@@ -5117,7 +5074,7 @@ mod tests {
         };
         let decode = |_engine: &ContainerEngine,
                       address: &RemoteAddress,
-                      _resolved: &ResolvedRootPath,
+                      _resolved: &ResolvedPath,
                       _metadata: &std::fs::Metadata,
                       page_index: usize,
                       _cancel: &Arc<AtomicBool>| {
@@ -5139,12 +5096,15 @@ mod tests {
         };
 
         let mut mixed = remote_ai_test_request(RemoteAddress {
-            root_id: favorite.id.to_string(),
-            relative_path: "vector.pdf".to_owned(),
+            path: favorite
+                .path
+                .join("vector.pdf")
+                .to_string_lossy()
+                .into_owned(),
             subresource: RemoteSubresource::PdfPage { page_number: 0 },
         });
         mixed.pages.push(mimageviewer_ipc::RemoteAiPageRequest {
-            address: RemoteAddress::file(favorite.id.to_string(), "large.png"),
+            address: favorite_address(&favorite, "large.png"),
             target_px: 1024,
             render_context: None,
         });
@@ -5189,8 +5149,7 @@ mod tests {
             ..Default::default()
         });
         let address = RemoteAddress {
-            root_id: favorite.id.to_string(),
-            relative_path: "book.cbz".to_owned(),
+            path: outer.to_string_lossy().into_owned(),
             subresource: RemoteSubresource::ZipEntry {
                 entry_name: "chapter.zip/page.png".to_owned(),
             },
@@ -5336,8 +5295,7 @@ mod tests {
     fn remote_virtual_page_identity_uses_the_app_adjustment_keys_and_container_location() {
         let container = PathBuf::from("C:/books/nested/book.zip");
         let zip_address = RemoteAddress {
-            root_id: "favorite".to_owned(),
-            relative_path: "book.zip".to_owned(),
+            path: container.to_string_lossy().into_owned(),
             subresource: RemoteSubresource::ZipEntry {
                 entry_name: "Chapter/001.JPG".to_owned(),
             },
@@ -5351,8 +5309,7 @@ mod tests {
 
         let pdf_path = PathBuf::from("C:/books/nested/book.pdf");
         let pdf_address = RemoteAddress {
-            root_id: "favorite".to_owned(),
-            relative_path: "book.pdf".to_owned(),
+            path: pdf_path.to_string_lossy().into_owned(),
             subresource: RemoteSubresource::PdfPage { page_number: 7 },
         };
         let pdf = remote_adjustment_identity(&pdf_address, &pdf_path).unwrap();
@@ -5364,7 +5321,7 @@ mod tests {
     }
     #[test]
     fn resume_page_resolution_rejects_positions_outside_the_current_pages() {
-        let container = RemoteAddress::file("favorite", "book.pdf");
+        let container = RemoteAddress::file("C:/Books/book.pdf");
         let items = (0..3)
             .map(|page_num| crate::grid_item::GridItem::PdfPage {
                 pdf_path: std::path::PathBuf::from("book.pdf"),
@@ -5376,8 +5333,7 @@ mod tests {
         assert_eq!(
             resolve_resume_page(&container, &items, 1),
             Some(RemoteAddress {
-                root_id: "favorite".to_owned(),
-                relative_path: "book.pdf".to_owned(),
+                path: "C:/Books/book.pdf".to_owned(),
                 subresource: RemoteSubresource::PdfPage { page_number: 1 },
             })
         );
@@ -5416,7 +5372,7 @@ mod tests {
         std::fs::write(album.join("001.jpg"), b"one").unwrap();
         std::fs::write(album.join("002.jpg"), b"two").unwrap();
         let favorite = FavoriteEntry::new("test".to_owned(), root);
-        let address = RemoteAddress::file(favorite.id.to_string(), "album");
+        let address = favorite_address(&favorite, "album");
 
         for error in [
             super::super::session::UiReadError::Busy,
@@ -5470,7 +5426,7 @@ mod tests {
     }
 
     #[test]
-    fn container_resolution_rejects_a_path_outside_favorites() {
+    fn container_resolution_accepts_absolute_paths_outside_favorites_but_rejects_zip_traversal() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("favorite");
         let outside = temp.path().join("outside.zip");
@@ -5482,20 +5438,16 @@ mod tests {
             ..Default::default()
         };
         let engine = ContainerEngine::new(settings);
-        let address = RemoteAddress::file(favorite.id.to_string(), "../outside.zip");
-        assert!(matches!(
-            engine.resolve(&address),
-            Err(MediaError {
-                code: MediaErrorCode::BadRequest,
-                ..
-            })
-        ));
+        let address = RemoteAddress::file(outside.to_string_lossy().into_owned());
+        assert_eq!(
+            engine.resolve(&address).unwrap().canonical,
+            std::fs::canonicalize(&outside).unwrap()
+        );
 
         let safe_root = favorite.path.clone();
         std::fs::write(safe_root.join("book.zip"), b"not a zip").unwrap();
         let unsafe_entry = RemoteAddress {
-            root_id: favorite.id.to_string(),
-            relative_path: "book.zip".to_owned(),
+            path: safe_root.join("book.zip").to_string_lossy().into_owned(),
             subresource: RemoteSubresource::ZipEntry {
                 entry_name: "../secret.jpg".to_owned(),
             },
@@ -5550,8 +5502,8 @@ mod tests {
         settings.auto_fullscreen_zip_pdf = true;
         settings.auto_fullscreen_image_folders = true;
         let engine = ContainerEngine::new(settings);
-        let context = RemoteAddress::file(favorite.id.to_string(), "album");
-        let page = RemoteAddress::file(favorite.id.to_string(), "album/002.jpg");
+        let context = favorite_address(&favorite, "album");
+        let page = favorite_address(&favorite, "album/002.jpg");
         let mut request = RemoteWriteRequest::RecordReadingProgress {
             address: page.clone(),
             context_address: context.clone(),
@@ -5673,9 +5625,9 @@ mod tests {
             }
         }
 
-        let context = RemoteAddress::file(favorite.id.to_string(), "album");
+        let context = favorite_address(&favorite, "album");
         let mut request = RemoteWriteRequest::ListBookBookmarks {
-            address: RemoteAddress::file(favorite.id.to_string(), "album/001.jpg"),
+            address: favorite_address(&favorite, "album/001.jpg"),
             context_address: context.clone(),
             page_index: 999,
             bookmark_supported: false,
@@ -5692,10 +5644,7 @@ mod tests {
         let target = row.target.as_ref().unwrap();
         assert_eq!(target.item_index, 1);
         assert_eq!(target.context_address, context);
-        assert_eq!(
-            target.address,
-            RemoteAddress::file(favorite.id.to_string(), "album/002.jpg")
-        );
+        assert_eq!(target.address, favorite_address(&favorite, "album/002.jpg"));
     }
 
     #[test]
@@ -5741,15 +5690,21 @@ mod tests {
 
         let mut request = RemoteWriteRequest::ListBookBookmarks {
             address: RemoteAddress {
-                root_id: favorite.id.to_string(),
-                relative_path: "book.zip".to_owned(),
+                path: favorite
+                    .path
+                    .join("book.zip")
+                    .to_string_lossy()
+                    .into_owned(),
                 subresource: RemoteSubresource::ZipEntry {
                     entry_name: "part-a/001.jpg".to_owned(),
                 },
             },
             context_address: RemoteAddress {
-                root_id: favorite.id.to_string(),
-                relative_path: "book.zip".to_owned(),
+                path: favorite
+                    .path
+                    .join("book.zip")
+                    .to_string_lossy()
+                    .into_owned(),
                 subresource: RemoteSubresource::ZipDirectory {
                     prefix: "part-a/".to_owned(),
                 },
@@ -5793,8 +5748,8 @@ mod tests {
             ..Default::default()
         });
         let mut request = RemoteWriteRequest::RecordReadingProgress {
-            address: RemoteAddress::file(favorite.id.to_string(), "album/001.jpg"),
-            context_address: RemoteAddress::file(favorite.id.to_string(), "album"),
+            address: favorite_address(&favorite, "album/001.jpg"),
+            context_address: favorite_address(&favorite, "album"),
             page_index: 0,
             page_number: 1,
             page_count: 1,
@@ -5815,8 +5770,8 @@ mod tests {
         ));
 
         let mut list = RemoteWriteRequest::ListBookBookmarks {
-            address: RemoteAddress::file(favorite.id.to_string(), "album/001.jpg"),
-            context_address: RemoteAddress::file(favorite.id.to_string(), "album"),
+            address: favorite_address(&favorite, "album/001.jpg"),
+            context_address: favorite_address(&favorite, "album"),
             page_index: 999,
             bookmark_supported: true,
         };
@@ -5842,7 +5797,7 @@ mod tests {
             .unwrap();
         let local = crate::app::materialize_local_folder_listing(&folder, scan, &engine.settings);
         let response = engine.folder_list(FolderListRequest {
-            address: RemoteAddress::file(favorite.id.to_string(), relative_folder),
+            address: favorite_address(favorite, relative_folder),
         });
         let FolderListResponse::Success(remote) = response else {
             panic!("remote folder listing failed for {relative_folder}");
@@ -5867,8 +5822,7 @@ mod tests {
                 _ => panic!("physical folder listing produced a virtual item"),
             };
             let name = path.file_name().unwrap().to_string_lossy();
-            let expected_address =
-                RemoteAddress::file(favorite.id.to_string(), format!("{relative_folder}/{name}"));
+            let expected_address = favorite_address(favorite, format!("{relative_folder}/{name}"));
             let expected_thumbnail = if expected_kind == RemoteEntryKind::Video {
                 local
                     .video_thumb_overrides
@@ -5876,8 +5830,8 @@ mod tests {
                     .rev()
                     .find(|(video, _)| crate::path_key::eq_keep_drive(video, path))
                     .map(|(_, image)| {
-                        RemoteAddress::file(
-                            favorite.id.to_string(),
+                        favorite_address(
+                            favorite,
                             format!(
                                 "{relative_folder}/{}",
                                 image.file_name().unwrap().to_string_lossy()
@@ -5913,14 +5867,13 @@ mod tests {
             .iter()
             .filter(|item| item.has_page_data())
             .count();
-        let context = RemoteAddress::file(favorite.id.to_string(), relative_folder);
+        let context = favorite_address(favorite, relative_folder);
         for (expected_index, item) in local.items.iter().enumerate() {
             let crate::grid_item::GridItem::Image(path) = item else {
                 continue;
             };
             let name = path.file_name().unwrap().to_string_lossy();
-            let page =
-                RemoteAddress::file(favorite.id.to_string(), format!("{relative_folder}/{name}"));
+            let page = favorite_address(favorite, format!("{relative_folder}/{name}"));
             let validated = engine.validate_folder_page(&page, &context).unwrap();
             assert_eq!(validated.page_index as usize, expected_index);
             assert_eq!(validated.page_count as usize, page_count);
@@ -5991,8 +5944,8 @@ mod tests {
                     .find(|entry| entry.name == "clip.mp4")
                     .expect("video entry");
                 assert_eq!(video.kind, RemoteEntryKind::Video);
-                assert_eq!(video.address.relative_path, "mixed/clip.mp4");
-                assert_eq!(video.thumbnail_address.relative_path, "mixed/clip.jpg");
+                assert!(video.address.path.ends_with("mixed\\clip.mp4"));
+                assert!(video.thumbnail_address.path.ends_with("mixed\\clip.jpg"));
                 assert!(remote.sort_state.locked_reason.is_none());
             } else if relative == "image-only" {
                 assert_eq!(
@@ -6079,7 +6032,7 @@ mod tests {
             sort_order: crate::settings::SortOrder::DateDesc,
             ..Default::default()
         });
-        let address = RemoteAddress::file(favorite.id.to_string(), "album");
+        let address = favorite_address(&favorite, "album");
         let response = engine.container(ContainerRequest {
             address: address.clone(),
             spread_mode: Some(RemoteSpreadMode::Ltr),

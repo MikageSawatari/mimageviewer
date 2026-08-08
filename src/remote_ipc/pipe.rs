@@ -179,23 +179,21 @@ impl ServerGuard {
         let session_handle = session_runtime.handle();
         let configured_worker_count = settings.parallelism.thread_count();
         let worker_count = remote_heavy_worker_count(configured_worker_count);
-        let roots = super::live_favorites::RemoteRoots::live(settings.favorites.clone())?;
-        let thumbnail_engine = Arc::new(ThumbnailEngine::new_with_roots(
-            settings.clone(),
-            Arc::clone(&roots),
-        ));
+        let favorites = super::live_favorites::LiveFavorites::live(settings.favorites.clone())?;
+        let thumbnail_engine = Arc::new(ThumbnailEngine::new(settings.clone()));
         let container_engine = Arc::new(ContainerEngine::new_with_session(
             settings.clone(),
             session_handle.clone(),
-            Arc::clone(&roots),
         ));
         let ai_executor = Arc::new(super::ai_job::ContainerRemoteAiExecutor::new(Arc::clone(
             &container_engine,
         )));
         let ai_jobs = super::ai_job::RemoteAiJobRegistry::new(ai_executor);
         session_handle.install_ai_jobs(&ai_jobs);
-        let video_stream_engine = Arc::new(VideoStreamEngine::new_with_roots(Arc::clone(&roots)));
-        let collection_engine = Arc::new(CollectionEngine::new_with_live_roots(settings, roots));
+        let video_stream_engine = Arc::new(VideoStreamEngine::new());
+        let collection_engine = Arc::new(CollectionEngine::new_with_live_favorites(
+            settings, favorites,
+        ));
         let (heavy_work_tx, heavy_work_rx) = mpsc::sync_channel::<Work>(HEAVY_WORK_QUEUE_CAPACITY);
         let heavy_work_rx = Arc::new(Mutex::new(heavy_work_rx));
         let (home_work_tx, home_work_rx) = mpsc::sync_channel::<Work>(HOME_WORK_QUEUE_CAPACITY);
@@ -2761,10 +2759,7 @@ mod tests {
             id: 81,
             owner: test_owner(),
             request: mimageviewer_ipc::ThumbnailRequest {
-                address: mimageviewer_ipc::RemoteAddress::file(
-                    "00000000-0000-0000-0000-000000000000",
-                    "page.jpg",
-                ),
+                address: mimageviewer_ipc::RemoteAddress::file("C:/Pictures/page.jpg"),
                 target_px: 256,
             },
         };
@@ -2777,10 +2772,7 @@ mod tests {
             id: 83,
             owner: test_owner(),
             request: mimageviewer_ipc::FolderListRequest {
-                address: mimageviewer_ipc::RemoteAddress::file(
-                    "00000000-0000-0000-0000-000000000000",
-                    "album",
-                ),
+                address: mimageviewer_ipc::RemoteAddress::file("C:/Pictures/album"),
             },
         };
         let jump_list = ClientMessage::VideoStreamJumpList {
@@ -2814,10 +2806,7 @@ mod tests {
             id: 42,
             owner: test_owner(),
             request: mimageviewer_ipc::ThumbnailRequest {
-                address: mimageviewer_ipc::RemoteAddress::file(
-                    "00000000-0000-0000-0000-000000000000",
-                    "page.jpg",
-                ),
+                address: mimageviewer_ipc::RemoteAddress::file("C:/Pictures/page.jpg"),
                 target_px: 256,
             },
         };

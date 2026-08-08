@@ -128,11 +128,36 @@ impl CapturePixelJob {
 }
 
 pub fn default_output_dir() -> PathBuf {
-    if let Some(pictures) = mimageviewer_registered_roots::pictures_root() {
+    if let Some(pictures) = pictures_root() {
         pictures.join("mimageviewer")
     } else {
         crate::data_dir::get().join("captures")
     }
+}
+
+#[cfg(windows)]
+/// OS の Pictures 既知フォルダを解決し、失敗時は USERPROFILE\Pictures へ戻す。
+pub fn pictures_root() -> Option<PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_Pictures, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+
+    let known = (|| unsafe {
+        let path = SHGetKnownFolderPath(&FOLDERID_Pictures, KF_FLAG_DEFAULT, None).ok()?;
+        let result = path.to_string().ok().map(PathBuf::from);
+        CoTaskMemFree(Some(path.0.cast()));
+        result
+    })();
+    known.or_else(|| {
+        std::env::var_os("USERPROFILE").map(|profile| PathBuf::from(profile).join("Pictures"))
+    })
+}
+
+#[cfg(not(windows))]
+/// 非 Windows のテスト環境では慣例的な Pictures ディレクトリを返す。
+pub fn pictures_root() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|home| PathBuf::from(home).join("Pictures"))
 }
 
 pub fn open_output_dir_async(output_dir: PathBuf) {

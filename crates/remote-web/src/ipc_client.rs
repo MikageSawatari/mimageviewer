@@ -2133,7 +2133,7 @@ mod tests {
         let request = ClientMessage::VideoStreamStart {
             id: 1,
             owner: test_owner(),
-            address: RemoteAddress::file("00000000-0000-0000-0000-000000000000", "movie.mp4"),
+            address: RemoteAddress::file("C:/Movies/movie.mp4"),
             quality: VideoStreamQuality::Standard,
         };
         assert_eq!(
@@ -2175,7 +2175,7 @@ mod tests {
             id: 1,
             owner: test_owner(),
             request: PageRequest {
-                address: RemoteAddress::file("00000000-0000-0000-0000-000000000000", "image.png"),
+                address: RemoteAddress::file("C:/Pictures/image.png"),
                 target_px: 2048,
                 priority: PagePriority::Foreground,
                 render_context: None,
@@ -2320,7 +2320,7 @@ mod tests {
                 let ClientMessage::Thumbnail { id, request, .. } = message else {
                     panic!("unexpected request type")
                 };
-                let marker = request.address.relative_path.as_bytes()[0];
+                let marker = request.address.path.as_bytes()[0];
                 write_frame(
                     &mut pipe,
                     &ServerMessage::Thumbnail {
@@ -2348,22 +2348,14 @@ mod tests {
         let first_client = Arc::clone(&client);
         let first = std::thread::spawn(move || {
             first_client
-                .thumbnail_address(
-                    &test_owner(),
-                    RemoteAddress::file("00000000-0000-0000-0000-000000000000", "a.jpg"),
-                    128,
-                )
+                .thumbnail_address(&test_owner(), RemoteAddress::file("C:/Pictures/a.jpg"), 128)
                 .map(|result| result.bytes)
                 .map_err(|failure| failure.error.to_string())
         });
         let second_client = Arc::clone(&client);
         let second = std::thread::spawn(move || {
             second_client
-                .thumbnail_address(
-                    &test_owner(),
-                    RemoteAddress::file("00000000-0000-0000-0000-000000000000", "b.jpg"),
-                    128,
-                )
+                .thumbnail_address(&test_owner(), RemoteAddress::file("C:/Pictures/b.jpg"), 128)
                 .map(|result| result.bytes)
                 .map_err(|failure| failure.error.to_string())
         });

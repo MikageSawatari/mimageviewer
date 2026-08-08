@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 36;
+pub const PROTOCOL_VERSION: u32 = 37;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -52,32 +52,26 @@ pub fn negotiate(client_version: u32) -> ServerHello {
 
 /// Web クライアントへ公開できるコンテンツアドレス。
 ///
-/// 実ファイル部分は常に許可された起点の ID + その root からの相対パスで表し、
-/// ZIP/PDF 内の位置だけを `subresource` へ追加する。絶対パスをこの型に載せない。
+/// 実ファイル部分は絶対パスで表し、ZIP/PDF 内の位置だけを `subresource` へ追加する。
 #[derive(Clone, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
 pub struct RemoteAddress {
-    /// 許可された起点の ID。
-    ///
-    /// お気に入り UUID または登録済み項目の正規化 path から導出した UUID が入る。
-    /// この値を直接お気に入り一覧から引く処理は、解決器の外に書かないこと。
-    pub root_id: String,
-    pub relative_path: String,
+    /// 対象の絶対パス。
+    pub path: String,
     pub subresource: RemoteSubresource,
 }
 
 impl RemoteAddress {
-    pub fn file(root_id: impl Into<String>, relative_path: impl Into<String>) -> Self {
+    pub fn file(path: impl Into<String>) -> Self {
         Self {
-            root_id: root_id.into(),
-            relative_path: relative_path.into(),
+            path: path.into(),
             subresource: RemoteSubresource::File,
         }
     }
 
     /// トランスポート両端で共通に実行する構文検証。
-    /// 実在確認・favorite allowlist・junction 境界は各プロセスが別途検証する。
+    /// 実在確認と canonicalize は各プロセスが別途行う。
     pub fn validate_syntax(&self) -> Result<(), AddressError> {
-        validate_relative_component_path(&self.relative_path, true)?;
+        validate_absolute_path(&self.path)?;
         match &self.subresource {
             RemoteSubresource::File | RemoteSubresource::PdfPage { .. } => Ok(()),
             RemoteSubresource::ZipEntry { entry_name } => validate_zip_path(entry_name, false),
@@ -104,8 +98,26 @@ pub enum RemoteSubresource {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddressError {
-    InvalidRelativePath,
+    InvalidPath,
     InvalidZipPath,
+}
+
+/// Core と remote-web が共有するアクセス境界の構文検証の正本。
+///
+/// 絶対パス判定と NUL 拒否を別の crate に複製せず、必ずこの関数を使うこと。
+pub fn validate_absolute_path(value: &str) -> Result<(), AddressError> {
+    let path = std::path::Path::new(value);
+    let bytes = value.as_bytes();
+    let absolute = path.is_absolute()
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+        || value.starts_with(r"\\");
+    if value.contains('\0') || !absolute {
+        return Err(AddressError::InvalidPath);
+    }
+    Ok(())
 }
 
 fn validate_relative_component_path(value: &str, allow_empty: bool) -> Result<(), AddressError> {
@@ -114,7 +126,7 @@ fn validate_relative_component_path(value: &str, allow_empty: bool) -> Result<()
         || looks_absolute_or_drive_qualified(value)
         || value.split(['/', '\\']).any(|part| part == "..")
     {
-        return Err(AddressError::InvalidRelativePath);
+        return Err(AddressError::InvalidPath);
     }
     Ok(())
 }
@@ -149,7 +161,7 @@ pub struct FolderListRequest {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct FolderListEntry {
-    /// Address of the listed cell, relative to its allowed root.
+    /// Absolute filesystem address of the listed cell.
     pub address: RemoteAddress,
     /// Thumbnail source; a video's sidecar image may differ from `address`.
     pub thumbnail_address: RemoteAddress,
@@ -425,6 +437,13 @@ impl RemoteGridScope {
             Self::Collection { .. } => None,
         }
     }
+
+    pub fn address_mut(&mut self) -> Option<&mut RemoteAddress> {
+        match self {
+            Self::Address { address } => Some(address),
+            Self::Collection { .. } => None,
+        }
+    }
 }
 
 /// 本体 UI thread が所有する永続ハンドルで適用する書き込み要求。
@@ -537,7 +556,59 @@ impl RemoteWriteRequest {
         }
     }
 
+    pub fn address_mut(&mut self) -> Option<&mut RemoteAddress> {
+        match self {
+            Self::SetSpread { address, .. }
+            | Self::RecordReadingProgress { address, .. }
+            | Self::SetRating { address, .. }
+            | Self::SetBookmark { address, .. }
+            | Self::GetItemState { address, .. }
+            | Self::ListBookBookmarks { address, .. }
+            | Self::SetBookBookmarkTitle { address, .. }
+            | Self::RemoveBookBookmark { address, .. }
+            | Self::SetAdjustment { address, .. }
+            | Self::GetAdjustmentState { address }
+            | Self::SetViewTrim { address, .. }
+            | Self::GetViewTrimState { address, .. } => Some(address),
+            Self::SetSortOrder { scope, .. } => scope.address_mut(),
+        }
+    }
+
     pub fn context_address(&self) -> Option<&RemoteAddress> {
+        match self {
+            Self::RecordReadingProgress {
+                context_address, ..
+            }
+            | Self::SetBookmark {
+                context_address, ..
+            }
+            | Self::GetItemState {
+                context_address, ..
+            }
+            | Self::ListBookBookmarks {
+                context_address, ..
+            }
+            | Self::SetBookBookmarkTitle {
+                context_address, ..
+            }
+            | Self::RemoveBookBookmark {
+                context_address, ..
+            }
+            | Self::SetViewTrim {
+                context_address, ..
+            }
+            | Self::GetViewTrimState {
+                context_address, ..
+            } => Some(context_address),
+            Self::SetSpread { .. }
+            | Self::SetRating { .. }
+            | Self::SetAdjustment { .. }
+            | Self::GetAdjustmentState { .. }
+            | Self::SetSortOrder { .. } => None,
+        }
+    }
+
+    pub fn context_address_mut(&mut self) -> Option<&mut RemoteAddress> {
         match self {
             Self::RecordReadingProgress {
                 context_address, ..
@@ -947,9 +1018,8 @@ pub enum RemoteEntryKind {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct RemoteEntry {
-    pub root_id: String,
-    /// 許可された起点の root からの相対パス。絶対パスはこの型に載せない。
-    pub relative_path: String,
+    /// 対象の絶対パス。
+    pub path: String,
     pub name: String,
     pub kind: RemoteEntryKind,
     pub detail: Option<String>,
@@ -2153,10 +2223,7 @@ mod tests {
             id: 42,
             owner: test_owner("test-client"),
             request: ThumbnailRequest {
-                address: RemoteAddress::file(
-                    "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
-                    "album/page.jpg",
-                ),
+                address: RemoteAddress::file("C:/Pictures/album/page.jpg"),
                 target_px: 384,
             },
         };
@@ -2174,21 +2241,16 @@ mod tests {
             owner: test_owner("test-client"),
             request: PageRequest {
                 address: RemoteAddress {
-                    root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
-                    relative_path: "books/volume.pdf".to_owned(),
+                    path: "C:/Books/volume.pdf".to_owned(),
                     subresource: RemoteSubresource::PdfPage { page_number: 7 },
                 },
                 target_px: 1805,
                 priority: PagePriority::Prefetch,
                 render_context: Some(RemotePageRenderContext {
-                    context_address: RemoteAddress::file(
-                        "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
-                        "books/volume.pdf",
-                    ),
+                    context_address: RemoteAddress::file("C:/Books/volume.pdf"),
                     display_slot: RemotePageDisplaySlot::SpreadRight,
                     spread_partner: Some(RemoteAddress {
-                        root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
-                        relative_path: "books/volume.pdf".to_owned(),
+                        path: "C:/Books/volume.pdf".to_owned(),
                         subresource: RemoteSubresource::PdfPage { page_number: 11 },
                     }),
                 }),
@@ -2219,19 +2281,19 @@ mod tests {
 
     #[test]
     fn folder_list_round_trips_with_sidecar_provenance() {
-        let video = RemoteAddress::file("favorite", "movies/sample.mp4");
-        let sidecar = RemoteAddress::file("favorite", "movies/sample.jpg");
+        let video = RemoteAddress::file("C:/Movies/sample.mp4");
+        let sidecar = RemoteAddress::file("C:/Movies/sample.jpg");
         let request = ClientMessage::FolderList {
             id: 49,
             owner: test_owner("test-client"),
             request: FolderListRequest {
-                address: RemoteAddress::file("favorite", "movies"),
+                address: RemoteAddress::file("C:/Movies"),
             },
         };
         let response = ServerMessage::FolderList {
             id: 49,
             response: FolderListResponse::Success(FolderListPayload {
-                effective_address: RemoteAddress::file("favorite", "movies"),
+                effective_address: RemoteAddress::file("C:/Movies"),
                 root_name: "Fixture".to_owned(),
                 thumb_aspect_height_ratio: 9.0 / 16.0,
                 sort_state: test_sort_state(None),
@@ -2258,21 +2320,16 @@ mod tests {
         let actual_response: ServerMessage =
             read_frame(&mut response_bytes.as_slice(), MAX_RESPONSE_FRAME_BYTES).unwrap();
         assert_eq!(actual_response, response);
-        let encoded = String::from_utf8(response_bytes[4..].to_vec()).unwrap();
-        assert!(!encoded.contains(":\\"));
     }
 
     #[test]
-    fn protocol_v36_registered_roots_page_identity_and_session_state_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 36);
+    fn protocol_v37_absolute_path_page_identity_and_session_state_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 37);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
                 owner: test_owner("test-client"),
-                address: RemoteAddress::file(
-                    "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
-                    "movies/sample.mp4",
-                ),
+                address: RemoteAddress::file("C:/Movies/sample.mp4"),
                 quality: VideoStreamQuality::Standard,
             },
             ClientMessage::VideoStreamPlaylist {
@@ -2392,10 +2449,9 @@ mod tests {
 
     #[test]
     fn container_spread_request_and_groups_round_trip() {
-        let container = RemoteAddress::file("favorite", "books/book.pdf");
+        let container = RemoteAddress::file("C:/Books/book.pdf");
         let page = |page_number| RemoteAddress {
-            root_id: "favorite".to_owned(),
-            relative_path: "books/book.pdf".to_owned(),
+            path: "C:/Books/book.pdf".to_owned(),
             subresource: RemoteSubresource::PdfPage { page_number },
         };
         let expected = ServerMessage::Container {
@@ -2429,7 +2485,7 @@ mod tests {
         assert_eq!(actual, expected);
 
         let request = ContainerRequest {
-            address: RemoteAddress::file("favorite", "books/book.pdf"),
+            address: RemoteAddress::file("C:/Books/book.pdf"),
             spread_mode: Some(RemoteSpreadMode::Ltr),
             reading_direction: Some(RemoteReadingDirection::Ltr),
             force_single_page: true,
@@ -2446,10 +2502,7 @@ mod tests {
             id: 45,
             owner: test_owner("test-client"),
             request: RemoteWriteRequest::SetSpread {
-                address: RemoteAddress::file(
-                    "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
-                    "books/book.pdf",
-                ),
+                address: RemoteAddress::file("C:/Books/book.pdf"),
                 spread_mode: RemoteSpreadMode::RtlCover,
                 reading_direction: RemoteReadingDirection::Rtl,
             },
@@ -2467,10 +2520,9 @@ mod tests {
 
     #[test]
     fn every_write_variant_and_item_state_round_trip() {
-        let container = RemoteAddress::file("favorite", "books/book.pdf");
+        let container = RemoteAddress::file("C:/Books/book.pdf");
         let page = RemoteAddress {
-            root_id: "favorite".to_owned(),
-            relative_path: "books/book.pdf".to_owned(),
+            path: "C:/Books/book.pdf".to_owned(),
             subresource: RemoteSubresource::PdfPage { page_number: 2 },
         };
         let requests = [
@@ -2557,7 +2609,7 @@ mod tests {
             },
             RemoteWriteRequest::SetViewTrim {
                 address: page.clone(),
-                context_address: RemoteAddress::file("favorite", "books/book.pdf"),
+                context_address: RemoteAddress::file("C:/Books/book.pdf"),
                 state: serde_json::json!({
                     "apply_mode": "book",
                     "book_settings": {
@@ -2572,7 +2624,7 @@ mod tests {
             },
             RemoteWriteRequest::GetViewTrimState {
                 address: page,
-                context_address: RemoteAddress::file("favorite", "books/book.pdf"),
+                context_address: RemoteAddress::file("C:/Books/book.pdf"),
             },
             RemoteWriteRequest::SetSortOrder {
                 scope: RemoteGridScope::Collection {
@@ -2609,15 +2661,13 @@ mod tests {
                     page_label: "009.jpg".to_owned(),
                     target: Some(RemoteBookBookmarkTarget {
                         address: RemoteAddress {
-                            root_id: "favorite".to_owned(),
-                            relative_path: "books/book.zip".to_owned(),
+                            path: "C:/Books/book.zip".to_owned(),
                             subresource: RemoteSubresource::ZipEntry {
                                 entry_name: "chapter/009.jpg".to_owned(),
                             },
                         },
                         context_address: RemoteAddress {
-                            root_id: "favorite".to_owned(),
-                            relative_path: "books/book.zip".to_owned(),
+                            path: "C:/Books/book.zip".to_owned(),
                             subresource: RemoteSubresource::ZipDirectory {
                                 prefix: "chapter/".to_owned(),
                             },
@@ -2710,7 +2760,7 @@ mod tests {
     }
 
     #[test]
-    fn collection_message_keeps_only_root_identity_and_relative_path() {
+    fn collection_message_carries_the_absolute_path() {
         let expected = ServerMessage::Collection {
             id: 77,
             response: CollectionResponse::Success(CollectionPayload {
@@ -2720,8 +2770,7 @@ mod tests {
                 entry_limit: 1000,
                 truncated: false,
                 entries: vec![RemoteEntry {
-                    root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
-                    relative_path: "books/volume-1".to_owned(),
+                    path: "C:/Books/volume-1".to_owned(),
                     name: "volume-1".to_owned(),
                     kind: RemoteEntryKind::Folder,
                     detail: Some("3 / 20 ページ".to_owned()),
@@ -2885,6 +2934,16 @@ mod tests {
     }
 
     #[test]
+    fn absolute_path_boundary_is_shared_and_rejects_nul() {
+        for path in ["C:/Pictures/page.jpg", r"\\server\share\page.jpg"] {
+            validate_absolute_path(path).unwrap();
+        }
+        for path in ["relative/page.jpg", "C:page.jpg", "C:/bad\0page.jpg"] {
+            assert_eq!(validate_absolute_path(path), Err(AddressError::InvalidPath));
+        }
+    }
+
+    #[test]
     fn zip_entry_address_rejects_traversal_and_windows_aliases() {
         for entry_name in [
             "../secret.jpg",
@@ -2894,8 +2953,7 @@ mod tests {
             r"C:\secret.jpg",
         ] {
             let address = RemoteAddress {
-                root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
-                relative_path: "books/volume.zip".to_owned(),
+                path: "C:/Books/volume.zip".to_owned(),
                 subresource: RemoteSubresource::ZipEntry {
                     entry_name: entry_name.to_owned(),
                 },
@@ -2908,15 +2966,13 @@ mod tests {
     fn valid_nested_zip_and_pdf_addresses_round_trip() {
         let addresses = [
             RemoteAddress {
-                root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
-                relative_path: "books/volume.zip".to_owned(),
+                path: "C:/Books/volume.zip".to_owned(),
                 subresource: RemoteSubresource::ZipEntry {
                     entry_name: "chapter.zip/pages/001.jpg".to_owned(),
                 },
             },
             RemoteAddress {
-                root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
-                relative_path: "books/volume.pdf".to_owned(),
+                path: "C:/Books/volume.pdf".to_owned(),
                 subresource: RemoteSubresource::PdfPage { page_number: 42 },
             },
         ];
@@ -2925,15 +2981,14 @@ mod tests {
             let encoded = serde_json::to_vec(&address).unwrap();
             let decoded: RemoteAddress = serde_json::from_slice(&encoded).unwrap();
             assert_eq!(decoded, address);
-            assert!(!String::from_utf8(encoded).unwrap().contains("C:"));
+            assert!(String::from_utf8(encoded).unwrap().contains("C:/Books/"));
         }
     }
 
     #[test]
     fn page_payload_carries_the_rendered_identity_across_ipc() {
         let identity = RemoteAddress {
-            root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
-            relative_path: "books/volume.pdf".to_owned(),
+            path: "C:/Books/volume.pdf".to_owned(),
             subresource: RemoteSubresource::PdfPage { page_number: 1 },
         };
         let expected = ServerMessage::Page {
@@ -2963,7 +3018,7 @@ mod tests {
 
     #[test]
     fn protocol_v25_remote_ai_messages_and_page_outcomes_round_trip() {
-        let address = RemoteAddress::file("30d6c167-7148-4f3e-9a5a-21c5fd31ecb2", "pages/001.png");
+        let address = RemoteAddress::file("C:/Pages/001.png");
         let start = RemoteAiStartRequest {
             request_id: "request-1".to_owned(),
             pages: vec![RemoteAiPageRequest {

@@ -83,9 +83,9 @@ globalThis.requestAnimationFrame = (callback) => {
 };
 globalThis.cancelAnimationFrame = () => {};
 const TEST_SESSION_ID = "0123456789abcdef0123456789abcdef";
+const testPath = (relative = "") => relative ? `C:/miv-test/${relative}` : "C:/miv-test";
 const TEST_PAGE_ADDRESS = {
-  root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
-  relative_path: "books/test.pdf",
+  path: testPath("books/test.pdf"),
   subresource: { kind: "pdf_page", page_number: 0 },
 };
 const pageIdentityHeader = (address) => encodeURIComponent(JSON.stringify(address));
@@ -409,13 +409,11 @@ test("legacy image telemetry resolves rejection and folder route without entryIn
 
 test("a folder-list video uses its absorbed sidecar as the thumbnail source", () => {
   const video = {
-    root_id: "favorite",
-    relative_path: "movies/clip.mp4",
+    path: testPath("movies/clip.mp4"),
     subresource: { kind: "file" },
   };
   const sidecar = {
-    root_id: "favorite",
-    relative_path: "movies/clip.jpg",
+    path: testPath("movies/clip.jpg"),
     subresource: { kind: "file" },
   };
   assert.equal(
@@ -427,15 +425,13 @@ test("a folder-list video uses its absorbed sidecar as the thumbnail source", ()
 
 test("grid return identity matches collection and addressed forms of the same item", () => {
   const address = {
-    root_id: "favorite",
-    relative_path: "album/child",
+    path: testPath("album/child"),
     subresource: { kind: "file" },
   };
   assert.equal(
     gridReturnItemIdentity({
       kind: "folder",
-      root_id: address.root_id,
-      relative_path: address.relative_path,
+      path: address.path,
     }),
     gridReturnItemIdentity({ kind: "folder", address })
   );
@@ -443,13 +439,11 @@ test("grid return identity matches collection and addressed forms of the same it
 
 test("book bookmark rows preserve DB order and keep hint separate from resolved target", () => {
   const address = (pageNumber) => ({
-    root_id: "favorite",
-    relative_path: "book.pdf",
+    path: testPath("book.pdf"),
     subresource: { kind: "pdf_page", page_number: pageNumber },
   });
   const context = {
-    root_id: "favorite",
-    relative_path: "book.pdf",
+    path: testPath("book.pdf"),
     subresource: { kind: "file" },
   };
   const list = normalizeRemoteBookBookmarkList({
@@ -496,8 +490,7 @@ test("container opening resumes the matching page and otherwise falls back safel
   const page = (pageNumber) => ({
     kind: "image",
     address: {
-      root_id: "favorite",
-      relative_path: "book.pdf",
+      path: testPath("book.pdf"),
       subresource: { kind: "pdf_page", page_number: pageNumber },
     },
   });
@@ -528,13 +521,13 @@ test("container opening resumes the matching page and otherwise falls back safel
 test("a collection root returns to its list without exposing a root kind", () => {
   assert.equal(rootOpenReturnHash({
     hasCollection: true,
-    relativePath: "",
+    atFavoriteRoot: true,
     collectionHash: "#collection/rating/5",
     fallbackHash: "#folder/root",
   }), "#collection/rating/5");
   assert.equal(rootOpenReturnHash({
     hasCollection: true,
-    relativePath: "books/book.zip",
+    atFavoriteRoot: false,
     collectionHash: "#collection/rating/5",
     fallbackHash: "#folder/favorite/books",
   }), "#folder/favorite/books");
@@ -935,23 +928,20 @@ test("remote colorize normalization preserves custom points and clamps desktop r
 test("plain image media routes resolve their containing folder", () => {
   assert.deepEqual(
     parentContainerAddress({
-      root_id: "favorite",
-      relative_path: "books/volume/page-002.jpg",
+      path: testPath("books/volume/page-002.jpg"),
       subresource: { kind: "file" },
     }),
     {
-      root_id: "favorite",
-      relative_path: "books/volume",
+      path: testPath("books/volume"),
       subresource: { kind: "file" },
     }
   );
 });
 
-test("a registered image root opens by its empty-path address", () => {
-  const rootId = "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2";
+test("an absolute image path opens by its file address", () => {
   const dispatched = [];
   const tile = createGridTile(
-    { kind: "image", name: "outside.jpg", root_id: rootId, relative_path: "" },
+    { kind: "image", name: "outside.jpg", path: testPath("outside.jpg") },
     0,
     { get: () => 0 },
     null,
@@ -963,13 +953,8 @@ test("a registered image root opens by its empty-path address", () => {
 
   assert.equal(dispatched.length, 1);
   assert.deepEqual(dispatched[0].requested.payload, {
-    kind: "media",
-    mediaKind: "image",
-    address: {
-      root_id: rootId,
-      relative_path: "",
-      subresource: { kind: "file" },
-    },
+    kind: "image",
+    path: testPath("outside.jpg"),
     imageIndex: 0,
     entryIndex: 0,
   });
@@ -977,8 +962,7 @@ test("a registered image root opens by its empty-path address", () => {
 
 test("tapping a video grid tile preserves the video route", () => {
   const address = {
-    root_id: "favorite",
-    relative_path: "clips/movie.mp4",
+    path: testPath("clips/movie.mp4"),
     subresource: { kind: "file" },
   };
   const dispatched = [];
@@ -1016,8 +1000,7 @@ test("tapping a video grid tile preserves the video route", () => {
 
 test("tapping an audio grid tile shows the shared unsupported notice route", () => {
   const address = {
-    root_id: "favorite",
-    relative_path: "music/track.flac",
+    path: testPath("music/track.flac"),
     subresource: { kind: "file" },
   };
   const dispatched = [];
@@ -1052,8 +1035,7 @@ test("tapping an audio grid tile shows the shared unsupported notice route", () 
 
 test("tapping an archive grid tile shows the same shared unsupported notice route", () => {
   const address = {
-    root_id: "favorite",
-    relative_path: "books/book.rar",
+    path: testPath("books/book.rar"),
     subresource: { kind: "file" },
   };
   const dispatched = [];
@@ -1343,13 +1325,11 @@ test("the AI status offers no cancel control, matching the desktop viewer", () =
 
 test("AI result identity mismatch is not applied or automatically fetched again", async () => {
   const requestedIdentity = {
-    root_id: TEST_PAGE_ADDRESS.root_id,
-    relative_path: "books/ai-source.pdf",
+    path: testPath("books/ai-source.pdf"),
     subresource: { kind: "pdf_page", page_number: 1 },
   };
   const responseIdentity = {
-    root_id: TEST_PAGE_ADDRESS.root_id,
-    relative_path: "books/other.pdf",
+    path: testPath("books/other.pdf"),
     subresource: { kind: "pdf_page", page_number: 1 },
   };
   let replaceCalls = 0;
@@ -1461,13 +1441,11 @@ test("viewer refuses a page response without a generation attestation", async ()
 
 test("viewer rejects a mismatched page identity without display or retry and reports both identities", async () => {
   const requestedIdentity = {
-    root_id: TEST_PAGE_ADDRESS.root_id,
-    relative_path: "books/first.pdf",
+    path: testPath("books/first.pdf"),
     subresource: { kind: "pdf_page", page_number: 1 },
   };
   const responseIdentity = {
-    root_id: TEST_PAGE_ADDRESS.root_id,
-    relative_path: "books/other.pdf",
+    path: testPath("books/other.pdf"),
     subresource: { kind: "pdf_page", page_number: 1 },
   };
   const initialImage = new FakeElement("img");
@@ -1632,8 +1610,7 @@ test("spread waits for both pages and atomically replaces the page layer", async
 
 test("spread rejects one mismatched page before replacing either side", async () => {
   const requested = (pageNumber) => ({
-    root_id: TEST_PAGE_ADDRESS.root_id,
-    relative_path: "books/spread.pdf",
+    path: testPath("books/spread.pdf"),
     subresource: { kind: "pdf_page", page_number: pageNumber },
   });
   const initialImage = new FakeElement("img");
@@ -1659,8 +1636,7 @@ test("spread rejects one mismatched page before replacing either side", async ()
     const identity = pageNumber === 1
       ? requested(0)
       : {
-        root_id: TEST_PAGE_ADDRESS.root_id,
-        relative_path: "books/other.pdf",
+        path: testPath("books/other.pdf"),
         subresource: { kind: "pdf_page", page_number: 1 },
       };
     return new Response(new Blob([new Uint8Array([pageNumber])]), {
@@ -1720,13 +1696,13 @@ test("folder list becomes renderable before spread metadata and open waits for i
     const url = new URL(input, testLocation.origin);
     if (url.pathname === "/api/list") {
       return Response.json({
-        path: "book",
+        path: testPath("book"),
         thumb_aspect_height_ratio: 1,
         entries: [
-          { kind: "dir", name: "child", path: "book/child" },
-          { kind: "image", name: "001.jpg", path: "book/001.jpg" },
-          { kind: "image", name: "002.jpg", path: "book/002.jpg" },
-          { kind: "video", name: "clip.mp4", path: "book/clip.mp4" },
+          { kind: "dir", name: "child", path: testPath("book/child") },
+          { kind: "image", name: "001.jpg", path: testPath("book/001.jpg") },
+          { kind: "image", name: "002.jpg", path: testPath("book/002.jpg") },
+          { kind: "video", name: "clip.mp4", path: testPath("book/clip.mp4") },
         ],
       });
     }
@@ -1738,14 +1714,13 @@ test("folder list becomes renderable before spread metadata and open waits for i
   };
 
   try {
-    const loaded = await loadFolder("favorite", "book", performance.now());
+    const loaded = await loadFolder(testPath("book"), performance.now());
     assert.equal(containerRequested, true);
     assert.equal(loaded.metrics.entryCount, 4);
     assert.equal(loaded.metrics.containerCount, 0);
 
     const pageAddress = {
-      root_id: "favorite",
-      relative_path: "book/002.jpg",
+      path: testPath("book/002.jpg"),
       subresource: { kind: "file" },
     };
     let viewerPreparationSettled = false;
@@ -1762,8 +1737,7 @@ test("folder list becomes renderable before spread metadata and open waits for i
       kind: "image",
       name,
       address: {
-        root_id: "favorite",
-        relative_path: `book/${name}`,
+        path: testPath(`book/${name}`),
         subresource: { kind: "file" },
       },
     });
@@ -1813,13 +1787,11 @@ test("a previous folder container result cannot satisfy the current folder", asy
 
   const containerResponse = (path) => {
     const address = {
-      root_id: "favorite",
-      relative_path: path,
+      path: testPath(path),
       subresource: { kind: "file" },
     };
     const pageAddress = {
-      root_id: "favorite",
-      relative_path: `${path}/001.jpg`,
+      path: testPath(`${path}/001.jpg`),
       subresource: { kind: "file" },
     };
     return {
@@ -1841,8 +1813,8 @@ test("a previous folder container result cannot satisfy the current folder", asy
   };
 
   try {
-    const oldFolder = await loadFolder("favorite", "old");
-    const currentFolder = await loadFolder("favorite", "current");
+    const oldFolder = await loadFolder(testPath("old"));
+    const currentFolder = await loadFolder(testPath("current"));
     assert.equal(oldFolder.requestController.signal.aborted, true);
 
     const current = containerResponse("current");
@@ -1854,12 +1826,12 @@ test("a previous folder container result cannot satisfy the current folder", asy
       currentPreparationSettled = true;
       return value;
     });
-    containerResolvers.get("old")(containerResponse("old").response);
+    containerResolvers.get(testPath("old"))(containerResponse("old").response);
     await oldFolder.containerLoad.promise;
     await Promise.resolve();
     assert.equal(currentPreparationSettled, false);
 
-    containerResolvers.get("current")(current.response);
+    containerResolvers.get(testPath("current"))(current.response);
     assert.equal(await currentPreparation, 0);
     assert.equal(currentFolder.requestController.signal.aborted, false);
   } finally {
@@ -1869,8 +1841,8 @@ test("a previous folder container result cannot satisfy the current folder", asy
 
 test("standalone reload is local and preserves the current hash", () => {
   const before = reloadCalls;
-  testLocation.hash = "#image/favorite/book%2F002.jpg";
+  testLocation.hash = "#image/C%3A%2Fmiv-test%2Fbook%2F002.jpg";
   reloadApplication();
   assert.equal(reloadCalls, before + 1);
-  assert.equal(testLocation.hash, "#image/favorite/book%2F002.jpg");
+  assert.equal(testLocation.hash, "#image/C%3A%2Fmiv-test%2Fbook%2F002.jpg");
 });

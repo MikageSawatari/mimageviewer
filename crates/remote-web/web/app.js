@@ -10,6 +10,7 @@ import {
   ViewerPanelAction,
   VIEWER_PANEL_ANIMATION_MS,
   adjustmentResetVisible,
+  addressedPostRequest,
   command,
   commandFromKey,
   createReadingProgressBatch,
@@ -513,7 +514,6 @@ const state = {
   gridReturnHash: "#home/places",
   gridHash: "#home/places",
   thumbAspectHeightRatio: 1,
-  rootId: null,
   favoriteName: "",
   folderPath: "",
   entries: [],
@@ -1375,7 +1375,7 @@ async function dispatchRoute() {
       return;
     }
     if (route.kind === "folder") {
-      await showFolder(route.rootId, route.path);
+      await showFolder(route.path);
       return;
     }
     if (route.kind === "container") {
@@ -1386,8 +1386,7 @@ async function dispatchRoute() {
       const parentAddress = parentContainerAddress(route.address);
       if (route.address.subresource.kind === "file") {
         const loaded = await loadFolder(
-          parentAddress.root_id,
-          parentAddress.relative_path,
+          parentAddress.path,
           performance.now()
         );
         if (!loaded) return;
@@ -1425,17 +1424,14 @@ async function dispatchRoute() {
       return;
     }
     if (route.kind === "image") {
-      const separator = route.path.lastIndexOf("/");
-      const folderPath = separator >= 0 ? route.path.slice(0, separator) : "";
+      const folderPath = parentPath(route.path);
       const address = {
-        root_id: route.rootId,
-        relative_path: folderPath,
+        path: folderPath,
         subresource: { kind: "file" },
       };
       await loadContainer(address);
       const pageAddress = {
-        root_id: route.rootId,
-        relative_path: route.path,
+        path: route.path,
         subresource: { kind: "file" },
       };
       const index = state.images.findIndex(
@@ -1509,15 +1505,14 @@ export function parseRoute(hash) {
       return { kind: "home", tab: "places" };
     }
   }
-  const match = hash.match(/^#(folder|image)\/([^/]+)\/(.*)$/);
+  const match = hash.match(/^#(folder|image)\/(.*)$/);
   if (!match) {
     return { kind: "home", tab: "places" };
   }
   try {
     return {
       kind: match[1],
-      rootId: match[2],
-      path: decodeURIComponent(match[3]),
+      path: decodeURIComponent(match[2]),
     };
   } catch {
     return { kind: "home", tab: "places" };
@@ -1540,12 +1535,12 @@ export function tagItemsHash(tag, kind = "all") {
   return `#tag/${kind}/${encodeURIComponent(tag)}`;
 }
 
-function folderHash(rootId, path) {
-  return `#folder/${rootId}/${encodeURIComponent(path)}`;
+function folderHash(path) {
+  return `#folder/${encodeURIComponent(path)}`;
 }
 
-function imageHash(rootId, path) {
-  return `#image/${rootId}/${encodeURIComponent(path)}`;
+function imageHash(path) {
+  return `#image/${encodeURIComponent(path)}`;
 }
 
 function containerHash(address) {
@@ -1564,8 +1559,7 @@ function decodeAddress(encoded) {
   const address = JSON.parse(decodeURIComponent(encoded));
   if (
     !address ||
-    typeof address.root_id !== "string" ||
-    typeof address.relative_path !== "string" ||
+    typeof address.path !== "string" ||
     !address.subresource ||
     typeof address.subresource.kind !== "string"
   ) {
@@ -1777,12 +1771,15 @@ function dispatchCommand(requested, meta = {}) {
     requested.name === CommandName.PARENT_FOLDER &&
     state.screenContext === "grid"
   ) {
+    const folderParent = state.folderPath ? parentPath(state.folderPath) : "";
     const target = state.container
       ? state.gridReturnHash
       : state.collection
       ? state.gridReturnHash
       : state.folderPath
-        ? folderHash(state.rootId, parentPath(state.folderPath))
+        ? folderParent === trimmedRemotePath(state.folderPath)
+          ? state.gridReturnHash
+          : folderHash(folderParent)
         : state.gridReturnHash;
     rememberParentGridReturnTarget(target);
     navigate(target);
@@ -1797,7 +1794,7 @@ function dispatchCommand(requested, meta = {}) {
         ? "search"
       : state.collection?.kind === "tag_items"
         ? "tags"
-      : state.rootId
+      : state.folderPath
         ? "favorites"
         : "places";
     navigate(homeHash(tab));
@@ -1954,7 +1951,7 @@ function executeOpenCommand(payload, meta) {
   }
   if (payload.kind === "favorite" || payload.kind === "folder") {
     meta.openRoute = payload.kind;
-    navigate(folderHash(payload.rootId, payload.path ?? ""));
+    navigate(folderHash(payload.path));
     return true;
   }
   if (payload.kind === "container" && payload.address) {
@@ -2027,7 +2024,7 @@ function executeOpenCommand(payload, meta) {
   if (legacyOpenRoute === "legacy_image_rejected") return false;
   if (state.collection) {
     tryEnterBrowserFullscreen();
-    navigate(imageHash(payload.rootId, payload.path), {
+    navigate(imageHash(payload.path), {
       viewerFromGrid: true,
       viewerDepth: 1,
       returnHash: location.hash,
@@ -2041,10 +2038,10 @@ function executeOpenCommand(payload, meta) {
       navigatedInApp: true,
       viewerFromGrid: true,
       viewerDepth: 1,
-      returnHash: folderHash(state.rootId, state.folderPath),
+      returnHash: folderHash(state.folderPath),
     },
     "",
-    imageHash(state.rootId, payload.path)
+    imageHash(payload.path)
   );
   renderImageViewer(payload.imageIndex, meta.at ?? performance.now());
   return true;
@@ -2052,13 +2049,12 @@ function executeOpenCommand(payload, meta) {
 
 function openFolderImageFromGrid(payload, meta) {
   const pageAddress = payload.address ?? {
-    root_id: payload.rootId ?? state.rootId,
-    relative_path: payload.path,
+    path: payload.path,
     subresource: { kind: "file" },
   };
-  if (!pageAddress.root_id || !pageAddress.relative_path) return false;
+  if (!pageAddress.path) return false;
   const folderLoad = state.folderContainerLoad;
-  const returnHash = folderHash(state.rootId, state.folderPath);
+  const returnHash = folderHash(state.folderPath);
   tryEnterBrowserFullscreen();
   history.pushState(
     {
@@ -2070,7 +2066,7 @@ function openFolderImageFromGrid(payload, meta) {
     },
     "",
     pageAddress.subresource.kind === "file"
-      ? imageHash(pageAddress.root_id, pageAddress.relative_path)
+      ? imageHash(pageAddress.path)
       : mediaHash(pageAddress)
   );
   renderLoading("ビューアを準備しています", folderLoad.controller);
@@ -2124,11 +2120,10 @@ export async function activateFolderContainerForImage(pageAddress, gridIndex) {
 function openGridEntry(index, meta) {
   const entry = state.entries[index];
   if (!entry) return false;
-  const rootId = entry.root_id ?? state.rootId;
   const path = entryPath(entry);
   if (entryIsFolder(entry)) {
     return executeOpenCommand(
-      { kind: "folder", rootId, path, entryIndex: index },
+      { kind: "folder", path, entryIndex: index },
       meta
     );
   }
@@ -2174,7 +2169,7 @@ function openGridEntry(index, meta) {
           imageIndex,
           entryIndex: index,
         }
-      : { kind: "image", rootId, path, imageIndex, entryIndex: index },
+      : { kind: "image", path, imageIndex, entryIndex: index },
     meta
   );
 }
@@ -2300,10 +2295,9 @@ function rememberParentGridReturnTarget(targetHash) {
   const targetKind = parseRoute(returnContext).kind;
   if (!["folder", "container", "collection"].includes(targetKind)) return;
   const currentAddress = state.container?.address ?? (
-    !state.collection && state.rootId
+    !state.collection && state.folderPath
       ? {
-          root_id: state.rootId,
-          relative_path: state.folderPath,
+          path: state.folderPath,
           subresource: { kind: "file" },
         }
       : null
@@ -2664,8 +2658,7 @@ function renderFavoriteTab(content) {
       dispatchCommand(
         command(CommandName.OPEN, {
           kind: "favorite",
-          rootId: favorite.id,
-          path: "",
+          path: favorite.path,
         }),
         { source: inputSourceFromEvent(event), detail: "favorite", at: performance.now() }
       );
@@ -2779,7 +2772,6 @@ async function showCollection(route) {
   state.container = null;
   state.gridReturnHash =
     route.collectionKind === "smart" ? homeHash("smart") : homeHash("places");
-  state.rootId = null;
   state.gridHash = location.hash;
   state.favoriteName = data.title ?? "一覧";
   state.folderPath = "";
@@ -2819,7 +2811,6 @@ async function showFavoriteSearch(route) {
   state.gridSortScope = null;
   state.container = null;
   state.gridReturnHash = homeHash("search");
-  state.rootId = null;
   state.gridHash = location.hash;
   state.favoriteName = title;
   state.folderPath = "";
@@ -2859,7 +2850,6 @@ async function showTagItems(route) {
   state.gridSortScope = null;
   state.container = null;
   state.gridReturnHash = homeHash("tags");
-  state.rootId = null;
   state.gridHash = location.hash;
   state.favoriteName = title;
   state.folderPath = "";
@@ -2963,10 +2953,10 @@ export function normalizeRemoteGridSortState(value) {
   };
 }
 
-async function showFolder(rootId, path) {
+async function showFolder(path) {
   const startedAt = performance.now();
   renderLoading("フォルダを読み込んでいます");
-  const loaded = await loadFolder(rootId, path, startedAt);
+  const loaded = await loadFolder(path, startedAt);
   if (!loaded) return;
   renderFolder(loaded.metrics, loaded.requestController);
 }
@@ -3059,7 +3049,7 @@ function applyContainerData(address, data, forceSinglePage, options = {}) {
   const effectiveAddress = data.effective_address ?? address;
   const rootReturnHash = rootOpenReturnHash({
     hasCollection: Boolean(state.collection),
-    relativePath: effectiveAddress.relative_path,
+    atFavoriteRoot: isFavoriteRoot(effectiveAddress.path),
     collectionHash: state.gridHash,
     fallbackHash: containerParentHash(address),
   });
@@ -3080,12 +3070,11 @@ function applyContainerData(address, data, forceSinglePage, options = {}) {
   };
   state.gridSortState = normalizeRemoteGridSortState(data.sort_state);
   state.gridSortScope = { kind: "address", address: effectiveAddress };
-  state.rootId = effectiveAddress.root_id;
   state.favoriteName =
     data.root_name ??
-    state.favorites.find((favorite) => favorite.id === state.rootId)?.name ??
+    favoriteForPath(effectiveAddress.path)?.name ??
     "項目";
-  state.folderPath = effectiveAddress.relative_path;
+  state.folderPath = effectiveAddress.path;
   state.entries = data.entries ?? [];
   state.images = state.entries.filter((entry) => entry.kind === "image");
   state.thumbAspectHeightRatio =
@@ -3111,7 +3100,7 @@ function applyContainerData(address, data, forceSinglePage, options = {}) {
     : Math.max(0, resumeEntryIndex);
   state.gridHash =
     data.kind === "folder"
-      ? folderHash(effectiveAddress.root_id, effectiveAddress.relative_path)
+      ? folderHash(effectiveAddress.path)
       : containerHash(effectiveAddress);
   state.gridReturnHash = rootReturnHash;
 }
@@ -3130,11 +3119,11 @@ export function containerInitialImageIndex({ openMode, resumePage, images }) {
 
 export function rootOpenReturnHash({
   hasCollection,
-  relativePath,
+  atFavoriteRoot,
   collectionHash,
   fallbackHash,
 }) {
-  return hasCollection && !relativePath ? collectionHash : fallbackHash;
+  return hasCollection && atFavoriteRoot ? collectionHash : fallbackHash;
 }
 
 function setSinglePageGroups() {
@@ -3304,14 +3293,13 @@ function currentRemotePageTarget() {
   if (!entry) return null;
   const address = entryAddress(entry);
   const contextAddress = state.container?.address ?? {
-    root_id: state.rootId,
-    relative_path: state.folderPath,
+    path: state.folderPath,
     subresource: { kind: "file" },
   };
   const pageIndex = state.entries.findIndex(
     (candidate) => entryIdentity(candidate) === entryIdentity(entry)
   );
-  if (!address?.root_id || !contextAddress?.root_id || pageIndex < 0) return null;
+  if (!address?.path || !contextAddress?.path || pageIndex < 0) return null;
   return { address, contextAddress, pageIndex };
 }
 
@@ -3342,11 +3330,9 @@ function enqueueReadingProgress(effect) {
   if (!effect?.request) return readingProgressWriteTail;
   readingProgressWriteTail = readingProgressWriteTail
     .catch(() => {})
-    .then(() => apiPostJson("/api/write", effect.request))
+    .then(() => apiAddressPostJson("/api/write", effect.request))
     .catch((error) => {
-      recordClientError("reading_progress_write_error", error, {
-        page: limitText(effect.identity, 240),
-      });
+      recordClientError("reading_progress_write_error", error);
     });
   return readingProgressWriteTail;
 }
@@ -3412,7 +3398,7 @@ async function refreshViewerItemState() {
   state.viewerItemState = null;
   menu?.setItemState(null, true);
   try {
-    const response = await apiPostJson("/api/write", {
+    const response = await apiAddressPostJson("/api/write", {
       kind: "get_item_state",
       address: target.address,
       context_address: target.contextAddress,
@@ -3453,7 +3439,7 @@ async function setViewerRating(stars) {
   state.commandMenu?.setItemState(null, true);
   let failure = null;
   try {
-    await apiPostJson("/api/write", {
+    await apiAddressPostJson("/api/write", {
       kind: "set_rating",
       address: target.address,
       stars,
@@ -3481,7 +3467,7 @@ async function toggleViewerBookmark() {
   state.commandMenu?.setItemState(null, true);
   let failure = null;
   try {
-    await apiPostJson("/api/write", {
+    await apiAddressPostJson("/api/write", {
       kind: "set_bookmark",
       address: target.address,
       context_address: target.contextAddress,
@@ -3600,7 +3586,7 @@ function requestSpreadMode(mode) {
   state.spreadMode = mode;
   state.readingDirection = readingDirection;
   spreadWriteTail = spreadWriteTail.then(async () => {
-    await apiPostJson("/api/write", writeRequest);
+    await apiAddressPostJson("/api/write", writeRequest);
     if (
       sequence === spreadWriteSequence &&
       state.container &&
@@ -3653,27 +3639,24 @@ async function refreshContainerSpread(
 }
 
 export async function loadFolder(
-  rootId,
   path,
   interactionStartedAt = performance.now()
 ) {
   const fetchStartedAt = performance.now();
-  const requestedPath = path ?? "";
-  const sameFolder =
-    state.rootId === rootId && state.folderPath === requestedPath;
+  const requestedPath = path;
+  const sameFolder = state.folderPath === requestedPath;
   state.requestController?.abort();
   state.folderContainerLoad = null;
   const controller = new AbortController();
   state.requestController = controller;
   const folderAddress = {
-    root_id: rootId,
-    relative_path: requestedPath,
+    path: requestedPath,
     subresource: { kind: "file" },
   };
   const forceSinglePage = containerForceSinglePage();
   const listPromise = apiJson(
     "/api/list",
-    { root: rootId, path: requestedPath },
+    { path: requestedPath },
     controller.signal
   );
   const containerLoad = {
@@ -3705,7 +3688,7 @@ export async function loadFolder(
   }
   const rootReturnHash = rootOpenReturnHash({
     hasCollection: Boolean(state.collection),
-    relativePath: requestedPath,
+    atFavoriteRoot: isFavoriteRoot(requestedPath),
     collectionHash: state.gridHash,
     fallbackHash: homeHash("favorites"),
   });
@@ -3715,19 +3698,17 @@ export async function loadFolder(
   state.gridSortScope = {
     kind: "address",
     address: {
-      root_id: data.root_id ?? rootId,
-      relative_path: data.path ?? requestedPath,
+      path: data.path ?? requestedPath,
       subresource: { kind: "file" },
     },
   };
   state.gridReturnHash = rootReturnHash;
-  state.rootId = rootId;
   state.favoriteName =
     data.root_name ??
-    state.favorites.find((favorite) => favorite.id === rootId)?.name ??
+    favoriteForPath(data.path ?? requestedPath)?.name ??
     "項目";
-  state.folderPath = data.path ?? "";
-  state.gridHash = folderHash(rootId, state.folderPath);
+  state.folderPath = data.path ?? requestedPath;
+  state.gridHash = folderHash(state.folderPath);
   state.thumbAspectHeightRatio =
     Number.isFinite(Number(data.thumb_aspect_height_ratio)) &&
     Number(data.thumb_aspect_height_ratio) > 0
@@ -3967,7 +3948,7 @@ async function changeGridSortOrder(sortOrder) {
   if (!state.gridSortScope || state.gridSortState?.locked_reason) return;
   state.gridSortWritePending = true;
   try {
-    const response = await apiPostJson("/api/write", {
+    const response = await apiAddressPostJson("/api/write", {
       kind: "set_sort_order",
       scope: state.gridSortScope,
       sort_order: sortOrder,
@@ -3994,35 +3975,15 @@ function buildBreadcrumbs() {
     return breadcrumbs;
   }
   if (state.container && state.container.kind !== "folder") {
-    const relativeSegments = state.container.address.relative_path
-      .split("/")
-      .filter(Boolean);
-    const fileName = relativeSegments.pop() ?? state.container.title;
-    const crumbs = [
-      {
-        label: state.favoriteName,
-        command: {
-          kind: "folder",
-          rootId: state.rootId,
-          path: "",
-        },
-      },
-    ];
-    let folderPath = "";
-    for (const segment of relativeSegments) {
-      folderPath = folderPath ? folderPath + "/" + segment : segment;
-      crumbs.push({
-        label: segment,
-        command: {
-          kind: "folder",
-          rootId: state.rootId,
-          path: folderPath,
-        },
-      });
-    }
+    const pathCrumbs = remotePathBreadcrumbs(state.container.address.path);
+    const file = pathCrumbs.pop();
+    const fileName = file?.label ?? state.container.title;
+    const crumbs = pathCrumbs.map((crumb) => ({
+      label: crumb.label,
+      command: { kind: "folder", path: crumb.path },
+    }));
     const rootAddress = {
-      root_id: state.rootId,
-      relative_path: state.container.address.relative_path,
+      path: state.container.address.path,
       subresource: { kind: "file" },
     };
     crumbs.push({
@@ -4039,8 +4000,7 @@ function buildBreadcrumbs() {
           command: {
             kind: "container",
             address: {
-              root_id: state.rootId,
-              relative_path: state.container.address.relative_path,
+              path: state.container.address.path,
               subresource: { kind: "zip_directory", prefix },
             },
           },
@@ -4064,13 +4024,7 @@ function buildBreadcrumbs() {
     });
     return breadcrumbs;
   }
-  const segments = state.folderPath ? state.folderPath.split("/") : [];
-  const crumbs = [{ label: state.favoriteName, path: "" }];
-  let accumulated = "";
-  for (const segment of segments) {
-    accumulated = accumulated ? `${accumulated}/${segment}` : segment;
-    crumbs.push({ label: segment, path: accumulated });
-  }
+  const crumbs = remotePathBreadcrumbs(state.folderPath);
 
   crumbs.forEach((crumb, index) => {
     if (index) {
@@ -4082,7 +4036,6 @@ function buildBreadcrumbs() {
       dispatchCommand(
         command(CommandName.OPEN, {
           kind: "folder",
-          rootId: state.rootId,
           path: crumb.path,
         }),
         { source: inputSourceFromEvent(event), detail: "breadcrumb" }
@@ -4125,7 +4078,6 @@ export function createGridTile(
   image.decoding = "async";
   image.dataset.telemetryObserved = "true";
 
-  const rootId = entry.root_id ?? state.rootId;
   if (entryIsFolder(entry)) {
     preview.append(textElement("span", "◆", "folder-glyph"));
     preview.append(image);
@@ -4134,7 +4086,6 @@ export function createGridTile(
       commandDispatcher(
         command(CommandName.OPEN, {
           kind: "folder",
-          rootId,
           path: entryPath(entry),
           entryIndex,
         }),
@@ -4161,7 +4112,6 @@ export function createGridTile(
               }
             : {
                 kind: "image",
-                rootId,
                 path: entryPath(entry),
                 imageIndex: index,
                 entryIndex,
@@ -4233,14 +4183,13 @@ export function createGridTile(
 }
 
 function entryPath(entry) {
-  return entry.relative_path ?? entry.path ?? "";
+  return entry.path ?? "";
 }
 
 function entryAddress(entry) {
   if (entry.address) return entry.address;
   return {
-    root_id: entry.root_id ?? state.rootId,
-    relative_path: entryPath(entry),
+    path: entryPath(entry),
     subresource: { kind: "file" },
   };
 }
@@ -4260,7 +4209,7 @@ function addressIdentity(address) {
 function entryIdentity(entry) {
   return entry.address
     ? addressIdentity(entry.address)
-    : `${entry.root_id ?? state.rootId ?? ""}\n${entryPath(entry)}`;
+    : entryPath(entry);
 }
 
 export function gridReturnItemIdentity(entry) {
@@ -4269,8 +4218,7 @@ export function gridReturnItemIdentity(entry) {
 
 function addressQueryParams(address, extra = {}) {
   const params = {
-    root: address.root_id,
-    path: address.relative_path,
+    path: address.path,
     ...extra,
   };
   const target = address.subresource;
@@ -4282,18 +4230,14 @@ function addressQueryParams(address, extra = {}) {
 
 export function parentContainerAddress(address) {
   if (address.subresource.kind === "file") {
-    const separator = address.relative_path.lastIndexOf("/");
     return {
-      root_id: address.root_id,
-      relative_path:
-        separator >= 0 ? address.relative_path.slice(0, separator) : "",
+      path: parentPath(address.path),
       subresource: { kind: "file" },
     };
   }
   if (address.subresource.kind === "pdf_page") {
     return {
-      root_id: address.root_id,
-      relative_path: address.relative_path,
+      path: address.path,
       subresource: { kind: "file" },
     };
   }
@@ -4301,8 +4245,7 @@ export function parentContainerAddress(address) {
   segments.pop();
   const prefix = segments.length ? segments.join("/") + "/" : "";
   return {
-    root_id: address.root_id,
-    relative_path: address.relative_path,
+    path: address.path,
     subresource: prefix
       ? { kind: "zip_directory", prefix }
       : { kind: "file" },
@@ -4315,18 +4258,14 @@ function containerParentHash(requestedAddress) {
     segments.pop();
     const prefix = segments.length ? segments.join("/") + "/" : "";
     const parentAddress = {
-      root_id: requestedAddress.root_id,
-      relative_path: requestedAddress.relative_path,
+      path: requestedAddress.path,
       subresource: prefix
         ? { kind: "zip_directory", prefix }
         : { kind: "file" },
     };
     return containerHash(parentAddress);
   }
-  const separator = requestedAddress.relative_path.lastIndexOf("/");
-  const parentPath =
-    separator >= 0 ? requestedAddress.relative_path.slice(0, separator) : "";
-  return folderHash(requestedAddress.root_id, parentPath);
+  return folderHash(parentPath(requestedAddress.path));
 }
 
 function entryIsFolder(entry) {
@@ -4756,7 +4695,7 @@ function commitRequestedPageGroup(groupIndex) {
   const viewerDepth = (Number(history.state?.viewerDepth) || 0) + 1;
   const targetHash = entry.address
     ? mediaHash(entry.address)
-    : imageHash(state.rootId, entry.path);
+    : imageHash(entry.path);
   history.pushState(
     {
       ...(history.state ?? {}),
@@ -4978,7 +4917,6 @@ function imageRequest(
     });
   return {
     url: apiUrl("/api/image", {
-      root: state.rootId,
       path: entry.path,
       w: resolvedLayout.requestWidth,
       epoch: state.remoteSessionCacheEpoch,
@@ -5004,10 +4942,9 @@ function imageInfo(entry) {
     });
   }
   const path = entry.path;
-  const key = `${state.rootId}\n${path}\n${entry?.mtime ?? ""}\n${entry?.size ?? ""}`;
+  const key = `${path}\n${entry?.mtime ?? ""}\n${entry?.size ?? ""}`;
   if (!state.imageInfoCache.has(key)) {
     const pending = apiJson("/api/image-info", {
-      root: state.rootId,
       path,
       epoch: state.remoteSessionCacheEpoch,
     }).catch(
@@ -5026,7 +4963,7 @@ function mediaImageInfoKey(address) {
 }
 
 function mediaContainerInfoKey(address) {
-  return `${address.root_id}\n${address.relative_path}`;
+  return address.path;
 }
 
 function rememberMediaImageInfo(request, info) {
@@ -5818,8 +5755,7 @@ export const VIEWER_MENU_MAX_ACTIONS = 11;
 function remoteAddressLooksValid(address) {
   return Boolean(
     address &&
-    typeof address.root_id === "string" &&
-    typeof address.relative_path === "string" &&
+    typeof address.path === "string" &&
     typeof address.subresource?.kind === "string"
   );
 }
@@ -5870,7 +5806,7 @@ export function remoteBookBookmarkTargetEntryIndex(entries, address) {
 }
 
 function remoteBookContainerIdentity(address) {
-  return `${address?.root_id ?? ""}\n${address?.relative_path ?? ""}`;
+  return address?.path ?? "";
 }
 
 export function viewerMenuDefinitions({ hasContainer, barsVisible }) {
@@ -6263,7 +6199,7 @@ export class ViewerViewTrimPanel {
     this.setDisabled(true);
     this.status.classList.remove("is-error");
     this.status.textContent = "現在値を読み込み中…";
-    const response = await apiPostJson("/api/write", {
+    const response = await apiAddressPostJson("/api/write", {
       kind: "get_view_trim_state",
       address: target.address,
       context_address: target.contextAddress,
@@ -6349,7 +6285,7 @@ export class ViewerViewTrimPanel {
     this.status.classList.remove("is-error");
     this.status.textContent = "保存中…";
     this.writeTail = this.writeTail.catch(() => {}).then(async () => {
-      const response = await apiPostJson("/api/write", {
+      const response = await apiAddressPostJson("/api/write", {
         kind: "set_view_trim",
         address: target.address,
         context_address: target.contextAddress,
@@ -7203,7 +7139,7 @@ export class ViewerAdjustmentPanel {
     const group = currentPageGroup();
     const entry = group?.entries[this.targetIndex];
     const address = entry ? entryAddress(entry) : null;
-    if (!entry || !address?.root_id) return null;
+    if (!entry || !address?.path) return null;
     return {
       entry,
       address,
@@ -7234,7 +7170,7 @@ export class ViewerAdjustmentPanel {
     const sequence = ++this.refreshSequence;
     this.setDisabled(true);
     this.status.textContent = "現在値を読み込み中…";
-    const response = await apiPostJson("/api/write", {
+    const response = await apiAddressPostJson("/api/write", {
       kind: "get_adjustment_state",
       address: target.address,
     });
@@ -7340,7 +7276,7 @@ export class ViewerAdjustmentPanel {
     };
     this.status.textContent = "保存中…";
     this.writeTail = this.writeTail.catch(() => {}).then(async () => {
-      const response = await apiPostJson("/api/write", request);
+      const response = await apiAddressPostJson("/api/write", request);
       if (commitId !== this.commitSequence || this.currentTarget()?.identity !== target.identity) {
         return;
       }
@@ -7561,7 +7497,7 @@ class ViewerBookmarkPanel {
     }
     const contextIdentity = remoteBookContainerIdentity(target.contextAddress);
     try {
-      const response = await apiPostJson("/api/write", {
+      const response = await apiAddressPostJson("/api/write", {
         kind: "list_book_bookmarks",
         address: target.address,
         context_address: target.contextAddress,
@@ -7810,7 +7746,7 @@ class ViewerBookmarkPanel {
     this.status.classList.remove("is-error");
     this.render();
     try {
-      await apiPostJson("/api/write", request);
+      await apiAddressPostJson("/api/write", request);
       this.editingId = null;
       await refreshViewerItemState().catch(() => {});
       await this.refresh();
@@ -8722,7 +8658,7 @@ export class RemoteAiController {
 
   async startIfEnabled(generation) {
     const adjustmentStates = await Promise.all(this.pages.map(async (page) => {
-      const response = await apiPostJson("/api/write", {
+      const response = await apiAddressPostJson("/api/write", {
         kind: "get_adjustment_state",
         address: page.address,
       });
@@ -8735,7 +8671,7 @@ export class RemoteAiController {
     }
     this.requestId = createRemoteAiRequestId(this.groupHash);
     this.show("準備しています");
-    const snapshot = await apiPostJson("/api/ai/jobs", {
+    const snapshot = await apiAddressPostJson("/api/ai/jobs", {
       request_id: this.requestId,
       pages: this.pages.map(({ address, target_px, render_context }) => ({
         address,
@@ -10150,6 +10086,11 @@ async function apiPostJson(path, body, signal) {
   return response.json();
 }
 
+async function apiAddressPostJson(endpoint, body, signal) {
+  const request = addressedPostRequest(endpoint, body);
+  return apiPostJson(request.url, request.body, signal);
+}
+
 function apiUrl(path, params = {}) {
   const url = new URL(path, location.origin);
   for (const [key, value] of Object.entries(params)) {
@@ -10198,9 +10139,101 @@ function textElement(tag, text, className) {
   return node;
 }
 
+function normalizedRemotePath(path) {
+  return String(path ?? "").replaceAll("\\", "/");
+}
+
+function trimmedRemotePath(path) {
+  const normalized = normalizedRemotePath(path);
+  if (normalized === "/" || /^[A-Za-z]:\/$/.test(normalized)) return normalized;
+  return normalized.replace(/\/+$/, "");
+}
+
+function favoriteForPath(path) {
+  const candidate = trimmedRemotePath(path).toLocaleLowerCase();
+  let matched = null;
+  let matchedLength = -1;
+  for (const favorite of state.favorites) {
+    const root = trimmedRemotePath(favorite.path).toLocaleLowerCase();
+    if (
+      root &&
+      (candidate === root || candidate.startsWith(root.endsWith("/") ? root : root + "/")) &&
+      root.length > matchedLength
+    ) {
+      matched = favorite;
+      matchedLength = root.length;
+    }
+  }
+  return matched;
+}
+
+function isFavoriteRoot(path) {
+  const favorite = favoriteForPath(path);
+  return Boolean(
+    favorite &&
+    trimmedRemotePath(favorite.path).toLocaleLowerCase() ===
+      trimmedRemotePath(path).toLocaleLowerCase()
+  );
+}
+
+function remotePathBreadcrumbs(path) {
+  const normalized = trimmedRemotePath(path);
+  const favorite = favoriteForPath(normalized);
+  if (favorite) {
+    const root = trimmedRemotePath(favorite.path);
+    const relative = normalized.slice(root.length).replace(/^\/+/, "");
+    const crumbs = [{ label: favorite.name, path: root }];
+    let accumulated = root;
+    for (const segment of relative.split("/").filter(Boolean)) {
+      accumulated = accumulated.endsWith("/")
+        ? accumulated + segment
+        : accumulated + "/" + segment;
+      crumbs.push({ label: segment, path: accumulated });
+    }
+    return crumbs;
+  }
+
+  let root;
+  let label;
+  let relative;
+  const drive = normalized.match(/^([A-Za-z]:)(?:\/(.*))?$/);
+  const unc = normalized.match(/^\/\/([^/]+)\/([^/]+)(?:\/(.*))?$/);
+  if (drive) {
+    root = drive[1] + "/";
+    label = drive[1] + "\\";
+    relative = drive[2] ?? "";
+  } else if (unc) {
+    root = `//${unc[1]}/${unc[2]}`;
+    label = `\\\\${unc[1]}\\${unc[2]}`;
+    relative = unc[3] ?? "";
+  } else {
+    root = "/";
+    label = "/";
+    relative = normalized.replace(/^\/+/, "");
+  }
+  const crumbs = [{ label, path: root }];
+  let accumulated = root;
+  for (const segment of relative.split("/").filter(Boolean)) {
+    accumulated = accumulated.endsWith("/")
+      ? accumulated + segment
+      : accumulated + "/" + segment;
+    crumbs.push({ label: segment, path: accumulated });
+  }
+  return crumbs;
+}
+
 function parentPath(path) {
-  const separator = path.lastIndexOf("/");
-  return separator >= 0 ? path.slice(0, separator) : "";
+  const normalized = trimmedRemotePath(path);
+  if (normalized === "/" || /^[A-Za-z]:\/$/.test(normalized)) return normalized;
+  const uncRoot = normalized.match(/^\/\/[^/]+\/[^/]+$/);
+  if (uncRoot) return normalized;
+  const separator = normalized.lastIndexOf("/");
+  if (separator < 0) return normalized;
+  if (separator === 0) return "/";
+  if (separator === 2 && /^[A-Za-z]:\//.test(normalized)) {
+    return normalized.slice(0, 3);
+  }
+  return normalized.slice(0, separator);
 }
 
 function distance(first, second) {

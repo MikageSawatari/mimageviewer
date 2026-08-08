@@ -296,8 +296,6 @@ function detailedRemoteAddress(address) {
   const pageNumber = Number(subresource.page_number);
   if (Number.isSafeInteger(pageNumber) && pageNumber >= 0) detail.page_number = pageNumber;
   return {
-    root_id: boundedTelemetryText(address.root_id, 128),
-    relative_path: boundedTelemetryText(address.relative_path, 600),
     subresource: detail,
   };
 }
@@ -2092,10 +2090,8 @@ export class VideoStreamViewer {
       // attempt visibly and let the user retry instead of keeping the viewer in an unbounded
       // "preparing" loop.
       started = await this.apiPostJson(
-        "/api/video/start",
+        `/api/video/start?path=${encodeURIComponent(this.address.path)}`,
         {
-          root: this.address.root_id,
-          path: this.address.relative_path,
           quality: this.quality,
         },
         this.abortController.signal

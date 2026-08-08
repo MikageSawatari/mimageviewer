@@ -10,11 +10,10 @@ use mimageviewer_ipc::{
 };
 
 use super::container::ContainerEngine;
-use super::path_guard::{ResolveError, ResolvedRootPath, canonicalize_within, resolve_existing};
+use super::path_guard::{ResolveError, ResolvedPath, resolve_existing};
 
 pub(super) struct ThumbnailEngine {
     settings: Arc<crate::settings::Settings>,
-    roots: Arc<super::live_favorites::RemoteRoots>,
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
     inflight: Mutex<HashMap<RequestKey, Arc<Flight>>>,
 }
@@ -79,13 +78,9 @@ struct Flight {
 }
 
 impl ThumbnailEngine {
-    pub(super) fn new_with_roots(
-        settings: crate::settings::Settings,
-        roots: Arc<super::live_favorites::RemoteRoots>,
-    ) -> Self {
+    pub(super) fn new(settings: crate::settings::Settings) -> Self {
         Self {
             settings: Arc::new(settings),
-            roots,
             stats: Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
             inflight: Mutex::new(HashMap::new()),
         }
@@ -170,25 +165,11 @@ impl ThumbnailEngine {
             );
         }
         if !matches!(request.address.subresource, RemoteSubresource::File)
-            || is_container_path(Path::new(&request.address.relative_path))
+            || is_container_path(Path::new(&request.address.path))
         {
             return container_engine.thumbnail(request, context);
         }
-        let roots = match self.roots.current() {
-            Ok(roots) => roots,
-            Err(error) => {
-                crate::logger::log(format!("remote_ipc: {error}"));
-                return error_response(
-                    ThumbnailErrorCode::Internal,
-                    "最新の閲覧起点を読み込めませんでした",
-                );
-            }
-        };
-        let resolved = match resolve_existing(
-            &roots,
-            &request.address.root_id,
-            &request.address.relative_path,
-        ) {
+        let resolved = match resolve_existing(&request.address.path) {
             Ok(path) => path,
             Err(error) => return resolve_error_response(error),
         };
@@ -200,7 +181,7 @@ impl ThumbnailEngine {
 
     fn generate_resolved(
         &self,
-        resolved: &ResolvedRootPath,
+        resolved: &ResolvedPath,
         target_px: u32,
         context: &WorkerContext,
     ) -> Result<Vec<u8>, ThumbnailResponse> {
@@ -212,14 +193,6 @@ impl ThumbnailEngine {
                 ThumbnailErrorCode::Unsupported,
                 "この種類のサムネイルは今回の増分では扱いません",
             ));
-        }
-        if is_folder {
-            validate_folder_sources(
-                &resolved.logical,
-                &resolved.canonical_root,
-                self.settings.folder_thumb_depth,
-                context.folder_pin_db.as_ref(),
-            )?;
         }
         let parent = resolved.logical.parent().ok_or_else(|| {
             error_response(
@@ -374,49 +347,6 @@ impl ThumbnailEngine {
     }
 }
 
-/// 本体の folder representative resolver は junction と pin も通常 UI 向けに辿る。
-/// IPC 境界では favorite 外を一切読めないよう、同じ深さの候補を生成前に検査する。
-fn validate_folder_sources(
-    folder: &Path,
-    canonical_root: &Path,
-    remaining_depth: u32,
-    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
-) -> Result<(), ThumbnailResponse> {
-    if let Some(pin_db) = pin_db
-        && let Some(source) = pin_db.lookup(folder)
-    {
-        let lookup = |path: &Path| pin_db.lookup(path);
-        if let Some(resolved) = crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
-            folder,
-            &source,
-            lookup,
-            remaining_depth as usize,
-        ) {
-            canonicalize_within(canonical_root, &resolved.abs_path)
-                .map_err(resolve_error_response)?;
-        }
-    }
-
-    let entries = std::fs::read_dir(folder)
-        .map_err(|_| error_response(ThumbnailErrorCode::NotFound, "フォルダを列挙できません"))?;
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        let kind = crate::fs_entry::classify_dir_entry(&entry, &file_type);
-        if kind.is_directory() {
-            if remaining_depth == 0 {
-                continue;
-            }
-            canonicalize_within(canonical_root, &entry.path()).map_err(resolve_error_response)?;
-            validate_folder_sources(&entry.path(), canonical_root, remaining_depth - 1, pin_db)?;
-        } else if kind.is_file() && is_supported_image(&entry.path()) {
-            canonicalize_within(canonical_root, &entry.path()).map_err(resolve_error_response)?;
-        }
-    }
-    Ok(())
-}
-
 fn apply_supported_folder_pin(
     request: &mut crate::thumb_loader::LoadRequest,
     container: &Path,
@@ -485,18 +415,9 @@ fn is_container_path(path: &Path) -> bool {
 
 fn resolve_error_response(error: ResolveError) -> ThumbnailResponse {
     match error {
-        ResolveError::InvalidRootId | ResolveError::InvalidRelativePath => error_response(
-            ThumbnailErrorCode::BadRequest,
-            "root_id または相対パスが不正です",
-        ),
-        ResolveError::RootNotFound => error_response(
-            ThumbnailErrorCode::FavoriteNotFound,
-            "お気に入りが登録されていません",
-        ),
-        ResolveError::EscapesRoot => error_response(
-            ThumbnailErrorCode::PathRejected,
-            "お気に入りの外へ出るパスは拒否されました",
-        ),
+        ResolveError::InvalidPath => {
+            error_response(ThumbnailErrorCode::BadRequest, "絶対パスが不正です")
+        }
         ResolveError::Unavailable => {
             error_response(ThumbnailErrorCode::NotFound, "対象が見つかりません")
         }
@@ -514,7 +435,7 @@ mod tests {
     #[test]
     fn identical_requests_share_one_flight() {
         let key = RequestKey {
-            address: RemoteAddress::file("a", "b.jpg"),
+            address: RemoteAddress::file("C:/Pictures/b.jpg"),
             target_px: 128,
         };
         let mut map = HashMap::new();
@@ -524,56 +445,5 @@ mod tests {
         });
         map.insert(key.clone(), Arc::clone(&flight));
         assert!(Arc::ptr_eq(map.get(&key).unwrap(), &flight));
-    }
-
-    #[test]
-    fn folder_representative_scan_rejects_a_link_outside_the_favorite() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("favorite");
-        let folder = root.join("album");
-        let outside = temp.path().join("outside");
-        std::fs::create_dir_all(&folder).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(outside.join("secret.jpg"), b"secret").unwrap();
-        let link = folder.join("escape");
-        if make_dir_link(&outside, &link).is_err() {
-            eprintln!("directory links are unavailable; escape assertion skipped");
-            return;
-        }
-
-        let result = validate_folder_sources(
-            &std::fs::canonicalize(&folder).unwrap(),
-            &std::fs::canonicalize(&root).unwrap(),
-            1,
-            None,
-        );
-        assert!(matches!(
-            result,
-            Err(ThumbnailResponse::Error(ThumbnailError {
-                code: ThumbnailErrorCode::PathRejected,
-                ..
-            }))
-        ));
-    }
-
-    #[cfg(windows)]
-    fn make_dir_link(target: &Path, link: &Path) -> std::io::Result<()> {
-        match std::os::windows::fs::symlink_dir(target, link) {
-            Ok(()) => Ok(()),
-            Err(error) if error.raw_os_error() == Some(1314) => {
-                let status = std::process::Command::new("cmd")
-                    .args(["/d", "/c", "mklink", "/J"])
-                    .arg(link)
-                    .arg(target)
-                    .status()?;
-                if status.success() { Ok(()) } else { Err(error) }
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    #[cfg(unix)]
-    fn make_dir_link(target: &Path, link: &Path) -> std::io::Result<()> {
-        std::os::unix::fs::symlink(target, link)
     }
 }

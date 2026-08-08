@@ -14,15 +14,13 @@ use crate::grid_item::GridItem;
 use crate::search_index_db::{IndexEntry, IndexKind, SEARCH_RESULT_LIMIT, SearchIndexDb};
 use crate::settings::Settings;
 
-use super::path_guard::{ResolvedRoots, map_existing_to_resolved_root, resolve_existing_roots};
-
 const MAX_REMOTE_COLLECTION_ENTRIES: usize = 1000;
 const MAX_REMOTE_TAG_CHOICES: usize = 2000;
 
 pub(super) struct CollectionEngine {
     settings: CollectionSettingsSource,
     sort_settings: super::RemoteSortSettingsSource,
-    roots: Arc<super::live_favorites::RemoteRoots>,
+    favorites: Arc<super::live_favorites::LiveFavorites>,
 }
 
 enum CollectionSettingsSource {
@@ -53,29 +51,29 @@ struct CandidateEntry {
 
 impl CollectionEngine {
     pub(super) fn new(settings: Settings) -> Self {
-        let roots = super::live_favorites::RemoteRoots::snapshot(settings.favorites.clone());
-        Self::new_with_roots(settings, roots)
+        let favorites = super::live_favorites::LiveFavorites::snapshot(settings.favorites.clone());
+        Self::new_with_favorites(settings, favorites)
     }
 
-    pub(super) fn new_with_roots(
+    pub(super) fn new_with_favorites(
         settings: Settings,
-        roots: Arc<super::live_favorites::RemoteRoots>,
+        favorites: Arc<super::live_favorites::LiveFavorites>,
     ) -> Self {
         Self {
             sort_settings: super::RemoteSortSettingsSource::Snapshot(settings.sort_order),
             settings: CollectionSettingsSource::Snapshot(settings),
-            roots,
+            favorites,
         }
     }
 
-    pub(super) fn new_with_live_roots(
+    pub(super) fn new_with_live_favorites(
         _settings: Settings,
-        roots: Arc<super::live_favorites::RemoteRoots>,
+        favorites: Arc<super::live_favorites::LiveFavorites>,
     ) -> Self {
         Self {
             settings: CollectionSettingsSource::Live,
             sort_settings: super::RemoteSortSettingsSource::Live,
-            roots,
+            favorites,
         }
     }
 
@@ -132,8 +130,8 @@ impl CollectionEngine {
             .map_err(|error| internal_error("最新の一覧設定を読み込めませんでした", error))
     }
 
-    /// Favorite search stays in CollectionEngine because it must share the collection
-    /// allowlist mapping, response bound, aspect ratio, and fixed-sort contract.
+    /// Favorite search stays in CollectionEngine because it shares the response bound,
+    /// aspect ratio, and fixed-sort contract with the other collections.
     pub(super) fn favorite_search(&self, request: FavoriteSearchRequest) -> FavoriteSearchResponse {
         match self.favorite_search_payload(request) {
             Ok(payload) => FavoriteSearchResponse::Success(payload),
@@ -162,15 +160,14 @@ impl CollectionEngine {
             .sort_settings
             .load()
             .map_err(|error| internal_error("最新の並び順を読み込めませんでした", error))?;
-        let roots = self.roots.current().map_err(|error| {
+        let favorites = self.favorites.current().map_err(|error| {
             crate::logger::log(format!("remote_ipc: {error}"));
             CollectionError::new(
                 CollectionErrorCode::Internal,
                 "最新の閲覧起点を読み込めませんでした",
             )
         })?;
-        if !roots
-            .favorites
+        if !favorites
             .iter()
             .any(|favorite| favorite.auto_index_structure)
         {
@@ -194,8 +191,7 @@ impl CollectionEngine {
                 ));
             }
         };
-        let favorite_paths = roots
-            .favorites
+        let favorite_paths = favorites
             .iter()
             .map(|favorite| favorite.path.clone())
             .collect::<Vec<_>>();
@@ -223,7 +219,7 @@ impl CollectionEngine {
                 ));
             }
         };
-        let (entries, truncated) = map_favorite_search_entries(&roots, index_entries);
+        let (entries, truncated) = map_favorite_search_entries(index_entries);
         Ok(FavoriteSearchPayload {
             listing: self.favorite_search_listing(&settings, sort_order, entries, truncated),
             index_state: FavoriteSearchIndexState::Ready,
@@ -348,18 +344,10 @@ impl CollectionEngine {
         request: &TagItemsRequest,
         sort_order: crate::settings::SortOrder,
     ) -> Result<TagItemsPayload, CollectionError> {
-        let roots = self.roots.current().map_err(|error| {
-            crate::logger::log(format!("remote_ipc: {error}"));
-            CollectionError::new(
-                CollectionErrorCode::Internal,
-                "最新の閲覧起点を読み込めませんでした",
-            )
-        })?;
         let key_scan_limit = tag_item_key_scan_limit(request.kind);
         let item_keys =
             crate::tag_view::select_tag_view_item_keys(db, request.tag.trim(), key_scan_limit + 1);
-        let (entries, truncated) =
-            map_tag_item_keys(&roots, item_keys, request.kind, key_scan_limit);
+        let (entries, truncated) = map_tag_item_keys(item_keys, request.kind, key_scan_limit);
         Ok(TagItemsPayload {
             listing: self.tag_items_listing(settings, sort_order, entries, truncated),
             state: TagIndexState::Ready,
@@ -614,14 +602,7 @@ impl CollectionEngine {
         sort_order: crate::settings::SortOrder,
         locked_reason: Option<&str>,
     ) -> Result<CollectionPayload, CollectionError> {
-        let roots = self.roots.current().map_err(|error| {
-            crate::logger::log(format!("remote_ipc: {error}"));
-            CollectionError::new(
-                CollectionErrorCode::Internal,
-                "最新の閲覧起点を読み込めませんでした",
-            )
-        })?;
-        let entries = to_remote_entries(&roots, candidates);
+        let entries = to_remote_entries(candidates);
         let (entries, truncated) = bound_remote_entries(entries);
         Ok(CollectionPayload {
             title: title.to_owned(),
@@ -732,22 +713,17 @@ fn candidate_from_tag_item_key(key: String, filter: TagItemKind) -> Option<Candi
 }
 
 fn map_tag_item_keys(
-    allowed: &super::live_favorites::AllowedRootsSnapshot,
     item_keys: Vec<String>,
     filter: TagItemKind,
     key_scan_limit: usize,
 ) -> (Vec<RemoteEntry>, bool) {
     let key_limit_reached = item_keys.len() > key_scan_limit;
-    let roots = resolve_existing_roots(allowed);
     let mut entries = Vec::with_capacity(MAX_REMOTE_COLLECTION_ENTRIES + 1);
     for key in item_keys.into_iter().take(key_scan_limit) {
         let Some(candidate) = candidate_from_tag_item_key(key, filter) else {
             continue;
         };
-        let Some(entry) = remote_entry_from_candidate(&roots, candidate) else {
-            continue;
-        };
-        entries.push(entry);
+        entries.push(remote_entry_from_candidate(candidate));
         if entries.len() > MAX_REMOTE_COLLECTION_ENTRIES {
             break;
         }
@@ -811,34 +787,27 @@ fn visible_places(settings: &Settings) -> Vec<PlaceSummary> {
     places
 }
 
-fn to_remote_entries(
-    allowed: &super::live_favorites::AllowedRootsSnapshot,
-    candidates: Vec<CandidateEntry>,
-) -> Vec<RemoteEntry> {
-    to_remote_entries_bounded(allowed, candidates, usize::MAX)
+fn to_remote_entries(candidates: Vec<CandidateEntry>) -> Vec<RemoteEntry> {
+    to_remote_entries_bounded(candidates, usize::MAX)
 }
 
 fn to_remote_entries_bounded(
-    allowed: &super::live_favorites::AllowedRootsSnapshot,
     candidates: Vec<CandidateEntry>,
     mapped_limit: usize,
 ) -> Vec<RemoteEntry> {
-    let roots = resolve_existing_roots(allowed);
     candidates
         .into_iter()
-        .filter_map(|candidate| remote_entry_from_candidate(&roots, candidate))
+        .map(remote_entry_from_candidate)
         .take(mapped_limit)
         .collect()
 }
 
-fn remote_entry_from_candidate(
-    roots: &ResolvedRoots<'_>,
-    candidate: CandidateEntry,
-) -> Option<RemoteEntry> {
-    let mapped = map_existing_to_resolved_root(roots, &candidate.path)?;
-    Some(RemoteEntry {
-        root_id: mapped.root_id,
-        relative_path: mapped.relative_path,
+fn remote_entry_from_candidate(candidate: CandidateEntry) -> RemoteEntry {
+    let logical = super::path_guard::resolve_existing(candidate.path.to_string_lossy().as_ref())
+        .map(|resolved| resolved.logical)
+        .unwrap_or_else(|_| candidate.path.clone());
+    RemoteEntry {
+        path: logical.to_string_lossy().into_owned(),
         name: if candidate.name.trim().is_empty() {
             file_name(&candidate.path)
         } else {
@@ -849,13 +818,10 @@ fn remote_entry_from_candidate(
         progress_current: candidate.progress_current,
         progress_total: candidate.progress_total,
         rating: candidate.rating,
-    })
+    }
 }
 
-fn map_favorite_search_entries(
-    allowed: &super::live_favorites::AllowedRootsSnapshot,
-    index_entries: Vec<IndexEntry>,
-) -> (Vec<RemoteEntry>, bool) {
+fn map_favorite_search_entries(index_entries: Vec<IndexEntry>) -> (Vec<RemoteEntry>, bool) {
     let index_limit_reached = index_entries.len() == SEARCH_RESULT_LIMIT;
     let candidates = index_entries
         .into_iter()
@@ -877,7 +843,7 @@ fn map_favorite_search_entries(
             })
         })
         .collect();
-    let entries = to_remote_entries_bounded(allowed, candidates, MAX_REMOTE_COLLECTION_ENTRIES + 1);
+    let entries = to_remote_entries_bounded(candidates, MAX_REMOTE_COLLECTION_ENTRIES + 1);
     let (entries, mapped_truncated) = bound_remote_entries(entries);
     (entries, mapped_truncated || index_limit_reached)
 }
@@ -1023,24 +989,6 @@ mod tests {
     use super::*;
     use crate::settings::FavoriteEntry;
 
-    fn allowed(
-        favorites: Vec<FavoriteEntry>,
-    ) -> super::super::live_favorites::AllowedRootsSnapshot {
-        allowed_with_registered(favorites, Vec::new())
-    }
-
-    fn allowed_with_registered(
-        favorites: Vec<FavoriteEntry>,
-        registered: Vec<PathBuf>,
-    ) -> super::super::live_favorites::AllowedRootsSnapshot {
-        super::super::live_favorites::AllowedRootsSnapshot {
-            favorites: Arc::new(favorites),
-            registered: mimageviewer_registered_roots::RegisteredRootsSnapshot::from_paths(
-                registered,
-            ),
-        }
-    }
-
     #[test]
     fn reading_history_media_entries_keep_kind_and_time_progress() {
         let mut video = crate::reading_history_db::ReadingHistoryEntry::new(
@@ -1089,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn unregistered_entries_are_dropped_and_addresses_stay_relative() {
+    fn entries_outside_favorites_are_kept_with_absolute_addresses() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("favorite");
         let inside = root.join("album/page.jpg");
@@ -1097,10 +1045,9 @@ mod tests {
         std::fs::create_dir_all(inside.parent().unwrap()).unwrap();
         std::fs::write(&inside, b"inside").unwrap();
         std::fs::write(&outside, b"outside").unwrap();
-        let favorite = FavoriteEntry::new("favorite".to_owned(), root);
         let candidates = vec![
             CandidateEntry {
-                path: inside,
+                path: inside.clone(),
                 name: "page.jpg".to_owned(),
                 kind: RemoteEntryKind::Image,
                 detail: None,
@@ -1109,7 +1056,7 @@ mod tests {
                 rating: None,
             },
             CandidateEntry {
-                path: outside,
+                path: outside.clone(),
                 name: "outside.jpg".to_owned(),
                 kind: RemoteEntryKind::Image,
                 detail: None,
@@ -1118,18 +1065,32 @@ mod tests {
                 rating: None,
             },
         ];
-        let roots = allowed(vec![favorite.clone()]);
-        let entries = to_remote_entries(&roots, candidates);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].root_id, favorite.id.to_string());
-        assert_eq!(entries[0].relative_path, "album/page.jpg");
-        assert!(!Path::new(&entries[0].relative_path).is_absolute());
-        let json = serde_json::to_string(&entries).unwrap();
-        assert!(!json.contains(&temp.path().to_string_lossy().to_string()));
+        let entries = to_remote_entries(candidates);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            PathBuf::from(&entries[0].path),
+            super::super::path_guard::resolve_existing(inside.to_string_lossy().as_ref())
+                .unwrap()
+                .logical
+        );
+        assert_eq!(
+            PathBuf::from(&entries[1].path),
+            super::super::path_guard::resolve_existing(outside.to_string_lossy().as_ref())
+                .unwrap()
+                .logical
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| Path::new(&entry.path).is_absolute())
+        );
+        let json = serde_json::to_value(&entries).unwrap();
+        assert_eq!(json[0]["path"].as_str(), Some(entries[0].path.as_str()));
+        assert_eq!(json[1]["path"].as_str(), Some(entries[1].path.as_str()));
     }
 
     #[test]
-    fn every_non_favorite_collection_source_maps_to_an_openable_registered_address() {
+    fn every_non_favorite_collection_source_maps_to_an_openable_absolute_address() {
         let temp = tempfile::tempdir().unwrap();
         let rating = temp.path().join("rated.zip");
         let media_bookmark = temp.path().join("clip.mp4");
@@ -1145,17 +1106,6 @@ mod tests {
         std::fs::create_dir_all(&book).unwrap();
         std::fs::create_dir_all(smart_item.parent().unwrap()).unwrap();
         std::fs::write(&smart_item, b"page").unwrap();
-        let roots = allowed_with_registered(
-            Vec::new(),
-            vec![
-                rating.clone(),
-                media_bookmark.clone(),
-                book_bookmark.clone(),
-                history.clone(),
-                books_root,
-                smart_root,
-            ],
-        );
         let candidates = [
             (&rating, RemoteEntryKind::Zip, "rated.zip"),
             (&media_bookmark, RemoteEntryKind::Video, "clip.mp4"),
@@ -1176,41 +1126,33 @@ mod tests {
         })
         .collect();
 
-        let entries = to_remote_entries(&roots, candidates);
+        let entries = to_remote_entries(candidates);
 
         assert_eq!(entries.len(), 6);
         for entry in &entries {
             assert!(
-                super::super::path_guard::resolve_existing(
-                    &roots,
-                    &entry.root_id,
-                    &entry.relative_path,
-                )
-                .is_ok(),
+                super::super::path_guard::resolve_existing(&entry.path).is_ok(),
                 "collection entry must resolve: {}",
                 entry.name
             );
-            assert!(!Path::new(&entry.relative_path).is_absolute());
+            assert!(Path::new(&entry.path).is_absolute());
         }
-        assert_eq!(entries[0].relative_path, "");
-        assert_eq!(entries[1].relative_path, "");
-        assert_eq!(entries[2].relative_path, "");
-        assert_eq!(entries[3].relative_path, "");
-        assert_eq!(entries[4].relative_path, "volume");
-        assert_eq!(entries[5].relative_path, "nested/page.jpg");
-        assert!(
-            !serde_json::to_string(&entries)
-                .unwrap()
-                .contains(temp.path().to_string_lossy().as_ref())
+        let json = serde_json::to_value(&entries).unwrap();
+        assert_eq!(
+            json.as_array().unwrap().len(),
+            entries.len(),
+            "every mapped source must remain serialized"
         );
+        for (encoded, entry) in json.as_array().unwrap().iter().zip(&entries) {
+            assert_eq!(encoded["path"].as_str(), Some(entry.path.as_str()));
+        }
     }
 
     #[test]
     fn aggregate_payload_is_bounded_to_one_thousand_entries() {
         let entries = (0..=MAX_REMOTE_COLLECTION_ENTRIES)
             .map(|index| RemoteEntry {
-                root_id: "00000000-0000-0000-0000-000000000000".to_owned(),
-                relative_path: format!("entry-{index}"),
+                path: format!("C:/entries/entry-{index}"),
                 name: format!("entry-{index}"),
                 kind: RemoteEntryKind::Image,
                 detail: None,
@@ -1256,18 +1198,6 @@ mod tests {
             favorites: vec![FavoriteEntry::new("favorite".to_owned(), root)],
             ..Default::default()
         })
-    }
-
-    fn tag_engine_with_registered(root: PathBuf, registered: Vec<PathBuf>) -> CollectionEngine {
-        let settings = Settings {
-            favorites: vec![FavoriteEntry::new("favorite".to_owned(), root)],
-            ..Default::default()
-        };
-        let roots = super::super::live_favorites::RemoteRoots::snapshot_with_registered(
-            settings.favorites.clone(),
-            mimageviewer_registered_roots::RegisteredRootsSnapshot::from_paths(registered),
-        );
-        CollectionEngine::new_with_roots(settings, roots)
     }
 
     fn tag_request(tag: impl Into<String>) -> TagItemsRequest {
@@ -1344,7 +1274,7 @@ mod tests {
     }
 
     #[test]
-    fn tag_items_include_registered_outside_paths_and_keep_missing_rows_unchanged() {
+    fn tag_items_include_existing_paths_outside_favorites_and_keep_missing_rows_unchanged() {
         let data_dir = crate::data_dir::TestDataDirGuard::new();
         let root = data_dir.path().join("favorite");
         let inside = root.join("inside.jpg");
@@ -1361,9 +1291,7 @@ mod tests {
         }
         drop(db);
 
-        let payload = tag_items_success(
-            tag_engine_with_registered(root, vec![outside.clone()]).tag_items(tag_request("cat")),
-        );
+        let payload = tag_items_success(tag_engine(root).tag_items(tag_request("cat")));
 
         assert_eq!(payload.state, TagIndexState::Ready);
         assert_eq!(payload.listing.entries.len(), 2);
@@ -1371,28 +1299,43 @@ mod tests {
             .listing
             .entries
             .iter()
-            .find(|entry| entry.relative_path == "inside.jpg")
+            .find(|entry| {
+                PathBuf::from(&entry.path)
+                    == super::super::path_guard::resolve_existing(inside.to_string_lossy().as_ref())
+                        .unwrap()
+                        .logical
+            })
             .unwrap();
-        assert!(!inside_entry.root_id.is_empty());
+        assert!(Path::new(&inside_entry.path).is_absolute());
         let outside_entry = payload
             .listing
             .entries
             .iter()
             .find(|entry| {
-                entry.root_id
-                    == mimageviewer_registered_roots::registered_root_id(&outside).to_string()
+                PathBuf::from(&entry.path)
+                    == super::super::path_guard::resolve_existing(
+                        outside.to_string_lossy().as_ref(),
+                    )
+                    .unwrap()
+                    .logical
             })
             .unwrap();
-        assert!(outside_entry.relative_path.is_empty());
-        let json = serde_json::to_string(&payload).unwrap();
-        assert!(!json.contains(&data_dir.path().to_string_lossy().to_string()));
+        assert!(Path::new(&outside_entry.path).is_absolute());
+        let json = serde_json::to_value(&payload).unwrap();
+        assert!(
+            json["listing"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["path"].as_str() == Some(outside_entry.path.as_str()))
+        );
         let db = crate::tags_db::TagsDb::open_readonly(&crate::tags_db::TagsDb::db_path()).unwrap();
         assert_eq!(db.display_tags_for_item(&missing_key), vec!["#cat"]);
         assert!(db.has_item_state(&missing_key));
     }
 
     #[test]
-    fn live_collection_settings_and_registered_roots_change_together() {
+    fn live_collection_settings_and_absolute_paths_change_together() {
         let data_dir = crate::settings_db::DataDirOverrideGuard::new();
         let first_root = data_dir.path().join("books-first");
         let second_root = data_dir.path().join("books-second");
@@ -1413,8 +1356,9 @@ mod tests {
         };
         let db = crate::settings_db::SettingsDb::create_new(data_dir.path()).unwrap();
         db.save_full(&settings).unwrap();
-        let roots = super::super::live_favorites::RemoteRoots::live(Vec::new()).unwrap();
-        let engine = CollectionEngine::new_with_live_roots(settings.clone(), roots);
+        let favorites =
+            super::super::live_favorites::LiveFavorites::live(settings.favorites.clone()).unwrap();
+        let engine = CollectionEngine::new_with_live_favorites(settings.clone(), favorites);
 
         let first = collection_success(engine.collection(CollectionRequest {
             kind: CollectionKind::Bookshelf,
@@ -1422,8 +1366,12 @@ mod tests {
         assert_eq!(first.entries.len(), 1);
         assert_eq!(first.entries[0].name, "First");
         assert_eq!(
-            first.entries[0].root_id,
-            mimageviewer_registered_roots::registered_root_id(&first_root).to_string()
+            PathBuf::from(&first.entries[0].path),
+            super::super::path_guard::resolve_existing(
+                first_root.join("First").to_string_lossy().as_ref(),
+            )
+            .unwrap()
+            .logical
         );
         let HomeResponse::Success(first_home) = engine.home() else {
             panic!("initial home failed");
@@ -1448,8 +1396,12 @@ mod tests {
         assert_eq!(second.entries.len(), 1);
         assert_eq!(second.entries[0].name, "Second");
         assert_eq!(
-            second.entries[0].root_id,
-            mimageviewer_registered_roots::registered_root_id(&second_root).to_string()
+            PathBuf::from(&second.entries[0].path),
+            super::super::path_guard::resolve_existing(
+                second_root.join("Second").to_string_lossy().as_ref(),
+            )
+            .unwrap()
+            .logical
         );
         let HomeResponse::Success(second_home) = engine.home() else {
             panic!("refreshed home failed");
@@ -1479,7 +1431,7 @@ mod tests {
             all.listing
                 .entries
                 .iter()
-                .find(|entry| entry.relative_path == "notes.unknown-extension")
+                .find(|entry| entry.path.ends_with("notes.unknown-extension"))
                 .map(|entry| entry.kind),
             Some(RemoteEntryKind::Other)
         );
@@ -1488,7 +1440,7 @@ mod tests {
             kind: TagItemKind::Folder,
         }));
         assert_eq!(folders.listing.entries.len(), 1);
-        assert_eq!(folders.listing.entries[0].relative_path, "folder");
+        assert!(folders.listing.entries[0].path.ends_with("folder"));
         assert_eq!(folders.listing.entries[0].kind, RemoteEntryKind::Folder);
     }
 
@@ -1499,13 +1451,10 @@ mod tests {
         let image = root.join("image.jpg");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(&image, b"image").unwrap();
-        let favorite = FavoriteEntry::new("favorite".to_owned(), root);
         let item_key = crate::tags_db::item_key_for_path(&image);
         let item_keys = vec![item_key; MAX_REMOTE_COLLECTION_ENTRIES + 1];
 
-        let roots = allowed(vec![favorite]);
         let (entries, truncated) = map_tag_item_keys(
-            &roots,
             item_keys,
             TagItemKind::All,
             crate::tag_view::TAG_VIEW_RESULT_LIMIT,
@@ -1529,18 +1478,14 @@ mod tests {
         let image = root.join("zzzz.jpg");
         std::fs::write(&image, b"image").unwrap();
         item_keys.push(crate::tags_db::item_key_for_path(&image));
-        let favorite = FavoriteEntry::new("favorite".to_owned(), root);
-
-        let roots = allowed(vec![favorite]);
         let (entries, truncated) = map_tag_item_keys(
-            &roots,
             item_keys,
             TagItemKind::Image,
             crate::tag_view::TAG_VIEW_FILTERED_KEY_SCAN_LIMIT,
         );
 
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].relative_path, "zzzz.jpg");
+        assert!(entries[0].path.ends_with("zzzz.jpg"));
         assert_eq!(entries[0].kind, RemoteEntryKind::Image);
         assert!(!truncated);
     }
@@ -1619,7 +1564,7 @@ mod tests {
     }
 
     #[test]
-    fn favorite_search_drops_index_paths_outside_the_live_allowlist() {
+    fn favorite_search_keeps_index_paths_outside_favorites() {
         let data_dir = crate::data_dir::TestDataDirGuard::new();
         let root = data_dir.path().join("favorite");
         let inside = root.join("match-inside");
@@ -1654,12 +1599,28 @@ mod tests {
         );
 
         assert_eq!(payload.index_state, FavoriteSearchIndexState::Ready);
-        assert_eq!(payload.listing.entries.len(), 1);
-        assert_eq!(payload.listing.entries[0].root_id, favorite.id.to_string());
-        assert_eq!(payload.listing.entries[0].relative_path, "match-inside");
-        assert!(!Path::new(&payload.listing.entries[0].relative_path).is_absolute());
-        let json = serde_json::to_string(&payload).unwrap();
-        assert!(!json.contains(&data_dir.path().to_string_lossy().to_string()));
+        assert_eq!(payload.listing.entries.len(), 2);
+        assert!(
+            payload
+                .listing
+                .entries
+                .iter()
+                .all(|entry| Path::new(&entry.path).is_absolute())
+        );
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            json["listing"]["entries"].as_array().unwrap().len(),
+            payload.listing.entries.len()
+        );
+        for entry in &payload.listing.entries {
+            assert!(
+                json["listing"]["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|encoded| encoded["path"].as_str() == Some(entry.path.as_str()))
+            );
+        }
     }
 
     #[test]
@@ -1668,7 +1629,6 @@ mod tests {
         let root = temp.path().join("favorite");
         let target = root.join("album");
         std::fs::create_dir_all(&target).unwrap();
-        let favorite = favorite_with_container_index(root, true);
         let index_entries = (0..=MAX_REMOTE_COLLECTION_ENTRIES)
             .map(|index| IndexEntry {
                 path: target.clone(),
@@ -1678,8 +1638,7 @@ mod tests {
             })
             .collect();
 
-        let roots = allowed(vec![favorite]);
-        let (entries, truncated) = map_favorite_search_entries(&roots, index_entries);
+        let (entries, truncated) = map_favorite_search_entries(index_entries);
 
         assert_eq!(entries.len(), MAX_REMOTE_COLLECTION_ENTRIES);
         assert!(truncated);

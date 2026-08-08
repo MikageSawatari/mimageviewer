@@ -827,11 +827,18 @@ mod tests {
             content_type: "image/jpeg".to_owned(),
             width: 1,
             height: 1,
-            identity: mimageviewer_ipc::RemoteAddress::file(
-                "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
-                "image.png",
-            ),
+            identity: fixture_address("image.png"),
         }
+    }
+
+    fn fixture_address(name: &str) -> mimageviewer_ipc::RemoteAddress {
+        mimageviewer_ipc::RemoteAddress::file(
+            std::env::temp_dir()
+                .join("mimageviewer-remote-ai-tests")
+                .join(name)
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 
     fn peer() -> mimageviewer_ipc::SessionPeerInfo {
@@ -845,10 +852,7 @@ mod tests {
         RemoteAiStartRequest {
             request_id: request_id.to_owned(),
             pages: vec![mimageviewer_ipc::RemoteAiPageRequest {
-                address: mimageviewer_ipc::RemoteAddress::file(
-                    "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
-                    "image.png",
-                ),
+                address: fixture_address("image.png"),
                 target_px: 1024,
                 render_context: None,
             }],
@@ -1079,10 +1083,7 @@ mod tests {
         mixed_request
             .pages
             .push(mimageviewer_ipc::RemoteAiPageRequest {
-                address: mimageviewer_ipc::RemoteAddress::file(
-                    "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
-                    "vector.pdf",
-                ),
+                address: fixture_address("vector.pdf"),
                 target_px: 1024,
                 render_context: None,
             });

@@ -86,8 +86,8 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 
 | 対象 | 状況 |
 |---|---|
-| サムネイル | remote-web は `root_id + relative_path + target_px` を本体へ IPC 中継する。本体が catalog 参照、既存生成経路、`CachePolicy` に従う保存を担当する (§9) |
-| 閲覧起点 | お気に入りの安定 UUID + root path に加え、一覧が返せる明示的な登録済み項目を許可する。登録済み項目の ID・列挙・変更検知・粒度は `crates/remote-registered-roots` が正本 |
+| サムネイル | remote-web は `絶対 path + subresource + target_px` を本体へ IPC 中継する。本体が catalog 参照、既存生成経路、`CachePolicy` に従う保存を担当する (§9) |
+| 閲覧起点 | お気に入り・スマートフォルダ・場所は従来どおり入口として表示するが、アクセス境界にはしない。リモートから読める範囲は mIV 本体と同じ |
 | 補正・回転・トリム・モザイク・消しゴム・ローカル調整・コミック注釈 | `books::BookPageSource::Composited` + `BakedEditSnapshot` に**ヘッドレス合成が既にある**。入力も File / ZipEntry / PdfPage をカバー済み |
 | AI アップスケール・カラー化 | `page_requires_full_composite` から display-only として**意図的に除外**されている。ヘッドレス経路への追加は**新規作業** |
 | ZIP / PDF 列挙 | `zip_loader` / `pdf_loader` をそのまま利用 |
@@ -95,20 +95,23 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 
 ## 3. 設計制約 (全フェーズ共通)
 
-### 3.1 パス表現 — 絶対パスを URL に出さない
+### 3.1 パス表現とリモートから読める範囲
 
-クライアントとのやり取りは必ず **`root_id` (UUID) + 許可された root からの相対パス**
-で行う。絶対パスを受け付ける API を作らず、起点の種類もクライアントへ公開しない。
+`RemoteAddress` は **絶対 path + subresource** とする。HTTP では絶対 path を必ずクエリ引数
+`?path=...` で渡し、URL path や診断ログの details へ入れない。request log は記録前にクエリ全体を
+落とす。ブラウザの hash route には利用者自身の端末内での履歴・復帰に必要な path を含める。
 
-- 相対パスは正規化し、`..` を含む・ドライブ指定を含む・正規化後に root の外へ出るものは拒否
-- シンボリックリンク / junction による脱出も、正規化後の実パスが root 配下かで判定する
-- 読めるのは、現在のお気に入りの中、またはタグ・レーティング・ブックマーク・閲覧履歴・本棚・
-  スマートフォルダによって mIV に現在明示的に登録されている項目に限る
-- 登録済みファイルで読めるのはそのファイル自身だけで、相対パスは空に限る。ZIP entry / PDF page は
-  空の相対パスに subresource を加えるので許可する。登録済みフォルダは配下を読めるが、いずれも親や
-  兄弟へ許可範囲を広げない
-- タグ解除などで登録が外れた項目は、次の解決から読めない。パス由来 ID だけを知っていても、現在の
-  登録集合に無ければ解決しない
+- リモートから読める範囲は **mIV 本体が開ける範囲と同じ**であり、お気に入り、スマートフォルダ、
+  タグ、レーティング、ブックマーク、閲覧履歴、本棚をアクセス境界にはしない
+- 保証できない範囲制限を保護として提示すると、利用者に検証されていない保証を信じさせるため、
+  favorite / registered-root allowlist は置かない。過去の制限は攻撃を防がず正当な一覧を欠落させた
+- 到達には tailnet 内の端末であることと PIN の両方が必要である。待受は 127.0.0.1 のままとし、
+  外部からは `tailscale serve` 経由だけにする
+- この判断は、有効化のたび接続ダイアログで「mIV が開ける画像・動画・PDF すべて」が対象になると
+  明示し、利用者が有効化前に認識できることを前提とする。無効化時には警告を出さない
+- path は NUL を含まない絶対パスで、実在することを remote-web と本体の境界で検証し、canonicalize
+  した値を永続キーと応答 identity に使う。ZIP entry / prefix の slash、drive、backslash、NUL、
+  `..` component 検証と PDF page 範囲検証は維持する
 
 ### 3.2 認証
 
@@ -175,18 +178,18 @@ stdout は起動時 Bearer token を含むため収集せず、stderr の安全�
 
 | エンドポイント | 内容 |
 |---|---|
-| `GET /api/favorites` | お気に入り一覧 (id, 表示名) を JSON で返す |
-| `GET /api/list?root=<uuid>&path=<rel>` | 本体の通常フォルダ一覧を IPC で取得する。従来の種別・表示名・相対パス・サイズ・mtime に加え、セルの `address` と吸収済み sidecar を含む `thumbnail_address` を返す |
-| `GET /api/thumb?root=<uuid>&path=<rel>&w=<px>` | 画像・フォルダのサムネイルを本体へ IPC 中継し WebP で返す。本体未接続時は 503 と利用者向け理由を返す |
-| `GET /api/image-info?root=<uuid>&path=<rel>` | EXIF 回転反映後の元画像寸法を返す。クライアントの実描画幅計算に使う |
-| `GET /api/image?root=<uuid>&path=<rel>&w=<px>` | 画像を `w` に合わせて縮小し WebP で返す。リサイズ不要・EXIF identity・ブラウザ対応形式なら元バイトを素通しする |
+| `GET /api/favorites` | お気に入り一覧 (id, 表示名, 絶対 path) を JSON で返す |
+| `GET /api/list?path=<absolute>` | 本体の通常フォルダ一覧を IPC で取得する。種別・表示名・絶対 path・サイズ・mtime に加え、セルの `address` と吸収済み sidecar を含む `thumbnail_address` を返す |
+| `GET /api/thumb?path=<absolute>&w=<px>` | 画像・フォルダのサムネイルを本体へ IPC 中継し WebP で返す。本体未接続時は 503 と利用者向け理由を返す |
+| `GET /api/image-info?path=<absolute>` | EXIF 回転反映後の元画像寸法を返す。クライアントの実描画幅計算に使う |
+| `GET /api/image?path=<absolute>&w=<px>` | 画像を `w` に合わせて縮小し WebP で返す。リサイズ不要・EXIF identity・ブラウザ対応形式なら元バイトを素通しする |
 | `GET /` および静的ファイル | フロントエンドを配信 |
 
 - サムネイルの catalog 参照・キー生成・生成・保存判定は本体の既存経路に集約する。remote-web は
   catalog の内部構造を知らず、専用サムネイル DB も持たない。この段階で扱う source は通常画像と
   フォルダ代表である。ZIP / PDF の container page は後続増分で対応済みであり、通常フォルダの動画は
   本体で同名画像を sidecar として吸収した場合、その画像 address を `/api/thumb` へ渡す
-- 本体側でも現在の root allowlist と canonical path の包含を検証し、remote-web の検証結果を信頼しない
+- 本体側でも絶対 path の構文・実在・canonicalize と実ファイル種別を再検証し、remote-web の検証結果を信頼しない
 - 一覧の走査と materialize は本体 `scan_directory_with_settings` →
   `materialize_local_folder_listing` だけを使い、remote-web に別の列挙を持たない
 
@@ -605,8 +608,7 @@ remote-web は pending 要求を id で解決し、接続断では全 pending �
 復旧した一時エラーを含めて失敗段階を直接集計できる。
 
 `ThumbnailRequest { address, target_px }` の `address` は §12 の共通アドレス型であり、本体側で
-再度 allowlist と canonical
-path containment を検証する。通常画像とフォルダ代表は `thumb_loader::process_load_request`
+再度、絶対 path の構文・実在・canonicalize と実ファイル種別を検証する。通常画像とフォルダ代表は `thumb_loader::process_load_request`
 (`load_one_cached`) へ渡し、catalog 参照、DCT / WIC / Susie、回転 DB、利用者のサイズ・画質、
 `CacheDecision::from_settings` による保存判断を既存経路へ揃える。同一要求の同時到着は flight を
 共有して重複生成しない。remote-web の `/api/thumb` はこの要求・応答を中継するだけで、IPC 往復
@@ -614,7 +616,7 @@ path containment を検証する。通常画像とフォルダ代表は `thumb_l
 
 本体未起動・pipe 未接続時も HTTP サーバ自体は起動する。`/api/thumb` は 503 と機械可読な
 `miv_not_running` を返し、フロントは「mIV 本体が起動していません」と画面内に表示する。
-仮想グリッドの tile は binding 世代と相対 path を応答時に照合し、破棄時は fetch を abort する。
+仮想グリッドの tile は binding 世代と絶対 path + subresource の address identity を応答時に照合し、破棄時は fetch を abort する。
 これにより scroll で detach / 再表示された tile に古い in-flight 応答を適用しない。
 ブラウザからのサムネイル HTTP 要求は同時 4 件に制限し、ネットワーク失敗・502・一時的な 503
 だけを 200 / 400 / 800 ms の指数 backoff で最大 3 回再試行する。404 / 422 と protocol 版不一致は
@@ -705,17 +707,15 @@ worker、request id 付き応答までを往復させ、両端の pipe 作成 fl
 返し、ファイルシステム走査や各集約ビューの内容取得は行わない。`scan_smart_folder` は利用者が
 該当スマートフォルダを開いて `/api/collection` を要求した時だけ実行する。読書履歴は本体設定
 由来の上限 (最大 1000) を既に持つ。他のレーティング・本棚・ブックマーク・スマートフォルダも
-IPC 応答を現在の許可済み起点へ写像した後に最大 1000 件へ制限し、`truncated` /
+IPC 応答を最大 1000 件へ制限し、`truncated` /
 `entry_limit` を返して Web 画面に打ち切りを表示する。現段階ではページングは実装しない。
 
-IPC の `RemoteEntry` は `root_id`、許可済み root からの `relative_path`、表示名、種別、
-進捗・レーティング等の表示用メタデータだけを持つ。候補の絶対 path は本体内で canonicalize し、
-最も深く一致する favorite root を優先し、該当しなければ一覧由来の登録済み起点へ写像する。
-欠落項目、未登録項目、junction / symlink で root 外へ出る項目は IPC 応答を作る前に除外する。
-remote-web も受信後に UUID、現在の登録、相対 path、canonical containment を再検証する。
+IPC の `RemoteEntry` は canonicalize 済みの絶対 `path`、表示名、種別、進捗・レーティング等の
+表示用メタデータを持つ。候補は favorite との包含関係では落とさず、欠落して canonicalize できない
+場合だけ元の絶対 path を保つ。開く時点で remote-web と本体が実在・種別を再検証する。
 
 HTTP は認証必須の `GET /api/home` と `GET /api/collection` を追加する。集約一覧の通常画像・
-フォルダは既存 `/api/thumb?root=<UUID>&path=<relative>&w=<px>` を使う。ZIP / PDF は §12 の増分で
+フォルダは既存 `/api/thumb?path=<absolute>&w=<px>` を使う。ZIP / PDF は §12 の増分で
 コンテナ内ページまで閲覧可能になった。動画・音声・変換アーカイブの再生、および
 読書履歴・レーティング・ブックマーク等への書き込みは後続のセッションロック設計と一緒に行う。
 
@@ -753,26 +753,25 @@ remote thumbnail IPC の `\\.\pipe\mimageviewer-remote-thumbnail` はremote-web�
 ### 12.1 共通アドレスと境界検証
 
 `crates/remote-ipc` の `RemoteAddress` を本体と remote-web の唯一のアドレス表現とする。
-実ファイルは常に `root_id` と許可済み root からの `relative_path` で表し、
+実ファイルは canonicalize 済みの絶対 `path` で表し、
 `RemoteSubresource` に `File`、`ZipDirectory { prefix }`、
 `ZipEntry { entry_name }`、`PdfPage { page_number }` を持つ。ZIP entry / prefix は
 `/` 区切りの相対表現だけを許し、先頭 slash、drive 指定、backslash、NUL、
 `..` component を両プロセスの共通検証で拒否する。PDF page は 0-origin とし、本体が実際に
 列挙した page count 未満であることを確認してからレンダリングする。
 
-remote-web は IPC 前に現在の root UUID、実コンテナの canonical containment、内部アドレス構文を
-検証する。本体も同じ構文検証の後に `remote_ipc::path_guard::resolve_existing` を通す。
-したがって remote-web の検証を迂回しても、未許可のコンテナ、junction / symlink 脱出、
-悪性 ZIP entry、範囲外 PDF page は本体境界で再度拒否される。絶対 path は IPC 応答にも
-HTTP / hash route にも含めない。
+remote-web は IPC 前に NUL のない絶対 path、実在、canonicalize、内部アドレス構文を検証する。
+本体も同じ構文検証の後に `remote_ipc::path_guard::resolve_existing` を通す。したがって
+remote-web の検証を迂回しても、相対・不存在 path、悪性 ZIP entry、範囲外 PDF page は本体境界で
+再度拒否される。絶対 path は IPC 応答とブラウザ hash route に含め、HTTP では query にだけ入れる。
+request log は query を保存しない。
 
 動画ストリーミングの実ファイルも同じ `RemoteAddress::File` と二重検証を通す。remote-web と
-本体はそれぞれ現在の root allowlist、canonical containment、実ファイル種別を検証し、本体 IPC
+本体はそれぞれ絶対 path の実在・canonicalize・実ファイル種別を検証し、本体 IPC
 境界では remote-web の判定を信頼しない。
 
-通常フォルダ一覧も要求 address を両側で検証する。本体が返した各セルの `address` と
-`thumbnail_address` は remote-web が現在の root allowlist と canonical containment を再検証し、
-sidecar だけが root 外を指す応答も除外する。同一 address の場合は同じ検証結果を共有する。
+通常フォルダ一覧も要求 address を両側で検証する。本体が列挙・canonicalize した各セルの
+`address` と `thumbnail_address` を remote-web は組み替えずに返す。
 
 ### 12.2 本体既存経路の再利用
 
@@ -802,7 +801,7 @@ turbojpeg q85 の JPEG で返す。`GET /api/thumb` はサムネイル用 WebP �
 
 フロントは ZIP/PDF を通常フォルダと同じ仮想グリッドで表示し、ページを既存の swipe、
 pinch zoom、表示モード、keyboard / mouse command layer へ渡す。hash route は
-`RemoteAddress` の JSON を percent encode した相対情報だけを保持する。パンくずは favorite、
+`RemoteAddress` の JSON を percent encode した絶対 path + subresource を保持する。パンくずは favorite、
 実フォルダ、コンテナ、ZIP 内 prefix を 1 DOM 上で組み立て、親の実フォルダへ戻れる。
 
 HTTP heavy admission は従来どおり最大 4、IPC 応答期限は 10 秒とする。本体の既存実測は
@@ -900,7 +899,7 @@ layout → atomic replace を実行する。bundler、TypeScript、追加 packag
 横長判定は本体 catalog の既存 `source_dims`（無い場合は既存 thumbnail の寸法）を read-only で
 参照し、寸法未確定時は fullscreen と同じく非横長として扱う。応答の `page_groups` はグループ列を
 読み進める順に並べ、各 `pages` は画面上の左→右順、`anchor` はそのグループの読み順先頭とする。
-remote-web は受信した各 address を現在の root allowlist で再検証し、組み直しや独自 sort をしない。
+remote-web は受信した各 address を組み直さず、独自 sort もしない。
 
 モードと固定キーは本体既定に合わせる。
 
@@ -957,7 +956,10 @@ LTR は「先頭ページです」「最終ページです」。RTL はそれぞ
 protocol v11 は書き込み種別を共有 `RemoteWriteRequest` enum へ集約し、最初の variant を
 `SetSpread { address, spread_mode, reading_direction }` とする。種別ごとの bool / `Option` /
 pending field は作らない。認証済み `POST /api/write` は remote-web の専用 bounded FIFO worker へ
-渡り、本体側でも favorite allowlist、canonical containment、コンテナ種別を再検証する。worker は
+渡る。要求内の各絶対 path は反復 `?path=...` query にだけ置き、JSON body は各 address の
+`path_query_index` と subresource を持つ。remote-web は query から typed request を復元し、
+body に path を直接置く旧形式や余分・重複 index を拒否する。本体側でも絶対 path の実在・
+canonicalize、コンテナ種別を再検証する。worker は
 DB を開かず、`SessionHandle` の bounded queue へ要求と one-shot 応答 channel を投入する。
 既存 repaint context を起こし、UI thread の `App::poll_remote_session` が drain して
 `App.spread_db` から mode / direction を1 transactionで保存し、成功または型付き失敗理由を
@@ -1081,7 +1083,7 @@ viewer の ☰ を開くたびに `GetItemState` で `rating_db` と `book_bookm
 
 protocol v13 は `ContainerKind::Folder` を追加し、通常フォルダも ZIP / PDF と同じ
 `GET /api/container` / `ContainerPayload` / `page_groups` 経路へ載せる。本体
-`ContainerEngine` は favorite 境界内の実ディレクトリを走査した後、ローカル
+`ContainerEngine` は要求された実在する絶対 path のディレクトリを走査した後、ローカル
 `App::load_folder` と同じ `materialize_local_folder_listing` を呼ぶ。sort、カテゴリ配置、動画
 sidecar、画像拡張子、実フォルダ対仮想コンテナの重複除外を別実装しない。
 protocol v16 以降の `/api/list` もこの結果を `FolderListPayload` として受け取り、一覧描画は
@@ -1219,9 +1221,9 @@ viewer のメイン操作メニューは使用頻度順に、ブックマーク�
 `GET /api/page` の入口は `ZipEntry` / `PdfPage` に加えて、通常フォルダ内画像の
 `RemoteSubresource::File` を受け付ける。File は実ファイルであり、かつ `/api/list` と同じ画像拡張子
 分類に一致する場合だけ許可し、動画・音声・テキスト、ZIP/PDF 本体、ディレクトリは page として 400 にする。3 種の許可対象も
-含め、全 address は従来の `Library::validate_remote_address` を通して現在の root 内の実在パスに
-限定する。入口の回帰テストは通常画像 / ZIP entry / PDF page の許可と、動画 / 音声 / テキスト /
-traversal の拒否を同じ guard に対して固定する。
+含め、全 address は `Library::validate_remote_address` を通して絶対 path の構文・実在・
+canonicalize と subresource を検証する。入口の回帰テストは通常画像 / ZIP entry / PDF page の許可と、
+動画 / 音声 / テキスト、相対・不存在 path、subresource traversal の拒否を同じ guard に対して固定する。
 
 remote-web の `MAX_CONCURRENT_HEAVY_IPC=4` と `MAX_CONCURRENT_IPC=6` は変更しない。ブラウザの
 サムネイル fetch は pure policy から最大 3 件とし、共有 heavy 枠を page / container の foreground
@@ -1314,12 +1316,10 @@ hit 時点の最新性そのものは証明しない。現在版は先行する 
 session と既存表示を保ったまま本体 DB だけが変わり、次の acquire / ping / page request が一度も
 発生しない間は表示中画像を自発更新しない、という採用済みの鮮度境界は残る。
 
-favorites と登録済み項目の経路 allowlist は remote-web と本体 IPC の両境界で同じ鮮度規則を使う。
-それぞれ persistent read-only connection の `data_version` を request ごとに確認し、再列挙した root
-集合が変化した時だけ cached roots を差し替える。
+favorites の `data_version` 観測はホームの「お気に入り」一覧と remote state generation の更新にだけ
+使う。お気に入りの追加・削除・名称変更は入口表示へ即時反映するが、path のアクセス可否は変えない。
 500 favorites の warm 計測では `data_version` が p50 2.10 µs / p95 2.40 µs、全件読込が
-p50 239.20 µs / p95 315.30 µs（p50 約 114 倍）だったため、サムネイルごとの全件読込や WAL を考慮しにくい
-mtime 観測は採らない。削除済み favorite id と登録が外れた path 由来 id は両境界で直ちに拒否する。
+p50 239.20 µs / p95 315.30 µs（p50 約 114 倍）だったため、変更が無い request での全件読込は行わない。
 
 Auto trim の見開き slot に相手 address が無い場合は、上下 harmonize だけを諦めて
 `AutoSingle` としてページ自体は描画する。相手が指定されている場合の address・slot 検証は維持する。
@@ -1445,8 +1445,8 @@ path、DOM target は記録しない。
 ### 12.22 ページ応答 identity の検査 (2026-08-08)
 
 `/api/page` と AI result の画像応答は、画素生成側が確定した `RemoteAddress` を
-`PagePayload.identity` として返す。identity は HTTP 要求値の echo ではない。core が favorite の
-実際の一致結果、解決済み logical path、実際に選んだ file / PDF page / archive entry から、画素を
+`PagePayload.identity` として返す。identity は HTTP 要求値の echo ではない。core が
+canonicalize 済み絶対 path、実際に選んだ file / PDF page / archive entry から、画素を
 応答へ載せる境界で再構成する。IPC protocol v31 はこの identity を page payload の一部として運ぶ。
 
 remote-web は core から受けた identity を percent-encoded JSON にし、
@@ -1456,30 +1456,28 @@ remote-web は core から受けた identity を percent-encoded JSON にし、
 不一致時は専用エラーを表示し、通常段 telemetry に要求 identity と応答 identity の両方を記録するが、
 同じ応答の自動再取得は行わない。thumbnail はこの検査の対象外である。
 
-identity の型は root UUID、root 相対 path、file / PDF page / archive entry だけを含む。
+identity の型は絶対 path と file / PDF page / archive entry だけを含む。
 PIN、Bearer token、session id などの接続秘密・session 情報は IPC payload と HTTP header のどちらにも
 含めない。
 
-### 12.23 一覧由来の登録済み起点 (protocol v36, 2026-08-08)
+### 12.23 パス allowlist の撤去 (protocol v37, 2026-08-08)
 
-リモートで一覧に表示できる項目は、その住所をそのまま開ける。お気に入り外の項目を一覧変換時に
-黙って落とさないため、タグ、★1〜5、動画・音声／本のブックマーク、一覧と同じ上限の閲覧履歴、
-`books_root_path()`、有効なスマートフォルダ rule の `source` を登録済み起点にする。スマートフォルダの
-`include_descendants` は列挙粒度を狭めず、source 配下を許可する。favorite root で絞るコンテナ検索は
-対象外である。
+リモートで一覧に表示できる項目は、お気に入りとの包含関係にかかわらず絶対 path の住所をそのまま
+開ける。タグ、★1〜5、動画・音声／本のブックマーク、閲覧履歴、本棚、スマートフォルダの候補を
+一覧変換時に allowlist で落とさない。ホームの「お気に入り」「スマートフォルダ」「場所」の 3 タブと
+操作は変えず、これらは入口・検索範囲としてだけ使う。
 
-`crates/remote-registered-roots` が正規化 path と標準 `Uuid::new_v5` による固定 namespace UUID v5、
-各 read-only DB の列挙、`PRAGMA data_version` による変更検知、ファイル自身／フォルダ配下という粒度を
-一元所有する。本体の `adjustment_db::normalize_path` も同じ正規化へ委譲する。OS の Pictures 解決も
-同クレートの `pictures_root()` を正本とし、本体の capture 既定出力がこれを使い、本棚既定値は従来どおり
-その `books` 子である。閲覧履歴の一覧・登録起点上限も同クレートの定数を本体が参照する。本体 IPC と
-remote-web は同じ共有規則から独立した現在 snapshot を作り、両境界で解決と canonical containment を
-検査する。favorite と登録済み起点が重なる場合は favorite を先に写像し、既存の住所・親移動・パンくずを
-維持する。
+保証できない制限を保護として提示しないという判断により `crates/remote-registered-roots` は削除した。
+同クレートへ移されていた `pictures_root()` は `capture.rs`、閲覧履歴上限は `reading_history_db.rs`、
+path 正規化は `adjustment_db.rs` へ戻した。本棚既定値が capture 既定出力の `books` 子である関係は維持する。
 
-登録済み起点は最大 100,000 件とし、正規化 path 順に決定的に保持する。超過時は絶対 path を含めず
-検出件数と保持件数だけを両 process の記録へ残す。protocol v36 の folder / container payload は
-起点種別ではなく `root_name` だけを返し、SPA は空の `relative_path` を root 境界として元の一覧へ戻る。
+protocol v37 の `RemoteAddress` / `RemoteEntry` は絶対 `path` と subresource を持つ。folder / container
+payload の `root_name` は表示用であり、アクセス境界を表さない。SPA は絶対 path から親移動とパンくずを
+構成し、favorite 配下では従来どおり favorite 名をパンくずの入口表示に使う。
+
+読み取り、動画開始に加え、`POST /api/write` と `POST /api/ai/jobs` の入れ子 address も絶対 path を
+反復 query 引数へ移し、JSON body には残さない。request log は query 全体を落とし、telemetry は
+クライアントと remote-web の両境界で path field と絶対 filesystem path 文字列を除去する。
 
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 
@@ -1550,9 +1548,9 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-一覧由来の登録済み起点と、種別を公開せずパンくず先頭を表示する `root_name` を追加した
-2026-08-08 時点の現行版は **v36**。`/api/page` と AI result の表示前照合、`FavoriteSearch`、
-タグ一覧・タグ項目検索、登録済み起点の二重検査は両側が v36 であることを前提とする。
+絶対 path + subresource へ住所を変更し path allowlist を撤去した 2026-08-08 時点の現行版は
+**v37**。`/api/page` と AI result の表示前照合、`FavoriteSearch`、タグ一覧・タグ項目検索、
+絶対 path の構文・実在・canonicalize の二重検査は両側が v37 であることを前提とする。
 
 ### 13.6 残タスク (2026-08-01 時点)
 

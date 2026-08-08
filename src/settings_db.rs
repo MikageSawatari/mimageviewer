@@ -1535,7 +1535,7 @@ fn read_favorites(conn: &Connection) -> Result<Vec<FavoriteEntry>, SettingsDbErr
     Ok(out)
 }
 
-/// Remote の favorite allowlist 用 read-only reader。
+/// Remote の favorite 一覧を追従する read-only reader。
 ///
 /// hot path は `PRAGMA data_version` だけを読み、別 connection の commit を観測した時だけ
 /// favorites 全件を読み直す。書き込み connection と snapshot を共有しないため、本体 UI の

@@ -103,6 +103,7 @@ import {
   visualViewportScaleTransition,
   appUpdateNotice,
   adjustmentResetVisible,
+  addressedPostRequest,
   rangeValueFromNormalized,
   rangeValueToNormalized,
   relativeRangeDragValue,
@@ -433,7 +434,7 @@ test("normal telemetry keeps health facts but removes path, message and identity
     message: "server message C:/private/movie.mp4",
     stack: "at C:/private/app.js:10",
     resource: "/private/movie.mp4",
-    remote_address: { root_id: "fav", relative_path: "private/movie.mp4" },
+    remote_address: { path: "C:/private/movie.mp4", subresource: { kind: "file" } },
     client_id: "browser-client-secret",
     remote_session_correlation: "0123456789abcdef01234567",
   });
@@ -450,8 +451,7 @@ test("normal telemetry keeps health facts but removes path, message and identity
 
 test("page identity comparison distinguishes PDF documents, ZIP entries, and files", () => {
   const pdf = (relativePath) => ({
-    root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
-    relative_path: relativePath,
+    path: `C:/${relativePath}`,
     subresource: { kind: "pdf_page", page_number: 1 },
   });
   const encoded = (identity) => encodeURIComponent(JSON.stringify(identity));
@@ -465,8 +465,7 @@ test("page identity comparison distinguishes PDF documents, ZIP entries, and fil
   );
 
   const zipEntry = (entryName) => ({
-    root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
-    relative_path: "books/first.zip",
+    path: "C:/books/first.zip",
     subresource: { kind: "zip_entry", entry_name: entryName },
   });
   assert.notEqual(
@@ -475,27 +474,58 @@ test("page identity comparison distinguishes PDF documents, ZIP entries, and fil
   );
   assert.notEqual(
     remoteAddressIdentity({
-      root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
-      relative_path: "pages/001.jpg",
+      path: "C:/pages/001.jpg",
       subresource: { kind: "file" },
     }),
     remoteAddressIdentity({
-      root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
-      relative_path: "pages/002.jpg",
+      path: "C:/pages/002.jpg",
       subresource: { kind: "file" },
     })
   );
 });
 
+test("addressed POST moves every filesystem path into repeated query arguments", () => {
+  const payload = {
+    kind: "set_bookmark",
+    address: {
+      path: "C:/Private/page.jpg",
+      subresource: { kind: "file" },
+    },
+    context_address: {
+      path: "C:/Private",
+      subresource: { kind: "file" },
+    },
+    page_index: 4,
+    bookmarked: true,
+  };
+  const request = addressedPostRequest("/api/write", payload);
+  const url = new URL(request.url, "https://remote.invalid");
+  assert.deepEqual(url.searchParams.getAll("path"), [
+    "C:/Private/page.jpg",
+    "C:/Private",
+  ]);
+  assert.equal(request.body.address.path_query_index, 0);
+  assert.equal(request.body.context_address.path_query_index, 1);
+  assert.equal("path" in request.body.address, false);
+  assert.equal("path" in request.body.context_address, false);
+  assert.doesNotMatch(JSON.stringify(request.body), /C:\/Private/);
+  assert.equal(payload.address.path, "C:/Private/page.jpg", "input remains immutable");
+
+  const collectionSort = addressedPostRequest("/api/write", {
+    kind: "set_sort_order",
+    scope: { kind: "collection", collection: "bookshelf" },
+    sort_order: "name_asc",
+  });
+  assert.equal(collectionSort.url, "/api/write");
+});
+
 test("normal mismatch telemetry retains only the two typed page identities", () => {
   const requested = {
-    root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
-    relative_path: "private/first.pdf",
+    path: "C:/private/first.pdf",
     subresource: { kind: "pdf_page", page_number: 1 },
   };
   const response = {
-    root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
-    relative_path: "private/other.pdf",
+    path: "C:/private/other.pdf",
     subresource: { kind: "pdf_page", page_number: 1 },
     session_id: "must-not-pass",
   };
@@ -508,10 +538,8 @@ test("normal mismatch telemetry retains only the two typed page identities", () 
   }), {
     type: "error",
     category: "page_identity_mismatch",
-    requested_page_identity: requested,
+    requested_page_identity: { subresource: requested.subresource },
     response_page_identity: {
-      root_id: response.root_id,
-      relative_path: response.relative_path,
       subresource: response.subresource,
     },
     telemetry_tier: "normal",
@@ -598,8 +626,13 @@ test("debug telemetry keeps diagnostic context but redacts the live session capa
   const event = telemetryEventForTier({
     type: "video_health",
     trigger: "periodic",
-    remote_address: { root_id: "fav", relative_path: "movie.mp4" },
-    server_message: `session ${rawSession} failed`,
+    remote_address: { path: "C:/movie.mp4", subresource: { kind: "file" } },
+    server_message: `session ${rawSession} failed for C:/Private/movie.mp4`,
+    page_identity: remoteAddressIdentity({
+      path: "C:/Private/movie.mp4",
+      subresource: { kind: "file" },
+    }),
+    unix_message: "failed at /home/example/private/movie.mp4",
   }, {
     detailed: true,
     clientId: "browser-client-1234",
@@ -610,9 +643,13 @@ test("debug telemetry keeps diagnostic context but redacts the live session capa
   assert.equal(event.telemetry_tier, "debug");
   assert.equal(event.client_id, "browser-client-1234");
   assert.equal(event.remote_session_correlation, "00112233445566778899aabb");
-  assert.equal(event.remote_address.relative_path, "movie.mp4");
-  assert.equal(event.server_message, "session [redacted-secret] failed");
+  assert.equal(event.remote_address.path, undefined);
+  assert.equal(event.remote_address.subresource.kind, "file");
+  assert.equal(event.server_message, "session [redacted-secret] failed for [redacted-path]");
+  assert.equal(event.page_identity, "[redacted-path]\nfile\n");
+  assert.equal(event.unix_message, "failed at [redacted-path]");
   assert.doesNotMatch(JSON.stringify(event), new RegExp(rawSession));
+  assert.doesNotMatch(JSON.stringify(event), /Private|\/home\/example/);
 });
 
 test("remote session correlation is a stable truncated SHA-256 derivative", async () => {
@@ -1156,8 +1193,7 @@ test("opening a container in portrait plans no persistent spread write", () => {
 
 test("an explicit portrait selection writes the selected mode, not effective Single", () => {
   const address = {
-    root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
-    relative_path: "books/book.pdf",
+    path: "C:/books/book.pdf",
     subresource: { kind: "file" },
   };
   const plan = planSpreadIntent({
