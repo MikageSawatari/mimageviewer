@@ -9773,9 +9773,9 @@ pub struct App {
     /// Alt+Tab 復帰直後に main viewport が数フレーム focused と報告されても
     /// Focus/raise コマンドを連投しないための debounce。
     fs_last_main_focus_restore_at: Option<std::time::Instant>,
-    /// フォーカス復帰クリックを検出中で、離されるまで全ての左クリック操作を抑制するフラグ。
-    /// 押下 → 離しの間に複数フレームあるため、時間ベースだけでなく状態でも追跡する。
-    pub(crate) fs_suppress_primary_until_release: bool,
+    /// フォーカス復帰 pointer または touch-owned gesture の間、左入力を抑制する owner。
+    /// terminal touch replacement は current frame だけ抑制し、cross-frame state にはしない。
+    pub(crate) fs_primary_suppression: crate::ui_fullscreen::FullscreenPrimarySuppression,
 
     // ── 通常フルスクリーン ズーム/パン/任意回転 ──────────────
     /// 通常フルスクリーンのズーム倍率（1.0 = フィット）
@@ -12389,7 +12389,7 @@ impl App {
             fs_prev_foreground_hwnd: 0,
             fs_last_native_focus_claim_at: None,
             fs_last_main_focus_restore_at: None,
-            fs_suppress_primary_until_release: false,
+            fs_primary_suppression: Default::default(),
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
             fs_zoom_active: false,
@@ -36869,7 +36869,7 @@ impl App {
         self.fs_prev_foreground_hwnd = 0;
         self.fs_last_native_focus_claim_at = None;
         self.fs_last_main_focus_restore_at = None;
-        self.fs_suppress_primary_until_release = false;
+        self.fs_primary_suppression = Default::default();
     }
 
     #[cfg(windows)]
@@ -36903,7 +36903,7 @@ impl App {
         self.fs_prev_foreground_hwnd = 0;
         self.fs_last_native_focus_claim_at = None;
         self.fs_last_main_focus_restore_at = None;
-        self.fs_suppress_primary_until_release = false;
+        self.fs_primary_suppression = Default::default();
     }
 
     #[cfg(windows)]
@@ -40889,7 +40889,7 @@ impl App {
         self.fs_prev_foreground_hwnd = 0;
         self.fs_last_native_focus_claim_at = None;
         self.fs_last_main_focus_restore_at = None;
-        self.fs_suppress_primary_until_release = false;
+        self.fs_primary_suppression = Default::default();
         self.reset_erase_mode();
 
         // 360 度パノラマビュー: 別画像へナビ時は GPU リソースを解放する
@@ -48827,7 +48827,7 @@ impl App {
         self.fs_prev_foreground_hwnd = 0;
         self.fs_last_native_focus_claim_at = None;
         self.fs_last_main_focus_restore_at = None;
-        self.fs_suppress_primary_until_release = false;
+        self.fs_primary_suppression = Default::default();
         self.fs_secondary_press_start = None;
         #[cfg(windows)]
         {

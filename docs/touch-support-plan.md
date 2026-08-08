@@ -559,6 +559,29 @@ press の合成や症状 guard は加えず、実際の press からの `total_d
 へ適用するよう ownership 境界を修正した。既存マウスの絶対 drag / clamp の意味も維持し、
 raw touch stream と最初の move の pan 反映をテストで固定する。
 
+#### パネル外タップ後の primary 抑制 ownership 修正 (2026-08-08)
+
+実機では、touch-owned 左右パネルをパネル外タップで閉じた後、
+タッチとマウスの両方でパンできなくなる退行が出た。fs_zoom、panel hit、
+command dispatch の continue はいずれも次フレームへ残る状態を作っておらず、
+旧共有状態 fs_suppress_primary_until_release が残るときだけ両入力の pan 分岐を
+まとめて飛ばすことを確認した。
+
+根本原因は、この共有状態を arm する owner と clear する owner が一致していなかったこと。
+touch command / correlated response は touch tracker の terminal frame でも latch を arm
+していた一方、clear は別 owner である egui pointer の primary_released() に依存していた。
+通常の単一 pass では同時に観測できる。一方、primary release の後に PointerGone tail が
+分かれ、パネル表示変更後の同一 app frame replay が先に走る列では、相関層は response 抑制を
+replay するが egui の release edge は前 pass で消費済みになる。この pass が latch を再 arm し、
+後続の PointerGone には release が無いため、将来の clear event が存在しない状態になっていた。
+
+FullscreenPrimarySuppression の Idle / PointerStream / TouchStream を単一 owner とし、
+pointer 起点は primary release、touch 起点は touch completion / Cancel で終端する reducer
+へ集約した。terminal touch replacement と correlated response は当該フレームだけを抑制し、
+cross-frame state を新規 arm しない。pointer release の遷移は input handler 冒頭に置き、
+navigator / capture selection / compare wipe の早期 return より前に必ず実行する。
+パネル外タップ後の touch / mouse drag と、terminal / replay / Cancel の各終端を unit test で固定した。
+
 上バーの可視判定は既に純関数 `still_top_bar_visible_from_inputs` (`ui_fullscreen.rs:1018-1027`)
 なので、入力構造体に 1 フィールド足すだけで済む。テストも既存パターンに乗る。
 
@@ -1156,7 +1179,7 @@ branch が `drive_egui_touch_input(..., false)` を呼んだため、相関ロ�
 
 原因は Step 3d の退行ではなく、タッチ対応以前からある「前面復帰クリックを操作に使わない」
 マウス向け branch が、`enabled=false` を観測停止として扱っていたことである。早期 return、
-foreground 奪還処理、`fs_suppress_primary_until_release` は維持し、branch 内で touch correlation
+foreground 奪還処理、`fs_primary_suppression` は維持し、branch 内で touch correlation
 だけを実行可能にした。返却結果は `ToggleChrome`（初回ヘルプ中の learn + chrome を含む）だけを
 採用し、`PageSide`、pinch、pan、widget への synthetic primary は採用しない。
 

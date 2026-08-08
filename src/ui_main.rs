@@ -12681,7 +12681,7 @@ impl App {
                         // Prevent the second click of the grid double-click from
                         // reaching the newly-opened fullscreen video and toggling
                         // playback back to paused.
-                        self.fs_suppress_primary_until_release = true;
+                        self.fs_primary_suppression.arm_pointer_stream();
                         self.fs_focus_regained_at = Some(std::time::Instant::now());
                     }
                     self.fs_open_intent_from_grid = true;

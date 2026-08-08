@@ -1294,7 +1294,7 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   `MA_ACTIVATEANDEAT` を返して破棄する。Windows がアクティブ化トリガとなった
   `WM_LBUTTONDOWN` を `wnd_proc` に dispatch しないので、再生 toggle (App 経路の
   `handle_native_video_mouse_button` / overlay 経路の `primary_clicked`) どちらも
-  発火せず、画像フルスクリーンの `fs_suppress_primary_until_release` と同等の
+  発火せず、画像フルスクリーンの `fs_primary_suppression` と同等の
   挙動になる (HTCLIENT 上の左クリックのみ対象、右/中ボタンはそのまま通す)。
   ANDEAT 判定はウィンドウ種別で 2 通りある:
   - **フルスクリーン (top-level popup HWND)**: `WM_MOUSEACTIVATE` は「非アクティブ

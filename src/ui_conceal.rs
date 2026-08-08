@@ -1057,7 +1057,7 @@ impl App {
         transform: &DisplayedImageTransform,
     ) {
         let full_rect = transform.viewport_rect;
-        if self.fs_suppress_primary_until_release {
+        if self.fs_primary_suppression.is_active() {
             return;
         }
         let primary_down = ctx.input(|i| i.pointer.primary_down());

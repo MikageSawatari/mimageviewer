@@ -61,6 +61,77 @@ const FS_NAVIGATOR_MIN_SELECTION: f32 = 8.0;
 const FS_PAN_MIN_VISIBLE_PX: f32 = 48.0;
 const PANORAMA_NAVIGATOR_EDGE_SAMPLES: usize = 24;
 
+/// Cross-frame owner for primary-pointer suppression in fullscreen.
+///
+/// Touch replacement on a terminal TouchFrame is deliberately not stored:
+/// it suppresses that pass only. Persisting it would require a future primary
+/// release even though the touch owner has already observed the stream end.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FullscreenPrimarySuppression {
+    #[default]
+    Idle,
+    PointerStream,
+    TouchStream,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FullscreenPrimarySuppressionEvent {
+    PointerStreamStarted,
+    PointerFrame {
+        released: bool,
+    },
+    TouchFrame {
+        suppresses_current_frame: bool,
+        active: bool,
+        completed: bool,
+        cancelled: bool,
+    },
+}
+
+impl FullscreenPrimarySuppression {
+    pub(crate) fn is_active(self) -> bool {
+        self != Self::Idle
+    }
+
+    pub(crate) fn arm_pointer_stream(&mut self) {
+        let _ = self.apply(FullscreenPrimarySuppressionEvent::PointerStreamStarted);
+    }
+
+    fn apply(&mut self, event: FullscreenPrimarySuppressionEvent) -> bool {
+        match event {
+            FullscreenPrimarySuppressionEvent::PointerStreamStarted => {
+                *self = Self::PointerStream;
+                true
+            }
+            FullscreenPrimarySuppressionEvent::PointerFrame { released } => {
+                let suppresses_current_frame = self.is_active();
+                if released && *self == Self::PointerStream {
+                    *self = Self::Idle;
+                }
+                suppresses_current_frame
+            }
+            FullscreenPrimarySuppressionEvent::TouchFrame {
+                suppresses_current_frame,
+                active,
+                completed,
+                cancelled,
+            } => {
+                let suppresses_this_frame = self.is_active() || suppresses_current_frame;
+                if cancelled || completed {
+                    *self = Self::Idle;
+                } else if suppresses_current_frame && active {
+                    // A positively correlated touch stream owns the same
+                    // promoted primary pointer, including a focus-reclaim tap.
+                    *self = Self::TouchStream;
+                } else if *self == Self::TouchStream && !active {
+                    *self = Self::Idle;
+                }
+                suppresses_this_frame
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct FlatNavigatorPage {
     main: DisplayedImageTransform,
@@ -16366,6 +16437,25 @@ impl App {
     ) -> (FsPageNav, bool) {
         let mut page_nav = FsPageNav::None;
         let mut close = false;
+        const FOCUS_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+        let (primary_down, primary_released) =
+            ctx.input(|i| (i.pointer.primary_down(), i.pointer.primary_released()));
+        if let Some(t) = self.fs_focus_regained_at {
+            if t.elapsed() >= FOCUS_RESTORE_GRACE {
+                self.fs_focus_regained_at = None;
+            } else if !self.fs_primary_suppression.is_active() && primary_down {
+                self.fs_primary_suppression.arm_pointer_stream();
+                self.fs_focus_regained_at = None;
+            }
+        }
+        // Snapshot before releasing persistent ownership. The terminal frame
+        // itself remains suppressed, while later early returns cannot strand
+        // the owner because this transition runs at the function boundary.
+        let mut suppress_this_frame =
+            self.fs_primary_suppression
+                .apply(FullscreenPrimarySuppressionEvent::PointerFrame {
+                    released: primary_released,
+                });
 
         // レンダラが連続読みを描画しているか。クリックのページジャンプ抑制と、
         // 連結方向スクロール / 直交方向パンの振り分けに使う。
@@ -16398,11 +16488,15 @@ impl App {
                 self.frame_counter,
                 false,
             );
-            if touch_frame.touch_cancelled()
-                || (!touch_frame.is_active() && touch_frame.has_touch_derived_pointer_activity())
-            {
-                self.fs_suppress_primary_until_release = false;
-            }
+            let _ =
+                self.fs_primary_suppression
+                    .apply(FullscreenPrimarySuppressionEvent::TouchFrame {
+                        suppresses_current_frame: false,
+                        active: touch_frame.is_active(),
+                        completed: !touch_frame.is_active()
+                            && touch_frame.has_touch_derived_pointer_activity(),
+                        cancelled: touch_frame.touch_cancelled(),
+                    });
             return (FsPageNav::None, false);
         }
         let seek_panel_rect = fullscreen_seek_panel_rect(full_rect);
@@ -16495,7 +16589,7 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 self.fs_focus_regained_at = Some(std::time::Instant::now());
-                self.fs_suppress_primary_until_release = true;
+                self.fs_primary_suppression.arm_pointer_stream();
                 let touch_frame = crate::touch_correlation::drive_egui_touch_input(
                     ctx,
                     crate::touch_correlation::TouchSurface::StillFullscreen,
@@ -16792,11 +16886,15 @@ impl App {
                 self.frame_counter,
                 false,
             );
-            if touch_frame.touch_cancelled()
-                || (!touch_frame.is_active() && touch_frame.has_touch_derived_pointer_activity())
-            {
-                self.fs_suppress_primary_until_release = false;
-            }
+            let _ =
+                self.fs_primary_suppression
+                    .apply(FullscreenPrimarySuppressionEvent::TouchFrame {
+                        suppresses_current_frame: false,
+                        active: touch_frame.is_active(),
+                        completed: !touch_frame.is_active()
+                            && touch_frame.has_touch_derived_pointer_activity(),
+                        cancelled: touch_frame.touch_cancelled(),
+                    });
             return (FsPageNav::None, false);
         }
 
@@ -17011,13 +17109,21 @@ impl App {
         {
             set_still_touch_first_run_help_phase(ctx, scope, StillTouchFirstRunHelpPhase::Ready);
         }
-        if touch_input_enabled
+        let touch_suppresses_current_frame = touch_input_enabled
             && (touch_bar_tap
                 || touch_has_replacement
-                || touch_owner == crate::touch_input::TouchOwner::Pinch)
-        {
-            self.fs_suppress_primary_until_release = true;
-        }
+                || touch_owner == crate::touch_input::TouchOwner::Pinch);
+        suppress_this_frame |=
+            self.fs_primary_suppression
+                .apply(FullscreenPrimarySuppressionEvent::TouchFrame {
+                    suppresses_current_frame: touch_suppresses_current_frame,
+                    active: touch_active,
+                    completed: !touch_active
+                        && (touch_activity
+                            || touch_has_replacement
+                            || touch_owner == crate::touch_input::TouchOwner::Pinch),
+                    cancelled: touch_frame.touch_cancelled(),
+                });
 
         // Wipe のドラッグ基準は、白線 / clip / シェーダー合成境界と同じ「フィット後の実表示
         // 画像矩形」にする。full_rect (黒帯込み) で取ると線・切り替え位置とドラッグがズレる。
@@ -17263,29 +17369,11 @@ impl App {
         );
         if touch_input_enabled && touch_frame.should_suppress_response(&fs_response) {
             // Positive raw-event correlation is required before the
-            // recognizer's suppression decision can arm the shared latch.
-            self.fs_suppress_primary_until_release = true;
+            // recognizer may suppress this response. This is terminal-frame
+            // evidence, not a new cross-frame owner.
+            suppress_this_frame = true;
         }
-        // ── フォーカス復帰クリックの抑制 ──
-        // 他アプリから戻ってきた直後に押された左ボタンはナビ目的ではないとみなし、
-        // 押下〜離すまでの全期間にわたってアプリ側の左クリック処理を無効化する。
-        // グレースを跨いだ正常クリックには影響しないよう、状態ベースで追跡する。
-        const FOCUS_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
-        let (primary_down, primary_released) =
-            ctx.input(|i| (i.pointer.primary_down(), i.pointer.primary_released()));
-        if let Some(t) = self.fs_focus_regained_at {
-            if t.elapsed() >= FOCUS_RESTORE_GRACE {
-                self.fs_focus_regained_at = None;
-            } else if !self.fs_suppress_primary_until_release && primary_down {
-                self.fs_suppress_primary_until_release = true;
-                self.fs_focus_regained_at = None;
-            }
-        }
-        // フレーム冒頭の状態をスナップ。release フレームでは primary_released と
-        // fs_response.clicked() が同一フレームで立つので、フラグのクリアを先に
-        // 行うと抑制対象のクリックがそのままナビを走らせてしまう。判定は
-        // スナップショットで行い、クリアは左クリック分岐が終わった後に回す。
-        let suppress_this_frame = self.fs_suppress_primary_until_release;
+        // ── フォーカス復帰クリック / touch replacement の抑制 ──
         if suppress_this_frame {
             // フォーカス復帰クリック: 左ボタン経由の分岐をすべてスキップ。
             // 右クリック処理 (下の secondary ブロック) は別系統なので走らせる
@@ -17464,17 +17552,6 @@ impl App {
                     }
                 }
             }
-        }
-        // 抑制対象クリックの release フレームでここに来るので、左クリック分岐の
-        // スキップが終わったこのタイミングでフラグを落とす。
-        let pinch_stream_finished =
-            touch_owner == crate::touch_input::TouchOwner::Pinch && !touch_active;
-        if suppress_this_frame
-            && ((primary_released && !touch_active)
-                || pinch_stream_finished
-                || touch_frame.touch_cancelled())
-        {
-            self.fs_suppress_primary_until_release = false;
         }
         // 分析モード中は右クリックを色固定に使うため、終了トリガーにしない
         // コンテキストメニュー表示中は右クリック処理をスキップ
@@ -30364,6 +30441,265 @@ mod tests {
         assert!(!app.close_touch_owned_side_panels());
         assert_eq!(app.adjustment_mode, ByPointer);
         assert_eq!(app.fs_info_panel_open, ByPointer);
+    }
+
+    #[test]
+    fn touch_panel_dismiss_release_clears_suppression_and_next_drags_pan() {
+        fn touch(phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
+            egui::Event::Touch {
+                device_id: egui::TouchDeviceId(31),
+                id: egui::TouchId(37),
+                phase,
+                pos,
+                force: None,
+            }
+        }
+
+        fn primary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }
+        }
+
+        fn run_frame(
+            app: &mut crate::app::AppTestEnvForTest,
+            ctx: &egui::Context,
+            screen: egui::Rect,
+            state: &FsFrameState,
+            events: Vec<egui::Event>,
+            advance_app_frame: bool,
+        ) {
+            if advance_app_frame {
+                app.frame_counter += 1;
+            }
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            let _ = app.handle_fs_wheel_and_click(ui, ctx, screen, state, false, 0);
+                        });
+                },
+            );
+        }
+
+        let mut app = crate::app::setup_app_for_test();
+        app.items.push(GridItem::Image(PathBuf::default()));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+        app.settings.touch_center_chrome_learned = true;
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+        app.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
+        app.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
+        app.fs_zoom = 2.0;
+        let state = FsFrameState {
+            is_video: false,
+            original_preview_active: false,
+            tex: None,
+            thumb_tex: None,
+            location_display: String::new(),
+            image_dims: None,
+            image_file_size: None,
+            image_downscaled: false,
+            is_loading: false,
+            vst3_waiting_for_video: false,
+            fs_load_failed: false,
+            pdf_content_type: None,
+        };
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let tap = screen.center();
+
+        run_frame(&mut app, &ctx, screen, &state, Vec::new(), true);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                touch(egui::TouchPhase::Start, tap),
+                egui::Event::PointerMoved(tap),
+                primary(tap, true),
+            ],
+            true,
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![touch(egui::TouchPhase::End, tap), primary(tap, false)],
+            true,
+        );
+        // The PointerGone tail may be delivered after a same-app-frame replay.
+        // Correlation must replay suppression for this pass, but the primary
+        // release edge itself was consumed by the preceding egui pass.
+        run_frame(&mut app, &ctx, screen, &state, Vec::new(), false);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerGone],
+            true,
+        );
+
+        assert_eq!(
+            app.adjustment_mode,
+            crate::ui_helpers::MetadataPanelOpenState::Closed
+        );
+        assert_eq!(
+            app.fs_info_panel_open,
+            crate::ui_helpers::MetadataPanelOpenState::Closed
+        );
+        assert!(
+            !app.fs_primary_suppression.is_active(),
+            "the replacement tap's release must finish the shared suppression latch"
+        );
+
+        let drag_start = tap;
+        let touch_dragged = tap + egui::vec2(64.0, 24.0);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                touch(egui::TouchPhase::Start, drag_start),
+                egui::Event::PointerMoved(drag_start),
+                primary(drag_start, true),
+            ],
+            true,
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                touch(egui::TouchPhase::Move, touch_dragged),
+                egui::Event::PointerMoved(touch_dragged),
+            ],
+            true,
+        );
+        assert_ne!(
+            app.fs_pan,
+            egui::Vec2::ZERO,
+            "a touch drag immediately after panel dismissal must reach fullscreen pan"
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                touch(egui::TouchPhase::End, touch_dragged),
+                primary(touch_dragged, false),
+                egui::Event::PointerGone,
+            ],
+            true,
+        );
+
+        app.fs_pan = egui::Vec2::ZERO;
+        let mouse_dragged = tap + egui::vec2(-72.0, 32.0);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerMoved(tap), primary(tap, true)],
+            true,
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerMoved(mouse_dragged)],
+            true,
+        );
+        assert_ne!(
+            app.fs_pan,
+            egui::Vec2::ZERO,
+            "the same released latch must not block the next mouse drag either"
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![primary(mouse_dragged, false), egui::Event::PointerGone],
+            true,
+        );
+    }
+
+    #[test]
+    fn fullscreen_primary_suppression_has_a_terminal_event_for_every_owner() {
+        use FullscreenPrimarySuppressionEvent::{PointerFrame, PointerStreamStarted, TouchFrame};
+
+        let mut suppression = FullscreenPrimarySuppression::default();
+        assert!(!suppression.apply(PointerFrame { released: false }));
+
+        assert!(suppression.apply(PointerStreamStarted));
+        assert_eq!(suppression, FullscreenPrimarySuppression::PointerStream);
+        assert!(suppression.apply(PointerFrame { released: false }));
+        assert!(suppression.apply(PointerFrame { released: true }));
+        assert_eq!(suppression, FullscreenPrimarySuppression::Idle);
+
+        assert!(suppression.apply(TouchFrame {
+            suppresses_current_frame: true,
+            active: true,
+            completed: false,
+            cancelled: false,
+        }));
+        assert_eq!(suppression, FullscreenPrimarySuppression::TouchStream);
+        assert!(suppression.apply(TouchFrame {
+            suppresses_current_frame: true,
+            active: false,
+            completed: true,
+            cancelled: false,
+        }));
+        assert_eq!(
+            suppression,
+            FullscreenPrimarySuppression::Idle,
+            "touch completion is authoritative even without a primary release edge"
+        );
+
+        for _ in 0..2 {
+            assert!(suppression.apply(TouchFrame {
+                suppresses_current_frame: true,
+                active: false,
+                completed: true,
+                cancelled: false,
+            }));
+            assert_eq!(
+                suppression,
+                FullscreenPrimarySuppression::Idle,
+                "terminal replacement and its replay suppress only their own frame"
+            );
+        }
+
+        assert!(suppression.apply(TouchFrame {
+            suppresses_current_frame: true,
+            active: true,
+            completed: false,
+            cancelled: false,
+        }));
+        assert!(suppression.apply(TouchFrame {
+            suppresses_current_frame: false,
+            active: false,
+            completed: false,
+            cancelled: true,
+        }));
+        assert_eq!(suppression, FullscreenPrimarySuppression::Idle);
     }
 
     #[test]

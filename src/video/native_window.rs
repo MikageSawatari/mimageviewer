@@ -1404,7 +1404,7 @@ unsafe extern "system" fn wnd_proc(
             // 対応する down 記録が無ければ無視するし、egui も down 抜きの up を
             // click 扱いしないので副作用は出ない。
             //
-            // 画像フルスクリーン (ui_fullscreen.rs の fs_suppress_primary_until_release)
+            // 画像フルスクリーン (ui_fullscreen.rs の fs_primary_suppression)
             // と同じく左クリックのみ抑制し、右/中ボタンによるアクティブ化は通常通り
             // 通す (右クリック = フルスクリーン終了がそのまま走るのは画像側挙動と
             // 整合する)。LOWORD(lparam) == HTCLIENT で「クライアント領域上のクリック」
