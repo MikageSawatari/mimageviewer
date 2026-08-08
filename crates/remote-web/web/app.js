@@ -501,6 +501,7 @@ const state = {
   home: { places: [], smart_folders: [] },
   homeLoadError: "",
   homeTab: "places",
+  favoriteSearch: { query: "", kind: "all" },
   collection: null,
   container: null,
   gridSortState: null,
@@ -1361,6 +1362,10 @@ async function dispatchRoute() {
       await showCollection(route);
       return;
     }
+    if (route.kind === "search") {
+      await showFavoriteSearch(route);
+      return;
+    }
     if (route.kind === "folder") {
       await showFolder(route.favoriteId, route.path);
       return;
@@ -1441,14 +1446,14 @@ async function dispatchRoute() {
   }
 }
 
-function parseRoute(hash) {
+export function parseRoute(hash) {
   if (!hash) {
     return { kind: "home", tab: "places" };
   }
   if (hash === "#favorites") {
     return { kind: "home", tab: "favorites" };
   }
-  const home = hash.match(/^#home\/(favorites|smart|places)$/);
+  const home = hash.match(/^#home\/(favorites|smart|places|search)$/);
   if (home) {
     return { kind: "home", tab: home[1] };
   }
@@ -1461,6 +1466,18 @@ function parseRoute(hash) {
       collectionKind: collection[1],
       value: collection[2] ?? "",
     };
+  }
+  const search = hash.match(/^#search\/(all|folder|zip|pdf)\/(.*)$/);
+  if (search) {
+    try {
+      return {
+        kind: "search",
+        searchKind: search[1],
+        query: decodeURIComponent(search[2]),
+      };
+    } catch {
+      return { kind: "home", tab: "search" };
+    }
   }
   const addressed = hash.match(/^#(container|media)\/(.*)$/);
   if (addressed) {
@@ -1491,6 +1508,10 @@ function homeHash(tab) {
 
 function collectionHash(kind, value = "") {
   return `#collection/${kind}${value ? `/${encodeURIComponent(value)}` : ""}`;
+}
+
+export function favoriteSearchHash(query, kind = "all") {
+  return `#search/${kind}/${encodeURIComponent(query)}`;
 }
 
 function folderHash(favoriteId, path) {
@@ -1746,6 +1767,8 @@ function dispatchCommand(requested, meta = {}) {
   ) {
     const tab = state.collection?.kind === "smart"
       ? "smart"
+      : state.collection?.kind === "favorite_search"
+        ? "search"
       : state.favoriteId
         ? "favorites"
         : "places";
@@ -2282,7 +2305,9 @@ function cleanupScreen(preserveRequestController = null) {
 function renderHome(tab = "places") {
   cleanupScreen();
   state.screenContext = "home";
-  state.homeTab = ["favorites", "smart", "places"].includes(tab) ? tab : "places";
+  state.homeTab = ["favorites", "smart", "places", "search"].includes(tab)
+    ? tab
+    : "places";
   state.collection = null;
   state.container = null;
   exitBrowserFullscreen();
@@ -2303,6 +2328,7 @@ function renderHome(tab = "places") {
   content.append(hero, createHomeTabs(state.homeTab));
   if (state.homeTab === "favorites") renderFavoriteTab(content);
   else if (state.homeTab === "smart") renderSmartFolderTab(content);
+  else if (state.homeTab === "search") renderFavoriteSearchTab(content);
   else renderPlacesTab(content);
   screen.append(content);
   state.commandMenu = new CommandMenu(screen, "home");
@@ -2316,6 +2342,7 @@ function createHomeTabs(active) {
     ["favorites", "お気に入り"],
     ["smart", "スマートフォルダ"],
     ["places", "場所"],
+    ["search", "検索"],
   ]) {
     const button = textElement("button", label, "home-tab");
     button.type = "button";
@@ -2325,6 +2352,68 @@ function createHomeTabs(active) {
     tabs.append(button);
   }
   return tabs;
+}
+
+function renderFavoriteSearchTab(content) {
+  content.append(
+    textElement(
+      "p",
+      "お気に入りの中から、フォルダ・ZIP・PDF を名前で探します。",
+      "favorite-search-description"
+    )
+  );
+  const controls = createFavoriteSearchForm(state.favoriteSearch, ({ query, kind }) => {
+    state.favoriteSearch = { query, kind };
+    navigate(favoriteSearchHash(query, kind), {
+      returnHash: homeHash("search"),
+    });
+  });
+  content.append(controls.form);
+}
+
+export function createFavoriteSearchForm(initial, onSubmit) {
+  const form = element("form", "favorite-search-form");
+  const query = element("input", "favorite-search-input");
+  query.type = "search";
+  query.name = "q";
+  query.placeholder = "名前を入力";
+  query.autocomplete = "off";
+  query.maxLength = 200;
+  query.required = true;
+  query.value = initial?.query ?? "";
+  query.setAttribute("aria-label", "検索語句");
+
+  const kind = element("select", "favorite-search-kind");
+  kind.name = "kind";
+  kind.setAttribute("aria-label", "検索する種類");
+  for (const [value, label] of [
+    ["all", "すべて"],
+    ["folder", "フォルダ"],
+    ["zip", "ZIP"],
+    ["pdf", "PDF"],
+  ]) {
+    const option = textElement("option", label);
+    option.value = value;
+    option.selected = value === (initial?.kind ?? "all");
+    kind.append(option);
+  }
+  kind.value = ["all", "folder", "zip", "pdf"].includes(initial?.kind)
+    ? initial.kind
+    : "all";
+
+  const submit = textElement("button", "検索", "favorite-search-submit");
+  submit.type = "submit";
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const value = query.value.trim();
+    if (!value) {
+      query.focus();
+      return;
+    }
+    onSubmit({ query: value, kind: kind.value });
+  });
+  form.append(query, kind, submit);
+  return { form, query, kind, submit };
 }
 
 function renderFavoriteTab(content) {
@@ -2468,6 +2557,74 @@ async function showCollection(route) {
   setSinglePageGroups();
   state.gridIndex = 0;
   renderFolder();
+}
+
+async function showFavoriteSearch(route) {
+  state.favoriteSearch = { query: route.query, kind: route.searchKind };
+  renderLoading("検索しています");
+  const data = await apiJson("/api/search/favorites", {
+    q: route.query,
+    kind: route.searchKind,
+  });
+  const listing = data.listing ?? {};
+  const entries = listing.entries ?? [];
+  // 何を探した結果なのかは画面に残っていないと分からなくなる。語句は本体が返す題ではなく、
+  // こちらが持っている route の値から組み立てる (本体へ語句を返送させる理由が無い)。
+  const title = favoriteSearchResultTitle(route.query, listing.title);
+  state.collection = {
+    kind: "favorite_search",
+    value: route.searchKind,
+    title,
+    truncated: Boolean(listing.truncated),
+    entryLimit: Number(listing.entry_limit) || 0,
+    emptyMessage: favoriteSearchEmptyMessage(data.index_state, entries.length),
+  };
+  state.gridSortState = normalizeRemoteGridSortState(listing.sort_state);
+  state.gridSortScope = null;
+  state.container = null;
+  state.gridReturnHash = homeHash("search");
+  state.favoriteId = null;
+  state.gridHash = location.hash;
+  state.favoriteName = title;
+  state.folderPath = "";
+  state.thumbAspectHeightRatio =
+    Number.isFinite(Number(listing.thumb_aspect_height_ratio)) &&
+    Number(listing.thumb_aspect_height_ratio) > 0
+      ? Number(listing.thumb_aspect_height_ratio)
+      : 1;
+  state.entries = entries;
+  // 今のコンテナ索引は画像を返さないが、その前提をここにもう 1 つ置かない。集約ビューと
+  // 同じ導出にしておけば、返るものが変わってもセルの開き方が食い違わない。
+  state.images = state.entries.filter((entry) => entry.kind === "image");
+  setSinglePageGroups();
+  state.gridIndex = 0;
+  renderFolder();
+}
+
+const FAVORITE_SEARCH_TITLE_MAX_CHARS = 30;
+
+/// 結果画面の題。長い語句はパンくずを押し出すので表示だけ丸めるが、丸めるのは見た目に
+/// 限る (route と入力欄の語句はそのまま)。
+export function favoriteSearchResultTitle(query, fallback = "検索結果") {
+  const trimmed = (query ?? "").trim();
+  if (!trimmed) return fallback;
+  const characters = Array.from(trimmed);
+  const shown =
+    characters.length > FAVORITE_SEARCH_TITLE_MAX_CHARS
+      ? `${characters.slice(0, FAVORITE_SEARCH_TITLE_MAX_CHARS).join("")}…`
+      : trimmed;
+  return `「${shown}」の検索結果`;
+}
+
+export function favoriteSearchEmptyMessage(indexState, entryCount = 0) {
+  if (entryCount > 0) return "";
+  if (indexState === "disabled") {
+    return "お気に入りにコンテナ索引が設定されていません。mIV 本体のお気に入り編集で設定できます。";
+  }
+  if (indexState === "unavailable") {
+    return "コンテナ索引をまだ利用できません。しばらくしてからもう一度検索してください。";
+  }
+  return "一致するフォルダ・ZIP・PDF はありませんでした。";
 }
 
 function collectionRequestParams(route) {
@@ -3356,9 +3513,9 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
   if (!state.entries.length) {
     const empty = textElement(
       "p",
-      state.container
+      state.collection?.emptyMessage || (state.container
         ? "このコンテナには表示できるページがありません。"
-        : "このフォルダには表示できるサブフォルダまたは画像がありません。",
+        : "このフォルダには表示できるサブフォルダまたは画像がありません。"),
       "empty-state center-status"
     );
     scroll.replaceChildren(empty);

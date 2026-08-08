@@ -1523,8 +1523,9 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-ページ画素生成側の response identity を `PagePayload` に追加した 2026-08-08 時点の現行版は
-**v31**。`/api/page` と AI result の表示前照合は両側が v31 であることを前提とする。
+お気に入り横断のコンテナ検索を追加した 2026-08-08 時点の現行版は **v33**。
+`/api/page` と AI result の表示前照合、および `FavoriteSearch` は両側が v33 であることを
+前提とする。
 
 ### 13.6 残タスク (2026-08-01 時点)
 

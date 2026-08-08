@@ -8,10 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimageviewer_ipc::{
-    CollectionErrorCode, CollectionKind, MediaErrorCode, PagePriority, RemoteAddress,
-    RemoteAiJobError, RemoteAiJobErrorCode, RemoteAiStartRequest, RemoteEntryKind,
-    RemotePageRenderContext, RemoteReadingDirection, RemoteSessionIdentity, RemoteSpreadMode,
-    RemoteSubresource, RemoteWriteErrorCode, RemoteWriteRequest, SessionResponse, SessionStatus,
+    CollectionErrorCode, CollectionKind, FavoriteSearchIndexState, FavoriteSearchKind,
+    FavoriteSearchRequest, MediaErrorCode, PagePriority, RemoteAddress, RemoteAiJobError,
+    RemoteAiJobErrorCode, RemoteAiStartRequest, RemoteEntryKind, RemotePageRenderContext,
+    RemoteReadingDirection, RemoteSessionIdentity, RemoteSpreadMode, RemoteSubresource,
+    RemoteWriteErrorCode, RemoteWriteRequest, SessionResponse, SessionStatus,
     VideoStreamControlAction, VideoStreamErrorCode, VideoStreamJumpThumbnailPayload,
     VideoStreamPlaylistKind, VideoStreamQuality, VideoStreamSegmentIndex,
     VideoStreamSegmentPayload, VideoStreamThumbnailPayload,
@@ -499,7 +500,9 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
     let query_result = parse_query(raw_query);
     let query = match query_result {
         Ok(query) => query,
-        Err(()) => return HttpResponse::text(400, "Bad Request"),
+        Err(()) => {
+            return HttpResponse::text(400, "Bad Request").with_header("Cache-Control", "no-store");
+        }
     };
 
     let method = request.method().clone();
@@ -618,6 +621,11 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             api_home(state, remote_owner.expect("route guard checked session"))
         }
         (Method::Get, "/api/collection") => api_collection(
+            state,
+            &query,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Get, "/api/search/favorites") => api_favorite_search(
             state,
             &query,
             remote_owner.expect("route guard checked session"),
@@ -2149,6 +2157,80 @@ fn api_collection(
                 }))
         }
         Err(failure) => collection_ipc_error_response(failure, started.elapsed(), kind_name),
+    }
+}
+
+fn api_favorite_search(
+    state: &AppState,
+    query: &[(String, String)],
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
+    let search_query = match required_query_value(query, "q") {
+        Ok(value) => value,
+        Err(()) => {
+            return HttpResponse::text(400, "Bad Request").with_header("Cache-Control", "no-store");
+        }
+    };
+    let kind_name = match required_query_value(query, "kind") {
+        Ok(value) => value,
+        Err(()) => {
+            return HttpResponse::text(400, "Bad Request").with_header("Cache-Control", "no-store");
+        }
+    };
+    let kind = match kind_name {
+        "all" => FavoriteSearchKind::All,
+        "folder" => FavoriteSearchKind::Folder,
+        "zip" => FavoriteSearchKind::Zip,
+        "pdf" => FavoriteSearchKind::Pdf,
+        _ => {
+            return HttpResponse::text(400, "Bad Request").with_header("Cache-Control", "no-store");
+        }
+    };
+    let query_length = search_query.chars().count();
+    let started = Instant::now();
+    let result = match state.ipc_admission.run(IpcClass::Heavy, || {
+        state.thumbnail_client.favorite_search(
+            owner,
+            FavoriteSearchRequest {
+                query: search_query.to_owned(),
+                kind,
+            },
+        )
+    }) {
+        Ok(result) => result,
+        Err(busy) => return collection_admission_busy_response(busy, "favorite_search"),
+    };
+    match result {
+        Ok(mut result) => {
+            state
+                .library
+                .retain_allowed_remote_entries(&mut result.value.listing.entries);
+            let entry_count = result.value.listing.entries.len();
+            let index_state = match result.value.index_state {
+                FavoriteSearchIndexState::Ready => "ready",
+                FavoriteSearchIndexState::Disabled => "disabled",
+                FavoriteSearchIndexState::Unavailable => "unavailable",
+            };
+            HttpResponse::json(&result.value)
+                .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+                .with_header("Cache-Control", "no-store")
+                .with_log_details(json!({
+                    "favorite_search": {
+                        "query_length": query_length,
+                        "kind": kind_name,
+                        "entry_count": entry_count,
+                        "index_state": index_state,
+                        "ipc_status": "ok",
+                        "ipc_ms": crate::diagnostics::duration_ms(started.elapsed()),
+                        "ipc_retry_count": result.retry_count,
+                        "ipc_retry_statuses": result.retry_statuses,
+                        "ipc_connection_id": result.connection_id,
+                    }
+                }))
+        }
+        Err(failure) => {
+            collection_ipc_error_response(failure, started.elapsed(), "favorite_search")
+        }
     }
 }
 

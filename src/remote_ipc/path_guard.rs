@@ -40,23 +40,53 @@ pub(super) fn map_existing_to_favorite(
     favorites: &[FavoriteEntry],
     candidate: &Path,
 ) -> Option<FavoriteRelativePath> {
+    let roots = resolve_existing_favorite_roots(favorites);
+    map_existing_to_resolved_favorite(&roots, candidate)
+}
+
+pub(super) struct ResolvedFavoriteRoot<'a> {
+    favorite: &'a FavoriteEntry,
+    canonical_root: PathBuf,
+}
+
+/// 候補列を変換する前に favorite root を 1 回だけ解決する。
+/// offline の root はその root だけを除外し、残りの allowlist 判定を継続する。
+pub(super) fn resolve_existing_favorite_roots(
+    favorites: &[FavoriteEntry],
+) -> Vec<ResolvedFavoriteRoot<'_>> {
+    favorites
+        .iter()
+        .filter_map(|favorite| {
+            std::fs::canonicalize(&favorite.path)
+                .ok()
+                .map(|canonical_root| ResolvedFavoriteRoot {
+                    favorite,
+                    canonical_root,
+                })
+        })
+        .collect()
+}
+
+pub(super) fn map_existing_to_resolved_favorite(
+    roots: &[ResolvedFavoriteRoot<'_>],
+    candidate: &Path,
+) -> Option<FavoriteRelativePath> {
     let canonical = std::fs::canonicalize(candidate).ok()?;
-    let mut best: Option<(usize, &FavoriteEntry, PathBuf)> = None;
-    for favorite in favorites {
-        let root = std::fs::canonicalize(&favorite.path).ok()?;
-        if !path_starts_with(&canonical, &root) {
+    let mut best: Option<(usize, &ResolvedFavoriteRoot<'_>)> = None;
+    for root in roots {
+        if !path_starts_with(&canonical, &root.canonical_root) {
             continue;
         }
-        let depth = root.components().count();
+        let depth = root.canonical_root.components().count();
         if best
             .as_ref()
-            .is_none_or(|(best_depth, _, _)| depth > *best_depth)
+            .is_none_or(|(best_depth, _)| depth > *best_depth)
         {
-            best = Some((depth, favorite, root));
+            best = Some((depth, root));
         }
     }
-    let (_, favorite, root) = best?;
-    let relative = components_after_root(&canonical, &root)?;
+    let (_, root) = best?;
+    let relative = components_after_root(&canonical, &root.canonical_root)?;
     let relative_path = relative
         .components()
         .filter_map(|component| match component {
@@ -67,7 +97,7 @@ pub(super) fn map_existing_to_favorite(
         .collect::<Vec<_>>()
         .join("/");
     Some(FavoriteRelativePath {
-        favorite_id: favorite.id.to_string(),
+        favorite_id: root.favorite.id.to_string(),
         relative_path,
     })
 }
@@ -367,6 +397,23 @@ mod tests {
         assert_eq!(mapped.relative_path, "album/page.jpg");
         assert!(!Path::new(&mapped.relative_path).is_absolute());
         assert!(map_existing_to_favorite(&[favorite], &outside).is_none());
+    }
+
+    #[test]
+    fn missing_favorite_root_does_not_hide_an_existing_favorite_member() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_root = temp.path().join("missing");
+        let existing_root = temp.path().join("existing");
+        let page = existing_root.join("album/page.jpg");
+        std::fs::create_dir_all(page.parent().unwrap()).unwrap();
+        std::fs::write(&page, b"page").unwrap();
+        let missing = favorite(&missing_root);
+        let existing = favorite(&existing_root);
+
+        let mapped = map_existing_to_favorite(&[missing, existing.clone()], &page).unwrap();
+
+        assert_eq!(mapped.favorite_id, existing.id.to_string());
+        assert_eq!(mapped.relative_path, "album/page.jpg");
     }
 
     #[cfg(windows)]

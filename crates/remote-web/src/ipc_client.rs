@@ -8,21 +8,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mimageviewer_ipc::{
     ClientHello, ClientMessage, CollectionError, CollectionErrorCode, CollectionKind,
     CollectionPayload, CollectionRequest, CollectionResponse, ContainerPayload, ContainerRequest,
-    ContainerResponse, FolderListPayload, FolderListRequest, FolderListResponse, FrameError,
-    HomePayload, HomeRequest, HomeResponse, MAX_CONTROL_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES,
-    MediaError, MediaErrorCode, PIPE_NAME, PROTOCOL_VERSION, PagePayload, PagePriority,
-    PageRequest, PageResponse, REMOTE_AI_START_ACCEPT_BUDGET, RemoteAddress,
-    RemoteAiCancelResponse, RemoteAiJobError, RemoteAiJobSnapshot, RemoteAiRecoverableResponse,
-    RemoteAiResultResponse, RemoteAiStartRequest, RemoteAiStartResponse, RemoteAiStateResponse,
-    RemotePageRenderContext, RemoteSessionIdentity, RemoteWebConnectionInfo, RemoteWriteError,
-    RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult, RequestId,
-    ServerMessage, SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionResponse,
-    SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse,
-    VIDEO_STREAM_START_BUDGET, VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode,
-    VideoStreamJumpListPayload, VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind,
-    VideoStreamPlaylistPayload, VideoStreamQuality, VideoStreamResult, VideoStreamSeekPayload,
-    VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamStartPayload,
-    VideoStreamStatePayload, VideoStreamThumbnailPayload, read_frame, write_frame,
+    ContainerResponse, FavoriteSearchPayload, FavoriteSearchRequest, FavoriteSearchResponse,
+    FolderListPayload, FolderListRequest, FolderListResponse, FrameError, HomePayload, HomeRequest,
+    HomeResponse, MAX_CONTROL_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, MediaError, MediaErrorCode,
+    PIPE_NAME, PROTOCOL_VERSION, PagePayload, PagePriority, PageRequest, PageResponse,
+    REMOTE_AI_START_ACCEPT_BUDGET, RemoteAddress, RemoteAiCancelResponse, RemoteAiJobError,
+    RemoteAiJobSnapshot, RemoteAiRecoverableResponse, RemoteAiResultResponse, RemoteAiStartRequest,
+    RemoteAiStartResponse, RemoteAiStateResponse, RemotePageRenderContext, RemoteSessionIdentity,
+    RemoteWebConnectionInfo, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest,
+    RemoteWriteResponse, RemoteWriteResult, RequestId, ServerMessage, SessionAcquireRequest,
+    SessionPeerInfo, SessionPingRequest, SessionResponse, SessionStatus, ThumbnailError,
+    ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse, VIDEO_STREAM_START_BUDGET,
+    VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode, VideoStreamJumpListPayload,
+    VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind, VideoStreamPlaylistPayload,
+    VideoStreamQuality, VideoStreamResult, VideoStreamSeekPayload, VideoStreamSegmentIndex,
+    VideoStreamSegmentPayload, VideoStreamStartPayload, VideoStreamStatePayload,
+    VideoStreamThumbnailPayload, read_frame, write_frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -532,6 +533,48 @@ impl ThumbnailClient {
             }),
         })
     }
+
+    pub fn favorite_search(
+        &self,
+        owner: &RemoteSessionIdentity,
+        request: FavoriteSearchRequest,
+    ) -> Result<IpcSuccess<FavoriteSearchPayload>, ClientFailure> {
+        self.collection_request(|id| ClientMessage::FavoriteSearch {
+            id,
+            owner: owner.clone(),
+            request: request.clone(),
+        })
+        .and_then(|success| match success.value {
+            ServerMessage::FavoriteSearch {
+                response: FavoriteSearchResponse::Success(payload),
+                ..
+            } => Ok(IpcSuccess {
+                value: payload,
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+                connection_id: success.connection_id,
+            }),
+            ServerMessage::FavoriteSearch {
+                response: FavoriteSearchResponse::Error(error),
+                ..
+            } => Err(ClientFailure {
+                error: ClientError::CollectionRemote(error),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+            _ => Err(ClientFailure {
+                error: ClientError::Protocol(protocol_failure(
+                    "response_route",
+                    "response_type_mismatch",
+                    None,
+                    "favorite search request received another response type",
+                )),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+        })
+    }
+
     pub fn folder_list(
         &self,
         owner: &RemoteSessionIdentity,

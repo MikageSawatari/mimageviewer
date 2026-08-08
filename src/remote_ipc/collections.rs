@@ -3,14 +3,16 @@ use std::sync::Arc;
 
 use mimageviewer_ipc::{
     CollectionError, CollectionErrorCode, CollectionKind, CollectionPayload, CollectionRequest,
-    CollectionResponse, HomePayload, HomeResponse, PlaceKind, PlaceSummary, RemoteEntry,
-    RemoteEntryKind, SmartFolderSummary,
+    CollectionResponse, FavoriteSearchIndexState, FavoriteSearchKind, FavoriteSearchPayload,
+    FavoriteSearchRequest, FavoriteSearchResponse, HomePayload, HomeResponse, PlaceKind,
+    PlaceSummary, RemoteEntry, RemoteEntryKind, SmartFolderSummary,
 };
 
 use crate::grid_item::GridItem;
+use crate::search_index_db::{IndexEntry, IndexKind, SEARCH_RESULT_LIMIT, SearchIndexDb};
 use crate::settings::{FavoriteEntry, Settings};
 
-use super::path_guard::map_existing_to_favorite;
+use super::path_guard::{map_existing_to_resolved_favorite, resolve_existing_favorite_roots};
 
 const MAX_REMOTE_COLLECTION_ENTRIES: usize = 1000;
 
@@ -97,6 +99,127 @@ impl CollectionEngine {
         match result {
             Ok(payload) => CollectionResponse::Success(payload),
             Err(error) => CollectionResponse::Error(error),
+        }
+    }
+
+    /// Favorite search stays in CollectionEngine because it must share the collection
+    /// allowlist mapping, response bound, aspect ratio, and fixed-sort contract.
+    pub(super) fn favorite_search(&self, request: FavoriteSearchRequest) -> FavoriteSearchResponse {
+        match self.favorite_search_payload(request) {
+            Ok(payload) => FavoriteSearchResponse::Success(payload),
+            Err(error) => FavoriteSearchResponse::Error(error),
+        }
+    }
+
+    fn favorite_search_payload(
+        &self,
+        request: FavoriteSearchRequest,
+    ) -> Result<FavoriteSearchPayload, CollectionError> {
+        if request.query.trim().is_empty() {
+            return Err(CollectionError::new(
+                CollectionErrorCode::BadRequest,
+                "検索語句を入力してください",
+            ));
+        }
+        if request.query.chars().count() > 200 {
+            return Err(CollectionError::new(
+                CollectionErrorCode::BadRequest,
+                "検索語句は 200 文字以内で入力してください",
+            ));
+        }
+        let sort_order = self
+            .sort_settings
+            .load()
+            .map_err(|error| internal_error("最新の並び順を読み込めませんでした", error))?;
+        let favorites = self.favorite_roots.current().map_err(|error| {
+            crate::logger::log(format!("remote_ipc: {error}"));
+            CollectionError::new(
+                CollectionErrorCode::Internal,
+                "最新のお気に入りを読み込めませんでした",
+            )
+        })?;
+        if !favorites
+            .iter()
+            .any(|favorite| favorite.auto_index_structure)
+        {
+            return Ok(
+                self.favorite_search_state_payload(sort_order, FavoriteSearchIndexState::Disabled)
+            );
+        }
+
+        let db = match SearchIndexDb::open_readonly() {
+            Ok(db) => db,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "remote_ipc: favorite search index open failed: {error}"
+                ));
+                return Ok(self.favorite_search_state_payload(
+                    sort_order,
+                    FavoriteSearchIndexState::Unavailable,
+                ));
+            }
+        };
+        let roots = favorites
+            .iter()
+            .map(|favorite| favorite.path.clone())
+            .collect::<Vec<_>>();
+        let kind = match request.kind {
+            FavoriteSearchKind::All => None,
+            FavoriteSearchKind::Folder => Some(IndexKind::Folder),
+            FavoriteSearchKind::Zip => Some(IndexKind::ZipFile),
+            FavoriteSearchKind::Pdf => Some(IndexKind::PdfFile),
+        };
+        let index_entries = match db.search(
+            &request.query,
+            &roots,
+            kind,
+            crate::search_query::MatchMode::And,
+        ) {
+            Ok(entries) => entries,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "remote_ipc: favorite search index read failed: {error}"
+                ));
+                return Ok(self.favorite_search_state_payload(
+                    sort_order,
+                    FavoriteSearchIndexState::Unavailable,
+                ));
+            }
+        };
+        let (entries, truncated) = map_favorite_search_entries(&favorites, index_entries);
+        Ok(FavoriteSearchPayload {
+            listing: self.favorite_search_listing(sort_order, entries, truncated),
+            index_state: FavoriteSearchIndexState::Ready,
+        })
+    }
+
+    fn favorite_search_state_payload(
+        &self,
+        sort_order: crate::settings::SortOrder,
+        index_state: FavoriteSearchIndexState,
+    ) -> FavoriteSearchPayload {
+        FavoriteSearchPayload {
+            listing: self.favorite_search_listing(sort_order, Vec::new(), false),
+            index_state,
+        }
+    }
+
+    fn favorite_search_listing(
+        &self,
+        sort_order: crate::settings::SortOrder,
+        entries: Vec<RemoteEntry>,
+        truncated: bool,
+    ) -> CollectionPayload {
+        CollectionPayload {
+            title: "検索結果".to_owned(),
+            thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(&self.settings),
+            sort_state: super::remote_grid_sort_state(
+                sort_order,
+                Some(super::FIXED_LIST_SORT_LOCK_REASON),
+            ),
+            entries,
+            entry_limit: MAX_REMOTE_COLLECTION_ENTRIES,
+            truncated,
         }
     }
 
@@ -363,10 +486,19 @@ fn to_remote_entries(
     favorites: &[FavoriteEntry],
     candidates: Vec<CandidateEntry>,
 ) -> Vec<RemoteEntry> {
+    to_remote_entries_bounded(favorites, candidates, usize::MAX)
+}
+
+fn to_remote_entries_bounded(
+    favorites: &[FavoriteEntry],
+    candidates: Vec<CandidateEntry>,
+    mapped_limit: usize,
+) -> Vec<RemoteEntry> {
+    let roots = resolve_existing_favorite_roots(favorites);
     candidates
         .into_iter()
         .filter_map(|candidate| {
-            let mapped = map_existing_to_favorite(favorites, &candidate.path)?;
+            let mapped = map_existing_to_resolved_favorite(&roots, &candidate.path)?;
             Some(RemoteEntry {
                 favorite_id: mapped.favorite_id,
                 relative_path: mapped.relative_path,
@@ -382,7 +514,39 @@ fn to_remote_entries(
                 rating: candidate.rating,
             })
         })
+        .take(mapped_limit)
         .collect()
+}
+
+fn map_favorite_search_entries(
+    favorites: &[FavoriteEntry],
+    index_entries: Vec<IndexEntry>,
+) -> (Vec<RemoteEntry>, bool) {
+    let index_limit_reached = index_entries.len() == SEARCH_RESULT_LIMIT;
+    let candidates = index_entries
+        .into_iter()
+        .filter_map(|entry| {
+            let kind = match entry.kind {
+                IndexKind::Folder => RemoteEntryKind::Folder,
+                IndexKind::ZipFile => RemoteEntryKind::Zip,
+                IndexKind::PdfFile => RemoteEntryKind::Pdf,
+                IndexKind::VideoFile => return None,
+            };
+            Some(CandidateEntry {
+                path: entry.path,
+                name: entry.display_name,
+                kind,
+                detail: None,
+                progress_current: None,
+                progress_total: None,
+                rating: None,
+            })
+        })
+        .collect();
+    let entries =
+        to_remote_entries_bounded(favorites, candidates, MAX_REMOTE_COLLECTION_ENTRIES + 1);
+    let (entries, mapped_truncated) = bound_remote_entries(entries);
+    (entries, mapped_truncated || index_limit_reached)
 }
 
 fn candidate_from_grid_item(
@@ -626,6 +790,150 @@ mod tests {
             })
             .collect();
         let (entries, truncated) = bound_remote_entries(entries);
+        assert_eq!(entries.len(), MAX_REMOTE_COLLECTION_ENTRIES);
+        assert!(truncated);
+    }
+
+    fn favorite_with_container_index(path: PathBuf, enabled: bool) -> FavoriteEntry {
+        let mut favorite = FavoriteEntry::new("favorite".to_owned(), path);
+        favorite.auto_index_structure = enabled;
+        favorite
+    }
+
+    fn search_engine(favorite: FavoriteEntry) -> CollectionEngine {
+        CollectionEngine::new(Settings {
+            favorites: vec![favorite],
+            ..Default::default()
+        })
+    }
+
+    fn search_request(query: impl Into<String>) -> FavoriteSearchRequest {
+        FavoriteSearchRequest {
+            query: query.into(),
+            kind: FavoriteSearchKind::All,
+        }
+    }
+
+    fn search_success(response: FavoriteSearchResponse) -> FavoriteSearchPayload {
+        match response {
+            FavoriteSearchResponse::Success(payload) => payload,
+            FavoriteSearchResponse::Error(error) => panic!("unexpected search error: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn favorite_search_rejects_empty_and_overlong_queries() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = search_engine(favorite_with_container_index(
+            root.path().to_path_buf(),
+            true,
+        ));
+        for query in [String::new(), "   ".to_owned(), "あ".repeat(201)] {
+            let FavoriteSearchResponse::Error(error) =
+                engine.favorite_search(search_request(query))
+            else {
+                panic!("invalid query unexpectedly succeeded");
+            };
+            assert_eq!(error.code, CollectionErrorCode::BadRequest);
+        }
+    }
+
+    #[test]
+    fn favorite_search_is_disabled_without_a_container_index_favorite() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = search_engine(favorite_with_container_index(
+            root.path().to_path_buf(),
+            false,
+        ));
+
+        let payload = search_success(engine.favorite_search(search_request("album")));
+
+        assert_eq!(payload.index_state, FavoriteSearchIndexState::Disabled);
+        assert!(payload.listing.entries.is_empty());
+    }
+
+    #[test]
+    fn missing_search_index_is_unavailable_and_is_not_created() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = data_dir.path().join("favorite");
+        std::fs::create_dir(&root).unwrap();
+        let engine = search_engine(favorite_with_container_index(root, true));
+        let db_path = SearchIndexDb::db_path();
+        assert!(!db_path.exists());
+
+        let payload = search_success(engine.favorite_search(search_request("album")));
+
+        assert_eq!(payload.index_state, FavoriteSearchIndexState::Unavailable);
+        assert!(payload.listing.entries.is_empty());
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn favorite_search_drops_index_paths_outside_the_live_allowlist() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = data_dir.path().join("favorite");
+        let inside = root.join("match-inside");
+        let outside = data_dir.path().join("match-outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let favorite = favorite_with_container_index(root.clone(), true);
+        let db = SearchIndexDb::open_at(&SearchIndexDb::db_path()).unwrap();
+        db.upsert_children(
+            &root,
+            &root,
+            &[
+                IndexEntry {
+                    path: inside,
+                    display_name: "match-inside".to_owned(),
+                    kind: IndexKind::Folder,
+                    mtime: 0,
+                },
+                IndexEntry {
+                    path: outside,
+                    display_name: "match-outside".to_owned(),
+                    kind: IndexKind::Folder,
+                    mtime: 0,
+                },
+            ],
+        )
+        .unwrap();
+        drop(db);
+
+        let payload = search_success(
+            search_engine(favorite.clone()).favorite_search(search_request("match")),
+        );
+
+        assert_eq!(payload.index_state, FavoriteSearchIndexState::Ready);
+        assert_eq!(payload.listing.entries.len(), 1);
+        assert_eq!(
+            payload.listing.entries[0].favorite_id,
+            favorite.id.to_string()
+        );
+        assert_eq!(payload.listing.entries[0].relative_path, "match-inside");
+        assert!(!Path::new(&payload.listing.entries[0].relative_path).is_absolute());
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(!json.contains(&data_dir.path().to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn favorite_search_mapping_stops_at_one_over_the_response_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        let target = root.join("album");
+        std::fs::create_dir_all(&target).unwrap();
+        let favorite = favorite_with_container_index(root, true);
+        let index_entries = (0..=MAX_REMOTE_COLLECTION_ENTRIES)
+            .map(|index| IndexEntry {
+                path: target.clone(),
+                display_name: format!("album-{index}"),
+                kind: IndexKind::Folder,
+                mtime: 0,
+            })
+            .collect();
+
+        let (entries, truncated) =
+            map_favorite_search_entries(std::slice::from_ref(&favorite), index_entries);
+
         assert_eq!(entries.len(), MAX_REMOTE_COLLECTION_ENTRIES);
         assert!(truncated);
     }

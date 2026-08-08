@@ -116,7 +116,11 @@ const {
   browserDoubleTapTelemetryEvent,
   commandTelemetryEvent,
   containerInitialImageIndex,
+  createFavoriteSearchForm,
   createGridTile,
+  favoriteSearchEmptyMessage,
+  favoriteSearchHash,
+  favoriteSearchResultTitle,
   gridReturnItemIdentity,
   invalidateViewerPendingLoad,
   loadFolder,
@@ -126,6 +130,7 @@ const {
   normalizeRemoteGridSortState,
   normalizeRemoteViewTrimState,
   parentContainerAddress,
+  parseRoute,
   reloadApplication,
   remoteAiCompletionMessage,
   remoteAiProgressText,
@@ -254,6 +259,64 @@ test("browser double-tap telemetry keeps the measured suppression decision", () 
     exclusion_reason: null,
     event_cancelable: true,
   });
+});
+
+test("favorite search route preserves encoded query and kind", () => {
+  for (const kind of ["all", "folder", "zip", "pdf"]) {
+    const query = "表紙 / final% -draft";
+    assert.deepEqual(parseRoute(favoriteSearchHash(query, kind)), {
+      kind: "search",
+      searchKind: kind,
+      query,
+    });
+  }
+});
+
+test("favorite search distinguishes empty, disabled, and unavailable states", () => {
+  assert.equal(
+    favoriteSearchEmptyMessage("ready", 0),
+    "一致するフォルダ・ZIP・PDF はありませんでした。"
+  );
+  assert.match(favoriteSearchEmptyMessage("disabled", 0), /コンテナ索引が設定されていません/);
+  assert.match(favoriteSearchEmptyMessage("unavailable", 0), /まだ利用できません/);
+  assert.equal(favoriteSearchEmptyMessage("disabled", 1), "");
+});
+
+test("favorite search result title keeps the searched words on screen", () => {
+  assert.equal(favoriteSearchResultTitle("表紙"), "「表紙」の検索結果");
+  assert.equal(favoriteSearchResultTitle("  表紙  "), "「表紙」の検索結果");
+  assert.equal(favoriteSearchResultTitle(""), "検索結果");
+  // 丸めるのは表示だけ。文字単位で数えるので、サロゲートペアを割らない。
+  const long = "あ".repeat(40);
+  assert.equal(favoriteSearchResultTitle(long), `「${"あ".repeat(30)}…」の検索結果`);
+  assert.equal(
+    favoriteSearchResultTitle("🐈".repeat(31)),
+    `「${"🐈".repeat(30)}…」の検索結果`
+  );
+});
+
+test("favorite search runs only when the form is submitted", () => {
+  const submissions = [];
+  const controls = createFavoriteSearchForm(
+    { query: "前回の語句", kind: "zip" },
+    (value) => submissions.push(value)
+  );
+  assert.equal(controls.query.value, "前回の語句");
+  assert.equal(controls.kind.value, "zip");
+
+  controls.query.value = "次の語句";
+  controls.query.dispatchEvent({ type: "input" });
+  controls.kind.value = "pdf";
+  controls.kind.dispatchEvent({ type: "change" });
+  assert.deepEqual(submissions, []);
+
+  let prevented = 0;
+  controls.form.dispatchEvent({
+    type: "submit",
+    preventDefault() { prevented += 1; },
+  });
+  assert.equal(prevented, 1);
+  assert.deepEqual(submissions, [{ query: "次の語句", kind: "pdf" }]);
 });
 
 test("legacy image telemetry resolves rejection and folder route without entryIndex", () => {

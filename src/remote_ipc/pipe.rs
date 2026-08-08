@@ -5,12 +5,12 @@ use std::time::{Duration, Instant};
 
 use mimageviewer_ipc::{
     ClientHello, ClientMessage, CollectionError, CollectionErrorCode, CollectionResponse,
-    ContainerResponse, FolderListResponse, HomeResponse, MAX_CONTROL_FRAME_BYTES, MediaError,
-    MediaErrorCode, PIPE_NAME, PROTOCOL_VERSION, PagePriority, PageResponse, RemoteSessionIdentity,
-    RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, ServerMessage,
-    SessionResponse, SessionStatus, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse,
-    VideoStreamError, VideoStreamErrorCode, VideoStreamResult, VideoStreamThumbnailPayload,
-    negotiate, read_frame, write_frame,
+    ContainerResponse, FavoriteSearchResponse, FolderListResponse, HomeResponse,
+    MAX_CONTROL_FRAME_BYTES, MediaError, MediaErrorCode, PIPE_NAME, PROTOCOL_VERSION, PagePriority,
+    PageResponse, RemoteSessionIdentity, RemoteWriteError, RemoteWriteErrorCode,
+    RemoteWriteRequest, RemoteWriteResponse, ServerMessage, SessionResponse, SessionStatus,
+    ThumbnailError, ThumbnailErrorCode, ThumbnailResponse, VideoStreamError, VideoStreamErrorCode,
+    VideoStreamResult, VideoStreamThumbnailPayload, negotiate, read_frame, write_frame,
 };
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
@@ -461,6 +461,12 @@ fn worker_loop(
                         id,
                         response: collection_engine.collection(request),
                     },
+                    ClientMessage::FavoriteSearch { id, request, .. } => {
+                        ServerMessage::FavoriteSearch {
+                            id,
+                            response: collection_engine.favorite_search(request),
+                        }
+                    }
                     ClientMessage::FolderList { id, request, .. } => ServerMessage::FolderList {
                         id,
                         response: container_engine.folder_list(request),
@@ -1091,6 +1097,7 @@ fn request_kind(message: &ClientMessage) -> &'static str {
         ClientMessage::Thumbnail { .. } => "thumbnail",
         ClientMessage::Home { .. } => "home",
         ClientMessage::Collection { .. } => "collection",
+        ClientMessage::FavoriteSearch { .. } => "favorite_search",
         ClientMessage::FolderList { .. } => "folder_list",
         ClientMessage::Container { .. } => "container",
         ClientMessage::Page { request, .. } => match request.priority {
@@ -1148,6 +1155,7 @@ fn message_owner(message: &ClientMessage) -> Option<&RemoteSessionIdentity> {
         ClientMessage::Thumbnail { owner, .. }
         | ClientMessage::Home { owner, .. }
         | ClientMessage::Collection { owner, .. }
+        | ClientMessage::FavoriteSearch { owner, .. }
         | ClientMessage::Container { owner, .. }
         | ClientMessage::FolderList { owner, .. }
         | ClientMessage::Page { owner, .. }
@@ -1185,6 +1193,7 @@ fn operation_description(message: &ClientMessage) -> String {
         },
         ClientMessage::Home { .. } => "ホームを読み込み中".to_owned(),
         ClientMessage::Collection { .. } => "集約ビューを読み込み中".to_owned(),
+        ClientMessage::FavoriteSearch { .. } => "お気に入りを検索中".to_owned(),
         ClientMessage::Container { .. } => "コンテナを列挙中".to_owned(),
         ClientMessage::FolderList { .. } => "フォルダ一覧を読み込み中".to_owned(),
         ClientMessage::Page { request, .. } => match request.address.subresource {
@@ -1303,6 +1312,10 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
             response: CollectionResponse::Success(_),
             ..
         }
+        | ServerMessage::FavoriteSearch {
+            response: FavoriteSearchResponse::Success(_),
+            ..
+        }
         | ServerMessage::Container {
             response: ContainerResponse::Success(_),
             ..
@@ -1391,6 +1404,10 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
         }
         | ServerMessage::Collection {
             response: CollectionResponse::Error(_),
+            ..
+        }
+        | ServerMessage::FavoriteSearch {
+            response: FavoriteSearchResponse::Error(_),
             ..
         }
         | ServerMessage::Container {
@@ -2015,6 +2032,13 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
                 "mIV 本体の集約ビューワーカーが停止しています",
             )),
         },
+        ClientMessage::FavoriteSearch { id, .. } => ServerMessage::FavoriteSearch {
+            id: *id,
+            response: FavoriteSearchResponse::Error(CollectionError::new(
+                CollectionErrorCode::Internal,
+                "mIV 本体のお気に入り検索ワーカーが停止しています",
+            )),
+        },
         ClientMessage::Container { id, .. } => ServerMessage::Container {
             id: *id,
             response: ContainerResponse::Error(MediaError::new(
@@ -2145,6 +2169,13 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
             response: CollectionResponse::Error(CollectionError::new(
                 CollectionErrorCode::Busy,
                 "mIV 本体のリモート集約ビュー queue が混み合っています",
+            )),
+        },
+        ClientMessage::FavoriteSearch { id, .. } => ServerMessage::FavoriteSearch {
+            id: *id,
+            response: FavoriteSearchResponse::Error(CollectionError::new(
+                CollectionErrorCode::Busy,
+                "mIV 本体のお気に入り検索 queue が混み合っています",
             )),
         },
         ClientMessage::Container { id, .. } => ServerMessage::Container {

@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use rusqlite::{Connection, params};
 
+pub const SEARCH_RESULT_LIMIT: usize = 5000;
+
 // -----------------------------------------------------------------------
 // 種別
 // -----------------------------------------------------------------------
@@ -90,7 +92,7 @@ pub struct SearchIndexDb {
 impl SearchIndexDb {
     /// `%APPDATA%/mimageviewer/search_index.db` を開く (なければ作成)。
     pub fn open() -> rusqlite::Result<Self> {
-        let db_path = crate::data_dir::get().join("search_index.db");
+        let db_path = Self::db_path();
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -122,6 +124,28 @@ impl SearchIndexDb {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Open the existing index read-only without creating a file or schema.
+    pub fn open_readonly() -> rusqlite::Result<Self> {
+        Self::open_readonly_at(&Self::db_path())
+    }
+
+    pub fn open_readonly_at(db_path: &Path) -> rusqlite::Result<Self> {
+        let conn = Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(750))?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    pub fn db_path() -> PathBuf {
+        crate::data_dir::get().join("search_index.db")
     }
 
     /// 親フォルダ配下の指定アイテムを一括 upsert する。
@@ -386,7 +410,7 @@ impl SearchIndexDb {
              FROM entries \
              WHERE {where_sql} \
              ORDER BY display_name COLLATE NOCASE \
-             LIMIT 5000"
+             LIMIT {SEARCH_RESULT_LIMIT}"
         );
 
         let mut stmt = conn.prepare(&sql)?;

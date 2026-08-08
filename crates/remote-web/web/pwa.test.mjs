@@ -326,6 +326,18 @@ test("safe areas protect portrait bars and landscape side controls", async () =>
   assert.doesNotMatch(css, /\.screen > \.topbar > :not\(\.menu-trigger\)/);
 });
 
+test("favorite search keeps flexible home tabs and iOS-safe text input sizing", async () => {
+  const css = await readFile(new URL("styles.css", here), "utf8");
+  assert.match(
+    css,
+    /\.home-tabs\s*\{[^}]*grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(72px,\s*1fr\)\)/
+  );
+  assert.match(
+    css,
+    /\.favorite-search-input,[\s\S]*\.favorite-search-kind\s*\{[^}]*font-size:\s*16px/
+  );
+});
+
 test("still-image panel reserves the agreed viewport while its transparent shield owns input", async () => {
   const css = await readFile(new URL("styles.css", here), "utf8");
   const app = await readFile(new URL("app.js", here), "utf8");

@@ -464,7 +464,7 @@ select {
 .home-tabs {
   display: grid;
   max-width: 720px;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
   margin: 0 auto 18px;
   padding: 4px;
   border: 1px solid var(--line);
@@ -488,6 +488,47 @@ select {
   background: var(--surface-raised);
   box-shadow: 0 3px 12px rgb(0 0 0 / 22%);
   color: #fff;
+}
+
+.favorite-search-description {
+  max-width: 720px;
+  margin: 0 auto 12px;
+  color: var(--muted);
+  line-height: 1.65;
+}
+
+.favorite-search-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(96px, auto) auto;
+  max-width: 720px;
+  margin: 0 auto;
+  gap: 8px;
+}
+
+.favorite-search-input,
+.favorite-search-kind,
+.favorite-search-submit {
+  min-height: 46px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.favorite-search-input,
+.favorite-search-kind {
+  min-width: 0;
+  padding: 9px 11px;
+  background: #171b23;
+  color: #f2f4f8;
+  font-size: 16px;
+}
+
+.favorite-search-submit {
+  padding: 9px 16px;
+  background: var(--accent-strong);
+  color: #fff;
+  font-size: 0.95rem;
+  font-weight: 700;
+  cursor: pointer;
 }
 
 .place-list {
