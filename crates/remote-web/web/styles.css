@@ -14,6 +14,12 @@
 
 * {
   box-sizing: border-box;
+  /* この repo に double-tap zoom を割り当てたい要素は 1 つも無い。`touch-action` は継承
+     しないので、祖先だけの宣言では実際に触れた要素まで届かない。個々の tap 対象へ書き足す
+     運用を 28 箇所続けても、素のテキストや余白は漏れ続ける。意図は最初から「どこにも
+     割り当てない」なので、そう書く。別の値が要る部品 (seek bar の none、スライダーの
+     pan-y など) は class 側の指定が詳細度で勝つ。 */
+  touch-action: manipulation;
 }
 
 /* The HTML hidden contract must win over every component's layout display. */
