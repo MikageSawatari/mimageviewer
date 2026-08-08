@@ -2282,6 +2282,49 @@ export function sessionOwnerBadge(status) {
   return { owner: "active", label: "操作中" };
 }
 
+/// ピンチ中の倍率とパン。指の間に挟んだ点が指の間に留まるようにする。
+///
+/// 変換は `translate(pan) scale(s)` で原点は中央なので、内容の点 u は
+/// `v = origin + pan + s * u` の位置に出る。開始時に指の中心にあった点を今の指の中心へ
+/// 持ってくると `pan = center - origin - (s / s0) * (startCenter - origin - startPan)`。
+/// 倍率の比を掛けないと、倍率が変わった分だけ内容がずれる。縮小では画面外まで飛ぶ。
+export function pinchTransformDecision({
+  startScale,
+  startPanX,
+  startPanY,
+  startCenterX,
+  startCenterY,
+  originX,
+  originY,
+  centerX,
+  centerY,
+  ratio,
+  minScale = VIEWER_MIN_SCALE,
+  maxScale = VIEWER_MAX_SCALE,
+}) {
+  const from = Math.max(minScale, Number(startScale) || 1);
+  const scale = Math.min(
+    maxScale,
+    Math.max(minScale, from * (Number(ratio) || 1))
+  );
+  // clamp 後の倍率で補正する。clamp 前の比で補正すると、上限や下限に張り付いた後も
+  // パンだけが動き続けて内容が逃げていく。
+  const applied = scale / from;
+  return {
+    scale,
+    panX:
+      (Number(centerX) || 0) -
+      (Number(originX) || 0) -
+      applied *
+        ((Number(startCenterX) || 0) - (Number(originX) || 0) - (Number(startPanX) || 0)),
+    panY:
+      (Number(centerY) || 0) -
+      (Number(originY) || 0) -
+      applied *
+        ((Number(startCenterY) || 0) - (Number(originY) || 0) - (Number(startPanY) || 0)),
+  };
+}
+
 export function reduceViewerTransform(current, requested) {
   let scale = current.scale;
   let panX = current.panX;

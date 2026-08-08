@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  pinchTransformDecision,
   VIEWER_MAX_SCALE,
   VIEWER_MIN_SCALE,
   CommandName,
@@ -2437,4 +2438,42 @@ test("zooming out is not stopped at the size the picture happens to be laid out 
     zoomed = reduceViewerTransform(zoomed, { name: CommandName.ZOOM_IN });
   }
   assert.equal(zoomed.scale, VIEWER_MAX_SCALE);
+});
+
+test("a pinch keeps the point between the fingers between the fingers", () => {
+  // origin 100 に中心があり、指の中心 300 の下にある内容の点は、開始時 (倍率 1・パン 0) で
+  // 中心から 200 の位置。半分に縮めても、その点は指の中心の下に残るべき。
+  const shrink = pinchTransformDecision({
+    startScale: 1,
+    startPanX: 0,
+    startPanY: 0,
+    startCenterX: 300,
+    startCenterY: 300,
+    originX: 100,
+    originY: 100,
+    centerX: 300,
+    centerY: 300,
+    ratio: 0.5,
+  });
+  assert.equal(shrink.scale, 0.5);
+  // origin + pan + s * u = 100 + 100 + 0.5 * 200 = 300
+  assert.equal(shrink.panX, 100);
+  assert.equal(shrink.panY, 100);
+
+  // 指を動かさず倍率も変えなければ、何も動かない。
+  const still = pinchTransformDecision({
+    startScale: 2,
+    startPanX: 40,
+    startPanY: -20,
+    startCenterX: 250,
+    startCenterY: 150,
+    originX: 100,
+    originY: 100,
+    centerX: 250,
+    centerY: 150,
+    ratio: 1,
+  });
+  assert.equal(still.scale, 2);
+  assert.equal(still.panX, 40);
+  assert.equal(still.panY, -20);
 });

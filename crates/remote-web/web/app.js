@@ -62,6 +62,7 @@ import {
   shouldShowKeyboardShortcuts,
   viewerGestureDecision,
   viewerDragOwnershipDecision,
+  pinchTransformDecision,
   VIEWER_MAX_SCALE,
   VIEWER_MIN_SCALE,
   viewerPanelGestureAction,
@@ -9306,12 +9307,17 @@ export class ImageViewer {
       this.pinched = false;
     } else if (this.pointers.size === 2) {
       const [first, second] = [...this.pointers.values()];
+      // 変換前の中央位置。倍率は中央を動かさないので、今の矩形の中心からパンを引けば出る。
+      // ジェスチャ開始時に 1 度だけ測り、移動中は測らない。
+      const layer = this.pageLayer.getBoundingClientRect();
       this.pinch = {
         distance: distance(first, second),
         scale: this.scale,
         center: midpoint(first, second),
         panX: this.panX,
         panY: this.panY,
+        originX: layer.left + layer.width / 2 - this.panX,
+        originY: layer.top + layer.height / 2 - this.panY,
       };
       this.pinched = true;
     }
@@ -9327,11 +9333,18 @@ export class ImageViewer {
       const center = midpoint(first, second);
       const ratio = distance(first, second) / Math.max(1, this.pinch.distance);
       dispatchCommand(
-        command(CommandName.SET_TRANSFORM, {
-          scale: clamp(this.pinch.scale * ratio, VIEWER_MIN_SCALE, VIEWER_MAX_SCALE),
-          panX: this.pinch.panX + center.x - this.pinch.center.x,
-          panY: this.pinch.panY + center.y - this.pinch.center.y,
-        }),
+        command(CommandName.SET_TRANSFORM, pinchTransformDecision({
+          startScale: this.pinch.scale,
+          startPanX: this.pinch.panX,
+          startPanY: this.pinch.panY,
+          startCenterX: this.pinch.center.x,
+          startCenterY: this.pinch.center.y,
+          originX: this.pinch.originX,
+          originY: this.pinch.originY,
+          centerX: center.x,
+          centerY: center.y,
+          ratio,
+        })),
         {
           source: pointerInputSource(event.pointerType),
           detail: "pinch_move",
