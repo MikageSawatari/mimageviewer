@@ -490,8 +490,7 @@ select {
   color: #fff;
 }
 
-.favorite-search-description,
-.tag-count-note {
+.favorite-search-description {
   max-width: 720px;
   margin: 0 auto 12px;
   color: var(--muted);

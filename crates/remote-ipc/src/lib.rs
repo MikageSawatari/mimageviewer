@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 35;
+pub const PROTOCOL_VERSION: u32 = 36;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -58,7 +58,7 @@ pub fn negotiate(client_version: u32) -> ServerHello {
 pub struct RemoteAddress {
     /// 許可された起点の ID。
     ///
-    /// 現在はお気に入りの UUID しか入らないが、お気に入り以外の起点も入り得る設計である。
+    /// お気に入り UUID または登録済み項目の正規化 path から導出した UUID が入る。
     /// この値を直接お気に入り一覧から引く処理は、解決器の外に書かないこと。
     pub root_id: String,
     pub relative_path: String,
@@ -162,6 +162,8 @@ pub struct FolderListEntry {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct FolderListPayload {
     pub effective_address: RemoteAddress,
+    /// 起点の種類を公開せずパンくず先頭を表示するための名前。
+    pub root_name: String,
     pub thumb_aspect_height_ratio: f64,
     pub sort_state: RemoteGridSortState,
     pub entries: Vec<FolderListEntry>,
@@ -760,6 +762,8 @@ pub struct PageGroup {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ContainerPayload {
     pub title: String,
+    /// 起点の種類を公開せずパンくず先頭を表示するための名前。
+    pub root_name: String,
     pub kind: ContainerKind,
     /// ZIP の単一ラッパー自動降下後など、実際に表示している位置。
     pub effective_address: RemoteAddress,
@@ -2228,6 +2232,7 @@ mod tests {
             id: 49,
             response: FolderListResponse::Success(FolderListPayload {
                 effective_address: RemoteAddress::file("favorite", "movies"),
+                root_name: "Fixture".to_owned(),
                 thumb_aspect_height_ratio: 9.0 / 16.0,
                 sort_state: test_sort_state(None),
                 entries: vec![FolderListEntry {
@@ -2258,9 +2263,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v35_page_identity_session_epoch_auto_trim_partner_video_and_audio_status_round_trip()
-     {
-        assert_eq!(PROTOCOL_VERSION, 35);
+    fn protocol_v36_registered_roots_page_identity_and_session_state_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 36);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -2398,6 +2402,7 @@ mod tests {
             id: 44,
             response: ContainerResponse::Success(ContainerPayload {
                 title: "book.pdf".to_owned(),
+                root_name: "Fixture".to_owned(),
                 kind: ContainerKind::Pdf,
                 effective_address: container,
                 entries: Vec::new(),

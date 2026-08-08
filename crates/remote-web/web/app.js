@@ -1783,7 +1783,7 @@ function dispatchCommand(requested, meta = {}) {
       ? state.gridReturnHash
       : state.folderPath
         ? folderHash(state.rootId, parentPath(state.folderPath))
-        : homeHash("favorites");
+        : state.gridReturnHash;
     rememberParentGridReturnTarget(target);
     navigate(target);
     handled = true;
@@ -2539,14 +2539,6 @@ function loadTagBrowseOnce() {
 }
 
 function renderTagBrowseTab(content) {
-  content.append(
-    textElement(
-      "p",
-      "件数は mIV 全体の数です。この端末から開けるのはお気に入りの中だけです。",
-      "tag-count-note"
-    )
-  );
-
   const form = element("form", "tag-browse-form");
   const query = element("input", "tag-filter-input");
   query.type = "search";
@@ -3065,6 +3057,12 @@ function containerForceSinglePage(options = {}) {
 
 function applyContainerData(address, data, forceSinglePage, options = {}) {
   const effectiveAddress = data.effective_address ?? address;
+  const rootReturnHash = rootOpenReturnHash({
+    hasCollection: Boolean(state.collection),
+    relativePath: effectiveAddress.relative_path,
+    collectionHash: state.gridHash,
+    fallbackHash: containerParentHash(address),
+  });
   state.collection = null;
   state.container = {
     kind: data.kind,
@@ -3084,8 +3082,9 @@ function applyContainerData(address, data, forceSinglePage, options = {}) {
   state.gridSortScope = { kind: "address", address: effectiveAddress };
   state.rootId = effectiveAddress.root_id;
   state.favoriteName =
+    data.root_name ??
     state.favorites.find((favorite) => favorite.id === state.rootId)?.name ??
-    "お気に入り";
+    "項目";
   state.folderPath = effectiveAddress.relative_path;
   state.entries = data.entries ?? [];
   state.images = state.entries.filter((entry) => entry.kind === "image");
@@ -3114,7 +3113,7 @@ function applyContainerData(address, data, forceSinglePage, options = {}) {
     data.kind === "folder"
       ? folderHash(effectiveAddress.root_id, effectiveAddress.relative_path)
       : containerHash(effectiveAddress);
-  state.gridReturnHash = containerParentHash(address);
+  state.gridReturnHash = rootReturnHash;
 }
 
 export function containerInitialImageIndex({ openMode, resumePage, images }) {
@@ -3127,6 +3126,15 @@ export function containerInitialImageIndex({ openMode, resumePage, images }) {
     if (resumeIndex >= 0) return resumeIndex;
   }
   return 0;
+}
+
+export function rootOpenReturnHash({
+  hasCollection,
+  relativePath,
+  collectionHash,
+  fallbackHash,
+}) {
+  return hasCollection && !relativePath ? collectionHash : fallbackHash;
 }
 
 function setSinglePageGroups() {
@@ -3695,6 +3703,12 @@ export async function loadFolder(
   ) {
     return null;
   }
+  const rootReturnHash = rootOpenReturnHash({
+    hasCollection: Boolean(state.collection),
+    relativePath: requestedPath,
+    collectionHash: state.gridHash,
+    fallbackHash: homeHash("favorites"),
+  });
   state.collection = null;
   state.container = null;
   state.gridSortState = normalizeRemoteGridSortState(data.sort_state);
@@ -3706,10 +3720,12 @@ export async function loadFolder(
       subresource: { kind: "file" },
     },
   };
-  state.gridReturnHash = homeHash("favorites");
+  state.gridReturnHash = rootReturnHash;
   state.rootId = rootId;
   state.favoriteName =
-    state.favorites.find((favorite) => favorite.id === rootId)?.name ?? "お気に入り";
+    data.root_name ??
+    state.favorites.find((favorite) => favorite.id === rootId)?.name ??
+    "項目";
   state.folderPath = data.path ?? "";
   state.gridHash = folderHash(rootId, state.folderPath);
   state.thumbAspectHeightRatio =
@@ -4135,11 +4151,11 @@ export function createGridTile(
       tile.addEventListener("click", (event) => {
         const index = imageIndexes.get(entryIdentity(entry));
         if (index !== undefined) {
-          const payload = entry.address
+          const payload = entry.address || entryPath(entry) === ""
             ? {
                 kind: "media",
                 mediaKind: "image",
-                address: entry.address,
+                address: entryAddress(entry),
                 imageIndex: index,
                 entryIndex,
               }

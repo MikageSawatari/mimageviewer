@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use image::GenericImageView;
 use mimageviewer_ipc::{ContainerEntry, FolderListEntry, RemoteAddress, RemoteEntry};
+use mimageviewer_registered_roots::{RegisteredRootCatalog, RegisteredRootsSnapshot};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use uuid::Uuid;
@@ -114,6 +115,7 @@ pub struct ImageMetrics {
 struct LibrarySnapshot {
     favorites: Vec<FavoriteRoot>,
     by_id: HashMap<Uuid, usize>,
+    registered: Arc<RegisteredRootsSnapshot>,
     sort_order: Option<String>,
 }
 
@@ -126,6 +128,7 @@ struct LibraryState {
     snapshot: Arc<LibrarySnapshot>,
     settings: Option<ObservedDatabase>,
     view_trim: Option<ObservedDatabase>,
+    registered: Option<RegisteredRootCatalog>,
     generation_counter: u64,
     generation: String,
 }
@@ -154,12 +157,26 @@ impl Library {
 
     #[cfg(test)]
     fn from_test_favorites(favorites: Vec<FavoriteRoot>) -> Self {
+        Self::from_test_roots(favorites, RegisteredRootsSnapshot::empty())
+    }
+
+    #[cfg(test)]
+    fn with_registered_for_test(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self::from_test_roots(Vec::new(), RegisteredRootsSnapshot::from_paths(paths))
+    }
+
+    #[cfg(test)]
+    fn from_test_roots(
+        favorites: Vec<FavoriteRoot>,
+        registered: Arc<RegisteredRootsSnapshot>,
+    ) -> Self {
         let prefix = "test".to_owned();
         Self {
             state: Mutex::new(LibraryState {
-                snapshot: Arc::new(library_snapshot(favorites, None)),
+                snapshot: Arc::new(library_snapshot(favorites, registered, None)),
                 settings: None,
                 view_trim: None,
+                registered: None,
                 generation_counter: 1,
                 generation: format!("{prefix}-1"),
             }),
@@ -177,6 +194,9 @@ impl Library {
         settings.data_version = data_version;
         let view_trim_path = data_dir.join("view_trim.db");
         let view_trim = open_observed_database(&view_trim_path)?;
+        let registered = RegisteredRootCatalog::open(data_dir).map_err(registered_store_error)?;
+        let registered_snapshot = registered.snapshot();
+        log_registered_limit(registered_snapshot.as_ref());
         let mut generation_seed = [0_u8; 16];
         getrandom::fill(&mut generation_seed).map_err(|error| {
             StoreError::Io(std::io::Error::other(format!(
@@ -186,9 +206,10 @@ impl Library {
         let generation_prefix = Uuid::from_bytes(generation_seed).simple().to_string();
         Ok(Self {
             state: Mutex::new(LibraryState {
-                snapshot: Arc::new(library_snapshot(favorites, sort_order)),
+                snapshot: Arc::new(library_snapshot(favorites, registered_snapshot, sort_order)),
                 settings: Some(settings),
                 view_trim,
+                registered: Some(registered),
                 generation_counter: 1,
                 generation: format!("{generation_prefix}-1"),
             }),
@@ -240,10 +261,7 @@ impl Library {
             let Ok(id) = Uuid::parse_str(&entry.root_id) else {
                 return false;
             };
-            let Some(favorite) = favorite_from_snapshot(&snapshot, id) else {
-                return false;
-            };
-            resolve_existing(&favorite.path, &entry.relative_path).is_ok()
+            resolve_root_path_in(&snapshot, id, &entry.relative_path).is_ok()
         });
     }
 
@@ -278,8 +296,7 @@ impl Library {
             return Err(StoreError::BadRequest);
         }
         let id = Uuid::parse_str(&address.root_id).map_err(|_| StoreError::BadRequest)?;
-        let favorite = self.favorite(id)?;
-        let path = resolve_existing(&favorite.path, &address.relative_path)?;
+        let path = self.resolve_root_path(id, &address.relative_path)?;
         let metadata = std::fs::metadata(&path)?;
         if metadata.is_file() && classify_path(&path) == EntryKind::Image {
             Ok(())
@@ -288,7 +305,7 @@ impl Library {
         }
     }
 
-    /// HTTP 層でも favorite allowlist と canonical containment を検証する。
+    /// HTTP 層でも root allowlist と canonical containment を検証する。
     /// 本体 IPC は同じ不変条件を独立に再検証するため、これは多重防御の外側である。
     pub(crate) fn validate_remote_file_video(
         &self,
@@ -301,8 +318,7 @@ impl Library {
             return Err(StoreError::BadRequest);
         }
         let id = Uuid::parse_str(&address.root_id).map_err(|_| StoreError::BadRequest)?;
-        let favorite = self.favorite(id)?;
-        let path = resolve_existing(&favorite.path, &address.relative_path)?;
+        let path = self.resolve_root_path(id, &address.relative_path)?;
         let metadata = std::fs::metadata(&path)?;
         if metadata.is_file() && classify_path(&path) == EntryKind::Video {
             Ok(())
@@ -321,15 +337,14 @@ impl Library {
 
     pub fn image(
         &self,
-        favorite_id: Uuid,
+        root_id: Uuid,
         relative: &str,
         requested_width: u32,
     ) -> Result<ImageResult, StoreError> {
         if requested_width == 0 || requested_width > MAX_IMAGE_WIDTH {
             return Err(StoreError::BadRequest);
         }
-        let favorite = self.favorite(favorite_id)?;
-        let image_path = resolve_existing(&favorite.path, relative)?;
+        let image_path = self.resolve_root_path(root_id, relative)?;
         let metadata = require_image_file(&image_path)?;
 
         let probe = image_support::probe_image(&image_path).ok_or(StoreError::Decode)?;
@@ -395,22 +410,19 @@ impl Library {
 
     pub fn image_info(
         &self,
-        favorite_id: Uuid,
+        root_id: Uuid,
         relative: &str,
     ) -> Result<ImageInfoResponse, StoreError> {
-        let favorite = self.favorite(favorite_id)?;
-        let image_path = resolve_existing(&favorite.path, relative)?;
+        let image_path = self.resolve_root_path(root_id, relative)?;
         require_image_file(&image_path)?;
         let probe = image_support::probe_image(&image_path).ok_or(StoreError::Decode)?;
         let (width, height) = probe.oriented_dimensions();
         Ok(ImageInfoResponse { width, height })
     }
 
-    fn favorite(&self, id: Uuid) -> Result<FavoriteRoot, StoreError> {
+    fn resolve_root_path(&self, id: Uuid, relative: &str) -> Result<PathBuf, StoreError> {
         let (snapshot, _) = self.snapshot(false)?;
-        favorite_from_snapshot(&snapshot, id)
-            .cloned()
-            .ok_or(StoreError::NotFound)
+        resolve_root_path_in(&snapshot, id, relative)
     }
 
     fn snapshot(
@@ -419,6 +431,7 @@ impl Library {
     ) -> Result<(Arc<LibrarySnapshot>, String), StoreError> {
         let mut state = self.state.lock().map_err(|_| StoreError::BadRequest)?;
         let mut changed = refresh_settings_snapshot(&mut state, self.settings_path.as_deref())?;
+        changed |= refresh_registered_roots(&mut state)?;
         if include_view_trim {
             changed |=
                 refresh_observed_database(&mut state.view_trim, self.view_trim_path.as_deref())?;
@@ -431,7 +444,11 @@ impl Library {
     }
 }
 
-fn library_snapshot(favorites: Vec<FavoriteRoot>, sort_order: Option<String>) -> LibrarySnapshot {
+fn library_snapshot(
+    favorites: Vec<FavoriteRoot>,
+    registered: Arc<RegisteredRootsSnapshot>,
+    sort_order: Option<String>,
+) -> LibrarySnapshot {
     let by_id = favorites
         .iter()
         .enumerate()
@@ -440,6 +457,7 @@ fn library_snapshot(favorites: Vec<FavoriteRoot>, sort_order: Option<String>) ->
     LibrarySnapshot {
         favorites,
         by_id,
+        registered,
         sort_order,
     }
 }
@@ -459,9 +477,32 @@ fn validate_remote_address_in(
         .validate_syntax()
         .map_err(|_| StoreError::BadRequest)?;
     let id = Uuid::parse_str(&address.root_id).map_err(|_| StoreError::BadRequest)?;
-    let favorite = favorite_from_snapshot(snapshot, id).ok_or(StoreError::NotFound)?;
-    resolve_existing(&favorite.path, &address.relative_path)?;
+    resolve_root_path_in(snapshot, id, &address.relative_path)?;
     Ok(())
+}
+
+/// The only remote-web root resolver. Callers never branch on favorite versus registered roots.
+fn resolve_root_path_in(
+    snapshot: &LibrarySnapshot,
+    id: Uuid,
+    relative: &str,
+) -> Result<PathBuf, StoreError> {
+    if let Some(favorite) = favorite_from_snapshot(snapshot, id) {
+        return resolve_existing(&favorite.path, relative).map_err(Into::into);
+    }
+    snapshot
+        .registered
+        .resolve_existing(id, relative)
+        .map(|resolved| resolved.canonical)
+        .map_err(|error| match error {
+            mimageviewer_registered_roots::ResolveError::InvalidRelativePath
+            | mimageviewer_registered_roots::ResolveError::FileRootHasRelativePath => {
+                StoreError::BadRequest
+            }
+            mimageviewer_registered_roots::ResolveError::RootNotFound
+            | mimageviewer_registered_roots::ResolveError::Unavailable
+            | mimageviewer_registered_roots::ResolveError::EscapesRoot => StoreError::NotFound,
+        })
 }
 
 fn refresh_settings_snapshot(
@@ -491,8 +532,50 @@ fn refresh_settings_snapshot(
     if favorites == state.snapshot.favorites && sort_order == state.snapshot.sort_order {
         return Ok(false);
     }
-    state.snapshot = Arc::new(library_snapshot(favorites, sort_order));
+    state.snapshot = Arc::new(library_snapshot(
+        favorites,
+        Arc::clone(&state.snapshot.registered),
+        sort_order,
+    ));
     Ok(true)
+}
+
+fn refresh_registered_roots(state: &mut LibraryState) -> Result<bool, StoreError> {
+    let Some(registered) = state.registered.as_mut() else {
+        return Ok(false);
+    };
+    if !registered.refresh().map_err(registered_store_error)? {
+        return Ok(false);
+    }
+    let registered = registered.snapshot();
+    log_registered_limit(registered.as_ref());
+    state.snapshot = Arc::new(library_snapshot(
+        state.snapshot.favorites.clone(),
+        registered,
+        state.snapshot.sort_order.clone(),
+    ));
+    Ok(true)
+}
+
+fn registered_store_error(error: mimageviewer_registered_roots::CatalogError) -> StoreError {
+    match error {
+        mimageviewer_registered_roots::CatalogError::Busy => StoreError::Busy,
+        mimageviewer_registered_roots::CatalogError::Io(error) => StoreError::Io(error),
+        mimageviewer_registered_roots::CatalogError::Database(error) => StoreError::Db(error),
+        mimageviewer_registered_roots::CatalogError::InvalidSetting { .. } => {
+            StoreError::BadRequest
+        }
+    }
+}
+
+fn log_registered_limit(snapshot: &RegisteredRootsSnapshot) {
+    if snapshot.limit_reached() {
+        eprintln!(
+            "remote-web: registered root limit reached discovered={} retained={}",
+            snapshot.discovered_count(),
+            snapshot.roots().len()
+        );
+    }
 }
 
 fn refresh_observed_database(
@@ -769,6 +852,134 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "safe.jpg");
+    }
+
+    #[test]
+    fn double_validation_accepts_registered_granularity_and_subresources_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip = temp.path().join("book.zip");
+        let pdf = temp.path().join("book.pdf");
+        let folder = temp.path().join("album");
+        let child = folder.join("page.jpg");
+        let unknown = temp.path().join("unknown.jpg");
+        std::fs::write(&zip, b"zip").unwrap();
+        std::fs::write(&pdf, b"pdf").unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(&child, b"page").unwrap();
+        std::fs::write(&unknown, b"unknown").unwrap();
+        let library = Library::with_registered_for_test([zip.clone(), pdf.clone(), folder.clone()]);
+        let zip_id = mimageviewer_registered_roots::registered_root_id(&zip).to_string();
+        let pdf_id = mimageviewer_registered_roots::registered_root_id(&pdf).to_string();
+        let folder_id = mimageviewer_registered_roots::registered_root_id(&folder).to_string();
+
+        let zip_entry = RemoteAddress {
+            root_id: zip_id.clone(),
+            relative_path: String::new(),
+            subresource: RemoteSubresource::ZipEntry {
+                entry_name: "chapter/001.jpg".to_owned(),
+            },
+        };
+        let pdf_page = RemoteAddress {
+            root_id: pdf_id,
+            relative_path: String::new(),
+            subresource: RemoteSubresource::PdfPage { page_number: 0 },
+        };
+        assert!(library.validate_remote_address(&zip_entry).is_ok());
+        assert!(library.validate_remote_address(&pdf_page).is_ok());
+        assert!(
+            library
+                .validate_remote_address(&RemoteAddress::file(folder_id, "page.jpg"))
+                .is_ok()
+        );
+        assert!(matches!(
+            library.validate_remote_address(&RemoteAddress::file(zip_id.clone(), "sibling.jpg")),
+            Err(StoreError::BadRequest)
+        ));
+        assert!(matches!(
+            library.validate_remote_address(&RemoteAddress::file(
+                mimageviewer_registered_roots::registered_root_id(temp.path()).to_string(),
+                "book.zip"
+            )),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            library.validate_remote_address(&RemoteAddress::file(
+                mimageviewer_registered_roots::registered_root_id(&unknown).to_string(),
+                ""
+            )),
+            Err(StoreError::NotFound)
+        ));
+
+        let remote_entry = |root_id: String, relative_path: &str, name: &str| RemoteEntry {
+            root_id,
+            relative_path: relative_path.to_owned(),
+            name: name.to_owned(),
+            kind: RemoteEntryKind::Zip,
+            detail: None,
+            progress_current: None,
+            progress_total: None,
+            rating: None,
+        };
+        let mut entries = vec![
+            remote_entry(zip_id, "", "book.zip"),
+            remote_entry(
+                mimageviewer_registered_roots::registered_root_id(&unknown).to_string(),
+                "",
+                "unknown.jpg",
+            ),
+        ];
+        library.retain_allowed_remote_entries(&mut entries);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "book.zip");
+        let json = serde_json::to_string(&entries).unwrap();
+        assert!(!json.contains(temp.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn live_double_validation_rejects_a_path_after_its_tag_is_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let tagged = temp.path().join("tagged.jpg");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(&tagged, b"tagged").unwrap();
+        Connection::open(data_dir.join("settings.db"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE favorites (
+                    id BLOB PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    sort_index INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        let tags = Connection::open(data_dir.join("tags.db")).unwrap();
+        tags.execute_batch("CREATE TABLE item_tags (item_key TEXT NOT NULL);")
+            .unwrap();
+        tags.execute(
+            "INSERT INTO item_tags VALUES (?1)",
+            [tagged.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+
+        let library = Library::load(&data_dir).unwrap();
+        let address = RemoteAddress::file(
+            mimageviewer_registered_roots::registered_root_id(&tagged).to_string(),
+            "",
+        );
+        assert!(library.validate_remote_address(&address).is_ok());
+        let before = library.remote_state().unwrap().remote_state_generation;
+
+        tags.execute("DELETE FROM item_tags", []).unwrap();
+
+        assert!(matches!(
+            library.validate_remote_address(&address),
+            Err(StoreError::NotFound)
+        ));
+        assert_ne!(
+            library.remote_state().unwrap().remote_state_generation,
+            before
+        );
     }
 
     #[test]

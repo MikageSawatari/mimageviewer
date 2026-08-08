@@ -10,13 +10,11 @@ use mimageviewer_ipc::{
 };
 
 use super::container::ContainerEngine;
-use super::path_guard::{
-    ResolveError, ResolvedFavoritePath, canonicalize_within, resolve_existing,
-};
+use super::path_guard::{ResolveError, ResolvedRootPath, canonicalize_within, resolve_existing};
 
 pub(super) struct ThumbnailEngine {
     settings: Arc<crate::settings::Settings>,
-    favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
+    roots: Arc<super::live_favorites::RemoteRoots>,
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
     inflight: Mutex<HashMap<RequestKey, Arc<Flight>>>,
 }
@@ -81,13 +79,13 @@ struct Flight {
 }
 
 impl ThumbnailEngine {
-    pub(super) fn new_with_favorite_roots(
+    pub(super) fn new_with_roots(
         settings: crate::settings::Settings,
-        favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
+        roots: Arc<super::live_favorites::RemoteRoots>,
     ) -> Self {
         Self {
             settings: Arc::new(settings),
-            favorite_roots,
+            roots,
             stats: Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
             inflight: Mutex::new(HashMap::new()),
         }
@@ -176,18 +174,18 @@ impl ThumbnailEngine {
         {
             return container_engine.thumbnail(request, context);
         }
-        let favorites = match self.favorite_roots.current() {
-            Ok(favorites) => favorites,
+        let roots = match self.roots.current() {
+            Ok(roots) => roots,
             Err(error) => {
                 crate::logger::log(format!("remote_ipc: {error}"));
                 return error_response(
                     ThumbnailErrorCode::Internal,
-                    "最新のお気に入りを読み込めませんでした",
+                    "最新の閲覧起点を読み込めませんでした",
                 );
             }
         };
         let resolved = match resolve_existing(
-            &favorites,
+            &roots,
             &request.address.root_id,
             &request.address.relative_path,
         ) {
@@ -202,7 +200,7 @@ impl ThumbnailEngine {
 
     fn generate_resolved(
         &self,
-        resolved: &ResolvedFavoritePath,
+        resolved: &ResolvedRootPath,
         target_px: u32,
         context: &WorkerContext,
     ) -> Result<Vec<u8>, ThumbnailResponse> {
@@ -226,7 +224,7 @@ impl ThumbnailEngine {
         let parent = resolved.logical.parent().ok_or_else(|| {
             error_response(
                 ThumbnailErrorCode::PathRejected,
-                "お気に入り root 自体のサムネイルは要求できません",
+                "閲覧起点自体のサムネイルは要求できません",
             )
         })?;
         let use_full_path_key = crate::path_key::is_drive_or_share_root(parent);
@@ -491,11 +489,11 @@ fn resolve_error_response(error: ResolveError) -> ThumbnailResponse {
             ThumbnailErrorCode::BadRequest,
             "root_id または相対パスが不正です",
         ),
-        ResolveError::FavoriteNotFound => error_response(
+        ResolveError::RootNotFound => error_response(
             ThumbnailErrorCode::FavoriteNotFound,
             "お気に入りが登録されていません",
         ),
-        ResolveError::EscapesFavorite => error_response(
+        ResolveError::EscapesRoot => error_response(
             ThumbnailErrorCode::PathRejected,
             "お気に入りの外へ出るパスは拒否されました",
         ),

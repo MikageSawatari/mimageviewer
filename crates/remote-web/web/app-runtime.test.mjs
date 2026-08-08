@@ -138,6 +138,7 @@ const {
   remoteAiPollingDelay,
   remoteBookBookmarkDisplayPage,
   remoteBookBookmarkTargetEntryIndex,
+  rootOpenReturnHash,
   resolveLegacyImageOpenRoute,
   resolveMediaOpenRoute,
   selectRecoverableRemoteAiJob,
@@ -522,6 +523,21 @@ test("container opening resumes the matching page and otherwise falls back safel
     resumePage: images[1].address,
     images,
   }), -1);
+});
+
+test("a collection root returns to its list without exposing a root kind", () => {
+  assert.equal(rootOpenReturnHash({
+    hasCollection: true,
+    relativePath: "",
+    collectionHash: "#collection/rating/5",
+    fallbackHash: "#folder/root",
+  }), "#collection/rating/5");
+  assert.equal(rootOpenReturnHash({
+    hasCollection: true,
+    relativePath: "books/book.zip",
+    collectionHash: "#collection/rating/5",
+    fallbackHash: "#folder/favorite/books",
+  }), "#folder/favorite/books");
 });
 
 test("every iPhone viewer menu page stays within the fixed action limit", () => {
@@ -929,6 +945,34 @@ test("plain image media routes resolve their containing folder", () => {
       subresource: { kind: "file" },
     }
   );
+});
+
+test("a registered image root opens by its empty-path address", () => {
+  const rootId = "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2";
+  const dispatched = [];
+  const tile = createGridTile(
+    { kind: "image", name: "outside.jpg", root_id: rootId, relative_path: "" },
+    0,
+    { get: () => 0 },
+    null,
+    180,
+    (requested, meta) => dispatched.push({ requested, meta })
+  );
+
+  tile.dispatchEvent({ type: "click", detail: 1, pointerType: "touch" });
+
+  assert.equal(dispatched.length, 1);
+  assert.deepEqual(dispatched[0].requested.payload, {
+    kind: "media",
+    mediaKind: "image",
+    address: {
+      root_id: rootId,
+      relative_path: "",
+      subresource: { kind: "file" },
+    },
+    imageIndex: 0,
+    entryIndex: 0,
+  });
 });
 
 test("tapping a video grid tile preserves the video route", () => {

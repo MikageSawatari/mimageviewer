@@ -3157,15 +3157,16 @@ mod tests {
         let root_id = favorite.id.to_string();
         let mut settings = crate::settings::Settings::default();
         settings.favorites = vec![favorite.clone()];
+        let roots = crate::remote_ipc::live_favorites::AllowedRootsSnapshot {
+            favorites: std::sync::Arc::new(vec![favorite]),
+            registered: mimageviewer_registered_roots::RegisteredRootsSnapshot::empty(),
+        };
 
         for relative in ["", "album/book.zip"] {
             let address = mimageviewer_ipc::RemoteAddress::file(&root_id, relative);
-            let worker = crate::remote_ipc::path_guard::resolve_existing(
-                std::slice::from_ref(&favorite),
-                &root_id,
-                relative,
-            )
-            .unwrap();
+            let worker =
+                crate::remote_ipc::path_guard::resolve_existing(&roots, &root_id, relative)
+                    .unwrap();
             let ui_key = remote_spread_key(&settings, &address).unwrap();
             assert_eq!(ui_key.exact, worker.logical, "relative={relative:?}");
         }

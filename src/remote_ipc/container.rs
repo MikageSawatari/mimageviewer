@@ -16,7 +16,7 @@ use mimageviewer_ipc::{
     ThumbnailResponse,
 };
 
-use super::path_guard::{ResolveError, ResolvedFavoritePath, resolve_existing};
+use super::path_guard::{ResolveError, ResolvedRootPath, resolve_existing};
 use super::thumbnail::WorkerContext;
 
 const CONTAINER_ENTRY_LIMIT: usize = 1000;
@@ -84,7 +84,7 @@ fn harmonized_remote_auto_bbox(
 
 fn remote_auto_trim_cache_key(
     address: &RemoteAddress,
-    resolved: &ResolvedFavoritePath,
+    resolved: &ResolvedRootPath,
     mtime: i64,
     file_size: i64,
     target_px: u32,
@@ -101,7 +101,7 @@ fn remote_auto_trim_cache_key(
 pub(super) struct ContainerEngine {
     settings: Arc<crate::settings::Settings>,
     sort_settings: super::RemoteSortSettingsSource,
-    favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
+    roots: Arc<super::live_favorites::RemoteRoots>,
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
     pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
     pdf_page_counts: Mutex<HashMap<PdfIdentity, u32>>,
@@ -492,7 +492,7 @@ struct ValidatedPageContext {
 }
 
 struct PreparedZipBookmarkList {
-    resolved: ResolvedFavoritePath,
+    resolved: ResolvedRootPath,
     tree: crate::zip_tree::ZipTree,
 }
 
@@ -523,12 +523,11 @@ impl ContainerEngine {
         let adjustment_settings = AdjustmentSettingsSource::Snapshot(
             crate::settings_db::AdjustmentRenderSettings::from_settings(&settings),
         );
-        let favorite_roots =
-            super::live_favorites::RemoteFavoriteRoots::snapshot(settings.favorites.clone());
+        let roots = super::live_favorites::RemoteRoots::snapshot(settings.favorites.clone());
         let sort_settings = super::RemoteSortSettingsSource::Snapshot(settings.sort_order);
         Self::new_inner(
             settings,
-            favorite_roots,
+            roots,
             None,
             None,
             adjustment_settings,
@@ -539,11 +538,11 @@ impl ContainerEngine {
     pub(super) fn new_with_session(
         settings: crate::settings::Settings,
         session: super::session::SessionHandle,
-        favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
+        roots: Arc<super::live_favorites::RemoteRoots>,
     ) -> Self {
         Self::new_inner(
             settings,
-            favorite_roots,
+            roots,
             Some(ResumeReader::Session(session.clone())),
             Some(session),
             AdjustmentSettingsSource::Live,
@@ -559,12 +558,11 @@ impl ContainerEngine {
         let adjustment_settings = AdjustmentSettingsSource::Snapshot(
             crate::settings_db::AdjustmentRenderSettings::from_settings(&settings),
         );
-        let favorite_roots =
-            super::live_favorites::RemoteFavoriteRoots::snapshot(settings.favorites.clone());
+        let roots = super::live_favorites::RemoteRoots::snapshot(settings.favorites.clone());
         let sort_settings = super::RemoteSortSettingsSource::Snapshot(settings.sort_order);
         Self::new_inner(
             settings,
-            favorite_roots,
+            roots,
             Some(ResumeReader::Error(error)),
             None,
             adjustment_settings,
@@ -574,7 +572,7 @@ impl ContainerEngine {
 
     fn new_inner(
         settings: crate::settings::Settings,
-        favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
+        roots: Arc<super::live_favorites::RemoteRoots>,
         resume_reader: Option<ResumeReader>,
         session: Option<super::session::SessionHandle>,
         adjustment_settings: AdjustmentSettingsSource,
@@ -605,7 +603,7 @@ impl ContainerEngine {
         Self {
             settings: Arc::new(settings),
             sort_settings,
-            favorite_roots,
+            roots,
             stats: Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
             pdf_passwords: crate::pdf_passwords::PdfPasswordStore::load(),
             pdf_page_counts: Mutex::new(HashMap::new()),
@@ -1047,6 +1045,7 @@ impl ContainerEngine {
             .collect::<Vec<_>>();
         let response = FolderListResponse::Success(FolderListPayload {
             effective_address: request.address,
+            root_name: resolved.root_name,
             thumb_aspect_height_ratio,
             sort_state: super::remote_grid_sort_state(
                 if sort_locked {
@@ -1799,14 +1798,8 @@ impl ContainerEngine {
         &self,
         address: &RemoteAddress,
         context_address: &RemoteAddress,
-    ) -> Result<
-        (
-            ResolvedFavoritePath,
-            String,
-            crate::zip_loader::ZipEnumeration,
-        ),
-        RemoteWriteError,
-    > {
+    ) -> Result<(ResolvedRootPath, String, crate::zip_loader::ZipEnumeration), RemoteWriteError>
+    {
         if address.relative_path != context_address.relative_path {
             return Err(RemoteWriteError::new(
                 RemoteWriteErrorCode::BadRequest,
@@ -2080,18 +2073,18 @@ impl ContainerEngine {
         response
     }
 
-    fn resolve(&self, address: &RemoteAddress) -> Result<ResolvedFavoritePath, MediaError> {
+    fn resolve(&self, address: &RemoteAddress) -> Result<ResolvedRootPath, MediaError> {
         address
             .validate_syntax()
             .map_err(|_| media_error(MediaErrorCode::BadRequest, "コンテンツアドレスが不正です"))?;
-        let favorites = self.favorite_roots.current().map_err(|error| {
+        let roots = self.roots.current().map_err(|error| {
             crate::logger::log(format!("remote_ipc: {error}"));
             media_error(
                 MediaErrorCode::Internal,
-                "最新のお気に入りを読み込めませんでした",
+                "最新の閲覧起点を読み込めませんでした",
             )
         })?;
-        resolve_existing(&favorites, &address.root_id, &address.relative_path)
+        resolve_existing(&roots, &address.root_id, &address.relative_path)
             .map_err(resolve_media_error)
     }
 
@@ -2178,7 +2171,7 @@ impl ContainerEngine {
         decode_source: &dyn Fn(
             &Self,
             &RemoteAddress,
-            &ResolvedFavoritePath,
+            &ResolvedRootPath,
             &std::fs::Metadata,
             usize,
             &Arc<AtomicBool>,
@@ -2511,7 +2504,7 @@ impl ContainerEngine {
     fn decode_remote_ai_source(
         &self,
         address: &RemoteAddress,
-        resolved: &ResolvedFavoritePath,
+        resolved: &ResolvedRootPath,
         metadata: &std::fs::Metadata,
         page_index: usize,
         cancel: &Arc<AtomicBool>,
@@ -2598,7 +2591,7 @@ impl ContainerEngine {
     fn enumerate(
         &self,
         request: &ContainerRequest,
-        resolved: &ResolvedFavoritePath,
+        resolved: &ResolvedRootPath,
     ) -> Result<ContainerPayload, MediaError> {
         let metadata = std::fs::metadata(&resolved.canonical)
             .map_err(|_| media_error(MediaErrorCode::NotFound, "コンテナが見つかりません"))?;
@@ -2671,7 +2664,7 @@ impl ContainerEngine {
     fn enumerate_folder(
         &self,
         request: &ContainerRequest,
-        resolved: &ResolvedFavoritePath,
+        resolved: &ResolvedRootPath,
     ) -> Result<ContainerPayload, MediaError> {
         if !matches!(request.address.subresource, RemoteSubresource::File) {
             return Err(media_error(
@@ -2710,6 +2703,7 @@ impl ContainerEngine {
         let spread = self.spread_payload(request, resolved, &items, None);
         Ok(ContainerPayload {
             title: container_title(&resolved.logical),
+            root_name: resolved.root_name.clone(),
             kind: ContainerKind::Folder,
             effective_address: request.address.clone(),
             entries,
@@ -2735,7 +2729,7 @@ impl ContainerEngine {
     fn enumerate_zip(
         &self,
         request: &ContainerRequest,
-        resolved: &ResolvedFavoritePath,
+        resolved: &ResolvedRootPath,
     ) -> Result<ContainerPayload, MediaError> {
         let address = &request.address;
         let requested_prefix = match &address.subresource {
@@ -2832,6 +2826,7 @@ impl ContainerEngine {
         );
         Ok(ContainerPayload {
             title: container_title(&resolved.logical),
+            root_name: resolved.root_name.clone(),
             kind: ContainerKind::Zip,
             effective_address: RemoteAddress {
                 root_id: address.root_id.clone(),
@@ -2869,7 +2864,7 @@ impl ContainerEngine {
     fn enumerate_pdf(
         &self,
         request: &ContainerRequest,
-        resolved: &ResolvedFavoritePath,
+        resolved: &ResolvedRootPath,
         metadata: &std::fs::Metadata,
     ) -> Result<ContainerPayload, MediaError> {
         let address = &request.address;
@@ -2908,6 +2903,7 @@ impl ContainerEngine {
         let spread = self.spread_payload(request, resolved, &items, None);
         Ok(ContainerPayload {
             title: container_title(&resolved.logical),
+            root_name: resolved.root_name.clone(),
             kind: ContainerKind::Pdf,
             effective_address: address.clone(),
             entries,
@@ -2933,7 +2929,7 @@ impl ContainerEngine {
     fn spread_payload(
         &self,
         request: &ContainerRequest,
-        resolved: &ResolvedFavoritePath,
+        resolved: &ResolvedRootPath,
         items: &[crate::grid_item::GridItem],
         zip_context: Option<(&[String], &Path)>,
     ) -> SpreadPayload {
@@ -3004,7 +3000,7 @@ impl ContainerEngine {
     fn remote_view_trim_plan(
         &self,
         page_address: &RemoteAddress,
-        resolved: &ResolvedFavoritePath,
+        resolved: &ResolvedRootPath,
         render_context: Option<&RemotePageRenderContext>,
     ) -> Result<RemoteViewTrimPlan, MediaError> {
         let keys = self.remote_view_trim_keys(page_address, resolved, render_context)?;
@@ -3107,7 +3103,7 @@ impl ContainerEngine {
     fn remote_auto_trim_bbox(
         &self,
         address: &RemoteAddress,
-        resolved: &ResolvedFavoritePath,
+        resolved: &ResolvedRootPath,
         target_px: u32,
         foreground: bool,
         context: &WorkerContext,
@@ -3158,7 +3154,7 @@ impl ContainerEngine {
     fn remote_view_trim_keys(
         &self,
         page_address: &RemoteAddress,
-        resolved: &ResolvedFavoritePath,
+        resolved: &ResolvedRootPath,
         render_context: Option<&RemotePageRenderContext>,
     ) -> Result<crate::spread_db::SpreadContainerKey, MediaError> {
         let Some(render_context) = render_context else {
@@ -3275,7 +3271,7 @@ impl ContainerEngine {
     fn load_image(
         &self,
         address: &RemoteAddress,
-        resolved: &ResolvedFavoritePath,
+        resolved: &ResolvedRootPath,
         target_px: u32,
         load_kind: RemoteImageLoadKind,
         foreground: bool,
@@ -3592,7 +3588,7 @@ impl ContainerEngine {
 
     fn ensure_pdf_page_in_range(
         &self,
-        resolved: &ResolvedFavoritePath,
+        resolved: &ResolvedRootPath,
         metadata: &std::fs::Metadata,
         page_number: u32,
     ) -> Result<(), MediaError> {
@@ -3604,7 +3600,7 @@ impl ContainerEngine {
     /// password_required も保持する専用テーブルが正本になる。
     fn pdf_page_count(
         &self,
-        resolved: &ResolvedFavoritePath,
+        resolved: &ResolvedRootPath,
         metadata: &std::fs::Metadata,
     ) -> Result<u32, MediaError> {
         let identity = PdfIdentity {
@@ -4428,11 +4424,11 @@ fn resolve_media_error(error: ResolveError) -> MediaError {
             MediaErrorCode::BadRequest,
             "root_id または相対パスが不正です",
         ),
-        ResolveError::FavoriteNotFound => media_error(
+        ResolveError::RootNotFound => media_error(
             MediaErrorCode::FavoriteNotFound,
             "お気に入りが登録されていません",
         ),
-        ResolveError::EscapesFavorite => media_error(
+        ResolveError::EscapesRoot => media_error(
             MediaErrorCode::PathRejected,
             "お気に入りの外へ出るパスは拒否されました",
         ),
@@ -5121,7 +5117,7 @@ mod tests {
         };
         let decode = |_engine: &ContainerEngine,
                       address: &RemoteAddress,
-                      _resolved: &ResolvedFavoritePath,
+                      _resolved: &ResolvedRootPath,
                       _metadata: &std::fs::Metadata,
                       page_index: usize,
                       _cancel: &Arc<AtomicBool>| {

@@ -1,48 +1,112 @@
 use std::sync::{Arc, Mutex};
 
+use mimageviewer_registered_roots::{RegisteredRootCatalog, RegisteredRootsSnapshot};
+
 use crate::settings::FavoriteEntry;
 
-enum FavoriteRootsSource {
-    Live(crate::settings_db::SettingsFavoritesReader),
-    Snapshot(Arc<Vec<FavoriteEntry>>),
+pub(super) struct AllowedRootsSnapshot {
+    pub favorites: Arc<Vec<FavoriteEntry>>,
+    pub registered: Arc<RegisteredRootsSnapshot>,
 }
 
-/// Remote IPC 内の全 allowlist consumer が共有する最新 favorite roots。
+enum RootsSource {
+    Live {
+        favorites: crate::settings_db::SettingsFavoritesReader,
+        registered: RegisteredRootCatalog,
+    },
+    Snapshot {
+        favorites: Arc<Vec<FavoriteEntry>>,
+        registered: Arc<RegisteredRootsSnapshot>,
+    },
+}
+
+/// Every Remote IPC allowlist consumer shares this one current root snapshot.
 ///
-/// production は専用 read-only SQLite connection の `data_version` を request ごとに確認し、
-/// 変更時だけ全件を読み直す。test constructor は明示 snapshot のままにして GLOBAL_DB と分離する。
-pub(super) struct RemoteFavoriteRoots {
-    source: Mutex<FavoriteRootsSource>,
+/// Production checks persistent read-only SQLite connections' `data_version` on every request.
+/// Test constructors remain explicit snapshots so they stay isolated from GLOBAL_DB.
+pub(super) struct RemoteRoots {
+    source: Mutex<RootsSource>,
 }
 
-impl RemoteFavoriteRoots {
+impl RemoteRoots {
     pub(super) fn live(initial: Vec<FavoriteEntry>) -> Result<Arc<Self>, String> {
-        let path = crate::data_dir::get().join("settings.db");
-        let reader =
-            crate::settings_db::SettingsFavoritesReader::open_existing_read_only_at(&path, initial)
-                .map_err(|error| format!("remote favorites read-only open failed: {error}"))?;
+        let data_dir = crate::data_dir::get();
+        let settings_path = data_dir.join("settings.db");
+        let favorites = crate::settings_db::SettingsFavoritesReader::open_existing_read_only_at(
+            &settings_path,
+            initial,
+        )
+        .map_err(|error| format!("remote favorites read-only open failed: {error}"))?;
+        let registered = RegisteredRootCatalog::open(&data_dir)
+            .map_err(|error| format!("remote registered roots read-only open failed: {error}"))?;
+        log_registered_limit(registered.snapshot().as_ref());
         Ok(Arc::new(Self {
-            source: Mutex::new(FavoriteRootsSource::Live(reader)),
+            source: Mutex::new(RootsSource::Live {
+                favorites,
+                registered,
+            }),
         }))
     }
 
     pub(super) fn snapshot(initial: Vec<FavoriteEntry>) -> Arc<Self> {
+        Self::snapshot_with_registered(initial, RegisteredRootsSnapshot::empty())
+    }
+
+    pub(super) fn snapshot_with_registered(
+        initial: Vec<FavoriteEntry>,
+        registered: Arc<RegisteredRootsSnapshot>,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            source: Mutex::new(FavoriteRootsSource::Snapshot(Arc::new(initial))),
+            source: Mutex::new(RootsSource::Snapshot {
+                favorites: Arc::new(initial),
+                registered,
+            }),
         })
     }
 
-    pub(super) fn current(&self) -> Result<Arc<Vec<FavoriteEntry>>, String> {
+    pub(super) fn current(&self) -> Result<AllowedRootsSnapshot, String> {
         let mut source = self
             .source
             .lock()
-            .map_err(|_| "remote favorites lock poisoned".to_owned())?;
+            .map_err(|_| "remote roots lock poisoned".to_owned())?;
         match &mut *source {
-            FavoriteRootsSource::Live(reader) => reader
-                .current()
-                .map_err(|error| format!("remote favorites refresh failed: {error}")),
-            FavoriteRootsSource::Snapshot(favorites) => Ok(Arc::clone(favorites)),
+            RootsSource::Live {
+                favorites,
+                registered,
+            } => {
+                let favorites = favorites
+                    .current()
+                    .map_err(|error| format!("remote favorites refresh failed: {error}"))?;
+                let changed = registered
+                    .refresh()
+                    .map_err(|error| format!("remote registered roots refresh failed: {error}"))?;
+                let registered = registered.snapshot();
+                if changed {
+                    log_registered_limit(registered.as_ref());
+                }
+                Ok(AllowedRootsSnapshot {
+                    favorites,
+                    registered,
+                })
+            }
+            RootsSource::Snapshot {
+                favorites,
+                registered,
+            } => Ok(AllowedRootsSnapshot {
+                favorites: Arc::clone(favorites),
+                registered: Arc::clone(registered),
+            }),
         }
+    }
+}
+
+fn log_registered_limit(snapshot: &RegisteredRootsSnapshot) {
+    if snapshot.limit_reached() {
+        crate::logger::log(format!(
+            "remote_ipc: registered root limit reached discovered={} retained={}",
+            snapshot.discovered_count(),
+            snapshot.roots().len()
+        ));
     }
 }
 
@@ -65,7 +129,7 @@ mod tests {
         let db = crate::settings_db::SettingsDb::create_new(data_dir.path()).unwrap();
         db.save_full(&settings).unwrap();
 
-        let roots = RemoteFavoriteRoots::live(settings.favorites.clone()).unwrap();
+        let roots = RemoteRoots::live(settings.favorites.clone()).unwrap();
         assert!(
             resolve_existing(
                 &roots.current().unwrap(),
@@ -83,7 +147,7 @@ mod tests {
                 &favorite.id.to_string(),
                 "page.jpg"
             ),
-            Err(ResolveError::FavoriteNotFound)
+            Err(ResolveError::RootNotFound)
         ));
     }
 }

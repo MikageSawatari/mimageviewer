@@ -443,7 +443,7 @@ impl AdjustmentDb {
 
 /// パスを正規化 (小文字化 + バックスラッシュ→スラッシュ)。
 pub fn normalize_path(path: &Path) -> String {
-    path.to_string_lossy().to_lowercase().replace('\\', "/")
+    mimageviewer_registered_roots::normalize_path(path)
 }
 
 /// ZIP/PDF コンテナ内のページ単位キーを構築する。

@@ -13,10 +13,11 @@ use rusqlite::OptionalExtension;
 use crate::archive_converter::ArchiveFormat;
 
 /// 閲覧履歴の保存件数上限。
-pub const READING_HISTORY_LIMIT_MAX: usize = 1000;
+pub const READING_HISTORY_LIMIT_MAX: usize =
+    mimageviewer_registered_roots::READING_HISTORY_LIMIT_MAX;
 
 /// 閲覧履歴の保存件数デフォルト。
-pub const READING_HISTORY_LIMIT_DEFAULT: usize = 1000;
+pub const READING_HISTORY_LIMIT_DEFAULT: usize = READING_HISTORY_LIMIT_MAX;
 
 /// 同じ本を読み続けている間の MRU touch 間隔。ローカル表示と remote 表示で共有する。
 pub const READING_HISTORY_TOUCH_THROTTLE: Duration = Duration::from_secs(30);
@@ -716,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn maximum_retention_remains_one_thousand_entries() {
+    fn maximum_retention_uses_the_shared_limit() {
         let (_dir, db) = temp_db();
         for i in 0..=READING_HISTORY_LIMIT_MAX {
             db.upsert(entry(&format!("C:/Books/{i}.zip"), i as i64), 5000)
@@ -730,5 +731,14 @@ mod tests {
             Some(READING_HISTORY_LIMIT_MAX as i64)
         );
         assert_eq!(rows.last().and_then(|row| row.last_page), Some(1));
+    }
+
+    #[test]
+    fn retention_limit_is_the_remote_registered_root_contract() {
+        assert_eq!(
+            READING_HISTORY_LIMIT_MAX,
+            mimageviewer_registered_roots::READING_HISTORY_LIMIT_MAX
+        );
+        assert_eq!(READING_HISTORY_LIMIT_DEFAULT, READING_HISTORY_LIMIT_MAX);
     }
 }

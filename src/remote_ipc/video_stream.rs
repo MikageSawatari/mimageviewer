@@ -97,20 +97,17 @@ impl VideoStreamStartBudget {
     }
 }
 pub(super) struct VideoStreamEngine {
-    favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
+    roots: Arc<super::live_favorites::RemoteRoots>,
 }
 
 impl VideoStreamEngine {
     pub(super) fn new(settings: crate::settings::Settings) -> Self {
-        let favorite_roots =
-            super::live_favorites::RemoteFavoriteRoots::snapshot(settings.favorites.clone());
-        Self::new_with_favorite_roots(favorite_roots)
+        let roots = super::live_favorites::RemoteRoots::snapshot(settings.favorites.clone());
+        Self::new_with_roots(roots)
     }
 
-    pub(super) fn new_with_favorite_roots(
-        favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
-    ) -> Self {
-        Self { favorite_roots }
+    pub(super) fn new_with_roots(roots: Arc<super::live_favorites::RemoteRoots>) -> Self {
+        Self { roots }
     }
 
     pub(super) fn resolve_start_address(
@@ -129,14 +126,14 @@ impl VideoStreamEngine {
                 "動画ストリーミングは実ファイルだけを受け付けます",
             ));
         }
-        let favorites = self.favorite_roots.current().map_err(|error| {
+        let roots = self.roots.current().map_err(|error| {
             crate::logger::log(format!("remote_ipc: {error}"));
             video_error(
                 VideoStreamErrorCode::Internal,
-                "最新のお気に入りを読み込めませんでした",
+                "最新の閲覧起点を読み込めませんでした",
             )
         })?;
-        let resolved = resolve_existing(&favorites, &address.root_id, &address.relative_path)
+        let resolved = resolve_existing(&roots, &address.root_id, &address.relative_path)
             .map_err(resolve_error)?;
         if !resolved
             .canonical
@@ -466,7 +463,7 @@ fn resolve_error(error: ResolveError) -> VideoStreamError {
             VideoStreamErrorCode::BadRequest,
             "動画アドレスの形式が正しくありません",
         ),
-        ResolveError::FavoriteNotFound => (
+        ResolveError::RootNotFound => (
             VideoStreamErrorCode::FavoriteNotFound,
             "お気に入りが見つかりません",
         ),
@@ -474,7 +471,7 @@ fn resolve_error(error: ResolveError) -> VideoStreamError {
             VideoStreamErrorCode::NotFound,
             "動画ファイルが見つかりません",
         ),
-        ResolveError::EscapesFavorite => (
+        ResolveError::EscapesRoot => (
             VideoStreamErrorCode::PathRejected,
             "お気に入りの外側は開けません",
         ),

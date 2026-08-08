@@ -128,9 +128,7 @@ impl CapturePixelJob {
 }
 
 pub fn default_output_dir() -> PathBuf {
-    if let Some(pictures) = pictures_dir()
-        .or_else(|| std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join("Pictures")))
-    {
+    if let Some(pictures) = mimageviewer_registered_roots::pictures_root() {
         pictures.join("mimageviewer")
     } else {
         crate::data_dir::get().join("captures")
@@ -190,24 +188,6 @@ pub fn reveal_path_async(path: PathBuf) {
             }
         })
         .ok();
-}
-
-#[cfg(windows)]
-fn pictures_dir() -> Option<PathBuf> {
-    use windows::Win32::System::Com::CoTaskMemFree;
-    use windows::Win32::UI::Shell::{FOLDERID_Pictures, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
-
-    unsafe {
-        let pwstr = SHGetKnownFolderPath(&FOLDERID_Pictures, KF_FLAG_DEFAULT, None).ok()?;
-        let path = pwstr.to_string().ok().map(PathBuf::from);
-        CoTaskMemFree(Some(pwstr.0 as *const core::ffi::c_void));
-        path
-    }
-}
-
-#[cfg(not(windows))]
-fn pictures_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|p| PathBuf::from(p).join("Pictures"))
 }
 
 pub fn basename_for_path(path: &Path) -> String {

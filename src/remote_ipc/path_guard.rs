@@ -1,26 +1,31 @@
 use std::path::{Component, Path, PathBuf};
 
 use mimageviewer_ipc::{RemoteAddress, RemoteSubresource};
+use mimageviewer_registered_roots::ResolveError as RegisteredResolveError;
 use uuid::Uuid;
 
 use crate::settings::FavoriteEntry;
 
+use super::live_favorites::AllowedRootsSnapshot;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ResolveError {
     InvalidRootId,
-    FavoriteNotFound,
+    RootNotFound,
     InvalidRelativePath,
     Unavailable,
-    EscapesFavorite,
+    EscapesRoot,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct ResolvedFavoritePath {
-    /// 要求文字列ではなく、favorite allowlist で実際に一致した UUID。
+pub(super) struct ResolvedRootPath {
+    /// 要求文字列ではなく、allowlist で実際に一致した UUID。
     pub root_id: String,
-    /// logical path を相対化する、設定上の favorite root。
+    /// パンくず先頭に使う、絶対 path を含まない root 表示名。
+    pub root_name: String,
+    /// logical path を相対化する root。
     pub logical_root: PathBuf,
-    /// お気に入り境界。フォルダ代表の再帰先や pin もこの内側に限る。
+    /// root 境界。フォルダ代表の再帰先や pin もこの内側に限る。
     pub canonical_root: PathBuf,
     /// 実ファイルを開くための canonical path。
     pub canonical: PathBuf,
@@ -29,32 +34,36 @@ pub(super) struct ResolvedFavoritePath {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct FavoriteRelativePath {
+pub(super) struct RootRelativePath {
     pub root_id: String,
     pub relative_path: String,
 }
 
-/// 既存の絶対 path を、最も深く一致するお気に入り root と相対 path に写像する。
-/// canonical path 同士で比較するため junction / symlink で root 外へ出た項目は返さない。
-pub(super) fn map_existing_to_favorite(
-    favorites: &[FavoriteEntry],
+/// 既存の絶対 path を、favorite 優先で許可済み root と相対 path に写像する。
+/// root の種類と粒度はこの境界の外へ出さない。
+pub(super) fn map_existing_to_root(
+    allowed: &AllowedRootsSnapshot,
     candidate: &Path,
-) -> Option<FavoriteRelativePath> {
-    let roots = resolve_existing_favorite_roots(favorites);
-    map_existing_to_resolved_favorite(&roots, candidate)
+) -> Option<RootRelativePath> {
+    let roots = resolve_existing_roots(allowed);
+    map_existing_to_resolved_root(&roots, candidate)
 }
 
-pub(super) struct ResolvedFavoriteRoot<'a> {
+struct ResolvedFavoriteRoot<'a> {
     favorite: &'a FavoriteEntry,
     canonical_root: PathBuf,
 }
 
+pub(super) struct ResolvedRoots<'a> {
+    favorites: Vec<ResolvedFavoriteRoot<'a>>,
+    registered: &'a mimageviewer_registered_roots::RegisteredRootsSnapshot,
+}
+
 /// 候補列を変換する前に favorite root を 1 回だけ解決する。
 /// offline の root はその root だけを除外し、残りの allowlist 判定を継続する。
-pub(super) fn resolve_existing_favorite_roots(
-    favorites: &[FavoriteEntry],
-) -> Vec<ResolvedFavoriteRoot<'_>> {
-    favorites
+pub(super) fn resolve_existing_roots(allowed: &AllowedRootsSnapshot) -> ResolvedRoots<'_> {
+    let favorites = allowed
+        .favorites
         .iter()
         .filter_map(|favorite| {
             std::fs::canonicalize(&favorite.path)
@@ -64,16 +73,20 @@ pub(super) fn resolve_existing_favorite_roots(
                     canonical_root,
                 })
         })
-        .collect()
+        .collect();
+    ResolvedRoots {
+        favorites,
+        registered: &allowed.registered,
+    }
 }
 
-pub(super) fn map_existing_to_resolved_favorite(
-    roots: &[ResolvedFavoriteRoot<'_>],
+pub(super) fn map_existing_to_resolved_root(
+    roots: &ResolvedRoots<'_>,
     candidate: &Path,
-) -> Option<FavoriteRelativePath> {
+) -> Option<RootRelativePath> {
     let canonical = std::fs::canonicalize(candidate).ok()?;
     let mut best: Option<(usize, &ResolvedFavoriteRoot<'_>)> = None;
-    for root in roots {
+    for root in &roots.favorites {
         if !path_starts_with(&canonical, &root.canonical_root) {
             continue;
         }
@@ -85,21 +98,21 @@ pub(super) fn map_existing_to_resolved_favorite(
             best = Some((depth, root));
         }
     }
-    let (_, root) = best?;
-    let relative = components_after_root(&canonical, &root.canonical_root)?;
-    let relative_path = relative
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
-            Component::CurDir => None,
-            _ => None,
+    if let Some((_, root)) = best {
+        let relative = components_after_root(&canonical, &root.canonical_root)?;
+        let relative_path = remote_relative_path(&relative)?;
+        return Some(RootRelativePath {
+            root_id: root.favorite.id.to_string(),
+            relative_path,
+        });
+    }
+    roots
+        .registered
+        .map_existing(candidate)
+        .map(|mapped| RootRelativePath {
+            root_id: mapped.root_id.to_string(),
+            relative_path: mapped.relative_path,
         })
-        .collect::<Vec<_>>()
-        .join("/");
-    Some(FavoriteRelativePath {
-        root_id: root.favorite.id.to_string(),
-        relative_path,
-    })
 }
 
 fn components_after_root(path: &Path, root: &Path) -> Option<PathBuf> {
@@ -126,34 +139,58 @@ fn component_eq(left: Component<'_>, right: Component<'_>) -> bool {
 }
 
 pub(super) fn resolve_existing(
-    favorites: &[FavoriteEntry],
+    allowed: &AllowedRootsSnapshot,
     root_id: &str,
     relative: &str,
-) -> Result<ResolvedFavoritePath, ResolveError> {
+) -> Result<ResolvedRootPath, ResolveError> {
     let root_id = Uuid::parse_str(root_id).map_err(|_| ResolveError::InvalidRootId)?;
-    let favorite = favorites
+    if let Some(favorite) = allowed
+        .favorites
         .iter()
         .find(|favorite| favorite.id == root_id)
-        .ok_or(ResolveError::FavoriteNotFound)?;
-    validate_relative(relative)?;
-
-    let canonical_root =
-        std::fs::canonicalize(&favorite.path).map_err(|_| ResolveError::Unavailable)?;
-    let logical = logical_favorite_path(&favorite.path, relative);
-    let canonical = canonicalize_within(&canonical_root, &logical)?;
-    Ok(ResolvedFavoritePath {
-        root_id: favorite.id.to_string(),
-        logical_root: favorite.path.clone(),
-        canonical_root,
-        canonical,
-        logical,
+    {
+        validate_relative(relative)?;
+        let canonical_root =
+            std::fs::canonicalize(&favorite.path).map_err(|_| ResolveError::Unavailable)?;
+        let logical = logical_root_path(&favorite.path, relative);
+        let canonical = canonicalize_within(&canonical_root, &logical)?;
+        return Ok(ResolvedRootPath {
+            root_id: favorite.id.to_string(),
+            root_name: favorite.name.clone(),
+            logical_root: favorite.path.clone(),
+            canonical_root,
+            canonical,
+            logical,
+        });
+    }
+    let resolved = allowed
+        .registered
+        .resolve_existing(root_id, relative)
+        .map_err(map_registered_resolve_error)?;
+    Ok(ResolvedRootPath {
+        root_id: resolved.root_id.to_string(),
+        root_name: resolved.root_name,
+        logical_root: resolved.root_path,
+        canonical_root: resolved.canonical_root,
+        canonical: resolved.canonical,
+        logical: resolved.logical,
     })
 }
 
+fn map_registered_resolve_error(error: RegisteredResolveError) -> ResolveError {
+    match error {
+        RegisteredResolveError::RootNotFound => ResolveError::RootNotFound,
+        RegisteredResolveError::InvalidRelativePath
+        | RegisteredResolveError::FileRootHasRelativePath => ResolveError::InvalidRelativePath,
+        RegisteredResolveError::Unavailable => ResolveError::Unavailable,
+        RegisteredResolveError::EscapesRoot => ResolveError::EscapesRoot,
+    }
+}
+
 /// 画素生成経路が使った解決済み logical path と subresource から、公開用 identity を再構成する。
-/// HTTP 要求の root/path をそのまま返さないため、この関数は `ResolvedFavoritePath` だけを入力にする。
+/// HTTP 要求の root/path をそのまま返さないため、この関数は `ResolvedRootPath` だけを入力にする。
 pub(super) fn page_identity_from_resolved(
-    resolved: &ResolvedFavoritePath,
+    resolved: &ResolvedRootPath,
     subresource: &RemoteSubresource,
 ) -> Option<RemoteAddress> {
     let relative = components_after_root(&resolved.logical, &resolved.logical_root)?;
@@ -174,12 +211,16 @@ pub(super) fn page_identity_from_resolved(
 
 /// favorite root と検証済み相対 path の論理キーを組み立てる。
 /// ファイルシステムへ触れないため UI thread の永続キー導出でも共有できる。
-pub(super) fn logical_favorite_path(favorite_root: &Path, relative: &str) -> PathBuf {
+pub(super) fn logical_root_path(root: &Path, relative: &str) -> PathBuf {
     if relative.is_empty() {
-        favorite_root.to_path_buf()
+        root.to_path_buf()
     } else {
-        favorite_root.join(relative)
+        root.join(relative)
     }
+}
+
+pub(super) fn logical_favorite_path(favorite_root: &Path, relative: &str) -> PathBuf {
+    logical_root_path(favorite_root, relative)
 }
 
 pub(super) fn canonicalize_within(
@@ -188,9 +229,21 @@ pub(super) fn canonicalize_within(
 ) -> Result<PathBuf, ResolveError> {
     let canonical = std::fs::canonicalize(candidate).map_err(|_| ResolveError::Unavailable)?;
     if !path_starts_with(&canonical, canonical_root) {
-        return Err(ResolveError::EscapesFavorite);
+        return Err(ResolveError::EscapesRoot);
     }
     Ok(canonical)
+}
+
+fn remote_relative_path(path: &Path) -> Option<String> {
+    let mut segments = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => segments.push(value.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => return None,
+        }
+    }
+    Some(segments.join("/"))
 }
 
 fn validate_relative(relative: &str) -> Result<(), ResolveError> {
@@ -249,11 +302,21 @@ mod tests {
         FavoriteEntry::new("test".to_owned(), root.to_path_buf())
     }
 
-    fn resolved_for_identity(relative: &str) -> ResolvedFavoritePath {
+    fn allowed(favorites: Vec<FavoriteEntry>, registered: Vec<PathBuf>) -> AllowedRootsSnapshot {
+        AllowedRootsSnapshot {
+            favorites: std::sync::Arc::new(favorites),
+            registered: mimageviewer_registered_roots::RegisteredRootsSnapshot::from_paths(
+                registered,
+            ),
+        }
+    }
+
+    fn resolved_for_identity(relative: &str) -> ResolvedRootPath {
         let logical_root = PathBuf::from("favorite");
-        let logical = logical_favorite_path(&logical_root, relative);
-        ResolvedFavoritePath {
+        let logical = logical_root_path(&logical_root, relative);
+        ResolvedRootPath {
             root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
+            root_name: "favorite".to_owned(),
             logical_root: logical_root.clone(),
             canonical_root: logical_root.clone(),
             canonical: logical.clone(),
@@ -314,13 +377,10 @@ mod tests {
         std::fs::create_dir_all(root.join("album")).unwrap();
         std::fs::write(root.join("album/page.jpg"), b"x").unwrap();
         let favorite = favorite(&root);
+        let roots = allowed(vec![favorite.clone()], Vec::new());
 
-        let resolved = resolve_existing(
-            std::slice::from_ref(&favorite),
-            &favorite.id.to_string(),
-            "album/page.jpg",
-        )
-        .unwrap();
+        let resolved =
+            resolve_existing(&roots, &favorite.id.to_string(), "album/page.jpg").unwrap();
         assert_eq!(
             resolved.canonical,
             std::fs::canonicalize(root.join("album/page.jpg")).unwrap()
@@ -334,10 +394,11 @@ mod tests {
         let root = temp.path().join("favorite");
         std::fs::create_dir_all(&root).unwrap();
         let favorite = favorite(&root);
+        let roots = allowed(vec![favorite.clone()], Vec::new());
 
         assert_eq!(
-            resolve_existing(&[favorite.clone()], &Uuid::new_v4().to_string(), ""),
-            Err(ResolveError::FavoriteNotFound)
+            resolve_existing(&roots, &Uuid::new_v4().to_string(), ""),
+            Err(ResolveError::RootNotFound)
         );
         for relative in [
             "../outside.jpg",
@@ -348,7 +409,7 @@ mod tests {
             "/etc/passwd",
         ] {
             assert_eq!(
-                resolve_existing(&[favorite.clone()], &favorite.id.to_string(), relative),
+                resolve_existing(&roots, &favorite.id.to_string(), relative),
                 Err(ResolveError::InvalidRelativePath),
                 "{relative:?}"
             );
@@ -369,13 +430,10 @@ mod tests {
             return;
         }
         let favorite = favorite(&root);
+        let roots = allowed(vec![favorite.clone()], Vec::new());
         assert_eq!(
-            resolve_existing(
-                &[favorite.clone()],
-                &favorite.id.to_string(),
-                "escape/secret.jpg"
-            ),
-            Err(ResolveError::EscapesFavorite)
+            resolve_existing(&roots, &favorite.id.to_string(), "escape/secret.jpg"),
+            Err(ResolveError::EscapesRoot)
         );
     }
 
@@ -389,14 +447,13 @@ mod tests {
         std::fs::write(nested.join("page.jpg"), b"x").unwrap();
         std::fs::write(&outside, b"x").unwrap();
         let favorite = favorite(&root);
+        let roots = allowed(vec![favorite.clone()], Vec::new());
 
-        let mapped =
-            map_existing_to_favorite(std::slice::from_ref(&favorite), &nested.join("page.jpg"))
-                .unwrap();
+        let mapped = map_existing_to_root(&roots, &nested.join("page.jpg")).unwrap();
         assert_eq!(mapped.root_id, favorite.id.to_string());
         assert_eq!(mapped.relative_path, "album/page.jpg");
         assert!(!Path::new(&mapped.relative_path).is_absolute());
-        assert!(map_existing_to_favorite(&[favorite], &outside).is_none());
+        assert!(map_existing_to_root(&roots, &outside).is_none());
     }
 
     #[test]
@@ -409,11 +466,74 @@ mod tests {
         std::fs::write(&page, b"page").unwrap();
         let missing = favorite(&missing_root);
         let existing = favorite(&existing_root);
+        let roots = allowed(vec![missing, existing.clone()], Vec::new());
 
-        let mapped = map_existing_to_favorite(&[missing, existing.clone()], &page).unwrap();
+        let mapped = map_existing_to_root(&roots, &page).unwrap();
 
         assert_eq!(mapped.root_id, existing.id.to_string());
         assert_eq!(mapped.relative_path, "album/page.jpg");
+    }
+
+    #[test]
+    fn registered_file_is_self_only_and_favorite_mapping_still_wins() {
+        let temp = tempfile::tempdir().unwrap();
+        let favorite_root = temp.path().join("favorite");
+        let registered_file = favorite_root.join("book.zip");
+        std::fs::create_dir(&favorite_root).unwrap();
+        std::fs::write(&registered_file, b"zip").unwrap();
+        let favorite = favorite(&favorite_root);
+        let roots = allowed(vec![favorite.clone()], vec![registered_file.clone()]);
+
+        let mapped = map_existing_to_root(&roots, &registered_file).unwrap();
+        assert_eq!(mapped.root_id, favorite.id.to_string());
+        assert_eq!(mapped.relative_path, "book.zip");
+
+        let registered_only = allowed(Vec::new(), vec![registered_file.clone()]);
+        let mapped = map_existing_to_root(&registered_only, &registered_file).unwrap();
+        assert_eq!(
+            mapped.root_id,
+            mimageviewer_registered_roots::registered_root_id(&registered_file).to_string()
+        );
+        assert!(mapped.relative_path.is_empty());
+        assert!(resolve_existing(&registered_only, &mapped.root_id, "").is_ok());
+        assert_eq!(
+            resolve_existing(&registered_only, &mapped.root_id, "sibling.jpg"),
+            Err(ResolveError::InvalidRelativePath)
+        );
+    }
+
+    #[test]
+    fn registered_file_subresources_keep_the_empty_root_relative_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip = temp.path().join("book.zip");
+        let pdf = temp.path().join("book.pdf");
+        std::fs::write(&zip, b"zip").unwrap();
+        std::fs::write(&pdf, b"pdf").unwrap();
+        let roots = allowed(Vec::new(), vec![zip.clone(), pdf.clone()]);
+        let addresses = [
+            RemoteAddress {
+                root_id: mimageviewer_registered_roots::registered_root_id(&zip).to_string(),
+                relative_path: String::new(),
+                subresource: RemoteSubresource::ZipEntry {
+                    entry_name: "chapter/001.jpg".to_owned(),
+                },
+            },
+            RemoteAddress {
+                root_id: mimageviewer_registered_roots::registered_root_id(&pdf).to_string(),
+                relative_path: String::new(),
+                subresource: RemoteSubresource::PdfPage { page_number: 0 },
+            },
+        ];
+
+        for address in addresses {
+            address.validate_syntax().unwrap();
+            let resolved = resolve_existing(&roots, &address.root_id, &address.relative_path)
+                .expect("registered container must resolve");
+            assert_eq!(
+                page_identity_from_resolved(&resolved, &address.subresource),
+                Some(address)
+            );
+        }
     }
 
     #[cfg(windows)]

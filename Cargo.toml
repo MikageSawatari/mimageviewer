@@ -6,6 +6,7 @@ members = [
     "crates/comic-core",
     "crates/music-core",
     "crates/remote-ipc",
+    "crates/remote-registered-roots",
     "crates/remote-web",
     "crates/vst3-host-tester",
     "tools/png2mag",
@@ -280,6 +281,7 @@ local-adjust-core = { path = "crates/local-adjust-core" }
 # docs/comic-integration-plan.md §2)。Inc 0 で配線、実使用は Inc 1 以降。
 comic-core = { path = "crates/comic-core" }
 mimageviewer-ipc = { path = "crates/remote-ipc" }
+mimageviewer-registered-roots = { path = "crates/remote-registered-roots" }
 # 音楽ビュー (音声再生・DJ 風タイムライン・スペクトラム解析) の純ロジック。
 # egui / cpal / FFmpeg / VST3 非依存 (rustfft + serde のみ)。analyze_stereo_timeline /
 # SpectrumAnalyzer / MediaVisualMode 等を本体から呼ぶ (統合計画

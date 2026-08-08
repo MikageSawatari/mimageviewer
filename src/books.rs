@@ -1752,6 +1752,14 @@ fn sanitize_filename(input: &str, fallback: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn default_books_root_is_the_capture_output_books_directory() {
+        assert_eq!(
+            default_books_root(),
+            crate::capture::default_output_dir().join("books")
+        );
+    }
+
     fn empty_baked_edits() -> BakedEditSnapshot {
         BakedEditSnapshot {
             params: crate::adjustment::AdjustParams::default(),

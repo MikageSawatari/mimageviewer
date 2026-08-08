@@ -2528,6 +2528,7 @@ fn api_list(
             let response = json!({
                 "root_id": payload.effective_address.root_id,
                 "path": payload.effective_address.relative_path,
+                "root_name": payload.root_name,
                 "thumb_aspect_height_ratio": payload.thumb_aspect_height_ratio,
                 "sort_state": payload.sort_state,
                 "entries": entries,

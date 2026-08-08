@@ -12,19 +12,32 @@ use mimageviewer_ipc::{
 
 use crate::grid_item::GridItem;
 use crate::search_index_db::{IndexEntry, IndexKind, SEARCH_RESULT_LIMIT, SearchIndexDb};
-use crate::settings::{FavoriteEntry, Settings};
+use crate::settings::Settings;
 
-use super::path_guard::{
-    ResolvedFavoriteRoot, map_existing_to_resolved_favorite, resolve_existing_favorite_roots,
-};
+use super::path_guard::{ResolvedRoots, map_existing_to_resolved_root, resolve_existing_roots};
 
 const MAX_REMOTE_COLLECTION_ENTRIES: usize = 1000;
 const MAX_REMOTE_TAG_CHOICES: usize = 2000;
 
 pub(super) struct CollectionEngine {
-    settings: Settings,
+    settings: CollectionSettingsSource,
     sort_settings: super::RemoteSortSettingsSource,
-    favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
+    roots: Arc<super::live_favorites::RemoteRoots>,
+}
+
+enum CollectionSettingsSource {
+    Live,
+    Snapshot(Settings),
+}
+
+impl CollectionSettingsSource {
+    fn load(&self) -> Result<Settings, String> {
+        match self {
+            Self::Live => crate::settings_db::with_db_result(|db| db.load_into_settings())
+                .map_err(|error| error.to_string()),
+            Self::Snapshot(settings) => Ok(settings.clone()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -40,37 +53,39 @@ struct CandidateEntry {
 
 impl CollectionEngine {
     pub(super) fn new(settings: Settings) -> Self {
-        let favorite_roots =
-            super::live_favorites::RemoteFavoriteRoots::snapshot(settings.favorites.clone());
-        Self::new_with_favorite_roots(settings, favorite_roots)
+        let roots = super::live_favorites::RemoteRoots::snapshot(settings.favorites.clone());
+        Self::new_with_roots(settings, roots)
     }
 
-    pub(super) fn new_with_favorite_roots(
+    pub(super) fn new_with_roots(
         settings: Settings,
-        favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
+        roots: Arc<super::live_favorites::RemoteRoots>,
     ) -> Self {
         Self {
             sort_settings: super::RemoteSortSettingsSource::Snapshot(settings.sort_order),
-            settings,
-            favorite_roots,
+            settings: CollectionSettingsSource::Snapshot(settings),
+            roots,
         }
     }
 
-    pub(super) fn new_with_live_favorite_roots(
-        settings: Settings,
-        favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
+    pub(super) fn new_with_live_roots(
+        _settings: Settings,
+        roots: Arc<super::live_favorites::RemoteRoots>,
     ) -> Self {
         Self {
-            settings,
+            settings: CollectionSettingsSource::Live,
             sort_settings: super::RemoteSortSettingsSource::Live,
-            favorite_roots,
+            roots,
         }
     }
 
     pub(super) fn home(&self) -> HomeResponse {
+        let settings = match self.load_settings() {
+            Ok(settings) => settings,
+            Err(error) => return HomeResponse::Error(error),
+        };
         HomeResponse::Success(HomePayload {
-            smart_folders: self
-                .settings
+            smart_folders: settings
                 .smart_folders
                 .iter()
                 .map(|definition| SmartFolderSummary {
@@ -78,11 +93,15 @@ impl CollectionEngine {
                     name: definition.name.clone(),
                 })
                 .collect(),
-            places: visible_places(&self.settings),
+            places: visible_places(&settings),
         })
     }
 
     pub(super) fn collection(&self, request: CollectionRequest) -> CollectionResponse {
+        let settings = match self.load_settings() {
+            Ok(settings) => settings,
+            Err(error) => return CollectionResponse::Error(error),
+        };
         let sort_order = match self.sort_settings.load() {
             Ok(sort_order) => sort_order,
             Err(error) => {
@@ -93,18 +112,24 @@ impl CollectionEngine {
             }
         };
         let result = match request.kind {
-            CollectionKind::ReadingHistory => self.reading_history(sort_order),
-            CollectionKind::Rating { stars } => self.rating(stars, sort_order),
-            CollectionKind::Bookshelf => self.bookshelf(sort_order),
-            CollectionKind::Bookmarks => self.bookmarks(sort_order),
+            CollectionKind::ReadingHistory => self.reading_history(&settings, sort_order),
+            CollectionKind::Rating { stars } => self.rating(&settings, stars, sort_order),
+            CollectionKind::Bookshelf => self.bookshelf(&settings, sort_order),
+            CollectionKind::Bookmarks => self.bookmarks(&settings, sort_order),
             CollectionKind::SmartFolder { definition_id } => {
-                self.smart_folder(&definition_id, sort_order)
+                self.smart_folder(&settings, &definition_id, sort_order)
             }
         };
         match result {
             Ok(payload) => CollectionResponse::Success(payload),
             Err(error) => CollectionResponse::Error(error),
         }
+    }
+
+    fn load_settings(&self) -> Result<Settings, CollectionError> {
+        self.settings
+            .load()
+            .map_err(|error| internal_error("最新の一覧設定を読み込めませんでした", error))
     }
 
     /// Favorite search stays in CollectionEngine because it must share the collection
@@ -132,24 +157,28 @@ impl CollectionEngine {
                 "検索語句は 200 文字以内で入力してください",
             ));
         }
+        let settings = self.load_settings()?;
         let sort_order = self
             .sort_settings
             .load()
             .map_err(|error| internal_error("最新の並び順を読み込めませんでした", error))?;
-        let favorites = self.favorite_roots.current().map_err(|error| {
+        let roots = self.roots.current().map_err(|error| {
             crate::logger::log(format!("remote_ipc: {error}"));
             CollectionError::new(
                 CollectionErrorCode::Internal,
-                "最新のお気に入りを読み込めませんでした",
+                "最新の閲覧起点を読み込めませんでした",
             )
         })?;
-        if !favorites
+        if !roots
+            .favorites
             .iter()
             .any(|favorite| favorite.auto_index_structure)
         {
-            return Ok(
-                self.favorite_search_state_payload(sort_order, FavoriteSearchIndexState::Disabled)
-            );
+            return Ok(self.favorite_search_state_payload(
+                &settings,
+                sort_order,
+                FavoriteSearchIndexState::Disabled,
+            ));
         }
 
         let db = match SearchIndexDb::open_readonly() {
@@ -159,12 +188,14 @@ impl CollectionEngine {
                     "remote_ipc: favorite search index open failed: {error}"
                 ));
                 return Ok(self.favorite_search_state_payload(
+                    &settings,
                     sort_order,
                     FavoriteSearchIndexState::Unavailable,
                 ));
             }
         };
-        let roots = favorites
+        let favorite_paths = roots
+            .favorites
             .iter()
             .map(|favorite| favorite.path.clone())
             .collect::<Vec<_>>();
@@ -176,7 +207,7 @@ impl CollectionEngine {
         };
         let index_entries = match db.search(
             &request.query,
-            &roots,
+            &favorite_paths,
             kind,
             crate::search_query::MatchMode::And,
         ) {
@@ -186,38 +217,41 @@ impl CollectionEngine {
                     "remote_ipc: favorite search index read failed: {error}"
                 ));
                 return Ok(self.favorite_search_state_payload(
+                    &settings,
                     sort_order,
                     FavoriteSearchIndexState::Unavailable,
                 ));
             }
         };
-        let (entries, truncated) = map_favorite_search_entries(&favorites, index_entries);
+        let (entries, truncated) = map_favorite_search_entries(&roots, index_entries);
         Ok(FavoriteSearchPayload {
-            listing: self.favorite_search_listing(sort_order, entries, truncated),
+            listing: self.favorite_search_listing(&settings, sort_order, entries, truncated),
             index_state: FavoriteSearchIndexState::Ready,
         })
     }
 
     fn favorite_search_state_payload(
         &self,
+        settings: &Settings,
         sort_order: crate::settings::SortOrder,
         index_state: FavoriteSearchIndexState,
     ) -> FavoriteSearchPayload {
         FavoriteSearchPayload {
-            listing: self.favorite_search_listing(sort_order, Vec::new(), false),
+            listing: self.favorite_search_listing(settings, sort_order, Vec::new(), false),
             index_state,
         }
     }
 
     fn favorite_search_listing(
         &self,
+        settings: &Settings,
         sort_order: crate::settings::SortOrder,
         entries: Vec<RemoteEntry>,
         truncated: bool,
     ) -> CollectionPayload {
         CollectionPayload {
             title: "検索結果".to_owned(),
-            thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(&self.settings),
+            thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(settings),
             sort_state: super::remote_grid_sort_state(
                 sort_order,
                 Some(super::FIXED_LIST_SORT_LOCK_REASON),
@@ -229,10 +263,13 @@ impl CollectionEngine {
     }
 
     pub(super) fn tag_browse(&self, _request: TagBrowseRequest) -> TagBrowseResponse {
-        TagBrowseResponse::Success(self.tag_browse_payload())
+        match self.load_settings() {
+            Ok(settings) => TagBrowseResponse::Success(self.tag_browse_payload(&settings)),
+            Err(error) => TagBrowseResponse::Error(error),
+        }
     }
 
-    fn tag_browse_payload(&self) -> TagBrowsePayload {
+    fn tag_browse_payload(&self, settings: &Settings) -> TagBrowsePayload {
         let db_path = crate::tags_db::TagsDb::db_path();
         if !db_path.try_exists().unwrap_or(false) {
             return empty_tag_browse_payload(TagIndexState::Unavailable);
@@ -244,7 +281,7 @@ impl CollectionEngine {
                 return empty_tag_browse_payload(TagIndexState::Unavailable);
             }
         };
-        tag_browse_payload_from_summaries(db.tag_summaries(), &self.settings.tags)
+        tag_browse_payload_from_summaries(db.tag_summaries(), &settings.tags)
     }
 
     pub(super) fn tag_items(&self, request: TagItemsRequest) -> TagItemsResponse {
@@ -259,78 +296,98 @@ impl CollectionEngine {
         request: TagItemsRequest,
     ) -> Result<TagItemsPayload, CollectionError> {
         validate_tag_items_request(&request)?;
+        let settings = self.load_settings()?;
         let sort_order = self
             .sort_settings
             .load()
             .map_err(|error| internal_error("最新の並び順を読み込めませんでした", error))?;
         let db_path = crate::tags_db::TagsDb::db_path();
         if !db_path.try_exists().unwrap_or(false) {
-            return Ok(self.tag_items_state_payload(sort_order, TagIndexState::Unavailable));
+            return Ok(self.tag_items_state_payload(
+                &settings,
+                sort_order,
+                TagIndexState::Unavailable,
+            ));
         }
         let db = match crate::tags_db::TagsDb::open_readonly(&db_path) {
             Ok(db) => db,
             Err(error) => {
                 crate::logger::log(format!("remote_ipc: tags index open failed: {error}"));
-                return Ok(self.tag_items_state_payload(sort_order, TagIndexState::Unavailable));
+                return Ok(self.tag_items_state_payload(
+                    &settings,
+                    sort_order,
+                    TagIndexState::Unavailable,
+                ));
             }
         };
         match db.has_any_tags() {
             Ok(true) => {}
             Ok(false) => {
-                return Ok(self.tag_items_state_payload(sort_order, TagIndexState::Empty));
+                return Ok(self.tag_items_state_payload(
+                    &settings,
+                    sort_order,
+                    TagIndexState::Empty,
+                ));
             }
             Err(error) => {
                 crate::logger::log(format!("remote_ipc: tags index query failed: {error}"));
-                return Ok(self.tag_items_state_payload(sort_order, TagIndexState::Unavailable));
+                return Ok(self.tag_items_state_payload(
+                    &settings,
+                    sort_order,
+                    TagIndexState::Unavailable,
+                ));
             }
         }
-        self.tag_items_from_db(&db, &request, sort_order)
+        self.tag_items_from_db(&settings, &db, &request, sort_order)
     }
 
     fn tag_items_from_db(
         &self,
+        settings: &Settings,
         db: &crate::tags_db::TagsDb,
         request: &TagItemsRequest,
         sort_order: crate::settings::SortOrder,
     ) -> Result<TagItemsPayload, CollectionError> {
-        let favorites = self.favorite_roots.current().map_err(|error| {
+        let roots = self.roots.current().map_err(|error| {
             crate::logger::log(format!("remote_ipc: {error}"));
             CollectionError::new(
                 CollectionErrorCode::Internal,
-                "最新のお気に入りを読み込めませんでした",
+                "最新の閲覧起点を読み込めませんでした",
             )
         })?;
         let key_scan_limit = tag_item_key_scan_limit(request.kind);
         let item_keys =
             crate::tag_view::select_tag_view_item_keys(db, request.tag.trim(), key_scan_limit + 1);
         let (entries, truncated) =
-            map_tag_item_keys(&favorites, item_keys, request.kind, key_scan_limit);
+            map_tag_item_keys(&roots, item_keys, request.kind, key_scan_limit);
         Ok(TagItemsPayload {
-            listing: self.tag_items_listing(sort_order, entries, truncated),
+            listing: self.tag_items_listing(settings, sort_order, entries, truncated),
             state: TagIndexState::Ready,
         })
     }
 
     fn tag_items_state_payload(
         &self,
+        settings: &Settings,
         sort_order: crate::settings::SortOrder,
         state: TagIndexState,
     ) -> TagItemsPayload {
         TagItemsPayload {
-            listing: self.tag_items_listing(sort_order, Vec::new(), false),
+            listing: self.tag_items_listing(settings, sort_order, Vec::new(), false),
             state,
         }
     }
 
     fn tag_items_listing(
         &self,
+        settings: &Settings,
         sort_order: crate::settings::SortOrder,
         entries: Vec<RemoteEntry>,
         truncated: bool,
     ) -> CollectionPayload {
         CollectionPayload {
             title: "タグの項目".to_owned(),
-            thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(&self.settings),
+            thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(settings),
             sort_state: super::remote_grid_sort_state(
                 sort_order,
                 Some(super::FIXED_LIST_SORT_LOCK_REASON),
@@ -343,6 +400,7 @@ impl CollectionEngine {
 
     fn reading_history(
         &self,
+        settings: &Settings,
         sort_order: crate::settings::SortOrder,
     ) -> Result<CollectionPayload, CollectionError> {
         let rows = if crate::reading_history_db::ReadingHistoryDb::db_path()
@@ -350,7 +408,7 @@ impl CollectionEngine {
             .unwrap_or(false)
         {
             crate::reading_history_db::ReadingHistoryDb::open_readonly()
-                .and_then(|db| db.list_recent(self.settings.reading_history_limit))
+                .and_then(|db| db.list_recent(settings.reading_history_limit))
                 .map_err(|error| internal_error("閲覧履歴を読み込めませんでした", error))?
         } else {
             Vec::new()
@@ -360,6 +418,7 @@ impl CollectionEngine {
             .map(candidate_from_reading_history_entry)
             .collect();
         self.payload(
+            settings,
             "閲覧履歴",
             candidates,
             sort_order,
@@ -369,6 +428,7 @@ impl CollectionEngine {
 
     fn rating(
         &self,
+        settings: &Settings,
         stars: u8,
         sort_order: crate::settings::SortOrder,
     ) -> Result<CollectionPayload, CollectionError> {
@@ -396,6 +456,7 @@ impl CollectionEngine {
             .filter_map(|row| candidate_from_grid_item(row.item, None, Some(stars)))
             .collect();
         self.payload(
+            settings,
             &format!("レーティング ★{stars}"),
             candidates,
             sort_order,
@@ -405,6 +466,7 @@ impl CollectionEngine {
 
     fn bookmarks(
         &self,
+        settings: &Settings,
         sort_order: crate::settings::SortOrder,
     ) -> Result<CollectionPayload, CollectionError> {
         let rows = crate::bookmark_browser::build_rows_readonly()
@@ -453,6 +515,7 @@ impl CollectionEngine {
             })
             .collect();
         self.payload(
+            settings,
             "ブックマーク",
             candidates,
             sort_order,
@@ -462,9 +525,10 @@ impl CollectionEngine {
 
     fn bookshelf(
         &self,
+        settings: &Settings,
         sort_order: crate::settings::SortOrder,
     ) -> Result<CollectionPayload, CollectionError> {
-        let root = self.settings.books_root_path();
+        let root = settings.books_root_path();
         let candidates = crate::books::list_books(&root)
             .map_err(|error| internal_error("本棚を読み込めませんでした", error))?
             .into_iter()
@@ -479,6 +543,7 @@ impl CollectionEngine {
             })
             .collect();
         self.payload(
+            settings,
             "本棚",
             candidates,
             sort_order,
@@ -488,14 +553,14 @@ impl CollectionEngine {
 
     fn smart_folder(
         &self,
+        settings: &Settings,
         definition_id: &str,
         sort_order: crate::settings::SortOrder,
     ) -> Result<CollectionPayload, CollectionError> {
         let id = uuid::Uuid::parse_str(definition_id).map_err(|_| {
             CollectionError::new(CollectionErrorCode::BadRequest, "ID が正しくありません")
         })?;
-        let definition = self
-            .settings
+        let definition = settings
             .smart_folders
             .iter()
             .find(|definition| definition.id == id)
@@ -507,11 +572,13 @@ impl CollectionEngine {
                 )
             })?;
         let title = definition.name.clone();
-        let mut settings = self.settings.clone();
-        settings.sort_order = sort_order;
-        let entries =
-            crate::app::smart_folder::build_remote_smart_folder_entries(&settings, definition)
-                .map_err(|error| internal_error("スマートフォルダを読み込めませんでした", error))?;
+        let mut evaluation_settings = settings.clone();
+        evaluation_settings.sort_order = sort_order;
+        let entries = crate::app::smart_folder::build_remote_smart_folder_entries(
+            &evaluation_settings,
+            definition,
+        )
+        .map_err(|error| internal_error("スマートフォルダを読み込めませんでした", error))?;
         let candidates = entries
             .into_iter()
             .map(|entry| CandidateEntry {
@@ -536,28 +603,29 @@ impl CollectionEngine {
                 rating: entry.rating,
             })
             .collect();
-        self.payload(&title, candidates, sort_order, None)
+        self.payload(settings, &title, candidates, sort_order, None)
     }
 
     fn payload(
         &self,
+        settings: &Settings,
         title: &str,
         candidates: Vec<CandidateEntry>,
         sort_order: crate::settings::SortOrder,
         locked_reason: Option<&str>,
     ) -> Result<CollectionPayload, CollectionError> {
-        let favorites = self.favorite_roots.current().map_err(|error| {
+        let roots = self.roots.current().map_err(|error| {
             crate::logger::log(format!("remote_ipc: {error}"));
             CollectionError::new(
                 CollectionErrorCode::Internal,
-                "最新のお気に入りを読み込めませんでした",
+                "最新の閲覧起点を読み込めませんでした",
             )
         })?;
-        let entries = to_remote_entries(&favorites, candidates);
+        let entries = to_remote_entries(&roots, candidates);
         let (entries, truncated) = bound_remote_entries(entries);
         Ok(CollectionPayload {
             title: title.to_owned(),
-            thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(&self.settings),
+            thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(settings),
             sort_state: super::remote_grid_sort_state(sort_order, locked_reason),
             entries,
             entry_limit: MAX_REMOTE_COLLECTION_ENTRIES,
@@ -664,13 +732,13 @@ fn candidate_from_tag_item_key(key: String, filter: TagItemKind) -> Option<Candi
 }
 
 fn map_tag_item_keys(
-    favorites: &[FavoriteEntry],
+    allowed: &super::live_favorites::AllowedRootsSnapshot,
     item_keys: Vec<String>,
     filter: TagItemKind,
     key_scan_limit: usize,
 ) -> (Vec<RemoteEntry>, bool) {
     let key_limit_reached = item_keys.len() > key_scan_limit;
-    let roots = resolve_existing_favorite_roots(favorites);
+    let roots = resolve_existing_roots(allowed);
     let mut entries = Vec::with_capacity(MAX_REMOTE_COLLECTION_ENTRIES + 1);
     for key in item_keys.into_iter().take(key_scan_limit) {
         let Some(candidate) = candidate_from_tag_item_key(key, filter) else {
@@ -744,18 +812,18 @@ fn visible_places(settings: &Settings) -> Vec<PlaceSummary> {
 }
 
 fn to_remote_entries(
-    favorites: &[FavoriteEntry],
+    allowed: &super::live_favorites::AllowedRootsSnapshot,
     candidates: Vec<CandidateEntry>,
 ) -> Vec<RemoteEntry> {
-    to_remote_entries_bounded(favorites, candidates, usize::MAX)
+    to_remote_entries_bounded(allowed, candidates, usize::MAX)
 }
 
 fn to_remote_entries_bounded(
-    favorites: &[FavoriteEntry],
+    allowed: &super::live_favorites::AllowedRootsSnapshot,
     candidates: Vec<CandidateEntry>,
     mapped_limit: usize,
 ) -> Vec<RemoteEntry> {
-    let roots = resolve_existing_favorite_roots(favorites);
+    let roots = resolve_existing_roots(allowed);
     candidates
         .into_iter()
         .filter_map(|candidate| remote_entry_from_candidate(&roots, candidate))
@@ -764,10 +832,10 @@ fn to_remote_entries_bounded(
 }
 
 fn remote_entry_from_candidate(
-    roots: &[ResolvedFavoriteRoot<'_>],
+    roots: &ResolvedRoots<'_>,
     candidate: CandidateEntry,
 ) -> Option<RemoteEntry> {
-    let mapped = map_existing_to_resolved_favorite(roots, &candidate.path)?;
+    let mapped = map_existing_to_resolved_root(roots, &candidate.path)?;
     Some(RemoteEntry {
         root_id: mapped.root_id,
         relative_path: mapped.relative_path,
@@ -785,7 +853,7 @@ fn remote_entry_from_candidate(
 }
 
 fn map_favorite_search_entries(
-    favorites: &[FavoriteEntry],
+    allowed: &super::live_favorites::AllowedRootsSnapshot,
     index_entries: Vec<IndexEntry>,
 ) -> (Vec<RemoteEntry>, bool) {
     let index_limit_reached = index_entries.len() == SEARCH_RESULT_LIMIT;
@@ -809,8 +877,7 @@ fn map_favorite_search_entries(
             })
         })
         .collect();
-    let entries =
-        to_remote_entries_bounded(favorites, candidates, MAX_REMOTE_COLLECTION_ENTRIES + 1);
+    let entries = to_remote_entries_bounded(allowed, candidates, MAX_REMOTE_COLLECTION_ENTRIES + 1);
     let (entries, mapped_truncated) = bound_remote_entries(entries);
     (entries, mapped_truncated || index_limit_reached)
 }
@@ -954,6 +1021,25 @@ fn internal_error(context: &str, error: impl std::fmt::Display) -> CollectionErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::FavoriteEntry;
+
+    fn allowed(
+        favorites: Vec<FavoriteEntry>,
+    ) -> super::super::live_favorites::AllowedRootsSnapshot {
+        allowed_with_registered(favorites, Vec::new())
+    }
+
+    fn allowed_with_registered(
+        favorites: Vec<FavoriteEntry>,
+        registered: Vec<PathBuf>,
+    ) -> super::super::live_favorites::AllowedRootsSnapshot {
+        super::super::live_favorites::AllowedRootsSnapshot {
+            favorites: Arc::new(favorites),
+            registered: mimageviewer_registered_roots::RegisteredRootsSnapshot::from_paths(
+                registered,
+            ),
+        }
+    }
 
     #[test]
     fn reading_history_media_entries_keep_kind_and_time_progress() {
@@ -1003,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn favorite_allowlist_drops_outside_entries_and_returns_only_relative_paths() {
+    fn unregistered_entries_are_dropped_and_addresses_stay_relative() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("favorite");
         let inside = root.join("album/page.jpg");
@@ -1032,13 +1118,91 @@ mod tests {
                 rating: None,
             },
         ];
-        let entries = to_remote_entries(std::slice::from_ref(&favorite), candidates);
+        let roots = allowed(vec![favorite.clone()]);
+        let entries = to_remote_entries(&roots, candidates);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].root_id, favorite.id.to_string());
         assert_eq!(entries[0].relative_path, "album/page.jpg");
         assert!(!Path::new(&entries[0].relative_path).is_absolute());
         let json = serde_json::to_string(&entries).unwrap();
         assert!(!json.contains(&temp.path().to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn every_non_favorite_collection_source_maps_to_an_openable_registered_address() {
+        let temp = tempfile::tempdir().unwrap();
+        let rating = temp.path().join("rated.zip");
+        let media_bookmark = temp.path().join("clip.mp4");
+        let book_bookmark = temp.path().join("bookmark.pdf");
+        let history = temp.path().join("recent.pdf");
+        let books_root = temp.path().join("books");
+        let book = books_root.join("volume");
+        let smart_root = temp.path().join("smart");
+        let smart_item = smart_root.join("nested/page.jpg");
+        for path in [&rating, &media_bookmark, &book_bookmark, &history] {
+            std::fs::write(path, b"fixture").unwrap();
+        }
+        std::fs::create_dir_all(&book).unwrap();
+        std::fs::create_dir_all(smart_item.parent().unwrap()).unwrap();
+        std::fs::write(&smart_item, b"page").unwrap();
+        let roots = allowed_with_registered(
+            Vec::new(),
+            vec![
+                rating.clone(),
+                media_bookmark.clone(),
+                book_bookmark.clone(),
+                history.clone(),
+                books_root,
+                smart_root,
+            ],
+        );
+        let candidates = [
+            (&rating, RemoteEntryKind::Zip, "rated.zip"),
+            (&media_bookmark, RemoteEntryKind::Video, "clip.mp4"),
+            (&book_bookmark, RemoteEntryKind::Pdf, "bookmark.pdf"),
+            (&history, RemoteEntryKind::Pdf, "recent.pdf"),
+            (&book, RemoteEntryKind::Folder, "volume"),
+            (&smart_item, RemoteEntryKind::Image, "page.jpg"),
+        ]
+        .into_iter()
+        .map(|(path, kind, name)| CandidateEntry {
+            path: path.clone(),
+            name: name.to_owned(),
+            kind,
+            detail: None,
+            progress_current: None,
+            progress_total: None,
+            rating: None,
+        })
+        .collect();
+
+        let entries = to_remote_entries(&roots, candidates);
+
+        assert_eq!(entries.len(), 6);
+        for entry in &entries {
+            assert!(
+                super::super::path_guard::resolve_existing(
+                    &roots,
+                    &entry.root_id,
+                    &entry.relative_path,
+                )
+                .is_ok(),
+                "collection entry must resolve: {}",
+                entry.name
+            );
+            assert!(!Path::new(&entry.relative_path).is_absolute());
+        }
+        assert_eq!(entries[0].relative_path, "");
+        assert_eq!(entries[1].relative_path, "");
+        assert_eq!(entries[2].relative_path, "");
+        assert_eq!(entries[3].relative_path, "");
+        assert_eq!(entries[4].relative_path, "volume");
+        assert_eq!(entries[5].relative_path, "nested/page.jpg");
+        assert!(
+            !serde_json::to_string(&entries)
+                .unwrap()
+                .contains(temp.path().to_string_lossy().as_ref())
+        );
     }
 
     #[test]
@@ -1094,6 +1258,18 @@ mod tests {
         })
     }
 
+    fn tag_engine_with_registered(root: PathBuf, registered: Vec<PathBuf>) -> CollectionEngine {
+        let settings = Settings {
+            favorites: vec![FavoriteEntry::new("favorite".to_owned(), root)],
+            ..Default::default()
+        };
+        let roots = super::super::live_favorites::RemoteRoots::snapshot_with_registered(
+            settings.favorites.clone(),
+            mimageviewer_registered_roots::RegisteredRootsSnapshot::from_paths(registered),
+        );
+        CollectionEngine::new_with_roots(settings, roots)
+    }
+
     fn tag_request(tag: impl Into<String>) -> TagItemsRequest {
         TagItemsRequest {
             tag: tag.into(),
@@ -1112,6 +1288,13 @@ mod tests {
         match response {
             TagItemsResponse::Success(payload) => payload,
             TagItemsResponse::Error(error) => panic!("unexpected tag items error: {error:?}"),
+        }
+    }
+
+    fn collection_success(response: CollectionResponse) -> CollectionPayload {
+        match response {
+            CollectionResponse::Success(payload) => payload,
+            CollectionResponse::Error(error) => panic!("unexpected collection error: {error:?}"),
         }
     }
 
@@ -1161,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn tag_items_drop_outside_and_missing_paths_without_changing_tags_db() {
+    fn tag_items_include_registered_outside_paths_and_keep_missing_rows_unchanged() {
         let data_dir = crate::data_dir::TestDataDirGuard::new();
         let root = data_dir.path().join("favorite");
         let inside = root.join("inside.jpg");
@@ -1178,16 +1361,100 @@ mod tests {
         }
         drop(db);
 
-        let payload = tag_items_success(tag_engine(root).tag_items(tag_request("cat")));
+        let payload = tag_items_success(
+            tag_engine_with_registered(root, vec![outside.clone()]).tag_items(tag_request("cat")),
+        );
 
         assert_eq!(payload.state, TagIndexState::Ready);
-        assert_eq!(payload.listing.entries.len(), 1);
-        assert_eq!(payload.listing.entries[0].relative_path, "inside.jpg");
+        assert_eq!(payload.listing.entries.len(), 2);
+        let inside_entry = payload
+            .listing
+            .entries
+            .iter()
+            .find(|entry| entry.relative_path == "inside.jpg")
+            .unwrap();
+        assert!(!inside_entry.root_id.is_empty());
+        let outside_entry = payload
+            .listing
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.root_id
+                    == mimageviewer_registered_roots::registered_root_id(&outside).to_string()
+            })
+            .unwrap();
+        assert!(outside_entry.relative_path.is_empty());
         let json = serde_json::to_string(&payload).unwrap();
         assert!(!json.contains(&data_dir.path().to_string_lossy().to_string()));
         let db = crate::tags_db::TagsDb::open_readonly(&crate::tags_db::TagsDb::db_path()).unwrap();
         assert_eq!(db.display_tags_for_item(&missing_key), vec!["#cat"]);
         assert!(db.has_item_state(&missing_key));
+    }
+
+    #[test]
+    fn live_collection_settings_and_registered_roots_change_together() {
+        let data_dir = crate::settings_db::DataDirOverrideGuard::new();
+        let first_root = data_dir.path().join("books-first");
+        let second_root = data_dir.path().join("books-second");
+        std::fs::create_dir_all(first_root.join("First")).unwrap();
+        std::fs::create_dir_all(second_root.join("Second")).unwrap();
+        let mut first_smart = crate::settings::SmartFolderDefinition::new("First smart");
+        first_smart
+            .rules
+            .push(crate::settings::SmartFolderRule::new(
+                data_dir.path().join("smart-first"),
+                false,
+                Default::default(),
+            ));
+        let mut settings = Settings {
+            book_root: Some(first_root.clone()),
+            smart_folders: vec![first_smart],
+            ..Default::default()
+        };
+        let db = crate::settings_db::SettingsDb::create_new(data_dir.path()).unwrap();
+        db.save_full(&settings).unwrap();
+        let roots = super::super::live_favorites::RemoteRoots::live(Vec::new()).unwrap();
+        let engine = CollectionEngine::new_with_live_roots(settings.clone(), roots);
+
+        let first = collection_success(engine.collection(CollectionRequest {
+            kind: CollectionKind::Bookshelf,
+        }));
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(first.entries[0].name, "First");
+        assert_eq!(
+            first.entries[0].root_id,
+            mimageviewer_registered_roots::registered_root_id(&first_root).to_string()
+        );
+        let HomeResponse::Success(first_home) = engine.home() else {
+            panic!("initial home failed");
+        };
+        assert_eq!(first_home.smart_folders[0].name, "First smart");
+
+        let mut second_smart = crate::settings::SmartFolderDefinition::new("Second smart");
+        second_smart
+            .rules
+            .push(crate::settings::SmartFolderRule::new(
+                data_dir.path().join("smart-second"),
+                true,
+                Default::default(),
+            ));
+        settings.book_root = Some(second_root.clone());
+        settings.smart_folders = vec![second_smart];
+        db.save_full(&settings).unwrap();
+
+        let second = collection_success(engine.collection(CollectionRequest {
+            kind: CollectionKind::Bookshelf,
+        }));
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(second.entries[0].name, "Second");
+        assert_eq!(
+            second.entries[0].root_id,
+            mimageviewer_registered_roots::registered_root_id(&second_root).to_string()
+        );
+        let HomeResponse::Success(second_home) = engine.home() else {
+            panic!("refreshed home failed");
+        };
+        assert_eq!(second_home.smart_folders[0].name, "Second smart");
     }
 
     #[test]
@@ -1236,8 +1503,9 @@ mod tests {
         let item_key = crate::tags_db::item_key_for_path(&image);
         let item_keys = vec![item_key; MAX_REMOTE_COLLECTION_ENTRIES + 1];
 
+        let roots = allowed(vec![favorite]);
         let (entries, truncated) = map_tag_item_keys(
-            std::slice::from_ref(&favorite),
+            &roots,
             item_keys,
             TagItemKind::All,
             crate::tag_view::TAG_VIEW_RESULT_LIMIT,
@@ -1263,8 +1531,9 @@ mod tests {
         item_keys.push(crate::tags_db::item_key_for_path(&image));
         let favorite = FavoriteEntry::new("favorite".to_owned(), root);
 
+        let roots = allowed(vec![favorite]);
         let (entries, truncated) = map_tag_item_keys(
-            std::slice::from_ref(&favorite),
+            &roots,
             item_keys,
             TagItemKind::Image,
             crate::tag_view::TAG_VIEW_FILTERED_KEY_SCAN_LIMIT,
@@ -1409,8 +1678,8 @@ mod tests {
             })
             .collect();
 
-        let (entries, truncated) =
-            map_favorite_search_entries(std::slice::from_ref(&favorite), index_entries);
+        let roots = allowed(vec![favorite]);
+        let (entries, truncated) = map_favorite_search_entries(&roots, index_entries);
 
         assert_eq!(entries.len(), MAX_REMOTE_COLLECTION_ENTRIES);
         assert!(truncated);
