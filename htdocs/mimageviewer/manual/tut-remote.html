@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>外出先からリモートで見る — チュートリアル — mImageViewer</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="自宅 PC の mImageViewer のライブラリを、外出先のスマートフォンやタブレットのブラウザから見る手順と、有効にする前に知っておくこと。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/tut-remote.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/tut-remote.html">
+  <meta property="og:title" content="外出先からリモートで見る｜mImageViewer">
+  <meta property="og:description" content="自宅 PC の mImageViewer のライブラリを、外出先のスマートフォンやタブレットのブラウザから見る手順と、有効にする前に知っておくこと。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="外出先からリモートで見る｜mImageViewer">
+  <meta name="twitter:description" content="自宅 PC の mImageViewer のライブラリを、外出先のスマートフォンやタブレットのブラウザから見る手順と、有効にする前に知っておくこと。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>外出先からリモートで見る</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+
+    <h1 class="page-title">外出先からリモートで見る</h1>
+    <p class="page-desc">
+      自宅の PC で mImageViewer を起動したままにしておくと、外出先のスマートフォン・タブレット・
+      ノート PC のブラウザから、同じライブラリを開けます。画像も、漫画（ZIP / PDF）も、動画も、
+      手元の端末にコピーせずにそのまま見られます。読んだ位置や★は自宅 PC に記録されるので、
+      帰宅後は続きから読めます。
+    </p>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        <strong>この機能は既定でオフです。</strong>有効にすると、<strong>mImageViewer で閲覧できる
+        すべてのファイル</strong>が、この PC の Tailscale アドレスへ接続でき、PIN を知っている人から
+        見えるようになります。対象はお気に入りの中だけではなく、mImageViewer が開ける画像・動画・PDF
+        すべてです。次の「何が見えるようになるか」を読んでから有効にしてください。
+      </div>
+    </div>
+
+    <h2>何が見えるようになるか</h2>
+    <p>
+      リモートから読める範囲は、<strong>mImageViewer 本体で開ける範囲と同じ</strong>です。
+      本体で開けるフォルダは、リモートからも開けます。お気に入りに登録していないフォルダも、
+      別のドライブも同じです。
+    </p>
+    <p>
+      これは意図的な設計です。範囲を狭めると、タグや★を付けたファイル・読みかけの本が
+      「自宅では見えるのに外出先では開けない」という状態になり、しかもそれに気づくのが
+      外出先になってしまいます。また、狭めた範囲が確実に守られていることを保証しきれない以上、
+      「ここから先は読めません」と表示するより、<strong>読める範囲を正直に伝えたうえで
+      使っていただくほう</strong>が安全だと考えています。
+    </p>
+    <p>
+      具体的には次のとおりです。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>種類</th><th>リモートから</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>フォルダ名・ファイル名</td><td>一覧に表示されます</td></tr>
+          <tr><td>画像</td><td>表示できます</td></tr>
+          <tr><td>ZIP / PDF の中身</td><td>ページを開けます</td></tr>
+          <tr><td>動画</td><td>再生できます</td></tr>
+          <tr><td>上記以外のファイル</td><td>名前は一覧に出ますが、中身は送られません</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>誰が接続できるか</h2>
+    <p>
+      接続するには、次の <strong>2 つが両方とも</strong>必要です。
+    </p>
+    <ul>
+      <li><strong>同じ Tailscale ネットワークに参加している端末であること。</strong>
+      mImageViewer 自体はインターネットに直接出ません。自宅 PC の中だけで待ち受け、外への公開は
+      Tailscale に任せます。Tailscale に参加していない端末からは、URL を知っていても届きません。</li>
+      <li><strong>PIN を知っていること。</strong>接続すると 6 桁の PIN の入力を求められます。
+      何度も間違えると、しばらく受け付けなくなります。</li>
+    </ul>
+    <p>
+      このうち<strong>守りの中心は 1 つめ</strong>です。Tailscale ネットワークに入れる端末を
+      自分のものだけに限ることで、そもそも届く相手を絞っています。PIN は、その内側で
+      うっかり開かれないようにするための確認であって、PIN だけで守られているわけではありません。
+      <strong>Tailscale 側を緩めた状態で PIN に頼らないでください。</strong>
+    </p>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        <strong>自分が管理している端末からだけ使ってください。</strong>借りた PC や他人の端末を
+        Tailscale に参加させると、mImageViewer だけでなく、その Tailscale ネットワークにある
+        すべての機器へ届くようになります。この機能は「自分の端末から自分のライブラリを見る」
+        用途を想定しています。家族や友人とライブラリを共有する使い方は想定していません。
+      </div>
+    </div>
+
+    <h2>準備する</h2>
+    <p>
+      使い始めるまでに必要なものは 3 つです。
+    </p>
+    <ol>
+      <li><strong>Tailscale：</strong>自宅 PC と、外出先で使う端末の両方に入れて、
+      同じアカウントでサインインします。これで 2 台が同じネットワークに入ります。</li>
+      <li><strong>PIN：</strong>6 文字以上で決めます。外出先から接続するときに入力します。
+      自宅 PC の画面は見られないので、覚えられるものにしてください。</li>
+      <li><strong>mImageViewer 側で有効にする：</strong>メニューの
+      <strong>ヘルプ → リモート接続…</strong>を開き、
+      <strong>「この端末からリモート接続を利用する」</strong>にチェックを入れて
+      <strong>OK</strong> を押します。</li>
+    </ol>
+
+    <h2>接続する</h2>
+    <p>
+      有効にすると、<strong>ヘルプ → リモート接続…</strong>のウィンドウに接続先の URL と
+      QR コードが表示されます。手元の端末で QR コードを読み取るか、URL を開いてください。
+      PIN を入力すると一覧が表示されます。
+    </p>
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        QR コードに含まれるのは<strong>接続先だけ</strong>で、PIN は含まれません。
+        ただし、接続先を知られないこと自体を守りとして当てにしないでください。
+        守っているのは、Tailscale ネットワークに入れる端末を限っていることです。
+      </div>
+    </div>
+    <p>
+      ブラウザのメニューから「ホーム画面に追加」しておくと、次回からアプリのように起動できます。
+    </p>
+
+    <h2>リモートでできること</h2>
+    <p>
+      画面はスマートフォンでの操作を前提に作ってあります。左右のタップでページ送り、
+      中央のタップで上下バーの表示切り替え、上へスワイプでメニュー、下へスワイプで一覧、
+      ピンチで拡大です。初回に操作の説明が表示され、あとからメニューの
+      <strong>「操作方法を見る」</strong>でも読み直せます。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>できること</th><th>内容</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>一覧を見る</td><td>お気に入り / スマートフォルダ / 場所（読書履歴・レーティング・本棚・ブックマーク）</td></tr>
+          <tr><td>探す</td><td>フォルダ・ZIP・PDF を名前で検索、タグから探す</td></tr>
+          <tr><td>画像を見る</td><td>全体フィット / 幅フィット / 原寸、拡大とパン</td></tr>
+          <tr><td>漫画を読む</td><td>見開き表示（右綴じ / 左綴じ、表紙あり）、ページ位置の指定</td></tr>
+          <tr><td>動画を見る</td><td>自宅 PC 側で変換しながら配信します。画質を選べます</td></tr>
+          <tr><td>印を付ける</td><td>レーティング（★）、ブックマーク</td></tr>
+          <tr><td>見え方を調整する</td><td>画像補正、表示トリム</td></tr>
+          <tr><td>続きを覚える</td><td>読んだ位置が自宅 PC に記録されます</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      レーティング・ブックマーク・読書位置・見開き設定・補正は、リモートで操作すると
+      <strong>自宅 PC 側に記録されます</strong>。帰宅後に mImageViewer を見ると反映されています。
+    </p>
+
+    <h2>リモートではできないこと</h2>
+    <ul>
+      <li><strong>ファイルの操作：</strong>コピー・移動・削除・名前の変更はできません。
+      リモートからファイルが消えたり増えたりすることはありません。</li>
+      <li><strong>タグの付け外し：</strong>付いているタグから探すことはできますが、
+      リモートで付けたり外したりはできません。</li>
+      <li><strong>音声ファイルの再生：</strong>一覧には出ますが、再生はできません。</li>
+      <li><strong>ZIP / PDF 以外のアーカイブ：</strong>RAR や 7z などは開けません。
+      自宅 PC で ZIP に変換しておくと開けるようになります。</li>
+      <li><strong>複数の端末で同時に操作すること：</strong>操作できるのは常に 1 台です。
+      2 台目から操作すると、そちらへ操作が移ります。</li>
+    </ul>
+
+    <h2>リモート接続中の自宅 PC</h2>
+    <p>
+      リモートから操作している間、自宅 PC の mImageViewer には「リモート接続中」の表示が出て、
+      その PC 側での通常の操作は受け付けなくなります。同じライブラリを 2 か所から同時に動かして
+      食い違うのを防ぐためです。
+    </p>
+    <p>
+      自宅 PC 側の<strong>「切断する」</strong>を押せば、その場で操作を取り戻せます。
+      そのあとリモート側で何か操作すると、また向こうへ移ります。
+    </p>
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        リモートで再生していた動画や音声は、操作が切り替わった時点で止まります。
+        再生位置は残るので、続きから再生できます。
+      </div>
+    </div>
+
+    <h2>使い終わったら</h2>
+    <p>
+      しばらく操作がないと、接続は自動的に切れます（再生中は切れません）。
+      次に操作すれば、また接続されます。
+    </p>
+    <p>
+      機能そのものを止めたいときは、<strong>ヘルプ → リモート接続…</strong>で
+      <strong>「この端末からリモート接続を利用する」</strong>のチェックを外して <strong>OK</strong> を
+      押します。以降は待ち受けを行わないので、PIN を知っていても接続できなくなります。
+    </p>
+
+    <h2>ノート PC から見たいとき</h2>
+    <p>
+      この機能はスマートフォン・タブレットでの閲覧を主眼に作っています。ノート PC からブラウザで
+      開くこともできますが、画面の作りはスマートフォン向けのままです。
+    </p>
+    <p>
+      ノート PC からなら、次のほうが快適なことが多いです。どちらも mImageViewer の全機能を
+      そのまま使えます。
+    </p>
+    <ul>
+      <li><strong>リモートデスクトップ：</strong>自宅 PC の画面をそのまま操作します。</li>
+      <li><strong>ネットワークドライブ：</strong>自宅 PC のフォルダをドライブとして割り当てると、
+      ノート PC の mImageViewer から普通のフォルダとして開けます。</li>
+    </ul>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        リモートから見たいフォルダは、あらかじめ自宅 PC で<a href="tut-cache.html">サムネイルキャッシュ</a>を
+        作っておくと、一覧の表示が目に見えて速くなります。特に大きなフォルダで効果があります。
+      </div>
+    </div>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>
