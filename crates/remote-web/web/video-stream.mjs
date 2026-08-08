@@ -1727,6 +1727,12 @@ export class VideoStreamViewer {
       event.preventDefault();
       event.stopPropagation();
     };
+    this.onSeekKeyDown = () => {
+      delete this.seekInput.dataset.pointerFocus;
+    };
+    this.onSeekBlur = () => {
+      delete this.seekInput.dataset.pointerFocus;
+    };
     this.seekInput.addEventListener("input", this.onSeekInput);
     this.seekInput.addEventListener("change", this.onSeekChange);
     this.seekInput.addEventListener("pointerdown", this.onSeekPointerDown);
@@ -1734,6 +1740,8 @@ export class VideoStreamViewer {
     this.seekInput.addEventListener("pointerup", this.onSeekPointerUp);
     this.seekInput.addEventListener("pointercancel", this.onSeekPointerCancel);
     this.seekInput.addEventListener("click", this.onSeekClick);
+    this.seekInput.addEventListener("keydown", this.onSeekKeyDown);
+    this.seekInput.addEventListener("blur", this.onSeekBlur);
 
     this.onTimeUpdate = () => {
       this.notePlaybackProgress();
@@ -1905,6 +1913,9 @@ export class VideoStreamViewer {
       maxDistancePx: 0,
       previewRequest: null,
     };
+    // pointerdown の既定動作を止めているので、ブラウザはこの focus が指由来だと
+    // 判断できない。指由来であることはここで分かっているので、その事実を渡す。
+    this.seekInput.dataset.pointerFocus = "true";
     this.seekInput.focus({ preventScroll: true });
     try {
       this.seekInput.setPointerCapture(event.pointerId);
@@ -3746,6 +3757,8 @@ export class VideoStreamViewer {
     this.seekInput.removeEventListener("pointerup", this.onSeekPointerUp);
     this.seekInput.removeEventListener("pointercancel", this.onSeekPointerCancel);
     this.seekInput.removeEventListener("click", this.onSeekClick);
+    this.seekInput.removeEventListener("keydown", this.onSeekKeyDown);
+    this.seekInput.removeEventListener("blur", this.onSeekBlur);
     this.seekDragState = { kind: "idle" };
     this.stage.removeEventListener("pointerdown", this.pointerDown);
     this.stage.removeEventListener("pointermove", this.pointerMove);

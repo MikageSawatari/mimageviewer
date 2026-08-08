@@ -3877,12 +3877,23 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
       direction: seekState.direction,
       maxDistancePx: 0,
     };
+    // pointerdown の既定動作を止めているので、ブラウザはこの focus が指由来だと
+    // 判断できない。読み込み直後のようにまだ pointer 操作を観測していない文書では
+    // keyboard 由来として扱われ、指で触っただけでリングが出る。指由来であることは
+    // ここで分かっているので、その事実を渡す。
+    seekInput.dataset.pointerFocus = "true";
     seekInput.focus({ preventScroll: true });
     try {
       seekInput.setPointerCapture(event.pointerId);
     } catch (_error) {
       // Touch input generally has implicit capture; explicit capture may already be gone.
     }
+  });
+  seekInput.addEventListener("keydown", () => {
+    delete seekInput.dataset.pointerFocus;
+  });
+  seekInput.addEventListener("blur", () => {
+    delete seekInput.dataset.pointerFocus;
   });
   seekInput.addEventListener("pointermove", (event) => {
     if (!seekPointerDrag || seekPointerDrag.pointerId !== event.pointerId) return;

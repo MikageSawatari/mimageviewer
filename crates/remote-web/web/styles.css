@@ -987,6 +987,7 @@ button {
   position: absolute;
   z-index: 4;
   bottom: max(112px, calc(env(safe-area-inset-bottom) + 96px));
+  transition: opacity 0.12s ease;
   left: max(12px, env(safe-area-inset-left));
   display: flex;
   width: max-content;
@@ -1003,6 +1004,13 @@ button {
   box-shadow: 0 3px 12px rgb(0 0 0 / 36%);
   font-size: 0.78rem;
   line-height: 1.4;
+}
+
+/* 状態表示は HUD の持ち物。バーを隠して読んでいる間は本の上に何も置かない。 */
+.viewer-bars-hidden .viewer-ai-status {
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
 }
 
 .viewer-ai-status[hidden] {
@@ -1208,11 +1216,17 @@ button {
   touch-action: none;
 }
 
-.viewer-seek-input:focus:not(:focus-visible) {
+.viewer-seek-input:focus:not(:focus-visible),
+.viewer-seek-input[data-pointer-focus]:focus-visible {
   outline: none;
   box-shadow: none;
 }
 
+/* シークバーは pointerdown の既定動作を止めて自前で focus を当てるため、
+   ブラウザは「この focus が指由来か」を判断できない。読み込み直後のように
+   まだ pointer 操作を観測していない文書では keyboard 由来として扱われ、
+   指で触っただけでリングが出る。指由来であることは自分たちが知っているので、
+   その事実を data-pointer-focus で渡す。 */
 .viewer-seek-input:focus-visible {
   outline: 3px solid var(--accent);
   outline-offset: 2px;

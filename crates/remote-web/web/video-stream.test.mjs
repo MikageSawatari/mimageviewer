@@ -886,6 +886,7 @@ test("video seek pointer maps micro travel to an absolute tap and threshold trav
     disabled: false,
     value: "120",
     step: "0.1",
+    dataset: {},
     getBoundingClientRect: () => ({ left: 0, width: 300 }),
     focus: () => calls.push("focus"),
     setPointerCapture: (pointerId) => {

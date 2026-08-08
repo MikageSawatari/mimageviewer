@@ -506,13 +506,32 @@ test("image and video seek share tap-or-relative-drag handling without replacing
     css,
     /\.video-stream-seek \.viewer-seek-input\s*\{[^}]*height:\s*44px/
   );
+  // 指で触っただけでリングを出さないための刻印。pointerdown の既定動作を止めて
+  // 自前で focus を当てるため、指由来かどうかはブラウザには分からない。
+  assert.match(app, /seekInput\.dataset\.pointerFocus = "true"/);
+  assert.match(video, /this\.seekInput\.dataset\.pointerFocus = "true"/);
+  assert.match(app, /delete seekInput\.dataset\.pointerFocus/);
+  assert.match(video, /delete this\.seekInput\.dataset\.pointerFocus/);
   assert.match(
     css,
-    /\.viewer-seek-input:focus:not\(:focus-visible\)\s*\{[^}]*outline:\s*none/
+    /\.viewer-seek-input\[data-pointer-focus\]:focus-visible\s*\{[^}]*outline:\s*none/
+  );
+  assert.match(
+    css,
+    /\.viewer-seek-input:focus:not\(:focus-visible\)[^{]*\{[^}]*outline:\s*none/
   );
   assert.match(
     css,
     /\.viewer-seek-input:focus-visible\s*\{[^}]*outline:\s*3px solid var\(--accent\)/
+  );
+});
+
+test("viewer status overlays belong to the HUD and leave with it", async () => {
+  const css = await readFile(new URL("styles.css", here), "utf8");
+  // バーを隠して読んでいる間は、本の上に状態表示を置かない。
+  assert.match(
+    css,
+    /\.viewer-bars-hidden \.viewer-ai-status\s*\{[^}]*visibility:\s*hidden/
   );
 });
 
