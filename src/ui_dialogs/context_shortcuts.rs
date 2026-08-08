@@ -54,6 +54,21 @@ const FS_IMAGE_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     },
 ];
 
+const FS_IMAGE_TOUCH_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
+    FixedShortcutRow {
+        keys: "中央をタップ",
+        description: "上部バー、下部シークバー、左右のパネルハンドルを表示 / 非表示にする",
+    },
+    FixedShortcutRow {
+        keys: "左右をタップ",
+        description: "前または次のページへ移動する",
+    },
+    FixedShortcutRow {
+        keys: "2 本指でピンチ / 移動",
+        description: "画像をズーム / パンする",
+    },
+];
+
 const FS_VIDEO_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     FixedShortcutRow {
         keys: "?",
@@ -284,6 +299,19 @@ impl ShortcutHelpContext {
         }
     }
 
+    fn touch_rows(self) -> &'static [FixedShortcutRow] {
+        match self {
+            Self::FsImage => FS_IMAGE_TOUCH_SHORTCUT_ROWS,
+            Self::Grid
+            | Self::FsVideo
+            | Self::Erase
+            | Self::Conceal
+            | Self::Crop
+            | Self::LocalAdjust
+            | Self::Text => &[],
+        }
+    }
+
     fn includes_row(self, row: &CommandDisplayRow) -> bool {
         if row.spec.action.is_location_navigation_action() && row.shortcut_labels.is_empty() {
             return false;
@@ -356,6 +384,7 @@ impl App {
                             &self.keymap,
                             help_context.supplemental_action_rows(),
                         );
+                        draw_touch_rows(ui, help_context.touch_rows());
                         draw_fixed_rows(ui, &self.keymap, help_context.fixed_rows());
                     });
 
@@ -479,6 +508,26 @@ fn draw_fixed_rows(ui: &mut egui::Ui, keymap: &crate::keymap::Keymap, rows: &[Fi
         });
 }
 
+fn draw_touch_rows(ui: &mut egui::Ui, rows: &[FixedShortcutRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new("タッチ操作").strong());
+    ui.add_space(2.0);
+    egui::Grid::new(("context_shortcuts_touch", rows.as_ptr() as usize))
+        .num_columns(2)
+        .spacing([18.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            for row in rows {
+                ui.monospace(row.keys);
+                ui.label(row.description);
+                ui.end_row();
+            }
+        });
+}
+
 fn supplemental_action_shortcut_label(keymap: &crate::keymap::Keymap, action: KeyAction) -> String {
     let labels = keymap.chord_labels(action);
     if labels.is_empty() {
@@ -514,7 +563,7 @@ fn draw_supplemental_action_rows(
 
 #[cfg(test)]
 mod tests {
-    use super::supplemental_action_shortcut_label;
+    use super::{ShortcutHelpContext, supplemental_action_shortcut_label};
     use crate::keymap::{Chord, KeyAction, Keymap, KeymapSettings, ModKind};
 
     #[test]
@@ -537,5 +586,14 @@ mod tests {
             supplemental_action_shortcut_label(&Keymap::from_settings(&settings), action),
             "未設定"
         );
+    }
+
+    #[test]
+    fn touch_help_rows_are_limited_to_still_image_fullscreen() {
+        let rows = ShortcutHelpContext::FsImage.touch_rows();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|row| row.keys == "中央をタップ"));
+        assert!(ShortcutHelpContext::Grid.touch_rows().is_empty());
+        assert!(ShortcutHelpContext::FsVideo.touch_rows().is_empty());
     }
 }

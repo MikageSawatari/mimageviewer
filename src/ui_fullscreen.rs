@@ -1230,6 +1230,145 @@ fn still_seek_bar_visible_from_inputs(input: StillSeekBarVisibilityInputs) -> bo
             || input.touch_chrome_latched)
 }
 
+#[derive(Clone, Copy, Default)]
+struct StillTouchInputEnabledInputs {
+    is_video: bool,
+    is_music_view: bool,
+    has_fullscreen_item: bool,
+    dialog_open: bool,
+    wants_keyboard_input: bool,
+    ime_input_active: bool,
+    context_menu_open: bool,
+    spread_popup_open: bool,
+    fit_popup_open: bool,
+    slideshow_popup_open: bool,
+    rotation_popup_open: bool,
+    compare_wipe_active: bool,
+    panorama_active: bool,
+    analysis_active: bool,
+    overlay_edit_active: bool,
+    view_trim_active: bool,
+    zoom_active: bool,
+}
+
+fn still_touch_input_enabled(input: StillTouchInputEnabledInputs) -> bool {
+    !input.is_video
+        && !input.is_music_view
+        && input.has_fullscreen_item
+        && !input.dialog_open
+        && !input.wants_keyboard_input
+        && !input.ime_input_active
+        && !input.context_menu_open
+        && !input.spread_popup_open
+        && !input.fit_popup_open
+        && !input.slideshow_popup_open
+        && !input.rotation_popup_open
+        && !input.compare_wipe_active
+        && !input.panorama_active
+        && !input.analysis_active
+        && !input.overlay_edit_active
+        && !input.view_trim_active
+        && !input.zoom_active
+}
+
+#[derive(Clone, Copy)]
+struct StillTouchFirstRunHelpEligibility {
+    learned: bool,
+    touch_activity: bool,
+    gestures_disabled: bool,
+    touch_input_enabled: bool,
+}
+
+fn should_start_still_touch_first_run_help(input: StillTouchFirstRunHelpEligibility) -> bool {
+    !input.learned && input.touch_activity && !input.gestures_disabled && input.touch_input_enabled
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StillTouchFirstRunHelpPhase {
+    /// The contact which discovered the help is consumed only to show it.
+    AwaitingInitialRelease,
+    /// A later tap anywhere dismisses the help and reveals chrome.
+    Ready,
+}
+
+impl Default for StillTouchFirstRunHelpPhase {
+    fn default() -> Self {
+        Self::AwaitingInitialRelease
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StillTouchFirstRunHelpState {
+    scope: StillTouchChromeLatch,
+    phase: StillTouchFirstRunHelpPhase,
+}
+
+fn still_touch_first_run_help_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::new((
+        "miv_touch_first_run_help",
+        ctx.viewport_id(),
+        crate::touch_correlation::TouchSurface::StillFullscreen,
+    ))
+}
+
+fn still_touch_first_run_help_phase(
+    ctx: &egui::Context,
+    scope: StillTouchChromeLatch,
+) -> Option<StillTouchFirstRunHelpPhase> {
+    let id = still_touch_first_run_help_id(ctx);
+    ctx.data(|data| {
+        data.get_temp::<StillTouchFirstRunHelpState>(id)
+            .filter(|state| state.scope == scope)
+            .map(|state| state.phase)
+    })
+}
+
+fn set_still_touch_first_run_help_phase(
+    ctx: &egui::Context,
+    scope: StillTouchChromeLatch,
+    phase: StillTouchFirstRunHelpPhase,
+) {
+    let id = still_touch_first_run_help_id(ctx);
+    ctx.data_mut(|data| {
+        data.insert_temp(id, StillTouchFirstRunHelpState { scope, phase });
+    });
+    ctx.request_repaint();
+}
+
+fn clear_still_touch_first_run_help(ctx: &egui::Context) {
+    let id = still_touch_first_run_help_id(ctx);
+    let removed = ctx.data_mut(|data| {
+        data.remove_temp::<StillTouchFirstRunHelpState>(id)
+            .is_some()
+    });
+    if removed {
+        ctx.request_repaint();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StillTouchFirstRunHelpTapAction {
+    Ignore,
+    LearnAndShowChrome,
+}
+
+fn still_touch_first_run_help_tap_action(
+    phase: StillTouchFirstRunHelpPhase,
+    command: crate::touch_input::TouchCommand,
+) -> StillTouchFirstRunHelpTapAction {
+    if phase == StillTouchFirstRunHelpPhase::Ready
+        && matches!(
+            command,
+            crate::touch_input::TouchCommand::ToggleChrome
+                | crate::touch_input::TouchCommand::PageSide { .. }
+        )
+    {
+        StillTouchFirstRunHelpTapAction::LearnAndShowChrome
+    } else {
+        StillTouchFirstRunHelpTapAction::Ignore
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct StillTouchChromeLatch {
     fs_idx: usize,
@@ -1517,8 +1656,8 @@ fn adjustment_panel_should_auto_close(
 
 fn still_passive_side_panel_hover_enabled(cursor_hidden: bool, touch_chrome_latched: bool) -> bool {
     // Touch pointer emulation passes through the physical edge before a
-    // handle or edge swipe commits. Once touch chrome owns the panel reach
-    // path, passive hover must not pre-open a panel and invert its toggle.
+    // visible handle commits. Once touch chrome owns the panel reach path,
+    // passive hover must not pre-open a panel and invert its toggle.
     !cursor_hidden && !touch_chrome_latched
 }
 
@@ -5797,6 +5936,124 @@ fn interact_still_touch_panel_handle(
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StillTouchFirstRunHelpLayout {
+    full_rect: egui::Rect,
+    left_half: egui::Rect,
+    right_half: egui::Rect,
+    center_tap_rect: egui::Rect,
+}
+
+fn still_touch_first_run_help_layout(full_rect: egui::Rect) -> StillTouchFirstRunHelpLayout {
+    StillTouchFirstRunHelpLayout {
+        full_rect,
+        left_half: egui::Rect::from_min_max(
+            full_rect.min,
+            egui::pos2(full_rect.center().x, full_rect.max.y),
+        ),
+        right_half: egui::Rect::from_min_max(
+            egui::pos2(full_rect.center().x, full_rect.min.y),
+            full_rect.max,
+        ),
+        center_tap_rect: crate::touch_input::center_tap_rect(full_rect),
+    }
+}
+
+fn still_touch_first_run_help_shows_scaling_hint(ui_scale: f32) -> bool {
+    (crate::settings::normalize_ui_scale_factor(ui_scale) - 1.0).abs() < f32::EPSILON
+}
+
+fn paint_still_touch_first_run_help_overlay(
+    ui: &egui::Ui,
+    full_rect: egui::Rect,
+    show_scaling_hint: bool,
+) {
+    let layout = still_touch_first_run_help_layout(full_rect);
+    let painter = ui.painter();
+    painter.rect_filled(
+        layout.full_rect,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 178),
+    );
+    for side in [layout.left_half, layout.right_half] {
+        painter.rect_filled(
+            side,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(54, 90, 132, 58),
+        );
+    }
+    painter.rect_filled(
+        layout.center_tap_rect,
+        8.0,
+        egui::Color32::from_rgba_unmultiplied(45, 112, 185, 128),
+    );
+    painter.rect_stroke(
+        layout.center_tap_rect,
+        8.0,
+        egui::Stroke::new(3.0, egui::Color32::from_rgb(170, 218, 255)),
+        egui::StrokeKind::Inside,
+    );
+
+    let main_font = egui::FontId::proportional(18.0);
+    let sub_font = egui::FontId::proportional(14.0);
+    let center = layout.center_tap_rect.center();
+    painter.text(
+        center - egui::vec2(0.0, 12.0),
+        egui::Align2::CENTER_CENTER,
+        "中央をタップ",
+        main_font.clone(),
+        egui::Color32::WHITE,
+    );
+    painter.text(
+        center + egui::vec2(0.0, 14.0),
+        egui::Align2::CENTER_CENTER,
+        "メニューを表示",
+        sub_font.clone(),
+        egui::Color32::from_gray(224),
+    );
+
+    for (side, points_right) in [(layout.left_half, false), (layout.right_half, true)] {
+        let arrow_center = egui::pos2(side.center().x, center.y - 14.0);
+        draw_panel_callout_arrow(painter, arrow_center, points_right, egui::Color32::WHITE);
+        painter.text(
+            arrow_center + egui::vec2(0.0, 30.0),
+            egui::Align2::CENTER_CENTER,
+            "ページ送り",
+            sub_font.clone(),
+            egui::Color32::WHITE,
+        );
+    }
+
+    if show_scaling_hint {
+        painter.text(
+            full_rect.center_bottom() - egui::vec2(0.0, 16.0),
+            egui::Align2::CENTER_BOTTOM,
+            "UI が小さい場合はメニューの「スケーリング」から変更できます",
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_gray(198),
+        );
+    }
+}
+
+/// Visual-only fixture for first-run touch-help snapshots.
+#[doc(hidden)]
+pub fn draw_still_touch_first_run_help_snapshot_fixture(
+    ui: &mut egui::Ui,
+    learned: bool,
+    ui_scale: f32,
+) {
+    let full_rect = ui.max_rect();
+    ui.painter()
+        .rect_filled(full_rect, 0.0, egui::Color32::BLACK);
+    if !learned {
+        paint_still_touch_first_run_help_overlay(
+            ui,
+            full_rect,
+            still_touch_first_run_help_shows_scaling_hint(ui_scale),
+        );
+    }
+}
+
 /// Visual-only fixture used by the integration snapshots. Production handle
 /// geometry and painting are reused so latch-on/off and the unchanged mouse
 /// callout can be compared without constructing the full application state.
@@ -5856,6 +6113,33 @@ impl App {
     pub(crate) fn still_touch_chrome_is_latched(&self, ctx: &egui::Context) -> bool {
         self.fullscreen_idx
             .is_some_and(|idx| still_touch_chrome_latched(ctx, idx, self.fullscreen_opened_at()))
+    }
+
+    fn draw_still_touch_first_run_help_overlay(
+        &self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        fs_idx: usize,
+    ) {
+        let scope = StillTouchChromeLatch {
+            fs_idx,
+            session_started_at: self.fullscreen_opened_at(),
+        };
+        if still_touch_first_run_help_phase(ctx, scope).is_none() {
+            return;
+        }
+
+        let _ = ui.interact(
+            full_rect,
+            egui::Id::new(("fs_touch_first_run_help_sink", ctx.viewport_id())),
+            egui::Sense::click_and_drag(),
+        );
+        paint_still_touch_first_run_help_overlay(
+            ui,
+            full_rect,
+            still_touch_first_run_help_shows_scaling_hint(self.settings.ui_scale_factor),
+        );
     }
 
     fn open_still_side_panel_by_touch(&mut self, action: StillSidePanelAction) {
@@ -11271,6 +11555,12 @@ impl App {
                         // ── 中央の境界ヒント (最初/最後の項目です…) ──
                         self.draw_boundary_hint(ui, full_rect, ctx);
 
+                        // The touch help is the final canvas overlay: once it is visible,
+                        // no panel, page, or gesture target should appear above its guide.
+                        self.draw_still_touch_first_run_help_overlay(
+                            ui, ctx, full_rect, fs_idx,
+                        );
+
                         // ── スロット保存ダイアログ ──
                         self.draw_slot_save_dialog(ctx);
                         self.draw_favorite_default_clear_confirm_dialog(ctx);
@@ -16056,6 +16346,7 @@ impl App {
         };
         let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
         if self.capture_region_selection.is_some() {
+            clear_still_touch_first_run_help(ctx);
             let touch_frame = crate::touch_correlation::drive_egui_touch_input(
                 ctx,
                 crate::touch_correlation::TouchSurface::StillFullscreen,
@@ -16415,6 +16706,7 @@ impl App {
         // return below both latch updates prevents a captured navigator interaction from freezing
         // either panel while preserving the existing panel-state dependencies for later input.
         if navigator_consumed {
+            clear_still_touch_first_run_help(ctx);
             let touch_frame = crate::touch_correlation::drive_egui_touch_input(
                 ctx,
                 crate::touch_correlation::TouchSurface::StillFullscreen,
@@ -16457,6 +16749,37 @@ impl App {
                     touch_chrome_latched,
                 })
         });
+        let touch_input_enabled = still_touch_input_enabled(StillTouchInputEnabledInputs {
+            is_video: state.is_video,
+            is_music_view: music_view_active,
+            has_fullscreen_item: panel_fs_idx.is_some(),
+            dialog_open: self.any_dialog_open(),
+            wants_keyboard_input: ctx.wants_keyboard_input(),
+            ime_input_active: self.ime_input_active(ctx),
+            context_menu_open: self.fs_context_menu_idx.is_some(),
+            spread_popup_open: self.spread_popup_open,
+            fit_popup_open: self.fit_popup_open,
+            slideshow_popup_open: self.slideshow_popup_open,
+            rotation_popup_open: fs_rotation_popup_open(ctx),
+            compare_wipe_active,
+            panorama_active,
+            analysis_active: self.analysis_mode,
+            overlay_edit_active: self.is_overlay_edit_mode_active(),
+            view_trim_active: self.view_trim_mode,
+            zoom_active: self.fs_zoom_mode_engaged(),
+        });
+        let touch_help_scope = panel_fs_idx.map(|fs_idx| StillTouchChromeLatch {
+            fs_idx,
+            session_started_at: self.fullscreen_opened_at(),
+        });
+        let mut touch_help_phase_before =
+            touch_help_scope.and_then(|scope| still_touch_first_run_help_phase(ctx, scope));
+        if self.settings.touch_center_chrome_learned || !touch_input_enabled {
+            if touch_help_phase_before.is_some() {
+                clear_still_touch_first_run_help(ctx);
+                touch_help_phase_before = None;
+            }
+        }
         let mut touch_excluded: Vec<egui::Rect> = fullscreen_side_panel_rects(
             full_rect,
             side_panel_chrome_enabled,
@@ -16479,24 +16802,11 @@ impl App {
             self.adjustment_mode.is_open(),
             has_right_panel,
         );
-
-        let touch_input_enabled = !state.is_video
-            && !music_view_active
-            && panel_fs_idx.is_some()
-            && !self.any_dialog_open()
-            && !ctx.wants_keyboard_input()
-            && !self.ime_input_active(ctx)
-            && self.fs_context_menu_idx.is_none()
-            && !self.spread_popup_open
-            && !self.fit_popup_open
-            && !self.slideshow_popup_open
-            && !fs_rotation_popup_open(ctx)
-            && !compare_wipe_active
-            && !panorama_active
-            && !self.analysis_mode
-            && !self.is_overlay_edit_mode_active()
-            && !self.view_trim_mode
-            && !self.fs_zoom_mode_engaged();
+        if touch_help_phase_before.is_some() {
+            // The modal guide owns the whole surface, including chrome which
+            // would normally be excluded from center/page tap classification.
+            touch_excluded.clear();
+        }
         let touch_frame = crate::touch_correlation::drive_egui_touch_input(
             ctx,
             crate::touch_correlation::TouchSurface::StillFullscreen,
@@ -16510,7 +16820,33 @@ impl App {
             self.frame_counter,
             touch_input_enabled,
         );
-        let touch_bar_tap = top_bar_visible
+        let touch_activity = touch_frame.has_touch_derived_pointer_activity();
+        let touch_help_started_this_frame = touch_help_phase_before.is_none()
+            && touch_help_scope.is_some()
+            && should_start_still_touch_first_run_help(StillTouchFirstRunHelpEligibility {
+                learned: self.settings.touch_center_chrome_learned,
+                touch_activity,
+                gestures_disabled: crate::touch_correlation::touch_gestures_disabled(),
+                touch_input_enabled,
+            });
+        if touch_help_started_this_frame && let Some(scope) = touch_help_scope {
+            // The discovering contact is never also the dismissing contact.
+            // This keeps the guide visible after the first tap instead of
+            // flashing only between that tap's press and release.
+            set_still_touch_first_run_help_phase(
+                ctx,
+                scope,
+                StillTouchFirstRunHelpPhase::AwaitingInitialRelease,
+            );
+        }
+        let touch_help_phase_for_commands = if touch_help_started_this_frame {
+            Some(StillTouchFirstRunHelpPhase::AwaitingInitialRelease)
+        } else {
+            touch_help_phase_before
+        };
+        let touch_help_intercepts = touch_help_phase_for_commands.is_some();
+        let touch_bar_tap = !touch_help_intercepts
+            && top_bar_visible
             && prepare_bar_button_touch_targets(
                 ctx,
                 self.frame_counter,
@@ -16519,9 +16855,30 @@ impl App {
             );
         let touch_owner = touch_frame.owner();
         let touch_active = touch_frame.is_active();
-        let touch_has_replacement = !touch_frame.commands().is_empty();
+        let touch_has_replacement =
+            !touch_frame.commands().is_empty() || (touch_help_intercepts && touch_activity);
+        let initial_help_contact_pending = touch_help_started_this_frame
+            || touch_help_phase_before == Some(StillTouchFirstRunHelpPhase::AwaitingInitialRelease);
+        let mut touch_help_learned_this_frame = false;
         if touch_input_enabled {
             for command in touch_frame.clone().into_commands() {
+                if let Some(help_phase) = touch_help_phase_for_commands {
+                    if still_touch_first_run_help_tap_action(help_phase, command)
+                        == StillTouchFirstRunHelpTapAction::LearnAndShowChrome
+                        && let Some(scope) = touch_help_scope
+                    {
+                        set_still_touch_chrome_latch(ctx, scope, true);
+                        clear_still_touch_first_run_help(ctx);
+                        if !self.settings.touch_center_chrome_learned {
+                            self.settings.touch_center_chrome_learned = true;
+                            self.settings.save();
+                        }
+                        touch_help_learned_this_frame = true;
+                    }
+                    // Every command belongs to the modal guide while it is
+                    // visible. In particular, PageSide never reaches page_nav.
+                    continue;
+                }
                 if touch_panel_tap_command_dismisses_before_dispatch(
                     command,
                     self.adjustment_mode,
@@ -16570,6 +16927,14 @@ impl App {
                     | crate::touch_input::TouchCommand::ScrollGridEnd => {}
                 }
             }
+        }
+        if touch_help_intercepts
+            && !touch_help_learned_this_frame
+            && initial_help_contact_pending
+            && !touch_active
+            && let Some(scope) = touch_help_scope
+        {
+            set_still_touch_first_run_help_phase(ctx, scope, StillTouchFirstRunHelpPhase::Ready);
         }
         if touch_bar_tap
             || touch_has_replacement
@@ -30356,6 +30721,212 @@ mod tests {
             },
         ] {
             assert!(!still_seek_bar_visible_from_inputs(blocked));
+        }
+    }
+
+    #[test]
+    fn first_run_touch_help_requires_unlearned_enabled_touch_activity() {
+        let visible = StillTouchFirstRunHelpEligibility {
+            learned: false,
+            touch_activity: true,
+            gestures_disabled: false,
+            touch_input_enabled: true,
+        };
+        assert!(should_start_still_touch_first_run_help(visible));
+        for hidden in [
+            StillTouchFirstRunHelpEligibility {
+                learned: true,
+                ..visible
+            },
+            StillTouchFirstRunHelpEligibility {
+                touch_activity: false,
+                ..visible
+            },
+            StillTouchFirstRunHelpEligibility {
+                gestures_disabled: true,
+                ..visible
+            },
+            StillTouchFirstRunHelpEligibility {
+                touch_input_enabled: false,
+                ..visible
+            },
+        ] {
+            assert!(!should_start_still_touch_first_run_help(hidden));
+        }
+
+        // Reopening creates a new viewport/session scope, but the one
+        // persistent learned bit still suppresses the guide.
+        assert!(!should_start_still_touch_first_run_help(
+            StillTouchFirstRunHelpEligibility {
+                learned: true,
+                ..visible
+            }
+        ));
+    }
+
+    #[test]
+    fn first_run_touch_help_state_round_trips_without_nested_context_locking() {
+        let ctx = egui::Context::default();
+        let scope = StillTouchChromeLatch {
+            fs_idx: 7,
+            session_started_at: None,
+        };
+
+        set_still_touch_first_run_help_phase(&ctx, scope, StillTouchFirstRunHelpPhase::Ready);
+        assert_eq!(
+            still_touch_first_run_help_phase(&ctx, scope),
+            Some(StillTouchFirstRunHelpPhase::Ready)
+        );
+        clear_still_touch_first_run_help(&ctx);
+        assert_eq!(still_touch_first_run_help_phase(&ctx, scope), None);
+    }
+
+    #[test]
+    fn still_touch_input_availability_covers_all_suppressed_modes() {
+        let enabled = StillTouchInputEnabledInputs {
+            has_fullscreen_item: true,
+            ..Default::default()
+        };
+        assert!(still_touch_input_enabled(enabled));
+        for disabled in [
+            StillTouchInputEnabledInputs {
+                is_video: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                is_music_view: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                has_fullscreen_item: false,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                dialog_open: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                wants_keyboard_input: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                ime_input_active: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                context_menu_open: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                spread_popup_open: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                fit_popup_open: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                slideshow_popup_open: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                rotation_popup_open: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                compare_wipe_active: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                panorama_active: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                analysis_active: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                overlay_edit_active: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                view_trim_active: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                zoom_active: true,
+                ..enabled
+            },
+        ] {
+            assert!(!still_touch_input_enabled(disabled));
+        }
+    }
+
+    #[test]
+    fn first_run_help_tap_always_learns_and_never_selects_page_navigation() {
+        use crate::touch_input::TouchCommand;
+
+        for tap in [
+            TouchCommand::ToggleChrome,
+            TouchCommand::PageSide { left: true },
+            TouchCommand::PageSide { left: false },
+        ] {
+            assert_eq!(
+                still_touch_first_run_help_tap_action(StillTouchFirstRunHelpPhase::Ready, tap,),
+                StillTouchFirstRunHelpTapAction::LearnAndShowChrome
+            );
+            assert_eq!(
+                still_touch_first_run_help_tap_action(
+                    StillTouchFirstRunHelpPhase::AwaitingInitialRelease,
+                    tap,
+                ),
+                StillTouchFirstRunHelpTapAction::Ignore
+            );
+        }
+        assert_eq!(
+            still_touch_first_run_help_tap_action(
+                StillTouchFirstRunHelpPhase::Ready,
+                TouchCommand::Pan {
+                    delta: egui::vec2(20.0, 0.0),
+                },
+            ),
+            StillTouchFirstRunHelpTapAction::Ignore
+        );
+    }
+
+    #[test]
+    fn first_run_help_overlay_uses_the_classifier_center_rectangle() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(1200.0, 800.0));
+        let layout = still_touch_first_run_help_layout(viewport);
+        let expected = crate::touch_input::center_tap_rect(viewport);
+        assert_eq!(layout.center_tap_rect, expected);
+
+        let geometry = crate::touch_input::TapZoneGeometry {
+            surface: viewport,
+            excluded: Vec::new(),
+            behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                accepts_pinch: true,
+            },
+        };
+        for point in [
+            expected.left_top(),
+            expected.right_top(),
+            expected.left_bottom(),
+            expected.right_bottom(),
+            expected.center(),
+        ] {
+            assert_eq!(
+                crate::touch_input::classify_tap(&geometry, point),
+                crate::touch_input::TapZone::Center
+            );
+        }
+    }
+
+    #[test]
+    fn first_run_help_scaling_hint_is_only_for_one_hundred_percent() {
+        assert!(still_touch_first_run_help_shows_scaling_hint(1.0));
+        for scale in [0.9, 1.1, 1.5, 2.0] {
+            assert!(!still_touch_first_run_help_shows_scaling_hint(scale));
         }
     }
 

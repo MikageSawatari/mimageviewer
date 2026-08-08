@@ -25,7 +25,7 @@
 | [top-level-grid-view.md](top-level-grid-view.md) | 検索・★固定・サブ展開・スマートフォルダ等の最上位一覧 ownership / 復元 snapshot と、スマートフォルダ root / scoped drill の不変条件 |
 | [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md) | フルスクリーン / 検索結果 / 動画タイルをまたぐ Ctrl+↑↓・境界ヒント・前後移動の統一仕様メモ |
 | [keymap-spec.md](keymap-spec.md) + [key-customization-impl-plan.md](key-customization-impl-plan.md) + [key-command-catalog-plan.md](key-command-catalog-plan.md) | キーボード操作 / ショートカット / `consume_key` / `key_pressed` / native VK 判定 / コマンドカタログ化を触るとき。新しいキー操作は keymap 対応要否を必ず確認 |
-| [touch-support-plan.md](touch-support-plan.md) | **仕様確定 / Phase 2 一覧スクロール・ピンチ列数変更まで実装済み**。タブレット PC のタッチ操作対応。静止画フルスクリーンは左右タップのページ送り、中央タップの上下クローム、2 本指ズーム / パン、上バーのタッチ専用 hit resolver を配線済み。サムネイル一覧は行スナップを維持した 1 本指スクロール、進行方向への release 確定、2 本指ピンチによる列数変更を配線済み。左右パネルのタッチ導線は後続。選択済みセルの再タップ open は利用者判断で見送り。3 領域タップ + 中央クローム + anchor-fraction スクロール + ピンチの設計とフェーズ別工数。タッチ / ポインタ入力を触るときに読む |
+| [touch-support-plan.md](touch-support-plan.md) | **仕様確定 / Phase 2 + Step 3d まで実装済み**。タブレット PC のタッチ操作対応。静止画 / 本フルスクリーンは左右タップのページ送り、中央タップの上下クロームと左右パネルハンドル、2 本指ズーム / パン、中央タップを学習するまでの初回オーバーレイヘルプを配線済み。サムネイル一覧は行スナップを維持した 1 本指スクロール、進行方向への release 確定、2 本指ピンチによる列数変更を配線済み。選択済みセルの再タップ open は利用者判断で見送り。動画 / 音楽のタッチ操作は Phase 3。3 領域タップ + 中央クローム + anchor-fraction スクロール + ピンチの設計とフェーズ別工数。タッチ / ポインタ入力を触るときに読む |
 
 ## 仕様・機能
 

@@ -17,13 +17,35 @@ const TAP_MAX_DURATION_MS: u64 = 700;
 const PINCH_CONTACT_COUNT: usize = 2;
 
 /// The center rectangle uses the middle 32% of the surface width.
-const CENTER_LEFT_FRACTION: f32 = 0.34;
+const CENTER_LEFT_FRACTION: f64 = 0.34;
 /// The center rectangle uses the middle 32% of the surface width.
-const CENTER_RIGHT_FRACTION: f32 = 0.66;
+const CENTER_RIGHT_FRACTION: f64 = 0.66;
 /// Excluding the top 15% avoids visible top chrome.
-const CENTER_TOP_FRACTION: f32 = 0.15;
+const CENTER_TOP_FRACTION: f64 = 0.15;
 /// Excluding the bottom 25% avoids the seek bar and leaves page area available.
-const CENTER_BOTTOM_FRACTION: f32 = 0.75;
+const CENTER_BOTTOM_FRACTION: f64 = 0.75;
+
+/// Returns the exact center rectangle taught by the still-viewer touch help.
+///
+/// Keep the classifier and the overlay on this single geometry producer so
+/// the visible guide cannot drift away from the actual tap target.
+pub(crate) fn center_tap_rect(surface: Rect) -> Rect {
+    let width = surface.width().max(0.0);
+    let height = surface.height().max(0.0);
+    let fraction_coord = |min: f32, extent: f32, fraction: f64| {
+        (f64::from(min) + f64::from(extent) * fraction) as f32
+    };
+    Rect::from_min_max(
+        Pos2::new(
+            fraction_coord(surface.min.x, width, CENTER_LEFT_FRACTION),
+            fraction_coord(surface.min.y, height, CENTER_TOP_FRACTION),
+        ),
+        Pos2::new(
+            fraction_coord(surface.min.x, width, CENTER_RIGHT_FRACTION),
+            fraction_coord(surface.min.y, height, CENTER_BOTTOM_FRACTION),
+        ),
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TouchPhase {
@@ -86,20 +108,13 @@ pub(crate) fn classify_tap(geom: &TapZoneGeometry, pos: Pos2) -> TapZone {
         return TapZone::Excluded;
     }
 
-    let width = geom.surface.width().max(0.0);
-    let height = geom.surface.height().max(0.0);
-    let relative_x = if width > 0.0 {
-        (pos.x - geom.surface.min.x) / width
-    } else {
-        0.5
-    };
-    let relative_y = if height > 0.0 {
-        (pos.y - geom.surface.min.y) / height
-    } else {
-        0.5
-    };
-    if (CENTER_LEFT_FRACTION..=CENTER_RIGHT_FRACTION).contains(&relative_x)
-        && (CENTER_TOP_FRACTION..=CENTER_BOTTOM_FRACTION).contains(&relative_y)
+    let center = center_tap_rect(geom.surface);
+    // `egui::Rect::contains` excludes the maximum edge, while the established
+    // center-zone contract includes both fractional boundaries (`..=`).
+    // Keep that public behavior while sharing the exact rectangle producer
+    // with the visible first-run guide.
+    if (center.min.x..=center.max.x).contains(&pos.x)
+        && (center.min.y..=center.max.y).contains(&pos.y)
     {
         TapZone::Center
     } else {

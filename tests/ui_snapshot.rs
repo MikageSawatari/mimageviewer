@@ -236,6 +236,28 @@ fn still_touch_panel_handles_latched_dark() {
 }
 
 #[test]
+fn still_touch_first_run_help_unlearned_100_dark() {
+    snapshot_with_theme(
+        "still_touch_first_run_help_unlearned_100_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            mimageviewer::draw_still_touch_first_run_help_snapshot_fixture(ui, false, 1.0);
+        },
+    );
+}
+
+#[test]
+fn still_touch_first_run_help_learned_hidden_dark() {
+    snapshot_with_theme(
+        "still_touch_first_run_help_learned_hidden_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            mimageviewer::draw_still_touch_first_run_help_snapshot_fixture(ui, true, 1.0);
+        },
+    );
+}
+
+#[test]
 fn still_touch_panel_handles_unlatched_dark() {
     snapshot_with_theme(
         "still_touch_panel_handles_unlatched_dark",
