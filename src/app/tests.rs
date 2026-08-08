@@ -10501,6 +10501,55 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.adjustment_favorite_params.is_empty());
     }
 
+    /// パネルのスロットボタンで「その場所の標準」を選んでいるときは、キーボードの
+    /// `Ctrl+Alt+数字` と同じ書き込みになる。ページ個別は作らず、既にあれば解除される。
+    #[test]
+    fn panel_slot_load_writes_to_the_standard_when_the_panel_shows_standard() {
+        use crate::app::AdjustScopeSelection;
+
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/other/a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.settings.global_preset = params_with_brightness(5.0);
+        app.adjustment_page_params
+            .insert(idx, params_with_brightness(50.0));
+        app.settings.preset_slots.slots[0] = Some(crate::adjustment::PresetSlot {
+            name: "S".to_string(),
+            params: params_with_brightness(42.0),
+        });
+
+        app.load_slot_from_panel(0, idx, AdjustScopeSelection::Standard);
+
+        assert_eq!(app.settings.global_preset.brightness, 42.0);
+        assert!(!app.adjustment_page_params.contains_key(&idx));
+    }
+
+    /// 「このページ」を選んでいるときは標準に触れず、そのページの個別設定になる。
+    #[test]
+    fn panel_slot_load_writes_to_the_page_when_the_panel_shows_this_page() {
+        use crate::app::AdjustScopeSelection;
+
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/other/a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.settings.global_preset = params_with_brightness(5.0);
+        app.settings.preset_slots.slots[0] = Some(crate::adjustment::PresetSlot {
+            name: "S".to_string(),
+            params: params_with_brightness(42.0),
+        });
+
+        app.load_slot_from_panel(0, idx, AdjustScopeSelection::Page);
+
+        assert_eq!(app.settings.global_preset.brightness, 5.0);
+        assert_eq!(
+            app.adjustment_page_params
+                .get(&idx)
+                .expect("page override")
+                .brightness,
+            42.0
+        );
+    }
+
     #[test]
     fn apply_slot_to_default_scope_uses_global_when_nearest_favorite_is_off() {
         let mut app = setup_app();
