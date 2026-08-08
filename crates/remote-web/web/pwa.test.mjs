@@ -546,6 +546,21 @@ test("viewer status overlays belong to the HUD and leave with it", async () => {
   );
 });
 
+test("sorting hands the bar back, and form controls keep the page typography", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  const css = await readFile(new URL("styles.css", here), "utf8");
+  const change = app.match(/async function changeGridSortOrder[\s\S]*?\n}\n/)?.[0] ?? "";
+  assert.match(change, /gridSortWritePending = true/);
+  // 印を付けたまま一覧を描き直すと、新しいバーが「保存中」の姿で作られて操作できなくなる。
+  assert.ok(
+    change.indexOf("state.gridSortWritePending = false") <
+      change.indexOf("dispatchRoute()"),
+    "the write flag must be cleared before the grid is rebuilt from it"
+  );
+  // iOS は 16px 未満のフォーム部品に focus すると画面全体を拡大する。
+  assert.match(css, /(?:^|\n)select,\ninput,\ntextarea\s*\{[^}]*font:\s*inherit/);
+});
+
 async function pngDimensions(relativePath) {
   const bytes = await readFile(new URL(relativePath, here));
   assert.deepEqual(

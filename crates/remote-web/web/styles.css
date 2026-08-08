@@ -151,6 +151,16 @@ button {
   user-select: none;
 }
 
+/* ネイティブのフォーム部品は既定で本文のタイポグラフィを継がない。iOS は 16px 未満の
+   フォーム部品に focus すると画面全体を拡大するので、継がせないと拡大の原因になる。
+   選択やキャレットの挙動は部品ごとに違うので、button 固有の指定はここへ広げない。 */
+select,
+input,
+textarea {
+  color: inherit;
+  font: inherit;
+}
+
 #telemetry-hud {
   position: fixed;
   z-index: 100;

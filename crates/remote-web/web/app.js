@@ -3389,12 +3389,14 @@ async function changeGridSortOrder(sortOrder) {
     if (!next) throw new Error("並べ替えの保存結果を取得できませんでした。");
     state.gridSortState = next;
     applyRemoteStateGeneration(response.remote_state_generation, { reloadViewer: false });
-    rememberCurrentGridViewport();
-    renderLoading("並べ替えています");
-    await dispatchRoute();
   } finally {
+    // 保存はここで終わり。この後の再描画は保存の一部ではない。印を付けたまま一覧を
+    // 描き直すと、新しい並べ替えバーが「保存中」の姿で作られ、二度と操作できなくなる。
     state.gridSortWritePending = false;
   }
+  rememberCurrentGridViewport();
+  renderLoading("並べ替えています");
+  await dispatchRoute();
 }
 
 function buildBreadcrumbs() {
