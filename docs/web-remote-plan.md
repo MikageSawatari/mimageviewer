@@ -86,7 +86,7 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 
 | 対象 | 状況 |
 |---|---|
-| サムネイル | remote-web は `favorite_id + relative_path + target_px` を本体へ IPC 中継する。本体が catalog 参照、既存生成経路、`CachePolicy` に従う保存を担当する (§9) |
+| サムネイル | remote-web は `root_id + relative_path + target_px` を本体へ IPC 中継する。本体が catalog 参照、既存生成経路、`CachePolicy` に従う保存を担当する (§9) |
 | お気に入り | `settings.rs` の `FavoriteEntry` (安定 UUID + root path)。**そのまま公開 allowlist として使う** |
 | 補正・回転・トリム・モザイク・消しゴム・ローカル調整・コミック注釈 | `books::BookPageSource::Composited` + `BakedEditSnapshot` に**ヘッドレス合成が既にある**。入力も File / ZipEntry / PdfPage をカバー済み |
 | AI アップスケール・カラー化 | `page_requires_full_composite` から display-only として**意図的に除外**されている。ヘッドレス経路への追加は**新規作業** |
@@ -97,7 +97,7 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 
 ### 3.1 パス表現 — 絶対パスを URL に出さない
 
-クライアントとのやり取りは必ず **`favorite_id` (UUID) + お気に入り root からの相対パス**
+クライアントとのやり取りは必ず **`root_id` (UUID) + お気に入り root からの相対パス**
 で行う。絶対パスを受け付ける API を作らない。
 
 - 相対パスは正規化し、`..` を含む・ドライブ指定を含む・正規化後に root の外へ出るものは拒否
@@ -170,10 +170,10 @@ stdout は起動時 Bearer token を含むため収集せず、stderr の安全�
 | エンドポイント | 内容 |
 |---|---|
 | `GET /api/favorites` | お気に入り一覧 (id, 表示名) を JSON で返す |
-| `GET /api/list?fav=<uuid>&path=<rel>` | 本体の通常フォルダ一覧を IPC で取得する。従来の種別・表示名・相対パス・サイズ・mtime に加え、セルの `address` と吸収済み sidecar を含む `thumbnail_address` を返す |
-| `GET /api/thumb?fav=<uuid>&path=<rel>&w=<px>` | 画像・フォルダのサムネイルを本体へ IPC 中継し WebP で返す。本体未接続時は 503 と利用者向け理由を返す |
-| `GET /api/image-info?fav=<uuid>&path=<rel>` | EXIF 回転反映後の元画像寸法を返す。クライアントの実描画幅計算に使う |
-| `GET /api/image?fav=<uuid>&path=<rel>&w=<px>` | 画像を `w` に合わせて縮小し WebP で返す。リサイズ不要・EXIF identity・ブラウザ対応形式なら元バイトを素通しする |
+| `GET /api/list?root=<uuid>&path=<rel>` | 本体の通常フォルダ一覧を IPC で取得する。従来の種別・表示名・相対パス・サイズ・mtime に加え、セルの `address` と吸収済み sidecar を含む `thumbnail_address` を返す |
+| `GET /api/thumb?root=<uuid>&path=<rel>&w=<px>` | 画像・フォルダのサムネイルを本体へ IPC 中継し WebP で返す。本体未接続時は 503 と利用者向け理由を返す |
+| `GET /api/image-info?root=<uuid>&path=<rel>` | EXIF 回転反映後の元画像寸法を返す。クライアントの実描画幅計算に使う |
+| `GET /api/image?root=<uuid>&path=<rel>&w=<px>` | 画像を `w` に合わせて縮小し WebP で返す。リサイズ不要・EXIF identity・ブラウザ対応形式なら元バイトを素通しする |
 | `GET /` および静的ファイル | フロントエンドを配信 |
 
 - サムネイルの catalog 参照・キー生成・生成・保存判定は本体の既存経路に集約する。remote-web は
@@ -702,7 +702,7 @@ worker、request id 付き応答までを往復させ、両端の pipe 作成 fl
 IPC 応答をお気に入り境界で絞り込んだ後に最大 1000 件へ制限し、`truncated` /
 `entry_limit` を返して Web 画面に打ち切りを表示する。現段階ではページングは実装しない。
 
-IPC の `RemoteEntry` は `favorite_id`、お気に入り root からの `relative_path`、表示名、種別、
+IPC の `RemoteEntry` は `root_id`、お気に入り root からの `relative_path`、表示名、種別、
 進捗・レーティング等の表示用メタデータだけを持つ。候補の絶対 path は本体内で canonicalize し、
 最も深く一致するお気に入り root へ写像する。どのお気に入りにも属さない項目、欠落項目、
 junction / symlink で root 外へ出る項目は IPC 応答を作る前に除外する。remote-web も受信後に
@@ -710,7 +710,7 @@ UUID、相対 path、canonical containment を再検証する。したがって�
 レーティングが含まれていてもブラウザへは出ない。
 
 HTTP は認証必須の `GET /api/home` と `GET /api/collection` を追加する。集約一覧の通常画像・
-フォルダは既存 `/api/thumb?fav=<UUID>&path=<relative>&w=<px>` を使う。ZIP / PDF は §12 の増分で
+フォルダは既存 `/api/thumb?root=<UUID>&path=<relative>&w=<px>` を使う。ZIP / PDF は §12 の増分で
 コンテナ内ページまで閲覧可能になった。動画・音声・変換アーカイブの再生、および
 読書履歴・レーティング・ブックマーク等への書き込みは後続のセッションロック設計と一緒に行う。
 
@@ -748,7 +748,7 @@ remote thumbnail IPC の `\\.\pipe\mimageviewer-remote-thumbnail` はremote-web�
 ### 12.1 共通アドレスと境界検証
 
 `crates/remote-ipc` の `RemoteAddress` を本体と remote-web の唯一のアドレス表現とする。
-実ファイルは常に `favorite_id` と favorite root からの `relative_path` で表し、
+実ファイルは常に `root_id` と favorite root からの `relative_path` で表し、
 `RemoteSubresource` に `File`、`ZipDirectory { prefix }`、
 `ZipEntry { entry_name }`、`PdfPage { page_number }` を持つ。ZIP entry / prefix は
 `/` 区切りの相対表現だけを許し、先頭 slash、drive 指定、backslash、NUL、
@@ -1523,9 +1523,9 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-タグ閲覧を追加した 2026-08-08 時点の現行版は **v34**。
+住所の錨を `favorite_id` から `root_id` へ改名した 2026-08-08 時点の現行版は **v35**。
 `/api/page` と AI result の表示前照合、`FavoriteSearch`、タグ一覧・タグ項目検索は両側が
-v34 であることを前提とする。
+v35 であることを前提とする。
 
 ### 13.6 残タスク (2026-08-01 時点)
 

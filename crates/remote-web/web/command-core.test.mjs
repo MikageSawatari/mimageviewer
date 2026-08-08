@@ -433,7 +433,7 @@ test("normal telemetry keeps health facts but removes path, message and identity
     message: "server message C:/private/movie.mp4",
     stack: "at C:/private/app.js:10",
     resource: "/private/movie.mp4",
-    remote_address: { favorite_id: "fav", relative_path: "private/movie.mp4" },
+    remote_address: { root_id: "fav", relative_path: "private/movie.mp4" },
     client_id: "browser-client-secret",
     remote_session_correlation: "0123456789abcdef01234567",
   });
@@ -450,7 +450,7 @@ test("normal telemetry keeps health facts but removes path, message and identity
 
 test("page identity comparison distinguishes PDF documents, ZIP entries, and files", () => {
   const pdf = (relativePath) => ({
-    favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+    root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
     relative_path: relativePath,
     subresource: { kind: "pdf_page", page_number: 1 },
   });
@@ -465,7 +465,7 @@ test("page identity comparison distinguishes PDF documents, ZIP entries, and fil
   );
 
   const zipEntry = (entryName) => ({
-    favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+    root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
     relative_path: "books/first.zip",
     subresource: { kind: "zip_entry", entry_name: entryName },
   });
@@ -475,12 +475,12 @@ test("page identity comparison distinguishes PDF documents, ZIP entries, and fil
   );
   assert.notEqual(
     remoteAddressIdentity({
-      favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+      root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
       relative_path: "pages/001.jpg",
       subresource: { kind: "file" },
     }),
     remoteAddressIdentity({
-      favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+      root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
       relative_path: "pages/002.jpg",
       subresource: { kind: "file" },
     })
@@ -489,12 +489,12 @@ test("page identity comparison distinguishes PDF documents, ZIP entries, and fil
 
 test("normal mismatch telemetry retains only the two typed page identities", () => {
   const requested = {
-    favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+    root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
     relative_path: "private/first.pdf",
     subresource: { kind: "pdf_page", page_number: 1 },
   };
   const response = {
-    favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+    root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
     relative_path: "private/other.pdf",
     subresource: { kind: "pdf_page", page_number: 1 },
     session_id: "must-not-pass",
@@ -510,7 +510,7 @@ test("normal mismatch telemetry retains only the two typed page identities", () 
     category: "page_identity_mismatch",
     requested_page_identity: requested,
     response_page_identity: {
-      favorite_id: response.favorite_id,
+      root_id: response.root_id,
       relative_path: response.relative_path,
       subresource: response.subresource,
     },
@@ -598,7 +598,7 @@ test("debug telemetry keeps diagnostic context but redacts the live session capa
   const event = telemetryEventForTier({
     type: "video_health",
     trigger: "periodic",
-    remote_address: { favorite_id: "fav", relative_path: "movie.mp4" },
+    remote_address: { root_id: "fav", relative_path: "movie.mp4" },
     server_message: `session ${rawSession} failed`,
   }, {
     detailed: true,
@@ -1156,7 +1156,7 @@ test("opening a container in portrait plans no persistent spread write", () => {
 
 test("an explicit portrait selection writes the selected mode, not effective Single", () => {
   const address = {
-    favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
+    root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2",
     relative_path: "books/book.pdf",
     subresource: { kind: "file" },
   };

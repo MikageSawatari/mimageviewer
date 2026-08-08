@@ -188,7 +188,7 @@ impl ThumbnailEngine {
         };
         let resolved = match resolve_existing(
             &favorites,
-            &request.address.favorite_id,
+            &request.address.root_id,
             &request.address.relative_path,
         ) {
             Ok(path) => path,
@@ -487,9 +487,9 @@ fn is_container_path(path: &Path) -> bool {
 
 fn resolve_error_response(error: ResolveError) -> ThumbnailResponse {
     match error {
-        ResolveError::InvalidFavoriteId | ResolveError::InvalidRelativePath => error_response(
+        ResolveError::InvalidRootId | ResolveError::InvalidRelativePath => error_response(
             ThumbnailErrorCode::BadRequest,
-            "favorite_id または相対パスが不正です",
+            "root_id または相対パスが不正です",
         ),
         ResolveError::FavoriteNotFound => error_response(
             ThumbnailErrorCode::FavoriteNotFound,

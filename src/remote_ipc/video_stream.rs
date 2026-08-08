@@ -136,7 +136,7 @@ impl VideoStreamEngine {
                 "最新のお気に入りを読み込めませんでした",
             )
         })?;
-        let resolved = resolve_existing(&favorites, &address.favorite_id, &address.relative_path)
+        let resolved = resolve_existing(&favorites, &address.root_id, &address.relative_path)
             .map_err(resolve_error)?;
         if !resolved
             .canonical
@@ -462,7 +462,7 @@ fn audio_processing_payload(
 
 fn resolve_error(error: ResolveError) -> VideoStreamError {
     let (code, message) = match error {
-        ResolveError::InvalidFavoriteId | ResolveError::InvalidRelativePath => (
+        ResolveError::InvalidRootId | ResolveError::InvalidRelativePath => (
             VideoStreamErrorCode::BadRequest,
             "動画アドレスの形式が正しくありません",
         ),
@@ -617,18 +617,18 @@ mod tests {
         std::fs::write(root.join("movie.mp4"), b"fixture").unwrap();
         std::fs::write(root.join("notes.txt"), b"fixture").unwrap();
         let favorite = crate::settings::FavoriteEntry::new("fixture".to_owned(), root.clone());
-        let favorite_id = favorite.id.to_string();
+        let root_id = favorite.id.to_string();
         let mut settings = crate::settings::Settings::default();
         settings.favorites = vec![favorite];
         let engine = VideoStreamEngine::new(settings);
 
         let resolved = engine
-            .resolve_start_address(&RemoteAddress::file(&favorite_id, "movie.mp4"))
+            .resolve_start_address(&RemoteAddress::file(&root_id, "movie.mp4"))
             .unwrap();
         assert_eq!(resolved, root.join("movie.mp4"));
         assert_eq!(
             engine
-                .resolve_start_address(&RemoteAddress::file(&favorite_id, "../movie.mp4"))
+                .resolve_start_address(&RemoteAddress::file(&root_id, "../movie.mp4"))
                 .unwrap_err()
                 .code,
             VideoStreamErrorCode::BadRequest
@@ -645,7 +645,7 @@ mod tests {
         );
         assert_eq!(
             engine
-                .resolve_start_address(&RemoteAddress::file(&favorite_id, "notes.txt"))
+                .resolve_start_address(&RemoteAddress::file(&root_id, "notes.txt"))
                 .unwrap_err()
                 .code,
             VideoStreamErrorCode::Unsupported

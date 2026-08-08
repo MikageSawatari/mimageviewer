@@ -407,9 +407,9 @@ function normalizedRemoteSubresource(value) {
 export function normalizeRemotePageIdentity(value) {
   if (!value || typeof value !== "object") return null;
   if (
-    typeof value.favorite_id !== "string" ||
-    !value.favorite_id ||
-    value.favorite_id.length > 128 ||
+    typeof value.root_id !== "string" ||
+    !value.root_id ||
+    value.root_id.length > 128 ||
     typeof value.relative_path !== "string" ||
     value.relative_path.length > 4096 ||
     value.relative_path.includes("\0")
@@ -419,7 +419,7 @@ export function normalizeRemotePageIdentity(value) {
   const subresource = normalizedRemoteSubresource(value.subresource);
   if (!subresource) return null;
   return {
-    favorite_id: value.favorite_id,
+    root_id: value.root_id,
     relative_path: value.relative_path,
     subresource,
   };
@@ -437,7 +437,7 @@ export function remoteAddressIdentity(address) {
         ? String(target.page_number)
         : "";
   return [
-    normalized.favorite_id,
+    normalized.root_id,
     normalized.relative_path,
     target.kind,
     inner,
@@ -473,7 +473,7 @@ const NORMAL_TELEMETRY_OMIT_KEYS = new Set([
   "device_id",
   "diagnostic_message",
   "entry_name",
-  "favorite_id",
+  "root_id",
   "filename",
   "load_error_message",
   "message",

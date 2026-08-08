@@ -296,7 +296,7 @@ function detailedRemoteAddress(address) {
   const pageNumber = Number(subresource.page_number);
   if (Number.isSafeInteger(pageNumber) && pageNumber >= 0) detail.page_number = pageNumber;
   return {
-    favorite_id: boundedTelemetryText(address.favorite_id, 128),
+    root_id: boundedTelemetryText(address.root_id, 128),
     relative_path: boundedTelemetryText(address.relative_path, 600),
     subresource: detail,
   };
@@ -2094,7 +2094,7 @@ export class VideoStreamViewer {
       started = await this.apiPostJson(
         "/api/video/start",
         {
-          fav: this.address.favorite_id,
+          root: this.address.root_id,
           path: this.address.relative_path,
           quality: this.quality,
         },

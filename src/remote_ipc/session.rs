@@ -2296,7 +2296,7 @@ mod tests {
         let favorite = "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2";
         let container = mimageviewer_ipc::RemoteAddress::file(favorite, "books/book.pdf");
         let page = mimageviewer_ipc::RemoteAddress {
-            favorite_id: favorite.to_owned(),
+            root_id: favorite.to_owned(),
             relative_path: "books/book.pdf".to_owned(),
             subresource: mimageviewer_ipc::RemoteSubresource::PdfPage { page_number: 3 },
         };

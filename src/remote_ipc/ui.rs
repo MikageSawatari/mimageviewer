@@ -2504,13 +2504,13 @@ fn remote_spread_key(
             "コンテンツアドレスが不正です",
         )
     })?;
-    let favorite_id = uuid::Uuid::parse_str(&address.favorite_id).map_err(|_| {
-        RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, "favorite_id が不正です")
+    let root_id = uuid::Uuid::parse_str(&address.root_id).map_err(|_| {
+        RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, "root_id が不正です")
     })?;
     let favorite = settings
         .favorites
         .iter()
-        .find(|favorite| favorite.id == favorite_id)
+        .find(|favorite| favorite.id == root_id)
         .ok_or_else(|| {
             RemoteWriteError::new(
                 RemoteWriteErrorCode::FavoriteNotFound,
@@ -2814,13 +2814,13 @@ fn remote_logical_path(
             "コンテンツアドレスが不正です",
         )
     })?;
-    let favorite_id = uuid::Uuid::parse_str(&address.favorite_id).map_err(|_| {
-        RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, "favorite_id が不正です")
+    let root_id = uuid::Uuid::parse_str(&address.root_id).map_err(|_| {
+        RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, "root_id が不正です")
     })?;
     let favorite = settings
         .favorites
         .iter()
-        .find(|favorite| favorite.id == favorite_id)
+        .find(|favorite| favorite.id == root_id)
         .ok_or_else(|| {
             RemoteWriteError::new(
                 RemoteWriteErrorCode::FavoriteNotFound,
@@ -3154,15 +3154,15 @@ mod tests {
         std::fs::create_dir_all(root.join("album")).unwrap();
         std::fs::write(root.join("album/book.zip"), b"zip").unwrap();
         let favorite = crate::settings::FavoriteEntry::new("test".to_owned(), root);
-        let favorite_id = favorite.id.to_string();
+        let root_id = favorite.id.to_string();
         let mut settings = crate::settings::Settings::default();
         settings.favorites = vec![favorite.clone()];
 
         for relative in ["", "album/book.zip"] {
-            let address = mimageviewer_ipc::RemoteAddress::file(&favorite_id, relative);
+            let address = mimageviewer_ipc::RemoteAddress::file(&root_id, relative);
             let worker = crate::remote_ipc::path_guard::resolve_existing(
                 std::slice::from_ref(&favorite),
-                &favorite_id,
+                &root_id,
                 relative,
             )
             .unwrap();
@@ -3176,14 +3176,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("favorite");
         let favorite = crate::settings::FavoriteEntry::new("test".to_owned(), root.clone());
-        let favorite_id = favorite.id.to_string();
+        let root_id = favorite.id.to_string();
         let settings = crate::settings::Settings {
             favorites: vec![favorite],
             ..Default::default()
         };
 
-        let folder = mimageviewer_ipc::RemoteAddress::file(&favorite_id, "album");
-        let image = mimageviewer_ipc::RemoteAddress::file(&favorite_id, "album/page.jpg");
+        let folder = mimageviewer_ipc::RemoteAddress::file(&root_id, "album");
+        let image = mimageviewer_ipc::RemoteAddress::file(&root_id, "album/page.jpg");
         let image_target = remote_rating_target(&settings, &image).unwrap();
         assert_eq!(
             image_target.key,
@@ -3203,7 +3203,7 @@ mod tests {
         assert_eq!(bookmark.page_index_hint, 4);
 
         let zip_page = mimageviewer_ipc::RemoteAddress {
-            favorite_id,
+            root_id,
             relative_path: "books/book.cbz".to_owned(),
             subresource: RemoteSubresource::ZipEntry {
                 entry_name: "chapter/001.png".to_owned(),

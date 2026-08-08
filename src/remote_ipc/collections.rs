@@ -769,7 +769,7 @@ fn remote_entry_from_candidate(
 ) -> Option<RemoteEntry> {
     let mapped = map_existing_to_resolved_favorite(roots, &candidate.path)?;
     Some(RemoteEntry {
-        favorite_id: mapped.favorite_id,
+        root_id: mapped.root_id,
         relative_path: mapped.relative_path,
         name: if candidate.name.trim().is_empty() {
             file_name(&candidate.path)
@@ -1034,7 +1034,7 @@ mod tests {
         ];
         let entries = to_remote_entries(std::slice::from_ref(&favorite), candidates);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].favorite_id, favorite.id.to_string());
+        assert_eq!(entries[0].root_id, favorite.id.to_string());
         assert_eq!(entries[0].relative_path, "album/page.jpg");
         assert!(!Path::new(&entries[0].relative_path).is_absolute());
         let json = serde_json::to_string(&entries).unwrap();
@@ -1045,7 +1045,7 @@ mod tests {
     fn aggregate_payload_is_bounded_to_one_thousand_entries() {
         let entries = (0..=MAX_REMOTE_COLLECTION_ENTRIES)
             .map(|index| RemoteEntry {
-                favorite_id: "00000000-0000-0000-0000-000000000000".to_owned(),
+                root_id: "00000000-0000-0000-0000-000000000000".to_owned(),
                 relative_path: format!("entry-{index}"),
                 name: format!("entry-{index}"),
                 kind: RemoteEntryKind::Image,
@@ -1386,10 +1386,7 @@ mod tests {
 
         assert_eq!(payload.index_state, FavoriteSearchIndexState::Ready);
         assert_eq!(payload.listing.entries.len(), 1);
-        assert_eq!(
-            payload.listing.entries[0].favorite_id,
-            favorite.id.to_string()
-        );
+        assert_eq!(payload.listing.entries[0].root_id, favorite.id.to_string());
         assert_eq!(payload.listing.entries[0].relative_path, "match-inside");
         assert!(!Path::new(&payload.listing.entries[0].relative_path).is_absolute());
         let json = serde_json::to_string(&payload).unwrap();

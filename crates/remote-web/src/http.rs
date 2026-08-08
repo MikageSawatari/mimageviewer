@@ -1027,7 +1027,7 @@ struct SessionPingBody {
 
 #[derive(Deserialize)]
 struct VideoStartBody {
-    fav: String,
+    root: String,
     path: String,
     quality: VideoStreamQuality,
 }
@@ -1072,7 +1072,7 @@ fn api_video_start(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let address = RemoteAddress::file(body.fav, body.path);
+    let address = RemoteAddress::file(body.root, body.path);
     if let Err(error) = state.library.validate_remote_file_video(&address) {
         return store_error_response(error).with_header("Cache-Control", "no-store");
     }
@@ -2471,10 +2471,10 @@ fn api_list(
     query: &[(String, String)],
     owner: &RemoteSessionIdentity,
 ) -> HttpResponse {
-    let Some((favorite, path)) = favorite_and_path(query) else {
+    let Some((root, path)) = root_and_path(query) else {
         return HttpResponse::text(400, "Bad Request");
     };
-    let address = RemoteAddress::file(favorite.to_string(), path);
+    let address = RemoteAddress::file(root.to_string(), path);
     if let Err(error) = state.library.validate_remote_address(&address) {
         return store_error_response(error);
     }
@@ -2526,7 +2526,7 @@ fn api_list(
                 .filter(|entry| entry.kind == RemoteEntryKind::Pdf)
                 .count();
             let response = json!({
-                "favorite_id": payload.effective_address.favorite_id,
+                "root_id": payload.effective_address.root_id,
                 "path": payload.effective_address.relative_path,
                 "thumb_aspect_height_ratio": payload.thumb_aspect_height_ratio,
                 "sort_state": payload.sort_state,
@@ -3295,10 +3295,10 @@ fn ipc_error_response(
 }
 
 fn api_image_info(state: &AppState, query: &[(String, String)]) -> HttpResponse {
-    let Some((favorite, path)) = favorite_and_path(query) else {
+    let Some((root, path)) = root_and_path(query) else {
         return HttpResponse::text(400, "Bad Request");
     };
-    match state.library.image_info(favorite, path) {
+    match state.library.image_info(root, path) {
         Ok(value) => HttpResponse::json(&value)
             .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
             .with_header("Cache-Control", "private, max-age=60"),
@@ -3307,7 +3307,7 @@ fn api_image_info(state: &AppState, query: &[(String, String)]) -> HttpResponse 
 }
 
 fn api_image(state: &AppState, query: &[(String, String)]) -> HttpResponse {
-    let Some((favorite, path)) = favorite_and_path(query) else {
+    let Some((root, path)) = root_and_path(query) else {
         return HttpResponse::text(400, "Bad Request");
     };
     let width = match required_query_value(query, "w").and_then(|value| {
@@ -3320,7 +3320,7 @@ fn api_image(state: &AppState, query: &[(String, String)]) -> HttpResponse {
         Err(()) => return HttpResponse::text(400, "Bad Request"),
     };
 
-    match state.library.image(favorite, path, width) {
+    match state.library.image(root, path, width) {
         Ok(value) => HttpResponse::bytes(200, value.content_type, value.bytes)
             .with_header("Cache-Control", "private, max-age=60")
             .with_log_details(json!({"image": value.metrics})),
@@ -3397,17 +3397,17 @@ fn read_body_limited(request: &mut Request, limit: usize) -> Result<Vec<u8>, Bod
     Ok(body)
 }
 
-fn favorite_and_path(query: &[(String, String)]) -> Option<(Uuid, &str)> {
-    let favorite = required_query_value(query, "fav")
+fn root_and_path(query: &[(String, String)]) -> Option<(Uuid, &str)> {
+    let root = required_query_value(query, "root")
         .ok()?
         .parse::<Uuid>()
         .ok()?;
     let path = required_query_value(query, "path").ok()?;
-    Some((favorite, path))
+    Some((root, path))
 }
 
 fn remote_address_from_query(query: &[(String, String)]) -> Result<RemoteAddress, ()> {
-    let (favorite, path) = favorite_and_path(query).ok_or(())?;
+    let (root, path) = root_and_path(query).ok_or(())?;
     let entry = query_value(query, "entry")?;
     let prefix = query_value(query, "prefix")?;
     let page = query_value(query, "page")?;
@@ -3432,7 +3432,7 @@ fn remote_address_from_query(query: &[(String, String)]) -> Result<RemoteAddress
         RemoteSubresource::File
     };
     let address = RemoteAddress {
-        favorite_id: favorite.to_string(),
+        root_id: root.to_string(),
         relative_path: path.to_owned(),
         subresource,
     };
@@ -3823,8 +3823,8 @@ mod tests {
 
     #[test]
     fn duplicate_security_parameters_are_rejected() {
-        let query = parse_query("fav=a&fav=b").unwrap();
-        assert!(query_value(&query, "fav").is_err());
+        let query = parse_query("root=a&root=b").unwrap();
+        assert!(query_value(&query, "root").is_err());
     }
 
     #[test]
@@ -3849,14 +3849,14 @@ mod tests {
     fn remote_address_query_rejects_zip_traversal_and_mixed_targets() {
         let id = "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2";
         let traversal =
-            parse_query(&format!("fav={id}&path=book.zip&entry=..%2Fsecret.jpg")).unwrap();
+            parse_query(&format!("root={id}&path=book.zip&entry=..%2Fsecret.jpg")).unwrap();
         assert!(remote_address_from_query(&traversal).is_err());
 
-        let mixed = parse_query(&format!("fav={id}&path=book.pdf&page=1&entry=page.jpg")).unwrap();
+        let mixed = parse_query(&format!("root={id}&path=book.pdf&page=1&entry=page.jpg")).unwrap();
         assert!(remote_address_from_query(&mixed).is_err());
 
         let valid = parse_query(&format!(
-            "fav={id}&path=book.zip&entry=chapter.zip%2F001.jpg"
+            "root={id}&path=book.zip&entry=chapter.zip%2F001.jpg"
         ))
         .unwrap();
         assert!(matches!(
@@ -3869,7 +3869,7 @@ mod tests {
     #[test]
     fn page_identity_header_is_ascii_and_round_trips_unicode_relative_paths() {
         let identity = RemoteAddress {
-            favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
+            root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
             relative_path: "本棚/第一巻.pdf".to_owned(),
             subresource: RemoteSubresource::PdfPage { page_number: 1 },
         };
@@ -4064,18 +4064,18 @@ mod tests {
         }
         std::fs::create_dir(temp.path().join("not-a-page.jpg")).unwrap();
         let library = Library::with_favorite_for_test(favorite_id, temp.path().to_owned());
-        let favorite_id = favorite_id.to_string();
+        let root_id = favorite_id.to_string();
 
-        let folder_page = RemoteAddress::file(favorite_id.clone(), "page.jpg");
+        let folder_page = RemoteAddress::file(root_id.clone(), "page.jpg");
         let zip_page = RemoteAddress {
-            favorite_id: favorite_id.clone(),
+            root_id: root_id.clone(),
             relative_path: "book.zip".to_owned(),
             subresource: RemoteSubresource::ZipEntry {
                 entry_name: "001.jpg".to_owned(),
             },
         };
         let pdf_page = RemoteAddress {
-            favorite_id: favorite_id.clone(),
+            root_id: root_id.clone(),
             relative_path: "book.pdf".to_owned(),
             subresource: RemoteSubresource::PdfPage { page_number: 0 },
         };
@@ -4084,38 +4084,26 @@ mod tests {
         assert!(validate_page_address(&library, &zip_page).is_ok());
         assert!(validate_page_address(&library, &pdf_page).is_ok());
         assert!(matches!(
-            validate_page_address(
-                &library,
-                &RemoteAddress::file(favorite_id.clone(), "movie.mp4")
-            ),
+            validate_page_address(&library, &RemoteAddress::file(root_id.clone(), "movie.mp4")),
+            Err(StoreError::BadRequest)
+        ));
+        assert!(matches!(
+            validate_page_address(&library, &RemoteAddress::file(root_id.clone(), "song.mp3")),
+            Err(StoreError::BadRequest)
+        ));
+        assert!(matches!(
+            validate_page_address(&library, &RemoteAddress::file(root_id.clone(), "notes.txt")),
             Err(StoreError::BadRequest)
         ));
         assert!(matches!(
             validate_page_address(
                 &library,
-                &RemoteAddress::file(favorite_id.clone(), "song.mp3")
+                &RemoteAddress::file(root_id.clone(), "not-a-page.jpg")
             ),
             Err(StoreError::BadRequest)
         ));
         assert!(matches!(
-            validate_page_address(
-                &library,
-                &RemoteAddress::file(favorite_id.clone(), "notes.txt")
-            ),
-            Err(StoreError::BadRequest)
-        ));
-        assert!(matches!(
-            validate_page_address(
-                &library,
-                &RemoteAddress::file(favorite_id.clone(), "not-a-page.jpg")
-            ),
-            Err(StoreError::BadRequest)
-        ));
-        assert!(matches!(
-            validate_page_address(
-                &library,
-                &RemoteAddress::file(favorite_id, "../outside.jpg")
-            ),
+            validate_page_address(&library, &RemoteAddress::file(root_id, "../outside.jpg")),
             Err(StoreError::BadRequest)
         ));
     }
@@ -4128,17 +4116,17 @@ mod tests {
         std::fs::write(temp.path().join("page.jpg"), b"fixture").unwrap();
         std::fs::create_dir(temp.path().join("folder.mp4")).unwrap();
         let library = Library::with_favorite_for_test(favorite_id, temp.path().to_owned());
-        let favorite_id = favorite_id.to_string();
+        let root_id = favorite_id.to_string();
 
         assert!(
             library
-                .validate_remote_file_video(&RemoteAddress::file(favorite_id.clone(), "movie.mp4",))
+                .validate_remote_file_video(&RemoteAddress::file(root_id.clone(), "movie.mp4",))
                 .is_ok()
         );
         for path in ["page.jpg", "folder.mp4", "../movie.mp4"] {
             assert!(
                 library
-                    .validate_remote_file_video(&RemoteAddress::file(favorite_id.clone(), path,))
+                    .validate_remote_file_video(&RemoteAddress::file(root_id.clone(), path,))
                     .is_err(),
                 "{path}",
             );
@@ -4324,7 +4312,7 @@ mod tests {
             (
                 Method::Post,
                 "/api/video/start",
-                r#"{"fav":"00000000-0000-0000-0000-000000000000","path":"movie.mp4","quality":"standard"}"#,
+                r#"{"root":"00000000-0000-0000-0000-000000000000","path":"movie.mp4","quality":"standard"}"#,
             ),
             (
                 Method::Post,
@@ -4756,9 +4744,9 @@ mod tests {
 
     #[test]
     fn thumbnail_diagnostics_distinguish_container_source_without_logging_a_path() {
-        let favorite_id = Uuid::nil().to_string();
-        let zip = RemoteAddress::file(favorite_id.clone(), "books/volume.ZIP");
-        let pdf = RemoteAddress::file(favorite_id, "books/volume.pdf");
+        let root_id = Uuid::nil().to_string();
+        let zip = RemoteAddress::file(root_id.clone(), "books/volume.ZIP");
+        let pdf = RemoteAddress::file(root_id, "books/volume.pdf");
         assert_eq!(remote_source_kind(&zip), "zip");
         assert_eq!(remote_source_kind(&pdf), "pdf");
         assert_eq!(remote_address_kind(&zip), "file");

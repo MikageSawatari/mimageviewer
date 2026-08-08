@@ -95,7 +95,7 @@ test("video start ends a busy attempt visibly instead of retrying forever", asyn
   const viewer = {
     playbackControlState: VideoPlaybackControlState.PLAY_REQUESTED,
     destroyed: false,
-    address: { favorite_id: "favorite", relative_path: "movie.mp4" },
+    address: { root_id: "favorite", relative_path: "movie.mp4" },
     quality: "standard",
     abortController: { signal: new AbortController().signal },
     clearPoll: () => {},
@@ -355,7 +355,7 @@ test("video health normal tier has no path while debug context adds a bounded re
     detailedContext: {
       enabled: true,
       address: {
-        favorite_id: "favorite-1",
+        root_id: "favorite-1",
         relative_path: "private/movie.mp4",
         subresource: { kind: "file" },
       },

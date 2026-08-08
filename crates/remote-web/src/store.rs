@@ -237,7 +237,7 @@ impl Library {
             return;
         };
         entries.retain(|entry| {
-            let Ok(id) = Uuid::parse_str(&entry.favorite_id) else {
+            let Ok(id) = Uuid::parse_str(&entry.root_id) else {
                 return false;
             };
             let Some(favorite) = favorite_from_snapshot(&snapshot, id) else {
@@ -277,7 +277,7 @@ impl Library {
         ) {
             return Err(StoreError::BadRequest);
         }
-        let id = Uuid::parse_str(&address.favorite_id).map_err(|_| StoreError::BadRequest)?;
+        let id = Uuid::parse_str(&address.root_id).map_err(|_| StoreError::BadRequest)?;
         let favorite = self.favorite(id)?;
         let path = resolve_existing(&favorite.path, &address.relative_path)?;
         let metadata = std::fs::metadata(&path)?;
@@ -300,7 +300,7 @@ impl Library {
         ) {
             return Err(StoreError::BadRequest);
         }
-        let id = Uuid::parse_str(&address.favorite_id).map_err(|_| StoreError::BadRequest)?;
+        let id = Uuid::parse_str(&address.root_id).map_err(|_| StoreError::BadRequest)?;
         let favorite = self.favorite(id)?;
         let path = resolve_existing(&favorite.path, &address.relative_path)?;
         let metadata = std::fs::metadata(&path)?;
@@ -458,7 +458,7 @@ fn validate_remote_address_in(
     address
         .validate_syntax()
         .map_err(|_| StoreError::BadRequest)?;
-    let id = Uuid::parse_str(&address.favorite_id).map_err(|_| StoreError::BadRequest)?;
+    let id = Uuid::parse_str(&address.root_id).map_err(|_| StoreError::BadRequest)?;
     let favorite = favorite_from_snapshot(snapshot, id).ok_or(StoreError::NotFound)?;
     resolve_existing(&favorite.path, &address.relative_path)?;
     Ok(())
@@ -747,7 +747,7 @@ mod tests {
         let id = Uuid::from_u128(0xfedcba9876543210fedcba9876543210);
         let library = Library::with_favorite_for_test(id, favorite_root);
         let address = |relative_path: &str| RemoteAddress {
-            favorite_id: id.to_string(),
+            root_id: id.to_string(),
             relative_path: relative_path.to_owned(),
             subresource: RemoteSubresource::File,
         };
@@ -817,7 +817,7 @@ mod tests {
         assert!(favorites_json.contains("Fixture"));
         assert!(!favorites_json.contains(&favorite_root.to_string_lossy().to_string()));
         let traversal = RemoteAddress {
-            favorite_id: favorite_id.to_string(),
+            root_id: favorite_id.to_string(),
             relative_path: "../page.png".to_owned(),
             subresource: RemoteSubresource::File,
         };

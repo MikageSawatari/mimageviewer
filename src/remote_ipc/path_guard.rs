@@ -7,7 +7,7 @@ use crate::settings::FavoriteEntry;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ResolveError {
-    InvalidFavoriteId,
+    InvalidRootId,
     FavoriteNotFound,
     InvalidRelativePath,
     Unavailable,
@@ -17,7 +17,7 @@ pub(super) enum ResolveError {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ResolvedFavoritePath {
     /// 要求文字列ではなく、favorite allowlist で実際に一致した UUID。
-    pub favorite_id: String,
+    pub root_id: String,
     /// logical path を相対化する、設定上の favorite root。
     pub logical_root: PathBuf,
     /// お気に入り境界。フォルダ代表の再帰先や pin もこの内側に限る。
@@ -30,7 +30,7 @@ pub(super) struct ResolvedFavoritePath {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct FavoriteRelativePath {
-    pub favorite_id: String,
+    pub root_id: String,
     pub relative_path: String,
 }
 
@@ -97,7 +97,7 @@ pub(super) fn map_existing_to_resolved_favorite(
         .collect::<Vec<_>>()
         .join("/");
     Some(FavoriteRelativePath {
-        favorite_id: root.favorite.id.to_string(),
+        root_id: root.favorite.id.to_string(),
         relative_path,
     })
 }
@@ -127,13 +127,13 @@ fn component_eq(left: Component<'_>, right: Component<'_>) -> bool {
 
 pub(super) fn resolve_existing(
     favorites: &[FavoriteEntry],
-    favorite_id: &str,
+    root_id: &str,
     relative: &str,
 ) -> Result<ResolvedFavoritePath, ResolveError> {
-    let favorite_id = Uuid::parse_str(favorite_id).map_err(|_| ResolveError::InvalidFavoriteId)?;
+    let root_id = Uuid::parse_str(root_id).map_err(|_| ResolveError::InvalidRootId)?;
     let favorite = favorites
         .iter()
-        .find(|favorite| favorite.id == favorite_id)
+        .find(|favorite| favorite.id == root_id)
         .ok_or(ResolveError::FavoriteNotFound)?;
     validate_relative(relative)?;
 
@@ -142,7 +142,7 @@ pub(super) fn resolve_existing(
     let logical = logical_favorite_path(&favorite.path, relative);
     let canonical = canonicalize_within(&canonical_root, &logical)?;
     Ok(ResolvedFavoritePath {
-        favorite_id: favorite.id.to_string(),
+        root_id: favorite.id.to_string(),
         logical_root: favorite.path.clone(),
         canonical_root,
         canonical,
@@ -151,7 +151,7 @@ pub(super) fn resolve_existing(
 }
 
 /// 画素生成経路が使った解決済み logical path と subresource から、公開用 identity を再構成する。
-/// HTTP 要求の favorite/path をそのまま返さないため、この関数は `ResolvedFavoritePath` だけを入力にする。
+/// HTTP 要求の root/path をそのまま返さないため、この関数は `ResolvedFavoritePath` だけを入力にする。
 pub(super) fn page_identity_from_resolved(
     resolved: &ResolvedFavoritePath,
     subresource: &RemoteSubresource,
@@ -166,7 +166,7 @@ pub(super) fn page_identity_from_resolved(
         }
     }
     Some(RemoteAddress {
-        favorite_id: resolved.favorite_id.clone(),
+        root_id: resolved.root_id.clone(),
         relative_path: segments.join("/"),
         subresource: subresource.clone(),
     })
@@ -253,7 +253,7 @@ mod tests {
         let logical_root = PathBuf::from("favorite");
         let logical = logical_favorite_path(&logical_root, relative);
         ResolvedFavoritePath {
-            favorite_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
+            root_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
             logical_root: logical_root.clone(),
             canonical_root: logical_root.clone(),
             canonical: logical.clone(),
@@ -393,7 +393,7 @@ mod tests {
         let mapped =
             map_existing_to_favorite(std::slice::from_ref(&favorite), &nested.join("page.jpg"))
                 .unwrap();
-        assert_eq!(mapped.favorite_id, favorite.id.to_string());
+        assert_eq!(mapped.root_id, favorite.id.to_string());
         assert_eq!(mapped.relative_path, "album/page.jpg");
         assert!(!Path::new(&mapped.relative_path).is_absolute());
         assert!(map_existing_to_favorite(&[favorite], &outside).is_none());
@@ -412,7 +412,7 @@ mod tests {
 
         let mapped = map_existing_to_favorite(&[missing, existing.clone()], &page).unwrap();
 
-        assert_eq!(mapped.favorite_id, existing.id.to_string());
+        assert_eq!(mapped.root_id, existing.id.to_string());
         assert_eq!(mapped.relative_path, "album/page.jpg");
     }
 
