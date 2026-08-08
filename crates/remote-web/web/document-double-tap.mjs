@@ -13,23 +13,25 @@ function touchByIdentifier(touches, identifier) {
 
 /// 既定動作を残す対象。
 ///
-/// 操作部品は `click` で動くものがあり (ページ送りの ‹ › など)、2 打目を止めると
-/// その操作だけ効かなくなる。素早く 2 回押すのは普通の使い方なので落とせない。
-/// これらは自分自身に `touch-action` を宣言済みか native の部品で、そもそも
-/// ブラウザが double-tap zoom をしないため、止める必要も無い。
-/// 文字入力は選択・キャレット操作の既定が要る。
+/// 基準は「2 打目を止めると本当に失われる操作があるか」だけ。2 打目の `touchend` を
+/// 止めると合成 click も落ちるので、click で起動するもの (ページ送りの ‹ › など) は
+/// 素早く 2 回押したときに 2 回目が効かなくなる。文字入力は選択・キャレットの既定が要る。
+///
+/// `select` と `label` はここに入れない。以前「native の部品だからブラウザは拡大しない」
+/// として除外したが、実際には拡大する。どちらもこちらが click で処理しておらず、
+/// 止めて失うのは 2 打目の起動転送だけなので、拡大を許す理由にならない。
 const KEEPS_DEFAULT_TAP_BEHAVIOUR = [
   "button",
   "a[href]",
-  "select",
-  "input",
   "textarea",
-  "label",
   "[contenteditable]",
   '[role="button"]',
   '[role="link"]',
   '[role="tab"]',
   '[role="option"]',
+  // range / checkbox / radio / button 系は文字入力ではなく、拡大だけが残る。
+  'input:not([type="range"]):not([type="checkbox"]):not([type="radio"])' +
+    ':not([type="button"]):not([type="submit"])',
 ].join(", ");
 
 function keepsDefaultTapBehaviour(target) {

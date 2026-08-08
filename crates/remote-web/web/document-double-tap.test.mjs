@@ -178,3 +178,22 @@ test("activatable targets keep both taps, because preventing one drops its click
   assert.equal(prevented, 1);
   owner.destroy();
 });
+
+test("pickers and labels are suppressed, because the browser does zoom on them", () => {
+  // 実機で `select` と `<label>` の上は拡大した。click で処理していないので、
+  // 止めて失うのは 2 打目の起動転送だけ。
+  for (const tagSelector of ["select", "label"]) {
+    const eventTarget = new FakeEventTarget();
+    let nowMs = 1_000;
+    let prevented = 0;
+    const target = {
+      closest: (selector) => (selector.includes(tagSelector) ? { tagName: tagSelector } : null),
+    };
+    const owner = installDocumentDoubleTapOwner(eventTarget, { now: () => nowMs });
+    dispatchTap(eventTarget, touch(1, 50, 90), () => { prevented += 1; }, target);
+    nowMs = 1_180;
+    dispatchTap(eventTarget, touch(2, 51, 91), () => { prevented += 1; }, target);
+    assert.equal(prevented, 1, `${tagSelector} must not keep browser double-tap zoom`);
+    owner.destroy();
+  }
+});
