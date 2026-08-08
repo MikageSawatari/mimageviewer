@@ -675,6 +675,12 @@ export const ViewerGesture = Object.freeze({
   PAN: "pan",
 });
 
+export const ViewerDragOwner = Object.freeze({
+  NONE: "none",
+  TRANSFORM: "transform",
+  STAGE: "stage",
+});
+
 export const ViewerPanelOrientation = Object.freeze({
   PORTRAIT: "portrait",
   LANDSCAPE: "landscape",
@@ -1729,6 +1735,7 @@ export function viewerGestureDecision({
   elapsedMs,
   moved = false,
   zoomed = false,
+  dragOwnership = null,
   contentScrolled = false,
   edgeGuarded = false,
   cancelled = false,
@@ -1754,6 +1761,7 @@ export function viewerGestureDecision({
     absX > swipe &&
     absX > absY * dominance
   ) {
+    if (dragOwnership?.ownsHorizontal) return ViewerGesture.PAN;
     return horizontal < 0
       ? ViewerGesture.SWIPE_LEFT
       : ViewerGesture.SWIPE_RIGHT;
@@ -1764,6 +1772,7 @@ export function viewerGestureDecision({
     absY > swipe &&
     absY > absX * dominance
   ) {
+    if (dragOwnership?.ownsVertical) return ViewerGesture.PAN;
     return vertical < 0
       ? ViewerGesture.SWIPE_UP
       : ViewerGesture.SWIPE_DOWN;
@@ -1778,30 +1787,49 @@ export function viewerGestureDecision({
   return moved ? ViewerGesture.PAN : null;
 }
 
-/// 指の移動方向に対して、実際の scrollTop が変化できるかを判定する。
-/// 上端で下へ、下端で上へ引く操作は pan にせず viewer swipe へ渡す。
-export function viewerVerticalScrollDecision({
-  scrollTop,
+/// 1 本指ドラッグ開始時の所有者を、変換と stage の scroll extent から一度だけ決める。
+/// 拡大変換は base layout の stage scroll より後段の幾何を持つため、両方が成立しても
+/// transform を優先し、同じドラッグで 2 つの座標系を動かさない。
+export function viewerDragOwnershipDecision({
+  fitMode,
+  scale = 1,
+  scrollWidth,
+  clientWidth,
   scrollHeight,
   clientHeight,
-  dragDeltaY,
   epsilon = 0.5,
 }) {
   const tolerance = Math.max(0, Number(epsilon) || 0);
-  const maximum = Math.max(
+  if ((Number(scale) || 1) > 1) {
+    return {
+      owner: ViewerDragOwner.TRANSFORM,
+      ownsHorizontal: true,
+      ownsVertical: true,
+    };
+  }
+
+  const horizontalExtent = Math.max(
+    0,
+    (Number(scrollWidth) || 0) - (Number(clientWidth) || 0)
+  );
+  const verticalExtent = Math.max(
     0,
     (Number(scrollHeight) || 0) - (Number(clientHeight) || 0)
   );
-  const top = Math.max(0, Math.min(maximum, Number(scrollTop) || 0));
-  const delta = Number(dragDeltaY) || 0;
-  const scrollable = maximum > tolerance;
-  const atStart = top <= tolerance;
-  const atEnd = top >= maximum - tolerance;
-  const canConsume = scrollable && (
-    (delta < 0 && !atEnd) ||
-    (delta > 0 && !atStart)
-  );
-  return { scrollable, canConsume, atStart, atEnd, maximum };
+  const horizontalScrollable = horizontalExtent > tolerance;
+  const verticalScrollable = verticalExtent > tolerance;
+
+  const ownsHorizontal = fitMode === FitMode.ORIGINAL && horizontalScrollable;
+  const ownsVertical =
+    (fitMode === FitMode.ORIGINAL || fitMode === FitMode.WIDTH) &&
+    verticalScrollable;
+  return {
+    owner: ownsHorizontal || ownsVertical
+      ? ViewerDragOwner.STAGE
+      : ViewerDragOwner.NONE,
+    ownsHorizontal,
+    ownsVertical,
+  };
 }
 
 export function createReadingProgressBatch() {

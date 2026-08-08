@@ -61,10 +61,11 @@ import {
   shouldShowLoadingIndicator,
   shouldShowKeyboardShortcuts,
   viewerGestureDecision,
+  viewerDragOwnershipDecision,
   viewerPanelGestureAction,
   viewerPanelTransition,
   viewerResizePlan,
-  viewerVerticalScrollDecision,
+  ViewerDragOwner,
   viewerTapCommand,
   viewerImageLayout,
   viewerLayoutTelemetry,
@@ -9247,16 +9248,6 @@ export class ImageViewer {
     this.boundaryMessage.hidden = true;
   }
 
-  /// 描画後の内容が表示領域から出ているか。倍率と CSS 寸法のどちらで大きくなっていても
-  /// 同じ答えになるよう、変換適用後の実寸で見る。
-  contentOverflowsStage() {
-    const content = this.pageLayer.getBoundingClientRect();
-    return (
-      content.width - this.stage.clientWidth > 1 ||
-      content.height - this.stage.clientHeight > 1
-    );
-  }
-
   resetTransform() {
     this.scale = 1;
     this.panX = 0;
@@ -9281,21 +9272,35 @@ export class ImageViewer {
     this.pageLayer.style.transform = `translate3d(${this.panX}px, ${this.panY}px, 0) scale(${this.scale})`;
   }
 
+  startSinglePointer(point, edgeGuarded) {
+    return {
+      startX: point.x,
+      startY: point.y,
+      lastX: point.x,
+      lastY: point.y,
+      startedAt: performance.now(),
+      edgeGuarded,
+      moved: false,
+      dragOwnership: viewerDragOwnershipDecision({
+        fitMode: this.fitMode,
+        scale: this.scale,
+        scrollWidth: this.stage.scrollWidth,
+        clientWidth: this.stage.clientWidth,
+        scrollHeight: this.stage.scrollHeight,
+        clientHeight: this.stage.clientHeight,
+      }),
+    };
+  }
+
   onPointerDown(event) {
     if (["mouse", "pen"].includes(event.pointerType) && event.button !== 0) return;
     this.stage.setPointerCapture?.(event.pointerId);
     this.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
     if (this.pointers.size === 1) {
-      this.single = {
-        startX: event.clientX,
-        startY: event.clientY,
-        lastX: event.clientX,
-        lastY: event.clientY,
-        startedAt: performance.now(),
-        edgeGuarded: event.clientX <= 32,
-        moved: false,
-        contentScrolled: false,
-      };
+      this.single = this.startSinglePointer(
+        { x: event.clientX, y: event.clientY },
+        event.clientX <= 32
+      );
       this.pinched = false;
     } else if (this.pointers.size === 2) {
       const [first, second] = [...this.pointers.values()];
@@ -9334,13 +9339,8 @@ export class ImageViewer {
       return;
     }
 
-    // 1 本指で動かせるかは「内容が画面からはみ出しているか」で決める。倍率で判定すると、
-    // 原寸のように倍率 1 のまま CSS 寸法だけ大きくなる経路が漏れ、はみ出しているのに
-    // 動かせなくなる。幅フィットのはみ出しは stage 側のスクロールが受け持つので渡す。
-    const canPanContent =
-      this.scale > 1.01 ||
-      (this.fitMode !== FitMode.WIDTH && this.contentOverflowsStage());
-    if (canPanContent && this.single && previous) {
+    const ownership = this.single?.dragOwnership;
+    if (ownership?.owner === ViewerDragOwner.TRANSFORM && previous) {
       dispatchCommand(
         command(CommandName.PAN_BY, {
           dx: event.clientX - previous.x,
@@ -9355,21 +9355,22 @@ export class ImageViewer {
       this.single.lastX = event.clientX;
       this.single.lastY = event.clientY;
       this.single.moved = true;
-    } else if (this.fitMode === FitMode.WIDTH && this.single && previous) {
-      const dragDeltaY = event.clientY - previous.y;
-      const scroll = viewerVerticalScrollDecision({
-        scrollTop: this.stage.scrollTop,
-        scrollHeight: this.stage.scrollHeight,
-        clientHeight: this.stage.clientHeight,
-        dragDeltaY,
-      });
-      const before = this.stage.scrollTop;
-      if (scroll.canConsume) this.stage.scrollTop -= dragDeltaY;
+    } else if (ownership?.owner === ViewerDragOwner.STAGE && previous) {
+      const beforeX = this.stage.scrollLeft;
+      const beforeY = this.stage.scrollTop;
+      if (ownership.ownsHorizontal) {
+        this.stage.scrollLeft -= event.clientX - previous.x;
+      }
+      if (ownership.ownsVertical) {
+        this.stage.scrollTop -= event.clientY - previous.y;
+      }
       this.single.lastX = event.clientX;
       this.single.lastY = event.clientY;
-      if (Math.abs(this.stage.scrollTop - before) > 0.5) {
+      if (
+        Math.abs(this.stage.scrollLeft - beforeX) > 0.5 ||
+        Math.abs(this.stage.scrollTop - beforeY) > 0.5
+      ) {
         this.single.moved = true;
-        this.single.contentScrolled = true;
       }
     }
   }
@@ -9384,16 +9385,7 @@ export class ImageViewer {
 
     if (this.pointers.size === 1) {
       const [remaining] = [...this.pointers.values()];
-      this.single = {
-        startX: remaining.x,
-        startY: remaining.y,
-        lastX: remaining.x,
-        lastY: remaining.y,
-        startedAt: performance.now(),
-        edgeGuarded: false,
-        moved: false,
-        contentScrolled: false,
-      };
+      this.single = this.startSinglePointer(remaining, false);
       this.pinch = null;
       return;
     }
@@ -9409,8 +9401,8 @@ export class ImageViewer {
         dy,
         elapsedMs: elapsed,
         moved: single.moved,
-        zoomed: this.scale > 1.01,
-        contentScrolled: single.contentScrolled,
+        zoomed: single.dragOwnership.owner === ViewerDragOwner.TRANSFORM,
+        dragOwnership: single.dragOwnership,
         edgeGuarded: single.edgeGuarded,
         cancelled,
       });

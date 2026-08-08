@@ -9,6 +9,7 @@ import {
   GridViewportMemory,
   ReadingDirection,
   SpreadMode,
+  ViewerDragOwner,
   ViewerGesture,
   ViewerPagePositionEvent,
   ViewerPanelAction,
@@ -75,13 +76,13 @@ import {
   viewerPostDisplayRefreshPlan,
   viewerSpreadPartnerIndex,
   viewerBoundaryMessage,
+  viewerDragOwnershipDecision,
   viewerGestureDecision,
   viewerPanelGestureAction,
   viewerPanelLayout,
   viewerPanelShellTransition,
   viewerPanelTransition,
   viewerResizePlan,
-  viewerVerticalScrollDecision,
   viewerSeekGroupIndex,
   viewerSeekRelativeDragValue,
   viewerSeekState,
@@ -1866,46 +1867,114 @@ test("viewer gesture rejects sub-threshold motion and prioritizes pan", () => {
   );
 });
 
-test("width-fit vertical pan requires real direction-specific scroll room", () => {
+test("viewer drag ownership follows transform and fit-mode overflow owners", () => {
   assert.deepEqual(
-    viewerVerticalScrollDecision({
-      scrollTop: 0,
-      scrollHeight: 800,
+    viewerDragOwnershipDecision({
+      fitMode: FitMode.ORIGINAL,
+      scale: 1,
+      scrollWidth: 1200,
+      clientWidth: 800,
+      scrollHeight: 1600,
       clientHeight: 800,
-      dragDeltaY: -80,
     }),
-    { scrollable: false, canConsume: false, atStart: true, atEnd: true, maximum: 0 }
+    {
+      owner: ViewerDragOwner.STAGE,
+      ownsHorizontal: true,
+      ownsVertical: true,
+    }
   );
-  assert.equal(viewerVerticalScrollDecision({
-    scrollTop: 200,
+  assert.deepEqual(
+    viewerDragOwnershipDecision({
+      fitMode: FitMode.WIDTH,
+      scale: 1,
+      scrollWidth: 1200,
+      clientWidth: 800,
+      scrollHeight: 1600,
+      clientHeight: 800,
+    }),
+    {
+      owner: ViewerDragOwner.STAGE,
+      ownsHorizontal: false,
+      ownsVertical: true,
+    }
+  );
+  assert.deepEqual(
+    viewerDragOwnershipDecision({
+      fitMode: FitMode.PAGE,
+      scale: 1,
+      scrollWidth: 1200,
+      clientWidth: 800,
+      scrollHeight: 1600,
+      clientHeight: 800,
+    }),
+    {
+      owner: ViewerDragOwner.NONE,
+      ownsHorizontal: false,
+      ownsVertical: false,
+    }
+  );
+  assert.deepEqual(
+    viewerDragOwnershipDecision({
+      fitMode: FitMode.WIDTH,
+      scale: 2,
+      scrollWidth: 1200,
+      clientWidth: 800,
+      scrollHeight: 1600,
+      clientHeight: 800,
+    }),
+    {
+      owner: ViewerDragOwner.TRANSFORM,
+      ownsHorizontal: true,
+      ownsVertical: true,
+    }
+  );
+});
+
+test("stage-owned drag axes stay pan-owned at an edge while unowned axes still swipe", () => {
+  const widthFit = viewerDragOwnershipDecision({
+    fitMode: FitMode.WIDTH,
+    scale: 1,
+    scrollWidth: 800,
+    clientWidth: 800,
     scrollHeight: 1600,
     clientHeight: 800,
-    dragDeltaY: -80,
-  }).canConsume, true);
-  assert.equal(viewerVerticalScrollDecision({
-    scrollTop: 0,
-    scrollHeight: 1600,
+  });
+  assert.equal(
+    viewerGestureDecision({
+      dx: 0,
+      dy: -80,
+      elapsedMs: 180,
+      dragOwnership: widthFit,
+    }),
+    ViewerGesture.PAN
+  );
+  assert.equal(
+    viewerGestureDecision({
+      dx: -80,
+      dy: 0,
+      elapsedMs: 180,
+      dragOwnership: widthFit,
+    }),
+    ViewerGesture.SWIPE_LEFT
+  );
+
+  const pageFit = viewerDragOwnershipDecision({
+    fitMode: FitMode.PAGE,
+    scale: 1,
+    scrollWidth: 800,
+    clientWidth: 800,
+    scrollHeight: 800,
     clientHeight: 800,
-    dragDeltaY: 80,
-  }).canConsume, false);
-  assert.equal(viewerVerticalScrollDecision({
-    scrollTop: 0,
-    scrollHeight: 1600,
-    clientHeight: 800,
-    dragDeltaY: -80,
-  }).canConsume, true);
-  assert.equal(viewerVerticalScrollDecision({
-    scrollTop: 800,
-    scrollHeight: 1600,
-    clientHeight: 800,
-    dragDeltaY: -80,
-  }).canConsume, false);
-  assert.equal(viewerVerticalScrollDecision({
-    scrollTop: 800,
-    scrollHeight: 1600,
-    clientHeight: 800,
-    dragDeltaY: 80,
-  }).canConsume, true);
+  });
+  assert.equal(
+    viewerGestureDecision({
+      dx: 0,
+      dy: -80,
+      elapsedMs: 180,
+      dragOwnership: pageFit,
+    }),
+    ViewerGesture.SWIPE_UP
+  );
 });
 
 test("reading progress batching emits latest only and force-flushes the final position", () => {
