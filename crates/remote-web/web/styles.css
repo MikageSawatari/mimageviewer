@@ -28,7 +28,8 @@ body,
   height: 100%;
   margin: 0;
   overflow: hidden;
-  /* Keep browser pinch zoom, but never assign double-tap zoom to the app shell. */
+  /* Keep browser pinch zoom. The document-level touch owner prevents only recognized
+     double taps; manipulation remains the shell-wide browser gesture policy. */
   touch-action: manipulation;
 }
 
@@ -161,10 +162,9 @@ textarea {
   font: inherit;
 }
 
-/* `#app` にも宣言してあるが、この repo の tap 対象は例外なく自分自身にも宣言している
-   (button / .grid-tile / .viewer-button …)。祖先の宣言だけでは double-tap zoom が
-   残るため、native の選択部品も同じ扱いにする。文字入力の選択操作とは事情が違うので
-   input / textarea へは広げない。 */
+/* 既存の要素別宣言は browser hint として維持するが、double-tap の全体 ownership は
+   document listener にある。文字入力の選択操作とは事情が違うので input / textarea へは
+   広げず、新しい tap 対象をこの方式で列挙しない。 */
 select {
   touch-action: manipulation;
 }

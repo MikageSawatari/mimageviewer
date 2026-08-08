@@ -68,6 +68,39 @@ export const ReadingDirection = Object.freeze({
   RTL: "rtl",
 });
 
+export const DOUBLE_TAP_MAX_DELAY_MS = 320;
+export const DOUBLE_TAP_MAX_DISTANCE_PX = 36;
+
+/// Shared recognition rule for app-owned double taps. A recognized pair is consumed as a pair,
+/// so the third tap starts a new candidate rather than overlapping the preceding double tap.
+export function doubleTapSequenceTransition(
+  previous,
+  { x, y, atMs },
+  {
+    maxDelayMs = DOUBLE_TAP_MAX_DELAY_MS,
+    maxDistancePx = DOUBLE_TAP_MAX_DISTANCE_PX,
+  } = {}
+) {
+  const current = {
+    x: Number(x) || 0,
+    y: Number(y) || 0,
+    atMs: Number(atMs) || 0,
+  };
+  const elapsed = current.atMs - Number(previous?.atMs);
+  const distance = Math.hypot(
+    current.x - (Number(previous?.x) || 0),
+    current.y - (Number(previous?.y) || 0)
+  );
+  const isDoubleTap = Boolean(previous) &&
+    elapsed >= 0 &&
+    elapsed <= maxDelayMs &&
+    distance <= maxDistancePx;
+  return {
+    isDoubleTap,
+    next: isDoubleTap ? null : current,
+  };
+}
+
 export function remoteSessionAcquireDecision(status, trigger) {
   if (status === "active") return "use_current";
   if (trigger === "explicit_reconnect") return "acquire";
@@ -784,7 +817,10 @@ export function viewerTapZone(clientX, width) {
 export function viewerTapSequenceTransition(
   previous,
   { x, y, atMs, width, inputSource = "touch" },
-  { maxDelayMs = 320, maxDistancePx = 36 } = {}
+  {
+    maxDelayMs = DOUBLE_TAP_MAX_DELAY_MS,
+    maxDistancePx = DOUBLE_TAP_MAX_DISTANCE_PX,
+  } = {}
 ) {
   const zone = viewerTapZone(x, width);
   const current = {
@@ -800,18 +836,15 @@ export function viewerTapSequenceTransition(
   if (zone !== "center") {
     return { action: "edge_tap", next: null, commitPrevious: Boolean(previous) };
   }
-  const elapsed = current.atMs - Number(previous?.atMs);
-  const distance = Math.hypot(
-    current.x - (Number(previous?.x) || 0),
-    current.y - (Number(previous?.y) || 0)
+  const transition = doubleTapSequenceTransition(
+    (
+      previous?.inputSource === "touch" &&
+      previous?.zone === "center"
+    ) ? previous : null,
+    current,
+    { maxDelayMs, maxDistancePx }
   );
-  if (
-    previous?.inputSource === "touch" &&
-    previous?.zone === "center" &&
-    elapsed >= 0 &&
-    elapsed <= maxDelayMs &&
-    distance <= maxDistancePx
-  ) {
+  if (transition.isDoubleTap) {
     return { action: "double_tap", next: null, commitPrevious: false };
   }
   return {

@@ -1,5 +1,6 @@
 import {
   CommandName,
+  DOUBLE_TAP_MAX_DELAY_MS,
   FitMode,
   GridViewportAnchor,
   GridViewportMemory,
@@ -91,6 +92,7 @@ import {
   loadLocalSettings,
   saveLocalSettings,
 } from "./local-settings.mjs";
+import { installDocumentDoubleTapOwner } from "./document-double-tap.mjs";
 import { VideoStreamViewer } from "./video-stream.mjs";
 
 export { ADJUSTMENT_PANEL_TABS };
@@ -559,6 +561,7 @@ const state = {
 
 let recentPointerSource = { source: "mouse", at: 0 };
 if (!RUNTIME_TEST_MODE) {
+  installDocumentDoubleTapOwner(document);
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker
       .register("/service-worker.js", { scope: "/", updateViaCache: "none" })
@@ -9205,7 +9208,7 @@ export class ImageViewer {
         source: pending.inputSource,
         detail: "tap_center",
       });
-    }, 320);
+    }, DOUBLE_TAP_MAX_DELAY_MS);
   }
 
   onPointerDown(event) {

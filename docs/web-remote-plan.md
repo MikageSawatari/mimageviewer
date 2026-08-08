@@ -1434,10 +1434,17 @@ remote 内部の原寸倍率では位置が変わらない。この構造を回�
 前回記録値から 0.01 以上変わった場合だけ `visual_viewport/scale_changed` を追加する。毎フレーム／全操作の
 記録にはせず、値は数値だけなので通常段で扱う。
 
-アプリ外周 (`html, body, #app`) の既定は `touch-action: manipulation` とし、browser の
-ダブルタップ zoom は全画面 UI のどこでも起動させない。`manipulation` は browser pinch を許可する。
-画像・動画 viewer の `none` は従来どおり独自 pinch / pan を所有し、縦スクロール領域の `pan-y` も
-そのまま維持する。viewport meta に `maximum-scale` / `user-scalable` は指定しない。
+アプリ外周 (`html, body, #app`) の既定は `touch-action: manipulation` とする。ただし要素別の宣言を
+増やして非対話テキストや余白まで列挙せず、document level の単一 owner が touch sequence を監視する。
+2 回の単指 tap の時間差と距離は `doubleTapSequenceTransition` の共通純関数で判定し、browser default を
+止めるのは成立した 2 打目の `touchend` だけとする。1 打目、時間・距離が外れた tap、12 CSS px を超えて
+移動した gesture は `preventDefault()` しない。`input` / `textarea` / contenteditable は候補外として
+文字選択と caret 操作を維持する。
+
+2 接点以上になった gesture は tap sequence を破棄し、touch event を一切抑止しないため browser pinch を
+維持する。画像・動画 viewer の `none` は従来どおり remote 独自 pinch / pan を所有し、縦スクロール領域の
+`pan-y` と既存要素の `manipulation` も browser hint として残すが、この対策のための要素別宣言は追加しない。
+viewport meta に `maximum-scale` / `user-scalable` は指定しない。
 
 ### 12.22 ページ応答 identity の検査 (2026-08-08)
 
