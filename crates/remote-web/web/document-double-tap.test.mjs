@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS,
+  DOUBLE_TAP_MAX_DELAY_MS,
   doubleTapSequenceTransition,
 } from "./command-core.mjs";
 import {
@@ -94,9 +96,10 @@ test("document owner preserves the first touchend and prevents only the matching
   dispatchTap(eventTarget, touch(2, 44, 84), () => { prevented += 1; });
   assert.equal(prevented, 1);
 
+  // 窓の外であることを定数から決める。数値で書くと、窓を広げたときに黙って意味が変わる。
   nowMs = 2_000;
   dispatchTap(eventTarget, touch(3, 40, 80), () => { prevented += 1; });
-  nowMs = 2_500;
+  nowMs += BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS + 60;
   dispatchTap(eventTarget, touch(4, 40, 80), () => { prevented += 1; });
   assert.equal(prevented, 1, "non-matching touchends must keep their defaults");
 
@@ -175,6 +178,30 @@ test("activatable targets keep both taps, because preventing one drops its click
   dispatchTap(eventTarget, touch(3, 50, 90), () => { prevented += 1; });
   nowMs = 3_180;
   dispatchTap(eventTarget, touch(4, 51, 91), () => { prevented += 1; });
+  assert.equal(prevented, 1);
+  owner.destroy();
+});
+
+test("a slower pair is still the browser's double tap, even when it is not the app's", () => {
+  assert.ok(
+    BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS > DOUBLE_TAP_MAX_DELAY_MS,
+    "the browser keeps zooming after the app has stopped calling it one gesture"
+  );
+  const eventTarget = new FakeEventTarget();
+  let nowMs = 1_000;
+  let prevented = 0;
+  const owner = installDocumentDoubleTapOwner(eventTarget, { now: () => nowMs });
+
+  dispatchTap(eventTarget, touch(1, 60, 120), () => { prevented += 1; });
+  nowMs += DOUBLE_TAP_MAX_DELAY_MS + 60;
+  dispatchTap(eventTarget, touch(2, 61, 121), () => { prevented += 1; });
+  assert.equal(prevented, 1, "a slow pair must still lose the browser zoom");
+
+  // ブラウザの窓も越えたら、ただの 2 回のタップ。
+  nowMs += BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS + 60;
+  dispatchTap(eventTarget, touch(3, 60, 120), () => { prevented += 1; });
+  nowMs += BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS + 60;
+  dispatchTap(eventTarget, touch(4, 61, 121), () => { prevented += 1; });
   assert.equal(prevented, 1);
   owner.destroy();
 });

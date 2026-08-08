@@ -24,6 +24,78 @@
       hidden
     ></div>
     <button id="telemetry-hud" type="button" aria-label="計測 HUD を隠す"></button>
+    <!--
+      アプリ本体は module なので、必要なファイルが 1 つでも読めないと何も実行されず、
+      画面が黒いまま止まる。読めないこと自体は正しい結果だが、黒いだけでは何が起きたか
+      分からない。この受け皿は module ではなく、本体が動かなくても必ず動く。
+    -->
+    <script>
+      (function () {
+        var failedUrls = [];
+        addEventListener(
+          "error",
+          function (event) {
+            var target = event && event.target;
+            var url = target && (target.src || target.href);
+            if (url && failedUrls.indexOf(String(url)) < 0) {
+              failedUrls.push(String(url));
+            }
+          },
+          true
+        );
+        setTimeout(function () {
+          if (window.__mivRemoteAppStarted) return;
+          var app = document.querySelector("#app");
+          if (!app || app.childElementCount > 0) return;
+          app.setAttribute("style", [
+            "display:grid",
+            "place-items:center",
+            "height:100%",
+            "padding:24px",
+            "text-align:center",
+            "line-height:1.7",
+          ].join(";"));
+          var card = document.createElement("div");
+          var title = document.createElement("p");
+          title.textContent = "アプリを読み込めませんでした。";
+          title.setAttribute("style", "margin:0 0 12px;font-size:1.15rem;font-weight:700");
+          card.appendChild(title);
+          var hint = document.createElement("p");
+          hint.textContent =
+            "再読み込みしてください。それでも表示されない場合は、PC 側の mImageViewer を再起動してください。";
+          hint.setAttribute("style", "margin:0 0 18px;color:#aab1bf");
+          card.appendChild(hint);
+          if (failedUrls.length) {
+            var detail = document.createElement("p");
+            detail.textContent = "読み込めなかったファイル: " + failedUrls.join(", ");
+            detail.setAttribute(
+              "style",
+              "margin:0 0 18px;color:#aab1bf;font-size:0.82rem;word-break:break-all"
+            );
+            card.appendChild(detail);
+          }
+          var reload = document.createElement("button");
+          reload.type = "button";
+          reload.textContent = "再読み込み";
+          reload.setAttribute("style", [
+            "min-height:48px",
+            "padding:0 24px",
+            "border:0",
+            "border-radius:14px",
+            "background:#42a5f5",
+            "color:#07121d",
+            "font:inherit",
+            "font-weight:700",
+            "touch-action:manipulation",
+          ].join(";"));
+          reload.addEventListener("click", function () {
+            location.reload();
+          });
+          card.appendChild(reload);
+          app.appendChild(card);
+        }, 8000);
+      })();
+    </script>
     <script type="module" src="/app.js"></script>
   </body>
 </html>

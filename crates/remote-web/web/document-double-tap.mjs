@@ -1,4 +1,5 @@
 import {
+  BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS,
   doubleTapSequenceTransition,
 } from "./command-core.mjs";
 
@@ -119,11 +120,16 @@ export function installDocumentDoubleTapOwner(
       return;
     }
 
-    const transition = doubleTapSequenceTransition(previousTap, {
-      x: touch.clientX,
-      y: touch.clientY,
-      atMs: now(),
-    });
+    const transition = doubleTapSequenceTransition(
+      previousTap,
+      {
+        x: touch.clientX,
+        y: touch.clientY,
+        atMs: now(),
+      },
+      // アプリのジェスチャではなく、ブラウザが拡大と見なす窓に合わせる。
+      { maxDelayMs: BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS }
+    );
     gesture = null;
     previousTap = transition.next;
     if (transition.isDoubleTap && event.cancelable !== false) {

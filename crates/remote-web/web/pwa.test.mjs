@@ -546,6 +546,23 @@ test("viewer status overlays belong to the HUD and leave with it", async () => {
   );
 });
 
+test("a page that never boots says so instead of staying black", async () => {
+  const html = await readFile(new URL("index.html", here), "utf8");
+  const app = await readFile(new URL("app.js", here), "utf8");
+  // 受け皿は module であってはいけない。本体が読めないときに動くためのもの。
+  const fallback = html.match(/<script>[\s\S]*?<\/script>/)?.[0] ?? "";
+  assert.match(fallback, /__mivRemoteAppStarted/);
+  assert.match(fallback, /アプリを読み込めませんでした/);
+  assert.match(fallback, /addEventListener\(\s*\n?\s*"error"/);
+  assert.match(fallback, /読み込めなかったファイル/);
+  assert.ok(
+    html.indexOf("<script>") < html.indexOf('<script type="module"'),
+    "the fallback must be installed before the module that may fail"
+  );
+  // 本体側は「実行され始めた」ことだけを伝える。以降の遅さは自分で画面に出す。
+  assert.match(app, /window\.__mivRemoteAppStarted = true/);
+});
+
 test("sorting hands the bar back, and form controls keep the page typography", async () => {
   const app = await readFile(new URL("app.js", here), "utf8");
   const css = await readFile(new URL("styles.css", here), "utf8");

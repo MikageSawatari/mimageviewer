@@ -71,6 +71,12 @@ export const ReadingDirection = Object.freeze({
 export const DOUBLE_TAP_MAX_DELAY_MS = 320;
 export const DOUBLE_TAP_MAX_DISTANCE_PX = 36;
 
+/// ブラウザが double-tap zoom と見なす窓。アプリのジェスチャ判定とは別物で、こちらは
+/// ブラウザの挙動で決まる。少しゆっくりめの 2 打がアプリでは別々のタップでも、ブラウザは
+/// まだ拡大するので、抑止側はアプリ側より広く取る必要がある (実機で 320ms では足りなかった)。
+/// 距離は現状同じで足りているため共有する。
+export const BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS = 520;
+
 /// Shared recognition rule for app-owned double taps. A recognized pair is consumed as a pair,
 /// so the third tap starts a new candidate rather than overlapping the preceding double tap.
 export function doubleTapSequenceTransition(

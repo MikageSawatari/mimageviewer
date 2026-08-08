@@ -97,6 +97,10 @@ import { VideoStreamViewer } from "./video-stream.mjs";
 
 export { ADJUSTMENT_PANEL_TABS };
 
+// index.html の受け皿への合図。ここまで来たということは、必要なファイルが全部読めて
+// このモジュールが実行され始めたということ。この後の遅さはアプリ自身が画面で伝える。
+if (typeof window !== "undefined") window.__mivRemoteAppStarted = true;
+
 const app = document.querySelector("#app");
 const hudElement = document.querySelector("#telemetry-hud");
 const sessionOwnerBadgeElement = document.querySelector(
