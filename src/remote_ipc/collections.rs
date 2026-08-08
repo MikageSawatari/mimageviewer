@@ -16,6 +16,7 @@ const MAX_REMOTE_COLLECTION_ENTRIES: usize = 1000;
 
 pub(super) struct CollectionEngine {
     settings: Settings,
+    sort_settings: super::RemoteSortSettingsSource,
     favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
 }
 
@@ -42,7 +43,19 @@ impl CollectionEngine {
         favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
     ) -> Self {
         Self {
+            sort_settings: super::RemoteSortSettingsSource::Snapshot(settings.sort_order),
             settings,
+            favorite_roots,
+        }
+    }
+
+    pub(super) fn new_with_live_favorite_roots(
+        settings: Settings,
+        favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
+    ) -> Self {
+        Self {
+            settings,
+            sort_settings: super::RemoteSortSettingsSource::Live,
             favorite_roots,
         }
     }
@@ -63,12 +76,23 @@ impl CollectionEngine {
     }
 
     pub(super) fn collection(&self, request: CollectionRequest) -> CollectionResponse {
+        let sort_order = match self.sort_settings.load() {
+            Ok(sort_order) => sort_order,
+            Err(error) => {
+                return CollectionResponse::Error(internal_error(
+                    "最新の並び順を読み込めませんでした",
+                    error,
+                ));
+            }
+        };
         let result = match request.kind {
-            CollectionKind::ReadingHistory => self.reading_history(),
-            CollectionKind::Rating { stars } => self.rating(stars),
-            CollectionKind::Bookshelf => self.bookshelf(),
-            CollectionKind::Bookmarks => self.bookmarks(),
-            CollectionKind::SmartFolder { definition_id } => self.smart_folder(&definition_id),
+            CollectionKind::ReadingHistory => self.reading_history(sort_order),
+            CollectionKind::Rating { stars } => self.rating(stars, sort_order),
+            CollectionKind::Bookshelf => self.bookshelf(sort_order),
+            CollectionKind::Bookmarks => self.bookmarks(sort_order),
+            CollectionKind::SmartFolder { definition_id } => {
+                self.smart_folder(&definition_id, sort_order)
+            }
         };
         match result {
             Ok(payload) => CollectionResponse::Success(payload),
@@ -76,7 +100,10 @@ impl CollectionEngine {
         }
     }
 
-    fn reading_history(&self) -> Result<CollectionPayload, CollectionError> {
+    fn reading_history(
+        &self,
+        sort_order: crate::settings::SortOrder,
+    ) -> Result<CollectionPayload, CollectionError> {
         let rows = if crate::reading_history_db::ReadingHistoryDb::db_path()
             .try_exists()
             .unwrap_or(false)
@@ -91,10 +118,19 @@ impl CollectionEngine {
             .into_iter()
             .map(candidate_from_reading_history_entry)
             .collect();
-        self.payload("閲覧履歴", candidates)
+        self.payload(
+            "閲覧履歴",
+            candidates,
+            sort_order,
+            Some(super::FIXED_LIST_SORT_LOCK_REASON),
+        )
     }
 
-    fn rating(&self, stars: u8) -> Result<CollectionPayload, CollectionError> {
+    fn rating(
+        &self,
+        stars: u8,
+        sort_order: crate::settings::SortOrder,
+    ) -> Result<CollectionPayload, CollectionError> {
         if !(1..=5).contains(&stars) {
             return Err(CollectionError::new(
                 CollectionErrorCode::BadRequest,
@@ -118,10 +154,18 @@ impl CollectionEngine {
             .into_iter()
             .filter_map(|row| candidate_from_grid_item(row.item, None, Some(stars)))
             .collect();
-        self.payload(&format!("レーティング ★{stars}"), candidates)
+        self.payload(
+            &format!("レーティング ★{stars}"),
+            candidates,
+            sort_order,
+            Some(super::FIXED_LIST_SORT_LOCK_REASON),
+        )
     }
 
-    fn bookmarks(&self) -> Result<CollectionPayload, CollectionError> {
+    fn bookmarks(
+        &self,
+        sort_order: crate::settings::SortOrder,
+    ) -> Result<CollectionPayload, CollectionError> {
         let rows = crate::bookmark_browser::build_rows_readonly()
             .map_err(|error| internal_error("ブックマークを読み込めませんでした", error))?;
         let candidates = rows
@@ -167,10 +211,18 @@ impl CollectionEngine {
                 }
             })
             .collect();
-        self.payload("ブックマーク", candidates)
+        self.payload(
+            "ブックマーク",
+            candidates,
+            sort_order,
+            Some(super::FIXED_LIST_SORT_LOCK_REASON),
+        )
     }
 
-    fn bookshelf(&self) -> Result<CollectionPayload, CollectionError> {
+    fn bookshelf(
+        &self,
+        sort_order: crate::settings::SortOrder,
+    ) -> Result<CollectionPayload, CollectionError> {
         let root = self.settings.books_root_path();
         let candidates = crate::books::list_books(&root)
             .map_err(|error| internal_error("本棚を読み込めませんでした", error))?
@@ -185,10 +237,19 @@ impl CollectionEngine {
                 rating: None,
             })
             .collect();
-        self.payload("本棚", candidates)
+        self.payload(
+            "本棚",
+            candidates,
+            sort_order,
+            Some(super::FIXED_LIST_SORT_LOCK_REASON),
+        )
     }
 
-    fn smart_folder(&self, definition_id: &str) -> Result<CollectionPayload, CollectionError> {
+    fn smart_folder(
+        &self,
+        definition_id: &str,
+        sort_order: crate::settings::SortOrder,
+    ) -> Result<CollectionPayload, CollectionError> {
         let id = uuid::Uuid::parse_str(definition_id).map_err(|_| {
             CollectionError::new(CollectionErrorCode::BadRequest, "ID が正しくありません")
         })?;
@@ -205,8 +266,10 @@ impl CollectionEngine {
                 )
             })?;
         let title = definition.name.clone();
+        let mut settings = self.settings.clone();
+        settings.sort_order = sort_order;
         let entries =
-            crate::app::smart_folder::build_remote_smart_folder_entries(&self.settings, definition)
+            crate::app::smart_folder::build_remote_smart_folder_entries(&settings, definition)
                 .map_err(|error| internal_error("スマートフォルダを読み込めませんでした", error))?;
         let candidates = entries
             .into_iter()
@@ -232,13 +295,15 @@ impl CollectionEngine {
                 rating: entry.rating,
             })
             .collect();
-        self.payload(&title, candidates)
+        self.payload(&title, candidates, sort_order, None)
     }
 
     fn payload(
         &self,
         title: &str,
         candidates: Vec<CandidateEntry>,
+        sort_order: crate::settings::SortOrder,
+        locked_reason: Option<&str>,
     ) -> Result<CollectionPayload, CollectionError> {
         let favorites = self.favorite_roots.current().map_err(|error| {
             crate::logger::log(format!("remote_ipc: {error}"));
@@ -252,6 +317,7 @@ impl CollectionEngine {
         Ok(CollectionPayload {
             title: title.to_owned(),
             thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(&self.settings),
+            sort_state: super::remote_grid_sort_state(sort_order, locked_reason),
             entries,
             entry_limit: MAX_REMOTE_COLLECTION_ENTRIES,
             truncated,

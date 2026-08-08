@@ -493,6 +493,9 @@ const state = {
   homeTab: "places",
   collection: null,
   container: null,
+  gridSortState: null,
+  gridSortScope: null,
+  gridSortWritePending: false,
   gridReturnHash: "#home/places",
   gridHash: "#home/places",
   thumbAspectHeightRatio: 1,
@@ -2349,6 +2352,8 @@ async function showCollection(route) {
     truncated: Boolean(data.truncated),
     entryLimit: Number(data.entry_limit) || 0,
   };
+  state.gridSortState = normalizeRemoteGridSortState(data.sort_state);
+  state.gridSortScope = collectionSortScope(route.collectionKind, route.value);
   state.container = null;
   state.gridReturnHash =
     route.collectionKind === "smart" ? homeHash("smart") : homeHash("places");
@@ -2376,6 +2381,39 @@ function collectionRequestParams(route) {
     return { kind: "smart_folder", id: route.value };
   }
   return { kind: route.collectionKind };
+}
+
+function collectionSortScope(kind, value) {
+  const collection = kind === "rating"
+    ? { type: "rating", stars: Number(value) }
+    : kind === "smart"
+      ? { type: "smart_folder", definition_id: value }
+      : { type: kind };
+  return { kind: "collection", collection };
+}
+
+export function normalizeRemoteGridSortState(value) {
+  if (!value || typeof value !== "object" || !Array.isArray(value.options)) return null;
+  const options = value.options.filter(
+    (option) => option &&
+      typeof option.value === "string" &&
+      typeof option.label === "string" &&
+      typeof option.short_label === "string"
+  ).map((option) => ({
+    value: option.value,
+    label: option.label,
+    short_label: option.short_label,
+  }));
+  if (!options.length || !options.some((option) => option.value === value.selected)) {
+    return null;
+  }
+  return {
+    selected: value.selected,
+    options,
+    locked_reason: typeof value.locked_reason === "string" && value.locked_reason
+      ? value.locked_reason
+      : null,
+  };
 }
 
 async function showFolder(favoriteId, path) {
@@ -2487,6 +2525,8 @@ function applyContainerData(address, data, forceSinglePage, options = {}) {
     resumePage: data.resume_page ?? null,
     openMode: data.open_mode ?? "grid",
   };
+  state.gridSortState = normalizeRemoteGridSortState(data.sort_state);
+  state.gridSortScope = { kind: "address", address: effectiveAddress };
   state.favoriteId = effectiveAddress.favorite_id;
   state.favoriteName =
     state.favorites.find((favorite) => favorite.id === state.favoriteId)?.name ??
@@ -3102,6 +3142,15 @@ export async function loadFolder(
   }
   state.collection = null;
   state.container = null;
+  state.gridSortState = normalizeRemoteGridSortState(data.sort_state);
+  state.gridSortScope = {
+    kind: "address",
+    address: {
+      favorite_id: data.favorite_id ?? favoriteId,
+      relative_path: data.path ?? requestedPath,
+      subresource: { kind: "file" },
+    },
+  };
   state.gridReturnHash = homeHash("favorites");
   state.favoriteId = favoriteId;
   state.favoriteName =
@@ -3172,6 +3221,7 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
     });
   });
   topbar.append(parent, home, buildBreadcrumbs(), createMenuButton("操作メニュー"));
+  const sortBar = createGridSortBar();
 
   const scroll = element("div", "grid-scroll");
   const thumbnailNotice = textElement("p", "", "thumbnail-service-notice");
@@ -3191,7 +3241,7 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
   const windowElement = element("div", "virtual-window");
   space.append(windowElement);
   scroll.append(space);
-  screen.append(topbar, collectionLimitNotice, thumbnailNotice, scroll);
+  screen.append(topbar, sortBar, collectionLimitNotice, thumbnailNotice, scroll);
   screen.addEventListener("contextmenu", (event) => {
     event.preventDefault();
     dispatchCommand(command(CommandName.TOGGLE_MENU), {
@@ -3274,6 +3324,76 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
         });
       });
     });
+  }
+}
+
+function createGridSortBar() {
+  const bar = element("div", "grid-sort-bar");
+  const sortState = state.gridSortState;
+  if (!sortState) {
+    bar.hidden = true;
+    return bar;
+  }
+  const label = textElement("label", "並べ替え", "grid-sort-label");
+  const select = document.createElement("select");
+  select.className = "grid-sort-select";
+  select.setAttribute("aria-label", "一覧の並べ替え");
+  for (const optionState of sortState.options) {
+    const option = document.createElement("option");
+    option.value = optionState.value;
+    option.textContent = optionState.label;
+    select.append(option);
+  }
+  select.value = sortState.selected;
+  const reason = textElement(
+    "span",
+    sortState.locked_reason ?? "",
+    "grid-sort-reason"
+  );
+  reason.hidden = !sortState.locked_reason;
+  select.disabled = Boolean(sortState.locked_reason) || state.gridSortWritePending;
+  if (sortState.locked_reason) {
+    select.title = sortState.locked_reason;
+    reason.setAttribute("role", "status");
+  }
+  select.addEventListener("change", () => {
+    const selected = select.value;
+    select.disabled = true;
+    reason.hidden = false;
+    reason.textContent = "保存中…";
+    changeGridSortOrder(selected).catch((error) => {
+      select.value = sortState.selected;
+      select.disabled = Boolean(sortState.locked_reason);
+      reason.hidden = false;
+      reason.textContent = error instanceof Error
+        ? error.message
+        : "並べ替えを保存できませんでした。";
+      reason.classList.add("is-error");
+    });
+  });
+  label.append(select);
+  bar.append(label, reason);
+  return bar;
+}
+
+async function changeGridSortOrder(sortOrder) {
+  if (!state.gridSortScope || state.gridSortState?.locked_reason) return;
+  state.gridSortWritePending = true;
+  try {
+    const response = await apiPostJson("/api/write", {
+      kind: "set_sort_order",
+      scope: state.gridSortScope,
+      sort_order: sortOrder,
+    });
+    const next = normalizeRemoteGridSortState(response.sort_state);
+    if (!next) throw new Error("並べ替えの保存結果を取得できませんでした。");
+    state.gridSortState = next;
+    applyRemoteStateGeneration(response.remote_state_generation, { reloadViewer: false });
+    rememberCurrentGridViewport();
+    renderLoading("並べ替えています");
+    await dispatchRoute();
+  } finally {
+    state.gridSortWritePending = false;
   }
 }
 
@@ -4115,6 +4235,7 @@ async function updateViewerImage(
   const refreshPlan = viewerPostDisplayRefreshPlan({ adjustmentStateCurrent });
   if (refreshPlan.adjustment) state.commandMenu?.refreshAdjustment();
   if (refreshPlan.bookmarks) state.commandMenu?.refreshBookmarks();
+  state.commandMenu?.refreshViewTrim();
   observeReadingProgress();
   if (group.entries.every((entry) => entry.address)) {
     schedulePagePrefetch(viewer).catch(() => {});
@@ -5395,6 +5516,275 @@ export function normalizeRemoteAdjustmentValues(values = {}) {
     colorize: normalizeRemoteColorizeParams(source.colorize),
     ai,
   };
+}
+
+function normalizedTrimMargins(value, keys) {
+  if (!value || typeof value !== "object") return null;
+  const result = {};
+  for (const key of keys) {
+    const number = Number(value[key]);
+    if (!Number.isFinite(number)) return null;
+    result[key] = number;
+  }
+  return result;
+}
+
+export function normalizeRemoteViewTrimState(value) {
+  if (!value || typeof value !== "object") return null;
+  if (!["none", "auto", "book"].includes(value.apply_mode)) return null;
+  const book = value.book_settings;
+  if (!book || typeof book !== "object") return null;
+  const single = normalizedTrimMargins(book.single, ["left", "top", "right", "bottom"]);
+  const linked = normalizedTrimMargins(book.spread_linked, ["top", "bottom", "inner", "outer"]);
+  const left = normalizedTrimMargins(book.spread_left, ["left", "top", "right", "bottom"]);
+  const right = normalizedTrimMargins(book.spread_right, ["left", "top", "right", "bottom"]);
+  if (!single || !linked || !left || !right) return null;
+  return {
+    apply_mode: value.apply_mode,
+    book_settings: {
+      enabled: Boolean(book.enabled),
+      spread_separate: Boolean(book.spread_separate),
+      single,
+      spread_linked: linked,
+      spread_left: left,
+      spread_right: right,
+    },
+  };
+}
+
+export function viewTrimSpreadControlKeys(bookSettings, isSpread) {
+  if (!isSpread) return ["single"];
+  return bookSettings?.spread_separate
+    ? ["spread_left", "spread_right"]
+    : ["spread_linked"];
+}
+
+function cloneViewTrimState(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+export function setViewTrimSpreadSeparate(stateValue, separate) {
+  const next = cloneViewTrimState(stateValue);
+  next.book_settings.spread_separate = Boolean(separate);
+  return next;
+}
+
+export class ViewerViewTrimPanel {
+  constructor() {
+    this.root = element("div", "viewer-view-trim-panel");
+    this.serverState = null;
+    this.targetIdentity = "";
+    this.refreshSequence = 0;
+    this.commitSequence = 0;
+    this.writeTail = Promise.resolve();
+    this.build();
+  }
+
+  build() {
+    const modeRow = element("label", "view-trim-mode-row");
+    modeRow.append(textElement("span", "適用モード"));
+    this.modeSelect = document.createElement("select");
+    for (const [value, label] of [
+      ["none", "トリムなし"],
+      ["auto", "自動余白カット（本全体）"],
+      ["book", "手動設定（本全体）"],
+    ]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      this.modeSelect.append(option);
+    }
+    this.modeSelect.addEventListener("change", () => {
+      if (!this.serverState) return;
+      this.serverState.apply_mode = this.modeSelect.value;
+      if (this.serverState.apply_mode === "book") {
+        this.serverState.book_settings.enabled = true;
+      }
+      this.renderState();
+      this.commit().catch((error) => this.showError(error));
+    });
+    modeRow.append(this.modeSelect);
+
+    this.enabledRow = element("label", "view-trim-check-row");
+    this.enabledInput = document.createElement("input");
+    this.enabledInput.type = "checkbox";
+    this.enabledInput.addEventListener("change", () => {
+      if (!this.serverState) return;
+      this.serverState.book_settings.enabled = this.enabledInput.checked;
+      this.commit().catch((error) => this.showError(error));
+    });
+    this.enabledRow.append(this.enabledInput, textElement("span", "手動トリムを有効にする"));
+
+    this.separateRow = element("label", "view-trim-check-row");
+    this.separateInput = document.createElement("input");
+    this.separateInput.type = "checkbox";
+    this.separateInput.addEventListener("change", () => {
+      if (!this.serverState) return;
+      this.serverState = setViewTrimSpreadSeparate(
+        this.serverState,
+        this.separateInput.checked
+      );
+      this.renderState();
+      this.commit().catch((error) => this.showError(error));
+    });
+    this.separateRow.append(
+      this.separateInput,
+      textElement("span", "見開きの左右を別々に調整")
+    );
+
+    this.controls = element("div", "view-trim-controls");
+    this.status = textElement("p", "現在値を読み込んでいます…", "view-trim-status");
+    this.status.setAttribute("role", "status");
+    this.root.append(modeRow, this.enabledRow, this.separateRow, this.controls, this.status);
+  }
+
+  currentTarget() {
+    const target = currentRemotePageTarget();
+    if (!target) return null;
+    return {
+      ...target,
+      identity: `${addressIdentity(target.contextAddress)}\n${addressIdentity(target.address)}`,
+    };
+  }
+
+  async refresh() {
+    const target = this.currentTarget();
+    if (!target) {
+      this.setDisabled(true);
+      this.status.textContent = "このページは表示トリムの対象ではありません。";
+      return;
+    }
+    this.targetIdentity = target.identity;
+    const sequence = ++this.refreshSequence;
+    this.setDisabled(true);
+    this.status.classList.remove("is-error");
+    this.status.textContent = "現在値を読み込み中…";
+    const response = await apiPostJson("/api/write", {
+      kind: "get_view_trim_state",
+      address: target.address,
+      context_address: target.contextAddress,
+    });
+    if (sequence !== this.refreshSequence || this.currentTarget()?.identity !== target.identity) {
+      return;
+    }
+    const next = normalizeRemoteViewTrimState(response.view_trim_state);
+    if (!next) throw new Error("表示トリムの現在値を取得できませんでした。");
+    this.serverState = next;
+    applyRemoteStateGeneration(response.remote_state_generation, { reloadViewer: true });
+    this.renderState();
+    this.setDisabled(false);
+    this.status.textContent = "スライダーを離すと保存します。";
+  }
+
+  renderState() {
+    const value = this.serverState;
+    if (!value) return;
+    const isSpread = (currentPageGroup()?.entries.length ?? 0) === 2;
+    const manual = value.apply_mode === "book";
+    this.modeSelect.value = value.apply_mode;
+    this.enabledInput.checked = value.book_settings.enabled;
+    this.enabledRow.hidden = !manual;
+    this.separateInput.checked = value.book_settings.spread_separate;
+    this.separateRow.hidden = !manual || !isSpread;
+    const groups = viewTrimSpreadControlKeys(value.book_settings, isSpread);
+    const nodes = [];
+    for (const group of groups) {
+      const keys = group === "spread_linked"
+        ? ["top", "bottom", "inner", "outer"]
+        : ["left", "top", "right", "bottom"];
+      const labels = {
+        single: "単ページ",
+        spread_linked: "見開き（連動）",
+        spread_left: "左ページ",
+        spread_right: "右ページ",
+      };
+      const section = element("section", "view-trim-control-group");
+      section.append(textElement("h3", labels[group]));
+      for (const key of keys) section.append(this.marginControl(group, key));
+      nodes.push(section);
+    }
+    this.controls.replaceChildren(...nodes);
+    this.controls.hidden = !manual;
+    this.setDisabled(false);
+  }
+
+  marginControl(group, key) {
+    const labels = { left: "左", top: "上", right: "右", bottom: "下", inner: "内側", outer: "外側" };
+    const row = element("label", "view-trim-slider-row");
+    row.append(textElement("span", labels[key]));
+    const input = document.createElement("input");
+    input.type = "range";
+    input.min = "0";
+    input.max = "20";
+    input.step = "0.1";
+    input.value = String(this.serverState.book_settings[group][key] * 100);
+    input.setAttribute("aria-label", `${labels[key]}のトリム率`);
+    const output = document.createElement("output");
+    const syncFromInput = () => {
+      const percent = Number(input.value);
+      output.value = `${percent.toFixed(1)}%`;
+      this.serverState.book_settings[group][key] = percent / 100;
+      this.serverState.book_settings.enabled = true;
+      this.enabledInput.checked = true;
+    };
+    output.value = `${Number(input.value).toFixed(1)}%`;
+    input.addEventListener("input", syncFromInput);
+    input.addEventListener("change", () => {
+      syncFromInput();
+      this.commit().catch((error) => this.showError(error));
+    });
+    row.append(input, output);
+    return row;
+  }
+
+  commit() {
+    const target = this.currentTarget();
+    if (!target || !this.serverState) return Promise.resolve();
+    const requestState = cloneViewTrimState(this.serverState);
+    const commitId = ++this.commitSequence;
+    this.status.classList.remove("is-error");
+    this.status.textContent = "保存中…";
+    this.writeTail = this.writeTail.catch(() => {}).then(async () => {
+      const response = await apiPostJson("/api/write", {
+        kind: "set_view_trim",
+        address: target.address,
+        context_address: target.contextAddress,
+        state: requestState,
+      });
+      if (commitId !== this.commitSequence || this.currentTarget()?.identity !== target.identity) {
+        return;
+      }
+      const next = normalizeRemoteViewTrimState(response.view_trim_state);
+      if (!next) throw new Error("表示トリムの保存結果を取得できませんでした。");
+      this.serverState = next;
+      this.renderState();
+      applyRemoteStateGeneration(response.remote_state_generation, { reloadViewer: true });
+      this.status.textContent = "保存しました。";
+    }).catch((error) => {
+      if (commitId === this.commitSequence) this.showError(error);
+      throw error;
+    });
+    return this.writeTail;
+  }
+
+  setDisabled(disabled) {
+    for (const control of this.root.querySelectorAll("input, select")) {
+      control.disabled = disabled;
+    }
+  }
+
+  showError(error) {
+    this.setDisabled(false);
+    this.status.classList.add("is-error");
+    this.status.textContent = error instanceof Error
+      ? error.message
+      : "表示トリム設定を保存できませんでした。";
+  }
+
+  destroy() {
+    this.refreshSequence += 1;
+    this.commitSequence += 1;
+  }
 }
 
 export class ViewerAdjustmentPanel {
@@ -6867,6 +7257,7 @@ class CommandMenu {
     this.keyboardElements = [];
     this.viewerTabButtons = new Map();
     this.adjustmentPanel = null;
+    this.viewTrimPanel = null;
     this.bookmarkPanel = null;
     const definition = menuDefinition(context, "main");
     this.root = element("div", "command-menu-layer");
@@ -7044,6 +7435,10 @@ class CommandMenu {
       this.adjustmentPanel ??= new ViewerAdjustmentPanel();
       this.placeholder.replaceChildren(this.adjustmentPanel.root);
       this.adjustmentPanel.refresh().catch((error) => this.adjustmentPanel.showError(error));
+    } else if (tab.id === "view_trim") {
+      this.viewTrimPanel ??= new ViewerViewTrimPanel();
+      this.placeholder.replaceChildren(this.viewTrimPanel.root);
+      this.viewTrimPanel.refresh().catch((error) => this.viewTrimPanel.showError(error));
     } else if (tab.id === "bookmarks") {
       this.bookmarkPanel ??= new ViewerBookmarkPanel();
       this.placeholder.replaceChildren(this.bookmarkPanel.root);
@@ -7070,6 +7465,11 @@ class CommandMenu {
   refreshAdjustment() {
     if (!this.opened || state.viewerPanelTab !== "adjustment") return;
     this.adjustmentPanel?.refresh().catch((error) => this.adjustmentPanel.showError(error));
+  }
+
+  refreshViewTrim() {
+    if (!this.opened || state.viewerPanelTab !== "view_trim") return;
+    this.viewTrimPanel?.refresh().catch((error) => this.viewTrimPanel.showError(error));
   }
 
   refreshBookmarks() {
@@ -7210,6 +7610,7 @@ class CommandMenu {
       this.root.removeEventListener("click", this.panelClickCapture, true);
       window.removeEventListener("resize", this.viewportResize);
       this.adjustmentPanel?.destroy();
+      this.viewTrimPanel?.destroy();
       this.bookmarkPanel?.destroy();
     }
     this.root.remove();

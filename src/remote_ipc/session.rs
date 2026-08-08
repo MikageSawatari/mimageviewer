@@ -2342,7 +2342,7 @@ mod tests {
             },
             RemoteWriteRequest::RemoveBookBookmark {
                 address: page.clone(),
-                context_address: container,
+                context_address: container.clone(),
                 page_index: 3,
                 id: 17,
             },
@@ -2363,7 +2363,22 @@ mod tests {
                     ai: None,
                 },
             },
-            RemoteWriteRequest::GetAdjustmentState { address: page },
+            RemoteWriteRequest::GetAdjustmentState {
+                address: page.clone(),
+            },
+            RemoteWriteRequest::SetViewTrim {
+                address: page.clone(),
+                context_address: container.clone(),
+                state: serde_json::json!({}),
+            },
+            RemoteWriteRequest::GetViewTrimState {
+                address: page,
+                context_address: container.clone(),
+            },
+            RemoteWriteRequest::SetSortOrder {
+                scope: mimageviewer_ipc::RemoteGridScope::Address { address: container },
+                sort_order: "FileName".to_owned(),
+            },
         ]
     }
 

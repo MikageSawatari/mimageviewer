@@ -2327,6 +2327,7 @@ fn api_list(
                 "favorite_id": payload.effective_address.favorite_id,
                 "path": payload.effective_address.relative_path,
                 "thumb_aspect_height_ratio": payload.thumb_aspect_height_ratio,
+                "sort_state": payload.sort_state,
                 "entries": entries,
             });
             match HttpResponse::json(&response) {
@@ -2477,9 +2478,8 @@ fn api_write(
         Ok(request) => request,
         Err(_) => return HttpResponse::text(400, "Bad Request"),
     };
-    if let Err(error) = state
-        .library
-        .validate_remote_address(write_request.address())
+    if let Some(address) = write_request.address()
+        && let Err(error) = state.library.validate_remote_address(address)
     {
         return store_error_response(error);
     }
@@ -2497,22 +2497,31 @@ fn api_write(
         Err(busy) => return write_admission_busy_response(busy, write_kind),
     };
     match result {
-        Ok(result) => HttpResponse::json(&json!({
-            "applied": true,
-            "item_state": result.value.item_state,
-            "adjustment_state": result.value.adjustment_state,
-            "book_bookmarks": result.value.book_bookmarks,
-        }))
-        .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
-        .with_header("Cache-Control", "no-store")
-        .with_log_details(json!({
-            "write": {
-                "kind": write_kind,
-                "ipc_status": "ok",
-                "ipc_ms": crate::diagnostics::duration_ms(started.elapsed()),
-                "ipc_connection_id": result.connection_id,
-            }
-        })),
+        Ok(result) => {
+            let remote_state_generation = match state.library.remote_state() {
+                Ok(state) => state.remote_state_generation,
+                Err(error) => return store_error_response(error),
+            };
+            HttpResponse::json(&json!({
+                "applied": true,
+                "item_state": result.value.item_state,
+                "adjustment_state": result.value.adjustment_state,
+                "book_bookmarks": result.value.book_bookmarks,
+                "view_trim_state": result.value.view_trim_state,
+                "sort_state": result.value.sort_state,
+                "remote_state_generation": remote_state_generation,
+            }))
+            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+            .with_header("Cache-Control", "no-store")
+            .with_log_details(json!({
+                "write": {
+                    "kind": write_kind,
+                    "ipc_status": "ok",
+                    "ipc_ms": crate::diagnostics::duration_ms(started.elapsed()),
+                    "ipc_connection_id": result.connection_id,
+                }
+            }))
+        }
         Err(failure) => write_ipc_error_response(failure, started.elapsed(), write_kind),
     }
 }

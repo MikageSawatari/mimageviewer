@@ -1484,6 +1484,19 @@ impl crate::app::App {
             RemoteWriteRequest::GetAdjustmentState { address } => {
                 self.remote_adjustment_state(address)
             }
+            RemoteWriteRequest::SetViewTrim {
+                address: _,
+                context_address,
+                state,
+            } => self.persist_remote_view_trim(context_address, state),
+            RemoteWriteRequest::GetViewTrimState {
+                address: _,
+                context_address,
+            } => self.remote_view_trim_state(context_address),
+            RemoteWriteRequest::SetSortOrder {
+                scope: _,
+                sort_order,
+            } => self.persist_remote_sort_order(sort_order),
             RemoteWriteRequest::SetBookmark { .. }
             | RemoteWriteRequest::GetItemState { .. }
             | RemoteWriteRequest::ListBookBookmarks { .. }
@@ -1906,6 +1919,139 @@ impl crate::app::App {
         );
         RemoteWriteResponse::Success(RemoteWriteResult::adjustment_state(
             self.remote_adjustment_state_for_target(&target),
+        ))
+    }
+
+    fn remote_view_trim_state(
+        &self,
+        context_address: &mimageviewer_ipc::RemoteAddress,
+    ) -> RemoteWriteResponse {
+        let key = match remote_spread_key(&self.settings, context_address) {
+            Ok(key) => key,
+            Err(error) => return RemoteWriteResponse::Error(error),
+        };
+        let Some(db) = self.view_trim_db.as_ref() else {
+            return write_error(
+                RemoteWriteErrorCode::PersistenceFailed,
+                "view_trim.db を利用できません",
+            );
+        };
+        let mut state = db
+            .get_book_state(&key.exact)
+            .or_else(|| {
+                key.fallback
+                    .as_deref()
+                    .and_then(|fallback| db.get_book_state(fallback))
+            })
+            .unwrap_or_default();
+        let legacy_margin_fit = matches!(
+            self.settings.fullscreen_fit_mode,
+            crate::settings::FullscreenFitMode::MarginFit
+        ) || self.settings.margin_fit_enabled;
+        state.apply_mode = crate::view_trim::effective_view_trim_base_apply_mode(
+            state.apply_mode,
+            legacy_margin_fit,
+        );
+        state.book_settings = state.book_settings.clamped();
+        match serde_json::to_value(state) {
+            Ok(state) => RemoteWriteResponse::Success(RemoteWriteResult::view_trim_state(state)),
+            Err(error) => {
+                crate::logger::log(format!(
+                    "remote_ipc: view trim state serialization failed: {error}"
+                ));
+                write_error(
+                    RemoteWriteErrorCode::Internal,
+                    "表示トリム設定を返せませんでした",
+                )
+            }
+        }
+    }
+
+    fn persist_remote_view_trim(
+        &mut self,
+        context_address: &mimageviewer_ipc::RemoteAddress,
+        value: &serde_json::Value,
+    ) -> RemoteWriteResponse {
+        let mut state = match super::normalize_remote_view_trim_state(value) {
+            Ok(state) => state,
+            Err(message) => return write_error(RemoteWriteErrorCode::BadRequest, message),
+        };
+        let key = match remote_spread_key(&self.settings, context_address) {
+            Ok(key) => key,
+            Err(error) => return RemoteWriteResponse::Error(error),
+        };
+        let Some(db) = self.view_trim_db.as_ref() else {
+            return write_error(
+                RemoteWriteErrorCode::PersistenceFailed,
+                "view_trim.db を利用できません",
+            );
+        };
+        let previous_separate = db
+            .get_book_state(&key.exact)
+            .or_else(|| {
+                key.fallback
+                    .as_deref()
+                    .and_then(|fallback| db.get_book_state(fallback))
+            })
+            .unwrap_or_default()
+            .book_settings
+            .spread_separate;
+        if previous_separate != state.book_settings.spread_separate {
+            let separate = state.book_settings.spread_separate;
+            state.book_settings.spread_separate = previous_separate;
+            state.book_settings = state.book_settings.with_spread_separate(separate);
+        }
+        if let Err(error) = db.set_book_state(&key.exact, state) {
+            crate::logger::log(format!("remote_ipc: view trim write failed: {error}"));
+            return write_error(
+                RemoteWriteErrorCode::PersistenceFailed,
+                "view_trim.db への保存に失敗しました",
+            );
+        }
+        if matches!(
+            self.settings.fullscreen_fit_mode,
+            crate::settings::FullscreenFitMode::MarginFit
+        ) || self.settings.margin_fit_enabled
+        {
+            self.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Page;
+            self.settings.margin_fit_enabled = false;
+            if !self.settings.save_checked() {
+                return write_error(
+                    RemoteWriteErrorCode::PersistenceFailed,
+                    "旧余白カット設定の移行に失敗しました",
+                );
+            }
+        }
+        match serde_json::to_value(state) {
+            Ok(state) => RemoteWriteResponse::Success(RemoteWriteResult::view_trim_state(state)),
+            Err(error) => {
+                crate::logger::log(format!(
+                    "remote_ipc: persisted view trim state serialization failed: {error}"
+                ));
+                write_error(
+                    RemoteWriteErrorCode::Internal,
+                    "保存した表示トリム設定を返せませんでした",
+                )
+            }
+        }
+    }
+
+    fn persist_remote_sort_order(&mut self, value: &str) -> RemoteWriteResponse {
+        let sort_order = match super::parse_sort_order_wire(value) {
+            Ok(sort_order) => sort_order,
+            Err(message) => return write_error(RemoteWriteErrorCode::BadRequest, message),
+        };
+        let previous = self.settings.sort_order;
+        self.settings.sort_order = sort_order;
+        if !self.settings.save_checked() {
+            self.settings.sort_order = previous;
+            return write_error(
+                RemoteWriteErrorCode::PersistenceFailed,
+                "並べ替え設定を保存できませんでした",
+            );
+        }
+        RemoteWriteResponse::Success(RemoteWriteResult::sort_state(
+            super::remote_grid_sort_state(sort_order, None),
         ))
     }
 

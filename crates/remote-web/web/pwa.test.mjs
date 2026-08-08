@@ -1,7 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile as readFileRaw } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
+
+// 検査は原文の構造を見るので、行末の違いで結果が変わってはいけない。
+// 作業コピーの行末は core.autocrlf と書き手の都合で LF にも CRLF にもなる。
+const readFile = async (url, encoding) => {
+  const contents = await readFileRaw(url, encoding);
+  return typeof contents === "string"
+    ? contents.split("\r\n").join("\n")
+    : contents;
+};
 
 const here = new URL("./", import.meta.url);
 

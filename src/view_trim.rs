@@ -189,6 +189,35 @@ impl Default for ViewTrimBookSettings {
 }
 
 impl ViewTrimBookSettings {
+    /// 保存・IPC 境界で、本単位設定に含まれる全 margin を正本の規則へ丸める。
+    pub fn clamped(self) -> Self {
+        Self {
+            enabled: self.enabled,
+            spread_separate: self.spread_separate,
+            single: self.single.clamped(),
+            spread_linked: self.spread_linked.clamped(),
+            spread_left: self.spread_left.clamped(),
+            spread_right: self.spread_right.clamped(),
+        }
+    }
+
+    /// 見開きの編集表現を切り替え、現在有効な側の値を本体共通規則で引き継ぐ。
+    pub fn with_spread_separate(mut self, separate: bool) -> Self {
+        if self.spread_separate == separate {
+            return self;
+        }
+        if separate {
+            let (left, right) = self.spread_linked.to_separate();
+            self.spread_left = left;
+            self.spread_right = right;
+        } else {
+            self.spread_linked =
+                ViewTrimLinkedMargins::average_from_separate(self.spread_left, self.spread_right);
+        }
+        self.spread_separate = separate;
+        self
+    }
+
     pub fn single_bbox(self) -> Option<egui::Rect> {
         self.enabled.then_some(())?;
         self.single.bbox()
@@ -528,6 +557,29 @@ mod tests {
         assert_eq!(as_right.right, 0.08);
         assert_eq!(as_right.top, 0.01);
         assert_eq!(as_right.bottom, 0.02);
+    }
+
+    #[test]
+    fn book_spread_representation_switch_preserves_inner_outer_semantics() {
+        let linked = ViewTrimBookSettings {
+            spread_linked: ViewTrimLinkedMargins {
+                top: 0.01,
+                bottom: 0.02,
+                inner: 0.08,
+                outer: 0.03,
+            },
+            ..Default::default()
+        };
+        let separate = linked.with_spread_separate(true);
+        assert!(separate.spread_separate);
+        assert_eq!(separate.spread_left.left, 0.03);
+        assert_eq!(separate.spread_left.right, 0.08);
+        assert_eq!(separate.spread_right.left, 0.08);
+        assert_eq!(separate.spread_right.right, 0.03);
+
+        let round_trip = separate.with_spread_separate(false);
+        assert!(!round_trip.spread_separate);
+        assert_eq!(round_trip.spread_linked, linked.spread_linked);
     }
 
     #[test]

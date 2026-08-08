@@ -100,6 +100,7 @@ fn remote_auto_trim_cache_key(
 
 pub(super) struct ContainerEngine {
     settings: Arc<crate::settings::Settings>,
+    sort_settings: super::RemoteSortSettingsSource,
     favorite_roots: Arc<super::live_favorites::RemoteFavoriteRoots>,
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
     pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
@@ -503,6 +504,7 @@ struct RecomputedFolderListing {
     materialize_ms: f64,
     image_only: bool,
     compiled: bool,
+    sort_order: crate::settings::SortOrder,
 }
 fn folder_thumb_aspect_height_ratio(settings: &crate::settings::Settings, folder: &Path) -> f64 {
     let aspect = if settings.thumb_aspect_auto {
@@ -523,7 +525,15 @@ impl ContainerEngine {
         );
         let favorite_roots =
             super::live_favorites::RemoteFavoriteRoots::snapshot(settings.favorites.clone());
-        Self::new_inner(settings, favorite_roots, None, None, adjustment_settings)
+        let sort_settings = super::RemoteSortSettingsSource::Snapshot(settings.sort_order);
+        Self::new_inner(
+            settings,
+            favorite_roots,
+            None,
+            None,
+            adjustment_settings,
+            sort_settings,
+        )
     }
 
     pub(super) fn new_with_session(
@@ -537,6 +547,7 @@ impl ContainerEngine {
             Some(ResumeReader::Session(session.clone())),
             Some(session),
             AdjustmentSettingsSource::Live,
+            super::RemoteSortSettingsSource::Live,
         )
     }
 
@@ -550,12 +561,14 @@ impl ContainerEngine {
         );
         let favorite_roots =
             super::live_favorites::RemoteFavoriteRoots::snapshot(settings.favorites.clone());
+        let sort_settings = super::RemoteSortSettingsSource::Snapshot(settings.sort_order);
         Self::new_inner(
             settings,
             favorite_roots,
             Some(ResumeReader::Error(error)),
             None,
             adjustment_settings,
+            sort_settings,
         )
     }
 
@@ -565,6 +578,7 @@ impl ContainerEngine {
         resume_reader: Option<ResumeReader>,
         session: Option<super::session::SessionHandle>,
         adjustment_settings: AdjustmentSettingsSource,
+        sort_settings: super::RemoteSortSettingsSource,
     ) -> Self {
         let spread_db_path = crate::data_dir::get().join("spread.db");
         let spread_db =
@@ -590,6 +604,7 @@ impl ContainerEngine {
             };
         Self {
             settings: Arc::new(settings),
+            sort_settings,
             favorite_roots,
             stats: Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
             pdf_passwords: crate::pdf_passwords::PdfPasswordStore::load(),
@@ -626,6 +641,20 @@ impl ContainerEngine {
             #[cfg(test)]
             AdjustmentSettingsSource::Snapshot(settings) => Ok(settings.clone()),
         }
+    }
+
+    fn settings_for_listing(&self) -> Result<crate::settings::Settings, RemoteWriteError> {
+        let mut settings = (*self.settings).clone();
+        settings.sort_order = self.sort_settings.load().map_err(|error| {
+            crate::logger::log(format!(
+                "remote_ipc: live sort settings read failed: {error}"
+            ));
+            RemoteWriteError::new(
+                RemoteWriteErrorCode::PersistenceFailed,
+                "最新の並び順を読み込めませんでした",
+            )
+        })?;
+        Ok(settings)
     }
 
     fn prepare_remote_edits(
@@ -998,6 +1027,11 @@ impl ContainerEngine {
                 return FolderListResponse::Error(media_error_from_remote_write(error));
             }
         };
+        let sort_locked = crate::app::physical_page_order_locked(
+            &self.settings,
+            &resolved.logical,
+            &listing.items,
+        );
         let entries = listing
             .items
             .iter()
@@ -1014,6 +1048,14 @@ impl ContainerEngine {
         let response = FolderListResponse::Success(FolderListPayload {
             effective_address: request.address,
             thumb_aspect_height_ratio,
+            sort_state: super::remote_grid_sort_state(
+                if sort_locked {
+                    crate::app::BOOK_READING_PAGE_ORDER
+                } else {
+                    listing.sort_order
+                },
+                sort_locked.then_some(super::BOOK_SORT_LOCK_REASON),
+            ),
             entries,
             scan_ms: listing.scan_ms,
             materialize_ms: listing.materialize_ms,
@@ -1158,6 +1200,83 @@ impl ContainerEngine {
             }
             RemoteWriteRequest::GetAdjustmentState { address } => {
                 self.validate_rating_page(address)
+            }
+            RemoteWriteRequest::SetViewTrim {
+                address,
+                context_address,
+                state,
+            } => {
+                self.validate_page_context(address, context_address)?;
+                super::normalize_remote_view_trim_state(state)
+                    .map(|_| ())
+                    .map_err(|message| {
+                        RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, message)
+                    })
+            }
+            RemoteWriteRequest::GetViewTrimState {
+                address,
+                context_address,
+            } => self
+                .validate_page_context(address, context_address)
+                .map(|_| ()),
+            RemoteWriteRequest::SetSortOrder { scope, sort_order } => {
+                super::parse_sort_order_wire(sort_order).map_err(|message| {
+                    RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, message)
+                })?;
+                match scope {
+                    mimageviewer_ipc::RemoteGridScope::Address { address } => {
+                        let resolved = self
+                            .resolve(address)
+                            .map_err(remote_write_error_from_media)?;
+                        if !std::fs::metadata(&resolved.canonical)
+                            .is_ok_and(|metadata| metadata.is_dir())
+                        {
+                            return Err(RemoteWriteError::new(
+                                RemoteWriteErrorCode::Unsupported,
+                                super::BOOK_SORT_LOCK_REASON,
+                            ));
+                        }
+                        let listing = self.recompute_folder_listing(&resolved.logical)?;
+                        if crate::app::physical_page_order_locked(
+                            &self.settings,
+                            &resolved.logical,
+                            &listing.items,
+                        ) {
+                            return Err(RemoteWriteError::new(
+                                RemoteWriteErrorCode::Unsupported,
+                                super::BOOK_SORT_LOCK_REASON,
+                            ));
+                        }
+                        Ok(())
+                    }
+                    mimageviewer_ipc::RemoteGridScope::Collection { collection } => {
+                        let mimageviewer_ipc::CollectionKind::SmartFolder { definition_id } =
+                            collection
+                        else {
+                            return Err(RemoteWriteError::new(
+                                RemoteWriteErrorCode::Unsupported,
+                                super::FIXED_LIST_SORT_LOCK_REASON,
+                            ));
+                        };
+                        let id = uuid::Uuid::parse_str(definition_id).map_err(|_| {
+                            RemoteWriteError::new(
+                                RemoteWriteErrorCode::BadRequest,
+                                "ID が正しくありません",
+                            )
+                        })?;
+                        self.settings
+                            .smart_folders
+                            .iter()
+                            .any(|definition| definition.id == id)
+                            .then_some(())
+                            .ok_or_else(|| {
+                                RemoteWriteError::new(
+                                    RemoteWriteErrorCode::NotFound,
+                                    "スマートフォルダが見つかりません",
+                                )
+                            })
+                    }
+                }
             }
         }
     }
@@ -1572,8 +1691,9 @@ impl ContainerEngine {
         &self,
         folder: &Path,
     ) -> Result<RecomputedFolderListing, RemoteWriteError> {
+        let settings = self.settings_for_listing()?;
         let scan_started = Instant::now();
-        let scan = crate::app::folder_scan::scan_directory_with_settings(folder, &self.settings)
+        let scan = crate::app::folder_scan::scan_directory_with_settings(folder, &settings)
             .map_err(|_| {
                 RemoteWriteError::new(
                     RemoteWriteErrorCode::PersistenceFailed,
@@ -1581,8 +1701,7 @@ impl ContainerEngine {
                 )
             })?;
         let scan_ms = scan_started.elapsed().as_secs_f64() * 1000.0;
-        let compiled =
-            crate::books::is_direct_book_folder(&self.settings.books_root_path(), folder);
+        let compiled = crate::books::is_direct_book_folder(&settings.books_root_path(), folder);
         let image_only = if compiled {
             scan.all_media
                 .iter()
@@ -1594,8 +1713,7 @@ impl ContainerEngine {
             )
         };
         let materialize_started = Instant::now();
-        let materialized =
-            crate::app::materialize_local_folder_listing(folder, scan, &self.settings);
+        let materialized = crate::app::materialize_local_folder_listing(folder, scan, &settings);
         let materialize_ms = materialize_started.elapsed().as_secs_f64() * 1000.0;
         Ok(RecomputedFolderListing {
             items: materialized.items,
@@ -1605,6 +1723,7 @@ impl ContainerEngine {
             materialize_ms,
             image_only,
             compiled,
+            sort_order: settings.sort_order,
         })
     }
 
@@ -2597,6 +2716,10 @@ impl ContainerEngine {
             thumb_aspect_height_ratio: super::collections::aggregate_thumb_aspect_height_ratio(
                 &self.settings,
             ),
+            sort_state: super::remote_grid_sort_state(
+                crate::app::BOOK_READING_PAGE_ORDER,
+                Some(super::BOOK_SORT_LOCK_REASON),
+            ),
             resume_page,
             open_mode: self.container_open_mode(auto_open),
             configured_spread_mode: spread.configured,
@@ -2725,6 +2848,10 @@ impl ContainerEngine {
             thumb_aspect_height_ratio: super::collections::aggregate_thumb_aspect_height_ratio(
                 &self.settings,
             ),
+            sort_state: super::remote_grid_sort_state(
+                crate::app::BOOK_READING_PAGE_ORDER,
+                Some(super::BOOK_SORT_LOCK_REASON),
+            ),
             resume_page,
             open_mode: self.container_open_mode(
                 at_resume_root && self.settings.effective_auto_fullscreen_zip_pdf(),
@@ -2786,6 +2913,10 @@ impl ContainerEngine {
             entries,
             thumb_aspect_height_ratio: super::collections::aggregate_thumb_aspect_height_ratio(
                 &self.settings,
+            ),
+            sort_state: super::remote_grid_sort_state(
+                crate::app::BOOK_READING_PAGE_ORDER,
+                Some(super::BOOK_SORT_LOCK_REASON),
             ),
             resume_page,
             open_mode: self.container_open_mode(self.settings.effective_auto_fullscreen_zip_pdf()),
@@ -5842,6 +5973,8 @@ mod tests {
             skip_zip_if_folder_exists: true,
             skip_image_if_video_exists: true,
             video_thumb_use_sidecar_image: true,
+            auto_fullscreen_zip_pdf: true,
+            auto_fullscreen_image_folders: true,
             thumb_aspect_auto: false,
             thumb_aspect: crate::settings::ThumbAspect::Landscape3x2,
             ..Default::default()
@@ -5864,6 +5997,16 @@ mod tests {
                 assert_eq!(video.kind, RemoteEntryKind::Video);
                 assert_eq!(video.address.relative_path, "mixed/clip.mp4");
                 assert_eq!(video.thumbnail_address.relative_path, "mixed/clip.jpg");
+                assert!(remote.sort_state.locked_reason.is_none());
+            } else if relative == "image-only" {
+                assert_eq!(
+                    remote.sort_state.selected,
+                    super::super::sort_order_wire_value(crate::app::BOOK_READING_PAGE_ORDER)
+                );
+                assert_eq!(
+                    remote.sort_state.locked_reason.as_deref(),
+                    Some(super::super::BOOK_SORT_LOCK_REASON)
+                );
             }
         }
     }
@@ -5937,6 +6080,7 @@ mod tests {
         let favorite = FavoriteEntry::new("test".to_owned(), root);
         let engine = ContainerEngine::new(crate::settings::Settings {
             favorites: vec![favorite.clone()],
+            sort_order: crate::settings::SortOrder::DateDesc,
             ..Default::default()
         });
         let address = RemoteAddress::file(favorite.id.to_string(), "album");
@@ -5953,6 +6097,14 @@ mod tests {
         assert_eq!(payload.entries.len(), 2);
         assert_eq!(payload.page_groups.len(), 1);
         assert_eq!(payload.page_groups[0].pages.len(), 2);
+        assert_eq!(
+            payload.sort_state.selected,
+            super::super::sort_order_wire_value(crate::app::BOOK_READING_PAGE_ORDER)
+        );
+        assert_eq!(
+            payload.sort_state.locked_reason.as_deref(),
+            Some(super::super::BOOK_SORT_LOCK_REASON)
+        );
 
         let mut write = RemoteWriteRequest::SetSpread {
             address,

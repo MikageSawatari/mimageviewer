@@ -6590,6 +6590,19 @@ impl PageOrderViewKind {
     }
 }
 
+/// 物理一覧を本として扱い、ページ順を固定するか。本体 UI と Remote が共有する判定境界。
+pub(crate) fn physical_page_order_locked(
+    settings: &crate::settings::Settings,
+    source_path: &Path,
+    items: &[GridItem],
+) -> bool {
+    crate::books::is_direct_book_folder(&settings.books_root_path(), source_path)
+        || crate::folder_tree::is_open_as_container(source_path)
+        || settings.auto_fullscreen_image_folders_enabled()
+            && !items.is_empty()
+            && items.iter().all(|item| matches!(item, GridItem::Image(_)))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SpreadRestoreDefaults {
     spread_mode: crate::settings::SpreadMode,
@@ -26786,18 +26799,14 @@ impl App {
         items: &[GridItem],
         view_kind: PageOrderViewKind,
     ) -> bool {
-        if crate::books::is_direct_book_folder(&self.book_root_path(), source_path)
-            || view_kind == PageOrderViewKind::ReadingHistory
-        {
+        if view_kind == PageOrderViewKind::ReadingHistory {
             return true;
         }
-        if crate::folder_tree::is_open_as_container(source_path) {
-            return true;
+        if view_kind == PageOrderViewKind::Physical {
+            return physical_page_order_locked(&self.settings, source_path, items);
         }
-
-        self.settings.auto_fullscreen_image_folders_enabled()
-            && view_kind == PageOrderViewKind::Physical
-            && Self::grid_items_are_image_only_folder_pages(items)
+        crate::books::is_direct_book_folder(&self.book_root_path(), source_path)
+            || crate::folder_tree::is_open_as_container(source_path)
     }
 
     /// 現在のビュー用ラッパー。判定本体は読み込み前にも使える items 引数付き述語へ集約する。

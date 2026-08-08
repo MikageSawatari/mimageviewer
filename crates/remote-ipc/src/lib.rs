@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 31;
+pub const PROTOCOL_VERSION: u32 = 32;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -159,6 +159,7 @@ pub struct FolderListEntry {
 pub struct FolderListPayload {
     pub effective_address: RemoteAddress,
     pub thumb_aspect_height_ratio: f64,
+    pub sort_state: RemoteGridSortState,
     pub entries: Vec<FolderListEntry>,
     /// Time spent scanning the directory and reading metadata.
     pub scan_ms: f64,
@@ -387,6 +388,39 @@ pub struct RemoteAdjustmentState {
     pub read_only: RemoteAdjustmentReadOnlyState,
 }
 
+/// 一覧で選べる値と現在値。値・ラベルは本体の `SortOrder` から毎回組み立てる。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteGridSortState {
+    pub selected: String,
+    pub options: Vec<RemoteGridSortOption>,
+    /// `Some` の間は選択 UI を無効にし、同じ文言を利用者へ表示する。
+    pub locked_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteGridSortOption {
+    pub value: String,
+    pub label: String,
+    pub short_label: String,
+}
+
+/// 並べ替え操作の対象一覧。相互排他な scope を一つの型で所有する。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RemoteGridScope {
+    Address { address: RemoteAddress },
+    Collection { collection: CollectionKind },
+}
+
+impl RemoteGridScope {
+    pub fn address(&self) -> Option<&RemoteAddress> {
+        match self {
+            Self::Address { address } => Some(address),
+            Self::Collection { .. } => None,
+        }
+    }
+}
+
 /// 本体 UI thread が所有する永続ハンドルで適用する書き込み要求。
 ///
 /// 書き込み種別はこの enum だけへ追加し、IPC / UI 間に種別ごとの pending field を作らない。
@@ -460,10 +494,26 @@ pub enum RemoteWriteRequest {
     GetAdjustmentState {
         address: RemoteAddress,
     },
+    /// `state` は本体の `ViewTrimBookState` の serde 表現そのもの。
+    /// IPC 専用のトリムモデルや既定値を持たず、本体 UI thread で型検証・clamp する。
+    SetViewTrim {
+        address: RemoteAddress,
+        context_address: RemoteAddress,
+        state: serde_json::Value,
+    },
+    GetViewTrimState {
+        address: RemoteAddress,
+        context_address: RemoteAddress,
+    },
+    SetSortOrder {
+        scope: RemoteGridScope,
+        /// 本体 `SortOrder` の serde 値。候補は `RemoteGridSortState` が返す。
+        sort_order: String,
+    },
 }
 
 impl RemoteWriteRequest {
-    pub fn address(&self) -> &RemoteAddress {
+    pub fn address(&self) -> Option<&RemoteAddress> {
         match self {
             Self::SetSpread { address, .. }
             | Self::RecordReadingProgress { address, .. }
@@ -474,7 +524,10 @@ impl RemoteWriteRequest {
             | Self::SetBookBookmarkTitle { address, .. }
             | Self::RemoveBookBookmark { address, .. }
             | Self::SetAdjustment { address, .. }
-            | Self::GetAdjustmentState { address } => address,
+            | Self::GetAdjustmentState { address }
+            | Self::SetViewTrim { address, .. }
+            | Self::GetViewTrimState { address, .. } => Some(address),
+            Self::SetSortOrder { scope, .. } => scope.address(),
         }
     }
 
@@ -497,11 +550,18 @@ impl RemoteWriteRequest {
             }
             | Self::RemoveBookBookmark {
                 context_address, ..
+            }
+            | Self::SetViewTrim {
+                context_address, ..
+            }
+            | Self::GetViewTrimState {
+                context_address, ..
             } => Some(context_address),
             Self::SetSpread { .. }
             | Self::SetRating { .. }
             | Self::SetAdjustment { .. }
-            | Self::GetAdjustmentState { .. } => None,
+            | Self::GetAdjustmentState { .. }
+            | Self::SetSortOrder { .. } => None,
         }
     }
 
@@ -517,6 +577,9 @@ impl RemoteWriteRequest {
             Self::RemoveBookBookmark { .. } => "remove_book_bookmark",
             Self::SetAdjustment { .. } => "set_adjustment",
             Self::GetAdjustmentState { .. } => "get_adjustment_state",
+            Self::SetViewTrim { .. } => "set_view_trim",
+            Self::GetViewTrimState { .. } => "get_view_trim_state",
+            Self::SetSortOrder { .. } => "set_sort_order",
         }
     }
 }
@@ -532,6 +595,8 @@ pub struct RemoteWriteResult {
     pub item_state: Option<RemoteItemState>,
     pub adjustment_state: Option<RemoteAdjustmentState>,
     pub book_bookmarks: Option<RemoteBookBookmarkList>,
+    pub view_trim_state: Option<serde_json::Value>,
+    pub sort_state: Option<RemoteGridSortState>,
 }
 
 impl RemoteWriteResult {
@@ -544,6 +609,8 @@ impl RemoteWriteResult {
             item_state: Some(item_state),
             adjustment_state: None,
             book_bookmarks: None,
+            view_trim_state: None,
+            sort_state: None,
         }
     }
 
@@ -552,6 +619,8 @@ impl RemoteWriteResult {
             item_state: None,
             adjustment_state: Some(adjustment_state),
             book_bookmarks: None,
+            view_trim_state: None,
+            sort_state: None,
         }
     }
 
@@ -560,6 +629,22 @@ impl RemoteWriteResult {
             item_state: None,
             adjustment_state: None,
             book_bookmarks: Some(book_bookmarks),
+            view_trim_state: None,
+            sort_state: None,
+        }
+    }
+
+    pub fn view_trim_state(view_trim_state: serde_json::Value) -> Self {
+        Self {
+            view_trim_state: Some(view_trim_state),
+            ..Self::default()
+        }
+    }
+
+    pub fn sort_state(sort_state: RemoteGridSortState) -> Self {
+        Self {
+            sort_state: Some(sort_state),
+            ..Self::default()
         }
     }
 }
@@ -677,6 +762,7 @@ pub struct ContainerPayload {
     pub entries: Vec<ContainerEntry>,
     /// ローカル一覧のサムネイルセルに使う高さ / 幅比。
     pub thumb_aspect_height_ratio: f64,
+    pub sort_state: RemoteGridSortState,
     /// `book_resume.db` の index を現在の列挙結果で検証し、ページ address に解決した値。
     pub resume_page: Option<RemoteAddress>,
     /// ローカルの auto-fullscreen と `book_open_resume` から解決した初期遷移。
@@ -868,6 +954,7 @@ pub struct RemoteEntry {
 pub struct CollectionPayload {
     pub title: String,
     pub thumb_aspect_height_ratio: f64,
+    pub sort_state: RemoteGridSortState,
     pub entries: Vec<RemoteEntry>,
     /// 応答サイズと初回 thumbnail burst を抑える読み取り専用上限。
     pub entry_limit: usize,
@@ -1809,6 +1896,18 @@ mod tests {
         }
     }
 
+    fn test_sort_state(locked_reason: Option<&str>) -> RemoteGridSortState {
+        RemoteGridSortState {
+            selected: "FileName".to_owned(),
+            options: vec![RemoteGridSortOption {
+                value: "FileName".to_owned(),
+                label: "ファイル名順".to_owned(),
+                short_label: "名前".to_owned(),
+            }],
+            locked_reason: locked_reason.map(str::to_owned),
+        }
+    }
+
     #[test]
     fn protocol_version_mismatch_is_rejected_and_reports_both_versions() {
         let client_version = PROTOCOL_VERSION + 1;
@@ -1991,6 +2090,7 @@ mod tests {
             response: FolderListResponse::Success(FolderListPayload {
                 effective_address: RemoteAddress::file("favorite", "movies"),
                 thumb_aspect_height_ratio: 9.0 / 16.0,
+                sort_state: test_sort_state(None),
                 entries: vec![FolderListEntry {
                     address: video,
                     thumbnail_address: sidecar,
@@ -2019,9 +2119,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v31_page_identity_session_epoch_auto_trim_partner_video_and_audio_status_round_trip()
+    fn protocol_v32_page_identity_session_epoch_auto_trim_partner_video_and_audio_status_round_trip()
      {
-        assert_eq!(PROTOCOL_VERSION, 31);
+        assert_eq!(PROTOCOL_VERSION, 32);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -2163,6 +2263,7 @@ mod tests {
                 effective_address: container,
                 entries: Vec::new(),
                 thumb_aspect_height_ratio: 1.5,
+                sort_state: test_sort_state(Some("本として表示中は名前順固定です")),
                 resume_page: Some(page(1)),
                 open_mode: ContainerOpenMode::ResumePage,
                 configured_spread_mode: RemoteSpreadMode::RtlCover,
@@ -2307,7 +2408,36 @@ mod tests {
                     }),
                 },
             },
-            RemoteWriteRequest::GetAdjustmentState { address: page },
+            RemoteWriteRequest::GetAdjustmentState {
+                address: page.clone(),
+            },
+            RemoteWriteRequest::SetViewTrim {
+                address: page.clone(),
+                context_address: RemoteAddress::file("favorite", "books/book.pdf"),
+                state: serde_json::json!({
+                    "apply_mode": "book",
+                    "book_settings": {
+                        "enabled": true,
+                        "spread_separate": false,
+                        "single": { "left": 0.01, "top": 0.02, "right": 0.03, "bottom": 0.04 },
+                        "spread_linked": { "top": 0.01, "bottom": 0.02, "inner": 0.03, "outer": 0.04 },
+                        "spread_left": { "left": 0.0, "top": 0.0, "right": 0.0, "bottom": 0.0 },
+                        "spread_right": { "left": 0.0, "top": 0.0, "right": 0.0, "bottom": 0.0 }
+                    }
+                }),
+            },
+            RemoteWriteRequest::GetViewTrimState {
+                address: page,
+                context_address: RemoteAddress::file("favorite", "books/book.pdf"),
+            },
+            RemoteWriteRequest::SetSortOrder {
+                scope: RemoteGridScope::Collection {
+                    collection: CollectionKind::SmartFolder {
+                        definition_id: "30d6c167-7148-4f3e-9a5a-21c5fd31ecb2".to_owned(),
+                    },
+                },
+                sort_order: "DateDesc".to_owned(),
+            },
         ];
         for request in requests {
             let encoded = serde_json::to_vec(&request).unwrap();
@@ -2442,6 +2572,7 @@ mod tests {
             response: CollectionResponse::Success(CollectionPayload {
                 title: "最近読んだ本".to_owned(),
                 thumb_aspect_height_ratio: 1.0,
+                sort_state: test_sort_state(Some("この一覧では並び順が固定されています")),
                 entry_limit: 1000,
                 truncated: false,
                 entries: vec![RemoteEntry {

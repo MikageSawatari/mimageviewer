@@ -17,6 +17,68 @@ pub(crate) use service::{RemoteServiceControl, RemoteServiceManager, RemoteServi
 pub(crate) use container::resolve_remote_effective_params_for_test;
 pub(crate) mod ui;
 
+pub(super) const BOOK_SORT_LOCK_REASON: &str =
+    "本として表示中は名前順固定です（一覧の並べ替えは使えません）。";
+pub(super) const FIXED_LIST_SORT_LOCK_REASON: &str = "この一覧では並び順が固定されています。";
+
+pub(super) fn sort_order_wire_value(order: crate::settings::SortOrder) -> String {
+    serde_json::to_value(order)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .expect("SortOrder serializes as a string")
+}
+
+pub(super) fn parse_sort_order_wire(
+    value: &str,
+) -> Result<crate::settings::SortOrder, &'static str> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned()))
+        .map_err(|_| "並び順が正しくありません")
+}
+
+pub(super) fn remote_grid_sort_state(
+    selected: crate::settings::SortOrder,
+    locked_reason: Option<&str>,
+) -> mimageviewer_ipc::RemoteGridSortState {
+    mimageviewer_ipc::RemoteGridSortState {
+        selected: sort_order_wire_value(selected),
+        options: crate::settings::SortOrder::all()
+            .iter()
+            .copied()
+            .map(|order| mimageviewer_ipc::RemoteGridSortOption {
+                value: sort_order_wire_value(order),
+                label: order.label().to_owned(),
+                short_label: order.short_label().to_owned(),
+            })
+            .collect(),
+        locked_reason: locked_reason.map(str::to_owned),
+    }
+}
+
+pub(super) fn normalize_remote_view_trim_state(
+    value: &serde_json::Value,
+) -> Result<crate::view_trim::ViewTrimBookState, &'static str> {
+    let mut state: crate::view_trim::ViewTrimBookState =
+        serde_json::from_value(value.clone()).map_err(|_| "表示トリム設定が正しくありません")?;
+    state.apply_mode = crate::view_trim::view_trim_base_apply_mode(state.apply_mode);
+    state.book_settings = state.book_settings.clamped();
+    Ok(state)
+}
+
+pub(super) enum RemoteSortSettingsSource {
+    Live,
+    Snapshot(crate::settings::SortOrder),
+}
+
+impl RemoteSortSettingsSource {
+    pub(super) fn load(&self) -> Result<crate::settings::SortOrder, String> {
+        match self {
+            Self::Live => crate::settings_db::with_db_result(|db| db.load_sort_order())
+                .map_err(|error| error.to_string()),
+            Self::Snapshot(order) => Ok(*order),
+        }
+    }
+}
+
 pub(crate) fn remote_adjustment_values(
     params: &crate::adjustment::AdjustParams,
 ) -> mimageviewer_ipc::RemoteAdjustmentValues {
@@ -323,6 +385,62 @@ mod adjustment_value_tests {
         let mut values = remote_adjustment_values(&crate::adjustment::AdjustParams::default());
         values.colorize.control_points[0].strength = f32::INFINITY;
         assert!(apply_remote_adjustment_values(Default::default(), &values).is_err());
+    }
+
+    #[test]
+    fn remote_view_trim_normalization_clamps_every_book_margin_and_drops_page_mode() {
+        let value = serde_json::json!({
+            "apply_mode": "page",
+            "book_settings": {
+                "enabled": true,
+                "spread_separate": true,
+                "single": { "left": -1.0, "top": 0.8, "right": 0.9, "bottom": -0.2 },
+                "spread_linked": { "top": 0.7, "bottom": -0.1, "inner": 0.6, "outer": 0.5 },
+                "spread_left": { "left": 0.4, "top": 0.3, "right": -0.4, "bottom": 0.8 },
+                "spread_right": { "left": -0.2, "top": 0.5, "right": 0.7, "bottom": 0.6 }
+            }
+        });
+        let normalized = normalize_remote_view_trim_state(&value).unwrap();
+        assert_eq!(
+            normalized.apply_mode,
+            crate::view_trim::ViewTrimApplyMode::None
+        );
+        for margin in [
+            normalized.book_settings.single.left,
+            normalized.book_settings.single.top,
+            normalized.book_settings.single.right,
+            normalized.book_settings.single.bottom,
+            normalized.book_settings.spread_linked.top,
+            normalized.book_settings.spread_linked.bottom,
+            normalized.book_settings.spread_linked.inner,
+            normalized.book_settings.spread_linked.outer,
+            normalized.book_settings.spread_left.left,
+            normalized.book_settings.spread_left.top,
+            normalized.book_settings.spread_left.right,
+            normalized.book_settings.spread_left.bottom,
+            normalized.book_settings.spread_right.left,
+            normalized.book_settings.spread_right.top,
+            normalized.book_settings.spread_right.right,
+            normalized.book_settings.spread_right.bottom,
+        ] {
+            assert!((0.0..=crate::view_trim::MAX_VIEW_TRIM_MARGIN).contains(&margin));
+        }
+    }
+
+    #[test]
+    fn remote_sort_state_uses_core_values_and_labels() {
+        let state = remote_grid_sort_state(crate::settings::SortOrder::DateDesc, None);
+        assert_eq!(state.options.len(), crate::settings::SortOrder::all().len());
+        for (option, order) in state.options.iter().zip(crate::settings::SortOrder::all()) {
+            assert_eq!(option.value, sort_order_wire_value(*order));
+            assert_eq!(option.label, order.label());
+            assert_eq!(option.short_label, order.short_label());
+            assert_eq!(parse_sort_order_wire(&option.value), Ok(*order));
+        }
+        assert_eq!(
+            state.selected,
+            sort_order_wire_value(crate::settings::SortOrder::DateDesc)
+        );
     }
 }
 

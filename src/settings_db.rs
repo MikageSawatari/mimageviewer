@@ -585,6 +585,16 @@ impl SettingsDb {
         })
     }
 
+    /// Remote の一覧 worker が、起動時 snapshot ではなく現在の共有並び順だけを読む。
+    pub(crate) fn load_sort_order(&self) -> Result<crate::settings::SortOrder, SettingsDbError> {
+        let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        read_settings_kv_typed(
+            &inner.conn,
+            "sort_order",
+            crate::settings::SortOrder::default,
+        )
+    }
+
     /// `Settings` を全テーブルに書き出す。
     ///
     /// rotation には触れない (= bootstrap save と user save 両方が共有)。

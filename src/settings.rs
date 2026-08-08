@@ -7341,6 +7341,11 @@ impl Settings {
         self.save_internal(/* allow_rotation = */ true);
     }
 
+    /// 永続化成否を呼び出し元へ返す必要がある typed write 境界向け。
+    pub(crate) fn save_checked(&self) -> bool {
+        self.save_internal(/* allow_rotation = */ true)
+    }
+
     /// `Settings::load` 内部の writeback (migration / version_changed) 専用の保存経路
     /// (Codex P2 v13 2026-05-14)。**世代 rotation を発火させない / `BACKUP_DONE_THIS_SESSION`
     /// flag も立てない** ことで、spec §6.1 の「プロセス最初の **user save** で 1 回 rotate」

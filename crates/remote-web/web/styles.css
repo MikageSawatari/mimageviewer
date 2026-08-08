@@ -316,6 +316,57 @@ button {
   white-space: nowrap;
 }
 
+.grid-sort-bar {
+  z-index: 3;
+  display: flex;
+  min-height: 46px;
+  align-items: center;
+  gap: 12px;
+  padding: 6px max(16px, env(safe-area-inset-right)) 6px
+    max(16px, env(safe-area-inset-left));
+  border-bottom: 1px solid rgb(255 255 255 / 8%);
+  background: #181b22;
+}
+
+.grid-sort-bar[hidden] {
+  display: none;
+}
+
+.grid-sort-label {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.grid-sort-select {
+  min-height: 34px;
+  padding: 4px 28px 4px 9px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: #f3f7ff;
+  background: var(--surface-raised);
+}
+
+.grid-sort-select:disabled {
+  color: var(--muted);
+  opacity: 0.72;
+}
+
+.grid-sort-reason {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.76rem;
+  line-height: 1.35;
+}
+
+.grid-sort-reason.is-error {
+  color: var(--danger);
+}
+
 .icon-button,
 .viewer-button {
   display: inline-grid;
@@ -1574,6 +1625,108 @@ button {
   display: grid;
   gap: 12px;
   padding: 4px 0 14px;
+}
+
+.viewer-view-trim-panel {
+  display: grid;
+  gap: 10px;
+  padding: 4px 0 14px;
+}
+
+.view-trim-mode-row,
+.view-trim-check-row,
+.view-trim-control-group {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-raised);
+}
+
+.view-trim-mode-row {
+  display: grid;
+  grid-template-columns: minmax(90px, 1fr) minmax(150px, 1.6fr);
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  font-size: 0.84rem;
+}
+
+.view-trim-mode-row select {
+  min-width: 0;
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: inherit;
+  background: var(--surface);
+}
+
+.view-trim-check-row {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 10px;
+  font-size: 0.84rem;
+}
+
+.view-trim-check-row[hidden],
+.view-trim-controls[hidden] {
+  display: none;
+}
+
+.view-trim-check-row input {
+  width: 20px;
+  height: 20px;
+  accent-color: var(--accent-strong);
+}
+
+.view-trim-controls {
+  display: grid;
+  gap: 9px;
+}
+
+.view-trim-control-group {
+  display: grid;
+  overflow: hidden;
+}
+
+.view-trim-control-group h3 {
+  margin: 0;
+  padding: 9px 10px 5px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.view-trim-slider-row {
+  display: grid;
+  grid-template-columns: 3.5em minmax(0, 1fr) 5.2ch;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border-top: 1px solid var(--line);
+  font-size: 0.82rem;
+}
+
+.view-trim-slider-row input[type="range"] {
+  width: 100%;
+  min-height: 28px;
+  touch-action: pan-y;
+}
+
+.view-trim-slider-row output {
+  color: var(--muted);
+  font: 650 0.76rem/1 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  text-align: right;
+}
+
+.view-trim-status {
+  min-height: 1.4em;
+  margin: 0 3px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.view-trim-status.is-error {
+  color: var(--danger);
 }
 
 .adjustment-tabs {

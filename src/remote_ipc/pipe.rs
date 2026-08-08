@@ -197,7 +197,7 @@ impl ServerGuard {
         let video_stream_engine = Arc::new(VideoStreamEngine::new_with_favorite_roots(Arc::clone(
             &favorite_roots,
         )));
-        let collection_engine = Arc::new(CollectionEngine::new_with_favorite_roots(
+        let collection_engine = Arc::new(CollectionEngine::new_with_live_favorite_roots(
             settings,
             favorite_roots,
         ));
@@ -1212,6 +1212,9 @@ fn operation_description(message: &ClientMessage) -> String {
             RemoteWriteRequest::RemoveBookBookmark { .. } => "ブックマークを削除中",
             RemoteWriteRequest::SetAdjustment { .. } => "画像補正を書き込み中",
             RemoteWriteRequest::GetAdjustmentState { .. } => "画像補正を確認中",
+            RemoteWriteRequest::SetViewTrim { .. } => "表示トリムを書き込み中",
+            RemoteWriteRequest::GetViewTrimState { .. } => "表示トリムを確認中",
+            RemoteWriteRequest::SetSortOrder { .. } => "並べ替えを書き込み中",
         }
         .to_owned(),
         ClientMessage::VideoStreamStart { .. } => "動画ストリーミングを開始中".to_owned(),

@@ -696,18 +696,7 @@ mod tests {
 }
 
 fn set_book_spread_separate(book: &mut ViewTrimBookSettings, separate: bool) {
-    if book.spread_separate == separate {
-        return;
-    }
-    if separate {
-        let (left, right) = book.spread_linked.to_separate();
-        book.spread_left = left;
-        book.spread_right = right;
-    } else {
-        book.spread_linked =
-            ViewTrimLinkedMargins::average_from_separate(book.spread_left, book.spread_right);
-    }
-    book.spread_separate = separate;
+    *book = book.with_spread_separate(separate);
 }
 
 fn set_page_spread_separate(

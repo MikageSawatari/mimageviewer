@@ -122,6 +122,8 @@ const {
   normalizeRemoteAdjustmentValues,
   normalizeRemoteBookBookmarkList,
   normalizeRemoteColorizeParams,
+  normalizeRemoteGridSortState,
+  normalizeRemoteViewTrimState,
   parentContainerAddress,
   reloadApplication,
   remoteAiCompletionMessage,
@@ -132,11 +134,54 @@ const {
   resolveLegacyImageOpenRoute,
   resolveMediaOpenRoute,
   selectRecoverableRemoteAiJob,
+  setViewTrimSpreadSeparate,
   setRuntimeTestErrorObserver,
   thumbnailAddressForEntry,
   videoFileTargetIndex,
+  viewTrimSpreadControlKeys,
   viewerMenuDefinitions,
 } = await import("./app.js");
+
+const viewTrimState = () => ({
+  apply_mode: "book",
+  book_settings: {
+    enabled: true,
+    spread_separate: false,
+    single: { left: 0.01, top: 0.02, right: 0.03, bottom: 0.04 },
+    spread_linked: { top: 0.05, bottom: 0.06, inner: 0.07, outer: 0.08 },
+    spread_left: { left: 0, top: 0, right: 0, bottom: 0 },
+    spread_right: { left: 0, top: 0, right: 0, bottom: 0 },
+  },
+});
+
+test("view trim keeps the core book shape and switches spread controls without page state", () => {
+  const normalized = normalizeRemoteViewTrimState(viewTrimState());
+  assert.deepEqual(viewTrimSpreadControlKeys(normalized.book_settings, false), ["single"]);
+  assert.deepEqual(viewTrimSpreadControlKeys(normalized.book_settings, true), ["spread_linked"]);
+
+  const separate = setViewTrimSpreadSeparate(normalized, true);
+  assert.deepEqual(viewTrimSpreadControlKeys(separate.book_settings, true), [
+    "spread_left",
+    "spread_right",
+  ]);
+  assert.deepEqual(separate.book_settings.spread_linked, normalized.book_settings.spread_linked);
+  assert.equal("page_override" in separate, false);
+});
+
+test("sort state accepts only server-provided options and keeps a visible lock reason", () => {
+  const sort = normalizeRemoteGridSortState({
+    selected: "DateDesc",
+    options: [
+      { value: "FileName", label: "ファイル名順", short_label: "名前" },
+      { value: "DateDesc", label: "日付順（新しい順）", short_label: "日付↓" },
+    ],
+    locked_reason: "本として表示中は名前順固定です",
+  });
+  assert.equal(sort.selected, "DateDesc");
+  assert.equal(sort.options.length, 2);
+  assert.equal(sort.locked_reason, "本として表示中は名前順固定です");
+  assert.equal(normalizeRemoteGridSortState({ selected: "Numeric", options: [] }), null);
+});
 
 test("session identity revocation tolerates a video viewer without page-load invalidation", () => {
   assert.doesNotThrow(() => invalidateViewerPendingLoad({ isVideoStreamViewer: true }));

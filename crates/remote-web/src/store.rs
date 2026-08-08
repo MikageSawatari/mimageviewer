@@ -114,6 +114,7 @@ pub struct ImageMetrics {
 struct LibrarySnapshot {
     favorites: Vec<FavoriteRoot>,
     by_id: HashMap<Uuid, usize>,
+    sort_order: Option<String>,
 }
 
 struct ObservedDatabase {
@@ -156,7 +157,7 @@ impl Library {
         let prefix = "test".to_owned();
         Self {
             state: Mutex::new(LibraryState {
-                snapshot: Arc::new(library_snapshot(favorites)),
+                snapshot: Arc::new(library_snapshot(favorites, None)),
                 settings: None,
                 view_trim: None,
                 generation_counter: 1,
@@ -171,7 +172,8 @@ impl Library {
     pub fn load(data_dir: &Path) -> Result<Self, StoreError> {
         let settings_path = data_dir.join("settings.db");
         let mut settings = open_observed_database(&settings_path)?.ok_or(StoreError::NotFound)?;
-        let (data_version, favorites) = read_stable_favorite_roots(&settings.connection)?;
+        let (data_version, favorites, sort_order) =
+            read_stable_settings_snapshot(&settings.connection)?;
         settings.data_version = data_version;
         let view_trim_path = data_dir.join("view_trim.db");
         let view_trim = open_observed_database(&view_trim_path)?;
@@ -184,7 +186,7 @@ impl Library {
         let generation_prefix = Uuid::from_bytes(generation_seed).simple().to_string();
         Ok(Self {
             state: Mutex::new(LibraryState {
-                snapshot: Arc::new(library_snapshot(favorites)),
+                snapshot: Arc::new(library_snapshot(favorites, sort_order)),
                 settings: Some(settings),
                 view_trim,
                 generation_counter: 1,
@@ -429,13 +431,17 @@ impl Library {
     }
 }
 
-fn library_snapshot(favorites: Vec<FavoriteRoot>) -> LibrarySnapshot {
+fn library_snapshot(favorites: Vec<FavoriteRoot>, sort_order: Option<String>) -> LibrarySnapshot {
     let by_id = favorites
         .iter()
         .enumerate()
         .map(|(idx, favorite)| (favorite.id, idx))
         .collect();
-    LibrarySnapshot { favorites, by_id }
+    LibrarySnapshot {
+        favorites,
+        by_id,
+        sort_order,
+    }
 }
 
 fn favorite_from_snapshot(snapshot: &LibrarySnapshot, id: Uuid) -> Option<&FavoriteRoot> {
@@ -479,12 +485,13 @@ fn refresh_settings_snapshot(
     if current == settings.data_version {
         return Ok(false);
     }
-    let (data_version, favorites) = read_stable_favorite_roots(&settings.connection)?;
+    let (data_version, favorites, sort_order) =
+        read_stable_settings_snapshot(&settings.connection)?;
     settings.data_version = data_version;
-    if favorites == state.snapshot.favorites {
+    if favorites == state.snapshot.favorites && sort_order == state.snapshot.sort_order {
         return Ok(false);
     }
-    state.snapshot = Arc::new(library_snapshot(favorites));
+    state.snapshot = Arc::new(library_snapshot(favorites, sort_order));
     Ok(true)
 }
 
@@ -550,15 +557,36 @@ fn read_favorite_roots(connection: &Connection) -> Result<Vec<FavoriteRoot>, Sto
     Ok(favorites)
 }
 
-fn read_stable_favorite_roots(
+fn read_sort_order_value(connection: &Connection) -> Result<Option<String>, StoreError> {
+    let has_settings_kv = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'settings_kv')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !has_settings_kv {
+        return Ok(None);
+    }
+    match connection.query_row(
+        "SELECT value FROM settings_kv WHERE key = 'sort_order'",
+        [],
+        |row| row.get(0),
+    ) {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_stable_settings_snapshot(
     connection: &Connection,
-) -> Result<(i64, Vec<FavoriteRoot>), StoreError> {
+) -> Result<(i64, Vec<FavoriteRoot>, Option<String>), StoreError> {
     for _ in 0..3 {
         let before = sqlite_data_version(connection)?;
         let favorites = read_favorite_roots(connection)?;
+        let sort_order = read_sort_order_value(connection)?;
         let after = sqlite_data_version(connection)?;
         if before == after {
-            return Ok((after, favorites));
+            return Ok((after, favorites, sort_order));
         }
     }
     Err(StoreError::Busy)
@@ -916,6 +944,11 @@ mod tests {
                     path TEXT NOT NULL,
                     sort_index INTEGER NOT NULL
                  );
+                 CREATE TABLE settings_kv (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                 );
+                 INSERT INTO settings_kv VALUES ('sort_order', 'FileName');
                  CREATE TABLE unrelated (value INTEGER NOT NULL);",
             )
             .unwrap();
@@ -951,11 +984,20 @@ mod tests {
             "unrelated settings writes must not invalidate page resources"
         );
 
+        settings_writer
+            .execute(
+                "UPDATE settings_kv SET value = 'DateDesc' WHERE key = 'sort_order'",
+                [],
+            )
+            .unwrap();
+        let after_sort = library.remote_state().unwrap().remote_state_generation;
+        assert_ne!(after_sort, initial);
+
         view_trim_writer
             .execute("INSERT INTO view_trim_state VALUES (1)", [])
             .unwrap();
         let after_trim = library.remote_state().unwrap().remote_state_generation;
-        assert_ne!(after_trim, initial);
+        assert_ne!(after_trim, after_sort);
         assert!(matches!(
             library.require_remote_state_generation(&initial),
             Err(StoreError::StaleGeneration(current)) if current == after_trim
