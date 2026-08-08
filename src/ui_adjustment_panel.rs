@@ -9292,7 +9292,7 @@ impl App {
     /// この境界で揃える。終了時の状態が次回起動へ漏れないよう、元画像比較は OFF、
     /// マスク表示は ON から始める。
     pub(crate) fn enter_local_adjust_mode(&mut self) {
-        self.adjustment_mode = false;
+        self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.local_adjust_mode = true;
         self.local_adjust_show_source = false;
         self.local_adjust_show_mask = true;
@@ -13547,7 +13547,7 @@ impl App {
                 "ui_adjustment_panel::draw_adjustment_panel:close_button",
             );
             self.persist_pending_view_trim_state();
-            self.adjustment_mode = false;
+            self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
             child.ctx().request_repaint();
             return;
         }
@@ -13701,9 +13701,9 @@ impl App {
             }
             // クリック処理は描画後にディスパッチ (借用衝突回避)。
             // 補正パネルは「ホバーで自動閉じる」モードなので、消しゴム / 隠蔽に入る前に
-            // adjustment_mode を倒しておく (enter_*_mode 内のガード `!self.adjustment_mode`
+            // adjustment_mode を Closed にしておく (enter_*_mode 内の open-state guard
             // と整合させるためにも必要)。`enter_*_mode` 自身が必要なキャッシュ初期化と
-            // post_filter バイパスを行うので、ここでは flag を倒すだけで十分。
+            // post_filter バイパスを行うので、ここでは owner を閉じるだけで十分。
             if activate_local_adjust {
                 crate::ime_focus::record_side_panel_close(
                     child.ctx(),
@@ -13717,7 +13717,7 @@ impl App {
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_erase",
                 );
-                self.adjustment_mode = false;
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
                 self.enter_erase_mode(fs_root_idx);
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
@@ -13726,7 +13726,7 @@ impl App {
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_conceal",
                 );
-                self.adjustment_mode = false;
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
                 self.enter_conceal_mode(fs_root_idx);
                 return;
             }
@@ -13735,7 +13735,7 @@ impl App {
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_crop",
                 );
-                self.adjustment_mode = false;
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
                 self.enter_export_crop_mode(fs_root_idx);
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
@@ -13744,7 +13744,7 @@ impl App {
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_text",
                 );
-                self.adjustment_mode = false;
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
                 self.enter_text_mode(fs_root_idx);
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
@@ -13753,7 +13753,7 @@ impl App {
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:open_export",
                 );
-                self.adjustment_mode = false;
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
                 let ctx = child.ctx().clone();
                 self.open_export_dialog_for_current(&ctx, fs_idx);
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ

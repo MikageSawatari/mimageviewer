@@ -1085,32 +1085,76 @@ fn still_touch_panel_handle_rects(full_rect: egui::Rect) -> [egui::Rect; 2] {
     ]
 }
 
+fn visible_still_touch_panel_handle_rects(
+    full_rect: egui::Rect,
+    handles_enabled: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
+) -> [egui::Rect; 2] {
+    if !handles_enabled {
+        return [egui::Rect::NOTHING; 2];
+    }
+    let [left, right] = still_touch_panel_handle_rects(full_rect);
+    [
+        if left_panel_open {
+            egui::Rect::NOTHING
+        } else {
+            left
+        },
+        if right_panel_open {
+            egui::Rect::NOTHING
+        } else {
+            right
+        },
+    ]
+}
+
 fn extend_touch_excluded_with_panel_handles(
     excluded: &mut Vec<egui::Rect>,
     full_rect: egui::Rect,
-    handles_visible: bool,
+    handles_enabled: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
 ) {
-    if handles_visible {
-        excluded.extend(
-            still_touch_panel_handle_rects(full_rect)
-                .into_iter()
-                .filter(egui::Rect::is_positive),
-        );
-    }
+    excluded.extend(
+        visible_still_touch_panel_handle_rects(
+            full_rect,
+            handles_enabled,
+            left_panel_open,
+            right_panel_open,
+        )
+        .into_iter()
+        .filter(egui::Rect::is_positive),
+    );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StillSidePanelAction {
-    ToggleAdjustment,
-    ToggleMetadata,
+    OpenAdjustment,
+    OpenMetadata,
 }
 
-fn still_side_panel_action_for_physical_edge(left: bool) -> StillSidePanelAction {
-    if left {
-        StillSidePanelAction::ToggleAdjustment
-    } else {
-        StillSidePanelAction::ToggleMetadata
+fn still_side_panel_action_for_handle_edge(
+    edge: crate::ui_helpers::PanelEdge,
+) -> StillSidePanelAction {
+    match edge {
+        crate::ui_helpers::PanelEdge::Left => StillSidePanelAction::OpenAdjustment,
+        crate::ui_helpers::PanelEdge::Right => StillSidePanelAction::OpenMetadata,
+        crate::ui_helpers::PanelEdge::Top => unreachable!("side-panel handle has no top edge"),
     }
+}
+
+fn touch_panel_tap_command_dismisses_before_dispatch(
+    command: crate::touch_input::TouchCommand,
+    left_open: crate::ui_helpers::MetadataPanelOpenState,
+    right_open: crate::ui_helpers::MetadataPanelOpenState,
+) -> bool {
+    matches!(
+        command,
+        crate::touch_input::TouchCommand::ToggleChrome
+            | crate::touch_input::TouchCommand::PageSide { .. }
+    ) && (left_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
+        || right_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle)
 }
 
 #[derive(Clone, Copy)]
@@ -1508,6 +1552,27 @@ fn fullscreen_cursor_in_panel_for_wheel(
 fn fullscreen_click_nav_delta_for_side(left: bool, rtl: bool) -> i32 {
     let ltr_base = if left { -1 } else { 1 };
     if rtl { -ltr_base } else { ltr_base }
+}
+
+/// Return the next pan for a canvas drag, including the frame where egui first
+/// promotes a click-and-drag response to the dragged state.
+///
+/// Sense::click_and_drag deliberately delays drag_started until movement
+/// exceeds the click threshold. Treating that promotion frame as a press-only
+/// frame drops the entire first (and often only, for coalesced touch input)
+/// movement. total_drag_delta is measured from the real pointer press even on
+/// that promotion frame, so applying it to the pan captured at drag start
+/// preserves the established absolute mouse-pan and clamp behavior without
+/// synthesizing another press.
+fn fullscreen_drag_pan_proposal(
+    response: &egui::Response,
+    pan_at_drag_start: egui::Vec2,
+) -> Option<egui::Vec2> {
+    response
+        .dragged_by(egui::PointerButton::Primary)
+        .then(|| response.total_drag_delta())
+        .flatten()
+        .map(|delta| pan_at_drag_start + delta)
 }
 
 fn fullscreen_click_nav_base_delta(pos_x: f32, center_x: f32, rtl: bool) -> i32 {
@@ -3025,7 +3090,7 @@ impl App {
             self.enter_analysis_mode_bypass();
             // 補正パネルと排他
             self.persist_pending_view_trim_state();
-            self.adjustment_mode = false;
+            self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
             self.cache_current_edit_preview_if_ready();
             self.local_adjust_mode = false;
             self.local_adjust_repair_point_pick_active = None;
@@ -5740,18 +5805,36 @@ pub fn draw_still_panel_reach_snapshot_fixture(
     ui: &mut egui::Ui,
     touch_chrome_latched: bool,
     mouse_callout_visible: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
 ) {
     let full_rect = ui.max_rect();
     ui.painter()
         .rect_filled(full_rect, 0.0, egui::Color32::BLACK);
+    if left_panel_open {
+        let rect = adjustment_panel_rect(full_rect);
+        ui.painter()
+            .rect_filled(rect, 0.0, egui::Color32::from_rgb(30, 30, 34));
+        ui.painter().text(
+            rect.left_top() + egui::vec2(16.0, 16.0),
+            egui::Align2::LEFT_TOP,
+            "画像補正",
+            egui::FontId::proportional(18.0),
+            egui::Color32::WHITE,
+        );
+    }
     if touch_chrome_latched {
         for (edge, rect) in [
             crate::ui_helpers::PanelEdge::Left,
             crate::ui_helpers::PanelEdge::Right,
         ]
         .into_iter()
-        .zip(still_touch_panel_handle_rects(full_rect))
-        {
+        .zip(visible_still_touch_panel_handle_rects(
+            full_rect,
+            true,
+            left_panel_open,
+            right_panel_open,
+        )) {
             if rect.is_positive() {
                 paint_panel_callout_chrome(ui, rect, edge, false, false);
             }
@@ -5775,29 +5858,12 @@ impl App {
             .is_some_and(|idx| still_touch_chrome_latched(ctx, idx, self.fullscreen_opened_at()))
     }
 
-    fn apply_still_side_panel_action(&mut self, action: StillSidePanelAction) {
+    fn open_still_side_panel_by_touch(&mut self, action: StillSidePanelAction) {
         match action {
-            StillSidePanelAction::ToggleAdjustment => {
-                if self.adjustment_mode {
-                    self.persist_pending_view_trim_state();
-                }
-                self.adjustment_mode = !self.adjustment_mode;
+            StillSidePanelAction::OpenAdjustment => {
+                self.open_fullscreen_touch_adjustment_panel();
             }
-            StillSidePanelAction::ToggleMetadata => {
-                self.toggle_fullscreen_touch_info_open();
-            }
-        }
-    }
-
-    fn open_still_side_panel(&mut self, action: StillSidePanelAction) {
-        match action {
-            StillSidePanelAction::ToggleAdjustment if !self.adjustment_mode => {
-                self.apply_still_side_panel_action(action);
-            }
-            StillSidePanelAction::ToggleMetadata => {
-                self.open_fullscreen_touch_info_panel();
-            }
-            StillSidePanelAction::ToggleAdjustment => {}
+            StillSidePanelAction::OpenMetadata => self.open_fullscreen_touch_info_panel(),
         }
     }
 
@@ -5811,32 +5877,26 @@ impl App {
         if !enabled || !touch_chrome_latched {
             return;
         }
+        let left_open = self.adjustment_mode.is_open();
+        let right_open = self.metadata_panel_click_shown()
+            || self.metadata_panel_hover_active
+            || self.fullscreen_tag_picker_open;
         for (edge, rect) in [
             crate::ui_helpers::PanelEdge::Left,
             crate::ui_helpers::PanelEdge::Right,
         ]
         .into_iter()
-        .zip(still_touch_panel_handle_rects(full_rect))
-        {
+        .zip(visible_still_touch_panel_handle_rects(
+            full_rect, true, left_open, right_open,
+        )) {
             if !rect.is_positive() {
                 continue;
             }
             let response = interact_still_touch_panel_handle(ui, rect, edge);
-            let action = still_side_panel_action_for_physical_edge(
-                edge == crate::ui_helpers::PanelEdge::Left,
-            );
-            let open = match action {
-                StillSidePanelAction::ToggleAdjustment => self.adjustment_mode,
-                StillSidePanelAction::ToggleMetadata => self.metadata_panel_click_shown(),
-            };
-            paint_panel_callout_chrome(ui, rect, edge, open, response.hovered());
-            let tip = if open {
-                "パネルを閉じる"
-            } else {
-                "パネルを開く"
-            };
-            if response.on_hover_text(tip).clicked() {
-                self.apply_still_side_panel_action(action);
+            let action = still_side_panel_action_for_handle_edge(edge);
+            paint_panel_callout_chrome(ui, rect, edge, false, response.hovered());
+            if response.on_hover_text("パネルを開く").clicked() {
+                self.open_still_side_panel_by_touch(action);
             }
         }
     }
@@ -5883,7 +5943,7 @@ impl App {
             ui.painter().rect_filled(bar_rect, 3.0, fill);
 
             let open = match edge {
-                crate::ui_helpers::PanelEdge::Left => self.adjustment_mode,
+                crate::ui_helpers::PanelEdge::Left => self.adjustment_mode.is_open(),
                 crate::ui_helpers::PanelEdge::Right => self.metadata_panel_click_shown(),
                 crate::ui_helpers::PanelEdge::Top => false,
             };
@@ -5906,10 +5966,7 @@ impl App {
             if response.on_hover_text(tip).clicked() {
                 match edge {
                     crate::ui_helpers::PanelEdge::Left => {
-                        if self.adjustment_mode {
-                            self.persist_pending_view_trim_state();
-                        }
-                        self.adjustment_mode = !self.adjustment_mode;
+                        self.toggle_fullscreen_pointer_adjustment_panel();
                     }
                     crate::ui_helpers::PanelEdge::Right => {
                         self.toggle_fullscreen_click_info_open();
@@ -8482,7 +8539,7 @@ impl App {
 
     fn seek_to_continuous_page(&mut self, ctx: &egui::Context, target_idx: usize) {
         if self.fullscreen_idx != Some(target_idx) {
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::seek_to_continuous_page:file_change",
@@ -10005,7 +10062,7 @@ impl App {
                             && !panorama_mode_active_now;
                         // 補正パネルは見開き Double でも使えるようにする (左右独立補正 + コピー)。
                         // 編集対象 (画面上の左/右) は `adjust_spread_target` で切替。
-                        let adjustment_active = self.adjustment_mode
+                        let adjustment_active = self.adjustment_mode.is_open()
                             && !compare_wipe_active
                             && !panorama_mode_active_now
                             && !self.fs_zoom_mode_engaged();
@@ -10526,7 +10583,7 @@ impl App {
                             let in_earlier_tool = self.erase_mode
                                 || self.local_adjust_mode
                                 || self.conceal_mode
-                                || self.adjustment_mode
+                                || self.adjustment_mode.is_open()
                                 || self.analysis_mode;
                             if !is_spread_double
                                 && !state.original_preview_active
@@ -11055,7 +11112,7 @@ impl App {
                                 ctx.request_repaint();
                             }
                             if side_panel_mode_pressed {
-                                if self.adjustment_mode {
+                                if self.adjustment_mode.is_open() {
                                     crate::ime_focus::record_side_panel_close(
                                         ctx,
                                         "ui_fullscreen::draw_fs_hover_bar:side_panel_mode_button",
@@ -14366,7 +14423,7 @@ impl App {
             self.toggle_compare_diff_mode(ctx, fs_idx);
         }
 
-        let adjustment_open_before_escape = self.adjustment_mode;
+        let adjustment_open_before_escape = self.adjustment_mode.is_open();
         if esc && self.compare_view_mode.is_overlay() {
             self.compare_view_mode = crate::app::CompareViewMode::Off;
             self.clear_compare_gpu_pair();
@@ -14402,7 +14459,7 @@ impl App {
         }
         // I / Tab は左右パネルの呼び出しモードを切り替える。
         if key_i {
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_key_input:FsToggleMetadata",
@@ -14430,7 +14487,7 @@ impl App {
             });
         }
         if key_z && !is_spread_double {
-            if !self.analysis_mode && self.adjustment_mode {
+            if !self.analysis_mode && self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_key_input:FsImageAnalysis",
@@ -14455,7 +14512,7 @@ impl App {
             } else {
                 "[ピクセルグリッド OFF]".to_string()
             });
-        } else if key_m && !self.adjustment_mode {
+        } else if key_m && !self.adjustment_mode.is_open() {
             // M: ルーペ表示のトグル (分析モード外でのみ。分析モードでは既存のモザイクグリッド操作)
             self.fs_loupe_locked = !self.fs_loupe_locked;
             self.show_feedback_toast(if self.fs_loupe_locked {
@@ -14474,7 +14531,7 @@ impl App {
         // 通常: 黒 → 白 → 市松 の 3 モード循環。
         // AI アップスケール有効時 (composite-first): 市松は出力にパターンが焼き込まれて崩れるので
         // 黒/白の 2 モード循環に制限する。デノイズのみの場合はアルファ保持パスを通るので市松 OK。
-        if key_b_bg && !self.analysis_mode && !self.adjustment_mode {
+        if key_b_bg && !self.analysis_mode && !self.adjustment_mode.is_open() {
             // 背景切替は透過 (alpha) のある画像でのみ意味を持つ。見開きはどちらかに透過が
             // あれば許可。RGB のみの不透明画像では切替しても見た目が変わらないので無効化し案内する。
             let idxs: Vec<usize> = match self.resolve_spread_pair(fs_idx) {
@@ -14507,7 +14564,7 @@ impl App {
         // 左ページを編集対象にする (Apply / Cancel で見開き状態に戻る)。
         if key_e
             && !self.analysis_mode
-            && !self.adjustment_mode
+            && !self.adjustment_mode.is_open()
             && !self.fs_entry_is_animated(fs_idx)
         {
             if self.erase_mode {
@@ -14530,7 +14587,7 @@ impl App {
                 .consume_action(ctx, KeyAction::FsLocalAdjustMode);
         if key_ctrl_g
             && !self.analysis_mode
-            && !self.adjustment_mode
+            && !self.adjustment_mode.is_open()
             && !self.erase_mode
             && !self.conceal_mode
             && !self.text_mode
@@ -14556,7 +14613,7 @@ impl App {
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsConcealMode);
         if key_ctrl_m
             && !self.analysis_mode
-            && !self.adjustment_mode
+            && !self.adjustment_mode.is_open()
             && !self.erase_mode
             && !is_video_fs
             && !self.fs_entry_is_animated(fs_idx)
@@ -14579,7 +14636,7 @@ impl App {
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsTextMode);
         if key_ctrl_t
             && !self.analysis_mode
-            && !self.adjustment_mode
+            && !self.adjustment_mode.is_open()
             && !self.erase_mode
             && !self.conceal_mode
             && !is_video_fs
@@ -14923,7 +14980,7 @@ impl App {
             focused,
             interaction_active,
         ) && !self.analysis_mode
-            && !self.adjustment_mode
+            && !self.adjustment_mode.is_open()
             && !self.is_overlay_edit_mode_active()
             && !self.view_trim_mode
             && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
@@ -16007,7 +16064,6 @@ impl App {
                     excluded: Vec::new(),
                     behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                         accepts_pinch: true,
-                        accepts_edge_swipe: false,
                     },
                 },
                 self.frame_counter,
@@ -16117,7 +16173,6 @@ impl App {
                         excluded: Vec::new(),
                         behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                             accepts_pinch: true,
-                            accepts_edge_swipe: false,
                         },
                     },
                     self.frame_counter,
@@ -16202,7 +16257,7 @@ impl App {
                             side_panel_chrome_enabled,
                             self.settings.fullscreen_side_panel_mode,
                             has_right_panel,
-                            self.adjustment_mode,
+                            self.adjustment_mode.is_open(),
                             navigator_exclusion,
                         );
                         let in_music_side_panel = music_side_panel_contains_pointer(
@@ -16250,55 +16305,55 @@ impl App {
         // 左端を占有している間 edge_hover が常に true 扱いになり off へ遷移できないので、
         // 強制的に落とす。
         if compare_wipe_active {
-            if self.adjustment_mode && !self.adjustment_dragging {
+            if self.adjustment_mode.is_open() && !self.adjustment_dragging {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_wheel_and_click:compare_wipe",
                 );
                 self.persist_pending_view_trim_state();
-                self.adjustment_mode = false;
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
             }
         } else if self.is_overlay_edit_mode_active() {
             // 消しゴム / 補正レイヤー / 隠蔽加工モード中は補正パネルを強制 OFF
             // (編集中に色補正バーが画面端ホバーで開かないように)。
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_wheel_and_click:overlay_edit",
                 );
             }
             self.persist_pending_view_trim_state();
-            self.adjustment_mode = false;
+            self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         } else if self.view_trim_mode {
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_wheel_and_click:view_trim",
                 );
             }
             self.persist_pending_view_trim_state();
-            self.adjustment_mode = false;
+            self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         } else if self
             .fullscreen_idx
             .is_some_and(|idx| self.fs_entry_is_animated(idx))
         {
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_wheel_and_click:animated_item",
                 );
             }
             self.persist_pending_view_trim_state();
-            self.adjustment_mode = false;
+            self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         } else if self.fs_zoom_mode_engaged() {
             // ZipPla ズーム中 (照準含む) は左端ホバーで補正パネルを開かない (パン操作の邪魔をしない)。
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_wheel_and_click:zoom_mode",
                 );
             }
-            self.adjustment_mode = false;
+            self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         } else if self
             .fullscreen_idx
             .is_some_and(|idx| self.fs_music_view_active(idx))
@@ -16306,13 +16361,13 @@ impl App {
             // 音楽ビュー: 画面端ホバーで画像用の補正パネルを開かない。パネル描画自体は
             // 抑制済みだが、adjustment_mode フラグを立てると画像に戻った瞬間まで残るので
             // ここで OFF に固定する (Inc 3 パネル漏れ修正)。
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_wheel_and_click:music_view",
                 );
             }
-            self.adjustment_mode = false;
+            self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         } else {
             let mode = self.settings.fullscreen_side_panel_mode.normalized();
             let bookmark_title_focused =
@@ -16333,14 +16388,14 @@ impl App {
                 && adjustment_panel_hover_active_at(
                     full_rect,
                     ctx.input(|input| input.pointer.hover_pos()),
-                    self.adjustment_mode,
+                    self.adjustment_mode.is_open(),
                     navigator_exclusion,
                 );
             if left_panel_hover_active || bookmark_title_focused {
-                self.adjustment_mode = true;
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
             } else if adjustment_panel_should_auto_close(
                 mode,
-                self.adjustment_mode,
+                self.adjustment_mode.is_open(),
                 self.adjustment_dragging,
                 left_panel_hover_active,
                 bookmark_title_focused,
@@ -16351,7 +16406,7 @@ impl App {
                     "ui_fullscreen::handle_fs_wheel_and_click:hover_auto_dismiss",
                 );
                 self.persist_pending_view_trim_state();
-                self.adjustment_mode = false;
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
             }
         }
 
@@ -16368,7 +16423,6 @@ impl App {
                     excluded: Vec::new(),
                     behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                         accepts_pinch: true,
-                        accepts_edge_swipe: false,
                     },
                 },
                 self.frame_counter,
@@ -16381,7 +16435,7 @@ impl App {
         }
 
         let side_panel_visible =
-            side_panel_chrome_enabled && (has_right_panel || self.adjustment_mode);
+            side_panel_chrome_enabled && (has_right_panel || self.adjustment_mode.is_open());
         let hover_in_top = ctx.input(|input| {
             !self.cursor_hidden
                 && input.pointer.hover_pos().is_some_and(|pos| {
@@ -16408,7 +16462,7 @@ impl App {
             side_panel_chrome_enabled,
             self.settings.fullscreen_side_panel_mode,
             has_right_panel,
-            self.adjustment_mode,
+            self.adjustment_mode.is_open(),
         )
         .iter()
         .collect();
@@ -16422,6 +16476,8 @@ impl App {
             &mut touch_excluded,
             full_rect,
             side_panel_chrome_enabled && touch_chrome_latched,
+            self.adjustment_mode.is_open(),
+            has_right_panel,
         );
 
         let touch_input_enabled = !state.is_video
@@ -16449,7 +16505,6 @@ impl App {
                 excluded: touch_excluded,
                 behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                     accepts_pinch: true,
-                    accepts_edge_swipe: self.fs_zoom_pan().is_none(),
                 },
             },
             self.frame_counter,
@@ -16467,6 +16522,17 @@ impl App {
         let touch_has_replacement = !touch_frame.commands().is_empty();
         if touch_input_enabled {
             for command in touch_frame.clone().into_commands() {
+                if touch_panel_tap_command_dismisses_before_dispatch(
+                    command,
+                    self.adjustment_mode,
+                    self.fs_info_panel_open,
+                ) {
+                    // The two panels form one modal touch-owned group: a canvas
+                    // tap outside them closes both touch-owned sides and is not
+                    // reused for page navigation or chrome toggling.
+                    self.close_touch_owned_side_panels();
+                    continue;
+                }
                 match command {
                     crate::touch_input::TouchCommand::ToggleChrome => {
                         if let Some(idx) = panel_fs_idx {
@@ -16502,19 +16568,6 @@ impl App {
                     // surface profile.
                     crate::touch_input::TouchCommand::ScrollGrid { .. }
                     | crate::touch_input::TouchCommand::ScrollGridEnd => {}
-                    crate::touch_input::TouchCommand::OpenSidePanel { left } => {
-                        if let Some(idx) = panel_fs_idx {
-                            set_still_touch_chrome_latch(
-                                ctx,
-                                StillTouchChromeLatch {
-                                    fs_idx: idx,
-                                    session_started_at: self.fullscreen_opened_at(),
-                                },
-                                true,
-                            );
-                        }
-                        self.open_still_side_panel(still_side_panel_action_for_physical_edge(left));
-                    }
                 }
             }
         }
@@ -16767,13 +16820,7 @@ impl App {
             egui::Id::new("fs_click"),
             egui::Sense::click_and_drag(),
         );
-        if touch_input_enabled
-            && !matches!(
-                touch_owner,
-                crate::touch_input::TouchOwner::EdgeSwipe { .. }
-            )
-            && touch_frame.should_suppress_response(&fs_response)
-        {
+        if touch_input_enabled && touch_frame.should_suppress_response(&fs_response) {
             // Positive raw-event correlation is required before the
             // recognizer's suppression decision can arm the shared latch.
             self.fs_suppress_primary_until_release = true;
@@ -16871,16 +16918,17 @@ impl App {
             {
                 // ページ単位表示でズームまたは回転中: ドラッグでパン。
                 // 連結読みのドラッグは直前の分岐で、主軸スクロールと直交パンに分けて扱う。
-                if primary_pressed {
-                    if let Some(pos) = pointer_pos {
-                        self.fs_pan_drag_start = Some((pos, self.fs_pan));
-                    }
-                } else if primary_down {
-                    if let Some((start_pos, start_pan)) = self.fs_pan_drag_start {
-                        if let Some(pos) = pointer_pos {
-                            self.set_fs_pan_from_input(self.fs_zoom, start_pan + (pos - start_pos));
-                        }
-                    }
+                if primary_pressed
+                    && let (Some(pos), Some(total_delta)) =
+                        (pointer_pos, fs_response.total_drag_delta())
+                {
+                    self.fs_pan_drag_start = Some((pos - total_delta, self.fs_pan));
+                }
+                if let Some((_, start_pan)) = self.fs_pan_drag_start
+                    && let Some(proposed_pan) =
+                        fullscreen_drag_pan_proposal(&fs_response, start_pan)
+                {
+                    self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
                 }
             }
             if primary_released {
@@ -16953,7 +17001,7 @@ impl App {
                                     side_panel_chrome_enabled,
                                     self.settings.fullscreen_side_panel_mode,
                                     has_right_panel,
-                                    self.adjustment_mode,
+                                    self.adjustment_mode.is_open(),
                                     navigator_exclusion,
                                 );
                                 let in_seek_panel =
@@ -17558,7 +17606,7 @@ impl App {
             }
             // source-swap を開始できない稀ケースのみ通常 open にフォールバック (音声モードは抜ける)。
             let cursor_state = self.fullscreen_cursor_state();
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
@@ -17590,7 +17638,7 @@ impl App {
         }
 
         let cursor_state = self.fullscreen_cursor_state();
-        if self.adjustment_mode {
+        if self.adjustment_mode.is_open() {
             crate::ime_focus::record_side_panel_close(
                 ctx,
                 "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
@@ -18070,7 +18118,7 @@ impl App {
         fs_idx: usize,
     ) {
         if close_fs {
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_navigation:close_fullscreen",
@@ -18088,7 +18136,7 @@ impl App {
         } else if close_to_page_list {
             // BS: 階層を 1 段戻す = コンテナのページ一覧 (L2) へ。close_fullscreen は
             // current_folder=ZIP/PDF のまま閉じるので L2 が出る (設定で分岐しない)。
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_navigation:close_to_page_list",
@@ -19074,7 +19122,7 @@ impl App {
             self.reset_analysis_mode();
         }
         self.persist_pending_view_trim_state();
-        self.adjustment_mode = false;
+        self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.view_trim_mode = false;
         self.view_trim_page_apply_root_idx = None;
         self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
@@ -19971,7 +20019,7 @@ impl App {
             // pointer-open の左右パネルは維持する。touch handle の右パネルは current-file
             // state なので閉じ、表示トリムの pending 値だけ旧対象へ確定する。
             self.persist_pending_view_trim_state();
-            self.close_touch_info_panel_for_file_change();
+            self.close_touch_side_panels_for_file_change();
         }
         self.fs_vertical_scroll =
             vertical_reading_reanchor_scroll(self.fs_vertical_scroll, old_offsets, new_pos);
@@ -21728,7 +21776,7 @@ impl App {
         }
         if fs_loupe_suppressed_by_edit_mode(
             self.analysis_mode,
-            self.adjustment_mode,
+            self.adjustment_mode.is_open(),
             self.text_mode,
         ) {
             return;
@@ -22456,7 +22504,7 @@ impl App {
             && !in_left_callout
             && !self.metadata_panel_click_shown()
             && !self.metadata_panel_hover_active
-            && !self.adjustment_mode
+            && !self.adjustment_mode.is_open()
             && !self.view_trim_mode
             && !self.is_overlay_edit_mode_active()
             && !self.analysis_mode
@@ -25781,7 +25829,10 @@ impl App {
             self.show_feedback_toast("エクスポート中です".to_string());
             return;
         }
-        if self.is_overlay_edit_mode_active() || self.adjustment_mode || self.analysis_mode {
+        if self.is_overlay_edit_mode_active()
+            || self.adjustment_mode.is_open()
+            || self.analysis_mode
+        {
             self.show_feedback_toast("編集モードを閉じてからエクスポートしてください".to_string());
             return;
         }
@@ -28646,7 +28697,7 @@ mod tests {
 
         assert_eq!(result, (FsPageNav::None, false));
         assert!(!app.metadata_panel_hover_active);
-        assert!(!app.adjustment_mode);
+        assert!(!app.adjustment_mode.is_open());
     }
 
     #[test]
@@ -29754,17 +29805,16 @@ mod tests {
     }
 
     #[test]
-    fn touch_panel_handles_are_tap_zone_exclusions() {
+    fn touch_panel_handles_are_excluded_only_while_their_panels_are_closed() {
         let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
         let mut excluded = Vec::new();
-        extend_touch_excluded_with_panel_handles(&mut excluded, viewport, true);
+        extend_touch_excluded_with_panel_handles(&mut excluded, viewport, true, false, false);
         assert_eq!(excluded.len(), 2);
         let geometry = crate::touch_input::TapZoneGeometry {
             surface: viewport,
             excluded,
             behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                 accepts_pinch: true,
-                accepts_edge_swipe: true,
             },
         };
         for rect in still_touch_panel_handle_rects(viewport) {
@@ -29777,70 +29827,102 @@ mod tests {
             crate::touch_input::classify_tap(&geometry, viewport.center()),
             crate::touch_input::TapZone::Center
         );
+
+        let [left, right] = visible_still_touch_panel_handle_rects(viewport, true, true, false);
+        assert!(!left.is_positive(), "an open left panel has no handle");
+        assert!(
+            right.is_positive(),
+            "the closed opposite panel keeps its handle"
+        );
+        let mut excluded = Vec::new();
+        extend_touch_excluded_with_panel_handles(&mut excluded, viewport, true, true, false);
+        assert_eq!(excluded, vec![right]);
     }
 
     #[test]
-    fn physical_edge_maps_directly_to_the_same_side_panel_action() {
+    fn handle_edge_maps_directly_to_the_same_side_panel_action() {
         assert_eq!(
-            still_side_panel_action_for_physical_edge(true),
-            StillSidePanelAction::ToggleAdjustment
+            still_side_panel_action_for_handle_edge(crate::ui_helpers::PanelEdge::Left),
+            StillSidePanelAction::OpenAdjustment
         );
         assert_eq!(
-            still_side_panel_action_for_physical_edge(false),
-            StillSidePanelAction::ToggleMetadata
+            still_side_panel_action_for_handle_edge(crate::ui_helpers::PanelEdge::Right),
+            StillSidePanelAction::OpenMetadata
         );
     }
 
     #[test]
-    fn touch_panel_action_matches_existing_callout_toggles() {
+    fn touch_panel_handle_action_is_open_only_and_records_touch_ownership() {
         let mut app = crate::app::setup_app_for_test();
         app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
 
-        app.apply_still_side_panel_action(StillSidePanelAction::ToggleAdjustment);
-        assert!(app.adjustment_mode);
-        app.apply_still_side_panel_action(StillSidePanelAction::ToggleAdjustment);
-        assert!(!app.adjustment_mode);
+        app.open_still_side_panel_by_touch(StillSidePanelAction::OpenAdjustment);
+        assert_eq!(
+            app.adjustment_mode,
+            crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
+        );
+        app.open_still_side_panel_by_touch(StillSidePanelAction::OpenAdjustment);
+        assert_eq!(
+            app.adjustment_mode,
+            crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
+        );
 
-        app.apply_still_side_panel_action(StillSidePanelAction::ToggleMetadata);
+        app.open_still_side_panel_by_touch(StillSidePanelAction::OpenMetadata);
         assert_eq!(
             app.fs_info_panel_open,
             crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
         );
         assert!(app.metadata_panel_click_shown());
-        app.apply_still_side_panel_action(StillSidePanelAction::ToggleMetadata);
-        assert!(!app.metadata_panel_click_shown());
+        app.open_still_side_panel_by_touch(StillSidePanelAction::OpenMetadata);
+        assert_eq!(
+            app.fs_info_panel_open,
+            crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
+        );
     }
 
     #[test]
-    fn touch_panel_ownership_blocks_passive_hover_and_edge_open_is_idempotent() {
+    fn touch_panel_ownership_blocks_passive_hover() {
         assert!(still_passive_side_panel_hover_enabled(false, false));
         assert!(!still_passive_side_panel_hover_enabled(false, true));
         assert!(!still_passive_side_panel_hover_enabled(true, false));
+    }
 
+    #[test]
+    fn outside_touch_tap_closes_both_touch_owned_panels_and_is_consumed() {
+        use crate::touch_input::TouchCommand;
+        use crate::ui_helpers::MetadataPanelOpenState::{ByPointer, ByTouchHandle, Closed};
         let mut app = crate::app::setup_app_for_test();
         app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+        app.adjustment_mode = ByTouchHandle;
+        app.fs_info_panel_open = ByTouchHandle;
 
-        // A synthetic edge hover may already have opened the left panel before
-        // the recognizer confirms EdgeSwipe. OpenSidePanel must keep it open.
-        app.adjustment_mode = true;
-        app.open_still_side_panel(StillSidePanelAction::ToggleAdjustment);
-        assert!(app.adjustment_mode);
-        app.adjustment_mode = false;
-        app.open_still_side_panel(StillSidePanelAction::ToggleAdjustment);
-        assert!(app.adjustment_mode);
+        for command in [
+            TouchCommand::ToggleChrome,
+            TouchCommand::PageSide { left: true },
+            TouchCommand::PageSide { left: false },
+        ] {
+            assert!(touch_panel_tap_command_dismisses_before_dispatch(
+                command,
+                app.adjustment_mode,
+                app.fs_info_panel_open
+            ));
+        }
+        assert!(app.close_touch_owned_side_panels());
+        assert_eq!(app.adjustment_mode, Closed);
+        assert_eq!(app.fs_info_panel_open, Closed);
 
-        app.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
-        app.open_still_side_panel(StillSidePanelAction::ToggleMetadata);
-        assert_eq!(
-            app.fs_info_panel_open,
-            crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
-        );
-        app.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
-        app.open_still_side_panel(StillSidePanelAction::ToggleMetadata);
-        assert_eq!(
-            app.fs_info_panel_open,
-            crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
-        );
+        // Pointer ownership retains the established mouse contract: canvas
+        // clicks are dispatched normally and do not dismiss either panel.
+        app.adjustment_mode = ByPointer;
+        app.fs_info_panel_open = ByPointer;
+        assert!(!touch_panel_tap_command_dismisses_before_dispatch(
+            TouchCommand::ToggleChrome,
+            app.adjustment_mode,
+            app.fs_info_panel_open
+        ));
+        assert!(!app.close_touch_owned_side_panels());
+        assert_eq!(app.adjustment_mode, ByPointer);
+        assert_eq!(app.fs_info_panel_open, ByPointer);
     }
 
     #[test]
@@ -29914,6 +29996,167 @@ mod tests {
                 egui::Event::PointerGone,
             ],
         ));
+    }
+
+    #[test]
+    fn viewer_pointer_passthrough_keeps_the_egui_canvas_drag_stream() {
+        #[derive(Clone, Copy, Debug, Default)]
+        struct DragProbe {
+            owner: crate::touch_input::TouchOwner,
+            started: bool,
+            dragged: bool,
+            stopped: bool,
+            delta: egui::Vec2,
+            proposed_pan: Option<egui::Vec2>,
+        }
+
+        fn touch(phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
+            egui::Event::Touch {
+                device_id: egui::TouchDeviceId(17),
+                id: egui::TouchId(23),
+                phase,
+                pos,
+                force: None,
+            }
+        }
+
+        fn primary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }
+        }
+
+        fn run_frame(
+            ctx: &egui::Context,
+            screen: egui::Rect,
+            frame: u64,
+            events: Vec<egui::Event>,
+        ) -> DragProbe {
+            let mut probe = DragProbe::default();
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            let touch_frame = crate::touch_correlation::drive_egui_touch_input(
+                                ctx,
+                                crate::touch_correlation::TouchSurface::StillFullscreen,
+                                crate::touch_input::TapZoneGeometry {
+                                    surface: screen,
+                                    excluded: Vec::new(),
+                                    behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                                        accepts_pinch: true,
+                                    },
+                                },
+                                frame,
+                                true,
+                            );
+                            let response = ui.interact(
+                                screen,
+                                egui::Id::new("touch_pan_canvas_probe"),
+                                egui::Sense::click_and_drag(),
+                            );
+                            probe = DragProbe {
+                                owner: touch_frame.owner(),
+                                started: response.drag_started_by(egui::PointerButton::Primary),
+                                dragged: response.dragged_by(egui::PointerButton::Primary),
+                                stopped: response.drag_stopped_by(egui::PointerButton::Primary),
+                                delta: response.drag_delta(),
+                                proposed_pan: fullscreen_drag_pan_proposal(
+                                    &response,
+                                    egui::vec2(11.0, 7.0),
+                                ),
+                            };
+                        });
+                },
+            );
+            probe
+        }
+
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let start = egui::pos2(300.0, 300.0);
+        let moved = start + egui::vec2(64.0, 24.0);
+
+        // Register the canvas before the input frame, matching egui's
+        // previous-pass hit-test ownership.
+        let _ = run_frame(&ctx, screen, 1, Vec::new());
+        let pressed = run_frame(
+            &ctx,
+            screen,
+            2,
+            vec![
+                touch(egui::TouchPhase::Start, start),
+                egui::Event::PointerMoved(start),
+                primary(start, true),
+            ],
+        );
+        assert_eq!(pressed.owner, crate::touch_input::TouchOwner::Undecided);
+        assert!(!pressed.started);
+
+        let moved_probe = run_frame(
+            &ctx,
+            screen,
+            3,
+            vec![
+                touch(egui::TouchPhase::Move, moved),
+                egui::Event::PointerMoved(moved),
+            ],
+        );
+        assert_eq!(
+            moved_probe.owner,
+            crate::touch_input::TouchOwner::ViewerPointerPassthrough
+        );
+        assert!(moved_probe.started);
+        assert!(moved_probe.dragged);
+        assert_eq!(moved_probe.delta, moved - start);
+        assert_eq!(
+            moved_probe.proposed_pan,
+            Some(egui::vec2(11.0, 7.0) + (moved - start)),
+            "the first promoted drag frame must pan even if touch move events were coalesced"
+        );
+
+        let moved_again = start + egui::vec2(96.0, 40.0);
+        let continued = run_frame(
+            &ctx,
+            screen,
+            4,
+            vec![
+                touch(egui::TouchPhase::Move, moved_again),
+                egui::Event::PointerMoved(moved_again),
+            ],
+        );
+        assert!(!continued.started);
+        assert!(continued.dragged);
+        assert_eq!(
+            continued.proposed_pan,
+            Some(egui::vec2(11.0, 7.0) + (moved_again - start)),
+            "continued drag remains relative to the real press position"
+        );
+
+        let released = run_frame(
+            &ctx,
+            screen,
+            5,
+            vec![
+                touch(egui::TouchPhase::End, moved_again),
+                primary(moved_again, false),
+                egui::Event::PointerGone,
+            ],
+        );
+        assert_eq!(
+            released.owner,
+            crate::touch_input::TouchOwner::ViewerPointerPassthrough
+        );
+        assert!(released.stopped);
     }
 
     #[test]

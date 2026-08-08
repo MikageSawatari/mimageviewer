@@ -10130,8 +10130,8 @@ pub struct App {
     pub(crate) ai_status_done_at: Option<std::time::Instant>,
 
     // ── 画像補正 ──────────────────────────────────────────────────
-    /// 補正パネル表示フラグ (左パネルホバーで表示)
-    pub(crate) adjustment_mode: bool,
+    /// 補正パネルの open owner (左パネルホバー / pointer / touch handle)
+    pub(crate) adjustment_mode: crate::ui_helpers::MetadataPanelOpenState,
     /// 補正レイヤーの独立左パネル表示フラグ。
     pub(crate) local_adjust_mode: bool,
     /// エクスポート / 最後段 crop パネルの独立左パネル表示フラグ。
@@ -12503,7 +12503,7 @@ impl App {
             ai_status_done_at: None,
 
             // 画像補正
-            adjustment_mode: false,
+            adjustment_mode: crate::ui_helpers::MetadataPanelOpenState::Closed,
             local_adjust_mode: false,
             export_crop_mode: false,
             adjust_spread_target: AdjustSpreadTarget::Left,
@@ -21961,7 +21961,7 @@ impl App {
         self.thumb_adjust_drag_color_dirty = false;
         self.adjustment_page_params.clear();
         self.adjustment_dragging = false;
-        self.adjustment_mode = false;
+        self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.cache_current_edit_preview_if_ready();
         self.local_adjust_mode = false;
         self.export_crop_mode = false;
@@ -35241,7 +35241,7 @@ impl App {
         self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
 
         self.finish_adjustment_drag_for_detached_pause();
-        self.adjustment_mode = false;
+        self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.cache_current_edit_preview_if_ready();
         self.local_adjust_mode = false;
         self.local_adjust_repair_point_pick_active = None;
@@ -56032,7 +56032,7 @@ impl App {
 
     fn close_fs_side_panel_runtime(&mut self) {
         self.metadata_panel_hover_active = false;
-        self.adjustment_mode = false;
+        self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.music_left_panel_active = false;
         self.music_right_panel_active = false;
@@ -56040,7 +56040,7 @@ impl App {
     }
 
     pub(crate) fn toggle_fullscreen_click_info_open(&mut self) {
-        let next = crate::ui_helpers::toggle_metadata_panel_by_pointer(
+        let next = crate::ui_helpers::toggle_side_panel_by_pointer(
             self.settings.fullscreen_side_panel_mode,
             self.fs_info_panel_open,
         );
@@ -56050,16 +56050,35 @@ impl App {
         }
     }
 
-    pub(crate) fn toggle_fullscreen_touch_info_open(&mut self) {
-        self.fs_info_panel_open =
-            crate::ui_helpers::toggle_metadata_panel_by_touch(self.fs_info_panel_open);
-        self.metadata_panel_hover_active = false;
+    pub(crate) fn toggle_fullscreen_pointer_adjustment_panel(&mut self) {
+        let next = crate::ui_helpers::toggle_side_panel_by_pointer(
+            self.settings.fullscreen_side_panel_mode,
+            self.adjustment_mode,
+        );
+        if next == self.adjustment_mode {
+            return;
+        }
+        if self.adjustment_mode.is_open() {
+            self.persist_pending_view_trim_state();
+        }
+        self.adjustment_mode = next;
+    }
+
+    pub(crate) fn open_fullscreen_touch_adjustment_panel(&mut self) {
+        self.adjustment_mode = crate::ui_helpers::open_side_panel_by_touch(self.adjustment_mode);
     }
 
     pub(crate) fn open_fullscreen_touch_info_panel(&mut self) {
         self.fs_info_panel_open =
-            crate::ui_helpers::open_metadata_panel_by_touch(self.fs_info_panel_open);
+            crate::ui_helpers::open_side_panel_by_touch(self.fs_info_panel_open);
         self.metadata_panel_hover_active = false;
+    }
+
+    pub(crate) fn close_fullscreen_adjustment_panel(&mut self) {
+        if self.adjustment_mode.is_open() {
+            self.persist_pending_view_trim_state();
+        }
+        self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
     }
 
     pub(crate) fn close_fullscreen_info_panel(&mut self) {
@@ -56067,9 +56086,29 @@ impl App {
         self.metadata_panel_hover_active = false;
     }
 
+    /// A canvas tap outside the open panel group closes every touch-owned side
+    /// panel together and is consumed by the caller. Pointer-owned panels are
+    /// deliberately untouched, including when only one side is touch-owned.
+    pub(crate) fn close_touch_owned_side_panels(&mut self) -> bool {
+        let close_left =
+            self.adjustment_mode == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
+        let close_right =
+            self.fs_info_panel_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
+        if close_left {
+            self.close_fullscreen_adjustment_panel();
+        }
+        if close_right {
+            self.close_fullscreen_info_panel();
+        }
+        close_left || close_right
+    }
+
     /// 連結表示の再アンカーは pointer-open を従来どおり維持するが、touch handle の
-    /// current-file state はページ移動境界で閉じる。
-    pub(crate) fn close_touch_info_panel_for_file_change(&mut self) {
+    /// current-file state はページ移動境界で左右とも閉じる。
+    pub(crate) fn close_touch_side_panels_for_file_change(&mut self) {
+        if self.adjustment_mode == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle {
+            self.close_fullscreen_adjustment_panel();
+        }
         if self.fs_info_panel_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle {
             self.close_fullscreen_info_panel();
         }
@@ -56086,11 +56125,11 @@ impl App {
             .fullscreen_idx
             .is_some_and(|idx| self.fs_music_view_active(idx))
             && self.music_left_click_open;
-        let closed = self.adjustment_mode || close_music_left || close_right;
-        if self.adjustment_mode {
+        let closed = self.adjustment_mode.is_open() || close_music_left || close_right;
+        if self.adjustment_mode.is_open() {
             self.persist_pending_view_trim_state();
         }
-        self.adjustment_mode = false;
+        self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.music_left_click_open = false;
         self.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         closed
@@ -58887,7 +58926,7 @@ impl App {
         self.slideshow_anchor_idx = None;
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
-        self.adjustment_mode = false;
+        self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.cache_current_edit_preview_if_ready();
         self.local_adjust_mode = false;
         self.local_adjust_repair_point_pick_active = None;

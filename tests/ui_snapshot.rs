@@ -230,7 +230,7 @@ fn still_touch_panel_handles_latched_dark() {
         "still_touch_panel_handles_latched_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
         |ui| {
-            mimageviewer::draw_still_panel_reach_snapshot_fixture(ui, true, false);
+            mimageviewer::draw_still_panel_reach_snapshot_fixture(ui, true, false, false, false);
         },
     );
 }
@@ -241,7 +241,7 @@ fn still_touch_panel_handles_unlatched_dark() {
         "still_touch_panel_handles_unlatched_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
         |ui| {
-            mimageviewer::draw_still_panel_reach_snapshot_fixture(ui, false, false);
+            mimageviewer::draw_still_panel_reach_snapshot_fixture(ui, false, false, false, false);
         },
     );
 }
@@ -252,7 +252,18 @@ fn still_mouse_panel_callout_dark() {
         "still_mouse_panel_callout_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
         |ui| {
-            mimageviewer::draw_still_panel_reach_snapshot_fixture(ui, false, true);
+            mimageviewer::draw_still_panel_reach_snapshot_fixture(ui, false, true, false, false);
+        },
+    );
+}
+
+#[test]
+fn still_touch_left_panel_open_has_only_right_handle_dark() {
+    snapshot_with_theme(
+        "still_touch_left_panel_open_has_only_right_handle_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            mimageviewer::draw_still_panel_reach_snapshot_fixture(ui, true, false, true, false);
         },
     );
 }

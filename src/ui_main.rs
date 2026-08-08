@@ -15108,8 +15108,7 @@ impl App {
                         // motion must not scroll while scale changes columns.
                         crate::touch_input::TouchCommand::Pan { .. } => {}
                         crate::touch_input::TouchCommand::ToggleChrome
-                        | crate::touch_input::TouchCommand::PageSide { .. }
-                        | crate::touch_input::TouchCommand::OpenSidePanel { .. } => {}
+                        | crate::touch_input::TouchCommand::PageSide { .. } => {}
                     }
                 }
                 if let GridTouchScrollPhase::Glide {

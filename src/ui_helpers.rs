@@ -113,11 +113,12 @@ pub(crate) fn edge_summons_adjustment(
     mode.normalized() == crate::settings::FsSidePanelMode::Hover && edge == PanelEdge::Left
 }
 
-/// 右情報パネルの明示 open を生成した入力 owner。
+/// 静止画の左右パネルの明示 open を生成した入力 owner。
 ///
-/// pointer 経路は従来どおり ClickToShow 専用、touch 経路だけは Hover でも
-/// 永続表示できる。複数の bool へ owner を分散させないため、この値を全 surface の
-/// resolver と lifecycle reset の正本にする。
+/// 既存 pointer 経路は、左補正パネルでは Hover の一時表示または ClickToShow、
+/// 右情報パネルでは ClickToShow の明示 open として扱う。touch 経路だけは Hover
+/// でも永続表示できる。補正パネルと情報パネルの双方で、複数の bool へ owner を
+/// 分散させないため、この値を全 surface の resolver と lifecycle reset の正本にする。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum MetadataPanelOpenState {
     #[default]
@@ -147,7 +148,7 @@ pub(crate) fn metadata_panel_explicit_shown(
 }
 
 /// 既存 mouse / native / music pointer 経路の toggle。Hover では必ず no-op。
-pub(crate) fn toggle_metadata_panel_by_pointer(
+pub(crate) fn toggle_side_panel_by_pointer(
     mode: crate::settings::FsSidePanelMode,
     state: MetadataPanelOpenState,
 ) -> MetadataPanelOpenState {
@@ -161,19 +162,7 @@ pub(crate) fn toggle_metadata_panel_by_pointer(
     }
 }
 
-pub(crate) fn toggle_metadata_panel_by_touch(
-    state: MetadataPanelOpenState,
-) -> MetadataPanelOpenState {
-    if state.is_open() {
-        MetadataPanelOpenState::Closed
-    } else {
-        MetadataPanelOpenState::ByTouchHandle
-    }
-}
-
-pub(crate) fn open_metadata_panel_by_touch(
-    state: MetadataPanelOpenState,
-) -> MetadataPanelOpenState {
+pub(crate) fn open_side_panel_by_touch(state: MetadataPanelOpenState) -> MetadataPanelOpenState {
     if state.is_open() {
         state
     } else {
@@ -2129,22 +2118,14 @@ mod tests {
         assert!(metadata_panel_explicit_shown(ClickToShow, ByPointer));
         assert!(metadata_panel_explicit_shown(ClickToShow, ByTouchHandle));
 
-        assert_eq!(toggle_metadata_panel_by_pointer(Hover, Closed), Closed);
+        assert_eq!(toggle_side_panel_by_pointer(Hover, Closed), Closed);
         assert_eq!(
-            toggle_metadata_panel_by_pointer(Hover, ByTouchHandle),
+            toggle_side_panel_by_pointer(Hover, ByTouchHandle),
             ByTouchHandle
         );
-        assert_eq!(
-            toggle_metadata_panel_by_pointer(ClickToShow, Closed),
-            ByPointer
-        );
-        assert_eq!(
-            toggle_metadata_panel_by_pointer(ClickToShow, ByPointer),
-            Closed
-        );
-        assert_eq!(toggle_metadata_panel_by_touch(Closed), ByTouchHandle);
-        assert_eq!(toggle_metadata_panel_by_touch(ByTouchHandle), Closed);
-        assert_eq!(open_metadata_panel_by_touch(Closed), ByTouchHandle);
-        assert_eq!(open_metadata_panel_by_touch(ByTouchHandle), ByTouchHandle);
+        assert_eq!(toggle_side_panel_by_pointer(ClickToShow, Closed), ByPointer);
+        assert_eq!(toggle_side_panel_by_pointer(ClickToShow, ByPointer), Closed);
+        assert_eq!(open_side_panel_by_touch(Closed), ByTouchHandle);
+        assert_eq!(open_side_panel_by_touch(ByTouchHandle), ByTouchHandle);
     }
 }

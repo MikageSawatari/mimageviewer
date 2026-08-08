@@ -872,7 +872,6 @@ fn touch_command_name(command: &TouchCommand) -> &'static str {
     match command {
         TouchCommand::ToggleChrome => "ToggleChrome",
         TouchCommand::PageSide { .. } => "PageSide",
-        TouchCommand::OpenSidePanel { .. } => "OpenSidePanel",
         TouchCommand::Zoom { .. } => "Zoom",
         TouchCommand::Pan { .. } => "Pan",
         TouchCommand::ScrollGrid { .. } => "ScrollGrid",
@@ -934,7 +933,6 @@ mod tests {
             excluded: Vec::new(),
             behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                 accepts_pinch: true,
-                accepts_edge_swipe: true,
             },
         }
     }

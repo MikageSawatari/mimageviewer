@@ -12,17 +12,6 @@ const TAP_MAX_DISTANCE_PT: f32 = 12.0;
 /// A tap may last at most 700 ms. Longer contact is reserved for the existing
 /// long-press/context-menu path instead of firing a viewer tap command.
 const TAP_MAX_DURATION_MS: u64 = 700;
-/// The edge band is at least 28 pt, or 5% of a wide surface. This fixes the
-/// plan's 24–32 pt range at its midpoint while scaling for large tablets.
-const EDGE_BAND_MIN_PT: f32 = 28.0;
-/// Five percent lets the edge target grow with wide tablet surfaces.
-const EDGE_BAND_WIDTH_FRACTION: f32 = 0.05;
-/// An edge swipe needs 40 pt of inward travel, the midpoint of the planned
-/// 32–48 pt range, so small edge taps cannot open a panel accidentally.
-const EDGE_SWIPE_INWARD_PT: f32 = 40.0;
-/// Horizontal travel must be at least 1.5 times vertical travel to distinguish
-/// a panel gesture from diagonal or vertical canvas movement.
-const EDGE_SWIPE_HORIZONTAL_RATIO: f32 = 1.5;
 /// Pinch recognition starts at two contacts. Additional contacts are tracked,
 /// but only the first two active contacts drive the transform.
 const PINCH_CONTACT_COUNT: usize = 2;
@@ -66,13 +55,7 @@ pub(crate) struct TapZoneGeometry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TouchSurfaceBehavior {
     Grid,
-    Viewer {
-        accepts_pinch: bool,
-        /// Whether a one-finger drag that starts in a physical side-edge band
-        /// may claim the panel gesture. Zoomed canvases disable this so the
-        /// existing pointer-pan path keeps ownership from the first drag.
-        accepts_edge_swipe: bool,
-    },
+    Viewer { accepts_pinch: bool },
 }
 
 impl TouchSurfaceBehavior {
@@ -81,19 +64,8 @@ impl TouchSurfaceBehavior {
             self,
             Self::Grid
                 | Self::Viewer {
-                    accepts_pinch: true,
-                    ..
+                    accepts_pinch: true
                 }
-        )
-    }
-
-    fn accepts_edge_swipe(self) -> bool {
-        matches!(
-            self,
-            Self::Viewer {
-                accepts_edge_swipe: true,
-                ..
-            }
         )
     }
 }
@@ -145,7 +117,6 @@ pub(crate) enum TouchOwner {
     ViewerPointerPassthrough,
     ViewerTapZone,
     Pinch,
-    EdgeSwipe { left: bool },
     Cancelled,
 }
 
@@ -160,9 +131,6 @@ pub(crate) enum TouchCommand {
     ToggleChrome,
     /// A physical screen side; the caller applies the reading direction.
     PageSide {
-        left: bool,
-    },
-    OpenSidePanel {
         left: bool,
     },
     Zoom {
@@ -194,18 +162,16 @@ struct Contact {
     pos: Pos2,
     start_ms: u64,
     max_distance_sq: f32,
-    edge_side: Option<bool>,
 }
 
 impl Contact {
-    fn new(sample: TouchSample, surface: Rect) -> Self {
+    fn new(sample: TouchSample) -> Self {
         Self {
             id: sample.id,
             start_pos: sample.pos,
             pos: sample.pos,
             start_ms: sample.now_ms,
             max_distance_sq: 0.0,
-            edge_side: edge_side(surface, sample.pos),
         }
     }
 
@@ -315,7 +281,7 @@ impl TouchRecognizer {
         if self.contacts.iter().any(|contact| contact.id == sample.id) {
             return Vec::new();
         }
-        self.contacts.push(Contact::new(sample, geom.surface));
+        self.contacts.push(Contact::new(sample));
 
         let mut commands = Vec::new();
         if self.contacts.len() >= PINCH_CONTACT_COUNT && geom.behavior.accepts_pinch() {
@@ -329,10 +295,6 @@ impl TouchRecognizer {
                     commands.push(TouchCommand::ScrollGridEnd);
                 }
                 TouchOwner::Pinch => self.rebase_pinch(),
-                // Step 3b settles this ownership boundary: EdgeSwipe emits
-                // OpenSidePanel as soon as it is confirmed, so a later contact
-                // must not add pinch/zoom to that already-committed action.
-                TouchOwner::EdgeSwipe { .. } => {}
                 TouchOwner::WidgetPassthrough
                 | TouchOwner::ViewerTapZone
                 | TouchOwner::Cancelled => {}
@@ -477,26 +439,7 @@ impl TouchRecognizer {
             return Vec::new();
         }
 
-        if behavior.accepts_edge_swipe()
-            && let Some(left) = contact.edge_side
-        {
-            let inward = if left { delta.x } else { -delta.x };
-            if inward >= EDGE_SWIPE_INWARD_PT
-                && delta.x.abs() >= delta.y.abs() * EDGE_SWIPE_HORIZONTAL_RATIO
-            {
-                self.owner = TouchOwner::EdgeSwipe { left };
-                self.suppress_primary = true;
-                return vec![TouchCommand::OpenSidePanel { left }];
-            }
-
-            // Once movement outside the tap slop is outward or clearly not
-            // horizontal, lock into the existing pointer-pan path.
-            if moved_beyond_tap
-                && (inward <= 0.0 || delta.x.abs() < delta.y.abs() * EDGE_SWIPE_HORIZONTAL_RATIO)
-            {
-                self.owner = TouchOwner::ViewerPointerPassthrough;
-            }
-        } else if moved_beyond_tap {
+        if moved_beyond_tap {
             self.owner = TouchOwner::ViewerPointerPassthrough;
         }
         Vec::new()
@@ -566,21 +509,6 @@ impl TouchRecognizer {
     }
 }
 
-fn edge_side(surface: Rect, pos: Pos2) -> Option<bool> {
-    if !surface.contains(pos) {
-        return None;
-    }
-    let band = EDGE_BAND_MIN_PT.max(surface.width().max(0.0) * EDGE_BAND_WIDTH_FRACTION);
-    let near_left = pos.x <= surface.min.x + band;
-    let near_right = pos.x >= surface.max.x - band;
-    match (near_left, near_right) {
-        (true, true) => Some(pos.x < surface.center().x),
-        (true, false) => Some(true),
-        (false, true) => Some(false),
-        (false, false) => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,7 +520,6 @@ mod tests {
             excluded: Vec::new(),
             behavior: TouchSurfaceBehavior::Viewer {
                 accepts_pinch: true,
-                accepts_edge_swipe: true,
             },
         }
     }
@@ -675,7 +602,6 @@ mod tests {
                 excluded: Vec::new(),
                 behavior: TouchSurfaceBehavior::Viewer {
                     accepts_pinch: true,
-                    accepts_edge_swipe: true,
                 },
             };
             assert_eq!(classify_tap(&geometry, surface.center()), TapZone::Center);
@@ -786,47 +712,6 @@ mod tests {
     }
 
     #[test]
-    fn edge_swipe_accepts_only_inward_horizontal_motion_from_the_band() {
-        let geometry = geom();
-
-        let mut accepted = TouchRecognizer::new();
-        accepted.handle_sample(&geometry, sample(1, 28.0, 400.0, TouchPhase::Start, 0));
-        assert_eq!(
-            accepted.handle_sample(&geometry, sample(1, 68.0, 410.0, TouchPhase::Move, 10)),
-            vec![TouchCommand::OpenSidePanel { left: true }]
-        );
-        assert_eq!(accepted.owner(), TouchOwner::EdgeSwipe { left: true });
-
-        let mut right = TouchRecognizer::new();
-        right.handle_sample(&geometry, sample(2, 975.0, 400.0, TouchPhase::Start, 0));
-        assert_eq!(
-            right.handle_sample(&geometry, sample(2, 935.0, 400.0, TouchPhase::Move, 10)),
-            vec![TouchCommand::OpenSidePanel { left: false }]
-        );
-    }
-
-    #[test]
-    fn edge_swipe_rejects_short_vertical_and_out_of_band_motion() {
-        let geometry = geom();
-        let cases = [
-            ((28.0, 400.0), (67.9, 400.0)),
-            ((28.0, 400.0), (68.0, 427.0)),
-            ((50.1, 400.0), (100.1, 400.0)),
-        ];
-        for (index, (start, end)) in cases.into_iter().enumerate() {
-            let mut recognizer = TouchRecognizer::new();
-            let id = index as u64 + 10;
-            recognizer.handle_sample(
-                &geometry,
-                sample(id, start.0, start.1, TouchPhase::Start, 0),
-            );
-            let commands =
-                recognizer.handle_sample(&geometry, sample(id, end.0, end.1, TouchPhase::End, 10));
-            assert!(commands.is_empty());
-        }
-    }
-
-    #[test]
     fn large_discontinuous_ids_and_third_contact_are_supported() {
         let geometry = geom();
         let mut recognizer = TouchRecognizer::new();
@@ -889,38 +774,6 @@ mod tests {
                 .handle_sample(&geometry, sample(1, 500.0, 400.0, TouchPhase::End, 10))
                 .is_empty()
         );
-        assert!(!recognizer.should_suppress_primary());
-    }
-
-    #[test]
-    fn confirmed_edge_swipe_keeps_ownership_when_contact_is_added() {
-        let geometry = geom();
-        let mut recognizer = TouchRecognizer::new();
-        recognizer.handle_sample(&geometry, sample(1, 28.0, 400.0, TouchPhase::Start, 0));
-        assert_eq!(
-            recognizer.handle_sample(&geometry, sample(1, 68.0, 400.0, TouchPhase::Move, 1)),
-            vec![TouchCommand::OpenSidePanel { left: true }]
-        );
-        assert_eq!(recognizer.owner(), TouchOwner::EdgeSwipe { left: true });
-
-        recognizer.handle_sample(&geometry, sample(2, 700.0, 400.0, TouchPhase::Start, 2));
-        assert_eq!(recognizer.owner(), TouchOwner::EdgeSwipe { left: true });
-        assert!(recognizer.should_suppress_primary());
-    }
-
-    #[test]
-    fn disabled_edge_swipe_falls_through_to_viewer_pointer_pan() {
-        let mut geometry = geom();
-        geometry.behavior = TouchSurfaceBehavior::Viewer {
-            accepts_pinch: true,
-            accepts_edge_swipe: false,
-        };
-        let mut recognizer = TouchRecognizer::new();
-        recognizer.handle_sample(&geometry, sample(1, 28.0, 400.0, TouchPhase::Start, 0));
-        let commands =
-            recognizer.handle_sample(&geometry, sample(1, 68.0, 400.0, TouchPhase::Move, 1));
-        assert!(commands.is_empty());
-        assert_eq!(recognizer.owner(), TouchOwner::ViewerPointerPassthrough);
         assert!(!recognizer.should_suppress_primary());
     }
 

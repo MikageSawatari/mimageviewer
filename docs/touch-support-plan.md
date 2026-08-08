@@ -519,23 +519,37 @@ release から確定先までの移動量が行高の 20% 未満なら従来ど�
 - ハンドル幅は `STILL_TOUCH_PANEL_HANDLE_WIDTH_PT = 48pt`。高さは viewport 高の 24% を
   96--220pt に clamp し、さらに上バー 44pt と下シークバー 38pt の間へ clamp する。
   極端に低い viewport で安全帯が無い場合は描画も hit test もしない
-- 左右ハンドルは物理的な左 / 右へ固定し、左は画像補正パネル、右はメタデータパネルを開閉する。
+- 左右ハンドルは物理的な左 / 右へ固定し、左は画像補正パネル、右はメタデータパネルを開く。
   読み方向では反転しない。マウス callout とタッチハンドルは同じ意味 action を呼ぶ
 - `Hover` / `ClickToShow` の両モードでタッチハンドルを表示する。ハンドル矩形はタップ zone の
-  `excluded` へ加え、ハンドル操作がページ移動 / 中央クローム toggle と競合しないようにした
-- `OpenSidePanel { left }` の consumer を同じ意味 action へ配線した。edge swipe で左パネルを
-  開いた場合も hover 消失で即座に auto-close しないよう、タッチクロームを latch してから開く。
-  latch 中は pointer emulation による受動 hover を止め、既に hover で開いていても
-  `OpenSidePanel` が toggle-close しない idempotent な open とした
-- 右情報パネルの明示 open は `MetadataPanelOpenState::{Closed, ByPointer, ByTouchHandle}` を
-  単一の正本とする。全 surface の resolver は同じ state を読み、`ByTouchHandle` は mode に
-  関係なく表示、`ByPointer` は従来どおり `ClickToShow` でだけ表示する。mouse / native / music の
-  pointer writer は `Hover` で no-op のまま、タッチハンドル / edge swipe だけが専用 writer から
-  `ByTouchHandle` を生成する
+  `excluded` へ加え、ハンドル操作がページ移動 / 中央クローム toggle と競合しないようにした。
+  対応パネルが開いた側は描画・hit test・`excluded` のすべてから外し、反対側だけを残す
+- 左補正パネルと右情報パネルの明示 open はどちらも
+  `MetadataPanelOpenState::{Closed, ByPointer, ByTouchHandle}` を単一の正本とする。全 surface の
+  resolver は同じ state を読み、`ByTouchHandle` は mode に関係なく表示、`ByPointer` は従来どおり
+  `ClickToShow` でだけ表示する。mouse / native / music の pointer writer は `Hover` で no-op の
+  まま、タッチハンドルだけが専用 writer から idempotent な `ByTouchHandle` を生成する
+- `ByTouchHandle` のパネル外をタップしたときは、左右の touch-owned パネルを 1 つの modal group
+  として両方閉じ、そのタップを page / chrome toggle に再利用しない。`ByPointer` は従来どおり
+  パネル外クリックでは閉じない
 - `ByTouchHandle` はファイル / ページ移動とフルスクリーン退出で `Closed` へ戻す。
   連結表示の再アンカーで従来維持していた `ByPointer` は維持し、touch owner だけを閉じる
 - `MIV_TOUCH_DEBUG=1` の既存 command / ownership 診断は維持した。初回オーバーレイヘルプ、
   動画 native / 音楽、パネル内部の小 target 対応はこの Step 3b には含めない
+
+#### 拡大中の 1 本指パン修正 (2026-08-08)
+
+実機で「ドラッグしてもパンできない」と報告されたため、Step 3b 直前の `9f64f5d3` と比較した。
+raw touch の press → move → release は `ViewerPointerPassthrough` で egui の
+`drag_started_by(Primary)` / `dragged_by(Primary)` / `drag_stopped_by(Primary)` まで成立していた。
+原因はそれより後段で、`Sense::click_and_drag` が移動閾値を超えた最初の move frame で初めて
+`drag_started` になるのに、pan 側がその frame を開始位置の保存だけに使い、同 frame の移動量を
+捨てていたことだった。短い / coalesced な touch move では全移動量を失う。
+
+この pan 処理は 2026-04-13 から存在し `9f64f5d3` にも同形であるため、**Step 3b の退行ではない**。
+press の合成や症状 guard は加えず、実際の press からの `total_drag_delta()` を drag 開始時の pan
+へ適用するよう ownership 境界を修正した。既存マウスの絶対 drag / clamp の意味も維持し、
+raw touch stream と最初の move の pan 反映をテストで固定する。
 
 上バーの可視判定は既に純関数 `still_top_bar_visible_from_inputs` (`ui_fullscreen.rs:1018-1027`)
 なので、入力構造体に 1 フィールド足すだけで済む。テストも既存パターンに乗る。
@@ -667,26 +681,13 @@ mIV では次の 3 段で担保する:
 > **すべて同じ `ToggleChrome` 相当の動作にする**こと。
 > 一方がクローム、もう一方が全パネルを開く、という設計は覚えにくく誤操作を招く。
 
-#### 補助経路: 端からの内向きスワイプ
+#### 不採用: 端からの内向きスワイプ (2026-08-08 実機決定)
 
-「中央タップ → 見えるハンドル」が**正規経路**。加えて、覚えた人向けの高速経路として
-**画面端から内側へのスワイプでそのパネルを直接開く**。
+Windows 11 実機では、右端は通知センター、左端はアプリへ未配送、下端はスタートメニュー、
+上端もアプリへ届かず、**上下左右すべてを OS が予約する**ことを確認した。mIV の gesture として
+安定して成立しないため、edge swipe の owner / command / contact state / 閾値を含む実装は削除した。
 
-- タップ面積を一切消費しない (ページ送り領域が減らない)
-- 「端から引き出す」はパネル操作として意味が自然
-- 上部タップより誤発火しにくく、`ClickToShow` の「明示操作」思想とも合う
-
-成立条件 (競合を避けるため):
-
-- 開始点が左右端 24〜32pt、または画面幅の 5% 以内
-- 内向きに 32〜48pt 以上移動
-- **横方向の移動が縦方向より明確に大きい**
-- swipe 確定時に pending のページタップを取り消す
-- 2 本指ジェスチャ / widget 操作 / パネル内ドラッグでは無効
-- **ズーム中はキャンバスの pan を優先**し、パネルは中央タップ → ハンドルから開く
-
-⚠ 発見可能性は低いので**単独では成立しない**。また Windows タブレットでは Android ほど
-共通のイディオムではなく、**OS 側のエッジジェスチャに先取りされる環境がありうる** (実機確認要)。
+左右パネルへのタッチ到達経路は、**「中央タップ → 見えるハンドル」の 1 本**に確定する。
 
 #### 検討して採らなかった案: 4 分割 (上左右=パネル / 下左右=ページ移動)
 
@@ -699,7 +700,7 @@ mIV では次の 3 段で担保する:
 | 面積 | 上下 50:50 だとページ送り領域が全面 → **半分**に減る。ページ送りは圧倒的に高頻度で、パネルは低頻度。高頻度操作の領域を削って低頻度操作へ割り当てることになる |
 | 誤タップ | 境界が見えないため、少し上をタップしただけで**補正/編集パネルが出る**。`docs/fullscreen-side-panel-mode-plan.md` に記録された既存の不満 (「編集パネルが出ること自体が怖い」) の再発と見なすべき |
 | 学習コスト | 「左上 = 左パネル」という不可視の割り当てを覚える必要がある |
-| ClickToShow との整合 | 明示操作でだけパネルを出す思想と相性が悪い。整合性の順は **見えるハンドル > エッジスワイプ > 不可視の 4 分割タップ** |
+| ClickToShow との整合 | 明示操作でだけパネルを出す思想と相性が悪い。採用した**見えるハンドル**の方が意図を確認しやすい |
 | **RTL** | 同じ画面左側に「**左上 = 画面固定の左パネル**」と「**左下 = 読み方向で次/前が反転するページ操作**」が混在する。不可視領域の意味が統一されない |
 
 **中央タップを残す価値**: 「中央タップ = 操作 UI を出す」は Kindle / 動画プレイヤー /
@@ -754,8 +755,8 @@ PDF 再レンダリング (`ui_fullscreen.rs:4015, 4216`) はそのまま再利�
 #### (1) パネルを開く導線
 
 Step 3b で静止画フルスクリーンの導線を実装した。中央タップでクロームを latch すると、
-`hover_pos()` に依存しない 48pt 幅の左右ハンドルが常時描画され、左右パネルを直接開閉できる。
-さらに左右エッジスワイプの `OpenSidePanel { left }` も同じ action へ配線した。
+`hover_pos()` に依存しない 48pt 幅の左右ハンドルが描画され、閉じている側のパネルを直接開ける。
+開いた側のハンドルは描画・hit test・tap-zone exclusion のすべてから消える。
 
 既存の hover callout はマウス用として従来の表示条件と形状を維持する。タッチ用 widget は
 press / release フレームで同じ widget ID と矩形を保つため、release と同じ入力 batch に
@@ -1015,8 +1016,6 @@ TouchOwner
 - **全接点が離れるまで primary 抑止を維持**する
 - 確定済み owner を**同じ接点集合のまま**別 action へ移さない。ただし接点追加時は
   `ViewerPointerPassthrough` から `Pinch` へ昇格し、現在位置で pinch 基準を取り直す
-- `EdgeSwipe` は `OpenSidePanel` を確定時に発火する owner なので、接点追加後も `Pinch` へ
-  昇格させない。確定済みのパネル action と zoom を同じ接点集合で重ねない
 - `WidgetPassthrough` / `ViewerTapZone` / `Cancelled` からは昇格しない。
   `Pinch` は接点が 1 本に戻っても単指 pan へ降格せず、全接点解放まで保持する
 - グリッドでは、スクロール認識のしきい値と egui の drag 開始しきい値を競争させない。
@@ -1120,6 +1119,7 @@ anchor/remainder 計算・端数表示時の可視/keep 範囲・pointer stream 
 | 9 | **動画のシーク量** | **±5 秒** (mIV のキーボードと同じ刻み。アプリ内の一貫性を優先) |
 | 10 | 動画の AI アップスケール / カラー化 | **静止画のみ対象**。動画再生中には元から機能が無く、タッチ対応で追加する話ではない |
 | 11 | **非アクティブな窓への最初のタップ** (2026-08-08) | **食べない**。ジェスチャは通常どおり動かし、overlay control へ届く synthetic press だけ抑止する。マウスは最初のクリックが再生/一時停止という副作用を持つので従来どおり食べる。§5.9 |
+| 12 | **エッジスワイプ** (2026-08-08 実機) | **不採用・実装削除**。Windows 11 では上下左右すべてが OS 予約で安定配送されない。左右パネルは「中央タップ → ハンドル」の 1 経路にする。§5.5 |
 
 #### 8 の補足: オーバーレイヘルプにスケーリングへの導線を添える
 
@@ -1139,10 +1139,10 @@ Codex Sol の指摘により、保証できる表現を次に限定する:
 
 > **タッチを行っていない mouse-only の入力列については、挙動を一切変更しない。**
 
-Step 3b の右情報パネルでは、この保証を writer と resolver の両方で固定した。
+Step 3b の左右パネルでは、この保証を writer と resolver の両方で固定した。
 `ByPointer` を生成する既存 mouse / native / music 経路は `ClickToShow` 以外で no-op、
 `Hover` でも永続表示できる `ByTouchHandle` はタッチ専用入口からだけ生成する。
-両 owner を bool へ分散せず `MetadataPanelOpenState` で型として区別する。
+左右とも owner を bool へ分散せず `MetadataPanelOpenState` で型として区別する。
 
 同じ egui viewport 上でマウスとタッチを**完全に同時**操作した場合、egui の `PointerState` が
 1 つしかない以上、2 つを完全独立にする保証はできない。ここを絶対条件にすると
@@ -1249,11 +1249,12 @@ NeeView は **ペンと指を区別していない**。リポジトリ全体で 
    synthetic press が生きている Cancel / suppression 境界で、click 距離超過の
    `PointerMoved` → primary release → `PointerGone` を注入し、click を成立させず down を解除する。
    canceled flag / capture changed の実機観測は引き続きできていない。
-4. **【実装解決・実機確認待ち】左右パネルのタッチハンドルが click completion へ到達するか**。
+4. **【実機確認済み・仕様更新】左右パネルのタッチハンドル**。
    hover 依存の既存 callout はタッチ target にせず、クローム latch 中に widget ID と 48pt 幅の
    矩形が継続する別ハンドルを実装した。Touch End と同じ batch に `PointerGone` を入れる
-   kittest で click completion と左右 action 発火を確認済み。実機では左右それぞれの tap と、
-   指を少し動かして離した場合を確認する。
+   kittest で click completion と左右 action 発火を確認済み。実機で open を確認後、開いた側の
+   ハンドルがパネル操作を塞ぐことが分かったため、開いた側の handle / hit / exclusion を消し、
+   touch-owned パネル外タップは左右をまとめて閉じる仕様へ更新した。
 5. 「フォルダを開く」ダイアログはフルパス入力式で参照ボタンが無く
    (`src/ui_dialogs/open_folder.rs:34-52, 81-106`)、OS タッチキーボードの自動表示も
    コードからは保証できない。タブレットでの実用性を実機確認する必要がある。

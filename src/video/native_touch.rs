@@ -502,7 +502,6 @@ mod tests {
             excluded: Vec::new(),
             behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                 accepts_pinch: false,
-                accepts_edge_swipe: true,
             },
         }
     }
@@ -725,9 +724,6 @@ mod tests {
         ));
         assert!(native_touch_command_toggles_chrome(
             TouchCommand::PageSide { left: true }
-        ));
-        assert!(!native_touch_command_toggles_chrome(
-            TouchCommand::OpenSidePanel { left: true }
         ));
     }
 
