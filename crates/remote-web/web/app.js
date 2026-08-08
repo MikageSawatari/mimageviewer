@@ -8817,10 +8817,13 @@ export class ImageViewer {
   setPageLayerSize(width, height) {
     this.pageLayer.style.width = `${Math.max(1, Number(width) || 1)}px`;
     this.pageLayer.style.height = `${Math.max(1, Number(height) || 1)}px`;
-    this.placeInitialStageScroll();
   }
 
   /// 新しい配置を入れた直後に、どこから見せ始めるか。
+  ///
+  /// **配置の寸法をすべて当ててから呼ぶこと。** 画像の寸法は page layer より後に当てる
+  /// 経路があり、途中で測ると内容がまだ最終の大きさではない。ページ送りだけ効いて
+  /// モード切替で効かなかったのはこれが理由。
   ///
   /// 原寸は内容が画面より大きいので、始点を決める必要がある。本体アプリはページ中央から
   /// 見せるので合わせる。左上は余白であることが多く、実用でも中央のほうが良い。
@@ -8871,8 +8874,7 @@ export class ImageViewer {
       image.style.maxWidth = "none";
       image.style.maxHeight = "none";
     });
-    this.stage.scrollTop = 0;
-    this.stage.scrollLeft = 0;
+    this.placeInitialStageScroll();
     if (resetTransform) {
       this.scale = 1;
       this.panX = 0;
@@ -9174,12 +9176,12 @@ export class ImageViewer {
         pages[index].request.cssWidth = layout.cssWidth;
         rememberMediaImageInfo(pages[index].request, decoded.info);
       });
-      this.stage.scrollTop = 0;
-      this.stage.scrollLeft = 0;
       const previousUrls = this.objectUrls.slice();
       this.pageLayer.replaceChildren(...decodedImages.map((decoded) => decoded.image));
       this.images = decodedImages.map((decoded) => decoded.image);
       this.image = this.images[0];
+      // 中身を差し替えてから決める。差し替え前は内容がまだ DOM に入っていない。
+      this.placeInitialStageScroll();
       this.commitPagePresentation(presentation);
       this.objectUrls = pendingUrls.slice();
       this.objectUrl = null;
