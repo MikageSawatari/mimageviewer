@@ -48,6 +48,7 @@ import {
   appUpdateNotice,
   resolveGridReturnViewport,
   sessionOwnerBadge,
+  sessionOwnerBadgeTransition,
   snappedGridOffset,
   thumbnailBindingMatches,
   thumbnailRequestConcurrency,
@@ -1176,13 +1177,32 @@ function setRemoteSessionStatus(status, message, observation = {}) {
   }
 }
 
+let sessionOwnerBadgeShownOwner = null;
+let sessionOwnerBadgeHideTimer = 0;
+
 function updateRemoteSessionOwnerBadge() {
-  sessionOwnerBadgeElement.hidden =
-    !state.authenticated || state.remoteSessionOwner === null;
-  if (sessionOwnerBadgeElement.hidden) return;
-  const presentation = sessionOwnerBadge(state.remoteSessionOwner);
+  const owner = state.authenticated ? state.remoteSessionOwner : null;
+  const transition = sessionOwnerBadgeTransition(sessionOwnerBadgeShownOwner, owner);
+  if (transition.action === "unchanged") return;
+  sessionOwnerBadgeShownOwner = owner;
+  clearTimeout(sessionOwnerBadgeHideTimer);
+  sessionOwnerBadgeHideTimer = 0;
+  if (transition.action === "hide") {
+    sessionOwnerBadgeElement.hidden = true;
+    return;
+  }
+  const presentation = sessionOwnerBadge(owner);
   sessionOwnerBadgeElement.dataset.owner = presentation.owner;
   sessionOwnerBadgeElement.textContent = presentation.label;
+  sessionOwnerBadgeElement.hidden = false;
+  if (transition.autoHideMs > 0) {
+    sessionOwnerBadgeHideTimer = window.setTimeout(() => {
+      sessionOwnerBadgeHideTimer = 0;
+      if (sessionOwnerBadgeShownOwner === owner) {
+        sessionOwnerBadgeElement.hidden = true;
+      }
+    }, transition.autoHideMs);
+  }
 }
 
 function sessionStatusFromHttp(status) {

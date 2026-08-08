@@ -2232,6 +2232,18 @@ export function shouldShowLoadingIndicator(
     Number(elapsedMs) >= Math.max(0, Number(thresholdMs) || 0);
 }
 
+export const SESSION_OWNER_BADGE_ACTIVE_MS = 3000;
+
+/// 「自分が操作している」は既定の状態で、出し続けても何も伝えない。所有権が変わった
+/// 直後だけ知らせ、他端末が握っている間は出したままにする。常時表示をやめるので、
+/// バッジが無い = 自分が操作できる、になる。
+export function sessionOwnerBadgeTransition(previousOwner, owner) {
+  if (previousOwner === owner) return { action: "unchanged" };
+  if (owner === null || owner === undefined) return { action: "hide" };
+  if (owner !== "active") return { action: "show", autoHideMs: 0 };
+  return { action: "show", autoHideMs: SESSION_OWNER_BADGE_ACTIVE_MS };
+}
+
 export function sessionOwnerBadge(status) {
   if (status === "other_device") {
     return {

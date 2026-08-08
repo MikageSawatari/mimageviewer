@@ -242,8 +242,10 @@ test("the running app version comes from the shell and acquisition can reload on
 
 test("critical telemetry is submitted before session-transition UI side effects", async () => {
   const app = await readFile(new URL("app.js", here), "utf8");
+  // 関数本体だけを取り出す。閉じ括弧が桁 0 に来るのは top-level 関数の終端だけ。
+  // 後ろに続く宣言を目印にすると、その宣言を足しただけでこの検査が空振りする。
   const statusOwner = app.match(
-    /function setRemoteSessionStatus[\s\S]*?\n}\n\nfunction updateRemoteSessionOwnerBadge/
+    /function setRemoteSessionStatus[\s\S]*?\n}\n/
   )?.[0] ?? "";
   assert.match(statusOwner, /remoteSessionTransitionTelemetry\(/);
   assert.match(statusOwner, /if \(transitionEvent\) enqueueTelemetry\(transitionEvent\)/);

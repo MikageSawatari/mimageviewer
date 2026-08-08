@@ -66,6 +66,8 @@ import {
   shouldShowLoadingIndicator,
   shouldShowKeyboardShortcuts,
   sessionOwnerBadge,
+  sessionOwnerBadgeTransition,
+  SESSION_OWNER_BADGE_ACTIVE_MS,
   viewerImageLayout,
   viewerLayoutTelemetry,
   viewerPageDisplaySlot,
@@ -694,6 +696,30 @@ test("session owner badge keeps active and superseded ownership explicit", () =>
     label: "別の端末が操作中",
   });
   assert.deepEqual(sessionOwnerBadge("acquiring"), sessionOwnerBadge("active"));
+});
+
+test("the owner badge announces changes, and only lingers when control is elsewhere", () => {
+  // 既定の状態を出し続けても何も伝えないので、変わった直後だけ知らせる。
+  assert.deepEqual(sessionOwnerBadgeTransition(null, "active"), {
+    action: "show",
+    autoHideMs: SESSION_OWNER_BADGE_ACTIVE_MS,
+  });
+  assert.deepEqual(sessionOwnerBadgeTransition("active", "active"), {
+    action: "unchanged",
+  });
+  // 他端末が握っている間は、出したままでないと伝わらない。
+  assert.deepEqual(sessionOwnerBadgeTransition("active", "other_device"), {
+    action: "show",
+    autoHideMs: 0,
+  });
+  assert.deepEqual(sessionOwnerBadgeTransition("other_device", "other_device"), {
+    action: "unchanged",
+  });
+  assert.deepEqual(sessionOwnerBadgeTransition("other_device", "active"), {
+    action: "show",
+    autoHideMs: SESSION_OWNER_BADGE_ACTIVE_MS,
+  });
+  assert.deepEqual(sessionOwnerBadgeTransition("active", null), { action: "hide" });
 });
 
 test("viewer keys map to the shared page and menu commands", () => {
