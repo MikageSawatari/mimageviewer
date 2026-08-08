@@ -70,6 +70,12 @@ export const ReadingDirection = Object.freeze({
 /// ブラウザが double-tap zoom と見なす窓。アプリのジェスチャ判定とは別物で、こちらは
 /// ブラウザの挙動で決まる (実機で 320ms では足りなかった)。アプリ自身は double-tap に
 /// 操作を割り当てず、この定数は browser zoom の document-level 抑止だけが使う。
+/// 表示倍率の範囲。下限を 1 にしていたため、原寸のように内容が画面より大きい状態から
+/// 全体を見ようとしても縮小できなかった。縮小は制限しない方針だが、0 まで許すと内容が
+/// 消えて戻す手掛かりも無くなるので、見失わない下限だけ置く。
+export const VIEWER_MIN_SCALE = 0.1;
+export const VIEWER_MAX_SCALE = 6;
+
 export const BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS = 520;
 export const BROWSER_DOUBLE_TAP_ZOOM_MAX_DISTANCE_PX = 180;
 
@@ -2281,13 +2287,13 @@ export function reduceViewerTransform(current, requested) {
   let panX = current.panX;
   let panY = current.panY;
   if (requested.name === CommandName.ZOOM_IN) {
-    scale = Math.min(6, scale * 1.2);
+    scale = Math.min(VIEWER_MAX_SCALE, scale * 1.2);
   } else if (requested.name === CommandName.ZOOM_OUT) {
-    scale = Math.max(1, scale / 1.2);
+    scale = Math.max(VIEWER_MIN_SCALE, scale / 1.2);
   } else if (requested.name === CommandName.ZOOM_RESET) {
     return { scale: 1, panX: 0, panY: 0 };
   } else if (requested.name === CommandName.SET_TRANSFORM) {
-    scale = Math.max(1, Math.min(6, requested.payload.scale));
+    scale = Math.max(VIEWER_MIN_SCALE, Math.min(VIEWER_MAX_SCALE, requested.payload.scale));
     panX = requested.payload.panX;
     panY = requested.payload.panY;
   } else if (requested.name === CommandName.PAN_BY) {
@@ -2296,7 +2302,10 @@ export function reduceViewerTransform(current, requested) {
   } else {
     return null;
   }
-  if (scale <= 1.01) return { scale: 1, panX: 0, panY: 0 };
+  // 1 付近まで戻したときに、わずかな倍率とパンが残らないようにする。1 未満は利用者が
+  // 意図して縮小した値なので戻さない。ここで一律に戻していたため、原寸のように内容が
+  // 画面より大きい状態から全体を見ようとしても縮小できなかった。
+  if (scale >= 1 && scale <= 1.01) return { scale: 1, panX: 0, panY: 0 };
   return { scale, panX, panY };
 }
 

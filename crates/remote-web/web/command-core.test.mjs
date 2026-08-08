@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  VIEWER_MAX_SCALE,
+  VIEWER_MIN_SCALE,
   CommandName,
   FitMode,
   GRID_VIEWPORT_MEMORY_LIMIT,
@@ -2417,4 +2419,22 @@ test("viewer transform commands dispatch through one pure state transition", () 
     initial
   );
   assert.equal(reduceViewerTransform(initial, { name: CommandName.NEXT_PAGE }), null);
+});
+
+test("zooming out is not stopped at the size the picture happens to be laid out at", () => {
+  // 原寸のように内容が画面より大きい状態から全体を見たいことがある。下限 1 だと
+  // 拡大しかできない。
+  assert.ok(VIEWER_MIN_SCALE < 1);
+  let state = { scale: 1, panX: 0, panY: 0 };
+  for (let step = 0; step < 40; step += 1) {
+    state = reduceViewerTransform(state, { name: CommandName.ZOOM_OUT });
+  }
+  assert.equal(state.scale, VIEWER_MIN_SCALE);
+  assert.ok(state.scale > 0, "the picture must never shrink to nothing");
+
+  let zoomed = { scale: 1, panX: 0, panY: 0 };
+  for (let step = 0; step < 40; step += 1) {
+    zoomed = reduceViewerTransform(zoomed, { name: CommandName.ZOOM_IN });
+  }
+  assert.equal(zoomed.scale, VIEWER_MAX_SCALE);
 });

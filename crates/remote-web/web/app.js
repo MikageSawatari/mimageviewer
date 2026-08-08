@@ -62,6 +62,8 @@ import {
   shouldShowKeyboardShortcuts,
   viewerGestureDecision,
   viewerDragOwnershipDecision,
+  VIEWER_MAX_SCALE,
+  VIEWER_MIN_SCALE,
   viewerPanelGestureAction,
   viewerPanelTransition,
   viewerResizePlan,
@@ -9326,7 +9328,7 @@ export class ImageViewer {
       const ratio = distance(first, second) / Math.max(1, this.pinch.distance);
       dispatchCommand(
         command(CommandName.SET_TRANSFORM, {
-          scale: clamp(this.pinch.scale * ratio, 1, 6),
+          scale: clamp(this.pinch.scale * ratio, VIEWER_MIN_SCALE, VIEWER_MAX_SCALE),
           panX: this.pinch.panX + center.x - this.pinch.center.x,
           panY: this.pinch.panY + center.y - this.pinch.center.y,
         }),
