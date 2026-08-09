@@ -3212,6 +3212,8 @@ impl App {
                 crate::video::NativeVideoOutputEvent::NavigateItem { .. }
                     | crate::video::NativeVideoOutputEvent::ToggleSidePanelMode
                     | crate::video::NativeVideoOutputEvent::ToggleClickInfoOpen
+                    | crate::video::NativeVideoOutputEvent::OpenTouchInfoPanel
+                    | crate::video::NativeVideoOutputEvent::DismissTouchSidePanels
                     | crate::video::NativeVideoOutputEvent::SetVideoAdjustments { .. }
             ) {
                 // fall through: NavigateItem は dispatch 続行
@@ -3280,6 +3282,20 @@ impl App {
             crate::video::NativeVideoOutputEvent::ToggleClickInfoOpen => {
                 self.toggle_fullscreen_click_info_open();
                 self.sync_native_video_metadata(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::OpenTouchInfoPanel => {
+                self.open_fullscreen_touch_info_panel();
+                self.sync_native_video_metadata(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::DismissTouchSidePanels => {
+                if self.fs_info_panel_open
+                    == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
+                {
+                    self.close_fullscreen_info_panel();
+                    self.sync_native_video_metadata(fs_idx);
+                }
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::ToggleVst3Gui => {

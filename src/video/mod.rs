@@ -423,6 +423,8 @@ pub enum NativeVideoOutputEvent {
     TogglePerfOverlay,
     ToggleSidePanelMode,
     ToggleClickInfoOpen,
+    OpenTouchInfoPanel,
+    DismissTouchSidePanels,
     ToggleVst3Gui,
     /// 動画 HUD の「音声モード」ボタン (Inc 7、動画→音声モード)。App が `enter_video_audio_mode`
     /// を呼ぶ (映像を切って音楽ビューへ、音声無中断)。
@@ -2335,6 +2337,8 @@ fn send_native_overlay_command(
         Command::TogglePerfOverlay => NativeVideoOutputEvent::TogglePerfOverlay,
         Command::ToggleSidePanelMode => NativeVideoOutputEvent::ToggleSidePanelMode,
         Command::ToggleClickInfoOpen => NativeVideoOutputEvent::ToggleClickInfoOpen,
+        Command::OpenTouchInfoPanel => NativeVideoOutputEvent::OpenTouchInfoPanel,
+        Command::DismissTouchSidePanels => NativeVideoOutputEvent::DismissTouchSidePanels,
         Command::ToggleVst3Gui => NativeVideoOutputEvent::ToggleVst3Gui,
         Command::ToggleAudioMode => NativeVideoOutputEvent::ToggleAudioMode,
         Command::CloseFullscreen => NativeVideoOutputEvent::CloseFullscreen { generation },
@@ -3833,6 +3837,20 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::ToggleClickInfoOpen,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::OpenTouchInfoPanel => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::OpenTouchInfoPanel,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::DismissTouchSidePanels => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::DismissTouchSidePanels,
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleVst3Gui => {

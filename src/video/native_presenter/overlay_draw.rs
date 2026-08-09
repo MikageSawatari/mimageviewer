@@ -2163,6 +2163,43 @@ pub(super) fn native_panel_callout_bar_rect(
     egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, height))
 }
 
+/// Phase 3 Step 3h: native video uses the same 48pt touch handle width as the
+/// still-image fullscreen surface. This is intentionally local to the native
+/// overlay so the still-image geometry remains untouched.
+pub(super) const NATIVE_TOUCH_PANEL_HANDLE_WIDTH_PT: f32 = 48.0;
+
+pub(super) fn native_touch_panel_handle_rect(
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    left: bool,
+) -> egui::Rect {
+    let safe_top = native_panel_top().min(overlay_height_points.max(0.0));
+    let safe_bottom =
+        (overlay_height_points - crate::video::native_presenter::HUD_BOTTOM_HEIGHT).max(0.0);
+    if safe_bottom <= safe_top {
+        return egui::Rect::NOTHING;
+    }
+
+    let safe_height = safe_bottom - safe_top;
+    let height = (overlay_height_points * 0.24)
+        .clamp(96.0, 220.0)
+        .min(safe_height);
+    let width = NATIVE_TOUCH_PANEL_HANDLE_WIDTH_PT.min(overlay_width_points.max(0.0) * 0.5);
+    if width <= 0.0 || height <= 0.0 {
+        return egui::Rect::NOTHING;
+    }
+
+    let x = if left {
+        0.0
+    } else {
+        (overlay_width_points - width).max(0.0)
+    };
+    egui::Rect::from_min_size(
+        egui::pos2(x, (safe_top + safe_bottom - height) * 0.5),
+        egui::vec2(width, height),
+    )
+}
+
 pub(super) fn native_panel_callout_arrow_direction(left: bool, open: bool) -> f32 {
     let inward = if left { 1.0 } else { -1.0 };
     if open { -inward } else { inward }
@@ -2226,6 +2263,59 @@ pub(super) fn draw_native_panel_callout(
                 "情報パネルを開閉"
             })
             .clicked();
+    });
+    clicked
+}
+
+pub(super) fn draw_native_touch_panel_handle(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    left: bool,
+) -> bool {
+    let mut clicked = false;
+    egui::Area::new(egui::Id::new(if left {
+        "native_left_touch_panel_handle"
+    } else {
+        "native_right_touch_panel_handle"
+    }))
+    .order(crate::ui_helpers::PANEL_CALLOUT_ORDER)
+    .fixed_pos(rect.min)
+    .show(ctx, |ui| {
+        ui.set_min_size(rect.size());
+        let local_rect = egui::Rect::from_min_size(ui.min_rect().min, rect.size());
+        let response = ui.interact(
+            local_rect,
+            egui::Id::new(if left {
+                "native_left_touch_panel_handle_hit"
+            } else {
+                "native_right_touch_panel_handle_hit"
+            }),
+            egui::Sense::click(),
+        );
+        let fill = if response.hovered() {
+            egui::Color32::from_rgba_unmultiplied(65, 125, 205, 235)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(35, 70, 115, 210)
+        };
+        ui.painter().rect_filled(local_rect, 4.0, fill);
+        ui.painter().rect_stroke(
+            local_rect,
+            4.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(95, 175, 255)),
+            egui::StrokeKind::Inside,
+        );
+        let center = local_rect.center();
+        let direction = native_panel_callout_arrow_direction(left, false);
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(center.x + direction * 5.5, center.y),
+                egui::pos2(center.x - direction * 5.5, center.y - 8.0),
+                egui::pos2(center.x - direction * 5.5, center.y + 8.0),
+            ],
+            egui::Color32::WHITE,
+            egui::Stroke::NONE,
+        ));
+        clicked = response.hover_tip_dark("パネルを開く").clicked();
     });
     clicked
 }

@@ -172,10 +172,21 @@ callout は実際にクリックする UI なので、表示中の bar rect だ�
 ClickToShow の左右パネルには明示的な × を置き、callout 矢印は開状態で外向きへ反転する。
 VST3 パネル表示中は callout を描画せず、HUD region にも含めない。
 
+Phase 3 Step 3h では、native touch の session-only chrome latch 中だけ左右端へ 48pt 幅の
+パネルハンドルを追加した。ハンドルの描画 rect をそのまま `compute_hud_regions()` の interactive
+region に含めるため、OS hit-test が HUD HWND を選び、HUD-source stream は Phase 3 Step 1 の規約どおり
+幾何を再判定せず `WidgetPassthrough` になる。presenter tap zone や最寄り widget を探す resolver は
+追加していない。ラッチ OFF、VST / 中央モーダル / tile / navigation preview 中は region も出さない。
+左パネルの presenter-local open は既存 bool から `MetadataPanelOpenState` へ置き換え、App-owned の
+右パネルと同じく pointer / touch owner を区別する。開いた側のハンドルだけを消し、反対側は残す。
+touch owner がある状態で presenter 面のタップが確定した場合は左右の touch-owned state を閉じ、
+その `SeekRelative` / `ToggleChrome` command を破棄する。既存 mouse hover latch と ClickToShow
+callout の可視判定・描画・region は変更しない。
+
 **Region 計算とアクティベーション検出**:
 
 `NativeEguiOverlay::compute_hud_regions` が egui run 末尾で表示中の各 UI 要素の rect を集めて返す
-(= 上 hover bar / 下 HUD / right panel / jump panel / ClickToShow callout / VST3 panel / speed popup / bookmark editor /
+(= 上 hover bar / 下 HUD / right panel / jump panel / touch panel handle / ClickToShow callout / VST3 panel / speed popup / bookmark editor /
 normalize blocker / tile overlay / seek hover thumbnail / checkmark)。**activation zone** (= bar
 非表示時の hover 検出範囲、画面上下端の帯) は region に **含めない** — 含めると bar 非表示時に VST の
 ノブが上下端と重なったとき入力を奪うため。

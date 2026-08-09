@@ -904,6 +904,25 @@ press / release フレームで同じ widget ID と矩形を保つため、relea
 `PointerGone` が来ても click completion に到達することを kittest で確認した (§6-4)。
 初回オーバーレイヘルプによる発見可能性の補強は次ステップに残す。
 
+#### Phase 3 Step 3h 実装記録 (2026-08-09)
+
+- 動画 native overlay にも、`NativeTouchAdapter::chrome_latched()` が ON の間だけ左右端へ
+  48pt 幅のタッチ専用ハンドルを描く。上バー直下の panel top (56pt) と下 64pt の HUD の
+  間だけを使い、
+  右パネルを表示できるメタデータが無い場合は右ハンドルを出さない
+- ハンドル rect は描画と同じ helper から `compute_hud_regions()` へ加える。これにより OS の
+  hit-test が HUD HWND を選び、Phase 3 Step 1 の HUD-source `WidgetPassthrough` で通常の
+  egui click になる。presenter の tap zone や新しい hit resolver は追加していない
+- 左の既存 session bool は `MetadataPanelOpenState` に置き換え、右の App-owned state と同じく
+  `ByPointer` / `ByTouchHandle` を区別する。開いた側のハンドルだけを描画・HUD region の両方から
+  外し、反対側は閉じていれば残す。左の選択中タブは変更しない
+- touch-owned パネルが開いている間に presenter 面のタップから `ToggleChrome` / `SeekRelative`
+  が確定した場合は、左右の touch owner を一つの modal group として閉じ、その command を破棄する。
+  pointer-owned 側は閉じず、同じタップをシークやクローム toggle に再利用しない
+- `side_panel_callout_visibility()` と既存 callout の描画・region 計算は変更していない。
+  ラッチ OFF ではハンドルの描画も region も無く、`MIV_DISABLE_TOUCH_GESTURES=1` ではラッチを
+  作る touch ownership 自体が無効になるため従来の mouse 経路だけに戻る
+
 #### (2) パネル内スクロールは既に動く
 
 egui の既定 `ScrollSource::ALL` は `drag: true` で、コンテンツドラッグと慣性スクロールを
