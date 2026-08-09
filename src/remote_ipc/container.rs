@@ -100,6 +100,11 @@ fn remote_auto_trim_cache_key(
     })
 }
 
+struct ActivePagePrefetch {
+    address: RemoteAddress,
+    cancel: Arc<AtomicBool>,
+}
+
 pub(super) struct ContainerEngine {
     settings: Arc<crate::settings::Settings>,
     listing_settings: RemoteListingSettingsSource,
@@ -116,7 +121,7 @@ pub(super) struct ContainerEngine {
     remote_ai_native_cache: Mutex<RemoteAiNativeCache>,
     comic_stamp_cache: Mutex<HashMap<String, Option<Arc<comic_core::RgbaOverlay>>>>,
     session: Option<super::session::SessionHandle>,
-    page_prefetch_cancels: Mutex<Vec<Arc<AtomicBool>>>,
+    page_prefetches: Mutex<Vec<ActivePagePrefetch>>,
 }
 
 enum AdjustmentSettingsSource {
@@ -633,7 +638,7 @@ impl ContainerEngine {
             remote_ai_native_cache: Mutex::new(RemoteAiNativeCache::default()),
             comic_stamp_cache: Mutex::new(HashMap::new()),
             session,
-            page_prefetch_cancels: Mutex::new(Vec::new()),
+            page_prefetches: Mutex::new(Vec::new()),
         }
     }
     fn adjustment_render_settings(
@@ -960,19 +965,30 @@ impl ContainerEngine {
     fn begin_page_render(
         &self,
         priority: PagePriority,
+        address: &RemoteAddress,
+        render_context: Option<&RemotePageRenderContext>,
         session_cancel: Option<Arc<AtomicBool>>,
     ) -> Arc<AtomicBool> {
         let cancel = session_cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let mut prefetches = self
-            .page_prefetch_cancels
+            .page_prefetches
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if priority == PagePriority::Foreground {
-            for prefetch in prefetches.drain(..) {
-                prefetch.store(true, Ordering::Relaxed);
-            }
+            let spread_partner = render_context.and_then(|context| context.spread_partner.as_ref());
+            prefetches.retain(|prefetch| {
+                let needed = prefetch.address == *address
+                    || spread_partner.is_some_and(|partner| prefetch.address == *partner);
+                if !needed {
+                    prefetch.cancel.store(true, Ordering::Relaxed);
+                }
+                needed
+            });
         } else {
-            prefetches.push(Arc::clone(&cancel));
+            prefetches.push(ActivePagePrefetch {
+                address: address.clone(),
+                cancel: Arc::clone(&cancel),
+            });
         }
         cancel
     }
@@ -982,10 +998,10 @@ impl ContainerEngine {
             return;
         }
         let mut prefetches = self
-            .page_prefetch_cancels
+            .page_prefetches
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        prefetches.retain(|active| !Arc::ptr_eq(active, cancel));
+        prefetches.retain(|active| !Arc::ptr_eq(&active.cancel, cancel));
     }
 
     pub(super) fn container(&self, request: ContainerRequest) -> ContainerResponse {
@@ -2018,7 +2034,12 @@ impl ContainerEngine {
             Ok(plan) => plan,
             Err(error) => return PageResponse::Error(error),
         };
-        let cancel = self.begin_page_render(priority, session_cancel);
+        let cancel = self.begin_page_render(
+            priority,
+            &request.address,
+            request.render_context.as_ref(),
+            session_cancel,
+        );
         let load_kind = if view_trim_plan.requires_auto_detection() {
             RemoteImageLoadKind::CompositedPageWithAutoTrim
         } else {
@@ -5254,19 +5275,100 @@ mod tests {
         assert_eq!(result.pixels, source.pixels);
     }
 
+    fn page_render_test_address(name: &str) -> RemoteAddress {
+        RemoteAddress::file(format!(r"C:\books\{name}.jpg"))
+    }
+
     #[test]
-    fn concurrent_prefetches_do_not_cancel_each_other_and_foreground_cancels_all() {
+    fn spread_partner_prefetch_completes_when_other_page_starts_in_foreground() {
         let engine = ContainerEngine::new(crate::settings::Settings::default());
-        let first = engine.begin_page_render(PagePriority::Prefetch, None);
-        let second = engine.begin_page_render(PagePriority::Prefetch, None);
+        let partner = page_render_test_address("left");
+        let requested = page_render_test_address("right");
+        let partner_prefetch =
+            engine.begin_page_render(PagePriority::Prefetch, &partner, None, None);
+        let render_context = RemotePageRenderContext {
+            context_address: page_render_test_address("book"),
+            display_slot: RemotePageDisplaySlot::SpreadRight,
+            spread_partner: Some(partner),
+        };
+
+        assert!(!partner_prefetch.load(Ordering::Relaxed));
+        let foreground = engine.begin_page_render(
+            PagePriority::Foreground,
+            &requested,
+            Some(&render_context),
+            None,
+        );
+
+        assert!(!partner_prefetch.load(Ordering::Relaxed));
+        assert!(!foreground.load(Ordering::Relaxed));
+        engine.finish_page_render(PagePriority::Prefetch, &partner_prefetch);
+        assert!(
+            engine
+                .page_prefetches
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn foreground_cancels_unrelated_prefetch() {
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let unrelated = page_render_test_address("unrelated");
+        let requested = page_render_test_address("requested");
+        let prefetch = engine.begin_page_render(PagePriority::Prefetch, &unrelated, None, None);
+
+        engine.begin_page_render(PagePriority::Foreground, &requested, None, None);
+
+        assert!(prefetch.load(Ordering::Relaxed));
+        engine.finish_page_render(PagePriority::Prefetch, &prefetch);
+        assert!(
+            engine
+                .page_prefetches
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn single_page_foreground_preserves_matching_prefetch() {
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let requested = page_render_test_address("requested");
+        let matching = engine.begin_page_render(PagePriority::Prefetch, &requested, None, None);
+
+        engine.begin_page_render(PagePriority::Foreground, &requested, None, None);
+
+        assert!(!matching.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn finishing_prefetch_removes_only_its_registration() {
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let address = page_render_test_address("requested");
+        let first = engine.begin_page_render(PagePriority::Prefetch, &address, None, None);
+        let second = engine.begin_page_render(PagePriority::Prefetch, &address, None, None);
 
         assert!(!first.load(Ordering::Relaxed));
         assert!(!second.load(Ordering::Relaxed));
-        let foreground = engine.begin_page_render(PagePriority::Foreground, None);
+        engine.finish_page_render(PagePriority::Prefetch, &first);
+        let prefetches = engine
+            .page_prefetches
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(prefetches.len(), 1);
+        assert!(Arc::ptr_eq(&prefetches[0].cancel, &second));
+        drop(prefetches);
 
-        assert!(first.load(Ordering::Relaxed));
-        assert!(second.load(Ordering::Relaxed));
-        assert!(!foreground.load(Ordering::Relaxed));
+        engine.finish_page_render(PagePriority::Prefetch, &second);
+        assert!(
+            engine
+                .page_prefetches
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
     }
 
     #[test]

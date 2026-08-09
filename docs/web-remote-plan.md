@@ -1641,9 +1641,11 @@ HTTP 503 `ipc_busy` / `admission_busy` は計画無効ではなく一時的な�
 ブラウザの `PageResourceCache`、remote-web HTTP admission は同時最大 2 件とする。本体の
 remote heavy worker は利用者設定の半分・最大 3 本で、prefetch 上限を
 `min(heavy_workers - 1, 2)` とし、常に foreground 1 本を予約する。同時 prefetch 同士は
-互いを cancel せず、foreground 到着時は進行中 prefetch をすべて cancel する。ブラウザ側も
-foreground が来た時点で無関係な prefetch を abort して直接開始する。このため同時実行数を
-上げても foreground が prefetch の後ろへ並ぶ構造にはしない。
+互いを cancel しない。本体の進行中 prefetch は対象 `RemoteAddress` と cancel token を組で
+登録し、foreground 到着時は自ページと `render_context.spread_partner` に一致する登録を保持して、
+無関係な prefetch だけを cancel する。ブラウザ側も foreground が来た時点で無関係な prefetch を
+abort して直接開始する。このため同時実行数を上げても foreground が prefetch の後ろへ並ぶ構造には
+しない。
 
 `page_display` の実機ログにより、前景が進行中の先読みへ相乗りした直後、新しい先読み計画が
 現在 group の key を含まないため、その通信を中止していたことが 2026-08-09 に確定した。
@@ -1654,6 +1656,24 @@ prefetch の中止も、既に前景待機者がいる通信は対象外とす�
 `awaitWithAbort` でその待機だけを従来どおり中止し、共有通信の controller とは分離する。
 503 `ipc_busy` に相乗りした前景が admission 失敗を継承せず直接 foreground 取得へ進む契約も維持する。
 現在 group を `schedule` の計画へ足すだけの例外処理は採らない。
+
+同じ実機ログの追跡で、本体側にも foreground 開始時に登録済み prefetch を一律 cancel する経路が
+あり、見開きの片方へ相乗り中にもう片方を foreground 取得すると、相乗り先を本体自身が止めて
+`MediaErrorCode::Busy` にしていたことが確定した。登録を token だけの列から
+`{ address, cancel }` へ変え、foreground がこれから使う自ページと見開き相方を所有対象として保護する。
+単ページでも同じ address の prefetch は保護し、対象外だけを従来どおり止める。完了時の解除は
+cancel token の `Arc` identity で当該登録だけを除く。
+
+heavy worker 1 本の foreground 予約により、prefetch を全件止めて入場枠を作る必要はない。ただし
+無関係な進行中 prefetch は decode、archive / PDF、I/O など foreground と共有する下位資源を消費し、
+遷移後は stale work にもなるため、対象を識別した選択的 cancel は維持する。
+
+ページの `miv_media_busy` に対する追加の自動再試行はこの増分では入れない。この Busy は core queue の
+一時的な入場拒否だけでなく、無関係になった prefetch の意図的 cancel と session 失効も同じ code で
+表す。ページ単位で一律再試行すると、優先度制御が止めた stale prefetch を IPC 内で再生成してしまう。
+現在表示に必要な prefetch を誤って cancel する原因は所有修正で除き、foreground 枠も予約済みである。
+将来 retry を広げる場合は、入場拒否と所有終了による cancel を protocol 上で型分けしてから行う。
+既存の HTTP admission 503 `ipc_busy` の計画内再投入は維持する。
 
 要求画像を表示できなかった場合の位置不整合は、この所有修正とは分けて未解決とする。
 `fetch_failed`、decode / apply failure、identity / generation 拒否でも `loadGroup()` は `false` を返すが、
