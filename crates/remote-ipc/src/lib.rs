@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 38;
+pub const PROTOCOL_VERSION: u32 = 39;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -1326,6 +1326,7 @@ pub struct VideoStreamStartPayload {
     pub duration_secs: f64,
     pub source_origin_secs: f64,
     pub buffer_target_secs: f64,
+    pub has_video: bool,
     pub encoder: String,
     pub video_size: VideoStreamSize,
     pub codecs: String,
@@ -1423,6 +1424,7 @@ pub struct VideoStreamStatePayload {
     pub buffered_secs: f64,
     pub effective_bitrate_bps: u64,
     pub ended: bool,
+    pub has_video: bool,
     pub encoder: String,
     pub video_size: VideoStreamSize,
     pub codecs: String,
@@ -2150,6 +2152,7 @@ mod tests {
             buffered_secs: 60.0,
             effective_bitrate_bps: 1_500_000,
             ended: false,
+            has_video: true,
             encoder: "nvenc".to_owned(),
             video_size: VideoStreamSize {
                 width: 1920,
@@ -2321,13 +2324,13 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v38_absolute_path_page_identity_and_session_state_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 38);
+    fn protocol_v39_audio_only_stream_shape_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 39);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
                 owner: test_owner("test-client"),
-                address: RemoteAddress::file("C:/Movies/sample.mp4"),
+                address: RemoteAddress::file("C:/Music/sample.flac"),
                 quality: VideoStreamQuality::Standard,
             },
             ClientMessage::VideoStreamPlaylist {
@@ -2379,12 +2382,13 @@ mod tests {
                     duration_secs: 284.5,
                     source_origin_secs: 0.0,
                     buffer_target_secs: 60.0,
-                    encoder: "software".to_owned(),
+                    has_video: false,
+                    encoder: "audio-only".to_owned(),
                     video_size: VideoStreamSize {
-                        width: 1920,
-                        height: 1080,
+                        width: 0,
+                        height: 0,
                     },
-                    codecs: "avc1.640028,mp4a.40.2".to_owned(),
+                    codecs: "mp4a.40.2".to_owned(),
                     audio_processing: VideoStreamAudioProcessing {
                         vst3_requested: true,
                         vst3_active: false,

@@ -1003,6 +1003,44 @@ select {
   touch-action: none;
 }
 
+.stream-video[hidden] {
+  display: none;
+}
+
+.audio-stream-surface {
+  display: grid;
+  width: min(560px, calc(100vw - 48px));
+  justify-items: center;
+  gap: 18px;
+  color: #f5f7fc;
+  text-align: center;
+}
+
+.audio-stream-surface[hidden] {
+  display: none;
+}
+
+.audio-stream-symbol {
+  display: grid;
+  width: 112px;
+  height: 112px;
+  place-items: center;
+  border: 1px solid rgb(255 255 255 / 18%);
+  border-radius: 50%;
+  background: rgb(30 38 55 / 72%);
+  box-shadow: 0 16px 48px rgb(0 0 0 / 38%);
+  font-size: 56px;
+}
+
+.audio-stream-title {
+  max-width: 100%;
+  overflow: hidden;
+  font-size: clamp(18px, 4vw, 26px);
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .stream-video {
   display: block;
   width: 100%;

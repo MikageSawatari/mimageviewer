@@ -28,10 +28,15 @@ pub(crate) struct StreamingSessionId(pub(crate) u64);
 pub(crate) struct StreamingGeneration(pub(crate) u64);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StreamReadyInfo {
+pub(crate) struct StreamReadyVideoInfo {
     pub(crate) encoder: H264EncoderKind,
     pub(crate) output_dimensions: OutputDimensions,
-    pub(crate) video_bitrate_bps: u64,
+    pub(crate) bitrate_bps: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamReadyInfo {
+    pub(crate) video: Option<StreamReadyVideoInfo>,
     pub(crate) audio_bitrate_bps: u64,
     pub(crate) codecs: String,
 }
@@ -167,9 +172,11 @@ fn publish_generation_worker_completion(
 
 fn stream_ready_info(info: ClocklessOutputInfo) -> StreamReadyInfo {
     StreamReadyInfo {
-        encoder: info.encoder,
-        output_dimensions: info.output_dimensions,
-        video_bitrate_bps: info.video_bitrate_bps,
+        video: info.video.map(|video| StreamReadyVideoInfo {
+            encoder: video.encoder,
+            output_dimensions: video.output_dimensions,
+            bitrate_bps: video.bitrate_bps,
+        }),
         audio_bitrate_bps: info.audio_bitrate_bps,
         codecs: info.codecs,
     }
@@ -490,9 +497,7 @@ impl RemoteVideoStreamingSession {
         if segment_capacity == 0 {
             return Err("remote streaming segment capacity must be non-zero".to_owned());
         }
-        if !inputs.has_video || !inputs.has_audio {
-            return Err("remote streaming requires both video and audio streams".to_owned());
-        }
+        validate_remote_stream_tracks(inputs)?;
         let generation = StreamingGeneration(1);
         let current = StreamingGenerationHandle::start(
             generation,
@@ -603,6 +608,16 @@ impl RemoteVideoStreamingSession {
     }
 }
 
+fn validate_remote_stream_tracks(
+    inputs: crate::video::RemoteStreamStartInputs,
+) -> Result<(), String> {
+    if inputs.has_audio {
+        Ok(())
+    } else {
+        Err("remote streaming requires an audio stream".to_owned())
+    }
+}
+
 fn run_generation_worker(
     config: GenerationConfig,
     control: &ClocklessTranscodeControl,
@@ -637,6 +652,24 @@ mod tests {
     use crate::video::stream::timeline::StreamTimeline;
 
     struct MarkDroppedOnDrop(Arc<AtomicBool>);
+
+    fn stream_inputs(has_video: bool, has_audio: bool) -> crate::video::RemoteStreamStartInputs {
+        crate::video::RemoteStreamStartInputs {
+            duration_secs: 60.0,
+            has_video,
+            has_audio,
+            source_origin_secs: 0.0,
+            normalize_gain: 1.0,
+        }
+    }
+
+    #[test]
+    fn audio_only_and_av_use_the_same_session_track_gate() {
+        assert!(validate_remote_stream_tracks(stream_inputs(true, true)).is_ok());
+        assert!(validate_remote_stream_tracks(stream_inputs(false, true)).is_ok());
+        assert!(validate_remote_stream_tracks(stream_inputs(false, false)).is_err());
+        assert!(validate_remote_stream_tracks(stream_inputs(true, false)).is_err());
+    }
 
     impl Drop for MarkDroppedOnDrop {
         fn drop(&mut self) {

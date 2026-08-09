@@ -476,20 +476,20 @@ remote streaming UI は `Opening` / `Starting` / `Streaming` の全状態でこ�
 headless worker は開始、世代最初の frame、`FirstFrameReady` 送信をログに残し、engine 側も
 各 readiness event の受領後に video/audio の required/ready を記録する。
 
-### mIV Remote 時計なし transcode 駆動部 (移行 1/3、未配線)
+### mIV Remote 時計なし transcode 駆動部
 
 `clockless_transcode.rs` は `VideoPlayer` / `engine/` / audio device と独立して同じファイルを
-FFmpeg で開く。補助 decoder の共通 helper で D3D11VA decode を試し、decoded frame は private
-video tap channel を介して既存 `VideoStreamEncoder::submit` へ、音声は 48kHz stereo f32 へ
-resample して既存 AAC encoder へ渡す。encoded packet は独立 A/V interleave owner から既存
-`Fmp4Segmenter` へ投入する。既存 remote session、decoder-output tap、headless player の状態や
-queue は参照しない。
+FFmpeg で開く。timed video track がある場合だけ、補助 decoder の共通 helper で D3D11VA decode を
+試し、decoded frame を private video tap channel 経由で既存 `VideoStreamEncoder::submit` へ渡す。
+音声は映像の有無にかかわらず 48kHz stereo f32 へ resample して既存 AAC encoder へ渡す。
+この `has_video` 判定だけが media layout の分岐であり、playlist、segment ring、seek generation、
+session owner、生存 timeout、放置 timeout は A/V と audio-only で同じ実装を使う。
 
 速度は wall clock で pace せず、完成 segment の ahead window だけで制御する。
 `ClocklessTranscodeControl` は producer/consumer sequence と capacity を 1 つの mutex state に
 保持し、空きが無ければ `Condvar` wait、consumer release で resume する。cancel は各 FFmpeg
-段の前後で同じ flag を検査するため、長い段の途中へ別 state field を持ち込まない。現段階は
-`dev-tools` の `clockless_transcode_bench` だけから起動し、本番配線と終端 flush は次段で行う。
+段の前後で同じ flag を検査するため、長い段の途中へ別 state field を持ち込まない。本番の
+remote session と `dev-tools` の `clockless_transcode_bench` は同じ driver と終端 flush を使う。
 
 ## モジュール構成 (現行責務)
 
@@ -499,7 +499,7 @@ queue は参照しない。
 ```
 src/video/
 ├── mod.rs                  # VideoPlayer 公開 API、UI tick、NativeVideoOutput 統合
-├── clockless_transcode.rs  # Remote 用の独立・時計なし demux/decode/encode 駆動部 (未配線)
+├── clockless_transcode.rs  # Remote 用の独立・時計なし demux/decode/encode 駆動部
 ├── decoder.rs              # demux + video/audio decode の 3-thread 実装
 ├── audio.rs                # cpal 出力、audio-pump、VST3 経由、back-pressure
 ├── audio_diagnostics.rs    # audio 診断 snapshot / perf 情報

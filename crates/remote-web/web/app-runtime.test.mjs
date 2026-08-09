@@ -1006,7 +1006,7 @@ test("tapping a video grid tile preserves the video route", () => {
   assert.equal(resolveMediaOpenRoute("video", { kind: "image", address }, 0), null);
 });
 
-test("tapping an audio grid tile shows the shared unsupported notice route", () => {
+test("tapping an audio grid tile opens the shared media viewer route", () => {
   const address = {
     path: testPath("music/track.flac"),
     subresource: { kind: "file" },
@@ -1025,20 +1025,17 @@ test("tapping an audio grid tile shows the shared unsupported notice route", () 
 
   assert.equal(dispatched.length, 1);
   assert.deepEqual(dispatched[0].requested.payload, {
-    kind: "unsupported",
-    entryKind: "audio",
+    kind: "media",
+    mediaKind: "audio",
+    address,
     entryIndex: 2,
   });
-  assert.equal(
-    unsupportedRemoteEntryMessage("audio"),
-    "この端末では音声を再生できません。"
-  );
+  assert.equal(unsupportedRemoteEntryMessage("audio"), "");
   const notice = new FakeElement("p");
   notice.hidden = true;
-  assert.equal(showUnsupportedRemoteEntryNotice(notice, "audio"), true);
-  assert.equal(notice.hidden, false);
-  assert.equal(notice.textContent, "この端末では音声を再生できません。");
-  assert.equal(resolveMediaOpenRoute("audio", { kind: "audio", address }, -1), null);
+  assert.equal(showUnsupportedRemoteEntryNotice(notice, "audio"), false);
+  assert.equal(notice.hidden, true);
+  assert.equal(resolveMediaOpenRoute("audio", { kind: "audio", address }, -1), "audio");
 });
 
 test("tapping an archive grid tile shows the same shared unsupported notice route", () => {

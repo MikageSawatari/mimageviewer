@@ -142,18 +142,24 @@ impl SegmentRing {
 
 /// CODECS は media playlist ではなく Master Playlist の
 /// EXT-X-STREAM-INF に属する属性なので、標準に従って 2 層を明示する。
-pub(crate) fn master_playlist(codecs: &str, bandwidth_bps: u64, width: u32, height: u32) -> String {
+pub(crate) fn master_playlist(
+    codecs: &str,
+    bandwidth_bps: u64,
+    dimensions: Option<(u32, u32)>,
+) -> String {
+    let resolution = dimensions
+        .map(|(width, height)| format!(",RESOLUTION={width}x{height}"))
+        .unwrap_or_default();
     format!(
         r#"#EXTM3U
 #EXT-X-VERSION:7
 #EXT-X-INDEPENDENT-SEGMENTS
-#EXT-X-STREAM-INF:BANDWIDTH={},CODECS="{}",RESOLUTION={}x{}
+#EXT-X-STREAM-INF:BANDWIDTH={},CODECS="{}"{}
 media.m3u8
 "#,
         bandwidth_bps.max(1),
         codecs,
-        width,
-        height
+        resolution,
     )
 }
 
@@ -239,11 +245,18 @@ mod tests {
 
     #[test]
     fn codecs_attribute_is_on_the_master_playlist() {
-        let playlist = master_playlist("avc1.42c01f", 400_000, 640, 360);
+        let playlist = master_playlist("avc1.42c01f", 400_000, Some((640, 360)));
         assert!(playlist.contains(
             r#"#EXT-X-STREAM-INF:BANDWIDTH=400000,CODECS="avc1.42c01f",RESOLUTION=640x360"#
         ));
         assert!(playlist.ends_with("media.m3u8\n"));
+    }
+
+    #[test]
+    fn audio_only_master_playlist_omits_resolution() {
+        let playlist = master_playlist("mp4a.40.2", 96_000, None);
+        assert!(playlist.contains(r#"#EXT-X-STREAM-INF:BANDWIDTH=96000,CODECS="mp4a.40.2""#));
+        assert!(!playlist.contains("RESOLUTION="));
     }
 
     #[test]

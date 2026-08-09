@@ -342,7 +342,9 @@ audible PTS、session 原点、先行量、PDC、chunk duration、許容量、�
 - chunk 境界は `PlanarPcmAssembler` に蓄積し、AAC 固定 1024 samples ごとにだけ frame を
   送る。333 / 901 / 17 samples 等の不一致境界を跨いで、padding を除く全 sample が欠落・
   重複なしで復元できる unit test を置いた
-- segmenter は video stream 0 + audio stream 1 を同じ fMP4 へ多重化する。master playlist の
+- segmenter は video stream 0 + audio stream 1 を同じ fMP4 へ多重化する。audio-only では
+  AAC を stream 0 とし、同じ muxer / ring / playlist 実装が AAC DTS の 2 秒境界で fragment を
+  確定する。master playlist の
   `CODECS` は video SPS と AAC AudioSpecificConfig の実出力から
   `avc1.PPCCLL,mp4a.40.2` を作り、bandwidth は両 encoder の実効 bitrate の和とする
 - AAC encoder の先頭 priming packet は DTS -1024 なので、増分 2 の `empty_moov` は
@@ -527,7 +529,7 @@ thumbnail を含めない。
   segmenter の typed `None` を保持して HTTP 503 または上限付き wait へ写像し、200 では
   必ず非空の init、または init と最初の media segment を参照できる playlist を返す
 
-### 6.2 IPC (動画 API v15、timeout v17、thumbnail v18、時計なし v19、終端 v20、VST 状態 v21)
+### 6.2 IPC (動画 API v15、timeout v17、thumbnail v18、時計なし v19、終端 v20、VST 状態 v21、audio-only v39)
 
 既存の長寿命 duplex 多重化接続 ([web-remote-plan.md](web-remote-plan.md) §9.5-9.6) に
 `ClientMessage` / `ServerMessage` の variant を追加する。**セグメントは pull 型**とし、
@@ -536,7 +538,7 @@ remote-web が HTTP 要求を受けた時に取りに行く。push 型の非同�
 
 | request | response |
 |---|---|
-| `VideoStreamStart { address, quality }` | `{ session, generation, duration_secs, source_origin_secs, buffer_target_secs, encoder, video_size, audio_processing, end_behavior }` |
+| `VideoStreamStart { address, quality }` | `{ session, generation, duration_secs, source_origin_secs, buffer_target_secs, has_video, encoder, video_size, audio_processing, end_behavior }` |
 | `VideoStreamControl { session, action }` | `SessionStatus` |
 | `VideoStreamSeek { session, position_secs }` | `{ generation }` |
 | `VideoStreamThumbnail { session, position_secs }` | `Pending` / 実 frame PTS + WebP / `Cleared` |
@@ -547,8 +549,9 @@ remote-web が HTTP 要求を受けた時に取りに行く。push 型の非同�
 
 セグメント IPC は既存の **heavy queue ではなく専用 lane** に置く。エンコード済みバイトを
 返すだけで CPU をほぼ使わないため、サムネイル生成やページレンダリングと同じ枠で待たせると
-再生が途切れる。`address` は既存の `RemoteAddress` をそのまま使い、本体側で favorite
-allowlist と canonical containment を再検証する ([web-remote-plan.md](web-remote-plan.md) §12.1)。
+再生が途切れる。`address` は既存の `RemoteAddress` をそのまま使い、本体側で
+お気に入りへの登録有無とは独立に、絶対パス・実在・対象種別を再検証して canonicalize する
+([web-remote-plan.md](web-remote-plan.md) §12.1)。
 
 `VideoStreamStart` の `address` は照合用ではなく、再生対象を指定する正本である。本体 UI
 thread は headless `VideoPlayer` を開き、metadata、duration、pending resume、normalize gain が
@@ -565,6 +568,8 @@ source origin は確定している。pause のままでは frame/audio を再�
 入力ではなく、門には含めない。normalize gain は player open 前の DB lookup で決まり、
 remote player は autoplay=false のため deferred normalize scan を開始しない。門を通る際に
 これらを同じ typed snapshot へ固定し、generation は player の後続 transport 状態を再読しない。
+音声 track は必須、timed video track は任意とする。後者の有無だけで video decode / H.264 encode を
+有効化し、seek、generation、playlist、segment、session owner の実装は分けない。
 
 start の wall-clock 予算は `mimageviewer_ipc::VIDEO_STREAM_START_BUDGET` の **15 秒だけ**を
 正本とする。本体が IPC request を stream queue へ積んだ時刻から deadline を一度だけ作り、
@@ -1057,7 +1062,6 @@ CPU に戻さず GPU scale して NVENC へ渡す経路が次の性能投資候�
 ### 第 2 段 (第 1 段の実測後に判断)
 
 - 映像補正 (grade pipeline) の反映 — presenter とは別のレンダーターゲットへ同じパスを通す
-- 音楽ファイル / 動画の音声モードを同じ HLS 経路で配信 (audio-only variant)
 - 字幕の焼き込み
 - LL-HLS による遅延短縮 (部分セグメント + blocking playlist reload)
 - HDR トーンマッピング

@@ -39,6 +39,16 @@ const PLAYLIST_RECOVERY_BACKOFF_MAX_MS = 2000;
 const SEEK_THUMBNAIL_POLL_MS = 120;
 const SEEK_THUMBNAIL_MATCH_TOLERANCE_SECS = 1.25;
 const VIDEO_LOOP_BOUNDARY_TOLERANCE_SECS = 0.020;
+const AUDIO_QUALITY_TRAFFIC = Object.freeze({
+  minimum: "約 29 MB / 時",
+  low: "約 43 MB / 時",
+  standard: "約 58 MB / 時",
+  high: "約 72 MB / 時",
+});
+
+function qualityTraffic(preset, hasVideo) {
+  return hasVideo ? preset.traffic : (AUDIO_QUALITY_TRAFFIC[preset.id] ?? preset.traffic);
+}
 
 export const VIDEO_PANEL_TABS = Object.freeze([
   Object.freeze({ id: "functions", label: "機能" }),
@@ -1081,16 +1091,19 @@ class VideoStreamMenu {
   }
 
   definition(page) {
+    const media = this.mediaState();
+    const mediaNoun = media.hasVideo === false ? "音声" : "動画";
+    const qualityNoun = media.hasVideo === false ? "音質" : "画質";
     if (page === "controls") {
       return {
-        title: "音量と画質",
+        title: `音量と${qualityNoun}`,
         actions: [
-          ["menu_back", "動画の操作へ戻る", "戻る"],
+          ["menu_back", `${mediaNoun}の操作へ戻る`, "戻る"],
           [CommandName.MEDIA_TOGGLE_PLAY, "再生 / 一時停止", "Space"],
           ...VIDEO_QUALITY_PRESETS.map((preset) => [
             CommandName.MEDIA_QUALITY,
-            `${preset.label} — ${preset.traffic}`,
-            "画質",
+            `${preset.label} — ${qualityTraffic(preset, media.hasVideo !== false)}`,
+            qualityNoun,
             { quality: preset.id },
           ]),
         ],
@@ -1101,12 +1114,11 @@ class VideoStreamMenu {
         volume: true,
       };
     }
-    const media = this.mediaState();
     return {
-      title: "動画の操作",
+      title: `${mediaNoun}の操作`,
       actions: [
         [CommandName.MEDIA_TOGGLE_PLAY, "再生 / 一時停止", "Space"],
-        ["menu_controls", "音量と画質", "通信量の目安を表示"],
+        ["menu_controls", `音量と${qualityNoun}`, "通信量の目安を表示"],
         [
           CommandName.TOGGLE_VIEWER_BARS,
           media.barsVisible === false ? "上下バーを表示" : "上下バーを隠す",
@@ -1120,7 +1132,7 @@ class VideoStreamMenu {
       shortcuts: [
         ["再生 / 一時停止", "Space"],
         ["10 秒戻る / 進む", "← / →"],
-        ["前 / 次の動画", "↑ / ↓"],
+        [`前 / 次の${mediaNoun}`, "↑ / ↓"],
         ["操作メニュー", "?"],
         ["全画面", "F11"],
       ],
@@ -1565,6 +1577,7 @@ export class VideoStreamViewer {
     this.publishVideoHealth = publishVideoHealth;
     this.getTelemetryDebugContext = getTelemetryDebugContext;
     this.quality = "standard";
+    this.hasVideo = entry.kind !== "audio";
     this.volume = 1;
     this.duration = 0;
     this.bufferTargetSecs = null;
@@ -1619,6 +1632,13 @@ export class VideoStreamViewer {
     this.video.setAttribute("playsinline", "");
     this.video.setAttribute("webkit-playsinline", "");
     this.video.setAttribute("aria-label", entry.name);
+    this.audioSurface = element("div", "audio-stream-surface");
+    this.audioSurface.setAttribute("role", "img");
+    this.audioSurface.setAttribute("aria-label", `音声: ${entry.name}`);
+    this.audioSurface.append(
+      textElement("span", "♪", "audio-stream-symbol"),
+      textElement("span", entry.name, "audio-stream-title")
+    );
     this.seekPreview = element("div", "video-seek-preview");
     this.seekPreview.hidden = true;
     this.seekPreview.setAttribute("role", "status");
@@ -1648,7 +1668,8 @@ export class VideoStreamViewer {
     this.notice.hidden = true;
     this.notice.setAttribute("role", "status");
     this.notice.setAttribute("aria-live", "polite");
-    this.stage.append(this.video, this.seekPreview, this.notice);
+    this.stage.append(this.video, this.audioSurface, this.seekPreview, this.notice);
+    this.setHasVideo(this.hasVideo);
 
     const top = element("div", "viewer-ui top");
     const close = textElement("button", "×", "viewer-button");
@@ -1664,7 +1685,7 @@ export class VideoStreamViewer {
     const bottom = element("div", "viewer-ui bottom video-stream-bottom");
     const previous = textElement("button", "‹", "viewer-button");
     previous.type = "button";
-    previous.setAttribute("aria-label", "前の動画");
+    previous.setAttribute("aria-label", entry.kind === "audio" ? "前の音声" : "前の動画");
     const seek = element("div", "viewer-seek video-stream-seek");
     this.counter = textElement("output", "0:00 / 0:00", "viewer-counter");
     this.seekInput = element("input", "viewer-seek-input");
@@ -1673,12 +1694,12 @@ export class VideoStreamViewer {
     this.seekInput.max = "0";
     this.seekInput.step = "0.1";
     this.seekInput.value = "0";
-    this.seekInput.setAttribute("aria-label", "動画の再生位置");
+    this.seekInput.setAttribute("aria-label", entry.kind === "audio" ? "音声の再生位置" : "動画の再生位置");
     this.diagnostics = textElement("div", "配信を開始しています…", "video-stream-diagnostics");
     seek.append(this.counter, this.seekInput, this.diagnostics);
     const next = textElement("button", "›", "viewer-button");
     next.type = "button";
-    next.setAttribute("aria-label", "次の動画");
+    next.setAttribute("aria-label", entry.kind === "audio" ? "次の音声" : "次の動画");
     bottom.append(previous, seek, next);
     this.root.append(this.stage, top, bottom);
 
@@ -2062,7 +2083,15 @@ export class VideoStreamViewer {
       volume: this.volume,
       playing: !this.video.paused,
       barsVisible: this.barsVisible,
+      hasVideo: this.hasVideo,
     };
+  }
+
+  setHasVideo(hasVideo) {
+    this.hasVideo = Boolean(hasVideo);
+    this.root.classList.toggle("audio-only-stream-viewer", !this.hasVideo);
+    this.video.hidden = !this.hasVideo;
+    this.audioSurface.hidden = this.hasVideo;
   }
 
   setBarsVisible(visible) {
@@ -2082,7 +2111,7 @@ export class VideoStreamViewer {
     this.lastServerMessage = "";
     this.lastDiagnosticMessage = "";
     this.playbackAttempts = newPlaybackAttemptStats();
-    this.showNotice("動画を準備しています。", "waiting");
+    this.showNotice(`${this.hasVideo === false ? "音声" : "動画"}を準備しています。`, "waiting");
     let started;
     try {
       // Start is a state-creating POST. A retryable 503 can be returned before the core admits
@@ -2104,6 +2133,7 @@ export class VideoStreamViewer {
     }
     if (this.destroyed) return;
     this.session = started.session;
+    if (typeof started.has_video === "boolean") this.setHasVideo(started.has_video);
     this.menu.setSession(this.session);
     this.generation = started.generation;
     let playlistUrl = started.playlist;
@@ -2527,7 +2557,7 @@ export class VideoStreamViewer {
     }
     if (requested.name === CommandName.MEDIA_QUALITY) {
       this.setQuality(requested.payload.quality).catch((error) => {
-        this.showOperationalError(error, "画質を変更できませんでした");
+        this.showOperationalError(error, `${this.hasVideo === false ? "音質" : "画質"}を変更できませんでした`);
       });
       return true;
     }
@@ -2711,6 +2741,7 @@ export class VideoStreamViewer {
     this.clearSeekThumbnailObjectUrl();
     this.renderSeekPreview();
     this.updateProgress();
+    if (!this.hasVideo) return request;
     const controller = this.seekThumbnailAbort;
     Promise.resolve(this.seekThumbnailClear)
       .then(() => this.pollSeekThumbnail(request, controller))
@@ -2908,7 +2939,7 @@ export class VideoStreamViewer {
   async setQuality(quality) {
     const preset = videoQualityPreset(quality);
     if (!this.session || this.destroyed || preset.id !== quality || quality === this.quality) return;
-    this.showNotice(`${preset.label}画質へ切り替えています。`, "waiting");
+    this.showNotice(`${preset.label}${this.hasVideo === false ? "音質" : "画質"}へ切り替えています。`, "waiting");
     const positionSecs = this.currentPosition();
     try {
       await this.apiPostJson(
@@ -2936,6 +2967,7 @@ export class VideoStreamViewer {
 
   applyServerState(mediaState) {
     this.lastState = mediaState;
+    if (typeof mediaState.has_video === "boolean") this.setHasVideo(mediaState.has_video);
     this.generation = mediaState.generation;
     this.duration = Math.max(0, Number(mediaState.duration_secs) || this.duration);
     this.bufferTargetSecs = Math.max(
@@ -3026,8 +3058,9 @@ export class VideoStreamViewer {
       ? `${(Number(source.effective_bitrate_bps) / 1_000_000).toFixed(1)} Mbps`
       : "";
     const preset = videoQualityPreset(this.quality);
+    const qualityNoun = this.hasVideo === false ? "音質" : "画質";
     this.diagnostics.textContent = [
-      `画質 ${preset.label} (${preset.traffic})`,
+      `${qualityNoun} ${preset.label} (${qualityTraffic(preset, this.hasVideo !== false)})`,
       dimensions,
       bitrate,
       this.audioProcessing.detail,
@@ -3351,10 +3384,12 @@ export class VideoStreamViewer {
         thresholdMs: WAITING_SUGGESTION_MS,
       });
       if (suggested) {
+        const qualityNoun = this.hasVideo === false ? "音質" : "画質";
+        const traffic = qualityTraffic(suggested, this.hasVideo !== false);
         this.showNotice(
-          `通信待ちが 3 秒続いています。${suggested.label}画質 (${suggested.traffic}) を試せます。`,
+          `通信待ちが 3 秒続いています。${suggested.label}${qualityNoun} (${traffic}) を試せます。`,
           "buffering",
-          `${suggested.label}画質にする`,
+          `${suggested.label}${qualityNoun}にする`,
           () => this.dispatch(
             command(CommandName.MEDIA_QUALITY, { quality: suggested.id }),
             { source: "touch", detail: "buffering_suggestion" }
@@ -3596,11 +3631,12 @@ export class VideoStreamViewer {
     if (this.remoteSessionState.blocksInteraction) return;
     this.rememberPlaybackError(error);
     const preset = videoQualityPreset(this.quality);
-    this.diagnostics.textContent = `画質 ${preset.label} (${preset.traffic})`;
+    const qualityNoun = this.hasVideo === false ? "音質" : "画質";
+    this.diagnostics.textContent = `${qualityNoun} ${preset.label} (${qualityTraffic(preset, this.hasVideo !== false)})`;
     this.showNotice(
       videoUserErrorMessage(
         { code: error?.code || "stream_start_failed" },
-        "動画を開始できませんでした"
+        `${this.hasVideo === false ? "音声" : "動画"}を開始できませんでした`
       ),
       "error",
       "再試行",

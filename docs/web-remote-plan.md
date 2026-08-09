@@ -692,7 +692,7 @@ worker、request id 付き応答までを往復させ、両端の pipe 作成 fl
 本体側にも専用の非表示設定がないため常に表示する。既知フォルダは取得できた実在フォルダだけを
 載せ、`folder_tree::path_eq` で重複を除く。
 
-列挙条件・順序・区切りは本体の共通 read model が所有する。remote-web は protocol v38 の Home
+列挙条件・順序・区切りは本体の共通 read model が所有する。remote-web は protocol v38 以降の Home
 payload を順に描画するだけで、既知フォルダやドライブを独自に列挙しない。ドライブ一覧は本体 IPC
 が `available_drives()` を `RemoteEntry::Folder` へ写像する collection として返し、既知フォルダと
 各ドライブは Home payload の絶対 path を持つ folder entry から既存フォルダ route を開く。

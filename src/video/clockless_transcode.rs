@@ -96,10 +96,15 @@ impl ClocklessTranscodeOptions {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ClocklessOutputInfo {
+pub(crate) struct ClocklessVideoOutputInfo {
     pub(crate) encoder: super::stream::encoder::H264EncoderKind,
     pub(crate) output_dimensions: OutputDimensions,
-    pub(crate) video_bitrate_bps: u64,
+    pub(crate) bitrate_bps: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClocklessOutputInfo {
+    pub(crate) video: Option<ClocklessVideoOutputInfo>,
     pub(crate) audio_bitrate_bps: u64,
     pub(crate) codecs: String,
 }
@@ -891,12 +896,19 @@ impl ClocklessMux {
         Ok(())
     }
 
-    fn drain_ready(&mut self, segmenter: &mut Fmp4Segmenter) -> Result<Option<u64>, String> {
-        let Some(watermark) = self
-            .latest_video_dts_secs
-            .zip(self.latest_audio_end_secs)
-            .map(|(video, audio)| video.min(audio))
-        else {
+    fn drain_ready(
+        &mut self,
+        segmenter: &mut Fmp4Segmenter,
+        has_video: bool,
+    ) -> Result<Option<u64>, String> {
+        let watermark = if has_video {
+            self.latest_video_dts_secs
+                .zip(self.latest_audio_end_secs)
+                .map(|(video, audio)| video.min(audio))
+        } else {
+            self.latest_audio_end_secs
+        };
+        let Some(watermark) = watermark else {
             return Ok(None);
         };
         self.drain_while(segmenter, |dts| dts <= watermark)
@@ -922,9 +934,12 @@ impl ClocklessMux {
             };
             if take_audio {
                 let packet = self.audio.pop_front().expect("audio front checked");
-                segmenter
+                if let Some(sequence) = segmenter
                     .push_audio_packet(&packet.packet)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error.to_string())?
+                {
+                    last_completed = Some(sequence);
+                }
             } else if video_dts.is_some_and(&ready) {
                 let packet = self.video.pop_front().expect("video front checked");
                 if let Some(sequence) = segmenter
@@ -1252,10 +1267,10 @@ impl ScaleProfiler {
 struct DriverState<'a> {
     options: &'a ClocklessTranscodeOptions,
     control: &'a ClocklessTranscodeControl,
-    frame_rate: FrameRate,
-    video: VideoStreamEncoder,
-    video_tap: VideoTapProducer,
-    video_rx: Receiver<TappedVideoFrame>,
+    frame_rate: Option<FrameRate>,
+    video: Option<VideoStreamEncoder>,
+    video_tap: Option<VideoTapProducer>,
+    video_rx: Option<Receiver<TappedVideoFrame>>,
     audio_encoder: OpenedAacEncoder,
     output: ClocklessStreamOutput,
     audio_processor: ClocklessAudioProcessor,
@@ -1291,18 +1306,30 @@ impl DriverState<'_> {
         self.wait_for_capacity()?;
         self.checkpoint()?;
         let started = Instant::now();
-        self.video_tap.try_publish(frame, pts_secs, SEEK_SERIAL);
+        self.video_tap
+            .as_mut()
+            .expect("video frames require a video tap")
+            .try_publish(frame, pts_secs, SEEK_SERIAL);
         self.times.video_download_secs += started.elapsed().as_secs_f64();
         let tapped = self
             .video_rx
+            .as_ref()
+            .expect("video frames require a tap receiver")
             .try_recv()
             .map_err(|error| format!("independent video tap did not publish a frame: {error}"))?;
         if self.options.profile_swscale {
             if self.scale_profiler.is_none() {
                 self.scale_profiler = Some(ScaleProfiler::new(
                     tapped.as_video(),
-                    self.video.input_format(),
-                    self.video.output_parameters().dimensions,
+                    self.video
+                        .as_ref()
+                        .expect("video frames require a video encoder")
+                        .input_format(),
+                    self.video
+                        .as_ref()
+                        .expect("video frames require a video encoder")
+                        .output_parameters()
+                        .dimensions,
                 )?);
             }
             let started = Instant::now();
@@ -1315,14 +1342,21 @@ impl DriverState<'_> {
         }
         self.checkpoint()?;
         let started = Instant::now();
+        let video = self
+            .video
+            .as_mut()
+            .expect("video frames require a video encoder");
         let packets = self.output.with_segmenter(|segmenter| {
-            self.video
+            video
                 .encode_frame(tapped, segmenter)
                 .map_err(|error| error.to_string())
         })?;
         self.times.video_scale_encode_secs += started.elapsed().as_secs_f64();
         for packet in packets {
-            self.mux.enqueue_video(packet, self.frame_rate)?;
+            self.mux.enqueue_video(
+                packet,
+                self.frame_rate.expect("video packets require a frame rate"),
+            )?;
         }
         self.video_frames = self.video_frames.saturating_add(1);
         self.max_source_pts = self.max_source_pts.max(pts_secs);
@@ -1332,6 +1366,9 @@ impl DriverState<'_> {
     fn push_audio_chunk(&mut self, chunk: ProcessedChunk) -> Result<(), String> {
         self.wait_for_capacity()?;
         self.checkpoint()?;
+        self.max_source_pts = self
+            .max_source_pts
+            .max(chunk.audible_pts_secs + chunk.duration_secs);
         let started = Instant::now();
         let chunk = self.audio_processor.process(chunk);
         self.times.audio_process_secs += started.elapsed().as_secs_f64();
@@ -1353,9 +1390,10 @@ impl DriverState<'_> {
         self.checkpoint()?;
         let started = Instant::now();
         if self.options.include_audio {
+            let has_video = self.video.is_some();
             let sequence = self
                 .output
-                .with_segmenter(|segmenter| self.mux.drain_ready(segmenter))?;
+                .with_segmenter(|segmenter| self.mux.drain_ready(segmenter, has_video))?;
             if let Some(sequence) = sequence {
                 self.completed_segments = self.completed_segments.max(sequence.saturating_add(1));
                 self.output.record_completed(sequence)?;
@@ -1440,31 +1478,46 @@ fn run_clockless_stream_inner(
         ..ClocklessStageTimes::default()
     };
 
-    let video_stream = input
-        .streams()
-        .best(MediaType::Video)
-        .filter(|stream| {
-            !stream
-                .disposition()
-                .contains(ffmpeg::format::stream::Disposition::ATTACHED_PIC)
+    let video_stream = input.streams().best(MediaType::Video).filter(|stream| {
+        !stream
+            .disposition()
+            .contains(ffmpeg::format::stream::Disposition::ATTACHED_PIC)
+    });
+    let video_stream_index = video_stream.as_ref().map(|stream| stream.index());
+    let video_time_base = video_stream.as_ref().map(|stream| stream.time_base());
+    let video_start_secs = video_stream.as_ref().map(stream_start_secs);
+    let frame_rate = video_stream
+        .as_ref()
+        .map(|stream| selected_frame_rate(stream.avg_frame_rate(), stream.rate()))
+        .transpose()?;
+    let video_params = video_stream
+        .as_ref()
+        .map(|stream| super::decoder::clone_codec_parameters(&stream.parameters()))
+        .transpose()?;
+    let source_codec = video_params
+        .as_ref()
+        .map(|params| params.id().name().to_owned())
+        .unwrap_or_else(|| "none".to_owned());
+    let mut video_decoder = video_params
+        .as_ref()
+        .map(|params| {
+            super::decoder::open_aux_video_decoder_with_fallback(
+                params,
+                params.id(),
+                options.hw_decode,
+                "clockless-transcode",
+            )
         })
-        .ok_or_else(|| "input has no timed video stream".to_owned())?;
-    let video_stream_index = video_stream.index();
-    let video_time_base = video_stream.time_base();
-    let video_start_secs = stream_start_secs(&video_stream);
-    let frame_rate = selected_frame_rate(video_stream.avg_frame_rate(), video_stream.rate())?;
-    let video_params = super::decoder::clone_codec_parameters(&video_stream.parameters())?;
-    let source_codec = video_params.id().name().to_owned();
-    let mut video_decoder = super::decoder::open_aux_video_decoder_with_fallback(
-        &video_params,
-        video_params.id(),
-        options.hw_decode,
-        "clockless-transcode",
-    )?;
-    let source_width = video_decoder.width();
-    let source_height = video_decoder.height();
-    let decoder_name = video_decoder.decoder_name().to_owned();
-    let hardware_decode_active = video_decoder.hw_decode_active();
+        .transpose()?;
+    let source_width = video_decoder.as_ref().map_or(0, |decoder| decoder.width());
+    let source_height = video_decoder.as_ref().map_or(0, |decoder| decoder.height());
+    let decoder_name = video_decoder
+        .as_ref()
+        .map(|decoder| decoder.decoder_name().to_owned())
+        .unwrap_or_else(|| "none".to_owned());
+    let hardware_decode_active = video_decoder
+        .as_ref()
+        .is_some_and(|decoder| decoder.hw_decode_active());
 
     let audio_stream = options
         .include_audio
@@ -1474,7 +1527,7 @@ fn run_clockless_stream_inner(
     let audio_start_secs = audio_stream.as_ref().map(stream_start_secs);
     let source_start_secs = audio_start_secs
         .into_iter()
-        .chain(std::iter::once(video_start_secs))
+        .chain(video_start_secs)
         .fold(f64::INFINITY, f64::min);
     let source_start_secs = if source_start_secs.is_finite() {
         source_start_secs
@@ -1493,20 +1546,37 @@ fn run_clockless_stream_inner(
     if options.include_audio && audio_path.is_none() {
         return Err("include_audio was requested but the input has no audio stream".to_owned());
     }
+    if video_decoder.is_none() && audio_path.is_none() {
+        return Err("input has neither a timed video stream nor an audio stream".to_owned());
+    }
     let audio_codec = audio_path.as_ref().map(|path| path.codec_name.clone());
 
-    let (video_tap_controller, video_tap) = video_tap_channel();
-    let (_video_tap_lease, video_rx) = video_tap_controller.attach(1).map_err(str::to_owned)?;
-    let video = open_video_stream_encoder(
-        options.encoder,
-        options.quality.internal(),
-        source_width,
-        source_height,
-        frame_rate,
-        SEEK_SERIAL,
-        timeline,
-    )
-    .map_err(|error| error.to_string())?;
+    // This is the one media-layout branch. Everything after the optional video encode path --
+    // AAC, mux/ring, playlist, seek generations, and session ownership -- remains shared.
+    let (video_tap, _video_tap_lease, video_rx) = if video_decoder.is_some() {
+        let (controller, producer) = video_tap_channel();
+        let (lease, receiver) = controller.attach(1).map_err(str::to_owned)?;
+        (Some(producer), Some(lease), Some(receiver))
+    } else {
+        (None, None, None)
+    };
+    let video = frame_rate
+        .map(|rate| {
+            open_video_stream_encoder(
+                options.encoder,
+                options.quality.internal(),
+                source_width,
+                source_height,
+                rate,
+                SEEK_SERIAL,
+                timeline,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .transpose()?;
+    // Audio-only streams interpret QualityPreset through the preset's existing AAC bitrate
+    // (64/96/128/160 kbps). Reusing that established ladder keeps quality changes on the same
+    // generation path and avoids inventing a second audio-specific preset contract.
     let audio_encoder = open_aac_encoder(
         processing_sample_rate,
         options.quality.internal().parameters().audio_bitrate_bps,
@@ -1514,19 +1584,35 @@ fn run_clockless_stream_inner(
         timeline,
     )
     .map_err(|error| error.to_string())?;
-    let segmenter = Fmp4Segmenter::with_capacity(
-        video.encoder(),
-        &audio_encoder.encoder,
-        frame_rate,
-        retained_segment_capacity(options.segment_capacity)?,
-    )
+    let retained_capacity = retained_segment_capacity(options.segment_capacity)?;
+    let segmenter = if let Some(video) = video.as_ref() {
+        Fmp4Segmenter::with_capacity(
+            video.encoder(),
+            &audio_encoder.encoder,
+            frame_rate.expect("video encoder requires a frame rate"),
+            retained_capacity,
+        )
+    } else {
+        Fmp4Segmenter::audio_only_with_capacity(&audio_encoder.encoder, retained_capacity)
+    }
     .map_err(|error| error.to_string())?;
-    let encoder = video.encoder_kind().as_str().to_owned();
-    let output = video.output_parameters().dimensions;
+    let encoder = video
+        .as_ref()
+        .map(|video| video.encoder_kind().as_str().to_owned())
+        .unwrap_or_else(|| "audio-only".to_owned());
+    let output = video
+        .as_ref()
+        .map(|video| video.output_parameters().dimensions)
+        .unwrap_or(OutputDimensions {
+            width: 0,
+            height: 0,
+        });
     let output_info = ClocklessOutputInfo {
-        encoder: video.encoder_kind(),
-        output_dimensions: output,
-        video_bitrate_bps: video.effective_video_bitrate_bps(),
+        video: video.as_ref().map(|video| ClocklessVideoOutputInfo {
+            encoder: video.encoder_kind(),
+            output_dimensions: video.output_parameters().dimensions,
+            bitrate_bps: video.effective_video_bitrate_bps(),
+        }),
         audio_bitrate_bps: audio_encoder.effective_bitrate_bps(),
         codecs: segmenter.codecs().to_owned(),
     };
@@ -1557,8 +1643,9 @@ fn run_clockless_stream_inner(
     let limit_at = options
         .max_source_secs
         .map(|seconds| source_origin_secs + seconds);
-    let video_tb_secs =
-        f64::from(video_time_base.numerator()) / f64::from(video_time_base.denominator());
+    let video_tb_secs = video_time_base.map_or(0.0, |time_base| {
+        f64::from(time_base.numerator()) / f64::from(time_base.denominator())
+    });
     let mut next_video_pts = source_origin_secs;
     if source_origin_secs > source_start_secs + f64::EPSILON {
         let target = (source_origin_secs * 1_000_000.0).round() as i64;
@@ -1575,7 +1662,9 @@ fn run_clockless_stream_inner(
                 "clockless seek to {source_origin_secs:.3}s failed: {seek_result}"
             ));
         }
-        video_decoder.decoder_mut().flush();
+        if let Some(decoder) = video_decoder.as_mut() {
+            decoder.decoder_mut().flush();
+        }
         if let Some(path) = audio_path.as_mut() {
             path.decoder.flush();
             path.next_pts_secs = None;
@@ -1593,10 +1682,13 @@ fn run_clockless_stream_inner(
         };
         let (stream, packet) = item.map_err(|error| format!("demux packet: {error}"))?;
         state.packets = state.packets.saturating_add(1);
-        if stream.index() == video_stream_index {
+        if Some(stream.index()) == video_stream_index {
             state.checkpoint()?;
             let send_started = Instant::now();
-            video_decoder
+            let decoder = video_decoder
+                .as_mut()
+                .expect("video stream index requires a video decoder");
+            decoder
                 .decoder_mut()
                 .send_packet(&packet)
                 .map_err(|error| format!("video send_packet: {error}"))?;
@@ -1604,7 +1696,7 @@ fn run_clockless_stream_inner(
             loop {
                 let mut frame = Video::empty();
                 let receive_started = Instant::now();
-                let received = video_decoder.decoder_mut().receive_frame(&mut frame);
+                let received = decoder.decoder_mut().receive_frame(&mut frame);
                 state.times.video_decode_secs += receive_started.elapsed().as_secs_f64();
                 match received {
                     Ok(()) => {
@@ -1612,7 +1704,15 @@ fn run_clockless_stream_inner(
                             .map(|pts| pts as f64 * video_tb_secs)
                             .unwrap_or(next_video_pts);
                         next_video_pts = pts
-                            + f64::from(frame_rate.denominator) / f64::from(frame_rate.numerator);
+                            + f64::from(
+                                frame_rate
+                                    .expect("video frames require a frame rate")
+                                    .denominator,
+                            ) / f64::from(
+                                frame_rate
+                                    .expect("video frames require a frame rate")
+                                    .numerator,
+                            );
                         if limit_at.is_some_and(|limit| pts > limit) {
                             reached_limit = true;
                             break;
@@ -1656,6 +1756,10 @@ fn run_clockless_stream_inner(
                         state.times.audio_decode_resample_secs +=
                             convert_started.elapsed().as_secs_f64();
                         if let Some(chunk) = chunk {
+                            if limit_at.is_some_and(|limit| chunk.audible_pts_secs > limit) {
+                                reached_limit = true;
+                                break;
+                            }
                             if chunk.audible_pts_secs + chunk.duration_secs >= source_origin_secs {
                                 state.push_audio_chunk(chunk)?;
                             }
@@ -1685,26 +1789,29 @@ fn run_clockless_stream_inner(
 
     if !reached_limit {
         state.checkpoint()?;
-        video_decoder
-            .decoder_mut()
-            .send_eof()
-            .map_err(|error| format!("video send_eof: {error}"))?;
-        loop {
-            let mut frame = Video::empty();
-            match video_decoder.decoder_mut().receive_frame(&mut frame) {
-                Ok(()) => {
-                    let pts = super::decoder::video_frame_timestamp(&frame)
-                        .map(|pts| pts as f64 * video_tb_secs)
-                        .unwrap_or(next_video_pts);
-                    next_video_pts =
-                        pts + f64::from(frame_rate.denominator) / f64::from(frame_rate.numerator);
-                    if pts >= source_origin_secs {
-                        state.push_video_frame(&frame, pts)?;
+        if let Some(decoder) = video_decoder.as_mut() {
+            decoder
+                .decoder_mut()
+                .send_eof()
+                .map_err(|error| format!("video send_eof: {error}"))?;
+            loop {
+                let mut frame = Video::empty();
+                match decoder.decoder_mut().receive_frame(&mut frame) {
+                    Ok(()) => {
+                        let pts = super::decoder::video_frame_timestamp(&frame)
+                            .map(|pts| pts as f64 * video_tb_secs)
+                            .unwrap_or(next_video_pts);
+                        let rate = frame_rate.expect("video frames require a frame rate");
+                        next_video_pts =
+                            pts + f64::from(rate.denominator) / f64::from(rate.numerator);
+                        if pts >= source_origin_secs {
+                            state.push_video_frame(&frame, pts)?;
+                        }
                     }
+                    Err(ffmpeg::Error::Eof) => break,
+                    Err(ffmpeg::Error::Other { errno }) if errno == FFMPEG_EAGAIN => break,
+                    Err(error) => return Err(format!("video drain receive_frame: {error}")),
                 }
-                Err(ffmpeg::Error::Eof) => break,
-                Err(ffmpeg::Error::Other { errno }) if errno == FFMPEG_EAGAIN => break,
-                Err(error) => return Err(format!("video drain receive_frame: {error}")),
             }
         }
         if let Some(path) = audio_path.as_mut() {
@@ -1765,11 +1872,18 @@ fn finish_transcode(
 ) -> Result<ClocklessTranscodeReport, String> {
     state.wait_for_capacity()?;
     state.checkpoint()?;
-    let started = Instant::now();
-    for packet in state.video.finish().map_err(|error| error.to_string())? {
-        state.mux.enqueue_video(packet, state.frame_rate)?;
+    if let Some(video) = state.video.as_mut() {
+        let started = Instant::now();
+        for packet in video.finish().map_err(|error| error.to_string())? {
+            state.mux.enqueue_video(
+                packet,
+                state
+                    .frame_rate
+                    .expect("video packets require a frame rate"),
+            )?;
+        }
+        state.times.video_scale_encode_secs += started.elapsed().as_secs_f64();
     }
-    state.times.video_scale_encode_secs += started.elapsed().as_secs_f64();
     if state.options.include_audio {
         let started = Instant::now();
         for packet in state
@@ -1815,8 +1929,8 @@ fn finish_transcode(
         source_codec,
         source_width,
         source_height,
-        frame_rate_num: state.frame_rate.numerator,
-        frame_rate_den: state.frame_rate.denominator,
+        frame_rate_num: state.frame_rate.map_or(0, |rate| rate.numerator),
+        frame_rate_den: state.frame_rate.map_or(1, |rate| rate.denominator),
         decoder_name,
         hardware_decode_active,
         encoder,
@@ -2053,6 +2167,48 @@ mod tests {
             audio.set_duration(AUDIO_SAMPLES_PER_PACKET as i64);
             audio.set_flags(Flags::KEY);
             audio.write_interleaved(&mut output).unwrap();
+        }
+        output.write_trailer().unwrap();
+    }
+
+    fn write_finite_audio_fixture(path: &Path, packet_count: i64) {
+        use ffmpeg::codec::packet::Flags;
+
+        const AUDIO_SAMPLES_PER_PACKET: usize = 4_000;
+        const AUDIO_RATE: i32 = 8_000;
+
+        ffmpeg::init().unwrap();
+        let mut output = ffmpeg::format::output_as(path, "avi").unwrap();
+        let codec = ffmpeg::codec::encoder::find(ffmpeg::codec::Id::PCM_S16LE).unwrap();
+        let stream_index;
+        {
+            let mut stream = output.add_stream(codec).unwrap();
+            stream_index = stream.index();
+            stream.set_time_base((1, AUDIO_RATE));
+            let mut parameters = stream.parameters_mut();
+            unsafe {
+                let parameters = &mut *parameters.as_mut_ptr();
+                parameters.codec_type = ffmpeg::ffi::AVMediaType::AVMEDIA_TYPE_AUDIO;
+                parameters.codec_id = ffmpeg::ffi::AVCodecID::AV_CODEC_ID_PCM_S16LE;
+                parameters.format = ffmpeg::ffi::AVSampleFormat::AV_SAMPLE_FMT_S16 as i32;
+                parameters.sample_rate = AUDIO_RATE;
+                parameters.bits_per_coded_sample = 16;
+                parameters.bits_per_raw_sample = 16;
+                parameters.block_align = 4;
+                parameters.bit_rate = i64::from(AUDIO_RATE) * 16 * 2;
+                ffmpeg::ffi::av_channel_layout_default(&mut parameters.ch_layout, 2);
+            }
+        }
+        output.write_header().unwrap();
+        for index in 0..packet_count {
+            let samples = vec![0_u8; AUDIO_SAMPLES_PER_PACKET * 2 * std::mem::size_of::<i16>()];
+            let mut packet = ffmpeg::Packet::copy(&samples);
+            packet.set_stream(stream_index);
+            packet.set_pts(Some(index * AUDIO_SAMPLES_PER_PACKET as i64));
+            packet.set_dts(Some(index * AUDIO_SAMPLES_PER_PACKET as i64));
+            packet.set_duration(AUDIO_SAMPLES_PER_PACKET as i64);
+            packet.set_flags(Flags::KEY);
+            packet.write_interleaved(&mut output).unwrap();
         }
         output.write_trailer().unwrap();
     }
@@ -2299,6 +2455,51 @@ mod tests {
         assert!(Arc::ptr_eq(
             &old_generation.vst3.as_ref().unwrap().failed,
             &new_generation.vst3.as_ref().unwrap().failed,
+        ));
+    }
+
+    #[test]
+    fn finite_audio_only_fixture_uses_the_shared_clockless_hls_pipeline() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("finite-audio.avi");
+        write_finite_audio_fixture(&path, 10);
+        let mut options = ClocklessTranscodeOptions::benchmark(path);
+        options.hw_decode = false;
+        options.quality = ClocklessQuality::Low;
+        options.max_source_secs = None;
+        options.segment_capacity = 4;
+        let control = ClocklessTranscodeControl::auto_releasing(options.segment_capacity).unwrap();
+        let output = ClocklessStreamOutput::new(options.segment_capacity, 0.0).unwrap();
+        let ready = Arc::new(Mutex::new(None));
+        let ready_for_callback = Arc::clone(&ready);
+
+        let report = run_clockless_stream(
+            &options,
+            &control,
+            output.clone(),
+            ClocklessAudioProcessing::default(),
+            move |info| *ready_for_callback.lock().unwrap() = Some(info),
+        )
+        .unwrap();
+
+        let info = ready.lock().unwrap().clone().expect("ready info");
+        assert!(info.video.is_none());
+        assert_eq!(info.audio_bitrate_bps, 96_000);
+        assert_eq!(info.codecs, "mp4a.40.2");
+        assert_eq!(report.video_frames, 0);
+        assert!(report.audio_frames > 0);
+        assert_eq!(report.encoder, "audio-only");
+        assert!(output.metrics().ended);
+        assert!(!output.master_playlist().unwrap().contains("RESOLUTION="));
+        assert!(
+            output
+                .media_playlist()
+                .unwrap()
+                .ends_with("#EXT-X-ENDLIST\n")
+        );
+        assert!(matches!(
+            output.segment(output.metrics().latest_sequence.unwrap()),
+            ClocklessSegmentBytes::Found(_)
         ));
     }
 

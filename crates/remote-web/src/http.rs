@@ -1082,7 +1082,7 @@ fn api_video_start(
         Err(()) => return HttpResponse::text(400, "Bad Request"),
     };
     let address = RemoteAddress::file(path);
-    if let Err(error) = state.library.validate_remote_file_video(&address) {
+    if let Err(error) = state.library.validate_remote_file_streamable(&address) {
         return store_error_response(error).with_header("Cache-Control", "no-store");
     }
     state.session_activity.note(owner);
@@ -1104,6 +1104,7 @@ fn api_video_start(
                 "duration_secs": payload.duration_secs,
                 "source_origin_secs": payload.source_origin_secs,
                 "buffer_target_secs": payload.buffer_target_secs,
+                "has_video": payload.has_video,
                 "codec": payload.codecs,
                 "encoder": payload.encoder,
                 "video_size": payload.video_size,
@@ -4199,17 +4200,25 @@ mod tests {
     }
 
     #[test]
-    fn video_entry_guard_accepts_only_absolute_video_files() {
+    fn stream_entry_guard_accepts_absolute_video_and_audio_files() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("movie.mp4"), b"fixture").unwrap();
+        std::fs::write(temp.path().join("song.mp3"), b"fixture").unwrap();
         std::fs::write(temp.path().join("page.jpg"), b"fixture").unwrap();
         std::fs::create_dir(temp.path().join("folder.mp4")).unwrap();
         let library = Library::empty_for_test(temp.path().join("cache"));
 
         assert!(
             library
-                .validate_remote_file_video(&RemoteAddress::file(
+                .validate_remote_file_streamable(&RemoteAddress::file(
                     temp.path().join("movie.mp4").to_string_lossy().into_owned(),
+                ))
+                .is_ok()
+        );
+        assert!(
+            library
+                .validate_remote_file_streamable(&RemoteAddress::file(
+                    temp.path().join("song.mp3").to_string_lossy().into_owned(),
                 ))
                 .is_ok()
         );
@@ -4220,7 +4229,7 @@ mod tests {
                 RemoteAddress::file(temp.path().join(path).to_string_lossy().into_owned())
             };
             assert!(
-                library.validate_remote_file_video(&address).is_err(),
+                library.validate_remote_file_streamable(&address).is_err(),
                 "{path}",
             );
         }

@@ -248,7 +248,7 @@ impl Library {
     }
 
     /// HTTP 層でも絶対パス・実在・種類を検証する。本体 IPC も独立に再検証する。
-    pub(crate) fn validate_remote_file_video(
+    pub(crate) fn validate_remote_file_streamable(
         &self,
         address: &RemoteAddress,
     ) -> Result<(), StoreError> {
@@ -260,7 +260,8 @@ impl Library {
         }
         let path = resolve_existing(&address.path)?;
         let metadata = std::fs::metadata(&path)?;
-        if metadata.is_file() && classify_path(&path) == EntryKind::Video {
+        if metadata.is_file() && matches!(classify_path(&path), EntryKind::Video | EntryKind::Audio)
+        {
             Ok(())
         } else {
             Err(StoreError::BadRequest)

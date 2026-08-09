@@ -917,20 +917,20 @@ impl crate::app::App {
             {
                 Err((
                     VideoStreamErrorCode::Failed,
-                    "リモート配信用 player と要求された動画が一致しません".to_owned(),
+                    "リモート配信用 player と要求されたメディアが一致しません".to_owned(),
                 ))
             }
             Some(player) => {
                 if let Some(error) = player.error() {
                     Err((
                         VideoStreamErrorCode::Failed,
-                        format!("要求された動画を再生できません: {error}"),
+                        format!("要求されたメディアを再生できません: {error}"),
                     ))
                 } else if let Some(inputs) = player.remote_stream_start_inputs() {
-                    if !inputs.has_video || !inputs.has_audio {
+                    if !inputs.has_audio {
                         Err((
                             VideoStreamErrorCode::Failed,
-                            "remote streaming requires both video and audio streams".to_owned(),
+                            "remote streaming requires an audio stream".to_owned(),
                         ))
                     } else {
                         Ok(Some(inputs))

@@ -2734,9 +2734,11 @@ mod tests {
     }
 
     #[test]
-    fn ownership_loss_cancels_registered_streaming() {
+    fn ownership_loss_cancels_video_or_audio_registered_streaming() {
         let mut state = SessionStateMachine::default();
         acquire(&mut state, Duration::ZERO);
+        // Registrations intentionally carry no media-kind branch. The same cancellation flag
+        // therefore owns both AV and audio-only generations.
         let (_, _, cancel) = register_test_stream(&mut state, Duration::ZERO);
 
         state.acquire(

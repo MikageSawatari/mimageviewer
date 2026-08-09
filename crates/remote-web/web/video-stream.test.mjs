@@ -23,6 +23,34 @@ import {
   videoUserErrorMessage,
 } from "./video-stream.mjs";
 
+test("audio-only server state hides the video surface without changing the media owner", () => {
+  const classes = new Set();
+  const viewer = {
+    hasVideo: true,
+    root: {
+      classList: {
+        toggle(name, enabled) {
+          if (enabled) classes.add(name);
+          else classes.delete(name);
+        },
+      },
+    },
+    video: { hidden: false },
+    audioSurface: { hidden: true },
+  };
+
+  VideoStreamViewer.prototype.setHasVideo.call(viewer, false);
+  assert.equal(viewer.hasVideo, false);
+  assert.equal(viewer.video.hidden, true);
+  assert.equal(viewer.audioSurface.hidden, false);
+  assert.equal(classes.has("audio-only-stream-viewer"), true);
+
+  VideoStreamViewer.prototype.setHasVideo.call(viewer, true);
+  assert.equal(viewer.video.hidden, false);
+  assert.equal(viewer.audioSurface.hidden, true);
+  assert.equal(classes.has("audio-only-stream-viewer"), false);
+});
+
 test("blocked remote session stops playback once and prevents another poll", () => {
   const calls = [];
   const viewer = {

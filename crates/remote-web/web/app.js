@@ -1397,7 +1397,7 @@ async function dispatchRoute() {
         if (!entry) {
           throw new Error("フォルダ内のメディアが見つかりませんでした。");
         }
-        if (entry.kind === "video") {
+        if (["video", "audio"].includes(entry.kind)) {
           state.gridIndex = entryIndex;
           renderVideoViewer(entry);
           return;
@@ -1898,14 +1898,13 @@ function dispatchCommand(requested, meta = {}) {
 }
 
 export function resolveMediaOpenRoute(requestedKind, addressedEntry, imageIndex) {
-  if (!["image", "video"].includes(requestedKind)) return null;
+  if (!["image", "video", "audio"].includes(requestedKind)) return null;
   if (!addressedEntry || addressedEntry.kind !== requestedKind) return null;
   if (requestedKind === "image" && imageIndex < 0) return null;
   return requestedKind;
 }
 
 export function unsupportedRemoteEntryMessage(kind) {
-  if (kind === "audio") return "この端末では音声を再生できません。";
   if (kind === "archive") return "この端末ではアーカイブを開けません。";
   return "";
 }
@@ -2145,7 +2144,7 @@ function openGridEntry(index, meta) {
       meta
     );
   }
-  if (entry.kind === "video") {
+  if (["video", "audio"].includes(entry.kind)) {
     return executeOpenCommand(
       {
         kind: "media",
@@ -3738,6 +3737,7 @@ export async function loadFolder(
       entry.kind === "dir" ||
       entry.kind === "image" ||
       entry.kind === "video" ||
+      entry.kind === "audio" ||
       entry.kind === "zip" ||
       entry.kind === "pdf"
   );
@@ -4142,7 +4142,7 @@ export function createGridTile(
           });
         }
       });
-    } else if (entry.kind === "video") {
+    } else if (["video", "audio"].includes(entry.kind)) {
       tile.addEventListener("click", (event) => {
         commandDispatcher(command(CommandName.OPEN, {
           kind: "media",
@@ -4304,7 +4304,7 @@ function entryTypeLabel(kind) {
 }
 
 function renderVideoViewer(entry) {
-  if (!entry || entry.kind !== "video") {
+  if (!entry || !["video", "audio"].includes(entry.kind)) {
     recordClientError("video_viewer_entry_rejected", "メディアビューアに未対応の項目が渡されました", {
       entry_found: Boolean(entry),
       resolved_kind: entry?.kind ?? "missing",
@@ -4376,16 +4376,18 @@ export function videoFileTargetIndex(currentIndex, count, delta, wrap = false) {
 function changeVideoFile(delta, wrap = false) {
   const viewer = state.viewer;
   if (!viewer?.isVideoStreamViewer) return { handled: false, advanced: false };
-  const videos = state.entries.filter((entry) => entry.kind === "video");
-  const current = videos.findIndex(
+  const mediaKind = viewer.entry?.kind ?? "video";
+  const mediaEntries = state.entries.filter((entry) => entry.kind === mediaKind);
+  const current = mediaEntries.findIndex(
     (entry) => addressIdentity(entryAddress(entry)) === addressIdentity(viewer.address)
   );
-  const nextIndex = videoFileTargetIndex(current, videos.length, delta, wrap);
+  const nextIndex = videoFileTargetIndex(current, mediaEntries.length, delta, wrap);
   if (nextIndex < 0) {
-    viewer.showBoundaryMessage(Number(delta) < 0 ? "先頭の動画です" : "最後の動画です");
+    const noun = mediaKind === "audio" ? "音声" : "動画";
+    viewer.showBoundaryMessage(Number(delta) < 0 ? `先頭の${noun}です` : `最後の${noun}です`);
     return { handled: true, advanced: false };
   }
-  const entry = videos[nextIndex];
+  const entry = mediaEntries[nextIndex];
   const entryIndex = state.entries.findIndex(
     (candidate) => entryIdentity(candidate) === entryIdentity(entry)
   );

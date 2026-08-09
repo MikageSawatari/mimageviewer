@@ -109,13 +109,13 @@ impl VideoStreamEngine {
         address.validate_syntax().map_err(|_| {
             video_error(
                 VideoStreamErrorCode::BadRequest,
-                "動画アドレスの形式が正しくありません",
+                "メディアアドレスの形式が正しくありません",
             )
         })?;
         if !matches!(address.subresource, RemoteSubresource::File) {
             return Err(video_error(
                 VideoStreamErrorCode::BadRequest,
-                "動画ストリーミングは実ファイルだけを受け付けます",
+                "メディアストリーミングは実ファイルだけを受け付けます",
             ));
         }
         let resolved = resolve_existing(&address.path).map_err(resolve_error)?;
@@ -126,23 +126,24 @@ impl VideoStreamEngine {
             .map(str::to_ascii_lowercase)
             .is_some_and(|extension| {
                 crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&extension.as_str())
+                    || crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS.contains(&extension.as_str())
             })
         {
             return Err(video_error(
                 VideoStreamErrorCode::Unsupported,
-                "対応していない動画形式です",
+                "対応していないメディア形式です",
             ));
         }
         let metadata = std::fs::metadata(&resolved.canonical).map_err(|_| {
             video_error(
                 VideoStreamErrorCode::NotFound,
-                "動画ファイルが見つかりません",
+                "メディアファイルが見つかりません",
             )
         })?;
         if !metadata.is_file() {
             return Err(video_error(
                 VideoStreamErrorCode::NotFound,
-                "動画ファイルが見つかりません",
+                "メディアファイルが見つかりません",
             ));
         }
         // canonical は worker 上の containment / 種別検証だけに使う。UI へは既存 player.path()
@@ -179,17 +180,16 @@ impl VideoStreamEngine {
                     }
                 };
                 let playback = stream.playback.snapshot();
+                let (has_video, encoder, video_size) = ready_video_payload(&ready);
                 VideoStreamResult::Success(VideoStreamStartPayload {
                     session: stream.session.0,
                     generation: stream.generation_id().0,
                     duration_secs: playback.duration_secs,
                     source_origin_secs: metrics.source_origin_secs,
                     buffer_target_secs: stream.buffer_target_secs,
-                    encoder: ready.encoder.as_str().to_owned(),
-                    video_size: VideoStreamSize {
-                        width: ready.output_dimensions.width,
-                        height: ready.output_dimensions.height,
-                    },
+                    has_video,
+                    encoder,
+                    video_size,
                     codecs: ready.codecs,
                     audio_processing: audio_processing_payload(stream.generation.audio_status()),
                     end_behavior: stream.end_behavior,
@@ -403,6 +403,7 @@ fn state_payload(
     metrics: StreamGenerationMetrics,
 ) -> VideoStreamStatePayload {
     let playback = stream.playback.snapshot();
+    let (has_video, encoder, video_size) = ready_video_payload(&ready);
     VideoStreamStatePayload {
         session: stream.session.0,
         generation: stream.generation_id().0,
@@ -418,16 +419,41 @@ fn state_payload(
         buffered_secs: metrics.buffered_secs,
         effective_bitrate_bps: metrics.effective_bitrate_bps,
         ended: metrics.ended,
-        encoder: ready.encoder.as_str().to_owned(),
-        video_size: VideoStreamSize {
-            width: ready.output_dimensions.width,
-            height: ready.output_dimensions.height,
-        },
+        has_video,
+        encoder,
+        video_size,
         codecs: ready.codecs,
         audio_processing: audio_processing_payload(stream.generation.audio_status()),
         play_intent: playback.play_intent,
         volume: playback.volume,
     }
+}
+
+fn ready_video_payload(
+    ready: &crate::video::stream::session::StreamReadyInfo,
+) -> (bool, String, VideoStreamSize) {
+    ready.video.as_ref().map_or_else(
+        || {
+            (
+                false,
+                "audio-only".to_owned(),
+                VideoStreamSize {
+                    width: 0,
+                    height: 0,
+                },
+            )
+        },
+        |video| {
+            (
+                true,
+                video.encoder.as_str().to_owned(),
+                VideoStreamSize {
+                    width: video.output_dimensions.width,
+                    height: video.output_dimensions.height,
+                },
+            )
+        },
+    )
 }
 
 fn audio_processing_payload(
@@ -445,11 +471,11 @@ fn resolve_error(error: ResolveError) -> VideoStreamError {
     let (code, message) = match error {
         ResolveError::InvalidPath => (
             VideoStreamErrorCode::BadRequest,
-            "動画アドレスの形式が正しくありません",
+            "メディアアドレスの形式が正しくありません",
         ),
         ResolveError::Unavailable => (
             VideoStreamErrorCode::NotFound,
-            "動画ファイルが見つかりません",
+            "メディアファイルが見つかりません",
         ),
     };
     video_error(code, message)
@@ -583,11 +609,12 @@ mod tests {
     }
 
     #[test]
-    fn start_address_accepts_any_existing_absolute_video_path() {
+    fn start_address_accepts_existing_absolute_video_and_audio_paths() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("favorite");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("movie.mp4"), b"fixture").unwrap();
+        std::fs::write(root.join("song.mp3"), b"fixture").unwrap();
         std::fs::write(root.join("notes.txt"), b"fixture").unwrap();
         let outside = temp.path().join("outside.mp4");
         std::fs::write(&outside, b"fixture").unwrap();
@@ -602,6 +629,18 @@ mod tests {
             resolved,
             super::super::path_guard::resolve_existing(
                 root.join("movie.mp4").to_string_lossy().as_ref(),
+            )
+            .unwrap()
+            .logical
+        );
+        assert_eq!(
+            engine
+                .resolve_start_address(&RemoteAddress::file(
+                    root.join("song.mp3").to_string_lossy().into_owned(),
+                ))
+                .unwrap(),
+            super::super::path_guard::resolve_existing(
+                root.join("song.mp3").to_string_lossy().as_ref(),
             )
             .unwrap()
             .logical

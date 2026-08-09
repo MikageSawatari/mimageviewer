@@ -4,13 +4,11 @@ use std::{fmt, mem, ptr, slice};
 use ffmpeg::codec::packet::Mut as _;
 use ffmpeg_the_third as ffmpeg;
 
-use super::encoder::FrameRate;
+use super::encoder::{FrameRate, SEGMENT_DURATION_SECS};
 use super::playlist::{SegmentLookup, SegmentRing, master_playlist};
 
 const AVIO_BUFFER_SIZE: usize = 32 * 1024;
 const AVERROR_ENOMEM: i32 = -12;
-const VIDEO_STREAM_INDEX: usize = 0;
-const AUDIO_STREAM_INDEX: usize = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Fmp4SegmenterError(String);
@@ -449,13 +447,15 @@ pub(crate) struct Fmp4Segmenter {
     init_segment: InitSegmentState,
     codecs: String,
     bandwidth_bps: u64,
-    width: u32,
-    height: u32,
-    video_source_time_base: ffmpeg::ffi::AVRational,
-    video_stream_time_base: ffmpeg::ffi::AVRational,
+    dimensions: Option<(u32, u32)>,
+    video_source_time_base: Option<ffmpeg::ffi::AVRational>,
+    video_stream_time_base: Option<ffmpeg::ffi::AVRational>,
     audio_source_time_base: ffmpeg::ffi::AVRational,
     audio_stream_time_base: ffmpeg::ffi::AVRational,
-    keyint_frames: u32,
+    video_stream_index: Option<usize>,
+    audio_stream_index: usize,
+    keyint_frames: Option<u32>,
+    fragment_duration_ticks: i64,
     fragment: FragmentState,
     last_video_pts: Option<i64>,
     last_video_dts: Option<i64>,
@@ -477,79 +477,116 @@ impl Fmp4Segmenter {
         frame_rate: FrameRate,
         capacity: usize,
     ) -> Result<Self, Fmp4SegmenterError> {
+        Self::with_optional_video_capacity(
+            Some((video_encoder, frame_rate)),
+            audio_encoder,
+            capacity,
+        )
+    }
+
+    pub(crate) fn audio_only_with_capacity(
+        audio_encoder: &ffmpeg::codec::encoder::audio::Encoder,
+        capacity: usize,
+    ) -> Result<Self, Fmp4SegmenterError> {
+        Self::with_optional_video_capacity(None, audio_encoder, capacity)
+    }
+
+    /// The stream layout is selected once here. Playlist, fragment publication, ring retention,
+    /// and lifecycle remain one implementation for AV and audio-only HLS.
+    fn with_optional_video_capacity(
+        video: Option<(&ffmpeg::codec::encoder::video::Encoder, FrameRate)>,
+        audio_encoder: &ffmpeg::codec::encoder::audio::Encoder,
+        capacity: usize,
+    ) -> Result<Self, Fmp4SegmenterError> {
         ffmpeg::init().map_err(|error| {
             Fmp4SegmenterError::new(format!("FFmpeg initialization failed: {error}"))
         })?;
         let ring = SegmentRing::new(capacity).map_err(Fmp4SegmenterError::new)?;
-        let video_encoder_context = unsafe { video_encoder.as_ptr() };
         let audio_encoder_context = unsafe { audio_encoder.as_ptr() };
-        let video_extradata = encoder_extradata(video_encoder_context, "H.264")?;
         let audio_extradata = encoder_extradata(audio_encoder_context, "AAC")?;
-        let video_codecs = avc1_codecs_from_extradata(&video_extradata)?;
         let audio_codecs = mp4a_codecs_from_extradata(&audio_extradata)?;
-        let codecs = format!("{video_codecs},{audio_codecs}");
-        let (video_source_time_base, video_bitrate_bps, width, height) = unsafe {
-            let context = &*video_encoder_context;
-            (
-                context.time_base,
-                context.bit_rate.max(1) as u64,
-                u32::try_from(context.width)
-                    .map_err(|_| Fmp4SegmenterError::new("invalid encoder width"))?,
-                u32::try_from(context.height)
-                    .map_err(|_| Fmp4SegmenterError::new("invalid encoder height"))?,
-            )
-        };
         let (audio_source_time_base, audio_bitrate_bps) = unsafe {
             let context = &*audio_encoder_context;
             (context.time_base, context.bit_rate.max(1) as u64)
         };
-        if width == 0
-            || height == 0
-            || video_source_time_base.num <= 0
-            || video_source_time_base.den <= 0
-            || audio_source_time_base.num <= 0
-            || audio_source_time_base.den <= 0
-        {
+        if audio_source_time_base.num <= 0 || audio_source_time_base.den <= 0 {
             return Err(Fmp4SegmenterError::new(
-                "encoder dimensions or time bases are invalid",
+                "audio encoder time base is invalid",
             ));
         }
-        let expected_time_base = ffmpeg::ffi::AVRational {
-            num: frame_rate.denominator as i32,
-            den: frame_rate.numerator as i32,
-        };
-        if unsafe { ffmpeg::ffi::av_cmp_q(video_source_time_base, expected_time_base) } != 0 {
-            return Err(Fmp4SegmenterError::new(
-                "encoder time base does not match the segment frame rate",
-            ));
-        }
-        crate::logger::log(format!(
-            "remote-stream fMP4 muxer: codecs={codecs} output={width}x{height} keyint_frames={}",
-            frame_rate.keyint_frames()
-        ));
+        let video_details = video
+            .map(|(encoder, frame_rate)| {
+                let context = unsafe { encoder.as_ptr() };
+                let extradata = encoder_extradata(context, "H.264")?;
+                let codec = avc1_codecs_from_extradata(&extradata)?;
+                let (time_base, bitrate_bps, width, height) = unsafe {
+                    let context_ref = &*context;
+                    (
+                        context_ref.time_base,
+                        context_ref.bit_rate.max(1) as u64,
+                        u32::try_from(context_ref.width)
+                            .map_err(|_| Fmp4SegmenterError::new("invalid encoder width"))?,
+                        u32::try_from(context_ref.height)
+                            .map_err(|_| Fmp4SegmenterError::new("invalid encoder height"))?,
+                    )
+                };
+                if width == 0 || height == 0 || time_base.num <= 0 || time_base.den <= 0 {
+                    return Err(Fmp4SegmenterError::new(
+                        "video encoder dimensions or time base are invalid",
+                    ));
+                }
+                let expected = ffmpeg::ffi::AVRational {
+                    num: frame_rate.denominator as i32,
+                    den: frame_rate.numerator as i32,
+                };
+                if unsafe { ffmpeg::ffi::av_cmp_q(time_base, expected) } != 0 {
+                    return Err(Fmp4SegmenterError::new(
+                        "encoder time base does not match the segment frame rate",
+                    ));
+                }
+                Ok((
+                    context,
+                    codec,
+                    time_base,
+                    bitrate_bps,
+                    width,
+                    height,
+                    frame_rate,
+                ))
+            })
+            .transpose()?;
+        let codecs = video_details
+            .as_ref()
+            .map(|(_, codec, ..)| format!("{codec},{audio_codecs}"))
+            .unwrap_or_else(|| audio_codecs.clone());
+        let video_bitrate_bps = video_details
+            .as_ref()
+            .map_or(0, |(_, _, _, bitrate, ..)| *bitrate);
         let bandwidth_bps = video_bitrate_bps.saturating_add(audio_bitrate_bps);
 
         let mut muxer = MuxerResources::allocate()?;
-        let video_stream = unsafe { ffmpeg::ffi::avformat_new_stream(muxer.context, ptr::null()) };
-        if video_stream.is_null() {
-            return Err(Fmp4SegmenterError::new("video avformat_new_stream failed"));
-        }
-        let result = unsafe {
-            ffmpeg::ffi::avcodec_parameters_from_context(
-                (*video_stream).codecpar,
-                video_encoder_context,
-            )
+        let video_stream = if let Some((context, _, time_base, ..)) = video_details.as_ref() {
+            let stream = unsafe { ffmpeg::ffi::avformat_new_stream(muxer.context, ptr::null()) };
+            if stream.is_null() {
+                return Err(Fmp4SegmenterError::new("video avformat_new_stream failed"));
+            }
+            let result = unsafe {
+                ffmpeg::ffi::avcodec_parameters_from_context((*stream).codecpar, *context)
+            };
+            if result < 0 {
+                return Err(Fmp4SegmenterError::ffmpeg(
+                    "avcodec_parameters_from_context(video)",
+                    result,
+                ));
+            }
+            unsafe {
+                (*stream).time_base = *time_base;
+                (*(*stream).codecpar).codec_tag = 0;
+            }
+            Some(stream)
+        } else {
+            None
         };
-        if result < 0 {
-            return Err(Fmp4SegmenterError::ffmpeg(
-                "avcodec_parameters_from_context(video)",
-                result,
-            ));
-        }
-        unsafe {
-            (*video_stream).time_base = video_source_time_base;
-            (*(*video_stream).codecpar).codec_tag = 0;
-        }
         let audio_stream = unsafe { ffmpeg::ffi::avformat_new_stream(muxer.context, ptr::null()) };
         if audio_stream.is_null() {
             return Err(Fmp4SegmenterError::new("audio avformat_new_stream failed"));
@@ -597,24 +634,50 @@ impl Fmp4Segmenter {
             return Err(Fmp4SegmenterError::ffmpeg("avformat_write_header", result));
         }
         muxer.lifecycle = MuxerLifecycle::HeaderWritten;
-        let video_stream_time_base = unsafe { (*video_stream).time_base };
+        let video_stream_time_base = video_stream.map(|stream| unsafe { (*stream).time_base });
         let audio_stream_time_base = unsafe { (*audio_stream).time_base };
         // AAC priming starts at DTS -1024. delay_moov lets the muxer build the edit list from
         // real first packets; init bytes are emitted with the first fragment and split there.
         let muxer_prefix = muxer.take_output()?;
+
+        let dimensions = video_details
+            .as_ref()
+            .map(|(_, _, _, _, width, height, _)| (*width, *height));
+        let video_source_time_base = video_details
+            .as_ref()
+            .map(|(_, _, time_base, ..)| *time_base);
+        let keyint_frames = video_details
+            .as_ref()
+            .map(|(_, _, _, _, _, _, rate)| rate.keyint_frames());
+        let fragment_duration_ticks = keyint_frames.map(i64::from).unwrap_or_else(|| unsafe {
+            ffmpeg::ffi::av_rescale_q(
+                i64::from(SEGMENT_DURATION_SECS),
+                ffmpeg::ffi::AVRational { num: 1, den: 1 },
+                audio_source_time_base,
+            )
+        });
+        crate::logger::log(format!(
+            "remote-stream fMP4 muxer: codecs={codecs} output={} fragment_ticks={fragment_duration_ticks}",
+            dimensions.map_or_else(
+                || "audio-only".to_owned(),
+                |(width, height)| format!("{width}x{height}")
+            )
+        ));
 
         Ok(Self {
             muxer,
             init_segment: InitSegmentState::Pending { muxer_prefix },
             codecs,
             bandwidth_bps,
-            width,
-            height,
+            dimensions,
             video_source_time_base,
             video_stream_time_base,
             audio_source_time_base,
             audio_stream_time_base,
-            keyint_frames: frame_rate.keyint_frames(),
+            video_stream_index: video_stream.map(|_| 0),
+            audio_stream_index: usize::from(video_stream.is_some()),
+            keyint_frames,
+            fragment_duration_ticks: fragment_duration_ticks.max(1),
             fragment: FragmentState::Empty,
             last_video_pts: None,
             last_video_dts: None,
@@ -643,7 +706,7 @@ impl Fmp4Segmenter {
     /// init と最初の media segment が同時に公開可能になってから返す。
     pub(crate) fn master_playlist(&self) -> Option<String> {
         self.init_segment()
-            .map(|_| master_playlist(&self.codecs, self.bandwidth_bps, self.width, self.height))
+            .map(|_| master_playlist(&self.codecs, self.bandwidth_bps, self.dimensions))
     }
 
     /// `EXT-X-MAP` が指す init を取得できる状態になってから返す。
@@ -688,7 +751,10 @@ impl Fmp4Segmenter {
         timeline_frame_index: CfrTimelineFrameIndex,
         frame: &mut ffmpeg::util::frame::video::Video,
     ) -> bool {
-        let boundary = timeline_frame_index.is_segment_boundary(self.keyint_frames);
+        let boundary = timeline_frame_index.is_segment_boundary(
+            self.keyint_frames
+                .expect("video frame preparation requires a video stream"),
+        );
         frame.set_kind(if boundary {
             ffmpeg::picture::Type::I
         } else {
@@ -724,7 +790,7 @@ impl Fmp4Segmenter {
     pub(crate) fn push_audio_packet(
         &mut self,
         packet: &ffmpeg::Packet,
-    ) -> Result<(), Fmp4SegmenterError> {
+    ) -> Result<Option<u64>, Fmp4SegmenterError> {
         match self.lifecycle {
             SegmenterLifecycle::Active => {}
             SegmenterLifecycle::Finished => {
@@ -748,7 +814,7 @@ impl Fmp4Segmenter {
     fn push_audio_packet_inner(
         &mut self,
         packet: &ffmpeg::Packet,
-    ) -> Result<(), Fmp4SegmenterError> {
+    ) -> Result<Option<u64>, Fmp4SegmenterError> {
         let pts = packet
             .pts()
             .ok_or_else(|| Fmp4SegmenterError::new("encoded audio packet has no PTS"))?;
@@ -776,9 +842,17 @@ impl Fmp4Segmenter {
                 "audio packet DTS {dts} arrived after fragment containing timestamps before {floor} was flushed"
             )));
         }
+        let completed = if self.video_stream_index.is_none()
+            && matches!(self.fragment, FragmentState::Writing { start_dts, .. }
+                if dts >= start_dts.saturating_add(self.fragment_duration_ticks))
+        {
+            self.flush_current_segment(Some(dts))?
+        } else {
+            None
+        };
         let duration = packet.duration().max(1);
         let mut mux_packet = packet.clone();
-        mux_packet.set_stream(AUDIO_STREAM_INDEX);
+        mux_packet.set_stream(self.audio_stream_index);
         mux_packet.set_duration(duration);
         mux_packet.rescale_ts(
             ffmpeg::Rational::from(self.audio_source_time_base),
@@ -796,7 +870,22 @@ impl Fmp4Segmenter {
         self.last_audio_pts = Some(pts);
         self.last_audio_dts = Some(dts);
         self.last_audio_end_dts = Some(dts.saturating_add(duration));
-        Ok(())
+        if self.video_stream_index.is_none() {
+            self.fragment = match self.fragment {
+                FragmentState::Empty => FragmentState::Writing {
+                    start_dts: dts,
+                    end_dts: dts.saturating_add(duration),
+                },
+                FragmentState::Writing { start_dts, .. } => FragmentState::Writing {
+                    start_dts,
+                    end_dts: dts.saturating_add(duration),
+                },
+                FragmentState::AwaitingIdr { .. } => {
+                    unreachable!("audio-only fragments never wait for a video IDR")
+                }
+            };
+        }
+        Ok(completed)
     }
 
     fn push_video_packet_inner(
@@ -831,7 +920,7 @@ impl Fmp4Segmenter {
         };
         let mut completed = None;
         if let FragmentState::Writing { start_dts, end_dts } = self.fragment {
-            let boundary_dts = start_dts.saturating_add(i64::from(self.keyint_frames));
+            let boundary_dts = start_dts.saturating_add(self.fragment_duration_ticks);
             if dts >= boundary_dts {
                 if packet_is_idr()? {
                     if dts > boundary_dts {
@@ -859,11 +948,20 @@ impl Fmp4Segmenter {
 
         let packet_duration = packet.duration().max(1);
         let mut mux_packet = packet.clone();
-        mux_packet.set_stream(VIDEO_STREAM_INDEX);
+        mux_packet.set_stream(
+            self.video_stream_index
+                .expect("video packets require a video stream"),
+        );
         mux_packet.set_duration(packet_duration);
         mux_packet.rescale_ts(
-            ffmpeg::Rational::from(self.video_source_time_base),
-            ffmpeg::Rational::from(self.video_stream_time_base),
+            ffmpeg::Rational::from(
+                self.video_source_time_base
+                    .expect("video packets require a video source time base"),
+            ),
+            ffmpeg::Rational::from(
+                self.video_stream_time_base
+                    .expect("video packets require a video stream time base"),
+            ),
         );
         let result = unsafe {
             ffmpeg::ffi::av_interleaved_write_frame(self.muxer.context, mux_packet.as_mut_ptr())
@@ -924,12 +1022,15 @@ impl Fmp4Segmenter {
                 "media segment duration is not positive",
             ));
         }
-        let audio_boundary_dts = boundary_dts.map(|video_dts| unsafe {
-            ffmpeg::ffi::av_rescale_q(
-                video_dts,
-                self.video_source_time_base,
-                self.audio_source_time_base,
-            )
+        let audio_boundary_dts = boundary_dts.map(|boundary| {
+            self.video_source_time_base
+                .map_or(boundary, |video_time_base| unsafe {
+                    ffmpeg::ffi::av_rescale_q(
+                        boundary,
+                        video_time_base,
+                        self.audio_source_time_base,
+                    )
+                })
         });
         if let (Some(audio_boundary), Some(last_audio_end)) =
             (audio_boundary_dts, self.last_audio_end_dts)
@@ -982,9 +1083,11 @@ impl Fmp4Segmenter {
                 "mp4 muxer fragment was not a moof+mdat media segment",
             ));
         }
-        let duration_secs = (end_dts - start_dts) as f64
-            * f64::from(self.video_source_time_base.num)
-            / f64::from(self.video_source_time_base.den);
+        let fragment_time_base = self
+            .video_source_time_base
+            .unwrap_or(self.audio_source_time_base);
+        let duration_secs = (end_dts - start_dts) as f64 * f64::from(fragment_time_base.num)
+            / f64::from(fragment_time_base.den);
         let sequence = self
             .ring
             .push(duration_secs, bytes)
@@ -1050,6 +1153,8 @@ mod tests {
 
     const AVERROR_EOF: i32 = -0x2046_4f45;
     const FFMPEG_EAGAIN: i32 = 11;
+    const VIDEO_STREAM_INDEX: usize = 0;
+    const AUDIO_STREAM_INDEX: usize = 1;
 
     #[test]
     fn codecs_are_parsed_from_avcc_and_annex_b_sps() {
@@ -1074,6 +1179,63 @@ mod tests {
 
     fn open_test_audio(bitrate_bps: u32) -> OpenedAacEncoder {
         open_aac_encoder(48_000, bitrate_bps, 0, StreamTimeline::new(0.0).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn audio_only_uses_the_shared_fmp4_ring_and_playlists() {
+        let mut audio = open_test_audio(96_000);
+        let mut segmenter = Fmp4Segmenter::audio_only_with_capacity(&audio.encoder, 4).unwrap();
+        let sample_rate = audio.input_sample_rate();
+        let sample_count = sample_rate as usize * 5;
+        let packets = audio
+            .push_chunk(ProcessedChunk {
+                samples: vec![0.0; sample_count * 2],
+                audible_pts_secs: 0.0,
+                duration_secs: sample_count as f64 / f64::from(sample_rate),
+                source_secs_per_output_sec: 1.0,
+                seek_serial: 0,
+                pdc_latency_secs_at_process: 0.0,
+            })
+            .unwrap()
+            .into_iter()
+            .chain(audio.finish().unwrap())
+            .collect::<Vec<_>>();
+
+        let mut completed = Vec::new();
+        for packet in packets {
+            if let Some(sequence) = segmenter.push_audio_packet(&packet).unwrap() {
+                completed.push(sequence);
+            }
+        }
+        if let Some(sequence) = segmenter.finish().unwrap() {
+            completed.push(sequence);
+        }
+
+        assert!(completed.len() >= 2);
+        assert_eq!(segmenter.codecs(), "mp4a.40.2");
+        let master = segmenter.master_playlist().unwrap();
+        assert!(master.contains(r#"CODECS="mp4a.40.2""#));
+        assert!(!master.contains("RESOLUTION="));
+        assert!(
+            segmenter
+                .media_playlist()
+                .unwrap()
+                .contains("#EXT-X-MAP:URI=\"init.mp4\"")
+        );
+        let init = segmenter.init_segment().unwrap();
+        let moov = mp4_child(init, *b"moov").expect("audio-only init has moov");
+        let tracks = mp4_boxes(moov)
+            .into_iter()
+            .filter(|(kind, _)| *kind == *b"trak")
+            .collect::<Vec<_>>();
+        assert_eq!(tracks.len(), 1);
+        assert!(tracks[0].1.windows(4).any(|bytes| bytes == b"soun"));
+        for sequence in completed {
+            let SegmentLookup::Found(segment) = segmenter.segment(sequence) else {
+                panic!("completed audio segment {sequence} is missing");
+            };
+            assert!(has_top_level_boxes(&segment.bytes, &[*b"moof", *b"mdat"]));
+        }
     }
 
     fn mp4_boxes(mut data: &[u8]) -> Vec<([u8; 4], &[u8])> {

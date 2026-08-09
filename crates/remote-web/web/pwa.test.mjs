@@ -535,7 +535,10 @@ test("image and video seek share tap-or-relative-drag handling without replacing
   assert.match(app, /seekRangePointerGestureDecision\(\{/);
   assert.match(app, /seekRangeAbsoluteValue\(\{/);
   assert.match(video, /this\.seekInput\.type = "range"/);
-  assert.match(video, /this\.seekInput\.setAttribute\("aria-label", "動画の再生位置"\)/);
+  assert.match(
+    video,
+    /this\.seekInput\.setAttribute\("aria-label", entry\.kind === "audio" \? "音声の再生位置" : "動画の再生位置"\)/
+  );
   assert.match(video, /this\.seekInput\.setAttribute\("aria-valuetext", this\.counter\.value\)/);
   assert.match(video, /seekRangePointerGestureDecision\(\{/);
   assert.match(video, /seekRangeAbsoluteValue\(\{/);
