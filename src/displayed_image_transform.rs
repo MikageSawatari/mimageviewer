@@ -471,6 +471,35 @@ impl FullscreenPageLayout {
             .find(|page| page.transform.contains_screen(pos))
     }
 
+    /// `pos` を含むページ。無ければ、`pos` を中心とする `window_size` 四方の窓と重なる
+    /// ページのうち `pos` にいちばん近いものを返す。
+    ///
+    /// ルーペのように「カーソルが画像の外へ出ても、拡大窓に画像が残っている間は対象を
+    /// 保ちたい」処理のための拡張。窓と重ならなくなれば `None` を返すので、拡大するものが
+    /// 無い状態で対象を持ち続けることはない。`window_size` が 0 なら `hit_test` と同じ。
+    pub(crate) fn hit_test_or_nearest_in_window(
+        &self,
+        pos: egui::Pos2,
+        window_size: f32,
+    ) -> Option<&DisplayedPage> {
+        if let Some(page) = self.hit_test(pos) {
+            return Some(page);
+        }
+        let window = egui::Rect::from_center_size(pos, egui::Vec2::splat(window_size.max(0.0)));
+        self.pages
+            .iter()
+            .filter_map(|page| {
+                let rect = page
+                    .transform
+                    .hit_rect
+                    .intersect(page.transform.viewport_rect);
+                (rect.is_positive() && rect.intersects(window))
+                    .then(|| (page, rect.distance_sq_to_pos(pos)))
+            })
+            .min_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(page, _)| page)
+    }
+
     pub(crate) fn page_by_idx(&self, page_idx: usize) -> Option<&DisplayedPage> {
         self.pages.iter().find(|page| page.page_idx() == page_idx)
     }
@@ -959,6 +988,61 @@ mod tests {
             Some(7)
         );
         assert!(layout.hit_test(egui::pos2(10.0, 10.0)).is_none());
+    }
+
+    /// ルーペは端の画素を見るためにカーソルを画像の外へ少し出す使い方をする。拡大窓に
+    /// 画像が残っている間は対象ページを保ち、何も拡大するものが無くなったら手放す。
+    #[test]
+    fn nearest_page_lookup_keeps_the_page_while_the_window_still_covers_it() {
+        let rect = egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(300.0, 400.0));
+        let layout = page_layout(FullscreenPageLayoutKind::Single, &[(7, rect)]);
+        let window = 100.0;
+
+        let inside = layout
+            .hit_test_or_nearest_in_window(rect.center(), window)
+            .map(|page| page.page_idx());
+        assert_eq!(inside, Some(7));
+
+        // 左へ 30pt はみ出した位置。窓 (半幅 50pt) はまだ画像に届いている。
+        let just_outside = layout
+            .hit_test_or_nearest_in_window(egui::pos2(70.0, 250.0), window)
+            .map(|page| page.page_idx());
+        assert_eq!(just_outside, Some(7));
+
+        // 半幅を超えて離れると拡大するものが無いので手放す。
+        assert!(
+            layout
+                .hit_test_or_nearest_in_window(egui::pos2(40.0, 250.0), window)
+                .is_none()
+        );
+
+        // 窓を 0 にすれば従来の hit_test と同じ。
+        assert!(
+            layout
+                .hit_test_or_nearest_in_window(egui::pos2(70.0, 250.0), 0.0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn nearest_page_lookup_picks_the_closer_side_of_a_spread() {
+        let left = egui::Rect::from_min_max(egui::pos2(0.0, 100.0), egui::pos2(200.0, 400.0));
+        let right = egui::Rect::from_min_max(egui::pos2(260.0, 100.0), egui::pos2(460.0, 400.0));
+        let layout = page_layout(FullscreenPageLayoutKind::Spread, &[(3, left), (4, right)]);
+
+        // 左右どちらの窓にも入る谷間で、近い側を選ぶ。
+        assert_eq!(
+            layout
+                .hit_test_or_nearest_in_window(egui::pos2(215.0, 250.0), 100.0)
+                .map(|page| page.page_idx()),
+            Some(3)
+        );
+        assert_eq!(
+            layout
+                .hit_test_or_nearest_in_window(egui::pos2(245.0, 250.0), 100.0)
+                .map(|page| page.page_idx()),
+            Some(4)
+        );
     }
 
     #[test]

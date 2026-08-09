@@ -60,6 +60,13 @@ const FS_NAVIGATOR_MARGIN: f32 = 12.0;
 const FS_NAVIGATOR_WHEEL_STEP: f32 = 20.0;
 const FS_NAVIGATOR_MIN_SELECTION: f32 = 8.0;
 const FS_NAVIGATOR_MIN_IMAGE_SCALE: f32 = 0.4;
+// ルーペパラメータ (将来設定化)
+const LOUPE_SIZE: f32 = 300.0;
+const LOUPE_ZOOM: f32 = 3.0;
+const LOUPE_OFFSET: f32 = 40.0;
+/// ルーペが 1 フレームで拡大している画面上の一辺。カーソルがページの外へ出ても、この窓に
+/// ページが残っている間は拡大するものがあるので、対象ページを保ってルーペを出し続ける。
+const LOUPE_SAMPLE_WINDOW: f32 = LOUPE_SIZE / LOUPE_ZOOM;
 /// Keep roughly one standard touch target visible so a dragged image always has an obvious
 /// recovery area. On an image or viewport smaller than this, the whole shorter axis is required.
 const FS_PAN_MIN_VISIBLE_PX: f32 = 48.0;
@@ -23164,7 +23171,14 @@ impl App {
             return;
         }
 
-        let Some(page) = self.fullscreen_page_layout.hit_test(cursor).copied() else {
+        // カーソルが画像の外へ出ても、拡大窓に画像が残っている間は消さない。端の画素を
+        // 検分するには少しはみ出す必要があり、`hit_test` だけだとその瞬間に対象ページを
+        // 失ってルーペごと消えていた (実機 2026-08-09)。
+        let Some(page) = self
+            .fullscreen_page_layout
+            .hit_test_or_nearest_in_window(cursor, LOUPE_SAMPLE_WINDOW)
+            .copied()
+        else {
             return;
         };
         let page_idx = page.page_idx();
@@ -23201,11 +23215,6 @@ impl App {
         // 画面 px → 今ルーペが参照するテクスチャ px の変換倍率。
         let total_scale = transform.screen_px_per_source_px(tex_size);
         let uv_center = transform.screen_to_source_normalized(cursor).to_vec2();
-
-        // ルーペパラメータ (将来設定化)
-        const LOUPE_SIZE: f32 = 300.0;
-        const LOUPE_ZOOM: f32 = 3.0;
-        const LOUPE_OFFSET: f32 = 40.0;
 
         // サンプル UV: LOUPE_SIZE / LOUPE_ZOOM をテクスチャピクセル単位に変換
         let sample_px_half = LOUPE_SIZE * 0.5 / (total_scale * LOUPE_ZOOM);
