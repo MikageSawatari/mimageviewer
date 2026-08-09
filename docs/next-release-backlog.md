@@ -1240,6 +1240,15 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   完了結果を withheld してからだけ `Ready` を公開する。literal な縮退寸法の分岐は置いていない。
   source reload の generation 境界でも同じ状態を失効させ、旧 worker 完了を同一 idx へ戻さない。
   `[compare-geometry]` の一時計測は実機確認まで残す。
+- 上記見立ての訂正と真因 (2026-08-10): 利用者実機では `ComparePreparationState` 導入後も症状が
+  残り、利用者の切り分けと `[compare-geometry]` ログから、4×4 の縮退 pair 説は誤りと確定した。
+  真因は縦横比が異なる場合の pinned 整列バッファで、current 自身の寸法を `target_size` とする
+  キャンバスへ pinned を等比縮小・中央配置した際、未書き込み余白が透明 RGBA のままだったこと。
+  WGPU は alpha blending、CPU fallback の Wipe も current を先に描くため、その透明余白から
+  current が見えて `[current | pinned | current]` になっていた。`target_size` の決め方は維持し、
+  比較準備 worker が pinned の範囲外をフルスクリーン既定背景と同じ不透明な黒で埋めるよう修正。
+  PinnedNormal / Wipe は黒い余白を表示し、Diff は黒背景と current の差を余白にも表示する。
+  異なる縦横比の余白画素と、同じ縦横比では従来の Lanczos 出力が変わらないことを単体テストで固定した。
 
 ### 1.61 見開きでページが 1 枚ダブる (横長ページの寸法をキャッシュ在住に頼っている) — 利用者報告
 

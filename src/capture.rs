@@ -608,6 +608,7 @@ pub fn align_rgba_to_canvas_lanczos(
     src_rgba: &[u8],
     canvas_w: u32,
     canvas_h: u32,
+    canvas_color: egui::Color32,
 ) -> Result<Vec<u8>, String> {
     if src_w == 0 || src_h == 0 || canvas_w == 0 || canvas_h == 0 {
         return Err("比較画像のサイズが 0 です".to_string());
@@ -635,7 +636,7 @@ pub fn align_rgba_to_canvas_lanczos(
         .checked_mul(canvas_h)
         .and_then(|px| px.checked_mul(4))
         .ok_or_else(|| "比較画像のキャンバスが大きすぎます".to_string())? as usize;
-    let mut out = vec![0_u8; len];
+    let mut out = canvas_color.to_srgba_unmultiplied().repeat(len / 4);
     let offset_x = (canvas_w - resized_w) / 2;
     blit_centered_exact_y(
         &mut out,
@@ -994,15 +995,43 @@ mod tests {
     }
 
     #[test]
-    fn align_rgba_to_canvas_lanczos_centers_with_transparent_padding() {
+    fn align_rgba_to_canvas_lanczos_centers_with_opaque_background_padding() {
         let src = vec![255, 0, 0, 255, 255, 0, 0, 255];
-        let out = align_rgba_to_canvas_lanczos(1, 2, &src, 4, 4).unwrap();
+        let out = align_rgba_to_canvas_lanczos(1, 2, &src, 4, 4, egui::Color32::BLACK).unwrap();
 
         assert_eq!(out.len(), 4 * 4 * 4);
-        assert_eq!(&out[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&out[0..4], &[0, 0, 0, 255]);
         assert_eq!(&out[4..8], &[255, 0, 0, 255]);
         assert_eq!(&out[8..12], &[255, 0, 0, 255]);
-        assert_eq!(&out[12..16], &[0, 0, 0, 0]);
+        assert_eq!(&out[12..16], &[0, 0, 0, 255]);
+
+        let current = vec![64, 128, 255, 255].repeat(4 * 4);
+        let diff = diff_rgba_color(4, 4, &out, &current).unwrap();
+        assert_ne!(&diff[0..4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn align_rgba_to_canvas_lanczos_preserves_same_aspect_output() {
+        let src = image::RgbaImage::from_fn(2, 3, |x, y| {
+            image::Rgba([
+                (x * 91 + y * 17) as u8,
+                (x * 23 + y * 71) as u8,
+                (x * 47 + y * 31) as u8,
+                255,
+            ])
+        });
+        let expected = crate::fast_resize::resize_rgba8_exact(
+            &src,
+            4,
+            6,
+            crate::fast_resize::Quality::Lanczos3,
+        )
+        .into_raw();
+
+        let out =
+            align_rgba_to_canvas_lanczos(2, 3, src.as_raw(), 4, 6, egui::Color32::BLACK).unwrap();
+
+        assert_eq!(out, expected);
     }
 
     #[test]

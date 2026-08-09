@@ -22886,6 +22886,10 @@ impl App {
                             &pinned_source_rgba,
                             width,
                             height,
+                            // フルスクリーン viewport の既定背景と同じ黒。透明余白にすると
+                            // alpha blend で下の current が透けるため、比較キャンバス側で
+                            // pinned の範囲外を不透明に確定する。
+                            egui::Color32::BLACK,
                         )?;
                         let diff_rgba = crate::capture::diff_rgba_color(
                             width,

@@ -1012,6 +1012,10 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 渡すため GPU texture / mip chainを再利用する。一方、`egui-wgpu`は全callbackのprepare後にpaint
 するため、callbackごとに異なるuniformとbind groupは`CompareShaderSlot::{Main, Navigator}`ごとに
 保持し、後のprepareが先の描画状態を上書きしない。
+比較キャンバスの寸法は current 側の完成画像寸法を正本とし、縦横比が違う pinned 側は等比縮小して
+中央配置する。このとき pinned の範囲外はフルスクリーン viewport の既定背景と同じ不透明な黒で
+埋め、WGPU の alpha blend と CPU fallback のどちらでも下層の current を透過させない。Diff は
+この黒背景と current の画素差を表示するため、current が黒でない余白は「差あり」として見える。
 本文の比較 callback は、ズーム / パン後の実画像矩形と viewport の交差だけを callback rect にし、
 切り落とした範囲を uniform の UV 窓で元の合成画像座標へ戻す。テクスチャ採取と Wipe 境界判定は
 復元後の座標を共有するため、白線の基準である実画像矩形と一致する。ナビゲータは実画像矩形が
