@@ -46840,7 +46840,7 @@ fn fullscreen_mode_change_resets_still_and_music_left_runtime_state() {
     app.metadata_panel_hover_active = true;
     app.music_left_panel_active = true;
     app.music_right_panel_active = true;
-    app.music_left_click_open = true;
+    app.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
     app.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
 
     app.reset_fs_side_panel_runtime_for_mode_change();
@@ -46849,7 +46849,10 @@ fn fullscreen_mode_change_resets_still_and_music_left_runtime_state() {
     assert!(!app.metadata_panel_hover_active);
     assert!(!app.music_left_panel_active);
     assert!(!app.music_right_panel_active);
-    assert!(!app.music_left_click_open);
+    assert_eq!(
+        app.music_left_panel_open,
+        crate::ui_helpers::MetadataPanelOpenState::Closed
+    );
     assert_eq!(
         app.fs_info_panel_open,
         crate::ui_helpers::MetadataPanelOpenState::Closed
@@ -47503,7 +47506,7 @@ fn fullscreen_tab_round_trips_with_open_panels_on_all_egui_surfaces() {
         if kind == 0 {
             app.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
         } else {
-            app.music_left_click_open = true;
+            app.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
         }
 
         assert_fullscreen_tab_round_trip(&mut app, idx);
@@ -47511,13 +47514,16 @@ fn fullscreen_tab_round_trips_with_open_panels_on_all_egui_surfaces() {
 }
 
 #[test]
-fn music_left_click_panel_resets_with_music_view_session() {
+fn music_left_panel_owner_resets_with_music_view_session() {
     let mut app = phase_c_support::setup_app();
-    app.music_left_click_open = true;
+    app.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
 
     app.clear_music_view_state();
 
-    assert!(!app.music_left_click_open);
+    assert_eq!(
+        app.music_left_panel_open,
+        crate::ui_helpers::MetadataPanelOpenState::Closed
+    );
 }
 
 #[cfg(windows)]
@@ -47526,14 +47532,17 @@ fn video_audio_transition_resets_music_left_session_but_keeps_same_file_right_st
     let mut app = phase_c_support::setup_app();
     app.music_left_panel_active = true;
     app.music_right_panel_active = true;
-    app.music_left_click_open = true;
+    app.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
     app.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
 
     app.reset_video_audio_side_panel_sessions(usize::MAX);
 
     assert!(!app.music_left_panel_active);
     assert!(!app.music_right_panel_active);
-    assert!(!app.music_left_click_open);
+    assert_eq!(
+        app.music_left_panel_open,
+        crate::ui_helpers::MetadataPanelOpenState::Closed
+    );
     assert_eq!(
         app.fs_info_panel_open,
         crate::ui_helpers::MetadataPanelOpenState::ByPointer

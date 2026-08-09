@@ -7451,7 +7451,7 @@ impl App {
     pub(crate) fn reset_video_audio_side_panel_sessions(&mut self, fs_idx: usize) {
         self.music_left_panel_active = false;
         self.music_right_panel_active = false;
-        self.music_left_click_open = false;
+        self.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.reset_native_side_panel_session();
         }

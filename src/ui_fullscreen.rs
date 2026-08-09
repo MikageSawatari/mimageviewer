@@ -1153,21 +1153,26 @@ pub(crate) fn panel_callout_bar_rect(
     )
 }
 
-/// Touch chrome reserves a 48 pt side handle: above the 40 pt target from the
-/// tablet measurements, with enough horizontal margin for normal finger drift.
-/// Keep this as the single width tuning point for Step 3b device feedback.
-const STILL_TOUCH_PANEL_HANDLE_WIDTH_PT: f32 = 48.0;
+/// Touch chrome reserves at most a 48 pt side handle: above the 40 pt target
+/// from the tablet measurements, with enough horizontal margin for normal
+/// finger drift. Music narrows this only to stay inside its existing empty
+/// visualization margin.
+const TOUCH_PANEL_HANDLE_WIDTH_PT: f32 = 48.0;
+const MUSIC_TOUCH_PANEL_HANDLE_MIN_WIDTH_PT: f32 = 24.0;
 
-fn still_touch_panel_handle_rect(
+fn touch_panel_handle_rect(
     full_rect: egui::Rect,
     edge: crate::ui_helpers::PanelEdge,
+    safe_top_inset: f32,
+    safe_bottom_inset: f32,
+    max_width: f32,
 ) -> egui::Rect {
     if edge == crate::ui_helpers::PanelEdge::Top {
         return egui::Rect::NOTHING;
     }
 
-    let safe_top = (full_rect.top() + TOP_BAR_HEIGHT).min(full_rect.bottom());
-    let safe_bottom = (full_rect.bottom() - FS_SEEK_BAR_HEIGHT).max(full_rect.top());
+    let safe_top = (full_rect.top() + safe_top_inset.max(0.0)).min(full_rect.bottom());
+    let safe_bottom = (full_rect.bottom() - safe_bottom_inset.max(0.0)).max(full_rect.top());
     if safe_bottom <= safe_top {
         return egui::Rect::NOTHING;
     }
@@ -1175,7 +1180,9 @@ fn still_touch_panel_handle_rect(
     let height = (full_rect.height() * 0.24)
         .clamp(96.0, 220.0)
         .min(safe_height);
-    let width = STILL_TOUCH_PANEL_HANDLE_WIDTH_PT.min(full_rect.width().max(0.0) * 0.5);
+    let width = TOUCH_PANEL_HANDLE_WIDTH_PT
+        .min(max_width.max(0.0))
+        .min(full_rect.width().max(0.0) * 0.5);
     if width <= 0.0 || height <= 0.0 {
         return egui::Rect::NOTHING;
     }
@@ -1187,6 +1194,19 @@ fn still_touch_panel_handle_rect(
     egui::Rect::from_min_size(
         egui::pos2(x, (safe_top + safe_bottom - height) * 0.5),
         egui::vec2(width, height),
+    )
+}
+
+fn still_touch_panel_handle_rect(
+    full_rect: egui::Rect,
+    edge: crate::ui_helpers::PanelEdge,
+) -> egui::Rect {
+    touch_panel_handle_rect(
+        full_rect,
+        edge,
+        TOP_BAR_HEIGHT,
+        FS_SEEK_BAR_HEIGHT,
+        TOUCH_PANEL_HANDLE_WIDTH_PT,
     )
 }
 
@@ -1203,10 +1223,23 @@ fn visible_still_touch_panel_handle_rects(
     left_panel_open: bool,
     right_panel_open: bool,
 ) -> [egui::Rect; 2] {
+    visible_touch_panel_handle_rects(
+        still_touch_panel_handle_rects(full_rect),
+        handles_enabled,
+        left_panel_open,
+        right_panel_open,
+    )
+}
+
+fn visible_touch_panel_handle_rects(
+    [left, right]: [egui::Rect; 2],
+    handles_enabled: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
+) -> [egui::Rect; 2] {
     if !handles_enabled {
         return [egui::Rect::NOTHING; 2];
     }
-    let [left, right] = still_touch_panel_handle_rects(full_rect);
     [
         if left_panel_open {
             egui::Rect::NOTHING
@@ -1646,17 +1679,10 @@ fn fullscreen_side_panel_contains_pointer(
 fn music_left_panel_visible_from_inputs(
     mode: crate::settings::FsSidePanelMode,
     hover_active: bool,
-    session_open: bool,
+    open_state: crate::ui_helpers::MetadataPanelOpenState,
     modal_open: bool,
 ) -> bool {
-    if modal_open {
-        return false;
-    }
-    match mode.normalized() {
-        crate::settings::FsSidePanelMode::Hover => hover_active,
-        crate::settings::FsSidePanelMode::ClickToShow => session_open,
-        crate::settings::FsSidePanelMode::Unknown => unreachable!("normalized side panel mode"),
-    }
+    music_right_panel_visible_from_inputs(mode, hover_active, open_state, modal_open)
 }
 
 fn music_right_panel_visible_from_inputs(
@@ -1690,7 +1716,7 @@ impl MusicViewFrameUiState {
         mode: crate::settings::FsSidePanelMode,
         left_hover_active: bool,
         right_hover_active: bool,
-        left_session_open: bool,
+        left_open_state: crate::ui_helpers::MetadataPanelOpenState,
         right_open_state: crate::ui_helpers::MetadataPanelOpenState,
         modal_open: bool,
     ) -> Self {
@@ -1698,7 +1724,7 @@ impl MusicViewFrameUiState {
             left_panel_visible: music_left_panel_visible_from_inputs(
                 mode,
                 left_hover_active,
-                left_session_open,
+                left_open_state,
                 modal_open,
             ),
             right_panel_visible: music_right_panel_visible_from_inputs(
@@ -1717,6 +1743,97 @@ impl MusicViewFrameUiState {
 }
 
 const MUSIC_TOP_BAR_HEIGHT: f32 = 54.0;
+
+fn music_visualization_side_margin(view_width: f32) -> f32 {
+    let edge_trigger = crate::ui_helpers::panel_edge_trigger_px(view_width);
+    (edge_trigger + view_width.max(0.0) * 0.03).max(8.0)
+}
+
+fn music_touch_panel_handle_rects(full_rect: egui::Rect) -> [egui::Rect; 2] {
+    let max_width = music_visualization_side_margin(full_rect.width());
+    let rects = [
+        touch_panel_handle_rect(
+            full_rect,
+            crate::ui_helpers::PanelEdge::Left,
+            MUSIC_TOP_BAR_HEIGHT,
+            crate::ui_music_panels::MUSIC_HUD_HEIGHT,
+            max_width,
+        ),
+        touch_panel_handle_rect(
+            full_rect,
+            crate::ui_helpers::PanelEdge::Right,
+            MUSIC_TOP_BAR_HEIGHT,
+            crate::ui_music_panels::MUSIC_HUD_HEIGHT,
+            max_width,
+        ),
+    ];
+    if rects[0].width() < MUSIC_TOUCH_PANEL_HANDLE_MIN_WIDTH_PT {
+        [egui::Rect::NOTHING; 2]
+    } else {
+        rects
+    }
+}
+
+fn visible_music_touch_panel_handle_rects(
+    full_rect: egui::Rect,
+    handles_enabled: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
+) -> [egui::Rect; 2] {
+    visible_touch_panel_handle_rects(
+        music_touch_panel_handle_rects(full_rect),
+        handles_enabled,
+        left_panel_open,
+        right_panel_open,
+    )
+}
+
+fn music_panel_callout_edges_without_touch_handles(handle_rects: [egui::Rect; 2]) -> [bool; 2] {
+    handle_rects.map(|rect| !rect.is_positive())
+}
+
+fn music_touch_observed_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::new(("miv_music_touch_observed", ctx.viewport_id()))
+}
+
+fn observe_music_touch_for_panel_handles(ctx: &egui::Context, gestures_disabled: bool) -> bool {
+    if gestures_disabled {
+        return false;
+    }
+    let id = music_touch_observed_id(ctx);
+    if ctx.data(|data| data.get_temp::<bool>(id).unwrap_or(false)) {
+        return true;
+    }
+    let touch_observed = ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Touch { .. }))
+    });
+    if touch_observed {
+        ctx.data_mut(|data| data.insert_temp(id, true));
+    }
+    touch_observed
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MusicPanelReachSource {
+    Pointer,
+    TouchHandle,
+}
+
+fn music_panel_open_state_after_reach(
+    mode: crate::settings::FsSidePanelMode,
+    state: crate::ui_helpers::MetadataPanelOpenState,
+    source: MusicPanelReachSource,
+) -> crate::ui_helpers::MetadataPanelOpenState {
+    match source {
+        MusicPanelReachSource::Pointer => {
+            crate::ui_helpers::toggle_side_panel_by_pointer(mode, state)
+        }
+        MusicPanelReachSource::TouchHandle => crate::ui_helpers::open_side_panel_by_touch(state),
+    }
+}
 
 fn music_side_panel_contains_pointer(
     full_rect: egui::Rect,
@@ -6283,16 +6400,35 @@ fn paint_panel_callout_chrome(
     );
 }
 
-fn interact_still_touch_panel_handle(
+fn interact_touch_panel_handle(
     ui: &mut egui::Ui,
     rect: egui::Rect,
-    edge: crate::ui_helpers::PanelEdge,
+    id: egui::Id,
 ) -> egui::Response {
-    ui.interact(
-        rect,
-        egui::Id::new(("fs_touch_panel_handle", edge)),
-        egui::Sense::click(),
-    )
+    ui.interact(rect, id, egui::Sense::click())
+}
+
+fn draw_music_touch_panel_handle(
+    ctx: &egui::Context,
+    bar_rect: egui::Rect,
+    edge: crate::ui_helpers::PanelEdge,
+) -> bool {
+    egui::Area::new(egui::Id::new((
+        "music_touch_panel_handle",
+        ctx.viewport_id(),
+        edge,
+    )))
+    .order(crate::ui_helpers::PANEL_CALLOUT_ORDER)
+    .fixed_pos(bar_rect.min)
+    .show(ctx, |ui| {
+        ui.set_min_size(bar_rect.size());
+        let rect = egui::Rect::from_min_size(ui.min_rect().min, bar_rect.size());
+        let hit_id = ui.id().with(("music_touch_panel_handle_hit", edge));
+        let response = interact_touch_panel_handle(ui, rect, hit_id);
+        paint_panel_callout_chrome(ui, rect, edge, false, response.hovered());
+        response.on_hover_text("パネルを開く").clicked()
+    })
+    .inner
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -6493,6 +6629,82 @@ pub fn draw_still_panel_reach_snapshot_fixture(
     }
 }
 
+/// Visual-only fixture for the music touch-panel handles. Production margin,
+/// handle geometry, visibility, and painting are reused so the snapshot also
+/// guards the empty-margin boundary around the mock waveform.
+#[doc(hidden)]
+pub fn draw_music_panel_reach_snapshot_fixture(
+    ui: &mut egui::Ui,
+    touch_observed: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
+) {
+    let full_rect = ui.max_rect();
+    let painter = ui.painter();
+    painter.rect_filled(full_rect, 0.0, crate::ui_music_timeline::MUSIC_VIEW_BG);
+    let top_rect = egui::Rect::from_min_size(
+        full_rect.min,
+        egui::vec2(full_rect.width(), MUSIC_TOP_BAR_HEIGHT),
+    );
+    let hud_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            full_rect.left(),
+            full_rect.bottom() - crate::ui_music_panels::MUSIC_HUD_HEIGHT,
+        ),
+        full_rect.max,
+    );
+    painter.rect_filled(top_rect, 0.0, egui::Color32::from_rgb(22, 25, 31));
+    painter.rect_filled(hud_rect, 0.0, egui::Color32::from_rgb(22, 25, 31));
+
+    let margin = music_visualization_side_margin(full_rect.width());
+    let waveform_rect = egui::Rect::from_min_max(
+        egui::pos2(full_rect.left() + margin, top_rect.bottom() + 16.0),
+        egui::pos2(full_rect.right() - margin, hud_rect.top() - 16.0),
+    );
+    painter.rect_filled(waveform_rect, 4.0, egui::Color32::from_rgb(8, 10, 14));
+    let center_y = waveform_rect.center().y;
+    painter.line_segment(
+        [
+            egui::pos2(waveform_rect.left(), center_y),
+            egui::pos2(waveform_rect.right(), center_y),
+        ],
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(70, 170, 225)),
+    );
+
+    if left_panel_open {
+        let panel_rect = egui::Rect::from_min_max(
+            egui::pos2(full_rect.left(), top_rect.bottom()),
+            egui::pos2(
+                full_rect.left() + crate::ui_music_panels::MUSIC_LEFT_PANEL_WIDTH,
+                hud_rect.top(),
+            ),
+        );
+        painter.rect_filled(panel_rect, 0.0, egui::Color32::from_rgb(30, 30, 34));
+        painter.text(
+            panel_rect.left_top() + egui::vec2(16.0, 16.0),
+            egui::Align2::LEFT_TOP,
+            "ブックマーク",
+            egui::FontId::proportional(18.0),
+            egui::Color32::WHITE,
+        );
+    }
+    for (edge, rect) in [
+        crate::ui_helpers::PanelEdge::Left,
+        crate::ui_helpers::PanelEdge::Right,
+    ]
+    .into_iter()
+    .zip(visible_music_touch_panel_handle_rects(
+        full_rect,
+        touch_observed,
+        left_panel_open,
+        right_panel_open,
+    )) {
+        if rect.is_positive() {
+            paint_panel_callout_chrome(ui, rect, edge, false, false);
+        }
+    }
+}
+
 impl App {
     /// live なフルスクリーン cache から、現在世代で判明済みのページ寸法を回収する。
     /// cache 自体は小さな先読み窓なので、フレーム冒頭に 1 回だけ走査する。
@@ -6588,7 +6800,11 @@ impl App {
             if !rect.is_positive() {
                 continue;
             }
-            let response = interact_still_touch_panel_handle(ui, rect, edge);
+            let response = interact_touch_panel_handle(
+                ui,
+                rect,
+                egui::Id::new(("fs_touch_panel_handle", edge)),
+            );
             let action = still_side_panel_action_for_handle_edge(edge);
             paint_panel_callout_chrome(ui, rect, edge, false, response.hovered());
             if response.on_hover_text("パネルを開く").clicked() {
@@ -6709,6 +6925,29 @@ impl App {
         );
     }
 
+    fn apply_music_panel_reach_requests(
+        &mut self,
+        left: Option<MusicPanelReachSource>,
+        right: Option<MusicPanelReachSource>,
+    ) -> bool {
+        let mode = self.settings.fullscreen_side_panel_mode;
+        let mut changed = false;
+        if let Some(source) = left {
+            let next = music_panel_open_state_after_reach(mode, self.music_left_panel_open, source);
+            changed |= next != self.music_left_panel_open;
+            self.music_left_panel_open = next;
+        }
+        if let Some(source) = right {
+            let next = music_panel_open_state_after_reach(mode, self.fs_info_panel_open, source);
+            if next != self.fs_info_panel_open {
+                self.fs_info_panel_open = next;
+                self.metadata_panel_hover_active = false;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     fn draw_music_panel_callouts(
         &mut self,
         ctx: &egui::Context,
@@ -6717,10 +6956,52 @@ impl App {
         panel_band_bottom: f32,
         fs_idx: usize,
         enabled: bool,
+        touch_observed: bool,
+        left_panel_visible: bool,
+        right_panel_visible: bool,
     ) {
-        if !enabled
-            || self.settings.fullscreen_side_panel_mode.normalized()
-                != crate::settings::FsSidePanelMode::ClickToShow
+        if !enabled {
+            return;
+        }
+        let handle_rects = visible_music_touch_panel_handle_rects(
+            full_rect,
+            touch_observed,
+            left_panel_visible,
+            right_panel_visible,
+        );
+        // A sticky touch observation is not an input-mode switch: mouse callouts must keep
+        // working. Suppress a callout only on the same edge as a positive handle rect, where
+        // drawing both hit targets would let one mouse click open and toggle the panel.
+        let callout_enabled_edges = music_panel_callout_edges_without_touch_handles(handle_rects);
+        if touch_observed {
+            let mut left = None;
+            let mut right = None;
+            for (edge, rect) in [
+                crate::ui_helpers::PanelEdge::Left,
+                crate::ui_helpers::PanelEdge::Right,
+            ]
+            .into_iter()
+            .zip(handle_rects)
+            {
+                if !rect.is_positive() || !draw_music_touch_panel_handle(ctx, rect, edge) {
+                    continue;
+                }
+                match edge {
+                    crate::ui_helpers::PanelEdge::Left => {
+                        left = Some(MusicPanelReachSource::TouchHandle)
+                    }
+                    crate::ui_helpers::PanelEdge::Right => {
+                        right = Some(MusicPanelReachSource::TouchHandle)
+                    }
+                    crate::ui_helpers::PanelEdge::Top => {}
+                }
+            }
+            if self.apply_music_panel_reach_requests(left, right) {
+                ctx.request_repaint();
+            }
+        }
+        if self.settings.fullscreen_side_panel_mode.normalized()
+            != crate::settings::FsSidePanelMode::ClickToShow
         {
             return;
         }
@@ -6737,10 +7018,16 @@ impl App {
         );
         let mut toggle_left = false;
         let mut toggle_right = false;
-        for edge in [
+        for (edge, callout_enabled) in [
             crate::ui_helpers::PanelEdge::Left,
             crate::ui_helpers::PanelEdge::Right,
-        ] {
+        ]
+        .into_iter()
+        .zip(callout_enabled_edges)
+        {
+            if !callout_enabled {
+                continue;
+            }
             if !crate::ui_helpers::callout_hit(panel_callout_edge_rect(full_rect, edge), pointer) {
                 continue;
             }
@@ -6751,7 +7038,7 @@ impl App {
                 continue;
             }
             let open = match edge {
-                crate::ui_helpers::PanelEdge::Left => self.music_left_click_open,
+                crate::ui_helpers::PanelEdge::Left => self.music_left_panel_open.is_open(),
                 crate::ui_helpers::PanelEdge::Right => self.metadata_panel_click_shown(),
                 crate::ui_helpers::PanelEdge::Top => false,
             };
@@ -6800,13 +7087,9 @@ impl App {
                 }
             }
         }
-        if toggle_left {
-            self.music_left_click_open = !self.music_left_click_open;
-        }
-        if toggle_right {
-            self.toggle_fullscreen_click_info_open();
-        }
-        if toggle_left || toggle_right {
+        let left = toggle_left.then_some(MusicPanelReachSource::Pointer);
+        let right = toggle_right.then_some(MusicPanelReachSource::Pointer);
+        if self.apply_music_panel_reach_requests(left, right) {
             ctx.request_repaint();
         }
     }
@@ -17030,7 +17313,7 @@ impl App {
             && music_left_panel_visible_from_inputs(
                 self.settings.fullscreen_side_panel_mode,
                 self.music_left_panel_active,
-                self.music_left_click_open,
+                self.music_left_panel_open,
                 music_modal_open,
             );
         let music_right_panel_visible = music_view_active
@@ -28311,6 +28594,10 @@ impl App {
         // 背景色はタイムラインのラベル列 / 左右隙間と共有 (実機 FB 2026-07、色の不揃い解消)。
         let bg = crate::ui_music_timeline::MUSIC_VIEW_BG;
         painter.rect_filled(rect, 0.0, bg);
+        let touch_observed = observe_music_touch_for_panel_handles(
+            ctx,
+            crate::touch_correlation::touch_gestures_disabled(),
+        );
 
         // 音楽ビューを開いている間はタイムライン解析を確実に走らせ、結果を取り込む (Inc 3b)。
         // ブックマーク (Inc 5) も現在ファイル用にロードしておく (左パネルが閉じていても
@@ -28401,8 +28688,7 @@ impl App {
         // 接し、グラフ端をクリックしようとして僅かにはみ出すとパネルが出てしまう。3% の隙間を挟む
         // ことでその誤爆を防ぐ (トリガ自体は 5% のまま = パネルの開けやすさをウィンドウモードでも
         // 維持)。gutter (= 5%+3% = 8%) は最低 8px。
-        let edge_trigger = crate::ui_helpers::panel_edge_trigger_px(rect.width());
-        let content_gutter = (edge_trigger + rect.width() * 0.03).max(8.0);
+        let content_gutter = music_visualization_side_margin(rect.width());
 
         // 中央領域の下端に MIDI 半音 spectrum + ピッチ鍵盤 (Inc 4) の帯を確保する。残りが
         // タイムライン (or 解析中アイコン) の領域。縦窓が短いときに spectrum が timeline を
@@ -28498,7 +28784,7 @@ impl App {
             side_panel_mode,
             self.music_left_panel_active,
             self.music_right_panel_active,
-            self.music_left_click_open,
+            self.music_left_panel_open,
             self.fs_info_panel_open,
             music_modal_open,
         );
@@ -28759,6 +29045,9 @@ impl App {
             panel_band_bottom,
             fs_idx,
             !music_modal_open,
+            touch_observed,
+            left_hover,
+            right_hover,
         );
 
         // 上情報バー (常時): ファイル名 (左) + Row ステッパー (中央、timeline 時) +
@@ -30616,19 +30905,31 @@ mod tests {
         assert!(music_left_panel_visible_from_inputs(
             FsSidePanelMode::Hover,
             true,
-            false,
+            Closed,
             false,
         ));
         assert!(!music_left_panel_visible_from_inputs(
             FsSidePanelMode::ClickToShow,
             true,
-            false,
+            Closed,
             false,
         ));
         assert!(music_left_panel_visible_from_inputs(
             FsSidePanelMode::ClickToShow,
             false,
-            true,
+            ByPointer,
+            false,
+        ));
+        assert!(!music_left_panel_visible_from_inputs(
+            FsSidePanelMode::Hover,
+            false,
+            ByPointer,
+            false,
+        ));
+        assert!(music_left_panel_visible_from_inputs(
+            FsSidePanelMode::Hover,
+            false,
+            ByTouchHandle,
             false,
         ));
 
@@ -30660,7 +30961,7 @@ mod tests {
         assert!(!music_left_panel_visible_from_inputs(
             FsSidePanelMode::ClickToShow,
             false,
-            true,
+            ByPointer,
             true,
         ));
         assert!(!music_right_panel_visible_from_inputs(
@@ -30672,6 +30973,30 @@ mod tests {
     }
 
     #[test]
+    fn music_panel_reach_preserves_mouse_hover_and_opens_touch_explicitly() {
+        use crate::settings::FsSidePanelMode;
+        use crate::ui_helpers::MetadataPanelOpenState::{ByTouchHandle, Closed};
+
+        assert_eq!(
+            music_panel_open_state_after_reach(
+                FsSidePanelMode::Hover,
+                Closed,
+                MusicPanelReachSource::Pointer,
+            ),
+            Closed,
+            "mouse-only Hover must not create explicit state"
+        );
+        assert_eq!(
+            music_panel_open_state_after_reach(
+                FsSidePanelMode::Hover,
+                Closed,
+                MusicPanelReachSource::TouchHandle,
+            ),
+            ByTouchHandle
+        );
+    }
+
+    #[test]
     fn music_view_interactive_ui_blocks_cursor_auto_hide() {
         use crate::settings::FsSidePanelMode;
         use crate::ui_helpers::MetadataPanelOpenState::{ByPointer, Closed};
@@ -30680,7 +31005,7 @@ mod tests {
             FsSidePanelMode::Hover,
             false,
             false,
-            false,
+            Closed,
             Closed,
             false,
         );
@@ -30690,7 +31015,7 @@ mod tests {
             FsSidePanelMode::Hover,
             true,
             false,
-            false,
+            Closed,
             Closed,
             false,
         );
@@ -30701,7 +31026,7 @@ mod tests {
             FsSidePanelMode::ClickToShow,
             false,
             false,
-            false,
+            Closed,
             ByPointer,
             false,
         );
@@ -30712,7 +31037,7 @@ mod tests {
             FsSidePanelMode::Hover,
             true,
             true,
-            false,
+            Closed,
             Closed,
             true,
         );
@@ -31088,7 +31413,7 @@ mod tests {
     fn touch_panel_handles_are_large_symmetric_and_avoid_chrome_bars() {
         let viewport = egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(1200.0, 600.0));
         let [left, right] = still_touch_panel_handle_rects(viewport);
-        assert_eq!(left.width(), STILL_TOUCH_PANEL_HANDLE_WIDTH_PT);
+        assert_eq!(left.width(), TOUCH_PANEL_HANDLE_WIDTH_PT);
         assert!(left.width() >= 44.0);
         assert_eq!(right.width(), left.width());
         assert_eq!(left.height(), right.height());
@@ -31110,6 +31435,210 @@ mod tests {
             still_touch_panel_handle_rects(too_short)
                 .into_iter()
                 .all(|rect| !rect.is_positive())
+        );
+    }
+
+    #[test]
+    fn common_touch_handle_geometry_preserves_legacy_still_rects_exactly() {
+        fn legacy(full_rect: egui::Rect, edge: crate::ui_helpers::PanelEdge) -> egui::Rect {
+            if edge == crate::ui_helpers::PanelEdge::Top {
+                return egui::Rect::NOTHING;
+            }
+            let safe_top = (full_rect.top() + TOP_BAR_HEIGHT).min(full_rect.bottom());
+            let safe_bottom = (full_rect.bottom() - FS_SEEK_BAR_HEIGHT).max(full_rect.top());
+            if safe_bottom <= safe_top {
+                return egui::Rect::NOTHING;
+            }
+            let safe_height = safe_bottom - safe_top;
+            let height = (full_rect.height() * 0.24)
+                .clamp(96.0, 220.0)
+                .min(safe_height);
+            let width = TOUCH_PANEL_HANDLE_WIDTH_PT.min(full_rect.width().max(0.0) * 0.5);
+            if width <= 0.0 || height <= 0.0 {
+                return egui::Rect::NOTHING;
+            }
+            let x = match edge {
+                crate::ui_helpers::PanelEdge::Left => full_rect.left(),
+                crate::ui_helpers::PanelEdge::Right => full_rect.right() - width,
+                crate::ui_helpers::PanelEdge::Top => unreachable!(),
+            };
+            egui::Rect::from_min_size(
+                egui::pos2(x, (safe_top + safe_bottom - height) * 0.5),
+                egui::vec2(width, height),
+            )
+        }
+
+        for full_rect in [
+            egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(1200.0, 600.0)),
+            egui::Rect::from_min_size(egui::pos2(-5.0, 7.0), egui::vec2(80.0, 90.0)),
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 70.0)),
+        ] {
+            for edge in [
+                crate::ui_helpers::PanelEdge::Left,
+                crate::ui_helpers::PanelEdge::Right,
+            ] {
+                assert_eq!(
+                    still_touch_panel_handle_rect(full_rect, edge),
+                    legacy(full_rect, edge)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn music_touch_handles_stay_in_visualization_margin_at_required_widths() {
+        for width in [320.0, 480.0, 600.0, 1280.0, 3840.0] {
+            let viewport =
+                egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(width, 800.0));
+            let margin = music_visualization_side_margin(width);
+            let [left, right] = music_touch_panel_handle_rects(viewport);
+            let expected_width = TOUCH_PANEL_HANDLE_WIDTH_PT.min(margin);
+            assert!(
+                (left.width() - expected_width).abs() < 0.001,
+                "width={width}"
+            );
+            assert!(
+                (right.width() - expected_width).abs() < 0.001,
+                "width={width}"
+            );
+            assert!(
+                left.right() <= viewport.left() + margin,
+                "left handle overlaps waveform seek rect at width={width}"
+            );
+            assert!(
+                right.left() >= viewport.right() - margin,
+                "right handle overlaps waveform seek rect at width={width}"
+            );
+            assert!(left.top() >= viewport.top() + MUSIC_TOP_BAR_HEIGHT);
+            assert!(left.bottom() <= viewport.bottom() - crate::ui_music_panels::MUSIC_HUD_HEIGHT);
+        }
+
+        let below_floor = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(299.0, 800.0));
+        assert!(
+            music_touch_panel_handle_rects(below_floor)
+                .into_iter()
+                .all(|rect| !rect.is_positive()),
+            "a margin below 24pt must fail closed"
+        );
+        let too_short = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(
+                800.0,
+                MUSIC_TOP_BAR_HEIGHT + crate::ui_music_panels::MUSIC_HUD_HEIGHT,
+            ),
+        );
+        assert!(
+            music_touch_panel_handle_rects(too_short)
+                .into_iter()
+                .all(|rect| !rect.is_positive())
+        );
+    }
+
+    #[test]
+    fn music_touch_handles_hide_only_on_the_open_side() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        assert!(
+            visible_music_touch_panel_handle_rects(viewport, false, false, false)
+                .into_iter()
+                .all(|rect| !rect.is_positive())
+        );
+        let [left, right] = visible_music_touch_panel_handle_rects(viewport, true, true, false);
+        assert!(!left.is_positive());
+        assert!(right.is_positive());
+
+        let [left, right] = visible_music_touch_panel_handle_rects(viewport, true, false, true);
+        assert!(left.is_positive());
+        assert!(!right.is_positive());
+    }
+
+    #[test]
+    fn music_touch_observed_keeps_left_callout_when_left_panel_is_open() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let handle_rects = visible_music_touch_panel_handle_rects(viewport, true, true, false);
+        assert_eq!(
+            music_panel_callout_edges_without_touch_handles(handle_rects),
+            [true, false]
+        );
+    }
+
+    #[test]
+    fn music_touch_observed_keeps_both_callouts_below_handle_width_floor() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(280.0, 800.0));
+        let handle_rects = visible_music_touch_panel_handle_rects(viewport, true, false, false);
+        assert_eq!(
+            music_panel_callout_edges_without_touch_handles(handle_rects),
+            [true, true]
+        );
+    }
+
+    #[test]
+    fn music_touch_observed_suppresses_callout_only_on_edge_with_handle() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let handle_rects = visible_music_touch_panel_handle_rects(viewport, true, false, true);
+        assert_eq!(
+            music_panel_callout_edges_without_touch_handles(handle_rects),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn music_touch_observation_is_viewport_sticky_and_disable_fails_closed() {
+        fn raw_input(viewport: egui::ViewportId, events: Vec<egui::Event>) -> egui::RawInput {
+            let mut input = egui::RawInput {
+                viewport_id: viewport,
+                events,
+                ..Default::default()
+            };
+            input.viewports.insert(
+                viewport,
+                egui::ViewportInfo {
+                    parent: Some(egui::ViewportId::ROOT),
+                    focused: Some(true),
+                    ..Default::default()
+                },
+            );
+            input
+        }
+
+        fn observe(
+            ctx: &egui::Context,
+            viewport: egui::ViewportId,
+            events: Vec<egui::Event>,
+            gestures_disabled: bool,
+        ) -> bool {
+            ctx.begin_pass(raw_input(viewport, events));
+            let observed = observe_music_touch_for_panel_handles(ctx, gestures_disabled);
+            let _ = ctx.end_pass();
+            observed
+        }
+
+        let ctx = egui::Context::default();
+        let viewport_a = egui::ViewportId::from_hash_of("music-touch-a");
+        let viewport_b = egui::ViewportId::from_hash_of("music-touch-b");
+        assert!(!observe(&ctx, viewport_a, Vec::new(), false));
+        assert!(observe(
+            &ctx,
+            viewport_a,
+            vec![egui::Event::Touch {
+                device_id: egui::TouchDeviceId(11),
+                id: egui::TouchId(17),
+                phase: egui::TouchPhase::Start,
+                pos: egui::pos2(40.0, 80.0),
+                force: None,
+            }],
+            false,
+        ));
+        assert!(
+            observe(&ctx, viewport_a, Vec::new(), false),
+            "the flag must survive file changes because its key has no fs_idx"
+        );
+        assert!(
+            !observe(&ctx, viewport_a, Vec::new(), true),
+            "MIV_DISABLE_TOUCH_GESTURES policy must hide a sticky handle"
+        );
+        assert!(
+            !observe(&ctx, viewport_b, Vec::new(), false),
+            "a sibling viewport must not inherit the observation"
         );
     }
 
@@ -31755,10 +32284,13 @@ mod tests {
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE)
                         .show(ctx, |ui| {
-                            let response = interact_still_touch_panel_handle(
+                            let response = interact_touch_panel_handle(
                                 ui,
                                 handle,
-                                crate::ui_helpers::PanelEdge::Left,
+                                egui::Id::new((
+                                    "fs_touch_panel_handle",
+                                    crate::ui_helpers::PanelEdge::Left,
+                                )),
                             );
                             paint_panel_callout_chrome(
                                 ui,

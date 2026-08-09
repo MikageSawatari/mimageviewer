@@ -236,6 +236,17 @@ fn still_touch_panel_handles_latched_dark() {
 }
 
 #[test]
+fn music_touch_panel_handles_observed_dark() {
+    snapshot_with_theme(
+        "music_touch_panel_handles_observed_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            mimageviewer::draw_music_panel_reach_snapshot_fixture(ui, true, false, false);
+        },
+    );
+}
+
+#[test]
 fn still_touch_first_run_help_unlearned_100_dark() {
     snapshot_with_theme(
         "still_touch_first_run_help_unlearned_100_dark",

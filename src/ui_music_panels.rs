@@ -770,8 +770,10 @@ impl App {
         let mut title_edit = self.music_bookmark_title_edit.take();
         let mut bulk = self.music_bulk_bookmark_dialog.take();
         let mut commands: Vec<NativeOverlayCommand> = Vec::new();
-        let click_to_show = self.settings.fullscreen_side_panel_mode.normalized()
-            == crate::settings::FsSidePanelMode::ClickToShow;
+        let explicit_open = crate::ui_helpers::metadata_panel_explicit_shown(
+            self.settings.fullscreen_side_panel_mode,
+            self.music_left_panel_open,
+        );
         let mut close_left_requested = false;
         // 音楽ビューではサムネを出さないので空の texture マップを渡す
         // (show_thumbnails=false で未参照)。
@@ -803,7 +805,7 @@ impl App {
                         &mut bulk,
                         &mut commands,
                     );
-                    if click_to_show {
+                    if explicit_open {
                         // 共有 body の右側はブックマーク / 一括ボタンが使うため、タイトル直後に
                         // music 専用の明示クローズを置く。
                         let close_rect = egui::Rect::from_min_size(
@@ -830,7 +832,7 @@ impl App {
                 });
         }
         if close_left_requested {
-            self.music_left_click_open = false;
+            self.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         }
 
         // ── 中央モーダル (改名 / 一括登録) は開いている間常に描く ──

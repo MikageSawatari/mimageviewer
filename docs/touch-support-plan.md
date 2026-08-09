@@ -953,37 +953,36 @@ mIV で `scroll_source()` を上書きしているのは `src/ui_main.rs:2278` �
   クリック可能なのは reveal path を持つ actionable toast だけという既存仕様を維持し、
   トースト側には変更を入れていない
 
-#### 未対応: 音声モード / 音楽ビューの左右パネルがタッチで開けない (2026-08-09 利用者報告)
+#### 音声モード / 音楽ビューの左右パネルハンドル実装記録 (2026-08-09)
 
-**症状**: 音声モード (動画の映像を切って音声で聴く状態) と音楽ビューで、左右パネルを開く
-手段がタッチに無い。
-
-**原因は静止画 Step 3b / 動画 Step 3h と同型**。`draw_music_panel_callouts`
-([ui_fullscreen.rs:6712](../src/ui_fullscreen.rs)) は `pointer = hover_pos()` を取り、
-`callout_hit(panel_callout_edge_rect(...), pointer)` が真のフレームだけ callout Area を出す。
-**タッチには hover が無いので callout がそもそも描かれない**。`ClickToShow` だけでなく
-`Hover` モードも同じ理由で到達不能 (辺へのホバーで出す設計のため)。
-利用者が名指しした「HUD の左右の空き領域」は、まさにこの callout が出るはずの帯である。
-
-**方針 (ClaudeCode 案)**: 空き領域に**見えないタップゾーンを足すのではなく、静止画・動画と
-同じ「hover に依存しない 48pt 幅の左右ハンドル」を音楽面にも出す**。理由:
-
-- §5.7 の 3 面統一の続きであり、面ごとに別の開き方を覚えさせない
-- 見えないゾーンは発見できないうえ、誤タップが「何か起きた」に化ける
-- ハンドル geometry / 矢印描画 / 開いた側を消す規則は Step 3b / 3h の helper をそのまま使える
-
-**決める必要がある点** (実装前に確定させる):
-
-1. **表示条件**。静止画はクローム latch、動画は `chrome_latched()` が gate だが、音楽面は
-   上下 HUD が常時表示で latch の概念が無い。「このビューポートでタッチを使った」ことを
-   gate にするのが素直 (マウスだけの利用者に恒久的な飾りを増やさない = fail-closed)。
-2. **モード非依存にするか**。`Hover` / `ClickToShow` どちらでもタッチからは同じく到達不能
-   なので、ハンドルは**モードに関わらず**出すのが筋。開いた状態の所有は既存の
-   `MetadataPanelOpenState` (`ByPointer` / `ByTouchHandle`) に合わせる。
-3. **帯の範囲**。音楽面は上下 HUD が常時あるので、`panel_band_top` / `panel_band_bottom` を
-   そのまま使い、HUD と重ねない。
-
-**優先度**: v2.13.0 のタッチ対応の穴なので、バックログ対応の合間に入れる (利用者判断)。
+- 音楽ビューで同じビューポートの raw `egui::Event::Touch` を一度でも観測すると、Hover /
+  ClickToShow に依らず左右端へ可視ハンドルを出す。観測済み bit は `ctx.data_temp` の
+  `ViewportId` key だけで保持し、曲 (`fs_idx`) を移っても消さない。時間では隠さず、
+  `MIV_DISABLE_TOUCH_GESTURES=1` と passive / ParkedLive では出さない。音楽面へ
+  `TouchCorrelation` / `TouchOwner` / タップゾーンは追加していない
+- 静止画の 48pt ハンドル geometry は、上 / 下の安全域と利用可能幅を引数に取る共通 helper へ
+  切り出した。静止画は従来の `TOP_BAR_HEIGHT` / `FS_SEEK_BAR_HEIGHT` / 48pt を渡すため rect は
+  完全に同一。音楽は `MUSIC_TOP_BAR_HEIGHT` / `MUSIC_HUD_HEIGHT` を安全域にする
+- 実レイアウト確認では、音楽の波形 tap-seek 面が左右の既存余白
+  `max(viewport width × 8%, 8pt)` の内側から始まる一方、固定 48pt は 600pt 未満の狭い detached
+  窓で重なることが分かった。利用者判断の option 4 により、音楽だけは
+  `min(48pt, 既存余白)` をハンドル幅とし、24pt 未満なら左右とも出さない。可視化の種類には
+  分岐せず常に同じ余白式を使うため、波形表示時も seek 面へ重ならず、タッチ観測時の layout
+  resize も起こさない
+- 左の session bool は `MetadataPanelOpenState` へ置き換え、左右とも `ByPointer` /
+  `ByTouchHandle` を区別する。touch owner は Hover でも明示表示と閉じるボタンを維持するが、
+  pointer owner は従来どおり Hover で explicit state を作らない。開いた側のハンドルは描画と
+  hit test の両方から消え、反対側だけ残る
+- **タッチの観測は入力モードの切り替えではない**。ハンドルを出した後もマウスの hover callout は
+  従来どおり毎フレーム評価する。抑止するのは**実際にハンドルを描いた辺だけ**で、同じ辺に
+  hit target を 2 つ重ねない (callout は toggle、ハンドルは open なので、1 回のクリックが
+  二重に処理される)。ハンドルの出ない辺 — パネルが開いている側、余白 24pt 未満の狭い窓、
+  右に出す情報が無い場合 — では callout がそのまま残る。
+  レビュー初版はここを `return` で一括打ち切りにしており、コンバーチブル機で「一度指で
+  触るとマウスの呼び出しバーが消える」「狭い窓ではどちらの入力でも開けない」退行になっていた
+- 320 / 480 / 600 / 1280 / 3840pt の各幅、24pt floor、上下 HUD、安全域不足、左右 open、
+  viewport sticky / sibling 分離 / disable、Hover の pointer / touch owner、既存静止画 rect の
+  完全一致を unit test で固定し、音楽ハンドルの描画 fixture を UI snapshot へ追加した
 
 #### (3) タッチターゲットが小さすぎる
 

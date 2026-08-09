@@ -10517,9 +10517,9 @@ pub struct App {
     pub(crate) music_left_panel_active: bool,
     /// 音楽ビュー右パネル (情報/★/タグ) の端ホバー開閉ラッチ。左と同じ二段判定。
     pub(crate) music_right_panel_active: bool,
-    /// ClickToShow の音楽ビュー左ジャンプパネル開状態。フルスクリーン / 楽曲単位の
-    /// セッション状態であり、Settings には保存しない。
-    pub(crate) music_left_click_open: bool,
+    /// 音楽ビュー左ジャンプパネルの明示 open owner。pointer 由来は ClickToShow だけ、
+    /// touch handle 由来は Hover でも表示する。Settings には保存しない。
+    pub(crate) music_left_panel_open: crate::ui_helpers::MetadataPanelOpenState,
     /// 左パネルに表示するブックマークのキャッシュ (現在の音声 path 用)。動画と同じ
     /// `VideoBookmarkDb` を path キーで共有する (D5.1)。追加/削除/改名/import で再取得。
     /// 左パネルは Hover の端ラッチまたは ClickToShow のセッション状態で表示する。
@@ -12645,7 +12645,7 @@ impl App {
             music_limiter_visible_until: None,
             music_left_panel_active: false,
             music_right_panel_active: false,
-            music_left_click_open: false,
+            music_left_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
             music_bookmarks: Vec::new(),
             music_bookmarks_loaded_for: None,
             #[cfg(windows)]
@@ -46824,7 +46824,7 @@ impl App {
         self.music_analysis_error = None;
         self.music_analysis_path = Some(path.to_path_buf());
         // 左ジャンプパネルは楽曲単位のセッション状態。音声→音声ナビでも引き継がない。
-        self.music_left_click_open = false;
+        self.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
 
         // ルックアップキー: size>0 (信頼できる) のときだけ作る。size 不明のビュー (mtime のみ等)
         // では LRU を使わない。
@@ -47047,7 +47047,7 @@ impl App {
         // だけでパネルが再表示される (Codex P3)。
         self.music_left_panel_active = false;
         self.music_right_panel_active = false;
-        self.music_left_click_open = false;
+        self.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         // ブックマークの一時状態 (キャッシュ / 改名ダイアログ / 一括登録ダイアログ) は破棄する。
         // ループ設定はセッション設定として保持する。
         self.music_bookmarks.clear();
@@ -56054,7 +56054,7 @@ impl App {
         self.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.music_left_panel_active = false;
         self.music_right_panel_active = false;
-        self.music_left_click_open = false;
+        self.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
     }
 
     pub(crate) fn toggle_fullscreen_click_info_open(&mut self) {
@@ -56142,13 +56142,13 @@ impl App {
         let close_music_left = self
             .fullscreen_idx
             .is_some_and(|idx| self.fs_music_view_active(idx))
-            && self.music_left_click_open;
+            && self.music_left_panel_open.is_open();
         let closed = self.adjustment_mode.is_open() || close_music_left || close_right;
         if self.adjustment_mode.is_open() {
             self.persist_pending_view_trim_state();
         }
         self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
-        self.music_left_click_open = false;
+        self.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         closed
     }
