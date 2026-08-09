@@ -1798,3 +1798,78 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 - **完了 (2026-08-07)**: release の core → remote → launcher ビルド後に
   `cargo test -p mimageviewer-launcher` を実行し、7 件すべて成功。single-instance 名前空間に加え、
   埋め込んだ remote が core と同じ版別 runtime directory へ hash 一致で展開されることも固定した
+
+## 14. ページ表示パイプラインの所有権 (2026-08-09 決定)
+
+リモートでページを捲ると、**シークバーのページ数だけ進み、画面が前のページのまま残る**
+不具合を 3 回、別々の場所で直した。3 件は独立した実装ミスではなく、1 つの誤りの現れである。
+
+> **打ち切りの判断はページ単位でされているのに、「必要か」は表示グループ単位で決まる。**
+
+Web の先読み計画・本体の前景描画・見開きの兄弟同士 — どれも「この仕事はもう要らない」を、
+**今の表示が何を必要としているかを知らないまま**決めていた。個別に条件 (待機者数 /
+アドレス一致) を足すたびに判断の入口が増え、次の入口で同じことが起きた。
+
+### 14.1 確認した事実 (再調査不要)
+
+| 事実 | 根拠 |
+|---|---|
+| ブラウザの `abort` は本体の処理を止めない | `crates/remote-web/src/ipc_client.rs` の `PAGE_RESPONSE_TIMEOUT` のコメント |
+| 前景 1 枠の予約は厳密な優先レーンではない | heavy queue は FIFO。サムネイル・コンテナ列挙が予約枠を使う |
+| 補正プレビューは cache / coordinator の外から独立した前景 `/api/page` を送る。`signal` を渡していないので中止手段が無い | `app.js` `AdjustmentPanel.runPreview` |
+| 遅れて着いた前景は、アドレスと `spread_partner` に一致しない先読みを取り消す | `src/remote_ipc/container.rs` `begin_page_render` |
+| その取消は `MediaErrorCode::Busy` → HTTP 503 `miv_media_error` になる | `crates/remote-web/src/http.rs` の `media_error` 変換 |
+| 前景の相乗りが許容する 503 は `ipc_busy` **だけ**。上記は再送出されて表示要求ごと失敗する | `app.js` `PageResourceCache.loadForeground` |
+| 相乗り中の PDF は本体で `Normal` lane のまま。前景の `HighNormal` へ昇格しない | `src/thumb_loader.rs` の `pdf_priority` |
+
+ページ 1 枚は実測 p50 1.5 MB / p95 7.9 MB、本体の生成に p50 0.6s / p95 2.0s。
+
+### 14.2 決定
+
+**ブラウザ内だけの修正 (段階 B) では構造的解決にならない。所有権の境界は Web と本体を
+またいで一度に切り替える。**
+
+当初 ClaudeCode は「A + B + C を実施し D / E は保留」を推奨した。別セッションの Codex が
+反対し、**具体的な破壊経路がコード上に実在する**ことを示した。上表の 3 行 (補正プレビュー →
+`begin_page_render` → `ipc_busy` 以外の 503) が繋がると、**前景 lease を持つ仕事が別の前景に
+取り消される**。lease はブラウザの中にしか無いので、本体はそれを知らない。ClaudeCode が
+実物を読んで裏を取り、判断を変えた。
+
+さらに、暫定パッチ (`143fc596` / `eed5ff93`) を残したまま新しい lease を足すと、
+**取消の所有者が 2 つ並存する**。これは CLAUDE.md「相互排他的な状態を複数の bool / `Option` /
+pending で表現しない」に反し、今回 3 周した誤りと同じ形である。暫定パッチは cutover で
+**撤去する**。段階の途中で止めて完了としない。
+
+### 14.3 段階
+
+**A — 契約と回帰テスト (先行)**
+
+表示グループの outcome 契約を固定する。`loadGroup` の戻り値を `bool` から
+`Applied / Superseded / Failed` の typed outcome にし、失敗時にシークバーと画面が食い違わない
+ことをテストで固定する。この時点では既存構造のまま落ちるテストを置く。
+
+**B + C + D0 — 所有権の cutover (一体)**
+
+- Web: 表示グループが需要を持つ (`DisplayRequestId` による lease)。見開き全ページの
+  foreground lease を fetch 開始前に**同期登録**する。計画の更新は plan lease の解放だけ。
+  `demands.is_empty()` のときだけ `abort`
+- `loadForeground` の「他の active を打ち切る」走査を**撤去**。`foregroundWaiters` /
+  `prefetchPlanned` も同じ変更で削除
+- 本体: job ID、先読み → 前景の**昇格**、明示的な release / cancel、cancel 理由の型分け
+  (取消 / admission / セッション失効)。protocol version を上げる
+- 本体の旧アドレス近似 (`begin_page_render` の retain) を**無効化・撤去**
+- 補正プレビューも同じ coordinator を通す
+
+**後段 (保留)**
+
+- 前景専用 lane の高度化
+- URL `prefetch=1` 互換の撤去
+- telemetry 拡張、性能計測、残存フィールドの整理
+
+### 14.4 壊れない理由
+
+打ち切りの入口が増えても同じ誤りが起きないのは、**入口が cancel token を触らないから**である。
+入口は lease を取る / 返すだけで、実際の取消は coordinator が `demands.is_empty()` を見て
+決める。有効優先度は需要の最大値で単調に上がる (降格しない)。
+
+`page_display` テレメトリは今回の 3 件を特定した観測の仕組みなので壊さない。
