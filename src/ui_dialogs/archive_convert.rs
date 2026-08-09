@@ -94,7 +94,7 @@ impl ArchiveConvertProgressShared {
 pub(crate) enum ArchiveConvertPhase {
     /// 事前スキャン中 (画像数カウント)
     Scanning,
-    /// RAR パスワード入力待ち
+    /// 変換層が再試行可能と判定したパスワード入力待ち
     PasswordRequired {
         message: Option<String>,
         resume: ArchivePasswordResume,
@@ -214,9 +214,6 @@ where
 fn prepare_archive_password_retry(
     state: &mut ArchiveConvertState,
 ) -> Option<(ArchivePasswordResume, String)> {
-    if state.format != ArchiveFormat::Rar {
-        return None;
-    }
     let password = state.password_input.trim().to_string();
     if password.is_empty() {
         return None;
@@ -1074,7 +1071,7 @@ impl App {
                             );
                             ui.label("キャッシュ管理メニューから削除することができます。");
                         }
-                        if state.format == ArchiveFormat::Rar && state.password.is_some() {
+                        if state.password.is_some() {
                             ui.add_space(4.0);
                             ui.label(
                                 egui::RichText::new(
@@ -1497,7 +1494,7 @@ impl App {
                             &dst,
                             cached_size,
                             summary.image_count,
-                            format == ArchiveFormat::Rar && password.is_some(),
+                            password.is_some(),
                         );
                         match record_result {
                             Ok(()) => {

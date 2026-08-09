@@ -11,6 +11,7 @@ use mimageviewer_ipc::{
     RemoteAiTerminalDetail,
 };
 
+use super::long_job::{RemoteLongJobDrainCause, RemoteLongJobRegistry};
 use super::session::SessionOperation;
 
 pub(super) struct ContainerRemoteAiExecutor {
@@ -64,13 +65,6 @@ pub(crate) enum RemoteAiExecutionOutcome {
     Failed(String),
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum RemoteAiDrainCause {
-    DiscardedByHost,
-    BackgroundExpired,
-    Superseded,
-}
-
 /// A remote job's drain participation. The underlying session operation stays live until the
 /// executor has acknowledged cancellation or produced a terminal result.
 struct RemoteAiJobLease {
@@ -96,6 +90,13 @@ impl RemoteAiJobLease {
             .as_ref()
             .expect("job lease is live")
             .started();
+    }
+
+    fn drain_cause(&self) -> Option<RemoteLongJobDrainCause> {
+        self.operation
+            .as_ref()
+            .expect("job lease is live")
+            .long_job_drain_cause()
     }
 
     fn finish(mut self, success: bool) {
@@ -157,7 +158,7 @@ impl RemoteAiJobRegistry {
             .unwrap_or(u64::MAX)
     }
 
-    pub(crate) fn has_nonterminal_jobs(&self) -> bool {
+    fn has_nonterminal_jobs_inner(&self) -> bool {
         self.inner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -166,19 +167,19 @@ impl RemoteAiJobRegistry {
             .any(|job| !job.snapshot.state.is_terminal())
     }
 
-    pub(crate) fn on_session_drain(&self, cause: RemoteAiDrainCause) {
+    fn on_session_drain_inner(&self, cause: RemoteLongJobDrainCause) {
         let (state, code, message) = match cause {
-            RemoteAiDrainCause::DiscardedByHost => (
+            RemoteLongJobDrainCause::DiscardedByHost => (
                 RemoteAiJobState::DiscardedByHost,
                 RemoteAiTerminalCode::DiscardedByHost,
                 "PC 側で接続が終了されたため AI 処理を中止しました",
             ),
-            RemoteAiDrainCause::BackgroundExpired => (
+            RemoteLongJobDrainCause::BackgroundExpired => (
                 RemoteAiJobState::BackgroundExpired,
                 RemoteAiTerminalCode::BackgroundExpired,
                 "バックグラウンド保持時間を超えたため AI 処理を中止しました",
             ),
-            RemoteAiDrainCause::Superseded => (
+            RemoteLongJobDrainCause::Superseded => (
                 RemoteAiJobState::Superseded,
                 RemoteAiTerminalCode::Superseded,
                 "別の端末へ操作権が移ったため AI 処理を中止しました",
@@ -280,6 +281,9 @@ impl RemoteAiJobRegistry {
             .spawn(move || {
                 if lease.wait_until_active().is_err() {
                     if let Some(registry) = registry.upgrade() {
+                        if let Some(cause) = lease.drain_cause() {
+                            registry.on_session_drain_inner(cause);
+                        }
                         registry.complete_cancelled_if_requested(&thread_job_id);
                     }
                     lease.finish(false);
@@ -313,6 +317,9 @@ impl RemoteAiJobRegistry {
                     }
                 };
                 let success = matches!(outcome, RemoteAiExecutionOutcome::Completed(_));
+                if let Some(cause) = lease.drain_cause() {
+                    registry.on_session_drain_inner(cause);
+                }
                 registry.complete(&thread_job_id, outcome);
                 lease.finish(success);
             });
@@ -568,6 +575,16 @@ impl RemoteAiJobRegistry {
             job.terminal_at = Some(Duration::ZERO);
         }
         self.prune_locked(&mut state, TERMINAL_RETENTION);
+    }
+}
+
+impl RemoteLongJobRegistry for RemoteAiJobRegistry {
+    fn has_nonterminal_jobs(&self) -> bool {
+        self.has_nonterminal_jobs_inner()
+    }
+
+    fn on_session_drain(&self, cause: RemoteLongJobDrainCause) {
+        self.on_session_drain_inner(cause);
     }
 }
 
@@ -1169,7 +1186,7 @@ mod tests {
         let (session, registry, calls) = fixture();
         let job = start(&session, &registry, "background-expiry");
         let call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
-        registry.on_session_drain(RemoteAiDrainCause::BackgroundExpired);
+        registry.on_session_drain(RemoteLongJobDrainCause::BackgroundExpired);
         assert!(call.cancel.load(Ordering::Acquire));
         wait_for_state(&registry, &job.job_id, RemoteAiJobState::Cancelling);
 

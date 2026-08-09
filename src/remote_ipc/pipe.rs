@@ -155,6 +155,7 @@ pub(super) struct ServerGuard {
     stream_work_tx: mpsc::SyncSender<Work>,
     session_runtime: SessionRuntime,
     _ai_jobs: Arc<super::ai_job::RemoteAiJobRegistry>,
+    _archive_jobs: Arc<super::archive_job::RemoteArchiveJobRegistry>,
 }
 
 impl ServerGuard {
@@ -190,6 +191,12 @@ impl ServerGuard {
         )));
         let ai_jobs = super::ai_job::RemoteAiJobRegistry::new(ai_executor);
         session_handle.install_ai_jobs(&ai_jobs);
+        let archive_executor = Arc::new(super::archive_job::ContainerRemoteArchiveExecutor::new(
+            Arc::clone(&container_engine),
+            session_handle.clone(),
+        ));
+        let archive_jobs = super::archive_job::RemoteArchiveJobRegistry::new(archive_executor);
+        session_handle.install_archive_jobs(&archive_jobs);
         let video_stream_engine = Arc::new(VideoStreamEngine::new());
         let collection_engine = Arc::new(CollectionEngine::new_with_live_favorites(
             settings, favorites,
@@ -361,6 +368,7 @@ impl ServerGuard {
             stream_work_tx,
             session_runtime,
             _ai_jobs: ai_jobs,
+            _archive_jobs: archive_jobs,
         })
     }
 
@@ -548,7 +556,16 @@ fn worker_loop(
                     | ClientMessage::RemoteAiState { .. }
                     | ClientMessage::RemoteAiRecoverable { .. }
                     | ClientMessage::RemoteAiCancel { .. }
-                    | ClientMessage::RemoteAiResult { .. }) => service_stopped_response(&other),
+                    | ClientMessage::RemoteAiResult { .. }
+                    | ClientMessage::RemoteArchiveStart { .. }
+                    | ClientMessage::RemoteArchiveState { .. }
+                    | ClientMessage::RemoteArchiveRecoverable { .. }
+                    | ClientMessage::RemoteArchiveCancel { .. }
+                    | ClientMessage::RemoteArchiveConfirm { .. }
+                    | ClientMessage::RemoteArchivePassword { .. }
+                    | ClientMessage::RemoteArchiveResult { .. }) => {
+                        service_stopped_response(&other)
+                    }
                 },
             ),
             Ok(Work::Stop) | Err(_) => break,
@@ -1112,6 +1129,13 @@ fn request_kind(message: &ClientMessage) -> &'static str {
         ClientMessage::RemoteAiRecoverable { .. } => "remote_ai_recoverable",
         ClientMessage::RemoteAiCancel { .. } => "remote_ai_cancel",
         ClientMessage::RemoteAiResult { .. } => "remote_ai_result",
+        ClientMessage::RemoteArchiveStart { .. } => "remote_archive_start",
+        ClientMessage::RemoteArchiveState { .. } => "remote_archive_state",
+        ClientMessage::RemoteArchiveRecoverable { .. } => "remote_archive_recoverable",
+        ClientMessage::RemoteArchiveCancel { .. } => "remote_archive_cancel",
+        ClientMessage::RemoteArchiveConfirm { .. } => "remote_archive_confirm",
+        ClientMessage::RemoteArchivePassword { .. } => "remote_archive_password",
+        ClientMessage::RemoteArchiveResult { .. } => "remote_archive_result",
         ClientMessage::Write { .. } => "write",
         ClientMessage::VideoStreamStart { .. } => "video_stream_start",
         ClientMessage::VideoStreamControl { .. } => "video_stream_control",
@@ -1169,6 +1193,13 @@ fn message_owner(message: &ClientMessage) -> Option<&RemoteSessionIdentity> {
         | ClientMessage::RemoteAiRecoverable { owner, .. }
         | ClientMessage::RemoteAiCancel { owner, .. }
         | ClientMessage::RemoteAiResult { owner, .. }
+        | ClientMessage::RemoteArchiveStart { owner, .. }
+        | ClientMessage::RemoteArchiveState { owner, .. }
+        | ClientMessage::RemoteArchiveRecoverable { owner, .. }
+        | ClientMessage::RemoteArchiveCancel { owner, .. }
+        | ClientMessage::RemoteArchiveConfirm { owner, .. }
+        | ClientMessage::RemoteArchivePassword { owner, .. }
+        | ClientMessage::RemoteArchiveResult { owner, .. }
         | ClientMessage::Write { owner, .. }
         | ClientMessage::VideoStreamStart { owner, .. }
         | ClientMessage::VideoStreamControl { owner, .. }
@@ -1217,6 +1248,15 @@ fn operation_description(message: &ClientMessage) -> String {
         ClientMessage::RemoteAiRecoverable { .. } => "復帰可能な remote AI job を確認中".to_owned(),
         ClientMessage::RemoteAiCancel { .. } => "remote AI job を取り消し中".to_owned(),
         ClientMessage::RemoteAiResult { .. } => "remote AI result を取得中".to_owned(),
+        ClientMessage::RemoteArchiveStart { .. } => "アーカイブ準備を開始中".to_owned(),
+        ClientMessage::RemoteArchiveState { .. } => "アーカイブ準備の状態を確認中".to_owned(),
+        ClientMessage::RemoteArchiveRecoverable { .. } => {
+            "復帰可能なアーカイブ操作を確認中".to_owned()
+        }
+        ClientMessage::RemoteArchiveCancel { .. } => "アーカイブ操作を取り消し中".to_owned(),
+        ClientMessage::RemoteArchiveConfirm { .. } => "アーカイブ変換の確認を送信中".to_owned(),
+        ClientMessage::RemoteArchivePassword { .. } => "アーカイブ認証情報を送信中".to_owned(),
+        ClientMessage::RemoteArchiveResult { .. } => "アーカイブ準備結果を取得中".to_owned(),
         ClientMessage::Write { request, .. } => match request {
             RemoteWriteRequest::SetSpread { .. } => "見開き設定を書き込み中",
             RemoteWriteRequest::RecordReadingProgress { .. } => "読書位置を記録中",
@@ -1296,6 +1336,46 @@ fn ai_result_stopped() -> mimageviewer_ipc::RemoteAiResultResponse {
     mimageviewer_ipc::RemoteAiResultResponse::Error(ai_stopped_error())
 }
 
+fn archive_session_error(response: SessionResponse) -> mimageviewer_ipc::RemoteArchiveJobError {
+    mimageviewer_ipc::RemoteArchiveJobError::new(
+        mimageviewer_ipc::RemoteArchiveJobErrorCode::SessionClosing,
+        response.message,
+    )
+}
+
+fn archive_stopped_error() -> mimageviewer_ipc::RemoteArchiveJobError {
+    mimageviewer_ipc::RemoteArchiveJobError::new(
+        mimageviewer_ipc::RemoteArchiveJobErrorCode::Internal,
+        "remote archive job registry is not available",
+    )
+}
+
+fn archive_busy_error() -> mimageviewer_ipc::RemoteArchiveJobError {
+    mimageviewer_ipc::RemoteArchiveJobError::new(
+        mimageviewer_ipc::RemoteArchiveJobErrorCode::Internal,
+        "remote archive queue is busy",
+    )
+}
+
+fn archive_start_stopped() -> mimageviewer_ipc::RemoteArchiveStartResponse {
+    mimageviewer_ipc::RemoteArchiveStartResponse::Error(archive_stopped_error())
+}
+fn archive_state_stopped() -> mimageviewer_ipc::RemoteArchiveStateResponse {
+    mimageviewer_ipc::RemoteArchiveStateResponse::Error(archive_stopped_error())
+}
+fn archive_recoverable_stopped() -> mimageviewer_ipc::RemoteArchiveRecoverableResponse {
+    mimageviewer_ipc::RemoteArchiveRecoverableResponse::Error(archive_stopped_error())
+}
+fn archive_cancel_stopped() -> mimageviewer_ipc::RemoteArchiveCancelResponse {
+    mimageviewer_ipc::RemoteArchiveCancelResponse::Error(archive_stopped_error())
+}
+fn archive_input_stopped() -> mimageviewer_ipc::RemoteArchiveInputResponse {
+    mimageviewer_ipc::RemoteArchiveInputResponse::Error(archive_stopped_error())
+}
+fn archive_result_stopped() -> mimageviewer_ipc::RemoteArchiveResultResponse {
+    mimageviewer_ipc::RemoteArchiveResultResponse::Error(archive_stopped_error())
+}
+
 fn response_outcome(response: &ServerMessage) -> &'static str {
     match response {
         ServerMessage::RemoteWebConnectionInfo { accepted: true, .. }
@@ -1361,6 +1441,34 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
         }
         | ServerMessage::RemoteAiResult {
             response: mimageviewer_ipc::RemoteAiResultResponse::Success(_),
+            ..
+        }
+        | ServerMessage::RemoteArchiveStart {
+            response: mimageviewer_ipc::RemoteArchiveStartResponse::Accepted(_),
+            ..
+        }
+        | ServerMessage::RemoteArchiveState {
+            response: mimageviewer_ipc::RemoteArchiveStateResponse::Success(_),
+            ..
+        }
+        | ServerMessage::RemoteArchiveRecoverable {
+            response: mimageviewer_ipc::RemoteArchiveRecoverableResponse::Success(_),
+            ..
+        }
+        | ServerMessage::RemoteArchiveCancel {
+            response: mimageviewer_ipc::RemoteArchiveCancelResponse::Success(_),
+            ..
+        }
+        | ServerMessage::RemoteArchiveConfirm {
+            response: mimageviewer_ipc::RemoteArchiveInputResponse::Success(_),
+            ..
+        }
+        | ServerMessage::RemoteArchivePassword {
+            response: mimageviewer_ipc::RemoteArchiveInputResponse::Success(_),
+            ..
+        }
+        | ServerMessage::RemoteArchiveResult {
+            response: mimageviewer_ipc::RemoteArchiveResultResponse::Success(_),
             ..
         }
         | ServerMessage::Write {
@@ -1463,6 +1571,34 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
         }
         | ServerMessage::RemoteAiResult {
             response: mimageviewer_ipc::RemoteAiResultResponse::Error(_),
+            ..
+        }
+        | ServerMessage::RemoteArchiveStart {
+            response: mimageviewer_ipc::RemoteArchiveStartResponse::Error(_),
+            ..
+        }
+        | ServerMessage::RemoteArchiveState {
+            response: mimageviewer_ipc::RemoteArchiveStateResponse::Error(_),
+            ..
+        }
+        | ServerMessage::RemoteArchiveRecoverable {
+            response: mimageviewer_ipc::RemoteArchiveRecoverableResponse::Error(_),
+            ..
+        }
+        | ServerMessage::RemoteArchiveCancel {
+            response: mimageviewer_ipc::RemoteArchiveCancelResponse::Error(_),
+            ..
+        }
+        | ServerMessage::RemoteArchiveConfirm {
+            response: mimageviewer_ipc::RemoteArchiveInputResponse::Error(_),
+            ..
+        }
+        | ServerMessage::RemoteArchivePassword {
+            response: mimageviewer_ipc::RemoteArchiveInputResponse::Error(_),
+            ..
+        }
+        | ServerMessage::RemoteArchiveResult {
+            response: mimageviewer_ipc::RemoteArchiveResultResponse::Error(_),
             ..
         }
         | ServerMessage::Write {
@@ -1759,7 +1895,7 @@ fn handle_connection(
                 request,
                 accept_before_unix_ms,
             } => {
-                session.note_ai_client_seen(owner);
+                session.note_long_job_client_seen(owner);
                 let response = match session.begin_operation(owner, "remote AI job".to_owned()) {
                     Ok(operation) => session
                         .ai_job_registry()
@@ -1884,6 +2020,180 @@ fn handle_connection(
                     }
                 };
                 let _ = reply_tx.send(ServerMessage::RemoteAiResult { id: *id, response });
+                continue;
+            }
+            ClientMessage::RemoteArchiveStart {
+                id,
+                owner,
+                request,
+                accept_before_unix_ms,
+            } => {
+                session.note_long_job_client_seen(owner);
+                let response = match session.begin_operation(owner, "remote archive job".to_owned())
+                {
+                    Ok(operation) => session
+                        .archive_job_registry()
+                        .map(|jobs| {
+                            jobs.start(
+                                owner.client_id.clone(),
+                                request.clone(),
+                                *accept_before_unix_ms,
+                                operation,
+                            )
+                        })
+                        .unwrap_or_else(archive_start_stopped),
+                    Err(response) => mimageviewer_ipc::RemoteArchiveStartResponse::Error(
+                        archive_session_error(response),
+                    ),
+                };
+                let _ = reply_tx.send(ServerMessage::RemoteArchiveStart { id: *id, response });
+                continue;
+            }
+            ClientMessage::RemoteArchiveState { id, owner, job_id } => {
+                let response =
+                    match session.begin_operation(owner, "remote archive state".to_owned()) {
+                        Ok(operation) => match operation.wait_until_active() {
+                            Ok(()) => {
+                                operation.started();
+                                let response = session
+                                    .archive_job_registry()
+                                    .map(|jobs| jobs.state(&owner.client_id, job_id))
+                                    .unwrap_or_else(archive_state_stopped);
+                                operation.finish(true);
+                                response
+                            }
+                            Err(response) => mimageviewer_ipc::RemoteArchiveStateResponse::Error(
+                                archive_session_error(response),
+                            ),
+                        },
+                        Err(response) => mimageviewer_ipc::RemoteArchiveStateResponse::Error(
+                            archive_session_error(response),
+                        ),
+                    };
+                let _ = reply_tx.send(ServerMessage::RemoteArchiveState { id: *id, response });
+                continue;
+            }
+            ClientMessage::RemoteArchiveRecoverable { id, owner } => {
+                let response = match session
+                    .begin_operation(owner, "remote archive recovery".to_owned())
+                {
+                    Ok(operation) => match operation.wait_until_active() {
+                        Ok(()) => {
+                            operation.started();
+                            let response = session
+                                .archive_job_registry()
+                                .map(|jobs| jobs.recoverable(&owner.client_id))
+                                .unwrap_or_else(archive_recoverable_stopped);
+                            operation.finish(true);
+                            response
+                        }
+                        Err(response) => mimageviewer_ipc::RemoteArchiveRecoverableResponse::Error(
+                            archive_session_error(response),
+                        ),
+                    },
+                    Err(response) => mimageviewer_ipc::RemoteArchiveRecoverableResponse::Error(
+                        archive_session_error(response),
+                    ),
+                };
+                let _ =
+                    reply_tx.send(ServerMessage::RemoteArchiveRecoverable { id: *id, response });
+                continue;
+            }
+            ClientMessage::RemoteArchiveCancel { id, owner, job_id } => {
+                let response =
+                    match session.begin_operation(owner, "remote archive cancel".to_owned()) {
+                        Ok(operation) => match operation.wait_until_active() {
+                            Ok(()) => {
+                                operation.started();
+                                let response = session
+                                    .archive_job_registry()
+                                    .map(|jobs| jobs.cancel(&owner.client_id, job_id))
+                                    .unwrap_or_else(archive_cancel_stopped);
+                                operation.finish(true);
+                                response
+                            }
+                            Err(response) => mimageviewer_ipc::RemoteArchiveCancelResponse::Error(
+                                archive_session_error(response),
+                            ),
+                        },
+                        Err(response) => mimageviewer_ipc::RemoteArchiveCancelResponse::Error(
+                            archive_session_error(response),
+                        ),
+                    };
+                let _ = reply_tx.send(ServerMessage::RemoteArchiveCancel { id: *id, response });
+                continue;
+            }
+            ClientMessage::RemoteArchiveConfirm { id, owner, request } => {
+                let response = match session
+                    .begin_operation(owner, "remote archive confirmation".to_owned())
+                {
+                    Ok(operation) => match operation.wait_until_active() {
+                        Ok(()) => {
+                            operation.started();
+                            let response = session
+                                .archive_job_registry()
+                                .map(|jobs| jobs.confirm(&owner.client_id, request.clone()))
+                                .unwrap_or_else(archive_input_stopped);
+                            operation.finish(true);
+                            response
+                        }
+                        Err(response) => mimageviewer_ipc::RemoteArchiveInputResponse::Error(
+                            archive_session_error(response),
+                        ),
+                    },
+                    Err(response) => mimageviewer_ipc::RemoteArchiveInputResponse::Error(
+                        archive_session_error(response),
+                    ),
+                };
+                let _ = reply_tx.send(ServerMessage::RemoteArchiveConfirm { id: *id, response });
+                continue;
+            }
+            ClientMessage::RemoteArchivePassword { id, owner, request } => {
+                let response =
+                    match session.begin_operation(owner, "remote archive password".to_owned()) {
+                        Ok(operation) => match operation.wait_until_active() {
+                            Ok(()) => {
+                                operation.started();
+                                let response = session
+                                    .archive_job_registry()
+                                    .map(|jobs| jobs.password(&owner.client_id, request.clone()))
+                                    .unwrap_or_else(archive_input_stopped);
+                                operation.finish(true);
+                                response
+                            }
+                            Err(response) => mimageviewer_ipc::RemoteArchiveInputResponse::Error(
+                                archive_session_error(response),
+                            ),
+                        },
+                        Err(response) => mimageviewer_ipc::RemoteArchiveInputResponse::Error(
+                            archive_session_error(response),
+                        ),
+                    };
+                let _ = reply_tx.send(ServerMessage::RemoteArchivePassword { id: *id, response });
+                continue;
+            }
+            ClientMessage::RemoteArchiveResult { id, owner, job_id } => {
+                let response =
+                    match session.begin_operation(owner, "remote archive result".to_owned()) {
+                        Ok(operation) => match operation.wait_until_active() {
+                            Ok(()) => {
+                                operation.started();
+                                let response = session
+                                    .archive_job_registry()
+                                    .map(|jobs| jobs.result(&owner.client_id, job_id))
+                                    .unwrap_or_else(archive_result_stopped);
+                                operation.finish(true);
+                                response
+                            }
+                            Err(response) => mimageviewer_ipc::RemoteArchiveResultResponse::Error(
+                                archive_session_error(response),
+                            ),
+                        },
+                        Err(response) => mimageviewer_ipc::RemoteArchiveResultResponse::Error(
+                            archive_session_error(response),
+                        ),
+                    };
+                let _ = reply_tx.send(ServerMessage::RemoteArchiveResult { id: *id, response });
                 continue;
             }
             _ => {}
@@ -2124,6 +2434,36 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
             id: *id,
             response: ai_result_stopped(),
         },
+        ClientMessage::RemoteArchiveStart { id, .. } => ServerMessage::RemoteArchiveStart {
+            id: *id,
+            response: archive_start_stopped(),
+        },
+        ClientMessage::RemoteArchiveState { id, .. } => ServerMessage::RemoteArchiveState {
+            id: *id,
+            response: archive_state_stopped(),
+        },
+        ClientMessage::RemoteArchiveRecoverable { id, .. } => {
+            ServerMessage::RemoteArchiveRecoverable {
+                id: *id,
+                response: archive_recoverable_stopped(),
+            }
+        }
+        ClientMessage::RemoteArchiveCancel { id, .. } => ServerMessage::RemoteArchiveCancel {
+            id: *id,
+            response: archive_cancel_stopped(),
+        },
+        ClientMessage::RemoteArchiveConfirm { id, .. } => ServerMessage::RemoteArchiveConfirm {
+            id: *id,
+            response: archive_input_stopped(),
+        },
+        ClientMessage::RemoteArchivePassword { id, .. } => ServerMessage::RemoteArchivePassword {
+            id: *id,
+            response: archive_input_stopped(),
+        },
+        ClientMessage::RemoteArchiveResult { id, .. } => ServerMessage::RemoteArchiveResult {
+            id: *id,
+            response: archive_result_stopped(),
+        },
         ClientMessage::VideoStreamStart { id, .. } => ServerMessage::VideoStreamStart {
             id: *id,
             response: stopped_video_response(),
@@ -2276,6 +2616,38 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
         ClientMessage::RemoteAiResult { id, .. } => ServerMessage::RemoteAiResult {
             id: *id,
             response: mimageviewer_ipc::RemoteAiResultResponse::Error(ai_busy_error()),
+        },
+        ClientMessage::RemoteArchiveStart { id, .. } => ServerMessage::RemoteArchiveStart {
+            id: *id,
+            response: mimageviewer_ipc::RemoteArchiveStartResponse::Error(archive_busy_error()),
+        },
+        ClientMessage::RemoteArchiveState { id, .. } => ServerMessage::RemoteArchiveState {
+            id: *id,
+            response: mimageviewer_ipc::RemoteArchiveStateResponse::Error(archive_busy_error()),
+        },
+        ClientMessage::RemoteArchiveRecoverable { id, .. } => {
+            ServerMessage::RemoteArchiveRecoverable {
+                id: *id,
+                response: mimageviewer_ipc::RemoteArchiveRecoverableResponse::Error(
+                    archive_busy_error(),
+                ),
+            }
+        }
+        ClientMessage::RemoteArchiveCancel { id, .. } => ServerMessage::RemoteArchiveCancel {
+            id: *id,
+            response: mimageviewer_ipc::RemoteArchiveCancelResponse::Error(archive_busy_error()),
+        },
+        ClientMessage::RemoteArchiveConfirm { id, .. } => ServerMessage::RemoteArchiveConfirm {
+            id: *id,
+            response: mimageviewer_ipc::RemoteArchiveInputResponse::Error(archive_busy_error()),
+        },
+        ClientMessage::RemoteArchivePassword { id, .. } => ServerMessage::RemoteArchivePassword {
+            id: *id,
+            response: mimageviewer_ipc::RemoteArchiveInputResponse::Error(archive_busy_error()),
+        },
+        ClientMessage::RemoteArchiveResult { id, .. } => ServerMessage::RemoteArchiveResult {
+            id: *id,
+            response: mimageviewer_ipc::RemoteArchiveResultResponse::Error(archive_busy_error()),
         },
         ClientMessage::VideoStreamStart { id, .. } => ServerMessage::VideoStreamStart {
             id: *id,

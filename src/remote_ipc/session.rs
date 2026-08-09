@@ -16,6 +16,7 @@ use crate::video::stream::session::{
     StreamingGeneration, StreamingGenerationAccess, StreamingSessionId,
 };
 
+use super::long_job::{RemoteLongJobDrainCause, RemoteLongJobRegistry};
 use super::video_stream::{VideoStreamStartBudget, VideoStreamStartStage};
 pub(crate) const LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -33,6 +34,19 @@ enum ReleaseReason {
     IdleTimeout,
     BackgroundExpired,
     Superseded,
+}
+
+impl ReleaseReason {
+    fn long_job_drain_cause(self) -> Option<RemoteLongJobDrainCause> {
+        match self {
+            Self::Local | Self::AcquireBarrierTimeout => {
+                Some(RemoteLongJobDrainCause::DiscardedByHost)
+            }
+            Self::BackgroundExpired => Some(RemoteLongJobDrainCause::BackgroundExpired),
+            Self::Superseded => Some(RemoteLongJobDrainCause::Superseded),
+            Self::LivenessTimeout | Self::IdleTimeout => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +203,8 @@ struct SessionStateMachine {
     acquisition_sequence: u64,
     control_return_sequence: u64,
     drain_reason: Option<ReleaseReason>,
+    drain_started_at: Option<Duration>,
+    next_drain_log_at: Duration,
     app_drain_complete: bool,
 }
 
@@ -205,6 +221,8 @@ impl Default for SessionStateMachine {
             acquisition_sequence: 0,
             control_return_sequence: 0,
             drain_reason: None,
+            drain_started_at: None,
+            next_drain_log_at: Duration::from_secs(3),
             app_drain_complete: false,
         }
     }
@@ -222,7 +240,7 @@ impl SessionStateMachine {
             // waiter, not a second BeginDrain transition, and must not replace its reason.
             RemoteControlPhase::DrainingRemote => return session_closing_response(),
             RemoteControlPhase::AcquiringRemote | RemoteControlPhase::RemoteActive => {
-                self.begin_drain(ReleaseReason::Superseded);
+                self.begin_drain(ReleaseReason::Superseded, now);
                 return session_closing_response();
             }
             RemoteControlPhase::Local => {}
@@ -246,6 +264,8 @@ impl SessionStateMachine {
         self.last_owner = Some(request.client_id.clone());
         self.last_release_reason = None;
         self.drain_reason = None;
+        self.drain_started_at = None;
+        self.next_drain_log_at = Duration::from_secs(3);
         self.app_drain_complete = false;
         self.active = Some(ActiveSession {
             client_id: request.client_id,
@@ -282,13 +302,13 @@ impl SessionStateMachine {
                 .is_ok()
     }
 
-    fn abort_acquire_barrier(&mut self, generation: u64) -> bool {
+    fn abort_acquire_barrier(&mut self, generation: u64, now: Duration) -> bool {
         if generation != self.generation
             || self.lifecycle.phase != RemoteControlPhase::AcquiringRemote
         {
             return false;
         }
-        self.begin_drain(ReleaseReason::AcquireBarrierTimeout)
+        self.begin_drain(ReleaseReason::AcquireBarrierTimeout, now)
     }
 
     fn ping(&mut self, now: Duration, request: &SessionPingRequest) -> SessionResponse {
@@ -320,7 +340,7 @@ impl SessionStateMachine {
         SessionResponse::active(active.session_id.clone())
     }
 
-    fn note_ai_client_seen(&mut self, now: Duration, owner: &RemoteSessionIdentity) -> bool {
+    fn note_long_job_client_seen(&mut self, now: Duration, owner: &RemoteSessionIdentity) -> bool {
         let Some(active) = self.active.as_mut() else {
             return false;
         };
@@ -540,17 +560,25 @@ impl SessionStateMachine {
 
     #[cfg(test)]
     fn local_disconnect(&mut self) {
-        self.begin_drain(ReleaseReason::Local);
+        let now = self
+            .active
+            .as_ref()
+            .map_or(Duration::ZERO, |active| active.last_ping);
+        self.begin_drain(ReleaseReason::Local, now);
     }
 
     fn expire(&mut self, now: Duration) -> Option<ReleaseReason> {
-        self.expire_with_ai(now, false)
+        self.expire_with_long_jobs(now, false)
     }
 
-    fn expire_with_ai(&mut self, now: Duration, has_nonterminal_ai: bool) -> Option<ReleaseReason> {
+    fn expire_with_long_jobs(
+        &mut self,
+        now: Duration,
+        has_nonterminal_long_job: bool,
+    ) -> Option<ReleaseReason> {
         let reason = self.active.as_ref().and_then(|active| {
             if now.saturating_sub(active.last_ping) >= LIVENESS_TIMEOUT {
-                if has_nonterminal_ai {
+                if has_nonterminal_long_job {
                     if now.saturating_sub(active.last_activity) >= IDLE_TIMEOUT {
                         Some(ReleaseReason::BackgroundExpired)
                     } else {
@@ -566,7 +594,7 @@ impl SessionStateMachine {
                     .is_some_and(|streaming| streaming.playing)
                 && now.saturating_sub(active.last_activity) >= IDLE_TIMEOUT
             {
-                Some(if has_nonterminal_ai {
+                Some(if has_nonterminal_long_job {
                     ReleaseReason::BackgroundExpired
                 } else {
                     ReleaseReason::IdleTimeout
@@ -576,7 +604,7 @@ impl SessionStateMachine {
             }
         });
         if reason.is_none()
-            && has_nonterminal_ai
+            && has_nonterminal_long_job
             && let Some(active) = self.active.as_mut()
             && now.saturating_sub(active.last_ping) >= LIVENESS_TIMEOUT
             && matches!(active.presence, RemoteClientPresence::Foreground)
@@ -584,12 +612,12 @@ impl SessionStateMachine {
             active.presence = RemoteClientPresence::Detached { since: now };
         }
         if let Some(reason) = reason {
-            self.begin_drain(reason);
+            self.begin_drain(reason, now);
         }
         reason
     }
 
-    fn begin_drain(&mut self, reason: ReleaseReason) -> bool {
+    fn begin_drain(&mut self, reason: ReleaseReason, now: Duration) -> bool {
         if self
             .lifecycle
             .transition(RemoteControlTransition::BeginDrain)
@@ -598,6 +626,8 @@ impl SessionStateMachine {
             return false;
         }
         self.drain_reason = Some(reason);
+        self.drain_started_at = Some(now);
+        self.next_drain_log_at = Duration::from_secs(3);
         self.app_drain_complete = false;
         if let Some(active) = self.active.as_mut() {
             active.cancel_streaming();
@@ -606,6 +636,31 @@ impl SessionStateMachine {
             }
         }
         true
+    }
+
+    fn drain_wait_diagnostic(
+        &mut self,
+        now: Duration,
+    ) -> Option<(ReleaseReason, Duration, bool, usize, usize, usize)> {
+        if self.lifecycle.phase != RemoteControlPhase::DrainingRemote {
+            return None;
+        }
+        let elapsed = now.saturating_sub(self.drain_started_at?);
+        if elapsed < self.next_drain_log_at {
+            return None;
+        }
+        self.next_drain_log_at = elapsed.saturating_add(Duration::from_secs(10));
+        let active = self.active.as_ref();
+        Some((
+            self.drain_reason?,
+            elapsed,
+            self.app_drain_complete,
+            active.map_or(0, |active| active.operations.len()),
+            active.map_or(0, |active| {
+                active.operations.values().filter(|op| op.started).count()
+            }),
+            active.map_or(0, |active| active.streaming_workers.len()),
+        ))
     }
 
     fn complete_app_drain(&mut self, generation: u64) -> bool {
@@ -657,6 +712,8 @@ impl SessionStateMachine {
         }
         self.last_release_reason = Some(reason);
         self.drain_reason = None;
+        self.drain_started_at = None;
+        self.next_drain_log_at = Duration::from_secs(3);
         self.app_drain_complete = false;
         self.generation = self.generation.wrapping_add(1);
         self.control_return_sequence = self.control_return_sequence.wrapping_add(1);
@@ -1125,6 +1182,8 @@ pub(crate) struct SessionHandle {
     phase_wake: Arc<(Mutex<u64>, Condvar)>,
     ai_bridge: Arc<Mutex<Option<RemoteAiExecutionBridge>>>,
     ai_jobs: Arc<Mutex<Weak<super::ai_job::RemoteAiJobRegistry>>>,
+    archive_jobs: Arc<Mutex<Weak<super::archive_job::RemoteArchiveJobRegistry>>>,
+    archive_cache_db: Arc<Mutex<Option<Arc<crate::archive_cache::ArchiveCacheDb>>>>,
 }
 
 impl UiRequestDispatch {
@@ -1222,6 +1281,8 @@ impl SessionHandle {
             phase_wake: Arc::new((Mutex::new(0), Condvar::new())),
             ai_bridge: Arc::new(Mutex::new(None)),
             ai_jobs: Arc::new(Mutex::new(Weak::new())),
+            archive_jobs: Arc::new(Mutex::new(Weak::new())),
+            archive_cache_db: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1237,6 +1298,50 @@ impl SessionHandle {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .upgrade()
+    }
+
+    pub(crate) fn install_archive_jobs(
+        &self,
+        jobs: &Arc<super::archive_job::RemoteArchiveJobRegistry>,
+    ) {
+        *self
+            .archive_jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(jobs);
+    }
+
+    pub(crate) fn archive_job_registry(
+        &self,
+    ) -> Option<Arc<super::archive_job::RemoteArchiveJobRegistry>> {
+        self.archive_jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .upgrade()
+    }
+
+    pub(crate) fn install_archive_cache_db(
+        &self,
+        db: Option<Arc<crate::archive_cache::ArchiveCacheDb>>,
+    ) {
+        *self
+            .archive_cache_db
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = db;
+    }
+
+    pub(crate) fn archive_cache_db(&self) -> Option<Arc<crate::archive_cache::ArchiveCacheDb>> {
+        self.archive_cache_db
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn has_nonterminal_long_jobs(&self) -> bool {
+        self.ai_job_registry()
+            .is_some_and(|jobs| RemoteLongJobRegistry::has_nonterminal_jobs(&*jobs))
+            || self
+                .archive_job_registry()
+                .is_some_and(|jobs| RemoteLongJobRegistry::has_nonterminal_jobs(&*jobs))
     }
 
     fn now(&self) -> Duration {
@@ -1282,7 +1387,7 @@ impl SessionHandle {
             self.notify_phase_changed();
         }
         if let Some(reason) = drain_reason {
-            self.notify_ai_drain(reason);
+            self.notify_long_job_drain(reason);
         }
         if response.status == SessionStatus::Active {
             crate::logger::log(format!(
@@ -1299,13 +1404,11 @@ impl SessionHandle {
     }
 
     pub(crate) fn ping(&self, request: &SessionPingRequest) -> SessionResponse {
-        let has_nonterminal_ai = self
-            .ai_job_registry()
-            .is_some_and(|jobs| jobs.has_nonterminal_jobs());
+        let has_nonterminal_long_job = self.has_nonterminal_long_jobs();
         let (response, phase_changed) = {
             let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            if has_nonterminal_ai {
-                state.note_ai_client_seen(self.now(), &request.owner);
+            if has_nonterminal_long_job {
+                state.note_long_job_client_seen(self.now(), &request.owner);
             }
             let phase = state.lifecycle.phase;
             let response = state.ping(self.now(), request);
@@ -1324,13 +1427,11 @@ impl SessionHandle {
         owner: &RemoteSessionIdentity,
         description: String,
     ) -> Result<SessionOperation, SessionResponse> {
-        let has_nonterminal_ai = self
-            .ai_job_registry()
-            .is_some_and(|jobs| jobs.has_nonterminal_jobs());
+        let has_nonterminal_long_job = self.has_nonterminal_long_jobs();
         let (result, phase_changed) = {
             let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            if has_nonterminal_ai {
-                state.note_ai_client_seen(self.now(), owner);
+            if has_nonterminal_long_job {
+                state.note_long_job_client_seen(self.now(), owner);
             }
             let phase = state.lifecycle.phase;
             let result = state.begin_operation(self.now(), owner, description);
@@ -1370,9 +1471,9 @@ impl SessionHandle {
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .abort_acquire_barrier(generation);
+            .abort_acquire_barrier(generation, self.now());
         if changed {
-            self.notify_ai_drain(ReleaseReason::AcquireBarrierTimeout);
+            self.notify_long_job_drain(ReleaseReason::AcquireBarrierTimeout);
             self.clear_video_stream(None);
             self.notify_phase_changed();
             crate::logger::log(
@@ -1514,9 +1615,9 @@ impl SessionHandle {
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .begin_drain(ReleaseReason::Local);
+            .begin_drain(ReleaseReason::Local, self.now());
         if phase_changed {
-            self.notify_ai_drain(ReleaseReason::Local);
+            self.notify_long_job_drain(ReleaseReason::Local);
             self.clear_video_stream(None); // drain starts before release
             self.notify_phase_changed();
             crate::logger::log("remote_ipc: session_drain_started reason=local".to_owned());
@@ -1524,32 +1625,27 @@ impl SessionHandle {
         }
     }
 
-    pub(crate) fn note_ai_client_seen(&self, owner: &RemoteSessionIdentity) {
+    pub(crate) fn note_long_job_client_seen(&self, owner: &RemoteSessionIdentity) {
         let changed = self
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .note_ai_client_seen(self.now(), owner);
+            .note_long_job_client_seen(self.now(), owner);
         if changed {
             self.notify_ui();
         }
     }
 
-    fn notify_ai_drain(&self, reason: ReleaseReason) {
-        let Some(jobs) = self.ai_job_registry() else {
+    fn notify_long_job_drain(&self, reason: ReleaseReason) {
+        let Some(cause) = reason.long_job_drain_cause() else {
             return;
         };
-        let cause = match reason {
-            ReleaseReason::Local | ReleaseReason::AcquireBarrierTimeout => {
-                super::ai_job::RemoteAiDrainCause::DiscardedByHost
-            }
-            ReleaseReason::BackgroundExpired => {
-                super::ai_job::RemoteAiDrainCause::BackgroundExpired
-            }
-            ReleaseReason::Superseded => super::ai_job::RemoteAiDrainCause::Superseded,
-            ReleaseReason::LivenessTimeout | ReleaseReason::IdleTimeout => return,
-        };
-        jobs.on_session_drain(cause);
+        if let Some(jobs) = self.ai_job_registry() {
+            RemoteLongJobRegistry::on_session_drain(&*jobs, cause);
+        }
+        if let Some(jobs) = self.archive_job_registry() {
+            RemoteLongJobRegistry::on_session_drain(&*jobs, cause);
+        }
     }
 
     pub(crate) fn submit_write(
@@ -1812,21 +1908,34 @@ impl SessionHandle {
         wake.notify_all();
     }
 
+    fn log_observable_drain_wait(&self) {
+        let diagnostic = self
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .drain_wait_diagnostic(self.now());
+        let Some((reason, elapsed, app_done, operations, started, streaming)) = diagnostic else {
+            return;
+        };
+        crate::logger::log(format!(
+            "remote_ipc: session_drain_wait reason={reason:?} elapsed_ms={} app_drain_complete={app_done} operations={operations} started_operations={started} streaming_workers={streaming}",
+            elapsed.as_millis(),
+        ));
+    }
+
     fn expire(&self) -> Option<ReleaseReason> {
-        let has_nonterminal_ai = self
-            .ai_job_registry()
-            .is_some_and(|jobs| jobs.has_nonterminal_jobs());
+        let has_nonterminal_long_job = self.has_nonterminal_long_jobs();
         let (reason, phase_changed) = {
             let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             let phase = state.lifecycle.phase;
-            let reason = state.expire_with_ai(self.now(), has_nonterminal_ai);
+            let reason = state.expire_with_long_jobs(self.now(), has_nonterminal_long_job);
             (reason, state.lifecycle.phase != phase)
         };
         if reason.is_some() {
             self.clear_video_stream(None);
         }
         if let Some(reason) = reason {
-            self.notify_ai_drain(reason);
+            self.notify_long_job_drain(reason);
         }
         if phase_changed {
             self.notify_phase_changed();
@@ -2125,6 +2234,20 @@ impl SessionOperation {
         Arc::clone(&self.cancel)
     }
 
+    pub(crate) fn long_job_drain_cause(&self) -> Option<RemoteLongJobDrainCause> {
+        let state = self
+            .handle
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.generation != self.generation
+            || state.lifecycle.phase != RemoteControlPhase::DrainingRemote
+        {
+            return None;
+        }
+        state.drain_reason?.long_job_drain_cause()
+    }
+
     pub(crate) fn started(&self) {
         self.handle
             .inner
@@ -2245,6 +2368,7 @@ fn session_watchdog(handle: SessionHandle, stop: Arc<AtomicBool>) {
             ));
             handle.notify_ui();
         }
+        handle.log_observable_drain_wait();
         let active = handle.snapshot().active.is_some();
         if active != sleep_prevented {
             set_sleep_prevention(active);
@@ -2421,6 +2545,38 @@ mod tests {
     }
 
     #[test]
+    fn drain_wait_diagnostic_is_delayed_and_rate_limited() {
+        let mut state = SessionStateMachine::default();
+        acquire(&mut state, Duration::ZERO);
+        state.local_disconnect();
+
+        assert!(
+            state
+                .drain_wait_diagnostic(Duration::from_secs(2))
+                .is_none()
+        );
+        let diagnostic = state
+            .drain_wait_diagnostic(Duration::from_secs(3))
+            .expect("three-second drain diagnostic");
+        assert_eq!(diagnostic.0, ReleaseReason::Local);
+        assert_eq!(diagnostic.1, Duration::from_secs(3));
+        assert_eq!(
+            (diagnostic.2, diagnostic.3, diagnostic.4, diagnostic.5),
+            (false, 0, 0, 0)
+        );
+        assert!(
+            state
+                .drain_wait_diagnostic(Duration::from_secs(12))
+                .is_none()
+        );
+        assert!(
+            state
+                .drain_wait_diagnostic(Duration::from_secs(13))
+                .is_some()
+        );
+    }
+
+    #[test]
     fn remote_control_lifecycle_has_one_valid_linear_path() {
         let mut lifecycle = RemoteControlLifecycle::default();
         assert_eq!(lifecycle.phase, RemoteControlPhase::Local);
@@ -2516,7 +2672,7 @@ mod tests {
         let mut state = SessionStateMachine::default();
         acquire(&mut state, Duration::ZERO);
 
-        assert_eq!(state.expire_with_ai(LIVENESS_TIMEOUT, true), None);
+        assert_eq!(state.expire_with_long_jobs(LIVENESS_TIMEOUT, true), None);
         assert_eq!(state.lifecycle.phase, RemoteControlPhase::RemoteActive);
         assert!(matches!(
             state.active.as_ref().map(|active| active.presence),
@@ -2524,7 +2680,7 @@ mod tests {
         ));
 
         let owner = state_owner(&state, "client");
-        assert!(state.note_ai_client_seen(LIVENESS_TIMEOUT + Duration::from_secs(1), &owner));
+        assert!(state.note_long_job_client_seen(LIVENESS_TIMEOUT + Duration::from_secs(1), &owner));
         assert!(matches!(
             state.active.as_ref().map(|active| active.presence),
             Some(RemoteClientPresence::Foreground)
@@ -2538,7 +2694,7 @@ mod tests {
         acquire(&mut state, Duration::ZERO);
 
         assert_eq!(
-            state.expire_with_ai(IDLE_TIMEOUT, true),
+            state.expire_with_long_jobs(IDLE_TIMEOUT, true),
             Some(ReleaseReason::BackgroundExpired)
         );
         assert_eq!(state.lifecycle.phase, RemoteControlPhase::DrainingRemote);
@@ -3354,5 +3510,20 @@ mod tests {
         handle.remote_web_disconnected(2);
         handle.remote_web_disconnected(3);
         assert!(!handle.snapshot().remote_web_connected);
+    }
+
+    #[test]
+    fn archive_cache_injection_preserves_the_exact_optional_instance() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let handle = SessionHandle::new();
+        assert!(handle.archive_cache_db().is_none());
+
+        let db = Arc::new(crate::archive_cache::ArchiveCacheDb::open().unwrap());
+        handle.install_archive_cache_db(Some(Arc::clone(&db)));
+        let installed = handle.archive_cache_db().expect("archive cache installed");
+        assert!(Arc::ptr_eq(&db, &installed));
+
+        handle.install_archive_cache_db(None);
+        assert!(handle.archive_cache_db().is_none());
     }
 }

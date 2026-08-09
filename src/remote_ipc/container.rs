@@ -657,7 +657,9 @@ impl ContainerEngine {
         }
     }
 
-    fn settings_for_listing(&self) -> Result<crate::settings::Settings, RemoteWriteError> {
+    pub(super) fn settings_for_listing(
+        &self,
+    ) -> Result<crate::settings::Settings, RemoteWriteError> {
         let mut settings = (*self.settings).clone();
         let live = self.listing_settings.load(&settings).map_err(|error| {
             crate::logger::log(format!(

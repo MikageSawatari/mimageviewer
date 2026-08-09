@@ -171,10 +171,12 @@ pub enum ConvertError {
     Io(std::io::Error),
     /// ユーザーキャンセルによる中断
     Cancelled,
-    /// パスワードが必要なアーカイブだった
+    /// この形式の reader へパスワードを渡せば再試行できる
     PasswordRequired,
-    /// 入力済み / 保存済みパスワードが正しくなかった
+    /// この形式の reader へ渡したパスワードが正しくなかったため再入力できる
     BadPassword,
+    /// 暗号化を識別できたが、この形式の reader にはパスワード入力手段がない
+    PasswordUnsupported,
     /// アーカイブ解析・展開時のエラー (ライブラリ依存のメッセージを文字列化)
     Archive(String),
     /// 画像エントリが 0 件だった
@@ -191,6 +193,9 @@ impl std::fmt::Display for ConvertError {
             Self::Cancelled => write!(f, "キャンセルされました"),
             Self::PasswordRequired => write!(f, "パスワードが必要です"),
             Self::BadPassword => write!(f, "パスワードが正しくありません"),
+            Self::PasswordUnsupported => {
+                write!(f, "この形式のパスワード付きアーカイブには対応していません")
+            }
             Self::Archive(s) => write!(f, "アーカイブエラー: {s}"),
             Self::NoImages => write!(f, "画像ファイルが含まれていません"),
             Self::TooLarge => write!(f, "展開後サイズが上限を超えました"),
@@ -318,6 +323,21 @@ fn rar_error(e: unrar::error::UnrarError) -> ConvertError {
     }
 }
 
+fn sevenz_error(error: sevenz_rust2::Error) -> ConvertError {
+    match error {
+        sevenz_rust2::Error::PasswordRequired | sevenz_rust2::Error::MaybeBadPassword(_) => {
+            ConvertError::PasswordUnsupported
+        }
+        error => ConvertError::Archive(error.to_string()),
+    }
+}
+
+fn lzh_error(error: impl std::fmt::Display) -> ConvertError {
+    // delharc exposes neither password input nor a typed encryption signal. In particular, do not
+    // infer PasswordRequired from library error text: LZH failures are not retryable with a secret.
+    ConvertError::Archive(error.to_string())
+}
+
 fn rar_archive<'a>(
     path: &'a Path,
     password: Option<&'a str>,
@@ -349,7 +369,7 @@ fn open_rar_listing(
         .map_err(rar_error)
 }
 
-fn resolve_rar_source_path(
+pub(crate) fn resolve_rar_source_path(
     path: &Path,
     password: Option<&str>,
 ) -> Result<std::path::PathBuf, ConvertError> {
@@ -411,8 +431,8 @@ fn scan_summary_rar(
 
 fn scan_summary_7z(path: &Path, cancel: &AtomicBool) -> Result<ArchiveImageSummary, ConvertError> {
     check_scan_cancel(cancel)?;
-    let reader = sevenz_rust2::ArchiveReader::open(path, Default::default())
-        .map_err(|e| ConvertError::Archive(e.to_string()))?;
+    let reader =
+        sevenz_rust2::ArchiveReader::open(path, Default::default()).map_err(sevenz_error)?;
     let mut count = 0u32;
     let mut bytes = 0u64;
     let mut nested = 0u32;
@@ -437,8 +457,10 @@ fn scan_summary_7z(path: &Path, cancel: &AtomicBool) -> Result<ArchiveImageSumma
 }
 
 fn scan_summary_lzh(path: &Path, cancel: &AtomicBool) -> Result<ArchiveImageSummary, ConvertError> {
+    // delharc 0.6.x has no password input and exposes no typed encryption error/flag. Keep every
+    // LZH failure non-retryable (`Archive`); never infer a password prompt from error text.
     check_scan_cancel(cancel)?;
-    let mut reader = delharc::parse_file(path).map_err(|e| ConvertError::Archive(e.to_string()))?;
+    let mut reader = delharc::parse_file(path).map_err(lzh_error)?;
     let mut count = 0u32;
     let mut bytes = 0u64;
     let mut nested = 0u32;
@@ -456,10 +478,7 @@ fn scan_summary_lzh(path: &Path, cancel: &AtomicBool) -> Result<ArchiveImageSumm
             }
         }
         check_scan_cancel(cancel)?;
-        if !reader
-            .next_file()
-            .map_err(|e| ConvertError::Archive(e.to_string()))?
-        {
+        if !reader.next_file().map_err(lzh_error)? {
             break;
         }
     }
@@ -956,6 +975,9 @@ fn expand_nested_guarded(
         Ok(()) => Ok(()),
         // 入れ子側の password error をそのまま返すと、単一変換 UI が外側アーカイブの
         // password prompt と誤認して再試行を繰り返す。入れ子の読取失敗として確定させる。
+        Err(ConvertError::PasswordUnsupported) if ctx.strict => Err(ConvertError::Archive(
+            format!("入れ子アーカイブ {prefix} はパスワード付き形式に対応していません"),
+        )),
         Err(ConvertError::PasswordRequired) if ctx.strict => Err(ConvertError::Archive(format!(
             "入れ子アーカイブ {prefix} を開くにはパスワードが必要です"
         ))),
@@ -1175,8 +1197,8 @@ fn expand_7z(
     prefix: &str,
     depth: u32,
 ) -> Result<(), ConvertError> {
-    let mut reader = sevenz_rust2::ArchiveReader::open(src, Default::default())
-        .map_err(|e| ConvertError::Archive(e.to_string()))?;
+    let mut reader =
+        sevenz_rust2::ArchiveReader::open(src, Default::default()).map_err(sevenz_error)?;
 
     // 進捗分母: この階層の直下画像数 (アーカイブメタの走査のみで安価)。
     let expected = reader
@@ -1278,7 +1300,7 @@ fn expand_7z(
     if let Some(e) = deferred {
         return Err(e);
     }
-    iter_result.map_err(|e| ConvertError::Archive(e.to_string()))?;
+    iter_result.map_err(sevenz_error)?;
     Ok(())
 }
 
@@ -1316,7 +1338,7 @@ fn expand_lzh(
 ) -> Result<(), ConvertError> {
     // 進捗分母: ヘッダスキャンのみで安価。
     {
-        let mut r = delharc::parse_file(src).map_err(|e| ConvertError::Archive(e.to_string()))?;
+        let mut r = delharc::parse_file(src).map_err(lzh_error)?;
         let mut expected = 0u32;
         loop {
             let header = r.header();
@@ -1324,17 +1346,14 @@ fn expand_lzh(
             if !header.is_directory() && !should_ignore_entry(&name) && is_image_entry(&name) {
                 expected += 1;
             }
-            if !r
-                .next_file()
-                .map_err(|e| ConvertError::Archive(e.to_string()))?
-            {
+            if !r.next_file().map_err(lzh_error)? {
                 break;
             }
         }
         ctx.add_expected(expected);
     }
 
-    let mut reader = delharc::parse_file(src).map_err(|e| ConvertError::Archive(e.to_string()))?;
+    let mut reader = delharc::parse_file(src).map_err(lzh_error)?;
     loop {
         ctx.check_cancel()?;
         // header の借用は raw_name 抽出までで終える (この後 reader を Read で使う)。
@@ -1362,10 +1381,7 @@ fn expand_lzh(
                             "安全な出力名に変換できない LZH エントリです: {raw_name}"
                         )));
                     }
-                    if !reader
-                        .next_file()
-                        .map_err(|e| ConvertError::Archive(e.to_string()))?
-                    {
+                    if !reader.next_file().map_err(lzh_error)? {
                         break;
                     }
                     continue;
@@ -1388,10 +1404,7 @@ fn expand_lzh(
                             "安全な出力名に変換できない LZH エントリです: {raw_name}"
                         )));
                     }
-                    if !reader
-                        .next_file()
-                        .map_err(|e| ConvertError::Archive(e.to_string()))?
-                    {
+                    if !reader.next_file().map_err(lzh_error)? {
                         break;
                     }
                     continue;
@@ -1427,10 +1440,7 @@ fn expand_lzh(
                 }
             }
         }
-        if !reader
-            .next_file()
-            .map_err(|e| ConvertError::Archive(e.to_string()))?
-        {
+        if !reader.next_file().map_err(lzh_error)? {
             break;
         }
     }
@@ -1994,6 +2004,25 @@ mod tests {
         let summary = scan_summary(&path, ArchiveFormat::Rar).unwrap();
         assert_eq!(summary.image_count, 0);
         assert_eq!(summary.total_uncompressed_bytes, 0);
+    }
+
+    #[test]
+    fn non_rar_encryption_errors_are_never_password_retryable() {
+        assert!(matches!(
+            sevenz_error(sevenz_rust2::Error::PasswordRequired),
+            ConvertError::PasswordUnsupported
+        ));
+        assert!(matches!(
+            sevenz_error(sevenz_rust2::Error::MaybeBadPassword(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bad password"
+            ))),
+            ConvertError::PasswordUnsupported
+        ));
+        assert!(matches!(
+            lzh_error("password required"),
+            ConvertError::Archive(_)
+        ));
     }
 
     #[test]

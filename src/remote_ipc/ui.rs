@@ -320,6 +320,7 @@ impl crate::app::App {
             std::sync::Arc::clone(&self.ai_model_manager),
             self.fs_transparent_bg_mode,
         ));
+        handle.install_archive_cache_db(self.archive_cache_db.clone());
         self.remote_session_ui.handle = Some(handle);
     }
 

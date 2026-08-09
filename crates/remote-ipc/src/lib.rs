@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 40;
+pub const PROTOCOL_VERSION: u32 = 41;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -23,6 +23,9 @@ pub const VIDEO_STREAM_START_BUDGET: Duration = Duration::from_secs(15);
 /// A remote AI POST must be admitted by the core within this window. The job itself has no
 /// inference deadline after admission.
 pub const REMOTE_AI_START_ACCEPT_BUDGET: Duration = Duration::from_secs(2);
+/// A remote archive POST only admits a long-running job. Inspection and conversion continue on
+/// the core-owned job thread after this short IPC admission window.
+pub const REMOTE_ARCHIVE_START_ACCEPT_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ClientHello {
@@ -1658,6 +1661,225 @@ pub enum RemoteAiResultResponse {
     Error(RemoteAiJobError),
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteArchiveStartRequest {
+    /// Client-generated idempotency key. Repeating it returns the original job.
+    pub request_id: String,
+    /// Public identity of the original archive. Cache paths are never accepted here.
+    pub source: RemoteAddress,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteArchiveJobState {
+    WaitingForLocalDrain,
+    Inspecting,
+    AwaitingConfirmation,
+    AwaitingPassword,
+    WaitingForConversionSlot,
+    Converting,
+    Finalizing,
+    Cancelling,
+    Ready,
+    DeclinedByUser,
+    Superseded,
+    CancelledByUser,
+    DiscardedByHost,
+    BackgroundExpired,
+    Failed,
+}
+
+impl RemoteArchiveJobState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Ready
+                | Self::DeclinedByUser
+                | Self::Superseded
+                | Self::CancelledByUser
+                | Self::DiscardedByHost
+                | Self::BackgroundExpired
+                | Self::Failed
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteArchiveProgress {
+    pub files_done: u64,
+    pub files_total: u64,
+    pub bytes_written: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteArchiveImageSummary {
+    pub image_count: u32,
+    pub total_uncompressed_bytes: u64,
+    pub nested_archive_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteArchivePasswordResume {
+    Inspect,
+    Convert,
+}
+
+/// Input requested by an archive job. This contains only displayable metadata; the submitted
+/// password is transported by `RemoteArchivePasswordRequest` and is never copied into a snapshot.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RemoteArchiveAwaitingInput {
+    Confirmation {
+        summary: RemoteArchiveImageSummary,
+    },
+    Password {
+        resume: RemoteArchivePasswordResume,
+        bad_password: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteArchiveTerminalCode {
+    DeclinedByUser,
+    Superseded,
+    CancelledByUser,
+    DiscardedByHost,
+    BackgroundExpired,
+    CacheUnavailable,
+    PasswordUnsupported,
+    SourceChanged,
+    IgnoredBySettings,
+    UnsupportedFormat,
+    NoImages,
+    ExecutionFailed,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteArchiveTerminalDetail {
+    pub code: RemoteArchiveTerminalCode,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteArchiveJobSnapshot {
+    pub job_id: String,
+    pub request_id: String,
+    /// Always the original archive address, never a cache ZIP path.
+    pub source: RemoteAddress,
+    pub state: RemoteArchiveJobState,
+    pub progress: Option<RemoteArchiveProgress>,
+    pub awaiting_input: Option<RemoteArchiveAwaitingInput>,
+    pub terminal: Option<RemoteArchiveTerminalDetail>,
+    pub created_unix_ms: u64,
+    pub updated_unix_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteArchiveAccessMode {
+    DirectRar,
+    CachedZip,
+}
+
+/// Public result of preparing an archive. The core keeps the direct-RAR/cache-ZIP backing path in
+/// its job registry; only the original source identity crosses IPC.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteArchiveOpenResult {
+    pub source: RemoteAddress,
+    pub access: RemoteArchiveAccessMode,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteArchiveJobErrorCode {
+    BadRequest,
+    StartExpired,
+    SessionClosing,
+    NotFound,
+    Forbidden,
+    JobGone,
+    InvalidState,
+    NotReady,
+    Internal,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteArchiveJobError {
+    pub code: RemoteArchiveJobErrorCode,
+    pub message: String,
+    pub terminal_code: Option<RemoteArchiveTerminalCode>,
+}
+
+impl RemoteArchiveJobError {
+    pub fn new(code: RemoteArchiveJobErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            terminal_code: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteArchiveConfirmRequest {
+    pub job_id: String,
+    pub proceed: bool,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteArchivePasswordRequest {
+    pub job_id: String,
+    pub password: String,
+}
+
+impl fmt::Debug for RemoteArchivePasswordRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteArchivePasswordRequest")
+            .field("job_id", &self.job_id)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum RemoteArchiveStartResponse {
+    Accepted(RemoteArchiveJobSnapshot),
+    Error(RemoteArchiveJobError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum RemoteArchiveStateResponse {
+    Success(RemoteArchiveJobSnapshot),
+    Error(RemoteArchiveJobError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum RemoteArchiveRecoverableResponse {
+    Success(Vec<RemoteArchiveJobSnapshot>),
+    Error(RemoteArchiveJobError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum RemoteArchiveCancelResponse {
+    Success(RemoteArchiveJobSnapshot),
+    Error(RemoteArchiveJobError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum RemoteArchiveInputResponse {
+    Success(RemoteArchiveJobSnapshot),
+    Error(RemoteArchiveJobError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum RemoteArchiveResultResponse {
+    Success(RemoteArchiveOpenResult),
+    Error(RemoteArchiveJobError),
+}
+
 impl VideoStreamError {
     pub fn new(code: VideoStreamErrorCode, message: impl Into<String>) -> Self {
         Self {
@@ -1763,6 +1985,41 @@ pub enum ClientMessage {
         job_id: String,
         page_index: u32,
     },
+    RemoteArchiveStart {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+        request: RemoteArchiveStartRequest,
+        accept_before_unix_ms: u64,
+    },
+    RemoteArchiveState {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+        job_id: String,
+    },
+    RemoteArchiveRecoverable {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+    },
+    RemoteArchiveCancel {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+        job_id: String,
+    },
+    RemoteArchiveConfirm {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+        request: RemoteArchiveConfirmRequest,
+    },
+    RemoteArchivePassword {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+        request: RemoteArchivePasswordRequest,
+    },
+    RemoteArchiveResult {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+        job_id: String,
+    },
     Write {
         id: RequestId,
         owner: RemoteSessionIdentity,
@@ -1850,6 +2107,13 @@ impl ClientMessage {
             | Self::RemoteAiRecoverable { id, .. }
             | Self::RemoteAiCancel { id, .. }
             | Self::RemoteAiResult { id, .. }
+            | Self::RemoteArchiveStart { id, .. }
+            | Self::RemoteArchiveState { id, .. }
+            | Self::RemoteArchiveRecoverable { id, .. }
+            | Self::RemoteArchiveCancel { id, .. }
+            | Self::RemoteArchiveConfirm { id, .. }
+            | Self::RemoteArchivePassword { id, .. }
+            | Self::RemoteArchiveResult { id, .. }
             | Self::Write { id, .. }
             | Self::VideoStreamStart { id, .. }
             | Self::VideoStreamControl { id, .. }
@@ -1933,6 +2197,34 @@ pub enum ServerMessage {
         id: RequestId,
         response: RemoteAiResultResponse,
     },
+    RemoteArchiveStart {
+        id: RequestId,
+        response: RemoteArchiveStartResponse,
+    },
+    RemoteArchiveState {
+        id: RequestId,
+        response: RemoteArchiveStateResponse,
+    },
+    RemoteArchiveRecoverable {
+        id: RequestId,
+        response: RemoteArchiveRecoverableResponse,
+    },
+    RemoteArchiveCancel {
+        id: RequestId,
+        response: RemoteArchiveCancelResponse,
+    },
+    RemoteArchiveConfirm {
+        id: RequestId,
+        response: RemoteArchiveInputResponse,
+    },
+    RemoteArchivePassword {
+        id: RequestId,
+        response: RemoteArchiveInputResponse,
+    },
+    RemoteArchiveResult {
+        id: RequestId,
+        response: RemoteArchiveResultResponse,
+    },
     Write {
         id: RequestId,
         response: RemoteWriteResponse,
@@ -1998,6 +2290,13 @@ impl ServerMessage {
             | Self::RemoteAiRecoverable { id, .. }
             | Self::RemoteAiCancel { id, .. }
             | Self::RemoteAiResult { id, .. }
+            | Self::RemoteArchiveStart { id, .. }
+            | Self::RemoteArchiveState { id, .. }
+            | Self::RemoteArchiveRecoverable { id, .. }
+            | Self::RemoteArchiveCancel { id, .. }
+            | Self::RemoteArchiveConfirm { id, .. }
+            | Self::RemoteArchivePassword { id, .. }
+            | Self::RemoteArchiveResult { id, .. }
             | Self::Write { id, .. }
             | Self::VideoStreamStart { id, .. }
             | Self::VideoStreamControl { id, .. }
@@ -2333,8 +2632,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v40_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 40);
+    fn protocol_v41_remote_video_thumbnail_shape_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 41);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -3137,5 +3436,48 @@ mod tests {
         let decoded: ServerMessage =
             read_frame(&mut frame.as_slice(), MAX_RESPONSE_FRAME_BYTES).unwrap();
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn remote_archive_password_is_redacted_and_never_enters_snapshot() {
+        let password = RemoteArchivePasswordRequest {
+            job_id: "archive-7-1".to_owned(),
+            password: "super-secret".to_owned(),
+        };
+        let debug = format!("{password:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("super-secret"));
+
+        let message = ClientMessage::RemoteArchivePassword {
+            id: 41,
+            owner: test_owner("phone"),
+            request: password.clone(),
+        };
+        let message_debug = format!("{message:?}");
+        assert!(!message_debug.contains("super-secret"));
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &message).unwrap();
+        let decoded: ClientMessage =
+            read_frame(&mut frame.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
+        assert_eq!(decoded, message);
+
+        let snapshot = RemoteArchiveJobSnapshot {
+            job_id: password.job_id.clone(),
+            request_id: "request-1".to_owned(),
+            source: RemoteAddress::file("C:/Books/secret.rar"),
+            state: RemoteArchiveJobState::AwaitingPassword,
+            progress: None,
+            awaiting_input: Some(RemoteArchiveAwaitingInput::Password {
+                resume: RemoteArchivePasswordResume::Convert,
+                bad_password: true,
+            }),
+            terminal: None,
+            created_unix_ms: 10,
+            updated_unix_ms: 20,
+        };
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(!encoded.contains("super-secret"));
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert!(value.get("password").is_none());
     }
 }

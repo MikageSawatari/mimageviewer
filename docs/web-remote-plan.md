@@ -1555,6 +1555,47 @@ p50 38.2 ms / p95 43.8 ms だった。この DB では一覧と無関係な VST 
 あたり約 22 µs の限定読取を選び、listing の判断項目を追加するときは
 `RemoteListingSettings`、固定 query、overlay test を同時に更新する。
 
+### 12.25 変換アーカイブの長時間ジョブ基盤 (protocol v41, 2026-08-09)
+
+RAR / 7z / LZH の準備は、通常の IPC worker 要求の中で同期実行しない。protocol v41 は
+archive 専用の start / state / recoverable / cancel / confirm / password / result と、確認待ち・
+パスワード待ち・変換枠待ち・変換・finalize・終端を表す snapshot を追加した。AI job の registry、
+snapshot、terminal 型は流用せず、session が参照する nonterminal 判定と drain 通知だけを
+`RemoteLongJobRegistry` として共有する。start は session operation を長時間 job へ lease して即時に
+job id を返し、検査・変換は専用 thread で進めるため Heavy worker 枠を保持しない。
+
+archive cache は App が起動時に開いた `Option<Arc<ArchiveCacheDb>>` を AI bridge と同じ session 登録
+境界から注入する。リモート側で DB を開き直さず、ローカル変換・cache maintenance と同じ
+`begin_convert()` lock を使う。DB 初期化失敗の `None` でも直接読み可能な RAR は開けるが、変換が
+必要な形式は確認前に `CacheUnavailable` で明示的に終端し、unwrap や無言の no-op にしない。
+
+公開 identity は利用者が選んだ元 archive の `RemoteAddress` のまま保持する。実際の読み込み先は
+core 内だけの `DirectRar { resolved_path }` または
+`CachedZip { path, source_path }` とし、cache path を serialize、履歴、URL、表示名へ出さない。
+prepared backing を実際の読み込みへ渡す直前に、元ファイルの fingerprint と backing の実在を
+core 内で再検証する。state / result の軽量な問い合わせでは filesystem I/O を行わない。
+
+パスワードは archive job が入力待ちの間に password API から入力の都度受け取り、executor の一時変数と
+有界 input channel だけを通す。request の Debug は値を redact し、snapshot / recoverable / terminal /
+result / URL / log / error message へは保存しない。password 再試行の可否は呼び出し側で形式判定せず、
+converter の `PasswordRequired` / `BadPassword` / `PasswordUnsupported` を正本にする。現行 converter が
+password を扱える RAR だけが前二者を返して該当段階から再開し、sevenz-rust2 が識別した暗号化 7z は
+`PasswordUnsupported` になる。delharc 0.6.x は password API も暗号化専用 error / flag も公開しないため、
+LZH の失敗は `Archive` / 非対応圧縮方式のまま通常エラーとし、文字列から password prompt を推測しない。
+
+owner が別端末へ移る場合は `Superseded`、本体が操作権を戻す場合は `DiscardedByHost`、background
+保持期限は `BackgroundExpired` を archive registry 自身へ通知して cancel する。`.part` は既存 converter
+の atomic publish guard が除去する。一方、record まで完了して整合状態になった cache ZIP は、元の
+remote 操作が同時に cancel 終端へ移っても共有 cache として残す。公開 job result だけは要求された
+owner 終端を優先する。
+
+新 owner の acquire は `DrainingRemote` を即時応答し、旧 job の終了を connection reader 上で待たない。
+`begin_convert()` 待ちは snapshot の `WaitingForConversionSlot` で識別でき、drain が 3 秒を超えた場合は
+reason、elapsed、App drain 完了、operation / streaming worker 数をログし、その後 10 秒ごとに再記録する。
+パスやパスワードはこの診断へ含めない。変換進捗は job 内の high-water 値で単調性を保つ。
+HTTP endpoint、Ask / password / progress UI、archive 一覧の
+公開と prepared backing を container 読み込みへ接続する作業は C-2 として残す。
+
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 
 この節は設計ではなく**開発手順**の記録。会話ログにしか残らない知識を失わないために書く。

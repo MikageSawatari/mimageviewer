@@ -1,7 +1,9 @@
 mod ai_job;
+mod archive_job;
 mod collections;
 mod container;
 mod live_favorites;
+mod long_job;
 mod path_guard;
 mod service;
 mod thumbnail;

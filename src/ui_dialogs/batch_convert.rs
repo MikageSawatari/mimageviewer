@@ -152,6 +152,7 @@ fn partition_targets(
 fn convert_error_label(e: &ConvertError) -> String {
     match e {
         ConvertError::PasswordRequired | ConvertError::BadPassword => "パスワード保護".to_string(),
+        ConvertError::PasswordUnsupported => "パスワード付き形式に非対応".to_string(),
         ConvertError::NoImages => "画像なし".to_string(),
         ConvertError::TooLarge => "サイズ超過".to_string(),
         ConvertError::Io(err) => format!("I/O エラー: {err}"),
@@ -510,6 +511,10 @@ mod tests {
         assert_eq!(
             convert_error_label(&ConvertError::BadPassword),
             "パスワード保護"
+        );
+        assert_eq!(
+            convert_error_label(&ConvertError::PasswordUnsupported),
+            "パスワード付き形式に非対応"
         );
     }
 }
