@@ -1358,6 +1358,15 @@ foreground 奪還処理、`fs_primary_suppression` は維持し、branch 内で 
 だけを実行可能にした。返却結果は `ToggleChrome`（初回ヘルプ中の learn + chrome を含む）だけを
 採用し、`PageSide`、pinch、pan、widget への synthetic primary は採用しない。
 
+2026-08-09 の Step 3g で、この修正が touch command の実行経路だけに留まり、egui
+`Response` 駆動の連結読みドラッグ / 拡大画像パンには focus reclaim の
+`PointerStream` 抑止が残っていたことを実機ログで確認した。arm 時点では入力源が未確定なので、
+後続の相関済み `TouchFrame` で owner を `PointerStream` から `TouchStream` へ訂正し、同じ
+touch frame の判断で provisional な pointer 抑止を置き換える。これにより canvas gesture は
+前面奪還中も通る一方、tap command は従来どおり実行され、overlay control へ届く synthetic
+primary response は既存の `should_suppress_response` 相関で引き続き抑止する。mouse-only stream は
+touch による訂正が起きないため、復帰クリックを release まで食べる従来契約を維持する。
+
 #### 8 の補足: オーバーレイヘルプにスケーリングへの導線を添える
 
 初回オーバーレイヘルプ (§5.5) の隅に、

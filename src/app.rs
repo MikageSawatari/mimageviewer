@@ -9773,8 +9773,9 @@ pub struct App {
     /// Alt+Tab 復帰直後に main viewport が数フレーム focused と報告されても
     /// Focus/raise コマンドを連投しないための debounce。
     fs_last_main_focus_restore_at: Option<std::time::Instant>,
-    /// フォーカス復帰 pointer または touch-owned gesture の間、左入力を抑制する owner。
-    /// terminal touch replacement は current frame だけ抑制し、cross-frame state にはしない。
+    /// フォーカス復帰 pointer または touch replacement の primary 抑制 owner。
+    /// 相関済み canvas gesture は TouchStream が寿命だけを所有して通し、terminal touch
+    /// replacement は current frame だけ抑制して cross-frame state にはしない。
     pub(crate) fs_primary_suppression: crate::ui_fullscreen::FullscreenPrimarySuppression,
 
     // ── 通常フルスクリーン ズーム/パン/任意回転 ──────────────

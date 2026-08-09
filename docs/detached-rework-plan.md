@@ -328,6 +328,14 @@ Windows 実機で確認済み。次は表示中 `App` の session 化か `MediaW
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**未修正の実機観測 (2026-08-09):** 静止画 fullscreen で mIV 以外のプロセスの窓が
+foreground のままになる環境では、タッチの primary start ごとに既存 focus reclaim が
+`SetForegroundWindow` を試みても foreground が移らず、同じ試行が継続する。利用者には別窓の
+ちらつきとして見える。これは focus / foreground machinery と detached-rework 凍結範囲の問題なので、
+touch Phase 3 Step 3g は相関済み touch canvas gesture へ primary 抑止を適用しない修正だけを行い、
+focus claim、debounce、viewport / detached predicate には変更を入れていない。後続リワークで
+foreground ownership を扱う際の観測として残す。
+
 | 日付 | 変更 | 触れた範囲 | 合意の根拠 |
 | --- | --- | --- | --- |
 | 2026-08-08 | 静止画 / 本の中央タップ初回ヘルプを、既存 still touch surface と同じ viewport-local temporary state で所有し、学習後は既存 chrome latch を表示状態へ遷移 | `src/ui_fullscreen.rs` の通常 / fullscreen / detached 共通 still viewport 入力・描画経路と `src/touch_input.rs` の中央矩形 producer。detached predicate、viewport ID / 登録 / recreate、runtime / host ownership、geometry / placement / focus model、window lifecycle は変更なし | 正本 `touch-support-plan.md` §5.1 / §5.5 が viewport + surface 単位の typed state と共通 touch command ownership を指定し、Codex の source inspection でも App-global な viewer 状態や detached 分岐を追加せず実装できることを確認した。既存 `StillTouchChromeLatch` と同じ scope を使い、delay / retry / repaint loop / geometry heuristic を追加せず、中央矩形を分類器と描画で共有して複数 viewport を混同しないため、症状パッチではなく §2 に適合する構造的な入力 ownership 追加と判断した |
