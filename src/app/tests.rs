@@ -36323,6 +36323,22 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn main_embedded_transition_results_are_polled_before_render() {
+        assert!(
+            should_poll_main_embedded_transitions_before_render(true, false),
+            "an active embedded still must apply completed folder navigation before painting"
+        );
+        assert!(
+            should_poll_main_embedded_transitions_before_render(false, true),
+            "an embedded PDF/ZIP reopen holdover must poll enumeration before painting"
+        );
+        assert!(
+            !should_poll_main_embedded_transitions_before_render(false, false),
+            "ordinary main-grid frames keep their existing tail polling order"
+        );
+    }
+
+    #[test]
     #[cfg(windows)]
     fn active_detached_session_owns_visible_viewport_until_closed() {
         let mut app = setup_app();

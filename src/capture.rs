@@ -125,6 +125,39 @@ impl CapturePixelJob {
         self.rotation = rotation;
         self
     }
+
+    /// Worker が公開する出力寸法を、画素処理を始める前に同じ規則で求める。
+    ///
+    /// 比較準備ではこの寸法を request 側に保持し、worker の完了結果が元の
+    /// source / crop / rotation / spread と整合する場合だけ Ready として公開する。
+    pub(crate) fn output_size(&self) -> Result<[usize; 2], String> {
+        let [width, height] = self.source.size;
+        if width == 0 || height == 0 || self.source.pixels.len() != width.saturating_mul(height) {
+            return Err("キャプチャ元画像のサイズが不正です".to_string());
+        }
+        let cropped = self.crop.map_or([width, height], |crop| {
+            let (_, _, crop_width, crop_height) = crop.pixel_bounds(width, height);
+            [crop_width, crop_height]
+        });
+        Ok(rotated_size(cropped, self.rotation))
+    }
+}
+
+impl CapturePixelWork {
+    /// `run_pixel_work` の出力キャンバス寸法。Spread は左右を横に連結した union。
+    pub(crate) fn output_size(&self) -> Result<[usize; 2], String> {
+        match self {
+            Self::Single(job) => job.output_size(),
+            Self::Spread { left, right, .. } => {
+                let [left_width, left_height] = left.output_size()?;
+                let [right_width, right_height] = right.output_size()?;
+                let width = left_width
+                    .checked_add(right_width)
+                    .ok_or_else(|| "見開きキャプチャの幅が大きすぎます".to_string())?;
+                Ok([width, left_height.max(right_height)])
+            }
+        }
+    }
 }
 
 pub fn default_output_dir() -> PathBuf {
@@ -928,6 +961,36 @@ mod tests {
         assert_eq!(&rgba[12..16], &[255, 0, 0, 255]);
         assert_eq!(&rgba[16..20], &[0, 0, 0, 0]);
         assert_eq!(&rgba[20..24], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn pixel_work_output_size_matches_cropped_rotated_spread_union() {
+        use crate::rotation_db::Rotation;
+
+        let left = egui::ColorImage::filled([6, 4], egui::Color32::RED);
+        let right = egui::ColorImage::filled([5, 7], egui::Color32::GREEN);
+        let work = CapturePixelWork::Spread {
+            basename: "spread".to_string(),
+            left: CapturePixelJob::already_adjusted("left".to_string(), Arc::new(left))
+                .with_crop(crate::export_crop::CropRect {
+                    min_x: 1.0,
+                    min_y: 0.0,
+                    max_x: 4.0,
+                    max_y: 4.0,
+                })
+                .with_rotation(Rotation::Cw90),
+            right: CapturePixelJob::already_adjusted("right".to_string(), Arc::new(right))
+                .with_crop(crate::export_crop::CropRect {
+                    min_x: 0.0,
+                    min_y: 2.0,
+                    max_x: 5.0,
+                    max_y: 4.0,
+                }),
+        };
+
+        assert_eq!(work.output_size().unwrap(), [9, 3]);
+        let (_basename, width, height, _rgba) = run_pixel_work(work).unwrap();
+        assert_eq!([width as usize, height as usize], [9, 3]);
     }
 
     #[test]
