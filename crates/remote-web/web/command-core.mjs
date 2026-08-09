@@ -1735,6 +1735,78 @@ export const ViewerPagePositionEvent = Object.freeze({
   DISCARD: "discard",
 });
 
+export const ViewerGroupLoadOutcome = Object.freeze({
+  APPLIED: "applied",
+  SUPERSEDED: "superseded",
+  FAILED: "failed",
+});
+
+export const ViewerGroupLoadCompletionAction = Object.freeze({
+  POST_DISPLAY: "post_display",
+  IGNORE: "ignore",
+  ROLLBACK: "rollback",
+  REPORT_FAILURE: "report_failure",
+});
+
+/// A request snapshot deliberately contains object-identity tokens. Rebuilding
+/// pageGroups creates a new context even when the numeric group index is reused.
+export function viewerPageGroupRequestMatches(request, current) {
+  if (!request || !current) return false;
+  return (
+    request.viewer === current.viewer &&
+    request.pageGroups === current.pageGroups &&
+    request.group === current.group &&
+    request.groupIndex === current.groupIndex &&
+    request.groupIdentity === current.groupIdentity &&
+    request.contextIdentity === current.contextIdentity
+  );
+}
+
+/// Resolve the only allowed completion action for a group load. A failed load
+/// may rewind position only when its explicit position owner still identifies
+/// the current request. Failures from fit/adjustment/resize refreshes are shown
+/// without moving the requested position.
+export function viewerGroupLoadCompletionPlan(
+  result,
+  { loadRequest = null, positionRequest = null, currentRequest = null } = {}
+) {
+  const outcome = result?.outcome;
+  if (!Object.values(ViewerGroupLoadOutcome).includes(outcome)) {
+    throw new TypeError("unknown viewer group load outcome");
+  }
+  const message = outcome === ViewerGroupLoadOutcome.FAILED &&
+    typeof result.message === "string"
+    ? result.message.trim()
+    : "";
+  if (outcome === ViewerGroupLoadOutcome.FAILED && !message) {
+    throw new TypeError("failed viewer group load requires a message");
+  }
+  if (outcome === ViewerGroupLoadOutcome.SUPERSEDED) {
+    return { action: ViewerGroupLoadCompletionAction.IGNORE };
+  }
+
+  if (
+    loadRequest &&
+    !viewerPageGroupRequestMatches(loadRequest, currentRequest)
+  ) {
+    return { action: ViewerGroupLoadCompletionAction.IGNORE };
+  }
+  if (outcome === ViewerGroupLoadOutcome.APPLIED) {
+    return { action: ViewerGroupLoadCompletionAction.POST_DISPLAY };
+  }
+
+  const ownsCurrentPosition =
+    viewerPageGroupRequestMatches(positionRequest, loadRequest) &&
+    viewerPageGroupRequestMatches(positionRequest, currentRequest);
+  // 位置を戻したことを述べてよいのは、実際に戻す側だけ。
+  return ownsCurrentPosition
+    ? {
+      action: ViewerGroupLoadCompletionAction.ROLLBACK,
+      message: `${message}前のページに戻りました。`,
+    }
+    : { action: ViewerGroupLoadCompletionAction.REPORT_FAILURE, message };
+}
+
 /// Requested and displayed positions remain two concrete values. UI feedback is
 /// always derived from the requested position; only an explicit discard rewinds it.
 export function viewerPagePositionTransition(

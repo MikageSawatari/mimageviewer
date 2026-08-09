@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { ViewerGroupLoadOutcome } from "./command-core.mjs";
 
 class FakeElement {
   constructor(tag = "div") {
@@ -928,7 +929,7 @@ test("page load queue emits one busy interval across pending replacements", asyn
       started.push(value);
       events.push(`run:${value}`);
       if (value === 1) await firstGate;
-      return true;
+      return { outcome: ViewerGroupLoadOutcome.APPLIED };
     },
     () => {},
     (value) => {
@@ -944,10 +945,67 @@ test("page load queue emits one busy interval across pending replacements", asyn
   assert.deepEqual(busy, [true]);
   assert.deepEqual(events, ["busy:true", "run:1"]);
   releaseFirst();
-  assert.deepEqual(await Promise.all([first, second, third]), [false, false, true]);
+  assert.deepEqual(await Promise.all([first, second, third]), [
+    { outcome: ViewerGroupLoadOutcome.SUPERSEDED },
+    { outcome: ViewerGroupLoadOutcome.SUPERSEDED },
+    { outcome: ViewerGroupLoadOutcome.APPLIED },
+  ]);
   assert.deepEqual(started, [1, 3]);
   assert.deepEqual(busy, [true, false]);
   assert.deepEqual(events, ["busy:true", "run:1", "run:3", "busy:false"]);
+});
+
+test("page load queue clear resolves active and pending requests as superseded", async () => {
+  let releaseActive;
+  const activeGate = new Promise((resolve) => { releaseActive = resolve; });
+  const discarded = [];
+  const queue = new LatestPageLoadQueue(
+    async (value) => {
+      if (value === "active") await activeGate;
+      return { outcome: ViewerGroupLoadOutcome.APPLIED };
+    },
+    () => {},
+    () => {},
+    (value, reason) => discarded.push({ value, reason })
+  );
+  const active = queue.request("active");
+  const pending = queue.request("pending");
+
+  queue.clear();
+  releaseActive();
+  assert.deepEqual(await Promise.all([active, pending]), [
+    { outcome: ViewerGroupLoadOutcome.SUPERSEDED },
+    { outcome: ViewerGroupLoadOutcome.SUPERSEDED },
+  ]);
+  assert.deepEqual(discarded, [
+    { value: "pending", reason: "queue_cleared" },
+  ]);
+});
+
+test("page load queue rejects a current run error but hides an old failed result", async () => {
+  const expected = new Error("queue worker failed");
+  const rejecting = new LatestPageLoadQueue(async () => { throw expected; });
+  await assert.rejects(rejecting.request("current"), expected);
+
+  let releaseOld;
+  const oldGate = new Promise((resolve) => { releaseOld = resolve; });
+  const queue = new LatestPageLoadQueue(async (value) => {
+    if (value === "old") {
+      await oldGate;
+      return {
+        outcome: ViewerGroupLoadOutcome.FAILED,
+        message: "old request failed",
+      };
+    }
+    return { outcome: ViewerGroupLoadOutcome.APPLIED };
+  });
+  const old = queue.request("old");
+  const current = queue.request("current");
+  releaseOld();
+  assert.deepEqual(await Promise.all([old, current]), [
+    { outcome: ViewerGroupLoadOutcome.SUPERSEDED },
+    { outcome: ViewerGroupLoadOutcome.APPLIED },
+  ]);
 });
 
 test("foreground page load aborts unrelated concurrent prefetches and starts immediately", async () => {
@@ -1763,7 +1821,7 @@ test("viewer load executes fetch, decode, layout and atomic replacement", async 
     interactionStartedAt: performance.now(),
   });
 
-  assert.equal(displayed, true);
+  assert.deepEqual(displayed, { outcome: ViewerGroupLoadOutcome.APPLIED });
   assert.equal(viewer.pageLayer.children.length, 1);
   assert.equal(viewer.pageLayer.children[0], viewer.image);
   assert.equal(viewer.image.style.width, "430px");
@@ -1862,12 +1920,197 @@ test("rapid page loads finish the active request and start only the latest pendi
     assert.equal(counter.textContent, "3 / 3");
     assert.equal(counter.classList.contains("is-pending"), true);
     releaseFirst();
-    assert.deepEqual(await Promise.all([first, second, third]), [false, false, true]);
+    assert.deepEqual(await Promise.all([first, second, third]), [
+      { outcome: ViewerGroupLoadOutcome.SUPERSEDED },
+      { outcome: ViewerGroupLoadOutcome.SUPERSEDED },
+      { outcome: ViewerGroupLoadOutcome.APPLIED },
+    ]);
     assert.deepEqual(requested, [1, 3]);
     assert.equal(maximumActiveFetches, 1);
     assert.equal(title.textContent, "Page 3");
     assert.equal(counter.textContent, "3 / 3");
     assert.equal(counter.classList.contains("is-pending"), false);
+  } finally {
+    globalThis.fetch = imageFetch;
+    viewer.destroy();
+  }
+});
+
+test("single and spread loads classify success, fetch, decode, and current abort outcomes", async () => {
+  const responseFor = (requestId) => new Response(
+    new Blob([new Uint8Array([1, 2, 3])]),
+    {
+      status: 200,
+      headers: {
+        "Content-Type": "image/jpeg",
+        "X-mIV-Request-Id": requestId,
+        "X-mIV-Image-Width": "1200",
+        "X-mIV-Image-Height": "1800",
+        "X-mIV-Remote-State-Generation": "test-1",
+        "X-mIV-Remote-Session": TEST_SESSION_ID,
+        "X-mIV-Page-Identity": pageIdentityHeader(TEST_PAGE_ADDRESS),
+      },
+    }
+  );
+  const requestFor = (name, page) => ({
+    url: `/api/page?outcome=${name}-${page}`,
+    remoteStateGeneration: "test-1",
+    remoteSessionId: TEST_SESSION_ID,
+    address: TEST_PAGE_ADDRESS,
+    width: 1800,
+    cssWidth: 430,
+    dpr: 2,
+    layout: { cssWidth: 430, cssHeight: 645 },
+    fitMode: "page",
+  });
+  const scenarios = [
+    { name: "success", outcome: "applied", reason: "dom_committed" },
+    { name: "fetch", outcome: "not_applied", reason: "fetch_failed" },
+    { name: "decode", outcome: "not_applied", reason: "decode_failed" },
+    { name: "abort", outcome: "not_applied", reason: "abort" },
+  ];
+
+  try {
+    for (const kind of ["single", "spread"]) {
+      for (const scenario of scenarios) {
+        let fetchIndex = 0;
+        globalThis.fetch = async () => {
+          fetchIndex += 1;
+          if (scenario.name === "fetch") {
+            return new Response("failed", { status: 500 });
+          }
+          if (scenario.name === "abort") {
+            throw new DOMException("aborted", "AbortError");
+          }
+          return responseFor(`${kind}-${scenario.name}-${fetchIndex}`);
+        };
+        FakeElement.decodeHook = scenario.name === "decode"
+          ? async () => { throw new Error(`${kind} decode failed`); }
+          : null;
+        const viewer = new ImageViewer({
+          root: new FakeElement("section"),
+          stage: new FakeElement("div"),
+          image: new FakeElement("img"),
+          title: new FakeElement("div"),
+          counter: new FakeElement("span"),
+          previous: new FakeElement("button"),
+          next: new FakeElement("button"),
+          loadingIndicator: new FakeElement("div"),
+        });
+        const history = [];
+        viewer.recordPageDisplay = (...args) => history.push(args);
+        const pages = (kind === "single" ? [1] : [1, 2]).map((page) => ({
+          entry: { name: `${kind} page ${page}` },
+          info: { width: 1200, height: 1800 },
+          request: requestFor(`${kind}-${scenario.name}`, page),
+        }));
+
+        const result = await viewer.loadGroup({
+          pages,
+          name: `${kind} ${scenario.name}`,
+          fitMode: "page",
+          gap: kind === "spread" ? 12 : 0,
+          index: 0,
+          count: 2,
+          pageNumbers: pages.map((_, index) => index + 1),
+          interactionStartedAt: performance.now(),
+        });
+        assert.equal(
+          result.outcome,
+          scenario.name === "success"
+            ? ViewerGroupLoadOutcome.APPLIED
+            : ViewerGroupLoadOutcome.FAILED,
+          `${kind} ${scenario.name}`
+        );
+        if (scenario.name === "abort") {
+          // 中断した事実だけを述べる。位置を戻したかは完了処理が決めるので、
+          // ここで「前のページに戻りました」と書くと戻さない経路で嘘になる。
+          assert.match(result.message, /表示が中断されました/);
+          assert.doesNotMatch(result.message, /前のページに戻りました/);
+        }
+        assert.equal(history.length, 1, `${kind} ${scenario.name} telemetry count`);
+        assert.equal(history[0][1], scenario.outcome);
+        assert.equal(history[0][2], scenario.reason);
+        if (scenario.name === "success") {
+          assert.deepEqual(history[0][3], history[0][4]);
+          assert.equal(history[0][3].length, pages.length);
+        } else {
+          assert.deepEqual(history[0][4] ?? [], []);
+        }
+        viewer.destroy();
+      }
+    }
+  } finally {
+    FakeElement.decodeHook = null;
+    globalThis.fetch = imageFetch;
+  }
+});
+
+test("a superseded spread cannot replace the newer spread outcome", async () => {
+  let releaseOld;
+  const oldGate = new Promise((resolve) => { releaseOld = resolve; });
+  let oldFetches = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(input, testLocation.origin);
+    const generation = url.searchParams.get("spread-outcome");
+    if (generation === "old") {
+      oldFetches += 1;
+      await oldGate;
+    }
+    return new Response(new Blob([generation]), {
+      status: 200,
+      headers: {
+        "Content-Type": "image/jpeg",
+        "X-mIV-Request-Id": `${generation}-${oldFetches}`,
+        "X-mIV-Image-Width": "1200",
+        "X-mIV-Image-Height": "1800",
+        "X-mIV-Remote-State-Generation": "test-1",
+        "X-mIV-Remote-Session": TEST_SESSION_ID,
+        "X-mIV-Page-Identity": pageIdentityHeader(TEST_PAGE_ADDRESS),
+      },
+    });
+  };
+  const viewer = new ImageViewer({
+    root: new FakeElement("section"),
+    stage: new FakeElement("div"),
+    image: new FakeElement("img"),
+    title: new FakeElement("div"),
+    counter: new FakeElement("span"),
+    previous: new FakeElement("button"),
+    next: new FakeElement("button"),
+    loadingIndicator: new FakeElement("div"),
+  });
+  const load = (generation, index) => viewer.loadGroup({
+    pages: [1, 2].map((page) => ({
+      entry: { name: `${generation} ${page}` },
+      info: { width: 1200, height: 1800 },
+      request: {
+        url: `/api/page?spread-outcome=${generation}&page=${page}`,
+        remoteStateGeneration: "test-1",
+        remoteSessionId: TEST_SESSION_ID,
+        address: TEST_PAGE_ADDRESS,
+        width: 1800,
+        cssWidth: 430,
+        dpr: 2,
+        fitMode: "page",
+      },
+    })),
+    name: generation,
+    fitMode: "page",
+    gap: 12,
+    index,
+    count: 2,
+    interactionStartedAt: performance.now(),
+  });
+  try {
+    const old = load("old", 0);
+    const current = load("current", 1);
+    releaseOld();
+    assert.deepEqual(await Promise.all([old, current]), [
+      { outcome: ViewerGroupLoadOutcome.SUPERSEDED },
+      { outcome: ViewerGroupLoadOutcome.APPLIED },
+    ]);
+    assert.equal(viewer.displayedGroupIndex(), 1);
   } finally {
     globalThis.fetch = imageFetch;
     viewer.destroy();
@@ -2024,9 +2267,9 @@ test("viewer refuses a page response without a generation attestation", async ()
       count: 1,
       interactionStartedAt: performance.now(),
     });
-    assert.equal(displayed, false);
+    assert.equal(displayed.outcome, ViewerGroupLoadOutcome.FAILED);
+    assert.match(displayed.message, /状態版/);
     assert.equal(viewer.pageLayer.children[0], initialImage);
-    assert.match(title.textContent, /状態版/);
   } finally {
     globalThis.fetch = imageFetch;
     viewer.destroy();
@@ -2092,10 +2335,10 @@ test("viewer rejects a mismatched page identity without display or retry and rep
       count: 1,
       interactionStartedAt: performance.now(),
     });
-    assert.equal(displayed, false);
+    assert.equal(displayed.outcome, ViewerGroupLoadOutcome.FAILED);
+    assert.match(displayed.message, /identity/);
     assert.equal(fetchCount, 1);
     assert.equal(viewer.pageLayer.children[0], initialImage);
-    assert.match(title.textContent, /identity/);
     assert.equal(errors.length, 1);
     assert.equal(errors[0].category, "page_identity_mismatch");
     assert.deepEqual(errors[0].extra.requested_page_identity, requestedIdentity);
@@ -2154,7 +2397,7 @@ test("spread waits for both pages and atomically replaces the page layer", async
     interactionStartedAt: performance.now(),
   });
 
-  assert.equal(displayed, true);
+  assert.deepEqual(displayed, { outcome: ViewerGroupLoadOutcome.APPLIED });
   assert.equal(pageLayer.children.length, 2);
   assert.equal(viewer.images.length, 2);
   assert.equal(pageLayer.style.gap, "12px");
@@ -2188,7 +2431,7 @@ test("spread waits for both pages and atomically replaces the page layer", async
     count: 3,
     interactionStartedAt: performance.now(),
   });
-  assert.equal(singleDisplayed, true);
+  assert.deepEqual(singleDisplayed, { outcome: ViewerGroupLoadOutcome.APPLIED });
   assert.equal(pageLayer.children.length, 1);
   assert.equal(viewer.images.length, 1);
   assert.equal(Math.round(parseFloat(pageLayer.style.width)), 667);
@@ -2271,7 +2514,8 @@ test("spread rejects one mismatched page before replacing either side", async ()
       count: 1,
       interactionStartedAt: performance.now(),
     });
-    assert.equal(displayed, false);
+    assert.equal(displayed.outcome, ViewerGroupLoadOutcome.FAILED);
+    assert.match(displayed.message, /identity/);
     assert.equal(fetchCount, 2);
     assert.deepEqual(pageLayer.children, [initialImage]);
     assert.equal(errors.length, 1);

@@ -484,6 +484,32 @@ test("page request feedback precedes load while display position commits at repl
   );
 });
 
+test("only committed page navigation owns failure rollback and shows its message afterward", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  assert.equal(
+    (app.match(/updateViewerImage\(performance\.now\(\), \{ positionRequest \}\)/g) ?? []).length,
+    1
+  );
+  assert.match(
+    app,
+    /async function updateViewerImage\([\s\S]*?positionRequest = null,/
+  );
+  assert.match(
+    app,
+    /ViewerGroupLoadCompletionAction\.ROLLBACK\)[\s\S]*?discardRequestedPageGroup\([\s\S]*?viewer\.showGroupLoadFailure\(completion\.message\)/
+  );
+  for (const trigger of [
+    "fit_mode",
+    "adjustment_commit",
+    "viewport_resize",
+  ]) {
+    const start = app.indexOf(`renderTrigger: "${trigger}"`);
+    assert.notEqual(start, -1);
+    const call = app.slice(Math.max(0, start - 100), start + 100);
+    assert.doesNotMatch(call, /positionRequest/);
+  }
+});
+
 test("image tiles preserve portrait and landscape shape below a separate label row", async () => {
   const css = await readFile(new URL("styles.css", here), "utf8");
   const app = await readFile(new URL("app.js", here), "utf8");

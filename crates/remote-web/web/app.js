@@ -8,6 +8,8 @@ import {
   ReadingDirection,
   SpreadMode,
   ViewerGesture,
+  ViewerGroupLoadCompletionAction,
+  ViewerGroupLoadOutcome,
   ViewerPanelAction,
   VIEWER_PANEL_ANIMATION_MS,
   adjustmentResetVisible,
@@ -66,6 +68,7 @@ import {
   shouldShowLoadingIndicator,
   shouldShowKeyboardShortcuts,
   viewerGestureDecision,
+  viewerGroupLoadCompletionPlan,
   viewerDragOwnershipDecision,
   pinchTransformDecision,
   VIEWER_MAX_SCALE,
@@ -80,6 +83,7 @@ import {
   viewerPageDisplayHistoryEvent,
   viewerPageDisplaySlot,
   viewerPageGroupGenerationSnapshot,
+  viewerPageGroupRequestMatches,
   ViewerPagePositionEvent,
   viewerPagePositionFeedback,
   viewerPagePositionTransition,
@@ -256,6 +260,13 @@ export class LatestOnlyTaskQueue {
 }
 
 /// 前景ページ描画専用。実行中の core IPC は完了させ、待機中は最新のページ群だけを残す。
+const VIEWER_GROUP_LOAD_SUPERSEDED = Object.freeze({
+  outcome: ViewerGroupLoadOutcome.SUPERSEDED,
+});
+const VIEWER_GROUP_LOAD_APPLIED = Object.freeze({
+  outcome: ViewerGroupLoadOutcome.APPLIED,
+});
+
 export class LatestPageLoadQueue {
   constructor(
     run,
@@ -291,7 +302,7 @@ export class LatestPageLoadQueue {
       if (plan.supersededPending) {
         plan.supersededPending.superseded = true;
         this.onDiscard(plan.supersededPending.value, "pending_superseded");
-        plan.supersededPending.resolve(false);
+        plan.supersededPending.resolve(VIEWER_GROUP_LOAD_SUPERSEDED);
       }
       this.pending = plan.pending;
       if (plan.supersedeActive) {
@@ -309,7 +320,7 @@ export class LatestPageLoadQueue {
     if (this.pending) {
       this.pending.superseded = true;
       this.onDiscard(this.pending.value, "queue_cleared");
-      this.pending.resolve(false);
+      this.pending.resolve(VIEWER_GROUP_LOAD_SUPERSEDED);
       this.pending = null;
     }
     if (this.active) this.active.superseded = true;
@@ -319,9 +330,14 @@ export class LatestPageLoadQueue {
   async runActive(ticket) {
     try {
       const result = await this.run(ticket.value);
-      ticket.resolve(ticket.superseded ? false : result);
+      if (ticket.superseded) {
+        ticket.resolve(VIEWER_GROUP_LOAD_SUPERSEDED);
+      } else {
+        viewerGroupLoadCompletionPlan(result);
+        ticket.resolve(result);
+      }
     } catch (error) {
-      if (ticket.superseded) ticket.resolve(false);
+      if (ticket.superseded) ticket.resolve(VIEWER_GROUP_LOAD_SUPERSEDED);
       else ticket.reject(error);
     } finally {
       const wasBusy = this.isBusy();
@@ -3433,6 +3449,32 @@ function currentPageGroup() {
   return state.pageGroups[state.pageGroupIndex] ?? null;
 }
 
+function viewerPageContextIdentity() {
+  const contextAddress = state.container?.requestedAddress;
+  const locationIdentity = contextAddress
+    ? addressIdentity(contextAddress)
+    : String(state.folderPath ?? "");
+  return `${state.screenContext ?? ""}\n${locationIdentity}`;
+}
+
+function captureViewerPageGroupRequest(
+  viewer = state.viewer,
+  groupIndex = state.pageGroupIndex
+) {
+  const group = state.pageGroups[groupIndex];
+  if (!viewer || !group || !Number.isInteger(groupIndex) || groupIndex < 0) {
+    return null;
+  }
+  return {
+    viewer,
+    pageGroups: state.pageGroups,
+    group,
+    groupIndex,
+    groupIdentity: group.entries.map(entryIdentity).join("\n"),
+    contextIdentity: viewerPageContextIdentity(),
+  };
+}
+
 function viewerSeekSnapshot(groupIndex = state.pageGroupIndex) {
   return viewerSeekState({
     groupPageIndexes: state.seekPageGroups,
@@ -3482,10 +3524,21 @@ function updateRequestedPageGroup(groupIndex) {
   return true;
 }
 
-function discardRequestedPageGroup(viewer, requestedGroupIndex) {
+function discardRequestedPageGroup(
+  viewer,
+  requestedGroupIndex,
+  positionRequest = null
+) {
   if (
     state.viewer !== viewer ||
     state.pageGroupIndex !== requestedGroupIndex
+  ) return false;
+  if (
+    positionRequest &&
+    !viewerPageGroupRequestMatches(
+      positionRequest,
+      captureViewerPageGroupRequest(viewer, requestedGroupIndex)
+    )
   ) return false;
   const displayedGroupIndex = viewer.displayedGroupIndex();
   if (!Number.isInteger(displayedGroupIndex)) return false;
@@ -4828,21 +4881,22 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   const commitSeekGroup = (groupIndex, reason) => {
     const viewer = state.viewer;
     if (!viewer || !updateRequestedPageGroup(groupIndex)) return;
+    const positionRequest = captureViewerPageGroupRequest(viewer, groupIndex);
     const sequence = ++seekCommitSequence;
     acquireRemoteSession(reason).then((acquired) => {
       if (!acquired) {
         if (sequence === seekCommitSequence) {
-          discardRequestedPageGroup(viewer, groupIndex);
+          discardRequestedPageGroup(viewer, groupIndex, positionRequest);
         }
         return;
       }
       if (sequence !== seekCommitSequence || state.viewer !== viewer) return;
-      if (!commitRequestedPageGroup(groupIndex)) {
-        discardRequestedPageGroup(viewer, groupIndex);
+      if (!commitRequestedPageGroup(groupIndex, positionRequest)) {
+        discardRequestedPageGroup(viewer, groupIndex, positionRequest);
       }
     }).catch(() => {
       if (sequence === seekCommitSequence && state.viewer === viewer) {
-        discardRequestedPageGroup(viewer, groupIndex);
+        discardRequestedPageGroup(viewer, groupIndex, positionRequest);
       }
     });
   };
@@ -5009,9 +5063,19 @@ function changeImageTo(nextGroupIndex) {
   return commitRequestedPageGroup(nextGroupIndex);
 }
 
-function commitRequestedPageGroup(groupIndex) {
+function commitRequestedPageGroup(
+  groupIndex,
+  positionRequest = captureViewerPageGroupRequest(state.viewer, groupIndex)
+) {
   const group = state.pageGroups[groupIndex];
-  if (!group || state.pageGroupIndex !== groupIndex) return false;
+  if (
+    !group ||
+    state.pageGroupIndex !== groupIndex ||
+    !viewerPageGroupRequestMatches(
+      positionRequest,
+      captureViewerPageGroupRequest(state.viewer, groupIndex)
+    )
+  ) return false;
   const entry = group.anchor;
   const viewerDepth = (Number(history.state?.viewerDepth) || 0) + 1;
   const targetHash = entry.address
@@ -5027,7 +5091,7 @@ function commitRequestedPageGroup(groupIndex) {
     "",
     targetHash
   );
-  updateViewerImage(performance.now()).catch(renderError);
+  updateViewerImage(performance.now(), { positionRequest }).catch(renderError);
   return true;
 }
 
@@ -5036,11 +5100,13 @@ async function updateViewerImage(
   {
     adjustmentStateCurrent = false,
     renderTrigger = "page_request",
+    positionRequest = null,
   } = {}
 ) {
   const group = currentPageGroup();
   const viewer = state.viewer;
   if (!group || !viewer) return;
+  const loadRequest = captureViewerPageGroupRequest(viewer, state.pageGroupIndex);
   const identity = group.entries.map(entryIdentity).join("\n");
   const remoteSessionIdSnapshot = state.remoteSessionId;
   const remoteSessionCacheEpochSnapshot = state.remoteSessionCacheEpoch;
@@ -5075,7 +5141,7 @@ async function updateViewerImage(
       remoteSessionCacheEpoch: remoteSessionCacheEpochSnapshot,
     }),
   }));
-  const displayed = await viewer.loadGroup({
+  const result = await viewer.loadGroup({
     pages,
     name: group.entries.map((entry) => entry.name).join(" / "),
     fitMode: state.fitMode,
@@ -5088,7 +5154,29 @@ async function updateViewerImage(
     interactionStartedAt,
     renderTrigger,
   });
-  if (!displayed || state.viewer !== viewer) return;
+  const completion = viewerGroupLoadCompletionPlan(result, {
+    loadRequest,
+    positionRequest,
+    currentRequest: captureViewerPageGroupRequest(
+      state.viewer,
+      state.pageGroupIndex
+    ),
+  });
+  if (completion.action === ViewerGroupLoadCompletionAction.IGNORE) return;
+  if (completion.action === ViewerGroupLoadCompletionAction.ROLLBACK) {
+    discardRequestedPageGroup(
+      viewer,
+      positionRequest.groupIndex,
+      positionRequest
+    );
+    if (state.viewer === viewer) viewer.showGroupLoadFailure(completion.message);
+    return;
+  }
+  if (completion.action === ViewerGroupLoadCompletionAction.REPORT_FAILURE) {
+    if (state.viewer === viewer) viewer.showGroupLoadFailure(completion.message);
+    return;
+  }
+  if (state.viewer !== viewer) return;
   document.title = `${group.anchor.name} — mIV Remote`;
   state.remoteAiController?.displayGroup(
     pages.map(({ entry, request }) => ({
@@ -9946,6 +10034,22 @@ function viewerPageDisplayFailureReason(error, phase) {
   return "apply_failed";
 }
 
+/// 失敗そのものだけを述べる。位置を戻したかどうかは完了処理しか知らないので、
+/// ここで「前のページに戻りました」と書くと、戻していない経路で嘘になる。
+function viewerGroupLoadFailure(error, fallbackMessage) {
+  if (error?.name === "AbortError") {
+    return {
+      outcome: ViewerGroupLoadOutcome.FAILED,
+      message: "ページの表示が中断されました。",
+    };
+  }
+  const message = error instanceof Error ? error.message.trim() : "";
+  return {
+    outcome: ViewerGroupLoadOutcome.FAILED,
+    message: message || fallbackMessage,
+  };
+}
+
 export class ImageViewer {
   constructor({
     root,
@@ -10508,7 +10612,7 @@ export class ImageViewer {
           "load_sequence_mismatch",
           [requestId]
         );
-        return false;
+        return VIEWER_GROUP_LOAD_SUPERSEDED;
       }
 
       phase = "decode";
@@ -10550,7 +10654,7 @@ export class ImageViewer {
           "load_sequence_mismatch",
           [requestId]
         );
-        return false;
+        return VIEWER_GROUP_LOAD_SUPERSEDED;
       }
       phase = "apply";
       this.resetTransform();
@@ -10573,7 +10677,7 @@ export class ImageViewer {
       pendingObjectUrl = null;
       previousUrls.forEach((url) => URL.revokeObjectURL(url));
       await nextFrame();
-      if (sequence !== this.loadSequence) return false;
+      if (sequence !== this.loadSequence) return VIEWER_GROUP_LOAD_SUPERSEDED;
 
       const event = {
         type: "image",
@@ -10598,7 +10702,7 @@ export class ImageViewer {
       hudState.displayDurations.push(event.tap_to_display_ms);
       if (hudState.displayDurations.length > 20) hudState.displayDurations.shift();
       updateHud();
-      return true;
+      return VIEWER_GROUP_LOAD_APPLIED;
     } catch (error) {
       if (pendingObjectUrl) URL.revokeObjectURL(pendingObjectUrl);
       if (sequence !== this.loadSequence) {
@@ -10608,7 +10712,7 @@ export class ImageViewer {
           "load_sequence_mismatch",
           [resource?.requestId]
         );
-        return false;
+        return VIEWER_GROUP_LOAD_SUPERSEDED;
       }
       const reason = viewerPageDisplayFailureReason(error, phase);
       this.recordPageDisplay(
@@ -10617,16 +10721,18 @@ export class ImageViewer {
         reason,
         [resource?.requestId]
       );
-      if (error?.name === "AbortError") return false;
-      this.title.textContent =
-        error instanceof Error ? error.message : "ページを表示できませんでした。";
-      this.root.classList.remove("viewer-ui-hidden");
-      if (error?.code !== "page_identity_mismatch") {
+      if (error?.name !== "AbortError") {
+        this.root.classList.remove("viewer-ui-hidden");
+      }
+      if (
+        error?.name !== "AbortError" &&
+        error?.code !== "page_identity_mismatch"
+      ) {
         recordClientError("image_load_error", error, {
           resource: safeResourcePath(request.url),
         });
       }
-      return false;
+      return viewerGroupLoadFailure(error, "ページを表示できませんでした。");
     }
   }
 
@@ -10678,7 +10784,7 @@ export class ImageViewer {
           "load_sequence_mismatch",
           resources.map((resource) => resource.requestId)
         );
-        return false;
+        return VIEWER_GROUP_LOAD_SUPERSEDED;
       }
 
       phase = "decode";
@@ -10708,7 +10814,7 @@ export class ImageViewer {
           "load_sequence_mismatch",
           resources.map((resource) => resource.requestId)
         );
-        return false;
+        return VIEWER_GROUP_LOAD_SUPERSEDED;
       }
 
       phase = "apply";
@@ -10756,7 +10862,7 @@ export class ImageViewer {
       previousUrls.forEach((url) => URL.revokeObjectURL(url));
       this.applyTransform();
       await nextFrame();
-      if (sequence !== this.loadSequence) return false;
+      if (sequence !== this.loadSequence) return VIEWER_GROUP_LOAD_SUPERSEDED;
 
       decodedImages.forEach((decoded, index) => {
         const resource = resources[index];
@@ -10786,7 +10892,7 @@ export class ImageViewer {
       });
       while (hudState.displayDurations.length > 20) hudState.displayDurations.shift();
       updateHud();
-      return true;
+      return VIEWER_GROUP_LOAD_APPLIED;
     } catch (error) {
       pendingUrls.forEach((url) => URL.revokeObjectURL(url));
       const candidateImageIds = resources?.map((resource) => resource.requestId) ?? [];
@@ -10797,7 +10903,7 @@ export class ImageViewer {
           "load_sequence_mismatch",
           candidateImageIds
         );
-        return false;
+        return VIEWER_GROUP_LOAD_SUPERSEDED;
       }
       const reason = viewerPageDisplayFailureReason(error, phase);
       this.recordPageDisplay(
@@ -10806,15 +10912,16 @@ export class ImageViewer {
         reason,
         candidateImageIds
       );
-      if (error?.name === "AbortError") return false;
-      this.title.textContent = error instanceof Error
-        ? error.message
-        : "見開きを表示できませんでした。";
-      this.root.classList.remove("viewer-ui-hidden");
-      if (error?.code !== "page_identity_mismatch") {
+      if (error?.name !== "AbortError") {
+        this.root.classList.remove("viewer-ui-hidden");
+      }
+      if (
+        error?.name !== "AbortError" &&
+        error?.code !== "page_identity_mismatch"
+      ) {
         recordClientError("spread_load_error", error);
       }
-      return false;
+      return viewerGroupLoadFailure(error, "見開きを表示できませんでした。");
     }
   }
 
@@ -10853,6 +10960,11 @@ export class ImageViewer {
       this.boundaryMessage.hidden = true;
       this.boundaryMessageTimer = 0;
     }, PAGE_BOUNDARY_MESSAGE_DURATION_MS);
+  }
+
+  showGroupLoadFailure(message) {
+    this.title.textContent = message;
+    this.root.classList.remove("viewer-ui-hidden");
   }
 
   hideBoundaryMessage() {

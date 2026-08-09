@@ -1873,3 +1873,35 @@ pending で表現しない」に反し、今回 3 周した誤りと同じ形で
 決める。有効優先度は需要の最大値で単調に上がる (降格しない)。
 
 `page_display` テレメトリは今回の 3 件を特定した観測の仕組みなので壊さない。
+
+### 14.5 段階 A: 表示グループ outcome 契約 (2026-08-09)
+
+段階 A では、`LatestPageLoadQueue` から `ImageViewer.loadGroup`、単ページ / 見開きの
+fetch・decode・DOM 適用、呼び出し側の完了処理までを、次の 3 outcome で統一した。
+
+- `applied` — DOM 適用済み。AI 通知、読書位置、補正 / ブックマーク更新、先読みなどの
+  post-display 処理を実行する
+- `superseded` — active / pending の追い越しまたは queue clear。位置復元も post-display
+  処理も行わず、新しい要求に確定を任せる
+- `failed { message }` — 現行要求の fetch / decode / apply / `AbortError` の終端失敗。
+  post-display 処理は行わず、失敗メッセージを表示する。未知 outcome と message の無い
+  `failed` は契約違反として例外にする
+
+位置を巻き戻すのは、ページ送り / seek の commit が stack-local な位置要求 owner を明示的に
+渡し、その owner が完了時にも同じ viewer、`pageGroups` 配列、group object、group index、
+group identity、container / folder context を指す場合だけである。fit 変更、補正保存、viewport
+resize、generation 更新、見開き再構成など位置変更を所有しない再描画の失敗では位置を動かさない。
+`pageGroups` の再構成後は同じ数値 index でも identity が一致しないため、古い失敗は新しい配列の
+別グループを選ばない。失敗メッセージは位置復元と表示 feedback の同期後に表示し、ページ名への
+上書きで消えないようにした。既存の `page_display` telemetry の `outcome` / `reason` / candidate /
+applied request ID は変更していない。
+
+失敗メッセージは**失敗した事実だけ**を述べ、位置を戻したかどうかは完了処理が付け足す。
+中断メッセージに「前のページに戻りました」を焼き込むと、位置を所有しない再描画の失敗
+(fit 変更・resize・見開き再構成) で戻していないのに戻したと言うことになるため。
+
+**既知の残存不整合**: `commitRequestedPageGroup` は表示完了前に `history.pushState` するため、
+終端失敗でアプリ位置・seek・表示を前ページへ戻しても URL / history は失敗ページを指したまま
+残る。jump 系には requested / displayed 契約を通らない入口もあり、段階 A で片方だけ直すと
+`viewerDepth` と戻る操作を含む別の不整合になる。B + C + D0 の cutover で位置変更入口を統一し、
+そこで URL / history も同じ所有権境界へ移して解消する。

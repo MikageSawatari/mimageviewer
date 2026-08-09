@@ -14,6 +14,8 @@ import {
   SpreadMode,
   ViewerDragOwner,
   ViewerGesture,
+  ViewerGroupLoadCompletionAction,
+  ViewerGroupLoadOutcome,
   ViewerPagePositionEvent,
   ViewerPanelAction,
   ViewerPanelOrientation,
@@ -79,6 +81,8 @@ import {
   viewerPageDisplayHistoryEvent,
   viewerPageDisplaySlot,
   viewerPageGroupGenerationSnapshot,
+  viewerPageGroupRequestMatches,
+  viewerGroupLoadCompletionPlan,
   viewerPagePositionFeedback,
   viewerPagePositionTransition,
   viewerPostDisplayRefreshPlan,
@@ -1652,6 +1656,93 @@ test("viewer page feedback follows requests until display or explicit discard", 
     displayedGroupIndex: 3,
   });
   assert.equal(viewerPagePositionFeedback(position).pending, false);
+});
+
+test("viewer group load completion runs post-display only for an applied current request", () => {
+  const viewer = {};
+  const pageGroups = [{ entries: [{ name: "old" }] }, { entries: [{ name: "new" }] }];
+  const request = {
+    viewer,
+    pageGroups,
+    group: pageGroups[1],
+    groupIndex: 1,
+    groupIdentity: "new-page",
+    contextIdentity: "book-a",
+  };
+  assert.deepEqual(viewerGroupLoadCompletionPlan(
+    { outcome: ViewerGroupLoadOutcome.APPLIED },
+    { loadRequest: request, currentRequest: request, positionRequest: request }
+  ), {
+    action: ViewerGroupLoadCompletionAction.POST_DISPLAY,
+  });
+  assert.deepEqual(viewerGroupLoadCompletionPlan(
+    { outcome: ViewerGroupLoadOutcome.SUPERSEDED },
+    { loadRequest: request, currentRequest: request, positionRequest: request }
+  ), {
+    action: ViewerGroupLoadCompletionAction.IGNORE,
+  });
+
+  const failed = {
+    outcome: ViewerGroupLoadOutcome.FAILED,
+    message: "ページを表示できませんでした。",
+  };
+  assert.deepEqual(viewerGroupLoadCompletionPlan(failed, {
+    loadRequest: request,
+    currentRequest: request,
+    positionRequest: request,
+  }), {
+    action: ViewerGroupLoadCompletionAction.ROLLBACK,
+    message: "ページを表示できませんでした。前のページに戻りました。",
+  });
+  // 位置を戻さない側が「戻りました」と言うと嘘になる。
+  assert.deepEqual(viewerGroupLoadCompletionPlan(failed, {
+    loadRequest: request,
+    currentRequest: request,
+  }), {
+    action: ViewerGroupLoadCompletionAction.REPORT_FAILURE,
+    message: "ページを表示できませんでした。",
+  });
+  assert.throws(
+    () => viewerGroupLoadCompletionPlan({ outcome: "future_outcome" }),
+    /unknown viewer group load outcome/
+  );
+  assert.throws(
+    () => viewerGroupLoadCompletionPlan({ outcome: ViewerGroupLoadOutcome.FAILED }),
+    /requires a message/
+  );
+});
+
+test("viewer group load completion rejects an old page-group context at the same index", () => {
+  const viewer = {};
+  const oldGroups = [{ entries: [{ name: "old page" }] }];
+  const newGroups = [{ entries: [{ name: "different page" }] }];
+  const oldRequest = {
+    viewer,
+    pageGroups: oldGroups,
+    group: oldGroups[0],
+    groupIndex: 0,
+    groupIdentity: "old-page",
+    contextIdentity: "book-a",
+  };
+  const currentRequest = {
+    viewer,
+    pageGroups: newGroups,
+    group: newGroups[0],
+    groupIndex: 0,
+    groupIdentity: "different-page",
+    contextIdentity: "book-a",
+  };
+  assert.equal(viewerPageGroupRequestMatches(oldRequest, currentRequest), false);
+  assert.deepEqual(viewerGroupLoadCompletionPlan(
+    { outcome: ViewerGroupLoadOutcome.FAILED, message: "late failure" },
+    {
+      loadRequest: oldRequest,
+      currentRequest,
+      positionRequest: oldRequest,
+    }
+  ), {
+    action: ViewerGroupLoadCompletionAction.IGNORE,
+  });
 });
 
 test("viewer seek relative drag mirrors physical RTL travel", () => {
