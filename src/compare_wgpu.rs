@@ -34,6 +34,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VsOut {
 struct Params {
     mode_wipe: vec2<f32>,
     _padding: vec2<f32>,
+    uv_window: vec4<f32>,
 };
 
 @group(0) @binding(0) var pinned_tex: texture_2d<f32>;
@@ -47,10 +48,11 @@ fn sample_compare_texture(tex: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let pinned = sample_compare_texture(pinned_tex, in.uv);
-    let current = sample_compare_texture(current_tex, in.uv);
+    let image_uv = mix(params.uv_window.xy, params.uv_window.zw, in.uv);
+    let pinned = sample_compare_texture(pinned_tex, image_uv);
+    let current = sample_compare_texture(current_tex, image_uv);
     if (params.mode_wipe.x < 0.5) {
-        if (in.uv.x <= params.mode_wipe.y) {
+        if (image_uv.x <= params.mode_wipe.y) {
             return pinned;
         }
         return current;
@@ -75,6 +77,7 @@ pub struct CompareShaderCallback {
     pub current_rgba: Arc<Vec<u8>>,
     pub mode: CompareShaderMode,
     pub wipe_fraction: f32,
+    pub uv_window: [f32; 4],
     pub target_format: wgpu::TextureFormat,
 }
 
@@ -238,7 +241,7 @@ impl CompareGpuResources {
             );
             let uniform = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("miv_compare_uniform"),
-                size: 16,
+                size: 32,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -284,7 +287,7 @@ impl CompareGpuResources {
             queue.write_buffer(
                 &pair.uniform,
                 0,
-                &uniform_bytes(callback.mode, callback.wipe_fraction),
+                &uniform_bytes(callback.mode, callback.wipe_fraction, callback.uv_window),
             );
         }
     }
@@ -349,13 +352,22 @@ fn upload_rgba_texture(
     UploadedTexture { texture, view }
 }
 
-fn uniform_bytes(mode: CompareShaderMode, wipe_fraction: f32) -> [u8; 16] {
+fn uniform_bytes(mode: CompareShaderMode, wipe_fraction: f32, uv_window: [f32; 4]) -> [u8; 32] {
     let mode = match mode {
         CompareShaderMode::Wipe => 0.0_f32,
         CompareShaderMode::Diff => 1.0_f32,
     };
-    let values = [mode, wipe_fraction.clamp(0.05, 0.95)];
-    let mut bytes = [0_u8; 16];
+    let values = [
+        mode,
+        wipe_fraction.clamp(0.05, 0.95),
+        0.0,
+        0.0,
+        uv_window[0],
+        uv_window[1],
+        uv_window[2],
+        uv_window[3],
+    ];
+    let mut bytes = [0_u8; 32];
     for (i, value) in values.iter().enumerate() {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&value.to_ne_bytes());
     }
@@ -413,7 +425,7 @@ mod tests {
         assert!(SHADER.contains("textureSample(tex, compare_sampler, uv)"));
         assert!(!SHADER.contains("textureSampleBias"));
         assert!(!SHADER.contains("textureSampleLevel"));
-        let default_bytes = uniform_bytes(CompareShaderMode::Wipe, 0.5);
+        let default_bytes = uniform_bytes(CompareShaderMode::Wipe, 0.5, [0.1, 0.2, 0.8, 0.9]);
         assert_eq!(
             f32::from_ne_bytes(default_bytes[0..4].try_into().unwrap()),
             0.0
@@ -423,6 +435,13 @@ mod tests {
             0.5
         );
         assert_eq!(&default_bytes[8..16], &[0; 8]);
+        assert_eq!(
+            default_bytes[16..]
+                .chunks_exact(4)
+                .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![0.1, 0.2, 0.8, 0.9]
+        );
 
         let module = wgpu::naga::front::wgsl::parse_str(SHADER).expect("parse compare WGSL");
         wgpu::naga::valid::Validator::new(

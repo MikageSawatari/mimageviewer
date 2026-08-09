@@ -980,6 +980,10 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 画像矩形へ `zoom_pan=None` で同じ `CompareShaderCallback` を再描画する。PinnedNormal は
 準備済み pinned texture を直接描画する。同一フレームの2 callback は同じ `pair.key` と寸法を
 渡すため GPU texture / mip chain / bind group を再利用し、2回目は uniform 更新と draw だけを行う。
+本文の比較 callback は、ズーム / パン後の実画像矩形と viewport の交差だけを callback rect にし、
+切り落とした範囲を uniform の UV 窓で元の合成画像座標へ戻す。テクスチャ採取と Wipe 境界判定は
+復元後の座標を共有するため、白線の基準である実画像矩形と一致する。ナビゲータは実画像矩形が
+パネル内に収まり UV 窓が常に全域となるので、このクリップによる表示変更はない。
 通常の単ページ / 見開きで利用者入力から `fs_pan` を更新するときは、直前の
 `FullscreenPageLayout` に記録された実表示矩形を使い、少なくとも 1 ページが viewport と
 各軸 48 logical point（ページまたは viewport がそれより小さい軸では、その小さい方の全幅）

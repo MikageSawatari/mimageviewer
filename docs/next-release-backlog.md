@@ -1162,6 +1162,12 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   等倍・ズーム + パン・レターボックスの3条件で、描画線 x から入力 fraction が往復一致する
   unit test を追加した。前フレームの矩形は保存せず、入力フレームの
   `compare_image_draw_rect` を使う。
+- 実装追記 (2026-08-09): GPU callback が画面外へ出た `draw_rect` をそのまま viewport に
+  指定し、egui-wgpu のクランプ後の矩形へ合成画像全体を押し込んでいた残件を修正した。
+  callback rect を `draw_rect ∩ image_rect` へ制限し、切り落とした範囲を UV 窓として
+  uniform へ渡す。テクスチャ採取と Wipe 判定は UV 窓で復元した合成画像座標を使うため、
+  白線は引き続き `draw_rect` 基準のまま一致する。ナビゲータは `zoom_pan=None` で
+  `visible == draw_rect`、UV 窓 `(0,0)-(1,1)` のため表示を変えない。
 
 ### 1.61 見開きでページが 1 枚ダブる (横長ページの寸法をキャッシュ在住に頼っている) — 利用者報告
 

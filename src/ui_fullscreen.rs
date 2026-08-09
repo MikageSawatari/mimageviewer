@@ -5465,6 +5465,21 @@ fn compare_wipe_grab_hit(draw_rect: egui::Rect, pointer: egui::Pos2, fraction: f
             <= COMPARE_WIPE_GRAB_HALF_WIDTH
 }
 
+/// Restrict the compare callback to the viewport and map its local UVs back into the full image.
+fn compare_shader_visible_region(
+    draw_rect: egui::Rect,
+    viewport_rect: egui::Rect,
+) -> Option<(egui::Rect, [f32; 4])> {
+    let visible = draw_rect.intersect(viewport_rect);
+    if !draw_rect.is_positive() || !visible.is_positive() {
+        return None;
+    }
+    let size = draw_rect.size();
+    let uv_min = (visible.min - draw_rect.min) / size;
+    let uv_max = (visible.max - draw_rect.min) / size;
+    Some((visible, [uv_min.x, uv_min.y, uv_max.x, uv_max.y]))
+}
+
 fn fullscreen_rect_excluding_fixed_bars(
     full_rect: egui::Rect,
     top_locked: bool,
@@ -21989,6 +22004,7 @@ impl App {
             zoom_pan,
             self.fullscreen_fit_scale_limits(pixels_per_point),
         )?;
+        let (callback_rect, uv_window) = compare_shader_visible_region(draw_rect, image_rect)?;
         let callback = crate::compare_wgpu::CompareShaderCallback {
             key: pair.key,
             width: pair.target_size[0] as u32,
@@ -21997,11 +22013,15 @@ impl App {
             current_rgba: Arc::clone(&pair.current_rgba),
             mode,
             wipe_fraction,
+            uv_window,
             target_format,
         };
         Some((
             draw_rect,
-            egui::Shape::Callback(egui_wgpu::Callback::new_paint_callback(draw_rect, callback)),
+            egui::Shape::Callback(egui_wgpu::Callback::new_paint_callback(
+                callback_rect,
+                callback,
+            )),
         ))
     }
 
@@ -35017,6 +35037,76 @@ mod tests {
                 egui::pos2(line_x, draw_rect.center().y),
                 fraction,
             ));
+        }
+    }
+
+    #[test]
+    fn compare_shader_visible_region_maps_callback_rect_to_full_image_uvs() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0));
+
+        let inside = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(400.0, 300.0));
+        assert_eq!(
+            compare_shader_visible_region(inside, viewport),
+            Some((inside, [0.0, 0.0, 1.0, 1.0]))
+        );
+
+        let zoomed =
+            egui::Rect::from_min_size(egui::pos2(-500.0, -400.0), egui::vec2(2000.0, 1600.0));
+        assert_eq!(
+            compare_shader_visible_region(zoomed, viewport),
+            Some((viewport, [0.25, 0.25, 0.75, 0.75]))
+        );
+
+        let panned_left =
+            egui::Rect::from_min_size(egui::pos2(-400.0, 0.0), egui::vec2(800.0, 800.0));
+        assert_eq!(
+            compare_shader_visible_region(panned_left, viewport),
+            Some((
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(400.0, 800.0)),
+                [0.5, 0.0, 1.0, 1.0],
+            ))
+        );
+
+        let outside = egui::Rect::from_min_size(egui::pos2(1200.0, 0.0), egui::vec2(100.0, 100.0));
+        assert_eq!(compare_shader_visible_region(outside, viewport), None);
+
+        let navigator_draw = App::compare_image_draw_rect(
+            viewport,
+            [400, 800],
+            None,
+            FullscreenFitScaleLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            compare_shader_visible_region(navigator_draw, viewport),
+            Some((navigator_draw, [0.0, 0.0, 1.0, 1.0]))
+        );
+    }
+
+    #[test]
+    fn compare_shader_wipe_boundary_stays_in_full_image_coordinates() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0));
+        let cases = [
+            (
+                egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(800.0, 600.0)),
+                0.37,
+            ),
+            (
+                egui::Rect::from_min_size(egui::pos2(-500.0, -400.0), egui::vec2(2000.0, 1600.0)),
+                0.37,
+            ),
+            (
+                egui::Rect::from_min_size(egui::pos2(-400.0, 0.0), egui::vec2(800.0, 800.0)),
+                0.75,
+            ),
+        ];
+
+        for (draw_rect, fraction) in cases {
+            let (callback_rect, uv_window) =
+                compare_shader_visible_region(draw_rect, viewport).unwrap();
+            let callback_u = (fraction - uv_window[0]) / (uv_window[2] - uv_window[0]);
+            let shader_screen_x = callback_rect.left() + callback_rect.width() * callback_u;
+            assert!((shader_screen_x - compare_wipe_screen_x(draw_rect, fraction)).abs() < 1.0e-4);
         }
     }
 
