@@ -5114,46 +5114,55 @@ async function updateViewerImage(
     state.remoteStateGeneration,
     group.entries.length
   );
-  const infos = await Promise.all(group.entries.map(imageInfo));
-  if (
-    state.viewer !== viewer ||
-    state.remoteSessionId !== remoteSessionIdSnapshot ||
-    state.remoteSessionCacheEpoch !== remoteSessionCacheEpochSnapshot ||
-    currentPageGroup()?.entries.map(entryIdentity).join("\n") !== identity
-  ) {
-    return;
+  // 例外も 3 outcome の境界の内側で受ける。ここを抜けると呼び出し側の
+  // .catch(renderError) まで飛び、位置を戻す判断が一度も行われない。
+  let pages = [];
+  let result;
+  try {
+    const infos = await Promise.all(group.entries.map(imageInfo));
+    if (
+      state.viewer !== viewer ||
+      state.remoteSessionId !== remoteSessionIdSnapshot ||
+      state.remoteSessionCacheEpoch !== remoteSessionCacheEpochSnapshot ||
+      currentPageGroup()?.entries.map(entryIdentity).join("\n") !== identity
+    ) {
+      return;
+    }
+    const layout = viewerSpreadLayout({
+      mode: state.fitMode,
+      pages: infos,
+      viewportWidth: viewer.stage.clientWidth || window.innerWidth,
+      viewportHeight: viewer.stage.clientHeight || window.innerHeight,
+      devicePixelRatio: window.devicePixelRatio || 1,
+      gap: group.entries.length > 1 ? state.spreadPageGapPx : 0,
+    });
+    pages = group.entries.map((entry, pageIndex) => ({
+      entry,
+      info: infos[pageIndex],
+      request: imageRequest(entry, infos[pageIndex], viewer.stage, {
+        layout: layout.pages[pageIndex],
+        remoteStateGeneration: generationSnapshot.pages[pageIndex],
+        remoteSessionId: remoteSessionIdSnapshot,
+        remoteSessionCacheEpoch: remoteSessionCacheEpochSnapshot,
+      }),
+    }));
+    result = await viewer.loadGroup({
+      pages,
+      name: group.entries.map((entry) => entry.name).join(" / "),
+      fitMode: state.fitMode,
+      gap: layout.gap,
+      index: state.pageGroupIndex,
+      count: state.pageGroups.length,
+      seekState: viewerSeekSnapshot(),
+      pageNumbers: (state.seekPageGroups[state.pageGroupIndex] ?? [])
+        .map((pageIndex) => pageIndex + 1),
+      interactionStartedAt,
+      renderTrigger,
+    });
+  } catch (error) {
+    if (state.viewer !== viewer) return;
+    result = viewerGroupLoadFailure(error, "ページを表示できませんでした。");
   }
-  const layout = viewerSpreadLayout({
-    mode: state.fitMode,
-    pages: infos,
-    viewportWidth: viewer.stage.clientWidth || window.innerWidth,
-    viewportHeight: viewer.stage.clientHeight || window.innerHeight,
-    devicePixelRatio: window.devicePixelRatio || 1,
-    gap: group.entries.length > 1 ? state.spreadPageGapPx : 0,
-  });
-  const pages = group.entries.map((entry, pageIndex) => ({
-    entry,
-    info: infos[pageIndex],
-    request: imageRequest(entry, infos[pageIndex], viewer.stage, {
-      layout: layout.pages[pageIndex],
-      remoteStateGeneration: generationSnapshot.pages[pageIndex],
-      remoteSessionId: remoteSessionIdSnapshot,
-      remoteSessionCacheEpoch: remoteSessionCacheEpochSnapshot,
-    }),
-  }));
-  const result = await viewer.loadGroup({
-    pages,
-    name: group.entries.map((entry) => entry.name).join(" / "),
-    fitMode: state.fitMode,
-    gap: layout.gap,
-    index: state.pageGroupIndex,
-    count: state.pageGroups.length,
-    seekState: viewerSeekSnapshot(),
-    pageNumbers: (state.seekPageGroups[state.pageGroupIndex] ?? [])
-      .map((pageIndex) => pageIndex + 1),
-    interactionStartedAt,
-    renderTrigger,
-  });
   const completion = viewerGroupLoadCompletionPlan(result, {
     loadRequest,
     positionRequest,

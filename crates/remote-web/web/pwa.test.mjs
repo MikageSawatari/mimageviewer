@@ -510,6 +510,18 @@ test("only committed page navigation owns failure rollback and shows its message
   }
 });
 
+test("a thrown page load still reaches the outcome contract instead of the render error path", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  const body = app.slice(app.indexOf("async function updateViewerImage("));
+  const load = body.slice(0, body.indexOf("const completion = viewerGroupLoadCompletionPlan("));
+  // loadGroup と imageInfo は例外を投げ得る。try の外に出ると呼び出し側の
+  // .catch(renderError) まで飛び、位置を戻す判断が一度も行われない。
+  assert.match(
+    load,
+    /\btry \{[\s\S]*await Promise\.all\(group\.entries\.map\(imageInfo\)\)[\s\S]*await viewer\.loadGroup\([\s\S]*\} catch \(error\) \{[\s\S]*viewerGroupLoadFailure\(error,/
+  );
+});
+
 test("image tiles preserve portrait and landscape shape below a separate label row", async () => {
   const css = await readFile(new URL("styles.css", here), "utf8");
   const app = await readFile(new URL("app.js", here), "utf8");
