@@ -6053,7 +6053,7 @@ struct StillTouchFirstRunHelpLayout {
     center_tap_rect: egui::Rect,
     /// Each label is centred in the side strip it describes, outside the
     /// centre tap rectangle. The screen-half centres (25% / 75%) are too close
-    /// to the rectangle for the longer direction-resolved page labels.
+    /// to the rectangle for the longer physical-side page labels.
     left_label_x: f32,
     right_label_x: f32,
 }
@@ -6082,17 +6082,10 @@ struct StillTouchPageLabels {
     right: &'static str,
 }
 
-fn still_touch_page_labels(is_rtl: bool) -> StillTouchPageLabels {
-    if is_rtl {
-        StillTouchPageLabels {
-            left: "次のページ",
-            right: "前のページ",
-        }
-    } else {
-        StillTouchPageLabels {
-            left: "前のページ",
-            right: "次のページ",
-        }
+fn still_touch_page_labels() -> StillTouchPageLabels {
+    StillTouchPageLabels {
+        left: "左のページへ",
+        right: "右のページへ",
     }
 }
 
@@ -6104,10 +6097,9 @@ fn paint_still_touch_first_run_help_overlay(
     ui: &egui::Ui,
     full_rect: egui::Rect,
     show_scaling_hint: bool,
-    is_rtl: bool,
 ) {
     let layout = still_touch_first_run_help_layout(full_rect);
-    let page_labels = still_touch_page_labels(is_rtl);
+    let page_labels = still_touch_page_labels();
     let painter = ui.painter();
     painter.rect_filled(
         layout.full_rect,
@@ -6183,7 +6175,6 @@ pub fn draw_still_touch_first_run_help_snapshot_fixture(
     ui: &mut egui::Ui,
     learned: bool,
     ui_scale: f32,
-    is_rtl: bool,
 ) {
     let full_rect = ui.max_rect();
     ui.painter()
@@ -6193,7 +6184,6 @@ pub fn draw_still_touch_first_run_help_snapshot_fixture(
             ui,
             full_rect,
             still_touch_first_run_help_shows_scaling_hint(ui_scale),
-            is_rtl,
         );
     }
 }
@@ -6283,7 +6273,6 @@ impl App {
             ui,
             full_rect,
             still_touch_first_run_help_shows_scaling_hint(self.settings.ui_scale_factor),
-            self.spread_mode.is_rtl(),
         );
     }
 
@@ -31440,19 +31429,12 @@ mod tests {
     }
 
     #[test]
-    fn first_run_touch_help_page_labels_follow_reading_direction() {
+    fn first_run_touch_help_page_labels_are_direction_independent() {
         assert_eq!(
-            still_touch_page_labels(false),
+            still_touch_page_labels(),
             StillTouchPageLabels {
-                left: "前のページ",
-                right: "次のページ",
-            }
-        );
-        assert_eq!(
-            still_touch_page_labels(true),
-            StillTouchPageLabels {
-                left: "次のページ",
-                right: "前のページ",
+                left: "左のページへ",
+                right: "右のページへ",
             }
         );
     }
