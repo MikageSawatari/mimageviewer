@@ -853,6 +853,39 @@ fn fs_loupe_suppressed_by_edit_mode(
     analysis_mode || adjustment_mode || text_mode
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LoupeSampleMapping {
+    uv_rect: egui::Rect,
+    image_rect: egui::Rect,
+}
+
+fn loupe_sample_mapping(
+    uv_center: egui::Vec2,
+    half_uv: egui::Vec2,
+    loupe_rect: egui::Rect,
+) -> LoupeSampleMapping {
+    debug_assert!(half_uv.x > 0.0 && half_uv.y > 0.0);
+    let desired_min = uv_center - half_uv;
+    let desired_max = uv_center + half_uv;
+    let uv_min = egui::pos2(desired_min.x.clamp(0.0, 1.0), desired_min.y.clamp(0.0, 1.0));
+    let uv_max = egui::pos2(desired_max.x.clamp(0.0, 1.0), desired_max.y.clamp(0.0, 1.0));
+    let desired_size = desired_max - desired_min;
+    let image_min_fraction = egui::vec2(
+        (uv_min.x - desired_min.x) / desired_size.x,
+        (uv_min.y - desired_min.y) / desired_size.y,
+    );
+    let image_max_fraction = egui::vec2(
+        (uv_max.x - desired_min.x) / desired_size.x,
+        (uv_max.y - desired_min.y) / desired_size.y,
+    );
+    let image_min = loupe_rect.min + image_min_fraction * loupe_rect.size();
+    let image_max = loupe_rect.min + image_max_fraction * loupe_rect.size();
+    LoupeSampleMapping {
+        uv_rect: egui::Rect::from_min_max(uv_min, uv_max),
+        image_rect: egui::Rect::from_min_max(image_min, image_max),
+    }
+}
+
 fn window_geometry_pos_to_viewport(pos: egui::Pos2, ui_scale: f32) -> egui::Pos2 {
     egui::pos2(
         crate::settings::window_geometry_to_viewport_points(pos.x, ui_scale),
@@ -23023,15 +23056,6 @@ impl App {
         // サンプル UV: LOUPE_SIZE / LOUPE_ZOOM をテクスチャピクセル単位に変換
         let sample_px_half = LOUPE_SIZE * 0.5 / (total_scale * LOUPE_ZOOM);
         let half_uv = egui::vec2(sample_px_half / tex_size.x, sample_px_half / tex_size.y);
-        let uv_min = egui::pos2(
-            (uv_center.x - half_uv.x).clamp(0.0, 1.0),
-            (uv_center.y - half_uv.y).clamp(0.0, 1.0),
-        );
-        let uv_max = egui::pos2(
-            (uv_center.x + half_uv.x).clamp(0.0, 1.0),
-            (uv_center.y + half_uv.y).clamp(0.0, 1.0),
-        );
-        let uv_rect = egui::Rect::from_min_max(uv_min, uv_max);
 
         // ポップアップ位置: カーソル右下 → はみ出すなら反転
         let mut popup_pos = cursor + egui::vec2(LOUPE_OFFSET, LOUPE_OFFSET);
@@ -23045,11 +23069,18 @@ impl App {
         popup_pos.x = popup_pos.x.max(full_rect.min.x + 4.0);
         popup_pos.y = popup_pos.y.max(full_rect.min.y + 4.0);
         let loupe_rect = egui::Rect::from_min_size(popup_pos, egui::vec2(LOUPE_SIZE, LOUPE_SIZE));
+        let sample = loupe_sample_mapping(uv_center, half_uv, loupe_rect);
 
         let painter = ui.painter();
-        // 背景 (黒で囲う) + 画像 + 枠線
+        // 画像外は既存の黒背景を残し、クリップした UV と同じ比率だけ描画先も切り詰める。
+        // これにより画像端でもカーソル位置と source px あたりの拡大率を変えない。
         painter.rect_filled(loupe_rect.expand(3.0), 4.0, egui::Color32::BLACK);
-        painter.image(handle_owned.id(), loupe_rect, uv_rect, egui::Color32::WHITE);
+        painter.image(
+            handle_owned.id(),
+            sample.image_rect,
+            sample.uv_rect,
+            egui::Color32::WHITE,
+        );
         painter.rect_stroke(
             loupe_rect,
             2.0,
@@ -29201,6 +29232,13 @@ mod tests {
         assert!((actual.bottom() - expected.bottom()).abs() < EPSILON);
     }
 
+    fn assert_loupe_scale(mapping: LoupeSampleMapping, texture_size: egui::Vec2, expected: f32) {
+        let scale_x = mapping.image_rect.width() / (mapping.uv_rect.width() * texture_size.x);
+        let scale_y = mapping.image_rect.height() / (mapping.uv_rect.height() * texture_size.y);
+        assert!((scale_x - expected).abs() < 1.0e-4);
+        assert!((scale_y - expected).abs() < 1.0e-4);
+    }
+
     #[test]
     fn navigator_hold_requests_visibility_when_fixed_setting_is_off() {
         assert!(fs_navigator_visibility_requested(false, true, true, false));
@@ -30895,6 +30933,42 @@ mod tests {
     fn loupe_is_suppressed_in_text_annotation_mode() {
         assert!(fs_loupe_suppressed_by_edit_mode(false, false, true));
         assert!(!fs_loupe_suppressed_by_edit_mode(false, false, false));
+    }
+
+    #[test]
+    fn loupe_mapping_keeps_source_scale_and_exposes_outside_background() {
+        let loupe = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(300.0, 300.0));
+        let half_uv = egui::vec2(0.1, 0.2);
+        let texture_size = egui::vec2(1000.0, 500.0);
+
+        let center = loupe_sample_mapping(egui::vec2(0.5, 0.5), half_uv, loupe);
+        assert_rect_close(
+            center.uv_rect,
+            egui::Rect::from_min_max(egui::pos2(0.4, 0.3), egui::pos2(0.6, 0.7)),
+        );
+        assert_rect_close(center.image_rect, loupe);
+        assert_loupe_scale(center, texture_size, 1.5);
+
+        let left = loupe_sample_mapping(egui::vec2(0.0, 0.5), half_uv, loupe);
+        assert_rect_close(
+            left.image_rect,
+            egui::Rect::from_min_max(egui::pos2(170.0, 30.0), egui::pos2(320.0, 330.0)),
+        );
+        assert_loupe_scale(left, texture_size, 1.5);
+
+        let right_top = loupe_sample_mapping(egui::vec2(1.0, 0.0), half_uv, loupe);
+        assert_rect_close(
+            right_top.image_rect,
+            egui::Rect::from_min_max(egui::pos2(20.0, 180.0), egui::pos2(170.0, 330.0)),
+        );
+        assert_loupe_scale(right_top, texture_size, 1.5);
+
+        let small_image = loupe_sample_mapping(egui::vec2(0.5, 0.5), egui::vec2(1.0, 1.0), loupe);
+        assert_rect_close(
+            small_image.image_rect,
+            egui::Rect::from_min_max(egui::pos2(95.0, 105.0), egui::pos2(245.0, 255.0)),
+        );
+        assert_loupe_scale(small_image, egui::vec2(100.0, 100.0), 1.5);
     }
 
     #[test]
