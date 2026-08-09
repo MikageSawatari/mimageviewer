@@ -116,6 +116,7 @@ const {
   browserDoubleTapTelemetryEvent,
   commandTelemetryEvent,
   containerInitialImageIndex,
+  createRemoteHomeDataRefreshCoordinator,
   createFavoriteSearchForm,
   createGridTile,
   filterRemoteTags,
@@ -157,6 +158,16 @@ const {
   viewTrimSpreadControlKeys,
   viewerMenuDefinitions,
 } = await import("./app.js");
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 const viewTrimState = () => ({
   apply_mode: "book",
@@ -1038,6 +1049,197 @@ test("tapping an audio grid tile opens the shared media viewer route", () => {
   assert.equal(showUnsupportedRemoteEntryNotice(notice, "audio"), false);
   assert.equal(notice.hidden, true);
   assert.equal(resolveMediaOpenRoute("audio", { kind: "audio", address }, -1), "audio");
+});
+
+test("generation refresh fetches favorites and home once without taking the viewer", async () => {
+  const previousHome = {
+    places: [{ kind: "folder", label: "以前の場所" }],
+    smart_folders: [{ id: "old", name: "以前のスマートフォルダ" }],
+  };
+  const appState = {
+    favorites: [{ name: "以前のお気に入り" }],
+    home: previousHome,
+    homeLoadError: "",
+    screenContext: "viewer",
+    homeTab: "places",
+  };
+  const requests = [];
+  const pending = new Map();
+  const renderedTabs = [];
+  const observedGenerations = [];
+  const coordinator = createRemoteHomeDataRefreshCoordinator({
+    requestJson(endpoint) {
+      requests.push(endpoint);
+      const request = deferred();
+      pending.set(endpoint, request);
+      return request.promise;
+    },
+    appState,
+    applyGeneration(generation, options) {
+      observedGenerations.push({ generation, options });
+    },
+    renderHomeScreen(tab) {
+      renderedTabs.push(tab);
+    },
+  });
+
+  const firstRefresh = coordinator.refreshAfterGenerationChange();
+  const consecutiveRefresh = coordinator.refreshAfterGenerationChange();
+  assert.deepEqual(requests, ["/api/favorites", "/api/home"]);
+
+  const nextFavorites = [{ name: "更新後のお気に入り" }];
+  const nextHome = {
+    places: [{ kind: "folder", label: "更新後の場所" }],
+    smart_folders: [{ id: "new", name: "更新後のスマートフォルダ" }],
+  };
+  pending.get("/api/favorites").resolve({
+    remote_state_generation: "generation-2",
+    favorites: nextFavorites,
+  });
+  pending.get("/api/home").resolve(nextHome);
+  await Promise.all([firstRefresh, consecutiveRefresh]);
+
+  assert.strictEqual(appState.favorites, nextFavorites);
+  assert.strictEqual(appState.home, nextHome);
+  assert.equal(appState.screenContext, "viewer");
+  assert.deepEqual(renderedTabs, []);
+  assert.deepEqual(observedGenerations, [
+    { generation: "generation-2", options: { reloadViewer: false } },
+  ]);
+});
+
+test("initial loading and a concurrent generation refresh share the same requests", async () => {
+  const appState = {
+    favorites: [],
+    home: { places: [], smart_folders: [] },
+    homeLoadError: "",
+    screenContext: "loading",
+    homeTab: "places",
+  };
+  const requests = [];
+  const pending = new Map();
+  const coordinator = createRemoteHomeDataRefreshCoordinator({
+    requestJson(endpoint) {
+      requests.push(endpoint);
+      const request = deferred();
+      pending.set(endpoint, request);
+      return request.promise;
+    },
+    appState,
+    applyGeneration() {},
+    renderHomeScreen() {},
+  });
+
+  const initialLoad = coordinator.loadInitial();
+  const generationRefresh = coordinator.refreshAfterGenerationChange();
+  assert.deepEqual(requests, ["/api/favorites", "/api/home"]);
+
+  pending.get("/api/favorites").resolve({
+    remote_state_generation: "generation-1",
+    favorites: [],
+  });
+  pending.get("/api/home").resolve({ places: [], smart_folders: [] });
+  await Promise.all([initialLoad, generationRefresh]);
+
+  assert.deepEqual(requests, ["/api/favorites", "/api/home"]);
+});
+
+test("successful generation home refresh redraws only the visible home data tab", async () => {
+  const appState = {
+    favorites: [],
+    home: { places: [], smart_folders: [] },
+    homeLoadError: "previous startup failure",
+    screenContext: "home",
+    homeTab: "smart",
+  };
+  const renderedTabs = [];
+  const nextHome = {
+    places: [{ kind: "folder", label: "更新後の場所" }],
+    smart_folders: [{ id: "new", name: "更新後のスマートフォルダ" }],
+  };
+  const coordinator = createRemoteHomeDataRefreshCoordinator({
+    requestJson(endpoint) {
+      if (endpoint === "/api/home") return Promise.resolve(nextHome);
+      return Promise.resolve({ remote_state_generation: "generation-4", favorites: [] });
+    },
+    appState,
+    applyGeneration() {},
+    renderHomeScreen(tab) {
+      renderedTabs.push(tab);
+    },
+  });
+
+  await coordinator.refreshAfterGenerationChange();
+
+  assert.strictEqual(appState.home, nextHome);
+  assert.equal(appState.homeLoadError, "");
+  assert.deepEqual(renderedTabs, ["smart"]);
+});
+
+test("failed generation home refresh preserves the last good places and smart folders", async () => {
+  const previousHome = {
+    places: [{ kind: "folder", label: "残る場所" }],
+    smart_folders: [{ id: "kept", name: "残るスマートフォルダ" }],
+  };
+  const appState = {
+    favorites: [{ name: "以前のお気に入り" }],
+    home: previousHome,
+    homeLoadError: "",
+    screenContext: "home",
+    homeTab: "places",
+  };
+  const renderedTabs = [];
+  const coordinator = createRemoteHomeDataRefreshCoordinator({
+    requestJson(endpoint) {
+      if (endpoint === "/api/home") return Promise.reject(new Error("temporary failure"));
+      return Promise.resolve({
+        remote_state_generation: "generation-3",
+        favorites: [{ name: "更新後のお気に入り" }],
+      });
+    },
+    appState,
+    applyGeneration() {},
+    renderHomeScreen(tab) {
+      renderedTabs.push(tab);
+    },
+  });
+
+  const results = await coordinator.refreshAfterGenerationChange();
+
+  assert.deepEqual(results.map((result) => result.status), ["fulfilled", "rejected"]);
+  assert.strictEqual(appState.home, previousHome);
+  assert.deepEqual(appState.home.places, previousHome.places);
+  assert.deepEqual(appState.home.smart_folders, previousHome.smart_folders);
+  assert.equal(appState.homeLoadError, "");
+  assert.deepEqual(renderedTabs, []);
+  assert.deepEqual(appState.favorites, [{ name: "更新後のお気に入り" }]);
+});
+
+test("initial home failure keeps its empty-state behavior separate from generation refresh", async () => {
+  const appState = {
+    favorites: [],
+    home: {
+      places: [{ kind: "folder", label: "起動前の仮データ" }],
+      smart_folders: [{ id: "temporary", name: "起動前の仮データ" }],
+    },
+    homeLoadError: "",
+    screenContext: "loading",
+    homeTab: "places",
+  };
+  const coordinator = createRemoteHomeDataRefreshCoordinator({
+    requestJson(endpoint) {
+      if (endpoint === "/api/home") return Promise.reject(new Error("initial failure"));
+      return Promise.resolve({ remote_state_generation: "generation-1", favorites: [] });
+    },
+    appState,
+    applyGeneration() {},
+    renderHomeScreen() {},
+  });
+
+  await coordinator.loadInitial();
+
+  assert.deepEqual(appState.home, { places: [], smart_folders: [] });
+  assert.equal(appState.homeLoadError, "initial failure");
 });
 
 test("resolved audio and video opens enter the media viewer instead of the image viewer", () => {

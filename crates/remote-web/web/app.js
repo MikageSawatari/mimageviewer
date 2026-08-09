@@ -693,17 +693,7 @@ async function enterAuthenticatedApp() {
   startSessionPing();
   startAppUpdateWatch().catch(() => {});
   renderLoading("お気に入りを読み込んでいます");
-  const data = await apiJson("/api/favorites");
-  applyRemoteStateGeneration(data.remote_state_generation, { reloadViewer: false });
-  state.favorites = data.favorites ?? [];
-  try {
-    state.home = await apiJson("/api/home");
-    state.homeLoadError = "";
-  } catch (error) {
-    state.home = { places: [], smart_folders: [] };
-    state.homeLoadError =
-      error instanceof Error ? error.message : "mIV 本体から一覧を取得できませんでした。";
-  }
+  await remoteHomeDataRefreshCoordinator.loadInitial();
   if (!location.hash) {
     history.replaceState({ mivRoute: true }, "", "#home/places");
   } else {
@@ -1071,7 +1061,93 @@ async function pingRemoteSession() {
   applyRemoteStateGeneration(result.remote_state_generation, { reloadViewer: true });
 }
 
-let remoteFavoritesRefreshPromise = null;
+export function createRemoteHomeDataRefreshCoordinator({
+  requestJson,
+  appState,
+  applyGeneration,
+  renderHomeScreen,
+}) {
+  const pendingByTarget = new Map();
+
+  // This is the canonical set of home-screen data invalidated by a remote-state generation
+  // change. Add future home-screen data sources here so generation refresh cannot omit one.
+  const targets = Object.freeze([
+    {
+      key: "favorites",
+      endpoint: "/api/favorites",
+      install(data) {
+        applyGeneration(data.remote_state_generation, { reloadViewer: false });
+        appState.favorites = data.favorites ?? [];
+        if (appState.screenContext === "home" && appState.homeTab === "favorites") {
+          renderHomeScreen("favorites");
+        }
+        return appState.favorites;
+      },
+    },
+    {
+      key: "home",
+      endpoint: "/api/home",
+      install(data) {
+        // A refresh replaces the last good value only after a successful request. In
+        // particular, do not reuse the initial-load fallback that clears both lists.
+        appState.home = data;
+        appState.homeLoadError = "";
+        if (
+          appState.screenContext === "home" &&
+          (appState.homeTab === "places" || appState.homeTab === "smart")
+        ) {
+          renderHomeScreen(appState.homeTab);
+        }
+        return appState.home;
+      },
+      handleInitialFailure(error) {
+        // Initial loading has no last good value, so it keeps the existing empty-state error
+        // behavior. Generation refresh deliberately never calls this handler.
+        appState.home = { places: [], smart_folders: [] };
+        appState.homeLoadError =
+          error instanceof Error ? error.message : "mIV 本体から一覧を取得できませんでした。";
+      },
+    },
+  ]);
+
+  function refresh(target) {
+    const existing = pendingByTarget.get(target.key);
+    if (existing) return existing;
+
+    const pending = requestJson(target.endpoint)
+      .then((data) => target.install(data))
+      .finally(() => {
+        if (pendingByTarget.get(target.key) === pending) {
+          pendingByTarget.delete(target.key);
+        }
+      });
+    pendingByTarget.set(target.key, pending);
+    return pending;
+  }
+
+  return {
+    async loadInitial() {
+      const results = await Promise.allSettled(targets.map((target) => refresh(target)));
+      for (let index = 0; index < results.length; index += 1) {
+        const result = results[index];
+        if (result.status === "fulfilled") continue;
+        const target = targets[index];
+        if (!target.handleInitialFailure) throw result.reason;
+        target.handleInitialFailure(result.reason);
+      }
+    },
+    refreshAfterGenerationChange() {
+      return Promise.allSettled(targets.map((target) => refresh(target)));
+    },
+  };
+}
+
+const remoteHomeDataRefreshCoordinator = createRemoteHomeDataRefreshCoordinator({
+  requestJson: apiJson,
+  appState: state,
+  applyGeneration: applyRemoteStateGeneration,
+  renderHomeScreen: renderHome,
+});
 
 function applyRemoteStateGeneration(observed, { reloadViewer = false } = {}) {
   const transition = remoteStateGenerationTransition(
@@ -1086,7 +1162,7 @@ function applyRemoteStateGeneration(observed, { reloadViewer = false } = {}) {
   pageResourceCache.clear();
   state.imageInfoCache.clear();
   state.containerImageInfoHints.clear();
-  refreshRemoteFavorites().catch(() => {});
+  remoteHomeDataRefreshCoordinator.refreshAfterGenerationChange();
   if (reloadViewer && state.viewer) {
     const viewer = state.viewer;
     queueMicrotask(() => {
@@ -1094,21 +1170,6 @@ function applyRemoteStateGeneration(observed, { reloadViewer = false } = {}) {
     });
   }
   return transition.generation;
-}
-
-async function refreshRemoteFavorites() {
-  if (!remoteFavoritesRefreshPromise) {
-    remoteFavoritesRefreshPromise = apiJson("/api/favorites").finally(() => {
-      remoteFavoritesRefreshPromise = null;
-    });
-  }
-  const data = await remoteFavoritesRefreshPromise;
-  applyRemoteStateGeneration(data.remote_state_generation, { reloadViewer: false });
-  state.favorites = data.favorites ?? [];
-  if (state.screenContext === "home" && state.homeTab === "favorites") {
-    renderHome("favorites");
-  }
-  return state.favorites;
 }
 
 function setRemoteSessionStatus(status, message, observation = {}) {

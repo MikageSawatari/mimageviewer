@@ -233,6 +233,18 @@ test("session epoch removes page preflight and repeated active acquisition", asy
   assert.doesNotMatch(app, /state\.viewer\?\.invalidatePendingLoad\(\)/);
 });
 
+test("remote state generation refreshes the canonical home data coordinator", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  assert.match(
+    app,
+    /enterAuthenticatedApp[\s\S]*await remoteHomeDataRefreshCoordinator\.loadInitial\(\)/
+  );
+  assert.match(
+    app,
+    /function applyRemoteStateGeneration[\s\S]*remoteHomeDataRefreshCoordinator\.refreshAfterGenerationChange\(\)/
+  );
+});
+
 test("the running app version comes from the shell and acquisition can reload only once", async () => {
   const app = await readFile(new URL("app.js", here), "utf8");
   assert.match(
