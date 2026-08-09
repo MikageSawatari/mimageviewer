@@ -6051,9 +6051,15 @@ struct StillTouchFirstRunHelpLayout {
     left_half: egui::Rect,
     right_half: egui::Rect,
     center_tap_rect: egui::Rect,
+    /// Each label is centred in the side strip it describes, outside the
+    /// centre tap rectangle. The screen-half centres (25% / 75%) are too close
+    /// to the rectangle for the longer direction-resolved page labels.
+    left_label_x: f32,
+    right_label_x: f32,
 }
 
 fn still_touch_first_run_help_layout(full_rect: egui::Rect) -> StillTouchFirstRunHelpLayout {
+    let center_tap_rect = crate::touch_input::center_tap_rect(full_rect);
     StillTouchFirstRunHelpLayout {
         full_rect,
         left_half: egui::Rect::from_min_max(
@@ -6064,7 +6070,29 @@ fn still_touch_first_run_help_layout(full_rect: egui::Rect) -> StillTouchFirstRu
             egui::pos2(full_rect.center().x, full_rect.min.y),
             full_rect.max,
         ),
-        center_tap_rect: crate::touch_input::center_tap_rect(full_rect),
+        center_tap_rect,
+        left_label_x: (full_rect.min.x + center_tap_rect.min.x) * 0.5,
+        right_label_x: (center_tap_rect.max.x + full_rect.max.x) * 0.5,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StillTouchPageLabels {
+    left: &'static str,
+    right: &'static str,
+}
+
+fn still_touch_page_labels(is_rtl: bool) -> StillTouchPageLabels {
+    if is_rtl {
+        StillTouchPageLabels {
+            left: "次のページ",
+            right: "前のページ",
+        }
+    } else {
+        StillTouchPageLabels {
+            left: "前のページ",
+            right: "次のページ",
+        }
     }
 }
 
@@ -6076,8 +6104,10 @@ fn paint_still_touch_first_run_help_overlay(
     ui: &egui::Ui,
     full_rect: egui::Rect,
     show_scaling_hint: bool,
+    is_rtl: bool,
 ) {
     let layout = still_touch_first_run_help_layout(full_rect);
+    let page_labels = still_touch_page_labels(is_rtl);
     let painter = ui.painter();
     painter.rect_filled(
         layout.full_rect,
@@ -6121,13 +6151,16 @@ fn paint_still_touch_first_run_help_overlay(
         egui::Color32::from_gray(224),
     );
 
-    for (side, points_right) in [(layout.left_half, false), (layout.right_half, true)] {
-        let arrow_center = egui::pos2(side.center().x, center.y - 14.0);
+    for (label_x, points_right, label) in [
+        (layout.left_label_x, false, page_labels.left),
+        (layout.right_label_x, true, page_labels.right),
+    ] {
+        let arrow_center = egui::pos2(label_x, center.y - 14.0);
         draw_panel_callout_arrow(painter, arrow_center, points_right, egui::Color32::WHITE);
         painter.text(
             arrow_center + egui::vec2(0.0, 30.0),
             egui::Align2::CENTER_CENTER,
-            "ページ送り",
+            label,
             sub_font.clone(),
             egui::Color32::WHITE,
         );
@@ -6150,6 +6183,7 @@ pub fn draw_still_touch_first_run_help_snapshot_fixture(
     ui: &mut egui::Ui,
     learned: bool,
     ui_scale: f32,
+    is_rtl: bool,
 ) {
     let full_rect = ui.max_rect();
     ui.painter()
@@ -6159,6 +6193,7 @@ pub fn draw_still_touch_first_run_help_snapshot_fixture(
             ui,
             full_rect,
             still_touch_first_run_help_shows_scaling_hint(ui_scale),
+            is_rtl,
         );
     }
 }
@@ -6248,6 +6283,7 @@ impl App {
             ui,
             full_rect,
             still_touch_first_run_help_shows_scaling_hint(self.settings.ui_scale_factor),
+            self.spread_mode.is_rtl(),
         );
     }
 
@@ -31399,6 +31435,56 @@ mod tests {
             assert_eq!(
                 crate::touch_input::classify_tap(&geometry, point),
                 crate::touch_input::TapZone::Center
+            );
+        }
+    }
+
+    #[test]
+    fn first_run_touch_help_page_labels_follow_reading_direction() {
+        assert_eq!(
+            still_touch_page_labels(false),
+            StillTouchPageLabels {
+                left: "前のページ",
+                right: "次のページ",
+            }
+        );
+        assert_eq!(
+            still_touch_page_labels(true),
+            StillTouchPageLabels {
+                left: "次のページ",
+                right: "前のページ",
+            }
+        );
+    }
+
+    #[test]
+    fn still_touch_help_side_labels_stay_clear_of_the_centre_rectangle() {
+        for width in [480.0_f32, 800.0, 1200.0, 3840.0] {
+            let viewport =
+                egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(width, 800.0));
+            let layout = still_touch_first_run_help_layout(viewport);
+
+            assert!(
+                layout.left_label_x < layout.center_tap_rect.min.x,
+                "left label at {} runs into the centre rect starting at {} (width {width})",
+                layout.left_label_x,
+                layout.center_tap_rect.min.x,
+            );
+            assert!(
+                layout.right_label_x > layout.center_tap_rect.max.x,
+                "right label at {} runs into the centre rect ending at {} (width {width})",
+                layout.right_label_x,
+                layout.center_tap_rect.max.x,
+            );
+            let left_room = layout.left_label_x - viewport.min.x;
+            let right_room = viewport.max.x - layout.right_label_x;
+            assert!(
+                (left_room - (layout.center_tap_rect.min.x - layout.left_label_x)).abs() < 0.01,
+                "left label is not centred in its strip (width {width})",
+            );
+            assert!(
+                (right_room - (layout.right_label_x - layout.center_tap_rect.max.x)).abs() < 0.01,
+                "right label is not centred in its strip (width {width})",
             );
         }
     }

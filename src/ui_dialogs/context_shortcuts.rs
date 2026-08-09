@@ -54,14 +54,37 @@ const FS_IMAGE_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     },
 ];
 
-const FS_IMAGE_TOUCH_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
+const FS_IMAGE_TOUCH_SHORTCUT_ROWS_LTR: &[FixedShortcutRow] = &[
     FixedShortcutRow {
         keys: "中央をタップ",
         description: "上部バー、下部シークバー、左右のパネルハンドルを表示 / 非表示にする",
     },
     FixedShortcutRow {
-        keys: "左右をタップ",
-        description: "前または次のページへ移動する",
+        keys: "左をタップ",
+        description: "前のページへ移動する",
+    },
+    FixedShortcutRow {
+        keys: "右をタップ",
+        description: "次のページへ移動する",
+    },
+    FixedShortcutRow {
+        keys: "2 本指でピンチ / 移動",
+        description: "画像をズーム / パンする",
+    },
+];
+
+const FS_IMAGE_TOUCH_SHORTCUT_ROWS_RTL: &[FixedShortcutRow] = &[
+    FixedShortcutRow {
+        keys: "中央をタップ",
+        description: "上部バー、下部シークバー、左右のパネルハンドルを表示 / 非表示にする",
+    },
+    FixedShortcutRow {
+        keys: "左をタップ",
+        description: "次のページへ移動する",
+    },
+    FixedShortcutRow {
+        keys: "右をタップ",
+        description: "前のページへ移動する",
     },
     FixedShortcutRow {
         keys: "2 本指でピンチ / 移動",
@@ -314,9 +337,14 @@ impl ShortcutHelpContext {
         }
     }
 
-    fn touch_rows(self, video_touch_available: bool) -> &'static [FixedShortcutRow] {
+    fn touch_rows(
+        self,
+        still_image_rtl: bool,
+        video_touch_available: bool,
+    ) -> &'static [FixedShortcutRow] {
         match self {
-            Self::FsImage => FS_IMAGE_TOUCH_SHORTCUT_ROWS,
+            Self::FsImage if still_image_rtl => FS_IMAGE_TOUCH_SHORTCUT_ROWS_RTL,
+            Self::FsImage => FS_IMAGE_TOUCH_SHORTCUT_ROWS_LTR,
             Self::FsVideo if video_touch_available => FS_VIDEO_TOUCH_SHORTCUT_ROWS,
             Self::Grid
             | Self::FsVideo
@@ -403,7 +431,11 @@ impl App {
                             &self.keymap,
                             help_context.supplemental_action_rows(),
                         );
-                        draw_touch_rows(ui, help_context.touch_rows(video_touch_available));
+                        draw_touch_rows(
+                            ui,
+                            help_context
+                                .touch_rows(self.spread_mode.is_rtl(), video_touch_available),
+                        );
                         draw_fixed_rows(ui, &self.keymap, help_context.fixed_rows());
                     });
 
@@ -608,16 +640,43 @@ mod tests {
     }
 
     #[test]
-    fn touch_help_rows_cover_still_image_and_video_without_music() {
-        let rows = ShortcutHelpContext::FsImage.touch_rows(false);
-        assert_eq!(rows.len(), 3);
-        assert!(rows.iter().any(|row| row.keys == "中央をタップ"));
-        assert!(ShortcutHelpContext::Grid.touch_rows(false).is_empty());
-        let video_rows = ShortcutHelpContext::FsVideo.touch_rows(true);
+    fn touch_help_rows_resolve_still_image_page_sides_for_ltr_and_rtl() {
+        let ltr_rows = ShortcutHelpContext::FsImage.touch_rows(false, false);
+        assert_eq!(ltr_rows.len(), 4);
+        assert!(ltr_rows.iter().any(|row| row.keys == "中央をタップ"));
+        assert!(ltr_rows.iter().any(|row| {
+            row.keys == "左をタップ" && row.description == "前のページへ移動する"
+        }));
+        assert!(ltr_rows.iter().any(|row| {
+            row.keys == "右をタップ" && row.description == "次のページへ移動する"
+        }));
+
+        let rtl_rows = ShortcutHelpContext::FsImage.touch_rows(true, false);
+        assert_eq!(rtl_rows.len(), 4);
+        assert!(rtl_rows.iter().any(|row| {
+            row.keys == "左をタップ" && row.description == "次のページへ移動する"
+        }));
+        assert!(rtl_rows.iter().any(|row| {
+            row.keys == "右をタップ" && row.description == "前のページへ移動する"
+        }));
+    }
+
+    #[test]
+    fn touch_help_rows_cover_video_without_music() {
+        assert!(
+            ShortcutHelpContext::Grid
+                .touch_rows(false, false)
+                .is_empty()
+        );
+        let video_rows = ShortcutHelpContext::FsVideo.touch_rows(false, true);
         assert_eq!(video_rows.len(), 3);
         assert!(video_rows.iter().any(|row| row.keys == "中央をタップ"));
         assert!(video_rows.iter().any(|row| row.keys == "左をタップ"));
         assert!(video_rows.iter().any(|row| row.keys == "右をタップ"));
-        assert!(ShortcutHelpContext::FsVideo.touch_rows(false).is_empty());
+        assert!(
+            ShortcutHelpContext::FsVideo
+                .touch_rows(false, false)
+                .is_empty()
+        );
     }
 }

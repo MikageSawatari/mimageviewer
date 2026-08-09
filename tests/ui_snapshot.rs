@@ -241,7 +241,18 @@ fn still_touch_first_run_help_unlearned_100_dark() {
         "still_touch_first_run_help_unlearned_100_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
         |ui| {
-            mimageviewer::draw_still_touch_first_run_help_snapshot_fixture(ui, false, 1.0);
+            mimageviewer::draw_still_touch_first_run_help_snapshot_fixture(ui, false, 1.0, false);
+        },
+    );
+}
+
+#[test]
+fn still_touch_first_run_help_unlearned_100_rtl_dark() {
+    snapshot_with_theme(
+        "still_touch_first_run_help_unlearned_100_rtl_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            mimageviewer::draw_still_touch_first_run_help_snapshot_fixture(ui, false, 1.0, true);
         },
     );
 }
@@ -252,7 +263,7 @@ fn still_touch_first_run_help_learned_hidden_dark() {
         "still_touch_first_run_help_learned_hidden_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
         |ui| {
-            mimageviewer::draw_still_touch_first_run_help_snapshot_fixture(ui, true, 1.0);
+            mimageviewer::draw_still_touch_first_run_help_snapshot_fixture(ui, true, 1.0, false);
         },
     );
 }
