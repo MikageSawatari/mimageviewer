@@ -60,6 +60,9 @@ globalThis.document = {
   createElement(tag) {
     return new FakeElement(tag);
   },
+  createElementNS(_namespace, tag) {
+    return new FakeElement(tag);
+  },
 };
 let reloadCalls = 0;
 const testLocation = {
@@ -155,6 +158,7 @@ const {
   tagItemsHash,
   tagItemsResultTitle,
   thumbnailAddressForEntry,
+  thumbnailRequestQueryForEntry,
   unsupportedRemoteEntryMessage,
   videoFileTargetIndex,
   viewTrimSpreadControlKeys,
@@ -444,6 +448,18 @@ test("a folder-list video uses its absorbed sidecar as the thumbnail source", ()
     sidecar
   );
   assert.equal(thumbnailAddressForEntry({ address: video }), video);
+  assert.deepEqual(
+    thumbnailRequestQueryForEntry(
+      { address: video, thumbnail_address: sidecar },
+      { w: 256, epoch: 7 }
+    ),
+    {
+      path: video.path,
+      w: 256,
+      epoch: 7,
+      thumbnail_source_path: sidecar.path,
+    }
+  );
 });
 
 test("grid return identity matches collection and addressed forms of the same item", () => {
@@ -1159,6 +1175,11 @@ test("tapping an audio grid tile opens the shared media viewer route", () => {
     180,
     (requested, meta) => dispatched.push({ requested, meta })
   );
+
+  const preview = tile.children[0];
+  assert.equal(preview.children.some((child) => child.tagName === "SVG"), true);
+  assert.equal(preview.children.some((child) => child.tagName === "IMG"), false);
+  assert.equal(tile._thumbnailBinding, undefined);
 
   tile.dispatchEvent({ type: "click", detail: 1, pointerType: "touch" });
 

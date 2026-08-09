@@ -26,6 +26,8 @@ pub struct VideoThumbDiag {
 }
 
 impl VideoThumbDiag {
+    const WTS_E_FAILEDEXTRACTION: i32 = 0x8004_B200u32 as i32;
+
     pub fn stage_label(&self) -> &'static str {
         match self.fail_stage {
             None => "ok",
@@ -41,8 +43,20 @@ impl VideoThumbDiag {
     pub fn hresult_hex(&self) -> String {
         format!("0x{:08x}", self.hresult as u32)
     }
+
+    /// Whether a later Shell call may succeed after Windows finishes extracting.
+    ///
+    /// Failures before/after GetImage are local setup/bitmap failures. Shell's
+    /// explicit WTS_E_FAILEDEXTRACTION is also permanent; other GetImage
+    /// failures include timeout/surrogate-not-ready states and receive the web
+    /// client's bounded retry budget.
+    pub fn extraction_may_be_pending(&self) -> bool {
+        self.fail_stage == Some(VideoThumbFailStage::GetImage)
+            && self.hresult != Self::WTS_E_FAILEDEXTRACTION
+    }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VideoThumbFailStage {
     CreateItem,
     Cast,
@@ -50,6 +64,41 @@ pub enum VideoThumbFailStage {
     GetObject,
     GetDibits,
     InvalidBitmap,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed_get_image(hresult: i32) -> VideoThumbDiag {
+        VideoThumbDiag {
+            hresult,
+            get_image_ms: 0,
+            dims: None,
+            avg_rgb: None,
+            span_rgb: None,
+            fail_stage: Some(VideoThumbFailStage::GetImage),
+        }
+    }
+
+    #[test]
+    fn shell_extraction_timeout_can_be_retried_by_the_caller() {
+        let diag = failed_get_image(0x8004_B201u32 as i32);
+        assert!(diag.extraction_may_be_pending());
+    }
+
+    #[test]
+    fn shell_failed_extraction_is_permanent() {
+        let diag = failed_get_image(0x8004_B200u32 as i32);
+        assert!(!diag.extraction_may_be_pending());
+    }
+
+    #[test]
+    fn shell_setup_failure_is_permanent() {
+        let mut diag = failed_get_image(0);
+        diag.fail_stage = Some(VideoThumbFailStage::CreateItem);
+        assert!(!diag.extraction_may_be_pending());
+    }
 }
 
 /// 動画ファイルから Windows Shell API でサムネイルを取得する。

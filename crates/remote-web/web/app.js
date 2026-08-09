@@ -4197,8 +4197,12 @@ export function createGridTile(
       );
     });
   } else {
-    preview.append(textElement("span", "◇", "file-glyph"));
-    preview.append(image);
+    if (entry.kind === "audio") {
+      preview.append(createAudioThumbnailIcon());
+    } else {
+      preview.append(textElement("span", "◇", "file-glyph"));
+      preview.append(image);
+    }
     if (entry.kind !== "image") {
       preview.append(textElement("span", entryTypeLabel(entry.kind), "type-badge"));
     }
@@ -4282,8 +4286,44 @@ export function createGridTile(
   }
   if (detail) label.title = entry.name + " — " + detail;
   tile.append(preview, label);
-  tile._thumbnailBinding = { image, entry, tracker: thumbnailTracker, cellWidth };
+  // Audio has no thumbnail source. Keeping it out of the binding also keeps the
+  // virtual grid from issuing a guaranteed-to-fail /api/thumb request.
+  if (entry.kind !== "audio") {
+    tile._thumbnailBinding = { image, entry, tracker: thumbnailTracker, cellWidth };
+  }
   return tile;
+}
+
+function createAudioThumbnailIcon() {
+  const namespace = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(namespace, "svg");
+  svg.setAttribute("class", "audio-thumbnail-icon");
+  svg.setAttribute("viewBox", "0 0 64 64");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "音声");
+
+  const beam = document.createElementNS(namespace, "path");
+  beam.setAttribute("d", "M22 17 H46 M22 17 V45 M46 17 V45");
+  beam.setAttribute("fill", "none");
+  beam.setAttribute("stroke", "currentColor");
+  beam.setAttribute("stroke-width", "5");
+  beam.setAttribute("stroke-linecap", "round");
+  beam.setAttribute("stroke-linejoin", "round");
+
+  const leftHead = document.createElementNS(namespace, "circle");
+  leftHead.setAttribute("cx", "16");
+  leftHead.setAttribute("cy", "46");
+  leftHead.setAttribute("r", "8");
+  leftHead.setAttribute("fill", "currentColor");
+
+  const rightHead = document.createElementNS(namespace, "circle");
+  rightHead.setAttribute("cx", "40");
+  rightHead.setAttribute("cy", "46");
+  rightHead.setAttribute("r", "8");
+  rightHead.setAttribute("fill", "currentColor");
+
+  svg.append(beam, leftHead, rightHead);
+  return svg;
 }
 
 function entryPath(entry) {
@@ -4329,6 +4369,16 @@ function addressQueryParams(address, extra = {}) {
   if (target.kind === "zip_entry") params.entry = target.entry_name;
   else if (target.kind === "zip_directory") params.prefix = target.prefix;
   else if (target.kind === "pdf_page") params.page = target.page_number;
+  return params;
+}
+
+export function thumbnailRequestQueryForEntry(entry, extra = {}) {
+  const address = entryAddress(entry);
+  const source = thumbnailAddressForEntry(entry);
+  const params = addressQueryParams(address, extra);
+  if (addressIdentity(source) !== addressIdentity(address)) {
+    params.thumbnail_source_path = source.path;
+  }
   return params;
 }
 
@@ -5191,7 +5241,7 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
   const bindingKey = thumbnailBindingKey(entry);
   const url = apiUrl(
     "/api/thumb",
-    addressQueryParams(thumbnailAddressForEntry(entry), {
+    thumbnailRequestQueryForEntry(entry, {
       w: targetPx,
       epoch: state.remoteSessionCacheEpoch,
     })

@@ -886,6 +886,13 @@ select {
   color: #768195;
 }
 
+.audio-thumbnail-icon {
+  width: clamp(3.5rem, 16vw, 6rem);
+  height: clamp(3.5rem, 16vw, 6rem);
+  color: #96b6de;
+  filter: drop-shadow(0 5px 12px rgb(0 0 0 / 28%));
+}
+
 .tile-label {
   position: relative;
   z-index: 1;

@@ -1017,17 +1017,14 @@ impl ContainerEngine {
             &resolved.logical,
             &listing.items,
         );
+        let thumbnail_sources =
+            super::RemoteThumbnailSources::from_pairs(&listing.video_thumb_overrides);
         let entries = listing
             .items
             .iter()
             .zip(&listing.metas)
             .filter_map(|(item, meta)| {
-                self.folder_list_entry(
-                    &request.address,
-                    item,
-                    *meta,
-                    &listing.video_thumb_overrides,
-                )
+                self.folder_list_entry(&request.address, item, *meta, &thumbnail_sources)
             })
             .collect::<Vec<_>>();
         let response = FolderListResponse::Success(FolderListPayload {
@@ -1715,7 +1712,7 @@ impl ContainerEngine {
         _container: &RemoteAddress,
         item: &crate::grid_item::GridItem,
         meta: Option<(i64, i64)>,
-        video_thumb_overrides: &[(std::path::PathBuf, std::path::PathBuf)],
+        thumbnail_sources: &super::RemoteThumbnailSources,
     ) -> Option<FolderListEntry> {
         let (path, kind) = match item {
             crate::grid_item::GridItem::Folder(path) => (path, RemoteEntryKind::Folder),
@@ -1736,16 +1733,9 @@ impl ContainerEngine {
             ))
         };
         let address = address_for(path)?;
-        let thumbnail_address = if kind == RemoteEntryKind::Video {
-            video_thumb_overrides
-                .iter()
-                .rev()
-                .find(|(video, _)| crate::path_key::eq_keep_drive(video, path))
-                .and_then(|(_, image)| address_for(image))
-                .unwrap_or_else(|| address.clone())
-        } else {
-            address.clone()
-        };
+        let thumbnail_address = thumbnail_sources
+            .source_address(path, kind)
+            .unwrap_or_else(|| address.clone());
         let (mtime, size) = meta.unwrap_or((0, 0));
         Some(FolderListEntry {
             address,

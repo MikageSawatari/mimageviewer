@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 39;
+pub const PROTOCOL_VERSION: u32 = 40;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -150,7 +150,11 @@ fn looks_absolute_or_drive_qualified(value: &str) -> bool {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ThumbnailRequest {
+    /// Identity of the item whose thumbnail is requested.
     pub address: RemoteAddress,
+    /// Optional image source selected for the item (for example a video sidecar).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_address: Option<RemoteAddress>,
     pub target_px: u32,
 }
 
@@ -1018,6 +1022,9 @@ pub enum RemoteEntryKind {
 pub struct RemoteEntry {
     /// 対象の絶対パス。
     pub path: String,
+    /// Optional thumbnail source. Videos may point at a same-stem sidecar image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_address: Option<RemoteAddress>,
     pub name: String,
     pub kind: RemoteEntryKind,
     pub detail: Option<String>,
@@ -2035,6 +2042,7 @@ pub enum ThumbnailErrorCode {
     PathRejected,
     NotFound,
     Unsupported,
+    NotReady,
     GenerationFailed,
     Busy,
     PasswordRequired,
@@ -2225,6 +2233,7 @@ mod tests {
             owner: test_owner("test-client"),
             request: ThumbnailRequest {
                 address: RemoteAddress::file("C:/Pictures/album/page.jpg"),
+                source_address: Some(RemoteAddress::file("C:/Pictures/album/page-sidecar.jpg")),
                 target_px: 384,
             },
         };
@@ -2324,8 +2333,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v39_audio_only_stream_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 39);
+    fn protocol_v40_remote_video_thumbnail_shape_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 40);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -2773,6 +2782,7 @@ mod tests {
                 truncated: false,
                 entries: vec![RemoteEntry {
                     path: "C:/Books/volume-1".to_owned(),
+                    thumbnail_address: None,
                     name: "volume-1".to_owned(),
                     kind: RemoteEntryKind::Folder,
                     detail: Some("3 / 20 ページ".to_owned()),
@@ -2959,6 +2969,7 @@ mod tests {
             PlaceSummary::Folder {
                 entry: RemoteEntry {
                     path: "C:/Users/test/Pictures".to_owned(),
+                    thumbnail_address: None,
                     name: "ピクチャ".to_owned(),
                     kind: RemoteEntryKind::Folder,
                     detail: None,

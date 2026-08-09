@@ -2718,6 +2718,15 @@ fn api_thumb(
     if let Err(error) = state.library.validate_remote_address(&address) {
         return store_error_response(error);
     }
+    let source_address = match thumbnail_source_from_query(query) {
+        Ok(source) => source,
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
+    if let Some(source) = source_address.as_ref()
+        && let Err(error) = state.library.validate_remote_address(source)
+    {
+        return store_error_response(error);
+    }
     let target_px = match requested_width(query) {
         Ok(width) => width,
         Err(()) => return HttpResponse::text(400, "Bad Request"),
@@ -2725,9 +2734,12 @@ fn api_thumb(
     let source_kind = remote_source_kind(&address);
     let started = Instant::now();
     let result = match state.ipc_admission.run(IpcClass::Heavy, || {
-        state
-            .thumbnail_client
-            .thumbnail_address(owner, address.clone(), target_px)
+        state.thumbnail_client.thumbnail_address(
+            owner,
+            address.clone(),
+            source_address.clone(),
+            target_px,
+        )
     }) {
         Ok(result) => result,
         Err(busy) => {
@@ -3228,13 +3240,19 @@ fn ipc_error_response(
                 | ThumbnailErrorCode::PathRejected
                 | ThumbnailErrorCode::NotFound => 404,
                 ThumbnailErrorCode::Unsupported => 415,
+                ThumbnailErrorCode::NotReady => 503,
                 ThumbnailErrorCode::Busy => 503,
                 ThumbnailErrorCode::GenerationFailed => 422,
                 ThumbnailErrorCode::PasswordRequired => 423,
                 ThumbnailErrorCode::PageOutOfRange => 416,
                 ThumbnailErrorCode::Internal => 500,
             };
-            (status, "miv_thumbnail_error", remote.message)
+            let code = if remote.code == ThumbnailErrorCode::NotReady {
+                "thumbnail_not_ready"
+            } else {
+                "miv_thumbnail_error"
+            };
+            (status, code, remote.message)
         }
         IpcClientError::CollectionRemote(remote) => (500, "miv_thumbnail_error", remote.message),
         IpcClientError::MediaRemote(remote) => (500, "miv_thumbnail_error", remote.message),
@@ -3506,6 +3524,15 @@ fn remote_address_from_query(query: &[(String, String)]) -> Result<RemoteAddress
     };
     address.validate_syntax().map_err(|_| ())?;
     Ok(address)
+}
+
+fn thumbnail_source_from_query(query: &[(String, String)]) -> Result<Option<RemoteAddress>, ()> {
+    let Some(path) = query_value(query, "thumbnail_source_path")? else {
+        return Ok(None);
+    };
+    let address = RemoteAddress::file(path.to_owned());
+    address.validate_syntax().map_err(|_| ())?;
+    Ok(Some(address))
 }
 
 fn requested_width(query: &[(String, String)]) -> Result<u32, ()> {
@@ -3893,6 +3920,22 @@ mod tests {
     fn duplicate_security_parameters_are_rejected() {
         let query = parse_query("path=C%3A%2Fa&path=C%3A%2Fb").unwrap();
         assert!(query_value(&query, "path").is_err());
+    }
+
+    #[test]
+    fn thumbnail_sidecar_query_is_an_optional_file_address() {
+        let query = parse_query(
+            "path=C%3A%2FMovies%2Fclip.mp4&thumbnail_source_path=C%3A%2FMovies%2Fclip.jpg",
+        )
+        .unwrap();
+        assert_eq!(
+            thumbnail_source_from_query(&query).unwrap(),
+            Some(RemoteAddress::file("C:/Movies/clip.jpg"))
+        );
+        let duplicate =
+            parse_query("thumbnail_source_path=C%3A%2Fa.jpg&thumbnail_source_path=C%3A%2Fb.jpg")
+                .unwrap();
+        assert!(thumbnail_source_from_query(&duplicate).is_err());
     }
 
     #[test]
@@ -4822,6 +4865,29 @@ mod tests {
         assert_eq!(details["thumb"]["ipc_stage"], "connect");
         assert_eq!(details["thumb"]["ipc_error_kind"], "not_found");
         assert_eq!(details["thumb"]["target_px"], 256);
+    }
+
+    #[test]
+    fn pending_shell_thumbnail_maps_to_bounded_web_retry_response() {
+        let response = ipc_error_response(
+            IpcClientError::Remote(mimageviewer_ipc::ThumbnailError::new(
+                mimageviewer_ipc::ThumbnailErrorCode::NotReady,
+                "Windows が動画サムネイルを抽出中です",
+            )),
+            0,
+            Vec::new(),
+            Duration::from_millis(20),
+            256,
+            "video",
+        );
+
+        assert_eq!(response.status, 503);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"], "thumbnail_not_ready");
+        assert_eq!(
+            response.log_details.unwrap()["thumb"]["ipc_status"],
+            "miv_not_ready"
+        );
     }
 
     #[test]

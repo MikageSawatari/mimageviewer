@@ -166,6 +166,7 @@ impl ClientError {
                 ThumbnailErrorCode::PathRejected => "miv_path_rejected",
                 ThumbnailErrorCode::NotFound => "miv_not_found",
                 ThumbnailErrorCode::Unsupported => "miv_unsupported",
+                ThumbnailErrorCode::NotReady => "miv_not_ready",
                 ThumbnailErrorCode::GenerationFailed => "miv_generation_failed",
                 ThumbnailErrorCode::Busy => "miv_busy",
                 ThumbnailErrorCode::PasswordRequired => "miv_password_required",
@@ -397,9 +398,14 @@ impl ThumbnailClient {
         &self,
         owner: &RemoteSessionIdentity,
         address: RemoteAddress,
+        source_address: Option<RemoteAddress>,
         target_px: u32,
     ) -> Result<ThumbnailSuccess, ClientFailure> {
-        let request = ThumbnailRequest { address, target_px };
+        let request = ThumbnailRequest {
+            address,
+            source_address,
+            target_px,
+        };
         run_with_retry(|| {
             let connection = self.get_connection()?;
             let connection_id = connection.id;
@@ -1944,6 +1950,16 @@ mod tests {
     }
 
     #[test]
+    fn thumbnail_not_ready_is_not_retried_inside_the_heavy_ipc_call() {
+        let error = ClientError::Remote(ThumbnailError::new(
+            ThumbnailErrorCode::NotReady,
+            "extracting",
+        ));
+        assert!(!error.should_retry_internally());
+        assert_eq!(error.ipc_status(), "miv_not_ready");
+    }
+
+    #[test]
     fn maintainer_connects_after_server_start_and_reannounces_after_disconnect() {
         #[derive(Clone, Copy)]
         struct FakeConnection {
@@ -2348,14 +2364,24 @@ mod tests {
         let first_client = Arc::clone(&client);
         let first = std::thread::spawn(move || {
             first_client
-                .thumbnail_address(&test_owner(), RemoteAddress::file("C:/Pictures/a.jpg"), 128)
+                .thumbnail_address(
+                    &test_owner(),
+                    RemoteAddress::file("C:/Pictures/a.jpg"),
+                    None,
+                    128,
+                )
                 .map(|result| result.bytes)
                 .map_err(|failure| failure.error.to_string())
         });
         let second_client = Arc::clone(&client);
         let second = std::thread::spawn(move || {
             second_client
-                .thumbnail_address(&test_owner(), RemoteAddress::file("C:/Pictures/b.jpg"), 128)
+                .thumbnail_address(
+                    &test_owner(),
+                    RemoteAddress::file("C:/Pictures/b.jpg"),
+                    None,
+                    128,
+                )
                 .map(|result| result.bytes)
                 .map_err(|failure| failure.error.to_string())
         });

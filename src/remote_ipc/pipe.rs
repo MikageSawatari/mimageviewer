@@ -2760,6 +2760,7 @@ mod tests {
             owner: test_owner(),
             request: mimageviewer_ipc::ThumbnailRequest {
                 address: mimageviewer_ipc::RemoteAddress::file("C:/Pictures/page.jpg"),
+                source_address: None,
                 target_px: 256,
             },
         };
@@ -2807,6 +2808,7 @@ mod tests {
             owner: test_owner(),
             request: mimageviewer_ipc::ThumbnailRequest {
                 address: mimageviewer_ipc::RemoteAddress::file("C:/Pictures/page.jpg"),
+                source_address: None,
                 target_px: 256,
             },
         };

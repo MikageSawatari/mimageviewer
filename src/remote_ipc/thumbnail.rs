@@ -20,6 +20,7 @@ pub(super) struct ThumbnailEngine {
 
 pub(super) struct WorkerContext {
     pub(super) folder_pin_db: Option<crate::folder_thumb_pins::FolderThumbPinDb>,
+    video_pin_db: Option<crate::video_pins::VideoPinDb>,
     rotation_db: Option<crate::rotation_db::RotationDb>,
     pub(super) adjustment_db: Option<crate::adjustment_db::AdjustmentDb>,
     pub(super) mask_db: Option<crate::mask_db::MaskDb>,
@@ -33,6 +34,7 @@ impl WorkerContext {
     pub(super) fn open() -> Self {
         Self {
             folder_pin_db: crate::folder_thumb_pins::FolderThumbPinDb::open().ok(),
+            video_pin_db: crate::video_pins::VideoPinDb::open().ok(),
             rotation_db: crate::rotation_db::RotationDb::open().ok(),
             adjustment_db: crate::adjustment_db::AdjustmentDb::open().ok(),
             mask_db: crate::mask_db::MaskDb::open_readonly().ok(),
@@ -56,18 +58,22 @@ impl WorkerContext {
 #[derive(Clone, Eq)]
 struct RequestKey {
     address: RemoteAddress,
+    source_address: Option<RemoteAddress>,
     target_px: u32,
 }
 
 impl PartialEq for RequestKey {
     fn eq(&self, other: &Self) -> bool {
-        self.address == other.address && self.target_px == other.target_px
+        self.address == other.address
+            && self.source_address == other.source_address
+            && self.target_px == other.target_px
     }
 }
 
 impl Hash for RequestKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.address.hash(state);
+        self.source_address.hash(state);
         self.target_px.hash(state);
     }
 }
@@ -95,6 +101,7 @@ impl ThumbnailEngine {
     ) -> ThumbnailResponse {
         let key = RequestKey {
             address: request.address.clone(),
+            source_address: request.source_address.clone(),
             target_px: request.target_px,
         };
         let (flight, owner) = {
@@ -173,13 +180,37 @@ impl ThumbnailEngine {
             Ok(path) => path,
             Err(error) => return resolve_error_response(error),
         };
-        match self.generate_resolved(&resolved, request.target_px, context) {
+        match self.generate_resolved(
+            &resolved,
+            request.source_address.as_ref(),
+            request.target_px,
+            context,
+        ) {
             Ok(webp_bytes) => ThumbnailResponse::Success { webp_bytes },
             Err(error) => error,
         }
     }
 
     fn generate_resolved(
+        &self,
+        resolved: &ResolvedPath,
+        source_address: Option<&RemoteAddress>,
+        target_px: u32,
+        context: &WorkerContext,
+    ) -> Result<Vec<u8>, ThumbnailResponse> {
+        if is_supported_video(&resolved.canonical) {
+            return self.generate_video_resolved(resolved, source_address, target_px, context);
+        }
+        if source_address.is_some() {
+            return Err(error_response(
+                ThumbnailErrorCode::BadRequest,
+                "サムネイル出所は動画にだけ指定できます",
+            ));
+        }
+        self.generate_catalog_resolved(resolved, target_px, context)
+    }
+
+    fn generate_catalog_resolved(
         &self,
         resolved: &ResolvedPath,
         target_px: u32,
@@ -345,6 +376,137 @@ impl ThumbnailEngine {
             )
         })
     }
+
+    fn generate_video_resolved(
+        &self,
+        resolved: &ResolvedPath,
+        source_address: Option<&RemoteAddress>,
+        target_px: u32,
+        context: &WorkerContext,
+    ) -> Result<Vec<u8>, ThumbnailResponse> {
+        let metadata = std::fs::metadata(&resolved.canonical)
+            .map_err(|_| error_response(ThumbnailErrorCode::NotFound, "対象が見つかりません"))?;
+        if !metadata.is_file() {
+            return Err(error_response(
+                ThumbnailErrorCode::Unsupported,
+                "動画ファイルではありません",
+            ));
+        }
+
+        // Keep the desktop priority chain: user pin, selected sidecar, then Shell.
+        // Pin/Shell results deliberately bypass CatalogDb; video cache ownership
+        // remains with video_pins.db, Windows thumbcache, and HTTP's 60-second cache.
+        if let Some(pin) = context
+            .video_pin_db
+            .as_ref()
+            .and_then(|database| database.lookup(&resolved.logical))
+            && !pin.thumb_webp.is_empty()
+        {
+            if crate::catalog::decode_thumb_to_color_image(&pin.thumb_webp).is_some() {
+                return Ok(pin.thumb_webp);
+            }
+            crate::logger::log(format!(
+                "remote_ipc: invalid video pin WebP path={}",
+                resolved.logical.display()
+            ));
+        }
+
+        if let Some(source_address) = source_address
+            && let Some(sidecar) = self.resolve_video_sidecar(resolved, source_address)?
+        {
+            return self.generate_catalog_resolved(&sidecar, target_px, context);
+        }
+
+        let effective_target = target_px.min(self.settings.thumb_px.max(1));
+        let (image, diag) =
+            crate::video_thumb::get_video_thumbnail(&resolved.logical, effective_target as i32);
+        let Some(image) = image else {
+            crate::logger::log(format!(
+                "remote_ipc: video shell FAIL path={} stage={} hr={} get_ms={}",
+                resolved.logical.display(),
+                diag.stage_label(),
+                diag.hresult_hex(),
+                diag.get_image_ms,
+            ));
+            return Err(if diag.extraction_may_be_pending() {
+                error_response(
+                    ThumbnailErrorCode::NotReady,
+                    "Windows が動画サムネイルを抽出中です",
+                )
+            } else {
+                error_response(
+                    ThumbnailErrorCode::GenerationFailed,
+                    "Windows Shell が動画サムネイルを生成できませんでした",
+                )
+            });
+        };
+        let image = color_image_to_dynamic(&image).ok_or_else(|| {
+            error_response(
+                ThumbnailErrorCode::GenerationFailed,
+                "動画サムネイルを WebP へ変換できませんでした",
+            )
+        })?;
+        crate::catalog::encode_thumb_webp(
+            &image,
+            effective_target,
+            self.settings.thumb_quality as f32,
+        )
+        .map(|(bytes, _, _)| bytes)
+        .ok_or_else(|| {
+            error_response(
+                ThumbnailErrorCode::GenerationFailed,
+                "WebP エンコードに失敗しました",
+            )
+        })
+    }
+
+    fn resolve_video_sidecar(
+        &self,
+        video: &ResolvedPath,
+        source_address: &RemoteAddress,
+    ) -> Result<Option<ResolvedPath>, ThumbnailResponse> {
+        if !self.settings.skip_image_if_video_exists || !self.settings.video_thumb_use_sidecar_image
+        {
+            return Ok(None);
+        }
+        source_address.validate_syntax().map_err(|_| {
+            error_response(
+                ThumbnailErrorCode::BadRequest,
+                "サムネイル出所のアドレスが不正です",
+            )
+        })?;
+        if !matches!(source_address.subresource, RemoteSubresource::File) {
+            return Err(error_response(
+                ThumbnailErrorCode::BadRequest,
+                "動画 sidecar は実ファイルでなければなりません",
+            ));
+        }
+        if crate::path_key::normalize_keep_drive(Path::new(&source_address.path))
+            == crate::path_key::normalize_keep_drive(&video.logical)
+        {
+            return Ok(None);
+        }
+
+        let sidecar = resolve_existing(&source_address.path).map_err(resolve_error_response)?;
+        let same_parent = sidecar
+            .canonical
+            .parent()
+            .zip(video.canonical.parent())
+            .is_some_and(|(left, right)| {
+                crate::path_key::normalize_keep_drive(left)
+                    == crate::path_key::normalize_keep_drive(right)
+            });
+        let same_stem = file_stem_lower(&sidecar.canonical)
+            .zip(file_stem_lower(&video.canonical))
+            .is_some_and(|(left, right)| left == right);
+        if !same_parent || !same_stem || !is_supported_image(&sidecar.canonical) {
+            return Err(error_response(
+                ThumbnailErrorCode::PathRejected,
+                "動画と同じフォルダ・stem の sidecar だけを使用できます",
+            ));
+        }
+        Ok(Some(sidecar))
+    }
 }
 
 fn apply_supported_folder_pin(
@@ -404,6 +566,20 @@ fn is_supported_image(path: &Path) -> bool {
         })
 }
 
+fn is_supported_video(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            let extension = extension.to_ascii_lowercase();
+            crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&extension.as_str())
+        })
+}
+
+fn file_stem_lower(path: &Path) -> Option<String> {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().to_lowercase())
+}
+
 fn is_container_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -432,10 +608,27 @@ fn error_response(code: ThumbnailErrorCode, message: impl Into<String>) -> Thumb
 mod tests {
     use super::*;
 
+    fn worker_context_with_video_pin(
+        video_pin_db: Option<crate::video_pins::VideoPinDb>,
+    ) -> WorkerContext {
+        WorkerContext {
+            folder_pin_db: None,
+            video_pin_db,
+            rotation_db: None,
+            adjustment_db: None,
+            mask_db: None,
+            local_adjust_db: None,
+            conceal_db: None,
+            comic_db: None,
+            crop_db: None,
+        }
+    }
+
     #[test]
     fn identical_requests_share_one_flight() {
         let key = RequestKey {
             address: RemoteAddress::file("C:/Pictures/b.jpg"),
+            source_address: None,
             target_px: 128,
         };
         let mut map = HashMap::new();
@@ -445,5 +638,69 @@ mod tests {
         });
         map.insert(key.clone(), Arc::clone(&flight));
         assert!(Arc::ptr_eq(map.get(&key).unwrap(), &flight));
+    }
+
+    #[test]
+    fn video_pin_precedes_sidecar_and_shell() {
+        let temp = tempfile::tempdir().unwrap();
+        let video = temp.path().join("clip.mp4");
+        let sidecar = temp.path().join("clip.jpg");
+        std::fs::write(&video, b"not a real video").unwrap();
+        std::fs::write(&sidecar, b"not a real image").unwrap();
+        let pin_image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([240, 20, 30, 255]),
+        ));
+        let pin_webp = crate::catalog::encode_thumb_webp(&pin_image, 8, 80.0)
+            .unwrap()
+            .0;
+        let pin_db =
+            crate::video_pins::VideoPinDb::open_at(&temp.path().join("video_pins.db")).unwrap();
+        pin_db.set_pin(&video, 2.0, &pin_webp).unwrap();
+        let context = worker_context_with_video_pin(Some(pin_db));
+        let engine = ThumbnailEngine::new(crate::settings::Settings::default());
+        let resolved = resolve_existing(video.to_string_lossy().as_ref()).unwrap();
+
+        let result = engine
+            .generate_video_resolved(
+                &resolved,
+                Some(&RemoteAddress::file(sidecar.to_string_lossy().into_owned())),
+                128,
+                &context,
+            )
+            .unwrap();
+
+        assert_eq!(result, pin_webp);
+    }
+
+    #[test]
+    fn video_sidecar_must_share_parent_and_stem() {
+        let temp = tempfile::tempdir().unwrap();
+        let video_dir = temp.path().join("videos");
+        let image_dir = temp.path().join("images");
+        std::fs::create_dir_all(&video_dir).unwrap();
+        std::fs::create_dir_all(&image_dir).unwrap();
+        let video = video_dir.join("clip.mp4");
+        let sidecar = image_dir.join("clip.jpg");
+        std::fs::write(&video, b"video").unwrap();
+        std::fs::write(&sidecar, b"image").unwrap();
+        let engine = ThumbnailEngine::new(crate::settings::Settings::default());
+        let resolved = resolve_existing(video.to_string_lossy().as_ref()).unwrap();
+
+        let error = engine
+            .resolve_video_sidecar(
+                &resolved,
+                &RemoteAddress::file(sidecar.to_string_lossy().into_owned()),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ThumbnailResponse::Error(ThumbnailError {
+                code: ThumbnailErrorCode::PathRejected,
+                ..
+            })
+        ));
     }
 }

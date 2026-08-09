@@ -91,7 +91,7 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 
 | 対象 | 状況 |
 |---|---|
-| サムネイル | remote-web は `絶対 path + subresource + target_px` を本体へ IPC 中継する。本体が catalog 参照、既存生成経路、`CachePolicy` に従う保存を担当する (§9) |
+| サムネイル | remote-web は `絶対 path + subresource + optional source_address + target_px` を本体へ IPC 中継する。本体が catalog 参照、画像の既存生成経路、動画の pin / sidecar / Shell 優先順位を担当する (§9) |
 | 閲覧起点 | お気に入り・スマートフォルダ・場所は従来どおり入口として表示するが、アクセス境界にはしない。リモートから読める範囲は mIV 本体と同じ |
 | 補正・回転・トリム・モザイク・消しゴム・ローカル調整・コミック注釈 | `books::BookPageSource::Composited` + `BakedEditSnapshot` に**ヘッドレス合成が既にある**。入力も File / ZipEntry / PdfPage をカバー済み |
 | AI アップスケール・カラー化 | `page_requires_full_composite` から display-only として**意図的に除外**されている。ヘッドレス経路への追加は**新規作業** |
@@ -185,15 +185,15 @@ stdout は起動時 Bearer token を含むため収集せず、stderr の安全�
 |---|---|
 | `GET /api/favorites` | お気に入り一覧 (id, 表示名, 絶対 path) を JSON で返す |
 | `GET /api/list?path=<absolute>` | 本体の通常フォルダ一覧を IPC で取得する。種別・表示名・絶対 path・サイズ・mtime に加え、セルの `address` と吸収済み sidecar を含む `thumbnail_address` を返す |
-| `GET /api/thumb?path=<absolute>&w=<px>` | 画像・フォルダのサムネイルを本体へ IPC 中継し WebP で返す。本体未接続時は 503 と利用者向け理由を返す |
+| `GET /api/thumb?path=<absolute>&w=<px>[&thumbnail_source_path=<absolute>]` | 画像・フォルダ・動画のサムネイルを本体へ IPC 中継し WebP で返す。動画の sidecar 選択時も `path` は元動画を保ち、任意の source path を併送する。本体未接続時は 503 と利用者向け理由を返す |
 | `GET /api/image-info?path=<absolute>` | EXIF 回転反映後の元画像寸法を返す。クライアントの実描画幅計算に使う |
 | `GET /api/image?path=<absolute>&w=<px>` | 画像を `w` に合わせて縮小し WebP で返す。リサイズ不要・EXIF identity・ブラウザ対応形式なら元バイトを素通しする |
 | `GET /` および静的ファイル | フロントエンドを配信 |
 
 - サムネイルの catalog 参照・キー生成・生成・保存判定は本体の既存経路に集約する。remote-web は
-  catalog の内部構造を知らず、専用サムネイル DB も持たない。この段階で扱う source は通常画像と
-  フォルダ代表である。ZIP / PDF の container page は後続増分で対応済みであり、通常フォルダの動画は
-  本体で同名画像を sidecar として吸収した場合、その画像 address を `/api/thumb` へ渡す
+  catalog の内部構造を知らず、専用サムネイル DB も持たない。通常画像・フォルダ代表・sidecar は
+  既存 catalog 経路を使う。動画自身は pin → sidecar → Windows Shell の順で選び、pin / Shell 用の
+  catalog key は新設しない
 - 本体側でも絶対 path の構文・実在・canonicalize と実ファイル種別を再検証し、remote-web の検証結果を信頼しない
 - 一覧の走査と materialize は本体 `scan_directory_with_settings` →
   `materialize_local_folder_listing` だけを使い、remote-web に別の列挙を持たない
@@ -612,7 +612,7 @@ remote-web は pending 要求を id で解決し、接続断では全 pending �
 `ipc_retry_count` / `ipc_retry_statuses` / `ipc_connection_id` を残し、次回測定では
 復旧した一時エラーを含めて失敗段階を直接集計できる。
 
-`ThumbnailRequest { address, target_px }` の `address` は §12 の共通アドレス型であり、本体側で
+`ThumbnailRequest { address, source_address, target_px }` の `address` は §12 の共通アドレス型であり、本体側で
 再度、絶対 path の構文・実在・canonicalize と実ファイル種別を検証する。通常画像とフォルダ代表は `thumb_loader::process_load_request`
 (`load_one_cached`) へ渡し、catalog 参照、DCT / WIC / Susie、回転 DB、利用者のサイズ・画質、
 `CacheDecision::from_settings` による保存判断を既存経路へ揃える。同一要求の同時到着は flight を
@@ -626,6 +626,14 @@ remote-web は pending 要求を id で解決し、接続断では全 pending �
 ブラウザからのサムネイル HTTP 要求は同時 4 件に制限し、ネットワーク失敗・502・一時的な 503
 だけを 200 / 400 / 800 ms の指数 backoff で最大 3 回再試行する。404 / 422 と protocol 版不一致は
 再試行しない。上限到達時は tile に「再試行上限」を表示する。
+
+protocol v40 では動画要求の identity と sidecar source を分離した。動画 pin は `video_pins.db`
+の WebP を最優先し、sidecar は通常画像と同じ catalog 経路、sidecar が無い場合だけ Windows
+Shell を 1 回呼ぶ。Shell の GetImage が抽出待ちになり得る失敗は `NotReady` →
+HTTP 503 `thumbnail_not_ready` として Heavy 枠を解放し、上記の bounded retry に渡す。
+`WTS_E_FAILEDEXTRACTION` と GetImage 以外の段階は `GenerationFailed` → 422 として再試行しない。
+pin / Shell は catalog へ保存せず、既存の `video_pins.db` / Windows thumbcache / HTTP 60 秒 cache
+だけを使う。
 
 旧 remote-web 生成経路が記録した `representative_missing` 50 件は、IPC 移管前の
 2026-07-31 00:24–00:25 (JST) の記録であり、移管後ログには 0 件だった。移管後のフォルダ代表は
@@ -1282,8 +1290,13 @@ remote container / folder list は ContainerEngine::recompute_folder_listing と
 
 FolderListEntry は address、thumbnail_address、name、RemoteEntryKind、size、
 mtime を運ぶ。動画と同名画像が video_thumb_use_sidecar_image により吸収された場合、動画の
-address は .mp4 のまま、thumbnail_address は吸収した画像になる。Web グリッドはセルの
-open には前者、/api/thumb には後者を使い、sidecar 画像を独立 tile として表示しない。
+address は .mp4 のまま、thumbnail_address は吸収した画像になる。Web グリッドは
+`thumbnailAddressForEntry` で後者を選ぶが、/api/thumb には元 address と source path を併送する。
+sidecar 画像は独立 tile として表示しない。
+
+集約系は結果中の動画を親フォルダ単位にまとめ、一覧順で先に現れる異なる親を最大64件だけ
+1回ずつ走査して既存の同stem規則を適用する。上限外の親は `thumbnail_address` を付けず
+Shellへフォールバックし、打ち切った親数をログへ残す。走査結果の専用cacheは持たない。
 
 タイル比率は手動設定なら本体 Settings、自動設定なら本体 auto_aspect_cache.db の該当フォルダを
 core 側で read-only 参照して運ぶ。DB が無い場合は作成せず Square へ戻るため、旧 /api/list の

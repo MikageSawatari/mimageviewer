@@ -247,9 +247,11 @@ impl CollectionEngine {
         &self,
         settings: &Settings,
         sort_order: crate::settings::SortOrder,
-        entries: Vec<RemoteEntry>,
+        mut entries: Vec<RemoteEntry>,
         truncated: bool,
     ) -> CollectionPayload {
+        super::RemoteThumbnailSources::for_remote_entries(settings, &entries)
+            .populate_remote_entries(&mut entries);
         CollectionPayload {
             title: "検索結果".to_owned(),
             thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(settings),
@@ -375,9 +377,11 @@ impl CollectionEngine {
         &self,
         settings: &Settings,
         sort_order: crate::settings::SortOrder,
-        entries: Vec<RemoteEntry>,
+        mut entries: Vec<RemoteEntry>,
         truncated: bool,
     ) -> CollectionPayload {
+        super::RemoteThumbnailSources::for_remote_entries(settings, &entries)
+            .populate_remote_entries(&mut entries);
         CollectionPayload {
             title: "タグの項目".to_owned(),
             thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(settings),
@@ -647,7 +651,9 @@ impl CollectionEngine {
         locked_reason: Option<&str>,
     ) -> Result<CollectionPayload, CollectionError> {
         let entries = to_remote_entries(candidates);
-        let (entries, truncated) = bound_remote_entries(entries);
+        let (mut entries, truncated) = bound_remote_entries(entries);
+        super::RemoteThumbnailSources::for_remote_entries(settings, &entries)
+            .populate_remote_entries(&mut entries);
         Ok(CollectionPayload {
             title: title.to_owned(),
             thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(settings),
@@ -877,6 +883,7 @@ fn remote_entry_from_candidate(candidate: CandidateEntry) -> RemoteEntry {
             candidate.name
         },
         kind: candidate.kind,
+        thumbnail_address: None,
         detail: candidate.detail,
         progress_current: candidate.progress_current,
         progress_total: candidate.progress_total,
@@ -1262,6 +1269,7 @@ mod tests {
                 path: format!("C:/entries/entry-{index}"),
                 name: format!("entry-{index}"),
                 kind: RemoteEntryKind::Image,
+                thumbnail_address: None,
                 detail: None,
                 progress_current: None,
                 progress_total: None,
@@ -1271,6 +1279,93 @@ mod tests {
         let (entries, truncated) = bound_remote_entries(entries);
         assert_eq!(entries.len(), MAX_REMOTE_COLLECTION_ENTRIES);
         assert!(truncated);
+    }
+
+    #[test]
+    fn aggregate_payload_assigns_same_folder_sidecar_without_removing_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let video = temp.path().join("clip.mp4");
+        let sidecar = temp.path().join("clip.jpg");
+        std::fs::write(&video, b"video").unwrap();
+        std::fs::write(&sidecar, b"image").unwrap();
+        let candidates = vec![
+            CandidateEntry {
+                path: video,
+                name: "clip.mp4".to_owned(),
+                kind: RemoteEntryKind::Video,
+                detail: None,
+                progress_current: None,
+                progress_total: None,
+                rating: None,
+            },
+            CandidateEntry {
+                path: sidecar,
+                name: "clip.jpg".to_owned(),
+                kind: RemoteEntryKind::Image,
+                detail: None,
+                progress_current: None,
+                progress_total: None,
+                rating: None,
+            },
+        ];
+        let settings = Settings::default();
+        let engine = CollectionEngine::new(settings.clone());
+
+        let payload = engine
+            .payload(
+                &settings,
+                "aggregate",
+                candidates,
+                settings.sort_order,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(payload.entries.len(), 2);
+        let video = payload
+            .entries
+            .iter()
+            .find(|entry| entry.kind == RemoteEntryKind::Video)
+            .unwrap();
+        assert_eq!(
+            video
+                .thumbnail_address
+                .as_ref()
+                .map(|address| PathBuf::from(&address.path)),
+            Some(temp.path().join("clip.jpg"))
+        );
+        let image = payload
+            .entries
+            .iter()
+            .find(|entry| entry.kind == RemoteEntryKind::Image)
+            .unwrap();
+        assert!(image.thumbnail_address.is_none());
+    }
+
+    #[test]
+    fn aggregate_payload_leaves_video_source_empty_without_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let video = temp.path().join("clip.mp4");
+        std::fs::write(&video, b"video").unwrap();
+        let settings = Settings::default();
+        let entries = vec![RemoteEntry {
+            path: video.to_string_lossy().into_owned(),
+            name: "clip.mp4".to_owned(),
+            kind: RemoteEntryKind::Video,
+            thumbnail_address: None,
+            detail: None,
+            progress_current: None,
+            progress_total: None,
+            rating: None,
+        }];
+
+        let sources = super::super::RemoteThumbnailSources::for_remote_entries(&settings, &entries);
+
+        assert!(
+            sources
+                .source_address(&video, RemoteEntryKind::Video)
+                .is_none()
+        );
     }
 
     fn favorite_with_container_index(path: PathBuf, enabled: bool) -> FavoriteEntry {

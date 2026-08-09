@@ -20,6 +20,214 @@ pub(crate) mod ui;
 pub(super) const BOOK_SORT_LOCK_REASON: &str =
     "本として表示中は名前順固定です（一覧の並べ替えは使えません）。";
 pub(super) const FIXED_LIST_SORT_LOCK_REASON: &str = "この一覧では並び順が固定されています。";
+const MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS: usize = 64;
+
+/// Remote grid thumbnail provenance shared by physical folders and aggregate lists.
+///
+/// Sidecar discovery remains owned by `folder_scan::filter_video_image_duplicates`.
+/// Aggregate lists only group videos by physical parent and feed one scan per parent
+/// into that existing rule; they never remove entries from the aggregate result set.
+#[derive(Default)]
+pub(super) struct RemoteThumbnailSources {
+    video_sidecars: std::collections::HashMap<String, std::path::PathBuf>,
+}
+
+impl RemoteThumbnailSources {
+    pub(super) fn from_pairs(pairs: &[(std::path::PathBuf, std::path::PathBuf)]) -> Self {
+        let mut video_sidecars = std::collections::HashMap::new();
+        for (video, image) in pairs {
+            video_sidecars.insert(crate::path_key::normalize_keep_drive(video), image.clone());
+        }
+        Self { video_sidecars }
+    }
+
+    pub(super) fn for_remote_entries(
+        settings: &crate::settings::Settings,
+        entries: &[mimageviewer_ipc::RemoteEntry],
+    ) -> Self {
+        if !settings.skip_image_if_video_exists || !settings.video_thumb_use_sidecar_image {
+            return Self::default();
+        }
+
+        let videos = entries
+            .iter()
+            .filter(|entry| entry.kind == mimageviewer_ipc::RemoteEntryKind::Video)
+            .map(|entry| std::path::PathBuf::from(&entry.path))
+            .collect::<Vec<_>>();
+        if videos.is_empty() {
+            return Self::default();
+        }
+
+        let requested = videos
+            .iter()
+            .map(|path| crate::path_key::normalize_keep_drive(path))
+            .collect::<std::collections::HashSet<_>>();
+        let mut parent_keys = std::collections::HashSet::new();
+        let mut parents = Vec::new();
+        for video in &videos {
+            if let Some(parent) = video.parent() {
+                let key = crate::path_key::normalize_keep_drive(parent);
+                if parent_keys.insert(key) {
+                    parents.push(parent.to_path_buf());
+                }
+            }
+        }
+
+        let skipped_parents = parents
+            .len()
+            .saturating_sub(MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS);
+        if skipped_parents > 0 {
+            crate::logger::log(format!(
+                "remote_ipc: aggregate sidecar parent scan capped limit={} scanned={} skipped_parents={skipped_parents}",
+                MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS,
+                MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS,
+            ));
+        }
+
+        // 64 parents bounds synchronous read_dir latency while covering clustered
+        // aggregate results; later parents safely fall through to the Shell thumbnail.
+        // With V requested videos and capped parents p, this is expected
+        // O(V + sum(E_p + S_p)) time and O(V + max(E_p + S_p)) working memory.
+        let mut sources = Self::default();
+        for parent in parents
+            .into_iter()
+            .take(MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS)
+        {
+            let mut scan =
+                match crate::app::folder_scan::scan_directory_with_settings(&parent, settings) {
+                    Ok(scan) => scan,
+                    Err(error) => {
+                        crate::logger::log(format!(
+                            "remote_ipc: aggregate sidecar scan failed parent={} error={error}",
+                            parent.display()
+                        ));
+                        continue;
+                    }
+                };
+            let found =
+                crate::app::folder_scan::filter_video_image_duplicates(&mut scan.all_media, true);
+            for (video, image) in found.sidecars {
+                let key = crate::path_key::normalize_keep_drive(&video);
+                if requested.contains(&key) {
+                    sources.video_sidecars.insert(key, image);
+                }
+            }
+        }
+        sources
+    }
+
+    pub(super) fn source_address(
+        &self,
+        path: &std::path::Path,
+        kind: mimageviewer_ipc::RemoteEntryKind,
+    ) -> Option<mimageviewer_ipc::RemoteAddress> {
+        if kind != mimageviewer_ipc::RemoteEntryKind::Video {
+            return None;
+        }
+        let source = self
+            .video_sidecars
+            .get(&crate::path_key::normalize_keep_drive(path))?;
+        let logical = path_guard::resolve_existing(source.to_string_lossy().as_ref())
+            .map(|resolved| resolved.logical)
+            .unwrap_or_else(|_| source.clone());
+        Some(mimageviewer_ipc::RemoteAddress::file(
+            logical.to_string_lossy().into_owned(),
+        ))
+    }
+
+    pub(super) fn populate_remote_entries(&self, entries: &mut [mimageviewer_ipc::RemoteEntry]) {
+        for entry in entries {
+            entry.thumbnail_address =
+                self.source_address(std::path::Path::new(&entry.path), entry.kind);
+        }
+    }
+}
+
+#[cfg(test)]
+mod remote_thumbnail_source_tests {
+    use super::*;
+
+    fn entry(path: &std::path::Path) -> mimageviewer_ipc::RemoteEntry {
+        mimageviewer_ipc::RemoteEntry {
+            path: path.to_string_lossy().into_owned(),
+            thumbnail_address: None,
+            name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            kind: mimageviewer_ipc::RemoteEntryKind::Video,
+            detail: None,
+            progress_current: None,
+            progress_total: None,
+            rating: None,
+        }
+    }
+
+    fn create_video_and_sidecar(root: &std::path::Path, index: usize) -> std::path::PathBuf {
+        let parent = root.join(format!("parent-{index:03}"));
+        std::fs::create_dir(&parent).unwrap();
+        let video = parent.join("clip.mp4");
+        std::fs::write(&video, b"video").unwrap();
+        std::fs::write(parent.join("clip.jpg"), b"sidecar").unwrap();
+        video
+    }
+
+    #[test]
+    fn aggregate_sidecar_scan_covers_every_parent_below_the_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let videos = (0..3)
+            .map(|index| create_video_and_sidecar(temp.path(), index))
+            .collect::<Vec<_>>();
+        let entries = videos.iter().map(|path| entry(path)).collect::<Vec<_>>();
+
+        let sources = RemoteThumbnailSources::for_remote_entries(
+            &crate::settings::Settings::default(),
+            &entries,
+        );
+
+        for video in videos {
+            assert!(
+                sources
+                    .source_address(&video, mimageviewer_ipc::RemoteEntryKind::Video)
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_sidecar_scan_caps_parents_and_leaves_the_rest_for_shell() {
+        let temp = tempfile::tempdir().unwrap();
+        let videos = (0..=MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS)
+            .map(|index| create_video_and_sidecar(temp.path(), index))
+            .collect::<Vec<_>>();
+        let entries = videos.iter().map(|path| entry(path)).collect::<Vec<_>>();
+
+        let sources = RemoteThumbnailSources::for_remote_entries(
+            &crate::settings::Settings::default(),
+            &entries,
+        );
+
+        for video in videos
+            .iter()
+            .take(MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS)
+        {
+            assert!(
+                sources
+                    .source_address(video, mimageviewer_ipc::RemoteEntryKind::Video)
+                    .is_some()
+            );
+        }
+        assert!(
+            sources
+                .source_address(
+                    &videos[MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS],
+                    mimageviewer_ipc::RemoteEntryKind::Video,
+                )
+                .is_none()
+        );
+    }
+}
 
 pub(super) fn sort_order_wire_value(order: crate::settings::SortOrder) -> String {
     serde_json::to_value(order)

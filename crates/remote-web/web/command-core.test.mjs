@@ -2394,6 +2394,12 @@ test("thumbnail retry policy retries only transient failures with a bounded back
     delayMs: 800,
     consumeRetryBudget: true,
   });
+  assert.deepEqual(thumbnailRetryDecision(503, "thumbnail_not_ready", 0), {
+    retry: true,
+    exhausted: false,
+    delayMs: 200,
+    consumeRetryBudget: true,
+  });
   assert.deepEqual(thumbnailRetryDecision(502, "ipc_protocol_error", 3), {
     retry: false,
     exhausted: true,
@@ -2401,7 +2407,7 @@ test("thumbnail retry policy retries only transient failures with a bounded back
     consumeRetryBudget: false,
   });
   assert.equal(thumbnailRetryDecision(404, "not_found", 0).retry, false);
-  assert.equal(thumbnailRetryDecision(422, "generation_failed", 0).retry, false);
+  assert.equal(thumbnailRetryDecision(422, "miv_thumbnail_error", 0).retry, false);
   assert.equal(
     thumbnailRetryDecision(503, "protocol_version_mismatch", 0).retry,
     false
