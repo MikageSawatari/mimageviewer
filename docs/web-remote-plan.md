@@ -879,14 +879,16 @@ foreground との優先度を持っていなかった。
 2026-08-04 の画質 mode 導入後は、表示と先読みを同じ長辺上限（8192 / 4096 / 2048 /
 1024、既定 4096）で取得する。標準画質の実測約 1.2 MiB/ページに対し、進行方向 3 ページで
 従来の約 3.6 MiB という帯域根拠を維持するため、前方 3 ページ、逆方向 1 ページへ変更した。
-先読み通信は同時 1 件、圧縮 Blob の LRU は最大 12 件かつ 32 MiB のままとする。viewer を離れた時、
-別 target の foreground を要求した時、または計画から外れた時は不要な fetch を中断する。
+2026-08-09 の実測見直し後は §12.26 を正とする。前方 3 / 逆方向 1 と表示・先読み共通の
+要求長辺は維持し、先読み通信は同時最大 2 件、圧縮 Blob の LRU は最大 12 件かつ実効下限
+48 MiB とする。viewer を離れた時、別 target の foreground を要求した時、または計画から
+外れた時は不要な fetch を中断する。
 
 現行 protocol の `PageRequest.priority` は `Foreground` / `Prefetch` を共有型で表す。remote-web は
-prefetch admission を1件に制限し、all / heavy の最終1枠を使用させない。本体も全接続合計の
-prefetch queued + active を1件に制限し、remote heavy worker が1本しかない設定では prefetch を
-`Busy` で拒否する。2 worker 時も heavy queue / active が空の時だけ先読みを開始し、最大1本なので
-もう1本を foreground に残す。既存 heavy 処理があれば先読みは待たせず `Busy` にする。PDF pool
+prefetch admission を2件に制限し、all / heavy の最終1枠を使用させない。本体も全接続合計の
+prefetch queued + active を worker 数に応じて最大2件に制限し、常に remote heavy worker 1本を
+foreground 用に残す。worker が1本なら prefetch は `Busy`、2本なら最大1件、3本なら最大2件とする。
+既存 heavy 処理や queue があれば先読みは待たせず `Busy` にする。PDF pool
 では foreground を `HighNormal`、prefetch を `Normal` に送り、ローカル UI の `Critical` 予約枠は
 リモート要求に使用しない。
 
@@ -1618,6 +1620,39 @@ folder / collection の Web 側 archive kind 除外は撤去した。Ignore の�
 §12.24 の live listing settings、bookmark の `OtherArchive`、reading history、rating、smart folder 等の
 集約系は `CollectionEngine` がその要求ですでに `load_into_settings()` した同じ `Settings` で archive
 候補を bound 前に除外する。tag item も同じロード済み値を mapping に渡し、追加の全設定 read は行わない。
+
+### 12.26 ページ先読みの実効化と表示履歴 (2026-08-09)
+
+実機の成功ページ 200 件では応答サイズが p50 1.5 MB、p95 7.9 MB、max 8.1 MB だった。
+以前の 32 MiB は単ページの現在 1 + 前方 3 + 後方 1 の 5 ページ作業集合すら p95 付近で
+保持できず、先読み済み Blob を使用前に LRU から捨て得た。要求解像度、画質 preset、
+`PAGE_JPEG_QUALITY`、`viewerImageLayout` は変更しない。
+
+`pageResourceCacheBudget` は設定 byte 数と、実測上限として丸めた 8 MiB × 作業集合ページ数の
+大きい方を実効予算にする。現在ページを最大見開き 2 ページとして数えるため、前方 3 + 後方 1 を
+含む最大 6 ページの下限は 48 MiB になる。定数の一方だけを将来変更しても
+「予算 < 作業集合」を作れないことを純関数テストで固定する。entry 上限 12 は維持する。
+
+HTTP 503 `ipc_busy` / `admission_busy` は計画無効ではなく一時的な入場拒否として扱う。
+失敗ページを pending の末尾へ戻し、他の計画ページへ機会を渡したうえで `Retry-After`
+(既定 1 秒) 後に再開する。pending 全消去と retry budget 消費は行わない。abort 済み要求は
+再投入しない。
+
+ブラウザの `PageResourceCache`、remote-web HTTP admission は同時最大 2 件とする。本体の
+remote heavy worker は利用者設定の半分・最大 3 本で、prefetch 上限を
+`min(heavy_workers - 1, 2)` とし、常に foreground 1 本を予約する。同時 prefetch 同士は
+互いを cancel せず、foreground 到着時は進行中 prefetch をすべて cancel する。ブラウザ側も
+foreground が来た時点で無関係な prefetch を abort して直接開始する。このため同時実行数を
+上げても foreground が prefetch の後ろへ並ぶ構造にはしない。
+
+症状「シークバーは進んだが画像が変わらない」はこの増分では修正しない。既存 telemetry に
+`page_display` を追加し、要求 group、1-origin の要求ページ番号、シークバーへ出した page label、
+取得候補と実際に DOM へ適用した HTTP request ID、`applied` / `not_applied`、固定列挙の理由を
+client timestamp / sequence 付きで残す。理由は `dom_committed`、`pending_superseded`、
+`queue_cleared`、`load_sequence_mismatch`、`abort`、identity / generation / session の既存判定名、
+fetch / decode / apply failure に限定する。request ID は server の単調数値識別子で、path、address、
+PIN、Bearer、remote session 生値は event builder の入力に持たせない。既存 normal/debug 段階化と
+server 最終 redaction は維持する。表示側へ guard、retry、追加 repaint は加えない。
 
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 

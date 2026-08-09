@@ -111,6 +111,7 @@ const {
   ImageViewer,
   LatestOnlyTaskQueue,
   LatestPageLoadQueue,
+  PageResourceCache,
   RemoteAiController,
   ViewerAdjustmentPanel,
   ViewerViewTrimPanel,
@@ -947,6 +948,45 @@ test("page load queue emits one busy interval across pending replacements", asyn
   assert.deepEqual(started, [1, 3]);
   assert.deepEqual(busy, [true, false]);
   assert.deepEqual(events, ["busy:true", "run:1", "run:3", "busy:false"]);
+});
+
+test("foreground page load aborts unrelated concurrent prefetches and starts immediately", async () => {
+  const started = [];
+  const aborted = [];
+  const fetchResource = (request, signal, prefetch) => {
+    started.push({ cacheKey: request.cacheKey, prefetch });
+    if (!prefetch) {
+      return Promise.resolve({
+        blob: new Blob([request.cacheKey]),
+        requestId: `foreground-${request.cacheKey}`,
+        fetchMs: 1,
+        info: null,
+      });
+    }
+    return new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        aborted.push(request.cacheKey);
+        const error = new Error("Aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    });
+  };
+  const cache = new PageResourceCache(12, 48 * 1024 * 1024, 2, fetchResource);
+  cache.schedule([{ cacheKey: "prefetch-a" }, { cacheKey: "prefetch-b" }]);
+  assert.deepEqual(started, [
+    { cacheKey: "prefetch-a", prefetch: true },
+    { cacheKey: "prefetch-b", prefetch: true },
+  ]);
+
+  const foreground = await cache.loadForeground(
+    { cacheKey: "foreground" },
+    new AbortController().signal
+  );
+  assert.equal(foreground.prefetchStatus, "miss");
+  assert.deepEqual(aborted.sort(), ["prefetch-a", "prefetch-b"]);
+  assert.deepEqual(started.at(-1), { cacheKey: "foreground", prefetch: false });
+  cache.clear();
 });
 
 test("remote adjustment normalization keeps valid local slider defaults and bounds", () => {

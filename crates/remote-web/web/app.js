@@ -4,6 +4,7 @@ import {
   GridViewportAnchor,
   GridViewportMemory,
   IMAGE_QUALITY_PRESETS,
+  MAX_VIEWER_VISIBLE_PAGES,
   ReadingDirection,
   SpreadMode,
   ViewerGesture,
@@ -30,7 +31,10 @@ import {
   normalizeVisualViewportScale,
   pageResponseGenerationAttestation,
   pageResponseIdentityAttestation,
+  pagePrefetchFailurePlan,
   pagePrefetchPlan,
+  pagePrefetchStartCount,
+  pageResourceCacheBudget,
   planSpreadIntent,
   reduceViewerTransform,
   remoteStateGenerationTransition,
@@ -73,6 +77,7 @@ import {
   viewerTapCommand,
   viewerImageLayout,
   viewerLayoutTelemetry,
+  viewerPageDisplayHistoryEvent,
   viewerPageDisplaySlot,
   viewerPageGroupGenerationSnapshot,
   ViewerPagePositionEvent,
@@ -116,13 +121,22 @@ const THUMBNAIL_MAX_CONCURRENCY = thumbnailRequestConcurrency(
 );
 const PAGE_LOADING_INDICATOR_DELAY_MS = 225;
 const PAGE_BOUNDARY_MESSAGE_DURATION_MS = 2400;
-// 標準画質の実測約 1.2 MiB/ページなら、進行方向 3 ページで従来と同じ約 3.6 MiB。
-// 逆方向 1 ページは維持し、選択中の画質を先読みでもそのまま使う。
-// prefetch は直列かつ foreground が active request を abort するため表示要求を待たせない。
+// 実機の成功ページは p50 1.5 MB / p95 7.9 MB / max 8.1 MB。計画上限は 8 MiB とし、
+// 単ページの現在 1 + 前方 3 + 後方 1 = 5 ページ (40 MiB)、見開き時は現在 2 を含む
+// 6 ページ (48 MiB) を保持できる下限を純関数で課す。要求解像度と JPEG 品質は変えない。
 const PAGE_PREFETCH_AHEAD = 3;
 const PAGE_PREFETCH_BEHIND = 1;
+const PAGE_PREFETCH_CONCURRENCY = 2;
 const PAGE_RESOURCE_CACHE_LIMIT = 12;
-const PAGE_RESOURCE_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const PAGE_RESOURCE_MEASURED_MAX_BYTES = 8 * 1024 * 1024;
+const PAGE_RESOURCE_CACHE_CONFIGURED_BYTES = 48 * 1024 * 1024;
+const PAGE_RESOURCE_CACHE_MAX_BYTES = pageResourceCacheBudget({
+  configuredBytes: PAGE_RESOURCE_CACHE_CONFIGURED_BYTES,
+  measuredPageBytes: PAGE_RESOURCE_MEASURED_MAX_BYTES,
+  ahead: PAGE_PREFETCH_AHEAD,
+  behind: PAGE_PREFETCH_BEHIND,
+  visiblePages: MAX_VIEWER_VISIBLE_PAGES,
+}).byteLimit;
 const SESSION_PING_INTERVAL_MS = 30_000;
 const READING_PROGRESS_INTERVAL_MS = 30_000;
 const AI_FOREGROUND_POLL_MS = 500;
@@ -243,10 +257,16 @@ export class LatestOnlyTaskQueue {
 
 /// 前景ページ描画専用。実行中の core IPC は完了させ、待機中は最新のページ群だけを残す。
 export class LatestPageLoadQueue {
-  constructor(run, onSupersede = () => {}, onBusyChange = () => {}) {
+  constructor(
+    run,
+    onSupersede = () => {},
+    onBusyChange = () => {},
+    onDiscard = () => {}
+  ) {
     this.run = run;
     this.onSupersede = onSupersede;
     this.onBusyChange = onBusyChange;
+    this.onDiscard = onDiscard;
     this.active = null;
     this.pending = null;
   }
@@ -270,6 +290,7 @@ export class LatestPageLoadQueue {
       );
       if (plan.supersededPending) {
         plan.supersededPending.superseded = true;
+        this.onDiscard(plan.supersededPending.value, "pending_superseded");
         plan.supersededPending.resolve(false);
       }
       this.pending = plan.pending;
@@ -287,6 +308,7 @@ export class LatestPageLoadQueue {
     const wasBusy = this.isBusy();
     if (this.pending) {
       this.pending.superseded = true;
+      this.onDiscard(this.pending.value, "queue_cleared");
       this.pending.resolve(false);
       this.pending = null;
     }
@@ -313,16 +335,21 @@ export class LatestPageLoadQueue {
   }
 }
 
-class PageResourceCache {
+export class PageResourceCache {
   constructor(
     limit = PAGE_RESOURCE_CACHE_LIMIT,
-    byteLimit = PAGE_RESOURCE_CACHE_MAX_BYTES
+    byteLimit = PAGE_RESOURCE_CACHE_MAX_BYTES,
+    prefetchConcurrency = PAGE_PREFETCH_CONCURRENCY,
+    fetchResource = fetchPageResource
   ) {
     this.limit = Math.max(1, Number(limit) || 1);
     this.byteLimit = Math.max(1, Number(byteLimit) || 1);
+    this.prefetchConcurrency = Math.max(1, Number(prefetchConcurrency) || 1);
+    this.fetchResource = fetchResource;
     this.ready = new Map();
     this.pending = [];
-    this.active = null;
+    this.active = new Map();
+    this.retryTimer = 0;
   }
 
   async loadForeground(request, signal) {
@@ -332,13 +359,25 @@ class PageResourceCache {
       this.ready.set(request.cacheKey, cached);
       return { ...cached, prefetchStatus: "hit" };
     }
-    if (this.active?.key === request.cacheKey) {
-      const resource = await awaitWithAbort(this.active.promise, signal);
-      return { ...resource, prefetchStatus: "in_flight" };
+    const joined = this.active.get(request.cacheKey);
+    for (const active of this.active.values()) {
+      if (active.key !== request.cacheKey) active.controller.abort();
     }
-    if (this.active) this.active.controller.abort();
+    if (joined) {
+      try {
+        const resource = await awaitWithAbort(joined.promise, signal);
+        return { ...resource, prefetchStatus: "in_flight" };
+      } catch (error) {
+        if (
+          signal?.aborted ||
+          error?.status !== 503 ||
+          error?.code !== "ipc_busy"
+        ) throw error;
+        // A foreground join must not inherit a temporary prefetch admission failure.
+      }
+    }
     this.pending = this.pending.filter((item) => item.cacheKey !== request.cacheKey);
-    const resource = await fetchPageResource(request, signal, false);
+    const resource = await this.fetchResource(request, signal, false);
     this.remember(request.cacheKey, resource);
     return { ...resource, prefetchStatus: "miss" };
   }
@@ -354,25 +393,43 @@ class PageResourceCache {
       unique.push(request);
     }
     this.pending = unique;
-    if (this.active && !seen.has(this.active.key)) this.active.controller.abort();
+    for (const active of this.active.values()) {
+      if (!seen.has(active.key)) active.controller.abort();
+    }
     this.pump();
   }
 
   pump() {
-    if (this.active) return;
-    const request = this.pending.shift();
-    if (!request) return;
-    if (this.ready.has(request.cacheKey)) {
-      this.pump();
-      return;
+    if (this.retryTimer) return;
+    let starts = pagePrefetchStartCount(
+      this.active.size,
+      this.pending.length,
+      this.prefetchConcurrency
+    );
+    while (starts > 0) {
+      const request = this.pending.shift();
+      if (!request) return;
+      if (this.ready.has(request.cacheKey) || this.active.has(request.cacheKey)) {
+        starts = pagePrefetchStartCount(
+          this.active.size,
+          this.pending.length,
+          this.prefetchConcurrency
+        );
+        continue;
+      }
+      this.startPrefetch(request);
+      starts -= 1;
     }
+  }
+
+  startPrefetch(request) {
     const controller = new AbortController();
     const active = {
       key: request.cacheKey,
       controller,
       promise: null,
     };
-    active.promise = fetchPageResource(request, controller.signal, true)
+    active.promise = this.fetchResource(request, controller.signal, true)
       .then((resource) => {
         if (!controller.signal.aborted) {
           this.remember(request.cacheKey, resource);
@@ -388,25 +445,42 @@ class PageResourceCache {
         return resource;
       })
       .catch((error) => {
-        if (error?.status === 503) this.pending = [];
+        const failure = controller.signal.aborted
+          ? { retry: false, pendingRequests: this.pending }
+          : pagePrefetchFailurePlan({
+            pendingRequests: this.pending,
+            failedRequest: request,
+            status: error?.status,
+            errorCode: error?.code,
+          });
+        this.pending = failure.pendingRequests;
+        if (failure.retry) this.scheduleRetry(error?.retryAfterMs);
         if (error?.name !== "AbortError") {
           enqueueTelemetry({
             type: "page_prefetch",
-            status: "failed",
+            status: failure.retry ? "admission_busy" : "failed",
+            retry_planned: failure.retry,
             message: limitText(error instanceof Error ? error.message : error, 240),
           });
         }
         throw error;
       })
       .finally(() => {
-        if (this.active === active) {
-          this.active = null;
-          this.pump();
-        }
+        if (this.active.get(active.key) === active) this.active.delete(active.key);
+        this.pump();
       });
     // A rejected background promise must be observed even when no foreground load joins it.
     active.promise.catch(() => {});
-    this.active = active;
+    this.active.set(active.key, active);
+  }
+
+  scheduleRetry(delayMs) {
+    if (this.retryTimer) return;
+    const delay = Math.max(100, Math.min(10_000, Number(delayMs) || 1000));
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = 0;
+      this.pump();
+    }, delay);
   }
 
   remember(key, resource) {
@@ -423,8 +497,10 @@ class PageResourceCache {
 
   clear() {
     this.pending = [];
-    this.active?.controller.abort();
-    this.active = null;
+    for (const active of this.active.values()) active.controller.abort();
+    this.active.clear();
+    clearTimeout(this.retryTimer);
+    this.retryTimer = 0;
     this.ready.clear();
   }
 }
@@ -4988,6 +5064,8 @@ async function updateViewerImage(
     index: state.pageGroupIndex,
     count: state.pageGroups.length,
     seekState: viewerSeekSnapshot(),
+    pageNumbers: (state.seekPageGroups[state.pageGroupIndex] ?? [])
+      .map((pageIndex) => pageIndex + 1),
     interactionStartedAt,
     renderTrigger,
   });
@@ -9835,6 +9913,20 @@ export class RemoteAiController {
   }
 }
 
+function viewerPageDisplayFailureReason(error, phase) {
+  if (error?.name === "AbortError") return "abort";
+  const code = String(error?.code ?? "");
+  if (new Set([
+    "page_identity_mismatch",
+    "remote_state_generation_unattested",
+    "remote_state_generation_mismatch",
+    "remote_session_unattested",
+  ]).has(code)) return code;
+  if (phase === "fetch") return "fetch_failed";
+  if (phase === "decode") return "decode_failed";
+  return "apply_failed";
+}
+
 export class ImageViewer {
   constructor({
     root,
@@ -9910,7 +10002,12 @@ export class ImageViewer {
           job.renderTrigger
         ),
       () => this.supersedeActiveLoad(),
-      (busy) => this.setPageLoadBusy(busy)
+      (busy) => this.setPageLoadBusy(busy),
+      (job, reason) => this.recordPageDisplay(
+        job?.presentation,
+        "not_applied",
+        reason
+      )
     );
 
     this.pointerDown = (event) => this.onPointerDown(event);
@@ -9969,6 +10066,7 @@ export class ImageViewer {
     index,
     count,
     seekState,
+    pageNumbers,
     interactionStartedAt,
     renderTrigger,
   }) {
@@ -9981,7 +10079,11 @@ export class ImageViewer {
       direction: ReadingDirection.LTR,
       label: `${index + 1} / ${count}`,
     };
-    const presentation = { name, seekState: resolvedSeekState };
+    const presentation = {
+      name,
+      seekState: resolvedSeekState,
+      pageNumbers: pageNumbers ?? [index + 1],
+    };
     this.setRequestedPagePresentation(presentation);
     return this.pageLoadQueue.request({
       kind: "single",
@@ -10018,6 +10120,7 @@ export class ImageViewer {
     index,
     count,
     seekState,
+    pageNumbers,
     interactionStartedAt,
     renderTrigger,
   }) {
@@ -10030,6 +10133,7 @@ export class ImageViewer {
         index,
         count,
         seekState,
+        pageNumbers,
         interactionStartedAt,
         renderTrigger,
       });
@@ -10043,7 +10147,11 @@ export class ImageViewer {
       direction: ReadingDirection.LTR,
       label: `${index + 1} / ${count}`,
     };
-    const presentation = { name, seekState: resolvedSeekState };
+    const presentation = {
+      name,
+      seekState: resolvedSeekState,
+      pageNumbers: pageNumbers ?? [index + 1],
+    };
     this.setRequestedPagePresentation(presentation);
     return this.pageLoadQueue.request({
       kind: "spread",
@@ -10139,6 +10247,26 @@ export class ImageViewer {
 
   restoreRequestedPagePresentation() {
     this.syncPagePositionFeedback();
+  }
+
+  recordPageDisplay(
+    presentation,
+    outcome,
+    reason,
+    candidateImageIds = [],
+    appliedImageIds = []
+  ) {
+    if (!presentation?.seekState) return;
+    enqueueTelemetry(viewerPageDisplayHistoryEvent({
+      outcome,
+      reason,
+      requestedGroupIndex: presentation.seekState.groupIndex,
+      requestedPageNumbers: presentation.pageNumbers,
+      seekGroupIndex: presentation.seekState.value,
+      seekPageLabel: presentation.seekState.label,
+      candidateImageIds,
+      appliedImageIds,
+    }));
   }
 
   layoutTelemetry() {
@@ -10327,8 +10455,9 @@ export class ImageViewer {
     this.fetchController = controller;
     const fetchStartedAt = performance.now();
     let pendingObjectUrl = null;
+    let resource = null;
+    let phase = "fetch";
     try {
-      let resource;
       if (request.cacheKey) {
         resource = await pageResourceCache.loadForeground(request, controller.signal);
       } else {
@@ -10353,8 +10482,17 @@ export class ImageViewer {
       const blob = resource.blob;
       const fetchMs = performance.now() - fetchStartedAt;
       const requestId = resource.requestId;
-      if (sequence !== this.loadSequence) return;
+      if (sequence !== this.loadSequence) {
+        this.recordPageDisplay(
+          presentation,
+          "not_applied",
+          "load_sequence_mismatch",
+          [requestId]
+        );
+        return false;
+      }
 
+      phase = "decode";
       pendingObjectUrl = URL.createObjectURL(blob);
       const decodedImage = element("img", "viewer-image");
       decodedImage.alt = name;
@@ -10386,8 +10524,16 @@ export class ImageViewer {
       }
       if (sequence !== this.loadSequence) {
         URL.revokeObjectURL(pendingObjectUrl);
-        return;
+        pendingObjectUrl = null;
+        this.recordPageDisplay(
+          presentation,
+          "not_applied",
+          "load_sequence_mismatch",
+          [requestId]
+        );
+        return false;
       }
+      phase = "apply";
       this.resetTransform();
       this.setLayout(request.fitMode, resolvedLayout, resolvedInfo, decodedImage);
       decodedImage.style.transform = "none";
@@ -10395,6 +10541,13 @@ export class ImageViewer {
       this.pageLayer.replaceChildren(decodedImage);
       this.image = decodedImage;
       this.images = [decodedImage];
+      this.recordPageDisplay(
+        presentation,
+        "applied",
+        "dom_committed",
+        [requestId],
+        [requestId]
+      );
       this.commitPagePresentation(presentation);
       this.objectUrl = pendingObjectUrl;
       this.objectUrls = [pendingObjectUrl];
@@ -10429,7 +10582,22 @@ export class ImageViewer {
       return true;
     } catch (error) {
       if (pendingObjectUrl) URL.revokeObjectURL(pendingObjectUrl);
-      if (sequence !== this.loadSequence) return false;
+      if (sequence !== this.loadSequence) {
+        this.recordPageDisplay(
+          presentation,
+          "not_applied",
+          "load_sequence_mismatch",
+          [resource?.requestId]
+        );
+        return false;
+      }
+      const reason = viewerPageDisplayFailureReason(error, phase);
+      this.recordPageDisplay(
+        presentation,
+        "not_applied",
+        reason,
+        [resource?.requestId]
+      );
       if (error?.name === "AbortError") return false;
       this.title.textContent =
         error instanceof Error ? error.message : "ページを表示できませんでした。";
@@ -10457,8 +10625,10 @@ export class ImageViewer {
     this.fetchController = controller;
     const startedAt = performance.now();
     const pendingUrls = [];
+    let resources = null;
+    let phase = "fetch";
     try {
-      const resources = await Promise.all(pages.map(async ({ request }) => {
+      resources = await Promise.all(pages.map(async ({ request }) => {
         if (request.cacheKey) {
           return pageResourceCache.loadForeground(request, controller.signal);
         }
@@ -10482,8 +10652,17 @@ export class ImageViewer {
           prefetchStatus: "not_applicable",
         };
       }));
-      if (sequence !== this.loadSequence) return false;
+      if (sequence !== this.loadSequence) {
+        this.recordPageDisplay(
+          presentation,
+          "not_applied",
+          "load_sequence_mismatch",
+          resources.map((resource) => resource.requestId)
+        );
+        return false;
+      }
 
+      phase = "decode";
       const decodedImages = await Promise.all(resources.map(async (resource, index) => {
         const decodedImage = element("img", "viewer-image");
         decodedImage.alt = pages[index].entry.name;
@@ -10504,9 +10683,16 @@ export class ImageViewer {
       }));
       if (sequence !== this.loadSequence) {
         pendingUrls.forEach((url) => URL.revokeObjectURL(url));
+        this.recordPageDisplay(
+          presentation,
+          "not_applied",
+          "load_sequence_mismatch",
+          resources.map((resource) => resource.requestId)
+        );
         return false;
       }
 
+      phase = "apply";
       const resolvedLayout = viewerSpreadLayout({
         mode: fitMode,
         pages: decodedImages.map((decoded) => decoded.info),
@@ -10536,6 +10722,13 @@ export class ImageViewer {
       this.pageLayer.replaceChildren(...decodedImages.map((decoded) => decoded.image));
       this.images = decodedImages.map((decoded) => decoded.image);
       this.image = this.images[0];
+      this.recordPageDisplay(
+        presentation,
+        "applied",
+        "dom_committed",
+        resources.map((resource) => resource.requestId),
+        resources.map((resource) => resource.requestId)
+      );
       // 中身を差し替えてから決める。差し替え前は内容がまだ DOM に入っていない。
       this.placeInitialStageScroll();
       this.commitPagePresentation(presentation);
@@ -10577,7 +10770,24 @@ export class ImageViewer {
       return true;
     } catch (error) {
       pendingUrls.forEach((url) => URL.revokeObjectURL(url));
-      if (sequence !== this.loadSequence || error?.name === "AbortError") return false;
+      const candidateImageIds = resources?.map((resource) => resource.requestId) ?? [];
+      if (sequence !== this.loadSequence) {
+        this.recordPageDisplay(
+          presentation,
+          "not_applied",
+          "load_sequence_mismatch",
+          candidateImageIds
+        );
+        return false;
+      }
+      const reason = viewerPageDisplayFailureReason(error, phase);
+      this.recordPageDisplay(
+        presentation,
+        "not_applied",
+        reason,
+        candidateImageIds
+      );
+      if (error?.name === "AbortError") return false;
       this.title.textContent = error instanceof Error
         ? error.message
         : "見開きを表示できませんでした。";
@@ -11437,6 +11647,10 @@ async function pageResourceResponseError(response) {
   );
   error.status = response.status;
   error.code = detail.error;
+  const retryAfterSeconds = Number(response.headers.get("Retry-After"));
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+    error.retryAfterMs = retryAfterSeconds * 1000;
+  }
   return error;
 }
 

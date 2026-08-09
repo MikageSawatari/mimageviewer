@@ -116,7 +116,7 @@ pub(super) struct ContainerEngine {
     remote_ai_native_cache: Mutex<RemoteAiNativeCache>,
     comic_stamp_cache: Mutex<HashMap<String, Option<Arc<comic_core::RgbaOverlay>>>>,
     session: Option<super::session::SessionHandle>,
-    page_prefetch_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    page_prefetch_cancels: Mutex<Vec<Arc<AtomicBool>>>,
 }
 
 enum AdjustmentSettingsSource {
@@ -633,7 +633,7 @@ impl ContainerEngine {
             remote_ai_native_cache: Mutex::new(RemoteAiNativeCache::default()),
             comic_stamp_cache: Mutex::new(HashMap::new()),
             session,
-            page_prefetch_cancel: Mutex::new(None),
+            page_prefetch_cancels: Mutex::new(Vec::new()),
         }
     }
     fn adjustment_render_settings(
@@ -963,15 +963,16 @@ impl ContainerEngine {
         session_cancel: Option<Arc<AtomicBool>>,
     ) -> Arc<AtomicBool> {
         let cancel = session_cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        let mut prefetch = self
-            .page_prefetch_cancel
+        let mut prefetches = self
+            .page_prefetch_cancels
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if let Some(previous) = prefetch.take() {
-            previous.store(true, Ordering::Relaxed);
-        }
-        if priority == PagePriority::Prefetch {
-            *prefetch = Some(Arc::clone(&cancel));
+        if priority == PagePriority::Foreground {
+            for prefetch in prefetches.drain(..) {
+                prefetch.store(true, Ordering::Relaxed);
+            }
+        } else {
+            prefetches.push(Arc::clone(&cancel));
         }
         cancel
     }
@@ -980,16 +981,11 @@ impl ContainerEngine {
         if priority != PagePriority::Prefetch {
             return;
         }
-        let mut prefetch = self
-            .page_prefetch_cancel
+        let mut prefetches = self
+            .page_prefetch_cancels
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if prefetch
-            .as_ref()
-            .is_some_and(|active| Arc::ptr_eq(active, cancel))
-        {
-            *prefetch = None;
-        }
+        prefetches.retain(|active| !Arc::ptr_eq(active, cancel));
     }
 
     pub(super) fn container(&self, request: ContainerRequest) -> ContainerResponse {
@@ -5259,12 +5255,17 @@ mod tests {
     }
 
     #[test]
-    fn foreground_page_cancels_only_the_active_remote_prefetch() {
+    fn concurrent_prefetches_do_not_cancel_each_other_and_foreground_cancels_all() {
         let engine = ContainerEngine::new(crate::settings::Settings::default());
-        let prefetch = engine.begin_page_render(PagePriority::Prefetch, None);
+        let first = engine.begin_page_render(PagePriority::Prefetch, None);
+        let second = engine.begin_page_render(PagePriority::Prefetch, None);
+
+        assert!(!first.load(Ordering::Relaxed));
+        assert!(!second.load(Ordering::Relaxed));
         let foreground = engine.begin_page_render(PagePriority::Foreground, None);
 
-        assert!(prefetch.load(Ordering::Relaxed));
+        assert!(first.load(Ordering::Relaxed));
+        assert!(second.load(Ordering::Relaxed));
         assert!(!foreground.load(Ordering::Relaxed));
     }
 

@@ -55,6 +55,7 @@ const HOME_WORK_QUEUE_CAPACITY: usize = 8;
 const WRITE_WORK_QUEUE_CAPACITY: usize = 16;
 const STREAM_WORK_QUEUE_CAPACITY: usize = 32;
 const STREAM_WORKER_COUNT: usize = 4;
+const MAX_CONCURRENT_PAGE_PREFETCH: usize = 2;
 
 enum Work {
     Request {
@@ -353,7 +354,7 @@ impl ServerGuard {
 
         crate::logger::log(format!(
             "remote_ipc: listening pipe={PIPE_NAME} protocol={PROTOCOL_VERSION} heavy_workers={worker_count} configured_workers={configured_worker_count} home_workers=1 write_workers=1 stream_workers={STREAM_WORKER_COUNT} prefetch_limit={} acceptors={ACCEPTOR_COUNT} multiplexed=true",
-            usize::from(worker_count >= 2)
+            remote_page_prefetch_limit(worker_count)
         ));
         Ok(Self {
             stop,
@@ -412,8 +413,9 @@ impl Drop for ServerGuard {
 
 fn remote_heavy_worker_count(configured_worker_count: usize) -> usize {
     // IPC decode がローカル表示用 worker と CPU / disk を奪い合わないよう、
-    // 利用者設定の半分かつ最大 2 本だけを remote 専用にする。
-    (configured_worker_count / 2).clamp(1, 2)
+    // 利用者設定の半分かつ最大 3 本だけを remote 専用にする。3 本ある場合も
+    // prefetch は最大 2 本までに制限し、残る 1 本を foreground に予約する。
+    (configured_worker_count / 2).clamp(1, 3)
 }
 
 fn worker_loop(
@@ -2315,15 +2317,24 @@ fn try_acquire_prefetch(
 ) -> Option<PrefetchPermit> {
     // prefetch 開始後も foreground 用 worker を 1 本空ける。queue が既にある時も
     // FIFO の前後関係で表示要求を遅らせ得るため受け付けない。
-    if heavy_worker_count < 2 || queued > 0 || active >= heavy_worker_count - 1 {
+    let limit = remote_page_prefetch_limit(heavy_worker_count);
+    if limit == 0 || queued > 0 || active >= heavy_worker_count - 1 {
         return None;
     }
     in_flight
-        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < limit).then_some(current + 1)
+        })
         .ok()
         .map(|_| PrefetchPermit {
             in_flight: Arc::clone(in_flight),
         })
+}
+
+fn remote_page_prefetch_limit(heavy_worker_count: usize) -> usize {
+    heavy_worker_count
+        .saturating_sub(1)
+        .min(MAX_CONCURRENT_PAGE_PREFETCH)
 }
 
 fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
@@ -3091,7 +3102,7 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_uses_at_most_one_remote_worker_and_is_disabled_with_one_worker() {
+    fn prefetch_uses_available_remote_workers_but_reserves_one_for_foreground() {
         let in_flight = Arc::new(AtomicUsize::new(0));
         assert!(try_acquire_prefetch(&in_flight, 1, 0, 0).is_none());
         assert!(try_acquire_prefetch(&in_flight, 2, 1, 0).is_none());
@@ -3099,7 +3110,13 @@ mod tests {
         let first = try_acquire_prefetch(&in_flight, 2, 0, 0).expect("first prefetch permit");
         assert!(try_acquire_prefetch(&in_flight, 2, 0, 0).is_none());
         drop(first);
-        assert!(try_acquire_prefetch(&in_flight, 2, 0, 0).is_some());
+        let first = try_acquire_prefetch(&in_flight, 3, 0, 0).expect("first prefetch permit");
+        let second = try_acquire_prefetch(&in_flight, 3, 0, 1).expect("second prefetch permit");
+        assert!(try_acquire_prefetch(&in_flight, 3, 0, 1).is_none());
+        assert_eq!(in_flight.load(Ordering::Acquire), 2);
+        drop(first);
+        drop(second);
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -3201,7 +3218,7 @@ mod tests {
         assert_eq!(remote_heavy_worker_count(1), 1);
         assert_eq!(remote_heavy_worker_count(2), 1);
         assert_eq!(remote_heavy_worker_count(4), 2);
-        assert_eq!(remote_heavy_worker_count(8), 2);
-        assert_eq!(remote_heavy_worker_count(64), 2);
+        assert_eq!(remote_heavy_worker_count(8), 3);
+        assert_eq!(remote_heavy_worker_count(64), 3);
     }
 }

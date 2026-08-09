@@ -47,7 +47,7 @@ const TELEMETRY_WINDOW: Duration = Duration::from_secs(60);
 pub const HTTP_WORKER_COUNT: usize = 12;
 pub const MAX_CONCURRENT_IPC: usize = 6;
 pub const MAX_CONCURRENT_HEAVY_IPC: usize = 4;
-pub const MAX_CONCURRENT_PAGE_PREFETCH: usize = 1;
+pub const MAX_CONCURRENT_PAGE_PREFETCH: usize = 2;
 pub const MAX_CONCURRENT_STREAM_IPC: usize = 4;
 const IPC_RETRY_AFTER_SECONDS: u64 = 1;
 
@@ -5392,15 +5392,17 @@ mod tests {
     #[test]
     fn page_prefetch_keeps_one_heavy_slot_for_foreground() {
         let admission = IpcAdmission::new();
-        let existing = (0..MAX_CONCURRENT_HEAVY_IPC - 2)
+        let existing = (0..MAX_CONCURRENT_HEAVY_IPC - MAX_CONCURRENT_PAGE_PREFETCH - 1)
             .map(|_| admission.try_enter(IpcClass::Heavy).unwrap())
             .collect::<Vec<_>>();
-        let prefetch = admission.try_enter(IpcClass::Prefetch).unwrap();
+        let prefetches = (0..MAX_CONCURRENT_PAGE_PREFETCH)
+            .map(|_| admission.try_enter(IpcClass::Prefetch).unwrap())
+            .collect::<Vec<_>>();
         assert!(admission.try_enter(IpcClass::Prefetch).is_err());
         let foreground = admission.try_enter(IpcClass::Heavy).unwrap();
         assert!(admission.try_enter(IpcClass::Heavy).is_err());
         drop(foreground);
-        drop(prefetch);
+        drop(prefetches);
         drop(existing);
     }
 

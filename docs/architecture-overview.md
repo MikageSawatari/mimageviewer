@@ -100,6 +100,11 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `diagnostics.rs` | 診断 zip 書き出し (`export_diagnostics_zip`)。logs ディレクトリのログ群 + システム情報をまとめてデスクトップに保存。環境設定「開発者」タブから呼ばれる |
 | `stats.rs` | 読み込み統計の集計 |
 
+2026-08-09 以降の `crates/remote-web/web/app.js` は、前方 3 / 後方 1 の要求解像度を維持したまま
+先読みを同時最大 2 件にし、最大見開き 2 + 前方 3 + 後方 1 を 8 MiB/ページで保持できる
+48 MiB 下限を持つ。DOM 適用境界は `page_display` telemetry に要求ページ、seek label、
+候補 / 適用 HTTP request ID、非適用理由を path と session capability なしで記録する。
+
 ### グリッド / サムネイル / フルスクリーン
 
 | モジュール | 役割 |

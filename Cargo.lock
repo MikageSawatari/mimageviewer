@@ -3997,7 +3997,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-ipc"
-version = "2.12.0"
+version = "2.13.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4015,7 +4015,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-remote"
-version = "2.12.0"
+version = "2.13.0"
 dependencies = [
  "argon2",
  "fast_image_resize",

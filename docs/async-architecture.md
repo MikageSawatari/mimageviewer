@@ -76,6 +76,12 @@
 
 ---
 
+2026-08-09 以降、上表の「mIV Remote Page 最終合成」の同時実行欄と末尾の直列取得記述は
+次の契約で読み替える。remote heavy worker は利用者設定の半分・最大 3 本、prefetch は
+`min(heavy_workers - 1, 2)` 本で、foreground 用に常に 1 本を予約する。同時 prefetch は互いを
+cancel せず、foreground が全 prefetch の cancel token を立てる。Web 側も同時 2 件で、503
+`ipc_busy` は pending 末尾へ戻して `Retry-After` 後に再開する。
+
 ## 2. スレッド間通信
 
 ### 2.1 共有アトミック

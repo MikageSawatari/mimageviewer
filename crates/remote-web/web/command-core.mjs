@@ -2273,6 +2273,58 @@ export function thumbnailRetryDecision(
   };
 }
 
+export const MAX_VIEWER_VISIBLE_PAGES = 2;
+
+/// Keep the byte budget structurally above the configured prefetch working set.
+/// The caller supplies the measured per-page upper bound used for planning; a stale
+/// configured byte limit can therefore never silently undercut the window constants.
+export function pageResourceCacheBudget({
+  configuredBytes,
+  measuredPageBytes,
+  ahead = 3,
+  behind = 1,
+  visiblePages = MAX_VIEWER_VISIBLE_PAGES,
+} = {}) {
+  const pages =
+    Math.max(1, Math.floor(Number(visiblePages) || 1)) +
+    Math.max(0, Math.floor(Number(ahead) || 0)) +
+    Math.max(0, Math.floor(Number(behind) || 0));
+  const perPage = Math.max(1, Math.floor(Number(measuredPageBytes) || 1));
+  const configured = Math.max(1, Math.floor(Number(configuredBytes) || 1));
+  const minimumBytes = Math.min(Number.MAX_SAFE_INTEGER, pages * perPage);
+  return {
+    workingSetPages: pages,
+    minimumBytes,
+    byteLimit: Math.max(configured, minimumBytes),
+  };
+}
+
+export function pagePrefetchStartCount(activeCount, pendingCount, concurrencyLimit) {
+  const limit = Math.max(1, Math.floor(Number(concurrencyLimit) || 1));
+  const active = Math.max(0, Math.floor(Number(activeCount) || 0));
+  const pending = Math.max(0, Math.floor(Number(pendingCount) || 0));
+  return Math.min(pending, Math.max(0, limit - active));
+}
+
+/// admission busy is a temporary capacity observation, not invalidation of the plan.
+/// Put that page behind the remaining plan so other pages get a chance before retry.
+export function pagePrefetchFailurePlan({
+  pendingRequests = [],
+  failedRequest = null,
+  status = 0,
+  errorCode = "",
+} = {}) {
+  const pending = Array.isArray(pendingRequests) ? pendingRequests.slice() : [];
+  const retry = Boolean(
+    Number(status) === 503 && errorCode === "ipc_busy" && failedRequest
+  );
+  if (!retry) return { retry: false, pendingRequests: pending };
+  const failedKey = failedRequest.cacheKey;
+  const retained = pending.filter((request) => request?.cacheKey !== failedKey);
+  retained.push(failedRequest);
+  return { retry: true, pendingRequests: retained };
+}
+
 export function pagePrefetchPlan({
   visibleIndexes,
   itemCount,
@@ -2302,6 +2354,75 @@ export function pagePrefetchPlan({
     push(backwardEdge - step * offset);
   }
   return result;
+}
+
+const VIEWER_PAGE_DISPLAY_OUTCOMES = new Set(["applied", "not_applied"]);
+const VIEWER_PAGE_DISPLAY_REASONS = new Set([
+  "dom_committed",
+  "pending_superseded",
+  "queue_cleared",
+  "load_sequence_mismatch",
+  "abort",
+  "page_identity_mismatch",
+  "remote_state_generation_unattested",
+  "remote_state_generation_mismatch",
+  "remote_session_unattested",
+  "fetch_failed",
+  "decode_failed",
+  "apply_failed",
+]);
+
+function boundedPageNumbers(values) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map((value) => Math.floor(Number(value)))
+    .filter((value) => Number.isInteger(value) && value > 0 && value <= 1_000_000))]
+    .slice(0, MAX_VIEWER_VISIBLE_PAGES);
+}
+
+function boundedImageIds(values) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map((value) => String(value ?? ""))
+    .filter((value) => /^[A-Za-z0-9_-]{1,64}$/.test(value)))]
+    .slice(0, MAX_VIEWER_VISIBLE_PAGES);
+}
+
+/// Build the content-free event at the request/seek/DOM-application boundary.
+/// Paths, addresses and session capabilities are deliberately not accepted.
+export function viewerPageDisplayHistoryEvent({
+  outcome,
+  reason,
+  requestedGroupIndex,
+  requestedPageNumbers,
+  seekGroupIndex,
+  seekPageLabel,
+  candidateImageIds = [],
+  appliedImageIds = [],
+} = {}) {
+  const normalizedOutcome = VIEWER_PAGE_DISPLAY_OUTCOMES.has(outcome)
+    ? outcome
+    : "not_applied";
+  const normalizedReason = VIEWER_PAGE_DISPLAY_REASONS.has(reason)
+    ? reason
+    : "apply_failed";
+  const requested = Math.max(0, Math.floor(Number(requestedGroupIndex) || 0));
+  const seek = Math.max(0, Math.floor(Number(seekGroupIndex) || 0));
+  const label = String(seekPageLabel ?? "");
+  const safeLabel = /^[0-9][0-9, /-]{0,63}$/.test(label) ? label : "";
+  const candidates = boundedImageIds(candidateImageIds);
+  const applied = normalizedOutcome === "applied"
+    ? boundedImageIds(appliedImageIds)
+    : [];
+  return {
+    type: "page_display",
+    outcome: normalizedOutcome,
+    reason: normalizedReason,
+    requested_group_index: requested,
+    requested_page_numbers: boundedPageNumbers(requestedPageNumbers),
+    seek_group_index: seek,
+    seek_page_label: safeLabel,
+    candidate_image_ids: candidates,
+    applied_image_ids: applied,
+  };
 }
 
 export function shouldShowLoadingIndicator(

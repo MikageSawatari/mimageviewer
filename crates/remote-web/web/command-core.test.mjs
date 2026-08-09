@@ -18,6 +18,7 @@ import {
   ViewerPanelAction,
   ViewerPanelOrientation,
   IMAGE_QUALITY_PRESETS,
+  MAX_VIEWER_VISIBLE_PAGES,
   VIDEO_QUALITY_PRESETS,
   bufferingQualitySuggestion,
   clampGridColumnOverride,
@@ -52,7 +53,10 @@ import {
   viewerTapCommand,
   viewerTapZone,
   nextFitMode,
+  pagePrefetchFailurePlan,
   pagePrefetchPlan,
+  pagePrefetchStartCount,
+  pageResourceCacheBudget,
   pageResponseGenerationAttestation,
   pageResponseIdentityAttestation,
   planSpreadIntent,
@@ -72,6 +76,7 @@ import {
   SESSION_OWNER_BADGE_ACTIVE_MS,
   viewerImageLayout,
   viewerLayoutTelemetry,
+  viewerPageDisplayHistoryEvent,
   viewerPageDisplaySlot,
   viewerPageGroupGenerationSnapshot,
   viewerPagePositionFeedback,
@@ -2440,6 +2445,117 @@ test("page prefetch follows reading direction and accepts a future spread", () =
     pagePrefetchPlan({ visibleIndexes: [0], itemCount: 3, direction: -1 }),
     [1]
   );
+});
+
+test("page resource budget cannot fall below the measured prefetch working set", () => {
+  const measuredPageBytes = 8 * 1024 * 1024;
+  assert.deepEqual(pageResourceCacheBudget({
+    configuredBytes: 32 * 1024 * 1024,
+    measuredPageBytes,
+    ahead: 3,
+    behind: 1,
+    visiblePages: 1,
+  }), {
+    workingSetPages: 5,
+    minimumBytes: 40 * 1024 * 1024,
+    byteLimit: 40 * 1024 * 1024,
+  });
+  assert.equal(pageResourceCacheBudget({
+    configuredBytes: 32 * 1024 * 1024,
+    measuredPageBytes,
+    ahead: 3,
+    behind: 1,
+    visiblePages: MAX_VIEWER_VISIBLE_PAGES,
+  }).byteLimit, 48 * 1024 * 1024);
+
+  const widerSpreadBudget = pageResourceCacheBudget({
+    configuredBytes: 48 * 1024 * 1024,
+    measuredPageBytes,
+    ahead: 4,
+    behind: 1,
+    visiblePages: MAX_VIEWER_VISIBLE_PAGES,
+  });
+  assert.deepEqual(widerSpreadBudget, {
+    workingSetPages: 7,
+    minimumBytes: 56 * 1024 * 1024,
+    byteLimit: 56 * 1024 * 1024,
+  });
+  assert.deepEqual(pageResourceCacheBudget({
+    configuredBytes: 48 * 1024 * 1024,
+    measuredPageBytes,
+    ahead: 4,
+    behind: 1,
+  }), widerSpreadBudget);
+});
+
+test("page prefetch admission busy retains the plan without consuming a page", () => {
+  const request = (cacheKey) => ({ cacheKey });
+  const failed = request("page-a");
+  const busy = pagePrefetchFailurePlan({
+    pendingRequests: [request("page-b"), request("page-c")],
+    failedRequest: failed,
+    status: 503,
+    errorCode: "ipc_busy",
+  });
+  assert.equal(busy.retry, true);
+  assert.deepEqual(
+    busy.pendingRequests.map(({ cacheKey }) => cacheKey),
+    ["page-b", "page-c", "page-a"]
+  );
+  assert.equal(pagePrefetchStartCount(0, busy.pendingRequests.length, 2), 2);
+
+  const terminal = pagePrefetchFailurePlan({
+    pendingRequests: busy.pendingRequests,
+    failedRequest: failed,
+    status: 422,
+    errorCode: "render_failed",
+  });
+  assert.equal(terminal.retry, false);
+  assert.deepEqual(terminal.pendingRequests, busy.pendingRequests);
+});
+
+test("page display history records applied and rejected boundaries without paths or secrets", () => {
+  const applied = viewerPageDisplayHistoryEvent({
+    outcome: "applied",
+    reason: "dom_committed",
+    requestedGroupIndex: 2,
+    requestedPageNumbers: [3, 4],
+    seekGroupIndex: 2,
+    seekPageLabel: "3-4 / 20",
+    candidateImageIds: ["request-41", "request-42"],
+    appliedImageIds: ["request-41", "request-42"],
+    path: "C:/private/book.pdf",
+    session_id: "0123456789abcdef0123456789abcdef",
+  });
+  assert.deepEqual(applied, {
+    type: "page_display",
+    outcome: "applied",
+    reason: "dom_committed",
+    requested_group_index: 2,
+    requested_page_numbers: [3, 4],
+    seek_group_index: 2,
+    seek_page_label: "3-4 / 20",
+    candidate_image_ids: ["request-41", "request-42"],
+    applied_image_ids: ["request-41", "request-42"],
+  });
+
+  const rejected = viewerPageDisplayHistoryEvent({
+    outcome: "not_applied",
+    reason: "remote_state_generation_unattested",
+    requestedGroupIndex: 4,
+    requestedPageNumbers: [5],
+    seekGroupIndex: 4,
+    seekPageLabel: "5 / 20",
+    candidateImageIds: ["request-50", "C:/private/page.jpg"],
+    appliedImageIds: ["request-50"],
+  });
+  assert.equal(rejected.outcome, "not_applied");
+  assert.equal(rejected.reason, "remote_state_generation_unattested");
+  assert.deepEqual(rejected.candidate_image_ids, ["request-50"]);
+  assert.deepEqual(rejected.applied_image_ids, []);
+
+  const serialized = JSON.stringify(telemetryEventForTier(rejected));
+  assert.doesNotMatch(serialized, /private|session|Bearer|C:\//i);
 });
 
 test("loading indicator appears only after the stable delay threshold", () => {
