@@ -523,8 +523,7 @@ impl NativeTouchAdapter {
                     egui_events.push(egui::Event::PointerMoved(pos));
                     if event.phase == NativeVideoTouchPhase::End {
                         if self.primary_pressed && !suppress_primary {
-                            egui_events.push(primary_button_event(pos, false));
-                            self.primary_pressed = false;
+                            self.release_primary_at(pos, &mut egui_events);
                         } else {
                             egui_events.push(egui::Event::PointerGone);
                         }
@@ -601,6 +600,19 @@ impl NativeTouchAdapter {
         self.primary_pressed = true;
     }
 
+    /// Completes a synthetic primary click and ends its pointer stream.
+    ///
+    /// Native touch has no later mouse-leave event that can terminate the
+    /// emulated pointer. Leaving the last touch position live would turn the
+    /// distance to the next tap into egui's per-pass pointer delta, which a
+    /// ScrollArea can consume as a drag on that next press.
+    fn release_primary_at(&mut self, pos: egui::Pos2, events: &mut Vec<egui::Event>) {
+        debug_assert!(self.primary_pressed);
+        events.push(primary_button_event(pos, false));
+        events.push(egui::Event::PointerGone);
+        self.primary_pressed = false;
+    }
+
     /// Cancels a synthetic primary press without completing a click.
     ///
     /// `egui::Event::PointerGone` only clears the latest pointer position; it
@@ -618,9 +630,7 @@ impl NativeTouchAdapter {
         let press_pos = self.primary_start_pos.unwrap_or(fallback_pos);
         let cancel_pos = press_pos + egui::vec2(PRIMARY_CANCEL_DISTANCE_POINTS, 0.0);
         events.push(egui::Event::PointerMoved(cancel_pos));
-        events.push(primary_button_event(cancel_pos, false));
-        events.push(egui::Event::PointerGone);
-        self.primary_pressed = false;
+        self.release_primary_at(cancel_pos, events);
         true
     }
 
@@ -741,6 +751,22 @@ mod tests {
                 } if *actual == pressed
             )
         })
+    }
+
+    fn pointer_delta_after_events(ctx: &egui::Context, events: Vec<egui::Event>) -> egui::Vec2 {
+        let mut delta = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                if delta.is_none() {
+                    delta = Some(ctx.input(|input| input.pointer.delta()));
+                }
+            },
+        );
+        delta.unwrap()
     }
 
     fn tap(
@@ -1080,7 +1106,53 @@ mod tests {
         );
         assert!(has_primary_button(&start.egui_events, true));
         assert!(has_primary_button(&end.egui_events, false));
+        let released = end
+            .egui_events
+            .iter()
+            .position(|event| has_primary_button(std::slice::from_ref(event), false))
+            .unwrap();
+        let gone = end
+            .egui_events
+            .iter()
+            .position(|event| matches!(event, egui::Event::PointerGone))
+            .unwrap();
+        assert!(released < gone);
         assert!(adapter.take_commands().is_empty());
+    }
+
+    #[test]
+    fn completed_hud_tap_clears_pointer_position_before_next_tap() {
+        let mut adapter = NativeTouchAdapter::default();
+        let ctx = egui::Context::default();
+
+        let first_start = adapter.handle_event(
+            hud_event(1, 500, 100, NativeVideoTouchPhase::Start),
+            &geometry(),
+            0,
+            1.0,
+        );
+        assert_eq!(
+            pointer_delta_after_events(&ctx, first_start.egui_events),
+            egui::Vec2::ZERO
+        );
+        let first_end = adapter.handle_event(
+            hud_event(1, 500, 100, NativeVideoTouchPhase::End),
+            &geometry(),
+            50,
+            1.0,
+        );
+        let _ = pointer_delta_after_events(&ctx, first_end.egui_events);
+
+        let second_start = adapter.handle_event(
+            hud_event(2, 500, 700, NativeVideoTouchPhase::Start),
+            &geometry(),
+            100,
+            1.0,
+        );
+        assert_eq!(
+            pointer_delta_after_events(&ctx, second_start.egui_events),
+            egui::Vec2::ZERO
+        );
     }
 
     #[test]

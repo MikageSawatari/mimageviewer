@@ -936,6 +936,23 @@ mIV で `scroll_source()` を上書きしているのは `src/ui_main.rs:2278` �
   (`scroll_area.rs:786-803`)。壊れはしないが、
   **「slider やタグボタンが密集した場所からはスクロールを始めにくい」** という UX 問題は残る
 
+#### Phase 3 Step 3i 実装記録 (2026-08-09)
+
+- 動画 native の右パネルで離れた位置のタグを順にタップするとパネルがスクロールする原因は、
+  `NativeTouchAdapter` が正常な synthetic primary release の後に `PointerGone` を出して
+  いなかったことだった。egui の `PointerState` に前回タップ位置が残り、次の HUD タップ開始時の
+  `PointerMoved` がタップ間の位置差を `pointer.delta()` にした。`ScrollArea` の背景
+  drag response は press 時点から active なので、その偽 delta をスクロール量として消費した
+- native touch の正常終了を `primary release -> PointerGone` の一つの終端処理に統一した。
+  実ドラッグ中の Start / Move 列と `TouchRecognizer` の tap / drag 判定には触れず、
+  `PointerGone` も End 後にだけ送るため、指ドラッグと慣性スクロールは維持される。
+  静止画・音楽の egui-winit 経路は元から同じ終端列を出しており変更していない
+- タグ完了の情報トーストはパネルと描画矩形が重なる場合があるが、egui viewer 経路では
+  reveal path を持たず painter 描画だけで `ui.interact` を作らない。native video 経路も
+  toast の `Area` を `interactable(false)` にしているため、どちらも入力を遮断しない。
+  クリック可能なのは reveal path を持つ actionable toast だけという既存仕様を維持し、
+  トースト側には変更を入れていない
+
 #### (3) タッチターゲットが小さすぎる
 
 UI 倍率 100% / OS 倍率 100% における実測 (egui logical point):
@@ -1238,6 +1255,26 @@ pass 番号や「実行済み」guard を置いてはならない。新しい su
 - 相互排他の状態を bool で持たない。**typed owner** にして、
   各 owner の arm と clear を 1 か所で対応付ける (#3 の修正がこれ)
 - 新しい surface / 新しい抑止を足すときは、この表を先に読む
+
+##### ⚠ もう 1 つの同型 — 「対になる経路を数えていない」
+
+2026-08-09 の 1 セッションで **3 回**出た。いずれも
+**同じ性質の経路が 2 本あり、片方だけ直していた**:
+
+| # | 直した側 | 残っていた側 | 症状 |
+| --- | --- | --- | --- |
+| 1 | ズームパンの `pointer.delta()` (8/8) | 連結読みの `pointer.delta()` | 連結読みで指ドラッグが効かない |
+| 2 | 前面奪還抑止のコマンド経路 (8/8) | 同じ抑止の応答駆動経路 | タップは効くのにドラッグだけ死ぬ |
+| 3 | synthetic pointer の Cancel 終端 | 通常タップの終端 (`PointerGone` 無し) | 次のタップでパネルが勝手にスクロール |
+
+**規則**: 直す前に、**同じ値を読む場所 / 同じ状態を終わらせる場所を機械的に数える**。
+
+- 「この関数を直した」ではなく「**この値の consumer を全部直した**」で完了とする
+- 終端は特に危ない。**正常終了と異常終了は必ず対になる**ので、片方だけ完全な状態を作らない。
+  終端処理は 1 か所の helper に集約し、両方がそこを通る形にする (#3 の修正がこれ)
+- CLAUDE.md「バグ修正の一般原則」の
+  「**同型の入口・終了経路も確認してから修正する**」がこれ。
+  読んでいても、実際に列挙しないと効かない
 
 必要なのは**アプリ側の所有権**:
 
