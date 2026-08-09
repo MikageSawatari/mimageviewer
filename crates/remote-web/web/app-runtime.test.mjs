@@ -124,6 +124,7 @@ const {
   favoriteSearchResultTitle,
   gridReturnItemIdentity,
   invalidateViewerPendingLoad,
+  isStreamMediaKind,
   loadFolder,
   normalizeRemoteAdjustmentValues,
   normalizeRemoteBookBookmarkList,
@@ -133,6 +134,7 @@ const {
   parentContainerAddress,
   parseRoute,
   reloadApplication,
+  renderResolvedMediaOpen,
   remoteAiCompletionMessage,
   remoteAiProgressText,
   remoteAiPollingDelay,
@@ -1036,6 +1038,38 @@ test("tapping an audio grid tile opens the shared media viewer route", () => {
   assert.equal(showUnsupportedRemoteEntryNotice(notice, "audio"), false);
   assert.equal(notice.hidden, true);
   assert.equal(resolveMediaOpenRoute("audio", { kind: "audio", address }, -1), "audio");
+});
+
+test("resolved audio and video opens enter the media viewer instead of the image viewer", () => {
+  for (const kind of ["audio", "video"]) {
+    const entry = {
+      kind,
+      name: kind === "audio" ? "track.flac" : "movie.mp4",
+      address: {
+        path: testPath(kind === "audio" ? "music/track.flac" : "clips/movie.mp4"),
+        subresource: { kind: "file" },
+      },
+    };
+    const calls = [];
+    const mediaRoute = resolveMediaOpenRoute(kind, entry, -1);
+    const renderedViewer = renderResolvedMediaOpen(
+      mediaRoute,
+      entry,
+      -1,
+      123,
+      (addressedEntry) => {
+        calls.push({ viewer: "media", entry: addressedEntry });
+        return true;
+      },
+      (imageIndex, startedAt) => calls.push({ viewer: "image", imageIndex, startedAt })
+    );
+
+    assert.equal(isStreamMediaKind(kind), true);
+    assert.equal(renderedViewer, "media");
+    assert.deepEqual(calls, [{ viewer: "media", entry }]);
+  }
+  assert.equal(isStreamMediaKind("image"), false);
+  assert.equal(isStreamMediaKind("archive"), false);
 });
 
 test("tapping an archive grid tile shows the same shared unsupported notice route", () => {

@@ -1397,7 +1397,7 @@ async function dispatchRoute() {
         if (!entry) {
           throw new Error("フォルダ内のメディアが見つかりませんでした。");
         }
-        if (["video", "audio"].includes(entry.kind)) {
+        if (isStreamMediaKind(entry.kind)) {
           state.gridIndex = entryIndex;
           renderVideoViewer(entry);
           return;
@@ -1897,8 +1897,14 @@ function dispatchCommand(requested, meta = {}) {
   return handled;
 }
 
+// This predicate is the canonical stream-media kind boundary. When another kind starts using
+// the shared media viewer, update only this predicate instead of copying the kind set to callers.
+export function isStreamMediaKind(kind) {
+  return kind === "video" || kind === "audio";
+}
+
 export function resolveMediaOpenRoute(requestedKind, addressedEntry, imageIndex) {
-  if (!["image", "video", "audio"].includes(requestedKind)) return null;
+  if (requestedKind !== "image" && !isStreamMediaKind(requestedKind)) return null;
   if (!addressedEntry || addressedEntry.kind !== requestedKind) return null;
   if (requestedKind === "image" && imageIndex < 0) return null;
   return requestedKind;
@@ -2004,13 +2010,15 @@ function executeOpenCommand(payload, meta) {
       "",
       mediaHash(payload.address)
     );
-    if (mediaRoute === "video") {
-      if (!renderVideoViewer(addressedEntry)) {
-        meta.openRoute = "video_viewer_entry_rejected";
-        return false;
-      }
-    } else {
-      renderImageViewer(imageIndex, meta.at ?? performance.now());
+    const renderedViewer = renderResolvedMediaOpen(
+      mediaRoute,
+      addressedEntry,
+      imageIndex,
+      meta.at ?? performance.now()
+    );
+    if (renderedViewer === "rejected") {
+      meta.openRoute = "video_viewer_entry_rejected";
+      return false;
     }
     return true;
   }
@@ -2144,7 +2152,7 @@ function openGridEntry(index, meta) {
       meta
     );
   }
-  if (["video", "audio"].includes(entry.kind)) {
+  if (isStreamMediaKind(entry.kind)) {
     return executeOpenCommand(
       {
         kind: "media",
@@ -4142,7 +4150,7 @@ export function createGridTile(
           });
         }
       });
-    } else if (["video", "audio"].includes(entry.kind)) {
+    } else if (isStreamMediaKind(entry.kind)) {
       tile.addEventListener("click", (event) => {
         commandDispatcher(command(CommandName.OPEN, {
           kind: "media",
@@ -4304,7 +4312,7 @@ function entryTypeLabel(kind) {
 }
 
 function renderVideoViewer(entry) {
-  if (!entry || !["video", "audio"].includes(entry.kind)) {
+  if (!entry || !isStreamMediaKind(entry.kind)) {
     recordClientError("video_viewer_entry_rejected", "メディアビューアに未対応の項目が渡されました", {
       entry_found: Boolean(entry),
       resolved_kind: entry?.kind ?? "missing",
@@ -4360,6 +4368,23 @@ function renderVideoViewer(entry) {
     }
   });
   return true;
+}
+
+// Keep the renderer selection in one production function so tests cover the dispatch that
+// follows resolveMediaOpenRoute, not just the resolver's return value.
+export function renderResolvedMediaOpen(
+  mediaRoute,
+  addressedEntry,
+  imageIndex,
+  startedAt,
+  renderMedia = renderVideoViewer,
+  renderImage = renderImageViewer
+) {
+  if (isStreamMediaKind(mediaRoute)) {
+    return renderMedia(addressedEntry) ? "media" : "rejected";
+  }
+  renderImage(imageIndex, startedAt);
+  return "image";
 }
 
 export function videoFileTargetIndex(currentIndex, count, delta, wrap = false) {
