@@ -2177,16 +2177,15 @@ struct ViewerContextBundle {
         std::collections::HashMap<usize, crate::view_trim::ViewTrimPageOverride>,
     view_trim_dirty_page_overrides: std::collections::HashSet<usize>,
     view_trim_save_pending: bool,
-    fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    fs_cache: ItemsGenerationMap<FsCacheEntry>,
     fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache,
     fs_margin_bbox_cache: std::collections::HashMap<usize, (u64, usize, Option<egui::Rect>)>,
     input_generation: std::collections::HashMap<usize, u64>,
-    fs_pending:
-        std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>, u64)>,
+    fs_pending: ItemsGenerationMap<FsPendingValue>,
     /// この viewer context の実描画先から得た PDF 初回レンダターゲット。
     fs_pdf_display_target: Option<crate::pdf_loader::PdfDisplayTarget>,
-    fs_early_dims: std::collections::HashMap<usize, [usize; 2]>,
-    fs_upload_backlog: Vec<(usize, FsLoadResult, u64)>,
+    fs_early_dims: ItemsGenerationMap<[usize; 2]>,
+    fs_upload_backlog: FsUploadBacklog,
     top_level_grid_view: top_level_grid_view::TopLevelGridView,
     items_are_global_search_view: bool,
     items_are_tag_view: bool,
@@ -2351,6 +2350,15 @@ impl Drop for ViewerContextBundle {
 
 #[cfg(windows)]
 impl ViewerContextBundle {
+    fn set_items_generation(&mut self, items_generation: u64) {
+        self.items_generation = items_generation;
+        self.fs_cache.set_items_generation(items_generation);
+        self.fs_pending.set_items_generation(items_generation);
+        self.fs_early_dims.set_items_generation(items_generation);
+        self.fs_upload_backlog
+            .set_items_generation(items_generation);
+    }
+
     fn empty() -> Self {
         // per-context ロード複合体: 空コンテキストは「誰も繋がっていない」fresh channel と
         // token を持つ (App::new と同じ初期状態。この tx を掴む worker は存在しないので
@@ -2469,14 +2477,14 @@ impl ViewerContextBundle {
             view_trim_page_overrides: std::collections::HashMap::new(),
             view_trim_dirty_page_overrides: std::collections::HashSet::new(),
             view_trim_save_pending: false,
-            fs_cache: std::collections::HashMap::new(),
+            fs_cache: ItemsGenerationMap::new("fs_cache"),
             fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache::default(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             input_generation: std::collections::HashMap::new(),
-            fs_pending: std::collections::HashMap::new(),
+            fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
             fs_pdf_display_target: None,
-            fs_early_dims: std::collections::HashMap::new(),
-            fs_upload_backlog: Vec::new(),
+            fs_early_dims: ItemsGenerationMap::new("fs_early_dims"),
+            fs_upload_backlog: FsUploadBacklog::new("fs_upload_backlog", fs_upload_backlog_idx),
             top_level_grid_view: top_level_grid_view::TopLevelGridView::default(),
             items_are_global_search_view: false,
             items_are_tag_view: false,
@@ -4808,6 +4816,18 @@ use crate::fs_animation::{
     decode_gif_frames, decode_gif_frames_from_bytes, decode_webp_frames,
     decode_webp_frames_from_bytes,
 };
+use crate::items_generation_cache::{ItemsGenerationMap, ItemsGenerationVec};
+
+type FsPendingValue = (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>, u64);
+type FsUploadBacklog = ItemsGenerationVec<(usize, FsLoadResult, u64)>;
+
+fn cancel_fs_pending_value(value: &mut FsPendingValue) {
+    value.0.store(true, Ordering::Relaxed);
+}
+
+fn fs_upload_backlog_idx(value: &(usize, FsLoadResult, u64)) -> usize {
+    value.0
+}
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::thumb_loader::{
     CacheDecision, DctDecodeError, LoadRequest, ScaleStats, ThumbMsg, apply_orientation,
@@ -8449,8 +8469,9 @@ pub struct App {
     native_video_parked_live_activation_requests: Vec<u64>,
     #[cfg(windows)]
     next_detached_viewer_context_serial: u64,
-    /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）
-    pub(crate) fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）。
+    /// entry はこの bundle の items_generation を刻み、全参照で照合する。
+    pub(crate) fs_cache: ItemsGenerationMap<FsCacheEntry>,
     pub(crate) fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache,
     /// raw Static 画素の近モノクロ要約。TextureId が source identity を兼ねるため、
     /// 再デコードや PDF 再レンダ後の古い値は lookup 時に自然に stale になる。
@@ -8483,12 +8504,12 @@ pub struct App {
     /// idx 単位で +1 する。`erase_result_cache` の key に含めることで、入力が
     /// 変わった後に古い MI-GAN 結果を表示しない。
     pub(crate) input_generation: std::collections::HashMap<usize, u64>,
-    /// 先読み中: item_idx → (キャンセルトークン, 受信チャネル, load 開始時の input_seq)
+    /// 先読み中: item_idx → (キャンセルトークン, 受信チャネル, load 開始時の input_seq)。
+    /// request の items_generation は map entry に刻み、完了物の各着地点まで運ぶ。
     /// `input_seq` は perf の `fs.ready` / `fs.paint` を `fs.load_begin` と同じ
     /// 操作に紐づけるための相関キー。`self.input_seq` を使うと非同期完了時に
     /// 別のユーザー操作にずれる。計装無効時や内部起動は 0。
-    pub(crate) fs_pending:
-        std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>, u64)>,
+    pub(crate) fs_pending: ItemsGenerationMap<FsPendingValue>,
 
     /// fullscreen / detached / in-window の実 viewport と effective ppp から得た
     /// PDF 初回レンダターゲット。viewer context と一緒に swap する。
@@ -8498,15 +8519,15 @@ pub struct App {
     /// `FsLoadResult::DimsOnly` を受信すると登録され、本体 (`Static` など) で
     /// fs_cache が埋まったら削除される。ホバーバーはデコード完了前でも
     /// これを見て即サイズを表示できる (⚠ ダウンスケール警告もここで判定可能)。
-    pub(crate) fs_early_dims: std::collections::HashMap<usize, [usize; 2]>,
+    pub(crate) fs_early_dims: ItemsGenerationMap<[usize; 2]>,
 
     /// デコード完了済みだが GPU アップロード未了の先読みエントリ。
     /// 20MP 級 JPEG の `ctx.load_texture` は UI スレッドで 25-60ms/枚かかり、
     /// 10 枚連続で来ると 500ms 超の UI フリーズになる (計測実績あり)。
     /// `poll_prefetch` では受信を drain してここに溜め、フレームあたり最大 1 枚だけ
     /// アップロードする (現在ページは即時)。
-    /// `(idx, FsLoadResult, load_seq)` — FIFO 順で消化する。
-    pub(crate) fs_upload_backlog: Vec<(usize, FsLoadResult, u64)>,
+    /// `(idx, FsLoadResult, load_seq)` と entry の items_generation — FIFO 順で消化する。
+    pub(crate) fs_upload_backlog: FsUploadBacklog,
 
     /// items が差し替わるたびにインクリメントする世代カウンタ。
     /// `LoadRequest::items_gen` → worker → `ThumbMsg::items_gen` を経由して poll_thumbnails
@@ -11900,7 +11921,7 @@ impl App {
             native_video_parked_live_activation_requests: Vec::new(),
             #[cfg(windows)]
             next_detached_viewer_context_serial: 1,
-            fs_cache: std::collections::HashMap::new(),
+            fs_cache: ItemsGenerationMap::new("fs_cache"),
             fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache::default(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             view_trim_mode: false,
@@ -11913,10 +11934,10 @@ impl App {
             view_trim_save_pending: false,
             view_trim_db,
             input_generation: std::collections::HashMap::new(),
-            fs_pending: std::collections::HashMap::new(),
+            fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
             fs_pdf_display_target: None,
-            fs_upload_backlog: Vec::new(),
-            fs_early_dims: std::collections::HashMap::new(),
+            fs_upload_backlog: FsUploadBacklog::new("fs_upload_backlog", fs_upload_backlog_idx),
+            fs_early_dims: ItemsGenerationMap::new("fs_early_dims"),
             colorize_mono_summary_cache: std::collections::HashMap::new(),
             items_generation: 0,
             top_level_grid_view: top_level_grid_view::TopLevelGridView::default(),
@@ -17767,7 +17788,7 @@ impl App {
                     self.items.push(GridItem::Video(config.path.clone()));
                     self.image_metas.push(None);
                     self.thumbnails.push(ThumbnailState::Pending);
-                    self.items_generation = self.items_generation.wrapping_add(1);
+                    self.bump_items_generation();
                     self.invalidate_facet_name_cache();
                     self.visible_indices.push(idx);
                     idx
@@ -22512,6 +22533,27 @@ impl App {
         }
     }
 
+    fn set_items_generation(&mut self, items_generation: u64) {
+        self.items_generation = items_generation;
+        self.fs_cache.set_items_generation(items_generation);
+        self.fs_pending.set_items_generation(items_generation);
+        self.fs_early_dims.set_items_generation(items_generation);
+        self.fs_upload_backlog
+            .set_items_generation(items_generation);
+    }
+
+    pub(crate) fn bump_items_generation(&mut self) {
+        self.set_items_generation(self.items_generation.wrapping_add(1));
+    }
+
+    #[cfg(test)]
+    fn fs_generation_state_is_current(&self) -> bool {
+        self.fs_cache.current_items_generation() == self.items_generation
+            && self.fs_pending.current_items_generation() == self.items_generation
+            && self.fs_early_dims.current_items_generation() == self.items_generation
+            && self.fs_upload_backlog.current_items_generation() == self.items_generation
+    }
+
     /// items / image_metas / thumbnails を新しい並びで差し替え、items_generation を bump する。
     ///
     /// 世代更新と thumbnails の Pending 初期化を 1 箇所に集約するためのヘルパ。
@@ -22552,7 +22594,7 @@ impl App {
                 _ => ThumbnailState::Pending,
             })
             .collect();
-        self.items_generation = self.items_generation.wrapping_add(1);
+        self.bump_items_generation();
         self.invalidate_facet_name_cache();
         // 一覧全体の差し替えでは同じ index が別アイテムを指し得るため、クリック範囲選択の
         // 起点を失効させる。Ctrl+G streaming のように内容 identity で追従できる経路だけ、
@@ -24287,6 +24329,27 @@ impl App {
             })
             .collect();
 
+        // 各残存 old_idx に対する new_idx を partition_point で O(log K) 算出。
+        let mut sorted_asc: Vec<usize> = sorted_desc_idxs.to_vec();
+        sorted_asc.sort_unstable();
+        let shift = |old: usize| -> Option<usize> {
+            let p = sorted_asc.partition_point(|&x| x < old);
+            if sorted_asc.get(p) == Some(&old) {
+                return None;
+            }
+            Some(old - p)
+        };
+
+        // 再生中の動画/音声 player は明示的に old idx -> new idx へ移して温存する。
+        // 新世代への bump より前に owner から取り出し、後段の invalidate 後に刻み直す。
+        let preserved_video_entries: Vec<(usize, FsCacheEntry)> = self
+            .fs_cache
+            .take_values()
+            .into_iter()
+            .filter(|(_, entry)| matches!(entry, FsCacheEntry::Video { .. }))
+            .filter_map(|(i, entry)| shift(i).map(|ni| (ni, entry)))
+            .collect();
+
         // 物理 shift: 降順なので items.remove(i) の再 shift は発生しない。
         for &i in sorted_desc_idxs {
             if i < self.items.len() {
@@ -24299,23 +24362,10 @@ impl App {
                 self.image_metas.remove(i);
             }
         }
-        self.items_generation = self.items_generation.wrapping_add(1);
+        self.bump_items_generation();
         self.remove_paths_from_subfolder_expansion_snapshot(&removed_snapshot_paths);
         self.remove_paths_from_smart_folder_snapshots(&removed_snapshot_paths);
 
-        // 各残存 old_idx に対する new_idx を partition_point で O(log K) 算出。
-        // 削除 idx 集合は降順入力だが、partition_point には昇順が要るので一度昇順化する。
-        // 削除済み判定も partition_point の位置で `sorted_asc[p] == old` を見れば済み、
-        // HashSet<usize> を別途作る必要はない。
-        let mut sorted_asc: Vec<usize> = sorted_desc_idxs.to_vec();
-        sorted_asc.sort_unstable();
-        let shift = |old: usize| -> Option<usize> {
-            let p = sorted_asc.partition_point(|&x| x < old);
-            if sorted_asc.get(p) == Some(&old) {
-                return None;
-            }
-            Some(old - p)
-        };
         self.grid_click_selection_anchor = self
             .grid_click_selection_anchor
             .and_then(|anchor| anchor.index_for_generation(previous_items_generation))
@@ -24639,17 +24689,6 @@ impl App {
                     shift(pending.target_idx).expect("tile-swap target removal handled above");
             }
         }
-
-        // 再生中の動画/音声 player (FsCacheEntry::Video) は shift した新 idx で温存する。
-        // invalidate の fs_cache.clear() に任せると、削除対象と無関係な別窓再生中の player が
-        // その場で drop され再生が突然止まる (review-v2.3.0 P2-2)。画像 entry は再デコードが
-        // 安価なので従来どおり捨てて再ロードに任せる。
-        let preserved_video_entries: Vec<(usize, FsCacheEntry)> =
-            std::mem::take(&mut self.fs_cache)
-                .into_iter()
-                .filter(|(_, entry)| matches!(entry, FsCacheEntry::Video { .. }))
-                .filter_map(|(i, entry)| shift(i).map(|ni| (ni, entry)))
-                .collect();
 
         self.invalidate_idx_state_and_queues();
         self.fs_cache.extend(preserved_video_entries);
@@ -34846,7 +34885,7 @@ impl App {
     #[cfg(windows)]
     fn assign_next_detached_viewer_context_generation(&mut self) -> u64 {
         let (context_serial, items_generation) = self.allocate_detached_viewer_context_generation();
-        self.items_generation = items_generation;
+        self.set_items_generation(items_generation);
         context_serial
     }
 
@@ -38915,7 +38954,7 @@ impl App {
             self.allocate_detached_viewer_context_generation();
         let mut bundle = self.split_materialized_physical_context_for_independent_still_open();
         bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        bundle.items_generation = items_generation;
+        bundle.set_items_generation(items_generation);
         bundle.address = physical_context.display().to_string();
         bundle.current_folder = Some(physical_context.clone());
         bundle.visible_indices = bundle
@@ -53363,6 +53402,35 @@ impl App {
         }
     }
 
+    fn enqueue_fs_upload_result_for_generation(
+        &mut self,
+        items_generation: u64,
+        idx: usize,
+        result: FsLoadResult,
+        load_seq: u64,
+    ) -> bool {
+        if !self
+            .fs_upload_backlog
+            .accepts_generation(idx, items_generation)
+        {
+            return false;
+        }
+        let backlog_pos = self
+            .fs_upload_backlog
+            .iter()
+            .position(|(key, _, _)| *key == idx);
+        if let Some(pos) = backlog_pos {
+            self.fs_upload_backlog.replace_for_generation(
+                pos,
+                items_generation,
+                (idx, result, load_seq),
+            )
+        } else {
+            self.fs_upload_backlog
+                .push_for_generation(items_generation, (idx, result, load_seq))
+        }
+    }
+
     fn enqueue_retained_pdf_page_raster_result(
         &mut self,
         idx: usize,
@@ -53375,15 +53443,7 @@ impl App {
             pixels,
             source_dims,
         };
-        if let Some(pos) = self
-            .fs_upload_backlog
-            .iter()
-            .position(|(key, _, _)| *key == idx)
-        {
-            self.fs_upload_backlog[pos] = (idx, result, load_seq);
-        } else {
-            self.fs_upload_backlog.push((idx, result, load_seq));
-        }
+        self.enqueue_fs_upload_result_for_generation(self.items_generation, idx, result, load_seq);
         self.fs_early_dims.remove(&idx);
         crate::logger::log(format!(
             "[PDF] Retained page enqueue idx={idx} kind=raster backlog={} reason={reason}",
@@ -59425,18 +59485,18 @@ impl App {
         // `DimsOnly` は非終端 (後続メッセージあり) なので fs_pending は維持して
         // drain を続ける。fs_early_dims への書き込みは fs_pending 借用中はできないので
         // ローカル vec に積んでから後段で apply する。
-        let mut completed: Vec<(usize, FsLoadResult, u64)> = Vec::new();
+        let mut completed: Vec<(usize, FsLoadResult, u64, u64)> = Vec::new();
         let mut disconnected: Vec<usize> = Vec::new();
-        let mut early_dims_updates: Vec<(usize, [usize; 2])> = Vec::new();
-        for (&key, (_, rx, seq)) in &self.fs_pending {
+        let mut early_dims_updates: Vec<(usize, [usize; 2], u64)> = Vec::new();
+        for (&key, items_generation, (_, rx, seq)) in self.fs_pending.iter_with_generation() {
             loop {
                 match rx.try_recv() {
                     Ok(FsLoadResult::DimsOnly { source_dims }) => {
-                        early_dims_updates.push((key, source_dims));
+                        early_dims_updates.push((key, source_dims, items_generation));
                         continue;
                     }
                     Ok(result) => {
-                        completed.push((key, result, *seq));
+                        completed.push((key, result, *seq, items_generation));
                         break;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -59448,8 +59508,9 @@ impl App {
             }
         }
         let early_dims_repaint = !early_dims_updates.is_empty();
-        for (key, dims) in early_dims_updates {
-            self.fs_early_dims.insert(key, dims);
+        for (key, dims, items_generation) in early_dims_updates {
+            self.fs_early_dims
+                .insert_for_generation(key, items_generation, dims);
         }
         // 送信側が drop されたエントリを除去 (キャンセル済みスレッドが送信せずに終了)
         for key in disconnected {
@@ -59458,7 +59519,7 @@ impl App {
         }
         // fs_pending からは即座に除去 (「先読み中 / 完了」状態の重複を防ぐ)。
         // backlog に積まれた時点で fs_cache に載る手前の最終中継点として扱う。
-        for (key, _, _) in &completed {
+        for (key, _, _, _) in &completed {
             self.fs_pending.remove(key);
             self.fs_early_dims.remove(key);
         }
@@ -59468,7 +59529,7 @@ impl App {
         // pano_high_res_source には入らないので、backlog に複数滞留させる必要なし。
         // mpsc 受信直後に drop して memory peak を最小化する。
         let current_fs = self.fullscreen_idx;
-        for (key, mut result, load_seq) in completed {
+        for (key, mut result, load_seq, items_generation) in completed {
             if Some(key) != current_fs {
                 if let FsLoadResult::StaticPanorama {
                     ci,
@@ -59480,15 +59541,7 @@ impl App {
                     result = FsLoadResult::Static { ci, source_dims };
                 }
             }
-            if let Some(pos) = self
-                .fs_upload_backlog
-                .iter()
-                .position(|(k, _, _)| *k == key)
-            {
-                self.fs_upload_backlog[pos] = (key, result, load_seq);
-            } else {
-                self.fs_upload_backlog.push((key, result, load_seq));
-            }
+            self.enqueue_fs_upload_result_for_generation(items_generation, key, result, load_seq);
         }
 
         // ── ペーシング: このフレームで何枚アップロードするか決める ──
@@ -59519,16 +59572,19 @@ impl App {
         // 両方ある場合は元の位置順 (FIFO) を維持するため、大きい位置から remove する。
         let mut positions: Vec<usize> = [cur_pos, other_pos].into_iter().flatten().collect();
         positions.sort_unstable_by(|a, b| b.cmp(a));
-        let mut to_process: Vec<(usize, FsLoadResult, u64)> = positions
+        let mut to_process: Vec<(u64, (usize, FsLoadResult, u64))> = positions
             .into_iter()
-            .map(|pos| self.fs_upload_backlog.remove(pos))
+            .map(|pos| self.fs_upload_backlog.remove_with_generation(pos))
             .collect();
         // descending で取り出したので元の位置順に直す
         to_process.reverse();
 
         let has_more_backlog = !self.fs_upload_backlog.is_empty();
         let repaint = !to_process.is_empty() || early_dims_repaint || has_more_backlog;
-        for (key, result, load_seq) in to_process {
+        for (items_generation, (key, result, load_seq)) in to_process {
+            if !self.fs_cache.accepts_generation(key, items_generation) {
+                continue;
+            }
             // 本体メッセージで fs_cache が埋まるので先行ヒントはもう不要。
             // (ホバーバーは fs_cache.source_dims を優先して見るため、残っていても
             // 実害はないが HashMap が膨張しないようクリーンアップする)
@@ -59676,7 +59732,8 @@ impl App {
                     unreachable!("DimsOnly should be drained before reaching completion match")
                 }
             };
-            self.fs_cache.insert(key, entry);
+            self.fs_cache
+                .insert_for_generation(key, items_generation, entry);
             self.fs_margin_bbox_cache.remove(&key);
             self.bump_input_generation_for_fs_cache_reload(key);
             // 360 度パノラマビュー Phase 2a (§3.6.4): worker は tee しなかったが、

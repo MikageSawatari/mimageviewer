@@ -37,6 +37,7 @@ use crate::displayed_image_transform::{
 use crate::fs_animation::FsCacheEntry;
 use crate::gpu_lanczos::FullscreenPaintResource;
 use crate::grid_item::{GridItem, ThumbnailState};
+use crate::items_generation_cache::ItemsGenerationMap;
 use crate::keymap::{
     Chord, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES, KeyAction, KeyName,
     KeyTrigger, Keymap, command_catalog,
@@ -6214,7 +6215,7 @@ fn continuous_reading_drag_delta(
 /// 寸法はテクスチャ退去で失わないため、同じ items 世代で既知から未知へは後退しない。
 fn is_landscape(
     idx: usize,
-    fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
+    fs_cache: &ItemsGenerationMap<FsCacheEntry>,
     thumbnails: &[ThumbnailState],
     page_dims_cache: &crate::page_dims::PageDimsCache,
     items_generation: u64,
@@ -6304,7 +6305,7 @@ fn build_spread_display_units(
     items: &[GridItem],
     spread_mode: SpreadMode,
     shift_anchor_idx: Option<usize>,
-    fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
+    fs_cache: &ItemsGenerationMap<FsCacheEntry>,
     thumbnails: &[ThumbnailState],
     page_dims_cache: &crate::page_dims::PageDimsCache,
     items_generation: u64,
@@ -24330,7 +24331,7 @@ impl App {
                 )
             } else {
                 // サムネイルのみ使用（fs_cache を空マップとして渡す）
-                let empty = std::collections::HashMap::new();
+                let empty = ItemsGenerationMap::new("fs_cache");
                 (
                     Self::get_display_size(left_idx, left_rot, &empty, &self.thumbnails),
                     Self::get_display_size(right_idx, right_rot, &empty, &self.thumbnails),
@@ -24612,7 +24613,7 @@ impl App {
     fn get_display_size(
         idx: usize,
         rotation: crate::rotation_db::Rotation,
-        fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
+        fs_cache: &ItemsGenerationMap<FsCacheEntry>,
         thumbnails: &[ThumbnailState],
     ) -> Option<egui::Vec2> {
         let tex = match fs_cache.get(&idx) {

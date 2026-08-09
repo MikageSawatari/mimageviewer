@@ -99,7 +99,7 @@
 | 名前 | 方向 | 内容 |
 | --- | --- | --- |
 | `tx / rx` (App) | ワーカー → UI | `ThumbMsg`: (idx, ColorImage, `ThumbLoadOrigin`, source_dims, canceled, finalized)。origin は `Source` / `UpgradeableCache` / `FinalCache` の 3 状態で、最後は編集 preview・drive-list・再帰 pin WebP など元ソースへ idle upgrade しない完成済み派生 cache。from-source 経路 (cache miss) では **2 シグナル**: ① 第 1 シグナル = display ColorImage (canceled=false, finalized=false) → UI は Loaded 化、`requested` は保持 ② 第 2 シグナル = cache save 完了通知 (None + finalized=true) → UI は `requested` を抜くだけで **`thumbnails[i]` は変更しない**。cache hit は 1 ショット (canceled=false で即 remove)。`canceled=true` は STALE 専用 (worker bail-out) で、UI は Evicted に戻して再試行可能にする (Failed にしない)。`finalized=true` と `canceled=true` は排他 |
-| `fs_pending[idx].1` | フルスクリーンスレッド → UI | `FsLoadResult`: **DimsOnly (非終端) / Static / Animated / Failed**。`DimsOnly` はヘッダ解析直後に先行送信される原寸ヒントで、UI は `fs_early_dims` に積み fs_pending は維持する (本デコードが続く)。詳細は [display-pipeline.md §2.2](display-pipeline.md) 参照 |
+| `fs_pending[idx].1` | フルスクリーンスレッド → UI | `FsLoadResult`: **DimsOnly (非終端) / Static / Animated / Failed**。pending は `fs_cache` / `fs_early_dims` / `fs_upload_backlog` と同じ viewer-context-owned `items_generation` を保持する。`DimsOnly` はヘッダ解析直後に先行送信される原寸ヒントで、UI は同世代だけ `fs_early_dims` に積み fs_pending は維持する (本デコードが続く)。終端結果も upload backlog と final cache の各着地点で同世代だけ採用し、不一致は通常ログへ記録して破棄する。詳細は [display-pipeline.md §2.2](display-pipeline.md) 参照 |
 | `ai_upscale_pending[idx].1` | AI スレッド → UI | `UpscaleResult` |
 | `final_effect_pending[key].rx` | カラー化 / 最終エフェクト worker → UI | `FinalEffectResult::Ready { pixels, elapsed_ms, timing }` / `Cancelled`。`timing` は色調補正、smart sharpen、カラー化判定／適用、Creative LUT、post filter の段階別時間を保持する。receiver は composite key、画像 index、`items_generation`、表示 / 先読み区分と同じ viewer context に保持し、stale 結果を texture cache へ公開しない。先読み結果も UI 側で完成 texture を 1 枚ずつ upload する |
 | `local_adjust_pending[idx].rx` | local / conceal materialization worker → UI | `EditMaterializeResult`。request は `items_generation`、`input_seq` と、local なら `LocalAdjustResultKey`、conceal なら `EditResultKey` を持つ。pending map は `ViewerContextBundle` 所有で context の swap / park とともに移動し、bundle drop / clear では cancel token を立てる。受信時は pending request identity と現在の generation key の両方を検証してから cache へ公開する |
@@ -617,7 +617,8 @@ bump + idx ベース状態の破棄を忘れずに行う。忘れると、進行
 
 新しい差し替え経路を増やすときは、必ず以下を揃える:
 
-1. `items_generation` を必ず bump (install_new_items 経由か直接 +1)
+1. `items_generation` を必ず `bump_items_generation()` で bump (`install_new_items` も同 helper を使用)。
+   これにより generation-stamped fullscreen state 4 種も同じ context 内で原子的に進む
 2. `invalidate_idx_state_and_queues()` を呼ぶ — requested / idle upgrade の idx memo /
    pending_finalize /
    texture_backlog / checked / keep_range / keep_set / keep_*_shared / idx-keyed

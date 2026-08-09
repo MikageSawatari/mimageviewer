@@ -3361,7 +3361,7 @@ impl App {
         self.items = items;
         self.thumbnails = thumbnails;
         self.image_metas = image_metas;
-        self.items_generation = self.items_generation.wrapping_add(1);
+        self.bump_items_generation();
         self.invalidate_idx_state_and_queues();
         // The restored samples still describe these moved items, but their installed App
         // generation is new so stale child work cannot publish into the root.

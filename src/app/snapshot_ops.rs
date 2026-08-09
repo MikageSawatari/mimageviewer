@@ -322,7 +322,7 @@ impl App {
         // items を差し替えたので、旧 ThumbMsg / pending / keep_set / idx-keyed cache が
         // 新 idx に着地して「サムネが化ける/消える」事故を防ぐ。`invalidate_idx_state_and_queues`
         // は thumbnails 自体は触らないので、上で入れ替えた captured_thumbnails は維持される。
-        self.items_generation = self.items_generation.wrapping_add(1);
+        self.bump_items_generation();
         self.invalidate_idx_state_and_queues();
         // tags_cache は invalidate 対象外なので手動 clear (= 既存 clear は冗長になるが
         // 残しておく方が安全、二重 clear は no-op)
@@ -550,7 +550,7 @@ impl App {
             // items を saved に戻したので、snapshot 中に走った ThumbMsg / pending が
             // 新 idx 配置に着地して壊さないよう invalidate。merged_thumbnails は
             // invalidate 後も保持される (= thumbnails 自体は invalidate 対象外)。
-            self.items_generation = self.items_generation.wrapping_add(1);
+            self.bump_items_generation();
             self.invalidate_idx_state_and_queues();
             self.clear_tags_cache();
             // items を saved (元フォルダ) に戻したので、ページ編集状態も元 idx で hydrate
@@ -641,7 +641,7 @@ impl App {
         self.selected = None;
         self.grid_click_selection_anchor = None;
         // items_generation bump + invalidate (= Codex P1-1)
-        self.items_generation = self.items_generation.wrapping_add(1);
+        self.bump_items_generation();
         self.invalidate_idx_state_and_queues();
         self.clear_tags_cache();
         // snapshot list (= subset) に戻したので、ページ編集状態も subset idx で合わせ直す

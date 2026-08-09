@@ -1449,6 +1449,13 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   刻み、読み出し・適用時に照合する。世代違いは現在の一覧のものではないと確定できるので、
   記録したうえで捨てる。欠けている識別子を足す修正であって、症状隠しではない。再現しなくても
   穴は塞がり、再発時は記録が残る。
+- 実装記録 (2026-08-09): `fs_cache` / `fs_early_dims` / `fs_pending` を生 `HashMap` から
+  `ItemsGenerationMap` へ、`fs_upload_backlog` を `ItemsGenerationVec` へ置換した。各 entry は
+  bundle-local な `items_generation` を保持し、lookup / iteration / 世代更新と
+  `fs_pending` 完了の early-dims / upload-backlog / final-cache 着地を fail-closed で照合する。
+  不一致は `[fs-generation] stale entry discarded cache=... idx=... expected_generation=...
+  actual_generation=...` と通常ログへ残して破棄し、pending は同時に cancel する。
+  `install_new_items` 相当の差し替えと旧完了拒否を状態遷移テストで固定した。
 - 優先度: P2。急ぎではないが、別の本のページが黙って表示され得る点で放置しない。
 
 ## 4. 入力カスタマイズ / マウス / ゲームパッド

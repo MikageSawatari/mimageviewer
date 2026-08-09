@@ -13,6 +13,51 @@ fn display_image_texture_options_always_keep_the_complete_mip_chain() {
 }
 
 #[test]
+fn fullscreen_fs_cache_does_not_cross_install_new_items_generation() {
+    let mut app = phase_c_support::setup_app();
+    app.items = vec![GridItem::Image(PathBuf::from("C:/old/book/page.png"))];
+    app.image_metas = vec![None];
+    app.fullscreen_idx = Some(0);
+    app.fs_cache.insert(0, FsCacheEntry::Failed);
+    app.fs_early_dims.insert(0, [1200, 1800]);
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (_tx, rx) = std::sync::mpsc::channel();
+    app.fs_pending
+        .insert(0, (std::sync::Arc::clone(&cancel), rx, 9));
+    app.fs_upload_backlog.push((0, FsLoadResult::Failed, 9));
+
+    app.install_new_items(
+        vec![GridItem::Image(PathBuf::from("C:/new/book/page.png"))],
+        vec![None],
+    );
+
+    assert!(app.fs_cache.get(&0).is_none());
+    assert!(app.fs_early_dims.get(&0).is_none());
+    assert!(!app.fs_pending.contains_key(&0));
+    assert!(app.fs_upload_backlog.is_empty());
+    assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(app.fs_generation_state_is_current());
+}
+
+#[test]
+fn stale_fullscreen_load_completion_is_not_enqueued_for_new_items() {
+    let mut app = phase_c_support::setup_app();
+    let request_generation = app.items_generation;
+    app.bump_items_generation();
+
+    let accepted = app.enqueue_fs_upload_result_for_generation(
+        request_generation,
+        0,
+        FsLoadResult::Failed,
+        17,
+    );
+
+    assert!(!accepted);
+    assert!(app.fs_upload_backlog.is_empty());
+    assert!(app.fs_cache.get(&0).is_none());
+}
+
+#[test]
 fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
