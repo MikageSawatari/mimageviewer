@@ -23,11 +23,9 @@ const REMOTE_ACQUIRE_BARRIER_LOG_AFTER: std::time::Duration = std::time::Duratio
 const REMOTE_ACQUIRE_BARRIER_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 const REMOTE_ACQUIRE_BARRIER_ABORT_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 const REMOTE_ENABLE_WARNING_PREFIX: &str = "リモート閲覧を有効にすると、";
-const REMOTE_ENABLE_WARNING_EMPHASIS: &str = "mIV で閲覧できるすべてのファイル";
+const REMOTE_ENABLE_WARNING_EMPHASIS: &str = "すべてのドライブについて、mIV で表示できるファイル";
 const REMOTE_ENABLE_WARNING_SUFFIX: &str =
     "が、この PC の Tailscale アドレスへ接続でき、PIN を知っている人から見えるようになります。";
-const REMOTE_ENABLE_WARNING_SECOND: &str =
-    "対象はお気に入りの中だけではなく、mIV が開ける画像・動画・PDF すべてです。";
 const REMOTE_MANUAL_URL: &str = "https://mikage.to/mimageviewer/manual/tut-remote.html";
 
 #[derive(Default)]
@@ -2336,7 +2334,6 @@ impl crate::app::App {
                             egui::RichText::new(REMOTE_ENABLE_WARNING_SUFFIX).color(error_color),
                         );
                     });
-                    ui.label(egui::RichText::new(REMOTE_ENABLE_WARNING_SECOND).color(error_color));
                     ui.hyperlink_to("詳しい説明を既定のブラウザで開く", REMOTE_MANUAL_URL);
                 }
                 ui.separator();
@@ -2946,7 +2943,7 @@ mod tests {
 
     const REMOTE_ENABLE_WARNING_FIRST: &str = concat!(
         "リモート閲覧を有効にすると、",
-        "mIV で閲覧できるすべてのファイル",
+        "すべてのドライブについて、mIV で表示できるファイル",
         "が、この PC の Tailscale アドレスへ接続でき、PIN を知っている人から見えるようになります。"
     );
 
@@ -3035,7 +3032,7 @@ mod tests {
         assert!(!remote_enable_warning_visible(true, true));
         assert_eq!(
             REMOTE_ENABLE_WARNING_FIRST,
-            "リモート閲覧を有効にすると、mIV で閲覧できるすべてのファイルが、この PC の Tailscale アドレスへ接続でき、PIN を知っている人から見えるようになります。"
+            "リモート閲覧を有効にすると、すべてのドライブについて、mIV で表示できるファイルが、この PC の Tailscale アドレスへ接続でき、PIN を知っている人から見えるようになります。"
         );
         assert_eq!(
             [
@@ -3045,10 +3042,6 @@ mod tests {
             ]
             .concat(),
             REMOTE_ENABLE_WARNING_FIRST
-        );
-        assert_eq!(
-            REMOTE_ENABLE_WARNING_SECOND,
-            "対象はお気に入りの中だけではなく、mIV が開ける画像・動画・PDF すべてです。"
         );
         assert_eq!(
             REMOTE_MANUAL_URL,
