@@ -155,11 +155,11 @@ export function mediaElementVolumeControlSupported(mediaElement) {
 
 export function videoControlMenuPresentation({
   hasVideo = true,
-  volumeControlSupported = true,
+  volumeControlSupported = null,
 } = {}) {
   const mediaNoun = hasVideo === false ? "音声" : "動画";
   const qualityNoun = hasVideo === false ? "音質" : "画質";
-  const showVolume = volumeControlSupported !== false;
+  const showVolume = volumeControlSupported === true;
   return {
     mediaNoun,
     qualityNoun,
@@ -1037,7 +1037,7 @@ export class VideoGenerationSwitchOwner {
   }
 }
 
-class VideoStreamMenu {
+export class VideoStreamMenu {
   constructor(
     host,
     dispatch,
@@ -1059,6 +1059,7 @@ class VideoStreamMenu {
     this.opened = false;
     this.previousFocus = null;
     this.keyboardElements = [];
+    this.keyboardAvailable = true;
     this.panelState = null;
     this.panelPointer = null;
     this.panelMotionTimer = 0;
@@ -1261,6 +1262,7 @@ class VideoStreamMenu {
       this.shortcuts.append(textElement("dt", label), textElement("dd", keys));
     }
     this.setMediaState(this.mediaState());
+    this.setKeyboardAvailable(this.keyboardAvailable);
   }
 
   renderVolume() {
@@ -1295,7 +1297,8 @@ class VideoStreamMenu {
       if (typeof event.button === "number" && event.button !== 0) return;
       event.stopPropagation();
       if (event.cancelable) event.preventDefault();
-      const trackWidth = input.getBoundingClientRect().width;
+      const trackRect = input.getBoundingClientRect();
+      const trackWidth = trackRect.width;
       const startVolume = videoVolumeRelativeDragValue({
         startVolume: Number(input.value),
         startClientX: event.clientX,
@@ -1306,10 +1309,13 @@ class VideoStreamMenu {
       pointerDrag = {
         pointerId: event.pointerId,
         startClientX: event.clientX,
+        startClientY: event.clientY,
         startVolume,
         targetVolume: startVolume,
+        trackLeft: trackRect.left,
         trackWidth,
         step: Number(input.step),
+        maxDistancePx: 0,
       };
       input.focus({ preventScroll: true });
       try {
@@ -1323,6 +1329,15 @@ class VideoStreamMenu {
       if (!drag || drag.pointerId !== event.pointerId) return;
       event.stopPropagation();
       if (event.cancelable) event.preventDefault();
+      const gesture = seekRangePointerGestureDecision({
+        startClientX: drag.startClientX,
+        startClientY: drag.startClientY,
+        currentClientX: event.clientX,
+        currentClientY: event.clientY,
+        maxDistancePx: drag.maxDistancePx,
+      });
+      drag.maxDistancePx = gesture.maxDistancePx;
+      if (gesture.kind !== "drag") return;
       drag.targetVolume = videoVolumeRelativeDragValue({
         startVolume: drag.startVolume,
         startClientX: drag.startClientX,
@@ -1337,6 +1352,14 @@ class VideoStreamMenu {
       if (!drag || drag.pointerId !== event.pointerId) return;
       event.stopPropagation();
       if (event.cancelable) event.preventDefault();
+      const gesture = seekRangePointerGestureDecision({
+        startClientX: drag.startClientX,
+        startClientY: drag.startClientY,
+        currentClientX: event.clientX,
+        currentClientY: event.clientY,
+        maxDistancePx: drag.maxDistancePx,
+        cancelled,
+      });
       try {
         if (input.hasPointerCapture(event.pointerId)) {
           input.releasePointerCapture(event.pointerId);
@@ -1345,17 +1368,26 @@ class VideoStreamMenu {
         // The browser may implicitly release capture before pointercancel.
       }
       pointerDrag = null;
-      if (cancelled) {
+      if (gesture.kind === "cancel") {
         updateDisplayedVolume(drag.startVolume);
         return;
       }
-      const targetVolume = videoVolumeRelativeDragValue({
-        startVolume: drag.startVolume,
-        startClientX: drag.startClientX,
-        currentClientX: event.clientX,
-        trackWidth: drag.trackWidth,
-        step: drag.step,
-      });
+      const targetVolume = gesture.kind === "tap"
+        ? seekRangeAbsoluteValue({
+          clientX: drag.startClientX,
+          trackLeft: drag.trackLeft,
+          trackWidth: drag.trackWidth,
+          min: 0,
+          max: 1,
+          step: drag.step,
+        })
+        : videoVolumeRelativeDragValue({
+          startVolume: drag.startVolume,
+          startClientX: drag.startClientX,
+          currentClientX: event.clientX,
+          trackWidth: drag.trackWidth,
+          step: drag.step,
+        });
       updateDisplayedVolume(targetVolume);
       if (targetVolume !== drag.startVolume) {
         this.send(event, CommandName.MEDIA_VOLUME, { volume: targetVolume });
@@ -1379,13 +1411,19 @@ class VideoStreamMenu {
     }
   }
 
+  refreshMediaPresentation() {
+    if (this.page === "main" || this.page === "controls") this.showPage(this.page);
+    else this.setMediaState(this.mediaState());
+  }
+
   setActionLabel(name, label) {
     const target = this.actionLabels?.get(name);
     if (target) target.textContent = label;
   }
 
   setKeyboardAvailable(available) {
-    for (const target of this.keyboardElements) target.hidden = !available;
+    this.keyboardAvailable = Boolean(available);
+    for (const target of this.keyboardElements) target.hidden = !this.keyboardAvailable;
   }
 
   setSession(session) {
@@ -1703,6 +1741,7 @@ export class VideoStreamViewer {
     subscribeRemoteSessionState = () => () => {},
     reportPlaybackIssue = () => {},
     publishVideoHealth = () => {},
+    publishVideoTelemetry = () => {},
     getTelemetryDebugContext = () => ({ enabled: false }),
     keyboardAvailable = true,
     getPanelTab = () => "functions",
@@ -1717,6 +1756,7 @@ export class VideoStreamViewer {
     this.apiPostJson = apiPostJson;
     this.reportPlaybackIssue = reportPlaybackIssue;
     this.publishVideoHealth = publishVideoHealth;
+    this.publishVideoTelemetry = publishVideoTelemetry;
     this.getTelemetryDebugContext = getTelemetryDebugContext;
     this.quality = "standard";
     this.hasVideo = entry.kind !== "audio";
@@ -1774,10 +1814,10 @@ export class VideoStreamViewer {
     this.video.setAttribute("playsinline", "");
     this.video.setAttribute("webkit-playsinline", "");
     this.video.setAttribute("aria-label", entry.name);
-    // Probe before attaching a media source, then restore synchronously. Supported browsers
-    // therefore cannot produce an audible test change; ignored assignments identify iOS-like
-    // platforms without relying on a user-agent string.
-    this.volumeControlSupported = mediaElementVolumeControlSupported(this.video);
+    // Keep the control hidden until loadedmetadata proves whether assignment is effective.
+    // A detached element accepts volume writes on iPadOS before its media engine applies the
+    // platform constraint, so construction time is not a valid capability boundary.
+    this.volumeControlSupported = null;
     this.audioSurface = element("div", "audio-stream-surface");
     this.audioSurface.setAttribute("role", "img");
     this.audioSurface.setAttribute("aria-label", `音声: ${entry.name}`);
@@ -1923,6 +1963,7 @@ export class VideoStreamViewer {
       this.checkPlaybackStartupProgress();
       if (!this.playRequested) this.finishSeekPreviewForAttachedGeneration();
     };
+    this.onLoadedMetadata = () => this.detectVolumeControlSupport();
     this.onWaiting = () => this.beginWaiting("waiting");
     this.onStalled = () => {
       if (this.generationSwitch.isSwitching()) return;
@@ -1964,6 +2005,7 @@ export class VideoStreamViewer {
     this.video.addEventListener("timeupdate", this.onTimeUpdate);
     this.video.addEventListener("playing", this.onPlaying);
     this.video.addEventListener("canplay", this.onCanPlay);
+    this.video.addEventListener("loadedmetadata", this.onLoadedMetadata);
     this.video.addEventListener("loadeddata", this.onLoadedData);
     this.video.addEventListener("waiting", this.onWaiting);
     this.video.addEventListener("stalled", this.onStalled);
@@ -2232,6 +2274,29 @@ export class VideoStreamViewer {
       hasVideo: this.hasVideo,
       volumeControlSupported: this.volumeControlSupported,
     };
+  }
+
+  detectVolumeControlSupport() {
+    if (this.destroyed || this.volumeControlSupported !== null) {
+      return this.volumeControlSupported === true;
+    }
+    // loadedmetadata means resource selection has completed and the media element has reached
+    // HAVE_METADATA, so platform volume constraints are active. The probe and restoration are
+    // synchronous within this pre-playback event handler, before an audio rendering turn can
+    // expose the temporary value.
+    const supported = mediaElementVolumeControlSupported(this.video);
+    this.volumeControlSupported = supported;
+    if (supported) this.video.volume = this.volume;
+    this.menu.refreshMediaPresentation();
+    try {
+      this.publishVideoTelemetry({
+        type: "media_capability",
+        action: "volume_control",
+        supported,
+        lifecycle: "loadedmetadata",
+      });
+    } catch {}
+    return supported;
   }
 
   setHasVideo(hasVideo) {
@@ -3924,6 +3989,7 @@ export class VideoStreamViewer {
     this.video.removeEventListener("timeupdate", this.onTimeUpdate);
     this.video.removeEventListener("playing", this.onPlaying);
     this.video.removeEventListener("canplay", this.onCanPlay);
+    this.video.removeEventListener("loadedmetadata", this.onLoadedMetadata);
     this.video.removeEventListener("loadeddata", this.onLoadedData);
     this.video.removeEventListener("waiting", this.onWaiting);
     this.video.removeEventListener("stalled", this.onStalled);

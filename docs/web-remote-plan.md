@@ -1017,10 +1017,13 @@ grid 列数に加え、診断の詳細段を端末ごとに明示 opt-in する 
 `state.images` 上の実ページ番号を `12-13 / 240` の形式で出す。range の値は綴じ方向にかかわらず
 読み順 group index と一致させ、LTR は native range の `dir=ltr`、RTL は `dir=rtl` を使う。これにより
 RTL では最小値が物理右端、最大値が物理左端となり、thumb と塗りの向きを native control 内で揃える。
-range は keyboard / ARIA の owner として残す一方、pointer は押下位置の絶対値を採らず、押下時の group
-index からの相対移動を使う。トラック全幅の移動を全 group 範囲へ正規化して step 1 で丸め、LTR は
-右移動、RTL は `dir` と同じ direction を使った左移動で index を増やす。pointer capture と既存の
-`touch-action: none` により thumb 外から始めた touch も追跡する。
+range は keyboard / ARIA の owner として残す。pointer は pointerup で tap / drag を確定し、tap なら
+押下したトラック位置の絶対値へ移動、drag なら押下時の値からの相対移動を使う。この規則は動画・音声の
+シークバー、静止画のページバー、音量、画像補正・表示トリムの各スライダーで共通とする。判定と絶対値・
+相対値の計算は `command-core.mjs` の共通関数を使う。静止画のページバーではトラック全幅の移動を全
+group 範囲へ正規化して step 1 で丸め、LTR は右移動、RTL は `dir` と同じ direction を使った左移動で
+index を増やす。静止画のページバーでは pointer capture と既存の `touch-action: none` により、thumb 外から
+始めた touch も追跡する。
 range の `input` または pointer move 中は thumb とラベルだけを更新し、native `change` / pointerup で
 session acquire を確認してから確定した1回だけ `changeImageTo` を呼ぶため、ドラッグ途中の画像 fetch /
 decode は発生しない。実ページが1枚だけなら range だけを隠し、`1 / 1` の位置表示は維持する。位置、

@@ -4424,6 +4424,7 @@ function renderVideoViewer(entry) {
       updateHud();
       if (telemetry && snapshot) enqueueTelemetry(snapshot);
     },
+    publishVideoTelemetry: (event) => enqueueTelemetry(event),
     getTelemetryDebugContext: () => ({
       enabled: state.localSettings.telemetryDebugDetails,
     }),
@@ -6383,18 +6384,166 @@ export class ViewerViewTrimPanel {
     input.value = String(this.serverState.book_settings[group][key] * 100);
     input.setAttribute("aria-label", `${labels[key]}のトリム率`);
     const output = document.createElement("output");
-    const syncFromInput = () => {
-      const percent = Number(input.value);
+    let pointerDrag = null;
+    let dirty = false;
+    const applyPercent = (rawPercent) => {
+      const percent = rangeValueFromNormalized({
+        normalized: rangeValueToNormalized({
+          value: rawPercent,
+          min: Number(input.min),
+          max: Number(input.max),
+        }),
+        min: Number(input.min),
+        max: Number(input.max),
+        step: Number(input.step),
+      });
+      const previousPercent = this.serverState.book_settings[group][key] * 100;
+      const changed = percent !== previousPercent || !this.serverState.book_settings.enabled;
+      input.value = String(percent);
       output.value = `${percent.toFixed(1)}%`;
       this.serverState.book_settings[group][key] = percent / 100;
       this.serverState.book_settings.enabled = true;
       this.enabledInput.checked = true;
+      dirty = changed || dirty;
+      return changed;
     };
     output.value = `${Number(input.value).toFixed(1)}%`;
-    input.addEventListener("input", syncFromInput);
-    input.addEventListener("change", () => {
-      syncFromInput();
+    input.addEventListener("input", () => {
+      if (pointerDrag) {
+        input.value = String(pointerDrag.targetPercent);
+        return;
+      }
+      applyPercent(Number(input.value));
+    });
+    const finish = (event) => {
+      event.stopPropagation();
+      if (!dirty) return;
+      dirty = false;
       this.commit().catch((error) => this.showError(error));
+    };
+    input.addEventListener("change", finish);
+    input.addEventListener("pointerdown", (event) => {
+      event.stopPropagation();
+      if (input.disabled || event.isPrimary === false) return;
+      if (typeof event.button === "number" && event.button !== 0) return;
+      if (event.pointerType !== "touch" && event.cancelable) event.preventDefault();
+      const trackRect = input.getBoundingClientRect();
+      const startPercent = Number(input.value);
+      pointerDrag = {
+        pointerId: event.pointerId,
+        startClientX: event.clientX,
+        startClientY: event.clientY,
+        startPercent,
+        targetPercent: startPercent,
+        startEnabled: this.serverState.book_settings.enabled,
+        startDirty: dirty,
+        trackLeft: trackRect.left,
+        trackWidth: trackRect.width,
+        maxDistancePx: 0,
+      };
+      input.focus({ preventScroll: true });
+      try {
+        input.setPointerCapture(event.pointerId);
+      } catch (_error) {
+        // Pointer capture can fail when the browser has already cancelled the pointer.
+      }
+    });
+    input.addEventListener("pointermove", (event) => {
+      const drag = pointerDrag;
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      event.stopPropagation();
+      if (event.pointerType !== "touch" && event.cancelable) event.preventDefault();
+      const gesture = seekRangePointerGestureDecision({
+        startClientX: drag.startClientX,
+        startClientY: drag.startClientY,
+        currentClientX: event.clientX,
+        currentClientY: event.clientY,
+        maxDistancePx: drag.maxDistancePx,
+      });
+      drag.maxDistancePx = gesture.maxDistancePx;
+      if (gesture.kind !== "drag") return;
+      drag.targetPercent = relativeRangeDragValue({
+        startValue: drag.startPercent,
+        startClientX: drag.startClientX,
+        currentClientX: event.clientX,
+        trackWidth: drag.trackWidth,
+        min: Number(input.min),
+        max: Number(input.max),
+        step: Number(input.step),
+      });
+      applyPercent(drag.targetPercent);
+    });
+    const releasePointer = (event) => {
+      const drag = pointerDrag;
+      if (!drag) return null;
+      const pointerId = typeof event.pointerId === "number" ? event.pointerId : drag.pointerId;
+      try {
+        if (input.hasPointerCapture(pointerId)) input.releasePointerCapture(pointerId);
+      } catch (_error) {
+        // Direct manipulation may release capture before pointercancel.
+      }
+      pointerDrag = null;
+      return drag;
+    };
+    const finishPointer = (event) => {
+      if (!pointerDrag || pointerDrag.pointerId !== event.pointerId) return;
+      event.stopPropagation();
+      if (event.pointerType !== "touch" && event.cancelable) event.preventDefault();
+      const drag = pointerDrag;
+      const gesture = seekRangePointerGestureDecision({
+        startClientX: drag.startClientX,
+        startClientY: drag.startClientY,
+        currentClientX: event.clientX,
+        currentClientY: event.clientY,
+        maxDistancePx: drag.maxDistancePx,
+      });
+      releasePointer(event);
+      const targetPercent = gesture.kind === "tap"
+        ? seekRangeAbsoluteValue({
+          clientX: drag.startClientX,
+          trackLeft: drag.trackLeft,
+          trackWidth: drag.trackWidth,
+          min: Number(input.min),
+          max: Number(input.max),
+          step: Number(input.step),
+        })
+        : relativeRangeDragValue({
+          startValue: drag.startPercent,
+          startClientX: drag.startClientX,
+          currentClientX: event.clientX,
+          trackWidth: drag.trackWidth,
+          min: Number(input.min),
+          max: Number(input.max),
+          step: Number(input.step),
+        });
+      applyPercent(targetPercent);
+      finish(event);
+    };
+    const cancelPointer = (event) => {
+      if (
+        pointerDrag &&
+        typeof event.pointerId === "number" &&
+        pointerDrag.pointerId !== event.pointerId
+      ) {
+        event.stopPropagation();
+        return;
+      }
+      const drag = releasePointer(event);
+      event.stopPropagation();
+      if (!drag) return;
+      input.value = String(drag.startPercent);
+      output.value = `${drag.startPercent.toFixed(1)}%`;
+      this.serverState.book_settings[group][key] = drag.startPercent / 100;
+      this.serverState.book_settings.enabled = drag.startEnabled;
+      this.enabledInput.checked = drag.startEnabled;
+      dirty = drag.startDirty;
+    };
+    input.addEventListener("pointerup", finishPointer);
+    input.addEventListener("pointercancel", cancelPointer);
+    input.addEventListener("touchcancel", cancelPointer);
+    input.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
     });
     row.append(input, output);
     return row;
@@ -6662,12 +6811,16 @@ export class ViewerAdjustmentPanel {
         if (input.disabled || event.isPrimary === false) return;
         if (typeof event.button === "number" && event.button !== 0) return;
         if (event.pointerType !== "touch" && event.cancelable) event.preventDefault();
+        const trackRect = input.getBoundingClientRect();
         pointerDrag = {
           pointerId: event.pointerId,
           startClientX: event.clientX,
+          startClientY: event.clientY,
           startValue: Number(this.values[key]),
           startDirty: this.dirty,
-          trackWidth: input.getBoundingClientRect().width,
+          trackLeft: trackRect.left,
+          trackWidth: trackRect.width,
+          maxDistancePx: 0,
         };
         input.focus({ preventScroll: true });
         try {
@@ -6680,6 +6833,15 @@ export class ViewerAdjustmentPanel {
         if (!pointerDrag || pointerDrag.pointerId !== event.pointerId) return;
         event.stopPropagation();
         if (event.pointerType !== "touch" && event.cancelable) event.preventDefault();
+        const gesture = seekRangePointerGestureDecision({
+          startClientX: pointerDrag.startClientX,
+          startClientY: pointerDrag.startClientY,
+          currentClientX: event.clientX,
+          currentClientY: event.clientY,
+          maxDistancePx: pointerDrag.maxDistancePx,
+        });
+        pointerDrag.maxDistancePx = gesture.maxDistancePx;
+        if (gesture.kind !== "drag") return;
         applyValue(relativeRangeDragValue({
           startValue: pointerDrag.startValue,
           startClientX: pointerDrag.startClientX,
@@ -6714,7 +6876,36 @@ export class ViewerAdjustmentPanel {
         }
         if (pointerDrag) {
           if (event.pointerType !== "touch" && event.cancelable) event.preventDefault();
+          const activePointer = pointerDrag;
+          const gesture = seekRangePointerGestureDecision({
+            startClientX: activePointer.startClientX,
+            startClientY: activePointer.startClientY,
+            currentClientX: event.clientX,
+            currentClientY: event.clientY,
+            maxDistancePx: activePointer.maxDistancePx,
+          });
           releasePointer(event);
+          if (gesture.kind === "tap") {
+            applyNormalizedPosition(seekRangeAbsoluteValue({
+              clientX: activePointer.startClientX,
+              trackLeft: activePointer.trackLeft,
+              trackWidth: activePointer.trackWidth,
+              min: 0,
+              max: 1,
+              step: 0,
+            }));
+          } else {
+            applyValue(relativeRangeDragValue({
+              startValue: activePointer.startValue,
+              startClientX: activePointer.startClientX,
+              currentClientX: event.clientX,
+              trackWidth: activePointer.trackWidth,
+              min,
+              max,
+              step,
+              logarithmic,
+            }));
+          }
         }
         finish(event);
       };
@@ -7158,12 +7349,16 @@ export class ViewerAdjustmentPanel {
       if (input.disabled || event.isPrimary === false) return;
       if (typeof event.button === "number" && event.button !== 0) return;
       if (event.pointerType !== "touch" && event.cancelable) event.preventDefault();
+      const trackRect = input.getBoundingClientRect();
       pointerDrag = {
         pointerId: event.pointerId,
         startClientX: event.clientX,
+        startClientY: event.clientY,
         startValue: Number(this.values.colorize[key]),
         startDirty: this.dirty,
-        trackWidth: input.getBoundingClientRect().width,
+        trackLeft: trackRect.left,
+        trackWidth: trackRect.width,
+        maxDistancePx: 0,
       };
       input.focus({ preventScroll: true });
       try {
@@ -7176,6 +7371,15 @@ export class ViewerAdjustmentPanel {
       if (!pointerDrag || pointerDrag.pointerId !== event.pointerId) return;
       event.stopPropagation();
       if (event.pointerType !== "touch" && event.cancelable) event.preventDefault();
+      const gesture = seekRangePointerGestureDecision({
+        startClientX: pointerDrag.startClientX,
+        startClientY: pointerDrag.startClientY,
+        currentClientX: event.clientX,
+        currentClientY: event.clientY,
+        maxDistancePx: pointerDrag.maxDistancePx,
+      });
+      pointerDrag.maxDistancePx = gesture.maxDistancePx;
+      if (gesture.kind !== "drag") return;
       applyValue(relativeRangeDragValue({
         startValue: pointerDrag.startValue,
         startClientX: pointerDrag.startClientX,
@@ -7210,7 +7414,36 @@ export class ViewerAdjustmentPanel {
       }
       if (pointerDrag) {
         if (event.pointerType !== "touch" && event.cancelable) event.preventDefault();
+        const activePointer = pointerDrag;
+        const gesture = seekRangePointerGestureDecision({
+          startClientX: activePointer.startClientX,
+          startClientY: activePointer.startClientY,
+          currentClientX: event.clientX,
+          currentClientY: event.clientY,
+          maxDistancePx: activePointer.maxDistancePx,
+        });
         releasePointer(event);
+        if (gesture.kind === "tap") {
+          applyNormalizedPosition(seekRangeAbsoluteValue({
+            clientX: activePointer.startClientX,
+            trackLeft: activePointer.trackLeft,
+            trackWidth: activePointer.trackWidth,
+            min: 0,
+            max: 1,
+            step: 0,
+          }));
+        } else {
+          applyValue(relativeRangeDragValue({
+            startValue: activePointer.startValue,
+            startClientX: activePointer.startClientX,
+            currentClientX: event.clientX,
+            trackWidth: activePointer.trackWidth,
+            min,
+            max,
+            step,
+            logarithmic: false,
+          }));
+        }
       }
       finish(event);
     };

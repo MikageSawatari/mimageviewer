@@ -110,6 +110,7 @@ const {
   LatestPageLoadQueue,
   RemoteAiController,
   ViewerAdjustmentPanel,
+  ViewerViewTrimPanel,
   VIEWER_MENU_MAX_ACTIONS,
   VIEWER_PANEL_TABS,
   activateFolderContainerForImage,
@@ -673,7 +674,7 @@ test("adjustment touch cancellation restores the starting value without committi
   for (const target of cases) {
     const input = target.input;
     input.disabled = false;
-    input.getBoundingClientRect = () => ({ width: 200 });
+    input.getBoundingClientRect = () => ({ left: 0, width: 200 });
     input.focus = () => {};
     input.setPointerCapture = () => {};
     input.hasPointerCapture = () => false;
@@ -688,6 +689,7 @@ test("adjustment touch cancellation restores the starting value without committi
       isPrimary: true,
       button: 0,
       clientX,
+      clientY: 20,
       cancelable,
       preventDefault() { prevented += 1; },
       stopPropagation() {},
@@ -710,7 +712,7 @@ test("adjustment touch cancellation restores the starting value without committi
 test("adjustment horizontal touch drag still previews and commits", () => {
   const panel = new ViewerAdjustmentPanel();
   const input = panel.controls.get("brightness").input;
-  input.getBoundingClientRect = () => ({ width: 200 });
+  input.getBoundingClientRect = () => ({ left: 0, width: 200 });
   input.focus = () => {};
   input.setPointerCapture = () => {};
   input.hasPointerCapture = () => true;
@@ -727,6 +729,7 @@ test("adjustment horizontal touch drag still previews and commits", () => {
     isPrimary: true,
     button: 0,
     clientX,
+    clientY: 20,
     cancelable: true,
     preventDefault() { prevented += 1; },
     stopPropagation() {},
@@ -741,6 +744,128 @@ test("adjustment horizontal touch drag still previews and commits", () => {
   assert.equal(previewCalls, 1);
   assert.equal(commitCalls, 1);
   assert.equal(prevented, 0);
+});
+
+test("adjustment pointer tap is absolute while drag remains relative", () => {
+  const panel = new ViewerAdjustmentPanel();
+  let previewCalls = 0;
+  let commitCalls = 0;
+  panel.queuePreview = () => { previewCalls += 1; };
+  panel.commitCurrent = async () => { commitCalls += 1; };
+  const cases = [
+    {
+      input: panel.controls.get("brightness").input,
+      read: () => panel.values.brightness,
+      tapValue: 50,
+    },
+    {
+      input: panel.colorizeControls.get("mono_tolerance").input,
+      read: () => panel.values.colorize.mono_tolerance,
+      tapValue: 48,
+    },
+  ];
+  let pointerId = 30;
+  for (const target of cases) {
+    const input = target.input;
+    input.disabled = false;
+    input.getBoundingClientRect = () => ({ left: 0, width: 200 });
+    input.focus = () => {};
+    input.setPointerCapture = () => {};
+    input.hasPointerCapture = () => false;
+    input.releasePointerCapture = () => {};
+    const pointerEvent = (type, clientX) => ({
+      type,
+      pointerId,
+      pointerType: "mouse",
+      isPrimary: true,
+      button: 0,
+      clientX,
+      clientY: 20,
+      cancelable: true,
+      preventDefault() {},
+      stopPropagation() {},
+    });
+    input.dispatchEvent(pointerEvent("pointerdown", 150));
+    input.dispatchEvent(pointerEvent("pointerup", 153));
+    assert.equal(target.read(), target.tapValue);
+    pointerId += 1;
+  }
+  assert.equal(previewCalls, 2);
+  assert.equal(commitCalls, 2);
+
+  const input = panel.controls.get("brightness").input;
+  input.dispatchEvent({
+    type: "pointerdown",
+    pointerId,
+    pointerType: "mouse",
+    isPrimary: true,
+    button: 0,
+    clientX: 180,
+    clientY: 20,
+    cancelable: true,
+    preventDefault() {},
+    stopPropagation() {},
+  });
+  input.dispatchEvent({
+    type: "pointerup",
+    pointerId,
+    pointerType: "mouse",
+    clientX: 200,
+    clientY: 20,
+    cancelable: true,
+    preventDefault() {},
+    stopPropagation() {},
+  });
+  assert.equal(panel.values.brightness, 70, "drag adds travel to the starting value");
+});
+
+test("view trim pointer tap is absolute, drag is relative, and cancellation restores", () => {
+  const panel = new ViewerViewTrimPanel();
+  panel.serverState = normalizeRemoteViewTrimState(viewTrimState());
+  let commitCalls = 0;
+  let prevented = 0;
+  panel.commit = async () => { commitCalls += 1; };
+  const row = panel.marginControl("single", "left");
+  const input = row.children[1];
+  input.getBoundingClientRect = () => ({ left: 0, width: 200 });
+  input.focus = () => {};
+  input.setPointerCapture = () => {};
+  input.hasPointerCapture = () => false;
+  input.releasePointerCapture = () => {};
+  let pointerId = 40;
+  const pointerEvent = (type, clientX) => ({
+    type,
+    pointerId,
+    pointerType: "touch",
+    isPrimary: true,
+    button: 0,
+    clientX,
+    clientY: 20,
+    cancelable: type !== "pointercancel",
+    preventDefault() { prevented += 1; },
+    stopPropagation() {},
+  });
+
+  input.dispatchEvent(pointerEvent("pointerdown", 100));
+  input.dispatchEvent(pointerEvent("pointerup", 103));
+  assert.equal(panel.serverState.book_settings.single.left, 0.1);
+  assert.equal(commitCalls, 1);
+
+  pointerId += 1;
+  input.dispatchEvent(pointerEvent("pointerdown", 150));
+  input.dispatchEvent(pointerEvent("pointermove", 170));
+  input.dispatchEvent(pointerEvent("pointerup", 170));
+  assert.equal(panel.serverState.book_settings.single.left, 0.12);
+  assert.equal(commitCalls, 2);
+
+  pointerId += 1;
+  input.dispatchEvent(pointerEvent("pointerdown", 120));
+  input.dispatchEvent(pointerEvent("pointermove", 180));
+  assert.notEqual(panel.serverState.book_settings.single.left, 0.12);
+  input.dispatchEvent(pointerEvent("pointercancel", 180));
+  assert.equal(panel.serverState.book_settings.single.left, 0.12);
+  assert.equal(commitCalls, 2);
+  assert.equal(prevented, 0, "touch must remain available to the vertical pan owner");
 });
 
 test("adjustment preview keeps one request in flight and coalesces to the latest value", async () => {

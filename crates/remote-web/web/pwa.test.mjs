@@ -587,16 +587,20 @@ test("image and video seek share tap-or-relative-drag handling without replacing
   );
 });
 
-test("video volume is capability-gated and shares relative range dragging", async () => {
+test("video volume is capability-gated after metadata and shares tap-or-drag range handling", async () => {
   const video = await readFile(new URL("video-stream.mjs", here), "utf8");
   const volumeBody = video.match(
     /renderVolume\(\)[\s\S]*?\n  }\n\n  setMediaState/
   )?.[0] ?? "";
+  assert.match(video, /addEventListener\("loadedmetadata", this\.onLoadedMetadata\)/);
   assert.match(video, /mediaElementVolumeControlSupported\(this\.video\)/);
+  assert.match(video, /type: "media_capability"[\s\S]*lifecycle: "loadedmetadata"/);
   assert.match(video, /volume: showVolume/);
   assert.match(volumeBody, /addEventListener\("pointerdown"/);
   assert.match(volumeBody, /event\.preventDefault\(\)/);
   assert.match(volumeBody, /videoVolumeRelativeDragValue\(\{/);
+  assert.match(volumeBody, /seekRangePointerGestureDecision\(\{/);
+  assert.match(volumeBody, /seekRangeAbsoluteValue\(\{/);
   assert.match(video, /relativeRangeDragValue\(\{/);
   assert.doesNotMatch(video, /userAgent|navigator\.platform/);
 });

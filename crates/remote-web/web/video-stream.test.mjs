@@ -6,6 +6,7 @@ import {
   VIDEO_PANEL_TABS,
   VideoPlaybackControlState,
   VideoSeekPreviewOwner,
+  VideoStreamMenu,
   VideoStreamViewer,
   hlsBufferConfig,
   hlsErrorTelemetryDetails,
@@ -910,7 +911,7 @@ test("video seek drag maps pointer travel to the visible timeline scale", () => 
   assert.equal(drag(100, -200), 0);
 });
 
-test("volume capability probes assignment and restores before media attachment", () => {
+test("volume capability probes assignment and restores the observed value", () => {
   const supported = { volume: 1 };
   assert.equal(mediaElementVolumeControlSupported(supported), true);
   assert.equal(supported.volume, 1);
@@ -926,6 +927,10 @@ test("volume capability probes assignment and restores before media attachment",
 });
 
 test("unsupported media volume hides the slider without hiding quality controls", () => {
+  assert.equal(videoControlMenuPresentation({
+    hasVideo: true,
+    volumeControlSupported: null,
+  }).showVolume, false, "the slider stays hidden before capability detection");
   assert.deepEqual(videoControlMenuPresentation({
     hasVideo: true,
     volumeControlSupported: false,
@@ -939,6 +944,115 @@ test("unsupported media volume hides the slider without hiding quality controls"
     hasVideo: false,
     volumeControlSupported: true,
   }).controlsTitle, "音量と音質");
+});
+
+test("loaded metadata volume detection refreshes presentation and publishes telemetry once", () => {
+  const detect = (video, desiredVolume) => {
+    const telemetry = [];
+    let refreshes = 0;
+    const viewer = {
+      destroyed: false,
+      volumeControlSupported: null,
+      video,
+      volume: desiredVolume,
+      menu: { refreshMediaPresentation: () => { refreshes += 1; } },
+      publishVideoTelemetry: (event) => telemetry.push(event),
+    };
+    const supported = VideoStreamViewer.prototype.detectVolumeControlSupport.call(viewer);
+    VideoStreamViewer.prototype.detectVolumeControlSupport.call(viewer);
+    return { supported, viewer, telemetry, refreshes };
+  };
+
+  const supported = detect({ volume: 1 }, 0.4);
+  assert.equal(supported.supported, true);
+  assert.equal(supported.viewer.video.volume, 0.4);
+  assert.equal(supported.refreshes, 1);
+  assert.deepEqual(supported.telemetry, [{
+    type: "media_capability",
+    action: "volume_control",
+    supported: true,
+    lifecycle: "loadedmetadata",
+  }]);
+
+  let ignoredVolume = 1;
+  const ignored = {};
+  Object.defineProperty(ignored, "volume", {
+    get: () => ignoredVolume,
+    set: () => {},
+  });
+  const unsupported = detect(ignored, 0.4);
+  assert.equal(unsupported.supported, false);
+  assert.equal(ignoredVolume, 1);
+  assert.equal(unsupported.telemetry[0].supported, false);
+});
+
+test("volume pointer tap is absolute while drag remains relative", () => {
+  class FakeElement {
+    constructor(tag) {
+      this.tagName = tag.toUpperCase();
+      this.children = [];
+      this.listeners = new Map();
+      this.disabled = false;
+      this.capturedPointer = null;
+    }
+    addEventListener(type, listener) {
+      const listeners = this.listeners.get(type) ?? [];
+      listeners.push(listener);
+      this.listeners.set(type, listeners);
+    }
+    append(...nodes) { this.children.push(...nodes); }
+    setAttribute() {}
+    focus() {}
+    getBoundingClientRect() { return { left: 0, width: 100 }; }
+    setPointerCapture(pointerId) { this.capturedPointer = pointerId; }
+    hasPointerCapture(pointerId) { return this.capturedPointer === pointerId; }
+    releasePointerCapture() { this.capturedPointer = null; }
+    dispatchEvent(event) {
+      for (const listener of this.listeners.get(event.type) ?? []) listener(event);
+    }
+  }
+  const previousDocument = globalThis.document;
+  globalThis.document = { createElement: (tag) => new FakeElement(tag) };
+  try {
+    const commands = [];
+    const menu = {
+      mediaState: () => ({ volume: 0.5 }),
+      actions: new FakeElement("div"),
+      send: (_event, name, payload) => commands.push({ name, payload }),
+    };
+    VideoStreamMenu.prototype.renderVolume.call(menu);
+    const input = menu.actions.children[0].children[1];
+    const pointer = (type, clientX, clientY = 20) => ({
+      type,
+      pointerId: 7,
+      pointerType: "touch",
+      isPrimary: true,
+      button: 0,
+      clientX,
+      clientY,
+      cancelable: true,
+      preventDefault() {},
+      stopPropagation() {},
+    });
+
+    input.dispatchEvent(pointer("pointerdown", 80));
+    input.dispatchEvent(pointer("pointerup", 83, 23));
+    assert.deepEqual(commands.at(-1), {
+      name: "media_volume",
+      payload: { volume: 0.8 },
+    });
+
+    input.value = "0.5";
+    input.dispatchEvent(pointer("pointerdown", 80));
+    input.dispatchEvent(pointer("pointermove", 100));
+    input.dispatchEvent(pointer("pointerup", 100));
+    assert.deepEqual(commands.at(-1), {
+      name: "media_volume",
+      payload: { volume: 0.7 },
+    });
+  } finally {
+    globalThis.document = previousDocument;
+  }
 });
 
 test("volume drag shares the relative range calculation and ignores press position", () => {
