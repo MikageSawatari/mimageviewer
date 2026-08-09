@@ -1650,6 +1650,12 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
 - 優先度: P2 (要望)。規模: 小 (新規アクション 2 本 + メニュー項目 + ドキュメント。既定変更なし)。
   `KeyAction` を足すときは `ini_name` / `context` / `trigger` / `default_chords` / `ALL_ACTIONS` /
   呼び出し側 helper / `docs/keymap.ini.default` / `docs/keymap-spec.md` を揃える。
+- **実装記録 (2026-08-10)**: `GridRename` / `GridReload` を Grid 文脈・既定 `none` で追加し、
+  既存の既定 chord は変更していない。更新メニューをファイルメニューへ追加した。
+  `reload_top_level_grid` の `TopLevelGridSurface` match 1 か所から各再入場経路へ配線し、フォルダ
+  ツリーペインと Ctrl+F の再適用も同じ入口で扱う。スマートフォルダ / サブ展開の走査中は無視し、
+  通常フォルダは読込後選択 hint で同じ項目へ戻し、スマートフォルダ / サブ展開は先頭へ戻す。
+  F2 / F3 / F5 の任意設定手順と、Ctrl+G の更新が索引再構築ではないことをマニュアルへ記載した。
 
 ### 4.9 削除確認ダイアログを矢印キーで選べるようにする — 利用者要望
 
@@ -1684,6 +1690,12 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
 - 関連: §4.8 の「F2 名前の変更」。名前の変更ダイアログはすでに Win32 なので、そちらの
   ダイアログ内キー操作は元から Windows 標準どおり。
 - 優先度: P2 (要望)。規模: 小。
+- **実装記録 (2026-08-10)**: 削除確認だけに選択位置を追加した。ごみ箱へ移す確認は「削除」、
+  完全削除の可能性がある確認は「キャンセル」を初期選択にし、左右と上下の矢印を同義で受ける。
+  Enter は `dialog_enter_pressed` の結果で選択中ボタンを実行し、矢印 / Enter は Y / N / Esc と同じ
+  `consume_delete_confirm_action` で消費する。選択中ボタンは `request_focus()` で表示し、他の
+  2 ボタン確認モーダルには広げていない。初期選択、方向移動、Enter、IME guard、背面への入力漏れを
+  純関数 / input consumption テストで固定した。
 
 ## 5. リリース前確認 / 依存更新
 

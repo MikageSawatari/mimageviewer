@@ -16154,6 +16154,10 @@ impl App {
         if self.restore_subfolder_expansion_for_synthetic_path(&folder) {
             return;
         }
+        self.select_after_load = self
+            .selected
+            .and_then(|index| self.items.get(index))
+            .map(|item| item.name().into_owned());
         let saved_override = self.archive_source_override.clone();
         self.load_folder(folder);
         if let Some(src) = saved_override {
@@ -31354,6 +31358,15 @@ impl App {
             .consume_action(ctx, KeyAction::GridOpenOperationCustomize)
         {
             self.show_operation_customize = true;
+            return None;
+        }
+
+        if self.keymap.consume_action(ctx, KeyAction::GridRename) {
+            self.request_grid_rename_dialog();
+            return None;
+        }
+        if self.keymap.consume_action(ctx, KeyAction::GridReload) {
+            self.reload_top_level_grid(ctx);
             return None;
         }
 

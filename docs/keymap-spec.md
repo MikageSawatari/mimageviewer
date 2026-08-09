@@ -181,7 +181,7 @@ Enter-held の各 API は対象 `ViewportId` を必須引数にし、別 viewpor
 | OS 予約 | <kbd>Alt</kbd>+<kbd>F4</kbd>、<kbd>Alt</kbd>+<kbd>Tab</kbd>、<kbd>Win</kbd> キー系など | Windows 側が先に処理する。mIV の keymap では上書きしない |
 | keyboard focus 移動 | <kbd>Tab</kbd> traversal | 非テキスト widget へ focus が移って `wants_keyboard_input()` が true のまま残り、全 shortcut が停止した履歴と、TextEdit から 1 hop だけ移動する不統一を避けるため、アプリ全体で常に無効。Tab chord 自体は `KeyAction` へ割り当て可能 |
 | フォーカスローカル UI | テキスト入力、IME 変換、コンボボックス、リスト、フォルダツリー、製本並べ替えダイアログ内の矢印 / Enter / Esc / PageUp / PageDown / Home / End など | その UI 部品の中だけで意味を持ち、グローバルショートカットとして外へ漏らさない |
-| モーダル削除確認 | <kbd>Y</kbd> = 削除、<kbd>N</kbd> / <kbd>Esc</kbd> = キャンセル、<kbd>Enter</kbd> = 無効 | 誤操作防止のため keymap 対象外の固定入力。ダイアログ表示中に Y / N / Esc を消費し、背面の KeyAction へ漏らさない。IME 変換中は Y / N / Esc の確認操作を行わない |
+| モーダル削除確認 | <kbd>Y</kbd> = 削除、<kbd>N</kbd> / <kbd>Esc</kbd> = キャンセル、<kbd>←</kbd> / <kbd>↑</kbd> = 削除を選択、<kbd>→</kbd> / <kbd>↓</kbd> = キャンセルを選択、<kbd>Enter</kbd> = 選択中を実行 | 破壊的操作の確認ダイアログだけで意味を持つフォーカスローカル入力のため keymap 対象外。ごみ箱へ移す確認は削除、完全削除の可能性がある確認はキャンセルを初期選択にする。表示中に各キーを消費して背面の KeyAction へ漏らさず、Enter は IME-safe helper で判定する。IME 変換中は Y / N / Esc / Enter の確認操作を行わない |
 | 最低限の脱出 / 閲覧ナビ | <kbd>Esc</kbd>、修飾なし矢印キー | モード脱出とページ / 一覧移動の最後の手段として残す。静止画 FS では raw-key permit を要求し、TextInput の全 phase では editor に残す一方、非テキスト `FocusedUi` はスライダー等にページ矢印を奪われないよう通す。Enter / Backspace / Home / End / PageUp / PageDown などは文脈ごとの `KeyAction` 化対象 |
 | 画像連結読みのドラッグ | 左ドラッグ = 連結方向スクロール、<kbd>Ctrl</kbd>+左ドラッグ = 軸固定を解除して直交方向にもパン | 連結レイアウト中だけの連続ポインター操作。離散コマンドではなく、ドラッグ中の各フレームの修飾状態で拘束を切り替えるため keymap 対象外。ダブルクリックの表示変形リセットも固定入力として扱う |
 | UI 表示倍率 | egui 既定の <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd> | `Settings.ui_scale_factor` と main Context の `zoom_factor` を単一の正本にするため、main / native presenter の両 egui Context で `zoom_with_keyboard=false`。表示倍率は設定メニュー「スケーリング」だけから変更し、KeyAction 対象外とする |
@@ -204,6 +204,8 @@ Enter-held の各 API は対象 `ViewportId` を必須引数にし、別 viewpor
 | <kbd>?</kbd> (既定) | 現在のサムネイル一覧コンテキストで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当て済みのものを表示し、固定扱いのナビゲーションキーは別枠で表示する |
 | <kbd>Backspace</kbd> | 親フォルダへ。Action: `GridParentFolder`。ドライブルート (`C:\` など) ではドライブ一覧へ戻り、元ドライブを選択状態にする。検索 (Ctrl+S / Ctrl+G) 中は検索仮想階層を 1 段ドリルアップ、最上位 (集約ビュー / 結果一覧) では no-op。タグビュー (Ctrl+T) 中は、検索結果から開いたフォルダ / ZIP / PDF / 変換アーカイブを 1 段戻り、検索結果一覧では no-op (検索を閉じるには <kbd>Esc</kbd> / 検索バーの <kbd>×</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd>・<kbd>Ctrl</kbd>+<kbd>T</kbd> 再押下)。Ctrl+F フィルタ中は、フィルタを実行したフォルダだけ親移動を no-op にする。検索結果から子フォルダへ入った後は通常どおり親へ戻れる |
 | <kbd>Enter</kbd> | 選択アイテムを開く。Action: `GridOpenSelected`。別ウィンドウセッションが同じ項目を既に表示中の場合は再オープンせず、必要に応じて別ウィンドウを前面化する |
+| 既定キーなし (`GridRename`) | 選択中の実ファイル / 実フォルダ 1 項目の名前を変更する。複数チェック中は実行せず通知する。Grid 文脈だけで、画像 / 動画フルスクリーンには入れない |
+| 既定キーなし (`GridReload`) | 現在の一覧を、その一覧種別の再読み込み / 再スキャン / 再クエリ経路で更新する。スマートフォルダ / サブ展開の走査中は二重起動せず、★固定中は何もしない。表示中のフォルダツリーペインも同時に再読み込みする |
 | 既定キーなし (`GridOpenSelectedAsPage` / `GridOpenSelectedAsList`) | 選択中の ZIP/PDF/対応アーカイブを、全体設定に関係なく「ページを開く」または「一覧を開く」で明示的に開く。右クリックメニュー、リングショートカット、マウスジェスチャ候補にも同じ操作を出す。メイン一覧をページ一覧へ切り替えるフル機能ウィンドウ用コマンドのため、複数ウィンドウモードでは共通実行入口でトーストを表示し、履歴・変換・一覧・viewer の状態を一切変更しない。現在コンテキストのショートカット一覧にも使用可能なときだけ表示する |
 | 既定キーなし (`GridOpenPreferences` / `GridOpenOperationCustomize`) | 「環境設定」または「操作カスタマイズ」を開く。Grid 文脈だけで、キーボード、リング、マウスジェスチャ、マウスボタン、ゲームパッド X+方向へ割り当てられる。メインウィンドウ側のダイアログが見えない画像 / 動画フルスクリーンでは候補に出さず、発火もしない |
 | 右ドラッグ（設定時） | 操作カスタマイズで選んだリングショートカットまたはマウスジェスチャを実行する。「ファイル上で右ドラッグを始めたとき、そのファイルを選択」が ON の場合は、押下時点で開始セルを選択してから操作を開始する。チェック済みの複数選択は解除せず、空き位置から開始した場合は選択を変えない。短い右クリックは従来どおり release 時に対象セルを選び、メニューを開く |

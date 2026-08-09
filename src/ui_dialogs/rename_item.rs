@@ -14,6 +14,24 @@ pub(crate) type RenameReceiver = mpsc::Receiver<RenameResult>;
 const DIALOG_TITLE: &str = "名前の変更";
 
 impl App {
+    /// グリッドのキー操作から、単一の実ファイル / 実フォルダだけを名前変更へ渡す。
+    pub(crate) fn request_grid_rename_dialog(&mut self) {
+        if self.checked.len() > 1 {
+            self.show_feedback_toast("名前の変更は 1 項目ずつ行ってください".to_owned());
+            return;
+        }
+        let target_index = self.checked.iter().next().copied().or(self.selected);
+        let Some(target) = target_index
+            .and_then(|index| self.items.get(index))
+            .and_then(crate::grid_item::GridItem::drag_source_path)
+            .map(PathBuf::from)
+        else {
+            self.show_feedback_toast("この項目は名前を変更できません".to_owned());
+            return;
+        };
+        self.request_rename_dialog(target);
+    }
+
     pub(crate) fn request_rename_dialog(&mut self, target: PathBuf) {
         if self.rename_pending.is_some() {
             self.show_feedback_toast("名前の変更が完了するまでお待ちください".to_owned());

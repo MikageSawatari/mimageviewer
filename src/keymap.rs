@@ -1469,6 +1469,8 @@ pub enum KeyAction {
     GridDeselect,
     GridToggleCheck,
     GridDelete,
+    GridRename,
+    GridReload,
     GridOpenSelected,
     GridOpenSelectedAsPage,
     GridOpenSelectedAsList,
@@ -1894,6 +1896,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridDeselect,
     KeyAction::GridToggleCheck,
     KeyAction::GridDelete,
+    KeyAction::GridRename,
+    KeyAction::GridReload,
     KeyAction::GridOpenSelected,
     KeyAction::GridOpenSelectedAsPage,
     KeyAction::GridOpenSelectedAsList,
@@ -2315,6 +2319,7 @@ pub enum MenuCommandId {
     FileOpenFolder,
     FileReadingHistory,
     FileLocalSearch,
+    FileReload,
     FileMetadataExport,
     FileMetadataImport,
     FileOpenCaptureFolder,
@@ -2358,6 +2363,7 @@ impl MenuCommandId {
         Self::FileOpenFolder,
         Self::FileReadingHistory,
         Self::FileLocalSearch,
+        Self::FileReload,
         Self::FileMetadataExport,
         Self::FileMetadataImport,
         Self::FileOpenCaptureFolder,
@@ -2401,6 +2407,7 @@ impl MenuCommandId {
             MenuCommandId::FileOpenFolder => "FileOpenFolder",
             MenuCommandId::FileReadingHistory => "FileReadingHistory",
             MenuCommandId::FileLocalSearch => "FileLocalSearch",
+            MenuCommandId::FileReload => "FileReload",
             MenuCommandId::FileMetadataExport => "FileMetadataExport",
             MenuCommandId::FileMetadataImport => "FileMetadataImport",
             MenuCommandId::FileOpenCaptureFolder => "FileOpenCaptureFolder",
@@ -2482,6 +2489,12 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         parent: TopMenuId::File,
         label: "現在地フィルタ",
         action: Some(KeyAction::GlobalLocalSearch),
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::FileReload,
+        parent: TopMenuId::File,
+        label: "最新の情報に更新",
+        action: Some(KeyAction::GridReload),
     },
     MenuCommandSpec {
         id: MenuCommandId::FileMetadataExport,
@@ -3382,6 +3395,8 @@ impl KeyAction {
             GridDeselect => "GridDeselect",
             GridToggleCheck => "GridToggleCheck",
             GridDelete => "GridDelete",
+            GridRename => "GridRename",
+            GridReload => "GridReload",
             GridOpenSelected => "GridOpenSelected",
             GridOpenSelectedAsPage => "GridOpenSelectedAsPage",
             GridOpenSelectedAsList => "GridOpenSelectedAsList",
@@ -3925,6 +3940,8 @@ impl KeyAction {
             GridDeselect => "チェックをすべて解除する",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
             GridDelete => "選択中またはチェック済みの実ファイル/実フォルダを削除する",
+            GridRename => "選択中の実ファイル/実フォルダの名前を変更する",
+            GridReload => "現在の一覧を最新の情報に更新する",
             GridOpenSelected => "選択中の項目を開く",
             GridOpenSelectedAsPage => {
                 "選択中の ZIP/PDF/対応アーカイブをページで開く（フル機能ウィンドウ）"
@@ -4357,6 +4374,8 @@ impl KeyAction {
             | GridDeselect
             | GridToggleCheck
             | GridDelete
+            | GridRename
+            | GridReload
             | GridOpenSelected
             | GridOpenSelectedAsPage
             | GridOpenSelectedAsList
@@ -4741,6 +4760,8 @@ impl KeyAction {
             | GridDeselect
             | GridToggleCheck
             | GridDelete
+            | GridRename
+            | GridReload
             | GridOpenSelected
             | GridOpenSelectedAsPage
             | GridOpenSelectedAsList
@@ -5172,6 +5193,7 @@ impl KeyAction {
             GridDeselect => ChordList::two(Chord::ctrl(D), Chord::ctrl_shift(A)),
             GridToggleCheck => ChordList::one(Chord::key(Space)),
             GridDelete => ChordList::one(Chord::key(Delete)),
+            GridRename | GridReload => ChordList::EMPTY,
             GridOpenSelected => ChordList::one(Chord::key(Enter)),
             GridOpenSelectedAsPage | GridOpenSelectedAsList => ChordList::EMPTY,
             GridOpenExternalPlayer => ChordList::one(Chord::shift(Enter)),
@@ -8427,6 +8449,7 @@ mod tests {
                 MenuCommandId::FileQuit,
                 MenuCommandId::FileOpenFolder,
                 MenuCommandId::FileLocalSearch,
+                MenuCommandId::FileReload,
                 MenuCommandId::FileMetadataExport,
                 MenuCommandId::FileMetadataImport,
                 MenuCommandId::FileOpenCaptureFolder,
@@ -8616,6 +8639,10 @@ mod tests {
             "現在地フィルタ (Ctrl+F)"
         );
         assert_eq!(
+            keymap.menu_command_label(MenuCommandId::FileReload),
+            "最新の情報に更新"
+        );
+        assert_eq!(
             keymap.menu_command_label(MenuCommandId::FavoritesFavSearch),
             "コンテナ検索 (Ctrl+S)"
         );
@@ -8636,6 +8663,7 @@ mod tests {
             GlobalFavSearch = none
             [Grid]
             GridOpenLocationReadingHistory = Ctrl+L
+            GridReload = F5
             "#,
         );
         assert_eq!(
@@ -8649,6 +8677,10 @@ mod tests {
         assert_eq!(
             keymap.menu_command_label(MenuCommandId::FileLocalSearch),
             "現在地フィルタ (F2)"
+        );
+        assert_eq!(
+            keymap.menu_command_label(MenuCommandId::FileReload),
+            "最新の情報に更新 (F5)"
         );
         assert_eq!(
             keymap.menu_command_label(MenuCommandId::FavoritesFavSearch),
@@ -8867,6 +8899,16 @@ mod tests {
         assert!(KeyAction::GridToggleStackMode.default_chords().is_empty());
         assert_eq!(KeyAction::GridToggleStackMode.context(), KeyContext::Grid);
         assert_eq!(KeyAction::GridToggleStackMode.trigger(), KeyTrigger::Press);
+    }
+
+    #[test]
+    fn grid_rename_and_reload_are_default_unassigned() {
+        for action in [KeyAction::GridRename, KeyAction::GridReload] {
+            assert!(KeyAction::all().contains(&action));
+            assert!(action.default_chords().is_empty());
+            assert_eq!(action.context(), KeyContext::Grid);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+        }
     }
 
     #[test]

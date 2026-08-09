@@ -2878,6 +2878,12 @@ impl App {
         }
     }
 
+    pub(crate) fn smart_folder_busy(&self) -> bool {
+        self.smart_folder_pending.is_some()
+            || self.smart_folder_prepare_pending.is_some()
+            || self.smart_folder_confirm_pending.is_some()
+    }
+
     /// テスト専用: snapshot から prepare 済み状態を組み立てるセットアップ helper。
     ///
     /// production はセッション復帰で prepare をやり直さなくなったため、この既定引数の

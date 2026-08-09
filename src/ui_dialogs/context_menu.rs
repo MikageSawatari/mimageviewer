@@ -40,6 +40,21 @@ enum DeleteConfirmKind {
     MayPermanent,
 }
 
+impl DeleteConfirmKind {
+    fn initial_selection(self) -> DeleteConfirmSelection {
+        match self {
+            Self::RecycleBin => DeleteConfirmSelection::Delete,
+            Self::MayPermanent => DeleteConfirmSelection::Cancel,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteConfirmSelection {
+    Delete,
+    Cancel,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeleteConfirmAction {
     None,
@@ -53,13 +68,30 @@ struct DeleteConfirmModalResponse {
     cancel_clicked: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeleteConfirmContent {
+    label: String,
+    kind: DeleteConfirmKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeleteConfirmKeyResponse {
+    selection: DeleteConfirmSelection,
+    action: DeleteConfirmAction,
+}
+
 const DELETE_CONFIRM_VISIBLE_TARGET_LIMIT: usize = 10;
+const DELETE_CONFIRM_SELECTION_ID: &str = "delete_confirm_selection";
 
 /// 削除確認をモーダル表示し、背面 UI への pointer 入力を backdrop で遮断する。
 ///
 /// backdrop のクリックは閉じる操作にせず吸収する。破壊的操作の確認結果は、明示的な
-/// ボタンまたは `consume_delete_confirm_action` が扱う Y / N / Esc だけで決める。
-fn show_delete_confirm_modal(ctx: &egui::Context, label: &str) -> DeleteConfirmModalResponse {
+/// ボタンまたは `consume_delete_confirm_action` が扱う固定キーだけで決める。
+fn show_delete_confirm_modal(
+    ctx: &egui::Context,
+    label: &str,
+    selection: DeleteConfirmSelection,
+) -> DeleteConfirmModalResponse {
     let mut response = DeleteConfirmModalResponse::default();
     let content_rect = ctx.content_rect();
     let dialog_width = (content_rect.width() - 32.0).clamp(240.0, 520.0);
@@ -88,10 +120,18 @@ fn show_delete_confirm_modal(ctx: &egui::Context, label: &str) -> DeleteConfirmM
         }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if ui.button("削除[Y]").clicked() {
+            let delete_response = ui.button("削除[Y]");
+            if selection == DeleteConfirmSelection::Delete {
+                delete_response.request_focus();
+            }
+            if delete_response.clicked() {
                 response.delete_clicked = true;
             }
-            if ui.button("キャンセル[N]").clicked() {
+            let cancel_response = ui.button("キャンセル[N]");
+            if selection == DeleteConfirmSelection::Cancel {
+                cancel_response.request_focus();
+            }
+            if cancel_response.clicked() {
                 response.cancel_clicked = true;
             }
         });
@@ -100,9 +140,11 @@ fn show_delete_confirm_modal(ctx: &egui::Context, label: &str) -> DeleteConfirmM
 }
 
 fn resolve_delete_confirm_action(
+    selection: DeleteConfirmSelection,
     y_pressed: bool,
     n_pressed: bool,
     escape_pressed: bool,
+    enter_pressed: bool,
     ime_active: bool,
 ) -> DeleteConfirmAction {
     if ime_active {
@@ -112,8 +154,28 @@ fn resolve_delete_confirm_action(
         DeleteConfirmAction::Cancel
     } else if y_pressed {
         DeleteConfirmAction::Delete
+    } else if enter_pressed {
+        match selection {
+            DeleteConfirmSelection::Delete => DeleteConfirmAction::Delete,
+            DeleteConfirmSelection::Cancel => DeleteConfirmAction::Cancel,
+        }
     } else {
         DeleteConfirmAction::None
+    }
+}
+
+fn move_delete_confirm_selection(
+    selection: DeleteConfirmSelection,
+    toward_delete: bool,
+    toward_cancel: bool,
+) -> DeleteConfirmSelection {
+    if toward_cancel {
+        // 両方向が同じ frame に来た場合も、安全側のキャンセルを優先する。
+        DeleteConfirmSelection::Cancel
+    } else if toward_delete {
+        DeleteConfirmSelection::Delete
+    } else {
+        selection
     }
 }
 
@@ -121,17 +183,33 @@ fn resolve_delete_confirm_action(
 /// Escape の意味判定自体は呼び出し側が IME-safe helper で先に済ませる。
 fn consume_delete_confirm_action(
     ctx: &egui::Context,
+    selection: DeleteConfirmSelection,
     ime_active: bool,
     escape_pressed: bool,
-) -> DeleteConfirmAction {
-    let (y_pressed, n_pressed) = ctx.input_mut(|input| {
+    enter_pressed: bool,
+) -> DeleteConfirmKeyResponse {
+    let (y_pressed, n_pressed, toward_delete, toward_cancel) = ctx.input_mut(|input| {
         let y_pressed = input.consume_key(egui::Modifiers::NONE, egui::Key::Y);
         let n_pressed = input.consume_key(egui::Modifiers::NONE, egui::Key::N);
-        let escape_modifiers = input.modifiers;
-        let _ = input.consume_key(escape_modifiers, egui::Key::Escape);
-        (y_pressed, n_pressed)
+        let modifiers = input.modifiers;
+        let toward_delete = input.consume_key(modifiers, egui::Key::ArrowLeft)
+            | input.consume_key(modifiers, egui::Key::ArrowUp);
+        let toward_cancel = input.consume_key(modifiers, egui::Key::ArrowRight)
+            | input.consume_key(modifiers, egui::Key::ArrowDown);
+        let _ = input.consume_key(modifiers, egui::Key::Escape);
+        let _ = input.consume_key(modifiers, egui::Key::Enter);
+        (y_pressed, n_pressed, toward_delete, toward_cancel)
     });
-    resolve_delete_confirm_action(y_pressed, n_pressed, escape_pressed, ime_active)
+    let selection = move_delete_confirm_selection(selection, toward_delete, toward_cancel);
+    let action = resolve_delete_confirm_action(
+        selection,
+        y_pressed,
+        n_pressed,
+        escape_pressed,
+        enter_pressed,
+        ime_active,
+    );
+    DeleteConfirmKeyResponse { selection, action }
 }
 
 /// ダイアログ状態を閉じ、Delete のときだけ worker へ渡す path 列を返す。
@@ -204,7 +282,10 @@ fn native_grid_context_menu_target_kind(target: &NativeGridContextMenuTarget) ->
 const DELETE_FOLDER_OMITTED_FILES_WARNING: &str =
     "フォルダの中には一覧に表示していないファイルも含まれます";
 
-fn delete_confirm_label_for_targets(targets: &[(usize, PathBuf)], items: &[GridItem]) -> String {
+fn delete_confirm_label_for_targets(
+    targets: &[(usize, PathBuf)],
+    items: &[GridItem],
+) -> DeleteConfirmContent {
     let kind = if delete_targets_may_permanently_delete(targets) {
         DeleteConfirmKind::MayPermanent
     } else {
@@ -238,7 +319,7 @@ fn delete_confirm_label_for_targets(targets: &[(usize, PathBuf)], items: &[GridI
             label.push_str(&format!("\n・他 {remaining} 件"));
         }
     }
-    label
+    DeleteConfirmContent { label, kind }
 }
 
 fn build_delete_confirm_label(
@@ -2048,22 +2129,46 @@ impl crate::app::App {
         }
 
         if self.delete_confirm_label.is_none() {
-            self.delete_confirm_label = Some(delete_confirm_label_for_targets(
-                &self.delete_targets,
-                &self.items,
-            ));
+            let content = delete_confirm_label_for_targets(&self.delete_targets, &self.items);
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new(DELETE_CONFIRM_SELECTION_ID),
+                    content.kind.initial_selection(),
+                );
+            });
+            self.delete_confirm_label = Some(content.label);
         }
         let label = self.delete_confirm_label.clone().unwrap_or_default();
+        let selection = ctx
+            .data(|data| data.get_temp(egui::Id::new(DELETE_CONFIRM_SELECTION_ID)))
+            .unwrap_or(DeleteConfirmSelection::Cancel);
 
         // CLAUDE.md の IME 定型どおり Modal closure の前で capture する。
         let ime_active = self.ime_input_active(ctx);
         let escape_pressed = self.dialog_escape_pressed(ctx);
-        let key_action = consume_delete_confirm_action(ctx, ime_active, escape_pressed);
-        let modal_response = show_delete_confirm_modal(ctx, &label);
+        let enter_pressed = self.dialog_enter_pressed(ctx);
+        let key_response = consume_delete_confirm_action(
+            ctx,
+            selection,
+            ime_active,
+            escape_pressed,
+            enter_pressed,
+        );
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new(DELETE_CONFIRM_SELECTION_ID),
+                key_response.selection,
+            );
+        });
+        let modal_response = show_delete_confirm_modal(ctx, &label, key_response.selection);
 
-        let action = if modal_response.cancel_clicked || key_action == DeleteConfirmAction::Cancel {
+        let action = if modal_response.cancel_clicked
+            || key_response.action == DeleteConfirmAction::Cancel
+        {
             DeleteConfirmAction::Cancel
-        } else if modal_response.delete_clicked || key_action == DeleteConfirmAction::Delete {
+        } else if modal_response.delete_clicked
+            || key_response.action == DeleteConfirmAction::Delete
+        {
             DeleteConfirmAction::Delete
         } else {
             DeleteConfirmAction::None
@@ -2887,10 +2992,18 @@ mod delete_confirm_tests {
         let targets = vec![(0, folder.clone())];
         let folder_label =
             delete_confirm_label_for_targets(&targets, &[GridItem::Folder(folder.clone())]);
-        assert!(folder_label.contains(DELETE_FOLDER_OMITTED_FILES_WARNING));
+        assert!(
+            folder_label
+                .label
+                .contains(DELETE_FOLDER_OMITTED_FILES_WARNING)
+        );
 
         let file_label = delete_confirm_label_for_targets(&targets, &[GridItem::Image(folder)]);
-        assert!(!file_label.contains(DELETE_FOLDER_OMITTED_FILES_WARNING));
+        assert!(
+            !file_label
+                .label
+                .contains(DELETE_FOLDER_OMITTED_FILES_WARNING)
+        );
     }
 
     #[test]
@@ -2908,7 +3021,7 @@ mod delete_confirm_tests {
             .iter()
             .map(|(_, path)| GridItem::Image(path.clone()))
             .collect::<Vec<_>>();
-        let label = delete_confirm_label_for_targets(&targets, &items);
+        let label = delete_confirm_label_for_targets(&targets, &items).label;
 
         for idx in 0..DELETE_CONFIRM_VISIBLE_TARGET_LIMIT {
             assert!(
@@ -2926,7 +3039,7 @@ mod delete_confirm_tests {
         let targets = vec![(0, PathBuf::from(r"C:\pictures\only_one.jpg"))];
 
         let items = vec![GridItem::Image(targets[0].1.clone())];
-        let label = delete_confirm_label_for_targets(&targets, &items);
+        let label = delete_confirm_label_for_targets(&targets, &items).label;
 
         assert!(label.contains("only_one.jpg"));
         assert!(!label.contains("\n\n対象:"));
@@ -2946,35 +3059,122 @@ mod delete_confirm_tests {
     }
 
     #[test]
-    fn delete_confirm_fixed_keys_resolve_y_delete_n_escape_cancel_enter_none() {
+    fn delete_confirm_initial_selection_depends_on_delete_kind() {
         assert_eq!(
-            resolve_delete_confirm_action(true, false, false, false),
-            DeleteConfirmAction::Delete
+            DeleteConfirmKind::RecycleBin.initial_selection(),
+            DeleteConfirmSelection::Delete
         );
         assert_eq!(
-            resolve_delete_confirm_action(false, true, false, false),
-            DeleteConfirmAction::Cancel
-        );
-        assert_eq!(
-            resolve_delete_confirm_action(false, false, true, false),
-            DeleteConfirmAction::Cancel
-        );
-        assert_eq!(
-            resolve_delete_confirm_action(false, false, false, false),
-            DeleteConfirmAction::None,
-            "Enter は resolver の入力に含めず、状態を変えない"
+            DeleteConfirmKind::MayPermanent.initial_selection(),
+            DeleteConfirmSelection::Cancel
         );
     }
 
     #[test]
-    fn delete_confirm_ignores_y_n_during_ime_composition() {
+    fn delete_confirm_fixed_keys_resolve_y_n_escape_and_selected_enter() {
         assert_eq!(
-            resolve_delete_confirm_action(true, false, false, true),
+            resolve_delete_confirm_action(
+                DeleteConfirmSelection::Cancel,
+                true,
+                false,
+                false,
+                false,
+                false,
+            ),
+            DeleteConfirmAction::Delete
+        );
+        assert_eq!(
+            resolve_delete_confirm_action(
+                DeleteConfirmSelection::Delete,
+                false,
+                true,
+                false,
+                false,
+                false,
+            ),
+            DeleteConfirmAction::Cancel
+        );
+        assert_eq!(
+            resolve_delete_confirm_action(
+                DeleteConfirmSelection::Delete,
+                false,
+                false,
+                true,
+                false,
+                false,
+            ),
+            DeleteConfirmAction::Cancel
+        );
+        assert_eq!(
+            resolve_delete_confirm_action(
+                DeleteConfirmSelection::Delete,
+                false,
+                false,
+                false,
+                true,
+                false,
+            ),
+            DeleteConfirmAction::Delete
+        );
+        assert_eq!(
+            resolve_delete_confirm_action(
+                DeleteConfirmSelection::Cancel,
+                false,
+                false,
+                false,
+                true,
+                false,
+            ),
+            DeleteConfirmAction::Cancel
+        );
+    }
+
+    #[test]
+    fn delete_confirm_ignores_y_n_enter_during_ime_composition() {
+        assert_eq!(
+            resolve_delete_confirm_action(
+                DeleteConfirmSelection::Delete,
+                true,
+                false,
+                false,
+                false,
+                true,
+            ),
             DeleteConfirmAction::None
         );
         assert_eq!(
-            resolve_delete_confirm_action(false, true, false, true),
+            resolve_delete_confirm_action(
+                DeleteConfirmSelection::Cancel,
+                false,
+                true,
+                false,
+                false,
+                true,
+            ),
             DeleteConfirmAction::None
+        );
+        assert_eq!(
+            resolve_delete_confirm_action(
+                DeleteConfirmSelection::Delete,
+                false,
+                false,
+                false,
+                true,
+                true,
+            ),
+            DeleteConfirmAction::None
+        );
+    }
+
+    #[test]
+    fn delete_confirm_arrow_directions_select_delete_or_cancel() {
+        assert_eq!(
+            move_delete_confirm_selection(DeleteConfirmSelection::Cancel, true, false),
+            DeleteConfirmSelection::Delete
+        );
+        assert_eq!(
+            move_delete_confirm_selection(DeleteConfirmSelection::Delete, false, true),
+            DeleteConfirmSelection::Cancel
         );
     }
 
@@ -3004,7 +3204,11 @@ mod delete_confirm_tests {
                         clicked_in_ui.store(true, Ordering::Relaxed);
                     }
                 });
-                let _ = show_delete_confirm_modal(ctx, "sample.jpg をゴミ箱に移動しますか？");
+                let _ = show_delete_confirm_modal(
+                    ctx,
+                    "sample.jpg をゴミ箱に移動しますか？",
+                    DeleteConfirmSelection::Delete,
+                );
             });
 
         harness.get_by_label("Background action").click();
@@ -3056,10 +3260,14 @@ mod delete_confirm_tests {
         let keymap = crate::keymap::Keymap::from_ini_str("[Grid]\nGridPin = Y\n");
         let ctx = egui::Context::default();
         begin_key_pass(&ctx, egui::Key::Y);
-        assert_eq!(
-            consume_delete_confirm_action(&ctx, false, false),
-            DeleteConfirmAction::Delete
+        let response = consume_delete_confirm_action(
+            &ctx,
+            DeleteConfirmSelection::Cancel,
+            false,
+            false,
+            false,
         );
+        assert_eq!(response.action, DeleteConfirmAction::Delete);
         assert!(
             !keymap.consume_action(&ctx, crate::keymap::KeyAction::GridPin),
             "削除確認で消費した Y は同 frame の背面 KeyAction に届かない"
@@ -3072,10 +3280,9 @@ mod delete_confirm_tests {
         let keymap = crate::keymap::Keymap::from_ini_str("[Grid]\nGridPin = N\n");
         let ctx = egui::Context::default();
         begin_key_pass(&ctx, egui::Key::N);
-        assert_eq!(
-            consume_delete_confirm_action(&ctx, true, false),
-            DeleteConfirmAction::None
-        );
+        let response =
+            consume_delete_confirm_action(&ctx, DeleteConfirmSelection::Delete, true, false, false);
+        assert_eq!(response.action, DeleteConfirmAction::None);
         assert!(!keymap.consume_action(&ctx, crate::keymap::KeyAction::GridPin));
         let _ = ctx.end_pass();
     }
@@ -3084,24 +3291,46 @@ mod delete_confirm_tests {
     fn delete_confirm_consumes_escape_after_ime_safe_capture() {
         let ctx = egui::Context::default();
         begin_key_pass(&ctx, egui::Key::Escape);
-        assert_eq!(
-            consume_delete_confirm_action(&ctx, false, true),
-            DeleteConfirmAction::Cancel
-        );
+        let response =
+            consume_delete_confirm_action(&ctx, DeleteConfirmSelection::Delete, false, true, false);
+        assert_eq!(response.action, DeleteConfirmAction::Cancel);
         assert!(ctx.input(|input| input.events.is_empty()));
         let _ = ctx.end_pass();
     }
 
     #[test]
-    fn delete_confirm_enter_is_unconsumed_and_has_no_dialog_action() {
+    fn delete_confirm_consumes_enter_and_uses_current_selection() {
         let ctx = egui::Context::default();
         begin_key_pass(&ctx, egui::Key::Enter);
-        assert_eq!(
-            consume_delete_confirm_action(&ctx, false, false),
-            DeleteConfirmAction::None
-        );
-        assert!(ctx.input(|input| input.key_pressed(egui::Key::Enter)));
+        let response =
+            consume_delete_confirm_action(&ctx, DeleteConfirmSelection::Cancel, false, false, true);
+        assert_eq!(response.action, DeleteConfirmAction::Cancel);
+        assert!(ctx.input(|input| input.events.is_empty()));
         let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn delete_confirm_consumes_horizontal_and_vertical_arrow_synonyms() {
+        for (key, expected) in [
+            (egui::Key::ArrowLeft, DeleteConfirmSelection::Delete),
+            (egui::Key::ArrowUp, DeleteConfirmSelection::Delete),
+            (egui::Key::ArrowRight, DeleteConfirmSelection::Cancel),
+            (egui::Key::ArrowDown, DeleteConfirmSelection::Cancel),
+        ] {
+            let ctx = egui::Context::default();
+            begin_key_pass(&ctx, key);
+            let response = consume_delete_confirm_action(
+                &ctx,
+                DeleteConfirmSelection::Cancel,
+                false,
+                false,
+                false,
+            );
+            assert_eq!(response.selection, expected, "{key:?}");
+            assert_eq!(response.action, DeleteConfirmAction::None);
+            assert!(ctx.input(|input| input.events.is_empty()));
+            let _ = ctx.end_pass();
+        }
     }
 
     #[cfg(windows)]
