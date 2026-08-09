@@ -6505,11 +6505,12 @@ struct FsFrameState {
     pdf_content_type: Option<PdfPageContentType>,
 }
 
-/// Per-frame quality choice for ordinary single-page keyboard navigation.
+/// Per-frame quality choice for ordinary paged keyboard navigation.
 ///
 /// This is not a timer or a cross-frame navigation mode. `ThumbnailPassThrough`
 /// is selected only while another page-turn input edge is still pending in the
-/// same input frame and a catalog thumbnail is already available.
+/// same input frame and catalog thumbnails are already available for every page
+/// in the current display unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FsPageTurnMaterialization {
     Materialize,
@@ -6555,9 +6556,9 @@ struct FsPageTurnFrameDecision {
 
 fn page_turn_materialization_for_inputs(
     page_turn_input_pending: bool,
-    catalog_thumbnail_ready: bool,
+    catalog_thumbnails_ready: bool,
 ) -> FsPageTurnMaterialization {
-    if page_turn_input_pending && catalog_thumbnail_ready {
+    if page_turn_input_pending && catalog_thumbnails_ready {
         FsPageTurnMaterialization::ThumbnailPassThrough
     } else {
         FsPageTurnMaterialization::Materialize
@@ -6565,18 +6566,18 @@ fn page_turn_materialization_for_inputs(
 }
 
 fn page_turn_decision_reason(
-    ordinary_single_page_context: bool,
+    ordinary_paged_context: bool,
     eligible_pending_edges: usize,
     matching_pending_edges: usize,
-    catalog_thumbnail_ready: bool,
+    catalog_thumbnails_ready: bool,
 ) -> &'static str {
-    if !ordinary_single_page_context {
+    if !ordinary_paged_context {
         "ordinary_context_blocked"
     } else if eligible_pending_edges == 0 && matching_pending_edges > 0 {
         "ambiguous_page_turn_chord"
     } else if eligible_pending_edges == 0 {
         "pending_zero"
-    } else if !catalog_thumbnail_ready {
+    } else if !catalog_thumbnails_ready {
         "catalog_thumbnail_unavailable"
     } else {
         "pass_through"
@@ -11690,6 +11691,7 @@ impl App {
                                             ui,
                                             ctx,
                                             image_rect,
+                                            fs_idx,
                                             compare_mode,
                                             zp,
                                         ) {
@@ -11848,6 +11850,7 @@ impl App {
                                             ui,
                                             ctx,
                                             image_rect,
+                                            fs_idx,
                                             compare_mode,
                                             zoom_pan,
                                         )
@@ -11885,6 +11888,7 @@ impl App {
                                             left,
                                             right,
                                             state.original_preview_active,
+                                            state.page_turn_materialization,
                                             None,
                                         );
                                         if let crate::app::CompareViewMode::Wipe { fraction } =
@@ -13123,8 +13127,6 @@ impl App {
     ) -> Option<&'static str> {
         if !self.reading_flow.is_paged() {
             Some("reading_flow_not_paged")
-        } else if self.spread_mode.is_spread() {
-            Some("spread_mode")
         } else if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
             Some("item_not_page_data")
         } else if self.any_modal_dialog_open_for_fullscreen_keys() {
@@ -13150,6 +13152,38 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// A pass-through frame must be able to paint the complete visible unit
+    /// from catalog textures. Spread pairing uses the same resolver as the
+    /// renderer; failure to resolve the unit, or one missing page thumbnail,
+    /// keeps the full materialization path.
+    #[cfg(any(windows, test))]
+    fn fs_page_turn_catalog_thumbnails_ready(&self, fs_idx: usize) -> bool {
+        let thumbnail_ready = |idx| {
+            matches!(
+                self.thumbnails.get(idx),
+                Some(ThumbnailState::Loaded { .. })
+            )
+        };
+        if !self.spread_mode.is_spread() {
+            return thumbnail_ready(fs_idx);
+        }
+
+        let nav = build_nav_indices(&self.items, self.current_grid_order());
+        let units = build_spread_display_units(
+            &nav,
+            &self.items,
+            self.spread_mode,
+            self.spread_shift_anchor_idx,
+            &self.fs_cache,
+            &self.thumbnails,
+            &self.page_dims_cache,
+            self.items_generation,
+        );
+        find_spread_display_unit(&units, fs_idx).is_some_and(|(_, unit)| {
+            !unit.pages.is_empty() && unit.pages.iter().copied().all(thumbnail_ready)
+        })
     }
 
     #[cfg(windows)]
@@ -13232,7 +13266,7 @@ impl App {
         fs_idx: usize,
         ordinary_context: bool,
         ordinary_blocker: Option<&'static str>,
-        thumbnail_ready: bool,
+        catalog_thumbnails_ready: bool,
         production_pending: bool,
         materialization: FsPageTurnMaterialization,
     ) {
@@ -13259,7 +13293,7 @@ impl App {
             ordinary_context,
             pending.matched_count,
             matching.matched_count,
-            thumbnail_ready,
+            catalog_thumbnails_ready,
         );
         let mut attrs = Vec::new();
         attrs.push(("n", serde_json::Value::from(self.frame_counter)));
@@ -13284,7 +13318,7 @@ impl App {
         ));
         attrs.push((
             "catalog_thumbnail_ready",
-            serde_json::Value::from(thumbnail_ready),
+            serde_json::Value::from(catalog_thumbnails_ready),
         ));
         attrs.push((
             "win32_key_down_count",
@@ -13438,7 +13472,7 @@ impl App {
         );
     }
 
-    /// Decide whether the current page is only passing through this input frame.
+    /// Decide whether the current display unit is only passing through this input frame.
     ///
     /// The decision source is exclusively the unconsumed, viewport-routed Win32
     /// key edge queue for this frame. No elapsed-time threshold participates.
@@ -13475,20 +13509,17 @@ impl App {
                 return cached.materialization;
             }
 
-            let catalog_thumbnail_ready = matches!(
-                self.thumbnails.get(fs_idx),
-                Some(ThumbnailState::Loaded { .. })
-            );
+            let catalog_thumbnails_ready = self.fs_page_turn_catalog_thumbnails_ready(fs_idx);
             let ordinary_context_blocker = self.fs_page_turn_ordinary_context_blocker(ctx, fs_idx);
-            let ordinary_single_page_context = ordinary_context_blocker.is_none();
-            let configurable_page_turn_pending = ordinary_single_page_context
+            let ordinary_paged_context = ordinary_context_blocker.is_none();
+            let configurable_page_turn_pending = ordinary_paged_context
                 && FS_PAGE_TURN_COALESCE_ACTIONS.into_iter().any(|action| {
                     self.keymap.any_effective_chord(action, |chord| {
                         self.keymap.pending_chord_press_in_frame(viewport, chord)
                             && self.fs_page_turn_chord_is_unambiguous(chord)
                     })
                 });
-            let fixed_page_turn_pending = ordinary_single_page_context
+            let fixed_page_turn_pending = ordinary_paged_context
                 && FS_FIXED_PAGE_TURN_CHORDS
                     .into_iter()
                     .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Up)))
@@ -13499,15 +13530,15 @@ impl App {
                     });
             let materialization = page_turn_materialization_for_inputs(
                 configurable_page_turn_pending || fixed_page_turn_pending,
-                catalog_thumbnail_ready,
+                catalog_thumbnails_ready,
             );
             self.emit_fs_page_turn_decision_probe(
                 viewport,
                 frame_nr,
                 fs_idx,
-                ordinary_single_page_context,
+                ordinary_paged_context,
                 ordinary_context_blocker,
-                catalog_thumbnail_ready,
+                catalog_thumbnails_ready,
                 configurable_page_turn_pending || fixed_page_turn_pending,
                 materialization,
             );
@@ -23605,10 +23636,11 @@ impl App {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         image_rect: egui::Rect,
+        fs_idx: usize,
         mode: crate::app::CompareViewMode,
         zoom_pan: Option<(f32, egui::Vec2)>,
     ) -> bool {
-        if self.compare_prepared_pair.is_none() {
+        if !self.compare_prepared_pair_matches(fs_idx) {
             return false;
         }
 
@@ -24188,6 +24220,7 @@ impl App {
                     left.idx,
                     right.idx,
                     false,
+                    FsPageTurnMaterialization::Materialize,
                     Some((left, right)),
                 );
             }
@@ -24205,6 +24238,7 @@ impl App {
         left_idx: usize,
         right_idx: usize,
         original_preview_active: bool,
+        page_turn_materialization: FsPageTurnMaterialization,
         display_override: Option<(&FsDisplayUnitHoldoverPage, &FsDisplayUnitHoldoverPage)>,
     ) -> FsNavigatorTextureSources {
         self.fullscreen_page_layout.clear();
@@ -24255,8 +24289,11 @@ impl App {
                 self.location_display_for_loading(right_idx),
             )
         };
+        let thumbnail_pass_through =
+            display_override.is_none() && page_turn_materialization.is_thumbnail_pass_through();
         let (left_display_tex, right_display_tex) = match display_override {
             Some((left, right)) => (Some(left.texture.clone()), Some(right.texture.clone())),
+            None if thumbnail_pass_through => (None, None),
             None => (
                 self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active)
                     .map(|texture| self.fullscreen_paint_resource_for_texture(left_idx, texture)),
@@ -24315,9 +24352,13 @@ impl App {
             ui.painter().clone()
         };
         let left_allow_thumbnail = display_override.is_none()
-            && (original_preview_active || !self.colorize_display_requires_final_effect(left_idx));
+            && (thumbnail_pass_through
+                || original_preview_active
+                || !self.colorize_display_requires_final_effect(left_idx));
         let right_allow_thumbnail = display_override.is_none()
-            && (original_preview_active || !self.colorize_display_requires_final_effect(right_idx));
+            && (thumbnail_pass_through
+                || original_preview_active
+                || !self.colorize_display_requires_final_effect(right_idx));
         let (left_source_size, right_source_size) = match display_override {
             Some((left, right)) => (left.source_size, right.source_size),
             None => (
@@ -31492,6 +31533,204 @@ mod tests {
         assert_eq!(app.selected, Some(2));
         assert_eq!(app.fs_vertical_scroll, 0.0);
         assert_eq!(app.fs_zoom, 1.5);
+    }
+
+    #[test]
+    fn compare_main_rejects_prepared_pair_from_another_current_page() {
+        let mut app = crate::app::setup_app_for_test();
+        let pixels = std::sync::Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::WHITE));
+        let rgba = std::sync::Arc::new(vec![255, 255, 255, 255]);
+        app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+            pixels: pixels.clone(),
+            texture: None,
+            indicator_pixels: pixels.clone(),
+            indicator_texture: None,
+            display_name: "pinned".to_string(),
+            source_idx: 2,
+            source_size: [1, 1],
+        });
+        app.compare_prepared_pair = Some(crate::app::ComparePreparedPair {
+            key: 1,
+            current_idx: 7,
+            pinned_source_idx: 2,
+            target_size: [1, 1],
+            pinned_rgba: rgba.clone(),
+            current_rgba: rgba,
+            pinned_pixels: pixels.clone(),
+            current_pixels: pixels.clone(),
+            diff_pixels: pixels,
+            pinned_texture: None,
+            current_texture: None,
+            diff_texture: None,
+        });
+
+        let ctx = egui::Context::default();
+        let image_rect =
+            egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(320.0, 240.0));
+        let mut composite_drawn = true;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 480.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        composite_drawn = app.draw_compare_prepared_mode(
+                            ui,
+                            ctx,
+                            image_rect,
+                            8,
+                            crate::app::CompareViewMode::PinnedNormal,
+                            None,
+                        );
+                    });
+            },
+        );
+
+        assert!(app.compare_prepared_pair_matches(7));
+        assert!(!app.compare_prepared_pair_matches(8));
+        assert!(
+            !composite_drawn,
+            "the main canvas must not paint a pair prepared for another current page"
+        );
+    }
+
+    fn setup_page_turn_spread_test(
+        page_count: usize,
+    ) -> (crate::app::AppTestEnvForTest, egui::Context) {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "page_turn_spread_thumb",
+            egui::ColorImage::filled([2, 3], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        for _ in 0..page_count {
+            app.items
+                .push(GridItem::Image(PathBuf::from("c:/test/spread-page.jpg")));
+            app.thumbnails.push(ThumbnailState::Loaded {
+                tex: texture.clone(),
+                from_cache: false,
+                from_edit_preview: false,
+                rendered_at_px: 3,
+                source_dims: Some((800, 1200)),
+            });
+        }
+        app.visible_indices = (0..page_count).collect();
+        app.reading_flow = ReadingFlow::Paged;
+        app.spread_mode = SpreadMode::Ltr;
+        app.fullscreen_idx = Some(0);
+        app.selected = Some(0);
+        (app, ctx)
+    }
+
+    #[test]
+    fn spread_page_turn_materialization_requires_both_catalog_thumbnails() {
+        let (mut app, _ctx) = setup_page_turn_spread_test(4);
+
+        assert_eq!(
+            page_turn_materialization_for_inputs(
+                true,
+                app.fs_page_turn_catalog_thumbnails_ready(0),
+            ),
+            FsPageTurnMaterialization::ThumbnailPassThrough
+        );
+
+        app.thumbnails[1] = ThumbnailState::Pending;
+        assert_eq!(
+            page_turn_materialization_for_inputs(
+                true,
+                app.fs_page_turn_catalog_thumbnails_ready(0),
+            ),
+            FsPageTurnMaterialization::Materialize,
+            "one missing page thumbnail must fail closed for the whole spread"
+        );
+    }
+
+    #[test]
+    fn spread_page_turn_sequence_paints_each_unit_once_before_materializing_stop() {
+        let (mut app, _ctx) = setup_page_turn_spread_test(8);
+        let mut painted = Vec::new();
+
+        for _ in 0..3 {
+            let idx = app.fullscreen_idx.expect("fullscreen spread");
+            let nav = build_nav_indices(&app.items, app.current_grid_order());
+            let units = build_spread_display_units(
+                &nav,
+                &app.items,
+                app.spread_mode,
+                app.spread_shift_anchor_idx,
+                &app.fs_cache,
+                &app.thumbnails,
+                &app.page_dims_cache,
+                app.items_generation,
+            );
+            let pages = find_spread_display_unit(&units, idx)
+                .expect("current spread unit")
+                .1
+                .pages
+                .clone();
+            painted.push((
+                pages,
+                page_turn_materialization_for_inputs(
+                    true,
+                    app.fs_page_turn_catalog_thumbnails_ready(idx),
+                ),
+            ));
+            let FsPageNav::Target(next_idx) = app.spread_page_nav(1) else {
+                panic!("spread navigation must advance by one display unit");
+            };
+            app.fullscreen_idx = Some(next_idx);
+            app.selected = Some(next_idx);
+        }
+
+        let stop_idx = app.fullscreen_idx.expect("stop spread");
+        let nav = build_nav_indices(&app.items, app.current_grid_order());
+        let units = build_spread_display_units(
+            &nav,
+            &app.items,
+            app.spread_mode,
+            app.spread_shift_anchor_idx,
+            &app.fs_cache,
+            &app.thumbnails,
+            &app.page_dims_cache,
+            app.items_generation,
+        );
+        let stop_pages = find_spread_display_unit(&units, stop_idx)
+            .expect("stop spread unit")
+            .1
+            .pages
+            .clone();
+        painted.push((
+            stop_pages,
+            page_turn_materialization_for_inputs(
+                false,
+                app.fs_page_turn_catalog_thumbnails_ready(stop_idx),
+            ),
+        ));
+
+        assert_eq!(
+            painted
+                .iter()
+                .map(|(pages, _)| pages.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]],
+            "one held-input frame must paint one complete spread unit"
+        );
+        assert!(
+            painted[..3]
+                .iter()
+                .all(|(_, mode)| { *mode == FsPageTurnMaterialization::ThumbnailPassThrough })
+        );
+        assert_eq!(
+            painted.last().map(|(_, mode)| *mode),
+            Some(FsPageTurnMaterialization::Materialize)
+        );
     }
 
     #[test]

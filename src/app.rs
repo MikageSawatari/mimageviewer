@@ -54096,7 +54096,7 @@ impl App {
             return;
         }
         // A ready final-effect result still performs a full-size GPU upload on
-        // the UI thread. If the current page is only passing through because a
+        // the UI thread. If the current display unit is only passing through because a
         // page-turn edge remains in this input frame, leave channel results
         // untouched. This includes adjacent prefetch results: uploading one of
         // those would still spend the UI frame the pass-through path protects.
@@ -59494,7 +59494,7 @@ impl App {
         // ── ペーシング: このフレームで何枚アップロードするか決める ──
         // 1. 現在フルスクリーン表示中の idx (= ユーザーが待っている画像) は即時に処理
         // 2. 他の先読み分は FIFO 先頭から 1 枚だけ取り出す
-        // 3. 同一フレームに未処理の単ページ送り入力が残る間は 0 枚。worker 完了物は
+        // 3. 同一フレームに未処理のページ送り入力が残る間は 0 枚。worker 完了物は
         //    backlog に保持し、入力が止まった最初のフレームで通常ペースへ戻す
         // backlog は通常 <10 要素なので `Vec::remove` の O(n) は実質コストなし。
         let cur = self.fullscreen_idx;

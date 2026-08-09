@@ -1150,6 +1150,14 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   「全段にあるが通常 context / 曖昧性で却下」を区別する。既存の `fs_upload_backlog` /
   final-effect upload 抑制は対策1と同じ
   materialization 判定へ既に接続済みのため、原因確定までは挙動を変更しない。
+- 見開き拡張 (2026-08-09): 上記の実機診断では 423 件すべてが
+  `ordinary_blocker=spread_mode` だったため、この blocker を撤去して対策1を paged の
+  見開きにも適用した。現在 idx を含む `SpreadDisplayUnit` を通常描画と同じ resolver で求め、
+  unit 内の全ページが `ThumbnailState::Loaded` の場合だけ通過扱いにする。片方でも未生成、
+  または unit を解決できなければ `Materialize` に倒す。通過中の `draw_fs_spread` は左右とも
+  processed resolver を呼ばず、カタログサムネイルで unit 全体を 1 frame 描く。入力判定は
+  従来どおり同一 frame の未消費ページ送り edge だけで、時間ガードと連結読みの対象範囲は
+  変更していない。単ページだけを対象としていた上の初回実装記録を、この追記で拡張した。
 
 ### 1.59 360 度ビューに等距離魚眼投影を追加する (提案・採否判断が要る)
 
@@ -1215,6 +1223,11 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   可視端で止まり、保存した fraction を `compare_wipe_screen_x(draw_rect, fraction)` へ通すため、
   白線・clip・掴み位置は引き続き同じ full-image 座標を共有する。等倍と 2x zoom の両方で、
   viewport 外の pointer が可視左 / 右端の fraction で頭打ちになる unit test を追加した。
+- ページ移動中の stale prepared pair 修正 (2026-08-09): 本文の
+  `draw_compare_prepared_mode` もナビゲータと同じ `compare_prepared_pair_matches(fs_idx)` を通す。
+  準備済み pair の `current_idx` が現在ページと違う間は古い合成を描かず、既存の通常表示 fallback
+  と「比較表示を準備中」を維持する。別ページの pair を本文が描画済みとして扱わない回帰 test を
+  追加した。
 
 ### 1.61 見開きでページが 1 枚ダブる (横長ページの寸法をキャッシュ在住に頼っている) — 利用者報告
 

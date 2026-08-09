@@ -297,6 +297,13 @@ frame 冒頭では、先読み窓ぶんの `fs_cache` を 1 回だけ走査し�
 ロード済みサムネイル → `PageDimsCache` → 未知なら縦長扱いであり、一度判明した寸法は live cache
 退去後も同じ viewer context / items 世代に残る。全 thumbnails の毎 frame 走査は行わない。
 
+paged 表示でキーリピート由来の未消費ページ送り edge が同じ input frame に残る場合は、現在の
+表示 unit をカタログサムネイルで 1 frame 描き、processed texture と完成済み worker result の
+GPU upload を次の frame へ保留する。単ページは現在ページ、見開きは通常描画と同じ
+`SpreadDisplayUnit` resolver が返す全ページについて `ThumbnailState::Loaded` を要求し、1 ページでも
+欠ける場合や unit を解決できない場合は通常の実体化へ fail-closed する。時間閾値や前 frame の
+pending state は使わず、連結読みは対象外とする。
+
 **`keep_fullscreen_viewport_alive`** はフルスクリーン非アクティブ時 (`fullscreen_idx == None`)
 に呼ばれ、`fs_viewport_shown == true` の 1 フレームだけ `Visible(false)` cmd を送って hidden 化
 する責務を持つ。それ以外のアイドルでは何もしない (2026-05-10、hidden viewport 維持コスト削減)。
