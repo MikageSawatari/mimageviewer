@@ -1140,7 +1140,7 @@ impl Chord {
         }
     }
 
-    fn matches_egui(self, key: egui::Key, modifiers: egui::Modifiers) -> bool {
+    pub(crate) fn matches_egui(self, key: egui::Key, modifiers: egui::Modifiers) -> bool {
         let Self::Key {
             ctrl,
             shift,
@@ -5952,6 +5952,19 @@ impl Keymap {
             && crate::key_input::pressed_key_down(viewport, |edge| chord.matches_key_edge(edge))
     }
 
+    /// Read-only cardinality companion to `pending_chord_press_in_frame` for perf logs.
+    #[cfg(windows)]
+    pub(crate) fn pending_chord_press_stats_in_frame(
+        &self,
+        viewport: egui::ViewportId,
+        chord: Chord,
+    ) -> crate::key_input::FrameKeyDownStats {
+        if chord.key_name().is_none() {
+            return crate::key_input::FrameKeyDownStats::default();
+        }
+        crate::key_input::frame_key_down_stats(viewport, |edge| chord.matches_key_edge(edge))
+    }
+
     pub fn first_chord_label(&self, action: KeyAction) -> Option<String> {
         self.effective_chords(action)
             .into_iter()
@@ -9580,6 +9593,10 @@ mod tests {
         let keymap = Keymap::empty();
         let right = key_edge(0x27, 0x4d, true, false, true);
         crate::key_input::set_test_frame(vec![right, right]);
+        let stats = keymap
+            .pending_chord_press_stats_in_frame(egui::ViewportId::ROOT, Chord::key(KeyName::Right));
+        assert_eq!(stats.matched_count, 2);
+        assert_eq!(stats.repeat_count, 2);
         assert!(
             keymap
                 .pending_chord_press_in_frame(egui::ViewportId::ROOT, Chord::key(KeyName::Right),)
@@ -9592,6 +9609,15 @@ mod tests {
         assert!(
             keymap
                 .pending_chord_press_in_frame(egui::ViewportId::ROOT, Chord::key(KeyName::Right),)
+        );
+        assert_eq!(
+            keymap
+                .pending_chord_press_stats_in_frame(
+                    egui::ViewportId::ROOT,
+                    Chord::key(KeyName::Right),
+                )
+                .matched_count,
+            1
         );
         assert!(crate::key_input::consume_key_down(
             egui::ViewportId::ROOT,

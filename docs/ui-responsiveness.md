@@ -200,8 +200,12 @@ wgpu の queue.write_texture が走る。20MP RGBA (78MB) で 26-58ms かかる�
 未消費入力である。worker 結果は捨てず backlog / channel に留めるため、停止後に再 decode せず
 materialize できる。同一 egui frame の複数 pass では一時 cache の判定を再生し、query pass が
 入力を消費したり、replay pass が別の品質状態を arm したりしない。計測は
-`fs.page_turn_ready` と `scripts/analyze_perf.py ... page-turn` で通過/実体化枚数、各 hold の
-ready→ready 間隔を出す。時刻は解析にだけ用い、実行時判定へ戻してはならない。
+`fs.page_turn_ready` に加え、判定 gate と Win32 edge 数を出す `fs.page_turn_decision`、
+egui-winit 翻訳直後の read-only `RawInput` 数を出す `fs.page_turn_winit_input`、
+root / fullscreen 等の egui 処理後 key event 数を出す `fs.page_turn_egui_input` を残す。
+`scripts/analyze_perf.py ... page-turn` は通過/実体化枚数、各 hold の ready→ready 間隔、
+発動しなかった理由、Win32 / winit / egui の 1 frame 内 cardinality を相関して出す。
+時刻は解析にだけ用い、実行時判定へ戻してはならない。
 
 静止画の `DISPLAY_IMAGE_TEXTURE_OPTIONS` は level 0 upload の直後に vendored `egui-wgpu` の
 render pass で mip chain も生成する。CPU resize や I/O は増えないが、GPU upload slot 1 件あたりの
