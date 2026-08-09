@@ -26,11 +26,6 @@ const REMOTE_ENABLE_WARNING_PREFIX: &str = "リモート閲覧を有効にする
 const REMOTE_ENABLE_WARNING_EMPHASIS: &str = "mIV で閲覧できるすべてのファイル";
 const REMOTE_ENABLE_WARNING_SUFFIX: &str =
     "が、この PC の Tailscale アドレスへ接続でき、PIN を知っている人から見えるようになります。";
-const REMOTE_ENABLE_WARNING_FIRST: &str = concat!(
-    "リモート閲覧を有効にすると、",
-    "mIV で閲覧できるすべてのファイル",
-    "が、この PC の Tailscale アドレスへ接続でき、PIN を知っている人から見えるようになります。"
-);
 const REMOTE_ENABLE_WARNING_SECOND: &str =
     "対象はお気に入りの中だけではなく、mIV が開ける画像・動画・PDF すべてです。";
 const REMOTE_MANUAL_URL: &str = "https://mikage.to/mimageviewer/manual/tut-remote.html";
@@ -2326,24 +2321,22 @@ impl crate::app::App {
                 ui.checkbox(&mut enabled, "この端末からリモート接続を利用する");
                 if remote_enable_warning_visible(was_enabled, enabled) {
                     ui.add_space(6.0);
-                    let warning_color = ui.visuals().warn_fg_color;
+                    let error_color = ui.visuals().error_fg_color;
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         ui.label(
-                            egui::RichText::new(REMOTE_ENABLE_WARNING_PREFIX).color(warning_color),
+                            egui::RichText::new(REMOTE_ENABLE_WARNING_PREFIX).color(error_color),
                         );
                         ui.label(
                             egui::RichText::new(REMOTE_ENABLE_WARNING_EMPHASIS)
                                 .strong()
-                                .color(warning_color),
+                                .color(error_color),
                         );
                         ui.label(
-                            egui::RichText::new(REMOTE_ENABLE_WARNING_SUFFIX).color(warning_color),
+                            egui::RichText::new(REMOTE_ENABLE_WARNING_SUFFIX).color(error_color),
                         );
                     });
-                    ui.label(
-                        egui::RichText::new(REMOTE_ENABLE_WARNING_SECOND).color(warning_color),
-                    );
+                    ui.label(egui::RichText::new(REMOTE_ENABLE_WARNING_SECOND).color(error_color));
                     ui.hyperlink_to("詳しい説明を既定のブラウザで開く", REMOTE_MANUAL_URL);
                 }
                 ui.separator();
@@ -2950,6 +2943,12 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REMOTE_ENABLE_WARNING_FIRST: &str = concat!(
+        "リモート閲覧を有効にすると、",
+        "mIV で閲覧できるすべてのファイル",
+        "が、この PC の Tailscale アドレスへ接続でき、PIN を知っている人から見えるようになります。"
+    );
 
     #[test]
     fn stream_control_errors_separate_session_loss_from_registration_invariants() {

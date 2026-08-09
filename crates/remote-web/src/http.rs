@@ -2124,6 +2124,7 @@ fn api_collection(
         Err(()) => return HttpResponse::text(400, "Bad Request"),
     };
     let kind = match kind_name {
+        "drive_list" => CollectionKind::DriveList,
         "reading_history" => CollectionKind::ReadingHistory,
         "bookmarks" => CollectionKind::Bookmarks,
         "bookshelf" => CollectionKind::Bookshelf,

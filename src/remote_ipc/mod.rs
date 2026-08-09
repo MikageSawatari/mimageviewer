@@ -66,6 +66,7 @@ pub(super) fn normalize_remote_view_trim_state(
 
 pub(super) enum RemoteSortSettingsSource {
     Live,
+    #[cfg(test)]
     Snapshot(crate::settings::SortOrder),
 }
 
@@ -74,6 +75,7 @@ impl RemoteSortSettingsSource {
         match self {
             Self::Live => crate::settings_db::with_db_result(|db| db.load_sort_order())
                 .map_err(|error| error.to_string()),
+            #[cfg(test)]
             Self::Snapshot(order) => Ok(*order),
         }
     }

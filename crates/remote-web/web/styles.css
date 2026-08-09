@@ -603,6 +603,14 @@ select {
   padding-bottom: 18px;
 }
 
+.place-separator {
+  width: 100%;
+  height: 1px;
+  margin: 4px 0;
+  border: 0;
+  background: var(--line);
+}
+
 .rating-card {
   display: grid;
   grid-template-columns: 52px 1fr;

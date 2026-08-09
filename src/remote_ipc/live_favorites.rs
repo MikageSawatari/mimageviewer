@@ -4,6 +4,7 @@ use crate::settings::FavoriteEntry;
 
 enum FavoritesSource {
     Live(crate::settings_db::SettingsFavoritesReader),
+    #[cfg(test)]
     Snapshot(Arc<Vec<FavoriteEntry>>),
 }
 
@@ -27,6 +28,7 @@ impl LiveFavorites {
         }))
     }
 
+    #[cfg(test)]
     pub(super) fn snapshot(initial: Vec<FavoriteEntry>) -> Arc<Self> {
         Arc::new(Self {
             source: Mutex::new(FavoritesSource::Snapshot(Arc::new(initial))),
@@ -42,6 +44,7 @@ impl LiveFavorites {
             FavoritesSource::Live(reader) => reader
                 .current()
                 .map_err(|error| format!("remote favorites refresh failed: {error}")),
+            #[cfg(test)]
             FavoritesSource::Snapshot(favorites) => Ok(Arc::clone(favorites)),
         }
     }

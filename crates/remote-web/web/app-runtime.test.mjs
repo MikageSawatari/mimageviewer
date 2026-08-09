@@ -280,6 +280,14 @@ test("favorite search route preserves encoded query and kind", () => {
   }
 });
 
+test("drive list uses the core-owned collection route", () => {
+  assert.deepEqual(parseRoute("#collection/drive_list"), {
+    kind: "collection",
+    collectionKind: "drive_list",
+    value: "",
+  });
+});
+
 test("favorite search distinguishes empty, disabled, and unavailable states", () => {
   assert.equal(
     favoriteSearchEmptyMessage("ready", 0),

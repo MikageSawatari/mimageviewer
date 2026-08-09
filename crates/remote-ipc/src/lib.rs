@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 37;
+pub const PROTOCOL_VERSION: u32 = 38;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -961,19 +961,16 @@ pub struct SmartFolderSummary {
     pub name: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlaceKind {
-    ReadingHistory,
-    Rating,
-    Bookshelf,
-    Bookmarks,
-}
-
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct PlaceSummary {
-    pub kind: PlaceKind,
-    pub name: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlaceSummary {
+    DriveList { name: String },
+    ReadingHistory { name: String },
+    Bookmarks { name: String },
+    Rating { name: String, stars: Vec<u8> },
+    Bookshelf { name: String },
+    Separator,
+    Folder { entry: RemoteEntry },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -996,6 +993,7 @@ pub struct CollectionRequest {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CollectionKind {
+    DriveList,
     ReadingHistory,
     Rating { stars: u8 },
     Bookshelf,
@@ -2323,8 +2321,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v37_absolute_path_page_identity_and_session_state_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 37);
+    fn protocol_v38_absolute_path_page_identity_and_session_state_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 38);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -2941,6 +2939,39 @@ mod tests {
         for path in ["relative/page.jpg", "C:page.jpg", "C:/bad\0page.jpg"] {
             assert_eq!(validate_absolute_path(path), Err(AddressError::InvalidPath));
         }
+    }
+
+    #[test]
+    fn place_summaries_keep_order_separators_and_typed_folder_targets() {
+        let places = vec![
+            PlaceSummary::DriveList {
+                name: "ドライブ一覧".to_owned(),
+            },
+            PlaceSummary::Rating {
+                name: "レーティング".to_owned(),
+                stars: vec![1, 2, 3, 4, 5],
+            },
+            PlaceSummary::Separator,
+            PlaceSummary::Folder {
+                entry: RemoteEntry {
+                    path: "C:/Users/test/Pictures".to_owned(),
+                    name: "ピクチャ".to_owned(),
+                    kind: RemoteEntryKind::Folder,
+                    detail: None,
+                    progress_current: None,
+                    progress_total: None,
+                    rating: None,
+                },
+            },
+        ];
+        let encoded = serde_json::to_vec(&places).unwrap();
+        let decoded: Vec<PlaceSummary> = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, places);
+        let json: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json[0]["kind"], "drive_list");
+        assert_eq!(json[1]["stars"], serde_json::json!([1, 2, 3, 4, 5]));
+        assert_eq!(json[2]["kind"], "separator");
+        assert_eq!(json[3]["entry"]["kind"], "folder");
     }
 
     #[test]

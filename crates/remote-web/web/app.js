@@ -1462,7 +1462,7 @@ export function parseRoute(hash) {
     return { kind: "home", tab: home[1] };
   }
   const collection = hash.match(
-    /^#collection\/(reading_history|bookmarks|bookshelf|rating|smart)(?:\/([^/]+))?$/
+    /^#collection\/(drive_list|reading_history|bookmarks|bookshelf|rating|smart)(?:\/([^/]+))?$/
   );
   if (collection) {
     return {
@@ -2698,6 +2698,10 @@ function renderPlacesTab(content) {
   }
   const list = element("div", "favorite-list place-list");
   for (const place of state.home.places ?? []) {
+    if (place.kind === "separator") {
+      list.append(element("hr", "place-separator"));
+      continue;
+    }
     if (place.kind === "rating") {
       const group = element("section", "rating-card");
       group.append(
@@ -2705,7 +2709,8 @@ function renderPlacesTab(content) {
         textElement("span", place.name, "favorite-name")
       );
       const stars = element("div", "rating-stars");
-      for (let rating = 5; rating >= 1; rating -= 1) {
+      for (const rating of place.stars ?? []) {
+        if (!Number.isInteger(rating) || rating < 1 || rating > 5) continue;
         const button = textElement("button", `★${rating}`, "rating-star-button");
         button.type = "button";
         button.addEventListener("click", () =>
@@ -2719,7 +2724,18 @@ function renderPlacesTab(content) {
       list.append(group);
       continue;
     }
+    if (place.kind === "folder") {
+      const entry = place.entry;
+      if (!entry || typeof entry.path !== "string" || !entry.path) continue;
+      const button = homeCard("▣", entry.name ?? entry.path);
+      button.addEventListener("click", () =>
+        navigate(folderHash(entry.path), { returnHash: homeHash("places") })
+      );
+      list.append(button);
+      continue;
+    }
     const icon = {
+      drive_list: "▦",
       reading_history: "↻",
       bookshelf: "▥",
       bookmarks: "🔖",
@@ -3690,7 +3706,10 @@ export async function loadFolder(
     hasCollection: Boolean(state.collection),
     atFavoriteRoot: isFavoriteRoot(requestedPath),
     collectionHash: state.gridHash,
-    fallbackHash: homeHash("favorites"),
+    fallbackHash:
+      typeof globalThis.history?.state?.returnHash === "string"
+        ? globalThis.history.state.returnHash
+        : homeHash("favorites"),
   });
   state.collection = null;
   state.container = null;

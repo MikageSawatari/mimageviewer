@@ -4498,7 +4498,7 @@ impl App {
             .menu_command_label(MenuCommandId::HelpOpenManual);
         let help_remote_connection_menu_label = self
             .keymap
-            .menu_command_label(MenuCommandId::HelpRemoteConnection);
+            .menu_command_label(MenuCommandId::SettingsRemoteConnection);
         let help_open_logs_menu_label = self.keymap.menu_command_label(MenuCommandId::HelpOpenLogs);
         let help_show_whats_new_menu_label = self
             .keymap
@@ -5314,7 +5314,7 @@ impl App {
                                                 ui.close();
                                             }
                                         }
-                                        MenuCommandId::HelpRemoteConnection => {
+                                        MenuCommandId::SettingsRemoteConnection => {
                                             ui.separator();
                                             if ui
                                                 .button(&help_remote_connection_menu_label)
@@ -11023,104 +11023,86 @@ impl App {
                     ui.add_enabled_ui(place_nav_enabled, |ui| {
                         let place_response = ui.menu_button("場所▼", |ui| {
                             ui.set_min_width(220.0);
-                            if self.settings.show_location_drive_list
-                                && ui.button("ドライブ一覧").clicked()
-                            {
-                                result = Some(AddressBarNav::DriveList(None));
-                                ui.close();
-                            }
-                            if self.settings.show_location_reading_history
-                                && ui.button("閲覧履歴").clicked()
-                            {
-                                result = Some(AddressBarNav::ReadingHistory);
-                                ui.close();
-                            }
-                            if ui.button("ブックマーク").clicked() {
-                                self.open_bookmark_browser();
-                                ui.close();
-                            }
-                            if self.settings.show_location_rating {
-                                ui.menu_button("レーティング", |ui| {
-                                    for stars in 1..=5 {
-                                        if ui
-                                            .button(rating_view_menu_label(stars, rating_counts))
-                                            .clicked()
-                                        {
-                                            self.enter_rating_view_from_menu(stars);
+                            let location_entries =
+                                crate::known_folders::location_menu_entries(&self.settings);
+                            for entry in location_entries {
+                                match entry {
+                                    crate::known_folders::LocationMenuEntry::DriveList => {
+                                        if ui.button("ドライブ一覧").clicked() {
+                                            result = Some(AddressBarNav::DriveList(None));
                                             ui.close();
                                         }
                                     }
-                                });
-                            }
-                            if self.settings.show_location_bookshelf
-                                && ui
-                                    .button("本棚フォルダ")
-                                    .hover_tip(self.book_root_path().to_string_lossy().to_string())
-                                    .clicked()
-                            {
-                                result = Some(AddressBarNav::BooksRoot);
-                                ui.close();
-                            }
-
-                            let mut quick_locations = Vec::new();
-                            let mut push_quick =
-                                |label: &'static str, path: Option<std::path::PathBuf>| {
-                                    let Some(path) = path else {
-                                        return;
-                                    };
-                                    if quick_locations.iter().any(
-                                        |existing: &crate::known_folders::QuickLocation| {
-                                            crate::folder_tree::path_eq(&existing.path, &path)
-                                        },
-                                    ) {
-                                        return;
-                                    }
-                                    quick_locations
-                                        .push(crate::known_folders::QuickLocation { label, path });
-                                };
-                            if self.settings.show_location_desktop {
-                                push_quick("デスクトップ", crate::known_folders::desktop_dir());
-                            }
-                            if self.settings.show_location_pictures {
-                                push_quick("ピクチャ", crate::known_folders::pictures_dir());
-                            }
-                            if self.settings.show_location_downloads {
-                                push_quick("ダウンロード", crate::known_folders::downloads_dir());
-                            }
-                            drop(push_quick);
-                            let drew_quick_locations = !quick_locations.is_empty();
-                            if drew_quick_locations {
-                                ui.separator();
-                            }
-                            for location in quick_locations {
-                                let full = location.path.to_string_lossy().to_string();
-                                if ui.button(location.label).hover_tip(&full).clicked() {
-                                    if let Some(resolved) =
-                                        resolve_folder_bar_nav_path(&location.path)
-                                    {
-                                        result = Some(AddressBarNav::Direct(resolved));
-                                    }
-                                    ui.close();
-                                }
-                            }
-                            if self.settings.show_location_drive_roots {
-                                let drives = crate::known_folders::available_drives();
-                                if !drives.is_empty() {
-                                    ui.separator();
-                                }
-                                for drive in drives {
-                                    let label = drive.to_string_lossy().to_string();
-                                    if ui
-                                        .button(egui::RichText::new(&label).monospace())
-                                        .hover_tip(&label)
-                                        .clicked()
-                                    {
-                                        if let Some(resolved) =
-                                            resolve_folder_bar_nav_path(&drive)
-                                        {
-                                            result = Some(AddressBarNav::Direct(resolved));
+                                    crate::known_folders::LocationMenuEntry::ReadingHistory => {
+                                        if ui.button("閲覧履歴").clicked() {
+                                            result = Some(AddressBarNav::ReadingHistory);
+                                            ui.close();
                                         }
-                                        ui.close();
+                                    }
+                                    crate::known_folders::LocationMenuEntry::Bookmarks => {
+                                        if ui.button("ブックマーク").clicked() {
+                                            self.open_bookmark_browser();
+                                            ui.close();
+                                        }
+                                    }
+                                    crate::known_folders::LocationMenuEntry::Rating { stars } => {
+                                        ui.menu_button("レーティング", |ui| {
+                                            for stars in stars {
+                                                if ui
+                                                    .button(rating_view_menu_label(
+                                                        stars,
+                                                        rating_counts,
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    self.enter_rating_view_from_menu(stars);
+                                                    ui.close();
+                                                }
+                                            }
+                                        });
+                                    }
+                                    crate::known_folders::LocationMenuEntry::Bookshelf => {
+                                        if ui
+                                            .button("本棚フォルダ")
+                                            .hover_tip(
+                                                self.book_root_path().to_string_lossy().to_string(),
+                                            )
+                                            .clicked()
+                                        {
+                                            result = Some(AddressBarNav::BooksRoot);
+                                            ui.close();
+                                        }
+                                    }
+                                    crate::known_folders::LocationMenuEntry::Separator => {
+                                        ui.separator();
+                                    }
+                                    crate::known_folders::LocationMenuEntry::QuickLocation(
+                                        location,
+                                    ) => {
+                                        let full = location.path.to_string_lossy().to_string();
+                                        if ui.button(location.label).hover_tip(&full).clicked() {
+                                            if let Some(resolved) =
+                                                resolve_folder_bar_nav_path(&location.path)
+                                            {
+                                                result = Some(AddressBarNav::Direct(resolved));
+                                            }
+                                            ui.close();
+                                        }
+                                    }
+                                    crate::known_folders::LocationMenuEntry::DriveRoot(drive) => {
+                                        let label = drive.to_string_lossy().to_string();
+                                        if ui
+                                            .button(egui::RichText::new(&label).monospace())
+                                            .hover_tip(&label)
+                                            .clicked()
+                                        {
+                                            if let Some(resolved) =
+                                                resolve_folder_bar_nav_path(&drive)
+                                            {
+                                                result = Some(AddressBarNav::Direct(resolved));
+                                            }
+                                            ui.close();
+                                        }
                                     }
                                 }
                             }

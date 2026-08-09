@@ -4,10 +4,10 @@ use std::sync::Arc;
 use mimageviewer_ipc::{
     CollectionError, CollectionErrorCode, CollectionKind, CollectionPayload, CollectionRequest,
     CollectionResponse, FavoriteSearchIndexState, FavoriteSearchKind, FavoriteSearchPayload,
-    FavoriteSearchRequest, FavoriteSearchResponse, HomePayload, HomeResponse, PlaceKind,
-    PlaceSummary, RemoteEntry, RemoteEntryKind, RemoteTagChoice, SmartFolderSummary,
-    TagBrowsePayload, TagBrowseRequest, TagBrowseResponse, TagIndexState, TagItemKind,
-    TagItemsPayload, TagItemsRequest, TagItemsResponse,
+    FavoriteSearchRequest, FavoriteSearchResponse, HomePayload, HomeResponse, PlaceSummary,
+    RemoteEntry, RemoteEntryKind, RemoteTagChoice, SmartFolderSummary, TagBrowsePayload,
+    TagBrowseRequest, TagBrowseResponse, TagIndexState, TagItemKind, TagItemsPayload,
+    TagItemsRequest, TagItemsResponse,
 };
 
 use crate::grid_item::GridItem;
@@ -25,6 +25,7 @@ pub(super) struct CollectionEngine {
 
 enum CollectionSettingsSource {
     Live,
+    #[cfg(test)]
     Snapshot(Settings),
 }
 
@@ -33,6 +34,7 @@ impl CollectionSettingsSource {
         match self {
             Self::Live => crate::settings_db::with_db_result(|db| db.load_into_settings())
                 .map_err(|error| error.to_string()),
+            #[cfg(test)]
             Self::Snapshot(settings) => Ok(settings.clone()),
         }
     }
@@ -50,11 +52,13 @@ struct CandidateEntry {
 }
 
 impl CollectionEngine {
+    #[cfg(test)]
     pub(super) fn new(settings: Settings) -> Self {
         let favorites = super::live_favorites::LiveFavorites::snapshot(settings.favorites.clone());
         Self::new_with_favorites(settings, favorites)
     }
 
+    #[cfg(test)]
     pub(super) fn new_with_favorites(
         settings: Settings,
         favorites: Arc<super::live_favorites::LiveFavorites>,
@@ -110,6 +114,7 @@ impl CollectionEngine {
             }
         };
         let result = match request.kind {
+            CollectionKind::DriveList => self.drive_list(&settings, sort_order),
             CollectionKind::ReadingHistory => self.reading_history(&settings, sort_order),
             CollectionKind::Rating { stars } => self.rating(&settings, stars, sort_order),
             CollectionKind::Bookshelf => self.bookshelf(&settings, sort_order),
@@ -408,6 +413,45 @@ impl CollectionEngine {
         self.payload(
             settings,
             "閲覧履歴",
+            candidates,
+            sort_order,
+            Some(super::FIXED_LIST_SORT_LOCK_REASON),
+        )
+    }
+
+    fn drive_list(
+        &self,
+        settings: &Settings,
+        sort_order: crate::settings::SortOrder,
+    ) -> Result<CollectionPayload, CollectionError> {
+        self.drive_list_from_paths(
+            settings,
+            sort_order,
+            crate::known_folders::available_drives(),
+        )
+    }
+
+    fn drive_list_from_paths(
+        &self,
+        settings: &Settings,
+        sort_order: crate::settings::SortOrder,
+        drives: Vec<PathBuf>,
+    ) -> Result<CollectionPayload, CollectionError> {
+        let candidates = drives
+            .into_iter()
+            .map(|path| CandidateEntry {
+                name: path.to_string_lossy().into_owned(),
+                path,
+                kind: RemoteEntryKind::Folder,
+                detail: None,
+                progress_current: None,
+                progress_total: None,
+                rating: None,
+            })
+            .collect();
+        self.payload(
+            settings,
+            "ドライブ一覧",
             candidates,
             sort_order,
             Some(super::FIXED_LIST_SORT_LOCK_REASON),
@@ -760,31 +804,50 @@ fn bound_remote_entries(mut entries: Vec<RemoteEntry>) -> (Vec<RemoteEntry>, boo
 }
 
 fn visible_places(settings: &Settings) -> Vec<PlaceSummary> {
-    let mut places = Vec::new();
-    if settings.show_location_reading_history {
-        places.push(PlaceSummary {
-            kind: PlaceKind::ReadingHistory,
-            name: "閲覧履歴".to_owned(),
-        });
+    crate::known_folders::location_menu_entries(settings)
+        .into_iter()
+        .map(|entry| match entry {
+            crate::known_folders::LocationMenuEntry::DriveList => PlaceSummary::DriveList {
+                name: "ドライブ一覧".to_owned(),
+            },
+            crate::known_folders::LocationMenuEntry::ReadingHistory => {
+                PlaceSummary::ReadingHistory {
+                    name: "閲覧履歴".to_owned(),
+                }
+            }
+            crate::known_folders::LocationMenuEntry::Bookmarks => PlaceSummary::Bookmarks {
+                name: "ブックマーク".to_owned(),
+            },
+            crate::known_folders::LocationMenuEntry::Rating { stars } => PlaceSummary::Rating {
+                name: "レーティング".to_owned(),
+                stars,
+            },
+            crate::known_folders::LocationMenuEntry::Bookshelf => PlaceSummary::Bookshelf {
+                name: "本棚フォルダ".to_owned(),
+            },
+            crate::known_folders::LocationMenuEntry::Separator => PlaceSummary::Separator,
+            crate::known_folders::LocationMenuEntry::QuickLocation(location) => {
+                remote_folder_place(location.label.to_owned(), location.path)
+            }
+            crate::known_folders::LocationMenuEntry::DriveRoot(path) => {
+                remote_folder_place(path.to_string_lossy().into_owned(), path)
+            }
+        })
+        .collect()
+}
+
+fn remote_folder_place(name: String, path: PathBuf) -> PlaceSummary {
+    PlaceSummary::Folder {
+        entry: remote_entry_from_candidate(CandidateEntry {
+            path,
+            name,
+            kind: RemoteEntryKind::Folder,
+            detail: None,
+            progress_current: None,
+            progress_total: None,
+            rating: None,
+        }),
     }
-    if settings.show_location_rating {
-        places.push(PlaceSummary {
-            kind: PlaceKind::Rating,
-            name: "レーティング".to_owned(),
-        });
-    }
-    if settings.show_location_bookshelf {
-        places.push(PlaceSummary {
-            kind: PlaceKind::Bookshelf,
-            name: "本棚".to_owned(),
-        });
-    }
-    // 本体の「場所▼」にもブックマーク専用の非表示設定はない。
-    places.push(PlaceSummary {
-        kind: PlaceKind::Bookmarks,
-        name: "ブックマーク".to_owned(),
-    });
-    places
 }
 
 fn to_remote_entries(candidates: Vec<CandidateEntry>) -> Vec<RemoteEntry> {
@@ -1026,14 +1089,58 @@ mod tests {
     #[test]
     fn hidden_location_settings_are_reflected() {
         let mut settings = Settings::default();
+        settings.show_location_drive_list = false;
         settings.show_location_reading_history = false;
         settings.show_location_rating = false;
         settings.show_location_bookshelf = true;
+        settings.show_location_desktop = false;
+        settings.show_location_pictures = false;
+        settings.show_location_downloads = false;
+        settings.show_location_drive_roots = false;
         let places = visible_places(&settings);
         assert_eq!(
-            places.iter().map(|place| place.kind).collect::<Vec<_>>(),
-            [PlaceKind::Bookshelf, PlaceKind::Bookmarks]
+            places,
+            [
+                PlaceSummary::Bookmarks {
+                    name: "ブックマーク".to_owned(),
+                },
+                PlaceSummary::Bookshelf {
+                    name: "本棚フォルダ".to_owned(),
+                },
+            ]
         );
+    }
+
+    #[test]
+    fn drive_list_and_direct_places_produce_openable_folders() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("drive-a");
+        let second = temp.path().join("drive-b");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let settings = Settings::default();
+        let engine = CollectionEngine::new(settings.clone());
+        let payload = engine
+            .drive_list_from_paths(
+                &settings,
+                settings.sort_order,
+                vec![first.clone(), second.clone()],
+            )
+            .unwrap();
+        assert_eq!(payload.title, "ドライブ一覧");
+        assert_eq!(payload.entries.len(), 2);
+        for entry in &payload.entries {
+            assert_eq!(entry.kind, RemoteEntryKind::Folder);
+            assert!(super::super::path_guard::resolve_existing(&entry.path).is_ok());
+        }
+
+        let place = remote_folder_place("デスクトップ".to_owned(), first);
+        let PlaceSummary::Folder { entry } = place else {
+            panic!("direct place must stay a typed folder entry");
+        };
+        assert_eq!(entry.name, "デスクトップ");
+        assert_eq!(entry.kind, RemoteEntryKind::Folder);
+        assert!(super::super::path_guard::resolve_existing(&entry.path).is_ok());
     }
 
     #[test]
