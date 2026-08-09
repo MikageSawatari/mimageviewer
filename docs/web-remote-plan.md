@@ -1536,6 +1536,25 @@ payload の `root_name` は表示用であり、アクセス境界を表さな�
 反復 query 引数へ移し、JSON body には残さない。request log は query 全体を落とし、telemetry は
 クライアントと remote-web の両境界で path field と絶対 filesystem path 文字列を除去する。
 
+### 12.24 物理フォルダー一覧の設定同期 (2026-08-09)
+
+`ContainerEngine` は起動時の `Settings` を保持するが、物理フォルダー一覧を 1 回生成するたびに、走査・
+materialize・並び順固定・サムネイル縦横比の判断へ使う設定だけを `settings.db` から読み直す。対象は
+`sort_order`、hidden 表示、grid 行順、変換対象 archive の扱いと旧互換値、ZIP/archive/画像/video の
+同名重複処理、video sidecar 採用、画像拡張子優先順、books root、画像フォルダー自動表示の派生述語に
+必要な値、thumbnail aspect である。17 key を単一の indexed query と 1 回の DB lock で取得し、起動時
+snapshot へ overlay する。旧 DB に key が無い場合だけ、起動時ロードで serde default 適用済みの値を使う。
+これ以外の container 表示・再生設定は引き続き起動時 snapshot であり、集約系一覧は従来どおり
+`CollectionSettingsSource::Live` から全設定を読む。
+
+方式は必要項目だけを読む案を採用した。2026-08-09 の warm read 計測では、従来の `sort_order` 1 key が
+p50 3.0 µs / p95 3.4 µs、17 key の point read が p50 52.8 µs / p95 60.1 µs、同じ 17 key の単一 query が
+p50 22.1 µs / p95 26.3 µs だった。一方、`load_into_settings()` 相当の SQL と JSON parse だけでも
+p50 38.2 ms / p95 43.8 ms だった。この DB では一覧と無関係な VST state が約 33.6 MB、chain slot state が
+約 4.4 MB あり、全設定方式はさらに Rust の `Settings` 再構築と VST hash 計算を伴う。したがって 1 listing
+あたり約 22 µs の限定読取を選び、listing の判断項目を追加するときは
+`RemoteListingSettings`、固定 query、overlay test を同時に更新する。
+
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 
 この節は設計ではなく**開発手順**の記録。会話ログにしか残らない知識を失わないために書く。

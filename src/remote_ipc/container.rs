@@ -102,7 +102,7 @@ fn remote_auto_trim_cache_key(
 
 pub(super) struct ContainerEngine {
     settings: Arc<crate::settings::Settings>,
-    sort_settings: super::RemoteSortSettingsSource,
+    listing_settings: RemoteListingSettingsSource,
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
     pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
     pdf_page_counts: Mutex<HashMap<PdfIdentity, u32>>,
@@ -123,6 +123,28 @@ enum AdjustmentSettingsSource {
     Live,
     #[cfg(test)]
     Snapshot(crate::settings_db::AdjustmentRenderSettings),
+}
+
+enum RemoteListingSettingsSource {
+    Live,
+    #[cfg(test)]
+    Snapshot(crate::settings_db::RemoteListingSettings),
+}
+
+impl RemoteListingSettingsSource {
+    fn load(
+        &self,
+        fallback: &crate::settings::Settings,
+    ) -> Result<crate::settings_db::RemoteListingSettings, String> {
+        match self {
+            Self::Live => {
+                crate::settings_db::with_db_result(|db| db.load_remote_listing_settings(fallback))
+                    .map_err(|error| error.to_string())
+            }
+            #[cfg(test)]
+            Self::Snapshot(settings) => Ok(settings.clone()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -506,6 +528,9 @@ struct RecomputedFolderListing {
     image_only: bool,
     compiled: bool,
     sort_order: crate::settings::SortOrder,
+    thumb_aspect_height_ratio: f64,
+    sort_locked: bool,
+    auto_fullscreen_image_folders_enabled: bool,
 }
 fn folder_thumb_aspect_height_ratio(settings: &crate::settings::Settings, folder: &Path) -> f64 {
     let aspect = if settings.thumb_aspect_auto {
@@ -524,8 +549,10 @@ impl ContainerEngine {
         let adjustment_settings = AdjustmentSettingsSource::Snapshot(
             crate::settings_db::AdjustmentRenderSettings::from_settings(&settings),
         );
-        let sort_settings = super::RemoteSortSettingsSource::Snapshot(settings.sort_order);
-        Self::new_inner(settings, None, None, adjustment_settings, sort_settings)
+        let listing_settings = RemoteListingSettingsSource::Snapshot(
+            crate::settings_db::RemoteListingSettings::from_settings(&settings),
+        );
+        Self::new_inner(settings, None, None, adjustment_settings, listing_settings)
     }
 
     pub(super) fn new_with_session(
@@ -537,7 +564,7 @@ impl ContainerEngine {
             Some(ResumeReader::Session(session.clone())),
             Some(session),
             AdjustmentSettingsSource::Live,
-            super::RemoteSortSettingsSource::Live,
+            RemoteListingSettingsSource::Live,
         )
     }
 
@@ -549,13 +576,15 @@ impl ContainerEngine {
         let adjustment_settings = AdjustmentSettingsSource::Snapshot(
             crate::settings_db::AdjustmentRenderSettings::from_settings(&settings),
         );
-        let sort_settings = super::RemoteSortSettingsSource::Snapshot(settings.sort_order);
+        let listing_settings = RemoteListingSettingsSource::Snapshot(
+            crate::settings_db::RemoteListingSettings::from_settings(&settings),
+        );
         Self::new_inner(
             settings,
             Some(ResumeReader::Error(error)),
             None,
             adjustment_settings,
-            sort_settings,
+            listing_settings,
         )
     }
 
@@ -564,7 +593,7 @@ impl ContainerEngine {
         resume_reader: Option<ResumeReader>,
         session: Option<super::session::SessionHandle>,
         adjustment_settings: AdjustmentSettingsSource,
-        sort_settings: super::RemoteSortSettingsSource,
+        listing_settings: RemoteListingSettingsSource,
     ) -> Self {
         let spread_db_path = crate::data_dir::get().join("spread.db");
         let spread_db =
@@ -590,7 +619,7 @@ impl ContainerEngine {
             };
         Self {
             settings: Arc::new(settings),
-            sort_settings,
+            listing_settings,
             stats: Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
             pdf_passwords: crate::pdf_passwords::PdfPasswordStore::load(),
             pdf_page_counts: Mutex::new(HashMap::new()),
@@ -630,15 +659,16 @@ impl ContainerEngine {
 
     fn settings_for_listing(&self) -> Result<crate::settings::Settings, RemoteWriteError> {
         let mut settings = (*self.settings).clone();
-        settings.sort_order = self.sort_settings.load().map_err(|error| {
+        let live = self.listing_settings.load(&settings).map_err(|error| {
             crate::logger::log(format!(
-                "remote_ipc: live sort settings read failed: {error}"
+                "remote_ipc: live listing settings read failed: {error}"
             ));
             RemoteWriteError::new(
                 RemoteWriteErrorCode::PersistenceFailed,
-                "最新の並び順を読み込めませんでした",
+                "最新の一覧設定を読み込めませんでした",
             )
         })?;
+        live.apply_to(&mut settings);
         Ok(settings)
     }
 
@@ -1004,19 +1034,12 @@ impl ContainerEngine {
                 "フォルダ一覧のアドレスが不正です",
             ));
         }
-        let thumb_aspect_height_ratio =
-            folder_thumb_aspect_height_ratio(&self.settings, &resolved.logical);
         let listing = match self.recompute_folder_listing(&resolved.logical) {
             Ok(listing) => listing,
             Err(error) => {
                 return FolderListResponse::Error(media_error_from_remote_write(error));
             }
         };
-        let sort_locked = crate::app::physical_page_order_locked(
-            &self.settings,
-            &resolved.logical,
-            &listing.items,
-        );
         let thumbnail_sources =
             super::RemoteThumbnailSources::from_pairs(&listing.video_thumb_overrides);
         let entries = listing
@@ -1030,14 +1053,14 @@ impl ContainerEngine {
         let response = FolderListResponse::Success(FolderListPayload {
             effective_address: request.address,
             root_name: absolute_root_name(&resolved.logical),
-            thumb_aspect_height_ratio,
+            thumb_aspect_height_ratio: listing.thumb_aspect_height_ratio,
             sort_state: super::remote_grid_sort_state(
-                if sort_locked {
+                if listing.sort_locked {
                     crate::app::BOOK_READING_PAGE_ORDER
                 } else {
                     listing.sort_order
                 },
-                sort_locked.then_some(super::BOOK_SORT_LOCK_REASON),
+                listing.sort_locked.then_some(super::BOOK_SORT_LOCK_REASON),
             ),
             entries,
             scan_ms: listing.scan_ms,
@@ -1634,6 +1657,7 @@ impl ContainerEngine {
         let items = listing.items;
         let image_only = listing.image_only;
         let compiled = listing.compiled;
+        let auto_fullscreen_image_folders_enabled = listing.auto_fullscreen_image_folders_enabled;
         let index = items
             .iter()
             .position(|item| {
@@ -1659,7 +1683,7 @@ impl ContainerEngine {
             page_count,
             image_only,
             true,
-            compiled || (image_only && self.settings.auto_fullscreen_image_folders_enabled()),
+            compiled || (image_only && auto_fullscreen_image_folders_enabled),
         )
         .map(|mut context| {
             context.page_number = u32::try_from(page_number).unwrap_or(u32::MAX);
@@ -1695,6 +1719,11 @@ impl ContainerEngine {
         let materialize_started = Instant::now();
         let materialized = crate::app::materialize_local_folder_listing(folder, scan, &settings);
         let materialize_ms = materialize_started.elapsed().as_secs_f64() * 1000.0;
+        let thumb_aspect_height_ratio = folder_thumb_aspect_height_ratio(&settings, folder);
+        let sort_locked =
+            crate::app::physical_page_order_locked(&settings, folder, &materialized.items);
+        let auto_fullscreen_image_folders_enabled =
+            settings.auto_fullscreen_image_folders_enabled();
         Ok(RecomputedFolderListing {
             items: materialized.items,
             metas: materialized.metas,
@@ -1704,6 +1733,9 @@ impl ContainerEngine {
             image_only,
             compiled,
             sort_order: settings.sort_order,
+            thumb_aspect_height_ratio,
+            sort_locked,
+            auto_fullscreen_image_folders_enabled,
         })
     }
 
@@ -2646,7 +2678,7 @@ impl ContainerEngine {
             .iter()
             .filter(|item| matches!(item, crate::grid_item::GridItem::Image(_)))
             .count();
-        let auto_open = listing.image_only && self.settings.auto_fullscreen_image_folders_enabled();
+        let auto_open = listing.image_only && listing.auto_fullscreen_image_folders_enabled;
         let items = listing
             .items
             .into_iter()

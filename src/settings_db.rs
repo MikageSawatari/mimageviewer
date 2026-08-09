@@ -40,6 +40,15 @@ use crate::settings::{
 };
 
 const SCHEMA_VERSION: &str = "1";
+const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv WHERE key IN (
+    'sort_order', 'show_hidden_files', 'grid_display_order',
+    'archive_file_handling', 'archive_convert_without_dialog',
+    'skip_zip_if_folder_exists', 'skip_archive_if_zip_exists',
+    'skip_image_if_video_exists', 'video_thumb_use_sidecar_image',
+    'skip_duplicate_images', 'image_ext_priority', 'book_root',
+    'auto_fullscreen_zip_pdf', 'auto_fullscreen_image_folders',
+    'detached_viewer_open_images_in_window', 'thumb_aspect', 'thumb_aspect_auto'
+)"#;
 
 /// `settings_kv` に格納する**しない** (= 専用テーブルに切り出される) フィールド名一覧。
 /// `Settings` の serde フィールド名と一致させる。
@@ -249,6 +258,76 @@ pub(crate) fn log_diag(msg: &str) {
 /// 直列化を担い、`with_db` 経由でアクセスする。
 pub struct SettingsDb {
     inner: Mutex<Inner>,
+}
+
+/// Physical-folder listing decisions that must follow settings committed after startup.
+///
+/// Keep this deliberately smaller than [`Settings`]. A full settings reload also reads
+/// histories and potentially large VST state tables that do not affect a folder listing.
+/// When a listing starts, the current values below are overlaid on the startup snapshot.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RemoteListingSettings {
+    sort_order: crate::settings::SortOrder,
+    show_hidden_files: bool,
+    grid_display_order: crate::settings::GridDisplayOrder,
+    archive_file_handling: crate::settings::ArchiveFileHandling,
+    archive_convert_without_dialog: bool,
+    skip_zip_if_folder_exists: bool,
+    skip_archive_if_zip_exists: bool,
+    skip_image_if_video_exists: bool,
+    video_thumb_use_sidecar_image: bool,
+    skip_duplicate_images: bool,
+    image_ext_priority: Vec<String>,
+    book_root: Option<PathBuf>,
+    auto_fullscreen_zip_pdf: bool,
+    auto_fullscreen_image_folders: bool,
+    detached_viewer_open_images_in_window: bool,
+    thumb_aspect: crate::settings::ThumbAspect,
+    thumb_aspect_auto: bool,
+}
+
+impl RemoteListingSettings {
+    pub(crate) fn from_settings(settings: &Settings) -> Self {
+        Self {
+            sort_order: settings.sort_order,
+            show_hidden_files: settings.show_hidden_files,
+            grid_display_order: settings.grid_display_order.clone(),
+            archive_file_handling: settings.archive_file_handling,
+            archive_convert_without_dialog: settings.archive_convert_without_dialog,
+            skip_zip_if_folder_exists: settings.skip_zip_if_folder_exists,
+            skip_archive_if_zip_exists: settings.skip_archive_if_zip_exists,
+            skip_image_if_video_exists: settings.skip_image_if_video_exists,
+            video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
+            skip_duplicate_images: settings.skip_duplicate_images,
+            image_ext_priority: settings.image_ext_priority.clone(),
+            book_root: settings.book_root.clone(),
+            auto_fullscreen_zip_pdf: settings.auto_fullscreen_zip_pdf,
+            auto_fullscreen_image_folders: settings.auto_fullscreen_image_folders,
+            detached_viewer_open_images_in_window: settings.detached_viewer_open_images_in_window,
+            thumb_aspect: settings.thumb_aspect,
+            thumb_aspect_auto: settings.thumb_aspect_auto,
+        }
+    }
+
+    pub(crate) fn apply_to(self, settings: &mut Settings) {
+        settings.sort_order = self.sort_order;
+        settings.show_hidden_files = self.show_hidden_files;
+        settings.grid_display_order = self.grid_display_order;
+        settings.archive_file_handling = self.archive_file_handling;
+        settings.archive_convert_without_dialog = self.archive_convert_without_dialog;
+        settings.skip_zip_if_folder_exists = self.skip_zip_if_folder_exists;
+        settings.skip_archive_if_zip_exists = self.skip_archive_if_zip_exists;
+        settings.skip_image_if_video_exists = self.skip_image_if_video_exists;
+        settings.video_thumb_use_sidecar_image = self.video_thumb_use_sidecar_image;
+        settings.skip_duplicate_images = self.skip_duplicate_images;
+        settings.image_ext_priority = self.image_ext_priority;
+        settings.book_root = self.book_root;
+        settings.auto_fullscreen_zip_pdf = self.auto_fullscreen_zip_pdf;
+        settings.auto_fullscreen_image_folders = self.auto_fullscreen_image_folders;
+        settings.detached_viewer_open_images_in_window = self.detached_viewer_open_images_in_window;
+        settings.thumb_aspect = self.thumb_aspect;
+        settings.thumb_aspect_auto = self.thumb_aspect_auto;
+    }
 }
 
 struct Inner {
@@ -585,7 +664,23 @@ impl SettingsDb {
         })
     }
 
-    /// Remote の一覧 worker が、起動時 snapshot ではなく現在の共有並び順だけを読む。
+    /// Read only the settings used to scan and materialize one physical-folder listing.
+    ///
+    /// The selected keys are fetched in one query while holding the shared DB lock once. The
+    /// startup snapshot supplies serde-compatible defaults for keys absent from an older DB.
+    pub(crate) fn load_remote_listing_settings(
+        &self,
+        fallback: &Settings,
+    ) -> Result<RemoteListingSettings, SettingsDbError> {
+        let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        let mut settings = RemoteListingSettings::from_settings(fallback);
+        for (key, raw) in read_remote_listing_settings(&inner.conn)? {
+            apply_remote_listing_setting(&mut settings, &key, &raw)?;
+        }
+        Ok(settings)
+    }
+
+    /// Remote の集約系 worker が現在の共有並び順だけを読む。
     pub(crate) fn load_sort_order(&self) -> Result<crate::settings::SortOrder, SettingsDbError> {
         let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
         read_settings_kv_typed(
@@ -1989,6 +2084,52 @@ fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError
     Ok(settings)
 }
 
+fn read_remote_listing_settings(
+    conn: &Connection,
+) -> Result<Vec<(String, String)>, SettingsDbError> {
+    let mut stmt = conn.prepare_cached(REMOTE_LISTING_SETTINGS_SQL)?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn apply_remote_listing_setting(
+    settings: &mut RemoteListingSettings,
+    key: &str,
+    raw: &str,
+) -> Result<(), SettingsDbError> {
+    macro_rules! assign {
+        ($field:ident) => {
+            settings.$field =
+                serde_json::from_str(raw).map_err(classify_settings_deserialization_error)?
+        };
+    }
+    match key {
+        "sort_order" => assign!(sort_order),
+        "show_hidden_files" => assign!(show_hidden_files),
+        "grid_display_order" => assign!(grid_display_order),
+        "archive_file_handling" => assign!(archive_file_handling),
+        "archive_convert_without_dialog" => assign!(archive_convert_without_dialog),
+        "skip_zip_if_folder_exists" => assign!(skip_zip_if_folder_exists),
+        "skip_archive_if_zip_exists" => assign!(skip_archive_if_zip_exists),
+        "skip_image_if_video_exists" => assign!(skip_image_if_video_exists),
+        "video_thumb_use_sidecar_image" => assign!(video_thumb_use_sidecar_image),
+        "skip_duplicate_images" => assign!(skip_duplicate_images),
+        "image_ext_priority" => assign!(image_ext_priority),
+        "book_root" => assign!(book_root),
+        "auto_fullscreen_zip_pdf" => assign!(auto_fullscreen_zip_pdf),
+        "auto_fullscreen_image_folders" => assign!(auto_fullscreen_image_folders),
+        "detached_viewer_open_images_in_window" => {
+            assign!(detached_viewer_open_images_in_window)
+        }
+        "thumb_aspect" => assign!(thumb_aspect),
+        "thumb_aspect_auto" => assign!(thumb_aspect_auto),
+        _ => debug_assert!(false, "unexpected remote listing setting: {key}"),
+    }
+    Ok(())
+}
+
 fn read_settings_kv_typed<T>(
     conn: &Connection,
     key: &str,
@@ -3244,6 +3385,74 @@ mod tests {
         db.save_full(&original).unwrap();
         let loaded = db.load_into_settings().unwrap();
         assert_settings_eq(&original, &loaded);
+    }
+
+    #[test]
+    fn remote_listing_settings_overlay_reads_every_live_field_only() {
+        use crate::settings::{
+            ArchiveFileHandling, GridDisplayOrder, GridItemDisplayKind, SortOrder, ThumbAspect,
+        };
+
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut live = Settings::default();
+        live.sort_order = SortOrder::DateDesc;
+        live.show_hidden_files = true;
+        live.grid_display_order = GridDisplayOrder::from_rows([
+            vec![GridItemDisplayKind::Image],
+            vec![GridItemDisplayKind::VideoAudio],
+            vec![GridItemDisplayKind::Archive],
+            vec![GridItemDisplayKind::Folder],
+        ]);
+        live.archive_file_handling = ArchiveFileHandling::Ignore;
+        live.archive_convert_without_dialog = true;
+        live.skip_zip_if_folder_exists = false;
+        live.skip_archive_if_zip_exists = false;
+        live.skip_image_if_video_exists = false;
+        live.video_thumb_use_sidecar_image = false;
+        live.skip_duplicate_images = false;
+        live.image_ext_priority = vec!["avif".to_owned(), "png".to_owned()];
+        live.book_root = Some(PathBuf::from(r"D:\Books"));
+        live.auto_fullscreen_zip_pdf = true;
+        live.auto_fullscreen_image_folders = true;
+        live.detached_viewer_open_images_in_window = true;
+        live.thumb_aspect = ThumbAspect::Portrait3x4;
+        live.thumb_aspect_auto = true;
+        db.save_full(&live).unwrap();
+
+        let mut startup_snapshot = Settings::default();
+        startup_snapshot.thumb_quality = 17;
+        db.load_remote_listing_settings(&startup_snapshot)
+            .unwrap()
+            .apply_to(&mut startup_snapshot);
+
+        assert_eq!(
+            RemoteListingSettings::from_settings(&startup_snapshot),
+            RemoteListingSettings::from_settings(&live)
+        );
+        assert_eq!(startup_snapshot.thumb_quality, 17);
+    }
+
+    #[test]
+    fn remote_listing_settings_uses_startup_fallback_for_missing_old_key() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'video_thumb_use_sidecar_image'",
+                [],
+            )
+            .unwrap();
+        let mut startup_snapshot = Settings::default();
+        startup_snapshot.video_thumb_use_sidecar_image = false;
+
+        db.load_remote_listing_settings(&startup_snapshot)
+            .unwrap()
+            .apply_to(&mut startup_snapshot);
+
+        assert!(!startup_snapshot.video_thumb_use_sidecar_image);
     }
 
     #[test]
