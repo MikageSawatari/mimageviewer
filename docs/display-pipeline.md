@@ -21,6 +21,11 @@ Pending ──────────(ワーカーがデコード)────�
 
 Failed は単発の終端ステート。デコードエラー時のみ。
 
+`Loaded` へ遷移した時点で、`source_dims`（無ければロード済み画像寸法）を per-context の
+`PageDimsCache` に記録する。`Evicted` は GPU texture だけを破棄し、同じ `items_generation` で
+判明済みのページ寸法は残す。idx 空間が変わるときだけ `invalidate_idx_state_and_queues` で clear し、
+cache 自身の generation 不一致も `None` へ fail-closed する。
+
 ### 1.2 2 フェーズ優先ロード
 
 `App::update()` 毎フレーム:
@@ -286,6 +291,11 @@ ui_fullscreen.rs::render_fullscreen_viewport
     ├─ rotation + zoom + pan + free_rotation を合成して描画
     └─ update_prefetch_window(idx)     # フィルタ後の前後数枚を先読み / 範囲外を解放
 ```
+
+frame 冒頭では、先読み窓ぶんの `fs_cache` を 1 回だけ走査し、`Static` / `Animated` / `Video` が
+現在の縦横判定に使う寸法を `PageDimsCache` へ回収する。見開きの判定順は `fs_cache` →
+ロード済みサムネイル → `PageDimsCache` → 未知なら縦長扱いであり、一度判明した寸法は live cache
+退去後も同じ viewer context / items 世代に残る。全 thumbnails の毎 frame 走査は行わない。
 
 **`keep_fullscreen_viewport_alive`** はフルスクリーン非アクティブ時 (`fullscreen_idx == None`)
 に呼ばれ、`fs_viewport_shown == true` の 1 フレームだけ `Visible(false)` cmd を送って hidden 化

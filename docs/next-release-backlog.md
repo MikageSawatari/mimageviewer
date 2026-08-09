@@ -1139,11 +1139,11 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   戻ると `… 8,7 / 一瞬 6,5 → 5,4 / 3,2 / 1`。
   **サムネイル表示から開くと再現しない**。先読み (後方) の枚数で発生位置が動く
   (2-3 枚 → 5 でダブる / 4-5 枚 → 7 / 6-7 枚 → 9)。
-- **原因は特定済み (報告の 3 つの数値すべてと一致)**:
+- **修正前の原因は特定済み (報告の 3 つの数値すべてと一致)**:
   1. 見開きの組み方は毎回 `build_spread_display_units_with_predicates`
-     ([src/ui_fullscreen.rs:5312](../src/ui_fullscreen.rs)) が **nav の先頭から歩き直して**
+     ([src/ui_fullscreen.rs:5960](../src/ui_fullscreen.rs)) が **nav の先頭から歩き直して**
      決める。横長ページは単独ユニットになるので、そこから後ろの偶奇が決まる。
-  2. その判定 `is_landscape` ([src/ui_fullscreen.rs:5193](../src/ui_fullscreen.rs)) は
+  2. 修正前の判定 `is_landscape` ([src/ui_fullscreen.rs:5838](../src/ui_fullscreen.rs)) は
      **フルスクリーンのテクスチャキャッシュ `fs_cache` かグリッドの `thumbnails` にしか
      寸法を聞かない**。どちらにも無ければ「**不明 = 縦長**」と返す (関数の doc にもそう書いてある)。
   3. `fs_cache` は先読み設定ぶんの窓なので、読み進めると横長ページ (例 1 の idx 0) が
@@ -1153,27 +1153,32 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   - 発生位置が先読み (後方) 枚数 N と一致する: N=2/3 → idx 0 が落ちるのが 1 ユニット早く、
     N=6/7 → 1 ユニット遅い。報告の 5 / 7 / 9 とそのまま合う。
 - **詳細表示が効く理由**: `update_keep_range_and_requests`
-  ([src/app.rs:30053](../src/app.rs)) は詳細表示のとき `keep_range = (0,0)` にして
+  ([src/app.rs:30057](../src/app.rs)) は詳細表示のとき `keep_range = (0,0)` にして
   **グリッドのサムネイルを全部 Evicted にし、要求キューも drain する** (詳細表示は独自の
   プレビュー経路を持つため意図的な抑止)。`ThumbnailState::Evicted` は `source_dims` を
   持たないので、詳細表示では 2 番目の寸法ソースが最初から消えている。
   サムネイル表示では 11 枚全部が keep 範囲に入るので寸法が常に分かり、再現しない。
-- ⚠ **詳細表示だけの問題ではない可能性 (要確認)**: サムネイル表示でも、画像枚数が多くて
-  横長ページがサムネイルの keep 範囲から外れれば同じ反転が起きるはず。報告が「詳細表示だけ」に
-  見えているのは 11 枚が全部 keep 範囲に収まるからで、数百枚のフォルダでは通常表示でも
-  再現する見込み。修正前にこれを確認して、影響範囲を確定する。
-- **修正方針 (症状パッチではなく、寸法の知識を単調にする)**:
-  - ページの縦横は **GPU キャッシュ在住とは独立した安定ソース**から取る。案 = idx →
-    `(w, h)` の軽い map を App に持ち、フルスクリーンのデコード / サムネイルのロード /
-    詳細表示のメタデータ探査 (`metadata_ops` の `probe_image_dims_from_bytes`) /
-    カタログ DB の `source_dims` のどこかで判明した時点で記録し、**テクスチャを捨てても消さない**
-    (11 枚でも 10 万枚でも数百 KB)。一度分かった寸法を忘れないことが不変条件。
-  - `is_landscape` の「不明 = 縦長」という silent fallback をやめ、不明は不明として扱う。
-    フォルダを開いた直後の未知は避けられないが、**既知 → 未知へ後退しない**ことが要点。
-  - 回帰テスト: `build_spread_display_units_with_predicates` は純関数なので、
-    「横長フラグが true → false へ変わってもユニット境界が変わらない」ことを
-    純関数レベルで固定できる。加えて「先読み窓から外れても偶奇が変わらない」を
-    App レベルの状態遷移テストにする。
+- **影響範囲は詳細表示に限定されない (2026-08-09 ソース確認で確定)**:
+  `evict_grid_thumbnail` は表示モードを問わず `Loaded` を `Evicted` にするため、通常の
+  サムネイル表示でも横長ページが keep 範囲から外れれば同じ既知 → 未知の後退が起きる。
+  11 枚の報告データでは全件が keep 範囲に残るためサムネイル表示で再現しなかっただけで、
+  枚数が多い通常表示も同じ根因の対象。
+- **実装記録 (2026-08-09、Codex 実装 / ClaudeCode レビュー・利用者実機確認待ち)**:
+  - `src/page_dims.rs` に generation 付き `PageDimsCache` を追加した。`ViewerContextBundle` と
+    App の同名 field で `items` / `thumbnails` / `fs_cache` と一緒に所有・swap し、generation
+    空間を共有しない main / detached 間で同じ世代番号の別 item 寸法を混同しない。
+  - 記録は `poll_thumbnails` の `Loaded` 遷移時と、フルスクリーン frame 冒頭で live な
+    `fs_cache` を 1 回 harvest する 2 箇所だけ。テクスチャ退去では消さず、idx 空間変更時の
+    正規フック `invalidate_idx_state_and_queues` だけで clear する。
+  - cache 自身も `items_generation` を刻印し、不一致なら `None` を返す fail-closed とした。
+    掃除漏れがあっても別 items の同じ idx へ寸法を誤適用せず、従来どおり未知へ倒す。
+  - `is_landscape` は `fs_cache` → `ThumbnailState::Loaded` → `PageDimsCache` の順で読む。
+    一度も寸法が分からないページの `false` fallback は維持し、禁止すべき既知 → 未知の後退だけを
+    解消した。回転は従来どおり判定へ反映せず、見開きアルゴリズムと先読み範囲も変更していない。
+  - 純関数の先頭横長 / 後退形、fs cache + thumbnail 退去後も境界不変の App 状態遷移、
+    generation fail-closed、同世代番号の main / detached 分離を回帰テストへ追加した。
+  - カタログ DB からの寸法先読みは今回行わない。未知ページの初期精度を将来改善する場合も、
+    UI スレッド同期 I/O を追加せず worker 境界で検討する。
 - **再現用テストデータ (生成済み)**: `C:\tmp\miv-spread-test\`
   - `case1-yoko-first-folder\` と `case1-yoko-first.zip` (01 = 横長 1800x1100、02〜11 = 縦長 900x1400)
   - `case2-yoko-second-folder\` と `case2-yoko-second.zip` (01 = 縦長、02 = 横長、03〜11 = 縦長)

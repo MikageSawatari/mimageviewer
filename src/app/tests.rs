@@ -12,6 +12,117 @@ fn display_image_texture_options_always_keep_the_complete_mip_chain() {
     );
 }
 
+#[test]
+fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    app.items = (1..=11)
+        .map(|page| GridItem::Image(PathBuf::from(format!("C:/spread/{page:02}.png"))))
+        .collect();
+    app.items_generation = 7;
+    app.spread_mode = crate::settings::SpreadMode::Rtl;
+    app.spread_shift_anchor_idx = None;
+
+    let portrait_tex = ctx.load_texture(
+        "spread_portrait_thumb",
+        egui::ColorImage::filled([1, 2], egui::Color32::WHITE),
+        egui::TextureOptions::LINEAR,
+    );
+    app.thumbnails = (0..11)
+        .map(|idx| {
+            if idx == 0 {
+                ThumbnailState::Pending
+            } else {
+                ThumbnailState::Loaded {
+                    tex: portrait_tex.clone(),
+                    from_cache: false,
+                    from_edit_preview: false,
+                    rendered_at_px: 2,
+                    source_dims: Some((900, 1400)),
+                }
+            }
+        })
+        .collect();
+
+    let landscape_tex = ctx.load_texture(
+        "spread_landscape_fs",
+        egui::ColorImage::filled([2, 1], egui::Color32::WHITE),
+        egui::TextureOptions::LINEAR,
+    );
+    app.fs_cache.insert(
+        0,
+        FsCacheEntry::Static {
+            tex: landscape_tex,
+            pixels: std::sync::Arc::new(egui::ColorImage::filled([2, 1], egui::Color32::WHITE)),
+            source_dims: Some([1800, 1100]),
+            load_seq: 0,
+        },
+    );
+
+    let nav = (0..11).collect::<Vec<_>>();
+    let before_eviction = app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        before_eviction,
+        vec![
+            vec![0],
+            vec![2, 1],
+            vec![4, 3],
+            vec![6, 5],
+            vec![8, 7],
+            vec![10, 9]
+        ]
+    );
+
+    app.harvest_page_dims_from_fs_cache();
+    assert_eq!(
+        app.page_dims_cache.get(app.items_generation, 0),
+        Some((1800, 1100))
+    );
+    app.fs_cache.remove(&0);
+    app.thumbnails[0] = ThumbnailState::Evicted;
+
+    let after_eviction = app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        after_eviction, before_eviction,
+        "live cache から横長ページが退去しても見開きユニット境界を変えてはならない"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn page_dims_cache_does_not_cross_equal_generation_viewer_bundles() {
+    let mut app = phase_c_support::setup_app();
+    app.items_generation = 5;
+    app.page_dims_cache.record(5, 0, (1800, 1100));
+
+    let mut detached = ViewerContextBundle::empty();
+    detached.items_generation = 5;
+    detached.page_dims_cache.record(5, 0, (900, 1400));
+    app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: detached });
+
+    let detached_dims = app
+        .with_active_detached_viewer_context(|mounted| {
+            mounted.page_dims_cache.get(mounted.items_generation, 0)
+        })
+        .expect("detached bundle is present");
+
+    assert_eq!(detached_dims, Some((900, 1400)));
+    assert_eq!(
+        app.page_dims_cache.get(app.items_generation, 0),
+        Some((1800, 1100)),
+        "同じ generation 番号でも main と detached の寸法を混同してはならない"
+    );
+    assert_eq!(
+        app.active_detached_viewer_context
+            .as_ref()
+            .expect("detached bundle remains parked")
+            .bundle
+            .page_dims_cache
+            .get(5, 0),
+        Some((900, 1400))
+    );
+}
+
 fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHandle) -> FsHoldover {
     FsHoldover::FolderNavigation(FsDisplayUnitHoldover {
         pages: vec![FsDisplayUnitHoldoverPage {

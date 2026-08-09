@@ -2131,6 +2131,7 @@ struct ViewerContextBundle {
     search_filter_origin_folder: Option<PathBuf>,
     checked: std::collections::HashSet<usize>,
     rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
+    page_dims_cache: crate::page_dims::PageDimsCache,
     rating_cache: std::collections::HashMap<usize, u8>,
     /// App-global な path rating 更新をこの context の idx cache へ反映済みの世代。
     rating_session_write_seen_generation: u64,
@@ -2431,6 +2432,7 @@ impl ViewerContextBundle {
             search_filter_origin_folder: None,
             checked: std::collections::HashSet::new(),
             rotation_cache: std::collections::HashMap::new(),
+            page_dims_cache: crate::page_dims::PageDimsCache::default(),
             rating_cache: std::collections::HashMap::new(),
             rating_session_write_seen_generation: 0,
             metadata_import_refresh_index: None,
@@ -9296,6 +9298,8 @@ pub struct App {
     pub(crate) rotation_db: Option<crate::rotation_db::RotationDb>,
     /// 現在フォルダのアイテムごとの回転キャッシュ (idx → Rotation)
     pub(crate) rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
+    /// 一度判明したページ寸法をテクスチャの退去後も保持する per-context cache。
+    pub(crate) page_dims_cache: crate::page_dims::PageDimsCache,
 
     // ── 音量ノーマライズ ──────────────────────────────────────────
     /// 動画音量の per-file 測定値キャッシュ (整 LUFS / true peak / 算出ゲイン)。
@@ -12216,6 +12220,7 @@ impl App {
             search_or_mode: false,
             rotation_db,
             rotation_cache: std::collections::HashMap::new(),
+            page_dims_cache: crate::page_dims::PageDimsCache::default(),
             audio_normalize_db,
             normalize_state: None,
             normalize_ui_states: std::collections::HashMap::new(),
@@ -14089,6 +14094,7 @@ impl App {
             search_filter_origin_folder,
             checked,
             rotation_cache,
+            page_dims_cache,
             rating_cache,
             rating_session_write_seen_generation,
             metadata_import_refresh_index,
@@ -14312,6 +14318,7 @@ impl App {
         swap_field!(search_filter_origin_folder);
         swap_field!(checked);
         swap_field!(rotation_cache);
+        swap_field!(page_dims_cache);
         swap_field!(rating_cache);
         swap_field!(rating_session_write_seen_generation);
         swap_field!(metadata_import_refresh_index);
@@ -23983,6 +23990,7 @@ impl App {
         // idx-keyed 状態なので、ここでは触らない。削除経路では呼び出し元が idx shift し、
         // 差し替え経路 (Ctrl+G) では呼び出し元が明示的に clear する。
         self.rotation_cache.clear();
+        self.page_dims_cache.clear();
         self.rating_cache.clear();
         self.adjustment_cache.clear();
         self.thumb_pixels.clear();
@@ -29697,6 +29705,13 @@ impl App {
                             source_dims,
                         };
                         textures_created += 1;
+                        // 見開きの縦横判定はテクスチャ寿命に依存させない。元寸法が無い
+                        // 旧 cache 等では、従来の判定と同じくロード済み画像寸法を使う。
+                        if let Some(dims) = source_dims
+                            .or_else(|| Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?)))
+                        {
+                            self.page_dims_cache.record(self.items_generation, i, dims);
+                        }
                         // auto_aspect: 新規 Loaded のタイミングで比率サンプルを記録。
                         // source_dims が None なら ColorImage の (w, h) を fallback として使う
                         // (動画 Shell サムネ / 旧 cache 由来などで source_dims が無いケース)。
@@ -38411,6 +38426,7 @@ impl App {
             search_filter_origin_folder,
             checked,
             rotation_cache,
+            page_dims_cache,
             rating_cache,
             rating_session_write_seen_generation,
             current_folder_rating_cache,
@@ -38591,6 +38607,7 @@ impl App {
             search_filter_origin_folder,
             checked,
             rotation_cache,
+            page_dims_cache,
             rating_cache,
             rating_session_write_seen_generation,
             current_folder_rating_cache,

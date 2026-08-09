@@ -122,6 +122,7 @@ pub mod native_context_menu;
 mod native_name_dialog;
 pub mod open_with;
 pub mod os_theme;
+mod page_dims;
 pub mod panorama;
 pub mod panorama_wgpu;
 pub mod path_key;

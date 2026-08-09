@@ -5831,37 +5831,20 @@ fn continuous_reading_drag_delta(
 }
 
 /// 指定インデックスの画像が横長（幅>高さ）かを判定する。
-/// テクスチャサイズが不明な場合は false（縦長として扱う）。
+///
+/// live なフルサイズ cache、ロード済みサムネイル、退去後も残るページ寸法 cache の順で
+/// 参照する。一度も寸法が判明していないページだけは false（縦長）として扱うが、判明済みの
+/// 寸法はテクスチャ退去で失わないため、同じ items 世代で既知から未知へは後退しない。
 fn is_landscape(
     idx: usize,
     fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
     thumbnails: &[ThumbnailState],
+    page_dims_cache: &crate::page_dims::PageDimsCache,
+    items_generation: u64,
 ) -> bool {
     // フルサイズキャッシュから判定
-    if let Some(entry) = fs_cache.get(&idx) {
-        match entry {
-            FsCacheEntry::Static {
-                tex, source_dims, ..
-            } => {
-                if let Some([w, h]) = source_dims {
-                    return w > h;
-                }
-                let s = tex.size_vec2();
-                return s.x > s.y;
-            }
-            FsCacheEntry::Animated { frames, .. } => {
-                if let Some((tex, _)) = frames.first() {
-                    let s = tex.size_vec2();
-                    return s.x > s.y;
-                }
-            }
-            FsCacheEntry::Video { player, .. } => {
-                if let Some(info) = player.info() {
-                    return info.width > info.height;
-                }
-            }
-            FsCacheEntry::Failed => {}
-        }
+    if let Some((w, h)) = fs_cache.get(&idx).and_then(fs_cache_entry_page_dims) {
+        return w > h;
     }
     // サムネイルから判定
     if let Some(ThumbnailState::Loaded {
@@ -5874,7 +5857,28 @@ fn is_landscape(
         let s = tex.size_vec2();
         return s.x > s.y;
     }
+    // live texture が退去済みでも、一度判明した同世代の寸法は忘れない。
+    if let Some((w, h)) = page_dims_cache.get(items_generation, idx) {
+        return w > h;
+    }
     false
+}
+
+fn fs_cache_entry_page_dims(entry: &FsCacheEntry) -> Option<(u32, u32)> {
+    fn from_usize(dims: [usize; 2]) -> Option<(u32, u32)> {
+        Some((u32::try_from(dims[0]).ok()?, u32::try_from(dims[1]).ok()?))
+    }
+
+    match entry {
+        FsCacheEntry::Static {
+            tex, source_dims, ..
+        } => from_usize(source_dims.unwrap_or_else(|| tex.size())),
+        FsCacheEntry::Animated { frames, .. } => {
+            frames.first().and_then(|(tex, _)| from_usize(tex.size()))
+        }
+        FsCacheEntry::Video { player, .. } => player.info().map(|info| (info.width, info.height)),
+        FsCacheEntry::Failed => None,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -5925,12 +5929,14 @@ fn build_spread_display_units(
     shift_anchor_idx: Option<usize>,
     fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
     thumbnails: &[ThumbnailState],
+    page_dims_cache: &crate::page_dims::PageDimsCache,
+    items_generation: u64,
 ) -> Vec<SpreadDisplayUnit> {
     build_spread_display_units_with_predicates(
         nav,
         spread_mode,
         shift_anchor_idx,
-        |idx| is_landscape(idx, fs_cache, thumbnails),
+        |idx| is_landscape(idx, fs_cache, thumbnails, page_dims_cache, items_generation),
         |idx| is_spread_pairable_item(items.get(idx)),
     )
 }
@@ -6488,6 +6494,34 @@ pub fn draw_still_panel_reach_snapshot_fixture(
 }
 
 impl App {
+    /// live なフルスクリーン cache から、現在世代で判明済みのページ寸法を回収する。
+    /// cache 自体は小さな先読み窓なので、フレーム冒頭に 1 回だけ走査する。
+    pub(crate) fn harvest_page_dims_from_fs_cache(&mut self) {
+        let generation = self.items_generation;
+        for (&idx, entry) in &self.fs_cache {
+            if let Some(dims) = fs_cache_entry_page_dims(entry) {
+                self.page_dims_cache.record(generation, idx, dims);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spread_display_unit_pages_for_test(&self, nav: &[usize]) -> Vec<Vec<usize>> {
+        build_spread_display_units(
+            nav,
+            &self.items,
+            self.spread_mode,
+            self.spread_shift_anchor_idx,
+            &self.fs_cache,
+            &self.thumbnails,
+            &self.page_dims_cache,
+            self.items_generation,
+        )
+        .into_iter()
+        .map(|unit| unit.screen_pages(self.spread_mode))
+        .collect()
+    }
+
     pub(crate) fn still_touch_chrome_is_latched(&self, ctx: &egui::Context) -> bool {
         self.fullscreen_idx
             .is_some_and(|idx| still_touch_chrome_latched(ctx, idx, self.fullscreen_opened_at()))
@@ -9376,6 +9410,8 @@ impl App {
                 self.spread_shift_anchor_idx,
                 &self.fs_cache,
                 &self.thumbnails,
+                &self.page_dims_cache,
+                self.items_generation,
             );
             match find_spread_display_unit(&units, fs_idx) {
                 Some((unit_index, _)) => Some((units, unit_index)),
@@ -10001,6 +10037,8 @@ impl App {
             }
             return;
         };
+
+        self.harvest_page_dims_from_fs_cache();
 
         // ── pending の PDF 再レンダリング結果を取り込む ──
         // show_viewport_immediate 内では &mut self が使えるので、
@@ -13156,6 +13194,8 @@ impl App {
             self.spread_shift_anchor_idx,
             &self.fs_cache,
             &self.thumbnails,
+            &self.page_dims_cache,
+            self.items_generation,
         );
         find_spread_display_unit(&units, nav[pos])
             .map(|(_, unit)| unit.spread_pair(self.spread_mode))
@@ -13218,6 +13258,8 @@ impl App {
             self.spread_shift_anchor_idx,
             &self.fs_cache,
             &self.thumbnails,
+            &self.page_dims_cache,
+            self.items_generation,
         );
         let Some((unit_pos, _)) = find_spread_display_unit(&units, fs_idx) else {
             return FsPageNav::Delta(base_delta);
@@ -13248,12 +13290,20 @@ impl App {
             self.spread_shift_anchor_idx,
             &self.fs_cache,
             &self.thumbnails,
+            &self.page_dims_cache,
+            self.items_generation,
         );
         let landscape_flags = nav
             .iter()
             .map(|&idx| {
                 !is_spread_pairable_item(self.items.get(idx))
-                    || is_landscape(idx, &self.fs_cache, &self.thumbnails)
+                    || is_landscape(
+                        idx,
+                        &self.fs_cache,
+                        &self.thumbnails,
+                        &self.page_dims_cache,
+                        self.items_generation,
+                    )
             })
             .collect::<Vec<_>>();
         spread_offset_nudge_from_units(&nav, &units, fs_idx, dir, &landscape_flags)
@@ -13320,6 +13370,8 @@ impl App {
             self.spread_shift_anchor_idx,
             &self.fs_cache,
             &self.thumbnails,
+            &self.page_dims_cache,
+            self.items_generation,
         );
         if let Some((_, unit)) = find_spread_display_unit(&units, idx) {
             let new_idx = unit.anchor_idx();
@@ -20139,6 +20191,8 @@ impl App {
                     self.spread_shift_anchor_idx,
                     &self.fs_cache,
                     &self.thumbnails,
+                    &self.page_dims_cache,
+                    self.items_generation,
                 )
                 .into_iter()
                 .map(|unit| {
@@ -33147,6 +33201,52 @@ mod tests {
                 .map(SpreadDisplayUnit::anchor_idx)
                 .collect::<Vec<_>>(),
             vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn spread_units_keep_leading_landscape_single_and_pair_following_pages() {
+        let nav = (0..11).collect::<Vec<_>>();
+        let units =
+            build_spread_display_units_with_landscape(&nav, SpreadMode::Rtl, None, |idx| idx == 0);
+
+        assert_eq!(
+            units
+                .iter()
+                .map(|unit| {
+                    unit.screen_pages(SpreadMode::Rtl)
+                        .into_iter()
+                        .map(|idx| idx + 1)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                vec![1],
+                vec![3, 2],
+                vec![5, 4],
+                vec![7, 6],
+                vec![9, 8],
+                vec![11, 10]
+            ]
+        );
+    }
+
+    #[test]
+    fn spread_units_regression_shape_when_leading_landscape_falls_back_to_portrait() {
+        let nav = (0..11).collect::<Vec<_>>();
+        let units =
+            build_spread_display_units_with_landscape(&nav, SpreadMode::Rtl, None, |_| false);
+
+        assert_eq!(
+            spread_unit_summary_1based(&units),
+            vec![
+                vec![1, 2],
+                vec![3, 4],
+                vec![5, 6],
+                vec![7, 8],
+                vec![9, 10],
+                vec![11]
+            ]
         );
     }
 
