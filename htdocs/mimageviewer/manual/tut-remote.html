@@ -53,42 +53,10 @@
     <div class="box warn">
       <span class="box-icon">⚠️</span>
       <div class="box-body">
-        <strong>この機能は既定でオフです。</strong>有効にすると、<strong>mImageViewer で閲覧できる
-        すべてのファイル</strong>が、この PC の Tailscale アドレスへ接続でき、PIN を知っている人から
-        見えるようになります。対象はお気に入りの中だけではなく、mImageViewer が開ける画像・動画・PDF
-        すべてです。次の「何が見えるようになるか」を読んでから有効にしてください。
+        <strong>この機能は既定でオフです。</strong>有効にすると、<strong>すべてのドライブについて、
+        mImageViewer で表示できるファイルが閲覧できるようになります。</strong>この PC の Tailscale
+        アドレスへ接続でき、PIN を知っている人から見えます。
       </div>
-    </div>
-
-    <h2>何が見えるようになるか</h2>
-    <p>
-      リモートから読める範囲は、<strong>mImageViewer 本体で開ける範囲と同じ</strong>です。
-      本体で開けるフォルダは、リモートからも開けます。お気に入りに登録していないフォルダも、
-      別のドライブも同じです。
-    </p>
-    <p>
-      これは意図的な設計です。範囲を狭めると、タグや★を付けたファイル・読みかけの本が
-      「自宅では見えるのに外出先では開けない」という状態になり、しかもそれに気づくのが
-      外出先になってしまいます。また、狭めた範囲が確実に守られていることを保証しきれない以上、
-      「ここから先は読めません」と表示するより、<strong>読める範囲を正直に伝えたうえで
-      使っていただくほう</strong>が安全だと考えています。
-    </p>
-    <p>
-      具体的には次のとおりです。
-    </p>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr><th>種類</th><th>リモートから</th></tr>
-        </thead>
-        <tbody>
-          <tr><td>フォルダ名・ファイル名</td><td>一覧に表示されます</td></tr>
-          <tr><td>画像</td><td>表示できます</td></tr>
-          <tr><td>ZIP / PDF の中身</td><td>ページを開けます</td></tr>
-          <tr><td>動画</td><td>再生できます</td></tr>
-          <tr><td>上記以外のファイル</td><td>名前は一覧に出ますが、中身は送られません</td></tr>
-        </tbody>
-      </table>
     </div>
 
     <h2>誰が接続できるか</h2>
@@ -106,7 +74,6 @@
       このうち<strong>守りの中心は 1 つめ</strong>です。Tailscale ネットワークに入れる端末を
       自分のものだけに限ることで、そもそも届く相手を絞っています。PIN は、その内側で
       うっかり開かれないようにするための確認であって、PIN だけで守られているわけではありません。
-      <strong>Tailscale 側を緩めた状態で PIN に頼らないでください。</strong>
     </p>
 
     <div class="box warn">
@@ -144,8 +111,6 @@
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
         QR コードに含まれるのは<strong>接続先だけ</strong>で、PIN は含まれません。
-        ただし、接続先を知られないこと自体を守りとして当てにしないでください。
-        守っているのは、Tailscale ネットワークに入れる端末を限っていることです。
       </div>
     </div>
     <p>
@@ -237,14 +202,6 @@
       <li><strong>ネットワークドライブ：</strong>自宅 PC のフォルダをドライブとして割り当てると、
       ノート PC の mImageViewer から普通のフォルダとして開けます。</li>
     </ul>
-
-    <div class="box tip">
-      <span class="box-icon">💡</span>
-      <div class="box-body">
-        リモートから見たいフォルダは、あらかじめ自宅 PC で<a href="tut-cache.html">サムネイルキャッシュ</a>を
-        作っておくと、一覧の表示が目に見えて速くなります。特に大きなフォルダで効果があります。
-      </div>
-    </div>
 
     <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
   </main>
