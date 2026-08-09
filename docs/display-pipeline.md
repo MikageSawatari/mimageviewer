@@ -747,8 +747,9 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
   wipe/diff比較と360度パノラマの独自`Rgba8Unorm` textureも同じGPU生成器を使う。パノラマは
   水平フル/垂直cropではU=Repeat、水平cropではU=ClampToEdgeを選び、低LODで部分画像の
   反対端が混ざらないようにする。経度シームではU微分を周期補正して`textureSampleGrad`へ渡し、
-  シームだけ過度に粗いmipが選ばれることを防ぐ。比較callbackは現在のpinned/current 1組だけを
-  保持し、解除・再準備時に旧組を解放する。右下のピン表示は72x54以下の専用textureを使う。1つの
+  シームだけ過度に粗いmipが選ばれることを防ぐ。比較callbackは現在のpinned/current textureと
+  mip chainを1組だけ保持し、解除・再準備時に旧組を解放する。本文 / ナビゲータのuniform bufferと
+  bind groupはtyped slotごとに分ける。右下のピン表示は72x54以下の専用textureを使う。1つの
   `TextureHandle` 内に全 level を保持するので、表示 texture の優先順位、論理サイズ、zoom、
   見開き、連結読み、ルーペ、pixel grid の座標系は変更しない。
 - animated frame、動画、サムネイル、mask、checker、UI texture は対象外。明示的な
@@ -1001,7 +1002,9 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 比較表示では本文と同じ単一比較キャンバスをレイアウト正本とし、Wipe / Diff はナビゲータの
 画像矩形へ `zoom_pan=None` で同じ `CompareShaderCallback` を再描画する。PinnedNormal は
 準備済み pinned texture を直接描画する。同一フレームの2 callback は同じ `pair.key` と寸法を
-渡すため GPU texture / mip chain / bind group を再利用し、2回目は uniform 更新と draw だけを行う。
+渡すため GPU texture / mip chainを再利用する。一方、`egui-wgpu`は全callbackのprepare後にpaint
+するため、callbackごとに異なるuniformとbind groupは`CompareShaderSlot::{Main, Navigator}`ごとに
+保持し、後のprepareが先の描画状態を上書きしない。
 本文の比較 callback は、ズーム / パン後の実画像矩形と viewport の交差だけを callback rect にし、
 切り落とした範囲を uniform の UV 窓で元の合成画像座標へ戻す。テクスチャ採取と Wipe 境界判定は
 復元後の座標を共有するため、白線の基準である実画像矩形と一致する。ナビゲータは実画像矩形が

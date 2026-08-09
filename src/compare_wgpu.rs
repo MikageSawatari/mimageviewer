@@ -69,7 +69,14 @@ pub enum CompareShaderMode {
     Diff,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompareShaderSlot {
+    Main,
+    Navigator,
+}
+
 pub struct CompareShaderCallback {
+    pub slot: CompareShaderSlot,
     pub key: u64,
     pub width: u32,
     pub height: u32,
@@ -98,10 +105,108 @@ struct CompareGpuPair {
     _current_texture: wgpu::Texture,
     _pinned_view: wgpu::TextureView,
     _current_view: wgpu::TextureView,
-    bind_group: wgpu::BindGroup,
-    uniform: wgpu::Buffer,
+    // 重いtexture / mip chainはpairで共有し、prepareごとに変わる軽量状態だけを分離する。
+    slots: CompareGpuSlots,
     width: u32,
     height: u32,
+}
+
+struct CompareGpuSlots {
+    main: CompareGpuSlot,
+    navigator: CompareGpuSlot,
+}
+
+struct CompareGpuSlot {
+    bind_group: wgpu::BindGroup,
+    uniform: wgpu::Buffer,
+}
+
+impl CompareGpuSlots {
+    fn new(
+        device: &wgpu::Device,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        pinned_view: &wgpu::TextureView,
+        current_view: &wgpu::TextureView,
+    ) -> Self {
+        Self {
+            main: CompareGpuSlot::new(
+                device,
+                bind_group_layout,
+                sampler,
+                pinned_view,
+                current_view,
+                CompareShaderSlot::Main,
+            ),
+            navigator: CompareGpuSlot::new(
+                device,
+                bind_group_layout,
+                sampler,
+                pinned_view,
+                current_view,
+                CompareShaderSlot::Navigator,
+            ),
+        }
+    }
+
+    fn get(&self, slot: CompareShaderSlot) -> &CompareGpuSlot {
+        // 新しい呼び出し箇所をenumへ追加したとき、slotの割り当て漏れはcompile errorにする。
+        match slot {
+            CompareShaderSlot::Main => &self.main,
+            CompareShaderSlot::Navigator => &self.navigator,
+        }
+    }
+}
+
+impl CompareGpuSlot {
+    fn new(
+        device: &wgpu::Device,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        pinned_view: &wgpu::TextureView,
+        current_view: &wgpu::TextureView,
+        slot: CompareShaderSlot,
+    ) -> Self {
+        let (uniform_label, bind_group_label) = match slot {
+            CompareShaderSlot::Main => ("miv_compare_main_uniform", "miv_compare_main_bind_group"),
+            CompareShaderSlot::Navigator => (
+                "miv_compare_navigator_uniform",
+                "miv_compare_navigator_bind_group",
+            ),
+        };
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(uniform_label),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(bind_group_label),
+            layout: bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(pinned_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(current_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        });
+        Self {
+            bind_group,
+            uniform,
+        }
+    }
 }
 
 impl CompareGpuResources {
@@ -239,34 +344,13 @@ impl CompareGpuResources {
                 &callback.current_rgba,
                 &self.mipmap_generator,
             );
-            let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("miv_compare_uniform"),
-                size: 32,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("miv_compare_bind_group"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&pinned.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&current.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: uniform.as_entire_binding(),
-                    },
-                ],
-            });
+            let slots = CompareGpuSlots::new(
+                device,
+                &self.bind_group_layout,
+                &self.sampler,
+                &pinned.view,
+                &current.view,
+            );
             self.pair = Some((
                 callback.key,
                 CompareGpuPair {
@@ -274,8 +358,7 @@ impl CompareGpuResources {
                     _current_texture: current.texture,
                     _pinned_view: pinned.view,
                     _current_view: current.view,
-                    bind_group,
-                    uniform,
+                    slots,
                     width: callback.width,
                     height: callback.height,
                 },
@@ -284,11 +367,13 @@ impl CompareGpuResources {
         if let Some((key, pair)) = self.pair.as_ref()
             && *key == callback.key
         {
-            queue.write_buffer(
-                &pair.uniform,
-                0,
-                &uniform_bytes(callback.mode, callback.wipe_fraction, callback.uv_window),
+            let write = uniform_write(
+                callback.slot,
+                callback.mode,
+                callback.wipe_fraction,
+                callback.uv_window,
             );
+            queue.write_buffer(&pair.slots.get(write.slot).uniform, 0, &write.bytes);
         }
     }
 }
@@ -374,6 +459,24 @@ fn uniform_bytes(mode: CompareShaderMode, wipe_fraction: f32, uv_window: [f32; 4
     bytes
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompareUniformWrite {
+    slot: CompareShaderSlot,
+    bytes: [u8; 32],
+}
+
+fn uniform_write(
+    slot: CompareShaderSlot,
+    mode: CompareShaderMode,
+    wipe_fraction: f32,
+    uv_window: [f32; 4],
+) -> CompareUniformWrite {
+    CompareUniformWrite {
+        slot,
+        bytes: uniform_bytes(mode, wipe_fraction, uv_window),
+    }
+}
+
 impl egui_wgpu::CallbackTrait for CompareShaderCallback {
     fn prepare(
         &self,
@@ -411,21 +514,28 @@ impl egui_wgpu::CallbackTrait for CompareShaderCallback {
             return;
         }
         render_pass.set_pipeline(&resources.pipeline);
-        render_pass.set_bind_group(0, &pair.bind_group, &[]);
+        render_pass.set_bind_group(0, &pair.slots.get(self.slot).bind_group, &[]);
         render_pass.draw(0..6, 0..1);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CompareShaderMode, SHADER, uniform_bytes};
+    use super::{CompareShaderMode, CompareShaderSlot, SHADER, uniform_bytes, uniform_write};
 
     #[test]
     fn compare_uses_fixed_mipmap_sampling_and_compact_uniform() {
         assert!(SHADER.contains("textureSample(tex, compare_sampler, uv)"));
         assert!(!SHADER.contains("textureSampleBias"));
         assert!(!SHADER.contains("textureSampleLevel"));
-        let default_bytes = uniform_bytes(CompareShaderMode::Wipe, 0.5, [0.1, 0.2, 0.8, 0.9]);
+        let default_write = uniform_write(
+            CompareShaderSlot::Main,
+            CompareShaderMode::Wipe,
+            0.5,
+            [0.1, 0.2, 0.8, 0.9],
+        );
+        assert_eq!(default_write.slot, CompareShaderSlot::Main);
+        let default_bytes = default_write.bytes;
         assert_eq!(
             f32::from_ne_bytes(default_bytes[0..4].try_into().unwrap()),
             0.0
@@ -450,5 +560,34 @@ mod tests {
         )
         .validate(&module)
         .expect("validate compare WGSL");
+    }
+
+    #[test]
+    fn compare_uniform_writes_keep_main_and_navigator_bytes_in_distinct_slots() {
+        let main = uniform_write(
+            CompareShaderSlot::Main,
+            CompareShaderMode::Wipe,
+            0.37,
+            [0.25, 0.2, 0.75, 0.8],
+        );
+        let navigator = uniform_write(
+            CompareShaderSlot::Navigator,
+            CompareShaderMode::Wipe,
+            0.37,
+            [0.0, 0.0, 1.0, 1.0],
+        );
+
+        assert_eq!(main.slot, CompareShaderSlot::Main);
+        assert_eq!(navigator.slot, CompareShaderSlot::Navigator);
+        assert_ne!(main.slot, navigator.slot);
+        assert_ne!(main.bytes, navigator.bytes);
+        assert_eq!(
+            &main.bytes,
+            &uniform_bytes(CompareShaderMode::Wipe, 0.37, [0.25, 0.2, 0.75, 0.8])
+        );
+        assert_eq!(
+            &navigator.bytes,
+            &uniform_bytes(CompareShaderMode::Wipe, 0.37, [0.0, 0.0, 1.0, 1.0])
+        );
     }
 }

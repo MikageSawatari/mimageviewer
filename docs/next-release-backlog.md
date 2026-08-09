@@ -1035,9 +1035,15 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
 - 実装記録 (2026-08-09、2): 比較中も単一の比較キャンバスを `FullscreenPageLayout` へ登録し、
   ナビゲータの画像矩形へ `zoom_pan=None` で同じ Wipe / Diff callback を再描画する。
   PinnedNormal は準備済み pinned texture を直接描画する。GPU 側の
-  `CompareGpuResources::ensure_pair` は同じ `pair.key` / 寸法なら既存の2 texture・bind groupを
-  再利用するため、2回目の pass に texture upload / mipmap 再生成はなく、uniform write と draw が
-  1回ずつ増える。
+  `CompareGpuResources::ensure_pair` は同じ `pair.key` / 寸法なら既存の2 textureとmip chainを
+  再利用するため、2回目の pass に texture upload / mipmap 再生成はない。
+- 実装追記 (2026-08-09、3): 上記の初期実装は texture と一緒に uniform / bind group まで共有し、
+  1フレーム内で本文の `prepare` が書いた部分UVを、後続するナビゲータの `prepare` の全域UVで
+  上書きしていた。`egui-wgpu` は全callbackの `prepare` 後に全callbackを `paint` するため、本文も
+  ナビゲータ用uniformで描画される退行になった。`CompareShaderSlot::{Main, Navigator}` を追加し、
+  texture / mip chainは従来どおり1組だけ共有しつつ、uniform buffer / bind groupだけをslotごとに
+  分離した。一般則として、**1フレームに同じGPU resourceを使うcallbackを複数出す場合、prepareで
+  callbackごとに変わるGPU状態は共有せず、paintまで生存するper-callback slotへ分ける**。
 
 ### 1.56 ルーペが画像の端で像を引き延ばす — 利用者報告
 
@@ -1180,6 +1186,13 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   uniform へ渡す。テクスチャ採取と Wipe 判定は UV 窓で復元した合成画像座標を使うため、
   白線は引き続き `draw_rect` 基準のまま一致する。ナビゲータは `zoom_pan=None` で
   `visible == draw_rect`、UV 窓 `(0,0)-(1,1)` のため表示を変えない。
+- 実機ログによる残件の真因 (2026-08-09): 上記の `draw_rect` / `visible` / 部分 `uv_window` は
+  正しかったが、§1.55-2で同一フレームに追加されたナビゲータcallbackが、同じ `pair.key` の
+  単一uniform bufferへ全域 `uv_window=(0,0)-(1,1)` を後書きしていた。`egui-wgpu` は全callbackの
+  `prepare`を先に回してから`paint`するため、本文のpaint時点には部分UVが失われ、合成画像全体を
+  クリップ済みcallback矩形へ引き伸ばしていた。本文 / ナビゲータをtyped slotに分け、重いtexture /
+  mip chainは共有したままuniform buffer / bind groupだけを分離した。1フレームに複数callbackを
+  出すときは、prepareで変わるGPU状態をpaintまで共有してはならない。
 
 ### 1.61 見開きでページが 1 枚ダブる (横長ページの寸法をキャッシュ在住に頼っている) — 利用者報告
 

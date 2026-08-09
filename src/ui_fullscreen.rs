@@ -209,6 +209,11 @@ struct CompareShaderShape {
     shape: egui::Shape,
 }
 
+const COMPARE_MAIN_SHADER_SLOT: crate::compare_wgpu::CompareShaderSlot =
+    crate::compare_wgpu::CompareShaderSlot::Main;
+const COMPARE_NAVIGATOR_SHADER_SLOT: crate::compare_wgpu::CompareShaderSlot =
+    crate::compare_wgpu::CompareShaderSlot::Navigator;
+
 #[derive(Clone)]
 struct CompareGeometryLogState {
     frame: u64,
@@ -17352,6 +17357,7 @@ impl App {
                 .as_ref()
                 .and_then(|pair| match mode {
                     crate::app::CompareViewMode::Wipe { fraction } => self.compare_shader_shape(
+                        COMPARE_NAVIGATOR_SHADER_SLOT,
                         layout.content_rect,
                         pair,
                         crate::compare_wgpu::CompareShaderMode::Wipe,
@@ -17360,6 +17366,7 @@ impl App {
                         ctx.pixels_per_point(),
                     ),
                     crate::app::CompareViewMode::Diff => self.compare_shader_shape(
+                        COMPARE_NAVIGATOR_SHADER_SLOT,
                         layout.content_rect,
                         pair,
                         crate::compare_wgpu::CompareShaderMode::Diff,
@@ -22394,6 +22401,7 @@ impl App {
     #[cfg(windows)]
     fn compare_shader_shape(
         &self,
+        slot: crate::compare_wgpu::CompareShaderSlot,
         image_rect: egui::Rect,
         pair: &crate::app::ComparePreparedPair,
         mode: crate::compare_wgpu::CompareShaderMode,
@@ -22410,6 +22418,7 @@ impl App {
         )?;
         let (callback_rect, uv_window) = compare_shader_visible_region(draw_rect, image_rect)?;
         let callback = crate::compare_wgpu::CompareShaderCallback {
+            slot,
             key: pair.key,
             width: pair.target_size[0] as u32,
             height: pair.target_size[1] as u32,
@@ -22435,6 +22444,7 @@ impl App {
     #[cfg(not(windows))]
     fn compare_shader_shape(
         &self,
+        _slot: crate::compare_wgpu::CompareShaderSlot,
         _image_rect: egui::Rect,
         _pair: &crate::app::ComparePreparedPair,
         _mode: crate::compare_wgpu::CompareShaderMode,
@@ -23194,6 +23204,7 @@ impl App {
             .as_ref()
             .and_then(|pair| match mode {
                 crate::app::CompareViewMode::Wipe { fraction } => self.compare_shader_shape(
+                    COMPARE_MAIN_SHADER_SLOT,
                     image_rect,
                     pair,
                     crate::compare_wgpu::CompareShaderMode::Wipe,
@@ -23202,6 +23213,7 @@ impl App {
                     ctx.pixels_per_point(),
                 ),
                 crate::app::CompareViewMode::Diff => self.compare_shader_shape(
+                    COMPARE_MAIN_SHADER_SLOT,
                     image_rect,
                     pair,
                     crate::compare_wgpu::CompareShaderMode::Diff,
@@ -35584,6 +35596,19 @@ mod tests {
             compare_shader_visible_region(navigator_draw, viewport),
             Some((navigator_draw, [0.0, 0.0, 1.0, 1.0]))
         );
+    }
+
+    #[test]
+    fn compare_main_and_navigator_callbacks_use_distinct_shader_slots() {
+        assert_eq!(
+            COMPARE_MAIN_SHADER_SLOT,
+            crate::compare_wgpu::CompareShaderSlot::Main
+        );
+        assert_eq!(
+            COMPARE_NAVIGATOR_SHADER_SLOT,
+            crate::compare_wgpu::CompareShaderSlot::Navigator
+        );
+        assert_ne!(COMPARE_MAIN_SHADER_SLOT, COMPARE_NAVIGATOR_SHADER_SLOT);
     }
 
     #[test]
