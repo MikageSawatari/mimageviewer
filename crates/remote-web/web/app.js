@@ -126,9 +126,19 @@ const PAGE_RESOURCE_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const SESSION_PING_INTERVAL_MS = 30_000;
 const READING_PROGRESS_INTERVAL_MS = 30_000;
 const AI_FOREGROUND_POLL_MS = 500;
+const ARCHIVE_FOREGROUND_POLL_MS = 500;
 const AI_RETRY_DELAYS_MS = Object.freeze([1000, 2000, 5000]);
 const AI_TERMINAL_STATES = new Set([
   "ready",
+  "superseded",
+  "cancelled_by_user",
+  "discarded_by_host",
+  "background_expired",
+  "failed",
+]);
+const ARCHIVE_TERMINAL_STATES = new Set([
+  "ready",
+  "declined_by_user",
   "superseded",
   "cancelled_by_user",
   "discarded_by_host",
@@ -547,6 +557,7 @@ const state = {
   viewer: null,
   commandMenu: null,
   remoteAiController: null,
+  archiveOpenController: null,
   thumbnailNotice: null,
   gridActionNotice: null,
   screenContext: "loading",
@@ -609,12 +620,14 @@ if (!RUNTIME_TEST_MODE) {
     if (document.visibilityState !== "visible") {
       state.remoteSessionUserActive = false;
       state.remoteAiController?.suspend();
+      state.archiveOpenController?.suspend();
     } else if (state.authenticated) {
       if (remoteSessionControlOwner.snapshot.status !== "active") return;
       if (state.viewer?.isVideoStreamViewer) {
         state.viewer.handleVisibilityResume().catch(() => {});
       } else {
         state.remoteAiController?.handleForegroundResume().catch(() => {});
+        state.archiveOpenController?.handleForegroundResume().catch(() => {});
       }
     }
   });
@@ -1988,7 +2001,7 @@ export function resolveMediaOpenRoute(requestedKind, addressedEntry, imageIndex)
 }
 
 export function unsupportedRemoteEntryMessage(kind) {
-  if (kind === "archive") return "この端末ではアーカイブを開けません。";
+  void kind;
   return "";
 }
 
@@ -2023,6 +2036,19 @@ function executeOpenCommand(payload, meta) {
   ) {
     state.gridIndex = payload.entryIndex;
     state.virtualGrid?.selectReturnAnchor(payload.entryIndex);
+  }
+  if (payload.kind === "archive" && payload.address) {
+    state.archiveOpenController?.destroy();
+    const controller = new RemoteArchiveOpenController(
+      app,
+      (listener) => remoteSessionControlOwner.subscribe(listener)
+    );
+    state.archiveOpenController = controller;
+    meta.openRoute = "archive_job";
+    controller
+      .open(payload.address, payload.name || "アーカイブ")
+      .catch((error) => controller.showRequestError(error));
+    return true;
   }
   if (payload.kind === "unsupported") {
     if (!showUnsupportedRemoteEntryNotice(state.gridActionNotice, payload.entryKind)) {
@@ -2208,6 +2234,17 @@ function openGridEntry(index, meta) {
   if (entryIsFolder(entry)) {
     return executeOpenCommand(
       { kind: "folder", path, entryIndex: index },
+      meta
+    );
+  }
+  if (entry.kind === "archive") {
+    return executeOpenCommand(
+      {
+        kind: "archive",
+        address: entryAddress(entry),
+        name: entry.name,
+        entryIndex: index,
+      },
       meta
     );
   }
@@ -2430,6 +2467,8 @@ function cleanupScreen(preserveRequestController = null) {
   state.gestureHelpDialog = null;
   state.remoteAiController?.destroy();
   state.remoteAiController = null;
+  state.archiveOpenController?.destroy();
+  state.archiveOpenController = null;
   state.viewer?.destroy();
   state.viewer = null;
   state.screenContext = "loading";
@@ -3824,7 +3863,8 @@ export async function loadFolder(
       entry.kind === "video" ||
       entry.kind === "audio" ||
       entry.kind === "zip" ||
-      entry.kind === "pdf"
+      entry.kind === "pdf" ||
+      entry.kind === "archive"
   );
   state.images = state.entries.filter((entry) => entry.kind === "image");
   setSinglePageGroups();
@@ -3837,7 +3877,7 @@ export async function loadFolder(
       fetchMs: performance.now() - fetchStartedAt,
       entryCount: state.entries.length,
       containerCount: state.entries.filter((entry) =>
-        ["zip", "pdf"].includes(entry.kind)
+        ["zip", "pdf", "archive"].includes(entry.kind)
       ).length,
     },
     requestController: controller,
@@ -4244,6 +4284,19 @@ export function createGridTile(
           at: performance.now(),
         });
       });
+    } else if (entry.kind === "archive") {
+      tile.addEventListener("click", (event) => {
+        commandDispatcher(command(CommandName.OPEN, {
+          kind: "archive",
+          address: entryAddress(entry),
+          name: entry.name,
+          entryIndex,
+        }), {
+          source: inputSourceFromEvent(event),
+          detail: "grid_tile",
+          at: performance.now(),
+        });
+      });
     } else if (unsupportedRemoteEntryMessage(entry.kind)) {
       tile.addEventListener("click", (event) => {
         commandDispatcher(
@@ -4286,9 +4339,9 @@ export function createGridTile(
   }
   if (detail) label.title = entry.name + " — " + detail;
   tile.append(preview, label);
-  // Audio has no thumbnail source. Keeping it out of the binding also keeps the
-  // virtual grid from issuing a guaranteed-to-fail /api/thumb request.
-  if (entry.kind !== "audio") {
+  // Audio and unopened convertible archives have no thumbnail source. Keeping
+  // them out of the binding avoids guaranteed-to-fail /api/thumb requests.
+  if (entry.kind !== "audio" && entry.kind !== "archive") {
     tile._thumbnailBinding = { image, entry, tracker: thumbnailTracker, cellWidth };
   }
   return tile;
@@ -8892,6 +8945,463 @@ class LocalSettingsDialog {
 
   destroy() {
     this.close(false);
+  }
+}
+
+const REMOTE_ARCHIVE_STATE_LABELS = Object.freeze({
+  waiting_for_local_drain: "PC 側の処理を待っています",
+  inspecting: "アーカイブの内容を確認しています",
+  awaiting_confirmation: "変換の確認を待っています",
+  awaiting_password: "パスワードの入力を待っています",
+  waiting_for_conversion_slot: "変換の開始を待っています",
+  converting: "アーカイブを変換しています",
+  finalizing: "変換結果を確認しています",
+  cancelling: "取り消しています",
+});
+
+function formatArchiveBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes < 1024) return `${Math.floor(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  }
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GiB`;
+}
+
+export function remoteArchiveProgressText(snapshot) {
+  const label = REMOTE_ARCHIVE_STATE_LABELS[snapshot?.state] || "アーカイブを準備しています";
+  const progress = snapshot?.progress;
+  if (!progress) return label;
+  const parts = [label];
+  const done = Math.max(0, Number(progress.files_done) || 0);
+  const total = Math.max(0, Number(progress.files_total) || 0);
+  if (total > 0) parts.push(`${Math.min(done, total)} / ${total} ファイル`);
+  const bytes = Math.max(0, Number(progress.bytes_written) || 0);
+  if (bytes > 0) parts.push(`${formatArchiveBytes(bytes)} 書き込み済み`);
+  return parts.join(" · ");
+}
+
+export function selectRecoverableRemoteArchiveJob(jobs, requestId) {
+  if (!requestId) return null;
+  return (Array.isArray(jobs) ? jobs : [])
+    .filter((job) => job?.request_id === requestId)
+    .sort((left, right) => Number(right.created_unix_ms) - Number(left.created_unix_ms))[0] ?? null;
+}
+
+function remoteArchiveSourceHash(address) {
+  const source = addressIdentity(address);
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  for (let index = 0; index < source.length; index += 1) {
+    const code = source.charCodeAt(index);
+    first = Math.imul(first ^ code, 0x01000193) >>> 0;
+    second = Math.imul(second ^ code, 0x85ebca6b) >>> 0;
+  }
+  return `${first.toString(16).padStart(8, "0")}${second.toString(16).padStart(8, "0")}`;
+}
+
+function createRemoteArchiveRequestId(address) {
+  const unique = globalThis.crypto?.randomUUID?.() ??
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return `miv-archive:${remoteArchiveSourceHash(address)}:${unique}`;
+}
+
+export class RemoteArchiveOpenController {
+  constructor(host, subscribeRemoteSessionState = () => () => {}) {
+    this.host = host;
+    this.address = null;
+    this.requestId = null;
+    this.job = null;
+    this.pollTimer = 0;
+    this.destroyed = false;
+    this.cancelOnDestroy = true;
+    this.remoteSessionState = { blocksInteraction: false };
+    this.previousFocus = document.activeElement;
+
+    this.root = element("div", "archive-open-layer");
+    this.root.setAttribute("role", "presentation");
+    this.panel = element("section", "archive-open-dialog");
+    this.panel.tabIndex = -1;
+    this.panel.setAttribute("role", "dialog");
+    this.panel.setAttribute("aria-modal", "true");
+    this.title = textElement("h2", "アーカイブを開く");
+    this.title.id = "archive-open-title";
+    this.panel.setAttribute("aria-labelledby", this.title.id);
+    this.sourceName = textElement("p", "", "archive-open-source");
+    this.message = textElement("p", "準備しています", "archive-open-message");
+    this.message.setAttribute("role", "status");
+    this.message.setAttribute("aria-live", "polite");
+    this.detail = textElement("p", "", "archive-open-detail");
+    this.progress = element("progress", "archive-open-progress");
+    this.progress.hidden = true;
+    this.actions = element("div", "archive-open-actions");
+    this.panel.append(
+      this.title,
+      this.sourceName,
+      this.message,
+      this.detail,
+      this.progress,
+      this.actions
+    );
+    this.root.append(this.panel);
+    this.root.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      if (this.job && !ARCHIVE_TERMINAL_STATES.has(this.job.state)) {
+        this.requestCancel().catch(() => {});
+      } else {
+        this.close();
+      }
+    });
+    this.host.append(this.root);
+    this.unsubscribeRemoteSessionState = subscribeRemoteSessionState((snapshot) => {
+      this.remoteSessionState = snapshot ?? { blocksInteraction: false };
+      if (this.remoteSessionState.blocksInteraction) {
+        this.clearPoll();
+      } else if (this.job && !ARCHIVE_TERMINAL_STATES.has(this.job.state)) {
+        this.schedulePoll(0);
+      }
+    });
+    queueMicrotask(() => this.panel.focus?.());
+  }
+
+  async open(address, name) {
+    if (this.destroyed) return;
+    this.address = address;
+    this.requestId = createRemoteArchiveRequestId(address);
+    this.sourceName.textContent = name;
+    this.showWorking("アーカイブを準備しています");
+    try {
+      const snapshot = await apiAddressPostJson("/api/archive/jobs", {
+        request_id: this.requestId,
+        source: address,
+      });
+      await this.handleSnapshot(snapshot);
+    } catch (error) {
+      const recovered = await this.recover().catch(() => null);
+      if (recovered) return;
+      throw error;
+    }
+  }
+
+  async recover() {
+    if (!this.requestId) return false;
+    const jobs = await apiJson("/api/archive/jobs", { recoverable: 1 });
+    const recovered = selectRecoverableRemoteArchiveJob(jobs, this.requestId);
+    if (!recovered) return false;
+    if (this.destroyed) {
+      this.cancelSnapshotBestEffort(recovered);
+      return true;
+    }
+    await this.handleSnapshot(recovered);
+    return true;
+  }
+
+  async handleForegroundResume() {
+    if (this.destroyed) return;
+    this.clearPoll();
+    if (await this.recover().catch(() => false)) return;
+    if (this.job && !ARCHIVE_TERMINAL_STATES.has(this.job.state)) {
+      await this.poll();
+    }
+  }
+
+  suspend() {
+    this.clearPoll();
+  }
+
+  async poll() {
+    if (
+      this.destroyed ||
+      !this.job?.job_id ||
+      document.visibilityState === "hidden" ||
+      this.remoteSessionState.blocksInteraction
+    ) return;
+    const snapshot = await apiJson(
+      `/api/archive/jobs/${encodeURIComponent(this.job.job_id)}`
+    );
+    await this.handleSnapshot(snapshot);
+  }
+
+  async handleSnapshot(snapshot) {
+    if (!snapshot?.job_id) return;
+    if (this.destroyed) {
+      this.cancelSnapshotBestEffort(snapshot);
+      return;
+    }
+    this.job = snapshot;
+    this.requestId = snapshot.request_id;
+    this.clearPoll();
+    if (snapshot.state === "ready") {
+      await this.openReady(snapshot);
+      return;
+    }
+    if (ARCHIVE_TERMINAL_STATES.has(snapshot.state)) {
+      this.showTerminal(snapshot);
+      return;
+    }
+    const input = snapshot.awaiting_input;
+    if (input?.kind === "confirmation") {
+      this.showConfirmation(input.summary ?? {});
+      return;
+    }
+    if (input?.kind === "password") {
+      this.showPassword(Boolean(input.bad_password));
+      return;
+    }
+    this.showWorking(remoteArchiveProgressText(snapshot), snapshot.progress);
+    this.showCancelAction();
+    this.schedulePoll(ARCHIVE_FOREGROUND_POLL_MS);
+  }
+
+  showConfirmation(summary) {
+    this.message.textContent = "このアーカイブは変換してから開きます。変換には時間がかかることがあります。";
+    const details = [
+      `画像 ${Math.max(0, Number(summary.image_count) || 0)} 枚`,
+      `展開後 ${formatArchiveBytes(summary.total_uncompressed_bytes)}`,
+    ];
+    const nested = Math.max(0, Number(summary.nested_archive_count) || 0);
+    if (nested > 0) details.push(`入れ子アーカイブ ${nested} 個`);
+    this.detail.textContent = `${details.join(" · ")}。変換後のキャッシュ ZIP は暗号化されません。`;
+    this.progress.hidden = true;
+    const proceed = textElement("button", "変換して開く", "archive-open-primary");
+    proceed.type = "button";
+    proceed.addEventListener("click", () => {
+      this.submitConfirmation(true).catch((error) => this.showRequestError(error));
+    });
+    const decline = textElement("button", "開かない");
+    decline.type = "button";
+    decline.addEventListener("click", () => {
+      this.submitConfirmation(false).catch((error) => this.showRequestError(error));
+    });
+    this.actions.replaceChildren(decline, proceed);
+    queueMicrotask(() => proceed.focus());
+  }
+
+  showPassword(badPassword) {
+    this.message.textContent = badPassword
+      ? "パスワードが違います。もう一度入力してください。"
+      : "この RAR を開くにはパスワードが必要です。";
+    this.detail.textContent = "パスワードはこの送信にだけ使い、ジョブ状態・URL・ログには残しません。変換したキャッシュ ZIP は暗号化されません。";
+    this.progress.hidden = true;
+    const form = element("form", "archive-open-password-form");
+    const input = element("input", "archive-open-password");
+    input.type = "password";
+    input.autocomplete = "off";
+    input.required = true;
+    input.maxLength = 1024;
+    input.setAttribute("aria-label", "アーカイブのパスワード");
+    const submit = textElement("button", "送信", "archive-open-primary");
+    submit.type = "submit";
+    const cancel = textElement("button", "中止");
+    cancel.type = "button";
+    cancel.addEventListener("click", () => {
+      input.value = "";
+      this.requestCancel().catch((error) => this.showRequestError(error));
+    });
+    form.append(input, cancel, submit);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const password = input.value;
+      input.value = "";
+      if (!password) return;
+      submit.disabled = true;
+      this.submitPassword(password).catch((error) => this.showRequestError(error));
+    });
+    this.actions.replaceChildren(form);
+    queueMicrotask(() => input.focus());
+  }
+
+  async submitConfirmation(proceed) {
+    if (!this.job?.job_id) return;
+    this.showWorking(proceed ? "変換を開始します" : "変換を取りやめています");
+    this.actions.replaceChildren();
+    const snapshot = await apiPostJson(
+      `/api/archive/jobs/${encodeURIComponent(this.job.job_id)}/confirm`,
+      { proceed }
+    );
+    await this.handleSnapshot(snapshot);
+  }
+
+  async submitPassword(password) {
+    if (!this.job?.job_id) return;
+    this.showWorking("パスワードを確認しています");
+    this.actions.replaceChildren();
+    const snapshot = await apiPostJson(
+      `/api/archive/jobs/${encodeURIComponent(this.job.job_id)}/password`,
+      { password }
+    );
+    password = "";
+    await this.handleSnapshot(snapshot);
+  }
+
+  async requestCancel() {
+    if (!this.job?.job_id || ARCHIVE_TERMINAL_STATES.has(this.job.state)) {
+      this.close();
+      return;
+    }
+    this.showWorking("取り消しています");
+    this.actions.replaceChildren();
+    const response = await observedFetch(
+      `/api/archive/jobs/${encodeURIComponent(this.job.job_id)}`,
+      {
+        method: "DELETE",
+        credentials: "same-origin",
+        headers: remoteHeaders({ Accept: "application/json" }),
+      }
+    );
+    if (!response.ok) {
+      const detail = await response.clone().json().catch(() => ({}));
+      throw new Error(detail.message || "アーカイブ操作を取り消せませんでした。");
+    }
+    await this.handleSnapshot(await response.json());
+  }
+
+  async openReady(snapshot) {
+    this.showWorking("アーカイブを開いています");
+    this.actions.replaceChildren();
+    const result = await apiJson(
+      `/api/archive/jobs/${encodeURIComponent(snapshot.job_id)}/result`
+    );
+    if (this.destroyed) return;
+    if (
+      !result?.source ||
+      addressIdentity(result.source) !== addressIdentity(this.address)
+    ) {
+      throw new Error("準備したアーカイブの公開アドレスを確認できませんでした。");
+    }
+    this.cancelOnDestroy = false;
+    this.close(false);
+    navigate(containerHash(result.source));
+  }
+
+  showWorking(message, progress = null) {
+    if (this.destroyed) return;
+    this.root.classList.remove("is-error");
+    this.message.textContent = message;
+    this.detail.textContent = "";
+    const total = Math.max(0, Number(progress?.files_total) || 0);
+    const done = Math.max(0, Number(progress?.files_done) || 0);
+    this.progress.hidden = total <= 0;
+    if (total > 0) {
+      this.progress.max = total;
+      this.progress.value = Math.min(done, total);
+    }
+  }
+
+  showCancelAction() {
+    const cancel = textElement("button", "中止");
+    cancel.type = "button";
+    cancel.addEventListener("click", () => {
+      this.requestCancel().catch((error) => this.showRequestError(error));
+    });
+    this.actions.replaceChildren(cancel);
+  }
+
+  showTerminal(snapshot) {
+    this.cancelOnDestroy = false;
+    this.progress.hidden = true;
+    this.message.textContent = snapshot.terminal?.message || (
+      snapshot.state === "declined_by_user"
+        ? "変換しませんでした。"
+        : "アーカイブ操作を完了できませんでした。"
+    );
+    this.detail.textContent = "";
+    this.root.classList.toggle("is-error", snapshot.state === "failed");
+    const close = textElement("button", "閉じる", "archive-open-primary");
+    close.type = "button";
+    close.addEventListener("click", () => this.close());
+    this.actions.replaceChildren(close);
+    queueMicrotask(() => close.focus());
+  }
+
+  showRequestError(error) {
+    if (this.destroyed || error?.name === "AbortError") return;
+    this.clearPoll();
+    this.root.classList.add("is-error");
+    this.message.textContent = error instanceof Error
+      ? error.message
+      : "アーカイブ操作を続けられませんでした。";
+    this.detail.textContent = "";
+    this.progress.hidden = true;
+    const close = textElement("button", "閉じる", "archive-open-primary");
+    close.type = "button";
+    close.addEventListener("click", () => this.close());
+    this.actions.replaceChildren(close);
+  }
+
+  schedulePoll(delay) {
+    this.clearPoll();
+    if (
+      this.destroyed ||
+      document.visibilityState === "hidden" ||
+      this.remoteSessionState.blocksInteraction
+    ) return;
+    this.pollTimer = window.setTimeout(() => {
+      this.pollTimer = 0;
+      this.poll().catch((error) => {
+        if (this.destroyed) return;
+        if (
+          error instanceof AuthenticationRequiredError ||
+          (Number.isFinite(Number(error?.status)) && Number(error.status) < 500)
+        ) {
+          this.showRequestError(error);
+          return;
+        }
+        this.showWorking("接続を確認しています");
+        this.showCancelAction();
+        this.schedulePoll(Math.max(1000, ARCHIVE_FOREGROUND_POLL_MS));
+      });
+    }, delay);
+  }
+
+  clearPoll() {
+    clearTimeout(this.pollTimer);
+    this.pollTimer = 0;
+  }
+
+  cancelSnapshotBestEffort(snapshot) {
+    if (!snapshot?.job_id || ARCHIVE_TERMINAL_STATES.has(snapshot.state)) return;
+    observedFetch(
+      "/api/archive/jobs/" + encodeURIComponent(snapshot.job_id),
+      {
+        method: "DELETE",
+        credentials: "same-origin",
+        headers: remoteHeaders({ Accept: "application/json" }),
+      }
+    ).catch(() => {});
+  }
+
+  close(restoreFocus = true) {
+    if (this.job && ARCHIVE_TERMINAL_STATES.has(this.job.state)) {
+      this.cancelOnDestroy = false;
+    }
+    const previousFocus = this.previousFocus;
+    this.destroy();
+    if (restoreFocus && previousFocus instanceof HTMLElement) {
+      previousFocus.focus({ preventScroll: true });
+    }
+  }
+
+  destroy() {
+    if (this.destroyed) return;
+    const activeJobId = this.cancelOnDestroy && this.job &&
+      !ARCHIVE_TERMINAL_STATES.has(this.job.state)
+      ? this.job.job_id
+      : null;
+    this.destroyed = true;
+    this.clearPoll();
+    this.unsubscribeRemoteSessionState?.();
+    this.root.remove();
+    if (state.archiveOpenController === this) state.archiveOpenController = null;
+    if (activeJobId) {
+      observedFetch(`/api/archive/jobs/${encodeURIComponent(activeJobId)}`, {
+        method: "DELETE",
+        credentials: "same-origin",
+        headers: remoteHeaders({ Accept: "application/json" }),
+      }).catch(() => {});
+    }
   }
 }
 

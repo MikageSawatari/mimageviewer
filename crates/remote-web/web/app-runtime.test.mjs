@@ -141,6 +141,7 @@ const {
   parseRoute,
   reloadApplication,
   renderResolvedMediaOpen,
+  remoteArchiveProgressText,
   remoteAiCompletionMessage,
   remoteAiProgressText,
   remoteAiPollingDelay,
@@ -150,6 +151,7 @@ const {
   resolveLegacyImageOpenRoute,
   resolveMediaOpenRoute,
   selectRecoverableRemoteAiJob,
+  selectRecoverableRemoteArchiveJob,
   setViewTrimSpreadSeparate,
   setRuntimeTestErrorObserver,
   showUnsupportedRemoteEntryNotice,
@@ -1008,6 +1010,36 @@ test("AI progress shows only server counters and never invents a percentage", ()
   );
 });
 
+test("archive progress uses only monotonic core counters and no invented percentage", () => {
+  const text = remoteArchiveProgressText({
+    state: "converting",
+    progress: {
+      files_done: 7,
+      files_total: 20,
+      bytes_written: 3 * 1024 * 1024,
+    },
+  });
+  assert.equal(text, "アーカイブを変換しています · 7 / 20 ファイル · 3.0 MiB 書き込み済み");
+  assert.equal(text.includes("%"), false);
+  assert.equal(
+    remoteArchiveProgressText({ state: "waiting_for_local_drain" }),
+    "PC 側の処理を待っています"
+  );
+});
+
+test("archive recovery requires the exact idempotency request id", () => {
+  const jobs = [
+    { request_id: "miv-archive:a:old", created_unix_ms: 10 },
+    { request_id: "miv-archive:a:current", created_unix_ms: 20 },
+    { request_id: "miv-archive:a:current", created_unix_ms: 30 },
+  ];
+  assert.equal(
+    selectRecoverableRemoteArchiveJob(jobs, "miv-archive:a:current")?.created_unix_ms,
+    30
+  );
+  assert.equal(selectRecoverableRemoteArchiveJob(jobs, "missing"), null);
+});
+
 test("AI recovery prefers the exact request and otherwise only resumes a running group", () => {
   const jobs = [
     { request_id: "miv-ai:group:old", state: "ready", created_unix_ms: 30 },
@@ -1429,7 +1461,7 @@ test("resolved audio and video opens enter the media viewer instead of the image
   assert.equal(isStreamMediaKind("archive"), false);
 });
 
-test("tapping an archive grid tile shows the same shared unsupported notice route", () => {
+test("tapping an archive grid tile starts the archive job route without a thumbnail request", () => {
   const address = {
     path: testPath("books/book.rar"),
     subresource: { kind: "file" },
@@ -1448,19 +1480,17 @@ test("tapping an archive grid tile shows the same shared unsupported notice rout
 
   assert.equal(dispatched.length, 1);
   assert.deepEqual(dispatched[0].requested.payload, {
-    kind: "unsupported",
-    entryKind: "archive",
+    kind: "archive",
+    address,
+    name: "book.rar",
     entryIndex: 3,
   });
-  assert.equal(
-    unsupportedRemoteEntryMessage("archive"),
-    "この端末ではアーカイブを開けません。"
-  );
+  assert.equal(tile._thumbnailBinding, undefined);
+  assert.equal(unsupportedRemoteEntryMessage("archive"), "");
   const notice = new FakeElement("p");
   notice.hidden = true;
-  assert.equal(showUnsupportedRemoteEntryNotice(notice, "archive"), true);
-  assert.equal(notice.hidden, false);
-  assert.equal(notice.textContent, "この端末ではアーカイブを開けません。");
+  assert.equal(showUnsupportedRemoteEntryNotice(notice, "archive"), false);
+  assert.equal(notice.hidden, true);
 });
 
 test("image viewer applies seek direction to the native range control", () => {

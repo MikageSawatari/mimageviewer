@@ -323,6 +323,19 @@ pub fn inspect_for_direct_read_cancelable(
     Ok(inspection)
 }
 
+#[cfg(test)]
+pub(crate) fn direct_read_test_fixture_bytes() -> Vec<u8> {
+    use base64::Engine as _;
+
+    // Tiny non-solid RAR with two distinct PNG payloads whose stored names are both page.png.
+    // Keep the fixture in one place so executor tests exercise the same header-backed path.
+    base64::engine::general_purpose::STANDARD
+        .decode(
+            "UmFyIRoHAQAzkrXlCgEFBgAFAQGAgABdyPuwJAIDC6UBBKUBIL8JEzuAAAAIcGFnZS5wbmcKAwKX0YuaNf3cAYlQTkcNChoKAAAADUlIRFIAAABAAAAAMAgCAAAALinrSAAAAGxJREFUeJztz7EJgDAAAEEMYiGW7j9mCgtxjCP48APcb+8z9+tetzGOc+28oAEtaEALGtCCBrSgAS1oQAsa0IIGtKABLWhACxrQgga0oAEtaEALGtCCBrSgAS1oQAsa0IIGtKABLWhAC34+8AHOE9+qokthcQAAAABJRU5ErkJggo4TMhYkAgMLvAEEvAEgRG2V/YAAAAhwYWdlLnBuZwoDAgoki5o1/dwBiVBORw0KGgoAAAANSUhEUgAAAEAAAAAwCAIAAAAuKetIAAAAC3RFWHRwYXJhbWV0ZXJzAAmqaREAAABsSURBVHic7c+xCYAwAABBDGIhli6YeR3I1jGO4MMPcL89892ve93GOM6184IGtKABLWhACxrQgga0oAEtaEALGtCCBrSgAS1oQAsa0IIGtKABLWhACxrQgga0oAEtaEALGtCCBrSgAS34+cAHG8He3/HxQZMAAAAASUVORK5CYIIdd1ZRAwUEAA==",
+        )
+        .expect("embedded direct-read RAR fixture")
+}
+
 fn check_inspection_cancel(cancel: &AtomicBool) -> io::Result<()> {
     if cancel.load(Ordering::Relaxed) {
         Err(io::Error::new(
@@ -463,15 +476,7 @@ mod tests {
 
     #[test]
     fn duplicate_rar_entry_names_are_unique_and_read_the_matching_header() {
-        use base64::Engine;
-
-        // Tiny non-solid RAR with two distinct PNG payloads whose stored names are both page.png.
-        // The fixture is embedded so the test does not require rar.exe at runtime.
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(
-                "UmFyIRoHAQAzkrXlCgEFBgAFAQGAgABdyPuwJAIDC6UBBKUBIL8JEzuAAAAIcGFnZS5wbmcKAwKX0YuaNf3cAYlQTkcNChoKAAAADUlIRFIAAABAAAAAMAgCAAAALinrSAAAAGxJREFUeJztz7EJgDAAAEEMYiGW7j9mCgtxjCP48APcb+8z9+tetzGOc+28oAEtaEALGtCCBrSgAS1oQAsa0IIGtKABLWhACxrQgga0oAEtaEALGtCCBrSgAS1oQAsa0IIGtKABLWhAC34+8AHOE9+qokthcQAAAABJRU5ErkJggo4TMhYkAgMLvAEEvAEgRG2V/YAAAAhwYWdlLnBuZwoDAgoki5o1/dwBiVBORw0KGgoAAAANSUhEUgAAAEAAAAAwCAIAAAAuKetIAAAAC3RFWHRwYXJhbWV0ZXJzAAmqaREAAABsSURBVHic7c+xCYAwAABBDGIhli6YeR3I1jGO4MMPcL89892ve93GOM6184IGtKABLWhACxrQgga0oAEtaEALGtCCBrSgAS1oQAsa0IIGtKABLWhACxrQgga0oAEtaEALGtCCBrSgAS34+cAHG8He3/HxQZMAAAAASUVORK5CYIIdd1ZRAwUEAA==",
-            )
-            .unwrap();
+        let bytes = direct_read_test_fixture_bytes();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("duplicate-names.rar");
         std::fs::write(&path, bytes).unwrap();

@@ -12,19 +12,24 @@ use mimageviewer_ipc::{
     FolderListPayload, FolderListRequest, FolderListResponse, FrameError, HomePayload, HomeRequest,
     HomeResponse, MAX_CONTROL_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, MediaError, MediaErrorCode,
     PIPE_NAME, PROTOCOL_VERSION, PagePayload, PagePriority, PageRequest, PageResponse,
-    REMOTE_AI_START_ACCEPT_BUDGET, RemoteAddress, RemoteAiCancelResponse, RemoteAiJobError,
-    RemoteAiJobSnapshot, RemoteAiRecoverableResponse, RemoteAiResultResponse, RemoteAiStartRequest,
-    RemoteAiStartResponse, RemoteAiStateResponse, RemotePageRenderContext, RemoteSessionIdentity,
-    RemoteWebConnectionInfo, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest,
-    RemoteWriteResponse, RemoteWriteResult, RequestId, ServerMessage, SessionAcquireRequest,
-    SessionPeerInfo, SessionPingRequest, SessionResponse, SessionStatus, TagBrowsePayload,
-    TagBrowseRequest, TagBrowseResponse, TagItemsPayload, TagItemsRequest, TagItemsResponse,
-    ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse,
-    VIDEO_STREAM_START_BUDGET, VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode,
-    VideoStreamJumpListPayload, VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind,
-    VideoStreamPlaylistPayload, VideoStreamQuality, VideoStreamResult, VideoStreamSeekPayload,
-    VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamStartPayload,
-    VideoStreamStatePayload, VideoStreamThumbnailPayload, read_frame, write_frame,
+    REMOTE_AI_START_ACCEPT_BUDGET, REMOTE_ARCHIVE_START_ACCEPT_BUDGET, RemoteAddress,
+    RemoteAiCancelResponse, RemoteAiJobError, RemoteAiJobSnapshot, RemoteAiRecoverableResponse,
+    RemoteAiResultResponse, RemoteAiStartRequest, RemoteAiStartResponse, RemoteAiStateResponse,
+    RemoteArchiveCancelResponse, RemoteArchiveConfirmRequest, RemoteArchiveInputResponse,
+    RemoteArchiveJobError, RemoteArchiveJobSnapshot, RemoteArchiveOpenResult,
+    RemoteArchivePasswordRequest, RemoteArchiveRecoverableResponse, RemoteArchiveResultResponse,
+    RemoteArchiveStartRequest, RemoteArchiveStartResponse, RemoteArchiveStateResponse,
+    RemotePageRenderContext, RemoteSessionIdentity, RemoteWebConnectionInfo, RemoteWriteError,
+    RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult, RequestId,
+    ServerMessage, SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionResponse,
+    SessionStatus, TagBrowsePayload, TagBrowseRequest, TagBrowseResponse, TagItemsPayload,
+    TagItemsRequest, TagItemsResponse, ThumbnailError, ThumbnailErrorCode, ThumbnailRequest,
+    ThumbnailResponse, VIDEO_STREAM_START_BUDGET, VideoStreamControlAction, VideoStreamError,
+    VideoStreamErrorCode, VideoStreamJumpListPayload, VideoStreamJumpThumbnailPayload,
+    VideoStreamPlaylistKind, VideoStreamPlaylistPayload, VideoStreamQuality, VideoStreamResult,
+    VideoStreamSeekPayload, VideoStreamSegmentIndex, VideoStreamSegmentPayload,
+    VideoStreamStartPayload, VideoStreamStatePayload, VideoStreamThumbnailPayload, read_frame,
+    write_frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -134,6 +139,7 @@ pub enum ClientError {
     SessionRemote(SessionResponse),
     VideoStreamRemote(VideoStreamError),
     RemoteAi(RemoteAiJobError),
+    RemoteArchive(RemoteArchiveJobError),
 }
 
 impl ClientError {
@@ -197,6 +203,9 @@ impl ClientError {
             .to_owned(),
             Self::VideoStreamRemote(error) => format!("miv_video_{:?}", error.code).to_lowercase(),
             Self::RemoteAi(error) => format!("miv_remote_ai_{:?}", error.code).to_lowercase(),
+            Self::RemoteArchive(error) => {
+                format!("miv_remote_archive_{:?}", error.code).to_lowercase()
+            }
         }
     }
 
@@ -247,6 +256,13 @@ impl fmt::Display for ClientError {
                 write!(
                     f,
                     "mIV 本体が remote AI 要求を拒否しました: {}",
+                    error.message
+                )
+            }
+            Self::RemoteArchive(error) => {
+                write!(
+                    f,
+                    "mIV 本体が remote archive 要求を拒否しました: {}",
                     error.message
                 )
             }
@@ -946,6 +962,193 @@ impl ThumbnailClient {
                 }),
                 Err(error) => Err(ClientFailure {
                     error: ClientError::RemoteAi(error),
+                    retry_count: success.retry_count,
+                    retry_statuses: success.retry_statuses,
+                }),
+            }
+        })
+    }
+
+    pub fn remote_archive_start(
+        &self,
+        owner: &RemoteSessionIdentity,
+        request: RemoteArchiveStartRequest,
+    ) -> Result<IpcSuccess<RemoteArchiveJobSnapshot>, ClientFailure> {
+        let accept_before_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .saturating_add(REMOTE_ARCHIVE_START_ACCEPT_BUDGET)
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        self.remote_archive_request(
+            |id| ClientMessage::RemoteArchiveStart {
+                id,
+                owner: owner.clone(),
+                request: request.clone(),
+                accept_before_unix_ms,
+            },
+            |message| match message {
+                ServerMessage::RemoteArchiveStart { response, .. } => Some(match response {
+                    RemoteArchiveStartResponse::Accepted(snapshot) => Ok(snapshot),
+                    RemoteArchiveStartResponse::Error(error) => Err(error),
+                }),
+                _ => None,
+            },
+        )
+    }
+
+    pub fn remote_archive_state(
+        &self,
+        owner: &RemoteSessionIdentity,
+        job_id: &str,
+    ) -> Result<IpcSuccess<RemoteArchiveJobSnapshot>, ClientFailure> {
+        self.remote_archive_request(
+            |id| ClientMessage::RemoteArchiveState {
+                id,
+                owner: owner.clone(),
+                job_id: job_id.to_owned(),
+            },
+            |message| match message {
+                ServerMessage::RemoteArchiveState { response, .. } => Some(match response {
+                    RemoteArchiveStateResponse::Success(snapshot) => Ok(snapshot),
+                    RemoteArchiveStateResponse::Error(error) => Err(error),
+                }),
+                _ => None,
+            },
+        )
+    }
+
+    pub fn remote_archive_recoverable(
+        &self,
+        owner: &RemoteSessionIdentity,
+    ) -> Result<IpcSuccess<Vec<RemoteArchiveJobSnapshot>>, ClientFailure> {
+        self.remote_archive_request(
+            |id| ClientMessage::RemoteArchiveRecoverable {
+                id,
+                owner: owner.clone(),
+            },
+            |message| match message {
+                ServerMessage::RemoteArchiveRecoverable { response, .. } => Some(match response {
+                    RemoteArchiveRecoverableResponse::Success(snapshots) => Ok(snapshots),
+                    RemoteArchiveRecoverableResponse::Error(error) => Err(error),
+                }),
+                _ => None,
+            },
+        )
+    }
+
+    pub fn remote_archive_cancel(
+        &self,
+        owner: &RemoteSessionIdentity,
+        job_id: &str,
+    ) -> Result<IpcSuccess<RemoteArchiveJobSnapshot>, ClientFailure> {
+        self.remote_archive_request(
+            |id| ClientMessage::RemoteArchiveCancel {
+                id,
+                owner: owner.clone(),
+                job_id: job_id.to_owned(),
+            },
+            |message| match message {
+                ServerMessage::RemoteArchiveCancel { response, .. } => Some(match response {
+                    RemoteArchiveCancelResponse::Success(snapshot) => Ok(snapshot),
+                    RemoteArchiveCancelResponse::Error(error) => Err(error),
+                }),
+                _ => None,
+            },
+        )
+    }
+
+    pub fn remote_archive_confirm(
+        &self,
+        owner: &RemoteSessionIdentity,
+        request: RemoteArchiveConfirmRequest,
+    ) -> Result<IpcSuccess<RemoteArchiveJobSnapshot>, ClientFailure> {
+        self.remote_archive_request(
+            |id| ClientMessage::RemoteArchiveConfirm {
+                id,
+                owner: owner.clone(),
+                request: request.clone(),
+            },
+            |message| match message {
+                ServerMessage::RemoteArchiveConfirm { response, .. } => Some(match response {
+                    RemoteArchiveInputResponse::Success(snapshot) => Ok(snapshot),
+                    RemoteArchiveInputResponse::Error(error) => Err(error),
+                }),
+                _ => None,
+            },
+        )
+    }
+
+    pub fn remote_archive_password(
+        &self,
+        owner: &RemoteSessionIdentity,
+        request: RemoteArchivePasswordRequest,
+    ) -> Result<IpcSuccess<RemoteArchiveJobSnapshot>, ClientFailure> {
+        self.remote_archive_request(
+            |id| ClientMessage::RemoteArchivePassword {
+                id,
+                owner: owner.clone(),
+                request: request.clone(),
+            },
+            |message| match message {
+                ServerMessage::RemoteArchivePassword { response, .. } => Some(match response {
+                    RemoteArchiveInputResponse::Success(snapshot) => Ok(snapshot),
+                    RemoteArchiveInputResponse::Error(error) => Err(error),
+                }),
+                _ => None,
+            },
+        )
+    }
+
+    pub fn remote_archive_result(
+        &self,
+        owner: &RemoteSessionIdentity,
+        job_id: &str,
+    ) -> Result<IpcSuccess<RemoteArchiveOpenResult>, ClientFailure> {
+        self.remote_archive_request(
+            |id| ClientMessage::RemoteArchiveResult {
+                id,
+                owner: owner.clone(),
+                job_id: job_id.to_owned(),
+            },
+            |message| match message {
+                ServerMessage::RemoteArchiveResult { response, .. } => Some(match response {
+                    RemoteArchiveResultResponse::Success(result) => Ok(result),
+                    RemoteArchiveResultResponse::Error(error) => Err(error),
+                }),
+                _ => None,
+            },
+        )
+    }
+
+    fn remote_archive_request<T>(
+        &self,
+        request: impl Fn(RequestId) -> ClientMessage,
+        response: impl Fn(ServerMessage) -> Option<Result<T, RemoteArchiveJobError>>,
+    ) -> Result<IpcSuccess<T>, ClientFailure> {
+        self.collection_request(request).and_then(|success| {
+            let Some(routed) = response(success.value) else {
+                return Err(ClientFailure {
+                    error: ClientError::Protocol(protocol_failure(
+                        "response_route",
+                        "response_type_mismatch",
+                        None,
+                        "remote archive request received another response type",
+                    )),
+                    retry_count: success.retry_count,
+                    retry_statuses: success.retry_statuses,
+                });
+            };
+            match routed {
+                Ok(value) => Ok(IpcSuccess {
+                    value,
+                    retry_count: success.retry_count,
+                    retry_statuses: success.retry_statuses,
+                    connection_id: success.connection_id,
+                }),
+                Err(error) => Err(ClientFailure {
+                    error: ClientError::RemoteArchive(error),
                     retry_count: success.retry_count,
                     retry_statuses: success.retry_statuses,
                 }),

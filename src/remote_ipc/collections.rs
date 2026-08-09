@@ -354,7 +354,12 @@ impl CollectionEngine {
         let key_scan_limit = tag_item_key_scan_limit(request.kind);
         let item_keys =
             crate::tag_view::select_tag_view_item_keys(db, request.tag.trim(), key_scan_limit + 1);
-        let (entries, truncated) = map_tag_item_keys(item_keys, request.kind, key_scan_limit);
+        let (entries, truncated) = map_tag_item_keys(
+            item_keys,
+            request.kind,
+            key_scan_limit,
+            !settings.archive_file_handling_ignores_convertible(),
+        );
         Ok(TagItemsPayload {
             listing: self.tag_items_listing(settings, sort_order, entries, truncated),
             state: TagIndexState::Ready,
@@ -650,7 +655,12 @@ impl CollectionEngine {
         sort_order: crate::settings::SortOrder,
         locked_reason: Option<&str>,
     ) -> Result<CollectionPayload, CollectionError> {
-        let entries = to_remote_entries(candidates);
+        let entries = to_remote_entries(
+            candidates
+                .into_iter()
+                .filter(|candidate| include_collection_candidate(settings, candidate))
+                .collect(),
+        );
         let (mut entries, truncated) = bound_remote_entries(entries);
         super::RemoteThumbnailSources::for_remote_entries(settings, &entries)
             .populate_remote_entries(&mut entries);
@@ -762,10 +772,16 @@ fn candidate_from_tag_item_key(key: String, filter: TagItemKind) -> Option<Candi
     })
 }
 
+fn include_collection_candidate(settings: &Settings, candidate: &CandidateEntry) -> bool {
+    candidate.kind != RemoteEntryKind::Archive
+        || !settings.archive_file_handling_ignores_convertible()
+}
+
 fn map_tag_item_keys(
     item_keys: Vec<String>,
     filter: TagItemKind,
     key_scan_limit: usize,
+    include_archives: bool,
 ) -> (Vec<RemoteEntry>, bool) {
     let key_limit_reached = item_keys.len() > key_scan_limit;
     let mut entries = Vec::with_capacity(MAX_REMOTE_COLLECTION_ENTRIES + 1);
@@ -773,6 +789,9 @@ fn map_tag_item_keys(
         let Some(candidate) = candidate_from_tag_item_key(key, filter) else {
             continue;
         };
+        if !include_archives && candidate.kind == RemoteEntryKind::Archive {
+            continue;
+        }
         entries.push(remote_entry_from_candidate(candidate));
         if entries.len() > MAX_REMOTE_COLLECTION_ENTRIES {
             break;
@@ -1282,6 +1301,69 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_ignore_hides_other_archive_bookmark_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("bookmark.7z");
+        let image = temp.path().join("page.jpg");
+        std::fs::write(&archive, b"archive").unwrap();
+        std::fs::write(&image, b"image").unwrap();
+        let candidates = || {
+            vec![
+                CandidateEntry {
+                    path: archive.clone(),
+                    name: "bookmark.7z".to_owned(),
+                    kind: RemoteEntryKind::Archive,
+                    detail: None,
+                    progress_current: Some(1),
+                    progress_total: None,
+                    rating: None,
+                },
+                CandidateEntry {
+                    path: image.clone(),
+                    name: "page.jpg".to_owned(),
+                    kind: RemoteEntryKind::Image,
+                    detail: None,
+                    progress_current: None,
+                    progress_total: None,
+                    rating: None,
+                },
+            ]
+        };
+        let mut settings = Settings::default();
+        settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+        let engine = CollectionEngine::new(settings.clone());
+        let ignored = engine
+            .payload(
+                &settings,
+                "bookmarks",
+                candidates(),
+                settings.sort_order,
+                None,
+            )
+            .unwrap();
+        assert_eq!(ignored.entries.len(), 1);
+        assert_eq!(ignored.entries[0].kind, RemoteEntryKind::Image);
+
+        settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+        let included = engine
+            .payload(
+                &settings,
+                "bookmarks",
+                candidates(),
+                settings.sort_order,
+                None,
+            )
+            .unwrap();
+        assert_eq!(included.entries.len(), 2);
+        assert!(
+            included
+                .entries
+                .iter()
+                .any(|entry| entry.kind == RemoteEntryKind::Archive)
+        );
+    }
+
+    #[test]
     fn aggregate_payload_assigns_same_folder_sidecar_without_removing_it() {
         let temp = tempfile::tempdir().unwrap();
         let video = temp.path().join("clip.mp4");
@@ -1660,10 +1742,36 @@ mod tests {
             item_keys,
             TagItemKind::All,
             crate::tag_view::TAG_VIEW_RESULT_LIMIT,
+            true,
         );
 
         assert_eq!(entries.len(), MAX_REMOTE_COLLECTION_ENTRIES);
         assert!(truncated);
+    }
+
+    #[test]
+    fn tag_item_mapping_honors_archive_ignore_without_an_extra_settings_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("tagged.7z");
+        std::fs::write(&archive, b"archive").unwrap();
+        let key = crate::tags_db::item_key_for_path(&archive);
+
+        let (ignored, _) = map_tag_item_keys(
+            vec![key.clone()],
+            TagItemKind::All,
+            crate::tag_view::TAG_VIEW_RESULT_LIMIT,
+            false,
+        );
+        let (included, _) = map_tag_item_keys(
+            vec![key],
+            TagItemKind::All,
+            crate::tag_view::TAG_VIEW_RESULT_LIMIT,
+            true,
+        );
+
+        assert!(ignored.is_empty());
+        assert_eq!(included.len(), 1);
+        assert_eq!(included[0].kind, RemoteEntryKind::Archive);
     }
 
     #[test]
@@ -1684,6 +1792,7 @@ mod tests {
             item_keys,
             TagItemKind::Image,
             crate::tag_view::TAG_VIEW_FILTERED_KEY_SCAN_LIMIT,
+            true,
         );
 
         assert_eq!(entries.len(), 1);

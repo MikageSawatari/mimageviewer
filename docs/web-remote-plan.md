@@ -1568,6 +1568,9 @@ archive cache は App が起動時に開いた `Option<Arc<ArchiveCacheDb>>` を
 境界から注入する。リモート側で DB を開き直さず、ローカル変換・cache maintenance と同じ
 `begin_convert()` lock を使う。DB 初期化失敗の `None` でも直接読み可能な RAR は開けるが、変換が
 必要な形式は確認前に `CacheUnavailable` で明示的に終端し、unwrap や無言の no-op にしない。
+Windows では canonical path が `\\?\` prefix 付きになるため、共有 DB の lookup / reserve / record の
+source key は通常表記の `ResolvedPath.logical` に統一し、fingerprint と converter の filesystem I/O
+だけに `ResolvedPath.canonical` を使う。これにより本体と remote が同じ cache record を参照する。
 
 公開 identity は利用者が選んだ元 archive の `RemoteAddress` のまま保持する。実際の読み込み先は
 core 内だけの `DirectRar { resolved_path }` または
@@ -1593,8 +1596,28 @@ owner 終端を優先する。
 `begin_convert()` 待ちは snapshot の `WaitingForConversionSlot` で識別でき、drain が 3 秒を超えた場合は
 reason、elapsed、App drain 完了、operation / streaming worker 数をログし、その後 10 秒ごとに再記録する。
 パスやパスワードはこの診断へ含めない。変換進捗は job 内の high-water 値で単調性を保つ。
-HTTP endpoint、Ask / password / progress UI、archive 一覧の
-公開と prepared backing を container 読み込みへ接続する作業は C-2 として残す。
+C-2 では `/api/archive/jobs` 以下を remote-web へ接続した。HTTP worker が行うのは start / state /
+recoverable / cancel / confirm / password / result の短い IPC だけで、検査・変換を同期実行しない。
+Web は Ask のときだけ画像数・展開後サイズ・入れ子数を示して確認し、Convert は確認を挟まず、
+直接読み可能な RAR と fingerprint が一致する既存 cache はどちらの設定でも確認なしで開く。変換中は
+Core snapshot の files done / total と bytes written だけを表示して推定 percentage を作らず、中止は
+archive job の cancel へ送る。password は専用 modal から POST body にだけ置き、送信直後に input を
+空にする。変換 cache ZIP が暗号化されないことも確認・password 画面で明示する。
+
+`result` の取得を、session 内の公開元 address → Core-only backing の登録境界にした。ここでは
+filesystem I/O を行わず、以後の
+container / page / thumbnail / metadata / write は元 archive address のままで、`ContainerEngine` の
+resolve が最初の読み込み時に fingerprint と backing の実在を再検証してから Direct RAR または
+cache ZIP へ差し替える。identity、履歴、resume、bookmark、
+補正・編集 DB key、catalog の所有元は元 archive のままで、backing path と job id は URL や payload に
+出ない。terminal job の 10 分保持を過ぎても active backing は session 中保持し、owner 交代・host discard・
+background expiry の drain で epoch を進めて破棄する。drain と backing 検証が競合した場合は古い結果を
+読み込みへ渡さない。これは共有 cache ZIP 自体を削除する操作ではない。
+
+folder / collection の Web 側 archive kind 除外は撤去した。Ignore の正本は Core に置き、物理 folder は
+§12.24 の live listing settings、bookmark の `OtherArchive`、reading history、rating、smart folder 等の
+集約系は `CollectionEngine` がその要求ですでに `load_into_settings()` した同じ `Settings` で archive
+候補を bound 前に除外する。tag item も同じロード済み値を mapping に渡し、追加の全設定 read は行わない。
 
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 

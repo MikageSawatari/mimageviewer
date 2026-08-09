@@ -15,6 +15,55 @@ pub(super) struct ResolvedPath {
     /// mIV の path key と公開住所に使う canonical path。
     /// Windows では filesystem API が付ける extended prefix を通常表記へ戻す。
     pub logical: PathBuf,
+    /// 変換済みアーカイブや直接読み RAR の、Core 内だけで使う読み込み実体。
+    /// identity / DB key / 公開住所には `logical` と `canonical` を使い続ける。
+    archive_backing: Option<ResolvedArchiveBacking>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedArchiveBacking {
+    canonical: PathBuf,
+    logical: PathBuf,
+}
+
+impl ResolvedPath {
+    pub(super) fn with_archive_backing(
+        source_path: &Path,
+        public_path: &str,
+        backing_path: &Path,
+    ) -> Result<Self, ResolveError> {
+        validate_absolute_path(public_path).map_err(|_| ResolveError::InvalidPath)?;
+        let canonical =
+            std::fs::canonicalize(source_path).map_err(|_| ResolveError::Unavailable)?;
+        let backing_canonical =
+            std::fs::canonicalize(backing_path).map_err(|_| ResolveError::Unavailable)?;
+        Ok(Self {
+            canonical,
+            logical: PathBuf::from(public_path),
+            archive_backing: Some(ResolvedArchiveBacking {
+                logical: logical_path_from_canonical(&backing_canonical),
+                canonical: backing_canonical,
+            }),
+        })
+    }
+
+    pub(super) fn has_archive_backing(&self) -> bool {
+        self.archive_backing.is_some()
+    }
+
+    pub(super) fn readable_canonical(&self) -> &Path {
+        self.archive_backing
+            .as_ref()
+            .map_or(self.canonical.as_path(), |backing| {
+                backing.canonical.as_path()
+            })
+    }
+
+    pub(super) fn readable_logical(&self) -> &Path {
+        self.archive_backing
+            .as_ref()
+            .map_or(self.logical.as_path(), |backing| backing.logical.as_path())
+    }
 }
 
 /// 絶対パスを検証し、実在する対象を canonical path へ正規化する。
@@ -23,7 +72,11 @@ pub(super) fn resolve_existing(path: &str) -> Result<ResolvedPath, ResolveError>
     validate_absolute_path(path).map_err(|_| ResolveError::InvalidPath)?;
     let canonical = std::fs::canonicalize(path).map_err(|_| ResolveError::Unavailable)?;
     let logical = logical_path_from_canonical(&canonical);
-    Ok(ResolvedPath { logical, canonical })
+    Ok(ResolvedPath {
+        logical,
+        canonical,
+        archive_backing: None,
+    })
 }
 
 fn logical_path_from_canonical(canonical: &Path) -> PathBuf {
@@ -95,5 +148,36 @@ mod tests {
             page_identity_from_resolved(&resolved, &RemoteSubresource::PdfPage { page_number: 2 });
         assert!(Path::new(&address.path).is_absolute());
         assert_eq!(address.path, resolved.logical.to_string_lossy());
+    }
+
+    #[test]
+    fn archive_backing_is_used_only_for_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("book.7z");
+        let backing = temp.path().join("cache.zip");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&backing, b"backing").unwrap();
+        let public = source.to_string_lossy().into_owned();
+
+        let resolved = ResolvedPath::with_archive_backing(&source, &public, &backing).unwrap();
+
+        assert_eq!(resolved.logical, PathBuf::from(&public));
+        assert_eq!(resolved.canonical, std::fs::canonicalize(&source).unwrap());
+        assert_eq!(
+            resolved.readable_canonical(),
+            std::fs::canonicalize(&backing).unwrap().as_path()
+        );
+        assert_ne!(resolved.readable_canonical(), resolved.canonical.as_path());
+        assert!(resolved.has_archive_backing());
+        assert_eq!(
+            page_identity_from_resolved(
+                &resolved,
+                &RemoteSubresource::ZipEntry {
+                    entry_name: "page.jpg".to_owned(),
+                }
+            )
+            .path,
+            public
+        );
     }
 }

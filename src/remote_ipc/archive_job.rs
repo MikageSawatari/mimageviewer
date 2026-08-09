@@ -56,10 +56,7 @@ impl RemoteArchiveOpenTarget {
     }
 
     pub(crate) fn validated_backing_path(&self) -> Option<&Path> {
-        let source_path = match &self.backing {
-            RemoteArchiveBacking::DirectRar { resolved_path } => resolved_path,
-            RemoteArchiveBacking::CachedZip { source_path, .. } => source_path,
-        };
+        let source_path = self.source_path();
         let backing_path = match &self.backing {
             RemoteArchiveBacking::DirectRar { resolved_path } => resolved_path.as_path(),
             RemoteArchiveBacking::CachedZip { path, .. } => path.as_path(),
@@ -67,6 +64,23 @@ impl RemoteArchiveOpenTarget {
         (source_fingerprint(source_path).ok().as_ref() == Some(&self.source_fingerprint)
             && backing_path.exists())
         .then_some(backing_path)
+    }
+
+    fn source_path(&self) -> &Path {
+        match &self.backing {
+            RemoteArchiveBacking::DirectRar { resolved_path } => resolved_path,
+            RemoteArchiveBacking::CachedZip { source_path, .. } => source_path,
+        }
+    }
+
+    fn resolved_path(&self) -> Option<super::path_guard::ResolvedPath> {
+        let backing = self.validated_backing_path()?;
+        super::path_guard::ResolvedPath::with_archive_backing(
+            self.source_path(),
+            &self.source.path,
+            backing,
+        )
+        .ok()
     }
 }
 
@@ -87,6 +101,7 @@ impl ContainerRemoteArchiveExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     struct CancelAwareExecutor {
         started: mpsc::Sender<()>,
@@ -94,6 +109,23 @@ mod tests {
     }
 
     struct NoInputControl;
+
+    struct PanicExecutor;
+
+    struct DecliningControl {
+        confirmations: AtomicUsize,
+    }
+
+    impl RemoteArchiveExecutor for PanicExecutor {
+        fn execute(
+            &self,
+            _request: &RemoteArchiveStartRequest,
+            _control: &dyn RemoteArchiveJobControl,
+            _cancel: &Arc<AtomicBool>,
+        ) -> RemoteArchiveExecutionOutcome {
+            panic!("ready-result test must not execute a worker")
+        }
+    }
 
     impl RemoteArchiveJobControl for NoInputControl {
         fn update(&self, _state: RemoteArchiveJobState, _progress: Option<RemoteArchiveProgress>) {}
@@ -108,6 +140,23 @@ mod tests {
             _bad_password: bool,
         ) -> Result<String, ()> {
             panic!("cache-unavailable flow must not request a password")
+        }
+    }
+
+    impl RemoteArchiveJobControl for DecliningControl {
+        fn update(&self, _state: RemoteArchiveJobState, _progress: Option<RemoteArchiveProgress>) {}
+
+        fn await_confirmation(&self, _summary: RemoteArchiveImageSummary) -> Result<bool, ()> {
+            self.confirmations.fetch_add(1, Ordering::Relaxed);
+            Ok(false)
+        }
+
+        fn await_password(
+            &self,
+            _resume: RemoteArchivePasswordResume,
+            _bad_password: bool,
+        ) -> Result<String, ()> {
+            panic!("unencrypted 7z test must not request a password")
         }
     }
 
@@ -134,6 +183,27 @@ mod tests {
             connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
             device_name: Some("archive test".to_owned()),
         }
+    }
+
+    fn write_test_7z(path: &Path) {
+        let mut writer = sevenz_rust2::ArchiveWriter::create(path).unwrap();
+        writer
+            .push_archive_entry(
+                sevenz_rust2::ArchiveEntry::new_file("page.jpg"),
+                Some(std::io::Cursor::new(b"page".to_vec())),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+    }
+
+    fn archive_executor(
+        settings: crate::settings::Settings,
+        cache_db: Option<Arc<crate::archive_cache::ArchiveCacheDb>>,
+    ) -> ContainerRemoteArchiveExecutor {
+        let session = SessionHandle::new();
+        session.install_archive_cache_db(cache_db);
+        let engine = Arc::new(super::super::container::ContainerEngine::new(settings));
+        ContainerRemoteArchiveExecutor::new(engine, session)
     }
 
     #[test]
@@ -214,6 +284,83 @@ mod tests {
     }
 
     #[test]
+    fn result_activates_private_backing_until_session_drain_without_deleting_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("book.7z");
+        let cache_path = temp.path().join("private-cache.zip");
+        std::fs::write(&source_path, b"archive").unwrap();
+        std::fs::write(&cache_path, b"zip").unwrap();
+        let source = RemoteAddress::file(source_path.to_string_lossy().into_owned());
+        let target = cached_target(
+            &source,
+            &source_path,
+            source_fingerprint(&source_path).unwrap(),
+            cache_path.clone(),
+        );
+        let registry = RemoteArchiveJobRegistry::new(Arc::new(PanicExecutor));
+        let (input, _input_rx) = mpsc::sync_channel(1);
+        let snapshot = RemoteArchiveJobSnapshot {
+            job_id: "archive-ready".to_owned(),
+            request_id: "ready-request".to_owned(),
+            source: source.clone(),
+            state: RemoteArchiveJobState::Ready,
+            progress: None,
+            awaiting_input: None,
+            terminal: None,
+            created_unix_ms: 1,
+            updated_unix_ms: 1,
+        };
+        {
+            let mut state = registry.inner.lock().unwrap();
+            state.order.push_back(snapshot.job_id.clone());
+            state.jobs.insert(
+                snapshot.job_id.clone(),
+                ArchiveJobEntry {
+                    owner: "browser".to_owned(),
+                    request: RemoteArchiveStartRequest {
+                        request_id: snapshot.request_id.clone(),
+                        source: source.clone(),
+                    },
+                    snapshot,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    input,
+                    requested_terminal: None,
+                    progress_high_water: RemoteArchiveProgress::default(),
+                    result: Some(target),
+                    terminal_at: Some(Duration::ZERO),
+                },
+            );
+        }
+
+        let result = registry.result("browser", "archive-ready");
+        assert!(matches!(result, RemoteArchiveResultResponse::Success(_)));
+        let resolved = registry
+            .active_resolved_path(&source.path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.logical, PathBuf::from(&source.path));
+        assert_eq!(
+            resolved.readable_canonical(),
+            std::fs::canonicalize(&cache_path).unwrap().as_path()
+        );
+
+        {
+            let mut state = registry.inner.lock().unwrap();
+            registry.prune_locked(&mut state, TERMINAL_RETENTION);
+            assert!(state.jobs.is_empty());
+            assert!(state.active_targets.contains_key(&source.path));
+        }
+        registry.on_session_drain_inner(RemoteLongJobDrainCause::Superseded);
+        assert!(
+            registry
+                .active_resolved_path(&source.path)
+                .unwrap()
+                .is_none()
+        );
+        assert!(cache_path.exists());
+    }
+
+    #[test]
     fn missing_cache_db_is_an_explicit_conversion_error() {
         match cache_unavailable() {
             RemoteArchiveExecutionOutcome::Failed(code, message) => {
@@ -247,6 +394,174 @@ mod tests {
             outcome,
             RemoteArchiveExecutionOutcome::Failed(RemoteArchiveTerminalCode::CacheUnavailable, _)
         ));
+    }
+
+    #[test]
+    fn ignore_stops_before_cache_lookup_scan_or_input() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("ignored.7z");
+        std::fs::write(&source_path, b"must not be scanned").unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+        let executor = archive_executor(settings, None);
+
+        let outcome = executor.execute(
+            &RemoteArchiveStartRequest {
+                request_id: "ignore".to_owned(),
+                source: RemoteAddress::file(source_path.to_string_lossy().into_owned()),
+            },
+            &NoInputControl,
+            &Arc::new(AtomicBool::new(false)),
+        );
+
+        assert!(matches!(
+            outcome,
+            RemoteArchiveExecutionOutcome::Failed(RemoteArchiveTerminalCode::IgnoredBySettings, _)
+        ));
+    }
+
+    #[test]
+    fn ask_requires_confirmation_before_conversion() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("ask.7z");
+        write_test_7z(&source_path);
+        let cache_db = Arc::new(crate::archive_cache::ArchiveCacheDb::open().unwrap());
+        let mut settings = crate::settings::Settings::default();
+        settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+        let executor = archive_executor(settings, Some(cache_db));
+        let control = DecliningControl {
+            confirmations: AtomicUsize::new(0),
+        };
+
+        let outcome = executor.execute(
+            &RemoteArchiveStartRequest {
+                request_id: "ask".to_owned(),
+                source: RemoteAddress::file(source_path.to_string_lossy().into_owned()),
+            },
+            &control,
+            &Arc::new(AtomicBool::new(false)),
+        );
+
+        assert!(matches!(outcome, RemoteArchiveExecutionOutcome::Declined));
+        assert_eq!(control.confirmations.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn convert_setting_converts_without_confirmation() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("convert.7z");
+        write_test_7z(&source_path);
+        let cache_db = Arc::new(crate::archive_cache::ArchiveCacheDb::open().unwrap());
+        let mut settings = crate::settings::Settings::default();
+        settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Convert);
+        let executor = archive_executor(settings, Some(Arc::clone(&cache_db)));
+
+        let outcome = executor.execute(
+            &RemoteArchiveStartRequest {
+                request_id: "convert".to_owned(),
+                source: RemoteAddress::file(source_path.to_string_lossy().into_owned()),
+            },
+            &NoInputControl,
+            &Arc::new(AtomicBool::new(false)),
+        );
+
+        let RemoteArchiveExecutionOutcome::Completed(target) = outcome else {
+            panic!("Convert setting must complete without confirmation")
+        };
+        assert_eq!(
+            target.public_result().access,
+            RemoteArchiveAccessMode::CachedZip
+        );
+        let fingerprint = source_fingerprint(&source_path).unwrap();
+        assert!(
+            cache_db
+                .lookup(&source_path, fingerprint.mtime, fingerprint.size)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn existing_cache_opens_without_scan_or_confirmation() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("cached.7z");
+        std::fs::write(&source_path, b"must not be scanned").unwrap();
+        let fingerprint = source_fingerprint(&source_path).unwrap();
+        let cache_db = Arc::new(crate::archive_cache::ArchiveCacheDb::open().unwrap());
+        let cached_path = cache_db.reserve_cache_zip_path(&source_path).unwrap();
+        std::fs::write(&cached_path, b"cached zip").unwrap();
+        cache_db
+            .record(
+                &source_path,
+                fingerprint.mtime,
+                fingerprint.size,
+                crate::archive_converter::ArchiveFormat::SevenZ,
+                &cached_path,
+                std::fs::metadata(&cached_path).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        let executor = archive_executor(
+            crate::settings::Settings::default(),
+            Some(Arc::clone(&cache_db)),
+        );
+
+        let outcome = executor.execute(
+            &RemoteArchiveStartRequest {
+                request_id: "cached".to_owned(),
+                source: RemoteAddress::file(source_path.to_string_lossy().into_owned()),
+            },
+            &NoInputControl,
+            &Arc::new(AtomicBool::new(false)),
+        );
+
+        let RemoteArchiveExecutionOutcome::Completed(target) = outcome else {
+            panic!("valid cache must open without scanning")
+        };
+        assert_eq!(
+            target.public_result().access,
+            RemoteArchiveAccessMode::CachedZip
+        );
+        assert_eq!(target.validated_backing_path(), Some(cached_path.as_path()));
+    }
+
+    #[test]
+    fn directly_readable_rar_opens_without_cache_or_confirmation() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("direct.rar");
+        std::fs::write(
+            &source_path,
+            crate::rar_loader::direct_read_test_fixture_bytes(),
+        )
+        .unwrap();
+        let executor = archive_executor(crate::settings::Settings::default(), None);
+
+        let outcome = executor.execute(
+            &RemoteArchiveStartRequest {
+                request_id: "direct-rar".to_owned(),
+                source: RemoteAddress::file(source_path.to_string_lossy().into_owned()),
+            },
+            &NoInputControl,
+            &Arc::new(AtomicBool::new(false)),
+        );
+
+        let RemoteArchiveExecutionOutcome::Completed(target) = outcome else {
+            panic!("directly readable RAR must not require conversion")
+        };
+        assert_eq!(
+            target.public_result().access,
+            RemoteArchiveAccessMode::DirectRar
+        );
+        let canonical_source = std::fs::canonicalize(source_path).unwrap();
+        assert_eq!(
+            target.validated_backing_path(),
+            Some(canonical_source.as_path())
+        );
     }
 
     #[test]
@@ -687,12 +1002,20 @@ struct ArchiveTombstone {
     terminal_code: Option<RemoteArchiveTerminalCode>,
 }
 
+struct ActiveArchiveTarget {
+    activation_id: u64,
+    target: RemoteArchiveOpenTarget,
+}
+
 #[derive(Default)]
 struct ArchiveRegistryState {
     next_sequence: u64,
+    next_activation_id: u64,
+    activation_epoch: u64,
     jobs: HashMap<String, ArchiveJobEntry>,
     order: VecDeque<String>,
     tombstones: VecDeque<ArchiveTombstone>,
+    active_targets: HashMap<String, ActiveArchiveTarget>,
 }
 
 pub(crate) struct RemoteArchiveJobRegistry {
@@ -1083,34 +1406,39 @@ impl RemoteArchiveJobRegistry {
                 "archive is not ready",
             ));
         }
-        match job.result.as_ref() {
-            Some(result) => RemoteArchiveResultResponse::Success(result.public_result()),
-            None => RemoteArchiveResultResponse::Error(RemoteArchiveJobError::new(
-                RemoteArchiveJobErrorCode::Internal,
-                "archive backing is unavailable",
-            )),
-        }
+        let result = match job.result.as_ref() {
+            Some(result) => result.clone(),
+            None => {
+                return RemoteArchiveResultResponse::Error(RemoteArchiveJobError::new(
+                    RemoteArchiveJobErrorCode::Internal,
+                    "archive backing is unavailable",
+                ));
+            }
+        };
+        state.next_activation_id = state.next_activation_id.wrapping_add(1).max(1);
+        let activation_id = state.next_activation_id;
+        state.active_targets.insert(
+            result.source.path.clone(),
+            ActiveArchiveTarget {
+                activation_id,
+                target: result.clone(),
+            },
+        );
+        RemoteArchiveResultResponse::Success(result.public_result())
     }
 
-    fn request_cancel_all(
-        &self,
-        state_value: RemoteArchiveJobState,
-        code: RemoteArchiveTerminalCode,
-        message: &str,
-    ) {
+    fn on_session_drain_inner(&self, cause: RemoteLongJobDrainCause) {
+        let (terminal_state, code, message) = archive_drain_terminal(cause);
         let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        state.activation_epoch = state.activation_epoch.wrapping_add(1);
+        state.active_targets.clear();
         for job in state
             .jobs
             .values_mut()
             .filter(|job| !job.snapshot.state.is_terminal())
         {
-            request_archive_cancel(job, state_value, code, message);
+            request_archive_cancel(job, terminal_state, code, message);
         }
-    }
-
-    fn on_session_drain_inner(&self, cause: RemoteLongJobDrainCause) {
-        let (state, code, message) = archive_drain_terminal(cause);
-        self.request_cancel_all(state, code, message);
     }
 
     fn prune_locked(&self, state: &mut ArchiveRegistryState, now: Duration) {
@@ -1140,30 +1468,39 @@ impl RemoteArchiveJobRegistry {
         }
     }
 
-    pub(crate) fn open_target(
+    pub(super) fn active_resolved_path(
         &self,
-        owner: &str,
-        job_id: &str,
-    ) -> Result<RemoteArchiveOpenTarget, RemoteArchiveJobError> {
-        let state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        let job = lookup_archive_job(&state, owner, job_id)?;
-        if job.snapshot.state != RemoteArchiveJobState::Ready {
-            return Err(RemoteArchiveJobError::new(
-                RemoteArchiveJobErrorCode::NotReady,
-                "archive is not ready",
-            ));
-        }
-        let result = job.result.clone().ok_or_else(|| {
-            RemoteArchiveJobError::new(
-                RemoteArchiveJobErrorCode::Internal,
-                "archive backing is unavailable",
-            )
-        })?;
-        drop(state);
-        if result.validated_backing_path().is_none() {
+        public_path: &str,
+    ) -> Result<Option<super::path_guard::ResolvedPath>, RemoteArchiveJobError> {
+        for _ in 0..2 {
+            let (epoch, activation_id, target) = {
+                let state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+                let Some(active) = state.active_targets.get(public_path) else {
+                    return Ok(None);
+                };
+                (
+                    state.activation_epoch,
+                    active.activation_id,
+                    active.target.clone(),
+                )
+            };
+            let resolved = target.resolved_path();
+            let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let still_active = state.activation_epoch == epoch
+                && state
+                    .active_targets
+                    .get(public_path)
+                    .is_some_and(|active| active.activation_id == activation_id);
+            if !still_active {
+                continue;
+            }
+            if let Some(resolved) = resolved {
+                return Ok(Some(resolved));
+            }
+            state.active_targets.remove(public_path);
             return Err(archive_source_changed_error());
         }
-        Ok(result)
+        Err(archive_invalid_state())
     }
 }
 
@@ -1350,9 +1687,12 @@ impl ContainerRemoteArchiveExecutor {
             }
         };
         let cache_db = self.session.archive_cache_db();
+        // ArchiveCacheDb の key は本体 UI と共有する。Windows の canonical path は
+        // extended prefix を持ち得るため、DB lookup / record / reserve には通常表記へ
+        // 戻した logical path を使い、実ファイル I/O と fingerprint だけ canonical path を使う。
         let mut fallback_cached = cache_db
             .as_ref()
-            .and_then(|db| db.lookup(&resolved.canonical, fingerprint.mtime, fingerprint.size));
+            .and_then(|db| db.lookup(&resolved.logical, fingerprint.mtime, fingerprint.size));
         let mut password = None;
         let summary = if format == crate::archive_converter::ArchiveFormat::Rar {
             match self.prepare_rar(
@@ -1459,7 +1799,7 @@ impl ContainerRemoteArchiveExecutor {
             *fingerprint =
                 source_fingerprint(&resolved.canonical).map_err(|_| rar_first_volume_failed())?;
             *fallback_cached = cache_db
-                .and_then(|db| db.lookup(&resolved.canonical, fingerprint.mtime, fingerprint.size));
+                .and_then(|db| db.lookup(&resolved.logical, fingerprint.mtime, fingerprint.size));
         }
         if inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct {
             return Ok(PreparedArchive::Target(RemoteArchiveOpenTarget {
@@ -1522,7 +1862,7 @@ impl ContainerRemoteArchiveExecutor {
             *fingerprint =
                 source_fingerprint(&resolved.canonical).map_err(|_| rar_first_volume_failed())?;
             *fallback_cached = cache_db
-                .and_then(|db| db.lookup(&resolved.canonical, fingerprint.mtime, fingerprint.size));
+                .and_then(|db| db.lookup(&resolved.logical, fingerprint.mtime, fingerprint.size));
             if let Some(path) = fallback_cached.take() {
                 return Ok(PreparedArchive::Target(cached_target(
                     public_source,
@@ -1563,11 +1903,11 @@ impl ContainerRemoteArchiveExecutor {
                 return source_changed();
             }
             if let Some(path) =
-                cache_db.lookup(&resolved.canonical, fingerprint.mtime, fingerprint.size)
+                cache_db.lookup(&resolved.logical, fingerprint.mtime, fingerprint.size)
             {
                 return cached_outcome(public_source, &resolved.canonical, fingerprint, path);
             }
-            let destination = match cache_db.reserve_cache_zip_path(&resolved.canonical) {
+            let destination = match cache_db.reserve_cache_zip_path(&resolved.logical) {
                 Ok(path) => path,
                 Err(_) => return cache_publish_failed(),
             };
@@ -1636,7 +1976,7 @@ impl ContainerRemoteArchiveExecutor {
             };
             if cache_db
                 .record(
-                    &resolved.canonical,
+                    &resolved.logical,
                     fingerprint.mtime,
                     fingerprint.size,
                     format,
@@ -1650,7 +1990,7 @@ impl ContainerRemoteArchiveExecutor {
                 let _ = std::fs::remove_file(&destination);
                 return cache_publish_failed();
             }
-            let prune = cache_db.prune_to_size_limit_locked(max_cache_bytes, &resolved.canonical);
+            let prune = cache_db.prune_to_size_limit_locked(max_cache_bytes, &resolved.logical);
             if let Err(error) = prune {
                 crate::logger::log(format!("remote_archive: cache prune failed: {error}"));
             }

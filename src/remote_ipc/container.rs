@@ -1103,11 +1103,11 @@ impl ContainerEngine {
                     RemoteSubresource::File => {
                         is_directory
                             || is_file
-                                && (is_zip_path(&resolved.logical)
+                                && (is_archive_container(&resolved)
                                     || is_pdf_path(&resolved.logical))
                     }
                     RemoteSubresource::ZipDirectory { .. } => {
-                        is_file && is_zip_path(&resolved.logical)
+                        is_file && is_archive_container(&resolved)
                     }
                     RemoteSubresource::ZipEntry { .. } | RemoteSubresource::PdfPage { .. } => false,
                 };
@@ -1398,7 +1398,7 @@ impl ContainerEngine {
                     remote_bookmark_row(bookmark, target)
                 })
                 .collect()
-        } else if is_zip_path(&resolved.logical) {
+        } else if is_archive_container(resolved) {
             let tree = &prepared_zip
                 .as_ref()
                 .expect("ZIP bookmark list is prepared during validation")
@@ -1578,15 +1578,16 @@ impl ContainerEngine {
                     ))
                 }
             }
-            RemoteSubresource::ZipEntry { entry_name } if is_zip_path(&resolved.logical) => {
-                let enumeration =
-                    crate::zip_loader::enumerate_image_entries_detailed(&resolved.logical)
-                        .map_err(|_| {
-                            RemoteWriteError::new(
-                                RemoteWriteErrorCode::PersistenceFailed,
-                                "ZIP を列挙できませんでした",
-                            )
-                        })?;
+            RemoteSubresource::ZipEntry { entry_name } if is_archive_container(&resolved) => {
+                let enumeration = crate::zip_loader::enumerate_image_entries_detailed(
+                    resolved.readable_logical(),
+                )
+                .map_err(|_| {
+                    RemoteWriteError::new(
+                        RemoteWriteErrorCode::PersistenceFailed,
+                        "ZIP を列挙できませんでした",
+                    )
+                })?;
                 enumeration
                     .entries
                     .iter()
@@ -1810,7 +1811,7 @@ impl ContainerEngine {
                 "ZIP ページとコンテキストが一致しません",
             ));
         }
-        if !is_zip_path(&resolved.logical) {
+        if !is_archive_container(&resolved) {
             return Err(RemoteWriteError::new(
                 RemoteWriteErrorCode::Unsupported,
                 "ZIP ページではありません",
@@ -1826,13 +1827,14 @@ impl ContainerEngine {
                 ));
             }
         };
-        let enumeration = crate::zip_loader::enumerate_image_entries_detailed(&resolved.logical)
-            .map_err(|_| {
-                RemoteWriteError::new(
-                    RemoteWriteErrorCode::PersistenceFailed,
-                    "ZIP を列挙できませんでした",
-                )
-            })?;
+        let enumeration =
+            crate::zip_loader::enumerate_image_entries_detailed(resolved.readable_logical())
+                .map_err(|_| {
+                    RemoteWriteError::new(
+                        RemoteWriteErrorCode::PersistenceFailed,
+                        "ZIP を列挙できませんでした",
+                    )
+                })?;
         Ok((resolved, requested_prefix, enumeration))
     }
 
@@ -2085,6 +2087,17 @@ impl ContainerEngine {
         address
             .validate_syntax()
             .map_err(|_| media_error(MediaErrorCode::BadRequest, "コンテンツアドレスが不正です"))?;
+        if let Some(registry) = self
+            .session
+            .as_ref()
+            .and_then(super::session::SessionHandle::archive_job_registry)
+        {
+            match registry.active_resolved_path(&address.path) {
+                Ok(Some(resolved)) => return Ok(resolved),
+                Ok(None) => {}
+                Err(error) => return Err(active_archive_media_error(error)),
+            }
+        }
         resolve_existing(&address.path).map_err(resolve_media_error)
     }
 
@@ -2517,10 +2530,10 @@ impl ContainerEngine {
                     cancel,
                 )
             }
-            RemoteSubresource::ZipEntry { entry_name } if is_zip_path(&resolved.logical) => {
+            RemoteSubresource::ZipEntry { entry_name } if is_archive_container(resolved) => {
                 decode_remote_ai_canonical(
                     crate::canonical_image_loader::CanonicalImageSource::ArchiveEntry {
-                        archive_path: &resolved.canonical,
+                        archive_path: resolved.readable_canonical(),
                         entry_name,
                     },
                     page_index,
@@ -2601,7 +2614,7 @@ impl ContainerEngine {
                 "対象はフォルダまたは ZIP/PDF ファイルではありません",
             ));
         }
-        if is_zip_path(&resolved.logical) {
+        if is_archive_container(resolved) {
             self.enumerate_zip(request, resolved)
         } else if is_pdf_path(&resolved.logical) {
             self.enumerate_pdf(request, resolved, &metadata)
@@ -2741,11 +2754,12 @@ impl ContainerEngine {
             }
         };
         let enumeration_started = Instant::now();
-        let enumeration = crate::zip_loader::enumerate_image_entries_detailed(&resolved.logical)
-            .map_err(|error| {
-                crate::logger::log(format!("remote_ipc: zip_enumerate_failed error={error}"));
-                media_error(MediaErrorCode::RenderFailed, "ZIP を列挙できませんでした")
-            })?;
+        let enumeration =
+            crate::zip_loader::enumerate_image_entries_detailed(resolved.readable_logical())
+                .map_err(|error| {
+                    crate::logger::log(format!("remote_ipc: zip_enumerate_failed error={error}"));
+                    media_error(MediaErrorCode::RenderFailed, "ZIP を列挙できませんでした")
+                })?;
         crate::logger::log(format!(
             "remote_ipc: zip_enumerate_complete duration_ms={:.1} raw_entry_count={}",
             enumeration_started.elapsed().as_secs_f64() * 1000.0,
@@ -3290,7 +3304,7 @@ impl ContainerEngine {
         let mtime = crate::ui_helpers::mtime_secs(&metadata);
         let file_size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
         let mut request = crate::thumb_loader::LoadRequest {
-            path: resolved.logical.clone(),
+            path: resolved.readable_logical().to_path_buf(),
             mtime,
             file_size,
             skip_cache: full_page,
@@ -3301,7 +3315,7 @@ impl ContainerEngine {
             ..Default::default()
         };
         let catalog_folder = match &address.subresource {
-            RemoteSubresource::File if is_zip_path(&resolved.logical) => {
+            RemoteSubresource::File if is_archive_container(resolved) => {
                 request.cache_key_override = Some(container_thumb_key(
                     crate::thumb_loader::CACHE_KEY_ZIP,
                     &resolved.logical,
@@ -3322,11 +3336,11 @@ impl ContainerEngine {
                     media_error(MediaErrorCode::PathRejected, "親フォルダを解決できません")
                 })?
             }
-            RemoteSubresource::ZipEntry { entry_name } if is_zip_path(&resolved.logical) => {
+            RemoteSubresource::ZipEntry { entry_name } if is_archive_container(resolved) => {
                 request.zip_entry = Some(entry_name.clone());
                 &resolved.logical
             }
-            RemoteSubresource::ZipDirectory { prefix } if is_zip_path(&resolved.logical) => {
+            RemoteSubresource::ZipDirectory { prefix } if is_archive_container(resolved) => {
                 request.zip_dir_prefix = Some(prefix.clone());
                 request.cache_key_override = Some(crate::grid_item::zipdir_cache_key(prefix));
                 request.folder_thumb_sort = Some(crate::app::BOOK_READING_PAGE_ORDER);
@@ -4350,6 +4364,10 @@ fn is_zip_path(path: &Path) -> bool {
         })
 }
 
+fn is_archive_container(resolved: &ResolvedPath) -> bool {
+    resolved.has_archive_backing() || is_zip_path(&resolved.logical)
+}
+
 fn is_pdf_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -4399,6 +4417,17 @@ fn resolve_media_error(error: ResolveError) -> MediaError {
         ResolveError::InvalidPath => media_error(MediaErrorCode::BadRequest, "絶対パスが不正です"),
         ResolveError::Unavailable => media_error(MediaErrorCode::NotFound, "対象が見つかりません"),
     }
+}
+
+fn active_archive_media_error(error: mimageviewer_ipc::RemoteArchiveJobError) -> MediaError {
+    crate::logger::log(format!(
+        "remote_archive: active backing rejected code={:?}",
+        error.code
+    ));
+    media_error(
+        MediaErrorCode::NotFound,
+        "アーカイブの元ファイルまたは変換結果が更新されました",
+    )
 }
 
 fn absolute_root_name(path: &Path) -> String {

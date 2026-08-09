@@ -10,12 +10,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mimageviewer_ipc::{
     CollectionErrorCode, CollectionKind, FavoriteSearchIndexState, FavoriteSearchKind,
     FavoriteSearchRequest, MediaErrorCode, PagePriority, RemoteAddress, RemoteAiJobError,
-    RemoteAiJobErrorCode, RemoteAiStartRequest, RemoteEntryKind, RemotePageRenderContext,
-    RemoteReadingDirection, RemoteSessionIdentity, RemoteSpreadMode, RemoteSubresource,
-    RemoteWriteErrorCode, RemoteWriteRequest, SessionResponse, SessionStatus, TagIndexState,
-    TagItemKind, TagItemsRequest, VideoStreamControlAction, VideoStreamErrorCode,
-    VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind, VideoStreamQuality,
-    VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamThumbnailPayload,
+    RemoteAiJobErrorCode, RemoteAiStartRequest, RemoteArchiveConfirmRequest, RemoteArchiveJobError,
+    RemoteArchiveJobErrorCode, RemoteArchivePasswordRequest, RemoteArchiveStartRequest,
+    RemoteEntryKind, RemotePageRenderContext, RemoteReadingDirection, RemoteSessionIdentity,
+    RemoteSpreadMode, RemoteSubresource, RemoteWriteErrorCode, RemoteWriteRequest, SessionResponse,
+    SessionStatus, TagIndexState, TagItemKind, TagItemsRequest, VideoStreamControlAction,
+    VideoStreamErrorCode, VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind,
+    VideoStreamQuality, VideoStreamSegmentIndex, VideoStreamSegmentPayload,
+    VideoStreamThumbnailPayload,
 };
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::Deserialize;
@@ -36,6 +38,8 @@ const MAX_PIN_BODY_BYTES: usize = 4 * 1024;
 const MAX_WRITE_BODY_BYTES: usize = 16 * 1024;
 const MAX_VIDEO_BODY_BYTES: usize = 16 * 1024;
 const MAX_AI_JOB_BODY_BYTES: usize = 32 * 1024;
+const MAX_ARCHIVE_JOB_BODY_BYTES: usize = 16 * 1024;
+const MAX_ARCHIVE_PASSWORD_BODY_BYTES: usize = 4 * 1024;
 const MAX_HTTP_ADDRESS_PATHS: usize = 16;
 const MAX_TELEMETRY_EVENTS: usize = 128;
 const TELEMETRY_REQUESTS_PER_WINDOW: usize = 30;
@@ -497,7 +501,8 @@ pub fn handle(mut request: Request, state: &Arc<AppState>) {
 }
 
 fn route(request: &mut Request, state: &AppState) -> HttpResponse {
-    let (path, raw_query) = split_url(request.url());
+    let request_url = request.url().to_owned();
+    let (path, raw_query) = split_url(&request_url);
     let video_route = path.starts_with("/api/video/") || path.starts_with("/stream/");
     let query_result = parse_query(raw_query);
     let query = match query_result {
@@ -684,6 +689,50 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             ai_state_job_id(path).expect("guard checked cancel route"),
             remote_owner.expect("route guard checked session"),
         ),
+        (Method::Post, "/api/archive/jobs") => api_archive_job_start(
+            request,
+            state,
+            &query,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Get, "/api/archive/jobs") => api_archive_jobs_recoverable(
+            state,
+            &query,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Get, path) if archive_action_job_id(path, "result").is_some() => {
+            api_archive_job_result(
+                state,
+                archive_action_job_id(path, "result").expect("guard checked result route"),
+                remote_owner.expect("route guard checked session"),
+            )
+        }
+        (Method::Post, path) if archive_action_job_id(path, "confirm").is_some() => {
+            api_archive_job_confirm(
+                request,
+                state,
+                archive_action_job_id(path, "confirm").expect("guard checked confirm route"),
+                remote_owner.expect("route guard checked session"),
+            )
+        }
+        (Method::Post, path) if archive_action_job_id(path, "password").is_some() => {
+            api_archive_job_password(
+                request,
+                state,
+                archive_action_job_id(path, "password").expect("guard checked password route"),
+                remote_owner.expect("route guard checked session"),
+            )
+        }
+        (Method::Get, path) if archive_state_job_id(path).is_some() => api_archive_job_state(
+            state,
+            archive_state_job_id(path).expect("guard checked state route"),
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Delete, path) if archive_state_job_id(path).is_some() => api_archive_job_cancel(
+            state,
+            archive_state_job_id(path).expect("guard checked cancel route"),
+            remote_owner.expect("route guard checked session"),
+        ),
         (Method::Post, "/api/write") => api_write(
             request,
             state,
@@ -721,6 +770,14 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
         (_, path) if path.starts_with("/api/ai/jobs/") => {
             HttpResponse::text(405, "Method Not Allowed")
                 .with_header("Allow", "GET, DELETE")
+                .with_header("Cache-Control", "no-store")
+        }
+        (_, "/api/archive/jobs") => HttpResponse::text(405, "Method Not Allowed")
+            .with_header("Allow", "GET, POST")
+            .with_header("Cache-Control", "no-store"),
+        (_, path) if path.starts_with("/api/archive/jobs/") => {
+            HttpResponse::text(405, "Method Not Allowed")
+                .with_header("Allow", "GET, POST, DELETE")
                 .with_header("Cache-Control", "no-store")
         }
         (
@@ -761,6 +818,19 @@ fn ai_result_job_id(path: &str) -> Option<&str> {
     let job_id = path
         .strip_prefix("/api/ai/jobs/")?
         .strip_suffix("/result")?;
+    (!job_id.is_empty() && !job_id.contains('/')).then_some(job_id)
+}
+
+fn archive_state_job_id(path: &str) -> Option<&str> {
+    let job_id = path.strip_prefix("/api/archive/jobs/")?;
+    (!job_id.is_empty() && !job_id.contains('/')).then_some(job_id)
+}
+
+fn archive_action_job_id<'a>(path: &'a str, action: &str) -> Option<&'a str> {
+    let suffix = format!("/{action}");
+    let job_id = path
+        .strip_prefix("/api/archive/jobs/")?
+        .strip_suffix(suffix.as_str())?;
     (!job_id.is_empty() && !job_id.contains('/')).then_some(job_id)
 }
 
@@ -1020,6 +1090,296 @@ fn remote_ai_job_error_name(code: RemoteAiJobErrorCode) -> &'static str {
         RemoteAiJobErrorCode::PageNotApplicable => "page_not_applicable",
         RemoteAiJobErrorCode::PageOutOfRange => "page_out_of_range",
         RemoteAiJobErrorCode::Internal => "internal",
+    }
+}
+
+fn api_archive_job_start(
+    request: &mut Request,
+    state: &AppState,
+    query: &[(String, String)],
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
+    let body = match read_body_limited(request, MAX_ARCHIVE_JOB_BODY_BYTES) {
+        Ok(body) => body,
+        Err(BodyReadError::TooLarge) => return HttpResponse::text(413, "Payload Too Large"),
+        Err(BodyReadError::Read) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let request: RemoteArchiveStartRequest = match addressed_json_from_query(&body, query) {
+        Ok(request) => request,
+        Err(_) => return HttpResponse::text(400, "Bad Request"),
+    };
+    if let Err(error) = state.library.validate_remote_address(&request.source) {
+        return store_error_response(error).with_header("Cache-Control", "no-store");
+    }
+    let result = match state.ipc_admission.run(IpcClass::Home, || {
+        state.thumbnail_client.remote_archive_start(owner, request)
+    }) {
+        Ok(result) => result,
+        Err(_) => return archive_admission_busy_response(),
+    };
+    match result {
+        Ok(success) => {
+            let mut response = HttpResponse::json(&success.value)
+                .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"));
+            response.status = 202;
+            response.with_header("Cache-Control", "no-store")
+        }
+        Err(failure) => archive_ipc_error_response(failure),
+    }
+}
+
+fn api_archive_jobs_recoverable(
+    state: &AppState,
+    query: &[(String, String)],
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
+    if query_value(query, "recoverable") != Ok(Some("1")) {
+        return HttpResponse::text(400, "Bad Request");
+    }
+    let result = match state.ipc_admission.run(IpcClass::Home, || {
+        state.thumbnail_client.remote_archive_recoverable(owner)
+    }) {
+        Ok(result) => result,
+        Err(_) => return archive_admission_busy_response(),
+    };
+    match result {
+        Ok(success) => HttpResponse::json(&success.value)
+            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+            .with_header("Cache-Control", "no-store"),
+        Err(failure) => archive_ipc_error_response(failure),
+    }
+}
+
+fn api_archive_job_state(
+    state: &AppState,
+    job_id: &str,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
+    let result = match state.ipc_admission.run(IpcClass::Home, || {
+        state.thumbnail_client.remote_archive_state(owner, job_id)
+    }) {
+        Ok(result) => result,
+        Err(_) => return archive_admission_busy_response(),
+    };
+    match result {
+        Ok(success) => HttpResponse::json(&success.value)
+            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+            .with_header("Cache-Control", "no-store"),
+        Err(failure) => archive_ipc_error_response(failure),
+    }
+}
+
+fn api_archive_job_cancel(
+    state: &AppState,
+    job_id: &str,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
+    let result = match state.ipc_admission.run(IpcClass::Home, || {
+        state.thumbnail_client.remote_archive_cancel(owner, job_id)
+    }) {
+        Ok(result) => result,
+        Err(_) => return archive_admission_busy_response(),
+    };
+    match result {
+        Ok(success) => archive_snapshot_response(success.value, 202),
+        Err(failure) => archive_ipc_error_response(failure),
+    }
+}
+
+fn api_archive_job_result(
+    state: &AppState,
+    job_id: &str,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
+    let result = match state.ipc_admission.run(IpcClass::Home, || {
+        state.thumbnail_client.remote_archive_result(owner, job_id)
+    }) {
+        Ok(result) => result,
+        Err(_) => return archive_admission_busy_response(),
+    };
+    match result {
+        Ok(success) => HttpResponse::json(&success.value)
+            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+            .with_header("Cache-Control", "no-store"),
+        Err(failure) => archive_ipc_error_response(failure),
+    }
+}
+
+fn archive_snapshot_response(
+    snapshot: mimageviewer_ipc::RemoteArchiveJobSnapshot,
+    pending_status: u16,
+) -> HttpResponse {
+    let terminal = snapshot.state.is_terminal();
+    let mut response = HttpResponse::json(&snapshot)
+        .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"));
+    response.status = if terminal { 200 } else { pending_status };
+    response.with_header("Cache-Control", "no-store")
+}
+
+#[derive(Deserialize)]
+struct ArchiveConfirmBody {
+    proceed: bool,
+}
+
+#[derive(Deserialize)]
+struct ArchivePasswordBody {
+    password: String,
+}
+
+fn api_archive_job_confirm(
+    request: &mut Request,
+    state: &AppState,
+    job_id: &str,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
+    let body = match read_body_limited(request, MAX_ARCHIVE_JOB_BODY_BYTES) {
+        Ok(body) => body,
+        Err(BodyReadError::TooLarge) => return HttpResponse::text(413, "Payload Too Large"),
+        Err(BodyReadError::Read) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let body: ArchiveConfirmBody = match serde_json::from_slice(&body) {
+        Ok(body) => body,
+        Err(_) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let result = match state.ipc_admission.run(IpcClass::Home, || {
+        state.thumbnail_client.remote_archive_confirm(
+            owner,
+            RemoteArchiveConfirmRequest {
+                job_id: job_id.to_owned(),
+                proceed: body.proceed,
+            },
+        )
+    }) {
+        Ok(result) => result,
+        Err(_) => return archive_admission_busy_response(),
+    };
+    match result {
+        Ok(success) => archive_snapshot_response(success.value, 202),
+        Err(failure) => archive_ipc_error_response(failure),
+    }
+}
+
+fn api_archive_job_password(
+    request: &mut Request,
+    state: &AppState,
+    job_id: &str,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
+    let body = match read_body_limited(request, MAX_ARCHIVE_PASSWORD_BODY_BYTES) {
+        Ok(body) => body,
+        Err(BodyReadError::TooLarge) => return HttpResponse::text(413, "Payload Too Large"),
+        Err(BodyReadError::Read) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let body: ArchivePasswordBody = match serde_json::from_slice(&body) {
+        Ok(body) => body,
+        Err(_) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let result = match state.ipc_admission.run(IpcClass::Home, || {
+        state.thumbnail_client.remote_archive_password(
+            owner,
+            RemoteArchivePasswordRequest {
+                job_id: job_id.to_owned(),
+                password: body.password,
+            },
+        )
+    }) {
+        Ok(result) => result,
+        Err(_) => return archive_admission_busy_response(),
+    };
+    match result {
+        Ok(success) => archive_snapshot_response(success.value, 202),
+        Err(failure) => archive_ipc_error_response(failure),
+    }
+}
+
+fn archive_admission_busy_response() -> HttpResponse {
+    HttpResponse::bytes(
+        503,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&json!({
+            "error": "ipc_busy",
+            "message": "remote archive request admission is busy",
+        }))
+        .unwrap_or_default(),
+    )
+    .with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string())
+    .with_header("Cache-Control", "no-store")
+}
+
+fn archive_ipc_error_response(failure: crate::ipc_client::ClientFailure) -> HttpResponse {
+    let (status, code, message, terminal_code) = match failure.error {
+        IpcClientError::RemoteArchive(RemoteArchiveJobError {
+            code,
+            message,
+            terminal_code,
+        }) => {
+            let status = match code {
+                RemoteArchiveJobErrorCode::BadRequest => 400,
+                RemoteArchiveJobErrorCode::StartExpired => 504,
+                RemoteArchiveJobErrorCode::SessionClosing
+                | RemoteArchiveJobErrorCode::InvalidState
+                | RemoteArchiveJobErrorCode::NotReady => 409,
+                RemoteArchiveJobErrorCode::NotFound | RemoteArchiveJobErrorCode::Forbidden => 404,
+                RemoteArchiveJobErrorCode::JobGone => 410,
+                RemoteArchiveJobErrorCode::Internal => 500,
+            };
+            (
+                status,
+                remote_archive_job_error_name(code).to_owned(),
+                message,
+                terminal_code,
+            )
+        }
+        IpcClientError::Unavailable(_) => (
+            503,
+            "miv_not_running".to_owned(),
+            "mIV core is not available".to_owned(),
+            None,
+        ),
+        IpcClientError::VersionMismatch { .. } => (
+            503,
+            "protocol_version_mismatch".to_owned(),
+            "IPC protocol versions do not match".to_owned(),
+            None,
+        ),
+        IpcClientError::Protocol(_) => (
+            502,
+            "ipc_protocol_error".to_owned(),
+            "IPC request failed".to_owned(),
+            None,
+        ),
+        IpcClientError::SessionRemote(response) => (
+            session_http_status(response.status),
+            "session_required".to_owned(),
+            response.message,
+            None,
+        ),
+        other => (500, "ipc_error".to_owned(), other.to_string(), None),
+    };
+    HttpResponse::bytes(
+        status,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&json!({
+            "error": code,
+            "message": message,
+            "terminal_code": terminal_code,
+        }))
+        .unwrap_or_default(),
+    )
+    .with_header("Cache-Control", "no-store")
+}
+
+fn remote_archive_job_error_name(code: RemoteArchiveJobErrorCode) -> &'static str {
+    match code {
+        RemoteArchiveJobErrorCode::BadRequest => "bad_request",
+        RemoteArchiveJobErrorCode::StartExpired => "start_expired",
+        RemoteArchiveJobErrorCode::SessionClosing => "session_closing",
+        RemoteArchiveJobErrorCode::NotFound => "not_found",
+        RemoteArchiveJobErrorCode::Forbidden => "forbidden",
+        RemoteArchiveJobErrorCode::JobGone => "job_gone",
+        RemoteArchiveJobErrorCode::InvalidState => "invalid_state",
+        RemoteArchiveJobErrorCode::NotReady => "not_ready",
+        RemoteArchiveJobErrorCode::Internal => "internal",
     }
 }
 
@@ -1717,7 +2077,8 @@ fn video_ipc_error_response(failure: crate::ipc_client::ClientFailure) -> HttpRe
         | IpcClientError::CollectionRemote(_)
         | IpcClientError::MediaRemote(_)
         | IpcClientError::WriteRemote(_)
-        | IpcClientError::RemoteAi(_) => (
+        | IpcClientError::RemoteAi(_)
+        | IpcClientError::RemoteArchive(_) => (
             502,
             "ipc_response_type_mismatch",
             "mIV 本体から予期しない応答を受信しました。".to_owned(),
@@ -1894,7 +2255,8 @@ fn session_failure_response(
         | IpcClientError::MediaRemote(_)
         | IpcClientError::WriteRemote(_)
         | IpcClientError::VideoStreamRemote(_)
-        | IpcClientError::RemoteAi(_) => HttpResponse::text(502, "Bad Gateway"),
+        | IpcClientError::RemoteAi(_)
+        | IpcClientError::RemoteArchive(_) => HttpResponse::text(502, "Bad Gateway"),
     }
     .with_header("Cache-Control", "no-store")
 }
@@ -2439,6 +2801,7 @@ fn collection_ipc_error_response(
         IpcClientError::WriteRemote(error) => (500, "miv_collection_error", error.message),
         IpcClientError::VideoStreamRemote(error) => (500, "miv_collection_error", error.message),
         IpcClientError::RemoteAi(error) => (500, "miv_collection_error", error.message),
+        IpcClientError::RemoteArchive(error) => (500, "miv_collection_error", error.message),
         IpcClientError::SessionRemote(response) => (
             session_http_status(response.status),
             "session_required",
@@ -3032,7 +3395,8 @@ fn write_ipc_error_response(
         | IpcClientError::CollectionRemote(_)
         | IpcClientError::MediaRemote(_)
         | IpcClientError::VideoStreamRemote(_)
-        | IpcClientError::RemoteAi(_) => (
+        | IpcClientError::RemoteAi(_)
+        | IpcClientError::RemoteArchive(_) => (
             500,
             "miv_write_error",
             "書き込みに失敗しました。".to_owned(),
@@ -3118,6 +3482,7 @@ fn media_ipc_error_response(
         IpcClientError::WriteRemote(error) => (500, "miv_media_error", error.message),
         IpcClientError::VideoStreamRemote(error) => (500, "miv_media_error", error.message),
         IpcClientError::RemoteAi(error) => (500, "miv_media_error", error.message),
+        IpcClientError::RemoteArchive(error) => (500, "miv_media_error", error.message),
         IpcClientError::SessionRemote(response) => (
             session_http_status(response.status),
             "session_required",
@@ -3259,6 +3624,7 @@ fn ipc_error_response(
         IpcClientError::WriteRemote(remote) => (500, "miv_thumbnail_error", remote.message),
         IpcClientError::VideoStreamRemote(remote) => (500, "miv_thumbnail_error", remote.message),
         IpcClientError::RemoteAi(remote) => (500, "miv_thumbnail_error", remote.message),
+        IpcClientError::RemoteArchive(remote) => (500, "miv_thumbnail_error", remote.message),
         IpcClientError::SessionRemote(response) => (
             session_http_status(response.status),
             "session_required",
@@ -4450,7 +4816,7 @@ mod tests {
     }
 
     #[test]
-    fn every_video_stream_and_ai_route_is_below_the_fail_closed_auth_guard() {
+    fn every_video_stream_ai_and_archive_route_is_below_the_fail_closed_auth_guard() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_state(&temp);
         let requests = [
@@ -4497,6 +4863,25 @@ mod tests {
             (Method::Get, "/api/ai/jobs/1-1", ""),
             (Method::Get, "/api/ai/jobs/1-1/result?page=0", ""),
             (Method::Delete, "/api/ai/jobs/1-1", ""),
+            (
+                Method::Post,
+                "/api/archive/jobs?path=C%3A%5CBooks%5Cbook.7z",
+                r#"{"request_id":"archive-r1","source":{"path":"","subresource":{"kind":"file"}}}"#,
+            ),
+            (Method::Get, "/api/archive/jobs?recoverable=1", ""),
+            (Method::Get, "/api/archive/jobs/archive-1-1", ""),
+            (Method::Get, "/api/archive/jobs/archive-1-1/result", ""),
+            (
+                Method::Post,
+                "/api/archive/jobs/archive-1-1/confirm",
+                r#"{"proceed":true}"#,
+            ),
+            (
+                Method::Post,
+                "/api/archive/jobs/archive-1-1/password",
+                r#"{"password":"secret"}"#,
+            ),
+            (Method::Delete, "/api/archive/jobs/archive-1-1", ""),
         ];
 
         for (method, path, body) in requests {
@@ -5245,6 +5630,68 @@ mod tests {
         assert_eq!(ai_state_job_id("/api/ai/jobs/7-1/result"), None);
         assert_eq!(ai_result_job_id("/api/ai/jobs/7-1/result/extra"), None);
         assert_eq!(ai_state_job_id("/api/ai/jobs/"), None);
+    }
+
+    #[test]
+    fn remote_archive_dynamic_routes_keep_control_actions_separate() {
+        assert_eq!(
+            archive_state_job_id("/api/archive/jobs/archive-7-1"),
+            Some("archive-7-1")
+        );
+        for action in ["result", "confirm", "password"] {
+            let path = format!("/api/archive/jobs/archive-7-1/{action}");
+            assert_eq!(archive_action_job_id(&path, action), Some("archive-7-1"));
+            assert_eq!(archive_state_job_id(&path), None);
+        }
+        assert_eq!(
+            archive_action_job_id("/api/archive/jobs/archive-7-1/password/extra", "password"),
+            None
+        );
+        assert_eq!(archive_state_job_id("/api/archive/jobs/"), None);
+    }
+
+    #[test]
+    fn remote_archive_typed_errors_map_to_stable_http_statuses() {
+        let cases = [
+            (RemoteArchiveJobErrorCode::BadRequest, 400, "bad_request"),
+            (
+                RemoteArchiveJobErrorCode::StartExpired,
+                504,
+                "start_expired",
+            ),
+            (
+                RemoteArchiveJobErrorCode::SessionClosing,
+                409,
+                "session_closing",
+            ),
+            (
+                RemoteArchiveJobErrorCode::InvalidState,
+                409,
+                "invalid_state",
+            ),
+            (RemoteArchiveJobErrorCode::NotReady, 409, "not_ready"),
+            (RemoteArchiveJobErrorCode::NotFound, 404, "not_found"),
+            (RemoteArchiveJobErrorCode::Forbidden, 404, "forbidden"),
+            (RemoteArchiveJobErrorCode::JobGone, 410, "job_gone"),
+            (RemoteArchiveJobErrorCode::Internal, 500, "internal"),
+        ];
+        for (code, expected_status, expected_name) in cases {
+            let response = archive_ipc_error_response(crate::ipc_client::ClientFailure {
+                error: IpcClientError::RemoteArchive(RemoteArchiveJobError {
+                    code,
+                    message: "typed failure".to_owned(),
+                    terminal_code: Some(
+                        mimageviewer_ipc::RemoteArchiveTerminalCode::PasswordUnsupported,
+                    ),
+                }),
+                retry_count: 0,
+                retry_statuses: Vec::new(),
+            });
+            assert_eq!(response.status, expected_status, "{code:?}");
+            let body: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["error"], expected_name);
+            assert_eq!(body["terminal_code"], "password_unsupported");
+        }
     }
 
     #[test]
