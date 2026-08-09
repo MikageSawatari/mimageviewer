@@ -1315,7 +1315,7 @@ impl App {
         let full_rect = transform.viewport_rect;
         // フォーカス復帰クリック中は塗り・選択操作を一切発生させない
         // (handle_fs_wheel_and_click で検出・セットされる)
-        if self.fs_suppress_primary_until_release {
+        if self.fs_primary_suppression.is_active() {
             return;
         }
         let primary_down = ctx.input(|i| i.pointer.primary_down());

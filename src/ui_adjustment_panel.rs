@@ -11,7 +11,8 @@
 //!     - 現在一覧の全画像を、場所の標準または現在ページの実効値へ揃える
 //!     - ページ個別では現在ページの個別設定を解除する
 //! - スライダー下の「すべてリセット」は選択中スコープの全補正値を初期値へ戻す
-//! - 保存スロット 10 個: クリック or Ctrl+数字で現在のページに適用
+//! - 保存スロット 10 個: パネルのクリックは選択中スコープへ、`Ctrl+数字` は常に現在の
+//!   ページへ、`Ctrl+Alt+数字` は常に場所の標準へ適用する
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -9292,7 +9293,7 @@ impl App {
     /// この境界で揃える。終了時の状態が次回起動へ漏れないよう、元画像比較は OFF、
     /// マスク表示は ON から始める。
     pub(crate) fn enter_local_adjust_mode(&mut self) {
-        self.adjustment_mode = false;
+        self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.local_adjust_mode = true;
         self.local_adjust_show_source = false;
         self.local_adjust_show_mask = true;
@@ -13560,7 +13561,7 @@ impl App {
                 "ui_adjustment_panel::draw_adjustment_panel:close_button",
             );
             self.persist_pending_view_trim_state();
-            self.adjustment_mode = false;
+            self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
             child.ctx().request_repaint();
             return;
         }
@@ -13714,9 +13715,9 @@ impl App {
             }
             // クリック処理は描画後にディスパッチ (借用衝突回避)。
             // 補正パネルは「ホバーで自動閉じる」モードなので、消しゴム / 隠蔽に入る前に
-            // adjustment_mode を倒しておく (enter_*_mode 内のガード `!self.adjustment_mode`
+            // adjustment_mode を Closed にしておく (enter_*_mode 内の open-state guard
             // と整合させるためにも必要)。`enter_*_mode` 自身が必要なキャッシュ初期化と
-            // post_filter バイパスを行うので、ここでは flag を倒すだけで十分。
+            // post_filter バイパスを行うので、ここでは owner を閉じるだけで十分。
             if activate_local_adjust {
                 crate::ime_focus::record_side_panel_close(
                     child.ctx(),
@@ -13730,7 +13731,7 @@ impl App {
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_erase",
                 );
-                self.adjustment_mode = false;
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
                 self.enter_erase_mode(fs_root_idx);
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
@@ -13739,7 +13740,7 @@ impl App {
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_conceal",
                 );
-                self.adjustment_mode = false;
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
                 self.enter_conceal_mode(fs_root_idx);
                 return;
             }
@@ -13748,7 +13749,7 @@ impl App {
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_crop",
                 );
-                self.adjustment_mode = false;
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
                 self.enter_export_crop_mode(fs_root_idx);
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
@@ -13757,7 +13758,7 @@ impl App {
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_text",
                 );
-                self.adjustment_mode = false;
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
                 self.enter_text_mode(fs_root_idx);
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
@@ -13766,7 +13767,7 @@ impl App {
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:open_export",
                 );
-                self.adjustment_mode = false;
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
                 let ctx = child.ctx().clone();
                 self.open_export_dialog_for_current(&ctx, fs_idx);
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
@@ -14376,13 +14377,34 @@ impl App {
             self.slot_save_dialog = Some((slot_idx, default_name, params));
         }
         if let Some(slot_idx) = load_from_slot {
-            self.capture_adjust_full(
-                format!(
-                    "スロット{}を適用",
-                    crate::adjustment::slot_key_label(slot_idx)
-                ),
-                |app| app.apply_slot_to_idx(slot_idx, fs_idx),
-            );
+            self.load_slot_from_panel(slot_idx, fs_idx, effective_scope_selection_after);
+        }
+    }
+
+    /// パネルのスロット名ボタンによる読み込み。
+    ///
+    /// 書き込み先は**画面に出ているスコープ選択に従う**。`Ctrl+数字` /
+    /// `Ctrl+Alt+数字` がページ / 標準で固定なのは、読みながら `Ctrl+1` と `Ctrl+2` を
+    /// 打ち分ける速さを守るためで (docs/adjustment-scope-selector-plan.md §5)、
+    /// ラジオが目の前に出ているパネル側までその固定を持ち込む理由はない。
+    /// キーボードの無い環境から標準へ読み込む唯一の導線でもある
+    /// (2026-08-08、タッチ対応中の利用者判断)。
+    pub(crate) fn load_slot_from_panel(
+        &mut self,
+        slot_idx: usize,
+        fs_idx: usize,
+        selection: AdjustScopeSelection,
+    ) {
+        let key_label = crate::adjustment::slot_key_label(slot_idx);
+        match selection {
+            AdjustScopeSelection::Page => self
+                .capture_adjust_full(format!("スロット{key_label}を適用"), |app| {
+                    app.apply_slot_to_idx(slot_idx, fs_idx)
+                }),
+            AdjustScopeSelection::Standard => self
+                .capture_adjust_full(format!("スロット{key_label}を標準に適用"), |app| {
+                    app.apply_slot_to_default_scope(slot_idx)
+                }),
         }
     }
 

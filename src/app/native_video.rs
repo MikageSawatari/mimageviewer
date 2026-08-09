@@ -3221,6 +3221,8 @@ impl App {
                 crate::video::NativeVideoOutputEvent::NavigateItem { .. }
                     | crate::video::NativeVideoOutputEvent::ToggleSidePanelMode
                     | crate::video::NativeVideoOutputEvent::ToggleClickInfoOpen
+                    | crate::video::NativeVideoOutputEvent::OpenTouchInfoPanel
+                    | crate::video::NativeVideoOutputEvent::DismissTouchSidePanels
                     | crate::video::NativeVideoOutputEvent::SetVideoAdjustments { .. }
             ) {
                 // fall through: NavigateItem は dispatch 続行
@@ -3240,6 +3242,17 @@ impl App {
             }
             crate::video::NativeVideoOutputEvent::Seek { target_secs } => {
                 self.handle_native_video_seek_command(ctx, fs_idx, target_secs);
+            }
+            crate::video::NativeVideoOutputEvent::SeekRelative { delta_secs } => {
+                self.native_video_seek_relative_with_hint(fs_idx, delta_secs);
+            }
+            crate::video::NativeVideoOutputEvent::TouchChromeLearned => {
+                if !self.settings.touch_video_chrome_learned {
+                    self.settings.touch_video_chrome_learned = true;
+                    self.settings.save();
+                    self.sync_native_video_metadata(fs_idx);
+                }
+                ctx.request_repaint();
             }
             crate::video::NativeVideoOutputEvent::TileSeek { target_secs } => {
                 self.handle_native_video_tile_seek_command(ctx, fs_idx, target_secs);
@@ -3278,6 +3291,20 @@ impl App {
             crate::video::NativeVideoOutputEvent::ToggleClickInfoOpen => {
                 self.toggle_fullscreen_click_info_open();
                 self.sync_native_video_metadata(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::OpenTouchInfoPanel => {
+                self.open_fullscreen_touch_info_panel();
+                self.sync_native_video_metadata(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::DismissTouchSidePanels => {
+                if self.fs_info_panel_open
+                    == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
+                {
+                    self.close_fullscreen_info_panel();
+                    self.sync_native_video_metadata(fs_idx);
+                }
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::ToggleVst3Gui => {
@@ -3608,6 +3635,7 @@ impl App {
             crate::video::native_window::NativeVideoWindowEvent::DpiChanged { .. }
             | crate::video::native_window::NativeVideoWindowEvent::RequestRaiseHud
             | crate::video::native_window::NativeVideoWindowEvent::RequestFocusClaim
+            | crate::video::native_window::NativeVideoWindowEvent::Touch(_)
             | crate::video::native_window::NativeVideoWindowEvent::CursorOwnership(_)
             | crate::video::native_window::NativeVideoWindowEvent::Destroyed => {}
         }
@@ -5225,8 +5253,21 @@ impl App {
             })
             .collect();
 
+        let touch_rows = [
+            ("中央をタップ", "HUD を表示 / 非表示"),
+            ("左をタップ", "5 秒戻る"),
+            ("右をタップ", "5 秒進む"),
+        ]
+        .into_iter()
+        .map(|(keys, description)| NativeOverlayShortcutHelpRow {
+            keys: keys.to_string(),
+            description: description.to_string(),
+        })
+        .collect();
+
         NativeOverlayShortcutHelp {
             sections,
+            touch_rows,
             fixed_rows,
         }
     }
@@ -5262,7 +5303,8 @@ impl App {
         let shortcuts = self.native_overlay_shortcut_labels();
         let shortcut_help = self.cached_native_overlay_shortcut_help();
         let side_panel_mode = self.settings.fullscreen_side_panel_mode;
-        let click_info_open = self.fs_click_info_open;
+        let info_panel_open = self.fs_info_panel_open;
+        let touch_video_chrome_learned = self.settings.touch_video_chrome_learned;
         // ★ レーティング (右パネル先頭。get_rating は &mut self なので player 借用より前に取る)。
         let rating = self.get_rating(fs_idx);
 
@@ -5314,6 +5356,7 @@ impl App {
                 last_present_path,
                 deinterlace_status,
                 interlace_detected,
+                touch_video_chrome_learned,
                 shortcuts,
                 shortcut_help: shortcut_help.clone(),
             }
@@ -5347,12 +5390,13 @@ impl App {
                 last_present_path: crate::video::decoder::PresentPathSnapshot::Pending,
                 deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot::Pending,
                 interlace_detected: false,
+                touch_video_chrome_learned,
                 shortcuts,
                 shortcut_help,
             }
         };
         player.set_native_metadata(Some(metadata));
-        player.set_native_side_panel_state(side_panel_mode, click_info_open);
+        player.set_native_side_panel_state(side_panel_mode, info_panel_open);
     }
 
     #[cfg(windows)]
@@ -7416,7 +7460,7 @@ impl App {
     pub(crate) fn reset_video_audio_side_panel_sessions(&mut self, fs_idx: usize) {
         self.music_left_panel_active = false;
         self.music_right_panel_active = false;
-        self.music_left_click_open = false;
+        self.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.reset_native_side_panel_session();
         }

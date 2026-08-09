@@ -1,14 +1,17 @@
 # タブレット PC タッチ操作対応 — 調査と設計方針
 
-> 状態: **調査完了 / 設計検討中 (未実装)**。2026-08-06。
-> 調査 = ClaudeCode + Codex Sol (read-only、3 ラウンド)、実装は未着手。
+> 状態: **調査完了 / 仕様確定 / Phase 1 Step 3b / 3c まで実装済み**。2026-08-08。
+> Step 0 診断プローブ、Step 1 純ロジック認識器、Step 2 egui 入力源相関、
+> Step 3 静止画フルスクリーンの左右タップ / 中央クローム / ピンチズーム・パン / 相関済みクリック抑止、
+> Step 3b 静止画フルスクリーンの左右パネル導線、Step 3c 上バーのタッチ専用 hit resolver、
+> Phase 2 の一覧直接スクロール / 方向スナップ / ピンチ列数変更まで完了。
 > きっかけ: 利用者からの「タブレット PC のタッチ操作に対応しているか」という質問。
 >
-> **確定した方針 (利用者判断 2026-08-06)**:
-> ① 動画も対応必須 (アプリとしてタッチ対応を表明するため)。
-> ② 左右パネルの操作もカバーする (AI アップスケール / カラー化 / ブックマーク / レーティング / タグ)。
-> ③ 「選択済みセルの再タップで開く」も入れる (既存マウス操作に影響しない範囲で)。
-> ④ **タッチ機能の ON/OFF 設定は作らない**。既存操作に影響を与えず、タッチしたときだけ別動作。
+> **仕様は確定済み (利用者判断 2026-08-06、2026-08-07 更新)。未決事項なし。§5.14 が決定一覧。**
+> 動画も対応必須 / 左右パネルもカバー / 再タップ open は見送り /
+> **タッチ ON-OFF 設定は作らない** (マウス無影響で、タッチしたときだけ別動作) /
+> ペンはタッチ扱い / 診断用の強制無効は持つ / タップ領域は中央矩形案 /
+> 動画のシークは ±5 秒 / AI アップスケールとカラー化は静止画のみ対象。
 
 関連ドキュメント:
 
@@ -27,7 +30,7 @@
 **静止画・動画の「閲覧行動」をタブレットのタッチだけで完結できるようにする**。具体的には:
 
 1. 一覧を指でスクロールする
-2. フォルダ / サムネイルをタップして開く (**選択済みセルの再タップで開く**を含む)
+2. フォルダ / サムネイルを既存のダブルタップで開く
 3. フルスクリーンでページを送る (単ページ / 見開き / 本)
 4. フルスクリーンで拡大縮小・パンする
 5. 隠れている UI (上バー / 左右パネル) をタッチで確実に呼び出す
@@ -46,9 +49,9 @@
 
 これらは「使えなくはない (タップ = 左クリックとして動く)」状態を維持するに留める。
 
-> ⚠ **ペンの扱いは未決定** (§5.14)。winit は指とペンを同じ `WindowEvent::Touch` に潰すため、
-> 「ペンは従来どおりマウス扱い」を保証するには winit / eframe より下に source tag を足す必要がある。
-> 何もしなければ**ペン接触もタッチとして解釈される**。
+> **ペンはタッチ扱いにする** (決定、§5.16)。winit は指とペンを同じ `WindowEvent::Touch` に潰すため、
+> 特別な対応をしなければペン接触もタッチとして解釈される。これを受け入れる。
+> 唯一の代償はグリッドからのファイル D&D がペンでできなくなること。ペンのホバーは効く。
 
 ---
 
@@ -136,22 +139,20 @@ egui viewport で効いているのは、すべて egui-winit の「先頭接点
 
 ### 2.6 動画 native presenter は事情が逆
 
-動画の presenter HWND / HUD HWND は **mIV 自前の Win32 ウィンドウ**で、
-`RegisterTouchWindow` も `WM_TOUCH` / `WM_POINTER` / `WM_GESTURE` ハンドラも持たない
-(`src/video/native_window.rs:22-39`, `src/video/native_window_host/hud_window.rs:64-75`)。
-未処理メッセージは `DefWindowProcW` に流れる (`native_window.rs:1478`, `hud_window.rs:1027`)。
-
-→ ここでは **Windows の既定タッチ→マウス合成が効く**。結果:
+動画の presenter HWND / HUD HWND は **mIV 自前の Win32 ウィンドウ**である。
+Phase 1 の実機ゲート前は両方とも `WM_POINTER` を処理せず `DefWindowProcW` に流していたため、
+**Windows の既定タッチ→マウス合成が効いていた**。結果:
 
 - タップ → 左クリック合成 → 再生/一時停止等に入る
 - 長押し → 右クリック合成 → mIV の native 右ボタン処理へ入る
 - **ピンチ → Ctrl+wheel が来るが、動画のズームには繋がらない** (Ctrl+wheel はタイル表示の列数変更のみ、`render_core.rs:4244-4280`)
 - **パン → `WM_VSCROLL/WM_HSCROLL` ハンドラが無く、何も起きない**
 
-**潜在バグ (Codex Sol の推測、要実機確認)**: OS が長押し成立時点で短い `WM_RBUTTONDOWN/UP` を
-生成する環境では、mIV が測る押下時間が元のタッチ開始ではなく右ボタン down からになるため、
-**「短い右クリック」と誤分類されてフルスクリーンが閉じる**可能性がある
-(`src/app/native_video.rs:8829-8855, 8898-8911, 9039-9052`)。
+**実機で確認済みのバグ**: presenter 上の長押しでは `WM_POINTERUP` の後に同一ミリ秒で
+`WM_RBUTTONDOWN/UP` が合成され、mIV が「短い右クリック」と分類してフルスクリーンを閉じた。
+Phase 1 Step 4 では presenter の `PT_TOUCH` stream 全体を所有して `DefWindowProcW` へ渡さない
+構造へ変更したため、この合成経路自体を遮断している。**構造的な解消の確定は変更後ビルドの
+実機確認後**とする。HUD HWND は今回所有していないため、HUD 上の長押し合成は Phase 3 まで残る。
 
 ### 2.7 リングショートカットのタッチ対応は「設計上の表現だけ」
 
@@ -303,6 +304,37 @@ egui-winit 0.33.3 は 1 回の `on_touch()` 呼び出しの中で、次の順序
 終了: Touch(End)   → PointerButton(Primary, released) → PointerGone
 ```
 
+ただし合成 pointer 列を出すかどうかは、`on_touch` の次の gate で接点ごとに決まる:
+
+```rust
+pointer_touch_id.is_none() || pointer_touch_id == Some(id)
+```
+
+gate が真なら phase ごとのミラー遷移と合成列は次のとおり。偽なら raw `Touch` だけで、
+その接点に合成 pointer 列は一切ない。
+
+| phase | `pointer_touch_id` の遷移 | `Touch` 直後の合成 pointer 列 |
+| --- | --- | --- |
+| `Start` | `Some(id)` にする | `PointerMoved` → primary press |
+| `Move` | 変更しない | `PointerMoved` |
+| `End` | `None` にする | primary release → `PointerGone` |
+| `Cancel` | `None` にする | `PointerGone` のみ。primary release は出ない |
+
+したがって 2 本目の `Start` は、1 本目が `pointer_touch_id` を保持している間は合成 pointer を
+伴わない。一方、pointer 接点だった指が先に `End` すると id が `None` になって gate が再び開く。
+その後も画面上に残っている 2 本目の `Move` は `PointerMoved` を出し、続く `End` は、その接点が
+primary press を一度も出していなくても primary release → `PointerGone` を出す。mIV の相関層は
+この再開放を含めて gate と 1 対 1 でミラーし、release を正当な期待列として相関する。
+
+`drive_egui_touch_input(..., enabled)` の `enabled` は、**入力を観測するかではなく、
+認識結果を実行してよいか**を表す。通常の呼び出しでは値にかかわらず raw Touch を処理し、
+接点、pending signature、egui-winit の `pointer_touch_id` ミラーを常に進める。
+`enabled=false` では返却コマンドと primary 抑止勧告だけを落とし、相関済み provenance と
+active/contact 状態は caller が境界を安全に閉じるため保持する。これにより Start が範囲選択等の
+抑止中、End が解除後という並びでも、次の stream を stray tail と誤認せず 1 回で認識できる。
+診断用 `MIV_DISABLE_TOUCH_GESTURES=1` はこの引数とは別の process-wide hard disable であり、
+従来どおり touch action と promoted-pointer filter を無効にして legacy 経路へ戻す。
+
 `InputState::events` は raw event 列を順序どおり clone している
 (`egui-0.33.3/src/input_state/mod.rs:574`) ので、mIV からこの並びを観測できる。
 
@@ -326,7 +358,7 @@ egui-winit 0.33.3 の実装契約**なので、**依存更新時のイベント�
 | 誤判定の向き | 結果 | 許容 |
 | --- | --- | --- |
 | タッチを見逃してマウス扱い | 従来どおりの左クリックとして動く | **許容可** |
-| マウスをタッチと誤認 | 再タップ open や中央タップ action が走る | **許容不可** |
+| マウスをタッチと誤認 | 中央タップなどの touch action が走る | **許容不可** |
 
 → **肯定証拠だけで新経路へ入る (fail-closed)** 設計にすれば、
 マウス操作は原理的に壊れない。具体的には:
@@ -351,12 +383,19 @@ egui-winit 0.33.3 の実装契約**なので、**依存更新時のイベント�
 
 2 段階に分ける:
 
-- **合成 primary pointer の所有**: 最初の接点の Start から、その接点の End/Cancel まで
+- **egui-winit の `pointer_touch_id` 保持**: gate が開いた `Start` でその id を保持し、
+  同じ id の `End` / `Cancel` で解放する。ただし解放後は別接点がまだ画面上に残っていても
+  gate が再び開き、その接点の `Move` / `End` も合成 pointer 列を出し得る。したがって
+  「先頭 1 接点だけが pointer をエミュレートする」ではない
 - **マルチタッチジェスチャの所有**: 最初の接点から、参加した全接点が End/Cancel するまで
 
 **2 本目が入った時点で pending の single tap を取り消し**、最初の指が先に離れても
 tap / ページ送りを発火させないことが重要。
-一度 pan / pinch / scroll に確定した stream は、**全接点が離れるまで別 action へ移さない**。
+一度 pan / pinch / scroll に確定した解釈を、**同じ接点集合のまま別 action へ移さない**。
+これは同じ接点の解釈が行き来することを禁じる規約であり、接点集合が増えた場合の昇格は
+禁じない。**接点が増えたときに限り、単指 pan から pinch へ昇格してよい**。昇格時は
+現在の接点位置から pinch の基準を取り直す。逆方向の pinch → 単指 pan への降格は行わず、
+2 本目が離れても全接点が離れるまで `Pinch` ownership を保持する。
 
 #### Cancel の穴 (実機確認要)
 
@@ -371,7 +410,6 @@ egui-winit は Touch Cancel 時に `PointerGone` を出すが、**primary releas
 | --- | --- | --- |
 | タップ | セル選択 / 開く | **中央矩形 = クローム表示 / それ以外は左右でページ移動** |
 | 単指ドラッグ | **スクロール** (file D&D は抑止) | 既存のパン / 連続読みスクロール |
-| **端からの内向きスワイプ** | — | **その側のパネルを開く** (補助経路、§5.5) |
 | 2 本指 | — | **ピンチズーム + 2 本指パン** |
 | 長押し | コンテキストメニュー (既存のまま) | コンテキストメニュー (既存のまま) |
 | リング | **接続しない** | **接続しない** |
@@ -394,6 +432,13 @@ egui-winit は Touch Cancel 時に `PointerGone` を出すが、**primary releas
 
 ### 5.4 一覧スクロール — anchor + fraction 方式
 
+**実装済み (Phase 2 一覧スクロール + 実機フィードバック反映)**。`scroll_offset_y` は行境界の anchor のまま維持し、
+1 行未満の描画端数は main viewport の一時データに分離した。端数表示中の可視 / keep 終端は
+1 行拡張し、touch move / hold / release から prefetch・settle・idle-upgrade の時刻を明示更新する。
+タッチ由来の primary stream だけ native file D&D を抑止する。最後に実際に動いた方向も同じ
+viewport 一時状態に保持し、release はその方向へ確定する。2 本目が加わった場合は一覧でも
+pinch へ昇格し、一覧側が連続倍率を列数変更へ解釈する。
+
 **太いスクロールバーやページ送りゾーンだけでは「タッチで快適」とは言えない**。
 指で一覧を直接動かせることは必須。ただし `scroll_offset_y` をドラッグ中だけ自由値にするのは避ける
 (行スナップは仮想表示・サムネイル保持の前提になっており、読み手が多い)。
@@ -406,20 +451,43 @@ egui-winit は Touch Cancel 時に `PointerGone` を出すが、**primary releas
 
 ドラッグが 1 行を越えるたびに `scroll_offset_y` を 1 行進め、`fractional_drag_y` から 1 行分を引く。
 これで **`scroll_offset_y` は常に行境界のまま**になり、既存の読み手を触らずに済む。
-指を離したら端数を最寄りの行へ確定する。
+指を離したら、最後に表示位置が動いた方向の行境界へ確定する。ただし移動開始直後の誤操作を
+吸収するため、端数が行高の 15% 以内なら逆方向への確定を許す。方向不明時だけ最寄り行へ
+フォールバックする。これにより release 時の逆走量は上下どちらも最大 15% となる。
+
+release から確定先までの移動量が行高の 20% 未満なら従来どおり即時確定し、それ以上なら
+130ms の cubic ease-out で補間する。補間中に動かすのは `fractional_drag_y` だけで、
+`scroll_offset_y` (anchor) は開始行の境界に保ち、完了 frame で確定先の行境界へ 1 回だけ
+更新して端数を 0 にする。新しい touch が始まった場合は、その frame まで進んだ端数を引き継いで
+補間を中断する。元の位置へ戻したり、補間完了を待ったりしない。
 
 付随して必要な改修:
 
 - 端数表示中は可視範囲の**末尾を追加で 1 行保持**する (でないと下端が欠ける)
-- touch move ごとに「スクロール中」を明示的に通知する
+- touch move / release と snap 補間の各 frame で「スクロール中」を明示的に通知する
   — `last_prefetch_scroll_at` / `last_scroll_event_at` / idle-upgrade の時刻を更新し、
-  指を離すまで scroll settle を発火させない。
+  snap 補間がある場合は完了まで scroll settle を発火させない。release frame は raw Touch End も
+  early intent として記録し、補間状態を作る前に prefetch gate が一瞬開くことを防ぐ。
   現在の scroll 検出はオフセット変化の fallback に頼っており (`app/runtime_ops.rs:13-31`)、
   **端数だけ動いたフレームは検出できない**
+- snap 補間中だけ `ctx.request_repaint()` を要求する。補間の terminal frame で状態を
+  `Contact` に戻してから repaint 条件を評価し、補間状態が無い frame から animation
+  repaint を出さない
 - **タッチ由来のポインタストリームでは native file D&D を無効にする** (`ui_main.rs:12325`)。
   マウス D&D は維持する
+- 一覧 pinch は recognizer の `Zoom { factor, pivot }` をそのまま受け、一覧側だけが列数へ
+  意味付けする。`Pan` は無視し、列数変更とスクロールを同時に走らせない
+- 倍率は gesture 開始または直前の列変更から乗算で累積する。1.25 以上で 1 列減、
+  0.8 以下で 1 列増としてから 1.0 へリセットする。`MIN_GRID_COLS` /
+  `MAX_GRID_COLS` の端でも threshold 到達後はリセットし、反転時の基準を中立に戻す
+- pinch 中の列数変更は即時反映して `bump_input_seq("grid_cols", None)` を呼ぶが、
+  `settings.save()` は呼ばない。gesture 内で列数が変わった dirty bit を viewport 一時状態に
+  保持し、`PinchEnd` または cancel で状態を consume した 1 回だけ保存する。
+  Ctrl+ホイールは従来どおり 1 step ごとに即時保存する
 
-**慣性は初期版では入れない**。「指に追従して動く + 離したら行スナップ」だけでも現状より大幅に改善する。
+**慣性は入れない**。「指に追従して動く + 離したら行スナップ」だけでも現状より大幅に改善する。
+上記 130ms は release 時点で既に決まっている snap 先までの短い補間であり、速度から到達行を
+増やす慣性ではない。
 無制限の物理スクロールは PDF 先読み・eviction・idle upgrade との調整コストに見合わない。
 実機評価後に必要なら、速度から最終到達行を決める限定形 (最大数画面・慣性中は prefetch 抑止・
 最後は必ず行スナップ) だけを追加する。
@@ -451,6 +519,69 @@ egui-winit は Touch Cancel 時に `PointerGone` を出すが、**primary releas
 
 → 中央タップと `ClickToShow` は**衝突しない**。
 
+#### Step 3b 実装記録 (2026-08-08)
+
+- 静止画フルスクリーンの egui viewport に、`TouchChromeLatched` が ON の間だけ描く
+  **タッチ専用ハンドル**を追加した。既存 hover callout の表示条件・矩形・矢印・tooltip は変更せず、
+  タッチハンドルは `hover_pos()` に依存しない別 widget とした
+- ハンドル幅は `STILL_TOUCH_PANEL_HANDLE_WIDTH_PT = 48pt`。高さは viewport 高の 24% を
+  96--220pt に clamp し、さらに上バー 44pt と下シークバー 38pt の間へ clamp する。
+  極端に低い viewport で安全帯が無い場合は描画も hit test もしない
+- 左右ハンドルは物理的な左 / 右へ固定し、左は画像補正パネル、右はメタデータパネルを開く。
+  読み方向では反転しない。マウス callout とタッチハンドルは同じ意味 action を呼ぶ
+- `Hover` / `ClickToShow` の両モードでタッチハンドルを表示する。ハンドル矩形はタップ zone の
+  `excluded` へ加え、ハンドル操作がページ移動 / 中央クローム toggle と競合しないようにした。
+  対応パネルが開いた側は描画・hit test・`excluded` のすべてから外し、反対側だけを残す
+- 左補正パネルと右情報パネルの明示 open はどちらも
+  `MetadataPanelOpenState::{Closed, ByPointer, ByTouchHandle}` を単一の正本とする。全 surface の
+  resolver は同じ state を読み、`ByTouchHandle` は mode に関係なく表示、`ByPointer` は従来どおり
+  `ClickToShow` でだけ表示する。mouse / native / music の pointer writer は `Hover` で no-op の
+  まま、タッチハンドルだけが専用 writer から idempotent な `ByTouchHandle` を生成する
+- `ByTouchHandle` のパネル外をタップしたときは、左右の touch-owned パネルを 1 つの modal group
+  として両方閉じ、そのタップを page / chrome toggle に再利用しない。`ByPointer` は従来どおり
+  パネル外クリックでは閉じない
+- `ByTouchHandle` はファイル / ページ移動とフルスクリーン退出で `Closed` へ戻す。
+  連結表示の再アンカーで従来維持していた `ByPointer` は維持し、touch owner だけを閉じる
+- `MIV_TOUCH_DEBUG=1` の既存 command / ownership 診断は維持した。初回オーバーレイヘルプ、
+  動画 native / 音楽、パネル内部の小 target 対応はこの Step 3b には含めない
+
+#### 拡大中の 1 本指パン修正 (2026-08-08)
+
+実機で「ドラッグしてもパンできない」と報告されたため、Step 3b 直前の `9f64f5d3` と比較した。
+raw touch の press → move → release は `ViewerPointerPassthrough` で egui の
+`drag_started_by(Primary)` / `dragged_by(Primary)` / `drag_stopped_by(Primary)` まで成立していた。
+原因はそれより後段で、`Sense::click_and_drag` が移動閾値を超えた最初の move frame で初めて
+`drag_started` になるのに、pan 側がその frame を開始位置の保存だけに使い、同 frame の移動量を
+捨てていたことだった。短い / coalesced な touch move では全移動量を失う。
+
+この pan 処理は 2026-04-13 から存在し `9f64f5d3` にも同形であるため、**Step 3b の退行ではない**。
+press の合成や症状 guard は加えず、実際の press からの `total_drag_delta()` を drag 開始時の pan
+へ適用するよう ownership 境界を修正した。既存マウスの絶対 drag / clamp の意味も維持し、
+raw touch stream と最初の move の pan 反映をテストで固定する。
+
+#### パネル外タップ後の primary 抑制 ownership 修正 (2026-08-08)
+
+実機では、touch-owned 左右パネルをパネル外タップで閉じた後、
+タッチとマウスの両方でパンできなくなる退行が出た。fs_zoom、panel hit、
+command dispatch の continue はいずれも次フレームへ残る状態を作っておらず、
+旧共有状態 fs_suppress_primary_until_release が残るときだけ両入力の pan 分岐を
+まとめて飛ばすことを確認した。
+
+根本原因は、この共有状態を arm する owner と clear する owner が一致していなかったこと。
+touch command / correlated response は touch tracker の terminal frame でも latch を arm
+していた一方、clear は別 owner である egui pointer の primary_released() に依存していた。
+通常の単一 pass では同時に観測できる。一方、primary release の後に PointerGone tail が
+分かれ、パネル表示変更後の同一 app frame replay が先に走る列では、相関層は response 抑制を
+replay するが egui の release edge は前 pass で消費済みになる。この pass が latch を再 arm し、
+後続の PointerGone には release が無いため、将来の clear event が存在しない状態になっていた。
+
+FullscreenPrimarySuppression の Idle / PointerStream / TouchStream を単一 owner とし、
+pointer 起点は primary release、touch 起点は touch completion / Cancel で終端する reducer
+へ集約した。terminal touch replacement と correlated response は当該フレームだけを抑制し、
+cross-frame state を新規 arm しない。pointer release の遷移は input handler 冒頭に置き、
+navigator / capture selection / compare wipe の早期 return より前に必ず実行する。
+パネル外タップ後の touch / mouse drag と、terminal / replay / Cancel の各終端を unit test で固定した。
+
 上バーの可視判定は既に純関数 `still_top_bar_visible_from_inputs` (`ui_fullscreen.rs:1018-1027`)
 なので、入力構造体に 1 フィールド足すだけで済む。テストも既存パターンに乗る。
 
@@ -464,52 +595,200 @@ Apple Books / Google Play Books / Kindle / YouTube などで**十分に定着し
 
 mIV では次の 3 段で担保する:
 
-**① 移行直後のクローム表示 (最も素直な回答)**
+**中央タップを学習するまで初回オーバーレイヘルプを出す。常時表示の affordance は置かない。**
 
-**タッチ操作でフルスクリーンへ入った場合だけ**、クロームを表示した状態で始める。
-中身は 3 つで、**それぞれ寿命が違う**:
+実装は面ごとに段階導入する。Step 3d は**静止画 / 本フルスクリーンだけ**を対象とし、
+未学習の状態で最初のタッチ接点が発生した時点に、その面で有効なジェスチャを図示した
+オーバーレイを重ねる。動画 / 音楽は Phase 3 で同じ方針を適用する。中央タップを教えた後は
+何も出さないので、**閲覧中に画像を遮るものが一切なくなる**。
 
-| 要素 | 内容 | 寿命 |
-| --- | --- | --- |
-| **A. 上下バー** | 上バー (× を含む) + 下シークバー | **移行直後のみ**。最初のページ送り / 中央タップ / 数秒で引っ込む |
-| **B. 左右の呼び出しハンドル** | パネルを開くハンドル | **タッチセッション中ずっと** (下記②) |
-| **C. 中央タップの案内** | 中央タップ領域の輪郭 + 1 行の案内文 | **中央タップを一度使うまで**。使ったら以後出さない |
+#### 表示条件 — 「1 回だけ」ではなく「中央タップを一度使うまで」
 
-- **C は「事実」ではなく「場所」を教える**。単なるテキストではなく
-  **中央タップ領域の輪郭を薄く描いて、その中に案内文を置く**。
-  これで「クロームがある」ではなく「**どこを叩けば戻せるか**」が伝わる。
-- **C をタップすることが中央タップそのもの**になるので、案内の消し方を別途覚える必要がない。
-- **C は控えめに**。全画面を覆うモーダルなチュートリアルにはしない。閉じる操作も要求しない。
-- 操作中 / パネル表示中 / スライダー・シークバーのドラッグ中は消さない。
-- **マウス・キーで開いた場合は A / B / C いずれも出さない** (既存挙動を一切変えない)。
+純粋な「1 回だけ」だと、**その 1 回を見逃した / 忘れた利用者が再び詰む**
+(タブレットには Esc キーが無く、逃げ道がない)。そこで:
 
-> ⚠ **毎回 3 秒出す設計にはしない**。条件は
-> **「利用者が中央タップ (またはエッジスワイプ) でクロームを一度呼び出すまで」**。
-> 呼び出せることを示せたら以後は出さない。
-> これは利用者向け設定ではなく「チュートリアル済みフラグ」なので §5.1-6 と矛盾しない。
-> **かつ、これが「閉じられない」ことへの安全網**になる: 呼び出し方を覚えるまでは
-> 毎回クロームが出ている状態で始まるので、× に必ず到達できる。
+> **中央タップでクロームを一度表示できたら「学習済み」**として、以後は出さない。
+> それまでは開くたびに出す。
 
-> ⚠ **発火は「グリッドからフルスクリーンへ入ったとき」だけ**にする。
-> フルスクリーン内のファイル移動 (`open_fullscreen_from_fs_navigation` の fast-swap 経路) では
-> 発火させない。ここを取り違えると**ファイルを送るたびにバーが被る**。
-> 本のページ送りはそもそもフルスクリーン内で完結するので影響しない。
+- 大多数の利用者にとっては**文字どおり 1 回**で終わる
+- 見逃した人にだけもう一度出るので、**「閉じられない」への安全網**が残る
+- **案内した操作全部の実行は要求しない**。煩わしいうえ、安全上必要なのは中央タップだけ
+- 必要なのは各面に真偽値 1 個 (「クロームを一度呼び出したか」)。静止画 / 本と動画は
+  左右タップの意味が異なるため独立して学習する。利用者向け設定ではないので
+  §5.1-6 の無設定方針と矛盾しない
+- **マウス・キーで開いた場合は出さない** (既存挙動を一切変えない)
 
-実装上は**新しいビジュアルを作る必要がない**。A は既存の上バー / シークバー、
-B は既存の `ClickToShow` 呼び出しバー (`ui_fullscreen.rs:945-978`) の可視条件を変えるだけ。
-新規描画は C だけ。
+#### 内容 — 面ごとに出し分ける
 
-**② タッチセッション中は左右の呼び出しハンドルを薄く常時表示**
+単なるテキスト箇条書きではなく、**中央領域の輪郭・左右領域を半透明で図示**する。
+「クロームがある」ではなく「**どこを叩けば何が起きるか**」を伝える。
 
-`ClickToShow` の呼び出しバーは既に 20pt の可視バーとして存在する (`ui_fullscreen.rs:945-978`)。
-これを**タッチセッション中はホバー条件なしで薄く出しっぱなし**にする。
-新規 UI ではなく既存コンポーネントの可視条件を変えるだけ。
+| 面 | オーバーレイの内容 |
+| --- | --- |
+| **静止画 / 本** | 中央タップ = メニュー / 左右タップ = 左右のページへ |
+| **動画** | 中央タップ = HUD 表示 / 非表示、左右タップ = ±5 秒の相対シーク |
+| **音楽** | **出さない** (下記) |
 
-- 端に置くので画像の中央を遮らない
-- **左右対称**なので利き手・持ち方に依存しない
-- 「端から引き出す = パネル」という意味が形と一致する
+**音楽ビューには初回ヘルプを出さない (利用者判断 2026-08-09)**。この案内の存在理由は
+2 つあり、音楽ビューはどちらにも当たらない:
 
-**③ 中央タップ / エッジスワイプ** (上記)
+1. **不可視の中央矩形を教える** — 音楽ビューは上下 HUD が常時表示で、隠れているクロームが無い
+2. **フルスクリーンからの逃げ道を作る** (タブレットには Esc が無い) — 閉じる手段が常に見えている
+
+シークもグラフのタップで既に届く。教えることも詰みも無い面に案内を出さない。
+
+- **オーバーレイ中はどこをタップしても中央タップとして扱う**ので、消し方を別途覚える必要がない
+- 全画面を覆うモーダルなチュートリアルにはしない。閉じる操作も要求しない
+- **隅に「UI が小さい場合はメニューの『スケーリング』から変更できます」の 1 行を添える**
+  (従属的に小さく。強制しない。詳細は §5.14-8)
+
+#### Step 3d 実装記録 (2026-08-08)
+
+- 「タッチで開いた」の判定は **(b) フルスクリーン中の最初のタッチ接点で表示**を採用した。
+  raw touch 相関済みの既存 `TouchFrame` を使うため、マウス / キーだけでは表示されず、
+  全 open 入口へ provenance を追加しない。最初の接触列は案内表示だけに消費し、その次の
+  任意位置タップを中央タップとして扱う
+- 学習済みは現在 `Settings.touch_still_chrome_learned` の bool 1 個へ保存する。
+  Step 3d で追加した旧名 `touch_center_chrome_learned` は未出荷だったため、Phase 3 Step 2b で
+  動画用フラグを分離する際に移行コードなしで対称な名前へ変更した
+  `settings_kv` の加法フィールド + `#[serde(default)]` なので DB schema family は変えず、
+  旧 DB のキー欠落は false で読み込む。旧 DB の boot が `LoadedExistingDb` のままで
+  quarantine しないことと、true の保存 / 再読込をテストした
+- 表示中は同じ viewport / surface の一時 typed state が全タッチコマンドを所有する。
+  左右タップもクローム表示 + 学習済み保存へ畳み、ページ送りには渡さない。ピンチ / パンも
+  オーバーレイを閉じず実行しない
+- 図示する中央矩形と `classify_tap` は共通の `center_tap_rect` producer を使う。
+  矩形一致と四隅を含む分類を unit test で固定した
+- `HelpShowContextShortcuts` の画像フルスクリーンへ「タッチ操作」欄を追加し、中央タップ、
+  左右タップ、2 本指ズーム / パンを再確認できるようにした。Step 3d 時点では動画 / 音楽には
+  追加せず、動画は Phase 3 Step 2 以降で追加した
+
+#### 動画・音楽のタップ割り当て
+
+**動画にはページ送りが無い**ため左右の動作は静止画と異なるが、タップ領域は静止画と
+同じ 3 領域を使う。
+
+**確定 (利用者実機判断 2026-08-08): 中央タップは HUD toggle、左右タップは単発で相対シーク。
+前後ファイル移動は下 HUD のボタンに任せる。**
+
+2026-08-06 の机上判断による次の旧仕様は、実機ではタップの意味が時間窓で変わって誤操作に
+感じられたため **2026-08-08 に撤回**した。履歴として削除せず残す。
+
+- **撤回: 「単一タップは画面全体で HUD 表示」**。現仕様は静止画と同じ
+  `center_tap_rect` の中央だけが HUD 表示 / 非表示を切り替える
+- **撤回: 「左右の『ダブル』タップで相対シーク。単一タップにシークを載せると誤操作しやすい」**。
+  現仕様は左 / 右の単発タップ 1 回ごとに、それぞれ 5 秒戻る / 進む
+
+現仕様:
+
+- 領域は静止画と完全に同じ `center_tap_rect` / `classify_tap` を使い、動画専用の矩形を作らない
+- 中央タップは HUD 表示 / 非表示だけを切り替え、シークしない
+- 左タップは -5 秒、右タップは +5 秒。物理的な画面の側を使い、RTL / LTR の読み方向で反転しない
+- 左右タップのシークはクローム latch に触れない。HUD が表示中なら表示したまま、隠れていれば
+  隠れたままにする
+- **前後ファイル移動は左右タップに載せない**。誤爆すると再生中の動画が消える。
+  **下 HUD の [前ファイル] / [次ファイル] ボタンで足りる** (既存)
+- 音楽ビューは既存のグラフ領域タップによるシークを変更しない。音声専用 native shell も従来どおり
+  `PageSide` をクローム toggle に写像し、動画の左右シークと初回案内を有効にしない
+
+**シーク量は ±5 秒で確定** (§5.14-9)。素の左右キーと同じ
+`native_video_seek_relative_with_hint(fs_idx, ±5.0)` を通し、アプリ内の刻みと
+先頭 / 末尾のフィードバックを共有する。
+
+#### Phase 3 Step 2 / Step 2b 実装記録 (2026-08-08)
+
+- Step 2 で追加した `DoubleTapRun`、500 ms の時間窓、48 pt の距離しきい値と関連テストは
+  Step 2b で削除した。`NativeTouchAdapter` はタップ間の時刻 / 距離 / 回数を保持しない
+- `PageSide` は動画ジェスチャ有効時に 1 コマンドからちょうど 1 回の `SeekRelative` を作る。
+  左は常に負、右は常に正で、読み方向の解決を通さない。中央の `ToggleChrome` だけが
+  chrome latch を変更し、`SeekRelative` の dispatch は latch を読み書きしない
+- 初回案内は静止画 / 本の `Settings.touch_still_chrome_learned` と動画の
+  `Settings.touch_video_chrome_learned` に分離した。旧 `touch_center_chrome_learned` も両新フラグも
+  v2.13.0 の未出荷データなので、移行コードなしで旧名を置き換えた。どちらも `settings_kv` の
+  加法フィールド + `#[serde(default)]` であり、DB schema family は変えない
+- 未学習の動画で最初の touch contact が来たときだけ案内を表示し、その接触列の release 後に来る
+  任意位置タップを学習 + HUD 表示へ畳む。案内中は左右タップもシークへ渡さない
+- Win32 stream 所有と共通 `TouchRecognizer` は変えず、動画固有の位置→command 写像と案内状態を
+  `NativeTouchAdapter` に置く。相対シークは absolute seek command を作らず、App の既存
+  `native_video_seek_relative_with_hint` へ渡す
+- HUD source は既存の widget passthrough を維持する。音楽ビューのファイルは変更せず、音声専用
+  native shell には左右シークも初回案内も追加しない
+
+#### Phase 3 Step 2c — 静止画ヘルプを読み方向で解決する (2026-08-09、Step 2d で一部訂正)
+
+- Step 2c では静止画 / 本の初回案内と `?` のコンテキストヘルプの両方を、現在の読み方向で
+  解決した「前のページ」/「次のページ」に変更した。LTR は左 = 前 / 右 = 次、RTL は左 = 次 /
+  右 = 前とし、実際のタップページ送りと同じ `spread_mode.is_rtl()` を正本にした
+- 当時は、初回案内も現在の画面で有効な割り当てだけを示せばよいと判断した。しかし学習フラグ
+  `touch_still_chrome_learned` は全ファイルで共有される一方、読み方向はファイルごとに変わり、
+  初回案内は学習後に再表示されない。LTR のファイルで覚えた対応は、その後 RTL のファイルを
+  開いても更新されないため、**一度しか出ない案内を方向解決した判断は誤りだった**
+- `?` のコンテキストヘルプは現在のファイルで何度でも開けるため陳腐化しない。こちらは
+  Step 2c の方向解決を維持し、現在の読み方向に応じた「前のページへ移動する」/
+  「次のページへ移動する」を表示する
+- 長い左右ラベルが中央矩形へ潜り込まないよう、左右ラベルは画面半分の
+  中心ではなく、それぞれが説明する画面端〜中央タップ矩形間の帯の中心へ置く。外向き矢印は
+  物理的な左右を示すものとして維持する
+- **音楽ビューは egui surface であり、native touch アダプタの対象外**。通常の音声モードでは
+  `fs_music_view_active` の面を egui が描き、native presenter は隠れているため、タッチは native
+  アダプタへ届かない。波形タップのシークは音楽ビュー自身の既存動作で、HUD は常時表示される。
+  `audio_only: true` の native overlay は音楽 VST シェル専用なので、**動画の native 挙動を
+  音楽ビューで検証しない**
+
+#### Phase 3 Step 2d — 初回案内を読み方向に依存しない文言へ戻す (2026-08-09)
+
+- 静止画 / 本の初回案内は、物理的なタップ位置との不変の対応を教える
+  「左のページへ」/「右のページへ」に変更した。どちらの読み方向でも、タップした側にある
+  ページへ移動するため常に正しい
+- 初回案内の描画、呼び出し元、スナップショット fixture から `spread_mode.is_rtl()` と
+  `is_rtl` 引数を外した。方向別に同じ画像を持たないため RTL 専用スナップショットも削除した
+- `?` のコンテキストヘルプは Step 2c の方向解決をそのまま維持する。初回案内は一度きりの
+  不変の対応、コンテキストヘルプは現在のファイルの前 / 次対応を答える役割とする
+
+#### Phase 3 Step 3f — 連結読みのタッチ操作 (2026-08-09)
+
+- 連結読みでも認識済みの左右タップはページ表示と同じページユニットを送ることにした。
+  `fullscreen_click_nav_delta_for_side(left, rtl)` で物理側を読み方向へ写像し、キーボードの
+  `FsPageNext` / `FsPagePrev` と同じ `spread_page_nav(base)` を使う。単ページは 1 ページ、
+  見開きは 2 ページ進み、共通の `FsPageNav` 着地で `seek_to_continuous_page` を使うため、
+  離散的な fullscreen 再オープンにはならない
+- マウスクリックの連結読み中ページ送り抑制は維持した。マウスにはホイールという自然な
+  連続スクロール手段があり、変形状態が一時的に外れたフレームの偶発クリックをページ移動へ
+  変えないためである。一方、recognizer が確定した touch tap は偶発入力ではないので、
+  §5.14-11 と同じくタッチとマウスを意図的に分けた
+- §5.5「拡大中の 1 本指パン修正」はページ表示側だけを直しており、連結読み側には同じ
+  `pointer.delta()` の穴が残っていた。連結読みの touch drag は egui response の
+  `total_drag_delta()` から直前適用済み総量を引いた増分を使う。press〜release が 1 RawInput に
+  畳まれて response が idle になる終端だけは、正に相関済みの touch Start / End 総量を使う
+- 累積量は fullscreen session と viewport に属する `Idle / Active / Completed` の typed state で
+  管理する。release / pointer-down 消失で `Completed` にし、同一 app frame の terminal replay は
+  0 増分、次 app frame または session 変更で `Idle` へ戻して削除する。次のタップへ状態を残さない
+- マウスドラッグは従来どおり response が drag を所有している間の `pointer.delta()` をそのまま
+  適用する。主軸 / 直交軸の分解と Ctrl の扱いも変更していない
+- タップとドラッグがページ表示 / 連結読みのどちらでも同じ説明どおりに動き、連結読みでは
+  ズームモードを使えず 1 本指ドラッグがスクロールに一意に決まる。このため初回ヘルプの
+  モード別併記は不要で、描画・文言・スナップショットは変更しない
+
+#### 忘れた人の再表示手段
+
+既存のコンテキストヘルプ **`HelpShowContextShortcuts`**
+(`docs/key-command-catalog-plan.md` Phase 7) に **「タッチ操作」欄を追加**する。
+現在の画面で有効な操作だけを出せるので、通常のヘルプページより見つけやすい。
+新しい機構は要らない。
+
+#### 撤回: タッチセッション中の常時ハンドル表示
+
+前案では「タッチセッション中は左右の呼び出しハンドルを薄く常時表示」としていたが、
+**撤回する** (利用者判断 2026-08-06「常にボタンがあるのはよくない」)。
+
+パネルへの到達は次の経路に確定した:
+
+```
+中央タップ → クローム表示 (上下バー + 左右のパネルハンドル) → ハンドルをタップ → パネルが開く
+```
+
+初回ヘルプが中央タップを習得させ、コンテキストヘルプから再確認できるので、
+常時 affordance が無くても安全性は保てる。
 
 #### 検討して採らなかった案: 右上に常時メニューアイコン
 
@@ -543,26 +822,13 @@ B は既存の `ClickToShow` 呼び出しバー (`ui_fullscreen.rs:945-978`) の
 > **すべて同じ `ToggleChrome` 相当の動作にする**こと。
 > 一方がクローム、もう一方が全パネルを開く、という設計は覚えにくく誤操作を招く。
 
-#### 補助経路: 端からの内向きスワイプ
+#### 不採用: 端からの内向きスワイプ (2026-08-08 実機決定)
 
-「中央タップ → 見えるハンドル」が**正規経路**。加えて、覚えた人向けの高速経路として
-**画面端から内側へのスワイプでそのパネルを直接開く**。
+Windows 11 実機では、右端は通知センター、左端はアプリへ未配送、下端はスタートメニュー、
+上端もアプリへ届かず、**上下左右すべてを OS が予約する**ことを確認した。mIV の gesture として
+安定して成立しないため、edge swipe の owner / command / contact state / 閾値を含む実装は削除した。
 
-- タップ面積を一切消費しない (ページ送り領域が減らない)
-- 「端から引き出す」はパネル操作として意味が自然
-- 上部タップより誤発火しにくく、`ClickToShow` の「明示操作」思想とも合う
-
-成立条件 (競合を避けるため):
-
-- 開始点が左右端 24〜32pt、または画面幅の 5% 以内
-- 内向きに 32〜48pt 以上移動
-- **横方向の移動が縦方向より明確に大きい**
-- swipe 確定時に pending のページタップを取り消す
-- 2 本指ジェスチャ / widget 操作 / パネル内ドラッグでは無効
-- **ズーム中はキャンバスの pan を優先**し、パネルは中央タップ → ハンドルから開く
-
-⚠ 発見可能性は低いので**単独では成立しない**。また Windows タブレットでは Android ほど
-共通のイディオムではなく、**OS 側のエッジジェスチャに先取りされる環境がありうる** (実機確認要)。
+左右パネルへのタッチ到達経路は、**「中央タップ → 見えるハンドル」の 1 本**に確定する。
 
 #### 検討して採らなかった案: 4 分割 (上左右=パネル / 下左右=ページ移動)
 
@@ -575,7 +841,7 @@ B は既存の `ClickToShow` 呼び出しバー (`ui_fullscreen.rs:945-978`) の
 | 面積 | 上下 50:50 だとページ送り領域が全面 → **半分**に減る。ページ送りは圧倒的に高頻度で、パネルは低頻度。高頻度操作の領域を削って低頻度操作へ割り当てることになる |
 | 誤タップ | 境界が見えないため、少し上をタップしただけで**補正/編集パネルが出る**。`docs/fullscreen-side-panel-mode-plan.md` に記録された既存の不満 (「編集パネルが出ること自体が怖い」) の再発と見なすべき |
 | 学習コスト | 「左上 = 左パネル」という不可視の割り当てを覚える必要がある |
-| ClickToShow との整合 | 明示操作でだけパネルを出す思想と相性が悪い。整合性の順は **見えるハンドル > エッジスワイプ > 不可視の 4 分割タップ** |
+| ClickToShow との整合 | 明示操作でだけパネルを出す思想と相性が悪い。採用した**見えるハンドル**の方が意図を確認しやすい |
 | **RTL** | 同じ画面左側に「**左上 = 画面固定の左パネル**」と「**左下 = 読み方向で次/前が反転するページ操作**」が混在する。不可視領域の意味が統一されない |
 
 **中央タップを残す価値**: 「中央タップ = 操作 UI を出す」は Kindle / 動画プレイヤー /
@@ -629,13 +895,33 @@ PDF 再レンダリング (`ui_fullscreen.rs:4015, 4216`) はそのまま再利�
 
 #### (1) パネルを開く導線
 
-ここが本当の壁。上バーの `ℹ` ボタンは**右パネルを開くボタンではなく `Hover`/`ClickToShow` の
-モード切替**である (`ui_fullscreen.rs:22333-22360`)。また ClickToShow の呼び出しバー自体が
-端に `hover_pos()` がある間だけ描かれる (`ui_fullscreen.rs:5422-5435`) ため、
-**タッチでは押下時に見えた callout が release フレームで `PointerGone` により消え、
-click completion に到達しない可能性が高い** (§6-4、実機確認要)。
+Step 3b で静止画フルスクリーンの導線を実装した。中央タップでクロームを latch すると、
+`hover_pos()` に依存しない 48pt 幅の左右ハンドルが描画され、閉じている側のパネルを直接開ける。
+開いた側のハンドルは描画・hit test・tap-zone exclusion のすべてから消える。
 
-→ **§5.5 の中央タップによるクローム表示が、パネル到達の前提条件**になる。
+既存の hover callout はマウス用として従来の表示条件と形状を維持する。タッチ用 widget は
+press / release フレームで同じ widget ID と矩形を保つため、release と同じ入力 batch に
+`PointerGone` が来ても click completion に到達することを kittest で確認した (§6-4)。
+初回オーバーレイヘルプによる発見可能性の補強は次ステップに残す。
+
+#### Phase 3 Step 3h 実装記録 (2026-08-09)
+
+- 動画 native overlay にも、`NativeTouchAdapter::chrome_latched()` が ON の間だけ左右端へ
+  48pt 幅のタッチ専用ハンドルを描く。上バー直下の panel top (56pt) と下 64pt の HUD の
+  間だけを使い、
+  右パネルを表示できるメタデータが無い場合は右ハンドルを出さない
+- ハンドル rect は描画と同じ helper から `compute_hud_regions()` へ加える。これにより OS の
+  hit-test が HUD HWND を選び、Phase 3 Step 1 の HUD-source `WidgetPassthrough` で通常の
+  egui click になる。presenter の tap zone や新しい hit resolver は追加していない
+- 左の既存 session bool は `MetadataPanelOpenState` に置き換え、右の App-owned state と同じく
+  `ByPointer` / `ByTouchHandle` を区別する。開いた側のハンドルだけを描画・HUD region の両方から
+  外し、反対側は閉じていれば残す。左の選択中タブは変更しない
+- touch-owned パネルが開いている間に presenter 面のタップから `ToggleChrome` / `SeekRelative`
+  が確定した場合は、左右の touch owner を一つの modal group として閉じ、その command を破棄する。
+  pointer-owned 側は閉じず、同じタップをシークやクローム toggle に再利用しない
+- `side_panel_callout_visibility()` と既存 callout の描画・region 計算は変更していない。
+  ラッチ OFF ではハンドルの描画も region も無く、`MIV_DISABLE_TOUCH_GESTURES=1` ではラッチを
+  作る touch ownership 自体が無効になるため従来の mouse 経路だけに戻る
 
 #### (2) パネル内スクロールは既に動く
 
@@ -649,6 +935,54 @@ mIV で `scroll_source()` を上書きしているのは `src/ui_main.rs:2278` �
   背景 drag response** を置いており、内側 widget の入力を奪わない
   (`scroll_area.rs:786-803`)。壊れはしないが、
   **「slider やタグボタンが密集した場所からはスクロールを始めにくい」** という UX 問題は残る
+
+#### Phase 3 Step 3i 実装記録 (2026-08-09)
+
+- 動画 native の右パネルで離れた位置のタグを順にタップするとパネルがスクロールする原因は、
+  `NativeTouchAdapter` が正常な synthetic primary release の後に `PointerGone` を出して
+  いなかったことだった。egui の `PointerState` に前回タップ位置が残り、次の HUD タップ開始時の
+  `PointerMoved` がタップ間の位置差を `pointer.delta()` にした。`ScrollArea` の背景
+  drag response は press 時点から active なので、その偽 delta をスクロール量として消費した
+- native touch の正常終了を `primary release -> PointerGone` の一つの終端処理に統一した。
+  実ドラッグ中の Start / Move 列と `TouchRecognizer` の tap / drag 判定には触れず、
+  `PointerGone` も End 後にだけ送るため、指ドラッグと慣性スクロールは維持される。
+  静止画・音楽の egui-winit 経路は元から同じ終端列を出しており変更していない
+- タグ完了の情報トーストはパネルと描画矩形が重なる場合があるが、egui viewer 経路では
+  reveal path を持たず painter 描画だけで `ui.interact` を作らない。native video 経路も
+  toast の `Area` を `interactable(false)` にしているため、どちらも入力を遮断しない。
+  クリック可能なのは reveal path を持つ actionable toast だけという既存仕様を維持し、
+  トースト側には変更を入れていない
+
+#### 音声モード / 音楽ビューの左右パネルハンドル実装記録 (2026-08-09)
+
+- 音楽ビューで同じビューポートの raw `egui::Event::Touch` を一度でも観測すると、Hover /
+  ClickToShow に依らず左右端へ可視ハンドルを出す。観測済み bit は `ctx.data_temp` の
+  `ViewportId` key だけで保持し、曲 (`fs_idx`) を移っても消さない。時間では隠さず、
+  `MIV_DISABLE_TOUCH_GESTURES=1` と passive / ParkedLive では出さない。音楽面へ
+  `TouchCorrelation` / `TouchOwner` / タップゾーンは追加していない
+- 静止画の 48pt ハンドル geometry は、上 / 下の安全域と利用可能幅を引数に取る共通 helper へ
+  切り出した。静止画は従来の `TOP_BAR_HEIGHT` / `FS_SEEK_BAR_HEIGHT` / 48pt を渡すため rect は
+  完全に同一。音楽は `MUSIC_TOP_BAR_HEIGHT` / `MUSIC_HUD_HEIGHT` を安全域にする
+- 実レイアウト確認では、音楽の波形 tap-seek 面が左右の既存余白
+  `max(viewport width × 8%, 8pt)` の内側から始まる一方、固定 48pt は 600pt 未満の狭い detached
+  窓で重なることが分かった。利用者判断の option 4 により、音楽だけは
+  `min(48pt, 既存余白)` をハンドル幅とし、24pt 未満なら左右とも出さない。可視化の種類には
+  分岐せず常に同じ余白式を使うため、波形表示時も seek 面へ重ならず、タッチ観測時の layout
+  resize も起こさない
+- 左の session bool は `MetadataPanelOpenState` へ置き換え、左右とも `ByPointer` /
+  `ByTouchHandle` を区別する。touch owner は Hover でも明示表示と閉じるボタンを維持するが、
+  pointer owner は従来どおり Hover で explicit state を作らない。開いた側のハンドルは描画と
+  hit test の両方から消え、反対側だけ残る
+- **タッチの観測は入力モードの切り替えではない**。ハンドルを出した後もマウスの hover callout は
+  従来どおり毎フレーム評価する。抑止するのは**実際にハンドルを描いた辺だけ**で、同じ辺に
+  hit target を 2 つ重ねない (callout は toggle、ハンドルは open なので、1 回のクリックが
+  二重に処理される)。ハンドルの出ない辺 — パネルが開いている側、余白 24pt 未満の狭い窓、
+  右に出す情報が無い場合 — では callout がそのまま残る。
+  レビュー初版はここを `return` で一括打ち切りにしており、コンバーチブル機で「一度指で
+  触るとマウスの呼び出しバーが消える」「狭い窓ではどちらの入力でも開けない」退行になっていた
+- 320 / 480 / 600 / 1280 / 3840pt の各幅、24pt floor、上下 HUD、安全域不足、左右 open、
+  viewport sticky / sibling 分離 / disable、Hover の pointer / touch owner、既存静止画 rect の
+  完全一致を unit test で固定し、音楽ハンドルの描画 fixture を UI snapshot へ追加した
 
 #### (3) タッチターゲットが小さすぎる
 
@@ -714,6 +1048,45 @@ UI 倍率 100% / OS 倍率 100% における実測 (egui logical point):
 - **hit resolver は名指しされた周辺の少数コントロールだけ**に入れる:
   ★ 行 / タグ ON-OFF / AI モデル行 / カラー化スロット / slider の縦方向 hit / ブックマーク追加。
 
+#### ⚠ 撤回: パネル内の hit resolver は入れない (2026-08-09、利用者判断)
+
+**上バー (Step 3c) だけを残し、左右パネルへの hit resolver 拡張は見送る。**
+Step 3e として着手したが、実装途中で撤回した。
+
+撤回の理由:
+
+- **実機で誰も困っていない**。Phase 1 / 2 / 3b / 3d / Phase 3 Step 1〜2d の実機確認で
+  報告されたのは長押し・パネルハンドル・パン・タップ取りこぼし・HUD・RTL ヘルプで、
+  **「★ が押せない」は一度も出ていない**
+- 上表のとおり **150% でこの範囲の対象は全部 23px 基準を満たす**。しかも
+  **Windows タブレットは OS 側で既に 150〜200% DPI のことが多く**、上表は OS 100% 前提の
+  論理 pt なので、実機ではさらに大きい
+- 何より、**resolver は今は存在しない失敗の仕方を持ち込む**。見えている矩形と当たる矩形が
+  食い違うので、スクロール直後の解決、複数 pass の二重発火、群の外の扱いを
+  すべて自前で守る必要がある。守り損ねると「**触っていないコントロールが反応する**」という
+  実機でしか出ない壊れ方になる。特に「指でスクロールしたつもりが ★ が付く」は
+  押しにくいことより明確に悪い
+- 規模は共有描画コードを含む 8 ファイル / 約 800 行だった
+
+**要望が出たときの対応方針 (利用者判断 2026-08-09)**: タップ範囲を調整するのではなく、
+**操作部品の大きさをスケーリングとは独立に選べる設定** (標準 / 大きめ / 最大) を検討する。
+
+- 描画される矩形そのものが大きくなるので、**見た目と当たり判定が食い違わない**。
+  resolver が必要とした不変条件 (スクロール無効化 / pass 二重発火 / 群の境界) が
+  そもそも不要になる
+- 失敗しても「パネルが縦に伸びる」「タグの折り返しが早くなる」という**目視で分かる形**で出る
+- **マウス利用者にも効く**。resolver はタッチにしか効かない
+- ★ の「フォント galley 依存で実 rect が保証できない」問題も、フォントサイズを上げれば消える
+- 実装はパネルの `Ui` に `interact_size` / `button_padding` / ★ フォントサイズを差し替える
+  スコープを被せる形で足りる見込み
+- ⚠ 既存の UI スケーリングと軸が重なって見えないようにすること。
+  **スケーリング = 全部が拡大して情報密度が落ちる / 部品サイズ = 操作部品だけが大きくなり
+  文字量は保たれる**、という違いが設定画面で伝わる書き方にする
+- 既定は「標準」。**「設定を変えないとタッチで使えない」状態にはしない** (§5.1-6 の方針)
+
+したがって §5.7 の到達目標は、案内 (初回ヘルプ隅のスケーリング導線) と上バー resolver で
+既に成立しているものとして扱う。
+
 工数 (Phase 1 で touch provenance / ownership が完成している前提):
 
 | 対象 | 概算 |
@@ -731,6 +1104,13 @@ Phase 2 の 7〜11 人日のうち **25〜35%** に相当する (= 既に見積�
 ⚠ **実装上の注意**: タッチを検出したフレームだけ widget 自体を大きくすると**レイアウトが跳ねる**。
 **見た目の rect は固定したまま、raw touch 位置から action を解決する**方式にすること。
 
+**Step 3c 実装記録 (2026-08-07)**: 最初の限定 slice として静止画上バーへ適用した。
+`draw_bar_button` が描いた 32×32pt の各 rect を viewport ごとの `ctx.data_temp` に記録し、
+次フレームの相関済み touch tap をバー全高 + 隣接中心の中点境界で最寄り id へ解決する。
+右端 id はバー右端まで、左端 id の左側は未割当のままにする。egui の widget / paint rect と
+mouse hover/click は変更せず、解決 id だけを既存 `Response::clicked()` 相当の分岐へ合流させる。
+バー内の未割当 touch tap は背景のページ送りにも通さない。
+
 最終的に説明できる状態:
 
 > **100% でも主要な閲覧・指定機能は操作できる。150% にするとより快適。**
@@ -740,36 +1120,9 @@ Phase 2 の 7〜11 人日のうち **25〜35%** に相当する (= 既に見積�
 
 ### 5.8 選択済みセルの再タップで開く
 
-**マウス無影響で追加可能**。ただし `Response::clicked()` の**後**で選択状態を見る実装では成立しない
-(未選択セルへの最初のタップも「選択済み」に見えて即 open してしまう)。
-**Touch Start 時点の選択状態を snapshot** しておく必要がある。
-
-発火条件 (すべて満たすときだけ):
-
-- §5.2 の exact Touch stream として確定している
-- Touch Start と End が同じセル
-- 移動量が tap しきい値未満
-- **そのセルが Touch Start 前から `selected` だった**
-- Ctrl / Shift なし
-- `checked` が空
-- タグバッジ / ボタン / popup / ダイアログ の上ではない
-- grid scroll / native D&D の owner へ遷移していない
-
-**ダブルタップは維持される** (追加であって置換ではない):
-
-- 未選択セル: 1 回目で選択、2 回目で「選択済み再タップ」として open
-- 選択済みセル: 1 回目で open
-- 判定失敗 / 入力源不明: 従来のダブルクリック / ダブルタップ open が残る
-
-同じ release で touch の再タップ open と `response.double_clicked()` が二重実行されないよう、
-**open は共通 helper に集約**し、touch 側で発火した release だけ既存のダブルクリック分岐を抑止する。
-現状の open 分岐はフォルダ / ZIP・PDF / メディア / 検索コンテナ / ブックマークビュー /
-detached 準備を含む (`ui_main.rs:12135-12305`) ため、**コード複製は危険**。
-
-複数選択との相互作用: 選択モデルは `selected` と `checked` を分離し、Check / Explorer の
-2 方式を持つ (`settings.rs:492-523`, `ui_main.rs:3761-3859`)。
-**修飾キー中または `checked` が非空のときは再タップ open を無効**にすれば、
-Ctrl/Shift range・checked items・Check 方式の状態を壊さない。
+**見送り (利用者判断 2026-08-07)**。「タップ操作はとりあえず閲覧用としているので、
+まずは選択機能はなくてもよい」との判断により、選択済みセルの 1 回タップ open は実装しない。
+一覧を開く操作は既存のダブルクリック / ダブルタップ / Enter を維持する。
 
 ### 5.9 動画 native HWND の入力アダプタ
 
@@ -792,10 +1145,11 @@ presenter HWND と HUD HWND は mIV 自前の Win32 ウィンドウで、egui-wi
 1. `RegisterTouchWindow` を呼ばない
 2. `EnableMouseInPointer` も呼ばない (これは**マウスにも** `WM_POINTER` を生成させる
    プロセス全体の設定で、「マウス無影響」の目的には逆効果)
-3. `WM_POINTERDOWN/UPDATE/UP` で `GetPointerType` を呼ぶ
+3. `WM_POINTERDOWN` で `GetPointerType` を呼び、その結果を stream の所有判断に固定する
 4. **`PT_TOUCH` と確定した stream は DOWN から UP/Cancel まで全メッセージを処理し、常に 0 を返す**
 5. `PT_PEN` その他は stream 全体を従来どおり `DefWindowProc` へ渡す
-6. touch stream から native overlay へ `Event::Touch` と先頭接点の pointer emulation を注入する
+6. touch stream を `NativeVideoWindowEvent::Touch` で native overlay の共通認識器へ渡し、
+   先頭接点だけを overlay の egui Context へ pointer emulation する
    → **egui 側と同じジェスチャ認識器を共有できる** (OS アダプタだけが別実装)
 7. `WM_POINTERCAPTURECHANGED` と `POINTER_FLAG_CANCELED` で必ず状態を解放する
 
@@ -806,6 +1160,65 @@ Microsoft は **「一つの pointer stream の一部だけを消費し、残り
 さらに既存の `WM_MOUSE*` handler で `GetCurrentInputMessageSource()` を確認し、
 `IMDT_TOUCH` と確定した重複だけを捨てる安全網を置ける。
 **失敗または `IMDT_UNAVAILABLE` の場合は捨てず、従来の mouse handler へ流す**のが安全側。
+
+#### Phase 1 Step 4 実装結果 (presenter の薄い縦切り)
+
+- 出荷ゲートでは未登録のまま presenter HWND に `PT_TOUCH` 237 件、HUD HWND に 35 件が届き、
+  **案 C が成立することを実機確認済み**。
+- 今回所有するのは **presenter HWND だけ**。`WindowState` (HWND ごとの `GWLP_USERDATA`) に
+  上限付き pointer-id 集合を持ち、DOWN で所有した stream だけを UP / canceled flag /
+  `WM_POINTERCAPTURECHANGED` まで一貫して消費する。Touch event は latest-value slot に載せず、
+  pump/render の bounded lossless route へ全件送る。
+- `POINTER_INFO.ptPixelLocation` は `ScreenToClient(presenter_hwnd)` で物理 client pixels にし、
+  mouse と共通の client-pixels→egui-points 純関数へ合流する。マルチモニタでも変換基準は HWND。
+- presenter overlay は既存の `TouchRecognizer` をそのまま所有し、
+  `TouchSurfaceBehavior::Viewer { accepts_pinch: false }` で認識する。
+  `touch_correlation.rs` は通さない。先頭接点だけを pointer emulation し、
+  `should_suppress_primary()` が立った stream では click を完成させない。synthetic press が
+  既に生きている場合だけ、click 距離を十分超える `PointerMoved` → primary release →
+  `PointerGone` の順で egui の down 状態を確実に解除する。
+- `ToggleChrome` と `PageSide` はどちらも session-only chrome latch の toggle に写像する。
+  latch は hover 可視判定への OR 入力で、`SwitchSource` の専用 source-session reset で
+  ファイル移動時に解除し、fullscreen 終了時は overlay の破棄・再生成によって false に戻る。
+  永続設定は変更しない。
+- touch DOWN のうち、最初の所有 stream かつ presenter の activation または thread focus が
+  不足している場合だけ typed `RequestFocusClaim` を pump へ送り、既存
+  `claim_foreground` 経路へ合流する。既に foreground/focus を持つ tap と2本目以降では送らない。
+  非アクティブ判定 (activation tap) は既存 `WM_MOUSEACTIVATE` と揃え、
+  child は foreground が他プロセスのとき、top-level popup は presenter 自身が foreground でないとき。
+- **activation tap の扱いはマウスと意図的に変える** (2026-08-08、実機判断)。
+  マウスはアクティブ化クリックを `MA_ACTIVATEANDEAT` で丸ごと食べる。presenter 本体の左クリックが
+  **再生 / 一時停止という副作用**を持つからである。タッチの presenter 本体はクロームを出すだけで
+  副作用が無く、非アクティブな窓をタップした人は次に操作する意図がある。したがって
+  **ジェスチャは通常どおり認識し、overlay の control へ届き得る synthetic press だけを抑止**する。
+  = 復帰タップでもクロームは出る。gesture ごと捨てると、前面状態次第で 1 タップ目の
+  意味が変わり挙動が読めなくなるため、この形に固定した。
+- **Phase 1 Step 4 時点では HUD HWND を意図的に対象外にした**。HUD は promoted mouse で
+  既存ボタンを操作できていたため、当時は presenter 側だけを所有し、HUD 上の
+  長押し→右クリック合成を Phase 3 へ残した。現状は下記 Phase 3 Step 1 で解消済み。
+- `MIV_DISABLE_TOUCH_GESTURES=1` では所有と promoted-mouse filter を無効にし、従来経路へ戻す。
+  Cancel / capture loss は防御的に実装したが、実機では引き続き未観測。
+
+#### Phase 3 Step 1 実装記録 (HUD HWND の所有)
+
+- HUD の HWND ごとの `WindowState` に presenter と同じ上限付き `NativeTouchOwnership` を持たせ、
+  `PT_TOUCH` と確定した DOWN だけを stream 単位で所有する。type probe、followup、座標変換、
+  canceled / UP / `WM_POINTERCAPTURECHANGED` の終端は両 wndproc で同じ Win32 helper を共有する。
+  未登録 pointer id、問い合わせ失敗、非 touch、上限超過は従来どおり `DefWindowProcW` へ渡す。
+- `NativeVideoTouchEvent.source: NativeVideoWindowSource` を正本に presenter / HUD の発生元を保持する。
+  overlay の `NativeTouchAdapter` は 1 つのままで、先頭接点だけが primary emulation を所有する。
+- **HUD HWND に届いた事実を OS の hit-test 結果として採用し、アプリ側で hit-test をやり直さない**。
+  HUD source は `TouchRecognizer::handle_widget_passthrough_sample` から開始 owner を直接
+  `WidgetPassthrough` にし、`classify_tap` と presenter の `compute_hud_regions()` 近似を通さない。
+  このため近似矩形がずれても HUD 操作が viewer tap / chrome toggle へ化けない。
+- 所有した HUD touch 由来の promoted mouse は全 mouse handler で
+  `GetCurrentInputMessageSource()==IMDT_TOUCH` と確定した場合だけ捨てる。問い合わせ失敗と
+  `IMDT_UNAVAILABLE` は fail-open、`MIV_DISABLE_TOUCH_GESTURES=1` は所有・filter とも無効。
+- HUD touch DOWN は既存 mouse-down と同じ `RequestFocusClaim` を送り、touch 用の `SetCapture` は
+  呼ばない。`WM_CAPTURECHANGED` / `WM_CANCELMODE` / `WM_DESTROY` / `WM_NCDESTROY` は mouse の
+  synthetic-up cleanup と同じ `emit_input_cleanup` で全 owned touch を Cancel して解放する。
+- `MIV_TOUCH_DEBUG=1` の ownership / 座標 / command / promoted-mouse discard ログに
+  `presenter` / `hud` の source を出す。自動テスト完了、実機での HUD ボタン操作と長押しは確認待ち。
 
 #### 案 D (フォールバック) の内容
 
@@ -836,6 +1249,64 @@ signature は **RDP 経由などで欠落する実例がある**ため、これ�
 更新済み**なので `Response::clicked()` / `drag_started()` は消えない。
 イベントを消すアプローチでは二重発火を防げない。
 
+#### 1 アプリフレーム内の複数 pass で守る戻り値契約
+
+egui はレイアウト変更や `request_discard` により、同じアプリフレームを複数回 drive する。
+`TouchFrame` が返す情報は、次の異なる寿命を持つものとして扱う:
+
+- **`commands` は最初の drive で 1 回だけ返す**。コマンド実行はページ、クローム、zoom / pan、
+  PDF 再描画などの状態を変えるため、同じフレームの後続 pass では必ず空にする
+- **相関済み `primary_events` と抑止判定は後続 pass にも同じ内容を返す**。これは
+  副作用のない問い合わせであり、後続 pass で解決される widget click や Step 3c の
+  バーボタンも参照するため
+
+実装では `touch_correlation` が最初の drive の結果からコマンドを除いた replay 用
+`TouchFrame` だけを保持し、同一フレームの 2 回目以降へ返す。呼び出し surface 側に
+pass 番号や「実行済み」guard を置いてはならない。新しい surface もこの戻り値契約を
+そのまま利用する (2026-08-07、実機の中央タップ二重 toggle 報告を受けて明文化・修正)。
+
+##### ⚠ 実機で 3 回踏んだ同型バグ — 「replay される値で状態を作らない」
+
+複数 pass の実害はここまでに **3 回**出ている。いずれも
+**「1 回しか起きないはずの出来事」を、replay される値から判定していた**ことが原因:
+
+| # | 症状 | replay された値 | 壊れた前提 |
+| --- | --- | --- | --- |
+| 1 | 中央タップでクロームが出ない (2 回必要) | `commands` | 「コマンドは 1 フレームに 1 回」 |
+| 2 | ピンチが 2 回に 1 回しか効かない | egui-winit の pointer gate | 「gate は先頭接点だけ通す」 |
+| 3 | パネル外タップで閉じた後、マウスも含めて左入力が全部死ぬ | 終端 `TouchFrame` の抑止判定 | 「arm した bool には必ず release が来る」 |
+
+**規則**: replay される値は**問い合わせ (query)** であって**出来事 (edge)** ではない。
+
+- replay される値から **cross-frame の状態を arm しないこと**。
+  arm するなら、その状態は**自分で Idle へ戻れる**必要がある
+  (例: `FullscreenPrimarySuppression::TouchStream` は接点が無いフレームで必ず Idle に戻る)
+- 「未来のエッジが来たら解除する」設計にしないこと。
+  そのエッジは**別の pass で既に消費されている**可能性がある
+- 相互排他の状態を bool で持たない。**typed owner** にして、
+  各 owner の arm と clear を 1 か所で対応付ける (#3 の修正がこれ)
+- 新しい surface / 新しい抑止を足すときは、この表を先に読む
+
+##### ⚠ もう 1 つの同型 — 「対になる経路を数えていない」
+
+2026-08-09 の 1 セッションで **3 回**出た。いずれも
+**同じ性質の経路が 2 本あり、片方だけ直していた**:
+
+| # | 直した側 | 残っていた側 | 症状 |
+| --- | --- | --- | --- |
+| 1 | ズームパンの `pointer.delta()` (8/8) | 連結読みの `pointer.delta()` | 連結読みで指ドラッグが効かない |
+| 2 | 前面奪還抑止のコマンド経路 (8/8) | 同じ抑止の応答駆動経路 | タップは効くのにドラッグだけ死ぬ |
+| 3 | synthetic pointer の Cancel 終端 | 通常タップの終端 (`PointerGone` 無し) | 次のタップでパネルが勝手にスクロール |
+
+**規則**: 直す前に、**同じ値を読む場所 / 同じ状態を終わらせる場所を機械的に数える**。
+
+- 「この関数を直した」ではなく「**この値の consumer を全部直した**」で完了とする
+- 終端は特に危ない。**正常終了と異常終了は必ず対になる**ので、片方だけ完全な状態を作らない。
+  終端処理は 1 か所の helper に集約し、両方がそこを通る形にする (#3 の修正がこれ)
+- CLAUDE.md「バグ修正の一般原則」の
+  「**同型の入口・終了経路も確認してから修正する**」がこれ。
+  読んでいても、実際に列挙しないと効かない
+
 必要なのは**アプリ側の所有権**:
 
 ```
@@ -852,6 +1323,10 @@ TouchOwner
 
 - 同じ release の `fs_response.clicked()` は抑止する
 - **全接点が離れるまで primary 抑止を維持**する
+- 確定済み owner を**同じ接点集合のまま**別 action へ移さない。ただし接点追加時は
+  `ViewerPointerPassthrough` から `Pinch` へ昇格し、現在位置で pinch 基準を取り直す
+- `WidgetPassthrough` / `ViewerTapZone` / `Cancelled` からは昇格しない。
+  `Pinch` は接点が 1 本に戻っても単指 pan へ降格せず、全接点解放まで保持する
 - グリッドでは、スクロール認識のしきい値と egui の drag 開始しきい値を競争させない。
   **タッチ由来なら D&D 自体を無効にする**方が確実
 
@@ -888,13 +1363,14 @@ Phase 1 で native 入力の vertical slice を通して実機検証し、完成
 | --- | --- | --- | --- |
 | **0** | 現行版の回避策を案内 (§4)。コード変更なし | ~0.5 人日 | なし |
 | **1** | **入力源分離と両 backend の成立確認**。viewport ごとの Touch stream / correlation / ownership、静止画フルスクリーンの tap-page・中央クローム・ピンチ/パン・閉じる、**native `WM_POINTER` アダプタ (§5.9 案 C)**、native で tap が egui へ一度だけ届き promoted mouse が二重発火しないことの確認、Cancel / capture loss 処理、入力源の診断ログ | **7〜10 人日** | mouse-only=低 (ただし mouse handler の early filter は高精度テスト必須), マウス+タッチ同時=中, **ペン=高** (viewport 側で指/ペン区別不能), detached=中 |
-| **2** | **一覧・再タップ open・静止画/音楽パネル**。grid の touch drag scroll (行スナップ維持)、選択済みセル再タップ open、中央クローム + 左右 callout、静止画の AI/カラー化/ブックマーク/★/タグ、音楽の ブックマーク/★/タグ、named widget の touch hit target、タグ入力の IME / タッチキーボード確認 | **7〜11 人日** | grid selection / D&D=中〜高, サムネ仮想化・prefetch=中, マウス click/double-click=低 (ただし共通 open helper の回帰範囲は広い), IME=中 |
+| **2** | **一覧・静止画/音楽パネル**。grid の touch drag scroll (行スナップ維持 + 方向 settle)、pinch 列数変更、中央クローム + 左右 callout、静止画の AI/カラー化/ブックマーク/★/タグ、音楽の ブックマーク/★/タグ、named widget の touch hit target、タグ入力の IME / タッチキーボード確認 | **7〜11 人日** | grid selection / D&D=中〜高, サムネ仮想化・prefetch=中, マウス click/double-click=低, IME=中 |
 | **3** | **動画 native の完成**。play/pause・seek・前後 file・HUD 表示・close、native 中央クローム/callout、ジャンプ/ブックマークパネル、補正パネル、★/タグパネル、native `ScrollArea` の drag/慣性、native ターゲットサイズ調整、mouse/touch/pen 混在・複数 HWND・DPI・capture loss の hardening | **8〜13 人日** | **native presenter/HUD=高**, **mouse promotion/filter=高**, 動画再生自体=中 (入力 transport 以外に触れないこと), detached/media window=中〜高, VST/IME=中 |
 
 **総工数: 22〜34 人日**。実機で native HWND の配送差や Cancel 問題が出た場合は上振れする。
 
-Phase 2 の内訳: パネル open + ターゲット調整 4〜7 人日 / 再タップ open 1.5〜2.5 人日 /
-grid scroll + 行スナップ + prefetch 3〜5 人日。
+Phase 2 の当初内訳: パネル open + ターゲット調整 4〜7 人日 /
+grid scroll + 行スナップ + prefetch + pinch 列数変更 3〜5 人日。
+再タップ open の 1.5〜2.5 人日は §5.8 の見送り判断により対象外。
 
 **「設定なし」にしたことの工数影響**:
 
@@ -903,7 +1379,9 @@ grid scroll + 行スナップ + prefetch 3〜5 人日。
 - → **正味 1.5〜3 人日程度の増**。単純な「タッチモード設定」案より高くつくが、
   マウス回帰リスクは下がる。
 
-新規ファイルは `src/touch_input.rs` (認識器の純ロジック、250〜400 行) 1 本。
+Phase 1 の入力基盤は `src/touch_input.rs` (認識器の純ロジック) と
+`src/touch_correlation.rs` (egui の順序相関、viewport + surface 単位の一時状態) に分離する。
+後者は Step 2 時点ではコマンドと抑止要否を計算するだけで、既存入力へ適用しない。
 主な既存アンカー: `src/app.rs:61796` / `src/ui_fullscreen.rs:15640` /
 `src/video/native_window.rs:1111` / `src/video/native_presenter/render_core.rs:4216`。
 
@@ -933,35 +1411,71 @@ anchor/remainder 計算・端数表示時の可視/keep 範囲・pointer stream 
 | 編集ツールの全面タッチ対応 | 10 人日以上 | 別プロジェクト扱い |
 | タッチによるファイル D&D | — | 入れない (むしろ抑止する) |
 
-### 5.14 未決の判断事項
+### 5.14 決定事項 (すべて確定済み)
 
-利用者判断 (2026-08-06) で ①動画必須 ②パネル対応 ③再タップ open ④設定なし は確定した。
-残るのは以下 3 点。**特に 1 は着手前に決める必要がある**。
+利用者判断 (2026-08-06、#3 は 2026-08-07、#11〜13 は 2026-08-08 更新)。**未決事項はない**。
 
-1. **【要決定】ペンの扱い** — 詳細は §5.16。
-   Codex Sol は **「設定なし方針そのものより、このペン仕様未決定の方が実装後の後悔要因になりやすい」**
-   と指摘している。**推奨は (c) 中間案**。
-2. **診断用の強制無効を持つか**。利用者向けの設定は作らないが、最初の数リリースは
-   `--disable-touch-gestures` または `MIV_DISABLE_TOUCH_GESTURES=1` を持つべきという提案。
-   タッチ = 左クリックの既存動作は残し、**新しいジェスチャ解釈だけ無効化**する。
-   永続設定でも自動タッチモードでもないので ④ の方針とは矛盾しない。
-   native HUD には既に環境変数デバッグの前例がある (`src/video/native_window.rs:1302-1317`)。
-   → **持つことを推奨**。逃げ道ゼロで出すのはリスクが高い。
-3. **フルスクリーンのタップ領域** (§5.5)。推奨は「中央矩形タップ = クローム表示 +
-   端からの内向きスワイプ = パネル直行」。利用者提案の 4 分割 (上左右 = パネル /
-   下左右 = ページ移動) も成立はするが、ページ送り面積・誤タップ・RTL の一貫性で劣る。
-   **どちらを採るかは実機の感触で決める価値がある** (机上では決め切れない類の判断)。
-4. **UI 倍率の案内文言** (§5.7)。「タッチ中心では 150% がおすすめ」に留め、
-   「必須」とは書かない方針でよいか。
-5. **動画に AI アップスケール / カラー化が存在しない件** (§5.7 参照)。
-   利用者の要望リストに挙がっているが、これらは**静止画の機能で、動画再生中には元から無い**。
-   タッチ対応で追加する話ではないので、「静止画のみ対象」と整理してよいか確認が要る。
+| # | 論点 | 決定 |
+| --- | --- | --- |
+| 1 | 対象範囲 | **動画も必須**。静止画・本・動画・音楽の閲覧系をカバーする |
+| 2 | 左右パネル | **対応する** (AI アップスケール / カラー化 / ブックマーク / ★ / タグ) |
+| 3 | 選択済みセルの再タップ open | **入れない**。タップは当面閲覧操作を優先し、既存のダブルクリック / ダブルタップ / Enter を維持する |
+| 4 | タッチ設定 | **作らない**。マウス無影響で、タッチしたときだけ別動作 (§5.2 の fail-closed) |
+| 5 | **ペンの扱い** | **(a) 特別な対応をしない** = **ペンはタッチ扱いになる**。§5.16 |
+| 6 | **診断用の強制無効** | **持つ**。`MIV_DISABLE_TOUCH_GESTURES=1` 等。簡単に付けられる範囲で |
+| 7 | **タップ領域レイアウト** | **中央矩形案で実装する**。気になれば実機を見てから他案を検討 |
+| 8 | **UI 倍率** | 案内は「おすすめ」に留め強制しない。**+ オーバーレイヘルプにスケーリングへの導線を添える** (下記) |
+| 9 | **動画のシーク量** | **±5 秒** (mIV のキーボードと同じ刻み。アプリ内の一貫性を優先) |
+| 10 | 動画の AI アップスケール / カラー化 | **静止画のみ対象**。動画再生中には元から機能が無く、タッチ対応で追加する話ではない |
+| 11 | **非アクティブな窓への最初のタップ** (2026-08-08) | **食べない**。ジェスチャは通常どおり動かし、overlay control へ届く synthetic press だけ抑止する。静止画 egui 面では中央の `ToggleChrome` だけを通し、左右の `PageSide` は前面化だけにしてページを送らない。初回ヘルプ表示中の全域タップは既存どおり learn + chrome 表示へ写像する。マウスは最初のクリックが再生/一時停止という副作用を持つので従来どおり食べる。§5.9 |
+| 12 | **エッジスワイプ** (2026-08-08 実機) | **不採用・実装削除**。Windows 11 では上下左右すべてが OS 予約で安定配送されない。左右パネルは「中央タップ → ハンドル」の 1 経路にする。§5.5 |
+| 13 | **動画のタップ領域と HUD** (2026-08-08 実機) | 静止画と同じ 3 領域を使い、中央タップは HUD toggle、左 / 右の単発タップは -5 / +5 秒シーク。時間窓によるダブルタップ判定は撤回・削除し、シークは chrome latch を変更しない。§5.5「動画・音楽のタップ割り当て」 |
+
+#### 11 の補足: v2.13.0 静止画 egui 面の実機バグ修正
+
+2026-08-08 の実機ログでは、他アプリが foreground の間も egui event 列には
+`Touch(Start) → PointerMoved → primary press` が届いていたが、focus reclaim の早期 return
+branch が `drive_egui_touch_input(..., false)` を呼んだため、相関ログは
+`commands=0[] contacts=0->0 pointer_touch=absent->absent` のままだった。11 回のタップが
+すべてこの形で捨てられ、初回ヘルプも閉じられなかった。
+
+原因は Step 3d の退行ではなく、タッチ対応以前からある「前面復帰クリックを操作に使わない」
+マウス向け branch が、`enabled=false` を観測停止として扱っていたことである。早期 return、
+foreground 奪還処理、`fs_primary_suppression` は維持し、branch 内で touch correlation
+だけを実行可能にした。返却結果は `ToggleChrome`（初回ヘルプ中の learn + chrome を含む）だけを
+採用し、`PageSide`、pinch、pan、widget への synthetic primary は採用しない。
+
+2026-08-09 の Step 3g で、この修正が touch command の実行経路だけに留まり、egui
+`Response` 駆動の連結読みドラッグ / 拡大画像パンには focus reclaim の
+`PointerStream` 抑止が残っていたことを実機ログで確認した。arm 時点では入力源が未確定なので、
+後続の相関済み `TouchFrame` で owner を `PointerStream` から `TouchStream` へ訂正し、同じ
+touch frame の判断で provisional な pointer 抑止を置き換える。これにより canvas gesture は
+前面奪還中も通る一方、tap command は従来どおり実行され、overlay control へ届く synthetic
+primary response は既存の `should_suppress_response` 相関で引き続き抑止する。mouse-only stream は
+touch による訂正が起きないため、復帰クリックを release まで食べる従来契約を維持する。
+
+#### 8 の補足: オーバーレイヘルプにスケーリングへの導線を添える
+
+初回オーバーレイヘルプ (§5.5) の隅に、
+**「UI が小さい場合はメニューの『スケーリング』から変更できます」**程度の
+**従属的な 1 行**を添える。
+
+- タッチを学習している**まさにその瞬間**に出るので文脈が合っている
+- **強制しない**。たまにしか使わない利用者はボタンが小さいままでも気にしない
+- ジェスチャの図示より**視覚的に従属させる** (小さく、下部に置く)
+- (任意) **UI 倍率が 100% のときだけ出す**。既に 150% 以上で使っている利用者には不要。
+  これは永続設定の静的な参照であって実行時状態による分岐ではないので、決定性方針に反しない
 
 ### 5.15 「マウス操作を変えない」の保証範囲 (明文化)
 
 Codex Sol の指摘により、保証できる表現を次に限定する:
 
 > **タッチを行っていない mouse-only の入力列については、挙動を一切変更しない。**
+
+Step 3b の左右パネルでは、この保証を writer と resolver の両方で固定した。
+`ByPointer` を生成する既存 mouse / native / music 経路は `ClickToShow` 以外で no-op、
+`Hover` でも永続表示できる `ByTouchHandle` はタッチ専用入口からだけ生成する。
+左右とも owner を bool へ分散せず `MetadataPanelOpenState` で型として区別する。
 
 同じ egui viewport 上でマウスとタッチを**完全に同時**操作した場合、egui の `PointerState` が
 1 つしかない以上、2 つを完全独立にする保証はできない。ここを絶対条件にすると
@@ -996,7 +1510,7 @@ egui-winit より下の入力層を大きく作り直す必要がある。実用
 
 | 案 | 内容 | ペンで失うもの / 得るもの | 追加工数 |
 | --- | --- | --- | --- |
-| **(a)** | ペン接触もタッチとして扱う | グリッドからの **native ファイル D&D が使えなくなる** (タッチでは抑止するため)。再タップ open / 中央タップがペンでも発火する | ゼロ |
+| **(a)** | ペン接触もタッチとして扱う | グリッドからの **native ファイル D&D が使えなくなる** (タッチでは抑止するため)。中央タップがペンでも発火する | ゼロ |
 | **(b)** | ペンは完全に従来のマウス扱い | 何も変わらない (現状維持)。タッチ用の大きなクロームもペンでは出ない | 中〜大 |
 | **(c)** | **ペンをタッチとして扱うが、D&D 抑止などマウス精度が要る挙動だけ除外する** | ホバー・D&D は残り、タッチ用クロームも使える | **小** |
 
@@ -1032,36 +1546,60 @@ NeeView は **ペンと指を区別していない**。リポジトリ全体で 
 その上で、**ペンと判定できたときだけグリッドの file D&D 抑止を外す**のが素直。
 判定に失敗しても (a) に落ちるだけで壊れない。
 
-**要実機確認**: `GetPointerType` が winit の `Touch.id` で機能するか (§6)。
-機能しなければ in-air ヒューリスティックへ、それも駄目なら (a) をそのまま採用する。
+#### 決定: (a) 特別な対応をしない = ペンはタッチ扱い
+
+利用者判断 (2026-08-06)。理由は「わざわざペンを持って操作するケースは少なそう」。
+**稀な入力源のために判定コストと誤判定リスクを負わない**という判断で、NeeView と同じ結論。
+
+**この決定で失うもの (1 つだけ)**:
+
+- **グリッドからのファイル D&D がペンでできなくなる**。
+  タッチ由来のドラッグは D&D を抑止してスクロールに回すため、ペンでドラッグすると一覧がスクロールする。
+
+**失わないもの**:
+
+- **ペンのホバーはそのまま効く** (かざすだけで egui のポインタが動く)。上記のとおり
+  (a)/(b) いずれでも変わらない
+- マウスの挙動 (D&D 含む) は一切変わらない
+
+**後から (c) へ移行できる**。`GetPointerType` による分類は入力アダプタに 1 段足すだけで、
+設計を崩さない加法的な変更。実運用で「ペンで D&D したい」という要望が出たら追加する。
 
 ---
 
 ## 6. 未確定事項 / 実機確認が必要な項目
 
-1. **【最優先】`WM_POINTER*` が presenter HWND と HUD HWND の両方に期待どおり配送されるか**。
-   API 仕様上 touch-unregistered window にも届くことは確認できたが、mIV の実 HWND 構成
-   (hit-test region / DirectComposition / `WS_EX_NOACTIVATE` の HUD) で成立するかは未確認。
-   **Phase 1 の出荷ゲートにする** (崩れると §5.9 の設計を引き直す)。
-2. 動画 native presenter で、長押し→右クリック合成が「短い右クリック」と誤分類されて
-   フルスクリーンが閉じるか (§2.6 の潜在バグ)。**実機必須**。
-3. **egui-winit の Touch Cancel が primary release を出さない件**
+1. **【通過済み】`WM_POINTER*` 配送ゲート**。実機ログで presenter HWND に
+   `PT_TOUCH` 237 件、HUD HWND に 35 件を観測し、touch-unregistered の実 HWND 構成
+   (hit-test region / DirectComposition / `WS_EX_NOACTIVATE` の HUD) でも案 C が成立すると確定した。
+2. **【presenter / HUD とも実装修正済み・実機確認待ち】** 動画 native presenter の長押しでは、
+   `WM_POINTERUP` 後に合成された短い右クリックでフルスクリーンが閉じた。
+   presenter の `PT_TOUCH` stream 全体を所有し `DefWindowProcW` へ渡さない構造へ修正済み。
+   Phase 3 Step 1 で HUD HWND も同じ whole-stream 所有へ移し、HUD 上に残っていた
+   長押し→右クリック合成も構造上解消した。変更後ビルドで presenter / HUD の双方について
+   「長押ししても右クリック扱いにならず、フルスクリーンも閉じない」ことを確認して解消確定とする。
+3. **【実装解決・Cancel 自体は実機未観測】egui-winit の Touch Cancel が primary release を出さない件**
    (`egui-winit-0.33.3/src/lib.rs:732-735`)。アプリ側の gesture state は Cancel で破棄できるが、
-   **egui widget 側に primary-down 状態が残らないか**。残る場合は入力アダプタ側で
-   release を補う必要があり、構造的な壁になる。
-4. **ClickToShow の呼び出しバーがタッチで押せるか**。callout は端に `hover_pos()` が
-   ある間だけ描かれる (`ui_fullscreen.rs:5422-5435`)。Touch End と同じ batch で
-   `PointerGone` が来るため、**押下時に見えた callout が release フレームで消えて
-   click completion に到達しない可能性が高い** (コード順序からの推測)。
-3. 「フォルダを開く」ダイアログはフルパス入力式で参照ボタンが無く
+   `PointerGone` 単独では egui の primary-down は解除されない。native adapter は
+   synthetic press が生きている Cancel / suppression 境界で、click 距離超過の
+   `PointerMoved` → primary release → `PointerGone` を注入し、click を成立させず down を解除する。
+   canceled flag / capture changed の実機観測は引き続きできていない。
+4. **【実機確認済み・仕様更新】左右パネルのタッチハンドル**。
+   hover 依存の既存 callout はタッチ target にせず、クローム latch 中に widget ID と 48pt 幅の
+   矩形が継続する別ハンドルを実装した。Touch End と同じ batch に `PointerGone` を入れる
+   kittest で click completion と左右 action 発火を確認済み。実機で open を確認後、開いた側の
+   ハンドルがパネル操作を塞ぐことが分かったため、開いた側の handle / hit / exclusion を消し、
+   touch-owned パネル外タップは左右をまとめて閉じる仕様へ更新した。
+5. 「フォルダを開く」ダイアログはフルパス入力式で参照ボタンが無く
    (`src/ui_dialogs/open_folder.rs:34-52, 81-106`)、OS タッチキーボードの自動表示も
    コードからは保証できない。タブレットでの実用性を実機確認する必要がある。
    なお「任意の場所へ移動」は `場所▼` / ドライブ一覧 / ピクチャ等の既存導線で到達できる
    (`ui_main.rs:10942, 11015`) ので、新しいフォルダピッカーは必須ではない。
-4. スクロールバーの実効的な掴みやすさ (DPI・UI 倍率・機種依存)。
-5. detached viewer で、root と別 viewport のタッチ状態が混ざらないこと。
-   passive detached の「最初のクリックは復帰だけ」という既存挙動を、最初のタップが
-   突き抜けて操作まで届かないかを実機確認する。
+6. スクロールバーの実効的な掴みやすさ (DPI・UI 倍率・機種依存)。
+7. detached viewer で、root と別 viewport のタッチ状態が混ざらないこと。
+   passive detached の最初の**マウスクリック**は従来どおり復帰だけ、最初の**中央タップ**は
+   chrome 表示まで届く一方、左右タップでページが動かず widget press にもならないことを
+   実機確認する。
 
 ---
 
@@ -1069,15 +1607,12 @@ NeeView は **ペンと指を区別していない**。リポジトリ全体で 
 
 1. **Phase 0 (即時)**: §4 の回避策を利用者へ案内する。
    これだけでフルスクリーンの「詰み」は回避でき、タブレットでも一応閲覧できる状態になる。
-2. **着手前に §5.14 の 3 点を決める** — ペンの扱い / 診断用強制無効の有無 /
-   動画に AI アップスケール・カラー化が無い件の扱い。
-   特に**ペン仕様の未決定は、実装後の後悔要因として最も大きい**。
+2. 仕様は §5.14 で**すべて確定済み**。着手前に決めるべきことは残っていない。
 3. **Phase 1**: 入力源分離と 2 つの backend の成立確認。
    静止画フルスクリーンのタッチ操作一式に加え、**動画 native の pointer adapter を
-   この段階で薄く通して実機検証する**。動画を出荷条件にする以上、
-   native HWND に `WM_POINTER` が期待どおり届くかの確認を最後まで先送りしない。
-4. **Phase 2**: 一覧の直接スクロール + 再タップ open + 静止画・音楽パネル。
-   ここまでで「静止画はタッチ対応」と言える。
+   presenter HWND に薄く実装済み**。配送ゲートは通過し、長押し修正後の実機確認を残す。
+4. **Phase 2**: 一覧の直接スクロール + 方向スナップ + ピンチ列数変更を実装済み。
+   Step 3b で静止画パネルの open 導線も実装した。パネル内部の小 target 対応と音楽パネルは残る。
 5. **Phase 3**: 動画 native の完成。ここまでで「mIV はタッチ対応」と表明できる。
 6. 実機フィードバック後に**慣性の要否を判断**する。必要なら短距離・行単位の限定慣性だけ。
 7. リング / ルーペ / 5 領域カスタマイズ / ピンチ回転は**要望が出るまで保留**。
@@ -1087,7 +1622,7 @@ NeeView は **ペンと指を区別していない**。リポジトリ全体で 
 なっているため。Phase 2 を先にすると、指でスクロールできるようになった利用者が
 サムネイルをタップしてフルスクリーンに入り、そこで詰む — という悪化した体験になる。
 
-**ただし動画 native の入力経路だけは Phase 1 で薄く通す**。ここは
-「`WM_POINTER` が presenter / HUD の実 HWND に期待どおり配送されるか」という
-**未確認の前提**の上に立っており、これが崩れると Phase 3 の設計ごと引き直しになる。
-Phase 1 の出荷ゲートに含める。
+**動画 native の入力経路は Phase 1 で presenter に薄く実装した**。
+`WM_POINTER` が presenter / HUD の実 HWND に届く出荷ゲートは通過済みで、案 C は成立する。
+HUD 側の stream 所有と pointer emulation は Phase 3 Step 1 で実装済み。
+ターゲットサイズ調整は実機判断を待つ後続 Step として残す。

@@ -27,7 +27,7 @@ egui-wgpu = { path = "vendor/egui-wgpu" }
 # 旧バージョンの runtime dir に新しい実行ファイルを上書きしてしまう。susie-worker / vst3-host-tester
 # / png2mag は独立した内部ヘルパーなので workspace inherit せず個別管理。
 [workspace.package]
-version = "2.12.0"
+version = "2.13.0"
 edition = "2024"
 # let-chain (Rust 1.88 で安定化) を本体・サブクレート共通で使っているため明示。
 rust-version = "1.88"
@@ -210,6 +210,7 @@ windows = { version = "0.61", features = [
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_Ime",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Pointer",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",

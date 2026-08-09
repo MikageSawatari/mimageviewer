@@ -35,6 +35,7 @@ use crate::displayed_image_transform::{
     quantize_points_to_physical_pixels,
 };
 use crate::fs_animation::{AnimationPlayback, FsCacheEntry};
+use crate::gpu_lanczos::FullscreenPaintResource;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::{
     Chord, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES, KeyAction, KeyName,
@@ -49,16 +50,139 @@ use crate::ui_helpers::{HoverTipExt, open_external_player};
 
 const COMPARE_INDICATOR_MAX_WIDTH: u32 = 72;
 const COMPARE_INDICATOR_MAX_HEIGHT: u32 = 54;
+const COMPARE_WIPE_MIN_FRACTION: f32 = 0.05;
+const COMPARE_WIPE_MAX_FRACTION: f32 = 0.95;
+const COMPARE_WIPE_GRAB_HALF_WIDTH: f32 = 14.0;
 // Tuned on real hardware to avoid a brief status flash on normal page turns.
 const COLORIZE_WAIT_INDICATOR_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 const FS_NAVIGATOR_HEADER_HEIGHT: f32 = 26.0;
 const FS_NAVIGATOR_MARGIN: f32 = 12.0;
 const FS_NAVIGATOR_WHEEL_STEP: f32 = 20.0;
 const FS_NAVIGATOR_MIN_SELECTION: f32 = 8.0;
+const FS_NAVIGATOR_MIN_IMAGE_SCALE: f32 = 0.4;
+// ルーペパラメータ (将来設定化)
+const LOUPE_SIZE: f32 = 300.0;
+const LOUPE_ZOOM: f32 = 3.0;
+const LOUPE_OFFSET: f32 = 40.0;
+/// ルーペが 1 フレームで拡大している画面上の一辺。カーソルがページの外へ出ても、この窓に
+/// ページが残っている間は拡大するものがあるので、対象ページを保ってルーペを出し続ける。
+const LOUPE_SAMPLE_WINDOW: f32 = LOUPE_SIZE / LOUPE_ZOOM;
 /// Keep roughly one standard touch target visible so a dragged image always has an obvious
 /// recovery area. On an image or viewport smaller than this, the whole shorter axis is required.
 const FS_PAN_MIN_VISIBLE_PX: f32 = 48.0;
 const PANORAMA_NAVIGATOR_EDGE_SAMPLES: usize = 24;
+
+/// Cross-frame owner for primary-pointer suppression in fullscreen.
+///
+/// Touch replacement on a terminal TouchFrame is deliberately not stored:
+/// it suppresses that pass only. Persisting it would require a future primary
+/// release even though the touch owner has already observed the stream end.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FullscreenPrimarySuppression {
+    #[default]
+    Idle,
+    PointerStream,
+    TouchStream,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FullscreenPrimarySuppressionEvent {
+    PointerStreamStarted,
+    PointerFrame {
+        released: bool,
+    },
+    TouchFrame {
+        suppresses_current_frame: bool,
+        active: bool,
+        completed: bool,
+        cancelled: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FullscreenPrimarySuppressionDecision {
+    Preserve,
+    Allow,
+    Suppress,
+}
+
+impl FullscreenPrimarySuppressionDecision {
+    fn overridden_by(self, next: Self) -> Self {
+        match next {
+            Self::Preserve => self,
+            Self::Allow | Self::Suppress => next,
+        }
+    }
+
+    fn suppresses_current_frame(self) -> bool {
+        self == Self::Suppress
+    }
+}
+
+impl FullscreenPrimarySuppression {
+    pub(crate) fn is_active(self) -> bool {
+        self != Self::Idle
+    }
+
+    pub(crate) fn arm_pointer_stream(&mut self) {
+        let _ = self.apply(FullscreenPrimarySuppressionEvent::PointerStreamStarted);
+    }
+
+    fn apply(
+        &mut self,
+        event: FullscreenPrimarySuppressionEvent,
+    ) -> FullscreenPrimarySuppressionDecision {
+        match event {
+            FullscreenPrimarySuppressionEvent::PointerStreamStarted => {
+                *self = Self::PointerStream;
+                FullscreenPrimarySuppressionDecision::Suppress
+            }
+            FullscreenPrimarySuppressionEvent::PointerFrame { released } => {
+                let decision = if self.is_active() {
+                    FullscreenPrimarySuppressionDecision::Suppress
+                } else {
+                    FullscreenPrimarySuppressionDecision::Allow
+                };
+                if released && *self == Self::PointerStream {
+                    *self = Self::Idle;
+                }
+                decision
+            }
+            FullscreenPrimarySuppressionEvent::TouchFrame {
+                suppresses_current_frame,
+                active,
+                completed,
+                cancelled,
+            } => {
+                // PointerStream is provisional until raw-touch correlation has
+                // identified the source. From that point the touch frame is
+                // authoritative for this pass: canvas gestures are allowed,
+                // while correlated replacement/control responses stay
+                // suppressed by `suppresses_current_frame`.
+                let decision = if active || completed || cancelled || suppresses_current_frame {
+                    if suppresses_current_frame {
+                        FullscreenPrimarySuppressionDecision::Suppress
+                    } else {
+                        FullscreenPrimarySuppressionDecision::Allow
+                    }
+                } else {
+                    FullscreenPrimarySuppressionDecision::Preserve
+                };
+                if cancelled || completed {
+                    *self = Self::Idle;
+                } else if active && (*self == Self::PointerStream || suppresses_current_frame) {
+                    // A positively correlated touch stream owns the same
+                    // promoted primary pointer, including a focus-reclaim
+                    // canvas gesture.
+                    *self = Self::TouchStream;
+                } else if *self == Self::TouchStream && !active {
+                    *self = Self::Idle;
+                }
+                decision
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct FlatNavigatorPage {
@@ -75,6 +199,62 @@ struct FlatNavigatorLayout {
     visible_rect: egui::Rect,
     screen_scale: f32,
     pages: Vec<FlatNavigatorPage>,
+}
+
+/// Processed full-image resources already resolved by the page draw path for this frame.
+/// Missing entries deliberately fall back to the catalog thumbnail in `draw_fs_navigator`.
+#[derive(Default)]
+struct FsNavigatorTextureSources {
+    pages: Vec<(usize, FullscreenPaintResource)>,
+}
+
+impl FsNavigatorTextureSources {
+    fn single(page_idx: usize, texture: Option<FullscreenPaintResource>) -> Self {
+        Self {
+            pages: texture
+                .into_iter()
+                .map(|texture| (page_idx, texture))
+                .collect(),
+        }
+    }
+
+    fn spread(
+        left_idx: usize,
+        left: Option<FullscreenPaintResource>,
+        right_idx: usize,
+        right: Option<FullscreenPaintResource>,
+    ) -> Self {
+        let mut pages = Vec::with_capacity(2);
+        if let Some(texture) = left {
+            pages.push((left_idx, texture));
+        }
+        if let Some(texture) = right {
+            pages.push((right_idx, texture));
+        }
+        Self { pages }
+    }
+
+    /// A display-unit holdover is painted after the live pages, so its resources must replace
+    /// the live map as a unit even when the capture-time idx equals the new page idx.
+    fn replace_with_display_unit(&mut self, unit: &FsDisplayUnitHoldover) {
+        self.pages = unit
+            .pages
+            .iter()
+            .map(|page| (page.idx, page.texture.clone()))
+            .collect();
+    }
+
+    fn texture_for_page<'a>(
+        &'a self,
+        page_idx: usize,
+        thumbnail: Option<&'a egui::TextureHandle>,
+    ) -> Option<&'a egui::TextureHandle> {
+        self.pages
+            .iter()
+            .find(|(idx, _)| *idx == page_idx)
+            .map(|(_, resource)| resource.source_texture())
+            .or(thumbnail)
+    }
 }
 
 #[derive(Clone)]
@@ -234,6 +414,22 @@ fn fs_navigator_uv_rect_is_full(visible: egui::Rect, full: egui::Rect) -> bool {
         && (visible.top() - full.top()).abs() <= EPSILON
         && (visible.right() - full.right()).abs() <= EPSILON
         && (visible.bottom() - full.bottom()).abs() <= EPSILON
+}
+
+/// Scale a fully visible image inside the navigator's full-view frame.
+///
+/// At exact fit one axis fills the viewport, so the ratio is 1 and the image, frame and overview
+/// remain identical. Zooming farther out shrinks the image continuously, but never below 40% of
+/// the overview so it remains useful as a navigation target.
+fn fs_navigator_fully_visible_image_scale(
+    content_bounds: egui::Rect,
+    clip_rect: egui::Rect,
+) -> f32 {
+    let width_ratio = content_bounds.width() / clip_rect.width().max(f32::EPSILON);
+    let height_ratio = content_bounds.height() / clip_rect.height().max(f32::EPSILON);
+    width_ratio
+        .max(height_ratio)
+        .clamp(FS_NAVIGATOR_MIN_IMAGE_SCALE, 1.0)
 }
 
 fn flat_navigator_main_pages(
@@ -412,25 +608,30 @@ fn build_flat_navigator_layout(
         .iter()
         .map(|page| page.visible_source_uv_rect(clip_rect))
         .collect::<Vec<_>>();
-    // When every page is already fully visible, the outline would cover the entire overview and
-    // convey no useful position information. Keep the user's enabled setting, but hide the panel
-    // until zoom, pan, trim, or a fit mode makes only part of the source visible.
-    if main_pages.iter().zip(&visible_uvs).all(|(page, visible)| {
+    let all_fully_visible = main_pages.iter().zip(&visible_uvs).all(|(page, visible)| {
         visible.is_some_and(|rect| fs_navigator_uv_rect_is_full(rect, page.uv_rect))
-    }) {
-        return None;
-    }
+    });
 
     let content_bounds = main_pages.iter().fold(None, |bounds, page| {
         fs_navigator_union_rect(bounds, page.full_image_rect)
     })?;
     let (panel_rect, header_rect, canvas_rect) =
         fs_navigator_panel_rect(host_rect, requested_size, corner)?;
-    let screen_scale = (canvas_rect.width() / content_bounds.width())
+    let fitted_screen_scale = (canvas_rect.width() / content_bounds.width())
         .min(canvas_rect.height() / content_bounds.height());
+    let image_scale = if all_fully_visible {
+        fs_navigator_fully_visible_image_scale(content_bounds, clip_rect)
+    } else {
+        1.0
+    };
+    let screen_scale = fitted_screen_scale * image_scale;
     if !screen_scale.is_finite() || screen_scale <= 0.0 {
         return None;
     }
+    let full_view_rect = egui::Rect::from_center_size(
+        canvas_rect.center(),
+        content_bounds.size() * fitted_screen_scale,
+    );
     let map_rect = |rect: egui::Rect| {
         egui::Rect::from_center_size(
             canvas_rect.center() + (rect.center() - content_bounds.center()) * screen_scale,
@@ -440,7 +641,7 @@ fn build_flat_navigator_layout(
 
     let mut pages = Vec::with_capacity(main_pages.len());
     let mut content_rect = None;
-    let mut visible_rect = None;
+    let mut visible_rect = all_fully_visible.then_some(full_view_rect);
     for (main, visible_uv) in main_pages.into_iter().zip(visible_uvs) {
         let navigator = DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
@@ -462,7 +663,7 @@ fn build_flat_navigator_layout(
             map_rect(main.full_image_rect),
         )?;
         content_rect = fs_navigator_union_rect(content_rect, navigator.full_image_rect);
-        if let Some(visible_uv) = visible_uv {
+        if !all_fully_visible && let Some(visible_uv) = visible_uv {
             visible_rect = fs_navigator_union_rect(
                 visible_rect,
                 fs_navigator_source_rect_aabb(&navigator, visible_uv),
@@ -682,6 +883,39 @@ fn fs_loupe_suppressed_by_edit_mode(
     text_mode: bool,
 ) -> bool {
     analysis_mode || adjustment_mode || text_mode
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoupeSampleMapping {
+    uv_rect: egui::Rect,
+    image_rect: egui::Rect,
+}
+
+fn loupe_sample_mapping(
+    uv_center: egui::Vec2,
+    half_uv: egui::Vec2,
+    loupe_rect: egui::Rect,
+) -> LoupeSampleMapping {
+    debug_assert!(half_uv.x > 0.0 && half_uv.y > 0.0);
+    let desired_min = uv_center - half_uv;
+    let desired_max = uv_center + half_uv;
+    let uv_min = egui::pos2(desired_min.x.clamp(0.0, 1.0), desired_min.y.clamp(0.0, 1.0));
+    let uv_max = egui::pos2(desired_max.x.clamp(0.0, 1.0), desired_max.y.clamp(0.0, 1.0));
+    let desired_size = desired_max - desired_min;
+    let image_min_fraction = egui::vec2(
+        (uv_min.x - desired_min.x) / desired_size.x,
+        (uv_min.y - desired_min.y) / desired_size.y,
+    );
+    let image_max_fraction = egui::vec2(
+        (uv_max.x - desired_min.x) / desired_size.x,
+        (uv_max.y - desired_min.y) / desired_size.y,
+    );
+    let image_min = loupe_rect.min + image_min_fraction * loupe_rect.size();
+    let image_max = loupe_rect.min + image_max_fraction * loupe_rect.size();
+    LoupeSampleMapping {
+        uv_rect: egui::Rect::from_min_max(uv_min, uv_max),
+        image_rect: egui::Rect::from_min_max(image_min, image_max),
+    }
 }
 
 fn window_geometry_pos_to_viewport(pos: egui::Pos2, ui_scale: f32) -> egui::Pos2 {
@@ -929,6 +1163,7 @@ pub(crate) const TOP_BAR_HEIGHT: f32 = 44.0;
 /// (補正パネル / メタデータパネル) はこの分だけ下端を空けてシークバーと重ならない
 /// ようにする (`draw_fullscreen_seek_overlay` の panel_rect と同じ高さ)。
 pub(crate) const FS_SEEK_BAR_HEIGHT: f32 = 38.0;
+const FS_SEEK_HOVER_HEIGHT: f32 = 78.0;
 /// ホイール感度（raw_scroll_delta の除数）
 const WHEEL_SENSITIVITY: f32 = 30.0;
 
@@ -940,6 +1175,11 @@ pub(crate) fn metadata_panel_rect(full_rect: egui::Rect) -> egui::Rect {
         egui::pos2(full_rect.max.x - panel_w, panel_top),
         egui::pos2(full_rect.max.x, panel_bottom),
     )
+}
+
+fn fullscreen_top_bar_rect(full_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(full_rect.min, egui::vec2(full_rect.width(), TOP_BAR_HEIGHT))
+        .intersect(full_rect)
 }
 
 pub(crate) fn panel_callout_edge_rect(
@@ -978,6 +1218,155 @@ pub(crate) fn panel_callout_bar_rect(
     )
 }
 
+/// Touch chrome reserves at most a 48 pt side handle: above the 40 pt target
+/// from the tablet measurements, with enough horizontal margin for normal
+/// finger drift. Music narrows this only to stay inside its existing empty
+/// visualization margin.
+const TOUCH_PANEL_HANDLE_WIDTH_PT: f32 = 48.0;
+const MUSIC_TOUCH_PANEL_HANDLE_MIN_WIDTH_PT: f32 = 24.0;
+
+fn touch_panel_handle_rect(
+    full_rect: egui::Rect,
+    edge: crate::ui_helpers::PanelEdge,
+    safe_top_inset: f32,
+    safe_bottom_inset: f32,
+    max_width: f32,
+) -> egui::Rect {
+    if edge == crate::ui_helpers::PanelEdge::Top {
+        return egui::Rect::NOTHING;
+    }
+
+    let safe_top = (full_rect.top() + safe_top_inset.max(0.0)).min(full_rect.bottom());
+    let safe_bottom = (full_rect.bottom() - safe_bottom_inset.max(0.0)).max(full_rect.top());
+    if safe_bottom <= safe_top {
+        return egui::Rect::NOTHING;
+    }
+    let safe_height = safe_bottom - safe_top;
+    let height = (full_rect.height() * 0.24)
+        .clamp(96.0, 220.0)
+        .min(safe_height);
+    let width = TOUCH_PANEL_HANDLE_WIDTH_PT
+        .min(max_width.max(0.0))
+        .min(full_rect.width().max(0.0) * 0.5);
+    if width <= 0.0 || height <= 0.0 {
+        return egui::Rect::NOTHING;
+    }
+    let x = match edge {
+        crate::ui_helpers::PanelEdge::Left => full_rect.left(),
+        crate::ui_helpers::PanelEdge::Right => full_rect.right() - width,
+        crate::ui_helpers::PanelEdge::Top => unreachable!(),
+    };
+    egui::Rect::from_min_size(
+        egui::pos2(x, (safe_top + safe_bottom - height) * 0.5),
+        egui::vec2(width, height),
+    )
+}
+
+fn still_touch_panel_handle_rect(
+    full_rect: egui::Rect,
+    edge: crate::ui_helpers::PanelEdge,
+) -> egui::Rect {
+    touch_panel_handle_rect(
+        full_rect,
+        edge,
+        TOP_BAR_HEIGHT,
+        FS_SEEK_BAR_HEIGHT,
+        TOUCH_PANEL_HANDLE_WIDTH_PT,
+    )
+}
+
+fn still_touch_panel_handle_rects(full_rect: egui::Rect) -> [egui::Rect; 2] {
+    [
+        still_touch_panel_handle_rect(full_rect, crate::ui_helpers::PanelEdge::Left),
+        still_touch_panel_handle_rect(full_rect, crate::ui_helpers::PanelEdge::Right),
+    ]
+}
+
+fn visible_still_touch_panel_handle_rects(
+    full_rect: egui::Rect,
+    handles_enabled: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
+) -> [egui::Rect; 2] {
+    visible_touch_panel_handle_rects(
+        still_touch_panel_handle_rects(full_rect),
+        handles_enabled,
+        left_panel_open,
+        right_panel_open,
+    )
+}
+
+fn visible_touch_panel_handle_rects(
+    [left, right]: [egui::Rect; 2],
+    handles_enabled: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
+) -> [egui::Rect; 2] {
+    if !handles_enabled {
+        return [egui::Rect::NOTHING; 2];
+    }
+    [
+        if left_panel_open {
+            egui::Rect::NOTHING
+        } else {
+            left
+        },
+        if right_panel_open {
+            egui::Rect::NOTHING
+        } else {
+            right
+        },
+    ]
+}
+
+fn extend_touch_excluded_with_panel_handles(
+    excluded: &mut Vec<egui::Rect>,
+    full_rect: egui::Rect,
+    handles_enabled: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
+) {
+    excluded.extend(
+        visible_still_touch_panel_handle_rects(
+            full_rect,
+            handles_enabled,
+            left_panel_open,
+            right_panel_open,
+        )
+        .into_iter()
+        .filter(egui::Rect::is_positive),
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StillSidePanelAction {
+    OpenAdjustment,
+    OpenMetadata,
+}
+
+fn still_side_panel_action_for_handle_edge(
+    edge: crate::ui_helpers::PanelEdge,
+) -> StillSidePanelAction {
+    match edge {
+        crate::ui_helpers::PanelEdge::Left => StillSidePanelAction::OpenAdjustment,
+        crate::ui_helpers::PanelEdge::Right => StillSidePanelAction::OpenMetadata,
+        crate::ui_helpers::PanelEdge::Top => unreachable!("side-panel handle has no top edge"),
+    }
+}
+
+fn touch_panel_tap_command_dismisses_before_dispatch(
+    command: crate::touch_input::TouchCommand,
+    left_open: crate::ui_helpers::MetadataPanelOpenState,
+    right_open: crate::ui_helpers::MetadataPanelOpenState,
+) -> bool {
+    matches!(
+        command,
+        crate::touch_input::TouchCommand::ToggleChrome
+            | crate::touch_input::TouchCommand::PageSide { .. }
+    ) && (left_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
+        || right_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle)
+}
+
 #[derive(Clone, Copy)]
 struct StillSidePanelChromeInputs {
     is_music_view: bool,
@@ -1013,6 +1402,7 @@ struct StillTopBarVisibilityInputs {
     slideshow_popup_open: bool,
     rotation_popup_open: bool,
     view_trim_mode: bool,
+    touch_chrome_latched: bool,
 }
 
 fn still_top_bar_visible_from_inputs(input: StillTopBarVisibilityInputs) -> bool {
@@ -1024,10 +1414,308 @@ fn still_top_bar_visible_from_inputs(input: StillTopBarVisibilityInputs) -> bool
         || input.slideshow_popup_open
         || input.rotation_popup_open
         || input.view_trim_mode
+        || input.touch_chrome_latched
+}
+
+#[derive(Clone, Copy)]
+struct StillSeekBarVisibilityInputs {
+    allowed: bool,
+    locked: bool,
+    bottom_hover: bool,
+    drag_active: bool,
+    side_panel_visible: bool,
+    touch_chrome_latched: bool,
+    wide_enough: bool,
+    content_available: bool,
+}
+
+fn still_seek_bar_visible_from_inputs(input: StillSeekBarVisibilityInputs) -> bool {
+    input.allowed
+        && input.wide_enough
+        && input.content_available
+        && (input.locked
+            || input.bottom_hover
+            || input.drag_active
+            || input.side_panel_visible
+            || input.touch_chrome_latched)
+}
+
+#[derive(Clone, Copy, Default)]
+struct StillTouchInputEnabledInputs {
+    is_video: bool,
+    is_music_view: bool,
+    has_fullscreen_item: bool,
+    dialog_open: bool,
+    wants_keyboard_input: bool,
+    ime_input_active: bool,
+    context_menu_open: bool,
+    spread_popup_open: bool,
+    fit_popup_open: bool,
+    slideshow_popup_open: bool,
+    rotation_popup_open: bool,
+    compare_wipe_active: bool,
+    panorama_active: bool,
+    analysis_active: bool,
+    overlay_edit_active: bool,
+    view_trim_active: bool,
+    zoom_active: bool,
+}
+
+fn still_touch_input_enabled(input: StillTouchInputEnabledInputs) -> bool {
+    !input.is_video
+        && !input.is_music_view
+        && input.has_fullscreen_item
+        && !input.dialog_open
+        && !input.wants_keyboard_input
+        && !input.ime_input_active
+        && !input.context_menu_open
+        && !input.spread_popup_open
+        && !input.fit_popup_open
+        && !input.slideshow_popup_open
+        && !input.rotation_popup_open
+        && !input.compare_wipe_active
+        && !input.panorama_active
+        && !input.analysis_active
+        && !input.overlay_edit_active
+        && !input.view_trim_active
+        && !input.zoom_active
+}
+
+#[derive(Clone, Copy)]
+struct StillTouchFirstRunHelpEligibility {
+    learned: bool,
+    touch_activity: bool,
+    gestures_disabled: bool,
+    touch_input_enabled: bool,
+}
+
+fn should_start_still_touch_first_run_help(input: StillTouchFirstRunHelpEligibility) -> bool {
+    !input.learned && input.touch_activity && !input.gestures_disabled && input.touch_input_enabled
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StillTouchFirstRunHelpPhase {
+    /// The contact which discovered the help is consumed only to show it.
+    AwaitingInitialRelease,
+    /// A later tap anywhere dismisses the help and reveals chrome.
+    Ready,
+}
+
+impl Default for StillTouchFirstRunHelpPhase {
+    fn default() -> Self {
+        Self::AwaitingInitialRelease
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StillTouchFirstRunHelpState {
+    scope: StillTouchChromeLatch,
+    phase: StillTouchFirstRunHelpPhase,
+}
+
+fn still_touch_first_run_help_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::new((
+        "miv_touch_first_run_help",
+        ctx.viewport_id(),
+        crate::touch_correlation::TouchSurface::StillFullscreen,
+    ))
+}
+
+fn still_touch_first_run_help_phase(
+    ctx: &egui::Context,
+    scope: StillTouchChromeLatch,
+) -> Option<StillTouchFirstRunHelpPhase> {
+    let id = still_touch_first_run_help_id(ctx);
+    ctx.data(|data| {
+        data.get_temp::<StillTouchFirstRunHelpState>(id)
+            .filter(|state| state.scope == scope)
+            .map(|state| state.phase)
+    })
+}
+
+fn set_still_touch_first_run_help_phase(
+    ctx: &egui::Context,
+    scope: StillTouchChromeLatch,
+    phase: StillTouchFirstRunHelpPhase,
+) {
+    let id = still_touch_first_run_help_id(ctx);
+    ctx.data_mut(|data| {
+        data.insert_temp(id, StillTouchFirstRunHelpState { scope, phase });
+    });
+    ctx.request_repaint();
+}
+
+fn clear_still_touch_first_run_help(ctx: &egui::Context) {
+    let id = still_touch_first_run_help_id(ctx);
+    let removed = ctx.data_mut(|data| {
+        data.remove_temp::<StillTouchFirstRunHelpState>(id)
+            .is_some()
+    });
+    if removed {
+        ctx.request_repaint();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StillTouchFirstRunHelpTapAction {
+    Ignore,
+    LearnAndShowChrome,
+}
+
+fn still_touch_first_run_help_tap_action(
+    phase: StillTouchFirstRunHelpPhase,
+    command: crate::touch_input::TouchCommand,
+) -> StillTouchFirstRunHelpTapAction {
+    if phase == StillTouchFirstRunHelpPhase::Ready
+        && matches!(
+            command,
+            crate::touch_input::TouchCommand::ToggleChrome
+                | crate::touch_input::TouchCommand::PageSide { .. }
+        )
+    {
+        StillTouchFirstRunHelpTapAction::LearnAndShowChrome
+    } else {
+        StillTouchFirstRunHelpTapAction::Ignore
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StillTouchForegroundReclaimAction {
+    None,
+    ToggleChrome,
+    LearnAndShowChrome,
+    SetHelpReady,
+}
+
+fn still_touch_foreground_reclaim_action(
+    help_phase: Option<StillTouchFirstRunHelpPhase>,
+    touch_active: bool,
+    commands: &[crate::touch_input::TouchCommand],
+) -> StillTouchForegroundReclaimAction {
+    if let Some(help_phase) = help_phase {
+        if commands.iter().copied().any(|command| {
+            still_touch_first_run_help_tap_action(help_phase, command)
+                == StillTouchFirstRunHelpTapAction::LearnAndShowChrome
+        }) {
+            return StillTouchForegroundReclaimAction::LearnAndShowChrome;
+        }
+        if help_phase == StillTouchFirstRunHelpPhase::AwaitingInitialRelease && !touch_active {
+            return StillTouchForegroundReclaimAction::SetHelpReady;
+        }
+        return StillTouchForegroundReclaimAction::None;
+    }
+
+    if commands
+        .iter()
+        .any(|command| *command == crate::touch_input::TouchCommand::ToggleChrome)
+    {
+        StillTouchForegroundReclaimAction::ToggleChrome
+    } else {
+        // PageSide, pinch, pan, and all other commands are activation-only
+        // no-ops while the existing focus-reclaim early return is active.
+        StillTouchForegroundReclaimAction::None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StillTouchChromeLatch {
+    fs_idx: usize,
+    session_started_at: Option<std::time::Instant>,
+}
+
+fn still_touch_chrome_latch_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::new((
+        "miv_touch_chrome_latch",
+        ctx.viewport_id(),
+        crate::touch_correlation::TouchSurface::StillFullscreen,
+    ))
+}
+
+fn still_touch_chrome_latched(
+    ctx: &egui::Context,
+    fs_idx: usize,
+    session_started_at: Option<std::time::Instant>,
+) -> bool {
+    ctx.data(|data| {
+        data.get_temp::<StillTouchChromeLatch>(still_touch_chrome_latch_id(ctx))
+            == Some(StillTouchChromeLatch {
+                fs_idx,
+                session_started_at,
+            })
+    })
+}
+
+fn toggle_still_touch_chrome_latch(
+    ctx: &egui::Context,
+    fs_idx: usize,
+    session_started_at: Option<std::time::Instant>,
+) {
+    let latch = StillTouchChromeLatch {
+        fs_idx,
+        session_started_at,
+    };
+    let latched = !still_touch_chrome_latched(ctx, fs_idx, session_started_at);
+    set_still_touch_chrome_latch(ctx, latch, latched);
+}
+
+fn set_still_touch_chrome_latch(ctx: &egui::Context, latch: StillTouchChromeLatch, latched: bool) {
+    let id = still_touch_chrome_latch_id(ctx);
+    ctx.data_mut(|data| {
+        if latched {
+            data.insert_temp(id, latch);
+        } else if data.get_temp::<StillTouchChromeLatch>(id) == Some(latch) {
+            data.remove_temp::<StillTouchChromeLatch>(id);
+        }
+    });
+    ctx.request_repaint();
 }
 
 fn fs_rotation_popup_open(ctx: &egui::Context) -> bool {
     egui::Popup::is_id_open(ctx, egui::Id::new("fs_rotation_btn").with("popup"))
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct FullscreenSidePanelRects {
+    left: Option<egui::Rect>,
+    right: Option<egui::Rect>,
+}
+
+impl FullscreenSidePanelRects {
+    fn iter(self) -> impl Iterator<Item = egui::Rect> {
+        [self.left, self.right].into_iter().flatten()
+    }
+}
+
+fn fullscreen_side_panel_rects(
+    full_rect: egui::Rect,
+    chrome_enabled: bool,
+    mode: crate::settings::FsSidePanelMode,
+    right_panel_visible: bool,
+    left_panel_visible: bool,
+) -> FullscreenSidePanelRects {
+    if !chrome_enabled {
+        return FullscreenSidePanelRects::default();
+    }
+    let click_mode = mode.normalized() == crate::settings::FsSidePanelMode::ClickToShow;
+    FullscreenSidePanelRects {
+        left: if left_panel_visible {
+            Some(adjustment_panel_rect(full_rect))
+        } else if click_mode {
+            Some(panel_callout_edge_rect(
+                full_rect,
+                crate::ui_helpers::PanelEdge::Left,
+            ))
+        } else {
+            None
+        },
+        right: Some(if right_panel_visible {
+            metadata_panel_rect(full_rect)
+        } else if click_mode {
+            panel_callout_edge_rect(full_rect, crate::ui_helpers::PanelEdge::Right)
+        } else {
+            metadata_panel_hover_activation_rect(full_rect)
+        }),
+    }
 }
 
 fn fullscreen_side_panel_contains_pointer(
@@ -1039,53 +1727,42 @@ fn fullscreen_side_panel_contains_pointer(
     left_panel_visible: bool,
     navigator_exclusion: Option<egui::Rect>,
 ) -> bool {
-    if !chrome_enabled || !fullscreen_edge_hover_allowed(pos, navigator_exclusion) {
+    if !fullscreen_edge_hover_allowed(pos, navigator_exclusion) {
         return false;
     }
-    let click_mode = mode.normalized() == crate::settings::FsSidePanelMode::ClickToShow;
-    let right_rect = if right_panel_visible {
-        metadata_panel_rect(full_rect)
-    } else if click_mode {
-        panel_callout_edge_rect(full_rect, crate::ui_helpers::PanelEdge::Right)
-    } else {
-        metadata_panel_hover_activation_rect(full_rect)
-    };
-    let in_left_panel = left_panel_visible && adjustment_panel_rect(full_rect).contains(pos);
-    let in_left_callout = click_mode
-        && panel_callout_edge_rect(full_rect, crate::ui_helpers::PanelEdge::Left).contains(pos);
-    right_rect.contains(pos) || in_left_panel || in_left_callout
+    fullscreen_side_panel_rects(
+        full_rect,
+        chrome_enabled,
+        mode,
+        right_panel_visible,
+        left_panel_visible,
+    )
+    .iter()
+    .any(|rect| rect.contains(pos))
 }
 
 fn music_left_panel_visible_from_inputs(
     mode: crate::settings::FsSidePanelMode,
     hover_active: bool,
-    session_open: bool,
+    open_state: crate::ui_helpers::MetadataPanelOpenState,
     modal_open: bool,
 ) -> bool {
-    if modal_open {
-        return false;
-    }
-    match mode.normalized() {
-        crate::settings::FsSidePanelMode::Hover => hover_active,
-        crate::settings::FsSidePanelMode::ClickToShow => session_open,
-        crate::settings::FsSidePanelMode::Unknown => unreachable!("normalized side panel mode"),
-    }
+    music_right_panel_visible_from_inputs(mode, hover_active, open_state, modal_open)
 }
 
 fn music_right_panel_visible_from_inputs(
     mode: crate::settings::FsSidePanelMode,
     hover_active: bool,
-    click_info_open: bool,
+    open_state: crate::ui_helpers::MetadataPanelOpenState,
     modal_open: bool,
 ) -> bool {
     if modal_open {
         return false;
     }
+    let explicit = crate::ui_helpers::metadata_panel_explicit_shown(mode, open_state);
     match mode.normalized() {
-        crate::settings::FsSidePanelMode::Hover => hover_active,
-        crate::settings::FsSidePanelMode::ClickToShow => {
-            crate::ui_helpers::metadata_panel_click_shown(mode, click_info_open)
-        }
+        crate::settings::FsSidePanelMode::Hover => hover_active || explicit,
+        crate::settings::FsSidePanelMode::ClickToShow => explicit,
         crate::settings::FsSidePanelMode::Unknown => unreachable!("normalized side panel mode"),
     }
 }
@@ -1104,21 +1781,21 @@ impl MusicViewFrameUiState {
         mode: crate::settings::FsSidePanelMode,
         left_hover_active: bool,
         right_hover_active: bool,
-        left_session_open: bool,
-        right_click_info_open: bool,
+        left_open_state: crate::ui_helpers::MetadataPanelOpenState,
+        right_open_state: crate::ui_helpers::MetadataPanelOpenState,
         modal_open: bool,
     ) -> Self {
         Self {
             left_panel_visible: music_left_panel_visible_from_inputs(
                 mode,
                 left_hover_active,
-                left_session_open,
+                left_open_state,
                 modal_open,
             ),
             right_panel_visible: music_right_panel_visible_from_inputs(
                 mode,
                 right_hover_active,
-                right_click_info_open,
+                right_open_state,
                 modal_open,
             ),
             modal_open,
@@ -1131,6 +1808,97 @@ impl MusicViewFrameUiState {
 }
 
 const MUSIC_TOP_BAR_HEIGHT: f32 = 54.0;
+
+fn music_visualization_side_margin(view_width: f32) -> f32 {
+    let edge_trigger = crate::ui_helpers::panel_edge_trigger_px(view_width);
+    (edge_trigger + view_width.max(0.0) * 0.03).max(8.0)
+}
+
+fn music_touch_panel_handle_rects(full_rect: egui::Rect) -> [egui::Rect; 2] {
+    let max_width = music_visualization_side_margin(full_rect.width());
+    let rects = [
+        touch_panel_handle_rect(
+            full_rect,
+            crate::ui_helpers::PanelEdge::Left,
+            MUSIC_TOP_BAR_HEIGHT,
+            crate::ui_music_panels::MUSIC_HUD_HEIGHT,
+            max_width,
+        ),
+        touch_panel_handle_rect(
+            full_rect,
+            crate::ui_helpers::PanelEdge::Right,
+            MUSIC_TOP_BAR_HEIGHT,
+            crate::ui_music_panels::MUSIC_HUD_HEIGHT,
+            max_width,
+        ),
+    ];
+    if rects[0].width() < MUSIC_TOUCH_PANEL_HANDLE_MIN_WIDTH_PT {
+        [egui::Rect::NOTHING; 2]
+    } else {
+        rects
+    }
+}
+
+fn visible_music_touch_panel_handle_rects(
+    full_rect: egui::Rect,
+    handles_enabled: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
+) -> [egui::Rect; 2] {
+    visible_touch_panel_handle_rects(
+        music_touch_panel_handle_rects(full_rect),
+        handles_enabled,
+        left_panel_open,
+        right_panel_open,
+    )
+}
+
+fn music_panel_callout_edges_without_touch_handles(handle_rects: [egui::Rect; 2]) -> [bool; 2] {
+    handle_rects.map(|rect| !rect.is_positive())
+}
+
+fn music_touch_observed_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::new(("miv_music_touch_observed", ctx.viewport_id()))
+}
+
+fn observe_music_touch_for_panel_handles(ctx: &egui::Context, gestures_disabled: bool) -> bool {
+    if gestures_disabled {
+        return false;
+    }
+    let id = music_touch_observed_id(ctx);
+    if ctx.data(|data| data.get_temp::<bool>(id).unwrap_or(false)) {
+        return true;
+    }
+    let touch_observed = ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Touch { .. }))
+    });
+    if touch_observed {
+        ctx.data_mut(|data| data.insert_temp(id, true));
+    }
+    touch_observed
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MusicPanelReachSource {
+    Pointer,
+    TouchHandle,
+}
+
+fn music_panel_open_state_after_reach(
+    mode: crate::settings::FsSidePanelMode,
+    state: crate::ui_helpers::MetadataPanelOpenState,
+    source: MusicPanelReachSource,
+) -> crate::ui_helpers::MetadataPanelOpenState {
+    match source {
+        MusicPanelReachSource::Pointer => {
+            crate::ui_helpers::toggle_side_panel_by_pointer(mode, state)
+        }
+        MusicPanelReachSource::TouchHandle => crate::ui_helpers::open_side_panel_by_touch(state),
+    }
+}
 
 fn music_side_panel_contains_pointer(
     full_rect: egui::Rect,
@@ -1208,12 +1976,21 @@ fn adjustment_panel_should_auto_close(
     dragging: bool,
     hover_active: bool,
     bookmark_title_focused: bool,
+    touch_chrome_latched: bool,
 ) -> bool {
     mode.normalized() == crate::settings::FsSidePanelMode::Hover
         && panel_open
         && !dragging
         && !hover_active
         && !bookmark_title_focused
+        && !touch_chrome_latched
+}
+
+fn still_passive_side_panel_hover_enabled(cursor_hidden: bool, touch_chrome_latched: bool) -> bool {
+    // Touch pointer emulation passes through the physical edge before a
+    // visible handle commits. Once touch chrome owns the panel reach path,
+    // passive hover must not pre-open a panel and invert its toggle.
+    !cursor_hidden && !touch_chrome_latched
 }
 
 fn should_handle_fullscreen_wheel(
@@ -1243,9 +2020,34 @@ fn fullscreen_cursor_in_panel_for_wheel(
     }
 }
 
-fn fullscreen_click_nav_base_delta(pos_x: f32, center_x: f32, rtl: bool) -> i32 {
-    let ltr_base = if pos_x > center_x { 1 } else { -1 };
+fn fullscreen_click_nav_delta_for_side(left: bool, rtl: bool) -> i32 {
+    let ltr_base = if left { -1 } else { 1 };
     if rtl { -ltr_base } else { ltr_base }
+}
+
+/// Return the next pan for a canvas drag, including the frame where egui first
+/// promotes a click-and-drag response to the dragged state.
+///
+/// Sense::click_and_drag deliberately delays drag_started until movement
+/// exceeds the click threshold. Treating that promotion frame as a press-only
+/// frame drops the entire first (and often only, for coalesced touch input)
+/// movement. total_drag_delta is measured from the real pointer press even on
+/// that promotion frame, so applying it to the pan captured at drag start
+/// preserves the established absolute mouse-pan and clamp behavior without
+/// synthesizing another press.
+fn fullscreen_drag_pan_proposal(
+    response: &egui::Response,
+    pan_at_drag_start: egui::Vec2,
+) -> Option<egui::Vec2> {
+    response
+        .dragged_by(egui::PointerButton::Primary)
+        .then(|| response.total_drag_delta())
+        .flatten()
+        .map(|delta| pan_at_drag_start + delta)
+}
+
+fn fullscreen_click_nav_base_delta(pos_x: f32, center_x: f32, rtl: bool) -> i32 {
+    fullscreen_click_nav_delta_for_side(pos_x < center_x, rtl)
 }
 
 fn should_zoom_fullscreen_wheel(ctrl_held: bool, overlay_edit_mode: bool) -> bool {
@@ -2759,7 +3561,7 @@ impl App {
             self.enter_analysis_mode_bypass();
             // 補正パネルと排他
             self.persist_pending_view_trim_state();
-            self.adjustment_mode = false;
+            self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
             self.cache_current_edit_preview_if_ready();
             self.local_adjust_mode = false;
             self.local_adjust_repair_point_pick_active = None;
@@ -4027,6 +4829,29 @@ impl App {
         };
     }
 
+    /// Apply a recognizer-provided touch scale at its screen-space pivot.
+    /// Input recognition stays separate from the existing zoom/pan ownership:
+    /// this thin adapter reuses the same clamps as wheel and drag input.
+    fn apply_touch_zoom_factor_about_pivot(
+        &mut self,
+        factor: f32,
+        pivot: egui::Pos2,
+        rect_center: egui::Pos2,
+    ) -> bool {
+        if !factor.is_finite() || factor <= 0.0 {
+            return false;
+        }
+        let old_zoom = self.fs_zoom;
+        let new_zoom = (old_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+        if (new_zoom - old_zoom).abs() <= f32::EPSILON {
+            return false;
+        }
+        let proposed_pan = zoom_preserve_pivot(pivot, rect_center, self.fs_pan, old_zoom, new_zoom);
+        self.fs_zoom = new_zoom;
+        self.set_fs_pan_from_input(new_zoom, proposed_pan);
+        true
+    }
+
     /// 中ボタンドラッグズームを処理する。
     ///
     /// ホイール押し込み + 上下ドラッグで fs_zoom / analysis_zoom を連続的に変える。
@@ -4623,6 +5448,23 @@ fn fullscreen_seek_knob_x(track_rect: egui::Rect, fraction: f32, rtl: bool) -> f
     }
 }
 
+/// Compare wipe fractions are always measured across the fitted, zoomed and panned image rect.
+/// A fraction of 0 is the rect's left edge and 1 is its right edge; the UI's 5% endpoint guard is
+/// applied only when storing an interactive value.
+fn compare_wipe_screen_x(draw_rect: egui::Rect, fraction: f32) -> f32 {
+    draw_rect.left() + draw_rect.width() * fraction.clamp(0.0, 1.0)
+}
+
+fn compare_wipe_fraction_from_screen_x(draw_rect: egui::Rect, screen_x: f32) -> f32 {
+    ((screen_x - draw_rect.left()) / draw_rect.width().max(f32::EPSILON)).clamp(0.0, 1.0)
+}
+
+fn compare_wipe_grab_hit(draw_rect: egui::Rect, pointer: egui::Pos2, fraction: f32) -> bool {
+    draw_rect.contains(pointer)
+        && (pointer.x - compare_wipe_screen_x(draw_rect, fraction)).abs()
+            <= COMPARE_WIPE_GRAB_HALF_WIDTH
+}
+
 fn fullscreen_rect_excluding_fixed_bars(
     full_rect: egui::Rect,
     top_locked: bool,
@@ -4953,6 +5795,209 @@ struct ContinuousReadingDragDelta {
     pan: egui::Vec2,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum ContinuousReadingDragState {
+    #[default]
+    Idle,
+    Active {
+        session_started_at: std::time::Instant,
+        applied_total: egui::Vec2,
+    },
+    Completed {
+        session_started_at: std::time::Instant,
+        terminal_frame: u64,
+        applied_total: egui::Vec2,
+    },
+}
+
+impl ContinuousReadingDragState {
+    fn advance(
+        self,
+        session_started_at: std::time::Instant,
+        app_frame: u64,
+        dragged: bool,
+        stopped: bool,
+        pointer_down: bool,
+        total_delta: Option<egui::Vec2>,
+    ) -> (Self, egui::Vec2) {
+        let state = match self {
+            Self::Active {
+                session_started_at: stored_session,
+                ..
+            }
+            | Self::Completed {
+                session_started_at: stored_session,
+                ..
+            } if stored_session != session_started_at => Self::Idle,
+            Self::Completed { terminal_frame, .. } if terminal_frame != app_frame => Self::Idle,
+            state => state,
+        };
+
+        // A terminal response can be replayed by a later egui pass in the same
+        // app frame. Keep the applied cumulative total until that frame ends so
+        // the replay contributes zero instead of re-applying the entire drag.
+        if matches!(
+            state,
+            Self::Completed {
+                terminal_frame,
+                ..
+            } if terminal_frame == app_frame
+        ) {
+            return (state, egui::Vec2::ZERO);
+        }
+
+        if (dragged || stopped)
+            && let Some(total_delta) = total_delta
+        {
+            let previous_total = match state {
+                Self::Active { applied_total, .. } => applied_total,
+                Self::Idle | Self::Completed { .. } => egui::Vec2::ZERO,
+            };
+            let incremental_delta = total_delta - previous_total;
+            let next = if stopped || !pointer_down {
+                Self::Completed {
+                    session_started_at,
+                    terminal_frame: app_frame,
+                    applied_total: total_delta,
+                }
+            } else {
+                Self::Active {
+                    session_started_at,
+                    applied_total: total_delta,
+                }
+            };
+            return (next, incremental_delta);
+        }
+
+        if matches!(state, Self::Active { .. }) && !pointer_down {
+            let applied_total = match state {
+                Self::Active { applied_total, .. } => applied_total,
+                Self::Idle | Self::Completed { .. } => egui::Vec2::ZERO,
+            };
+            return (
+                Self::Completed {
+                    session_started_at,
+                    terminal_frame: app_frame,
+                    applied_total,
+                },
+                egui::Vec2::ZERO,
+            );
+        }
+
+        (state, egui::Vec2::ZERO)
+    }
+}
+
+/// Whether a continuous-reading drag should consume this frame.
+///
+/// The mouse must actually be dragging. `pointer.delta()` is non-zero for plain
+/// hover movement, so admitting the mouse on a non-zero delta alone would scroll
+/// the page whenever the cursor crosses the image with no button held.
+///
+/// A correlated touch stream may open the branch on its cumulative delta instead,
+/// because a coalesced press-move-release arrives in one frame and the response
+/// reports no ongoing drag by the time it is read.
+fn continuous_reading_drag_consumes_frame(
+    response_dragged: bool,
+    touch_activity: bool,
+    touch_delta: egui::Vec2,
+) -> bool {
+    response_dragged || (touch_activity && touch_delta != egui::Vec2::ZERO)
+}
+
+fn continuous_reading_response_drag_delta(
+    ctx: &egui::Context,
+    response: &egui::Response,
+    coalesced_touch_total: Option<egui::Vec2>,
+    session_started_at: Option<std::time::Instant>,
+    app_frame: u64,
+    enabled: bool,
+    pointer_down: bool,
+) -> egui::Vec2 {
+    let state_id = egui::Id::new(("continuous_reading_drag_state", ctx.viewport_id()));
+    let Some(session_started_at) = session_started_at.filter(|_| enabled) else {
+        ctx.data_mut(|data| data.remove_temp::<ContinuousReadingDragState>(state_id));
+        return egui::Vec2::ZERO;
+    };
+    // Response::total_drag_delta reads Context input internally, so collect
+    // every response fact before taking the temp-data write lock below.
+    let response_dragged = response.dragged_by(egui::PointerButton::Primary);
+    let response_stopped = response.drag_stopped_by(egui::PointerButton::Primary);
+    let response_total = response.total_drag_delta();
+    ctx.data_mut(|data| {
+        let state = data
+            .get_temp::<ContinuousReadingDragState>(state_id)
+            .unwrap_or_default();
+        // A complete touch stream can be delivered in one RawInput. egui then
+        // observes the final pointer as idle and exposes no Response drag even
+        // though the ordered touch/pointer correlation proved the gesture.
+        // Prefer the normal Response cumulative total; use the correlated raw
+        // Start/End total only for that collapsed terminal shape.
+        let total_delta = response_total.or(coalesced_touch_total);
+        let coalesced_terminal = response_total.is_none() && coalesced_touch_total.is_some();
+        let (next, incremental_delta) = state.advance(
+            session_started_at,
+            app_frame,
+            response_dragged || coalesced_terminal,
+            response_stopped || coalesced_terminal,
+            pointer_down,
+            total_delta,
+        );
+        if next == ContinuousReadingDragState::Idle {
+            data.remove_temp::<ContinuousReadingDragState>(state_id);
+        } else {
+            data.insert_temp(state_id, next);
+        }
+        incremental_delta
+    })
+}
+
+fn continuous_reading_coalesced_touch_drag_total(
+    ctx: &egui::Context,
+    touch_frame: &crate::touch_correlation::TouchFrame,
+) -> Option<egui::Vec2> {
+    if touch_frame.owner() != crate::touch_input::TouchOwner::ViewerPointerPassthrough
+        || touch_frame.is_active()
+    {
+        return None;
+    }
+    let mut releases = touch_frame.correlated_primary_release_positions();
+    let release_pos = releases.next()?;
+    if releases.next().is_some() {
+        return None;
+    }
+
+    let endpoints = ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Touch {
+                    device_id,
+                    id,
+                    phase,
+                    pos,
+                    ..
+                } if *phase != egui::TouchPhase::Move => Some((*device_id, *id, *phase, *pos)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    let [start, end] = endpoints.as_slice() else {
+        return None;
+    };
+    if start.0 != end.0
+        || start.1 != end.1
+        || start.2 != egui::TouchPhase::Start
+        || end.2 != egui::TouchPhase::End
+        || end.3 != release_pos
+    {
+        return None;
+    }
+    let total = end.3 - start.3;
+    (total != egui::Vec2::ZERO).then_some(total)
+}
+
 fn continuous_reading_drag_delta(
     flow: ReadingFlow,
     direction: ReadingDirection,
@@ -4985,37 +6030,20 @@ fn continuous_reading_drag_delta(
 }
 
 /// 指定インデックスの画像が横長（幅>高さ）かを判定する。
-/// テクスチャサイズが不明な場合は false（縦長として扱う）。
+///
+/// live なフルサイズ cache、ロード済みサムネイル、退去後も残るページ寸法 cache の順で
+/// 参照する。一度も寸法が判明していないページだけは false（縦長）として扱うが、判明済みの
+/// 寸法はテクスチャ退去で失わないため、同じ items 世代で既知から未知へは後退しない。
 fn is_landscape(
     idx: usize,
     fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
     thumbnails: &[ThumbnailState],
+    page_dims_cache: &crate::page_dims::PageDimsCache,
+    items_generation: u64,
 ) -> bool {
     // フルサイズキャッシュから判定
-    if let Some(entry) = fs_cache.get(&idx) {
-        match entry {
-            FsCacheEntry::Static {
-                tex, source_dims, ..
-            } => {
-                if let Some([w, h]) = source_dims {
-                    return w > h;
-                }
-                let s = tex.size_vec2();
-                return s.x > s.y;
-            }
-            FsCacheEntry::Animated { frames, .. } => {
-                if let Some((tex, _)) = frames.first() {
-                    let s = tex.size_vec2();
-                    return s.x > s.y;
-                }
-            }
-            FsCacheEntry::Video { player, .. } => {
-                if let Some(info) = player.info() {
-                    return info.width > info.height;
-                }
-            }
-            FsCacheEntry::Failed => {}
-        }
+    if let Some((w, h)) = fs_cache.get(&idx).and_then(fs_cache_entry_page_dims) {
+        return w > h;
     }
     // サムネイルから判定
     if let Some(ThumbnailState::Loaded {
@@ -5028,7 +6056,28 @@ fn is_landscape(
         let s = tex.size_vec2();
         return s.x > s.y;
     }
+    // live texture が退去済みでも、一度判明した同世代の寸法は忘れない。
+    if let Some((w, h)) = page_dims_cache.get(items_generation, idx) {
+        return w > h;
+    }
     false
+}
+
+fn fs_cache_entry_page_dims(entry: &FsCacheEntry) -> Option<(u32, u32)> {
+    fn from_usize(dims: [usize; 2]) -> Option<(u32, u32)> {
+        Some((u32::try_from(dims[0]).ok()?, u32::try_from(dims[1]).ok()?))
+    }
+
+    match entry {
+        FsCacheEntry::Static {
+            tex, source_dims, ..
+        } => from_usize(source_dims.unwrap_or_else(|| tex.size())),
+        FsCacheEntry::Animated { frames, .. } => {
+            frames.first().and_then(|(tex, _)| from_usize(tex.size()))
+        }
+        FsCacheEntry::Video { player, .. } => player.info().map(|info| (info.width, info.height)),
+        FsCacheEntry::Failed => None,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -5079,12 +6128,14 @@ fn build_spread_display_units(
     shift_anchor_idx: Option<usize>,
     fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
     thumbnails: &[ThumbnailState],
+    page_dims_cache: &crate::page_dims::PageDimsCache,
+    items_generation: u64,
 ) -> Vec<SpreadDisplayUnit> {
     build_spread_display_units_with_predicates(
         nav,
         spread_mode,
         shift_anchor_idx,
-        |idx| is_landscape(idx, fs_cache, thumbnails),
+        |idx| is_landscape(idx, fs_cache, thumbnails, page_dims_cache, items_generation),
         |idx| is_spread_pairable_item(items.get(idx)),
     )
 }
@@ -5435,7 +6486,445 @@ fn image_reading_position(image_indices: &[usize], idx: usize) -> Option<usize> 
         .map(|pos| pos + 1)
 }
 
+fn paint_panel_callout_chrome(
+    ui: &egui::Ui,
+    bar_rect: egui::Rect,
+    edge: crate::ui_helpers::PanelEdge,
+    open: bool,
+    hovered: bool,
+) {
+    let fill = if hovered {
+        egui::Color32::from_rgba_unmultiplied(65, 125, 205, 235)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(35, 70, 115, 210)
+    };
+    ui.painter().rect_filled(bar_rect, 3.0, fill);
+    let points_right = match edge {
+        crate::ui_helpers::PanelEdge::Left => !open,
+        crate::ui_helpers::PanelEdge::Right => open,
+        crate::ui_helpers::PanelEdge::Top => false,
+    };
+    draw_panel_callout_arrow(
+        ui.painter(),
+        bar_rect.center(),
+        points_right,
+        egui::Color32::WHITE,
+    );
+}
+
+fn interact_touch_panel_handle(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: egui::Id,
+) -> egui::Response {
+    ui.interact(rect, id, egui::Sense::click())
+}
+
+fn draw_music_touch_panel_handle(
+    ctx: &egui::Context,
+    bar_rect: egui::Rect,
+    edge: crate::ui_helpers::PanelEdge,
+) -> bool {
+    egui::Area::new(egui::Id::new((
+        "music_touch_panel_handle",
+        ctx.viewport_id(),
+        edge,
+    )))
+    .order(crate::ui_helpers::PANEL_CALLOUT_ORDER)
+    .fixed_pos(bar_rect.min)
+    .show(ctx, |ui| {
+        ui.set_min_size(bar_rect.size());
+        let rect = egui::Rect::from_min_size(ui.min_rect().min, bar_rect.size());
+        let hit_id = ui.id().with(("music_touch_panel_handle_hit", edge));
+        let response = interact_touch_panel_handle(ui, rect, hit_id);
+        paint_panel_callout_chrome(ui, rect, edge, false, response.hovered());
+        response.on_hover_text("パネルを開く").clicked()
+    })
+    .inner
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StillTouchFirstRunHelpLayout {
+    full_rect: egui::Rect,
+    left_half: egui::Rect,
+    right_half: egui::Rect,
+    center_tap_rect: egui::Rect,
+    /// Each label is centred in the side strip it describes, outside the
+    /// centre tap rectangle. The screen-half centres (25% / 75%) are too close
+    /// to the rectangle for the longer physical-side page labels.
+    left_label_x: f32,
+    right_label_x: f32,
+}
+
+fn still_touch_first_run_help_layout(full_rect: egui::Rect) -> StillTouchFirstRunHelpLayout {
+    let center_tap_rect = crate::touch_input::center_tap_rect(full_rect);
+    StillTouchFirstRunHelpLayout {
+        full_rect,
+        left_half: egui::Rect::from_min_max(
+            full_rect.min,
+            egui::pos2(full_rect.center().x, full_rect.max.y),
+        ),
+        right_half: egui::Rect::from_min_max(
+            egui::pos2(full_rect.center().x, full_rect.min.y),
+            full_rect.max,
+        ),
+        center_tap_rect,
+        left_label_x: (full_rect.min.x + center_tap_rect.min.x) * 0.5,
+        right_label_x: (center_tap_rect.max.x + full_rect.max.x) * 0.5,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StillTouchPageLabels {
+    left: &'static str,
+    right: &'static str,
+}
+
+fn still_touch_page_labels() -> StillTouchPageLabels {
+    StillTouchPageLabels {
+        left: "左のページへ",
+        right: "右のページへ",
+    }
+}
+
+fn still_touch_first_run_help_shows_scaling_hint(ui_scale: f32) -> bool {
+    (crate::settings::normalize_ui_scale_factor(ui_scale) - 1.0).abs() < f32::EPSILON
+}
+
+fn paint_still_touch_first_run_help_overlay(
+    ui: &egui::Ui,
+    full_rect: egui::Rect,
+    show_scaling_hint: bool,
+) {
+    let layout = still_touch_first_run_help_layout(full_rect);
+    let page_labels = still_touch_page_labels();
+    let painter = ui.painter();
+    painter.rect_filled(
+        layout.full_rect,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 178),
+    );
+    for side in [layout.left_half, layout.right_half] {
+        painter.rect_filled(
+            side,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(54, 90, 132, 58),
+        );
+    }
+    painter.rect_filled(
+        layout.center_tap_rect,
+        8.0,
+        egui::Color32::from_rgba_unmultiplied(45, 112, 185, 128),
+    );
+    painter.rect_stroke(
+        layout.center_tap_rect,
+        8.0,
+        egui::Stroke::new(3.0, egui::Color32::from_rgb(170, 218, 255)),
+        egui::StrokeKind::Inside,
+    );
+
+    let main_font = egui::FontId::proportional(18.0);
+    let sub_font = egui::FontId::proportional(14.0);
+    let center = layout.center_tap_rect.center();
+    painter.text(
+        center - egui::vec2(0.0, 12.0),
+        egui::Align2::CENTER_CENTER,
+        "中央をタップ",
+        main_font.clone(),
+        egui::Color32::WHITE,
+    );
+    painter.text(
+        center + egui::vec2(0.0, 14.0),
+        egui::Align2::CENTER_CENTER,
+        "メニューを表示",
+        sub_font.clone(),
+        egui::Color32::from_gray(224),
+    );
+
+    for (label_x, points_right, label) in [
+        (layout.left_label_x, false, page_labels.left),
+        (layout.right_label_x, true, page_labels.right),
+    ] {
+        let arrow_center = egui::pos2(label_x, center.y - 14.0);
+        draw_panel_callout_arrow(painter, arrow_center, points_right, egui::Color32::WHITE);
+        painter.text(
+            arrow_center + egui::vec2(0.0, 30.0),
+            egui::Align2::CENTER_CENTER,
+            label,
+            sub_font.clone(),
+            egui::Color32::WHITE,
+        );
+    }
+
+    if show_scaling_hint {
+        painter.text(
+            full_rect.center_bottom() - egui::vec2(0.0, 16.0),
+            egui::Align2::CENTER_BOTTOM,
+            "UI が小さい場合はメニューの「スケーリング」から変更できます",
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_gray(198),
+        );
+    }
+}
+
+/// Visual-only fixture for first-run touch-help snapshots.
+#[doc(hidden)]
+pub fn draw_still_touch_first_run_help_snapshot_fixture(
+    ui: &mut egui::Ui,
+    learned: bool,
+    ui_scale: f32,
+) {
+    let full_rect = ui.max_rect();
+    ui.painter()
+        .rect_filled(full_rect, 0.0, egui::Color32::BLACK);
+    if !learned {
+        paint_still_touch_first_run_help_overlay(
+            ui,
+            full_rect,
+            still_touch_first_run_help_shows_scaling_hint(ui_scale),
+        );
+    }
+}
+
+/// Visual-only fixture used by the integration snapshots. Production handle
+/// geometry and painting are reused so latch-on/off and the unchanged mouse
+/// callout can be compared without constructing the full application state.
+#[doc(hidden)]
+pub fn draw_still_panel_reach_snapshot_fixture(
+    ui: &mut egui::Ui,
+    touch_chrome_latched: bool,
+    mouse_callout_visible: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
+) {
+    let full_rect = ui.max_rect();
+    ui.painter()
+        .rect_filled(full_rect, 0.0, egui::Color32::BLACK);
+    if left_panel_open {
+        let rect = adjustment_panel_rect(full_rect);
+        ui.painter()
+            .rect_filled(rect, 0.0, egui::Color32::from_rgb(30, 30, 34));
+        ui.painter().text(
+            rect.left_top() + egui::vec2(16.0, 16.0),
+            egui::Align2::LEFT_TOP,
+            "画像補正",
+            egui::FontId::proportional(18.0),
+            egui::Color32::WHITE,
+        );
+    }
+    if touch_chrome_latched {
+        for (edge, rect) in [
+            crate::ui_helpers::PanelEdge::Left,
+            crate::ui_helpers::PanelEdge::Right,
+        ]
+        .into_iter()
+        .zip(visible_still_touch_panel_handle_rects(
+            full_rect,
+            true,
+            left_panel_open,
+            right_panel_open,
+        )) {
+            if rect.is_positive() {
+                paint_panel_callout_chrome(ui, rect, edge, false, false);
+            }
+        }
+    }
+    if mouse_callout_visible {
+        let edge = crate::ui_helpers::PanelEdge::Left;
+        paint_panel_callout_chrome(
+            ui,
+            panel_callout_bar_rect(full_rect, edge),
+            edge,
+            false,
+            false,
+        );
+    }
+}
+
+/// Visual-only fixture for the music touch-panel handles. Production margin,
+/// handle geometry, visibility, and painting are reused so the snapshot also
+/// guards the empty-margin boundary around the mock waveform.
+#[doc(hidden)]
+pub fn draw_music_panel_reach_snapshot_fixture(
+    ui: &mut egui::Ui,
+    touch_observed: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
+) {
+    let full_rect = ui.max_rect();
+    let painter = ui.painter();
+    painter.rect_filled(full_rect, 0.0, crate::ui_music_timeline::MUSIC_VIEW_BG);
+    let top_rect = egui::Rect::from_min_size(
+        full_rect.min,
+        egui::vec2(full_rect.width(), MUSIC_TOP_BAR_HEIGHT),
+    );
+    let hud_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            full_rect.left(),
+            full_rect.bottom() - crate::ui_music_panels::MUSIC_HUD_HEIGHT,
+        ),
+        full_rect.max,
+    );
+    painter.rect_filled(top_rect, 0.0, egui::Color32::from_rgb(22, 25, 31));
+    painter.rect_filled(hud_rect, 0.0, egui::Color32::from_rgb(22, 25, 31));
+
+    let margin = music_visualization_side_margin(full_rect.width());
+    let waveform_rect = egui::Rect::from_min_max(
+        egui::pos2(full_rect.left() + margin, top_rect.bottom() + 16.0),
+        egui::pos2(full_rect.right() - margin, hud_rect.top() - 16.0),
+    );
+    painter.rect_filled(waveform_rect, 4.0, egui::Color32::from_rgb(8, 10, 14));
+    let center_y = waveform_rect.center().y;
+    painter.line_segment(
+        [
+            egui::pos2(waveform_rect.left(), center_y),
+            egui::pos2(waveform_rect.right(), center_y),
+        ],
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(70, 170, 225)),
+    );
+
+    if left_panel_open {
+        let panel_rect = egui::Rect::from_min_max(
+            egui::pos2(full_rect.left(), top_rect.bottom()),
+            egui::pos2(
+                full_rect.left() + crate::ui_music_panels::MUSIC_LEFT_PANEL_WIDTH,
+                hud_rect.top(),
+            ),
+        );
+        painter.rect_filled(panel_rect, 0.0, egui::Color32::from_rgb(30, 30, 34));
+        painter.text(
+            panel_rect.left_top() + egui::vec2(16.0, 16.0),
+            egui::Align2::LEFT_TOP,
+            "ブックマーク",
+            egui::FontId::proportional(18.0),
+            egui::Color32::WHITE,
+        );
+    }
+    for (edge, rect) in [
+        crate::ui_helpers::PanelEdge::Left,
+        crate::ui_helpers::PanelEdge::Right,
+    ]
+    .into_iter()
+    .zip(visible_music_touch_panel_handle_rects(
+        full_rect,
+        touch_observed,
+        left_panel_open,
+        right_panel_open,
+    )) {
+        if rect.is_positive() {
+            paint_panel_callout_chrome(ui, rect, edge, false, false);
+        }
+    }
+}
+
 impl App {
+    /// live なフルスクリーン cache から、現在世代で判明済みのページ寸法を回収する。
+    /// cache 自体は小さな先読み窓なので、フレーム冒頭に 1 回だけ走査する。
+    pub(crate) fn harvest_page_dims_from_fs_cache(&mut self) {
+        let generation = self.items_generation;
+        for (&idx, entry) in &self.fs_cache {
+            if let Some(dims) = fs_cache_entry_page_dims(entry) {
+                self.page_dims_cache.record(generation, idx, dims);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spread_display_unit_pages_for_test(&self, nav: &[usize]) -> Vec<Vec<usize>> {
+        build_spread_display_units(
+            nav,
+            &self.items,
+            self.spread_mode,
+            self.spread_shift_anchor_idx,
+            &self.fs_cache,
+            &self.thumbnails,
+            &self.page_dims_cache,
+            self.items_generation,
+        )
+        .into_iter()
+        .map(|unit| unit.screen_pages(self.spread_mode))
+        .collect()
+    }
+
+    pub(crate) fn still_touch_chrome_is_latched(&self, ctx: &egui::Context) -> bool {
+        self.fullscreen_idx
+            .is_some_and(|idx| still_touch_chrome_latched(ctx, idx, self.fullscreen_opened_at()))
+    }
+
+    fn draw_still_touch_first_run_help_overlay(
+        &self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        fs_idx: usize,
+    ) {
+        let scope = StillTouchChromeLatch {
+            fs_idx,
+            session_started_at: self.fullscreen_opened_at(),
+        };
+        if still_touch_first_run_help_phase(ctx, scope).is_none() {
+            return;
+        }
+
+        let _ = ui.interact(
+            full_rect,
+            egui::Id::new(("fs_touch_first_run_help_sink", ctx.viewport_id())),
+            egui::Sense::click_and_drag(),
+        );
+        paint_still_touch_first_run_help_overlay(
+            ui,
+            full_rect,
+            still_touch_first_run_help_shows_scaling_hint(self.settings.ui_scale_factor),
+        );
+    }
+
+    fn open_still_side_panel_by_touch(&mut self, action: StillSidePanelAction) {
+        match action {
+            StillSidePanelAction::OpenAdjustment => {
+                self.open_fullscreen_touch_adjustment_panel();
+            }
+            StillSidePanelAction::OpenMetadata => self.open_fullscreen_touch_info_panel(),
+        }
+    }
+
+    fn draw_fs_touch_panel_handles(
+        &mut self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        enabled: bool,
+        touch_chrome_latched: bool,
+    ) {
+        if !enabled || !touch_chrome_latched {
+            return;
+        }
+        let left_open = self.adjustment_mode.is_open();
+        let right_open = self.metadata_panel_click_shown()
+            || self.metadata_panel_hover_active
+            || self.fullscreen_tag_picker_open;
+        for (edge, rect) in [
+            crate::ui_helpers::PanelEdge::Left,
+            crate::ui_helpers::PanelEdge::Right,
+        ]
+        .into_iter()
+        .zip(visible_still_touch_panel_handle_rects(
+            full_rect, true, left_open, right_open,
+        )) {
+            if !rect.is_positive() {
+                continue;
+            }
+            let response = interact_touch_panel_handle(
+                ui,
+                rect,
+                egui::Id::new(("fs_touch_panel_handle", edge)),
+            );
+            let action = still_side_panel_action_for_handle_edge(edge);
+            paint_panel_callout_chrome(ui, rect, edge, false, response.hovered());
+            if response.on_hover_text("パネルを開く").clicked() {
+                self.open_still_side_panel_by_touch(action);
+            }
+        }
+    }
+
     fn draw_fs_panel_callouts(
         &mut self,
         ui: &mut egui::Ui,
@@ -5478,7 +6967,7 @@ impl App {
             ui.painter().rect_filled(bar_rect, 3.0, fill);
 
             let open = match edge {
-                crate::ui_helpers::PanelEdge::Left => self.adjustment_mode,
+                crate::ui_helpers::PanelEdge::Left => self.adjustment_mode.is_open(),
                 crate::ui_helpers::PanelEdge::Right => self.metadata_panel_click_shown(),
                 crate::ui_helpers::PanelEdge::Top => false,
             };
@@ -5501,10 +6990,7 @@ impl App {
             if response.on_hover_text(tip).clicked() {
                 match edge {
                     crate::ui_helpers::PanelEdge::Left => {
-                        if self.adjustment_mode {
-                            self.persist_pending_view_trim_state();
-                        }
-                        self.adjustment_mode = !self.adjustment_mode;
+                        self.toggle_fullscreen_pointer_adjustment_panel();
                     }
                     crate::ui_helpers::PanelEdge::Right => {
                         self.toggle_fullscreen_click_info_open();
@@ -5551,6 +7037,29 @@ impl App {
         );
     }
 
+    fn apply_music_panel_reach_requests(
+        &mut self,
+        left: Option<MusicPanelReachSource>,
+        right: Option<MusicPanelReachSource>,
+    ) -> bool {
+        let mode = self.settings.fullscreen_side_panel_mode;
+        let mut changed = false;
+        if let Some(source) = left {
+            let next = music_panel_open_state_after_reach(mode, self.music_left_panel_open, source);
+            changed |= next != self.music_left_panel_open;
+            self.music_left_panel_open = next;
+        }
+        if let Some(source) = right {
+            let next = music_panel_open_state_after_reach(mode, self.fs_info_panel_open, source);
+            if next != self.fs_info_panel_open {
+                self.fs_info_panel_open = next;
+                self.metadata_panel_hover_active = false;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     fn draw_music_panel_callouts(
         &mut self,
         ctx: &egui::Context,
@@ -5559,10 +7068,52 @@ impl App {
         panel_band_bottom: f32,
         fs_idx: usize,
         enabled: bool,
+        touch_observed: bool,
+        left_panel_visible: bool,
+        right_panel_visible: bool,
     ) {
-        if !enabled
-            || self.settings.fullscreen_side_panel_mode.normalized()
-                != crate::settings::FsSidePanelMode::ClickToShow
+        if !enabled {
+            return;
+        }
+        let handle_rects = visible_music_touch_panel_handle_rects(
+            full_rect,
+            touch_observed,
+            left_panel_visible,
+            right_panel_visible,
+        );
+        // A sticky touch observation is not an input-mode switch: mouse callouts must keep
+        // working. Suppress a callout only on the same edge as a positive handle rect, where
+        // drawing both hit targets would let one mouse click open and toggle the panel.
+        let callout_enabled_edges = music_panel_callout_edges_without_touch_handles(handle_rects);
+        if touch_observed {
+            let mut left = None;
+            let mut right = None;
+            for (edge, rect) in [
+                crate::ui_helpers::PanelEdge::Left,
+                crate::ui_helpers::PanelEdge::Right,
+            ]
+            .into_iter()
+            .zip(handle_rects)
+            {
+                if !rect.is_positive() || !draw_music_touch_panel_handle(ctx, rect, edge) {
+                    continue;
+                }
+                match edge {
+                    crate::ui_helpers::PanelEdge::Left => {
+                        left = Some(MusicPanelReachSource::TouchHandle)
+                    }
+                    crate::ui_helpers::PanelEdge::Right => {
+                        right = Some(MusicPanelReachSource::TouchHandle)
+                    }
+                    crate::ui_helpers::PanelEdge::Top => {}
+                }
+            }
+            if self.apply_music_panel_reach_requests(left, right) {
+                ctx.request_repaint();
+            }
+        }
+        if self.settings.fullscreen_side_panel_mode.normalized()
+            != crate::settings::FsSidePanelMode::ClickToShow
         {
             return;
         }
@@ -5579,10 +7130,16 @@ impl App {
         );
         let mut toggle_left = false;
         let mut toggle_right = false;
-        for edge in [
+        for (edge, callout_enabled) in [
             crate::ui_helpers::PanelEdge::Left,
             crate::ui_helpers::PanelEdge::Right,
-        ] {
+        ]
+        .into_iter()
+        .zip(callout_enabled_edges)
+        {
+            if !callout_enabled {
+                continue;
+            }
             if !crate::ui_helpers::callout_hit(panel_callout_edge_rect(full_rect, edge), pointer) {
                 continue;
             }
@@ -5593,7 +7150,7 @@ impl App {
                 continue;
             }
             let open = match edge {
-                crate::ui_helpers::PanelEdge::Left => self.music_left_click_open,
+                crate::ui_helpers::PanelEdge::Left => self.music_left_panel_open.is_open(),
                 crate::ui_helpers::PanelEdge::Right => self.metadata_panel_click_shown(),
                 crate::ui_helpers::PanelEdge::Top => false,
             };
@@ -5642,13 +7199,9 @@ impl App {
                 }
             }
         }
-        if toggle_left {
-            self.music_left_click_open = !self.music_left_click_open;
-        }
-        if toggle_right {
-            self.toggle_fullscreen_click_info_open();
-        }
-        if toggle_left || toggle_right {
+        let left = toggle_left.then_some(MusicPanelReachSource::Pointer);
+        let right = toggle_right.then_some(MusicPanelReachSource::Pointer);
+        if self.apply_music_panel_reach_requests(left, right) {
             ctx.request_repaint();
         }
     }
@@ -8080,7 +9633,7 @@ impl App {
 
     fn seek_to_continuous_page(&mut self, ctx: &egui::Context, target_idx: usize) {
         if self.fullscreen_idx != Some(target_idx) {
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::seek_to_continuous_page:file_change",
@@ -8098,6 +9651,27 @@ impl App {
         ctx.request_repaint();
     }
 
+    fn land_still_page_navigation_target(
+        &mut self,
+        ctx: &egui::Context,
+        current_idx: usize,
+        target_idx: usize,
+    ) {
+        if self.continuous_reading_active_for_idx(current_idx)
+            && self.continuous_reading_supported_idx(target_idx)
+        {
+            // A discrete page-unit command inside one continuous stream changes
+            // its anchor; it is not a fresh fullscreen file open.
+            self.seek_to_continuous_page(ctx, target_idx);
+        } else {
+            self.open_fullscreen_from_fs_navigation(
+                ctx,
+                target_idx,
+                crate::app::HistoryTrigger::UserChosen,
+            );
+        }
+    }
+
     fn draw_fullscreen_seek_overlay(
         &mut self,
         ui: &mut egui::Ui,
@@ -8105,6 +9679,7 @@ impl App {
         full_rect: egui::Rect,
         fs_idx: usize,
         side_panel_visible: bool,
+        touch_chrome_latched: bool,
     ) -> Option<usize> {
         self.fs_seek_overlay_visible = false;
         // 分析モード中は対象画像に集中するため、下端のページシークバーを出さない
@@ -8119,11 +9694,10 @@ impl App {
         if !primary_down {
             self.fs_seek_drag_active = false;
         }
-        const SEEK_HOVER_HEIGHT: f32 = 78.0;
         let locked = self.settings.fullscreen_seek_bar_locked;
 
         let bottom_band = egui::Rect::from_min_max(
-            egui::pos2(full_rect.left(), full_rect.bottom() - SEEK_HOVER_HEIGHT),
+            egui::pos2(full_rect.left(), full_rect.bottom() - FS_SEEK_HOVER_HEIGHT),
             full_rect.right_bottom(),
         );
         let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
@@ -8134,12 +9708,20 @@ impl App {
         });
         // 可視判定 (O(1)) を info 構築より先に行う: 非表示フレームで全 items の
         // filter+collect を毎フレーム回さない (10k ページ級アーカイブの hot path)。
-        if !locked && !bottom_hover && !self.fs_seek_drag_active && !side_panel_visible {
-            return None;
-        }
-
         let panel_rect = fullscreen_seek_panel_rect(full_rect);
-        if panel_rect.width() < 160.0 {
+        let visibility = StillSeekBarVisibilityInputs {
+            allowed: true,
+            locked,
+            bottom_hover,
+            drag_active: self.fs_seek_drag_active,
+            side_panel_visible,
+            touch_chrome_latched,
+            wide_enough: panel_rect.width() >= 160.0,
+            // This first pure check is the O(1) candidate gate. The exact
+            // content result is established immediately below from the cache.
+            content_available: true,
+        };
+        if !still_seek_bar_visible_from_inputs(visibility) {
             return None;
         }
 
@@ -8226,6 +9808,8 @@ impl App {
                 self.spread_shift_anchor_idx,
                 &self.fs_cache,
                 &self.thumbnails,
+                &self.page_dims_cache,
+                self.items_generation,
             );
             match find_spread_display_unit(&units, fs_idx) {
                 Some((unit_index, _)) => Some((units, unit_index)),
@@ -8852,6 +10436,8 @@ impl App {
             return;
         };
 
+        self.harvest_page_dims_from_fs_cache();
+
         // ── pending の PDF 再レンダリング結果を取り込む ──
         // show_viewport_immediate 内では &mut self が使えるので、
         // メインの update() を待たずにここで直接 poll する。
@@ -9155,6 +10741,7 @@ impl App {
                 // 既に更新済みなので二重処理しない。
                 if !embedded {
                     self.update_ime_state(ctx);
+                    crate::touch_debug::log_egui_touch_events(ctx, self.frame_counter);
                 }
                 #[cfg(windows)]
                 if !embedded {
@@ -9594,7 +11181,7 @@ impl App {
                             && !panorama_mode_active_now;
                         // 補正パネルは見開き Double でも使えるようにする (左右独立補正 + コピー)。
                         // 編集対象 (画面上の左/右) は `adjust_spread_target` で切替。
-                        let adjustment_active = self.adjustment_mode
+                        let adjustment_active = self.adjustment_mode.is_open()
                             && !compare_wipe_active
                             && !panorama_mode_active_now
                             && !self.fs_zoom_mode_engaged();
@@ -9627,6 +11214,16 @@ impl App {
                         let media_t0 = std::time::Instant::now();
                         self.fullscreen_page_layout.clear();
                         let mut single_transform: Option<DisplayedImageTransform> = None;
+                        let mut navigator_texture_sources = if spread_pair == SpreadPair::Single {
+                            FsNavigatorTextureSources::single(
+                                fs_idx,
+                                state.tex.clone().map(|texture| {
+                                    self.fullscreen_paint_resource_for_texture(fs_idx, texture)
+                                }),
+                            )
+                        } else {
+                            FsNavigatorTextureSources::default()
+                        };
                         if self.continuous_reading_active_for_idx(fs_idx) {
                             self.draw_fs_continuous_reading(
                                 ui,
@@ -9839,9 +11436,9 @@ impl App {
                                                         fit_scale_limits,
                                                     )
                                                     .unwrap_or(image_rect);
-                                                    let wipe_x = ref_rect.left()
-                                                        + ref_rect.width()
-                                                            * fraction.clamp(0.05, 0.95);
+                                                    let wipe_x = compare_wipe_screen_x(
+                                                        ref_rect, fraction,
+                                                    );
                                                     let clip = egui::Rect::from_min_max(
                                                         ref_rect.min,
                                                         egui::pos2(wipe_x, ref_rect.max.y),
@@ -9944,7 +11541,7 @@ impl App {
                                         } else {
                                             None
                                         };
-                                        self.draw_fs_spread(
+                                        navigator_texture_sources = self.draw_fs_spread(
                                             ui,
                                             ctx,
                                             image_rect,
@@ -9967,9 +11564,9 @@ impl App {
                                                     fit_scale_limits,
                                                 )
                                                 .unwrap_or(image_rect);
-                                                let wipe_x = ref_rect.left()
-                                                    + ref_rect.width()
-                                                        * fraction.clamp(0.05, 0.95);
+                                                let wipe_x = compare_wipe_screen_x(
+                                                    ref_rect, fraction,
+                                                );
                                                 let clip = egui::Rect::from_min_max(
                                                     ref_rect.min,
                                                     egui::pos2(wipe_x, ref_rect.max.y),
@@ -9993,33 +11590,49 @@ impl App {
                             }
                         }
                         if single_transform.is_none()
-                            && spread_pair == SpreadPair::Single
                             && !matches!(
                                 self.compare_view_mode,
                                 crate::app::CompareViewMode::Off
                             )
-                            && let Some(handle) = state.tex.as_ref().or(state.thumb_tex.as_ref())
                         {
-                            let size = handle.size_vec2();
-                            single_transform = DisplayedImageTransform::resolve(
-                                DisplayedImageTransformInput {
-                                    page_idx: fs_idx,
-                                    viewport_rect: image_rect,
-                                    source_size: source_size.unwrap_or(size),
-                                    texture_size: size,
-                                    rotation: crate::rotation_db::Rotation::None,
-                                    free_rotation_rad: 0.0,
-                                    content_bbox: None,
-                                    fit_mode: FullscreenFitMode::Page,
-                                    fit_scale_limits: self.fullscreen_fit_scale_limits(
-                                        ctx.pixels_per_point(),
-                                    ),
-                                    pixels_per_point: ctx.pixels_per_point(),
-                                    placement: ResolvedDisplayPlacement::Normal {
-                                        zoom_pan: self.fs_zoom_pan(),
+                            let compare_size = self
+                                .compare_prepared_pair
+                                .as_ref()
+                                .filter(|pair| pair.current_idx == fs_idx)
+                                .map(|pair| {
+                                    egui::vec2(
+                                        pair.target_size[0] as f32,
+                                        pair.target_size[1] as f32,
+                                    )
+                                })
+                                .or_else(|| {
+                                    state
+                                        .tex
+                                        .as_ref()
+                                        .or(state.thumb_tex.as_ref())
+                                        .map(|handle| handle.size_vec2())
+                                });
+                            if let Some(compare_size) = compare_size {
+                                single_transform = DisplayedImageTransform::resolve(
+                                    DisplayedImageTransformInput {
+                                        page_idx: fs_idx,
+                                        viewport_rect: image_rect,
+                                        source_size: compare_size,
+                                        texture_size: compare_size,
+                                        rotation: crate::rotation_db::Rotation::None,
+                                        free_rotation_rad: 0.0,
+                                        content_bbox: None,
+                                        fit_mode: FullscreenFitMode::Page,
+                                        fit_scale_limits: self.fullscreen_fit_scale_limits(
+                                            ctx.pixels_per_point(),
+                                        ),
+                                        pixels_per_point: ctx.pixels_per_point(),
+                                        placement: ResolvedDisplayPlacement::Normal {
+                                            zoom_pan: self.fs_zoom_pan(),
+                                        },
                                     },
-                                },
-                            );
+                                );
+                            }
                         }
                         if let Some(transform) = single_transform {
                             self.fullscreen_page_layout
@@ -10105,7 +11718,7 @@ impl App {
                             let in_earlier_tool = self.erase_mode
                                 || self.local_adjust_mode
                                 || self.conceal_mode
-                                || self.adjustment_mode
+                                || self.adjustment_mode.is_open()
                                 || self.analysis_mode;
                             if !is_spread_double
                                 && !state.original_preview_active
@@ -10171,6 +11784,7 @@ impl App {
                                 image_rect,
                                 &unit,
                             );
+                            navigator_texture_sources.replace_with_display_unit(&unit);
                         }
 
                         // ページ単位の編集オーバーレイより後に描く。holdover はビュー単位の状態なので、
@@ -10190,11 +11804,19 @@ impl App {
                                 image_rect,
                                 &unit,
                             );
+                            navigator_texture_sources.replace_with_display_unit(&unit);
                         }
 
                         // Keep the fixed overview above transient display-unit holdovers. The
-                        // navigator stays absent until the target frame has a resolved page layout.
-                        self.draw_fs_navigator(ui, ctx, image_rect, fs_idx);
+                        // navigator uses the same display unit and stays absent until that unit has
+                        // a resolved page layout.
+                        self.draw_fs_navigator(
+                            ui,
+                            ctx,
+                            image_rect,
+                            fs_idx,
+                            &navigator_texture_sources,
+                        );
 
                         // 透過背景 (Shift+B) の変更通知は共通トーストが担う。同じ文言・同じ
                         // 表示時間の専用インジケータを並べると右上で重なるため持たない。
@@ -10387,12 +12009,21 @@ impl App {
                                 zoom_active: self.fs_zoom_mode_engaged(),
                                 animated: self.fs_entry_is_animated(fs_idx),
                             });
-                        self.draw_fs_panel_callouts(
+                        let touch_chrome_latched = self.still_touch_chrome_is_latched(ctx);
+                        self.draw_fs_touch_panel_handles(
                             ui,
-                            ctx,
                             full_rect,
                             callouts_enabled,
+                            touch_chrome_latched,
                         );
+                        if !touch_chrome_latched {
+                            self.draw_fs_panel_callouts(
+                                ui,
+                                ctx,
+                                full_rect,
+                                callouts_enabled,
+                            );
+                        }
                         // 静止画は左右どちらかの実パネルが表示中なら、上部バーと下部
                         // ページシークバーを同時表示する。callout だけの hover は含めない。
                         if !state.is_video
@@ -10402,6 +12033,7 @@ impl App {
                                 full_rect,
                                 fs_idx,
                                 side_panel_visible,
+                                touch_chrome_latched,
                             )
                         {
                             jump_to = Some(seek_target);
@@ -10497,6 +12129,11 @@ impl App {
                             let mut top_bar_lock_pressed = false;
                             let navigator_exclusion =
                                 self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
+                            let touch_chrome_latched = still_touch_chrome_latched(
+                                ctx,
+                                fs_idx,
+                                self.fullscreen_opened_at(),
+                            );
                             let hover_in_top = ctx.input(|i| {
                                 !self.cursor_hidden
                                     && i.pointer
@@ -10519,6 +12156,7 @@ impl App {
                                     slideshow_popup_open: self.slideshow_popup_open,
                                     rotation_popup_open: fs_rotation_popup_open(ctx),
                                     view_trim_mode: self.view_trim_mode,
+                                    touch_chrome_latched,
                                 },
                             );
                             let top_bar_page_infos = if top_bar_visible {
@@ -10599,6 +12237,8 @@ impl App {
                                 &mut top_bar_lock_pressed,
                                 self.cursor_hidden,
                                 navigator_exclusion,
+                                touch_chrome_latched,
+                                self.frame_counter,
                             );
                             if top_bar_lock_pressed {
                                 self.settings.fullscreen_top_bar_locked =
@@ -10607,7 +12247,7 @@ impl App {
                                 ctx.request_repaint();
                             }
                             if side_panel_mode_pressed {
-                                if self.adjustment_mode {
+                                if self.adjustment_mode.is_open() {
                                     crate::ime_focus::record_side_panel_close(
                                         ctx,
                                         "ui_fullscreen::draw_fs_hover_bar:side_panel_mode_button",
@@ -10765,6 +12405,12 @@ impl App {
 
                         // ── 中央の境界ヒント (最初/最後の項目です…) ──
                         self.draw_boundary_hint(ui, full_rect, ctx);
+
+                        // The touch help is the final canvas overlay: once it is visible,
+                        // no panel, page, or gesture target should appear above its guide.
+                        self.draw_still_touch_first_run_help_overlay(
+                            ui, ctx, full_rect, fs_idx,
+                        );
 
                         // ── スロット保存ダイアログ ──
                         self.draw_slot_save_dialog(ctx);
@@ -11968,6 +13614,8 @@ impl App {
             self.spread_shift_anchor_idx,
             &self.fs_cache,
             &self.thumbnails,
+            &self.page_dims_cache,
+            self.items_generation,
         );
         find_spread_display_unit(&units, nav[pos])
             .map(|(_, unit)| unit.spread_pair(self.spread_mode))
@@ -12030,6 +13678,8 @@ impl App {
             self.spread_shift_anchor_idx,
             &self.fs_cache,
             &self.thumbnails,
+            &self.page_dims_cache,
+            self.items_generation,
         );
         let Some((unit_pos, _)) = find_spread_display_unit(&units, fs_idx) else {
             return FsPageNav::Delta(base_delta);
@@ -12060,12 +13710,20 @@ impl App {
             self.spread_shift_anchor_idx,
             &self.fs_cache,
             &self.thumbnails,
+            &self.page_dims_cache,
+            self.items_generation,
         );
         let landscape_flags = nav
             .iter()
             .map(|&idx| {
                 !is_spread_pairable_item(self.items.get(idx))
-                    || is_landscape(idx, &self.fs_cache, &self.thumbnails)
+                    || is_landscape(
+                        idx,
+                        &self.fs_cache,
+                        &self.thumbnails,
+                        &self.page_dims_cache,
+                        self.items_generation,
+                    )
             })
             .collect::<Vec<_>>();
         spread_offset_nudge_from_units(&nav, &units, fs_idx, dir, &landscape_flags)
@@ -12132,6 +13790,8 @@ impl App {
             self.spread_shift_anchor_idx,
             &self.fs_cache,
             &self.thumbnails,
+            &self.page_dims_cache,
+            self.items_generation,
         );
         if let Some((_, unit)) = find_spread_display_unit(&units, idx) {
             let new_idx = unit.anchor_idx();
@@ -13939,7 +15599,7 @@ impl App {
             self.toggle_compare_diff_mode(ctx, fs_idx);
         }
 
-        let adjustment_open_before_escape = self.adjustment_mode;
+        let adjustment_open_before_escape = self.adjustment_mode.is_open();
         if esc && self.compare_view_mode.is_overlay() {
             self.compare_view_mode = crate::app::CompareViewMode::Off;
             self.clear_compare_gpu_pair();
@@ -13975,7 +15635,7 @@ impl App {
         }
         // I / Tab は左右パネルの呼び出しモードを切り替える。
         if key_i {
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_key_input:FsToggleMetadata",
@@ -14003,7 +15663,7 @@ impl App {
             });
         }
         if key_z && !is_spread_double {
-            if !self.analysis_mode && self.adjustment_mode {
+            if !self.analysis_mode && self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_key_input:FsImageAnalysis",
@@ -14028,7 +15688,7 @@ impl App {
             } else {
                 "[ピクセルグリッド OFF]".to_string()
             });
-        } else if key_m && !self.adjustment_mode {
+        } else if key_m && !self.adjustment_mode.is_open() {
             // M: ルーペ表示のトグル (分析モード外でのみ。分析モードでは既存のモザイクグリッド操作)
             self.fs_loupe_locked = !self.fs_loupe_locked;
             self.show_feedback_toast(if self.fs_loupe_locked {
@@ -14047,7 +15707,7 @@ impl App {
         // 通常: 黒 → 白 → 市松 の 3 モード循環。
         // AI アップスケール有効時 (composite-first): 市松は出力にパターンが焼き込まれて崩れるので
         // 黒/白の 2 モード循環に制限する。デノイズのみの場合はアルファ保持パスを通るので市松 OK。
-        if key_b_bg && !self.analysis_mode && !self.adjustment_mode {
+        if key_b_bg && !self.analysis_mode && !self.adjustment_mode.is_open() {
             // 背景切替は透過 (alpha) のある画像でのみ意味を持つ。見開きはどちらかに透過が
             // あれば許可。RGB のみの不透明画像では切替しても見た目が変わらないので無効化し案内する。
             let idxs: Vec<usize> = match self.resolve_spread_pair(fs_idx) {
@@ -14080,7 +15740,7 @@ impl App {
         // 左ページを編集対象にする (Apply / Cancel で見開き状態に戻る)。
         if key_e
             && !self.analysis_mode
-            && !self.adjustment_mode
+            && !self.adjustment_mode.is_open()
             && !self.fs_entry_is_animated(fs_idx)
         {
             if self.erase_mode {
@@ -14103,7 +15763,7 @@ impl App {
                 .consume_action(ctx, KeyAction::FsLocalAdjustMode);
         if key_ctrl_g
             && !self.analysis_mode
-            && !self.adjustment_mode
+            && !self.adjustment_mode.is_open()
             && !self.erase_mode
             && !self.conceal_mode
             && !self.text_mode
@@ -14129,7 +15789,7 @@ impl App {
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsConcealMode);
         if key_ctrl_m
             && !self.analysis_mode
-            && !self.adjustment_mode
+            && !self.adjustment_mode.is_open()
             && !self.erase_mode
             && !is_video_fs
             && !self.fs_entry_is_animated(fs_idx)
@@ -14152,7 +15812,7 @@ impl App {
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsTextMode);
         if key_ctrl_t
             && !self.analysis_mode
-            && !self.adjustment_mode
+            && !self.adjustment_mode.is_open()
             && !self.erase_mode
             && !self.conceal_mode
             && !is_video_fs
@@ -14426,12 +16086,12 @@ impl App {
 
     // ── ホイール & クリック ──────────────────────────────────────────────
 
-    fn handle_compare_wipe_drag(&mut self, ctx: &egui::Context, image_rect: egui::Rect) -> bool {
+    fn handle_compare_wipe_drag(&mut self, ctx: &egui::Context, draw_rect: egui::Rect) -> bool {
         let crate::app::CompareViewMode::Wipe { fraction } = self.compare_view_mode else {
             self.compare_wipe_dragging = false;
             return false;
         };
-        if image_rect.width() <= 1.0 {
+        if draw_rect.width() <= 1.0 {
             return false;
         }
 
@@ -14449,9 +16109,8 @@ impl App {
             return was_dragging;
         }
 
-        let line_x = image_rect.left() + image_rect.width() * fraction.clamp(0.05, 0.95);
         let hit = pointer_pos
-            .map(|p| image_rect.contains(p) && (p.x - line_x).abs() <= 14.0)
+            .map(|p| compare_wipe_grab_hit(draw_rect, p, fraction))
             .unwrap_or(false);
         if hit {
             ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
@@ -14461,8 +16120,8 @@ impl App {
         }
         if self.compare_wipe_dragging && primary_down {
             if let Some(pos) = pointer_pos {
-                let new_fraction =
-                    ((pos.x - image_rect.left()) / image_rect.width()).clamp(0.05, 0.95);
+                let new_fraction = compare_wipe_fraction_from_screen_x(draw_rect, pos.x)
+                    .clamp(COMPARE_WIPE_MIN_FRACTION, COMPARE_WIPE_MAX_FRACTION);
                 self.compare_view_mode = crate::app::CompareViewMode::Wipe {
                     fraction: new_fraction,
                 };
@@ -14489,10 +16148,9 @@ impl App {
             focused,
             interaction_active,
         ) && !self.analysis_mode
-            && !self.adjustment_mode
+            && !self.adjustment_mode.is_open()
             && !self.is_overlay_edit_mode_active()
             && !self.view_trim_mode
-            && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
             && self.capture_region_selection.is_none()
             && matches!(
                 self.items.get(fs_idx),
@@ -15330,12 +16988,105 @@ impl App {
         }
     }
 
+    fn draw_compare_navigator_content(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        layout: &FlatNavigatorLayout,
+        painter: &egui::Painter,
+    ) -> bool {
+        let mode = self.compare_view_mode;
+        if matches!(mode, crate::app::CompareViewMode::Off)
+            || !self.compare_prepared_pair_matches(fs_idx)
+        {
+            return false;
+        }
+
+        let shader_shape =
+            self.compare_prepared_pair
+                .as_ref()
+                .and_then(|pair| match mode {
+                    crate::app::CompareViewMode::Wipe { fraction } => self.compare_shader_shape(
+                        layout.content_rect,
+                        pair,
+                        crate::compare_wgpu::CompareShaderMode::Wipe,
+                        fraction,
+                        None,
+                        ctx.pixels_per_point(),
+                    ),
+                    crate::app::CompareViewMode::Diff => self.compare_shader_shape(
+                        layout.content_rect,
+                        pair,
+                        crate::compare_wgpu::CompareShaderMode::Diff,
+                        0.5,
+                        None,
+                        ctx.pixels_per_point(),
+                    ),
+                    crate::app::CompareViewMode::Off
+                    | crate::app::CompareViewMode::PinnedNormal => None,
+                });
+        if let Some((draw_rect, shape)) = shader_shape {
+            painter.add(shape);
+            if let crate::app::CompareViewMode::Wipe { fraction } = mode {
+                Self::paint_compare_wipe_line(painter, draw_rect, fraction);
+            }
+            return true;
+        }
+
+        let paint_texture = |painter: &egui::Painter, tex: &egui::TextureHandle| {
+            painter.image(
+                tex.id(),
+                layout.content_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        };
+        match mode {
+            crate::app::CompareViewMode::PinnedNormal => {
+                let Some(tex) =
+                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Pinned)
+                else {
+                    return false;
+                };
+                paint_texture(painter, &tex);
+            }
+            crate::app::CompareViewMode::Wipe { fraction } => {
+                let current =
+                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Current);
+                let pinned =
+                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Pinned);
+                let (Some(current), Some(pinned)) = (current, pinned) else {
+                    return false;
+                };
+                paint_texture(painter, &current);
+                let wipe_x = compare_wipe_screen_x(layout.content_rect, fraction);
+                let pinned_clip = egui::Rect::from_min_max(
+                    layout.content_rect.min,
+                    egui::pos2(wipe_x, layout.content_rect.bottom()),
+                );
+                paint_texture(&painter.with_clip_rect(pinned_clip), &pinned);
+                Self::paint_compare_wipe_line(painter, layout.content_rect, fraction);
+            }
+            crate::app::CompareViewMode::Diff => {
+                let Some(tex) =
+                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Diff)
+                else {
+                    return false;
+                };
+                paint_texture(painter, &tex);
+            }
+            crate::app::CompareViewMode::Off => return false,
+        }
+        true
+    }
+
     fn draw_fs_navigator(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         image_rect: egui::Rect,
         fs_idx: usize,
+        texture_sources: &FsNavigatorTextureSources,
     ) {
         if !self.fs_navigator_allowed(ctx, fs_idx) {
             return;
@@ -15465,25 +17216,29 @@ impl App {
 
         let canvas_painter = painter.with_clip_rect(layout.canvas_rect);
         canvas_painter.rect_filled(layout.canvas_rect, 0.0, egui::Color32::BLACK);
-        for page in &layout.pages {
-            if let Some(ThumbnailState::Loaded { tex, .. }) =
-                self.thumbnails.get(page.main.page_idx)
-            {
-                page.navigator
-                    .paint_texture(&canvas_painter, tex.id(), egui::Color32::WHITE);
-            } else {
-                canvas_painter.rect_filled(
+        if !self.draw_compare_navigator_content(ctx, fs_idx, &layout, &canvas_painter) {
+            for page in &layout.pages {
+                let thumbnail = match self.thumbnails.get(page.main.page_idx) {
+                    Some(ThumbnailState::Loaded { tex, .. }) => Some(tex),
+                    _ => None,
+                };
+                if let Some(tex) = texture_sources.texture_for_page(page.main.page_idx, thumbnail) {
+                    page.navigator
+                        .paint_texture(&canvas_painter, tex.id(), egui::Color32::WHITE);
+                } else {
+                    canvas_painter.rect_filled(
+                        page.navigator.paint_rect,
+                        0.0,
+                        egui::Color32::from_gray(42),
+                    );
+                }
+                canvas_painter.rect_stroke(
                     page.navigator.paint_rect,
                     0.0,
-                    egui::Color32::from_gray(42),
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(96)),
+                    egui::StrokeKind::Inside,
                 );
             }
-            canvas_painter.rect_stroke(
-                page.navigator.paint_rect,
-                0.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(96)),
-                egui::StrokeKind::Inside,
-            );
         }
         canvas_painter.rect_stroke(
             layout.visible_rect,
@@ -15544,6 +17299,25 @@ impl App {
     ) -> (FsPageNav, bool) {
         let mut page_nav = FsPageNav::None;
         let mut close = false;
+        const FOCUS_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+        let (pointer_primary_down, primary_released) =
+            ctx.input(|i| (i.pointer.primary_down(), i.pointer.primary_released()));
+        if let Some(t) = self.fs_focus_regained_at {
+            if t.elapsed() >= FOCUS_RESTORE_GRACE {
+                self.fs_focus_regained_at = None;
+            } else if !self.fs_primary_suppression.is_active() && pointer_primary_down {
+                self.fs_primary_suppression.arm_pointer_stream();
+                self.fs_focus_regained_at = None;
+            }
+        }
+        // Snapshot before releasing persistent ownership. The terminal frame
+        // itself remains suppressed, while later early returns cannot strand
+        // the owner because this transition runs at the function boundary.
+        let mut primary_suppression =
+            self.fs_primary_suppression
+                .apply(FullscreenPrimarySuppressionEvent::PointerFrame {
+                    released: primary_released,
+                });
 
         // レンダラが連続読みを描画しているか。クリックのページジャンプ抑制と、
         // 連結方向スクロール / 直交方向パンの振り分けに使う。
@@ -15562,13 +17336,38 @@ impl App {
         };
         let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
         if self.capture_region_selection.is_some() {
+            clear_still_touch_first_run_help(ctx);
+            let touch_frame = crate::touch_correlation::drive_egui_touch_input(
+                ctx,
+                crate::touch_correlation::TouchSurface::StillFullscreen,
+                crate::touch_input::TapZoneGeometry {
+                    surface: full_rect,
+                    excluded: Vec::new(),
+                    behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                        accepts_pinch: true,
+                    },
+                },
+                self.frame_counter,
+                false,
+            );
+            let _ =
+                self.fs_primary_suppression
+                    .apply(FullscreenPrimarySuppressionEvent::TouchFrame {
+                        suppresses_current_frame: false,
+                        active: touch_frame.is_active(),
+                        completed: !touch_frame.is_active()
+                            && touch_frame.has_touch_derived_pointer_activity(),
+                        cancelled: touch_frame.touch_cancelled(),
+                    });
             return (FsPageNav::None, false);
         }
         let seek_panel_rect = fullscreen_seek_panel_rect(full_rect);
+        let touch_chrome_latched = self.still_touch_chrome_is_latched(ctx);
         let seek_panel_interactive = self.fullscreen_idx.is_some_and(|idx| {
             self.fullscreen_seek_overlay_allowed(idx, state.is_video)
                 && (self.settings.fullscreen_seek_bar_locked
                     || self.fs_seek_drag_active
+                    || touch_chrome_latched
                     || ctx.input(|i| {
                         i.pointer
                             .hover_pos()
@@ -15652,7 +17451,61 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 self.fs_focus_regained_at = Some(std::time::Instant::now());
-                self.fs_suppress_primary_until_release = true;
+                self.fs_primary_suppression.arm_pointer_stream();
+                let touch_frame = crate::touch_correlation::drive_egui_touch_input(
+                    ctx,
+                    crate::touch_correlation::TouchSurface::StillFullscreen,
+                    crate::touch_input::TapZoneGeometry {
+                        surface: full_rect,
+                        excluded: Vec::new(),
+                        behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                            accepts_pinch: true,
+                        },
+                    },
+                    self.frame_counter,
+                    true,
+                );
+                let _ = self.fs_primary_suppression.apply(
+                    FullscreenPrimarySuppressionEvent::TouchFrame {
+                        suppresses_current_frame: !touch_frame.commands().is_empty(),
+                        active: touch_frame.is_active(),
+                        completed: !touch_frame.is_active()
+                            && touch_frame.has_touch_derived_pointer_activity(),
+                        cancelled: touch_frame.touch_cancelled(),
+                    },
+                );
+                if let Some(idx) = self.fullscreen_idx {
+                    let scope = StillTouchChromeLatch {
+                        fs_idx: idx,
+                        session_started_at: self.fullscreen_opened_at(),
+                    };
+                    let help_phase = still_touch_first_run_help_phase(ctx, scope);
+                    match still_touch_foreground_reclaim_action(
+                        help_phase,
+                        touch_frame.is_active(),
+                        touch_frame.commands(),
+                    ) {
+                        StillTouchForegroundReclaimAction::ToggleChrome => {
+                            toggle_still_touch_chrome_latch(ctx, idx, self.fullscreen_opened_at());
+                        }
+                        StillTouchForegroundReclaimAction::LearnAndShowChrome => {
+                            set_still_touch_chrome_latch(ctx, scope, true);
+                            clear_still_touch_first_run_help(ctx);
+                            if !self.settings.touch_still_chrome_learned {
+                                self.settings.touch_still_chrome_learned = true;
+                                self.settings.save();
+                            }
+                        }
+                        StillTouchForegroundReclaimAction::SetHelpReady => {
+                            set_still_touch_first_run_help_phase(
+                                ctx,
+                                scope,
+                                StillTouchFirstRunHelpPhase::Ready,
+                            );
+                        }
+                        StillTouchForegroundReclaimAction::None => {}
+                    }
+                }
                 return (FsPageNav::None, false);
             }
         }
@@ -15676,10 +17529,12 @@ impl App {
                 zoom_active: self.fs_zoom_mode_engaged(),
                 animated: panel_fs_idx.is_some_and(|idx| self.fs_entry_is_animated(idx)),
             });
+        let passive_side_panel_hover_enabled =
+            still_passive_side_panel_hover_enabled(self.cursor_hidden, touch_chrome_latched);
         self.update_metadata_panel_hover_latch(
             ctx,
             full_rect,
-            side_panel_chrome_enabled,
+            side_panel_chrome_enabled && passive_side_panel_hover_enabled,
             navigator_exclusion,
         );
 
@@ -15695,14 +17550,14 @@ impl App {
             && music_left_panel_visible_from_inputs(
                 self.settings.fullscreen_side_panel_mode,
                 self.music_left_panel_active,
-                self.music_left_click_open,
+                self.music_left_panel_open,
                 music_modal_open,
             );
         let music_right_panel_visible = music_view_active
             && music_right_panel_visible_from_inputs(
                 self.settings.fullscreen_side_panel_mode,
                 self.music_right_panel_active,
-                self.fs_click_info_open,
+                self.fs_info_panel_open,
                 music_modal_open,
             );
         // When the OS cursor is hidden, egui still exposes the last hover position.
@@ -15730,7 +17585,7 @@ impl App {
                             side_panel_chrome_enabled,
                             self.settings.fullscreen_side_panel_mode,
                             has_right_panel,
-                            self.adjustment_mode,
+                            self.adjustment_mode.is_open(),
                             navigator_exclusion,
                         );
                         let in_music_side_panel = music_side_panel_contains_pointer(
@@ -15778,55 +17633,55 @@ impl App {
         // 左端を占有している間 edge_hover が常に true 扱いになり off へ遷移できないので、
         // 強制的に落とす。
         if compare_wipe_active {
-            if self.adjustment_mode && !self.adjustment_dragging {
+            if self.adjustment_mode.is_open() && !self.adjustment_dragging {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_wheel_and_click:compare_wipe",
                 );
                 self.persist_pending_view_trim_state();
-                self.adjustment_mode = false;
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
             }
         } else if self.is_overlay_edit_mode_active() {
             // 消しゴム / 補正レイヤー / 隠蔽加工モード中は補正パネルを強制 OFF
             // (編集中に色補正バーが画面端ホバーで開かないように)。
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_wheel_and_click:overlay_edit",
                 );
             }
             self.persist_pending_view_trim_state();
-            self.adjustment_mode = false;
+            self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         } else if self.view_trim_mode {
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_wheel_and_click:view_trim",
                 );
             }
             self.persist_pending_view_trim_state();
-            self.adjustment_mode = false;
+            self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         } else if self
             .fullscreen_idx
             .is_some_and(|idx| self.fs_entry_is_animated(idx))
         {
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_wheel_and_click:animated_item",
                 );
             }
             self.persist_pending_view_trim_state();
-            self.adjustment_mode = false;
+            self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         } else if self.fs_zoom_mode_engaged() {
             // ZipPla ズーム中 (照準含む) は左端ホバーで補正パネルを開かない (パン操作の邪魔をしない)。
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_wheel_and_click:zoom_mode",
                 );
             }
-            self.adjustment_mode = false;
+            self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         } else if self
             .fullscreen_idx
             .is_some_and(|idx| self.fs_music_view_active(idx))
@@ -15834,13 +17689,13 @@ impl App {
             // 音楽ビュー: 画面端ホバーで画像用の補正パネルを開かない。パネル描画自体は
             // 抑制済みだが、adjustment_mode フラグを立てると画像に戻った瞬間まで残るので
             // ここで OFF に固定する (Inc 3 パネル漏れ修正)。
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_wheel_and_click:music_view",
                 );
             }
-            self.adjustment_mode = false;
+            self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         } else {
             let mode = self.settings.fullscreen_side_panel_mode.normalized();
             let bookmark_title_focused =
@@ -15851,7 +17706,7 @@ impl App {
                         )
                     })
                 });
-            let left_panel_hover_active = passive_hover_enabled
+            let left_panel_hover_active = passive_side_panel_hover_enabled
                 && crate::ui_helpers::edge_summons_adjustment(
                     mode,
                     crate::ui_helpers::PanelEdge::Left,
@@ -15861,24 +17716,25 @@ impl App {
                 && adjustment_panel_hover_active_at(
                     full_rect,
                     ctx.input(|input| input.pointer.hover_pos()),
-                    self.adjustment_mode,
+                    self.adjustment_mode.is_open(),
                     navigator_exclusion,
                 );
             if left_panel_hover_active || bookmark_title_focused {
-                self.adjustment_mode = true;
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
             } else if adjustment_panel_should_auto_close(
                 mode,
-                self.adjustment_mode,
+                self.adjustment_mode.is_open(),
                 self.adjustment_dragging,
                 left_panel_hover_active,
                 bookmark_title_focused,
+                touch_chrome_latched,
             ) {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_wheel_and_click:hover_auto_dismiss",
                 );
                 self.persist_pending_view_trim_state();
-                self.adjustment_mode = false;
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
             }
         }
 
@@ -15887,8 +17743,257 @@ impl App {
         // return below both latch updates prevents a captured navigator interaction from freezing
         // either panel while preserving the existing panel-state dependencies for later input.
         if navigator_consumed {
+            clear_still_touch_first_run_help(ctx);
+            let touch_frame = crate::touch_correlation::drive_egui_touch_input(
+                ctx,
+                crate::touch_correlation::TouchSurface::StillFullscreen,
+                crate::touch_input::TapZoneGeometry {
+                    surface: full_rect,
+                    excluded: Vec::new(),
+                    behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                        accepts_pinch: true,
+                    },
+                },
+                self.frame_counter,
+                false,
+            );
+            let _ =
+                self.fs_primary_suppression
+                    .apply(FullscreenPrimarySuppressionEvent::TouchFrame {
+                        suppresses_current_frame: false,
+                        active: touch_frame.is_active(),
+                        completed: !touch_frame.is_active()
+                            && touch_frame.has_touch_derived_pointer_activity(),
+                        cancelled: touch_frame.touch_cancelled(),
+                    });
             return (FsPageNav::None, false);
         }
+
+        let side_panel_visible =
+            side_panel_chrome_enabled && (has_right_panel || self.adjustment_mode.is_open());
+        let hover_in_top = ctx.input(|input| {
+            !self.cursor_hidden
+                && input.pointer.hover_pos().is_some_and(|pos| {
+                    pos.y < TOP_BAR_HOVER_Y
+                        && fullscreen_edge_hover_allowed(pos, navigator_exclusion)
+                })
+        });
+        let top_bar_visible = panel_fs_idx.is_some_and(|idx| {
+            self.fullscreen_top_bar_chrome_allowed(idx)
+                && still_top_bar_visible_from_inputs(StillTopBarVisibilityInputs {
+                    locked: self.settings.fullscreen_top_bar_locked,
+                    hover_in_top,
+                    side_panel_visible,
+                    spread_popup_open: self.spread_popup_open,
+                    fit_popup_open: self.fit_popup_open,
+                    slideshow_popup_open: self.slideshow_popup_open,
+                    rotation_popup_open: fs_rotation_popup_open(ctx),
+                    view_trim_mode: self.view_trim_mode,
+                    touch_chrome_latched,
+                })
+        });
+        let touch_input_enabled = still_touch_input_enabled(StillTouchInputEnabledInputs {
+            is_video: state.is_video,
+            is_music_view: music_view_active,
+            has_fullscreen_item: panel_fs_idx.is_some(),
+            dialog_open: self.any_dialog_open(),
+            wants_keyboard_input: ctx.wants_keyboard_input(),
+            ime_input_active: self.ime_input_active(ctx),
+            context_menu_open: self.fs_context_menu_idx.is_some(),
+            spread_popup_open: self.spread_popup_open,
+            fit_popup_open: self.fit_popup_open,
+            slideshow_popup_open: self.slideshow_popup_open,
+            rotation_popup_open: fs_rotation_popup_open(ctx),
+            compare_wipe_active,
+            panorama_active,
+            analysis_active: self.analysis_mode,
+            overlay_edit_active: self.is_overlay_edit_mode_active(),
+            view_trim_active: self.view_trim_mode,
+            zoom_active: self.fs_zoom_mode_engaged(),
+        });
+        let touch_help_scope = panel_fs_idx.map(|fs_idx| StillTouchChromeLatch {
+            fs_idx,
+            session_started_at: self.fullscreen_opened_at(),
+        });
+        let mut touch_help_phase_before =
+            touch_help_scope.and_then(|scope| still_touch_first_run_help_phase(ctx, scope));
+        if self.settings.touch_still_chrome_learned || !touch_input_enabled {
+            if touch_help_phase_before.is_some() {
+                clear_still_touch_first_run_help(ctx);
+                touch_help_phase_before = None;
+            }
+        }
+        let mut touch_excluded: Vec<egui::Rect> = fullscreen_side_panel_rects(
+            full_rect,
+            side_panel_chrome_enabled,
+            self.settings.fullscreen_side_panel_mode,
+            has_right_panel,
+            self.adjustment_mode.is_open(),
+        )
+        .iter()
+        .collect();
+        if seek_panel_interactive {
+            touch_excluded.push(seek_panel_rect);
+        }
+        if top_bar_visible {
+            touch_excluded.push(fullscreen_top_bar_rect(full_rect));
+        }
+        extend_touch_excluded_with_panel_handles(
+            &mut touch_excluded,
+            full_rect,
+            side_panel_chrome_enabled && touch_chrome_latched,
+            self.adjustment_mode.is_open(),
+            has_right_panel,
+        );
+        if touch_help_phase_before.is_some() {
+            // The modal guide owns the whole surface, including chrome which
+            // would normally be excluded from center/page tap classification.
+            touch_excluded.clear();
+        }
+        let touch_frame = crate::touch_correlation::drive_egui_touch_input(
+            ctx,
+            crate::touch_correlation::TouchSurface::StillFullscreen,
+            crate::touch_input::TapZoneGeometry {
+                surface: full_rect,
+                excluded: touch_excluded,
+                behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                    accepts_pinch: true,
+                },
+            },
+            self.frame_counter,
+            touch_input_enabled,
+        );
+        let touch_activity = touch_frame.has_touch_derived_pointer_activity();
+        let touch_help_started_this_frame = touch_help_phase_before.is_none()
+            && touch_help_scope.is_some()
+            && should_start_still_touch_first_run_help(StillTouchFirstRunHelpEligibility {
+                learned: self.settings.touch_still_chrome_learned,
+                touch_activity,
+                gestures_disabled: crate::touch_correlation::touch_gestures_disabled(),
+                touch_input_enabled,
+            });
+        if touch_help_started_this_frame && let Some(scope) = touch_help_scope {
+            // The discovering contact is never also the dismissing contact.
+            // This keeps the guide visible after the first tap instead of
+            // flashing only between that tap's press and release.
+            set_still_touch_first_run_help_phase(
+                ctx,
+                scope,
+                StillTouchFirstRunHelpPhase::AwaitingInitialRelease,
+            );
+        }
+        let touch_help_phase_for_commands = if touch_help_started_this_frame {
+            Some(StillTouchFirstRunHelpPhase::AwaitingInitialRelease)
+        } else {
+            touch_help_phase_before
+        };
+        let touch_help_intercepts = touch_help_phase_for_commands.is_some();
+        let touch_bar_tap = touch_input_enabled
+            && !touch_help_intercepts
+            && top_bar_visible
+            && prepare_bar_button_touch_targets(
+                ctx,
+                self.frame_counter,
+                fullscreen_top_bar_rect(full_rect),
+                &touch_frame,
+            );
+        let touch_owner = touch_frame.owner();
+        let touch_active = touch_frame.is_active();
+        let touch_has_replacement =
+            !touch_frame.commands().is_empty() || (touch_help_intercepts && touch_activity);
+        let initial_help_contact_pending = touch_help_started_this_frame
+            || touch_help_phase_before == Some(StillTouchFirstRunHelpPhase::AwaitingInitialRelease);
+        let mut touch_help_learned_this_frame = false;
+        if touch_input_enabled {
+            for command in touch_frame.clone().into_commands() {
+                if let Some(help_phase) = touch_help_phase_for_commands {
+                    if still_touch_first_run_help_tap_action(help_phase, command)
+                        == StillTouchFirstRunHelpTapAction::LearnAndShowChrome
+                        && let Some(scope) = touch_help_scope
+                    {
+                        set_still_touch_chrome_latch(ctx, scope, true);
+                        clear_still_touch_first_run_help(ctx);
+                        if !self.settings.touch_still_chrome_learned {
+                            self.settings.touch_still_chrome_learned = true;
+                            self.settings.save();
+                        }
+                        touch_help_learned_this_frame = true;
+                    }
+                    // Every command belongs to the modal guide while it is
+                    // visible. In particular, PageSide never reaches page_nav.
+                    continue;
+                }
+                if touch_panel_tap_command_dismisses_before_dispatch(
+                    command,
+                    self.adjustment_mode,
+                    self.fs_info_panel_open,
+                ) {
+                    // The two panels form one modal touch-owned group: a canvas
+                    // tap outside them closes both touch-owned sides and is not
+                    // reused for page navigation or chrome toggling.
+                    self.close_touch_owned_side_panels();
+                    continue;
+                }
+                match command {
+                    crate::touch_input::TouchCommand::ToggleChrome => {
+                        if let Some(idx) = panel_fs_idx {
+                            toggle_still_touch_chrome_latch(ctx, idx, self.fullscreen_opened_at());
+                        }
+                    }
+                    crate::touch_input::TouchCommand::PageSide { left } => {
+                        // A recognized tap is an intentional discrete page turn,
+                        // including in continuous reading. Use the same unit
+                        // resolver as FsPageNext/FsPagePrev.
+                        let base =
+                            fullscreen_click_nav_delta_for_side(left, self.spread_mode.is_rtl());
+                        page_nav = self.spread_page_nav(base);
+                    }
+                    crate::touch_input::TouchCommand::Zoom { factor, pivot } => {
+                        if self.apply_touch_zoom_factor_about_pivot(
+                            factor,
+                            pivot,
+                            default_image_rect.center(),
+                        ) {
+                            ctx.request_repaint();
+                        }
+                    }
+                    crate::touch_input::TouchCommand::Pan { delta } => {
+                        self.set_fs_pan_from_input(self.fs_zoom, self.fs_pan + delta);
+                        ctx.request_repaint();
+                    }
+                    crate::touch_input::TouchCommand::PinchEnd => {
+                        self.maybe_rerender_pdf(self.fs_zoom);
+                    }
+                    // Grid-only commands cannot be produced by this viewer
+                    // surface profile.
+                    crate::touch_input::TouchCommand::ScrollGrid { .. }
+                    | crate::touch_input::TouchCommand::ScrollGridEnd => {}
+                }
+            }
+        }
+        if touch_help_intercepts
+            && !touch_help_learned_this_frame
+            && initial_help_contact_pending
+            && !touch_active
+            && let Some(scope) = touch_help_scope
+        {
+            set_still_touch_first_run_help_phase(ctx, scope, StillTouchFirstRunHelpPhase::Ready);
+        }
+        let touch_suppresses_current_frame = touch_input_enabled
+            && (touch_bar_tap
+                || touch_has_replacement
+                || touch_owner == crate::touch_input::TouchOwner::Pinch);
+        primary_suppression = primary_suppression.overridden_by(self.fs_primary_suppression.apply(
+            FullscreenPrimarySuppressionEvent::TouchFrame {
+                suppresses_current_frame: touch_suppresses_current_frame,
+                active: touch_active,
+                completed: !touch_active
+                    && (touch_activity
+                        || touch_has_replacement
+                        || touch_owner == crate::touch_input::TouchOwner::Pinch),
+                cancelled: touch_frame.touch_cancelled(),
+            },
+        ));
 
         // Wipe のドラッグ基準は、白線 / clip / シェーダー合成境界と同じ「フィット後の実表示
         // 画像矩形」にする。full_rect (黒帯込み) で取ると線・切り替え位置とドラッグがズレる。
@@ -16132,27 +18237,33 @@ impl App {
             egui::Id::new("fs_click"),
             egui::Sense::click_and_drag(),
         );
-        // ── フォーカス復帰クリックの抑制 ──
-        // 他アプリから戻ってきた直後に押された左ボタンはナビ目的ではないとみなし、
-        // 押下〜離すまでの全期間にわたってアプリ側の左クリック処理を無効化する。
-        // グレースを跨いだ正常クリックには影響しないよう、状態ベースで追跡する。
-        const FOCUS_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
-        let (primary_down, primary_released) =
-            ctx.input(|i| (i.pointer.primary_down(), i.pointer.primary_released()));
-        if let Some(t) = self.fs_focus_regained_at {
-            if t.elapsed() >= FOCUS_RESTORE_GRACE {
-                self.fs_focus_regained_at = None;
-            } else if !self.fs_suppress_primary_until_release && primary_down {
-                self.fs_suppress_primary_until_release = true;
-                self.fs_focus_regained_at = None;
-            }
+        let continuous_touch_delta = continuous_reading_response_drag_delta(
+            ctx,
+            &fs_response,
+            touch_activity
+                .then(|| continuous_reading_coalesced_touch_drag_total(ctx, &touch_frame))
+                .flatten(),
+            self.fullscreen_opened_at(),
+            self.frame_counter,
+            continuous_active && touch_activity,
+            pointer_primary_down,
+        );
+        // Keep the established mouse path byte-for-byte in meaning: while
+        // Response owns the drag, apply egui's per-frame pointer delta. Only
+        // a positively correlated touch stream needs cumulative accounting.
+        let continuous_pointer_delta = if touch_activity {
+            continuous_touch_delta
+        } else {
+            ctx.input(|input| input.pointer.delta())
+        };
+        if touch_input_enabled && touch_frame.should_suppress_response(&fs_response) {
+            // Positive raw-event correlation is required before the
+            // recognizer may suppress this response. This is terminal-frame
+            // evidence, not a new cross-frame owner.
+            primary_suppression = FullscreenPrimarySuppressionDecision::Suppress;
         }
-        // フレーム冒頭の状態をスナップ。release フレームでは primary_released と
-        // fs_response.clicked() が同一フレームで立つので、フラグのクリアを先に
-        // 行うと抑制対象のクリックがそのままナビを走らせてしまう。判定は
-        // スナップショットで行い、クリアは左クリック分岐が終わった後に回す。
-        let suppress_this_frame = self.fs_suppress_primary_until_release;
-        if suppress_this_frame {
+        // ── フォーカス復帰クリック / touch replacement の抑制 ──
+        if primary_suppression.suppresses_current_frame() {
             // フォーカス復帰クリック: 左ボタン経由の分岐をすべてスキップ。
             // 右クリック処理 (下の secondary ブロック) は別系統なので走らせる
         } else if self.is_overlay_edit_mode_active() {
@@ -16199,12 +18310,18 @@ impl App {
                         }
                     }
                 }
-            } else if continuous_active && primary_down && !cursor_in_panel {
-                let pointer_delta = ctx.input(|i| i.pointer.delta());
+            } else if continuous_active
+                && !cursor_in_panel
+                && continuous_reading_drag_consumes_frame(
+                    primary_down,
+                    touch_activity,
+                    continuous_touch_delta,
+                )
+            {
                 let delta = continuous_reading_drag_delta(
                     self.reading_flow,
                     self.reading_direction,
-                    pointer_delta,
+                    continuous_pointer_delta,
                     mods.ctrl,
                 );
                 self.scroll_vertical_reading_by(
@@ -16225,16 +18342,17 @@ impl App {
             {
                 // ページ単位表示でズームまたは回転中: ドラッグでパン。
                 // 連結読みのドラッグは直前の分岐で、主軸スクロールと直交パンに分けて扱う。
-                if primary_pressed {
-                    if let Some(pos) = pointer_pos {
-                        self.fs_pan_drag_start = Some((pos, self.fs_pan));
-                    }
-                } else if primary_down {
-                    if let Some((start_pos, start_pan)) = self.fs_pan_drag_start {
-                        if let Some(pos) = pointer_pos {
-                            self.set_fs_pan_from_input(self.fs_zoom, start_pan + (pos - start_pos));
-                        }
-                    }
+                if primary_pressed
+                    && let (Some(pos), Some(total_delta)) =
+                        (pointer_pos, fs_response.total_drag_delta())
+                {
+                    self.fs_pan_drag_start = Some((pos - total_delta, self.fs_pan));
+                }
+                if let Some((_, start_pan)) = self.fs_pan_drag_start
+                    && let Some(proposed_pan) =
+                        fullscreen_drag_pan_proposal(&fs_response, start_pan)
+                {
+                    self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
                 }
             }
             if primary_released {
@@ -16307,15 +18425,18 @@ impl App {
                                     side_panel_chrome_enabled,
                                     self.settings.fullscreen_side_panel_mode,
                                     has_right_panel,
-                                    self.adjustment_mode,
+                                    self.adjustment_mode.is_open(),
                                     navigator_exclusion,
                                 );
                                 let in_seek_panel =
                                     seek_panel_interactive && seek_panel_rect.contains(pos);
-                                // 連続読み中はクリックでのページジャンプを抑制する。連続読みは
-                                // 連続スクロール表示なので、左半分/右半分クリックで別ファイルへ
-                                // 飛ぶのはモデルに反する (特に fs_zoom が一瞬インフレされず
-                                // has_transform=false になった隙のクリックで誤爆する)。
+                                // Mouse clicks stay suppressed in continuous reading. The wheel is
+                                // the natural continuous-scroll input for a mouse, and preserving
+                                // this guard also prevents a stray click in a transient untransformed
+                                // frame from jumping pages. A recognizer-confirmed touch tap is
+                                // intentional rather than incidental, so PageSide is deliberately
+                                // dispatched above even in continuous reading (touch/mouse parity is
+                                // not required here; see touch-support-plan §5.14-11).
                                 if !in_side_panel && !in_seek_panel && !continuous_active {
                                     let base = fullscreen_click_nav_base_delta(
                                         pos.x,
@@ -16329,11 +18450,6 @@ impl App {
                     }
                 }
             }
-        }
-        // 抑制対象クリックの release フレームでここに来るので、左クリック分岐の
-        // スキップが終わったこのタイミングでフラグを落とす。
-        if suppress_this_frame && primary_released {
-            self.fs_suppress_primary_until_release = false;
         }
         // 分析モード中は右クリックを色固定に使うため、終了トリガーにしない
         // コンテキストメニュー表示中は右クリック処理をスキップ
@@ -16918,7 +19034,7 @@ impl App {
             }
             // source-swap を開始できない稀ケースのみ通常 open にフォールバック (音声モードは抜ける)。
             let cursor_state = self.fullscreen_cursor_state();
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
@@ -16950,7 +19066,7 @@ impl App {
         }
 
         let cursor_state = self.fullscreen_cursor_state();
-        if self.adjustment_mode {
+        if self.adjustment_mode.is_open() {
             crate::ime_focus::record_side_panel_close(
                 ctx,
                 "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
@@ -17430,7 +19546,7 @@ impl App {
         fs_idx: usize,
     ) {
         if close_fs {
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_navigation:close_fullscreen",
@@ -17448,7 +19564,7 @@ impl App {
         } else if close_to_page_list {
             // BS: 階層を 1 段戻す = コンテナのページ一覧 (L2) へ。close_fullscreen は
             // current_folder=ZIP/PDF のまま閉じるので L2 が出る (設定で分岐しない)。
-            if self.adjustment_mode {
+            if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::handle_fs_navigation:close_to_page_list",
@@ -17516,11 +19632,7 @@ impl App {
                         );
                     }
                 } else {
-                    self.open_fullscreen_from_fs_navigation(
-                        ctx,
-                        new_idx,
-                        crate::app::HistoryTrigger::UserChosen,
-                    );
+                    self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
                 }
             } else if let FsPageNav::Boundary { at_end } = page_nav {
                 self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
@@ -17555,11 +19667,7 @@ impl App {
                     fs_idx,
                     nav_delta,
                 ) {
-                    self.open_fullscreen_from_fs_navigation(
-                        ctx,
-                        new_idx,
-                        crate::app::HistoryTrigger::UserChosen,
-                    );
+                    self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
                 } else {
                     // 境界到達: 中央にヒントを出す (nav_delta > 0 なら末尾)
                     self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
@@ -18438,7 +20546,7 @@ impl App {
             self.reset_analysis_mode();
         }
         self.persist_pending_view_trim_state();
-        self.adjustment_mode = false;
+        self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.view_trim_mode = false;
         self.view_trim_page_apply_root_idx = None;
         self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
@@ -18619,6 +20727,8 @@ impl App {
                     self.spread_shift_anchor_idx,
                     &self.fs_cache,
                     &self.thumbnails,
+                    &self.page_dims_cache,
+                    self.items_generation,
                 )
                 .into_iter()
                 .map(|unit| {
@@ -19332,8 +21442,10 @@ impl App {
         }
         if self.fullscreen_idx != Some(new_idx) {
             // 連結ストリーム内の再アンカーはファイルを開き直す遷移ではないため、
-            // 左右パネルは維持する。表示トリムの pending 値だけ旧対象へ確定する。
+            // pointer-open の左右パネルは維持する。touch handle の右パネルは current-file
+            // state なので閉じ、表示トリムの pending 値だけ旧対象へ確定する。
             self.persist_pending_view_trim_state();
+            self.close_touch_side_panels_for_file_change();
         }
         self.fs_vertical_scroll =
             vertical_reading_reanchor_scroll(self.fs_vertical_scroll, old_offsets, new_pos);
@@ -20792,7 +22904,7 @@ impl App {
                     fit_scale_limits,
                 )
                 .unwrap_or(image_rect);
-                let wipe_x = ref_rect.left() + ref_rect.width() * fraction.clamp(0.05, 0.95);
+                let wipe_x = compare_wipe_screen_x(ref_rect, fraction);
                 let clip =
                     egui::Rect::from_min_max(ref_rect.min, egui::pos2(wipe_x, ref_rect.max.y));
                 Self::draw_compare_pinned_image(
@@ -20859,15 +22971,19 @@ impl App {
         );
     }
 
-    fn draw_compare_wipe_line(ui: &mut egui::Ui, image_rect: egui::Rect, fraction: f32) {
-        let x = image_rect.left() + image_rect.width() * fraction.clamp(0.05, 0.95);
-        ui.painter().line_segment(
+    fn paint_compare_wipe_line(painter: &egui::Painter, image_rect: egui::Rect, fraction: f32) {
+        let x = compare_wipe_screen_x(image_rect, fraction);
+        painter.line_segment(
             [
                 egui::pos2(x, image_rect.top()),
                 egui::pos2(x, image_rect.bottom()),
             ],
             egui::Stroke::new(2.0, egui::Color32::from_white_alpha(150)),
         );
+    }
+
+    fn draw_compare_wipe_line(ui: &mut egui::Ui, image_rect: egui::Rect, fraction: f32) {
+        Self::paint_compare_wipe_line(ui.painter(), image_rect, fraction);
     }
 
     fn draw_compare_pin_indicator(
@@ -21090,7 +23206,7 @@ impl App {
         }
         if fs_loupe_suppressed_by_edit_mode(
             self.analysis_mode,
-            self.adjustment_mode,
+            self.adjustment_mode.is_open(),
             self.text_mode,
         ) {
             return;
@@ -21118,7 +23234,14 @@ impl App {
             return;
         }
 
-        let Some(page) = self.fullscreen_page_layout.hit_test(cursor).copied() else {
+        // カーソルが画像の外へ出ても、拡大窓に画像が残っている間は消さない。端の画素を
+        // 検分するには少しはみ出す必要があり、`hit_test` だけだとその瞬間に対象ページを
+        // 失ってルーペごと消えていた (実機 2026-08-09)。
+        let Some(page) = self
+            .fullscreen_page_layout
+            .hit_test_or_nearest_in_window(cursor, LOUPE_SAMPLE_WINDOW)
+            .copied()
+        else {
             return;
         };
         let page_idx = page.page_idx();
@@ -21156,23 +23279,9 @@ impl App {
         let total_scale = transform.screen_px_per_source_px(tex_size);
         let uv_center = transform.screen_to_source_normalized(cursor).to_vec2();
 
-        // ルーペパラメータ (将来設定化)
-        const LOUPE_SIZE: f32 = 300.0;
-        const LOUPE_ZOOM: f32 = 3.0;
-        const LOUPE_OFFSET: f32 = 40.0;
-
         // サンプル UV: LOUPE_SIZE / LOUPE_ZOOM をテクスチャピクセル単位に変換
         let sample_px_half = LOUPE_SIZE * 0.5 / (total_scale * LOUPE_ZOOM);
         let half_uv = egui::vec2(sample_px_half / tex_size.x, sample_px_half / tex_size.y);
-        let uv_min = egui::pos2(
-            (uv_center.x - half_uv.x).clamp(0.0, 1.0),
-            (uv_center.y - half_uv.y).clamp(0.0, 1.0),
-        );
-        let uv_max = egui::pos2(
-            (uv_center.x + half_uv.x).clamp(0.0, 1.0),
-            (uv_center.y + half_uv.y).clamp(0.0, 1.0),
-        );
-        let uv_rect = egui::Rect::from_min_max(uv_min, uv_max);
 
         // ポップアップ位置: カーソル右下 → はみ出すなら反転
         let mut popup_pos = cursor + egui::vec2(LOUPE_OFFSET, LOUPE_OFFSET);
@@ -21186,11 +23295,18 @@ impl App {
         popup_pos.x = popup_pos.x.max(full_rect.min.x + 4.0);
         popup_pos.y = popup_pos.y.max(full_rect.min.y + 4.0);
         let loupe_rect = egui::Rect::from_min_size(popup_pos, egui::vec2(LOUPE_SIZE, LOUPE_SIZE));
+        let sample = loupe_sample_mapping(uv_center, half_uv, loupe_rect);
 
         let painter = ui.painter();
-        // 背景 (黒で囲う) + 画像 + 枠線
+        // 画像外は既存の黒背景を残し、クリップした UV と同じ比率だけ描画先も切り詰める。
+        // これにより画像端でもカーソル位置と source px あたりの拡大率を変えない。
         painter.rect_filled(loupe_rect.expand(3.0), 4.0, egui::Color32::BLACK);
-        painter.image(handle_owned.id(), loupe_rect, uv_rect, egui::Color32::WHITE);
+        painter.image(
+            handle_owned.id(),
+            sample.image_rect,
+            sample.uv_rect,
+            egui::Color32::WHITE,
+        );
         painter.rect_stroke(
             loupe_rect,
             2.0,
@@ -21248,15 +23364,17 @@ impl App {
                     self.fullscreen_page_layout.push(transform);
                 }
             }
-            [left, right] => self.draw_fs_spread(
-                ui,
-                ctx,
-                image_rect,
-                left.idx,
-                right.idx,
-                false,
-                Some((left, right)),
-            ),
+            [left, right] => {
+                let _ = self.draw_fs_spread(
+                    ui,
+                    ctx,
+                    image_rect,
+                    left.idx,
+                    right.idx,
+                    false,
+                    Some((left, right)),
+                );
+            }
             _ => debug_assert!(false, "display unit must contain one or two pages"),
         }
     }
@@ -21272,7 +23390,7 @@ impl App {
         right_idx: usize,
         original_preview_active: bool,
         display_override: Option<(&FsDisplayUnitHoldoverPage, &FsDisplayUnitHoldoverPage)>,
-    ) {
+    ) -> FsNavigatorTextureSources {
         self.fullscreen_page_layout.clear();
         let zoom_pan = self.fs_zoom_pan();
         let fit_mode = self.effective_fullscreen_fit_mode();
@@ -21629,6 +23747,8 @@ impl App {
             // ルーペ用レイアウトには書かない (ルーペは非見開きパスのロジックで描画しない)。
             self.fullscreen_page_layout.clear();
         }
+
+        FsNavigatorTextureSources::spread(left_idx, left_display_tex, right_idx, right_display_tex)
     }
 
     /// テクスチャの表示サイズ（回転考慮）を返す。テクスチャ未取得なら None。
@@ -21814,7 +23934,7 @@ impl App {
             && !in_left_callout
             && !self.metadata_panel_click_shown()
             && !self.metadata_panel_hover_active
-            && !self.adjustment_mode
+            && !self.adjustment_mode.is_open()
             && !self.view_trim_mode
             && !self.is_overlay_edit_mode_active()
             && !self.analysis_mode
@@ -21911,6 +24031,8 @@ impl App {
         top_bar_lock_pressed: &mut bool,
         cursor_hidden: bool,
         navigator_exclusion: Option<egui::Rect>,
+        touch_chrome_latched: bool,
+        touch_target_frame: u64,
     ) {
         let hover_in_top = ctx.input(|i| {
             !cursor_hidden
@@ -21931,13 +24053,14 @@ impl App {
             slideshow_popup_open: *slideshow_popup_open,
             rotation_popup_open: fs_rotation_popup_open(ctx),
             view_trim_mode: *view_trim_mode,
+            touch_chrome_latched,
         }) {
             return;
         }
 
         crate::os_theme::apply_dark_ui(ui);
-        let bar_rect =
-            egui::Rect::from_min_size(full_rect.min, egui::vec2(full_rect.width(), TOP_BAR_HEIGHT));
+        let bar_rect = fullscreen_top_bar_rect(full_rect);
+        record_bar_button_touch_frame(ctx, touch_target_frame, bar_rect);
         ui.painter().rect_filled(
             bar_rect,
             0.0,
@@ -25136,7 +27259,10 @@ impl App {
             self.show_feedback_toast("エクスポート中です".to_string());
             return;
         }
-        if self.is_overlay_edit_mode_active() || self.adjustment_mode || self.analysis_mode {
+        if self.is_overlay_edit_mode_active()
+            || self.adjustment_mode.is_open()
+            || self.analysis_mode
+        {
             self.show_feedback_toast("編集モードを閉じてからエクスポートしてください".to_string());
             return;
         }
@@ -26715,6 +28841,10 @@ impl App {
         // 背景色はタイムラインのラベル列 / 左右隙間と共有 (実機 FB 2026-07、色の不揃い解消)。
         let bg = crate::ui_music_timeline::MUSIC_VIEW_BG;
         painter.rect_filled(rect, 0.0, bg);
+        let touch_observed = observe_music_touch_for_panel_handles(
+            ctx,
+            crate::touch_correlation::touch_gestures_disabled(),
+        );
 
         // 音楽ビューを開いている間はタイムライン解析を確実に走らせ、結果を取り込む (Inc 3b)。
         // ブックマーク (Inc 5) も現在ファイル用にロードしておく (左パネルが閉じていても
@@ -26805,8 +28935,7 @@ impl App {
         // 接し、グラフ端をクリックしようとして僅かにはみ出すとパネルが出てしまう。3% の隙間を挟む
         // ことでその誤爆を防ぐ (トリガ自体は 5% のまま = パネルの開けやすさをウィンドウモードでも
         // 維持)。gutter (= 5%+3% = 8%) は最低 8px。
-        let edge_trigger = crate::ui_helpers::panel_edge_trigger_px(rect.width());
-        let content_gutter = (edge_trigger + rect.width() * 0.03).max(8.0);
+        let content_gutter = music_visualization_side_margin(rect.width());
 
         // 中央領域の下端に MIDI 半音 spectrum + ピッチ鍵盤 (Inc 4) の帯を確保する。残りが
         // タイムライン (or 解析中アイコン) の領域。縦窓が短いときに spectrum が timeline を
@@ -26902,8 +29031,8 @@ impl App {
             side_panel_mode,
             self.music_left_panel_active,
             self.music_right_panel_active,
-            self.music_left_click_open,
-            self.fs_click_info_open,
+            self.music_left_panel_open,
+            self.fs_info_panel_open,
             music_modal_open,
         );
         let left_hover = frame_ui.left_panel_visible;
@@ -27163,6 +29292,9 @@ impl App {
             panel_band_bottom,
             fs_idx,
             !music_modal_open,
+            touch_observed,
+            left_hover,
+            right_hover,
         );
 
         // 上情報バー (常時): ファイル名 (左) + Row ステッパー (中央、timeline 時) +
@@ -27316,6 +29448,13 @@ mod tests {
         assert!((actual.bottom() - expected.bottom()).abs() < EPSILON);
     }
 
+    fn assert_loupe_scale(mapping: LoupeSampleMapping, texture_size: egui::Vec2, expected: f32) {
+        let scale_x = mapping.image_rect.width() / (mapping.uv_rect.width() * texture_size.x);
+        let scale_y = mapping.image_rect.height() / (mapping.uv_rect.height() * texture_size.y);
+        assert!((scale_x - expected).abs() < 1.0e-4);
+        assert!((scale_y - expected).abs() < 1.0e-4);
+    }
+
     #[test]
     fn navigator_hold_requests_visibility_when_fixed_setting_is_off() {
         assert!(fs_navigator_visibility_requested(false, true, true, false));
@@ -27326,6 +29465,75 @@ mod tests {
         assert!(!fs_navigator_visibility_requested(
             false, false, true, false
         ));
+    }
+
+    #[test]
+    fn navigator_uses_processed_source_per_page_and_thumbnail_fallback() {
+        let ctx = egui::Context::default();
+        let processed = ctx.load_texture(
+            "navigator_processed",
+            egui::ColorImage::filled([2, 2], egui::Color32::RED),
+            egui::TextureOptions::LINEAR,
+        );
+        let thumbnail = ctx.load_texture(
+            "navigator_thumbnail",
+            egui::ColorImage::filled([1, 1], egui::Color32::BLUE),
+            egui::TextureOptions::LINEAR,
+        );
+        let sources = FsNavigatorTextureSources::spread(
+            11,
+            Some(FullscreenPaintResource::resampleable(
+                11,
+                processed.clone(),
+                crate::gpu_lanczos::FullscreenPaintSourceGeneration { items: 3, input: 7 },
+            )),
+            10,
+            None,
+        );
+
+        assert_eq!(
+            sources.texture_for_page(11, Some(&thumbnail)).unwrap().id(),
+            processed.id()
+        );
+        assert_eq!(
+            sources.texture_for_page(10, Some(&thumbnail)).unwrap().id(),
+            thumbnail.id()
+        );
+    }
+
+    #[test]
+    fn navigator_holdover_replaces_live_texture_even_when_page_idx_matches() {
+        let ctx = egui::Context::default();
+        let live = ctx.load_texture(
+            "navigator_live",
+            egui::ColorImage::filled([2, 2], egui::Color32::GREEN),
+            egui::TextureOptions::LINEAR,
+        );
+        let held = ctx.load_texture(
+            "navigator_holdover",
+            egui::ColorImage::filled([2, 2], egui::Color32::YELLOW),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut sources = FsNavigatorTextureSources::single(
+            4,
+            Some(FullscreenPaintResource::direct(live.clone())),
+        );
+        let holdover = FsDisplayUnitHoldover {
+            pages: vec![FsDisplayUnitHoldoverPage {
+                idx: 4,
+                texture: FullscreenPaintResource::direct(held.clone()),
+                rotation: crate::rotation_db::Rotation::None,
+                source_size: None,
+                content_bbox: None,
+            }],
+        };
+
+        sources.replace_with_display_unit(&holdover);
+
+        assert_eq!(
+            sources.texture_for_page(4, Some(&live)).unwrap().id(),
+            held.id()
+        );
     }
 
     fn single_page_layout_with_pan(zoom: f32, pan: egui::Vec2) -> FullscreenPageLayout {
@@ -27637,6 +29845,15 @@ mod tests {
         (app, image_rect, fs_idx)
     }
 
+    #[test]
+    fn flat_navigator_is_allowed_during_compare_display() {
+        let (mut app, _, fs_idx) = setup_flat_navigator_input_test();
+        let ctx = egui::Context::default();
+        app.compare_view_mode = crate::app::CompareViewMode::Wipe { fraction: 0.5 };
+
+        assert!(app.fs_navigator_allowed(&ctx, fs_idx));
+    }
+
     fn navigator_pointer_input(
         pos: egui::Pos2,
         button: Option<(egui::PointerButton, bool)>,
@@ -27922,7 +30139,7 @@ mod tests {
 
         assert_eq!(result, (FsPageNav::None, false));
         assert!(!app.metadata_panel_hover_active);
-        assert!(!app.adjustment_mode);
+        assert!(!app.adjustment_mode.is_open());
     }
 
     #[test]
@@ -27955,7 +30172,7 @@ mod tests {
     }
 
     #[test]
-    fn flat_navigator_keeps_catalog_thumbnail_full_when_view_is_trimmed() {
+    fn flat_navigator_keeps_full_image_overview_when_view_is_trimmed() {
         let trim = egui::Rect::from_min_max(egui::pos2(0.15, 0.10), egui::pos2(0.82, 0.91));
         let main = navigator_test_transform_with_content(
             4,
@@ -28031,7 +30248,7 @@ mod tests {
     }
 
     #[test]
-    fn flat_navigator_hides_when_the_whole_image_is_visible() {
+    fn flat_navigator_fit_keeps_image_frame_and_overview_identical() {
         let main = navigator_test_transform(
             3,
             crate::rotation_db::Rotation::None,
@@ -28041,16 +30258,64 @@ mod tests {
         pages.begin(FullscreenPageLayoutKind::Single);
         pages.push(main);
 
-        assert!(
-            build_flat_navigator_layout(
-                &pages,
-                main.viewport_rect,
-                main.viewport_rect,
-                260.0,
-                FullscreenNavigatorCorner::BottomRight,
-            )
-            .is_none()
+        let navigator = build_flat_navigator_layout(
+            &pages,
+            main.viewport_rect,
+            main.viewport_rect,
+            260.0,
+            FullscreenNavigatorCorner::BottomRight,
+        )
+        .unwrap();
+
+        assert_rect_close(navigator.content_rect, navigator.visible_rect);
+        assert_rect_close(
+            navigator.pages[0].navigator.full_image_rect,
+            navigator.visible_rect,
         );
+    }
+
+    #[test]
+    fn flat_navigator_zoomed_out_shrinks_image_inside_full_frame_with_floor() {
+        let main = navigator_test_transform(
+            3,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((0.2, egui::Vec2::ZERO)),
+            },
+        );
+        let mut pages = FullscreenPageLayout::default();
+        pages.begin(FullscreenPageLayoutKind::Single);
+        pages.push(main);
+
+        let navigator = build_flat_navigator_layout(
+            &pages,
+            main.viewport_rect,
+            main.viewport_rect,
+            260.0,
+            FullscreenNavigatorCorner::BottomRight,
+        )
+        .unwrap();
+
+        assert!(navigator.visible_rect.contains_rect(navigator.content_rect));
+        assert!(
+            (navigator.content_rect.width() / navigator.visible_rect.width()
+                - FS_NAVIGATOR_MIN_IMAGE_SCALE)
+                .abs()
+                < 1.0e-3
+        );
+    }
+
+    #[test]
+    fn flat_navigator_image_scale_is_continuous_at_exact_fit() {
+        let clip = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+        let exact = egui::Rect::from_center_size(clip.center(), egui::vec2(1000.0, 600.0));
+        let just_below = egui::Rect::from_center_size(clip.center(), egui::vec2(999.0, 599.4));
+
+        let exact_scale = fs_navigator_fully_visible_image_scale(exact, clip);
+        let below_scale = fs_navigator_fully_visible_image_scale(just_below, clip);
+        assert_eq!(exact_scale, 1.0);
+        assert!((below_scale - 0.999).abs() < 1.0e-6);
+        assert!((exact_scale - below_scale - 0.001).abs() < 1.0e-6);
     }
 
     #[test]
@@ -28281,6 +30546,425 @@ mod tests {
                 "{flow:?} {direction:?}: Ctrl ありは直交方向もパン"
             );
         }
+    }
+
+    #[test]
+    fn continuous_reading_drag_state_applies_cumulative_totals_once_and_finishes() {
+        let session = std::time::Instant::now();
+        let (state, delta) = ContinuousReadingDragState::Idle.advance(
+            session,
+            10,
+            true,
+            false,
+            true,
+            Some(egui::vec2(0.0, -20.0)),
+        );
+        assert_eq!(delta, egui::vec2(0.0, -20.0));
+
+        let (state, delta) =
+            state.advance(session, 11, true, false, true, Some(egui::vec2(0.0, -50.0)));
+        assert_eq!(delta, egui::vec2(0.0, -30.0));
+
+        let (state, delta) =
+            state.advance(session, 12, true, true, false, Some(egui::vec2(0.0, -80.0)));
+        assert_eq!(delta, egui::vec2(0.0, -30.0));
+        assert!(matches!(
+            state,
+            ContinuousReadingDragState::Completed {
+                terminal_frame: 12,
+                ..
+            }
+        ));
+
+        // egui can evaluate the terminal response again in one app frame.
+        // Its cumulative total was already applied and must not be replayed.
+        let (state, delta) =
+            state.advance(session, 12, true, true, false, Some(egui::vec2(0.0, -80.0)));
+        assert_eq!(delta, egui::Vec2::ZERO);
+
+        let (state, delta) = state.advance(session, 13, false, false, false, None);
+        assert_eq!(state, ContinuousReadingDragState::Idle);
+        assert_eq!(delta, egui::Vec2::ZERO);
+    }
+
+    #[test]
+    fn continuous_reading_drag_state_keeps_coalesced_press_move_release_delta() {
+        let session = std::time::Instant::now();
+        let (state, delta) = ContinuousReadingDragState::Idle.advance(
+            session,
+            20,
+            true,
+            true,
+            false,
+            Some(egui::vec2(17.0, -83.0)),
+        );
+
+        assert_eq!(delta, egui::vec2(17.0, -83.0));
+        assert!(matches!(
+            state,
+            ContinuousReadingDragState::Completed {
+                terminal_frame: 20,
+                applied_total,
+                ..
+            } if applied_total == egui::vec2(17.0, -83.0)
+        ));
+
+        // A fresh session never inherits a previous gesture's cumulative total.
+        let next_session = session + std::time::Duration::from_secs(1);
+        let (_, delta) = state.advance(
+            next_session,
+            21,
+            true,
+            false,
+            true,
+            Some(egui::vec2(-9.0, 4.0)),
+        );
+        assert_eq!(delta, egui::vec2(-9.0, 4.0));
+    }
+
+    #[test]
+    fn continuous_page_unit_navigation_uses_keyboard_path_and_seek_landing() {
+        let mut app = crate::app::setup_app_for_test();
+        for page in 0..6 {
+            app.items.push(GridItem::Image(PathBuf::from(format!(
+                "c:/test/continuous-page-{page}.jpg"
+            ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.visible_indices = (0..app.items.len()).collect();
+        app.open_fullscreen(0, crate::app::HistoryTrigger::UserChosen);
+        app.reading_flow = ReadingFlow::Vertical;
+        let ctx = egui::Context::default();
+
+        // FsPageNext/FsPagePrev and a recognized side tap both enter through
+        // spread_page_nav. Single-page mode advances exactly one page.
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        let next = app.spread_page_nav(1);
+        assert_eq!(next, FsPageNav::Delta(1));
+        app.fs_zoom = 1.75;
+        app.fs_vertical_scroll = 42.0;
+        app.handle_fs_navigation(&ctx, false, false, None, None, None, next, None, 0);
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.fs_vertical_scroll, 0.0);
+        assert_eq!(
+            app.fs_zoom, 1.75,
+            "continuous page-unit landing must seek, not perform a fresh fullscreen open"
+        );
+
+        // A spread is one display unit, so the same command advances two
+        // portrait pages and retains the continuous stream's state owner.
+        app.seek_to_continuous_page(&ctx, 0);
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        let next_spread = app.spread_page_nav(1);
+        assert_eq!(next_spread, FsPageNav::Target(2));
+        app.fs_zoom = 1.5;
+        app.fs_vertical_scroll = 70.0;
+        app.handle_fs_navigation(&ctx, false, false, None, None, None, next_spread, None, 0);
+        assert_eq!(app.fullscreen_idx, Some(2));
+        assert_eq!(app.selected, Some(2));
+        assert_eq!(app.fs_vertical_scroll, 0.0);
+        assert_eq!(app.fs_zoom, 1.5);
+    }
+
+    /// Hovering a mouse across the image must not scroll continuous reading.
+    /// `pointer.delta()` is non-zero for plain movement, so the frame gate has
+    /// to require an actual drag from the mouse and admit a cumulative total
+    /// only from a correlated touch stream.
+    #[test]
+    fn continuous_reading_drag_frame_gate_ignores_mouse_movement_without_a_drag() {
+        let moved = egui::vec2(0.0, 40.0);
+
+        assert!(
+            !continuous_reading_drag_consumes_frame(false, false, moved),
+            "a moving mouse with no button held must not scroll"
+        );
+        assert!(
+            !continuous_reading_drag_consumes_frame(false, false, egui::Vec2::ZERO),
+            "a still mouse must not scroll"
+        );
+        assert!(
+            continuous_reading_drag_consumes_frame(true, false, egui::Vec2::ZERO),
+            "a mouse drag keeps the established per-frame pointer delta path"
+        );
+        assert!(
+            continuous_reading_drag_consumes_frame(false, true, moved),
+            "a coalesced touch drag reports no ongoing drag but must still scroll"
+        );
+        assert!(
+            !continuous_reading_drag_consumes_frame(false, true, egui::Vec2::ZERO),
+            "touch activity alone, with nothing accumulated, must not scroll"
+        );
+    }
+
+    #[test]
+    fn continuous_touch_drag_keeps_terminal_delta_and_next_tap_while_mouse_stays_unchanged() {
+        fn touch(phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
+            egui::Event::Touch {
+                device_id: egui::TouchDeviceId(41),
+                id: egui::TouchId(43),
+                phase,
+                pos,
+                force: None,
+            }
+        }
+
+        fn primary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }
+        }
+
+        fn run_frame(
+            app: &mut crate::app::AppTestEnvForTest,
+            ctx: &egui::Context,
+            screen: egui::Rect,
+            state: &FsFrameState,
+            events: Vec<egui::Event>,
+            advance_app_frame: bool,
+        ) -> (FsPageNav, bool) {
+            if advance_app_frame {
+                app.frame_counter += 1;
+            }
+            let mut result = (FsPageNav::None, false);
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            result =
+                                app.handle_fs_wheel_and_click(ui, ctx, screen, state, false, 0);
+                        });
+                },
+            );
+            result
+        }
+
+        let mut app = crate::app::setup_app_for_test();
+        for page in 0..4 {
+            app.items.push(GridItem::Image(PathBuf::from(format!(
+                "c:/test/continuous-pointer-{page}.jpg"
+            ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.visible_indices = (0..app.items.len()).collect();
+        app.open_fullscreen(0, crate::app::HistoryTrigger::UserChosen);
+        app.reading_flow = ReadingFlow::Vertical;
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.settings.touch_still_chrome_learned = true;
+        let state = FsFrameState {
+            is_video: false,
+            original_preview_active: false,
+            tex: None,
+            thumb_tex: None,
+            location_display: String::new(),
+            image_dims: None,
+            image_file_size: None,
+            image_downscaled: false,
+            is_loading: false,
+            vst3_waiting_for_video: false,
+            fs_load_failed: false,
+            pdf_content_type: None,
+        };
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let drag_start = egui::pos2(400.0, 320.0);
+        let drag_end = egui::pos2(400.0, 240.0);
+
+        run_frame(&mut app, &ctx, screen, &state, Vec::new(), true);
+        app.fs_primary_suppression.arm_pointer_stream();
+        let nav = run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                touch(egui::TouchPhase::Start, drag_start),
+                egui::Event::PointerMoved(drag_start),
+                primary(drag_start, true),
+                touch(egui::TouchPhase::Move, drag_end),
+                egui::Event::PointerMoved(drag_end),
+                touch(egui::TouchPhase::End, drag_end),
+                primary(drag_end, false),
+            ],
+            true,
+        );
+        assert_eq!(nav, (FsPageNav::None, false));
+        assert_eq!(
+            app.fs_vertical_scroll, 80.0,
+            "an armed focus-reclaim stream must apply the full coalesced touch drag"
+        );
+        assert_eq!(
+            app.fs_primary_suppression,
+            FullscreenPrimarySuppression::Idle,
+            "touch completion must clear the corrected owner"
+        );
+
+        // A repeated egui pass in the same app frame must not apply the
+        // terminal cumulative total again.
+        run_frame(&mut app, &ctx, screen, &state, Vec::new(), false);
+        assert_eq!(app.fs_vertical_scroll, 80.0);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerGone],
+            true,
+        );
+
+        let tap = egui::pos2(600.0, 300.0);
+        app.fs_primary_suppression.arm_pointer_stream();
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                touch(egui::TouchPhase::Start, tap),
+                egui::Event::PointerMoved(tap),
+                primary(tap, true),
+            ],
+            true,
+        );
+        let tap_nav = run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![touch(egui::TouchPhase::End, tap), primary(tap, false)],
+            true,
+        );
+        assert_eq!(
+            tap_nav,
+            (FsPageNav::Delta(1), false),
+            "an armed touch tap must remain a page-unit command"
+        );
+        assert_eq!(
+            app.fs_primary_suppression,
+            FullscreenPrimarySuppression::Idle
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerGone],
+            true,
+        );
+
+        app.spread_mode = crate::settings::SpreadMode::Rtl;
+        let rtl_next_tap = egui::pos2(200.0, 300.0);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                touch(egui::TouchPhase::Start, rtl_next_tap),
+                egui::Event::PointerMoved(rtl_next_tap),
+                primary(rtl_next_tap, true),
+            ],
+            true,
+        );
+        let rtl_spread_nav = run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                touch(egui::TouchPhase::End, rtl_next_tap),
+                primary(rtl_next_tap, false),
+            ],
+            true,
+        );
+        assert_eq!(
+            rtl_spread_nav,
+            (FsPageNav::Target(2), false),
+            "RTL maps the physical left side to the next two-page display unit"
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerGone],
+            true,
+        );
+        app.spread_mode = crate::settings::SpreadMode::Single;
+
+        // Mouse drag remains a 1:1 continuous scroll, while a mouse click is
+        // still intentionally not page navigation in continuous reading.
+        app.fs_vertical_scroll = 0.0;
+        let mouse_start = egui::pos2(400.0, 320.0);
+        let mouse_middle = egui::pos2(400.0, 300.0);
+        let mouse_end = egui::pos2(400.0, 270.0);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                egui::Event::PointerMoved(mouse_start),
+                primary(mouse_start, true),
+            ],
+            true,
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerMoved(mouse_middle)],
+            true,
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerMoved(mouse_end)],
+            true,
+        );
+        assert_eq!(app.fs_vertical_scroll, 50.0);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![primary(mouse_end, false), egui::Event::PointerGone],
+            true,
+        );
+
+        let mouse_tap = egui::pos2(600.0, 300.0);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                egui::Event::PointerMoved(mouse_tap),
+                primary(mouse_tap, true),
+            ],
+            true,
+        );
+        let mouse_nav = run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![primary(mouse_tap, false), egui::Event::PointerGone],
+            true,
+        );
+        assert_eq!(mouse_nav, (FsPageNav::None, false));
     }
 
     #[test]
@@ -28525,71 +31209,151 @@ mod tests {
     }
 
     #[test]
+    fn loupe_mapping_keeps_source_scale_and_exposes_outside_background() {
+        let loupe = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(300.0, 300.0));
+        let half_uv = egui::vec2(0.1, 0.2);
+        let texture_size = egui::vec2(1000.0, 500.0);
+
+        let center = loupe_sample_mapping(egui::vec2(0.5, 0.5), half_uv, loupe);
+        assert_rect_close(
+            center.uv_rect,
+            egui::Rect::from_min_max(egui::pos2(0.4, 0.3), egui::pos2(0.6, 0.7)),
+        );
+        assert_rect_close(center.image_rect, loupe);
+        assert_loupe_scale(center, texture_size, 1.5);
+
+        let left = loupe_sample_mapping(egui::vec2(0.0, 0.5), half_uv, loupe);
+        assert_rect_close(
+            left.image_rect,
+            egui::Rect::from_min_max(egui::pos2(170.0, 30.0), egui::pos2(320.0, 330.0)),
+        );
+        assert_loupe_scale(left, texture_size, 1.5);
+
+        let right_top = loupe_sample_mapping(egui::vec2(1.0, 0.0), half_uv, loupe);
+        assert_rect_close(
+            right_top.image_rect,
+            egui::Rect::from_min_max(egui::pos2(20.0, 180.0), egui::pos2(170.0, 330.0)),
+        );
+        assert_loupe_scale(right_top, texture_size, 1.5);
+
+        let small_image = loupe_sample_mapping(egui::vec2(0.5, 0.5), egui::vec2(1.0, 1.0), loupe);
+        assert_rect_close(
+            small_image.image_rect,
+            egui::Rect::from_min_max(egui::pos2(95.0, 105.0), egui::pos2(245.0, 255.0)),
+        );
+        assert_loupe_scale(small_image, egui::vec2(100.0, 100.0), 1.5);
+    }
+
+    #[test]
     fn music_panel_visibility_uses_hover_or_explicit_click_state_by_mode() {
         use crate::settings::FsSidePanelMode;
+        use crate::ui_helpers::MetadataPanelOpenState::{ByPointer, ByTouchHandle, Closed};
 
         assert!(music_left_panel_visible_from_inputs(
             FsSidePanelMode::Hover,
             true,
-            false,
+            Closed,
             false,
         ));
         assert!(!music_left_panel_visible_from_inputs(
             FsSidePanelMode::ClickToShow,
             true,
-            false,
+            Closed,
             false,
         ));
         assert!(music_left_panel_visible_from_inputs(
             FsSidePanelMode::ClickToShow,
             false,
-            true,
+            ByPointer,
+            false,
+        ));
+        assert!(!music_left_panel_visible_from_inputs(
+            FsSidePanelMode::Hover,
+            false,
+            ByPointer,
+            false,
+        ));
+        assert!(music_left_panel_visible_from_inputs(
+            FsSidePanelMode::Hover,
+            false,
+            ByTouchHandle,
             false,
         ));
 
         assert!(!music_right_panel_visible_from_inputs(
             FsSidePanelMode::ClickToShow,
             true,
-            false,
+            Closed,
             false,
         ));
         assert!(music_right_panel_visible_from_inputs(
             FsSidePanelMode::ClickToShow,
             false,
-            true,
+            ByPointer,
             false,
         ));
         assert!(!music_right_panel_visible_from_inputs(
             FsSidePanelMode::Hover,
             false,
-            true,
+            ByPointer,
+            false,
+        ));
+        assert!(music_right_panel_visible_from_inputs(
+            FsSidePanelMode::Hover,
+            false,
+            ByTouchHandle,
             false,
         ));
 
         assert!(!music_left_panel_visible_from_inputs(
             FsSidePanelMode::ClickToShow,
             false,
-            true,
+            ByPointer,
             true,
         ));
         assert!(!music_right_panel_visible_from_inputs(
             FsSidePanelMode::ClickToShow,
             false,
-            true,
+            ByPointer,
             true,
         ));
     }
 
     #[test]
+    fn music_panel_reach_preserves_mouse_hover_and_opens_touch_explicitly() {
+        use crate::settings::FsSidePanelMode;
+        use crate::ui_helpers::MetadataPanelOpenState::{ByTouchHandle, Closed};
+
+        assert_eq!(
+            music_panel_open_state_after_reach(
+                FsSidePanelMode::Hover,
+                Closed,
+                MusicPanelReachSource::Pointer,
+            ),
+            Closed,
+            "mouse-only Hover must not create explicit state"
+        );
+        assert_eq!(
+            music_panel_open_state_after_reach(
+                FsSidePanelMode::Hover,
+                Closed,
+                MusicPanelReachSource::TouchHandle,
+            ),
+            ByTouchHandle
+        );
+    }
+
+    #[test]
     fn music_view_interactive_ui_blocks_cursor_auto_hide() {
         use crate::settings::FsSidePanelMode;
+        use crate::ui_helpers::MetadataPanelOpenState::{ByPointer, Closed};
 
         let idle = MusicViewFrameUiState::from_panel_inputs(
             FsSidePanelMode::Hover,
             false,
             false,
-            false,
-            false,
+            Closed,
+            Closed,
             false,
         );
         assert!(!idle.blocks_cursor_auto_hide());
@@ -28598,8 +31362,8 @@ mod tests {
             FsSidePanelMode::Hover,
             true,
             false,
-            false,
-            false,
+            Closed,
+            Closed,
             false,
         );
         assert!(hover_left.left_panel_visible);
@@ -28609,8 +31373,8 @@ mod tests {
             FsSidePanelMode::ClickToShow,
             false,
             false,
-            false,
-            true,
+            Closed,
+            ByPointer,
             false,
         );
         assert!(click_right.right_panel_visible);
@@ -28620,8 +31384,8 @@ mod tests {
             FsSidePanelMode::Hover,
             true,
             true,
-            false,
-            false,
+            Closed,
+            Closed,
             true,
         );
         assert!(!modal.left_panel_visible);
@@ -28993,6 +31757,1099 @@ mod tests {
     }
 
     #[test]
+    fn touch_panel_handles_are_large_symmetric_and_avoid_chrome_bars() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(1200.0, 600.0));
+        let [left, right] = still_touch_panel_handle_rects(viewport);
+        assert_eq!(left.width(), TOUCH_PANEL_HANDLE_WIDTH_PT);
+        assert!(left.width() >= 44.0);
+        assert_eq!(right.width(), left.width());
+        assert_eq!(left.height(), right.height());
+        assert_eq!(left.top(), right.top());
+        assert_eq!(left.bottom(), right.bottom());
+        assert_eq!(left.left(), viewport.left());
+        assert_eq!(right.right(), viewport.right());
+        assert!(left.top() >= viewport.top() + TOP_BAR_HEIGHT);
+        assert!(left.bottom() <= viewport.bottom() - FS_SEEK_BAR_HEIGHT);
+
+        let short = egui::Rect::from_min_size(egui::pos2(5.0, 7.0), egui::vec2(800.0, 90.0));
+        for rect in still_touch_panel_handle_rects(short) {
+            assert!(rect.is_positive());
+            assert!(rect.top() >= short.top() + TOP_BAR_HEIGHT);
+            assert!(rect.bottom() <= short.bottom() - FS_SEEK_BAR_HEIGHT);
+        }
+        let too_short = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 70.0));
+        assert!(
+            still_touch_panel_handle_rects(too_short)
+                .into_iter()
+                .all(|rect| !rect.is_positive())
+        );
+    }
+
+    #[test]
+    fn common_touch_handle_geometry_preserves_legacy_still_rects_exactly() {
+        fn legacy(full_rect: egui::Rect, edge: crate::ui_helpers::PanelEdge) -> egui::Rect {
+            if edge == crate::ui_helpers::PanelEdge::Top {
+                return egui::Rect::NOTHING;
+            }
+            let safe_top = (full_rect.top() + TOP_BAR_HEIGHT).min(full_rect.bottom());
+            let safe_bottom = (full_rect.bottom() - FS_SEEK_BAR_HEIGHT).max(full_rect.top());
+            if safe_bottom <= safe_top {
+                return egui::Rect::NOTHING;
+            }
+            let safe_height = safe_bottom - safe_top;
+            let height = (full_rect.height() * 0.24)
+                .clamp(96.0, 220.0)
+                .min(safe_height);
+            let width = TOUCH_PANEL_HANDLE_WIDTH_PT.min(full_rect.width().max(0.0) * 0.5);
+            if width <= 0.0 || height <= 0.0 {
+                return egui::Rect::NOTHING;
+            }
+            let x = match edge {
+                crate::ui_helpers::PanelEdge::Left => full_rect.left(),
+                crate::ui_helpers::PanelEdge::Right => full_rect.right() - width,
+                crate::ui_helpers::PanelEdge::Top => unreachable!(),
+            };
+            egui::Rect::from_min_size(
+                egui::pos2(x, (safe_top + safe_bottom - height) * 0.5),
+                egui::vec2(width, height),
+            )
+        }
+
+        for full_rect in [
+            egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(1200.0, 600.0)),
+            egui::Rect::from_min_size(egui::pos2(-5.0, 7.0), egui::vec2(80.0, 90.0)),
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 70.0)),
+        ] {
+            for edge in [
+                crate::ui_helpers::PanelEdge::Left,
+                crate::ui_helpers::PanelEdge::Right,
+            ] {
+                assert_eq!(
+                    still_touch_panel_handle_rect(full_rect, edge),
+                    legacy(full_rect, edge)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn music_touch_handles_stay_in_visualization_margin_at_required_widths() {
+        for width in [320.0, 480.0, 600.0, 1280.0, 3840.0] {
+            let viewport =
+                egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(width, 800.0));
+            let margin = music_visualization_side_margin(width);
+            let [left, right] = music_touch_panel_handle_rects(viewport);
+            let expected_width = TOUCH_PANEL_HANDLE_WIDTH_PT.min(margin);
+            assert!(
+                (left.width() - expected_width).abs() < 0.001,
+                "width={width}"
+            );
+            assert!(
+                (right.width() - expected_width).abs() < 0.001,
+                "width={width}"
+            );
+            assert!(
+                left.right() <= viewport.left() + margin,
+                "left handle overlaps waveform seek rect at width={width}"
+            );
+            assert!(
+                right.left() >= viewport.right() - margin,
+                "right handle overlaps waveform seek rect at width={width}"
+            );
+            assert!(left.top() >= viewport.top() + MUSIC_TOP_BAR_HEIGHT);
+            assert!(left.bottom() <= viewport.bottom() - crate::ui_music_panels::MUSIC_HUD_HEIGHT);
+        }
+
+        let below_floor = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(299.0, 800.0));
+        assert!(
+            music_touch_panel_handle_rects(below_floor)
+                .into_iter()
+                .all(|rect| !rect.is_positive()),
+            "a margin below 24pt must fail closed"
+        );
+        let too_short = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(
+                800.0,
+                MUSIC_TOP_BAR_HEIGHT + crate::ui_music_panels::MUSIC_HUD_HEIGHT,
+            ),
+        );
+        assert!(
+            music_touch_panel_handle_rects(too_short)
+                .into_iter()
+                .all(|rect| !rect.is_positive())
+        );
+    }
+
+    #[test]
+    fn music_touch_handles_hide_only_on_the_open_side() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        assert!(
+            visible_music_touch_panel_handle_rects(viewport, false, false, false)
+                .into_iter()
+                .all(|rect| !rect.is_positive())
+        );
+        let [left, right] = visible_music_touch_panel_handle_rects(viewport, true, true, false);
+        assert!(!left.is_positive());
+        assert!(right.is_positive());
+
+        let [left, right] = visible_music_touch_panel_handle_rects(viewport, true, false, true);
+        assert!(left.is_positive());
+        assert!(!right.is_positive());
+    }
+
+    #[test]
+    fn music_touch_observed_keeps_left_callout_when_left_panel_is_open() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let handle_rects = visible_music_touch_panel_handle_rects(viewport, true, true, false);
+        assert_eq!(
+            music_panel_callout_edges_without_touch_handles(handle_rects),
+            [true, false]
+        );
+    }
+
+    #[test]
+    fn music_touch_observed_keeps_both_callouts_below_handle_width_floor() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(280.0, 800.0));
+        let handle_rects = visible_music_touch_panel_handle_rects(viewport, true, false, false);
+        assert_eq!(
+            music_panel_callout_edges_without_touch_handles(handle_rects),
+            [true, true]
+        );
+    }
+
+    #[test]
+    fn music_touch_observed_suppresses_callout_only_on_edge_with_handle() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let handle_rects = visible_music_touch_panel_handle_rects(viewport, true, false, true);
+        assert_eq!(
+            music_panel_callout_edges_without_touch_handles(handle_rects),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn music_touch_observation_is_viewport_sticky_and_disable_fails_closed() {
+        fn raw_input(viewport: egui::ViewportId, events: Vec<egui::Event>) -> egui::RawInput {
+            let mut input = egui::RawInput {
+                viewport_id: viewport,
+                events,
+                ..Default::default()
+            };
+            input.viewports.insert(
+                viewport,
+                egui::ViewportInfo {
+                    parent: Some(egui::ViewportId::ROOT),
+                    focused: Some(true),
+                    ..Default::default()
+                },
+            );
+            input
+        }
+
+        fn observe(
+            ctx: &egui::Context,
+            viewport: egui::ViewportId,
+            events: Vec<egui::Event>,
+            gestures_disabled: bool,
+        ) -> bool {
+            ctx.begin_pass(raw_input(viewport, events));
+            let observed = observe_music_touch_for_panel_handles(ctx, gestures_disabled);
+            let _ = ctx.end_pass();
+            observed
+        }
+
+        let ctx = egui::Context::default();
+        let viewport_a = egui::ViewportId::from_hash_of("music-touch-a");
+        let viewport_b = egui::ViewportId::from_hash_of("music-touch-b");
+        assert!(!observe(&ctx, viewport_a, Vec::new(), false));
+        assert!(observe(
+            &ctx,
+            viewport_a,
+            vec![egui::Event::Touch {
+                device_id: egui::TouchDeviceId(11),
+                id: egui::TouchId(17),
+                phase: egui::TouchPhase::Start,
+                pos: egui::pos2(40.0, 80.0),
+                force: None,
+            }],
+            false,
+        ));
+        assert!(
+            observe(&ctx, viewport_a, Vec::new(), false),
+            "the flag must survive file changes because its key has no fs_idx"
+        );
+        assert!(
+            !observe(&ctx, viewport_a, Vec::new(), true),
+            "MIV_DISABLE_TOUCH_GESTURES policy must hide a sticky handle"
+        );
+        assert!(
+            !observe(&ctx, viewport_b, Vec::new(), false),
+            "a sibling viewport must not inherit the observation"
+        );
+    }
+
+    #[test]
+    fn touch_panel_handles_are_excluded_only_while_their_panels_are_closed() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+        let mut excluded = Vec::new();
+        extend_touch_excluded_with_panel_handles(&mut excluded, viewport, true, false, false);
+        assert_eq!(excluded.len(), 2);
+        let geometry = crate::touch_input::TapZoneGeometry {
+            surface: viewport,
+            excluded,
+            behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                accepts_pinch: true,
+            },
+        };
+        for rect in still_touch_panel_handle_rects(viewport) {
+            assert_eq!(
+                crate::touch_input::classify_tap(&geometry, rect.center()),
+                crate::touch_input::TapZone::Excluded
+            );
+        }
+        assert_eq!(
+            crate::touch_input::classify_tap(&geometry, viewport.center()),
+            crate::touch_input::TapZone::Center
+        );
+
+        let [left, right] = visible_still_touch_panel_handle_rects(viewport, true, true, false);
+        assert!(!left.is_positive(), "an open left panel has no handle");
+        assert!(
+            right.is_positive(),
+            "the closed opposite panel keeps its handle"
+        );
+        let mut excluded = Vec::new();
+        extend_touch_excluded_with_panel_handles(&mut excluded, viewport, true, true, false);
+        assert_eq!(excluded, vec![right]);
+    }
+
+    #[test]
+    fn handle_edge_maps_directly_to_the_same_side_panel_action() {
+        assert_eq!(
+            still_side_panel_action_for_handle_edge(crate::ui_helpers::PanelEdge::Left),
+            StillSidePanelAction::OpenAdjustment
+        );
+        assert_eq!(
+            still_side_panel_action_for_handle_edge(crate::ui_helpers::PanelEdge::Right),
+            StillSidePanelAction::OpenMetadata
+        );
+    }
+
+    #[test]
+    fn touch_panel_handle_action_is_open_only_and_records_touch_ownership() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+
+        app.open_still_side_panel_by_touch(StillSidePanelAction::OpenAdjustment);
+        assert_eq!(
+            app.adjustment_mode,
+            crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
+        );
+        app.open_still_side_panel_by_touch(StillSidePanelAction::OpenAdjustment);
+        assert_eq!(
+            app.adjustment_mode,
+            crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
+        );
+
+        app.open_still_side_panel_by_touch(StillSidePanelAction::OpenMetadata);
+        assert_eq!(
+            app.fs_info_panel_open,
+            crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
+        );
+        assert!(app.metadata_panel_click_shown());
+        app.open_still_side_panel_by_touch(StillSidePanelAction::OpenMetadata);
+        assert_eq!(
+            app.fs_info_panel_open,
+            crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
+        );
+    }
+
+    #[test]
+    fn touch_panel_ownership_blocks_passive_hover() {
+        assert!(still_passive_side_panel_hover_enabled(false, false));
+        assert!(!still_passive_side_panel_hover_enabled(false, true));
+        assert!(!still_passive_side_panel_hover_enabled(true, false));
+    }
+
+    #[test]
+    fn outside_touch_tap_closes_both_touch_owned_panels_and_is_consumed() {
+        use crate::touch_input::TouchCommand;
+        use crate::ui_helpers::MetadataPanelOpenState::{ByPointer, ByTouchHandle, Closed};
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+        app.adjustment_mode = ByTouchHandle;
+        app.fs_info_panel_open = ByTouchHandle;
+
+        for command in [
+            TouchCommand::ToggleChrome,
+            TouchCommand::PageSide { left: true },
+            TouchCommand::PageSide { left: false },
+        ] {
+            assert!(touch_panel_tap_command_dismisses_before_dispatch(
+                command,
+                app.adjustment_mode,
+                app.fs_info_panel_open
+            ));
+        }
+        assert!(app.close_touch_owned_side_panels());
+        assert_eq!(app.adjustment_mode, Closed);
+        assert_eq!(app.fs_info_panel_open, Closed);
+
+        // Pointer ownership retains the established mouse contract: canvas
+        // clicks are dispatched normally and do not dismiss either panel.
+        app.adjustment_mode = ByPointer;
+        app.fs_info_panel_open = ByPointer;
+        assert!(!touch_panel_tap_command_dismisses_before_dispatch(
+            TouchCommand::ToggleChrome,
+            app.adjustment_mode,
+            app.fs_info_panel_open
+        ));
+        assert!(!app.close_touch_owned_side_panels());
+        assert_eq!(app.adjustment_mode, ByPointer);
+        assert_eq!(app.fs_info_panel_open, ByPointer);
+    }
+
+    #[test]
+    fn touch_panel_dismiss_release_clears_suppression_and_next_drags_pan() {
+        fn touch(phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
+            egui::Event::Touch {
+                device_id: egui::TouchDeviceId(31),
+                id: egui::TouchId(37),
+                phase,
+                pos,
+                force: None,
+            }
+        }
+
+        fn primary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }
+        }
+
+        fn run_frame(
+            app: &mut crate::app::AppTestEnvForTest,
+            ctx: &egui::Context,
+            screen: egui::Rect,
+            state: &FsFrameState,
+            events: Vec<egui::Event>,
+            advance_app_frame: bool,
+        ) {
+            if advance_app_frame {
+                app.frame_counter += 1;
+            }
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            let _ = app.handle_fs_wheel_and_click(ui, ctx, screen, state, false, 0);
+                        });
+                },
+            );
+        }
+
+        let mut app = crate::app::setup_app_for_test();
+        app.items.push(GridItem::Image(PathBuf::default()));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+        app.settings.touch_still_chrome_learned = true;
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+        app.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
+        app.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
+        app.fs_zoom = 2.0;
+        let state = FsFrameState {
+            is_video: false,
+            original_preview_active: false,
+            tex: None,
+            thumb_tex: None,
+            location_display: String::new(),
+            image_dims: None,
+            image_file_size: None,
+            image_downscaled: false,
+            is_loading: false,
+            vst3_waiting_for_video: false,
+            fs_load_failed: false,
+            pdf_content_type: None,
+        };
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let tap = screen.center();
+
+        run_frame(&mut app, &ctx, screen, &state, Vec::new(), true);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                touch(egui::TouchPhase::Start, tap),
+                egui::Event::PointerMoved(tap),
+                primary(tap, true),
+            ],
+            true,
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![touch(egui::TouchPhase::End, tap), primary(tap, false)],
+            true,
+        );
+        // The PointerGone tail may be delivered after a same-app-frame replay.
+        // Correlation must replay suppression for this pass, but the primary
+        // release edge itself was consumed by the preceding egui pass.
+        run_frame(&mut app, &ctx, screen, &state, Vec::new(), false);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerGone],
+            true,
+        );
+
+        assert_eq!(
+            app.adjustment_mode,
+            crate::ui_helpers::MetadataPanelOpenState::Closed
+        );
+        assert_eq!(
+            app.fs_info_panel_open,
+            crate::ui_helpers::MetadataPanelOpenState::Closed
+        );
+        assert!(
+            !app.fs_primary_suppression.is_active(),
+            "the replacement tap's release must finish the shared suppression latch"
+        );
+
+        let drag_start = tap;
+        let touch_dragged = tap + egui::vec2(64.0, 24.0);
+        app.fs_primary_suppression.arm_pointer_stream();
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                touch(egui::TouchPhase::Start, drag_start),
+                egui::Event::PointerMoved(drag_start),
+                primary(drag_start, true),
+            ],
+            true,
+        );
+        assert_eq!(
+            app.fs_primary_suppression,
+            FullscreenPrimarySuppression::TouchStream,
+            "raw-touch correlation must correct the provisional pointer owner"
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                touch(egui::TouchPhase::Move, touch_dragged),
+                egui::Event::PointerMoved(touch_dragged),
+            ],
+            true,
+        );
+        assert_ne!(
+            app.fs_pan,
+            egui::Vec2::ZERO,
+            "a touch drag immediately after panel dismissal must reach fullscreen pan"
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                touch(egui::TouchPhase::End, touch_dragged),
+                primary(touch_dragged, false),
+                egui::Event::PointerGone,
+            ],
+            true,
+        );
+        assert_eq!(
+            app.fs_primary_suppression,
+            FullscreenPrimarySuppression::Idle,
+            "the corrected owner must end on touch completion"
+        );
+
+        app.fs_pan = egui::Vec2::ZERO;
+        let mouse_dragged = tap + egui::vec2(-72.0, 32.0);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerMoved(tap), primary(tap, true)],
+            true,
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerMoved(mouse_dragged)],
+            true,
+        );
+        assert_ne!(
+            app.fs_pan,
+            egui::Vec2::ZERO,
+            "the same released latch must not block the next mouse drag either"
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![primary(mouse_dragged, false), egui::Event::PointerGone],
+            true,
+        );
+
+        app.fs_pan = egui::Vec2::ZERO;
+        app.fs_primary_suppression.arm_pointer_stream();
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerMoved(tap), primary(tap, true)],
+            true,
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerMoved(mouse_dragged)],
+            true,
+        );
+        assert_eq!(
+            app.fs_pan,
+            egui::Vec2::ZERO,
+            "a mouse reclaim click must not begin a canvas drag"
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![primary(mouse_dragged, false), egui::Event::PointerGone],
+            true,
+        );
+        assert_eq!(
+            app.fs_primary_suppression,
+            FullscreenPrimarySuppression::Idle,
+            "the mouse owner must end on primary release"
+        );
+    }
+
+    #[test]
+    fn fullscreen_primary_suppression_has_a_terminal_event_for_every_owner() {
+        use FullscreenPrimarySuppressionDecision::{Allow, Preserve, Suppress};
+        use FullscreenPrimarySuppressionEvent::{PointerFrame, PointerStreamStarted, TouchFrame};
+
+        let mut suppression = FullscreenPrimarySuppression::default();
+        assert_eq!(suppression.apply(PointerFrame { released: false }), Allow);
+
+        assert_eq!(suppression.apply(PointerStreamStarted), Suppress);
+        assert_eq!(suppression, FullscreenPrimarySuppression::PointerStream);
+        assert_eq!(
+            suppression.apply(PointerFrame { released: false }),
+            Suppress
+        );
+        assert_eq!(suppression.apply(PointerFrame { released: true }), Suppress);
+        assert_eq!(suppression, FullscreenPrimarySuppression::Idle);
+
+        assert_eq!(
+            suppression.apply(TouchFrame {
+                suppresses_current_frame: true,
+                active: true,
+                completed: false,
+                cancelled: false,
+            }),
+            Suppress
+        );
+        assert_eq!(suppression, FullscreenPrimarySuppression::TouchStream);
+        assert_eq!(
+            suppression.apply(TouchFrame {
+                suppresses_current_frame: true,
+                active: false,
+                completed: true,
+                cancelled: false,
+            }),
+            Suppress
+        );
+        assert_eq!(
+            suppression,
+            FullscreenPrimarySuppression::Idle,
+            "touch completion is authoritative even without a primary release edge"
+        );
+
+        for _ in 0..2 {
+            assert_eq!(
+                suppression.apply(TouchFrame {
+                    suppresses_current_frame: true,
+                    active: false,
+                    completed: true,
+                    cancelled: false,
+                }),
+                Suppress
+            );
+            assert_eq!(
+                suppression,
+                FullscreenPrimarySuppression::Idle,
+                "terminal replacement and its replay suppress only their own frame"
+            );
+        }
+
+        assert_eq!(
+            suppression.apply(TouchFrame {
+                suppresses_current_frame: true,
+                active: true,
+                completed: false,
+                cancelled: false,
+            }),
+            Suppress
+        );
+        assert_eq!(
+            suppression.apply(TouchFrame {
+                suppresses_current_frame: false,
+                active: false,
+                completed: false,
+                cancelled: true,
+            }),
+            Allow
+        );
+        assert_eq!(suppression, FullscreenPrimarySuppression::Idle);
+
+        // A focus-reclaim press is provisionally mouse-owned. Positive touch
+        // correlation corrects that owner and replaces the pointer decision,
+        // allowing canvas gestures for every active frame.
+        assert_eq!(suppression.apply(PointerStreamStarted), Suppress);
+        let pointer = suppression.apply(PointerFrame { released: false });
+        let touch = suppression.apply(TouchFrame {
+            suppresses_current_frame: false,
+            active: true,
+            completed: false,
+            cancelled: false,
+        });
+        assert_eq!(pointer.overridden_by(touch), Allow);
+        assert_eq!(suppression, FullscreenPrimarySuppression::TouchStream);
+
+        let pointer = suppression.apply(PointerFrame { released: false });
+        let touch = suppression.apply(TouchFrame {
+            suppresses_current_frame: false,
+            active: true,
+            completed: false,
+            cancelled: false,
+        });
+        assert_eq!(pointer.overridden_by(touch), Allow);
+        assert_eq!(
+            suppression.apply(TouchFrame {
+                suppresses_current_frame: false,
+                active: false,
+                completed: true,
+                cancelled: false,
+            }),
+            Allow
+        );
+        assert_eq!(suppression, FullscreenPrimarySuppression::Idle);
+
+        // Correlated replacement/control input remains suppressed, and its
+        // touch completion clears the corrected owner without a pointer edge.
+        assert_eq!(suppression.apply(PointerStreamStarted), Suppress);
+        assert_eq!(
+            suppression.apply(TouchFrame {
+                suppresses_current_frame: true,
+                active: true,
+                completed: false,
+                cancelled: false,
+            }),
+            Suppress
+        );
+        assert_eq!(suppression, FullscreenPrimarySuppression::TouchStream);
+        assert_eq!(
+            suppression.apply(TouchFrame {
+                suppresses_current_frame: true,
+                active: false,
+                completed: true,
+                cancelled: false,
+            }),
+            Suppress
+        );
+        assert_eq!(suppression, FullscreenPrimarySuppression::Idle);
+
+        // With no touch evidence, the touch query cannot weaken the existing
+        // mouse reclaim contract. The release frame is still consumed.
+        assert_eq!(suppression.apply(PointerStreamStarted), Suppress);
+        let pointer = suppression.apply(PointerFrame { released: false });
+        let touch = suppression.apply(TouchFrame {
+            suppresses_current_frame: false,
+            active: false,
+            completed: false,
+            cancelled: false,
+        });
+        assert_eq!(touch, Preserve);
+        assert_eq!(pointer.overridden_by(touch), Suppress);
+        assert_eq!(suppression.apply(PointerFrame { released: true }), Suppress);
+        assert_eq!(suppression, FullscreenPrimarySuppression::Idle);
+    }
+
+    #[test]
+    fn foreground_reclaim_overlay_control_synthetic_response_remains_suppressed() {
+        fn touch(phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
+            egui::Event::Touch {
+                device_id: egui::TouchDeviceId(53),
+                id: egui::TouchId(59),
+                phase,
+                pos,
+                force: None,
+            }
+        }
+
+        fn primary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let control = egui::Rect::from_center_size(screen.center(), egui::vec2(80.0, 48.0));
+        let pos = control.center();
+        let control_id = egui::Id::new("foreground_reclaim_control_probe");
+
+        // Prime egui's previous-pass hit test for the synthetic primary click.
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let _ = ui.interact(control, control_id, egui::Sense::click());
+                    });
+            },
+        );
+
+        let mut suppression = FullscreenPrimarySuppression::PointerStream;
+        let mut probe = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    touch(egui::TouchPhase::Start, pos),
+                    egui::Event::PointerMoved(pos),
+                    primary(pos, true),
+                    touch(egui::TouchPhase::End, pos),
+                    primary(pos, false),
+                    egui::Event::PointerGone,
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let touch_frame = crate::touch_correlation::drive_egui_touch_input(
+                            ctx,
+                            crate::touch_correlation::TouchSurface::StillFullscreen,
+                            crate::touch_input::TapZoneGeometry {
+                                surface: screen,
+                                excluded: Vec::new(),
+                                behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                                    accepts_pinch: true,
+                                },
+                            },
+                            1,
+                            true,
+                        );
+                        let response = ui.interact(control, control_id, egui::Sense::click());
+                        let correlated = touch_frame.should_suppress_response(&response);
+                        let pointer =
+                            suppression.apply(FullscreenPrimarySuppressionEvent::PointerFrame {
+                                released: true,
+                            });
+                        let touch =
+                            suppression.apply(FullscreenPrimarySuppressionEvent::TouchFrame {
+                                suppresses_current_frame: correlated,
+                                active: touch_frame.is_active(),
+                                completed: !touch_frame.is_active()
+                                    && touch_frame.has_touch_derived_pointer_activity(),
+                                cancelled: touch_frame.touch_cancelled(),
+                            });
+                        probe =
+                            Some((response.clicked(), correlated, pointer.overridden_by(touch)));
+                    });
+            },
+        );
+
+        let (synthetic_clicked, correlated, decision) = probe.unwrap();
+        assert!(
+            synthetic_clicked,
+            "the probe must demonstrate the synthetic response that needs gating"
+        );
+        assert!(correlated);
+        assert!(decision.suppresses_current_frame());
+        assert_eq!(suppression, FullscreenPrimarySuppression::Idle);
+    }
+
+    #[test]
+    fn persistent_touch_handle_completes_click_when_release_frame_has_pointer_gone() {
+        fn run_frame(
+            ctx: &egui::Context,
+            screen: egui::Rect,
+            handle: egui::Rect,
+            events: Vec<egui::Event>,
+        ) -> bool {
+            let mut clicked = false;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            let response = interact_touch_panel_handle(
+                                ui,
+                                handle,
+                                egui::Id::new((
+                                    "fs_touch_panel_handle",
+                                    crate::ui_helpers::PanelEdge::Left,
+                                )),
+                            );
+                            paint_panel_callout_chrome(
+                                ui,
+                                handle,
+                                crate::ui_helpers::PanelEdge::Left,
+                                false,
+                                response.hovered(),
+                            );
+                            clicked = response.clicked();
+                        });
+                },
+            );
+            clicked
+        }
+
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let handle = still_touch_panel_handle_rect(screen, crate::ui_helpers::PanelEdge::Left);
+        let pos = handle.center();
+        assert!(!run_frame(&ctx, screen, handle, Vec::new()));
+        assert!(!run_frame(
+            &ctx,
+            screen,
+            handle,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        ));
+        assert!(run_frame(
+            &ctx,
+            screen,
+            handle,
+            vec![
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerGone,
+            ],
+        ));
+    }
+
+    #[test]
+    fn viewer_pointer_passthrough_keeps_the_egui_canvas_drag_stream() {
+        #[derive(Clone, Copy, Debug, Default)]
+        struct DragProbe {
+            owner: crate::touch_input::TouchOwner,
+            started: bool,
+            dragged: bool,
+            stopped: bool,
+            delta: egui::Vec2,
+            proposed_pan: Option<egui::Vec2>,
+        }
+
+        fn touch(phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
+            egui::Event::Touch {
+                device_id: egui::TouchDeviceId(17),
+                id: egui::TouchId(23),
+                phase,
+                pos,
+                force: None,
+            }
+        }
+
+        fn primary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }
+        }
+
+        fn run_frame(
+            ctx: &egui::Context,
+            screen: egui::Rect,
+            frame: u64,
+            events: Vec<egui::Event>,
+        ) -> DragProbe {
+            let mut probe = DragProbe::default();
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            let touch_frame = crate::touch_correlation::drive_egui_touch_input(
+                                ctx,
+                                crate::touch_correlation::TouchSurface::StillFullscreen,
+                                crate::touch_input::TapZoneGeometry {
+                                    surface: screen,
+                                    excluded: Vec::new(),
+                                    behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                                        accepts_pinch: true,
+                                    },
+                                },
+                                frame,
+                                true,
+                            );
+                            let response = ui.interact(
+                                screen,
+                                egui::Id::new("touch_pan_canvas_probe"),
+                                egui::Sense::click_and_drag(),
+                            );
+                            probe = DragProbe {
+                                owner: touch_frame.owner(),
+                                started: response.drag_started_by(egui::PointerButton::Primary),
+                                dragged: response.dragged_by(egui::PointerButton::Primary),
+                                stopped: response.drag_stopped_by(egui::PointerButton::Primary),
+                                delta: response.drag_delta(),
+                                proposed_pan: fullscreen_drag_pan_proposal(
+                                    &response,
+                                    egui::vec2(11.0, 7.0),
+                                ),
+                            };
+                        });
+                },
+            );
+            probe
+        }
+
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let start = egui::pos2(300.0, 300.0);
+        let moved = start + egui::vec2(64.0, 24.0);
+
+        // Register the canvas before the input frame, matching egui's
+        // previous-pass hit-test ownership.
+        let _ = run_frame(&ctx, screen, 1, Vec::new());
+        let pressed = run_frame(
+            &ctx,
+            screen,
+            2,
+            vec![
+                touch(egui::TouchPhase::Start, start),
+                egui::Event::PointerMoved(start),
+                primary(start, true),
+            ],
+        );
+        assert_eq!(pressed.owner, crate::touch_input::TouchOwner::Undecided);
+        assert!(!pressed.started);
+
+        let moved_probe = run_frame(
+            &ctx,
+            screen,
+            3,
+            vec![
+                touch(egui::TouchPhase::Move, moved),
+                egui::Event::PointerMoved(moved),
+            ],
+        );
+        assert_eq!(
+            moved_probe.owner,
+            crate::touch_input::TouchOwner::ViewerPointerPassthrough
+        );
+        assert!(moved_probe.started);
+        assert!(moved_probe.dragged);
+        assert_eq!(moved_probe.delta, moved - start);
+        assert_eq!(
+            moved_probe.proposed_pan,
+            Some(egui::vec2(11.0, 7.0) + (moved - start)),
+            "the first promoted drag frame must pan even if touch move events were coalesced"
+        );
+
+        let moved_again = start + egui::vec2(96.0, 40.0);
+        let continued = run_frame(
+            &ctx,
+            screen,
+            4,
+            vec![
+                touch(egui::TouchPhase::Move, moved_again),
+                egui::Event::PointerMoved(moved_again),
+            ],
+        );
+        assert!(!continued.started);
+        assert!(continued.dragged);
+        assert_eq!(
+            continued.proposed_pan,
+            Some(egui::vec2(11.0, 7.0) + (moved_again - start)),
+            "continued drag remains relative to the real press position"
+        );
+
+        let released = run_frame(
+            &ctx,
+            screen,
+            5,
+            vec![
+                touch(egui::TouchPhase::End, moved_again),
+                primary(moved_again, false),
+                egui::Event::PointerGone,
+            ],
+        );
+        assert_eq!(
+            released.owner,
+            crate::touch_input::TouchOwner::ViewerPointerPassthrough
+        );
+        assert!(released.stopped);
+    }
+
+    #[test]
     fn hidden_side_panel_chrome_does_not_claim_panel_or_callout_rects() {
         let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
         let right_panel = egui::pos2(1800.0, 300.0);
@@ -29018,6 +32875,42 @@ mod tests {
             false,
             None,
         ));
+    }
+
+    #[test]
+    fn side_panel_rect_producer_is_the_mouse_hit_test_source() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(1200.0, 800.0));
+        let mode = crate::settings::FsSidePanelMode::ClickToShow;
+        let rects = fullscreen_side_panel_rects(viewport, true, mode, true, true);
+        assert_eq!(rects.left, Some(adjustment_panel_rect(viewport)));
+        assert_eq!(rects.right, Some(metadata_panel_rect(viewport)));
+        for rect in rects.iter() {
+            assert!(fullscreen_side_panel_contains_pointer(
+                viewport,
+                rect.center(),
+                true,
+                mode,
+                true,
+                true,
+                None,
+            ));
+        }
+
+        let hidden = fullscreen_side_panel_rects(viewport, true, mode, false, false);
+        assert_eq!(
+            hidden.left,
+            Some(panel_callout_edge_rect(
+                viewport,
+                crate::ui_helpers::PanelEdge::Left,
+            ))
+        );
+        assert_eq!(
+            hidden.right,
+            Some(panel_callout_edge_rect(
+                viewport,
+                crate::ui_helpers::PanelEdge::Right,
+            ))
+        );
     }
 
     #[test]
@@ -29087,6 +32980,7 @@ mod tests {
             slideshow_popup_open: false,
             rotation_popup_open: false,
             view_trim_mode: false,
+            touch_chrome_latched: false,
         };
         assert!(!still_top_bar_visible_from_inputs(hidden));
         assert!(still_top_bar_visible_from_inputs(
@@ -29107,6 +33001,386 @@ mod tests {
                 ..hidden
             }
         ));
+        assert!(still_top_bar_visible_from_inputs(
+            StillTopBarVisibilityInputs {
+                touch_chrome_latched: true,
+                ..hidden
+            }
+        ));
+    }
+
+    #[test]
+    fn still_seek_bar_touch_latch_uses_the_existing_visibility_gates() {
+        let hidden = StillSeekBarVisibilityInputs {
+            allowed: true,
+            locked: false,
+            bottom_hover: false,
+            drag_active: false,
+            side_panel_visible: false,
+            touch_chrome_latched: false,
+            wide_enough: true,
+            content_available: true,
+        };
+        assert!(!still_seek_bar_visible_from_inputs(hidden));
+        assert!(still_seek_bar_visible_from_inputs(
+            StillSeekBarVisibilityInputs {
+                touch_chrome_latched: true,
+                ..hidden
+            }
+        ));
+        for blocked in [
+            StillSeekBarVisibilityInputs {
+                allowed: false,
+                touch_chrome_latched: true,
+                ..hidden
+            },
+            StillSeekBarVisibilityInputs {
+                wide_enough: false,
+                touch_chrome_latched: true,
+                ..hidden
+            },
+            StillSeekBarVisibilityInputs {
+                content_available: false,
+                touch_chrome_latched: true,
+                ..hidden
+            },
+        ] {
+            assert!(!still_seek_bar_visible_from_inputs(blocked));
+        }
+    }
+
+    #[test]
+    fn first_run_touch_help_requires_unlearned_enabled_touch_activity() {
+        let visible = StillTouchFirstRunHelpEligibility {
+            learned: false,
+            touch_activity: true,
+            gestures_disabled: false,
+            touch_input_enabled: true,
+        };
+        assert!(should_start_still_touch_first_run_help(visible));
+
+        let settings = crate::settings::Settings {
+            touch_video_chrome_learned: true,
+            ..Default::default()
+        };
+        assert!(!settings.touch_still_chrome_learned);
+        assert!(should_start_still_touch_first_run_help(
+            StillTouchFirstRunHelpEligibility {
+                learned: settings.touch_still_chrome_learned,
+                ..visible
+            }
+        ));
+
+        for hidden in [
+            StillTouchFirstRunHelpEligibility {
+                learned: true,
+                ..visible
+            },
+            StillTouchFirstRunHelpEligibility {
+                touch_activity: false,
+                ..visible
+            },
+            StillTouchFirstRunHelpEligibility {
+                gestures_disabled: true,
+                ..visible
+            },
+            StillTouchFirstRunHelpEligibility {
+                touch_input_enabled: false,
+                ..visible
+            },
+        ] {
+            assert!(!should_start_still_touch_first_run_help(hidden));
+        }
+
+        // Reopening creates a new viewport/session scope, but the one
+        // persistent learned bit still suppresses the guide.
+        assert!(!should_start_still_touch_first_run_help(
+            StillTouchFirstRunHelpEligibility {
+                learned: true,
+                ..visible
+            }
+        ));
+    }
+
+    #[test]
+    fn first_run_touch_help_state_round_trips_without_nested_context_locking() {
+        let ctx = egui::Context::default();
+        let scope = StillTouchChromeLatch {
+            fs_idx: 7,
+            session_started_at: None,
+        };
+
+        set_still_touch_first_run_help_phase(&ctx, scope, StillTouchFirstRunHelpPhase::Ready);
+        assert_eq!(
+            still_touch_first_run_help_phase(&ctx, scope),
+            Some(StillTouchFirstRunHelpPhase::Ready)
+        );
+        clear_still_touch_first_run_help(&ctx);
+        assert_eq!(still_touch_first_run_help_phase(&ctx, scope), None);
+    }
+
+    #[test]
+    fn still_touch_input_availability_covers_all_suppressed_modes() {
+        let enabled = StillTouchInputEnabledInputs {
+            has_fullscreen_item: true,
+            ..Default::default()
+        };
+        assert!(still_touch_input_enabled(enabled));
+        for disabled in [
+            StillTouchInputEnabledInputs {
+                is_video: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                is_music_view: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                has_fullscreen_item: false,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                dialog_open: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                wants_keyboard_input: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                ime_input_active: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                context_menu_open: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                spread_popup_open: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                fit_popup_open: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                slideshow_popup_open: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                rotation_popup_open: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                compare_wipe_active: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                panorama_active: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                analysis_active: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                overlay_edit_active: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                view_trim_active: true,
+                ..enabled
+            },
+            StillTouchInputEnabledInputs {
+                zoom_active: true,
+                ..enabled
+            },
+        ] {
+            assert!(!still_touch_input_enabled(disabled));
+        }
+    }
+
+    #[test]
+    fn first_run_help_tap_always_learns_and_never_selects_page_navigation() {
+        use crate::touch_input::TouchCommand;
+
+        for tap in [
+            TouchCommand::ToggleChrome,
+            TouchCommand::PageSide { left: true },
+            TouchCommand::PageSide { left: false },
+        ] {
+            assert_eq!(
+                still_touch_first_run_help_tap_action(StillTouchFirstRunHelpPhase::Ready, tap,),
+                StillTouchFirstRunHelpTapAction::LearnAndShowChrome
+            );
+            assert_eq!(
+                still_touch_first_run_help_tap_action(
+                    StillTouchFirstRunHelpPhase::AwaitingInitialRelease,
+                    tap,
+                ),
+                StillTouchFirstRunHelpTapAction::Ignore
+            );
+        }
+        assert_eq!(
+            still_touch_first_run_help_tap_action(
+                StillTouchFirstRunHelpPhase::Ready,
+                TouchCommand::Pan {
+                    delta: egui::vec2(20.0, 0.0),
+                },
+            ),
+            StillTouchFirstRunHelpTapAction::Ignore
+        );
+    }
+
+    #[test]
+    fn foreground_reclaim_touch_allows_only_chrome_activation() {
+        use crate::touch_input::TouchCommand;
+
+        assert_eq!(
+            still_touch_foreground_reclaim_action(None, false, &[TouchCommand::ToggleChrome],),
+            StillTouchForegroundReclaimAction::ToggleChrome
+        );
+        for blocked in [
+            TouchCommand::PageSide { left: true },
+            TouchCommand::PageSide { left: false },
+            TouchCommand::Pan {
+                delta: egui::vec2(8.0, 0.0),
+            },
+            TouchCommand::PinchEnd,
+        ] {
+            assert_eq!(
+                still_touch_foreground_reclaim_action(None, false, &[blocked]),
+                StillTouchForegroundReclaimAction::None
+            );
+        }
+
+        // The modal first-run guide already treats either physical side as a
+        // learn-and-show-chrome tap. It still cannot become page navigation.
+        for tap in [
+            TouchCommand::ToggleChrome,
+            TouchCommand::PageSide { left: true },
+            TouchCommand::PageSide { left: false },
+        ] {
+            assert_eq!(
+                still_touch_foreground_reclaim_action(
+                    Some(StillTouchFirstRunHelpPhase::Ready),
+                    false,
+                    &[tap],
+                ),
+                StillTouchForegroundReclaimAction::LearnAndShowChrome
+            );
+        }
+        assert_eq!(
+            still_touch_foreground_reclaim_action(
+                Some(StillTouchFirstRunHelpPhase::AwaitingInitialRelease),
+                true,
+                &[],
+            ),
+            StillTouchForegroundReclaimAction::None
+        );
+        assert_eq!(
+            still_touch_foreground_reclaim_action(
+                Some(StillTouchFirstRunHelpPhase::AwaitingInitialRelease),
+                false,
+                &[],
+            ),
+            StillTouchForegroundReclaimAction::SetHelpReady
+        );
+    }
+
+    #[test]
+    fn first_run_help_overlay_uses_the_classifier_center_rectangle() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(1200.0, 800.0));
+        let layout = still_touch_first_run_help_layout(viewport);
+        let expected = crate::touch_input::center_tap_rect(viewport);
+        assert_eq!(layout.center_tap_rect, expected);
+
+        let geometry = crate::touch_input::TapZoneGeometry {
+            surface: viewport,
+            excluded: Vec::new(),
+            behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                accepts_pinch: true,
+            },
+        };
+        for point in [
+            expected.left_top(),
+            expected.right_top(),
+            expected.left_bottom(),
+            expected.right_bottom(),
+            expected.center(),
+        ] {
+            assert_eq!(
+                crate::touch_input::classify_tap(&geometry, point),
+                crate::touch_input::TapZone::Center
+            );
+        }
+    }
+
+    #[test]
+    fn first_run_touch_help_page_labels_are_direction_independent() {
+        assert_eq!(
+            still_touch_page_labels(),
+            StillTouchPageLabels {
+                left: "左のページへ",
+                right: "右のページへ",
+            }
+        );
+    }
+
+    #[test]
+    fn still_touch_help_side_labels_stay_clear_of_the_centre_rectangle() {
+        for width in [480.0_f32, 800.0, 1200.0, 3840.0] {
+            let viewport =
+                egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(width, 800.0));
+            let layout = still_touch_first_run_help_layout(viewport);
+
+            assert!(
+                layout.left_label_x < layout.center_tap_rect.min.x,
+                "left label at {} runs into the centre rect starting at {} (width {width})",
+                layout.left_label_x,
+                layout.center_tap_rect.min.x,
+            );
+            assert!(
+                layout.right_label_x > layout.center_tap_rect.max.x,
+                "right label at {} runs into the centre rect ending at {} (width {width})",
+                layout.right_label_x,
+                layout.center_tap_rect.max.x,
+            );
+            let left_room = layout.left_label_x - viewport.min.x;
+            let right_room = viewport.max.x - layout.right_label_x;
+            assert!(
+                (left_room - (layout.center_tap_rect.min.x - layout.left_label_x)).abs() < 0.01,
+                "left label is not centred in its strip (width {width})",
+            );
+            assert!(
+                (right_room - (layout.right_label_x - layout.center_tap_rect.max.x)).abs() < 0.01,
+                "right label is not centred in its strip (width {width})",
+            );
+        }
+    }
+
+    #[test]
+    fn first_run_help_scaling_hint_is_only_for_one_hundred_percent() {
+        assert!(still_touch_first_run_help_shows_scaling_hint(1.0));
+        for scale in [0.9, 1.1, 1.5, 2.0] {
+            assert!(!still_touch_first_run_help_shows_scaling_hint(scale));
+        }
+    }
+
+    #[test]
+    fn touch_chrome_latch_is_page_and_fullscreen_session_scoped() {
+        let ctx = egui::Context::default();
+        let session = std::time::Instant::now();
+        toggle_still_touch_chrome_latch(&ctx, 7, Some(session));
+        assert!(still_touch_chrome_latched(&ctx, 7, Some(session)));
+        assert!(!still_touch_chrome_latched(&ctx, 8, Some(session)));
+
+        let reopened = session + std::time::Duration::from_millis(1);
+        assert!(!still_touch_chrome_latched(&ctx, 7, Some(reopened)));
+        toggle_still_touch_chrome_latch(&ctx, 7, Some(reopened));
+        assert!(still_touch_chrome_latched(&ctx, 7, Some(reopened)));
+        toggle_still_touch_chrome_latch(&ctx, 7, Some(reopened));
+        assert!(!still_touch_chrome_latched(&ctx, 7, Some(reopened)));
     }
 
     #[test]
@@ -29188,18 +33462,22 @@ mod tests {
     fn focused_bookmark_title_owns_hover_panel_lifetime() {
         let mode = crate::settings::FsSidePanelMode::Hover;
         assert!(adjustment_panel_should_auto_close(
-            mode, true, false, false, false,
+            mode, true, false, false, false, false,
         ));
         assert!(
-            !adjustment_panel_should_auto_close(mode, true, false, false, true),
+            !adjustment_panel_should_auto_close(mode, true, false, false, true, false),
             "a focused bookmark title must keep its containing hover panel registered"
         );
         assert!(!adjustment_panel_should_auto_close(
-            mode, true, false, true, false,
+            mode, true, false, true, false, false,
+        ));
+        assert!(!adjustment_panel_should_auto_close(
+            mode, true, false, false, false, true,
         ));
         assert!(!adjustment_panel_should_auto_close(
             crate::settings::FsSidePanelMode::ClickToShow,
             true,
+            false,
             false,
             false,
             false,
@@ -29802,6 +34080,52 @@ mod tests {
                 .map(SpreadDisplayUnit::anchor_idx)
                 .collect::<Vec<_>>(),
             vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn spread_units_keep_leading_landscape_single_and_pair_following_pages() {
+        let nav = (0..11).collect::<Vec<_>>();
+        let units =
+            build_spread_display_units_with_landscape(&nav, SpreadMode::Rtl, None, |idx| idx == 0);
+
+        assert_eq!(
+            units
+                .iter()
+                .map(|unit| {
+                    unit.screen_pages(SpreadMode::Rtl)
+                        .into_iter()
+                        .map(|idx| idx + 1)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                vec![1],
+                vec![3, 2],
+                vec![5, 4],
+                vec![7, 6],
+                vec![9, 8],
+                vec![11, 10]
+            ]
+        );
+    }
+
+    #[test]
+    fn spread_units_regression_shape_when_leading_landscape_falls_back_to_portrait() {
+        let nav = (0..11).collect::<Vec<_>>();
+        let units =
+            build_spread_display_units_with_landscape(&nav, SpreadMode::Rtl, None, |_| false);
+
+        assert_eq!(
+            spread_unit_summary_1based(&units),
+            vec![
+                vec![1, 2],
+                vec![3, 4],
+                vec![5, 6],
+                vec![7, 8],
+                vec![9, 10],
+                vec![11]
+            ]
         );
     }
 
@@ -30608,12 +34932,16 @@ mod tests {
     fn fullscreen_click_nav_delta_ltr_right_is_next() {
         assert_eq!(fullscreen_click_nav_base_delta(60.0, 50.0, false), 1);
         assert_eq!(fullscreen_click_nav_base_delta(40.0, 50.0, false), -1);
+        assert_eq!(fullscreen_click_nav_delta_for_side(false, false), 1);
+        assert_eq!(fullscreen_click_nav_delta_for_side(true, false), -1);
     }
 
     #[test]
     fn fullscreen_click_nav_delta_rtl_left_is_next() {
         assert_eq!(fullscreen_click_nav_base_delta(40.0, 50.0, true), 1);
         assert_eq!(fullscreen_click_nav_base_delta(60.0, 50.0, true), -1);
+        assert_eq!(fullscreen_click_nav_delta_for_side(true, true), 1);
+        assert_eq!(fullscreen_click_nav_delta_for_side(false, true), -1);
     }
 
     #[test]
@@ -30678,7 +35006,7 @@ mod tests {
     #[test]
     fn locked_bar_separators_stay_inside_both_bars() {
         let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
-        let top_bar = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), TOP_BAR_HEIGHT));
+        let top_bar = fullscreen_top_bar_rect(full);
         let seek_panel = fullscreen_seek_panel_rect(full);
         let media = fullscreen_rect_excluding_fixed_bars(full, true, true, 0);
         const HALF_STROKE: f32 = 0.5;
@@ -30735,9 +35063,47 @@ mod tests {
         assert!((fitted.center().x - full.center().x).abs() < 0.5); // 中央寄せ
         // 同一 fraction でも基準が違えば線の x がズレる。
         let f = 0.25_f32;
-        let x_fitted = fitted.left() + fitted.width() * f;
-        let x_full = full.left() + full.width() * f;
+        let x_fitted = compare_wipe_screen_x(fitted, f);
+        let x_full = compare_wipe_screen_x(full, f);
         assert!((x_fitted - x_full).abs() > 100.0);
+    }
+
+    #[test]
+    fn compare_wipe_fraction_and_screen_x_round_trip_for_fit_zoom_and_letterbox() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(1000.0, 800.0));
+        let fit = App::compare_image_draw_rect(
+            viewport,
+            [1000, 800],
+            None,
+            FullscreenFitScaleLimits::default(),
+        )
+        .unwrap();
+        let zoomed = App::compare_image_draw_rect(
+            viewport,
+            [1000, 800],
+            Some((2.0, egui::vec2(73.0, -41.0))),
+            FullscreenFitScaleLimits::default(),
+        )
+        .unwrap();
+        let letterboxed = App::compare_image_draw_rect(
+            viewport,
+            [400, 800],
+            None,
+            FullscreenFitScaleLimits::default(),
+        )
+        .unwrap();
+
+        let fraction = 0.37;
+        for draw_rect in [fit, zoomed, letterboxed] {
+            let line_x = compare_wipe_screen_x(draw_rect, fraction);
+            let grabbed_fraction = compare_wipe_fraction_from_screen_x(draw_rect, line_x);
+            assert!((grabbed_fraction - fraction).abs() < 1.0e-6);
+            assert!(compare_wipe_grab_hit(
+                draw_rect,
+                egui::pos2(line_x, draw_rect.center().y),
+                fraction,
+            ));
+        }
     }
 
     #[test]

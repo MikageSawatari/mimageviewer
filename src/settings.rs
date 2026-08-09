@@ -3782,6 +3782,15 @@ pub struct Settings {
     /// 静止画フルスクリーン上部 HUD を常時表示し、画像領域から除外する。
     #[serde(default)]
     pub fullscreen_top_bar_locked: bool,
+    /// Whether touch has successfully revealed still-viewer chrome once.
+    /// This is an internal first-run-help marker, not a user-facing setting.
+    #[serde(default)]
+    pub touch_still_chrome_learned: bool,
+    /// Whether touch has successfully revealed native-video chrome once.
+    /// This is independent from the still-viewer marker because the taught
+    /// side-zone actions differ between the two surfaces.
+    #[serde(default)]
+    pub touch_video_chrome_learned: bool,
     /// 固定表示した上部 / 下部バーと画像領域の間隔 (画面 px)。
     ///
     /// 上下を共通にするのは、同じフルスクリーンクロームの余白を揃えつつ、用途の薄い
@@ -5291,6 +5300,8 @@ impl Default for Settings {
             fullscreen_navigator_size: FULLSCREEN_NAVIGATOR_SIZE_DEFAULT,
             fullscreen_seek_bar_locked: false,
             fullscreen_top_bar_locked: false,
+            touch_still_chrome_learned: false,
+            touch_video_chrome_learned: false,
             fullscreen_fixed_bar_gap_px: 0,
             fullscreen_seek_direction: FullscreenSeekDirection::default(),
             fullscreen_horizontal_cursor_direction: FullscreenHorizontalCursorDirection::default(),

@@ -43,6 +43,7 @@ pub mod gpu_renderer;
 pub(crate) mod native_cursor;
 #[cfg(windows)]
 pub mod native_presenter;
+pub(crate) mod native_touch;
 #[cfg(windows)]
 pub mod native_window;
 #[cfg(windows)]
@@ -427,6 +428,10 @@ pub enum NativeVideoOutputEvent {
     Seek {
         target_secs: f64,
     },
+    SeekRelative {
+        delta_secs: f64,
+    },
+    TouchChromeLearned,
     TileSeek {
         target_secs: f64,
     },
@@ -446,6 +451,8 @@ pub enum NativeVideoOutputEvent {
     TogglePerfOverlay,
     ToggleSidePanelMode,
     ToggleClickInfoOpen,
+    OpenTouchInfoPanel,
+    DismissTouchSidePanels,
     ToggleVst3Gui,
     /// 動画 HUD の「音声モード」ボタン (Inc 7、動画→音声モード)。App が `enter_video_audio_mode`
     /// を呼ぶ (映像を切って音楽ビューへ、音声無中断)。
@@ -759,7 +766,7 @@ enum NativeVideoOutputCommand {
     },
     SetSidePanelState {
         mode: crate::settings::FsSidePanelMode,
-        click_info_open: bool,
+        info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
     },
     ResetSidePanelSession,
     SetLoopEnabled {
@@ -1578,12 +1585,16 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::SetMetadata { metadata });
     }
 
-    fn set_side_panel_state(&self, mode: crate::settings::FsSidePanelMode, click_info_open: bool) {
+    fn set_side_panel_state(
+        &self,
+        mode: crate::settings::FsSidePanelMode,
+        info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
+    ) {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetSidePanelState {
                 mode,
-                click_info_open,
+                info_panel_open,
             });
     }
 
@@ -2628,6 +2639,8 @@ fn send_native_overlay_command(
     use crate::video::native_presenter::NativeOverlayCommand as Command;
     let event = match command {
         Command::Seek { target_secs } => NativeVideoOutputEvent::Seek { target_secs },
+        Command::SeekRelative { delta_secs } => NativeVideoOutputEvent::SeekRelative { delta_secs },
+        Command::TouchChromeLearned => NativeVideoOutputEvent::TouchChromeLearned,
         Command::TileSeek { target_secs } => NativeVideoOutputEvent::TileSeek { target_secs },
         Command::NavigateItem { delta, via_wheel } => {
             NativeVideoOutputEvent::NavigateItem { delta, via_wheel }
@@ -2641,6 +2654,8 @@ fn send_native_overlay_command(
         Command::TogglePerfOverlay => NativeVideoOutputEvent::TogglePerfOverlay,
         Command::ToggleSidePanelMode => NativeVideoOutputEvent::ToggleSidePanelMode,
         Command::ToggleClickInfoOpen => NativeVideoOutputEvent::ToggleClickInfoOpen,
+        Command::OpenTouchInfoPanel => NativeVideoOutputEvent::OpenTouchInfoPanel,
+        Command::DismissTouchSidePanels => NativeVideoOutputEvent::DismissTouchSidePanels,
         Command::ToggleVst3Gui => NativeVideoOutputEvent::ToggleVst3Gui,
         Command::ToggleAudioMode => NativeVideoOutputEvent::ToggleAudioMode,
         Command::CloseFullscreen => NativeVideoOutputEvent::CloseFullscreen { generation },
@@ -3389,9 +3404,9 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::SetSidePanelState {
                     mode,
-                    click_info_open,
+                    info_panel_open,
                 } => {
-                    presenter.set_overlay_side_panel_state(mode, click_info_open);
+                    presenter.set_overlay_side_panel_state(mode, info_panel_open);
                 }
                 NativeVideoOutputCommand::ResetSidePanelSession => {
                     presenter.reset_overlay_side_panel_session();
@@ -3640,7 +3655,7 @@ fn run_native_video_output(
                     presenter.set_overlay_metadata(None);
                     presenter.set_overlay_timeline_markers(Vec::new());
                     presenter.set_overlay_jump_entries(Vec::new());
-                    presenter.reset_overlay_side_panel_session();
+                    presenter.reset_overlay_source_session();
                     // 前ソースの perf 履歴 (interval_ms / source_delta_ms / av_offset_ms)
                     // が残ったまま新ソースの最初のサンプルが入ると、median ベースの Y 軸が
                     // 古い fps を引きずって新サンプル蓄積後にガクッと切り替わる。新動画は
@@ -4065,6 +4080,22 @@ fn run_native_video_output(
                                     NativeVideoOutputEvent::Seek { target_secs },
                                 );
                             }
+                            crate::video::native_presenter::NativeOverlayCommand::SeekRelative {
+                                delta_secs,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SeekRelative { delta_secs },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::TouchChromeLearned => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::TouchChromeLearned,
+                                );
+                            }
                             crate::video::native_presenter::NativeOverlayCommand::TileSeek {
                                 target_secs,
                             } => {
@@ -4136,6 +4167,20 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::ToggleClickInfoOpen,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::OpenTouchInfoPanel => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::OpenTouchInfoPanel,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::DismissTouchSidePanels => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::DismissTouchSidePanels,
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleVst3Gui => {
@@ -7140,13 +7185,13 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
-    pub fn set_native_side_panel_state(
+    pub(crate) fn set_native_side_panel_state(
         &self,
         mode: crate::settings::FsSidePanelMode,
-        click_info_open: bool,
+        info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
     ) {
         if let Some(output) = self.native_output.as_ref() {
-            output.set_side_panel_state(mode, click_info_open);
+            output.set_side_panel_state(mode, info_panel_open);
         }
     }
 

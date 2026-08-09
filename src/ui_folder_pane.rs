@@ -25,6 +25,32 @@ pub(crate) fn folder_pane_hover_blocks_grid_scroll(
             .is_some_and(|(rect, pos)| rect.contains(pos))
 }
 
+fn folder_pane_trailing_width(ui: &egui::Ui, has_trailing_widget: bool) -> f32 {
+    if has_trailing_widget {
+        ui.spacing().item_spacing.x + ui.spacing().interact_size.y
+    } else {
+        0.0
+    }
+}
+
+fn show_bounded_folder_pane_body<R>(
+    ui: &mut egui::Ui,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    // SidePanel stores its content rect as the next frame's width. Allocate the remaining body
+    // exactly once in the parent Ui so a child ScrollArea can never grow that persisted rect from
+    // content width, even if a future row widget accidentally asks for too much horizontal space.
+    let body_size = ui.available_size();
+    let (body_rect, _) = ui.allocate_exact_size(body_size, egui::Sense::hover());
+    let mut body_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(body_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    body_ui.set_clip_rect(body_rect.intersect(ui.clip_rect()));
+    add_contents(&mut body_ui)
+}
+
 impl App {
     pub(crate) fn set_folder_tree_pane_visible(&mut self, visible: bool) {
         self.settings.folder_tree_pane_visible = visible;
@@ -184,7 +210,7 @@ impl App {
                 ui.add_enabled_ui(!disabled, |ui| {
                     self.render_folder_pane_header(ui);
                     ui.separator();
-                    nav = self.render_folder_pane_tree(ui);
+                    nav = show_bounded_folder_pane_body(ui, |ui| self.render_folder_pane_tree(ui));
                 });
             });
         let width_ratio = (panel.response.rect.width() / content_width)
@@ -298,11 +324,8 @@ impl App {
                             text = text.color(ui.visuals().warn_fg_color);
                         }
                         let selected = row.is_cursor && self.folder_pane.has_focus;
-                        let trailing_width = if row.loading || row.error.is_some() {
-                            18.0
-                        } else {
-                            0.0
-                        };
+                        let trailing_width =
+                            folder_pane_trailing_width(ui, row.loading || row.error.is_some());
                         let label_width = (ui.available_width() - trailing_width).max(16.0);
                         let (label_rect, label_resp) = ui.allocate_exact_size(
                             egui::vec2(label_width, FOLDER_PANE_ROW_HEIGHT),
@@ -364,6 +387,63 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loading_row_does_not_grow_folder_pane_across_frames() {
+        use egui_kittest::Harness;
+        use std::sync::{Arc, Mutex};
+        let widths = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&widths);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 480.0))
+            .build(move |ctx| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(draw_loading_width_test_panel(ctx));
+            });
+        harness.run_steps(8);
+        assert_loading_width_stable(&widths.lock().unwrap());
+    }
+
+    fn assert_loading_width_stable(widths: &[f32]) {
+        assert!(widths.len() >= 8);
+        let first = widths[0];
+        assert!(widths.iter().all(|width| (*width - first).abs() <= 0.1));
+    }
+
+    fn draw_loading_width_test_panel(ctx: &egui::Context) -> f32 {
+        egui::SidePanel::left("folder_tree_pane_loading_width_test")
+            .resizable(true)
+            .default_width(240.0)
+            .width_range(FOLDER_PANE_MIN_WIDTH..=FOLDER_PANE_MAX_WIDTH)
+            .show(ctx, |ui| {
+                ui.label("Folder");
+                ui.separator();
+                show_bounded_folder_pane_body(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.set_height(FOLDER_PANE_ROW_HEIGHT);
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                ui.add_space(FOLDER_PANE_ARROW_WIDTH);
+                                let trailing_width = folder_pane_trailing_width(ui, true);
+                                let label_width = (ui.available_width() - trailing_width).max(16.0);
+                                ui.allocate_exact_size(
+                                    egui::vec2(label_width, FOLDER_PANE_ROW_HEIGHT),
+                                    egui::Sense::hover(),
+                                );
+                                ui.spinner();
+                            });
+                        });
+                });
+            })
+            .response
+            .rect
+            .width()
+    }
 
     #[test]
     fn folder_pane_hover_gates_only_pointer_inside_visible_pane() {

@@ -81,7 +81,7 @@ impl App {
     ///
     /// 表示条件:
     /// - 通常ホバー: マウスカーソルが画面右端にある間
-    /// - クリック表示: 現在ファイルの runtime flag が ON
+    /// - 明示表示: mode gate 済みの pointer owner、または touch handle owner
     ///
     /// 右パネル表示中は上部バーも常に同時表示する。
     /// 右パネルは常に上部バーの下から開始する。
@@ -108,7 +108,12 @@ impl App {
         // boundary idempotently current as well because capture-selection and other modal paths
         // can bypass the general image-input handler while this panel is still rendered.
         let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
-        self.update_metadata_panel_hover_latch(ctx, full_rect, true, navigator_exclusion);
+        self.update_metadata_panel_hover_latch(
+            ctx,
+            full_rect,
+            !self.still_touch_chrome_is_latched(ctx),
+            navigator_exclusion,
+        );
         let hover_visible = self.metadata_panel_hover_active;
         let explicit = self.metadata_panel_click_shown();
 
@@ -169,7 +174,7 @@ impl App {
             egui::Color32::from_gray(200),
         );
 
-        // ClickToShow で開いた右パネルを明示的に閉じるボタン。
+        // pointer / touch handle で明示的に開いた右パネルを閉じるボタン。
         if explicit {
             let close_size = 22.0;
             let close_margin = 5.0;
@@ -203,7 +208,7 @@ impl App {
                 stroke,
             );
             if close_resp.on_hover_text("情報パネルを閉じる").clicked() {
-                self.toggle_fullscreen_click_info_open();
+                self.close_fullscreen_info_panel();
             }
         }
 

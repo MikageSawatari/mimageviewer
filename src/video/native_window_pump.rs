@@ -15,9 +15,9 @@ use super::native_cursor::{
     reduce_cursor_routing_batch,
 };
 use super::native_window::{
-    NativeCursorOwnershipEdge, NativeVideoWindowEvent, NativeVideoWindowEventEnvelope,
-    NativeVideoWindowSource, NativeWindowEventReceiver, NativeWindowEventRoute,
-    native_window_event_route, post_typed_pump_quit,
+    NativeCursorOwnershipEdge, NativeVideoTouchPhase, NativeVideoWindowEvent,
+    NativeVideoWindowEventEnvelope, NativeVideoWindowSource, NativeWindowEventReceiver,
+    NativeWindowEventRoute, native_window_event_route, post_typed_pump_quit,
 };
 use super::native_window_host::{
     NativeHudWindowRequest, NativeRenderTargetTransfer, NativeWindowHost, NativeWindowHostConfig,
@@ -1332,6 +1332,18 @@ fn cursor_routing_event_for_epoch(
             // WM_MOUSEWHEEL is routed to the focus window, so it is genuine
             // activity but does not by itself prove cursor input ownership.
             establishes_target: false,
+        },
+        NativeVideoWindowEvent::Touch(touch) => match touch.phase {
+            NativeVideoTouchPhase::Start => CursorRoutingEventKind::Explicit {
+                position: [touch.x, touch.y],
+                establishes_target: true,
+            },
+            NativeVideoTouchPhase::Move => CursorRoutingEventKind::Move([touch.x, touch.y]),
+            NativeVideoTouchPhase::End => CursorRoutingEventKind::Explicit {
+                position: [touch.x, touch.y],
+                establishes_target: false,
+            },
+            NativeVideoTouchPhase::Cancel => CursorRoutingEventKind::CaptureLost,
         },
         NativeVideoWindowEvent::CursorOwnership(edge) => match edge {
             NativeCursorOwnershipEdge::Leave => CursorRoutingEventKind::Leave,

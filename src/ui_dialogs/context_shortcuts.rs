@@ -54,6 +54,59 @@ const FS_IMAGE_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     },
 ];
 
+const FS_IMAGE_TOUCH_SHORTCUT_ROWS_LTR: &[FixedShortcutRow] = &[
+    FixedShortcutRow {
+        keys: "中央をタップ",
+        description: "上部バー、下部シークバー、左右のパネルハンドルを表示 / 非表示にする",
+    },
+    FixedShortcutRow {
+        keys: "左をタップ",
+        description: "前のページへ移動する",
+    },
+    FixedShortcutRow {
+        keys: "右をタップ",
+        description: "次のページへ移動する",
+    },
+    FixedShortcutRow {
+        keys: "2 本指でピンチ / 移動",
+        description: "画像をズーム / パンする",
+    },
+];
+
+const FS_IMAGE_TOUCH_SHORTCUT_ROWS_RTL: &[FixedShortcutRow] = &[
+    FixedShortcutRow {
+        keys: "中央をタップ",
+        description: "上部バー、下部シークバー、左右のパネルハンドルを表示 / 非表示にする",
+    },
+    FixedShortcutRow {
+        keys: "左をタップ",
+        description: "次のページへ移動する",
+    },
+    FixedShortcutRow {
+        keys: "右をタップ",
+        description: "前のページへ移動する",
+    },
+    FixedShortcutRow {
+        keys: "2 本指でピンチ / 移動",
+        description: "画像をズーム / パンする",
+    },
+];
+
+const FS_VIDEO_TOUCH_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
+    FixedShortcutRow {
+        keys: "中央をタップ",
+        description: "HUD を表示 / 非表示にする",
+    },
+    FixedShortcutRow {
+        keys: "左をタップ",
+        description: "5 秒戻る",
+    },
+    FixedShortcutRow {
+        keys: "右をタップ",
+        description: "5 秒進む",
+    },
+];
+
 const FS_VIDEO_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     FixedShortcutRow {
         keys: "?",
@@ -284,6 +337,25 @@ impl ShortcutHelpContext {
         }
     }
 
+    fn touch_rows(
+        self,
+        still_image_rtl: bool,
+        video_touch_available: bool,
+    ) -> &'static [FixedShortcutRow] {
+        match self {
+            Self::FsImage if still_image_rtl => FS_IMAGE_TOUCH_SHORTCUT_ROWS_RTL,
+            Self::FsImage => FS_IMAGE_TOUCH_SHORTCUT_ROWS_LTR,
+            Self::FsVideo if video_touch_available => FS_VIDEO_TOUCH_SHORTCUT_ROWS,
+            Self::Grid
+            | Self::FsVideo
+            | Self::Erase
+            | Self::Conceal
+            | Self::Crop
+            | Self::LocalAdjust
+            | Self::Text => &[],
+        }
+    }
+
     fn includes_row(self, row: &CommandDisplayRow) -> bool {
         if row.spec.action.is_location_navigation_action() && row.shortcut_labels.is_empty() {
             return false;
@@ -312,6 +384,9 @@ impl App {
         }
 
         let help_context = self.current_shortcut_help_context();
+        let video_touch_available = self
+            .fullscreen_idx
+            .is_some_and(|fs_idx| matches!(self.items.get(fs_idx), Some(GridItem::Video(_))));
 
         let mut open = true;
         let escape_pressed = self.dialog_escape_pressed(ctx);
@@ -355,6 +430,11 @@ impl App {
                             ui,
                             &self.keymap,
                             help_context.supplemental_action_rows(),
+                        );
+                        draw_touch_rows(
+                            ui,
+                            help_context
+                                .touch_rows(self.spread_mode.is_rtl(), video_touch_available),
                         );
                         draw_fixed_rows(ui, &self.keymap, help_context.fixed_rows());
                     });
@@ -479,6 +559,26 @@ fn draw_fixed_rows(ui: &mut egui::Ui, keymap: &crate::keymap::Keymap, rows: &[Fi
         });
 }
 
+fn draw_touch_rows(ui: &mut egui::Ui, rows: &[FixedShortcutRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new("タッチ操作").strong());
+    ui.add_space(2.0);
+    egui::Grid::new(("context_shortcuts_touch", rows.as_ptr() as usize))
+        .num_columns(2)
+        .spacing([18.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            for row in rows {
+                ui.monospace(row.keys);
+                ui.label(row.description);
+                ui.end_row();
+            }
+        });
+}
+
 fn supplemental_action_shortcut_label(keymap: &crate::keymap::Keymap, action: KeyAction) -> String {
     let labels = keymap.chord_labels(action);
     if labels.is_empty() {
@@ -514,7 +614,7 @@ fn draw_supplemental_action_rows(
 
 #[cfg(test)]
 mod tests {
-    use super::supplemental_action_shortcut_label;
+    use super::{ShortcutHelpContext, supplemental_action_shortcut_label};
     use crate::keymap::{Chord, KeyAction, Keymap, KeymapSettings, ModKind};
 
     #[test]
@@ -536,6 +636,47 @@ mod tests {
         assert_eq!(
             supplemental_action_shortcut_label(&Keymap::from_settings(&settings), action),
             "未設定"
+        );
+    }
+
+    #[test]
+    fn touch_help_rows_resolve_still_image_page_sides_for_ltr_and_rtl() {
+        let ltr_rows = ShortcutHelpContext::FsImage.touch_rows(false, false);
+        assert_eq!(ltr_rows.len(), 4);
+        assert!(ltr_rows.iter().any(|row| row.keys == "中央をタップ"));
+        assert!(ltr_rows.iter().any(|row| {
+            row.keys == "左をタップ" && row.description == "前のページへ移動する"
+        }));
+        assert!(ltr_rows.iter().any(|row| {
+            row.keys == "右をタップ" && row.description == "次のページへ移動する"
+        }));
+
+        let rtl_rows = ShortcutHelpContext::FsImage.touch_rows(true, false);
+        assert_eq!(rtl_rows.len(), 4);
+        assert!(rtl_rows.iter().any(|row| {
+            row.keys == "左をタップ" && row.description == "次のページへ移動する"
+        }));
+        assert!(rtl_rows.iter().any(|row| {
+            row.keys == "右をタップ" && row.description == "前のページへ移動する"
+        }));
+    }
+
+    #[test]
+    fn touch_help_rows_cover_video_without_music() {
+        assert!(
+            ShortcutHelpContext::Grid
+                .touch_rows(false, false)
+                .is_empty()
+        );
+        let video_rows = ShortcutHelpContext::FsVideo.touch_rows(false, true);
+        assert_eq!(video_rows.len(), 3);
+        assert!(video_rows.iter().any(|row| row.keys == "中央をタップ"));
+        assert!(video_rows.iter().any(|row| row.keys == "左をタップ"));
+        assert!(video_rows.iter().any(|row| row.keys == "右をタップ"));
+        assert!(
+            ShortcutHelpContext::FsVideo
+                .touch_rows(false, false)
+                .is_empty()
         );
     }
 }

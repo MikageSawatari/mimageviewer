@@ -290,6 +290,7 @@ struct NativeEguiOverlay {
     last_text_input_focus_claim_at: Option<Instant>,
     started_at: Instant,
     pending_events: Vec<egui::Event>,
+    native_touch: crate::video::native_touch::NativeTouchAdapter,
     modifiers: egui::Modifiers,
     pointer_pos: Option<egui::Pos2>,
     event_count: u64,
@@ -422,10 +423,11 @@ struct NativeEguiOverlay {
     jump_panel_visible: bool,
     /// App settings から同期される、左右パネル共通の表示モード。
     side_panel_mode: FsSidePanelMode,
-    /// ClickToShow の右情報パネル状態。正本は App の現在ファイル用 runtime flag。
-    click_info_open: bool,
-    /// ClickToShow の左ジャンプパネル状態。動画ソース単位の presenter-local session。
-    left_session_open: bool,
+    /// 右情報パネルの明示 open owner。正本は App の current-file typed state。
+    info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
+    /// 左ジャンプパネルの明示 open owner。動画ソース単位の presenter-local session。
+    /// pointer と touch handle を同じ typed state で区別し、外タップ dismiss の正本にする。
+    left_panel_open: crate::ui_helpers::MetadataPanelOpenState,
     /// 右パネル (情報/★/タグ) の端ホバー開閉ラッチ。画面右端 5% の細いトリガで開き、
     /// パネル矩形 + ヒステリシス余白から出るまで維持する。パネル幅ぶんの広い当たり判定が
     /// 中央のクリック (右クリックページ送り等) を食う問題への対策 (実機 FB 2026-07)。
@@ -704,6 +706,7 @@ pub struct NativeOverlayMetadata {
     pub deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot,
     /// 再生中に一度でもインターレースが検出されたか (latched、動的)。
     pub interlace_detected: bool,
+    pub touch_video_chrome_learned: bool,
     pub shortcuts: NativeOverlayShortcutLabels,
     pub shortcut_help: Arc<NativeOverlayShortcutHelp>,
 }
@@ -732,6 +735,7 @@ pub struct NativeOverlayShortcutLabels {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NativeOverlayShortcutHelp {
     pub sections: Vec<NativeOverlayShortcutHelpSection>,
+    pub touch_rows: Vec<NativeOverlayShortcutHelpRow>,
     pub fixed_rows: Vec<NativeOverlayShortcutHelpRow>,
 }
 
@@ -1116,7 +1120,7 @@ struct NativeRightPanelVisibilityInputs {
     tag_picker_open: bool,
     pointer_in_hover_rect: bool,
     side_panel_mode: FsSidePanelMode,
-    click_info_open: bool,
+    info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
 }
 
 fn native_right_panel_visible_from_inputs(input: NativeRightPanelVisibilityInputs) -> bool {
@@ -1132,13 +1136,14 @@ fn native_right_panel_visible_from_inputs(input: NativeRightPanelVisibilityInput
     if input.video_speed_popup_open || input.hover_preview_active {
         return false;
     }
+    let explicit = crate::ui_helpers::metadata_panel_explicit_shown(
+        input.side_panel_mode,
+        input.info_panel_open,
+    );
     input.tag_picker_open
         || match input.side_panel_mode.normalized() {
-            FsSidePanelMode::Hover => input.pointer_in_hover_rect,
-            FsSidePanelMode::ClickToShow => crate::ui_helpers::metadata_panel_click_shown(
-                input.side_panel_mode,
-                input.click_info_open,
-            ),
+            FsSidePanelMode::Hover => input.pointer_in_hover_rect || explicit,
+            FsSidePanelMode::ClickToShow => explicit,
             FsSidePanelMode::Unknown => unreachable!("normalized side panel mode"),
         }
 }
@@ -1151,7 +1156,7 @@ struct NativeJumpPanelVisibilityInputs {
     hover_preview_active: bool,
     pointer_in_hover_rect: bool,
     side_panel_mode: FsSidePanelMode,
-    left_session_open: bool,
+    left_panel_open: crate::ui_helpers::MetadataPanelOpenState,
 }
 
 fn native_jump_panel_visible_from_inputs(input: NativeJumpPanelVisibilityInputs) -> bool {
@@ -1165,8 +1170,11 @@ fn native_jump_panel_visible_from_inputs(input: NativeJumpPanelVisibilityInputs)
         return false;
     }
     match input.side_panel_mode.normalized() {
-        FsSidePanelMode::Hover => input.pointer_in_hover_rect,
-        FsSidePanelMode::ClickToShow => input.left_session_open,
+        FsSidePanelMode::Hover => {
+            input.pointer_in_hover_rect
+                || input.left_panel_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
+        }
+        FsSidePanelMode::ClickToShow => input.left_panel_open.is_open(),
         FsSidePanelMode::Unknown => unreachable!("normalized side panel mode"),
     }
 }
@@ -1222,6 +1230,55 @@ fn native_panel_callout_hud_rects(
     ]
 }
 
+#[derive(Clone, Copy)]
+struct NativeTouchPanelHandleInputs {
+    chrome_latched: bool,
+    blocked: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
+    right_panel_available: bool,
+}
+
+fn native_touch_panel_handle_hud_rects(
+    width: f32,
+    height: f32,
+    input: NativeTouchPanelHandleInputs,
+) -> [Option<egui::Rect>; 2] {
+    if !input.chrome_latched || input.blocked {
+        return [None, None];
+    }
+    let left = (!input.left_panel_open)
+        .then(|| native_touch_panel_handle_rect(width, height, true))
+        .filter(egui::Rect::is_positive);
+    let right = (input.right_panel_available && !input.right_panel_open)
+        .then(|| native_touch_panel_handle_rect(width, height, false))
+        .filter(egui::Rect::is_positive);
+    [left, right]
+}
+
+fn native_touch_panel_tap_command_dismisses_before_dispatch(
+    command: crate::video::native_touch::NativeVideoTouchCommand,
+    left_open: crate::ui_helpers::MetadataPanelOpenState,
+    right_open: crate::ui_helpers::MetadataPanelOpenState,
+) -> bool {
+    matches!(
+        command,
+        crate::video::native_touch::NativeVideoTouchCommand::ToggleChrome
+            | crate::video::native_touch::NativeVideoTouchCommand::SeekRelative { .. }
+    ) && (left_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
+        || right_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle)
+}
+
+fn native_touch_owned_panel_sides(
+    left_open: crate::ui_helpers::MetadataPanelOpenState,
+    right_open: crate::ui_helpers::MetadataPanelOpenState,
+) -> [bool; 2] {
+    [
+        left_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle,
+        right_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle,
+    ]
+}
+
 fn native_video_fullscreen_shortcut_key(
     key: &crate::video::native_window::NativeVideoKeyEvent,
 ) -> bool {
@@ -1233,6 +1290,10 @@ pub enum NativeOverlayCommand {
     Seek {
         target_secs: f64,
     },
+    SeekRelative {
+        delta_secs: f64,
+    },
+    TouchChromeLearned,
     TileSeek {
         target_secs: f64,
     },
@@ -1253,6 +1314,8 @@ pub enum NativeOverlayCommand {
     TogglePerfOverlay,
     ToggleSidePanelMode,
     ToggleClickInfoOpen,
+    OpenTouchInfoPanel,
+    DismissTouchSidePanels,
     ToggleVst3Gui,
     /// 動画 HUD の「音声モード」ボタン: 映像を切って音楽ビュー (DJ 波形 + spectrum) へ切り替える
     /// (Inc 7、動画→音声モード)。App が `enter_video_audio_mode` を呼ぶ。音声は無中断。
@@ -1431,6 +1494,9 @@ impl NativeOverlayInputRouting {
             }
             // native viewer の close は App 側でセッション終了として扱う。
             NativeEvent::CloseRequested { .. } => true,
+            // Touch is consumed by the presenter-local recognizer and primary
+            // emulation. It must never re-enter the legacy App mouse path.
+            NativeEvent::Touch(_) => false,
             // 内部処理イベント (presenter thread が直接消費する)。UI 転送しない。
             NativeEvent::GeometryChanged { .. }
             | NativeEvent::DpiChanged { .. }
@@ -2853,7 +2919,9 @@ impl NativeRenderCore {
 
     pub(crate) fn fullscreen_overlay_active(&self) -> bool {
         self.egui_overlay.as_ref().is_some_and(|overlay| {
-            overlay.navigation_preview.is_some() || overlay.tile_overlay.is_some()
+            overlay.navigation_preview.is_some()
+                || overlay.tile_overlay.is_some()
+                || overlay.native_touch.first_run_help_visible()
         })
     }
 
@@ -3006,18 +3074,27 @@ impl NativeRenderCore {
         }
     }
 
-    pub fn set_overlay_side_panel_state(&mut self, mode: FsSidePanelMode, click_info_open: bool) {
+    pub(crate) fn set_overlay_side_panel_state(
+        &mut self,
+        mode: FsSidePanelMode,
+        info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
+    ) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
-            overlay.set_side_panel_state(mode, click_info_open);
+            overlay.set_side_panel_state(mode, info_panel_open);
         }
     }
 
-    /// Source swap で presenter-local な左セッションと hover latch を閉じる。
+    /// Source swap で presenter-local な panel/touch session を閉じる。
     /// 右状態は App が新ファイルの false を別 command で同期する。
-    pub fn reset_overlay_side_panel_session(&mut self) {
+    pub fn reset_overlay_source_session(&mut self) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.reset_side_panel_session();
         }
+    }
+
+    /// Video/audio mode changes use the same session boundary as source swap.
+    pub fn reset_overlay_side_panel_session(&mut self) {
+        self.reset_overlay_source_session();
     }
 
     pub fn set_overlay_fallback_file_name(&mut self, file_name: String) {
@@ -3806,6 +3883,7 @@ impl NativeEguiOverlay {
             last_text_input_focus_claim_at: None,
             started_at: Instant::now(),
             pending_events: Vec::new(),
+            native_touch: crate::video::native_touch::NativeTouchAdapter::default(),
             modifiers: egui::Modifiers::default(),
             pointer_pos: None,
             event_count: 0,
@@ -3897,8 +3975,8 @@ impl NativeEguiOverlay {
             right_panel_visible: false,
             jump_panel_visible: false,
             side_panel_mode: FsSidePanelMode::Hover,
-            click_info_open: false,
-            left_session_open: false,
+            info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
+            left_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
             right_panel_hover_latched: false,
             jump_panel_hover_latched: false,
             side_panel_escape_consumed: false,
@@ -3975,6 +4053,124 @@ impl NativeEguiOverlay {
         }
     }
 
+    /// Builds the Phase 1 touch exclusion approximation.
+    ///
+    /// `compute_hud_regions()` returns the HUD HWND input-claim regions, not
+    /// exact painted egui chrome response rects. In particular, its drag
+    /// capture path may return the full surface while egui reports a pointer
+    /// down. Native Cancel must therefore release synthetic primary-down state
+    /// before `PointerGone`, or this approximation would remain capture-all.
+    fn native_touch_geometry(&self) -> crate::touch_input::TapZoneGeometry {
+        let ppp = self.pixels_per_point;
+        let surface = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(self.width as f32 / ppp, self.height as f32 / ppp),
+        );
+        let excluded = self
+            .compute_hud_regions()
+            .into_iter()
+            .map(|rect| {
+                egui::Rect::from_min_max(
+                    crate::video::native_touch::native_client_pixels_to_points(
+                        [rect.left, rect.top],
+                        ppp,
+                    ),
+                    crate::video::native_touch::native_client_pixels_to_points(
+                        [rect.right, rect.bottom],
+                        ppp,
+                    ),
+                )
+            })
+            .collect();
+        crate::touch_input::TapZoneGeometry {
+            surface,
+            excluded,
+            behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                accepts_pinch: false,
+            },
+        }
+    }
+
+    fn push_native_touch_event(
+        &mut self,
+        touch: crate::video::native_window::NativeVideoTouchEvent,
+    ) {
+        let debug_window = match touch.source {
+            crate::video::native_window::NativeVideoWindowSource::Presenter => {
+                crate::touch_debug::TouchDebugWindow::Presenter
+            }
+            crate::video::native_window::NativeVideoWindowSource::Hud => {
+                crate::touch_debug::TouchDebugWindow::Hud
+            }
+        };
+        let geometry = self.native_touch_geometry();
+        let now_ms = self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let output =
+            self.native_touch
+                .handle_event(touch, &geometry, now_ms, self.pixels_per_point);
+        crate::touch_debug::log_native_touch_coordinates(
+            debug_window,
+            touch.pointer_id,
+            [touch.x, touch.y],
+            output.pos,
+        );
+        self.enqueue_native_pointer_events(output.egui_events);
+        let touch_commands = self.native_touch.take_commands();
+        let dismiss_touch_panels = touch_commands.iter().copied().any(|command| {
+            native_touch_panel_tap_command_dismisses_before_dispatch(
+                command,
+                self.left_panel_open,
+                self.info_panel_open,
+            )
+        });
+        for command in &touch_commands {
+            crate::touch_debug::log_native_touch_command(debug_window, command);
+        }
+        if dismiss_touch_panels {
+            let [close_left, close_right] =
+                native_touch_owned_panel_sides(self.left_panel_open, self.info_panel_open);
+            if close_left {
+                self.left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
+            }
+            if close_right {
+                self.tag_picker_open = false;
+                self.pending_overlay_commands
+                    .push(NativeOverlayCommand::DismissTouchSidePanels);
+            }
+        } else {
+            for command in touch_commands {
+                match command {
+                    crate::video::native_touch::NativeVideoTouchCommand::ToggleChrome => {
+                        self.native_touch.toggle_chrome();
+                    }
+                    crate::video::native_touch::NativeVideoTouchCommand::SeekRelative {
+                        delta_secs,
+                    } => {
+                        self.pending_overlay_commands
+                            .push(NativeOverlayCommand::SeekRelative { delta_secs });
+                    }
+                    crate::video::native_touch::NativeVideoTouchCommand::LearnAndShowChrome => {
+                        self.native_touch.show_chrome();
+                        self.pending_overlay_commands
+                            .push(NativeOverlayCommand::TouchChromeLearned);
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn enqueue_native_pointer_events(&mut self, events: Vec<egui::Event>) {
+        for event in &events {
+            match event {
+                egui::Event::PointerMoved(pos) => self.pointer_pos = Some(*pos),
+                egui::Event::PointerGone => self.pointer_pos = None,
+                _ => {}
+            }
+        }
+        self.pending_events.extend(events);
+    }
+
     fn hud_dimmed_suppresses_overlay_pointer_event(
         event: &crate::video::native_window::NativeVideoWindowEvent,
     ) -> bool {
@@ -4017,7 +4213,11 @@ impl NativeEguiOverlay {
         hover_pos: Option<egui::Pos2>,
         overlay_height_points: f32,
         external_drag_in_progress: bool,
+        touch_chrome_latched: bool,
     ) -> bool {
+        if touch_chrome_latched {
+            return true;
+        }
         if external_drag_in_progress {
             return false;
         }
@@ -4028,7 +4228,11 @@ impl NativeEguiOverlay {
         hover_pos: Option<egui::Pos2>,
         currently_visible: bool,
         external_drag_in_progress: bool,
+        touch_chrome_latched: bool,
     ) -> bool {
+        if touch_chrome_latched {
+            return true;
+        }
         if external_drag_in_progress {
             return false;
         }
@@ -4105,11 +4309,11 @@ impl NativeEguiOverlay {
                     && key.virtual_key == 0x1B
                     && self.side_panel_mode.normalized() == FsSidePanelMode::ClickToShow
                     && !self.text_input_active()
-                    && (self.left_session_open || self.click_info_open)
+                    && (self.left_panel_open.is_open() || self.info_panel_open.is_open())
                 {
-                    self.left_session_open = false;
+                    self.left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
                     self.tag_picker_open = false;
-                    if self.click_info_open {
+                    if self.info_panel_open.is_open() {
                         self.pending_overlay_commands
                             .push(NativeOverlayCommand::ToggleClickInfoOpen);
                     }
@@ -4287,6 +4491,7 @@ impl NativeEguiOverlay {
                 self.pending_events.push(egui::Event::PointerGone);
                 self.dirty = true;
             }
+            NativeEvent::Touch(touch) => self.push_native_touch_event(touch),
             // viewer close は App 側に転送し、overlay には流さない。
             NativeEvent::CloseRequested { .. } => {}
             // 内部処理イベント (presenter thread が直接消費する)。overlay には流さない。
@@ -4380,10 +4585,7 @@ impl NativeEguiOverlay {
     }
 
     fn native_pos(&self, x: i32, y: i32) -> egui::Pos2 {
-        egui::pos2(
-            x as f32 / self.pixels_per_point,
-            y as f32 / self.pixels_per_point,
-        )
+        crate::video::native_touch::native_client_pixels_to_points([x, y], self.pixels_per_point)
     }
 
     fn set_perf_visible(&mut self, visible: bool) -> bool {
@@ -4515,23 +4717,34 @@ impl NativeEguiOverlay {
     }
 
     fn set_metadata(&mut self, metadata: Option<NativeOverlayMetadata>) {
+        let learned_snapshot = metadata
+            .as_ref()
+            .map(|metadata| metadata.touch_video_chrome_learned);
+        let touch_changed = self
+            .native_touch
+            .configure_video_gestures(!self.audio_only, learned_snapshot);
         if self.video_metadata == metadata {
+            self.dirty |= touch_changed;
             return;
         }
         self.video_metadata = metadata;
         self.dirty = true;
     }
 
-    fn set_side_panel_state(&mut self, mode: FsSidePanelMode, click_info_open: bool) {
+    fn set_side_panel_state(
+        &mut self,
+        mode: FsSidePanelMode,
+        info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
+    ) {
         let mode = mode.normalized();
         let mode_changed = self.side_panel_mode != mode;
-        if !mode_changed && self.click_info_open == click_info_open {
+        if !mode_changed && self.info_panel_open == info_panel_open {
             return;
         }
         self.side_panel_mode = mode;
-        self.click_info_open = click_info_open;
+        self.info_panel_open = info_panel_open;
         if mode_changed {
-            self.left_session_open = false;
+            self.left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
             self.right_panel_hover_latched = false;
             self.jump_panel_hover_latched = false;
         }
@@ -4539,10 +4752,14 @@ impl NativeEguiOverlay {
     }
 
     fn reset_side_panel_session(&mut self) {
-        let changed = self.left_session_open
+        let touch_reset = self.native_touch.reset_for_source_swap();
+        let touch_changed = touch_reset.changed;
+        self.enqueue_native_pointer_events(touch_reset.egui_events);
+        let changed = self.left_panel_open.is_open()
             || self.right_panel_hover_latched
-            || self.jump_panel_hover_latched;
-        self.left_session_open = false;
+            || self.jump_panel_hover_latched
+            || touch_changed;
+        self.left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.right_panel_hover_latched = false;
         self.jump_panel_hover_latched = false;
         if changed {
@@ -4645,6 +4862,12 @@ impl NativeEguiOverlay {
             return;
         }
         self.audio_only = audio_only;
+        let learned_snapshot = self
+            .video_metadata
+            .as_ref()
+            .map(|metadata| metadata.touch_video_chrome_learned);
+        self.native_touch
+            .configure_video_gestures(!audio_only, learned_snapshot);
         self.dirty = true;
     }
 
@@ -5076,6 +5299,7 @@ impl NativeEguiOverlay {
     /// - 下 HUD (`hud_visible()`): 画面下端 (H-220)..H pt 帯
     /// - right panel (`right_panel_visible()`): 画面右端の panel rect
     /// - jump panel (`jump_panel_visible`): 画面下半分の jump rect
+    /// - touch panel handles (touch chrome latch 中): 左右端の 48pt rect
     /// - VST3 panel (`vst3_panel_visible()`): center modal panel
     /// - speed popup (`video_speed_popup_open`): 画面下端の popup
     /// - bookmark title editor (`bookmark_title_edit.is_some()`): center modal
@@ -5099,6 +5323,15 @@ impl NativeEguiOverlay {
         let ppp = self.pixels_per_point;
         let width_px = self.width.max(1) as i32;
         let height_px = self.height.max(1) as i32;
+
+        if self.native_touch.first_run_help_visible() {
+            return vec![RECT {
+                left: 0,
+                top: 0,
+                right: width_px,
+                bottom: height_px,
+            }];
+        }
 
         // capture_all: drag 中はクリックを HUD 経由で受け取りたいので region を画面全体に。
         let pointer_down = self.egui_ctx.input(|i| i.pointer.any_down());
@@ -5261,6 +5494,13 @@ impl NativeEguiOverlay {
         .into_iter()
         .flatten()
         {
+            regions.push(rect_to_px(rect));
+        }
+
+        // Phase 3 Step 3h: the handle itself is a HUD HWND input region. The
+        // OS hit-test therefore routes touch to the HUD-owned widget stream;
+        // presenter tap-zone geometry is not used to resolve the handle.
+        for rect in self.touch_panel_handle_rects().into_iter().flatten() {
             regions.push(rect_to_px(rect));
         }
 
@@ -5597,6 +5837,7 @@ impl NativeEguiOverlay {
             self.visibility_hover_pos(),
             overlay_height_points,
             self.external_drag_in_progress,
+            self.native_touch.chrome_latched(),
         )
     }
 
@@ -5605,6 +5846,7 @@ impl NativeEguiOverlay {
             self.visibility_hover_pos(),
             self.top_bar_visible,
             self.external_drag_in_progress,
+            self.native_touch.chrome_latched(),
         )
     }
 
@@ -5672,7 +5914,7 @@ impl NativeEguiOverlay {
             tag_picker_open: self.tag_picker_open,
             pointer_in_hover_rect: self.right_panel_hover_latched,
             side_panel_mode: self.side_panel_mode,
-            click_info_open: self.click_info_open,
+            info_panel_open: self.info_panel_open,
         })
     }
 
@@ -5685,7 +5927,7 @@ impl NativeEguiOverlay {
             hover_preview_active: self.hover_preview_target_secs.is_some(),
             pointer_in_hover_rect: self.jump_panel_hover_latched,
             side_panel_mode: self.side_panel_mode,
-            left_session_open: self.left_session_open,
+            left_panel_open: self.left_panel_open,
         })
     }
 
@@ -5696,6 +5938,29 @@ impl NativeEguiOverlay {
                 || !metadata.current_tags.is_empty()
                 || !metadata.tag_choices.is_empty()
         })
+    }
+
+    fn touch_panel_handle_rects(&self) -> [Option<egui::Rect>; 2] {
+        let width = self.width as f32 / self.pixels_per_point;
+        let height = self.height as f32 / self.pixels_per_point;
+        native_touch_panel_handle_hud_rects(
+            width,
+            height,
+            NativeTouchPanelHandleInputs {
+                chrome_latched: self.native_touch.chrome_latched(),
+                blocked: self.audio_only
+                    || self.external_drag_in_progress
+                    || self.shortcut_help_open
+                    || self.vst3_panel_visible()
+                    || self.video_speed_popup_open
+                    || self.hover_preview_target_secs.is_some()
+                    || self.tile_overlay.is_some()
+                    || self.navigation_preview.is_some(),
+                left_panel_open: self.left_panel_open.is_open(),
+                right_panel_open: self.info_panel_open.is_open(),
+                right_panel_available: self.metadata_available(),
+            },
+        )
     }
 
     /// ClickToShow の最端 hover で表示する左右 callout。panel 本体の modal gate と揃える。
@@ -5825,6 +6090,8 @@ impl NativeEguiOverlay {
         let overlay_width_points = self.width as f32 / ppp;
         let overlay_height_points = self.height as f32 / ppp;
         let (left_callout_visible, right_callout_visible) = self.side_panel_callout_visibility();
+        let touch_panel_handle_rects = self.touch_panel_handle_rects();
+        let touch_panel_handles_visible = touch_panel_handle_rects.iter().any(Option::is_some);
         let position_secs = self.video_position_secs;
         let duration_secs = self.video_duration_secs;
         // P10-2: now-playing バナー (現在再生中のチャプター/ブックマーク) は左パネル
@@ -5885,6 +6152,8 @@ impl NativeEguiOverlay {
         let perf_visible = self.perf_visible;
         let vst3_available = self.vst3_available;
         let audio_only = self.audio_only;
+        let ui_scale = self.ui_scale;
+        let touch_first_run_help_visible = self.native_touch.first_run_help_visible();
         let side_panel_mode = self.side_panel_mode;
         let vst3_panel_visible = vst3_panel.as_ref().is_some_and(|panel| panel.visible);
         let hud_dimmed = self.hud_dimmed;
@@ -5940,6 +6209,8 @@ impl NativeEguiOverlay {
             || ring_guide_visible
             || left_callout_visible
             || right_callout_visible
+            || touch_panel_handles_visible
+            || touch_first_run_help_visible
             || normalize_scanning;
         // カーソル auto-hide の判定用: チェックマークのような「受動表示」(ユーザーが
         // 操作する対象ではなく単なる状態インジケータ) は countdown をブロックしない。
@@ -5972,11 +6243,13 @@ impl NativeEguiOverlay {
             || vst3_panel_visible
             || ring_picker_visible
             || ring_guide_visible
+            || touch_first_run_help_visible
             || normalize_scanning
             || in_top_activation_zone
             || in_bottom_activation_zone
             || left_callout_visible
-            || right_callout_visible;
+            || right_callout_visible
+            || touch_panel_handles_visible;
         let pending_event_count = self.pending_events.len();
         let mut commands = std::mem::take(&mut self.pending_overlay_commands);
         let mut last_seek_target_secs = self.last_seek_target_secs;
@@ -5998,8 +6271,8 @@ impl NativeEguiOverlay {
         let mut last_drawn_shortcut_help_rect: Option<egui::Rect> = None;
         let mut last_drawn_ring_picker_rect: Option<egui::Rect> = None;
         let mut last_drawn_ring_guide_rect: Option<egui::Rect> = None;
-        let left_session_open_before = self.left_session_open;
-        let mut left_session_open = left_session_open_before;
+        let left_panel_open_before = self.left_panel_open;
+        let mut left_panel_open = left_panel_open_before;
         if !overlay_visible {
             self.set_visual_attached(false)?;
             last_seek_target_secs = None;
@@ -6092,11 +6365,20 @@ impl NativeEguiOverlay {
                             overlay_width_points,
                             overlay_height_points,
                             metadata.shortcut_help.as_ref(),
+                            !audio_only,
                             &mut shortcut_help_open,
                         );
                     } else {
                         shortcut_help_open = false;
                     }
+                }
+                if touch_first_run_help_visible {
+                    draw_native_video_touch_first_run_help(
+                        ctx,
+                        overlay_width_points,
+                        overlay_height_points,
+                        ui_scale,
+                    );
                 }
                 return;
             }
@@ -6136,11 +6418,20 @@ impl NativeEguiOverlay {
                             overlay_width_points,
                             overlay_height_points,
                             metadata.shortcut_help.as_ref(),
+                            !audio_only,
                             &mut shortcut_help_open,
                         );
                     } else {
                         shortcut_help_open = false;
                     }
+                }
+                if touch_first_run_help_visible {
+                    draw_native_video_touch_first_run_help(
+                        ctx,
+                        overlay_width_points,
+                        overlay_height_points,
+                        ui_scale,
+                    );
                 }
                 return;
             }
@@ -6273,7 +6564,7 @@ impl NativeEguiOverlay {
                     self.side_panel_mode.normalized() == FsSidePanelMode::ClickToShow,
                 );
                 if close_left {
-                    left_session_open = false;
+                    left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
                 }
             }
             // Panel より後に描いて、開いている panel の端でも callout をクリック可能にする。
@@ -6283,10 +6574,13 @@ impl NativeEguiOverlay {
                     overlay_width_points,
                     overlay_height_points,
                     true,
-                    left_session_open,
+                    left_panel_open.is_open(),
                 )
             {
-                left_session_open = !left_session_open;
+                left_panel_open = crate::ui_helpers::toggle_side_panel_by_pointer(
+                    self.side_panel_mode,
+                    left_panel_open,
+                );
             }
             if right_callout_visible
                 && draw_native_panel_callout(
@@ -6294,11 +6588,27 @@ impl NativeEguiOverlay {
                     overlay_width_points,
                     overlay_height_points,
                     false,
-                    self.click_info_open,
+                    crate::ui_helpers::metadata_panel_explicit_shown(
+                        self.side_panel_mode,
+                        self.info_panel_open,
+                    ),
                 )
             {
                 self.tag_picker_open = false;
                 commands.push(NativeOverlayCommand::ToggleClickInfoOpen);
+            }
+            // Touch handles are separate widgets from the unchanged mouse
+            // callouts. Their rects are also published to the HUD HWND region,
+            // so HUD-source widget passthrough completes these as normal clicks.
+            if let Some(rect) = touch_panel_handle_rects[0]
+                && draw_native_touch_panel_handle(ctx, rect, true)
+            {
+                left_panel_open = crate::ui_helpers::open_side_panel_by_touch(left_panel_open);
+            }
+            if let Some(rect) = touch_panel_handle_rects[1]
+                && draw_native_touch_panel_handle(ctx, rect, false)
+            {
+                commands.push(NativeOverlayCommand::OpenTouchInfoPanel);
             }
             if bookmark_title_edit.is_some() {
                 last_drawn_bookmark_editor_rect = draw_native_bookmark_title_editor(
@@ -6326,6 +6636,7 @@ impl NativeEguiOverlay {
                         overlay_width_points,
                         overlay_height_points,
                         metadata.shortcut_help.as_ref(),
+                        !audio_only,
                         &mut shortcut_help_open,
                     );
                 } else {
@@ -7606,6 +7917,14 @@ impl NativeEguiOverlay {
                     );
                 }
             }
+            if touch_first_run_help_visible {
+                draw_native_video_touch_first_run_help(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    ui_scale,
+                );
+            }
         });
         let repaint_delay = full_output
             .viewport_output
@@ -7668,8 +7987,8 @@ impl NativeEguiOverlay {
         self.top_bar_visible = top_bar_visible || side_panel_visible;
         self.right_panel_visible = right_panel_visible;
         self.jump_panel_visible = jump_panel_visible;
-        self.left_session_open = left_session_open;
-        let left_session_open_changed = left_session_open != left_session_open_before;
+        self.left_panel_open = left_panel_open;
+        let left_panel_open_changed = left_panel_open != left_panel_open_before;
         // egui 側で発行されたクリップボードコピー (Ctrl+C / Ctrl+X 応答) を OS に流す。
         for cmd in &full_output.platform_output.commands {
             if let egui::OutputCommand::CopyText(text) = cmd {
@@ -7756,7 +8075,7 @@ impl NativeEguiOverlay {
             || self.bookmark_title_edit.is_some()
             || self.bulk_bookmark_dialog.is_some()
             || self.shortcut_help_open
-            || left_session_open_changed;
+            || left_panel_open_changed;
         log_event(
             "egui_overlay_present",
             &[
@@ -8322,16 +8641,20 @@ fn channel_delta(a: u8, b: u8) -> u8 {
 mod tests {
     use super::{
         NativeEguiOverlay, NativeJumpPanelVisibilityInputs, NativeOverlayInputRouting,
-        NativePixelSample, NativeRightPanelVisibilityInputs, compare_pixel_probe,
-        compute_video_visual_transform, configure_overlay_style, copy_cpu_rgba_to_swapchain_bgra,
-        cursor_move_is_activity, effective_overlay_pixels_per_point, egui_key_from_virtual_key,
-        metadata_clean_text, native_jump_panel_visible_from_inputs, native_panel_callout_hud_rects,
-        native_right_panel_visible_from_inputs, native_video_fullscreen_shortcut_key,
-        sample_cpu_rgba_pixel, should_claim_text_input_focus,
+        NativePixelSample, NativeRightPanelVisibilityInputs, NativeTouchPanelHandleInputs,
+        compare_pixel_probe, compute_video_visual_transform, configure_overlay_style,
+        copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity,
+        effective_overlay_pixels_per_point, egui_key_from_virtual_key, metadata_clean_text,
+        native_jump_panel_visible_from_inputs, native_panel_callout_hud_rects,
+        native_right_panel_visible_from_inputs, native_touch_owned_panel_sides,
+        native_touch_panel_handle_hud_rects,
+        native_touch_panel_tap_command_dismisses_before_dispatch,
+        native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel, should_claim_text_input_focus,
     };
     use crate::settings::FsSidePanelMode;
     use crate::video::native_presenter::overlay_draw::{
-        native_panel_callout_arrow_direction, native_panel_callout_bar_rect,
+        NATIVE_TOUCH_PANEL_HANDLE_WIDTH_PT, native_panel_callout_arrow_direction,
+        native_panel_callout_bar_rect, native_panel_top,
     };
     use crate::video::native_window::{
         NativeVideoKeyEvent, NativeVideoMouseButton, NativeVideoMouseButtonEvent,
@@ -8538,16 +8861,27 @@ mod tests {
         let upper_hover = Some(egui::pos2(120.0, 100.0));
 
         assert!(
-            NativeEguiOverlay::native_hud_bottom_visible_from_hover(bottom_hover, 720.0, false),
+            NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+                bottom_hover,
+                720.0,
+                false,
+                false,
+            ),
             "raw hover near the bottom should show the dimmed HUD"
         );
         assert!(!NativeEguiOverlay::native_hud_bottom_visible_from_hover(
             upper_hover,
             720.0,
-            false
+            false,
+            false,
         ));
         assert!(
-            !NativeEguiOverlay::native_hud_bottom_visible_from_hover(bottom_hover, 720.0, true),
+            !NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+                bottom_hover,
+                720.0,
+                true,
+                false,
+            ),
             "external drag remains authoritative even for raw hover"
         );
         assert!(
@@ -8561,12 +8895,14 @@ mod tests {
         assert!(NativeEguiOverlay::native_hud_top_visible_from_hover(
             Some(egui::pos2(40.0, 20.0)),
             false,
-            false
+            false,
+            false,
         ));
         assert!(!NativeEguiOverlay::native_hud_top_visible_from_hover(
             Some(egui::pos2(40.0, 80.0)),
             false,
-            false
+            false,
+            false,
         ));
         assert!(
             NativeEguiOverlay::hud_dimmed_suppresses_overlay_pointer_event(
@@ -8592,7 +8928,30 @@ mod tests {
         assert!(NativeEguiOverlay::native_hud_bottom_visible_from_hover(
             pointer_pos,
             720.0,
-            false
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn touch_chrome_latch_reveals_bars_without_hover_and_preserves_hover_behavior() {
+        assert!(NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+            None, 720.0, false, true,
+        ));
+        assert!(NativeEguiOverlay::native_hud_top_visible_from_hover(
+            None, false, false, true,
+        ));
+        assert!(NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+            Some(egui::pos2(100.0, 650.0)),
+            720.0,
+            false,
+            false,
+        ));
+        assert!(!NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+            Some(egui::pos2(100.0, 100.0)),
+            720.0,
+            false,
+            false,
         ));
     }
 
@@ -8608,9 +8967,23 @@ mod tests {
             tag_picker_open: false,
             pointer_in_hover_rect: true,
             side_panel_mode: FsSidePanelMode::Hover,
-            click_info_open: false,
+            info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
         };
         assert!(native_right_panel_visible_from_inputs(right_base));
+        assert!(!native_right_panel_visible_from_inputs(
+            NativeRightPanelVisibilityInputs {
+                pointer_in_hover_rect: false,
+                info_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByPointer,
+                ..right_base
+            }
+        ));
+        assert!(native_right_panel_visible_from_inputs(
+            NativeRightPanelVisibilityInputs {
+                pointer_in_hover_rect: false,
+                info_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle,
+                ..right_base
+            }
+        ));
         assert!(!native_right_panel_visible_from_inputs(
             NativeRightPanelVisibilityInputs {
                 shortcut_help_open: true,
@@ -8640,9 +9013,22 @@ mod tests {
             hover_preview_active: false,
             pointer_in_hover_rect: true,
             side_panel_mode: FsSidePanelMode::Hover,
-            left_session_open: false,
+            left_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
         };
         assert!(native_jump_panel_visible_from_inputs(jump_base));
+        assert!(!native_jump_panel_visible_from_inputs(
+            NativeJumpPanelVisibilityInputs {
+                pointer_in_hover_rect: false,
+                ..jump_base
+            }
+        ));
+        assert!(native_jump_panel_visible_from_inputs(
+            NativeJumpPanelVisibilityInputs {
+                pointer_in_hover_rect: false,
+                left_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle,
+                ..jump_base
+            }
+        ));
         assert!(!native_jump_panel_visible_from_inputs(
             NativeJumpPanelVisibilityInputs {
                 shortcut_help_open: true,
@@ -8663,12 +9049,12 @@ mod tests {
             tag_picker_open: false,
             pointer_in_hover_rect: true,
             side_panel_mode: FsSidePanelMode::ClickToShow,
-            click_info_open: false,
+            info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
         };
         assert!(!native_right_panel_visible_from_inputs(right_base));
         assert!(native_right_panel_visible_from_inputs(
             NativeRightPanelVisibilityInputs {
-                click_info_open: true,
+                info_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByPointer,
                 pointer_in_hover_rect: false,
                 ..right_base
             }
@@ -8676,7 +9062,7 @@ mod tests {
         assert!(!native_right_panel_visible_from_inputs(
             NativeRightPanelVisibilityInputs {
                 metadata_available: false,
-                click_info_open: true,
+                info_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByPointer,
                 ..right_base
             }
         ));
@@ -8688,12 +9074,12 @@ mod tests {
             hover_preview_active: false,
             pointer_in_hover_rect: true,
             side_panel_mode: FsSidePanelMode::ClickToShow,
-            left_session_open: false,
+            left_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
         };
         assert!(!native_jump_panel_visible_from_inputs(jump_base));
         assert!(native_jump_panel_visible_from_inputs(
             NativeJumpPanelVisibilityInputs {
-                left_session_open: true,
+                left_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByPointer,
                 pointer_in_hover_rect: false,
                 ..jump_base
             }
@@ -8722,6 +9108,92 @@ mod tests {
             native_panel_callout_hud_rects(1920.0, 1080.0, true, true, true),
             [None, None]
         );
+    }
+
+    #[test]
+    fn native_touch_handle_regions_follow_latch() {
+        let input = NativeTouchPanelHandleInputs {
+            chrome_latched: true,
+            blocked: false,
+            left_panel_open: false,
+            right_panel_open: false,
+            right_panel_available: true,
+        };
+        let [left, right] = native_touch_panel_handle_hud_rects(1200.0, 600.0, input);
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert_eq!(left.width(), NATIVE_TOUCH_PANEL_HANDLE_WIDTH_PT);
+        assert_eq!(right.width(), NATIVE_TOUCH_PANEL_HANDLE_WIDTH_PT);
+        assert_eq!(left.height(), right.height());
+        assert_eq!(left.top(), right.top());
+        assert_eq!(left.bottom(), right.bottom());
+        assert_eq!(left.left(), 0.0);
+        assert_eq!(right.right(), 1200.0);
+        for rect in [left, right] {
+            assert!(rect.top() >= native_panel_top());
+            assert!(rect.bottom() <= 600.0 - crate::video::native_presenter::HUD_BOTTOM_HEIGHT);
+        }
+    }
+
+    #[test]
+    fn native_touch_handle_regions_hide_unlatched_and_open_sides() {
+        let input = NativeTouchPanelHandleInputs {
+            chrome_latched: false,
+            blocked: false,
+            left_panel_open: false,
+            right_panel_open: false,
+            right_panel_available: true,
+        };
+        assert_eq!(
+            native_touch_panel_handle_hud_rects(1000.0, 800.0, input),
+            [None, None]
+        );
+        let [left, right] = native_touch_panel_handle_hud_rects(
+            1000.0,
+            800.0,
+            NativeTouchPanelHandleInputs {
+                chrome_latched: true,
+                left_panel_open: true,
+                ..input
+            },
+        );
+        assert!(left.is_none());
+        assert!(right.is_some());
+        let [left, right] = native_touch_panel_handle_hud_rects(
+            1000.0,
+            800.0,
+            NativeTouchPanelHandleInputs {
+                chrome_latched: true,
+                right_panel_available: false,
+                ..input
+            },
+        );
+        assert!(left.is_some());
+        assert!(right.is_none());
+    }
+
+    #[test]
+    fn native_touch_panel_outside_taps_are_consumed_only_for_touch_owner() {
+        use crate::ui_helpers::MetadataPanelOpenState::{ByPointer, ByTouchHandle, Closed};
+        let seek =
+            crate::video::native_touch::NativeVideoTouchCommand::SeekRelative { delta_secs: 5.0 };
+        assert!(native_touch_panel_tap_command_dismisses_before_dispatch(
+            seek,
+            ByTouchHandle,
+            ByTouchHandle,
+        ));
+        assert_eq!(
+            native_touch_owned_panel_sides(ByTouchHandle, ByTouchHandle),
+            [true, true]
+        );
+        assert!(native_touch_panel_tap_command_dismisses_before_dispatch(
+            crate::video::native_touch::NativeVideoTouchCommand::ToggleChrome,
+            Closed,
+            ByTouchHandle,
+        ));
+        assert!(!native_touch_panel_tap_command_dismisses_before_dispatch(
+            seek, ByPointer, Closed,
+        ));
     }
 
     #[test]

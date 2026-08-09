@@ -2137,6 +2137,7 @@ struct ViewerContextBundle {
     search_filter_origin_folder: Option<PathBuf>,
     checked: std::collections::HashSet<usize>,
     rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
+    page_dims_cache: crate::page_dims::PageDimsCache,
     rating_cache: std::collections::HashMap<usize, u8>,
     /// App-global な path rating 更新をこの context の idx cache へ反映済みの世代。
     rating_session_write_seen_generation: u64,
@@ -2437,6 +2438,7 @@ impl ViewerContextBundle {
             search_filter_origin_folder: None,
             checked: std::collections::HashSet::new(),
             rotation_cache: std::collections::HashMap::new(),
+            page_dims_cache: crate::page_dims::PageDimsCache::default(),
             rating_cache: std::collections::HashMap::new(),
             rating_session_write_seen_generation: 0,
             metadata_import_refresh_index: None,
@@ -9035,9 +9037,9 @@ pub struct App {
     pub(crate) show_metadata_panel: bool,
     /// 右端ホバーで開いたメタデータパネルを、カーソルがパネル内にいる間だけ維持する。
     pub(crate) metadata_panel_hover_active: bool,
-    /// ClickToShow で右情報パネルを開いているか。現在ファイルだけの transient 状態で、
-    /// ファイル移動またはフルスクリーン退出時に閉じる。
-    pub(crate) fs_click_info_open: bool,
+    /// 右情報パネルの明示 open owner。pointer は ClickToShow 専用、touch handle は
+    /// Hover でも表示する。現在ファイルだけの transient 状態。
+    pub(crate) fs_info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
     /// AI メタデータキャッシュ: 正規化キー → パース結果 (None = メタデータなし)
     /// キーは [`App::metadata_cache_key`] で生成 (ZIP エントリ・PDF ページごとに一意)。
     pub(crate) metadata_cache:
@@ -9330,6 +9332,8 @@ pub struct App {
     pub(crate) rotation_db: Option<crate::rotation_db::RotationDb>,
     /// 現在フォルダのアイテムごとの回転キャッシュ (idx → Rotation)
     pub(crate) rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
+    /// 一度判明したページ寸法をテクスチャの退去後も保持する per-context cache。
+    pub(crate) page_dims_cache: crate::page_dims::PageDimsCache,
 
     // ── 音量ノーマライズ ──────────────────────────────────────────
     /// 動画音量の per-file 測定値キャッシュ (整 LUFS / true peak / 算出ゲイン)。
@@ -9807,9 +9811,10 @@ pub struct App {
     /// Alt+Tab 復帰直後に main viewport が数フレーム focused と報告されても
     /// Focus/raise コマンドを連投しないための debounce。
     fs_last_main_focus_restore_at: Option<std::time::Instant>,
-    /// フォーカス復帰クリックを検出中で、離されるまで全ての左クリック操作を抑制するフラグ。
-    /// 押下 → 離しの間に複数フレームあるため、時間ベースだけでなく状態でも追跡する。
-    pub(crate) fs_suppress_primary_until_release: bool,
+    /// フォーカス復帰 pointer または touch replacement の primary 抑制 owner。
+    /// 相関済み canvas gesture は TouchStream が寿命だけを所有して通し、terminal touch
+    /// replacement は current frame だけ抑制して cross-frame state にはしない。
+    pub(crate) fs_primary_suppression: crate::ui_fullscreen::FullscreenPrimarySuppression,
 
     // ── 通常フルスクリーン ズーム/パン/任意回転 ──────────────
     /// 通常フルスクリーンのズーム倍率（1.0 = フィット）
@@ -10167,8 +10172,8 @@ pub struct App {
     pub(crate) ai_status_done_at: Option<std::time::Instant>,
 
     // ── 画像補正 ──────────────────────────────────────────────────
-    /// 補正パネル表示フラグ (左パネルホバーで表示)
-    pub(crate) adjustment_mode: bool,
+    /// 補正パネルの open owner (左パネルホバー / pointer / touch handle)
+    pub(crate) adjustment_mode: crate::ui_helpers::MetadataPanelOpenState,
     /// 補正レイヤーの独立左パネル表示フラグ。
     pub(crate) local_adjust_mode: bool,
     /// エクスポート / 最後段 crop パネルの独立左パネル表示フラグ。
@@ -10549,9 +10554,9 @@ pub struct App {
     pub(crate) music_left_panel_active: bool,
     /// 音楽ビュー右パネル (情報/★/タグ) の端ホバー開閉ラッチ。左と同じ二段判定。
     pub(crate) music_right_panel_active: bool,
-    /// ClickToShow の音楽ビュー左ジャンプパネル開状態。フルスクリーン / 楽曲単位の
-    /// セッション状態であり、Settings には保存しない。
-    pub(crate) music_left_click_open: bool,
+    /// 音楽ビュー左ジャンプパネルの明示 open owner。pointer 由来は ClickToShow だけ、
+    /// touch handle 由来は Hover でも表示する。Settings には保存しない。
+    pub(crate) music_left_panel_open: crate::ui_helpers::MetadataPanelOpenState,
     /// 左パネルに表示するブックマークのキャッシュ (現在の音声 path 用)。動画と同じ
     /// `VideoBookmarkDb` を path キーで共有する (D5.1)。追加/削除/改名/import で再取得。
     /// 左パネルは Hover の端ラッチまたは ClickToShow のセッション状態で表示する。
@@ -12157,7 +12162,7 @@ impl App {
             favsearch: FavSearchState::default(),
             show_metadata_panel: false,
             metadata_panel_hover_active: false,
-            fs_click_info_open: false,
+            fs_info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
             metadata_cache: std::collections::HashMap::new(),
             exif_cache: std::collections::HashMap::new(),
             xmp_cache: std::collections::HashMap::new(),
@@ -12252,6 +12257,7 @@ impl App {
             search_or_mode: false,
             rotation_db,
             rotation_cache: std::collections::HashMap::new(),
+            page_dims_cache: crate::page_dims::PageDimsCache::default(),
             audio_normalize_db,
             normalize_state: None,
             normalize_ui_states: std::collections::HashMap::new(),
@@ -12426,7 +12432,7 @@ impl App {
             fs_prev_foreground_hwnd: 0,
             fs_last_native_focus_claim_at: None,
             fs_last_main_focus_restore_at: None,
-            fs_suppress_primary_until_release: false,
+            fs_primary_suppression: Default::default(),
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
             fs_zoom_active: false,
@@ -12541,7 +12547,7 @@ impl App {
             ai_status_done_at: None,
 
             // 画像補正
-            adjustment_mode: false,
+            adjustment_mode: crate::ui_helpers::MetadataPanelOpenState::Closed,
             local_adjust_mode: false,
             export_crop_mode: false,
             adjust_spread_target: AdjustSpreadTarget::Left,
@@ -12677,7 +12683,7 @@ impl App {
             music_limiter_visible_until: None,
             music_left_panel_active: false,
             music_right_panel_active: false,
-            music_left_click_open: false,
+            music_left_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
             music_bookmarks: Vec::new(),
             music_bookmarks_loaded_for: None,
             #[cfg(windows)]
@@ -14129,6 +14135,7 @@ impl App {
             search_filter_origin_folder,
             checked,
             rotation_cache,
+            page_dims_cache,
             rating_cache,
             rating_session_write_seen_generation,
             metadata_import_refresh_index,
@@ -14352,6 +14359,7 @@ impl App {
         swap_field!(search_filter_origin_folder);
         swap_field!(checked);
         swap_field!(rotation_cache);
+        swap_field!(page_dims_cache);
         swap_field!(rating_cache);
         swap_field!(rating_session_write_seen_generation);
         swap_field!(metadata_import_refresh_index);
@@ -21928,7 +21936,7 @@ impl App {
         self.thumb_adjust_drag_color_dirty = false;
         self.adjustment_page_params.clear();
         self.adjustment_dragging = false;
-        self.adjustment_mode = false;
+        self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.cache_current_edit_preview_if_ready();
         self.local_adjust_mode = false;
         self.export_crop_mode = false;
@@ -23949,6 +23957,7 @@ impl App {
         // idx-keyed 状態なので、ここでは触らない。削除経路では呼び出し元が idx shift し、
         // 差し替え経路 (Ctrl+G) では呼び出し元が明示的に clear する。
         self.rotation_cache.clear();
+        self.page_dims_cache.clear();
         self.rating_cache.clear();
         self.adjustment_cache.clear();
         self.thumb_pixels.clear();
@@ -29692,6 +29701,13 @@ impl App {
                             source_dims,
                         };
                         textures_created += 1;
+                        // 見開きの縦横判定はテクスチャ寿命に依存させない。元寸法が無い
+                        // 旧 cache 等では、従来の判定と同じくロード済み画像寸法を使う。
+                        if let Some(dims) = source_dims
+                            .or_else(|| Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?)))
+                        {
+                            self.page_dims_cache.record(self.items_generation, i, dims);
+                        }
                         // auto_aspect: 新規 Loaded のタイミングで比率サンプルを記録。
                         // source_dims が None なら ColorImage の (w, h) を fallback として使う
                         // (動画 Shell サムネ / 旧 cache 由来などで source_dims が無いケース)。
@@ -30128,6 +30144,19 @@ impl App {
             grid_vis_first,
             self.fullscreen_idx,
         );
+        let fractional_drag_y = crate::ui_main::grid_touch_scroll_remainder(
+            ctx,
+            self.scroll_offset_y,
+            cell_h,
+            self.items_generation,
+        );
+        let strict_visible_end = crate::ui_main::extend_grid_end_for_touch_fraction(
+            vis_first.saturating_add(items_per_page),
+            cols,
+            vis_count,
+            fractional_drag_y,
+        );
+        let strict_visible_items = strict_visible_end.saturating_sub(vis_first);
 
         let prev_pages = self.settings.thumb_prev_pages as usize;
         let next_pages = self.settings.thumb_next_pages as usize;
@@ -30136,6 +30165,12 @@ impl App {
         let mut vis_keep_end = vis_first
             .saturating_add((1 + next_pages) * items_per_page)
             .min(vis_count);
+        vis_keep_end = crate::ui_main::extend_grid_end_for_touch_fraction(
+            vis_keep_end,
+            cols,
+            vis_count,
+            fractional_drag_y,
+        );
 
         // ── 共有 VRAM pool: サムネイル保持帯 ───────────────────────────
         // モード別のサムネイル配分を超えている場合だけ、実 texture 寸法と TextureId
@@ -30193,6 +30228,13 @@ impl App {
                 }
             }
         }
+        if crate::ui_main::grid_touch_fraction_is_visible(fractional_drag_y) {
+            // The fractional viewport exposes this whole extra row. Even when
+            // the VRAM band is capped, do not evict the row currently peeking
+            // in at the bottom of the touch-dragged grid.
+            vis_keep_start_capped = vis_keep_start_capped.min(vis_first);
+            vis_keep_end = vis_keep_end.max(strict_visible_end);
+        }
 
         // keep_set: prefetch / eviction / retain / idle upgrade がこれを使う。
         let keep_slice = self
@@ -30246,9 +30288,12 @@ impl App {
 
         // 可視範囲の raw index 範囲を計算 (1 ページ分 + 上下 1 行のマージン)
         let vis_visible_start = vis_first.saturating_sub(cols);
-        let vis_visible_end = vis_first
-            .saturating_add(items_per_page + cols)
-            .min(vis_count);
+        let vis_visible_end = crate::ui_main::extend_grid_end_for_touch_fraction(
+            vis_first.saturating_add(items_per_page + cols),
+            cols,
+            vis_count,
+            fractional_drag_y,
+        );
         let visible_raw_start = self
             .visible_indices
             .get(vis_visible_start)
@@ -30325,8 +30370,7 @@ impl App {
         // と誤報告してしまう (= ログ読解で「visible 全部 ready なのに何で遅延?」と混乱)。
         // docs/prefetch-suppression-during-scroll-plan.md 参照。
         let decision_now = std::time::Instant::now();
-        let visible_pending_now: usize = self.visible_indices
-            [vis_first..vis_first.saturating_add(items_per_page).min(vis_count)]
+        let visible_pending_now: usize = self.visible_indices[vis_first..strict_visible_end]
             .iter()
             .filter(|&&raw_idx| {
                 !matches!(
@@ -30740,7 +30784,8 @@ impl App {
         // pop して pdf_pool.normal に積んだ Job は priority=false のまま残る。
         // ここで現フレームの visible PDF を集めて pool に「HighNormal lane へ昇格」を依頼する。
         // (docs/scroll-visibility-priority-plan.md Phase 2)
-        let visible_keys = self.collect_visible_pdf_perf_keys(vis_first, items_per_page, vis_count);
+        let visible_keys =
+            self.collect_visible_pdf_perf_keys(vis_first, strict_visible_items, vis_count);
 
         // **Codex P2-2 対応**: dedup 過剰防止。
         // 単に「keys 一致」では、thumb worker が直後に同じ key を pool.normal へ enqueue
@@ -33482,6 +33527,23 @@ impl App {
         })
     }
 
+    /// Applies one discrete grid-column change without choosing a persistence
+    /// boundary. Mouse wheel saves immediately; touch pinch batches its save
+    /// until the recognizer reports the end of the gesture.
+    pub(crate) fn change_grid_cols_by(&mut self, delta: i32) -> bool {
+        let new_cols = (self.settings.grid_cols as i32 + delta).clamp(
+            crate::settings::MIN_GRID_COLS as i32,
+            crate::settings::MAX_GRID_COLS as i32,
+        ) as usize;
+        if new_cols == self.settings.grid_cols {
+            return false;
+        }
+
+        self.settings.grid_cols = new_cols;
+        self.bump_input_seq("grid_cols", None);
+        true
+    }
+
     fn process_scroll(&mut self, ctx: &egui::Context) {
         // ダイアログ / popup / フルスクリーン表示中はスクロールを消費しない
         // (ダイアログや ComboBox popup 内の ScrollArea が正しく動くようにする)。
@@ -33517,22 +33579,17 @@ impl App {
             if ctrl {
                 // Ctrl+ホイール: 列数を増減（1〜10 の範囲）
                 let delta = -scroll_delta_y.signum() as i32;
-                let new_cols = (self.settings.grid_cols as i32 + delta).clamp(
-                    crate::settings::MIN_GRID_COLS as i32,
-                    crate::settings::MAX_GRID_COLS as i32,
-                ) as usize;
-                if new_cols != self.settings.grid_cols {
-                    self.settings.grid_cols = new_cols;
+                if self.change_grid_cols_by(delta) {
                     self.settings.save();
-                    self.bump_input_seq("grid_cols", None);
                 }
             } else {
                 // 上スクロール(delta>0) → オフセット減、下スクロール(delta<0) → オフセット増
-                let direction = -scroll_delta_y.signum();
                 let prev_offset = self.scroll_offset_y;
-                self.scroll_offset_y = (self.scroll_offset_y + direction * cell_h).max(0.0);
-                // 行境界にスナップ
-                self.scroll_offset_y = (self.scroll_offset_y / cell_h).round() * cell_h;
+                self.scroll_offset_y = crate::ui_main::grid_wheel_scroll_offset(
+                    self.scroll_offset_y,
+                    scroll_delta_y,
+                    cell_h,
+                );
                 if (self.scroll_offset_y - prev_offset).abs() > 0.5 {
                     self.bump_input_seq(
                         "grid_wheel",
@@ -34130,6 +34187,10 @@ impl App {
         // Keep the active detached *sibling* context out of this current-session predicate: the main
         // context can own its own fullscreen while a media window is mounted separately.
         self.fullscreen_idx.is_some() && !self.current_viewer_session_is_detached_or_switching()
+    }
+
+    pub(crate) fn fullscreen_opened_at(&self) -> Option<std::time::Instant> {
+        self.fs_opened_at
     }
 
     fn reconcile_fullscreen_after_main_focus(
@@ -35196,7 +35257,7 @@ impl App {
         self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
 
         self.finish_adjustment_drag_for_detached_pause();
-        self.adjustment_mode = false;
+        self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.cache_current_edit_preview_if_ready();
         self.local_adjust_mode = false;
         self.local_adjust_repair_point_pick_active = None;
@@ -36911,7 +36972,7 @@ impl App {
         self.fs_prev_foreground_hwnd = 0;
         self.fs_last_native_focus_claim_at = None;
         self.fs_last_main_focus_restore_at = None;
-        self.fs_suppress_primary_until_release = false;
+        self.fs_primary_suppression = Default::default();
     }
 
     #[cfg(windows)]
@@ -36945,7 +37006,7 @@ impl App {
         self.fs_prev_foreground_hwnd = 0;
         self.fs_last_native_focus_claim_at = None;
         self.fs_last_main_focus_restore_at = None;
-        self.fs_suppress_primary_until_release = false;
+        self.fs_primary_suppression = Default::default();
     }
 
     #[cfg(windows)]
@@ -38452,6 +38513,7 @@ impl App {
             search_filter_origin_folder,
             checked,
             rotation_cache,
+            page_dims_cache,
             rating_cache,
             rating_session_write_seen_generation,
             current_folder_rating_cache,
@@ -38632,6 +38694,7 @@ impl App {
             search_filter_origin_folder,
             checked,
             rotation_cache,
+            page_dims_cache,
             rating_cache,
             rating_session_write_seen_generation,
             current_folder_rating_cache,
@@ -40833,8 +40896,8 @@ impl App {
         if self.fullscreen_idx.is_some() && self.fullscreen_idx != Some(idx) {
             self.cache_current_edit_preview_if_ready();
         }
-        // ClickToShow の左右パネルはファイル単位の一時状態。新規入場と viewer 内の
-        // ファイル移動が集約されるこの境界で、前ファイルの開状態を引き継がない。
+        // 明示 open の左右パネルはファイル単位の一時状態。新規入場と viewer 内の
+        // ファイル移動が集約されるこの境界で、前ファイルの owner を引き継がない。
         self.reset_fs_side_panel_runtime_for_file_change();
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
         // 別アイテムへナビ / 新規オープンする時点で、前アイテムの「動画→音声モード」(Inc 7) は
@@ -40931,7 +40994,7 @@ impl App {
         self.fs_prev_foreground_hwnd = 0;
         self.fs_last_native_focus_claim_at = None;
         self.fs_last_main_focus_restore_at = None;
-        self.fs_suppress_primary_until_release = false;
+        self.fs_primary_suppression = Default::default();
         self.reset_erase_mode();
 
         // 360 度パノラマビュー: 別画像へナビ時は GPU リソースを解放する
@@ -46836,7 +46899,7 @@ impl App {
         self.music_analysis_error = None;
         self.music_analysis_path = Some(path.to_path_buf());
         // 左ジャンプパネルは楽曲単位のセッション状態。音声→音声ナビでも引き継がない。
-        self.music_left_click_open = false;
+        self.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
 
         // ルックアップキー: size>0 (信頼できる) のときだけ作る。size 不明のビュー (mtime のみ等)
         // では LRU を使わない。
@@ -47059,7 +47122,7 @@ impl App {
         // だけでパネルが再表示される (Codex P3)。
         self.music_left_panel_active = false;
         self.music_right_panel_active = false;
-        self.music_left_click_open = false;
+        self.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         // ブックマークの一時状態 (キャッシュ / 改名ダイアログ / 一括登録ダイアログ) は破棄する。
         // ループ設定はセッション設定として保持する。
         self.music_bookmarks.clear();
@@ -48772,7 +48835,7 @@ impl App {
         self.fs_prev_foreground_hwnd = 0;
         self.fs_last_native_focus_claim_at = None;
         self.fs_last_main_focus_restore_at = None;
-        self.fs_suppress_primary_until_release = false;
+        self.fs_primary_suppression = Default::default();
         self.fs_secondary_press_start = None;
         #[cfg(windows)]
         {
@@ -56075,9 +56138,9 @@ impl App {
     }
 
     pub(crate) fn metadata_panel_click_shown(&self) -> bool {
-        crate::ui_helpers::metadata_panel_click_shown(
+        crate::ui_helpers::metadata_panel_explicit_shown(
             self.settings.fullscreen_side_panel_mode,
-            self.fs_click_info_open,
+            self.fs_info_panel_open,
         )
     }
 
@@ -56095,7 +56158,7 @@ impl App {
         self.close_fs_side_panel_runtime();
     }
 
-    /// ClickToShow の左右パネルを現在ファイルの境界で閉じる。
+    /// 明示 open の左右パネルを現在ファイルの境界で閉じる。
     pub(crate) fn reset_fs_side_panel_runtime_for_file_change(&mut self) {
         // 表示トリムの保存責務はパネルが現在見えているかではなく、編集対象ファイルが
         // 変わるこの境界が持つ。Hover パネル外で mouse-up した場合や、同フレームに
@@ -56106,21 +56169,86 @@ impl App {
 
     fn close_fs_side_panel_runtime(&mut self) {
         self.metadata_panel_hover_active = false;
-        self.adjustment_mode = false;
-        self.fs_click_info_open = false;
+        self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
+        self.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.music_left_panel_active = false;
         self.music_right_panel_active = false;
-        self.music_left_click_open = false;
+        self.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
     }
 
     pub(crate) fn toggle_fullscreen_click_info_open(&mut self) {
-        if self.settings.fullscreen_side_panel_mode.normalized()
-            != crate::settings::FsSidePanelMode::ClickToShow
-        {
+        let next = crate::ui_helpers::toggle_side_panel_by_pointer(
+            self.settings.fullscreen_side_panel_mode,
+            self.fs_info_panel_open,
+        );
+        if next != self.fs_info_panel_open {
+            self.fs_info_panel_open = next;
+            self.metadata_panel_hover_active = false;
+        }
+    }
+
+    pub(crate) fn toggle_fullscreen_pointer_adjustment_panel(&mut self) {
+        let next = crate::ui_helpers::toggle_side_panel_by_pointer(
+            self.settings.fullscreen_side_panel_mode,
+            self.adjustment_mode,
+        );
+        if next == self.adjustment_mode {
             return;
         }
-        self.fs_click_info_open = !self.fs_click_info_open;
+        if self.adjustment_mode.is_open() {
+            self.persist_pending_view_trim_state();
+        }
+        self.adjustment_mode = next;
+    }
+
+    pub(crate) fn open_fullscreen_touch_adjustment_panel(&mut self) {
+        self.adjustment_mode = crate::ui_helpers::open_side_panel_by_touch(self.adjustment_mode);
+    }
+
+    pub(crate) fn open_fullscreen_touch_info_panel(&mut self) {
+        self.fs_info_panel_open =
+            crate::ui_helpers::open_side_panel_by_touch(self.fs_info_panel_open);
         self.metadata_panel_hover_active = false;
+    }
+
+    pub(crate) fn close_fullscreen_adjustment_panel(&mut self) {
+        if self.adjustment_mode.is_open() {
+            self.persist_pending_view_trim_state();
+        }
+        self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
+    }
+
+    pub(crate) fn close_fullscreen_info_panel(&mut self) {
+        self.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
+        self.metadata_panel_hover_active = false;
+    }
+
+    /// A canvas tap outside the open panel group closes every touch-owned side
+    /// panel together and is consumed by the caller. Pointer-owned panels are
+    /// deliberately untouched, including when only one side is touch-owned.
+    pub(crate) fn close_touch_owned_side_panels(&mut self) -> bool {
+        let close_left =
+            self.adjustment_mode == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
+        let close_right =
+            self.fs_info_panel_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
+        if close_left {
+            self.close_fullscreen_adjustment_panel();
+        }
+        if close_right {
+            self.close_fullscreen_info_panel();
+        }
+        close_left || close_right
+    }
+
+    /// 連結表示の再アンカーは pointer-open を従来どおり維持するが、touch handle の
+    /// current-file state はページ移動境界で左右とも閉じる。
+    pub(crate) fn close_touch_side_panels_for_file_change(&mut self) {
+        if self.adjustment_mode == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle {
+            self.close_fullscreen_adjustment_panel();
+        }
+        if self.fs_info_panel_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle {
+            self.close_fullscreen_info_panel();
+        }
     }
 
     pub(crate) fn close_click_side_panels(&mut self) -> bool {
@@ -56129,18 +56257,18 @@ impl App {
         {
             return false;
         }
-        let close_right = self.fs_click_info_open;
+        let close_right = self.metadata_panel_click_shown();
         let close_music_left = self
             .fullscreen_idx
             .is_some_and(|idx| self.fs_music_view_active(idx))
-            && self.music_left_click_open;
-        let closed = self.adjustment_mode || close_music_left || close_right;
-        if self.adjustment_mode {
+            && self.music_left_panel_open.is_open();
+        let closed = self.adjustment_mode.is_open() || close_music_left || close_right;
+        if self.adjustment_mode.is_open() {
             self.persist_pending_view_trim_state();
         }
-        self.adjustment_mode = false;
-        self.music_left_click_open = false;
-        self.fs_click_info_open = false;
+        self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
+        self.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
+        self.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         closed
     }
 
@@ -59109,7 +59237,7 @@ impl App {
         self.slideshow_anchor_idx = None;
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
-        self.adjustment_mode = false;
+        self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.cache_current_edit_preview_if_ready();
         self.local_adjust_mode = false;
         self.local_adjust_repair_point_pick_active = None;
@@ -62074,6 +62202,7 @@ impl eframe::App for App {
         // メインビューポートの IME 状態を更新 (ここで Ime イベントを拾う)。
         // フルスクリーンビューポートは別イベントキューなので render_fullscreen_viewport 内で別途呼ぶ。
         self.update_ime_state(ctx);
+        crate::touch_debug::log_egui_touch_events(ctx, self.frame_counter);
 
         // エクスプローラ等から mIV へドロップされたファイル / フォルダを現在のフォルダへコピーする
         // (mIV → 外部 のドラッグ送出と対称の受け取り方向)。毎フレーム走るので、

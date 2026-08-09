@@ -125,6 +125,7 @@ pub mod native_context_menu;
 mod native_name_dialog;
 pub mod open_with;
 pub mod os_theme;
+mod page_dims;
 pub mod panorama;
 pub mod panorama_wgpu;
 pub mod path_key;
@@ -176,6 +177,9 @@ pub mod tag_write_worker;
 pub mod tags_db;
 pub mod thumb_loader;
 pub mod thumb_overlay_layout;
+mod touch_correlation;
+mod touch_debug;
+pub(crate) mod touch_input;
 pub mod tray;
 mod tray_integration;
 mod ui_adjustment_panel;
@@ -188,6 +192,11 @@ mod ui_folder_pane;
 pub mod ui_font_catalog;
 pub mod ui_fonts;
 mod ui_fullscreen;
+#[doc(hidden)]
+pub use ui_fullscreen::{
+    draw_music_panel_reach_snapshot_fixture, draw_still_panel_reach_snapshot_fixture,
+    draw_still_touch_first_run_help_snapshot_fixture,
+};
 pub mod ui_helpers;
 mod ui_main;
 mod ui_metadata_panel;

@@ -182,9 +182,14 @@ gate 解放後 update_keep_range_and_requests が再走したときに新規 enq
 で clear されるため backstop 計算に使えない。
 
 `last_prefetch_scroll_at` は:
-- `App::update` 冒頭の input intent detection (= ctx.input ベース) で set
+- `App::update` 冒頭の input intent detection (= ctx.input ベース。thumbnail grid の
+  raw Touch Move / End も含む) で prefetch 用 timestamp を set。End を含めるのは、
+  指を止めてから離した frame に snap 補間開始前の gate が開くことを防ぐため
 - `update_scroll_settle_state` の offset 変化検出でも fallback として set
-  (= scrollbar drag / touch などキー以外の経路の保険)
+  (= scrollbar drag などキー以外の経路の保険)
+- 一覧の touch drag は `scroll_offset_y` を行境界に保ったまま描画端数だけ動くため、
+  touch command 適用境界から move / hold / release と snap 補間の各 frame で prefetch /
+  settle / idle-upgrade の各 timestamp を明示的に set。snap 補間完了までは scroll 中として扱う
 - **clear しない**。backstop 3 秒は前回の scroll から経った時間で判定する
 - folder 切替 (= `start_loading_items`) では `None` ではなく **`Some(now)`** にリセット
   (= 「直前にスクロールしたのと同じ扱い」で新コンテキストでも gate を効かせる、Codex R4 確認)
@@ -216,10 +221,10 @@ if (cur_offset - self.prev_scroll_offset_y).abs() > 0.5 {
 }
 ```
 
-input intent detection は **scrollbar ドラッグや touch を直接拾わない** が、
-そういう経路では offset 変化が遅れて発生するので fallback で 1 フレ遅れて
-last_prefetch_scroll_at が更新される。実害は 1 frame の prefetch 漏れだけで、
-q.retain で次フレ確実に prune される (= 1.2 で正しい priority タイミング後に prune)。
+input intent detection は **scrollbar ドラッグを直接拾わない** が、この経路では offset 変化が
+発生するので fallback で 1 フレ遅れて last_prefetch_scroll_at が更新される。実害は 1 frame の
+prefetch 漏れだけで、q.retain で次フレ確実に prune される (= 1.2 で正しい priority タイミング後に
+prune)。一覧の touch drag は offset が変わらない端数フレームを持つため、この fallback には頼らない。
 
 ### 1.4 backstop (Codex R1 P2-3 対応、`decide_prefetch_allowed` 内に統合)
 

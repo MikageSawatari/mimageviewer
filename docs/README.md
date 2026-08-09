@@ -26,7 +26,7 @@
 | [top-level-grid-view.md](top-level-grid-view.md) | 検索・★固定・サブ展開・スマートフォルダ等の最上位一覧 ownership / 復元 snapshot と、スマートフォルダ root / scoped drill の不変条件 |
 | [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md) | フルスクリーン / 検索結果 / 動画タイルをまたぐ Ctrl+↑↓・境界ヒント・前後移動の統一仕様メモ |
 | [keymap-spec.md](keymap-spec.md) + [key-customization-impl-plan.md](key-customization-impl-plan.md) + [key-command-catalog-plan.md](key-command-catalog-plan.md) | キーボード操作 / ショートカット / `consume_key` / `key_pressed` / native VK 判定 / コマンドカタログ化を触るとき。新しいキー操作は keymap 対応要否を必ず確認 |
-| [touch-support-plan.md](touch-support-plan.md) | **調査完了・設計検討中 / 未実装**。タブレット PC のタッチ操作対応。タッチ入力が winit / egui-winit のどこまで届いているか、ホバー依存 UI の棚卸し、競合 NeeView の方式、3 領域タップ + 中央クローム + anchor-fraction スクロール + ピンチの設計案とフェーズ別工数。タッチ / ポインタ入力を触るときに読む |
+| [touch-support-plan.md](touch-support-plan.md) | **仕様確定 / Phase 2 + Step 3d まで実装済み**。タブレット PC のタッチ操作対応。静止画 / 本フルスクリーンは左右タップのページ送り、中央タップの上下クロームと左右パネルハンドル、2 本指ズーム / パン、中央タップを学習するまでの初回オーバーレイヘルプを配線済み。サムネイル一覧は行スナップを維持した 1 本指スクロール、進行方向への release 確定、2 本指ピンチによる列数変更を配線済み。選択済みセルの再タップ open は利用者判断で見送り。動画 / 音楽のタッチ操作は Phase 3。3 領域タップ + 中央クローム + anchor-fraction スクロール + ピンチの設計とフェーズ別工数。タッチ / ポインタ入力を触るときに読む |
 
 ## 仕様・機能
 
@@ -102,6 +102,7 @@
 | [tag-catalog-redesign-plan.md](tag-catalog-redesign-plan.md) | `tags.db`、タグ facet、メタデータ転送を含む現行タグ機能の正本 |
 | [sidecar-metadata-ingest.md](sidecar-metadata-ingest.md) | サイドカー経由のメタデータ取り込み。**`tags.db` 移行前の記述が残っており内容更新待ち**。現行のタグ正本は上の tag-catalog-redesign-plan.md |
 | [video-architecture.md](video-architecture.md) | 動画サブシステムの恒久正本。D3D11VA + native presenter、channel/pacing、current module responsibility、ownership 負債を記載。行数 snapshot は監査記録へ分離 |
+| [video-upscale-shader-plan.md](video-upscale-shader-plan.md) | **設計確定 / 未実装**。動画の拡大縮小を DWM/DComp から mIV のシェーダへ移す設計。表示解像度サーフェス、Phase A (Lanczos3/NIS/ニアレスト+縮小) と Phase B (Anime4K)、変種の一般化、実測によるモデル選択、切替で固まらせない不変条件 |
 | [playback-speed-design.md](playback-speed-design.md) | 動画倍速再生機能の仕様。Signalsmith Stretch、音声 PTS/PDC/queue 秒数、native-only 速度 HUD、検証計画 |
 | [ffmpeg-lgpl-source-distribution.md](ffmpeg-lgpl-source-distribution.md) | FFmpeg LGPLv3-or-later build の配布時チェックリスト、対応ソース、同梱外部ライブラリの確認メモ |
 | [licensing-tensorrt.md](licensing-tensorrt.md) | TensorRT 対応のライセンス、再配布境界、確認事項 |

@@ -332,6 +332,8 @@ C:\home\mimageviewer_vendor_backup\
   スクロールオフセットは App が自前管理（egui の自動スクロールは使わない）。
 - **Row snapping**: オフセットは常に `cell_size` の整数倍。最大オフセットも
   `ceil((total_h - viewport_h) / cell_size) * cell_size` で行境界に揃える。
+  一覧の touch drag も `scroll_offset_y` 自体は anchor として行境界に保ち、1 行未満の
+  描画端数だけを viewport の一時データに分離する。端数を canonical offset へ混ぜない。
 - **Mouse wheel**: `ctx.input_mut` で MouseWheel イベントを消費し、1行分に変換。
 - **Popup / menu wheel passthrough**: `menu_button` / `ComboBox` / popup 内に
   `ScrollArea` を置く場合、popup が開いている frame では `raw_scroll_delta` /
@@ -553,9 +555,13 @@ pool に流れる前に止めるので cancel 不可問題に影響されない�
 
 `last_prefetch_scroll_at` は **`emit_scroll_settle_event` で clear されない** 専用 timestamp
 (`last_scroll_event_at` とは別)。`App::update` 冒頭の `detect_scroll_input_intent`
-(ctx.input wheel + arrow keys + Page/Home/End) で即時更新する。
+(ctx.input wheel + arrow keys + Page/Home/End + thumbnail grid の Touch Move / End) で即時更新する。
 これで `update_keep_range_and_requests` の gate 判定時に同フレーム入力が反映済み。
-scrollbar drag / touch は `update_scroll_settle_state` の offset 変化 fallback で 1 フレ遅れて拾う。
+scrollbar drag は `update_scroll_settle_state` の offset 変化 fallback で 1 フレ遅れて拾う。
+一覧の touch drag は early Touch Move intent で同フレームの prefetch を止め、端数だけ動く
+フレームでも settle / idle-upgrade を止めるため、`ui_main.rs` の touch command 適用境界と
+release 後の snap 補間中から各 timestamp を明示更新する。snap 補間は行高の 20% 以上を
+130ms ease-out で端数だけ動かし、anchor は完了時に 1 回だけ更新する。
 
 新 perf イベント:
 - `ui/prefetch_suppressed`: `transition`(start/continue/end) + `allow_reason`(unblock 時) +

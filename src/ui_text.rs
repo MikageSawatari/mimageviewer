@@ -53,6 +53,15 @@ const HANDLE_R: f32 = 7.0;
 /// 超過時は最古エントリから捨てる。
 const COMIC_UNDO_CAP: usize = 100;
 
+fn text_floating_ui_blocks_canvas_input(
+    ctx: &egui::Context,
+    pointer_pos: Option<egui::Pos2>,
+) -> bool {
+    pointer_pos
+        .and_then(|pos| ctx.layer_id_at(pos))
+        .is_some_and(|layer| matches!(layer.order, egui::Order::Middle | egui::Order::Foreground))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum TextAlignReference {
     #[default]
@@ -2357,7 +2366,6 @@ impl App {
         ctx: &egui::Context,
         transform: &DisplayedImageTransform,
     ) {
-        let image_rect = transform.viewport_rect;
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
@@ -2367,8 +2375,6 @@ impl App {
         let Some(view) = self.text_img_view(fs_idx, transform) else {
             return;
         };
-        let panel_rect = self.text_panel_rect(image_rect);
-        let detail_rect = self.text_detail_panel_rect(image_rect);
         let fonts = self.ensure_comic_fonts();
 
         let (pressed, down, released, pos) = ctx.input(|i| {
@@ -2379,13 +2385,12 @@ impl App {
                 i.pointer.interact_pos(),
             )
         });
-        let pointer_over_panel =
-            pos.is_some_and(|p| panel_rect.contains(p) || detail_rect.contains(p));
+        let pointer_over_floating_ui = text_floating_ui_blocks_canvas_input(ctx, pos);
         if self.text_drag.is_none()
             && self.handle_overlay_space_pan_drag(
                 ctx,
                 self.keymap.key_held_action(ctx, KeyAction::TextSpacePan),
-                !pointer_over_panel,
+                !pointer_over_floating_ui,
                 pressed,
                 down,
                 released,
@@ -2416,7 +2421,7 @@ impl App {
         if pressed {
             self.text_smart_guides = TextSmartGuides::default();
             if let Some(pos) = pos {
-                if pointer_over_panel {
+                if pointer_over_floating_ui {
                     return;
                 }
                 let img = view.screen_to_image(pos);
@@ -2658,8 +2663,8 @@ impl App {
 
     // ── オーバーレイ描画 ──────────────────────────────────────────────
 
-    /// テキストモードのパネル領域 (クリック吸収判定用)。
-    /// 左右パネルの本体 (スクロール領域) の高さ。`draw_text_panel` と入力抑制矩形
+    /// テキストモードのパネル領域 (Area 内のクリック吸収 sink 用)。
+    /// 左右パネルの本体 (スクロール領域) の高さ。`draw_text_panel` と左右 Area の sink 矩形
     /// (`text_panel_rect` / `text_detail_panel_rect`) で同じ値を共有する。
     fn text_panel_body_height(image_rect: egui::Rect) -> f32 {
         // body (一覧スクロール + 操作行) は利用可能高から chrome (ヘッダ / 追加行 /
@@ -9506,6 +9511,70 @@ fn shape_half(shape: &BubbleShape) -> (f32, f32) {
 mod tests {
     use super::*;
     use crate::rotation_db::Rotation;
+
+    fn primary_press_input(pos: egui::Pos2) -> egui::RawInput {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 480.0),
+            )),
+            ..Default::default()
+        };
+        input.events.push(egui::Event::PointerMoved(pos));
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        input
+    }
+
+    #[test]
+    fn floating_layer_outside_panel_blocks_text_canvas_click() {
+        use std::cell::Cell;
+
+        let pos = egui::pos2(450.0, 150.0);
+        let panel_rect = egui::Rect::from_min_size(
+            egui::pos2(PANEL_MARGIN_X, PANEL_MARGIN_Y),
+            egui::vec2(PANEL_W + 16.0, 300.0),
+        );
+        assert!(!panel_rect.contains(pos));
+        let blocked = Cell::new(false);
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let mut priming_input = primary_press_input(pos);
+            priming_input.events.truncate(1);
+            let _ = ctx.run(priming_input, |ctx| {
+                egui::Area::new(egui::Id::new(0xC010_57u64))
+                    .fixed_pos(egui::pos2(400.0, 100.0))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| ui.set_min_size(egui::vec2(100.0, 100.0)));
+            });
+        }
+        let _ = ctx.run(primary_press_input(pos), |ctx| {
+            assert!(ctx.input(|input| input.pointer.primary_pressed()));
+            blocked.set(text_floating_ui_blocks_canvas_input(
+                ctx,
+                ctx.input(|input| input.pointer.interact_pos()),
+            ));
+            egui::Area::new(egui::Id::new(0xC010_57u64))
+                .fixed_pos(egui::pos2(400.0, 100.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| ui.set_min_size(egui::vec2(100.0, 100.0)));
+        });
+        assert!(blocked.get());
+
+        let unblocked = Cell::new(true);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(primary_press_input(pos), |ctx| {
+            unblocked.set(text_floating_ui_blocks_canvas_input(
+                ctx,
+                ctx.input(|input| input.pointer.interact_pos()),
+            ));
+        });
+        assert!(!unblocked.get());
+    }
 
     fn badge_object(id: u64, text: &str, tagged: bool) -> AnnotationObject {
         let mut bubble = build_annotation_bubble(

@@ -21,6 +21,11 @@ Pending ──────────(ワーカーがデコード)────�
 
 Failed は単発の終端ステート。デコードエラー時のみ。
 
+`Loaded` へ遷移した時点で、`source_dims`（無ければロード済み画像寸法）を per-context の
+`PageDimsCache` に記録する。`Evicted` は GPU texture だけを破棄し、同じ `items_generation` で
+判明済みのページ寸法は残す。idx 空間が変わるときだけ `invalidate_idx_state_and_queues` で clear し、
+cache 自身の generation 不一致も `None` へ fail-closed する。
+
 ### 1.2 2 フェーズ優先ロード
 
 `App::update()` 毎フレーム:
@@ -286,6 +291,11 @@ ui_fullscreen.rs::render_fullscreen_viewport
     ├─ rotation + zoom + pan + free_rotation を合成して描画
     └─ update_prefetch_window(idx)     # フィルタ後の前後数枚を先読み / 範囲外を解放
 ```
+
+frame 冒頭では、先読み窓ぶんの `fs_cache` を 1 回だけ走査し、`Static` / `Animated` / `Video` が
+現在の縦横判定に使う寸法を `PageDimsCache` へ回収する。見開きの判定順は `fs_cache` →
+ロード済みサムネイル → `PageDimsCache` → 未知なら縦長扱いであり、一度判明した寸法は live cache
+退去後も同じ viewer context / items 世代に残る。全 thumbnails の毎 frame 走査は行わない。
 
 **`keep_fullscreen_viewport_alive`** はフルスクリーン非アクティブ時 (`fullscreen_idx == None`)
 に呼ばれ、`fs_viewport_shown == true` の 1 フレームだけ `Visible(false)` cmd を送って hidden 化
@@ -966,10 +976,23 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 フルスクリーンのナビゲータも、このフレームで描画済みの `FullscreenPageLayout` を正本にする。
 単ページ / 見開きの各 `DisplayedImageTransform` を同じ比率で縮小した座標空間へ写し、
 現在範囲は `visible_source_uv_rect(clip_rect)` の UV をその縮小 transform へ戻して描く。
+画像全体が見えている場合もナビゲータは隠さない。表示範囲枠は全体枠に置き、実表示がフィット基準
+より小さいときは縮小画像だけを内側へ連続的に縮める（下限 40%）。フィット丁度では画像 = 枠 =
+全体となり、ズームアウトをまたいで大きさが飛ばない。
 ナビゲータ上の位置は `screen_to_source_normalized` で UV へ変換し、
 `pan_to_center_source_normalized` で倍率を変えずに画面中央へ置く `fs_pan` を求める。
 このためフィット、表示トリム、90度回転、見開きの配置をナビゲータ側で再計算しない。
-縮小画像は既存のサムネイルカタログを使い、UI スレッドで画像読み込みやデコードを行わない。
+縮小画像は、そのフレームの単ページ / 見開き描画が解決済みの
+`FullscreenPaintResource::source_texture()` を使う。これは加工済みの full-image texture であり、
+ズーム中に可視 source 領域だけを持つ Lanczos 拡大出力 (`paint_texture_id()`) は使わない。
+加工済み composite が未準備のページだけは既存のサムネイルカタログへフォールバックし、黒や
+点滅を挟まない。nav / colorize holdover を重ねたフレームは、ナビゲータへ渡す idx → resource も
+その display unit 全体へ置き換え、本文とナビゲータが新旧ページで食い違わないようにする。
+ナビゲータ自身は texture producer を呼ばず、UI スレッドで画像読み込みやデコードも行わない。
+比較表示では本文と同じ単一比較キャンバスをレイアウト正本とし、Wipe / Diff はナビゲータの
+画像矩形へ `zoom_pan=None` で同じ `CompareShaderCallback` を再描画する。PinnedNormal は
+準備済み pinned texture を直接描画する。同一フレームの2 callback は同じ `pair.key` と寸法を
+渡すため GPU texture / mip chain / bind group を再利用し、2回目は uniform 更新と draw だけを行う。
 通常の単ページ / 見開きで利用者入力から `fs_pan` を更新するときは、直前の
 `FullscreenPageLayout` に記録された実表示矩形を使い、少なくとも 1 ページが viewport と
 各軸 48 logical point（ページまたは viewport がそれより小さい軸では、その小さい方の全幅）
@@ -981,15 +1004,14 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 
 ナビゲータが実際に表示されている間は、そのパネル矩形を配置された側の左右端と上下端まで
 それぞれ広げた領域を、同じ側のサイドパネルと上下ホバーバーの受動的な表示判定から除外する。
-反対側の画面端は除外せず、ナビゲータが自動非表示または実効非表示なら除外領域を作らない。
+反対側の画面端は除外せず、ナビゲータが実効非表示なら除外領域を作らない。
 360度パノラマでは `FullscreenPageLayout` を使わず、equirect の元画像をレターボックス表示する。
 現在範囲は viewport の NDC 外周を `panorama::ndc_to_equirect_uv` へ通した折れ線とし、
 `aspect = viewport_w / viewport_h` と `tan_half = tan(fov_y / 2)` は `panorama_wgpu` と同じ導出を使う。
 yaw の継ぎ目では隣接点の U 差が 0.5 を超える線分を分割する。クリック / ドラッグは
 `PanoramaState` の yaw / pitch / fov_y だけを更新し、GPU 描画経路には介入しない。
-平面は全体が見えると自動非表示になるが、パノラマは `FOV_MAX` でも全球を表示できないため
-設定が ON の間は常に表示する。`FullscreenPageLayoutKind::Continuous` は全体図が極端に
-細長くなるため引き続き対象外とする。
+平面・パノラマとも、利用者が固定表示またはホールド表示を要求している間は全体可視でも表示する。
+`FullscreenPageLayoutKind::Continuous` は全体図が極端に細長くなるため引き続き対象外とする。
 
 ### 2.4.1 フルスクリーン静止画の GPU Lanczos3 縮小・標準拡大と選択式拡大
 

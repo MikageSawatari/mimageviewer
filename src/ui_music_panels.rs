@@ -245,6 +245,19 @@ fn info_row(ui: &mut egui::Ui, label: &str, value: &str, clicked_url: &mut Optio
     ui.add_space(2.0);
 }
 
+/// 音楽ビューの左右パネルに明示クローズを出すか。
+///
+/// 判定に使うのは表示モードではなく **open owner**。touch handle は Hover でも明示 open を
+/// 作るので、モードで判定すると「タッチで開いたパネルを閉じる手段が無い」経路ができる
+/// (実機 2026-08-09、右パネルで実際に起きた)。左右で同じ規則を使うことが不変条件なので、
+/// 両パネルの描画をこの 1 関数へ通す。
+pub(crate) fn music_side_panel_close_visible(
+    mode: crate::settings::FsSidePanelMode,
+    open_state: crate::ui_helpers::MetadataPanelOpenState,
+) -> bool {
+    crate::ui_helpers::metadata_panel_explicit_shown(mode, open_state)
+}
+
 impl App {
     // ───────────────────────── ブックマークのデータ操作 ─────────────────────────
 
@@ -569,9 +582,10 @@ impl App {
             egui::Color32::from_gray(205),
         );
         let mut close_requested = false;
-        if self.settings.fullscreen_side_panel_mode.normalized()
-            == crate::settings::FsSidePanelMode::ClickToShow
-        {
+        if music_side_panel_close_visible(
+            self.settings.fullscreen_side_panel_mode,
+            self.fs_info_panel_open,
+        ) {
             let close_rect = egui::Rect::from_center_size(
                 egui::pos2(title_rect.right() - 16.0, title_rect.center().y),
                 egui::vec2(24.0, 24.0),
@@ -710,7 +724,7 @@ impl App {
             crate::ui_helpers::open_url(&url);
         }
         if close_requested {
-            self.toggle_fullscreen_click_info_open();
+            self.close_fullscreen_info_panel();
         }
     }
 
@@ -770,8 +784,10 @@ impl App {
         let mut title_edit = self.music_bookmark_title_edit.take();
         let mut bulk = self.music_bulk_bookmark_dialog.take();
         let mut commands: Vec<NativeOverlayCommand> = Vec::new();
-        let click_to_show = self.settings.fullscreen_side_panel_mode.normalized()
-            == crate::settings::FsSidePanelMode::ClickToShow;
+        let explicit_open = music_side_panel_close_visible(
+            self.settings.fullscreen_side_panel_mode,
+            self.music_left_panel_open,
+        );
         let mut close_left_requested = false;
         // 音楽ビューではサムネを出さないので空の texture マップを渡す
         // (show_thumbnails=false で未参照)。
@@ -803,7 +819,7 @@ impl App {
                         &mut bulk,
                         &mut commands,
                     );
-                    if click_to_show {
+                    if explicit_open {
                         // 共有 body の右側はブックマーク / 一括ボタンが使うため、タイトル直後に
                         // music 専用の明示クローズを置く。
                         let close_rect = egui::Rect::from_min_size(
@@ -830,7 +846,7 @@ impl App {
                 });
         }
         if close_left_requested {
-            self.music_left_click_open = false;
+            self.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         }
 
         // ── 中央モーダル (改名 / 一括登録) は開いている間常に描く ──
@@ -1825,6 +1841,38 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// タッチで開いたパネルは Hover モードでも閉じられなければならない。
+    ///
+    /// 左右で別々にモード判定を書いていたため、右パネルだけ「タッチで開いたのに閉じる
+    /// ボタンが出ない」状態になっていた (実機 2026-08-09)。左右が同じ 1 関数を通ることを
+    /// 前提に、規則そのものをここで固定する。
+    #[test]
+    fn music_side_panel_close_follows_the_open_owner_not_the_mode() {
+        use crate::settings::FsSidePanelMode;
+        use crate::ui_helpers::MetadataPanelOpenState;
+
+        for mode in [FsSidePanelMode::Hover, FsSidePanelMode::ClickToShow] {
+            assert!(
+                music_side_panel_close_visible(mode, MetadataPanelOpenState::ByTouchHandle),
+                "touch handle で開いたパネルは {mode:?} でも閉じられること"
+            );
+            assert!(
+                !music_side_panel_close_visible(mode, MetadataPanelOpenState::Closed),
+                "閉じているパネルに閉じるボタンを出さないこと ({mode:?})"
+            );
+        }
+
+        // マウス由来は従来どおり ClickToShow のときだけ明示 open として扱う。
+        assert!(!music_side_panel_close_visible(
+            FsSidePanelMode::Hover,
+            MetadataPanelOpenState::ByPointer
+        ));
+        assert!(music_side_panel_close_visible(
+            FsSidePanelMode::ClickToShow,
+            MetadataPanelOpenState::ByPointer
+        ));
+    }
 
     #[test]
     fn hms_formats() {
