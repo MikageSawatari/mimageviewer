@@ -10,9 +10,11 @@ import {
   hlsBufferConfig,
   hlsErrorTelemetryDetails,
   hlsFragmentLoadMetrics,
+  mediaElementVolumeControlSupported,
   preventVideoNativeZoom,
   resolveVideoPlaylist,
   videoAudioProcessingPresentation,
+  videoControlMenuPresentation,
   videoEndDecision,
   videoPlayRejectionDecision,
   videoPlaybackControlTransition,
@@ -20,6 +22,7 @@ import {
   videoHealthSample,
   videoHealthSamplingDecision,
   videoSeekRelativeDragValue,
+  videoVolumeRelativeDragValue,
   videoUserErrorMessage,
 } from "./video-stream.mjs";
 
@@ -905,6 +908,52 @@ test("video seek drag maps pointer travel to the visible timeline scale", () => 
   assert.equal(drag(220, 280), 240);
   assert.equal(drag(100, 400), 600);
   assert.equal(drag(100, -200), 0);
+});
+
+test("volume capability probes assignment and restores before media attachment", () => {
+  const supported = { volume: 1 };
+  assert.equal(mediaElementVolumeControlSupported(supported), true);
+  assert.equal(supported.volume, 1);
+
+  let ignoredVolume = 1;
+  const ignored = {};
+  Object.defineProperty(ignored, "volume", {
+    get: () => ignoredVolume,
+    set: () => {},
+  });
+  assert.equal(mediaElementVolumeControlSupported(ignored), false);
+  assert.equal(ignoredVolume, 1);
+});
+
+test("unsupported media volume hides the slider without hiding quality controls", () => {
+  assert.deepEqual(videoControlMenuPresentation({
+    hasVideo: true,
+    volumeControlSupported: false,
+  }), {
+    mediaNoun: "動画",
+    qualityNoun: "画質",
+    controlsTitle: "画質",
+    showVolume: false,
+  });
+  assert.equal(videoControlMenuPresentation({
+    hasVideo: false,
+    volumeControlSupported: true,
+  }).controlsTitle, "音量と音質");
+});
+
+test("volume drag shares the relative range calculation and ignores press position", () => {
+  const drag = (startClientX, currentClientX) => videoVolumeRelativeDragValue({
+    startVolume: 0.5,
+    startClientX,
+    currentClientX,
+    trackWidth: 100,
+    step: 0.01,
+  });
+  assert.equal(drag(10, 30), 0.7);
+  assert.equal(drag(70, 90), 0.7);
+  assert.equal(drag(20, 20), 0.5);
+  assert.equal(drag(20, 200), 1);
+  assert.equal(drag(80, -100), 0);
 });
 
 test("video seek pointer maps micro travel to an absolute tap and threshold travel to a relative drag", () => {

@@ -233,16 +233,23 @@ test("session epoch removes page preflight and repeated active acquisition", asy
   assert.doesNotMatch(app, /state\.viewer\?\.invalidatePendingLoad\(\)/);
 });
 
-test("remote state generation refreshes the canonical home data coordinator", async () => {
+test("remote session acquisition refreshes the canonical home data coordinator", async () => {
   const app = await readFile(new URL("app.js", here), "utf8");
   assert.match(
     app,
     /enterAuthenticatedApp[\s\S]*await remoteHomeDataRefreshCoordinator\.loadInitial\(\)/
   );
+  const sessionBody = app.match(
+    /function applyRemoteSessionId[\s\S]*?\n}\n\nconst APP_UPDATE_POLL_INTERVAL_MS/
+  )?.[0] ?? "";
+  const generationBody = app.match(
+    /function applyRemoteStateGeneration[\s\S]*?\n}\n\nfunction setRemoteSessionStatus/
+  )?.[0] ?? "";
   assert.match(
-    app,
-    /function applyRemoteStateGeneration[\s\S]*remoteHomeDataRefreshCoordinator\.refreshAfterGenerationChange\(\)/
+    sessionBody,
+    /if \(next\)[\s\S]*refreshHomeData\(\)/
   );
+  assert.doesNotMatch(generationBody, /remoteHomeDataRefreshCoordinator|\/api\/home/);
 });
 
 test("the running app version comes from the shell and acquisition can reload only once", async () => {
@@ -578,6 +585,20 @@ test("image and video seek share tap-or-relative-drag handling without replacing
     css,
     /\.viewer-seek-input:focus-visible\s*\{[^}]*outline:\s*3px solid var\(--accent\)/
   );
+});
+
+test("video volume is capability-gated and shares relative range dragging", async () => {
+  const video = await readFile(new URL("video-stream.mjs", here), "utf8");
+  const volumeBody = video.match(
+    /renderVolume\(\)[\s\S]*?\n  }\n\n  setMediaState/
+  )?.[0] ?? "";
+  assert.match(video, /mediaElementVolumeControlSupported\(this\.video\)/);
+  assert.match(video, /volume: showVolume/);
+  assert.match(volumeBody, /addEventListener\("pointerdown"/);
+  assert.match(volumeBody, /event\.preventDefault\(\)/);
+  assert.match(volumeBody, /videoVolumeRelativeDragValue\(\{/);
+  assert.match(video, /relativeRangeDragValue\(\{/);
+  assert.doesNotMatch(video, /userAgent|navigator\.platform/);
 });
 
 test("viewer status overlays belong to the HUD and leave with it", async () => {

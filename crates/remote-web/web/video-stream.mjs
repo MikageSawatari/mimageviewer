@@ -114,6 +114,60 @@ export function videoSeekRelativeDragValue({
   });
 }
 
+export function videoVolumeRelativeDragValue({
+  startVolume = 1,
+  startClientX = 0,
+  currentClientX = 0,
+  trackWidth = 0,
+  step = 0.01,
+} = {}) {
+  return relativeRangeDragValue({
+    startValue: startVolume,
+    startClientX,
+    currentClientX,
+    trackWidth,
+    min: 0,
+    max: 1,
+    step,
+  });
+}
+
+export function mediaElementVolumeControlSupported(mediaElement) {
+  const original = Number(mediaElement?.volume);
+  if (!Number.isFinite(original) || original < 0 || original > 1) return false;
+  const probe = original >= 0.5
+    ? Math.max(0, original - 0.01)
+    : Math.min(1, original + 0.01);
+  if (probe === original) return false;
+  try {
+    mediaElement.volume = probe;
+    const accepted = Math.abs(Number(mediaElement.volume) - probe) <= 1e-6;
+    mediaElement.volume = original;
+    const restored = Math.abs(Number(mediaElement.volume) - original) <= 1e-6;
+    return accepted && restored;
+  } catch (_error) {
+    try {
+      mediaElement.volume = original;
+    } catch {}
+    return false;
+  }
+}
+
+export function videoControlMenuPresentation({
+  hasVideo = true,
+  volumeControlSupported = true,
+} = {}) {
+  const mediaNoun = hasVideo === false ? "音声" : "動画";
+  const qualityNoun = hasVideo === false ? "音質" : "画質";
+  const showVolume = volumeControlSupported !== false;
+  return {
+    mediaNoun,
+    qualityNoun,
+    controlsTitle: showVolume ? `音量と${qualityNoun}` : qualityNoun,
+    showVolume,
+  };
+}
+
 function normalizedVideoLoopBoundaries(behavior) {
   const values = behavior?.kind === "loop" ? behavior.boundary_starts_secs : [];
   const normalized = [...new Set((values ?? [])
@@ -1092,11 +1146,15 @@ class VideoStreamMenu {
 
   definition(page) {
     const media = this.mediaState();
-    const mediaNoun = media.hasVideo === false ? "音声" : "動画";
-    const qualityNoun = media.hasVideo === false ? "音質" : "画質";
+    const {
+      mediaNoun,
+      qualityNoun,
+      controlsTitle,
+      showVolume,
+    } = videoControlMenuPresentation(media);
     if (page === "controls") {
       return {
-        title: `音量と${qualityNoun}`,
+        title: controlsTitle,
         actions: [
           ["menu_back", `${mediaNoun}の操作へ戻る`, "戻る"],
           [CommandName.MEDIA_TOGGLE_PLAY, "再生 / 一時停止", "Space"],
@@ -1111,14 +1169,14 @@ class VideoStreamMenu {
           ["再生 / 一時停止", "Space"],
           ["10 秒戻る / 進む", "← / →"],
         ],
-        volume: true,
+        volume: showVolume,
       };
     }
     return {
       title: `${mediaNoun}の操作`,
       actions: [
         [CommandName.MEDIA_TOGGLE_PLAY, "再生 / 一時停止", "Space"],
-        ["menu_controls", `音量と${qualityNoun}`, "通信量の目安を表示"],
+        ["menu_controls", controlsTitle, "通信量の目安を表示"],
         [
           CommandName.TOGGLE_VIEWER_BARS,
           media.barsVisible === false ? "上下バーを表示" : "上下バーを隠す",
@@ -1218,12 +1276,96 @@ class VideoStreamMenu {
     input.step = "0.01";
     input.value = String(media.volume ?? 1);
     input.setAttribute("aria-label", "音量");
-    input.addEventListener("input", () => {
-      output.value = `${Math.round(Number(input.value) * 100)}%`;
+    let pointerDrag = null;
+    const updateDisplayedVolume = (volume) => {
+      input.value = String(volume);
+      output.value = `${Math.round(Number(volume) * 100)}%`;
       output.textContent = output.value;
+    };
+    input.addEventListener("input", () => {
+      if (pointerDrag) input.value = String(pointerDrag.targetVolume);
+      updateDisplayedVolume(Number(input.value));
     });
     input.addEventListener("change", (event) => {
+      if (pointerDrag) return;
       this.send(event, CommandName.MEDIA_VOLUME, { volume: Number(input.value) });
+    });
+    input.addEventListener("pointerdown", (event) => {
+      if (input.disabled || event.isPrimary === false) return;
+      if (typeof event.button === "number" && event.button !== 0) return;
+      event.stopPropagation();
+      if (event.cancelable) event.preventDefault();
+      const trackWidth = input.getBoundingClientRect().width;
+      const startVolume = videoVolumeRelativeDragValue({
+        startVolume: Number(input.value),
+        startClientX: event.clientX,
+        currentClientX: event.clientX,
+        trackWidth,
+        step: Number(input.step),
+      });
+      pointerDrag = {
+        pointerId: event.pointerId,
+        startClientX: event.clientX,
+        startVolume,
+        targetVolume: startVolume,
+        trackWidth,
+        step: Number(input.step),
+      };
+      input.focus({ preventScroll: true });
+      try {
+        input.setPointerCapture(event.pointerId);
+      } catch (_error) {
+        // Touch input may already have implicit capture.
+      }
+    });
+    input.addEventListener("pointermove", (event) => {
+      const drag = pointerDrag;
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      event.stopPropagation();
+      if (event.cancelable) event.preventDefault();
+      drag.targetVolume = videoVolumeRelativeDragValue({
+        startVolume: drag.startVolume,
+        startClientX: drag.startClientX,
+        currentClientX: event.clientX,
+        trackWidth: drag.trackWidth,
+        step: drag.step,
+      });
+      updateDisplayedVolume(drag.targetVolume);
+    });
+    const finishPointerDrag = (event, cancelled) => {
+      const drag = pointerDrag;
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      event.stopPropagation();
+      if (event.cancelable) event.preventDefault();
+      try {
+        if (input.hasPointerCapture(event.pointerId)) {
+          input.releasePointerCapture(event.pointerId);
+        }
+      } catch (_error) {
+        // The browser may implicitly release capture before pointercancel.
+      }
+      pointerDrag = null;
+      if (cancelled) {
+        updateDisplayedVolume(drag.startVolume);
+        return;
+      }
+      const targetVolume = videoVolumeRelativeDragValue({
+        startVolume: drag.startVolume,
+        startClientX: drag.startClientX,
+        currentClientX: event.clientX,
+        trackWidth: drag.trackWidth,
+        step: drag.step,
+      });
+      updateDisplayedVolume(targetVolume);
+      if (targetVolume !== drag.startVolume) {
+        this.send(event, CommandName.MEDIA_VOLUME, { volume: targetVolume });
+      }
+    };
+    input.addEventListener("pointerup", (event) => finishPointerDrag(event, false));
+    input.addEventListener("pointercancel", (event) => finishPointerDrag(event, true));
+    input.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
     });
     field.append(row, input);
     this.actions.append(field);
@@ -1632,6 +1774,10 @@ export class VideoStreamViewer {
     this.video.setAttribute("playsinline", "");
     this.video.setAttribute("webkit-playsinline", "");
     this.video.setAttribute("aria-label", entry.name);
+    // Probe before attaching a media source, then restore synchronously. Supported browsers
+    // therefore cannot produce an audible test change; ignored assignments identify iOS-like
+    // platforms without relying on a user-agent string.
+    this.volumeControlSupported = mediaElementVolumeControlSupported(this.video);
     this.audioSurface = element("div", "audio-stream-surface");
     this.audioSurface.setAttribute("role", "img");
     this.audioSurface.setAttribute("aria-label", `音声: ${entry.name}`);
@@ -2084,6 +2230,7 @@ export class VideoStreamViewer {
       playing: !this.video.paused,
       barsVisible: this.barsVisible,
       hasVideo: this.hasVideo,
+      volumeControlSupported: this.volumeControlSupported,
     };
   }
 
@@ -2923,7 +3070,7 @@ export class VideoStreamViewer {
   }
 
   async setVolume(requestedVolume) {
-    if (!this.session || this.destroyed) return;
+    if (!this.session || this.destroyed || !this.volumeControlSupported) return;
     const volume = Math.max(0, Math.min(1, Number(requestedVolume) || 0));
     await this.apiPostJson(
       "/api/video/control",
@@ -2975,7 +3122,7 @@ export class VideoStreamViewer {
       Number(mediaState.buffer_target_secs) || this.bufferTargetSecs
     );
     this.volume = Math.max(0, Math.min(1, Number(mediaState.volume) || 0));
-    this.video.volume = this.volume;
+    if (this.volumeControlSupported) this.video.volume = this.volume;
     this.encoder = String(mediaState.encoder ?? this.encoder);
     this.codecs = String(mediaState.codecs ?? this.codecs);
     this.updateAudioProcessing(mediaState.audio_processing, true);

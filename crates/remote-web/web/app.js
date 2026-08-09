@@ -820,7 +820,10 @@ export function invalidateViewerPendingLoad(viewer) {
   }
 }
 
-function applyRemoteSessionId(sessionId) {
+export function applyRemoteSessionId(
+  sessionId,
+  refreshHomeData = () => remoteHomeDataRefreshCoordinator.refreshAfterSessionAcquire()
+) {
   const next = String(sessionId ?? "");
   if (state.remoteSessionId === next) return;
   // Identity is the admission boundary. Publish its revocation before invoking an optional
@@ -841,6 +844,12 @@ function applyRemoteSessionId(sessionId) {
   pageResourceCache.clear();
   state.imageInfoCache.clear();
   state.containerImageInfoHints.clear();
+  if (next) {
+    // Remote ownership is exclusive: core settings can change only while the remote does not
+    // own control. Every core-side change therefore crosses a disconnect and a new acquisition,
+    // making acquisition the complete refresh signal. Do not move this back to generation.
+    refreshHomeData();
+  }
 }
 
 const APP_UPDATE_POLL_INTERVAL_MS = 5 * 60 * 1000;
@@ -1068,9 +1077,10 @@ export function createRemoteHomeDataRefreshCoordinator({
   renderHomeScreen,
 }) {
   const pendingByTarget = new Map();
+  let sessionRefreshPromise = null;
 
-  // This is the canonical set of home-screen data invalidated by a remote-state generation
-  // change. Add future home-screen data sources here so generation refresh cannot omit one.
+  // This is the canonical set of home-screen data invalidated by a new remote session.
+  // Add future home-screen data sources here so session refresh cannot omit one.
   const targets = Object.freeze([
     {
       key: "favorites",
@@ -1102,7 +1112,7 @@ export function createRemoteHomeDataRefreshCoordinator({
       },
       handleInitialFailure(error) {
         // Initial loading has no last good value, so it keeps the existing empty-state error
-        // behavior. Generation refresh deliberately never calls this handler.
+        // behavior. A post-acquisition refresh deliberately never calls this handler.
         appState.home = { places: [], smart_folders: [] };
         appState.homeLoadError =
           error instanceof Error ? error.message : "mIV 本体から一覧を取得できませんでした。";
@@ -1125,9 +1135,18 @@ export function createRemoteHomeDataRefreshCoordinator({
     return pending;
   }
 
+  function refreshAfterSessionAcquire() {
+    sessionRefreshPromise = Promise.allSettled(targets.map((target) => refresh(target)));
+    return sessionRefreshPromise;
+  }
+
   return {
     async loadInitial() {
-      const results = await Promise.allSettled(targets.map((target) => refresh(target)));
+      // Initial acquisition already starts this batch from applyRemoteSessionId. Retain the
+      // settled promise until boot consumes it so a fast response cannot cause a second batch.
+      const initialRefresh = sessionRefreshPromise ?? refreshAfterSessionAcquire();
+      const results = await initialRefresh;
+      if (sessionRefreshPromise === initialRefresh) sessionRefreshPromise = null;
       for (let index = 0; index < results.length; index += 1) {
         const result = results[index];
         if (result.status === "fulfilled") continue;
@@ -1136,9 +1155,7 @@ export function createRemoteHomeDataRefreshCoordinator({
         target.handleInitialFailure(result.reason);
       }
     },
-    refreshAfterGenerationChange() {
-      return Promise.allSettled(targets.map((target) => refresh(target)));
-    },
+    refreshAfterSessionAcquire,
   };
 }
 
@@ -1162,7 +1179,6 @@ function applyRemoteStateGeneration(observed, { reloadViewer = false } = {}) {
   pageResourceCache.clear();
   state.imageInfoCache.clear();
   state.containerImageInfoHints.clear();
-  remoteHomeDataRefreshCoordinator.refreshAfterGenerationChange();
   if (reloadViewer && state.viewer) {
     const viewer = state.viewer;
     queueMicrotask(() => {

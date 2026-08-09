@@ -113,6 +113,7 @@ const {
   VIEWER_MENU_MAX_ACTIONS,
   VIEWER_PANEL_TABS,
   activateFolderContainerForImage,
+  applyRemoteSessionId,
   browserDoubleTapTelemetryEvent,
   commandTelemetryEvent,
   containerInitialImageIndex,
@@ -1051,7 +1052,7 @@ test("tapping an audio grid tile opens the shared media viewer route", () => {
   assert.equal(resolveMediaOpenRoute("audio", { kind: "audio", address }, -1), "audio");
 });
 
-test("generation refresh fetches favorites and home once without taking the viewer", async () => {
+test("session acquisition refreshes favorites and home once without taking the viewer", async () => {
   const previousHome = {
     places: [{ kind: "folder", label: "以前の場所" }],
     smart_folders: [{ id: "old", name: "以前のスマートフォルダ" }],
@@ -1083,8 +1084,8 @@ test("generation refresh fetches favorites and home once without taking the view
     },
   });
 
-  const firstRefresh = coordinator.refreshAfterGenerationChange();
-  const consecutiveRefresh = coordinator.refreshAfterGenerationChange();
+  const firstRefresh = coordinator.refreshAfterSessionAcquire();
+  const consecutiveRefresh = coordinator.refreshAfterSessionAcquire();
   assert.deepEqual(requests, ["/api/favorites", "/api/home"]);
 
   const nextFavorites = [{ name: "更新後のお気に入り" }];
@@ -1108,7 +1109,7 @@ test("generation refresh fetches favorites and home once without taking the view
   ]);
 });
 
-test("initial loading and a concurrent generation refresh share the same requests", async () => {
+test("initial loading consumes an already completed acquisition refresh without duplicate requests", async () => {
   const appState = {
     favorites: [],
     home: { places: [], smart_folders: [] },
@@ -1130,8 +1131,7 @@ test("initial loading and a concurrent generation refresh share the same request
     renderHomeScreen() {},
   });
 
-  const initialLoad = coordinator.loadInitial();
-  const generationRefresh = coordinator.refreshAfterGenerationChange();
+  const acquisitionRefresh = coordinator.refreshAfterSessionAcquire();
   assert.deepEqual(requests, ["/api/favorites", "/api/home"]);
 
   pending.get("/api/favorites").resolve({
@@ -1139,12 +1139,13 @@ test("initial loading and a concurrent generation refresh share the same request
     favorites: [],
   });
   pending.get("/api/home").resolve({ places: [], smart_folders: [] });
-  await Promise.all([initialLoad, generationRefresh]);
+  await acquisitionRefresh;
+  await coordinator.loadInitial();
 
   assert.deepEqual(requests, ["/api/favorites", "/api/home"]);
 });
 
-test("successful generation home refresh redraws only the visible home data tab", async () => {
+test("successful session home refresh redraws only the visible home data tab", async () => {
   const appState = {
     favorites: [],
     home: { places: [], smart_folders: [] },
@@ -1169,14 +1170,14 @@ test("successful generation home refresh redraws only the visible home data tab"
     },
   });
 
-  await coordinator.refreshAfterGenerationChange();
+  await coordinator.refreshAfterSessionAcquire();
 
   assert.strictEqual(appState.home, nextHome);
   assert.equal(appState.homeLoadError, "");
   assert.deepEqual(renderedTabs, ["smart"]);
 });
 
-test("failed generation home refresh preserves the last good places and smart folders", async () => {
+test("failed session home refresh preserves the last good places and smart folders", async () => {
   const previousHome = {
     places: [{ kind: "folder", label: "残る場所" }],
     smart_folders: [{ id: "kept", name: "残るスマートフォルダ" }],
@@ -1204,7 +1205,7 @@ test("failed generation home refresh preserves the last good places and smart fo
     },
   });
 
-  const results = await coordinator.refreshAfterGenerationChange();
+  const results = await coordinator.refreshAfterSessionAcquire();
 
   assert.deepEqual(results.map((result) => result.status), ["fulfilled", "rejected"]);
   assert.strictEqual(appState.home, previousHome);
@@ -1215,7 +1216,7 @@ test("failed generation home refresh preserves the last good places and smart fo
   assert.deepEqual(appState.favorites, [{ name: "更新後のお気に入り" }]);
 });
 
-test("initial home failure keeps its empty-state behavior separate from generation refresh", async () => {
+test("initial home failure keeps its empty-state behavior separate from session refresh", async () => {
   const appState = {
     favorites: [],
     home: {
@@ -1240,6 +1241,14 @@ test("initial home failure keeps its empty-state behavior separate from generati
 
   assert.deepEqual(appState.home, { places: [], smart_folders: [] });
   assert.equal(appState.homeLoadError, "initial failure");
+});
+
+test("losing a session does not refresh home data until a new session is acquired", () => {
+  const refreshes = [];
+  applyRemoteSessionId(TEST_SESSION_ID, () => refreshes.push("acquired"));
+  applyRemoteSessionId("", () => refreshes.push("lost"));
+
+  assert.deepEqual(refreshes, ["acquired"]);
 });
 
 test("resolved audio and video opens enter the media viewer instead of the image viewer", () => {
