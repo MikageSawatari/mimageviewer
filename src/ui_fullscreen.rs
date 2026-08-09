@@ -50,12 +50,16 @@ use crate::ui_helpers::{HoverTipExt, open_external_player};
 
 const COMPARE_INDICATOR_MAX_WIDTH: u32 = 72;
 const COMPARE_INDICATOR_MAX_HEIGHT: u32 = 54;
+const COMPARE_WIPE_MIN_FRACTION: f32 = 0.05;
+const COMPARE_WIPE_MAX_FRACTION: f32 = 0.95;
+const COMPARE_WIPE_GRAB_HALF_WIDTH: f32 = 14.0;
 // Tuned on real hardware to avoid a brief status flash on normal page turns.
 const COLORIZE_WAIT_INDICATOR_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 const FS_NAVIGATOR_HEADER_HEIGHT: f32 = 26.0;
 const FS_NAVIGATOR_MARGIN: f32 = 12.0;
 const FS_NAVIGATOR_WHEEL_STEP: f32 = 20.0;
 const FS_NAVIGATOR_MIN_SELECTION: f32 = 8.0;
+const FS_NAVIGATOR_MIN_IMAGE_SCALE: f32 = 0.4;
 /// Keep roughly one standard touch target visible so a dragged image always has an obvious
 /// recovery area. On an image or viewport smaller than this, the whole shorter axis is required.
 const FS_PAN_MIN_VISIBLE_PX: f32 = 48.0;
@@ -405,6 +409,22 @@ fn fs_navigator_uv_rect_is_full(visible: egui::Rect, full: egui::Rect) -> bool {
         && (visible.bottom() - full.bottom()).abs() <= EPSILON
 }
 
+/// Scale a fully visible image inside the navigator's full-view frame.
+///
+/// At exact fit one axis fills the viewport, so the ratio is 1 and the image, frame and overview
+/// remain identical. Zooming farther out shrinks the image continuously, but never below 40% of
+/// the overview so it remains useful as a navigation target.
+fn fs_navigator_fully_visible_image_scale(
+    content_bounds: egui::Rect,
+    clip_rect: egui::Rect,
+) -> f32 {
+    let width_ratio = content_bounds.width() / clip_rect.width().max(f32::EPSILON);
+    let height_ratio = content_bounds.height() / clip_rect.height().max(f32::EPSILON);
+    width_ratio
+        .max(height_ratio)
+        .clamp(FS_NAVIGATOR_MIN_IMAGE_SCALE, 1.0)
+}
+
 fn flat_navigator_main_pages(
     layout: &FullscreenPageLayout,
 ) -> Option<Vec<DisplayedImageTransform>> {
@@ -581,25 +601,30 @@ fn build_flat_navigator_layout(
         .iter()
         .map(|page| page.visible_source_uv_rect(clip_rect))
         .collect::<Vec<_>>();
-    // When every page is already fully visible, the outline would cover the entire overview and
-    // convey no useful position information. Keep the user's enabled setting, but hide the panel
-    // until zoom, pan, trim, or a fit mode makes only part of the source visible.
-    if main_pages.iter().zip(&visible_uvs).all(|(page, visible)| {
+    let all_fully_visible = main_pages.iter().zip(&visible_uvs).all(|(page, visible)| {
         visible.is_some_and(|rect| fs_navigator_uv_rect_is_full(rect, page.uv_rect))
-    }) {
-        return None;
-    }
+    });
 
     let content_bounds = main_pages.iter().fold(None, |bounds, page| {
         fs_navigator_union_rect(bounds, page.full_image_rect)
     })?;
     let (panel_rect, header_rect, canvas_rect) =
         fs_navigator_panel_rect(host_rect, requested_size, corner)?;
-    let screen_scale = (canvas_rect.width() / content_bounds.width())
+    let fitted_screen_scale = (canvas_rect.width() / content_bounds.width())
         .min(canvas_rect.height() / content_bounds.height());
+    let image_scale = if all_fully_visible {
+        fs_navigator_fully_visible_image_scale(content_bounds, clip_rect)
+    } else {
+        1.0
+    };
+    let screen_scale = fitted_screen_scale * image_scale;
     if !screen_scale.is_finite() || screen_scale <= 0.0 {
         return None;
     }
+    let full_view_rect = egui::Rect::from_center_size(
+        canvas_rect.center(),
+        content_bounds.size() * fitted_screen_scale,
+    );
     let map_rect = |rect: egui::Rect| {
         egui::Rect::from_center_size(
             canvas_rect.center() + (rect.center() - content_bounds.center()) * screen_scale,
@@ -609,7 +634,7 @@ fn build_flat_navigator_layout(
 
     let mut pages = Vec::with_capacity(main_pages.len());
     let mut content_rect = None;
-    let mut visible_rect = None;
+    let mut visible_rect = all_fully_visible.then_some(full_view_rect);
     for (main, visible_uv) in main_pages.into_iter().zip(visible_uvs) {
         let navigator = DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
@@ -631,7 +656,7 @@ fn build_flat_navigator_layout(
             map_rect(main.full_image_rect),
         )?;
         content_rect = fs_navigator_union_rect(content_rect, navigator.full_image_rect);
-        if let Some(visible_uv) = visible_uv {
+        if !all_fully_visible && let Some(visible_uv) = visible_uv {
             visible_rect = fs_navigator_union_rect(
                 visible_rect,
                 fs_navigator_source_rect_aabb(&navigator, visible_uv),
@@ -5414,6 +5439,23 @@ fn fullscreen_seek_knob_x(track_rect: egui::Rect, fraction: f32, rtl: bool) -> f
     } else {
         track_rect.left() + track_rect.width() * fraction
     }
+}
+
+/// Compare wipe fractions are always measured across the fitted, zoomed and panned image rect.
+/// A fraction of 0 is the rect's left edge and 1 is its right edge; the UI's 5% endpoint guard is
+/// applied only when storing an interactive value.
+fn compare_wipe_screen_x(draw_rect: egui::Rect, fraction: f32) -> f32 {
+    draw_rect.left() + draw_rect.width() * fraction.clamp(0.0, 1.0)
+}
+
+fn compare_wipe_fraction_from_screen_x(draw_rect: egui::Rect, screen_x: f32) -> f32 {
+    ((screen_x - draw_rect.left()) / draw_rect.width().max(f32::EPSILON)).clamp(0.0, 1.0)
+}
+
+fn compare_wipe_grab_hit(draw_rect: egui::Rect, pointer: egui::Pos2, fraction: f32) -> bool {
+    draw_rect.contains(pointer)
+        && (pointer.x - compare_wipe_screen_x(draw_rect, fraction)).abs()
+            <= COMPARE_WIPE_GRAB_HALF_WIDTH
 }
 
 fn fullscreen_rect_excluding_fixed_bars(
@@ -11354,9 +11396,9 @@ impl App {
                                                         fit_scale_limits,
                                                     )
                                                     .unwrap_or(image_rect);
-                                                    let wipe_x = ref_rect.left()
-                                                        + ref_rect.width()
-                                                            * fraction.clamp(0.05, 0.95);
+                                                    let wipe_x = compare_wipe_screen_x(
+                                                        ref_rect, fraction,
+                                                    );
                                                     let clip = egui::Rect::from_min_max(
                                                         ref_rect.min,
                                                         egui::pos2(wipe_x, ref_rect.max.y),
@@ -11482,9 +11524,9 @@ impl App {
                                                     fit_scale_limits,
                                                 )
                                                 .unwrap_or(image_rect);
-                                                let wipe_x = ref_rect.left()
-                                                    + ref_rect.width()
-                                                        * fraction.clamp(0.05, 0.95);
+                                                let wipe_x = compare_wipe_screen_x(
+                                                    ref_rect, fraction,
+                                                );
                                                 let clip = egui::Rect::from_min_max(
                                                     ref_rect.min,
                                                     egui::pos2(wipe_x, ref_rect.max.y),
@@ -11508,33 +11550,49 @@ impl App {
                             }
                         }
                         if single_transform.is_none()
-                            && spread_pair == SpreadPair::Single
                             && !matches!(
                                 self.compare_view_mode,
                                 crate::app::CompareViewMode::Off
                             )
-                            && let Some(handle) = state.tex.as_ref().or(state.thumb_tex.as_ref())
                         {
-                            let size = handle.size_vec2();
-                            single_transform = DisplayedImageTransform::resolve(
-                                DisplayedImageTransformInput {
-                                    page_idx: fs_idx,
-                                    viewport_rect: image_rect,
-                                    source_size: source_size.unwrap_or(size),
-                                    texture_size: size,
-                                    rotation: crate::rotation_db::Rotation::None,
-                                    free_rotation_rad: 0.0,
-                                    content_bbox: None,
-                                    fit_mode: FullscreenFitMode::Page,
-                                    fit_scale_limits: self.fullscreen_fit_scale_limits(
-                                        ctx.pixels_per_point(),
-                                    ),
-                                    pixels_per_point: ctx.pixels_per_point(),
-                                    placement: ResolvedDisplayPlacement::Normal {
-                                        zoom_pan: self.fs_zoom_pan(),
+                            let compare_size = self
+                                .compare_prepared_pair
+                                .as_ref()
+                                .filter(|pair| pair.current_idx == fs_idx)
+                                .map(|pair| {
+                                    egui::vec2(
+                                        pair.target_size[0] as f32,
+                                        pair.target_size[1] as f32,
+                                    )
+                                })
+                                .or_else(|| {
+                                    state
+                                        .tex
+                                        .as_ref()
+                                        .or(state.thumb_tex.as_ref())
+                                        .map(|handle| handle.size_vec2())
+                                });
+                            if let Some(compare_size) = compare_size {
+                                single_transform = DisplayedImageTransform::resolve(
+                                    DisplayedImageTransformInput {
+                                        page_idx: fs_idx,
+                                        viewport_rect: image_rect,
+                                        source_size: compare_size,
+                                        texture_size: compare_size,
+                                        rotation: crate::rotation_db::Rotation::None,
+                                        free_rotation_rad: 0.0,
+                                        content_bbox: None,
+                                        fit_mode: FullscreenFitMode::Page,
+                                        fit_scale_limits: self.fullscreen_fit_scale_limits(
+                                            ctx.pixels_per_point(),
+                                        ),
+                                        pixels_per_point: ctx.pixels_per_point(),
+                                        placement: ResolvedDisplayPlacement::Normal {
+                                            zoom_pan: self.fs_zoom_pan(),
+                                        },
                                     },
-                                },
-                            );
+                                );
+                            }
                         }
                         if let Some(transform) = single_transform {
                             self.fullscreen_page_layout
@@ -15974,12 +16032,12 @@ impl App {
 
     // ── ホイール & クリック ──────────────────────────────────────────────
 
-    fn handle_compare_wipe_drag(&mut self, ctx: &egui::Context, image_rect: egui::Rect) -> bool {
+    fn handle_compare_wipe_drag(&mut self, ctx: &egui::Context, draw_rect: egui::Rect) -> bool {
         let crate::app::CompareViewMode::Wipe { fraction } = self.compare_view_mode else {
             self.compare_wipe_dragging = false;
             return false;
         };
-        if image_rect.width() <= 1.0 {
+        if draw_rect.width() <= 1.0 {
             return false;
         }
 
@@ -15997,9 +16055,8 @@ impl App {
             return was_dragging;
         }
 
-        let line_x = image_rect.left() + image_rect.width() * fraction.clamp(0.05, 0.95);
         let hit = pointer_pos
-            .map(|p| image_rect.contains(p) && (p.x - line_x).abs() <= 14.0)
+            .map(|p| compare_wipe_grab_hit(draw_rect, p, fraction))
             .unwrap_or(false);
         if hit {
             ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
@@ -16009,8 +16066,8 @@ impl App {
         }
         if self.compare_wipe_dragging && primary_down {
             if let Some(pos) = pointer_pos {
-                let new_fraction =
-                    ((pos.x - image_rect.left()) / image_rect.width()).clamp(0.05, 0.95);
+                let new_fraction = compare_wipe_fraction_from_screen_x(draw_rect, pos.x)
+                    .clamp(COMPARE_WIPE_MIN_FRACTION, COMPARE_WIPE_MAX_FRACTION);
                 self.compare_view_mode = crate::app::CompareViewMode::Wipe {
                     fraction: new_fraction,
                 };
@@ -16040,7 +16097,6 @@ impl App {
             && !self.adjustment_mode.is_open()
             && !self.is_overlay_edit_mode_active()
             && !self.view_trim_mode
-            && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
             && self.capture_region_selection.is_none()
             && matches!(
                 self.items.get(fs_idx),
@@ -16878,6 +16934,98 @@ impl App {
         }
     }
 
+    fn draw_compare_navigator_content(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        layout: &FlatNavigatorLayout,
+        painter: &egui::Painter,
+    ) -> bool {
+        let mode = self.compare_view_mode;
+        if matches!(mode, crate::app::CompareViewMode::Off)
+            || !self.compare_prepared_pair_matches(fs_idx)
+        {
+            return false;
+        }
+
+        let shader_shape =
+            self.compare_prepared_pair
+                .as_ref()
+                .and_then(|pair| match mode {
+                    crate::app::CompareViewMode::Wipe { fraction } => self.compare_shader_shape(
+                        layout.content_rect,
+                        pair,
+                        crate::compare_wgpu::CompareShaderMode::Wipe,
+                        fraction,
+                        None,
+                        ctx.pixels_per_point(),
+                    ),
+                    crate::app::CompareViewMode::Diff => self.compare_shader_shape(
+                        layout.content_rect,
+                        pair,
+                        crate::compare_wgpu::CompareShaderMode::Diff,
+                        0.5,
+                        None,
+                        ctx.pixels_per_point(),
+                    ),
+                    crate::app::CompareViewMode::Off
+                    | crate::app::CompareViewMode::PinnedNormal => None,
+                });
+        if let Some((draw_rect, shape)) = shader_shape {
+            painter.add(shape);
+            if let crate::app::CompareViewMode::Wipe { fraction } = mode {
+                Self::paint_compare_wipe_line(painter, draw_rect, fraction);
+            }
+            return true;
+        }
+
+        let paint_texture = |painter: &egui::Painter, tex: &egui::TextureHandle| {
+            painter.image(
+                tex.id(),
+                layout.content_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        };
+        match mode {
+            crate::app::CompareViewMode::PinnedNormal => {
+                let Some(tex) =
+                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Pinned)
+                else {
+                    return false;
+                };
+                paint_texture(painter, &tex);
+            }
+            crate::app::CompareViewMode::Wipe { fraction } => {
+                let current =
+                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Current);
+                let pinned =
+                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Pinned);
+                let (Some(current), Some(pinned)) = (current, pinned) else {
+                    return false;
+                };
+                paint_texture(painter, &current);
+                let wipe_x = compare_wipe_screen_x(layout.content_rect, fraction);
+                let pinned_clip = egui::Rect::from_min_max(
+                    layout.content_rect.min,
+                    egui::pos2(wipe_x, layout.content_rect.bottom()),
+                );
+                paint_texture(&painter.with_clip_rect(pinned_clip), &pinned);
+                Self::paint_compare_wipe_line(painter, layout.content_rect, fraction);
+            }
+            crate::app::CompareViewMode::Diff => {
+                let Some(tex) =
+                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Diff)
+                else {
+                    return false;
+                };
+                paint_texture(painter, &tex);
+            }
+            crate::app::CompareViewMode::Off => return false,
+        }
+        true
+    }
+
     fn draw_fs_navigator(
         &mut self,
         ui: &mut egui::Ui,
@@ -17014,27 +17162,29 @@ impl App {
 
         let canvas_painter = painter.with_clip_rect(layout.canvas_rect);
         canvas_painter.rect_filled(layout.canvas_rect, 0.0, egui::Color32::BLACK);
-        for page in &layout.pages {
-            let thumbnail = match self.thumbnails.get(page.main.page_idx) {
-                Some(ThumbnailState::Loaded { tex, .. }) => Some(tex),
-                _ => None,
-            };
-            if let Some(tex) = texture_sources.texture_for_page(page.main.page_idx, thumbnail) {
-                page.navigator
-                    .paint_texture(&canvas_painter, tex.id(), egui::Color32::WHITE);
-            } else {
-                canvas_painter.rect_filled(
+        if !self.draw_compare_navigator_content(ctx, fs_idx, &layout, &canvas_painter) {
+            for page in &layout.pages {
+                let thumbnail = match self.thumbnails.get(page.main.page_idx) {
+                    Some(ThumbnailState::Loaded { tex, .. }) => Some(tex),
+                    _ => None,
+                };
+                if let Some(tex) = texture_sources.texture_for_page(page.main.page_idx, thumbnail) {
+                    page.navigator
+                        .paint_texture(&canvas_painter, tex.id(), egui::Color32::WHITE);
+                } else {
+                    canvas_painter.rect_filled(
+                        page.navigator.paint_rect,
+                        0.0,
+                        egui::Color32::from_gray(42),
+                    );
+                }
+                canvas_painter.rect_stroke(
                     page.navigator.paint_rect,
                     0.0,
-                    egui::Color32::from_gray(42),
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(96)),
+                    egui::StrokeKind::Inside,
                 );
             }
-            canvas_painter.rect_stroke(
-                page.navigator.paint_rect,
-                0.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(96)),
-                egui::StrokeKind::Inside,
-            );
         }
         canvas_painter.rect_stroke(
             layout.visible_rect,
@@ -22684,7 +22834,7 @@ impl App {
                     fit_scale_limits,
                 )
                 .unwrap_or(image_rect);
-                let wipe_x = ref_rect.left() + ref_rect.width() * fraction.clamp(0.05, 0.95);
+                let wipe_x = compare_wipe_screen_x(ref_rect, fraction);
                 let clip =
                     egui::Rect::from_min_max(ref_rect.min, egui::pos2(wipe_x, ref_rect.max.y));
                 Self::draw_compare_pinned_image(
@@ -22751,15 +22901,19 @@ impl App {
         );
     }
 
-    fn draw_compare_wipe_line(ui: &mut egui::Ui, image_rect: egui::Rect, fraction: f32) {
-        let x = image_rect.left() + image_rect.width() * fraction.clamp(0.05, 0.95);
-        ui.painter().line_segment(
+    fn paint_compare_wipe_line(painter: &egui::Painter, image_rect: egui::Rect, fraction: f32) {
+        let x = compare_wipe_screen_x(image_rect, fraction);
+        painter.line_segment(
             [
                 egui::pos2(x, image_rect.top()),
                 egui::pos2(x, image_rect.bottom()),
             ],
             egui::Stroke::new(2.0, egui::Color32::from_white_alpha(150)),
         );
+    }
+
+    fn draw_compare_wipe_line(ui: &mut egui::Ui, image_rect: egui::Rect, fraction: f32) {
+        Self::paint_compare_wipe_line(ui.painter(), image_rect, fraction);
     }
 
     fn draw_compare_pin_indicator(
@@ -29629,6 +29783,15 @@ mod tests {
         (app, image_rect, fs_idx)
     }
 
+    #[test]
+    fn flat_navigator_is_allowed_during_compare_display() {
+        let (mut app, _, fs_idx) = setup_flat_navigator_input_test();
+        let ctx = egui::Context::default();
+        app.compare_view_mode = crate::app::CompareViewMode::Wipe { fraction: 0.5 };
+
+        assert!(app.fs_navigator_allowed(&ctx, fs_idx));
+    }
+
     fn navigator_pointer_input(
         pos: egui::Pos2,
         button: Option<(egui::PointerButton, bool)>,
@@ -30023,7 +30186,7 @@ mod tests {
     }
 
     #[test]
-    fn flat_navigator_hides_when_the_whole_image_is_visible() {
+    fn flat_navigator_fit_keeps_image_frame_and_overview_identical() {
         let main = navigator_test_transform(
             3,
             crate::rotation_db::Rotation::None,
@@ -30033,16 +30196,64 @@ mod tests {
         pages.begin(FullscreenPageLayoutKind::Single);
         pages.push(main);
 
-        assert!(
-            build_flat_navigator_layout(
-                &pages,
-                main.viewport_rect,
-                main.viewport_rect,
-                260.0,
-                FullscreenNavigatorCorner::BottomRight,
-            )
-            .is_none()
+        let navigator = build_flat_navigator_layout(
+            &pages,
+            main.viewport_rect,
+            main.viewport_rect,
+            260.0,
+            FullscreenNavigatorCorner::BottomRight,
+        )
+        .unwrap();
+
+        assert_rect_close(navigator.content_rect, navigator.visible_rect);
+        assert_rect_close(
+            navigator.pages[0].navigator.full_image_rect,
+            navigator.visible_rect,
         );
+    }
+
+    #[test]
+    fn flat_navigator_zoomed_out_shrinks_image_inside_full_frame_with_floor() {
+        let main = navigator_test_transform(
+            3,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((0.2, egui::Vec2::ZERO)),
+            },
+        );
+        let mut pages = FullscreenPageLayout::default();
+        pages.begin(FullscreenPageLayoutKind::Single);
+        pages.push(main);
+
+        let navigator = build_flat_navigator_layout(
+            &pages,
+            main.viewport_rect,
+            main.viewport_rect,
+            260.0,
+            FullscreenNavigatorCorner::BottomRight,
+        )
+        .unwrap();
+
+        assert!(navigator.visible_rect.contains_rect(navigator.content_rect));
+        assert!(
+            (navigator.content_rect.width() / navigator.visible_rect.width()
+                - FS_NAVIGATOR_MIN_IMAGE_SCALE)
+                .abs()
+                < 1.0e-3
+        );
+    }
+
+    #[test]
+    fn flat_navigator_image_scale_is_continuous_at_exact_fit() {
+        let clip = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+        let exact = egui::Rect::from_center_size(clip.center(), egui::vec2(1000.0, 600.0));
+        let just_below = egui::Rect::from_center_size(clip.center(), egui::vec2(999.0, 599.4));
+
+        let exact_scale = fs_navigator_fully_visible_image_scale(exact, clip);
+        let below_scale = fs_navigator_fully_visible_image_scale(just_below, clip);
+        assert_eq!(exact_scale, 1.0);
+        assert!((below_scale - 0.999).abs() < 1.0e-6);
+        assert!((exact_scale - below_scale - 0.001).abs() < 1.0e-6);
     }
 
     #[test]
@@ -34757,9 +34968,47 @@ mod tests {
         assert!((fitted.center().x - full.center().x).abs() < 0.5); // 中央寄せ
         // 同一 fraction でも基準が違えば線の x がズレる。
         let f = 0.25_f32;
-        let x_fitted = fitted.left() + fitted.width() * f;
-        let x_full = full.left() + full.width() * f;
+        let x_fitted = compare_wipe_screen_x(fitted, f);
+        let x_full = compare_wipe_screen_x(full, f);
         assert!((x_fitted - x_full).abs() > 100.0);
+    }
+
+    #[test]
+    fn compare_wipe_fraction_and_screen_x_round_trip_for_fit_zoom_and_letterbox() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(1000.0, 800.0));
+        let fit = App::compare_image_draw_rect(
+            viewport,
+            [1000, 800],
+            None,
+            FullscreenFitScaleLimits::default(),
+        )
+        .unwrap();
+        let zoomed = App::compare_image_draw_rect(
+            viewport,
+            [1000, 800],
+            Some((2.0, egui::vec2(73.0, -41.0))),
+            FullscreenFitScaleLimits::default(),
+        )
+        .unwrap();
+        let letterboxed = App::compare_image_draw_rect(
+            viewport,
+            [400, 800],
+            None,
+            FullscreenFitScaleLimits::default(),
+        )
+        .unwrap();
+
+        let fraction = 0.37;
+        for draw_rect in [fit, zoomed, letterboxed] {
+            let line_x = compare_wipe_screen_x(draw_rect, fraction);
+            let grabbed_fraction = compare_wipe_fraction_from_screen_x(draw_rect, line_x);
+            assert!((grabbed_fraction - fraction).abs() < 1.0e-6);
+            assert!(compare_wipe_grab_hit(
+                draw_rect,
+                egui::pos2(line_x, draw_rect.center().y),
+                fraction,
+            ));
+        }
     }
 
     #[test]
