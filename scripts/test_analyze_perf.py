@@ -16,6 +16,7 @@ from analyze_perf import (
     analyze_idle_health,
     cmd_colorize,
     cmd_idle_health,
+    cmd_page_turn,
     cmd_pre_grid,
     load_events,
 )
@@ -64,6 +65,57 @@ def page_turn(t: float, idx: int, mode: str, generation: int = 2) -> dict:
     }
 
 
+def page_turn_decision(
+    t: float,
+    frame_number: int,
+    reason: str,
+    pending: int,
+    matching: int,
+    chords: str = "",
+) -> dict:
+    return {
+        "t": t,
+        "cat": "fs",
+        "kind": "page_turn_decision",
+        "n": frame_number,
+        "frame_nr": frame_number,
+        "idx": 7,
+        "reason": reason,
+        "ordinary_blocker": "none",
+        "win32_pending_page_turn_edge_count": pending,
+        "win32_pending_page_turn_repeat_count": pending,
+        "win32_matching_page_turn_edge_count": matching,
+        "win32_matching_page_turn_chords": chords,
+    }
+
+
+def page_turn_egui_probe(t: float, frame_number: int, count: int) -> dict:
+    return {
+        "t": t,
+        "cat": "fs",
+        "kind": "page_turn_egui_input",
+        "n": frame_number,
+        "frame_nr": frame_number,
+        "source": "fullscreen",
+        "egui_page_turn_event_count": count,
+        "egui_page_turn_repeat_count": count,
+        "egui_page_turn_chords": f"Left={count}/{count}r",
+    }
+
+
+def page_turn_winit_probe(t: float, frame_number: int, count: int) -> dict:
+    return {
+        "t": t,
+        "cat": "fs",
+        "kind": "page_turn_winit_input",
+        "frame_nr": frame_number,
+        "viewport": "FFFF",
+        "winit_page_turn_event_count": count,
+        "winit_page_turn_repeat_count": count,
+        "winit_page_turn_chords": f"Left={count}/{count}r",
+    }
+
+
 class PageTurnTests(unittest.TestCase):
     def test_groups_pass_pages_with_the_materialized_stop_page(self) -> None:
         report = analyze_page_turn([
@@ -96,6 +148,42 @@ class PageTurnTests(unittest.TestCase):
         self.assertEqual(len(report["holds"]), 2)
         self.assertFalse(report["holds"][0]["complete"])
         self.assertTrue(report["holds"][1]["complete"])
+
+    def test_reports_false_reason_and_three_input_stage_cardinalities(self) -> None:
+        events = [
+            page_turn_decision(1.000, 40, "pending_zero", 0, 0),
+            page_turn_winit_probe(1.001, 40, 1),
+            page_turn_egui_probe(1.001, 40, 1),
+            page_turn_decision(1.034, 41, "pass_through", 2, 2, "Left=2/2r"),
+            page_turn_winit_probe(1.035, 41, 1),
+            page_turn_egui_probe(1.035, 41, 1),
+        ]
+        report = analyze_page_turn(events)
+
+        self.assertEqual(
+            report["decision_reasons"],
+            {"pending_zero": 1, "pass_through": 1},
+        )
+        self.assertEqual(len(report["diagnostic_decisions"]), 2)
+        self.assertEqual(
+            report["diagnostic_decisions"][0]["winit_probes"][0]
+            ["winit_page_turn_event_count"],
+            1,
+        )
+        self.assertEqual(
+            report["diagnostic_decisions"][0]["egui_probes"][0]
+            ["egui_page_turn_event_count"],
+            1,
+        )
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cmd_page_turn(events)
+        rendered = output.getvalue()
+        self.assertIn("pending_zero=1", rendered)
+        self.assertIn("Win32 pending/repeat/matching", rendered)
+        self.assertIn("winit press/repeat", rendered)
+        self.assertIn("0/0/0 | 1/1 | 1/1", rendered)
 
 
 class IdleHealthTests(unittest.TestCase):

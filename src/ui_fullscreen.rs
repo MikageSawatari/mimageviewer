@@ -5474,8 +5474,14 @@ fn compare_wipe_screen_x(draw_rect: egui::Rect, fraction: f32) -> f32 {
     draw_rect.left() + draw_rect.width() * fraction.clamp(0.0, 1.0)
 }
 
-fn compare_wipe_fraction_from_screen_x(draw_rect: egui::Rect, screen_x: f32) -> f32 {
-    ((screen_x - draw_rect.left()) / draw_rect.width().max(f32::EPSILON)).clamp(0.0, 1.0)
+fn compare_wipe_fraction_from_screen_x(
+    draw_rect: egui::Rect,
+    viewport_rect: egui::Rect,
+    screen_x: f32,
+) -> Option<f32> {
+    let (visible, _) = compare_shader_visible_region(draw_rect, viewport_rect)?;
+    let visible_x = screen_x.clamp(visible.left(), visible.right());
+    Some(((visible_x - draw_rect.left()) / draw_rect.width().max(f32::EPSILON)).clamp(0.0, 1.0))
 }
 
 fn compare_wipe_grab_hit(draw_rect: egui::Rect, pointer: egui::Pos2, fraction: f32) -> bool {
@@ -6519,6 +6525,13 @@ const FS_PAGE_TURN_COALESCE_ACTIONS: [KeyAction; 6] = [
     KeyAction::FsSpreadShiftNext,
 ];
 
+const FS_FIXED_PAGE_TURN_CHORDS: [Chord; 4] = [
+    Chord::key(KeyName::Left),
+    Chord::key(KeyName::Right),
+    Chord::key(KeyName::Up),
+    Chord::key(KeyName::Down),
+];
+
 impl FsPageTurnMaterialization {
     pub(crate) const fn is_thumbnail_pass_through(self) -> bool {
         matches!(self, Self::ThumbnailPassThrough)
@@ -6548,6 +6561,83 @@ fn page_turn_materialization_for_inputs(
         FsPageTurnMaterialization::ThumbnailPassThrough
     } else {
         FsPageTurnMaterialization::Materialize
+    }
+}
+
+fn page_turn_decision_reason(
+    ordinary_single_page_context: bool,
+    eligible_pending_edges: usize,
+    matching_pending_edges: usize,
+    catalog_thumbnail_ready: bool,
+) -> &'static str {
+    if !ordinary_single_page_context {
+        "ordinary_context_blocked"
+    } else if eligible_pending_edges == 0 && matching_pending_edges > 0 {
+        "ambiguous_page_turn_chord"
+    } else if eligible_pending_edges == 0 {
+        "pending_zero"
+    } else if !catalog_thumbnail_ready {
+        "catalog_thumbnail_unavailable"
+    } else {
+        "pass_through"
+    }
+}
+
+#[cfg(windows)]
+struct PageTurnInputEventStats {
+    key_down_count: usize,
+    repeat_count: usize,
+    page_turn_count: usize,
+    page_turn_repeat_count: usize,
+    labels: String,
+}
+
+#[cfg(windows)]
+fn page_turn_input_event_stats(
+    events: &[egui::Event],
+    chords: &[Chord],
+) -> PageTurnInputEventStats {
+    let mut key_down_count = 0;
+    let mut repeat_count = 0;
+    let mut chord_counts = vec![(0_usize, 0_usize); chords.len()];
+    for event in events {
+        let egui::Event::Key {
+            key,
+            pressed: true,
+            repeat,
+            modifiers,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        key_down_count += 1;
+        repeat_count += usize::from(*repeat);
+        if let Some((position, _)) = chords
+            .iter()
+            .enumerate()
+            .find(|(_, chord)| chord.matches_egui(*key, *modifiers))
+        {
+            chord_counts[position].0 += 1;
+            chord_counts[position].1 += usize::from(*repeat);
+        }
+    }
+    let page_turn_count = chord_counts.iter().map(|counts| counts.0).sum();
+    let page_turn_repeat_count = chord_counts.iter().map(|counts| counts.1).sum();
+    let labels = chords
+        .iter()
+        .zip(chord_counts)
+        .filter_map(|(chord, (count, repeats))| {
+            (count > 0).then(|| format!("{}={count}/{repeats}r", chord.display_name()))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    PageTurnInputEventStats {
+        key_down_count,
+        repeat_count,
+        page_turn_count,
+        page_turn_repeat_count,
+        labels,
     }
 }
 
@@ -11218,6 +11308,18 @@ impl App {
                         let input_t0 = std::time::Instant::now();
 
                         // ── キー入力 ──
+                        #[cfg(windows)]
+                        self.emit_fs_page_turn_egui_input_probe(
+                            ctx,
+                            fs_idx,
+                            if embedded {
+                                "embedded"
+                            } else if detached {
+                                "detached"
+                            } else {
+                                "fullscreen"
+                            },
+                        );
                         // 音声 (映像なし動画) は動画スコープの Video* アクション (L / B / 音量 /
                         // 前後ファイル) を共有するので、ショートカット一覧も動画スコープを使う。
                         let active_scopes = if matches!(
@@ -13013,6 +13115,329 @@ impl App {
         }
     }
 
+    #[cfg(windows)]
+    fn fs_page_turn_ordinary_context_blocker(
+        &self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> Option<&'static str> {
+        if !self.reading_flow.is_paged() {
+            Some("reading_flow_not_paged")
+        } else if self.spread_mode.is_spread() {
+            Some("spread_mode")
+        } else if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
+            Some("item_not_page_data")
+        } else if self.any_modal_dialog_open_for_fullscreen_keys() {
+            Some("modal_dialog")
+        } else if self.fs_context_menu_idx.is_some() {
+            Some("context_menu")
+        } else if self.capture_region_selection.is_some() {
+            Some("capture_region")
+        } else if self.is_overlay_edit_mode_active() {
+            Some("overlay_edit_mode")
+        } else if self.analysis_mode {
+            Some("analysis_mode")
+        } else if self.view_trim_mode {
+            Some("view_trim_mode")
+        } else if self.fs_zoom_mode_engaged() {
+            Some("zoom_mode")
+        } else if !matches!(self.compare_view_mode, crate::app::CompareViewMode::Off) {
+            Some("compare_mode")
+        } else if self.is_panorama_mode_active(fs_idx) {
+            Some("panorama_mode")
+        } else if self.original_preview_active(ctx, fs_idx) {
+            Some("original_preview")
+        } else {
+            None
+        }
+    }
+
+    #[cfg(windows)]
+    fn fs_page_turn_chord_is_unambiguous(&self, chord: Chord) -> bool {
+        // A customized chord can overlap another active action. Dispatch is
+        // first-wins, so an overlap is not proof that the edge will become a
+        // page turn. Stay on the full-quality path in that ambiguous case.
+        !KeyAction::all().iter().copied().any(|action| {
+            FS_IMAGE_ACTIVE_SCOPES.contains(&action.context())
+                && action.trigger() == KeyTrigger::Press
+                && !FS_PAGE_TURN_COALESCE_ACTIONS.contains(&action)
+                && !(matches!(
+                    action,
+                    KeyAction::FsStackJumpPrev | KeyAction::FsStackJumpNext
+                ) && !self.stack_showing_flat)
+                && self
+                    .keymap
+                    .any_effective_chord(action, |bound| bound == chord)
+        })
+    }
+
+    /// Candidate chords are materialized only while perf logging is enabled.
+    /// The normal hot path keeps using borrowed keymap walks below.
+    #[cfg(windows)]
+    fn fs_page_turn_candidate_chords(&self) -> Vec<Chord> {
+        let mut chords = Vec::new();
+        let mut push_unique = |chord| {
+            if !chords.contains(&chord) {
+                chords.push(chord);
+            }
+        };
+        for action in FS_PAGE_TURN_COALESCE_ACTIONS {
+            self.keymap.any_effective_chord(action, |chord| {
+                push_unique(chord);
+                false
+            });
+        }
+        for chord in FS_FIXED_PAGE_TURN_CHORDS
+            .into_iter()
+            .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Up)))
+            .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Down)))
+        {
+            push_unique(chord);
+        }
+        chords
+    }
+
+    #[cfg(windows)]
+    fn fs_page_turn_win32_chord_stats(
+        &self,
+        viewport: egui::ViewportId,
+        chords: &[Chord],
+    ) -> (crate::key_input::FrameKeyDownStats, String) {
+        let mut total = crate::key_input::FrameKeyDownStats::default();
+        let mut labels = Vec::new();
+        for chord in chords {
+            let stats = self
+                .keymap
+                .pending_chord_press_stats_in_frame(viewport, *chord);
+            total.matched_count += stats.matched_count;
+            total.repeat_count += stats.repeat_count;
+            if stats.matched_count > 0 {
+                labels.push(format!(
+                    "{}={}/{}r",
+                    chord.display_name(),
+                    stats.matched_count,
+                    stats.repeat_count
+                ));
+            }
+        }
+        (total, labels.join(","))
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
+    fn emit_fs_page_turn_decision_probe(
+        &self,
+        viewport: egui::ViewportId,
+        frame_nr: u64,
+        fs_idx: usize,
+        ordinary_context: bool,
+        ordinary_blocker: Option<&'static str>,
+        thumbnail_ready: bool,
+        production_pending: bool,
+        materialization: FsPageTurnMaterialization,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let matching_chords = self.fs_page_turn_candidate_chords();
+        let eligible_chords = matching_chords
+            .iter()
+            .copied()
+            .filter(|chord| self.fs_page_turn_chord_is_unambiguous(*chord))
+            .collect::<Vec<_>>();
+        let (matching, matching_labels) =
+            self.fs_page_turn_win32_chord_stats(viewport, &matching_chords);
+        let (pending, pending_labels) =
+            self.fs_page_turn_win32_chord_stats(viewport, &eligible_chords);
+        let all = crate::key_input::frame_key_down_stats(viewport, |_edge| true);
+        let counted_pending = if ordinary_context {
+            pending.matched_count != 0
+        } else {
+            false
+        };
+        let reason = page_turn_decision_reason(
+            ordinary_context,
+            pending.matched_count,
+            matching.matched_count,
+            thumbnail_ready,
+        );
+        let mut attrs = Vec::new();
+        attrs.push(("n", serde_json::Value::from(self.frame_counter)));
+        attrs.push(("frame_nr", serde_json::Value::from(frame_nr)));
+        attrs.push(("idx", serde_json::Value::from(fs_idx)));
+        attrs.push((
+            "items_generation",
+            serde_json::Value::from(self.items_generation),
+        ));
+        attrs.push((
+            "mode",
+            serde_json::Value::from(materialization.perf_label()),
+        ));
+        attrs.push(("reason", serde_json::Value::from(reason)));
+        attrs.push((
+            "ordinary_context",
+            serde_json::Value::from(ordinary_context),
+        ));
+        attrs.push((
+            "ordinary_blocker",
+            serde_json::Value::from(ordinary_blocker.unwrap_or("none")),
+        ));
+        attrs.push((
+            "catalog_thumbnail_ready",
+            serde_json::Value::from(thumbnail_ready),
+        ));
+        attrs.push((
+            "win32_key_down_count",
+            serde_json::Value::from(all.matched_count),
+        ));
+        attrs.push((
+            "win32_repeat_count",
+            serde_json::Value::from(all.repeat_count),
+        ));
+        attrs.push((
+            "win32_matching_page_turn_edge_count",
+            serde_json::Value::from(matching.matched_count),
+        ));
+        attrs.push((
+            "win32_pending_page_turn_edge_count",
+            serde_json::Value::from(pending.matched_count),
+        ));
+        attrs.push((
+            "win32_pending_page_turn_repeat_count",
+            serde_json::Value::from(pending.repeat_count),
+        ));
+        attrs.push((
+            "win32_matching_page_turn_chords",
+            serde_json::Value::from(matching_labels),
+        ));
+        attrs.push((
+            "win32_pending_page_turn_chords",
+            serde_json::Value::from(pending_labels),
+        ));
+        attrs.push((
+            "production_pending",
+            serde_json::Value::from(production_pending),
+        ));
+        attrs.push(("counted_pending", serde_json::Value::from(counted_pending)));
+        crate::perf::event(
+            "fs",
+            "page_turn_decision",
+            self.perf_item_key(fs_idx).as_deref(),
+            self.input_seq,
+            &attrs,
+        );
+    }
+
+    #[cfg(windows)]
+    fn emit_fs_page_turn_egui_input_probe(
+        &self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        source: &'static str,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let chords = self.fs_page_turn_candidate_chords();
+        let stats = ctx.input(|input| page_turn_input_event_stats(&input.events, &chords));
+        if stats.page_turn_count == 0 {
+            return;
+        }
+        crate::perf::event(
+            "fs",
+            "page_turn_egui_input",
+            None,
+            self.input_seq,
+            &[
+                ("n", serde_json::Value::from(self.frame_counter)),
+                (
+                    "frame_nr",
+                    serde_json::Value::from(ctx.cumulative_frame_nr()),
+                ),
+                ("idx", serde_json::Value::from(fs_idx)),
+                ("source", serde_json::Value::from(source)),
+                (
+                    "egui_key_down_count",
+                    serde_json::Value::from(stats.key_down_count),
+                ),
+                (
+                    "egui_repeat_count",
+                    serde_json::Value::from(stats.repeat_count),
+                ),
+                (
+                    "egui_page_turn_event_count",
+                    serde_json::Value::from(stats.page_turn_count),
+                ),
+                (
+                    "egui_page_turn_repeat_count",
+                    serde_json::Value::from(stats.page_turn_repeat_count),
+                ),
+                (
+                    "egui_page_turn_chords",
+                    serde_json::Value::from(stats.labels),
+                ),
+            ],
+        );
+    }
+
+    /// Record the egui-winit translated input before `egui::Context::run`.
+    /// Read-only: this never removes, merges, or injects events.
+    #[cfg(windows)]
+    pub(crate) fn emit_fs_page_turn_winit_input_probe(
+        &self,
+        ctx: &egui::Context,
+        raw_input: &egui::RawInput,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return;
+        };
+        let chords = self.fs_page_turn_candidate_chords();
+        let stats = page_turn_input_event_stats(&raw_input.events, &chords);
+        if stats.page_turn_count == 0 {
+            return;
+        }
+        crate::perf::event(
+            "fs",
+            "page_turn_winit_input",
+            None,
+            self.input_seq,
+            &[
+                (
+                    "frame_nr",
+                    serde_json::Value::from(ctx.cumulative_frame_nr().wrapping_add(1)),
+                ),
+                ("idx", serde_json::Value::from(fs_idx)),
+                (
+                    "viewport",
+                    serde_json::Value::from(format!("{:?}", raw_input.viewport_id)),
+                ),
+                (
+                    "winit_key_down_count",
+                    serde_json::Value::from(stats.key_down_count),
+                ),
+                (
+                    "winit_repeat_count",
+                    serde_json::Value::from(stats.repeat_count),
+                ),
+                (
+                    "winit_page_turn_event_count",
+                    serde_json::Value::from(stats.page_turn_count),
+                ),
+                (
+                    "winit_page_turn_repeat_count",
+                    serde_json::Value::from(stats.page_turn_repeat_count),
+                ),
+                (
+                    "winit_page_turn_chords",
+                    serde_json::Value::from(stats.labels),
+                ),
+            ],
+        );
+    }
+
     /// Decide whether the current page is only passing through this input frame.
     ///
     /// The decision source is exclusively the unconsumed, viewport-routed Win32
@@ -13054,61 +13479,37 @@ impl App {
                 self.thumbnails.get(fs_idx),
                 Some(ThumbnailState::Loaded { .. })
             );
-            let ordinary_single_page_context = self.reading_flow.is_paged()
-                && !self.spread_mode.is_spread()
-                && self.items.get(fs_idx).is_some_and(GridItem::has_page_data)
-                && !self.any_modal_dialog_open_for_fullscreen_keys()
-                && self.fs_context_menu_idx.is_none()
-                && self.capture_region_selection.is_none()
-                && !self.is_overlay_edit_mode_active()
-                && !self.analysis_mode
-                && !self.view_trim_mode
-                && !self.fs_zoom_mode_engaged()
-                && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
-                && !self.is_panorama_mode_active(fs_idx)
-                && !self.original_preview_active(ctx, fs_idx);
-
-            // A customized chord can overlap another active action. Dispatch is
-            // first-wins, so an overlap is not proof that the edge will become a
-            // page turn. Stay on the full-quality path in that ambiguous case.
-            let chord_is_unambiguous_page_turn = |chord: Chord| {
-                !KeyAction::all().iter().copied().any(|action| {
-                    FS_IMAGE_ACTIVE_SCOPES.contains(&action.context())
-                        && action.trigger() == KeyTrigger::Press
-                        && !FS_PAGE_TURN_COALESCE_ACTIONS.contains(&action)
-                        && !(matches!(
-                            action,
-                            KeyAction::FsStackJumpPrev | KeyAction::FsStackJumpNext
-                        ) && !self.stack_showing_flat)
-                        && self
-                            .keymap
-                            .any_effective_chord(action, |bound| bound == chord)
-                })
-            };
+            let ordinary_context_blocker = self.fs_page_turn_ordinary_context_blocker(ctx, fs_idx);
+            let ordinary_single_page_context = ordinary_context_blocker.is_none();
             let configurable_page_turn_pending = ordinary_single_page_context
                 && FS_PAGE_TURN_COALESCE_ACTIONS.into_iter().any(|action| {
                     self.keymap.any_effective_chord(action, |chord| {
                         self.keymap.pending_chord_press_in_frame(viewport, chord)
-                            && chord_is_unambiguous_page_turn(chord)
+                            && self.fs_page_turn_chord_is_unambiguous(chord)
                     })
                 });
             let fixed_page_turn_pending = ordinary_single_page_context
-                && [
-                    Chord::key(KeyName::Left),
-                    Chord::key(KeyName::Right),
-                    Chord::key(KeyName::Up),
-                    Chord::key(KeyName::Down),
-                ]
-                .into_iter()
-                .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Up)))
-                .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Down)))
-                .any(|chord| {
-                    self.keymap.pending_chord_press_in_frame(viewport, chord)
-                        && chord_is_unambiguous_page_turn(chord)
-                });
+                && FS_FIXED_PAGE_TURN_CHORDS
+                    .into_iter()
+                    .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Up)))
+                    .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Down)))
+                    .any(|chord| {
+                        self.keymap.pending_chord_press_in_frame(viewport, chord)
+                            && self.fs_page_turn_chord_is_unambiguous(chord)
+                    });
             let materialization = page_turn_materialization_for_inputs(
                 configurable_page_turn_pending || fixed_page_turn_pending,
                 catalog_thumbnail_ready,
+            );
+            self.emit_fs_page_turn_decision_probe(
+                viewport,
+                frame_nr,
+                fs_idx,
+                ordinary_single_page_context,
+                ordinary_context_blocker,
+                catalog_thumbnail_ready,
+                configurable_page_turn_pending || fixed_page_turn_pending,
+                materialization,
             );
             ctx.data_mut(|data| {
                 data.insert_temp(
@@ -14173,6 +14574,8 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return false;
         };
+        #[cfg(windows)]
+        self.emit_fs_page_turn_egui_input_probe(ctx, fs_idx, "root");
         let _owner = self.keyboard_owner_for_pass(ctx);
         if self.viewer_session_is_detached() {
             return false;
@@ -16435,7 +16838,12 @@ impl App {
 
     // ── ホイール & クリック ──────────────────────────────────────────────
 
-    fn handle_compare_wipe_drag(&mut self, ctx: &egui::Context, draw_rect: egui::Rect) -> bool {
+    fn handle_compare_wipe_drag(
+        &mut self,
+        ctx: &egui::Context,
+        draw_rect: egui::Rect,
+        viewport_rect: egui::Rect,
+    ) -> bool {
         let crate::app::CompareViewMode::Wipe { fraction } = self.compare_view_mode else {
             self.compare_wipe_dragging = false;
             return false;
@@ -16469,13 +16877,16 @@ impl App {
         }
         if self.compare_wipe_dragging && primary_down {
             if let Some(pos) = pointer_pos {
-                let new_fraction = compare_wipe_fraction_from_screen_x(draw_rect, pos.x)
-                    .clamp(COMPARE_WIPE_MIN_FRACTION, COMPARE_WIPE_MAX_FRACTION);
-                self.compare_view_mode = crate::app::CompareViewMode::Wipe {
-                    fraction: new_fraction,
-                };
-                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                ctx.request_repaint();
+                if let Some(new_fraction) =
+                    compare_wipe_fraction_from_screen_x(draw_rect, viewport_rect, pos.x)
+                {
+                    self.compare_view_mode = crate::app::CompareViewMode::Wipe {
+                        fraction: new_fraction
+                            .clamp(COMPARE_WIPE_MIN_FRACTION, COMPARE_WIPE_MAX_FRACTION),
+                    };
+                    ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    ctx.request_repaint();
+                }
             }
             return true;
         }
@@ -18407,7 +18818,9 @@ impl App {
                 )
             })
             .unwrap_or(compare_base_rect);
-        if !cursor_in_panel && self.handle_compare_wipe_drag(ctx, compare_drag_rect) {
+        if !cursor_in_panel
+            && self.handle_compare_wipe_drag(ctx, compare_drag_rect, compare_base_rect)
+        {
             return (FsPageNav::None, false);
         }
 
@@ -31102,6 +31515,24 @@ mod tests {
     }
 
     #[test]
+    fn page_turn_decision_reason_distinguishes_each_false_gate() {
+        assert_eq!(
+            page_turn_decision_reason(false, 1, 1, true),
+            "ordinary_context_blocked"
+        );
+        assert_eq!(page_turn_decision_reason(true, 0, 0, true), "pending_zero");
+        assert_eq!(
+            page_turn_decision_reason(true, 0, 1, true),
+            "ambiguous_page_turn_chord"
+        );
+        assert_eq!(
+            page_turn_decision_reason(true, 1, 1, false),
+            "catalog_thumbnail_unavailable"
+        );
+        assert_eq!(page_turn_decision_reason(true, 1, 1, true), "pass_through");
+    }
+
+    #[test]
     fn page_turn_sequence_keeps_one_painted_index_per_frame_and_materializes_stop() {
         let mut app = crate::app::setup_app_for_test();
         for page in 0..5 {
@@ -35545,7 +35976,8 @@ mod tests {
         let fraction = 0.37;
         for draw_rect in [fit, zoomed, letterboxed] {
             let line_x = compare_wipe_screen_x(draw_rect, fraction);
-            let grabbed_fraction = compare_wipe_fraction_from_screen_x(draw_rect, line_x);
+            let grabbed_fraction =
+                compare_wipe_fraction_from_screen_x(draw_rect, viewport, line_x).unwrap();
             assert!((grabbed_fraction - fraction).abs() < 1.0e-6);
             assert!(compare_wipe_grab_hit(
                 draw_rect,
@@ -35553,6 +35985,41 @@ mod tests {
                 fraction,
             ));
         }
+    }
+
+    #[test]
+    fn compare_wipe_pointer_clamps_to_visible_image_edges() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0));
+        let fit = egui::Rect::from_min_max(egui::pos2(100.0, 0.0), egui::pos2(900.0, 800.0));
+        assert_eq!(
+            compare_wipe_fraction_from_screen_x(fit, viewport, -500.0),
+            Some(0.0)
+        );
+        assert_eq!(
+            compare_wipe_fraction_from_screen_x(fit, viewport, 1500.0),
+            Some(1.0)
+        );
+
+        let zoomed =
+            egui::Rect::from_min_size(egui::pos2(-500.0, -400.0), egui::vec2(2000.0, 1600.0));
+        assert_eq!(
+            compare_wipe_fraction_from_screen_x(zoomed, viewport, -500.0),
+            Some(0.25)
+        );
+        assert_eq!(
+            compare_wipe_fraction_from_screen_x(zoomed, viewport, 1500.0),
+            Some(0.75)
+        );
+        assert_eq!(
+            compare_wipe_screen_x(zoomed, 0.25),
+            viewport.left(),
+            "the clamped fraction must place the painted/grabbable line at the same edge"
+        );
+        assert_eq!(
+            compare_wipe_screen_x(zoomed, 0.75),
+            viewport.right(),
+            "the clamped fraction must place the painted/grabbable line at the same edge"
+        );
     }
 
     #[test]

@@ -1134,6 +1134,22 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   `fs.page_turn_ready` (`mode=pass_through|materialized`) と
   `python scripts/analyze_perf.py <jsonl> page-turn` を追加した。対策2へ進む判断は、この対策1を
   同じ実機条件で再計測し、通過/実体化枚数と ready→ready を確認してから行う。
+- 戻り方向の残件調査 (2026-08-09、Codex): ソース上は通常単ページ predicate、固定の
+  Left / Right / Up / Down、カスタム `FsPagePrev` / `FsPageNext`、曖昧 chord 除外のいずれにも
+  前進 / 後退の非対称条件がなく、既存 `page_turn_ready mode=materialized` だけでは
+  `ordinary context`、pending 0、曖昧 chord、catalog thumbnail 未準備のどこで落ちたか確定
+  できなかった。このため判定条件は緩めず、時間閾値も追加していない。
+  `fs.page_turn_decision` に判定理由、通常 context blocker、Win32 frame queue の全 key-down 数、
+  候補 / eligible ページ送り edge 数・repeat 数・chord を追加した。さらに read-only の
+  `raw_input_hook` から `fs.page_turn_winit_input` に egui-winit 翻訳直後の `RawInput` 数を残し、
+  `fs.page_turn_egui_input` に root / embedded / fullscreen / detached の egui 処理後
+  `Event::Key` 数・repeat 数・chord を追加した。
+  `analyze_perf.py page-turn` はページ入力のあった frame だけを相関し、false 理由と
+  Win32 pending/repeat/matching 対 winit/egui の各 press/repeat の署名を集計する。これで次の
+  実機ログから「Win32 到着前」「Win32 から egui-winit 翻訳まで」「RawInput から egui 処理後」
+  「全段にあるが通常 context / 曖昧性で却下」を区別する。既存の `fs_upload_backlog` /
+  final-effect upload 抑制は対策1と同じ
+  materialization 判定へ既に接続済みのため、原因確定までは挙動を変更しない。
 
 ### 1.59 360 度ビューに等距離魚眼投影を追加する (提案・採否判断が要る)
 
@@ -1193,6 +1209,12 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   クリップ済みcallback矩形へ引き伸ばしていた。本文 / ナビゲータをtyped slotに分け、重いtexture /
   mip chainは共有したままuniform buffer / bind groupだけを分離した。1フレームに複数callbackを
   出すときは、prepareで変わるGPU状態をpaintまで共有してはならない。
+- 画面端クランプ追記 (2026-08-09): drag 中の pointer x は、シェーダ callback と同じ
+  `compare_shader_visible_region(draw_rect, viewport)` が返す `visible` の左右端へ先にクランプし、
+  その x を full `draw_rect` の fraction へ戻す。ズーム / パンで画像が画面外へ広がっても境界は
+  可視端で止まり、保存した fraction を `compare_wipe_screen_x(draw_rect, fraction)` へ通すため、
+  白線・clip・掴み位置は引き続き同じ full-image 座標を共有する。等倍と 2x zoom の両方で、
+  viewport 外の pointer が可視左 / 右端の fraction で頭打ちになる unit test を追加した。
 
 ### 1.61 見開きでページが 1 枚ダブる (横長ページの寸法をキャッシュ在住に頼っている) — 利用者報告
 

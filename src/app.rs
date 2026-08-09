@@ -61465,6 +61465,13 @@ impl App {
 // -----------------------------------------------------------------------
 
 impl eframe::App for App {
+    /// Observe the egui-winit translation boundary for page-turn diagnostics.
+    /// The probe is read-only and enabled only by `--perf-log`.
+    #[cfg(windows)]
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.emit_fs_page_turn_winit_input_probe(ctx, raw_input);
+    }
+
     /// メインウィンドウ surface のクリア色 (= egui が何も描かなかったフレームで見える色)。
     ///
     /// eframe 既定は near-black `(12,12,12, a=180)` 固定 ([eframe epi.rs] `clear_color`)。

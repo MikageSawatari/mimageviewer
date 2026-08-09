@@ -40,7 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 
@@ -253,9 +253,48 @@ def analyze_page_turn(events: list[dict]) -> dict:
             finish(True)
     finish(False)
 
+    decisions = sorted(
+        (
+            e for e in events
+            if e.get("cat") == "fs" and e.get("kind") == "page_turn_decision"
+        ),
+        key=lambda e: float(e.get("t", 0.0)),
+    )
+    winit_probes_by_frame: dict[int, list[dict]] = defaultdict(list)
+    egui_probes_by_frame: dict[int, list[dict]] = defaultdict(list)
+    for event in events:
+        if event.get("cat") != "fs":
+            continue
+        kind = event.get("kind")
+        if kind == "page_turn_winit_input":
+            winit_probes_by_frame[int(event.get("frame_nr", -1))].append(event)
+        elif kind == "page_turn_egui_input":
+            frame = int(event.get("frame_nr", event.get("n", -1)))
+            egui_probes_by_frame[frame].append(event)
+
+    diagnostic_decisions = []
+    for decision in decisions:
+        frame = int(decision.get("frame_nr", decision.get("n", -1)))
+        matching_edges = int(decision.get("win32_matching_page_turn_edge_count", 0))
+        winit_probes = winit_probes_by_frame.get(frame, [])
+        egui_probes = egui_probes_by_frame.get(frame, [])
+        if matching_edges == 0 and not winit_probes and not egui_probes:
+            continue
+        diagnostic_decisions.append({
+            "decision": decision,
+            "winit_probes": winit_probes,
+            "egui_probes": egui_probes,
+        })
+    decision_reasons = dict(Counter(
+        row["decision"].get("reason", "unknown")
+        for row in diagnostic_decisions
+    ))
+
     return {
         "counts": counts,
         "holds": holds,
+        "decision_reasons": decision_reasons,
+        "diagnostic_decisions": diagnostic_decisions,
         "intervals_ms": [
             interval
             for hold in holds
@@ -272,6 +311,84 @@ def cmd_page_turn(events: list[dict]) -> None:
         f"pass_through={counts['pass_through']} "
         f"materialized={counts['materialized']}"
     )
+    diagnostic = report["diagnostic_decisions"]
+    if diagnostic:
+        reasons = " ".join(
+            f"{reason}={count}"
+            for reason, count in sorted(report["decision_reasons"].items())
+        )
+        print(f"page-turn decision reasons (input frames): {reasons}")
+        signatures = Counter()
+        for row in diagnostic:
+            decision = row["decision"]
+            winit_probes = row["winit_probes"]
+            egui_probes = row["egui_probes"]
+            winit_count = max(
+                (int(probe.get("winit_page_turn_event_count", 0)) for probe in winit_probes),
+                default=0,
+            )
+            winit_repeats = max(
+                (int(probe.get("winit_page_turn_repeat_count", 0)) for probe in winit_probes),
+                default=0,
+            )
+            egui_count = max(
+                (int(probe.get("egui_page_turn_event_count", 0)) for probe in egui_probes),
+                default=0,
+            )
+            egui_repeats = max(
+                (int(probe.get("egui_page_turn_repeat_count", 0)) for probe in egui_probes),
+                default=0,
+            )
+            winit_viewports = ",".join(sorted({
+                str(probe.get("viewport", "?")) for probe in winit_probes
+            }))
+            winit_chords = ",".join(sorted({
+                str(probe.get("winit_page_turn_chords", ""))
+                for probe in winit_probes
+                if probe.get("winit_page_turn_chords")
+            }))
+            egui_sources = ",".join(sorted({
+                str(probe.get("source", "?")) for probe in egui_probes
+            }))
+            egui_chords = ",".join(sorted({
+                str(probe.get("egui_page_turn_chords", ""))
+                for probe in egui_probes
+                if probe.get("egui_page_turn_chords")
+            }))
+            signature = (
+                str(decision.get("reason", "unknown")),
+                str(decision.get("ordinary_blocker", "none")),
+                int(decision.get("win32_pending_page_turn_edge_count", 0)),
+                int(decision.get("win32_pending_page_turn_repeat_count", 0)),
+                int(decision.get("win32_matching_page_turn_edge_count", 0)),
+                winit_count,
+                winit_repeats,
+                egui_count,
+                egui_repeats,
+                str(decision.get("win32_matching_page_turn_chords", "")),
+                winit_viewports,
+                winit_chords,
+                egui_sources,
+                egui_chords,
+            )
+            signatures[signature] += 1
+        print("input-stage signatures:")
+        print(
+            " count reason / blocker | Win32 pending/repeat/matching | "
+            "winit press/repeat | egui press/repeat | chords"
+        )
+        for signature, count in signatures.most_common():
+            (reason, blocker, pending, win_repeat, matching, winit_count,
+             winit_repeat, egui_count, egui_repeat, win_chords,
+             winit_viewports, winit_chords, sources, egui_chords) = signature
+            print(
+                f" {count:>5} {reason} / {blocker} | "
+                f"{pending}/{win_repeat}/{matching} | "
+                f"{winit_count}/{winit_repeat} | {egui_count}/{egui_repeat} | "
+                f"win32={win_chords or '-'} "
+                f"winit[{winit_viewports or '-'}]={winit_chords or '-'} "
+                f"egui[{sources or '-'}]={egui_chords or '-'}"
+            )
     if not report["holds"]:
         print("(pass_through を含むキーリピート区間なし)")
         return
