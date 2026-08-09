@@ -1645,14 +1645,32 @@ remote heavy worker は利用者設定の半分・最大 3 本で、prefetch 上
 foreground が来た時点で無関係な prefetch を abort して直接開始する。このため同時実行数を
 上げても foreground が prefetch の後ろへ並ぶ構造にはしない。
 
-症状「シークバーは進んだが画像が変わらない」はこの増分では修正しない。既存 telemetry に
-`page_display` を追加し、要求 group、1-origin の要求ページ番号、シークバーへ出した page label、
-取得候補と実際に DOM へ適用した HTTP request ID、`applied` / `not_applied`、固定列挙の理由を
-client timestamp / sequence 付きで残す。理由は `dom_committed`、`pending_superseded`、
+`page_display` の実機ログにより、前景が進行中の先読みへ相乗りした直後、新しい先読み計画が
+現在 group の key を含まないため、その通信を中止していたことが 2026-08-09 に確定した。
+`PageResourceCache.active` は `prefetchPlanned` と `foregroundWaiters` を持ち、先読み計画の所有と
+前景待機者を明示的に分ける。`schedule` は計画外かつ前景待機者 0 件の通信だけを中止し、計画外の
+通信から最後の前景待機者が離れた場合はその時点で中止する。別の foreground 到着による無関係な
+prefetch の中止も、既に前景待機者がいる通信は対象外とする。前景自身の `AbortSignal` は
+`awaitWithAbort` でその待機だけを従来どおり中止し、共有通信の controller とは分離する。
+503 `ipc_busy` に相乗りした前景が admission 失敗を継承せず直接 foreground 取得へ進む契約も維持する。
+現在 group を `schedule` の計画へ足すだけの例外処理は採らない。
+
+要求画像を表示できなかった場合の位置不整合は、この所有修正とは分けて未解決とする。
+`fetch_failed`、decode / apply failure、identity / generation 拒否でも `loadGroup()` は `false` を返すが、
+同じ `false` は新しい要求による active / pending の supersede にも使われる。単純に `false` で
+`discardRequestedPageGroup` を呼ぶと、同じ group の resize / 再描画として後続している正当な要求まで
+描画位置へ巻き戻し得る。また既存 discard はタイトルを描画ページ名へ戻すため、終端失敗メッセージと
+履歴 URL の扱いも同時に定義する必要がある。後続では queue outcome を terminal failure と supersede に
+型分けしたうえで、終端失敗だけ要求位置を描画位置へ戻し、エラー表示と history を整合させる。
+自動再試行、delay、追加 repaint は採らない。
+
+既存 telemetry の `page_display` は、要求 group、1-origin の要求ページ番号、シークバーへ出した
+page label、取得候補と実際に DOM へ適用した HTTP request ID、`applied` / `not_applied`、固定列挙の
+理由を client timestamp / sequence 付きで残す。理由は `dom_committed`、`pending_superseded`、
 `queue_cleared`、`load_sequence_mismatch`、`abort`、identity / generation / session の既存判定名、
 fetch / decode / apply failure に限定する。request ID は server の単調数値識別子で、path、address、
 PIN、Bearer、remote session 生値は event builder の入力に持たせない。既存 normal/debug 段階化と
-server 最終 redaction は維持する。表示側へ guard、retry、追加 repaint は加えない。
+server 最終 redaction は維持する。
 
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 

@@ -989,6 +989,134 @@ test("foreground page load aborts unrelated concurrent prefetches and starts imm
   cache.clear();
 });
 
+test("foreground joined prefetch survives a schedule that no longer includes its key", async () => {
+  let resolvePrefetch;
+  let prefetchAborted = false;
+  const request = { cacheKey: "joined-page" };
+  const resource = {
+    blob: new Blob([request.cacheKey]),
+    requestId: "prefetch-joined-page",
+    fetchMs: 1,
+    info: null,
+  };
+  const fetchResource = (_request, signal, prefetch) => {
+    assert.equal(prefetch, true);
+    return new Promise((resolve, reject) => {
+      resolvePrefetch = resolve;
+      signal.addEventListener("abort", () => {
+        prefetchAborted = true;
+        const error = new Error("Aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    });
+  };
+  const cache = new PageResourceCache(12, 48 * 1024 * 1024, 1, fetchResource);
+  cache.schedule([request]);
+
+  const foreground = cache.loadForeground(request, new AbortController().signal);
+  cache.schedule([]);
+  resolvePrefetch(resource);
+
+  assert.deepEqual(await foreground, { ...resource, prefetchStatus: "in_flight" });
+  assert.equal(prefetchAborted, false);
+  cache.clear();
+});
+
+test("unjoined prefetch is still aborted when its key leaves the schedule", async () => {
+  let prefetchAborted = false;
+  let observeAbort;
+  const aborted = new Promise((resolve) => { observeAbort = resolve; });
+  const fetchResource = (_request, signal, prefetch) => {
+    assert.equal(prefetch, true);
+    return new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        prefetchAborted = true;
+        observeAbort();
+        const error = new Error("Aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    });
+  };
+  const cache = new PageResourceCache(12, 48 * 1024 * 1024, 1, fetchResource);
+  cache.schedule([{ cacheKey: "prefetch-only" }]);
+
+  cache.schedule([]);
+  await aborted;
+
+  assert.equal(prefetchAborted, true);
+  cache.clear();
+});
+
+test("foreground abort still cancels its own wait on a joined prefetch", async () => {
+  let resolvePrefetch;
+  let prefetchAborted = false;
+  const request = { cacheKey: "foreground-abort" };
+  const fetchResource = (_request, signal, prefetch) => {
+    assert.equal(prefetch, true);
+    return new Promise((resolve, reject) => {
+      resolvePrefetch = resolve;
+      signal.addEventListener("abort", () => {
+        prefetchAborted = true;
+        const error = new Error("Aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    });
+  };
+  const cache = new PageResourceCache(12, 48 * 1024 * 1024, 1, fetchResource);
+  cache.schedule([request]);
+  const controller = new AbortController();
+  const foreground = cache.loadForeground(request, controller.signal);
+
+  controller.abort();
+  await assert.rejects(foreground, { name: "AbortError" });
+  assert.equal(prefetchAborted, false, "foreground abort must not take ownership of the shared fetch");
+
+  resolvePrefetch({
+    blob: new Blob([request.cacheKey]),
+    requestId: "prefetch-foreground-abort",
+    fetchMs: 1,
+    info: null,
+  });
+  await Promise.resolve();
+  cache.clear();
+});
+
+test("foreground join does not inherit a temporary prefetch admission failure", async () => {
+  let rejectPrefetch;
+  const started = [];
+  const request = { cacheKey: "prefetch-busy" };
+  const fetchResource = (_request, _signal, prefetch) => {
+    started.push(prefetch);
+    if (!prefetch) {
+      return Promise.resolve({
+        blob: new Blob([request.cacheKey]),
+        requestId: "foreground-after-busy",
+        fetchMs: 1,
+        info: null,
+      });
+    }
+    return new Promise((_resolve, reject) => { rejectPrefetch = reject; });
+  };
+  const cache = new PageResourceCache(12, 48 * 1024 * 1024, 1, fetchResource);
+  cache.schedule([request]);
+  const foreground = cache.loadForeground(request, new AbortController().signal);
+
+  const error = new Error("Busy");
+  error.status = 503;
+  error.code = "ipc_busy";
+  error.retryAfterMs = 100;
+  rejectPrefetch(error);
+
+  const result = await foreground;
+  assert.equal(result.prefetchStatus, "miss");
+  assert.equal(result.requestId, "foreground-after-busy");
+  assert.deepEqual(started, [true, false]);
+  cache.clear();
+});
+
 test("remote adjustment normalization keeps valid local slider defaults and bounds", () => {
   assert.deepEqual(normalizeRemoteAdjustmentValues(), {
     brightness: 0,

@@ -360,8 +360,11 @@ export class PageResourceCache {
       return { ...cached, prefetchStatus: "hit" };
     }
     const joined = this.active.get(request.cacheKey);
+    if (joined) joined.foregroundWaiters += 1;
     for (const active of this.active.values()) {
-      if (active.key !== request.cacheKey) active.controller.abort();
+      if (active.key !== request.cacheKey && active.foregroundWaiters === 0) {
+        active.controller.abort();
+      }
     }
     if (joined) {
       try {
@@ -374,6 +377,9 @@ export class PageResourceCache {
           error?.code !== "ipc_busy"
         ) throw error;
         // A foreground join must not inherit a temporary prefetch admission failure.
+      } finally {
+        joined.foregroundWaiters -= 1;
+        this.abortUnownedActive(joined);
       }
     }
     this.pending = this.pending.filter((item) => item.cacheKey !== request.cacheKey);
@@ -394,9 +400,20 @@ export class PageResourceCache {
     }
     this.pending = unique;
     for (const active of this.active.values()) {
-      if (!seen.has(active.key)) active.controller.abort();
+      active.prefetchPlanned = seen.has(active.key);
+      this.abortUnownedActive(active);
     }
     this.pump();
+  }
+
+  abortUnownedActive(active) {
+    if (
+      this.active.get(active.key) === active &&
+      !active.prefetchPlanned &&
+      active.foregroundWaiters === 0
+    ) {
+      active.controller.abort();
+    }
   }
 
   pump() {
@@ -427,6 +444,8 @@ export class PageResourceCache {
     const active = {
       key: request.cacheKey,
       controller,
+      prefetchPlanned: true,
+      foregroundWaiters: 0,
       promise: null,
     };
     active.promise = this.fetchResource(request, controller.signal, true)

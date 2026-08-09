@@ -80,7 +80,10 @@
 次の契約で読み替える。remote heavy worker は利用者設定の半分・最大 3 本、prefetch は
 `min(heavy_workers - 1, 2)` 本で、foreground 用に常に 1 本を予約する。同時 prefetch は互いを
 cancel せず、foreground が全 prefetch の cancel token を立てる。Web 側も同時 2 件で、503
-`ipc_busy` は pending 末尾へ戻して `Retry-After` 後に再開する。
+`ipc_busy` は pending 末尾へ戻して `Retry-After` 後に再開する。ただし Web の foreground が
+進行中 prefetch へ相乗りした場合、その active entry は前景待機者数を持ち、先読み計画や別の
+foreground は前景待機者がいる間その共有通信を cancel しない。foreground 自身の cancel は
+共有 controller ではなく、その待機だけへ適用する。
 
 ## 2. スレッド間通信
 
