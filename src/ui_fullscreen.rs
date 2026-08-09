@@ -5555,6 +5555,209 @@ struct ContinuousReadingDragDelta {
     pan: egui::Vec2,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum ContinuousReadingDragState {
+    #[default]
+    Idle,
+    Active {
+        session_started_at: std::time::Instant,
+        applied_total: egui::Vec2,
+    },
+    Completed {
+        session_started_at: std::time::Instant,
+        terminal_frame: u64,
+        applied_total: egui::Vec2,
+    },
+}
+
+impl ContinuousReadingDragState {
+    fn advance(
+        self,
+        session_started_at: std::time::Instant,
+        app_frame: u64,
+        dragged: bool,
+        stopped: bool,
+        pointer_down: bool,
+        total_delta: Option<egui::Vec2>,
+    ) -> (Self, egui::Vec2) {
+        let state = match self {
+            Self::Active {
+                session_started_at: stored_session,
+                ..
+            }
+            | Self::Completed {
+                session_started_at: stored_session,
+                ..
+            } if stored_session != session_started_at => Self::Idle,
+            Self::Completed { terminal_frame, .. } if terminal_frame != app_frame => Self::Idle,
+            state => state,
+        };
+
+        // A terminal response can be replayed by a later egui pass in the same
+        // app frame. Keep the applied cumulative total until that frame ends so
+        // the replay contributes zero instead of re-applying the entire drag.
+        if matches!(
+            state,
+            Self::Completed {
+                terminal_frame,
+                ..
+            } if terminal_frame == app_frame
+        ) {
+            return (state, egui::Vec2::ZERO);
+        }
+
+        if (dragged || stopped)
+            && let Some(total_delta) = total_delta
+        {
+            let previous_total = match state {
+                Self::Active { applied_total, .. } => applied_total,
+                Self::Idle | Self::Completed { .. } => egui::Vec2::ZERO,
+            };
+            let incremental_delta = total_delta - previous_total;
+            let next = if stopped || !pointer_down {
+                Self::Completed {
+                    session_started_at,
+                    terminal_frame: app_frame,
+                    applied_total: total_delta,
+                }
+            } else {
+                Self::Active {
+                    session_started_at,
+                    applied_total: total_delta,
+                }
+            };
+            return (next, incremental_delta);
+        }
+
+        if matches!(state, Self::Active { .. }) && !pointer_down {
+            let applied_total = match state {
+                Self::Active { applied_total, .. } => applied_total,
+                Self::Idle | Self::Completed { .. } => egui::Vec2::ZERO,
+            };
+            return (
+                Self::Completed {
+                    session_started_at,
+                    terminal_frame: app_frame,
+                    applied_total,
+                },
+                egui::Vec2::ZERO,
+            );
+        }
+
+        (state, egui::Vec2::ZERO)
+    }
+}
+
+/// Whether a continuous-reading drag should consume this frame.
+///
+/// The mouse must actually be dragging. `pointer.delta()` is non-zero for plain
+/// hover movement, so admitting the mouse on a non-zero delta alone would scroll
+/// the page whenever the cursor crosses the image with no button held.
+///
+/// A correlated touch stream may open the branch on its cumulative delta instead,
+/// because a coalesced press-move-release arrives in one frame and the response
+/// reports no ongoing drag by the time it is read.
+fn continuous_reading_drag_consumes_frame(
+    response_dragged: bool,
+    touch_activity: bool,
+    touch_delta: egui::Vec2,
+) -> bool {
+    response_dragged || (touch_activity && touch_delta != egui::Vec2::ZERO)
+}
+
+fn continuous_reading_response_drag_delta(
+    ctx: &egui::Context,
+    response: &egui::Response,
+    coalesced_touch_total: Option<egui::Vec2>,
+    session_started_at: Option<std::time::Instant>,
+    app_frame: u64,
+    enabled: bool,
+    pointer_down: bool,
+) -> egui::Vec2 {
+    let state_id = egui::Id::new(("continuous_reading_drag_state", ctx.viewport_id()));
+    let Some(session_started_at) = session_started_at.filter(|_| enabled) else {
+        ctx.data_mut(|data| data.remove_temp::<ContinuousReadingDragState>(state_id));
+        return egui::Vec2::ZERO;
+    };
+    // Response::total_drag_delta reads Context input internally, so collect
+    // every response fact before taking the temp-data write lock below.
+    let response_dragged = response.dragged_by(egui::PointerButton::Primary);
+    let response_stopped = response.drag_stopped_by(egui::PointerButton::Primary);
+    let response_total = response.total_drag_delta();
+    ctx.data_mut(|data| {
+        let state = data
+            .get_temp::<ContinuousReadingDragState>(state_id)
+            .unwrap_or_default();
+        // A complete touch stream can be delivered in one RawInput. egui then
+        // observes the final pointer as idle and exposes no Response drag even
+        // though the ordered touch/pointer correlation proved the gesture.
+        // Prefer the normal Response cumulative total; use the correlated raw
+        // Start/End total only for that collapsed terminal shape.
+        let total_delta = response_total.or(coalesced_touch_total);
+        let coalesced_terminal = response_total.is_none() && coalesced_touch_total.is_some();
+        let (next, incremental_delta) = state.advance(
+            session_started_at,
+            app_frame,
+            response_dragged || coalesced_terminal,
+            response_stopped || coalesced_terminal,
+            pointer_down,
+            total_delta,
+        );
+        if next == ContinuousReadingDragState::Idle {
+            data.remove_temp::<ContinuousReadingDragState>(state_id);
+        } else {
+            data.insert_temp(state_id, next);
+        }
+        incremental_delta
+    })
+}
+
+fn continuous_reading_coalesced_touch_drag_total(
+    ctx: &egui::Context,
+    touch_frame: &crate::touch_correlation::TouchFrame,
+) -> Option<egui::Vec2> {
+    if touch_frame.owner() != crate::touch_input::TouchOwner::ViewerPointerPassthrough
+        || touch_frame.is_active()
+    {
+        return None;
+    }
+    let mut releases = touch_frame.correlated_primary_release_positions();
+    let release_pos = releases.next()?;
+    if releases.next().is_some() {
+        return None;
+    }
+
+    let endpoints = ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Touch {
+                    device_id,
+                    id,
+                    phase,
+                    pos,
+                    ..
+                } if *phase != egui::TouchPhase::Move => Some((*device_id, *id, *phase, *pos)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    let [start, end] = endpoints.as_slice() else {
+        return None;
+    };
+    if start.0 != end.0
+        || start.1 != end.1
+        || start.2 != egui::TouchPhase::Start
+        || end.2 != egui::TouchPhase::End
+        || end.3 != release_pos
+    {
+        return None;
+    }
+    let total = end.3 - start.3;
+    (total != egui::Vec2::ZERO).then_some(total)
+}
+
 fn continuous_reading_drag_delta(
     flow: ReadingFlow,
     direction: ReadingDirection,
@@ -8973,6 +9176,27 @@ impl App {
         self.record_book_resume(target_idx);
         self.record_reading_history(target_idx, crate::app::HistoryTrigger::UserChosen);
         ctx.request_repaint();
+    }
+
+    fn land_still_page_navigation_target(
+        &mut self,
+        ctx: &egui::Context,
+        current_idx: usize,
+        target_idx: usize,
+    ) {
+        if self.continuous_reading_active_for_idx(current_idx)
+            && self.continuous_reading_supported_idx(target_idx)
+        {
+            // A discrete page-unit command inside one continuous stream changes
+            // its anchor; it is not a fresh fullscreen file open.
+            self.seek_to_continuous_page(ctx, target_idx);
+        } else {
+            self.open_fullscreen_from_fs_navigation(
+                ctx,
+                target_idx,
+                crate::app::HistoryTrigger::UserChosen,
+            );
+        }
     }
 
     fn draw_fullscreen_seek_overlay(
@@ -16463,12 +16687,12 @@ impl App {
         let mut page_nav = FsPageNav::None;
         let mut close = false;
         const FOCUS_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
-        let (primary_down, primary_released) =
+        let (pointer_primary_down, primary_released) =
             ctx.input(|i| (i.pointer.primary_down(), i.pointer.primary_released()));
         if let Some(t) = self.fs_focus_regained_at {
             if t.elapsed() >= FOCUS_RESTORE_GRACE {
                 self.fs_focus_regained_at = None;
-            } else if !self.fs_primary_suppression.is_active() && primary_down {
+            } else if !self.fs_primary_suppression.is_active() && pointer_primary_down {
                 self.fs_primary_suppression.arm_pointer_stream();
                 self.fs_focus_regained_at = None;
             }
@@ -17095,13 +17319,12 @@ impl App {
                         }
                     }
                     crate::touch_input::TouchCommand::PageSide { left } => {
-                        if !continuous_active {
-                            let base = fullscreen_click_nav_delta_for_side(
-                                left,
-                                self.spread_mode.is_rtl(),
-                            );
-                            page_nav = self.spread_page_nav(base);
-                        }
+                        // A recognized tap is an intentional discrete page turn,
+                        // including in continuous reading. Use the same unit
+                        // resolver as FsPageNext/FsPagePrev.
+                        let base =
+                            fullscreen_click_nav_delta_for_side(left, self.spread_mode.is_rtl());
+                        page_nav = self.spread_page_nav(base);
                     }
                     crate::touch_input::TouchCommand::Zoom { factor, pivot } => {
                         if self.apply_touch_zoom_factor_about_pivot(
@@ -17392,6 +17615,25 @@ impl App {
             egui::Id::new("fs_click"),
             egui::Sense::click_and_drag(),
         );
+        let continuous_touch_delta = continuous_reading_response_drag_delta(
+            ctx,
+            &fs_response,
+            touch_activity
+                .then(|| continuous_reading_coalesced_touch_drag_total(ctx, &touch_frame))
+                .flatten(),
+            self.fullscreen_opened_at(),
+            self.frame_counter,
+            continuous_active && touch_activity,
+            pointer_primary_down,
+        );
+        // Keep the established mouse path byte-for-byte in meaning: while
+        // Response owns the drag, apply egui's per-frame pointer delta. Only
+        // a positively correlated touch stream needs cumulative accounting.
+        let continuous_pointer_delta = if touch_activity {
+            continuous_touch_delta
+        } else {
+            ctx.input(|input| input.pointer.delta())
+        };
         if touch_input_enabled && touch_frame.should_suppress_response(&fs_response) {
             // Positive raw-event correlation is required before the
             // recognizer may suppress this response. This is terminal-frame
@@ -17446,12 +17688,18 @@ impl App {
                         }
                     }
                 }
-            } else if continuous_active && primary_down && !cursor_in_panel {
-                let pointer_delta = ctx.input(|i| i.pointer.delta());
+            } else if continuous_active
+                && !cursor_in_panel
+                && continuous_reading_drag_consumes_frame(
+                    primary_down,
+                    touch_activity,
+                    continuous_touch_delta,
+                )
+            {
                 let delta = continuous_reading_drag_delta(
                     self.reading_flow,
                     self.reading_direction,
-                    pointer_delta,
+                    continuous_pointer_delta,
                     mods.ctrl,
                 );
                 self.scroll_vertical_reading_by(
@@ -17560,10 +17808,13 @@ impl App {
                                 );
                                 let in_seek_panel =
                                     seek_panel_interactive && seek_panel_rect.contains(pos);
-                                // 連続読み中はクリックでのページジャンプを抑制する。連続読みは
-                                // 連続スクロール表示なので、左半分/右半分クリックで別ファイルへ
-                                // 飛ぶのはモデルに反する (特に fs_zoom が一瞬インフレされず
-                                // has_transform=false になった隙のクリックで誤爆する)。
+                                // Mouse clicks stay suppressed in continuous reading. The wheel is
+                                // the natural continuous-scroll input for a mouse, and preserving
+                                // this guard also prevents a stray click in a transient untransformed
+                                // frame from jumping pages. A recognizer-confirmed touch tap is
+                                // intentional rather than incidental, so PageSide is deliberately
+                                // dispatched above even in continuous reading (touch/mouse parity is
+                                // not required here; see touch-support-plan §5.14-11).
                                 if !in_side_panel && !in_seek_panel && !continuous_active {
                                     let base = fullscreen_click_nav_base_delta(
                                         pos.x,
@@ -18747,11 +18998,7 @@ impl App {
                         );
                     }
                 } else {
-                    self.open_fullscreen_from_fs_navigation(
-                        ctx,
-                        new_idx,
-                        crate::app::HistoryTrigger::UserChosen,
-                    );
+                    self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
                 }
             } else if let FsPageNav::Boundary { at_end } = page_nav {
                 self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
@@ -18786,11 +19033,7 @@ impl App {
                     fs_idx,
                     nav_delta,
                 ) {
-                    self.open_fullscreen_from_fs_navigation(
-                        ctx,
-                        new_idx,
-                        crate::app::HistoryTrigger::UserChosen,
-                    );
+                    self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
                 } else {
                     // 境界到達: 中央にヒントを出す (nav_delta > 0 なら末尾)
                     self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
@@ -29599,6 +29842,414 @@ mod tests {
                 "{flow:?} {direction:?}: Ctrl ありは直交方向もパン"
             );
         }
+    }
+
+    #[test]
+    fn continuous_reading_drag_state_applies_cumulative_totals_once_and_finishes() {
+        let session = std::time::Instant::now();
+        let (state, delta) = ContinuousReadingDragState::Idle.advance(
+            session,
+            10,
+            true,
+            false,
+            true,
+            Some(egui::vec2(0.0, -20.0)),
+        );
+        assert_eq!(delta, egui::vec2(0.0, -20.0));
+
+        let (state, delta) =
+            state.advance(session, 11, true, false, true, Some(egui::vec2(0.0, -50.0)));
+        assert_eq!(delta, egui::vec2(0.0, -30.0));
+
+        let (state, delta) =
+            state.advance(session, 12, true, true, false, Some(egui::vec2(0.0, -80.0)));
+        assert_eq!(delta, egui::vec2(0.0, -30.0));
+        assert!(matches!(
+            state,
+            ContinuousReadingDragState::Completed {
+                terminal_frame: 12,
+                ..
+            }
+        ));
+
+        // egui can evaluate the terminal response again in one app frame.
+        // Its cumulative total was already applied and must not be replayed.
+        let (state, delta) =
+            state.advance(session, 12, true, true, false, Some(egui::vec2(0.0, -80.0)));
+        assert_eq!(delta, egui::Vec2::ZERO);
+
+        let (state, delta) = state.advance(session, 13, false, false, false, None);
+        assert_eq!(state, ContinuousReadingDragState::Idle);
+        assert_eq!(delta, egui::Vec2::ZERO);
+    }
+
+    #[test]
+    fn continuous_reading_drag_state_keeps_coalesced_press_move_release_delta() {
+        let session = std::time::Instant::now();
+        let (state, delta) = ContinuousReadingDragState::Idle.advance(
+            session,
+            20,
+            true,
+            true,
+            false,
+            Some(egui::vec2(17.0, -83.0)),
+        );
+
+        assert_eq!(delta, egui::vec2(17.0, -83.0));
+        assert!(matches!(
+            state,
+            ContinuousReadingDragState::Completed {
+                terminal_frame: 20,
+                applied_total,
+                ..
+            } if applied_total == egui::vec2(17.0, -83.0)
+        ));
+
+        // A fresh session never inherits a previous gesture's cumulative total.
+        let next_session = session + std::time::Duration::from_secs(1);
+        let (_, delta) = state.advance(
+            next_session,
+            21,
+            true,
+            false,
+            true,
+            Some(egui::vec2(-9.0, 4.0)),
+        );
+        assert_eq!(delta, egui::vec2(-9.0, 4.0));
+    }
+
+    #[test]
+    fn continuous_page_unit_navigation_uses_keyboard_path_and_seek_landing() {
+        let mut app = crate::app::setup_app_for_test();
+        for page in 0..6 {
+            app.items.push(GridItem::Image(PathBuf::from(format!(
+                "c:/test/continuous-page-{page}.jpg"
+            ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.visible_indices = (0..app.items.len()).collect();
+        app.open_fullscreen(0, crate::app::HistoryTrigger::UserChosen);
+        app.reading_flow = ReadingFlow::Vertical;
+        let ctx = egui::Context::default();
+
+        // FsPageNext/FsPagePrev and a recognized side tap both enter through
+        // spread_page_nav. Single-page mode advances exactly one page.
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        let next = app.spread_page_nav(1);
+        assert_eq!(next, FsPageNav::Delta(1));
+        app.fs_zoom = 1.75;
+        app.fs_vertical_scroll = 42.0;
+        app.handle_fs_navigation(&ctx, false, false, None, None, None, next, None, 0);
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.fs_vertical_scroll, 0.0);
+        assert_eq!(
+            app.fs_zoom, 1.75,
+            "continuous page-unit landing must seek, not perform a fresh fullscreen open"
+        );
+
+        // A spread is one display unit, so the same command advances two
+        // portrait pages and retains the continuous stream's state owner.
+        app.seek_to_continuous_page(&ctx, 0);
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        let next_spread = app.spread_page_nav(1);
+        assert_eq!(next_spread, FsPageNav::Target(2));
+        app.fs_zoom = 1.5;
+        app.fs_vertical_scroll = 70.0;
+        app.handle_fs_navigation(&ctx, false, false, None, None, None, next_spread, None, 0);
+        assert_eq!(app.fullscreen_idx, Some(2));
+        assert_eq!(app.selected, Some(2));
+        assert_eq!(app.fs_vertical_scroll, 0.0);
+        assert_eq!(app.fs_zoom, 1.5);
+    }
+
+    /// Hovering a mouse across the image must not scroll continuous reading.
+    /// `pointer.delta()` is non-zero for plain movement, so the frame gate has
+    /// to require an actual drag from the mouse and admit a cumulative total
+    /// only from a correlated touch stream.
+    #[test]
+    fn continuous_reading_drag_frame_gate_ignores_mouse_movement_without_a_drag() {
+        let moved = egui::vec2(0.0, 40.0);
+
+        assert!(
+            !continuous_reading_drag_consumes_frame(false, false, moved),
+            "a moving mouse with no button held must not scroll"
+        );
+        assert!(
+            !continuous_reading_drag_consumes_frame(false, false, egui::Vec2::ZERO),
+            "a still mouse must not scroll"
+        );
+        assert!(
+            continuous_reading_drag_consumes_frame(true, false, egui::Vec2::ZERO),
+            "a mouse drag keeps the established per-frame pointer delta path"
+        );
+        assert!(
+            continuous_reading_drag_consumes_frame(false, true, moved),
+            "a coalesced touch drag reports no ongoing drag but must still scroll"
+        );
+        assert!(
+            !continuous_reading_drag_consumes_frame(false, true, egui::Vec2::ZERO),
+            "touch activity alone, with nothing accumulated, must not scroll"
+        );
+    }
+
+    #[test]
+    fn continuous_touch_drag_keeps_terminal_delta_and_next_tap_while_mouse_stays_unchanged() {
+        fn touch(phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
+            egui::Event::Touch {
+                device_id: egui::TouchDeviceId(41),
+                id: egui::TouchId(43),
+                phase,
+                pos,
+                force: None,
+            }
+        }
+
+        fn primary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }
+        }
+
+        fn run_frame(
+            app: &mut crate::app::AppTestEnvForTest,
+            ctx: &egui::Context,
+            screen: egui::Rect,
+            state: &FsFrameState,
+            events: Vec<egui::Event>,
+            advance_app_frame: bool,
+        ) -> (FsPageNav, bool) {
+            if advance_app_frame {
+                app.frame_counter += 1;
+            }
+            let mut result = (FsPageNav::None, false);
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            result =
+                                app.handle_fs_wheel_and_click(ui, ctx, screen, state, false, 0);
+                        });
+                },
+            );
+            result
+        }
+
+        let mut app = crate::app::setup_app_for_test();
+        for page in 0..4 {
+            app.items.push(GridItem::Image(PathBuf::from(format!(
+                "c:/test/continuous-pointer-{page}.jpg"
+            ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.visible_indices = (0..app.items.len()).collect();
+        app.open_fullscreen(0, crate::app::HistoryTrigger::UserChosen);
+        app.reading_flow = ReadingFlow::Vertical;
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.settings.touch_still_chrome_learned = true;
+        let state = FsFrameState {
+            is_video: false,
+            original_preview_active: false,
+            tex: None,
+            thumb_tex: None,
+            location_display: String::new(),
+            image_dims: None,
+            image_file_size: None,
+            image_downscaled: false,
+            is_loading: false,
+            vst3_waiting_for_video: false,
+            fs_load_failed: false,
+            pdf_content_type: None,
+        };
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let drag_start = egui::pos2(400.0, 320.0);
+        let drag_end = egui::pos2(400.0, 240.0);
+
+        run_frame(&mut app, &ctx, screen, &state, Vec::new(), true);
+        let nav = run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                touch(egui::TouchPhase::Start, drag_start),
+                egui::Event::PointerMoved(drag_start),
+                primary(drag_start, true),
+                touch(egui::TouchPhase::Move, drag_end),
+                egui::Event::PointerMoved(drag_end),
+                touch(egui::TouchPhase::End, drag_end),
+                primary(drag_end, false),
+            ],
+            true,
+        );
+        assert_eq!(nav, (FsPageNav::None, false));
+        assert_eq!(
+            app.fs_vertical_scroll, 80.0,
+            "a coalesced touch press/move/release must apply the full cumulative drag"
+        );
+
+        // A repeated egui pass in the same app frame must not apply the
+        // terminal cumulative total again.
+        run_frame(&mut app, &ctx, screen, &state, Vec::new(), false);
+        assert_eq!(app.fs_vertical_scroll, 80.0);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerGone],
+            true,
+        );
+
+        let tap = egui::pos2(600.0, 300.0);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                touch(egui::TouchPhase::Start, tap),
+                egui::Event::PointerMoved(tap),
+                primary(tap, true),
+            ],
+            true,
+        );
+        let tap_nav = run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![touch(egui::TouchPhase::End, tap), primary(tap, false)],
+            true,
+        );
+        assert_eq!(
+            tap_nav,
+            (FsPageNav::Delta(1), false),
+            "the first tap after a completed drag must remain a page-unit command"
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerGone],
+            true,
+        );
+
+        app.spread_mode = crate::settings::SpreadMode::Rtl;
+        let rtl_next_tap = egui::pos2(200.0, 300.0);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                touch(egui::TouchPhase::Start, rtl_next_tap),
+                egui::Event::PointerMoved(rtl_next_tap),
+                primary(rtl_next_tap, true),
+            ],
+            true,
+        );
+        let rtl_spread_nav = run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                touch(egui::TouchPhase::End, rtl_next_tap),
+                primary(rtl_next_tap, false),
+            ],
+            true,
+        );
+        assert_eq!(
+            rtl_spread_nav,
+            (FsPageNav::Target(2), false),
+            "RTL maps the physical left side to the next two-page display unit"
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerGone],
+            true,
+        );
+        app.spread_mode = crate::settings::SpreadMode::Single;
+
+        // Mouse drag remains a 1:1 continuous scroll, while a mouse click is
+        // still intentionally not page navigation in continuous reading.
+        app.fs_vertical_scroll = 0.0;
+        let mouse_start = egui::pos2(400.0, 320.0);
+        let mouse_middle = egui::pos2(400.0, 300.0);
+        let mouse_end = egui::pos2(400.0, 270.0);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                egui::Event::PointerMoved(mouse_start),
+                primary(mouse_start, true),
+            ],
+            true,
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerMoved(mouse_middle)],
+            true,
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![egui::Event::PointerMoved(mouse_end)],
+            true,
+        );
+        assert_eq!(app.fs_vertical_scroll, 50.0);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![primary(mouse_end, false), egui::Event::PointerGone],
+            true,
+        );
+
+        let mouse_tap = egui::pos2(600.0, 300.0);
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                egui::Event::PointerMoved(mouse_tap),
+                primary(mouse_tap, true),
+            ],
+            true,
+        );
+        let mouse_nav = run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![primary(mouse_tap, false), egui::Event::PointerGone],
+            true,
+        );
+        assert_eq!(mouse_nav, (FsPageNav::None, false));
     }
 
     #[test]

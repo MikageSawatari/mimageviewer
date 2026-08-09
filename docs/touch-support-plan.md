@@ -745,6 +745,30 @@ mIV では次の 3 段で担保する:
 - `?` のコンテキストヘルプは Step 2c の方向解決をそのまま維持する。初回案内は一度きりの
   不変の対応、コンテキストヘルプは現在のファイルの前 / 次対応を答える役割とする
 
+#### Phase 3 Step 3f — 連結読みのタッチ操作 (2026-08-09)
+
+- 連結読みでも認識済みの左右タップはページ表示と同じページユニットを送ることにした。
+  `fullscreen_click_nav_delta_for_side(left, rtl)` で物理側を読み方向へ写像し、キーボードの
+  `FsPageNext` / `FsPagePrev` と同じ `spread_page_nav(base)` を使う。単ページは 1 ページ、
+  見開きは 2 ページ進み、共通の `FsPageNav` 着地で `seek_to_continuous_page` を使うため、
+  離散的な fullscreen 再オープンにはならない
+- マウスクリックの連結読み中ページ送り抑制は維持した。マウスにはホイールという自然な
+  連続スクロール手段があり、変形状態が一時的に外れたフレームの偶発クリックをページ移動へ
+  変えないためである。一方、recognizer が確定した touch tap は偶発入力ではないので、
+  §5.14-11 と同じくタッチとマウスを意図的に分けた
+- §5.5「拡大中の 1 本指パン修正」はページ表示側だけを直しており、連結読み側には同じ
+  `pointer.delta()` の穴が残っていた。連結読みの touch drag は egui response の
+  `total_drag_delta()` から直前適用済み総量を引いた増分を使う。press〜release が 1 RawInput に
+  畳まれて response が idle になる終端だけは、正に相関済みの touch Start / End 総量を使う
+- 累積量は fullscreen session と viewport に属する `Idle / Active / Completed` の typed state で
+  管理する。release / pointer-down 消失で `Completed` にし、同一 app frame の terminal replay は
+  0 増分、次 app frame または session 変更で `Idle` へ戻して削除する。次のタップへ状態を残さない
+- マウスドラッグは従来どおり response が drag を所有している間の `pointer.delta()` をそのまま
+  適用する。主軸 / 直交軸の分解と Ctrl の扱いも変更していない
+- タップとドラッグがページ表示 / 連結読みのどちらでも同じ説明どおりに動き、連結読みでは
+  ズームモードを使えず 1 本指ドラッグがスクロールに一意に決まる。このため初回ヘルプの
+  モード別併記は不要で、描画・文言・スナップショットは変更しない
+
 #### 忘れた人の再表示手段
 
 既存のコンテキストヘルプ **`HelpShowContextShortcuts`**
