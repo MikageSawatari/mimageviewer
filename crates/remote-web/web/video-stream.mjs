@@ -132,39 +132,38 @@ export function videoVolumeRelativeDragValue({
   });
 }
 
-export function mediaElementVolumeControlSupported(mediaElement) {
-  const original = Number(mediaElement?.volume);
-  if (!Number.isFinite(original) || original < 0 || original > 1) return false;
-  const probe = original >= 0.5
-    ? Math.max(0, original - 0.01)
-    : Math.min(1, original + 0.01);
-  if (probe === original) return false;
-  try {
-    mediaElement.volume = probe;
-    const accepted = Math.abs(Number(mediaElement.volume) - probe) <= 1e-6;
-    mediaElement.volume = original;
-    const restored = Math.abs(Number(mediaElement.volume) - original) <= 1e-6;
-    return accepted && restored;
-  } catch (_error) {
-    try {
-      mediaElement.volume = original;
-    } catch {}
-    return false;
-  }
+export const IOS_VOLUME_NOTICE =
+  "iOS / iPadOS では、音量はデバイスのボタンで操作します。ここでの変更は反映されません。";
+
+export function isIosOrIpadosDevice({
+  userAgent = "",
+  platform = "",
+  maxTouchPoints = 0,
+} = {}) {
+  const agent = String(userAgent ?? "");
+  if (/iPad|iPhone|iPod/i.test(agent)) return true;
+  // iPadOS のデスクトップ表示は Mac を名乗る。Mac 本体と区別するため touch points も要件にする。
+  const macIdentity = /Macintosh/i.test(agent) || /^Mac/i.test(String(platform ?? ""));
+  return macIdentity && Math.max(0, Number(maxTouchPoints) || 0) > 1;
+}
+
+export function iosOrIpadosDeviceFromNavigator(navigatorValue = globalThis.navigator) {
+  return isIosOrIpadosDevice({
+    userAgent: navigatorValue?.userAgent,
+    platform: navigatorValue?.platform,
+    maxTouchPoints: navigatorValue?.maxTouchPoints,
+  });
 }
 
 export function videoControlMenuPresentation({
   hasVideo = true,
-  volumeControlSupported = null,
 } = {}) {
   const mediaNoun = hasVideo === false ? "音声" : "動画";
   const qualityNoun = hasVideo === false ? "音質" : "画質";
-  const showVolume = volumeControlSupported === true;
   return {
     mediaNoun,
     qualityNoun,
-    controlsTitle: showVolume ? `音量と${qualityNoun}` : qualityNoun,
-    showVolume,
+    controlsTitle: `音量と${qualityNoun}`,
   };
 }
 
@@ -1151,7 +1150,6 @@ export class VideoStreamMenu {
       mediaNoun,
       qualityNoun,
       controlsTitle,
-      showVolume,
     } = videoControlMenuPresentation(media);
     if (page === "controls") {
       return {
@@ -1170,7 +1168,7 @@ export class VideoStreamMenu {
           ["再生 / 一時停止", "Space"],
           ["10 秒戻る / 進む", "← / →"],
         ],
-        volume: showVolume,
+        volume: true,
       };
     }
     return {
@@ -1400,6 +1398,9 @@ export class VideoStreamMenu {
       event.stopPropagation();
     });
     field.append(row, input);
+    if (media.showIosVolumeNotice) {
+      field.append(textElement("span", IOS_VOLUME_NOTICE, "video-menu-volume-notice"));
+    }
     this.actions.append(field);
   }
 
@@ -1409,11 +1410,6 @@ export class VideoStreamMenu {
       button.classList.toggle("is-current", selected);
       button.setAttribute("aria-pressed", String(selected));
     }
-  }
-
-  refreshMediaPresentation() {
-    if (this.page === "main" || this.page === "controls") this.showPage(this.page);
-    else this.setMediaState(this.mediaState());
   }
 
   setActionLabel(name, label) {
@@ -1741,7 +1737,6 @@ export class VideoStreamViewer {
     subscribeRemoteSessionState = () => () => {},
     reportPlaybackIssue = () => {},
     publishVideoHealth = () => {},
-    publishVideoTelemetry = () => {},
     getTelemetryDebugContext = () => ({ enabled: false }),
     keyboardAvailable = true,
     getPanelTab = () => "functions",
@@ -1756,10 +1751,10 @@ export class VideoStreamViewer {
     this.apiPostJson = apiPostJson;
     this.reportPlaybackIssue = reportPlaybackIssue;
     this.publishVideoHealth = publishVideoHealth;
-    this.publishVideoTelemetry = publishVideoTelemetry;
     this.getTelemetryDebugContext = getTelemetryDebugContext;
     this.quality = "standard";
     this.hasVideo = entry.kind !== "audio";
+    this.showIosVolumeNotice = iosOrIpadosDeviceFromNavigator();
     this.volume = 1;
     this.duration = 0;
     this.bufferTargetSecs = null;
@@ -1814,10 +1809,6 @@ export class VideoStreamViewer {
     this.video.setAttribute("playsinline", "");
     this.video.setAttribute("webkit-playsinline", "");
     this.video.setAttribute("aria-label", entry.name);
-    // Keep the control hidden until loadedmetadata proves whether assignment is effective.
-    // A detached element accepts volume writes on iPadOS before its media engine applies the
-    // platform constraint, so construction time is not a valid capability boundary.
-    this.volumeControlSupported = null;
     this.audioSurface = element("div", "audio-stream-surface");
     this.audioSurface.setAttribute("role", "img");
     this.audioSurface.setAttribute("aria-label", `音声: ${entry.name}`);
@@ -1963,7 +1954,6 @@ export class VideoStreamViewer {
       this.checkPlaybackStartupProgress();
       if (!this.playRequested) this.finishSeekPreviewForAttachedGeneration();
     };
-    this.onLoadedMetadata = () => this.detectVolumeControlSupport();
     this.onWaiting = () => this.beginWaiting("waiting");
     this.onStalled = () => {
       if (this.generationSwitch.isSwitching()) return;
@@ -2005,7 +1995,6 @@ export class VideoStreamViewer {
     this.video.addEventListener("timeupdate", this.onTimeUpdate);
     this.video.addEventListener("playing", this.onPlaying);
     this.video.addEventListener("canplay", this.onCanPlay);
-    this.video.addEventListener("loadedmetadata", this.onLoadedMetadata);
     this.video.addEventListener("loadeddata", this.onLoadedData);
     this.video.addEventListener("waiting", this.onWaiting);
     this.video.addEventListener("stalled", this.onStalled);
@@ -2272,31 +2261,8 @@ export class VideoStreamViewer {
       playing: !this.video.paused,
       barsVisible: this.barsVisible,
       hasVideo: this.hasVideo,
-      volumeControlSupported: this.volumeControlSupported,
+      showIosVolumeNotice: this.showIosVolumeNotice,
     };
-  }
-
-  detectVolumeControlSupport() {
-    if (this.destroyed || this.volumeControlSupported !== null) {
-      return this.volumeControlSupported === true;
-    }
-    // loadedmetadata means resource selection has completed and the media element has reached
-    // HAVE_METADATA, so platform volume constraints are active. The probe and restoration are
-    // synchronous within this pre-playback event handler, before an audio rendering turn can
-    // expose the temporary value.
-    const supported = mediaElementVolumeControlSupported(this.video);
-    this.volumeControlSupported = supported;
-    if (supported) this.video.volume = this.volume;
-    this.menu.refreshMediaPresentation();
-    try {
-      this.publishVideoTelemetry({
-        type: "media_capability",
-        action: "volume_control",
-        supported,
-        lifecycle: "loadedmetadata",
-      });
-    } catch {}
-    return supported;
   }
 
   setHasVideo(hasVideo) {
@@ -3135,7 +3101,7 @@ export class VideoStreamViewer {
   }
 
   async setVolume(requestedVolume) {
-    if (!this.session || this.destroyed || !this.volumeControlSupported) return;
+    if (!this.session || this.destroyed) return;
     const volume = Math.max(0, Math.min(1, Number(requestedVolume) || 0));
     await this.apiPostJson(
       "/api/video/control",
@@ -3187,7 +3153,7 @@ export class VideoStreamViewer {
       Number(mediaState.buffer_target_secs) || this.bufferTargetSecs
     );
     this.volume = Math.max(0, Math.min(1, Number(mediaState.volume) || 0));
-    if (this.volumeControlSupported) this.video.volume = this.volume;
+    this.video.volume = this.volume;
     this.encoder = String(mediaState.encoder ?? this.encoder);
     this.codecs = String(mediaState.codecs ?? this.codecs);
     this.updateAudioProcessing(mediaState.audio_processing, true);
@@ -3989,7 +3955,6 @@ export class VideoStreamViewer {
     this.video.removeEventListener("timeupdate", this.onTimeUpdate);
     this.video.removeEventListener("playing", this.onPlaying);
     this.video.removeEventListener("canplay", this.onCanPlay);
-    this.video.removeEventListener("loadedmetadata", this.onLoadedMetadata);
     this.video.removeEventListener("loadeddata", this.onLoadedData);
     this.video.removeEventListener("waiting", this.onWaiting);
     this.video.removeEventListener("stalled", this.onStalled);

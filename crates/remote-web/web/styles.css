@@ -2407,6 +2407,12 @@ select {
   touch-action: none;
 }
 
+.video-menu-volume-notice {
+  color: var(--muted);
+  font-size: 0.76rem;
+  line-height: 1.5;
+}
+
 .command-shortcut-title {
   margin: 20px 0 8px;
   color: var(--muted);

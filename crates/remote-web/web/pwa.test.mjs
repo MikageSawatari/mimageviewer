@@ -587,22 +587,31 @@ test("image and video seek share tap-or-relative-drag handling without replacing
   );
 });
 
-test("video volume is capability-gated after metadata and shares tap-or-drag range handling", async () => {
+test("video volume is always present and only its iOS notice is platform-gated", async () => {
   const video = await readFile(new URL("video-stream.mjs", here), "utf8");
+  const css = await readFile(new URL("styles.css", here), "utf8");
   const volumeBody = video.match(
     /renderVolume\(\)[\s\S]*?\n  }\n\n  setMediaState/
   )?.[0] ?? "";
-  assert.match(video, /addEventListener\("loadedmetadata", this\.onLoadedMetadata\)/);
-  assert.match(video, /mediaElementVolumeControlSupported\(this\.video\)/);
-  assert.match(video, /type: "media_capability"[\s\S]*lifecycle: "loadedmetadata"/);
-  assert.match(video, /volume: showVolume/);
+  assert.doesNotMatch(
+    video,
+    /mediaElementVolumeControlSupported|volumeControlSupported|media_capability|onLoadedMetadata/
+  );
+  assert.match(video, /volume: true/);
+  assert.match(video, /isIosOrIpadosDevice\(\{[\s\S]*maxTouchPoints/);
+  assert.match(video, /iosOrIpadosDeviceFromNavigator\(navigatorValue = globalThis\.navigator\)/);
+  assert.match(
+    video,
+    /iOS \/ iPadOS では、音量はデバイスのボタンで操作します。ここでの変更は反映されません。/
+  );
+  assert.match(volumeBody, /if \(media\.showIosVolumeNotice\)/);
+  assert.match(css, /\.video-menu-volume-notice\s*\{/);
   assert.match(volumeBody, /addEventListener\("pointerdown"/);
   assert.match(volumeBody, /event\.preventDefault\(\)/);
   assert.match(volumeBody, /videoVolumeRelativeDragValue\(\{/);
   assert.match(volumeBody, /seekRangePointerGestureDecision\(\{/);
   assert.match(volumeBody, /seekRangeAbsoluteValue\(\{/);
   assert.match(video, /relativeRangeDragValue\(\{/);
-  assert.doesNotMatch(video, /userAgent|navigator\.platform/);
 });
 
 test("viewer status overlays belong to the HUD and leave with it", async () => {

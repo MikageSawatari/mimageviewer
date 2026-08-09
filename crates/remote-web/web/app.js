@@ -4424,7 +4424,6 @@ function renderVideoViewer(entry) {
       updateHud();
       if (telemetry && snapshot) enqueueTelemetry(snapshot);
     },
-    publishVideoTelemetry: (event) => enqueueTelemetry(event),
     getTelemetryDebugContext: () => ({
       enabled: state.localSettings.telemetryDebugDetails,
     }),

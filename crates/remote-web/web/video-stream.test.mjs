@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  IOS_VOLUME_NOTICE,
   VideoGenerationSwitchOwner,
   VIDEO_PANEL_TABS,
   VideoPlaybackControlState,
@@ -11,7 +12,8 @@ import {
   hlsBufferConfig,
   hlsErrorTelemetryDetails,
   hlsFragmentLoadMetrics,
-  mediaElementVolumeControlSupported,
+  iosOrIpadosDeviceFromNavigator,
+  isIosOrIpadosDevice,
   preventVideoNativeZoom,
   resolveVideoPlaylist,
   videoAudioProcessingPresentation,
@@ -911,82 +913,59 @@ test("video seek drag maps pointer travel to the visible timeline scale", () => 
   assert.equal(drag(100, -200), 0);
 });
 
-test("volume capability probes assignment and restores the observed value", () => {
-  const supported = { volume: 1 };
-  assert.equal(mediaElementVolumeControlSupported(supported), true);
-  assert.equal(supported.volume, 1);
-
-  let ignoredVolume = 1;
-  const ignored = {};
-  Object.defineProperty(ignored, "volume", {
-    get: () => ignoredVolume,
-    set: () => {},
-  });
-  assert.equal(mediaElementVolumeControlSupported(ignored), false);
-  assert.equal(ignoredVolume, 1);
+test("iOS and iPadOS detection includes desktop-mode iPad without matching PCs", () => {
+  assert.equal(isIosOrIpadosDevice({
+    userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)",
+    platform: "iPhone",
+    maxTouchPoints: 5,
+  }), true);
+  assert.equal(isIosOrIpadosDevice({
+    userAgent: "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X)",
+    platform: "iPad",
+    maxTouchPoints: 5,
+  }), true);
+  assert.equal(isIosOrIpadosDevice({
+    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    platform: "MacIntel",
+    maxTouchPoints: 5,
+  }), true, "iPadOS desktop mode identifies itself as a touch-capable Mac");
+  assert.equal(isIosOrIpadosDevice({
+    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6)",
+    platform: "MacIntel",
+    maxTouchPoints: 0,
+  }), false);
+  assert.equal(isIosOrIpadosDevice({
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    platform: "Win32",
+    maxTouchPoints: 10,
+  }), false);
+  assert.equal(isIosOrIpadosDevice({
+    userAgent: "Mozilla/5.0 (Linux; Android 15)",
+    platform: "Linux armv8l",
+    maxTouchPoints: 5,
+  }), false);
+  assert.equal(iosOrIpadosDeviceFromNavigator({
+    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    platform: "MacIntel",
+    maxTouchPoints: 5,
+  }), true);
 });
 
-test("unsupported media volume hides the slider without hiding quality controls", () => {
-  assert.equal(videoControlMenuPresentation({
-    hasVideo: true,
-    volumeControlSupported: null,
-  }).showVolume, false, "the slider stays hidden before capability detection");
-  assert.deepEqual(videoControlMenuPresentation({
-    hasVideo: true,
-    volumeControlSupported: false,
-  }), {
+test("volume controls are always present for video and audio", () => {
+  assert.deepEqual(videoControlMenuPresentation({ hasVideo: true }), {
     mediaNoun: "動画",
     qualityNoun: "画質",
-    controlsTitle: "画質",
-    showVolume: false,
+    controlsTitle: "音量と画質",
   });
   assert.equal(videoControlMenuPresentation({
     hasVideo: false,
-    volumeControlSupported: true,
   }).controlsTitle, "音量と音質");
+  assert.equal(VideoStreamMenu.prototype.definition.call({
+    mediaState: () => ({ hasVideo: true }),
+  }, "controls").volume, true);
 });
 
-test("loaded metadata volume detection refreshes presentation and publishes telemetry once", () => {
-  const detect = (video, desiredVolume) => {
-    const telemetry = [];
-    let refreshes = 0;
-    const viewer = {
-      destroyed: false,
-      volumeControlSupported: null,
-      video,
-      volume: desiredVolume,
-      menu: { refreshMediaPresentation: () => { refreshes += 1; } },
-      publishVideoTelemetry: (event) => telemetry.push(event),
-    };
-    const supported = VideoStreamViewer.prototype.detectVolumeControlSupport.call(viewer);
-    VideoStreamViewer.prototype.detectVolumeControlSupport.call(viewer);
-    return { supported, viewer, telemetry, refreshes };
-  };
-
-  const supported = detect({ volume: 1 }, 0.4);
-  assert.equal(supported.supported, true);
-  assert.equal(supported.viewer.video.volume, 0.4);
-  assert.equal(supported.refreshes, 1);
-  assert.deepEqual(supported.telemetry, [{
-    type: "media_capability",
-    action: "volume_control",
-    supported: true,
-    lifecycle: "loadedmetadata",
-  }]);
-
-  let ignoredVolume = 1;
-  const ignored = {};
-  Object.defineProperty(ignored, "volume", {
-    get: () => ignoredVolume,
-    set: () => {},
-  });
-  const unsupported = detect(ignored, 0.4);
-  assert.equal(unsupported.supported, false);
-  assert.equal(ignoredVolume, 1);
-  assert.equal(unsupported.telemetry[0].supported, false);
-});
-
-test("volume pointer tap is absolute while drag remains relative", () => {
+test("iOS volume notice is conditional while tap and drag behavior stays unchanged", () => {
   class FakeElement {
     constructor(tag) {
       this.tagName = tag.toUpperCase();
@@ -1014,14 +993,29 @@ test("volume pointer tap is absolute while drag remains relative", () => {
   const previousDocument = globalThis.document;
   globalThis.document = { createElement: (tag) => new FakeElement(tag) };
   try {
+    const plainMenu = {
+      mediaState: () => ({ volume: 0.5, showIosVolumeNotice: false }),
+      actions: new FakeElement("div"),
+      send: () => {},
+    };
+    VideoStreamMenu.prototype.renderVolume.call(plainMenu);
+    assert.equal(plainMenu.actions.children[0].children.length, 2);
+
     const commands = [];
     const menu = {
-      mediaState: () => ({ volume: 0.5 }),
+      mediaState: () => ({ volume: 0.5, showIosVolumeNotice: true }),
       actions: new FakeElement("div"),
       send: (_event, name, payload) => commands.push({ name, payload }),
     };
     VideoStreamMenu.prototype.renderVolume.call(menu);
-    const input = menu.actions.children[0].children[1];
+    const volumeField = menu.actions.children[0];
+    assert.equal(volumeField.children.length, 3, "notice does not replace the slider");
+    assert.equal(
+      volumeField.children[2].textContent,
+      "iOS / iPadOS では、音量はデバイスのボタンで操作します。ここでの変更は反映されません。"
+    );
+    assert.equal(volumeField.children[2].textContent, IOS_VOLUME_NOTICE);
+    const input = volumeField.children[1];
     const pointer = (type, clientX, clientY = 20) => ({
       type,
       pointerId: 7,
