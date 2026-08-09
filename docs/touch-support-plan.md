@@ -953,6 +953,38 @@ mIV で `scroll_source()` を上書きしているのは `src/ui_main.rs:2278` �
   クリック可能なのは reveal path を持つ actionable toast だけという既存仕様を維持し、
   トースト側には変更を入れていない
 
+#### 未対応: 音声モード / 音楽ビューの左右パネルがタッチで開けない (2026-08-09 利用者報告)
+
+**症状**: 音声モード (動画の映像を切って音声で聴く状態) と音楽ビューで、左右パネルを開く
+手段がタッチに無い。
+
+**原因は静止画 Step 3b / 動画 Step 3h と同型**。`draw_music_panel_callouts`
+([ui_fullscreen.rs:6712](../src/ui_fullscreen.rs)) は `pointer = hover_pos()` を取り、
+`callout_hit(panel_callout_edge_rect(...), pointer)` が真のフレームだけ callout Area を出す。
+**タッチには hover が無いので callout がそもそも描かれない**。`ClickToShow` だけでなく
+`Hover` モードも同じ理由で到達不能 (辺へのホバーで出す設計のため)。
+利用者が名指しした「HUD の左右の空き領域」は、まさにこの callout が出るはずの帯である。
+
+**方針 (ClaudeCode 案)**: 空き領域に**見えないタップゾーンを足すのではなく、静止画・動画と
+同じ「hover に依存しない 48pt 幅の左右ハンドル」を音楽面にも出す**。理由:
+
+- §5.7 の 3 面統一の続きであり、面ごとに別の開き方を覚えさせない
+- 見えないゾーンは発見できないうえ、誤タップが「何か起きた」に化ける
+- ハンドル geometry / 矢印描画 / 開いた側を消す規則は Step 3b / 3h の helper をそのまま使える
+
+**決める必要がある点** (実装前に確定させる):
+
+1. **表示条件**。静止画はクローム latch、動画は `chrome_latched()` が gate だが、音楽面は
+   上下 HUD が常時表示で latch の概念が無い。「このビューポートでタッチを使った」ことを
+   gate にするのが素直 (マウスだけの利用者に恒久的な飾りを増やさない = fail-closed)。
+2. **モード非依存にするか**。`Hover` / `ClickToShow` どちらでもタッチからは同じく到達不能
+   なので、ハンドルは**モードに関わらず**出すのが筋。開いた状態の所有は既存の
+   `MetadataPanelOpenState` (`ByPointer` / `ByTouchHandle`) に合わせる。
+3. **帯の範囲**。音楽面は上下 HUD が常時あるので、`panel_band_top` / `panel_band_bottom` を
+   そのまま使い、HUD と重ねない。
+
+**優先度**: v2.13.0 のタッチ対応の穴なので、バックログ対応の合間に入れる (利用者判断)。
+
 #### (3) タッチターゲットが小さすぎる
 
 UI 倍率 100% / OS 倍率 100% における実測 (egui logical point):
