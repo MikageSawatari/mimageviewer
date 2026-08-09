@@ -2280,6 +2280,43 @@ enum ComparePreparedTextureKind {
     Diff,
 }
 
+enum CapturePixelJobPreparation {
+    WaitingForSource,
+    Ready(crate::capture::CapturePixelJob),
+}
+
+enum ComparePixelWorkPreparation {
+    WaitingForSource,
+    Ready {
+        work: crate::capture::CapturePixelWork,
+        source_indices: Vec<usize>,
+    },
+}
+
+fn compare_source_size_matches_canonical(
+    source_size: [usize; 2],
+    canonical_size: Option<(f32, f32)>,
+) -> bool {
+    let Some((canonical_width, canonical_height)) = canonical_size else {
+        return false;
+    };
+    if source_size[0] == 0
+        || source_size[1] == 0
+        || !canonical_width.is_finite()
+        || !canonical_height.is_finite()
+        || canonical_width <= 0.0
+        || canonical_height <= 0.0
+    {
+        return false;
+    }
+    // GPU 上限で一様縮小された source も正当なので、絶対寸法ではなく両軸が同じ倍率で
+    // canonical source と対応することを確認する。縮退値そのものを sentinel にしない。
+    let lhs = source_size[0] as f64 * canonical_height as f64;
+    let rhs = source_size[1] as f64 * canonical_width as f64;
+    let scale = lhs.abs().max(rhs.abs()).max(1.0);
+    (lhs - rhs).abs() <= scale * 0.005
+}
+
 struct ExportDialogTarget {
     source: crate::export_dialog::ExportSource,
     source_label: String,
@@ -11938,8 +11975,8 @@ impl App {
                             )
                         {
                             let compare_size = self
-                                .compare_prepared_pair
-                                .as_ref()
+                                .compare_preparation
+                                .prepared_pair()
                                 .filter(|pair| pair.current_idx == fs_idx)
                                 .map(|pair| {
                                     egui::vec2(
@@ -17796,8 +17833,8 @@ impl App {
         }
 
         let shader_shape =
-            self.compare_prepared_pair
-                .as_ref()
+            self.compare_preparation
+                .prepared_pair()
                 .and_then(|pair| match mode {
                     crate::app::CompareViewMode::Wipe { fraction } => self.compare_shader_shape(
                         COMPARE_NAVIGATOR_SHADER_SLOT,
@@ -17824,7 +17861,7 @@ impl App {
             .as_ref()
             .map(|shape| shape.draw_rect)
             .or_else(|| {
-                self.compare_prepared_pair.as_ref().and_then(|pair| {
+                self.compare_preparation.prepared_pair().and_then(|pair| {
                     Self::compare_image_draw_rect(
                         layout.content_rect,
                         pair.target_size,
@@ -17833,7 +17870,8 @@ impl App {
                     )
                 })
             });
-        if let (Some(pair), Some(draw_rect)) = (self.compare_prepared_pair.as_ref(), draw_rect) {
+        if let (Some(pair), Some(draw_rect)) = (self.compare_preparation.prepared_pair(), draw_rect)
+        {
             log_compare_geometry_if_changed(
                 ctx,
                 self.frame_counter,
@@ -18832,8 +18870,8 @@ impl App {
         // フィット矩形を作る。compare_image_draw_rect はアスペクト比だけで矩形が決まるので
         // target_size でも source_size でも同じ実表示画像矩形になり、描画 fallback と一致する。
         let compare_target_size = self
-            .compare_prepared_pair
-            .as_ref()
+            .compare_preparation
+            .prepared_pair()
             .map(|pair| pair.target_size)
             .or_else(|| {
                 self.pinned_compare_slot
@@ -22690,9 +22728,82 @@ impl App {
         let Some(slot) = self.pinned_compare_slot.as_ref() else {
             return false;
         };
-        self.compare_prepared_pair.as_ref().is_some_and(|pair| {
-            pair.current_idx == fs_idx && pair.pinned_source_idx == slot.source_idx
-        })
+        self.compare_preparation
+            .prepared_pair()
+            .is_some_and(|pair| {
+                pair.current_idx == fs_idx && pair.pinned_source_idx == slot.source_idx
+            })
+    }
+
+    fn prepare_compare_pixel_job(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Result<CapturePixelJobPreparation, String> {
+        // fs_cache の表示用 entry を残したまま、表示解像度更新などの replacement load が
+        // 進む期間がある。capture 経路はその entry から complete な final composite を作れるが、
+        // 比較用 source としてはまだ確定していないので worker へ渡さない。
+        if self.fs_pending.contains_key(&idx) {
+            return Ok(CapturePixelJobPreparation::WaitingForSource);
+        }
+        let preparation =
+            self.prepare_capture_pixel_job_with_output_crop_state(ctx, idx, None, true)?;
+        let CapturePixelJobPreparation::Ready(job) = preparation else {
+            return Ok(CapturePixelJobPreparation::WaitingForSource);
+        };
+        let canonical_size = self.source_dims_for_idx(idx);
+        if !compare_source_size_matches_canonical(job.source.size, canonical_size) {
+            crate::logger::log(format!(
+                "compare source withheld: idx={} source={}x{} canonical={:?}",
+                idx, job.source.size[0], job.source.size[1], canonical_size,
+            ));
+            return Ok(CapturePixelJobPreparation::WaitingForSource);
+        }
+        Ok(CapturePixelJobPreparation::Ready(job))
+    }
+
+    fn prepare_compare_pixel_work(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Result<ComparePixelWorkPreparation, String> {
+        match self.resolve_visible_spread_pair(idx) {
+            SpreadPair::Single => match self.prepare_compare_pixel_job(ctx, idx)? {
+                CapturePixelJobPreparation::WaitingForSource => {
+                    Ok(ComparePixelWorkPreparation::WaitingForSource)
+                }
+                CapturePixelJobPreparation::Ready(job) => Ok(ComparePixelWorkPreparation::Ready {
+                    work: crate::capture::CapturePixelWork::Single(job),
+                    source_indices: vec![idx],
+                }),
+            },
+            SpreadPair::Double { left, right } => {
+                let left_job = match self.prepare_compare_pixel_job(ctx, left)? {
+                    CapturePixelJobPreparation::WaitingForSource => {
+                        return Ok(ComparePixelWorkPreparation::WaitingForSource);
+                    }
+                    CapturePixelJobPreparation::Ready(job) => job,
+                };
+                let right_job = match self.prepare_compare_pixel_job(ctx, right)? {
+                    CapturePixelJobPreparation::WaitingForSource => {
+                        return Ok(ComparePixelWorkPreparation::WaitingForSource);
+                    }
+                    CapturePixelJobPreparation::Ready(job) => job,
+                };
+                let basename = crate::capture::basename_from_text(&format!(
+                    "{}_{}",
+                    left_job.basename, right_job.basename
+                ));
+                Ok(ComparePixelWorkPreparation::Ready {
+                    work: crate::capture::CapturePixelWork::Spread {
+                        basename,
+                        left: left_job,
+                        right: right_job,
+                    },
+                    source_indices: vec![left, right],
+                })
+            }
+        }
     }
 
     fn ensure_compare_prepared_pair(&mut self, ctx: &egui::Context, fs_idx: usize) -> bool {
@@ -22702,13 +22813,15 @@ impl App {
         if self.compare_prepared_pair_matches(fs_idx) {
             return true;
         }
-        if self
-            .compare_prepare_pending
-            .as_ref()
-            .is_some_and(|pending| {
-                pending.current_idx == fs_idx && pending.pinned_source_idx == slot.source_idx
-            })
-        {
+        let request = crate::app::ComparePrepareRequest {
+            current_idx: fs_idx,
+            pinned_source_idx: slot.source_idx,
+        };
+        if matches!(
+            &self.compare_preparation,
+            crate::app::ComparePreparationState::Preparing(pending)
+                if pending.request == request
+        ) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
             return false;
         }
@@ -22716,9 +22829,29 @@ impl App {
         let pinned_source_idx = slot.source_idx;
         let pinned_size = slot.source_size;
         let pinned_pixels = Arc::clone(&slot.pixels);
-        let current_work = match self.prepare_capture_pixel_work(ctx, fs_idx) {
-            Ok(work) => work,
+        let (current_work, source_indices) = match self.prepare_compare_pixel_work(ctx, fs_idx) {
+            Ok(ComparePixelWorkPreparation::Ready {
+                work,
+                source_indices,
+            }) => (work, source_indices),
+            Ok(ComparePixelWorkPreparation::WaitingForSource) => {
+                let already_waiting = matches!(
+                    self.compare_preparation,
+                    crate::app::ComparePreparationState::WaitingForSource(waiting)
+                        if waiting == request
+                );
+                if !already_waiting {
+                    self.compare_preparation =
+                        crate::app::ComparePreparationState::WaitingForSource(request);
+                    self.clear_compare_gpu_pair();
+                    self.compare_wipe_dragging = false;
+                    self.show_feedback_toast("比較表示を準備中".to_string());
+                }
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                return false;
+            }
             Err(err) => {
+                self.compare_preparation = crate::app::ComparePreparationState::Unprepared;
                 self.compare_view_mode = crate::app::CompareViewMode::Off;
                 self.clear_compare_gpu_pair();
                 self.compare_wipe_dragging = false;
@@ -22726,7 +22859,18 @@ impl App {
                 return false;
             }
         };
-        self.compare_prepared_pair = None;
+        let expected_target_size = match current_work.output_size() {
+            Ok(size) => size,
+            Err(err) => {
+                self.compare_preparation = crate::app::ComparePreparationState::Unprepared;
+                self.compare_view_mode = crate::app::CompareViewMode::Off;
+                self.clear_compare_gpu_pair();
+                self.compare_wipe_dragging = false;
+                self.show_feedback_toast(err);
+                return false;
+            }
+        };
+        self.compare_preparation = crate::app::ComparePreparationState::Unprepared;
         self.clear_compare_gpu_pair();
         let (tx, rx) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
@@ -22765,15 +22909,19 @@ impl App {
 
         match thread {
             Ok(_) => {
-                self.compare_prepare_pending = Some(crate::app::ComparePreparePending {
-                    current_idx: fs_idx,
-                    pinned_source_idx,
-                    rx,
-                });
+                self.compare_preparation = crate::app::ComparePreparationState::Preparing(
+                    crate::app::ComparePreparePending {
+                        request,
+                        source_indices,
+                        expected_target_size,
+                        rx,
+                    },
+                );
                 self.show_feedback_toast("比較表示を準備中".to_string());
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             Err(err) => {
+                self.compare_preparation = crate::app::ComparePreparationState::Unprepared;
                 self.show_feedback_toast(format!("比較 worker を開始できません: {err}"));
             }
         }
@@ -22785,7 +22933,7 @@ impl App {
         ctx: &egui::Context,
         kind: ComparePreparedTextureKind,
     ) -> Option<egui::TextureHandle> {
-        let pair = self.compare_prepared_pair.as_mut()?;
+        let pair = self.compare_preparation.prepared_pair_mut()?;
         let key = pair.key;
         let target_size = pair.target_size;
         let (slot, pixels, label) = match kind {
@@ -23646,8 +23794,8 @@ impl App {
         }
 
         let shader_shape = self
-            .compare_prepared_pair
-            .as_ref()
+            .compare_preparation
+            .prepared_pair()
             .and_then(|pair| match mode {
                 crate::app::CompareViewMode::Wipe { fraction } => self.compare_shader_shape(
                     COMPARE_MAIN_SHADER_SLOT,
@@ -23673,7 +23821,7 @@ impl App {
             .as_ref()
             .map(|shape| shape.draw_rect)
             .or_else(|| {
-                self.compare_prepared_pair.as_ref().and_then(|pair| {
+                self.compare_preparation.prepared_pair().and_then(|pair| {
                     Self::compare_image_draw_rect(
                         image_rect,
                         pair.target_size,
@@ -23682,7 +23830,8 @@ impl App {
                     )
                 })
             });
-        if let (Some(pair), Some(draw_rect)) = (self.compare_prepared_pair.as_ref(), draw_rect) {
+        if let (Some(pair), Some(draw_rect)) = (self.compare_preparation.prepared_pair(), draw_rect)
+        {
             log_compare_geometry_if_changed(
                 ctx,
                 self.frame_counter,
@@ -26874,8 +27023,7 @@ impl App {
             self.pinned_compare_slot = None;
             self.compare_view_mode = crate::app::CompareViewMode::Off;
             self.compare_pin_load_pending = None;
-            self.compare_prepare_pending = None;
-            self.compare_prepared_pair = None;
+            self.compare_preparation = crate::app::ComparePreparationState::Unprepared;
             self.clear_compare_gpu_pair();
             self.compare_wipe_dragging = false;
             self.show_feedback_toast("比較画像を解除しました".to_string());
@@ -26948,8 +27096,7 @@ impl App {
         match thread {
             Ok(_) => {
                 self.compare_pin_load_pending = None;
-                self.compare_prepare_pending = None;
-                self.compare_prepared_pair = None;
+                self.compare_preparation = crate::app::ComparePreparationState::Unprepared;
                 self.clear_compare_gpu_pair();
                 self.compare_pin_pending = Some(crate::app::ComparePinPending { source_idx, rx });
                 self.show_feedback_toast("比較画像を準備中".to_string());
@@ -27505,6 +27652,26 @@ impl App {
         override_crop: Option<crate::export_crop::CropRect>,
         use_stored_crop: bool,
     ) -> Result<crate::capture::CapturePixelJob, String> {
+        match self.prepare_capture_pixel_job_with_output_crop_state(
+            ctx,
+            idx,
+            override_crop,
+            use_stored_crop,
+        )? {
+            CapturePixelJobPreparation::Ready(job) => Ok(job),
+            CapturePixelJobPreparation::WaitingForSource => {
+                Err("最終合成の完了後に再実行してください".to_string())
+            }
+        }
+    }
+
+    fn prepare_capture_pixel_job_with_output_crop_state(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        override_crop: Option<crate::export_crop::CropRect>,
+        use_stored_crop: bool,
+    ) -> Result<CapturePixelJobPreparation, String> {
         let basename = self
             .capture_basename_for_idx(idx)
             .ok_or_else(|| "このアイテムはキャプチャ保存できません".to_string())?;
@@ -27513,9 +27680,10 @@ impl App {
         // 同じ経路にして「表示どおり保存/コピー/比較」する (Codex 監査 P0)。
         let pixels = match self.comic_composited_pixels_for_export(ctx, idx) {
             Some(p) => p,
-            None => self
-                .ensure_final_composite_pixels(ctx, idx)
-                .ok_or_else(|| "最終合成の完了後に再実行してください".to_string())?,
+            None => match self.ensure_final_composite_pixels(ctx, idx) {
+                Some(pixels) => pixels,
+                None => return Ok(CapturePixelJobPreparation::WaitingForSource),
+            },
         };
         let size = pixels.size;
         let rotation = self.get_rotation(idx);
@@ -27528,7 +27696,7 @@ impl App {
         } else if use_stored_crop && let Some(rect) = self.export_crop_rect_for_pixels(idx, size) {
             job = job.with_crop(rect);
         }
-        Ok(job)
+        Ok(CapturePixelJobPreparation::Ready(job))
     }
 
     pub(crate) fn add_grid_selection_to_active_book(&mut self, ctx: &egui::Context) {
@@ -31550,24 +31718,59 @@ mod tests {
             source_idx: 2,
             source_size: [1, 1],
         });
-        app.compare_prepared_pair = Some(crate::app::ComparePreparedPair {
-            key: 1,
-            current_idx: 7,
-            pinned_source_idx: 2,
-            target_size: [1, 1],
-            pinned_rgba: rgba.clone(),
-            current_rgba: rgba,
-            pinned_pixels: pixels.clone(),
-            current_pixels: pixels.clone(),
-            diff_pixels: pixels,
-            pinned_texture: None,
-            current_texture: None,
-            diff_texture: None,
-        });
-
         let ctx = egui::Context::default();
         let image_rect =
             egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(320.0, 240.0));
+        app.compare_preparation = crate::app::ComparePreparationState::WaitingForSource(
+            crate::app::ComparePrepareRequest {
+                current_idx: 7,
+                pinned_source_idx: 2,
+            },
+        );
+        let mut waiting_composite_drawn = true;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 480.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        waiting_composite_drawn = app.draw_compare_prepared_mode(
+                            ui,
+                            ctx,
+                            image_rect,
+                            7,
+                            crate::app::CompareViewMode::Wipe { fraction: 0.5 },
+                            None,
+                        );
+                    });
+            },
+        );
+        assert!(
+            !waiting_composite_drawn,
+            "a pair waiting for its source must not reach compare drawing"
+        );
+
+        app.compare_preparation =
+            crate::app::ComparePreparationState::Ready(crate::app::ComparePreparedPair {
+                key: 1,
+                current_idx: 7,
+                pinned_source_idx: 2,
+                target_size: [1, 1],
+                pinned_rgba: rgba.clone(),
+                current_rgba: rgba,
+                pinned_pixels: pixels.clone(),
+                current_pixels: pixels.clone(),
+                diff_pixels: pixels,
+                pinned_texture: None,
+                current_texture: None,
+                diff_texture: None,
+            });
         let mut composite_drawn = true;
         let _ = ctx.run(
             egui::RawInput {
@@ -31599,6 +31802,121 @@ mod tests {
             !composite_drawn,
             "the main canvas must not paint a pair prepared for another current page"
         );
+    }
+
+    #[test]
+    fn compare_source_validation_uses_canonical_aspect_not_a_literal_placeholder_size() {
+        assert!(compare_source_size_matches_canonical(
+            [4096, 6144],
+            Some((3584.0, 5376.0)),
+        ));
+        assert!(compare_source_size_matches_canonical(
+            [3, 3],
+            Some((900.0, 900.0)),
+        ));
+        assert!(!compare_source_size_matches_canonical(
+            [3, 3],
+            Some((3584.0, 4608.0)),
+        ));
+    }
+
+    #[test]
+    fn compare_prepare_result_with_unexpected_target_stays_waiting() {
+        let mut app = crate::app::setup_app_for_test();
+        let pixels = std::sync::Arc::new(egui::ColorImage::filled([2, 3], egui::Color32::WHITE));
+        app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+            pixels: pixels.clone(),
+            texture: None,
+            indicator_pixels: pixels,
+            indicator_texture: None,
+            display_name: "pinned".to_string(),
+            source_idx: 2,
+            source_size: [2, 3],
+        });
+        let request = crate::app::ComparePrepareRequest {
+            current_idx: 7,
+            pinned_source_idx: 2,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(crate::app::ComparePrepareResult {
+            current_idx: 7,
+            pinned_source_idx: 2,
+            width: 3,
+            height: 3,
+            pinned_rgba: vec![255; 3 * 3 * 4],
+            current_rgba: vec![255; 3 * 3 * 4],
+            diff_rgba: vec![0; 3 * 3 * 4],
+        }))
+        .unwrap();
+        app.compare_preparation =
+            crate::app::ComparePreparationState::Preparing(crate::app::ComparePreparePending {
+                request,
+                source_indices: vec![7],
+                expected_target_size: [3, 5],
+                rx,
+            });
+
+        app.poll_compare_prepare_pending(&egui::Context::default());
+
+        assert!(matches!(
+            app.compare_preparation,
+            crate::app::ComparePreparationState::WaitingForSource(waiting)
+                if waiting == request
+        ));
+    }
+
+    #[test]
+    fn compare_prepare_result_is_withheld_during_source_replacement() {
+        let mut app = crate::app::setup_app_for_test();
+        let pixels = std::sync::Arc::new(egui::ColorImage::filled([2, 3], egui::Color32::WHITE));
+        app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+            pixels: pixels.clone(),
+            texture: None,
+            indicator_pixels: pixels,
+            indicator_texture: None,
+            display_name: "pinned".to_string(),
+            source_idx: 2,
+            source_size: [2, 3],
+        });
+        let request = crate::app::ComparePrepareRequest {
+            current_idx: 7,
+            pinned_source_idx: 2,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(crate::app::ComparePrepareResult {
+            current_idx: 7,
+            pinned_source_idx: 2,
+            width: 3,
+            height: 3,
+            pinned_rgba: vec![255; 3 * 3 * 4],
+            current_rgba: vec![255; 3 * 3 * 4],
+            diff_rgba: vec![0; 3 * 3 * 4],
+        }))
+        .unwrap();
+        let (_load_tx, load_rx) = std::sync::mpsc::channel();
+        app.fs_pending.insert(
+            7,
+            (
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                load_rx,
+                0,
+            ),
+        );
+        app.compare_preparation =
+            crate::app::ComparePreparationState::Preparing(crate::app::ComparePreparePending {
+                request,
+                source_indices: vec![7],
+                expected_target_size: [3, 3],
+                rx,
+            });
+
+        app.poll_compare_prepare_pending(&egui::Context::default());
+
+        assert!(matches!(
+            app.compare_preparation,
+            crate::app::ComparePreparationState::WaitingForSource(waiting)
+                if waiting == request
+        ));
     }
 
     fn setup_page_turn_spread_test(

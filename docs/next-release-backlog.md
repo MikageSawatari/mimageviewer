@@ -1228,6 +1228,18 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   準備済み pair の `current_idx` が現在ページと違う間は古い合成を描かず、既存の通常表示 fallback
   と「比較表示を準備中」を維持する。別ページの pair を本文が描画済みとして扱わない回帰 test を
   追加した。
+- 新規準備時の縮退 pair 修正 (2026-08-10、実機確認待ち): `prepare_capture_pixel_work` は
+  replacement load (`fs_pending`) 中でも在住中の旧 `fs_cache` から complete な final composite を
+  作れたため、確定前の source を worker が snapshot し、その寸法を正当な完了結果として
+  `ComparePreparedPair` へ publish できた。従来の完了側検査は `w × h × 4` の byte 数しか見ず、
+  実機ログの縮退寸法も通していた。`ComparePreparationState` を
+  `Unprepared / WaitingForSource / Preparing / Ready` の排他的 enum にし、replacement load と
+  final composite 未完了は `WaitingForSource` のまま通常ページを描く。source が canonical 寸法と
+  同じ縦横倍率であること、worker 結果が crop / rotation / 見開き union から事前計算した寸法と
+  一致することを確認し、worker 開始後にいずれかの source replacement が始まった競合でも
+  完了結果を withheld してからだけ `Ready` を公開する。literal な縮退寸法の分岐は置いていない。
+  source reload の generation 境界でも同じ状態を失効させ、旧 worker 完了を同一 idx へ戻さない。
+  `[compare-geometry]` の一時計測は実機確認まで残す。
 
 ### 1.61 見開きでページが 1 枚ダブる (横長ページの寸法をキャッシュ在住に頼っている) — 利用者報告
 
@@ -1456,6 +1468,15 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   不一致は `[fs-generation] stale entry discarded cache=... idx=... expected_generation=...
   actual_generation=...` と通常ログへ残して破棄し、pending は同時に cancel する。
   `install_new_items` 相当の差し替えと旧完了拒否を状態遷移テストで固定した。
+- 退行修正 (2026-08-10、実機確認待ち): 世代更新時の即時 purge により、それまで stale entry が
+  偶然埋めていた main embedded の 1 presentation frame が黒として露出した。active detached は
+  `update_active_detached_viewer_context` 内で `poll_folder_nav` / apply → PDF/ZIP enumerate →
+  `poll_fs_nav_lock` → `render_fullscreen_viewport` の順だった一方、main embedded は先に
+  `render_fullscreen_viewport` で shape を構築し、early-return 内で folder result を apply/purge して
+  いた。main も遷移結果の apply・enumerate・既存 holdover の解放判定を描画前へ移し、描画後の
+  回収は同フレーム中に初めて embedded へ入った場合だけの backstop にした。世代刻印・即時 purge・
+  既存 holdover は維持している。`FolderNavMode::Fullscreen` の `load_folder_nav_target` / reopen は
+  画像フォルダ・ZIP・PDF の共通経路なので、PDF 固有の例外は追加していない。
 - 優先度: P2。急ぎではないが、別の本のページが黙って表示され得る点で放置しない。
 
 ## 4. 入力カスタマイズ / マウス / ゲームパッド

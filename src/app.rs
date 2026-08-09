@@ -2696,6 +2696,14 @@ fn should_render_main_fullscreen_viewport_after_detached_context(
     !active_detached_context_updated || embedded_fs_active || embedded_fs_pending
 }
 
+#[cfg(windows)]
+fn should_poll_main_embedded_transitions_before_render(
+    embedded_fs_active: bool,
+    embedded_fs_pending: bool,
+) -> bool {
+    embedded_fs_active || embedded_fs_pending
+}
+
 /// メインウィンドウ surface のクリア色 (= egui が何も描かなかったフレームで見える色)。
 /// テーマのパネル背景 (= メニューバー背景) に合わせ、描画スキップフレームの「一瞬黒」が
 /// ライトテーマで目立つのを緩和する。詳細は `eframe::App::clear_color` impl の doc を参照。
@@ -3923,6 +3931,12 @@ pub(crate) struct ComparePreparedPair {
     pub(crate) diff_texture: Option<egui::TextureHandle>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ComparePrepareRequest {
+    pub(crate) current_idx: usize,
+    pub(crate) pinned_source_idx: usize,
+}
+
 pub(crate) struct ComparePrepareResult {
     pub(crate) current_idx: usize,
     pub(crate) pinned_source_idx: usize,
@@ -3934,9 +3948,56 @@ pub(crate) struct ComparePrepareResult {
 }
 
 pub(crate) struct ComparePreparePending {
-    pub(crate) current_idx: usize,
-    pub(crate) pinned_source_idx: usize,
+    pub(crate) request: ComparePrepareRequest,
+    pub(crate) source_indices: Vec<usize>,
+    pub(crate) expected_target_size: [usize; 2],
     pub(crate) rx: mpsc::Receiver<Result<ComparePrepareResult, String>>,
+}
+
+/// 比較合成の排他的なライフサイクル。
+///
+/// `WaitingForSource` は PDF の表示解像度更新など、現在ページの最終 source がまだ
+/// 確定していない状態を表す。準備中 / 準備済みを別々の `Option` で持たないため、
+/// worker 完了前の縮退画像を Ready として描画へ公開できない。
+#[derive(Default)]
+pub(crate) enum ComparePreparationState {
+    #[default]
+    Unprepared,
+    WaitingForSource(ComparePrepareRequest),
+    Preparing(ComparePreparePending),
+    Ready(ComparePreparedPair),
+}
+
+impl ComparePreparationState {
+    pub(crate) fn request(&self) -> Option<ComparePrepareRequest> {
+        match self {
+            Self::WaitingForSource(request) => Some(*request),
+            Self::Preparing(pending) => Some(pending.request),
+            Self::Ready(pair) => Some(ComparePrepareRequest {
+                current_idx: pair.current_idx,
+                pinned_source_idx: pair.pinned_source_idx,
+            }),
+            Self::Unprepared => None,
+        }
+    }
+
+    pub(crate) fn prepared_pair(&self) -> Option<&ComparePreparedPair> {
+        match self {
+            Self::Ready(pair) => Some(pair),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn prepared_pair_mut(&mut self) -> Option<&mut ComparePreparedPair> {
+        match self {
+            Self::Ready(pair) => Some(pair),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        matches!(self, Self::WaitingForSource(_) | Self::Preparing(_))
+    }
 }
 
 /// 起動オーバーレイ用の `StartupProgressHook` を作る共通ヘルパー。
@@ -8918,8 +8979,7 @@ pub struct App {
     pub(crate) compare_view_mode: CompareViewMode,
     pub(crate) compare_pin_load_pending: Option<ComparePinLoadPending>,
     pub(crate) compare_pin_pending: Option<ComparePinPending>,
-    pub(crate) compare_prepare_pending: Option<ComparePreparePending>,
-    pub(crate) compare_prepared_pair: Option<ComparePreparedPair>,
+    pub(crate) compare_preparation: ComparePreparationState,
     pub(crate) compare_prepared_next_key: u64,
     pub(crate) compare_wipe_dragging: bool,
     /// フォルダ読み込み後に選択するアイテム名（BS で親に戻るとき等）
@@ -12090,8 +12150,7 @@ impl App {
             compare_view_mode: CompareViewMode::Off,
             compare_pin_load_pending: None,
             compare_pin_pending: None,
-            compare_prepare_pending: None,
-            compare_prepared_pair: None,
+            compare_preparation: ComparePreparationState::Unprepared,
             compare_prepared_next_key: 1,
             compare_wipe_dragging: false,
             select_after_load: None,
@@ -26706,8 +26765,7 @@ impl App {
                     source_idx,
                 });
                 self.compare_view_mode = CompareViewMode::Off;
-                self.compare_prepare_pending = None;
-                self.compare_prepared_pair = None;
+                self.compare_preparation = ComparePreparationState::Unprepared;
                 self.clear_compare_gpu_pair();
                 self.compare_wipe_dragging = false;
                 self.show_feedback_toast(format!("比較画像を設定: {display_name}"));
@@ -26766,7 +26824,7 @@ impl App {
     }
 
     pub(crate) fn poll_compare_prepare_pending(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.compare_prepare_pending.as_ref() else {
+        let ComparePreparationState::Preparing(pending) = &self.compare_preparation else {
             return;
         };
         let result = match pending.rx.try_recv() {
@@ -26779,14 +26837,19 @@ impl App {
                 Err("比較表示の準備が中断されました".to_string())
             }
         };
-        let pending_current_idx = pending.current_idx;
-        let pending_pinned_source_idx = pending.pinned_source_idx;
-        self.compare_prepare_pending = None;
+        let pending = match std::mem::replace(
+            &mut self.compare_preparation,
+            ComparePreparationState::Unprepared,
+        ) {
+            ComparePreparationState::Preparing(pending) => pending,
+            _ => unreachable!(),
+        };
+        let request = pending.request;
 
         match result {
             Ok(result) => {
-                if result.current_idx != pending_current_idx
-                    || result.pinned_source_idx != pending_pinned_source_idx
+                if result.current_idx != request.current_idx
+                    || result.pinned_source_idx != request.pinned_source_idx
                 {
                     return;
                 }
@@ -26797,35 +26860,59 @@ impl App {
                 {
                     return;
                 }
-                let expected = result.width as usize * result.height as usize * 4;
-                if result.pinned_rgba.len() != expected
-                    || result.current_rgba.len() != expected
-                    || result.diff_rgba.len() != expected
+                // worker 開始後に PDF 表示解像度更新などの replacement load が始まる
+                // 競合もある。snapshot 元のいずれかが更新中なら、旧 snapshot の完了を
+                // Ready として公開せず source 確定後に作り直す。
+                if pending
+                    .source_indices
+                    .iter()
+                    .any(|idx| self.fs_pending.contains_key(idx))
                 {
-                    self.show_feedback_toast("比較表示のサイズが不正です".to_string());
+                    self.compare_preparation = ComparePreparationState::WaitingForSource(request);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    return;
+                }
+                let result_size = [result.width as usize, result.height as usize];
+                let expected_bytes = result_size[0]
+                    .checked_mul(result_size[1])
+                    .and_then(|pixels| pixels.checked_mul(4));
+                if result_size != pending.expected_target_size
+                    || expected_bytes.is_none()
+                    || result.pinned_rgba.len() != expected_bytes.unwrap_or(0)
+                    || result.current_rgba.len() != expected_bytes.unwrap_or(0)
+                    || result.diff_rgba.len() != expected_bytes.unwrap_or(0)
+                {
+                    crate::logger::log(format!(
+                        "compare prepare result withheld: current_idx={} pinned_idx={} expected={}x{} actual={}x{} pinned_bytes={} current_bytes={} diff_bytes={}",
+                        request.current_idx,
+                        request.pinned_source_idx,
+                        pending.expected_target_size[0],
+                        pending.expected_target_size[1],
+                        result_size[0],
+                        result_size[1],
+                        result.pinned_rgba.len(),
+                        result.current_rgba.len(),
+                        result.diff_rgba.len(),
+                    ));
+                    self.compare_preparation = ComparePreparationState::WaitingForSource(request);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
                     return;
                 }
 
-                let pinned_pixels = egui::ColorImage::from_rgba_unmultiplied(
-                    [result.width as usize, result.height as usize],
-                    &result.pinned_rgba,
-                );
-                let current_pixels = egui::ColorImage::from_rgba_unmultiplied(
-                    [result.width as usize, result.height as usize],
-                    &result.current_rgba,
-                );
-                let diff_pixels = egui::ColorImage::from_rgba_unmultiplied(
-                    [result.width as usize, result.height as usize],
-                    &result.diff_rgba,
-                );
+                let pinned_pixels =
+                    egui::ColorImage::from_rgba_unmultiplied(result_size, &result.pinned_rgba);
+                let current_pixels =
+                    egui::ColorImage::from_rgba_unmultiplied(result_size, &result.current_rgba);
+                let diff_pixels =
+                    egui::ColorImage::from_rgba_unmultiplied(result_size, &result.diff_rgba);
                 let key = self.compare_prepared_next_key;
                 self.compare_prepared_next_key =
                     self.compare_prepared_next_key.wrapping_add(1).max(1);
-                self.compare_prepared_pair = Some(ComparePreparedPair {
+                self.compare_preparation = ComparePreparationState::Ready(ComparePreparedPair {
                     key,
                     current_idx: result.current_idx,
                     pinned_source_idx: result.pinned_source_idx,
-                    target_size: [result.width as usize, result.height as usize],
+                    target_size: result_size,
                     pinned_rgba: Arc::new(result.pinned_rgba),
                     current_rgba: Arc::new(result.current_rgba),
                     pinned_pixels: Arc::new(pinned_pixels),
@@ -52229,6 +52316,10 @@ impl App {
     pub(crate) fn bump_input_generation_for_fs_cache_reload(&mut self, idx: usize) {
         let slot = self.input_generation.entry(idx).or_insert(0);
         *slot = slot.wrapping_add(1);
+        // 比較 worker が旧 raw source を snapshot 済みなら、その完了結果は新しい
+        // source と同一 idx でも publish してはいけない。source 所有境界で typed
+        // preparation state ごと失効させ、次の描画で新 source から準備し直す。
+        self.invalidate_compare_prepared_for_idx(idx);
         self.fs_lanczos_cache.remove_page(idx);
         self.cancel_erase_commit_pending_for_idx(idx);
         self.clear_erase_result_caches_for_idx(idx);
@@ -57472,21 +57563,20 @@ impl App {
 
     pub(crate) fn invalidate_compare_prepared_for_idx(&mut self, idx: usize) {
         let prepared_affected = self
-            .compare_prepared_pair
-            .as_ref()
+            .compare_preparation
+            .prepared_pair()
             .is_some_and(|pair| pair.current_idx == idx || pair.pinned_source_idx == idx);
-        let pending_affected = self
-            .compare_prepare_pending
-            .as_ref()
-            .is_some_and(|pending| pending.current_idx == idx || pending.pinned_source_idx == idx);
+        let affected = self
+            .compare_preparation
+            .request()
+            .is_some_and(|request| request.current_idx == idx || request.pinned_source_idx == idx);
+        if affected {
+            self.compare_preparation = ComparePreparationState::Unprepared;
+        }
         if prepared_affected {
-            self.compare_prepared_pair = None;
             self.clear_compare_gpu_pair();
         }
-        if pending_affected {
-            self.compare_prepare_pending = None;
-        }
-        if prepared_affected || pending_affected {
+        if affected {
             self.compare_wipe_dragging = false;
         }
     }
@@ -57497,9 +57587,8 @@ impl App {
     /// 比較ピクセルも古くなるが、mark_comic_dirty は現在ページ (fullscreen_idx) しか無効化
     /// しないため取りこぼす (Codex P2)。
     pub(crate) fn invalidate_all_compare_prepared(&mut self) {
-        self.compare_prepared_pair = None;
+        self.compare_preparation = ComparePreparationState::Unprepared;
         self.clear_compare_gpu_pair();
-        self.compare_prepare_pending = None;
         self.compare_wipe_dragging = false;
         // ピン留め (X) スロットは焼き込み済み pixels を保持するので、フォントソース変更では
         // 旧フォントのまま残る。スロット + 進行中の pin worker / load も落とす (Codex P2)。
@@ -57581,8 +57670,7 @@ impl App {
     pub(crate) fn clear_all_color_caches(&mut self) {
         self.adjustment_cache.clear();
         self.thumb_adjust_tex.clear();
-        self.compare_prepare_pending = None;
-        self.compare_prepared_pair = None;
+        self.compare_preparation = ComparePreparationState::Unprepared;
         self.clear_compare_gpu_pair();
         self.compare_wipe_dragging = false;
         self.clear_all_final_pipeline_caches();
@@ -62232,7 +62320,8 @@ impl eframe::App for App {
             || self.export_pending.is_some()
             || self.compare_pin_load_pending.is_some()
             || self.compare_pin_pending.is_some()
-            || self.compare_prepare_pending.is_some()
+            || (self.compare_preparation.is_pending()
+                && !matches!(self.compare_view_mode, CompareViewMode::Off))
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -62445,6 +62534,35 @@ impl eframe::App for App {
             self.keep_fullscreen_viewport_alive(ctx);
         }
         let t_keep_fullscreen_viewport = frame_t0.elapsed();
+        // active detached は update_active_detached_viewer_context 内で
+        // folder result -> PDF/ZIP enumerate -> nav lock -> render の順に処理する。
+        // main embedded も同じ所有順序に揃え、items_generation 更新による cache purge が
+        // CentralPanel の shape 構築後に走って 1 presentation frame だけ黒くなる隙をなくす。
+        // FolderNavMode::Fullscreen の着地点は画像フォルダ / ZIP / PDF で共通なので、
+        // コンテナ種別ごとの分岐は作らない。
+        #[cfg(windows)]
+        let main_embedded_transitions_polled_before_render = {
+            let embedded_active = self.fullscreen_embedded_still_active();
+            let embedded_pending =
+                self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active();
+            let should_poll = should_poll_main_embedded_transitions_before_render(
+                embedded_active,
+                embedded_pending,
+            );
+            if should_poll {
+                if let Some(result) = self.poll_folder_nav()
+                    && keyboard_nav.is_none()
+                {
+                    self.apply_folder_nav_result(ctx, result);
+                }
+                self.poll_pdf_enumerate();
+                self.poll_zip_enumerate();
+                // apply/enumerate が新しい表示を同フレームで準備できた場合だけ、既存の
+                // generation-aware holdover を描画前に解放する。
+                self.poll_fs_nav_lock(ctx);
+            }
+            should_poll
+        };
         // in-window 静止画フルスクリーンは render_fullscreen_viewport が main ctx に
         // 直接 CentralPanel を描く。描画前に判定を控え、後段でグリッド描画を抑止する
         // (描画後だと handle_fs_navigation の close で fullscreen_idx が None になり
@@ -62672,20 +62790,21 @@ impl eframe::App for App {
                         return;
                     }
                 }
-                // Ctrl+↑↓ DFS の結果回収 (native 動画ブロックと同じ理由)。
-                if let Some(result) = self.poll_folder_nav() {
-                    if keyboard_nav.is_none() {
+                // 通常は描画前に回収済み。描画中の状態遷移でこの early-return に初めて
+                // 入った場合だけ従来の後段回収を backstop として残す。
+                if !main_embedded_transitions_polled_before_render {
+                    if let Some(result) = self.poll_folder_nav()
+                        && keyboard_nav.is_none()
+                    {
                         self.apply_folder_nav_result(ctx, result);
                     }
+                    self.poll_pdf_enumerate();
+                    self.poll_zip_enumerate();
+                    self.poll_fs_nav_lock(ctx);
                 }
                 if self.archive_convert.is_some() {
                     self.show_archive_convert_dialog(ctx);
                 }
-                // apply_folder_nav_result が PDF/ZIP に着地した場合、列挙ワーカー結果の
-                // 回収はグリッド描画 tail の poll_*_enumerate が担う。embedded 早期
-                // return は tail を飛ばすので、ここでも最低限の回収を行う (Codex P2)。
-                self.poll_pdf_enumerate();
-                self.poll_zip_enumerate();
                 // グリッド描画 tail を飛ばすので tail の「pending 中 repaint」も失われる。
                 // folder nav / PDF・ZIP 列挙ワーカーは別スレッドで完了し repaint を
                 // 要求しないため、静止画フルスクリーンで egui が寝ると結果を次の入力まで
