@@ -188,10 +188,20 @@ wgpu の queue.write_texture が走る。20MP RGBA (78MB) で 26-58ms かかる�
 1. worker はデコード結果を `FsLoadResult` で送る (この時点では ColorImage、GPU 未アップ)
 2. UI は完了を `fs_upload_backlog: Vec<(idx, FsLoadResult, seq)>` にステージ
 3. 1 フレームにつき **最大 1 枚**だけ `ctx.load_texture` する
-4. ただし **現在 `fullscreen_idx` に対応するエントリは即時アップロード** (表示遅延ゼロ)
+4. ただし **現在 `fullscreen_idx` に対応するエントリは即時アップロード** (表示遅延ゼロ)。例外は
+   通常単ページのキーリピートで、同じ input frame に未消費の次ページ入力が残り、カタログ
+   サムネイルを描ける frame。この frame は全 upload slot を保留し、入力が止まった最初の frame で
+   current 優先の通常ペースへ戻す
 5. backlog が残っていれば `ctx.request_repaint()` で次フレーム継続
 
 実装は [src/app.rs `poll_prefetch`](../src/app.rs) 参照。
+
+このキーリピート例外の正本は経過時間ではなく、viewport に配送された Win32 frame edge queue の
+未消費入力である。worker 結果は捨てず backlog / channel に留めるため、停止後に再 decode せず
+materialize できる。同一 egui frame の複数 pass では一時 cache の判定を再生し、query pass が
+入力を消費したり、replay pass が別の品質状態を arm したりしない。計測は
+`fs.page_turn_ready` と `scripts/analyze_perf.py ... page-turn` で通過/実体化枚数、各 hold の
+ready→ready 間隔を出す。時刻は解析にだけ用い、実行時判定へ戻してはならない。
 
 静止画の `DISPLAY_IMAGE_TEXTURE_OPTIONS` は level 0 upload の直後に vendored `egui-wgpu` の
 render pass で mip chain も生成する。CPU resize や I/O は増えないが、GPU upload slot 1 件あたりの

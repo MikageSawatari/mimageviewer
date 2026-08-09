@@ -54095,6 +54095,19 @@ impl App {
         if self.final_effect_pending.is_empty() {
             return;
         }
+        // A ready final-effect result still performs a full-size GPU upload on
+        // the UI thread. If the current page is only passing through because a
+        // page-turn edge remains in this input frame, leave channel results
+        // untouched. This includes adjacent prefetch results: uploading one of
+        // those would still spend the UI frame the pass-through path protects.
+        // The first frame without pending page input collects them.
+        let defer_page_turn_uploads = self.fullscreen_idx.is_some_and(|idx| {
+            self.fs_page_turn_materialization_for_frame(ctx, idx)
+                .is_thumbnail_pass_through()
+        });
+        if defer_page_turn_uploads {
+            return;
+        }
         let mut completed = Vec::new();
         let mut disconnected = Vec::new();
         for (&key, pending) in &self.final_effect_pending {
@@ -59481,17 +59494,25 @@ impl App {
         // ── ペーシング: このフレームで何枚アップロードするか決める ──
         // 1. 現在フルスクリーン表示中の idx (= ユーザーが待っている画像) は即時に処理
         // 2. 他の先読み分は FIFO 先頭から 1 枚だけ取り出す
+        // 3. 同一フレームに未処理の単ページ送り入力が残る間は 0 枚。worker 完了物は
+        //    backlog に保持し、入力が止まった最初のフレームで通常ペースへ戻す
         // backlog は通常 <10 要素なので `Vec::remove` の O(n) は実質コストなし。
         let cur = self.fullscreen_idx;
+        let defer_page_turn_uploads = cur.is_some_and(|idx| {
+            self.fs_page_turn_materialization_for_frame(ctx, idx)
+                .is_thumbnail_pass_through()
+        });
         let (mut cur_pos, mut other_pos) = (None, None);
-        for (i, (k, _, _)) in self.fs_upload_backlog.iter().enumerate() {
-            if Some(*k) == cur {
-                cur_pos = Some(i);
-            } else if other_pos.is_none() {
-                other_pos = Some(i);
-            }
-            if cur_pos.is_some() && other_pos.is_some() {
-                break;
+        if !defer_page_turn_uploads {
+            for (i, (k, _, _)) in self.fs_upload_backlog.iter().enumerate() {
+                if Some(*k) == cur {
+                    cur_pos = Some(i);
+                } else if other_pos.is_none() {
+                    other_pos = Some(i);
+                }
+                if cur_pos.is_some() && other_pos.is_some() {
+                    break;
+                }
             }
         }
 

@@ -6320,6 +6320,7 @@ fn spread_shift_anchor_pos_for_target(target_pos: usize, landscape_flags: &[bool
 struct FsFrameState {
     is_video: bool,
     original_preview_active: bool,
+    page_turn_materialization: FsPageTurnMaterialization,
     tex: Option<egui::TextureHandle>,
     thumb_tex: Option<egui::TextureHandle>,
     /// 上部ホバーバー左側に表示するパス文字列。
@@ -6339,6 +6340,58 @@ struct FsFrameState {
     fs_load_failed: bool,
     /// PDF ページのコンテンツ種別 (非 PDF なら None)
     pdf_content_type: Option<PdfPageContentType>,
+}
+
+/// Per-frame quality choice for ordinary single-page keyboard navigation.
+///
+/// This is not a timer or a cross-frame navigation mode. `ThumbnailPassThrough`
+/// is selected only while another page-turn input edge is still pending in the
+/// same input frame and a catalog thumbnail is already available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FsPageTurnMaterialization {
+    Materialize,
+    ThumbnailPassThrough,
+}
+
+const FS_PAGE_TURN_COALESCE_ACTIONS: [KeyAction; 6] = [
+    KeyAction::FsPagePrev,
+    KeyAction::FsPageNext,
+    KeyAction::FsSpreadShiftLeft,
+    KeyAction::FsSpreadShiftRight,
+    KeyAction::FsSpreadShiftPrev,
+    KeyAction::FsSpreadShiftNext,
+];
+
+impl FsPageTurnMaterialization {
+    pub(crate) const fn is_thumbnail_pass_through(self) -> bool {
+        matches!(self, Self::ThumbnailPassThrough)
+    }
+
+    const fn perf_label(self) -> &'static str {
+        match self {
+            Self::Materialize => "materialized",
+            Self::ThumbnailPassThrough => "pass_through",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FsPageTurnFrameDecision {
+    frame_nr: u64,
+    items_generation: u64,
+    idx: usize,
+    materialization: FsPageTurnMaterialization,
+}
+
+fn page_turn_materialization_for_inputs(
+    page_turn_input_pending: bool,
+    catalog_thumbnail_ready: bool,
+) -> FsPageTurnMaterialization {
+    if page_turn_input_pending && catalog_thumbnail_ready {
+        FsPageTurnMaterialization::ThumbnailPassThrough
+    } else {
+        FsPageTurnMaterialization::Materialize
+    }
 }
 
 #[derive(Clone)]
@@ -10484,7 +10537,8 @@ impl App {
             self.fullscreen_viewport_id()
         };
         self.sync_conceal_preview_before_pipeline(ctx, preview_viewport_id);
-        let state = self.prepare_fullscreen_state(ctx, fs_idx);
+        let page_turn_materialization = self.fs_page_turn_materialization_for_frame(ctx, fs_idx);
+        let state = self.prepare_fullscreen_state(ctx, fs_idx, page_turn_materialization);
 
         let mut close_fs = false;
         let mut close_to_page_list = false;
@@ -11306,6 +11360,48 @@ impl App {
                                                     ),
                                                 ],
                                             );
+                                            // `page_turn_ready` is the compact event consumed by
+                                            // the key-repeat analyzer. Pass-through is ready when
+                                            // the catalog thumbnail paints; materialized is ready
+                                            // only after a non-thumbnail source paints. A normal
+                                            // decode-wait thumbnail therefore cannot be mistaken
+                                            // for the final stop page.
+                                            if state
+                                                .page_turn_materialization
+                                                .is_thumbnail_pass_through()
+                                                || source != "thumbnail"
+                                            {
+                                                crate::perf::event(
+                                                    "fs",
+                                                    "page_turn_ready",
+                                                    key.as_deref(),
+                                                    self.input_seq,
+                                                    &[
+                                                        (
+                                                            "idx",
+                                                            serde_json::Value::from(fs_idx),
+                                                        ),
+                                                        (
+                                                            "items_generation",
+                                                            serde_json::Value::from(
+                                                                self.items_generation,
+                                                            ),
+                                                        ),
+                                                        (
+                                                            "mode",
+                                                            serde_json::Value::from(
+                                                                state
+                                                                    .page_turn_materialization
+                                                                    .perf_label(),
+                                                            ),
+                                                        ),
+                                                        (
+                                                            "source",
+                                                            serde_json::Value::from(source),
+                                                        ),
+                                                    ],
+                                                );
+                                            }
                                             self.fs_painted_last = Some((fs_idx, cur_id, entry_seq));
                                         }
                                     }
@@ -11747,11 +11843,15 @@ impl App {
                         // カラー化待ちはページ枠ごとの fallback にせず、旧表示ユニットを
                         // 黒背景ごと重ねる。見開きは新しい左右が両方揃ったフレームだけ
                         // typed state を解放するため、新旧ページの混在も片側の黒も出ない。
-                        if let Some(unit) = self.colorize_display_unit_holdover_for_draw(
-                            fs_idx,
-                            spread_pair,
-                            state.original_preview_active,
-                        ) {
+                        if !state
+                            .page_turn_materialization
+                            .is_thumbnail_pass_through()
+                            && let Some(unit) = self.colorize_display_unit_holdover_for_draw(
+                                fs_idx,
+                                spread_pair,
+                                state.original_preview_active,
+                            )
+                        {
                             for page in &unit.pages {
                                 self.trace_fs_texture_choice(
                                     "fullscreen_overlay",
@@ -12756,13 +12856,135 @@ impl App {
         }
     }
 
+    /// Decide whether the current page is only passing through this input frame.
+    ///
+    /// The decision source is exclusively the unconsumed, viewport-routed Win32
+    /// key edge queue for this frame. No elapsed-time threshold participates.
+    /// The temp cache keeps egui replay passes in the same frame read-only and
+    /// deterministic; it is invalidated by frame, item generation, and idx.
+    pub(crate) fn fs_page_turn_materialization_for_frame(
+        &self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> FsPageTurnMaterialization {
+        #[cfg(not(windows))]
+        {
+            let _ = (ctx, fs_idx);
+            FsPageTurnMaterialization::Materialize
+        }
+
+        #[cfg(windows)]
+        {
+            let viewport = if self.fullscreen_embedded_still_active() {
+                ctx.viewport_id()
+            } else {
+                self.fullscreen_viewport_id()
+            };
+            let frame_nr = ctx.cumulative_frame_nr();
+            let cache_id = egui::Id::new(("fs_page_turn_materialization", viewport));
+            if let Some(cached) = ctx
+                .data(|data| data.get_temp::<FsPageTurnFrameDecision>(cache_id))
+                .filter(|cached| {
+                    cached.frame_nr == frame_nr
+                        && cached.items_generation == self.items_generation
+                        && cached.idx == fs_idx
+                })
+            {
+                return cached.materialization;
+            }
+
+            let catalog_thumbnail_ready = matches!(
+                self.thumbnails.get(fs_idx),
+                Some(ThumbnailState::Loaded { .. })
+            );
+            let ordinary_single_page_context = self.reading_flow.is_paged()
+                && !self.spread_mode.is_spread()
+                && self.items.get(fs_idx).is_some_and(GridItem::has_page_data)
+                && !self.any_modal_dialog_open_for_fullscreen_keys()
+                && self.fs_context_menu_idx.is_none()
+                && self.capture_region_selection.is_none()
+                && !self.is_overlay_edit_mode_active()
+                && !self.analysis_mode
+                && !self.view_trim_mode
+                && !self.fs_zoom_mode_engaged()
+                && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
+                && !self.is_panorama_mode_active(fs_idx)
+                && !self.original_preview_active(ctx, fs_idx);
+
+            // A customized chord can overlap another active action. Dispatch is
+            // first-wins, so an overlap is not proof that the edge will become a
+            // page turn. Stay on the full-quality path in that ambiguous case.
+            let chord_is_unambiguous_page_turn = |chord: Chord| {
+                !KeyAction::all().iter().copied().any(|action| {
+                    FS_IMAGE_ACTIVE_SCOPES.contains(&action.context())
+                        && action.trigger() == KeyTrigger::Press
+                        && !FS_PAGE_TURN_COALESCE_ACTIONS.contains(&action)
+                        && !(matches!(
+                            action,
+                            KeyAction::FsStackJumpPrev | KeyAction::FsStackJumpNext
+                        ) && !self.stack_showing_flat)
+                        && self
+                            .keymap
+                            .any_effective_chord(action, |bound| bound == chord)
+                })
+            };
+            let configurable_page_turn_pending = ordinary_single_page_context
+                && FS_PAGE_TURN_COALESCE_ACTIONS.into_iter().any(|action| {
+                    self.keymap.any_effective_chord(action, |chord| {
+                        self.keymap.pending_chord_press_in_frame(viewport, chord)
+                            && chord_is_unambiguous_page_turn(chord)
+                    })
+                });
+            let fixed_page_turn_pending = ordinary_single_page_context
+                && [
+                    Chord::key(KeyName::Left),
+                    Chord::key(KeyName::Right),
+                    Chord::key(KeyName::Up),
+                    Chord::key(KeyName::Down),
+                ]
+                .into_iter()
+                .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Up)))
+                .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Down)))
+                .any(|chord| {
+                    self.keymap.pending_chord_press_in_frame(viewport, chord)
+                        && chord_is_unambiguous_page_turn(chord)
+                });
+            let materialization = page_turn_materialization_for_inputs(
+                configurable_page_turn_pending || fixed_page_turn_pending,
+                catalog_thumbnail_ready,
+            );
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    cache_id,
+                    FsPageTurnFrameDecision {
+                        frame_nr,
+                        items_generation: self.items_generation,
+                        idx: fs_idx,
+                        materialization,
+                    },
+                );
+            });
+            materialization
+        }
+    }
+
     /// フルスクリーン描画に必要な状態を事前計算する。
-    fn prepare_fullscreen_state(&mut self, ctx: &egui::Context, fs_idx: usize) -> FsFrameState {
+    fn prepare_fullscreen_state(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        page_turn_materialization: FsPageTurnMaterialization,
+    ) -> FsFrameState {
         let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         let original_preview_active = self.original_preview_active(ctx, fs_idx);
 
-        let tex = self.resolve_fs_processed_texture(ctx, fs_idx, original_preview_active);
-        if crate::perf::is_enabled()
+        let tex = if page_turn_materialization.is_thumbnail_pass_through() {
+            None
+        } else {
+            self.resolve_fs_processed_texture(ctx, fs_idx, original_preview_active)
+        };
+        if !page_turn_materialization.is_thumbnail_pass_through()
+            && crate::perf::is_enabled()
             && tex.is_none()
             && matches!(self.fs_painted_last, Some((painted_idx, _, _)) if painted_idx == fs_idx)
         {
@@ -12797,7 +13019,8 @@ impl App {
 
         let fs_load_failed = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Failed));
 
-        let waiting_for_colorize = !original_preview_active
+        let waiting_for_colorize = !page_turn_materialization.is_thumbnail_pass_through()
+            && !original_preview_active
             && tex.is_none()
             && self.colorize_display_requires_final_effect(fs_idx);
         let thumb_tex = if waiting_for_colorize {
@@ -12907,6 +13130,7 @@ impl App {
         FsFrameState {
             is_video,
             original_preview_active,
+            page_turn_materialization,
             tex,
             thumb_tex,
             location_display,
@@ -30074,6 +30298,7 @@ mod tests {
         let state = FsFrameState {
             is_video: false,
             original_preview_active: false,
+            page_turn_materialization: FsPageTurnMaterialization::Materialize,
             tex: None,
             thumb_tex: None,
             location_display: String::new(),
@@ -30634,6 +30859,72 @@ mod tests {
         assert_eq!(app.fs_zoom, 1.5);
     }
 
+    #[test]
+    fn page_turn_materialization_requires_pending_input_and_catalog_thumbnail() {
+        assert_eq!(
+            page_turn_materialization_for_inputs(true, true),
+            FsPageTurnMaterialization::ThumbnailPassThrough
+        );
+        assert_eq!(
+            page_turn_materialization_for_inputs(false, true),
+            FsPageTurnMaterialization::Materialize
+        );
+        assert_eq!(
+            page_turn_materialization_for_inputs(true, false),
+            FsPageTurnMaterialization::Materialize
+        );
+        assert_eq!(
+            page_turn_materialization_for_inputs(false, false),
+            FsPageTurnMaterialization::Materialize
+        );
+    }
+
+    #[test]
+    fn page_turn_sequence_keeps_one_painted_index_per_frame_and_materializes_stop() {
+        let mut app = crate::app::setup_app_for_test();
+        for page in 0..5 {
+            app.items.push(GridItem::Image(PathBuf::from(format!(
+                "c:/test/page-turn-{page}.jpg"
+            ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.visible_indices = (0..app.items.len()).collect();
+        app.open_fullscreen(0, crate::app::HistoryTrigger::UserChosen);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.reading_flow = ReadingFlow::Paged;
+        let ctx = egui::Context::default();
+        let mut painted = Vec::new();
+
+        for _ in 0..3 {
+            let idx = app.fullscreen_idx.expect("fullscreen page");
+            painted.push((idx, page_turn_materialization_for_inputs(true, true)));
+            let next = app.spread_page_nav(1);
+            assert_eq!(next, FsPageNav::Delta(1));
+            // Simulate the landing after this frame without entering the
+            // process-global Windows viewer routing used by open_fullscreen.
+            // The production resolver above is what proves the command is one
+            // page; this helper only advances the test's visible anchor.
+            app.seek_to_continuous_page(&ctx, idx + 1);
+        }
+        let stop_idx = app.fullscreen_idx.expect("stop page");
+        painted.push((stop_idx, page_turn_materialization_for_inputs(false, true)));
+
+        assert_eq!(
+            painted.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "quality coalescing must never combine N page turns in one frame"
+        );
+        assert!(
+            painted[..3]
+                .iter()
+                .all(|(_, mode)| { *mode == FsPageTurnMaterialization::ThumbnailPassThrough })
+        );
+        assert_eq!(
+            painted.last().map(|(_, mode)| *mode),
+            Some(FsPageTurnMaterialization::Materialize)
+        );
+    }
+
     /// Hovering a mouse across the image must not scroll continuous reading.
     /// `pointer.delta()` is non-zero for plain movement, so the frame gate has
     /// to require an actual drag from the mouse and admit a cumulative total
@@ -30730,6 +31021,7 @@ mod tests {
         let state = FsFrameState {
             is_video: false,
             original_preview_active: false,
+            page_turn_materialization: FsPageTurnMaterialization::Materialize,
             tex: None,
             thumb_tex: None,
             location_display: String::new(),
@@ -32137,6 +32429,7 @@ mod tests {
         let state = FsFrameState {
             is_video: false,
             original_preview_active: false,
+            page_turn_materialization: FsPageTurnMaterialization::Materialize,
             tex: None,
             thumb_tex: None,
             location_display: String::new(),

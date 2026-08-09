@@ -12,6 +12,7 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
 サブコマンド:
     summary             全イベントの件数とカテゴリ別 breakdown を表示
     latency             seq ごとに input → *.ready / *.paint のレイテンシを集計
+    page-turn           キーリピート中の通過/実体化ページ数と ready→ready 間隔を集計
     priority            可視サムネイルが未 decode のうちに非可視が先に処理された違反を検出
     dump <seq>          指定 seq に紐づく全イベントを時系列で列挙
     timeline [seq]      ガントチャート (matplotlib が必要)。seq 指定可
@@ -188,6 +189,113 @@ def cmd_latency(events: list[dict]) -> None:
     stats("fs.paint", fs_paint)
     stats("thumb.first_ready", thumb_first)
     stats("ai.job_ready", ai_ready)
+
+
+# -----------------------------------------------------------------------
+# page-turn
+# -----------------------------------------------------------------------
+
+def analyze_page_turn(events: list[dict]) -> dict:
+    """Group pass-through readiness events into keyboard-hold bursts.
+
+    Runtime coalescing never uses timestamps. Timestamps are used here only to
+    report the ready-to-ready intervals that were already recorded.
+    """
+    ready = sorted(
+        (
+            e for e in events
+            if e.get("cat") == "fs"
+            and e.get("kind") == "page_turn_ready"
+            and e.get("mode") in ("pass_through", "materialized")
+        ),
+        key=lambda e: float(e.get("t", 0.0)),
+    )
+    counts = {"pass_through": 0, "materialized": 0}
+    holds: list[dict] = []
+    active: list[dict] = []
+    active_generation = None
+
+    def finish(complete: bool) -> None:
+        nonlocal active, active_generation
+        if not active:
+            return
+        intervals_ms = [
+            (float(cur.get("t", 0.0)) - float(prev.get("t", 0.0))) * 1000.0
+            for prev, cur in zip(active, active[1:])
+        ]
+        holds.append({
+            "complete": complete,
+            "events": list(active),
+            "indices": [event.get("idx") for event in active],
+            "pass_through": sum(
+                event.get("mode") == "pass_through" for event in active
+            ),
+            "materialized": sum(
+                event.get("mode") == "materialized" for event in active
+            ),
+            "intervals_ms": intervals_ms,
+        })
+        active = []
+        active_generation = None
+
+    for event in ready:
+        mode = event["mode"]
+        counts[mode] += 1
+        generation = event.get("items_generation")
+        if active and generation != active_generation:
+            finish(False)
+        if mode == "pass_through":
+            if not active:
+                active_generation = generation
+            active.append(event)
+        elif active:
+            active.append(event)
+            finish(True)
+    finish(False)
+
+    return {
+        "counts": counts,
+        "holds": holds,
+        "intervals_ms": [
+            interval
+            for hold in holds
+            for interval in hold["intervals_ms"]
+        ],
+    }
+
+
+def cmd_page_turn(events: list[dict]) -> None:
+    report = analyze_page_turn(events)
+    counts = report["counts"]
+    print(
+        "page-turn ready: "
+        f"pass_through={counts['pass_through']} "
+        f"materialized={counts['materialized']}"
+    )
+    if not report["holds"]:
+        print("(pass_through を含むキーリピート区間なし)")
+        return
+
+    print()
+    print(f"{'hold':>4} {'status':<10} {'pass':>5} {'final':>5} {'indices':<24} ready→ready (ms)")
+    print("-" * 90)
+    for number, hold in enumerate(report["holds"], 1):
+        status = "complete" if hold["complete"] else "incomplete"
+        indices = ",".join(str(idx) for idx in hold["indices"])
+        intervals = ", ".join(f"{ms:.1f}" for ms in hold["intervals_ms"]) or "-"
+        print(
+            f"{number:>4} {status:<10} {hold['pass_through']:>5} "
+            f"{hold['materialized']:>5} {indices:<24} {intervals}"
+        )
+
+    intervals = report["intervals_ms"]
+    if intervals:
+        ordered = sorted(intervals)
+        print()
+        print(
+            f"ready→ready: n={len(ordered)} min={ordered[0]:.1f} "
+            f"p50={ordered[len(ordered) // 2]:.1f} max={ordered[-1]:.1f} ms"
+        )
 
 
 # -----------------------------------------------------------------------
@@ -1781,6 +1889,7 @@ def main() -> None:
     subs = parser.add_subparsers(dest="cmd", required=True)
     subs.add_parser("summary")
     subs.add_parser("latency")
+    subs.add_parser("page-turn")
     subs.add_parser("priority")
     subs.add_parser("thumbs")
     subs.add_parser("colorize")
@@ -1850,6 +1959,8 @@ def main() -> None:
         cmd_summary(events)
     elif args.cmd == "latency":
         cmd_latency(events)
+    elif args.cmd == "page-turn":
+        cmd_page_turn(events)
     elif args.cmd == "priority":
         cmd_priority(events)
     elif args.cmd == "thumbs":

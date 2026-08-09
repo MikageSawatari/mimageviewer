@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from analyze_perf import (
+    analyze_page_turn,
     analyze_idle_health,
     cmd_colorize,
     cmd_idle_health,
@@ -50,6 +51,51 @@ def thumb(t: float, kind: str, key: str) -> dict:
         "idx": 7,
         "items_gen": 2,
     }
+
+
+def page_turn(t: float, idx: int, mode: str, generation: int = 2) -> dict:
+    return {
+        "t": t,
+        "cat": "fs",
+        "kind": "page_turn_ready",
+        "idx": idx,
+        "items_generation": generation,
+        "mode": mode,
+    }
+
+
+class PageTurnTests(unittest.TestCase):
+    def test_groups_pass_pages_with_the_materialized_stop_page(self) -> None:
+        report = analyze_page_turn([
+            page_turn(1.000, 10, "pass_through"),
+            page_turn(1.034, 11, "pass_through"),
+            page_turn(1.069, 12, "pass_through"),
+            page_turn(1.105, 13, "materialized"),
+            page_turn(2.000, 20, "materialized"),
+        ])
+
+        self.assertEqual(
+            report["counts"],
+            {"pass_through": 3, "materialized": 2},
+        )
+        self.assertEqual(len(report["holds"]), 1)
+        hold = report["holds"][0]
+        self.assertTrue(hold["complete"])
+        self.assertEqual(hold["indices"], [10, 11, 12, 13])
+        self.assertEqual(hold["pass_through"], 3)
+        self.assertEqual(hold["materialized"], 1)
+        self.assertAlmostEqual(hold["intervals_ms"][0], 34.0)
+
+    def test_generation_change_closes_an_incomplete_hold(self) -> None:
+        report = analyze_page_turn([
+            page_turn(1.000, 4, "pass_through", generation=2),
+            page_turn(1.020, 0, "pass_through", generation=3),
+            page_turn(1.050, 1, "materialized", generation=3),
+        ])
+
+        self.assertEqual(len(report["holds"]), 2)
+        self.assertFalse(report["holds"][0]["complete"])
+        self.assertTrue(report["holds"][1]["complete"])
 
 
 class IdleHealthTests(unittest.TestCase):

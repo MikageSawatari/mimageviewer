@@ -824,6 +824,28 @@ AI 待ちの `complete=false` final composite も表示専用の候補である�
 表示はキャッシュ欠落を挟まず原子的に差し替わる。コピー / 書き出しと nav lock 解除は従来どおり
 `complete=true` だけを受け付ける。
 
+#### 単ページのキーリピート中だけ使う通過ページ分岐
+
+通常の単ページ表示では、上の優先順位へ入る前に
+`fs_page_turn_materialization_for_frame` が描画品質を決める。同じ描画先 viewport の Win32
+frame edge queue に未消費の `FsPagePrev` / `FsPageNext`、単ページへフォールバックする
+`FsSpreadShift*`、または固定矢印の前後ページ入力が残り、カタログサムネイルも Loaded のときだけ
+`ThumbnailPassThrough` になる。この判定に経過時間は使わない。同一 egui frame の再 pass は
+frame / items generation / idx が一致する一時 cache の値を読むだけで、入力を再消費しない。
+
+`ThumbnailPassThrough` は `resolve_fs_processed_texture` を呼ばず、カタログサムネイルをその idx の
+1 frame として描く。この frame は `ColorizeDisplayUnit` の旧ページ holdover も上に重ねない。
+重ねると `fs.paint` は出ても実際には通過 idx が見えず、「各ページを 1 frame 表示する」契約を
+破るためである。holdover 自体は保持し、停止ページの通常 materialize 待ちでは再び使う。
+`poll_prefetch` は decode 完了物を `fs_upload_backlog` まで受け取るが
+`ctx.load_texture` は行わず、`poll_final_effects` も完成結果を channel に残す。隣接ページの
+final-effect 先読み結果も、この frame に upload すれば同じ UI 予算を使うため一緒に保留する。
+入力が残らない最初の frame は即 `Materialize` へ戻り、通常の優先順位と backlog ペーシングで
+最終品質を作る。サムネイルが無ければ pending 入力中でも `Materialize` とし、従来の decode 待ちを
+保つ。これは品質作業だけの合流であり、ナビゲーションは従来どおり 1 frame 1 page、各 idx は
+最低 1 回 paint される。見開き、連結読み、ホイール、クリック、seek drag、ゲームパッド、
+スライドショー、編集・解析表示はこの分岐を使わない。
+
 `colorize_display_requires_final_effect(idx)` は、設定が有効かだけでなく、そのページで
 待たずに出せる画素と final-effect worker の出力が視覚的に変わるかを表す gate である。
 `AllImages` は常に gate する。`MonochromeOnly` の高速パスは色調補正が identity の場合だけ使い、

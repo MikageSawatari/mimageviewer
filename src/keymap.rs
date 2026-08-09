@@ -5924,6 +5924,34 @@ impl Keymap {
             .unwrap_or_else(|| action.default_chords().iter().collect())
     }
 
+    /// Evaluate effective chords without allocating the `Vec` returned by the
+    /// public settings/display helper. Pre-dispatch scheduling calls this on a
+    /// hot UI path, so it must stay a borrowed/default-list walk.
+    pub(crate) fn any_effective_chord(
+        &self,
+        action: KeyAction,
+        mut predicate: impl FnMut(Chord) -> bool,
+    ) -> bool {
+        match self.overrides.get(&action) {
+            Some(chords) => chords.iter().copied().any(predicate),
+            None => action.default_chords().iter().any(&mut predicate),
+        }
+    }
+
+    /// Return whether an unconsumed Win32 key-down edge for `chord` is still
+    /// present in this frame. This is deliberately read-only: callers that
+    /// choose rendering work before fullscreen dispatch may observe the input,
+    /// but the normal ownership boundary remains responsible for consuming it.
+    #[cfg(windows)]
+    pub(crate) fn pending_chord_press_in_frame(
+        &self,
+        viewport: egui::ViewportId,
+        chord: Chord,
+    ) -> bool {
+        chord.key_name().is_some()
+            && crate::key_input::pressed_key_down(viewport, |edge| chord.matches_key_edge(edge))
+    }
+
     pub fn first_chord_label(&self, action: KeyAction) -> Option<String> {
         self.effective_chords(action)
             .into_iter()
@@ -9542,6 +9570,38 @@ mod tests {
                 "{action:?}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_page_chord_query_is_read_only() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let right = key_edge(0x27, 0x4d, true, false, true);
+        crate::key_input::set_test_frame(vec![right, right]);
+        assert!(
+            keymap
+                .pending_chord_press_in_frame(egui::ViewportId::ROOT, Chord::key(KeyName::Right),)
+        );
+        assert!(crate::key_input::consume_key_down(
+            egui::ViewportId::ROOT,
+            true,
+            |edge| edge.virtual_key == 0x27,
+        ));
+        assert!(
+            keymap
+                .pending_chord_press_in_frame(egui::ViewportId::ROOT, Chord::key(KeyName::Right),)
+        );
+        assert!(crate::key_input::consume_key_down(
+            egui::ViewportId::ROOT,
+            true,
+            |edge| edge.virtual_key == 0x27,
+        ));
+        assert!(
+            !keymap
+                .pending_chord_press_in_frame(egui::ViewportId::ROOT, Chord::key(KeyName::Right),)
+        );
     }
 
     #[cfg(windows)]

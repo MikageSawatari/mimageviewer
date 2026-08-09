@@ -1116,6 +1116,18 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
      アップロードを 1 フレーム 1 枚のバックログへ回して 1 フレームに 2 回分を乗せない。
   4. **最終合成の先読み**: 次ページ分だけでも作れば、切り替えはテクスチャ差し替えで済む。
 - 規模 / 優先度: 1 = Medium / **P2**、2〜4 = Medium / P3。
+- 対策1 実装記録 (2026-08-09): 通常の単ページ表示で、描画準備より前に同じ viewport の
+  Win32 frame edge queue を読み取り、**そのフレームに未消費の前後ページ入力が残る**場合だけ
+  現在 idx を通過ページと判定する。時間閾値・キー押下開始時刻・前フレームからの pending 状態は
+  判定に使わない。同一 egui frame の再 pass は frame / items generation / idx 付きの一時 cache で
+  同じ判定を再生する。カタログサムネイルが Loaded の通過ページでは processed resolver、
+  `fs_upload_backlog` の upload、完成済み final-effect の upload を保留し、サムネイルを 1 frame
+  paint する。未消費入力が無い最初の frame は即 `Materialize` に戻り、保留結果を通常経路で
+  upload / 最終合成する。サムネイル未生成時は常に既存の materialize / decode 待ちを使う。
+  見開き、連結読み、ホイール、クリック、seek drag、ゲームパッド、スライドショーは対象外。
+  `fs.page_turn_ready` (`mode=pass_through|materialized`) と
+  `python scripts/analyze_perf.py <jsonl> page-turn` を追加した。対策2へ進む判断は、この対策1を
+  同じ実機条件で再計測し、通過/実体化枚数と ready→ready を確認してから行う。
 
 ### 1.59 360 度ビューに等距離魚眼投影を追加する (提案・採否判断が要る)
 
