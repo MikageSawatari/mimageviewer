@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ViewerGroupLoadOutcome } from "./command-core.mjs";
+import {
+  FOREGROUND_ADMISSION_RETRY_LIMIT,
+  ViewerGroupLoadOutcome,
+} from "./command-core.mjs";
 
 class FakeElement {
   constructor(tag = "div") {
@@ -2734,4 +2737,73 @@ test("standalone reload is local and preserves the current hash", () => {
   reloadApplication();
   assert.equal(reloadCalls, before + 1);
   assert.equal(testLocation.hash, "#image/C%3A%2Fmiv-test%2Fbook%2F002.jpg");
+});
+
+test("retained pages stay bounded even when the prefetch plan is empty", async () => {
+  // 1 ページだけのコンテナを順に開くと計画が空になり、pump() は開始枠が無いので
+  // 早期 return する。保持だけが増え続けないことを固定する。
+  const page = (size) => ({ blob: { size }, requestId: null, fetchMs: 1 });
+  const cache = new PageResourceCache(4, 10, 1, async () => page(4));
+  for (let index = 0; index < 6; index += 1) {
+    const request = { cacheKey: `single-${index}` };
+    await cache.loadForeground(request, undefined);
+    cache.schedule([], [request.cacheKey]);
+  }
+  assert.ok(cache.ready.size <= 4, `retained ${cache.ready.size} entries`);
+  assert.ok(cache.readyBytes <= 10 + 4, `retained ${cache.readyBytes} bytes`);
+  // 直前に表示したページは保護されているので残る。
+  assert.equal(cache.ready.has("single-5"), true);
+  cache.clear();
+});
+
+test("a displayed page retries a momentary admission refusal instead of failing", async () => {
+  const busy = () => {
+    const error = new Error("busy");
+    error.status = 503;
+    error.code = "ipc_busy";
+    error.retryAfterMs = 100;
+    return error;
+  };
+  let attempts = 0;
+  const cache = new PageResourceCache(4, 1024, 1, async () => {
+    attempts += 1;
+    if (attempts < 3) throw busy();
+    return { blob: { size: 1 }, requestId: "ok", fetchMs: 1 };
+  });
+  const resource = await cache.loadForeground({ cacheKey: "retry" }, undefined);
+  assert.equal(resource.requestId, "ok");
+  assert.equal(attempts, 3);
+  cache.clear();
+
+  let alwaysBusy = 0;
+  const givingUp = new PageResourceCache(4, 1024, 1, async () => {
+    alwaysBusy += 1;
+    throw busy();
+  });
+  await assert.rejects(
+    givingUp.loadForeground({ cacheKey: "give-up" }, undefined),
+    (error) => error.code === "ipc_busy"
+  );
+  // 無限に粘らない。
+  assert.equal(alwaysBusy, FOREGROUND_ADMISSION_RETRY_LIMIT + 1);
+  givingUp.clear();
+});
+
+test("a foreground admission retry stops when its own load is aborted", async () => {
+  const controller = new AbortController();
+  let attempts = 0;
+  const cache = new PageResourceCache(4, 1024, 1, async () => {
+    attempts += 1;
+    controller.abort();
+    const error = new Error("busy");
+    error.status = 503;
+    error.code = "ipc_busy";
+    throw error;
+  });
+  await assert.rejects(
+    cache.loadForeground({ cacheKey: "aborted" }, controller.signal),
+    (error) => error.code === "ipc_busy"
+  );
+  assert.equal(attempts, 1);
+  cache.clear();
 });

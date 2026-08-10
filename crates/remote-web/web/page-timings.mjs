@@ -70,6 +70,25 @@ export function appendPageTimingSample(history, presetId, sample) {
   };
 }
 
+export const PAGE_TIMING_COUNTED_MEMORY = 64;
+
+/// The same fetched resource can be displayed again (back/forward, fit change,
+/// resize). Counting it again would fill "the last N pages" with one blob.
+/// Mutates `countedIds`; returns whether this display is a new sample.
+export function shouldCountPageTiming(
+  countedIds,
+  requestId,
+  memory = PAGE_TIMING_COUNTED_MEMORY
+) {
+  if (typeof requestId !== "string" || !requestId) return true;
+  if (countedIds.has(requestId)) return false;
+  countedIds.add(requestId);
+  while (countedIds.size > Math.max(1, Math.floor(Number(memory) || 1))) {
+    countedIds.delete(countedIds.values().next().value);
+  }
+  return true;
+}
+
 export function averagePageTimings(history, presetId) {
   const samples = normalizePageTimingHistory(history).presets[presetId] ?? [];
   if (!samples.length) return null;

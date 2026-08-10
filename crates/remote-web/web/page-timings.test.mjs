@@ -10,6 +10,7 @@ import {
   loadPageTimingHistory,
   pageTimingSample,
   savePageTimingHistory,
+  shouldCountPageTiming,
 } from "./page-timings.mjs";
 
 test("page timing averages have no estimate for zero samples", () => {
@@ -99,4 +100,24 @@ test("page timing storage is separate, versioned, and failure-safe", () => {
   };
   assert.equal(loadPageTimingHistory(unavailable).storageAvailable, false);
   assert.equal(savePageTimingHistory(history, unavailable).saved, false);
+});
+
+test("re-displaying the same fetched page is not a new timing sample", () => {
+  const counted = new Set();
+  assert.equal(shouldCountPageTiming(counted, "req-1"), true);
+  // 戻る / fit 変更 / resize で同じ取得結果を出し直しても数えない。
+  assert.equal(shouldCountPageTiming(counted, "req-1"), false);
+  assert.equal(shouldCountPageTiming(counted, "req-2"), true);
+
+  // request ID が無いときは判定できないので、標本として通す。
+  assert.equal(shouldCountPageTiming(counted, null), true);
+  assert.equal(shouldCountPageTiming(counted, ""), true);
+
+  // 記憶は有界。古い ID から落ちる。
+  const bounded = new Set();
+  for (let index = 0; index < 5; index += 1) {
+    shouldCountPageTiming(bounded, `id-${index}`, 3);
+  }
+  assert.equal(bounded.size, 3);
+  assert.equal(shouldCountPageTiming(bounded, "id-0", 3), true);
 });

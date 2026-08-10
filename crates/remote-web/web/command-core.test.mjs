@@ -56,6 +56,7 @@ import {
   viewerTapZone,
   nextFitMode,
   pagePrefetchFailurePlan,
+  pageAdmissionRetryDelayMs,
   pagePrefetchBudgetAllowsStart,
   pagePrefetchPlan,
   pagePrefetchStartCount,
@@ -2747,4 +2748,15 @@ test("a pinch keeps the point between the fingers between the fingers", () => {
   assert.equal(still.scale, 2);
   assert.equal(still.panX, 40);
   assert.equal(still.panY, -20);
+});
+
+test("admission retry honours Retry-After and stays within a usable range", () => {
+  assert.equal(pageAdmissionRetryDelayMs(500, 0), 500);
+  // 助言が無ければ短い待ちから伸ばす。
+  assert.equal(pageAdmissionRetryDelayMs(null, 0), 250);
+  assert.equal(pageAdmissionRetryDelayMs(null, 1), 500);
+  // 表示待ちなので上限は短く、下限は無駄打ちしない程度に。
+  assert.equal(pageAdmissionRetryDelayMs(60_000, 0), 2000);
+  assert.equal(pageAdmissionRetryDelayMs(1, 0), 100);
+  assert.equal(pageAdmissionRetryDelayMs("bad", 0), 250);
 });

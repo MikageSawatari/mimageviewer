@@ -2403,6 +2403,19 @@ export function pageResourceAdmissionPlan({
   };
 }
 
+export const FOREGROUND_ADMISSION_RETRY_LIMIT = 3;
+
+/// A displayed page must not fail because the server was momentarily full. Honour
+/// Retry-After when the server sends one, otherwise back off from a short delay.
+export function pageAdmissionRetryDelayMs(retryAfterMs, attempt = 0) {
+  const advertised = Number(retryAfterMs);
+  const step = Math.max(0, Math.floor(Number(attempt) || 0));
+  const base = Number.isFinite(advertised) && advertised > 0
+    ? advertised
+    : 250 * 2 ** step;
+  return Math.max(100, Math.min(2000, Math.floor(base)));
+}
+
 export function pagePrefetchStartCount(activeCount, pendingCount, concurrencyLimit) {
   const limit = Math.max(1, Math.floor(Number(concurrencyLimit) || 1));
   const active = Math.max(0, Math.floor(Number(activeCount) || 0));

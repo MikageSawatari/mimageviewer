@@ -34,6 +34,8 @@ import {
   pageResponseGenerationAttestation,
   pageResponseIdentityAttestation,
   pagePrefetchFailurePlan,
+  FOREGROUND_ADMISSION_RETRY_LIMIT,
+  pageAdmissionRetryDelayMs,
   pagePrefetchBudgetAllowsStart,
   pagePrefetchPlan,
   pagePrefetchStartCount,
@@ -112,6 +114,7 @@ import {
   loadPageTimingHistory,
   pageTimingSample,
   savePageTimingHistory,
+  shouldCountPageTiming,
 } from "./page-timings.mjs";
 import { installDocumentDoubleTapOwner } from "./document-double-tap.mjs";
 import { VideoStreamViewer } from "./video-stream.mjs";
@@ -412,9 +415,30 @@ export class PageResourceCache {
       }
     }
     this.pending = this.pending.filter((item) => item.cacheKey !== request.cacheKey);
-    const resource = await this.fetchResource(request, signal, false);
+    const resource = await this.fetchForegroundResource(request, signal);
     this.remember(request.cacheKey, resource);
     return { ...resource, prefetchStatus: "miss" };
+  }
+
+  /// 表示するページを admission の一時的な満杯で失敗させない。見開きは 2 ページを
+  /// 同時に要求するので、先読みが枠を持っている瞬間に 2 枚目だけ弾かれ得る。
+  async fetchForegroundResource(request, signal) {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.fetchResource(request, signal, false);
+      } catch (error) {
+        if (
+          attempt >= FOREGROUND_ADMISSION_RETRY_LIMIT ||
+          signal?.aborted ||
+          error?.status !== 503 ||
+          error?.code !== "ipc_busy"
+        ) throw error;
+        await delayWithAbort(
+          pageAdmissionRetryDelayMs(error?.retryAfterMs, attempt),
+          signal
+        );
+      }
+    }
   }
 
   schedule(requests, visibleKeys = []) {
@@ -558,6 +582,30 @@ export class PageResourceCache {
     this.ready.delete(key);
     this.ready.set(key, resource);
     this.readyBytes += resource.blob.size;
+    this.trimUnprotected();
+  }
+
+  /// 予算は「開始の門」だが、保持そのものは常に有界でなければならない。`pump()` は
+  /// 開始枠が無いと破棄まで到達しないので (1 ページだけのコンテナを順に開くと計画が
+  /// 空で毎回そこで返る)、保持を増やした側でも保護集合の外を削る。
+  trimUnprotected() {
+    if (
+      this.ready.size <= this.limit &&
+      pagePrefetchBudgetAllowsStart(this.readyBytes, this.byteLimit)
+    ) {
+      return;
+    }
+    const admission = pageResourceAdmissionPlan({
+      entries: [...this.ready].map(([key, resource]) => ({
+        key,
+        bytes: resource.blob.size,
+      })),
+      protectedKeys: this.protectedKeys(),
+      limit: this.limit,
+      byteLimit: this.byteLimit,
+      retainedBytes: this.readyBytes,
+    });
+    for (const key of admission.evictKeys) this.deleteReady(key);
   }
 
   protectedKeys() {
@@ -610,11 +658,34 @@ function abortError() {
   return error;
 }
 
+function delayWithAbort(delayMs, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, delayMs);
+    function abort() {
+      clearTimeout(timer);
+      reject(abortError());
+    }
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
 const thumbnailRequestLimiter = new RequestLimiter(THUMBNAIL_MAX_CONCURRENCY);
 const pageResourceCache = new PageResourceCache();
 
+const countedPageTimingRequestIds = new Set();
+
 function recordSuccessfulPageTiming(request, resource, decodeMs) {
   if (!request?.imageQualityPresetId) return;
+  if (!shouldCountPageTiming(countedPageTimingRequestIds, resource?.requestId)) {
+    return;
+  }
   const sample = pageTimingSample({
     totalFetchMs: resource?.fetchMs,
     generationMs: resource?.pageRenderMs,
