@@ -59,8 +59,8 @@ wipe/diffのcallback resourceは現在の比較組（pinned/currentの2枚）だ
 比較準備のCPU payloadも描画経路別に分け、Windowsのwipe/diffはshader入力のRGBA 2枚、
 PinnedNormalはpinned 1枚、CPU fallbackのwipeは2枚、diffは差分1枚だけを保持する。
 途中cancel不能なcompare workerは`Preparing` / `Draining`で1本に直列化し、失効後も完了を回収するまで
-次を開始しない。見開き表示中は左右ページと画面同率の中央gapを先に1枚へ合成し、その完成canvasが
-一辺8192pxを超える場合だけ全体を等比縮小する。8192px以内のcanvasは画素を変更しない。
+次を開始しない。比較は単ページ表示だけで利用し、見開きへ移行した時点で終了する。単ページは通常の
+decode上限で一辺8192px以内だが、比較workerの等比縮小とtexture作成直前の上限検査はbackstopとして残す。
 画面解像度で描く360度パノラマのsettle overlayは1 mipのままとする。
 360度パノラマは水平フル/垂直cropではU方向Repeat、水平cropではU方向ClampToEdgeの
 bind groupを選び、低LODで部分画像の反対端が混ざらないようにする。

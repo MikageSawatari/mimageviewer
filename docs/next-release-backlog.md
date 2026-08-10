@@ -1263,9 +1263,10 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   見ず、状態が残っていれば通常ページ unit を同じ frame へ追加できた。
   `CompareFramePrimaryDraw::{OrdinaryOnly, PreparedCompareOnly}` を primary 描画の単一 decision とし、
   current に一致する `Ready` のときだけ比較を描く。それ以外は通常ページだけを描き、比較を描いた
-  フレームでは後段の nav / colorize holdover も重ねない。単ページ・見開きの両経路を同じ decision
-  に通し、準備中 / 準備完了 / 比較 OFF の排他を単体テストで固定した。
-- 見開き比較の寸法上限・確保量対策 (2026-08-10、実機確認待ち): 実機の最大canvas
+  フレームでは後段の nav / colorize holdover も重ねない。当初は単ページ・見開きの両経路を同じ
+  decision に通したが、後述の最終判断で見開き比較経路は撤去した。単ページ側の準備中 / 準備完了 /
+  比較 OFF の排他は単体テストで固定している。
+- 見開き比較の調査・scope cut (2026-08-10): 実機の最大canvas
   `8320x7296` は、egui-wgpuのdevice descriptorとアプリ共通の`MAX_TEXTURE_DIM=8192`を幅で超えていた。
   当初はpanicの`Out of Memory`表示と確保量からメモリ不足と読んだが、利用者環境はRAM 128GB / VRAM
   24GBであり、この読みは可能性が低い。上限を超えたtexture作成要求を真因として扱う。
@@ -1275,10 +1276,13 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   - ページ移動で旧receiverを捨てて次の途中cancel不能workerを並走できた経路を、
     `Preparing` / `Draining`の単一ownerへ直列化した。旧CPU pairとcallback GPU pairを次worker開始前に
     解放し、`[compare-memory]`へtarget、CPU/GPU合計bytes、buffer/texture数、mip有無、解放順を出す。
-  - 利用者判断を更新し、見開きは現在ページ1枚へ縮退せず左右ページ全体を比較する。直近の
-    `FullscreenPageLayout`からページ幅に対する中央gap比率を取り、左・黒gap・右の順に合成する。
-    合成後canvasが一辺8192を超える場合だけ全体をLanczos等比縮小する。`8320x7296`は`8192x7184`。
-    上限内は画素を変更しない。独自WGPU texture作成直前の8192 guardもbackstopとして維持する。
+  - 最終利用者判断: 見開き比較は対象外とし、比較は単ページ表示だけで利用する。中央gap欠落、8192超過、
+    別の見開きへ移動したときの本文/ナビゲータ不一致とlayout未確定の3系統が同日に確認され、layout
+    timingへ追加patchを重ねず機能境界を引く。見開き中のX/C/Shift+C/Alt+Cは単ページへの切替を案内し、
+    比較中に見開きへ移行した場合はフレーム先頭で比較を終了する。見開きprimaryから比較準備・描画を
+    削除し、中央gap再現と見開き比較canvasも撤去する。
+  - 単ページは通常8192以内だが、比較workerの等比縮小と独自WGPU texture作成直前の8192 guardは
+    将来の別入口に対するbackstopとして維持する。typed payload、旧pairの先行解放、worker直列化も維持する。
 - Wipe線の表示条件・端点更新 (2026-08-10、利用者決定): 白線はポインタが比較画像をhover中だけ表示し、
   画像外では隠す。touchはhoverが無いため静止画touch chrome latch中も表示する。線位置、CPU clip、
   GPU uniformをすべて`0.0..=1.0`へ統一し、5%/95%制限を除いて左右端までドラッグ可能にした。

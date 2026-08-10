@@ -4049,14 +4049,12 @@ pub(crate) struct ComparePrepareResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ComparePrepareScope {
     SinglePage,
-    Spread,
 }
 
 impl ComparePrepareScope {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::SinglePage => "single-page",
-            Self::Spread => "spread",
         }
     }
 }

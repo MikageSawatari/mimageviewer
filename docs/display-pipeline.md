@@ -1017,19 +1017,19 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 `WaitingForSource` / `Preparing` / `Draining` と別ページの `Ready` は通常ページだけを描く。準備中に raw pinned
 texture や Wipe の切れ端を通常ページへ重ねず、準備済み比較を描いた後も nav / colorize holdover を
 重ねない。
+比較を準備・描画できるのは `SpreadMode::Single` の単ページ表示だけとする。X / C / Shift+C / Alt+C
+の全入口は見開き表示モードで案内toastを表示して状態を変更しない。表紙が1枚だけ見える瞬間も
+layout結果ではなく表示モードで拒否する。ページ移動や表示モード変更で比較中に見開き表示モードへ
+入った場合は、フレーム先頭で比較を終了してから通常の見開きを描く。
+見開き側の primary 分岐には比較準備・比較描画を置かない。
 比較キャンバスの寸法は current 側の完成画像寸法を正本とし、縦横比が違う pinned 側は等比縮小して
 中央配置する。このとき pinned の範囲外はフルスクリーン viewport の既定背景と同じ不透明な黒で
 埋め、WGPU の alpha blend と CPU fallback のどちらでも下層の current を透過させない。Diff は
 この黒背景と current の画素差を表示するため、current が黒でない余白は「差あり」として見える。
-見開き表示中は左右ページを画面上の順に並べ、実描画された左右ページ幅に対する中央 gap の比率を
-`FullscreenPageLayout` から取得して、不透明な黒の gap を挟んだ見開き全体を比較キャンバスにする。
-ページ切替直後など直近レイアウトのページ組が一致しないフレームは古い比率を流用せず、通常表示で
-配置が確定するまで `WaitingForSource` と同じく準備を待つ。
-比較キャンバスは縦横とも `MAX_TEXTURE_DIM = 8192` 以下にする。左右ページと gap を先に合成し、
-完成キャンバスのどちらか一辺が上限を超える場合だけ、全体を Lanczos で等比縮小して準備する。
-`8320x7296` なら `8192x7184` となり、gap も画像と同率で縮む。上限内のキャンバスは寸法も画素も
-変更しない。独自 WGPU upload は同じ判定を texture 作成の直前にも通し、normal path 以外の入口が
-増えても上限超過の texture を作らない。
+単ページ画像は decode 時点で `MAX_TEXTURE_DIM = 8192` 以下だが、比較workerも完成キャンバスが上限を
+超えた場合は全体を Lanczos で等比縮小する backstop を持つ。上限内は寸法も画素も変更しない。
+独自 WGPU upload も同じ判定を texture 作成の直前に通し、別入口が増えても上限超過の texture を
+作らない。
 比較準備workerは同時に1本だけ所有し、失効した途中cancel不能workerは`Draining`で
 完了を回収してから次要求を開始する。描画方式ごとのtyped CPU payloadにより、WindowsのWipe / Diffは
 pinned/current RGBA 2枚だけを保持し、Diff用CPU画像 / managed textureはCPU fallbackのDiff時だけ作る。

@@ -92,7 +92,6 @@ pub enum CapturePixelWork {
     Spread {
         basename: String,
         left: CapturePixelJob,
-        gap_width: u32,
         right: CapturePixelJob,
     },
 }
@@ -142,62 +141,8 @@ impl CapturePixelJob {
         });
         Ok(rotated_size(cropped, self.rotation))
     }
-}
-
-impl CapturePixelWork {
-    /// 画面上の gap 比率から、左右ページと中央 gap を持つ見開き work を作る。
-    pub(crate) fn spread_with_displayed_gap(
-        basename: String,
-        left: CapturePixelJob,
-        right: CapturePixelJob,
-        gap_to_page_width_ratio: f64,
-    ) -> Result<Self, String> {
-        let [left_width, _] = left.output_size()?;
-        let [right_width, _] = right.output_size()?;
-        let page_width = left_width
-            .checked_add(right_width)
-            .ok_or_else(|| "見開きキャプチャの幅が大きすぎます".to_string())?;
-        if !gap_to_page_width_ratio.is_finite() || gap_to_page_width_ratio < 0.0 {
-            return Err("見開きキャプチャの中央間隔が不正です".to_string());
-        }
-        let gap_width = (page_width as f64 * gap_to_page_width_ratio).round();
-        if gap_width > u32::MAX as f64 {
-            return Err("見開きキャプチャの中央間隔が大きすぎます".to_string());
-        }
-        Ok(Self::Spread {
-            basename,
-            left,
-            gap_width: gap_width as u32,
-            right,
-        })
-    }
-
-    /// `run_pixel_work` の出力キャンバス寸法。Spread は左右と中央 gap の union。
-    pub(crate) fn output_size(&self) -> Result<[usize; 2], String> {
-        match self {
-            Self::Single(job) => job.output_size(),
-            Self::Spread {
-                left,
-                gap_width,
-                right,
-                ..
-            } => {
-                let [left_width, left_height] = left.output_size()?;
-                let [right_width, right_height] = right.output_size()?;
-                let width = left_width
-                    .checked_add(*gap_width as usize)
-                    .and_then(|width| width.checked_add(right_width))
-                    .ok_or_else(|| "見開きキャプチャの幅が大きすぎます".to_string())?;
-                Ok([width, left_height.max(right_height)])
-            }
-        }
-    }
 
     /// 比較用 texture として公開できる出力キャンバス寸法。
-    ///
-    /// 保存用 capture は GPU texture ではないため大きな出力も許すが、比較は同じ画素を
-    /// `egui` / `wgpu` texture にする。合成後キャンバス全体を device descriptor と
-    /// 同じ上限へ収める寸法を worker 開始前にも同じ規則で求める。
     pub(crate) fn compare_output_size(&self) -> Result<[usize; 2], String> {
         fit_compare_canvas_size(self.output_size()?)
     }
@@ -540,24 +485,21 @@ pub fn run_pixel_work(work: CapturePixelWork) -> Result<(String, u32, u32, Vec<u
         CapturePixelWork::Spread {
             basename,
             left,
-            gap_width,
             right,
         } => {
             let (_, left_w, left_h, left_rgba) = run_pixel_job(left)?;
             let (_, right_w, right_h, right_rgba) = run_pixel_job(right)?;
             combine_spread_rgba(
-                basename, left_w, left_h, left_rgba, gap_width, right_w, right_h, right_rgba,
+                basename, left_w, left_h, left_rgba, right_w, right_h, right_rgba,
             )
         }
     }
 }
 
-/// 比較経路の最終キャンバスを作る。見開きなら中央 gap まで合成してから、必要な場合だけ
-/// キャンバス全体を texture 上限内へ等比縮小する。
-pub fn run_compare_pixel_work(
-    work: CapturePixelWork,
-) -> Result<(String, u32, u32, Vec<u8>), String> {
-    let (basename, width, height, rgba) = run_pixel_work(work)?;
+/// 比較経路の最終キャンバスを、必要な場合だけ texture 上限内へ等比縮小する。
+/// 通常は decode 時点で上限内だが、別入口が増えても上限超過を公開しないための backstop。
+pub fn run_compare_pixel_job(job: CapturePixelJob) -> Result<(String, u32, u32, Vec<u8>), String> {
+    let (basename, width, height, rgba) = run_pixel_job(job)?;
     let target = fit_compare_canvas_size([width as usize, height as usize])?;
     if target == [width as usize, height as usize] {
         return Ok((basename, width, height, rgba));
@@ -583,7 +525,6 @@ fn combine_spread_rgba(
     left_w: u32,
     left_h: u32,
     left_rgba: Vec<u8>,
-    gap_width: u32,
     right_w: u32,
     right_h: u32,
     right_rgba: Vec<u8>,
@@ -598,8 +539,7 @@ fn combine_spread_rgba(
     }
 
     let width = left_w
-        .checked_add(gap_width)
-        .and_then(|width| width.checked_add(right_w))
+        .checked_add(right_w)
         .ok_or_else(|| "見開きキャプチャの幅が大きすぎます".to_string())?;
     let height = left_h.max(right_h);
     let len = width
@@ -608,18 +548,11 @@ fn combine_spread_rgba(
         .ok_or_else(|| "見開きキャプチャの画像が大きすぎます".to_string())? as usize;
     let mut out = vec![0_u8; len];
     blit_centered(&mut out, width, height, 0, left_w, left_h, &left_rgba);
-    for y in 0..height as usize {
-        let gap_start = (y * width as usize + left_w as usize) * 4;
-        let gap_end = gap_start + gap_width as usize * 4;
-        for pixel in out[gap_start..gap_end].chunks_exact_mut(4) {
-            pixel.copy_from_slice(&[0, 0, 0, 255]);
-        }
-    }
     blit_centered(
         &mut out,
         width,
         height,
-        left_w + gap_width,
+        left_w,
         right_w,
         right_h,
         &right_rgba,
@@ -1035,7 +968,6 @@ mod tests {
             basename: "spread".to_string(),
             left: CapturePixelJob::already_adjusted("left".to_string(), Arc::new(left))
                 .with_conceal(Arc::new(vec![true]), preset),
-            gap_width: 0,
             right: CapturePixelJob::already_adjusted("right".to_string(), Arc::new(right)),
         };
 
@@ -1053,7 +985,6 @@ mod tests {
         let work = CapturePixelWork::Spread {
             basename: "spread".to_string(),
             left: CapturePixelJob::already_adjusted("left".to_string(), Arc::new(left)),
-            gap_width: 0,
             right: CapturePixelJob::already_adjusted("right".to_string(), Arc::new(right)),
         };
 
@@ -1068,26 +999,6 @@ mod tests {
         assert_eq!(&rgba[12..16], &[255, 0, 0, 255]);
         assert_eq!(&rgba[16..20], &[0, 0, 0, 0]);
         assert_eq!(&rgba[20..24], &[0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn spread_composite_reproduces_displayed_gap_proportion() {
-        let left = egui::ColorImage::filled([2, 1], egui::Color32::RED);
-        let right = egui::ColorImage::filled([3, 1], egui::Color32::GREEN);
-        let work = CapturePixelWork::spread_with_displayed_gap(
-            "spread-gap".to_string(),
-            CapturePixelJob::already_adjusted("left".to_string(), Arc::new(left)),
-            CapturePixelJob::already_adjusted("right".to_string(), Arc::new(right)),
-            0.4,
-        )
-        .unwrap();
-
-        let (_basename, width, height, rgba) = run_pixel_work(work).unwrap();
-
-        assert_eq!((width, height), (7, 1));
-        let gap_width = width - 2 - 3;
-        assert!((gap_width as f64 / (2 + 3) as f64 - 0.4).abs() < f64::EPSILON);
-        assert_eq!(&rgba[2 * 4..4 * 4], &[0, 0, 0, 255, 0, 0, 0, 255]);
     }
 
     #[test]
@@ -1106,7 +1017,6 @@ mod tests {
                     max_y: 4.0,
                 })
                 .with_rotation(Rotation::Cw90),
-            gap_width: 0,
             right: CapturePixelJob::already_adjusted("right".to_string(), Arc::new(right))
                 .with_crop(crate::export_crop::CropRect {
                     min_x: 0.0,
@@ -1116,26 +1026,18 @@ mod tests {
                 }),
         };
 
-        assert_eq!(work.output_size().unwrap(), [9, 3]);
         let (_basename, width, height, _rgba) = run_pixel_work(work).unwrap();
         assert_eq!([width as usize, height as usize], [9, 3]);
     }
 
     #[test]
-    fn compare_spread_composes_gap_before_fitting_to_texture_limit() {
-        let left = egui::ColorImage::filled([4096, 1], egui::Color32::RED);
-        let right = egui::ColorImage::filled([4096, 1], egui::Color32::GREEN);
-        let work = CapturePixelWork::spread_with_displayed_gap(
-            "over-limit-spread".to_string(),
-            CapturePixelJob::already_adjusted("left".to_string(), Arc::new(left)),
-            CapturePixelJob::already_adjusted("right".to_string(), Arc::new(right)),
-            128.0 / 8192.0,
-        )
-        .unwrap();
+    fn compare_canvas_backstop_scales_over_texture_limit() {
+        let over_limit = egui::ColorImage::filled([8320, 1], egui::Color32::RED);
+        let job = CapturePixelJob::already_adjusted("over-limit".to_string(), Arc::new(over_limit));
 
-        assert_eq!(work.output_size().unwrap(), [8320, 1]);
-        assert_eq!(work.compare_output_size().unwrap(), [8192, 1]);
-        let (_basename, width, height, rgba) = run_compare_pixel_work(work).unwrap();
+        assert_eq!(job.output_size().unwrap(), [8320, 1]);
+        assert_eq!(job.compare_output_size().unwrap(), [8192, 1]);
+        let (_basename, width, height, rgba) = run_compare_pixel_job(job).unwrap();
         assert_eq!((width, height), (8192, 1));
         assert_eq!(rgba.len(), 8192 * 4);
         assert_eq!(fit_compare_canvas_size([8320, 7296]).unwrap(), [8192, 7184]);
@@ -1152,13 +1054,10 @@ mod tests {
             vec![egui::Color32::RED, egui::Color32::from_rgb(1, 2, 3)],
         );
         let expected = color_image_to_rgba(&source);
-        let work = CapturePixelWork::Single(CapturePixelJob::already_adjusted(
-            "under-limit".to_string(),
-            Arc::new(source),
-        ));
+        let job = CapturePixelJob::already_adjusted("under-limit".to_string(), Arc::new(source));
 
-        assert_eq!(work.compare_output_size().unwrap(), [2, 1]);
-        let (_basename, width, height, rgba) = run_compare_pixel_work(work).unwrap();
+        assert_eq!(job.compare_output_size().unwrap(), [2, 1]);
+        let (_basename, width, height, rgba) = run_compare_pixel_job(job).unwrap();
         assert_eq!((width, height), (2, 1));
         assert_eq!(rgba, expected);
     }

@@ -52,6 +52,8 @@ use crate::ui_helpers::{HoverTipExt, open_external_player};
 const COMPARE_INDICATOR_MAX_WIDTH: u32 = 72;
 const COMPARE_INDICATOR_MAX_HEIGHT: u32 = 54;
 const COMPARE_WIPE_GRAB_HALF_WIDTH: f32 = 14.0;
+const COMPARE_SPREAD_UNAVAILABLE_MESSAGE: &str =
+    "見開き表示では比較できません。単ページ表示に切り替えてください";
 // Tuned on real hardware to avoid a brief status flash on normal page turns.
 const COLORIZE_WAIT_INDICATOR_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 const FS_NAVIGATOR_HEADER_HEIGHT: f32 = 26.0;
@@ -2312,20 +2314,21 @@ enum CapturePixelJobPreparation {
     Ready(crate::capture::CapturePixelJob),
 }
 
-enum ComparePixelWorkPreparation {
+enum CompareCurrentJobPreparation {
     WaitingForSource,
     Ready {
-        work: crate::capture::CapturePixelWork,
+        job: crate::capture::CapturePixelJob,
         scope: crate::app::ComparePrepareScope,
         source_indices: Vec<usize>,
     },
 }
 
-fn compare_prepare_scope(pair: SpreadPair) -> crate::app::ComparePrepareScope {
-    match pair {
-        SpreadPair::Single => crate::app::ComparePrepareScope::SinglePage,
-        SpreadPair::Double { .. } => crate::app::ComparePrepareScope::Spread,
-    }
+fn comparison_available_for_spread_mode(spread_mode: SpreadMode) -> bool {
+    !spread_mode.is_spread()
+}
+
+fn comparison_should_end_for_spread_mode(spread_mode: SpreadMode, comparison_active: bool) -> bool {
+    comparison_active && !comparison_available_for_spread_mode(spread_mode)
 }
 
 fn compare_source_size_matches_canonical(
@@ -10840,6 +10843,9 @@ impl App {
         //  毎フレーム 3〜4 回呼ばれるのを避ける)
         let spread_pair = self.resolve_spread_pair(fs_idx);
         let is_spread_double = matches!(spread_pair, SpreadPair::Double { .. });
+        // 比較は単ページ表示だけが所有する。ページ移動や表示モード変更で見開きが
+        // 確定したフレームでは、比較用の準備・描画へ進む前に状態を終了する。
+        self.end_comparison_for_spread_mode_if_needed();
         // 見開きパートナーの事前読み込み + アニメーション進行
         if let SpreadPair::Double { left, right } = spread_pair {
             let partner = if left == fs_idx { right } else { left };
@@ -11839,44 +11845,16 @@ impl App {
                                     } // else (= !panorama_painted) ブロック終端
                                 }
                                 SpreadPair::Double { left, right } => {
-                                    let compare_mode = self.compare_view_mode;
-                                    let zoom_pan = self.fs_zoom_pan();
-                                    let compare_requested = !matches!(
-                                        compare_mode,
-                                        crate::app::CompareViewMode::Off
+                                    navigator_texture_sources = self.draw_fs_spread(
+                                        ui,
+                                        ctx,
+                                        image_rect,
+                                        left,
+                                        right,
+                                        state.original_preview_active,
+                                        state.page_turn_materialization,
+                                        None,
                                     );
-                                    if compare_requested {
-                                        self.ensure_compare_prepared_pair(ctx, fs_idx);
-                                    }
-                                    let requested_draw = CompareFramePrimaryDraw::resolve(
-                                        compare_requested,
-                                        self.compare_prepared_pair_matches(fs_idx),
-                                    );
-                                    let prepared_compare_drawn = requested_draw
-                                        .draws_prepared_compare()
-                                        && self.draw_compare_prepared_mode(
-                                            ui,
-                                            ctx,
-                                            image_rect,
-                                            fs_idx,
-                                            compare_mode,
-                                            zoom_pan,
-                                        );
-                                    if prepared_compare_drawn {
-                                        primary_draw = CompareFramePrimaryDraw::PreparedCompareOnly;
-                                    } else {
-                                        // 単ページと同じ排他契約。準備中の見開きも通常表示だけ。
-                                        navigator_texture_sources = self.draw_fs_spread(
-                                            ui,
-                                            ctx,
-                                            image_rect,
-                                            left,
-                                            right,
-                                            state.original_preview_active,
-                                            state.page_turn_materialization,
-                                            None,
-                                        );
-                                    }
                                 }
                             }
                         }
@@ -22674,59 +22652,23 @@ impl App {
         Ok(CapturePixelJobPreparation::Ready(job))
     }
 
-    fn prepare_compare_pixel_work(
+    fn prepare_compare_current_job(
         &mut self,
         ctx: &egui::Context,
         idx: usize,
-    ) -> Result<ComparePixelWorkPreparation, String> {
-        let pair = self.resolve_visible_spread_pair(idx);
-        let scope = compare_prepare_scope(pair);
-        match pair {
-            SpreadPair::Single => match self.prepare_compare_pixel_job(ctx, idx)? {
-                CapturePixelJobPreparation::WaitingForSource => {
-                    Ok(ComparePixelWorkPreparation::WaitingForSource)
-                }
-                CapturePixelJobPreparation::Ready(job) => Ok(ComparePixelWorkPreparation::Ready {
-                    work: crate::capture::CapturePixelWork::Single(job),
-                    scope,
-                    source_indices: vec![idx],
-                }),
-            },
-            SpreadPair::Double { left, right } => {
-                // gap は設定値の絶対 pixel 数ではなく、直近フレームで実際に描画された
-                // 左右ページ幅に対する比率を使う。ページ切替直後などレイアウトが古い場合は
-                // 通常表示で新しい配置が確定するまで待つ。
-                let Some(gap_ratio) = self
-                    .fullscreen_page_layout
-                    .spread_gap_to_page_width_ratio(left, right)
-                else {
-                    return Ok(ComparePixelWorkPreparation::WaitingForSource);
-                };
-                let left_job = match self.prepare_compare_pixel_job(ctx, left)? {
-                    CapturePixelJobPreparation::WaitingForSource => {
-                        return Ok(ComparePixelWorkPreparation::WaitingForSource);
-                    }
-                    CapturePixelJobPreparation::Ready(job) => job,
-                };
-                let right_job = match self.prepare_compare_pixel_job(ctx, right)? {
-                    CapturePixelJobPreparation::WaitingForSource => {
-                        return Ok(ComparePixelWorkPreparation::WaitingForSource);
-                    }
-                    CapturePixelJobPreparation::Ready(job) => job,
-                };
-                let basename = crate::capture::basename_from_text(&format!(
-                    "{}_{}",
-                    left_job.basename, right_job.basename
-                ));
-                let work = crate::capture::CapturePixelWork::spread_with_displayed_gap(
-                    basename, left_job, right_job, gap_ratio,
-                )?;
-                Ok(ComparePixelWorkPreparation::Ready {
-                    work,
-                    scope,
-                    source_indices: vec![left, right],
-                })
+    ) -> Result<CompareCurrentJobPreparation, String> {
+        if !comparison_available_for_spread_mode(self.spread_mode) {
+            return Err(COMPARE_SPREAD_UNAVAILABLE_MESSAGE.to_string());
+        }
+        match self.prepare_compare_pixel_job(ctx, idx)? {
+            CapturePixelJobPreparation::WaitingForSource => {
+                Ok(CompareCurrentJobPreparation::WaitingForSource)
             }
+            CapturePixelJobPreparation::Ready(job) => Ok(CompareCurrentJobPreparation::Ready {
+                job,
+                scope: crate::app::ComparePrepareScope::SinglePage,
+                source_indices: vec![idx],
+            }),
         }
     }
 
@@ -22762,14 +22704,14 @@ impl App {
         let pinned_source_idx = slot.source_idx;
         let pinned_size = slot.source_size;
         let pinned_pixels = Arc::clone(&slot.pixels);
-        let (current_work, scope, source_indices) =
-            match self.prepare_compare_pixel_work(ctx, fs_idx) {
-                Ok(ComparePixelWorkPreparation::Ready {
-                    work,
+        let (current_job, scope, source_indices) =
+            match self.prepare_compare_current_job(ctx, fs_idx) {
+                Ok(CompareCurrentJobPreparation::Ready {
+                    job,
                     scope,
                     source_indices,
-                }) => (work, scope, source_indices),
-                Ok(ComparePixelWorkPreparation::WaitingForSource) => {
+                }) => (job, scope, source_indices),
+                Ok(CompareCurrentJobPreparation::WaitingForSource) => {
                     let already_waiting = matches!(
                         self.compare_preparation,
                         crate::app::ComparePreparationState::WaitingForSource(waiting)
@@ -22791,7 +22733,7 @@ impl App {
                     return false;
                 }
             };
-        let expected_target_size = match current_work.compare_output_size() {
+        let expected_target_size = match current_job.compare_output_size() {
             Ok(size) => size,
             Err(err) => {
                 self.deactivate_compare_view();
@@ -22818,7 +22760,7 @@ impl App {
         let thread = std::thread::Builder::new()
             .name("compare-prepare".into())
             .spawn(move || {
-                let result = crate::capture::run_compare_pixel_work(current_work).and_then(
+                let result = crate::capture::run_compare_pixel_job(current_job).and_then(
                     |(_basename, width, height, current_rgba)| {
                         let pinned_source_rgba =
                             crate::capture::color_image_to_rgba(pinned_pixels.as_ref());
@@ -27033,7 +26975,37 @@ impl App {
         }
     }
 
+    fn reject_compare_action_in_spread(&mut self, fs_idx: usize) -> bool {
+        if self.fullscreen_idx != Some(fs_idx)
+            || comparison_available_for_spread_mode(self.spread_mode)
+        {
+            return false;
+        }
+        self.show_feedback_toast(COMPARE_SPREAD_UNAVAILABLE_MESSAGE.to_string());
+        true
+    }
+
+    fn end_comparison_for_spread_mode_if_needed(&mut self) {
+        if comparison_should_end_for_spread_mode(
+            self.spread_mode,
+            !matches!(self.compare_view_mode, crate::app::CompareViewMode::Off),
+        ) {
+            self.deactivate_compare_view();
+        }
+    }
+
+    fn clear_compare_pin(&mut self, ctx: &egui::Context) {
+        self.pinned_compare_slot = None;
+        self.compare_pin_load_pending = None;
+        self.deactivate_compare_view();
+        self.show_feedback_toast("比較画像を解除しました".to_string());
+        ctx.request_repaint();
+    }
+
     pub(crate) fn toggle_compare_pin_from_current(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.reject_compare_action_in_spread(fs_idx) {
+            return;
+        }
         if self.compare_pin_pending.is_some() {
             self.show_feedback_toast("比較画像を準備中です".to_string());
             return;
@@ -27044,46 +27016,42 @@ impl App {
             .as_ref()
             .is_some_and(|slot| slot.source_idx == fs_idx)
         {
-            self.pinned_compare_slot = None;
-            self.compare_pin_load_pending = None;
-            self.deactivate_compare_view();
-            self.show_feedback_toast("比較画像を解除しました".to_string());
-            ctx.request_repaint();
+            self.clear_compare_pin(ctx);
             return;
         }
 
-        let work = match self.prepare_capture_pixel_work(ctx, fs_idx) {
-            Ok(work) => work,
+        let job = match self.prepare_capture_pixel_job(ctx, fs_idx) {
+            Ok(job) => job,
             Err(err) => {
                 self.show_feedback_toast(err);
                 return;
             }
         };
-        self.start_compare_pin_work(ctx, fs_idx, work);
+        self.start_compare_pin_job(ctx, fs_idx, job);
     }
 
     pub(crate) fn start_compare_pin_single(&mut self, ctx: &egui::Context, idx: usize) {
-        let work = match self.prepare_capture_pixel_job(ctx, idx) {
-            Ok(job) => crate::capture::CapturePixelWork::Single(job),
+        let job = match self.prepare_capture_pixel_job(ctx, idx) {
+            Ok(job) => job,
             Err(err) => {
                 self.show_feedback_toast(err);
                 return;
             }
         };
-        self.start_compare_pin_work(ctx, idx, work);
+        self.start_compare_pin_job(ctx, idx, job);
     }
 
-    fn start_compare_pin_work(
+    fn start_compare_pin_job(
         &mut self,
         ctx: &egui::Context,
         source_idx: usize,
-        work: crate::capture::CapturePixelWork,
+        job: crate::capture::CapturePixelJob,
     ) {
         let (tx, rx) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("compare-pin".into())
             .spawn(move || {
-                let result = crate::capture::run_compare_pixel_work(work).and_then(
+                let result = crate::capture::run_compare_pixel_job(job).and_then(
                     |(basename, width, height, rgba)| {
                         let source = image::RgbaImage::from_raw(width, height, rgba)
                             .ok_or_else(|| "比較画像のRGBAサイズが不正です".to_string())?;
@@ -27154,7 +27122,7 @@ impl App {
             .as_ref()
             .is_some_and(|slot| slot.source_idx == idx)
         {
-            self.toggle_compare_pin_from_current(ctx, idx);
+            self.clear_compare_pin(ctx);
             return;
         }
 
@@ -27189,6 +27157,9 @@ impl App {
     }
 
     pub(crate) fn toggle_compare_pinned_view(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.reject_compare_action_in_spread(fs_idx) {
+            return;
+        }
         if self.pinned_compare_slot.is_none() {
             self.show_feedback_toast("比較画像が未設定です。X で設定してください".to_string());
             return;
@@ -27215,6 +27186,9 @@ impl App {
     }
 
     pub(crate) fn toggle_compare_wipe_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.reject_compare_action_in_spread(fs_idx) {
+            return;
+        }
         if self.pinned_compare_slot.is_none() {
             self.show_feedback_toast("比較画像が未設定です。X で設定してください".to_string());
             return;
@@ -27238,6 +27212,9 @@ impl App {
     }
 
     pub(crate) fn toggle_compare_diff_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.reject_compare_action_in_spread(fs_idx) {
+            return;
+        }
         if self.pinned_compare_slot.is_none() {
             self.show_feedback_toast("比較画像が未設定です。X で設定してください".to_string());
             return;
@@ -27642,21 +27619,17 @@ impl App {
                 .prepare_capture_pixel_job(ctx, idx)
                 .map(crate::capture::CapturePixelWork::Single),
             SpreadPair::Double { left, right } => {
-                let gap_ratio = self
-                    .fullscreen_page_layout
-                    .spread_gap_to_page_width_ratio(left, right)
-                    .ok_or_else(|| {
-                        "見開き表示の配置が未確定です。もう一度実行してください".to_string()
-                    })?;
                 let left_job = self.prepare_capture_pixel_job(ctx, left)?;
                 let right_job = self.prepare_capture_pixel_job(ctx, right)?;
                 let basename = crate::capture::basename_from_text(&format!(
                     "{}_{}",
                     left_job.basename, right_job.basename
                 ));
-                crate::capture::CapturePixelWork::spread_with_displayed_gap(
-                    basename, left_job, right_job, gap_ratio,
-                )
+                Ok(crate::capture::CapturePixelWork::Spread {
+                    basename,
+                    left: left_job,
+                    right: right_job,
+                })
             }
         }
     }
@@ -31890,15 +31863,76 @@ mod tests {
     }
 
     #[test]
-    fn compare_spread_prepares_the_whole_spread_scope() {
+    fn comparison_is_available_only_in_single_page_mode() {
+        assert!(comparison_available_for_spread_mode(SpreadMode::Single));
+        for spread in [
+            SpreadMode::Ltr,
+            SpreadMode::LtrCover,
+            SpreadMode::Rtl,
+            SpreadMode::RtlCover,
+        ] {
+            assert!(!comparison_available_for_spread_mode(spread));
+            assert!(!comparison_should_end_for_spread_mode(spread, false));
+            assert!(comparison_should_end_for_spread_mode(spread, true));
+        }
+        assert!(!comparison_should_end_for_spread_mode(
+            SpreadMode::Single,
+            true
+        ));
         assert_eq!(
-            compare_prepare_scope(SpreadPair::Single),
-            crate::app::ComparePrepareScope::SinglePage
+            COMPARE_SPREAD_UNAVAILABLE_MESSAGE,
+            "見開き表示では比較できません。単ページ表示に切り替えてください"
         );
+    }
+
+    #[test]
+    fn spread_compare_shortcuts_only_show_single_page_guidance() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.fullscreen_idx = Some(7);
+        app.spread_mode = SpreadMode::LtrCover;
+
+        app.toggle_compare_pin_from_current(&ctx, 7);
         assert_eq!(
-            compare_prepare_scope(SpreadPair::Double { left: 4, right: 5 }),
-            crate::app::ComparePrepareScope::Spread
+            app.fs_feedback_toast
+                .as_ref()
+                .map(|(text, _, _)| text.as_str()),
+            Some(COMPARE_SPREAD_UNAVAILABLE_MESSAGE)
         );
+        assert!(app.pinned_compare_slot.is_none());
+
+        for action in [
+            App::toggle_compare_pinned_view,
+            App::toggle_compare_wipe_mode,
+            App::toggle_compare_diff_mode,
+        ] {
+            app.fs_feedback_toast = None;
+            action(&mut app, &ctx, 7);
+            assert_eq!(
+                app.fs_feedback_toast
+                    .as_ref()
+                    .map(|(text, _, _)| text.as_str()),
+                Some(COMPARE_SPREAD_UNAVAILABLE_MESSAGE)
+            );
+            assert!(matches!(
+                app.compare_view_mode,
+                crate::app::CompareViewMode::Off
+            ));
+        }
+    }
+
+    #[test]
+    fn entering_spread_mode_ends_active_comparison() {
+        let mut app = crate::app::setup_app_for_test();
+        app.compare_view_mode = crate::app::CompareViewMode::Wipe { fraction: 0.5 };
+        app.spread_mode = SpreadMode::Rtl;
+
+        app.end_comparison_for_spread_mode_if_needed();
+
+        assert!(matches!(
+            app.compare_view_mode,
+            crate::app::CompareViewMode::Off
+        ));
     }
 
     #[test]

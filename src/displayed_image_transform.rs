@@ -521,26 +521,6 @@ impl FullscreenPageLayout {
         }
         Some((self.pages[0].page_idx(), self.pages[1].page_idx()))
     }
-
-    /// 画面上の中央 gap を、左右ページの実描画幅の合計に対する比率で返す。
-    ///
-    /// capture/compare の見開き合成は source pixel 寸法が画面と異なるため、絶対値ではなく
-    /// この比率を使って中央 gap を再現する。要求したページ組と直近の実描画が一致しない
-    /// フレームでは値を返さず、古いページの配置を流用させない。
-    pub(crate) fn spread_gap_to_page_width_ratio(
-        &self,
-        left_idx: usize,
-        right_idx: usize,
-    ) -> Option<f64> {
-        if self.spread_pair() != Some((left_idx, right_idx)) {
-            return None;
-        }
-        let left = self.pages[0].transform.paint_rect;
-        let right = self.pages[1].transform.paint_rect;
-        let page_width = left.width() as f64 + right.width() as f64;
-        let gap = (right.left() - left.right()).max(0.0) as f64;
-        (page_width.is_finite() && page_width > 0.0 && gap.is_finite()).then_some(gap / page_width)
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1162,17 +1142,6 @@ mod tests {
                 .map(|p| p.page_idx()),
             Some(1)
         );
-    }
-
-    #[test]
-    fn spread_gap_ratio_comes_from_the_matching_displayed_pair() {
-        let left = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(90.0, 100.0));
-        let right = egui::Rect::from_min_max(egui::pos2(110.0, 0.0), egui::pos2(200.0, 100.0));
-        let layout = page_layout(FullscreenPageLayoutKind::Spread, &[(1, left), (2, right)]);
-
-        let ratio = layout.spread_gap_to_page_width_ratio(1, 2).unwrap();
-        assert!((ratio - 20.0 / 180.0).abs() < f64::EPSILON);
-        assert_eq!(layout.spread_gap_to_page_width_ratio(2, 1), None);
     }
 
     #[test]
