@@ -471,6 +471,23 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   切り替えを提供するのか、パノラマ設定に持たせるのかを先に決める。
 - 規模 / 優先度: Medium / P3 (提案段階。採否未定)。
 
+### 1.62 お気に入り編集を開いている間、進捗が動いていなくても 100ms ごとに repaint する
+
+- 出典: v2.13.0 の idle health 測定中に判明 (2026-08-11)。退行ではなく既存仕様。
+- 観測: `favorites_editor.rs:752` が `ctx.request_repaint_after(100ms)` を**無条件で**呼ぶため、
+  ダイアログを開いている間ずっと 11〜12 fps で `App::update` が回る。perf log で
+  `prev_frame_causes=['src\\ui_dialogs\\favorites_editor.rs:752']` が連続して確認できる。
+- 実害: 利用者は**起動後の索引作成が終わるのを確認するためにこのダイアログを開いたままにする**
+  運用をしており、索引作成は 5 分ほどかかる。その間ずっと起きている。ノート PC やタブレットの
+  電池には無視できない。v2.13.0 でタッチ対応を入れた以上、タブレット運用は増える。
+- 現行コードのコメントは「active が空でも notify-rs が動き出した瞬間に拾えるよう常に呼ぶ」と
+  理由を書いており、**意図的**である。直すなら意図を保ったまま頻度を落とす:
+  - active が空の間は 100ms ではなく 500ms〜1s へ落とす (動き出しの検出遅れは許容範囲)
+  - または watcher 側から `ctx.request_repaint()` を呼び、ポーリング自体をやめる (構造的)
+- 同型の確認: 他にも「進捗表示のために無条件 `request_repaint_after`」を持つダイアログが
+  無いか探すこと。あれば同じ方針で揃える。
+- 規模 / 優先度: Small / P2。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
@@ -746,6 +763,49 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   - **入力所有権 (raw key permit / IME の viewport 分離)** と **native window health** —
     後者は native video window が生きている間だけ 1 秒に 1 回 pump へ ping を送る。
     無再生時は送らないが、**動画を開いたまま放置したときのアイドル影響は未実測**。
+
+### 5.7 v2.13.0 リリース前確認の記録 (2026-08-11)
+
+- **依存**: PDFium `chromium/7988` / FFmpeg `n7.1.5-12-g1fdbca85aa` とも最新で更新なし。
+  DLL の ProductVersion `n7.1.5-12-g1fdbca85aa-20260803` が `vendor/ffmpeg/VERSION` と一致。
+  LGPL 対応ソースの差し替え不要。VST3 bridge は C++ 最終変更 2026-08-01 / exe ビルド
+  2026-08-06 なので再ビルド不要 (`-SkipVst3Bridge`)。Susie ワーカーは再ビルドした。
+  - ⚠ `setup-pdfium.sh check` は「新しいバージョンあり」と誤検知する。`vendor/pdfium/VERSION`
+    が無い環境では現行版を「未インストール」と読むため。**DLL の FileVersion で判定する**
+    (`153.0.7988.0` = `chromium/7988`)。FFmpeg の VERSION 腐りと同じ型。
+- **CI**: master success (run 31402289417)。ubuntu の `cargo check` を含む。
+  今サイクルの 114 commit が初めて CI を通った。タッチ対応は `#[cfg(windows)]` の塊なので
+  ここが最大の未検証点だったが、漏れは無かった。
+- **署名 / 依存 DLL**: 配布 4 種すべて `Certum Trusted Network CA` + RFC3161 タイムスタンプ。
+  `dumpbin /dependents` で launcher / core / portable / susie32 とも
+  `VCRUNTIME140.dll` / `MSVCP140.dll` なし。
+- **idle health**: `static-foreground` / `static-background` とも PASS。
+  測定窓は perf event 0 件・perf log 増加 0 バイト (完全 sleep)、CPU one-core ratio
+  0.0219 / 0.0115。
+  - **1 回目の `static-foreground` は FAIL (35 fps) だったが退行ではない**。起動から約 2 分の
+    時点で、索引作成が進行中かつお気に入り編集ダイアログを開いたまま測っていた。
+    同ダイアログは進捗を流すため 100ms ごとに repaint を要求する既存仕様
+    ([favorites_editor.rs](../src/ui_dialogs/favorites_editor.rs) の live 更新)。
+    ダイアログを閉じて測り直すと 0 フレーム。**「過去 3 回は 0 フレーム」という比較だけで
+    退行と断定してはいけない**。アプリが busy でなかったことを先に確認する。
+  - `video-pin-background` は **§5.4 の既知のゲート欠陥で不成立**。証拠窓が測定区間そのもの
+    (t=352.4-367.4) になり、対象キーの thumbnail work は t=337.5 で 15 秒前に終わっていた
+    (`matched=0`)。加えて操作側の誤りもあり、ピン留めフォルダの**中**を表示していたため
+    マッチしたのは個々の動画ファイル (`from_cache=false` = アイドル高画質化の候補外) で、
+    フォルダタイル (`dir::<path>`) ではなかった。**waiver とする**根拠は、
+    v2.13.0 が `idle_upgrade` を含む行を 1 行も変更していないこと
+    (`git log -S "idle_upgrade" v2.12.0..HEAD -- src/` が 0 件)、および測定区間自体は
+    完全 sleep (CPU 0.0052) だったこと。セッションログは
+    `target/idle-health/v2.13.0-idle-health-session.jsonl` に退避済み。
+- **perf smoke**: frame 4476、16ms 超のギャップ 132 件 (97.05% が 16ms 未満)。
+  **件数ではなく直前の `ui.tail_repaint.action` で判定**した結果:
+  - 100ms 超は 18 件。うち 11 件が `none` (repaint 未要求 = 入力待ちで就寝)、
+    6 件が `request_repaint_after_idle_upgrade` で `idle_upgrade_delay_ms` がギャップ長と
+    一致 (予定どおりの起床)
+  - **`request_repaint` が立っていた 100ms 超は 1 件のみ**: 起動直後 t=1.109s の 198ms
+    (`reasons=['requested_nonempty']` = サムネイル要求中)。今サイクルの新経路とは無関係
+  - 100ms 超の件数は v2.12.0 の 53 件・v2.9.1 の 24 件より少ない
+- **検索 bench**: 全文索引に触れていないため未実施。
 
 ### 5.6 v2.12.0 リリース前確認の記録 (2026-08-06)
 
