@@ -879,10 +879,10 @@ foreground との優先度を持っていなかった。
 2026-08-04 の画質 mode 導入後は、表示と先読みを同じ長辺上限（8192 / 4096 / 2048 /
 1024、既定 4096）で取得する。標準画質の実測約 1.2 MiB/ページに対し、進行方向 3 ページで
 従来の約 3.6 MiB という帯域根拠を維持するため、前方 3 ページ、逆方向 1 ページへ変更した。
-2026-08-09 の実測見直し後は §12.26 を正とする。前方 3 / 逆方向 1 と表示・先読み共通の
-要求長辺は維持し、先読み通信は同時最大 2 件、圧縮 Blob の LRU は最大 12 件かつ実効下限
-48 MiB とする。viewer を離れた時、別 target の foreground を要求した時、または計画から
-外れた時は不要な fetch を中断する。
+2026-08-11 の予算化後は §14.6 を正とする。表示・先読み共通の要求長辺は維持し、先読み通信は
+同時最大 2 件、窓の上限は前方 12 / 逆方向 4、圧縮 Blob は固定 64 MiB の開始ゲートで実効深さを
+決める。viewer を離れた時、別 target の foreground を要求した時、または計画から外れた時は
+不要な fetch を中断する。
 
 現行 protocol の `PageRequest.priority` は `Foreground` / `Prefetch` を共有型で表す。remote-web は
 prefetch admission を2件に制限し、all / heavy の最終1枠を使用させない。本体も全接続合計の
@@ -1628,10 +1628,9 @@ folder / collection の Web 側 archive kind 除外は撤去した。Ignore の�
 保持できず、先読み済み Blob を使用前に LRU から捨て得た。要求解像度、画質 preset、
 `PAGE_JPEG_QUALITY`、`viewerImageLayout` は変更しない。
 
-`pageResourceCacheBudget` は設定 byte 数と、実測上限として丸めた 8 MiB × 作業集合ページ数の
-大きい方を実効予算にする。現在ページを最大見開き 2 ページとして数えるため、前方 3 + 後方 1 を
-含む最大 6 ページの下限は 48 MiB になる。定数の一方だけを将来変更しても
-「予算 < 作業集合」を作れないことを純関数テストで固定する。entry 上限 12 は維持する。
+この段階では 8 MiB × 作業集合ページ数による 48 MiB 下限と entry 上限 12 を採ったが、
+窓を広げるほど byte 予算まで増えるため、2026-08-11 に §14.6 の固定 64 MiB admission と
+保護集合方式へ置き換えた。以下の 503 / 同時実行 / foreground 相乗り契約は引き続き有効である。
 
 HTTP 503 `ipc_busy` / `admission_busy` は計画無効ではなく一時的な入場拒否として扱う。
 失敗ページを pending の末尾へ戻し、他の計画ページへ機会を渡したうえで `Retry-After`
@@ -1930,3 +1929,36 @@ cutover で位置所有権を `DisplayRequestId` へ移すときに、まとめ�
 メッセージが残ること) は、`updateViewerImage` が module private なため構造 assertion で
 留めている。apply 段階の失敗、generation 更新、見開き再構成、bookmark jump の実挙動テストも
 無い。cutover で位置所有権を型にするときに、呼び出し側を試験可能な形へ出して固定する。
+
+### 14.6 先読みのバイト予算化と画質別処理時間 (2026-08-11)
+
+これは §14.3 の B + C + D0 所有権 cutover とは別の増分である。Web の
+`foregroundWaiters` / `prefetchPlanned` / `abortUnownedActive`、本体の page cancel と lease は
+変更しておらず、段階 A の `applied` / `superseded` / `failed` outcome と `page_display`
+telemetry も維持する。
+
+固定ページ数分を必ず保持するために byte 予算を膨らませる方式をやめた。Safari では
+`deviceMemory` / `performance.memory` による端末メモリ検出を使えないため、圧縮 JPEG Blob の
+固定 **64 MiB** を保守的な開始値とする。`PageResourceCache` は保持 byte を走る合計で会計し、
+`pump()` は保持量が予算以上なら新しい prefetch を始めない。取得済み Blob は予算超過だけでは
+捨てず、タイマーで無理に再開もしない。展開後 bitmap は表示中の最大 2 ページだけが DOM の
+object URL を所有する従来契約のままである。
+
+先読み窓は進行方向 12 / 逆方向 4 を上限とし、実際に埋まる深さは 64 MiB の admission が
+決める。entry 上限は表示最大 2 + 計画最大 16 = 18、保護集合の K は
+`entry limit - MAX_VIEWER_VISIBLE_PAGES` = 16 とした。保護集合は表示中の cache key と、近い順の
+`pagePrefetchPlan` 先頭 K 件である。開始枠を作る必要があるときだけ保護集合外の LRU を古い順に
+捨てる。保護対象だけで予算以上なら超過を受け入れて停止し、ページ移動後の `schedule()` で
+保護集合が変わった時点に再評価する。これにより取得直後の計画ページを byte 超過だけで捨てて
+同じ key を再取得する循環を作らない。標準画質の小さいページなら 12/4 全体が入り、高品質の
+大きいページでは同じ byte 予算により自動的に浅くなる。
+
+`/api/page` の成功応答は、既存 log の `ipc_ms` と同じ値を
+`X-mIV-Page-Render-Ms` で返す。Web は段階 A の表示 outcome が `applied` になった foreground
+ページだけを対象に、生成 = header、転送 = fetch 全体 - 生成 (下限 0)、展開 = image decode を
+画質 preset ごとの直近 10 件リングへ保存する。保存先は秘密を含まない端末 localStorage の
+versioned な別 key である。画質 UI は標本がある preset にだけ
+「直近 N ページの平均 — 生成 / 転送 / 展開」を表示する (N は実際の標本数。
+3 件しかないときに 10 と書かない)。この値は preset 固有の性能値ではなく、
+現在読んでいる PDF / archive / JPEG の寸法・補正内容・端末・通信に依存する実測であり、標本の
+ない preset に推測値は出さない。

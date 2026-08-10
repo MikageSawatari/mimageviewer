@@ -34,8 +34,10 @@ import {
   pageResponseGenerationAttestation,
   pageResponseIdentityAttestation,
   pagePrefetchFailurePlan,
+  pagePrefetchBudgetAllowsStart,
   pagePrefetchPlan,
   pagePrefetchStartCount,
+  pageResourceAdmissionPlan,
   pageResourceCacheBudget,
   planSpreadIntent,
   reduceViewerTransform,
@@ -103,6 +105,14 @@ import {
   loadLocalSettings,
   saveLocalSettings,
 } from "./local-settings.mjs";
+import {
+  appendPageTimingSample,
+  averagePageTimings,
+  formatPageTimingAverage,
+  loadPageTimingHistory,
+  pageTimingSample,
+  savePageTimingHistory,
+} from "./page-timings.mjs";
 import { installDocumentDoubleTapOwner } from "./document-double-tap.mjs";
 import { VideoStreamViewer } from "./video-stream.mjs";
 
@@ -125,21 +135,16 @@ const THUMBNAIL_MAX_CONCURRENCY = thumbnailRequestConcurrency(
 );
 const PAGE_LOADING_INDICATOR_DELAY_MS = 225;
 const PAGE_BOUNDARY_MESSAGE_DURATION_MS = 2400;
-// 実機の成功ページは p50 1.5 MB / p95 7.9 MB / max 8.1 MB。計画上限は 8 MiB とし、
-// 単ページの現在 1 + 前方 3 + 後方 1 = 5 ページ (40 MiB)、見開き時は現在 2 を含む
-// 6 ページ (48 MiB) を保持できる下限を純関数で課す。要求解像度と JPEG 品質は変えない。
-const PAGE_PREFETCH_AHEAD = 3;
-const PAGE_PREFETCH_BEHIND = 1;
+// Safari では端末メモリを取得できないため、圧縮 JPEG Blob の固定 64 MiB を先読み開始の
+// 門にする。12/4 は窓の上限にすぎず、実際の深さは保持済みバイト数で決まる。
+const PAGE_PREFETCH_AHEAD = 12;
+const PAGE_PREFETCH_BEHIND = 4;
 const PAGE_PREFETCH_CONCURRENCY = 2;
-const PAGE_RESOURCE_CACHE_LIMIT = 12;
-const PAGE_RESOURCE_MEASURED_MAX_BYTES = 8 * 1024 * 1024;
-const PAGE_RESOURCE_CACHE_CONFIGURED_BYTES = 48 * 1024 * 1024;
+const PAGE_RESOURCE_CACHE_LIMIT =
+  MAX_VIEWER_VISIBLE_PAGES + PAGE_PREFETCH_AHEAD + PAGE_PREFETCH_BEHIND;
+const PAGE_RESOURCE_CACHE_CONFIGURED_BYTES = 64 * 1024 * 1024;
 const PAGE_RESOURCE_CACHE_MAX_BYTES = pageResourceCacheBudget({
   configuredBytes: PAGE_RESOURCE_CACHE_CONFIGURED_BYTES,
-  measuredPageBytes: PAGE_RESOURCE_MEASURED_MAX_BYTES,
-  ahead: PAGE_PREFETCH_AHEAD,
-  behind: PAGE_PREFETCH_BEHIND,
-  visiblePages: MAX_VIEWER_VISIBLE_PAGES,
 }).byteLimit;
 const SESSION_PING_INTERVAL_MS = 30_000;
 const READING_PROGRESS_INTERVAL_MS = 30_000;
@@ -169,6 +174,7 @@ const RUNTIME_TEST_MODE = globalThis.__MIV_RUNTIME_TEST_MODE__ === true;
 let runtimeTestErrorObserver = null;
 const REMOTE_CLIENT_ID = loadRemoteClientId();
 const LOCAL_SETTINGS_LOAD = loadLocalSettings();
+let pageTimingHistory = loadPageTimingHistory().history;
 
 class AuthenticationRequiredError extends Error {}
 class RemoteSessionBlockedError extends Error {}
@@ -363,8 +369,15 @@ export class PageResourceCache {
     this.prefetchConcurrency = Math.max(1, Number(prefetchConcurrency) || 1);
     this.fetchResource = fetchResource;
     this.ready = new Map();
+    this.readyBytes = 0;
     this.pending = [];
     this.active = new Map();
+    this.visibleKeys = new Set();
+    this.prefetchProtectedKeys = [];
+    this.prefetchProtectLimit = Math.max(
+      0,
+      this.limit - MAX_VIEWER_VISIBLE_PAGES
+    );
     this.retryTimer = 0;
   }
 
@@ -404,17 +417,20 @@ export class PageResourceCache {
     return { ...resource, prefetchStatus: "miss" };
   }
 
-  schedule(requests) {
+  schedule(requests, visibleKeys = []) {
     const unique = [];
     const seen = new Set();
     for (const request of requests) {
-      if (!request?.cacheKey || seen.has(request.cacheKey) || this.ready.has(request.cacheKey)) {
-        continue;
-      }
+      if (!request?.cacheKey || seen.has(request.cacheKey)) continue;
       seen.add(request.cacheKey);
+      if (this.ready.has(request.cacheKey)) continue;
       unique.push(request);
     }
     this.pending = unique;
+    this.visibleKeys = new Set(
+      (visibleKeys ?? []).filter((key) => typeof key === "string" && key)
+    );
+    this.prefetchProtectedKeys = [...seen].slice(0, this.prefetchProtectLimit);
     for (const active of this.active.values()) {
       active.prefetchPlanned = seen.has(active.key);
       this.abortUnownedActive(active);
@@ -439,6 +455,24 @@ export class PageResourceCache {
       this.pending.length,
       this.prefetchConcurrency
     );
+    if (starts <= 0) return;
+    if (
+      this.ready.size >= this.limit ||
+      !pagePrefetchBudgetAllowsStart(this.readyBytes, this.byteLimit)
+    ) {
+      const admission = pageResourceAdmissionPlan({
+        entries: [...this.ready].map(([key, resource]) => ({
+          key,
+          bytes: resource.blob.size,
+        })),
+        protectedKeys: this.protectedKeys(),
+        limit: this.limit,
+        byteLimit: this.byteLimit,
+        retainedBytes: this.readyBytes,
+      });
+      for (const key of admission.evictKeys) this.deleteReady(key);
+      if (!admission.allowStart) return;
+    }
     while (starts > 0) {
       const request = this.pending.shift();
       if (!request) return;
@@ -519,15 +553,23 @@ export class PageResourceCache {
   }
 
   remember(key, resource) {
+    const previous = this.ready.get(key);
+    if (previous) this.readyBytes -= previous.blob.size;
     this.ready.delete(key);
     this.ready.set(key, resource);
-    while (
-      this.ready.size > this.limit ||
-      [...this.ready.values()].reduce((sum, value) => sum + value.blob.size, 0) >
-        this.byteLimit
-    ) {
-      this.ready.delete(this.ready.keys().next().value);
-    }
+    this.readyBytes += resource.blob.size;
+  }
+
+  protectedKeys() {
+    return new Set([...this.visibleKeys, ...this.prefetchProtectedKeys]);
+  }
+
+  deleteReady(key) {
+    const resource = this.ready.get(key);
+    if (!resource) return false;
+    this.ready.delete(key);
+    this.readyBytes = Math.max(0, this.readyBytes - resource.blob.size);
+    return true;
   }
 
   clear() {
@@ -537,6 +579,9 @@ export class PageResourceCache {
     clearTimeout(this.retryTimer);
     this.retryTimer = 0;
     this.ready.clear();
+    this.readyBytes = 0;
+    this.visibleKeys.clear();
+    this.prefetchProtectedKeys = [];
   }
 }
 
@@ -567,6 +612,22 @@ function abortError() {
 
 const thumbnailRequestLimiter = new RequestLimiter(THUMBNAIL_MAX_CONCURRENCY);
 const pageResourceCache = new PageResourceCache();
+
+function recordSuccessfulPageTiming(request, resource, decodeMs) {
+  if (!request?.imageQualityPresetId) return;
+  const sample = pageTimingSample({
+    totalFetchMs: resource?.fetchMs,
+    generationMs: resource?.pageRenderMs,
+    decodeMs,
+  });
+  if (!sample) return;
+  pageTimingHistory = appendPageTimingSample(
+    pageTimingHistory,
+    request.imageQualityPresetId,
+    sample
+  );
+  pageTimingHistory = savePageTimingHistory(pageTimingHistory).history;
+}
 
 const telemetryState = {
   queue: [],
@@ -5201,7 +5262,7 @@ async function updateViewerImage(
   state.commandMenu?.refreshViewTrim();
   observeReadingProgress();
   if (group.entries.every((entry) => entry.address)) {
-    schedulePagePrefetch(viewer).catch(() => {});
+    schedulePagePrefetch(viewer, pages).catch(() => {});
     return;
   }
   const nextEntry = state.images[state.imageIndex + 1];
@@ -5215,7 +5276,7 @@ async function updateViewerImage(
   }
 }
 
-async function schedulePagePrefetch(viewer) {
+async function schedulePagePrefetch(viewer, visiblePages = []) {
   const group = currentPageGroup();
   const currentIdentity = group?.entries.map(entryIdentity).join("\n") ?? "";
   const visibleIndexes = (group?.entries ?? [])
@@ -5259,7 +5320,10 @@ async function schedulePagePrefetch(viewer) {
   ) {
     return;
   }
-  pageResourceCache.schedule(requests.filter(Boolean));
+  pageResourceCache.schedule(
+    requests.filter(Boolean),
+    visiblePages.map(({ request }) => request.cacheKey).filter(Boolean)
+  );
 }
 
 function imageRequest(
@@ -5289,8 +5353,8 @@ function imageRequest(
         devicePixelRatio: dpr,
         maxRequestWidth: 8192,
       });
-    const targetPx = targetPxOverride ??
-      imageQualityPreset(state.localSettings.imageQuality).maxLongSide;
+    const qualityPreset = imageQualityPreset(state.localSettings.imageQuality);
+    const targetPx = targetPxOverride ?? qualityPreset.maxLongSide;
     const infoCacheKey = mediaImageInfoKey(entry.address);
     return {
       url: apiUrl(
@@ -5325,6 +5389,8 @@ function imageRequest(
       containerInfoKey: mediaContainerInfoKey(entry.address),
       renderContext,
       prefetch,
+      imageQualityPresetId:
+        targetPxOverride == null && !adjustmentPreview ? qualityPreset.id : null,
     };
   }
   const resolvedLayout = layout ?? viewerImageLayout({
@@ -9044,10 +9110,14 @@ class LocalSettingsDialog {
       radio.value = preset.id;
       radio.checked = state.localSettings.imageQuality === preset.id;
       const qualityCopy = element("span", "local-settings-copy");
+      const timingAverage = formatPageTimingAverage(
+        averagePageTimings(pageTimingHistory, preset.id)
+      );
       qualityCopy.append(
         textElement("strong", preset.label),
         textElement("small", `最大 ${preset.maxLongSide} px`)
       );
+      if (timingAverage) qualityCopy.append(textElement("small", timingAverage));
       qualityOption.append(radio, qualityCopy);
       radio.addEventListener("change", () => {
         if (!radio.checked || !setLocalImageQuality(preset.id)) return;
@@ -10687,6 +10757,7 @@ export class ImageViewer {
       previousUrls.forEach((url) => URL.revokeObjectURL(url));
       await nextFrame();
       if (sequence !== this.loadSequence) return VIEWER_GROUP_LOAD_SUPERSEDED;
+      recordSuccessfulPageTiming(request, resource, decodeMs);
 
       const event = {
         type: "image",
@@ -10876,6 +10947,7 @@ export class ImageViewer {
       decodedImages.forEach((decoded, index) => {
         const resource = resources[index];
         const request = pages[index].request;
+        recordSuccessfulPageTiming(request, resource, decoded.decodeMs);
         const event = {
           type: "image",
           request_id: resource.requestId,
@@ -11711,10 +11783,16 @@ async function fetchPageResource(request, signal, prefetch) {
   requirePageResponseGeneration(request, response);
   const width = Number(response.headers.get("X-mIV-Image-Width"));
   const height = Number(response.headers.get("X-mIV-Image-Height"));
+  const pageRenderHeader = response.headers.get("X-mIV-Page-Render-Ms");
+  const pageRenderMs = pageRenderHeader === null ? null : Number(pageRenderHeader);
   return {
     blob: await response.blob(),
     requestId: response.headers.get("X-mIV-Request-Id"),
     fetchMs: performance.now() - startedAt,
+    pageRenderMs:
+      pageRenderMs !== null && Number.isFinite(pageRenderMs) && pageRenderMs >= 0
+        ? pageRenderMs
+        : null,
     info:
       Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0
         ? { width, height }

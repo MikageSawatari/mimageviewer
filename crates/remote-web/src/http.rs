@@ -3141,6 +3141,11 @@ fn api_thumb(
     }
 }
 
+fn with_page_render_timing(response: HttpResponse, ipc_ms: f64) -> HttpResponse {
+    debug_assert_eq!(response.status, 200);
+    response.with_header("X-mIV-Page-Render-Ms", ipc_ms.to_string())
+}
+
 fn api_page(
     state: &AppState,
     query: &[(String, String)],
@@ -3236,6 +3241,7 @@ fn api_page(
     }
     match result {
         Ok(result) => {
+            let ipc_ms = crate::diagnostics::duration_ms(started.elapsed());
             let payload = result.value;
             let blob_bytes = payload.bytes.len();
             if payload.identity.validate_syntax().is_err() {
@@ -3247,17 +3253,20 @@ fn api_page(
             let Some(content_type) = remote_page_content_type(&payload.content_type) else {
                 return HttpResponse::text(502, "Bad Gateway");
             };
-            HttpResponse::bytes(200, content_type, payload.bytes)
-                .with_header(
-                    "Cache-Control",
-                    if adjustment_preview.is_some() {
-                        "no-store"
-                    } else {
-                        "private, max-age=60"
-                    },
-                )
-                .with_header("X-mIV-Image-Width", payload.width.to_string())
-                .with_header("X-mIV-Image-Height", payload.height.to_string())
+            with_page_render_timing(
+                HttpResponse::bytes(200, content_type, payload.bytes)
+                    .with_header(
+                        "Cache-Control",
+                        if adjustment_preview.is_some() {
+                            "no-store"
+                        } else {
+                            "private, max-age=60"
+                        },
+                    )
+                    .with_header("X-mIV-Image-Width", payload.width.to_string())
+                    .with_header("X-mIV-Image-Height", payload.height.to_string()),
+                ipc_ms,
+            )
                 .with_header("X-mIV-Page-Identity", identity)
                 .with_header("X-mIV-Remote-State-Generation", remote_state_generation)
                 .with_header("X-mIV-Remote-Session", owner.session_id.clone())
@@ -3265,7 +3274,7 @@ fn api_page(
                 .with_log_details(json!({
                     "page": {
                         "ipc_status": "ok",
-                        "ipc_ms": crate::diagnostics::duration_ms(started.elapsed()),
+                        "ipc_ms": ipc_ms,
                         "ipc_retry_count": result.retry_count,
                         "ipc_retry_statuses": result.retry_statuses,
                         "ipc_connection_id": result.connection_id,
@@ -4387,6 +4396,21 @@ mod tests {
         );
         assert!(!header.contains("session"));
         assert!(!header.contains("token"));
+    }
+
+    #[test]
+    fn successful_page_response_exposes_the_measured_render_duration() {
+        let response = with_page_render_timing(
+            HttpResponse::bytes(200, "image/jpeg", vec![1, 2, 3]),
+            1842.375,
+        );
+        assert_eq!(response.status, 200);
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| { *name == "X-mIV-Page-Render-Ms" && value == "1842.375" })
+        );
     }
 
     #[cfg(not(feature = "embedded-web-assets"))]

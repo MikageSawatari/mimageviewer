@@ -56,8 +56,10 @@ import {
   viewerTapZone,
   nextFitMode,
   pagePrefetchFailurePlan,
+  pagePrefetchBudgetAllowsStart,
   pagePrefetchPlan,
   pagePrefetchStartCount,
+  pageResourceAdmissionPlan,
   pageResourceCacheBudget,
   pageResponseGenerationAttestation,
   pageResponseIdentityAttestation,
@@ -2536,47 +2538,67 @@ test("page prefetch follows reading direction and accepts a future spread", () =
     pagePrefetchPlan({ visibleIndexes: [0], itemCount: 3, direction: -1 }),
     [1]
   );
+  assert.deepEqual(
+    pagePrefetchPlan({
+      visibleIndexes: [10, 11],
+      itemCount: 40,
+      direction: 1,
+      ahead: 12,
+      behind: 4,
+    }),
+    [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 9, 8, 7, 6]
+  );
 });
 
-test("page resource budget cannot fall below the measured prefetch working set", () => {
-  const measuredPageBytes = 8 * 1024 * 1024;
+test("page resource budget stays fixed when the maximum prefetch window grows", () => {
   assert.deepEqual(pageResourceCacheBudget({
     configuredBytes: 32 * 1024 * 1024,
-    measuredPageBytes,
-    ahead: 3,
-    behind: 1,
-    visiblePages: 1,
-  }), {
-    workingSetPages: 5,
-    minimumBytes: 40 * 1024 * 1024,
-    byteLimit: 40 * 1024 * 1024,
-  });
-  assert.equal(pageResourceCacheBudget({
-    configuredBytes: 32 * 1024 * 1024,
-    measuredPageBytes,
-    ahead: 3,
-    behind: 1,
+    measuredPageBytes: 8 * 1024 * 1024,
+    ahead: 12,
+    behind: 4,
     visiblePages: MAX_VIEWER_VISIBLE_PAGES,
-  }).byteLimit, 48 * 1024 * 1024);
+  }), { byteLimit: 32 * 1024 * 1024 });
+});
 
-  const widerSpreadBudget = pageResourceCacheBudget({
-    configuredBytes: 48 * 1024 * 1024,
-    measuredPageBytes,
-    ahead: 4,
-    behind: 1,
-    visiblePages: MAX_VIEWER_VISIBLE_PAGES,
+test("page prefetch byte admission closes at the budget boundary", () => {
+  assert.equal(pagePrefetchBudgetAllowsStart(63, 64), true);
+  assert.equal(pagePrefetchBudgetAllowsStart(64, 64), false);
+  assert.equal(pagePrefetchBudgetAllowsStart(65, 64), false);
+});
+
+test("page resource admission evicts oldest unprotected entries only", () => {
+  assert.deepEqual(pageResourceAdmissionPlan({
+    entries: [
+      { key: "old-protected", bytes: 3 },
+      { key: "old-unprotected", bytes: 3 },
+      { key: "new-unprotected", bytes: 3 },
+    ],
+    protectedKeys: ["old-protected"],
+    limit: 10,
+    byteLimit: 5,
+  }), {
+    evictKeys: ["old-unprotected", "new-unprotected"],
+    retainedBytes: 3,
+    retainedCount: 1,
+    allowStart: true,
   });
-  assert.deepEqual(widerSpreadBudget, {
-    workingSetPages: 7,
-    minimumBytes: 56 * 1024 * 1024,
-    byteLimit: 56 * 1024 * 1024,
+});
+
+test("page resource admission accepts protected-only budget overage", () => {
+  assert.deepEqual(pageResourceAdmissionPlan({
+    entries: [
+      { key: "visible", bytes: 4 },
+      { key: "nearest-prefetch", bytes: 4 },
+    ],
+    protectedKeys: ["visible", "nearest-prefetch"],
+    limit: 10,
+    byteLimit: 5,
+  }), {
+    evictKeys: [],
+    retainedBytes: 8,
+    retainedCount: 2,
+    allowStart: false,
   });
-  assert.deepEqual(pageResourceCacheBudget({
-    configuredBytes: 48 * 1024 * 1024,
-    measuredPageBytes,
-    ahead: 4,
-    behind: 1,
-  }), widerSpreadBudget);
 });
 
 test("page prefetch admission busy retains the plan without consuming a page", () => {

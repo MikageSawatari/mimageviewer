@@ -100,6 +100,7 @@ const imageFetch = async () => new Response(new Blob([new Uint8Array([1, 2, 3])]
     "X-mIV-Request-Id": "runtime-test",
     "X-mIV-Image-Width": "1200",
     "X-mIV-Image-Height": "1800",
+    "X-mIV-Page-Render-Ms": "600",
     "X-mIV-Remote-State-Generation": "test-1",
     "X-mIV-Remote-Session": TEST_SESSION_ID,
     "X-mIV-Page-Identity": pageIdentityHeader(TEST_PAGE_ADDRESS),
@@ -1006,6 +1007,56 @@ test("page load queue rejects a current run error but hides an old failed result
     { outcome: ViewerGroupLoadOutcome.SUPERSEDED },
     { outcome: ViewerGroupLoadOutcome.APPLIED },
   ]);
+});
+
+test("deep page prefetch stops at the byte budget and resumes after protection moves", async () => {
+  const started = [];
+  const requests = Array.from({ length: 18 }, (_, index) => ({
+    cacheKey: `page-${index}`,
+  }));
+  const fetchResource = async (request, _signal, prefetch) => {
+    started.push({ cacheKey: request.cacheKey, prefetch });
+    return {
+      blob: new Blob([new Uint8Array(3)]),
+      requestId: `request-${request.cacheKey}`,
+      fetchMs: 1,
+      pageRenderMs: 0.5,
+      info: null,
+    };
+  };
+  const cache = new PageResourceCache(18, 5, 1, fetchResource);
+
+  cache.schedule(requests.slice(0, 16), []);
+  for (let attempt = 0; attempt < 20 && cache.active.size > 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.deepEqual(started.map(({ cacheKey }) => cacheKey), ["page-0", "page-1"]);
+  assert.equal(cache.pending.length, 14, "the deep 12/4 window must remain planned");
+  assert.equal(cache.readyBytes, 6);
+
+  cache.schedule(requests.slice(2, 18), ["page-1"]);
+  for (let attempt = 0; attempt < 20 && cache.active.size > 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.deepEqual(started.map(({ cacheKey }) => cacheKey), [
+    "page-0",
+    "page-1",
+    "page-2",
+  ]);
+  assert.equal(cache.ready.has("page-0"), false, "oldest unprotected page is evicted");
+  assert.equal(cache.ready.has("page-1"), true, "the displayed page stays protected");
+
+  const displayed = await cache.loadForeground(
+    requests[1],
+    new AbortController().signal
+  );
+  assert.equal(displayed.prefetchStatus, "hit");
+  assert.equal(
+    started.filter(({ cacheKey }) => cacheKey === "page-1").length,
+    1,
+    "a protected fetched page must not be discarded and fetched again"
+  );
+  cache.clear();
 });
 
 test("foreground page load aborts unrelated concurrent prefetches and starts immediately", async () => {

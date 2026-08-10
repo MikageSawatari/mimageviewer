@@ -2347,27 +2347,59 @@ export function thumbnailRetryDecision(
 
 export const MAX_VIEWER_VISIBLE_PAGES = 2;
 
-/// Keep the byte budget structurally above the configured prefetch working set.
-/// The caller supplies the measured per-page upper bound used for planning; a stale
-/// configured byte limit can therefore never silently undercut the window constants.
-export function pageResourceCacheBudget({
-  configuredBytes,
-  measuredPageBytes,
-  ahead = 3,
-  behind = 1,
-  visiblePages = MAX_VIEWER_VISIBLE_PAGES,
-} = {}) {
-  const pages =
-    Math.max(1, Math.floor(Number(visiblePages) || 1)) +
-    Math.max(0, Math.floor(Number(ahead) || 0)) +
-    Math.max(0, Math.floor(Number(behind) || 0));
-  const perPage = Math.max(1, Math.floor(Number(measuredPageBytes) || 1));
+/// The byte budget is a fixed admission threshold, not a page-count-derived
+/// retention target. Increasing the maximum prefetch window must not inflate it.
+export function pageResourceCacheBudget({ configuredBytes } = {}) {
   const configured = Math.max(1, Math.floor(Number(configuredBytes) || 1));
-  const minimumBytes = Math.min(Number.MAX_SAFE_INTEGER, pages * perPage);
+  return { byteLimit: configured };
+}
+
+export function pagePrefetchBudgetAllowsStart(retainedBytes, byteLimit) {
+  const retained = Math.max(0, Math.floor(Number(retainedBytes) || 0));
+  const budget = Math.max(1, Math.floor(Number(byteLimit) || 1));
+  return retained < budget;
+}
+
+/// Plan the LRU removals needed before starting another prefetch. Entries are
+/// ordered oldest first. Protected entries are never selected; if they alone fill
+/// the budget, admission remains closed and the overage is retained.
+export function pageResourceAdmissionPlan({
+  entries = [],
+  protectedKeys = [],
+  limit = Number.MAX_SAFE_INTEGER,
+  byteLimit,
+  retainedBytes: retainedBytesOverride = null,
+} = {}) {
+  const maximum = Math.max(1, Math.floor(Number(limit) || 1));
+  const budget = Math.max(1, Math.floor(Number(byteLimit) || 1));
+  const protectedSet = new Set(protectedKeys ?? []);
+  const retained = (Array.isArray(entries) ? entries : [])
+    .filter((entry) => entry?.key != null)
+    .map((entry) => ({
+      key: entry.key,
+      bytes: Math.max(0, Math.floor(Number(entry.bytes) || 0)),
+    }));
+  let retainedBytes = retainedBytesOverride === null
+    ? retained.reduce((sum, entry) => sum + entry.bytes, 0)
+    : Math.max(0, Math.floor(Number(retainedBytesOverride) || 0));
+  const evictKeys = [];
+  while (
+    retained.length >= maximum ||
+    !pagePrefetchBudgetAllowsStart(retainedBytes, budget)
+  ) {
+    const index = retained.findIndex((entry) => !protectedSet.has(entry.key));
+    if (index < 0) break;
+    const [evicted] = retained.splice(index, 1);
+    retainedBytes -= evicted.bytes;
+    evictKeys.push(evicted.key);
+  }
   return {
-    workingSetPages: pages,
-    minimumBytes,
-    byteLimit: Math.max(configured, minimumBytes),
+    evictKeys,
+    retainedBytes,
+    retainedCount: retained.length,
+    allowStart:
+      retained.length < maximum &&
+      pagePrefetchBudgetAllowsStart(retainedBytes, budget),
   };
 }
 
