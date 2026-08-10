@@ -817,6 +817,18 @@ class RemoteSessionControlOwner {
 }
 
 const remoteSessionControlOwner = new RemoteSessionControlOwner();
+// module scope の singleton は起動ブロック (`if (!RUNTIME_TEST_MODE)`) より前で
+// 初期化しておくこと。boot() は最初の await より前に renderLoading → cleanupScreen
+// まで同期的に到達するので、後ろで宣言すると TDZ でモジュール評価ごと落ちる。
+const containerSpreadRefreshOwner = new LatestOnlyTaskQueue(
+  performContainerSpreadRefresh,
+  () => {},
+  (left, right) =>
+    left.viewer === right.viewer &&
+    left.addressIdentity === right.addressIdentity &&
+    left.currentIdentity === right.currentIdentity &&
+    left.forceSinglePage === right.forceSinglePage
+);
 
 const state = {
   authenticated: false,
@@ -3771,15 +3783,6 @@ function discardRequestedPageGroup(
 
 let spreadWriteTail = Promise.resolve();
 let spreadWriteSequence = 0;
-const containerSpreadRefreshOwner = new LatestOnlyTaskQueue(
-  performContainerSpreadRefresh,
-  () => {},
-  (left, right) =>
-    left.viewer === right.viewer &&
-    left.addressIdentity === right.addressIdentity &&
-    left.currentIdentity === right.currentIdentity &&
-    left.forceSinglePage === right.forceSinglePage
-);
 let readingProgressBatch = createReadingProgressBatch();
 let readingProgressContextIdentity = "";
 let readingProgressTimer = 0;

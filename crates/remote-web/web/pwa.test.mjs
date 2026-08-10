@@ -95,6 +95,37 @@ test("the shell registers a root-scoped service worker without script caching", 
   );
 });
 
+test("the startup path never touches a singleton declared after boot runs", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  const bootBlock = app.indexOf("if (!RUNTIME_TEST_MODE) {");
+  assert.ok(bootBlock > 0, "startup block not found");
+  assert.match(app.slice(bootBlock), /\n  boot\(\);/);
+
+  // boot() はモジュール本体から同期的に呼ばれ、最初の await より前に
+  // renderLoading -> cleanupScreen まで到達する。そこで起動ブロックより後に
+  // 宣言された const を触ると TDZ でモジュール評価ごと落ち、画面が真っ黒になる。
+  // RUNTIME_TEST_MODE の node テストは起動ブロックを丸ごと飛ばすので気付けない。
+  const declaredAt = new Map();
+  for (const match of app.matchAll(/^const ([A-Za-z_$][\w$]*) = /gm)) {
+    if (!declaredAt.has(match[1])) declaredAt.set(match[1], match.index);
+  }
+  const late = [...declaredAt].filter(([, at]) => at > bootBlock).map(([name]) => name);
+  assert.ok(late.length, "no late declarations found; the pattern stopped matching");
+
+  for (const name of ["cleanupScreen", "renderLoading", "renderError", "renderPinLogin"]) {
+    const start = app.indexOf("function " + name + "(");
+    assert.ok(start > 0, name + " not found");
+    const body = app.slice(start, app.indexOf("\n}", start));
+    for (const identifier of late) {
+      assert.doesNotMatch(
+        body,
+        new RegExp("\\b" + identifier + "\\b"),
+        name + " references " + identifier + ", declared after the startup block (TDZ)"
+      );
+    }
+  }
+});
+
 test("the service worker only falls back for failed page navigations", async () => {
   const worker = await readFile(new URL("service-worker.js", here), "utf8");
   assert.match(worker, /request\.method !== "GET" \|\| request\.mode !== "navigate"/);
