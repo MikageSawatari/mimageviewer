@@ -301,7 +301,10 @@ paged 表示でキーリピート由来の未消費ページ送り edge が同�
 表示 unit をカタログサムネイルで 1 frame 描き、processed texture と完成済み worker result の
 GPU upload を次の frame へ保留する。単ページは現在ページ、見開きは通常描画と同じ
 `SpreadDisplayUnit` resolver が返す全ページについて `ThumbnailState::Loaded` を要求し、1 ページでも
-欠ける場合や unit を解決できない場合は通常の実体化へ fail-closed する。時間閾値や前 frame の
+欠ける場合や unit を解決できない場合は通常の実体化へ fail-closed する。ただし、その display unit の
+全ページについて `current_final_composite_texture` が既に返せる場合は、未消費 edge があっても
+`Materialize` を維持し、完成表示からサムネイルへ降格しない。この在住確認は cache lookup だけで、
+`resolve_fs_processed_texture` や新しい worker / GPU upload を起動しない。時間閾値や前 frame の
 pending state は使わず、連結読みは対象外とする。
 
 **`keep_fullscreen_viewport_alive`** はフルスクリーン非アクティブ時 (`fullscreen_idx == None`)
@@ -833,14 +836,17 @@ AI 待ちの `complete=false` final composite も表示専用の候補である�
 表示はキャッシュ欠落を挟まず原子的に差し替わる。コピー / 書き出しと nav lock 解除は従来どおり
 `complete=true` だけを受け付ける。
 
-#### 単ページのキーリピート中だけ使う通過ページ分岐
+#### ページ単位表示のキーリピート中だけ使う通過ページ分岐
 
-通常の単ページ表示では、上の優先順位へ入る前に
+通常のページ単位表示では、上の優先順位へ入る前に
 `fs_page_turn_materialization_for_frame` が描画品質を決める。同じ描画先 viewport の Win32
 frame edge queue に未消費の `FsPagePrev` / `FsPageNext`、単ページへフォールバックする
 `FsSpreadShift*`、または固定矢印の前後ページ入力が残り、カタログサムネイルも Loaded のときだけ
-`ThumbnailPassThrough` になる。この判定に経過時間は使わない。同一 egui frame の再 pass は
-frame / items generation / idx が一致する一時 cache の値を読むだけで、入力を再消費しない。
+`ThumbnailPassThrough` になる。ただし、現在の display unit に含まれる全ページの
+`final_composite_cache` が既に表示可能なら、入力 pending にかかわらず `Materialize` を返す。
+完成画像を一度出せる idx / 見開き unit は、同じ idx のままサムネイルへ降格しない。この判定に
+経過時間は使わない。同一 egui frame の再 pass は frame / items generation / idx が一致する
+一時 cache の値を読むだけで、入力や cache 在住状態を再評価しない。
 
 `ThumbnailPassThrough` は `resolve_fs_processed_texture` を呼ばず、カタログサムネイルをその idx の
 1 frame として描く。この frame は `ColorizeDisplayUnit` の旧ページ holdover も上に重ねない。
@@ -851,9 +857,10 @@ frame / items generation / idx が一致する一時 cache の値を読むだけ
 final-effect 先読み結果も、この frame に upload すれば同じ UI 予算を使うため一緒に保留する。
 入力が残らない最初の frame は即 `Materialize` へ戻り、通常の優先順位と backlog ペーシングで
 最終品質を作る。サムネイルが無ければ pending 入力中でも `Materialize` とし、従来の decode 待ちを
-保つ。これは品質作業だけの合流であり、ナビゲーションは従来どおり 1 frame 1 page、各 idx は
-最低 1 回 paint される。見開き、連結読み、ホイール、クリック、seek drag、ゲームパッド、
-スライドショー、編集・解析表示はこの分岐を使わない。
+保つ。これは品質作業だけの合流であり、ナビゲーションは従来どおり 1 frame 1 display unit、各 idx は
+最低 1 回 paint される。見開きは通常描画と同じ `SpreadDisplayUnit` の全ページがサムネイル準備済み、
+かつ display unit 全体の final composite がまだ揃っていないときだけ unit 全体を通過表示する。縦 / 横連結読み、
+ホイール、クリック、seek drag、ゲームパッド、スライドショー、編集・解析表示はこの分岐を使わない。
 
 `colorize_display_requires_final_effect(idx)` は、設定が有効かだけでなく、そのページで
 待たずに出せる画素と final-effect worker の出力が視覚的に変わるかを表す gate である。
