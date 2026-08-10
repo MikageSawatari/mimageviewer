@@ -54417,14 +54417,14 @@ impl App {
             return;
         }
         // A ready final-effect result still performs a full-size GPU upload on
-        // the UI thread. If the current display unit is only passing through because a
-        // page-turn edge remains in this input frame, leave channel results
-        // untouched. This includes adjacent prefetch results: uploading one of
-        // those would still spend the UI frame the pass-through path protects.
-        // The first frame without pending page input collects them.
+        // the UI thread. While a page-turn edge remains and catalog thumbnails
+        // cover the display unit, leave channel results untouched. This upload
+        // gate is independent of paint source: a resident final composite may be
+        // painted without admitting any new upload. Adjacent prefetch results use
+        // the same budget, so the first frame without pending page input collects them.
         let defer_page_turn_uploads = self.fullscreen_idx.is_some_and(|idx| {
-            self.fs_page_turn_materialization_for_frame(ctx, idx)
-                .is_thumbnail_pass_through()
+            self.fs_page_turn_decision_for_frame(ctx, idx)
+                .defer_ui_uploads()
         });
         if defer_page_turn_uploads {
             return;
@@ -59859,11 +59859,12 @@ impl App {
         // 2. 他の先読み分は FIFO 先頭から 1 枚だけ取り出す
         // 3. 同一フレームに未処理のページ送り入力が残る間は 0 枚。worker 完了物は
         //    backlog に保持し、入力が止まった最初のフレームで通常ペースへ戻す
+        //    (既存の final composite を描けるかどうかとは独立した gate)。
         // backlog は通常 <10 要素なので `Vec::remove` の O(n) は実質コストなし。
         let cur = self.fullscreen_idx;
         let defer_page_turn_uploads = cur.is_some_and(|idx| {
-            self.fs_page_turn_materialization_for_frame(ctx, idx)
-                .is_thumbnail_pass_through()
+            self.fs_page_turn_decision_for_frame(ctx, idx)
+                .defer_ui_uploads()
         });
         let (mut cur_pos, mut other_pos) = (None, None);
         if !defer_page_turn_uploads {

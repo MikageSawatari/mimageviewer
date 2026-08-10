@@ -191,7 +191,8 @@ wgpu の queue.write_texture が走る。20MP RGBA (78MB) で 26-58ms かかる�
 4. ただし **現在 `fullscreen_idx` に対応するエントリは即時アップロード** (表示遅延ゼロ)。例外は
    通常単ページのキーリピートで、同じ input frame に未消費の次ページ入力が残り、カタログ
    サムネイルを描ける frame。この frame は全 upload slot を保留し、入力が止まった最初の frame で
-   current 優先の通常ペースへ戻す
+   current 優先の通常ペースへ戻す。final composite が既に GPU 常駐している場合はそれを描くが、
+   upload slot の保留は解除しない (常駐 texture の paint と新規 upload は別判定)
 5. backlog が残っていれば `ctx.request_repaint()` で次フレーム継続
 
 実装は [src/app.rs `poll_prefetch`](../src/app.rs) 参照。
@@ -200,7 +201,7 @@ wgpu の queue.write_texture が走る。20MP RGBA (78MB) で 26-58ms かかる�
 未消費入力である。worker 結果は捨てず backlog / channel に留めるため、停止後に再 decode せず
 materialize できる。同一 egui frame の複数 pass では一時 cache の判定を再生し、query pass が
 入力を消費したり、replay pass が別の品質状態を arm したりしない。計測は
-`fs.page_turn_ready` に加え、判定 gate と Win32 edge 数を出す `fs.page_turn_decision`、
+`fs.page_turn_ready` に加え、paint source・`defer_ui_uploads`・Win32 edge 数を出す `fs.page_turn_decision`、
 egui-winit 翻訳直後の read-only `RawInput` 数を出す `fs.page_turn_winit_input`、
 root / fullscreen 等の egui 処理後 key event 数を出す `fs.page_turn_egui_input` を残す。
 `scripts/analyze_perf.py ... page-turn` は通過/実体化枚数、各 hold の ready→ready 間隔、

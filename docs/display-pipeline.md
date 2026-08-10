@@ -839,27 +839,32 @@ AI 待ちの `complete=false` final composite も表示専用の候補である�
 #### ページ単位表示のキーリピート中だけ使う通過ページ分岐
 
 通常のページ単位表示では、上の優先順位へ入る前に
-`fs_page_turn_materialization_for_frame` が描画品質を決める。同じ描画先 viewport の Win32
+`fs_page_turn_decision_for_frame` が `paint_source` と `defer_ui_uploads` を別々に決める。同じ描画先 viewport の Win32
 frame edge queue に未消費の `FsPagePrev` / `FsPageNext`、単ページへフォールバックする
-`FsSpreadShift*`、または固定矢印の前後ページ入力が残り、カタログサムネイルも Loaded のときだけ
-`ThumbnailPassThrough` になる。ただし、現在の display unit に含まれる全ページの
-`final_composite_cache` が既に表示可能なら、入力 pending にかかわらず `Materialize` を返す。
-完成画像を一度出せる idx / 見開き unit は、同じ idx のままサムネイルへ降格しない。この判定に
+`FsSpreadShift*`、または固定矢印の前後ページ入力が残り、カタログサムネイルも Loaded なら
+`defer_ui_uploads=true` になる。この upload 保留条件には final composite の在住状態を入れない。
+`paint_source=Thumbnail` になるのは upload 保留中かつ現在の display unit の final composite が
+まだ表示できない場合だけで、既に表示可能なら `paint_source=Composite` のままにする。
+そのため完成画像を一度出せる idx / 見開き unit はサムネイルへ降格せず、同時に新しい full-size upload
+は入力が続く間保留される。この判定に
 経過時間は使わない。同一 egui frame の再 pass は frame / items generation / idx が一致する
 一時 cache の値を読むだけで、入力や cache 在住状態を再評価しない。
 
-`ThumbnailPassThrough` は `resolve_fs_processed_texture` を呼ばず、カタログサムネイルをその idx の
+`paint_source=Thumbnail` は `resolve_fs_processed_texture` を呼ばず、カタログサムネイルをその idx の
 1 frame として描く。この frame は `ColorizeDisplayUnit` の旧ページ holdover も上に重ねない。
 重ねると `fs.paint` は出ても実際には通過 idx が見えず、「各ページを 1 frame 表示する」契約を
 破るためである。holdover 自体は保持し、停止ページの通常 materialize 待ちでは再び使う。
-`poll_prefetch` は decode 完了物を `fs_upload_backlog` まで受け取るが
-`ctx.load_texture` は行わず、`poll_final_effects` も完成結果を channel に残す。隣接ページの
+`defer_ui_uploads=true` の frame では `poll_prefetch` は decode 完了物を `fs_upload_backlog` まで受け取るが
+`ctx.load_texture` は行わず、`poll_final_effects` も完成結果を channel に残す。この規則は
+`paint_source` と独立している。隣接ページの
 final-effect 先読み結果も、この frame に upload すれば同じ UI 予算を使うため一緒に保留する。
-入力が残らない最初の frame は即 `Materialize` へ戻り、通常の優先順位と backlog ペーシングで
-最終品質を作る。サムネイルが無ければ pending 入力中でも `Materialize` とし、従来の decode 待ちを
+入力が残らない最初の frame は `defer_ui_uploads=false` へ戻り、通常の優先順位と backlog ペーシングで
+最終品質を作る。サムネイルが無ければ pending 入力中でも `paint_source=Composite` /
+`defer_ui_uploads=false` とし、従来の decode 待ちを
 保つ。これは品質作業だけの合流であり、ナビゲーションは従来どおり 1 frame 1 display unit、各 idx は
 最低 1 回 paint される。見開きは通常描画と同じ `SpreadDisplayUnit` の全ページがサムネイル準備済み、
-かつ display unit 全体の final composite がまだ揃っていないときだけ unit 全体を通過表示する。縦 / 横連結読み、
+なら unit 全体の upload を保留し、さらに display unit 全体の final composite がまだ揃っていないときだけ
+unit 全体をサムネイルで通過表示する。縦 / 横連結読み、
 ホイール、クリック、seek drag、ゲームパッド、スライドショー、編集・解析表示はこの分岐を使わない。
 
 `colorize_display_requires_final_effect(idx)` は、設定が有効かだけでなく、そのページで
