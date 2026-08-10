@@ -1012,6 +1012,11 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 渡すため GPU texture / mip chainを再利用する。一方、`egui-wgpu`は全callbackのprepare後にpaint
 するため、callbackごとに異なるuniformとbind groupは`CompareShaderSlot::{Main, Navigator}`ごとに
 保持し、後のprepareが先の描画状態を上書きしない。
+本文の primary 描画は `CompareFramePrimaryDraw` が排他的に所有する。現在ページに一致する
+`ComparePreparationState::Ready` があるフレームは準備済み比較だけを描き、`Unprepared` /
+`WaitingForSource` / `Preparing` と別ページの `Ready` は通常ページだけを描く。準備中に raw pinned
+texture や Wipe の切れ端を通常ページへ重ねず、準備済み比較を描いた後も nav / colorize holdover を
+重ねない。
 比較キャンバスの寸法は current 側の完成画像寸法を正本とし、縦横比が違う pinned 側は等比縮小して
 中央配置する。このとき pinned の範囲外はフルスクリーン viewport の既定背景と同じ不透明な黒で
 埋め、WGPU の alpha blend と CPU fallback のどちらでも下層の current を透過させない。Diff は

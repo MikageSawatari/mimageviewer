@@ -3138,7 +3138,6 @@ impl CompareViewMode {
 
 pub(crate) struct PinnedCompareSlot {
     pub(crate) pixels: Arc<egui::ColorImage>,
-    pub(crate) texture: Option<egui::TextureHandle>,
     /// 右下インジケーター専用の小型画像。フル解像度textureを72x54表示のためだけに
     /// uploadしないよう、compare-pin workerで事前縮小する。
     pub(crate) indicator_pixels: Arc<egui::ColorImage>,
@@ -8974,7 +8973,8 @@ pub struct App {
     pub(crate) export_pending: Option<crate::export_dialog::ExportPending>,
     /// Ctrl+E で現在表示中の実フォルダへ保存したため、グリッド復帰時に再読み込みする対象。
     pub(crate) export_folder_refresh_pending: Option<PathBuf>,
-    /// X / C 比較ビューのピン留めスロット。CPU pixels を正とし、texture は派生物。
+    /// X / C 比較ビューのピン留めスロット。CPU pixels を正とし、右下 indicator texture
+    /// だけを派生物として保持する。本文は準備済み比較 pair から描画する。
     pub(crate) pinned_compare_slot: Option<PinnedCompareSlot>,
     pub(crate) compare_view_mode: CompareViewMode,
     pub(crate) compare_pin_load_pending: Option<ComparePinLoadPending>,
@@ -26758,7 +26758,6 @@ impl App {
                 self.pinned_compare_slot = Some(PinnedCompareSlot {
                     source_size: pixels.size,
                     pixels: Arc::new(pixels),
-                    texture: None,
                     indicator_pixels: Arc::new(indicator_pixels),
                     indicator_texture: None,
                     display_name: display_name.clone(),

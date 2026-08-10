@@ -1249,6 +1249,17 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   比較準備 worker が pinned の範囲外をフルスクリーン既定背景と同じ不透明な黒で埋めるよう修正。
   PinnedNormal / Wipe は黒い余白を表示し、Diff は黒背景と current の差を余白にも表示する。
   異なる縦横比の余白画素と、同じ縦横比では従来の Lanczos 出力が変わらないことを単体テストで固定した。
+- 3 回目の真因 (2026-08-10): 不透明な黒余白へ直した後の実機スクリーンショットで、比較矩形の
+  外側に通常の現在ページが別レイヤーとして残ることを確認した。`draw_compare_prepared_mode` が
+  `false` を返す準備中 fallback は、単ページでは `draw_fs_image`、見開きでは `draw_fs_spread` で
+  通常ページを描いた直後、Wipe の raw pinned texture を狭い矩形へ重ねる二重描画だった。
+  PinnedNormal も準備中に raw pinned texture を先行表示し、通常ページだけを出す契約に反していた。
+  さらに primary の後段にある colorize / folder-nav の display-unit holdover は比較描画の成否を
+  見ず、状態が残っていれば通常ページ unit を同じ frame へ追加できた。
+  `CompareFramePrimaryDraw::{OrdinaryOnly, PreparedCompareOnly}` を primary 描画の単一 decision とし、
+  current に一致する `Ready` のときだけ比較を描く。それ以外は通常ページだけを描き、比較を描いた
+  フレームでは後段の nav / colorize holdover も重ねない。単ページ・見開きの両経路を同じ decision
+  に通し、準備中 / 準備完了 / 比較 OFF の排他を単体テストで固定した。
 
 ### 1.61 見開きでページが 1 枚ダブる (横長ページの寸法をキャッシュ在住に頼っている) — 利用者報告
 
