@@ -51,8 +51,6 @@ use crate::ui_helpers::{HoverTipExt, open_external_player};
 
 const COMPARE_INDICATOR_MAX_WIDTH: u32 = 72;
 const COMPARE_INDICATOR_MAX_HEIGHT: u32 = 54;
-const COMPARE_WIPE_MIN_FRACTION: f32 = 0.05;
-const COMPARE_WIPE_MAX_FRACTION: f32 = 0.95;
 const COMPARE_WIPE_GRAB_HALF_WIDTH: f32 = 14.0;
 // Tuned on real hardware to avoid a brief status flash on normal page turns.
 const COLORIZE_WAIT_INDICATOR_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
@@ -2326,7 +2324,7 @@ enum ComparePixelWorkPreparation {
 fn compare_prepare_scope(pair: SpreadPair) -> crate::app::ComparePrepareScope {
     match pair {
         SpreadPair::Single => crate::app::ComparePrepareScope::SinglePage,
-        SpreadPair::Double { .. } => crate::app::ComparePrepareScope::SpreadCurrentPage,
+        SpreadPair::Double { .. } => crate::app::ComparePrepareScope::Spread,
     }
 }
 
@@ -5543,10 +5541,17 @@ fn fullscreen_seek_knob_x(track_rect: egui::Rect, fraction: f32, rtl: bool) -> f
 }
 
 /// Compare wipe fractions are always measured across the fitted, zoomed and panned image rect.
-/// A fraction of 0 is the rect's left edge and 1 is its right edge; the UI's 5% endpoint guard is
-/// applied only when storing an interactive value.
+/// A fraction of 0 is the rect's left edge and 1 is its right edge.
 fn compare_wipe_screen_x(draw_rect: egui::Rect, fraction: f32) -> f32 {
     draw_rect.left() + draw_rect.width() * fraction.clamp(0.0, 1.0)
+}
+
+fn compare_wipe_line_visible(
+    image_rect: egui::Rect,
+    pointer_hover_pos: Option<egui::Pos2>,
+    touch_chrome_latched: bool,
+) -> bool {
+    touch_chrome_latched || pointer_hover_pos.is_some_and(|pos| image_rect.contains(pos))
 }
 
 fn compare_wipe_fraction_from_screen_x(
@@ -16858,8 +16863,7 @@ impl App {
                     compare_wipe_fraction_from_screen_x(draw_rect, viewport_rect, pos.x)
                 {
                     self.compare_view_mode = crate::app::CompareViewMode::Wipe {
-                        fraction: new_fraction
-                            .clamp(COMPARE_WIPE_MIN_FRACTION, COMPARE_WIPE_MAX_FRACTION),
+                        fraction: new_fraction,
                     };
                     ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                     ctx.request_repaint();
@@ -17795,7 +17799,13 @@ impl App {
         }
         if let Some(shader_shape) = shader_shape {
             painter.add(shader_shape.shape);
-            if let crate::app::CompareViewMode::Wipe { fraction } = mode {
+            if let crate::app::CompareViewMode::Wipe { fraction } = mode
+                && compare_wipe_line_visible(
+                    shader_shape.draw_rect,
+                    ctx.input(|input| input.pointer.hover_pos()),
+                    self.still_touch_chrome_is_latched(ctx),
+                )
+            {
                 Self::paint_compare_wipe_line(painter, shader_shape.draw_rect, fraction);
             }
             return true;
@@ -17833,7 +17843,13 @@ impl App {
                     egui::pos2(wipe_x, layout.content_rect.bottom()),
                 );
                 paint_texture(&painter.with_clip_rect(pinned_clip), &pinned);
-                Self::paint_compare_wipe_line(painter, layout.content_rect, fraction);
+                if compare_wipe_line_visible(
+                    layout.content_rect,
+                    ctx.input(|input| input.pointer.hover_pos()),
+                    self.still_touch_chrome_is_latched(ctx),
+                ) {
+                    Self::paint_compare_wipe_line(painter, layout.content_rect, fraction);
+                }
             }
             crate::app::CompareViewMode::Diff => {
                 let Some(tex) =
@@ -22663,19 +22679,54 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Result<ComparePixelWorkPreparation, String> {
-        // 見開き全体を1枚の比較キャンバスにすると、幅が約2倍になり、CPU pairと
-        // pinned/currentの完全mip chainがともに約2倍になる。固定上限で画質を落とさず、
-        // 見開き時だけ現在ページ1枚を比較対象にして資源量を単ページへ戻す。
-        let scope = compare_prepare_scope(self.resolve_visible_spread_pair(idx));
-        match self.prepare_compare_pixel_job(ctx, idx)? {
-            CapturePixelJobPreparation::WaitingForSource => {
-                Ok(ComparePixelWorkPreparation::WaitingForSource)
+        let pair = self.resolve_visible_spread_pair(idx);
+        let scope = compare_prepare_scope(pair);
+        match pair {
+            SpreadPair::Single => match self.prepare_compare_pixel_job(ctx, idx)? {
+                CapturePixelJobPreparation::WaitingForSource => {
+                    Ok(ComparePixelWorkPreparation::WaitingForSource)
+                }
+                CapturePixelJobPreparation::Ready(job) => Ok(ComparePixelWorkPreparation::Ready {
+                    work: crate::capture::CapturePixelWork::Single(job),
+                    scope,
+                    source_indices: vec![idx],
+                }),
+            },
+            SpreadPair::Double { left, right } => {
+                // gap は設定値の絶対 pixel 数ではなく、直近フレームで実際に描画された
+                // 左右ページ幅に対する比率を使う。ページ切替直後などレイアウトが古い場合は
+                // 通常表示で新しい配置が確定するまで待つ。
+                let Some(gap_ratio) = self
+                    .fullscreen_page_layout
+                    .spread_gap_to_page_width_ratio(left, right)
+                else {
+                    return Ok(ComparePixelWorkPreparation::WaitingForSource);
+                };
+                let left_job = match self.prepare_compare_pixel_job(ctx, left)? {
+                    CapturePixelJobPreparation::WaitingForSource => {
+                        return Ok(ComparePixelWorkPreparation::WaitingForSource);
+                    }
+                    CapturePixelJobPreparation::Ready(job) => job,
+                };
+                let right_job = match self.prepare_compare_pixel_job(ctx, right)? {
+                    CapturePixelJobPreparation::WaitingForSource => {
+                        return Ok(ComparePixelWorkPreparation::WaitingForSource);
+                    }
+                    CapturePixelJobPreparation::Ready(job) => job,
+                };
+                let basename = crate::capture::basename_from_text(&format!(
+                    "{}_{}",
+                    left_job.basename, right_job.basename
+                ));
+                let work = crate::capture::CapturePixelWork::spread_with_displayed_gap(
+                    basename, left_job, right_job, gap_ratio,
+                )?;
+                Ok(ComparePixelWorkPreparation::Ready {
+                    work,
+                    scope,
+                    source_indices: vec![left, right],
+                })
             }
-            CapturePixelJobPreparation::Ready(job) => Ok(ComparePixelWorkPreparation::Ready {
-                work: crate::capture::CapturePixelWork::Single(job),
-                scope,
-                source_indices: vec![idx],
-            }),
         }
     }
 
@@ -22740,7 +22791,7 @@ impl App {
                     return false;
                 }
             };
-        let expected_target_size = match current_work.output_size() {
+        let expected_target_size = match current_work.compare_output_size() {
             Ok(size) => size,
             Err(err) => {
                 self.deactivate_compare_view();
@@ -22767,7 +22818,7 @@ impl App {
         let thread = std::thread::Builder::new()
             .name("compare-prepare".into())
             .spawn(move || {
-                let result = crate::capture::run_pixel_work(current_work).and_then(
+                let result = crate::capture::run_compare_pixel_work(current_work).and_then(
                     |(_basename, width, height, current_rgba)| {
                         let pinned_source_rgba =
                             crate::capture::color_image_to_rgba(pinned_pixels.as_ref());
@@ -23810,7 +23861,13 @@ impl App {
             let bg_style = self.fs_bg_style(ctx);
             paint_transparent_bg(ui.painter(), shader_shape.draw_rect, &bg_style);
             ui.painter().add(shader_shape.shape);
-            if let crate::app::CompareViewMode::Wipe { fraction } = mode {
+            if let crate::app::CompareViewMode::Wipe { fraction } = mode
+                && compare_wipe_line_visible(
+                    shader_shape.draw_rect,
+                    ctx.input(|input| input.pointer.hover_pos()),
+                    self.still_touch_chrome_is_latched(ctx),
+                )
+            {
                 // 白線はシェーダーの合成境界 (draw_rect = フィット後の実表示画像矩形) に揃える。
                 Self::draw_compare_wipe_line(ui, shader_shape.draw_rect, fraction);
             }
@@ -23875,7 +23932,13 @@ impl App {
                     Some(clip),
                     fit_scale_limits,
                 );
-                Self::draw_compare_wipe_line(ui, ref_rect, fraction);
+                if compare_wipe_line_visible(
+                    ref_rect,
+                    ctx.input(|input| input.pointer.hover_pos()),
+                    self.still_touch_chrome_is_latched(ctx),
+                ) {
+                    Self::draw_compare_wipe_line(ui, ref_rect, fraction);
+                }
                 true
             }
             crate::app::CompareViewMode::Diff => {
@@ -27020,7 +27083,7 @@ impl App {
         let thread = std::thread::Builder::new()
             .name("compare-pin".into())
             .spawn(move || {
-                let result = crate::capture::run_pixel_work(work).and_then(
+                let result = crate::capture::run_compare_pixel_work(work).and_then(
                     |(basename, width, height, rgba)| {
                         let source = image::RgbaImage::from_raw(width, height, rgba)
                             .ok_or_else(|| "比較画像のRGBAサイズが不正です".to_string())?;
@@ -27579,17 +27642,21 @@ impl App {
                 .prepare_capture_pixel_job(ctx, idx)
                 .map(crate::capture::CapturePixelWork::Single),
             SpreadPair::Double { left, right } => {
+                let gap_ratio = self
+                    .fullscreen_page_layout
+                    .spread_gap_to_page_width_ratio(left, right)
+                    .ok_or_else(|| {
+                        "見開き表示の配置が未確定です。もう一度実行してください".to_string()
+                    })?;
                 let left_job = self.prepare_capture_pixel_job(ctx, left)?;
                 let right_job = self.prepare_capture_pixel_job(ctx, right)?;
                 let basename = crate::capture::basename_from_text(&format!(
                     "{}_{}",
                     left_job.basename, right_job.basename
                 ));
-                Ok(crate::capture::CapturePixelWork::Spread {
-                    basename,
-                    left: left_job,
-                    right: right_job,
-                })
+                crate::capture::CapturePixelWork::spread_with_displayed_gap(
+                    basename, left_job, right_job, gap_ratio,
+                )
             }
         }
     }
@@ -31823,14 +31890,14 @@ mod tests {
     }
 
     #[test]
-    fn compare_spread_prepares_only_the_current_page_scope() {
+    fn compare_spread_prepares_the_whole_spread_scope() {
         assert_eq!(
             compare_prepare_scope(SpreadPair::Single),
             crate::app::ComparePrepareScope::SinglePage
         );
         assert_eq!(
             compare_prepare_scope(SpreadPair::Double { left: 4, right: 5 }),
-            crate::app::ComparePrepareScope::SpreadCurrentPage
+            crate::app::ComparePrepareScope::Spread
         );
     }
 
@@ -36597,6 +36664,32 @@ mod tests {
                 fraction,
             ));
         }
+    }
+
+    #[test]
+    fn compare_wipe_line_uses_image_hover_or_touch_chrome_latch() {
+        let image = egui::Rect::from_min_max(egui::pos2(100.0, 50.0), egui::pos2(900.0, 750.0));
+
+        assert!(!compare_wipe_line_visible(image, None, false));
+        assert!(compare_wipe_line_visible(
+            image,
+            Some(image.center()),
+            false
+        ));
+        assert!(!compare_wipe_line_visible(
+            image,
+            Some(egui::pos2(50.0, 400.0)),
+            false
+        ));
+        assert!(compare_wipe_line_visible(image, None, true));
+    }
+
+    #[test]
+    fn compare_wipe_screen_position_allows_both_image_edges() {
+        let image = egui::Rect::from_min_max(egui::pos2(100.0, 50.0), egui::pos2(900.0, 750.0));
+
+        assert_eq!(compare_wipe_screen_x(image, 0.0), image.left());
+        assert_eq!(compare_wipe_screen_x(image, 1.0), image.right());
     }
 
     #[test]

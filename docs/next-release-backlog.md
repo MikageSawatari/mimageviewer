@@ -1265,22 +1265,23 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   current に一致する `Ready` のときだけ比較を描く。それ以外は通常ページだけを描き、比較を描いた
   フレームでは後段の nav / colorize holdover も重ねない。単ページ・見開きの両経路を同じ decision
   に通し、準備中 / 準備完了 / 比較 OFF の排他を単体テストで固定した。
-- 見開き比較OOMの計測と対策 (2026-08-10、実機確認待ち): 実機の最大canvas
-  `8320x7296` はRGBA 1枚が242,810,880 bytes。修正前の`ComparePreparedPair`は
-  pinned/currentの`Vec<u8>` 2枚とpinned/current/diffの`ColorImage` 3枚を重複保持していたため、
-  定常CPU量は1,214,054,400 bytesだった。Windows callbackのpinned/current完全mip 2枚は
-  647,495,328 bytesで、旧GPU組は新規確保前にdrop済みだった。mipは大縮小時のモアレ抑制に
-  実使用されているため撤去しない。
-  - 準備payloadをtyped化し、WindowsのWipe/DiffはRGBA 2枚 (同寸法なら485,621,760 bytes)、
+- 見開き比較の寸法上限・確保量対策 (2026-08-10、実機確認待ち): 実機の最大canvas
+  `8320x7296` は、egui-wgpuのdevice descriptorとアプリ共通の`MAX_TEXTURE_DIM=8192`を幅で超えていた。
+  当初はpanicの`Out of Memory`表示と確保量からメモリ不足と読んだが、利用者環境はRAM 128GB / VRAM
+  24GBであり、この読みは可能性が低い。上限を超えたtexture作成要求を真因として扱う。
+  - 確保量の無駄は真因と独立して削減した。準備payloadをtyped化し、WindowsのWipe/DiffはRGBA 2枚、
     PinnedNormalはpinned 1枚、CPU fallbackのWipeは2枚、DiffはDiff時だけ差分1枚を保持する。
     `TextureHandle`へは`Arc<ColorImage>`を直接渡し、追加のdeep cloneも作らない。
   - ページ移動で旧receiverを捨てて次の途中cancel不能workerを並走できた経路を、
     `Preparing` / `Draining`の単一ownerへ直列化した。旧CPU pairとcallback GPU pairを次worker開始前に
     解放し、`[compare-memory]`へtarget、CPU/GPU合計bytes、buffer/texture数、mip有無、解放順を出す。
-  - 上記だけでは問題canvasのGPU量647,495,328 bytesが減らないため、見開き中だけ現在ページ1枚を
-    比較対象にする。問題の左右同寸法ケースでは`4160x7296`となり、CPU 242,810,880 bytes、
-    完全mip付きGPU 323,747,432 bytesへ半減する。固定サイズ上限、空きメモリ依存分岐、OOMの
-    握りつぶしは入れていない。
+  - 利用者判断を更新し、見開きは現在ページ1枚へ縮退せず左右ページ全体を比較する。直近の
+    `FullscreenPageLayout`からページ幅に対する中央gap比率を取り、左・黒gap・右の順に合成する。
+    合成後canvasが一辺8192を超える場合だけ全体をLanczos等比縮小する。`8320x7296`は`8192x7184`。
+    上限内は画素を変更しない。独自WGPU texture作成直前の8192 guardもbackstopとして維持する。
+- Wipe線の表示条件・端点更新 (2026-08-10、利用者決定): 白線はポインタが比較画像をhover中だけ表示し、
+  画像外では隠す。touchはhoverが無いため静止画touch chrome latch中も表示する。線位置、CPU clip、
+  GPU uniformをすべて`0.0..=1.0`へ統一し、5%/95%制限を除いて左右端までドラッグ可能にした。
 
 ### 1.61 見開きでページが 1 枚ダブる (横長ページの寸法をキャッシュ在住に頼っている) — 利用者報告
 

@@ -337,13 +337,16 @@ impl CompareGpuResources {
             })
             .unwrap_or(true);
         if recreate {
+            if compare_texture_extent(callback.width, callback.height).is_none() {
+                return;
+            }
             // 新textureを確保する前に旧組をdropし、8K比較で旧/new組が同時に
             // VRAMへ残る時間を作らない。wgpu backend側のin-flight解放遅延を除けば、
             // CompareGpuResourcesが所有する完全mip chainは常に2枚までになる。
             let released_gpu_bytes = self.pair.take().map_or(0, |(_, pair)| {
                 rgba8_texture_bytes(pair.width, pair.height, true) * 2
             });
-            let pinned = upload_rgba_texture(
+            let Some(pinned) = upload_rgba_texture(
                 device,
                 queue,
                 "miv_compare_pinned_texture",
@@ -351,8 +354,10 @@ impl CompareGpuResources {
                 callback.height,
                 &callback.pinned_rgba,
                 &self.mipmap_generator,
-            );
-            let current = upload_rgba_texture(
+            ) else {
+                return;
+            };
+            let Some(current) = upload_rgba_texture(
                 device,
                 queue,
                 "miv_compare_current_texture",
@@ -360,7 +365,9 @@ impl CompareGpuResources {
                 callback.height,
                 &callback.current_rgba,
                 &self.mipmap_generator,
-            );
+            ) else {
+                return;
+            };
             let slots = CompareGpuSlots::new(
                 device,
                 &self.bind_group_layout,
@@ -423,6 +430,29 @@ struct UploadedTexture {
     view: wgpu::TextureView,
 }
 
+fn compare_texture_extent(width: u32, height: u32) -> Option<wgpu::Extent3d> {
+    crate::capture::validate_compare_canvas_size([
+        usize::try_from(width).ok()?,
+        usize::try_from(height).ok()?,
+    ])
+    .ok()?;
+    Some(wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    })
+}
+
+fn create_compare_texture<T>(
+    width: u32,
+    height: u32,
+    create: impl FnOnce(wgpu::Extent3d) -> T,
+) -> Option<(wgpu::Extent3d, T)> {
+    let size = compare_texture_extent(width, height)?;
+    let texture = create(size);
+    Some((size, texture))
+}
+
 fn upload_rgba_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -431,24 +461,21 @@ fn upload_rgba_texture(
     height: u32,
     rgba: &[u8],
     mipmap_generator: &egui_wgpu::MipmapGenerator,
-) -> UploadedTexture {
-    let size = wgpu::Extent3d {
-        width,
-        height,
-        depth_or_array_layers: 1,
-    };
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size,
-        mip_level_count: egui_wgpu::mip_level_count(width, height),
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_DST
-            | wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
+) -> Option<UploadedTexture> {
+    let (size, texture) = create_compare_texture(width, height, |size| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size,
+            mip_level_count: egui_wgpu::mip_level_count(width, height),
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+    })?;
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &texture,
@@ -466,7 +493,7 @@ fn upload_rgba_texture(
     );
     mipmap_generator.generate(device, queue, &texture);
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    UploadedTexture { texture, view }
+    Some(UploadedTexture { texture, view })
 }
 
 fn uniform_bytes(mode: CompareShaderMode, wipe_fraction: f32, uv_window: [f32; 4]) -> [u8; 32] {
@@ -476,7 +503,7 @@ fn uniform_bytes(mode: CompareShaderMode, wipe_fraction: f32, uv_window: [f32; 4
     };
     let values = [
         mode,
-        wipe_fraction.clamp(0.05, 0.95),
+        wipe_fraction.clamp(0.0, 1.0),
         0.0,
         0.0,
         uv_window[0],
@@ -554,8 +581,8 @@ impl egui_wgpu::CallbackTrait for CompareShaderCallback {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompareShaderMode, CompareShaderSlot, SHADER, rgba8_texture_bytes, uniform_bytes,
-        uniform_write,
+        CompareShaderMode, CompareShaderSlot, SHADER, create_compare_texture, rgba8_texture_bytes,
+        uniform_bytes, uniform_write,
     };
 
     #[test]
@@ -632,5 +659,28 @@ mod tests {
             &navigator.bytes,
             &uniform_bytes(CompareShaderMode::Wipe, 0.37, [0.0, 0.0, 1.0, 1.0])
         );
+    }
+
+    #[test]
+    fn compare_canvas_over_limit_never_reaches_texture_creation() {
+        let creation_reached = std::cell::Cell::new(false);
+        let rejected = create_compare_texture(crate::app::MAX_TEXTURE_DIM as u32 + 1, 1, |_| {
+            creation_reached.set(true);
+        });
+
+        assert!(rejected.is_none());
+        assert!(!creation_reached.get());
+        assert!(create_compare_texture(crate::app::MAX_TEXTURE_DIM as u32, 1, |_| ()).is_some());
+    }
+
+    #[test]
+    fn compare_uniform_allows_wipe_at_both_image_edges() {
+        for fraction in [0.0, 1.0] {
+            let bytes = uniform_bytes(CompareShaderMode::Wipe, fraction, [0.0, 0.0, 1.0, 1.0]);
+            assert_eq!(
+                f32::from_ne_bytes(bytes[4..8].try_into().unwrap()),
+                fraction
+            );
+        }
     }
 }

@@ -1021,14 +1021,26 @@ texture や Wipe の切れ端を通常ページへ重ねず、準備済み比較
 中央配置する。このとき pinned の範囲外はフルスクリーン viewport の既定背景と同じ不透明な黒で
 埋め、WGPU の alpha blend と CPU fallback のどちらでも下層の current を透過させない。Diff は
 この黒背景と current の画素差を表示するため、current が黒でない余白は「差あり」として見える。
-見開き表示中も比較キャンバスは現在ページ1枚を単位とし、左右2ページのunionを巨大なtextureへ
-連結しない。比較準備workerは同時に1本だけ所有し、失効した途中cancel不能workerは`Draining`で
+見開き表示中は左右ページを画面上の順に並べ、実描画された左右ページ幅に対する中央 gap の比率を
+`FullscreenPageLayout` から取得して、不透明な黒の gap を挟んだ見開き全体を比較キャンバスにする。
+ページ切替直後など直近レイアウトのページ組が一致しないフレームは古い比率を流用せず、通常表示で
+配置が確定するまで `WaitingForSource` と同じく準備を待つ。
+比較キャンバスは縦横とも `MAX_TEXTURE_DIM = 8192` 以下にする。左右ページと gap を先に合成し、
+完成キャンバスのどちらか一辺が上限を超える場合だけ、全体を Lanczos で等比縮小して準備する。
+`8320x7296` なら `8192x7184` となり、gap も画像と同率で縮む。上限内のキャンバスは寸法も画素も
+変更しない。独自 WGPU upload は同じ判定を texture 作成の直前にも通し、normal path 以外の入口が
+増えても上限超過の texture を作らない。
+比較準備workerは同時に1本だけ所有し、失効した途中cancel不能workerは`Draining`で
 完了を回収してから次要求を開始する。描画方式ごとのtyped CPU payloadにより、WindowsのWipe / Diffは
 pinned/current RGBA 2枚だけを保持し、Diff用CPU画像 / managed textureはCPU fallbackのDiff時だけ作る。
 本文の比較 callback は、ズーム / パン後の実画像矩形と viewport の交差だけを callback rect にし、
 切り落とした範囲を uniform の UV 窓で元の合成画像座標へ戻す。テクスチャ採取と Wipe 境界判定は
 復元後の座標を共有するため、白線の基準である実画像矩形と一致する。ナビゲータは実画像矩形が
 パネル内に収まり UV 窓が常に全域となるので、このクリップによる表示変更はない。
+Wipe の白線はポインタが各画像矩形を hover している間だけ描き、画像外へ出たら隠す。タッチには
+hover が無いため、静止画の touch chrome latch が ON の間はパネルハンドルと同じ条件で白線を
+表示する。境界 fraction は CPU の線 / clip と GPU uniform の双方で `0.0..=1.0` とし、左右端まで
+ドラッグできる。
 通常の単ページ / 見開きで利用者入力から `fs_pan` を更新するときは、直前の
 `FullscreenPageLayout` に記録された実表示矩形を使い、少なくとも 1 ページが viewport と
 各軸 48 logical point（ページまたは viewport がそれより小さい軸では、その小さい方の全幅）

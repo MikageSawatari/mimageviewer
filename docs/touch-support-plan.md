@@ -582,6 +582,14 @@ cross-frame state を新規 arm しない。pointer release の遷移は input h
 navigator / capture selection / compare wipe の早期 return より前に必ず実行する。
 パネル外タップ後の touch / mouse drag と、terminal / replay / Cancel の各終端を unit test で固定した。
 
+#### 比較 Wipe 境界線の touch 表示 (利用者決定 2026-08-10)
+
+- Wipe の白線は通常、ポインタが比較画像矩形を hover している間だけ表示し、画像外では隠す
+- touch には hover が無いため、`TouchChromeLatched` が ON の間はパネルハンドルと同じ条件で
+  白線を表示する。独立した touch 用 latch や時間切れは追加しない
+- 境界は左右端の `0.0..=1.0` まで動かせる。画面上の白線 / clip と GPU uniform の clamp を
+  同じ範囲に保ち、線と合成 seam をずらさない
+
 上バーの可視判定は既に純関数 `still_top_bar_visible_from_inputs` (`ui_fullscreen.rs:1018-1027`)
 なので、入力構造体に 1 フィールド足すだけで済む。テストも既存パターンに乗る。
 
