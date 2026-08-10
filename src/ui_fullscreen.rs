@@ -5550,11 +5550,12 @@ fn compare_wipe_screen_x(draw_rect: egui::Rect, fraction: f32) -> f32 {
 }
 
 fn compare_wipe_line_visible(
-    image_rect: egui::Rect,
+    draw_rect: egui::Rect,
     pointer_hover_pos: Option<egui::Pos2>,
-    touch_chrome_latched: bool,
+    fraction: f32,
+    dragging: bool,
 ) -> bool {
-    touch_chrome_latched || pointer_hover_pos.is_some_and(|pos| image_rect.contains(pos))
+    dragging || pointer_hover_pos.is_some_and(|pos| compare_wipe_grab_hit(draw_rect, pos, fraction))
 }
 
 fn compare_wipe_fraction_from_screen_x(
@@ -5571,6 +5572,21 @@ fn compare_wipe_grab_hit(draw_rect: egui::Rect, pointer: egui::Pos2, fraction: f
     draw_rect.contains(pointer)
         && (pointer.x - compare_wipe_screen_x(draw_rect, fraction)).abs()
             <= COMPARE_WIPE_GRAB_HALF_WIDTH
+}
+
+fn align_compare_color_image_to_canvas(
+    pixels: &egui::ColorImage,
+    target_size: [usize; 2],
+) -> Result<Vec<u8>, String> {
+    let rgba = crate::capture::color_image_to_rgba(pixels);
+    crate::capture::align_rgba_to_canvas_lanczos(
+        pixels.size[0] as u32,
+        pixels.size[1] as u32,
+        &rgba,
+        target_size[0] as u32,
+        target_size[1] as u32,
+        egui::Color32::BLACK,
+    )
 }
 
 /// Restrict the compare callback to the viewport and map its local UVs back into the full image.
@@ -5685,10 +5701,14 @@ fn log_compare_geometry_if_changed(
         |(layout, source_clip_rect)| compare_geometry_log_navigator(layout, source_clip_rect),
     );
     let line = format!(
-        "[compare-geometry] caller={caller} mode={mode_name} fraction={fraction} pair_key={} current_idx={} pinned_idx={} image_rect={} zoom_pan={} target={}x{} draw_rect={} visible={} uv_window={} callback_rect={} wipe_x={} navigator_content={} navigator_yellow={} navigator_inputs=[{}]",
+        "[compare-geometry] caller={caller} mode={mode_name} fraction={fraction} pair_key={} current_idx={} pinned_idx={} current_input={}x{} pinned_input={}x{} image_rect={} zoom_pan={} target={}x{} draw_rect={} visible={} uv_window={} callback_rect={} wipe_x={} navigator_content={} navigator_yellow={} navigator_inputs=[{}]",
         pair.key,
         pair.current_idx,
         pair.pinned_source_idx,
+        pair.current_input_size[0],
+        pair.current_input_size[1],
+        pair.pinned_input_size[0],
+        pair.pinned_input_size[1],
         compare_geometry_log_rect(image_rect),
         compare_geometry_log_zoom_pan(zoom_pan),
         pair.target_size[0],
@@ -17781,7 +17801,8 @@ impl App {
                 && compare_wipe_line_visible(
                     shader_shape.draw_rect,
                     ctx.input(|input| input.pointer.hover_pos()),
-                    self.still_touch_chrome_is_latched(ctx),
+                    fraction,
+                    self.compare_wipe_dragging,
                 )
             {
                 Self::paint_compare_wipe_line(painter, shader_shape.draw_rect, fraction);
@@ -17824,7 +17845,8 @@ impl App {
                 if compare_wipe_line_visible(
                     layout.content_rect,
                     ctx.input(|input| input.pointer.hover_pos()),
-                    self.still_touch_chrome_is_latched(ctx),
+                    fraction,
+                    self.compare_wipe_dragging,
                 ) {
                     Self::paint_compare_wipe_line(painter, layout.content_rect, fraction);
                 }
@@ -22697,7 +22719,6 @@ impl App {
             crate::app::ComparePreparationState::Preparing(_)
                 | crate::app::ComparePreparationState::Draining(_)
         ) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
             return false;
         }
 
@@ -22733,7 +22754,7 @@ impl App {
                     return false;
                 }
             };
-        let expected_target_size = match current_job.compare_output_size() {
+        let current_input_size = match current_job.output_size() {
             Ok(size) => size,
             Err(err) => {
                 self.deactivate_compare_view();
@@ -22741,6 +22762,15 @@ impl App {
                 return false;
             }
         };
+        let expected_target_size =
+            match crate::capture::fit_compare_canvas_for_sources(current_input_size, pinned_size) {
+                Ok(size) => size,
+                Err(err) => {
+                    self.deactivate_compare_view();
+                    self.show_feedback_toast(err);
+                    return false;
+                }
+            };
         let released_cpu_bytes = self
             .compare_preparation
             .prepared_pair()
@@ -22748,80 +22778,114 @@ impl App {
         self.compare_preparation = crate::app::ComparePreparationState::Unprepared;
         self.clear_compare_gpu_pair();
         crate::logger::log(format!(
-            "[compare-memory] stage=prepare-start target={}x{} scope={} output={} cpu_total_bytes=0 released_cpu_bytes={} gpu_total_bytes=0 old_pair_release=before_worker",
+            "[compare-memory] stage=prepare-start target={}x{} current_input={}x{} pinned_input={}x{} scope={} output={} cpu_total_bytes=0 released_cpu_bytes={} gpu_total_bytes=0 old_pair_release=before_worker",
             expected_target_size[0],
             expected_target_size[1],
+            current_input_size[0],
+            current_input_size[1],
+            pinned_size[0],
+            pinned_size[1],
             scope.label(),
             request.output.label(),
             released_cpu_bytes,
         ));
         let (tx, rx) = std::sync::mpsc::channel();
         let output = request.output;
+        let repaint_ctx = ctx.clone();
+        let started_at = std::time::Instant::now();
         let thread = std::thread::Builder::new()
             .name("compare-prepare".into())
             .spawn(move || {
-                let result = crate::capture::run_compare_pixel_job(current_job).and_then(
-                    |(_basename, width, height, current_rgba)| {
-                        let pinned_source_rgba =
-                            crate::capture::color_image_to_rgba(pinned_pixels.as_ref());
-                        let pinned_rgba = crate::capture::align_rgba_to_canvas_lanczos(
-                            pinned_size[0] as u32,
-                            pinned_size[1] as u32,
-                            &pinned_source_rgba,
-                            width,
-                            height,
-                            // フルスクリーン viewport の既定背景と同じ黒。透明余白にすると
-                            // alpha blend で下の current が透けるため、比較キャンバス側で
-                            // pinned の範囲外を不透明に確定する。
-                            egui::Color32::BLACK,
-                        )?;
-                        let size = [width as usize, height as usize];
-                        let pixels = match output {
-                            crate::app::ComparePrepareOutput::ShaderPair => {
-                                crate::app::ComparePreparedPixels::ShaderPair {
-                                    pinned_rgba: Arc::new(pinned_rgba),
-                                    current_rgba: Arc::new(current_rgba),
+                let result = if output == crate::app::ComparePrepareOutput::PinnedTexture {
+                    let width = expected_target_size[0] as u32;
+                    let height = expected_target_size[1] as u32;
+                    align_compare_color_image_to_canvas(
+                        pinned_pixels.as_ref(),
+                        expected_target_size,
+                    )
+                    .map(|pinned_rgba| crate::app::ComparePrepareResult {
+                        current_idx: fs_idx,
+                        pinned_source_idx,
+                        width,
+                        height,
+                        pixels: crate::app::ComparePreparedPixels::PinnedTexture(Arc::new(
+                            egui::ColorImage::from_rgba_unmultiplied(
+                                expected_target_size,
+                                &pinned_rgba,
+                            ),
+                        )),
+                    })
+                } else {
+                    crate::capture::run_compare_pixel_job(current_job).and_then(
+                        |(_basename, current_width, current_height, current_source_rgba)| {
+                            let width = expected_target_size[0] as u32;
+                            let height = expected_target_size[1] as u32;
+                            let current_rgba = crate::capture::align_rgba_to_canvas_lanczos(
+                                current_width,
+                                current_height,
+                                &current_source_rgba,
+                                width,
+                                height,
+                                egui::Color32::BLACK,
+                            )?;
+                            let pinned_rgba = align_compare_color_image_to_canvas(
+                                pinned_pixels.as_ref(),
+                                expected_target_size,
+                            )?;
+                            let size = [width as usize, height as usize];
+                            let pixels = match output {
+                                crate::app::ComparePrepareOutput::ShaderPair => {
+                                    crate::app::ComparePreparedPixels::ShaderPair {
+                                        pinned_rgba: Arc::new(pinned_rgba),
+                                        current_rgba: Arc::new(current_rgba),
+                                    }
                                 }
-                            }
-                            crate::app::ComparePrepareOutput::PinnedTexture => {
-                                crate::app::ComparePreparedPixels::PinnedTexture(Arc::new(
-                                    egui::ColorImage::from_rgba_unmultiplied(size, &pinned_rgba),
-                                ))
-                            }
-                            crate::app::ComparePrepareOutput::WipeTextures => {
-                                crate::app::ComparePreparedPixels::WipeTextures {
-                                    pinned: Arc::new(egui::ColorImage::from_rgba_unmultiplied(
-                                        size,
+                                crate::app::ComparePrepareOutput::PinnedTexture => {
+                                    crate::app::ComparePreparedPixels::PinnedTexture(Arc::new(
+                                        egui::ColorImage::from_rgba_unmultiplied(
+                                            size,
+                                            &pinned_rgba,
+                                        ),
+                                    ))
+                                }
+                                crate::app::ComparePrepareOutput::WipeTextures => {
+                                    crate::app::ComparePreparedPixels::WipeTextures {
+                                        pinned: Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+                                            size,
+                                            &pinned_rgba,
+                                        )),
+                                        current: Arc::new(
+                                            egui::ColorImage::from_rgba_unmultiplied(
+                                                size,
+                                                &current_rgba,
+                                            ),
+                                        ),
+                                    }
+                                }
+                                crate::app::ComparePrepareOutput::DiffTexture => {
+                                    let diff_rgba = crate::capture::diff_rgba_color(
+                                        width,
+                                        height,
                                         &pinned_rgba,
-                                    )),
-                                    current: Arc::new(egui::ColorImage::from_rgba_unmultiplied(
-                                        size,
                                         &current_rgba,
-                                    )),
+                                    )?;
+                                    crate::app::ComparePreparedPixels::DiffTexture(Arc::new(
+                                        egui::ColorImage::from_rgba_unmultiplied(size, &diff_rgba),
+                                    ))
                                 }
-                            }
-                            crate::app::ComparePrepareOutput::DiffTexture => {
-                                let diff_rgba = crate::capture::diff_rgba_color(
-                                    width,
-                                    height,
-                                    &pinned_rgba,
-                                    &current_rgba,
-                                )?;
-                                crate::app::ComparePreparedPixels::DiffTexture(Arc::new(
-                                    egui::ColorImage::from_rgba_unmultiplied(size, &diff_rgba),
-                                ))
-                            }
-                        };
-                        Ok(crate::app::ComparePrepareResult {
-                            current_idx: fs_idx,
-                            pinned_source_idx,
-                            width,
-                            height,
-                            pixels,
-                        })
-                    },
-                );
+                            };
+                            Ok(crate::app::ComparePrepareResult {
+                                current_idx: fs_idx,
+                                pinned_source_idx,
+                                width,
+                                height,
+                                pixels,
+                            })
+                        },
+                    )
+                };
                 let _ = tx.send(result);
+                repaint_ctx.request_repaint();
             });
 
         match thread {
@@ -22831,12 +22895,14 @@ impl App {
                         request,
                         scope,
                         source_indices,
+                        current_input_size,
+                        pinned_input_size: pinned_size,
                         expected_target_size,
+                        started_at,
                         rx,
                     },
                 );
                 self.show_feedback_toast("比較表示を準備中".to_string());
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             Err(err) => {
                 self.compare_preparation = crate::app::ComparePreparationState::Unprepared;
@@ -23807,7 +23873,8 @@ impl App {
                 && compare_wipe_line_visible(
                     shader_shape.draw_rect,
                     ctx.input(|input| input.pointer.hover_pos()),
-                    self.still_touch_chrome_is_latched(ctx),
+                    fraction,
+                    self.compare_wipe_dragging,
                 )
             {
                 // 白線はシェーダーの合成境界 (draw_rect = フィット後の実表示画像矩形) に揃える。
@@ -23877,7 +23944,8 @@ impl App {
                 if compare_wipe_line_visible(
                     ref_rect,
                     ctx.input(|input| input.pointer.hover_pos()),
-                    self.still_touch_chrome_is_latched(ctx),
+                    fraction,
+                    self.compare_wipe_dragging,
                 ) {
                     Self::draw_compare_wipe_line(ui, ref_rect, fraction);
                 }
@@ -27157,6 +27225,7 @@ impl App {
     }
 
     pub(crate) fn toggle_compare_pinned_view(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        let switch_started = std::time::Instant::now();
         if self.reject_compare_action_in_spread(fs_idx) {
             return;
         }
@@ -27171,12 +27240,38 @@ impl App {
             crate::app::CompareViewMode::Diff => crate::app::CompareViewMode::Off,
         };
         if matches!(next_mode, crate::app::CompareViewMode::Off) {
-            self.deactivate_compare_view();
+            if matches!(
+                self.compare_view_mode,
+                crate::app::CompareViewMode::PinnedNormal
+            ) {
+                self.hide_compare_pinned_view();
+            } else {
+                self.deactivate_compare_view();
+            }
         } else {
             self.compare_view_mode = next_mode;
             self.compare_wipe_dragging = false;
-            self.clear_compare_gpu_pair();
-            self.ensure_compare_prepared_pair(ctx, fs_idx);
+            let reused = self.compare_prepared_pair_matches(fs_idx);
+            if reused {
+                if let Some(pair) = self.compare_preparation.prepared_pair() {
+                    crate::logger::log(format!(
+                        "[compare-memory] stage=pinned-ready-reused target={}x{} current_input={}x{} pinned_input={}x{} output=pinned-texture switch_ms={:.3} cpu_total_bytes={} gpu_textures={} worker_started=false",
+                        pair.target_size[0],
+                        pair.target_size[1],
+                        pair.current_input_size[0],
+                        pair.current_input_size[1],
+                        pair.pinned_input_size[0],
+                        pair.pinned_input_size[1],
+                        switch_started.elapsed().as_secs_f64() * 1000.0,
+                        pair.allocated_cpu_bytes(),
+                        usize::from(pair.pinned_texture.is_some()),
+                    ));
+                }
+                ctx.request_repaint();
+            } else {
+                self.clear_compare_gpu_pair();
+                self.ensure_compare_prepared_pair(ctx, fs_idx);
+            }
         }
         let label = match self.compare_view_mode {
             crate::app::CompareViewMode::PinnedNormal => "[比較: ピン表示]",
@@ -31758,6 +31853,8 @@ mod tests {
                 key: 1,
                 current_idx: 7,
                 pinned_source_idx: 2,
+                current_input_size: [1, 1],
+                pinned_input_size: [1, 1],
                 target_size: [1, 1],
                 pixels: crate::app::ComparePreparedPixels::PinnedTexture(pixels),
                 pinned_texture: None,
@@ -31886,6 +31983,63 @@ mod tests {
     }
 
     #[test]
+    fn c_off_on_retains_the_prepared_pinned_buffer_without_starting_a_worker() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let pinned = std::sync::Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::WHITE));
+        app.fullscreen_idx = Some(7);
+        app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+            pixels: pinned.clone(),
+            indicator_pixels: pinned.clone(),
+            indicator_texture: None,
+            display_name: "pinned".to_string(),
+            source_idx: 2,
+            source_size: [8, 12],
+        });
+        app.compare_view_mode = crate::app::CompareViewMode::PinnedNormal;
+        app.compare_preparation =
+            crate::app::ComparePreparationState::Ready(crate::app::ComparePreparedPair {
+                key: 41,
+                current_idx: 7,
+                pinned_source_idx: 2,
+                current_input_size: [8, 12],
+                pinned_input_size: [8, 12],
+                target_size: [8, 12],
+                pixels: crate::app::ComparePreparedPixels::PinnedTexture(pinned),
+                pinned_texture: None,
+                current_texture: None,
+                diff_texture: None,
+            });
+
+        app.toggle_compare_pinned_view(&ctx, 7);
+        assert!(matches!(
+            app.compare_view_mode,
+            crate::app::CompareViewMode::Off
+        ));
+        assert!(matches!(
+            app.compare_preparation,
+            crate::app::ComparePreparationState::Ready(ref pair) if pair.key == 41
+        ));
+
+        app.toggle_compare_pinned_view(&ctx, 7);
+        assert!(matches!(
+            app.compare_view_mode,
+            crate::app::CompareViewMode::PinnedNormal
+        ));
+        assert!(matches!(
+            app.compare_preparation,
+            crate::app::ComparePreparationState::Ready(ref pair) if pair.key == 41
+        ));
+
+        app.toggle_compare_pinned_view(&ctx, 7);
+        app.invalidate_compare_prepared_for_idx(7);
+        assert!(matches!(
+            app.compare_preparation,
+            crate::app::ComparePreparationState::Unprepared
+        ));
+    }
+
+    #[test]
     fn spread_compare_shortcuts_only_show_single_page_guidance() {
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
@@ -31948,7 +32102,10 @@ mod tests {
                 request,
                 scope: crate::app::ComparePrepareScope::SinglePage,
                 source_indices: vec![7],
+                current_input_size: [8320, 7296],
+                pinned_input_size: [4160, 7296],
                 expected_target_size: [8320, 7296],
+                started_at: std::time::Instant::now(),
                 rx,
             });
 
@@ -32000,7 +32157,10 @@ mod tests {
                 request,
                 scope: crate::app::ComparePrepareScope::SinglePage,
                 source_indices: vec![7],
+                current_input_size: [3, 5],
+                pinned_input_size: [2, 3],
                 expected_target_size: [3, 5],
+                started_at: std::time::Instant::now(),
                 rx,
             });
 
@@ -32061,7 +32221,10 @@ mod tests {
                 request,
                 scope: crate::app::ComparePrepareScope::SinglePage,
                 source_indices: vec![7],
+                current_input_size: [3, 3],
+                pinned_input_size: [2, 3],
                 expected_target_size: [3, 3],
+                started_at: std::time::Instant::now(),
                 rx,
             });
 
@@ -36701,21 +36864,25 @@ mod tests {
     }
 
     #[test]
-    fn compare_wipe_line_uses_image_hover_or_touch_chrome_latch() {
+    fn compare_wipe_line_uses_drag_or_the_same_grab_band_as_input() {
         let image = egui::Rect::from_min_max(egui::pos2(100.0, 50.0), egui::pos2(900.0, 750.0));
+        let fraction = 0.25;
+        let line_x = compare_wipe_screen_x(image, fraction);
 
-        assert!(!compare_wipe_line_visible(image, None, false));
+        assert!(!compare_wipe_line_visible(image, None, fraction, false));
         assert!(compare_wipe_line_visible(
             image,
-            Some(image.center()),
+            Some(egui::pos2(line_x, image.center().y)),
+            fraction,
             false
         ));
         assert!(!compare_wipe_line_visible(
             image,
-            Some(egui::pos2(50.0, 400.0)),
+            Some(egui::pos2(image.right() - 1.0, image.center().y)),
+            fraction,
             false
         ));
-        assert!(compare_wipe_line_visible(image, None, true));
+        assert!(compare_wipe_line_visible(image, None, fraction, true));
     }
 
     #[test]

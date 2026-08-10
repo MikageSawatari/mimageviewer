@@ -755,7 +755,8 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
   水平フル/垂直cropではU=Repeat、水平cropではU=ClampToEdgeを選び、低LODで部分画像の
   反対端が混ざらないようにする。経度シームではU微分を周期補正して`textureSampleGrad`へ渡し、
   シームだけ過度に粗いmipが選ばれることを防ぐ。比較callbackは現在のpinned/current textureと
-  mip chainを1組だけ保持し、解除・再準備時に旧組を解放する。本文 / ナビゲータのuniform bufferと
+  mip chainを1組だけ保持し、入力失効・別サイズの再準備時に旧組を解放する。Cの通常表示へ戻る操作では
+  準備済みpinned buffer / managed textureを保持し、同じcurrentへ再表示するときはworkerを起動しない。本文 / ナビゲータのuniform bufferと
   bind groupはtyped slotごとに分ける。右下のピン表示は72x54以下の専用textureを使う。1つの
   `TextureHandle` 内に全 level を保持するので、表示 texture の優先順位、論理サイズ、zoom、
   見開き、連結読み、ルーペ、pixel grid の座標系は変更しない。
@@ -1022,8 +1023,9 @@ texture や Wipe の切れ端を通常ページへ重ねず、準備済み比較
 layout結果ではなく表示モードで拒否する。ページ移動や表示モード変更で比較中に見開き表示モードへ
 入った場合は、フレーム先頭で比較を終了してから通常の見開きを描く。
 見開き側の primary 分岐には比較準備・比較描画を置かない。
-比較キャンバスの寸法は current 側の完成画像寸法を正本とし、縦横比が違う pinned 側は等比縮小して
-中央配置する。このとき pinned の範囲外はフルスクリーン viewport の既定背景と同じ不透明な黒で
+比較キャンバスは current 側の縦横比を正本とし、その比率を維持したまま pinned 側の入力寸法も
+不必要な縮小なしで収まる解像度まで引き上げる。縦横比が違う pinned 側は等比で中央配置する。
+このとき pinned の範囲外はフルスクリーン viewport の既定背景と同じ不透明な黒で
 埋め、WGPU の alpha blend と CPU fallback のどちらでも下層の current を透過させない。Diff は
 この黒背景と current の画素差を表示するため、current が黒でない余白は「差あり」として見える。
 単ページ画像は decode 時点で `MAX_TEXTURE_DIM = 8192` 以下だが、比較workerも完成キャンバスが上限を
@@ -1031,15 +1033,17 @@ layout結果ではなく表示モードで拒否する。ページ移動や表�
 独自 WGPU upload も同じ判定を texture 作成の直前に通し、別入口が増えても上限超過の texture を
 作らない。
 比較準備workerは同時に1本だけ所有し、失効した途中cancel不能workerは`Draining`で
-完了を回収してから次要求を開始する。描画方式ごとのtyped CPU payloadにより、WindowsのWipe / Diffは
+完了を回収してから次要求を開始する。workerは結果送信直後にeguiへrepaintを要求し、100ms tickを
+待たずに完了を回収する。PinnedNormalはcurrentの完成寸法だけをworker開始前に使い、不要なcurrent RGBAを
+生成しない。描画方式ごとのtyped CPU payloadにより、WindowsのWipe / Diffは
 pinned/current RGBA 2枚だけを保持し、Diff用CPU画像 / managed textureはCPU fallbackのDiff時だけ作る。
 本文の比較 callback は、ズーム / パン後の実画像矩形と viewport の交差だけを callback rect にし、
 切り落とした範囲を uniform の UV 窓で元の合成画像座標へ戻す。テクスチャ採取と Wipe 境界判定は
 復元後の座標を共有するため、白線の基準である実画像矩形と一致する。ナビゲータは実画像矩形が
 パネル内に収まり UV 窓が常に全域となるので、このクリップによる表示変更はない。
-Wipe の白線はポインタが各画像矩形を hover している間だけ描き、画像外へ出たら隠す。タッチには
-hover が無いため、静止画の touch chrome latch が ON の間はパネルハンドルと同じ条件で白線を
-表示する。境界 fraction は CPU の線 / clip と GPU uniform の双方で `0.0..=1.0` とし、左右端まで
+Wipe の白線はドラッグ中、またはポインタが`compare_wipe_grab_hit`と同じgrab band内にある間だけ描く。
+画像上のそれ以外の場所では隠し、touch chrome latchは表示条件に使わない。タッチ由来のprimary dragも
+`compare_wipe_dragging`を共有するため、指でドラッグしている間は表示する。境界 fraction は CPU の線 / clip と GPU uniform の双方で `0.0..=1.0` とし、左右端まで
 ドラッグできる。
 通常の単ページ / 見開きで利用者入力から `fs_pan` を更新するときは、直前の
 `FullscreenPageLayout` に記録された実表示矩形を使い、少なくとも 1 ページが viewport と

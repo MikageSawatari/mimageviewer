@@ -3919,6 +3919,8 @@ pub(crate) struct ComparePreparedPair {
     pub(crate) key: u64,
     pub(crate) current_idx: usize,
     pub(crate) pinned_source_idx: usize,
+    pub(crate) current_input_size: [usize; 2],
+    pub(crate) pinned_input_size: [usize; 2],
     pub(crate) target_size: [usize; 2],
     pub(crate) pixels: ComparePreparedPixels,
     pub(crate) pinned_texture: Option<egui::TextureHandle>,
@@ -4063,7 +4065,10 @@ pub(crate) struct ComparePreparePending {
     pub(crate) request: ComparePrepareRequest,
     pub(crate) scope: ComparePrepareScope,
     pub(crate) source_indices: Vec<usize>,
+    pub(crate) current_input_size: [usize; 2],
+    pub(crate) pinned_input_size: [usize; 2],
     pub(crate) expected_target_size: [usize; 2],
+    pub(crate) started_at: std::time::Instant,
     pub(crate) rx: mpsc::Receiver<Result<ComparePrepareResult, String>>,
 }
 
@@ -26956,7 +26961,6 @@ impl App {
         let result = match pending.rx.try_recv() {
             Ok(result) => result,
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 return;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -27048,11 +27052,16 @@ impl App {
                 }
 
                 crate::logger::log(format!(
-                    "[compare-memory] stage=cpu-ready target={}x{} scope={} output={} cpu_total_bytes={} cpu_buffers={} gpu_total_bytes=0 gpu_mips=not-allocated old_pair_release=before_worker",
+                    "[compare-memory] stage=cpu-ready target={}x{} current_input={}x{} pinned_input={}x{} scope={} output={} prepare_ms={:.3} cpu_total_bytes={} cpu_buffers={} gpu_total_bytes=0 gpu_mips=not-allocated old_pair_release=before_worker",
                     result_size[0],
                     result_size[1],
+                    pending.current_input_size[0],
+                    pending.current_input_size[1],
+                    pending.pinned_input_size[0],
+                    pending.pinned_input_size[1],
                     scope.label(),
                     result.pixels.output().label(),
+                    pending.started_at.elapsed().as_secs_f64() * 1000.0,
                     result.pixels.allocated_bytes(),
                     result.pixels.buffer_count(),
                 ));
@@ -27063,6 +27072,8 @@ impl App {
                     key,
                     current_idx: result.current_idx,
                     pinned_source_idx: result.pinned_source_idx,
+                    current_input_size: pending.current_input_size,
+                    pinned_input_size: pending.pinned_input_size,
                     target_size: result_size,
                     pixels: result.pixels,
                     pinned_texture: None,
@@ -57704,6 +57715,34 @@ impl App {
         if let Some(render_state) = self.wgpu_render_state.as_ref() {
             let mut renderer = render_state.renderer.write();
             crate::compare_wgpu::clear_gpu_pair(&mut renderer.callback_resources);
+        }
+    }
+
+    /// Cで通常表示へ戻るだけなら、次のCで同じ固定画像を即座に再表示できるよう
+    /// 準備済みの固定側CPU/GPU資源を保持する。
+    pub(crate) fn hide_compare_pinned_view(&mut self) {
+        let retain_ready = self
+            .compare_preparation
+            .prepared_pair()
+            .is_some_and(|pair| matches!(&pair.pixels, ComparePreparedPixels::PinnedTexture(_)));
+        if !retain_ready {
+            self.deactivate_compare_view();
+            return;
+        }
+        self.compare_view_mode = CompareViewMode::Off;
+        self.compare_wipe_dragging = false;
+        if let Some(pair) = self.compare_preparation.prepared_pair() {
+            crate::logger::log(format!(
+                "[compare-memory] stage=pinned-hidden-retained target={}x{} current_input={}x{} pinned_input={}x{} output=pinned-texture cpu_total_bytes={} gpu_textures={} reuse=next-c",
+                pair.target_size[0],
+                pair.target_size[1],
+                pair.current_input_size[0],
+                pair.current_input_size[1],
+                pair.pinned_input_size[0],
+                pair.pinned_input_size[1],
+                pair.allocated_cpu_bytes(),
+                usize::from(pair.pinned_texture.is_some()),
+            ));
         }
     }
 

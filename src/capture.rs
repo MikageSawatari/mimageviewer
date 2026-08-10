@@ -143,6 +143,7 @@ impl CapturePixelJob {
     }
 
     /// 比較用 texture として公開できる出力キャンバス寸法。
+    #[cfg(test)]
     pub(crate) fn compare_output_size(&self) -> Result<[usize; 2], String> {
         fit_compare_canvas_size(self.output_size()?)
     }
@@ -160,6 +161,24 @@ pub(crate) fn fit_compare_canvas_size(size: [usize; 2]) -> Result<[usize; 2], St
     let width = ((size[0] as f64 * scale).round() as usize).clamp(1, crate::app::MAX_TEXTURE_DIM);
     let height = ((size[1] as f64 * scale).round() as usize).clamp(1, crate::app::MAX_TEXTURE_DIM);
     validate_compare_canvas_size([width, height])
+}
+
+/// Keep the current page's displayed aspect ratio, but do not throw away pinned-side detail
+/// merely because the current page has fewer source pixels. The final texture-limit fit is
+/// applied after the shared canvas size is chosen.
+pub(crate) fn fit_compare_canvas_for_sources(
+    current_size: [usize; 2],
+    pinned_size: [usize; 2],
+) -> Result<[usize; 2], String> {
+    if current_size[0] == 0 || current_size[1] == 0 || pinned_size[0] == 0 || pinned_size[1] == 0 {
+        return Err("比較表示のサイズが不正です".to_string());
+    }
+    let scale = 1.0_f64
+        .max(pinned_size[0] as f64 / current_size[0] as f64)
+        .max(pinned_size[1] as f64 / current_size[1] as f64);
+    let width = (current_size[0] as f64 * scale).ceil() as usize;
+    let height = (current_size[1] as f64 * scale).ceil() as usize;
+    fit_compare_canvas_size([width, height])
 }
 
 pub(crate) fn validate_compare_canvas_size(size: [usize; 2]) -> Result<[usize; 2], String> {
@@ -1060,6 +1079,30 @@ mod tests {
         let (_basename, width, height, rgba) = run_compare_pixel_job(job).unwrap();
         assert_eq!((width, height), (2, 1));
         assert_eq!(rgba, expected);
+    }
+
+    #[test]
+    fn compare_canvas_keeps_current_aspect_without_reducing_a_larger_pinned_input() {
+        assert_eq!(
+            fit_compare_canvas_for_sources([4, 4], [3584, 4608]).unwrap(),
+            [4608, 4608]
+        );
+        assert_eq!(
+            fit_compare_canvas_for_sources([3680, 5504], [4096, 6144]).unwrap(),
+            [4108, 6144]
+        );
+        assert_eq!(
+            fit_compare_canvas_for_sources([2000, 3000], [1000, 1500]).unwrap(),
+            [2000, 3000]
+        );
+    }
+
+    #[test]
+    fn compare_canvas_for_sources_applies_texture_limit_after_choosing_the_canvas() {
+        assert_eq!(
+            fit_compare_canvas_for_sources([8320, 7296], [9000, 7000]).unwrap(),
+            [8192, 7184]
+        );
     }
 
     #[test]
