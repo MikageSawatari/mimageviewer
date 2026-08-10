@@ -204,9 +204,6 @@ struct FlatNavigatorLayout {
 
 struct CompareShaderShape {
     draw_rect: egui::Rect,
-    visible_rect: egui::Rect,
-    uv_window: [f32; 4],
-    callback_rect: egui::Rect,
     shape: egui::Shape,
 }
 
@@ -243,12 +240,6 @@ const COMPARE_MAIN_SHADER_SLOT: crate::compare_wgpu::CompareShaderSlot =
     crate::compare_wgpu::CompareShaderSlot::Main;
 const COMPARE_NAVIGATOR_SHADER_SLOT: crate::compare_wgpu::CompareShaderSlot =
     crate::compare_wgpu::CompareShaderSlot::Navigator;
-
-#[derive(Clone)]
-struct CompareGeometryLogState {
-    frame: u64,
-    line: String,
-}
 
 /// Processed full-image resources already resolved by the page draw path for this frame.
 /// Missing entries deliberately fall back to the catalog thumbnail in `draw_fs_navigator`.
@@ -5602,148 +5593,6 @@ fn compare_shader_visible_region(
     let uv_min = (visible.min - draw_rect.min) / size;
     let uv_max = (visible.max - draw_rect.min) / size;
     Some((visible, [uv_min.x, uv_min.y, uv_max.x, uv_max.y]))
-}
-
-fn compare_geometry_log_rect(rect: egui::Rect) -> String {
-    format!(
-        "({:.3},{:.3})-({:.3},{:.3})",
-        rect.left(),
-        rect.top(),
-        rect.right(),
-        rect.bottom()
-    )
-}
-
-fn compare_geometry_log_uv_window(uv_window: [f32; 4]) -> String {
-    format!(
-        "({:.6},{:.6})-({:.6},{:.6})",
-        uv_window[0], uv_window[1], uv_window[2], uv_window[3]
-    )
-}
-
-fn compare_geometry_log_zoom_pan(zoom_pan: Option<(f32, egui::Vec2)>) -> String {
-    zoom_pan.map_or_else(
-        || "none".to_string(),
-        |(zoom, pan)| format!("zoom={zoom:.6},pan=({:.3},{:.3})", pan.x, pan.y),
-    )
-}
-
-fn compare_geometry_log_mode(mode: crate::app::CompareViewMode) -> (&'static str, Option<f32>) {
-    match mode {
-        crate::app::CompareViewMode::Off => ("Off", None),
-        crate::app::CompareViewMode::PinnedNormal => ("PinnedNormal", None),
-        crate::app::CompareViewMode::Wipe { fraction } => ("Wipe", Some(fraction)),
-        crate::app::CompareViewMode::Diff => ("Diff", None),
-    }
-}
-
-fn compare_geometry_log_navigator(
-    layout: &FlatNavigatorLayout,
-    source_clip_rect: egui::Rect,
-) -> (String, String, String) {
-    let inputs = layout
-        .pages
-        .iter()
-        .map(|page| {
-            let visible_uv = page
-                .main
-                .visible_source_uv_rect(source_clip_rect)
-                .map_or_else(|| "none".to_string(), compare_geometry_log_rect);
-            format!(
-                "page={} full_uv={} visible_uv={}",
-                page.main.page_idx,
-                compare_geometry_log_rect(page.main.uv_rect),
-                visible_uv
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("|");
-    (
-        compare_geometry_log_rect(layout.content_rect),
-        compare_geometry_log_rect(layout.visible_rect),
-        inputs,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn log_compare_geometry_if_changed(
-    ctx: &egui::Context,
-    frame: u64,
-    caller: &'static str,
-    mode: crate::app::CompareViewMode,
-    image_rect: egui::Rect,
-    zoom_pan: Option<(f32, egui::Vec2)>,
-    pair: &crate::app::ComparePreparedPair,
-    draw_rect: egui::Rect,
-    shader_shape: Option<&CompareShaderShape>,
-    navigator: Option<(&FlatNavigatorLayout, egui::Rect)>,
-) {
-    let (mode_name, fraction) = compare_geometry_log_mode(mode);
-    let fraction = fraction.map_or_else(|| "n/a".to_string(), |value| format!("{value:.6}"));
-    let (visible, uv_window, callback_rect) = shader_shape.map_or_else(
-        || ("n/a".to_string(), "n/a".to_string(), "n/a".to_string()),
-        |shape| {
-            (
-                compare_geometry_log_rect(shape.visible_rect),
-                compare_geometry_log_uv_window(shape.uv_window),
-                compare_geometry_log_rect(shape.callback_rect),
-            )
-        },
-    );
-    let wipe_x = match mode {
-        crate::app::CompareViewMode::Wipe { fraction } => {
-            format!("{:.3}", compare_wipe_screen_x(draw_rect, fraction))
-        }
-        _ => "n/a".to_string(),
-    };
-    let (nav_content, nav_yellow, nav_inputs) = navigator.map_or_else(
-        || ("n/a".to_string(), "n/a".to_string(), "n/a".to_string()),
-        |(layout, source_clip_rect)| compare_geometry_log_navigator(layout, source_clip_rect),
-    );
-    let line = format!(
-        "[compare-geometry] caller={caller} mode={mode_name} fraction={fraction} pair_key={} current_idx={} pinned_idx={} current_input={}x{} pinned_input={}x{} image_rect={} zoom_pan={} target={}x{} draw_rect={} visible={} uv_window={} callback_rect={} wipe_x={} navigator_content={} navigator_yellow={} navigator_inputs=[{}]",
-        pair.key,
-        pair.current_idx,
-        pair.pinned_source_idx,
-        pair.current_input_size[0],
-        pair.current_input_size[1],
-        pair.pinned_input_size[0],
-        pair.pinned_input_size[1],
-        compare_geometry_log_rect(image_rect),
-        compare_geometry_log_zoom_pan(zoom_pan),
-        pair.target_size[0],
-        pair.target_size[1],
-        compare_geometry_log_rect(draw_rect),
-        visible,
-        uv_window,
-        callback_rect,
-        wipe_x,
-        nav_content,
-        nav_yellow,
-        nav_inputs,
-    );
-    let id = egui::Id::new(("compare_geometry_log", caller));
-    let should_log = ctx.data_mut(|data| {
-        let previous = data.get_temp::<CompareGeometryLogState>(id);
-        let continuously_seen = previous.as_ref().is_some_and(|previous| {
-            previous.frame == frame || previous.frame.wrapping_add(1) == frame
-        });
-        let changed = previous
-            .as_ref()
-            .is_none_or(|previous| previous.line != line);
-        data.insert_temp(
-            id,
-            CompareGeometryLogState {
-                frame,
-                line: line.clone(),
-            },
-        );
-        !continuously_seen || changed
-    });
-    if should_log {
-        // TEMPORARY instrumentation: 原因確定後は回帰テストへ置き換えてこのログを撤去する。
-        crate::logger::log(line);
-    }
 }
 
 fn fullscreen_rect_excluding_fixed_bars(
@@ -17732,7 +17581,6 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
         layout: &FlatNavigatorLayout,
-        source_clip_rect: egui::Rect,
         painter: &egui::Painter,
     ) -> bool {
         let mode = self.compare_view_mode;
@@ -17767,34 +17615,6 @@ impl App {
                     crate::app::CompareViewMode::Off
                     | crate::app::CompareViewMode::PinnedNormal => None,
                 });
-        let draw_rect = shader_shape
-            .as_ref()
-            .map(|shape| shape.draw_rect)
-            .or_else(|| {
-                self.compare_preparation.prepared_pair().and_then(|pair| {
-                    Self::compare_image_draw_rect(
-                        layout.content_rect,
-                        pair.target_size,
-                        None,
-                        self.fullscreen_fit_scale_limits(ctx.pixels_per_point()),
-                    )
-                })
-            });
-        if let (Some(pair), Some(draw_rect)) = (self.compare_preparation.prepared_pair(), draw_rect)
-        {
-            log_compare_geometry_if_changed(
-                ctx,
-                self.frame_counter,
-                "navigator",
-                mode,
-                layout.content_rect,
-                None,
-                pair,
-                draw_rect,
-                shader_shape.as_ref(),
-                Some((layout, source_clip_rect)),
-            );
-        }
         if let Some(shader_shape) = shader_shape {
             painter.add(shader_shape.shape);
             if let crate::app::CompareViewMode::Wipe { fraction } = mode
@@ -18000,7 +17820,7 @@ impl App {
 
         let canvas_painter = painter.with_clip_rect(layout.canvas_rect);
         canvas_painter.rect_filled(layout.canvas_rect, 0.0, egui::Color32::BLACK);
-        if !self.draw_compare_navigator_content(ctx, fs_idx, &layout, image_rect, &canvas_painter) {
+        if !self.draw_compare_navigator_content(ctx, fs_idx, &layout, &canvas_painter) {
             for page in &layout.pages {
                 let thumbnail = match self.thumbnails.get(page.main.page_idx) {
                     Some(ThumbnailState::Loaded { tex, .. }) => Some(tex),
@@ -23044,9 +22864,6 @@ impl App {
         };
         Some(CompareShaderShape {
             draw_rect,
-            visible_rect: callback_rect,
-            uv_window,
-            callback_rect,
             shape: egui::Shape::Callback(egui_wgpu::Callback::new_paint_callback(
                 callback_rect,
                 callback,
@@ -23837,34 +23654,6 @@ impl App {
                 ),
                 _ => None,
             });
-        let draw_rect = shader_shape
-            .as_ref()
-            .map(|shape| shape.draw_rect)
-            .or_else(|| {
-                self.compare_preparation.prepared_pair().and_then(|pair| {
-                    Self::compare_image_draw_rect(
-                        image_rect,
-                        pair.target_size,
-                        zoom_pan,
-                        self.fullscreen_fit_scale_limits(ctx.pixels_per_point()),
-                    )
-                })
-            });
-        if let (Some(pair), Some(draw_rect)) = (self.compare_preparation.prepared_pair(), draw_rect)
-        {
-            log_compare_geometry_if_changed(
-                ctx,
-                self.frame_counter,
-                "main",
-                mode,
-                image_rect,
-                zoom_pan,
-                pair,
-                draw_rect,
-                shader_shape.as_ref(),
-                None,
-            );
-        }
         if let Some(shader_shape) = shader_shape {
             let bg_style = self.fs_bg_style(ctx);
             paint_transparent_bg(ui.painter(), shader_shape.draw_rect, &bg_style);
