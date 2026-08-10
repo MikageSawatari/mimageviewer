@@ -208,6 +208,50 @@ select {
   bottom: max(78px, calc(env(safe-area-inset-bottom) + 64px));
 }
 
+.telemetry-hud-header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 7px;
+  white-space: nowrap;
+}
+
+.telemetry-hud-body {
+  display: block;
+}
+
+.page-prefetch-indicator {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 1px;
+  font-size: 9px;
+  line-height: 1;
+  letter-spacing: -1px;
+}
+
+.page-prefetch-dot-ready {
+  color: #43d17b;
+}
+
+.page-prefetch-dot-active {
+  color: #ffd45a;
+}
+
+.page-prefetch-dot-missing {
+  color: #05070a;
+  text-shadow:
+    0 0 1px rgb(255 255 255 / 78%),
+    0 0 2px rgb(255 255 255 / 42%);
+}
+
+.page-prefetch-divider {
+  margin: 0 1px;
+  color: #b9c1cc;
+  letter-spacing: 0;
+}
+
 .pin-screen {
   display: grid;
   width: 100%;

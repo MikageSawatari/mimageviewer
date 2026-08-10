@@ -309,6 +309,12 @@ test("video health HUD and persistent debug-tier warning stay wired", async () =
   assert.match(css, /#telemetry-hud\[data-telemetry-tier="debug"\]/);
   assert.match(app, /dataset\.viewerKind = video \? "video" : "default"/);
   assert.match(css, /#telemetry-hud\[data-viewer-kind="video"\][\s\S]*bottom:/);
+  assert.match(app, /pageResourceCache\.statusForKeys\(plan\.behindKeys\)/);
+  assert.match(app, /setAttribute\("aria-label", summary\.accessibleLabel\)/);
+  assert.match(app, /hudElement\.setAttribute\([\s\S]*prefetch\?\.title/);
+  assert.match(css, /\.page-prefetch-dot-ready[\s\S]*#43d17b/);
+  assert.match(css, /\.page-prefetch-dot-active[\s\S]*#ffd45a/);
+  assert.match(css, /\.page-prefetch-dot-missing[\s\S]*#05070a/);
 });
 
 test("colorize controls use the adjustment preview and commit path without losing custom points", async () => {

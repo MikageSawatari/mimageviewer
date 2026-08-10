@@ -2473,6 +2473,56 @@ export function pagePrefetchPlan({
   return result;
 }
 
+/// HUD は物理ページ番号ではなく、読書上の「後方 / 前方」を左右に固定して見せる。
+/// 後方は現在地に近い点が区切り側へ来るよう、画面上では遠い順に並べる。
+export function pagePrefetchHudPlan({
+  visibleIndexes,
+  itemCount,
+  direction,
+  ahead = 3,
+  behind = 1,
+}) {
+  const aheadIndexes = pagePrefetchPlan({
+    visibleIndexes,
+    itemCount,
+    direction,
+    ahead,
+    behind: 0,
+  });
+  const behindNearToFar = pagePrefetchPlan({
+    visibleIndexes,
+    itemCount,
+    direction,
+    ahead: 0,
+    behind,
+  });
+  return {
+    behindIndexes: behindNearToFar.reverse(),
+    aheadIndexes,
+  };
+}
+
+export function pagePrefetchIndicatorSummary({ behind = [], ahead = [] } = {}) {
+  const normalize = (values) => (Array.isArray(values) ? values : []).map((value) =>
+    value === "ready" || value === "active" ? value : "missing"
+  );
+  const normalizedBehind = normalize(behind);
+  const normalizedAhead = normalize(ahead);
+  const statuses = [...normalizedBehind, ...normalizedAhead];
+  const readyCount = statuses.filter((status) => status === "ready").length;
+  const activeCount = statuses.filter((status) => status === "active").length;
+  const missingCount = statuses.length - readyCount - activeCount;
+  return {
+    behind: normalizedBehind,
+    ahead: normalizedAhead,
+    readyCount,
+    activeCount,
+    missingCount,
+    accessibleLabel:
+      `先読み: 取得済み ${readyCount} / 取得中 ${activeCount} / 未取得 ${missingCount}`,
+  };
+}
+
 const VIEWER_PAGE_DISPLAY_OUTCOMES = new Set(["applied", "not_applied"]);
 const VIEWER_PAGE_DISPLAY_REASONS = new Set([
   "dom_committed",

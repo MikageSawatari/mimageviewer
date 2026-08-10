@@ -1978,3 +1978,34 @@ versioned な別 key である。画質 UI は標本がある preset にだけ
 3. **同じ取得結果の再表示を新しい標本として数えない。** 戻る / fit 変更 / resize で
    同じ blob を出し直すたびに計上され、「直近 N ページ」が 1 枚の再表示で埋まっていた。
    request ID で重複を弾く (記憶は有界)。
+
+### 14.7 見開き再構成の単一 owner と先読み HUD (2026-08-11)
+
+見開き保存後と viewport resize がそれぞれ `refreshContainerSpread` → `loadContainer` を
+直接呼び、共有 `requestController` を互いに abort していた。負けた `loadContainer` は
+`false` を返し、呼び出し側も表示を更新せず終了するため、最後に残るべき表示義務そのものが
+消え得た。また見開き保存の promise は write と refresh を同じ `catch` で囲んでいたため、
+refresh の追い越しまで write 失敗として扱い、fallback refresh をもう 1 件発行していた。
+
+見開き再構成は `LatestOnlyTaskQueue` を owner とする 1 本の入口へ集約した。実行中の 1 件は
+完了させ、待機中は最新だけを残す。置き換えられた待機要求は `superseded`、実行失敗は
+`failed { message }`、表示まで完了した要求は `applied` を返すため、保存、端末設定、resize の
+各呼び出し側は追い越しと失敗を混同しない。write の失敗処理も refresh から分離し、成功時・
+失敗時とも server の確定状態を読む refresh は 1 件だけ要求する。同じ viewer / container /
+現在ページ / `forceSinglePage` の要求は active または pending の同じ promise へ join し、保存と
+resize が同じ再構成を要求しても `/api/container` を重ねない。異なる重複要求は直列 owner が
+`loadContainer` を実行し、最後の要求が必ず新しい page group の表示まで進む。
+
+計測 HUD の先読み表示は、区切りの左を読書上の後方、右を前方とし、RTL / LTR にかかわらず
+これから読む側を右へ置く。状態は `PageResourceCache.statusForKeys()` だけから取得し、内部 map は
+UI へ公開しない。色は緑 = `ready` (取得済み)、黄 = abort されていない `active` (取得中)、
+黒 = どちらでもない (未取得)。色だけに依存せず、`title` / `aria-label` に取得済み・取得中・
+未取得の件数を表示する。通常の `updateHud()` に加え、先読み開始、完了、破棄、cache clear / evict
+で更新し、先読み専用タイマーは持たない。ドットは既存 HUD の先頭行内へ置き、既存行数を増やさない。
+
+予算と窓は変更しない。標準画質の実測はページ p50 1.35 MiB / p95 2.61 MiB、本体生成
+`ipc_ms` p50 552 ms、ページ要求 222 件中 503 が 52 件 (24%、prefetch 146 / foreground 22)、
+同時間帯の `/api/thumb` は 193 件だった。64 MiB は p50 換算約 47 ページに対し窓上限 18 ページ
+(約 24 MiB) なので限界要因ではなく、heavy 枠の admission が先に詰まっている。したがって
+`PAGE_RESOURCE_CACHE_CONFIGURED_BYTES = 64 MiB`、前方 12 / 後方 4、entry 上限 18 を据え置き、
+HUD で詰まり方を観測してから別の変更として判断する。

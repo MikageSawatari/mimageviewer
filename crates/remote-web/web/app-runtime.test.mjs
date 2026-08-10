@@ -908,10 +908,10 @@ test("adjustment preview keeps one request in flight and coalesces to the latest
     active -= 1;
   });
 
-  queue.enqueue(1);
+  const first = queue.enqueue(1);
   await Promise.resolve();
-  queue.enqueue(2);
-  queue.enqueue(3);
+  const second = queue.enqueue(2);
+  const third = queue.enqueue(3);
   releaseFirst();
   for (let attempt = 0; attempt < 20 && completed.length < 2; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -920,6 +920,81 @@ test("adjustment preview keeps one request in flight and coalesces to the latest
   assert.deepEqual(started, [1, 3]);
   assert.deepEqual(completed, [1, 3]);
   assert.equal(maxActive, 1);
+  assert.deepEqual(await Promise.all([first, second, third]), [
+    { outcome: ViewerGroupLoadOutcome.APPLIED },
+    { outcome: ViewerGroupLoadOutcome.SUPERSEDED },
+    { outcome: ViewerGroupLoadOutcome.APPLIED },
+  ]);
+});
+
+test("container-style latest-only refresh always displays the last grouping", async () => {
+  const firstGate = deferred();
+  const displayedGroups = [];
+  const queue = new LatestOnlyTaskQueue(async ({ mode, groups }) => {
+    if (mode === "single") await firstGate.promise;
+    displayedGroups.push(groups);
+  });
+
+  const single = queue.enqueue({ mode: "single", groups: [[0], [1], [2], [3]] });
+  await Promise.resolve();
+  const staleSpread = queue.enqueue({ mode: "ltr", groups: [[0, 1], [2, 3]] });
+  const latestSpread = queue.enqueue({ mode: "rtl", groups: [[1, 0], [3, 2]] });
+  firstGate.resolve();
+
+  assert.deepEqual(await Promise.all([single, staleSpread, latestSpread]), [
+    { outcome: ViewerGroupLoadOutcome.APPLIED },
+    { outcome: ViewerGroupLoadOutcome.SUPERSEDED },
+    { outcome: ViewerGroupLoadOutcome.APPLIED },
+  ]);
+  assert.deepEqual(displayedGroups, [
+    [[0], [1], [2], [3]],
+    [[1, 0], [3, 2]],
+  ]);
+});
+
+test("latest-only refresh distinguishes failure from supersede", async () => {
+  const firstGate = deferred();
+  const queue = new LatestOnlyTaskQueue(async (value) => {
+    if (value === "active") await firstGate.promise;
+    if (value === "failure") throw new Error("container refresh failed");
+  });
+
+  const active = queue.enqueue("active");
+  await Promise.resolve();
+  const superseded = queue.enqueue("superseded");
+  const failure = queue.enqueue("failure");
+  firstGate.resolve();
+
+  assert.deepEqual(await active, { outcome: ViewerGroupLoadOutcome.APPLIED });
+  assert.deepEqual(await superseded, { outcome: ViewerGroupLoadOutcome.SUPERSEDED });
+  assert.deepEqual(await failure, {
+    outcome: ViewerGroupLoadOutcome.FAILED,
+    message: "container refresh failed",
+  });
+});
+
+test("identical container-style refreshes join the active owner", async () => {
+  const gate = deferred();
+  let runs = 0;
+  const sameTask = (left, right) =>
+    left.viewer === right.viewer &&
+    left.address === right.address &&
+    left.forceSinglePage === right.forceSinglePage;
+  const queue = new LatestOnlyTaskQueue(async () => {
+    runs += 1;
+    await gate.promise;
+  }, () => {}, sameTask);
+  const viewer = {};
+  const first = queue.enqueue({ viewer, address: "book", forceSinglePage: false });
+  const duplicate = queue.enqueue({ viewer, address: "book", forceSinglePage: false });
+
+  assert.strictEqual(duplicate, first);
+  gate.resolve();
+  assert.deepEqual(await Promise.all([first, duplicate]), [
+    { outcome: ViewerGroupLoadOutcome.APPLIED },
+    { outcome: ViewerGroupLoadOutcome.APPLIED },
+  ]);
+  assert.equal(runs, 1);
 });
 
 test("page load queue emits one busy interval across pending replacements", async () => {
@@ -1059,6 +1134,55 @@ test("deep page prefetch stops at the byte budget and resumes after protection m
     1,
     "a protected fetched page must not be discarded and fetched again"
   );
+  cache.clear();
+});
+
+test("page resource cache reports HUD states and notifies start completion and discard", async () => {
+  const firstGate = deferred();
+  const events = [];
+  const fetchResource = (request, signal) => {
+    if (request.cacheKey === "ready-page") return firstGate.promise;
+    return new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        const error = new Error("Aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    });
+  };
+  const cache = new PageResourceCache(
+    4,
+    1024,
+    1,
+    fetchResource,
+    (event) => events.push(event)
+  );
+
+  cache.schedule([{ cacheKey: "ready-page" }]);
+  assert.deepEqual(
+    cache.statusForKeys(["ready-page", "absent-page"]),
+    ["active", "missing"]
+  );
+  firstGate.resolve({ blob: new Blob(["ready"]), requestId: "ready", fetchMs: 1 });
+  for (let attempt = 0; attempt < 20 && cache.active.size > 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.deepEqual(cache.statusForKeys(["ready-page"]), ["ready"]);
+
+  cache.schedule([{ cacheKey: "discarded-page" }]);
+  assert.deepEqual(cache.statusForKeys(["discarded-page"]), ["active"]);
+  cache.schedule([]);
+  assert.deepEqual(cache.statusForKeys(["discarded-page"]), ["missing"]);
+  for (
+    let attempt = 0;
+    attempt < 20 && !events.some((event) => event.type === "discard");
+    attempt += 1
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.ok(events.some((event) => event.type === "start" && event.key === "ready-page"));
+  assert.ok(events.some((event) => event.type === "ready" && event.key === "ready-page"));
+  assert.ok(events.some((event) => event.type === "discard" && event.key === "discarded-page"));
   cache.clear();
 });
 

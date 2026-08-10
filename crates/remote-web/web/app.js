@@ -36,6 +36,8 @@ import {
   pagePrefetchFailurePlan,
   FOREGROUND_ADMISSION_RETRY_LIMIT,
   pageAdmissionRetryDelayMs,
+  pagePrefetchHudPlan,
+  pagePrefetchIndicatorSummary,
   pagePrefetchBudgetAllowsStart,
   pagePrefetchPlan,
   pagePrefetchStartCount,
@@ -232,19 +234,35 @@ class RequestLimiter {
 /// 進行中を中断せず、待機中は最後の 1 件だけを残す直列キュー。
 /// 補正プレビューが UI 入力の回数だけ IPC を詰まらせないために使う。
 export class LatestOnlyTaskQueue {
-  constructor(run, onError = () => {}) {
+  constructor(run, onError = () => {}, sameTask = () => false) {
     this.run = run;
     this.onError = onError;
+    this.sameTask = sameTask;
     this.running = false;
+    this.active = null;
     this.latest = null;
   }
 
   enqueue(value) {
-    this.latest = value;
+    if (this.active && this.sameTask(this.active.value, value)) {
+      return this.active.promise;
+    }
+    if (this.latest && this.sameTask(this.latest.value, value)) {
+      return this.latest.promise;
+    }
+    let resolveTicket;
+    const promise = new Promise((resolve) => {
+      resolveTicket = resolve;
+    });
+    const ticket = { value, promise, resolve: resolveTicket };
+    if (this.latest) this.latest.resolve(VIEWER_GROUP_LOAD_SUPERSEDED);
+    this.latest = ticket;
     if (!this.running) this.pump();
+    return promise;
   }
 
   clear() {
+    if (this.latest) this.latest.resolve(VIEWER_GROUP_LOAD_SUPERSEDED);
     this.latest = null;
   }
 
@@ -253,12 +271,29 @@ export class LatestOnlyTaskQueue {
     this.running = true;
     try {
       while (this.latest !== null) {
-        const value = this.latest;
+        const ticket = this.latest;
         this.latest = null;
+        this.active = ticket;
         try {
-          await this.run(value);
+          const result = await this.run(ticket.value);
+          if (result === undefined) {
+            ticket.resolve(VIEWER_GROUP_LOAD_APPLIED);
+          } else {
+            viewerGroupLoadCompletionPlan(result);
+            ticket.resolve(result);
+          }
         } catch (error) {
-          if (error?.name !== "AbortError") this.onError(error);
+          if (error?.name !== "AbortError") {
+            try {
+              this.onError(error);
+            } catch {}
+          }
+          ticket.resolve({
+            outcome: ViewerGroupLoadOutcome.FAILED,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        } finally {
+          if (this.active === ticket) this.active = null;
         }
       }
     } finally {
@@ -365,12 +400,14 @@ export class PageResourceCache {
     limit = PAGE_RESOURCE_CACHE_LIMIT,
     byteLimit = PAGE_RESOURCE_CACHE_MAX_BYTES,
     prefetchConcurrency = PAGE_PREFETCH_CONCURRENCY,
-    fetchResource = fetchPageResource
+    fetchResource = fetchPageResource,
+    onStatusChange = () => {}
   ) {
     this.limit = Math.max(1, Number(limit) || 1);
     this.byteLimit = Math.max(1, Number(byteLimit) || 1);
     this.prefetchConcurrency = Math.max(1, Number(prefetchConcurrency) || 1);
     this.fetchResource = fetchResource;
+    this.onStatusChange = onStatusChange;
     this.ready = new Map();
     this.readyBytes = 0;
     this.pending = [];
@@ -382,6 +419,20 @@ export class PageResourceCache {
       this.limit - MAX_VIEWER_VISIBLE_PAGES
     );
     this.retryTimer = 0;
+  }
+
+  statusForKeys(keys = []) {
+    return (Array.isArray(keys) ? keys : []).map((key) => {
+      if (this.ready.has(key)) return "ready";
+      const active = this.active.get(key);
+      return active && !active.controller.signal.aborted ? "active" : "missing";
+    });
+  }
+
+  notifyStatusChange(type, key = "") {
+    try {
+      this.onStatusChange({ type, key });
+    } catch {}
   }
 
   async loadForeground(request, signal) {
@@ -560,11 +611,16 @@ export class PageResourceCache {
       })
       .finally(() => {
         if (this.active.get(active.key) === active) this.active.delete(active.key);
+        this.notifyStatusChange(
+          controller.signal.aborted ? "discard" : "settled",
+          active.key
+        );
         this.pump();
       });
     // A rejected background promise must be observed even when no foreground load joins it.
     active.promise.catch(() => {});
     this.active.set(active.key, active);
+    this.notifyStatusChange("start", active.key);
   }
 
   scheduleRetry(delayMs) {
@@ -583,6 +639,7 @@ export class PageResourceCache {
     this.ready.set(key, resource);
     this.readyBytes += resource.blob.size;
     this.trimUnprotected();
+    this.notifyStatusChange("ready", key);
   }
 
   /// 予算は「開始の門」だが、保持そのものは常に有界でなければならない。`pump()` は
@@ -617,6 +674,7 @@ export class PageResourceCache {
     if (!resource) return false;
     this.ready.delete(key);
     this.readyBytes = Math.max(0, this.readyBytes - resource.blob.size);
+    this.notifyStatusChange("evict", key);
     return true;
   }
 
@@ -630,6 +688,7 @@ export class PageResourceCache {
     this.readyBytes = 0;
     this.visibleKeys.clear();
     this.prefetchProtectedKeys = [];
+    this.notifyStatusChange("clear");
   }
 }
 
@@ -677,7 +736,16 @@ function delayWithAbort(delayMs, signal) {
 }
 
 const thumbnailRequestLimiter = new RequestLimiter(THUMBNAIL_MAX_CONCURRENCY);
-const pageResourceCache = new PageResourceCache();
+const pageResourceCache = new PageResourceCache(
+  PAGE_RESOURCE_CACHE_LIMIT,
+  PAGE_RESOURCE_CACHE_MAX_BYTES,
+  PAGE_PREFETCH_CONCURRENCY,
+  fetchPageResource,
+  ({ type }) => {
+    if (type === "clear") hudState.pagePrefetch = null;
+    updateHud();
+  }
+);
 
 const countedPageTimingRequestIds = new Set();
 
@@ -720,6 +788,7 @@ const hudState = {
   video: null,
   displayDurations: [],
   errors: [],
+  pagePrefetch: null,
 };
 
 class RemoteSessionControlOwner {
@@ -2682,6 +2751,7 @@ function menuCommand(event, name, payload = {}) {
 
 function cleanupScreen(preserveRequestController = null) {
   rememberCurrentGridViewport();
+  containerSpreadRefreshOwner.clear();
   clearInterval(state.authCountdownTimer);
   state.authCountdownTimer = 0;
   if (
@@ -3701,6 +3771,15 @@ function discardRequestedPageGroup(
 
 let spreadWriteTail = Promise.resolve();
 let spreadWriteSequence = 0;
+const containerSpreadRefreshOwner = new LatestOnlyTaskQueue(
+  performContainerSpreadRefresh,
+  () => {},
+  (left, right) =>
+    left.viewer === right.viewer &&
+    left.addressIdentity === right.addressIdentity &&
+    left.currentIdentity === right.currentIdentity &&
+    left.forceSinglePage === right.forceSinglePage
+);
 let readingProgressBatch = createReadingProgressBatch();
 let readingProgressContextIdentity = "";
 let readingProgressTimer = 0;
@@ -4005,56 +4084,103 @@ function requestSpreadMode(mode) {
   state.spreadMode = mode;
   state.readingDirection = readingDirection;
   spreadWriteTail = spreadWriteTail.then(async () => {
-    await apiAddressPostJson("/api/write", writeRequest);
-    if (
-      sequence === spreadWriteSequence &&
-      state.container &&
-      addressIdentity(state.container.requestedAddress) === identity
-    ) {
-      await refreshContainerSpread();
+    let writeError = null;
+    try {
+      await apiAddressPostJson("/api/write", writeRequest);
+    } catch (error) {
+      writeError = error;
     }
-  }).catch(async (error) => {
     if (
       sequence === spreadWriteSequence &&
       state.container &&
       addressIdentity(state.container.requestedAddress) === identity
     ) {
-      await refreshContainerSpread().catch(() => {});
-      state.viewer?.showBoundaryMessage(
-        error instanceof Error ? error.message : "見開き設定を保存できませんでした。"
-      );
+      const refresh = await refreshContainerSpread();
+      if (writeError) {
+        state.viewer?.showBoundaryMessage(
+          writeError instanceof Error
+            ? writeError.message
+            : "見開き設定を保存できませんでした。"
+        );
+      } else if (refresh.outcome === ViewerGroupLoadOutcome.FAILED) {
+        state.viewer?.showBoundaryMessage(refresh.message);
+      }
     }
   });
   return true;
 }
 
-async function refreshContainerSpread(
+function refreshContainerSpread(
   forceSinglePage = shouldForceSinglePageForViewport(),
   renderTrigger = "spread_refresh"
 ) {
-  if (!state.container) return;
+  if (!state.container) return Promise.resolve(VIEWER_GROUP_LOAD_SUPERSEDED);
   const viewer = state.viewer;
   const current = currentPageGroup()?.anchor ?? state.images[state.imageIndex];
   const currentIdentity = current ? entryIdentity(current) : "";
   const address = state.container.requestedAddress;
-  const loaded = await loadContainer(address, {
+  if (!viewer || !currentIdentity) {
+    return Promise.resolve({
+      outcome: ViewerGroupLoadOutcome.FAILED,
+      message: "現在のページを再構成できませんでした。",
+    });
+  }
+  return containerSpreadRefreshOwner.enqueue({
+    address,
+    addressIdentity: addressIdentity(address),
+    currentIdentity,
     forceSinglePage,
+    renderTrigger,
+    viewer,
   });
-  if (!loaded || state.viewer !== viewer || !viewer || !currentIdentity) return;
+}
+
+async function performContainerSpreadRefresh(request) {
+  if (
+    state.viewer !== request.viewer ||
+    !state.container ||
+    addressIdentity(state.container.requestedAddress) !== request.addressIdentity
+  ) {
+    return VIEWER_GROUP_LOAD_SUPERSEDED;
+  }
+  let loaded;
+  try {
+    loaded = await loadContainer(request.address, {
+      forceSinglePage: request.forceSinglePage,
+    });
+  } catch (error) {
+    if (
+      error?.name === "AbortError" &&
+      (state.viewer !== request.viewer ||
+        !state.container ||
+        addressIdentity(state.container.requestedAddress) !== request.addressIdentity)
+    ) {
+      return VIEWER_GROUP_LOAD_SUPERSEDED;
+    }
+    throw error;
+  }
+  if (!loaded || state.viewer !== request.viewer) return VIEWER_GROUP_LOAD_SUPERSEDED;
   const imageIndex = state.images.findIndex(
-    (entry) => entryIdentity(entry) === currentIdentity
+    (entry) => entryIdentity(entry) === request.currentIdentity
   );
-  if (imageIndex < 0) return;
+  if (imageIndex < 0) {
+    throw new Error("更新後のコンテナに現在のページがありません。");
+  }
   const groupIndex = pageGroupIndexForEntry(state.images[imageIndex]);
-  if (groupIndex < 0) return;
+  if (groupIndex < 0) {
+    throw new Error("更新後の見開きグループを特定できませんでした。");
+  }
   const group = state.pageGroups[groupIndex];
   state.pageGroupIndex = groupIndex;
   state.imageIndex = state.images.findIndex(
     (entry) => entryIdentity(entry) === entryIdentity(group.anchor)
   );
   updateGridReturnTargetItem(group.anchor);
-  viewer.cancelPendingCenterTap();
-  await updateViewerImage(performance.now(), { renderTrigger });
+  request.viewer.cancelPendingCenterTap();
+  await updateViewerImage(performance.now(), {
+    renderTrigger: request.renderTrigger,
+  });
+  return VIEWER_GROUP_LOAD_APPLIED;
 }
 
 export async function loadFolder(
@@ -5350,10 +5476,19 @@ async function updateViewerImage(
 async function schedulePagePrefetch(viewer, visiblePages = []) {
   const group = currentPageGroup();
   const currentIdentity = group?.entries.map(entryIdentity).join("\n") ?? "";
+  hudState.pagePrefetch = null;
+  updateHud();
   const visibleIndexes = (group?.entries ?? [])
     .map((entry) => state.images.findIndex((image) => entryIdentity(image) === entryIdentity(entry)))
     .filter((index) => index >= 0);
   const indexes = pagePrefetchPlan({
+    visibleIndexes,
+    itemCount: state.images.length,
+    direction: state.pageDirection,
+    ahead: PAGE_PREFETCH_AHEAD,
+    behind: PAGE_PREFETCH_BEHIND,
+  });
+  const hudPlan = pagePrefetchHudPlan({
     visibleIndexes,
     itemCount: state.images.length,
     direction: state.pageDirection,
@@ -5391,10 +5526,22 @@ async function schedulePagePrefetch(viewer, visiblePages = []) {
   ) {
     return;
   }
+  const requestsByIndex = new Map(
+    indexes.map((index, requestIndex) => [index, requests[requestIndex]])
+  );
+  hudState.pagePrefetch = {
+    behindKeys: hudPlan.behindIndexes
+      .map((index) => requestsByIndex.get(index)?.cacheKey)
+      .filter(Boolean),
+    aheadKeys: hudPlan.aheadIndexes
+      .map((index) => requestsByIndex.get(index)?.cacheKey)
+      .filter(Boolean),
+  };
   pageResourceCache.schedule(
     requests.filter(Boolean),
     visiblePages.map(({ request }) => request.cacheKey).filter(Boolean)
   );
+  updateHud();
 }
 
 function imageRequest(
@@ -9228,10 +9375,10 @@ class LocalSettingsDialog {
       this.updateStorageStatus();
       const forceSinglePage = shouldForceSinglePageForViewport();
       if (state.container && forceSinglePage !== state.forceSinglePage) {
-        refreshContainerSpread(forceSinglePage).catch((error) => {
-          state.viewer?.showBoundaryMessage(
-            error instanceof Error ? error.message : "表示を更新できませんでした。"
-          );
+        refreshContainerSpread(forceSinglePage).then((result) => {
+          if (result.outcome === ViewerGroupLoadOutcome.FAILED) {
+            state.viewer?.showBoundaryMessage(result.message);
+          }
         });
       }
     });
@@ -10313,7 +10460,11 @@ export class ImageViewer {
           panelOpen: Boolean(state.commandMenu?.isOpen()),
         });
         if (plan.refreshContainer) {
-          refreshContainerSpread(forceSinglePage, "viewport_resize").catch(renderError);
+          refreshContainerSpread(forceSinglePage, "viewport_resize").then((result) => {
+            if (result.outcome === ViewerGroupLoadOutcome.FAILED) {
+              renderError(new Error(result.message));
+            }
+          });
           return;
         }
         updateViewerImage(performance.now(), {
@@ -12187,7 +12338,8 @@ function updateHud() {
   const video = hudState.video;
   hudElement.dataset.viewerKind = video ? "video" : "default";
   const recent = hudState.displayDurations.slice(-7);
-  const lines = [debugDetails ? "mIV PoC 計測 · 詳細記録 ON" : "mIV PoC 計測"];
+  const heading = debugDetails ? "mIV PoC 計測 · 詳細記録 ON" : "mIV PoC 計測";
+  const lines = [];
   if (video) {
     const dropped = Number.isFinite(video.dropped_video_frames)
       ? `${video.dropped_video_frames}/${video.total_video_frames ?? "—"}`
@@ -12229,7 +12381,48 @@ function updateHud() {
   lines.push(
     `error(60s) ${hudState.errors.length}  · ${debugDetails ? "tapで設定" : "tapで隠す"}`
   );
-  hudElement.textContent = lines.join("\n");
+  const header = element("span", "telemetry-hud-header");
+  header.append(textElement("span", heading, "telemetry-hud-heading"));
+  const prefetch = video ? null : pagePrefetchHudIndicator();
+  if (prefetch) header.append(prefetch);
+  hudElement.title = prefetch?.title ?? "";
+  hudElement.setAttribute(
+    "aria-label",
+    [
+      heading,
+      prefetch?.title,
+      debugDetails ? "タップで設定" : "タップで隠す",
+    ].filter(Boolean).join("。")
+  );
+  const body = textElement("span", lines.join("\n"), "telemetry-hud-body");
+  hudElement.replaceChildren(header, body);
+}
+
+function pagePrefetchHudIndicator() {
+  const plan = hudState.pagePrefetch;
+  if (!plan) return null;
+  const summary = pagePrefetchIndicatorSummary({
+    behind: pageResourceCache.statusForKeys(plan.behindKeys),
+    ahead: pageResourceCache.statusForKeys(plan.aheadKeys),
+  });
+  if (!summary.behind.length && !summary.ahead.length) return null;
+  const indicator = element("span", "page-prefetch-indicator");
+  indicator.title = summary.accessibleLabel;
+  indicator.setAttribute("role", "img");
+  indicator.setAttribute("aria-label", summary.accessibleLabel);
+  const appendDot = (status) => {
+    const dot = textElement(
+      "span",
+      "●",
+      `page-prefetch-dot page-prefetch-dot-${status}`
+    );
+    dot.setAttribute("aria-hidden", "true");
+    indicator.append(dot);
+  };
+  summary.behind.forEach(appendDot);
+  indicator.append(textElement("span", "｜", "page-prefetch-divider"));
+  summary.ahead.forEach(appendDot);
+  return indicator;
 }
 
 function formatHealthSeconds(value) {

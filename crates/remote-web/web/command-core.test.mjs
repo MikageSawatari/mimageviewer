@@ -58,6 +58,8 @@ import {
   pagePrefetchFailurePlan,
   pageAdmissionRetryDelayMs,
   pagePrefetchBudgetAllowsStart,
+  pagePrefetchHudPlan,
+  pagePrefetchIndicatorSummary,
   pagePrefetchPlan,
   pagePrefetchStartCount,
   pageResourceAdmissionPlan,
@@ -2548,6 +2550,46 @@ test("page prefetch follows reading direction and accepts a future spread", () =
       behind: 4,
     }),
     [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 9, 8, 7, 6]
+  );
+});
+
+test("prefetch HUD keeps the reading future on the right for LTR and RTL", () => {
+  assert.deepEqual(
+    pagePrefetchHudPlan({
+      visibleIndexes: [10, 11],
+      itemCount: 30,
+      direction: 1,
+      ahead: 3,
+      behind: 2,
+    }),
+    { behindIndexes: [8, 9], aheadIndexes: [12, 13, 14] }
+  );
+  assert.deepEqual(
+    pagePrefetchHudPlan({
+      visibleIndexes: [10, 11],
+      itemCount: 30,
+      direction: -1,
+      ahead: 3,
+      behind: 2,
+    }),
+    { behindIndexes: [13, 12], aheadIndexes: [9, 8, 7] }
+  );
+});
+
+test("prefetch HUD summary exposes ready active and missing counts", () => {
+  assert.deepEqual(
+    pagePrefetchIndicatorSummary({
+      behind: ["ready", "missing"],
+      ahead: ["active", "ready", "unknown"],
+    }),
+    {
+      behind: ["ready", "missing"],
+      ahead: ["active", "ready", "missing"],
+      readyCount: 2,
+      activeCount: 1,
+      missingCount: 2,
+      accessibleLabel: "先読み: 取得済み 2 / 取得中 1 / 未取得 2",
+    }
   );
 });
 
