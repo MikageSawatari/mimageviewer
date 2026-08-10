@@ -82,6 +82,7 @@ pub struct CompareShaderCallback {
     pub height: u32,
     pub pinned_rgba: Arc<Vec<u8>>,
     pub current_rgba: Arc<Vec<u8>>,
+    pub cpu_pair_bytes: u64,
     pub mode: CompareShaderMode,
     pub wipe_fraction: f32,
     pub uv_window: [f32; 4],
@@ -109,6 +110,20 @@ struct CompareGpuPair {
     slots: CompareGpuSlots,
     width: u32,
     height: u32,
+}
+
+pub fn rgba8_texture_bytes(width: u32, height: u32, mipmapped: bool) -> u128 {
+    let mut width = u128::from(width);
+    let mut height = u128::from(height);
+    let mut total = 0_u128;
+    loop {
+        total += width * height * 4;
+        if !mipmapped || (width == 1 && height == 1) {
+            return total;
+        }
+        width = (width / 2).max(1);
+        height = (height / 2).max(1);
+    }
 }
 
 struct CompareGpuSlots {
@@ -325,7 +340,9 @@ impl CompareGpuResources {
             // 新textureを確保する前に旧組をdropし、8K比較で旧/new組が同時に
             // VRAMへ残る時間を作らない。wgpu backend側のin-flight解放遅延を除けば、
             // CompareGpuResourcesが所有する完全mip chainは常に2枚までになる。
-            self.pair = None;
+            let released_gpu_bytes = self.pair.take().map_or(0, |(_, pair)| {
+                rgba8_texture_bytes(pair.width, pair.height, true) * 2
+            });
             let pinned = upload_rgba_texture(
                 device,
                 queue,
@@ -363,6 +380,14 @@ impl CompareGpuResources {
                     height: callback.height,
                 },
             ));
+            crate::logger::log(format!(
+                "[compare-memory] stage=gpu-ready target={}x{} cpu_total_bytes={} cpu_buffers=2 gpu_total_bytes={} gpu_textures=2 gpu_mips=full released_gpu_bytes={} old_pair_release=before_new_alloc",
+                callback.width,
+                callback.height,
+                callback.cpu_pair_bytes,
+                rgba8_texture_bytes(callback.width, callback.height, true) * 2,
+                released_gpu_bytes,
+            ));
         }
         if let Some((key, pair)) = self.pair.as_ref()
             && *key == callback.key
@@ -382,7 +407,14 @@ impl CompareGpuResources {
 /// 高解像度texture 2枚だけを即時dropする。
 pub fn clear_gpu_pair(callback_resources: &mut egui_wgpu::CallbackResources) {
     if let Some(resources) = callback_resources.get_mut::<CompareGpuResources>() {
-        resources.pair = None;
+        if let Some((_, pair)) = resources.pair.take() {
+            crate::logger::log(format!(
+                "[compare-memory] stage=gpu-clear target={}x{} released_gpu_bytes={} gpu_total_bytes=0 gpu_mips=full",
+                pair.width,
+                pair.height,
+                rgba8_texture_bytes(pair.width, pair.height, true) * 2,
+            ));
+        }
     }
 }
 
@@ -521,7 +553,18 @@ impl egui_wgpu::CallbackTrait for CompareShaderCallback {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompareShaderMode, CompareShaderSlot, SHADER, uniform_bytes, uniform_write};
+    use super::{
+        CompareShaderMode, CompareShaderSlot, SHADER, rgba8_texture_bytes, uniform_bytes,
+        uniform_write,
+    };
+
+    #[test]
+    fn compare_memory_measurement_counts_the_complete_mip_chain() {
+        assert_eq!(rgba8_texture_bytes(8320, 7296, false), 242_810_880);
+        assert_eq!(rgba8_texture_bytes(8320, 7296, true), 323_747_664);
+        assert_eq!(rgba8_texture_bytes(8320, 7296, true) * 2, 647_495_328);
+        assert_eq!(rgba8_texture_bytes(4160, 7296, true) * 2, 323_747_432);
+    }
 
     #[test]
     fn compare_uses_fixed_mipmap_sampling_and_compact_uniform() {

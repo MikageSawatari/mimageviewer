@@ -3920,20 +3920,122 @@ pub(crate) struct ComparePreparedPair {
     pub(crate) current_idx: usize,
     pub(crate) pinned_source_idx: usize,
     pub(crate) target_size: [usize; 2],
-    pub(crate) pinned_rgba: Arc<Vec<u8>>,
-    pub(crate) current_rgba: Arc<Vec<u8>>,
-    pub(crate) pinned_pixels: Arc<egui::ColorImage>,
-    pub(crate) current_pixels: Arc<egui::ColorImage>,
-    pub(crate) diff_pixels: Arc<egui::ColorImage>,
+    pub(crate) pixels: ComparePreparedPixels,
     pub(crate) pinned_texture: Option<egui::TextureHandle>,
     pub(crate) current_texture: Option<egui::TextureHandle>,
     pub(crate) diff_texture: Option<egui::TextureHandle>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComparePrepareOutput {
+    ShaderPair,
+    PinnedTexture,
+    WipeTextures,
+    DiffTexture,
+}
+
+impl ComparePrepareOutput {
+    pub(crate) fn for_mode(mode: CompareViewMode, gpu_compare_available: bool) -> Option<Self> {
+        match mode {
+            CompareViewMode::Off => None,
+            CompareViewMode::PinnedNormal => Some(Self::PinnedTexture),
+            CompareViewMode::Wipe { .. } if gpu_compare_available => Some(Self::ShaderPair),
+            CompareViewMode::Diff if gpu_compare_available => Some(Self::ShaderPair),
+            CompareViewMode::Wipe { .. } => Some(Self::WipeTextures),
+            CompareViewMode::Diff => Some(Self::DiffTexture),
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ShaderPair => "shader-pair",
+            Self::PinnedTexture => "pinned-texture",
+            Self::WipeTextures => "wipe-textures",
+            Self::DiffTexture => "diff-texture",
+        }
+    }
+}
+
+pub(crate) enum ComparePreparedPixels {
+    ShaderPair {
+        pinned_rgba: Arc<Vec<u8>>,
+        current_rgba: Arc<Vec<u8>>,
+    },
+    PinnedTexture(Arc<egui::ColorImage>),
+    WipeTextures {
+        pinned: Arc<egui::ColorImage>,
+        current: Arc<egui::ColorImage>,
+    },
+    DiffTexture(Arc<egui::ColorImage>),
+}
+
+impl ComparePreparedPixels {
+    pub(crate) fn output(&self) -> ComparePrepareOutput {
+        match self {
+            Self::ShaderPair { .. } => ComparePrepareOutput::ShaderPair,
+            Self::PinnedTexture(_) => ComparePrepareOutput::PinnedTexture,
+            Self::WipeTextures { .. } => ComparePrepareOutput::WipeTextures,
+            Self::DiffTexture(_) => ComparePrepareOutput::DiffTexture,
+        }
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> u64 {
+        let rgba_bytes = |rgba: &Arc<Vec<u8>>| rgba.capacity() as u64;
+        let color_bytes = |pixels: &Arc<egui::ColorImage>| {
+            (pixels.pixels.capacity() * std::mem::size_of::<egui::Color32>()) as u64
+        };
+        match self {
+            Self::ShaderPair {
+                pinned_rgba,
+                current_rgba,
+            } => rgba_bytes(pinned_rgba) + rgba_bytes(current_rgba),
+            Self::PinnedTexture(pinned) => color_bytes(pinned),
+            Self::WipeTextures { pinned, current } => color_bytes(pinned) + color_bytes(current),
+            Self::DiffTexture(diff) => color_bytes(diff),
+        }
+    }
+
+    pub(crate) fn buffer_count(&self) -> usize {
+        match self {
+            Self::ShaderPair { .. } | Self::WipeTextures { .. } => 2,
+            Self::PinnedTexture(_) | Self::DiffTexture(_) => 1,
+        }
+    }
+
+    pub(crate) fn valid_for_size(&self, size: [usize; 2]) -> bool {
+        let Some(expected_pixels) = size[0].checked_mul(size[1]) else {
+            return false;
+        };
+        let Some(expected_rgba) = expected_pixels.checked_mul(4) else {
+            return false;
+        };
+        let rgba_valid = |rgba: &Arc<Vec<u8>>| rgba.len() == expected_rgba;
+        let color_valid = |pixels: &Arc<egui::ColorImage>| {
+            pixels.size == size && pixels.pixels.len() == expected_pixels
+        };
+        match self {
+            Self::ShaderPair {
+                pinned_rgba,
+                current_rgba,
+            } => rgba_valid(pinned_rgba) && rgba_valid(current_rgba),
+            Self::PinnedTexture(pinned) => color_valid(pinned),
+            Self::WipeTextures { pinned, current } => color_valid(pinned) && color_valid(current),
+            Self::DiffTexture(diff) => color_valid(diff),
+        }
+    }
+}
+
+impl ComparePreparedPair {
+    pub(crate) fn allocated_cpu_bytes(&self) -> u64 {
+        self.pixels.allocated_bytes()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ComparePrepareRequest {
     pub(crate) current_idx: usize,
     pub(crate) pinned_source_idx: usize,
+    pub(crate) output: ComparePrepareOutput,
 }
 
 pub(crate) struct ComparePrepareResult {
@@ -3941,13 +4043,27 @@ pub(crate) struct ComparePrepareResult {
     pub(crate) pinned_source_idx: usize,
     pub(crate) width: u32,
     pub(crate) height: u32,
-    pub(crate) pinned_rgba: Vec<u8>,
-    pub(crate) current_rgba: Vec<u8>,
-    pub(crate) diff_rgba: Vec<u8>,
+    pub(crate) pixels: ComparePreparedPixels,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComparePrepareScope {
+    SinglePage,
+    SpreadCurrentPage,
+}
+
+impl ComparePrepareScope {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::SinglePage => "single-page",
+            Self::SpreadCurrentPage => "spread-current-page",
+        }
+    }
 }
 
 pub(crate) struct ComparePreparePending {
     pub(crate) request: ComparePrepareRequest,
+    pub(crate) scope: ComparePrepareScope,
     pub(crate) source_indices: Vec<usize>,
     pub(crate) expected_target_size: [usize; 2],
     pub(crate) rx: mpsc::Receiver<Result<ComparePrepareResult, String>>,
@@ -3964,6 +4080,8 @@ pub(crate) enum ComparePreparationState {
     Unprepared,
     WaitingForSource(ComparePrepareRequest),
     Preparing(ComparePreparePending),
+    /// 入力が失効したが、途中cancel不能なworkerの完了を回収するまで次を直列化する状態。
+    Draining(ComparePreparePending),
     Ready(ComparePreparedPair),
 }
 
@@ -3971,10 +4089,11 @@ impl ComparePreparationState {
     pub(crate) fn request(&self) -> Option<ComparePrepareRequest> {
         match self {
             Self::WaitingForSource(request) => Some(*request),
-            Self::Preparing(pending) => Some(pending.request),
+            Self::Preparing(pending) | Self::Draining(pending) => Some(pending.request),
             Self::Ready(pair) => Some(ComparePrepareRequest {
                 current_idx: pair.current_idx,
                 pinned_source_idx: pair.pinned_source_idx,
+                output: pair.pixels.output(),
             }),
             Self::Unprepared => None,
         }
@@ -3995,7 +4114,18 @@ impl ComparePreparationState {
     }
 
     pub(crate) fn is_pending(&self) -> bool {
-        matches!(self, Self::WaitingForSource(_) | Self::Preparing(_))
+        matches!(
+            self,
+            Self::WaitingForSource(_) | Self::Preparing(_) | Self::Draining(_)
+        )
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        let old = std::mem::take(self);
+        *self = match old {
+            Self::Preparing(pending) | Self::Draining(pending) => Self::Draining(pending),
+            _ => Self::Unprepared,
+        };
     }
 }
 
@@ -26763,10 +26893,7 @@ impl App {
                     display_name: display_name.clone(),
                     source_idx,
                 });
-                self.compare_view_mode = CompareViewMode::Off;
-                self.compare_preparation = ComparePreparationState::Unprepared;
-                self.clear_compare_gpu_pair();
-                self.compare_wipe_dragging = false;
+                self.deactivate_compare_view();
                 self.show_feedback_toast(format!("比較画像を設定: {display_name}"));
                 ctx.request_repaint();
             }
@@ -26823,8 +26950,10 @@ impl App {
     }
 
     pub(crate) fn poll_compare_prepare_pending(&mut self, ctx: &egui::Context) {
-        let ComparePreparationState::Preparing(pending) = &self.compare_preparation else {
-            return;
+        let (pending, draining) = match &self.compare_preparation {
+            ComparePreparationState::Preparing(pending) => (pending, false),
+            ComparePreparationState::Draining(pending) => (pending, true),
+            _ => return,
         };
         let result = match pending.rx.try_recv() {
             Ok(result) => result,
@@ -26840,10 +26969,37 @@ impl App {
             &mut self.compare_preparation,
             ComparePreparationState::Unprepared,
         ) {
-            ComparePreparationState::Preparing(pending) => pending,
+            ComparePreparationState::Preparing(pending)
+            | ComparePreparationState::Draining(pending) => pending,
             _ => unreachable!(),
         };
         let request = pending.request;
+        let scope = pending.scope;
+
+        if draining {
+            crate::logger::log(
+                "[compare-memory] stage=worker-result-drained reason=source-invalidated old_pair_release=before_next_worker",
+            );
+            ctx.request_repaint();
+            return;
+        }
+
+        let active_output = ComparePrepareOutput::for_mode(
+            self.compare_view_mode,
+            cfg!(windows) && self.wgpu_render_state.is_some(),
+        );
+        if self.fullscreen_idx != Some(request.current_idx) || active_output != Some(request.output)
+        {
+            crate::logger::log(format!(
+                "[compare-memory] stage=worker-result-discarded current_idx={} target_output={} active_idx={:?} active_output={} old_pair_release=before_worker",
+                request.current_idx,
+                request.output.label(),
+                self.fullscreen_idx,
+                active_output.map_or("off", ComparePrepareOutput::label),
+            ));
+            ctx.request_repaint();
+            return;
+        }
 
         match result {
             Ok(result) => {
@@ -26872,38 +27028,36 @@ impl App {
                     return;
                 }
                 let result_size = [result.width as usize, result.height as usize];
-                let expected_bytes = result_size[0]
-                    .checked_mul(result_size[1])
-                    .and_then(|pixels| pixels.checked_mul(4));
                 if result_size != pending.expected_target_size
-                    || expected_bytes.is_none()
-                    || result.pinned_rgba.len() != expected_bytes.unwrap_or(0)
-                    || result.current_rgba.len() != expected_bytes.unwrap_or(0)
-                    || result.diff_rgba.len() != expected_bytes.unwrap_or(0)
+                    || result.pixels.output() != request.output
+                    || !result.pixels.valid_for_size(result_size)
                 {
                     crate::logger::log(format!(
-                        "compare prepare result withheld: current_idx={} pinned_idx={} expected={}x{} actual={}x{} pinned_bytes={} current_bytes={} diff_bytes={}",
+                        "compare prepare result withheld: current_idx={} pinned_idx={} expected={}x{} actual={}x{} expected_output={} actual_output={} cpu_bytes={}",
                         request.current_idx,
                         request.pinned_source_idx,
                         pending.expected_target_size[0],
                         pending.expected_target_size[1],
                         result_size[0],
                         result_size[1],
-                        result.pinned_rgba.len(),
-                        result.current_rgba.len(),
-                        result.diff_rgba.len(),
+                        request.output.label(),
+                        result.pixels.output().label(),
+                        result.pixels.allocated_bytes(),
                     ));
                     self.compare_preparation = ComparePreparationState::WaitingForSource(request);
                     ctx.request_repaint_after(std::time::Duration::from_millis(100));
                     return;
                 }
 
-                let pinned_pixels =
-                    egui::ColorImage::from_rgba_unmultiplied(result_size, &result.pinned_rgba);
-                let current_pixels =
-                    egui::ColorImage::from_rgba_unmultiplied(result_size, &result.current_rgba);
-                let diff_pixels =
-                    egui::ColorImage::from_rgba_unmultiplied(result_size, &result.diff_rgba);
+                crate::logger::log(format!(
+                    "[compare-memory] stage=cpu-ready target={}x{} scope={} output={} cpu_total_bytes={} cpu_buffers={} gpu_total_bytes=0 gpu_mips=not-allocated old_pair_release=before_worker",
+                    result_size[0],
+                    result_size[1],
+                    scope.label(),
+                    result.pixels.output().label(),
+                    result.pixels.allocated_bytes(),
+                    result.pixels.buffer_count(),
+                ));
                 let key = self.compare_prepared_next_key;
                 self.compare_prepared_next_key =
                     self.compare_prepared_next_key.wrapping_add(1).max(1);
@@ -26912,11 +27066,7 @@ impl App {
                     current_idx: result.current_idx,
                     pinned_source_idx: result.pinned_source_idx,
                     target_size: result_size,
-                    pinned_rgba: Arc::new(result.pinned_rgba),
-                    current_rgba: Arc::new(result.current_rgba),
-                    pinned_pixels: Arc::new(pinned_pixels),
-                    current_pixels: Arc::new(current_pixels),
-                    diff_pixels: Arc::new(diff_pixels),
+                    pixels: result.pixels,
                     pinned_texture: None,
                     current_texture: None,
                     diff_texture: None,
@@ -35376,8 +35526,7 @@ impl App {
         self.capture_region_selection = None;
         self.clear_fullscreen_tag_picker_state();
 
-        self.compare_view_mode = CompareViewMode::Off;
-        self.clear_compare_gpu_pair();
+        self.deactivate_compare_view();
         if self.panorama_state.is_some() {
             self.toggle_panorama_mode(fs_idx);
         }
@@ -57560,6 +57709,31 @@ impl App {
         }
     }
 
+    /// 比較表示を終了し、準備済みCPUバッファとcallback側GPU textureを同じ所有境界で落とす。
+    pub(crate) fn deactivate_compare_view(&mut self) {
+        let released_cpu_bytes = self
+            .compare_preparation
+            .prepared_pair()
+            .map_or(0, ComparePreparedPair::allocated_cpu_bytes);
+        self.compare_view_mode = CompareViewMode::Off;
+        // 実行中workerはrun_pixel_workの途中で止められない。receiverを捨てると再開時に
+        // 次workerを起動できて並走するため、Preparingだけはpollして捨てるまで所有を保つ。
+        if !matches!(
+            self.compare_preparation,
+            ComparePreparationState::Preparing(_) | ComparePreparationState::Draining(_)
+        ) {
+            self.compare_preparation = ComparePreparationState::Unprepared;
+        }
+        self.clear_compare_gpu_pair();
+        self.compare_wipe_dragging = false;
+        if released_cpu_bytes > 0 {
+            crate::logger::log(format!(
+                "[compare-memory] stage=deactivate cpu_total_bytes=0 released_cpu_bytes={} gpu_total_bytes=0 release_order=before_next_prepare",
+                released_cpu_bytes,
+            ));
+        }
+    }
+
     pub(crate) fn invalidate_compare_prepared_for_idx(&mut self, idx: usize) {
         let prepared_affected = self
             .compare_preparation
@@ -57570,7 +57744,7 @@ impl App {
             .request()
             .is_some_and(|request| request.current_idx == idx || request.pinned_source_idx == idx);
         if affected {
-            self.compare_preparation = ComparePreparationState::Unprepared;
+            self.compare_preparation.invalidate();
         }
         if prepared_affected {
             self.clear_compare_gpu_pair();
@@ -57586,7 +57760,7 @@ impl App {
     /// 比較ピクセルも古くなるが、mark_comic_dirty は現在ページ (fullscreen_idx) しか無効化
     /// しないため取りこぼす (Codex P2)。
     pub(crate) fn invalidate_all_compare_prepared(&mut self) {
-        self.compare_preparation = ComparePreparationState::Unprepared;
+        self.compare_preparation.invalidate();
         self.clear_compare_gpu_pair();
         self.compare_wipe_dragging = false;
         // ピン留め (X) スロットは焼き込み済み pixels を保持するので、フォントソース変更では
@@ -57669,7 +57843,7 @@ impl App {
     pub(crate) fn clear_all_color_caches(&mut self) {
         self.adjustment_cache.clear();
         self.thumb_adjust_tex.clear();
-        self.compare_preparation = ComparePreparationState::Unprepared;
+        self.compare_preparation.invalidate();
         self.clear_compare_gpu_pair();
         self.compare_wipe_dragging = false;
         self.clear_all_final_pipeline_caches();
@@ -59143,8 +59317,7 @@ impl App {
         self.local_adjust_segmentation_pending = None;
         self.analysis_mode = false;
         self.reset_erase_mode();
-        self.compare_view_mode = crate::app::CompareViewMode::Off;
-        self.clear_compare_gpu_pair();
+        self.deactivate_compare_view();
         self.show_metadata_panel = false;
         self.metadata_panel_hover_active = false;
     }

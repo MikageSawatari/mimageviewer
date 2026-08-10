@@ -1014,13 +1014,17 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 保持し、後のprepareが先の描画状態を上書きしない。
 本文の primary 描画は `CompareFramePrimaryDraw` が排他的に所有する。現在ページに一致する
 `ComparePreparationState::Ready` があるフレームは準備済み比較だけを描き、`Unprepared` /
-`WaitingForSource` / `Preparing` と別ページの `Ready` は通常ページだけを描く。準備中に raw pinned
+`WaitingForSource` / `Preparing` / `Draining` と別ページの `Ready` は通常ページだけを描く。準備中に raw pinned
 texture や Wipe の切れ端を通常ページへ重ねず、準備済み比較を描いた後も nav / colorize holdover を
 重ねない。
 比較キャンバスの寸法は current 側の完成画像寸法を正本とし、縦横比が違う pinned 側は等比縮小して
 中央配置する。このとき pinned の範囲外はフルスクリーン viewport の既定背景と同じ不透明な黒で
 埋め、WGPU の alpha blend と CPU fallback のどちらでも下層の current を透過させない。Diff は
 この黒背景と current の画素差を表示するため、current が黒でない余白は「差あり」として見える。
+見開き表示中も比較キャンバスは現在ページ1枚を単位とし、左右2ページのunionを巨大なtextureへ
+連結しない。比較準備workerは同時に1本だけ所有し、失効した途中cancel不能workerは`Draining`で
+完了を回収してから次要求を開始する。描画方式ごとのtyped CPU payloadにより、WindowsのWipe / Diffは
+pinned/current RGBA 2枚だけを保持し、Diff用CPU画像 / managed textureはCPU fallbackのDiff時だけ作る。
 本文の比較 callback は、ズーム / パン後の実画像矩形と viewport の交差だけを callback rect にし、
 切り落とした範囲を uniform の UV 窓で元の合成画像座標へ戻す。テクスチャ採取と Wipe 境界判定は
 復元後の座標を共有するため、白線の基準である実画像矩形と一致する。ナビゲータは実画像矩形が
