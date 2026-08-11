@@ -2245,3 +2245,11 @@ v37 → v38 ではなく **v42** とした。v42 は `PageRequest.job_id`、opti
 必ず両方を再ビルド・再起動する。3a では `heavy_queue.rs`、`sync_channel`、worker 数 / 容量、
 両側の prefetch admission、先読み窓 12/4、64 MiB 予算、画質 preset、位置 ownership、
 既存 `page_display` telemetry field を変更していない。
+
+**実機確認 (2026-08-11)**: 通常の閲覧は問題なしと利用者が確認した。ページ送り、見開き、
+遅い PDF / ZIP、先読み中ページを開く、補正プレビューの追い越しを含む。
+**未確認は 2 つある**。① 64 MiB 予算を埋めた深い高解像度コンテナで、遠い取得済みページを
+近い候補と交換する経路 (§14.6 の規則。候補スコープを外すと `full byte budget evicts a farther
+planned page before fetching a nearer one` が実際に落ちることは自動テストで確認済み)。
+② 表示中の切断 / 再接続とセッションの解放 / 再取得。どちらも段階 3b が queue の剪定と
+入口拒否の撤去で同じ経路へ触れるため、**3b の実機確認で必ず併せて見る**。
