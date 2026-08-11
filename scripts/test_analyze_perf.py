@@ -15,6 +15,7 @@ from unittest import mock
 
 from analyze_perf import (
     analyze_page_turn,
+    analyze_test_script_input,
     analyze_idle_health,
     cmd_colorize,
     cmd_idle_health,
@@ -73,6 +74,83 @@ def page_turn(
         "mode": mode,
         "source": source,
     }
+
+
+def hold_begin(t: float, hold_id: int, key: str = "Right") -> dict:
+    return {
+        "t": t,
+        "cat": "test_script",
+        "kind": "hold_begin",
+        "hold_id": hold_id,
+        "key": key,
+        "target_viewport": "ROOT",
+        "repeat_delay_ms": 250.0,
+        "repeat_hz": 30.0,
+    }
+
+
+def hold_end(t: float, hold_id: int) -> dict:
+    return {
+        "t": t,
+        "cat": "test_script",
+        "kind": "hold_end",
+        "hold_id": hold_id,
+        "down_count": 1,
+        "repeat_count": 5,
+        "up_count": 1,
+    }
+
+
+def frame_input(
+    t: float,
+    hold_id: int,
+    *,
+    held: bool,
+    edge_count: int,
+    materialized_in_frame: int,
+    frame_nr: int,
+) -> dict:
+    return {
+        "t": t,
+        "cat": "test_script",
+        "kind": "frame_input",
+        "hold_id": hold_id,
+        "held": held,
+        "edge_count": edge_count,
+        "materialized_in_frame": materialized_in_frame,
+        "frame_nr": frame_nr,
+    }
+
+
+def valid_test_script_input(hold_id: int = 900) -> list[dict]:
+    # No hold_begin/end here: invariant-only tests keep exercising the legacy
+    # time-gap splitter while satisfying the independent harness evidence gate.
+    return [
+        frame_input(
+            0.10,
+            hold_id,
+            held=True,
+            edge_count=1,
+            materialized_in_frame=0,
+            frame_nr=1,
+        ),
+        frame_input(
+            0.12,
+            hold_id,
+            held=True,
+            edge_count=0,
+            materialized_in_frame=0,
+            frame_nr=2,
+        ),
+        frame_input(
+            0.14,
+            hold_id,
+            held=True,
+            edge_count=3,
+            materialized_in_frame=3,
+            frame_nr=3,
+        ),
+    ]
 
 
 def page_turn_gate_decision(
@@ -222,7 +300,10 @@ class PageTurnInvariantCliTests(unittest.TestCase):
         events: list[dict],
         *,
         check: bool = True,
+        input_evidence: bool = True,
     ) -> SimpleNamespace:
+        if check and input_evidence:
+            events = list(events) + valid_test_script_input()
         synthetic_jsonl = (
             "\n".join(json.dumps(event) for event in events) + "\n"
         )
@@ -358,6 +439,62 @@ class PageTurnInvariantCliTests(unittest.TestCase):
         self.assertIn("I3 violation:", inclusive.stdout)
         self.assertIn("checked bursts=1", inclusive.stdout)
 
+    def test_hold_id_keeps_463ms_ready_events_in_one_burst(self) -> None:
+        hold_id = 17
+        events = [
+            hold_begin(0.5, hold_id),
+            page_turn(1.000, 1, "materialized"),
+            page_turn(1.463, 2, "materialized"),
+            hold_end(2.0, hold_id),
+        ] + valid_test_script_input(hold_id)
+
+        result = self.run_page_turn(events, input_evidence=False)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("page-turn burst split: hold_id", result.stdout)
+        self.assertIn("checked bursts=1 violations=0", result.stdout)
+
+    def test_hold_id_boundary_splits_nearby_ready_events(self) -> None:
+        events = [
+            hold_begin(0.5, 17),
+            page_turn(1.000, 1, "materialized"),
+            hold_end(1.010, 17),
+            hold_begin(1.020, 18),
+            page_turn(1.100, 3, "materialized"),
+            hold_end(1.200, 18),
+        ] + valid_test_script_input(17)
+
+        result = self.run_page_turn(events, input_evidence=False)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("page-turn burst split: hold_id", result.stdout)
+        self.assertIn("checked bursts=2 violations=0", result.stdout)
+
+    def test_hold_mode_ignores_ready_events_outside_down_up_ranges(self) -> None:
+        events = [
+            page_turn(0.400, 10, "materialized"),
+            hold_begin(0.500, 17),
+            page_turn(0.600, 1, "materialized"),
+            hold_end(0.700, 17),
+            page_turn(0.800, 20, "materialized"),
+        ] + valid_test_script_input(17)
+
+        result = self.run_page_turn(events, input_evidence=False)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("page-turn burst split: hold_id", result.stdout)
+        self.assertIn("checked bursts=1 violations=0", result.stdout)
+
+    def test_without_hold_events_keeps_legacy_300ms_burst_split(self) -> None:
+        result = self.run_page_turn([
+            page_turn(1.000, 1, "materialized"),
+            page_turn(1.463, 3, "materialized"),
+        ])
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("page-turn burst split: time_gap (legacy 300ms;", result.stdout)
+        self.assertIn("checked bursts=2 violations=0", result.stdout)
+
     def test_i2_exempts_only_passthrough_rendition_unavailable_mix(self) -> None:
         unavailable_mix = [
             page_turn_gate_decision(0.99, 1, defer_ui_uploads=True),
@@ -461,13 +598,23 @@ class PageTurnInvariantCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertNotIn("I5 violation:", result.stdout)
 
-    def test_check_without_page_turn_events_is_a_successful_no_op(self) -> None:
+    def test_check_without_page_turn_events_is_not_exercised(self) -> None:
         result = self.run_page_turn([
             {"t": 1.0, "cat": "fs", "kind": "paint", "idx": 3},
         ])
 
-        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("checked bursts=0 violations=0", result.stdout)
+        self.assertIn("page-turn invariants: status=not-exercised", result.stdout)
+
+    def test_page_turn_check_rejects_missing_harness_evidence(self) -> None:
+        result = self.run_page_turn(
+            [page_turn(1.0, 1, "materialized")],
+            input_evidence=False,
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("test-script input: status=not-established", result.stdout)
 
     def test_without_check_keeps_the_existing_success_output(self) -> None:
         result = self.run_page_turn([
@@ -481,6 +628,124 @@ class PageTurnInvariantCliTests(unittest.TestCase):
             "page-turn ready: pass_through=0 materialized=2\n"
             "(pass_through を含むキーリピート区間なし)\n",
         )
+
+
+class TestScriptInputGateTests(unittest.TestCase):
+    def run_input_check(self, events: list[dict]) -> SimpleNamespace:
+        synthetic_jsonl = "\n".join(json.dumps(event) for event in events) + "\n"
+        stdout = io.StringIO()
+        exit_code = 0
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "analyze_perf.py",
+                    "test-script.jsonl",
+                    "test-script-input",
+                    "--check",
+                ],
+            ),
+            mock.patch.object(Path, "is_file", return_value=True),
+            mock.patch.object(
+                Path,
+                "open",
+                return_value=io.StringIO(synthetic_jsonl),
+            ),
+            contextlib.redirect_stdout(stdout),
+        ):
+            try:
+                main()
+            except SystemExit as error:
+                exit_code = int(error.code or 0)
+        return SimpleNamespace(returncode=exit_code, stdout=stdout.getvalue())
+
+    def test_missing_vibration_or_accumulation_is_not_established(self) -> None:
+        missing_vibration = [
+            frame_input(
+                1.0,
+                1,
+                held=True,
+                edge_count=2,
+                materialized_in_frame=2,
+                frame_nr=1,
+            ),
+        ]
+        missing_accumulation = [
+            frame_input(
+                1.0,
+                1,
+                held=True,
+                edge_count=1,
+                materialized_in_frame=0,
+                frame_nr=1,
+            ),
+            frame_input(
+                1.1,
+                1,
+                held=True,
+                edge_count=0,
+                materialized_in_frame=0,
+                frame_nr=2,
+            ),
+        ]
+
+        # Accumulation is only demanded of a page-turn measurement, so the
+        # missing-accumulation case has to carry page-turn events to be a
+        # failure at all.
+        measured_without_accumulation = missing_accumulation + [
+            page_turn(1.05, 1, "materialized"),
+        ]
+
+        for missing, events in (
+            ("vibration", missing_vibration),
+            ("accumulation", measured_without_accumulation),
+        ):
+            with self.subTest(missing=missing):
+                report = analyze_test_script_input(events)
+                self.assertEqual(report["status"], "not-established")
+                result = self.run_input_check(events)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(f"{missing}=no", result.stdout)
+
+    def test_fast_run_without_page_turns_does_not_need_accumulation(self) -> None:
+        # A frame only absorbs several repeats when it outlasts the repeat
+        # interval. A real 2.5s hold on the grid ran at ~166fps and accumulated
+        # nothing, so requiring it here would call a working harness broken.
+        events = [
+            frame_input(
+                1.0,
+                1,
+                held=True,
+                edge_count=1,
+                materialized_in_frame=0,
+                frame_nr=1,
+            ),
+            frame_input(
+                1.1,
+                1,
+                held=True,
+                edge_count=0,
+                materialized_in_frame=0,
+                frame_nr=2,
+            ),
+        ]
+
+        report = analyze_test_script_input(events)
+        self.assertEqual(report["status"], "pass")
+        self.assertFalse(report["page_turn_measured"])
+
+        result = self.run_input_check(events)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("accumulation=no (not required", result.stdout)
+
+    def test_vibration_and_accumulation_establish_the_harness(self) -> None:
+        result = self.run_input_check(valid_test_script_input())
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("status=pass", result.stdout)
+        self.assertIn("vibration=yes", result.stdout)
+        self.assertIn("accumulation=yes", result.stdout)
 
 
 class IdleHealthTests(unittest.TestCase):

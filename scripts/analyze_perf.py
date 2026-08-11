@@ -14,6 +14,8 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
     latency             seq ごとに input → *.ready / *.paint のレイテンシを集計
     page-turn [--check] キーリピート中の通過/実体化ページ数を集計。
                         --check でページ送りの不変条件を検査
+    test-script-input [--check]
+                        合成 hold の振動・repeat 蓄積の観測事実を検査
     priority            可視サムネイルが未 decode のうちに非可視が先に処理された違反を検出
     dump <seq>          指定 seq に紐づく全イベントを時系列で列挙
     timeline [seq]      ガントチャート (matplotlib が必要)。seq 指定可
@@ -421,28 +423,164 @@ PAGE_TURN_BURST_GAP_EPSILON = 1e-9
 PAGE_TURN_INVARIANT_SOURCES = ("final_composite", "thumbnail")
 
 
+def _positive_hold_id(event: dict) -> int | None:
+    for field in ("script_hold_id", "hold_id"):
+        value = event.get(field)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
+
+def _test_script_page_hold_ids(
+    events: list[dict],
+) -> tuple[bool, dict[int, int]]:
+    """Map page-turn event ordinals to the enclosing Down/Up hold."""
+    active_hold_ids: list[int] = []
+    page_hold_ids: dict[int, int] = {}
+    hold_event_seen = False
+    for ordinal, event in enumerate(events):
+        if event.get("cat") == "test_script":
+            hold_id = _positive_hold_id(event)
+            if hold_id is None:
+                continue
+            kind = event.get("kind")
+            if kind == "hold_begin":
+                hold_event_seen = True
+                active_hold_ids = [
+                    active for active in active_hold_ids if active != hold_id
+                ]
+                active_hold_ids.append(hold_id)
+            elif kind == "hold_end":
+                hold_event_seen = True
+                active_hold_ids = [
+                    active for active in active_hold_ids if active != hold_id
+                ]
+            continue
+
+        if (
+            event.get("cat") == "fs"
+            and event.get("kind") == "page_turn_ready"
+        ):
+            explicit = _positive_hold_id(event)
+            if explicit is not None:
+                page_hold_ids[ordinal] = explicit
+            elif active_hold_ids:
+                page_hold_ids[ordinal] = active_hold_ids[-1]
+    return hold_event_seen, page_hold_ids
+
+
+def analyze_test_script_input(events: list[dict]) -> dict:
+    """Report synthetic-input observations without making app-side judgments."""
+    frames = [
+        event
+        for event in events
+        if event.get("cat") == "test_script"
+        and event.get("kind") == "frame_input"
+        and _positive_hold_id(event) is not None
+    ]
+    by_hold: dict[int, list[dict]] = defaultdict(list)
+    for event in frames:
+        by_hold[_positive_hold_id(event)].append(event)
+
+    vibration_hold_ids: list[int] = []
+    for hold_id, hold_frames in sorted(by_hold.items()):
+        held_with_edge = any(
+            event.get("held") is True
+            and int(event.get("edge_count", 0)) > 0
+            for event in hold_frames
+        )
+        held_without_edge = any(
+            event.get("held") is True and int(event.get("edge_count", 0)) == 0
+            for event in hold_frames
+        )
+        if held_with_edge and held_without_edge:
+            vibration_hold_ids.append(hold_id)
+
+    accumulated_frames = [
+        event
+        for event in frames
+        if int(event.get("materialized_in_frame", 0)) > 1
+    ]
+    # A frame only absorbs several repeats when it outlasts the repeat
+    # interval. A healthy fast run never produces one -- a real 2.5s hold on the
+    # grid ran at ~166fps and accumulated nothing -- so demanding it everywhere
+    # would report a working harness as broken. It is required only where it
+    # carries meaning: a page-turn measurement, whose whole subject is the slow
+    # frames of docs/display-pipeline.md 2.5.
+    page_turn_measured = any(
+        event.get("cat") == "fs" and event.get("kind") == "page_turn_ready"
+        for event in events
+    )
+    failures: list[str] = []
+    if not vibration_hold_ids:
+        failures.append(
+            "no hold observed both held=true/edge>0 and held=true/edge=0 frames"
+        )
+    if page_turn_measured and not accumulated_frames:
+        failures.append(
+            "no frame materialized multiple repeats during a page-turn measurement"
+        )
+    return {
+        "status": "pass" if not failures else "not-established",
+        "hold_ids": sorted(by_hold),
+        "frame_count": len(frames),
+        "vibration_hold_ids": vibration_hold_ids,
+        "accumulated_frames": accumulated_frames,
+        "page_turn_measured": page_turn_measured,
+        "failures": failures,
+    }
+
+
+def _print_test_script_input_report(report: dict) -> None:
+    vibration = "yes" if report["vibration_hold_ids"] else "no"
+    if report["accumulated_frames"]:
+        accumulation = "yes"
+    elif report["page_turn_measured"]:
+        accumulation = "no"
+    else:
+        accumulation = "no (not required: no page-turn measurement)"
+    print(
+        "test-script input: "
+        f"status={report['status']} holds={len(report['hold_ids'])} "
+        f"frames={report['frame_count']} vibration={vibration} "
+        f"accumulation={accumulation}"
+    )
+    for failure in report["failures"]:
+        print(f"  not-established: {failure}")
+
+
+def cmd_test_script_input(events: list[dict], check: bool) -> int:
+    report = analyze_test_script_input(events)
+    _print_test_script_input_report(report)
+    return 1 if check and report["status"] != "pass" else 0
+
+
 def _page_turn_check_bursts(events: list[dict]) -> list[dict]:
     """Split page_turn_ready events into trace-check bursts.
 
     This is intentionally separate from ``analyze_page_turn``. The latter is
     the long-standing aggregation used without --check, while the invariant
-    gate has the brief's 300 ms / items_generation boundaries.
+    gate uses test-script hold boundaries when present. Legacy/manual logs
+    retain the brief's 300 ms / items_generation boundaries.
     """
+    hold_split, page_hold_ids = _test_script_page_hold_ids(events)
     ready = sorted(
         (
-            event
-            for event in events
+            (ordinal, event)
+            for ordinal, event in enumerate(events)
             if event.get("cat") == "fs"
             and event.get("kind") == "page_turn_ready"
             and isinstance(event.get("idx"), int)
+            and (not hold_split or ordinal in page_hold_ids)
         ),
-        key=lambda event: float(event.get("t", 0.0)),
+        key=lambda item: (float(item[1].get("t", 0.0)), item[0]),
     )
     bursts: list[dict] = []
     active: list[dict] = []
+    active_hold_id: int | None = None
 
     def finish() -> None:
-        nonlocal active
+        nonlocal active, active_hold_id
         if not active:
             return
         indices = [int(event["idx"]) for event in active]
@@ -473,10 +611,14 @@ def _page_turn_check_bursts(events: list[dict]) -> list[dict]:
             "direction": direction,
             "start_t": float(active[0].get("t", 0.0)),
             "end_t": float(active[-1].get("t", 0.0)),
+            "hold_id": active_hold_id,
+            "split_mode": "hold_id" if hold_split else "time_gap",
         })
         active = []
+        active_hold_id = None
 
-    for event in ready:
+    for ordinal, event in ready:
+        hold_id = page_hold_ids.get(ordinal) if hold_split else None
         if active:
             gap = (
                 float(event.get("t", 0.0))
@@ -486,10 +628,14 @@ def _page_turn_check_bursts(events: list[dict]) -> list[dict]:
                 event.get("items_generation")
                 != active[-1].get("items_generation")
             )
-            if generation_changed or gap > (
+            hold_changed = hold_split and hold_id != active_hold_id
+            legacy_gap = not hold_split and gap > (
                 PAGE_TURN_BURST_GAP_SECS + PAGE_TURN_BURST_GAP_EPSILON
-            ):
+            )
+            if generation_changed or hold_changed or legacy_gap:
                 finish()
+        if not active:
+            active_hold_id = hold_id
         active.append(event)
     finish()
     return bursts
@@ -708,6 +854,9 @@ def analyze_page_turn_invariants(events: list[dict]) -> dict:
 
     return {
         "bursts": bursts,
+        "burst_split": (
+            "hold_id" if _test_script_page_hold_ids(events)[0] else "time_gap"
+        ),
         "violations": violations,
         "violation_counts": dict(Counter(
             violation["id"] for violation in violations
@@ -722,6 +871,7 @@ def _page_turn_burst_label(burst: dict | None, fallback_event: dict) -> str:
         return f"burst t={t:.3f}..{t:.3f} unknown idx={idx}..{idx}"
     return (
         f"burst t={burst['start_t']:.3f}..{burst['end_t']:.3f} "
+        f"hold_id={burst['hold_id'] if burst['hold_id'] is not None else '-'} "
         f"{burst['direction']} "
         f"idx={burst['indices'][0]}..{burst['indices'][-1]}"
     )
@@ -740,9 +890,23 @@ def _print_page_turn_sources(burst: dict | None) -> None:
 
 def cmd_page_turn_check(events: list[dict]) -> int:
     # v2.13.0 does not emit page-turn events after the pass-through experiment
-    # was removed. An empty trace is therefore a valid no-op check; keep the
-    # analyzer for the next implementation and for archived measurement logs.
+    # was removed. Keep invariant coverage and harness-input coverage separate:
+    # this combined gate reports zero checked bursts as not exercised, while
+    # the test-script-input command can validate the harness facts alone.
     report = analyze_page_turn_invariants(events)
+    input_report = analyze_test_script_input(events)
+    if report["burst_split"] == "hold_id":
+        print(
+            "page-turn burst split: hold_id "
+            "(test_script Down/Up; unscoped ready ignored; "
+            "items_generation boundary retained)"
+        )
+    else:
+        print(
+            "page-turn burst split: time_gap "
+            f"(legacy {PAGE_TURN_BURST_GAP_SECS * 1000:.0f}ms; "
+            "items_generation boundary retained)"
+        )
     for violation in report["violations"]:
         invariant = violation["id"]
         burst = violation["burst"]
@@ -800,7 +964,17 @@ def cmd_page_turn_check(events: list[dict]) -> int:
         f"checked bursts={len(report['bursts'])} "
         f"violations={len(report['violations'])}"
     )
-    return 1 if report["violations"] else 0
+    if report["bursts"]:
+        invariant_status = "fail" if report["violations"] else "pass"
+    else:
+        invariant_status = "not-exercised"
+    print(f"page-turn invariants: status={invariant_status}")
+    _print_test_script_input_report(input_report)
+    return 1 if (
+        report["violations"]
+        or not report["bursts"]
+        or input_report["status"] != "pass"
+    ) else 0
 
 
 # -----------------------------------------------------------------------
@@ -2400,6 +2574,12 @@ def main() -> None:
         action="store_true",
         help="ページ送りのトレース不変条件 I1-I5 を検査する",
     )
+    p_test_script_input = subs.add_parser("test-script-input")
+    p_test_script_input.add_argument(
+        "--check",
+        action="store_true",
+        help="振動・repeat 蓄積の証拠が揃わなければ終了コード 1 を返す",
+    )
     subs.add_parser("priority")
     subs.add_parser("thumbs")
     subs.add_parser("colorize")
@@ -2473,6 +2653,8 @@ def main() -> None:
         cmd_page_turn(events)
         if args.check:
             sys.exit(cmd_page_turn_check(events))
+    elif args.cmd == "test-script-input":
+        sys.exit(cmd_test_script_input(events, args.check))
     elif args.cmd == "priority":
         cmd_priority(events)
     elif args.cmd == "thumbs":
