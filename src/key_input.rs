@@ -1108,6 +1108,8 @@ struct SyntheticViewportBatch {
 
 #[derive(Debug)]
 struct PreparedSyntheticFrame {
+    #[cfg_attr(not(feature = "test-script"), allow(dead_code))]
+    frame_nr: u64,
     time_key: RawInputTimeKey,
     raw_input_time: Option<f64>,
     batches: Vec<SyntheticViewportBatch>,
@@ -1207,6 +1209,7 @@ impl SyntheticInputPlugin {
             self.record_issue(issue);
         }
         self.prepared = Some(PreparedSyntheticFrame {
+            frame_nr,
             time_key,
             raw_input_time: input.time,
             batches,
@@ -1340,6 +1343,59 @@ pub(crate) fn install_synthetic_input_plugin(ctx: &egui::Context) {
 pub fn take_synthetic_input_issues(ctx: &egui::Context) -> Vec<SyntheticInputIssue> {
     ctx.with_plugin(|plugin: &mut SyntheticInputPlugin| plugin.issues.drain(..).collect())
         .unwrap_or_default()
+}
+
+#[cfg(feature = "test-script")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SyntheticHoldObservation {
+    pub(crate) frame_nr: u64,
+    pub(crate) key: SyntheticNavigationKey,
+    pub(crate) hold_ids: Vec<u64>,
+}
+
+/// Return the synthetic holds that are active in the RawInput frame currently
+/// being processed. The result only identifies which production level reads
+/// need attribution; the held value itself must still be read through
+/// `Keymap::key_held_chord`.
+#[cfg(feature = "test-script")]
+pub(crate) fn synthetic_hold_observations(ctx: &egui::Context) -> Vec<SyntheticHoldObservation> {
+    let Some((frame_nr, armed)) = ctx
+        .with_plugin(|plugin: &mut SyntheticInputPlugin| {
+            plugin
+                .prepared
+                .as_ref()
+                .map(|prepared| (prepared.frame_nr, prepared.armed))
+        })
+        .flatten()
+    else {
+        return Vec::new();
+    };
+    if !armed {
+        return Vec::new();
+    }
+
+    let Ok(guard) = state().lock() else {
+        return Vec::new();
+    };
+    let mut observations: Vec<SyntheticHoldObservation> = Vec::new();
+    for held in &guard.synthetic.held {
+        let Some(hold_id) = held.hold_id else {
+            continue;
+        };
+        if let Some(existing) = observations
+            .iter_mut()
+            .find(|observation| observation.key == held.key)
+        {
+            existing.hold_ids.push(hold_id);
+        } else {
+            observations.push(SyntheticHoldObservation {
+                frame_nr,
+                key: held.key,
+                hold_ids: vec![hold_id],
+            });
+        }
+    }
+    observations
 }
 
 /// Arm the production synthetic timeline without disturbing the HWND registry

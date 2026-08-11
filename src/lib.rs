@@ -1216,6 +1216,7 @@ pub fn run() -> eframe::Result {
             app.pending_initial_size = Some(size);
             #[cfg(all(feature = "test-script", windows))]
             if let Some(path) = test_script_path.clone() {
+                app.prepare_test_script_run();
                 test_script::start(path, &cc.egui_ctx).map_err(std::io::Error::other)?;
             }
             emit_startup("creator_exit", None);

@@ -501,6 +501,39 @@ def analyze_test_script_input(events: list[dict]) -> dict:
         for event in frames
         if int(event.get("materialized_in_frame", 0)) > 1
     ]
+    level_reads = [
+        event
+        for event in events
+        if event.get("cat") == "test_script"
+        and event.get("kind") == "level_read"
+        and event.get("reader") == "Keymap::key_held_chord"
+        and _positive_hold_id(event) is not None
+        and isinstance(event.get("frame_nr"), int)
+    ]
+    level_reads_by_frame: dict[tuple[int, int], list[dict]] = defaultdict(list)
+    for event in level_reads:
+        level_reads_by_frame[
+            (_positive_hold_id(event), int(event["frame_nr"]))
+        ].append(event)
+    required_level_reads = {
+        (_positive_hold_id(event), int(event["frame_nr"]))
+        for event in frames
+        if event.get("held") is True and isinstance(event.get("frame_nr"), int)
+    }
+    missing_level_reads = sorted(
+        pair for pair in required_level_reads if pair not in level_reads_by_frame
+    )
+    false_level_reads = sorted(
+        pair
+        for pair in required_level_reads
+        if pair in level_reads_by_frame
+        and not all(event.get("held") is True for event in level_reads_by_frame[pair])
+    )
+    level_established = (
+        bool(required_level_reads)
+        and not missing_level_reads
+        and not false_level_reads
+    )
     # A frame only absorbs several repeats when it outlasts the repeat
     # interval. A healthy fast run never produces one -- a real 2.5s hold on the
     # grid ran at ~166fps and accumulated nothing -- so demanding it everywhere
@@ -516,6 +549,14 @@ def analyze_test_script_input(events: list[dict]) -> dict:
         failures.append(
             "no hold observed both held=true/edge>0 and held=true/edge=0 frames"
         )
+    if missing_level_reads:
+        failures.append(
+            "production keymap level read missing for held synthetic input frames"
+        )
+    if false_level_reads:
+        failures.append(
+            "production keymap level read returned held=false for held synthetic input frames"
+        )
     if page_turn_measured and not accumulated_frames:
         failures.append(
             "no frame materialized multiple repeats during a page-turn measurement"
@@ -526,6 +567,10 @@ def analyze_test_script_input(events: list[dict]) -> dict:
         "frame_count": len(frames),
         "vibration_hold_ids": vibration_hold_ids,
         "accumulated_frames": accumulated_frames,
+        "level_read_count": len(level_reads),
+        "level_established": level_established,
+        "missing_level_reads": missing_level_reads,
+        "false_level_reads": false_level_reads,
         "page_turn_measured": page_turn_measured,
         "failures": failures,
     }
@@ -533,6 +578,7 @@ def analyze_test_script_input(events: list[dict]) -> dict:
 
 def _print_test_script_input_report(report: dict) -> None:
     vibration = "yes" if report["vibration_hold_ids"] else "no"
+    level = "yes" if report["level_established"] else "no"
     if report["accumulated_frames"]:
         accumulation = "yes"
     elif report["page_turn_measured"]:
@@ -543,6 +589,7 @@ def _print_test_script_input_report(report: dict) -> None:
         "test-script input: "
         f"status={report['status']} holds={len(report['hold_ids'])} "
         f"frames={report['frame_count']} vibration={vibration} "
+        f"level={level} level_reads={report['level_read_count']} "
         f"accumulation={accumulation}"
     )
     for failure in report["failures"]:

@@ -14021,6 +14021,31 @@ impl App {
         &self,
         ctx: &egui::Context,
     ) -> crate::test_script::TestScriptSnapshot {
+        let keymap_level_observations = crate::key_input::synthetic_hold_observations(ctx)
+            .into_iter()
+            .map(|observation| {
+                let key_name = match observation.key {
+                    crate::key_input::SyntheticNavigationKey::Right => KeyName::Right,
+                    crate::key_input::SyntheticNavigationKey::Left => KeyName::Left,
+                    crate::key_input::SyntheticNavigationKey::Up => KeyName::Up,
+                    crate::key_input::SyntheticNavigationKey::Down => KeyName::Down,
+                    crate::key_input::SyntheticNavigationKey::PageUp => KeyName::PageUp,
+                    crate::key_input::SyntheticNavigationKey::PageDown => KeyName::PageDown,
+                    crate::key_input::SyntheticNavigationKey::Home => KeyName::Home,
+                    crate::key_input::SyntheticNavigationKey::End => KeyName::End,
+                    crate::key_input::SyntheticNavigationKey::Enter => KeyName::Enter,
+                    crate::key_input::SyntheticNavigationKey::Escape => KeyName::Esc,
+                };
+                crate::test_script::KeymapLevelObservation {
+                    frame_nr: observation.frame_nr,
+                    key: key_name.settings_name().to_string(),
+                    hold_ids: observation.hold_ids,
+                    held: self
+                        .keymap
+                        .test_script_key_held_chord(ctx, Chord::key(key_name)),
+                }
+            })
+            .collect();
         let target = crate::key_input::resolve_synthetic_routing_target().ok();
         let target_viewport = target
             .map(|target| {
@@ -14086,6 +14111,7 @@ impl App {
             fullscreen_raw_key_permit: false,
             has_previous_page: nav_position.is_some_and(|position| position > 0),
             has_next_page: nav_position.is_some_and(|position| position + 1 < nav.len()),
+            keymap_level_observations,
         }
     }
 

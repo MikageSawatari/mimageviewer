@@ -632,12 +632,21 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
-### 2.3 アプリ内蔵のテストスクリプト実行 (実機確認の往復をなくす) — 利用者提案
+### 2.3 アプリ内蔵のテストスクリプト実行 (実機確認の往復をなくす) — 完了
 
 - 出典: 利用者提案 2026-08-11。§1.58 の実機確認で 5 往復して直せなかったことを受けて。
 - **設計の正本は [test-script-runner-plan.md](test-script-runner-plan.md)。着手時はそちらを読む。**
   差し込む層の決定 (§1)、同期点 (§2)、timeline の規約 (§3)、level の chokepoint (§4)、
   判定器を false green にしない条件 (§9) が入っている。
+- **完了 (2026-08-11、S1〜S4)**:
+  - `--test-script` + 隔離 `--data-dir`、Rhai runner、deterministic hold timeline、Win32 / egui
+    fan-out、production `Keymap::key_held_chord` の level 観測、外部 Python 判定まで実装した。
+  - `scripts/page-turn-smoke.ps1 -SelfTest` は PNG fixture 生成から fullscreen の Right hold、
+    app 終了コードと analyzer 終了コードの確認まで無人で完走する。
+  - 対話デスクトップの実ログで `app exit=0`、`status=pass`、`vibration=yes`、`level=yes`
+    (`level_reads=826`) を確認した。前提不足 run は app / analyzer / harness が非 0 になる。
+  - 以上により **§1.58 の再着手条件は満たされた**。ページ送り固有 event と不変条件の再実装は
+    §1.58 の作業として行い、正本 §13.2 の実データ計測を最終 gate にする。
 - **やりたいこと**: 起動引数でテスト用スクリプトを渡すと、mIV 内のスレッドがそれを実行し、
   操作をアプリ内から再現する。別プロセスからのキー注入をやめる。Rhai は
   スタック機能 ([filename-stack-plan.md](filename-stack-plan.md)) で既に使っており、

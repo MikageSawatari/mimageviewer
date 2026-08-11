@@ -14159,6 +14159,18 @@ impl App {
         self.common_modal_dialog_open()
     }
 
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn prepare_test_script_run(&mut self) {
+        // A fresh isolated data directory normally opens first-run and migration
+        // dialogs. Scripted runs cannot dismiss pointer-driven setup UI, and
+        // allowing those dialogs to block input would make an unattended smoke
+        // test impossible. Suppress startup-only prompts in memory; never save
+        // these choices to the isolated profile.
+        self.settings.first_setup_completed = true;
+        self.show_mouse_nav_migration_prompt = false;
+        self.show_whats_new = false;
+    }
+
     pub(crate) fn clear_fullscreen_tag_picker_state(&mut self) {
         self.fullscreen_tag_picker_open = false;
         self.fullscreen_tag_picker_input.clear();

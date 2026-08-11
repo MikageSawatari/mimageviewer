@@ -32,6 +32,14 @@ const EXIT_ENVIRONMENT_FAILURE: i32 = 2;
 // fixed wgpu device-drop timeout observed on contended Windows GPU systems.
 const SHUTDOWN_WATCHDOG_GRACE: Duration = Duration::from_secs(6);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeymapLevelObservation {
+    pub(crate) frame_nr: u64,
+    pub(crate) key: String,
+    pub(crate) hold_ids: Vec<u64>,
+    pub(crate) held: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TestScriptSnapshot {
     pub(crate) is_fullscreen: bool,
@@ -56,6 +64,7 @@ pub(crate) struct TestScriptSnapshot {
     pub(crate) fullscreen_raw_key_permit: bool,
     pub(crate) has_previous_page: bool,
     pub(crate) has_next_page: bool,
+    pub(crate) keymap_level_observations: Vec<KeymapLevelObservation>,
 }
 
 impl Default for TestScriptSnapshot {
@@ -83,6 +92,7 @@ impl Default for TestScriptSnapshot {
             fullscreen_raw_key_permit: false,
             has_previous_page: false,
             has_next_page: false,
+            keymap_level_observations: Vec::new(),
         }
     }
 }
@@ -374,6 +384,28 @@ fn emit_perf_fail(outcome: &ScriptOutcome) {
             ("message", serde_json::Value::from(outcome.message.as_str())),
         ],
     );
+}
+
+fn emit_perf_level_reads(observations: &[KeymapLevelObservation]) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    for observation in observations {
+        for hold_id in &observation.hold_ids {
+            crate::perf::event(
+                "test_script",
+                "level_read",
+                Some(&observation.key),
+                0,
+                &[
+                    ("hold_id", serde_json::Value::from(*hold_id)),
+                    ("held", serde_json::Value::from(observation.held)),
+                    ("frame_nr", serde_json::Value::from(observation.frame_nr)),
+                    ("reader", serde_json::Value::from("Keymap::key_held_chord")),
+                ],
+            );
+        }
+    }
 }
 
 fn rhai_error(message: impl Into<String>) -> Box<EvalAltResult> {
@@ -866,6 +898,10 @@ fn start_inner(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
     if !crate::key_input::arm_synthetic_input() {
         return Err("failed to arm synthetic input timeline".to_string());
     }
+    // Synthetic routing intentionally obeys the production foreground/focus
+    // rules. Request focus here so unattended runs can satisfy that precondition
+    // without a host-side click or key injection.
+    ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
 
     let (tx, rx) = mpsc::channel();
     let snapshot = Arc::new(RwLock::new(TestScriptSnapshot::default()));
@@ -1025,6 +1061,7 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
         }
         runtime.last_frame = Some(frame);
     }
+    emit_perf_level_reads(&snapshot.keymap_level_observations);
     if let Ok(mut published) = runtime.snapshot.write() {
         *published = snapshot;
     } else {
