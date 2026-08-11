@@ -7265,13 +7265,14 @@ impl KeymapSettings {
 
 #[cfg(windows)]
 fn key_held_via_os(viewport: egui::ViewportId, key: KeyName) -> bool {
-    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-
     let routed_physical_state = key
         .routed_hold_extended()
         .and_then(|extended| crate::key_input::routed_return_key_held(viewport, extended));
-    key_held_from_os_sources(key, routed_physical_state, |virtual_key| unsafe {
-        GetAsyncKeyState(virtual_key as i32) < 0
+    key_held_from_os_sources(key, routed_physical_state, |virtual_key| {
+        crate::key_input::physical_key_down(crate::key_input::PhysicalKeySlot::new(
+            virtual_key,
+            key.routed_hold_extended().unwrap_or(false),
+        ))
     })
 }
 
@@ -7309,10 +7310,8 @@ const fn modifier_virtual_key(kind: ModKind) -> u16 {
 
 #[cfg(windows)]
 pub(crate) fn modifier_held_via_os(kind: ModKind) -> bool {
-    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-
     let vk = modifier_virtual_key(kind);
-    unsafe { GetAsyncKeyState(vk as i32) < 0 }
+    crate::key_input::physical_key_down(crate::key_input::PhysicalKeySlot::new(vk.into(), false))
 }
 
 #[cfg(not(windows))]

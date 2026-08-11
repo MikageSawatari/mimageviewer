@@ -34111,11 +34111,14 @@ impl App {
                 return;
             }
 
-            use windows::Win32::UI::Input::KeyboardAndMouse::{
-                GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT,
-            };
+            use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU, VK_SHIFT};
 
-            let key_down = |vk: u16| unsafe { GetAsyncKeyState(vk as i32) < 0 };
+            let key_down = |vk: u16| {
+                crate::key_input::physical_key_down(crate::key_input::PhysicalKeySlot::new(
+                    vk.into(),
+                    false,
+                ))
+            };
             let modifiers = Self::egui_modifiers_from_physical_state(
                 key_down(VK_CONTROL.0),
                 key_down(VK_SHIFT.0),
@@ -34153,6 +34156,9 @@ impl App {
         let ctrl_v = {
             #[cfg(windows)]
             {
+                // Clipboard paste depends on GetAsyncKeyState's transition low
+                // bit, which the keyboard level chokepoint intentionally does
+                // not model. Synthetic clipboard input is outside S1.
                 let ctrl =
                     unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x11) };
                 let v =

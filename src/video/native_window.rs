@@ -1935,6 +1935,8 @@ fn ime_composition_string(hwnd: HWND, mode: IME_COMPOSITION_STRING) -> Option<St
 }
 
 fn native_key_event(wparam: WPARAM, lparam: LPARAM) -> NativeVideoKeyEvent {
+    // The native presenter WndProc is a separate input route and is explicitly
+    // outside the app-side synthetic timeline.
     let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
     let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
     let alt = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;

@@ -10,20 +10,21 @@ use crate::keymap::{CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, Key
 fn native_video_key_physically_down(
     key: &crate::video::native_window::NativeVideoKeyEvent,
 ) -> bool {
+    let physically_down = crate::key_input::physical_key_down(
+        crate::key_input::PhysicalKeySlot::new(key.virtual_key, key.extended),
+    );
     // headless な単体テストは合成 KeyDown を送るので実際には物理キーが押されておらず、
     // GetAsyncKeyState が常に false を返して F12 トグルが走らない。この OS 問い合わせは
     // 実機の stale 再配送弾き専用なので、テスト時は「押されている」とみなして production
     // 分岐 (実機でのみ意味を持つ) を迂回する。
     #[cfg(test)]
     {
-        let _ = key;
+        let _ = physically_down;
         true
     }
     #[cfg(not(test))]
     {
-        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-        // high bit (0x8000) = 現在押下中。呼び出し時点の物理状態を返す。
-        unsafe { (GetAsyncKeyState(key.virtual_key as i32) as u16 & 0x8000) != 0 }
+        physically_down
     }
 }
 

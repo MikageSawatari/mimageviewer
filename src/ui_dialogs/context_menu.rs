@@ -14,6 +14,7 @@ use crate::native_context_menu::{
 fn primary_mouse_button_physically_down() -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 
+    // Mouse state is outside the keyboard-only synthetic timeline.
     unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 }
 }
 

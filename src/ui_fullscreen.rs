@@ -2473,9 +2473,12 @@ fn current_foreground_hwnd() -> usize {
 /// ため、Ctrl 依存の挙動 (ソースプレビュー / 補正レイヤー境界筆の通常筆切替) はこれを使う。
 #[cfg(windows)]
 pub(crate) fn ctrl_held_via_os() -> bool {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL};
+    use windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
 
-    unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) < 0 }
+    crate::key_input::physical_key_down(crate::key_input::PhysicalKeySlot::new(
+        VK_CONTROL.0.into(),
+        false,
+    ))
 }
 
 #[cfg(not(windows))]
@@ -2485,9 +2488,12 @@ pub(crate) fn ctrl_held_via_os() -> bool {
 
 #[cfg(windows)]
 fn shift_held_via_os() -> bool {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_SHIFT};
+    use windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT;
 
-    unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) < 0 }
+    crate::key_input::physical_key_down(crate::key_input::PhysicalKeySlot::new(
+        VK_SHIFT.0.into(),
+        false,
+    ))
 }
 
 #[cfg(not(windows))]

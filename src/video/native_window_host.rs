@@ -429,6 +429,7 @@ impl NativeWindowHost {
                 foreground_is_current_process:
                     super::native_window::foreground_belongs_to_current_process_strict(),
             },
+            // Mouse capture is outside the keyboard-only synthetic timeline.
             global_lbutton_down: unsafe {
                 (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0
             },
