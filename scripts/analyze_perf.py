@@ -608,6 +608,20 @@ def cmd_test_script_input(events: list[dict], check: bool) -> int:
     return 1 if check and report["status"] != "pass" else 0
 
 
+def _hold_release_time(events: list[dict], hold_id: object) -> float | None:
+    """Return when the script released the key for this hold, if it is known."""
+    if hold_id is None:
+        return None
+    for event in events:
+        if (
+            event.get("cat") == "test_script"
+            and event.get("kind") == "hold_end"
+            and event.get("hold_id") == hold_id
+        ):
+            return float(event.get("t", 0.0))
+    return None
+
+
 def _page_turn_check_bursts(events: list[dict]) -> list[dict]:
     """Split page_turn_ready events into trace-check bursts.
 
@@ -877,6 +891,14 @@ def analyze_page_turn_invariants(events: list[dict]) -> dict:
             or last_idx == max_idx_by_generation[burst["items_generation"]]
         )
         endpoint_exception = repeated_tail and at_endpoint
+        # Anchor the settle window to the key coming up, not to the last ready
+        # event. Holding at the end of a folder stops producing ready events
+        # while the key is still down, so a burst can end seconds before the
+        # release that R4 is actually about.
+        settle_anchor = max(
+            burst["end_t"],
+            _hold_release_time(events, burst.get("hold_id")) or burst["end_t"],
+        )
         settled = last_event.get("mode") == "materialized" or any(
             event.get("cat") == "fs"
             and event.get("kind") == "page_turn_ready"
@@ -885,7 +907,7 @@ def analyze_page_turn_invariants(events: list[dict]) -> dict:
             and event.get("items_generation") == burst["items_generation"]
             and burst["end_t"]
             <= float(event.get("t", 0.0))
-            <= burst["end_t"] + PAGE_TURN_SETTLE_WINDOW_SECS
+            <= settle_anchor + PAGE_TURN_SETTLE_WINDOW_SECS
             for event in events
         )
         if not settled and not endpoint_exception:
