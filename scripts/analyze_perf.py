@@ -419,6 +419,10 @@ def cmd_page_turn(events: list[dict]) -> None:
 
 
 PAGE_TURN_BURST_GAP_SECS = 0.300
+# How long after a hold's key-up the landing page may take to materialize (R4).
+# Measured settles are 29-56ms; this is generous but bounded so a page that
+# never settles still fails.
+PAGE_TURN_SETTLE_WINDOW_SECS = 1.500
 PAGE_TURN_BURST_GAP_EPSILON = 1e-9
 PAGE_TURN_INVARIANT_SOURCES = ("final_composite", "thumbnail")
 
@@ -557,10 +561,12 @@ def analyze_test_script_input(events: list[dict]) -> dict:
         failures.append(
             "production keymap level read returned held=false for held synthetic input frames"
         )
-    if page_turn_measured and not accumulated_frames:
-        failures.append(
-            "no frame materialized multiple repeats during a page-turn measurement"
-        )
+    # Accumulation is reported, never required. It only happens when a frame
+    # outlasts the repeat interval, which is a property of how heavy the book
+    # is, not of whether the harness works: a 1.6MP folder renders at ~6ms and
+    # can never pile repeats up, so gating on it fails correct runs. That the
+    # timeline can deliver piled-up repeats is covered by the key_input unit
+    # test that advances a synthetic clock by 460ms.
     return {
         "status": "pass" if not failures else "not-established",
         "hold_ids": sorted(by_hold),
@@ -854,9 +860,12 @@ def analyze_page_turn_invariants(events: list[dict]) -> dict:
                     "missing_indices": missing,
                 })
 
-        # I4: a burst normally settles on a materialized frame. The sole
-        # exception is a repeated endpoint (0 or the highest observed index in
-        # this items_generation), which represents holding at a folder edge.
+        # I4: the page a burst lands on must end up materialized. R4 is about
+        # what happens *after* the key comes up, so the settle is looked for in
+        # a window following the burst rather than inside it. Measured settles
+        # land 29-56ms after release; a hold-scoped burst ends at the Up itself,
+        # so requiring the last in-burst event to be materialized reports every
+        # correct run as a violation.
         last_event = burst_events[-1]
         last_idx = burst["indices"][-1]
         repeated_tail = (
@@ -868,7 +877,18 @@ def analyze_page_turn_invariants(events: list[dict]) -> dict:
             or last_idx == max_idx_by_generation[burst["items_generation"]]
         )
         endpoint_exception = repeated_tail and at_endpoint
-        if last_event.get("mode") != "materialized" and not endpoint_exception:
+        settled = last_event.get("mode") == "materialized" or any(
+            event.get("cat") == "fs"
+            and event.get("kind") == "page_turn_ready"
+            and event.get("mode") == "materialized"
+            and event.get("idx") == last_idx
+            and event.get("items_generation") == burst["items_generation"]
+            and burst["end_t"]
+            <= float(event.get("t", 0.0))
+            <= burst["end_t"] + PAGE_TURN_SETTLE_WINDOW_SECS
+            for event in events
+        )
+        if not settled and not endpoint_exception:
             violations.append({
                 "id": "I4",
                 "burst": burst,

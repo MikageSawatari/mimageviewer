@@ -709,8 +709,8 @@ class TestScriptInputGateTests(unittest.TestCase):
                 exit_code = int(error.code or 0)
         return SimpleNamespace(returncode=exit_code, stdout=stdout.getvalue())
 
-    def test_missing_vibration_or_accumulation_is_not_established(self) -> None:
-        missing_vibration = add_level_reads([
+    def test_missing_vibration_is_not_established(self) -> None:
+        missing_vibration = [
             frame_input(
                 1.0,
                 1,
@@ -719,8 +719,20 @@ class TestScriptInputGateTests(unittest.TestCase):
                 materialized_in_frame=2,
                 frame_nr=1,
             ),
-        ])
-        missing_accumulation = add_level_reads([
+        ]
+
+        report = analyze_test_script_input(missing_vibration)
+        self.assertEqual(report["status"], "not-established")
+        result = self.run_input_check(missing_vibration)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("vibration=no", result.stdout)
+
+    def test_missing_accumulation_alone_still_establishes_the_harness(self) -> None:
+        # Accumulation only happens when a frame outlasts the repeat interval,
+        # which depends on how heavy the book is rather than on the harness. A
+        # 1.6MP folder renders at ~6ms and can never produce one, so requiring
+        # it here failed correct runs.
+        events = [
             frame_input(
                 1.0,
                 1,
@@ -737,25 +749,12 @@ class TestScriptInputGateTests(unittest.TestCase):
                 materialized_in_frame=0,
                 frame_nr=2,
             ),
-        ])
-
-        # Accumulation is only demanded of a page-turn measurement, so the
-        # missing-accumulation case has to carry page-turn events to be a
-        # failure at all.
-        measured_without_accumulation = missing_accumulation + [
             page_turn(1.05, 1, "materialized"),
         ]
 
-        for missing, events in (
-            ("vibration", missing_vibration),
-            ("accumulation", measured_without_accumulation),
-        ):
-            with self.subTest(missing=missing):
-                report = analyze_test_script_input(events)
-                self.assertEqual(report["status"], "not-established")
-                result = self.run_input_check(events)
-                self.assertEqual(result.returncode, 1, result.stdout)
-                self.assertIn(f"{missing}=no", result.stdout)
+        report = analyze_test_script_input(add_level_reads(events))
+        self.assertEqual(report["status"], "pass")
+        self.assertFalse(report["accumulated_frames"])
 
     def test_fast_run_without_page_turns_does_not_need_accumulation(self) -> None:
         # A frame only absorbs several repeats when it outlasts the repeat
