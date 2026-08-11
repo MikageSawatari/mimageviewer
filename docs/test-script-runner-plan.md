@@ -388,9 +388,12 @@ S4 の PowerShell は**プロセスの終了コード**で合否を見る。と�
 待ち先が third-party の GPU teardown なので根本原因側で直せない。**flush より前に強制終了
 しないこと**が S3 (perf log を判定に使う) の前提。
 
-**未解決 / 再確認が要る**: DWM が健全な環境で `run-native-return` (綺麗な経路) が実際に働くか。
-S2 の測定はすべて `forced-watchdog` 経由だった。**もし健全な環境でも綺麗に落ちないなら、
-それは mIV 本体の shutdown の問題**なので backlog へ独立した項目として起票する。
+**解決済み (2026-08-11、再起動後に再測定)**: DWM 復旧後は `shutdown path=run-native-return` で
+exit 0、全体 2.6 秒 (DWM 停止時は watchdog 経由で 10.1 秒)。**環境要因で確定**であり、mIV 本体の
+shutdown 欠陥ではない。watchdog は保険として残す (harness が結果を返せないことがあってはならない)。
+
+同種の症状を今後見たときの読み方: `shutdown path=forced-watchdog` が続くなら、まず GPU /
+compositor 側の健全性を疑う。`run-native-return` に戻らないなら mIV 側を疑ってよい。
 
 ## 13. §2.3 自体の完了条件
 
