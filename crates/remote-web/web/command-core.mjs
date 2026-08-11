@@ -2473,28 +2473,28 @@ export function pagePrefetchPlan({
   return result;
 }
 
-/// HUD は物理ページ番号ではなく、読書上の「後方 / 前方」を左右に固定して見せる。
-/// 後方は現在地に近い点が区切り側へ来るよう、画面上では遠い順に並べる。
+/// HUD の左右は最後に動いた方向ではなく、現在ページとの位置関係で固定する。
+/// 左側は現在より前の index を遠い順、右側は後の index を近い順に並べる。
+/// page group の index 自体が読書順なので、RTL でもこれから読む側は右に残る。
 export function pagePrefetchHudPlan({
   visibleIndexes,
   itemCount,
-  direction,
   ahead = 3,
   behind = 1,
 }) {
   const aheadIndexes = pagePrefetchPlan({
     visibleIndexes,
     itemCount,
-    direction,
+    direction: 1,
     ahead,
     behind: 0,
   });
   const behindNearToFar = pagePrefetchPlan({
     visibleIndexes,
     itemCount,
-    direction,
-    ahead: 0,
-    behind,
+    direction: -1,
+    ahead: behind,
+    behind: 0,
   });
   return {
     behindIndexes: behindNearToFar.reverse(),

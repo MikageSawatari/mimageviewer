@@ -151,6 +151,40 @@ const PAGE_RESOURCE_CACHE_CONFIGURED_BYTES = 64 * 1024 * 1024;
 const PAGE_RESOURCE_CACHE_MAX_BYTES = pageResourceCacheBudget({
   configuredBytes: PAGE_RESOURCE_CACHE_CONFIGURED_BYTES,
 }).byteLimit;
+const CONTAINER_SPREAD_REFRESH_FAILURE_MESSAGE =
+  "見開き表示を更新できませんでした。";
+export const ContainerSpreadRefreshExitReason = Object.freeze({
+  VIEWER_CHANGED_BEFORE_LOAD: "viewer_changed_before_load",
+  CONTAINER_MISSING_BEFORE_LOAD: "container_missing_before_load",
+  CONTAINER_CHANGED_BEFORE_LOAD: "container_changed_before_load",
+  VIEWER_CHANGED_DURING_LOAD: "viewer_changed_during_load",
+  CONTAINER_MISSING_DURING_LOAD: "container_missing_during_load",
+  CONTAINER_CHANGED_DURING_LOAD: "container_changed_during_load",
+  CONTAINER_LOAD_ABORTED: "container_load_aborted",
+  CONTAINER_LOAD_FAILED: "container_load_failed",
+  CONTAINER_LOAD_NOT_APPLIED: "container_load_not_applied",
+  CURRENT_PAGE_MISSING: "current_page_missing",
+  GROUP_MISSING: "group_missing",
+  DISPLAY_SUPERSEDED: "display_superseded",
+  DISPLAY_FAILED: "display_failed",
+  UNEXPECTED_ERROR: "unexpected_error",
+});
+export const ViewerImageUpdateExitReason = Object.freeze({
+  GROUP_MISSING_BEFORE_LOAD: "group_missing_before_load",
+  VIEWER_MISSING_BEFORE_LOAD: "viewer_missing_before_load",
+  VIEWER_CHANGED_BEFORE_GROUP_LOAD: "viewer_changed_before_group_load",
+  SESSION_CHANGED_BEFORE_GROUP_LOAD: "session_changed_before_group_load",
+  CACHE_EPOCH_CHANGED_BEFORE_GROUP_LOAD: "cache_epoch_changed_before_group_load",
+  GROUP_CHANGED_BEFORE_GROUP_LOAD: "group_changed_before_group_load",
+  VIEWER_CHANGED_ON_ERROR: "viewer_changed_on_error",
+  PRELOAD_FAILED: "preload_failed",
+  PRELOAD_ABORTED: "preload_aborted",
+  GROUP_LOAD_THROWN: "group_load_thrown",
+  GROUP_LOAD_ABORTED: "group_load_aborted",
+  GROUP_LOAD_SUPERSEDED: "group_load_superseded",
+  LOAD_REQUEST_CHANGED_AFTER_GROUP_LOAD: "load_request_changed_after_group_load",
+  VIEWER_CHANGED_AFTER_GROUP_LOAD: "viewer_changed_after_group_load",
+});
 const SESSION_PING_INTERVAL_MS = 30_000;
 const READING_PROGRESS_INTERVAL_MS = 30_000;
 const AI_FOREGROUND_POLL_MS = 500;
@@ -283,15 +317,22 @@ export class LatestOnlyTaskQueue {
             ticket.resolve(result);
           }
         } catch (error) {
+          let mappedFailure = null;
           if (error?.name !== "AbortError") {
             try {
-              this.onError(error);
+              mappedFailure = this.onError(error, ticket.value);
             } catch {}
           }
-          ticket.resolve({
-            outcome: ViewerGroupLoadOutcome.FAILED,
-            message: error instanceof Error ? error.message : String(error),
-          });
+          ticket.resolve(
+            mappedFailure?.outcome === ViewerGroupLoadOutcome.FAILED &&
+              typeof mappedFailure.message === "string" &&
+              mappedFailure.message.trim()
+              ? mappedFailure
+              : {
+                outcome: ViewerGroupLoadOutcome.FAILED,
+                message: error instanceof Error ? error.message : String(error),
+              }
+          );
         } finally {
           if (this.active === ticket) this.active = null;
         }
@@ -535,12 +576,22 @@ export class PageResourceCache {
       this.ready.size >= this.limit ||
       !pagePrefetchBudgetAllowsStart(this.readyBytes, this.byteLimit)
     ) {
+      const candidate = this.pending.find(
+        (request) =>
+          request?.cacheKey &&
+          !this.ready.has(request.cacheKey) &&
+          !this.active.has(request.cacheKey)
+      );
+      if (!candidate) return;
       const admission = pageResourceAdmissionPlan({
         entries: [...this.ready].map(([key, resource]) => ({
           key,
           bytes: resource.blob.size,
         })),
-        protectedKeys: this.protectedKeys(),
+        // The candidate and every plan entry nearer than it stay protected. A
+        // farther planned entry may be evicted to make the next nearer request
+        // admissible, but a nearer entry can never be traded for a farther one.
+        protectedKeys: this.protectedKeys(candidate.cacheKey),
         limit: this.limit,
         byteLimit: this.byteLimit,
         retainedBytes: this.readyBytes,
@@ -665,8 +716,15 @@ export class PageResourceCache {
     for (const key of admission.evictKeys) this.deleteReady(key);
   }
 
-  protectedKeys() {
-    return new Set([...this.visibleKeys, ...this.prefetchProtectedKeys]);
+  protectedKeys(candidateKey = null) {
+    let plannedKeys = this.prefetchProtectedKeys;
+    if (candidateKey) {
+      const candidateIndex = plannedKeys.indexOf(candidateKey);
+      if (candidateIndex >= 0) {
+        plannedKeys = plannedKeys.slice(0, candidateIndex + 1);
+      }
+    }
+    return new Set([...this.visibleKeys, ...plannedKeys]);
   }
 
   deleteReady(key) {
@@ -822,7 +880,10 @@ const remoteSessionControlOwner = new RemoteSessionControlOwner();
 // まで同期的に到達するので、後ろで宣言すると TDZ でモジュール評価ごと落ちる。
 const containerSpreadRefreshOwner = new LatestOnlyTaskQueue(
   performContainerSpreadRefresh,
-  () => {},
+  (error, request) => reportContainerSpreadRefreshError(error, request, {
+    reason: ContainerSpreadRefreshExitReason.UNEXPECTED_ERROR,
+    stage: "owner_completion",
+  }),
   (left, right) =>
     left.viewer === right.viewer &&
     left.addressIdentity === right.addressIdentity &&
@@ -4015,7 +4076,6 @@ async function openRemoteBookBookmarkTarget(target) {
   );
   updateGridReturnTargetItem(group.anchor);
   viewer.hideBoundaryMessage();
-  viewer.cancelPendingCenterTap();
   const viewerDepth = (Number(history.state?.viewerDepth) || 0) + 1;
   history.pushState(
     {
@@ -4138,52 +4198,186 @@ function refreshContainerSpread(
   });
 }
 
-async function performContainerSpreadRefresh(request) {
+function containerSpreadRefreshContextExitReason(request, duringLoad = false) {
+  if (state.viewer !== request.viewer) {
+    return duringLoad
+      ? ContainerSpreadRefreshExitReason.VIEWER_CHANGED_DURING_LOAD
+      : ContainerSpreadRefreshExitReason.VIEWER_CHANGED_BEFORE_LOAD;
+  }
+  if (!state.container) {
+    return duringLoad
+      ? ContainerSpreadRefreshExitReason.CONTAINER_MISSING_DURING_LOAD
+      : ContainerSpreadRefreshExitReason.CONTAINER_MISSING_BEFORE_LOAD;
+  }
   if (
-    state.viewer !== request.viewer ||
-    !state.container ||
     addressIdentity(state.container.requestedAddress) !== request.addressIdentity
   ) {
-    return VIEWER_GROUP_LOAD_SUPERSEDED;
+    return duringLoad
+      ? ContainerSpreadRefreshExitReason.CONTAINER_CHANGED_DURING_LOAD
+      : ContainerSpreadRefreshExitReason.CONTAINER_CHANGED_BEFORE_LOAD;
   }
-  let loaded;
-  try {
-    loaded = await loadContainer(request.address, {
-      forceSinglePage: request.forceSinglePage,
-    });
-  } catch (error) {
-    if (
-      error?.name === "AbortError" &&
-      (state.viewer !== request.viewer ||
-        !state.container ||
-        addressIdentity(state.container.requestedAddress) !== request.addressIdentity)
-    ) {
-      return VIEWER_GROUP_LOAD_SUPERSEDED;
-    }
-    throw error;
-  }
-  if (!loaded || state.viewer !== request.viewer) return VIEWER_GROUP_LOAD_SUPERSEDED;
-  const imageIndex = state.images.findIndex(
-    (entry) => entryIdentity(entry) === request.currentIdentity
-  );
-  if (imageIndex < 0) {
-    throw new Error("更新後のコンテナに現在のページがありません。");
-  }
-  const groupIndex = pageGroupIndexForEntry(state.images[imageIndex]);
-  if (groupIndex < 0) {
-    throw new Error("更新後の見開きグループを特定できませんでした。");
-  }
-  const group = state.pageGroups[groupIndex];
-  state.pageGroupIndex = groupIndex;
-  state.imageIndex = state.images.findIndex(
-    (entry) => entryIdentity(entry) === entryIdentity(group.anchor)
-  );
-  updateGridReturnTargetItem(group.anchor);
-  request.viewer.cancelPendingCenterTap();
-  await updateViewerImage(performance.now(), {
-    renderTrigger: request.renderTrigger,
+  return null;
+}
+
+function recordContainerSpreadRefreshOutcome(request, outcome, reason, extra = {}) {
+  enqueueTelemetry({
+    type: "spread_refresh",
+    outcome,
+    reason,
+    render_trigger: request?.renderTrigger ?? "spread_refresh",
+    ...extra,
   });
-  return VIEWER_GROUP_LOAD_APPLIED;
+}
+
+function supersedeContainerSpreadRefresh(request, reason, stage) {
+  recordContainerSpreadRefreshOutcome(request, "superseded", reason, { stage });
+  return { outcome: ViewerGroupLoadOutcome.SUPERSEDED, reason };
+}
+
+export function reportContainerSpreadRefreshError(
+  error,
+  request = null,
+  {
+    reason = ContainerSpreadRefreshExitReason.UNEXPECTED_ERROR,
+    stage = "unknown",
+  } = {}
+) {
+  recordClientError("spread_refresh_error", error, {
+    reason,
+    stage,
+    render_trigger: request?.renderTrigger ?? "spread_refresh",
+  });
+  return {
+    outcome: ViewerGroupLoadOutcome.FAILED,
+    reason,
+    message: CONTAINER_SPREAD_REFRESH_FAILURE_MESSAGE,
+  };
+}
+
+async function performContainerSpreadRefresh(request) {
+  let stage = "preflight";
+  try {
+    const initialExit = containerSpreadRefreshContextExitReason(request, false);
+    if (initialExit) {
+      return supersedeContainerSpreadRefresh(request, initialExit, stage);
+    }
+
+    stage = "container_load";
+    let loaded;
+    try {
+      loaded = await loadContainer(request.address, {
+        forceSinglePage: request.forceSinglePage,
+      });
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        const contextExit = containerSpreadRefreshContextExitReason(request, true);
+        if (contextExit) {
+          return supersedeContainerSpreadRefresh(request, contextExit, stage);
+        }
+        return reportContainerSpreadRefreshError(error, request, {
+          reason: ContainerSpreadRefreshExitReason.CONTAINER_LOAD_ABORTED,
+          stage,
+        });
+      }
+      throw error;
+    }
+
+    const loadedContextExit = containerSpreadRefreshContextExitReason(request, true);
+    if (loadedContextExit) {
+      return supersedeContainerSpreadRefresh(request, loadedContextExit, stage);
+    }
+    if (!loaded) {
+      return supersedeContainerSpreadRefresh(
+        request,
+        ContainerSpreadRefreshExitReason.CONTAINER_LOAD_NOT_APPLIED,
+        stage
+      );
+    }
+
+    stage = "resolve_current_page";
+    const imageIndex = state.images.findIndex(
+      (entry) => entryIdentity(entry) === request.currentIdentity
+    );
+    if (imageIndex < 0) {
+      return reportContainerSpreadRefreshError(
+        new Error("更新後のコンテナに現在のページがありません。"),
+        request,
+        {
+          reason: ContainerSpreadRefreshExitReason.CURRENT_PAGE_MISSING,
+          stage,
+        }
+      );
+    }
+    const groupIndex = pageGroupIndexForEntry(state.images[imageIndex]);
+    if (groupIndex < 0) {
+      return reportContainerSpreadRefreshError(
+        new Error("更新後の見開きグループを特定できませんでした。"),
+        request,
+        {
+          reason: ContainerSpreadRefreshExitReason.GROUP_MISSING,
+          stage,
+        }
+      );
+    }
+
+    stage = "viewer_update";
+    const group = state.pageGroups[groupIndex];
+    state.pageGroupIndex = groupIndex;
+    state.imageIndex = state.images.findIndex(
+      (entry) => entryIdentity(entry) === entryIdentity(group.anchor)
+    );
+    updateGridReturnTargetItem(group.anchor);
+    const displayResult = await updateViewerImage(performance.now(), {
+      renderTrigger: request.renderTrigger,
+    });
+    if (displayResult?.outcome === ViewerGroupLoadOutcome.APPLIED) {
+      recordContainerSpreadRefreshOutcome(request, "applied", "display_applied");
+      return VIEWER_GROUP_LOAD_APPLIED;
+    }
+    if (displayResult?.outcome === ViewerGroupLoadOutcome.SUPERSEDED) {
+      recordContainerSpreadRefreshOutcome(
+        request,
+        "superseded",
+        ContainerSpreadRefreshExitReason.DISPLAY_SUPERSEDED,
+        { stage, viewer_update_reason: displayResult.reason ?? "unknown" }
+      );
+      return {
+        outcome: ViewerGroupLoadOutcome.SUPERSEDED,
+        reason: ContainerSpreadRefreshExitReason.DISPLAY_SUPERSEDED,
+      };
+    }
+    if (displayResult?.outcome === ViewerGroupLoadOutcome.FAILED) {
+      recordClientError(
+        "spread_refresh_error",
+        new Error(displayResult.message || "viewer update failed"),
+        {
+          reason: ContainerSpreadRefreshExitReason.DISPLAY_FAILED,
+          stage,
+          render_trigger: request.renderTrigger,
+          viewer_update_reason: displayResult.reason ?? "load_failed",
+        }
+      );
+      recordContainerSpreadRefreshOutcome(
+        request,
+        "failed",
+        ContainerSpreadRefreshExitReason.DISPLAY_FAILED,
+        { stage, viewer_update_reason: displayResult.reason ?? "load_failed" }
+      );
+      return {
+        outcome: ViewerGroupLoadOutcome.FAILED,
+        reason: ContainerSpreadRefreshExitReason.DISPLAY_FAILED,
+        message: CONTAINER_SPREAD_REFRESH_FAILURE_MESSAGE,
+      };
+    }
+    throw new TypeError("viewer update returned an unknown outcome");
+  } catch (error) {
+    return reportContainerSpreadRefreshError(error, request, {
+      reason: stage === "container_load"
+        ? ContainerSpreadRefreshExitReason.CONTAINER_LOAD_FAILED
+        : ContainerSpreadRefreshExitReason.UNEXPECTED_ERROR,
+      stage,
+    });
+  }
 }
 
 export async function loadFolder(
@@ -5356,6 +5550,48 @@ function commitRequestedPageGroup(
   return true;
 }
 
+export function viewerImageUpdateContextExitReason({
+  viewerMatches = true,
+  sessionMatches = true,
+  cacheEpochMatches = true,
+  groupMatches = true,
+} = {}) {
+  if (!viewerMatches) {
+    return ViewerImageUpdateExitReason.VIEWER_CHANGED_BEFORE_GROUP_LOAD;
+  }
+  if (!sessionMatches) {
+    return ViewerImageUpdateExitReason.SESSION_CHANGED_BEFORE_GROUP_LOAD;
+  }
+  if (!cacheEpochMatches) {
+    return ViewerImageUpdateExitReason.CACHE_EPOCH_CHANGED_BEFORE_GROUP_LOAD;
+  }
+  if (!groupMatches) {
+    return ViewerImageUpdateExitReason.GROUP_CHANGED_BEFORE_GROUP_LOAD;
+  }
+  return null;
+}
+
+function supersedeViewerImageUpdate(reason, renderTrigger, stage) {
+  enqueueTelemetry({
+    type: "viewer_update",
+    outcome: "not_applied",
+    reason,
+    stage,
+    render_trigger: renderTrigger,
+  });
+  return { outcome: ViewerGroupLoadOutcome.SUPERSEDED, reason };
+}
+
+function viewerImageFailureForDisplay(result, renderTrigger) {
+  if (
+    result?.outcome === ViewerGroupLoadOutcome.FAILED &&
+    (renderTrigger === "spread_refresh" || renderTrigger === "viewport_resize")
+  ) {
+    return { ...result, message: CONTAINER_SPREAD_REFRESH_FAILURE_MESSAGE };
+  }
+  return result;
+}
+
 async function updateViewerImage(
   interactionStartedAt = performance.now(),
   {
@@ -5366,7 +5602,20 @@ async function updateViewerImage(
 ) {
   const group = currentPageGroup();
   const viewer = state.viewer;
-  if (!group || !viewer) return;
+  if (!group) {
+    return supersedeViewerImageUpdate(
+      ViewerImageUpdateExitReason.GROUP_MISSING_BEFORE_LOAD,
+      renderTrigger,
+      "preflight"
+    );
+  }
+  if (!viewer) {
+    return supersedeViewerImageUpdate(
+      ViewerImageUpdateExitReason.VIEWER_MISSING_BEFORE_LOAD,
+      renderTrigger,
+      "preflight"
+    );
+  }
   const loadRequest = captureViewerPageGroupRequest(viewer, state.pageGroupIndex);
   const identity = group.entries.map(entryIdentity).join("\n");
   const remoteSessionIdSnapshot = state.remoteSessionId;
@@ -5379,16 +5628,26 @@ async function updateViewerImage(
   // .catch(renderError) まで飛び、位置を戻す判断が一度も行われない。
   let pages = [];
   let result;
+  let stage = "image_info";
+  let loadGroupReached = false;
   try {
     const infos = await Promise.all(group.entries.map(imageInfo));
-    if (
-      state.viewer !== viewer ||
-      state.remoteSessionId !== remoteSessionIdSnapshot ||
-      state.remoteSessionCacheEpoch !== remoteSessionCacheEpochSnapshot ||
-      currentPageGroup()?.entries.map(entryIdentity).join("\n") !== identity
-    ) {
-      return;
+    const contextExit = viewerImageUpdateContextExitReason({
+      viewerMatches: state.viewer === viewer,
+      sessionMatches: state.remoteSessionId === remoteSessionIdSnapshot,
+      cacheEpochMatches:
+        state.remoteSessionCacheEpoch === remoteSessionCacheEpochSnapshot,
+      groupMatches:
+        currentPageGroup()?.entries.map(entryIdentity).join("\n") === identity,
+    });
+    if (contextExit) {
+      return supersedeViewerImageUpdate(
+        contextExit,
+        renderTrigger,
+        "after_image_info"
+      );
     }
+    stage = "layout";
     const layout = viewerSpreadLayout({
       mode: state.fitMode,
       pages: infos,
@@ -5407,6 +5666,8 @@ async function updateViewerImage(
         remoteSessionCacheEpoch: remoteSessionCacheEpochSnapshot,
       }),
     }));
+    stage = "group_load";
+    loadGroupReached = true;
     result = await viewer.loadGroup({
       pages,
       name: group.entries.map((entry) => entry.name).join(" / "),
@@ -5421,8 +5682,30 @@ async function updateViewerImage(
       renderTrigger,
     });
   } catch (error) {
-    if (state.viewer !== viewer) return;
-    result = viewerGroupLoadFailure(error, "ページを表示できませんでした。");
+    if (state.viewer !== viewer) {
+      return supersedeViewerImageUpdate(
+        ViewerImageUpdateExitReason.VIEWER_CHANGED_ON_ERROR,
+        renderTrigger,
+        stage
+      );
+    }
+    const reason = loadGroupReached
+      ? error?.name === "AbortError"
+        ? ViewerImageUpdateExitReason.GROUP_LOAD_ABORTED
+        : ViewerImageUpdateExitReason.GROUP_LOAD_THROWN
+      : error?.name === "AbortError"
+        ? ViewerImageUpdateExitReason.PRELOAD_ABORTED
+        : ViewerImageUpdateExitReason.PRELOAD_FAILED;
+    recordClientError("viewer_update_error", error, {
+      reason,
+      stage,
+      render_trigger: renderTrigger,
+    });
+    result = {
+      outcome: ViewerGroupLoadOutcome.FAILED,
+      reason,
+      message: "ページを表示できませんでした。",
+    };
   }
   const completion = viewerGroupLoadCompletionPlan(result, {
     loadRequest,
@@ -5432,21 +5715,47 @@ async function updateViewerImage(
       state.pageGroupIndex
     ),
   });
-  if (completion.action === ViewerGroupLoadCompletionAction.IGNORE) return;
+  if (completion.action === ViewerGroupLoadCompletionAction.IGNORE) {
+    return supersedeViewerImageUpdate(
+      result?.outcome === ViewerGroupLoadOutcome.SUPERSEDED
+        ? ViewerImageUpdateExitReason.GROUP_LOAD_SUPERSEDED
+        : ViewerImageUpdateExitReason.LOAD_REQUEST_CHANGED_AFTER_GROUP_LOAD,
+      renderTrigger,
+      "completion"
+    );
+  }
   if (completion.action === ViewerGroupLoadCompletionAction.ROLLBACK) {
     discardRequestedPageGroup(
       viewer,
       positionRequest.groupIndex,
       positionRequest
     );
-    if (state.viewer === viewer) viewer.showGroupLoadFailure(completion.message);
-    return;
+    const displayedFailure = viewerImageFailureForDisplay(
+      { ...result, message: completion.message },
+      renderTrigger
+    );
+    if (state.viewer === viewer) {
+      viewer.showGroupLoadFailure(displayedFailure.message);
+    }
+    return displayedFailure;
   }
   if (completion.action === ViewerGroupLoadCompletionAction.REPORT_FAILURE) {
-    if (state.viewer === viewer) viewer.showGroupLoadFailure(completion.message);
-    return;
+    const displayedFailure = viewerImageFailureForDisplay(
+      { ...result, message: completion.message },
+      renderTrigger
+    );
+    if (state.viewer === viewer) {
+      viewer.showGroupLoadFailure(displayedFailure.message);
+    }
+    return displayedFailure;
   }
-  if (state.viewer !== viewer) return;
+  if (state.viewer !== viewer) {
+    return supersedeViewerImageUpdate(
+      ViewerImageUpdateExitReason.VIEWER_CHANGED_AFTER_GROUP_LOAD,
+      renderTrigger,
+      "post_display"
+    );
+  }
   document.title = `${group.anchor.name} — mIV Remote`;
   state.remoteAiController?.displayGroup(
     pages.map(({ entry, request }) => ({
@@ -5463,7 +5772,7 @@ async function updateViewerImage(
   observeReadingProgress();
   if (group.entries.every((entry) => entry.address)) {
     schedulePagePrefetch(viewer, pages).catch(() => {});
-    return;
+    return VIEWER_GROUP_LOAD_APPLIED;
   }
   const nextEntry = state.images[state.imageIndex + 1];
   if (nextEntry) {
@@ -5474,6 +5783,7 @@ async function updateViewerImage(
       preload.src = imageRequest(nextEntry, nextInfo, viewer.stage).url;
     }).catch(() => {});
   }
+  return VIEWER_GROUP_LOAD_APPLIED;
 }
 
 async function schedulePagePrefetch(viewer, visiblePages = []) {
@@ -5494,7 +5804,6 @@ async function schedulePagePrefetch(viewer, visiblePages = []) {
   const hudPlan = pagePrefetchHudPlan({
     visibleIndexes,
     itemCount: state.images.length,
-    direction: state.pageDirection,
     ahead: PAGE_PREFETCH_AHEAD,
     behind: PAGE_PREFETCH_BEHIND,
   });

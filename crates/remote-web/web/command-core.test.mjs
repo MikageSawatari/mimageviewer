@@ -463,6 +463,25 @@ test("normal telemetry keeps health facts but removes path, message and identity
   });
 });
 
+test("normal telemetry keeps typed refresh exits while omitting diagnostics", () => {
+  assert.deepEqual(telemetryEventForTier({
+    type: "viewer_update",
+    outcome: "not_applied",
+    reason: "group_changed_before_group_load",
+    stage: "after_image_info",
+    render_trigger: "spread_refresh",
+    message: "Cannot read properties of undefined",
+    stack: "TypeError at C:/private/app.js:1",
+  }), {
+    type: "viewer_update",
+    outcome: "not_applied",
+    reason: "group_changed_before_group_load",
+    stage: "after_image_info",
+    render_trigger: "spread_refresh",
+    telemetry_tier: "normal",
+  });
+});
+
 test("page identity comparison distinguishes PDF documents, ZIP entries, and files", () => {
   const pdf = (relativePath) => ({
     path: `C:/${relativePath}`,
@@ -2553,7 +2572,7 @@ test("page prefetch follows reading direction and accepts a future spread", () =
   );
 });
 
-test("prefetch HUD keeps the reading future on the right for LTR and RTL", () => {
+test("prefetch HUD splits around the current page regardless of last movement", () => {
   assert.deepEqual(
     pagePrefetchHudPlan({
       visibleIndexes: [10, 11],
@@ -2572,7 +2591,20 @@ test("prefetch HUD keeps the reading future on the right for LTR and RTL", () =>
       ahead: 3,
       behind: 2,
     }),
-    { behindIndexes: [13, 12], aheadIndexes: [9, 8, 7] }
+    { behindIndexes: [8, 9], aheadIndexes: [12, 13, 14] }
+  );
+  assert.deepEqual(
+    pagePrefetchHudPlan({
+      visibleIndexes: [0],
+      itemCount: 20,
+      direction: -1,
+      ahead: 12,
+      behind: 4,
+    }),
+    {
+      behindIndexes: [],
+      aheadIndexes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    }
   );
 });
 

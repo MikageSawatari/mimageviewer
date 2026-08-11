@@ -1947,11 +1947,14 @@ object URL を所有する従来契約のままである。
 先読み窓は進行方向 12 / 逆方向 4 を上限とし、実際に埋まる深さは 64 MiB の admission が
 決める。entry 上限は表示最大 2 + 計画最大 16 = 18、保護集合の K は
 `entry limit - MAX_VIEWER_VISIBLE_PAGES` = 16 とした。保護集合は表示中の cache key と、近い順の
-`pagePrefetchPlan` 先頭 K 件である。開始枠を作る必要があるときだけ保護集合外の LRU を古い順に
-捨てる。保護対象だけで予算以上なら超過を受け入れて停止し、ページ移動後の `schedule()` で
-保護集合が変わった時点に再評価する。これにより取得直後の計画ページを byte 超過だけで捨てて
-同じ key を再取得する循環を作らない。標準画質の小さいページなら 12/4 全体が入り、高品質の
-大きいページでは同じ byte 予算により自動的に浅くなる。
+`pagePrefetchPlan` 先頭 K 件である。保持を削る通常境界ではこの集合全体を保護する。一方、予算が
+満杯の状態から次の計画ページを取得するときは、表示中 key と、計画順でその候補以下の近い key
+だけを admission の保護集合にする。候補より後ろの遠い取得済み key があれば LRU 順に捨てて
+開始枠を作り、候補より近い key は絶対に捨てない。遠い key が無ければ従来どおり開始を止め、
+保護対象だけの予算超過を受け入れる。ページ移動後の `schedule()` で距離順位を作り直すため、
+小さい予算でも現在地に近いページから埋まり、近いページの取得 → 破棄 → 再取得の循環は作らない。
+標準画質の小さいページなら 12/4 全体が入り、高品質の大きいページでは同じ byte 予算により
+自動的に浅くなる。
 
 `/api/page` の成功応答は、既存 log の `ipc_ms` と同じ値を
 `X-mIV-Page-Render-Ms` で返す。Web は段階 A の表示 outcome が `applied` になった foreground
@@ -1996,12 +1999,30 @@ refresh の追い越しまで write 失敗として扱い、fallback refresh を
 resize が同じ再構成を要求しても `/api/container` を重ねない。異なる重複要求は直列 owner が
 `loadContainer` を実行し、最後の要求が必ず新しい page group の表示まで進む。
 
-計測 HUD の先読み表示は、区切りの左を読書上の後方、右を前方とし、RTL / LTR にかかわらず
-これから読む側を右へ置く。状態は `PageResourceCache.statusForKeys()` だけから取得し、内部 map は
-UI へ公開しない。色は緑 = `ready` (取得済み)、黄 = abort されていない `active` (取得中)、
+その後の実機再現で、owner の直列化後も表示直前に失敗する別の原因を特定した。browser の
+double-tap fit ownership を撤去した `acf317e0` で `ImageViewer.cancelPendingCenterTap()` 自体は
+削除されたが、見開き再構成と bookmark jump の呼び出しが 2 箇所残っていた。見開き再構成は
+ここで同期 `TypeError` となるため `updateViewerImage` / `loadGroup` に届かず、`page_display` が
+1 件も出なかった。失効した 2 呼び出しを撤去し、旧 gesture state を別の形で復活させていない。
+
+同じ観測欠落を繰り返さないため、refresh owner の例外は `spread_refresh_error` として stack を
+含めて `recordClientError` へ渡し、画面には生の JS message ではなく
+「見開き表示を更新できませんでした。」だけを出す。`performContainerSpreadRefresh` の viewer /
+container 不一致、load abort / 非適用、現在ページ / group 不在、表示失敗を固定 reason へ分け、
+`updateViewerImage` も `loadGroup` 前の viewer / session / cache epoch / group 変化と preload 失敗を
+固定 reason で telemetry に残す。normal tier には reason / stage が残り、message / stack は既存の
+privacy 契約どおり詳細記録 tier だけに残る。
+
+計測 HUD の先読み表示は最後に動いた `pageDirection` では分割せず、現在の表示 page index より
+前を区切りの左、後を右へ置く。このため戻る操作の直後も左右は反転せず、先頭ページでは左側が
+0 件になる。page group の順序を使うため RTL / LTR にかかわらずこれから読む側を右へ置く意図も
+維持する。先読み計画自体の進行方向優先は変更しない。状態は
+`PageResourceCache.statusForKeys()` だけから取得し、内部 map は UI へ公開しない。色は緑 =
+`ready` (取得済み)、黄 = abort されていない `active` (取得中)、
 黒 = どちらでもない (未取得)。色だけに依存せず、`title` / `aria-label` に取得済み・取得中・
 未取得の件数を表示する。通常の `updateHud()` に加え、先読み開始、完了、破棄、cache clear / evict
-で更新し、先読み専用タイマーは持たない。ドットは既存 HUD の先頭行内へ置き、既存行数を増やさない。
+で更新し、先読み専用タイマーは持たない。12 + 4 + 区切りの全件を減らさず、HUD の先頭は flex
+wrap して狭い画面では見出しとドットを別行へ収める。
 
 予算と窓は変更しない。標準画質の実測はページ p50 1.35 MiB / p95 2.61 MiB、本体生成
 `ipc_ms` p50 552 ms、ページ要求 222 件中 503 が 52 件 (24%、prefetch 146 / foreground 22)、

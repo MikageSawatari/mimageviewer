@@ -346,6 +346,8 @@ test("video health HUD and persistent debug-tier warning stay wired", async () =
   assert.match(css, /\.page-prefetch-dot-ready[\s\S]*#43d17b/);
   assert.match(css, /\.page-prefetch-dot-active[\s\S]*#ffd45a/);
   assert.match(css, /\.page-prefetch-dot-missing[\s\S]*#05070a/);
+  assert.match(css, /\.telemetry-hud-header\s*\{[^}]*flex-wrap:\s*wrap/);
+  assert.match(css, /\.page-prefetch-indicator\s*\{[^}]*max-width:\s*100%/);
 });
 
 test("colorize controls use the adjustment preview and commit path without losing custom points", async () => {
@@ -498,7 +500,7 @@ test("viewer taps dispatch immediately and have no application double-tap fit pa
   assert.doesNotMatch(tapBranch, /setTimeout|double_tap|FIT_/);
   assert.doesNotMatch(
     app,
-    /viewerTapSequence|pending_center_tap|centerTapTimer|fit_toggle_page_original/
+    /viewerTapSequence|pending_center_tap|centerTapTimer|fit_toggle_page_original|cancelPendingCenterTap/
   );
 });
 
@@ -533,7 +535,7 @@ test("only committed page navigation owns failure rollback and shows its message
   );
   assert.match(
     app,
-    /ViewerGroupLoadCompletionAction\.ROLLBACK\)[\s\S]*?discardRequestedPageGroup\([\s\S]*?viewer\.showGroupLoadFailure\(completion\.message\)/
+    /ViewerGroupLoadCompletionAction\.ROLLBACK\)[\s\S]*?discardRequestedPageGroup\([\s\S]*?viewer\.showGroupLoadFailure\(displayedFailure\.message\)/
   );
   for (const trigger of [
     "fit_mode",
@@ -555,7 +557,7 @@ test("a thrown page load still reaches the outcome contract instead of the rende
   // .catch(renderError) まで飛び、位置を戻す判断が一度も行われない。
   assert.match(
     load,
-    /\btry \{[\s\S]*await Promise\.all\(group\.entries\.map\(imageInfo\)\)[\s\S]*await viewer\.loadGroup\([\s\S]*\} catch \(error\) \{[\s\S]*viewerGroupLoadFailure\(error,/
+    /\btry \{[\s\S]*await Promise\.all\(group\.entries\.map\(imageInfo\)\)[\s\S]*await viewer\.loadGroup\([\s\S]*\} catch \(error\) \{[\s\S]*recordClientError\("viewer_update_error", error,/
   );
 });
 

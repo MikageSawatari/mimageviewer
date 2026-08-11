@@ -113,12 +113,14 @@ globalThis.fetch = imageFetch;
 
 const {
   ADJUSTMENT_PANEL_TABS,
+  ContainerSpreadRefreshExitReason,
   ImageViewer,
   LatestOnlyTaskQueue,
   LatestPageLoadQueue,
   PageResourceCache,
   RemoteAiController,
   ViewerAdjustmentPanel,
+  ViewerImageUpdateExitReason,
   ViewerViewTrimPanel,
   VIEWER_MENU_MAX_ACTIONS,
   VIEWER_PANEL_TABS,
@@ -146,6 +148,7 @@ const {
   parentContainerAddress,
   parseRoute,
   reloadApplication,
+  reportContainerSpreadRefreshError,
   renderResolvedMediaOpen,
   remoteArchiveProgressText,
   remoteAiCompletionMessage,
@@ -171,6 +174,7 @@ const {
   videoFileTargetIndex,
   viewTrimSpreadControlKeys,
   viewerMenuDefinitions,
+  viewerImageUpdateContextExitReason,
 } = await import("./app.js");
 
 function deferred() {
@@ -973,6 +977,64 @@ test("latest-only refresh distinguishes failure from supersede", async () => {
   });
 });
 
+test("container refresh records the internal exception but returns only Japanese feedback", async () => {
+  const errors = [];
+  setRuntimeTestErrorObserver((event) => errors.push(event));
+  const internal = new TypeError("cancelPendingCenterTap is not a function");
+  const request = { renderTrigger: "spread_refresh" };
+  const queue = new LatestOnlyTaskQueue(
+    async () => { throw internal; },
+    (error, failedRequest) => reportContainerSpreadRefreshError(
+      error,
+      failedRequest,
+      {
+        reason: ContainerSpreadRefreshExitReason.UNEXPECTED_ERROR,
+        stage: "viewer_update",
+      }
+    )
+  );
+  try {
+    const result = await queue.enqueue(request);
+    assert.deepEqual(result, {
+      outcome: ViewerGroupLoadOutcome.FAILED,
+      reason: ContainerSpreadRefreshExitReason.UNEXPECTED_ERROR,
+      message: "見開き表示を更新できませんでした。",
+    });
+    assert.doesNotMatch(result.message, /cancelPendingCenterTap|TypeError|not a function/);
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].category, "spread_refresh_error");
+    assert.equal(errors[0].error, internal);
+    assert.match(errors[0].error.stack, /cancelPendingCenterTap is not a function/);
+    assert.deepEqual(errors[0].extra, {
+      reason: ContainerSpreadRefreshExitReason.UNEXPECTED_ERROR,
+      stage: "viewer_update",
+      render_trigger: "spread_refresh",
+    });
+  } finally {
+    setRuntimeTestErrorObserver(null);
+  }
+});
+
+test("viewer update context exits keep each pre-load reason distinct", () => {
+  assert.equal(
+    viewerImageUpdateContextExitReason({ viewerMatches: false }),
+    ViewerImageUpdateExitReason.VIEWER_CHANGED_BEFORE_GROUP_LOAD
+  );
+  assert.equal(
+    viewerImageUpdateContextExitReason({ sessionMatches: false }),
+    ViewerImageUpdateExitReason.SESSION_CHANGED_BEFORE_GROUP_LOAD
+  );
+  assert.equal(
+    viewerImageUpdateContextExitReason({ cacheEpochMatches: false }),
+    ViewerImageUpdateExitReason.CACHE_EPOCH_CHANGED_BEFORE_GROUP_LOAD
+  );
+  assert.equal(
+    viewerImageUpdateContextExitReason({ groupMatches: false }),
+    ViewerImageUpdateExitReason.GROUP_CHANGED_BEFORE_GROUP_LOAD
+  );
+  assert.equal(viewerImageUpdateContextExitReason(), null);
+});
+
 test("identical container-style refreshes join the active owner", async () => {
   const gate = deferred();
   let runs = 0;
@@ -1134,6 +1196,67 @@ test("deep page prefetch stops at the byte budget and resumes after protection m
     1,
     "a protected fetched page must not be discarded and fetched again"
   );
+  cache.clear();
+});
+
+test("full byte budget evicts a farther planned page before fetching a nearer one", async () => {
+  const started = [];
+  const resource = (key) => ({
+    blob: new Blob([new Uint8Array(3)]),
+    requestId: `request-${key}`,
+    fetchMs: 1,
+    info: null,
+  });
+  const cache = new PageResourceCache(18, 5, 1, async (request) => {
+    started.push(request.cacheKey);
+    return resource(request.cacheKey);
+  });
+  cache.ready.set("nearer", resource("nearer"));
+  cache.ready.set("farther", resource("farther"));
+  cache.readyBytes = 6;
+
+  cache.schedule([
+    { cacheKey: "nearer" },
+    { cacheKey: "target" },
+    { cacheKey: "farther" },
+  ]);
+  for (let attempt = 0; attempt < 20 && cache.active.size > 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  assert.deepEqual(started, ["target"]);
+  assert.equal(cache.ready.has("nearer"), true);
+  assert.equal(cache.ready.has("target"), true);
+  assert.equal(cache.ready.has("farther"), false);
+  cache.clear();
+});
+
+test("full byte budget never evicts a nearer page to start a farther request", () => {
+  const resource = (key) => ({
+    blob: new Blob([new Uint8Array(3)]),
+    requestId: `request-${key}`,
+    fetchMs: 1,
+    info: null,
+  });
+  const started = [];
+  const cache = new PageResourceCache(18, 5, 1, async (request) => {
+    started.push(request.cacheKey);
+    return resource(request.cacheKey);
+  });
+  cache.ready.set("near-1", resource("near-1"));
+  cache.ready.set("near-2", resource("near-2"));
+  cache.readyBytes = 6;
+
+  cache.schedule([
+    { cacheKey: "near-1" },
+    { cacheKey: "near-2" },
+    { cacheKey: "far-target" },
+  ]);
+
+  assert.deepEqual(started, []);
+  assert.equal(cache.pending.length, 1);
+  assert.equal(cache.ready.has("near-1"), true);
+  assert.equal(cache.ready.has("near-2"), true);
   cache.clear();
 });
 
