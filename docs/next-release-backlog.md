@@ -611,6 +611,9 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
 ### 2.3 アプリ内蔵のテストスクリプト実行 (実機確認の往復をなくす) — 利用者提案
 
 - 出典: 利用者提案 2026-08-11。§1.58 の実機確認で 5 往復して直せなかったことを受けて。
+- **設計の正本は [test-script-runner-plan.md](test-script-runner-plan.md)。着手時はそちらを読む。**
+  差し込む層の決定 (§1)、同期点 (§2)、timeline の規約 (§3)、level の chokepoint (§4)、
+  判定器を false green にしない条件 (§9) が入っている。
 - **やりたいこと**: 起動引数でテスト用スクリプトを渡すと、mIV 内のスレッドがそれを実行し、
   操作をアプリ内から再現する。別プロセスからのキー注入をやめる。Rhai は
   スタック機能 ([filename-stack-plan.md](filename-stack-plan.md)) で既に使っており、
