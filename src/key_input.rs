@@ -61,6 +61,22 @@ pub enum SyntheticNavigationKey {
 }
 
 impl SyntheticNavigationKey {
+    #[cfg(feature = "test-script")]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Right => "Right",
+            Self::Left => "Left",
+            Self::Up => "Up",
+            Self::Down => "Down",
+            Self::PageUp => "PageUp",
+            Self::PageDown => "PageDown",
+            Self::Home => "Home",
+            Self::End => "End",
+            Self::Enter => "Enter",
+            Self::Escape => "Escape",
+        }
+    }
+
     const fn physical_slot(self) -> PhysicalKeySlot {
         match self {
             Self::Right => PhysicalKeySlot::new(0x27, true),
@@ -156,6 +172,7 @@ pub enum SyntheticKeyCommandKind {
 pub struct SyntheticKeyCommand {
     pub at: Instant,
     pub kind: SyntheticKeyCommandKind,
+    pub(crate) hold_id: Option<u64>,
 }
 
 impl SyntheticKeyCommand {
@@ -167,6 +184,7 @@ impl SyntheticKeyCommand {
         Self {
             at,
             kind: SyntheticKeyCommandKind::Down { key, modifiers },
+            hold_id: None,
         }
     }
 
@@ -174,6 +192,7 @@ impl SyntheticKeyCommand {
         Self {
             at,
             kind: SyntheticKeyCommandKind::Up { key },
+            hold_id: None,
         }
     }
 
@@ -181,7 +200,14 @@ impl SyntheticKeyCommand {
         Self {
             at,
             kind: SyntheticKeyCommandKind::CancelAll,
+            hold_id: None,
         }
+    }
+
+    #[cfg(any(test, feature = "test-script"))]
+    pub const fn with_hold_id(mut self, hold_id: u64) -> Self {
+        self.hold_id = Some(hold_id);
+        self
     }
 }
 
@@ -407,9 +433,12 @@ struct HeldSyntheticKey {
     key: SyntheticNavigationKey,
     modifiers: SyntheticModifiers,
     target: SyntheticRoutingTarget,
+    hold_id: Option<u64>,
     next_repeat_at: Instant,
     repeat_interval: Duration,
     order: u64,
+    materialized_down_count: u64,
+    materialized_repeat_count: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -417,6 +446,7 @@ struct MaterializedSyntheticEvent {
     at: Instant,
     key: SyntheticNavigationKey,
     target: SyntheticRoutingTarget,
+    hold_id: Option<u64>,
     pressed: bool,
     repeat: bool,
     modifiers: SyntheticModifiers,
@@ -453,10 +483,37 @@ impl MaterializedSyntheticEvent {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum SyntheticInputFact {
+    HoldBegin {
+        hold_id: u64,
+        key: SyntheticNavigationKey,
+        target: SyntheticRoutingTarget,
+        repeat_delay: Duration,
+        repeat_hz: f64,
+    },
+    HoldEnd {
+        hold_id: u64,
+        down_count: u64,
+        repeat_count: u64,
+        up_count: u64,
+    },
+    FrameInput {
+        hold_id: u64,
+        held: bool,
+        edge_count: u64,
+        // Number of repeat edges materialized in this outer input frame.
+        // The analyzer uses values greater than one as accumulated-repeat
+        // evidence; Down and Up are represented by edge_count instead.
+        materialized_in_frame: u64,
+    },
+}
+
 #[derive(Debug)]
 struct SyntheticMaterialization {
     armed: bool,
     events: Vec<MaterializedSyntheticEvent>,
+    facts: Vec<SyntheticInputFact>,
     final_modifiers: SyntheticModifiers,
     issue: Option<SyntheticInputIssue>,
 }
@@ -466,6 +523,7 @@ impl SyntheticMaterialization {
         Self {
             armed: false,
             events: Vec::new(),
+            facts: Vec::new(),
             final_modifiers: SyntheticModifiers::default(),
             issue: None,
         }
@@ -588,10 +646,12 @@ impl SyntheticTimeline {
             let modifiers = self.modifiers();
             let held = &mut self.held[index];
             let at = held.next_repeat_at;
+            held.materialized_repeat_count = held.materialized_repeat_count.saturating_add(1);
             events.push(MaterializedSyntheticEvent {
                 at,
                 key: held.key,
                 target: held.target,
+                hold_id: held.hold_id,
                 pressed: true,
                 repeat: true,
                 modifiers,
@@ -603,10 +663,15 @@ impl SyntheticTimeline {
     fn release_key(
         &mut self,
         key: SyntheticNavigationKey,
+        hold_id: Option<u64>,
         at: Instant,
         events: &mut Vec<MaterializedSyntheticEvent>,
+        facts: &mut Vec<SyntheticInputFact>,
+        collect_facts: bool,
     ) {
-        let Some(index) = self.held.iter().position(|held| held.key == key) else {
+        let Some(index) = self.held.iter().position(|held| {
+            held.key == key && hold_id.map_or(true, |hold_id| held.hold_id == Some(hold_id))
+        }) else {
             return;
         };
         let modifiers = self.modifiers();
@@ -615,13 +680,28 @@ impl SyntheticTimeline {
             at,
             key: held.key,
             target: held.target,
+            hold_id: held.hold_id,
             pressed: false,
             repeat: false,
             modifiers,
         });
+        if collect_facts && let Some(hold_id) = held.hold_id {
+            facts.push(SyntheticInputFact::HoldEnd {
+                hold_id,
+                down_count: held.materialized_down_count,
+                repeat_count: held.materialized_repeat_count,
+                up_count: 1,
+            });
+        }
     }
 
-    fn cancel_all_at(&mut self, at: Instant, events: &mut Vec<MaterializedSyntheticEvent>) {
+    fn cancel_all_at(
+        &mut self,
+        at: Instant,
+        events: &mut Vec<MaterializedSyntheticEvent>,
+        facts: &mut Vec<SyntheticInputFact>,
+        collect_facts: bool,
+    ) {
         while !self.held.is_empty() {
             let index = self
                 .held
@@ -636,9 +716,49 @@ impl SyntheticTimeline {
                 at,
                 key: held.key,
                 target: held.target,
+                hold_id: held.hold_id,
                 pressed: false,
                 repeat: false,
                 modifiers,
+            });
+            if collect_facts && let Some(hold_id) = held.hold_id {
+                facts.push(SyntheticInputFact::HoldEnd {
+                    hold_id,
+                    down_count: held.materialized_down_count,
+                    repeat_count: held.materialized_repeat_count,
+                    up_count: 1,
+                });
+            }
+        }
+    }
+
+    fn append_frame_input_facts(
+        &self,
+        events: &[MaterializedSyntheticEvent],
+        facts: &mut Vec<SyntheticInputFact>,
+    ) {
+        let mut hold_ids = Vec::new();
+        for hold_id in events
+            .iter()
+            .filter_map(|event| event.hold_id)
+            .chain(self.held.iter().filter_map(|held| held.hold_id))
+        {
+            if !hold_ids.contains(&hold_id) {
+                hold_ids.push(hold_id);
+            }
+        }
+        for hold_id in hold_ids {
+            facts.push(SyntheticInputFact::FrameInput {
+                hold_id,
+                held: self.held.iter().any(|held| held.hold_id == Some(hold_id)),
+                edge_count: events
+                    .iter()
+                    .filter(|event| event.hold_id == Some(hold_id))
+                    .count() as u64,
+                materialized_in_frame: events
+                    .iter()
+                    .filter(|event| event.hold_id == Some(hold_id) && event.repeat)
+                    .count() as u64,
             });
         }
     }
@@ -648,6 +768,7 @@ impl SyntheticTimeline {
         now: Instant,
         mut resolve: R,
         mut focused: F,
+        collect_facts: bool,
     ) -> SyntheticMaterialization
     where
         F: FnMut(egui::ViewportId) -> Option<bool>,
@@ -658,17 +779,22 @@ impl SyntheticTimeline {
         }
 
         let mut events = Vec::new();
+        let mut facts = Vec::new();
         if let Some(lost) = self
             .held
             .iter()
             .find(|held| focused(held.target.viewport) == Some(false))
             .map(|held| held.target.viewport)
         {
-            self.cancel_all_at(now, &mut events);
+            self.cancel_all_at(now, &mut events, &mut facts, collect_facts);
             self.commands.clear();
+            if collect_facts {
+                self.append_frame_input_facts(&events, &mut facts);
+            }
             return SyntheticMaterialization {
                 armed: true,
                 events,
+                facts,
                 final_modifiers: SyntheticModifiers::default(),
                 issue: Some(SyntheticInputIssue::FocusLost { viewport: lost }),
             };
@@ -708,26 +834,46 @@ impl SyntheticTimeline {
                         key,
                         modifiers,
                         target,
+                        hold_id: queued.command.hold_id,
                         next_repeat_at: queued.command.at + self.repeat_delay,
                         repeat_interval: self.repeat_interval,
                         order: queued.sequence,
+                        materialized_down_count: 1,
+                        materialized_repeat_count: 0,
                     });
                     events.push(MaterializedSyntheticEvent {
                         at: queued.command.at,
                         key,
                         target,
+                        hold_id: queued.command.hold_id,
                         pressed: true,
                         repeat: false,
                         modifiers: self.modifiers(),
                     });
+                    if collect_facts && let Some(hold_id) = queued.command.hold_id {
+                        facts.push(SyntheticInputFact::HoldBegin {
+                            hold_id,
+                            key,
+                            target,
+                            repeat_delay: self.repeat_delay,
+                            repeat_hz: 1.0 / self.repeat_interval.as_secs_f64(),
+                        });
+                    }
                 }
                 SyntheticKeyCommandKind::Up { key } => {
                     self.commands.pop_front();
-                    self.release_key(key, queued.command.at, &mut events);
+                    self.release_key(
+                        key,
+                        queued.command.hold_id,
+                        queued.command.at,
+                        &mut events,
+                        &mut facts,
+                        collect_facts,
+                    );
                 }
                 SyntheticKeyCommandKind::CancelAll => {
                     self.commands.pop_front();
-                    self.cancel_all_at(queued.command.at, &mut events);
+                    self.cancel_all_at(queued.command.at, &mut events, &mut facts, collect_facts);
                 }
             }
         }
@@ -735,9 +881,14 @@ impl SyntheticTimeline {
             self.emit_repeats_through(now, &mut events);
         }
 
+        if collect_facts {
+            self.append_frame_input_facts(&events, &mut facts);
+        }
+
         SyntheticMaterialization {
             armed: true,
             events,
+            facts,
             final_modifiers: self.modifiers(),
             issue,
         }
@@ -840,6 +991,7 @@ impl KeyInputState {
                 resolve_registered_target(registry, hwnd)
             },
             focused,
+            synthetic_perf_facts_enabled(),
         );
         for event in &materialized.events {
             self.enqueue_key_edge(event.key_edge());
@@ -851,6 +1003,22 @@ impl KeyInputState {
 fn state() -> &'static Mutex<KeyInputState> {
     static STATE: OnceLock<Mutex<KeyInputState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(KeyInputState::default()))
+}
+
+#[inline]
+fn synthetic_perf_facts_enabled() -> bool {
+    #[cfg(test)]
+    {
+        true
+    }
+    #[cfg(all(not(test), feature = "test-script"))]
+    {
+        crate::perf::is_enabled()
+    }
+    #[cfg(all(not(test), not(feature = "test-script")))]
+    {
+        false
+    }
 }
 
 #[cfg(windows)]
@@ -952,6 +1120,7 @@ struct PreparedSyntheticFrame {
 struct SyntheticInputPlugin {
     prepared: Option<PreparedSyntheticFrame>,
     issues: VecDeque<SyntheticInputIssue>,
+    next_frame_nr: u64,
 }
 
 impl SyntheticInputPlugin {
@@ -996,6 +1165,8 @@ impl SyntheticInputPlugin {
         }
 
         self.record_undelivered_previous_frame();
+        let frame_nr = self.next_frame_nr;
+        self.next_frame_nr = self.next_frame_nr.saturating_add(1);
         let materialized = state()
             .lock()
             .map(|mut guard| {
@@ -1015,6 +1186,7 @@ impl SyntheticInputPlugin {
                 .all(|pair| pair[0].at <= pair[1].at),
             "synthetic input materialization must stay chronological"
         );
+        emit_synthetic_input_facts(&materialized.facts, frame_nr);
 
         let mut batches: Vec<SyntheticViewportBatch> = Vec::new();
         for event in materialized.events {
@@ -1065,6 +1237,86 @@ impl SyntheticInputPlugin {
         }
     }
 }
+
+#[cfg(feature = "test-script")]
+fn emit_synthetic_input_facts(facts: &[SyntheticInputFact], frame_nr: u64) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    for fact in facts {
+        match fact {
+            SyntheticInputFact::HoldBegin {
+                hold_id,
+                key,
+                target,
+                repeat_delay,
+                repeat_hz,
+            } => {
+                let target_viewport = if target.viewport == egui::ViewportId::ROOT {
+                    "ROOT".to_string()
+                } else {
+                    format!("{:?}", target.viewport)
+                };
+                crate::perf::event(
+                    "test_script",
+                    "hold_begin",
+                    Some(key.as_str()),
+                    0,
+                    &[
+                        ("hold_id", serde_json::Value::from(*hold_id)),
+                        ("target_viewport", serde_json::Value::from(target_viewport)),
+                        (
+                            "repeat_delay_ms",
+                            serde_json::Value::from(repeat_delay.as_secs_f64() * 1000.0),
+                        ),
+                        ("repeat_hz", serde_json::Value::from(*repeat_hz)),
+                    ],
+                );
+            }
+            SyntheticInputFact::HoldEnd {
+                hold_id,
+                down_count,
+                repeat_count,
+                up_count,
+            } => crate::perf::event(
+                "test_script",
+                "hold_end",
+                None,
+                0,
+                &[
+                    ("hold_id", serde_json::Value::from(*hold_id)),
+                    ("down_count", serde_json::Value::from(*down_count)),
+                    ("repeat_count", serde_json::Value::from(*repeat_count)),
+                    ("up_count", serde_json::Value::from(*up_count)),
+                ],
+            ),
+            SyntheticInputFact::FrameInput {
+                hold_id,
+                held,
+                edge_count,
+                materialized_in_frame,
+            } => crate::perf::event(
+                "test_script",
+                "frame_input",
+                None,
+                0,
+                &[
+                    ("hold_id", serde_json::Value::from(*hold_id)),
+                    ("held", serde_json::Value::from(*held)),
+                    ("edge_count", serde_json::Value::from(*edge_count)),
+                    (
+                        "materialized_in_frame",
+                        serde_json::Value::from(*materialized_in_frame),
+                    ),
+                    ("frame_nr", serde_json::Value::from(frame_nr)),
+                ],
+            ),
+        }
+    }
+}
+
+#[cfg(not(feature = "test-script"))]
+fn emit_synthetic_input_facts(_facts: &[SyntheticInputFact], _frame_nr: u64) {}
 
 impl egui::Plugin for SyntheticInputPlugin {
     fn debug_name(&self) -> &'static str {
@@ -1600,8 +1852,8 @@ unsafe extern "system" fn main_key_input_subclass_proc(
 mod tests {
     use super::{
         KeyEdge, KeyInputState, PhysicalKeySlot, RawKeyEdge, RegisterHwndResult, ReturnKeyState,
-        SyntheticInputIssue, SyntheticInputPlugin, SyntheticKeyCommand, SyntheticModifiers,
-        SyntheticNavigationKey, SyntheticRoutingTargetError, TEST_INPUT_LOCK,
+        SyntheticInputFact, SyntheticInputIssue, SyntheticInputPlugin, SyntheticKeyCommand,
+        SyntheticModifiers, SyntheticNavigationKey, SyntheticRoutingTargetError, TEST_INPUT_LOCK,
         arm_test_synthetic_input, arm_test_synthetic_input_without_registration, begin_frame,
         clear_test_synthetic_input, consume_all_key_down_with_result, consume_key_down,
         consume_key_edges, enqueue_test_synthetic_command, materialize_test_synthetic_input,
@@ -2005,6 +2257,102 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].at < pair[1].at)
         );
+    }
+
+    #[test]
+    fn synthetic_hold_facts_report_levels_edges_and_accumulated_repeats() {
+        let _serial = TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        let _cleanup = ClearSyntheticInput;
+        let viewport = egui::ViewportId::from_hash_of("synthetic-facts");
+        arm_test_synthetic_input(0x409, viewport);
+        assert!(set_test_synthetic_repeat(Duration::from_millis(250), 30.0));
+        let start = Instant::now();
+        enqueue_test_synthetic_command(
+            SyntheticKeyCommand::down(
+                start,
+                SyntheticNavigationKey::Right,
+                SyntheticModifiers::default(),
+            )
+            .with_hold_id(7),
+        );
+
+        let down = materialize_test_synthetic_input(start, |_| Some(true));
+        assert!(down.facts.iter().any(|fact| matches!(
+            fact,
+            SyntheticInputFact::HoldBegin {
+                hold_id: 7,
+                key: SyntheticNavigationKey::Right,
+                target,
+                repeat_delay,
+                repeat_hz,
+            } if target.viewport == viewport
+                && *repeat_delay == Duration::from_millis(250)
+                && (*repeat_hz - 30.0).abs() < 0.000_001
+        )));
+        assert!(down.facts.iter().any(|fact| matches!(
+            fact,
+            SyntheticInputFact::FrameInput {
+                hold_id: 7,
+                held: true,
+                edge_count: 1,
+                materialized_in_frame: 0,
+            }
+        )));
+
+        let between =
+            materialize_test_synthetic_input(start + Duration::from_millis(100), |_| Some(true));
+        assert_eq!(
+            between.facts,
+            [SyntheticInputFact::FrameInput {
+                hold_id: 7,
+                held: true,
+                edge_count: 0,
+                materialized_in_frame: 0,
+            }]
+        );
+
+        let accumulated =
+            materialize_test_synthetic_input(start + Duration::from_millis(710), |_| Some(true));
+        assert!(accumulated.facts.iter().any(|fact| matches!(
+            fact,
+            SyntheticInputFact::FrameInput {
+                hold_id: 7,
+                held: true,
+                edge_count,
+                materialized_in_frame,
+            } if *edge_count > 1 && *materialized_in_frame > 1
+        )));
+
+        enqueue_test_synthetic_command(
+            SyntheticKeyCommand::up(
+                start + Duration::from_millis(711),
+                SyntheticNavigationKey::Right,
+            )
+            .with_hold_id(7),
+        );
+        let released =
+            materialize_test_synthetic_input(start + Duration::from_millis(711), |_| Some(true));
+        assert!(released.facts.iter().any(|fact| matches!(
+            fact,
+            SyntheticInputFact::HoldEnd {
+                hold_id: 7,
+                down_count: 1,
+                repeat_count,
+                up_count: 1,
+            } if *repeat_count > 1
+        )));
+        assert!(released.facts.iter().any(|fact| matches!(
+            fact,
+            SyntheticInputFact::FrameInput {
+                hold_id: 7,
+                held: false,
+                edge_count: 1,
+                ..
+            }
+        )));
     }
 
     #[test]

@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, mpsc};
 use std::time::{Duration, Instant};
 
@@ -139,6 +139,14 @@ impl ScriptOutcomeKind {
             Self::EnvironmentFailure => EXIT_ENVIRONMENT_FAILURE,
         }
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::ScriptFailure => "script_failure",
+            Self::EnvironmentFailure => "environment_failure",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,6 +184,16 @@ impl ScriptOutcome {
 }
 
 #[derive(Debug)]
+struct PreconditionTrace {
+    name: &'static str,
+    satisfied: bool,
+    timeout_ms: Option<u64>,
+    elapsed_ms: u64,
+    target_registered: Option<bool>,
+    focused: Option<bool>,
+}
+
+#[derive(Debug)]
 enum UiCommand {
     Key(SyntheticKeyCommand),
     Cancel(Instant),
@@ -188,6 +206,7 @@ enum UiCommand {
         applied: mpsc::SyncSender<Result<(), String>>,
     },
     Log(String),
+    Precondition(PreconditionTrace),
     Finished(ScriptOutcome),
 }
 
@@ -242,6 +261,7 @@ struct RunnerBridge {
     snapshot: Arc<RwLock<TestScriptSnapshot>>,
     interrupt: Arc<InterruptState>,
     wake: Arc<dyn Fn() + Send + Sync>,
+    next_hold_id: Arc<AtomicU64>,
 }
 
 impl RunnerBridge {
@@ -267,6 +287,15 @@ impl RunnerBridge {
 
     fn require_key_target(&self) -> Result<(), String> {
         let snapshot = self.latest_snapshot()?;
+        let satisfied = snapshot.target_registered && snapshot.focused;
+        let _ = self.send_unchecked(UiCommand::Precondition(PreconditionTrace {
+            name: "key_target",
+            satisfied,
+            timeout_ms: None,
+            elapsed_ms: 0,
+            target_registered: Some(snapshot.target_registered),
+            focused: Some(snapshot.focused),
+        }));
         if !snapshot.target_registered {
             return Err(
                 "synthetic key target is not registered; wait_until(|s| s.target_registered, timeout_ms) before sending input"
@@ -281,6 +310,70 @@ impl RunnerBridge {
         }
         Ok(())
     }
+
+    fn allocate_hold_id(&self) -> u64 {
+        self.next_hold_id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+fn emit_perf_step(message: &str) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    crate::perf::event(
+        "test_script",
+        "step",
+        None,
+        0,
+        &[("message", serde_json::Value::from(message))],
+    );
+}
+
+fn emit_perf_precondition(trace: &PreconditionTrace) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    let mut extras = vec![
+        ("name", serde_json::Value::from(trace.name)),
+        ("satisfied", serde_json::Value::from(trace.satisfied)),
+        ("elapsed_ms", serde_json::Value::from(trace.elapsed_ms)),
+    ];
+    if let Some(timeout_ms) = trace.timeout_ms {
+        extras.push(("timeout_ms", serde_json::Value::from(timeout_ms)));
+    }
+    if let Some(target_registered) = trace.target_registered {
+        extras.push((
+            "target_registered",
+            serde_json::Value::from(target_registered),
+        ));
+    }
+    if let Some(focused) = trace.focused {
+        extras.push(("focused", serde_json::Value::from(focused)));
+    }
+    crate::perf::event("test_script", "precondition", None, 0, &extras);
+}
+
+fn emit_perf_fail(outcome: &ScriptOutcome) {
+    if outcome.kind == ScriptOutcomeKind::Success || !crate::perf::is_enabled() {
+        return;
+    }
+    crate::perf::event(
+        "test_script",
+        "fail",
+        None,
+        0,
+        &[
+            (
+                "failure_kind",
+                serde_json::Value::from(outcome.kind.as_str()),
+            ),
+            (
+                "exit_code",
+                serde_json::Value::from(outcome.kind.exit_code()),
+            ),
+            ("message", serde_json::Value::from(outcome.message.as_str())),
+        ],
+    );
 }
 
 fn rhai_error(message: impl Into<String>) -> Box<EvalAltResult> {
@@ -340,20 +433,23 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
             let key = parse_navigation_key(&name)?;
             let duration = checked_duration(ms, "hold_key ms")?;
             hold_bridge.require_key_target().map_err(rhai_error)?;
+            let hold_id = hold_bridge.allocate_hold_id();
             hold_bridge
-                .send(UiCommand::Key(SyntheticKeyCommand::down(
-                    Instant::now(),
-                    key,
-                    SyntheticModifiers::default(),
-                )))
+                .send(UiCommand::Key(
+                    SyntheticKeyCommand::down(Instant::now(), key, SyntheticModifiers::default())
+                        .with_hold_id(hold_id),
+                ))
                 .map_err(rhai_error)?;
             if let Err(error) = wait_interruptibly(&hold_bridge.interrupt, duration) {
-                let _ = hold_bridge
-                    .send_unchecked(UiCommand::Key(SyntheticKeyCommand::up(Instant::now(), key)));
+                let _ = hold_bridge.send_unchecked(UiCommand::Key(
+                    SyntheticKeyCommand::up(Instant::now(), key).with_hold_id(hold_id),
+                ));
                 return Err(error);
             }
             hold_bridge
-                .send(UiCommand::Key(SyntheticKeyCommand::up(Instant::now(), key)))
+                .send(UiCommand::Key(
+                    SyntheticKeyCommand::up(Instant::now(), key).with_hold_id(hold_id),
+                ))
                 .map_err(rhai_error)
         },
     );
@@ -435,10 +531,30 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
                 wait_bridge.interrupt.check().map_err(rhai_error)?;
                 let snapshot = wait_bridge.latest_snapshot().map_err(rhai_error)?;
                 if condition.call_within_context::<bool>(&ctx, (snapshot.to_rhai_map(),))? {
+                    wait_bridge
+                        .send(UiCommand::Precondition(PreconditionTrace {
+                            name: "wait_until",
+                            satisfied: true,
+                            timeout_ms: Some(timeout.as_millis() as u64),
+                            elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX))
+                                as u64,
+                            target_registered: Some(snapshot.target_registered),
+                            focused: Some(snapshot.focused),
+                        }))
+                        .map_err(rhai_error)?;
                     return Ok(());
                 }
                 let elapsed = started.elapsed();
                 if elapsed >= timeout {
+                    let _ =
+                        wait_bridge.send_unchecked(UiCommand::Precondition(PreconditionTrace {
+                            name: "wait_until",
+                            satisfied: false,
+                            timeout_ms: Some(timeout.as_millis() as u64),
+                            elapsed_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+                            target_registered: Some(snapshot.target_registered),
+                            focused: Some(snapshot.focused),
+                        }));
                     return Err(rhai_error(format!(
                         "wait_until timed out after {} ms",
                         timeout.as_millis()
@@ -730,11 +846,13 @@ pub(crate) fn start(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
     PROCESS_EXIT_CODE.store(EXIT_NOT_SET, Ordering::Release);
     let result = start_inner(path, ctx);
     if let Err(error) = &result {
+        let outcome = ScriptOutcome::environment_failure(format!("runner start failed: {error}"));
         PROCESS_EXIT_CODE.store(EXIT_ENVIRONMENT_FAILURE, Ordering::Release);
         crate::logger::log(format!(
             "[test-script] finished kind=EnvironmentFailure exit_code={} message=runner start failed: {error}",
             EXIT_ENVIRONMENT_FAILURE
         ));
+        emit_perf_fail(&outcome);
         let _ = crate::key_input::cancel_synthetic_input(Instant::now());
         crate::key_input::disarm_synthetic_input();
         // eframe has already created its wgpu Device before invoking the app
@@ -760,6 +878,7 @@ fn start_inner(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
         wake: Arc::new(move || {
             wake_ctx.request_repaint_of(egui::ViewportId::ROOT);
         }),
+        next_hold_id: Arc::new(AtomicU64::new(0)),
     };
 
     let mut guard = runtime()
@@ -882,11 +1001,14 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
     let frame = frame_key(ctx);
     let issues = crate::key_input::take_synthetic_input_issues(ctx);
     let Ok(mut guard) = runtime().lock() else {
+        let outcome =
+            ScriptOutcome::environment_failure("test-script runtime is poisoned".to_string());
         PROCESS_EXIT_CODE.store(EXIT_ENVIRONMENT_FAILURE, Ordering::Release);
         crate::logger::log(format!(
             "[test-script] finished kind=EnvironmentFailure exit_code={} message=test-script runtime is poisoned",
             EXIT_ENVIRONMENT_FAILURE
         ));
+        emit_perf_fail(&outcome);
         let _ = crate::key_input::cancel_synthetic_input(Instant::now());
         crate::key_input::disarm_synthetic_input();
         arm_shutdown_watchdog(EXIT_ENVIRONMENT_FAILURE, "runtime-poisoned");
@@ -954,7 +1076,9 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
             }
             UiCommand::Log(message) => {
                 crate::logger::log(format!("[test-script] {message}"));
+                emit_perf_step(&message);
             }
+            UiCommand::Precondition(trace) => emit_perf_precondition(&trace),
             UiCommand::Finished(outcome) => runtime.begin_finish(outcome, frame),
         }
     }
@@ -980,6 +1104,7 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
                 outcome.kind.exit_code(),
                 outcome.message
             ));
+            emit_perf_fail(&outcome);
             crate::key_input::disarm_synthetic_input();
             arm_shutdown_watchdog(outcome.kind.exit_code(), "close-request");
             close = true;
@@ -1042,6 +1167,9 @@ pub(crate) fn on_app_exit() {
         return;
     };
     PROCESS_EXIT_CODE.store(EXIT_ENVIRONMENT_FAILURE, Ordering::Release);
+    let outcome = ScriptOutcome::environment_failure(
+        "application exited before the test script completed".to_string(),
+    );
     runtime
         .interrupt
         .fail("application exited before the test script completed");
@@ -1051,6 +1179,7 @@ pub(crate) fn on_app_exit() {
         "[test-script] finished kind=EnvironmentFailure exit_code={} message=application exited before the test script completed",
         EXIT_ENVIRONMENT_FAILURE
     ));
+    emit_perf_fail(&outcome);
     arm_shutdown_watchdog(EXIT_ENVIRONMENT_FAILURE, "premature-app-exit");
 }
 
@@ -1135,6 +1264,7 @@ mod tests {
                 wake: Arc::new(move || {
                     wake_count.fetch_add(1, AtomicOrdering::Relaxed);
                 }),
+                next_hold_id: Arc::new(AtomicU64::new(0)),
             },
             rx,
             wakes,
@@ -1274,6 +1404,29 @@ mod tests {
                 message,
             })) if message.contains("unsupported synthetic navigation key")
         ));
+    }
+
+    #[test]
+    fn hold_key_assigns_one_monotonic_id_to_its_down_and_up() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source(
+            r#"
+                hold_key("Left", 0);
+                hold_key("Right", 0);
+            "#
+            .to_string(),
+            bridge,
+        )
+        .unwrap();
+        let commands = receive_through_finished(&rx);
+        let hold_ids = commands
+            .iter()
+            .filter_map(|command| match command {
+                UiCommand::Key(command) => command.hold_id,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(hold_ids, [1, 1, 2, 2]);
     }
 
     #[test]
