@@ -2264,6 +2264,7 @@ struct ViewerContextBundle {
     >,
     thumb_edit_preview_keys: std::collections::HashMap<usize, String>,
     thumb_adjust_tex: std::collections::HashMap<usize, egui::TextureHandle>,
+    passthrough_rendition_cache: PassthroughRenditionCache,
     adjustment_page_params: std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
     local_adjust_page_layers:
         std::collections::HashMap<usize, Vec<local_adjust_core::LocalAdjustmentLayer>>,
@@ -2549,6 +2550,7 @@ impl ViewerContextBundle {
             thumb_edit_preview_layers: std::collections::HashMap::new(),
             thumb_edit_preview_keys: std::collections::HashMap::new(),
             thumb_adjust_tex: std::collections::HashMap::new(),
+            passthrough_rendition_cache: PassthroughRenditionCache::default(),
             adjustment_page_params: std::collections::HashMap::new(),
             local_adjust_page_layers: std::collections::HashMap::new(),
             local_adjust_pages: std::collections::HashSet::new(),
@@ -5702,6 +5704,21 @@ pub(crate) enum FsPageDisplaySource {
     RetainedPdfFinalAi,
 }
 
+/// Whether an explicit fullscreen open should start full-resolution work now.
+/// Page-turn pass-through uses the deferred variant; release returns to Eager
+/// without storing a second navigation-mode flag in App state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsOpenMaterialization {
+    Eager,
+    DeferredPageTurn,
+}
+
+impl FsOpenMaterialization {
+    const fn is_eager(self) -> bool {
+        matches!(self, Self::Eager)
+    }
+}
+
 impl FsPageLoadState {
     fn needs_load_request(self) -> bool {
         matches!(self, Self::NeedsLoad)
@@ -5906,6 +5923,86 @@ pub(crate) struct FinalCompositeKey {
     pub(crate) edit_key: EditResultKey,
     pub(crate) params_hash: u64,
     pub(crate) bg: u8,
+}
+
+const PASSTHROUGH_RENDITION_CACHE_CAPACITY: usize = 16;
+
+#[derive(Clone)]
+pub(crate) struct PassthroughRenditionEntry {
+    /// Catalog-thumbnail pixels used to build this rendition. Pointer identity
+    /// closes the independent thumbnail quality-upgrade lifetime without a
+    /// second effect-key system.
+    source_pixels: Arc<egui::ColorImage>,
+    /// Keep the CPU result beside the GPU texture so the cache owns one complete rendition.
+    _pixels: Arc<egui::ColorImage>,
+    pub(crate) texture: egui::TextureHandle,
+}
+
+/// Small viewer-context-local LRU for color-faithful page-turn thumbnails.
+/// `FinalCompositeKey` already owns idx, edit generation, effect parameters and background.
+#[derive(Clone, Default)]
+pub(crate) struct PassthroughRenditionCache {
+    entries: std::collections::HashMap<FinalCompositeKey, PassthroughRenditionEntry>,
+    lru: std::collections::VecDeque<FinalCompositeKey>,
+}
+
+impl PassthroughRenditionCache {
+    fn get(
+        &mut self,
+        key: FinalCompositeKey,
+        source_pixels: &Arc<egui::ColorImage>,
+    ) -> Option<PassthroughRenditionEntry> {
+        let source_matches = self
+            .entries
+            .get(&key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.source_pixels, source_pixels));
+        if !source_matches {
+            self.remove(&key);
+            return None;
+        }
+        self.touch(key);
+        self.entries.get(&key).cloned()
+    }
+
+    fn insert(&mut self, key: FinalCompositeKey, entry: PassthroughRenditionEntry) {
+        self.entries.insert(key, entry);
+        self.touch(key);
+        while self.lru.len() > PASSTHROUGH_RENDITION_CACHE_CAPACITY {
+            if let Some(oldest) = self.lru.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &FinalCompositeKey) {
+        self.entries.remove(key);
+        if let Some(pos) = self.lru.iter().position(|candidate| candidate == key) {
+            self.lru.remove(pos);
+        }
+    }
+
+    fn touch(&mut self, key: FinalCompositeKey) {
+        if let Some(pos) = self.lru.iter().position(|candidate| *candidate == key) {
+            self.lru.remove(pos);
+        }
+        self.lru.push_back(key);
+    }
+
+    fn contains_texture(&self, texture_id: egui::TextureId) -> bool {
+        self.entries
+            .values()
+            .any(|entry| entry.texture.id() == texture_id)
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.lru.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 const FINAL_EFFECT_PREFETCH_BLOCK_LOG_CAPACITY: usize = 256;
@@ -6299,6 +6396,44 @@ struct FinalEffectJob {
     colorize: crate::colorize::ColorizeParams,
     creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
     post_filter: crate::adjustment::PostFilter,
+}
+
+/// Build the low-resolution page-turn rendition synchronously on the UI thread.
+/// The order is the page-turn contract in display-pipeline §2.5.6:
+/// color adjustment -> Creative LUT -> colorize. Content edits, AI, sharpen and
+/// post filters stay outside this bounded thumbnail-sized path.
+fn build_passthrough_rendition_pixels(
+    source: &egui::ColorImage,
+    params: &crate::adjustment::AdjustParams,
+    final_color_effect_required: bool,
+    creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
+) -> egui::ColorImage {
+    let adjusted = if params.is_color_identity() {
+        source.clone()
+    } else {
+        crate::adjustment::apply_adjustments_fast(source, params)
+    };
+    let lut_applied = if final_color_effect_required {
+        if let Some((lut, strength)) = creative_lut {
+            crate::creative_lut::apply_to_color_image(&adjusted, &lut, strength)
+        } else {
+            adjusted
+        }
+    } else {
+        adjusted
+    };
+    if final_color_effect_required
+        && !matches!(
+            params.colorize.mode,
+            crate::colorize::ColorizeMode::Disabled
+        )
+    {
+        let cancel = AtomicBool::new(false);
+        crate::colorize::apply_applicable_with_cancel(&lut_applied, &params.colorize, &cancel)
+            .unwrap_or(lut_applied)
+    } else {
+        lut_applied
+    }
 }
 
 fn run_final_effect_job(job: FinalEffectJob, cancel: &AtomicBool) -> FinalEffectResult {
@@ -10598,6 +10733,9 @@ pub struct App {
     /// `effective_params(idx)` が色調 identity でないときのみ格納。
     /// サムネ描画時は `thumbnails[idx].tex` より優先される。
     pub(crate) thumb_adjust_tex: std::collections::HashMap<usize, egui::TextureHandle>,
+    /// ページ送り中に使う、完成画像と同じ色処理を適用済みの低解像度 rendition。
+    /// viewer context ごとに所有し、通常の final composite cache とは寿命を分ける。
+    pub(crate) passthrough_rendition_cache: PassthroughRenditionCache,
     /// 前フレームのスライダードラッグ状態。true→false 遷移を検知して
     /// release 時に `thumb_adjust_tex` を全無効化する。
     pub(crate) thumb_adjust_was_dragging: bool,
@@ -12820,6 +12958,7 @@ impl App {
             thumb_edit_preview_layers: std::collections::HashMap::new(),
             thumb_edit_preview_keys: std::collections::HashMap::new(),
             thumb_adjust_tex: std::collections::HashMap::new(),
+            passthrough_rendition_cache: PassthroughRenditionCache::default(),
             thumb_adjust_was_dragging: false,
             thumb_adjust_drag_color_dirty: false,
             adjustment_dragging: false,
@@ -14433,6 +14572,7 @@ impl App {
             thumb_edit_preview_layers,
             thumb_edit_preview_keys,
             thumb_adjust_tex,
+            passthrough_rendition_cache,
             adjustment_page_params,
             local_adjust_page_layers,
             local_adjust_pages,
@@ -14665,6 +14805,7 @@ impl App {
         swap_field!(thumb_edit_preview_layers);
         swap_field!(thumb_edit_preview_keys);
         swap_field!(thumb_adjust_tex);
+        swap_field!(passthrough_rendition_cache);
         swap_field!(adjustment_page_params);
         swap_field!(local_adjust_page_layers);
         swap_field!(local_adjust_pages);
@@ -16810,6 +16951,7 @@ impl App {
         self.reset_folder_rating_counts();
         self.adjustment_cache.clear();
         self.thumb_pixels.clear();
+        self.passthrough_rendition_cache.clear();
         self.thumb_edit_preview_layers.clear();
         self.thumb_adjust_tex.clear();
         self.fs_cache.clear();
@@ -22197,6 +22339,7 @@ impl App {
         // 画像補正: ページ個別パラメータを DB から復元
         self.adjustment_cache.clear();
         self.thumb_pixels.clear();
+        self.passthrough_rendition_cache.clear();
         self.thumb_edit_preview_layers.clear();
         self.thumb_adjust_tex.clear();
         self.thumb_adjust_was_dragging = false;
@@ -24249,6 +24392,7 @@ impl App {
         self.rating_cache.clear();
         self.adjustment_cache.clear();
         self.thumb_pixels.clear();
+        self.passthrough_rendition_cache.clear();
         self.thumb_edit_preview_layers.clear();
         self.thumb_adjust_tex.clear();
         self.ai_upscale_cache.clear();
@@ -30382,6 +30526,7 @@ impl App {
             self.keep_start_shared.store(0, Ordering::Relaxed);
             self.keep_end_shared.store(0, Ordering::Relaxed);
             self.thumb_pixels.clear();
+            self.passthrough_rendition_cache.clear();
             self.thumb_edit_preview_layers.clear();
             self.thumb_adjust_tex.clear();
             let force_full_reconcile =
@@ -38853,6 +38998,7 @@ impl App {
             thumb_edit_preview_layers,
             thumb_edit_preview_keys,
             thumb_adjust_tex,
+            passthrough_rendition_cache,
             adjustment_page_params,
             local_adjust_page_layers,
             local_adjust_pages,
@@ -39099,6 +39245,7 @@ impl App {
             thumb_edit_preview_layers,
             thumb_edit_preview_keys,
             thumb_adjust_tex,
+            passthrough_rendition_cache,
             adjustment_page_params,
             local_adjust_page_layers,
             local_adjust_pages,
@@ -41114,6 +41261,19 @@ impl App {
     /// 見開き正規化のような内部起動は bump しないので、fs load は現在の
     /// `self.input_seq` (= 直近のユーザー入力) に紐づく。
     pub fn open_fullscreen(&mut self, idx: usize, history_trigger: HistoryTrigger) {
+        self.open_fullscreen_with_materialization(
+            idx,
+            history_trigger,
+            FsOpenMaterialization::Eager,
+        );
+    }
+
+    pub(crate) fn open_fullscreen_with_materialization(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        materialization: FsOpenMaterialization,
+    ) {
         #[cfg(windows)]
         if self.route_materialized_physical_still_open_to_active_context(idx) {
             return;
@@ -41123,7 +41283,11 @@ impl App {
         // 前ページの完成済み編集結果を退避する。grid からの新規入場では
         // fullscreen_idx=None なので holdover は空になる。
         if self.fullscreen_idx != Some(idx) {
-            self.capture_colorize_page_transition_holdover(idx);
+            if materialization.is_eager() {
+                self.capture_colorize_page_transition_holdover(idx);
+            } else {
+                self.clear_colorize_display_unit_holdover();
+            }
         }
         if self.fullscreen_idx.is_some() && self.fullscreen_idx != Some(idx) {
             self.cache_current_edit_preview_if_ready();
@@ -41329,12 +41493,14 @@ impl App {
             Some(GridItem::Image(_))
             | Some(GridItem::ZipImage { .. })
             | Some(GridItem::PdfPage { .. }) => {
-                let load_state = self.ensure_fs_page_load(idx);
-                if load_state.is_display_ready() {
-                    crate::logger::log(format!("  cache hit idx={idx} → instant display"));
-                }
-                if self.reading_flow.is_paged() {
-                    self.update_prefetch_window(idx);
+                if materialization.is_eager() {
+                    let load_state = self.ensure_fs_page_load(idx);
+                    if load_state.is_display_ready() {
+                        crate::logger::log(format!("  cache hit idx={idx} → instant display"));
+                    }
+                    if self.reading_flow.is_paged() {
+                        self.update_prefetch_window(idx);
+                    }
                 }
             }
             Some(GridItem::Video(_)) => {
@@ -53774,6 +53940,19 @@ impl App {
         }
     }
 
+    /// Cancel producers whose outputs cannot be admitted while a physical page-turn
+    /// level is held. Resident caches and completed upload backlog entries are kept;
+    /// only in-flight full-resolution decode/effect/AI work is stopped.
+    pub(crate) fn defer_page_turn_full_resolution_work(&mut self) {
+        self.fs_pending.clear();
+        self.fs_early_dims.clear();
+        for pending in self.final_ai_pending.values() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.final_ai_pending.clear();
+        self.cancel_all_final_effects();
+    }
+
     #[cfg(test)]
     fn insert_retained_final_ai(
         &mut self,
@@ -54437,6 +54616,15 @@ impl App {
 
     fn poll_final_effects(&mut self, ctx: &egui::Context) {
         if self.final_effect_pending.is_empty() {
+            return;
+        }
+        if let Some(fs_idx) = self.fullscreen_idx
+            && self
+                .fs_page_turn_decision_for_frame(ctx, fs_idx)
+                .defer_ui_uploads()
+        {
+            // Completed workers retain their channel result until physical release.
+            // Collecting here would perform a full-size UI-thread texture upload.
             return;
         }
         let mut completed = Vec::new();
@@ -59788,6 +59976,96 @@ impl App {
         computed
     }
 
+    /// Return a color-faithful catalog-thumbnail rendition for page-turn pass-through.
+    /// This is intentionally synchronous: publishing an uncolored texture first would
+    /// violate R2, while the measured thumbnail-sized work is bounded to a few milliseconds.
+    pub(crate) fn ensure_passthrough_rendition(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        let (catalog_texture, from_edit_preview) = match self.thumbnails.get(idx) {
+            Some(crate::grid_item::ThumbnailState::Loaded {
+                tex,
+                from_edit_preview,
+                ..
+            }) => (tex.clone(), *from_edit_preview),
+            _ => return None,
+        };
+        let source_pixels = self.thumb_pixels.get(&idx)?.clone();
+        let params = self.effective_params(idx).clone();
+        let final_color_effect_required = self.colorize_display_requires_final_effect(idx);
+        let key = self.final_composite_key_for_pixels(
+            self.current_edit_result_key(idx),
+            source_pixels.size,
+            &params,
+        );
+        if let Some(entry) = self.passthrough_rendition_cache.get(key, &source_pixels) {
+            return Some(entry.texture);
+        }
+
+        let creative_lut = if final_color_effect_required && !params.creative_lut.is_identity() {
+            self.creative_lut_library
+                .get(params.creative_lut.id)
+                .map(|lut| (lut, params.creative_lut.strength))
+        } else {
+            None
+        };
+        let no_color_effect = params.is_color_identity() && !final_color_effect_required;
+        let (pixels, texture) = if no_color_effect && !from_edit_preview {
+            (Arc::clone(&source_pixels), catalog_texture)
+        } else {
+            let pixels = Arc::new(build_passthrough_rendition_pixels(
+                &source_pixels,
+                &params,
+                final_color_effect_required,
+                creative_lut,
+            ));
+            let texture = ctx.load_texture(
+                format!(
+                    "passthrough_rendition_{}_{}_{}_{}",
+                    key.edit_key.idx, key.edit_key.source_gen, key.params_hash, key.bg
+                ),
+                (*pixels).clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            (pixels, texture)
+        };
+        self.passthrough_rendition_cache.insert(
+            key,
+            PassthroughRenditionEntry {
+                source_pixels,
+                _pixels: pixels,
+                texture: texture.clone(),
+            },
+        );
+        Some(texture)
+    }
+
+    pub(crate) fn is_passthrough_rendition_texture(&self, texture: &egui::TextureHandle) -> bool {
+        self.passthrough_rendition_cache
+            .contains_texture(texture.id())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn passthrough_rendition_cache_len_for_test(&self) -> usize {
+        self.passthrough_rendition_cache.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_passthrough_rendition_pixels_for_test(
+        &self,
+        idx: usize,
+    ) -> Option<Arc<egui::ColorImage>> {
+        self.passthrough_rendition_cache
+            .lru
+            .iter()
+            .rev()
+            .find(|key| key.edit_key.idx == idx)
+            .and_then(|key| self.passthrough_rendition_cache.entries.get(key))
+            .map(|entry| Arc::clone(&entry._pixels))
+    }
+
     /// 一旦 `fs_upload_backlog` に積み、1 フレームあたり最大 1 枚だけ `ctx.load_texture`
     /// する。現在フルスクリーン表示中の idx は即時アップロードして表示遅延ゼロ。
     /// これにより 20MP JPEG 連続 prefetch 時の 500ms 級 UI フリーズを回避する。
@@ -59867,7 +60145,16 @@ impl App {
         // ── ペーシング: このフレームで何枚アップロードするか決める ──
         // 1. 現在フルスクリーン表示中の idx (= ユーザーが待っている画像) は即時に処理
         // 2. 他の先読み分は FIFO 先頭から 1 枚だけ取り出す
+        // 3. ページ送り level が held の間は 0 枚。worker 結果は backlog に残し、
+        //    release 後の通常フレームで同じ優先順位のまま消化する。
         // backlog は通常 <10 要素なので `Vec::remove` の O(n) は実質コストなし。
+        if let Some(fs_idx) = self.fullscreen_idx
+            && self
+                .fs_page_turn_decision_for_frame(ctx, fs_idx)
+                .defer_ui_uploads()
+        {
+            return;
+        }
         let cur = self.fullscreen_idx;
         let (mut cur_pos, mut other_pos) = (None, None);
         for (i, (k, _, _)) in self.fs_upload_backlog.iter().enumerate() {
@@ -62592,60 +62879,65 @@ impl eframe::App for App {
         if let Some(fs_idx) = self.fullscreen_idx {
             // プリセットに基づいてアップスケール設定を同期
             self.sync_upscale_from_preset(fs_idx);
-            let continuous_keep_set = if !self.reading_flow.is_paged()
-                && self.fs_vertical_cache_keep_set.contains(&fs_idx)
-            {
-                Some(self.fs_vertical_cache_keep_set.clone())
-            } else {
-                None
-            };
-            // 見開き相方ページ (Double のとき)。reconcile と local_adjust の両方で使う。
-            let spread_other: Option<usize> = match self.resolve_spread_pair(fs_idx) {
-                crate::ui_fullscreen::SpreadPair::Double { left, right } => {
-                    Some(if left == fs_idx { right } else { left })
-                }
-                _ => None,
-            };
-            // PDF raster の display-fit 結果が AI 用 native 入力と異なるなら、native
-            // 解像度へ再レンダして AI を起動する。
-            // sync_upscale_from_preset の **直後** = fs_idx の AI 設定が最新の地点で評価。
-            // 判定自体はページ個別 effective_params なので、見開き相方・連続表示の可視
-            // ページ (= ui_fullscreen が final AI をかける全ページ) にも個別に適用する。
-            {
-                let mut targets: Vec<usize> = Vec::with_capacity(2);
-                targets.push(fs_idx);
-                if let Some(other) = spread_other {
-                    targets.push(other);
+            let defer_page_turn_materialization = self
+                .fs_page_turn_decision_for_frame(ctx, fs_idx)
+                .defer_ui_uploads();
+            if !defer_page_turn_materialization {
+                let continuous_keep_set = if !self.reading_flow.is_paged()
+                    && self.fs_vertical_cache_keep_set.contains(&fs_idx)
+                {
+                    Some(self.fs_vertical_cache_keep_set.clone())
+                } else {
+                    None
+                };
+                // 見開き相方ページ (Double のとき)。reconcile と local_adjust の両方で使う。
+                let spread_other: Option<usize> = match self.resolve_spread_pair(fs_idx) {
+                    crate::ui_fullscreen::SpreadPair::Double { left, right } => {
+                        Some(if left == fs_idx { right } else { left })
+                    }
+                    _ => None,
+                };
+                // PDF raster の display-fit 結果が AI 用 native 入力と異なるなら、native
+                // 解像度へ再レンダして AI を起動する。
+                // sync_upscale_from_preset の **直後** = fs_idx の AI 設定が最新の地点で評価。
+                // 判定自体はページ個別 effective_params なので、見開き相方・連続表示の可視
+                // ページ (= ui_fullscreen が final AI をかける全ページ) にも個別に適用する。
+                {
+                    let mut targets: Vec<usize> = Vec::with_capacity(2);
+                    targets.push(fs_idx);
+                    if let Some(other) = spread_other {
+                        targets.push(other);
+                    }
+                    if let Some(keep_set) = continuous_keep_set.as_ref() {
+                        targets.extend(keep_set.iter().copied());
+                    }
+                    targets.sort_unstable();
+                    targets.dedup();
+                    for idx in targets {
+                        self.maybe_native_rerender_pdf_for_ai(idx);
+                    }
                 }
                 if let Some(keep_set) = continuous_keep_set.as_ref() {
-                    targets.extend(keep_set.iter().copied());
+                    self.evict_final_pipeline_cache_for_keep_set(keep_set);
+                } else {
+                    self.evict_final_pipeline_cache(fs_idx);
                 }
-                targets.sort_unstable();
-                targets.dedup();
-                for idx in targets {
-                    self.maybe_native_rerender_pdf_for_ai(idx);
+                if let Some(other) = spread_other {
+                    self.maybe_start_local_adjust_render(other);
                 }
+                self.maybe_start_local_adjust_render(fs_idx);
+                if let Some(keep_set) = continuous_keep_set.as_ref() {
+                    self.evict_adjustment_cache_for_keep_set(keep_set);
+                } else {
+                    self.evict_adjustment_cache(fs_idx);
+                }
+                // AI 先読み (新パイプライン v1.1.0)。現在ページの final_ai が完了 / 不要
+                // のときだけ隣接ページを起動するため、毎フレーム呼んでも spawn の競合を
+                // 起こさない (= 内部で has_uncancelled_final_ai_pending を gate に使う)。
+                // Pipeline P1 リファクタで dead code 化していた旧 `prefetch_ai_upscale` の
+                // 後継 (= ページ送り時 AI を待たされる退行を直す)。
+                self.prefetch_final_ai(ctx, fs_idx);
             }
-            if let Some(keep_set) = continuous_keep_set.as_ref() {
-                self.evict_final_pipeline_cache_for_keep_set(keep_set);
-            } else {
-                self.evict_final_pipeline_cache(fs_idx);
-            }
-            if let Some(other) = spread_other {
-                self.maybe_start_local_adjust_render(other);
-            }
-            self.maybe_start_local_adjust_render(fs_idx);
-            if let Some(keep_set) = continuous_keep_set.as_ref() {
-                self.evict_adjustment_cache_for_keep_set(keep_set);
-            } else {
-                self.evict_adjustment_cache(fs_idx);
-            }
-            // AI 先読み (新パイプライン v1.1.0)。現在ページの final_ai が完了 / 不要
-            // のときだけ隣接ページを起動するため、毎フレーム呼んでも spawn の競合を
-            // 起こさない (= 内部で has_uncancelled_final_ai_pending を gate に使う)。
-            // Pipeline P1 リファクタで dead code 化していた旧 `prefetch_ai_upscale` の
-            // 後継 (= ページ送り時 AI を待たされる退行を直す)。
-            self.prefetch_final_ai(ctx, fs_idx);
         }
         let t_fullscreen_work = frame_t0.elapsed();
 

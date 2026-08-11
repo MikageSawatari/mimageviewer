@@ -450,11 +450,24 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   規模。detached リワーク ([detached-rework-plan.md](detached-rework-plan.md)) と presenter を
   共有するので、着手時期はリワークの進捗と調整する
 
-### 1.58 ページ送り (キー押しっぱなし) が引っかかる — v2.13.0 で入れて削除した。やり直し
+### 1.58 ページ送り (キー押しっぱなし) が引っかかる — 本体修正済み、実ログ gate 待ち
 
 - 出典: 利用者メール (pattier、2026-08-07) + `--perf-log` 実測。キーリピート間隔 34ms に対し、
   1 ページの実体化に UI スレッドで upload 21ms + final_composite_build 21ms かかり、
   構造的に追いつかない。連結読みが速いのは実体化済みを見せるだけだから。
+- **2026-08-12 本体修正**: source inspection で、見開きだけ旧
+  `ColorizeDisplayUnitHoldover` が対象 unit の final 完成まで前 unit を上描きし、正しく遷移した
+  frame を隠していたと確定。見開きの physical held level 中は display-unit 原子の色忠実
+  low-resolution rendition を描き、full decode / final effect / AI と UI upload を保留する。
+  release frame で止まった unit だけを実体化する。単一ページは既存の materialized path のまま。
+- **再デコードの根因**: cache key mismatch ではなく、通過する全ページで eager decode / prefetch を
+  始めた後に `fs_cache` / `final_composite_cache` の keep window が先行ページを eviction していた。
+  見開き held 中は通過先 producer 自体を起動せず、進行中 producer だけ cancel して resident result と
+  完成済み upload backlog は保持する形へ変更した。
+- `fs/page_turn_ready` / `fs/page_turn_decision` を復活し、`idx` / `mode` / `source` /
+  `items_generation` / `reason` / `defer_ui_uploads` / `passthrough_rendition_ready` を出す。
+  `scripts/page-turn/measure-spread-rtl-roundtrip.rhai` も追加した。残作業は隔離 foreground で
+  `page-turn --check` の `checked bursts>0 / violations=0`、単一・見開き・実 ZIP の数値確認。
 - **v2.13.0 で対策 1 (通過表示 = 通り過ぎるページをカタログサムネイルで描く) を入れ、
   出荷前の実機確認で 5 回直して 5 回とも失敗したため削除した (2026-08-11)。**
   最後の状態は v2.12.0 より悪かった (カラー化した本でページごとにカラー / 白黒が入れ替わり、
@@ -478,9 +491,9 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   まま 5 回直し、毎回実機確認に依存して 1 往復 1 仮説しか試せなかった。§2.3 の
   「アプリ内蔵テストスクリプト」ができてから着手する。判定は
   `python scripts/analyze_perf.py <jsonl> page-turn --check` (実装済み) を使う。
-- 対策 2〜4 は未着手のまま残る: 再デコードの抑止 / UI スレッドの 42ms 削減 (表示解像度へ
-  縮めてからアップロード、`edit_result` upload の分散) / 最終合成の先読み。
-  **対策 1 より先に 3 を試す価値がある** (42ms が減れば通過表示自体が要らなくなる可能性)。
+- UI スレッドの 42ms 削減 (通常 materialized path の表示解像度 upload、`edit_result` upload の分散) /
+  最終合成の先読みは別の改善余地として残る。今回の見開き held path は full-size work を開始しないため、
+  §1.58 の主症状と再デコードをこの追加最適化に依存させていない。
 - 規模 / 優先度: Medium / P2。
 
 ### 1.63 Alt+N で出したままにしたナビゲータを、タッチで消せない — 利用者報告

@@ -1422,12 +1422,14 @@ delta に適用するため、ドラッグ途中の Ctrl 押下 / 解放でも�
 
 ---
 
-### 2.5 ページ送り中の表示規則 (次版でやり直すときの正本)
+### 2.5 ページ送り中の表示規則 (実装の正本)
 
-> **v2.13.0 では通過表示の実装を削除した。** `page_turn_decision_for_inputs` /
-> `FsPageTurnDecision` と専用の perf event は現行コードに存在しない。この節は次版でテスト基盤を
-> 先に作って再実装するときの正本として残す。`colorize_display_requires_final_effect` /
-> `waiting_for_colorize`、または新しいページ送り判定を変更・追加する前に、ここを読むこと。
+> **v2.13.0 では通過表示をいったん削除し、2026-08-12 に見開きだけを対象として再実装した。**
+> `page_turn_decision_for_inputs` / `FsPageTurnDecision` と `fs/page_turn_ready` /
+> `fs/page_turn_decision` は現行コードに存在する。単一ページは実測済みの 1 命令 : 1 完成画像を
+> 維持し、見開きの physical key level が held の間だけ低解像度の色忠実 rendition を使う。
+> `colorize_display_requires_final_effect` / `waiting_for_colorize`、またはページ送り判定を変更する前に、
+> この節を読むこと。
 > **この領域は繰り返し壊れており、壊れ方が毎回違う。**
 > 2026-08-11 の 1 日だけで 3 回退行した (すべて「支配している規則を読まずに判定へ条件を
 > 足した / 反転させた」もの)。
@@ -1619,23 +1621,48 @@ Target(15), Target(17), …` と単調増加で、逆行は 0 件。つまり**�
 (間隔中央値 6〜7ms)、その中で表示画像が変わったのは 22〜23 回だけ。
 つまり**描画が遅いのではなく、表示単位が更新されない**。
 
+##### 根本原因と 2026-08-12 の修正
+
+source inspection で、見開きの表示欠落は `open_fullscreen` が前の
+`ColorizeDisplayUnitHoldover` を capture し、`colorize_display_unit_holdover_for_draw` が対象見開きの
+全ページで final texture が解決するまでその旧 unit を通常描画の上へ重ね続ける経路と確定した。
+ナビゲーション先の frame は描かれていたが、旧 unit の overlay に隠されていたため、final が同時に
+揃った表示単位しか画面上で観測されなかった。
+
+再デコードは key mismatch ではない。ページ送りのたびに `open_fullscreen` が
+`ensure_fs_page_load` と `update_prefetch_window` を起動し、通過ページまで full decode / final pipeline
+へ投入していた一方、`fs_cache` / `final_composite_cache` の小さい keep window が先に通ったページを
+退避した。2 周目は正しい同じ key であっても resident entry が既に無く、もう一度 source decode へ
+入っていた。
+
+修正後は、見開きで physical key level が held の間だけ次を一体で行う。
+
+- 表示単位の全ページを、色調補正 → Creative LUT → カラー化済みの低解像度 rendition として
+  同じ frame で原子的に解決する。ready 状態は通過モードへ入る条件に使わない。
+- `open_fullscreen` は通過先の full decode / prefetch を開始せず、進行中の context-owned
+  decode / final effect / AI producer を cancel する。resident cache と完成済み upload backlog は保持する。
+- release frame は current page だけを通常の eager materialization へ戻し、その後の通常 prefetch を再開する。
+- 旧 `ColorizeDisplayUnitHoldover` は materialized path だけで描き、通過中の新 display unit を覆わない。
+
+単一ページはこの分岐に入れず、既存の全 `final_composite` 経路を維持する。実機 perf 計測は
+Windows の foreground precondition を満たす環境で §2.5.5 の gate を通して完了させる。
+
 #### 2.5.4 表示単位 (見開き / 連結)
 
-見開きでは、**表示単位に含まれるページのどれか 1 つでも代役が成立しないなら、単位全体で
-通過表示を使わない**。片側だけ完成画像にすると、左右で加工の有無が食い違う。
-サムネイルの有無も同じく単位全体で判定する。削除前は
-`fs_page_turn_display_unit_readiness` がこの役割を持っていたが、次版では壊れた実装を復元せず、
-表示単位の resolver とテストを先に定めてから新しく接続する。
+見開きでは、**表示単位全体を 1 回で解決する**。片側だけ完成画像、もう片側だけ rendition という
+組み合わせは描かない。physical key level が held なら unit 全体が通過モードであり、rendition の
+有無はそのモード自体をページごとに反転させない。全 rendition があれば両方を使い、無ければ
+既に resident な色忠実 texture が両方揃う場合だけ unit 全体で使う。いずれも無ければ未解決 unit と
+して後続 frame の差し替えを待つ。
 
 縦・横の連結読みは通過表示の対象外 (スクロールは実体化済みのページを見せるだけなので、
 キーごとの実体化コストが元から出ない)。
 
 #### 2.5.5 トレース不変条件 (機械判定)
 
-次版の実装では、上の規則が `fs.page_turn_ready` / `fs.page_turn_decision` の並びに現れるよう
-計装し、`python scripts/analyze_perf.py <jsonl> page-turn --check` で検査する。v2.13.0 は
-これらの event を出さないため、該当 event の無いログに対する `--check` は
-`checked bursts=0 violations=0`、exit 0 の no-op になる。判定器と回帰テストは次版用に残す。
+現行実装は上の規則を `fs/page_turn_ready` / `fs/page_turn_decision` の並びとして計装し、
+`python scripts/analyze_perf.py <jsonl> page-turn --check` で検査する。event が無いログを成功扱い
+しないため、本番計測では `checked bursts>0` も完了条件に含める。
 **規則を変えたらこの不変条件も同時に更新する。**
 
 | ID | 不変条件 | 対応する要件 |
@@ -1655,10 +1682,13 @@ Target(15), Target(17), …` と単調増加で、逆行は 0 件。つまり**�
 
 1. ~~サムネイル寸法での色処理コストを実測する~~ → **実測済み (§2.5.3.1)。約 2ms / 枚で、
    UI スレッド同期実行が可能。**
-2. **通過表示に色処理を適用する**。色調補正 → LUT → カラー化の順で、**UI スレッドで同期的に**。
-   これで R1 と R2 を同時に満たせる。「カラー化中」で前ページを保持する必要がなくなる。
-3. **通過中はフルサイズのアップロードとデコードを始めない**。
-4. **止まったページだけ実体化する** (R4)。
+2. ~~通過表示に色処理を適用する~~ → 色調補正 → LUT → カラー化を UI スレッドで同期実行する
+   context-local rendition cache を実装済み。
+3. ~~通過中はフルサイズのアップロードとデコードを始めない~~ → 見開きの held level では producer
+   起動と UI upload 回収を保留し、既存 producer を cancel する。
+4. ~~止まったページだけ実体化する~~ → release frame で current display unit を eager path へ戻す。
+
+残る完了条件は §2.5.5 の実ログ gate と実 ZIP の回帰計測である。
 
 ##### ボトルネックは 1 つではない (2026-08-11 実測)
 

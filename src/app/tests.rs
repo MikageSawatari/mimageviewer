@@ -24783,6 +24783,153 @@ mod pipeline_cache_refactor_tests {
     }
 
     #[test]
+    fn deferred_page_turn_open_does_not_start_decode_until_materialization() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\missing\page-turn-deferred.png");
+        app.visible_indices = vec![idx];
+        app.details_order = vec![idx];
+
+        app.open_fullscreen_with_materialization(
+            idx,
+            HistoryTrigger::UserChosen,
+            FsOpenMaterialization::DeferredPageTurn,
+        );
+
+        assert_eq!(app.fullscreen_idx, Some(idx));
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::NeedsLoad);
+        assert!(app.fs_pending.is_empty());
+
+        app.open_fullscreen_with_materialization(
+            idx,
+            HistoryTrigger::UserChosen,
+            FsOpenMaterialization::Eager,
+        );
+
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::LoadPending);
+        assert!(app.fs_pending.contains_key(&idx));
+    }
+
+    #[test]
+    fn deferring_page_turn_work_cancels_producers_but_preserves_resident_results() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let resident_idx = push_image(&mut app, r"C:\pics\resident.png");
+        let pending_idx = push_image(&mut app, r"C:\pics\pending.png");
+        let resident_pixels = Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::LIGHT_BLUE));
+        let resident_tex = ctx.load_texture(
+            "page_turn_resident",
+            (*resident_pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            resident_idx,
+            FsCacheEntry::Static {
+                tex: resident_tex,
+                pixels: Arc::clone(&resident_pixels),
+                source_dims: Some([2, 2]),
+                load_seq: 1,
+            },
+        );
+
+        let (_fs_tx, fs_rx) = std::sync::mpsc::channel();
+        let fs_cancel = Arc::new(AtomicBool::new(false));
+        let input_seq = app.input_seq;
+        app.fs_pending
+            .insert(pending_idx, (Arc::clone(&fs_cancel), fs_rx, input_seq));
+        app.fs_upload_backlog
+            .push((pending_idx, FsLoadResult::Failed, input_seq));
+
+        let ai_key = FinalAiKey {
+            edit_key: dummy_edit_key(&app, pending_idx),
+            color_ai_hash: 1,
+            bg: 0,
+        };
+        let (ai_pending, ai_cancel) = make_fake_final_ai_pending();
+        app.final_ai_pending.insert(ai_key, ai_pending);
+
+        let effect_key = FinalCompositeKey {
+            edit_key: dummy_edit_key(&app, pending_idx),
+            params_hash: 1,
+            bg: 0,
+        };
+        let effect_cancel = Arc::new(AtomicBool::new(false));
+        let (_effect_tx, effect_rx) = std::sync::mpsc::channel();
+        let items_generation = app.items_generation;
+        app.final_effect_pending.insert(
+            effect_key,
+            FinalEffectPending {
+                cancel: Arc::clone(&effect_cancel),
+                rx: effect_rx,
+                items_generation,
+                output_complete: true,
+                nearest_sampler: false,
+                prefetch: false,
+            },
+        );
+
+        app.defer_page_turn_full_resolution_work();
+
+        assert!(fs_cancel.load(Ordering::Relaxed));
+        assert!(ai_cancel.load(Ordering::Relaxed));
+        assert!(effect_cancel.load(Ordering::Relaxed));
+        assert!(app.fs_pending.is_empty());
+        assert!(app.final_ai_pending.is_empty());
+        assert!(app.final_effect_pending.is_empty());
+        assert!(app.fs_cache.contains_key(&resident_idx));
+        assert_eq!(app.fs_upload_backlog.len(), 1);
+    }
+
+    #[test]
+    fn page_turn_rendition_reuses_identity_thumbnail_and_rekeys_color_adjustment() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\page-turn-rendition.png");
+        let source = Arc::new(egui::ColorImage::filled(
+            [2, 2],
+            egui::Color32::from_rgb(64, 96, 128),
+        ));
+        let catalog = ctx.load_texture(
+            "page_turn_catalog",
+            (*source).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let catalog_id = catalog.id();
+        app.thumbnails[idx] = ThumbnailState::Loaded {
+            tex: catalog,
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 2,
+            source_dims: Some((2, 2)),
+        };
+        app.thumb_pixels.insert(idx, Arc::clone(&source));
+
+        let identity = app
+            .ensure_passthrough_rendition(&ctx, idx)
+            .expect("identity rendition");
+        assert_eq!(identity.id(), catalog_id);
+        assert_eq!(app.passthrough_rendition_cache_len_for_test(), 1);
+        assert!(Arc::ptr_eq(
+            &app.current_passthrough_rendition_pixels_for_test(idx)
+                .expect("identity pixels"),
+            &source,
+        ));
+
+        let mut adjusted_params = crate::adjustment::AdjustParams::default();
+        adjusted_params.brightness = 25.0;
+        app.adjustment_page_params.insert(idx, adjusted_params);
+        let adjusted = app
+            .ensure_passthrough_rendition(&ctx, idx)
+            .expect("adjusted rendition");
+        let adjusted_pixels = app
+            .current_passthrough_rendition_pixels_for_test(idx)
+            .expect("adjusted pixels");
+
+        assert_ne!(adjusted.id(), catalog_id);
+        assert_ne!(*adjusted_pixels, *source);
+        assert_eq!(app.passthrough_rendition_cache_len_for_test(), 2);
+    }
+
+    #[test]
     fn paged_prefetch_starts_current_needs_load_after_cancelling_siblings() {
         let mut app = setup_app();
         let current = push_image(&mut app, r"C:\missing\current.png");

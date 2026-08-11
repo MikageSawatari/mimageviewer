@@ -26,7 +26,7 @@ use crate::adjustment::PostFilter;
 use crate::ai::ModelKind;
 use crate::app::{
     App, ColorizeDisplayUnitHoldover, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover,
-    ViewerPresentation,
+    FsOpenMaterialization, FsPageLoadState, ViewerPresentation,
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
@@ -4089,7 +4089,7 @@ impl App {
         })
     }
 
-    fn clear_colorize_display_unit_holdover(&mut self) {
+    pub(crate) fn clear_colorize_display_unit_holdover(&mut self) {
         if matches!(
             self.fs_holdover_tex,
             Some(FsHoldover::ColorizeDisplayUnit(_))
@@ -6443,6 +6443,7 @@ fn spread_shift_anchor_pos_for_target(target_pos: usize, landscape_flags: &[bool
 struct FsFrameState {
     is_video: bool,
     original_preview_active: bool,
+    page_turn_decision: FsPageTurnDecision,
     tex: Option<egui::TextureHandle>,
     thumb_tex: Option<egui::TextureHandle>,
     /// 上部ホバーバー左側に表示するパス文字列。
@@ -6462,6 +6463,92 @@ struct FsFrameState {
     fs_load_failed: bool,
     /// PDF ページのコンテンツ種別 (非 PDF なら None)
     pdf_content_type: Option<PdfPageContentType>,
+}
+
+/// Per-frame page-turn choices. The paint source and UI-work admission are
+/// deliberately separate axes; rendition readiness is diagnostic/unit-resolver input only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FsPageTurnPaintSource {
+    Materialized,
+    PassThrough,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FsPageTurnDecision {
+    paint_source: FsPageTurnPaintSource,
+    defer_ui_uploads: bool,
+    passthrough_rendition_ready: bool,
+}
+
+const FS_PAGE_TURN_COALESCE_ACTIONS: [KeyAction; 6] = [
+    KeyAction::FsPagePrev,
+    KeyAction::FsPageNext,
+    KeyAction::FsSpreadShiftLeft,
+    KeyAction::FsSpreadShiftRight,
+    KeyAction::FsSpreadShiftPrev,
+    KeyAction::FsSpreadShiftNext,
+];
+
+const FS_FIXED_PAGE_TURN_CHORDS: [Chord; 4] = [
+    Chord::key(KeyName::Left),
+    Chord::key(KeyName::Right),
+    Chord::key(KeyName::Up),
+    Chord::key(KeyName::Down),
+];
+
+impl FsPageTurnDecision {
+    const fn normal() -> Self {
+        Self {
+            paint_source: FsPageTurnPaintSource::Materialized,
+            defer_ui_uploads: false,
+            passthrough_rendition_ready: false,
+        }
+    }
+
+    const fn paint_source(self) -> FsPageTurnPaintSource {
+        self.paint_source
+    }
+
+    pub(crate) const fn defer_ui_uploads(self) -> bool {
+        self.defer_ui_uploads
+    }
+
+    const fn perf_label(self) -> &'static str {
+        match self.paint_source {
+            FsPageTurnPaintSource::Materialized => "materialized",
+            FsPageTurnPaintSource::PassThrough => "pass_through",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FsPageTurnFrameDecision {
+    frame_nr: u64,
+    items_generation: u64,
+    idx: usize,
+    decision: FsPageTurnDecision,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FsPageTurnReadySignature {
+    items_generation: u64,
+    mode: &'static str,
+    pages: Vec<(usize, egui::TextureId, &'static str)>,
+}
+
+fn page_turn_decision_for_inputs(
+    page_turn_input_held: bool,
+    passthrough_rendition_ready: bool,
+) -> FsPageTurnDecision {
+    FsPageTurnDecision {
+        paint_source: if page_turn_input_held {
+            FsPageTurnPaintSource::PassThrough
+        } else {
+            FsPageTurnPaintSource::Materialized
+        },
+        defer_ui_uploads: page_turn_input_held,
+        passthrough_rendition_ready,
+    }
 }
 
 #[derive(Clone)]
@@ -10543,6 +10630,21 @@ impl App {
 
         self.harvest_page_dims_from_fs_cache();
 
+        let page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
+        if !page_turn_decision.defer_ui_uploads()
+            && self.items.get(fs_idx).is_some_and(GridItem::has_page_data)
+        {
+            // A pass-through open intentionally did not start the full-resolution
+            // producer. The first physical-level release frame materializes only
+            // the page on which navigation stopped.
+            let stop_page_needs_load =
+                matches!(self.fs_page_load_state(fs_idx), FsPageLoadState::NeedsLoad);
+            self.ensure_fs_page_load(fs_idx);
+            if stop_page_needs_load && self.reading_flow.is_paged() {
+                self.update_prefetch_window(fs_idx);
+            }
+        }
+
         // ── pending の PDF 再レンダリング結果を取り込む ──
         // show_viewport_immediate 内では &mut self が使えるので、
         // メインの update() を待たずにここで直接 poll する。
@@ -10589,7 +10691,9 @@ impl App {
         if let SpreadPair::Double { left, right } = spread_pair {
             let partner = if left == fs_idx { right } else { left };
             self.advance_animation(ctx, partner);
-            self.ensure_fs_page_load(partner);
+            if !page_turn_decision.defer_ui_uploads() {
+                self.ensure_fs_page_load(partner);
+            }
         }
         // in-window モード中は静止画を専用 viewport ではなくメインウィンドウの
         // egui ctx に直接描画する (embedded)。本関数冒頭で動画は early-return
@@ -10610,7 +10714,7 @@ impl App {
             self.fullscreen_viewport_id()
         };
         self.sync_conceal_preview_before_pipeline(ctx, preview_viewport_id);
-        let state = self.prepare_fullscreen_state(ctx, fs_idx);
+        let state = self.prepare_fullscreen_state(ctx, fs_idx, page_turn_decision);
 
         let mut close_fs = false;
         let mut close_to_page_list = false;
@@ -11114,17 +11218,20 @@ impl App {
                             })
                             .and_then(|idx| self.pdf_content_bbox_for_display_idx(idx));
 
-                        if current_is_pdf {
+                        if current_is_pdf && !state.page_turn_decision.defer_ui_uploads() {
                             self.ensure_fs_page_load(fs_idx);
                             self.ensure_pdf_display_resolution(fs_idx, pdf_current_bbox);
                         }
-                        if let Some(partner) = pdf_partner {
+                        if !state.page_turn_decision.defer_ui_uploads()
+                            && let Some(partner) = pdf_partner
+                        {
                             if matches!(self.items.get(partner), Some(GridItem::PdfPage { .. })) {
                                 self.ensure_fs_page_load(partner);
                                 self.ensure_pdf_display_resolution(partner, pdf_partner_bbox);
                             }
                         }
-                        if pdf_target_changed
+                        if !state.page_turn_decision.defer_ui_uploads()
+                            && pdf_target_changed
                             && (current_is_pdf || partner_is_pdf)
                             && self.reading_flow.is_paged()
                         {
@@ -11326,7 +11433,7 @@ impl App {
                         let mut navigator_texture_sources = if spread_pair == SpreadPair::Single {
                             FsNavigatorTextureSources::single(
                                 fs_idx,
-                                state.tex.clone().map(|texture| {
+                                state.tex.clone().or_else(|| state.thumb_tex.clone()).map(|texture| {
                                     self.fullscreen_paint_resource_for_texture(fs_idx, texture)
                                 }),
                             )
@@ -11536,6 +11643,7 @@ impl App {
                                         left,
                                         right,
                                         state.original_preview_active,
+                                        state.page_turn_decision,
                                         None,
                                     );
                                 }
@@ -11718,6 +11826,10 @@ impl App {
                         // 黒背景ごと重ねる。見開きは新しい左右が両方揃ったフレームだけ
                         // typed state を解放するため、新旧ページの混在も片側の黒も出ない。
                         if primary_draw.draws_ordinary()
+                            && matches!(
+                                state.page_turn_decision.paint_source(),
+                                FsPageTurnPaintSource::Materialized
+                            )
                             && let Some(unit) = self.colorize_display_unit_holdover_for_draw(
                                 fs_idx,
                                 spread_pair,
@@ -11762,6 +11874,14 @@ impl App {
                             );
                             navigator_texture_sources.replace_with_display_unit(&unit);
                         }
+
+                        self.emit_fs_page_turn_ready_for_display_unit(
+                            ctx,
+                            fs_idx,
+                            spread_pair,
+                            state.page_turn_decision,
+                            &navigator_texture_sources,
+                        );
 
                         // Keep the fixed overview above transient display-unit holdovers. The
                         // navigator uses the same display unit and stays absent until that unit has
@@ -12730,13 +12850,346 @@ impl App {
         }
     }
 
+    #[cfg(windows)]
+    fn fs_page_turn_ordinary_context_blocker(
+        &self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> Option<&'static str> {
+        if !self.reading_flow.is_paged() {
+            Some("reading_flow_not_paged")
+        } else if !self.spread_mode.is_spread() {
+            // Single-page already paints every command as final_composite at the
+            // repeat rate. Keep that established path unchanged; the measured R1
+            // failure and the display-unit holdover are spread-specific.
+            Some("single_page_materialized")
+        } else if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
+            Some("item_not_page_data")
+        } else if self.any_modal_dialog_open_for_fullscreen_keys() {
+            Some("modal_dialog")
+        } else if self.fs_context_menu_idx.is_some() {
+            Some("context_menu")
+        } else if self.capture_region_selection.is_some() {
+            Some("capture_region")
+        } else if self.is_overlay_edit_mode_active() {
+            Some("overlay_edit_mode")
+        } else if self.analysis_mode {
+            Some("analysis_mode")
+        } else if self.view_trim_mode {
+            Some("view_trim_mode")
+        } else if self.fs_zoom_mode_engaged() {
+            Some("zoom_mode")
+        } else if !matches!(self.compare_view_mode, crate::app::CompareViewMode::Off) {
+            Some("compare_mode")
+        } else if self.is_panorama_mode_active(fs_idx) {
+            Some("panorama_mode")
+        } else if self.original_preview_active(ctx, fs_idx) {
+            Some("original_preview")
+        } else {
+            None
+        }
+    }
+
+    #[cfg(windows)]
+    fn fs_page_turn_chord_is_unambiguous(&self, chord: Chord) -> bool {
+        !KeyAction::all().iter().copied().any(|action| {
+            FS_IMAGE_ACTIVE_SCOPES.contains(&action.context())
+                && action.trigger() == KeyTrigger::Press
+                && !FS_PAGE_TURN_COALESCE_ACTIONS.contains(&action)
+                && !(matches!(
+                    action,
+                    KeyAction::FsStackJumpPrev | KeyAction::FsStackJumpNext
+                ) && !self.stack_showing_flat)
+                && self.keymap.effective_chords(action).contains(&chord)
+        })
+    }
+
+    /// Resolve the physical page-turn level for the owning viewport. This reads
+    /// current OS/synthetic level only: repeat edges, elapsed time and prior frames
+    /// do not participate.
+    #[cfg(windows)]
+    fn fs_page_turn_input_held(
+        &self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> (bool, Option<&'static str>, egui::ViewportId) {
+        let viewport = if self.fullscreen_embedded_still_active() {
+            ctx.viewport_id()
+        } else {
+            self.fullscreen_viewport_id()
+        };
+        let blocker = self.fs_page_turn_ordinary_context_blocker(ctx, fs_idx);
+        if blocker.is_some() {
+            return (false, blocker, viewport);
+        }
+        let configurable = FS_PAGE_TURN_COALESCE_ACTIONS.into_iter().any(|action| {
+            self.keymap
+                .effective_chords(action)
+                .into_iter()
+                .any(|chord| {
+                    self.keymap.key_held_chord_via_os(viewport, chord)
+                        && self.fs_page_turn_chord_is_unambiguous(chord)
+                })
+        });
+        let fixed = FS_FIXED_PAGE_TURN_CHORDS
+            .into_iter()
+            .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Up)))
+            .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Down)))
+            .any(|chord| {
+                self.keymap.key_held_chord_via_os(viewport, chord)
+                    && self.fs_page_turn_chord_is_unambiguous(chord)
+            });
+        (configurable || fixed, None, viewport)
+    }
+
+    fn fs_page_turn_passthrough_renditions_ready(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> bool {
+        let pages = self.fs_display_unit_page_indices(fs_idx);
+        !pages.is_empty()
+            && pages
+                .into_iter()
+                .all(|idx| self.ensure_passthrough_rendition(ctx, idx).is_some())
+    }
+
+    fn emit_fs_page_turn_decision_probe(
+        &mut self,
+        frame_nr: u64,
+        fs_idx: usize,
+        ordinary_blocker: Option<&'static str>,
+        page_turn_input_held: bool,
+        decision: FsPageTurnDecision,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let reason = if let Some(blocker) = ordinary_blocker {
+            blocker
+        } else if !page_turn_input_held {
+            "pending_zero"
+        } else if !decision.passthrough_rendition_ready {
+            "passthrough_rendition_unavailable"
+        } else {
+            "pass_through"
+        };
+        for idx in self.fs_display_unit_page_indices(fs_idx) {
+            crate::perf::event(
+                "fs",
+                "page_turn_decision",
+                self.perf_item_key(idx).as_deref(),
+                self.input_seq,
+                &[
+                    ("n", serde_json::Value::from(self.frame_counter)),
+                    ("frame_nr", serde_json::Value::from(frame_nr)),
+                    ("idx", serde_json::Value::from(idx)),
+                    (
+                        "items_generation",
+                        serde_json::Value::from(self.items_generation),
+                    ),
+                    ("mode", serde_json::Value::from(decision.perf_label())),
+                    ("reason", serde_json::Value::from(reason)),
+                    (
+                        "defer_ui_uploads",
+                        serde_json::Value::from(decision.defer_ui_uploads()),
+                    ),
+                    (
+                        "passthrough_rendition_ready",
+                        serde_json::Value::from(decision.passthrough_rendition_ready),
+                    ),
+                ],
+            );
+        }
+    }
+
+    /// Decide paint source and heavy-work admission from the current physical level.
+    /// A frame-local cache keeps egui replay passes deterministic without carrying
+    /// navigation mode across frames.
+    pub(crate) fn fs_page_turn_decision_for_frame(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> FsPageTurnDecision {
+        #[cfg(not(windows))]
+        {
+            let _ = (ctx, fs_idx);
+            FsPageTurnDecision::normal()
+        }
+
+        #[cfg(windows)]
+        {
+            let (page_turn_input_held, ordinary_blocker, viewport) =
+                self.fs_page_turn_input_held(ctx, fs_idx);
+            let frame_nr = ctx.cumulative_frame_nr();
+            let cache_id = egui::Id::new(("fs_page_turn_decision", viewport));
+            if let Some(cached) = ctx
+                .data(|data| data.get_temp::<FsPageTurnFrameDecision>(cache_id))
+                .filter(|cached| {
+                    cached.frame_nr == frame_nr
+                        && cached.items_generation == self.items_generation
+                        && cached.idx == fs_idx
+                })
+            {
+                return cached.decision;
+            }
+            let passthrough_rendition_ready =
+                page_turn_input_held && self.fs_page_turn_passthrough_renditions_ready(ctx, fs_idx);
+            let decision =
+                page_turn_decision_for_inputs(page_turn_input_held, passthrough_rendition_ready);
+            self.emit_fs_page_turn_decision_probe(
+                frame_nr,
+                fs_idx,
+                ordinary_blocker,
+                page_turn_input_held,
+                decision,
+            );
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    cache_id,
+                    FsPageTurnFrameDecision {
+                        frame_nr,
+                        items_generation: self.items_generation,
+                        idx: fs_idx,
+                        decision,
+                    },
+                );
+            });
+            decision
+        }
+    }
+
+    /// Emit readiness only after the final visible display-unit source has been
+    /// selected (including holdovers). Spread pages are accepted only as a complete
+    /// unit, so the trace cannot report a half-painted pair as ready.
+    fn emit_fs_page_turn_ready_for_display_unit(
+        &self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        spread_pair: SpreadPair,
+        decision: FsPageTurnDecision,
+        sources: &FsNavigatorTextureSources,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let mut expected = match spread_pair {
+            SpreadPair::Single => vec![fs_idx],
+            SpreadPair::Double { left, right } => vec![left, right],
+        };
+        expected.sort_unstable();
+        let pages = expected
+            .iter()
+            .filter_map(|idx| {
+                sources
+                    .pages
+                    .iter()
+                    .find(|(page_idx, _)| page_idx == idx)
+                    .map(|(_, resource)| (*idx, resource.source_texture()))
+            })
+            .collect::<Vec<_>>();
+        if pages.len() != expected.len() {
+            return;
+        }
+
+        let trace_pages = pages
+            .iter()
+            .map(|(idx, texture)| {
+                let source = if self.is_passthrough_rendition_texture(texture) {
+                    "thumbnail"
+                } else {
+                    self.fs_texture_source_for_trace(*idx, texture)
+                };
+                (*idx, *texture, source)
+            })
+            .collect::<Vec<_>>();
+        if matches!(decision.paint_source(), FsPageTurnPaintSource::Materialized)
+            && trace_pages
+                .iter()
+                .any(|(_, _, source)| *source == "thumbnail")
+        {
+            // A normal decode-wait thumbnail is not the materialized stop page.
+            return;
+        }
+        let signature = FsPageTurnReadySignature {
+            items_generation: self.items_generation,
+            mode: decision.perf_label(),
+            pages: trace_pages
+                .iter()
+                .map(|(idx, texture, source)| (*idx, texture.id(), *source))
+                .collect(),
+        };
+        let cache_id = egui::Id::new(("fs_page_turn_ready", self.fullscreen_viewport_id()));
+        if ctx
+            .data(|data| data.get_temp::<FsPageTurnReadySignature>(cache_id))
+            .as_ref()
+            == Some(&signature)
+        {
+            return;
+        }
+        ctx.data_mut(|data| data.insert_temp(cache_id, signature));
+
+        let viewport = if self.fullscreen_embedded_still_active() {
+            ctx.viewport_id()
+        } else {
+            self.fullscreen_viewport_id()
+        };
+        let script_hold_id = crate::key_input::synthetic_frame_hold_id(ctx, viewport);
+
+        for (idx, texture, source) in trace_pages {
+            let mut attrs = vec![
+                ("idx", serde_json::Value::from(idx)),
+                (
+                    "items_generation",
+                    serde_json::Value::from(self.items_generation),
+                ),
+                ("mode", serde_json::Value::from(decision.perf_label())),
+                ("source", serde_json::Value::from(source)),
+                (
+                    "texture_id",
+                    serde_json::Value::from(format!("{:?}", texture.id())),
+                ),
+            ];
+            if let Some(hold_id) = script_hold_id {
+                attrs.push(("script_hold_id", serde_json::Value::from(hold_id)));
+            }
+            crate::perf::event(
+                "fs",
+                "page_turn_ready",
+                self.perf_item_key(idx).as_deref(),
+                self.input_seq,
+                &attrs,
+            );
+        }
+    }
+
     /// フルスクリーン描画に必要な状態を事前計算する。
-    fn prepare_fullscreen_state(&mut self, ctx: &egui::Context, fs_idx: usize) -> FsFrameState {
+    fn prepare_fullscreen_state(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        page_turn_decision: FsPageTurnDecision,
+    ) -> FsFrameState {
         let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         let original_preview_active = self.original_preview_active(ctx, fs_idx);
 
-        let tex = self.resolve_fs_processed_texture(ctx, fs_idx, original_preview_active);
-        if crate::perf::is_enabled()
+        let pass_through = matches!(
+            page_turn_decision.paint_source(),
+            FsPageTurnPaintSource::PassThrough
+        );
+        let tex = if pass_through {
+            if page_turn_decision.passthrough_rendition_ready {
+                None
+            } else {
+                // Rendition absence does not leave pass-through mode or admit new work.
+                // A resident faithful texture is cheap to paint and is the unit fallback.
+                self.resolve_fs_display_tex(fs_idx, true)
+            }
+        } else {
+            self.resolve_fs_processed_texture(ctx, fs_idx, original_preview_active)
+        };
+        if !pass_through
+            && crate::perf::is_enabled()
             && tex.is_none()
             && matches!(self.fs_painted_last, Some((painted_idx, _, _)) if painted_idx == fs_idx)
         {
@@ -12771,10 +13224,13 @@ impl App {
 
         let fs_load_failed = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Failed));
 
-        let waiting_for_colorize = !original_preview_active
+        let waiting_for_colorize = !pass_through
+            && !original_preview_active
             && tex.is_none()
             && self.colorize_display_requires_final_effect(fs_idx);
-        let thumb_tex = if waiting_for_colorize {
+        let thumb_tex = if pass_through && page_turn_decision.passthrough_rendition_ready {
+            self.ensure_passthrough_rendition(ctx, fs_idx)
+        } else if waiting_for_colorize {
             // 生サムネイルは白黒なので使わない。paged の ColorizeDisplayUnit と
             // folder-nav holdover はページ別 fallback にせず後段の overlay で描く。
             None
@@ -12881,6 +13337,7 @@ impl App {
         FsFrameState {
             is_video,
             original_preview_active,
+            page_turn_decision,
             tex,
             thumb_tex,
             location_display,
@@ -19070,6 +19527,20 @@ impl App {
             return;
         }
 
+        let target_is_still_page = self.items.get(idx).is_some_and(GridItem::has_page_data);
+        let materialization = if target_is_still_page
+            && self.fullscreen_idx.is_some_and(|current_idx| {
+                self.fs_page_turn_decision_for_frame(ctx, current_idx)
+                    .defer_ui_uploads()
+            }) {
+            FsOpenMaterialization::DeferredPageTurn
+        } else {
+            FsOpenMaterialization::Eager
+        };
+        if matches!(materialization, FsOpenMaterialization::DeferredPageTurn) {
+            self.defer_page_turn_full_resolution_work();
+        }
+
         self.sync_main_selection_from_viewer_idx(idx);
 
         // 7e: VST ホスト表示中に file-nav したら、まず VST ホストを畳んでクリーンな音声モード
@@ -19141,7 +19612,7 @@ impl App {
                 "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
             );
         }
-        self.open_fullscreen(idx, history_trigger);
+        self.open_fullscreen_with_materialization(idx, history_trigger, materialization);
         // `open_fullscreen` resets cursor idleness for a new fullscreen entry.
         // Fullscreen-internal navigation should keep the mouse cursor state continuous;
         // keyboard page turns must not revive a hidden cursor, while pointer navigation
@@ -23668,6 +24139,7 @@ impl App {
                     left.idx,
                     right.idx,
                     false,
+                    FsPageTurnDecision::normal(),
                     Some((left, right)),
                 );
             }
@@ -23685,6 +24157,7 @@ impl App {
         left_idx: usize,
         right_idx: usize,
         original_preview_active: bool,
+        page_turn_decision: FsPageTurnDecision,
         display_override: Option<(&FsDisplayUnitHoldoverPage, &FsDisplayUnitHoldoverPage)>,
     ) -> FsNavigatorTextureSources {
         self.fullscreen_page_layout.clear();
@@ -23735,8 +24208,26 @@ impl App {
                 self.location_display_for_loading(right_idx),
             )
         };
-        let (left_display_tex, right_display_tex) = match display_override {
+        let pass_through = display_override.is_none()
+            && matches!(
+                page_turn_decision.paint_source(),
+                FsPageTurnPaintSource::PassThrough
+            );
+        let thumbnail_paint = pass_through && page_turn_decision.passthrough_rendition_ready;
+        let (mut left_display_tex, mut right_display_tex) = match display_override {
             Some((left, right)) => (Some(left.texture.clone()), Some(right.texture.clone())),
+            None if thumbnail_paint => (
+                self.ensure_passthrough_rendition(ctx, left_idx)
+                    .map(crate::gpu_lanczos::FullscreenPaintResource::direct),
+                self.ensure_passthrough_rendition(ctx, right_idx)
+                    .map(crate::gpu_lanczos::FullscreenPaintResource::direct),
+            ),
+            None if pass_through => (
+                self.resolve_fs_display_tex(left_idx, true)
+                    .map(|texture| self.fullscreen_paint_resource_for_texture(left_idx, texture)),
+                self.resolve_fs_display_tex(right_idx, true)
+                    .map(|texture| self.fullscreen_paint_resource_for_texture(right_idx, texture)),
+            ),
             None => (
                 self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active)
                     .map(|texture| self.fullscreen_paint_resource_for_texture(left_idx, texture)),
@@ -23744,6 +24235,12 @@ impl App {
                     .map(|texture| self.fullscreen_paint_resource_for_texture(right_idx, texture)),
             ),
         };
+        if pass_through && (left_display_tex.is_none() || right_display_tex.is_none()) {
+            // The visible unit is atomic. Never expose one faithful side beside one
+            // missing/raw side merely because their cache readiness differs.
+            left_display_tex = None;
+            right_display_tex = None;
+        }
         // 透過背景スタイル (bg_style はテクスチャ借用を含むため左右描画の前後で寿命に注意)
         // fs_bg_style は &mut self を要求するため先に解決してから以降は shared borrow に切り替える。
         // 透過画像が見開きの片方だけの場合もあるので両ページに同じ bg を適用する。
@@ -23795,9 +24292,15 @@ impl App {
             ui.painter().clone()
         };
         let left_allow_thumbnail = display_override.is_none()
-            && (original_preview_active || !self.colorize_display_requires_final_effect(left_idx));
+            && (thumbnail_paint
+                || (!pass_through
+                    && (original_preview_active
+                        || !self.colorize_display_requires_final_effect(left_idx))));
         let right_allow_thumbnail = display_override.is_none()
-            && (original_preview_active || !self.colorize_display_requires_final_effect(right_idx));
+            && (thumbnail_paint
+                || (!pass_through
+                    && (original_preview_active
+                        || !self.colorize_display_requires_final_effect(right_idx))));
         let (left_source_size, right_source_size) = match display_override {
             Some((left, right)) => (left.source_size, right.source_size),
             None => (
@@ -29839,6 +30342,69 @@ mod tests {
     }
 
     #[test]
+    fn page_turn_held_level_selects_pass_through_even_without_a_thumbnail_rendition() {
+        let decision = page_turn_decision_for_inputs(true, false);
+
+        assert_eq!(decision.paint_source(), FsPageTurnPaintSource::PassThrough);
+        assert!(decision.defer_ui_uploads());
+        assert!(!decision.passthrough_rendition_ready);
+    }
+
+    #[test]
+    fn page_turn_decision_keeps_paint_and_ui_work_as_independent_axes() {
+        let cases = [
+            (true, true, FsPageTurnPaintSource::PassThrough, true),
+            (true, false, FsPageTurnPaintSource::PassThrough, true),
+            (false, true, FsPageTurnPaintSource::Materialized, false),
+            (false, false, FsPageTurnPaintSource::Materialized, false),
+        ];
+
+        for (held, ready, expected_source, expected_defer) in cases {
+            let decision = page_turn_decision_for_inputs(held, ready);
+            assert_eq!(decision.paint_source(), expected_source);
+            assert_eq!(decision.defer_ui_uploads(), expected_defer);
+            assert_eq!(decision.passthrough_rendition_ready, ready);
+        }
+    }
+
+    #[test]
+    fn page_turn_release_materializes_on_the_next_frame_without_hysteresis() {
+        let held = page_turn_decision_for_inputs(true, true);
+        let released = page_turn_decision_for_inputs(false, true);
+
+        assert_eq!(held.paint_source(), FsPageTurnPaintSource::PassThrough);
+        assert!(held.defer_ui_uploads());
+        assert_eq!(
+            released,
+            FsPageTurnDecision {
+                paint_source: FsPageTurnPaintSource::Materialized,
+                defer_ui_uploads: false,
+                passthrough_rendition_ready: true,
+            }
+        );
+    }
+
+    #[test]
+    fn page_turn_pass_through_is_spread_scoped_without_page_cache_gates() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items
+            .push(GridItem::Image(PathBuf::from("c:/test/page-turn.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+        app.reading_flow = ReadingFlow::Paged;
+        app.spread_mode = SpreadMode::Single;
+
+        assert_eq!(
+            app.fs_page_turn_ordinary_context_blocker(&ctx, 0),
+            Some("single_page_materialized")
+        );
+
+        app.spread_mode = SpreadMode::Rtl;
+        assert_eq!(app.fs_page_turn_ordinary_context_blocker(&ctx, 0), None);
+    }
+
+    #[test]
     fn navigator_hold_requests_visibility_when_fixed_setting_is_off() {
         assert!(fs_navigator_visibility_requested(false, true, true, false));
     }
@@ -30490,6 +31056,7 @@ mod tests {
         let state = FsFrameState {
             is_video: false,
             original_preview_active: false,
+            page_turn_decision: FsPageTurnDecision::normal(),
             tex: None,
             thumb_tex: None,
             location_display: String::new(),
@@ -31586,6 +32153,7 @@ mod tests {
         let state = FsFrameState {
             is_video: false,
             original_preview_active: false,
+            page_turn_decision: FsPageTurnDecision::normal(),
             tex: None,
             thumb_tex: None,
             location_display: String::new(),
@@ -32993,6 +33561,7 @@ mod tests {
         let state = FsFrameState {
             is_video: false,
             original_preview_active: false,
+            page_turn_decision: FsPageTurnDecision::normal(),
             tex: None,
             thumb_tex: None,
             location_display: String::new(),

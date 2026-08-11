@@ -409,8 +409,9 @@ compositor 側の健全性を疑う。`run-native-return` に戻らないなら 
 
 ## 13. §2.3 自体の完了条件
 
-`fs/page_turn_ready` / `page_turn_decision` は現行コードに無いので、**この基盤だけでは
-`--check` は `checked bursts=0` の no-op**。§1.58 を待たずに基盤の正しさを証明する必要がある。
+§2.3 統合時点では `fs/page_turn_ready` / `fs/page_turn_decision` が無く、`--check` は
+`checked bursts=0` の no-op だった。2026-08-12 の §1.58 本体修正で両 event を復活し、現在は
+実ページ送り burst の I1〜I5 を検査できる。
 
 self-test (`scripts/page-turn/selftest.rhai`) が次を示すこと:
 
@@ -476,11 +477,13 @@ python scripts/analyze_perf.py <perf-log> test-script-input --check
 python scripts/analyze_perf.py <perf-log> page-turn --check
 ```
 
-後者は §1.58 の `fs/page_turn_ready` / `page_turn_decision` が戻るまでは burst 0 で失敗する。
-これは no-op を成功にしないための意図した状態で、§1.58 再実装後の不変条件ゲートとなる。
+後者は `fs/page_turn_ready` / `fs/page_turn_decision` を読む。`checked bursts=0` は no-op として
+未完了扱いにし、本番計測では `checked bursts>0 / violations=0` を要求する。
 
-上記 self-test が実ログで通ったため、**§1.58 の着手条件は満たされた**。§1.58 再実装時は
-`fs/page_turn_ready` / `page_turn_decision` を戻したうえで、§13.2 の本番計測も通す。
+上記 self-test が実ログで通ったため、**§1.58 の着手条件は満たされた**。§1.58 は両 event と
+display-unit 原子の見開き通過表示を実装済み。単一ページは `scripts/page-turn/measure.rhai`、
+RTL 見開きの往復は `scripts/page-turn/measure-spread-rtl-roundtrip.rhai` を使う。残る完了条件は
+§13.2 の隔離 foreground 本番計測である。
 
 ## 14. 後続 (この基盤ができてから)
 
