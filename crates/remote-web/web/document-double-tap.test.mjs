@@ -34,6 +34,12 @@ class FakeEventTarget {
 }
 
 const plainTarget = { closest: () => null };
+const buttonTarget = {
+  closest: (selector) => selector === "button" ? { tagName: "BUTTON" } : null,
+};
+const linkTarget = {
+  closest: (selector) => selector === "a[href]" ? { tagName: "A" } : null,
+};
 const textInputTarget = {
   closest: (selector) => selector.startsWith("input:not")
     ? { tagName: "INPUT" }
@@ -85,9 +91,9 @@ test("the browser rule keeps every tap as a candidate and uses its own slop", ()
   assert.equal(late.zooms, false);
 });
 
-test("a suppressed pair does not consume its second tap", () => {
-  // 実機で、抑止した対の直後のタップが前のタップと組になって拡大した。ブラウザは
-  // こちらの「対を消費する」規則を知らないので、常に直前のタップと比べる。
+test("a recognized pair does not consume its second tap", () => {
+  // 実機では成立した対の直後のタップも前のタップと組になるため、観測側も常に
+  // 直前のタップと比べる。
   const first = browserDoubleTapZoomDecision(null, { x: 50, y: 50, atMs: 1_000 });
   const second = browserDoubleTapZoomDecision(first.next, { x: 52, y: 51, atMs: 1_150 });
   assert.equal(second.zooms, true);
@@ -97,7 +103,7 @@ test("a suppressed pair does not consume its second tap", () => {
   assert.equal(third.zooms, true, "the third tap still pairs with the second");
 });
 
-test("document owner preserves the first touchend and prevents only the matching second tap", () => {
+test("document observer preserves every touchend and reports recognized pairs", () => {
   const eventTarget = new FakeEventTarget();
   let nowMs = 1_000;
   let prevented = 0;
@@ -123,14 +129,14 @@ test("document owner preserves the first touchend and prevents only the matching
 
   nowMs = 1_220;
   dispatchTap(eventTarget, touch(2, 44, 84), () => { prevented += 1; });
-  assert.equal(prevented, 1);
+  assert.equal(prevented, 0, "a recognized pair must keep its synthetic click");
   assert.deepEqual(decisions.at(-1), {
-    decision: "pair_suppressed",
+    decision: "pair_recognized",
     atMs: 1_220,
     elapsedMs: 220,
     distancePx: Math.hypot(4, 4),
     isDoubleTap: true,
-    suppressed: true,
+    suppressed: false,
     excluded: false,
     exclusionReason: null,
     cancelable: true,
@@ -141,7 +147,7 @@ test("document owner preserves the first touchend and prevents only the matching
   dispatchTap(eventTarget, touch(3, 40, 80), () => { prevented += 1; });
   nowMs += BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS + 60;
   dispatchTap(eventTarget, touch(4, 40, 80), () => { prevented += 1; });
-  assert.equal(prevented, 1, "non-matching touchends must keep their defaults");
+  assert.equal(prevented, 0, "non-matching touchends must keep their defaults");
 
   nowMs = 3_000;
   eventTarget.dispatch("touchstart", touchEvent({ touches: [touch(5, 40, 80)] }));
@@ -149,9 +155,11 @@ test("document owner preserves the first touchend and prevents only the matching
     changedTouches: [touch(5, 140, 80)],
     preventDefault: () => { prevented += 1; },
   }));
+  assert.equal(decisions.at(-1).decision, "travel_exceeded");
   nowMs = 3_100;
   dispatchTap(eventTarget, touch(6, 142, 80), () => { prevented += 1; });
-  assert.equal(prevented, 1, "a moved gesture must not seed a double-tap pair");
+  assert.equal(prevented, 0, "a moved gesture must keep its default and not seed a pair");
+  assert.equal(decisions.at(-1).decision, "candidate_started");
 
   nowMs = 4_000;
   dispatchTap(eventTarget, touch(7, 70, 90), () => { prevented += 1; });
@@ -163,15 +171,15 @@ test("document owner preserves the first touchend and prevents only the matching
     cancelable: false,
     preventDefault: () => { prevented += 1; },
   }));
-  assert.equal(prevented, 1);
-  assert.equal(decisions.at(-1).decision, "pair_not_cancelable");
+  assert.equal(prevented, 0);
+  assert.equal(decisions.at(-1).decision, "pair_recognized");
   assert.equal(decisions.at(-1).isDoubleTap, true);
   assert.equal(decisions.at(-1).suppressed, false);
   assert.equal(decisions.at(-1).cancelable, false);
   owner.destroy();
 });
 
-test("document owner leaves pinch and text editing defaults untouched", () => {
+test("document observer leaves multi-touch out of the pair sequence", () => {
   const eventTarget = new FakeEventTarget();
   let nowMs = 1_000;
   let prevented = 0;
@@ -195,6 +203,7 @@ test("document owner leaves pinch and text editing defaults untouched", () => {
     preventDefault: () => { prevented += 1; },
   }));
   assert.equal(prevented, 0, "multi-touch endings must never suppress browser pinch");
+  assert.equal(decisions.length, 0, "multi-touch must not enter double-tap observations");
 
   nowMs = 2_000;
   dispatchTap(
@@ -211,86 +220,99 @@ test("document owner leaves pinch and text editing defaults untouched", () => {
     textInputTarget
   );
   assert.equal(prevented, 0, "text inputs keep selection and caret defaults");
-  assert.equal(decisions.at(-1).exclusionReason, "text_input");
+  assert.equal(decisions.at(-1).decision, "pair_recognized");
   assert.equal(decisions.at(-1).isDoubleTap, true);
+  assert.equal(decisions.at(-1).excluded, false);
+  assert.equal(decisions.at(-1).exclusionReason, null);
   owner.destroy();
 });
 
-test("activatable targets keep both taps, because preventing one drops its click", () => {
+test("buttons, links, inputs, and plain elements share the observation contract", () => {
+  for (const [kind, target] of [
+    ["button", buttonTarget],
+    ["link", linkTarget],
+    ["input", textInputTarget],
+    ["plain", plainTarget],
+  ]) {
+    const eventTarget = new FakeEventTarget();
+    let nowMs = 1_000;
+    let prevented = 0;
+    const decisions = [];
+    const owner = installDocumentDoubleTapOwner(eventTarget, {
+      now: () => nowMs,
+      onDecision: (decision) => decisions.push(decision),
+    });
+
+    dispatchTap(eventTarget, touch(1, 50, 90), () => { prevented += 1; }, target);
+    nowMs = 1_180;
+    dispatchTap(eventTarget, touch(2, 51, 91), () => { prevented += 1; }, target);
+
+    assert.equal(prevented, 0, `${kind} must keep both tap defaults`);
+    assert.equal(decisions.length, 2, `${kind} must report both taps`);
+    assert.deepEqual(decisions.map((decision) => decision.decision), [
+      "candidate_started",
+      "pair_recognized",
+    ]);
+    assert.equal(decisions[1].elapsedMs, 180);
+    assert.equal(decisions[1].distancePx, Math.hypot(1, 1));
+    assert.equal(decisions[1].isDoubleTap, true);
+    assert.equal(decisions[1].suppressed, false);
+    assert.equal(decisions[1].excluded, false);
+    assert.equal(decisions[1].exclusionReason, null);
+    owner.destroy();
+  }
+});
+
+test("the document observer uses the browser recognition window", () => {
   const eventTarget = new FakeEventTarget();
   let nowMs = 1_000;
   let prevented = 0;
   const decisions = [];
-  // 実際の closest と同じく、対象に一致する selector のときだけ要素を返す。
-  const buttonTarget = {
-    closest: (selector) => (selector.includes("button") ? { tagName: "BUTTON" } : null),
-  };
   const owner = installDocumentDoubleTapOwner(eventTarget, {
     now: () => nowMs,
     onDecision: (decision) => decisions.push(decision),
   });
 
-  dispatchTap(eventTarget, touch(1, 50, 90), () => { prevented += 1; }, buttonTarget);
-  nowMs = 1_180;
-  dispatchTap(eventTarget, touch(2, 51, 91), () => { prevented += 1; }, buttonTarget);
-  assert.equal(
-    prevented,
-    0,
-    "rapidly tapping a page button twice must activate it twice"
-  );
-  assert.equal(decisions.length, 2);
-  assert.equal(decisions[0].excluded, true);
-  assert.equal(decisions[0].exclusionReason, "button");
-  assert.equal(decisions[1].exclusionReason, "button");
-  assert.equal(decisions[1].elapsedMs, 180);
-  assert.equal(decisions[1].distancePx, Math.hypot(1, 1));
-  assert.equal(decisions[1].isDoubleTap, true);
-  assert.equal(decisions[1].suppressed, false);
-
-  // 操作部品でなければ、これまでどおり 2 打目だけ止める。
-  nowMs = 3_000;
-  dispatchTap(eventTarget, touch(3, 50, 90), () => { prevented += 1; });
-  nowMs = 3_180;
-  dispatchTap(eventTarget, touch(4, 51, 91), () => { prevented += 1; });
-  assert.equal(prevented, 1);
-  owner.destroy();
-});
-
-test("the document owner uses the browser suppression window", () => {
-  const eventTarget = new FakeEventTarget();
-  let nowMs = 1_000;
-  let prevented = 0;
-  const owner = installDocumentDoubleTapOwner(eventTarget, { now: () => nowMs });
-
   dispatchTap(eventTarget, touch(1, 60, 120), () => { prevented += 1; });
   nowMs += BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS - 40;
   dispatchTap(eventTarget, touch(2, 61, 121), () => { prevented += 1; });
-  assert.equal(prevented, 1, "a pair inside the browser window must lose browser zoom");
+  assert.equal(prevented, 0, "a recognized pair must keep both defaults");
+  assert.equal(decisions.at(-1).decision, "pair_recognized");
+  assert.equal(decisions.at(-1).isDoubleTap, true);
 
   // ブラウザの窓も越えたら、ただの 2 回のタップ。
   nowMs += BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS + 60;
   dispatchTap(eventTarget, touch(3, 60, 120), () => { prevented += 1; });
   nowMs += BROWSER_DOUBLE_TAP_ZOOM_MAX_DELAY_MS + 60;
   dispatchTap(eventTarget, touch(4, 61, 121), () => { prevented += 1; });
-  assert.equal(prevented, 1);
+  assert.equal(prevented, 0);
+  assert.equal(decisions.at(-1).decision, "pair_rejected");
+  assert.equal(decisions.at(-1).isDoubleTap, false);
   owner.destroy();
 });
 
-test("pickers and labels are suppressed, because the browser does zoom on them", () => {
-  // 実機で `select` と `<label>` の上は拡大した。click で処理していないので、
-  // 止めて失うのは 2 打目の起動転送だけ。
+test("pickers and labels are observed without suppressing their defaults", () => {
   for (const tagSelector of ["select", "label"]) {
     const eventTarget = new FakeEventTarget();
     let nowMs = 1_000;
     let prevented = 0;
+    const decisions = [];
     const target = {
       closest: (selector) => (selector.includes(tagSelector) ? { tagName: tagSelector } : null),
     };
-    const owner = installDocumentDoubleTapOwner(eventTarget, { now: () => nowMs });
+    const owner = installDocumentDoubleTapOwner(eventTarget, {
+      now: () => nowMs,
+      onDecision: (decision) => decisions.push(decision),
+    });
     dispatchTap(eventTarget, touch(1, 50, 90), () => { prevented += 1; }, target);
     nowMs = 1_180;
     dispatchTap(eventTarget, touch(2, 51, 91), () => { prevented += 1; }, target);
-    assert.equal(prevented, 1, `${tagSelector} must not keep browser double-tap zoom`);
+    assert.equal(prevented, 0, `${tagSelector} must keep both tap defaults`);
+    assert.equal(decisions.at(-1).decision, "pair_recognized");
+    assert.equal(decisions.at(-1).isDoubleTap, true);
+    assert.equal(decisions.at(-1).suppressed, false);
+    assert.equal(decisions.at(-1).excluded, false);
+    assert.equal(decisions.at(-1).exclusionReason, null);
     owner.destroy();
   }
 });

@@ -273,13 +273,13 @@ test("open telemetry records the requested kind, media kind, and reached route",
   assert.equal(rejected.handled, false);
 });
 
-test("browser double-tap telemetry keeps the measured suppression decision", () => {
+test("browser double-tap telemetry keeps the recognized observation", () => {
   const event = browserDoubleTapTelemetryEvent({
-    decision: "pair_suppressed",
+    decision: "pair_recognized",
     elapsedMs: 222.34,
     distancePx: 5.678,
     isDoubleTap: true,
-    suppressed: true,
+    suppressed: false,
     excluded: false,
     exclusionReason: null,
     cancelable: true,
@@ -288,12 +288,12 @@ test("browser double-tap telemetry keeps the measured suppression decision", () 
   assert.deepEqual(event, {
     type: "browser_double_tap",
     action: "suppression_decision",
-    decision: "pair_suppressed",
+    decision: "pair_recognized",
     tap_pair_sequence: 7,
     previous_tap_elapsed_ms: 222.3,
     previous_tap_distance_px: 5.7,
     recognized_double_tap: true,
-    suppressed: true,
+    suppressed: false,
     excluded: false,
     exclusion_reason: null,
     event_cancelable: true,

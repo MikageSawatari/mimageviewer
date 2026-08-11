@@ -1470,36 +1470,37 @@ pointer 開始時の値へ戻す。cancel 前に横ブレの preview が発行�
 独自 pinch / pan の ownership として維持する。`manipulation` への変更は browser pinch/pan と remote の
 gesture owner を競合させるため行わない。アプリ外周の browser zoom policy は §12.21 のとおりとする。
 
-### 12.21 browser double-tap zoom の ownership と計測 (2026-08-07、2026-08-08 更新)
+### 12.21 browser double-tap zoom の ownership と計測 (2026-08-07、2026-08-11 更新)
 
 2026-08-08 の利用者判断により、静止画 viewer のダブルタップによる `Page` ⇔ `Original` 切替は廃止した。
 原寸表示は操作メニュー → 表示の「原寸 (100%)」に残す。これに伴い、中央 tap の pair 候補、320 ms の
 保留 timer、保留 tap の commit、原寸トグル専用 command と候補棄却 telemetry も撤去し、中央 tap は
 各 `pointerup` で即時に上下バーを切り替える。アプリ自身はダブルタップに意味を割り当てない。
 
-一方、browser の double-tap zoom は独立して起こり得るため、document level の単一 owner は維持する。
+一方、browser の double-tap zoom は独立して起こり得るため、document level の単一 observer は維持する。
 アプリ外周 (`html, body, #app`) の既定は `touch-action: manipulation` とし、2 回の単指 tap の時間差と
-距離を `doubleTapSequenceTransition` の純粋関数で判定する。browser default を止めるのは成立した2打目の
-`touchend` だけで、1打目、時間・距離が外れた tap、12 CSS px を超えて移動した gesture は
-`preventDefault()` しない。2接点以上は sequence を破棄し、browser pinch を維持する。文字入力や click を
-失う操作要素は固定 selector ごとの除外理由を持ち、2打目も止めない。
+距離を `browserDoubleTapZoomDecision` の純粋関数で判定する。ただし observer は成立した2打目を含む
+**どの `touchend` も `preventDefault()` しない**。button / link / input / 素の要素を selector で分けず、
+対象種別にかかわらず同じ認識経路を通す。12 CSS px を超えて移動した gesture は候補にせず、2接点以上も
+sequence を破棄するため、drag と multi-touch は pair 観測へ入らない。
 
 `document-double-tap.mjs` は telemetry を知らず、任意 callback に固定形式の判定事実だけを返す。app は
-これを通常段の `browser_double_tap/suppression_decision` として、直前の実 tap からの経過 ms と距離 px、
-double-tap と認識したか、抑止したか、除外対象かと固定の除外理由、`event.cancelable` を記録する。抑止候補の
-消費状態とは別に診断用の直前 tap を保持するため、除外対象上の2打や、成立 pair 直後の3打目でも実際の
-直前 tap との差を失わない。pair には SPA の実行中に単調増加する数値だけの相関番号を付け、session ID、
-path、DOM target は記録しない。
+これを既存 schema の通常段 `browser_double_tap/suppression_decision` として、直前の実 tap からの経過 ms
+と距離 px、double-tap と認識したか、`event.cancelable` を記録する。成立した対は `pair_recognized` とし、
+`suppressed` / `excluded` は常に false、除外理由は null である。action 名はログ schema の互換名であって、
+現在の挙動が抑止を行うことを意味しない。成立 pair 直後の3打目でも実際の直前 tap との差を失わない。
+pair には SPA の実行中に単調増加する数値だけの相関番号を付け、session ID、path、DOM target は記録しない。
 
 `visualViewport` の resize は従来どおり 250 ms 落ち着いた時点で、前回記録値から scale が 0.01 以上
 変わった場合だけ `visual_viewport/scale_changed` を通常段へ送る。この event には直前の tap pair 相関番号、
 最後の resize 観測時点での pair からの経過 ms、pair の時間・距離・認識・抑止・除外理由・`cancelable` を
 併記し、browser zoom の発生と直前 pair を直接照合できるようにする。
 
-この更新では browser 抑止の 520 ms 窓と距離を変更せず、要素別 `touch-action` を追加せず、viewport meta に
-`maximum-scale` / `user-scalable` を指定しない。原寸表示後に pan できず menu が開くという観測は、
-ダブルタップ経路の廃止で修正済みとは扱わない。操作メニューから原寸へ入った場合にも起こるかを別途確認し、
-必要なら独立した不具合として調査する。
+520 ms の認識窓と距離は変更せず、要素別の抑止 selector は持たない。browser zoom を止める境界は
+§14.8.1 の viewport meta (`maximum-scale=1, user-scalable=no`) であり、通常タブで iOS がこの指定を
+無視して拡大する場合は受け入れる。原寸表示後に pan できず menu が開くという観測は、この変更で
+修正済みとは扱わない。操作メニューから原寸へ入った場合にも起こるかを別途確認し、必要なら独立した
+不具合として調査する。
 
 ### 12.22 ページ応答 identity の検査 (2026-08-08)
 
@@ -2042,14 +2043,26 @@ HUD で詰まり方を観測してから別の変更として判断する。
 での結果なので、抑止対象を広げても解決しない。実際、ボタンへ広げる案は click 再送を
 伴い、click 以外で起動する部品を壊しかけた (`2ca1454f` を revert)。
 
+**JS の抑止は tap も落としている。** 直近の実機ログでは tap 判定 65 件に対して command は
+59 件だった。差の多くは正常な drag (`travel_exceeded`) だが、`pair_suppressed` の直後に
+command が無い tap が含まれていた。2 打目の既定を止めると合成 click も失われ、ページ送りや
+seek の入力が消える。拡大を止められない一方で入力欠落だけを作るため、この抑止には利点が残らない。
+
 そこで viewport meta に **`maximum-scale=1, user-scalable=no`** を入れる。ホーム画面へ
 追加した standalone では iOS がこれを尊重する。通常タブでは無視されるが害は無い。
+
+この実測を受け、document listener は 2 打目を含む**すべての tap の既定動作を残す**観測専用へ
+変更した。button / link / input / 素の要素を分けていた `DEFAULT_TAP_EXCLUSIONS` は撤去し、
+対象種別による分岐を持たない。時間窓・距離による pair 認識、移動量判定、multi-touch の除外、
+`onDecision` 通知は残す。成立した対は `pair_recognized` として記録し、`suppressed: false` を伴う。
 
 - **失うもの**: UI 全体をピンチで拡大する操作。**画像のピンチ拡大はアプリが自前で
   持っている**ので影響しない
 - 以前は逆の判断 (ブラウザのピンチ拡大を残す) を `pwa.test.mjs` の
   `assert.doesNotMatch(html, /maximum-scale|user-scalable/i)` で固定していた。上の実測を
   根拠に反転させ、テストも現在の意図を固定する形へ書き換えた
-- JS の二度打ち抑止そのものは残す。standalone 以外では唯一の best-effort であり、
-  いま実害 (タップの取りこぼし) は観測されていない。**ただしこれ単独では拡大を
-  止められない**ことを前提にすること
+- standalone ではない通常タブでは iOS が viewport 指定を無視し、browser zoom が起こり得る。
+  JS の `preventDefault()` でも止められないことが実測済みなので、通常タブでの拡大は入力欠落を
+  再導入せず受け入れる
+- document listener は zoom の再発と tap 入力の相関を取る唯一の観測点なので撤去しない。
+  pair 認識と `visualViewport` の scale 変化の相関を引き続き telemetry に残す

@@ -213,6 +213,14 @@ const ARCHIVE_TERMINAL_STATES = new Set([
 const APP_ASSET_TOKEN_PATTERN = /^[a-f0-9]{16}$/;
 const APP_UPDATE_RELOAD_ATTEMPT_KEY = "miv-remote-app-update-reload-attempt";
 const RUNTIME_TEST_MODE = globalThis.__MIV_RUNTIME_TEST_MODE__ === true;
+// boot() はこの起動ブロックより後の module scope const を同期的に参照できない。
+// telemetry の許可集合も、起動前に初期化される singleton と同じ側へ置く。
+const BROWSER_DOUBLE_TAP_DECISIONS = new Set([
+  "candidate_started",
+  "pair_rejected",
+  "pair_recognized",
+  "travel_exceeded",
+]);
 let runtimeTestErrorObserver = null;
 const REMOTE_CLIENT_ID = loadRemoteClientId();
 const LOCAL_SETTINGS_LOAD = loadLocalSettings();
@@ -2063,30 +2071,9 @@ function optionalTelemetryMeasurement(value) {
   return Number.isFinite(measurement) ? roundMs(measurement) : null;
 }
 
-const BROWSER_DOUBLE_TAP_DECISIONS = new Set([
-  "candidate_started",
-  "pair_rejected",
-  "pair_suppressed",
-  "pair_not_cancelable",
-  "excluded_target",
-  "travel_exceeded",
-]);
-const BROWSER_DOUBLE_TAP_EXCLUSIONS = new Set([
-  "button",
-  "link",
-  "textarea",
-  "contenteditable",
-  "role_button",
-  "role_link",
-  "role_tab",
-  "role_option",
-  "text_input",
-]);
-
 export function browserDoubleTapTelemetryEvent(decision, tapPairSequence = null) {
   const sequence = Number(tapPairSequence);
   const decisionName = String(decision?.decision || "unknown");
-  const exclusionReason = String(decision?.exclusionReason || "");
   return {
     type: "browser_double_tap",
     action: "suppression_decision",
@@ -2100,9 +2087,7 @@ export function browserDoubleTapTelemetryEvent(decision, tapPairSequence = null)
     recognized_double_tap: Boolean(decision?.isDoubleTap),
     suppressed: Boolean(decision?.suppressed),
     excluded: Boolean(decision?.excluded),
-    exclusion_reason: BROWSER_DOUBLE_TAP_EXCLUSIONS.has(exclusionReason)
-      ? exclusionReason
-      : null,
+    exclusion_reason: null,
     event_cancelable: Boolean(decision?.cancelable),
   };
 }

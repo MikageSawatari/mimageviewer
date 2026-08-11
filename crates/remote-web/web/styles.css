@@ -34,8 +34,9 @@ body,
   height: 100%;
   margin: 0;
   overflow: hidden;
-  /* Keep browser pinch zoom. The document-level touch owner prevents only recognized
-     double taps; manipulation remains the shell-wide browser gesture policy. */
+  /* The document listener only observes double-tap pairs and never prevents defaults.
+     manipulation remains the shell-wide browser hint; the viewport meta owns the hard
+     zoom limit in standalone mode. */
   touch-action: manipulation;
 }
 
@@ -168,9 +169,8 @@ textarea {
   font: inherit;
 }
 
-/* 既存の要素別宣言は browser hint として維持するが、double-tap の全体 ownership は
-   document listener にある。文字入力の選択操作とは事情が違うので input / textarea へは
-   広げず、新しい tap 対象をこの方式で列挙しない。 */
+/* 既存の要素別宣言は browser hint として維持する。document listener は対象 selector を
+   列挙せず、どの要素でも既定を止めない。 */
 select {
   touch-action: manipulation;
 }

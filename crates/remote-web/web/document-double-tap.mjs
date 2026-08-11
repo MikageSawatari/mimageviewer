@@ -9,45 +9,10 @@ function touchByIdentifier(touches, identifier) {
   return null;
 }
 
-/// 既定動作を残す対象。
-///
-/// 基準は「2 打目を止めると本当に失われる操作があるか」だけ。2 打目の `touchend` を
-/// 止めると合成 click も落ちるので、click で起動するもの (ページ送りの ‹ › など) は
-/// 素早く 2 回押したときに 2 回目が効かなくなる。文字入力は選択・キャレットの既定が要る。
-///
-/// `select` と `label` はここに入れない。以前「native の部品だからブラウザは拡大しない」
-/// として除外したが、実際には拡大する。どちらもこちらが click で処理しておらず、
-/// 止めて失うのは 2 打目の起動転送だけなので、拡大を許す理由にならない。
-const DEFAULT_TAP_EXCLUSIONS = [
-  ["button", "button"],
-  ["link", "a[href]"],
-  ["textarea", "textarea"],
-  ["contenteditable", "[contenteditable]"],
-  ["role_button", '[role="button"]'],
-  ["role_link", '[role="link"]'],
-  ["role_tab", '[role="tab"]'],
-  ["role_option", '[role="option"]'],
-  // range / checkbox / radio / button 系は文字入力ではなく、拡大だけが残る。
-  [
-    "text_input",
-    'input:not([type="range"]):not([type="checkbox"]):not([type="radio"])' +
-      ':not([type="button"]):not([type="submit"])',
-  ],
-];
-
-function defaultTapExclusionReason(target) {
-  for (const [reason, selector] of DEFAULT_TAP_EXCLUSIONS) {
-    if (target?.closest?.(selector)) return reason;
-  }
-  return null;
-}
-
-/// Own browser double-tap suppression once for the whole document. The first tap and every
-/// non-matching touchend keep their defaults; only the second tap of a recognized pair is
-/// prevented. Multi-touch gestures never enter the tap sequence, leaving browser pinch intact.
-/// Preventing a touchend also drops its synthesized click, so activatable targets are left
-/// alone (see DEFAULT_TAP_EXCLUSIONS). An optional callback exposes only the fixed decision
-/// facts; the caller owns any logging or correlation policy.
+/// Observe browser double-tap pairs once for the whole document without preventing any default.
+/// Multi-touch gestures never enter the tap sequence. Target type does not affect recognition,
+/// so buttons, links, inputs, and plain elements follow the same path. An optional callback
+/// exposes only the fixed decision facts; the caller owns any logging or correlation policy.
 export function installDocumentDoubleTapOwner(
   eventTarget,
   {
@@ -77,20 +42,16 @@ export function installDocumentDoubleTapOwner(
     if (event.touches?.length !== 1) {
       gesture = { multiTouch: true };
       previousTap = null;
-        return;
+      return;
     }
     const touch = event.touches[0];
-    const exclusionReason = defaultTapExclusionReason(event.target);
     gesture = {
       identifier: touch.identifier,
       startX: touch.clientX,
       startY: touch.clientY,
       maxTravelPx: 0,
-      exclusionReason,
       multiTouch: false,
     };
-    // 除外は「この 1 打の既定動作を残す」だけの話で、履歴は捨てない。ブラウザは対象の
-    // 種類で対を作るかを変えないので、こちらも変えない。
   };
 
   const onTouchMove = (event) => {
@@ -98,7 +59,7 @@ export function installDocumentDoubleTapOwner(
     if (event.touches?.length !== 1) {
       gesture.multiTouch = true;
       previousTap = null;
-        return;
+      return;
     }
     const touch = touchByIdentifier(event.touches, gesture.identifier);
     if (!touch) {
@@ -116,7 +77,7 @@ export function installDocumentDoubleTapOwner(
     if (gesture.multiTouch) {
       if (event.touches?.length === 0) gesture = null;
       previousTap = null;
-        return;
+      return;
     }
     if (event.touches?.length !== 0 || event.changedTouches?.length !== 1) {
       rejectGesture();
@@ -137,27 +98,8 @@ export function installDocumentDoubleTapOwner(
       y: touch.clientY,
       atMs,
     };
-    // 抑止の判定と記録は同じ 1 つの結果から出す。対を消費しなくなったので、観測用に
-    // 別の履歴を持つ理由も無くなった。
+    // ブラウザと同じく常に直前の tap と比べ、成立した対も次の観測候補として残す。
     const decision = browserDoubleTapZoomDecision(previousTap, currentTap);
-    if (gesture.exclusionReason) {
-      notifyDecision({
-        decision: "excluded_target",
-        atMs,
-        elapsedMs: decision.elapsedMs,
-        distancePx: decision.distancePx,
-        isDoubleTap: decision.zooms,
-        suppressed: false,
-        excluded: true,
-        exclusionReason: gesture.exclusionReason,
-        cancelable: eventCancelable,
-      });
-      gesture = null;
-      // 除外対象でも「タップが 1 回あった」ことは変わらない。ブラウザは次のタップと
-      // 組にして拡大するので、候補として残す。
-      previousTap = decision.next;
-      return;
-    }
     if (Math.max(gesture.maxTravelPx, endTravelPx) > maxTapTravelPx) {
       notifyDecision({
         decision: "travel_exceeded",
@@ -176,13 +118,14 @@ export function installDocumentDoubleTapOwner(
 
     gesture = null;
     previousTap = decision.next;
-    const suppressed = decision.zooms && eventCancelable;
-    if (suppressed) {
-      event.preventDefault();
-    }
+    // 2 打目の既定は止めない。止めても iOS の拡大は起きる (suppressed の 46ms 後に
+    // scale 1 -> 1.03 を実測) 一方で、合成 click が落ちてページ送りが消える
+    // (pair_suppressed なのに command が出ていないタップを実測)。拡大は viewport の
+    // maximum-scale / user-scalable で止める。ここは対の認識だけを所有し、観測に徹する。
+    const suppressed = false;
     notifyDecision({
       decision: decision.zooms
-        ? (suppressed ? "pair_suppressed" : "pair_not_cancelable")
+        ? "pair_recognized"
         : (decision.elapsedMs === null ? "candidate_started" : "pair_rejected"),
       atMs,
       elapsedMs: decision.elapsedMs,
@@ -206,7 +149,7 @@ export function installDocumentDoubleTapOwner(
   });
   eventTarget.addEventListener("touchend", onTouchEnd, {
     capture: true,
-    passive: false,
+    passive: true,
   });
   eventTarget.addEventListener("touchcancel", onTouchCancel, {
     capture: true,
