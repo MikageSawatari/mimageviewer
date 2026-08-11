@@ -5964,7 +5964,7 @@ impl Keymap {
     /// present in this frame. This is deliberately read-only: callers that
     /// choose rendering work before fullscreen dispatch may observe the input,
     /// but the normal ownership boundary remains responsible for consuming it.
-    #[cfg(windows)]
+    #[cfg(all(windows, test))]
     pub(crate) fn pending_chord_press_in_frame(
         &self,
         viewport: egui::ViewportId,
@@ -5985,6 +5985,29 @@ impl Keymap {
             return crate::key_input::FrameKeyDownStats::default();
         }
         crate::key_input::frame_key_down_stats(viewport, |edge| chord.matches_key_edge(edge))
+    }
+
+    /// Return whether every physical part of `chord` is held right now.
+    ///
+    /// Unlike the Win32 edge queue helpers above, this is a level signal: key
+    /// repeat does not make it alternate between true and false across frames.
+    /// The caller supplies the owning viewport so physical Enter/NumpadEnter
+    /// latches stay routed to the same viewer context as normal dispatch.
+    #[cfg(windows)]
+    pub(crate) fn key_held_chord_via_os(&self, viewport: egui::ViewportId, chord: Chord) -> bool {
+        let Some(name) = chord.key_name() else {
+            return false;
+        };
+        let Some((ctrl, shift, alt)) = chord.key_modifiers() else {
+            return false;
+        };
+        if modifier_held_via_os(ModKind::Ctrl) != ctrl
+            || modifier_held_via_os(ModKind::Shift) != shift
+            || modifier_held_via_os(ModKind::Alt) != alt
+        {
+            return false;
+        }
+        key_held_via_os(viewport, name)
     }
 
     pub fn first_chord_label(&self, action: KeyAction) -> Option<String> {
@@ -7115,25 +7138,12 @@ impl Keymap {
     }
 
     fn key_held_chord(&self, ctx: &egui::Context, chord: Chord) -> bool {
-        if chord.has_key_modifiers() {
-            return false;
-        }
-        let Some(name) = chord.key_name() else {
-            return false;
-        };
         // KeyHold は「修飾キーなしの通常キー」契約 (validate_for_trigger 参照)。修飾キーが
         // 同時に押されている間は不成立にして、Ctrl+Z (undo) / Shift+Z (分析) 等が KeyHold
         // アクション (例: 全画面ズーム) を誤起動しないようにする (Codex P1)。FS ビューポートで
         // stale な egui modifiers を避け、押下中判定と同じく OS 直読みを使う。
         #[cfg(windows)]
         {
-            let _ = ctx;
-            if modifier_held_via_os(ModKind::Ctrl)
-                || modifier_held_via_os(ModKind::Shift)
-                || modifier_held_via_os(ModKind::Alt)
-            {
-                return false;
-            }
             // Windows では OS 直読み (KeyName の固有 VK) を唯一の判定にする
             // (review-v2.3.0 hunt P2):
             // - `to_egui` が None のキー (NumpadEnter / Yen 等) でも hold が成立する
@@ -7142,10 +7152,16 @@ impl Keymap {
             //   経由の「上段数字キーで誤発火」も起きない。
             // - Enter / NumpadEnter は共有 VK_RETURN を直接読まず、Win32 edge の extended bit
             //   から作る物理ラッチを使うため、KeyHold でも双方向に分離される。
-            key_held_via_os(ctx.viewport_id(), name)
+            self.key_held_chord_via_os(ctx.viewport_id(), chord)
         }
         #[cfg(not(windows))]
         {
+            if chord.has_key_modifiers() {
+                return false;
+            }
+            let Some(name) = chord.key_name() else {
+                return false;
+            };
             let Some(key) = KeyName::to_egui(name) else {
                 return false;
             };

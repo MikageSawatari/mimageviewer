@@ -6504,10 +6504,10 @@ struct FsPageTurnFrameDecision {
 }
 
 fn page_turn_decision_for_inputs(
-    page_turn_input_pending: bool,
+    page_turn_input_held: bool,
     passthrough_rendition_ready: bool,
 ) -> FsPageTurnDecision {
-    let defer_ui_uploads = page_turn_input_pending && passthrough_rendition_ready;
+    let defer_ui_uploads = page_turn_input_held && passthrough_rendition_ready;
     let paint_source = if defer_ui_uploads {
         FsPageTurnPaintSource::Thumbnail
     } else {
@@ -6521,15 +6521,15 @@ fn page_turn_decision_for_inputs(
 
 fn page_turn_decision_reason(
     ordinary_paged_context: bool,
-    eligible_pending_edges: usize,
-    matching_pending_edges: usize,
+    eligible_held_chords: usize,
+    matching_held_chords: usize,
     passthrough_rendition_ready: bool,
 ) -> &'static str {
     if !ordinary_paged_context {
         "ordinary_context_blocked"
-    } else if eligible_pending_edges == 0 && matching_pending_edges > 0 {
+    } else if eligible_held_chords == 0 && matching_held_chords > 0 {
         "ambiguous_page_turn_chord"
-    } else if eligible_pending_edges == 0 {
+    } else if eligible_held_chords == 0 {
         "pending_zero"
     } else if !passthrough_rendition_ready {
         "passthrough_rendition_unavailable"
@@ -13062,6 +13062,21 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn fs_page_turn_held_chords(
+        &self,
+        viewport: egui::ViewportId,
+        chords: &[Chord],
+    ) -> (usize, String) {
+        let labels = chords
+            .iter()
+            .copied()
+            .filter(|chord| self.keymap.key_held_chord_via_os(viewport, *chord))
+            .map(Chord::display_name)
+            .collect::<Vec<_>>();
+        (labels.len(), labels.join(","))
+    }
+
+    #[cfg(windows)]
     #[allow(clippy::too_many_arguments)]
     fn emit_fs_page_turn_decision_probe(
         &self,
@@ -13087,16 +13102,20 @@ impl App {
             self.fs_page_turn_win32_chord_stats(viewport, &matching_chords);
         let (pending, pending_labels) =
             self.fs_page_turn_win32_chord_stats(viewport, &eligible_chords);
+        let (matching_held, matching_held_labels) =
+            self.fs_page_turn_held_chords(viewport, &matching_chords);
+        let (eligible_held, eligible_held_labels) =
+            self.fs_page_turn_held_chords(viewport, &eligible_chords);
         let all = crate::key_input::frame_key_down_stats(viewport, |_edge| true);
         let counted_pending = if ordinary_context {
-            pending.matched_count != 0
+            eligible_held != 0
         } else {
             false
         };
         let reason = page_turn_decision_reason(
             ordinary_context,
-            pending.matched_count,
-            matching.matched_count,
+            usize::from(production_pending),
+            matching_held,
             passthrough_rendition_ready,
         );
         let mut attrs = Vec::new();
@@ -13152,6 +13171,22 @@ impl App {
         attrs.push((
             "win32_pending_page_turn_chords",
             serde_json::Value::from(pending_labels),
+        ));
+        attrs.push((
+            "win32_matching_page_turn_held_count",
+            serde_json::Value::from(matching_held),
+        ));
+        attrs.push((
+            "win32_eligible_page_turn_held_count",
+            serde_json::Value::from(eligible_held),
+        ));
+        attrs.push((
+            "win32_matching_page_turn_held_chords",
+            serde_json::Value::from(matching_held_labels),
+        ));
+        attrs.push((
+            "win32_eligible_page_turn_held_chords",
+            serde_json::Value::from(eligible_held_labels),
         ));
         attrs.push((
             "production_pending",
@@ -13279,8 +13314,9 @@ impl App {
 
     /// Decide what to paint and whether to defer UI-thread uploads for this frame.
     ///
-    /// The decision source is exclusively the unconsumed, viewport-routed Win32
-    /// key edge queue for this frame. No elapsed-time threshold participates.
+    /// The decision source is exclusively the current viewport-routed Win32
+    /// physical key state. Key-repeat edges do not participate, nor does any
+    /// elapsed-time threshold or cross-frame smoothing.
     /// The temp cache keeps egui replay passes in the same frame read-only and
     /// deterministic; it is invalidated by frame, item generation, and idx.
     pub(crate) fn fs_page_turn_decision_for_frame(
@@ -13315,27 +13351,27 @@ impl App {
             }
             let ordinary_context_blocker = self.fs_page_turn_ordinary_context_blocker(ctx, fs_idx);
             let ordinary_paged_context = ordinary_context_blocker.is_none();
-            let configurable_page_turn_pending = ordinary_paged_context
+            let configurable_page_turn_held = ordinary_paged_context
                 && FS_PAGE_TURN_COALESCE_ACTIONS.into_iter().any(|action| {
                     self.keymap.any_effective_chord(action, |chord| {
-                        self.keymap.pending_chord_press_in_frame(viewport, chord)
+                        self.keymap.key_held_chord_via_os(viewport, chord)
                             && self.fs_page_turn_chord_is_unambiguous(chord)
                     })
                 });
-            let fixed_page_turn_pending = ordinary_paged_context
+            let fixed_page_turn_held = ordinary_paged_context
                 && FS_FIXED_PAGE_TURN_CHORDS
                     .into_iter()
                     .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Up)))
                     .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Down)))
                     .any(|chord| {
-                        self.keymap.pending_chord_press_in_frame(viewport, chord)
+                        self.keymap.key_held_chord_via_os(viewport, chord)
                             && self.fs_page_turn_chord_is_unambiguous(chord)
                     });
-            let page_turn_input_pending = configurable_page_turn_pending || fixed_page_turn_pending;
-            let passthrough_rendition_ready = page_turn_input_pending
-                && self.fs_page_turn_passthrough_renditions_ready(ctx, fs_idx);
+            let page_turn_input_held = configurable_page_turn_held || fixed_page_turn_held;
+            let passthrough_rendition_ready =
+                page_turn_input_held && self.fs_page_turn_passthrough_renditions_ready(ctx, fs_idx);
             let decision =
-                page_turn_decision_for_inputs(page_turn_input_pending, passthrough_rendition_ready);
+                page_turn_decision_for_inputs(page_turn_input_held, passthrough_rendition_ready);
             self.emit_fs_page_turn_decision_probe(
                 viewport,
                 frame_nr,
@@ -13343,7 +13379,7 @@ impl App {
                 ordinary_paged_context,
                 ordinary_context_blocker,
                 passthrough_rendition_ready,
-                page_turn_input_pending,
+                page_turn_input_held,
                 decision,
             );
             ctx.data_mut(|data| {
@@ -32207,6 +32243,32 @@ mod tests {
             assert_eq!(decision.paint_source(), paint_source);
             assert_eq!(decision.defer_ui_uploads(), defer_uploads);
         }
+    }
+
+    #[test]
+    fn page_turn_held_signal_never_reverses_source_at_same_index_and_releases_next_frame() {
+        const IDX: usize = 123;
+        let frames = [true, true, true, true, false]
+            .into_iter()
+            .map(|held| (IDX, page_turn_decision_for_inputs(held, true)))
+            .collect::<Vec<_>>();
+
+        assert!(frames.iter().all(|(idx, _)| *idx == IDX));
+        assert!(frames[..4].iter().all(|(_, decision)| {
+            decision.paint_source() == FsPageTurnPaintSource::Thumbnail
+                && decision.defer_ui_uploads()
+        }));
+        assert!(
+            frames[..4]
+                .windows(2)
+                .all(|pair| { pair[0].1.paint_source() == pair[1].1.paint_source() }),
+            "a physically held page-turn chord must not oscillate with key-repeat edges"
+        );
+        assert_eq!(
+            frames.last().map(|(_, decision)| *decision),
+            Some(FsPageTurnDecision::normal()),
+            "the first frame after physical release must return to the composite"
+        );
     }
 
     #[test]
