@@ -1140,7 +1140,7 @@ impl Chord {
         }
     }
 
-    fn matches_egui(self, key: egui::Key, modifiers: egui::Modifiers) -> bool {
+    pub(crate) fn matches_egui(self, key: egui::Key, modifiers: egui::Modifiers) -> bool {
         let Self::Key {
             ctrl,
             shift,
@@ -1469,6 +1469,8 @@ pub enum KeyAction {
     GridDeselect,
     GridToggleCheck,
     GridDelete,
+    GridRename,
+    GridReload,
     GridOpenSelected,
     GridOpenSelectedAsPage,
     GridOpenSelectedAsList,
@@ -1894,6 +1896,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridDeselect,
     KeyAction::GridToggleCheck,
     KeyAction::GridDelete,
+    KeyAction::GridRename,
+    KeyAction::GridReload,
     KeyAction::GridOpenSelected,
     KeyAction::GridOpenSelectedAsPage,
     KeyAction::GridOpenSelectedAsList,
@@ -2315,6 +2319,7 @@ pub enum MenuCommandId {
     FileOpenFolder,
     FileReadingHistory,
     FileLocalSearch,
+    FileReload,
     FileMetadataExport,
     FileMetadataImport,
     FileOpenCaptureFolder,
@@ -2359,6 +2364,7 @@ impl MenuCommandId {
         Self::FileOpenFolder,
         Self::FileReadingHistory,
         Self::FileLocalSearch,
+        Self::FileReload,
         Self::FileMetadataExport,
         Self::FileMetadataImport,
         Self::FileOpenCaptureFolder,
@@ -2403,6 +2409,7 @@ impl MenuCommandId {
             MenuCommandId::FileOpenFolder => "FileOpenFolder",
             MenuCommandId::FileReadingHistory => "FileReadingHistory",
             MenuCommandId::FileLocalSearch => "FileLocalSearch",
+            MenuCommandId::FileReload => "FileReload",
             MenuCommandId::FileMetadataExport => "FileMetadataExport",
             MenuCommandId::FileMetadataImport => "FileMetadataImport",
             MenuCommandId::FileOpenCaptureFolder => "FileOpenCaptureFolder",
@@ -2485,6 +2492,12 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         parent: TopMenuId::File,
         label: "現在地フィルタ",
         action: Some(KeyAction::GlobalLocalSearch),
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::FileReload,
+        parent: TopMenuId::File,
+        label: "最新の情報に更新",
+        action: Some(KeyAction::GridReload),
     },
     MenuCommandSpec {
         id: MenuCommandId::FileMetadataExport,
@@ -3085,6 +3098,13 @@ impl KeyAction {
         ALL_ACTIONS
     }
 
+    pub fn from_ini_name(name: &str) -> Option<Self> {
+        ALL_ACTIONS
+            .iter()
+            .copied()
+            .find(|action| action.ini_name().eq_ignore_ascii_case(name.trim()))
+    }
+
     pub fn is_user_facing(self) -> bool {
         !matches!(
             self,
@@ -3391,6 +3411,8 @@ impl KeyAction {
             GridDeselect => "GridDeselect",
             GridToggleCheck => "GridToggleCheck",
             GridDelete => "GridDelete",
+            GridRename => "GridRename",
+            GridReload => "GridReload",
             GridOpenSelected => "GridOpenSelected",
             GridOpenSelectedAsPage => "GridOpenSelectedAsPage",
             GridOpenSelectedAsList => "GridOpenSelectedAsList",
@@ -3934,6 +3956,8 @@ impl KeyAction {
             GridDeselect => "チェックをすべて解除する",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
             GridDelete => "選択中またはチェック済みの実ファイル/実フォルダを削除する",
+            GridRename => "選択中の実ファイル/実フォルダの名前を変更する",
+            GridReload => "現在の一覧を最新の情報に更新する",
             GridOpenSelected => "選択中の項目を開く",
             GridOpenSelectedAsPage => {
                 "選択中の ZIP/PDF/対応アーカイブをページで開く（フル機能ウィンドウ）"
@@ -4366,6 +4390,8 @@ impl KeyAction {
             | GridDeselect
             | GridToggleCheck
             | GridDelete
+            | GridRename
+            | GridReload
             | GridOpenSelected
             | GridOpenSelectedAsPage
             | GridOpenSelectedAsList
@@ -4750,6 +4776,8 @@ impl KeyAction {
             | GridDeselect
             | GridToggleCheck
             | GridDelete
+            | GridRename
+            | GridReload
             | GridOpenSelected
             | GridOpenSelectedAsPage
             | GridOpenSelectedAsList
@@ -5181,6 +5209,7 @@ impl KeyAction {
             GridDeselect => ChordList::two(Chord::ctrl(D), Chord::ctrl_shift(A)),
             GridToggleCheck => ChordList::one(Chord::key(Space)),
             GridDelete => ChordList::one(Chord::key(Delete)),
+            GridRename | GridReload => ChordList::EMPTY,
             GridOpenSelected => ChordList::one(Chord::key(Enter)),
             GridOpenSelectedAsPage | GridOpenSelectedAsList => ChordList::EMPTY,
             GridOpenExternalPlayer => ChordList::one(Chord::shift(Enter)),
@@ -5933,6 +5962,29 @@ impl Keymap {
             .unwrap_or_else(|| action.default_chords().iter().collect())
     }
 
+    /// Return whether every physical part of `chord` is held right now.
+    ///
+    /// This is a level signal: key repeat does not make it alternate between
+    /// true and false across frames.
+    /// The caller supplies the owning viewport so physical Enter/NumpadEnter
+    /// latches stay routed to the same viewer context as normal dispatch.
+    #[cfg(windows)]
+    pub(crate) fn key_held_chord_via_os(&self, viewport: egui::ViewportId, chord: Chord) -> bool {
+        let Some(name) = chord.key_name() else {
+            return false;
+        };
+        let Some((ctrl, shift, alt)) = chord.key_modifiers() else {
+            return false;
+        };
+        if modifier_held_via_os(ModKind::Ctrl) != ctrl
+            || modifier_held_via_os(ModKind::Shift) != shift
+            || modifier_held_via_os(ModKind::Alt) != alt
+        {
+            return false;
+        }
+        key_held_via_os(viewport, name)
+    }
+
     pub fn first_chord_label(&self, action: KeyAction) -> Option<String> {
         self.effective_chords(action)
             .into_iter()
@@ -6261,6 +6313,10 @@ impl Keymap {
     /// accidentally multiply toggles or destructive actions by using this API.
     pub fn consume_action_press_count(&self, ctx: &egui::Context, action: KeyAction) -> usize {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
+        #[cfg(all(windows, feature = "test-script"))]
+        if crate::test_script::consume_pending_action(action) {
+            return 1;
+        }
         if action.press_multiplicity() == PressMultiplicity::SinglePerFrame {
             return usize::from(self.consume_action(ctx, action));
         }
@@ -6285,6 +6341,10 @@ impl Keymap {
 
     pub fn consume_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
+        #[cfg(all(windows, feature = "test-script"))]
+        if crate::test_script::consume_pending_action(action) {
+            return true;
+        }
         if let Some(chords) = self.overrides.get(&action) {
             for chord in chords.iter().copied() {
                 if self.consume_chord(ctx, chord) {
@@ -6317,6 +6377,10 @@ impl Keymap {
 
     pub fn consume_action_no_repeat(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
+        #[cfg(all(windows, feature = "test-script"))]
+        if crate::test_script::consume_pending_action(action) {
+            return true;
+        }
         if let Some(chords) = self.overrides.get(&action) {
             for chord in chords.iter().copied() {
                 if self.consume_chord_no_repeat(ctx, chord) {
@@ -6349,6 +6413,10 @@ impl Keymap {
 
     pub fn pressed_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
+        #[cfg(all(windows, feature = "test-script"))]
+        if crate::test_script::peek_pending_action(action) {
+            return true;
+        }
         if let Some(chords) = self.overrides.get(&action) {
             for chord in chords.iter().copied() {
                 if self.pressed_chord(ctx, chord) {
@@ -7061,25 +7129,12 @@ impl Keymap {
     }
 
     fn key_held_chord(&self, ctx: &egui::Context, chord: Chord) -> bool {
-        if chord.has_key_modifiers() {
-            return false;
-        }
-        let Some(name) = chord.key_name() else {
-            return false;
-        };
         // KeyHold は「修飾キーなしの通常キー」契約 (validate_for_trigger 参照)。修飾キーが
         // 同時に押されている間は不成立にして、Ctrl+Z (undo) / Shift+Z (分析) 等が KeyHold
         // アクション (例: 全画面ズーム) を誤起動しないようにする (Codex P1)。FS ビューポートで
         // stale な egui modifiers を避け、押下中判定と同じく OS 直読みを使う。
         #[cfg(windows)]
         {
-            let _ = ctx;
-            if modifier_held_via_os(ModKind::Ctrl)
-                || modifier_held_via_os(ModKind::Shift)
-                || modifier_held_via_os(ModKind::Alt)
-            {
-                return false;
-            }
             // Windows では OS 直読み (KeyName の固有 VK) を唯一の判定にする
             // (review-v2.3.0 hunt P2):
             // - `to_egui` が None のキー (NumpadEnter / Yen 等) でも hold が成立する
@@ -7088,10 +7143,16 @@ impl Keymap {
             //   経由の「上段数字キーで誤発火」も起きない。
             // - Enter / NumpadEnter は共有 VK_RETURN を直接読まず、Win32 edge の extended bit
             //   から作る物理ラッチを使うため、KeyHold でも双方向に分離される。
-            key_held_via_os(ctx.viewport_id(), name)
+            self.key_held_chord_via_os(ctx.viewport_id(), chord)
         }
         #[cfg(not(windows))]
         {
+            if chord.has_key_modifiers() {
+                return false;
+            }
+            let Some(name) = chord.key_name() else {
+                return false;
+            };
             let Some(key) = KeyName::to_egui(name) else {
                 return false;
             };
@@ -7236,13 +7297,14 @@ impl KeymapSettings {
 
 #[cfg(windows)]
 fn key_held_via_os(viewport: egui::ViewportId, key: KeyName) -> bool {
-    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-
     let routed_physical_state = key
         .routed_hold_extended()
         .and_then(|extended| crate::key_input::routed_return_key_held(viewport, extended));
-    key_held_from_os_sources(key, routed_physical_state, |virtual_key| unsafe {
-        GetAsyncKeyState(virtual_key as i32) < 0
+    key_held_from_os_sources(key, routed_physical_state, |virtual_key| {
+        crate::key_input::physical_key_down(crate::key_input::PhysicalKeySlot::new(
+            virtual_key,
+            key.routed_hold_extended().unwrap_or(false),
+        ))
     })
 }
 
@@ -7280,10 +7342,8 @@ const fn modifier_virtual_key(kind: ModKind) -> u16 {
 
 #[cfg(windows)]
 pub(crate) fn modifier_held_via_os(kind: ModKind) -> bool {
-    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-
     let vk = modifier_virtual_key(kind);
-    unsafe { GetAsyncKeyState(vk as i32) < 0 }
+    crate::key_input::physical_key_down(crate::key_input::PhysicalKeySlot::new(vk.into(), false))
 }
 
 #[cfg(not(windows))]
@@ -8395,6 +8455,7 @@ mod tests {
                 MenuCommandId::FileQuit,
                 MenuCommandId::FileOpenFolder,
                 MenuCommandId::FileLocalSearch,
+                MenuCommandId::FileReload,
                 MenuCommandId::FileMetadataExport,
                 MenuCommandId::FileMetadataImport,
                 MenuCommandId::FileOpenCaptureFolder,
@@ -8610,6 +8671,10 @@ mod tests {
             "現在地フィルタ (Ctrl+F)"
         );
         assert_eq!(
+            keymap.menu_command_label(MenuCommandId::FileReload),
+            "最新の情報に更新"
+        );
+        assert_eq!(
             keymap.menu_command_label(MenuCommandId::FavoritesFavSearch),
             "コンテナ検索 (Ctrl+S)"
         );
@@ -8630,6 +8695,7 @@ mod tests {
             GlobalFavSearch = none
             [Grid]
             GridOpenLocationReadingHistory = Ctrl+L
+            GridReload = F5
             "#,
         );
         assert_eq!(
@@ -8643,6 +8709,10 @@ mod tests {
         assert_eq!(
             keymap.menu_command_label(MenuCommandId::FileLocalSearch),
             "現在地フィルタ (F2)"
+        );
+        assert_eq!(
+            keymap.menu_command_label(MenuCommandId::FileReload),
+            "最新の情報に更新 (F5)"
         );
         assert_eq!(
             keymap.menu_command_label(MenuCommandId::FavoritesFavSearch),
@@ -8861,6 +8931,16 @@ mod tests {
         assert!(KeyAction::GridToggleStackMode.default_chords().is_empty());
         assert_eq!(KeyAction::GridToggleStackMode.context(), KeyContext::Grid);
         assert_eq!(KeyAction::GridToggleStackMode.trigger(), KeyTrigger::Press);
+    }
+
+    #[test]
+    fn grid_rename_and_reload_are_default_unassigned() {
+        for action in [KeyAction::GridRename, KeyAction::GridReload] {
+            assert!(KeyAction::all().contains(&action));
+            assert!(action.default_chords().is_empty());
+            assert_eq!(action.context(), KeyContext::Grid);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+        }
     }
 
     #[test]

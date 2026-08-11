@@ -6,6 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use eframe::egui;
+
 use super::subfolder_expansion::SubfolderExpansionRestoreState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -320,6 +322,71 @@ pub(crate) enum TopLevelGridSurface {
     ReadingHistory,
     Bookmarks,
     Rating { stars: u8 },
+}
+
+impl super::App {
+    /// 現在の最上位一覧を、その surface が所有する再入場経路で更新する。
+    pub(crate) fn reload_top_level_grid(&mut self, ctx: &egui::Context) {
+        let surface = self.top_level_grid_view.surface().clone();
+        let folder_pane_active = self.effective_folder();
+
+        match surface {
+            TopLevelGridSurface::Folder => {
+                let local_search = self.show_search_bar.then(|| self.search_query.clone());
+                self.reload_current_folder_preserving_override();
+                if let Some(query) = local_search {
+                    self.show_search_bar = true;
+                    self.search_query = query;
+                    self.execute_search(ctx);
+                }
+            }
+            TopLevelGridSurface::SmartFolder(state) => {
+                if self.smart_folder_busy() {
+                    return;
+                }
+                self.open_smart_folder(state.definition_id, true);
+            }
+            TopLevelGridSurface::SubfolderExpansion => {
+                if self.subfolder_expansion_busy() {
+                    return;
+                }
+                if let Some(snapshot) = self.subfolder_expansion_snapshot.as_ref() {
+                    self.start_subfolder_expansion_scan_roots(
+                        snapshot.root.clone(),
+                        snapshot.roots.clone(),
+                    );
+                }
+            }
+            TopLevelGridSurface::Search(TopLevelSearchView::Global) => {
+                self.spawn_global_search();
+            }
+            TopLevelGridSurface::Search(TopLevelSearchView::Favorite) => {
+                self.execute_favsearch();
+            }
+            TopLevelGridSurface::Search(TopLevelSearchView::Tag) => {
+                self.open_tag_view_with_query(Some(self.tag_view.query.clone()), false);
+            }
+            TopLevelGridSurface::Rating { stars } => self.enter_rating_view(stars),
+            TopLevelGridSurface::ReadingHistory => self.enter_reading_history(),
+            TopLevelGridSurface::Bookmarks => self.enter_bookmark_view(),
+            TopLevelGridSurface::DriveList => {
+                let origin = self.selected.and_then(|index| match self.items.get(index) {
+                    Some(crate::grid_item::GridItem::Folder(path)) => Some(path.clone()),
+                    _ => None,
+                });
+                self.enter_drive_list(origin);
+            }
+            TopLevelGridSurface::Snapshot => {}
+        }
+
+        if self.settings.folder_tree_pane_visible {
+            self.folder_pane.reload_for_active(
+                folder_pane_active.as_deref(),
+                self.settings.sort_order,
+                self.settings.show_hidden_files,
+            );
+        }
+    }
 }
 
 pub(crate) struct TopLevelGridView {

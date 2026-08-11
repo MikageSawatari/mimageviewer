@@ -125,6 +125,71 @@ impl CapturePixelJob {
         self.rotation = rotation;
         self
     }
+
+    /// Worker が公開する出力寸法を、画素処理を始める前に同じ規則で求める。
+    ///
+    /// 比較準備ではこの寸法を request 側に保持し、worker の完了結果が元の
+    /// source / crop / rotation / spread と整合する場合だけ Ready として公開する。
+    pub(crate) fn output_size(&self) -> Result<[usize; 2], String> {
+        let [width, height] = self.source.size;
+        if width == 0 || height == 0 || self.source.pixels.len() != width.saturating_mul(height) {
+            return Err("キャプチャ元画像のサイズが不正です".to_string());
+        }
+        let cropped = self.crop.map_or([width, height], |crop| {
+            let (_, _, crop_width, crop_height) = crop.pixel_bounds(width, height);
+            [crop_width, crop_height]
+        });
+        Ok(rotated_size(cropped, self.rotation))
+    }
+
+    /// 比較用 texture として公開できる出力キャンバス寸法。
+    #[cfg(test)]
+    pub(crate) fn compare_output_size(&self) -> Result<[usize; 2], String> {
+        fit_compare_canvas_size(self.output_size()?)
+    }
+}
+
+pub(crate) fn fit_compare_canvas_size(size: [usize; 2]) -> Result<[usize; 2], String> {
+    if size[0] == 0 || size[1] == 0 {
+        return Err("比較表示のサイズが不正です".to_string());
+    }
+    if size[0] <= crate::app::MAX_TEXTURE_DIM && size[1] <= crate::app::MAX_TEXTURE_DIM {
+        return Ok(size);
+    }
+    let scale = (crate::app::MAX_TEXTURE_DIM as f64 / size[0] as f64)
+        .min(crate::app::MAX_TEXTURE_DIM as f64 / size[1] as f64);
+    let width = ((size[0] as f64 * scale).round() as usize).clamp(1, crate::app::MAX_TEXTURE_DIM);
+    let height = ((size[1] as f64 * scale).round() as usize).clamp(1, crate::app::MAX_TEXTURE_DIM);
+    validate_compare_canvas_size([width, height])
+}
+
+/// Keep the current page's displayed aspect ratio, but do not throw away pinned-side detail
+/// merely because the current page has fewer source pixels. The final texture-limit fit is
+/// applied after the shared canvas size is chosen.
+pub(crate) fn fit_compare_canvas_for_sources(
+    current_size: [usize; 2],
+    pinned_size: [usize; 2],
+) -> Result<[usize; 2], String> {
+    if current_size[0] == 0 || current_size[1] == 0 || pinned_size[0] == 0 || pinned_size[1] == 0 {
+        return Err("比較表示のサイズが不正です".to_string());
+    }
+    let scale = 1.0_f64
+        .max(pinned_size[0] as f64 / current_size[0] as f64)
+        .max(pinned_size[1] as f64 / current_size[1] as f64);
+    let width = (current_size[0] as f64 * scale).ceil() as usize;
+    let height = (current_size[1] as f64 * scale).ceil() as usize;
+    fit_compare_canvas_size([width, height])
+}
+
+pub(crate) fn validate_compare_canvas_size(size: [usize; 2]) -> Result<[usize; 2], String> {
+    if size[0] == 0
+        || size[1] == 0
+        || size[0] > crate::app::MAX_TEXTURE_DIM
+        || size[1] > crate::app::MAX_TEXTURE_DIM
+    {
+        return Err("比較表示のサイズが不正です".to_string());
+    }
+    Ok(size)
 }
 
 pub fn default_output_dir() -> PathBuf {
@@ -455,6 +520,30 @@ pub fn run_pixel_work(work: CapturePixelWork) -> Result<(String, u32, u32, Vec<u
     }
 }
 
+/// 比較経路の最終キャンバスを、必要な場合だけ texture 上限内へ等比縮小する。
+/// 通常は decode 時点で上限内だが、別入口が増えても上限超過を公開しないための backstop。
+pub fn run_compare_pixel_job(job: CapturePixelJob) -> Result<(String, u32, u32, Vec<u8>), String> {
+    let (basename, width, height, rgba) = run_pixel_job(job)?;
+    let target = fit_compare_canvas_size([width as usize, height as usize])?;
+    if target == [width as usize, height as usize] {
+        return Ok((basename, width, height, rgba));
+    }
+    let source = image::RgbaImage::from_raw(width, height, rgba)
+        .ok_or_else(|| "比較画像の RGBA バッファを作成できません".to_string())?;
+    let resized = crate::fast_resize::resize_rgba8_exact(
+        &source,
+        target[0] as u32,
+        target[1] as u32,
+        crate::fast_resize::Quality::Lanczos3,
+    );
+    Ok((
+        basename,
+        target[0] as u32,
+        target[1] as u32,
+        resized.into_raw(),
+    ))
+}
+
 fn combine_spread_rgba(
     basename: String,
     left_w: u32,
@@ -580,6 +669,7 @@ pub fn align_rgba_to_canvas_lanczos(
     src_rgba: &[u8],
     canvas_w: u32,
     canvas_h: u32,
+    canvas_color: egui::Color32,
 ) -> Result<Vec<u8>, String> {
     if src_w == 0 || src_h == 0 || canvas_w == 0 || canvas_h == 0 {
         return Err("比較画像のサイズが 0 です".to_string());
@@ -607,7 +697,7 @@ pub fn align_rgba_to_canvas_lanczos(
         .checked_mul(canvas_h)
         .and_then(|px| px.checked_mul(4))
         .ok_or_else(|| "比較画像のキャンバスが大きすぎます".to_string())? as usize;
-    let mut out = vec![0_u8; len];
+    let mut out = canvas_color.to_srgba_unmultiplied().repeat(len / 4);
     let offset_x = (canvas_w - resized_w) / 2;
     blit_centered_exact_y(
         &mut out,
@@ -936,15 +1026,128 @@ mod tests {
     }
 
     #[test]
-    fn align_rgba_to_canvas_lanczos_centers_with_transparent_padding() {
+    fn pixel_work_output_size_matches_cropped_rotated_spread_union() {
+        use crate::rotation_db::Rotation;
+
+        let left = egui::ColorImage::filled([6, 4], egui::Color32::RED);
+        let right = egui::ColorImage::filled([5, 7], egui::Color32::GREEN);
+        let work = CapturePixelWork::Spread {
+            basename: "spread".to_string(),
+            left: CapturePixelJob::already_adjusted("left".to_string(), Arc::new(left))
+                .with_crop(crate::export_crop::CropRect {
+                    min_x: 1.0,
+                    min_y: 0.0,
+                    max_x: 4.0,
+                    max_y: 4.0,
+                })
+                .with_rotation(Rotation::Cw90),
+            right: CapturePixelJob::already_adjusted("right".to_string(), Arc::new(right))
+                .with_crop(crate::export_crop::CropRect {
+                    min_x: 0.0,
+                    min_y: 2.0,
+                    max_x: 5.0,
+                    max_y: 4.0,
+                }),
+        };
+
+        let (_basename, width, height, _rgba) = run_pixel_work(work).unwrap();
+        assert_eq!([width as usize, height as usize], [9, 3]);
+    }
+
+    #[test]
+    fn compare_canvas_backstop_scales_over_texture_limit() {
+        let over_limit = egui::ColorImage::filled([8320, 1], egui::Color32::RED);
+        let job = CapturePixelJob::already_adjusted("over-limit".to_string(), Arc::new(over_limit));
+
+        assert_eq!(job.output_size().unwrap(), [8320, 1]);
+        assert_eq!(job.compare_output_size().unwrap(), [8192, 1]);
+        let (_basename, width, height, rgba) = run_compare_pixel_job(job).unwrap();
+        assert_eq!((width, height), (8192, 1));
+        assert_eq!(rgba.len(), 8192 * 4);
+        assert_eq!(fit_compare_canvas_size([8320, 7296]).unwrap(), [8192, 7184]);
+        assert_eq!(
+            validate_compare_canvas_size([8320, 7296]).unwrap_err(),
+            "比較表示のサイズが不正です"
+        );
+    }
+
+    #[test]
+    fn compare_canvas_under_texture_limit_is_untouched() {
+        let source = egui::ColorImage::new(
+            [2, 1],
+            vec![egui::Color32::RED, egui::Color32::from_rgb(1, 2, 3)],
+        );
+        let expected = color_image_to_rgba(&source);
+        let job = CapturePixelJob::already_adjusted("under-limit".to_string(), Arc::new(source));
+
+        assert_eq!(job.compare_output_size().unwrap(), [2, 1]);
+        let (_basename, width, height, rgba) = run_compare_pixel_job(job).unwrap();
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(rgba, expected);
+    }
+
+    #[test]
+    fn compare_canvas_keeps_current_aspect_without_reducing_a_larger_pinned_input() {
+        assert_eq!(
+            fit_compare_canvas_for_sources([4, 4], [3584, 4608]).unwrap(),
+            [4608, 4608]
+        );
+        assert_eq!(
+            fit_compare_canvas_for_sources([3680, 5504], [4096, 6144]).unwrap(),
+            [4108, 6144]
+        );
+        assert_eq!(
+            fit_compare_canvas_for_sources([2000, 3000], [1000, 1500]).unwrap(),
+            [2000, 3000]
+        );
+    }
+
+    #[test]
+    fn compare_canvas_for_sources_applies_texture_limit_after_choosing_the_canvas() {
+        assert_eq!(
+            fit_compare_canvas_for_sources([8320, 7296], [9000, 7000]).unwrap(),
+            [8192, 7184]
+        );
+    }
+
+    #[test]
+    fn align_rgba_to_canvas_lanczos_centers_with_opaque_background_padding() {
         let src = vec![255, 0, 0, 255, 255, 0, 0, 255];
-        let out = align_rgba_to_canvas_lanczos(1, 2, &src, 4, 4).unwrap();
+        let out = align_rgba_to_canvas_lanczos(1, 2, &src, 4, 4, egui::Color32::BLACK).unwrap();
 
         assert_eq!(out.len(), 4 * 4 * 4);
-        assert_eq!(&out[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&out[0..4], &[0, 0, 0, 255]);
         assert_eq!(&out[4..8], &[255, 0, 0, 255]);
         assert_eq!(&out[8..12], &[255, 0, 0, 255]);
-        assert_eq!(&out[12..16], &[0, 0, 0, 0]);
+        assert_eq!(&out[12..16], &[0, 0, 0, 255]);
+
+        let current = vec![64, 128, 255, 255].repeat(4 * 4);
+        let diff = diff_rgba_color(4, 4, &out, &current).unwrap();
+        assert_ne!(&diff[0..4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn align_rgba_to_canvas_lanczos_preserves_same_aspect_output() {
+        let src = image::RgbaImage::from_fn(2, 3, |x, y| {
+            image::Rgba([
+                (x * 91 + y * 17) as u8,
+                (x * 23 + y * 71) as u8,
+                (x * 47 + y * 31) as u8,
+                255,
+            ])
+        });
+        let expected = crate::fast_resize::resize_rgba8_exact(
+            &src,
+            4,
+            6,
+            crate::fast_resize::Quality::Lanczos3,
+        )
+        .into_raw();
+
+        let out =
+            align_rgba_to_canvas_lanczos(2, 3, src.as_raw(), 4, 6, egui::Color32::BLACK).unwrap();
+
+        assert_eq!(out, expected);
     }
 
     #[test]

@@ -1761,7 +1761,7 @@ impl App {
                 }
                 Ok(SubfolderExpansionPrepareEvent::Done(prepared)) => {
                     self.subfolder_expansion_install_pending = None;
-                    self.install_prepared_subfolder_expansion(*prepared);
+                    self.install_prepared_subfolder_expansion(*prepared, Some(ctx));
                     return true;
                 }
                 Ok(SubfolderExpansionPrepareEvent::Cancelled) => {
@@ -2051,7 +2051,11 @@ impl App {
         true
     }
 
-    fn install_prepared_subfolder_expansion(&mut self, prepared: PreparedSubfolderExpansion) {
+    fn install_prepared_subfolder_expansion(
+        &mut self,
+        prepared: PreparedSubfolderExpansion,
+        ctx: Option<&egui::Context>,
+    ) {
         let install_t0 = Instant::now();
         let perf_on = crate::perf::is_enabled();
         let seq = self.input_seq;
@@ -2087,6 +2091,8 @@ impl App {
 
         let item_count = items.len();
         let start_loading_t0 = Instant::now();
+        let local_search =
+            (ctx.is_some() && self.show_search_bar).then(|| self.search_query.clone());
         self.start_loading_subfolder_items(
             subfolder_expansion_synthetic_path(),
             items,
@@ -2121,6 +2127,11 @@ impl App {
         self.subfolder_expansion_diag = Some(diag.clone());
         self.address =
             subfolder_expansion_view_label("サブ展開", &root, &roots, Some(&scan_filter));
+        if let (Some(ctx), Some(query)) = (ctx, local_search) {
+            self.show_search_bar = true;
+            self.search_query = query;
+            self.execute_search(ctx);
+        }
         if perf_on {
             crate::perf::event(
                 "subfolder",
@@ -2335,7 +2346,7 @@ impl App {
                 }
                 Ok(SubfolderExpansionPrepareEvent::Done(prepared)) => {
                     self.subfolder_expansion_install_pending = None;
-                    self.install_prepared_subfolder_expansion(*prepared);
+                    self.install_prepared_subfolder_expansion(*prepared, None);
                     return;
                 }
                 Ok(SubfolderExpansionPrepareEvent::Cancelled) => {

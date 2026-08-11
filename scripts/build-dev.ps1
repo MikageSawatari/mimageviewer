@@ -17,9 +17,15 @@
 #
 # This script builds only the application core. It does not run the result or
 # touch the normal application data.
+#
+# Usage:
+#   .\scripts\build-dev.ps1
+#   .\scripts\build-dev.ps1 -TestScript
 
 [CmdletBinding()]
-param()
+param(
+    [switch] $TestScript
+)
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -116,8 +122,15 @@ try {
     Stop-StagedProcess -ExeName 'mimageviewer-remote' -ExePath $remoteExe -Label 'remote service'
 
     Ensure-LibclangPath
-    Write-Host '[build-dev] building normal-profile core with Cargo profile dev-runtime'
-    & cargo build --profile dev-runtime --bin mimageviewer-core
+    $featureArgs = @()
+    $featureLabel = 'normal feature set'
+    if ($TestScript) {
+        $featureArgs = @('--features', 'test-script')
+        $featureLabel = 'test-script feature'
+    }
+    Write-Host ('[build-dev] building normal-profile core with Cargo profile dev-runtime ({0})' -f
+        $featureLabel)
+    & cargo build --profile dev-runtime --bin mimageviewer-core @featureArgs
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }

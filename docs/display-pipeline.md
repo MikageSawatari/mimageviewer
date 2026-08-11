@@ -297,6 +297,16 @@ frame 冒頭では、先読み窓ぶんの `fs_cache` を 1 回だけ走査し�
 ロード済みサムネイル → `PageDimsCache` → 未知なら縦長扱いであり、一度判明した寸法は live cache
 退去後も同じ viewer context / items 世代に残る。全 thumbnails の毎 frame 走査は行わない。
 
+paged 表示でキーリピート由来の未消費ページ送り edge が同じ input frame に残る場合は、現在の
+表示 unit をカタログサムネイルで 1 frame 描き、processed texture と完成済み worker result の
+GPU upload を次の frame へ保留する。単ページは現在ページ、見開きは通常描画と同じ
+`SpreadDisplayUnit` resolver が返す全ページについて `ThumbnailState::Loaded` を要求し、1 ページでも
+欠ける場合や unit を解決できない場合は通常の実体化へ fail-closed する。ただし、その display unit の
+全ページについて `current_final_composite_texture` が既に返せる場合は、未消費 edge があっても
+`Materialize` を維持し、完成表示からサムネイルへ降格しない。この在住確認は cache lookup だけで、
+`resolve_fs_processed_texture` や新しい worker / GPU upload を起動しない。時間閾値や前 frame の
+pending state は使わず、連結読みは対象外とする。
+
 **`keep_fullscreen_viewport_alive`** はフルスクリーン非アクティブ時 (`fullscreen_idx == None`)
 に呼ばれ、`fs_viewport_shown == true` の 1 フレームだけ `Visible(false)` cmd を送って hidden 化
 する責務を持つ。それ以外のアイドルでは何もしない (2026-05-10、hidden viewport 維持コスト削減)。
@@ -760,8 +770,10 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
   wipe/diff比較と360度パノラマの独自`Rgba8Unorm` textureも同じGPU生成器を使う。パノラマは
   水平フル/垂直cropではU=Repeat、水平cropではU=ClampToEdgeを選び、低LODで部分画像の
   反対端が混ざらないようにする。経度シームではU微分を周期補正して`textureSampleGrad`へ渡し、
-  シームだけ過度に粗いmipが選ばれることを防ぐ。比較callbackは現在のpinned/current 1組だけを
-  保持し、解除・再準備時に旧組を解放する。右下のピン表示は72x54以下の専用textureを使う。1つの
+  シームだけ過度に粗いmipが選ばれることを防ぐ。比較callbackは現在のpinned/current textureと
+  mip chainを1組だけ保持し、入力失効・別サイズの再準備時に旧組を解放する。Cの通常表示へ戻る操作では
+  準備済みpinned buffer / managed textureを保持し、同じcurrentへ再表示するときはworkerを起動しない。本文 / ナビゲータのuniform bufferと
+  bind groupはtyped slotごとに分ける。右下のピン表示は72x54以下の専用textureを使う。1つの
   `TextureHandle` 内に全 level を保持するので、表示 texture の優先順位、論理サイズ、zoom、
   見開き、連結読み、ルーペ、pixel grid の座標系は変更しない。
 - animated frame、動画、サムネイル、mask、checker、UI texture は対象外。明示的な
@@ -836,6 +848,14 @@ AI 待ちの `complete=false` final composite も表示専用の候補である�
 カラー化済みの暫定 texture を表示し続ける。完成結果の `insert` が同じ key を上書きするため、
 表示はキャッシュ欠落を挟まず原子的に差し替わる。コピー / 書き出しと nav lock 解除は従来どおり
 `complete=true` だけを受け付ける。
+
+#### ページ単位表示のキーリピート
+
+v2.13.0 では、キーリピート中のページをカタログサムネイルで代替する通過表示を削除した。
+ページ単位表示も通常の優先順位だけを使い、毎フレーム `resolve_fs_processed_texture` で完成画像を
+解決する。final-effect worker の完了結果と `fs_upload_backlog` もページ送り入力では保留せず、
+通常の回収・GPU upload ペースで処理する。次版で再実装するときの設計要件と失敗から得た知見は
+§2.5 を正本とする。
 
 `colorize_display_requires_final_effect(idx)` は、設定が有効かだけでなく、そのページで
 待たずに出せる画素と final-effect worker の出力が視覚的に変わるかを表す gate である。
@@ -992,7 +1012,41 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 比較表示では本文と同じ単一比較キャンバスをレイアウト正本とし、Wipe / Diff はナビゲータの
 画像矩形へ `zoom_pan=None` で同じ `CompareShaderCallback` を再描画する。PinnedNormal は
 準備済み pinned texture を直接描画する。同一フレームの2 callback は同じ `pair.key` と寸法を
-渡すため GPU texture / mip chain / bind group を再利用し、2回目は uniform 更新と draw だけを行う。
+渡すため GPU texture / mip chainを再利用する。一方、`egui-wgpu`は全callbackのprepare後にpaint
+するため、callbackごとに異なるuniformとbind groupは`CompareShaderSlot::{Main, Navigator}`ごとに
+保持し、後のprepareが先の描画状態を上書きしない。
+本文の primary 描画は `CompareFramePrimaryDraw` が排他的に所有する。現在ページに一致する
+`ComparePreparationState::Ready` があるフレームは準備済み比較だけを描き、`Unprepared` /
+`WaitingForSource` / `Preparing` / `Draining` と別ページの `Ready` は通常ページだけを描く。準備中に raw pinned
+texture や Wipe の切れ端を通常ページへ重ねず、準備済み比較を描いた後も nav / colorize holdover を
+重ねない。
+比較を準備・描画できるのは `SpreadMode::Single` の単ページ表示だけとする。X / C / Shift+C / Alt+C
+の全入口は見開き表示モードで案内toastを表示して状態を変更しない。表紙が1枚だけ見える瞬間も
+layout結果ではなく表示モードで拒否する。ページ移動や表示モード変更で比較中に見開き表示モードへ
+入った場合は、フレーム先頭で比較を終了してから通常の見開きを描く。
+見開き側の primary 分岐には比較準備・比較描画を置かない。
+比較キャンバスは current 側の縦横比を正本とし、その比率を維持したまま pinned 側の入力寸法も
+不必要な縮小なしで収まる解像度まで引き上げる。縦横比が違う pinned 側は等比で中央配置する。
+このとき pinned の範囲外はフルスクリーン viewport の既定背景と同じ不透明な黒で
+埋め、WGPU の alpha blend と CPU fallback のどちらでも下層の current を透過させない。Diff は
+この黒背景と current の画素差を表示するため、current が黒でない余白は「差あり」として見える。
+単ページ画像は decode 時点で `MAX_TEXTURE_DIM = 8192` 以下だが、比較workerも完成キャンバスが上限を
+超えた場合は全体を Lanczos で等比縮小する backstop を持つ。上限内は寸法も画素も変更しない。
+独自 WGPU upload も同じ判定を texture 作成の直前に通し、別入口が増えても上限超過の texture を
+作らない。
+比較準備workerは同時に1本だけ所有し、失効した途中cancel不能workerは`Draining`で
+完了を回収してから次要求を開始する。workerは結果送信直後にeguiへrepaintを要求し、100ms tickを
+待たずに完了を回収する。PinnedNormalはcurrentの完成寸法だけをworker開始前に使い、不要なcurrent RGBAを
+生成しない。描画方式ごとのtyped CPU payloadにより、WindowsのWipe / Diffは
+pinned/current RGBA 2枚だけを保持し、Diff用CPU画像 / managed textureはCPU fallbackのDiff時だけ作る。
+本文の比較 callback は、ズーム / パン後の実画像矩形と viewport の交差だけを callback rect にし、
+切り落とした範囲を uniform の UV 窓で元の合成画像座標へ戻す。テクスチャ採取と Wipe 境界判定は
+復元後の座標を共有するため、白線の基準である実画像矩形と一致する。ナビゲータは実画像矩形が
+パネル内に収まり UV 窓が常に全域となるので、このクリップによる表示変更はない。
+Wipe の白線はドラッグ中、またはポインタが`compare_wipe_grab_hit`と同じgrab band内にある間だけ描く。
+画像上のそれ以外の場所では隠し、touch chrome latchは表示条件に使わない。タッチ由来のprimary dragも
+`compare_wipe_dragging`を共有するため、指でドラッグしている間は表示する。境界 fraction は CPU の線 / clip と GPU uniform の双方で `0.0..=1.0` とし、左右端まで
+ドラッグできる。
 通常の単ページ / 見開きで利用者入力から `fs_pan` を更新するときは、直前の
 `FullscreenPageLayout` に記録された実表示矩形を使い、少なくとも 1 ページが viewport と
 各軸 48 logical point（ページまたは viewport がそれより小さい軸では、その小さい方の全幅）
@@ -1400,6 +1454,140 @@ delta に適用するため、ドラッグ途中の Ctrl 押下 / 解放でも�
 隠蔽加工、切り取り、テキスト注釈、エクスポートはページ単位表示専用であり、連結表示中は
 ヘッダーアイコンを無効化して「ページ単位表示でのみ使用できます」と案内する。対応する
 ショートカットを押した場合も、同じ文言に機能名を付けた no-op 表示で理由を知らせる。
+
+---
+
+### 2.5 ページ送り中の表示規則 (次版でやり直すときの正本)
+
+> **v2.13.0 では通過表示の実装を削除した。** `page_turn_decision_for_inputs` /
+> `FsPageTurnDecision` と専用の perf event は現行コードに存在しない。この節は次版でテスト基盤を
+> 先に作って再実装するときの正本として残す。`colorize_display_requires_final_effect` /
+> `waiting_for_colorize`、または新しいページ送り判定を変更・追加する前に、ここを読むこと。
+> **この領域は繰り返し壊れており、壊れ方が毎回違う。**
+> 2026-08-11 の 1 日だけで 3 回退行した (すべて「支配している規則を読まずに判定へ条件を
+> 足した / 反転させた」もの)。
+
+#### 2.5.1 満たすべき要件
+
+| ID | 要件 | 出どころ |
+| --- | --- | --- |
+| **R1** | **ページ表示自体を飛ばさない。** キーを押しっぱなしで通り過ぎるページも、一瞬でも必ず 1 回は画面に出す | 利用者要件 (§1.58、2026-08-07) |
+| **R2** | **白黒 → カラーの切り替わりを見せない。** カラー化や LUT が乗る絵で、色が付く前の状態を一瞬でも出さない | 利用者報告 2026-07-29 (「LUT 未適用の絵が 1 フレーム見えてから色が変わる」)。確定要件 |
+| **R3** | **押しっぱなしで引っかからない。** 入力が続いている間、UI スレッドでフルサイズのアップロードや最終合成を行わない | 実測 (§1.58): 1 枚あたり upload 21ms + final_composite_build 21ms で、キーリピート間隔 34ms に構造的に追いつかない |
+| **R4** | **キーを離したら完成画像で終わる。** 押し終わったページは通常の画質・加工で表示する | 同上 |
+
+R1〜R4 は同時に満たす。**どれか 1 つのために他を崩す修正を入れない。**
+
+#### 2.5.2 2 つの軸を混ぜない
+
+判定は**独立した 2 つの問い**からなる。1 つの真偽値で兼ねてはいけない
+(2026-08-11 の退行はこれが原因)。
+
+| 軸 | 問い | 誰が読むか |
+| --- | --- | --- |
+| **A. 描画元** (`paint_source`) | このフレームで**何を描くか** — カタログサムネイルか、完成画像か | `prepare_fullscreen_state` |
+| **B. 重い処理の保留** (`defer_ui_uploads`) | このフレームで**UI スレッドを使うか** — final-effect 結果の回収 / `fs_upload_batch` の消化 | `poll_final_effects` / `fs_upload_backlog` の消化 |
+
+- **B は R3 の本体**。「ページ送り入力がこのフレームに残っている」かどうかだけで決める。
+  描画元の都合を混ぜない。
+- **A は B の結果ではない**。すでに常駐している完成画像を描く費用は、サムネイルを描く費用と
+  同じ (どちらもアップロード済み texture を貼るだけ)。**B で保留したまま A で完成画像を
+  選んでよい**。
+
+#### 2.5.2.1 「ページ送り中か」は**フレーム間で安定した信号**でなければならない
+
+**この節は 2026-08-11 に 4 回連続で退行させた原因そのもの。判定を触る前に必ず読むこと。**
+
+通過表示に入るかどうかは「いまページ送り中か」で決まる。この信号が**フレームごとに変わると、
+描画元も一緒に変わってちらつく**。
+
+§1.58 の初期実装は、これを **「このフレームに未消費のページ送りキー edge が残っているか」**
+で判定していた。キーリピートは約 30 回/秒、描画は 60fps なので、**おおむね 1 フレームおきに
+true と false が入れ替わる**。その結果、同じページのまま描画元が毎フレーム往復する。
+
+実測 (2026-08-11、`analyze_perf.py page-turn --check`):
+
+```
+I1 violation: burst t=45.222..45.987 idx=123
+  final_composite -> thumbnail -> final_composite -> thumbnail -> ... (28 往復)
+```
+
+ページは動いていない。**入力信号が 30Hz で振動しているだけ**。
+
+したがって判定には、**そのフレームに edge が来たか**ではなく、
+**ページ送りキーが今押されているか** (`keymap::key_held_chord` /
+`key_held_via_os` の OS 直読み) を使う。押下状態は物理状態そのものなので、
+リピート周期に関係なくバーストの間 true のまま安定する。
+
+§1.58 が edge 方式を選んだのは「時間閾値・押下開始時刻・前フレームからの pending 状態を
+判定に使わない」ためだが、**押下状態の直読みはそのいずれでもない** (履歴を持たない現在値)。
+制約の意図を保ったまま、信号だけを安定させられる。
+
+**禁止**: この不安定さを、時間閾値・ヒステリシス・「前フレームの決定を覚えておく」で
+埋めないこと。原因は信号の選び方であって、平滑化で隠す対象ではない。
+
+#### 2.5.3 サムネイルを代役に使ってよい条件
+
+通過表示は「カタログサムネイルをそのページの代役にする」最適化である。**代役が成立しない
+ときは使わない。** 成立条件は加工の種類ごとに違い、判断基準は**見た目の差**と**処理時間**の
+2 つ。
+
+| 加工 | サムネイルとの見た目の差 | フルサイズの実測 | 通過表示の扱い |
+| --- | --- | --- | --- |
+| 色調補正 (明るさ / コントラスト / 彩度など) | 色が変わる | `adjust_ms` **0.00ms** | **サムネイルを使う**。理想はサムネイルに補正を適用して出すこと (§2.5.6) |
+| Creative LUT | 色が変わる | `creative_lut_ms` **0.00ms** | 削除前の実装では「色の最終段」として待つ側に入れていた (R2 の出どころが LUT の報告だったため) |
+| カラー化 | **白黒 → カラー**。差が最も大きい | `colorize_apply_ms` 中央値 **7.9ms** / 最大 **135ms** (1123×1648 で 10ms) | **サムネイルを使わない**。完成画像が来るまで前ページを保持し「カラー化中」を表示する |
+| 消しゴム / 隠蔽 / テキスト注釈 | 内容が変わる | 最悪 **1 秒以上** かかりうる | **サムネイルを使う (加工なしで通過してよい)**。待つと R1 / R3 を壊すため、意図的にスキップする |
+
+**消しゴム・隠蔽・注釈をスキップする理由は「色ではないから」ではなく「時間がかかりすぎるから」。**
+将来この 3 つが十分速くなったら、扱いを再判断する余地がある。
+
+判定の正本は `colorize_display_requires_final_effect(idx)`
+([ui_fullscreen.rs](../src/ui_fullscreen.rs))。**この述語を新しく作り直さない。**
+現在の対象は Creative LUT と カラー化 (`AllImages` / `MonochromeOnly` かつ色補正が
+identity でない等)。
+
+#### 2.5.4 表示単位 (見開き / 連結)
+
+見開きでは、**表示単位に含まれるページのどれか 1 つでも代役が成立しないなら、単位全体で
+通過表示を使わない**。片側だけ完成画像にすると、左右で加工の有無が食い違う。
+サムネイルの有無も同じく単位全体で判定する。削除前は
+`fs_page_turn_display_unit_readiness` がこの役割を持っていたが、次版では壊れた実装を復元せず、
+表示単位の resolver とテストを先に定めてから新しく接続する。
+
+縦・横の連結読みは通過表示の対象外 (スクロールは実体化済みのページを見せるだけなので、
+キーごとの実体化コストが元から出ない)。
+
+#### 2.5.5 トレース不変条件 (機械判定)
+
+次版の実装では、上の規則が `fs.page_turn_ready` / `fs.page_turn_decision` の並びに現れるよう
+計装し、`python scripts/analyze_perf.py <jsonl> page-turn --check` で検査する。v2.13.0 は
+これらの event を出さないため、該当 event の無いログに対する `--check` は
+`checked bursts=0 violations=0`、exit 0 の no-op になる。判定器と回帰テストは次版用に残す。
+**規則を変えたらこの不変条件も同時に更新する。**
+
+| ID | 不変条件 | 対応する要件 |
+| --- | --- | --- |
+| I1 | 1 バースト内で、同じ idx の `source` が `final_composite` → `thumbnail` へ戻らない | R2 |
+| I2 | 1 バースト内で `source` がページをまたいで混ざらない | R2 |
+| I3 | バーストの最初と最後の間のすべての idx が 1 回以上出る | R1 |
+| I4 | バーストの最後の idx は `materialized` で終わる | R4 |
+| I5 | 入力が残っている間 `defer_ui_uploads=true` が維持される | R3 |
+
+**削除前に確認した例外**: フォルダ末尾でキーを押し続けると最後のページがサムネイル画質のまま
+留まった (利用者判断 2026-08-10「支障なし」)。次版の判定器でも I4 はこの場合だけ免除する。
+
+#### 2.5.6 未対応 / 次に検討すること
+
+- **サムネイルに色調補正を適用して出す**。`adjust_ms` が実測 0.00ms なので費用はほぼ無い。
+  削除前の初期実装はサムネイルをそのまま出しており、補正前の色が一瞬見えた。
+- **サムネイルをカラー化して出す**。フルサイズで中央値 7.9ms なので、面積比でサムネイルなら
+  1ms を下回る見込み。実現すれば「カラー化中」で前ページを保持する必要がなくなり、R1 と R2 を
+  同時に満たせる。**ただしトーン階調化のぼかしに固定費がある可能性があるため、サムネイル
+  寸法での実測を先に取ること。**
+- **カラー化 Disabled + 色調補正のみ**のページは、`colorize_display_requires_final_effect`
+  が `false` を返す (`is_color_identity` を見ているのが `MonochromeOnly` の枝の中だけのため)。
+  上の「サムネイルに補正を適用」を入れれば自然に解消する。
 
 ---
 

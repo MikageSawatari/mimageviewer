@@ -326,6 +326,8 @@ impl DetachedActivationWatcher {
             SendMessageTimeoutW, WM_NCHITTEST, WindowFromPoint,
         };
 
+        // Mouse capture is outside the keyboard-only synthetic timeline, so
+        // this physical button level intentionally bypasses key_input.
         let left_button_down =
             unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 };
         let foreground_hwnd = unsafe { GetForegroundWindow().0 as u64 };

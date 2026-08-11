@@ -41,6 +41,9 @@ autobins = false
 
 [features]
 manual-e2e = []
+# Opt-in in-process Rhai runner for isolated application tests. Production
+# builds keep this disabled unless the developer explicitly requests it.
+test-script = []
 # ベンチマーク、配布パック生成、診断用の補助 bin は通常の build/test 対象から外す。
 # 必要なときだけ `--features dev-tools --bin <name>` で明示的に有効化する。
 dev-tools = ["pack-build-tools"]

@@ -90,6 +90,12 @@ synthetic path と、履歴 stack の同じ添字に置く `SmartFolderViewState
 
 ## 3. 更新と失効
 
+明示的な一覧更新は `reload_top_level_grid` を唯一の router とし、
+`TopLevelGridSurface` の網羅 match から通常フォルダ、各検索、スマートフォルダ、サブ展開、
+レーティング、履歴、ブックマーク、ドライブ一覧の既存再入場経路へ振り分ける。★固定は凍結を
+維持して no-op とする。スマートフォルダ / サブ展開の走査中は二重起動せず、通常フォルダの
+選択と Ctrl+F フィルタ、表示中のフォルダツリーペインは更新後に復元 / 再適用する。
+
 root 再準備では新しい実フォルダ表示順を state へ反映する。同じ entry path が残っていれば
 並び替え後の index へ追従できる。削除・リネームで entry が消えた場合は stale な実パスを
 scope として保持せず root へ戻す。定義削除、worker cancel、別最上位ビューへの遷移は既存の

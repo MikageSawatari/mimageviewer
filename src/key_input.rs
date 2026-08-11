@@ -8,6 +8,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
@@ -19,6 +20,224 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const MAIN_KEY_INPUT_SUBCLASS_ID: usize = 0x6D69_6B31; // "mik1"
 const MAX_PENDING_EVENTS: usize = 256;
 const MAX_LOGGED_UNREGISTERED_HWND: usize = 16;
+const MAX_SYNTHETIC_INPUT_ISSUES: usize = 64;
+const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(250);
+const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_nanos(33_333_333);
+
+/// A physical Windows key slot used by level-sensitive input consumers.
+///
+/// `extended` is required because main Enter and numpad Enter share
+/// `VK_RETURN`. The initial synthetic-input surface deliberately exposes only
+/// [`SyntheticNavigationKey`]; characters, JIS punctuation, numpad keys,
+/// clipboard operations, and IME input are outside this stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhysicalKeySlot {
+    pub vk: u32,
+    pub extended: bool,
+}
+
+impl PhysicalKeySlot {
+    pub const fn new(vk: u32, extended: bool) -> Self {
+        Self { vk, extended }
+    }
+}
+
+/// Navigation keys supported by the initial synthetic-input timeline.
+///
+/// Printable keys, JIS symbols, numpad-specific keys, clipboard shortcuts,
+/// text events, and IME events are intentionally not representable here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntheticNavigationKey {
+    Right,
+    Left,
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Enter,
+    Escape,
+}
+
+impl SyntheticNavigationKey {
+    #[cfg(feature = "test-script")]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Right => "Right",
+            Self::Left => "Left",
+            Self::Up => "Up",
+            Self::Down => "Down",
+            Self::PageUp => "PageUp",
+            Self::PageDown => "PageDown",
+            Self::Home => "Home",
+            Self::End => "End",
+            Self::Enter => "Enter",
+            Self::Escape => "Escape",
+        }
+    }
+
+    const fn physical_slot(self) -> PhysicalKeySlot {
+        match self {
+            Self::Right => PhysicalKeySlot::new(0x27, true),
+            Self::Left => PhysicalKeySlot::new(0x25, true),
+            Self::Up => PhysicalKeySlot::new(0x26, true),
+            Self::Down => PhysicalKeySlot::new(0x28, true),
+            Self::PageUp => PhysicalKeySlot::new(0x21, true),
+            Self::PageDown => PhysicalKeySlot::new(0x22, true),
+            Self::Home => PhysicalKeySlot::new(0x24, true),
+            Self::End => PhysicalKeySlot::new(0x23, true),
+            Self::Enter => PhysicalKeySlot::new(0x0D, false),
+            Self::Escape => PhysicalKeySlot::new(0x1B, false),
+        }
+    }
+
+    const fn scan_code(self) -> u16 {
+        match self {
+            Self::Right => 0x4D,
+            Self::Left => 0x4B,
+            Self::Up => 0x48,
+            Self::Down => 0x50,
+            Self::PageUp => 0x49,
+            Self::PageDown => 0x51,
+            Self::Home => 0x47,
+            Self::End => 0x4F,
+            Self::Enter => 0x1C,
+            Self::Escape => 0x01,
+        }
+    }
+
+    const fn egui_key(self) -> egui::Key {
+        match self {
+            Self::Right => egui::Key::ArrowRight,
+            Self::Left => egui::Key::ArrowLeft,
+            Self::Up => egui::Key::ArrowUp,
+            Self::Down => egui::Key::ArrowDown,
+            Self::PageUp => egui::Key::PageUp,
+            Self::PageDown => egui::Key::PageDown,
+            Self::Home => egui::Key::Home,
+            Self::End => egui::Key::End,
+            Self::Enter => egui::Key::Enter,
+            Self::Escape => egui::Key::Escape,
+        }
+    }
+}
+
+/// Generic modifier level attached to a synthetic navigation hold.
+///
+/// Left/right-specific modifier keys are not part of the initial navigation
+/// API. On Windows `command` is derived from `ctrl`, while `mac_cmd` is always
+/// false.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyntheticModifiers {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+}
+
+impl SyntheticModifiers {
+    const fn union(self, other: Self) -> Self {
+        Self {
+            ctrl: self.ctrl || other.ctrl,
+            shift: self.shift || other.shift,
+            alt: self.alt || other.alt,
+        }
+    }
+
+    const fn to_egui(self) -> egui::Modifiers {
+        egui::Modifiers {
+            alt: self.alt,
+            ctrl: self.ctrl,
+            shift: self.shift,
+            mac_cmd: false,
+            command: self.ctrl,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntheticKeyCommandKind {
+    Down {
+        key: SyntheticNavigationKey,
+        modifiers: SyntheticModifiers,
+    },
+    Up {
+        key: SyntheticNavigationKey,
+    },
+    CancelAll,
+}
+
+/// A monotonic-clock command consumed by the synthetic input timeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyntheticKeyCommand {
+    pub at: Instant,
+    pub kind: SyntheticKeyCommandKind,
+    pub(crate) hold_id: Option<u64>,
+}
+
+impl SyntheticKeyCommand {
+    pub const fn down(
+        at: Instant,
+        key: SyntheticNavigationKey,
+        modifiers: SyntheticModifiers,
+    ) -> Self {
+        Self {
+            at,
+            kind: SyntheticKeyCommandKind::Down { key, modifiers },
+            hold_id: None,
+        }
+    }
+
+    pub const fn up(at: Instant, key: SyntheticNavigationKey) -> Self {
+        Self {
+            at,
+            kind: SyntheticKeyCommandKind::Up { key },
+            hold_id: None,
+        }
+    }
+
+    pub const fn cancel_all(at: Instant) -> Self {
+        Self {
+            at,
+            kind: SyntheticKeyCommandKind::CancelAll,
+            hold_id: None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-script"))]
+    pub const fn with_hold_id(mut self, hold_id: u64) -> Self {
+        self.hold_id = Some(hold_id);
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyntheticRoutingTarget {
+    pub hwnd: u64,
+    pub viewport: egui::ViewportId,
+}
+
+/// A typed routing result so a future script runner can wait or fail instead
+/// of silently redirecting an unregistered foreground HWND to ROOT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntheticRoutingTargetError {
+    NoForegroundWindow,
+    UnregisteredForegroundWindow { hwnd: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SyntheticInputIssue {
+    WaitingForRouting(SyntheticRoutingTargetError),
+    WaitingForFocus(SyntheticRoutingTarget),
+    FocusLost {
+        viewport: egui::ViewportId,
+    },
+    TargetViewportNotRendered {
+        viewport: egui::ViewportId,
+        raw_input_time: Option<f64>,
+        event_count: usize,
+    },
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyEdge {
@@ -203,6 +422,479 @@ impl ViewportReturnKeyStates {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct QueuedSyntheticCommand {
+    sequence: u64,
+    command: SyntheticKeyCommand,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HeldSyntheticKey {
+    key: SyntheticNavigationKey,
+    modifiers: SyntheticModifiers,
+    target: SyntheticRoutingTarget,
+    hold_id: Option<u64>,
+    next_repeat_at: Instant,
+    repeat_interval: Duration,
+    order: u64,
+    materialized_down_count: u64,
+    materialized_repeat_count: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MaterializedSyntheticEvent {
+    at: Instant,
+    key: SyntheticNavigationKey,
+    target: SyntheticRoutingTarget,
+    hold_id: Option<u64>,
+    pressed: bool,
+    repeat: bool,
+    modifiers: SyntheticModifiers,
+}
+
+impl MaterializedSyntheticEvent {
+    fn key_edge(self) -> KeyEdge {
+        let slot = self.key.physical_slot();
+        KeyEdge {
+            source_hwnd: self.target.hwnd,
+            source_viewport: self.target.viewport,
+            virtual_key: slot.vk,
+            scan_code: self.key.scan_code(),
+            extended: slot.extended,
+            pressed: self.pressed,
+            repeat: self.repeat,
+            ctrl: self.modifiers.ctrl,
+            shift: self.modifiers.shift,
+            alt: self.modifiers.alt,
+        }
+    }
+
+    fn egui_event(self) -> egui::Event {
+        let key = self.key.egui_key();
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: self.pressed,
+            // Match egui-winit: egui derives repeat from viewport-local
+            // keys_down while processing the event stream.
+            repeat: false,
+            modifiers: self.modifiers.to_egui(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum SyntheticInputFact {
+    HoldBegin {
+        hold_id: u64,
+        key: SyntheticNavigationKey,
+        target: SyntheticRoutingTarget,
+        repeat_delay: Duration,
+        repeat_hz: f64,
+    },
+    HoldEnd {
+        hold_id: u64,
+        down_count: u64,
+        repeat_count: u64,
+        up_count: u64,
+    },
+    FrameInput {
+        hold_id: u64,
+        held: bool,
+        edge_count: u64,
+        // Number of repeat edges materialized in this outer input frame.
+        // The analyzer uses values greater than one as accumulated-repeat
+        // evidence; Down and Up are represented by edge_count instead.
+        materialized_in_frame: u64,
+    },
+}
+
+#[derive(Debug)]
+struct SyntheticMaterialization {
+    armed: bool,
+    events: Vec<MaterializedSyntheticEvent>,
+    facts: Vec<SyntheticInputFact>,
+    final_modifiers: SyntheticModifiers,
+    issue: Option<SyntheticInputIssue>,
+}
+
+impl SyntheticMaterialization {
+    fn disarmed() -> Self {
+        Self {
+            armed: false,
+            events: Vec::new(),
+            facts: Vec::new(),
+            final_modifiers: SyntheticModifiers::default(),
+            issue: None,
+        }
+    }
+}
+
+struct SyntheticTimeline {
+    armed: bool,
+    commands: VecDeque<QueuedSyntheticCommand>,
+    held: Vec<HeldSyntheticKey>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    next_sequence: u64,
+    repeat_delay: Duration,
+    repeat_interval: Duration,
+}
+
+impl Default for SyntheticTimeline {
+    fn default() -> Self {
+        Self {
+            armed: false,
+            commands: VecDeque::new(),
+            held: Vec::new(),
+            next_sequence: 0,
+            repeat_delay: DEFAULT_REPEAT_DELAY,
+            repeat_interval: DEFAULT_REPEAT_INTERVAL,
+        }
+    }
+}
+
+impl SyntheticTimeline {
+    #[cfg(any(test, feature = "test-script"))]
+    fn arm(&mut self) {
+        *self = Self::default();
+        self.armed = true;
+    }
+
+    #[cfg(any(test, feature = "test-script"))]
+    fn disarm(&mut self) {
+        *self = Self::default();
+    }
+
+    #[cfg(any(test, feature = "test-script"))]
+    fn set_repeat(&mut self, delay: Duration, hz: f64) -> bool {
+        if !hz.is_finite() || hz <= 0.0 {
+            return false;
+        }
+        let interval = Duration::from_secs_f64(1.0 / hz);
+        if interval.is_zero() {
+            return false;
+        }
+        self.repeat_delay = delay;
+        self.repeat_interval = interval;
+        true
+    }
+
+    #[cfg(any(test, feature = "test-script"))]
+    fn is_idle(&self) -> bool {
+        self.commands.is_empty() && self.held.is_empty()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn enqueue(&mut self, command: SyntheticKeyCommand) {
+        let queued = QueuedSyntheticCommand {
+            sequence: self.next_sequence,
+            command,
+        };
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        let index = self
+            .commands
+            .iter()
+            .position(|existing| {
+                (existing.command.at, existing.sequence) > (queued.command.at, queued.sequence)
+            })
+            .unwrap_or(self.commands.len());
+        self.commands.insert(index, queued);
+    }
+
+    fn modifiers(&self) -> SyntheticModifiers {
+        self.held
+            .iter()
+            .fold(SyntheticModifiers::default(), |current, held| {
+                current.union(held.modifiers)
+            })
+    }
+
+    fn physical_key_down(&self, slot: PhysicalKeySlot) -> bool {
+        if !self.armed {
+            return false;
+        }
+        let modifiers = self.modifiers();
+        match slot.vk {
+            0x10 => modifiers.shift,
+            0x11 => modifiers.ctrl,
+            0x12 => modifiers.alt,
+            // Sided modifier slots are intentionally outside the initial
+            // synthetic navigation API.
+            0xA0..=0xA5 => false,
+            _ => self.held.iter().any(|held| {
+                let held_slot = held.key.physical_slot();
+                held_slot.vk == slot.vk && (slot.vk != 0x0D || held_slot.extended == slot.extended)
+            }),
+        }
+    }
+
+    fn next_repeat_index_through(&self, cutoff: Instant) -> Option<usize> {
+        self.held
+            .iter()
+            .enumerate()
+            .filter(|(_, held)| held.next_repeat_at <= cutoff)
+            .min_by_key(|(_, held)| (held.next_repeat_at, held.order))
+            .map(|(index, _)| index)
+    }
+
+    fn emit_repeats_through(
+        &mut self,
+        cutoff: Instant,
+        events: &mut Vec<MaterializedSyntheticEvent>,
+    ) {
+        while let Some(index) = self.next_repeat_index_through(cutoff) {
+            let modifiers = self.modifiers();
+            let held = &mut self.held[index];
+            let at = held.next_repeat_at;
+            held.materialized_repeat_count = held.materialized_repeat_count.saturating_add(1);
+            events.push(MaterializedSyntheticEvent {
+                at,
+                key: held.key,
+                target: held.target,
+                hold_id: held.hold_id,
+                pressed: true,
+                repeat: true,
+                modifiers,
+            });
+            held.next_repeat_at += held.repeat_interval;
+        }
+    }
+
+    fn release_key(
+        &mut self,
+        key: SyntheticNavigationKey,
+        hold_id: Option<u64>,
+        at: Instant,
+        events: &mut Vec<MaterializedSyntheticEvent>,
+        facts: &mut Vec<SyntheticInputFact>,
+        collect_facts: bool,
+    ) {
+        let Some(index) = self.held.iter().position(|held| {
+            held.key == key && hold_id.map_or(true, |hold_id| held.hold_id == Some(hold_id))
+        }) else {
+            return;
+        };
+        let modifiers = self.modifiers();
+        let held = self.held.remove(index);
+        events.push(MaterializedSyntheticEvent {
+            at,
+            key: held.key,
+            target: held.target,
+            hold_id: held.hold_id,
+            pressed: false,
+            repeat: false,
+            modifiers,
+        });
+        if collect_facts && let Some(hold_id) = held.hold_id {
+            facts.push(SyntheticInputFact::HoldEnd {
+                hold_id,
+                down_count: held.materialized_down_count,
+                repeat_count: held.materialized_repeat_count,
+                up_count: 1,
+            });
+        }
+    }
+
+    fn cancel_all_at(
+        &mut self,
+        at: Instant,
+        events: &mut Vec<MaterializedSyntheticEvent>,
+        facts: &mut Vec<SyntheticInputFact>,
+        collect_facts: bool,
+    ) {
+        while !self.held.is_empty() {
+            let index = self
+                .held
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, held)| held.order)
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            let modifiers = self.modifiers();
+            let held = self.held.remove(index);
+            events.push(MaterializedSyntheticEvent {
+                at,
+                key: held.key,
+                target: held.target,
+                hold_id: held.hold_id,
+                pressed: false,
+                repeat: false,
+                modifiers,
+            });
+            if collect_facts && let Some(hold_id) = held.hold_id {
+                facts.push(SyntheticInputFact::HoldEnd {
+                    hold_id,
+                    down_count: held.materialized_down_count,
+                    repeat_count: held.materialized_repeat_count,
+                    up_count: 1,
+                });
+            }
+        }
+    }
+
+    fn append_frame_input_facts(
+        &self,
+        events: &[MaterializedSyntheticEvent],
+        facts: &mut Vec<SyntheticInputFact>,
+    ) {
+        let mut hold_ids = Vec::new();
+        for hold_id in events
+            .iter()
+            .filter_map(|event| event.hold_id)
+            .chain(self.held.iter().filter_map(|held| held.hold_id))
+        {
+            if !hold_ids.contains(&hold_id) {
+                hold_ids.push(hold_id);
+            }
+        }
+        for hold_id in hold_ids {
+            facts.push(SyntheticInputFact::FrameInput {
+                hold_id,
+                held: self.held.iter().any(|held| held.hold_id == Some(hold_id)),
+                edge_count: events
+                    .iter()
+                    .filter(|event| event.hold_id == Some(hold_id))
+                    .count() as u64,
+                materialized_in_frame: events
+                    .iter()
+                    .filter(|event| event.hold_id == Some(hold_id) && event.repeat)
+                    .count() as u64,
+            });
+        }
+    }
+
+    fn materialize<F, R>(
+        &mut self,
+        now: Instant,
+        mut resolve: R,
+        mut focused: F,
+        collect_facts: bool,
+    ) -> SyntheticMaterialization
+    where
+        F: FnMut(egui::ViewportId) -> Option<bool>,
+        R: FnMut() -> Result<SyntheticRoutingTarget, SyntheticRoutingTargetError>,
+    {
+        if !self.armed {
+            return SyntheticMaterialization::disarmed();
+        }
+
+        let mut events = Vec::new();
+        let mut facts = Vec::new();
+        if let Some(lost) = self
+            .held
+            .iter()
+            .find(|held| focused(held.target.viewport) == Some(false))
+            .map(|held| held.target.viewport)
+        {
+            self.cancel_all_at(now, &mut events, &mut facts, collect_facts);
+            self.commands.clear();
+            if collect_facts {
+                self.append_frame_input_facts(&events, &mut facts);
+            }
+            return SyntheticMaterialization {
+                armed: true,
+                events,
+                facts,
+                final_modifiers: SyntheticModifiers::default(),
+                issue: Some(SyntheticInputIssue::FocusLost { viewport: lost }),
+            };
+        }
+
+        let mut issue = None;
+        loop {
+            let Some(queued) = self.commands.front().copied() else {
+                break;
+            };
+            if queued.command.at > now {
+                break;
+            }
+
+            // Repeats due at the same timestamp as an Up/Cancel are emitted
+            // first, preserving Down -> due repeats -> Up after a sleeping UI.
+            self.emit_repeats_through(queued.command.at, &mut events);
+            match queued.command.kind {
+                SyntheticKeyCommandKind::Down { key, modifiers } => {
+                    if self.held.iter().any(|held| held.key == key) {
+                        self.commands.pop_front();
+                        continue;
+                    }
+                    let target = match resolve() {
+                        Ok(target) => target,
+                        Err(error) => {
+                            issue = Some(SyntheticInputIssue::WaitingForRouting(error));
+                            break;
+                        }
+                    };
+                    if focused(target.viewport) != Some(true) {
+                        issue = Some(SyntheticInputIssue::WaitingForFocus(target));
+                        break;
+                    }
+                    self.commands.pop_front();
+                    self.held.push(HeldSyntheticKey {
+                        key,
+                        modifiers,
+                        target,
+                        hold_id: queued.command.hold_id,
+                        next_repeat_at: queued.command.at + self.repeat_delay,
+                        repeat_interval: self.repeat_interval,
+                        order: queued.sequence,
+                        materialized_down_count: 1,
+                        materialized_repeat_count: 0,
+                    });
+                    events.push(MaterializedSyntheticEvent {
+                        at: queued.command.at,
+                        key,
+                        target,
+                        hold_id: queued.command.hold_id,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: self.modifiers(),
+                    });
+                    if collect_facts && let Some(hold_id) = queued.command.hold_id {
+                        facts.push(SyntheticInputFact::HoldBegin {
+                            hold_id,
+                            key,
+                            target,
+                            repeat_delay: self.repeat_delay,
+                            repeat_hz: 1.0 / self.repeat_interval.as_secs_f64(),
+                        });
+                    }
+                }
+                SyntheticKeyCommandKind::Up { key } => {
+                    self.commands.pop_front();
+                    self.release_key(
+                        key,
+                        queued.command.hold_id,
+                        queued.command.at,
+                        &mut events,
+                        &mut facts,
+                        collect_facts,
+                    );
+                }
+                SyntheticKeyCommandKind::CancelAll => {
+                    self.commands.pop_front();
+                    self.cancel_all_at(queued.command.at, &mut events, &mut facts, collect_facts);
+                }
+            }
+        }
+        if issue.is_none() {
+            self.emit_repeats_through(now, &mut events);
+        }
+
+        if collect_facts {
+            self.append_frame_input_facts(&events, &mut facts);
+        }
+
+        SyntheticMaterialization {
+            armed: true,
+            events,
+            facts,
+            final_modifiers: self.modifiers(),
+            issue,
+        }
+    }
+}
+
 #[derive(Default)]
 struct KeyInputState {
     installed_hwnds: HwndViewportRegistry,
@@ -211,6 +903,9 @@ struct KeyInputState {
     frame_active_viewports: Vec<egui::ViewportId>,
     return_keys: ViewportReturnKeyStates,
     logged_unregistered_hwnds: Vec<u64>,
+    synthetic: SyntheticTimeline,
+    #[cfg(test)]
+    test_foreground_hwnd: Option<u64>,
 }
 
 impl KeyInputState {
@@ -242,6 +937,14 @@ impl KeyInputState {
         Some(viewport)
     }
 
+    fn enqueue_key_edge(&mut self, edge: KeyEdge) {
+        self.return_keys.apply_edge(edge.source_viewport, &edge);
+        while self.pending.len() >= MAX_PENDING_EVENTS {
+            self.pending.pop_front();
+        }
+        self.pending.push_back(edge);
+    }
+
     fn enqueue_raw_edge(&mut self, hwnd_raw: u64, raw: RawKeyEdge) -> (KeyEdge, bool) {
         // The root HWND is installed before its subclass can publish input.
         // Missing registration is therefore an invariant violation. Route it
@@ -252,11 +955,7 @@ impl KeyInputState {
             .viewport_for_hwnd(hwnd_raw)
             .unwrap_or(egui::ViewportId::ROOT);
         let edge = raw.with_source(hwnd_raw, source_viewport);
-        self.return_keys.apply_edge(source_viewport, &edge);
-        while self.pending.len() >= MAX_PENDING_EVENTS {
-            self.pending.pop_front();
-        }
-        self.pending.push_back(edge);
+        self.enqueue_key_edge(edge);
 
         let unregistered = self.installed_hwnds.viewport_for_hwnd(hwnd_raw).is_none();
         let should_log = unregistered && !self.logged_unregistered_hwnds.contains(&hwnd_raw);
@@ -274,11 +973,431 @@ impl KeyInputState {
             .contains(&viewport)
             .then(|| self.return_keys.is_down(viewport, extended))
     }
+
+    fn materialize_synthetic<F>(&mut self, now: Instant, focused: F) -> SyntheticMaterialization
+    where
+        F: FnMut(egui::ViewportId) -> Option<bool>,
+    {
+        #[cfg(test)]
+        let foreground_override = self.test_foreground_hwnd;
+        let registry = &self.installed_hwnds;
+        let materialized = self.synthetic.materialize(
+            now,
+            || {
+                #[cfg(test)]
+                let hwnd = foreground_override.unwrap_or_else(current_foreground_hwnd_raw);
+                #[cfg(not(test))]
+                let hwnd = current_foreground_hwnd_raw();
+                resolve_registered_target(registry, hwnd)
+            },
+            focused,
+            synthetic_perf_facts_enabled(),
+        );
+        for event in &materialized.events {
+            self.enqueue_key_edge(event.key_edge());
+        }
+        materialized
+    }
 }
 
 fn state() -> &'static Mutex<KeyInputState> {
     static STATE: OnceLock<Mutex<KeyInputState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(KeyInputState::default()))
+}
+
+#[inline]
+fn synthetic_perf_facts_enabled() -> bool {
+    #[cfg(test)]
+    {
+        true
+    }
+    #[cfg(all(not(test), feature = "test-script"))]
+    {
+        crate::perf::is_enabled()
+    }
+    #[cfg(all(not(test), not(feature = "test-script")))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+fn current_foreground_hwnd_raw() -> u64 {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    unsafe { GetForegroundWindow().0 as usize as u64 }
+}
+
+#[cfg(not(windows))]
+fn current_foreground_hwnd_raw() -> u64 {
+    0
+}
+
+fn resolve_registered_target(
+    registry: &HwndViewportRegistry,
+    hwnd: u64,
+) -> Result<SyntheticRoutingTarget, SyntheticRoutingTargetError> {
+    if hwnd == 0 {
+        return Err(SyntheticRoutingTargetError::NoForegroundWindow);
+    }
+    let Some(viewport) = registry.viewport_for_hwnd(hwnd) else {
+        return Err(SyntheticRoutingTargetError::UnregisteredForegroundWindow { hwnd });
+    };
+    Ok(SyntheticRoutingTarget { hwnd, viewport })
+}
+
+pub fn resolve_synthetic_routing_target()
+-> Result<SyntheticRoutingTarget, SyntheticRoutingTargetError> {
+    let Ok(guard) = state().lock() else {
+        return Err(SyntheticRoutingTargetError::NoForegroundWindow);
+    };
+    #[cfg(test)]
+    let hwnd = guard
+        .test_foreground_hwnd
+        .unwrap_or_else(current_foreground_hwnd_raw);
+    #[cfg(not(test))]
+    let hwnd = current_foreground_hwnd_raw();
+    resolve_registered_target(&guard.installed_hwnds, hwnd)
+}
+
+/// Return the current physical level from the synthetic timeline while it is
+/// armed, or from the caller's operating-system source otherwise.
+///
+/// The OS source is a parameter because the two readers need different Win32
+/// calls. Callers asking "is this key held right now" want `GetAsyncKeyState`,
+/// while the subclass proc must stamp an edge with `GetKeyState`, whose value is
+/// synchronized with the message being processed. Substituting the async state
+/// there would describe the wrong moment whenever messages are drained late,
+/// which is exactly the slow-frame case this timeline exists to reproduce.
+fn physical_key_down_from(slot: PhysicalKeySlot, os_level: impl FnOnce() -> bool) -> bool {
+    if let Ok(guard) = state().lock()
+        && guard.synthetic.armed
+    {
+        return guard.synthetic.physical_key_down(slot);
+    }
+    os_level()
+}
+
+/// Return the current physical level from the synthetic timeline while it is
+/// armed, or from the operating system otherwise.
+///
+/// This chokepoint is deliberately not feature-gated. Before the script runner
+/// exists, production has no arming path and therefore follows the OS branch.
+pub fn physical_key_down(slot: PhysicalKeySlot) -> bool {
+    physical_key_down_from(slot, || {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+
+        unsafe { GetAsyncKeyState(slot.vk as i32) < 0 }
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RawInputTimeKey(Option<u64>);
+
+impl From<Option<f64>> for RawInputTimeKey {
+    fn from(time: Option<f64>) -> Self {
+        Self(time.map(f64::to_bits))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SyntheticViewportBatch {
+    viewport: egui::ViewportId,
+    events: Vec<egui::Event>,
+}
+
+#[derive(Debug)]
+struct PreparedSyntheticFrame {
+    time_key: RawInputTimeKey,
+    raw_input_time: Option<f64>,
+    batches: Vec<SyntheticViewportBatch>,
+    delivered_viewports: Vec<egui::ViewportId>,
+    final_modifiers: egui::Modifiers,
+    armed: bool,
+}
+
+#[derive(Default)]
+struct SyntheticInputPlugin {
+    prepared: Option<PreparedSyntheticFrame>,
+    issues: VecDeque<SyntheticInputIssue>,
+    next_frame_nr: u64,
+}
+
+impl SyntheticInputPlugin {
+    fn record_issue(&mut self, issue: SyntheticInputIssue) {
+        while self.issues.len() >= MAX_SYNTHETIC_INPUT_ISSUES {
+            self.issues.pop_front();
+        }
+        self.issues.push_back(issue);
+    }
+
+    fn record_undelivered_previous_frame(&mut self) {
+        let Some(prepared) = self.prepared.as_ref() else {
+            return;
+        };
+        let misses: Vec<_> = prepared
+            .batches
+            .iter()
+            .filter(|batch| {
+                batch.viewport != egui::ViewportId::ROOT
+                    && !batch.events.is_empty()
+                    && !prepared.delivered_viewports.contains(&batch.viewport)
+            })
+            .map(|batch| SyntheticInputIssue::TargetViewportNotRendered {
+                viewport: batch.viewport,
+                raw_input_time: prepared.raw_input_time,
+                event_count: batch.events.len(),
+            })
+            .collect();
+        for miss in misses {
+            self.record_issue(miss);
+        }
+    }
+
+    fn prepare_root(&mut self, input: &egui::RawInput) {
+        let time_key = RawInputTimeKey::from(input.time);
+        if self
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.time_key == time_key)
+        {
+            return;
+        }
+
+        self.record_undelivered_previous_frame();
+        let frame_nr = self.next_frame_nr;
+        self.next_frame_nr = self.next_frame_nr.saturating_add(1);
+        let materialized = state()
+            .lock()
+            .map(|mut guard| {
+                guard.materialize_synthetic(Instant::now(), |viewport| {
+                    if viewport == input.viewport_id {
+                        Some(input.focused)
+                    } else {
+                        input.viewports.get(&viewport).and_then(|info| info.focused)
+                    }
+                })
+            })
+            .unwrap_or_else(|_| SyntheticMaterialization::disarmed());
+        debug_assert!(
+            materialized
+                .events
+                .windows(2)
+                .all(|pair| pair[0].at <= pair[1].at),
+            "synthetic input materialization must stay chronological"
+        );
+        emit_synthetic_input_facts(&materialized.facts, frame_nr);
+
+        let mut batches: Vec<SyntheticViewportBatch> = Vec::new();
+        for event in materialized.events {
+            let egui_event = event.egui_event();
+            if let Some(batch) = batches
+                .iter_mut()
+                .find(|batch| batch.viewport == event.target.viewport)
+            {
+                batch.events.push(egui_event);
+            } else {
+                batches.push(SyntheticViewportBatch {
+                    viewport: event.target.viewport,
+                    events: vec![egui_event],
+                });
+            }
+        }
+        if let Some(issue) = materialized.issue {
+            self.record_issue(issue);
+        }
+        self.prepared = Some(PreparedSyntheticFrame {
+            time_key,
+            raw_input_time: input.time,
+            batches,
+            delivered_viewports: Vec::new(),
+            final_modifiers: materialized.final_modifiers.to_egui(),
+            armed: materialized.armed,
+        });
+    }
+
+    fn inject_prepared(&mut self, input: &mut egui::RawInput) {
+        let Some(prepared) = self.prepared.as_mut() else {
+            return;
+        };
+        if !prepared.armed {
+            return;
+        }
+        input.modifiers = prepared.final_modifiers;
+        let Some(batch) = prepared
+            .batches
+            .iter()
+            .find(|batch| batch.viewport == input.viewport_id)
+        else {
+            return;
+        };
+        input.events.extend(batch.events.iter().cloned());
+        if !prepared.delivered_viewports.contains(&input.viewport_id) {
+            prepared.delivered_viewports.push(input.viewport_id);
+        }
+    }
+}
+
+#[cfg(feature = "test-script")]
+fn emit_synthetic_input_facts(facts: &[SyntheticInputFact], frame_nr: u64) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    for fact in facts {
+        match fact {
+            SyntheticInputFact::HoldBegin {
+                hold_id,
+                key,
+                target,
+                repeat_delay,
+                repeat_hz,
+            } => {
+                let target_viewport = if target.viewport == egui::ViewportId::ROOT {
+                    "ROOT".to_string()
+                } else {
+                    format!("{:?}", target.viewport)
+                };
+                crate::perf::event(
+                    "test_script",
+                    "hold_begin",
+                    Some(key.as_str()),
+                    0,
+                    &[
+                        ("hold_id", serde_json::Value::from(*hold_id)),
+                        ("target_viewport", serde_json::Value::from(target_viewport)),
+                        (
+                            "repeat_delay_ms",
+                            serde_json::Value::from(repeat_delay.as_secs_f64() * 1000.0),
+                        ),
+                        ("repeat_hz", serde_json::Value::from(*repeat_hz)),
+                    ],
+                );
+            }
+            SyntheticInputFact::HoldEnd {
+                hold_id,
+                down_count,
+                repeat_count,
+                up_count,
+            } => crate::perf::event(
+                "test_script",
+                "hold_end",
+                None,
+                0,
+                &[
+                    ("hold_id", serde_json::Value::from(*hold_id)),
+                    ("down_count", serde_json::Value::from(*down_count)),
+                    ("repeat_count", serde_json::Value::from(*repeat_count)),
+                    ("up_count", serde_json::Value::from(*up_count)),
+                ],
+            ),
+            SyntheticInputFact::FrameInput {
+                hold_id,
+                held,
+                edge_count,
+                materialized_in_frame,
+            } => crate::perf::event(
+                "test_script",
+                "frame_input",
+                None,
+                0,
+                &[
+                    ("hold_id", serde_json::Value::from(*hold_id)),
+                    ("held", serde_json::Value::from(*held)),
+                    ("edge_count", serde_json::Value::from(*edge_count)),
+                    (
+                        "materialized_in_frame",
+                        serde_json::Value::from(*materialized_in_frame),
+                    ),
+                    ("frame_nr", serde_json::Value::from(frame_nr)),
+                ],
+            ),
+        }
+    }
+}
+
+#[cfg(not(feature = "test-script"))]
+fn emit_synthetic_input_facts(_facts: &[SyntheticInputFact], _frame_nr: u64) {}
+
+impl egui::Plugin for SyntheticInputPlugin {
+    fn debug_name(&self) -> &'static str {
+        "miv_synthetic_input"
+    }
+
+    fn input_hook(&mut self, input: &mut egui::RawInput) {
+        if input.viewport_id == egui::ViewportId::ROOT {
+            self.prepare_root(input);
+        }
+        self.inject_prepared(input);
+    }
+}
+
+/// Install before the IME input plugin so synthetic Escape and Enter traverse
+/// the same normalization order as backend-generated key events.
+pub(crate) fn install_synthetic_input_plugin(ctx: &egui::Context) {
+    ctx.add_plugin(SyntheticInputPlugin::default());
+}
+
+pub fn take_synthetic_input_issues(ctx: &egui::Context) -> Vec<SyntheticInputIssue> {
+    ctx.with_plugin(|plugin: &mut SyntheticInputPlugin| plugin.issues.drain(..).collect())
+        .unwrap_or_default()
+}
+
+/// Arm the production synthetic timeline without disturbing the HWND registry
+/// or real key queues. The timeline remains the single owner of synthetic
+/// level state used by [`physical_key_down`].
+#[cfg(any(test, feature = "test-script"))]
+pub fn arm_synthetic_input() -> bool {
+    state()
+        .lock()
+        .map(|mut guard| guard.synthetic.arm())
+        .is_ok()
+}
+
+/// Queue a timestamped synthetic key command. Materialization still happens
+/// only in the ROOT input plugin on the UI thread.
+#[cfg(any(test, feature = "test-script"))]
+pub fn enqueue_synthetic_command(command: SyntheticKeyCommand) -> bool {
+    state()
+        .lock()
+        .map(|mut guard| guard.synthetic.enqueue(command))
+        .is_ok()
+}
+
+#[cfg(any(test, feature = "test-script"))]
+pub fn set_synthetic_repeat(delay: Duration, hz: f64) -> bool {
+    state()
+        .lock()
+        .map(|mut guard| guard.synthetic.set_repeat(delay, hz))
+        .unwrap_or(false)
+}
+
+#[cfg(any(test, feature = "test-script"))]
+pub fn synthetic_input_is_idle() -> bool {
+    state()
+        .lock()
+        .map(|guard| guard.synthetic.is_idle())
+        .unwrap_or(true)
+}
+
+/// Drop commands that have not acquired a routing target, then enqueue one
+/// ordered CancelAll so any already-held keys still produce their Up events in
+/// the ROOT plugin. This is used by every script terminal path.
+#[cfg(any(test, feature = "test-script"))]
+pub fn cancel_synthetic_input(at: Instant) -> bool {
+    state()
+        .lock()
+        .map(|mut guard| {
+            guard.synthetic.commands.clear();
+            guard.synthetic.enqueue(SyntheticKeyCommand::cancel_all(at));
+        })
+        .is_ok()
+}
+
+#[cfg(any(test, feature = "test-script"))]
+pub fn disarm_synthetic_input() {
+    if let Ok(mut guard) = state().lock() {
+        guard.synthetic.disarm();
+    }
 }
 
 pub fn install_main_window_subclass(hwnd_raw: u64) -> bool {
@@ -532,6 +1651,67 @@ pub fn set_test_return_key_state(viewport: egui::ViewportId, main_down: bool, nu
     }
 }
 
+/// Arm a deterministic synthetic timeline and register its foreground target.
+#[cfg(test)]
+pub fn arm_test_synthetic_input(foreground_hwnd: u64, viewport: egui::ViewportId) {
+    if let Ok(mut guard) = state().lock() {
+        *guard = KeyInputState::default();
+        guard.synthetic.arm();
+        guard.test_foreground_hwnd = Some(foreground_hwnd);
+        guard.register_hwnd(foreground_hwnd, viewport);
+    }
+}
+
+#[cfg(test)]
+pub fn arm_test_synthetic_input_without_registration(foreground_hwnd: u64) {
+    if let Ok(mut guard) = state().lock() {
+        *guard = KeyInputState::default();
+        guard.synthetic.arm();
+        guard.test_foreground_hwnd = Some(foreground_hwnd);
+    }
+}
+
+#[cfg(test)]
+pub fn register_test_synthetic_target(hwnd: u64, viewport: egui::ViewportId) {
+    if let Ok(mut guard) = state().lock() {
+        guard.register_hwnd(hwnd, viewport);
+    }
+}
+
+#[cfg(test)]
+pub fn set_test_synthetic_repeat(delay: Duration, hz: f64) -> bool {
+    if let Ok(mut guard) = state().lock() {
+        guard.synthetic.set_repeat(delay, hz)
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+pub fn enqueue_test_synthetic_command(command: SyntheticKeyCommand) {
+    if let Ok(mut guard) = state().lock() {
+        guard.synthetic.enqueue(command);
+    }
+}
+
+#[cfg(test)]
+pub fn clear_test_synthetic_input() {
+    if let Ok(mut guard) = state().lock() {
+        *guard = KeyInputState::default();
+    }
+}
+
+#[cfg(test)]
+fn materialize_test_synthetic_input(
+    now: Instant,
+    focused: impl FnMut(egui::ViewportId) -> Option<bool>,
+) -> SyntheticMaterialization {
+    state()
+        .lock()
+        .map(|mut guard| guard.materialize_synthetic(now, focused))
+        .unwrap_or_else(|_| SyntheticMaterialization::disarmed())
+}
+
 #[cfg(test)]
 pub(crate) static TEST_INPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -613,7 +1793,12 @@ fn push_edge(hwnd_raw: u64, raw: RawKeyEdge) {
 }
 
 fn key_state(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> bool {
-    unsafe { GetKeyState(vk.0 as i32) < 0 }
+    // `GetKeyState`, not `GetAsyncKeyState`: this stamps the modifier flags on an
+    // edge built from a message, so it must report the state that belonged to
+    // that message rather than the state at drain time.
+    physical_key_down_from(PhysicalKeySlot::new(vk.0.into(), false), || unsafe {
+        GetKeyState(vk.0 as i32) < 0
+    })
 }
 
 fn key_edge_from_message(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<RawKeyEdge> {
@@ -666,9 +1851,40 @@ unsafe extern "system" fn main_key_input_subclass_proc(
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyEdge, KeyInputState, RawKeyEdge, RegisterHwndResult, ReturnKeyState, TEST_INPUT_LOCK,
-        begin_frame, consume_key_down, pressed_key_down, set_test_frame, set_test_routed_frame,
+        KeyEdge, KeyInputState, PhysicalKeySlot, RawKeyEdge, RegisterHwndResult, ReturnKeyState,
+        SyntheticInputFact, SyntheticInputIssue, SyntheticInputPlugin, SyntheticKeyCommand,
+        SyntheticModifiers, SyntheticNavigationKey, SyntheticRoutingTargetError, TEST_INPUT_LOCK,
+        arm_test_synthetic_input, arm_test_synthetic_input_without_registration, begin_frame,
+        clear_test_synthetic_input, consume_all_key_down_with_result, consume_key_down,
+        consume_key_edges, enqueue_test_synthetic_command, materialize_test_synthetic_input,
+        physical_key_down, physical_key_down_from, pressed_key_down,
+        register_test_synthetic_target, resolve_synthetic_routing_target, set_test_frame,
+        set_test_routed_frame, set_test_synthetic_repeat, state,
     };
+    use std::time::{Duration, Instant};
+
+    struct ClearSyntheticInput;
+
+    impl Drop for ClearSyntheticInput {
+        fn drop(&mut self) {
+            clear_test_synthetic_input();
+        }
+    }
+
+    fn raw_input(viewport: egui::ViewportId, time: f64, focused: bool) -> egui::RawInput {
+        let mut input = egui::RawInput {
+            viewport_id: viewport,
+            time: Some(time),
+            focused,
+            ..Default::default()
+        };
+        input.viewports.entry(viewport).or_default().focused = Some(focused);
+        input
+    }
+
+    fn run_input_hook(plugin: &mut SyntheticInputPlugin, input: &mut egui::RawInput) {
+        <SyntheticInputPlugin as egui::Plugin>::input_hook(plugin, input);
+    }
 
     fn raw_edge(virtual_key: u32, pressed: bool) -> RawKeyEdge {
         RawKeyEdge {
@@ -852,5 +2068,483 @@ mod tests {
         assert_eq!(input.pending.pop_front(), Some(edge));
         let (_, should_log_again) = input.enqueue_raw_edge(0x301, raw_edge(0x27, false));
         assert!(!should_log_again, "one diagnostic per unregistered HWND");
+    }
+
+    #[test]
+    fn synthetic_timeline_fans_out_the_same_order_to_win32_and_egui() {
+        let _serial = TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        let _cleanup = ClearSyntheticInput;
+        let viewport = egui::ViewportId::from_hash_of("synthetic-child");
+        let hwnd = 0x401;
+        arm_test_synthetic_input(hwnd, viewport);
+        assert!(set_test_synthetic_repeat(Duration::from_millis(100), 20.0));
+        let start = Instant::now() - Duration::from_millis(500);
+        enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+            start,
+            SyntheticNavigationKey::Right,
+            SyntheticModifiers::default(),
+        ));
+        enqueue_test_synthetic_command(SyntheticKeyCommand::up(
+            start + Duration::from_millis(160),
+            SyntheticNavigationKey::Right,
+        ));
+
+        let mut plugin = SyntheticInputPlugin::default();
+        let mut root = raw_input(egui::ViewportId::ROOT, 1.0, true);
+        root.viewports.entry(viewport).or_default().focused = Some(true);
+        run_input_hook(&mut plugin, &mut root);
+        assert!(root.events.is_empty());
+        let mut child = raw_input(viewport, 1.0, true);
+        run_input_hook(&mut plugin, &mut child);
+
+        let edges: Vec<_> = state()
+            .lock()
+            .expect("key input state poisoned")
+            .pending
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(edges.len(), 4);
+        assert_eq!(
+            edges.iter().map(|edge| edge.pressed).collect::<Vec<_>>(),
+            [true, true, true, false]
+        );
+        assert_eq!(
+            edges.iter().map(|edge| edge.repeat).collect::<Vec<_>>(),
+            [false, true, true, false]
+        );
+        assert!(edges.iter().all(|edge| edge.source_hwnd == hwnd));
+        assert!(edges.iter().all(|edge| edge.source_viewport == viewport));
+
+        let egui_edges: Vec<_> = child
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Key {
+                    key,
+                    pressed,
+                    repeat,
+                    ..
+                } => Some((*key, *pressed, *repeat)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(egui_edges.len(), edges.len());
+        assert_eq!(
+            egui_edges.iter().map(|edge| edge.1).collect::<Vec<_>>(),
+            edges.iter().map(|edge| edge.pressed).collect::<Vec<_>>()
+        );
+        assert!(
+            egui_edges
+                .iter()
+                .all(|edge| edge.0 == egui::Key::ArrowRight)
+        );
+        assert!(egui_edges.iter().all(|edge| !edge.2));
+    }
+
+    #[test]
+    fn disarmed_level_reads_the_callers_own_os_source() {
+        // The subclass proc stamps edge modifiers with `GetKeyState` so they
+        // describe the message being processed, while held-key readers want
+        // `GetAsyncKeyState`. Routing both through one hard-coded OS call would
+        // silently give queued edges the modifier state at drain time instead.
+        let _serial = TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        let _cleanup = ClearSyntheticInput;
+        clear_test_synthetic_input();
+
+        let mut consulted = 0_u32;
+        let level = physical_key_down_from(PhysicalKeySlot::new(0x27, true), || {
+            consulted += 1;
+            true
+        });
+        assert!(level, "the disarmed path must return the caller's OS level");
+        assert_eq!(consulted, 1, "the caller's OS source must be the only one");
+
+        // Once armed, the timeline replaces the OS source entirely.
+        arm_test_synthetic_input(0x403, egui::ViewportId::ROOT);
+        let mut armed_consulted = 0_u32;
+        let armed_level = physical_key_down_from(PhysicalKeySlot::new(0x27, true), || {
+            armed_consulted += 1;
+            true
+        });
+        assert!(!armed_level, "no synthetic key is held yet");
+        assert_eq!(
+            armed_consulted, 0,
+            "an armed timeline must not consult the OS"
+        );
+    }
+
+    #[test]
+    fn synthetic_level_stays_down_between_edges_and_across_frames() {
+        let _serial = TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        let _cleanup = ClearSyntheticInput;
+        arm_test_synthetic_input(0x402, egui::ViewportId::ROOT);
+        let start = Instant::now();
+        enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+            start,
+            SyntheticNavigationKey::Down,
+            SyntheticModifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+            },
+        ));
+        let down = materialize_test_synthetic_input(start, |_| Some(true));
+        assert_eq!(down.events.len(), 1);
+        assert!(down.events[0].modifiers.ctrl);
+        assert!(down.final_modifiers.ctrl);
+        assert!(physical_key_down(PhysicalKeySlot::new(0x28, false)));
+        assert!(physical_key_down(PhysicalKeySlot::new(0x11, false)));
+
+        begin_frame();
+        let between =
+            materialize_test_synthetic_input(start + Duration::from_millis(100), |_| Some(true));
+        assert!(between.events.is_empty());
+        begin_frame();
+        assert!(physical_key_down(PhysicalKeySlot::new(0x28, false)));
+        assert!(physical_key_down(PhysicalKeySlot::new(0x11, false)));
+
+        let repeats =
+            materialize_test_synthetic_input(start + Duration::from_millis(300), |_| Some(true));
+        assert!(repeats.events.iter().all(|event| event.repeat));
+        begin_frame();
+        assert!(physical_key_down(PhysicalKeySlot::new(0x28, false)));
+
+        enqueue_test_synthetic_command(SyntheticKeyCommand::up(
+            start + Duration::from_millis(400),
+            SyntheticNavigationKey::Down,
+        ));
+        materialize_test_synthetic_input(start + Duration::from_millis(400), |_| Some(true));
+        assert!(!physical_key_down(PhysicalKeySlot::new(0x28, false)));
+        assert!(!physical_key_down(PhysicalKeySlot::new(0x11, false)));
+    }
+
+    #[test]
+    fn synthetic_materialize_catches_up_all_repeats_after_a_long_sleep() {
+        let _serial = TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        let _cleanup = ClearSyntheticInput;
+        arm_test_synthetic_input(0x403, egui::ViewportId::ROOT);
+        let start = Instant::now();
+        enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+            start,
+            SyntheticNavigationKey::PageDown,
+            SyntheticModifiers::default(),
+        ));
+        materialize_test_synthetic_input(start, |_| Some(true));
+        let first_repeat =
+            materialize_test_synthetic_input(start + Duration::from_millis(250), |_| Some(true));
+        assert_eq!(first_repeat.events.len(), 1);
+
+        let caught_up =
+            materialize_test_synthetic_input(start + Duration::from_millis(710), |_| Some(true));
+        assert_eq!(caught_up.events.len(), 13);
+        assert!(caught_up.events.iter().all(|event| event.repeat));
+        assert!(
+            caught_up
+                .events
+                .windows(2)
+                .all(|pair| pair[0].at < pair[1].at)
+        );
+    }
+
+    #[test]
+    fn synthetic_hold_facts_report_levels_edges_and_accumulated_repeats() {
+        let _serial = TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        let _cleanup = ClearSyntheticInput;
+        let viewport = egui::ViewportId::from_hash_of("synthetic-facts");
+        arm_test_synthetic_input(0x409, viewport);
+        assert!(set_test_synthetic_repeat(Duration::from_millis(250), 30.0));
+        let start = Instant::now();
+        enqueue_test_synthetic_command(
+            SyntheticKeyCommand::down(
+                start,
+                SyntheticNavigationKey::Right,
+                SyntheticModifiers::default(),
+            )
+            .with_hold_id(7),
+        );
+
+        let down = materialize_test_synthetic_input(start, |_| Some(true));
+        assert!(down.facts.iter().any(|fact| matches!(
+            fact,
+            SyntheticInputFact::HoldBegin {
+                hold_id: 7,
+                key: SyntheticNavigationKey::Right,
+                target,
+                repeat_delay,
+                repeat_hz,
+            } if target.viewport == viewport
+                && *repeat_delay == Duration::from_millis(250)
+                && (*repeat_hz - 30.0).abs() < 0.000_001
+        )));
+        assert!(down.facts.iter().any(|fact| matches!(
+            fact,
+            SyntheticInputFact::FrameInput {
+                hold_id: 7,
+                held: true,
+                edge_count: 1,
+                materialized_in_frame: 0,
+            }
+        )));
+
+        let between =
+            materialize_test_synthetic_input(start + Duration::from_millis(100), |_| Some(true));
+        assert_eq!(
+            between.facts,
+            [SyntheticInputFact::FrameInput {
+                hold_id: 7,
+                held: true,
+                edge_count: 0,
+                materialized_in_frame: 0,
+            }]
+        );
+
+        let accumulated =
+            materialize_test_synthetic_input(start + Duration::from_millis(710), |_| Some(true));
+        assert!(accumulated.facts.iter().any(|fact| matches!(
+            fact,
+            SyntheticInputFact::FrameInput {
+                hold_id: 7,
+                held: true,
+                edge_count,
+                materialized_in_frame,
+            } if *edge_count > 1 && *materialized_in_frame > 1
+        )));
+
+        enqueue_test_synthetic_command(
+            SyntheticKeyCommand::up(
+                start + Duration::from_millis(711),
+                SyntheticNavigationKey::Right,
+            )
+            .with_hold_id(7),
+        );
+        let released =
+            materialize_test_synthetic_input(start + Duration::from_millis(711), |_| Some(true));
+        assert!(released.facts.iter().any(|fact| matches!(
+            fact,
+            SyntheticInputFact::HoldEnd {
+                hold_id: 7,
+                down_count: 1,
+                repeat_count,
+                up_count: 1,
+            } if *repeat_count > 1
+        )));
+        assert!(released.facts.iter().any(|fact| matches!(
+            fact,
+            SyntheticInputFact::FrameInput {
+                hold_id: 7,
+                held: false,
+                edge_count: 1,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn synthetic_unregistered_foreground_is_typed_and_retryable() {
+        let _serial = TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        let _cleanup = ClearSyntheticInput;
+        let hwnd = 0x404;
+        let viewport = egui::ViewportId::from_hash_of("late-synthetic-target");
+        arm_test_synthetic_input_without_registration(hwnd);
+        assert_eq!(
+            resolve_synthetic_routing_target(),
+            Err(SyntheticRoutingTargetError::UnregisteredForegroundWindow { hwnd })
+        );
+        let start = Instant::now();
+        enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+            start,
+            SyntheticNavigationKey::Home,
+            SyntheticModifiers::default(),
+        ));
+        let waiting = materialize_test_synthetic_input(start, |_| Some(true));
+        assert_eq!(
+            waiting.issue,
+            Some(SyntheticInputIssue::WaitingForRouting(
+                SyntheticRoutingTargetError::UnregisteredForegroundWindow { hwnd }
+            ))
+        );
+        assert!(waiting.events.is_empty());
+
+        register_test_synthetic_target(hwnd, viewport);
+        let routed = materialize_test_synthetic_input(start, |_| Some(true));
+        assert_eq!(routed.events.len(), 1);
+        assert_eq!(routed.events[0].target.viewport, viewport);
+    }
+
+    #[test]
+    fn synthetic_plugin_reinjects_without_double_materializing_same_time() {
+        let _serial = TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        let _cleanup = ClearSyntheticInput;
+        arm_test_synthetic_input(0x405, egui::ViewportId::ROOT);
+        enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+            Instant::now() - Duration::from_millis(1),
+            SyntheticNavigationKey::Enter,
+            SyntheticModifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+            },
+        ));
+
+        let mut plugin = SyntheticInputPlugin::default();
+        let mut first = raw_input(egui::ViewportId::ROOT, 7.0, true);
+        run_input_hook(&mut plugin, &mut first);
+        let pending_after_first = state()
+            .lock()
+            .expect("key input state poisoned")
+            .pending
+            .len();
+        let mut second = raw_input(egui::ViewportId::ROOT, 7.0, true);
+        run_input_hook(&mut plugin, &mut second);
+        let pending_after_second = state()
+            .lock()
+            .expect("key input state poisoned")
+            .pending
+            .len();
+
+        assert_eq!(pending_after_first, 1);
+        assert_eq!(pending_after_second, pending_after_first);
+        assert_eq!(first.events, second.events);
+        assert_eq!(first.events.len(), 1);
+        assert!(first.modifiers.ctrl);
+        assert!(matches!(
+            first.events.as_slice(),
+            [egui::Event::Key { modifiers, .. }] if modifiers.ctrl && modifiers.command && !modifiers.mac_cmd
+        ));
+        assert!(
+            state()
+                .lock()
+                .expect("key input state poisoned")
+                .pending
+                .front()
+                .is_some_and(|edge| edge.ctrl)
+        );
+    }
+
+    #[test]
+    fn synthetic_pending_cap_preserves_repeat_folding_and_release() {
+        let _serial = TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        let _cleanup = ClearSyntheticInput;
+        let viewport = egui::ViewportId::from_hash_of("synthetic-cap");
+        arm_test_synthetic_input(0x406, viewport);
+        assert!(set_test_synthetic_repeat(Duration::from_millis(1), 1000.0));
+        let start = Instant::now();
+        enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+            start,
+            SyntheticNavigationKey::Right,
+            SyntheticModifiers::default(),
+        ));
+        enqueue_test_synthetic_command(SyntheticKeyCommand::up(
+            start + Duration::from_millis(400),
+            SyntheticNavigationKey::Right,
+        ));
+        let materialized =
+            materialize_test_synthetic_input(start + Duration::from_millis(400), |_| Some(true));
+        assert!(materialized.events.len() > super::MAX_PENDING_EVENTS);
+        assert_eq!(
+            state()
+                .lock()
+                .expect("key input state poisoned")
+                .pending
+                .len(),
+            super::MAX_PENDING_EVENTS
+        );
+
+        begin_frame();
+        let result =
+            consume_all_key_down_with_result(viewport, true, |edge| edge.virtual_key == 0x27);
+        assert_eq!(result.matched_count, super::MAX_PENDING_EVENTS - 1);
+        assert_eq!(result.triggered_count, 1);
+        assert_eq!(
+            consume_key_edges(viewport, |edge| edge.virtual_key == 0x27),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn synthetic_plugin_records_undrawn_child_and_cancels_on_focus_loss() {
+        let _serial = TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        let _cleanup = ClearSyntheticInput;
+        let viewport = egui::ViewportId::from_hash_of("synthetic-focus-child");
+        arm_test_synthetic_input(0x407, viewport);
+        enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+            Instant::now() - Duration::from_millis(1),
+            SyntheticNavigationKey::End,
+            SyntheticModifiers::default(),
+        ));
+
+        let mut undrawn_plugin = SyntheticInputPlugin::default();
+        let mut first_root = raw_input(egui::ViewportId::ROOT, 10.0, true);
+        first_root.viewports.entry(viewport).or_default().focused = Some(true);
+        run_input_hook(&mut undrawn_plugin, &mut first_root);
+        let mut next_root = raw_input(egui::ViewportId::ROOT, 11.0, true);
+        next_root.viewports.entry(viewport).or_default().focused = Some(true);
+        run_input_hook(&mut undrawn_plugin, &mut next_root);
+        assert!(undrawn_plugin.issues.iter().any(|issue| matches!(
+            issue,
+            SyntheticInputIssue::TargetViewportNotRendered {
+                viewport: missed,
+                event_count: 1,
+                ..
+            } if *missed == viewport
+        )));
+
+        clear_test_synthetic_input();
+        arm_test_synthetic_input(0x408, viewport);
+        enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+            Instant::now() - Duration::from_millis(1),
+            SyntheticNavigationKey::End,
+            SyntheticModifiers::default(),
+        ));
+        let mut focus_plugin = SyntheticInputPlugin::default();
+        let mut focused_root = raw_input(egui::ViewportId::ROOT, 20.0, true);
+        focused_root.viewports.entry(viewport).or_default().focused = Some(true);
+        run_input_hook(&mut focus_plugin, &mut focused_root);
+        let mut focused_child = raw_input(viewport, 20.0, true);
+        run_input_hook(&mut focus_plugin, &mut focused_child);
+        assert!(physical_key_down(PhysicalKeySlot::new(0x23, false)));
+
+        let mut blurred_root = raw_input(egui::ViewportId::ROOT, 21.0, true);
+        blurred_root.viewports.entry(viewport).or_default().focused = Some(false);
+        run_input_hook(&mut focus_plugin, &mut blurred_root);
+        let mut blurred_child = raw_input(viewport, 21.0, false);
+        run_input_hook(&mut focus_plugin, &mut blurred_child);
+        assert!(!physical_key_down(PhysicalKeySlot::new(0x23, false)));
+        assert!(matches!(
+            blurred_child.events.as_slice(),
+            [egui::Event::Key { pressed: false, .. }]
+        ));
+        assert!(focus_plugin.issues.iter().any(|issue| matches!(
+            issue,
+            SyntheticInputIssue::FocusLost { viewport: lost } if *lost == viewport
+        )));
     }
 }

@@ -188,10 +188,13 @@ wgpu の queue.write_texture が走る。20MP RGBA (78MB) で 26-58ms かかる�
 1. worker はデコード結果を `FsLoadResult` で送る (この時点では ColorImage、GPU 未アップ)
 2. UI は完了を `fs_upload_backlog: Vec<(idx, FsLoadResult, seq)>` にステージ
 3. 1 フレームにつき **最大 1 枚**だけ `ctx.load_texture` する
-4. ただし **現在 `fullscreen_idx` に対応するエントリは即時アップロード** (表示遅延ゼロ)
+4. 現在 `fullscreen_idx` に対応するエントリは即時アップロード (表示遅延ゼロ)
 5. backlog が残っていれば `ctx.request_repaint()` で次フレーム継続
 
-実装は [src/app.rs `poll_prefetch`](../src/app.rs) 参照。
+v2.13.0 ではキーリピート中の通過表示と upload 保留を削除した。ページ送り中も
+final-effect 完了結果を通常どおり回収し、`fs_upload_backlog` は上の通常ペースで消化する。
+削除した `fs.page_turn_*` event と実行時判定は現行経路に含めない。次版で再実装するときの
+要件・計測不変条件は [display-pipeline.md §2.5](display-pipeline.md#25-ページ送り中の表示規則-次版でやり直すときの正本) を正本とする。
 
 静止画の `DISPLAY_IMAGE_TEXTURE_OPTIONS` は level 0 upload の直後に vendored `egui-wgpu` の
 render pass で mip chain も生成する。CPU resize や I/O は増えないが、GPU upload slot 1 件あたりの

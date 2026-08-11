@@ -34,6 +34,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VsOut {
 struct Params {
     mode_wipe: vec2<f32>,
     _padding: vec2<f32>,
+    uv_window: vec4<f32>,
 };
 
 @group(0) @binding(0) var pinned_tex: texture_2d<f32>;
@@ -47,10 +48,11 @@ fn sample_compare_texture(tex: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let pinned = sample_compare_texture(pinned_tex, in.uv);
-    let current = sample_compare_texture(current_tex, in.uv);
+    let image_uv = mix(params.uv_window.xy, params.uv_window.zw, in.uv);
+    let pinned = sample_compare_texture(pinned_tex, image_uv);
+    let current = sample_compare_texture(current_tex, image_uv);
     if (params.mode_wipe.x < 0.5) {
-        if (in.uv.x <= params.mode_wipe.y) {
+        if (image_uv.x <= params.mode_wipe.y) {
             return pinned;
         }
         return current;
@@ -67,14 +69,23 @@ pub enum CompareShaderMode {
     Diff,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompareShaderSlot {
+    Main,
+    Navigator,
+}
+
 pub struct CompareShaderCallback {
+    pub slot: CompareShaderSlot,
     pub key: u64,
     pub width: u32,
     pub height: u32,
     pub pinned_rgba: Arc<Vec<u8>>,
     pub current_rgba: Arc<Vec<u8>>,
+    pub cpu_pair_bytes: u64,
     pub mode: CompareShaderMode,
     pub wipe_fraction: f32,
+    pub uv_window: [f32; 4],
     pub target_format: wgpu::TextureFormat,
 }
 
@@ -95,10 +106,122 @@ struct CompareGpuPair {
     _current_texture: wgpu::Texture,
     _pinned_view: wgpu::TextureView,
     _current_view: wgpu::TextureView,
-    bind_group: wgpu::BindGroup,
-    uniform: wgpu::Buffer,
+    // 重いtexture / mip chainはpairで共有し、prepareごとに変わる軽量状態だけを分離する。
+    slots: CompareGpuSlots,
     width: u32,
     height: u32,
+}
+
+pub fn rgba8_texture_bytes(width: u32, height: u32, mipmapped: bool) -> u128 {
+    let mut width = u128::from(width);
+    let mut height = u128::from(height);
+    let mut total = 0_u128;
+    loop {
+        total += width * height * 4;
+        if !mipmapped || (width == 1 && height == 1) {
+            return total;
+        }
+        width = (width / 2).max(1);
+        height = (height / 2).max(1);
+    }
+}
+
+struct CompareGpuSlots {
+    main: CompareGpuSlot,
+    navigator: CompareGpuSlot,
+}
+
+struct CompareGpuSlot {
+    bind_group: wgpu::BindGroup,
+    uniform: wgpu::Buffer,
+}
+
+impl CompareGpuSlots {
+    fn new(
+        device: &wgpu::Device,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        pinned_view: &wgpu::TextureView,
+        current_view: &wgpu::TextureView,
+    ) -> Self {
+        Self {
+            main: CompareGpuSlot::new(
+                device,
+                bind_group_layout,
+                sampler,
+                pinned_view,
+                current_view,
+                CompareShaderSlot::Main,
+            ),
+            navigator: CompareGpuSlot::new(
+                device,
+                bind_group_layout,
+                sampler,
+                pinned_view,
+                current_view,
+                CompareShaderSlot::Navigator,
+            ),
+        }
+    }
+
+    fn get(&self, slot: CompareShaderSlot) -> &CompareGpuSlot {
+        // 新しい呼び出し箇所をenumへ追加したとき、slotの割り当て漏れはcompile errorにする。
+        match slot {
+            CompareShaderSlot::Main => &self.main,
+            CompareShaderSlot::Navigator => &self.navigator,
+        }
+    }
+}
+
+impl CompareGpuSlot {
+    fn new(
+        device: &wgpu::Device,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        pinned_view: &wgpu::TextureView,
+        current_view: &wgpu::TextureView,
+        slot: CompareShaderSlot,
+    ) -> Self {
+        let (uniform_label, bind_group_label) = match slot {
+            CompareShaderSlot::Main => ("miv_compare_main_uniform", "miv_compare_main_bind_group"),
+            CompareShaderSlot::Navigator => (
+                "miv_compare_navigator_uniform",
+                "miv_compare_navigator_bind_group",
+            ),
+        };
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(uniform_label),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(bind_group_label),
+            layout: bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(pinned_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(current_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        });
+        Self {
+            bind_group,
+            uniform,
+        }
+    }
 }
 
 impl CompareGpuResources {
@@ -214,11 +337,16 @@ impl CompareGpuResources {
             })
             .unwrap_or(true);
         if recreate {
+            if compare_texture_extent(callback.width, callback.height).is_none() {
+                return;
+            }
             // 新textureを確保する前に旧組をdropし、8K比較で旧/new組が同時に
             // VRAMへ残る時間を作らない。wgpu backend側のin-flight解放遅延を除けば、
             // CompareGpuResourcesが所有する完全mip chainは常に2枚までになる。
-            self.pair = None;
-            let pinned = upload_rgba_texture(
+            let released_gpu_bytes = self.pair.take().map_or(0, |(_, pair)| {
+                rgba8_texture_bytes(pair.width, pair.height, true) * 2
+            });
+            let Some(pinned) = upload_rgba_texture(
                 device,
                 queue,
                 "miv_compare_pinned_texture",
@@ -226,8 +354,10 @@ impl CompareGpuResources {
                 callback.height,
                 &callback.pinned_rgba,
                 &self.mipmap_generator,
-            );
-            let current = upload_rgba_texture(
+            ) else {
+                return;
+            };
+            let Some(current) = upload_rgba_texture(
                 device,
                 queue,
                 "miv_compare_current_texture",
@@ -235,35 +365,16 @@ impl CompareGpuResources {
                 callback.height,
                 &callback.current_rgba,
                 &self.mipmap_generator,
+            ) else {
+                return;
+            };
+            let slots = CompareGpuSlots::new(
+                device,
+                &self.bind_group_layout,
+                &self.sampler,
+                &pinned.view,
+                &current.view,
             );
-            let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("miv_compare_uniform"),
-                size: 16,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("miv_compare_bind_group"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&pinned.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&current.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: uniform.as_entire_binding(),
-                    },
-                ],
-            });
             self.pair = Some((
                 callback.key,
                 CompareGpuPair {
@@ -271,21 +382,30 @@ impl CompareGpuResources {
                     _current_texture: current.texture,
                     _pinned_view: pinned.view,
                     _current_view: current.view,
-                    bind_group,
-                    uniform,
+                    slots,
                     width: callback.width,
                     height: callback.height,
                 },
+            ));
+            crate::logger::log(format!(
+                "[compare-memory] stage=gpu-ready target={}x{} cpu_total_bytes={} cpu_buffers=2 gpu_total_bytes={} gpu_textures=2 gpu_mips=full released_gpu_bytes={} old_pair_release=before_new_alloc",
+                callback.width,
+                callback.height,
+                callback.cpu_pair_bytes,
+                rgba8_texture_bytes(callback.width, callback.height, true) * 2,
+                released_gpu_bytes,
             ));
         }
         if let Some((key, pair)) = self.pair.as_ref()
             && *key == callback.key
         {
-            queue.write_buffer(
-                &pair.uniform,
-                0,
-                &uniform_bytes(callback.mode, callback.wipe_fraction),
+            let write = uniform_write(
+                callback.slot,
+                callback.mode,
+                callback.wipe_fraction,
+                callback.uv_window,
             );
+            queue.write_buffer(&pair.slots.get(write.slot).uniform, 0, &write.bytes);
         }
     }
 }
@@ -294,13 +414,43 @@ impl CompareGpuResources {
 /// 高解像度texture 2枚だけを即時dropする。
 pub fn clear_gpu_pair(callback_resources: &mut egui_wgpu::CallbackResources) {
     if let Some(resources) = callback_resources.get_mut::<CompareGpuResources>() {
-        resources.pair = None;
+        if let Some((_, pair)) = resources.pair.take() {
+            crate::logger::log(format!(
+                "[compare-memory] stage=gpu-clear target={}x{} released_gpu_bytes={} gpu_total_bytes=0 gpu_mips=full",
+                pair.width,
+                pair.height,
+                rgba8_texture_bytes(pair.width, pair.height, true) * 2,
+            ));
+        }
     }
 }
 
 struct UploadedTexture {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+}
+
+fn compare_texture_extent(width: u32, height: u32) -> Option<wgpu::Extent3d> {
+    crate::capture::validate_compare_canvas_size([
+        usize::try_from(width).ok()?,
+        usize::try_from(height).ok()?,
+    ])
+    .ok()?;
+    Some(wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    })
+}
+
+fn create_compare_texture<T>(
+    width: u32,
+    height: u32,
+    create: impl FnOnce(wgpu::Extent3d) -> T,
+) -> Option<(wgpu::Extent3d, T)> {
+    let size = compare_texture_extent(width, height)?;
+    let texture = create(size);
+    Some((size, texture))
 }
 
 fn upload_rgba_texture(
@@ -311,24 +461,21 @@ fn upload_rgba_texture(
     height: u32,
     rgba: &[u8],
     mipmap_generator: &egui_wgpu::MipmapGenerator,
-) -> UploadedTexture {
-    let size = wgpu::Extent3d {
-        width,
-        height,
-        depth_or_array_layers: 1,
-    };
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size,
-        mip_level_count: egui_wgpu::mip_level_count(width, height),
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_DST
-            | wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
+) -> Option<UploadedTexture> {
+    let (size, texture) = create_compare_texture(width, height, |size| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size,
+            mip_level_count: egui_wgpu::mip_level_count(width, height),
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+    })?;
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &texture,
@@ -346,20 +493,47 @@ fn upload_rgba_texture(
     );
     mipmap_generator.generate(device, queue, &texture);
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    UploadedTexture { texture, view }
+    Some(UploadedTexture { texture, view })
 }
 
-fn uniform_bytes(mode: CompareShaderMode, wipe_fraction: f32) -> [u8; 16] {
+fn uniform_bytes(mode: CompareShaderMode, wipe_fraction: f32, uv_window: [f32; 4]) -> [u8; 32] {
     let mode = match mode {
         CompareShaderMode::Wipe => 0.0_f32,
         CompareShaderMode::Diff => 1.0_f32,
     };
-    let values = [mode, wipe_fraction.clamp(0.05, 0.95)];
-    let mut bytes = [0_u8; 16];
+    let values = [
+        mode,
+        wipe_fraction.clamp(0.0, 1.0),
+        0.0,
+        0.0,
+        uv_window[0],
+        uv_window[1],
+        uv_window[2],
+        uv_window[3],
+    ];
+    let mut bytes = [0_u8; 32];
     for (i, value) in values.iter().enumerate() {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&value.to_ne_bytes());
     }
     bytes
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompareUniformWrite {
+    slot: CompareShaderSlot,
+    bytes: [u8; 32],
+}
+
+fn uniform_write(
+    slot: CompareShaderSlot,
+    mode: CompareShaderMode,
+    wipe_fraction: f32,
+    uv_window: [f32; 4],
+) -> CompareUniformWrite {
+    CompareUniformWrite {
+        slot,
+        bytes: uniform_bytes(mode, wipe_fraction, uv_window),
+    }
 }
 
 impl egui_wgpu::CallbackTrait for CompareShaderCallback {
@@ -399,21 +573,39 @@ impl egui_wgpu::CallbackTrait for CompareShaderCallback {
             return;
         }
         render_pass.set_pipeline(&resources.pipeline);
-        render_pass.set_bind_group(0, &pair.bind_group, &[]);
+        render_pass.set_bind_group(0, &pair.slots.get(self.slot).bind_group, &[]);
         render_pass.draw(0..6, 0..1);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CompareShaderMode, SHADER, uniform_bytes};
+    use super::{
+        CompareShaderMode, CompareShaderSlot, SHADER, create_compare_texture, rgba8_texture_bytes,
+        uniform_bytes, uniform_write,
+    };
+
+    #[test]
+    fn compare_memory_measurement_counts_the_complete_mip_chain() {
+        assert_eq!(rgba8_texture_bytes(8320, 7296, false), 242_810_880);
+        assert_eq!(rgba8_texture_bytes(8320, 7296, true), 323_747_664);
+        assert_eq!(rgba8_texture_bytes(8320, 7296, true) * 2, 647_495_328);
+        assert_eq!(rgba8_texture_bytes(4160, 7296, true) * 2, 323_747_432);
+    }
 
     #[test]
     fn compare_uses_fixed_mipmap_sampling_and_compact_uniform() {
         assert!(SHADER.contains("textureSample(tex, compare_sampler, uv)"));
         assert!(!SHADER.contains("textureSampleBias"));
         assert!(!SHADER.contains("textureSampleLevel"));
-        let default_bytes = uniform_bytes(CompareShaderMode::Wipe, 0.5);
+        let default_write = uniform_write(
+            CompareShaderSlot::Main,
+            CompareShaderMode::Wipe,
+            0.5,
+            [0.1, 0.2, 0.8, 0.9],
+        );
+        assert_eq!(default_write.slot, CompareShaderSlot::Main);
+        let default_bytes = default_write.bytes;
         assert_eq!(
             f32::from_ne_bytes(default_bytes[0..4].try_into().unwrap()),
             0.0
@@ -423,6 +615,13 @@ mod tests {
             0.5
         );
         assert_eq!(&default_bytes[8..16], &[0; 8]);
+        assert_eq!(
+            default_bytes[16..]
+                .chunks_exact(4)
+                .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![0.1, 0.2, 0.8, 0.9]
+        );
 
         let module = wgpu::naga::front::wgsl::parse_str(SHADER).expect("parse compare WGSL");
         wgpu::naga::valid::Validator::new(
@@ -431,5 +630,57 @@ mod tests {
         )
         .validate(&module)
         .expect("validate compare WGSL");
+    }
+
+    #[test]
+    fn compare_uniform_writes_keep_main_and_navigator_bytes_in_distinct_slots() {
+        let main = uniform_write(
+            CompareShaderSlot::Main,
+            CompareShaderMode::Wipe,
+            0.37,
+            [0.25, 0.2, 0.75, 0.8],
+        );
+        let navigator = uniform_write(
+            CompareShaderSlot::Navigator,
+            CompareShaderMode::Wipe,
+            0.37,
+            [0.0, 0.0, 1.0, 1.0],
+        );
+
+        assert_eq!(main.slot, CompareShaderSlot::Main);
+        assert_eq!(navigator.slot, CompareShaderSlot::Navigator);
+        assert_ne!(main.slot, navigator.slot);
+        assert_ne!(main.bytes, navigator.bytes);
+        assert_eq!(
+            &main.bytes,
+            &uniform_bytes(CompareShaderMode::Wipe, 0.37, [0.25, 0.2, 0.75, 0.8])
+        );
+        assert_eq!(
+            &navigator.bytes,
+            &uniform_bytes(CompareShaderMode::Wipe, 0.37, [0.0, 0.0, 1.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn compare_canvas_over_limit_never_reaches_texture_creation() {
+        let creation_reached = std::cell::Cell::new(false);
+        let rejected = create_compare_texture(crate::app::MAX_TEXTURE_DIM as u32 + 1, 1, |_| {
+            creation_reached.set(true);
+        });
+
+        assert!(rejected.is_none());
+        assert!(!creation_reached.get());
+        assert!(create_compare_texture(crate::app::MAX_TEXTURE_DIM as u32, 1, |_| ()).is_some());
+    }
+
+    #[test]
+    fn compare_uniform_allows_wipe_at_both_image_edges() {
+        for fraction in [0.0, 1.0] {
+            let bytes = uniform_bytes(CompareShaderMode::Wipe, fraction, [0.0, 0.0, 1.0, 1.0]);
+            assert_eq!(
+                f32::from_ne_bytes(bytes[4..8].try_into().unwrap()),
+                fraction
+            );
+        }
     }
 }

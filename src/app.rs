@@ -2183,16 +2183,15 @@ struct ViewerContextBundle {
         std::collections::HashMap<usize, crate::view_trim::ViewTrimPageOverride>,
     view_trim_dirty_page_overrides: std::collections::HashSet<usize>,
     view_trim_save_pending: bool,
-    fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    fs_cache: ItemsGenerationMap<FsCacheEntry>,
     fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache,
     fs_margin_bbox_cache: std::collections::HashMap<usize, (u64, usize, Option<egui::Rect>)>,
     input_generation: std::collections::HashMap<usize, u64>,
-    fs_pending:
-        std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>, u64)>,
+    fs_pending: ItemsGenerationMap<FsPendingValue>,
     /// この viewer context の実描画先から得た PDF 初回レンダターゲット。
     fs_pdf_display_target: Option<crate::pdf_loader::PdfDisplayTarget>,
-    fs_early_dims: std::collections::HashMap<usize, [usize; 2]>,
-    fs_upload_backlog: Vec<(usize, FsLoadResult, u64)>,
+    fs_early_dims: ItemsGenerationMap<[usize; 2]>,
+    fs_upload_backlog: FsUploadBacklog,
     top_level_grid_view: top_level_grid_view::TopLevelGridView,
     items_are_global_search_view: bool,
     items_are_tag_view: bool,
@@ -2357,6 +2356,15 @@ impl Drop for ViewerContextBundle {
 
 #[cfg(windows)]
 impl ViewerContextBundle {
+    fn set_items_generation(&mut self, items_generation: u64) {
+        self.items_generation = items_generation;
+        self.fs_cache.set_items_generation(items_generation);
+        self.fs_pending.set_items_generation(items_generation);
+        self.fs_early_dims.set_items_generation(items_generation);
+        self.fs_upload_backlog
+            .set_items_generation(items_generation);
+    }
+
     fn empty() -> Self {
         // per-context ロード複合体: 空コンテキストは「誰も繋がっていない」fresh channel と
         // token を持つ (App::new と同じ初期状態。この tx を掴む worker は存在しないので
@@ -2475,14 +2483,14 @@ impl ViewerContextBundle {
             view_trim_page_overrides: std::collections::HashMap::new(),
             view_trim_dirty_page_overrides: std::collections::HashSet::new(),
             view_trim_save_pending: false,
-            fs_cache: std::collections::HashMap::new(),
+            fs_cache: ItemsGenerationMap::new("fs_cache"),
             fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache::default(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             input_generation: std::collections::HashMap::new(),
-            fs_pending: std::collections::HashMap::new(),
+            fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
             fs_pdf_display_target: None,
-            fs_early_dims: std::collections::HashMap::new(),
-            fs_upload_backlog: Vec::new(),
+            fs_early_dims: ItemsGenerationMap::new("fs_early_dims"),
+            fs_upload_backlog: FsUploadBacklog::new("fs_upload_backlog", fs_upload_backlog_idx),
             top_level_grid_view: top_level_grid_view::TopLevelGridView::default(),
             items_are_global_search_view: false,
             items_are_tag_view: false,
@@ -2692,6 +2700,14 @@ fn should_render_main_fullscreen_viewport_after_detached_context(
     embedded_fs_pending: bool,
 ) -> bool {
     !active_detached_context_updated || embedded_fs_active || embedded_fs_pending
+}
+
+#[cfg(windows)]
+fn should_poll_main_embedded_transitions_before_render(
+    embedded_fs_active: bool,
+    embedded_fs_pending: bool,
+) -> bool {
+    embedded_fs_active || embedded_fs_pending
 }
 
 /// メインウィンドウ surface のクリア色 (= egui が何も描かなかったフレームで見える色)。
@@ -3136,7 +3152,6 @@ impl CompareViewMode {
 
 pub(crate) struct PinnedCompareSlot {
     pub(crate) pixels: Arc<egui::ColorImage>,
-    pub(crate) texture: Option<egui::TextureHandle>,
     /// 右下インジケーター専用の小型画像。フル解像度textureを72x54表示のためだけに
     /// uploadしないよう、compare-pin workerで事前縮小する。
     pub(crate) indicator_pixels: Arc<egui::ColorImage>,
@@ -3875,15 +3890,125 @@ pub(crate) struct ComparePreparedPair {
     pub(crate) key: u64,
     pub(crate) current_idx: usize,
     pub(crate) pinned_source_idx: usize,
+    pub(crate) current_input_size: [usize; 2],
+    pub(crate) pinned_input_size: [usize; 2],
     pub(crate) target_size: [usize; 2],
-    pub(crate) pinned_rgba: Arc<Vec<u8>>,
-    pub(crate) current_rgba: Arc<Vec<u8>>,
-    pub(crate) pinned_pixels: Arc<egui::ColorImage>,
-    pub(crate) current_pixels: Arc<egui::ColorImage>,
-    pub(crate) diff_pixels: Arc<egui::ColorImage>,
+    pub(crate) pixels: ComparePreparedPixels,
     pub(crate) pinned_texture: Option<egui::TextureHandle>,
     pub(crate) current_texture: Option<egui::TextureHandle>,
     pub(crate) diff_texture: Option<egui::TextureHandle>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComparePrepareOutput {
+    ShaderPair,
+    PinnedTexture,
+    WipeTextures,
+    DiffTexture,
+}
+
+impl ComparePrepareOutput {
+    pub(crate) fn for_mode(mode: CompareViewMode, gpu_compare_available: bool) -> Option<Self> {
+        match mode {
+            CompareViewMode::Off => None,
+            CompareViewMode::PinnedNormal => Some(Self::PinnedTexture),
+            CompareViewMode::Wipe { .. } if gpu_compare_available => Some(Self::ShaderPair),
+            CompareViewMode::Diff if gpu_compare_available => Some(Self::ShaderPair),
+            CompareViewMode::Wipe { .. } => Some(Self::WipeTextures),
+            CompareViewMode::Diff => Some(Self::DiffTexture),
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ShaderPair => "shader-pair",
+            Self::PinnedTexture => "pinned-texture",
+            Self::WipeTextures => "wipe-textures",
+            Self::DiffTexture => "diff-texture",
+        }
+    }
+}
+
+pub(crate) enum ComparePreparedPixels {
+    ShaderPair {
+        pinned_rgba: Arc<Vec<u8>>,
+        current_rgba: Arc<Vec<u8>>,
+    },
+    PinnedTexture(Arc<egui::ColorImage>),
+    WipeTextures {
+        pinned: Arc<egui::ColorImage>,
+        current: Arc<egui::ColorImage>,
+    },
+    DiffTexture(Arc<egui::ColorImage>),
+}
+
+impl ComparePreparedPixels {
+    pub(crate) fn output(&self) -> ComparePrepareOutput {
+        match self {
+            Self::ShaderPair { .. } => ComparePrepareOutput::ShaderPair,
+            Self::PinnedTexture(_) => ComparePrepareOutput::PinnedTexture,
+            Self::WipeTextures { .. } => ComparePrepareOutput::WipeTextures,
+            Self::DiffTexture(_) => ComparePrepareOutput::DiffTexture,
+        }
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> u64 {
+        let rgba_bytes = |rgba: &Arc<Vec<u8>>| rgba.capacity() as u64;
+        let color_bytes = |pixels: &Arc<egui::ColorImage>| {
+            (pixels.pixels.capacity() * std::mem::size_of::<egui::Color32>()) as u64
+        };
+        match self {
+            Self::ShaderPair {
+                pinned_rgba,
+                current_rgba,
+            } => rgba_bytes(pinned_rgba) + rgba_bytes(current_rgba),
+            Self::PinnedTexture(pinned) => color_bytes(pinned),
+            Self::WipeTextures { pinned, current } => color_bytes(pinned) + color_bytes(current),
+            Self::DiffTexture(diff) => color_bytes(diff),
+        }
+    }
+
+    pub(crate) fn buffer_count(&self) -> usize {
+        match self {
+            Self::ShaderPair { .. } | Self::WipeTextures { .. } => 2,
+            Self::PinnedTexture(_) | Self::DiffTexture(_) => 1,
+        }
+    }
+
+    pub(crate) fn valid_for_size(&self, size: [usize; 2]) -> bool {
+        let Some(expected_pixels) = size[0].checked_mul(size[1]) else {
+            return false;
+        };
+        let Some(expected_rgba) = expected_pixels.checked_mul(4) else {
+            return false;
+        };
+        let rgba_valid = |rgba: &Arc<Vec<u8>>| rgba.len() == expected_rgba;
+        let color_valid = |pixels: &Arc<egui::ColorImage>| {
+            pixels.size == size && pixels.pixels.len() == expected_pixels
+        };
+        match self {
+            Self::ShaderPair {
+                pinned_rgba,
+                current_rgba,
+            } => rgba_valid(pinned_rgba) && rgba_valid(current_rgba),
+            Self::PinnedTexture(pinned) => color_valid(pinned),
+            Self::WipeTextures { pinned, current } => color_valid(pinned) && color_valid(current),
+            Self::DiffTexture(diff) => color_valid(diff),
+        }
+    }
+}
+
+impl ComparePreparedPair {
+    pub(crate) fn allocated_cpu_bytes(&self) -> u64 {
+        self.pixels.allocated_bytes()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ComparePrepareRequest {
+    pub(crate) current_idx: usize,
+    pub(crate) pinned_source_idx: usize,
+    pub(crate) output: ComparePrepareOutput,
 }
 
 pub(crate) struct ComparePrepareResult {
@@ -3891,15 +4016,91 @@ pub(crate) struct ComparePrepareResult {
     pub(crate) pinned_source_idx: usize,
     pub(crate) width: u32,
     pub(crate) height: u32,
-    pub(crate) pinned_rgba: Vec<u8>,
-    pub(crate) current_rgba: Vec<u8>,
-    pub(crate) diff_rgba: Vec<u8>,
+    pub(crate) pixels: ComparePreparedPixels,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComparePrepareScope {
+    SinglePage,
+}
+
+impl ComparePrepareScope {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::SinglePage => "single-page",
+        }
+    }
 }
 
 pub(crate) struct ComparePreparePending {
-    pub(crate) current_idx: usize,
-    pub(crate) pinned_source_idx: usize,
+    pub(crate) request: ComparePrepareRequest,
+    pub(crate) scope: ComparePrepareScope,
+    pub(crate) source_indices: Vec<usize>,
+    pub(crate) current_input_size: [usize; 2],
+    pub(crate) pinned_input_size: [usize; 2],
+    pub(crate) expected_target_size: [usize; 2],
+    pub(crate) started_at: std::time::Instant,
     pub(crate) rx: mpsc::Receiver<Result<ComparePrepareResult, String>>,
+}
+
+/// 比較合成の排他的なライフサイクル。
+///
+/// `WaitingForSource` は PDF の表示解像度更新など、現在ページの最終 source がまだ
+/// 確定していない状態を表す。準備中 / 準備済みを別々の `Option` で持たないため、
+/// worker 完了前の縮退画像を Ready として描画へ公開できない。
+#[derive(Default)]
+pub(crate) enum ComparePreparationState {
+    #[default]
+    Unprepared,
+    WaitingForSource(ComparePrepareRequest),
+    Preparing(ComparePreparePending),
+    /// 入力が失効したが、途中cancel不能なworkerの完了を回収するまで次を直列化する状態。
+    Draining(ComparePreparePending),
+    Ready(ComparePreparedPair),
+}
+
+impl ComparePreparationState {
+    pub(crate) fn request(&self) -> Option<ComparePrepareRequest> {
+        match self {
+            Self::WaitingForSource(request) => Some(*request),
+            Self::Preparing(pending) | Self::Draining(pending) => Some(pending.request),
+            Self::Ready(pair) => Some(ComparePrepareRequest {
+                current_idx: pair.current_idx,
+                pinned_source_idx: pair.pinned_source_idx,
+                output: pair.pixels.output(),
+            }),
+            Self::Unprepared => None,
+        }
+    }
+
+    pub(crate) fn prepared_pair(&self) -> Option<&ComparePreparedPair> {
+        match self {
+            Self::Ready(pair) => Some(pair),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn prepared_pair_mut(&mut self) -> Option<&mut ComparePreparedPair> {
+        match self {
+            Self::Ready(pair) => Some(pair),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        matches!(
+            self,
+            Self::WaitingForSource(_) | Self::Preparing(_) | Self::Draining(_)
+        )
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        let old = std::mem::take(self);
+        *self = match old {
+            Self::Preparing(pending) | Self::Draining(pending) => Self::Draining(pending),
+            _ => Self::Unprepared,
+        };
+    }
 }
 
 /// 起動オーバーレイ用の `StartupProgressHook` を作る共通ヘルパー。
@@ -4779,6 +4980,18 @@ use crate::canonical_image_loader::{
     CanonicalImageSource, CanonicalStaticImage, decode_canonical_image,
 };
 use crate::fs_animation::{AnimationPlayback, FsCacheEntry, FsLoadResult};
+use crate::items_generation_cache::{ItemsGenerationMap, ItemsGenerationVec};
+
+type FsPendingValue = (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>, u64);
+type FsUploadBacklog = ItemsGenerationVec<(usize, FsLoadResult, u64)>;
+
+fn cancel_fs_pending_value(value: &mut FsPendingValue) {
+    value.0.store(true, Ordering::Relaxed);
+}
+
+fn fs_upload_backlog_idx(value: &(usize, FsLoadResult, u64)) -> usize {
+    value.0
+}
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::thumb_loader::{
     CacheDecision, DctDecodeError, LoadRequest, ScaleStats, ThumbMsg, apply_orientation,
@@ -7850,7 +8063,7 @@ fn viewer_context_bundle_needs_resident_media_updates(
 
 fn pause_current_media_player_for_remote_session(
     fullscreen_idx: Option<usize>,
-    fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
+    fs_cache: &ItemsGenerationMap<FsCacheEntry>,
 ) -> bool {
     let Some(FsCacheEntry::Video { player, .. }) =
         fullscreen_idx.and_then(|idx| fs_cache.get(&idx))
@@ -8483,8 +8696,9 @@ pub struct App {
     native_video_parked_live_activation_requests: Vec<u64>,
     #[cfg(windows)]
     next_detached_viewer_context_serial: u64,
-    /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）
-    pub(crate) fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）。
+    /// entry はこの bundle の items_generation を刻み、全参照で照合する。
+    pub(crate) fs_cache: ItemsGenerationMap<FsCacheEntry>,
     pub(crate) fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache,
     /// raw Static 画素の近モノクロ要約。TextureId が source identity を兼ねるため、
     /// 再デコードや PDF 再レンダ後の古い値は lookup 時に自然に stale になる。
@@ -8517,12 +8731,12 @@ pub struct App {
     /// idx 単位で +1 する。`erase_result_cache` の key に含めることで、入力が
     /// 変わった後に古い MI-GAN 結果を表示しない。
     pub(crate) input_generation: std::collections::HashMap<usize, u64>,
-    /// 先読み中: item_idx → (キャンセルトークン, 受信チャネル, load 開始時の input_seq)
+    /// 先読み中: item_idx → (キャンセルトークン, 受信チャネル, load 開始時の input_seq)。
+    /// request の items_generation は map entry に刻み、完了物の各着地点まで運ぶ。
     /// `input_seq` は perf の `fs.ready` / `fs.paint` を `fs.load_begin` と同じ
     /// 操作に紐づけるための相関キー。`self.input_seq` を使うと非同期完了時に
     /// 別のユーザー操作にずれる。計装無効時や内部起動は 0。
-    pub(crate) fs_pending:
-        std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>, u64)>,
+    pub(crate) fs_pending: ItemsGenerationMap<FsPendingValue>,
 
     /// fullscreen / detached / in-window の実 viewport と effective ppp から得た
     /// PDF 初回レンダターゲット。viewer context と一緒に swap する。
@@ -8532,15 +8746,15 @@ pub struct App {
     /// `FsLoadResult::DimsOnly` を受信すると登録され、本体 (`Static` など) で
     /// fs_cache が埋まったら削除される。ホバーバーはデコード完了前でも
     /// これを見て即サイズを表示できる (⚠ ダウンスケール警告もここで判定可能)。
-    pub(crate) fs_early_dims: std::collections::HashMap<usize, [usize; 2]>,
+    pub(crate) fs_early_dims: ItemsGenerationMap<[usize; 2]>,
 
     /// デコード完了済みだが GPU アップロード未了の先読みエントリ。
     /// 20MP 級 JPEG の `ctx.load_texture` は UI スレッドで 25-60ms/枚かかり、
     /// 10 枚連続で来ると 500ms 超の UI フリーズになる (計測実績あり)。
     /// `poll_prefetch` では受信を drain してここに溜め、フレームあたり最大 1 枚だけ
     /// アップロードする (現在ページは即時)。
-    /// `(idx, FsLoadResult, load_seq)` — FIFO 順で消化する。
-    pub(crate) fs_upload_backlog: Vec<(usize, FsLoadResult, u64)>,
+    /// `(idx, FsLoadResult, load_seq)` と entry の items_generation — FIFO 順で消化する。
+    pub(crate) fs_upload_backlog: FsUploadBacklog,
 
     /// items が差し替わるたびにインクリメントする世代カウンタ。
     /// `LoadRequest::items_gen` → worker → `ThumbMsg::items_gen` を経由して poll_thumbnails
@@ -8926,13 +9140,13 @@ pub struct App {
     pub(crate) export_pending: Option<crate::export_dialog::ExportPending>,
     /// Ctrl+E で現在表示中の実フォルダへ保存したため、グリッド復帰時に再読み込みする対象。
     pub(crate) export_folder_refresh_pending: Option<PathBuf>,
-    /// X / C 比較ビューのピン留めスロット。CPU pixels を正とし、texture は派生物。
+    /// X / C 比較ビューのピン留めスロット。CPU pixels を正とし、右下 indicator texture
+    /// だけを派生物として保持する。本文は準備済み比較 pair から描画する。
     pub(crate) pinned_compare_slot: Option<PinnedCompareSlot>,
     pub(crate) compare_view_mode: CompareViewMode,
     pub(crate) compare_pin_load_pending: Option<ComparePinLoadPending>,
     pub(crate) compare_pin_pending: Option<ComparePinPending>,
-    pub(crate) compare_prepare_pending: Option<ComparePreparePending>,
-    pub(crate) compare_prepared_pair: Option<ComparePreparedPair>,
+    pub(crate) compare_preparation: ComparePreparationState,
     pub(crate) compare_prepared_next_key: u64,
     pub(crate) compare_wipe_dragging: bool,
     /// フォルダ読み込み後に選択するアイテム名（BS で親に戻るとき等）
@@ -11937,7 +12151,7 @@ impl App {
             native_video_parked_live_activation_requests: Vec::new(),
             #[cfg(windows)]
             next_detached_viewer_context_serial: 1,
-            fs_cache: std::collections::HashMap::new(),
+            fs_cache: ItemsGenerationMap::new("fs_cache"),
             fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache::default(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             view_trim_mode: false,
@@ -11950,10 +12164,10 @@ impl App {
             view_trim_save_pending: false,
             view_trim_db,
             input_generation: std::collections::HashMap::new(),
-            fs_pending: std::collections::HashMap::new(),
+            fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
             fs_pdf_display_target: None,
-            fs_upload_backlog: Vec::new(),
-            fs_early_dims: std::collections::HashMap::new(),
+            fs_upload_backlog: FsUploadBacklog::new("fs_upload_backlog", fs_upload_backlog_idx),
+            fs_early_dims: ItemsGenerationMap::new("fs_early_dims"),
             colorize_mono_summary_cache: std::collections::HashMap::new(),
             items_generation: 0,
             top_level_grid_view: top_level_grid_view::TopLevelGridView::default(),
@@ -12106,8 +12320,7 @@ impl App {
             compare_view_mode: CompareViewMode::Off,
             compare_pin_load_pending: None,
             compare_pin_pending: None,
-            compare_prepare_pending: None,
-            compare_prepared_pair: None,
+            compare_preparation: ComparePreparationState::Unprepared,
             compare_prepared_next_key: 1,
             compare_wipe_dragging: false,
             select_after_load: None,
@@ -13861,6 +14074,11 @@ impl App {
             crate::keyboard_input::PendingFocusEvent::EditingEnded,
         );
         self.pending_text_input_focus.set(transition.claim);
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn test_script_pending_text_input_focus(&self) -> bool {
+        self.pending_text_input_focus.get().is_some()
     }
 
     pub(crate) fn clear_book_bookmark_title_edit(&mut self) {
@@ -16174,6 +16392,10 @@ impl App {
         if self.restore_subfolder_expansion_for_synthetic_path(&folder) {
             return;
         }
+        self.select_after_load = self
+            .selected
+            .and_then(|index| self.items.get(index))
+            .map(|item| item.name().into_owned());
         let saved_override = self.archive_source_override.clone();
         self.load_folder(folder);
         if let Some(src) = saved_override {
@@ -17734,7 +17956,7 @@ impl App {
                     self.items.push(GridItem::Video(config.path.clone()));
                     self.image_metas.push(None);
                     self.thumbnails.push(ThumbnailState::Pending);
-                    self.items_generation = self.items_generation.wrapping_add(1);
+                    self.bump_items_generation();
                     self.invalidate_facet_name_cache();
                     self.visible_indices.push(idx);
                     idx
@@ -22479,6 +22701,27 @@ impl App {
         }
     }
 
+    fn set_items_generation(&mut self, items_generation: u64) {
+        self.items_generation = items_generation;
+        self.fs_cache.set_items_generation(items_generation);
+        self.fs_pending.set_items_generation(items_generation);
+        self.fs_early_dims.set_items_generation(items_generation);
+        self.fs_upload_backlog
+            .set_items_generation(items_generation);
+    }
+
+    pub(crate) fn bump_items_generation(&mut self) {
+        self.set_items_generation(self.items_generation.wrapping_add(1));
+    }
+
+    #[cfg(test)]
+    fn fs_generation_state_is_current(&self) -> bool {
+        self.fs_cache.current_items_generation() == self.items_generation
+            && self.fs_pending.current_items_generation() == self.items_generation
+            && self.fs_early_dims.current_items_generation() == self.items_generation
+            && self.fs_upload_backlog.current_items_generation() == self.items_generation
+    }
+
     /// items / image_metas / thumbnails を新しい並びで差し替え、items_generation を bump する。
     ///
     /// 世代更新と thumbnails の Pending 初期化を 1 箇所に集約するためのヘルパ。
@@ -22519,7 +22762,7 @@ impl App {
                 _ => ThumbnailState::Pending,
             })
             .collect();
-        self.items_generation = self.items_generation.wrapping_add(1);
+        self.bump_items_generation();
         self.invalidate_facet_name_cache();
         // 一覧全体の差し替えでは同じ index が別アイテムを指し得るため、クリック範囲選択の
         // 起点を失効させる。Ctrl+G streaming のように内容 identity で追従できる経路だけ、
@@ -24254,6 +24497,27 @@ impl App {
             })
             .collect();
 
+        // 各残存 old_idx に対する new_idx を partition_point で O(log K) 算出。
+        let mut sorted_asc: Vec<usize> = sorted_desc_idxs.to_vec();
+        sorted_asc.sort_unstable();
+        let shift = |old: usize| -> Option<usize> {
+            let p = sorted_asc.partition_point(|&x| x < old);
+            if sorted_asc.get(p) == Some(&old) {
+                return None;
+            }
+            Some(old - p)
+        };
+
+        // 再生中の動画/音声 player は明示的に old idx -> new idx へ移して温存する。
+        // 新世代への bump より前に owner から取り出し、後段の invalidate 後に刻み直す。
+        let preserved_video_entries: Vec<(usize, FsCacheEntry)> = self
+            .fs_cache
+            .take_values()
+            .into_iter()
+            .filter(|(_, entry)| matches!(entry, FsCacheEntry::Video { .. }))
+            .filter_map(|(i, entry)| shift(i).map(|ni| (ni, entry)))
+            .collect();
+
         // 物理 shift: 降順なので items.remove(i) の再 shift は発生しない。
         for &i in sorted_desc_idxs {
             if i < self.items.len() {
@@ -24266,23 +24530,10 @@ impl App {
                 self.image_metas.remove(i);
             }
         }
-        self.items_generation = self.items_generation.wrapping_add(1);
+        self.bump_items_generation();
         self.remove_paths_from_subfolder_expansion_snapshot(&removed_snapshot_paths);
         self.remove_paths_from_smart_folder_snapshots(&removed_snapshot_paths);
 
-        // 各残存 old_idx に対する new_idx を partition_point で O(log K) 算出。
-        // 削除 idx 集合は降順入力だが、partition_point には昇順が要るので一度昇順化する。
-        // 削除済み判定も partition_point の位置で `sorted_asc[p] == old` を見れば済み、
-        // HashSet<usize> を別途作る必要はない。
-        let mut sorted_asc: Vec<usize> = sorted_desc_idxs.to_vec();
-        sorted_asc.sort_unstable();
-        let shift = |old: usize| -> Option<usize> {
-            let p = sorted_asc.partition_point(|&x| x < old);
-            if sorted_asc.get(p) == Some(&old) {
-                return None;
-            }
-            Some(old - p)
-        };
         self.grid_click_selection_anchor = self
             .grid_click_selection_anchor
             .and_then(|anchor| anchor.index_for_generation(previous_items_generation))
@@ -24606,17 +24857,6 @@ impl App {
                     shift(pending.target_idx).expect("tile-swap target removal handled above");
             }
         }
-
-        // 再生中の動画/音声 player (FsCacheEntry::Video) は shift した新 idx で温存する。
-        // invalidate の fs_cache.clear() に任せると、削除対象と無関係な別窓再生中の player が
-        // その場で drop され再生が突然止まる (review-v2.3.0 P2-2)。画像 entry は再デコードが
-        // 安価なので従来どおり捨てて再ロードに任せる。
-        let preserved_video_entries: Vec<(usize, FsCacheEntry)> =
-            std::mem::take(&mut self.fs_cache)
-                .into_iter()
-                .filter(|(_, entry)| matches!(entry, FsCacheEntry::Video { .. }))
-                .filter_map(|(i, entry)| shift(i).map(|ni| (ni, entry)))
-                .collect();
 
         self.invalidate_idx_state_and_queues();
         self.fs_cache.extend(preserved_video_entries);
@@ -26623,17 +26863,12 @@ impl App {
                 self.pinned_compare_slot = Some(PinnedCompareSlot {
                     source_size: pixels.size,
                     pixels: Arc::new(pixels),
-                    texture: None,
                     indicator_pixels: Arc::new(indicator_pixels),
                     indicator_texture: None,
                     display_name: display_name.clone(),
                     source_idx,
                 });
-                self.compare_view_mode = CompareViewMode::Off;
-                self.compare_prepare_pending = None;
-                self.compare_prepared_pair = None;
-                self.clear_compare_gpu_pair();
-                self.compare_wipe_dragging = false;
+                self.deactivate_compare_view();
                 self.show_feedback_toast(format!("比較画像を設定: {display_name}"));
                 ctx.request_repaint();
             }
@@ -26690,27 +26925,60 @@ impl App {
     }
 
     pub(crate) fn poll_compare_prepare_pending(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.compare_prepare_pending.as_ref() else {
-            return;
+        let (pending, draining) = match &self.compare_preparation {
+            ComparePreparationState::Preparing(pending) => (pending, false),
+            ComparePreparationState::Draining(pending) => (pending, true),
+            _ => return,
         };
         let result = match pending.rx.try_recv() {
             Ok(result) => result,
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 return;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 Err("比較表示の準備が中断されました".to_string())
             }
         };
-        let pending_current_idx = pending.current_idx;
-        let pending_pinned_source_idx = pending.pinned_source_idx;
-        self.compare_prepare_pending = None;
+        let pending = match std::mem::replace(
+            &mut self.compare_preparation,
+            ComparePreparationState::Unprepared,
+        ) {
+            ComparePreparationState::Preparing(pending)
+            | ComparePreparationState::Draining(pending) => pending,
+            _ => unreachable!(),
+        };
+        let request = pending.request;
+        let scope = pending.scope;
+
+        if draining {
+            crate::logger::log(
+                "[compare-memory] stage=worker-result-drained reason=source-invalidated old_pair_release=before_next_worker",
+            );
+            ctx.request_repaint();
+            return;
+        }
+
+        let active_output = ComparePrepareOutput::for_mode(
+            self.compare_view_mode,
+            cfg!(windows) && self.wgpu_render_state.is_some(),
+        );
+        if self.fullscreen_idx != Some(request.current_idx) || active_output != Some(request.output)
+        {
+            crate::logger::log(format!(
+                "[compare-memory] stage=worker-result-discarded current_idx={} target_output={} active_idx={:?} active_output={} old_pair_release=before_worker",
+                request.current_idx,
+                request.output.label(),
+                self.fullscreen_idx,
+                active_output.map_or("off", ComparePrepareOutput::label),
+            ));
+            ctx.request_repaint();
+            return;
+        }
 
         match result {
             Ok(result) => {
-                if result.current_idx != pending_current_idx
-                    || result.pinned_source_idx != pending_pinned_source_idx
+                if result.current_idx != request.current_idx
+                    || result.pinned_source_idx != request.pinned_source_idx
                 {
                     return;
                 }
@@ -26721,40 +26989,65 @@ impl App {
                 {
                     return;
                 }
-                let expected = result.width as usize * result.height as usize * 4;
-                if result.pinned_rgba.len() != expected
-                    || result.current_rgba.len() != expected
-                    || result.diff_rgba.len() != expected
+                // worker 開始後に PDF 表示解像度更新などの replacement load が始まる
+                // 競合もある。snapshot 元のいずれかが更新中なら、旧 snapshot の完了を
+                // Ready として公開せず source 確定後に作り直す。
+                if pending
+                    .source_indices
+                    .iter()
+                    .any(|idx| self.fs_pending.contains_key(idx))
                 {
-                    self.show_feedback_toast("比較表示のサイズが不正です".to_string());
+                    self.compare_preparation = ComparePreparationState::WaitingForSource(request);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    return;
+                }
+                let result_size = [result.width as usize, result.height as usize];
+                if result_size != pending.expected_target_size
+                    || result.pixels.output() != request.output
+                    || !result.pixels.valid_for_size(result_size)
+                {
+                    crate::logger::log(format!(
+                        "compare prepare result withheld: current_idx={} pinned_idx={} expected={}x{} actual={}x{} expected_output={} actual_output={} cpu_bytes={}",
+                        request.current_idx,
+                        request.pinned_source_idx,
+                        pending.expected_target_size[0],
+                        pending.expected_target_size[1],
+                        result_size[0],
+                        result_size[1],
+                        request.output.label(),
+                        result.pixels.output().label(),
+                        result.pixels.allocated_bytes(),
+                    ));
+                    self.compare_preparation = ComparePreparationState::WaitingForSource(request);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
                     return;
                 }
 
-                let pinned_pixels = egui::ColorImage::from_rgba_unmultiplied(
-                    [result.width as usize, result.height as usize],
-                    &result.pinned_rgba,
-                );
-                let current_pixels = egui::ColorImage::from_rgba_unmultiplied(
-                    [result.width as usize, result.height as usize],
-                    &result.current_rgba,
-                );
-                let diff_pixels = egui::ColorImage::from_rgba_unmultiplied(
-                    [result.width as usize, result.height as usize],
-                    &result.diff_rgba,
-                );
+                crate::logger::log(format!(
+                    "[compare-memory] stage=cpu-ready target={}x{} current_input={}x{} pinned_input={}x{} scope={} output={} prepare_ms={:.3} cpu_total_bytes={} cpu_buffers={} gpu_total_bytes=0 gpu_mips=not-allocated old_pair_release=before_worker",
+                    result_size[0],
+                    result_size[1],
+                    pending.current_input_size[0],
+                    pending.current_input_size[1],
+                    pending.pinned_input_size[0],
+                    pending.pinned_input_size[1],
+                    scope.label(),
+                    result.pixels.output().label(),
+                    pending.started_at.elapsed().as_secs_f64() * 1000.0,
+                    result.pixels.allocated_bytes(),
+                    result.pixels.buffer_count(),
+                ));
                 let key = self.compare_prepared_next_key;
                 self.compare_prepared_next_key =
                     self.compare_prepared_next_key.wrapping_add(1).max(1);
-                self.compare_prepared_pair = Some(ComparePreparedPair {
+                self.compare_preparation = ComparePreparationState::Ready(ComparePreparedPair {
                     key,
                     current_idx: result.current_idx,
                     pinned_source_idx: result.pinned_source_idx,
-                    target_size: [result.width as usize, result.height as usize],
-                    pinned_rgba: Arc::new(result.pinned_rgba),
-                    current_rgba: Arc::new(result.current_rgba),
-                    pinned_pixels: Arc::new(pinned_pixels),
-                    current_pixels: Arc::new(current_pixels),
-                    diff_pixels: Arc::new(diff_pixels),
+                    current_input_size: pending.current_input_size,
+                    pinned_input_size: pending.pinned_input_size,
+                    target_size: result_size,
+                    pixels: result.pixels,
                     pinned_texture: None,
                     current_texture: None,
                     diff_texture: None,
@@ -31314,6 +31607,15 @@ impl App {
             return None;
         }
 
+        if self.keymap.consume_action(ctx, KeyAction::GridRename) {
+            self.request_grid_rename_dialog();
+            return None;
+        }
+        if self.keymap.consume_action(ctx, KeyAction::GridReload) {
+            self.reload_top_level_grid(ctx);
+            return None;
+        }
+
         if self
             .keymap
             .consume_action(ctx, KeyAction::GridToggleStackMode)
@@ -33810,11 +34112,14 @@ impl App {
                 return;
             }
 
-            use windows::Win32::UI::Input::KeyboardAndMouse::{
-                GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT,
-            };
+            use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU, VK_SHIFT};
 
-            let key_down = |vk: u16| unsafe { GetAsyncKeyState(vk as i32) < 0 };
+            let key_down = |vk: u16| {
+                crate::key_input::physical_key_down(crate::key_input::PhysicalKeySlot::new(
+                    vk.into(),
+                    false,
+                ))
+            };
             let modifiers = Self::egui_modifiers_from_physical_state(
                 key_down(VK_CONTROL.0),
                 key_down(VK_SHIFT.0),
@@ -33852,6 +34157,9 @@ impl App {
         let ctrl_v = {
             #[cfg(windows)]
             {
+                // Clipboard paste depends on GetAsyncKeyState's transition low
+                // bit, which the keyboard level chokepoint intentionally does
+                // not model. Synthetic clipboard input is outside S1.
                 let ctrl =
                     unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x11) };
                 let v =
@@ -34846,7 +35154,7 @@ impl App {
     #[cfg(windows)]
     fn assign_next_detached_viewer_context_generation(&mut self) -> u64 {
         let (context_serial, items_generation) = self.allocate_detached_viewer_context_generation();
-        self.items_generation = items_generation;
+        self.set_items_generation(items_generation);
         context_serial
     }
 
@@ -35238,8 +35546,7 @@ impl App {
         self.capture_region_selection = None;
         self.clear_fullscreen_tag_picker_state();
 
-        self.compare_view_mode = CompareViewMode::Off;
-        self.clear_compare_gpu_pair();
+        self.deactivate_compare_view();
         if self.panorama_state.is_some() {
             self.toggle_panorama_mode(fs_idx);
         }
@@ -39002,7 +39309,7 @@ impl App {
             self.allocate_detached_viewer_context_generation();
         let mut bundle = self.split_materialized_physical_context_for_independent_still_open();
         bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        bundle.items_generation = items_generation;
+        bundle.set_items_generation(items_generation);
         bundle.address = physical_context.display().to_string();
         bundle.current_folder = Some(physical_context.clone());
         bundle.visible_indices = bundle
@@ -52280,6 +52587,10 @@ impl App {
     pub(crate) fn bump_input_generation_for_fs_cache_reload(&mut self, idx: usize) {
         let slot = self.input_generation.entry(idx).or_insert(0);
         *slot = slot.wrapping_add(1);
+        // 比較 worker が旧 raw source を snapshot 済みなら、その完了結果は新しい
+        // source と同一 idx でも publish してはいけない。source 所有境界で typed
+        // preparation state ごと失効させ、次の描画で新 source から準備し直す。
+        self.invalidate_compare_prepared_for_idx(idx);
         self.fs_lanczos_cache.remove_page(idx);
         self.cancel_erase_commit_pending_for_idx(idx);
         self.clear_erase_result_caches_for_idx(idx);
@@ -53497,6 +53808,35 @@ impl App {
         }
     }
 
+    fn enqueue_fs_upload_result_for_generation(
+        &mut self,
+        items_generation: u64,
+        idx: usize,
+        result: FsLoadResult,
+        load_seq: u64,
+    ) -> bool {
+        if !self
+            .fs_upload_backlog
+            .accepts_generation(idx, items_generation)
+        {
+            return false;
+        }
+        let backlog_pos = self
+            .fs_upload_backlog
+            .iter()
+            .position(|(key, _, _)| *key == idx);
+        if let Some(pos) = backlog_pos {
+            self.fs_upload_backlog.replace_for_generation(
+                pos,
+                items_generation,
+                (idx, result, load_seq),
+            )
+        } else {
+            self.fs_upload_backlog
+                .push_for_generation(items_generation, (idx, result, load_seq))
+        }
+    }
+
     fn enqueue_retained_pdf_page_raster_result(
         &mut self,
         idx: usize,
@@ -53509,15 +53849,7 @@ impl App {
             pixels,
             source_dims,
         };
-        if let Some(pos) = self
-            .fs_upload_backlog
-            .iter()
-            .position(|(key, _, _)| *key == idx)
-        {
-            self.fs_upload_backlog[pos] = (idx, result, load_seq);
-        } else {
-            self.fs_upload_backlog.push((idx, result, load_seq));
-        }
+        self.enqueue_fs_upload_result_for_generation(self.items_generation, idx, result, load_seq);
         self.fs_early_dims.remove(&idx);
         crate::logger::log(format!(
             "[PDF] Retained page enqueue idx={idx} kind=raster backlog={} reason={reason}",
@@ -57677,23 +58009,75 @@ impl App {
         }
     }
 
+    /// Cで通常表示へ戻るだけなら、次のCで同じ固定画像を即座に再表示できるよう
+    /// 準備済みの固定側CPU/GPU資源を保持する。
+    pub(crate) fn hide_compare_pinned_view(&mut self) {
+        let retain_ready = self
+            .compare_preparation
+            .prepared_pair()
+            .is_some_and(|pair| matches!(&pair.pixels, ComparePreparedPixels::PinnedTexture(_)));
+        if !retain_ready {
+            self.deactivate_compare_view();
+            return;
+        }
+        self.compare_view_mode = CompareViewMode::Off;
+        self.compare_wipe_dragging = false;
+        if let Some(pair) = self.compare_preparation.prepared_pair() {
+            crate::logger::log(format!(
+                "[compare-memory] stage=pinned-hidden-retained target={}x{} current_input={}x{} pinned_input={}x{} output=pinned-texture cpu_total_bytes={} gpu_textures={} reuse=next-c",
+                pair.target_size[0],
+                pair.target_size[1],
+                pair.current_input_size[0],
+                pair.current_input_size[1],
+                pair.pinned_input_size[0],
+                pair.pinned_input_size[1],
+                pair.allocated_cpu_bytes(),
+                usize::from(pair.pinned_texture.is_some()),
+            ));
+        }
+    }
+
+    /// 比較表示を終了し、準備済みCPUバッファとcallback側GPU textureを同じ所有境界で落とす。
+    pub(crate) fn deactivate_compare_view(&mut self) {
+        let released_cpu_bytes = self
+            .compare_preparation
+            .prepared_pair()
+            .map_or(0, ComparePreparedPair::allocated_cpu_bytes);
+        self.compare_view_mode = CompareViewMode::Off;
+        // 実行中workerはrun_pixel_workの途中で止められない。receiverを捨てると再開時に
+        // 次workerを起動できて並走するため、Preparingだけはpollして捨てるまで所有を保つ。
+        if !matches!(
+            self.compare_preparation,
+            ComparePreparationState::Preparing(_) | ComparePreparationState::Draining(_)
+        ) {
+            self.compare_preparation = ComparePreparationState::Unprepared;
+        }
+        self.clear_compare_gpu_pair();
+        self.compare_wipe_dragging = false;
+        if released_cpu_bytes > 0 {
+            crate::logger::log(format!(
+                "[compare-memory] stage=deactivate cpu_total_bytes=0 released_cpu_bytes={} gpu_total_bytes=0 release_order=before_next_prepare",
+                released_cpu_bytes,
+            ));
+        }
+    }
+
     pub(crate) fn invalidate_compare_prepared_for_idx(&mut self, idx: usize) {
         let prepared_affected = self
-            .compare_prepared_pair
-            .as_ref()
+            .compare_preparation
+            .prepared_pair()
             .is_some_and(|pair| pair.current_idx == idx || pair.pinned_source_idx == idx);
-        let pending_affected = self
-            .compare_prepare_pending
-            .as_ref()
-            .is_some_and(|pending| pending.current_idx == idx || pending.pinned_source_idx == idx);
+        let affected = self
+            .compare_preparation
+            .request()
+            .is_some_and(|request| request.current_idx == idx || request.pinned_source_idx == idx);
+        if affected {
+            self.compare_preparation.invalidate();
+        }
         if prepared_affected {
-            self.compare_prepared_pair = None;
             self.clear_compare_gpu_pair();
         }
-        if pending_affected {
-            self.compare_prepare_pending = None;
-        }
-        if prepared_affected || pending_affected {
+        if affected {
             self.compare_wipe_dragging = false;
         }
     }
@@ -57704,9 +58088,8 @@ impl App {
     /// 比較ピクセルも古くなるが、mark_comic_dirty は現在ページ (fullscreen_idx) しか無効化
     /// しないため取りこぼす (Codex P2)。
     pub(crate) fn invalidate_all_compare_prepared(&mut self) {
-        self.compare_prepared_pair = None;
+        self.compare_preparation.invalidate();
         self.clear_compare_gpu_pair();
-        self.compare_prepare_pending = None;
         self.compare_wipe_dragging = false;
         // ピン留め (X) スロットは焼き込み済み pixels を保持するので、フォントソース変更では
         // 旧フォントのまま残る。スロット + 進行中の pin worker / load も落とす (Codex P2)。
@@ -57788,8 +58171,7 @@ impl App {
     pub(crate) fn clear_all_color_caches(&mut self) {
         self.adjustment_cache.clear();
         self.thumb_adjust_tex.clear();
-        self.compare_prepare_pending = None;
-        self.compare_prepared_pair = None;
+        self.compare_preparation.invalidate();
         self.clear_compare_gpu_pair();
         self.compare_wipe_dragging = false;
         self.clear_all_final_pipeline_caches();
@@ -59263,8 +59645,7 @@ impl App {
         self.local_adjust_segmentation_pending = None;
         self.analysis_mode = false;
         self.reset_erase_mode();
-        self.compare_view_mode = crate::app::CompareViewMode::Off;
-        self.clear_compare_gpu_pair();
+        self.deactivate_compare_view();
         self.show_metadata_panel = false;
         self.metadata_panel_hover_active = false;
     }
@@ -59705,18 +60086,18 @@ impl App {
         // `DimsOnly` は非終端 (後続メッセージあり) なので fs_pending は維持して
         // drain を続ける。fs_early_dims への書き込みは fs_pending 借用中はできないので
         // ローカル vec に積んでから後段で apply する。
-        let mut completed: Vec<(usize, FsLoadResult, u64)> = Vec::new();
+        let mut completed: Vec<(usize, FsLoadResult, u64, u64)> = Vec::new();
         let mut disconnected: Vec<usize> = Vec::new();
-        let mut early_dims_updates: Vec<(usize, [usize; 2])> = Vec::new();
-        for (&key, (_, rx, seq)) in &self.fs_pending {
+        let mut early_dims_updates: Vec<(usize, [usize; 2], u64)> = Vec::new();
+        for (&key, items_generation, (_, rx, seq)) in self.fs_pending.iter_with_generation() {
             loop {
                 match rx.try_recv() {
                     Ok(FsLoadResult::DimsOnly { source_dims }) => {
-                        early_dims_updates.push((key, source_dims));
+                        early_dims_updates.push((key, source_dims, items_generation));
                         continue;
                     }
                     Ok(result) => {
-                        completed.push((key, result, *seq));
+                        completed.push((key, result, *seq, items_generation));
                         break;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -59728,8 +60109,9 @@ impl App {
             }
         }
         let early_dims_repaint = !early_dims_updates.is_empty();
-        for (key, dims) in early_dims_updates {
-            self.fs_early_dims.insert(key, dims);
+        for (key, dims, items_generation) in early_dims_updates {
+            self.fs_early_dims
+                .insert_for_generation(key, items_generation, dims);
         }
         // 送信側が drop されたエントリを除去 (キャンセル済みスレッドが送信せずに終了)
         for key in disconnected {
@@ -59738,7 +60120,7 @@ impl App {
         }
         // fs_pending からは即座に除去 (「先読み中 / 完了」状態の重複を防ぐ)。
         // backlog に積まれた時点で fs_cache に載る手前の最終中継点として扱う。
-        for (key, _, _) in &completed {
+        for (key, _, _, _) in &completed {
             self.fs_pending.remove(key);
             self.fs_early_dims.remove(key);
         }
@@ -59748,7 +60130,7 @@ impl App {
         // pano_high_res_source には入らないので、backlog に複数滞留させる必要なし。
         // mpsc 受信直後に drop して memory peak を最小化する。
         let current_fs = self.fullscreen_idx;
-        for (key, mut result, load_seq) in completed {
+        for (key, mut result, load_seq, items_generation) in completed {
             if Some(key) != current_fs {
                 if let FsLoadResult::StaticPanorama {
                     ci,
@@ -59760,15 +60142,7 @@ impl App {
                     result = FsLoadResult::Static { ci, source_dims };
                 }
             }
-            if let Some(pos) = self
-                .fs_upload_backlog
-                .iter()
-                .position(|(k, _, _)| *k == key)
-            {
-                self.fs_upload_backlog[pos] = (key, result, load_seq);
-            } else {
-                self.fs_upload_backlog.push((key, result, load_seq));
-            }
+            self.enqueue_fs_upload_result_for_generation(items_generation, key, result, load_seq);
         }
 
         // ── ペーシング: このフレームで何枚アップロードするか決める ──
@@ -59791,16 +60165,19 @@ impl App {
         // 両方ある場合は元の位置順 (FIFO) を維持するため、大きい位置から remove する。
         let mut positions: Vec<usize> = [cur_pos, other_pos].into_iter().flatten().collect();
         positions.sort_unstable_by(|a, b| b.cmp(a));
-        let mut to_process: Vec<(usize, FsLoadResult, u64)> = positions
+        let mut to_process: Vec<(u64, (usize, FsLoadResult, u64))> = positions
             .into_iter()
-            .map(|pos| self.fs_upload_backlog.remove(pos))
+            .map(|pos| self.fs_upload_backlog.remove_with_generation(pos))
             .collect();
         // descending で取り出したので元の位置順に直す
         to_process.reverse();
 
         let has_more_backlog = !self.fs_upload_backlog.is_empty();
         let repaint = !to_process.is_empty() || early_dims_repaint || has_more_backlog;
-        for (key, result, load_seq) in to_process {
+        for (items_generation, (key, result, load_seq)) in to_process {
+            if !self.fs_cache.accepts_generation(key, items_generation) {
+                continue;
+            }
             // 本体メッセージで fs_cache が埋まるので先行ヒントはもう不要。
             // (ホバーバーは fs_cache.source_dims を優先して見るため、残っていても
             // 実害はないが HashMap が膨張しないようクリーンアップする)
@@ -59957,7 +60334,8 @@ impl App {
                     unreachable!("DimsOnly should be drained before reaching completion match")
                 }
             };
-            self.fs_cache.insert(key, entry);
+            self.fs_cache
+                .insert_for_generation(key, items_generation, entry);
             self.fs_margin_bbox_cache.remove(&key);
             self.bump_input_generation_for_fs_cache_reload(key);
             // 360 度パノラマビュー Phase 2a (§3.6.4): worker は tee しなかったが、
@@ -61773,6 +62151,13 @@ impl eframe::App for App {
         // This also ages a root PendingFocus claim on every pass, including
         // passes that return before the normal keyboard handler.
         let _keyboard_owner = self.keyboard_owner_for_pass(ctx);
+        #[cfg(all(windows, feature = "test-script"))]
+        {
+            let snapshot = self.test_script_snapshot(ctx);
+            if crate::test_script::ui_update(ctx, snapshot) {
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+            }
+        }
         self.edit_preview_repaint_ctx = Some(ctx.clone());
         if self
             .creative_lut_library
@@ -62437,7 +62822,8 @@ impl eframe::App for App {
             || self.export_pending.is_some()
             || self.compare_pin_load_pending.is_some()
             || self.compare_pin_pending.is_some()
-            || self.compare_prepare_pending.is_some()
+            || (self.compare_preparation.is_pending()
+                && !matches!(self.compare_view_mode, CompareViewMode::Off))
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -62650,6 +63036,35 @@ impl eframe::App for App {
             self.keep_fullscreen_viewport_alive(ctx);
         }
         let t_keep_fullscreen_viewport = frame_t0.elapsed();
+        // active detached は update_active_detached_viewer_context 内で
+        // folder result -> PDF/ZIP enumerate -> nav lock -> render の順に処理する。
+        // main embedded も同じ所有順序に揃え、items_generation 更新による cache purge が
+        // CentralPanel の shape 構築後に走って 1 presentation frame だけ黒くなる隙をなくす。
+        // FolderNavMode::Fullscreen の着地点は画像フォルダ / ZIP / PDF で共通なので、
+        // コンテナ種別ごとの分岐は作らない。
+        #[cfg(windows)]
+        let main_embedded_transitions_polled_before_render = {
+            let embedded_active = self.fullscreen_embedded_still_active();
+            let embedded_pending =
+                self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active();
+            let should_poll = should_poll_main_embedded_transitions_before_render(
+                embedded_active,
+                embedded_pending,
+            );
+            if should_poll {
+                if let Some(result) = self.poll_folder_nav()
+                    && keyboard_nav.is_none()
+                {
+                    self.apply_folder_nav_result(ctx, result);
+                }
+                self.poll_pdf_enumerate();
+                self.poll_zip_enumerate();
+                // apply/enumerate が新しい表示を同フレームで準備できた場合だけ、既存の
+                // generation-aware holdover を描画前に解放する。
+                self.poll_fs_nav_lock(ctx);
+            }
+            should_poll
+        };
         // in-window 静止画フルスクリーンは render_fullscreen_viewport が main ctx に
         // 直接 CentralPanel を描く。描画前に判定を控え、後段でグリッド描画を抑止する
         // (描画後だと handle_fs_navigation の close で fullscreen_idx が None になり
@@ -62877,20 +63292,21 @@ impl eframe::App for App {
                         return;
                     }
                 }
-                // Ctrl+↑↓ DFS の結果回収 (native 動画ブロックと同じ理由)。
-                if let Some(result) = self.poll_folder_nav() {
-                    if keyboard_nav.is_none() {
+                // 通常は描画前に回収済み。描画中の状態遷移でこの early-return に初めて
+                // 入った場合だけ従来の後段回収を backstop として残す。
+                if !main_embedded_transitions_polled_before_render {
+                    if let Some(result) = self.poll_folder_nav()
+                        && keyboard_nav.is_none()
+                    {
                         self.apply_folder_nav_result(ctx, result);
                     }
+                    self.poll_pdf_enumerate();
+                    self.poll_zip_enumerate();
+                    self.poll_fs_nav_lock(ctx);
                 }
                 if self.archive_convert.is_some() {
                     self.show_archive_convert_dialog(ctx);
                 }
-                // apply_folder_nav_result が PDF/ZIP に着地した場合、列挙ワーカー結果の
-                // 回収はグリッド描画 tail の poll_*_enumerate が担う。embedded 早期
-                // return は tail を飛ばすので、ここでも最低限の回収を行う (Codex P2)。
-                self.poll_pdf_enumerate();
-                self.poll_zip_enumerate();
                 // グリッド描画 tail を飛ばすので tail の「pending 中 repaint」も失われる。
                 // folder nav / PDF・ZIP 列挙ワーカーは別スレッドで完了し repaint を
                 // 要求しないため、静止画フルスクリーンで egui が寝ると結果を次の入力まで
@@ -64129,6 +64545,8 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::test_script::on_app_exit();
         // 後段の本物の on_exit に処理を委譲する (trait impl は 1 つしか書けないため、
         // ここで helper メソッド群を逃がす都合上 update と on_exit の間に
         // `impl App` ブロックを開く)。

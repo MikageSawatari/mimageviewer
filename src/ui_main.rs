@@ -4875,6 +4875,7 @@ impl App {
         let local_search_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::FileLocalSearch);
+        let reload_menu_label = self.keymap.menu_command_label(MenuCommandId::FileReload);
         let metadata_export_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::FileMetadataExport);
@@ -5020,6 +5021,12 @@ impl App {
                                             if ui.button(&local_search_menu_label).clicked() {
                                                 // 相互排他は open_local_metadata_search 内で (Ctrl+S/Ctrl+G を閉じる)
                                                 self.open_local_metadata_search();
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::FileReload => {
+                                            if ui.button(&reload_menu_label).clicked() {
+                                                self.reload_top_level_grid(ctx);
                                                 ui.close();
                                             }
                                         }

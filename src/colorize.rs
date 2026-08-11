@@ -1551,4 +1551,135 @@ mod tests {
             }
         }
     }
+
+    /// Manual measurement for page-turn thumbnail effect costs.
+    /// Run with: `cargo test --release -p mimageviewer --lib
+    /// thumbnail_effect_cost_measurement -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual performance measurement; run with --release and --nocapture"]
+    fn thumbnail_effect_cost_measurement() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const RUNS: usize = 15;
+        const SIZES: &[(usize, usize)] = &[(347, 506), (800, 1200), (1123, 1648), (2480, 3508)];
+
+        fn measure_ms<T>(runs: usize, mut operation: impl FnMut() -> T) -> (f64, f64) {
+            // Discard allocator and Rayon pool initialization effects.
+            black_box(operation());
+            let mut samples = Vec::with_capacity(runs);
+            for _ in 0..runs {
+                let started = Instant::now();
+                let output = operation();
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                black_box(output);
+                samples.push(elapsed_ms);
+            }
+            samples.sort_unstable_by(f64::total_cmp);
+            let median = if runs % 2 == 0 {
+                (samples[runs / 2 - 1] + samples[runs / 2]) * 0.5
+            } else {
+                samples[runs / 2]
+            };
+            (median, *samples.last().expect("at least one measured run"))
+        }
+
+        let master = image::load_from_memory(include_bytes!(
+            "../samples/tone-algorithm-comparison/01_source.png"
+        ))
+        .expect("decode deterministic monochrome screentone fixture");
+        let adjust_params = crate::adjustment::AdjustParams {
+            contrast: 20.0,
+            ..crate::adjustment::AdjustParams::default()
+        };
+        let colorize_params = ColorizeParams {
+            mode: ColorizeMode::AllImages,
+            palette: ColorizePalette::Legacy4Color,
+            luminance_weight: 100,
+            density_normalization_strength: 0,
+            tone_method: ToneDensityMethod::Gaussian,
+            tone_radius: 1.0,
+            tone_strength: 100,
+            ..ColorizeParams::default()
+        };
+        let cancel = AtomicBool::new(false);
+
+        println!(
+            "input=samples/tone-algorithm-comparison/01_source.png source={}x{} runs={} warmup_discarded=1 release={} rayon_threads={}",
+            master.width(),
+            master.height(),
+            RUNS,
+            !cfg!(debug_assertions),
+            rayon::current_num_threads(),
+        );
+        println!(
+            "adjustment=contrast:+20,colorize=all_images/legacy4color/luminance100/density_normalization0/gaussian/radius1.0/strength100"
+        );
+        println!(
+            "size\tpixels\teffective_tone_radius\tadjust_median_ms\tadjust_max_ms\tcolorize_median_ms\tcolorize_max_ms\ttone_blur_median_ms\ttone_blur_max_ms"
+        );
+
+        for &(width, height) in SIZES {
+            let resized = crate::fast_resize::resize_dynamic_exact(
+                &master,
+                width as u32,
+                height as u32,
+                crate::fast_resize::Quality::Lanczos3,
+            )
+            .to_rgba8();
+            let source = ColorImage::from_rgba_unmultiplied([width, height], resized.as_raw());
+            assert_eq!(source.size, [width, height]);
+            let luma: Vec<u8> = source
+                .pixels
+                .par_iter()
+                .map(|pixel| {
+                    (crate::adjustment::pixel_lum_f32(*pixel) * 255.0)
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                })
+                .collect();
+            let tone_radius = effective_tone_radius(colorize_params.tone_radius, source.size);
+
+            let (adjust_median, adjust_max) = measure_ms(RUNS, || {
+                crate::adjustment::apply_adjustments_fast(
+                    black_box(&source),
+                    black_box(&adjust_params),
+                )
+            });
+            let (colorize_median, colorize_max) = measure_ms(RUNS, || {
+                apply_applicable_with_cancel(
+                    black_box(&source),
+                    black_box(&colorize_params),
+                    black_box(&cancel),
+                )
+                .expect("measurement is never cancelled")
+            });
+            let (tone_median, tone_max) = measure_ms(RUNS, || {
+                tone_density_luma(
+                    black_box(&luma),
+                    width,
+                    height,
+                    ToneDensityMethod::Gaussian,
+                    tone_radius,
+                    black_box(&cancel),
+                )
+                .expect("measurement is never cancelled")
+                .expect("Gaussian tone density returns a buffer")
+            });
+
+            println!(
+                "{}x{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}",
+                width,
+                height,
+                width * height,
+                tone_radius,
+                adjust_median,
+                adjust_max,
+                colorize_median,
+                colorize_max,
+                tone_median,
+                tone_max,
+            );
+        }
+    }
 }

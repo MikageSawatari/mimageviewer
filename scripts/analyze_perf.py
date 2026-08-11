@@ -12,6 +12,10 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
 サブコマンド:
     summary             全イベントの件数とカテゴリ別 breakdown を表示
     latency             seq ごとに input → *.ready / *.paint のレイテンシを集計
+    page-turn [--check] キーリピート中の通過/実体化ページ数を集計。
+                        --check でページ送りの不変条件を検査
+    test-script-input [--check]
+                        合成 hold の振動・repeat 蓄積の観測事実を検査
     priority            可視サムネイルが未 decode のうちに非可視が先に処理された違反を検出
     dump <seq>          指定 seq に紐づく全イベントを時系列で列挙
     timeline [seq]      ガントチャート (matplotlib が必要)。seq 指定可
@@ -39,7 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 
@@ -188,6 +192,789 @@ def cmd_latency(events: list[dict]) -> None:
     stats("fs.paint", fs_paint)
     stats("thumb.first_ready", thumb_first)
     stats("ai.job_ready", ai_ready)
+
+
+# -----------------------------------------------------------------------
+# page-turn
+# -----------------------------------------------------------------------
+
+def analyze_page_turn(events: list[dict]) -> dict:
+    """Group pass-through readiness events into keyboard-hold bursts.
+
+    Runtime coalescing never uses timestamps. Timestamps are used here only to
+    report the ready-to-ready intervals that were already recorded.
+    """
+    ready = sorted(
+        (
+            e for e in events
+            if e.get("cat") == "fs"
+            and e.get("kind") == "page_turn_ready"
+            and e.get("mode") in ("pass_through", "materialized")
+        ),
+        key=lambda e: float(e.get("t", 0.0)),
+    )
+    counts = {"pass_through": 0, "materialized": 0}
+    holds: list[dict] = []
+    active: list[dict] = []
+    active_generation = None
+
+    def finish(complete: bool) -> None:
+        nonlocal active, active_generation
+        if not active:
+            return
+        intervals_ms = [
+            (float(cur.get("t", 0.0)) - float(prev.get("t", 0.0))) * 1000.0
+            for prev, cur in zip(active, active[1:])
+        ]
+        holds.append({
+            "complete": complete,
+            "events": list(active),
+            "indices": [event.get("idx") for event in active],
+            "pass_through": sum(
+                event.get("mode") == "pass_through" for event in active
+            ),
+            "materialized": sum(
+                event.get("mode") == "materialized" for event in active
+            ),
+            "intervals_ms": intervals_ms,
+        })
+        active = []
+        active_generation = None
+
+    for event in ready:
+        mode = event["mode"]
+        counts[mode] += 1
+        generation = event.get("items_generation")
+        if active and generation != active_generation:
+            finish(False)
+        if mode == "pass_through":
+            if not active:
+                active_generation = generation
+            active.append(event)
+        elif active:
+            active.append(event)
+            finish(True)
+    finish(False)
+
+    decisions = sorted(
+        (
+            e for e in events
+            if e.get("cat") == "fs" and e.get("kind") == "page_turn_decision"
+        ),
+        key=lambda e: float(e.get("t", 0.0)),
+    )
+    winit_probes_by_frame: dict[int, list[dict]] = defaultdict(list)
+    egui_probes_by_frame: dict[int, list[dict]] = defaultdict(list)
+    for event in events:
+        if event.get("cat") != "fs":
+            continue
+        kind = event.get("kind")
+        if kind == "page_turn_winit_input":
+            winit_probes_by_frame[int(event.get("frame_nr", -1))].append(event)
+        elif kind == "page_turn_egui_input":
+            frame = int(event.get("frame_nr", event.get("n", -1)))
+            egui_probes_by_frame[frame].append(event)
+
+    diagnostic_decisions = []
+    for decision in decisions:
+        frame = int(decision.get("frame_nr", decision.get("n", -1)))
+        matching_edges = int(decision.get("win32_matching_page_turn_edge_count", 0))
+        winit_probes = winit_probes_by_frame.get(frame, [])
+        egui_probes = egui_probes_by_frame.get(frame, [])
+        if matching_edges == 0 and not winit_probes and not egui_probes:
+            continue
+        diagnostic_decisions.append({
+            "decision": decision,
+            "winit_probes": winit_probes,
+            "egui_probes": egui_probes,
+        })
+    decision_reasons = dict(Counter(
+        row["decision"].get("reason", "unknown")
+        for row in diagnostic_decisions
+    ))
+
+    return {
+        "counts": counts,
+        "holds": holds,
+        "decision_reasons": decision_reasons,
+        "diagnostic_decisions": diagnostic_decisions,
+        "intervals_ms": [
+            interval
+            for hold in holds
+            for interval in hold["intervals_ms"]
+        ],
+    }
+
+
+def cmd_page_turn(events: list[dict]) -> None:
+    report = analyze_page_turn(events)
+    counts = report["counts"]
+    print(
+        "page-turn ready: "
+        f"pass_through={counts['pass_through']} "
+        f"materialized={counts['materialized']}"
+    )
+    diagnostic = report["diagnostic_decisions"]
+    if diagnostic:
+        reasons = " ".join(
+            f"{reason}={count}"
+            for reason, count in sorted(report["decision_reasons"].items())
+        )
+        print(f"page-turn decision reasons (input frames): {reasons}")
+        signatures = Counter()
+        for row in diagnostic:
+            decision = row["decision"]
+            winit_probes = row["winit_probes"]
+            egui_probes = row["egui_probes"]
+            winit_count = max(
+                (int(probe.get("winit_page_turn_event_count", 0)) for probe in winit_probes),
+                default=0,
+            )
+            winit_repeats = max(
+                (int(probe.get("winit_page_turn_repeat_count", 0)) for probe in winit_probes),
+                default=0,
+            )
+            egui_count = max(
+                (int(probe.get("egui_page_turn_event_count", 0)) for probe in egui_probes),
+                default=0,
+            )
+            egui_repeats = max(
+                (int(probe.get("egui_page_turn_repeat_count", 0)) for probe in egui_probes),
+                default=0,
+            )
+            winit_viewports = ",".join(sorted({
+                str(probe.get("viewport", "?")) for probe in winit_probes
+            }))
+            winit_chords = ",".join(sorted({
+                str(probe.get("winit_page_turn_chords", ""))
+                for probe in winit_probes
+                if probe.get("winit_page_turn_chords")
+            }))
+            egui_sources = ",".join(sorted({
+                str(probe.get("source", "?")) for probe in egui_probes
+            }))
+            egui_chords = ",".join(sorted({
+                str(probe.get("egui_page_turn_chords", ""))
+                for probe in egui_probes
+                if probe.get("egui_page_turn_chords")
+            }))
+            signature = (
+                str(decision.get("reason", "unknown")),
+                str(decision.get("ordinary_blocker", "none")),
+                int(decision.get("win32_pending_page_turn_edge_count", 0)),
+                int(decision.get("win32_pending_page_turn_repeat_count", 0)),
+                int(decision.get("win32_matching_page_turn_edge_count", 0)),
+                winit_count,
+                winit_repeats,
+                egui_count,
+                egui_repeats,
+                str(decision.get("win32_matching_page_turn_chords", "")),
+                winit_viewports,
+                winit_chords,
+                egui_sources,
+                egui_chords,
+            )
+            signatures[signature] += 1
+        print("input-stage signatures:")
+        print(
+            " count reason / blocker | Win32 pending/repeat/matching | "
+            "winit press/repeat | egui press/repeat | chords"
+        )
+        for signature, count in signatures.most_common():
+            (reason, blocker, pending, win_repeat, matching, winit_count,
+             winit_repeat, egui_count, egui_repeat, win_chords,
+             winit_viewports, winit_chords, sources, egui_chords) = signature
+            print(
+                f" {count:>5} {reason} / {blocker} | "
+                f"{pending}/{win_repeat}/{matching} | "
+                f"{winit_count}/{winit_repeat} | {egui_count}/{egui_repeat} | "
+                f"win32={win_chords or '-'} "
+                f"winit[{winit_viewports or '-'}]={winit_chords or '-'} "
+                f"egui[{sources or '-'}]={egui_chords or '-'}"
+            )
+    if not report["holds"]:
+        print("(pass_through を含むキーリピート区間なし)")
+        return
+
+    print()
+    print(f"{'hold':>4} {'status':<10} {'pass':>5} {'final':>5} {'indices':<24} ready→ready (ms)")
+    print("-" * 90)
+    for number, hold in enumerate(report["holds"], 1):
+        status = "complete" if hold["complete"] else "incomplete"
+        indices = ",".join(str(idx) for idx in hold["indices"])
+        intervals = ", ".join(f"{ms:.1f}" for ms in hold["intervals_ms"]) or "-"
+        print(
+            f"{number:>4} {status:<10} {hold['pass_through']:>5} "
+            f"{hold['materialized']:>5} {indices:<24} {intervals}"
+        )
+
+    intervals = report["intervals_ms"]
+    if intervals:
+        ordered = sorted(intervals)
+        print()
+        print(
+            f"ready→ready: n={len(ordered)} min={ordered[0]:.1f} "
+            f"p50={ordered[len(ordered) // 2]:.1f} max={ordered[-1]:.1f} ms"
+        )
+
+
+PAGE_TURN_BURST_GAP_SECS = 0.300
+PAGE_TURN_BURST_GAP_EPSILON = 1e-9
+PAGE_TURN_INVARIANT_SOURCES = ("final_composite", "thumbnail")
+
+
+def _positive_hold_id(event: dict) -> int | None:
+    for field in ("script_hold_id", "hold_id"):
+        value = event.get(field)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
+
+def _test_script_page_hold_ids(
+    events: list[dict],
+) -> tuple[bool, dict[int, int]]:
+    """Map page-turn event ordinals to the enclosing Down/Up hold."""
+    active_hold_ids: list[int] = []
+    page_hold_ids: dict[int, int] = {}
+    hold_event_seen = False
+    for ordinal, event in enumerate(events):
+        if event.get("cat") == "test_script":
+            hold_id = _positive_hold_id(event)
+            if hold_id is None:
+                continue
+            kind = event.get("kind")
+            if kind == "hold_begin":
+                hold_event_seen = True
+                active_hold_ids = [
+                    active for active in active_hold_ids if active != hold_id
+                ]
+                active_hold_ids.append(hold_id)
+            elif kind == "hold_end":
+                hold_event_seen = True
+                active_hold_ids = [
+                    active for active in active_hold_ids if active != hold_id
+                ]
+            continue
+
+        if (
+            event.get("cat") == "fs"
+            and event.get("kind") == "page_turn_ready"
+        ):
+            explicit = _positive_hold_id(event)
+            if explicit is not None:
+                page_hold_ids[ordinal] = explicit
+            elif active_hold_ids:
+                page_hold_ids[ordinal] = active_hold_ids[-1]
+    return hold_event_seen, page_hold_ids
+
+
+def analyze_test_script_input(events: list[dict]) -> dict:
+    """Report synthetic-input observations without making app-side judgments."""
+    frames = [
+        event
+        for event in events
+        if event.get("cat") == "test_script"
+        and event.get("kind") == "frame_input"
+        and _positive_hold_id(event) is not None
+    ]
+    by_hold: dict[int, list[dict]] = defaultdict(list)
+    for event in frames:
+        by_hold[_positive_hold_id(event)].append(event)
+
+    vibration_hold_ids: list[int] = []
+    for hold_id, hold_frames in sorted(by_hold.items()):
+        held_with_edge = any(
+            event.get("held") is True
+            and int(event.get("edge_count", 0)) > 0
+            for event in hold_frames
+        )
+        held_without_edge = any(
+            event.get("held") is True and int(event.get("edge_count", 0)) == 0
+            for event in hold_frames
+        )
+        if held_with_edge and held_without_edge:
+            vibration_hold_ids.append(hold_id)
+
+    accumulated_frames = [
+        event
+        for event in frames
+        if int(event.get("materialized_in_frame", 0)) > 1
+    ]
+    # A frame only absorbs several repeats when it outlasts the repeat
+    # interval. A healthy fast run never produces one -- a real 2.5s hold on the
+    # grid ran at ~166fps and accumulated nothing -- so demanding it everywhere
+    # would report a working harness as broken. It is required only where it
+    # carries meaning: a page-turn measurement, whose whole subject is the slow
+    # frames of docs/display-pipeline.md 2.5.
+    page_turn_measured = any(
+        event.get("cat") == "fs" and event.get("kind") == "page_turn_ready"
+        for event in events
+    )
+    failures: list[str] = []
+    if not vibration_hold_ids:
+        failures.append(
+            "no hold observed both held=true/edge>0 and held=true/edge=0 frames"
+        )
+    if page_turn_measured and not accumulated_frames:
+        failures.append(
+            "no frame materialized multiple repeats during a page-turn measurement"
+        )
+    return {
+        "status": "pass" if not failures else "not-established",
+        "hold_ids": sorted(by_hold),
+        "frame_count": len(frames),
+        "vibration_hold_ids": vibration_hold_ids,
+        "accumulated_frames": accumulated_frames,
+        "page_turn_measured": page_turn_measured,
+        "failures": failures,
+    }
+
+
+def _print_test_script_input_report(report: dict) -> None:
+    vibration = "yes" if report["vibration_hold_ids"] else "no"
+    if report["accumulated_frames"]:
+        accumulation = "yes"
+    elif report["page_turn_measured"]:
+        accumulation = "no"
+    else:
+        accumulation = "no (not required: no page-turn measurement)"
+    print(
+        "test-script input: "
+        f"status={report['status']} holds={len(report['hold_ids'])} "
+        f"frames={report['frame_count']} vibration={vibration} "
+        f"accumulation={accumulation}"
+    )
+    for failure in report["failures"]:
+        print(f"  not-established: {failure}")
+
+
+def cmd_test_script_input(events: list[dict], check: bool) -> int:
+    report = analyze_test_script_input(events)
+    _print_test_script_input_report(report)
+    return 1 if check and report["status"] != "pass" else 0
+
+
+def _page_turn_check_bursts(events: list[dict]) -> list[dict]:
+    """Split page_turn_ready events into trace-check bursts.
+
+    This is intentionally separate from ``analyze_page_turn``. The latter is
+    the long-standing aggregation used without --check, while the invariant
+    gate uses test-script hold boundaries when present. Legacy/manual logs
+    retain the brief's 300 ms / items_generation boundaries.
+    """
+    hold_split, page_hold_ids = _test_script_page_hold_ids(events)
+    ready = sorted(
+        (
+            (ordinal, event)
+            for ordinal, event in enumerate(events)
+            if event.get("cat") == "fs"
+            and event.get("kind") == "page_turn_ready"
+            and isinstance(event.get("idx"), int)
+            and (not hold_split or ordinal in page_hold_ids)
+        ),
+        key=lambda item: (float(item[1].get("t", 0.0)), item[0]),
+    )
+    bursts: list[dict] = []
+    active: list[dict] = []
+    active_hold_id: int | None = None
+
+    def finish() -> None:
+        nonlocal active, active_hold_id
+        if not active:
+            return
+        indices = [int(event["idx"]) for event in active]
+        nondecreasing = all(
+            previous <= current
+            for previous, current in zip(indices, indices[1:])
+        )
+        nonincreasing = all(
+            previous >= current
+            for previous, current in zip(indices, indices[1:])
+        )
+        if nondecreasing and any(
+            previous < current
+            for previous, current in zip(indices, indices[1:])
+        ):
+            direction = "forward"
+        elif nonincreasing and any(
+            previous > current
+            for previous, current in zip(indices, indices[1:])
+        ):
+            direction = "backward"
+        else:
+            direction = "unknown"
+        bursts.append({
+            "events": list(active),
+            "indices": indices,
+            "items_generation": active[0].get("items_generation"),
+            "direction": direction,
+            "start_t": float(active[0].get("t", 0.0)),
+            "end_t": float(active[-1].get("t", 0.0)),
+            "hold_id": active_hold_id,
+            "split_mode": "hold_id" if hold_split else "time_gap",
+        })
+        active = []
+        active_hold_id = None
+
+    for ordinal, event in ready:
+        hold_id = page_hold_ids.get(ordinal) if hold_split else None
+        if active:
+            gap = (
+                float(event.get("t", 0.0))
+                - float(active[-1].get("t", 0.0))
+            )
+            generation_changed = (
+                event.get("items_generation")
+                != active[-1].get("items_generation")
+            )
+            hold_changed = hold_split and hold_id != active_hold_id
+            legacy_gap = not hold_split and gap > (
+                PAGE_TURN_BURST_GAP_SECS + PAGE_TURN_BURST_GAP_EPSILON
+            )
+            if generation_changed or hold_changed or legacy_gap:
+                finish()
+        if not active:
+            active_hold_id = hold_id
+        active.append(event)
+    finish()
+    return bursts
+
+
+def _page_turn_source_sequence(events: list[dict]) -> list[tuple[int, str]]:
+    return [
+        (int(event["idx"]), str(event.get("source", "?")))
+        for event in events
+    ]
+
+
+def _nearest_page_turn_burst(
+    decision: dict,
+    bursts: list[dict],
+) -> dict | None:
+    """Find the burst that supplies context for an I5 decision."""
+    decision_t = float(decision.get("t", 0.0))
+    generation = decision.get("items_generation")
+    candidates: list[tuple[float, dict]] = []
+    for burst in bursts:
+        if burst["items_generation"] != generation:
+            continue
+        if decision_t < burst["start_t"]:
+            distance = burst["start_t"] - decision_t
+        elif decision_t > burst["end_t"]:
+            distance = decision_t - burst["end_t"]
+        else:
+            distance = 0.0
+        if distance <= PAGE_TURN_BURST_GAP_SECS + PAGE_TURN_BURST_GAP_EPSILON:
+            candidates.append((distance, burst))
+    return min(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def _page_turn_decision_reason_for_ready(
+    ready: dict,
+    events: list[dict],
+) -> str | None:
+    """Return the closest same-page decision that explains a ready event."""
+    ready_t = float(ready.get("t", 0.0))
+    candidates: list[tuple[bool, float, dict]] = []
+    for event in events:
+        if (
+            event.get("cat") != "fs"
+            or event.get("kind") != "page_turn_decision"
+            or event.get("idx") != ready.get("idx")
+            or event.get("items_generation")
+            != ready.get("items_generation")
+        ):
+            continue
+        event_t = float(event.get("t", 0.0))
+        distance = abs(ready_t - event_t)
+        if distance <= PAGE_TURN_BURST_GAP_SECS + PAGE_TURN_BURST_GAP_EPSILON:
+            # A decision normally precedes its ready probe. Prefer that side of
+            # the timestamp when equally close synthetic or coarse logs exist.
+            candidates.append((event_t > ready_t, distance, event))
+    if not candidates:
+        return None
+    return str(min(candidates, key=lambda item: (item[0], item[1]))[2].get("reason"))
+
+
+def analyze_page_turn_invariants(events: list[dict]) -> dict:
+    """Check the page-turn trace invariants I1--I5 from the v2.13 brief."""
+    bursts = _page_turn_check_bursts(events)
+    max_idx_by_generation: dict[object, int] = {}
+    for burst in bursts:
+        generation = burst["items_generation"]
+        observed_max = max(burst["indices"])
+        max_idx_by_generation[generation] = max(
+            observed_max,
+            max_idx_by_generation.get(generation, observed_max),
+        )
+
+    violations: list[dict] = []
+    for burst in bursts:
+        burst_events = burst["events"]
+        sources_by_idx: dict[int, list[str]] = defaultdict(list)
+        for event in burst_events:
+            sources_by_idx[int(event["idx"])].append(
+                str(event.get("source", "?"))
+            )
+
+        # I1: once a page has reached final_composite, it must not regress to
+        # thumbnail within the same keyboard-hold burst.
+        for idx, sources in sorted(sources_by_idx.items()):
+            saw_final = False
+            regressed = False
+            for source in sources:
+                if source == "final_composite":
+                    saw_final = True
+                elif source == "thumbnail" and saw_final:
+                    regressed = True
+                    break
+            if regressed:
+                violations.append({
+                    "id": "I1",
+                    "burst": burst,
+                    "idx": idx,
+                    "sources": list(sources),
+                })
+
+        # I2 concerns the two explicitly named display paths. Other sources,
+        # such as fs_cache, stay visible in diagnostics but are neutral here.
+        invariant_source_events = [
+            event
+            for event in burst_events
+            if event.get("source") in PAGE_TURN_INVARIANT_SOURCES
+        ]
+        source_counts = Counter(
+            str(event["source"])
+            for event in invariant_source_events
+        )
+        source_indices = {
+            source: {
+                int(event["idx"])
+                for event in invariant_source_events
+                if event.get("source") == source
+            }
+            for source in PAGE_TURN_INVARIANT_SOURCES
+        }
+        mixes_across_pages = any(
+            final_idx != thumbnail_idx
+            for final_idx in source_indices["final_composite"]
+            for thumbnail_idx in source_indices["thumbnail"]
+        )
+        mixed_final_events = [
+            event
+            for event in invariant_source_events
+            if event.get("source") == "final_composite"
+            and any(
+                int(event["idx"]) != thumbnail_idx
+                for thumbnail_idx in source_indices["thumbnail"]
+            )
+        ]
+        rendition_unavailable_exception = (
+            bool(mixed_final_events)
+            and all(
+                _page_turn_decision_reason_for_ready(event, events)
+                == "passthrough_rendition_unavailable"
+                for event in mixed_final_events
+            )
+        )
+        if mixes_across_pages and not rendition_unavailable_exception:
+            violations.append({
+                "id": "I2",
+                "burst": burst,
+                "source_counts": source_counts,
+                "thumbnail_indices": [
+                    int(event["idx"])
+                    for event in invariant_source_events
+                    if event.get("source") == "thumbnail"
+                ],
+            })
+
+        # I3 applies only when the burst has an unambiguous direction.
+        if burst["direction"] != "unknown":
+            first_idx = burst["indices"][0]
+            last_idx = burst["indices"][-1]
+            present = set(burst["indices"])
+            missing = sorted(
+                set(range(min(first_idx, last_idx), max(first_idx, last_idx) + 1))
+                - present
+            )
+            if missing:
+                violations.append({
+                    "id": "I3",
+                    "burst": burst,
+                    "idx": last_idx,
+                    "missing_indices": missing,
+                })
+
+        # I4: a burst normally settles on a materialized frame. The sole
+        # exception is a repeated endpoint (0 or the highest observed index in
+        # this items_generation), which represents holding at a folder edge.
+        last_event = burst_events[-1]
+        last_idx = burst["indices"][-1]
+        repeated_tail = (
+            len(burst["indices"]) >= 2
+            and burst["indices"][-2] == last_idx
+        )
+        at_endpoint = (
+            last_idx == 0
+            or last_idx == max_idx_by_generation[burst["items_generation"]]
+        )
+        endpoint_exception = repeated_tail and at_endpoint
+        if last_event.get("mode") != "materialized" and not endpoint_exception:
+            violations.append({
+                "id": "I4",
+                "burst": burst,
+                "idx": last_idx,
+                "mode": str(last_event.get("mode", "?")),
+            })
+
+    # I5 is a decision-frame invariant rather than a ready-burst invariant.
+    decisions = sorted(
+        (
+            event
+            for event in events
+            if event.get("cat") == "fs"
+            and event.get("kind") == "page_turn_decision"
+        ),
+        key=lambda event: float(event.get("t", 0.0)),
+    )
+    for decision in decisions:
+        if (
+            decision.get("passthrough_rendition_ready") is True
+            and decision.get("reason") != "pending_zero"
+            and decision.get("defer_ui_uploads") is not True
+        ):
+            violations.append({
+                "id": "I5",
+                "burst": _nearest_page_turn_burst(decision, bursts),
+                "idx": decision.get("idx"),
+                "decision": decision,
+            })
+
+    return {
+        "bursts": bursts,
+        "burst_split": (
+            "hold_id" if _test_script_page_hold_ids(events)[0] else "time_gap"
+        ),
+        "violations": violations,
+        "violation_counts": dict(Counter(
+            violation["id"] for violation in violations
+        )),
+    }
+
+
+def _page_turn_burst_label(burst: dict | None, fallback_event: dict) -> str:
+    if burst is None:
+        t = float(fallback_event.get("t", 0.0))
+        idx = fallback_event.get("idx", "?")
+        return f"burst t={t:.3f}..{t:.3f} unknown idx={idx}..{idx}"
+    return (
+        f"burst t={burst['start_t']:.3f}..{burst['end_t']:.3f} "
+        f"hold_id={burst['hold_id'] if burst['hold_id'] is not None else '-'} "
+        f"{burst['direction']} "
+        f"idx={burst['indices'][0]}..{burst['indices'][-1]}"
+    )
+
+
+def _print_page_turn_sources(burst: dict | None) -> None:
+    if burst is None:
+        print("  source sequence: (no matching page_turn_ready burst)")
+        return
+    sequence = ", ".join(
+        f"{idx}:{source}"
+        for idx, source in _page_turn_source_sequence(burst["events"])
+    )
+    print(f"  source sequence: {sequence or '(none)'}")
+
+
+def cmd_page_turn_check(events: list[dict]) -> int:
+    # v2.13.0 does not emit page-turn events after the pass-through experiment
+    # was removed. Keep invariant coverage and harness-input coverage separate:
+    # this combined gate reports zero checked bursts as not exercised, while
+    # the test-script-input command can validate the harness facts alone.
+    report = analyze_page_turn_invariants(events)
+    input_report = analyze_test_script_input(events)
+    if report["burst_split"] == "hold_id":
+        print(
+            "page-turn burst split: hold_id "
+            "(test_script Down/Up; unscoped ready ignored; "
+            "items_generation boundary retained)"
+        )
+    else:
+        print(
+            "page-turn burst split: time_gap "
+            f"(legacy {PAGE_TURN_BURST_GAP_SECS * 1000:.0f}ms; "
+            "items_generation boundary retained)"
+        )
+    for violation in report["violations"]:
+        invariant = violation["id"]
+        burst = violation["burst"]
+        fallback = (
+            violation.get("decision")
+            or (burst["events"][0] if burst is not None else {})
+        )
+        label = _page_turn_burst_label(burst, fallback)
+        if invariant == "I1":
+            print(
+                f"I1 violation: {label} idx={violation['idx']} "
+                "final_composite -> thumbnail"
+            )
+            print(
+                f"  actual sources at idx={violation['idx']}: "
+                + " -> ".join(violation["sources"])
+            )
+            _print_page_turn_sources(burst)
+        elif invariant == "I2":
+            counts = violation["source_counts"]
+            thumbnail_indices = ",".join(
+                str(idx) for idx in violation["thumbnail_indices"]
+            )
+            print(f"I2 violation: {label}")
+            print(
+                "  mixed sources: "
+                f"final_composite x{counts['final_composite']}, "
+                f"thumbnail x{counts['thumbnail']} "
+                f"(thumbnail at idx={thumbnail_indices})"
+            )
+            _print_page_turn_sources(burst)
+        elif invariant == "I3":
+            missing = ",".join(
+                str(idx) for idx in violation["missing_indices"]
+            )
+            print(f"I3 violation: {label} missing idx={missing}")
+            _print_page_turn_sources(burst)
+        elif invariant == "I4":
+            print(
+                f"I4 violation: {label} idx={violation['idx']} "
+                f"ended mode={violation['mode']}"
+            )
+            _print_page_turn_sources(burst)
+        elif invariant == "I5":
+            decision = violation["decision"]
+            print(
+                f"I5 violation: {label} idx={violation['idx']} "
+                f"decision t={float(decision.get('t', 0.0)):.3f} "
+                f"reason={decision.get('reason', '?')} "
+                f"defer_ui_uploads={decision.get('defer_ui_uploads', '?')}"
+            )
+            _print_page_turn_sources(burst)
+
+    print(
+        f"checked bursts={len(report['bursts'])} "
+        f"violations={len(report['violations'])}"
+    )
+    if report["bursts"]:
+        invariant_status = "fail" if report["violations"] else "pass"
+    else:
+        invariant_status = "not-exercised"
+    print(f"page-turn invariants: status={invariant_status}")
+    _print_test_script_input_report(input_report)
+    return 1 if (
+        report["violations"]
+        or not report["bursts"]
+        or input_report["status"] != "pass"
+    ) else 0
 
 
 # -----------------------------------------------------------------------
@@ -1781,6 +2568,18 @@ def main() -> None:
     subs = parser.add_subparsers(dest="cmd", required=True)
     subs.add_parser("summary")
     subs.add_parser("latency")
+    p_page_turn = subs.add_parser("page-turn")
+    p_page_turn.add_argument(
+        "--check",
+        action="store_true",
+        help="ページ送りのトレース不変条件 I1-I5 を検査する",
+    )
+    p_test_script_input = subs.add_parser("test-script-input")
+    p_test_script_input.add_argument(
+        "--check",
+        action="store_true",
+        help="振動・repeat 蓄積の証拠が揃わなければ終了コード 1 を返す",
+    )
     subs.add_parser("priority")
     subs.add_parser("thumbs")
     subs.add_parser("colorize")
@@ -1850,6 +2649,12 @@ def main() -> None:
         cmd_summary(events)
     elif args.cmd == "latency":
         cmd_latency(events)
+    elif args.cmd == "page-turn":
+        cmd_page_turn(events)
+        if args.check:
+            sys.exit(cmd_page_turn_check(events))
+    elif args.cmd == "test-script-input":
+        sys.exit(cmd_test_script_input(events, args.check))
     elif args.cmd == "priority":
         cmd_priority(events)
     elif args.cmd == "thumbs":
