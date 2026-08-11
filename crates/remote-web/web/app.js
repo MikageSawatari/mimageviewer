@@ -141,6 +141,8 @@ const THUMBNAIL_MAX_CONCURRENCY = thumbnailRequestConcurrency(
 );
 const PAGE_LOADING_INDICATOR_DELAY_MS = 225;
 const PAGE_BOUNDARY_MESSAGE_DURATION_MS = 2400;
+// history.go(-N) は範囲外だと何も起こさない。popstate が来ないことでそれを知る。
+const VIEWER_EXIT_HISTORY_TIMEOUT_MS = 250;
 // Safari では端末メモリを取得できないため、圧縮 JPEG Blob の固定 64 MiB を先読み開始の
 // 門にする。12/4 は窓の上限にすぎず、実際の深さは保持済みバイト数で決まる。
 const PAGE_PREFETCH_AHEAD = 12;
@@ -4107,15 +4109,43 @@ async function flushReadingProgress(reset = true) {
   }
 }
 
+/// 戻り先は `state.gridHash` として分かっている。履歴を遡るのは、ブラウザの戻る
+/// スタックを素直に保つための最適化でしかない。`history.go(-N)` は N が実際の履歴数を
+/// 超えると**仕様上なにも起こさない**ので、それだけに頼ると本を閉じられなくなる。
+/// アプリのリロードを挟むと、履歴は作り直されるのに viewerDepth は復元された state から
+/// 読まれるため、実体より大きな N で呼ぶ状態が普通に起きる。
 async function leaveViewerForGrid() {
   await flushReadingProgress();
   const viewerDepth = Number(history.state?.viewerDepth) || 0;
-  if (history.state?.viewerFromGrid && viewerDepth > 0) {
-    history.go(-viewerDepth);
-  } else {
-    history.replaceState({ mivRoute: true }, "", state.gridHash);
-    await dispatchRoute();
+  const traversable = Boolean(history.state?.viewerFromGrid) && viewerDepth > 0;
+  if (traversable) {
+    // popstate が来れば dispatchRoute が画面を替える。届かなければ go は範囲外だった。
+    const traversed = await new Promise((resolve) => {
+      const done = (value) => {
+        window.removeEventListener("popstate", onPopState);
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const onPopState = () => done(true);
+      const timer = setTimeout(() => done(false), VIEWER_EXIT_HISTORY_TIMEOUT_MS);
+      window.addEventListener("popstate", onPopState, { once: true });
+      history.go(-viewerDepth);
+    });
+    // popstate が来ても画面が替わるとは限らない。popstate の購読者は操作権が
+    // 有効なときだけ経路を切り替えるので、届いたことではなく出られたことで判断する。
+    if (traversed) {
+      await nextFrame();
+      if (state.screenContext !== "viewer") return;
+    }
   }
+  enqueueTelemetry({
+    type: "viewer_exit",
+    used_history: traversable,
+    viewer_depth: Math.min(999, Math.max(0, viewerDepth)),
+    fell_back: traversable,
+  });
+  history.replaceState({ mivRoute: true }, "", state.gridHash);
+  await dispatchRoute();
 }
 
 function shouldForceSinglePageForViewport() {
