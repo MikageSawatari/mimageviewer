@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 41;
+pub const PROTOCOL_VERSION: u32 = 42;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -873,6 +873,10 @@ pub enum ContainerResponse {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PageRequest {
+    /// Web の需要 coordinator が発行した、接続内で一意な page job identity。
+    pub job_id: String,
+    /// 先読みには表示要求がまだ無いため `None`。前景開始時だけ設定する。
+    pub display_request_id: Option<String>,
     pub address: RemoteAddress,
     /// 表示用ラスタの長辺上限。
     pub target_px: u32,
@@ -910,6 +914,71 @@ pub enum PagePriority {
     Foreground,
     /// 有界な先読み。foreground より後ろの Normal lane へ入れる。
     Prefetch,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageCancelCause {
+    NoDemand,
+    SessionInvalidated,
+    ContextReset,
+    ConnectionClosed,
+    ServiceStopping,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PageDemandPromotion {
+    pub job: String,
+    /// 昇格の相関元。先読みの初回 PageRequest には display identity が無いため、
+    /// 昇格操作そのものがこれを運ぶ。
+    pub display: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PageDemandRelease {
+    pub job: String,
+    pub cause: PageCancelCause,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PageDemandRequest {
+    pub promote: Vec<PageDemandPromotion>,
+    pub release: Vec<PageDemandRelease>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageDemandPromoteStatus {
+    Promoted,
+    AlreadyForeground,
+    AlreadyReleased { cause: PageCancelCause },
+    UnknownJob,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PageDemandPromoteResult {
+    pub job: String,
+    pub status: PageDemandPromoteStatus,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageDemandReleaseStatus {
+    Released,
+    AlreadyReleased { cause: PageCancelCause },
+    Tombstoned,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PageDemandReleaseResult {
+    pub job: String,
+    pub status: PageDemandReleaseStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PageDemandResponse {
+    pub promote: Vec<PageDemandPromoteResult>,
+    pub release: Vec<PageDemandReleaseResult>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -954,6 +1023,7 @@ pub enum MediaErrorCode {
     Unsupported,
     PasswordRequired,
     PageOutOfRange,
+    Cancelled,
     Busy,
     RenderFailed,
     Internal,
@@ -1959,6 +2029,11 @@ pub enum ClientMessage {
         owner: RemoteSessionIdentity,
         request: PageRequest,
     },
+    PageDemand {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+        request: PageDemandRequest,
+    },
     RemoteAiStart {
         id: RequestId,
         owner: RemoteSessionIdentity,
@@ -2102,6 +2177,7 @@ impl ClientMessage {
             | Self::FolderList { id, .. }
             | Self::Container { id, .. }
             | Self::Page { id, .. }
+            | Self::PageDemand { id, .. }
             | Self::RemoteAiStart { id, .. }
             | Self::RemoteAiState { id, .. }
             | Self::RemoteAiRecoverable { id, .. }
@@ -2176,6 +2252,10 @@ pub enum ServerMessage {
     Page {
         id: RequestId,
         response: PageResponse,
+    },
+    PageDemand {
+        id: RequestId,
+        response: PageDemandResponse,
     },
     RemoteAiStart {
         id: RequestId,
@@ -2285,6 +2365,7 @@ impl ServerMessage {
             | Self::Container { id, .. }
             | Self::FolderList { id, .. }
             | Self::Page { id, .. }
+            | Self::PageDemand { id, .. }
             | Self::RemoteAiStart { id, .. }
             | Self::RemoteAiState { id, .. }
             | Self::RemoteAiRecoverable { id, .. }
@@ -2549,6 +2630,8 @@ mod tests {
             id: 43,
             owner: test_owner("test-client"),
             request: PageRequest {
+                job_id: "page-job-43".to_owned(),
+                display_request_id: None,
                 address: RemoteAddress {
                     path: "C:/Books/volume.pdf".to_owned(),
                     subresource: RemoteSubresource::PdfPage { page_number: 7 },
@@ -2586,6 +2669,48 @@ mod tests {
         let actual: ClientMessage =
             read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn page_demand_round_trips_with_typed_results() {
+        let request = ClientMessage::PageDemand {
+            id: 44,
+            owner: test_owner("test-client"),
+            request: PageDemandRequest {
+                promote: vec![PageDemandPromotion {
+                    job: "page-job-43".to_owned(),
+                    display: "display-9".to_owned(),
+                }],
+                release: vec![PageDemandRelease {
+                    job: "page-job-41".to_owned(),
+                    cause: PageCancelCause::NoDemand,
+                }],
+            },
+        };
+        let mut request_bytes = Vec::new();
+        write_frame(&mut request_bytes, &request).unwrap();
+        let actual_request: ClientMessage =
+            read_frame(&mut request_bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
+        assert_eq!(actual_request, request);
+
+        let response = ServerMessage::PageDemand {
+            id: 44,
+            response: PageDemandResponse {
+                promote: vec![PageDemandPromoteResult {
+                    job: "page-job-43".to_owned(),
+                    status: PageDemandPromoteStatus::Promoted,
+                }],
+                release: vec![PageDemandReleaseResult {
+                    job: "page-job-41".to_owned(),
+                    status: PageDemandReleaseStatus::Released,
+                }],
+            },
+        };
+        let mut response_bytes = Vec::new();
+        write_frame(&mut response_bytes, &response).unwrap();
+        let actual_response: ServerMessage =
+            read_frame(&mut response_bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
+        assert_eq!(actual_response, response);
     }
 
     #[test]
@@ -2632,8 +2757,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v41_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 41);
+    fn protocol_v42_remote_video_thumbnail_shape_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 42);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,

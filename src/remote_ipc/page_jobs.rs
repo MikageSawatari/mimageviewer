@@ -1,10 +1,10 @@
 //! Connection-scoped page job identities and cancellation state.
 //!
 //! This module deliberately knows nothing about the heavy queue. The registry is the source of
-//! truth for demand, lifetime, and monotonic priority; stage 3 will mirror that priority into the
-//! queue while holding the wiring layer's critical section.
+//! truth for demand, lifetime, and monotonic priority. Stage 3a resolves that priority immediately
+//! before dispatch; stage 3b will additionally mirror it into the replacement heavy queue.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -62,6 +62,7 @@ pub(super) enum PageJobPriority {
 pub(super) enum PageJobCancelCause {
     NoDemand,
     SessionInvalidated,
+    ContextReset,
     ConnectionClosed,
     ServiceStopping,
 }
@@ -83,7 +84,7 @@ pub(super) enum PromotePageJobResult {
 pub(super) enum ReleasePageJobResult {
     Released,
     AlreadyReleased { cause: PageJobCancelCause },
-    UnknownJob,
+    Tombstoned,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,7 +130,7 @@ enum PageJobState {
 }
 
 struct PageJobRecord {
-    display_request_id: DisplayRequestId,
+    display_request_id: Option<DisplayRequestId>,
     priority: PageJobPriority,
     state: PageJobState,
     cancel: Arc<AtomicBool>,
@@ -138,6 +139,47 @@ struct PageJobRecord {
 #[derive(Default)]
 struct PageJobRegistryState {
     jobs_by_connection: HashMap<PageJobConnectionId, HashMap<PageJobId, PageJobRecord>>,
+    tombstones_by_connection: HashMap<PageJobConnectionId, PageJobTombstones>,
+    lifecycle: PageJobRegistryLifecycle,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PageJobRegistryLifecycle {
+    #[default]
+    Accepting,
+    Stopping {
+        cause: PageJobCancelCause,
+    },
+}
+
+const MAX_TOMBSTONES_PER_CONNECTION: usize = 256;
+
+#[derive(Default)]
+struct PageJobTombstones {
+    causes: HashMap<PageJobId, PageJobCancelCause>,
+    order: VecDeque<PageJobId>,
+}
+
+impl PageJobTombstones {
+    fn insert(&mut self, job_id: PageJobId, cause: PageJobCancelCause) -> ReleasePageJobResult {
+        if let Some(existing) = self.causes.get(&job_id).copied() {
+            return ReleasePageJobResult::AlreadyReleased { cause: existing };
+        }
+        self.causes.insert(job_id.clone(), cause);
+        self.order.push_back(job_id);
+        while self.order.len() > MAX_TOMBSTONES_PER_CONNECTION {
+            if let Some(expired) = self.order.pop_front() {
+                self.causes.remove(&expired);
+            }
+        }
+        ReleasePageJobResult::Tombstoned
+    }
+
+    fn take(&mut self, job_id: &PageJobId) -> Option<PageJobCancelCause> {
+        let cause = self.causes.remove(job_id)?;
+        self.order.retain(|queued| queued != job_id);
+        Some(cause)
+    }
 }
 
 #[derive(Default)]
@@ -154,21 +196,32 @@ impl PageJobRegistry {
         &self,
         connection_id: PageJobConnectionId,
         job_id: PageJobId,
-        display_request_id: DisplayRequestId,
+        display_request_id: Option<DisplayRequestId>,
         priority: PageJobPriority,
     ) -> Result<Arc<AtomicBool>, RegisterPageJobError> {
         let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let tombstoned = state
+            .tombstones_by_connection
+            .get_mut(&connection_id)
+            .and_then(|tombstones| tombstones.take(&job_id));
+        let stopped = match state.lifecycle {
+            PageJobRegistryLifecycle::Accepting => None,
+            PageJobRegistryLifecycle::Stopping { cause } => Some(cause),
+        };
+        let released = tombstoned.or(stopped);
         let jobs = state.jobs_by_connection.entry(connection_id).or_default();
         if jobs.contains_key(&job_id) {
             return Err(RegisterPageJobError::DuplicateJob);
         }
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(released.is_some()));
         jobs.insert(
             job_id,
             PageJobRecord {
                 display_request_id,
                 priority,
-                state: PageJobState::Active,
+                state: released
+                    .map(PageJobState::Released)
+                    .unwrap_or(PageJobState::Active),
                 cancel: Arc::clone(&cancel),
             },
         );
@@ -179,6 +232,7 @@ impl PageJobRegistry {
         &self,
         connection_id: PageJobConnectionId,
         job_id: &PageJobId,
+        display_request_id: DisplayRequestId,
     ) -> PromotePageJobResult {
         let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         let Some(job) = state
@@ -191,6 +245,7 @@ impl PageJobRegistry {
         if let PageJobState::Released(cause) = job.state {
             return PromotePageJobResult::AlreadyReleased { cause };
         }
+        job.display_request_id = Some(display_request_id);
         match job.priority {
             PageJobPriority::Prefetch => {
                 job.priority = PageJobPriority::Foreground;
@@ -212,7 +267,11 @@ impl PageJobRegistry {
             .get_mut(&connection_id)
             .and_then(|jobs| jobs.get_mut(job_id))
         else {
-            return ReleasePageJobResult::UnknownJob;
+            return state
+                .tombstones_by_connection
+                .entry(connection_id)
+                .or_default()
+                .insert(job_id.clone(), cause);
         };
         match job.state {
             PageJobState::Active => {
@@ -234,7 +293,20 @@ impl PageJobRegistry {
             .jobs_by_connection
             .get(&connection_id)
             .and_then(|jobs| jobs.get(job_id))
-            .map(|job| job.display_request_id.clone())
+            .and_then(|job| job.display_request_id.clone())
+    }
+
+    pub(super) fn priority(
+        &self,
+        connection_id: PageJobConnectionId,
+        job_id: &PageJobId,
+    ) -> Option<PageJobPriority> {
+        let state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        state
+            .jobs_by_connection
+            .get(&connection_id)
+            .and_then(|jobs| jobs.get(job_id))
+            .map(|job| job.priority)
     }
 
     pub(super) fn finish(
@@ -273,6 +345,7 @@ impl PageJobRegistry {
         cause: PageJobCancelCause,
     ) -> CancelPageJobsResult {
         let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        state.tombstones_by_connection.remove(&connection_id);
         let Some(mut jobs) = state.jobs_by_connection.remove(&connection_id) else {
             return CancelPageJobsResult::default();
         };
@@ -290,13 +363,29 @@ impl PageJobRegistry {
         )
     }
 
+    /// Service shutdown is terminal for this registry instance. In addition to cancelling
+    /// current jobs, registrations racing detached connection threads start pre-cancelled.
+    pub(super) fn stop(&self, cause: PageJobCancelCause) -> CancelPageJobsResult {
+        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        state.lifecycle = PageJobRegistryLifecycle::Stopping { cause };
+        cancel_jobs(
+            state
+                .jobs_by_connection
+                .values_mut()
+                .flat_map(|jobs| jobs.values_mut()),
+            cause,
+        )
+    }
+
     pub(super) fn snapshot(&self) -> PageJobRegistrySnapshot {
         let state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         let mut snapshot = PageJobRegistrySnapshot::default();
         let mut display_request_ids = HashSet::new();
         for (connection_id, jobs) in &state.jobs_by_connection {
             for job in jobs.values() {
-                display_request_ids.insert((*connection_id, &job.display_request_id));
+                if let Some(display_request_id) = &job.display_request_id {
+                    display_request_ids.insert((*connection_id, display_request_id));
+                }
                 match (job.priority, job.state) {
                     (PageJobPriority::Prefetch, PageJobState::Active) => {
                         snapshot.prefetch_active += 1
@@ -350,7 +439,7 @@ mod tests {
             .register(
                 connection_id,
                 job_id.into(),
-                format!("display-{job_id}").into(),
+                Some(format!("display-{job_id}").into()),
                 priority,
             )
             .unwrap()
@@ -361,15 +450,15 @@ mod tests {
         let registry = PageJobRegistry::new();
         register(&registry, 1, "page-1", PageJobPriority::Prefetch);
         assert_eq!(
-            registry.promote(1, &"page-1".into()),
+            registry.promote(1, &"page-1".into(), "display-page-1".into()),
             PromotePageJobResult::Promoted
         );
         assert_eq!(
-            registry.promote(1, &"page-1".into()),
+            registry.promote(1, &"page-1".into(), "display-page-1".into()),
             PromotePageJobResult::AlreadyForeground
         );
         assert_eq!(
-            registry.promote(1, &"missing".into()),
+            registry.promote(1, &"missing".into(), "display-missing".into()),
             PromotePageJobResult::UnknownJob
         );
         assert_eq!(registry.snapshot().foreground_active, 1);
@@ -383,7 +472,7 @@ mod tests {
             registry.register(
                 1,
                 "shared".into(),
-                "display-duplicate".into(),
+                Some("display-duplicate".into()),
                 PageJobPriority::Foreground,
             ),
             Err(RegisterPageJobError::DuplicateJob)
@@ -400,7 +489,7 @@ mod tests {
             .register(
                 1,
                 "page-a".into(),
-                "display-a".into(),
+                Some("display-a".into()),
                 PageJobPriority::Prefetch,
             )
             .unwrap();
@@ -408,7 +497,7 @@ mod tests {
             .register(
                 1,
                 "page-b".into(),
-                "display-a".into(),
+                Some("display-a".into()),
                 PageJobPriority::Foreground,
             )
             .unwrap();
@@ -416,7 +505,7 @@ mod tests {
             .register(
                 2,
                 "page-a".into(),
-                "display-b".into(),
+                Some("display-b".into()),
                 PageJobPriority::Foreground,
             )
             .unwrap();
@@ -455,7 +544,7 @@ mod tests {
             }
         );
         assert_eq!(
-            registry.promote(1, &"page-1".into()),
+            registry.promote(1, &"page-1".into(), "display-page-1".into()),
             PromotePageJobResult::AlreadyReleased {
                 cause: PageJobCancelCause::NoDemand
             }
@@ -489,7 +578,7 @@ mod tests {
         assert!(first_b.load(Ordering::Acquire));
         assert!(!second.load(Ordering::Acquire));
         assert_eq!(
-            registry.promote(2, &"a".into()),
+            registry.promote(2, &"a".into(), "display-a".into()),
             PromotePageJobResult::Promoted
         );
         assert_eq!(
@@ -558,11 +647,52 @@ mod tests {
         );
         assert_eq!(
             registry.release(9, &"missing".into(), PageJobCancelCause::NoDemand),
-            ReleasePageJobResult::UnknownJob
+            ReleasePageJobResult::Tombstoned
+        );
+        assert_eq!(
+            registry.release(9, &"missing".into(), PageJobCancelCause::ServiceStopping),
+            ReleasePageJobResult::AlreadyReleased {
+                cause: PageJobCancelCause::NoDemand
+            }
         );
         assert_eq!(
             registry.finish(9, &"missing".into()),
             FinishPageJobResult::UnknownJob
+        );
+    }
+
+    #[test]
+    fn release_before_register_cancels_the_late_job() {
+        let registry = PageJobRegistry::new();
+        assert_eq!(
+            registry.release(7, &"late".into(), PageJobCancelCause::ContextReset),
+            ReleasePageJobResult::Tombstoned
+        );
+        let cancel = registry
+            .register(7, "late".into(), None, PageJobPriority::Prefetch)
+            .unwrap();
+        assert!(cancel.load(Ordering::Acquire));
+        assert_eq!(
+            registry.finish(7, &"late".into()),
+            FinishPageJobResult::AlreadyReleased {
+                cause: PageJobCancelCause::ContextReset
+            }
+        );
+    }
+
+    #[test]
+    fn promotion_attaches_the_display_request_to_a_prefetch_job() {
+        let registry = PageJobRegistry::new();
+        registry
+            .register(3, "page".into(), None, PageJobPriority::Prefetch)
+            .unwrap();
+        assert_eq!(
+            registry.promote(3, &"page".into(), "display-3".into()),
+            PromotePageJobResult::Promoted
+        );
+        assert_eq!(
+            registry.display_request_id(3, &"page".into()),
+            Some("display-3".into())
         );
     }
 
@@ -575,5 +705,23 @@ mod tests {
             FinishPageJobResult::Finished
         );
         assert_eq!(registry.snapshot(), PageJobRegistrySnapshot::default());
+    }
+
+    #[test]
+    fn service_stop_pre_cancels_a_registration_that_races_shutdown() {
+        let registry = PageJobRegistry::new();
+        registry.stop(PageJobCancelCause::ServiceStopping);
+
+        let cancel = registry
+            .register(4, "late-stop".into(), None, PageJobPriority::Foreground)
+            .unwrap();
+
+        assert!(cancel.load(Ordering::Acquire));
+        assert_eq!(
+            registry.finish(4, &"late-stop".into()),
+            FinishPageJobResult::AlreadyReleased {
+                cause: PageJobCancelCause::ServiceStopping
+            }
+        );
     }
 }

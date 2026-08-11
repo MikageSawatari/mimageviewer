@@ -33,7 +33,6 @@ import {
   normalizeVisualViewportScale,
   pageResponseGenerationAttestation,
   pageResponseIdentityAttestation,
-  pagePrefetchFailurePlan,
   FOREGROUND_ADMISSION_RETRY_LIMIT,
   pageAdmissionRetryDelayMs,
   pageRequestIsTransientlyBusy,
@@ -41,7 +40,6 @@ import {
   pagePrefetchIndicatorSummary,
   pagePrefetchBudgetAllowsStart,
   pagePrefetchPlan,
-  pagePrefetchStartCount,
   pageResourceAdmissionPlan,
   pageResourceCacheBudget,
   planSpreadIntent,
@@ -121,6 +119,13 @@ import {
 } from "./page-timings.mjs";
 import { installDocumentDoubleTapOwner } from "./document-double-tap.mjs";
 import { VideoStreamViewer } from "./video-stream.mjs";
+import {
+  PageCancelCause,
+  PageDisplayCoordinator,
+  PageJobPriority,
+  PageJobState,
+  pageResourceKey,
+} from "./page-coordinator.mjs";
 
 export { ADJUSTMENT_PANEL_TABS };
 
@@ -279,10 +284,16 @@ class RequestLimiter {
 /// 進行中を中断せず、待機中は最後の 1 件だけを残す直列キュー。
 /// 補正プレビューが UI 入力の回数だけ IPC を詰まらせないために使う。
 export class LatestOnlyTaskQueue {
-  constructor(run, onError = () => {}, sameTask = () => false) {
+  constructor(
+    run,
+    onError = () => {},
+    sameTask = () => false,
+    onSupersede = () => {}
+  ) {
     this.run = run;
     this.onError = onError;
     this.sameTask = sameTask;
+    this.onSupersede = onSupersede;
     this.running = false;
     this.active = null;
     this.latest = null;
@@ -300,14 +311,22 @@ export class LatestOnlyTaskQueue {
       resolveTicket = resolve;
     });
     const ticket = { value, promise, resolve: resolveTicket };
-    if (this.latest) this.latest.resolve(VIEWER_GROUP_LOAD_SUPERSEDED);
+    if (this.active) this.onSupersede(this.active.value);
+    if (this.latest) {
+      this.onSupersede(this.latest.value);
+      this.latest.resolve(VIEWER_GROUP_LOAD_SUPERSEDED);
+    }
     this.latest = ticket;
     if (!this.running) this.pump();
     return promise;
   }
 
   clear() {
-    if (this.latest) this.latest.resolve(VIEWER_GROUP_LOAD_SUPERSEDED);
+    if (this.active) this.onSupersede(this.active.value);
+    if (this.latest) {
+      this.onSupersede(this.latest.value);
+      this.latest.resolve(VIEWER_GROUP_LOAD_SUPERSEDED);
+    }
     this.latest = null;
   }
 
@@ -403,7 +422,7 @@ export class LatestPageLoadQueue {
       this.pending = plan.pending;
       if (plan.supersedeActive) {
         this.active.superseded = true;
-        this.onSupersede();
+        this.onSupersede(this.active.value, "active_superseded");
       }
       if (plan.start) this.active = plan.start;
       this.notifyBusyTransition(wasBusy);
@@ -419,7 +438,10 @@ export class LatestPageLoadQueue {
       this.pending.resolve(VIEWER_GROUP_LOAD_SUPERSEDED);
       this.pending = null;
     }
-    if (this.active) this.active.superseded = true;
+    if (this.active) {
+      this.active.superseded = true;
+      this.onSupersede(this.active.value, "queue_cleared");
+    }
     this.notifyBusyTransition(wasBusy);
   }
 
@@ -451,245 +473,58 @@ export class PageResourceCache {
   constructor(
     limit = PAGE_RESOURCE_CACHE_LIMIT,
     byteLimit = PAGE_RESOURCE_CACHE_MAX_BYTES,
-    prefetchConcurrency = PAGE_PREFETCH_CONCURRENCY,
-    fetchResource = fetchPageResource,
+    protectedKeyIds = () => [],
     onStatusChange = () => {}
   ) {
     this.limit = Math.max(1, Number(limit) || 1);
     this.byteLimit = Math.max(1, Number(byteLimit) || 1);
-    this.prefetchConcurrency = Math.max(1, Number(prefetchConcurrency) || 1);
-    this.fetchResource = fetchResource;
+    this.protectedKeyIds = protectedKeyIds;
     this.onStatusChange = onStatusChange;
     this.ready = new Map();
     this.readyBytes = 0;
-    this.pending = [];
-    this.active = new Map();
-    this.visibleKeys = new Set();
-    this.prefetchProtectedKeys = [];
-    this.prefetchProtectLimit = Math.max(
-      0,
-      this.limit - MAX_VIEWER_VISIBLE_PAGES
-    );
-    this.retryTimer = 0;
   }
 
-  statusForKeys(keys = []) {
-    return (Array.isArray(keys) ? keys : []).map((key) => {
-      if (this.ready.has(key)) return "ready";
-      const active = this.active.get(key);
-      return active && !active.controller.signal.aborted ? "active" : "missing";
-    });
+  setProtectedKeyProvider(protectedKeyIds) {
+    this.protectedKeyIds =
+      typeof protectedKeyIds === "function" ? protectedKeyIds : () => [];
   }
 
-  notifyStatusChange(type, key = "") {
-    try {
-      this.onStatusChange({ type, key });
-    } catch {}
+  hasBytes(key) {
+    return this.ready.has(key);
   }
 
-  async loadForeground(request, signal) {
-    const cached = this.ready.get(request.cacheKey);
-    if (cached) {
-      this.ready.delete(request.cacheKey);
-      this.ready.set(request.cacheKey, cached);
-      return { ...cached, prefetchStatus: "hit" };
-    }
-    const joined = this.active.get(request.cacheKey);
-    if (joined) joined.foregroundWaiters += 1;
-    for (const active of this.active.values()) {
-      if (active.key !== request.cacheKey && active.foregroundWaiters === 0) {
-        active.controller.abort();
-      }
-    }
-    if (joined) {
-      try {
-        const resource = await awaitWithAbort(joined.promise, signal);
-        return { ...resource, prefetchStatus: "in_flight" };
-      } catch (error) {
-        if (
-          signal?.aborted ||
-          !pageRequestIsTransientlyBusy(error?.status)
-        ) throw error;
-        // A foreground join must not inherit a temporary prefetch admission failure.
-      } finally {
-        joined.foregroundWaiters -= 1;
-        this.abortUnownedActive(joined);
-      }
-    }
-    this.pending = this.pending.filter((item) => item.cacheKey !== request.cacheKey);
-    const resource = await this.fetchForegroundResource(request, signal);
-    this.remember(request.cacheKey, resource);
-    return { ...resource, prefetchStatus: "miss" };
+  get(key) {
+    const resource = this.ready.get(key);
+    if (!resource) return null;
+    this.ready.delete(key);
+    this.ready.set(key, resource);
+    return resource;
   }
 
-  /// 表示するページを admission の一時的な満杯で失敗させない。見開きは 2 ページを
-  /// 同時に要求するので、先読みが枠を持っている瞬間に 2 枚目だけ弾かれ得る。
-  async fetchForegroundResource(request, signal) {
-    for (let attempt = 0; ; attempt += 1) {
-      try {
-        return await this.fetchResource(request, signal, false);
-      } catch (error) {
-        if (
-          attempt >= FOREGROUND_ADMISSION_RETRY_LIMIT ||
-          signal?.aborted ||
-          !pageRequestIsTransientlyBusy(error?.status)
-        ) throw error;
-        await delayWithAbort(
-          pageAdmissionRetryDelayMs(error?.retryAfterMs, attempt),
-          signal
-        );
-      }
-    }
-  }
-
-  schedule(requests, visibleKeys = []) {
-    const unique = [];
-    const seen = new Set();
-    for (const request of requests) {
-      if (!request?.cacheKey || seen.has(request.cacheKey)) continue;
-      seen.add(request.cacheKey);
-      if (this.ready.has(request.cacheKey)) continue;
-      unique.push(request);
-    }
-    this.pending = unique;
-    this.visibleKeys = new Set(
-      (visibleKeys ?? []).filter((key) => typeof key === "string" && key)
-    );
-    this.prefetchProtectedKeys = [...seen].slice(0, this.prefetchProtectLimit);
-    for (const active of this.active.values()) {
-      active.prefetchPlanned = seen.has(active.key);
-      this.abortUnownedActive(active);
-    }
-    this.pump();
-  }
-
-  abortUnownedActive(active) {
-    if (
-      this.active.get(active.key) === active &&
-      !active.prefetchPlanned &&
-      active.foregroundWaiters === 0
-    ) {
-      active.controller.abort();
-    }
-  }
-
-  pump() {
-    if (this.retryTimer) return;
-    let starts = pagePrefetchStartCount(
-      this.active.size,
-      this.pending.length,
-      this.prefetchConcurrency
-    );
-    if (starts <= 0) return;
+  prefetchAdmits(candidateKeyId) {
     if (
       this.ready.size >= this.limit ||
       !pagePrefetchBudgetAllowsStart(this.readyBytes, this.byteLimit)
     ) {
-      const candidate = this.pending.find(
-        (request) =>
-          request?.cacheKey &&
-          !this.ready.has(request.cacheKey) &&
-          !this.active.has(request.cacheKey)
-      );
-      if (!candidate) return;
+      const orderedProtected = this.protectedKeyIds();
+      const candidateIndex = orderedProtected.indexOf(candidateKeyId);
+      const admissionProtected = candidateIndex >= 0
+        ? orderedProtected.slice(0, candidateIndex + 1)
+        : orderedProtected;
       const admission = pageResourceAdmissionPlan({
         entries: [...this.ready].map(([key, resource]) => ({
           key,
           bytes: resource.blob.size,
         })),
-        // The candidate and every plan entry nearer than it stay protected. A
-        // farther planned entry may be evicted to make the next nearer request
-        // admissible, but a nearer entry can never be traded for a farther one.
-        protectedKeys: this.protectedKeys(candidate.cacheKey),
+        protectedKeys: new Set(admissionProtected),
         limit: this.limit,
         byteLimit: this.byteLimit,
         retainedBytes: this.readyBytes,
       });
       for (const key of admission.evictKeys) this.deleteReady(key);
-      if (!admission.allowStart) return;
+      return admission.allowStart;
     }
-    while (starts > 0) {
-      const request = this.pending.shift();
-      if (!request) return;
-      if (this.ready.has(request.cacheKey) || this.active.has(request.cacheKey)) {
-        starts = pagePrefetchStartCount(
-          this.active.size,
-          this.pending.length,
-          this.prefetchConcurrency
-        );
-        continue;
-      }
-      this.startPrefetch(request);
-      starts -= 1;
-    }
-  }
-
-  startPrefetch(request) {
-    const controller = new AbortController();
-    const active = {
-      key: request.cacheKey,
-      controller,
-      prefetchPlanned: true,
-      foregroundWaiters: 0,
-      promise: null,
-    };
-    active.promise = this.fetchResource(request, controller.signal, true)
-      .then((resource) => {
-        if (!controller.signal.aborted) {
-          this.remember(request.cacheKey, resource);
-          rememberMediaImageInfo(request, resource.info);
-          enqueueTelemetry({
-            type: "page_prefetch",
-            status: "ready",
-            fetch_ms: roundMs(resource.fetchMs),
-            bytes: resource.blob.size,
-            requested_width: request.width,
-          });
-        }
-        return resource;
-      })
-      .catch((error) => {
-        const failure = controller.signal.aborted
-          ? { retry: false, pendingRequests: this.pending }
-          : pagePrefetchFailurePlan({
-            pendingRequests: this.pending,
-            failedRequest: request,
-            status: error?.status,
-            errorCode: error?.code,
-          });
-        this.pending = failure.pendingRequests;
-        if (failure.retry) this.scheduleRetry(error?.retryAfterMs);
-        if (error?.name !== "AbortError") {
-          enqueueTelemetry({
-            type: "page_prefetch",
-            status: failure.retry ? "admission_busy" : "failed",
-            retry_planned: failure.retry,
-            message: limitText(error instanceof Error ? error.message : error, 240),
-          });
-        }
-        throw error;
-      })
-      .finally(() => {
-        if (this.active.get(active.key) === active) this.active.delete(active.key);
-        this.notifyStatusChange(
-          controller.signal.aborted ? "discard" : "settled",
-          active.key
-        );
-        this.pump();
-      });
-    // A rejected background promise must be observed even when no foreground load joins it.
-    active.promise.catch(() => {});
-    this.active.set(active.key, active);
-    this.notifyStatusChange("start", active.key);
-  }
-
-  scheduleRetry(delayMs) {
-    if (this.retryTimer) return;
-    const delay = Math.max(100, Math.min(10_000, Number(delayMs) || 1000));
-    this.retryTimer = setTimeout(() => {
-      this.retryTimer = 0;
-      this.pump();
-    }, delay);
+    return true;
   }
 
   remember(key, resource) {
@@ -717,23 +552,12 @@ export class PageResourceCache {
         key,
         bytes: resource.blob.size,
       })),
-      protectedKeys: this.protectedKeys(),
+      protectedKeys: new Set(this.protectedKeyIds()),
       limit: this.limit,
       byteLimit: this.byteLimit,
       retainedBytes: this.readyBytes,
     });
     for (const key of admission.evictKeys) this.deleteReady(key);
-  }
-
-  protectedKeys(candidateKey = null) {
-    let plannedKeys = this.prefetchProtectedKeys;
-    if (candidateKey) {
-      const candidateIndex = plannedKeys.indexOf(candidateKey);
-      if (candidateIndex >= 0) {
-        plannedKeys = plannedKeys.slice(0, candidateIndex + 1);
-      }
-    }
-    return new Set([...this.visibleKeys, ...plannedKeys]);
   }
 
   deleteReady(key) {
@@ -746,17 +570,350 @@ export class PageResourceCache {
   }
 
   clear() {
-    this.pending = [];
-    for (const active of this.active.values()) active.controller.abort();
-    this.active.clear();
-    clearTimeout(this.retryTimer);
-    this.retryTimer = 0;
     this.ready.clear();
     this.readyBytes = 0;
-    this.visibleKeys.clear();
-    this.prefetchProtectedKeys = [];
     this.notifyStatusChange("clear");
   }
+
+  notifyStatusChange(type, key = "") {
+    try {
+      this.onStatusChange({ type, key });
+    } catch {}
+  }
+}
+
+export class PageDemandAdapter {
+  constructor({
+    cache,
+    fetchResource = fetchPageResource,
+    postDemand = (body) => apiPostJson("/api/page/demand", body),
+    prefetchConcurrency = PAGE_PREFETCH_CONCURRENCY,
+    wirePrefix = null,
+    onStatusChange = () => {},
+  }) {
+    this.cache = cache;
+    this.fetchResource = fetchResource;
+    this.postDemand = postDemand;
+    this.onStatusChange = onStatusChange;
+    this.wirePrefix = wirePrefix ?? pageWirePrefix();
+    this.requestsByKey = new Map();
+    this.jobs = new Map();
+    this.groupWaiters = new Map();
+    this.displayedRequestId = null;
+    this.pendingPromotions = new Map();
+    this.pendingReleases = new Map();
+    this.demandFlushQueued = false;
+    this.coordinator = new PageDisplayCoordinator({
+      hasBytes: (keyId) => this.cache.hasBytes(keyId),
+      prefetchAdmits: (keyId) => this.cache.prefetchAdmits(keyId),
+      prefetchConcurrency,
+    });
+    this.cache.setProtectedKeyProvider(
+      () => this.coordinator.protectedKeyIds()
+    );
+  }
+
+  nextDisplayRequestId() {
+    return this.coordinator.nextDisplayRequestId();
+  }
+
+  openDisplay({ requestId, groupKey, requests }) {
+    const keys = this.registerRequests(requests);
+    this.ensureGroupWaiter(requestId);
+    this.applyEffects(this.coordinator.openDisplay({ requestId, groupKey, keys }));
+    return requestId;
+  }
+
+  async waitForDisplay(requestId, signal) {
+    const waiter = this.ensureGroupWaiter(requestId);
+    await awaitWithAbort(waiter.promise, signal);
+  }
+
+  resourceForKey(keyId) {
+    const resource = this.cache.get(keyId);
+    if (!resource) throw new Error("ページ画像の保持データが見つかりません。");
+    return resource;
+  }
+
+  commitDisplay(requestId) {
+    const previous = this.displayedRequestId;
+    this.displayedRequestId = requestId;
+    if (previous && previous !== requestId) {
+      this.releaseDisplay(previous, PageCancelCause.NO_DEMAND);
+    }
+  }
+
+  releaseDisplay(requestId, cause = PageCancelCause.NO_DEMAND) {
+    if (!requestId) return;
+    this.applyEffects(this.coordinator.releaseDisplay(requestId, cause));
+    const waiter = this.groupWaiters.get(requestId);
+    if (waiter && !waiter.settled) {
+      waiter.settled = true;
+      waiter.reject(abortError());
+    }
+    this.groupWaiters.delete(requestId);
+    if (this.displayedRequestId === requestId) this.displayedRequestId = null;
+  }
+
+  setPlan(requests) {
+    const keys = this.registerRequests(requests);
+    this.applyEffects(this.coordinator.setPlan(keys));
+  }
+
+  invalidate(cause) {
+    this.applyEffects(this.coordinator.invalidate(cause));
+    this.displayedRequestId = null;
+    for (const waiter of this.groupWaiters.values()) {
+      if (!waiter.settled) {
+        waiter.settled = true;
+        waiter.reject(abortError());
+      }
+    }
+    this.groupWaiters.clear();
+  }
+
+  statusForKeys(keys = []) {
+    return (Array.isArray(keys) ? keys : []).map((keyId) => {
+      if (this.cache.hasBytes(keyId)) return "ready";
+      const job = this.coordinator.jobFor(keyId);
+      return job?.state === PageJobState.RUNNING ? "active" : "missing";
+    });
+  }
+
+  registerRequests(requests) {
+    const keys = [];
+    const seen = new Set();
+    for (const request of requests ?? []) {
+      if (!request?.cacheKey || seen.has(request.cacheKey)) continue;
+      seen.add(request.cacheKey);
+      keys.push(request.cacheKey);
+      this.requestsByKey.set(request.cacheKey, request);
+    }
+    return keys;
+  }
+
+  ensureGroupWaiter(requestId) {
+    let waiter = this.groupWaiters.get(requestId);
+    if (waiter) return waiter;
+    let resolve;
+    let reject;
+    const promise = new Promise((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    promise.catch(() => {});
+    waiter = { promise, resolve, reject, settled: false };
+    this.groupWaiters.set(requestId, waiter);
+    return waiter;
+  }
+
+  applyEffects(effects) {
+    for (const effect of effects ?? []) {
+      switch (effect.type) {
+        case "start":
+          this.startJob(effect);
+          break;
+        case "promote":
+          this.promoteJob(effect);
+          break;
+        case "cancel":
+          this.cancelJob(effect);
+          break;
+        case "group_ready": {
+          const waiter = this.ensureGroupWaiter(effect.requestId);
+          if (!waiter.settled) {
+            waiter.settled = true;
+            waiter.resolve();
+          }
+          break;
+        }
+        case "group_failed": {
+          const waiter = this.ensureGroupWaiter(effect.requestId);
+          if (!waiter.settled) {
+            waiter.settled = true;
+            const error = new Error("ページ表示グループの読み込みに失敗しました。");
+            error.code = effect.reason;
+            waiter.reject(error);
+          }
+          break;
+        }
+        case "ignored":
+          enqueueTelemetry({
+            type: "page_coordinator",
+            status: "ignored",
+            reason: effect.reason,
+          });
+          break;
+      }
+    }
+    try {
+      this.onStatusChange();
+    } catch {}
+    this.pruneRequestMetadata();
+  }
+
+  pruneRequestMetadata() {
+    const retained = new Set(this.coordinator.protectedKeyIds());
+    for (const job of this.jobs.values()) retained.add(job.keyId);
+    for (const keyId of this.requestsByKey.keys()) {
+      if (!retained.has(keyId)) this.requestsByKey.delete(keyId);
+    }
+  }
+
+  startJob(effect) {
+    const request = this.requestsByKey.get(effect.keyId);
+    if (!request) {
+      this.applyEffects(this.coordinator.settle(effect.jobId, {
+        status: PageJobState.FAILED,
+      }));
+      return;
+    }
+    const job = {
+      ...effect,
+      effectPriority: effect.priority,
+      wireJobId: this.wirePrefix + "-j" + effect.jobId,
+      wireDisplayId: effect.requestId
+        ? this.wirePrefix + "-d" + effect.requestId
+        : null,
+      request,
+      controller: new AbortController(),
+    };
+    this.jobs.set(effect.jobId, job);
+    this.runJob(job).catch(() => {});
+  }
+
+  promoteJob(effect) {
+    const job = this.jobs.get(effect.jobId);
+    if (!job) return;
+    job.priority = PageJobPriority.FOREGROUND;
+    job.wireDisplayId = this.wirePrefix + "-d" + effect.requestId;
+    this.pendingPromotions.set(job.wireJobId, job.wireDisplayId);
+    this.queueDemandFlush();
+  }
+
+  cancelJob(effect) {
+    const job = this.jobs.get(effect.jobId);
+    job?.controller.abort();
+    const wireJobId =
+      job?.wireJobId ?? this.wirePrefix + "-j" + effect.jobId;
+    this.pendingPromotions.delete(wireJobId);
+    this.pendingReleases.set(wireJobId, effect.cause);
+    this.queueDemandFlush();
+  }
+
+  queueDemandFlush() {
+    if (this.demandFlushQueued) return;
+    this.demandFlushQueued = true;
+    queueMicrotask(() => {
+      this.demandFlushQueued = false;
+      const promote = [...this.pendingPromotions]
+        .map(([job, display]) => ({ job, display }));
+      const release = [...this.pendingReleases]
+        .map(([job, cause]) => ({ job, cause }));
+      this.pendingPromotions.clear();
+      this.pendingReleases.clear();
+      if (!promote.length && !release.length) return;
+      Promise.resolve(this.postDemand({ promote, release })).catch((error) => {
+        recordClientError("page_demand_error", error);
+      });
+    });
+  }
+
+  async runJob(job) {
+    let outcome = PageJobState.FAILED;
+    try {
+      let resource;
+      let foregroundBusyRetries = 0;
+      for (let attempt = 0; ; attempt += 1) {
+        const prefetch = job.priority === PageJobPriority.PREFETCH;
+        const request = {
+          ...job.request,
+          url: pageJobUrl(
+            job.request.url,
+            job.wireJobId,
+            job.wireDisplayId,
+            prefetch
+          ),
+        };
+        try {
+          resource = await this.fetchResource(
+            request,
+            job.controller.signal,
+            prefetch
+          );
+          break;
+        } catch (error) {
+          if (
+            job.controller.signal.aborted ||
+            !pageRequestIsTransientlyBusy(error?.status) ||
+            (!prefetch &&
+              foregroundBusyRetries >= FOREGROUND_ADMISSION_RETRY_LIMIT)
+          ) {
+            throw error;
+          }
+          if (!prefetch) foregroundBusyRetries += 1;
+          await delayWithAbort(
+            pageAdmissionRetryDelayMs(error?.retryAfterMs, attempt),
+            job.controller.signal
+          );
+        }
+      }
+      if (job.controller.signal.aborted) throw abortError();
+      const prefetchStatus =
+        job.effectPriority === PageJobPriority.PREFETCH
+          ? job.priority === PageJobPriority.FOREGROUND
+            ? "in_flight"
+            : "prefetched"
+          : "miss";
+      resource = { ...resource, prefetchStatus };
+      this.cache.remember(job.keyId, resource);
+      rememberMediaImageInfo(job.request, resource.info);
+      if (job.priority === PageJobPriority.PREFETCH) {
+        enqueueTelemetry({
+          type: "page_prefetch",
+          status: "ready",
+          fetch_ms: roundMs(resource.fetchMs),
+          bytes: resource.blob.size,
+          requested_width: job.request.width,
+        });
+      }
+      outcome = PageJobState.READY;
+    } catch (error) {
+      outcome = job.controller.signal.aborted
+        ? PageJobState.ABORTED
+        : PageJobState.FAILED;
+      if (error?.name !== "AbortError") {
+        enqueueTelemetry({
+          type: "page_prefetch",
+          status: "failed",
+          message: limitText(error instanceof Error ? error.message : error, 240),
+        });
+      }
+    } finally {
+      this.jobs.delete(job.jobId);
+      this.applyEffects(this.coordinator.settle(job.jobId, { status: outcome }));
+    }
+  }
+}
+
+function pageWirePrefix() {
+  const random = globalThis.crypto?.randomUUID?.()
+    ?.replaceAll("-", "")
+    ?.slice(0, 20) ?? Math.random().toString(36).slice(2);
+  return "p" + Date.now().toString(36) + "-" + random;
+}
+
+function pageJobUrl(url, job, display, prefetch) {
+  const resolved = new URL(
+    url,
+    globalThis.location?.origin ?? "http://localhost"
+  );
+  resolved.searchParams.set("job", job);
+  if (display) resolved.searchParams.set("display", display);
+  else resolved.searchParams.delete("display");
+  if (prefetch) resolved.searchParams.set("prefetch", "1");
+  else resolved.searchParams.delete("prefetch");
+  return resolved.pathname + resolved.search;
 }
 
 function awaitWithAbort(promise, signal) {
@@ -806,13 +963,21 @@ const thumbnailRequestLimiter = new RequestLimiter(THUMBNAIL_MAX_CONCURRENCY);
 const pageResourceCache = new PageResourceCache(
   PAGE_RESOURCE_CACHE_LIMIT,
   PAGE_RESOURCE_CACHE_MAX_BYTES,
-  PAGE_PREFETCH_CONCURRENCY,
-  fetchPageResource,
+  () => [],
   ({ type }) => {
     if (type === "clear") hudState.pagePrefetch = null;
     updateHud();
   }
 );
+const pageDemandAdapter = new PageDemandAdapter({
+  cache: pageResourceCache,
+  onStatusChange: () => updateHud(),
+});
+
+function invalidatePageResources(cause = PageCancelCause.CONTEXT_RESET) {
+  pageDemandAdapter.invalidate(cause);
+  pageResourceCache.clear();
+}
 
 const countedPageTimingRequestIds = new Set();
 
@@ -1248,7 +1413,7 @@ export function applyRemoteSessionId(
   // header を付けられない <img> などの HTTP cache だけを分離する。
   state.remoteSessionCacheEpoch = next ? newRemoteSessionCacheEpoch() : "";
   invalidateViewerPendingLoad(state.viewer);
-  pageResourceCache.clear();
+  invalidatePageResources(PageCancelCause.SESSION_INVALIDATED);
   state.imageInfoCache.clear();
   state.containerImageInfoHints.clear();
   if (next) {
@@ -1583,7 +1748,7 @@ function applyRemoteStateGeneration(observed, { reloadViewer = false } = {}) {
   if (!transition.changed) return transition.generation;
 
   invalidateViewerPendingLoad(state.viewer);
-  pageResourceCache.clear();
+  invalidatePageResources();
   state.imageInfoCache.clear();
   state.containerImageInfoHints.clear();
   if (reloadViewer && state.viewer) {
@@ -1840,7 +2005,7 @@ async function dispatchRoute() {
   ) {
     await flushReadingProgress();
   }
-  if (route.kind !== "media") pageResourceCache.clear();
+  if (route.kind !== "media") invalidatePageResources();
   try {
     if (route.kind === "home") {
       renderHome(route.tab);
@@ -5644,6 +5809,7 @@ async function updateViewerImage(
   let result;
   let stage = "image_info";
   let loadGroupReached = false;
+  let displayRequestId = null;
   try {
     const infos = await Promise.all(group.entries.map(imageInfo));
     const contextExit = viewerImageUpdateContextExitReason({
@@ -5680,6 +5846,14 @@ async function updateViewerImage(
         remoteSessionCacheEpoch: remoteSessionCacheEpochSnapshot,
       }),
     }));
+    if (pages.every(({ request }) => request.cacheKey)) {
+      displayRequestId = pageDemandAdapter.nextDisplayRequestId();
+      pageDemandAdapter.openDisplay({
+        requestId: displayRequestId,
+        groupKey: identity,
+        requests: pages.map(({ request }) => request),
+      });
+    }
     stage = "group_load";
     loadGroupReached = true;
     result = await viewer.loadGroup({
@@ -5694,8 +5868,13 @@ async function updateViewerImage(
         .map((pageIndex) => pageIndex + 1),
       interactionStartedAt,
       renderTrigger,
+      displayRequestId,
     });
+    if (result?.outcome !== ViewerGroupLoadOutcome.APPLIED) {
+      pageDemandAdapter.releaseDisplay(displayRequestId);
+    }
   } catch (error) {
+    pageDemandAdapter.releaseDisplay(displayRequestId);
     if (state.viewer !== viewer) {
       return supersedeViewerImageUpdate(
         ViewerImageUpdateExitReason.VIEWER_CHANGED_ON_ERROR,
@@ -5863,10 +6042,7 @@ async function schedulePagePrefetch(viewer, visiblePages = []) {
       .map((index) => requestsByIndex.get(index)?.cacheKey)
       .filter(Boolean),
   };
-  pageResourceCache.schedule(
-    requests.filter(Boolean),
-    visiblePages.map(({ request }) => request.cacheKey).filter(Boolean)
-  );
+  pageDemandAdapter.setPlan(requests.filter(Boolean));
   updateHud();
 }
 
@@ -5900,6 +6076,17 @@ function imageRequest(
     const qualityPreset = imageQualityPreset(state.localSettings.imageQuality);
     const targetPx = targetPxOverride ?? qualityPreset.maxLongSide;
     const infoCacheKey = mediaImageInfoKey(entry.address);
+    const renderRevision = previewRevision ?? state.pageRenderRevision;
+    const resourceKey = pageResourceKey({
+      address: entry.address,
+      targetPx,
+      renderRevision,
+      generation: remoteStateGeneration,
+      sessionId: remoteSessionId,
+      sessionCacheEpoch: remoteSessionCacheEpoch,
+      renderContext,
+      adjustmentPreview,
+    });
     return {
       url: apiUrl(
         "/api/page",
@@ -5908,7 +6095,7 @@ function imageRequest(
           generation: remoteStateGeneration,
           epoch: remoteSessionCacheEpoch,
           ...(prefetch ? { prefetch: 1 } : {}),
-          rev: previewRevision ?? state.pageRenderRevision,
+          rev: renderRevision,
           ...(renderContext
             ? { render_context: JSON.stringify(renderContext) }
             : {}),
@@ -5917,9 +6104,8 @@ function imageRequest(
             : {}),
         })
       ),
-      cacheKey: adjustmentPreview
-        ? null
-        : `${infoCacheKey}\n${targetPx}\n${state.pageRenderRevision}\n${remoteStateGeneration}\n${remoteSessionId}\n${JSON.stringify(renderContext)}`,
+      cacheKey: resourceKey.id,
+      cacheable: resourceKey.cacheable,
       remoteStateGeneration,
       remoteSessionId,
       address: entry.address,
@@ -7525,7 +7711,13 @@ export class ViewerAdjustmentPanel {
     this.colorizePresetSlots = [null, null, null, null];
     this.previewQueue = new LatestOnlyTaskQueue(
       (job) => this.runPreview(job),
-      (error) => this.showError(error)
+      (error) => this.showError(error),
+      () => false,
+      (job) => {
+        job.cancelled = true;
+        job.controller?.abort();
+        pageDemandAdapter.releaseDisplay(job.displayRequestId);
+      }
     );
     this.build();
   }
@@ -8506,22 +8698,33 @@ export class ViewerAdjustmentPanel {
       adjustmentPreview: { scope: job.scope, values: job.values },
       previewRevision: `preview-${state.pageRenderRevision}-${job.sequence}`,
     });
-    const response = await observedFetch(request.url, { credentials: "same-origin" });
-    if (!response.ok) {
-      const detail = await response.clone().json().catch(() => ({}));
-      throw new Error(detail.message || `補正プレビューに失敗しました (HTTP ${response.status})。`);
+    if (job.cancelled) return;
+    job.controller = new AbortController();
+    job.displayRequestId = pageDemandAdapter.nextDisplayRequestId();
+    pageDemandAdapter.openDisplay({
+      requestId: job.displayRequestId,
+      groupKey: "adjustment-preview-" + job.identity,
+      requests: [request],
+    });
+    try {
+      await pageDemandAdapter.waitForDisplay(
+        job.displayRequestId,
+        job.controller.signal
+      );
+      const blob = pageDemandAdapter.resourceForKey(request.cacheKey).blob;
+      if (
+        job.cancelled ||
+        job.epoch !== this.previewEpoch ||
+        this.previewQueue.latest !== null ||
+        this.currentTarget()?.identity !== job.identity
+      ) {
+        return;
+      }
+      await state.viewer?.replacePageBlob(job.pageIndex, blob, job.entry.name);
+    } finally {
+      pageDemandAdapter.releaseDisplay(job.displayRequestId);
+      pageResourceCache.deleteReady(request.cacheKey);
     }
-    requirePageResponseIdentity(request.address, response);
-    requirePageResponseGeneration(request, response);
-    const blob = await response.blob();
-    if (
-      job.epoch !== this.previewEpoch ||
-      this.previewQueue.latest !== null ||
-      this.currentTarget()?.identity !== job.identity
-    ) {
-      return;
-    }
-    await state.viewer?.replacePageBlob(job.pageIndex, blob, job.entry.name);
   }
 
   commitCurrent() {
@@ -8547,7 +8750,7 @@ export class ViewerAdjustmentPanel {
       }
       this.applyServerState(response.adjustment_state);
       state.pageRenderRevision += 1;
-      pageResourceCache.clear();
+      invalidatePageResources();
       await updateViewerImage(performance.now(), {
         adjustmentStateCurrent: true,
         renderTrigger: "adjustment_commit",
@@ -9594,7 +9797,7 @@ function setLocalImageQuality(quality) {
   state.localSettings = saved.settings;
   state.localSettingsStorageAvailable = saved.saved;
   if (changed) {
-    pageResourceCache.clear();
+    invalidatePageResources();
     if (
       state.screenContext === "viewer" &&
       state.viewer &&
@@ -10720,7 +10923,7 @@ export class ImageViewer {
     this.lastWheelCommandAt = 0;
     this.resizeTimer = 0;
     this.loadSequence = 0;
-    this.fetchController = null;
+    this.legacyFetchController = null;
     this.objectUrl = null;
     this.objectUrls = [];
     this.loadingTimer = 0;
@@ -10737,7 +10940,8 @@ export class ImageViewer {
           job.gap,
           job.interactionStartedAt,
           job.presentation,
-          job.renderTrigger
+          job.renderTrigger,
+          job.displayRequestId
         )
         : this.loadMeasuredImage(
           job.request,
@@ -10745,15 +10949,18 @@ export class ImageViewer {
           job.name,
           job.info,
           job.presentation,
-          job.renderTrigger
+          job.renderTrigger,
+          job.displayRequestId
         ),
-      () => this.supersedeActiveLoad(),
+      (job) => {
+        pageDemandAdapter.releaseDisplay(job?.displayRequestId);
+        this.supersedeActiveLoad();
+      },
       (busy) => this.setPageLoadBusy(busy),
-      (job, reason) => this.recordPageDisplay(
-        job?.presentation,
-        "not_applied",
-        reason
-      )
+      (job, reason) => {
+        pageDemandAdapter.releaseDisplay(job?.displayRequestId);
+        this.recordPageDisplay(job?.presentation, "not_applied", reason);
+      }
     );
 
     this.pointerDown = (event) => this.onPointerDown(event);
@@ -10819,6 +11026,7 @@ export class ImageViewer {
     pageNumbers,
     interactionStartedAt,
     renderTrigger,
+    displayRequestId = null,
   }) {
     const resolvedSeekState = seekState ?? {
       visible: count > 1,
@@ -10843,6 +11051,7 @@ export class ImageViewer {
       info,
       presentation,
       renderTrigger,
+      displayRequestId,
     });
   }
 
@@ -10858,8 +11067,8 @@ export class ImageViewer {
       this.loadingIndicator.hidden = true;
     }
     this.supersedeActiveLoad();
-    this.fetchController?.abort();
-    this.fetchController = null;
+    this.legacyFetchController?.abort();
+    this.legacyFetchController = null;
   }
 
   loadGroup({
@@ -10873,6 +11082,7 @@ export class ImageViewer {
     pageNumbers,
     interactionStartedAt,
     renderTrigger,
+    displayRequestId = null,
   }) {
     if (pages.length === 1) {
       return this.load({
@@ -10886,6 +11096,7 @@ export class ImageViewer {
         pageNumbers,
         interactionStartedAt,
         renderTrigger,
+        displayRequestId,
       });
     }
     const resolvedSeekState = seekState ?? {
@@ -10911,6 +11122,7 @@ export class ImageViewer {
       interactionStartedAt,
       presentation,
       renderTrigger,
+      displayRequestId,
     });
   }
 
@@ -11197,22 +11409,26 @@ export class ImageViewer {
     name,
     info,
     presentation,
-    renderTrigger
+    renderTrigger,
+    displayRequestId
   ) {
     const sequence = ++this.loadSequence;
-    this.fetchController?.abort();
-    const controller = new AbortController();
-    this.fetchController = controller;
+    const legacyController = displayRequestId ? null : new AbortController();
+    if (legacyController) {
+      this.legacyFetchController?.abort();
+      this.legacyFetchController = legacyController;
+    }
     const fetchStartedAt = performance.now();
     let pendingObjectUrl = null;
     let resource = null;
     let phase = "fetch";
     try {
-      if (request.cacheKey) {
-        resource = await pageResourceCache.loadForeground(request, controller.signal);
+      if (request.cacheKey && displayRequestId) {
+        await pageDemandAdapter.waitForDisplay(displayRequestId);
+        resource = pageDemandAdapter.resourceForKey(request.cacheKey);
       } else {
         const response = await observedFetch(request.url, {
-          signal: controller.signal,
+          signal: legacyController?.signal,
           credentials: "same-origin",
           sessionEpochBound: true,
         });
@@ -11291,6 +11507,7 @@ export class ImageViewer {
       this.pageLayer.replaceChildren(decodedImage);
       this.image = decodedImage;
       this.images = [decodedImage];
+      pageDemandAdapter.commitDisplay(displayRequestId);
       this.recordPageDisplay(
         presentation,
         "applied",
@@ -11370,24 +11587,30 @@ export class ImageViewer {
     gap,
     interactionStartedAt,
     presentation,
-    renderTrigger
+    renderTrigger,
+    displayRequestId
   ) {
     const sequence = ++this.loadSequence;
-    this.fetchController?.abort();
-    const controller = new AbortController();
-    this.fetchController = controller;
+    const legacyController = displayRequestId ? null : new AbortController();
+    if (legacyController) {
+      this.legacyFetchController?.abort();
+      this.legacyFetchController = legacyController;
+    }
     const startedAt = performance.now();
     const pendingUrls = [];
     let resources = null;
     let phase = "fetch";
     try {
+      if (displayRequestId) {
+        await pageDemandAdapter.waitForDisplay(displayRequestId);
+      }
       resources = await Promise.all(pages.map(async ({ request }) => {
-        if (request.cacheKey) {
-          return pageResourceCache.loadForeground(request, controller.signal);
+        if (request.cacheKey && displayRequestId) {
+          return pageDemandAdapter.resourceForKey(request.cacheKey);
         }
         const fetchStartedAt = performance.now();
         const response = await observedFetch(request.url, {
-          signal: controller.signal,
+          signal: legacyController?.signal,
           credentials: "same-origin",
           sessionEpochBound: true,
         });
@@ -11475,6 +11698,7 @@ export class ImageViewer {
       this.pageLayer.replaceChildren(...decodedImages.map((decoded) => decoded.image));
       this.images = decodedImages.map((decoded) => decoded.image);
       this.image = this.images[0];
+      pageDemandAdapter.commitDisplay(displayRequestId);
       this.recordPageDisplay(
         presentation,
         "applied",
@@ -11933,7 +12157,7 @@ export class ImageViewer {
     this.boundaryMessage.hidden = true;
     this.pageLoadQueue.clear();
     this.loadSequence += 1;
-    this.fetchController?.abort();
+    this.legacyFetchController?.abort();
     if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
     for (const objectUrl of this.objectUrls) {
       if (objectUrl !== this.objectUrl) URL.revokeObjectURL(objectUrl);
@@ -12765,8 +12989,8 @@ function pagePrefetchHudIndicator() {
   const plan = hudState.pagePrefetch;
   if (!plan) return null;
   const summary = pagePrefetchIndicatorSummary({
-    behind: pageResourceCache.statusForKeys(plan.behindKeys),
-    ahead: pageResourceCache.statusForKeys(plan.aheadKeys),
+    behind: pageDemandAdapter.statusForKeys(plan.behindKeys),
+    ahead: pageDemandAdapter.statusForKeys(plan.aheadKeys),
   });
   if (!summary.behind.length && !summary.ahead.length) return null;
   const indicator = element("span", "page-prefetch-indicator");

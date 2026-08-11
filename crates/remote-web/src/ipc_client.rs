@@ -11,25 +11,25 @@ use mimageviewer_ipc::{
     ContainerResponse, FavoriteSearchPayload, FavoriteSearchRequest, FavoriteSearchResponse,
     FolderListPayload, FolderListRequest, FolderListResponse, FrameError, HomePayload, HomeRequest,
     HomeResponse, MAX_CONTROL_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, MediaError, MediaErrorCode,
-    PIPE_NAME, PROTOCOL_VERSION, PagePayload, PagePriority, PageRequest, PageResponse,
-    REMOTE_AI_START_ACCEPT_BUDGET, REMOTE_ARCHIVE_START_ACCEPT_BUDGET, RemoteAddress,
-    RemoteAiCancelResponse, RemoteAiJobError, RemoteAiJobSnapshot, RemoteAiRecoverableResponse,
-    RemoteAiResultResponse, RemoteAiStartRequest, RemoteAiStartResponse, RemoteAiStateResponse,
-    RemoteArchiveCancelResponse, RemoteArchiveConfirmRequest, RemoteArchiveInputResponse,
-    RemoteArchiveJobError, RemoteArchiveJobSnapshot, RemoteArchiveOpenResult,
-    RemoteArchivePasswordRequest, RemoteArchiveRecoverableResponse, RemoteArchiveResultResponse,
-    RemoteArchiveStartRequest, RemoteArchiveStartResponse, RemoteArchiveStateResponse,
-    RemotePageRenderContext, RemoteSessionIdentity, RemoteWebConnectionInfo, RemoteWriteError,
-    RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult, RequestId,
-    ServerMessage, SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionResponse,
-    SessionStatus, TagBrowsePayload, TagBrowseRequest, TagBrowseResponse, TagItemsPayload,
-    TagItemsRequest, TagItemsResponse, ThumbnailError, ThumbnailErrorCode, ThumbnailRequest,
-    ThumbnailResponse, VIDEO_STREAM_START_BUDGET, VideoStreamControlAction, VideoStreamError,
-    VideoStreamErrorCode, VideoStreamJumpListPayload, VideoStreamJumpThumbnailPayload,
-    VideoStreamPlaylistKind, VideoStreamPlaylistPayload, VideoStreamQuality, VideoStreamResult,
-    VideoStreamSeekPayload, VideoStreamSegmentIndex, VideoStreamSegmentPayload,
-    VideoStreamStartPayload, VideoStreamStatePayload, VideoStreamThumbnailPayload, read_frame,
-    write_frame,
+    PIPE_NAME, PROTOCOL_VERSION, PageDemandRequest, PageDemandResponse, PagePayload, PagePriority,
+    PageRequest, PageResponse, REMOTE_AI_START_ACCEPT_BUDGET, REMOTE_ARCHIVE_START_ACCEPT_BUDGET,
+    RemoteAddress, RemoteAiCancelResponse, RemoteAiJobError, RemoteAiJobSnapshot,
+    RemoteAiRecoverableResponse, RemoteAiResultResponse, RemoteAiStartRequest,
+    RemoteAiStartResponse, RemoteAiStateResponse, RemoteArchiveCancelResponse,
+    RemoteArchiveConfirmRequest, RemoteArchiveInputResponse, RemoteArchiveJobError,
+    RemoteArchiveJobSnapshot, RemoteArchiveOpenResult, RemoteArchivePasswordRequest,
+    RemoteArchiveRecoverableResponse, RemoteArchiveResultResponse, RemoteArchiveStartRequest,
+    RemoteArchiveStartResponse, RemoteArchiveStateResponse, RemotePageRenderContext,
+    RemoteSessionIdentity, RemoteWebConnectionInfo, RemoteWriteError, RemoteWriteErrorCode,
+    RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult, RequestId, ServerMessage,
+    SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionResponse, SessionStatus,
+    TagBrowsePayload, TagBrowseRequest, TagBrowseResponse, TagItemsPayload, TagItemsRequest,
+    TagItemsResponse, ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse,
+    VIDEO_STREAM_START_BUDGET, VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode,
+    VideoStreamJumpListPayload, VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind,
+    VideoStreamPlaylistPayload, VideoStreamQuality, VideoStreamResult, VideoStreamSeekPayload,
+    VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamStartPayload,
+    VideoStreamStatePayload, VideoStreamThumbnailPayload, read_frame, write_frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -188,6 +188,7 @@ impl ClientError {
                 MediaErrorCode::Unsupported => "miv_media_unsupported",
                 MediaErrorCode::PasswordRequired => "miv_media_password_required",
                 MediaErrorCode::PageOutOfRange => "miv_media_page_out_of_range",
+                MediaErrorCode::Cancelled => "miv_media_cancelled",
                 MediaErrorCode::Busy => "miv_media_busy",
                 MediaErrorCode::RenderFailed => "miv_media_render_failed",
                 MediaErrorCode::Internal => "miv_media_internal",
@@ -774,6 +775,8 @@ impl ThumbnailClient {
     pub fn page(
         &self,
         owner: &RemoteSessionIdentity,
+        job_id: String,
+        display_request_id: Option<String>,
         address: RemoteAddress,
         target_px: u32,
         priority: PagePriority,
@@ -784,6 +787,8 @@ impl ThumbnailClient {
             id,
             owner: owner.clone(),
             request: PageRequest {
+                job_id: job_id.clone(),
+                display_request_id: display_request_id.clone(),
                 address: address.clone(),
                 target_px,
                 priority,
@@ -815,6 +820,36 @@ impl ThumbnailClient {
                     "response_type_mismatch",
                     None,
                     "page request received another response type",
+                )),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+        })
+    }
+
+    pub fn page_demand(
+        &self,
+        owner: &RemoteSessionIdentity,
+        request: PageDemandRequest,
+    ) -> Result<IpcSuccess<PageDemandResponse>, ClientFailure> {
+        self.collection_request(|id| ClientMessage::PageDemand {
+            id,
+            owner: owner.clone(),
+            request: request.clone(),
+        })
+        .and_then(|success| match success.value {
+            ServerMessage::PageDemand { response, .. } => Ok(IpcSuccess {
+                value: response,
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+                connection_id: success.connection_id,
+            }),
+            _ => Err(ClientFailure {
+                error: ClientError::Protocol(protocol_failure(
+                    "response_route",
+                    "response_type_mismatch",
+                    None,
+                    "page demand request received another response type",
                 )),
                 retry_count: success.retry_count,
                 retry_statuses: success.retry_statuses,
@@ -2394,6 +2429,8 @@ mod tests {
             id: 1,
             owner: test_owner(),
             request: PageRequest {
+                job_id: "timeout-page".to_owned(),
+                display_request_id: Some("timeout-display".to_owned()),
                 address: RemoteAddress::file("C:/Pictures/image.png"),
                 target_px: 2048,
                 priority: PagePriority::Foreground,

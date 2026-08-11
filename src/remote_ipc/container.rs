@@ -100,11 +100,6 @@ fn remote_auto_trim_cache_key(
     })
 }
 
-struct ActivePagePrefetch {
-    address: RemoteAddress,
-    cancel: Arc<AtomicBool>,
-}
-
 pub(super) struct ContainerEngine {
     settings: Arc<crate::settings::Settings>,
     listing_settings: RemoteListingSettingsSource,
@@ -121,7 +116,6 @@ pub(super) struct ContainerEngine {
     remote_ai_native_cache: Mutex<RemoteAiNativeCache>,
     comic_stamp_cache: Mutex<HashMap<String, Option<Arc<comic_core::RgbaOverlay>>>>,
     session: Option<super::session::SessionHandle>,
-    page_prefetches: Mutex<Vec<ActivePagePrefetch>>,
 }
 
 enum AdjustmentSettingsSource {
@@ -638,7 +632,6 @@ impl ContainerEngine {
             remote_ai_native_cache: Mutex::new(RemoteAiNativeCache::default()),
             comic_stamp_cache: Mutex::new(HashMap::new()),
             session,
-            page_prefetches: Mutex::new(Vec::new()),
         }
     }
     fn adjustment_render_settings(
@@ -960,48 +953,6 @@ impl ContainerEngine {
                     "Creative LUT を読み込めないためページを合成できません",
                 )
             })
-    }
-
-    fn begin_page_render(
-        &self,
-        priority: PagePriority,
-        address: &RemoteAddress,
-        render_context: Option<&RemotePageRenderContext>,
-        session_cancel: Option<Arc<AtomicBool>>,
-    ) -> Arc<AtomicBool> {
-        let cancel = session_cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        let mut prefetches = self
-            .page_prefetches
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if priority == PagePriority::Foreground {
-            let spread_partner = render_context.and_then(|context| context.spread_partner.as_ref());
-            prefetches.retain(|prefetch| {
-                let needed = prefetch.address == *address
-                    || spread_partner.is_some_and(|partner| prefetch.address == *partner);
-                if !needed {
-                    prefetch.cancel.store(true, Ordering::Relaxed);
-                }
-                needed
-            });
-        } else {
-            prefetches.push(ActivePagePrefetch {
-                address: address.clone(),
-                cancel: Arc::clone(&cancel),
-            });
-        }
-        cancel
-    }
-
-    fn finish_page_render(&self, priority: PagePriority, cancel: &Arc<AtomicBool>) {
-        if priority != PagePriority::Prefetch {
-            return;
-        }
-        let mut prefetches = self
-            .page_prefetches
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        prefetches.retain(|active| !Arc::ptr_eq(&active.cancel, cancel));
     }
 
     pub(super) fn container(&self, request: ContainerRequest) -> ContainerResponse {
@@ -1990,24 +1941,27 @@ impl ContainerEngine {
         response
     }
 
-    pub(super) fn page_with_session_cancel(
+    pub(super) fn page_with_job_cancel(
         &self,
         request: PageRequest,
         context: &WorkerContext,
-        session_cancel: Arc<AtomicBool>,
+        job_cancel: Arc<AtomicBool>,
     ) -> PageResponse {
-        self.page_inner(request, context, Some(session_cancel))
+        self.page_inner(request, context, job_cancel)
     }
 
     fn page_inner(
         &self,
         request: PageRequest,
         context: &WorkerContext,
-        session_cancel: Option<Arc<AtomicBool>>,
+        cancel: Arc<AtomicBool>,
     ) -> PageResponse {
         let started = Instant::now();
         let source_kind = media_source_kind(&request.address);
         let priority = request.priority;
+        if cancel.load(Ordering::Acquire) {
+            return cancelled_page_error();
+        }
         if request.target_px == 0 || request.target_px > MAX_PAGE_RENDER_PX {
             return PageResponse::Error(media_error(
                 MediaErrorCode::BadRequest,
@@ -2034,12 +1988,6 @@ impl ContainerEngine {
             Ok(plan) => plan,
             Err(error) => return PageResponse::Error(error),
         };
-        let cancel = self.begin_page_render(
-            priority,
-            &request.address,
-            request.render_context.as_ref(),
-            session_cancel,
-        );
         let load_kind = if view_trim_plan.requires_auto_detection() {
             RemoteImageLoadKind::CompositedPageWithAutoTrim
         } else {
@@ -2083,11 +2031,15 @@ impl ContainerEngine {
             },
             Err(error) => PageResponse::Error(error),
         };
+        let response = if cancel.load(Ordering::Acquire) {
+            cancelled_page_error()
+        } else {
+            response
+        };
         let (outcome, output_bytes) = match &response {
             PageResponse::Success(payload) => ("ok", payload.bytes.len()),
             PageResponse::Error(_) => ("error", 0),
         };
-        self.finish_page_render(priority, &cancel);
         crate::logger::log(format!(
             "remote_ipc: media_operation operation=page source_kind={source_kind} priority={} outcome={outcome} duration_ms={:.1} output_bytes={output_bytes}",
             if priority == PagePriority::Prefetch {
@@ -4465,6 +4417,7 @@ fn remote_write_error_from_media(error: MediaError) -> RemoteWriteError {
         MediaErrorCode::Busy => RemoteWriteErrorCode::Busy,
         MediaErrorCode::PasswordRequired
         | MediaErrorCode::PageOutOfRange
+        | MediaErrorCode::Cancelled
         | MediaErrorCode::RenderFailed
         | MediaErrorCode::Internal => RemoteWriteErrorCode::Internal,
     };
@@ -4490,6 +4443,13 @@ fn media_error(code: MediaErrorCode, message: impl Into<String>) -> MediaError {
     MediaError::new(code, message)
 }
 
+fn cancelled_page_error() -> PageResponse {
+    PageResponse::Error(media_error(
+        MediaErrorCode::Cancelled,
+        "ページの表示需要がなくなったため処理を取り消しました",
+    ))
+}
+
 fn thumbnail_error_from_media(error: MediaError) -> ThumbnailResponse {
     let code = match error.code {
         MediaErrorCode::BadRequest => ThumbnailErrorCode::BadRequest,
@@ -4499,6 +4459,7 @@ fn thumbnail_error_from_media(error: MediaError) -> ThumbnailResponse {
         MediaErrorCode::Unsupported => ThumbnailErrorCode::Unsupported,
         MediaErrorCode::PasswordRequired => ThumbnailErrorCode::PasswordRequired,
         MediaErrorCode::PageOutOfRange => ThumbnailErrorCode::PageOutOfRange,
+        MediaErrorCode::Cancelled => ThumbnailErrorCode::Busy,
         MediaErrorCode::Busy => ThumbnailErrorCode::Busy,
         MediaErrorCode::RenderFailed => ThumbnailErrorCode::GenerationFailed,
         MediaErrorCode::Internal => ThumbnailErrorCode::Internal,
@@ -4515,6 +4476,33 @@ mod tests {
     use super::*;
     use crate::settings::FavoriteEntry;
     use std::io::{Cursor, Write};
+
+    #[test]
+    fn page_render_observes_the_registry_job_token() {
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let context = WorkerContext::open();
+        let cancel = Arc::new(AtomicBool::new(true));
+        let response = engine.page_with_job_cancel(
+            PageRequest {
+                job_id: "cancelled-page".to_owned(),
+                display_request_id: Some("cancelled-display".to_owned()),
+                address: RemoteAddress::file(r"C:\Pictures\page.jpg"),
+                target_px: 2048,
+                priority: PagePriority::Foreground,
+                render_context: None,
+                adjustment_preview: None,
+            },
+            &context,
+            cancel,
+        );
+        assert!(matches!(
+            response,
+            PageResponse::Error(MediaError {
+                code: MediaErrorCode::Cancelled,
+                ..
+            })
+        ));
+    }
 
     fn favorite_address(favorite: &FavoriteEntry, relative: impl AsRef<Path>) -> RemoteAddress {
         let path = favorite.path.join(relative);
@@ -5273,102 +5261,6 @@ mod tests {
 
         assert!(Arc::ptr_eq(&result, &source));
         assert_eq!(result.pixels, source.pixels);
-    }
-
-    fn page_render_test_address(name: &str) -> RemoteAddress {
-        RemoteAddress::file(format!(r"C:\books\{name}.jpg"))
-    }
-
-    #[test]
-    fn spread_partner_prefetch_completes_when_other_page_starts_in_foreground() {
-        let engine = ContainerEngine::new(crate::settings::Settings::default());
-        let partner = page_render_test_address("left");
-        let requested = page_render_test_address("right");
-        let partner_prefetch =
-            engine.begin_page_render(PagePriority::Prefetch, &partner, None, None);
-        let render_context = RemotePageRenderContext {
-            context_address: page_render_test_address("book"),
-            display_slot: RemotePageDisplaySlot::SpreadRight,
-            spread_partner: Some(partner),
-        };
-
-        assert!(!partner_prefetch.load(Ordering::Relaxed));
-        let foreground = engine.begin_page_render(
-            PagePriority::Foreground,
-            &requested,
-            Some(&render_context),
-            None,
-        );
-
-        assert!(!partner_prefetch.load(Ordering::Relaxed));
-        assert!(!foreground.load(Ordering::Relaxed));
-        engine.finish_page_render(PagePriority::Prefetch, &partner_prefetch);
-        assert!(
-            engine
-                .page_prefetches
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn foreground_cancels_unrelated_prefetch() {
-        let engine = ContainerEngine::new(crate::settings::Settings::default());
-        let unrelated = page_render_test_address("unrelated");
-        let requested = page_render_test_address("requested");
-        let prefetch = engine.begin_page_render(PagePriority::Prefetch, &unrelated, None, None);
-
-        engine.begin_page_render(PagePriority::Foreground, &requested, None, None);
-
-        assert!(prefetch.load(Ordering::Relaxed));
-        engine.finish_page_render(PagePriority::Prefetch, &prefetch);
-        assert!(
-            engine
-                .page_prefetches
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn single_page_foreground_preserves_matching_prefetch() {
-        let engine = ContainerEngine::new(crate::settings::Settings::default());
-        let requested = page_render_test_address("requested");
-        let matching = engine.begin_page_render(PagePriority::Prefetch, &requested, None, None);
-
-        engine.begin_page_render(PagePriority::Foreground, &requested, None, None);
-
-        assert!(!matching.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn finishing_prefetch_removes_only_its_registration() {
-        let engine = ContainerEngine::new(crate::settings::Settings::default());
-        let address = page_render_test_address("requested");
-        let first = engine.begin_page_render(PagePriority::Prefetch, &address, None, None);
-        let second = engine.begin_page_render(PagePriority::Prefetch, &address, None, None);
-
-        assert!(!first.load(Ordering::Relaxed));
-        assert!(!second.load(Ordering::Relaxed));
-        engine.finish_page_render(PagePriority::Prefetch, &first);
-        let prefetches = engine
-            .page_prefetches
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        assert_eq!(prefetches.len(), 1);
-        assert!(Arc::ptr_eq(&prefetches[0].cancel, &second));
-        drop(prefetches);
-
-        engine.finish_page_render(PagePriority::Prefetch, &second);
-        assert!(
-            engine
-                .page_prefetches
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .is_empty()
-        );
     }
 
     #[test]

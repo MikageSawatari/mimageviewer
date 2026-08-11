@@ -405,7 +405,12 @@ export class PageDisplayCoordinator {
         job.priority === PageJobPriority.PREFETCH
       ) {
         job.priority = PageJobPriority.FOREGROUND;
-        effects.push({ type: "promote", jobId: job.jobId, keyId });
+        effects.push({
+          type: "promote",
+          jobId: job.jobId,
+          keyId,
+          requestId: this.#pendingDisplayRequestId(keyId),
+        });
       }
     }
     for (const keyId of this.#foregroundKeys()) {
@@ -426,7 +431,7 @@ export class PageDisplayCoordinator {
       if (this.#terminalFailureKeys.has(keyId)) continue;
       if (this.#displayDemands.get(keyId)?.size) continue;
       if (this.#currentJob(keyId) || this.#hasBytes(keyId)) continue;
-      if (!this.#prefetchAdmits()) break;
+      if (!this.#prefetchAdmits(keyId)) break;
       this.#startJob(keyId, PageJobPriority.PREFETCH, effects);
       activePrefetches += 1;
     }

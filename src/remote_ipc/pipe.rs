@@ -39,6 +39,10 @@ use windows::core::PCWSTR;
 
 use super::collections::CollectionEngine;
 use super::container::ContainerEngine;
+use super::page_jobs::{
+    DisplayRequestId, PageJobCancelCause, PageJobId, PageJobPriority, PageJobRegistry,
+    PromotePageJobResult, RegisterPageJobError, ReleasePageJobResult,
+};
 use super::session::{
     SessionHandle, SessionOperation, SessionRuntime, UiWriteOutcome, VideoStreamUiOutcome,
     VideoStreamUiRequest,
@@ -64,8 +68,22 @@ enum Work {
         enqueued_at: Instant,
         _prefetch_permit: Option<PrefetchPermit>,
         session_operation: SessionOperation,
+        page_job: Option<PageJobWork>,
     },
     Stop,
+}
+
+struct PageJobWork {
+    registry: Arc<PageJobRegistry>,
+    connection_id: u64,
+    job_id: PageJobId,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for PageJobWork {
+    fn drop(&mut self) {
+        self.registry.finish(self.connection_id, &self.job_id);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +175,7 @@ pub(super) struct ServerGuard {
     session_runtime: SessionRuntime,
     _ai_jobs: Arc<super::ai_job::RemoteAiJobRegistry>,
     _archive_jobs: Arc<super::archive_job::RemoteArchiveJobRegistry>,
+    page_jobs: Arc<PageJobRegistry>,
 }
 
 impl ServerGuard {
@@ -179,6 +198,8 @@ impl ServerGuard {
 
         let session_runtime = SessionRuntime::start()?;
         let session_handle = session_runtime.handle();
+        let page_jobs = Arc::new(PageJobRegistry::new());
+        session_handle.install_page_jobs(&page_jobs);
         let configured_worker_count = settings.parallelism.thread_count();
         let worker_count = remote_heavy_worker_count(configured_worker_count);
         let favorites = super::live_favorites::LiveFavorites::live(settings.favorites.clone())?;
@@ -301,6 +322,7 @@ impl ServerGuard {
             let listener_next_connection_id = Arc::clone(&next_connection_id);
             let listener_prefetch_in_flight = Arc::clone(&prefetch_in_flight);
             let listener_session = session_handle.clone();
+            let listener_page_jobs = Arc::clone(&page_jobs);
             match std::thread::Builder::new()
                 .name(format!("remote-ipc-listener-{index}"))
                 .spawn(move || {
@@ -318,6 +340,7 @@ impl ServerGuard {
                         listener_prefetch_in_flight,
                         worker_count,
                         listener_session,
+                        listener_page_jobs,
                         initial_pipe,
                         index,
                     )
@@ -370,6 +393,7 @@ impl ServerGuard {
             session_runtime,
             _ai_jobs: ai_jobs,
             _archive_jobs: archive_jobs,
+            page_jobs,
         })
     }
 
@@ -380,6 +404,7 @@ impl ServerGuard {
 
 impl Drop for ServerGuard {
     fn drop(&mut self) {
+        self.page_jobs.stop(PageJobCancelCause::ServiceStopping);
         self.stop.store(true, Ordering::Release);
         for _ in 0..self.listeners.len() {
             poke_listener();
@@ -444,6 +469,7 @@ fn worker_loop(
                 enqueued_at,
                 _prefetch_permit,
                 session_operation,
+                page_job,
             }) => execute_work(
                 message,
                 reply,
@@ -451,7 +477,8 @@ fn worker_loop(
                 metrics,
                 &format!("heavy-{worker_index}"),
                 session_operation,
-                |message, cancel| match message {
+                page_job,
+                |message, _session_cancel, page_job| match message {
                     ClientMessage::Thumbnail { id, request, .. } => ServerMessage::Thumbnail {
                         id,
                         response: thumbnail_engine.handle(request, &context, container_engine),
@@ -486,11 +513,20 @@ fn worker_loop(
                         id,
                         response: container_engine.container(request),
                     },
-                    ClientMessage::Page { id, request, .. } => ServerMessage::Page {
-                        id,
-                        response: container_engine
-                            .page_with_session_cancel(request, &context, cancel),
-                    },
+                    ClientMessage::Page {
+                        id, mut request, ..
+                    } => {
+                        let page_job = page_job.expect("page work carries its registry lease");
+                        request.priority = effective_page_priority(page_job);
+                        ServerMessage::Page {
+                            id,
+                            response: container_engine.page_with_job_cancel(
+                                request,
+                                &context,
+                                Arc::clone(&page_job.cancel),
+                            ),
+                        }
+                    }
                     ClientMessage::VideoStreamJumpList {
                         id,
                         session: stream_session,
@@ -547,6 +583,7 @@ fn worker_loop(
                         ),
                     },
                     other @ (ClientMessage::VideoStreamStart { .. }
+                    | ClientMessage::PageDemand { .. }
                     | ClientMessage::VideoStreamControl { .. }
                     | ClientMessage::VideoStreamSeek { .. }
                     | ClientMessage::VideoStreamThumbnail { .. }
@@ -594,6 +631,7 @@ fn home_worker_loop(
                 enqueued_at,
                 _prefetch_permit,
                 session_operation,
+                page_job,
             }) => execute_work(
                 message,
                 reply,
@@ -601,7 +639,8 @@ fn home_worker_loop(
                 metrics,
                 "home-0",
                 session_operation,
-                |message, _cancel| match message {
+                page_job,
+                |message, _cancel, _page_job| match message {
                     ClientMessage::Home { id, .. } => ServerMessage::Home {
                         id,
                         response: collection_engine.home(),
@@ -1068,44 +1107,113 @@ fn execute_work(
     metrics: &QueueMetrics,
     worker: &str,
     session_operation: SessionOperation,
-    handler: impl FnOnce(ClientMessage, Arc<AtomicBool>) -> ServerMessage,
+    page_job: Option<PageJobWork>,
+    handler: impl FnOnce(ClientMessage, Arc<AtomicBool>, Option<&PageJobWork>) -> ServerMessage,
 ) {
     let request_id = message.id();
-    let request_kind = request_kind(&message);
+    let request_kind = match (&message, page_job.as_ref()) {
+        (ClientMessage::Page { .. }, Some(page_job)) => match effective_page_priority(page_job) {
+            PagePriority::Foreground => "page_foreground",
+            PagePriority::Prefetch => "page_prefetch",
+        },
+        _ => request_kind(&message),
+    };
     let (queued, active) = metrics.started();
+    let registry_fields = page_registry_log_fields(page_job.as_ref());
     crate::logger::log(format!(
-        "remote_ipc: worker_start request_id={request_id} kind={request_kind} queue={} worker={worker} queue_wait_ms={:.1} queued={queued} active={active}",
+        "remote_ipc: worker_start request_id={request_id} kind={request_kind} queue={} worker={worker} queue_wait_ms={:.1} queued={queued} active={active}{registry_fields}",
         metrics.name,
         enqueued_at.elapsed().as_secs_f64() * 1000.0
     ));
     let started_at = Instant::now();
-    let response = if let Err(response) = session_operation.wait_until_active() {
-        ServerMessage::Session {
-            id: request_id,
-            response,
+    let response = if page_job
+        .as_ref()
+        .is_some_and(|page_job| page_job.cancel.load(Ordering::Acquire))
+    {
+        cancelled_page_response(request_id)
+    } else if let Err(response) = session_operation.wait_until_active() {
+        if page_job
+            .as_ref()
+            .is_some_and(|page_job| page_job.cancel.load(Ordering::Acquire))
+        {
+            cancelled_page_response(request_id)
+        } else {
+            ServerMessage::Session {
+                id: request_id,
+                response,
+            }
         }
     } else {
         session_operation.started();
-        handler(message, session_operation.cancel_flag())
+        handler(message, session_operation.cancel_flag(), page_job.as_ref())
     };
     let ownership = session_operation.ownership_response();
-    let response = if ownership.status == SessionStatus::Active {
-        response
-    } else {
-        ServerMessage::Session {
-            id: request_id,
-            response: ownership,
-        }
-    };
+    let response =
+        if is_cancelled_page_response(&response) || ownership.status == SessionStatus::Active {
+            response
+        } else {
+            ServerMessage::Session {
+                id: request_id,
+                response: ownership,
+            }
+        };
     let outcome = response_outcome(&response);
     session_operation.finish(outcome == "ok");
     let reply_ok = reply.send(response).is_ok();
     let (queued, active) = metrics.finished();
+    let registry_fields = page_registry_log_fields(page_job.as_ref());
     crate::logger::log(format!(
-        "remote_ipc: worker_complete request_id={request_id} kind={request_kind} queue={} worker={worker} outcome={outcome} duration_ms={:.1} reply_ok={reply_ok} queued={queued} active={active}",
+        "remote_ipc: worker_complete request_id={request_id} kind={request_kind} queue={} worker={worker} outcome={outcome} duration_ms={:.1} reply_ok={reply_ok} queued={queued} active={active}{registry_fields}",
         metrics.name,
         started_at.elapsed().as_secs_f64() * 1000.0
     ));
+}
+
+fn effective_page_priority(page_job: &PageJobWork) -> PagePriority {
+    match page_job
+        .registry
+        .priority(page_job.connection_id, &page_job.job_id)
+    {
+        Some(PageJobPriority::Foreground) => PagePriority::Foreground,
+        Some(PageJobPriority::Prefetch) | None => PagePriority::Prefetch,
+    }
+}
+
+fn cancelled_page_response(id: u64) -> ServerMessage {
+    ServerMessage::Page {
+        id,
+        response: PageResponse::Error(MediaError::new(
+            MediaErrorCode::Cancelled,
+            "ページの表示需要がなくなったため処理を取り消しました",
+        )),
+    }
+}
+
+fn is_cancelled_page_response(response: &ServerMessage) -> bool {
+    matches!(
+        response,
+        ServerMessage::Page {
+            response: PageResponse::Error(MediaError {
+                code: MediaErrorCode::Cancelled,
+                ..
+            }),
+            ..
+        }
+    )
+}
+
+fn page_registry_log_fields(page_job: Option<&PageJobWork>) -> String {
+    let Some(page_job) = page_job else {
+        return String::new();
+    };
+    let snapshot = page_job.registry.snapshot();
+    format!(
+        " page_jobs_active={} page_jobs_released={} page_jobs_prefetch_active={} page_jobs_foreground_active={}",
+        snapshot.active(),
+        snapshot.released(),
+        snapshot.prefetch_active,
+        snapshot.foreground_active,
+    )
 }
 
 fn request_kind(message: &ClientMessage) -> &'static str {
@@ -1126,6 +1234,7 @@ fn request_kind(message: &ClientMessage) -> &'static str {
             PagePriority::Foreground => "page_foreground",
             PagePriority::Prefetch => "page_prefetch",
         },
+        ClientMessage::PageDemand { .. } => "page_demand",
         ClientMessage::RemoteAiStart { .. } => "remote_ai_start",
         ClientMessage::RemoteAiState { .. } => "remote_ai_state",
         ClientMessage::RemoteAiRecoverable { .. } => "remote_ai_recoverable",
@@ -1190,6 +1299,7 @@ fn message_owner(message: &ClientMessage) -> Option<&RemoteSessionIdentity> {
         | ClientMessage::Container { owner, .. }
         | ClientMessage::FolderList { owner, .. }
         | ClientMessage::Page { owner, .. }
+        | ClientMessage::PageDemand { owner, .. }
         | ClientMessage::RemoteAiStart { owner, .. }
         | ClientMessage::RemoteAiState { owner, .. }
         | ClientMessage::RemoteAiRecoverable { owner, .. }
@@ -1245,6 +1355,7 @@ fn operation_description(message: &ClientMessage) -> String {
             }
             _ => "ページをレンダリング中".to_owned(),
         },
+        ClientMessage::PageDemand { .. } => "ページ表示の需要を更新中".to_owned(),
         ClientMessage::RemoteAiStart { .. } => "remote AI job を開始中".to_owned(),
         ClientMessage::RemoteAiState { .. } => "remote AI job の状態を確認中".to_owned(),
         ClientMessage::RemoteAiRecoverable { .. } => "復帰可能な remote AI job を確認中".to_owned(),
@@ -1425,6 +1536,7 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
             response: PageResponse::Success(_),
             ..
         }
+        | ServerMessage::PageDemand { .. }
         | ServerMessage::RemoteAiStart {
             response: mimageviewer_ipc::RemoteAiStartResponse::Accepted(_),
             ..
@@ -1664,6 +1776,7 @@ fn acceptor_loop(
     prefetch_in_flight: Arc<AtomicUsize>,
     heavy_worker_count: usize,
     session: SessionHandle,
+    page_jobs: Arc<PageJobRegistry>,
     initial_pipe: PipeStream,
     index: usize,
 ) {
@@ -1714,6 +1827,7 @@ fn acceptor_loop(
         let stream_metrics = Arc::clone(&stream_metrics);
         let prefetch_in_flight = Arc::clone(&prefetch_in_flight);
         let session = session.clone();
+        let page_jobs = Arc::clone(&page_jobs);
         if let Err(error) = std::thread::Builder::new()
             .name(format!("remote-ipc-connection-{connection_id}"))
             .spawn(move || {
@@ -1731,6 +1845,7 @@ fn acceptor_loop(
                     prefetch_in_flight,
                     heavy_worker_count,
                     session,
+                    page_jobs,
                 )
             })
         {
@@ -1758,6 +1873,7 @@ fn handle_connection(
     prefetch_in_flight: Arc<AtomicUsize>,
     heavy_worker_count: usize,
     session: SessionHandle,
+    page_jobs: Arc<PageJobRegistry>,
 ) {
     let _lifecycle = ConnectionLifecycle {
         id: connection_id,
@@ -1889,6 +2005,24 @@ fn handle_connection(
                     Err(response) => response,
                 };
                 let _ = reply_tx.send(ServerMessage::Session { id: *id, response });
+                continue;
+            }
+            ClientMessage::PageDemand { id, owner, request } => {
+                let response = match session
+                    .begin_operation(owner, "ページ表示の需要を更新中".to_owned())
+                {
+                    Ok(operation) => match operation.wait_until_active() {
+                        Ok(()) => {
+                            operation.started();
+                            let response = apply_page_demand(&page_jobs, connection_id, request);
+                            operation.finish(true);
+                            ServerMessage::PageDemand { id: *id, response }
+                        }
+                        Err(response) => ServerMessage::Session { id: *id, response },
+                    },
+                    Err(response) => ServerMessage::Session { id: *id, response },
+                };
+                let _ = reply_tx.send(response);
                 continue;
             }
             ClientMessage::RemoteAiStart {
@@ -2213,6 +2347,60 @@ fn handle_connection(
                     continue;
                 }
             };
+        let page_job = if let ClientMessage::Page { request, .. } = &message {
+            let job_id = PageJobId::from(request.job_id.clone());
+            let priority = match request.priority {
+                PagePriority::Foreground => PageJobPriority::Foreground,
+                PagePriority::Prefetch => PageJobPriority::Prefetch,
+            };
+            let display_request_id = request
+                .display_request_id
+                .clone()
+                .map(DisplayRequestId::from);
+            let cancel = match page_jobs.register(
+                connection_id,
+                job_id.clone(),
+                display_request_id,
+                priority,
+            ) {
+                Ok(cancel) => cancel,
+                Err(RegisterPageJobError::DuplicateJob) => {
+                    let _ = reply_tx.send(ServerMessage::Page {
+                        id: request_id,
+                        response: PageResponse::Error(MediaError::new(
+                            MediaErrorCode::BadRequest,
+                            "page job identity is already registered",
+                        )),
+                    });
+                    drop(session_operation);
+                    continue;
+                }
+            };
+            // A drain can win between begin_operation and registry registration. Mirror the
+            // already-set session token into the sole render cancellation token in that race.
+            if session_operation.cancel_flag().load(Ordering::Acquire) {
+                page_jobs.release(
+                    connection_id,
+                    &job_id,
+                    PageJobCancelCause::SessionInvalidated,
+                );
+            }
+            let page_job = PageJobWork {
+                registry: Arc::clone(&page_jobs),
+                connection_id,
+                job_id,
+                cancel,
+            };
+            if page_job.cancel.load(Ordering::Acquire) {
+                let _ = reply_tx.send(cancelled_page_response(request_id));
+                drop(page_job);
+                drop(session_operation);
+                continue;
+            }
+            Some(page_job)
+        } else {
+            None
+        };
         let prefetch_permit = if matches!(
             message,
             ClientMessage::Page {
@@ -2253,6 +2441,7 @@ fn handle_connection(
             reply_tx.clone(),
             prefetch_permit,
             session_operation,
+            page_job,
         ) {
             Ok(()) => {
                 let (queued, active) = metrics.snapshot();
@@ -2287,6 +2476,110 @@ fn handle_connection(
     let _ = writer.join();
 }
 
+fn apply_page_demand(
+    registry: &PageJobRegistry,
+    connection_id: u64,
+    request: &mimageviewer_ipc::PageDemandRequest,
+) -> mimageviewer_ipc::PageDemandResponse {
+    let promote = request
+        .promote
+        .iter()
+        .map(|promotion| {
+            let job_id = PageJobId::from(promotion.job.clone());
+            // A promote may overtake the GET and is intentionally best-effort. Losing it only
+            // leaves that request at its initial prefetch priority; release uses tombstones
+            // because losing cancellation would violate ownership.
+            let status = match registry.promote(
+                connection_id,
+                &job_id,
+                DisplayRequestId::from(promotion.display.clone()),
+            ) {
+                PromotePageJobResult::Promoted => {
+                    mimageviewer_ipc::PageDemandPromoteStatus::Promoted
+                }
+                PromotePageJobResult::AlreadyForeground => {
+                    mimageviewer_ipc::PageDemandPromoteStatus::AlreadyForeground
+                }
+                PromotePageJobResult::AlreadyReleased { cause } => {
+                    mimageviewer_ipc::PageDemandPromoteStatus::AlreadyReleased {
+                        cause: page_cancel_cause_to_ipc(cause),
+                    }
+                }
+                PromotePageJobResult::UnknownJob => {
+                    mimageviewer_ipc::PageDemandPromoteStatus::UnknownJob
+                }
+            };
+            mimageviewer_ipc::PageDemandPromoteResult {
+                job: promotion.job.clone(),
+                status,
+            }
+        })
+        .collect();
+    let release = request
+        .release
+        .iter()
+        .map(|release| {
+            let job_id = PageJobId::from(release.job.clone());
+            let status = match registry.release(
+                connection_id,
+                &job_id,
+                page_cancel_cause_from_ipc(release.cause),
+            ) {
+                ReleasePageJobResult::Released => {
+                    mimageviewer_ipc::PageDemandReleaseStatus::Released
+                }
+                ReleasePageJobResult::AlreadyReleased { cause } => {
+                    mimageviewer_ipc::PageDemandReleaseStatus::AlreadyReleased {
+                        cause: page_cancel_cause_to_ipc(cause),
+                    }
+                }
+                ReleasePageJobResult::Tombstoned => {
+                    mimageviewer_ipc::PageDemandReleaseStatus::Tombstoned
+                }
+            };
+            mimageviewer_ipc::PageDemandReleaseResult {
+                job: release.job.clone(),
+                status,
+            }
+        })
+        .collect();
+    let snapshot = registry.snapshot();
+    crate::logger::log(format!(
+        "remote_ipc: page_demand connection_id={connection_id} promote={} release={} page_jobs_active={} page_jobs_released={} page_jobs_prefetch_active={} page_jobs_foreground_active={}",
+        request.promote.len(),
+        request.release.len(),
+        snapshot.active(),
+        snapshot.released(),
+        snapshot.prefetch_active,
+        snapshot.foreground_active,
+    ));
+    mimageviewer_ipc::PageDemandResponse { promote, release }
+}
+
+fn page_cancel_cause_from_ipc(cause: mimageviewer_ipc::PageCancelCause) -> PageJobCancelCause {
+    match cause {
+        mimageviewer_ipc::PageCancelCause::NoDemand => PageJobCancelCause::NoDemand,
+        mimageviewer_ipc::PageCancelCause::SessionInvalidated => {
+            PageJobCancelCause::SessionInvalidated
+        }
+        mimageviewer_ipc::PageCancelCause::ContextReset => PageJobCancelCause::ContextReset,
+        mimageviewer_ipc::PageCancelCause::ConnectionClosed => PageJobCancelCause::ConnectionClosed,
+        mimageviewer_ipc::PageCancelCause::ServiceStopping => PageJobCancelCause::ServiceStopping,
+    }
+}
+
+fn page_cancel_cause_to_ipc(cause: PageJobCancelCause) -> mimageviewer_ipc::PageCancelCause {
+    match cause {
+        PageJobCancelCause::NoDemand => mimageviewer_ipc::PageCancelCause::NoDemand,
+        PageJobCancelCause::SessionInvalidated => {
+            mimageviewer_ipc::PageCancelCause::SessionInvalidated
+        }
+        PageJobCancelCause::ContextReset => mimageviewer_ipc::PageCancelCause::ContextReset,
+        PageJobCancelCause::ConnectionClosed => mimageviewer_ipc::PageCancelCause::ConnectionClosed,
+        PageJobCancelCause::ServiceStopping => mimageviewer_ipc::PageCancelCause::ServiceStopping,
+    }
+}
+
 fn enqueue_work(
     work_tx: &mpsc::SyncSender<Work>,
     metrics: &QueueMetrics,
@@ -2294,6 +2587,7 @@ fn enqueue_work(
     reply: mpsc::Sender<ServerMessage>,
     prefetch_permit: Option<PrefetchPermit>,
     session_operation: SessionOperation,
+    page_job: Option<PageJobWork>,
 ) -> Result<(), mpsc::TrySendError<Work>> {
     metrics.reserve();
     let result = work_tx.try_send(Work::Request {
@@ -2302,6 +2596,7 @@ fn enqueue_work(
         enqueued_at: Instant::now(),
         _prefetch_permit: prefetch_permit,
         session_operation,
+        page_job,
     });
     if result.is_err() {
         metrics.rollback();
@@ -2348,7 +2643,8 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
         }
         ClientMessage::SessionAcquire { id, .. }
         | ClientMessage::SessionPing { id, .. }
-        | ClientMessage::SessionActivity { id, .. } => ServerMessage::Session {
+        | ClientMessage::SessionActivity { id, .. }
+        | ClientMessage::PageDemand { id, .. } => ServerMessage::Session {
             id: *id,
             response: session_response(
                 SessionStatus::NotAcquired,
@@ -2414,8 +2710,8 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
         ClientMessage::Page { id, .. } => ServerMessage::Page {
             id: *id,
             response: PageResponse::Error(MediaError::new(
-                MediaErrorCode::Internal,
-                "mIV 本体のページワーカーが停止しています",
+                MediaErrorCode::Cancelled,
+                "mIV 本体のページワーカー停止により処理を取り消しました",
             )),
         },
         ClientMessage::Write { id, .. } => ServerMessage::Write {
@@ -2531,7 +2827,8 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
         }
         ClientMessage::SessionAcquire { id, .. }
         | ClientMessage::SessionPing { id, .. }
-        | ClientMessage::SessionActivity { id, .. } => ServerMessage::Session {
+        | ClientMessage::SessionActivity { id, .. }
+        | ClientMessage::PageDemand { id, .. } => ServerMessage::Session {
             id: *id,
             response: session_response(
                 SessionStatus::NotAcquired,
@@ -3083,6 +3380,7 @@ mod tests {
             reply_tx,
             None,
             session_operation,
+            None,
         )
         .expect("Home request must enter its dedicated queue");
 
@@ -3117,6 +3415,77 @@ mod tests {
         drop(first);
         drop(second);
         assert_eq!(in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn page_demand_glue_promotes_then_releases_the_registered_lease() {
+        let registry = Arc::new(PageJobRegistry::new());
+        let job_id = PageJobId::from("page-job");
+        let cancel = registry
+            .register(7, job_id.clone(), None, PageJobPriority::Prefetch)
+            .unwrap();
+        let work = PageJobWork {
+            registry: Arc::clone(&registry),
+            connection_id: 7,
+            job_id,
+            cancel: Arc::clone(&cancel),
+        };
+
+        let promoted = apply_page_demand(
+            &registry,
+            7,
+            &mimageviewer_ipc::PageDemandRequest {
+                promote: vec![mimageviewer_ipc::PageDemandPromotion {
+                    job: "page-job".to_owned(),
+                    display: "display-1".to_owned(),
+                }],
+                release: Vec::new(),
+            },
+        );
+        assert_eq!(
+            promoted.promote[0].status,
+            mimageviewer_ipc::PageDemandPromoteStatus::Promoted
+        );
+        assert_eq!(effective_page_priority(&work), PagePriority::Foreground);
+        assert_eq!(
+            registry.display_request_id(7, &PageJobId::from("page-job")),
+            Some(DisplayRequestId::from("display-1"))
+        );
+
+        let released = apply_page_demand(
+            &registry,
+            7,
+            &mimageviewer_ipc::PageDemandRequest {
+                promote: Vec::new(),
+                release: vec![mimageviewer_ipc::PageDemandRelease {
+                    job: "page-job".to_owned(),
+                    cause: mimageviewer_ipc::PageCancelCause::NoDemand,
+                }],
+            },
+        );
+        assert_eq!(
+            released.release[0].status,
+            mimageviewer_ipc::PageDemandReleaseStatus::Released
+        );
+        assert!(cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn stopped_page_work_has_a_typed_cancelled_response() {
+        let response = service_stopped_response(&ClientMessage::Page {
+            id: 91,
+            owner: test_owner(),
+            request: mimageviewer_ipc::PageRequest {
+                job_id: "page-91".to_owned(),
+                display_request_id: Some("display-91".to_owned()),
+                address: mimageviewer_ipc::RemoteAddress::file("C:/Pictures/page.jpg"),
+                target_px: 2048,
+                priority: PagePriority::Foreground,
+                render_context: None,
+                adjustment_preview: None,
+            },
+        });
+        assert!(is_cancelled_page_response(&response));
     }
 
     #[test]

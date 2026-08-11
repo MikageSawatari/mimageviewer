@@ -347,7 +347,12 @@ test("a prefetch job promotes once and never demotes", () => {
     requestId: "first",
     groupKey: "group-first",
     keys: ["page"],
-  }), [{ type: "promote", jobId: job.jobId, keyId: "page" }]);
+  }), [{
+    type: "promote",
+    jobId: job.jobId,
+    keyId: "page",
+    requestId: "first",
+  }]);
   assert.deepEqual(coordinator.openDisplay({
     requestId: "second",
     groupKey: "group-second",
@@ -417,10 +422,15 @@ test("setPlan cancels active work but not a plan member that never started", () 
 
 test("prefetch admission gates only prefetch and resumes on a later mutation", () => {
   let admits = false;
+  const candidates = [];
   const coordinator = new PageDisplayCoordinator({
-    prefetchAdmits: () => admits,
+    prefetchAdmits: (keyId) => {
+      candidates.push(keyId);
+      return admits;
+    },
   });
   assert.deepEqual(coordinator.setPlan(["planned"]), []);
+  assert.deepEqual(candidates, ["planned"]);
   const foreground = coordinator.openDisplay({
     requestId: "display",
     groupKey: "group",
@@ -428,9 +438,30 @@ test("prefetch admission gates only prefetch and resumes on a later mutation", (
   });
   assert.equal(startFor(foreground, "foreground").priority, "foreground");
   assert.equal(startFor(foreground, "planned"), undefined);
+  assert.deepEqual(candidates, ["planned", "planned"]);
   admits = true;
   const resumed = coordinator.setPlan(["planned"]);
   assert.equal(startFor(resumed, "planned").priority, "prefetch");
+  assert.deepEqual(candidates, ["planned", "planned", "planned"]);
+});
+
+test("prefetch admission receives candidates in plan order and stops at the first refusal", () => {
+  const candidates = [];
+  const coordinator = new PageDisplayCoordinator({
+    prefetchConcurrency: 3,
+    prefetchAdmits: (keyId) => {
+      candidates.push(keyId);
+      return keyId !== "middle";
+    },
+  });
+
+  const effects = coordinator.setPlan(["near", "middle", "far"]);
+
+  assert.deepEqual(candidates, ["near", "middle"]);
+  assert.deepEqual(
+    effectsOf(effects, "start").map(({ keyId }) => keyId),
+    ["near"]
+  );
 });
 
 test("prefetch concurrency is bounded and the next plan member starts on settle", () => {

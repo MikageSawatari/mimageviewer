@@ -117,6 +117,7 @@ const {
   ImageViewer,
   LatestOnlyTaskQueue,
   LatestPageLoadQueue,
+  PageDemandAdapter,
   PageResourceCache,
   RemoteAiController,
   ViewerAdjustmentPanel,
@@ -1149,53 +1150,253 @@ test("page load queue rejects a current run error but hides an old failed result
   ]);
 });
 
+function adapterPageRequest(cacheKey) {
+  return {
+    cacheKey,
+    cacheable: true,
+    url: "/api/page?generation=test-1&w=1024",
+    address: TEST_PAGE_ADDRESS,
+    remoteStateGeneration: "test-1",
+    remoteSessionId: TEST_SESSION_ID,
+    width: 1024,
+  };
+}
+
+function pendingPageFetch(started) {
+  return (request, signal, prefetch) => {
+    started.push({ request, signal, prefetch });
+    return new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        const error = new Error("Aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    });
+  };
+}
+
+async function waitForAdapterIdle(adapter) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if (adapter.jobs.size === 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.equal(adapter.jobs.size, 0, "page jobs did not settle");
+}
+
+test("display leases are all registered before the first page fetch begins", () => {
+  const cache = new PageResourceCache(8, 1024 * 1024);
+  let adapter;
+  const protectedAtStart = [];
+  adapter = new PageDemandAdapter({
+    cache,
+    wirePrefix: "test",
+    fetchResource: (_request, _signal, _prefetch) => {
+      protectedAtStart.push(adapter.coordinator.protectedKeyIds());
+      return new Promise(() => {});
+    },
+    postDemand: async () => ({}),
+  });
+  const requests = [adapterPageRequest("left"), adapterPageRequest("right")];
+  adapter.openDisplay({
+    requestId: "spread",
+    groupKey: "spread-group",
+    requests,
+  });
+
+  assert.deepEqual(protectedAtStart, [
+    ["left", "right"],
+    ["left", "right"],
+  ]);
+  adapter.releaseDisplay("spread");
+});
+
+test("releasing one overlapping display does not cancel their shared page job", async () => {
+  const started = [];
+  const demandBodies = [];
+  const cache = new PageResourceCache(8, 1024 * 1024);
+  const adapter = new PageDemandAdapter({
+    cache,
+    wirePrefix: "test",
+    fetchResource: pendingPageFetch(started),
+    postDemand: async (body) => { demandBodies.push(body); },
+  });
+  const request = adapterPageRequest("shared");
+  adapter.openDisplay({ requestId: "first", groupKey: "g1", requests: [request] });
+  adapter.openDisplay({ requestId: "second", groupKey: "g2", requests: [request] });
+
+  adapter.releaseDisplay("first");
+  await Promise.resolve();
+  assert.equal(started[0].signal.aborted, false);
+  assert.deepEqual(demandBodies, []);
+
+  adapter.releaseDisplay("second");
+  await Promise.resolve();
+  assert.equal(started[0].signal.aborted, true);
+  assert.deepEqual(demandBodies, [{
+    promote: [],
+    release: [{ job: "test-j1", cause: "no_demand" }],
+  }]);
+});
+
+test("a planned prefetch promotes once and batches the display identity", async () => {
+  const started = [];
+  const demandBodies = [];
+  const cache = new PageResourceCache(8, 1024 * 1024);
+  const adapter = new PageDemandAdapter({
+    cache,
+    wirePrefix: "test",
+    fetchResource: pendingPageFetch(started),
+    postDemand: async (body) => { demandBodies.push(body); },
+  });
+  const request = adapterPageRequest("planned");
+  adapter.setPlan([request]);
+  adapter.openDisplay({ requestId: "reader-1", groupKey: "g1", requests: [request] });
+  adapter.openDisplay({ requestId: "reader-2", groupKey: "g2", requests: [request] });
+  await Promise.resolve();
+
+  assert.equal(started.length, 1);
+  assert.equal(started[0].prefetch, true);
+  assert.match(started[0].request.url, /[?&]job=test-j1(?:&|$)/);
+  assert.deepEqual(demandBodies, [{
+    promote: [{ job: "test-j1", display: "test-dreader-1" }],
+    release: [],
+  }]);
+
+  adapter.releaseDisplay("reader-1");
+  adapter.releaseDisplay("reader-2");
+  adapter.setPlan([]);
+});
+
+test("only jobs whose final demand disappears are released in one tick", async () => {
+  const started = [];
+  const demandBodies = [];
+  const cache = new PageResourceCache(8, 1024 * 1024);
+  const adapter = new PageDemandAdapter({
+    cache,
+    wirePrefix: "test",
+    fetchResource: pendingPageFetch(started),
+    postDemand: async (body) => { demandBodies.push(body); },
+  });
+  const first = adapterPageRequest("first");
+  const kept = adapterPageRequest("kept");
+  adapter.setPlan([first, kept]);
+  adapter.setPlan([kept]);
+  await Promise.resolve();
+
+  assert.equal(started[0].signal.aborted, true);
+  assert.equal(started[1].signal.aborted, false);
+  assert.deepEqual(demandBodies, [{
+    promote: [],
+    release: [{ job: "test-j1", cause: "no_demand" }],
+  }]);
+  adapter.setPlan([]);
+});
+
+test("Cancelled 409 is terminal and never enters the busy retry loop", async () => {
+  let attempts = 0;
+  const cache = new PageResourceCache(8, 1024 * 1024);
+  const adapter = new PageDemandAdapter({
+    cache,
+    wirePrefix: "test",
+    fetchResource: async () => {
+      attempts += 1;
+      const error = new Error("cancelled");
+      error.status = 409;
+      error.code = "miv_media_error";
+      throw error;
+    },
+    postDemand: async () => ({}),
+  });
+  const request = adapterPageRequest("cancelled");
+  adapter.openDisplay({
+    requestId: "cancelled-display",
+    groupKey: "cancelled-group",
+    requests: [request],
+  });
+
+  await assert.rejects(adapter.waitForDisplay("cancelled-display"));
+  assert.equal(attempts, 1);
+  adapter.releaseDisplay("cancelled-display");
+});
+
+test("page byte retention stays bounded and protects coordinator-owned keys", () => {
+  const protectedKeys = new Set(["displayed"]);
+  const cache = new PageResourceCache(
+    2,
+    5,
+    () => [...protectedKeys]
+  );
+  const resource = (name) => ({
+    blob: new Blob([new Uint8Array(3)]),
+    requestId: name,
+    fetchMs: 1,
+  });
+  cache.remember("displayed", resource("displayed"));
+  cache.remember("old", resource("old"));
+  cache.remember("new", resource("new"));
+
+  assert.equal(cache.hasBytes("displayed"), true);
+  assert.equal(cache.hasBytes("old"), false);
+  assert.equal(cache.hasBytes("new"), false);
+  assert.ok(cache.ready.size <= 2);
+  assert.ok(cache.readyBytes <= 6);
+  cache.clear();
+});
+
 test("deep page prefetch stops at the byte budget and resumes after protection moves", async () => {
   const started = [];
-  const requests = Array.from({ length: 18 }, (_, index) => ({
-    cacheKey: `page-${index}`,
-  }));
-  const fetchResource = async (request, _signal, prefetch) => {
-    started.push({ cacheKey: request.cacheKey, prefetch });
-    return {
-      blob: new Blob([new Uint8Array(3)]),
-      requestId: `request-${request.cacheKey}`,
-      fetchMs: 1,
-      pageRenderMs: 0.5,
-      info: null,
-    };
-  };
-  const cache = new PageResourceCache(18, 5, 1, fetchResource);
+  const requests = Array.from({ length: 18 }, (_, index) =>
+    adapterPageRequest(`page-${index}`)
+  );
+  const cache = new PageResourceCache(18, 5);
+  const adapter = new PageDemandAdapter({
+    cache,
+    prefetchConcurrency: 1,
+    wirePrefix: "budget",
+    fetchResource: async (request, _signal, prefetch) => {
+      started.push({ cacheKey: request.cacheKey, prefetch });
+      return {
+        blob: new Blob([new Uint8Array(3)]),
+        requestId: `request-${request.cacheKey}`,
+        fetchMs: 1,
+        pageRenderMs: 0.5,
+        info: null,
+      };
+    },
+    postDemand: async () => ({}),
+  });
 
-  cache.schedule(requests.slice(0, 16), []);
-  for (let attempt = 0; attempt < 20 && cache.active.size > 0; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  }
+  adapter.setPlan(requests.slice(0, 16));
+  await waitForAdapterIdle(adapter);
   assert.deepEqual(started.map(({ cacheKey }) => cacheKey), ["page-0", "page-1"]);
-  assert.equal(cache.pending.length, 14, "the deep 12/4 window must remain planned");
   assert.equal(cache.readyBytes, 6);
 
-  cache.schedule(requests.slice(2, 18), ["page-1"]);
-  for (let attempt = 0; attempt < 20 && cache.active.size > 0; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  }
+  adapter.openDisplay({
+    requestId: "display-page-1",
+    groupKey: "display-page-1",
+    requests: [requests[1]],
+  });
+  await adapter.waitForDisplay("display-page-1");
+  adapter.commitDisplay("display-page-1");
+  adapter.setPlan(requests.slice(2, 18));
+  await waitForAdapterIdle(adapter);
+
   assert.deepEqual(started.map(({ cacheKey }) => cacheKey), [
     "page-0",
     "page-1",
     "page-2",
   ]);
-  assert.equal(cache.ready.has("page-0"), false, "oldest unprotected page is evicted");
-  assert.equal(cache.ready.has("page-1"), true, "the displayed page stays protected");
-
-  const displayed = await cache.loadForeground(
-    requests[1],
-    new AbortController().signal
-  );
-  assert.equal(displayed.prefetchStatus, "hit");
+  assert.equal(cache.hasBytes("page-0"), false, "oldest unprotected page is evicted");
+  assert.equal(cache.hasBytes("page-1"), true, "the displayed page stays protected");
+  assert.equal(adapter.resourceForKey("page-1").requestId, "request-page-1");
   assert.equal(
     started.filter(({ cacheKey }) => cacheKey === "page-1").length,
     1,
     "a protected fetched page must not be discarded and fetched again"
   );
+
+  adapter.releaseDisplay("display-page-1");
+  adapter.setPlan([]);
   cache.clear();
 });
 
@@ -1207,27 +1408,33 @@ test("full byte budget evicts a farther planned page before fetching a nearer on
     fetchMs: 1,
     info: null,
   });
-  const cache = new PageResourceCache(18, 5, 1, async (request) => {
-    started.push(request.cacheKey);
-    return resource(request.cacheKey);
-  });
+  const cache = new PageResourceCache(18, 5);
   cache.ready.set("nearer", resource("nearer"));
   cache.ready.set("farther", resource("farther"));
   cache.readyBytes = 6;
+  const adapter = new PageDemandAdapter({
+    cache,
+    prefetchConcurrency: 1,
+    wirePrefix: "near",
+    fetchResource: async (request) => {
+      started.push(request.cacheKey);
+      return resource(request.cacheKey);
+    },
+    postDemand: async () => ({}),
+  });
 
-  cache.schedule([
-    { cacheKey: "nearer" },
-    { cacheKey: "target" },
-    { cacheKey: "farther" },
+  adapter.setPlan([
+    adapterPageRequest("nearer"),
+    adapterPageRequest("target"),
+    adapterPageRequest("farther"),
   ]);
-  for (let attempt = 0; attempt < 20 && cache.active.size > 0; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  }
+  await waitForAdapterIdle(adapter);
 
   assert.deepEqual(started, ["target"]);
-  assert.equal(cache.ready.has("nearer"), true);
-  assert.equal(cache.ready.has("target"), true);
-  assert.equal(cache.ready.has("farther"), false);
+  assert.equal(cache.hasBytes("nearer"), true);
+  assert.equal(cache.hasBytes("target"), true);
+  assert.equal(cache.hasBytes("farther"), false);
+  adapter.setPlan([]);
   cache.clear();
 });
 
@@ -1239,243 +1446,166 @@ test("full byte budget never evicts a nearer page to start a farther request", (
     info: null,
   });
   const started = [];
-  const cache = new PageResourceCache(18, 5, 1, async (request) => {
-    started.push(request.cacheKey);
-    return resource(request.cacheKey);
-  });
+  const cache = new PageResourceCache(18, 5);
   cache.ready.set("near-1", resource("near-1"));
   cache.ready.set("near-2", resource("near-2"));
   cache.readyBytes = 6;
+  const adapter = new PageDemandAdapter({
+    cache,
+    prefetchConcurrency: 1,
+    wirePrefix: "far",
+    fetchResource: async (request) => {
+      started.push(request.cacheKey);
+      return resource(request.cacheKey);
+    },
+    postDemand: async () => ({}),
+  });
 
-  cache.schedule([
-    { cacheKey: "near-1" },
-    { cacheKey: "near-2" },
-    { cacheKey: "far-target" },
+  adapter.setPlan([
+    adapterPageRequest("near-1"),
+    adapterPageRequest("near-2"),
+    adapterPageRequest("far-target"),
   ]);
 
   assert.deepEqual(started, []);
-  assert.equal(cache.pending.length, 1);
-  assert.equal(cache.ready.has("near-1"), true);
-  assert.equal(cache.ready.has("near-2"), true);
+  assert.equal(adapter.jobs.size, 0);
+  assert.equal(cache.hasBytes("near-1"), true);
+  assert.equal(cache.hasBytes("near-2"), true);
+  adapter.setPlan([]);
   cache.clear();
 });
 
-test("page resource cache reports HUD states and notifies start completion and discard", async () => {
-  const firstGate = deferred();
-  const events = [];
-  const fetchResource = (request, signal) => {
-    if (request.cacheKey === "ready-page") return firstGate.promise;
-    return new Promise((_resolve, reject) => {
-      signal.addEventListener("abort", () => {
-        const error = new Error("Aborted");
-        error.name = "AbortError";
-        reject(error);
-      }, { once: true });
+test("retained pages stay bounded even when the prefetch plan is empty", async () => {
+  const cache = new PageResourceCache(4, 10);
+  const adapter = new PageDemandAdapter({
+    cache,
+    wirePrefix: "single",
+    fetchResource: async (request) => ({
+      blob: new Blob([new Uint8Array(4)]),
+      requestId: `request-${request.cacheKey}`,
+      fetchMs: 1,
+      info: null,
+    }),
+    postDemand: async () => ({}),
+  });
+  let finalRequestId = null;
+  for (let index = 0; index < 6; index += 1) {
+    const requestId = `single-display-${index}`;
+    finalRequestId = requestId;
+    adapter.openDisplay({
+      requestId,
+      groupKey: requestId,
+      requests: [adapterPageRequest(`single-${index}`)],
     });
-  };
+    await adapter.waitForDisplay(requestId);
+    adapter.commitDisplay(requestId);
+    adapter.setPlan([]);
+  }
+
+  assert.ok(cache.ready.size <= 4, `retained ${cache.ready.size} entries`);
+  assert.ok(cache.readyBytes <= 14, `retained ${cache.readyBytes} bytes`);
+  assert.equal(cache.hasBytes("single-5"), true);
+  adapter.releaseDisplay(finalRequestId);
+  cache.clear();
+});
+
+test("a foreground admission retry stops when its own load is aborted", async () => {
+  const firstAttempt = deferred();
+  let attempts = 0;
+  const cache = new PageResourceCache(4, 1024);
+  const adapter = new PageDemandAdapter({
+    cache,
+    wirePrefix: "abort-retry",
+    fetchResource: async () => {
+      attempts += 1;
+      firstAttempt.resolve();
+      const error = new Error("busy");
+      error.status = 503;
+      error.code = "ipc_busy";
+      error.retryAfterMs = 10_000;
+      throw error;
+    },
+    postDemand: async () => ({}),
+  });
+  adapter.openDisplay({
+    requestId: "aborted-display",
+    groupKey: "aborted-group",
+    requests: [adapterPageRequest("aborted")],
+  });
+  const waiting = adapter.waitForDisplay("aborted-display");
+  await firstAttempt.promise;
+  adapter.releaseDisplay("aborted-display");
+
+  await assert.rejects(waiting, (error) => error.name === "AbortError");
+  await waitForAdapterIdle(adapter);
+  assert.equal(attempts, 1);
+  cache.clear();
+});
+
+test("page demand adapter reports HUD states and refreshes on start settle cancel and evict", async () => {
+  const readyGate = deferred();
+  let hudRefreshes = 0;
+  const cacheEvents = [];
   const cache = new PageResourceCache(
     4,
     1024,
-    1,
-    fetchResource,
-    (event) => events.push(event)
-  );
-
-  cache.schedule([{ cacheKey: "ready-page" }]);
-  assert.deepEqual(
-    cache.statusForKeys(["ready-page", "absent-page"]),
-    ["active", "missing"]
-  );
-  firstGate.resolve({ blob: new Blob(["ready"]), requestId: "ready", fetchMs: 1 });
-  for (let attempt = 0; attempt < 20 && cache.active.size > 0; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  }
-  assert.deepEqual(cache.statusForKeys(["ready-page"]), ["ready"]);
-
-  cache.schedule([{ cacheKey: "discarded-page" }]);
-  assert.deepEqual(cache.statusForKeys(["discarded-page"]), ["active"]);
-  cache.schedule([]);
-  assert.deepEqual(cache.statusForKeys(["discarded-page"]), ["missing"]);
-  for (
-    let attempt = 0;
-    attempt < 20 && !events.some((event) => event.type === "discard");
-    attempt += 1
-  ) {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  }
-  assert.ok(events.some((event) => event.type === "start" && event.key === "ready-page"));
-  assert.ok(events.some((event) => event.type === "ready" && event.key === "ready-page"));
-  assert.ok(events.some((event) => event.type === "discard" && event.key === "discarded-page"));
-  cache.clear();
-});
-
-test("foreground page load aborts unrelated concurrent prefetches and starts immediately", async () => {
-  const started = [];
-  const aborted = [];
-  const fetchResource = (request, signal, prefetch) => {
-    started.push({ cacheKey: request.cacheKey, prefetch });
-    if (!prefetch) {
-      return Promise.resolve({
-        blob: new Blob([request.cacheKey]),
-        requestId: `foreground-${request.cacheKey}`,
-        fetchMs: 1,
-        info: null,
-      });
+    () => [],
+    (event) => {
+      cacheEvents.push(event);
+      hudRefreshes += 1;
     }
-    return new Promise((_resolve, reject) => {
-      signal.addEventListener("abort", () => {
-        aborted.push(request.cacheKey);
-        const error = new Error("Aborted");
-        error.name = "AbortError";
-        reject(error);
-      }, { once: true });
-    });
-  };
-  const cache = new PageResourceCache(12, 48 * 1024 * 1024, 2, fetchResource);
-  cache.schedule([{ cacheKey: "prefetch-a" }, { cacheKey: "prefetch-b" }]);
-  assert.deepEqual(started, [
-    { cacheKey: "prefetch-a", prefetch: true },
-    { cacheKey: "prefetch-b", prefetch: true },
-  ]);
-
-  const foreground = await cache.loadForeground(
-    { cacheKey: "foreground" },
-    new AbortController().signal
   );
-  assert.equal(foreground.prefetchStatus, "miss");
-  assert.deepEqual(aborted.sort(), ["prefetch-a", "prefetch-b"]);
-  assert.deepEqual(started.at(-1), { cacheKey: "foreground", prefetch: false });
-  cache.clear();
-});
+  const adapter = new PageDemandAdapter({
+    cache,
+    wirePrefix: "hud",
+    fetchResource: (request, signal) => {
+      if (request.cacheKey === "ready-page") return readyGate.promise;
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => {
+          const error = new Error("Aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+    },
+    postDemand: async () => ({}),
+    onStatusChange: () => { hudRefreshes += 1; },
+  });
 
-test("foreground joined prefetch survives a schedule that no longer includes its key", async () => {
-  let resolvePrefetch;
-  let prefetchAborted = false;
-  const request = { cacheKey: "joined-page" };
-  const resource = {
-    blob: new Blob([request.cacheKey]),
-    requestId: "prefetch-joined-page",
-    fetchMs: 1,
-    info: null,
-  };
-  const fetchResource = (_request, signal, prefetch) => {
-    assert.equal(prefetch, true);
-    return new Promise((resolve, reject) => {
-      resolvePrefetch = resolve;
-      signal.addEventListener("abort", () => {
-        prefetchAborted = true;
-        const error = new Error("Aborted");
-        error.name = "AbortError";
-        reject(error);
-      }, { once: true });
-    });
-  };
-  const cache = new PageResourceCache(12, 48 * 1024 * 1024, 1, fetchResource);
-  cache.schedule([request]);
+  adapter.setPlan([adapterPageRequest("ready-page")]);
+  assert.deepEqual(adapter.statusForKeys(["ready-page", "absent-page"]), [
+    "active",
+    "missing",
+  ]);
+  const afterStart = hudRefreshes;
+  assert.ok(afterStart > 0);
 
-  const foreground = cache.loadForeground(request, new AbortController().signal);
-  cache.schedule([]);
-  resolvePrefetch(resource);
-
-  assert.deepEqual(await foreground, { ...resource, prefetchStatus: "in_flight" });
-  assert.equal(prefetchAborted, false);
-  cache.clear();
-});
-
-test("unjoined prefetch is still aborted when its key leaves the schedule", async () => {
-  let prefetchAborted = false;
-  let observeAbort;
-  const aborted = new Promise((resolve) => { observeAbort = resolve; });
-  const fetchResource = (_request, signal, prefetch) => {
-    assert.equal(prefetch, true);
-    return new Promise((_resolve, reject) => {
-      signal.addEventListener("abort", () => {
-        prefetchAborted = true;
-        observeAbort();
-        const error = new Error("Aborted");
-        error.name = "AbortError";
-        reject(error);
-      }, { once: true });
-    });
-  };
-  const cache = new PageResourceCache(12, 48 * 1024 * 1024, 1, fetchResource);
-  cache.schedule([{ cacheKey: "prefetch-only" }]);
-
-  cache.schedule([]);
-  await aborted;
-
-  assert.equal(prefetchAborted, true);
-  cache.clear();
-});
-
-test("foreground abort still cancels its own wait on a joined prefetch", async () => {
-  let resolvePrefetch;
-  let prefetchAborted = false;
-  const request = { cacheKey: "foreground-abort" };
-  const fetchResource = (_request, signal, prefetch) => {
-    assert.equal(prefetch, true);
-    return new Promise((resolve, reject) => {
-      resolvePrefetch = resolve;
-      signal.addEventListener("abort", () => {
-        prefetchAborted = true;
-        const error = new Error("Aborted");
-        error.name = "AbortError";
-        reject(error);
-      }, { once: true });
-    });
-  };
-  const cache = new PageResourceCache(12, 48 * 1024 * 1024, 1, fetchResource);
-  cache.schedule([request]);
-  const controller = new AbortController();
-  const foreground = cache.loadForeground(request, controller.signal);
-
-  controller.abort();
-  await assert.rejects(foreground, { name: "AbortError" });
-  assert.equal(prefetchAborted, false, "foreground abort must not take ownership of the shared fetch");
-
-  resolvePrefetch({
-    blob: new Blob([request.cacheKey]),
-    requestId: "prefetch-foreground-abort",
+  readyGate.resolve({
+    blob: new Blob(["ready"]),
+    requestId: "ready",
     fetchMs: 1,
     info: null,
   });
-  await Promise.resolve();
+  await waitForAdapterIdle(adapter);
+  assert.deepEqual(adapter.statusForKeys(["ready-page"]), ["ready"]);
+  assert.ok(hudRefreshes > afterStart, "settle refreshes the HUD");
+  assert.ok(cacheEvents.some((event) => event.type === "ready"));
+
+  adapter.setPlan([adapterPageRequest("discarded-page")]);
+  assert.deepEqual(adapter.statusForKeys(["discarded-page"]), ["active"]);
+  const beforeCancel = hudRefreshes;
+  adapter.setPlan([]);
+  assert.deepEqual(adapter.statusForKeys(["discarded-page"]), ["missing"]);
+  assert.ok(hudRefreshes > beforeCancel, "cancel refreshes the HUD");
+  await waitForAdapterIdle(adapter);
+
+  const beforeEvict = hudRefreshes;
+  assert.equal(cache.deleteReady("ready-page"), true);
+  assert.deepEqual(adapter.statusForKeys(["ready-page"]), ["missing"]);
+  assert.ok(hudRefreshes > beforeEvict, "eviction refreshes the HUD");
+  assert.ok(cacheEvents.some((event) => event.type === "evict"));
   cache.clear();
 });
-
-test("foreground join does not inherit a temporary prefetch admission failure", async () => {
-  let rejectPrefetch;
-  const started = [];
-  const request = { cacheKey: "prefetch-busy" };
-  const fetchResource = (_request, _signal, prefetch) => {
-    started.push(prefetch);
-    if (!prefetch) {
-      return Promise.resolve({
-        blob: new Blob([request.cacheKey]),
-        requestId: "foreground-after-busy",
-        fetchMs: 1,
-        info: null,
-      });
-    }
-    return new Promise((_resolve, reject) => { rejectPrefetch = reject; });
-  };
-  const cache = new PageResourceCache(12, 48 * 1024 * 1024, 1, fetchResource);
-  cache.schedule([request]);
-  const foreground = cache.loadForeground(request, new AbortController().signal);
-
-  const error = new Error("Busy");
-  error.status = 503;
-  error.code = "ipc_busy";
-  error.retryAfterMs = 100;
-  rejectPrefetch(error);
-
-  const result = await foreground;
-  assert.equal(result.prefetchStatus, "miss");
-  assert.equal(result.requestId, "foreground-after-busy");
-  assert.deepEqual(started, [true, false]);
-  cache.clear();
-});
-
 test("remote adjustment normalization keeps valid local slider defaults and bounds", () => {
   assert.deepEqual(normalizeRemoteAdjustmentValues(), {
     brightness: 0,
@@ -2070,7 +2200,7 @@ test("viewer generation invalidation cancels fetch and rejects a late decode rep
     loadingIndicator,
   });
   let aborted = false;
-  viewer.fetchController = { abort() { aborted = true; } };
+  viewer.legacyFetchController = { abort() { aborted = true; } };
   viewer.loadSequence = 7;
   viewer.loadingTimer = setTimeout(() => {}, 1000);
 
@@ -2078,7 +2208,7 @@ test("viewer generation invalidation cancels fetch and rejects a late decode rep
 
   assert.equal(viewer.loadSequence, 8);
   assert.equal(aborted, true);
-  assert.equal(viewer.fetchController, null);
+  assert.equal(viewer.legacyFetchController, null);
   assert.equal(viewer.loadingTimer, 0);
   assert.equal(loadingIndicator.hidden, true);
 });
@@ -2986,71 +3116,69 @@ test("standalone reload is local and preserves the current hash", () => {
   assert.equal(testLocation.hash, "#image/C%3A%2Fmiv-test%2Fbook%2F002.jpg");
 });
 
-test("retained pages stay bounded even when the prefetch plan is empty", async () => {
-  // 1 ページだけのコンテナを順に開くと計画が空になり、pump() は開始枠が無いので
-  // 早期 return する。保持だけが増え続けないことを固定する。
-  const page = (size) => ({ blob: { size }, requestId: null, fetchMs: 1 });
-  const cache = new PageResourceCache(4, 10, 1, async () => page(4));
-  for (let index = 0; index < 6; index += 1) {
-    const request = { cacheKey: `single-${index}` };
-    await cache.loadForeground(request, undefined);
-    cache.schedule([], [request.cacheKey]);
-  }
-  assert.ok(cache.ready.size <= 4, `retained ${cache.ready.size} entries`);
-  assert.ok(cache.readyBytes <= 10 + 4, `retained ${cache.readyBytes} bytes`);
-  // 直前に表示したページは保護されているので残る。
-  assert.equal(cache.ready.has("single-5"), true);
-  cache.clear();
-});
-
-test("a displayed page retries a momentary admission refusal instead of failing", async () => {
-  const busy = () => {
-    const error = new Error("busy");
-    error.status = 503;
-    error.code = "ipc_busy";
-    error.retryAfterMs = 100;
-    return error;
-  };
+test("a coordinated display retries momentary admission refusal with the same lease", async () => {
   let attempts = 0;
-  const cache = new PageResourceCache(4, 1024, 1, async () => {
-    attempts += 1;
-    if (attempts < 3) throw busy();
-    return { blob: { size: 1 }, requestId: "ok", fetchMs: 1 };
+  const cache = new PageResourceCache(4, 1024);
+  const adapter = new PageDemandAdapter({
+    cache,
+    wirePrefix: "retry",
+    fetchResource: async (request) => {
+      attempts += 1;
+      assert.match(request.url, /[?&]job=retry-j1(?:&|$)/);
+      if (attempts < 3) {
+        const error = new Error("busy");
+        error.status = 503;
+        error.code = "ipc_busy";
+        error.retryAfterMs = 1;
+        throw error;
+      }
+      return {
+        blob: new Blob(["ready"]),
+        requestId: "ok",
+        fetchMs: 1,
+        info: null,
+      };
+    },
+    postDemand: async () => ({}),
   });
-  const resource = await cache.loadForeground({ cacheKey: "retry" }, undefined);
-  assert.equal(resource.requestId, "ok");
+  const request = adapterPageRequest("retry");
+  adapter.openDisplay({
+    requestId: "retry-display",
+    groupKey: "retry-group",
+    requests: [request],
+  });
+
+  await adapter.waitForDisplay("retry-display");
+  assert.equal(adapter.resourceForKey("retry").requestId, "ok");
   assert.equal(attempts, 3);
-  cache.clear();
-
-  let alwaysBusy = 0;
-  const givingUp = new PageResourceCache(4, 1024, 1, async () => {
-    alwaysBusy += 1;
-    throw busy();
-  });
-  await assert.rejects(
-    givingUp.loadForeground({ cacheKey: "give-up" }, undefined),
-    (error) => error.code === "ipc_busy"
-  );
-  // 無限に粘らない。
-  assert.equal(alwaysBusy, FOREGROUND_ADMISSION_RETRY_LIMIT + 1);
-  givingUp.clear();
+  assert.ok(attempts <= FOREGROUND_ADMISSION_RETRY_LIMIT + 1);
+  adapter.releaseDisplay("retry-display");
 });
 
-test("a foreground admission retry stops when its own load is aborted", async () => {
-  const controller = new AbortController();
-  let attempts = 0;
-  const cache = new PageResourceCache(4, 1024, 1, async () => {
-    attempts += 1;
-    controller.abort();
-    const error = new Error("busy");
-    error.status = 503;
-    error.code = "ipc_busy";
-    throw error;
-  });
-  await assert.rejects(
-    cache.loadForeground({ cacheKey: "aborted" }, controller.signal),
-    (error) => error.code === "ipc_busy"
+test("latest-only preview supersession exposes a cancellation hook", async () => {
+  const firstStarted = deferred();
+  const cancelled = [];
+  const queue = new LatestOnlyTaskQueue(
+    async (job) => {
+      if (job.id === "preview-2") return;
+      firstStarted.resolve();
+      await new Promise((resolve) => {
+        job.controller.signal.addEventListener("abort", resolve, { once: true });
+      });
+    },
+    () => {},
+    () => false,
+    (job) => {
+      job.controller.abort();
+      cancelled.push(job.id);
+    }
   );
-  assert.equal(attempts, 1);
-  cache.clear();
+  const first = { id: "preview-1", controller: new AbortController() };
+  const second = { id: "preview-2", controller: new AbortController() };
+  queue.enqueue(first);
+  await firstStarted.promise;
+  queue.enqueue(second);
+
+  assert.deepEqual(cancelled, ["preview-1"]);
+  assert.equal(first.controller.signal.aborted, true);
 });

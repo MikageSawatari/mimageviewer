@@ -1183,6 +1183,7 @@ pub(crate) struct SessionHandle {
     ai_bridge: Arc<Mutex<Option<RemoteAiExecutionBridge>>>,
     ai_jobs: Arc<Mutex<Weak<super::ai_job::RemoteAiJobRegistry>>>,
     archive_jobs: Arc<Mutex<Weak<super::archive_job::RemoteArchiveJobRegistry>>>,
+    page_jobs: Arc<Mutex<Weak<super::page_jobs::PageJobRegistry>>>,
     archive_cache_db: Arc<Mutex<Option<Arc<crate::archive_cache::ArchiveCacheDb>>>>,
 }
 
@@ -1282,6 +1283,7 @@ impl SessionHandle {
             ai_bridge: Arc::new(Mutex::new(None)),
             ai_jobs: Arc::new(Mutex::new(Weak::new())),
             archive_jobs: Arc::new(Mutex::new(Weak::new())),
+            page_jobs: Arc::new(Mutex::new(Weak::new())),
             archive_cache_db: Arc::new(Mutex::new(None)),
         }
     }
@@ -1314,6 +1316,20 @@ impl SessionHandle {
         &self,
     ) -> Option<Arc<super::archive_job::RemoteArchiveJobRegistry>> {
         self.archive_jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .upgrade()
+    }
+
+    pub(super) fn install_page_jobs(&self, jobs: &Arc<super::page_jobs::PageJobRegistry>) {
+        *self
+            .page_jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(jobs);
+    }
+
+    pub(super) fn page_job_registry(&self) -> Option<Arc<super::page_jobs::PageJobRegistry>> {
+        self.page_jobs
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .upgrade()
@@ -1415,6 +1431,7 @@ impl SessionHandle {
             (response, state.lifecycle.phase != phase)
         };
         if phase_changed {
+            self.notify_page_job_drain();
             self.clear_video_stream(None);
             self.notify_phase_changed();
             self.notify_ui();
@@ -1438,6 +1455,7 @@ impl SessionHandle {
             (result, state.lifecycle.phase != phase)
         };
         if phase_changed {
+            self.notify_page_job_drain();
             self.clear_video_stream(None);
             self.notify_phase_changed();
             self.notify_ui();
@@ -1599,6 +1617,12 @@ impl SessionHandle {
     }
 
     pub(crate) fn remote_web_disconnected(&self, connection_id: u64) {
+        if let Some(jobs) = self.page_job_registry() {
+            jobs.close_connection(
+                connection_id,
+                super::page_jobs::PageJobCancelCause::ConnectionClosed,
+            );
+        }
         let removed = self
             .remote_web_connections
             .lock()
@@ -1637,6 +1661,7 @@ impl SessionHandle {
     }
 
     fn notify_long_job_drain(&self, reason: ReleaseReason) {
+        self.notify_page_job_drain();
         let Some(cause) = reason.long_job_drain_cause() else {
             return;
         };
@@ -1645,6 +1670,12 @@ impl SessionHandle {
         }
         if let Some(jobs) = self.archive_job_registry() {
             RemoteLongJobRegistry::on_session_drain(&*jobs, cause);
+        }
+    }
+
+    fn notify_page_job_drain(&self) {
+        if let Some(jobs) = self.page_job_registry() {
+            jobs.cancel_all(super::page_jobs::PageJobCancelCause::SessionInvalidated);
         }
     }
 
@@ -3510,6 +3541,58 @@ mod tests {
         handle.remote_web_disconnected(2);
         handle.remote_web_disconnected(3);
         assert!(!handle.snapshot().remote_web_connected);
+    }
+
+    #[test]
+    fn remote_web_disconnect_cancels_only_that_connections_page_jobs() {
+        let handle = SessionHandle::new();
+        let jobs = Arc::new(super::super::page_jobs::PageJobRegistry::new());
+        handle.install_page_jobs(&jobs);
+        let first = jobs
+            .register(
+                1,
+                "first".into(),
+                None,
+                super::super::page_jobs::PageJobPriority::Prefetch,
+            )
+            .unwrap();
+        let second = jobs
+            .register(
+                2,
+                "second".into(),
+                None,
+                super::super::page_jobs::PageJobPriority::Prefetch,
+            )
+            .unwrap();
+
+        handle.remote_web_disconnected(1);
+
+        assert!(first.load(Ordering::Acquire));
+        assert!(!second.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn session_drain_cancels_every_registered_page_job() {
+        let handle = SessionHandle::new();
+        let jobs = Arc::new(super::super::page_jobs::PageJobRegistry::new());
+        handle.install_page_jobs(&jobs);
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        assert!(handle.finish_acquire(handle.snapshot().generation));
+        let cancel = jobs
+            .register(
+                1,
+                "page".into(),
+                None,
+                super::super::page_jobs::PageJobPriority::Foreground,
+            )
+            .unwrap();
+
+        handle.local_disconnect();
+
+        assert!(cancel.load(Ordering::Acquire));
     }
 
     #[test]

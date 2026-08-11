@@ -1780,9 +1780,10 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-絶対 path + subresource へ住所を変更し path allowlist を撤去した 2026-08-08 時点の現行版は
-**v37**。`/api/page` と AI result の表示前照合、`FavoriteSearch`、タグ一覧・タグ項目検索、
-絶対 path の構文・実在・canonicalize の二重検査は両側が v37 であることを前提とする。
+表示所有権 cutover 段階 3a を配線した 2026-08-11 時点の現行版は **v42**。
+v42 は `PageRequest` の job / optional display request ID、batched `PageDemand` の promote / release、
+typed な `Cancelled` を追加する。v37 で導入した絶対 path + subresource、表示前照合、検索契約と、
+v41 までの長時間ジョブ契約も引き続き両側が同じ版であることを前提とする。
 
 ### 13.6 残タスク (2026-08-01 時点)
 
@@ -1848,7 +1849,10 @@ pending で表現しない」に反し、今回 3 周した誤りと同じ形で
 `Applied / Superseded / Failed` の typed outcome にし、失敗時にシークバーと画面が食い違わない
 ことをテストで固定する。この時点では既存構造のまま落ちるテストを置く。
 
-**B + C + D0 — 所有権の cutover (一体)**
+**B + C + D0 — 所有権の cutover (3a、2026-08-11 完了)**
+
+当初ここに記した「heavy queue への切替まで一体」の段階分けは §14.11 で差し替え済み。
+取消 owner を二重にしない一体性は維持し、admission / queue 順序と位置 ownership は切り離した。
 
 - Web: 表示グループが需要を持つ (`DisplayRequestId` による lease)。見開き全ページの
   foreground lease を fetch 開始前に**同期登録**する。計画の更新は plan lease の解放だけ。
@@ -1860,7 +1864,17 @@ pending で表現しない」に反し、今回 3 周した誤りと同じ形で
 - 本体の旧アドレス近似 (`begin_page_render` の retain) を**無効化・撤去**
 - 補正プレビューも同じ coordinator を通す
 
-**後段 (保留)**
+**3b — admission / heavy queue (保留)**
+
+- 段階 2 の `heavy_queue` へ `sync_channel` を差し替え、待機中 job の剪定と lane 昇格を配線する
+- `try_acquire_prefetch` の入口拒否を撤去し、1 worker の実行不能な prefetch へ typed 応答を返す
+- remote-web の `IpcAdmission` は HTTP worker を守る別 owner として維持する
+
+**3c — 位置 ownership (保留)**
+
+- requested / displayed 位置、URL / history と `DisplayRequestId` の境界を統合する
+
+**その他の後段 (保留)**
 
 - 前景専用 lane の高度化
 - URL `prefetch=1` 互換の撤去
@@ -2089,8 +2103,9 @@ seek の入力が消える。拡大を止められない一方で入力欠落だ
 8. `releaseDisplay` は冪等で、二重 release は `unknown_request`、同じ request ID の二重 open は
    `duplicate_request_id` として無視し、需要を二重に増減しない。
 9. 1 要求内の同じ key は 1 需要として数える。
-10. `protectedKeyIds()` は全表示需要を先に、続いて plan の近い順を返し、cache が表示中の
-    全 key を保護集合にできるようにする。
+10. `protectedKeyIds()` は全表示需要を先に、続いて plan の近い順を返す。cache は通常の
+    trim ではこの全 key を保護し、prefetch admission ではこの順序を唯一の正本として
+    候補 key までを保護する。
 11. failed / aborted は key の恒久状態ではなく、その job attempt の終端結果とする。
     `settle` 時点でその attempt を待っていた要求だけへ結果を記録し、key から current job を
     外す。plan 需要だけでは同じ失敗を自動再試行せず、新しい `openDisplay` を明示的な再試行
@@ -2100,9 +2115,12 @@ seek の入力が消える。拡大を止められない一方で入力欠落だ
 effect の順序も `ignored` → `cancel` → `promote` → `start` → group 終端通知に固定した。
 coordinator が所有するのは需要、単調な優先度、job ID とジョブ生死、表示グループ結果である。
 圧縮 byte の保持 / LRU / 破棄 / admission 用の byte 会計は引き続き `PageResourceCache` が持ち、
-coordinator は `hasBytes` と `prefetchAdmits` でその状態を読むだけとする。ただしジョブ登録簿を
-cache と coordinator の 2 箇所へ分裂させないため、foreground / prefetch を問わず全 job ID の
-発行と開始判断は coordinator に一本化する。
+coordinator は `hasBytes` と `prefetchAdmits(candidateKeyId)` でその状態を読むだけとする。
+prefetch 開始判断では plan 順に現在の候補 key を渡し、cache は `protectedKeyIds()` の先頭から
+その候補までを admission の保護集合にする。これにより候補より遠い取得済み key は交換できるが、
+表示中 key と候補以下の近い key は捨てない。ただしジョブ登録簿を cache と coordinator の
+2 箇所へ分裂させないため、foreground / prefetch を問わず全 job ID の発行と開始判断は
+coordinator に一本化する。
 
 完了 / cancel 済み job の履歴は 256 件を上限とし、running job は破棄しない。**まだ需要のある
 key の current job も破棄しない。** 上限は記憶量の制限であって、そこで生きた routing を
@@ -2142,7 +2160,7 @@ Prefetch が最後の 1 worker を使わない制約、待機中 job の昇格�
 shutdown だけを持つ。
 
 優先度の正本は registry であり、queue の lane はその写しである。registry が queue を
-呼ぶ、または queue が registry を呼ぶ構造にはせず、段階 3 の配線側が両者を同じ
+呼ぶ、または queue が registry を呼ぶ構造にはせず、段階 3b の配線側が両者を同じ
 critical section で揃える。両操作は冪等なので、途中の no-op や失敗は typed な結果として
 観測し、次の昇格操作で写しを正本へ追従させられる。
 
@@ -2150,16 +2168,17 @@ registry の記録は job の `finish` で消える。ただし **connection が
 呼ばない** (待機中の payload は剪定され、実行中の render は自分の cancel token だけを見る)
 ので、`close_connection` は打ち切りと同時にその connection の記録ごと破棄する終端操作とする。
 再接続のたびに 1 件ずつ残す形にしない。既に走っていた render が後から `finish` を呼ぶと
-`UnknownJob` になるが、これは close 後の想定どおりの結果であり異常ではない。段階 3 の
+`UnknownJob` になるが、これは close 後の想定どおりの結果であり異常ではない。段階 3a の
 配線でこれを警告として記録しないこと。session 失効は connection が生き残り、各 job が
 完了を報告できるので `cancel_all` を使い、記録は残す。
 
 3 レーン化だけで現在の入口拒否を外すのは不十分である。昇格と D0 の需要ベース剪定が
 無いままでは、読者が先へ進んだ後も古い先読みが queue に残り、後着の前景が待たされる。
 現行の `begin_page_render` は worker が queue から pop した後に走るため、queue で待機中の
-先読みを剪定できない。そのため段階 3 では B + C + D0 と一体で enqueue 側へ所有権を移す。
+先読みを剪定できない。そのため段階 3a では enqueue 時から registry token を持たせ、
+段階 3b で待機 payload の物理的な剪定を同じ ownership へ配線する。
 
-`heavy_queue::prune` は落とした payload を黙って破棄せず呼び出し側へ返す。段階 3 で載せる
+`heavy_queue::prune` は落とした payload を黙って破棄せず呼び出し側へ返す。段階 3a で載せた
 `Work` が client への `reply` を所有しており、剪定した要求へ typed な終端応答を返さないと
 呼び出し元が永久に待つためである。先読みの 1 worker 予約は、入口で要求を拒否する
 方式から queue の pop 条件 (`active < workers - 1`) へ移す設計とした。ただしこの制約は
@@ -2171,10 +2190,58 @@ Interactive も読者が待つ仕事であり、ここまで予約で制限す�
 
 worker が 1 本の場合は `workers - 1 == 0` のため Prefetch は queue から pop されない。
 現行の入口は `remote_page_prefetch_limit(1) == 0` として typed な 503 を即応答するので、
-段階 2 では回帰ではない。段階 3 で入口拒否を撤去すると、実行不能な Prefetch は client timeout まで
+段階 2 では回帰ではない。段階 3b で入口拒否を撤去すると、実行不能な Prefetch は client timeout まで
 queue に残り得る。**1-worker pool の実行不能 Prefetch へ誰がいつ typed 応答を返すか**は、
-段階 3 の admission / prune 配線で必ず決める未解決事項とする。
+段階 3b の admission / prune 配線で必ず決める未解決事項とする。
 
 この増分も dormant である。新しい 2 モジュールは request 経路から呼ばれず、現行の
 `sync_channel`、worker 数、queue 容量、`begin_page_render` は変更していない。protocol version も
 据え置きで、実機の表示や telemetry に変化は無い。
+
+### 14.11 表示所有権 cutover 段階 3a: Web / 本体の同時配線 (2026-08-11)
+
+段階 3 は 3a / 3b / 3c に分割した。3a は取消と優先度の ownership だけを Web と本体で
+同時に切り替え、3b は queue 順序と admission、3c は requested / displayed 位置を扱う。
+取消 owner を一度に 1 つへ切り替える §14.2 の決定は変えていない。一方、現行
+`sync_channel` と入口拒否を同時に変えると、実機で ownership 配線と並べ替えの副作用を
+切り分けられないため分けた。§14.3 の従来の段階記述はこの分割で差し替え済みである。
+
+3a の判断は次のとおり。
+
+1. plan だけが需要を持つ prefetch job には display request ID が無いため wire / registry とも
+   optional とし、表示需要による promote 時にその display request ID を記録する。
+2. 実効優先度の正本は `PageJobRegistry` とする。`PageRequest.priority` は初期値であり、pipe が
+   dispatch 直前に registry から再解決する。container は registry を知らない。
+3. release、接続断、停止で捨てる page job には `MediaErrorCode::Cancelled` を必ず返す。
+   remote-web は HTTP 409 + `miv_media_cancelled` とし、503 の busy 再試行へ載せない。
+4. render が見る取消源は registry 発行 token だけとする。session drain は
+   `cancel_all(SessionInvalidated)`、接続断は `close_connection(ConnectionClosed)` を呼ぶ。
+   page 以外の仕事が使う `SessionOperation::cancel_flag()` は維持する。
+5. release が GET / register を追い越す競合は、connection ごとの有界な released-job 墓標で
+   塞ぐ。後着 register は最初から取消済み token を得て queue へ入らない。promote の追い越しは
+   prefetch のまま走るだけなので best-effort とする。
+6. 1 worker 環境で実行不能になる prefetch の扱いは 3b に残す。3a では
+   `try_acquire_prefetch` の入口拒否が残るため新しい待ち詰まりを作らない。
+7. remote-web の `IpcAdmission` は HTTP worker を守る別目的の owner なので変更しない。
+
+Web の `PageDisplayCoordinator` が唯一の需要 owner となり、見開き全ページを fetch 開始前に
+同期登録する。effect adapter は start を fetch、promote / release を同一 tick の batched
+`PageDemand`、group 終端を既存の `applied / superseded / failed` 契約へ接続する。補正 preview も
+要素数 1 の consumer として同じ coordinator を通す。`PageResourceCache` は圧縮 byte、LRU、
+64 MiB 予算だけの owner となり、保護集合を `protectedKeyIds()` から受け取る。通常の trim は
+全表示 key と全 plan key を保護する一方、coordinator は prefetch 開始候補を
+`prefetchAdmits(candidateKeyId)` へ渡し、admission だけは ordered な `protectedKeyIds()` を
+候補までで切る。候補より遠い取得済み plan key は LRU 順に交換可能だが、表示 key と候補以下の
+近い plan key は捨てない。別の plan 順序は持たない。
+
+この cutover で、本体の `begin_page_render` / `page_prefetches` による住所・spread partner 近似と、
+Web の `loadForeground` による他 active の取消走査、`foregroundWaiters`、`prefetchPlanned`、
+`abortUnownedActive` を撤去した。これら 4 系統の取消判断は、表示需要と plan 需要を合わせた
+1 つの lease と registry token に置き換わった。
+
+protocol は、作業開始時の実リポジトリが既に v41 だったため、ブリーフの旧 baseline
+v37 → v38 ではなく **v42** とした。v42 は `PageRequest.job_id`、optional な
+`display_request_id`、batched `PageDemand` と typed `Cancelled` を追加する。本体と remote-web は
+必ず両方を再ビルド・再起動する。3a では `heavy_queue.rs`、`sync_channel`、worker 数 / 容量、
+両側の prefetch admission、先読み窓 12/4、64 MiB 予算、画質 preset、位置 ownership、
+既存 `page_display` telemetry field を変更していない。

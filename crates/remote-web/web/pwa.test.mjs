@@ -340,7 +340,7 @@ test("video health HUD and persistent debug-tier warning stay wired", async () =
   assert.match(css, /#telemetry-hud\[data-telemetry-tier="debug"\]/);
   assert.match(app, /dataset\.viewerKind = video \? "video" : "default"/);
   assert.match(css, /#telemetry-hud\[data-viewer-kind="video"\][\s\S]*bottom:/);
-  assert.match(app, /pageResourceCache\.statusForKeys\(plan\.behindKeys\)/);
+  assert.match(app, /pageDemandAdapter\.statusForKeys\(plan\.behindKeys\)/);
   assert.match(app, /setAttribute\("aria-label", summary\.accessibleLabel\)/);
   assert.match(app, /hudElement\.setAttribute\([\s\S]*prefetch\?\.title/);
   assert.match(css, /\.page-prefetch-dot-ready[\s\S]*#43d17b/);

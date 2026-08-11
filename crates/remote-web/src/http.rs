@@ -9,15 +9,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimageviewer_ipc::{
     CollectionErrorCode, CollectionKind, FavoriteSearchIndexState, FavoriteSearchKind,
-    FavoriteSearchRequest, MediaErrorCode, PagePriority, RemoteAddress, RemoteAiJobError,
-    RemoteAiJobErrorCode, RemoteAiStartRequest, RemoteArchiveConfirmRequest, RemoteArchiveJobError,
-    RemoteArchiveJobErrorCode, RemoteArchivePasswordRequest, RemoteArchiveStartRequest,
-    RemoteEntryKind, RemotePageRenderContext, RemoteReadingDirection, RemoteSessionIdentity,
-    RemoteSpreadMode, RemoteSubresource, RemoteWriteErrorCode, RemoteWriteRequest, SessionResponse,
-    SessionStatus, TagIndexState, TagItemKind, TagItemsRequest, VideoStreamControlAction,
-    VideoStreamErrorCode, VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind,
-    VideoStreamQuality, VideoStreamSegmentIndex, VideoStreamSegmentPayload,
-    VideoStreamThumbnailPayload,
+    FavoriteSearchRequest, MediaErrorCode, PageDemandRequest, PagePriority, RemoteAddress,
+    RemoteAiJobError, RemoteAiJobErrorCode, RemoteAiStartRequest, RemoteArchiveConfirmRequest,
+    RemoteArchiveJobError, RemoteArchiveJobErrorCode, RemoteArchivePasswordRequest,
+    RemoteArchiveStartRequest, RemoteEntryKind, RemotePageRenderContext, RemoteReadingDirection,
+    RemoteSessionIdentity, RemoteSpreadMode, RemoteSubresource, RemoteWriteErrorCode,
+    RemoteWriteRequest, SessionResponse, SessionStatus, TagIndexState, TagItemKind,
+    TagItemsRequest, VideoStreamControlAction, VideoStreamErrorCode,
+    VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind, VideoStreamQuality,
+    VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamThumbnailPayload,
 };
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::Deserialize;
@@ -40,6 +40,8 @@ const MAX_VIDEO_BODY_BYTES: usize = 16 * 1024;
 const MAX_AI_JOB_BODY_BYTES: usize = 32 * 1024;
 const MAX_ARCHIVE_JOB_BODY_BYTES: usize = 16 * 1024;
 const MAX_ARCHIVE_PASSWORD_BODY_BYTES: usize = 4 * 1024;
+const MAX_PAGE_DEMAND_BODY_BYTES: usize = 32 * 1024;
+const MAX_PAGE_DEMAND_ITEMS: usize = 256;
 const MAX_HTTP_ADDRESS_PATHS: usize = 16;
 const MAX_TELEMETRY_EVENTS: usize = 128;
 const TELEMETRY_REQUESTS_PER_WINDOW: usize = 30;
@@ -757,6 +759,11 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
         (Method::Get, "/api/page") => api_page(
             state,
             &query,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Post, "/api/page/demand") => api_page_demand(
+            request,
+            state,
             remote_owner.expect("route guard checked session"),
         ),
         (Method::Post, "/api/telemetry") => api_telemetry(request, state),
@@ -3152,14 +3159,21 @@ fn api_page(
     owner: &RemoteSessionIdentity,
 ) -> HttpResponse {
     let remote_state_generation = match query_value(query, "generation") {
-        Ok(Some(value))
-            if (1..=128).contains(&value.len())
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') =>
-        {
-            value.to_owned()
-        }
+        Ok(Some(value)) if valid_page_wire_identity(value) => value.to_owned(),
+        _ => return HttpResponse::text(400, "Bad Request"),
+    };
+    let job_id = match query_value(query, "job") {
+        Ok(Some(value)) if valid_page_wire_identity(value) => value.to_owned(),
+        _ => return HttpResponse::text(400, "Bad Request"),
+    };
+    let priority = match query_value(query, "prefetch") {
+        Ok(None) => PagePriority::Foreground,
+        Ok(Some("1")) => PagePriority::Prefetch,
+        _ => return HttpResponse::text(400, "Bad Request"),
+    };
+    let display_request_id = match query_value(query, "display") {
+        Ok(Some(value)) if valid_page_wire_identity(value) => Some(value.to_owned()),
+        Ok(None) if priority == PagePriority::Prefetch => None,
         _ => return HttpResponse::text(400, "Bad Request"),
     };
     if let Err(error) = state
@@ -3178,11 +3192,6 @@ fn api_page(
     let target_px = match requested_width(query) {
         Ok(width) => width,
         Err(()) => return HttpResponse::text(400, "Bad Request"),
-    };
-    let priority = match query_value(query, "prefetch") {
-        Ok(None) => PagePriority::Foreground,
-        Ok(Some("1")) => PagePriority::Prefetch,
-        _ => return HttpResponse::text(400, "Bad Request"),
     };
     let adjustment_preview = match query_value(query, "adjustment_preview") {
         Ok(None) => None,
@@ -3223,6 +3232,8 @@ fn api_page(
     let result = match state.ipc_admission.run(ipc_class, || {
         state.thumbnail_client.page(
             owner,
+            job_id.clone(),
+            display_request_id.clone(),
             address.clone(),
             target_px,
             priority,
@@ -3292,6 +3303,58 @@ fn api_page(
             media_ipc_error_response(failure, started.elapsed(), "page", Some(target_px))
         }
     }
+}
+
+fn api_page_demand(
+    request: &mut Request,
+    state: &AppState,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
+    let body = match read_body_limited(request, MAX_PAGE_DEMAND_BODY_BYTES) {
+        Ok(body) => body,
+        Err(BodyReadError::TooLarge) => return HttpResponse::text(413, "Payload Too Large"),
+        Err(BodyReadError::Read) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let demand: PageDemandRequest = match serde_json::from_slice(&body) {
+        Ok(demand) => demand,
+        Err(_) => return HttpResponse::text(400, "Bad Request"),
+    };
+    if demand.promote.len() > MAX_PAGE_DEMAND_ITEMS
+        || demand.release.len() > MAX_PAGE_DEMAND_ITEMS
+        || demand.promote.len() + demand.release.len() == 0
+        || demand.promote.iter().any(|item| {
+            !valid_page_wire_identity(&item.job) || !valid_page_wire_identity(&item.display)
+        })
+        || demand
+            .release
+            .iter()
+            .any(|item| !valid_page_wire_identity(&item.job))
+    {
+        return HttpResponse::text(400, "Bad Request");
+    }
+    let started = Instant::now();
+    match state.thumbnail_client.page_demand(owner, demand) {
+        Ok(result) => HttpResponse::json(&result.value)
+            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+            .with_header("Cache-Control", "no-store")
+            .with_log_details(json!({
+                "page_demand": {
+                    "ipc_status": "ok",
+                    "ipc_ms": crate::diagnostics::duration_ms(started.elapsed()),
+                    "ipc_retry_count": result.retry_count,
+                    "ipc_retry_statuses": result.retry_statuses,
+                    "ipc_connection_id": result.connection_id,
+                }
+            })),
+        Err(failure) => media_ipc_error_response(failure, started.elapsed(), "page_demand", None),
+    }
+}
+
+fn valid_page_wire_identity(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 fn validate_page_address(library: &Library, address: &RemoteAddress) -> Result<(), StoreError> {
@@ -3477,6 +3540,7 @@ fn media_ipc_error_response(
                 MediaErrorCode::Unsupported => 415,
                 MediaErrorCode::PasswordRequired => 423,
                 MediaErrorCode::PageOutOfRange => 416,
+                MediaErrorCode::Cancelled => 409,
                 MediaErrorCode::Busy => {
                     retryable = true;
                     503
@@ -4295,6 +4359,58 @@ mod tests {
     fn duplicate_security_parameters_are_rejected() {
         let query = parse_query("path=C%3A%2Fa&path=C%3A%2Fb").unwrap();
         assert!(query_value(&query, "path").is_err());
+    }
+
+    #[test]
+    fn page_wire_identities_use_the_generation_character_contract() {
+        assert!(valid_page_wire_identity("page-123"));
+        assert!(valid_page_wire_identity(&"a".repeat(128)));
+        assert!(!valid_page_wire_identity(""));
+        assert!(!valid_page_wire_identity(&"a".repeat(129)));
+        assert!(!valid_page_wire_identity("page_123"));
+        assert!(!valid_page_wire_identity("page/123"));
+    }
+
+    #[test]
+    fn page_rejects_invalid_job_and_display_identities_before_ipc() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let owner = RemoteSessionIdentity {
+            client_id: "client".to_owned(),
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        };
+        for query in [
+            "generation=generation-1&job=bad_job&display=display-1",
+            "generation=generation-1&job=job-1&display=bad_display",
+            "generation=generation-1&job=job-1",
+        ] {
+            assert_eq!(
+                api_page(&state, &parse_query(query).unwrap(), &owner).status,
+                400
+            );
+        }
+    }
+
+    #[test]
+    fn page_demand_rejects_invalid_job_and_display_identities_before_ipc() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let owner = RemoteSessionIdentity {
+            client_id: "client".to_owned(),
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        };
+        for body in [
+            r#"{"promote":[{"job":"bad_job","display":"display-1"}],"release":[]}"#,
+            r#"{"promote":[{"job":"job-1","display":"bad_display"}],"release":[]}"#,
+            r#"{"promote":[],"release":[{"job":"bad/job","cause":"no_demand"}]}"#,
+        ] {
+            let mut request: Request = TestRequest::new()
+                .with_method(Method::Post)
+                .with_path("/api/page/demand")
+                .with_body(body)
+                .into();
+            assert_eq!(api_page_demand(&mut request, &state, &owner).status, 400);
+        }
     }
 
     #[test]
@@ -5317,6 +5433,36 @@ mod tests {
         assert_eq!(response.status, 423);
         let body: Value = serde_json::from_slice(&response.body).unwrap();
         assert!(body["message"].as_str().unwrap().contains("パスワード保護"));
+    }
+
+    #[test]
+    fn cancelled_page_is_http_409_without_retry_after() {
+        let response = media_ipc_error_response(
+            crate::ipc_client::ClientFailure {
+                error: IpcClientError::MediaRemote(mimageviewer_ipc::MediaError::new(
+                    MediaErrorCode::Cancelled,
+                    "cancelled",
+                )),
+                retry_count: 0,
+                retry_statuses: Vec::new(),
+            },
+            Duration::from_millis(5),
+            "page",
+            Some(2048),
+        );
+        assert_eq!(response.status, 409);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"], "miv_media_error");
+        assert!(
+            !response
+                .headers
+                .iter()
+                .any(|(name, _)| *name == "Retry-After")
+        );
+        assert_eq!(
+            response.log_details.unwrap()["page"]["ipc_status"],
+            "miv_media_cancelled"
+        );
     }
 
     #[test]
