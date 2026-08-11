@@ -501,6 +501,9 @@ struct SpreadPayload {
     configured: RemoteSpreadMode,
     effective: RemoteSpreadMode,
     reading_direction: RemoteReadingDirection,
+    image_count: usize,
+    video_count: usize,
+    other_count: usize,
     groups: Vec<PageGroup>,
 }
 
@@ -2657,17 +2660,17 @@ impl ContainerEngine {
             .map_err(media_error_from_remote_write)?;
         let resume_page =
             self.resume_page_for_items(&address, &resolved.logical, &listing.items, true);
-        let total = listing
-            .items
+        let source_items = listing.items;
+        let total = source_items
             .iter()
             .filter(|item| matches!(item, crate::grid_item::GridItem::Image(_)))
             .count();
         let auto_open = listing.image_only && listing.auto_fullscreen_image_folders_enabled;
-        let items = listing
-            .items
-            .into_iter()
+        let items = source_items
+            .iter()
             .filter(|item| matches!(item, crate::grid_item::GridItem::Image(_)))
             .take(CONTAINER_ENTRY_LIMIT)
+            .cloned()
             .collect::<Vec<_>>();
         let entries = items
             .iter()
@@ -2680,7 +2683,7 @@ impl ContainerEngine {
                 })
             })
             .collect::<Vec<_>>();
-        let spread = self.spread_payload(request, resolved, &items, None);
+        let spread = self.spread_payload(request, resolved, &items, Some(&source_items), None);
         Ok(ContainerPayload {
             title: container_title(&resolved.logical),
             root_name: absolute_root_name(&resolved.logical),
@@ -2699,6 +2702,9 @@ impl ContainerEngine {
             configured_spread_mode: spread.configured,
             effective_spread_mode: spread.effective,
             reading_direction: spread.reading_direction,
+            image_count: spread.image_count,
+            video_count: spread.video_count,
+            other_count: spread.other_count,
             spread_page_gap_px: self.settings.spread_page_gap_px,
             page_groups: spread.groups,
             entry_limit: CONTAINER_ENTRY_LIMIT,
@@ -2802,6 +2808,7 @@ impl ContainerEngine {
             request,
             resolved,
             &items,
+            None,
             Some((&effective_segments, &resolved.logical)),
         );
         Ok(ContainerPayload {
@@ -2833,6 +2840,9 @@ impl ContainerEngine {
             configured_spread_mode: spread.configured,
             effective_spread_mode: spread.effective,
             reading_direction: spread.reading_direction,
+            image_count: spread.image_count,
+            video_count: spread.video_count,
+            other_count: spread.other_count,
             spread_page_gap_px: self.settings.spread_page_gap_px,
             page_groups: spread.groups,
             entry_limit: CONTAINER_ENTRY_LIMIT,
@@ -2878,7 +2888,7 @@ impl ContainerEngine {
                 page_count: None,
             })
             .collect::<Vec<_>>();
-        let spread = self.spread_payload(request, resolved, &items, None);
+        let spread = self.spread_payload(request, resolved, &items, None, None);
         Ok(ContainerPayload {
             title: container_title(&resolved.logical),
             root_name: absolute_root_name(&resolved.logical),
@@ -2897,6 +2907,9 @@ impl ContainerEngine {
             configured_spread_mode: spread.configured,
             effective_spread_mode: spread.effective,
             reading_direction: spread.reading_direction,
+            image_count: spread.image_count,
+            video_count: spread.video_count,
+            other_count: spread.other_count,
             spread_page_gap_px: self.settings.spread_page_gap_px,
             page_groups: spread.groups,
             entry_limit: CONTAINER_ENTRY_LIMIT,
@@ -2909,6 +2922,7 @@ impl ContainerEngine {
         request: &ContainerRequest,
         resolved: &ResolvedPath,
         items: &[crate::grid_item::GridItem],
+        source_items: Option<&[crate::grid_item::GridItem]>,
         zip_context: Option<(&[String], &Path)>,
     ) -> SpreadPayload {
         let key = if let Some((segments, root)) = zip_context {
@@ -2918,15 +2932,27 @@ impl ContainerEngine {
         };
         let (stored_mode, stored_direction) =
             self.stored_spread_state(&key.exact, key.fallback.as_deref());
+        let source_items = source_items.unwrap_or(items);
+        let defaults = if crate::app::physical_page_order_locked(
+            &self.settings,
+            &resolved.logical,
+            source_items,
+        ) {
+            crate::app::SpreadRestoreDefaults::for_book(&self.settings)
+        } else {
+            crate::app::SpreadRestoreDefaults::NON_BOOK
+        };
         let (configured, effective, reading_direction) = resolve_spread_state(
             request.spread_mode,
             request.reading_direction,
             stored_mode,
             stored_direction,
-            self.settings.default_spread_mode,
-            self.settings.default_reading_direction,
+            defaults.spread_mode(),
+            defaults.reading_direction(),
             request.force_single_page,
         );
+        let (image_count, video_count, other_count) =
+            crate::ui_fullscreen::seek_overlay_media_counts(source_items);
         let landscape = self.cached_landscape_flags(&resolved.logical, items);
         let index_groups = crate::ui_fullscreen::build_remote_spread_page_groups(
             items,
@@ -2954,6 +2980,9 @@ impl ContainerEngine {
             configured,
             effective,
             reading_direction,
+            image_count,
+            video_count,
+            other_count,
             groups,
         }
     }
@@ -6092,6 +6121,9 @@ mod tests {
         };
         assert_eq!(payload.kind, ContainerKind::Folder);
         assert_eq!(payload.entries.len(), 2);
+        assert_eq!(payload.image_count, 2);
+        assert_eq!(payload.video_count, 0);
+        assert_eq!(payload.other_count, 0);
         assert_eq!(payload.page_groups.len(), 1);
         assert_eq!(payload.page_groups[0].pages.len(), 2);
         assert_eq!(
@@ -6109,6 +6141,153 @@ mod tests {
             reading_direction: RemoteReadingDirection::Rtl,
         };
         engine.validate_write_request(&mut write).unwrap();
+    }
+
+    #[test]
+    fn folder_spread_defaults_follow_the_core_book_predicate_and_keep_stored_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        let image_only = root.join("image-only");
+        let mixed_media = root.join("mixed-media");
+        let mixed_containers = root.join("mixed-containers");
+        for folder in [&image_only, &mixed_media, &mixed_containers] {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("001.jpg"), b"one").unwrap();
+            std::fs::write(folder.join("002.jpg"), b"two").unwrap();
+        }
+        std::fs::write(mixed_media.join("clip.mp4"), b"video").unwrap();
+        std::fs::create_dir_all(mixed_containers.join("child")).unwrap();
+        write_remote_ai_test_zip(
+            &mixed_containers.join("appendix.zip"),
+            &[("001.jpg", b"zip-page")],
+        );
+
+        let favorite = FavoriteEntry::new("test".to_owned(), root);
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            auto_fullscreen_zip_pdf: true,
+            auto_fullscreen_image_folders: true,
+            default_spread_mode: crate::settings::SpreadMode::RtlCover,
+            default_reading_direction: crate::settings::ReadingDirection::Rtl,
+            ..Default::default()
+        });
+        *engine
+            .spread_db
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        let open = |relative: &str| {
+            let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
+                address: favorite_address(&favorite, relative),
+                spread_mode: None,
+                reading_direction: None,
+                force_single_page: false,
+            }) else {
+                panic!("folder container enumeration failed for {relative}");
+            };
+            payload
+        };
+
+        let image_only_payload = open("image-only");
+        assert_eq!(
+            image_only_payload.configured_spread_mode,
+            RemoteSpreadMode::RtlCover
+        );
+        assert_eq!(image_only_payload.image_count, 2);
+        assert_eq!(image_only_payload.video_count, 0);
+        assert_eq!(image_only_payload.other_count, 0);
+
+        let mixed_media_payload = open("mixed-media");
+        assert_eq!(
+            mixed_media_payload.configured_spread_mode,
+            RemoteSpreadMode::Single
+        );
+        assert_eq!(
+            mixed_media_payload.reading_direction,
+            RemoteReadingDirection::Ltr
+        );
+        assert_eq!(mixed_media_payload.image_count, 2);
+        assert_eq!(mixed_media_payload.video_count, 1);
+        assert_eq!(mixed_media_payload.other_count, 0);
+
+        let mixed_containers_payload = open("mixed-containers");
+        assert_eq!(
+            mixed_containers_payload.configured_spread_mode,
+            RemoteSpreadMode::Single
+        );
+
+        let spread_path = temp.path().join("spread.db");
+        let writable = crate::spread_db::SpreadDb::open_at(&spread_path).unwrap();
+        let key = crate::spread_db::container_key_with_fallback(&mixed_media, &[]);
+        writable
+            .set(
+                &key.exact,
+                crate::settings::SpreadMode::Rtl,
+                crate::settings::SpreadMode::Single,
+                crate::settings::ReadingFlow::Paged,
+                crate::settings::ReadingDirection::Rtl,
+            )
+            .unwrap();
+        *engine
+            .spread_db
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(writable);
+
+        let stored_payload = open("mixed-media");
+        assert_eq!(stored_payload.configured_spread_mode, RemoteSpreadMode::Rtl);
+        assert_eq!(stored_payload.effective_spread_mode, RemoteSpreadMode::Rtl);
+        assert_eq!(
+            stored_payload.reading_direction,
+            RemoteReadingDirection::Rtl
+        );
+    }
+
+    #[test]
+    fn zip_and_pdf_spread_defaults_remain_book_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            default_spread_mode: crate::settings::SpreadMode::LtrCover,
+            default_reading_direction: crate::settings::ReadingDirection::Ltr,
+            ..Default::default()
+        });
+        *engine
+            .spread_db
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+
+        for extension in ["zip", "pdf"] {
+            let path = temp.path().join(format!("book.{extension}"));
+            std::fs::write(&path, b"container").unwrap();
+            let resolved = resolve_existing(path.to_string_lossy().as_ref()).unwrap();
+            let item = if extension == "zip" {
+                crate::grid_item::GridItem::ZipImage {
+                    zip_path: path.clone(),
+                    entry_name: "001.jpg".to_owned(),
+                }
+            } else {
+                crate::grid_item::GridItem::PdfPage {
+                    pdf_path: path.clone(),
+                    page_num: 0,
+                    content_type: None,
+                }
+            };
+            let spread = engine.spread_payload(
+                &ContainerRequest {
+                    address: RemoteAddress::file(path.to_string_lossy().into_owned()),
+                    spread_mode: None,
+                    reading_direction: None,
+                    force_single_page: false,
+                },
+                &resolved,
+                &[item],
+                None,
+                None,
+            );
+            assert_eq!(spread.configured, RemoteSpreadMode::LtrCover);
+            assert_eq!(spread.effective, RemoteSpreadMode::LtrCover);
+            assert_eq!(spread.image_count, 1);
+            assert_eq!(spread.video_count, 0);
+            assert_eq!(spread.other_count, 0);
+        }
     }
 
     #[test]

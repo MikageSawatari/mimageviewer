@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 42;
+pub const PROTOCOL_VERSION: u32 = 43;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -859,6 +859,10 @@ pub struct ContainerPayload {
     pub effective_spread_mode: RemoteSpreadMode,
     /// Single を含む物理的なページ送り方向。spread.db の reading direction を反映する。
     pub reading_direction: RemoteReadingDirection,
+    /// 本体 seek overlay と同じ nav item 分類による件数内訳。
+    pub image_count: usize,
+    pub video_count: usize,
+    pub other_count: usize,
     pub spread_page_gap_px: u32,
     pub page_groups: Vec<PageGroup>,
     pub entry_limit: usize,
@@ -2757,8 +2761,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v42_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 42);
+    fn protocol_v43_remote_video_thumbnail_shape_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 43);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -2904,6 +2908,9 @@ mod tests {
                 configured_spread_mode: RemoteSpreadMode::RtlCover,
                 effective_spread_mode: RemoteSpreadMode::RtlCover,
                 reading_direction: RemoteReadingDirection::Rtl,
+                image_count: 2,
+                video_count: 0,
+                other_count: 0,
                 spread_page_gap_px: 8,
                 page_groups: vec![PageGroup {
                     anchor: page(0),

@@ -101,6 +101,7 @@ import {
   viewerPanelTransition,
   viewerResizePlan,
   viewerSeekGroupIndex,
+  viewerSeekMediaPresentation,
   viewerSeekRelativeDragValue,
   viewerSeekState,
   viewerSpreadLayout,
@@ -1804,6 +1805,31 @@ test("viewer seek hides only its range for a one-image sequence", () => {
       label: "1 / 1",
     }
   );
+});
+
+test("viewer seek media presentation matches the core mixed-media summary", () => {
+  assert.deepEqual(
+    viewerSeekMediaPresentation({ imageCount: 12, videoCount: 3, otherCount: 1 }),
+    {
+      allNavItemsAreImages: false,
+      summary: "画像 12 ファイル、動画 3 ファイル、その他 1 件",
+    }
+  );
+  assert.deepEqual(viewerSeekMediaPresentation({ imageCount: 4 }), {
+    allNavItemsAreImages: true,
+    summary: "画像 4 ファイル",
+  });
+  assert.deepEqual(
+    viewerSeekMediaPresentation({ imageCount: 0, videoCount: 2 }),
+    {
+      allNavItemsAreImages: false,
+      summary: "動画 2 ファイル",
+    }
+  );
+  assert.deepEqual(viewerSeekMediaPresentation(), {
+    allNavItemsAreImages: false,
+    summary: "",
+  });
 });
 
 test("viewer gesture separates vertical and horizontal swipes", () => {

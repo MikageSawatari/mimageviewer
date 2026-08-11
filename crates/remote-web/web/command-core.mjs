@@ -1729,6 +1729,27 @@ export function viewerSeekState({
   };
 }
 
+export function viewerSeekMediaPresentation({
+  imageCount = 0,
+  videoCount = 0,
+  otherCount = 0,
+} = {}) {
+  const count = (value) => Math.max(0, Math.floor(Number(value) || 0));
+  const images = count(imageCount);
+  const videos = count(videoCount);
+  const others = count(otherCount);
+  const allNavItemsAreImages =
+    images + videos + others === images && images > 0;
+  const parts = [];
+  if (images > 0) parts.push(`画像 ${images} ファイル`);
+  if (videos > 0) parts.push(`動画 ${videos} ファイル`);
+  if (others > 0) parts.push(`その他 ${others} 件`);
+  return {
+    allNavItemsAreImages,
+    summary: parts.join("、"),
+  };
+}
+
 export const ViewerPagePositionEvent = Object.freeze({
   REQUEST: "request",
   DISPLAY: "display",

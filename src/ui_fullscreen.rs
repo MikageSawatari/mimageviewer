@@ -5704,6 +5704,15 @@ fn count_seek_overlay_non_image_items(items: &[GridItem], nav_indices: &[usize])
         })
 }
 
+/// Remote の静止画 viewer へ、本体 seek overlay と同じ nav item 内訳を公開する。
+pub(crate) fn seek_overlay_media_counts(items: &[GridItem]) -> (usize, usize, usize) {
+    let display_order = (0..items.len()).collect::<Vec<_>>();
+    let image_count = build_image_reading_indices(items, &display_order).len();
+    let nav_indices = build_nav_indices(items, &display_order);
+    let (video_count, other_count) = count_seek_overlay_non_image_items(items, &nav_indices);
+    (image_count, video_count, other_count)
+}
+
 fn vertical_reading_offsets(
     heights: &[f32],
     gap: f32,

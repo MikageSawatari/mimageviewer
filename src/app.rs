@@ -6826,18 +6826,26 @@ pub(crate) struct SpreadRestoreDefaults {
 }
 
 impl SpreadRestoreDefaults {
-    const NON_BOOK: Self = Self {
+    pub(crate) const NON_BOOK: Self = Self {
         spread_mode: crate::settings::SpreadMode::Single,
         reading_flow: crate::settings::ReadingFlow::Paged,
         reading_direction: crate::settings::ReadingDirection::Ltr,
     };
 
-    fn for_book(settings: &crate::settings::Settings) -> Self {
+    pub(crate) fn for_book(settings: &crate::settings::Settings) -> Self {
         Self {
             spread_mode: settings.default_spread_mode,
             reading_flow: settings.default_reading_flow,
             reading_direction: settings.default_reading_direction,
         }
+    }
+
+    pub(crate) fn spread_mode(self) -> crate::settings::SpreadMode {
+        self.spread_mode
+    }
+
+    pub(crate) fn reading_direction(self) -> crate::settings::ReadingDirection {
+        self.reading_direction
     }
 }
 

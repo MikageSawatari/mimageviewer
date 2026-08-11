@@ -836,6 +836,10 @@ RAR / 7z / LZH の変換、リモートからの PDF password 入力、コンテ
 読書履歴・rating・bookmark 等の書き込みは含めない。nested ZIP は本体の列挙文字列と
 `read_entry_bytes` をそのまま使うため対応するが、nested RAR / 7z / LZH は変換増分まで扱わない。
 
+アニメーション GIF / APNG / WebP は当面非対応とする。remote の `/api/page` は常に JPEG へ
+変換するため静止画として表示される。対応には元バイトを返す別経路が必要で、先読み予算、cache key、
+見開き合成のすべてへ影響するため、独立した増分として扱う。
+
 ### 12.5 実機で判明した PDF worker と初回表示の修正 (2026-07-31)
 
 隔離 `--data-dir` の本体では PDFium pool の子が存在せず、PDF 要求が 1〜12 ms で
@@ -1692,6 +1696,21 @@ fetch / decode / apply failure に限定する。request ID は server の単調
 PIN、Bearer、remote session 生値は event builder の入力に持たせない。既存 normal/debug 段階化と
 server 最終 redaction は維持する。
 
+### 12.27 混在フォルダの本判定と seek overlay parity (protocol v43, 2026-08-11)
+
+通常フォルダの保存値が無い見開き既定は、本体と同じ
+`crate::app::physical_page_order_locked` を `spread_payload` から直接呼んで決める。remote 側に
+画像のみ・自動フルスクリーン等の条件を再記述しない。本と判定された場合だけ端末共通の
+`default_spread_mode` / `default_reading_direction` を使い、それ以外は本体の
+`SpreadRestoreDefaults::NON_BOOK` と同じ Single / LTR とする。明示 request と `spread.db` の保存値は
+従来どおり既定より優先する。ZIP / PDF は `is_open_as_container` により本のままである。
+
+folder container は画像 entry / page group へ絞る前の materialized items をこの判定へ渡す。
+同じ full items から本体 seek overlay の nav item 分類を通して画像・動画・その他の件数を作り、
+protocol v43 の `ContainerPayload` に載せる。Web は全 nav item が画像かを本体と同じ式で判定し、
+真なら従来の seek range、偽なら `fullscreen_mixed_media_summary` と同じ順序・単位・読点の件数サマリを
+表示する。判定と文面生成は `command-core.mjs` の純関数が所有する。
+
 ## 13. 作業運用メモ (セッションをまたぐ引き継ぎ用)
 
 この節は設計ではなく**開発手順**の記録。会話ログにしか残らない知識を失わないために書く。
@@ -1780,10 +1799,11 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-表示所有権 cutover 段階 3a を配線した 2026-08-11 時点の現行版は **v42**。
-v42 は `PageRequest` の job / optional display request ID、batched `PageDemand` の promote / release、
-typed な `Cancelled` を追加する。v37 で導入した絶対 path + subresource、表示前照合、検索契約と、
-v41 までの長時間ジョブ契約も引き続き両側が同じ版であることを前提とする。
+混在フォルダ parity を配線した 2026-08-11 時点の現行版は **v43**。
+v43 は `ContainerPayload` に本体 seek overlay と同じ画像・動画・その他の件数内訳を追加する。
+v42 の `PageRequest` job / optional display request ID、batched `PageDemand` の promote / release、
+typed な `Cancelled`、v37 以降の絶対 path + subresource、表示前照合、検索契約、長時間ジョブ契約も
+引き続き両側が同じ版であることを前提とする。
 
 ### 13.6 残タスク (2026-08-01 時点)
 

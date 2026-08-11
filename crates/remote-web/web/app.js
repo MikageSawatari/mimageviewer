@@ -96,6 +96,7 @@ import {
   viewerSpreadPartnerIndex,
   viewerBoundaryMessage,
   viewerSeekGroupIndex,
+  viewerSeekMediaPresentation,
   viewerSeekRelativeDragValue,
   viewerSeekState,
   viewerSpreadLayout,
@@ -3740,6 +3741,9 @@ function applyContainerData(address, data, forceSinglePage, options = {}) {
     configuredSpreadMode: data.configured_spread_mode ?? SpreadMode.SINGLE,
     effectiveSpreadMode: data.effective_spread_mode ?? SpreadMode.SINGLE,
     readingDirection: data.reading_direction ?? ReadingDirection.LTR,
+    imageCount: Math.max(0, Math.floor(Number(data.image_count) || 0)),
+    videoCount: Math.max(0, Math.floor(Number(data.video_count) || 0)),
+    otherCount: Math.max(0, Math.floor(Number(data.other_count) || 0)),
     forceSinglePage,
     resumePage: data.resume_page ?? null,
     openMode: data.open_mode ?? "grid",
@@ -3902,12 +3906,24 @@ function captureViewerPageGroupRequest(
 }
 
 function viewerSeekSnapshot(groupIndex = state.pageGroupIndex) {
-  return viewerSeekState({
+  const seekState = viewerSeekState({
     groupPageIndexes: state.seekPageGroups,
     currentGroupIndex: groupIndex,
     pageCount: state.images.length,
     rtl: isRtlReadingDirection(state.readingDirection),
   });
+  const media = viewerSeekMediaPresentation(state.container
+    ? {
+        imageCount: state.container.imageCount,
+        videoCount: state.container.videoCount,
+        otherCount: state.container.otherCount,
+      }
+    : { imageCount: state.images.length });
+  return {
+    ...seekState,
+    visible: seekState.visible && media.allNavItemsAreImages,
+    label: media.allNavItemsAreImages ? seekState.label : media.summary,
+  };
 }
 
 function viewerPagePresentation(groupIndex = state.pageGroupIndex) {
