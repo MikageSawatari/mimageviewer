@@ -627,6 +627,85 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   AI ON/OFF / デノイズ / post-filter / スマートシャープのどれかを最初に切り分ける。
 - 優先度: P3 monitor / 再現待ち。
 
+### 3.3 手動ビットマップマスクの共通強化 (バケツ / 1px 拡張・縮小) — 利用者要望
+
+- 背景: 同じ「手描きビットマップマスク」を持つサブシステムが 3 面あり、ツールの品揃えが揃っていない。
+  補正レイヤーだけが 1px 拡張・縮小を持ち、色を見て塗るツール (境界筆) も補正レイヤーだけにある。
+
+  | 面 | マスク表現 | ビットマップツール | 1px 拡張/縮小 | 色サンプル元 |
+  | --- | --- | --- | --- | --- |
+  | 消しゴム [ui_erase.rs](../src/ui_erase.rs) | `Vec<bool>` (`erase_mask`) | 筆 / 囲み / 多角形 | なし | `erase_base_cache` (raw を黒フラット化) |
+  | 補正レイヤー [ui_adjustment_panel.rs](../src/ui_adjustment_panel.rs) | `Vec<f32>` (`RasterVectorMask.alpha`、実質 0/1) | 筆 / 境界筆 / 隙間補完 / 囲み / 多角形 | あり | `current_local_adjust_source_pixels` |
+  | 隠蔽加工 [ui_conceal.rs](../src/ui_conceal.rs) | `Vec<bool>` (`conceal_mask`) | 筆 / 囲み / 多角形 | なし | `current_conceal_source_pixels` |
+
+- 対象範囲 (2026-08-11 利用者判断): **3 面すべてに両機能を入れる**。共通ロジックを
+  `mask_db.rs` に置けば追加コストは配線とパネル UI だけなので、ここで 3 面の機能差を解消する。
+
+#### (a) バケツツール (許容値以下の同色を塗りつぶす)
+
+- 既存資産: 補正レイヤーの `paint_local_adjust_edge_brush_stamp`
+  ([ui_adjustment_panel.rs](../src/ui_adjustment_panel.rs) の `local_adjust_edge_brush_pixel_allowed` /
+  `paint_local_adjust_alpha_edge_brush_line` 一帯) が、既に
+  「クリック点 RGB を seed → 最大チャンネル差 ≤ 許容値 → 4 近傍 BFS」を実装している。
+  バケツとの差は **ブラシ半径 (`radius_sq`) で打ち切っている点だけ**。半径無制限版の stamp を足す形になる。
+  色差許容スライダー (`local_adjust_edge_brush_tolerance`、既定 48.0) も UI に既存。
+- 消しゴム / 隠蔽側は色を見るツールが 1 つも無いので新規。`Vec<bool>` 版の flood fill を
+  `mask_db.rs` に置いて 2 面で共有する (前例: [margin_fit.rs](../src/margin_fit.rs) の 8 連結 flood fill)。
+- 塗り範囲モード (2026-08-11 利用者判断): **連結 / 非連結の両対応**。
+  「隣接のみ」チェックボックスで切替える。非連結は BFS 不要の O(n) 1 パスで済み、
+  マンガの白地一括マスクに効く。
+- 境界の扱い: 補正レイヤーは境界判定 (`local_adjust_boundary_pixel_at`) を併用できるが、
+  消しゴム / 隠蔽側にその概念が無い。まずは 3 面とも「色差許容のみ」で揃える。
+- 書き込み先はビットマップのみ。ベクタ図形 (直線 / 矩形 / 楕円) は塗り範囲の障壁にしないし、
+  バケツで書き換えもしない (既存の筆 / 囲みと同じ規約)。
+- **性能が唯一の実装リスク**: `fs_cache` は長辺 8192 に clamp されるので最悪 8192x8192 = 67MP。
+  素朴な per-pixel BFS では UI スレッドで数百 ms〜秒級のヒッチになり得る
+  ([ui-responsiveness.md](ui-responsiveness.md) §4 抵触)。段階的に:
+  1. スキャンライン span fill で実装して 8192px 最悪ケースを実測する。
+  2. 閾値を超えるなら worker 化する。テンプレは同ファイルの領域分割
+     (`local_adjust_segmentation_pending` + `poll_local_adjust_segmentation`) がそのまま使える。
+  - 実測値は着手時にこの項へ書き戻す。
+
+#### (b) 1px 拡張・縮小を消しゴム / 隠蔽にも追加
+
+- 既存実体: `local_adjust_morph_alpha_1px` (3x3 の min/max)、ボタンは
+  `draw_local_manual_mask_tool_panel` の「1px拡張」/「1px縮小」、適用は
+  `apply_local_adjust_bitmap_mask_op`。回帰テストは
+  `bitmap_mask_expand_and_shrink_use_3x3_neighbors`。
+- 消しゴム / 隠蔽へは `Vec<bool>` 版を `mask_db.rs` に置き、
+  `push_undo_snapshot()` → morph → `mark_erase_mask_texture_dirty(None)` →
+  `clear_erase_preview(fs_idx)` の順で適用する (隠蔽は対応する snapshot / dirty / キャッシュ破棄)。
+- **ベクタ図形には効かない** (補正レイヤーの既存規約と同じ)。期待とズレやすいので
+  ボタン近くの説明文で明示する。バケツと組み合わせると、JPEG リンギングで残る
+  輪郭のハロー画素を 1px 拡張で潰せる、という使い方が主用途になる。
+
+#### 触る箇所
+
+```
+src/app.rs                   EraseTool / LocalAdjustMaskTool / ConcealTool に Bucket 追加、
+                             許容値・隣接フラグのフィールド (App 保持で足りる。設定 DB 変更は不要)
+src/mask_db.rs               bool 版 flood fill (連結 / 非連結) + 1px morph
+src/ui_erase.rs              ツール dispatch / パネル / スライダー / 1px ボタン
+src/ui_conceal.rs            同上
+src/ui_adjustment_panel.rs   半径無制限 stamp、Bucket アーム、draw_local_tool_settings
+src/keymap.rs                EraseToolBucket / LaToolBucket / ConcealToolBucket
+                             (ini_name / context / trigger / default_chords / ALL_ACTIONS の 5 点セット)
+docs/keymap.ini.default
+htdocs/mimageviewer/manual/{erase,local-adjustment,conceal}.html
+docs/preset-and-adjustment.md, docs/local-adjustment-layer-v1.1.0-plan.md,
+docs/conceal-feature-plan.md
+```
+
+- 空きキー: `K` が 3 モードとも未使用 (Photoshop の `G` は補正レイヤーで隙間補完が使用中)。
+- スライダー置き場: 消しゴムは `erase_brush_radius` / `erase_line_width` と同じ位置に
+  ツール条件付きで追加 (パネル幅 `PANEL_W=190`、2 ボタン/行に収まる)。
+  補正レイヤーは `draw_local_tool_settings` の match アーム追加のみ。
+- 許容値は `erase_brush_radius` / `local_adjust_edge_brush_tolerance` と同様に
+  App フィールド + Default 値でセッション内保持とし、設定 DB のスキーマは変えない。
+- 優先度: P2 (利用者要望、既存構造に素直に乗る)。着手前に
+  [preset-and-adjustment.md](preset-and-adjustment.md) と
+  [ui-responsiveness.md](ui-responsiveness.md) §4 を読む。
+
 ## 4. 入力カスタマイズ / マウス / ゲームパッド
 
 ### 4.2 音声モードから戻る Z が 1 回だけ効かなかった (未再現・報告者の追加情報待ち)
