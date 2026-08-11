@@ -2131,3 +2131,50 @@ B + C + D0 cutover で `DisplayRequestId` 境界へまとめて移す。
 この増分は dormant である。`app.js` から import せず、既存の `loadSequence` /
 `fetchController` / `foregroundWaiters` / `prefetchPlanned` / `abortUnownedActive` と本体の
 `begin_page_render` はそのまま残るため、実機の表示・protocol version・telemetry は変わらない。
+
+### 14.10 表示所有権 cutover 段階 2: 本体側基盤 (2026-08-11)
+
+段階 2 では本体側に `remote_ipc::page_jobs` と `remote_ipc::heavy_queue` を追加した。
+前者は connection ごとの page job ID、display request ID、需要の生死、単調な
+Prefetch → Foreground 優先度、明示的な release 理由と cancel token を持つ。後者は
+payload に依存しない 3 レーン (Foreground / Interactive / Prefetch) の順序、レーン別容量、
+Prefetch が最後の 1 worker を使わない制約、待機中 job の昇格と剪定、blocking pop /
+shutdown だけを持つ。
+
+優先度の正本は registry であり、queue の lane はその写しである。registry が queue を
+呼ぶ、または queue が registry を呼ぶ構造にはせず、段階 3 の配線側が両者を同じ
+critical section で揃える。両操作は冪等なので、途中の no-op や失敗は typed な結果として
+観測し、次の昇格操作で写しを正本へ追従させられる。
+
+registry の記録は job の `finish` で消える。ただし **connection が切れたときは誰も `finish` を
+呼ばない** (待機中の payload は剪定され、実行中の render は自分の cancel token だけを見る)
+ので、`close_connection` は打ち切りと同時にその connection の記録ごと破棄する終端操作とする。
+再接続のたびに 1 件ずつ残す形にしない。既に走っていた render が後から `finish` を呼ぶと
+`UnknownJob` になるが、これは close 後の想定どおりの結果であり異常ではない。段階 3 の
+配線でこれを警告として記録しないこと。session 失効は connection が生き残り、各 job が
+完了を報告できるので `cancel_all` を使い、記録は残す。
+
+3 レーン化だけで現在の入口拒否を外すのは不十分である。昇格と D0 の需要ベース剪定が
+無いままでは、読者が先へ進んだ後も古い先読みが queue に残り、後着の前景が待たされる。
+現行の `begin_page_render` は worker が queue から pop した後に走るため、queue で待機中の
+先読みを剪定できない。そのため段階 3 では B + C + D0 と一体で enqueue 側へ所有権を移す。
+
+`heavy_queue::prune` は落とした payload を黙って破棄せず呼び出し側へ返す。段階 3 で載せる
+`Work` が client への `reply` を所有しており、剪定した要求へ typed な終端応答を返さないと
+呼び出し元が永久に待つためである。先読みの 1 worker 予約は、入口で要求を拒否する
+方式から queue の pop 条件 (`active < workers - 1`) へ移す設計とした。ただしこの制約は
+**Prefetch に対してだけ**働く。Interactive のサムネイルやコンテナ列挙は全 worker を使えるため、
+それらが実行中なら後着の Foreground page も待つ。読者が列挙の完了を待っているときは
+Interactive も読者が待つ仕事であり、ここまで予約で制限すると grid を不要に遅くするため、
+この狭い保証を意図した仕様とする。この増分では
+`try_acquire_prefetch` の入口拒否を撤去していない。
+
+worker が 1 本の場合は `workers - 1 == 0` のため Prefetch は queue から pop されない。
+現行の入口は `remote_page_prefetch_limit(1) == 0` として typed な 503 を即応答するので、
+段階 2 では回帰ではない。段階 3 で入口拒否を撤去すると、実行不能な Prefetch は client timeout まで
+queue に残り得る。**1-worker pool の実行不能 Prefetch へ誰がいつ typed 応答を返すか**は、
+段階 3 の admission / prune 配線で必ず決める未解決事項とする。
+
+この増分も dormant である。新しい 2 モジュールは request 経路から呼ばれず、現行の
+`sync_channel`、worker 数、queue 容量、`begin_page_render` は変更していない。protocol version も
+据え置きで、実機の表示や telemetry に変化は無い。
