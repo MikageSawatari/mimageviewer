@@ -461,7 +461,13 @@ test("adjustment ranges yield vertical pan without weakening viewer gesture owne
     css,
     /html,\s*body,\s*#app\s*\{[^}]*touch-action:\s*manipulation/
   );
-  assert.doesNotMatch(html, /maximum-scale|user-scalable/i);
+  // 以前はここで maximum-scale / user-scalable を禁じ、ブラウザのピンチ拡大を残していた。
+  // 2 打目の touchend を preventDefault しても iOS の拡大は止まらないことが実測で
+  // 分かったため (suppressed の 46ms 後に scale 1 -> 1.03)、standalone で実際に効く
+  // この指定へ切り替えた。画像のピンチ拡大はアプリが自前で持っている。利用者判断。
+  assert.match(html, /content="[^"]*maximum-scale=1[^"]*"/);
+  assert.match(html, /content="[^"]*user-scalable=no[^"]*"/);
+  assert.match(html, /content="[^"]*viewport-fit=cover[^"]*"/);
 });
 
 test("image fit transforms only the page layer while controls stay its siblings", async () => {

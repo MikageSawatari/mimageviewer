@@ -2,7 +2,11 @@
 <html lang="ja">
   <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <!-- ホーム画面へ追加した standalone では iOS がこの倍率制限を尊重する。通常タブでは
+         無視されるが、そこでも害は無い。JS で 2 打目の touchend を preventDefault しても
+         拡大は止まらないことを実測で確認している (suppressed の 46ms 後に scale 1 → 1.03)。
+         画像のピンチ拡大はアプリが自前で持っているので、失うのは UI 全体の拡大だけ。 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
     <meta name="color-scheme" content="dark">
     <meta name="theme-color" content="#111318">
     <meta name="referrer" content="no-referrer">

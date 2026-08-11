@@ -2030,3 +2030,26 @@ wrap して狭い画面では見出しとドットを別行へ収める。
 (約 24 MiB) なので限界要因ではなく、heavy 枠の admission が先に詰まっている。したがって
 `PAGE_RESOURCE_CACHE_CONFIGURED_BYTES = 64 MiB`、前方 12 / 後方 4、entry 上限 18 を据え置き、
 HUD で詰まり方を観測してから別の変更として判断する。
+
+#### 14.8.1 ブラウザ拡大は viewport で止める (2026-08-11、利用者判断)
+
+ボタンやページ送りを連打すると UI 全体が拡大し、ボタンが見切れる。telemetry の
+`visual_viewport_scale` が 1.03 や 1.6 へ上がったまま戻らないことで裏が取れている。
+
+**JS の二度打ち抑止では止まらない。** 2 打目の `touchend` を `preventDefault()` した
+**46ms 後**に scale が 1 → 1.03 へ上がった記録がある (`pair_suppressed` /
+`suppressed: true` の直後)。`* { touch-action: manipulation }` も全体に効いている状態
+での結果なので、抑止対象を広げても解決しない。実際、ボタンへ広げる案は click 再送を
+伴い、click 以外で起動する部品を壊しかけた (`2ca1454f` を revert)。
+
+そこで viewport meta に **`maximum-scale=1, user-scalable=no`** を入れる。ホーム画面へ
+追加した standalone では iOS がこれを尊重する。通常タブでは無視されるが害は無い。
+
+- **失うもの**: UI 全体をピンチで拡大する操作。**画像のピンチ拡大はアプリが自前で
+  持っている**ので影響しない
+- 以前は逆の判断 (ブラウザのピンチ拡大を残す) を `pwa.test.mjs` の
+  `assert.doesNotMatch(html, /maximum-scale|user-scalable/i)` で固定していた。上の実測を
+  根拠に反転させ、テストも現在の意図を固定する形へ書き換えた
+- JS の二度打ち抑止そのものは残す。standalone 以外では唯一の best-effort であり、
+  いま実害 (タップの取りこぼし) は観測されていない。**ただしこれ単独では拡大を
+  止められない**ことを前提にすること
