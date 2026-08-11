@@ -2030,3 +2030,19 @@ wrap して狭い画面では見出しとドットを別行へ収める。
 (約 24 MiB) なので限界要因ではなく、heavy 枠の admission が先に詰まっている。したがって
 `PAGE_RESOURCE_CACHE_CONFIGURED_BYTES = 64 MiB`、前方 12 / 後方 4、entry 上限 18 を据え置き、
 HUD で詰まり方を観測してから別の変更として判断する。
+
+### 14.8 ボタン上の browser double-tap 抑止と click 再送 (2026-08-11)
+
+iPad 実機で `visual_viewport_scale` が 1.03 に上がったまま戻らず、同時間帯に
+`browser_double_tap` の `excluded_target` / `button` が 16 件出た。文書全体の double-tap owner が
+`button` / `[role="button"]` を除外していたため、主要操作であるページ送りボタンの連打を
+ブラウザ拡大へ渡していた。
+
+button 系は除外ではなく、成立した 2 打目の `touchend` を owner が止めたうえで、対象要素へ
+`bubbles` / `cancelable` / `composed` を立てた click を 1 回だけ再送する。通常は
+`preventDefault` により browser の合成 click は出ないが、実装差で届いた場合も二重起動しないよう、
+再送直後の同一対象・同一タスク境界の browser click だけを document capture で破棄する。リンク、
+テキスト入力、`contenteditable` は navigation / 選択 / caret の既定を再現しないため従来どおり
+除外する。判定、再送、重複排除は `document-double-tap.mjs` に閉じ、app 側へ条件を増やさない。
+
+先読みの 64 MiB 予算、12/4 窓、admission、取消 / lease、表示 outcome は変更していない。

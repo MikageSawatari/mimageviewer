@@ -29,7 +29,10 @@ class FakeEventTarget {
   }
 
   dispatch(type, event) {
-    for (const listener of this.listeners.get(type) ?? []) listener(event);
+    for (const listener of this.listeners.get(type) ?? []) {
+      listener(event);
+      if (event.immediatePropagationStopped) break;
+    }
   }
 }
 
@@ -58,6 +61,34 @@ function dispatchTap(eventTarget, point, preventDefault, target = plainTarget) {
     changedTouches: [point],
     preventDefault,
   }));
+}
+
+function fakeClickEvent(type, init) {
+  return {
+    type,
+    ...init,
+    target: null,
+    defaultPrevented: false,
+    immediatePropagationStopped: false,
+    preventDefault() {
+      if (this.cancelable) this.defaultPrevented = true;
+    },
+    stopImmediatePropagation() {
+      this.immediatePropagationStopped = true;
+    },
+    stopPropagation() {},
+  };
+}
+
+function dispatchBrowserClick(eventTarget, target) {
+  const event = fakeClickEvent("click", {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+  });
+  event.target = target;
+  eventTarget.dispatch("click", event);
+  return event;
 }
 
 test("the browser rule keeps every tap as a candidate and uses its own slop", () => {
@@ -171,7 +202,7 @@ test("document owner preserves the first touchend and prevents only the matching
   owner.destroy();
 });
 
-test("document owner leaves pinch and text editing defaults untouched", () => {
+test("document owner leaves pinch, links, and text editing defaults untouched", () => {
   const eventTarget = new FakeEventTarget();
   let nowMs = 1_000;
   let prevented = 0;
@@ -213,47 +244,94 @@ test("document owner leaves pinch and text editing defaults untouched", () => {
   assert.equal(prevented, 0, "text inputs keep selection and caret defaults");
   assert.equal(decisions.at(-1).exclusionReason, "text_input");
   assert.equal(decisions.at(-1).isDoubleTap, true);
+
+  for (const [reason, selectors] of [
+    ["link", ['a[href]', '[role="button"]']],
+    ["contenteditable", ["[contenteditable]"]],
+  ]) {
+    const target = {
+      closest: (candidate) => selectors.includes(candidate) ? { tagName: "SPAN" } : null,
+    };
+    nowMs += 1_000;
+    dispatchTap(
+      eventTarget,
+      touch(5, 40, 80),
+      () => { prevented += 1; },
+      target
+    );
+    nowMs += 200;
+    dispatchTap(
+      eventTarget,
+      touch(6, 42, 82),
+      () => { prevented += 1; },
+      target
+    );
+    assert.equal(decisions.at(-1).decision, "excluded_target");
+    assert.equal(decisions.at(-1).exclusionReason, reason);
+    assert.equal(decisions.at(-1).suppressed, false);
+  }
+  assert.equal(prevented, 0, "link and editing defaults must not be prevented");
   owner.destroy();
 });
 
-test("activatable targets keep both taps, because preventing one drops its click", () => {
-  const eventTarget = new FakeEventTarget();
-  let nowMs = 1_000;
-  let prevented = 0;
-  const decisions = [];
-  // 実際の closest と同じく、対象に一致する selector のときだけ要素を返す。
-  const buttonTarget = {
-    closest: (selector) => (selector.includes("button") ? { tagName: "BUTTON" } : null),
-  };
-  const owner = installDocumentDoubleTapOwner(eventTarget, {
-    now: () => nowMs,
-    onDecision: (decision) => decisions.push(decision),
-  });
+test("button-like targets suppress the pair and replay the second click exactly once", () => {
+  for (const [reason, selectors] of [
+    ["button", ["button"]],
+    ["role_button", ['[role="button"]']],
+    ["button_role_tab", ["button", '[role="tab"]']],
+  ]) {
+    const eventTarget = new FakeEventTarget();
+    let nowMs = 1_000;
+    let prevented = 0;
+    let clicks = 0;
+    const observedClicks = [];
+    const decisions = [];
+    const button = {
+      disabled: false,
+      contains: (candidate) => candidate === button,
+      closest: (candidate) => selectors.includes(candidate) ? button : null,
+      dispatchEvent(event) {
+        event.target = button;
+        eventTarget.dispatch(event.type, event);
+        return !event.defaultPrevented;
+      },
+    };
+    const owner = installDocumentDoubleTapOwner(eventTarget, {
+      now: () => nowMs,
+      onDecision: (decision) => decisions.push(decision),
+      createClickEvent: fakeClickEvent,
+    });
+    eventTarget.addEventListener("click", (event) => {
+      clicks += 1;
+      observedClicks.push(event);
+    });
 
-  dispatchTap(eventTarget, touch(1, 50, 90), () => { prevented += 1; }, buttonTarget);
-  nowMs = 1_180;
-  dispatchTap(eventTarget, touch(2, 51, 91), () => { prevented += 1; }, buttonTarget);
-  assert.equal(
-    prevented,
-    0,
-    "rapidly tapping a page button twice must activate it twice"
-  );
-  assert.equal(decisions.length, 2);
-  assert.equal(decisions[0].excluded, true);
-  assert.equal(decisions[0].exclusionReason, "button");
-  assert.equal(decisions[1].exclusionReason, "button");
-  assert.equal(decisions[1].elapsedMs, 180);
-  assert.equal(decisions[1].distancePx, Math.hypot(1, 1));
-  assert.equal(decisions[1].isDoubleTap, true);
-  assert.equal(decisions[1].suppressed, false);
+    dispatchTap(eventTarget, touch(1, 50, 90), () => { prevented += 1; }, button);
+    dispatchBrowserClick(eventTarget, button);
+    assert.equal(clicks, 1, "the first browser click must pass through");
 
-  // 操作部品でなければ、これまでどおり 2 打目だけ止める。
-  nowMs = 3_000;
-  dispatchTap(eventTarget, touch(3, 50, 90), () => { prevented += 1; });
-  nowMs = 3_180;
-  dispatchTap(eventTarget, touch(4, 51, 91), () => { prevented += 1; });
-  assert.equal(prevented, 1);
-  owner.destroy();
+    nowMs = 1_180;
+    dispatchTap(eventTarget, touch(2, 51, 91), () => { prevented += 1; }, button);
+    assert.equal(prevented, 1, `${reason} must suppress browser double-tap zoom`);
+    assert.equal(clicks, 2, `${reason} must receive one replayed second click`);
+    assert.equal(observedClicks.at(-1).bubbles, true);
+    assert.equal(observedClicks.at(-1).cancelable, true);
+    assert.equal(observedClicks.at(-1).composed, true);
+    assert.equal(decisions.length, 2);
+    assert.equal(decisions[0].decision, "candidate_started");
+    assert.equal(decisions[1].decision, "pair_suppressed");
+    assert.equal(decisions[1].elapsedMs, 180);
+    assert.equal(decisions[1].distancePx, Math.hypot(1, 1));
+    assert.equal(decisions[1].isDoubleTap, true);
+    assert.equal(decisions[1].suppressed, true);
+    assert.equal(decisions[1].excluded, false);
+    assert.equal(decisions[1].exclusionReason, null);
+
+    const unexpectedBrowserClick = dispatchBrowserClick(eventTarget, button);
+    assert.equal(clicks, 2, "an unexpected browser click must not activate twice");
+    assert.equal(unexpectedBrowserClick.defaultPrevented, true);
+    owner.destroy();
+  }
 });
 
 test("the document owner uses the browser suppression window", () => {
