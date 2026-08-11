@@ -2264,7 +2264,6 @@ struct ViewerContextBundle {
     >,
     thumb_edit_preview_keys: std::collections::HashMap<usize, String>,
     thumb_adjust_tex: std::collections::HashMap<usize, egui::TextureHandle>,
-    passthrough_rendition_cache: PassthroughRenditionCache,
     adjustment_page_params: std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
     local_adjust_page_layers:
         std::collections::HashMap<usize, Vec<local_adjust_core::LocalAdjustmentLayer>>,
@@ -2550,7 +2549,6 @@ impl ViewerContextBundle {
             thumb_edit_preview_layers: std::collections::HashMap::new(),
             thumb_edit_preview_keys: std::collections::HashMap::new(),
             thumb_adjust_tex: std::collections::HashMap::new(),
-            passthrough_rendition_cache: PassthroughRenditionCache::default(),
             adjustment_page_params: std::collections::HashMap::new(),
             local_adjust_page_layers: std::collections::HashMap::new(),
             local_adjust_pages: std::collections::HashSet::new(),
@@ -5910,88 +5908,6 @@ pub(crate) struct FinalCompositeKey {
     pub(crate) bg: u8,
 }
 
-const PASSTHROUGH_RENDITION_CACHE_CAPACITY: usize = 16;
-
-#[derive(Clone)]
-pub(crate) struct PassthroughRenditionEntry {
-    /// The catalog-thumbnail pixels used to build this rendition. The effect
-    /// key intentionally stays on the existing `FinalCompositeKey` system;
-    /// pointer identity closes the separate thumbnail quality-upgrade lifetime.
-    source_pixels: Arc<egui::ColorImage>,
-    // Retain the CPU rendition with the texture so cache entries are complete
-    // and tests can compare the exact final-stage output.
-    _pixels: Arc<egui::ColorImage>,
-    pub(crate) texture: egui::TextureHandle,
-}
-
-/// Small viewer-context-local LRU for page-turn thumbnail renditions.
-///
-/// `FinalCompositeKey` already owns `(idx, edit generation, final-effect
-/// parameters)`, so this cache does not introduce another effect-key system.
-#[derive(Clone, Default)]
-pub(crate) struct PassthroughRenditionCache {
-    entries: std::collections::HashMap<FinalCompositeKey, PassthroughRenditionEntry>,
-    lru: std::collections::VecDeque<FinalCompositeKey>,
-}
-
-impl PassthroughRenditionCache {
-    fn get(
-        &mut self,
-        key: FinalCompositeKey,
-        source_pixels: &Arc<egui::ColorImage>,
-    ) -> Option<PassthroughRenditionEntry> {
-        let source_matches = self
-            .entries
-            .get(&key)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.source_pixels, source_pixels));
-        if !source_matches {
-            self.remove(&key);
-            return None;
-        }
-        self.touch(key);
-        self.entries.get(&key).cloned()
-    }
-
-    fn insert(&mut self, key: FinalCompositeKey, entry: PassthroughRenditionEntry) {
-        self.entries.insert(key, entry);
-        self.touch(key);
-        while self.lru.len() > PASSTHROUGH_RENDITION_CACHE_CAPACITY {
-            if let Some(oldest) = self.lru.pop_front() {
-                self.entries.remove(&oldest);
-            }
-        }
-    }
-
-    fn remove(&mut self, key: &FinalCompositeKey) {
-        self.entries.remove(key);
-        if let Some(pos) = self.lru.iter().position(|candidate| candidate == key) {
-            self.lru.remove(pos);
-        }
-    }
-
-    fn remove_idx(&mut self, idx: usize) {
-        self.entries.retain(|key, _| key.edit_key.idx != idx);
-        self.lru.retain(|key| key.edit_key.idx != idx);
-    }
-
-    fn clear(&mut self) {
-        self.entries.clear();
-        self.lru.clear();
-    }
-
-    fn touch(&mut self, key: FinalCompositeKey) {
-        if let Some(pos) = self.lru.iter().position(|candidate| *candidate == key) {
-            self.lru.remove(pos);
-        }
-        self.lru.push_back(key);
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-}
-
 const FINAL_EFFECT_PREFETCH_BLOCK_LOG_CAPACITY: usize = 256;
 const FINAL_EFFECT_PREFETCH_BLOCK_LOG_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(1);
@@ -6383,31 +6299,6 @@ struct FinalEffectJob {
     colorize: crate::colorize::ColorizeParams,
     creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
     post_filter: crate::adjustment::PostFilter,
-}
-
-fn build_passthrough_rendition_pixels(
-    source: &egui::ColorImage,
-    params: &crate::adjustment::AdjustParams,
-    colorize_applies: bool,
-    creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
-) -> egui::ColorImage {
-    let adjusted = if params.is_color_identity() {
-        source.clone()
-    } else {
-        crate::adjustment::apply_adjustments_fast(source, params)
-    };
-    let colorized = if colorize_applies {
-        let cancel = AtomicBool::new(false);
-        crate::colorize::apply_applicable_with_cancel(&adjusted, &params.colorize, &cancel)
-            .unwrap_or(adjusted)
-    } else {
-        adjusted
-    };
-    if let Some((lut, strength)) = creative_lut {
-        crate::creative_lut::apply_to_color_image(&colorized, &lut, strength)
-    } else {
-        colorized
-    }
 }
 
 fn run_final_effect_job(job: FinalEffectJob, cancel: &AtomicBool) -> FinalEffectResult {
@@ -10707,9 +10598,6 @@ pub struct App {
     /// `effective_params(idx)` が色調 identity でないときのみ格納。
     /// サムネ描画時は `thumbnails[idx].tex` より優先される。
     pub(crate) thumb_adjust_tex: std::collections::HashMap<usize, egui::TextureHandle>,
-    /// ページ送り中だけ使う、色の最終段まで適用した catalog-thumbnail rendition。
-    /// `FinalCompositeKey` と元 thumbnail pixels の identity で照合する viewer-context LRU。
-    pub(crate) passthrough_rendition_cache: PassthroughRenditionCache,
     /// 前フレームのスライダードラッグ状態。true→false 遷移を検知して
     /// release 時に `thumb_adjust_tex` を全無効化する。
     pub(crate) thumb_adjust_was_dragging: bool,
@@ -12932,7 +12820,6 @@ impl App {
             thumb_edit_preview_layers: std::collections::HashMap::new(),
             thumb_edit_preview_keys: std::collections::HashMap::new(),
             thumb_adjust_tex: std::collections::HashMap::new(),
-            passthrough_rendition_cache: PassthroughRenditionCache::default(),
             thumb_adjust_was_dragging: false,
             thumb_adjust_drag_color_dirty: false,
             adjustment_dragging: false,
@@ -14529,7 +14416,6 @@ impl App {
             thumb_edit_preview_layers,
             thumb_edit_preview_keys,
             thumb_adjust_tex,
-            passthrough_rendition_cache,
             adjustment_page_params,
             local_adjust_page_layers,
             local_adjust_pages,
@@ -14762,7 +14648,6 @@ impl App {
         swap_field!(thumb_edit_preview_layers);
         swap_field!(thumb_edit_preview_keys);
         swap_field!(thumb_adjust_tex);
-        swap_field!(passthrough_rendition_cache);
         swap_field!(adjustment_page_params);
         swap_field!(local_adjust_page_layers);
         swap_field!(local_adjust_pages);
@@ -38945,7 +38830,6 @@ impl App {
             thumb_edit_preview_layers,
             thumb_edit_preview_keys,
             thumb_adjust_tex,
-            passthrough_rendition_cache,
             adjustment_page_params,
             local_adjust_page_layers,
             local_adjust_pages,
@@ -39192,7 +39076,6 @@ impl App {
             thumb_edit_preview_layers,
             thumb_edit_preview_keys,
             thumb_adjust_tex,
-            passthrough_rendition_cache,
             adjustment_page_params,
             local_adjust_page_layers,
             local_adjust_pages,
@@ -39251,7 +39134,6 @@ impl App {
         detached.thumb_edit_preview_layers = self.thumb_edit_preview_layers.clone();
         detached.thumb_edit_preview_keys = self.thumb_edit_preview_keys.clone();
         detached.thumb_adjust_tex = self.thumb_adjust_tex.clone();
-        detached.passthrough_rendition_cache = self.passthrough_rendition_cache.clone();
         detached.adjustment_page_params = self.adjustment_page_params.clone();
         detached.local_adjust_page_layers = self.local_adjust_page_layers.clone();
         detached.local_adjust_pages = self.local_adjust_pages.clone();
@@ -51653,7 +51535,6 @@ impl App {
         self.final_ai_failed.retain(|key| key.edit_key.idx != idx);
         self.final_composite_cache
             .retain_with_drop_reason("pipeline_invalidate_idx", |key, _| key.edit_key.idx != idx);
-        self.passthrough_rendition_cache.remove_idx(idx);
         if clear_retained {
             self.clear_retained_final_ai_for_idx(idx);
         }
@@ -51673,7 +51554,6 @@ impl App {
         self.cancel_all_final_effects();
         self.final_composite_cache
             .clear_with_drop_reason("pipeline_invalidate_all");
-        self.passthrough_rendition_cache.clear();
         self.comic_cache.clear();
         self.cancel_all_comic_bakes();
     }
@@ -51688,7 +51568,6 @@ impl App {
         self.cancel_all_final_effects();
         self.final_composite_cache
             .clear_with_drop_reason("session_close");
-        self.passthrough_rendition_cache.clear();
         self.comic_cache.clear();
         self.cancel_all_comic_bakes();
     }
@@ -54537,19 +54416,6 @@ impl App {
         if self.final_effect_pending.is_empty() {
             return;
         }
-        // A ready final-effect result still performs a full-size GPU upload on
-        // the UI thread. While a page-turn edge remains and faithful passthrough
-        // renditions cover the display unit, leave channel results untouched. This upload
-        // gate is independent of paint source: a resident final composite may be
-        // painted without admitting any new upload. Adjacent prefetch results use
-        // the same budget, so the first frame without pending page input collects them.
-        let defer_page_turn_uploads = self.fullscreen_idx.is_some_and(|idx| {
-            self.fs_page_turn_decision_for_frame(ctx, idx)
-                .defer_ui_uploads()
-        });
-        if defer_page_turn_uploads {
-            return;
-        }
         let mut completed = Vec::new();
         let mut disconnected = Vec::new();
         for (&key, pending) in &self.final_effect_pending {
@@ -54738,130 +54604,6 @@ impl App {
         };
         let _ = self.spawn_final_effect_job(ctx, key, job, output_complete, false);
         existing_texture
-    }
-
-    /// Return the final pipeline's colorize decision when it is already known
-    /// without inspecting the reduced thumbnail.
-    ///
-    /// `MonochromeOnly` deliberately refuses to guess while color adjustment
-    /// can change the classifier input, or while the current full-size edit
-    /// summary is absent. In those cases page turning stays on Composite until
-    /// the exact decision material exists.
-    pub(crate) fn passthrough_colorize_decision(
-        &self,
-        idx: usize,
-        params: &crate::adjustment::AdjustParams,
-    ) -> Option<bool> {
-        if self.post_filter_bypassed {
-            return Some(false);
-        }
-        match params.colorize.mode {
-            crate::colorize::ColorizeMode::Disabled => Some(false),
-            crate::colorize::ColorizeMode::AllImages => Some(true),
-            crate::colorize::ColorizeMode::MonochromeOnly => {
-                if !params.is_color_identity() {
-                    return None;
-                }
-                let edit_key = self.current_edit_result_key(idx);
-                if !self.edit_result_cache.contains_key(&edit_key) {
-                    return None;
-                }
-                let summary = self.colorize_mono_summary_cache.get(&idx)?;
-                if summary.edit_key != edit_key {
-                    return None;
-                }
-                Some(crate::colorize::is_near_monochrome_residual(
-                    summary.p95_residual,
-                    params.colorize.mono_tolerance,
-                ))
-            }
-        }
-    }
-
-    /// Build or fetch the page-turn rendition for one catalog thumbnail.
-    ///
-    /// Only the color-final stages are admitted here: color adjustment,
-    /// colorize, and Creative LUT. Edit layers, AI, smart sharpen and post
-    /// filters remain outside this deliberately small synchronous path.
-    pub(crate) fn ensure_passthrough_rendition(
-        &mut self,
-        ctx: &egui::Context,
-        idx: usize,
-    ) -> Option<egui::TextureHandle> {
-        let (catalog_texture, from_edit_preview) = match self.thumbnails.get(idx) {
-            Some(crate::grid_item::ThumbnailState::Loaded {
-                tex,
-                from_edit_preview,
-                ..
-            }) => (tex.clone(), *from_edit_preview),
-            _ => return None,
-        };
-        let source_pixels = self.thumb_pixels.get(&idx)?.clone();
-        let params = self.effective_params(idx).clone();
-        let colorize_applies = self.passthrough_colorize_decision(idx, &params)?;
-        let key = self.final_composite_key_for_pixels(
-            self.current_edit_result_key(idx),
-            source_pixels.size,
-            &params,
-        );
-        if let Some(entry) = self.passthrough_rendition_cache.get(key, &source_pixels) {
-            return Some(entry.texture);
-        }
-
-        let creative_lut = (!self.post_filter_bypassed && !params.creative_lut.is_identity())
-            .then(|| {
-                self.creative_lut_library
-                    .get(params.creative_lut.id)
-                    .map(|lut| (lut, params.creative_lut.strength))
-            })
-            .flatten();
-        let no_color_effect =
-            params.is_color_identity() && !colorize_applies && creative_lut.is_none();
-        let (pixels, texture) = if no_color_effect && !from_edit_preview {
-            (Arc::clone(&source_pixels), catalog_texture)
-        } else {
-            let pixels = Arc::new(build_passthrough_rendition_pixels(
-                &source_pixels,
-                &params,
-                colorize_applies,
-                creative_lut,
-            ));
-            let texture = ctx.load_texture(
-                format!(
-                    "passthrough_rendition_{}_{}_{}_{}",
-                    key.edit_key.idx, key.edit_key.source_gen, key.params_hash, key.bg
-                ),
-                (*pixels).clone(),
-                egui::TextureOptions::LINEAR,
-            );
-            (pixels, texture)
-        };
-        self.passthrough_rendition_cache.insert(
-            key,
-            PassthroughRenditionEntry {
-                source_pixels,
-                _pixels: pixels,
-                texture: texture.clone(),
-            },
-        );
-        Some(texture)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn passthrough_rendition_cache_len_for_test(&self) -> usize {
-        self.passthrough_rendition_cache.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn current_passthrough_rendition_pixels_for_test(
-        &self,
-        idx: usize,
-    ) -> Option<Arc<egui::ColorImage>> {
-        self.passthrough_rendition_cache
-            .entries
-            .iter()
-            .find(|(key, _)| key.edit_key.idx == idx)
-            .map(|(_, entry)| Arc::clone(&entry._pixels))
     }
 
     pub(crate) fn creative_lut_requires_final_effect(
@@ -58076,7 +57818,6 @@ impl App {
         self.bump_adjustment_generation(idx);
         self.final_composite_cache
             .retain_with_drop_reason("final_stage_invalidate", |key, _| key.edit_key.idx != idx);
-        self.passthrough_rendition_cache.remove_idx(idx);
         // comic は final composite を下地にするので連動破棄 + 進行中 bake も cancel
         // (clear_final_pipeline_caches_for_idx と同じ理由)。
         self.comic_cache.remove(&idx);
@@ -60103,26 +59844,17 @@ impl App {
         // ── ペーシング: このフレームで何枚アップロードするか決める ──
         // 1. 現在フルスクリーン表示中の idx (= ユーザーが待っている画像) は即時に処理
         // 2. 他の先読み分は FIFO 先頭から 1 枚だけ取り出す
-        // 3. 同一フレームに未処理のページ送り入力が残る間は 0 枚。worker 完了物は
-        //    backlog に保持し、入力が止まった最初のフレームで通常ペースへ戻す
-        //    (既存の final composite を描けるかどうかとは独立した gate)。
         // backlog は通常 <10 要素なので `Vec::remove` の O(n) は実質コストなし。
         let cur = self.fullscreen_idx;
-        let defer_page_turn_uploads = cur.is_some_and(|idx| {
-            self.fs_page_turn_decision_for_frame(ctx, idx)
-                .defer_ui_uploads()
-        });
         let (mut cur_pos, mut other_pos) = (None, None);
-        if !defer_page_turn_uploads {
-            for (i, (k, _, _)) in self.fs_upload_backlog.iter().enumerate() {
-                if Some(*k) == cur {
-                    cur_pos = Some(i);
-                } else if other_pos.is_none() {
-                    other_pos = Some(i);
-                }
-                if cur_pos.is_some() && other_pos.is_some() {
-                    break;
-                }
+        for (i, (k, _, _)) in self.fs_upload_backlog.iter().enumerate() {
+            if Some(*k) == cur {
+                cur_pos = Some(i);
+            } else if other_pos.is_none() {
+                other_pos = Some(i);
+            }
+            if cur_pos.is_some() && other_pos.is_some() {
+                break;
             }
         }
 
@@ -62079,13 +61811,6 @@ impl App {
 // -----------------------------------------------------------------------
 
 impl eframe::App for App {
-    /// Observe the egui-winit translation boundary for page-turn diagnostics.
-    /// The probe is read-only and enabled only by `--perf-log`.
-    #[cfg(windows)]
-    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        self.emit_fs_page_turn_winit_input_probe(ctx, raw_input);
-    }
-
     /// メインウィンドウ surface のクリア色 (= egui が何も描かなかったフレームで見える色)。
     ///
     /// eframe 既定は near-black `(12,12,12, a=180)` 固定 ([eframe epi.rs] `clear_color`)。

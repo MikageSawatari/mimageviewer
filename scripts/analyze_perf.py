@@ -739,6 +739,9 @@ def _print_page_turn_sources(burst: dict | None) -> None:
 
 
 def cmd_page_turn_check(events: list[dict]) -> int:
+    # v2.13.0 does not emit page-turn events after the pass-through experiment
+    # was removed. An empty trace is therefore a valid no-op check; keep the
+    # analyzer for the next implementation and for archived measurement logs.
     report = analyze_page_turn_invariants(events)
     for violation in report["violations"]:
         invariant = violation["id"]

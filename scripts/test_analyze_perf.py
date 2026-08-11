@@ -461,6 +461,14 @@ class PageTurnInvariantCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertNotIn("I5 violation:", result.stdout)
 
+    def test_check_without_page_turn_events_is_a_successful_no_op(self) -> None:
+        result = self.run_page_turn([
+            {"t": 1.0, "cat": "fs", "kind": "paint", "idx": 3},
+        ])
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("checked bursts=0 violations=0", result.stdout)
+
     def test_without_check_keeps_the_existing_success_output(self) -> None:
         result = self.run_page_turn([
             page_turn(1.0, 1, "materialized"),

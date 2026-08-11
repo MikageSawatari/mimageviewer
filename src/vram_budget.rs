@@ -135,11 +135,10 @@ pub(crate) enum VramSubsystem {
     Thumbnails,
     ThumbTextures,
     ThumbAdjustTex,
-    PassthroughRenditionCache,
 }
 
 impl VramSubsystem {
-    pub(crate) const ALL: [Self; 15] = [
+    pub(crate) const ALL: [Self; 14] = [
         Self::FsCache,
         Self::FinalCompositeCache,
         Self::AdjustmentCache,
@@ -154,7 +153,6 @@ impl VramSubsystem {
         Self::Thumbnails,
         Self::ThumbTextures,
         Self::ThumbAdjustTex,
-        Self::PassthroughRenditionCache,
     ];
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -173,7 +171,6 @@ impl VramSubsystem {
             Self::Thumbnails => "thumbnails",
             Self::ThumbTextures => "thumb_textures",
             Self::ThumbAdjustTex => "thumb_adjust_tex",
-            Self::PassthroughRenditionCache => "passthrough_rendition_cache",
         }
     }
 }

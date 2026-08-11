@@ -836,36 +836,13 @@ AI 待ちの `complete=false` final composite も表示専用の候補である�
 表示はキャッシュ欠落を挟まず原子的に差し替わる。コピー / 書き出しと nav lock 解除は従来どおり
 `complete=true` だけを受け付ける。
 
-#### ページ単位表示のキーリピート中だけ使う通過ページ分岐
+#### ページ単位表示のキーリピート
 
-通常のページ単位表示では、上の優先順位へ入る前に
-`fs_page_turn_decision_for_frame` が `paint_source` と `defer_ui_uploads` を別々に決める。同じ描画先 viewport の Win32
-frame edge queue に未消費の `FsPagePrev` / `FsPageNext`、単ページへフォールバックする
-`FsSpreadShift*`、または固定矢印の前後ページ入力が残り、カタログサムネイルも Loaded なら
-`defer_ui_uploads=true` になる。この upload 保留条件には final composite の在住状態を入れない。
-`paint_source=Thumbnail` になるのは upload 保留中かつ現在の display unit の final composite が
-まだ表示できない場合だけで、既に表示可能なら `paint_source=Composite` のままにする。
-そのため完成画像を一度出せる idx / 見開き unit はサムネイルへ降格せず、同時に新しい full-size upload
-は入力が続く間保留される。この判定に
-経過時間は使わない。同一 egui frame の再 pass は frame / items generation / idx が一致する
-一時 cache の値を読むだけで、入力や cache 在住状態を再評価しない。
-
-`paint_source=Thumbnail` は `resolve_fs_processed_texture` を呼ばず、カタログサムネイルをその idx の
-1 frame として描く。この frame は `ColorizeDisplayUnit` の旧ページ holdover も上に重ねない。
-重ねると `fs.paint` は出ても実際には通過 idx が見えず、「各ページを 1 frame 表示する」契約を
-破るためである。holdover 自体は保持し、停止ページの通常 materialize 待ちでは再び使う。
-`defer_ui_uploads=true` の frame では `poll_prefetch` は decode 完了物を `fs_upload_backlog` まで受け取るが
-`ctx.load_texture` は行わず、`poll_final_effects` も完成結果を channel に残す。この規則は
-`paint_source` と独立している。隣接ページの
-final-effect 先読み結果も、この frame に upload すれば同じ UI 予算を使うため一緒に保留する。
-入力が残らない最初の frame は `defer_ui_uploads=false` へ戻り、通常の優先順位と backlog ペーシングで
-最終品質を作る。サムネイルが無ければ pending 入力中でも `paint_source=Composite` /
-`defer_ui_uploads=false` とし、従来の decode 待ちを
-保つ。これは品質作業だけの合流であり、ナビゲーションは従来どおり 1 frame 1 display unit、各 idx は
-最低 1 回 paint される。見開きは通常描画と同じ `SpreadDisplayUnit` の全ページがサムネイル準備済み、
-なら unit 全体の upload を保留し、さらに display unit 全体の final composite がまだ揃っていないときだけ
-unit 全体をサムネイルで通過表示する。縦 / 横連結読み、
-ホイール、クリック、seek drag、ゲームパッド、スライドショー、編集・解析表示はこの分岐を使わない。
+v2.13.0 では、キーリピート中のページをカタログサムネイルで代替する通過表示を削除した。
+ページ単位表示も通常の優先順位だけを使い、毎フレーム `resolve_fs_processed_texture` で完成画像を
+解決する。final-effect worker の完了結果と `fs_upload_backlog` もページ送り入力では保留せず、
+通常の回収・GPU upload ペースで処理する。次版で再実装するときの設計要件と失敗から得た知見は
+§2.5 を正本とする。
 
 `colorize_display_requires_final_effect(idx)` は、設定が有効かだけでなく、そのページで
 待たずに出せる画素と final-effect worker の出力が視覚的に変わるかを表す gate である。
@@ -1445,11 +1422,13 @@ delta に適用するため、ドラッグ途中の Ctrl 押下 / 解放でも�
 
 ---
 
-### 2.5 ページ送り中の表示規則 (押しっぱなしで通り過ぎるページ)
+### 2.5 ページ送り中の表示規則 (次版でやり直すときの正本)
 
-> **この節がページ送り表示の正本。** `page_turn_decision_for_inputs` / `FsPageTurnDecision` /
-> `colorize_display_requires_final_effect` / `waiting_for_colorize` のいずれかを変更する前に、
-> ここを読むこと。**この領域は繰り返し壊れており、壊れ方が毎回違う。**
+> **v2.13.0 では通過表示の実装を削除した。** `page_turn_decision_for_inputs` /
+> `FsPageTurnDecision` と専用の perf event は現行コードに存在しない。この節は次版でテスト基盤を
+> 先に作って再実装するときの正本として残す。`colorize_display_requires_final_effect` /
+> `waiting_for_colorize`、または新しいページ送り判定を変更・追加する前に、ここを読むこと。
+> **この領域は繰り返し壊れており、壊れ方が毎回違う。**
 > 2026-08-11 の 1 日だけで 3 回退行した (すべて「支配している規則を読まずに判定へ条件を
 > 足した / 反転させた」もの)。
 
@@ -1521,7 +1500,7 @@ I1 violation: burst t=45.222..45.987 idx=123
 | 加工 | サムネイルとの見た目の差 | フルサイズの実測 | 通過表示の扱い |
 | --- | --- | --- | --- |
 | 色調補正 (明るさ / コントラスト / 彩度など) | 色が変わる | `adjust_ms` **0.00ms** | **サムネイルを使う**。理想はサムネイルに補正を適用して出すこと (§2.5.6) |
-| Creative LUT | 色が変わる | `creative_lut_ms` **0.00ms** | 現状は「色の最終段」として待つ側に入っている (R2 の出どころが LUT の報告だったため) |
+| Creative LUT | 色が変わる | `creative_lut_ms` **0.00ms** | 削除前の実装では「色の最終段」として待つ側に入れていた (R2 の出どころが LUT の報告だったため) |
 | カラー化 | **白黒 → カラー**。差が最も大きい | `colorize_apply_ms` 中央値 **7.9ms** / 最大 **135ms** (1123×1648 で 10ms) | **サムネイルを使わない**。完成画像が来るまで前ページを保持し「カラー化中」を表示する |
 | 消しゴム / 隠蔽 / テキスト注釈 | 内容が変わる | 最悪 **1 秒以上** かかりうる | **サムネイルを使う (加工なしで通過してよい)**。待つと R1 / R3 を壊すため、意図的にスキップする |
 
@@ -1537,15 +1516,19 @@ identity でない等)。
 
 見開きでは、**表示単位に含まれるページのどれか 1 つでも代役が成立しないなら、単位全体で
 通過表示を使わない**。片側だけ完成画像にすると、左右で加工の有無が食い違う。
-サムネイルの有無も同じく単位全体で判定する (`fs_page_turn_display_unit_readiness`)。
+サムネイルの有無も同じく単位全体で判定する。削除前は
+`fs_page_turn_display_unit_readiness` がこの役割を持っていたが、次版では壊れた実装を復元せず、
+表示単位の resolver とテストを先に定めてから新しく接続する。
 
 縦・横の連結読みは通過表示の対象外 (スクロールは実体化済みのページを見せるだけなので、
 キーごとの実体化コストが元から出ない)。
 
 #### 2.5.5 トレース不変条件 (機械判定)
 
-上の規則は `fs.page_turn_ready` / `fs.page_turn_decision` の並びに現れる。
-`python scripts/analyze_perf.py <jsonl> page-turn --check` がこれを検査する。
+次版の実装では、上の規則が `fs.page_turn_ready` / `fs.page_turn_decision` の並びに現れるよう
+計装し、`python scripts/analyze_perf.py <jsonl> page-turn --check` で検査する。v2.13.0 は
+これらの event を出さないため、該当 event の無いログに対する `--check` は
+`checked bursts=0 violations=0`、exit 0 の no-op になる。判定器と回帰テストは次版用に残す。
 **規則を変えたらこの不変条件も同時に更新する。**
 
 | ID | 不変条件 | 対応する要件 |
@@ -1556,18 +1539,18 @@ identity でない等)。
 | I4 | バーストの最後の idx は `materialized` で終わる | R4 |
 | I5 | 入力が残っている間 `defer_ui_uploads=true` が維持される | R3 |
 
-**既知の例外**: フォルダ末尾でキーを押し続けると最後のページがサムネイル画質のまま留まる
-(利用者判断 2026-08-10「支障なし」)。I4 はこの場合だけ免除する。
+**削除前に確認した例外**: フォルダ末尾でキーを押し続けると最後のページがサムネイル画質のまま
+留まった (利用者判断 2026-08-10「支障なし」)。次版の判定器でも I4 はこの場合だけ免除する。
 
 #### 2.5.6 未対応 / 次に検討すること
 
 - **サムネイルに色調補正を適用して出す**。`adjust_ms` が実測 0.00ms なので費用はほぼ無い。
-  現状はサムネイルをそのまま出しており、補正前の色が一瞬見える。
+  削除前の初期実装はサムネイルをそのまま出しており、補正前の色が一瞬見えた。
 - **サムネイルをカラー化して出す**。フルサイズで中央値 7.9ms なので、面積比でサムネイルなら
   1ms を下回る見込み。実現すれば「カラー化中」で前ページを保持する必要がなくなり、R1 と R2 を
   同時に満たせる。**ただしトーン階調化のぼかしに固定費がある可能性があるため、サムネイル
   寸法での実測を先に取ること。**
-- **カラー化 Disabled + 色調補正のみ**のページは、現状 `colorize_display_requires_final_effect`
+- **カラー化 Disabled + 色調補正のみ**のページは、`colorize_display_requires_final_effect`
   が `false` を返す (`is_color_identity` を見ているのが `MonochromeOnly` の枝の中だけのため)。
   上の「サムネイルに補正を適用」を入れれば自然に解消する。
 

@@ -370,38 +370,6 @@ pub fn frame_had_key_down(viewport: egui::ViewportId) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FrameKeyDownStats {
-    pub matched_count: usize,
-    pub repeat_count: usize,
-}
-
-/// Count matching key-down edges without consuming the viewport-routed frame queue.
-///
-/// This is intended for perf diagnostics that compare the Win32 subclass queue with
-/// egui's translated `Event::Key` list. Normal dispatch should continue to use the
-/// consume helpers below.
-pub fn frame_key_down_stats<F>(viewport: egui::ViewportId, predicate: F) -> FrameKeyDownStats
-where
-    F: Fn(KeyEdge) -> bool,
-{
-    state()
-        .lock()
-        .map(|guard| {
-            let mut stats = FrameKeyDownStats::default();
-            for edge in
-                guard.frame.iter().copied().filter(|edge| {
-                    edge.source_viewport == viewport && edge.pressed && predicate(*edge)
-                })
-            {
-                stats.matched_count += 1;
-                stats.repeat_count += usize::from(edge.repeat);
-            }
-            stats
-        })
-        .unwrap_or_default()
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConsumeKeyDownResult {
     pub matched_count: usize,
     pub triggered_count: usize,
@@ -699,8 +667,7 @@ unsafe extern "system" fn main_key_input_subclass_proc(
 mod tests {
     use super::{
         KeyEdge, KeyInputState, RawKeyEdge, RegisterHwndResult, ReturnKeyState, TEST_INPUT_LOCK,
-        begin_frame, consume_key_down, frame_key_down_stats, pressed_key_down, set_test_frame,
-        set_test_routed_frame,
+        begin_frame, consume_key_down, pressed_key_down, set_test_frame, set_test_routed_frame,
     };
 
     fn raw_edge(virtual_key: u32, pressed: bool) -> RawKeyEdge {
@@ -826,30 +793,6 @@ mod tests {
         assert!(!pressed_key_down(egui::ViewportId::ROOT, |edge| {
             edge.virtual_key == 0x28
         }));
-    }
-
-    #[test]
-    fn frame_key_down_stats_preserve_cardinality_repeats_and_viewport() {
-        let _serial = TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
-        let source = egui::ViewportId::from_hash_of("stats-source");
-        let sibling = egui::ViewportId::from_hash_of("stats-sibling");
-        let physical = raw_edge(0x25, true).with_source(0x101, source);
-        let mut repeat = physical;
-        repeat.repeat = true;
-        let sibling_edge = raw_edge(0x25, true).with_source(0x202, sibling);
-        set_test_routed_frame(vec![physical, repeat, sibling_edge]);
-
-        let stats = frame_key_down_stats(source, |edge| edge.virtual_key == 0x25);
-        assert_eq!(stats.matched_count, 2);
-        assert_eq!(stats.repeat_count, 1);
-        assert!(pressed_key_down(source, |edge| edge.virtual_key == 0x25));
-        assert_eq!(
-            frame_key_down_stats(sibling, |edge| edge.virtual_key == 0x25).matched_count,
-            1
-        );
     }
 
     #[test]
