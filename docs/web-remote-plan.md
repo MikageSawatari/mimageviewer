@@ -2066,3 +2066,68 @@ seek の入力が消える。拡大を止められない一方で入力欠落だ
   再導入せず受け入れる
 - document listener は zoom の再発と tap 入力の相関を取る唯一の観測点なので撤去しない。
   pair 認識と `visualViewport` の scale 変化の相関を引き続き telemetry に残す
+
+### 14.9 表示所有権 cutover 段階 1: coordinator 契約 (2026-08-11)
+
+段階 1 では `page-coordinator.mjs` を DOM / fetch / timer / `AbortController` に依存しない
+純粋な状態機械として追加し、次の契約を固定した。
+
+1. ジョブを打ち切るのは表示需要と plan 需要がともに空になったときだけとする。例外は
+   session 失効 / context reset が需要全体を無効化する `invalidate` だけであり、通常の入口は
+   cancel token を直接触らず lease を取る / 返す。
+2. ジョブの有効優先度は需要の最大値で、`prefetch` から `foreground` へ単調に上がる。
+   表示需要が外れても降格しない。
+3. `promote` は同じジョブに高々 1 回だけ出す。最初から foreground のジョブには出さない。
+4. まだ開始していない plan 項目を外しても `cancel` effect は出さない。
+5. 表示グループは 1〜2 ページを一単位とし、全員 ready のときだけ `group_ready`、1 枚でも
+   failed / aborted なら `group_failed` を高々 1 回出す。見開きの片側失敗を部分適用せず、
+   反対側で取得済みの byte は cache の判断まで保持する。
+6. `releaseDisplay` 後の要求へ `group_ready` / `group_failed` を出さない。遅れて届いた結果は
+   typed な `ignored` とする。
+7. 完了は key ではなく job ID で照合する。同じ key の新ジョブ開始後に旧 job ID が届いても
+   `stale_job` として無視し、新ジョブと現在の表示要求を変えない。
+8. `releaseDisplay` は冪等で、二重 release は `unknown_request`、同じ request ID の二重 open は
+   `duplicate_request_id` として無視し、需要を二重に増減しない。
+9. 1 要求内の同じ key は 1 需要として数える。
+10. `protectedKeyIds()` は全表示需要を先に、続いて plan の近い順を返し、cache が表示中の
+    全 key を保護集合にできるようにする。
+11. failed / aborted は key の恒久状態ではなく、その job attempt の終端結果とする。
+    `settle` 時点でその attempt を待っていた要求だけへ結果を記録し、key から current job を
+    外す。plan 需要だけでは同じ失敗を自動再試行せず、新しい `openDisplay` を明示的な再試行
+    シグナルとして対象 key の失敗記憶を解除する。key が全需要を失ったときと `invalidate`
+    でも失敗記憶を破棄し、window への再進入時には再試行できるようにする。
+
+effect の順序も `ignored` → `cancel` → `promote` → `start` → group 終端通知に固定した。
+coordinator が所有するのは需要、単調な優先度、job ID とジョブ生死、表示グループ結果である。
+圧縮 byte の保持 / LRU / 破棄 / admission 用の byte 会計は引き続き `PageResourceCache` が持ち、
+coordinator は `hasBytes` と `prefetchAdmits` でその状態を読むだけとする。ただしジョブ登録簿を
+cache と coordinator の 2 箇所へ分裂させないため、foreground / prefetch を問わず全 job ID の
+発行と開始判断は coordinator に一本化する。
+
+完了 / cancel 済み job の履歴は 256 件を上限とし、running job は破棄しない。**まだ需要のある
+key の current job も破棄しない。** 上限は記憶量の制限であって、そこで生きた routing を
+書き換えてはならない (ready のまま current な job を落とすと、読者が既に持っているページを
+もう一度取得しにいく)。これらは需要のある key の数で上限が付き、需要が消えた時点で
+`#reconcile` が current から外して破棄可能になるため、それまでは履歴が上限を少し超える。
+上限から押し出された job ID への遅い `settle` は、保持中なら判別できた `stale_job` /
+`already_settled` から typed な `unknown_job` へ理由の精度だけを落とす。
+
+retry は coordinator に持たせない。`Retry-After`、待機 timer、HTTP の一時失敗判定は副作用を
+実行する adapter の責務であり、再送しても coordinator からは同じ job ID のままである。
+coordinator の `settle` が受けるのは ready / failed / aborted の終端結果だけとする。
+
+`pageResourceKey` は address、target size、render revision、generation、session ID、
+`sessionCacheEpoch`、正規化した render context (`context_address` / `display_slot` /
+`spread_partner`)、補正 preview を固定順の JSON 配列へ直列化する。object は再帰的に key を
+sort する。改行連結を使わないため値中の改行や引用符で欄境界が曖昧にならない。現状は
+`sessionCacheEpoch` が session ID の変化からだけ進み、同時に cache clear されるが、これは
+偶然維持されている不変条件である。epoch 自体を key に含め、将来 epoch だけ進む入口が増えても
+旧 byte を共有しない。補正 preview は内容を identity に含め、cacheable にはしない。
+
+位置の requested / displayed 所有権はこの段階へ前倒ししない。`openDisplay` は将来の位置 owner を
+載せる `groupKey` だけを保持し、§14.5.1 の非位置再描画による追い越しと bookmark jump の 2 経路は
+B + C + D0 cutover で `DisplayRequestId` 境界へまとめて移す。
+
+この増分は dormant である。`app.js` から import せず、既存の `loadSequence` /
+`fetchController` / `foregroundWaiters` / `prefetchPlanned` / `abortUnownedActive` と本体の
+`begin_page_render` はそのまま残るため、実機の表示・protocol version・telemetry は変わらない。
