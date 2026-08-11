@@ -1873,7 +1873,10 @@ export function viewerGestureDecision({
   pinched = false,
   swipeThreshold = 52,
   axisDominance = 1.25,
-  tapDistance = 12,
+  // swipe の半分。連打で指を弾くように離すと 12〜20px は普通に滑るので
+  // (実測 dy -12〜-18px / 45〜65ms)、12px では tap が丸ごと落ちる。一方で
+  // swipe に近い距離まで許すと、曖昧なドラッグまでページを送ってしまう。
+  tapDistance = swipeThreshold / 2,
   tapDurationMs = 450,
 }) {
   if (cancelled || pinched) return null;

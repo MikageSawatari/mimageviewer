@@ -1823,6 +1823,19 @@ test("viewer gesture separates vertical and horizontal swipes", () => {
     viewerGestureDecision({ dx: 60, dy: 50, elapsedMs: 180 }),
     null
   );
+  // 連打で指を弾くように離すと縦に 12〜20px 滑る (実機実測)。これを tap から
+  // 外すと、swipe にも届かないのでどの操作にもならず、ページ送りが消える。
+  for (const [dx, dy, elapsedMs] of [
+    [-3, -17, 65],
+    [-9, -18, 47],
+    [-5, -15, 45],
+  ]) {
+    assert.equal(
+      viewerGestureDecision({ dx, dy, elapsedMs }),
+      ViewerGesture.TAP,
+      `dx=${dx} dy=${dy}`
+    );
+  }
 });
 
 test("viewer panel dimensions follow portrait bottom-half and landscape left-40-percent rules", () => {
