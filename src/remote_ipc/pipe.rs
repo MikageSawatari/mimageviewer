@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -39,6 +40,10 @@ use windows::core::PCWSTR;
 
 use super::collections::CollectionEngine;
 use super::container::ContainerEngine;
+use super::heavy_queue::{
+    CompleteHeavyQueueResult, HeavyQueue, HeavyQueueCapacities, HeavyQueueItem, HeavyQueueLane,
+    HeavyQueuePushErrorKind, HeavyQueueSnapshot, PromoteHeavyQueueResult,
+};
 use super::page_jobs::{
     DisplayRequestId, PageJobCancelCause, PageJobId, PageJobPriority, PageJobRegistry,
     PromotePageJobResult, RegisterPageJobError, ReleasePageJobResult,
@@ -54,19 +59,24 @@ const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 const PIPE_MAX_INSTANCES: u32 = 16;
 /// 再接続が集中しても待機中 instance を切らさないため、常時この本数を accept 待ちにする。
 const ACCEPTOR_COUNT: usize = 4;
-const HEAVY_WORK_QUEUE_CAPACITY: usize = 16;
+// remote-web admits at most four concurrent heavy IPC requests. Eight slots leave headroom for
+// promotion/reconnect overlap without treating this queue as a bulk backlog; Interactive keeps
+// the old capacity because direct IPC clients may mix thumbnails and container enumeration.
+const HEAVY_WORK_QUEUE_CAPACITIES: HeavyQueueCapacities = HeavyQueueCapacities {
+    foreground: 8,
+    interactive: 16,
+    prefetch: 8,
+};
 const HOME_WORK_QUEUE_CAPACITY: usize = 8;
 const WRITE_WORK_QUEUE_CAPACITY: usize = 16;
 const STREAM_WORK_QUEUE_CAPACITY: usize = 32;
 const STREAM_WORKER_COUNT: usize = 4;
-const MAX_CONCURRENT_PAGE_PREFETCH: usize = 2;
 
 enum Work {
     Request {
         message: ClientMessage,
         reply: mpsc::Sender<ServerMessage>,
         enqueued_at: Instant,
-        _prefetch_permit: Option<PrefetchPermit>,
         session_operation: SessionOperation,
         page_job: Option<PageJobWork>,
     },
@@ -94,14 +104,341 @@ enum WorkLane {
     Stream,
 }
 
-struct PrefetchPermit {
-    in_flight: Arc<AtomicUsize>,
+type HeavyKey = (u64, u64);
+type PageJobKey = (u64, PageJobId);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeavyEnqueueErrorKind {
+    Cancelled,
+    PrefetchUnavailableWithSingleWorker,
+    LaneFull,
+    DuplicateKey,
+    Shutdown,
 }
 
-impl Drop for PrefetchPermit {
-    fn drop(&mut self) {
-        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+impl HeavyEnqueueErrorKind {
+    fn log_reason(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled_before_enqueue",
+            Self::PrefetchUnavailableWithSingleWorker => "prefetch_unavailable_with_single_worker",
+            Self::LaneFull => "lane_full",
+            Self::DuplicateKey => "duplicate_key",
+            Self::Shutdown => "shutdown",
+        }
     }
+}
+
+struct HeavyEnqueueError {
+    kind: HeavyEnqueueErrorKind,
+    lane: HeavyQueueLane,
+    work: Work,
+}
+
+struct HeavyQueueWiring {
+    queue: HeavyQueue<HeavyKey, Work>,
+    registry: Arc<PageJobRegistry>,
+    worker_count: usize,
+    /// Glue-only mirror from the registry identity to the queue identity. Neither owner calls the
+    /// other; every paired registry/queue transition is serialized by this mutex.
+    page_keys: Mutex<HashMap<PageJobKey, HeavyKey>>,
+}
+
+impl HeavyQueueWiring {
+    fn new(worker_count: usize, registry: Arc<PageJobRegistry>) -> Self {
+        Self::new_with_capacities(worker_count, HEAVY_WORK_QUEUE_CAPACITIES, registry)
+    }
+
+    fn new_with_capacities(
+        worker_count: usize,
+        capacities: HeavyQueueCapacities,
+        registry: Arc<PageJobRegistry>,
+    ) -> Self {
+        Self {
+            queue: HeavyQueue::new(worker_count, capacities),
+            registry,
+            worker_count,
+            page_keys: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn enqueue(&self, connection_id: u64, work: Work) -> Result<HeavyQueueLane, HeavyEnqueueError> {
+        self.enqueue_inner(connection_id, work)
+    }
+
+    fn enqueue_inner(
+        &self,
+        connection_id: u64,
+        work: Work,
+    ) -> Result<HeavyQueueLane, HeavyEnqueueError> {
+        let (request_id, lane, page_key, cancelled) = heavy_work_metadata(&work);
+        let key = (connection_id, request_id);
+        let mut page_keys = self
+            .page_keys
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if cancelled {
+            return Err(HeavyEnqueueError {
+                kind: HeavyEnqueueErrorKind::Cancelled,
+                lane,
+                work,
+            });
+        }
+        if lane == HeavyQueueLane::Prefetch && self.worker_count == 1 {
+            return Err(HeavyEnqueueError {
+                kind: HeavyEnqueueErrorKind::PrefetchUnavailableWithSingleWorker,
+                lane,
+                work,
+            });
+        }
+        self.push_locked(&mut page_keys, page_key, key, lane, work)
+    }
+
+    fn push_locked(
+        &self,
+        page_keys: &mut HashMap<PageJobKey, HeavyKey>,
+        page_key: Option<PageJobKey>,
+        key: HeavyKey,
+        lane: HeavyQueueLane,
+        work: Work,
+    ) -> Result<HeavyQueueLane, HeavyEnqueueError> {
+        match self.queue.push(key, lane, work) {
+            Ok(()) => {
+                if let Some(page_key) = page_key {
+                    if let Some(previous_key) = page_keys.insert(page_key.clone(), key) {
+                        crate::logger::log(format!(
+                            "remote_ipc: page_queue_reconcile action=map_insert result=replaced connection_id={} job_id={} previous_request_id={} request_id={}",
+                            page_key.0,
+                            page_key.1.as_str(),
+                            previous_key.1,
+                            key.1,
+                        ));
+                    }
+                }
+                Ok(lane)
+            }
+            Err(error) => {
+                let kind = match error.kind() {
+                    HeavyQueuePushErrorKind::LaneFull => HeavyEnqueueErrorKind::LaneFull,
+                    HeavyQueuePushErrorKind::DuplicateKey => HeavyEnqueueErrorKind::DuplicateKey,
+                    HeavyQueuePushErrorKind::Shutdown => HeavyEnqueueErrorKind::Shutdown,
+                };
+                let (_, work, lane) = error.into_item().into_parts();
+                Err(HeavyEnqueueError { kind, lane, work })
+            }
+        }
+    }
+
+    fn pop(&self) -> Option<HeavyQueueItem<HeavyKey, Work>> {
+        self.queue.pop()
+    }
+
+    fn complete(&self, key: &HeavyKey, page_key: Option<&PageJobKey>) -> CompleteHeavyQueueResult {
+        let mut page_keys = self
+            .page_keys
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(page_key) = page_key
+            && page_keys.get(page_key) == Some(key)
+        {
+            page_keys.remove(page_key);
+        }
+        self.queue.complete(key)
+    }
+
+    fn promote_page(
+        &self,
+        connection_id: u64,
+        job_id: &PageJobId,
+        display_request_id: DisplayRequestId,
+    ) -> PromotePageJobResult {
+        let display_request_present = !display_request_id.as_str().is_empty();
+        let page_keys = self
+            .page_keys
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let result = self
+            .registry
+            .promote(connection_id, job_id, display_request_id);
+        if matches!(
+            result,
+            PromotePageJobResult::Promoted | PromotePageJobResult::AlreadyForeground
+        ) && let Some(key) = page_keys.get(&(connection_id, job_id.clone()))
+        {
+            let queue_result = self.queue.promote(key);
+            log_page_queue_promotion(
+                connection_id,
+                job_id,
+                display_request_present,
+                result,
+                queue_result,
+            );
+        }
+        result
+    }
+
+    fn release_page(
+        &self,
+        connection_id: u64,
+        job_id: &PageJobId,
+        cause: PageJobCancelCause,
+    ) -> (ReleasePageJobResult, Vec<Work>) {
+        let mut page_keys = self
+            .page_keys
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let result = self.registry.release(connection_id, job_id, cause);
+        let removed = if matches!(
+            result,
+            ReleasePageJobResult::Released | ReleasePageJobResult::AlreadyReleased { .. }
+        ) {
+            page_keys
+                .get(&(connection_id, job_id.clone()))
+                .copied()
+                .map(|key| self.queue.prune(|queued_key, _, _| *queued_key == key))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !removed.is_empty() {
+            page_keys.remove(&(connection_id, job_id.clone()));
+        }
+        (result, heavy_payloads(removed))
+    }
+
+    fn close_connection(&self, connection_id: u64) -> Vec<Work> {
+        let mut page_keys = self
+            .page_keys
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let result = self
+            .registry
+            .close_connection(connection_id, PageJobCancelCause::ConnectionClosed);
+        let removed = self
+            .queue
+            .prune(|(queued_connection_id, _), _, _| *queued_connection_id == connection_id);
+        page_keys.retain(|(job_connection_id, _), _| *job_connection_id != connection_id);
+        log_connection_prune(
+            connection_id,
+            result.released,
+            result.already_released,
+            removed.len(),
+        );
+        heavy_payloads(removed)
+    }
+
+    fn stop(&self) -> Vec<Work> {
+        let mut page_keys = self
+            .page_keys
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.registry.stop(PageJobCancelCause::ServiceStopping);
+        let removed = self.queue.shutdown();
+        page_keys.clear();
+        heavy_payloads(removed)
+    }
+
+    fn snapshot(&self) -> HeavyQueueSnapshot {
+        self.queue.snapshot()
+    }
+}
+
+struct HeavyCompletionGuard<'a> {
+    wiring: &'a HeavyQueueWiring,
+    key: HeavyKey,
+    lane: HeavyQueueLane,
+    page_key: Option<PageJobKey>,
+    completed: bool,
+}
+
+impl<'a> HeavyCompletionGuard<'a> {
+    fn new(
+        wiring: &'a HeavyQueueWiring,
+        key: HeavyKey,
+        lane: HeavyQueueLane,
+        page_key: Option<PageJobKey>,
+    ) -> Self {
+        Self {
+            wiring,
+            key,
+            lane,
+            page_key,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) -> CompleteHeavyQueueResult {
+        self.completed = true;
+        self.wiring.complete(&self.key, self.page_key.as_ref())
+    }
+}
+
+impl Drop for HeavyCompletionGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.completed = true;
+            let _ = self.wiring.complete(&self.key, self.page_key.as_ref());
+        }
+    }
+}
+
+fn heavy_work_metadata(work: &Work) -> (u64, HeavyQueueLane, Option<PageJobKey>, bool) {
+    match work {
+        Work::Request {
+            message, page_job, ..
+        } => (
+            message.id(),
+            heavy_queue_lane(message, page_job.as_ref()),
+            page_job_key(page_job.as_ref()),
+            page_job_cancelled(page_job.as_ref()),
+        ),
+        Work::Stop => unreachable!(),
+    }
+}
+
+fn page_job_key(page_job: Option<&PageJobWork>) -> Option<PageJobKey> {
+    page_job.map(|job| (job.connection_id, job.job_id.clone()))
+}
+
+fn page_job_cancelled(page_job: Option<&PageJobWork>) -> bool {
+    page_job.is_some_and(|job| job.cancel.load(Ordering::Acquire))
+}
+
+fn heavy_queue_lane(message: &ClientMessage, page_job: Option<&PageJobWork>) -> HeavyQueueLane {
+    match message {
+        ClientMessage::Page { .. } => match effective_page_priority(page_job.unwrap()) {
+            PagePriority::Foreground => HeavyQueueLane::Foreground,
+            PagePriority::Prefetch => HeavyQueueLane::Prefetch,
+        },
+        _ => HeavyQueueLane::Interactive,
+    }
+}
+
+fn heavy_payloads(items: Vec<HeavyQueueItem<HeavyKey, Work>>) -> Vec<Work> {
+    items.into_iter().map(|item| item.into_parts().1).collect()
+}
+
+fn log_page_queue_promotion(
+    connection_id: u64,
+    job_id: &PageJobId,
+    display_request_present: bool,
+    registry: PromotePageJobResult,
+    queue: PromoteHeavyQueueResult,
+) {
+    crate::logger::log(format!(
+        "remote_ipc: page_queue_reconcile action=promote connection_id={connection_id} job_id={} display_request_present={display_request_present} registry={registry:?} queue={queue:?}",
+        job_id.as_str()
+    ));
+}
+
+fn log_connection_prune(
+    connection_id: u64,
+    released: usize,
+    already_released: usize,
+    pruned: usize,
+) {
+    crate::logger::log(format!(
+        "remote_ipc: page_queue_reconcile action=close_connection connection_id={connection_id} registry_released={released} registry_already_released={already_released} queue_pruned={pruned}"
+    ));
 }
 
 struct QueueMetrics {
@@ -146,6 +483,92 @@ impl QueueMetrics {
     }
 }
 
+struct QueueLogState {
+    queued: usize,
+    active: usize,
+    lane_fields: String,
+}
+
+enum ExecutionQueue<'a> {
+    Metrics(&'a QueueMetrics),
+    Heavy(HeavyCompletionGuard<'a>),
+}
+
+impl ExecutionQueue<'_> {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Metrics(metrics) => metrics.name,
+            Self::Heavy(_) => "heavy",
+        }
+    }
+
+    fn started(&self) -> QueueLogState {
+        match self {
+            Self::Metrics(metrics) => {
+                let (queued, active) = metrics.started();
+                QueueLogState {
+                    queued,
+                    active,
+                    lane_fields: String::new(),
+                }
+            }
+            Self::Heavy(completion) => {
+                heavy_queue_log_state(completion.wiring.snapshot(), Some(completion.lane))
+            }
+        }
+    }
+
+    fn finished(&mut self) -> QueueLogState {
+        match self {
+            Self::Metrics(metrics) => {
+                let (queued, active) = metrics.finished();
+                QueueLogState {
+                    queued,
+                    active,
+                    lane_fields: String::new(),
+                }
+            }
+            Self::Heavy(completion) => {
+                if completion.complete() == CompleteHeavyQueueResult::UnknownKey {
+                    crate::logger::log(format!(
+                        "remote_ipc: page_queue_reconcile action=complete key={:?} queue=unknown_key",
+                        completion.key
+                    ));
+                }
+                heavy_queue_log_state(completion.wiring.snapshot(), Some(completion.lane))
+            }
+        }
+    }
+}
+
+fn heavy_queue_log_state(
+    snapshot: HeavyQueueSnapshot,
+    lane: Option<HeavyQueueLane>,
+) -> QueueLogState {
+    let lane = lane.map(heavy_lane_name).unwrap_or("none");
+    QueueLogState {
+        queued: snapshot.queued(),
+        active: snapshot.active(),
+        lane_fields: format!(
+            " lane={lane} foreground_queued={} foreground_active={} interactive_queued={} interactive_active={} prefetch_queued={} prefetch_active={}",
+            snapshot.foreground.queued,
+            snapshot.foreground.active,
+            snapshot.interactive.queued,
+            snapshot.interactive.active,
+            snapshot.prefetch.queued,
+            snapshot.prefetch.active,
+        ),
+    }
+}
+
+fn heavy_lane_name(lane: HeavyQueueLane) -> &'static str {
+    match lane {
+        HeavyQueueLane::Foreground => "foreground",
+        HeavyQueueLane::Interactive => "interactive",
+        HeavyQueueLane::Prefetch => "prefetch",
+    }
+}
+
 struct ConnectionLifecycle {
     id: u64,
     started_at: Instant,
@@ -168,14 +591,13 @@ pub(super) struct ServerGuard {
     stream_workers: Vec<std::thread::JoinHandle<()>>,
     home_worker: Option<std::thread::JoinHandle<()>>,
     write_worker: Option<std::thread::JoinHandle<()>>,
-    heavy_work_tx: mpsc::SyncSender<Work>,
+    heavy_queue: Arc<HeavyQueueWiring>,
     home_work_tx: mpsc::SyncSender<Work>,
     write_work_tx: mpsc::SyncSender<Work>,
     stream_work_tx: mpsc::SyncSender<Work>,
     session_runtime: SessionRuntime,
     _ai_jobs: Arc<super::ai_job::RemoteAiJobRegistry>,
     _archive_jobs: Arc<super::archive_job::RemoteArchiveJobRegistry>,
-    page_jobs: Arc<PageJobRegistry>,
 }
 
 impl ServerGuard {
@@ -223,18 +645,15 @@ impl ServerGuard {
         let collection_engine = Arc::new(CollectionEngine::new_with_live_favorites(
             settings, favorites,
         ));
-        let (heavy_work_tx, heavy_work_rx) = mpsc::sync_channel::<Work>(HEAVY_WORK_QUEUE_CAPACITY);
-        let heavy_work_rx = Arc::new(Mutex::new(heavy_work_rx));
+        let heavy_queue = Arc::new(HeavyQueueWiring::new(worker_count, Arc::clone(&page_jobs)));
         let (home_work_tx, home_work_rx) = mpsc::sync_channel::<Work>(HOME_WORK_QUEUE_CAPACITY);
         let (write_work_tx, write_work_rx) = mpsc::sync_channel::<Work>(WRITE_WORK_QUEUE_CAPACITY);
         let (stream_work_tx, stream_work_rx) =
             mpsc::sync_channel::<Work>(STREAM_WORK_QUEUE_CAPACITY);
         let stream_work_rx = Arc::new(Mutex::new(stream_work_rx));
-        let heavy_metrics = Arc::new(QueueMetrics::new("heavy"));
         let home_metrics = Arc::new(QueueMetrics::new("home"));
         let write_metrics = Arc::new(QueueMetrics::new("write"));
         let stream_metrics = Arc::new(QueueMetrics::new("stream"));
-        let prefetch_in_flight = Arc::new(AtomicUsize::new(0));
         let home_collection_engine = Arc::clone(&collection_engine);
         let home_container_engine = Arc::clone(&container_engine);
         let home_worker_metrics = Arc::clone(&home_metrics);
@@ -265,23 +684,21 @@ impl ServerGuard {
             .map_err(|error| format!("remote IPC write worker を開始できません: {error}"))?;
         let mut workers = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
-            let work_rx = Arc::clone(&heavy_work_rx);
+            let worker_queue = Arc::clone(&heavy_queue);
             let thumbnail_engine = Arc::clone(&thumbnail_engine);
             let container_engine = Arc::clone(&container_engine);
             let collection_engine = Arc::clone(&collection_engine);
             let session = session_handle.clone();
-            let worker_metrics = Arc::clone(&heavy_metrics);
             workers.push(
                 std::thread::Builder::new()
                     .name(format!("remote-thumb-{index}"))
                     .spawn(move || {
                         worker_loop(
-                            &work_rx,
+                            &worker_queue,
                             &thumbnail_engine,
                             &container_engine,
                             &collection_engine,
                             &session,
-                            &worker_metrics,
                             index,
                         )
                     })
@@ -311,16 +728,14 @@ impl ServerGuard {
         let mut listeners = Vec::with_capacity(ACCEPTOR_COUNT);
         for (index, initial_pipe) in initial_pipes.into_iter().enumerate() {
             let listener_stop = Arc::clone(&stop);
-            let listener_heavy_tx = heavy_work_tx.clone();
+            let listener_heavy_queue = Arc::clone(&heavy_queue);
             let listener_home_tx = home_work_tx.clone();
             let listener_write_tx = write_work_tx.clone();
             let listener_stream_tx = stream_work_tx.clone();
-            let listener_heavy_metrics = Arc::clone(&heavy_metrics);
             let listener_home_metrics = Arc::clone(&home_metrics);
             let listener_write_metrics = Arc::clone(&write_metrics);
             let listener_stream_metrics = Arc::clone(&stream_metrics);
             let listener_next_connection_id = Arc::clone(&next_connection_id);
-            let listener_prefetch_in_flight = Arc::clone(&prefetch_in_flight);
             let listener_session = session_handle.clone();
             let listener_page_jobs = Arc::clone(&page_jobs);
             match std::thread::Builder::new()
@@ -328,17 +743,14 @@ impl ServerGuard {
                 .spawn(move || {
                     acceptor_loop(
                         listener_stop,
-                        listener_heavy_tx,
+                        listener_heavy_queue,
                         listener_home_tx,
                         listener_write_tx,
                         listener_stream_tx,
-                        listener_heavy_metrics,
                         listener_home_metrics,
                         listener_write_metrics,
                         listener_stream_metrics,
                         listener_next_connection_id,
-                        listener_prefetch_in_flight,
-                        worker_count,
                         listener_session,
                         listener_page_jobs,
                         initial_pipe,
@@ -354,9 +766,7 @@ impl ServerGuard {
                     for listener in listeners {
                         let _ = listener.join();
                     }
-                    for _ in 0..worker_count {
-                        let _ = heavy_work_tx.send(Work::Stop);
-                    }
+                    respond_stopped_works(heavy_queue.stop(), "listener_start_failed");
                     let _ = home_work_tx.send(Work::Stop);
                     let _ = write_work_tx.send(Work::Stop);
                     for _ in 0..STREAM_WORKER_COUNT {
@@ -376,8 +786,10 @@ impl ServerGuard {
         }
 
         crate::logger::log(format!(
-            "remote_ipc: listening pipe={PIPE_NAME} protocol={PROTOCOL_VERSION} heavy_workers={worker_count} configured_workers={configured_worker_count} home_workers=1 write_workers=1 stream_workers={STREAM_WORKER_COUNT} prefetch_limit={} acceptors={ACCEPTOR_COUNT} multiplexed=true",
-            remote_page_prefetch_limit(worker_count)
+            "remote_ipc: listening pipe={PIPE_NAME} protocol={PROTOCOL_VERSION} heavy_workers={worker_count} configured_workers={configured_worker_count} home_workers=1 write_workers=1 stream_workers={STREAM_WORKER_COUNT} heavy_foreground_capacity={} heavy_interactive_capacity={} heavy_prefetch_capacity={} acceptors={ACCEPTOR_COUNT} multiplexed=true",
+            HEAVY_WORK_QUEUE_CAPACITIES.foreground,
+            HEAVY_WORK_QUEUE_CAPACITIES.interactive,
+            HEAVY_WORK_QUEUE_CAPACITIES.prefetch,
         ));
         Ok(Self {
             stop,
@@ -386,14 +798,13 @@ impl ServerGuard {
             stream_workers,
             home_worker: Some(home_worker),
             write_worker: Some(write_worker),
-            heavy_work_tx,
+            heavy_queue,
             home_work_tx,
             write_work_tx,
             stream_work_tx,
             session_runtime,
             _ai_jobs: ai_jobs,
             _archive_jobs: archive_jobs,
-            page_jobs,
         })
     }
 
@@ -404,16 +815,13 @@ impl ServerGuard {
 
 impl Drop for ServerGuard {
     fn drop(&mut self) {
-        self.page_jobs.stop(PageJobCancelCause::ServiceStopping);
+        respond_stopped_works(self.heavy_queue.stop(), "service_stopping");
         self.stop.store(true, Ordering::Release);
         for _ in 0..self.listeners.len() {
             poke_listener();
         }
         for listener in self.listeners.drain(..) {
             let _ = listener.join();
-        }
-        for _ in 0..self.workers.len() {
-            let _ = self.heavy_work_tx.send(Work::Stop);
         }
         let _ = self.home_work_tx.send(Work::Stop);
         let _ = self.write_work_tx.send(Work::Stop);
@@ -439,42 +847,46 @@ impl Drop for ServerGuard {
 fn remote_heavy_worker_count(configured_worker_count: usize) -> usize {
     // IPC decode がローカル表示用 worker と CPU / disk を奪い合わないよう、
     // 利用者設定の半分かつ最大 3 本だけを remote 専用にする。3 本ある場合も
-    // prefetch は最大 2 本までに制限し、残る 1 本を foreground に予約する。
+    // queue の pop 条件が prefetch を最大 2 本までに制限し、最後の 1 本を残す。
     (configured_worker_count / 2).clamp(1, 3)
 }
 
 fn worker_loop(
-    work_rx: &Mutex<mpsc::Receiver<Work>>,
+    work_queue: &HeavyQueueWiring,
     thumbnail_engine: &ThumbnailEngine,
     container_engine: &ContainerEngine,
     collection_engine: &CollectionEngine,
     session: &SessionHandle,
-    metrics: &QueueMetrics,
     worker_index: usize,
 ) {
     crate::logger::log(format!(
-        "remote_ipc: worker_started queue={} worker={worker_index}",
-        metrics.name
+        "remote_ipc: worker_started queue=heavy worker={worker_index}"
     ));
     let context = WorkerContext::open();
     loop {
-        let work = {
-            let receiver = work_rx.lock().unwrap_or_else(|error| error.into_inner());
-            receiver.recv()
+        let Some(item) = work_queue.pop() else {
+            break;
         };
+        let lane = item.lane();
+        let (key, work, item_lane) = item.into_parts();
+        debug_assert_eq!(lane, item_lane);
         match work {
-            Ok(Work::Request {
+            Work::Request {
                 message,
                 reply,
                 enqueued_at,
-                _prefetch_permit,
                 session_operation,
                 page_job,
-            }) => execute_work(
+            } => execute_work(
                 message,
                 reply,
                 enqueued_at,
-                metrics,
+                ExecutionQueue::Heavy(HeavyCompletionGuard::new(
+                    work_queue,
+                    key,
+                    lane,
+                    page_job_key(page_job.as_ref()),
+                )),
                 &format!("heavy-{worker_index}"),
                 session_operation,
                 page_job,
@@ -607,12 +1019,11 @@ fn worker_loop(
                     }
                 },
             ),
-            Ok(Work::Stop) | Err(_) => break,
+            Work::Stop => unreachable!(),
         }
     }
     crate::logger::log(format!(
-        "remote_ipc: worker_stopped queue={} worker={worker_index}",
-        metrics.name
+        "remote_ipc: worker_stopped queue=heavy worker={worker_index}"
     ));
 }
 
@@ -629,14 +1040,13 @@ fn home_worker_loop(
                 message,
                 reply,
                 enqueued_at,
-                _prefetch_permit,
                 session_operation,
                 page_job,
             }) => execute_work(
                 message,
                 reply,
                 enqueued_at,
-                metrics,
+                ExecutionQueue::Metrics(metrics),
                 "home-0",
                 session_operation,
                 page_job,
@@ -1104,7 +1514,7 @@ fn execute_work(
     message: ClientMessage,
     reply: mpsc::Sender<ServerMessage>,
     enqueued_at: Instant,
-    metrics: &QueueMetrics,
+    mut queue: ExecutionQueue<'_>,
     worker: &str,
     session_operation: SessionOperation,
     page_job: Option<PageJobWork>,
@@ -1118,11 +1528,14 @@ fn execute_work(
         },
         _ => request_kind(&message),
     };
-    let (queued, active) = metrics.started();
+    let queue_name = queue.name();
+    let queue_state = queue.started();
+    let queued = queue_state.queued;
+    let active = queue_state.active;
+    let lane_fields = &queue_state.lane_fields;
     let registry_fields = page_registry_log_fields(page_job.as_ref());
     crate::logger::log(format!(
-        "remote_ipc: worker_start request_id={request_id} kind={request_kind} queue={} worker={worker} queue_wait_ms={:.1} queued={queued} active={active}{registry_fields}",
-        metrics.name,
+        "remote_ipc: worker_start request_id={request_id} kind={request_kind} queue={queue_name} worker={worker} queue_wait_ms={:.1} queued={queued} active={active}{lane_fields}{registry_fields}",
         enqueued_at.elapsed().as_secs_f64() * 1000.0
     ));
     let started_at = Instant::now();
@@ -1160,11 +1573,13 @@ fn execute_work(
     let outcome = response_outcome(&response);
     session_operation.finish(outcome == "ok");
     let reply_ok = reply.send(response).is_ok();
-    let (queued, active) = metrics.finished();
+    let queue_state = queue.finished();
+    let queued = queue_state.queued;
+    let active = queue_state.active;
+    let lane_fields = &queue_state.lane_fields;
     let registry_fields = page_registry_log_fields(page_job.as_ref());
     crate::logger::log(format!(
-        "remote_ipc: worker_complete request_id={request_id} kind={request_kind} queue={} worker={worker} outcome={outcome} duration_ms={:.1} reply_ok={reply_ok} queued={queued} active={active}{registry_fields}",
-        metrics.name,
+        "remote_ipc: worker_complete request_id={request_id} kind={request_kind} queue={queue_name} worker={worker} outcome={outcome} duration_ms={:.1} reply_ok={reply_ok} queued={queued} active={active}{lane_fields}{registry_fields}",
         started_at.elapsed().as_secs_f64() * 1000.0
     ));
 }
@@ -1207,12 +1622,17 @@ fn page_registry_log_fields(page_job: Option<&PageJobWork>) -> String {
         return String::new();
     };
     let snapshot = page_job.registry.snapshot();
+    let display_request_present = page_job
+        .registry
+        .display_request_id(page_job.connection_id, &page_job.job_id)
+        .is_some();
     format!(
-        " page_jobs_active={} page_jobs_released={} page_jobs_prefetch_active={} page_jobs_foreground_active={}",
+        " page_jobs_active={} page_jobs_released={} page_jobs_prefetch_active={} page_jobs_foreground_active={} page_jobs_total={} page_display_request_present={display_request_present}",
         snapshot.active(),
         snapshot.released(),
         snapshot.prefetch_active,
         snapshot.foreground_active,
+        snapshot.total(),
     )
 }
 
@@ -1764,17 +2184,14 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
 
 fn acceptor_loop(
     stop: Arc<AtomicBool>,
-    heavy_work_tx: mpsc::SyncSender<Work>,
+    heavy_queue: Arc<HeavyQueueWiring>,
     home_work_tx: mpsc::SyncSender<Work>,
     write_work_tx: mpsc::SyncSender<Work>,
     stream_work_tx: mpsc::SyncSender<Work>,
-    heavy_metrics: Arc<QueueMetrics>,
     home_metrics: Arc<QueueMetrics>,
     write_metrics: Arc<QueueMetrics>,
     stream_metrics: Arc<QueueMetrics>,
     next_connection_id: Arc<AtomicU64>,
-    prefetch_in_flight: Arc<AtomicUsize>,
-    heavy_worker_count: usize,
     session: SessionHandle,
     page_jobs: Arc<PageJobRegistry>,
     initial_pipe: PipeStream,
@@ -1817,15 +2234,13 @@ fn acceptor_loop(
         crate::logger::log(format!(
             "remote_ipc: connection_accepted connection_id={connection_id} acceptor={index}"
         ));
-        let heavy_work_tx = heavy_work_tx.clone();
+        let heavy_queue = Arc::clone(&heavy_queue);
         let home_work_tx = home_work_tx.clone();
         let write_work_tx = write_work_tx.clone();
         let stream_work_tx = stream_work_tx.clone();
-        let heavy_metrics = Arc::clone(&heavy_metrics);
         let home_metrics = Arc::clone(&home_metrics);
         let write_metrics = Arc::clone(&write_metrics);
         let stream_metrics = Arc::clone(&stream_metrics);
-        let prefetch_in_flight = Arc::clone(&prefetch_in_flight);
         let session = session.clone();
         let page_jobs = Arc::clone(&page_jobs);
         if let Err(error) = std::thread::Builder::new()
@@ -1834,16 +2249,13 @@ fn acceptor_loop(
                 handle_connection(
                     connection_id,
                     pipe,
-                    heavy_work_tx,
+                    heavy_queue,
                     home_work_tx,
                     write_work_tx,
                     stream_work_tx,
-                    heavy_metrics,
                     home_metrics,
                     write_metrics,
                     stream_metrics,
-                    prefetch_in_flight,
-                    heavy_worker_count,
                     session,
                     page_jobs,
                 )
@@ -1862,16 +2274,13 @@ fn acceptor_loop(
 fn handle_connection(
     connection_id: u64,
     mut pipe: PipeStream,
-    heavy_work_tx: mpsc::SyncSender<Work>,
+    heavy_queue: Arc<HeavyQueueWiring>,
     home_work_tx: mpsc::SyncSender<Work>,
     write_work_tx: mpsc::SyncSender<Work>,
     stream_work_tx: mpsc::SyncSender<Work>,
-    heavy_metrics: Arc<QueueMetrics>,
     home_metrics: Arc<QueueMetrics>,
     write_metrics: Arc<QueueMetrics>,
     stream_metrics: Arc<QueueMetrics>,
-    prefetch_in_flight: Arc<AtomicUsize>,
-    heavy_worker_count: usize,
     session: SessionHandle,
     page_jobs: Arc<PageJobRegistry>,
 ) {
@@ -2014,7 +2423,7 @@ fn handle_connection(
                     Ok(operation) => match operation.wait_until_active() {
                         Ok(()) => {
                             operation.started();
-                            let response = apply_page_demand(&page_jobs, connection_id, request);
+                            let response = apply_page_demand(&heavy_queue, connection_id, request);
                             operation.finish(true);
                             ServerMessage::PageDemand { id: *id, response }
                         }
@@ -2401,45 +2810,38 @@ fn handle_connection(
         } else {
             None
         };
-        let prefetch_permit = if matches!(
-            message,
-            ClientMessage::Page {
-                request: mimageviewer_ipc::PageRequest {
-                    priority: PagePriority::Prefetch,
-                    ..
+        if work_lane(&message) == WorkLane::Heavy {
+            let stopped = enqueue_heavy_connection_work(
+                &heavy_queue,
+                connection_id,
+                request_id,
+                kind,
+                Work::Request {
+                    message,
+                    reply: reply_tx.clone(),
+                    enqueued_at: Instant::now(),
+                    session_operation,
+                    page_job,
                 },
-                ..
+            );
+            if stopped {
+                break;
             }
-        ) {
-            let (queued, active) = heavy_metrics.snapshot();
-            match try_acquire_prefetch(&prefetch_in_flight, heavy_worker_count, queued, active) {
-                Some(permit) => Some(permit),
-                None => {
-                    crate::logger::log(format!(
-                        "remote_ipc: prefetch_busy connection_id={connection_id} request_id={request_id} heavy_workers={heavy_worker_count} queued={queued} active={active}"
-                    ));
-                    let _ = reply_tx.send(queue_busy_response(&message));
-                    drop(session_operation);
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
+            continue;
+        }
         // Home は専用 worker へ分離する。重い queue が満杯でも connection reader を
         // 塞がず、後続 Home を読めるよう Busy を明示応答する。
         let (work_tx, metrics) = match work_lane(&message) {
             WorkLane::Home => (&home_work_tx, &home_metrics),
             WorkLane::Write => (&write_work_tx, &write_metrics),
             WorkLane::Stream => (&stream_work_tx, &stream_metrics),
-            WorkLane::Heavy => (&heavy_work_tx, &heavy_metrics),
+            WorkLane::Heavy => unreachable!(),
         };
         match enqueue_work(
             work_tx,
             metrics,
             message,
             reply_tx.clone(),
-            prefetch_permit,
             session_operation,
             page_job,
         ) {
@@ -2471,13 +2873,117 @@ fn handle_connection(
             Err(mpsc::TrySendError::Disconnected(Work::Stop)) => unreachable!(),
         }
     }
+    respond_cancelled_works(
+        heavy_queue.close_connection(connection_id),
+        "connection_closed",
+    );
     session.remote_web_disconnected(connection_id);
     drop(reply_tx);
     let _ = writer.join();
 }
 
+fn enqueue_heavy_connection_work(
+    wiring: &HeavyQueueWiring,
+    connection_id: u64,
+    request_id: u64,
+    request_kind_name: &str,
+    work: Work,
+) -> bool {
+    match wiring.enqueue(connection_id, work) {
+        Ok(lane) => {
+            let state = heavy_queue_log_state(wiring.snapshot(), Some(lane));
+            crate::logger::log(format!(
+                "remote_ipc: request_enqueued connection_id={connection_id} request_id={request_id} kind={request_kind_name} queue=heavy queued={} active={}{}",
+                state.queued, state.active, state.lane_fields
+            ));
+            false
+        }
+        Err(error) => reject_heavy_connection_work(
+            wiring,
+            connection_id,
+            request_id,
+            request_kind_name,
+            error,
+        ),
+    }
+}
+
+fn reject_heavy_connection_work(
+    wiring: &HeavyQueueWiring,
+    connection_id: u64,
+    request_id: u64,
+    request_kind_name: &str,
+    error: HeavyEnqueueError,
+) -> bool {
+    let state = heavy_queue_log_state(wiring.snapshot(), Some(error.lane));
+    let event = match error.kind {
+        HeavyEnqueueErrorKind::LaneFull => "queue_full",
+        HeavyEnqueueErrorKind::Shutdown => "queue_stopped",
+        _ => "queue_rejected",
+    };
+    crate::logger::log(format!(
+        "remote_ipc: {event} connection_id={connection_id} request_id={request_id} kind={request_kind_name} queue=heavy reason={} queued={} active={}{}",
+        error.kind.log_reason(),
+        state.queued,
+        state.active,
+        state.lane_fields
+    ));
+    let stopped = error.kind == HeavyEnqueueErrorKind::Shutdown;
+    respond_rejected_heavy_work(error);
+    stopped
+}
+
+fn respond_rejected_heavy_work(error: HeavyEnqueueError) {
+    let Work::Request { message, reply, .. } = error.work else {
+        unreachable!();
+    };
+    let response = match error.kind {
+        HeavyEnqueueErrorKind::Cancelled => cancelled_work_response(&message),
+        HeavyEnqueueErrorKind::PrefetchUnavailableWithSingleWorker
+        | HeavyEnqueueErrorKind::LaneFull => queue_busy_response(&message),
+        HeavyEnqueueErrorKind::DuplicateKey => duplicate_request_response(&message),
+        HeavyEnqueueErrorKind::Shutdown => service_stopped_response(&message),
+    };
+    let _ = reply.send(response);
+}
+
+fn cancelled_work_response(message: &ClientMessage) -> ServerMessage {
+    match message {
+        ClientMessage::Page { id, .. } => cancelled_page_response(*id),
+        _ => service_stopped_response(message),
+    }
+}
+
+fn respond_cancelled_works(works: Vec<Work>, reason: &'static str) {
+    respond_removed_works(works, reason, false);
+}
+
+fn respond_stopped_works(works: Vec<Work>, reason: &'static str) {
+    respond_removed_works(works, reason, true);
+}
+
+fn respond_removed_works(works: Vec<Work>, reason: &'static str, stopped: bool) {
+    for work in works {
+        let Work::Request { message, reply, .. } = work else {
+            unreachable!();
+        };
+        let request_id = message.id();
+        let kind = request_kind(&message);
+        let response = if stopped {
+            service_stopped_response(&message)
+        } else {
+            cancelled_work_response(&message)
+        };
+        let outcome = response_outcome(&response);
+        let reply_ok = reply.send(response).is_ok();
+        crate::logger::log(format!(
+            "remote_ipc: queue_pruned request_id={request_id} kind={kind} queue=heavy reason={reason} outcome={outcome} reply_ok={reply_ok}"
+        ));
+    }
+}
+
 fn apply_page_demand(
-    registry: &PageJobRegistry,
+    wiring: &HeavyQueueWiring,
     connection_id: u64,
     request: &mimageviewer_ipc::PageDemandRequest,
 ) -> mimageviewer_ipc::PageDemandResponse {
@@ -2489,7 +2995,7 @@ fn apply_page_demand(
             // A promote may overtake the GET and is intentionally best-effort. Losing it only
             // leaves that request at its initial prefetch priority; release uses tombstones
             // because losing cancellation would violate ownership.
-            let status = match registry.promote(
+            let status = match wiring.promote_page(
                 connection_id,
                 &job_id,
                 DisplayRequestId::from(promotion.display.clone()),
@@ -2520,11 +3026,13 @@ fn apply_page_demand(
         .iter()
         .map(|release| {
             let job_id = PageJobId::from(release.job.clone());
-            let status = match registry.release(
+            let (result, removed) = wiring.release_page(
                 connection_id,
                 &job_id,
                 page_cancel_cause_from_ipc(release.cause),
-            ) {
+            );
+            respond_cancelled_works(removed, "release");
+            let status = match result {
                 ReleasePageJobResult::Released => {
                     mimageviewer_ipc::PageDemandReleaseStatus::Released
                 }
@@ -2543,7 +3051,7 @@ fn apply_page_demand(
             }
         })
         .collect();
-    let snapshot = registry.snapshot();
+    let snapshot = wiring.registry.snapshot();
     crate::logger::log(format!(
         "remote_ipc: page_demand connection_id={connection_id} promote={} release={} page_jobs_active={} page_jobs_released={} page_jobs_prefetch_active={} page_jobs_foreground_active={}",
         request.promote.len(),
@@ -2585,7 +3093,6 @@ fn enqueue_work(
     metrics: &QueueMetrics,
     message: ClientMessage,
     reply: mpsc::Sender<ServerMessage>,
-    prefetch_permit: Option<PrefetchPermit>,
     session_operation: SessionOperation,
     page_job: Option<PageJobWork>,
 ) -> Result<(), mpsc::TrySendError<Work>> {
@@ -2594,7 +3101,6 @@ fn enqueue_work(
         message,
         reply,
         enqueued_at: Instant::now(),
-        _prefetch_permit: prefetch_permit,
         session_operation,
         page_job,
     });
@@ -2602,34 +3108,6 @@ fn enqueue_work(
         metrics.rollback();
     }
     result
-}
-
-fn try_acquire_prefetch(
-    in_flight: &Arc<AtomicUsize>,
-    heavy_worker_count: usize,
-    queued: usize,
-    active: usize,
-) -> Option<PrefetchPermit> {
-    // prefetch 開始後も foreground 用 worker を 1 本空ける。queue が既にある時も
-    // FIFO の前後関係で表示要求を遅らせ得るため受け付けない。
-    let limit = remote_page_prefetch_limit(heavy_worker_count);
-    if limit == 0 || queued > 0 || active >= heavy_worker_count - 1 {
-        return None;
-    }
-    in_flight
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            (current < limit).then_some(current + 1)
-        })
-        .ok()
-        .map(|_| PrefetchPermit {
-            in_flight: Arc::clone(in_flight),
-        })
-}
-
-fn remote_page_prefetch_limit(heavy_worker_count: usize) -> usize {
-    heavy_worker_count
-        .saturating_sub(1)
-        .min(MAX_CONCURRENT_PAGE_PREFETCH)
 }
 
 fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
@@ -2814,6 +3292,80 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
             response: stopped_video_response(),
         },
     }
+}
+
+fn duplicate_media_error() -> MediaError {
+    MediaError::new(
+        MediaErrorCode::BadRequest,
+        "同じ接続内で request ID が重複しています",
+    )
+}
+
+fn duplicate_collection_error() -> CollectionError {
+    CollectionError::new(
+        CollectionErrorCode::BadRequest,
+        "同じ接続内で request ID が重複しています",
+    )
+}
+
+fn duplicate_request_response(message: &ClientMessage) -> ServerMessage {
+    match message {
+        ClientMessage::Thumbnail { id, .. } => ServerMessage::Thumbnail {
+            id: *id,
+            response: ThumbnailResponse::Error(ThumbnailError::new(
+                ThumbnailErrorCode::BadRequest,
+                "同じ接続内で request ID が重複しています",
+            )),
+        },
+        ClientMessage::Collection { id, .. } => ServerMessage::Collection {
+            id: *id,
+            response: CollectionResponse::Error(duplicate_collection_error()),
+        },
+        ClientMessage::FavoriteSearch { id, .. } => ServerMessage::FavoriteSearch {
+            id: *id,
+            response: FavoriteSearchResponse::Error(duplicate_collection_error()),
+        },
+        _ => duplicate_request_response_tail(message),
+    }
+}
+
+fn duplicate_request_response_tail(message: &ClientMessage) -> ServerMessage {
+    match message {
+        ClientMessage::TagBrowse { id, .. } => ServerMessage::TagBrowse {
+            id: *id,
+            response: TagBrowseResponse::Error(duplicate_collection_error()),
+        },
+        ClientMessage::TagItems { id, .. } => ServerMessage::TagItems {
+            id: *id,
+            response: TagItemsResponse::Error(duplicate_collection_error()),
+        },
+        ClientMessage::Container { id, .. } => ServerMessage::Container {
+            id: *id,
+            response: ContainerResponse::Error(duplicate_media_error()),
+        },
+        ClientMessage::Page { id, .. } => ServerMessage::Page {
+            id: *id,
+            response: PageResponse::Error(duplicate_media_error()),
+        },
+        ClientMessage::VideoStreamJumpList { id, .. } => ServerMessage::VideoStreamJumpList {
+            id: *id,
+            response: VideoStreamResult::Error(duplicate_video_error()),
+        },
+        ClientMessage::VideoStreamJumpThumbnail { id, .. } => {
+            ServerMessage::VideoStreamJumpThumbnail {
+                id: *id,
+                response: VideoStreamResult::Error(duplicate_video_error()),
+            }
+        }
+        _ => service_stopped_response(message),
+    }
+}
+
+fn duplicate_video_error() -> VideoStreamError {
+    VideoStreamError::new(
+        VideoStreamErrorCode::BadRequest,
+        "同じ接続内で request ID が重複しています",
+    )
 }
 
 fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
@@ -3322,6 +3874,97 @@ mod tests {
         }
     }
 
+    fn active_test_operation() -> SessionOperation {
+        let session = SessionHandle::new();
+        session.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "queue-test".to_owned(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Unknown,
+                device_name: None,
+            },
+        });
+        assert!(session.finish_acquire(session.snapshot().generation));
+        let owner = session.owner_for_test("queue-test");
+        session
+            .begin_operation(&owner, "queue test".to_owned())
+            .unwrap()
+    }
+
+    fn page_work(
+        registry: &Arc<PageJobRegistry>,
+        connection_id: u64,
+        request_id: u64,
+        job_id: &str,
+        priority: PageJobPriority,
+        reply: mpsc::Sender<ServerMessage>,
+    ) -> Work {
+        let cancel = registry
+            .register(connection_id, job_id.into(), None, priority)
+            .unwrap();
+        Work::Request {
+            message: ClientMessage::Page {
+                id: request_id,
+                owner: test_owner(),
+                request: mimageviewer_ipc::PageRequest {
+                    job_id: job_id.to_owned(),
+                    display_request_id: None,
+                    address: mimageviewer_ipc::RemoteAddress::file("C:/Pictures/page.jpg"),
+                    target_px: 2048,
+                    priority: match priority {
+                        PageJobPriority::Foreground => PagePriority::Foreground,
+                        PageJobPriority::Prefetch => PagePriority::Prefetch,
+                    },
+                    render_context: None,
+                    adjustment_preview: None,
+                },
+            },
+            reply,
+            enqueued_at: Instant::now(),
+            session_operation: active_test_operation(),
+            page_job: Some(PageJobWork {
+                registry: Arc::clone(registry),
+                connection_id,
+                job_id: job_id.into(),
+                cancel,
+            }),
+        }
+    }
+
+    fn thumbnail_work(request_id: u64, reply: mpsc::Sender<ServerMessage>) -> Work {
+        Work::Request {
+            message: ClientMessage::Thumbnail {
+                id: request_id,
+                owner: test_owner(),
+                request: mimageviewer_ipc::ThumbnailRequest {
+                    address: mimageviewer_ipc::RemoteAddress::file("C:/Pictures/page.jpg"),
+                    source_address: None,
+                    target_px: 256,
+                },
+            },
+            reply,
+            enqueued_at: Instant::now(),
+            session_operation: active_test_operation(),
+            page_job: None,
+        }
+    }
+
+    fn complete_heavy_item(
+        wiring: &HeavyQueueWiring,
+        item: HeavyQueueItem<HeavyKey, Work>,
+    ) -> (HeavyQueueLane, Work) {
+        let lane = item.lane();
+        let (key, work, _) = item.into_parts();
+        let page_key = match &work {
+            Work::Request { page_job, .. } => page_job_key(page_job.as_ref()),
+            Work::Stop => None,
+        };
+        assert!(matches!(
+            wiring.complete(&key, page_key.as_ref()),
+            CompleteHeavyQueueResult::Completed { .. }
+        ));
+        (lane, work)
+    }
+
     #[test]
     fn remote_pipe_dacl_has_one_current_user_ace() {
         let security = current_user_pipe_security().unwrap();
@@ -3378,7 +4021,6 @@ mod tests {
                 request: mimageviewer_ipc::HomeRequest,
             },
             reply_tx,
-            None,
             session_operation,
             None,
         )
@@ -3400,39 +4042,84 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_uses_available_remote_workers_but_reserves_one_for_foreground() {
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        assert!(try_acquire_prefetch(&in_flight, 1, 0, 0).is_none());
-        assert!(try_acquire_prefetch(&in_flight, 2, 1, 0).is_none());
-        assert!(try_acquire_prefetch(&in_flight, 2, 0, 1).is_none());
-        let first = try_acquire_prefetch(&in_flight, 2, 0, 0).expect("first prefetch permit");
-        assert!(try_acquire_prefetch(&in_flight, 2, 0, 0).is_none());
-        drop(first);
-        let first = try_acquire_prefetch(&in_flight, 3, 0, 0).expect("first prefetch permit");
-        let second = try_acquire_prefetch(&in_flight, 3, 0, 1).expect("second prefetch permit");
-        assert!(try_acquire_prefetch(&in_flight, 3, 0, 1).is_none());
-        assert_eq!(in_flight.load(Ordering::Acquire), 2);
-        drop(first);
-        drop(second);
-        assert_eq!(in_flight.load(Ordering::Acquire), 0);
+    fn heavy_wiring_prioritizes_foreground_before_thumbnail_and_prefetch() {
+        let registry = Arc::new(PageJobRegistry::new());
+        let wiring = HeavyQueueWiring::new(3, Arc::clone(&registry));
+        let (prefetch_tx, _prefetch_rx) = mpsc::channel();
+        let (thumbnail_tx, _thumbnail_rx) = mpsc::channel();
+        let (foreground_tx, _foreground_rx) = mpsc::channel();
+        assert!(matches!(
+            wiring.enqueue(
+                1,
+                page_work(
+                    &registry,
+                    1,
+                    10,
+                    "prefetch",
+                    PageJobPriority::Prefetch,
+                    prefetch_tx,
+                ),
+            ),
+            Ok(HeavyQueueLane::Prefetch)
+        ));
+        assert!(matches!(
+            wiring.enqueue(1, thumbnail_work(11, thumbnail_tx)),
+            Ok(HeavyQueueLane::Interactive)
+        ));
+        assert!(matches!(
+            wiring.enqueue(
+                1,
+                page_work(
+                    &registry,
+                    1,
+                    12,
+                    "foreground",
+                    PageJobPriority::Foreground,
+                    foreground_tx,
+                ),
+            ),
+            Ok(HeavyQueueLane::Foreground)
+        ));
+        let lanes = (0..3)
+            .map(|_| complete_heavy_item(&wiring, wiring.pop().unwrap()).0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lanes,
+            vec![
+                HeavyQueueLane::Foreground,
+                HeavyQueueLane::Interactive,
+                HeavyQueueLane::Prefetch,
+            ]
+        );
     }
 
     #[test]
-    fn page_demand_glue_promotes_then_releases_the_registered_lease() {
+    fn page_demand_promotion_moves_prefetch_ahead_of_waiting_interactive_work() {
         let registry = Arc::new(PageJobRegistry::new());
-        let job_id = PageJobId::from("page-job");
-        let cancel = registry
-            .register(7, job_id.clone(), None, PageJobPriority::Prefetch)
-            .unwrap();
-        let work = PageJobWork {
-            registry: Arc::clone(&registry),
-            connection_id: 7,
-            job_id,
-            cancel: Arc::clone(&cancel),
-        };
+        let wiring = HeavyQueueWiring::new(2, Arc::clone(&registry));
+        let (reply_tx, _reply_rx) = mpsc::channel();
+        let (thumbnail_tx, _thumbnail_rx) = mpsc::channel();
+        assert!(matches!(
+            wiring.enqueue(
+                7,
+                page_work(
+                    &registry,
+                    7,
+                    70,
+                    "page-job",
+                    PageJobPriority::Prefetch,
+                    reply_tx,
+                ),
+            ),
+            Ok(HeavyQueueLane::Prefetch)
+        ));
+        assert!(matches!(
+            wiring.enqueue(7, thumbnail_work(71, thumbnail_tx)),
+            Ok(HeavyQueueLane::Interactive)
+        ));
 
         let promoted = apply_page_demand(
-            &registry,
+            &wiring,
             7,
             &mimageviewer_ipc::PageDemandRequest {
                 promote: vec![mimageviewer_ipc::PageDemandPromotion {
@@ -3446,19 +4133,75 @@ mod tests {
             promoted.promote[0].status,
             mimageviewer_ipc::PageDemandPromoteStatus::Promoted
         );
-        assert_eq!(effective_page_priority(&work), PagePriority::Foreground);
         assert_eq!(
-            registry.display_request_id(7, &PageJobId::from("page-job")),
-            Some(DisplayRequestId::from("display-1"))
+            wiring.snapshot().foreground.queued,
+            1,
+            "promotion must move the queue mirror before dispatch"
         );
+        let promoted_item = wiring.pop().unwrap();
+        assert_eq!(promoted_item.lane(), HeavyQueueLane::Foreground);
+        let (_, work) = complete_heavy_item(&wiring, promoted_item);
+        let Work::Request { page_job, .. } = &work else {
+            unreachable!();
+        };
+        assert_eq!(
+            effective_page_priority(page_job.as_ref().unwrap()),
+            PagePriority::Foreground
+        );
+        let interactive_item = wiring.pop().unwrap();
+        assert_eq!(interactive_item.lane(), HeavyQueueLane::Interactive);
+        let _ = complete_heavy_item(&wiring, interactive_item);
+    }
 
+    #[test]
+    fn dropped_heavy_completion_guard_releases_the_active_slot() {
+        let registry = Arc::new(PageJobRegistry::new());
+        let wiring = HeavyQueueWiring::new(1, registry);
+        let (first_tx, _first_rx) = mpsc::channel();
+        let (second_tx, _second_rx) = mpsc::channel();
+        assert!(wiring.enqueue(1, thumbnail_work(72, first_tx)).is_ok());
+
+        let first = wiring.pop().unwrap();
+        let (key, work, lane) = first.into_parts();
+        let completion = HeavyCompletionGuard::new(&wiring, key, lane, None);
+        assert_eq!(wiring.snapshot().active(), 1);
+        drop(completion);
+        drop(work);
+        assert_eq!(wiring.snapshot().active(), 0);
+
+        assert!(wiring.enqueue(1, thumbnail_work(73, second_tx)).is_ok());
+        let second = wiring.pop().unwrap();
+        assert_eq!(second.lane(), HeavyQueueLane::Interactive);
+        let _ = complete_heavy_item(&wiring, second);
+    }
+
+    #[test]
+    fn page_demand_release_prunes_waiting_work_and_replies_cancelled() {
+        let registry = Arc::new(PageJobRegistry::new());
+        let wiring = HeavyQueueWiring::new(2, Arc::clone(&registry));
+        let (reply_tx, reply_rx) = mpsc::channel();
+        assert!(
+            wiring
+                .enqueue(
+                    7,
+                    page_work(
+                        &registry,
+                        7,
+                        71,
+                        "release-job",
+                        PageJobPriority::Prefetch,
+                        reply_tx,
+                    ),
+                )
+                .is_ok()
+        );
         let released = apply_page_demand(
-            &registry,
+            &wiring,
             7,
             &mimageviewer_ipc::PageDemandRequest {
                 promote: Vec::new(),
                 release: vec![mimageviewer_ipc::PageDemandRelease {
-                    job: "page-job".to_owned(),
+                    job: "release-job".to_owned(),
                     cause: mimageviewer_ipc::PageCancelCause::NoDemand,
                 }],
             },
@@ -3467,7 +4210,260 @@ mod tests {
             released.release[0].status,
             mimageviewer_ipc::PageDemandReleaseStatus::Released
         );
-        assert!(cancel.load(Ordering::Acquire));
+        assert_eq!(wiring.snapshot().queued(), 0);
+        assert!(is_cancelled_page_response(
+            &reply_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        ));
+    }
+
+    #[test]
+    fn connection_prune_is_scoped_and_replies_to_its_waiting_page() {
+        let registry = Arc::new(PageJobRegistry::new());
+        let wiring = HeavyQueueWiring::new(2, Arc::clone(&registry));
+        let (first_tx, first_rx) = mpsc::channel();
+        let (second_tx, second_rx) = mpsc::channel();
+        assert!(
+            wiring
+                .enqueue(
+                    1,
+                    page_work(
+                        &registry,
+                        1,
+                        80,
+                        "first",
+                        PageJobPriority::Foreground,
+                        first_tx,
+                    ),
+                )
+                .is_ok()
+        );
+        assert!(
+            wiring
+                .enqueue(
+                    2,
+                    page_work(
+                        &registry,
+                        2,
+                        81,
+                        "second",
+                        PageJobPriority::Foreground,
+                        second_tx,
+                    ),
+                )
+                .is_ok()
+        );
+        respond_cancelled_works(wiring.close_connection(1), "connection_test");
+        assert!(is_cancelled_page_response(
+            &first_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        ));
+        assert!(matches!(
+            second_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(wiring.snapshot().foreground.queued, 1);
+        assert!(registry.priority(1, &PageJobId::from("first")).is_none());
+        assert_eq!(
+            registry.priority(2, &PageJobId::from("second")),
+            Some(PageJobPriority::Foreground)
+        );
+        let _ = complete_heavy_item(&wiring, wiring.pop().unwrap());
+    }
+
+    #[test]
+    fn single_worker_prefetch_is_rejected_immediately_with_busy() {
+        let registry = Arc::new(PageJobRegistry::new());
+        let wiring = HeavyQueueWiring::new(1, Arc::clone(&registry));
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let work = page_work(
+            &registry,
+            1,
+            90,
+            "single-worker",
+            PageJobPriority::Prefetch,
+            reply_tx,
+        );
+        let started = Instant::now();
+        let error = match wiring.enqueue(1, work) {
+            Ok(_) => panic!("single-worker prefetch must not enter the queue"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind,
+            HeavyEnqueueErrorKind::PrefetchUnavailableWithSingleWorker
+        );
+        assert!(started.elapsed() < Duration::from_millis(50));
+        respond_rejected_heavy_work(error);
+        assert!(matches!(
+            reply_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ServerMessage::Page {
+                response: PageResponse::Error(MediaError {
+                    code: MediaErrorCode::Busy,
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert_eq!(wiring.snapshot().queued(), 0);
+    }
+
+    #[test]
+    fn full_prefetch_lane_does_not_block_foreground_admission() {
+        let registry = Arc::new(PageJobRegistry::new());
+        let wiring = HeavyQueueWiring::new_with_capacities(
+            2,
+            HeavyQueueCapacities {
+                foreground: 1,
+                interactive: 1,
+                prefetch: 1,
+            },
+            Arc::clone(&registry),
+        );
+        let (first_tx, _first_rx) = mpsc::channel();
+        let (full_tx, full_rx) = mpsc::channel();
+        let (foreground_tx, _foreground_rx) = mpsc::channel();
+        assert!(
+            wiring
+                .enqueue(
+                    1,
+                    page_work(
+                        &registry,
+                        1,
+                        100,
+                        "prefetch-1",
+                        PageJobPriority::Prefetch,
+                        first_tx,
+                    ),
+                )
+                .is_ok()
+        );
+        let error = wiring
+            .enqueue(
+                1,
+                page_work(
+                    &registry,
+                    1,
+                    101,
+                    "prefetch-2",
+                    PageJobPriority::Prefetch,
+                    full_tx,
+                ),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, HeavyEnqueueErrorKind::LaneFull);
+        respond_rejected_heavy_work(error);
+        assert!(matches!(
+            full_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ServerMessage::Page {
+                response: PageResponse::Error(MediaError {
+                    code: MediaErrorCode::Busy,
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert!(
+            wiring
+                .enqueue(
+                    1,
+                    page_work(
+                        &registry,
+                        1,
+                        102,
+                        "foreground",
+                        PageJobPriority::Foreground,
+                        foreground_tx,
+                    ),
+                )
+                .is_ok()
+        );
+        assert_eq!(wiring.snapshot().foreground.queued, 1);
+        respond_stopped_works(wiring.stop(), "test_cleanup");
+    }
+
+    #[test]
+    fn duplicate_heavy_key_is_bad_request_not_busy() {
+        let registry = Arc::new(PageJobRegistry::new());
+        let wiring = HeavyQueueWiring::new(2, registry);
+        let (first_tx, _first_rx) = mpsc::channel();
+        let (duplicate_tx, duplicate_rx) = mpsc::channel();
+        assert!(wiring.enqueue(1, thumbnail_work(110, first_tx)).is_ok());
+        let error = wiring
+            .enqueue(1, thumbnail_work(110, duplicate_tx))
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, HeavyEnqueueErrorKind::DuplicateKey);
+        respond_rejected_heavy_work(error);
+        assert!(matches!(
+            duplicate_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ServerMessage::Thumbnail {
+                response: ThumbnailResponse::Error(ThumbnailError {
+                    code: ThumbnailErrorCode::BadRequest,
+                    ..
+                }),
+                ..
+            }
+        ));
+        respond_stopped_works(wiring.stop(), "test_cleanup");
+    }
+
+    #[test]
+    fn heavy_shutdown_replies_to_every_waiting_payload() {
+        let registry = Arc::new(PageJobRegistry::new());
+        let wiring = HeavyQueueWiring::new(2, Arc::clone(&registry));
+        let (page_tx, page_rx) = mpsc::channel();
+        let (thumbnail_tx, thumbnail_rx) = mpsc::channel();
+        assert!(
+            wiring
+                .enqueue(
+                    1,
+                    page_work(
+                        &registry,
+                        1,
+                        120,
+                        "shutdown-page",
+                        PageJobPriority::Foreground,
+                        page_tx,
+                    ),
+                )
+                .is_ok()
+        );
+        assert!(wiring.enqueue(1, thumbnail_work(121, thumbnail_tx)).is_ok());
+        respond_stopped_works(wiring.stop(), "shutdown_test");
+        assert!(is_cancelled_page_response(
+            &page_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        ));
+        assert!(matches!(
+            thumbnail_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ServerMessage::Thumbnail {
+                response: ThumbnailResponse::Error(ThumbnailError {
+                    code: ThumbnailErrorCode::Internal,
+                    ..
+                }),
+                ..
+            }
+        ));
+        let snapshot = wiring.snapshot();
+        assert!(snapshot.shutdown);
+        assert_eq!(snapshot.queued(), 0);
+    }
+
+    #[test]
+    fn heavy_log_state_keeps_totals_and_adds_every_lane_breakdown() {
+        let state = heavy_queue_log_state(HeavyQueueSnapshot::default(), None);
+        assert_eq!(state.queued, 0);
+        assert_eq!(state.active, 0);
+        for field in [
+            "lane=none",
+            "foreground_queued=0",
+            "foreground_active=0",
+            "interactive_queued=0",
+            "interactive_active=0",
+            "prefetch_queued=0",
+            "prefetch_active=0",
+        ] {
+            assert!(state.lane_fields.contains(field), "missing {field}");
+        }
     }
 
     #[test]
@@ -3486,22 +4482,6 @@ mod tests {
             },
         });
         assert!(is_cancelled_page_response(&response));
-    }
-
-    #[test]
-    fn full_heavy_queue_rejects_immediately_and_home_lane_remains_available() {
-        let (heavy_tx, _heavy_rx) = mpsc::sync_channel(1);
-        heavy_tx.try_send(Work::Stop).unwrap();
-        let started = std::time::Instant::now();
-        assert!(matches!(
-            heavy_tx.try_send(Work::Stop),
-            Err(mpsc::TrySendError::Full(Work::Stop))
-        ));
-        assert!(started.elapsed() < Duration::from_millis(50));
-
-        let (home_tx, home_rx) = mpsc::sync_channel(1);
-        home_tx.try_send(Work::Stop).unwrap();
-        assert!(matches!(home_rx.try_recv(), Ok(Work::Stop)));
     }
 
     #[test]
@@ -3551,11 +4531,8 @@ mod tests {
             stream_tx.try_send(Work::Stop),
             Err(mpsc::TrySendError::Full(Work::Stop))
         ));
-        let (heavy_tx, heavy_rx) = mpsc::sync_channel(1);
         let (home_tx, home_rx) = mpsc::sync_channel(1);
-        heavy_tx.try_send(Work::Stop).unwrap();
         home_tx.try_send(Work::Stop).unwrap();
-        assert!(matches!(heavy_rx.try_recv(), Ok(Work::Stop)));
         assert!(matches!(home_rx.try_recv(), Ok(Work::Stop)));
     }
 

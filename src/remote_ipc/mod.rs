@@ -2,13 +2,9 @@ mod ai_job;
 mod archive_job;
 mod collections;
 mod container;
-// Dormant until stage 3 wires plan §14.3 B + C + D0 into the request path.
-#[allow(dead_code)]
 mod heavy_queue;
 mod live_favorites;
 mod long_job;
-// Dormant until stage 3 wires plan §14.3 B + C + D0 into the request path.
-#[allow(dead_code)]
 mod page_jobs;
 mod path_guard;
 mod service;

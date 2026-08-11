@@ -2253,3 +2253,51 @@ v37 → v38 ではなく **v42** とした。v42 は `PageRequest.job_id`、opti
 planned page before fetching a nearer one` が実際に落ちることは自動テストで確認済み)。
 ② 表示中の切断 / 再接続とセッションの解放 / 再取得。どちらも段階 3b が queue の剪定と
 入口拒否の撤去で同じ経路へ触れるため、**3b の実機確認で必ず併せて見る**。
+
+### 14.12 表示所有権 cutover 段階 3b: heavy queue / admission 配線 (2026-08-11)
+
+段階 3b では本体の heavy lane を単一 FIFO の `sync_channel` から、段階 2 で追加した
+`HeavyQueue` の Foreground / Interactive / Prefetch 3 レーンへ切り替えた。page は
+`PageJobRegistry` の実効優先度を enqueue 直前にも読み、Foreground または Prefetch へ入れる。
+サムネイル、コンテナ列挙、AI、video jump など、それ以外の heavy work は Interactive とする。
+優先度の正本は引き続き registry、queue lane は写しであり、どちらからも相手を呼ばない。
+pipe の glue mutex が job ID と `(connection_id, request_id)` の対応を持ち、promote / release
+時に両 owner を直列に更新する。dispatch 直前にも registry を再解決する契約は変えていない。
+
+この切替により、本体側の `try_acquire_prefetch`、`PrefetchPermit`、`prefetch_in_flight`、
+`MAX_CONCURRENT_PAGE_PREFETCH`、`remote_page_prefetch_limit` を撤去した。先読みが最後の
+1 worker を占有しない制限は入口の拒否ではなく、queue の pop 条件
+`active < workers - 1` が所有する。サムネイルが待機中というだけでは先読みを拒否しない。
+ただし worker が 1 本ならこの条件を満たす先読みは 1 件も無いため、enqueue 時に
+`prefetch_unavailable_with_single_worker` として typed に記録し、従来どおり busy を即応答する。
+実行不能な payload を 10 分の page timeout まで保持しないための、§14.10 の宿題への回答である。
+
+page release は registry token を立てた同じ glue 操作で、まだ queue に待機している payload を
+物理的に剪定する。接続断ではその connection の待機 work だけをまとめて剪定し、別 connection
+には触れない。shutdown は `HeavyQueue::shutdown` で全待機 payload を返す。release / 接続断で
+剪定した page には `MediaErrorCode::Cancelled`、shutdown には各 message 種別の停止応答を返す。
+`Work.reply` を黙って drop せず、queue から返った全 payload に typed な終端応答を返すことを
+glue 層の義務とする。既に実行中なら queue からは取り出さず、registry token による段階 3a の
+取消をそのまま使う。
+
+容量は単一 16 件をやめ、Foreground 8 / Interactive 16 / Prefetch 8 の lane 別上限とした。
+remote-web の `MAX_CONCURRENT_IPC = 6` / `MAX_CONCURRENT_HEAVY_IPC = 4` /
+`MAX_CONCURRENT_PAGE_PREFETCH = 2` が通常の queue 深さを既に数件へ制限しているため、
+Foreground / Prefetch の 8 は promote や再接続の重なりを含めても 2 倍の余裕がある。
+Interactive 16 は direct IPC client がサムネイルと列挙を混在させる場合に旧上限を維持する。
+重要なのは合計を深くすることではなく、Prefetch lane が満杯でも Foreground admission が
+独立して成功することである。この queue は大量滞留を捌く owner ではなく、先読み 1〜2 件の後ろへ
+後着 foreground を置かないための短い並べ替え境界である。
+
+heavy の `queued` / `active` は `QueueMetrics` との二重会計をやめ、queue snapshot だけを
+出所とする。既存の `queue=heavy`、`queued`、`active`、worker 名、`queue_wait_ms`、
+`outcome`、`duration_ms`、`reply_ok` は維持し、`lane` と Foreground / Interactive /
+Prefetch ごとの queued / active を追加した。home / write / stream の channel、worker、
+`QueueMetrics` は変更していない。worker 数の `(設定値 / 2).clamp(1, 3)`、remote-web の
+`IpcAdmission`、wire 形式と protocol v42、位置 ownership も据え置きである。
+
+queue に入った page job の対応表への insert は release 最適化でも必ず実行する通常文とし、
+想定外の mapping 置換は `page_queue_reconcile` の typed log に残す。worker が pop した active
+key は lane と page mapping を持つ completion guard が所有し、正常 return だけでなく handler
+の unwind でも `HeavyQueue::complete` を呼ぶ。page render、container 列挙、collection query
+などが panic しても active slot と prefetch 用 N-1 判定を永久に消費しない。
