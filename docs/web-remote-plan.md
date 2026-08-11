@@ -1890,9 +1890,10 @@ pending で表現しない」に反し、今回 3 周した誤りと同じ形で
 - `try_acquire_prefetch` の入口拒否を撤去し、1 worker の実行不能な prefetch へ typed 応答を返す
 - remote-web の `IpcAdmission` は HTTP worker を守る別 owner として維持する
 
-**3c — 位置 ownership (保留)**
+**3c — 位置 ownership (2026-08-12 完了)**
 
-- requested / displayed 位置、URL / history と `DisplayRequestId` の境界を統合する
+- requested / displayed の identity snapshot を持つ純粋状態機械へ位置所有権を集約し、
+  URL / history も同じ owner 境界へ移した。詳細は §14.13
 
 **その他の後段 (保留)**
 
@@ -1934,36 +1935,30 @@ applied request ID は変更していない。
 中断メッセージに「前のページに戻りました」を焼き込むと、位置を所有しない再描画の失敗
 (fit 変更・resize・見開き再構成) で戻していないのに戻したと言うことになるため。
 
-**既知の残存不整合**: `commitRequestedPageGroup` は表示完了前に `history.pushState` するため、
-終端失敗でアプリ位置・seek・表示を前ページへ戻しても URL / history は失敗ページを指したまま
-残る。jump 系には requested / displayed 契約を通らない入口もあり、段階 A で片方だけ直すと
-`viewerDepth` と戻る操作を含む別の不整合になる。B + C + D0 の cutover で位置変更入口を統一し、
-そこで URL / history も同じ所有権境界へ移して解消する。
+**解消済みの残存不整合**: 段階 A で残った URL / history と jump 系の不整合は、
+段階 3c で位置変更入口と history を同じ owner へ集約して解消した。失敗時は
+requested を displayed へ戻した同じ境界で `replaceState` する。`viewerDepth` と grid 復帰の
+判断は §14.13 に固定した。
 
-#### 14.5.1 段階 A が収束させない経路 (cutover で必ず塞ぐ)
+#### 14.5.1 段階 A で未収束だった経路 (3c で解消済み)
 
-段階 A は**位置変更を所有する要求が終端失敗した場合**を収束させる。所有は要求ごとに
-渡しているので、次の 2 つは収束しない。**どちらも「誰が収束の義務を負うか」を要求単位で
-答えていることが原因**であり、入口ごとに条件を足すと §14 冒頭と同じ誤りを繰り返す。
-cutover で位置所有権を `DisplayRequestId` へ移すときに、まとめて解消する。
+段階 A では要求ごとの token が巻き戻し義務を所有していたため、次の 2 経路が未収束だった。
 
-1. **非位置再描画が位置要求を追い越すと、所有が消える。** ページ送り B の読み込み中に
-   fit 変更 / viewport resize / generation 更新が起きると、queue は元の要求を `superseded` に
-   し、後着の要求が同じ group B を読み直す。後着には位置所有者が無いので、終端失敗しても
-   巻き戻さない。表示は A のまま、位置と seek は B に残る。
-2. **ブックマーク jump は位置を動かすが所有者を渡していない。** `state.pageGroupIndex` を
-   直接代入してから表示するので、終端失敗すると新しい位置・seek と古い DOM が残る。
+1. ページ送り B を fit 変更 / viewport resize / generation 更新が追い越し、token を持たない
+   後着再描画が終端失敗すると、表示 A に対して位置と seek だけ B に残った。
+2. ブックマーク jump が `state.pageGroupIndex` を直接動かし、token を渡さないまま終端失敗すると、
+   新しい位置・seek と古い DOM が残った。
 
-「要求が所有する」のではなく「要求位置が表示位置より先にあること自体が義務を生む」と
-すれば両方消えるが、それには**表示位置が自分の grouping 文脈を持つ**必要がある
-(`refreshContainerSpread` は `pageGroups` を作り直してから表示するので、古い表示 index を
-新しい配列へ当てると別ページを指す)。これは cutover の所有権モデルそのものなので、
-段階 A では前倒ししない。
+段階 3c は「要求が所有する」モデルをやめ、**requested が displayed より先にあること
+自体が収束義務を生む**モデルへ移した。そのため、上のどちらにも入口別の分岐や token 配線を
+追加せずに収束する。displayed も grouping identity snapshot を持ち、再構成時は `reanchor` でだけ
+新しい `pageGroups` へ張り直す。詳細は §14.13。
 
-**テストの負債**: 呼び出し側の収束 (state / seek / counter / DOM の一致、巻き戻し後も失敗
-メッセージが残ること) は、`updateViewerImage` が module private なため構造 assertion で
-留めている。apply 段階の失敗、generation 更新、見開き再構成、bookmark jump の実挙動テストも
-無い。cutover で位置所有権を型にするときに、呼び出し側を試験可能な形へ出して固定する。
+**テストの現状**: `viewer-position.test.mjs` は上の 2 経路、非位置再描画、古い grouping の
+遅延終端、displayed unresolved、長さ 4 以下の操作列総当たりを固定する。`pwa.test.mjs` は
+ページ送り / seek / bookmark の 3 入口、history owner、`state.pageGroupIndex` 代入境界、
+`open` / `reanchor` / DOM commit の構造を固定する。実ブラウザでの通信失敗と history 操作の目視は
+依然として実機 smoke の対象とする。
 
 ### 14.6 先読みのバイト予算化と画質別処理時間 (2026-08-11)
 
@@ -2343,3 +2338,50 @@ key は lane と page mapping を持つ completion guard が所有し、正常 r
 
 **実機確認 (2026-08-11)**: 混在フォルダが単ページで開き件数サマリが出ること、画像のみフォルダの
 既定見開き、保存値の優先、ZIP / PDF の本既定がいずれも従来どおりであることを利用者が確認した。
+
+### 14.13 表示所有権 cutover 段階 3c: requested / displayed 位置 (2026-08-12)
+
+段階 3c では、位置変更要求ごとの `positionRequest` token を廃止し、
+`viewer-position.mjs` の純粋状態機械が持つ `(requested, displayed)` の identity snapshot 対へ
+巻き戻し義務を移した。snapshot の中身は状態機械が解釈せず、
+`viewerPageGroupRequestMatches` だけで同一性を比較する。終端判定は
+`viewerGroupLoadCompletionPlan({ loadRequest, currentRequest, displayedRequest })` の 1 本に集約し、
+状態機械からこれを呼ぶ。
+
+判定順は次で固定した。`superseded` と現 requested に一致しない `loadRequest` は
+`IGNORE`、一致する `applied` は `POST_DISPLAY`、一致する `failed` で
+requested ≠ displayed なら `ROLLBACK`、requested == displayed なら `REPORT_FAILURE` とする。
+displayed が unresolved (`null`) の場合は戻し先がないため巻き戻さず `REPORT_FAILURE` にする。
+これにより、非位置再描画がページ送り B を追い越しても requested(B) ≠ displayed(A) から
+自動的に巻き戻し義務が生じる。bookmark jump も同じ `requestPageGroup` を通るので、
+§14.5.1 の 2 経路は入口別の分岐を追加せずに閉じた。
+
+`requested` と `displayed` はどちらも `pageGroups` 配列、group object、index、entry identity、
+container context を含む snapshot である。DOM 差し替え後の既存 commit 点
+(`ImageViewer.commitPagePresentation`) だけが `display(snapshot)` を呼ぶ。grouping 再構成は
+`setSinglePageGroups` / `setContainerPageGroups` が再構成前の両 snapshot を保持し、再構成後に
+`reanchorViewerPageGroups` を通じて `reanchor` する 1 境界に集約した。requested は再構成前の
+requested anchor entry、displayed は DOM commit 時の displayed anchor entry を新配列で引き直す。
+見つからない側は unresolved とし、古い数値 index を新配列へ当てない。
+
+adapter 境界では、owner と `state.pageGroupIndex` が食い違わないこと、displayed は生きている
+`pageGroups` 配列へ解決済みの snapshot しか持たないことを不変条件とする。DOM commit は読み込み開始時の
+snapshot を `resolveReanchoredViewerPosition` で現在の配列へ解決できた場合だけ `display` し、解決不能なら
+displayed を据え置く。request / rewind の snapshot を `state.pageGroupIndex` へ適用できなかった場合は、
+型付き理由を記録した上で `reanchorViewerPageGroups` により owner と index を生きている配列へ収束させる。
+
+**URL は常に requested を写す**。ページ送り、seek commit、bookmark jump の位置変更は
+`requestPageGroup` の 1 owner だけを通り、`request` が実際に動いたときだけ
+`history.pushState` する。巻き戻しが実際に起きたときは displayed の hash へ
+`history.replaceState` する。request 時の `viewerDepth + 1` は従来どおりとし、rewind では
+depth を減らさない。このため rewind 後の back が 1 回同じページへ戻る無駄な操作になるが、
+履歴 entry 数と `viewerDepth` を食い違わせず、`history.go(-viewerDepth)` による grid 復帰を壊さない判断である。
+
+`rewind({ expected })` は冪等で、seek の session 取得失敗など表示開始前の中止では、
+後着要求を戻さないよう自分の expected snapshot がまだ requested に一致する場合だけ戻す。
+`updateViewerImage` は token を受け取らず、読み込み開始時の `loadRequest` と状態機械の現在値だけで
+終端処理を決める。`page_display` / `viewer_update` telemetry の既存 field / outcome、
+段階 3a / 3b の coordinator / registry / heavy queue / lease / `PageDemand`、本体コード、protocol v43 は変更していない。
+
+回帰は `viewer-position.test.mjs` の契約・2 経路・非位置再描画・再構成・unresolved・
+長さ 4 以下の全操作列、`command-core.test.mjs` の終端判定、`pwa.test.mjs` の単一 owner 構造で固定した。

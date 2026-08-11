@@ -16,7 +16,6 @@ import {
   ViewerGesture,
   ViewerGroupLoadCompletionAction,
   ViewerGroupLoadOutcome,
-  ViewerPagePositionEvent,
   ViewerPanelAction,
   ViewerPanelOrientation,
   IMAGE_QUALITY_PRESETS,
@@ -88,8 +87,6 @@ import {
   viewerPageGroupGenerationSnapshot,
   viewerPageGroupRequestMatches,
   viewerGroupLoadCompletionPlan,
-  viewerPagePositionFeedback,
-  viewerPagePositionTransition,
   viewerPostDisplayRefreshPlan,
   viewerSpreadPartnerIndex,
   viewerBoundaryMessage,
@@ -1630,59 +1627,6 @@ test("viewer seek keeps logical values and delegates RTL geometry to the native 
   assert.equal(viewerSeekGroupIndex(99, groups.length), 2);
 });
 
-test("viewer page feedback follows requests until display or explicit discard", () => {
-  let position = { requestedGroupIndex: 1, displayedGroupIndex: 1 };
-  position = viewerPagePositionTransition(position, {
-    type: ViewerPagePositionEvent.REQUEST,
-    groupIndex: 3,
-  });
-  assert.deepEqual(viewerPagePositionFeedback(position), {
-    groupIndex: 3,
-    pending: true,
-  });
-
-  position = viewerPagePositionTransition(position, {
-    type: ViewerPagePositionEvent.DISPLAY,
-    groupIndex: 3,
-  });
-  assert.deepEqual(viewerPagePositionFeedback(position), {
-    groupIndex: 3,
-    pending: false,
-  });
-
-  position = viewerPagePositionTransition(position, {
-    type: ViewerPagePositionEvent.REQUEST,
-    groupIndex: 4,
-  });
-  position = viewerPagePositionTransition(position, {
-    type: ViewerPagePositionEvent.REQUEST,
-    groupIndex: 5,
-  });
-  assert.deepEqual(position, {
-    requestedGroupIndex: 5,
-    displayedGroupIndex: 3,
-  });
-
-  position = viewerPagePositionTransition(position, {
-    type: ViewerPagePositionEvent.DISCARD,
-    groupIndex: 4,
-  });
-  assert.deepEqual(position, {
-    requestedGroupIndex: 5,
-    displayedGroupIndex: 3,
-  });
-
-  position = viewerPagePositionTransition(position, {
-    type: ViewerPagePositionEvent.DISCARD,
-    groupIndex: 5,
-  });
-  assert.deepEqual(position, {
-    requestedGroupIndex: 3,
-    displayedGroupIndex: 3,
-  });
-  assert.equal(viewerPagePositionFeedback(position).pending, false);
-});
-
 test("viewer group load completion runs post-display only for an applied current request", () => {
   const viewer = {};
   const pageGroups = [{ entries: [{ name: "old" }] }, { entries: [{ name: "new" }] }];
@@ -1694,15 +1638,21 @@ test("viewer group load completion runs post-display only for an applied current
     groupIdentity: "new-page",
     contextIdentity: "book-a",
   };
+  const displayedRequest = {
+    ...request,
+    group: pageGroups[0],
+    groupIndex: 0,
+    groupIdentity: "old-page",
+  };
   assert.deepEqual(viewerGroupLoadCompletionPlan(
     { outcome: ViewerGroupLoadOutcome.APPLIED },
-    { loadRequest: request, currentRequest: request, positionRequest: request }
+    { loadRequest: request, currentRequest: request, displayedRequest }
   ), {
     action: ViewerGroupLoadCompletionAction.POST_DISPLAY,
   });
   assert.deepEqual(viewerGroupLoadCompletionPlan(
     { outcome: ViewerGroupLoadOutcome.SUPERSEDED },
-    { loadRequest: request, currentRequest: request, positionRequest: request }
+    { loadRequest: request, currentRequest: request, displayedRequest }
   ), {
     action: ViewerGroupLoadCompletionAction.IGNORE,
   });
@@ -1714,7 +1664,7 @@ test("viewer group load completion runs post-display only for an applied current
   assert.deepEqual(viewerGroupLoadCompletionPlan(failed, {
     loadRequest: request,
     currentRequest: request,
-    positionRequest: request,
+    displayedRequest,
   }), {
     action: ViewerGroupLoadCompletionAction.ROLLBACK,
     message: "ページを表示できませんでした。前のページに戻りました。",
@@ -1723,6 +1673,15 @@ test("viewer group load completion runs post-display only for an applied current
   assert.deepEqual(viewerGroupLoadCompletionPlan(failed, {
     loadRequest: request,
     currentRequest: request,
+    displayedRequest: request,
+  }), {
+    action: ViewerGroupLoadCompletionAction.REPORT_FAILURE,
+    message: "ページを表示できませんでした。",
+  });
+  assert.deepEqual(viewerGroupLoadCompletionPlan(failed, {
+    loadRequest: request,
+    currentRequest: request,
+    displayedRequest: null,
   }), {
     action: ViewerGroupLoadCompletionAction.REPORT_FAILURE,
     message: "ページを表示できませんでした。",
@@ -1763,7 +1722,7 @@ test("viewer group load completion rejects an old page-group context at the same
     {
       loadRequest: oldRequest,
       currentRequest,
-      positionRequest: oldRequest,
+      displayedRequest: oldRequest,
     }
   ), {
     action: ViewerGroupLoadCompletionAction.IGNORE,

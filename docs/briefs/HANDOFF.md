@@ -32,13 +32,60 @@ D0 と同じものなので、段階 1 → 2 → 3 を順に進める。
    request 経路からは未使用で protocol version も据え置き。
    ブリーフは [codex-remote-page-jobs-stage2-brief.md](codex-remote-page-jobs-stage2-brief.md)
 3. **段階 3 は 3a / 3b / 3c に分割した** (plan §14.11 が正本)。
-   - **3a 完了 (`4e13ae8a`)** — 取消と優先度の所有権を Web / 本体で同時に切り替え。protocol v42。
-     4 つの取消機構が 1 本の lease に置き換わった。**実機確認済み** (通常の閲覧は問題なし)
-   - **3b 完了・未検証 (`507af0f1`)** — heavy lane を 3 レーン queue へ差し替え、入口拒否を撤去。
-     **⚠ 全テストの再実行と実機確認がまだ。ここから再開する**
-   - **3c 未着手** — 位置の requested / displayed 所有権 (§14.5.1 の 2 経路 + URL / history)
+   - **3a 完了・実機確認済み (`4e13ae8a`)** — 取消と優先度の所有権を Web / 本体で同時に切替。
+     protocol v42。4 つの取消機構が 1 本の lease に置き換わった
+   - **3b 完了・実機確認済み (`507af0f1`)** — heavy lane を 3 レーン queue へ差し替え、
+     入口拒否を撤去。目視では判断できなかったのでログで測った (plan §14.12 末尾に実測表)
+   - **3c 完了・実機未確認 (2026-08-12)** — 位置の requested / displayed 所有権。
+     plan §14.13。`positionRequest` token を廃止し、義務を (requested, displayed) の対から
+     導く形にした。**次は実機確認から**
+4. **混在フォルダのパリティ 完了・実機確認済み (`c3dc2743`)** — protocol v43。plan §12.27。
+   本体の `physical_page_order_locked` と seek overlay の分類をリモートから直接呼ぶ形にした
+5. **master 取り込み済み (`7de01e38`)** — v2.13.0 を含む 45 件。`master` は `web-remote` に
+   完全に含まれる。退避ブランチ `web-remote-premerge` あり
 
-### 再開したら最初にやること (2026-08-11 の中断時点)
+## 段階 3c で入ったもの (正本は plan §14.13)
+
+`viewer-position.mjs` の純粋状態機械が requested / displayed の identity snapshot を持つ。
+巻き戻し義務は token ではなく**その対**から決まる (requested が displayed より先にあれば、
+終端失敗した側が誰であっても戻す)。これで §14.5.1 の 2 経路が入口別の分岐無しに閉じた。
+
+- 位置を動かす入口は `requestPageGroup` の 1 本 (ページ送り / seek / bookmark jump)。
+  `state.pageGroupIndex` への代入は `assignOwnedPageGroupPosition` の 1 か所だけ
+- URL は常に requested を写す。`request` で push、実際に巻き戻したときだけ `replaceState`
+- `pageGroups` の再構成は `reanchorViewerPageGroups` が唯一の境界。displayed も
+  生きている配列の snapshot しか持たない (DOM commit 時にも再解決する)
+- owner と `state.pageGroupIndex` が食い違ったら再アンカーで収束させ、型付きの理由を残す
+
+**実機で見る項目** (3a / 3b から持ち越した 2 つを含む):
+
+- 読み込み中のページ B を fit 変更 / 画面回転が追い越して失敗したとき、表示・seek・タイトル・
+  URL が揃ってページ A へ戻る
+- ブックマーク jump の失敗でも同じく戻る
+- seek の session 取得失敗が、後から要求した別ページを巻き戻さない
+- 見開き再構成 (回転 / 見開き切替) の直後に古い読み込みが失敗しても、別ページへ飛ばない
+- 巻き戻し後の back と grid 復帰 (同じページへ戻る無駄な back が 1 回出るのは仕様)
+- **64 MiB 予算を埋めた深い高解像度コンテナで、遠い取得済みページが近い候補と交換される**
+  (3a から未確認)
+- **表示中の切断 / 再接続、セッションの解放 / 再取得** (3a から未確認)
+
+## 作業の進め方 (この一連で確立したもの)
+
+- 実装は Codex (`codex exec -c model="gpt-5.6-sol" -c service_tier="default"
+  --sandbox workspace-write`)、ブリーフ / レビュー / テスト / 統合は ClaudeCode、
+  実機確認は利用者。**fast は使わない**
+- 同じタスクの 2 周目以降は `codex exec resume --last` (新セッションを開かない)。
+  resume に `-C` / `--cd` は**無い**ので worktree の中から打つ
+- **レビューでは「テストが本物か」を必ず確かめる**。修正を潰して該当テストが実際に落ちる
+  ことを見る。この一連で 3 回、これで本物の欠陥を捕まえた
+- **release ビルドでしか出ない差に注意**。`debug_assert!` は式ごと評価されないので、
+  副作用を入れると release で消える (3b で実害)。`dev-runtime` は release を継承する
+- ビルドは `.\scripts\build-dev.ps1`。**`*>&1` や `| Select-Object` を付けて呼ばない**
+  (cargo の stderr が terminating error 化して落ちる)
+- web の新モジュールは `build.rs` が `web/` を再帰走査して配るので登録不要
+  (`*.test.mjs` は自動除外)
+
+### 検証コマンド
 
 ```
 cd crates/remote-web/web && node --test
@@ -47,17 +94,6 @@ cargo test -p mimageviewer --lib
 cargo test -p mimageviewer-remote
 .\scripts\build-dev.ps1
 ```
-
-実機で見る項目 (3a から持ち越した 2 つを含む):
-
-- 待機中のサムネイル / 先読みがあっても前景ページが先に表示される
-- サムネイル待機中に先読みが 503 にならない
-- **待機中の先読みを開くと、queued な仕事を追い越して表示される** (release ビルドでのみ
-  壊れていた経路。`debug_assert!` が insert ごと消えていた)
-- ページ送り連打で release された待機 job が後から pop されない
-- **64 MiB 予算を埋めた深い高解像度コンテナで、遠い取得済みページが近い候補と交換される**
-  (3a から未確認)
-- **表示中の切断 / 再接続、セッションの解放 / 再取得** (3a から未確認)
 
 ### 旧記述 (分割前)
 

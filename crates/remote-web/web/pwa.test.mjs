@@ -517,7 +517,7 @@ test("page request feedback precedes load while display position commits at repl
     app.indexOf("async function updateViewerImage(")
   );
   assert.doesNotMatch(navigation, /setSeekState\(/);
-  assert.match(navigation, /updateRequestedPageGroup/);
+  assert.match(navigation, /requestPageGroup/);
   assert.match(app, /viewer\.setRequestedPagePresentation/);
   assert.match(
     app,
@@ -527,38 +527,98 @@ test("page request feedback precedes load while display position commits at repl
     app,
     /this\.pageLayer\.replaceChildren\(\.\.\.decodedImages[\s\S]*?this\.commitPagePresentation\(presentation\);/
   );
+  assert.match(app, /positionSnapshot:\s*loadRequest/);
+
+  const commitStart = app.indexOf("  commitPagePresentation(");
+  const commit = app.slice(
+    commitStart,
+    app.indexOf("  restoreRequestedPagePresentation(", commitStart)
+  );
+  assert.match(
+    commit,
+    /const livePositionSnapshot = resolveReanchoredViewerPosition\(positionSnapshot\);/
+  );
+  assert.match(
+    commit,
+    /if \(livePositionSnapshot\) \{\s*viewerPositionOwner\.display\(livePositionSnapshot\);\s*\}/
+  );
+  assert.doesNotMatch(commit, /viewerPositionOwner\.display\(positionSnapshot\)/);
 });
 
-test("only committed page navigation owns failure rollback and shows its message afterward", async () => {
+test("page position movement, history, open, and reanchor have one structural owner", async () => {
   const app = await readFile(new URL("app.js", here), "utf8");
-  assert.equal(
-    (app.match(/updateViewerImage\(performance\.now\(\), \{ positionRequest \}\)/g) ?? []).length,
-    1
+  const owner = app.slice(
+    app.indexOf("function requestPageGroup("),
+    app.indexOf("let spreadWriteTail")
   );
-  assert.match(
-    app,
-    /async function updateViewerImage\([\s\S]*?positionRequest = null,/
+  assert.equal((owner.match(/history\.pushState\(/g) ?? []).length, 1);
+
+  const bookmark = app.slice(
+    app.indexOf("async function openRemoteBookBookmarkTarget("),
+    app.indexOf("async function flushReadingProgress(")
   );
-  assert.match(
-    app,
-    /ViewerGroupLoadCompletionAction\.ROLLBACK\)[\s\S]*?discardRequestedPageGroup\([\s\S]*?viewer\.showGroupLoadFailure\(displayedFailure\.message\)/
+  const seek = app.slice(
+    app.indexOf("const commitSeekGroup = ("),
+    app.indexOf("seekInput.addEventListener")
   );
-  for (const trigger of [
-    "fit_mode",
-    "adjustment_commit",
-    "viewport_resize",
-  ]) {
-    const start = app.indexOf(`renderTrigger: "${trigger}"`);
-    assert.notEqual(start, -1);
-    const call = app.slice(Math.max(0, start - 100), start + 100);
-    assert.doesNotMatch(call, /positionRequest/);
+  const navigation = app.slice(
+    app.indexOf("function changeImageTo("),
+    app.indexOf("export function viewerImageUpdateContextExitReason(")
+  );
+  for (const route of [bookmark, seek, navigation]) {
+    assert.match(route, /requestPageGroup\(/);
+    assert.doesNotMatch(route, /history\.pushState\(|state\.pageGroupIndex\s*=/);
   }
+
+  assert.equal((app.match(/state\.pageGroupIndex\s*=/g) ?? []).length, 1);
+  assert.match(
+    app,
+    /function assignOwnedPageGroupPosition\(groupIndex\) \{\s*state\.pageGroupIndex = groupIndex;\s*\}/
+  );
+  assert.match(app, /function renderImageViewer\([\s\S]*?openViewerPagePosition\(/);
+  assert.match(app, /function setSinglePageGroups\([\s\S]*?reanchorViewerPageGroups\(/);
+  assert.match(app, /function setContainerPageGroups\([\s\S]*?reanchorViewerPageGroups\(/);
+  assert.doesNotMatch(app, /positionRequest/);
+  assert.match(
+    app,
+    /async function updateViewerImage\([\s\S]*?viewerPositionOwner\.settle\(result, \{ loadRequest \}\)/
+  );
+  assert.match(
+    app,
+    /ViewerGroupLoadCompletionAction\.ROLLBACK\)[\s\S]*?commitViewerPositionRewind\(viewer, completion\)[\s\S]*?viewer\.showGroupLoadFailure\(displayedFailure\.message\)/
+  );
+
+  const convergence = app.slice(
+    app.indexOf("function convergeViewerPositionAfterApplyFailure("),
+    app.indexOf("function commitViewerPositionRewind(")
+  );
+  assert.match(convergence, /const reanchored = reanchorViewerPageGroups\(\);/);
+  assert.match(
+    convergence,
+    /recordClientError\("viewer_position_apply_error", reason, \{\s*reason,/
+  );
+  const rewind = app.slice(
+    app.indexOf("function commitViewerPositionRewind("),
+    app.indexOf("function discardRequestedPageGroup(")
+  );
+  assert.match(
+    rewind,
+    /!applyRequestedPageGroupPosition\(rewind\.to\)[\s\S]*?convergeViewerPositionAfterApplyFailure\(\s*ViewerPositionApplyFailureReason\.REWIND,\s*rewind\.to/
+  );
+  assert.match(
+    owner,
+    /!applyRequestedPageGroupPosition\(requestedSnapshot,[\s\S]*?convergeViewerPositionAfterApplyFailure\(\s*ViewerPositionApplyFailureReason\.REQUEST,\s*requestedSnapshot/
+  );
+  assert.match(
+    app,
+    /if \(!positionSnapshot\) \{[\s\S]*?recordClientError\([\s\S]*?ViewerPositionApplyFailureReason\.OPEN,[\s\S]*?reason: ViewerPositionApplyFailureReason\.OPEN,/
+  );
 });
 
 test("a thrown page load still reaches the outcome contract instead of the render error path", async () => {
   const app = await readFile(new URL("app.js", here), "utf8");
   const body = app.slice(app.indexOf("async function updateViewerImage("));
-  const load = body.slice(0, body.indexOf("const completion = viewerGroupLoadCompletionPlan("));
+  const load = body.slice(0, body.indexOf("const completion = viewerPositionOwner.settle("));
   // loadGroup と imageInfo は例外を投げ得る。try の外に出ると呼び出し側の
   // .catch(renderError) まで飛び、位置を戻す判断が一度も行われない。
   assert.match(

@@ -1750,12 +1750,6 @@ export function viewerSeekMediaPresentation({
   };
 }
 
-export const ViewerPagePositionEvent = Object.freeze({
-  REQUEST: "request",
-  DISPLAY: "display",
-  DISCARD: "discard",
-});
-
 export const ViewerGroupLoadOutcome = Object.freeze({
   APPLIED: "applied",
   SUPERSEDED: "superseded",
@@ -1783,13 +1777,11 @@ export function viewerPageGroupRequestMatches(request, current) {
   );
 }
 
-/// Resolve the only allowed completion action for a group load. A failed load
-/// may rewind position only when its explicit position owner still identifies
-/// the current request. Failures from fit/adjustment/resize refreshes are shown
-/// without moving the requested position.
+/// Resolve the only allowed completion action for a group load. Rollback duty
+/// follows from the current requested/displayed pair, not from a per-load token.
 export function viewerGroupLoadCompletionPlan(
   result,
-  { loadRequest = null, positionRequest = null, currentRequest = null } = {}
+  { loadRequest = null, currentRequest = null, displayedRequest = null } = {}
 ) {
   const outcome = result?.outcome;
   if (!Object.values(ViewerGroupLoadOutcome).includes(outcome)) {
@@ -1806,79 +1798,23 @@ export function viewerGroupLoadCompletionPlan(
     return { action: ViewerGroupLoadCompletionAction.IGNORE };
   }
 
-  if (
-    loadRequest &&
-    !viewerPageGroupRequestMatches(loadRequest, currentRequest)
-  ) {
+  if (!viewerPageGroupRequestMatches(loadRequest, currentRequest)) {
     return { action: ViewerGroupLoadCompletionAction.IGNORE };
   }
   if (outcome === ViewerGroupLoadOutcome.APPLIED) {
     return { action: ViewerGroupLoadCompletionAction.POST_DISPLAY };
   }
 
-  const ownsCurrentPosition =
-    viewerPageGroupRequestMatches(positionRequest, loadRequest) &&
-    viewerPageGroupRequestMatches(positionRequest, currentRequest);
+  const requestedIsAhead =
+    displayedRequest !== null &&
+    !viewerPageGroupRequestMatches(currentRequest, displayedRequest);
   // 位置を戻したことを述べてよいのは、実際に戻す側だけ。
-  return ownsCurrentPosition
+  return requestedIsAhead
     ? {
       action: ViewerGroupLoadCompletionAction.ROLLBACK,
       message: `${message}前のページに戻りました。`,
     }
     : { action: ViewerGroupLoadCompletionAction.REPORT_FAILURE, message };
-}
-
-/// Requested and displayed positions remain two concrete values. UI feedback is
-/// always derived from the requested position; only an explicit discard rewinds it.
-export function viewerPagePositionTransition(
-  { requestedGroupIndex, displayedGroupIndex },
-  { type, groupIndex } = {}
-) {
-  let requested = requestedGroupIndex;
-  let displayed = displayedGroupIndex;
-  if (!Number.isInteger(requested) || requested < 0) {
-    throw new RangeError("requestedGroupIndex must be a non-negative integer");
-  }
-  if (!Number.isInteger(displayed) || displayed < 0) {
-    throw new RangeError("displayedGroupIndex must be a non-negative integer");
-  }
-  if (type === ViewerPagePositionEvent.REQUEST) {
-    requested = groupIndex;
-  } else if (type === ViewerPagePositionEvent.DISPLAY) {
-    displayed = groupIndex;
-  } else if (type === ViewerPagePositionEvent.DISCARD) {
-    if (!Number.isInteger(groupIndex) || groupIndex < 0) {
-      throw new RangeError("discard groupIndex must be a non-negative integer");
-    }
-    if (requested === groupIndex) requested = displayed;
-  } else {
-    throw new TypeError("unknown viewer page position event");
-  }
-  if (!Number.isInteger(requested) || requested < 0) {
-    throw new RangeError("groupIndex must be a non-negative integer");
-  }
-  if (!Number.isInteger(displayed) || displayed < 0) {
-    throw new RangeError("groupIndex must be a non-negative integer");
-  }
-  return { requestedGroupIndex: requested, displayedGroupIndex: displayed };
-}
-
-export function viewerPagePositionFeedback({
-  requestedGroupIndex,
-  displayedGroupIndex,
-}) {
-  const requested = requestedGroupIndex;
-  const displayed = displayedGroupIndex;
-  if (!Number.isInteger(requested) || requested < 0) {
-    throw new RangeError("requestedGroupIndex must be a non-negative integer");
-  }
-  if (!Number.isInteger(displayed) || displayed < 0) {
-    throw new RangeError("displayedGroupIndex must be a non-negative integer");
-  }
-  return {
-    groupIndex: requested,
-    pending: requested !== displayed,
-  };
 }
 
 export function viewerGestureDecision({
