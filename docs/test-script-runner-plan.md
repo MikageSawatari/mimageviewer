@@ -302,7 +302,7 @@ run が次を観測できなかったら、**成功ではなく不成立**とし
 | --- | --- | --- |
 | 同じ hold 中に `held=true/edge=あり` と `held=true/edge=なし` の**両方** | §2.5.2.1 の 30Hz 振動を実際に通した = 合成入力が edge と level の両方に届いている | **常に** |
 | `frame_input held=true` と同じ `(hold_id, frame_nr)` で production の `Keymap::key_held_chord` が `held=true` を返した | timeline 内の level ではなく、実際の consumer まで到達した | **常に** |
-| 複数 repeat が 1 フレームに materialize された | §3.2 の蓄積条件を通した | **page-turn 計測のときだけ** (下記) |
+| 複数 repeat が 1 フレームに materialize された | §3.2 の蓄積条件を通した | 観測結果を報告するが合否には使わない (下記) |
 | burst が 1 つ以上ある | 検査対象があった | page-turn の不変条件検査時 |
 
 **蓄積条件を常時必須にしてはいけない (2026-08-11 に実測で判明)。** 1 フレームが複数 repeat を
@@ -310,9 +310,9 @@ run が次を観測できなかったら、**成功ではなく不成立**とし
 2.5 秒 hold が **約 166fps** で回り、repeat 68 個が全部別フレームに散った (`vibration=yes` /
 `accumulation=no`)。健全な速い run を「不成立」と報告してしまう。
 
-したがって蓄積条件は **`fs/page_turn_ready` があるログ (= §1.58 の計測) のときだけ必須**にする。
-それ以外では観測結果を出すが合否には使わない。**遅いフレームこそが §1.58 の主題**なので、
-page-turn 計測で蓄積が 0 なら、その計測は興味のある条件を通っていない。
+したがって蓄積条件は、`fs/page_turn_ready` がある §1.58 の計測でも**報告だけで gate にしない**。
+1.6MP の実データは約 6ms/frame で回り、正しい 1:1 通過表示ほど複数 repeat が同一 frame に
+溜まらない。R1〜R4 の合否は page-turn I1〜I5 と実際の命令数 / 表示数で判定する。
 
 ### 9.3 アプリが出す事実 (判定しない)
 
@@ -423,8 +423,8 @@ self-test (`scripts/page-turn/selftest.rhai`) が次を示すこと:
 `(hold_id, frame_nr)` で production の `Keymap::key_held_chord` を実際に呼び、
 `test_script/level_read held=true` が出たことを Python 側で照合する。
 
-蓄積は S3 の実測訂正どおり、`fs/page_turn_ready` がある §1.58 計測でだけ必須。
-self-test は速い run でも成立しなければならず、蓄積 0 を不成立にしない。
+蓄積は S3 と §1.58 の実測訂正どおり、page-turn 計測を含めて報告だけにする。
+self-test と本番計測は速い run でも成立しなければならず、蓄積 0 を不成立にしない。
 
 ### 13.1 無人 self-test
 
@@ -481,9 +481,10 @@ python scripts/analyze_perf.py <perf-log> page-turn --check
 未完了扱いにし、本番計測では `checked bursts>0 / violations=0` を要求する。
 
 上記 self-test が実ログで通ったため、**§1.58 の着手条件は満たされた**。§1.58 は両 event と
-display-unit 原子の見開き通過表示を実装済み。単一ページは `scripts/page-turn/measure.rhai`、
+単一 / 見開き display-unit の通過表示を実装済み。単一ページは `scripts/page-turn/measure.rhai`、
 RTL 見開きの往復は `scripts/page-turn/measure-spread-rtl-roundtrip.rhai` を使う。残る完了条件は
-§13.2 の隔離 foreground 本番計測である。
+§13.2 の隔離 foreground 本番計測である。通過表示は単一ページにも適用し、4.1MP 実 ZIP の
+materialized 経路で観測した 174 命令 / 29 表示の解消も同じ gate で確認する。
 
 ## 14. 後続 (この基盤ができてから)
 

@@ -450,24 +450,33 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   規模。detached リワーク ([detached-rework-plan.md](detached-rework-plan.md)) と presenter を
   共有するので、着手時期はリワークの進捗と調整する
 
-### 1.58 ページ送り (キー押しっぱなし) が引っかかる — 本体修正済み、実ログ gate 待ち
+### 1.58 ページ送り (キー押しっぱなし) が引っかかる — 見開き実機合格、単一ページ gate 待ち
 
 - 出典: 利用者メール (pattier、2026-08-07) + `--perf-log` 実測。キーリピート間隔 34ms に対し、
   1 ページの実体化に UI スレッドで upload 21ms + final_composite_build 21ms かかり、
   構造的に追いつかない。連結読みが速いのは実体化済みを見せるだけだから。
-- **2026-08-12 本体修正**: source inspection で、見開きだけ旧
+- **2026-08-12 見開き本体修正**: source inspection で、見開きだけ旧
   `ColorizeDisplayUnitHoldover` が対象 unit の final 完成まで前 unit を上描きし、正しく遷移した
   frame を隠していたと確定。見開きの physical held level 中は display-unit 原子の色忠実
   low-resolution rendition を描き、full decode / final effect / AI と UI upload を保留する。
-  release frame で止まった unit だけを実体化する。単一ページは既存の materialized path のまま。
+  release frame で止まった unit だけを実体化する。
+- **見開きの利用者実測は合格**: 修正前 23 / 267 表示から **267 / 267** (順番どおり、中央値
+  30ms)、hold 中の `decode_begin` は **0 / 0 / 0**、release 後 **29〜56ms** で左右同時に
+  materialized、`page-turn --check` は **checked bursts=3 / violations=0** になった。
+- **単一ページにも同じ規則を適用**: `aimodel1` (1.6MP) は materialized のままでも 144 / 144
+  だったが、4.1MP の実 ZIP (`原神.zip`) は **174 命令 / 29 表示 (約 1:6)** だった。
+  source inspection で `fs_page_turn_ordinary_context_blocker` の `single_page_materialized` が
+  pass-through を明示的に除外していたと確定したため、この blocker を除いた。held 中は resident
+  final の有無をページ別に見ず全ページ一様に rendition、release 後だけ materialized とする。
 - **再デコードの根因**: cache key mismatch ではなく、通過する全ページで eager decode / prefetch を
   始めた後に `fs_cache` / `final_composite_cache` の keep window が先行ページを eviction していた。
   見開き held 中は通過先 producer 自体を起動せず、進行中 producer だけ cancel して resident result と
   完成済み upload backlog は保持する形へ変更した。
 - `fs/page_turn_ready` / `fs/page_turn_decision` を復活し、`idx` / `mode` / `source` /
   `items_generation` / `reason` / `defer_ui_uploads` / `passthrough_rendition_ready` を出す。
-  `scripts/page-turn/measure-spread-rtl-roundtrip.rhai` も追加した。残作業は隔離 foreground で
-  `page-turn --check` の `checked bursts>0 / violations=0`、単一・見開き・実 ZIP の数値確認。
+  `fs/paint` も通過 rendition を `source=thumbnail` として記録し、見開きは atomic source 解決後に
+  両ページを出す。`scripts/page-turn/measure-spread-rtl-roundtrip.rhai` も追加した。残作業は隔離
+  foreground で単一 `aimodel1` / 4.1MP ZIP を数値確認し、見開き回帰も再確認すること。
 - **v2.13.0 で対策 1 (通過表示 = 通り過ぎるページをカタログサムネイルで描く) を入れ、
   出荷前の実機確認で 5 回直して 5 回とも失敗したため削除した (2026-08-11)。**
   最後の状態は v2.12.0 より悪かった (カラー化した本でページごとにカラー / 白黒が入れ替わり、
@@ -492,7 +501,7 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   「アプリ内蔵テストスクリプト」ができてから着手する。判定は
   `python scripts/analyze_perf.py <jsonl> page-turn --check` (実装済み) を使う。
 - UI スレッドの 42ms 削減 (通常 materialized path の表示解像度 upload、`edit_result` upload の分散) /
-  最終合成の先読みは別の改善余地として残る。今回の見開き held path は full-size work を開始しないため、
+  最終合成の先読みは別の改善余地として残る。今回の held path は full-size work を開始しないため、
   §1.58 の主症状と再デコードをこの追加最適化に依存させていない。
 - 規模 / 優先度: Medium / P2。
 

@@ -3913,6 +3913,9 @@ impl App {
         texture: &egui::TextureHandle,
     ) -> &'static str {
         let texture_id = texture.id();
+        if self.is_passthrough_rendition_texture(texture) {
+            return "thumbnail";
+        }
         if self
             .current_comic_composite_texture(idx)
             .is_some_and(|tex| tex.id() == texture_id)
@@ -6534,6 +6537,36 @@ struct FsPageTurnReadySignature {
     items_generation: u64,
     mode: &'static str,
     pages: Vec<(usize, egui::TextureId, &'static str)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FsDisplayUnitTracePage {
+    idx: usize,
+    texture_id: egui::TextureId,
+    source: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FsPaintDisplayUnitSignature {
+    items_generation: u64,
+    pages: Vec<(usize, egui::TextureId)>,
+}
+
+fn fs_paint_page_changed_from_previous(
+    previous: Option<&FsPaintDisplayUnitSignature>,
+    items_generation: u64,
+    idx: usize,
+    texture_id: egui::TextureId,
+) -> bool {
+    previous.map_or(true, |previous| {
+        previous.items_generation != items_generation
+            || !previous
+                .pages
+                .iter()
+                .any(|(previous_idx, previous_texture_id)| {
+                    *previous_idx == idx && *previous_texture_id == texture_id
+                })
+    })
 }
 
 fn page_turn_decision_for_inputs(
@@ -12858,11 +12891,6 @@ impl App {
     ) -> Option<&'static str> {
         if !self.reading_flow.is_paged() {
             Some("reading_flow_not_paged")
-        } else if !self.spread_mode.is_spread() {
-            // Single-page already paints every command as final_composite at the
-            // repeat rate. Keep that established path unchanged; the measured R1
-            // failure and the display-unit holdover are spread-specific.
-            Some("single_page_materialized")
         } else if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
             Some("item_not_page_data")
         } else if self.any_modal_dialog_open_for_fullscreen_keys() {
@@ -13059,20 +13087,12 @@ impl App {
         }
     }
 
-    /// Emit readiness only after the final visible display-unit source has been
-    /// selected (including holdovers). Spread pages are accepted only as a complete
-    /// unit, so the trace cannot report a half-painted pair as ready.
-    fn emit_fs_page_turn_ready_for_display_unit(
+    fn fs_display_unit_trace_pages(
         &self,
-        ctx: &egui::Context,
         fs_idx: usize,
         spread_pair: SpreadPair,
-        decision: FsPageTurnDecision,
         sources: &FsNavigatorTextureSources,
-    ) {
-        if !crate::perf::is_enabled() {
-            return;
-        }
+    ) -> Option<Vec<FsDisplayUnitTracePage>> {
         let mut expected = match spread_pair {
             SpreadPair::Single => vec![fs_idx],
             SpreadPair::Double { left, right } => vec![left, right],
@@ -13085,28 +13105,124 @@ impl App {
                     .pages
                     .iter()
                     .find(|(page_idx, _)| page_idx == idx)
-                    .map(|(_, resource)| (*idx, resource.source_texture()))
+                    .map(|(_, resource)| {
+                        let texture = resource.source_texture();
+                        let source = if self.is_passthrough_rendition_texture(texture) {
+                            "thumbnail"
+                        } else {
+                            self.fs_texture_source_for_trace(*idx, texture)
+                        };
+                        FsDisplayUnitTracePage {
+                            idx: *idx,
+                            texture_id: texture.id(),
+                            source,
+                        }
+                    })
             })
             .collect::<Vec<_>>();
-        if pages.len() != expected.len() {
+        (pages.len() == expected.len()).then_some(pages)
+    }
+
+    /// Record the resources selected by the completed display-unit draw, after spread
+    /// resolution and holdover replacement. Dedup compares each page only with the
+    /// immediately preceding display unit's `(idx, texture)` pairs.
+    fn emit_fs_spread_paint_for_display_unit(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        spread_pair: SpreadPair,
+        decision: FsPageTurnDecision,
+        sources: &FsNavigatorTextureSources,
+    ) {
+        if !crate::perf::is_enabled() {
             return;
         }
-
-        let trace_pages = pages
+        let trace_pages = self
+            .fs_display_unit_trace_pages(fs_idx, spread_pair, sources)
+            .unwrap_or_default();
+        let viewport = if self.fullscreen_embedded_still_active() {
+            ctx.viewport_id()
+        } else {
+            self.fullscreen_viewport_id()
+        };
+        let cache_id = egui::Id::new(("fs_paint_display_unit", viewport));
+        let previous = ctx.data(|data| data.get_temp::<FsPaintDisplayUnitSignature>(cache_id));
+        let changed_pages = trace_pages
             .iter()
-            .map(|(idx, texture)| {
-                let source = if self.is_passthrough_rendition_texture(texture) {
-                    "thumbnail"
-                } else {
-                    self.fs_texture_source_for_trace(*idx, texture)
-                };
-                (*idx, *texture, source)
+            .copied()
+            .filter(|page| {
+                fs_paint_page_changed_from_previous(
+                    previous.as_ref(),
+                    self.items_generation,
+                    page.idx,
+                    page.texture_id,
+                )
             })
             .collect::<Vec<_>>();
-        if matches!(decision.paint_source(), FsPageTurnPaintSource::Materialized)
-            && trace_pages
+        let current = FsPaintDisplayUnitSignature {
+            items_generation: self.items_generation,
+            pages: trace_pages
                 .iter()
-                .any(|(_, _, source)| *source == "thumbnail")
+                .map(|page| (page.idx, page.texture_id))
+                .collect(),
+        };
+        ctx.data_mut(|data| data.insert_temp(cache_id, current));
+
+        for page in changed_pages {
+            let entry_seq = if matches!(decision.paint_source(), FsPageTurnPaintSource::PassThrough)
+            {
+                self.input_seq
+            } else {
+                self.fs_cache
+                    .get(&page.idx)
+                    .map(|entry| entry.load_seq())
+                    .unwrap_or(0)
+            };
+            crate::perf::event(
+                "fs",
+                "paint",
+                self.perf_item_key(page.idx).as_deref(),
+                entry_seq,
+                &[
+                    ("idx", serde_json::Value::from(page.idx)),
+                    (
+                        "items_generation",
+                        serde_json::Value::from(self.items_generation),
+                    ),
+                    ("mode", serde_json::Value::from(decision.perf_label())),
+                    ("source", serde_json::Value::from(page.source)),
+                    (
+                        "texture_id",
+                        serde_json::Value::from(format!("{:?}", page.texture_id)),
+                    ),
+                ],
+            );
+        }
+    }
+
+    /// Emit readiness only after the final visible display-unit source has been
+    /// selected (including holdovers). Spread pages are accepted only as a complete
+    /// unit, so the trace cannot report a half-painted pair as ready.
+    fn emit_fs_page_turn_ready_for_display_unit(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        spread_pair: SpreadPair,
+        decision: FsPageTurnDecision,
+        sources: &FsNavigatorTextureSources,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let Some(trace_pages) = self.fs_display_unit_trace_pages(fs_idx, spread_pair, sources)
+        else {
+            return;
+        };
+        if matches!(spread_pair, SpreadPair::Double { .. }) {
+            self.emit_fs_spread_paint_for_display_unit(ctx, fs_idx, spread_pair, decision, sources);
+        }
+        if matches!(decision.paint_source(), FsPageTurnPaintSource::Materialized)
+            && trace_pages.iter().any(|page| page.source == "thumbnail")
         {
             // A normal decode-wait thumbnail is not the materialized stop page.
             return;
@@ -13116,7 +13232,7 @@ impl App {
             mode: decision.perf_label(),
             pages: trace_pages
                 .iter()
-                .map(|(idx, texture, source)| (*idx, texture.id(), *source))
+                .map(|page| (page.idx, page.texture_id, page.source))
                 .collect(),
         };
         let cache_id = egui::Id::new(("fs_page_turn_ready", self.fullscreen_viewport_id()));
@@ -13136,18 +13252,18 @@ impl App {
         };
         let script_hold_id = crate::key_input::synthetic_frame_hold_id(ctx, viewport);
 
-        for (idx, texture, source) in trace_pages {
+        for page in trace_pages {
             let mut attrs = vec![
-                ("idx", serde_json::Value::from(idx)),
+                ("idx", serde_json::Value::from(page.idx)),
                 (
                     "items_generation",
                     serde_json::Value::from(self.items_generation),
                 ),
                 ("mode", serde_json::Value::from(decision.perf_label())),
-                ("source", serde_json::Value::from(source)),
+                ("source", serde_json::Value::from(page.source)),
                 (
                     "texture_id",
-                    serde_json::Value::from(format!("{:?}", texture.id())),
+                    serde_json::Value::from(format!("{:?}", page.texture_id)),
                 ),
             ];
             if let Some(hold_id) = script_hold_id {
@@ -13156,7 +13272,7 @@ impl App {
             crate::perf::event(
                 "fs",
                 "page_turn_ready",
-                self.perf_item_key(idx).as_deref(),
+                self.perf_item_key(page.idx).as_deref(),
                 self.input_seq,
                 &attrs,
             );
@@ -13178,13 +13294,10 @@ impl App {
             FsPageTurnPaintSource::PassThrough
         );
         let tex = if pass_through {
-            if page_turn_decision.passthrough_rendition_ready {
-                None
-            } else {
-                // Rendition absence does not leave pass-through mode or admit new work.
-                // A resident faithful texture is cheap to paint and is the unit fallback.
-                self.resolve_fs_display_tex(fs_idx, true)
-            }
+            // The physical held level owns the paint mode for the whole burst. Do not
+            // choose a resident final page-by-page merely because one happens to be
+            // cached; every passing page uses the same low-resolution rendition path.
+            None
         } else {
             self.resolve_fs_processed_texture(ctx, fs_idx, original_preview_active)
         };
@@ -13228,7 +13341,7 @@ impl App {
             && !original_preview_active
             && tex.is_none()
             && self.colorize_display_requires_final_effect(fs_idx);
-        let thumb_tex = if pass_through && page_turn_decision.passthrough_rendition_ready {
+        let thumb_tex = if pass_through {
             self.ensure_passthrough_rendition(ctx, fs_idx)
         } else if waiting_for_colorize {
             // 生サムネイルは白黒なので使わない。paged の ColorizeDisplayUnit と
@@ -24213,20 +24326,13 @@ impl App {
                 page_turn_decision.paint_source(),
                 FsPageTurnPaintSource::PassThrough
             );
-        let thumbnail_paint = pass_through && page_turn_decision.passthrough_rendition_ready;
         let (mut left_display_tex, mut right_display_tex) = match display_override {
             Some((left, right)) => (Some(left.texture.clone()), Some(right.texture.clone())),
-            None if thumbnail_paint => (
+            None if pass_through => (
                 self.ensure_passthrough_rendition(ctx, left_idx)
                     .map(crate::gpu_lanczos::FullscreenPaintResource::direct),
                 self.ensure_passthrough_rendition(ctx, right_idx)
                     .map(crate::gpu_lanczos::FullscreenPaintResource::direct),
-            ),
-            None if pass_through => (
-                self.resolve_fs_display_tex(left_idx, true)
-                    .map(|texture| self.fullscreen_paint_resource_for_texture(left_idx, texture)),
-                self.resolve_fs_display_tex(right_idx, true)
-                    .map(|texture| self.fullscreen_paint_resource_for_texture(right_idx, texture)),
             ),
             None => (
                 self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active)
@@ -24292,12 +24398,12 @@ impl App {
             ui.painter().clone()
         };
         let left_allow_thumbnail = display_override.is_none()
-            && (thumbnail_paint
+            && (pass_through
                 || (!pass_through
                     && (original_preview_active
                         || !self.colorize_display_requires_final_effect(left_idx))));
         let right_allow_thumbnail = display_override.is_none()
-            && (thumbnail_paint
+            && (pass_through
                 || (!pass_through
                     && (original_preview_active
                         || !self.colorize_display_requires_final_effect(right_idx))));
@@ -30385,7 +30491,7 @@ mod tests {
     }
 
     #[test]
-    fn page_turn_pass_through_is_spread_scoped_without_page_cache_gates() {
+    fn page_turn_pass_through_covers_single_and_spread_without_page_cache_gates() {
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
         app.items
@@ -30395,13 +30501,91 @@ mod tests {
         app.reading_flow = ReadingFlow::Paged;
         app.spread_mode = SpreadMode::Single;
 
-        assert_eq!(
-            app.fs_page_turn_ordinary_context_blocker(&ctx, 0),
-            Some("single_page_materialized")
-        );
+        assert_eq!(app.fs_page_turn_ordinary_context_blocker(&ctx, 0), None);
 
         app.spread_mode = SpreadMode::Rtl;
         assert_eq!(app.fs_page_turn_ordinary_context_blocker(&ctx, 0), None);
+    }
+
+    #[test]
+    fn page_turn_pass_through_does_not_select_a_resident_final_when_rendition_is_missing() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items.push(GridItem::Image(PathBuf::from(
+            "c:/test/page-turn-final.jpg",
+        )));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+        let pixels =
+            std::sync::Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::LIGHT_BLUE));
+        let texture = ctx.load_texture(
+            "page_turn_resident_final",
+            (*pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Static {
+                tex: texture,
+                pixels,
+                source_dims: Some([2, 2]),
+                load_seq: 1,
+            },
+        );
+
+        let state =
+            app.prepare_fullscreen_state(&ctx, 0, page_turn_decision_for_inputs(true, false));
+
+        assert!(state.tex.is_none());
+        assert!(state.thumb_tex.is_none());
+    }
+
+    #[test]
+    fn fs_paint_dedup_compares_each_page_with_the_immediately_previous_display_unit() {
+        let ctx = egui::Context::default();
+        let texture_a = ctx
+            .load_texture(
+                "fs_paint_a",
+                egui::ColorImage::filled([1, 1], egui::Color32::RED),
+                egui::TextureOptions::LINEAR,
+            )
+            .id();
+        let texture_b = ctx
+            .load_texture(
+                "fs_paint_b",
+                egui::ColorImage::filled([1, 1], egui::Color32::BLUE),
+                egui::TextureOptions::LINEAR,
+            )
+            .id();
+        let previous = FsPaintDisplayUnitSignature {
+            items_generation: 7,
+            pages: vec![(2, texture_a), (3, texture_b)],
+        };
+
+        assert!(!fs_paint_page_changed_from_previous(
+            Some(&previous),
+            7,
+            3,
+            texture_b,
+        ));
+        assert!(fs_paint_page_changed_from_previous(
+            Some(&previous),
+            7,
+            4,
+            texture_a,
+        ));
+        assert!(fs_paint_page_changed_from_previous(
+            Some(&previous),
+            7,
+            2,
+            texture_b,
+        ));
+        assert!(fs_paint_page_changed_from_previous(
+            Some(&previous),
+            8,
+            2,
+            texture_a,
+        ));
     }
 
     #[test]

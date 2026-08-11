@@ -838,10 +838,10 @@ AI 待ちの `complete=false` final composite も表示専用の候補である�
 
 #### ページ単位表示のキーリピート
 
-v2.13.0 では、キーリピート中のページをカタログサムネイルで代替する通過表示を削除した。
-ページ単位表示も通常の優先順位だけを使い、毎フレーム `resolve_fs_processed_texture` で完成画像を
-解決する。final-effect worker の完了結果と `fs_upload_backlog` もページ送り入力では保留せず、
-通常の回収・GPU upload ペースで処理する。次版で再実装するときの設計要件と失敗から得た知見は
+v2.13.0 で一度削除した通過表示は、2026-08-12 に単一 / 見開き共通で再実装した。physical
+page-turn key level が held の間は、色忠実な低解像度 rendition を全ページ一様に選び、final-effect
+worker の完了回収、`fs_upload_backlog`、full decode / AI producer を保留する。release 後は current
+display unit を `resolve_fs_processed_texture` の通常経路へ戻す。詳細な要件と失敗から得た知見は
 §2.5 を正本とする。
 
 `colorize_display_requires_final_effect(idx)` は、設定が有効かだけでなく、そのページで
@@ -1424,10 +1424,10 @@ delta に適用するため、ドラッグ途中の Ctrl 押下 / 解放でも�
 
 ### 2.5 ページ送り中の表示規則 (実装の正本)
 
-> **v2.13.0 では通過表示をいったん削除し、2026-08-12 に見開きだけを対象として再実装した。**
+> **v2.13.0 では通過表示をいったん削除し、2026-08-12 にページ単位表示へ再実装した。**
 > `page_turn_decision_for_inputs` / `FsPageTurnDecision` と `fs/page_turn_ready` /
-> `fs/page_turn_decision` は現行コードに存在する。単一ページは実測済みの 1 命令 : 1 完成画像を
-> 維持し、見開きの physical key level が held の間だけ低解像度の色忠実 rendition を使う。
+> `fs/page_turn_decision` は現行コードに存在する。単一ページ / 見開きとも physical key level が
+> held の間は、全ページ一様に低解像度の色忠実 rendition を使い、release 後に完成画像へ戻す。
 > `colorize_display_requires_final_effect` / `waiting_for_colorize`、またはページ送り判定を変更する前に、
 > この節を読むこと。
 > **この領域は繰り返し壊れており、壊れ方が毎回違う。**
@@ -1478,9 +1478,10 @@ R1〜R4 は同時に満たす。**どれか 1 つのために他を崩す修正�
 
 - **B は R3 の本体**。「ページ送り入力がこのフレームに残っている」かどうかだけで決める。
   描画元の都合を混ぜない。
-- **A は B の結果ではない**。すでに常駐している完成画像を描く費用は、サムネイルを描く費用と
-  同じ (どちらもアップロード済み texture を貼るだけ)。**B で保留したまま A で完成画像を
-  選んでよい**。
+- **A は B の結果ではない**。ただし現行のページ送り規則では、physical key level が held になった
+  バースト全体で A を `pass_through` に固定する。常駐している完成画像を貼る費用自体は安いが、
+  **「完成画像が cache にあるか」はページごとに違うため、通過中の A をその条件で選んではいけない。**
+  B は同時に `true` だが、A と B は別々の field / consumer のまま維持する。
 
 #### 2.5.2.1 「ページ送り中か」は**フレーム間で安定した信号**でなければならない
 
@@ -1516,9 +1517,9 @@ I1 violation: burst t=45.222..45.987 idx=123
 
 #### 2.5.3 サムネイルを代役に使ってよい条件
 
-通過表示は「カタログサムネイルをそのページの代役にする」最適化である。**代役が成立しない
-ときは使わない。** 成立条件は加工の種類ごとに違い、判断基準は**見た目の差**と**処理時間**の
-2 つ。
+通過表示は「カタログサムネイルから作る低解像度 rendition をそのページの代役にする」最適化で
+ある。rendition がまだ得られなくても通過モード自体をページ別に解除せず、直前の表示単位を保った
+まま得られる画質で差し替える。加工の扱いは**見た目の差**と**処理時間**の 2 つで決める。
 
 | 加工 | サムネイルとの見た目の差 | フルサイズの実測 | 通過表示の扱い |
 | --- | --- | --- | --- |
@@ -1561,10 +1562,10 @@ I1 violation: burst t=45.222..45.987 idx=123
 現在の対象は Creative LUT と カラー化 (`AllImages` / `MonochromeOnly` かつ色補正が
 identity でない等)。
 
-#### 2.5.3.2 実測: 症状は見開き固有だった (2026-08-11)
+#### 2.5.3.2 実測: 軽い本では見開きだけに露出した (2026-08-11〜12)
 
 **利用者が引っかかりを確認したフォルダ** (`aimodel1`、306 枚、**1.0〜1.6MP**) を、同じフォルダ・
-同じ設定で単一ページと見開き (RTL) の両方で計測した。**解像度は関係なかった。**
+同じ設定で単一ページと見開き (RTL) の両方で計測した。この軽い本では解像度は支配項でなかった。
 
 | モード | ナビ命令 | 実際に描かれた枚数 | 画面滞留時間 | 逆行 | 再訪 |
 | --- | --- | --- | --- | --- | --- |
@@ -1582,9 +1583,14 @@ Target(15), Target(17), …` と単調増加で、逆行は 0 件。つまり**�
 > 「ページ数が巻き戻るようにちらつく」については、**逆行そのものは観測できていない**。
 > 止まって飛ぶ挙動が巻き戻りとして知覚されている可能性が高いが、未確認。
 
-単一ページは同条件で 1 命令 1 描画を維持し、すべて `final_composite` で追いついている。
-**したがって §1.58 の主症状はスループットではなく、見開き表示単位が「両ページ揃うまで描かない」
-ことによる描画欠落**である (§2.5.4)。R1 (ページ表示自体を飛ばさない) の違反そのもの。
+単一ページはこの条件では 1 命令 1 描画を維持し、すべて `final_composite` で追いついていた。
+一方、見開きの主症状はスループットではなく、表示単位が final 完成まで旧 unit に覆われることによる
+描画欠落だった (§2.5.4)。どちらも R1 は同じであり、単一が常に安全という意味ではない。
+
+その後、4.1MP の実 ZIP (`原神.zip`) を単一ページで測ると、materialized 経路は **174 命令に
+対して 29 表示 (約 1:6)** しか出なかった。`aimodel1` の 1:1 は完成処理が 34ms の repeat に
+たまたま追いついていただけで、高解像度では単一ページにも同じ R1 違反が露出する。この実測を受け、
+利用者判断で単一ページも見開きと同じ pass-through 規則へ統一した。
 
 計測メモ: **RTL 見開きでは Right が「戻る」方向**。前進は Left。RTL で Right を押し続けると
 `page_nav=Boundary { at_end: false }` が 144 回並ぶだけになる (実際にそうなった)。
@@ -1635,25 +1641,34 @@ source inspection で、見開きの表示欠落は `open_fullscreen` が前の
 退避した。2 周目は正しい同じ key であっても resident entry が既に無く、もう一度 source decode へ
 入っていた。
 
-修正後は、見開きで physical key level が held の間だけ次を一体で行う。
+修正後は、単一ページ / 見開きで physical key level が held の間、次を一体で行う。
 
 - 表示単位の全ページを、色調補正 → Creative LUT → カラー化済みの低解像度 rendition として
   同じ frame で原子的に解決する。ready 状態は通過モードへ入る条件に使わない。
 - `open_fullscreen` は通過先の full decode / prefetch を開始せず、進行中の context-owned
   decode / final effect / AI producer を cancel する。resident cache と完成済み upload backlog は保持する。
-- release frame は current page だけを通常の eager materialization へ戻し、その後の通常 prefetch を再開する。
+- release frame は current display unit だけを通常の eager materialization へ戻し、その後の通常
+  prefetch を再開する。
 - 旧 `ColorizeDisplayUnitHoldover` は materialized path だけで描き、通過中の新 display unit を覆わない。
 
-単一ページはこの分岐に入れず、既存の全 `final_composite` 経路を維持する。実機 perf 計測は
-Windows の foreground precondition を満たす環境で §2.5.5 の gate を通して完了させる。
+最初の見開き修正 (96faeee6) は利用者実測で、**267 / 267 ページを順番どおり表示** (間隔中央値
+30ms)、hold 中の `decode_begin` **0 / 0 / 0**、release 後 **29〜56ms** で左右同時に完成画像へ
+settle、`page-turn --check` は **checked bursts=3 / violations=0** を確認した。
 
-#### 2.5.4 表示単位 (見開き / 連結)
+単一ページ側の source inspection では、`fs_page_turn_ordinary_context_blocker` の
+`single_page_materialized` が pass-through を明示的に除外し、`open_fullscreen` の eager
+materialization へ流していた。4.1MP ZIP では次の final texture が間に合わず旧ページが残るため、
+174 命令のうち完成した 29 ページしか `fs/paint` に現れなかった。この blocker を除き、held 中は
+resident final の有無を見ず rendition だけを選ぶようにした。単一ページの新しい実機数値は
+Windows の隔離 foreground 計測で確認する。
 
-見開きでは、**表示単位全体を 1 回で解決する**。片側だけ完成画像、もう片側だけ rendition という
-組み合わせは描かない。physical key level が held なら unit 全体が通過モードであり、rendition の
-有無はそのモード自体をページごとに反転させない。全 rendition があれば両方を使い、無ければ
-既に resident な色忠実 texture が両方揃う場合だけ unit 全体で使う。いずれも無ければ未解決 unit と
-して後続 frame の差し替えを待つ。
+#### 2.5.4 表示単位 (単一 / 見開き / 連結)
+
+単一ページは 1 ページ、見開きは左右 2 ページを表示単位として、**表示単位全体を 1 回で解決する**。
+physical key level が held なら burst 内の全 unit が通過モードであり、resident final や rendition の
+有無でページごとに mode を反転させない。見開きは左右 rendition が揃った frame だけを原子的に描き、
+片側だけ完成画像、もう片側だけ rendition という組み合わせを描かない。rendition がまだ無ければ
+未解決 unit として直前表示を保ち、後続 frame の rendition へ差し替える。
 
 縦・横の連結読みは通過表示の対象外 (スクロールは実体化済みのページを見せるだけなので、
 キーごとの実体化コストが元から出ない)。
@@ -1670,11 +1685,16 @@ Windows の foreground precondition を満たす環境で §2.5.5 の gate を�
 | I1 | 1 バースト内で、同じ idx の `source` が `final_composite` → `thumbnail` へ戻らない | R2 |
 | I2 | 1 バースト内で `source` がページをまたいで混ざらない | R2 |
 | I3 | バーストの最初と最後の間のすべての idx が 1 回以上出る | R1 |
-| I4 | バーストの最後の idx は `materialized` で終わる | R4 |
+| I4 | key-up 後 1.5 秒以内に、着地点 idx の `materialized` が現れる | R4 |
 | I5 | 入力が残っている間 `defer_ui_uploads=true` が維持される | R3 |
 
-**削除前に確認した例外**: フォルダ末尾でキーを押し続けると最後のページがサムネイル画質のまま
-留まった (利用者判断 2026-08-10「支障なし」)。次版の判定器でも I4 はこの場合だけ免除する。
+`fs/paint` は単一ページでは既存の `(idx, texture)` producer が rendition も記録し、見開きでは
+holdover を含む最終表示単位の解決後に同じ page list から記録する。`source=thumbnail` が通過
+rendition、`source=final_composite` が完成画像である。前表示単位と同じ `(idx, texture)` は重複して
+出さない。これにより `fs/paint` の表示ページ数と `fs/page_turn_ready` を直接照合できる。
+
+**endpoint 例外**: 端で同じ idx への入力が繰り返される場合だけ I4 を免除する。通常の burst は
+hold 単位で key-up 時に閉じるため、settle を burst 内の最後に要求してはいけない。
 
 #### 2.5.6 やり直しの作業順 (2026-08-11 に更新)
 
@@ -1684,11 +1704,12 @@ Windows の foreground precondition を満たす環境で §2.5.5 の gate を�
    UI スレッド同期実行が可能。**
 2. ~~通過表示に色処理を適用する~~ → 色調補正 → LUT → カラー化を UI スレッドで同期実行する
    context-local rendition cache を実装済み。
-3. ~~通過中はフルサイズのアップロードとデコードを始めない~~ → 見開きの held level では producer
+3. ~~通過中はフルサイズのアップロードとデコードを始めない~~ → ページ単位表示の held level では producer
    起動と UI upload 回収を保留し、既存 producer を cancel する。
 4. ~~止まったページだけ実体化する~~ → release frame で current display unit を eager path へ戻す。
 
-残る完了条件は §2.5.5 の実ログ gate と実 ZIP の回帰計測である。
+見開きの実ログ gate は合格済み。残る完了条件は単一ページの `aimodel1` / 4.1MP 実 ZIP と、
+見開きを含む回帰計測である。
 
 ##### ボトルネックは 1 つではない (2026-08-11 実測)
 
@@ -1696,14 +1717,14 @@ Windows の foreground precondition を満たす環境で §2.5.5 の gate を�
 
 | 対象 | ページの画素数 | 合成コスト | ページ間隔 | 追いつくか |
 | --- | --- | --- | --- | --- |
-| 実物 ZIP (1792×2304 PNG、664 枚) | 4.1MP | 4.7ms | **33.5ms** | ✅ 追いつく |
+| 実物 ZIP (1792×2304 PNG、664 枚) | 4.1MP | 4.7ms | **33.5ms** | materialized 単一は ❌ **29 / 174** |
 | 合成 fixture JPEG | 11.8MP | 13.9ms | **35ms** | ✅ 追いつく |
 | 合成 fixture JPEG | 24.0MP | 28.2ms | **67ms** | ❌ 追いつかない |
 | 実物の本 (`-Setup`、カラー化 + AI 有効) | 小さい | — | — | デコード 72.9ms + AI タイル 57.5ms×44 が支配。upload は **1.38ms** |
 
-**合成コストは画素数にほぼ完全な線形** (4.1→4.7 / 11.8→13.9 / 24.0→28.2、いずれも約 1.17ms/MP)。
-**閾値は 11.8MP と 24MP の間**にある。4MP 級の本は現状でも問題なく追いつくので、
-**再現には高解像度スキャン (概ね 15MP 超) が要る**。
+合成 fixture 単体のコストは画素数にほぼ線形だったが、実アプリでは decode / upload / final-effect
+回収を含むため、4.1MP ZIP でも materialized 経路は追いつかなかった。したがって合成 fixture の
+11.8〜24MP だけから実用上の閾値を決めてはいけない。
 
 実物の本では upload は問題ですらなかった (ページが小さいため)。合成 fixture では upload が
 支配的だった。**共通して効くのは「通過するページでフル解像度の作業を始めない」こと**であって、

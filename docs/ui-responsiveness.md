@@ -191,10 +191,11 @@ wgpu の queue.write_texture が走る。20MP RGBA (78MB) で 26-58ms かかる�
 4. 現在 `fullscreen_idx` に対応するエントリは即時アップロード (表示遅延ゼロ)
 5. backlog が残っていれば `ctx.request_repaint()` で次フレーム継続
 
-v2.13.0 ではキーリピート中の通過表示と upload 保留を削除した。ページ送り中も
-final-effect 完了結果を通常どおり回収し、`fs_upload_backlog` は上の通常ペースで消化する。
-削除した `fs.page_turn_*` event と実行時判定は現行経路に含めない。次版で再実装するときの
-要件・計測不変条件は [display-pipeline.md §2.5](display-pipeline.md#25-ページ送り中の表示規則-次版でやり直すときの正本) を正本とする。
+v2.13.0 で一度削除したページ送り通過表示は、2026-08-12 にページ単位表示の physical held
+level を owner として再実装した。単一ページ / 見開きとも held 中は色忠実な低解像度 rendition を
+描き、full decode / final effect / AI producer と `fs_upload_backlog` の回収を保留する。release 後は
+current display unit を通常 materialized path へ戻す。要件・計測不変条件は
+[display-pipeline.md §2.5](display-pipeline.md#25-ページ送り中の表示規則-実装の正本) を正本とする。
 
 静止画の `DISPLAY_IMAGE_TEXTURE_OPTIONS` は level 0 upload の直後に vendored `egui-wgpu` の
 render pass で mip chain も生成する。CPU resize や I/O は増えないが、GPU upload slot 1 件あたりの
