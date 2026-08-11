@@ -2301,3 +2301,22 @@ queue に入った page job の対応表への insert は release 最適化で�
 key は lane と page mapping を持つ completion guard が所有し、正常 return だけでなく handler
 の unwind でも `HeavyQueue::complete` を呼ぶ。page render、container 列挙、collection query
 などが panic しても active slot と prefetch 用 N-1 判定を永久に消費しない。
+
+**実機確認 (2026-08-11)**: 利用者の操作では異常なし。ただしサムネイル読み込みが速く終わるため、
+先読みの詰まりは目視で判断できなかった。**ログで測った** (`target/dev-runtime/data/logs/mimageviewer.log`)。
+
+| 項目 | 実測 |
+|---|---|
+| heavy lane の処理 | thumbnail 272 / page_prefetch 60 / page_foreground 22 / container 12 / folder_list 5 |
+| 拒否・剪定 | `queue_full` / `lane_full` / `queue_pruned` / 1-worker 拒否 / `outcome=cancelled` **すべて 0 件** |
+| 昇格が queue へ届いた回数 | 9 件 (`registry=Promoted queue=Promoted` 1 / `queue=Running{Prefetch}` 8) |
+| queue 待ち | foreground p50 0ms / max 228ms、prefetch p50 0ms / max 340ms |
+
+**サムネイル 272 件と先読み 60 件が同じ lane で混在したうえで、先読みは 1 件も拒否されていない。**
+旧実装は `queued > 0` で無条件に拒否したので、この構成が 22-24% の 503 の発生源だった。
+`queue=Promoted` が 1 件出ていることで、release ビルドでのみ壊れていた昇格経路
+(`debug_assert!` が insert ごと消えていた) が実機ビルドで動いていることも確認できた。
+残り 8 件の `Running{Prefetch}` は pop 済みで queue に動かす対象が無い正常な結果である。
+
+**未確認は 3a から持ち越した 2 つのまま**。64 MiB 予算を埋めた深いコンテナでの遠近交換と、
+表示中の切断 / 再接続・セッション解放。どちらもこの回の操作では発生条件に届いていない。
