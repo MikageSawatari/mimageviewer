@@ -496,6 +496,36 @@ impl Default for SyntheticTimeline {
 }
 
 impl SyntheticTimeline {
+    #[cfg(any(test, feature = "test-script"))]
+    fn arm(&mut self) {
+        *self = Self::default();
+        self.armed = true;
+    }
+
+    #[cfg(any(test, feature = "test-script"))]
+    fn disarm(&mut self) {
+        *self = Self::default();
+    }
+
+    #[cfg(any(test, feature = "test-script"))]
+    fn set_repeat(&mut self, delay: Duration, hz: f64) -> bool {
+        if !hz.is_finite() || hz <= 0.0 {
+            return false;
+        }
+        let interval = Duration::from_secs_f64(1.0 / hz);
+        if interval.is_zero() {
+            return false;
+        }
+        self.repeat_delay = delay;
+        self.repeat_interval = interval;
+        true
+    }
+
+    #[cfg(any(test, feature = "test-script"))]
+    fn is_idle(&self) -> bool {
+        self.commands.is_empty() && self.held.is_empty()
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     fn enqueue(&mut self, command: SyntheticKeyCommand) {
         let queued = QueuedSyntheticCommand {
@@ -1060,6 +1090,64 @@ pub fn take_synthetic_input_issues(ctx: &egui::Context) -> Vec<SyntheticInputIss
         .unwrap_or_default()
 }
 
+/// Arm the production synthetic timeline without disturbing the HWND registry
+/// or real key queues. The timeline remains the single owner of synthetic
+/// level state used by [`physical_key_down`].
+#[cfg(any(test, feature = "test-script"))]
+pub fn arm_synthetic_input() -> bool {
+    state()
+        .lock()
+        .map(|mut guard| guard.synthetic.arm())
+        .is_ok()
+}
+
+/// Queue a timestamped synthetic key command. Materialization still happens
+/// only in the ROOT input plugin on the UI thread.
+#[cfg(any(test, feature = "test-script"))]
+pub fn enqueue_synthetic_command(command: SyntheticKeyCommand) -> bool {
+    state()
+        .lock()
+        .map(|mut guard| guard.synthetic.enqueue(command))
+        .is_ok()
+}
+
+#[cfg(any(test, feature = "test-script"))]
+pub fn set_synthetic_repeat(delay: Duration, hz: f64) -> bool {
+    state()
+        .lock()
+        .map(|mut guard| guard.synthetic.set_repeat(delay, hz))
+        .unwrap_or(false)
+}
+
+#[cfg(any(test, feature = "test-script"))]
+pub fn synthetic_input_is_idle() -> bool {
+    state()
+        .lock()
+        .map(|guard| guard.synthetic.is_idle())
+        .unwrap_or(true)
+}
+
+/// Drop commands that have not acquired a routing target, then enqueue one
+/// ordered CancelAll so any already-held keys still produce their Up events in
+/// the ROOT plugin. This is used by every script terminal path.
+#[cfg(any(test, feature = "test-script"))]
+pub fn cancel_synthetic_input(at: Instant) -> bool {
+    state()
+        .lock()
+        .map(|mut guard| {
+            guard.synthetic.commands.clear();
+            guard.synthetic.enqueue(SyntheticKeyCommand::cancel_all(at));
+        })
+        .is_ok()
+}
+
+#[cfg(any(test, feature = "test-script"))]
+pub fn disarm_synthetic_input() {
+    if let Ok(mut guard) = state().lock() {
+        guard.synthetic.disarm();
+    }
+}
+
 pub fn install_main_window_subclass(hwnd_raw: u64) -> bool {
     install_window_subclass(hwnd_raw, egui::ViewportId::ROOT, "main")
 }
@@ -1316,7 +1404,7 @@ pub fn set_test_return_key_state(viewport: egui::ViewportId, main_down: bool, nu
 pub fn arm_test_synthetic_input(foreground_hwnd: u64, viewport: egui::ViewportId) {
     if let Ok(mut guard) = state().lock() {
         *guard = KeyInputState::default();
-        guard.synthetic.armed = true;
+        guard.synthetic.arm();
         guard.test_foreground_hwnd = Some(foreground_hwnd);
         guard.register_hwnd(foreground_hwnd, viewport);
     }
@@ -1326,7 +1414,7 @@ pub fn arm_test_synthetic_input(foreground_hwnd: u64, viewport: egui::ViewportId
 pub fn arm_test_synthetic_input_without_registration(foreground_hwnd: u64) {
     if let Ok(mut guard) = state().lock() {
         *guard = KeyInputState::default();
-        guard.synthetic.armed = true;
+        guard.synthetic.arm();
         guard.test_foreground_hwnd = Some(foreground_hwnd);
     }
 }
@@ -1340,17 +1428,8 @@ pub fn register_test_synthetic_target(hwnd: u64, viewport: egui::ViewportId) {
 
 #[cfg(test)]
 pub fn set_test_synthetic_repeat(delay: Duration, hz: f64) -> bool {
-    if !hz.is_finite() || hz <= 0.0 {
-        return false;
-    }
-    let interval = Duration::from_secs_f64(1.0 / hz);
-    if interval.is_zero() {
-        return false;
-    }
     if let Ok(mut guard) = state().lock() {
-        guard.synthetic.repeat_delay = delay;
-        guard.synthetic.repeat_interval = interval;
-        true
+        guard.synthetic.set_repeat(delay, hz)
     } else {
         false
     }

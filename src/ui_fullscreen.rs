@@ -14016,6 +14016,79 @@ impl App {
         });
     }
 
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn test_script_snapshot(
+        &self,
+        ctx: &egui::Context,
+    ) -> crate::test_script::TestScriptSnapshot {
+        let target = crate::key_input::resolve_synthetic_routing_target().ok();
+        let target_viewport = target
+            .map(|target| {
+                if target.viewport == egui::ViewportId::ROOT {
+                    "ROOT".to_string()
+                } else {
+                    format!("{:?}", target.viewport)
+                }
+            })
+            .unwrap_or_else(|| "unregistered".to_string());
+        let focused = target
+            .map(|target| {
+                ctx.input_for(target.viewport, |input| {
+                    input.viewport().focused.unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        let fs_idx = self.fullscreen_idx;
+        let current_is_still_image = fs_idx.is_some_and(|idx| {
+            matches!(
+                self.items.get(idx),
+                Some(GridItem::Image(_))
+                    | Some(GridItem::ZipImage { .. })
+                    | Some(GridItem::PdfPage { .. })
+            )
+        });
+        let music_view_active = fs_idx.is_some_and(|idx| self.fs_music_view_active(idx));
+        let continuous_reading =
+            fs_idx.is_some_and(|idx| self.continuous_reading_active_for_idx(idx));
+        let nav = build_nav_indices(&self.items, self.current_grid_order());
+        let nav_position =
+            fs_idx.and_then(|idx| nav.iter().position(|candidate| *candidate == idx));
+        let pending_thumbs = self
+            .requested
+            .len()
+            .saturating_add(self.texture_backlog.len())
+            .saturating_add(self.fs_upload_backlog.len());
+
+        crate::test_script::TestScriptSnapshot {
+            is_fullscreen: fs_idx.is_some(),
+            fs_idx: fs_idx.map_or(-1, |idx| idx as i64),
+            items_generation: self.items_generation as i64,
+            focused,
+            target_viewport,
+            target_registered: target.is_some(),
+            // A child callback publishes true after it is actually reached.
+            target_rendered: target.is_some_and(|target| target.viewport == egui::ViewportId::ROOT),
+            pending_thumbs: i64::try_from(pending_thumbs).unwrap_or(i64::MAX),
+            spread_mode: format!("{:?}", self.spread_mode),
+            continuous_reading,
+            current_is_still_image,
+            music_view_active,
+            modal_open: self.any_modal_dialog_open_for_fullscreen_keys(),
+            context_menu_open: self.fs_context_menu_idx.is_some(),
+            popup_open: self.spread_popup_open || self.fit_popup_open || self.slideshow_popup_open,
+            ime_active: target
+                .filter(|target| target.viewport == ctx.viewport_id())
+                .is_some_and(|_| self.ime_input_active(ctx)),
+            text_input_or_pending_focus: self.test_script_pending_text_input_focus(),
+            overlay_edit_active: self.is_overlay_edit_mode_active(),
+            capture_region_selection: self.capture_region_selection.is_some(),
+            // The exact owner is published by handle_fs_key_input in the target viewport pass.
+            fullscreen_raw_key_permit: false,
+            has_previous_page: nav_position.is_some_and(|position| position > 0),
+            has_next_page: nav_position.is_some_and(|position| position + 1 < nav.len()),
+        }
+    }
+
     /// フルスクリーンのキー入力を処理し、アクションを返す。
     pub(crate) fn handle_fs_key_input(
         &mut self,
@@ -14031,6 +14104,23 @@ impl App {
         let fullscreen_raw_key_permit = owner.fullscreen_raw_key_permit();
 
         let has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::test_script::publish_fullscreen_input_state(
+            ctx,
+            fs_idx,
+            has_focus,
+            true,
+            fullscreen_raw_key_permit.is_some(),
+            self.ime_input_active(ctx),
+            matches!(
+                owner,
+                crate::keyboard_input::KeyboardOwner::TextInput { .. }
+            ) || self.test_script_pending_text_input_focus(),
+            self.spread_popup_open
+                || self.fit_popup_open
+                || self.slideshow_popup_open
+                || fs_rotation_popup_open(ctx),
+        );
         let mut action = FsKeyAction {
             close: false,
             close_to_page_list: false,

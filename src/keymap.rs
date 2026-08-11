@@ -3089,6 +3089,13 @@ impl KeyAction {
         ALL_ACTIONS
     }
 
+    pub fn from_ini_name(name: &str) -> Option<Self> {
+        ALL_ACTIONS
+            .iter()
+            .copied()
+            .find(|action| action.ini_name().eq_ignore_ascii_case(name.trim()))
+    }
+
     pub fn is_user_facing(self) -> bool {
         !matches!(
             self,
@@ -6297,6 +6304,10 @@ impl Keymap {
     /// accidentally multiply toggles or destructive actions by using this API.
     pub fn consume_action_press_count(&self, ctx: &egui::Context, action: KeyAction) -> usize {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
+        #[cfg(all(windows, feature = "test-script"))]
+        if crate::test_script::consume_pending_action(action) {
+            return 1;
+        }
         if action.press_multiplicity() == PressMultiplicity::SinglePerFrame {
             return usize::from(self.consume_action(ctx, action));
         }
@@ -6321,6 +6332,10 @@ impl Keymap {
 
     pub fn consume_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
+        #[cfg(all(windows, feature = "test-script"))]
+        if crate::test_script::consume_pending_action(action) {
+            return true;
+        }
         if let Some(chords) = self.overrides.get(&action) {
             for chord in chords.iter().copied() {
                 if self.consume_chord(ctx, chord) {
@@ -6353,6 +6368,10 @@ impl Keymap {
 
     pub fn consume_action_no_repeat(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
+        #[cfg(all(windows, feature = "test-script"))]
+        if crate::test_script::consume_pending_action(action) {
+            return true;
+        }
         if let Some(chords) = self.overrides.get(&action) {
             for chord in chords.iter().copied() {
                 if self.consume_chord_no_repeat(ctx, chord) {
@@ -6385,6 +6404,10 @@ impl Keymap {
 
     pub fn pressed_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
+        #[cfg(all(windows, feature = "test-script"))]
+        if crate::test_script::peek_pending_action(action) {
+            return true;
+        }
         if let Some(chords) = self.overrides.get(&action) {
             for chord in chords.iter().copied() {
                 if self.pressed_chord(ctx, chord) {

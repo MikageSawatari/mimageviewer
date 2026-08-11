@@ -14037,6 +14037,11 @@ impl App {
         self.pending_text_input_focus.set(transition.claim);
     }
 
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn test_script_pending_text_input_focus(&self) -> bool {
+        self.pending_text_input_focus.get().is_some()
+    }
+
     pub(crate) fn clear_book_bookmark_title_edit(&mut self) {
         self.book_bookmark_title_edit = None;
         self.clear_pending_text_input_focus();
@@ -61843,6 +61848,13 @@ impl eframe::App for App {
         // This also ages a root PendingFocus claim on every pass, including
         // passes that return before the normal keyboard handler.
         let _keyboard_owner = self.keyboard_owner_for_pass(ctx);
+        #[cfg(all(windows, feature = "test-script"))]
+        {
+            let snapshot = self.test_script_snapshot(ctx);
+            if crate::test_script::ui_update(ctx, snapshot) {
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+            }
+        }
         self.edit_preview_repaint_ctx = Some(ctx.clone());
         if self
             .creative_lut_library
@@ -64228,6 +64240,8 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::test_script::on_app_exit();
         // 後段の本物の on_exit に処理を委譲する (trait impl は 1 つしか書けないため、
         // ここで helper メソッド群を逃がす都合上 update と on_exit の間に
         // `impl App` ブロックを開く)。

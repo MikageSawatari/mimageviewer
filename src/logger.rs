@@ -253,6 +253,18 @@ pub fn log(msg: impl AsRef<str>) {
     }
 }
 
+/// Buffered log data is normally flushed by [`log`] after every line. Keep an
+/// explicit flush operation for shutdown paths that may terminate the process
+/// without running Rust destructors.
+pub fn flush() {
+    if let Some(file) = FILE.get()
+        && let Ok(mut log_file) = file.lock()
+        && let Some(f) = log_file.file.as_mut()
+    {
+        let _ = f.flush();
+    }
+}
+
 /// 現在スレッドの ID から数字部分だけを取り出す。
 /// `ThreadId(N)` → `Some(N)`、パースできなければ `None`。
 /// `logger` と `perf` の両方から参照される共通ヘルパ。

@@ -359,6 +359,39 @@ default keymap で作る。**
 | S3 | perf event + `analyze_perf.py` の hold_id 分割と §9.2 の不成立条件 | `scripts/test_analyze_perf.py` に回帰テスト |
 | S4 | `page-turn-smoke.ps1` の中身差し替え + self-test script + 本書/backlog 更新 | **§13** |
 
+## 12.1 終了コードの配送と shutdown watchdog (S2 で判明)
+
+S4 の PowerShell は**プロセスの終了コード**で合否を見る。ところが S2 の実機確認で、script が
+`kind=Success exit_code=0` まで到達し、settings 保存 / IndexerManager join / fts-dispatcher
+まで正常に流れたあと、**プロセスが終了しない**事象が出た (2/2 再現)。
+
+```
+[   3.876s] [test-script] finished kind=Success exit_code=0 message=script completed
+[   5.901s] [fts-dispatcher] shutdown clean
+[  12.410s] PANIC at wgpu-core/device/queue.rs:208:
+            We timed out while waiting on the last successful submission to complete!
+```
+
+- `App::update` が Close 要求の直後に `return` してフレームを打ち切っていたのが原因ではない
+  (打ち切りをやめても再現した)。`run_native` が復帰しないのは wgpu device drop が
+  submission を待ち続けるため。
+- **測定時、この PC は別セッションの操作で DWM が落ちていた。** presentation が完了しない
+  状態と症状が一致する (panic 時刻が 12.484s / 12.410s とほぼ一定 = 負荷変動ではなく
+  「永久に完了しない待ち」)。利用者の実 profile の `panic.log` にこの panic の履歴は無い。
+- したがって**現時点では環境要因の可能性が高く、mIV 側の shutdown 欠陥とは断定していない**。
+
+対応: script 完了時に **6 秒の watchdog** を張り、通常ログと perf log を flush したうえで確定
+した終了コードで `process::exit` する。`shutdown path=run-native-return` (綺麗に落ちた) と
+`shutdown path=forced-watchdog` (強制終了した) をログで区別する。
+
+**これは harness の終了処理に限った watchdog であり、production の症状パッチではない。**
+待ち先が third-party の GPU teardown なので根本原因側で直せない。**flush より前に強制終了
+しないこと**が S3 (perf log を判定に使う) の前提。
+
+**未解決 / 再確認が要る**: DWM が健全な環境で `run-native-return` (綺麗な経路) が実際に働くか。
+S2 の測定はすべて `forced-watchdog` 経由だった。**もし健全な環境でも綺麗に落ちないなら、
+それは mIV 本体の shutdown の問題**なので backlog へ独立した項目として起票する。
+
 ## 13. §2.3 自体の完了条件
 
 `fs/page_turn_ready` / `page_turn_decision` は現行コードに無いので、**この基盤だけでは

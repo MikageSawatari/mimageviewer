@@ -128,6 +128,8 @@ pub mod panorama;
 pub mod panorama_wgpu;
 pub mod path_key;
 pub mod reading_history_db;
+#[cfg(all(windows, any(test, feature = "test-script")))]
+mod test_script;
 mod vram_budget;
 // loose-deps ポータブルビルド専用の native ファイル所在解決 (exe 隣の bundled file)。
 // 通常ビルドでは中身が無いので宣言ごと cfg で落とす。詳細: docs/portable-build-plan.md
@@ -789,6 +791,36 @@ pub fn run() -> eframe::Result {
     if maybe_handle_version_or_help() {
         std::process::exit(0);
     }
+    #[cfg(any(not(feature = "test-script"), not(windows)))]
+    let test_script_requested = std::env::args_os()
+        .skip(1)
+        .take_while(|arg| arg != "--")
+        .any(|arg| arg == "--test-script");
+    #[cfg(not(feature = "test-script"))]
+    if test_script_requested {
+        write_to_parent_console(
+            "error: --test-script requires a build with the test-script feature\n",
+        );
+        std::process::exit(2);
+    }
+    #[cfg(all(feature = "test-script", not(windows)))]
+    if test_script_requested {
+        write_to_parent_console("error: --test-script is only supported on Windows\n");
+        std::process::exit(2);
+    }
+    #[cfg(all(feature = "test-script", windows))]
+    let test_script_path = {
+        let args = std::env::args_os().collect::<Vec<_>>();
+        match test_script::cli_script_path_from(&args) {
+            Ok(path) => path,
+            Err(error) => {
+                write_to_parent_console(&format!("error: {error}\n"));
+                std::process::exit(2);
+            }
+        }
+    };
+    #[cfg(all(feature = "test-script", windows))]
+    let scripted_run = test_script_path.is_some();
     // run() 入口の Instant を起動時間計測の t=0 とする。
     // --pdf-worker モードでは計測しないので worker 判定の前に取らない。
     // --perf-log 無効時は `emit_startup` が no-op なのでコストはゼロ。
@@ -838,7 +870,20 @@ pub fn run() -> eframe::Result {
     // 静かに exit する (トレイ常駐中でもここで落ちる = ユーザーはトレイアイコンから
     // 復帰することで操作を再開できる)。
     #[cfg(windows)]
-    let skip_single_instance = dcomp_presenter_config.is_some();
+    let skip_single_instance = dcomp_presenter_config.is_some() || {
+        #[cfg(feature = "test-script")]
+        {
+            // Script runs already require an explicit isolated data directory.
+            // They must also avoid the normal-instance activation/open-path
+            // listeners: automation may run beside an installed instance, and
+            // those listeners add unrelated shutdown joins to the test result.
+            scripted_run
+        }
+        #[cfg(not(feature = "test-script"))]
+        {
+            false
+        }
+    };
     #[cfg(not(windows))]
     let skip_single_instance = false;
     let _single_instance = if skip_single_instance {
@@ -1078,7 +1123,7 @@ pub fn run() -> eframe::Result {
     emit_startup("before_run_native", None);
     install_ui_heartbeat_watchdog();
 
-    eframe::run_native(
+    let run_result = eframe::run_native(
         "mimageviewer",
         options,
         Box::new(move |cc| {
@@ -1169,10 +1214,19 @@ pub fn run() -> eframe::Result {
             // (egui#4918 / winit#923 対策)。ViewportBuilder 段階では
             // マルチモニタ DPI 混在時にサイズが壊れるケースがある。
             app.pending_initial_size = Some(size);
+            #[cfg(all(feature = "test-script", windows))]
+            if let Some(path) = test_script_path.clone() {
+                test_script::start(path, &cc.egui_ctx).map_err(std::io::Error::other)?;
+            }
             emit_startup("creator_exit", None);
             Ok(Box::new(app))
         }),
-    )
+    );
+    #[cfg(all(feature = "test-script", windows))]
+    if scripted_run && run_result.is_ok() {
+        test_script::exit_after_run_native();
+    }
+    run_result
 }
 
 /// `--window-size WxH` 引数をパース（例: `--window-size 1400x860`）。
@@ -1350,6 +1404,7 @@ fn cli_flag_takes_value(flag: &str) -> bool {
     matches!(
         flag,
         "--data-dir"
+            | "--test-script"
             | "--window-size"
             | "--perf-log-path"
             | "--play-test"
@@ -1426,6 +1481,18 @@ mod tests {
             parse_startup_open_path_arg_from(&args),
             Some(PathBuf::from(r"C:\books\book.rar"))
         );
+    }
+
+    #[test]
+    fn startup_open_path_does_not_open_test_script_value() {
+        let args = os_args(&[
+            "mimageviewer.exe",
+            "--data-dir",
+            r"D:\miv-data",
+            "--test-script",
+            r"D:\scripts\smoke.rhai",
+        ]);
+        assert_eq!(parse_startup_open_path_arg_from(&args), None);
     }
 
     #[test]
