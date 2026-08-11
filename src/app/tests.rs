@@ -22487,6 +22487,26 @@ mod pipeline_cache_refactor_tests {
         app.adjustment_page_params.insert(idx, params);
     }
 
+    fn install_passthrough_thumbnail(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        label: &str,
+        image: egui::ColorImage,
+        from_edit_preview: bool,
+    ) {
+        let pixels = Arc::new(image.clone());
+        let texture = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
+        app.thumbnails[idx] = ThumbnailState::Loaded {
+            tex: texture,
+            from_cache: false,
+            from_edit_preview,
+            rendered_at_px: pixels.size[0].max(pixels.size[1]) as u32,
+            source_dims: Some((pixels.size[0] as u32, pixels.size[1] as u32)),
+        };
+        app.thumb_pixels.insert(idx, pixels);
+    }
+
     #[test]
     fn colorize_display_gate_matches_mode_and_page_summary() {
         let mut app = setup_app();
@@ -22523,6 +22543,245 @@ mod pipeline_cache_refactor_tests {
         assert!(app.colorize_display_requires_final_effect(color_idx));
         set_colorize_mode(&mut app, color_idx, ColorizeMode::Disabled);
         assert!(!app.colorize_display_requires_final_effect(color_idx));
+    }
+
+    #[test]
+    fn page_turn_colorize_decision_matches_final_classifier_or_waits() {
+        let mut app = setup_app();
+        let mono_idx = push_image(&mut app, "C:/pics/rendition-mono.jpg");
+        let color_idx = push_image(&mut app, "C:/pics/rendition-color.jpg");
+        let mono = egui::ColorImage::new(
+            [8, 8],
+            (0..64)
+                .map(|value| egui::Color32::from_gray((value * 4) as u8))
+                .collect(),
+        );
+        let color = egui::ColorImage::new(
+            [8, 8],
+            (0..64)
+                .map(|value| {
+                    [
+                        egui::Color32::RED,
+                        egui::Color32::GREEN,
+                        egui::Color32::BLUE,
+                    ][value % 3]
+                })
+                .collect(),
+        );
+        install_colorize_summary_edit_result(&mut app, mono_idx, mono.clone());
+        install_colorize_summary_edit_result(&mut app, color_idx, color.clone());
+        app.fullscreen_idx = Some(mono_idx);
+        assert_eq!(app.reconcile_colorize_mono_summaries(), 2);
+        set_colorize_mode(&mut app, mono_idx, ColorizeMode::MonochromeOnly);
+        set_colorize_mode(&mut app, color_idx, ColorizeMode::MonochromeOnly);
+
+        for (idx, full_size_input) in [(mono_idx, &mono), (color_idx, &color)] {
+            let params = app.effective_params(idx);
+            assert_eq!(
+                app.passthrough_colorize_decision(idx, params),
+                Some(crate::colorize::should_apply(
+                    full_size_input,
+                    &params.colorize
+                ))
+            );
+        }
+
+        let mut changed = app.effective_params(color_idx).clone();
+        changed.saturation = -100.0;
+        app.adjustment_page_params
+            .insert(color_idx, changed.clone());
+        assert_eq!(
+            app.passthrough_colorize_decision(color_idx, &changed),
+            None,
+            "non-identity color adjustment must wait instead of classifying the thumbnail"
+        );
+
+        app.colorize_mono_summary_cache.remove(&mono_idx);
+        assert_eq!(
+            app.passthrough_colorize_decision(mono_idx, app.effective_params(mono_idx)),
+            None,
+            "a missing full-size summary must make the rendition unavailable"
+        );
+    }
+
+    #[test]
+    fn page_turn_passthrough_rendition_applies_adjustment_colorize_and_creative_lut() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+
+        let adjust_idx = push_image(&mut app, "C:/pics/rendition-adjust.jpg");
+        let adjust_source = egui::ColorImage::filled([8, 8], egui::Color32::from_gray(60));
+        install_passthrough_thumbnail(
+            &mut app,
+            &ctx,
+            adjust_idx,
+            "rendition_adjust_source",
+            adjust_source.clone(),
+            false,
+        );
+        let mut adjust_params = app.effective_params(adjust_idx).clone();
+        adjust_params.brightness = 30.0;
+        app.adjustment_page_params.insert(adjust_idx, adjust_params);
+        assert!(app.ensure_passthrough_rendition(&ctx, adjust_idx).is_some());
+        let adjusted = app
+            .current_passthrough_rendition_pixels_for_test(adjust_idx)
+            .unwrap();
+        assert!(adjusted.pixels[0].r() > adjust_source.pixels[0].r());
+
+        let colorize_idx = push_image(&mut app, "C:/pics/rendition-colorize.jpg");
+        let colorize_source = egui::ColorImage::new(
+            [16, 16],
+            (0..256)
+                .map(|value| egui::Color32::from_gray(value as u8))
+                .collect(),
+        );
+        install_passthrough_thumbnail(
+            &mut app,
+            &ctx,
+            colorize_idx,
+            "rendition_colorize_source",
+            colorize_source,
+            false,
+        );
+        set_colorize_mode(&mut app, colorize_idx, ColorizeMode::AllImages);
+        assert!(
+            app.ensure_passthrough_rendition(&ctx, colorize_idx)
+                .is_some()
+        );
+        let colorized = app
+            .current_passthrough_rendition_pixels_for_test(colorize_idx)
+            .unwrap();
+        assert!(
+            colorized
+                .pixels
+                .iter()
+                .any(|pixel| pixel.r() != pixel.g() || pixel.g() != pixel.b())
+        );
+
+        let entries = app.settings.creative_luts.clone();
+        let lut_id = entries.first().unwrap().id;
+        for _ in 0..10_000 {
+            app.creative_lut_library.poll(&entries, &ctx);
+            if app.creative_lut_library.get(Some(lut_id)).is_some() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(app.creative_lut_library.get(Some(lut_id)).is_some());
+        let lut_idx = push_image(&mut app, "C:/pics/rendition-lut.jpg");
+        let lut_source = egui::ColorImage::filled([8, 8], egui::Color32::from_rgb(70, 110, 180));
+        install_passthrough_thumbnail(
+            &mut app,
+            &ctx,
+            lut_idx,
+            "rendition_lut_source",
+            lut_source.clone(),
+            false,
+        );
+        let mut lut_params = app.effective_params(lut_idx).clone();
+        lut_params.creative_lut.id = Some(lut_id);
+        lut_params.creative_lut.strength = 1.0;
+        app.adjustment_page_params.insert(lut_idx, lut_params);
+        assert!(app.ensure_passthrough_rendition(&ctx, lut_idx).is_some());
+        let lut_applied = app
+            .current_passthrough_rendition_pixels_for_test(lut_idx)
+            .unwrap();
+        assert_ne!(lut_applied.pixels, lut_source.pixels);
+    }
+
+    #[test]
+    fn page_turn_passthrough_rendition_skips_edit_overlays() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/rendition-no-overlays.jpg");
+        let base = egui::ColorImage::filled([8, 8], egui::Color32::from_rgb(220, 210, 200));
+        install_passthrough_thumbnail(
+            &mut app,
+            &ctx,
+            idx,
+            "rendition_edit_preview_source",
+            base.clone(),
+            true,
+        );
+        let overlay_texture = ctx.load_texture(
+            "rendition_baked_overlay",
+            egui::ColorImage::filled([8, 8], egui::Color32::BLACK),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails[idx] = ThumbnailState::Loaded {
+            tex: overlay_texture,
+            from_cache: false,
+            from_edit_preview: true,
+            rendered_at_px: 8,
+            source_dims: Some((8, 8)),
+        };
+        install_colorize_summary_edit_result(
+            &mut app,
+            idx,
+            egui::ColorImage::filled([8, 8], egui::Color32::BLUE),
+        );
+        app.mask_pages.insert(idx);
+        app.conceal_pages.insert(idx);
+        app.comic_pages.insert(idx);
+
+        assert!(app.ensure_passthrough_rendition(&ctx, idx).is_some());
+        let rendition = app
+            .current_passthrough_rendition_pixels_for_test(idx)
+            .unwrap();
+        assert_eq!(rendition.pixels, base.pixels);
+    }
+
+    #[test]
+    fn page_turn_passthrough_rendition_cache_reuses_key_and_invalidates_on_params() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/rendition-cache.jpg");
+        install_passthrough_thumbnail(
+            &mut app,
+            &ctx,
+            idx,
+            "rendition_cache_source",
+            egui::ColorImage::filled([8, 8], egui::Color32::GRAY),
+            false,
+        );
+
+        let first = app.ensure_passthrough_rendition(&ctx, idx).unwrap();
+        let second = app.ensure_passthrough_rendition(&ctx, idx).unwrap();
+        assert_eq!(first.id(), second.id());
+        assert_eq!(app.passthrough_rendition_cache_len_for_test(), 1);
+
+        let old = app.effective_params(idx).clone();
+        let mut new = old.clone();
+        new.brightness = 15.0;
+        app.adjustment_page_params.insert(idx, new.clone());
+        app.clear_caches_for_param_change(idx, &old, &new);
+        assert_eq!(app.passthrough_rendition_cache_len_for_test(), 0);
+
+        let changed = app.ensure_passthrough_rendition(&ctx, idx).unwrap();
+        assert_ne!(first.id(), changed.id());
+        assert_eq!(app.passthrough_rendition_cache_len_for_test(), 1);
+    }
+
+    #[test]
+    fn page_turn_passthrough_rendition_cache_is_bounded_lru() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        for page in 0..=PASSTHROUGH_RENDITION_CACHE_CAPACITY {
+            let idx = push_image(&mut app, &format!("C:/pics/rendition-lru-{page}.jpg"));
+            install_passthrough_thumbnail(
+                &mut app,
+                &ctx,
+                idx,
+                &format!("rendition_lru_source_{page}"),
+                egui::ColorImage::filled([2, 2], egui::Color32::from_gray(page as u8)),
+                false,
+            );
+            assert!(app.ensure_passthrough_rendition(&ctx, idx).is_some());
+        }
+        assert_eq!(
+            app.passthrough_rendition_cache_len_for_test(),
+            PASSTHROUGH_RENDITION_CACHE_CAPACITY
+        );
     }
 
     #[test]

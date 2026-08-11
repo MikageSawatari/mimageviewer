@@ -6,9 +6,11 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from analyze_perf import (
@@ -19,6 +21,7 @@ from analyze_perf import (
     cmd_page_turn,
     cmd_pre_grid,
     load_events,
+    main,
 )
 
 
@@ -54,7 +57,13 @@ def thumb(t: float, kind: str, key: str) -> dict:
     }
 
 
-def page_turn(t: float, idx: int, mode: str, generation: int = 2) -> dict:
+def page_turn(
+    t: float,
+    idx: int,
+    mode: str,
+    generation: int = 2,
+    source: str = "thumbnail",
+) -> dict:
     return {
         "t": t,
         "cat": "fs",
@@ -62,6 +71,27 @@ def page_turn(t: float, idx: int, mode: str, generation: int = 2) -> dict:
         "idx": idx,
         "items_generation": generation,
         "mode": mode,
+        "source": source,
+    }
+
+
+def page_turn_gate_decision(
+    t: float,
+    idx: int,
+    defer_ui_uploads: bool,
+    generation: int = 2,
+    reason: str = "pass_through",
+    passthrough_rendition_ready: bool = True,
+) -> dict:
+    return {
+        "t": t,
+        "cat": "fs",
+        "kind": "page_turn_decision",
+        "idx": idx,
+        "items_generation": generation,
+        "reason": reason,
+        "passthrough_rendition_ready": passthrough_rendition_ready,
+        "defer_ui_uploads": defer_ui_uploads,
     }
 
 
@@ -184,6 +214,265 @@ class PageTurnTests(unittest.TestCase):
         self.assertIn("Win32 pending/repeat/matching", rendered)
         self.assertIn("winit press/repeat", rendered)
         self.assertIn("0/0/0 | 1/1 | 1/1", rendered)
+
+
+class PageTurnInvariantCliTests(unittest.TestCase):
+    def run_page_turn(
+        self,
+        events: list[dict],
+        *,
+        check: bool = True,
+    ) -> SimpleNamespace:
+        synthetic_jsonl = (
+            "\n".join(json.dumps(event) for event in events) + "\n"
+        )
+        argv = ["analyze_perf.py", "page-turn.jsonl", "page-turn"]
+        if check:
+            argv.append("--check")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        exit_code = 0
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(Path, "is_file", return_value=True),
+            mock.patch.object(
+                Path,
+                "open",
+                return_value=io.StringIO(synthetic_jsonl),
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            try:
+                main()
+            except SystemExit as error:
+                exit_code = int(error.code or 0)
+        return SimpleNamespace(
+            returncode=exit_code,
+            stdout=stdout.getvalue(),
+            stderr=stderr.getvalue(),
+        )
+
+    def test_i1_through_i5_each_have_failing_and_passing_traces(self) -> None:
+        common_good = [
+            page_turn(1.0, 1, "materialized"),
+            page_turn(1.1, 2, "materialized"),
+        ]
+        cases = {
+            "I1": (
+                [
+                    page_turn(
+                        1.0,
+                        1,
+                        "materialized",
+                        source="final_composite",
+                    ),
+                    page_turn(1.1, 1, "materialized", source="thumbnail"),
+                ],
+                [
+                    page_turn(
+                        1.0,
+                        1,
+                        "materialized",
+                        source="thumbnail",
+                    ),
+                    page_turn(
+                        1.1,
+                        1,
+                        "materialized",
+                        source="final_composite",
+                    ),
+                ],
+            ),
+            "I2": (
+                [
+                    page_turn(
+                        1.0,
+                        1,
+                        "materialized",
+                        source="final_composite",
+                    ),
+                    page_turn(1.1, 2, "materialized", source="thumbnail"),
+                ],
+                common_good,
+            ),
+            "I3": (
+                [
+                    page_turn(1.0, 1, "materialized"),
+                    page_turn(1.1, 3, "materialized"),
+                ],
+                [
+                    page_turn(1.0, 1, "materialized"),
+                    page_turn(1.1, 2, "materialized"),
+                    page_turn(1.2, 3, "materialized"),
+                ],
+            ),
+            "I4": (
+                [
+                    page_turn(1.0, 1, "materialized"),
+                    page_turn(1.1, 2, "pass_through"),
+                ],
+                common_good,
+            ),
+            "I5": (
+                common_good
+                + [page_turn_gate_decision(1.05, 2, defer_ui_uploads=False)],
+                common_good
+                + [page_turn_gate_decision(1.05, 2, defer_ui_uploads=True)],
+            ),
+        }
+
+        for invariant, (failing_events, passing_events) in cases.items():
+            with self.subTest(invariant=invariant, status="fail"):
+                result = self.run_page_turn(failing_events)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(f"{invariant} violation:", result.stdout)
+                self.assertIn("source sequence:", result.stdout)
+            with self.subTest(invariant=invariant, status="pass"):
+                result = self.run_page_turn(passing_events)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertIn("checked bursts=1 violations=0", result.stdout)
+
+    def test_bursts_split_after_300ms_and_on_generation_change(self) -> None:
+        split_cases = {
+            "gap": [
+                page_turn(1.0, 1, "materialized"),
+                page_turn(1.301, 3, "materialized"),
+            ],
+            "generation": [
+                page_turn(1.0, 1, "materialized", generation=2),
+                page_turn(1.1, 3, "materialized", generation=3),
+            ],
+        }
+        for split, events in split_cases.items():
+            with self.subTest(split=split):
+                result = self.run_page_turn(events)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertIn("checked bursts=2 violations=0", result.stdout)
+
+        inclusive = self.run_page_turn([
+            page_turn(1.0, 1, "materialized"),
+            page_turn(1.3, 3, "materialized"),
+        ])
+        self.assertEqual(inclusive.returncode, 1, inclusive.stdout)
+        self.assertIn("I3 violation:", inclusive.stdout)
+        self.assertIn("checked bursts=1", inclusive.stdout)
+
+    def test_i2_exempts_only_passthrough_rendition_unavailable_mix(self) -> None:
+        unavailable_mix = [
+            page_turn_gate_decision(0.99, 1, defer_ui_uploads=True),
+            page_turn(1.0, 1, "pass_through", source="thumbnail"),
+            page_turn_gate_decision(
+                1.09,
+                2,
+                defer_ui_uploads=False,
+                reason="passthrough_rendition_unavailable",
+                passthrough_rendition_ready=False,
+            ),
+            page_turn(1.1, 2, "materialized", source="final_composite"),
+        ]
+        result = self.run_page_turn(unavailable_mix)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("I2 violation:", result.stdout)
+
+        unexplained_mix = list(unavailable_mix)
+        unexplained_mix[2] = page_turn_gate_decision(
+            1.09,
+            2,
+            defer_ui_uploads=False,
+            reason="pending_zero",
+            passthrough_rendition_ready=False,
+        )
+        result = self.run_page_turn(unexplained_mix)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("I2 violation:", result.stdout)
+
+    def test_i3_is_skipped_for_a_direction_unknown_burst(self) -> None:
+        result = self.run_page_turn([
+            page_turn(1.0, 1, "materialized"),
+            page_turn(1.1, 4, "materialized"),
+            page_turn(1.2, 3, "materialized"),
+        ])
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("I3 violation:", result.stdout)
+
+    def test_i4_endpoint_exception_requires_a_repeated_endpoint(self) -> None:
+        endpoint_cases = {
+            "last": [
+                page_turn(1.0, 1, "materialized"),
+                page_turn(1.1, 2, "pass_through"),
+                page_turn(1.2, 2, "pass_through"),
+            ],
+            "first": [
+                page_turn(1.0, 1, "materialized"),
+                page_turn(1.1, 0, "pass_through"),
+                page_turn(1.2, 0, "pass_through"),
+            ],
+        }
+        for endpoint, events in endpoint_cases.items():
+            with self.subTest(endpoint=endpoint):
+                result = self.run_page_turn(events)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertNotIn("I4 violation:", result.stdout)
+
+        interior_repeat = self.run_page_turn([
+            page_turn(1.0, 0, "materialized"),
+            page_turn(1.1, 1, "pass_through"),
+            page_turn(1.2, 1, "pass_through"),
+            # A later burst establishes that idx=1 was not the final page.
+            page_turn(2.0, 2, "materialized"),
+        ])
+        self.assertEqual(interior_repeat.returncode, 1, interior_repeat.stdout)
+        self.assertIn("I4 violation:", interior_repeat.stdout)
+
+        endpoint_without_repeat = self.run_page_turn([
+            page_turn(1.0, 1, "materialized"),
+            page_turn(1.1, 2, "pass_through"),
+        ])
+        self.assertEqual(
+            endpoint_without_repeat.returncode,
+            1,
+            endpoint_without_repeat.stdout,
+        )
+        self.assertIn("I4 violation:", endpoint_without_repeat.stdout)
+
+    def test_i5_only_applies_to_rendition_ready_pending_frames(self) -> None:
+        events = [
+            page_turn(1.0, 1, "materialized"),
+            page_turn(1.1, 2, "materialized"),
+            page_turn_gate_decision(
+                1.02,
+                1,
+                defer_ui_uploads=False,
+                reason="pending_zero",
+            ),
+            page_turn_gate_decision(
+                1.04,
+                1,
+                defer_ui_uploads=False,
+                passthrough_rendition_ready=False,
+            ),
+            page_turn_gate_decision(1.06, 2, defer_ui_uploads=True),
+        ]
+
+        result = self.run_page_turn(events)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("I5 violation:", result.stdout)
+
+    def test_without_check_keeps_the_existing_success_output(self) -> None:
+        result = self.run_page_turn([
+            page_turn(1.0, 1, "materialized"),
+            page_turn(1.1, 3, "materialized"),
+        ], check=False)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(
+            result.stdout,
+            "page-turn ready: pass_through=0 materialized=2\n"
+            "(pass_through を含むキーリピート区間なし)\n",
+        )
 
 
 class IdleHealthTests(unittest.TestCase):

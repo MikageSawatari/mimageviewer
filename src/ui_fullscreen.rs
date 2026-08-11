@@ -3871,30 +3871,11 @@ impl App {
         if self.creative_lut_requires_final_effect(params) {
             return true;
         }
-        match params.colorize.mode {
-            crate::colorize::ColorizeMode::Disabled => false,
-            crate::colorize::ColorizeMode::AllImages => true,
-            crate::colorize::ColorizeMode::MonochromeOnly => {
-                if !params.is_color_identity() {
-                    return true;
-                }
-                // final AI は復元・拡大処理であり、入力の近モノクロ性を反転させない前提で扱う。
-                let edit_key = self.current_edit_result_key(idx);
-                if !self.edit_result_cache.contains_key(&edit_key) {
-                    return true;
-                }
-                let Some(summary) = self.colorize_mono_summary_cache.get(&idx) else {
-                    return true;
-                };
-                if summary.edit_key != edit_key {
-                    return true;
-                }
-                crate::colorize::is_near_monochrome_residual(
-                    summary.p95_residual,
-                    params.colorize.mono_tolerance,
-                )
-            }
-        }
+        // `MonochromeOnly` の判定材料は通過レンディションと共有する。final AI は
+        // 復元・拡大処理であり、入力の近モノクロ性を反転させない前提。色調補正が
+        // classifier 入力を変える場合や full-size summary 未到着時は未確定 = 待つ。
+        self.passthrough_colorize_decision(idx, params)
+            .unwrap_or(true)
     }
 
     /// Perf trace 用に、実際に選ばれた fullscreen テクスチャの所有元を特定する。
@@ -6522,20 +6503,12 @@ struct FsPageTurnFrameDecision {
     decision: FsPageTurnDecision,
 }
 
-#[cfg(any(windows, test))]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct FsPageTurnDisplayUnitReadiness {
-    catalog_thumbnails_ready: bool,
-    final_composite_available: bool,
-}
-
 fn page_turn_decision_for_inputs(
     page_turn_input_pending: bool,
-    catalog_thumbnails_ready: bool,
-    final_composite_available: bool,
+    passthrough_rendition_ready: bool,
 ) -> FsPageTurnDecision {
-    let defer_ui_uploads = page_turn_input_pending && catalog_thumbnails_ready;
-    let paint_source = if defer_ui_uploads && !final_composite_available {
+    let defer_ui_uploads = page_turn_input_pending && passthrough_rendition_ready;
+    let paint_source = if defer_ui_uploads {
         FsPageTurnPaintSource::Thumbnail
     } else {
         FsPageTurnPaintSource::Composite
@@ -6550,8 +6523,7 @@ fn page_turn_decision_reason(
     ordinary_paged_context: bool,
     eligible_pending_edges: usize,
     matching_pending_edges: usize,
-    catalog_thumbnails_ready: bool,
-    final_composite_available: bool,
+    passthrough_rendition_ready: bool,
 ) -> &'static str {
     if !ordinary_paged_context {
         "ordinary_context_blocked"
@@ -6559,10 +6531,8 @@ fn page_turn_decision_reason(
         "ambiguous_page_turn_chord"
     } else if eligible_pending_edges == 0 {
         "pending_zero"
-    } else if final_composite_available {
-        "final_composite_available"
-    } else if !catalog_thumbnails_ready {
-        "catalog_thumbnail_unavailable"
+    } else if !passthrough_rendition_ready {
+        "passthrough_rendition_unavailable"
     } else {
         "pass_through"
     }
@@ -12986,58 +12956,38 @@ impl App {
         }
     }
 
-    /// Readiness of the complete visible display unit for the page-turn quality
-    /// decision. Spread pairing uses the same resolver as paged and continuous
-    /// rendering; failure to resolve the unit keeps both readiness values false.
-    ///
-    /// Final-composite readiness is deliberately a read-only cache lookup via
-    /// `current_final_composite_texture`. It must not call the producer
-    /// (`resolve_fs_processed_texture`) because the decision itself cannot start
-    /// work or perform a GPU upload.
+    /// Ensure the complete visible display unit has faithful page-turn renditions.
+    /// Spread pairing uses the same resolver as paged and continuous rendering;
+    /// failure to resolve the unit or prepare either page fails closed.
     #[cfg(any(windows, test))]
-    fn fs_page_turn_display_unit_readiness(&self, fs_idx: usize) -> FsPageTurnDisplayUnitReadiness {
-        let readiness_for_pages = |pages: &[usize]| {
-            if pages.is_empty() {
-                return FsPageTurnDisplayUnitReadiness::default();
-            }
-            FsPageTurnDisplayUnitReadiness {
-                catalog_thumbnails_ready: pages.iter().copied().all(|idx| {
-                    matches!(
-                        self.thumbnails.get(idx),
-                        Some(ThumbnailState::Loaded { .. })
-                    )
-                }),
-                final_composite_available: pages
-                    .iter()
-                    .copied()
-                    .all(|idx| self.current_final_composite_texture(idx).is_some()),
-            }
+    fn fs_page_turn_passthrough_renditions_ready(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> bool {
+        let pages = if !self.spread_mode.is_spread() {
+            vec![fs_idx]
+        } else {
+            let nav = build_nav_indices(&self.items, self.current_grid_order());
+            let units = build_spread_display_units(
+                &nav,
+                &self.items,
+                self.spread_mode,
+                self.spread_shift_anchor_idx,
+                &self.fs_cache,
+                &self.thumbnails,
+                &self.page_dims_cache,
+                self.items_generation,
+            );
+            let Some((_, unit)) = find_spread_display_unit(&units, fs_idx) else {
+                return false;
+            };
+            unit.pages.clone()
         };
-
-        if !self.spread_mode.is_spread() {
-            return readiness_for_pages(std::slice::from_ref(&fs_idx));
-        }
-
-        let nav = build_nav_indices(&self.items, self.current_grid_order());
-        let units = build_spread_display_units(
-            &nav,
-            &self.items,
-            self.spread_mode,
-            self.spread_shift_anchor_idx,
-            &self.fs_cache,
-            &self.thumbnails,
-            &self.page_dims_cache,
-            self.items_generation,
-        );
-        find_spread_display_unit(&units, fs_idx)
-            .map(|(_, unit)| readiness_for_pages(&unit.pages))
-            .unwrap_or_default()
-    }
-
-    #[cfg(test)]
-    fn fs_page_turn_catalog_thumbnails_ready(&self, fs_idx: usize) -> bool {
-        self.fs_page_turn_display_unit_readiness(fs_idx)
-            .catalog_thumbnails_ready
+        !pages.is_empty()
+            && pages
+                .into_iter()
+                .all(|idx| self.ensure_passthrough_rendition(ctx, idx).is_some())
     }
 
     #[cfg(windows)]
@@ -13120,8 +13070,7 @@ impl App {
         fs_idx: usize,
         ordinary_context: bool,
         ordinary_blocker: Option<&'static str>,
-        catalog_thumbnails_ready: bool,
-        final_composite_available: bool,
+        passthrough_rendition_ready: bool,
         production_pending: bool,
         decision: FsPageTurnDecision,
     ) {
@@ -13148,8 +13097,7 @@ impl App {
             ordinary_context,
             pending.matched_count,
             matching.matched_count,
-            catalog_thumbnails_ready,
-            final_composite_available,
+            passthrough_rendition_ready,
         );
         let mut attrs = Vec::new();
         attrs.push(("n", serde_json::Value::from(self.frame_counter)));
@@ -13174,12 +13122,8 @@ impl App {
             serde_json::Value::from(ordinary_blocker.unwrap_or("none")),
         ));
         attrs.push((
-            "catalog_thumbnail_ready",
-            serde_json::Value::from(catalog_thumbnails_ready),
-        ));
-        attrs.push((
-            "final_composite_available",
-            serde_json::Value::from(final_composite_available),
+            "passthrough_rendition_ready",
+            serde_json::Value::from(passthrough_rendition_ready),
         ));
         attrs.push((
             "win32_key_down_count",
@@ -13340,7 +13284,7 @@ impl App {
     /// The temp cache keeps egui replay passes in the same frame read-only and
     /// deterministic; it is invalidated by frame, item generation, and idx.
     pub(crate) fn fs_page_turn_decision_for_frame(
-        &self,
+        &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> FsPageTurnDecision {
@@ -13369,10 +13313,6 @@ impl App {
             {
                 return cached.decision;
             }
-
-            let display_unit_readiness = self.fs_page_turn_display_unit_readiness(fs_idx);
-            let catalog_thumbnails_ready = display_unit_readiness.catalog_thumbnails_ready;
-            let final_composite_available = display_unit_readiness.final_composite_available;
             let ordinary_context_blocker = self.fs_page_turn_ordinary_context_blocker(ctx, fs_idx);
             let ordinary_paged_context = ordinary_context_blocker.is_none();
             let configurable_page_turn_pending = ordinary_paged_context
@@ -13391,20 +13331,19 @@ impl App {
                         self.keymap.pending_chord_press_in_frame(viewport, chord)
                             && self.fs_page_turn_chord_is_unambiguous(chord)
                     });
-            let decision = page_turn_decision_for_inputs(
-                configurable_page_turn_pending || fixed_page_turn_pending,
-                catalog_thumbnails_ready,
-                final_composite_available,
-            );
+            let page_turn_input_pending = configurable_page_turn_pending || fixed_page_turn_pending;
+            let passthrough_rendition_ready = page_turn_input_pending
+                && self.fs_page_turn_passthrough_renditions_ready(ctx, fs_idx);
+            let decision =
+                page_turn_decision_for_inputs(page_turn_input_pending, passthrough_rendition_ready);
             self.emit_fs_page_turn_decision_probe(
                 viewport,
                 frame_nr,
                 fs_idx,
                 ordinary_paged_context,
                 ordinary_context_blocker,
-                catalog_thumbnails_ready,
-                final_composite_available,
-                configurable_page_turn_pending || fixed_page_turn_pending,
+                passthrough_rendition_ready,
+                page_turn_input_pending,
                 decision,
             );
             ctx.data_mut(|data| {
@@ -13478,7 +13417,9 @@ impl App {
             && !original_preview_active
             && tex.is_none()
             && self.colorize_display_requires_final_effect(fs_idx);
-        let thumb_tex = if waiting_for_colorize {
+        let thumb_tex = if matches!(paint_source, FsPageTurnPaintSource::Thumbnail) {
+            self.ensure_passthrough_rendition(ctx, fs_idx)
+        } else if waiting_for_colorize {
             // 生サムネイルは白黒なので使わない。paged の ColorizeDisplayUnit と
             // folder-nav holdover はページ別 fallback にせず後段の overlay で描く。
             None
@@ -24333,9 +24274,17 @@ impl App {
                 page_turn_decision.paint_source(),
                 FsPageTurnPaintSource::Thumbnail
             );
+        let passthrough_renditions = thumbnail_paint.then(|| {
+            (
+                self.ensure_passthrough_rendition(ctx, left_idx)
+                    .map(crate::gpu_lanczos::FullscreenPaintResource::direct),
+                self.ensure_passthrough_rendition(ctx, right_idx)
+                    .map(crate::gpu_lanczos::FullscreenPaintResource::direct),
+            )
+        });
         let (left_display_tex, right_display_tex) = match display_override {
             Some((left, right)) => (Some(left.texture.clone()), Some(right.texture.clone())),
-            None if thumbnail_paint => (None, None),
+            None if thumbnail_paint => passthrough_renditions.unwrap_or_default(),
             None => (
                 self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active)
                     .map(|texture| self.fullscreen_paint_resource_for_texture(left_idx, texture)),
@@ -32100,12 +32049,13 @@ mod tests {
     ) -> (crate::app::AppTestEnvForTest, egui::Context) {
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
+        let pixels = Arc::new(egui::ColorImage::filled([2, 3], egui::Color32::WHITE));
         let texture = ctx.load_texture(
             "page_turn_spread_thumb",
-            egui::ColorImage::filled([2, 3], egui::Color32::WHITE),
+            (*pixels).clone(),
             egui::TextureOptions::LINEAR,
         );
-        for _ in 0..page_count {
+        for idx in 0..page_count {
             app.items
                 .push(GridItem::Image(PathBuf::from("c:/test/spread-page.jpg")));
             app.thumbnails.push(ThumbnailState::Loaded {
@@ -32115,6 +32065,7 @@ mod tests {
                 rendered_at_px: 3,
                 source_dims: Some((800, 1200)),
             });
+            app.thumb_pixels.insert(idx, Arc::clone(&pixels));
         }
         app.visible_indices = (0..page_count).collect();
         app.reading_flow = ReadingFlow::Paged;
@@ -32124,40 +32075,14 @@ mod tests {
         (app, ctx)
     }
 
-    fn materialize_page_turn_test_final_composite(
-        app: &mut crate::app::AppTestEnvForTest,
-        ctx: &egui::Context,
-        idx: usize,
-    ) {
-        let image = egui::ColorImage::filled([2, 3], egui::Color32::WHITE);
-        let pixels = Arc::new(image.clone());
-        let texture = ctx.load_texture(
-            format!("page_turn_final_raw_{idx}"),
-            image,
-            egui::TextureOptions::LINEAR,
-        );
-        app.fs_cache.insert(
-            idx,
-            FsCacheEntry::Static {
-                tex: texture,
-                pixels,
-                source_dims: Some([800, 1200]),
-                load_seq: 1,
-            },
-        );
-        assert!(app.resolve_fs_processed_texture(ctx, idx, false).is_some());
-        assert!(app.current_final_composite_texture(idx).is_some());
-    }
-
     #[test]
-    fn spread_page_turn_decision_requires_both_catalog_thumbnails() {
-        let (mut app, _ctx) = setup_page_turn_spread_test(4);
+    fn spread_page_turn_decision_requires_both_passthrough_renditions() {
+        let (mut app, ctx) = setup_page_turn_spread_test(4);
 
         assert_eq!(
             page_turn_decision_for_inputs(
                 true,
-                app.fs_page_turn_catalog_thumbnails_ready(0),
-                false,
+                app.fs_page_turn_passthrough_renditions_ready(&ctx, 0),
             ),
             FsPageTurnDecision {
                 paint_source: FsPageTurnPaintSource::Thumbnail,
@@ -32169,48 +32094,28 @@ mod tests {
         assert_eq!(
             page_turn_decision_for_inputs(
                 true,
-                app.fs_page_turn_catalog_thumbnails_ready(0),
-                false,
+                app.fs_page_turn_passthrough_renditions_ready(&ctx, 0),
             ),
             FsPageTurnDecision::normal(),
-            "one missing page thumbnail must fail closed for the whole spread"
+            "one missing page rendition must fail closed for the whole spread"
         );
     }
 
     #[test]
-    fn spread_page_turn_final_composite_availability_requires_the_whole_display_unit() {
+    fn spread_page_turn_waits_when_one_colorize_decision_is_unknown() {
         let (mut app, ctx) = setup_page_turn_spread_test(4);
+        let mut params = app.effective_params(1).clone();
+        params.colorize.mode = crate::colorize::ColorizeMode::MonochromeOnly;
+        app.adjustment_page_params.insert(1, params);
 
-        assert!(
-            !app.fs_page_turn_display_unit_readiness(0)
-                .final_composite_available
-        );
-        materialize_page_turn_test_final_composite(&mut app, &ctx, 0);
-        assert!(
-            !app.fs_page_turn_display_unit_readiness(0)
-                .final_composite_available
-        );
-        materialize_page_turn_test_final_composite(&mut app, &ctx, 1);
-        assert!(
-            app.fs_page_turn_display_unit_readiness(0)
-                .final_composite_available
-        );
-
-        app.reading_flow = ReadingFlow::Vertical;
-        assert!(
-            app.fs_page_turn_display_unit_readiness(0)
-                .final_composite_available
-        );
-        app.reading_flow = ReadingFlow::Horizontal;
-        assert!(
-            app.fs_page_turn_display_unit_readiness(0)
-                .final_composite_available
-        );
+        assert!(app.ensure_passthrough_rendition(&ctx, 0).is_some());
+        assert!(app.ensure_passthrough_rendition(&ctx, 1).is_none());
+        assert!(!app.fs_page_turn_passthrough_renditions_ready(&ctx, 0));
     }
 
     #[test]
     fn spread_page_turn_sequence_paints_each_unit_once_before_materializing_stop() {
-        let (mut app, _ctx) = setup_page_turn_spread_test(8);
+        let (mut app, ctx) = setup_page_turn_spread_test(8);
         let mut painted = Vec::new();
 
         for _ in 0..3 {
@@ -32235,8 +32140,7 @@ mod tests {
                 pages,
                 page_turn_decision_for_inputs(
                     true,
-                    app.fs_page_turn_catalog_thumbnails_ready(idx),
-                    false,
+                    app.fs_page_turn_passthrough_renditions_ready(&ctx, idx),
                 ),
             ));
             let FsPageNav::Target(next_idx) = app.spread_page_nav(1) else {
@@ -32267,8 +32171,7 @@ mod tests {
             stop_pages,
             page_turn_decision_for_inputs(
                 false,
-                app.fs_page_turn_catalog_thumbnails_ready(stop_idx),
-                false,
+                app.fs_page_turn_passthrough_renditions_ready(&ctx, stop_idx),
             ),
         ));
 
@@ -32293,82 +32196,35 @@ mod tests {
     #[test]
     fn page_turn_decision_separates_paint_source_from_upload_deferral() {
         let cases = [
-            (true, true, true, FsPageTurnPaintSource::Composite, true),
-            (true, true, false, FsPageTurnPaintSource::Thumbnail, true),
-            (true, false, false, FsPageTurnPaintSource::Composite, false),
-            (false, false, false, FsPageTurnPaintSource::Composite, false),
+            (true, true, FsPageTurnPaintSource::Thumbnail, true),
+            (true, false, FsPageTurnPaintSource::Composite, false),
+            (false, true, FsPageTurnPaintSource::Composite, false),
+            (false, false, FsPageTurnPaintSource::Composite, false),
         ];
 
-        for (pending, thumbnail_ready, final_available, paint_source, defer_uploads) in cases {
-            let decision = page_turn_decision_for_inputs(pending, thumbnail_ready, final_available);
+        for (pending, rendition_ready, paint_source, defer_uploads) in cases {
+            let decision = page_turn_decision_for_inputs(pending, rendition_ready);
             assert_eq!(decision.paint_source(), paint_source);
             assert_eq!(decision.defer_ui_uploads(), defer_uploads);
         }
     }
 
     #[test]
-    fn page_turn_paint_source_never_downgrades_after_final_composite_is_available() {
-        let pending_by_frame = [true, false, true, false];
-        let final_available_by_frame = [false, true, true, true];
-        let paint_sources = pending_by_frame
-            .into_iter()
-            .zip(final_available_by_frame)
-            .map(|(pending, final_available)| {
-                page_turn_decision_for_inputs(pending, true, final_available).paint_source()
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            paint_sources,
-            vec![
-                FsPageTurnPaintSource::Thumbnail,
-                FsPageTurnPaintSource::Composite,
-                FsPageTurnPaintSource::Composite,
-                FsPageTurnPaintSource::Composite,
-            ]
-        );
-    }
-
-    #[test]
-    fn page_turn_uploads_remain_deferred_after_final_composite_is_available() {
-        let decisions = [false, true, true]
-            .into_iter()
-            .map(|final_available| page_turn_decision_for_inputs(true, true, final_available))
-            .collect::<Vec<_>>();
-
-        assert!(decisions.iter().all(|decision| decision.defer_ui_uploads()));
-        assert_eq!(
-            decisions.last().map(|decision| decision.paint_source()),
-            Some(FsPageTurnPaintSource::Composite)
-        );
-    }
-
-    #[test]
     fn page_turn_decision_reason_distinguishes_each_false_gate() {
         assert_eq!(
-            page_turn_decision_reason(false, 1, 1, true, true),
+            page_turn_decision_reason(false, 1, 1, true),
             "ordinary_context_blocked"
         );
+        assert_eq!(page_turn_decision_reason(true, 0, 0, true), "pending_zero");
         assert_eq!(
-            page_turn_decision_reason(true, 0, 0, true, true),
-            "pending_zero"
-        );
-        assert_eq!(
-            page_turn_decision_reason(true, 0, 1, true, true),
+            page_turn_decision_reason(true, 0, 1, true),
             "ambiguous_page_turn_chord"
         );
         assert_eq!(
-            page_turn_decision_reason(true, 1, 1, false, false),
-            "catalog_thumbnail_unavailable"
+            page_turn_decision_reason(true, 1, 1, false),
+            "passthrough_rendition_unavailable"
         );
-        assert_eq!(
-            page_turn_decision_reason(true, 1, 1, true, true),
-            "final_composite_available"
-        );
-        assert_eq!(
-            page_turn_decision_reason(true, 1, 1, true, false),
-            "pass_through"
-        );
+        assert_eq!(page_turn_decision_reason(true, 1, 1, true), "pass_through");
     }
 
     #[test]
@@ -32389,7 +32245,7 @@ mod tests {
 
         for _ in 0..3 {
             let idx = app.fullscreen_idx.expect("fullscreen page");
-            painted.push((idx, page_turn_decision_for_inputs(true, true, false)));
+            painted.push((idx, page_turn_decision_for_inputs(true, true)));
             let next = app.spread_page_nav(1);
             assert_eq!(next, FsPageNav::Delta(1));
             // Simulate the landing after this frame without entering the
@@ -32399,7 +32255,7 @@ mod tests {
             app.seek_to_continuous_page(&ctx, idx + 1);
         }
         let stop_idx = app.fullscreen_idx.expect("stop page");
-        painted.push((stop_idx, page_turn_decision_for_inputs(false, true, false)));
+        painted.push((stop_idx, page_turn_decision_for_inputs(false, true)));
 
         assert_eq!(
             painted.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),

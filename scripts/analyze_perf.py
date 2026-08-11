@@ -12,7 +12,8 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
 サブコマンド:
     summary             全イベントの件数とカテゴリ別 breakdown を表示
     latency             seq ごとに input → *.ready / *.paint のレイテンシを集計
-    page-turn           キーリピート中の通過/実体化ページ数と ready→ready 間隔を集計
+    page-turn [--check] キーリピート中の通過/実体化ページ数を集計。
+                        --check でページ送りの不変条件を検査
     priority            可視サムネイルが未 decode のうちに非可視が先に処理された違反を検出
     dump <seq>          指定 seq に紐づく全イベントを時系列で列挙
     timeline [seq]      ガントチャート (matplotlib が必要)。seq 指定可
@@ -413,6 +414,390 @@ def cmd_page_turn(events: list[dict]) -> None:
             f"ready→ready: n={len(ordered)} min={ordered[0]:.1f} "
             f"p50={ordered[len(ordered) // 2]:.1f} max={ordered[-1]:.1f} ms"
         )
+
+
+PAGE_TURN_BURST_GAP_SECS = 0.300
+PAGE_TURN_BURST_GAP_EPSILON = 1e-9
+PAGE_TURN_INVARIANT_SOURCES = ("final_composite", "thumbnail")
+
+
+def _page_turn_check_bursts(events: list[dict]) -> list[dict]:
+    """Split page_turn_ready events into trace-check bursts.
+
+    This is intentionally separate from ``analyze_page_turn``. The latter is
+    the long-standing aggregation used without --check, while the invariant
+    gate has the brief's 300 ms / items_generation boundaries.
+    """
+    ready = sorted(
+        (
+            event
+            for event in events
+            if event.get("cat") == "fs"
+            and event.get("kind") == "page_turn_ready"
+            and isinstance(event.get("idx"), int)
+        ),
+        key=lambda event: float(event.get("t", 0.0)),
+    )
+    bursts: list[dict] = []
+    active: list[dict] = []
+
+    def finish() -> None:
+        nonlocal active
+        if not active:
+            return
+        indices = [int(event["idx"]) for event in active]
+        nondecreasing = all(
+            previous <= current
+            for previous, current in zip(indices, indices[1:])
+        )
+        nonincreasing = all(
+            previous >= current
+            for previous, current in zip(indices, indices[1:])
+        )
+        if nondecreasing and any(
+            previous < current
+            for previous, current in zip(indices, indices[1:])
+        ):
+            direction = "forward"
+        elif nonincreasing and any(
+            previous > current
+            for previous, current in zip(indices, indices[1:])
+        ):
+            direction = "backward"
+        else:
+            direction = "unknown"
+        bursts.append({
+            "events": list(active),
+            "indices": indices,
+            "items_generation": active[0].get("items_generation"),
+            "direction": direction,
+            "start_t": float(active[0].get("t", 0.0)),
+            "end_t": float(active[-1].get("t", 0.0)),
+        })
+        active = []
+
+    for event in ready:
+        if active:
+            gap = (
+                float(event.get("t", 0.0))
+                - float(active[-1].get("t", 0.0))
+            )
+            generation_changed = (
+                event.get("items_generation")
+                != active[-1].get("items_generation")
+            )
+            if generation_changed or gap > (
+                PAGE_TURN_BURST_GAP_SECS + PAGE_TURN_BURST_GAP_EPSILON
+            ):
+                finish()
+        active.append(event)
+    finish()
+    return bursts
+
+
+def _page_turn_source_sequence(events: list[dict]) -> list[tuple[int, str]]:
+    return [
+        (int(event["idx"]), str(event.get("source", "?")))
+        for event in events
+    ]
+
+
+def _nearest_page_turn_burst(
+    decision: dict,
+    bursts: list[dict],
+) -> dict | None:
+    """Find the burst that supplies context for an I5 decision."""
+    decision_t = float(decision.get("t", 0.0))
+    generation = decision.get("items_generation")
+    candidates: list[tuple[float, dict]] = []
+    for burst in bursts:
+        if burst["items_generation"] != generation:
+            continue
+        if decision_t < burst["start_t"]:
+            distance = burst["start_t"] - decision_t
+        elif decision_t > burst["end_t"]:
+            distance = decision_t - burst["end_t"]
+        else:
+            distance = 0.0
+        if distance <= PAGE_TURN_BURST_GAP_SECS + PAGE_TURN_BURST_GAP_EPSILON:
+            candidates.append((distance, burst))
+    return min(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def _page_turn_decision_reason_for_ready(
+    ready: dict,
+    events: list[dict],
+) -> str | None:
+    """Return the closest same-page decision that explains a ready event."""
+    ready_t = float(ready.get("t", 0.0))
+    candidates: list[tuple[bool, float, dict]] = []
+    for event in events:
+        if (
+            event.get("cat") != "fs"
+            or event.get("kind") != "page_turn_decision"
+            or event.get("idx") != ready.get("idx")
+            or event.get("items_generation")
+            != ready.get("items_generation")
+        ):
+            continue
+        event_t = float(event.get("t", 0.0))
+        distance = abs(ready_t - event_t)
+        if distance <= PAGE_TURN_BURST_GAP_SECS + PAGE_TURN_BURST_GAP_EPSILON:
+            # A decision normally precedes its ready probe. Prefer that side of
+            # the timestamp when equally close synthetic or coarse logs exist.
+            candidates.append((event_t > ready_t, distance, event))
+    if not candidates:
+        return None
+    return str(min(candidates, key=lambda item: (item[0], item[1]))[2].get("reason"))
+
+
+def analyze_page_turn_invariants(events: list[dict]) -> dict:
+    """Check the page-turn trace invariants I1--I5 from the v2.13 brief."""
+    bursts = _page_turn_check_bursts(events)
+    max_idx_by_generation: dict[object, int] = {}
+    for burst in bursts:
+        generation = burst["items_generation"]
+        observed_max = max(burst["indices"])
+        max_idx_by_generation[generation] = max(
+            observed_max,
+            max_idx_by_generation.get(generation, observed_max),
+        )
+
+    violations: list[dict] = []
+    for burst in bursts:
+        burst_events = burst["events"]
+        sources_by_idx: dict[int, list[str]] = defaultdict(list)
+        for event in burst_events:
+            sources_by_idx[int(event["idx"])].append(
+                str(event.get("source", "?"))
+            )
+
+        # I1: once a page has reached final_composite, it must not regress to
+        # thumbnail within the same keyboard-hold burst.
+        for idx, sources in sorted(sources_by_idx.items()):
+            saw_final = False
+            regressed = False
+            for source in sources:
+                if source == "final_composite":
+                    saw_final = True
+                elif source == "thumbnail" and saw_final:
+                    regressed = True
+                    break
+            if regressed:
+                violations.append({
+                    "id": "I1",
+                    "burst": burst,
+                    "idx": idx,
+                    "sources": list(sources),
+                })
+
+        # I2 concerns the two explicitly named display paths. Other sources,
+        # such as fs_cache, stay visible in diagnostics but are neutral here.
+        invariant_source_events = [
+            event
+            for event in burst_events
+            if event.get("source") in PAGE_TURN_INVARIANT_SOURCES
+        ]
+        source_counts = Counter(
+            str(event["source"])
+            for event in invariant_source_events
+        )
+        source_indices = {
+            source: {
+                int(event["idx"])
+                for event in invariant_source_events
+                if event.get("source") == source
+            }
+            for source in PAGE_TURN_INVARIANT_SOURCES
+        }
+        mixes_across_pages = any(
+            final_idx != thumbnail_idx
+            for final_idx in source_indices["final_composite"]
+            for thumbnail_idx in source_indices["thumbnail"]
+        )
+        mixed_final_events = [
+            event
+            for event in invariant_source_events
+            if event.get("source") == "final_composite"
+            and any(
+                int(event["idx"]) != thumbnail_idx
+                for thumbnail_idx in source_indices["thumbnail"]
+            )
+        ]
+        rendition_unavailable_exception = (
+            bool(mixed_final_events)
+            and all(
+                _page_turn_decision_reason_for_ready(event, events)
+                == "passthrough_rendition_unavailable"
+                for event in mixed_final_events
+            )
+        )
+        if mixes_across_pages and not rendition_unavailable_exception:
+            violations.append({
+                "id": "I2",
+                "burst": burst,
+                "source_counts": source_counts,
+                "thumbnail_indices": [
+                    int(event["idx"])
+                    for event in invariant_source_events
+                    if event.get("source") == "thumbnail"
+                ],
+            })
+
+        # I3 applies only when the burst has an unambiguous direction.
+        if burst["direction"] != "unknown":
+            first_idx = burst["indices"][0]
+            last_idx = burst["indices"][-1]
+            present = set(burst["indices"])
+            missing = sorted(
+                set(range(min(first_idx, last_idx), max(first_idx, last_idx) + 1))
+                - present
+            )
+            if missing:
+                violations.append({
+                    "id": "I3",
+                    "burst": burst,
+                    "idx": last_idx,
+                    "missing_indices": missing,
+                })
+
+        # I4: a burst normally settles on a materialized frame. The sole
+        # exception is a repeated endpoint (0 or the highest observed index in
+        # this items_generation), which represents holding at a folder edge.
+        last_event = burst_events[-1]
+        last_idx = burst["indices"][-1]
+        repeated_tail = (
+            len(burst["indices"]) >= 2
+            and burst["indices"][-2] == last_idx
+        )
+        at_endpoint = (
+            last_idx == 0
+            or last_idx == max_idx_by_generation[burst["items_generation"]]
+        )
+        endpoint_exception = repeated_tail and at_endpoint
+        if last_event.get("mode") != "materialized" and not endpoint_exception:
+            violations.append({
+                "id": "I4",
+                "burst": burst,
+                "idx": last_idx,
+                "mode": str(last_event.get("mode", "?")),
+            })
+
+    # I5 is a decision-frame invariant rather than a ready-burst invariant.
+    decisions = sorted(
+        (
+            event
+            for event in events
+            if event.get("cat") == "fs"
+            and event.get("kind") == "page_turn_decision"
+        ),
+        key=lambda event: float(event.get("t", 0.0)),
+    )
+    for decision in decisions:
+        if (
+            decision.get("passthrough_rendition_ready") is True
+            and decision.get("reason") != "pending_zero"
+            and decision.get("defer_ui_uploads") is not True
+        ):
+            violations.append({
+                "id": "I5",
+                "burst": _nearest_page_turn_burst(decision, bursts),
+                "idx": decision.get("idx"),
+                "decision": decision,
+            })
+
+    return {
+        "bursts": bursts,
+        "violations": violations,
+        "violation_counts": dict(Counter(
+            violation["id"] for violation in violations
+        )),
+    }
+
+
+def _page_turn_burst_label(burst: dict | None, fallback_event: dict) -> str:
+    if burst is None:
+        t = float(fallback_event.get("t", 0.0))
+        idx = fallback_event.get("idx", "?")
+        return f"burst t={t:.3f}..{t:.3f} unknown idx={idx}..{idx}"
+    return (
+        f"burst t={burst['start_t']:.3f}..{burst['end_t']:.3f} "
+        f"{burst['direction']} "
+        f"idx={burst['indices'][0]}..{burst['indices'][-1]}"
+    )
+
+
+def _print_page_turn_sources(burst: dict | None) -> None:
+    if burst is None:
+        print("  source sequence: (no matching page_turn_ready burst)")
+        return
+    sequence = ", ".join(
+        f"{idx}:{source}"
+        for idx, source in _page_turn_source_sequence(burst["events"])
+    )
+    print(f"  source sequence: {sequence or '(none)'}")
+
+
+def cmd_page_turn_check(events: list[dict]) -> int:
+    report = analyze_page_turn_invariants(events)
+    for violation in report["violations"]:
+        invariant = violation["id"]
+        burst = violation["burst"]
+        fallback = (
+            violation.get("decision")
+            or (burst["events"][0] if burst is not None else {})
+        )
+        label = _page_turn_burst_label(burst, fallback)
+        if invariant == "I1":
+            print(
+                f"I1 violation: {label} idx={violation['idx']} "
+                "final_composite -> thumbnail"
+            )
+            print(
+                f"  actual sources at idx={violation['idx']}: "
+                + " -> ".join(violation["sources"])
+            )
+            _print_page_turn_sources(burst)
+        elif invariant == "I2":
+            counts = violation["source_counts"]
+            thumbnail_indices = ",".join(
+                str(idx) for idx in violation["thumbnail_indices"]
+            )
+            print(f"I2 violation: {label}")
+            print(
+                "  mixed sources: "
+                f"final_composite x{counts['final_composite']}, "
+                f"thumbnail x{counts['thumbnail']} "
+                f"(thumbnail at idx={thumbnail_indices})"
+            )
+            _print_page_turn_sources(burst)
+        elif invariant == "I3":
+            missing = ",".join(
+                str(idx) for idx in violation["missing_indices"]
+            )
+            print(f"I3 violation: {label} missing idx={missing}")
+            _print_page_turn_sources(burst)
+        elif invariant == "I4":
+            print(
+                f"I4 violation: {label} idx={violation['idx']} "
+                f"ended mode={violation['mode']}"
+            )
+            _print_page_turn_sources(burst)
+        elif invariant == "I5":
+            decision = violation["decision"]
+            print(
+                f"I5 violation: {label} idx={violation['idx']} "
+                f"decision t={float(decision.get('t', 0.0)):.3f} "
+                f"reason={decision.get('reason', '?')} "
+                f"defer_ui_uploads={decision.get('defer_ui_uploads', '?')}"
+            )
+            _print_page_turn_sources(burst)
+
+    print(
+        f"checked bursts={len(report['bursts'])} "
+        f"violations={len(report['violations'])}"
+    )
+    return 1 if report["violations"] else 0
 
 
 # -----------------------------------------------------------------------
@@ -2006,7 +2391,12 @@ def main() -> None:
     subs = parser.add_subparsers(dest="cmd", required=True)
     subs.add_parser("summary")
     subs.add_parser("latency")
-    subs.add_parser("page-turn")
+    p_page_turn = subs.add_parser("page-turn")
+    p_page_turn.add_argument(
+        "--check",
+        action="store_true",
+        help="ページ送りのトレース不変条件 I1-I5 を検査する",
+    )
     subs.add_parser("priority")
     subs.add_parser("thumbs")
     subs.add_parser("colorize")
@@ -2078,6 +2468,8 @@ def main() -> None:
         cmd_latency(events)
     elif args.cmd == "page-turn":
         cmd_page_turn(events)
+        if args.check:
+            sys.exit(cmd_page_turn_check(events))
     elif args.cmd == "priority":
         cmd_priority(events)
     elif args.cmd == "thumbs":

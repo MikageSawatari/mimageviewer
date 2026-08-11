@@ -190,6 +190,15 @@ impl App {
                 accountant.add_texture(VramSubsystem::ThumbAdjustTex, texture, false);
             }
         }
+        for (key, entry) in &self.passthrough_rendition_cache.entries {
+            if includes_idx(indices, key.edit_key.idx) {
+                accountant.add_texture(
+                    VramSubsystem::PassthroughRenditionCache,
+                    &entry.texture,
+                    false,
+                );
+            }
+        }
     }
 
     pub(crate) fn vram_accounting_snapshot(&self) -> VramAccountingSnapshot {
