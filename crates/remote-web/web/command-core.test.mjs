@@ -2686,9 +2686,11 @@ test("page prefetch admission busy retains the plan without consuming a page", (
     errorCode: "ipc_busy",
   });
   assert.equal(busy.retry, true);
+  // 弾かれたページを最後尾へ回すと、読者が次に見る 1 枚だけ穴が空いたまま
+  // 遠いページが先に埋まる。計画上の位置を保つ。
   assert.deepEqual(
     busy.pendingRequests.map(({ cacheKey }) => cacheKey),
-    ["page-b", "page-c", "page-a"]
+    ["page-a", "page-b", "page-c"]
   );
   assert.equal(pagePrefetchStartCount(0, busy.pendingRequests.length, 2), 2);
 

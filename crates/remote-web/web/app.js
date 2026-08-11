@@ -36,6 +36,7 @@ import {
   pagePrefetchFailurePlan,
   FOREGROUND_ADMISSION_RETRY_LIMIT,
   pageAdmissionRetryDelayMs,
+  pageRequestIsTransientlyBusy,
   pagePrefetchHudPlan,
   pagePrefetchIndicatorSummary,
   pagePrefetchBudgetAllowsStart,
@@ -497,8 +498,7 @@ export class PageResourceCache {
       } catch (error) {
         if (
           signal?.aborted ||
-          error?.status !== 503 ||
-          error?.code !== "ipc_busy"
+          !pageRequestIsTransientlyBusy(error?.status)
         ) throw error;
         // A foreground join must not inherit a temporary prefetch admission failure.
       } finally {
@@ -522,8 +522,7 @@ export class PageResourceCache {
         if (
           attempt >= FOREGROUND_ADMISSION_RETRY_LIMIT ||
           signal?.aborted ||
-          error?.status !== 503 ||
-          error?.code !== "ipc_busy"
+          !pageRequestIsTransientlyBusy(error?.status)
         ) throw error;
         await delayWithAbort(
           pageAdmissionRetryDelayMs(error?.retryAfterMs, attempt),

@@ -2405,6 +2405,14 @@ export function pageResourceAdmissionPlan({
 
 export const FOREGROUND_ADMISSION_RETRY_LIMIT = 3;
 
+/// 503 は「いま容量が無い」であって、その要求が無効だという返事ではない。
+/// remote-web の admission は `ipc_busy`、本体側の混雑は `miv_media_error` として
+/// 届く。コード名で絞ると本体由来の混雑を終端失敗として扱い、そのページを計画から
+/// 落としてしまう (実機で「次の 1 枚だけ穴が空く」形で観測)。
+export function pageRequestIsTransientlyBusy(status) {
+  return Number(status) === 503;
+}
+
 /// A displayed page must not fail because the server was momentarily full. Honour
 /// Retry-After when the server sends one, otherwise back off from a short delay.
 export function pageAdmissionRetryDelayMs(retryAfterMs, attempt = 0) {
@@ -2424,7 +2432,10 @@ export function pagePrefetchStartCount(activeCount, pendingCount, concurrencyLim
 }
 
 /// admission busy is a temporary capacity observation, not invalidation of the plan.
-/// Put that page behind the remaining plan so other pages get a chance before retry.
+/// Keep the page at its planned position: pump() consumes the plan in order, so an
+/// in-flight request is always nearer than anything still pending. Demoting it behind
+/// the rest leaves a hole exactly where the reader is about to look, while every
+/// farther page fills in. The retry delay, not the queue order, is what paces it.
 export function pagePrefetchFailurePlan({
   pendingRequests = [],
   failedRequest = null,
@@ -2433,12 +2444,12 @@ export function pagePrefetchFailurePlan({
 } = {}) {
   const pending = Array.isArray(pendingRequests) ? pendingRequests.slice() : [];
   const retry = Boolean(
-    Number(status) === 503 && errorCode === "ipc_busy" && failedRequest
+    pageRequestIsTransientlyBusy(status) && failedRequest
   );
   if (!retry) return { retry: false, pendingRequests: pending };
   const failedKey = failedRequest.cacheKey;
   const retained = pending.filter((request) => request?.cacheKey !== failedKey);
-  retained.push(failedRequest);
+  retained.unshift(failedRequest);
   return { retry: true, pendingRequests: retained };
 }
 
