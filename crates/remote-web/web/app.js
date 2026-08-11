@@ -11741,8 +11741,24 @@ export class ImageViewer {
     }
   }
 
+  /// 指を離したのにコマンドを出さずに終わった理由を残す。連打でタップが抜ける
+  /// という報告に対し、どの経路で消えたのかを観測できるようにするためのもの。
+  /// 判断は変えない。
+  recordGestureDropped(reason) {
+    enqueueTelemetry({
+      type: "viewer_gesture",
+      action: "dropped",
+      reason,
+      pointers: this.pointers.size,
+      pinched: Boolean(this.pinched),
+    });
+  }
+
   onPointerUp(event, cancelled) {
-    if (!this.pointers.has(event.pointerId)) return;
+    if (!this.pointers.has(event.pointerId)) {
+      this.recordGestureDropped("unknown_pointer");
+      return;
+    }
     const single = this.single;
     this.pointers.delete(event.pointerId);
     if (this.stage.hasPointerCapture?.(event.pointerId)) {
@@ -11753,9 +11769,14 @@ export class ImageViewer {
       const [remaining] = [...this.pointers.values()];
       this.single = this.startSinglePointer(remaining, false);
       this.pinch = null;
+      // 次の指が先に触れていると、離した指のタップは評価されずに終わる。
+      this.recordGestureDropped("overlapping_pointer");
       return;
     }
-    if (this.pointers.size > 0) return;
+    if (this.pointers.size > 0) {
+      this.recordGestureDropped("pointers_remaining");
+      return;
+    }
 
     const source = pointerInputSource(event.pointerType);
     if (!this.pinched && single) {
@@ -11824,6 +11845,19 @@ export class ImageViewer {
           source,
           detail: "pan",
         });
+      } else {
+        // 指は 1 本で離れたのに、タップにもスワイプにもならなかった。
+        enqueueTelemetry({
+          type: "viewer_gesture",
+          action: "dropped",
+          reason: "gesture_none",
+          gesture: String(gesture ?? "none"),
+          moved: Boolean(single.moved),
+          cancelled: Boolean(cancelled),
+          elapsed_ms: roundMs(elapsed),
+          dx: roundMs(dx),
+          dy: roundMs(dy),
+        });
       }
     } else if (this.pinched) {
       enqueueTelemetry({
@@ -11843,6 +11877,9 @@ export class ImageViewer {
           { source, detail: "pinch" }
         );
       }
+    } else {
+      // pinch でもないのに single が無い。開始を取りこぼしている。
+      this.recordGestureDropped("no_single");
     }
     this.single = null;
     this.pinch = null;
