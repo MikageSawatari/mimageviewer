@@ -3138,13 +3138,30 @@ fn fit_display_size_in_rect(rect: egui::Rect, display_size: egui::Vec2) -> egui:
     egui::Rect::from_center_size(rect.center(), display_size * fit_scale)
 }
 
-/// Resolve the screen rectangle from canonical page dimensions while retaining
-/// the actual texture dimensions for sampling and GPU-scale decisions. Catalog
-/// thumbnails are integer-rounded independently from the source page, so using
-/// their own aspect ratio for layout visibly stretches the pass-through frame.
+fn fs_texture_content_rect(
+    page_rect: egui::Rect,
+    texture_size: egui::Vec2,
+    rotation: crate::rotation_db::Rotation,
+    preserve_texture_aspect: bool,
+) -> egui::Rect {
+    if preserve_texture_aspect {
+        fit_display_size_in_rect(page_rect, rotated_display_size(texture_size, rotation))
+    } else {
+        page_rect
+    }
+}
+
+/// Resolve the page rectangle from canonical dimensions, optionally fitting the
+/// actual texture inside it without changing the texture's pixel aspect.
+///
+/// The canonical rectangle keeps the page frame stable. Pass-through thumbnails
+/// are integer-rounded independently, so painting them across that whole rectangle
+/// would introduce a small non-uniform stretch. They instead use a centered contain
+/// rectangle; final textures continue to fill the canonical page rectangle.
 fn resolve_fs_image_transform(
     input: DisplayedImageTransformInput,
     layout_source_size: Option<egui::Vec2>,
+    preserve_texture_aspect: bool,
 ) -> Option<DisplayedImageTransform> {
     let Some(layout_source_size) = layout_source_size else {
         return DisplayedImageTransform::resolve(input);
@@ -3159,7 +3176,13 @@ fn resolve_fs_image_transform(
         texture_size: layout_size,
         ..input
     })?;
-    DisplayedImageTransform::from_resolved_rect(input, layout.full_image_rect)
+    let paint_rect = fs_texture_content_rect(
+        layout.full_image_rect,
+        input.texture_size,
+        input.rotation,
+        preserve_texture_aspect,
+    );
+    DisplayedImageTransform::from_resolved_rect(input, paint_rect)
 }
 
 fn normalized_sub_rect(rect: egui::Rect, uv: egui::Rect) -> egui::Rect {
@@ -11218,12 +11241,13 @@ impl App {
                         } else {
                             self.fullscreen_media_rect(full_rect, fs_idx, state.is_video)
                         };
-                        let pdf_display_target = crate::pdf_loader::PdfDisplayTarget::from_logical_size(
-                            pdf_media_rect.width(),
-                            pdf_media_rect.height(),
-                            ctx.pixels_per_point(),
-                            pdf_fit_mode,
-                        );
+                        let pdf_display_target =
+                            crate::pdf_loader::PdfDisplayTarget::from_logical_size(
+                                pdf_media_rect.width(),
+                                pdf_media_rect.height(),
+                                ctx.pixels_per_point(),
+                                pdf_fit_mode,
+                            );
                         let pdf_target_changed =
                             self.fs_pdf_display_target != Some(pdf_display_target);
                         self.fs_pdf_display_target = Some(pdf_display_target);
@@ -11234,10 +11258,8 @@ impl App {
                             }
                             SpreadPair::Single => None,
                         };
-                        let current_is_pdf = matches!(
-                            self.items.get(fs_idx),
-                            Some(GridItem::PdfPage { .. })
-                        );
+                        let current_is_pdf =
+                            matches!(self.items.get(fs_idx), Some(GridItem::PdfPage { .. }));
                         let partner_is_pdf = pdf_partner.is_some_and(|idx| {
                             matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }))
                         });
@@ -11296,13 +11318,7 @@ impl App {
                                     .events
                                     .iter()
                                     .filter(|event| {
-                                        matches!(
-                                            event,
-                                            egui::Event::Key {
-                                                pressed: true,
-                                                ..
-                                            }
-                                        )
+                                        matches!(event, egui::Event::Key { pressed: true, .. })
                                     })
                                     .count();
                                 let wheel_event_count = i
@@ -11364,8 +11380,12 @@ impl App {
                             ));
                         }
                         let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
-                        if key_action.close { close_fs = true; }
-                        if key_action.close_to_page_list { close_to_page_list = true; }
+                        if key_action.close {
+                            close_fs = true;
+                        }
+                        if key_action.close_to_page_list {
+                            close_to_page_list = true;
+                        }
                         page_nav = key_action.page_nav;
                         ctrl_nav = key_action.ctrl_nav;
                         sibling_nav = key_action.sibling_nav;
@@ -11395,11 +11415,18 @@ impl App {
                             is_spread_double,
                             prev_foreground_hwnd,
                         );
-                        if !wheel_nav.is_none() { page_nav = wheel_nav; }
-                        if click_close { close_fs = true; }
+                        if !wheel_nav.is_none() {
+                            page_nav = wheel_nav;
+                        }
+                        if click_close {
+                            close_fs = true;
+                        }
                         // perf: ホイール/クリック起因のナビ
                         if !wheel_nav.is_none() {
-                            self.bump_input_seq("fs_wheel", Some(&format!("page_nav={wheel_nav:?}")));
+                            self.bump_input_seq(
+                                "fs_wheel",
+                                Some(&format!("page_nav={wheel_nav:?}")),
+                            );
                         } else if click_close {
                             self.bump_input_seq("fs_close_click", None);
                         }
@@ -11423,9 +11450,8 @@ impl App {
                         // 360 度パノラマビューモード中は分析 / 補正 / 比較を抑止する
                         // (= 上バーの 360 / × / window のみ、機能制限モード)。
                         let panorama_mode_active_now = self.is_panorama_mode_active(fs_idx);
-                        let analysis_active = self.analysis_mode
-                            && !is_spread_double
-                            && !panorama_mode_active_now;
+                        let analysis_active =
+                            self.analysis_mode && !is_spread_double && !panorama_mode_active_now;
                         // 補正パネルは見開き Double でも使えるようにする (左右独立補正 + コピー)。
                         // 編集対象 (画面上の左/右) は `adjust_spread_target` で切替。
                         let adjustment_active = self.adjustment_mode.is_open()
@@ -11435,10 +11461,11 @@ impl App {
                         // VST3 動画コンパクト表示モード: 動画のときだけ右上 1/4 に縮小し、
                         // 残った左下 3/4 をプラグイン GUI 用に空ける。動画でない (画像/PDF)
                         // ときは無視する (= プラグインで分析するのは動画なので)。
-                        let vst3_compact_active =
-                            cfg!(windows) && state.is_video && self.settings.vst3_enabled
-                                && self.settings.vst3_gui_visible
-                                && self.settings.vst3_video_compact;
+                        let vst3_compact_active = cfg!(windows)
+                            && state.is_video
+                            && self.settings.vst3_enabled
+                            && self.settings.vst3_gui_visible
+                            && self.settings.vst3_video_compact;
                         let content_rect =
                             self.fullscreen_media_rect(full_rect, fs_idx, state.is_video);
                         let image_rect = if analysis_active {
@@ -11448,9 +11475,8 @@ impl App {
                         } else {
                             content_rect
                         };
-                        let source_size = self
-                            .fs_page_coordinate_source_size(fs_idx)
-                            .or_else(|| {
+                        let source_size =
+                            self.fs_page_coordinate_source_size(fs_idx).or_else(|| {
                                 state
                                     .image_dims
                                     .map(|(w, h)| egui::vec2(w as f32, h as f32))
@@ -11464,7 +11490,13 @@ impl App {
                         let mut navigator_texture_sources = if spread_pair == SpreadPair::Single {
                             FsNavigatorTextureSources::single(
                                 fs_idx,
-                                state.tex.clone().or_else(|| state.thumb_tex.clone()).map(|texture| {
+                                Self::fs_display_texture_choice(
+                                    state.is_video,
+                                    state.tex.as_ref(),
+                                    state.thumb_tex.as_ref(),
+                                )
+                                .cloned()
+                                .map(|texture| {
                                     self.fullscreen_paint_resource_for_texture(fs_idx, texture)
                                 }),
                             )
@@ -11509,161 +11541,111 @@ impl App {
                                     {
                                         // ZipPla 風全画面ズーム (Z): 専用描画へ分岐。
                                         // 通常のズーム/パン/比較/フィット経路はスキップする。
-                                        single_transform = self.draw_fs_zoom_mode(
-                                            ui, ctx, image_rect, fs_idx, &state,
-                                        );
+                                        single_transform = self
+                                            .draw_fs_zoom_mode(ui, ctx, image_rect, fs_idx, &state);
                                     } else {
-
-                                    let fs_rotation = self.get_rotation(fs_idx);
-                                    let zp = if analysis_active {
-                                        Some((self.analysis_zoom, self.analysis_pan))
-                                    } else {
-                                        self.fs_zoom_pan()
-                                    };
-                                    let free_rot = if analysis_active { 0.0 } else { self.fs_free_rotation };
-                                    // 前フレームと異なる (idx, テクスチャ) の最初の描画で paint を emit。
-                                    // seq はエントリ自身の `load_seq` を使う (self.input_seq だと
-                                    // paint 時点で別操作に更新されていて load→ready→paint の相関が崩れる)。
-                                    if crate::perf::is_enabled()
-                                        && let Some(tex) = Self::fs_display_texture_choice(
-                                            state.is_video,
-                                            state.tex.as_ref(),
-                                            state.thumb_tex.as_ref(),
-                                        )
-                                    {
-                                        let cur_id = tex.id();
-                                        let prev = self.fs_painted_last;
-                                        let is_new = !matches!(
-                                            prev,
-                                            Some((prev_idx, prev_id, _)) if prev_idx == fs_idx && prev_id == cur_id
+                                        let fs_rotation = self.get_rotation(fs_idx);
+                                        let zp = if analysis_active {
+                                            Some((self.analysis_zoom, self.analysis_pan))
+                                        } else {
+                                            self.fs_zoom_pan()
+                                        };
+                                        let free_rot = if analysis_active {
+                                            0.0
+                                        } else {
+                                            self.fs_free_rotation
+                                        };
+                                        let compare_mode = self.compare_view_mode;
+                                        let compare_requested = !matches!(
+                                            compare_mode,
+                                            crate::app::CompareViewMode::Off
                                         );
-                                        if is_new {
-                                            let key = self.perf_item_key(fs_idx);
-                                            let entry_seq = self
-                                                .fs_cache
-                                                .get(&fs_idx)
-                                                .map(|e| e.load_seq())
-                                                .unwrap_or(0);
-                                            let source = self
-                                                .fs_texture_source_for_trace(fs_idx, tex);
-                                            crate::perf::event(
-                                                "fs",
-                                                "paint",
-                                                key.as_deref(),
-                                                entry_seq,
-                                                &[
-                                                    ("idx", serde_json::Value::from(fs_idx)),
-                                                    (
-                                                        "items_generation",
-                                                        serde_json::Value::from(
-                                                            self.items_generation,
-                                                        ),
-                                                    ),
-                                                    (
-                                                        "source",
-                                                        serde_json::Value::from(source),
-                                                    ),
-                                                    (
-                                                        "texture_id",
-                                                        serde_json::Value::from(format!(
-                                                            "{:?}", cur_id
-                                                        )),
-                                                    ),
-                                                ],
-                                            );
-                                            self.fs_painted_last = Some((fs_idx, cur_id, entry_seq));
-                                        }
-                                    }
-                                    let compare_mode = self.compare_view_mode;
-                                    let compare_requested = !matches!(
-                                        compare_mode,
-                                        crate::app::CompareViewMode::Off
-                                    );
-                                    // 入力ハンドラ (キー / ホイール / クリック / gamepad) と
-                                    // 同一述語で判定し、描画と入力の食い違いを構造的に防ぐ。
-                                    let continuous_reading_active =
-                                        self.continuous_reading_active_for_idx(fs_idx);
-                                    let pixels_per_point = ctx.pixels_per_point();
-                                    let fit_scale_limits =
-                                        self.fullscreen_fit_scale_limits(pixels_per_point);
-                                    if continuous_reading_active {
-                                        self.draw_fs_continuous_reading(
-                                            ui,
-                                            ctx,
-                                            image_rect,
-                                            fs_idx,
-                                            state.original_preview_active,
-                                        );
-                                    } else {
-                                        if compare_requested {
-                                            self.ensure_compare_prepared_pair(ctx, fs_idx);
-                                        }
-                                        let requested_draw = CompareFramePrimaryDraw::resolve(
-                                            compare_requested,
-                                            self.compare_prepared_pair_matches(fs_idx),
-                                        );
-                                        let prepared_compare_drawn = requested_draw
-                                            .draws_prepared_compare()
-                                            && self.draw_compare_prepared_mode(
+                                        // 入力ハンドラ (キー / ホイール / クリック / gamepad) と
+                                        // 同一述語で判定し、描画と入力の食い違いを構造的に防ぐ。
+                                        let continuous_reading_active =
+                                            self.continuous_reading_active_for_idx(fs_idx);
+                                        let pixels_per_point = ctx.pixels_per_point();
+                                        let fit_scale_limits =
+                                            self.fullscreen_fit_scale_limits(pixels_per_point);
+                                        if continuous_reading_active {
+                                            self.draw_fs_continuous_reading(
                                                 ui,
                                                 ctx,
                                                 image_rect,
                                                 fs_idx,
-                                                compare_mode,
-                                                zp,
+                                                state.original_preview_active,
                                             );
-                                        if prepared_compare_drawn {
-                                            primary_draw =
-                                                CompareFramePrimaryDraw::PreparedCompareOnly;
-                                        }
+                                        } else {
+                                            if compare_requested {
+                                                self.ensure_compare_prepared_pair(ctx, fs_idx);
+                                            }
+                                            let requested_draw = CompareFramePrimaryDraw::resolve(
+                                                compare_requested,
+                                                self.compare_prepared_pair_matches(fs_idx),
+                                            );
+                                            let prepared_compare_drawn = requested_draw
+                                                .draws_prepared_compare()
+                                                && self.draw_compare_prepared_mode(
+                                                    ui,
+                                                    ctx,
+                                                    image_rect,
+                                                    fs_idx,
+                                                    compare_mode,
+                                                    zp,
+                                                );
+                                            if prepared_compare_drawn {
+                                                primary_draw =
+                                                    CompareFramePrimaryDraw::PreparedCompareOnly;
+                                            }
 
-                                        if !prepared_compare_drawn {
-                                            // `Ready` でない間は通常ページだけを描く。旧 fallback
-                                            // の raw pinned overlay を重ねると、現在ページと狭い比較
-                                            // 矩形が同じ frame に共存していた。
-                                            let pixel_grid_enabled =
-                                                self.fs_pixel_grid_enabled && !analysis_active;
-                                            // 余白カットフィット用 bbox (設定 OFF なら None)。
-                                            // bg_style が self を借用する前に算出しておく。
-                                            let fit_mode = if analysis_active {
-                                                FullscreenFitMode::Page
-                                            } else {
-                                                self.effective_fullscreen_fit_mode()
-                                            };
-                                            let content_bbox = if state.is_video {
-                                                None
-                                            } else {
-                                                self.view_trim_single_content_bbox(fs_idx)
-                                            };
-                                            let paint_resource = state.tex.clone().map(|texture| {
-                                                self.fullscreen_paint_resource_for_texture(
-                                                    fs_idx, texture,
-                                                )
-                                            });
-                                            let bg_style = self.fs_bg_style(ctx);
-                                            single_transform = self.draw_fs_image(
-                                                ui,
-                                                image_rect,
-                                                fs_idx,
-                                                source_size,
-                                                None,
-                                                paint_resource.as_ref(),
-                                                state.thumb_tex.as_ref(),
-                                                state.is_video,
-                                                state.vst3_waiting_for_video,
-                                                state.fs_load_failed,
-                                                fs_rotation,
-                                                zp,
-                                                free_rot,
-                                                &bg_style,
-                                                &state.location_display,
-                                                pixel_grid_enabled,
-                                                fit_mode,
-                                                fit_scale_limits,
-                                                content_bbox,
-                                            );
+                                            if !prepared_compare_drawn {
+                                                // `Ready` でない間は通常ページだけを描く。旧 fallback
+                                                // の raw pinned overlay を重ねると、現在ページと狭い比較
+                                                // 矩形が同じ frame に共存していた。
+                                                let pixel_grid_enabled =
+                                                    self.fs_pixel_grid_enabled && !analysis_active;
+                                                // 余白カットフィット用 bbox (設定 OFF なら None)。
+                                                // bg_style が self を借用する前に算出しておく。
+                                                let fit_mode = if analysis_active {
+                                                    FullscreenFitMode::Page
+                                                } else {
+                                                    self.effective_fullscreen_fit_mode()
+                                                };
+                                                let content_bbox = if state.is_video {
+                                                    None
+                                                } else {
+                                                    self.view_trim_single_content_bbox(fs_idx)
+                                                };
+                                                let paint_resource =
+                                                    state.tex.clone().map(|texture| {
+                                                        self.fullscreen_paint_resource_for_texture(
+                                                            fs_idx, texture,
+                                                        )
+                                                    });
+                                                let bg_style = self.fs_bg_style(ctx);
+                                                single_transform = self.draw_fs_image(
+                                                    ui,
+                                                    image_rect,
+                                                    fs_idx,
+                                                    source_size,
+                                                    None,
+                                                    paint_resource.as_ref(),
+                                                    state.thumb_tex.as_ref(),
+                                                    state.is_video,
+                                                    state.vst3_waiting_for_video,
+                                                    state.fs_load_failed,
+                                                    fs_rotation,
+                                                    zp,
+                                                    free_rot,
+                                                    &bg_style,
+                                                    &state.location_display,
+                                                    pixel_grid_enabled,
+                                                    fit_mode,
+                                                    fit_scale_limits,
+                                                    content_bbox,
+                                                );
+                                            }
                                         }
-                                    }
                                     } // else (= !panorama_painted) ブロック終端
                                 }
                                 SpreadPair::Double { left, right } => {
@@ -11681,10 +11663,7 @@ impl App {
                             }
                         }
                         if single_transform.is_none()
-                            && !matches!(
-                                self.compare_view_mode,
-                                crate::app::CompareViewMode::Off
-                            )
+                            && !matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
                         {
                             let compare_size = self
                                 .compare_preparation
@@ -11714,9 +11693,8 @@ impl App {
                                         free_rotation_rad: 0.0,
                                         content_bbox: None,
                                         fit_mode: FullscreenFitMode::Page,
-                                        fit_scale_limits: self.fullscreen_fit_scale_limits(
-                                            ctx.pixels_per_point(),
-                                        ),
+                                        fit_scale_limits: self
+                                            .fullscreen_fit_scale_limits(ctx.pixels_per_point()),
                                         pixels_per_point: ctx.pixels_per_point(),
                                         placement: ResolvedDisplayPlacement::Normal {
                                             zoom_pan: self.fs_zoom_pan(),
@@ -11754,9 +11732,7 @@ impl App {
                         // 消しゴム同様、見開き中は 1 フレーム遷移期間で is_spread_double が
                         // true のまま conceal_mode = true になりうるので、その 1 フレームは
                         // overlay 描画をスキップして単一ページ表示で出す次フレームに描画する。
-                        if self.conceal_mode
-                            && !is_spread_double
-                            && !state.original_preview_active
+                        if self.conceal_mode && !is_spread_double && !state.original_preview_active
                         {
                             if let Some(transform) = single_transform.as_ref() {
                                 self.handle_conceal_paint(ctx, transform);
@@ -11769,10 +11745,7 @@ impl App {
 
                         // ── テキスト注釈モード: キャンバス選択/移動 + パネル描画 ──
                         // (Inc 3b 座標逆写像 + 選択 / 3c ドラッグ移動 / 3d IME 編集)。
-                        if self.text_mode
-                            && !is_spread_double
-                            && !state.original_preview_active
-                        {
+                        if self.text_mode && !is_spread_double && !state.original_preview_active {
                             if let Some(transform) = single_transform.as_ref() {
                                 // 子ダイアログ表示中はキャンバスのポインタ操作を止める (Codex P2:
                                 // ダイアログ上のクリック/ドラッグが背面オブジェクトの選択/移動/削除に
@@ -11840,18 +11813,11 @@ impl App {
                         }
 
                         let overlay_t0 = std::time::Instant::now();
-                        self.draw_capture_region_selection_overlay(
-                            ui,
-                            ctx,
-                            full_rect,
-                            fs_idx,
-                        );
+                        self.draw_capture_region_selection_overlay(ui, ctx, full_rect, fs_idx);
                         // ── ルーペ (Shift ホールド / M トグル) ──
                         // パノラマ・分析・補正・テキスト注釈モードでは内部で早期 return する。
                         // 消しゴムモードのマスクオーバーレイより上に載せる (最新状態を拡大)。
-                        self.draw_fs_loupe_if_active(
-                            ui, ctx, image_rect, fs_idx,
-                        );
+                        self.draw_fs_loupe_if_active(ui, ctx, image_rect, fs_idx);
 
                         // カラー化待ちはページ枠ごとの fallback にせず、旧表示ユニットを
                         // 黒背景ごと重ねる。見開きは新しい左右が両方揃ったフレームだけ
@@ -11875,12 +11841,7 @@ impl App {
                                     page.texture.source_texture(),
                                 );
                             }
-                            self.draw_fs_display_unit_holdover(
-                                ui,
-                                ctx,
-                                image_rect,
-                                &unit,
-                            );
+                            self.draw_fs_display_unit_holdover(ui, ctx, image_rect, &unit);
                             navigator_texture_sources.replace_with_display_unit(&unit);
                         }
 
@@ -11897,12 +11858,7 @@ impl App {
                                     page.texture.source_texture(),
                                 );
                             }
-                            self.draw_fs_display_unit_holdover(
-                                ui,
-                                ctx,
-                                image_rect,
-                                &unit,
-                            );
+                            self.draw_fs_display_unit_holdover(ui, ctx, image_rect, &unit);
                             navigator_texture_sources.replace_with_display_unit(&unit);
                         }
 
@@ -11970,24 +11926,30 @@ impl App {
 
                         // ── PDF 再レンダリング進捗 ──
                         if self.fs_pending.contains_key(&fs_idx) {
-                            let label = if matches!(self.items.get(fs_idx), Some(GridItem::PdfPage { .. })) {
-                                "PDF 再レンダリング中..."
-                            } else {
-                                "読込中..."
-                            };
+                            let label =
+                                if matches!(self.items.get(fs_idx), Some(GridItem::PdfPage { .. }))
+                                {
+                                    "PDF 再レンダリング中..."
+                                } else {
+                                    "読込中..."
+                                };
                             let font = egui::FontId::proportional(13.0);
                             let pos = egui::pos2(image_rect.min.x + 12.0, image_rect.max.y - 12.0);
                             let galley = ui.painter().layout_no_wrap(
-                                label.to_string(), font.clone(), egui::Color32::WHITE,
+                                label.to_string(),
+                                font.clone(),
+                                egui::Color32::WHITE,
                             );
-                            let text_rect = egui::Align2::LEFT_BOTTOM
-                                .anchor_size(pos, galley.size());
+                            let text_rect =
+                                egui::Align2::LEFT_BOTTOM.anchor_size(pos, galley.size());
                             let bg = text_rect.expand(4.0);
                             ui.painter().rect_filled(
-                                bg, 4.0,
+                                bg,
+                                4.0,
                                 egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
                             );
-                            ui.painter().galley(text_rect.min, galley, egui::Color32::WHITE);
+                            ui.painter()
+                                .galley(text_rect.min, galley, egui::Color32::WHITE);
                         }
 
                         // 連結読みではシークバーと同じ current page を左パネルの編集対象にする。
@@ -12016,7 +11978,11 @@ impl App {
                                 _ => None,
                             };
                             let close_analysis = self.draw_analysis_panel(
-                                ui, ctx, full_rect, image_rect, pixels.as_deref(),
+                                ui,
+                                ctx,
+                                full_rect,
+                                image_rect,
+                                pixels.as_deref(),
                             );
                             if close_analysis {
                                 // × も Z / ホバーボタンと同じ経路 (ズーム/パン引き継ぎ込み) に
@@ -12124,12 +12090,7 @@ impl App {
                             touch_chrome_latched,
                         );
                         if !touch_chrome_latched {
-                            self.draw_fs_panel_callouts(
-                                ui,
-                                ctx,
-                                full_rect,
-                                callouts_enabled,
-                            );
+                            self.draw_fs_panel_callouts(ui, ctx, full_rect, callouts_enabled);
                         }
                         // 静止画は左右どちらかの実パネルが表示中なら、上部バーと下部
                         // ページシークバーを同時表示する。callout だけの hover は含めない。
@@ -12168,7 +12129,8 @@ impl App {
                         // 上情報バー + 下シークバーを描くため、Inc 3 パネル漏れ修正)。
                         if self.fullscreen_top_bar_chrome_allowed(fs_idx) {
                             let saved_nav = page_nav;
-                            let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
+                            let has_page_override =
+                                self.adjustment_page_params.contains_key(&fs_idx);
                             // Phase 6: 動画モードかどうかを上ホバーバーに通知する。
                             // 動画なら video_meta (duration, bitrate) と画像 dims (= 動画解像度) を
                             // 動画用 info text 構築のために流す。
@@ -12177,12 +12139,12 @@ impl App {
                             #[cfg(windows)]
                             if is_video_mode {
                                 if let Some(crate::fs_animation::FsCacheEntry::Video {
-                                    player, ..
+                                    player,
+                                    ..
                                 }) = self.fs_cache.get(&fs_idx)
                                 {
                                     if let Some(info) = player.info() {
-                                        video_meta =
-                                            Some((info.duration_secs, info.bit_rate_bps));
+                                        video_meta = Some((info.duration_secs, info.bit_rate_bps));
                                     }
                                 }
                             }
@@ -12202,8 +12164,7 @@ impl App {
                             // ウィンドウ / 全画面 切り替えボタン: 静止画フルスクリーン
                             // (= 非動画、Windows) のときだけ出す。動画は native HUD 側に
                             // 専用トグルがある。
-                            let show_window_toggle =
-                                cfg!(windows) && !is_video_mode && !detached;
+                            let show_window_toggle = cfg!(windows) && !is_video_mode && !detached;
                             let slideshow_was_playing = self.slideshow_playing;
                             // 360 度パノラマビュー: 検出 + アクティブ状態を計算
                             // (docs/panorama-360-view-plan.md §5.3)。is_panorama_mode_active
@@ -12211,8 +12172,8 @@ impl App {
                             // detect Some だけで十分 (= 360 ボタン押下で初期化可能)。
                             // 非対応画像でもボタンは disabled で常に表示する。
                             let panorama_trigger = self.detect_panorama(fs_idx);
-                            let panorama_active = self.panorama_state.is_some()
-                                && panorama_trigger.is_some();
+                            let panorama_active =
+                                self.panorama_state.is_some() && panorama_trigger.is_some();
                             // panorama_mode_active=true なら他のボタン (info / analysis /
                             // spread / 補正 / rotate / capture / VST / play / tile) は全て隠す。
                             let panorama_mode_active = panorama_active;
@@ -12243,18 +12204,13 @@ impl App {
                             );
                             let hover_in_top = ctx.input(|i| {
                                 !self.cursor_hidden
-                                    && i.pointer
-                                        .hover_pos()
-                                        .is_some_and(|p| {
-                                            p.y < TOP_BAR_HOVER_Y
-                                                && fullscreen_edge_hover_allowed(
-                                                    p,
-                                                    navigator_exclusion,
-                                                )
-                                        })
+                                    && i.pointer.hover_pos().is_some_and(|p| {
+                                        p.y < TOP_BAR_HOVER_Y
+                                            && fullscreen_edge_hover_allowed(p, navigator_exclusion)
+                                    })
                             });
-                            let top_bar_visible = still_top_bar_visible_from_inputs(
-                                StillTopBarVisibilityInputs {
+                            let top_bar_visible =
+                                still_top_bar_visible_from_inputs(StillTopBarVisibilityInputs {
                                     locked: self.settings.fullscreen_top_bar_locked,
                                     hover_in_top,
                                     side_panel_visible,
@@ -12264,8 +12220,7 @@ impl App {
                                     rotation_popup_open: fs_rotation_popup_open(ctx),
                                     view_trim_mode: self.view_trim_mode,
                                     touch_chrome_latched,
-                                },
-                            );
+                                });
                             let top_bar_page_infos = if top_bar_visible {
                                 match spread_pair {
                                     SpreadPair::Single => {
@@ -12292,16 +12247,21 @@ impl App {
                                 Vec::new()
                             };
                             Self::draw_fs_hover_bar(
-                                ui, ctx, &self.keymap, full_rect,
+                                ui,
+                                ctx,
+                                &self.keymap,
+                                full_rect,
                                 &top_bar_page_infos,
-                                &mut close_fs, &mut page_nav,
+                                &mut close_fs,
+                                &mut page_nav,
                                 self.settings.fullscreen_side_panel_mode,
                                 &mut side_panel_mode_pressed,
                                 side_panel_visible,
                                 &mut self.slideshow_playing,
                                 &mut self.settings.slideshow_interval_secs,
                                 &mut self.settings.slideshow_end_action,
-                                current_rotation, &mut rotation_choice,
+                                current_rotation,
+                                &mut rotation_choice,
                                 self.analysis_mode,
                                 &mut bar_analysis_pressed,
                                 panorama_trigger,
@@ -12431,7 +12391,9 @@ impl App {
                                 self.show_vst3_manager = !self.show_vst3_manager;
                             }
                             // ホイール/キーで確定したページ移動を保護
-                            if nav_locked { page_nav = saved_nav; }
+                            if nav_locked {
+                                page_nav = saved_nav;
+                            }
                         }
                         fs_hover_bar_ms = hover_bar_t0.elapsed().as_secs_f64() * 1000.0;
                         if let Some(rotation) = rotation_choice {
@@ -12453,9 +12415,8 @@ impl App {
                         }
 
                         // ── 右上フィードバックトースト ──
-                        let ring_surface_context = self.ring_shortcut_context_for_surface(
-                            crate::app::ActionSurface::Viewer,
-                        );
+                        let ring_surface_context = self
+                            .ring_shortcut_context_for_surface(crate::app::ActionSurface::Viewer);
                         if self.mouse_ring_flick.is_some()
                             && ring_surface_context
                                 == crate::ring_shortcut::RingShortcutContext::VideoFullscreen
@@ -12515,9 +12476,7 @@ impl App {
 
                         // The touch help is the final canvas overlay: once it is visible,
                         // no panel, page, or gesture target should appear above its guide.
-                        self.draw_still_touch_first_run_help_overlay(
-                            ui, ctx, full_rect, fs_idx,
-                        );
+                        self.draw_still_touch_first_run_help_overlay(ui, ctx, full_rect, fs_idx);
 
                         // ── スロット保存ダイアログ ──
                         self.draw_slot_save_dialog(ctx);
@@ -12525,9 +12484,9 @@ impl App {
                         self.draw_export_dialog(ctx);
                         self.draw_export_progress_dialog(ctx);
 
-                        let spread_changed_from_direction =
-                            self.reading_direction != reading_direction_before
-                                && self.sync_spread_mode_from_reading_direction();
+                        let spread_changed_from_direction = self.reading_direction
+                            != reading_direction_before
+                            && self.sync_spread_mode_from_reading_direction();
                         // ホバーバーのポップアップからモードが変更された場合
                         if self.spread_mode != spread_before {
                             if !spread_changed_from_direction {
@@ -12548,7 +12507,8 @@ impl App {
                             }
                         }
                         let reading_flow_changed = self.reading_flow != reading_flow_before;
-                        if reading_flow_changed || self.reading_direction != reading_direction_before
+                        if reading_flow_changed
+                            || self.reading_direction != reading_direction_before
                         {
                             self.reset_continuous_reading_transform();
                             if reading_flow_changed {
@@ -13204,7 +13164,7 @@ impl App {
     /// Record the resources selected by the completed display-unit draw, after spread
     /// resolution and holdover replacement. Dedup compares each page only with the
     /// immediately preceding display unit's `(idx, texture)` pairs.
-    fn emit_fs_spread_paint_for_display_unit(
+    fn emit_fs_paint_for_display_unit(
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
@@ -13256,6 +13216,25 @@ impl App {
                     .map(|entry| entry.load_seq())
                     .unwrap_or(0)
             };
+            let transform = self
+                .fullscreen_page_layout
+                .page_by_idx(page.idx)
+                .map(|displayed| displayed.transform);
+            let draw_rect = transform.map(|transform| transform.paint_rect);
+            let display_size = transform
+                .map(|transform| rotated_display_size(transform.texture_size, transform.rotation));
+            let scale_x = transform.map(|transform| {
+                transform.full_image_rect.width()
+                    / rotated_display_size(transform.texture_size, transform.rotation)
+                        .x
+                        .max(1.0)
+            });
+            let scale_y = transform.map(|transform| {
+                transform.full_image_rect.height()
+                    / rotated_display_size(transform.texture_size, transform.rotation)
+                        .y
+                        .max(1.0)
+            });
             crate::perf::event(
                 "fs",
                 "paint",
@@ -13273,8 +13252,68 @@ impl App {
                         "texture_id",
                         serde_json::Value::from(format!("{:?}", page.texture_id)),
                     ),
+                    (
+                        "x",
+                        draw_rect
+                            .map(|rect| serde_json::Value::from(rect.min.x))
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                    (
+                        "y",
+                        draw_rect
+                            .map(|rect| serde_json::Value::from(rect.min.y))
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                    (
+                        "w",
+                        draw_rect
+                            .map(|rect| serde_json::Value::from(rect.width()))
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                    (
+                        "h",
+                        draw_rect
+                            .map(|rect| serde_json::Value::from(rect.height()))
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                    (
+                        "texture_w",
+                        display_size
+                            .map(|size| serde_json::Value::from(size.x))
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                    (
+                        "texture_h",
+                        display_size
+                            .map(|size| serde_json::Value::from(size.y))
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                    (
+                        "scale_x",
+                        scale_x
+                            .map(serde_json::Value::from)
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                    (
+                        "scale_y",
+                        scale_y
+                            .map(serde_json::Value::from)
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
                 ],
             );
+        }
+        if let [page] = trace_pages.as_slice() {
+            let entry_seq = if matches!(decision.paint_source(), FsPageTurnPaintSource::PassThrough)
+            {
+                self.input_seq
+            } else {
+                self.fs_cache
+                    .get(&page.idx)
+                    .map(|entry| entry.load_seq())
+                    .unwrap_or(0)
+            };
+            self.fs_painted_last = Some((page.idx, page.texture_id, entry_seq));
         }
     }
 
@@ -13296,9 +13335,7 @@ impl App {
         else {
             return;
         };
-        if matches!(spread_pair, SpreadPair::Double { .. }) {
-            self.emit_fs_spread_paint_for_display_unit(ctx, fs_idx, spread_pair, decision, sources);
-        }
+        self.emit_fs_paint_for_display_unit(ctx, fs_idx, spread_pair, decision, sources);
         if matches!(decision.paint_source(), FsPageTurnPaintSource::Materialized)
             && trace_pages.iter().any(|page| page.source == "thumbnail")
         {
@@ -20702,7 +20739,8 @@ impl App {
         if let Some(resource) = display_tex {
             let handle = resource.source_texture();
             let tex_size = handle.size_vec2();
-            let use_source_layout = self.is_passthrough_rendition_texture(handle)
+            let preserve_texture_aspect = self.is_passthrough_rendition_texture(handle);
+            let use_source_layout = preserve_texture_aspect
                 || matches!(self.items.get(page_idx), Some(GridItem::PdfPage { .. }));
             let layout_source_size = use_source_layout
                 .then(|| self.fs_page_layout_source_size(page_idx))
@@ -20724,6 +20762,7 @@ impl App {
                         placement: ResolvedDisplayPlacement::Normal { zoom_pan },
                     },
                     layout_source_size,
+                    preserve_texture_aspect,
                 )
             }) else {
                 return None;
@@ -24905,7 +24944,9 @@ impl App {
 
         if let Some(handle) = display_tex {
             let tex_size = handle.size_vec2();
-            let use_layout = self.is_passthrough_rendition_texture(handle.source_texture())
+            let preserve_texture_aspect =
+                self.is_passthrough_rendition_texture(handle.source_texture());
+            let use_layout = preserve_texture_aspect
                 || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }));
             let layout_size = use_layout
                 .then(|| self.fs_page_layout_source_size(idx))
@@ -24917,7 +24958,9 @@ impl App {
                 }
                 _ => layout_size,
             };
-            let img_rect = fit_display_size_in_rect(rect, display_size);
+            let page_rect = fit_display_size_in_rect(rect, display_size);
+            let img_rect =
+                fs_texture_content_rect(page_rect, tex_size, rotation, preserve_texture_aspect);
             let transform = DisplayedImageTransform::from_resolved_rect(
                 DisplayedImageTransformInput {
                     page_idx: idx,
@@ -30785,7 +30828,7 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_thumbnail_uses_the_final_page_rectangle() {
+    fn passthrough_thumbnail_preserves_its_aspect_inside_the_final_page_rectangle() {
         let viewport_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
         let source_size = egui::vec2(1000.0, 1501.0);
         let make_input = |texture_size| DisplayedImageTransformInput {
@@ -30802,20 +30845,34 @@ mod tests {
             placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
         };
 
-        let pass =
-            resolve_fs_image_transform(make_input(egui::vec2(300.0, 450.0)), Some(source_size))
-                .expect("pass-through transform");
-        let final_image =
-            resolve_fs_image_transform(make_input(source_size), None).expect("final transform");
+        let pass = resolve_fs_image_transform(
+            make_input(egui::vec2(300.0, 450.0)),
+            Some(source_size),
+            true,
+        )
+        .expect("pass-through transform");
+        let final_image = resolve_fs_image_transform(make_input(source_size), None, false)
+            .expect("final transform");
 
-        assert!((pass.full_image_rect.left() - final_image.full_image_rect.left()).abs() < 1.0e-4);
-        assert!((pass.full_image_rect.top() - final_image.full_image_rect.top()).abs() < 1.0e-4);
         assert!(
-            (pass.full_image_rect.width() - final_image.full_image_rect.width()).abs() < 1.0e-4
+            final_image
+                .full_image_rect
+                .contains_rect(pass.full_image_rect)
         );
         assert!(
-            (pass.full_image_rect.height() - final_image.full_image_rect.height()).abs() < 1.0e-4
+            (pass.full_image_rect.center().x - final_image.full_image_rect.center().x).abs()
+                < 1.0e-4
         );
+        assert!(
+            (pass.full_image_rect.center().y - final_image.full_image_rect.center().y).abs()
+                < 1.0e-4
+        );
+        let texture_ratio = 300.0 / 450.0;
+        let paint_ratio = pass.full_image_rect.width() / pass.full_image_rect.height();
+        assert!((paint_ratio - texture_ratio).abs() < 1.0e-4);
+        let scale_x = pass.full_image_rect.width() / 300.0;
+        let scale_y = pass.full_image_rect.height() / 450.0;
+        assert!((scale_x - scale_y).abs() < 1.0e-4);
     }
 
     #[test]
@@ -30840,22 +30897,35 @@ mod tests {
         let pass = resolve_fs_image_transform(
             make_input(egui::vec2(327.0, 473.0), egui::vec2(327.0, 473.0)),
             Some(page_box_layout),
+            true,
         )
         .expect("PDF pass-through transform");
         let final_image = resolve_fs_image_transform(
             make_input(egui::vec2(1643.0, 2375.0), egui::vec2(1643.0, 2375.0)),
             Some(page_box_layout),
+            false,
         )
         .expect("PDF final transform");
 
-        assert!((pass.full_image_rect.left() - final_image.full_image_rect.left()).abs() < 1.0e-4);
-        assert!((pass.full_image_rect.top() - final_image.full_image_rect.top()).abs() < 1.0e-4);
         assert!(
-            (pass.full_image_rect.width() - final_image.full_image_rect.width()).abs() < 1.0e-4
+            final_image
+                .full_image_rect
+                .contains_rect(pass.full_image_rect)
         );
         assert!(
-            (pass.full_image_rect.height() - final_image.full_image_rect.height()).abs() < 1.0e-4
+            (pass.full_image_rect.center().x - final_image.full_image_rect.center().x).abs()
+                < 1.0e-4
         );
+        assert!(
+            (pass.full_image_rect.center().y - final_image.full_image_rect.center().y).abs()
+                < 1.0e-4
+        );
+        let texture_ratio = 327.0 / 473.0;
+        let paint_ratio = pass.full_image_rect.width() / pass.full_image_rect.height();
+        assert!((paint_ratio - texture_ratio).abs() < 1.0e-4);
+        let scale_x = pass.full_image_rect.width() / 327.0;
+        let scale_y = pass.full_image_rect.height() / 473.0;
+        assert!((scale_x - scale_y).abs() < 1.0e-4);
     }
 
     #[test]

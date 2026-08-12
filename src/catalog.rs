@@ -672,10 +672,25 @@ pub fn encode_thumb_webp(
     long_side: u32,
     quality: f32,
 ) -> Option<(Vec<u8>, u32, u32)> {
-    let thumb = crate::fast_resize::resize_dynamic_fit(
+    encode_thumb_webp_with_source_dims(img, long_side, quality, (img.width(), img.height()))
+}
+
+/// `encode_thumb_webp` variant that uses canonical source dimensions for aspect.
+///
+/// PDF page boxes and DCT-scaled JPEG buffers can differ slightly from the decoded
+/// raster's already-rounded aspect. The output still never exceeds `long_side` or
+/// upscales the supplied raster.
+pub fn encode_thumb_webp_with_source_dims(
+    img: &image::DynamicImage,
+    long_side: u32,
+    quality: f32,
+    source_dims: (u32, u32),
+) -> Option<(Vec<u8>, u32, u32)> {
+    let thumb = crate::fast_resize::resize_dynamic_fit_with_source_aspect(
         img,
         long_side,
         long_side,
+        source_dims,
         crate::fast_resize::Quality::Lanczos3,
     );
     let rgb = thumb.to_rgb8();

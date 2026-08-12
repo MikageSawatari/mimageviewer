@@ -2754,8 +2754,21 @@ fn fit_to_target(w: f32, h: f32, target: f32) -> (f32, f32) {
     if long <= 0.0 {
         return (w, h);
     }
-    let scale = target / long;
-    (w * scale, h * scale)
+    let target = target.round().clamp(1.0, u32::MAX as f32) as u32;
+    let Some(source_dims) = (PdfPageSizePoints {
+        width: w,
+        height: h,
+    })
+    .catalog_layout_dims() else {
+        let scale = target as f32 / long;
+        return (w * scale, h * scale);
+    };
+    let (width, height) = crate::fast_resize::aspect_accurate_fit_dimensions(
+        (target, target),
+        (target, target),
+        source_dims,
+    );
+    (width as f32, height as f32)
 }
 
 // -----------------------------------------------------------------------
@@ -2791,6 +2804,26 @@ mod tests {
             display_render_long_edge(window, 600.0, 900.0, false, vector_target()),
             1320
         );
+    }
+
+    #[test]
+    fn pdf_render_target_chooses_near_cap_dimensions_with_low_aspect_error() {
+        for (width, height, target) in [
+            (1643.0, 2375.0, 473.0),
+            (1024.0, 1536.0, 512.0),
+            (896.0, 1120.0, 512.0),
+        ] {
+            let (render_w, render_h) = fit_to_target(width, height, target);
+            let source_ratio = f64::from(width / height);
+            let render_ratio = f64::from(render_w / render_h);
+            let relative_error = ((render_ratio / source_ratio) - 1.0).abs();
+
+            assert!(render_w <= target && render_h <= target);
+            assert!(
+                relative_error <= 0.0005,
+                "{width}x{height} -> {render_w}x{render_h}: {relative_error:.6}"
+            );
+        }
     }
 
     #[test]

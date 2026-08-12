@@ -719,6 +719,15 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
 - `thumb_loader::resize_to_display_color_image` — 表示用サムネ (Lanczos3、品質重視)
 - `catalog::encode_thumb_webp` — キャッシュ用サムネ (Lanczos3、品質重視)
 
+表示用 / catalog 用サムネイルの整数寸法は `fast_resize::aspect_accurate_fit_dimensions` を
+共用する。長辺を上限へ固定して短辺を 1 回だけ丸めると、PDF のように raster ごとの丸めが
+異なるページで 0.1% 程度の縦横比誤差が残る。そこで width / height の両軸から整数候補を
+列挙し、元の縦横比に対する相対誤差 0.05% 以下を満たす最大解像度の候補を選ぶ。PDF page box
+や JPEG DCT 縮小のように decoded raster より正確な `source_dims` がある場合は、その比率を
+選択器へ渡す。PDFium の `fit_to_target` も page box を同じ選択器へ渡し、低解像度 raster を
+最初から選択済み整数寸法で描画する。上限を超える拡大はせず、既存 catalog 行も強制再生成
+しないため、この改善は新規生成分から適用する。
+
 新規リサイズ経路を増やすときは `image::DynamicImage::resize(_exact)` を直接呼ばず、
 `fast_resize::resize_dynamic_fit` / `resize_dynamic_exact` を使うこと。`image` crate の
 `resize` は UI スレッドに乗ったとき秒単位の応答なしを招きやすい。
@@ -1720,12 +1729,17 @@ resident final や rendition の有無でページごとに mode を反転させ
 片側だけ完成画像、もう片側だけ rendition という組み合わせを描かない。rendition がまだ無ければ
 未解決 unit として直前表示を保ち、後続 frame の rendition へ差し替える。
 
-通過 rendition の texture は低解像度でも、表示矩形は source/header 寸法
+通過 rendition の外側の**ページ矩形**は、低解像度 texture の整数寸法ではなく source/header 寸法
 (`ThumbnailState::Loaded::source_dims` を含む) から求める。PDF は thumbnail / fullscreen の
 各 raster 寸法が別々に整数丸めされるため、PDFium が読むページ box を 1/1000 point の固定小数点
-レイアウト寸法として catalog に保存し、通過 rendition と完成 texture の両方をその同じ縦横比へ
-配置する。これは注釈等が使う完成 raster の画素座標とは別の軸である。単一 / 見開きとも settle で
-位置・幅・高さ・縦横比を変えない。
+レイアウト寸法として catalog に保存し、通過 rendition と完成 texture のページ矩形を同じ位置・
+大きさに固定する。これは注釈等が使う完成 raster の画素座標とは別の軸である。
+
+ただし低解像度 raster 自体をそのページ矩形へ非等方に引き伸ばしてはならない。rendition の実描画
+矩形は texture 自身の縦横比を保つ contain fit とし、ページ矩形の中央へ置く。完成 texture だけは
+従来どおりページ矩形全体へ描く。整数丸め差に相当する最大数 pixel の余白は許容し、低解像度の
+中身を伸縮して settle 時に位置が動くことを避ける。単一 / 見開きとも同じ規則を使い、見開きの
+source 選択と差し替えは引き続き表示単位で原子的に行う。
 
 縦・横の連結読みは通過表示の対象外 (スクロールは実体化済みのページを見せるだけなので、
 キーごとの実体化コストが元から出ない)。
@@ -1748,7 +1762,10 @@ resident final や rendition の有無でページごとに mode を反転させ
 `fs/paint` は単一ページでは既存の `(idx, texture)` producer が rendition も記録し、見開きでは
 holdover を含む最終表示単位の解決後に同じ page list から記録する。`source=thumbnail` が通過
 rendition、`source=final_composite` が完成画像である。前表示単位と同じ `(idx, texture)` は重複して
-出さない。これにより `fs/paint` の表示ページ数と `fs/page_turn_ready` を直接照合できる。
+出さない。event の `x` / `y` / `w` / `h` は実際に texture を描いた矩形、`texture_w` /
+`texture_h` は回転後 texture 寸法、`scale_x` / `scale_y` はその描画倍率である。これにより
+`fs/paint` の表示ページ数と `fs/page_turn_ready` を直接照合でき、同じ idx の rendition → final で
+非等方伸縮が混入していないかもログから確認できる。
 
 開始時から境界で、1 回も display unit が変わらない hold は ready signature も変えないため、
 その押下に対応する `fs/page_turn_ready` を 1 件も出さない。

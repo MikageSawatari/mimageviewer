@@ -385,11 +385,13 @@ impl CacheDecision {
 pub fn resize_to_display_color_image(
     img: &image::DynamicImage,
     display_px: u32,
+    source_dims: Option<(u32, u32)>,
 ) -> egui::ColorImage {
-    let resized = crate::fast_resize::resize_dynamic_fit(
+    let resized = crate::fast_resize::resize_dynamic_fit_with_source_aspect(
         img,
         display_px,
         display_px,
+        source_dims.unwrap_or((img.width(), img.height())),
         crate::fast_resize::Quality::Lanczos3,
     );
     let rgba = resized.to_rgba8();
@@ -402,26 +404,27 @@ pub fn resize_to_display_color_image(
 pub fn decode_image_for_thumb(path: &std::path::Path, display_px: u32) -> Option<egui::ColorImage> {
     // JPEG なら TurboJPEG で DCT scale 付き高速デコードを試す。
     // この関数は cache 用 thumb_px を持たないので target = display_px を使う。
-    let turbo_img: Option<image::DynamicImage> = if is_jpeg_ext(path) {
-        match decode_jpeg_turbo_scaled_from_path(path, display_px) {
-            Ok((img, _stats)) => Some(img),
-            Err(DctDecodeError::TerminalRejection(msg)) => {
-                // adversarial JPEG — fallback すると danger なので None で諦める。
-                // この関数は cosmetic helper (動画 sidecar) なので致命的ではない。
-                crate::logger::log(format!(
-                    "decode_image_for_thumb: DCT terminal rejection {path:?}: {msg}"
-                ));
-                return None;
+    let (turbo_img, source_dims): (Option<image::DynamicImage>, Option<(u32, u32)>) =
+        if is_jpeg_ext(path) {
+            match decode_jpeg_turbo_scaled_from_path(path, display_px) {
+                Ok((img, stats)) => (Some(img), Some((stats.src_w, stats.src_h))),
+                Err(DctDecodeError::TerminalRejection(msg)) => {
+                    // adversarial JPEG — fallback すると danger なので None で諦める。
+                    // この関数は cosmetic helper (動画 sidecar) なので致命的ではない。
+                    crate::logger::log(format!(
+                        "decode_image_for_thumb: DCT terminal rejection {path:?}: {msg}"
+                    ));
+                    return None;
+                }
+                Err(DctDecodeError::Fallback(_)) => (None, None),
             }
-            Err(DctDecodeError::Fallback(_)) => None,
-        }
-    } else {
-        None
-    };
+        } else {
+            (None, None)
+        };
     let img = turbo_img
         .or_else(|| image::open(path).ok())
         .or_else(|| crate::wic_decoder::decode_to_dynamic_image(path))?;
-    Some(resize_to_display_color_image(&img, display_px))
+    Some(resize_to_display_color_image(&img, display_px, source_dims))
 }
 
 /// EXIF Orientation に基づいて画像を回転・反転する。
@@ -2841,7 +2844,7 @@ pub fn load_one_cached(
     //     WebP 量子化を経由しないため画質劣化なし、かつ WebP encode を待たない
     //     from_cache = false: 元画像由来の高画質 (段階 E アップグレード不要)
     let t_display = std::time::Instant::now();
-    let display_ci = resize_to_display_color_image(&img, display_px);
+    let display_ci = resize_to_display_color_image(&img, display_px, source_dims);
     let display_ci = match pinned_page_adjustment {
         Some(params) => crate::adjustment::apply_adjustments_fast(&display_ci, params),
         None => display_ci,
@@ -2894,7 +2897,12 @@ pub fn load_one_cached(
     if should_save {
         let cat = catalog.expect("should_save => catalog is Some");
         let t_enc = std::time::Instant::now();
-        match crate::catalog::encode_thumb_webp(&img, thumb_px, thumb_quality as f32) {
+        match crate::catalog::encode_thumb_webp_with_source_dims(
+            &img,
+            thumb_px,
+            thumb_quality as f32,
+            source_dims.unwrap_or((img.width(), img.height())),
+        ) {
             Some((webp_data, w, h)) => {
                 let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
                 if let Err(e) = cat.save(name, mtime, file_size, w, h, source_dims, &webp_data) {
@@ -3858,7 +3866,12 @@ pub fn encode_and_save_with_source_dims(
     thumb_quality: u8,
 ) -> Option<usize> {
     let source_dims = source_dims_override.or(Some((img.width(), img.height())));
-    let (webp_data, w, h) = crate::catalog::encode_thumb_webp(img, thumb_px, thumb_quality as f32)?;
+    let (webp_data, w, h) = crate::catalog::encode_thumb_webp_with_source_dims(
+        img,
+        thumb_px,
+        thumb_quality as f32,
+        source_dims.unwrap_or((img.width(), img.height())),
+    )?;
     catalog
         .save(key, mtime, file_size, w, h, source_dims, &webp_data)
         .ok()?;
