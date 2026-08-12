@@ -67,8 +67,8 @@
       <li><strong>同じ Tailscale ネットワークに参加している端末であること。</strong>
       mImageViewer 自体はインターネットに直接出ません。自宅 PC の中だけで待ち受け、外への公開は
       Tailscale に任せます。Tailscale に参加していない端末からは、URL を知っていても届きません。</li>
-      <li><strong>PIN を知っていること。</strong>接続すると 6 桁の PIN の入力を求められます。
-      何度も間違えると、しばらく受け付けなくなります。</li>
+      <li><strong>PIN を知っていること。</strong>接続すると、自宅 PC で決めた PIN の入力を
+      求められます。何度も間違えると、しばらく受け付けなくなります。</li>
     </ul>
     <p>
       このうち<strong>守りの中心は 1 つめ</strong>です。Tailscale ネットワークに入れる端末を
@@ -88,18 +88,54 @@
 
     <h2>準備する</h2>
     <p>
-      使い始めるまでに必要なものは 3 つです。
+      最初に <strong>Tailscale</strong> を、自宅 PC と外出先で使う端末の両方に入れて、
+      同じアカウントでサインインしてください。これで 2 台が同じネットワークに入ります。
+    </p>
+    <p>
+      あとは自宅 PC の mImageViewer で、メニューの
+      <strong>設定 → リモート接続…</strong>を開いて上から順に進めます。
+      このウィンドウでの操作はその場で反映されます。
     </p>
     <ol>
-      <li><strong>Tailscale：</strong>自宅 PC と、外出先で使う端末の両方に入れて、
-      同じアカウントでサインインします。これで 2 台が同じネットワークに入ります。</li>
-      <li><strong>PIN：</strong>6 文字以上で決めます。外出先から接続するときに入力します。
-      自宅 PC の画面は見られないので、覚えられるものにしてください。</li>
-      <li><strong>mImageViewer 側で有効にする：</strong>メニューの
-      <strong>設定 → リモート接続…</strong>を開き、
-      <strong>「この端末からリモート接続を利用する」</strong>にチェックを入れて
-      <strong>OK</strong> を押します。</li>
+      <li><strong>PIN を決める。</strong><strong>PIN: 未設定</strong>と表示されているときは
+      入力欄が開いています。6 文字以上で決めて<strong>「設定」</strong>を押してください。
+      外出先から接続するたびに入力するもので、そのとき自宅 PC の画面は見られないので、
+      覚えられるものにします。あとから<strong>「PIN を変更」</strong>で変えられます。</li>
+      <li><strong>有効にする。</strong><strong>「リモート接続を有効にする」</strong>を押します。
+      押した時点で待ち受けが始まります。しばらくすると接続先の URL と QR コードが
+      同じウィンドウに出ます。</li>
+      <li><strong>外から HTTPS で開けるようにする。</strong>
+      <strong>tailscale serve: 未設定</strong>と出ている場合は、実行する内容と
+      コマンドが表示されるので、<strong>「tailscale serve を設定する」</strong>を押してください。
+      mImageViewer が代わりに設定します。押すまでは何も変更しません。</li>
     </ol>
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <strong>PIN に使える文字。</strong>半角の英数字と記号が使えます。日本語や空白は使えません。
+        入力欄は伏字になるため、正しく入力できたかを目で確かめられない文字を
+        使えないようにしています。
+      </div>
+    </div>
+    <p>
+      すでに <strong>tailscale serve</strong> で別のものを公開している場合は、
+      置き換わることが表示されます。押す前に内容を確認してください。
+      解除したいときは Tailscale 側で行います。
+    </p>
+
+    <h3>Tailscale 側の設定が足りないとき</h3>
+    <p>
+      次の 2 つは Tailscale の管理画面での設定です。mImageViewer からは変更できないので、
+      足りない場合はウィンドウに案内が出ます。
+    </p>
+    <ul>
+      <li><strong>HTTPS の証明書が有効になっていない。</strong>この状態では
+      <strong>「tailscale serve を設定する」</strong>を押せません。管理画面で先に有効にしてください。</li>
+      <li><strong>接続キーの有効期限が近い、または切れている。</strong>期限が切れると
+      その PC が Tailscale ネットワークから外れ、<strong>外出先から接続できなくなります</strong>。
+      気付くのはたいてい外出先なので、期限が表示されているうちに、管理画面で期限をなくしておくと
+      安心です。</li>
+    </ul>
 
     <div class="box info">
       <span class="box-icon">ℹ️</span>
@@ -121,9 +157,8 @@
 
     <h2>接続する</h2>
     <p>
-      有効にすると、<strong>設定 → リモート接続…</strong>のウィンドウに接続先の URL と
-      QR コードが表示されます。手元の端末で QR コードを読み取るか、URL を開いてください。
-      PIN を入力すると一覧が表示されます。
+      <strong>設定 → リモート接続…</strong>のウィンドウに出ている QR コードを手元の端末で
+      読み取るか、同じウィンドウの URL を開いてください。PIN を入力すると一覧が表示されます。
     </p>
     <div class="box info">
       <span class="box-icon">ℹ️</span>
@@ -203,8 +238,8 @@
     </p>
     <p>
       機能そのものを止めたいときは、<strong>設定 → リモート接続…</strong>で
-      <strong>「この端末からリモート接続を利用する」</strong>のチェックを外して <strong>OK</strong> を
-      押します。以降は待ち受けを行わないので、PIN を知っていても接続できなくなります。
+      <strong>「リモート接続を無効にする」</strong>を押します。押した時点で待ち受けをやめるので、
+      以降は PIN を知っていても接続できなくなります。
     </p>
 
     <h2>ノート PC から見たいとき</h2>
