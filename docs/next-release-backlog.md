@@ -1017,7 +1017,26 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   - 音声モード / detached / タイル表示 / キャプチャ / サムネ生成のどこまで回すか。
     **キャプチャした静止画の向き**も揃える必要がある。
 - 縦長動画は**スマートフォン撮影で普通に発生する** (センサーは横向きで記録し、
-  回転タグで向きを表す)。手元に無ければ、スマホで縦持ち撮影した MP4 を 1 本用意すれば足りる。
+  回転タグで向きを表す)。
+- **テスト素材は既にリポジトリにある (2026-08-13 に tkhd の matrix を直接読んで確認)**:
+  - `testimage/iphone/IMG_1197.MOV` — rotate=90、格納 1280×720 → 表示は 720×1280
+  - `testimage/iphone/PIR-206_3.MOV` — rotate=90、格納 640×480 → 表示は 480×640
+  - 同フォルダの他の MP4/MOV と `testimage/movie/*.mp4` は rotate=0 なので、
+    **回転 0 の回帰確認**に使える。
+- **難易度は見た目より低い (2026-08-13 の調査)**。SAR と同じ座席に座らせられる。
+  - `update_video_visual_transform` は既に **`Matrix3x2` + `SetTransform2`** で DComp へ渡して
+    おり、**M12 / M21 を 0.0 で埋めているだけ** ([render_core.rs:3406](../src/video/native_presenter/render_core.rs:3406))。
+    回転は**既にある枠の 2 フィールドを埋める**話で、シェーダも swap chain 変更も要らない。
+  - 刻みを決める純関数 `compute_video_visual_transform()` (unit test 6 件) が既にあり、
+    SAR は「display_w = surface_w × sar」でここに入っている。回転 90/270 のときに
+    表示寸法を転置し、戻り値を 2x2 へ広げる。**回転 0 で現在と完全一致することをテストで固定する。**
+  - `ffmpeg-the-third` 3.0.2 は `Stream::side_data()` / `Frame::side_data()` と
+    `Type::DisplayMatrix` を公開済み。`av_display_rotation_get` 相当 (行列の
+    `atan2(m[1], m[0])`、16.16 固定小数) は 15 行程度で自前実装できる。**新しい依存は不要。**
+  - デコードや swap chain には触らない (SAR と同じく DComp 側で 1 度だけ回る)。
+- **⚠ 二重回転の罠**: サムネイルは Windows Shell API が作っており**既に回転済み**。
+  サムネ経路・タイル一覧のサムネへ回転を適用してはいけない。回転を足すのは
+  「再生の表示」と、必要なら「キャプチャした静止画」だけ。
 - **libmpv 置き換えは採らない** (同メールの提案)。理由: ①mIV の再生は native presenter /
   D3D11 共有サーフェス / VST3 チェーン / トレイ常駐と密結合で、エンジン差し替えは
   再生機能の作り直しに等しい ②libmpv は既定 LGPL だが構成次第で GPL 汚染する
