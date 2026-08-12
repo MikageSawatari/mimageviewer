@@ -38,6 +38,7 @@ use windows_numerics::Matrix3x2;
 use crate::settings::FsSidePanelMode;
 use crate::ui_helpers::HoverTipExt;
 use crate::video::decoder::{VideoFrame, VideoFrameData};
+use crate::video::display_metadata::VideoOrientation;
 pub(crate) use crate::video::native_cursor::cursor_move_is_activity;
 use crate::video::native_window_health::NativeRenderOperation;
 use crate::video::native_window_host::{
@@ -194,9 +195,10 @@ pub struct NativeRenderCore {
     /// Sample aspect ratio (= pixel aspect ratio)。1/1 = 正方ピクセル (= 従来挙動)。
     /// アナモフィック動画 (NTSC DVD 等で SAR=97/80 など) で `update_video_visual_transform`
     /// の M11/M22 を anisotropic にして表示比を補正する。decoder の VideoInfo 経由で
-    /// `set_video_sar(num, den)` で設定される。
+    /// `set_video_geometry(num, den, orientation)` で設定される。
     sar_num: u32,
     sar_den: u32,
+    orientation: VideoOrientation,
     width: u32,
     height: u32,
     surface_width: u32,
@@ -1944,6 +1946,7 @@ impl NativeRenderCore {
                 video_compact: false,
                 sar_num: 1,
                 sar_den: 1,
+                orientation: VideoOrientation::IDENTITY,
                 width: config.width,
                 height: config.height,
                 surface_width: config.width,
@@ -2051,20 +2054,31 @@ impl NativeRenderCore {
         Ok(())
     }
 
-    pub fn set_video_sar(&mut self, num: u32, den: u32) -> Result<(), String> {
+    pub fn set_video_geometry(
+        &mut self,
+        num: u32,
+        den: u32,
+        orientation: VideoOrientation,
+    ) -> Result<(), String> {
         let num = num.max(1);
         let den = den.max(1);
-        if self.sar_num == num && self.sar_den == den {
+        if self.sar_num == num && self.sar_den == den && self.orientation == orientation {
             return Ok(());
         }
         self.sar_num = num;
         self.sar_den = den;
+        self.orientation = orientation;
         self.update_video_visual_transform(self.width, self.height)?;
         log_event(
-            "video_sar",
+            "video_geometry",
             &[
                 ("sar_num", Value::from(self.sar_num as i64)),
                 ("sar_den", Value::from(self.sar_den as i64)),
+                (
+                    "rotation_degrees",
+                    Value::from(self.orientation.rotation_degrees() as i64),
+                ),
+                ("reflected", Value::from(self.orientation.is_reflected())),
             ],
         );
         Ok(())
@@ -2079,6 +2093,7 @@ impl NativeRenderCore {
         let new_h = frame.height.max(1);
         let new_sar_num = frame.sar_num.max(1);
         let new_sar_den = frame.sar_den.max(1);
+        let new_orientation = frame.orientation;
         let size_changed = self.surface_width != new_w || self.surface_height != new_h;
 
         if size_changed {
@@ -2090,34 +2105,45 @@ impl NativeRenderCore {
                 new_h,
                 new_sar_num,
                 new_sar_den,
+                new_orientation,
             )
         } else {
             // 解像度は不変。既存 swap chain をそのまま再利用する。
-            self.present_reusing_surface(frame, sync_interval, new_sar_num, new_sar_den)
+            self.present_reusing_surface(
+                frame,
+                sync_interval,
+                new_sar_num,
+                new_sar_den,
+                new_orientation,
+            )
         }
     }
 
     /// 解像度不変時の present。既存の `swap_chain` / `backbuffer` をそのまま使う。
-    /// SAR だけ変わった場合は transform を再計算する (swap chain content は正しいので
-    /// 中間状態は生じない)。
+    /// SAR / orientation だけ変わった場合は transform を再計算する
+    /// (swap chain content は正しいので中間状態は生じない)。
     fn present_reusing_surface(
         &mut self,
         frame: &VideoFrame,
         sync_interval: u32,
         new_sar_num: u32,
         new_sar_den: u32,
+        new_orientation: VideoOrientation,
     ) -> Result<NativePresentOutcome, String> {
         let wait_t0 = Instant::now();
         let wait_result = unsafe { WaitForSingleObject(self.waitable, 100) };
         let wait_ms = wait_t0.elapsed().as_secs_f64() * 1000.0;
         let timed_out = wait_result == WAIT_TIMEOUT;
 
-        let sar_changed = self.sar_num != new_sar_num || self.sar_den != new_sar_den;
-        if sar_changed {
-            // SAR だけ変わった (= 同一解像度で SAR 違いの動画へ切替)。swap chain の
+        let geometry_changed = self.sar_num != new_sar_num
+            || self.sar_den != new_sar_den
+            || self.orientation != new_orientation;
+        if geometry_changed {
+            // 表示メタデータだけ変わった (= 同一解像度の動画へ切替)。swap chain の
             // サイズは正しいので transform を作り直すだけでよい。
             self.sar_num = new_sar_num;
             self.sar_den = new_sar_den;
+            self.orientation = new_orientation;
             self.update_video_visual_transform(self.width, self.height)?;
         }
 
@@ -2150,7 +2176,7 @@ impl NativeRenderCore {
             copy_fence_value: copy.copy_fence_value,
             surface_width: self.surface_width,
             surface_height: self.surface_height,
-            geometry_changed: sar_changed,
+            geometry_changed,
             surface_swapped: false,
             commit_sync_ms: 0.0,
             wait_ms,
@@ -2184,6 +2210,7 @@ impl NativeRenderCore {
         new_h: u32,
         new_sar_num: u32,
         new_sar_den: u32,
+        new_orientation: VideoOrientation,
     ) -> Result<NativePresentOutcome, String> {
         let geom_t0 = Instant::now();
         // 1. 新 swap chain + backbuffer を用意する。ここでは visual には繋がない。
@@ -2233,19 +2260,20 @@ impl NativeRenderCore {
         //    「`surface_*` だけ新サイズに進み swap_chain は旧のまま」という不整合に陥り、
         //    次回以降の `present` が `present_reusing_surface` 経路へ誤って入って固着する
         //    (Codex P2)。`self.*` の更新は Commit 成功後 (手順 6) に一括で行う。
-        let (m11, m22, offset_x, offset_y) = compute_video_visual_transform(
+        let (m11, m12, m21, m22, offset_x, offset_y) = compute_video_visual_transform(
             new_w,
             new_h,
             self.width,
             self.height,
             new_sar_num,
             new_sar_den,
+            new_orientation,
             self.video_compact,
         );
         let transform = Matrix3x2 {
             M11: m11,
-            M12: 0.0,
-            M21: 0.0,
+            M12: m12,
+            M21: m21,
             M22: m22,
             M31: offset_x,
             M32: offset_y,
@@ -2272,6 +2300,7 @@ impl NativeRenderCore {
         // 6. Commit 成功。ここで初めて `self.*` を新 surface へ確定する (一括更新)。
         self.sar_num = new_sar_num;
         self.sar_den = new_sar_den;
+        self.orientation = new_orientation;
         self.surface_width = new_w;
         self.surface_height = new_h;
         let old_swap_chain = std::mem::replace(&mut self.swap_chain, new_swap_chain);
@@ -2292,8 +2321,8 @@ impl NativeRenderCore {
         let geom_ms = geom_t0.elapsed().as_secs_f64() * 1000.0;
         crate::logger::log(format!(
             "native-presenter: video surface swapped to {new_w}x{new_h} sar={}/{} \
-             geom_ms={geom_ms:.2} commit_sync_ms={commit_sync_ms:.2}",
-            self.sar_num, self.sar_den
+             orientation={:?} geom_ms={geom_ms:.2} commit_sync_ms={commit_sync_ms:.2}",
+            self.sar_num, self.sar_den, self.orientation
         ));
         log_event(
             "video_surface_swap",
@@ -2302,6 +2331,11 @@ impl NativeRenderCore {
                 ("surface_height", Value::from(new_h as i64)),
                 ("sar_num", Value::from(self.sar_num as i64)),
                 ("sar_den", Value::from(self.sar_den as i64)),
+                (
+                    "rotation_degrees",
+                    Value::from(self.orientation.rotation_degrees() as i64),
+                ),
+                ("reflected", Value::from(self.orientation.is_reflected())),
                 ("geom_ms", Value::from(geom_ms)),
                 ("commit_sync_ms", Value::from(commit_sync_ms)),
                 (
@@ -3394,19 +3428,20 @@ impl NativeRenderCore {
     /// 前の値)。stale なサイズで transform を計算すると最大化/復元/ドラッグの追従が
     /// 1 ステップ遅れる (2026-05 修正)。
     fn update_video_visual_transform(&self, win_w: u32, win_h: u32) -> Result<(), String> {
-        let (m11, m22, offset_x, offset_y) = compute_video_visual_transform(
+        let (m11, m12, m21, m22, offset_x, offset_y) = compute_video_visual_transform(
             self.surface_width,
             self.surface_height,
             win_w,
             win_h,
             self.sar_num,
             self.sar_den,
+            self.orientation,
             self.video_compact,
         );
         let transform = Matrix3x2 {
             M11: m11,
-            M12: 0.0,
-            M21: 0.0,
+            M12: m12,
+            M21: m21,
             M22: m22,
             M31: offset_x,
             M32: offset_y,
@@ -8501,16 +8536,14 @@ fn log_event(kind: &str, fields: &[(&str, Value)]) {
     crate::perf::event("native_presenter", kind, None, 0, fields);
 }
 
-/// 動画 visual の DirectComposition transform 行列を SAR 込みで計算する。
+/// 動画 visual の DirectComposition transform 行列を SAR + display matrix 込みで計算する。
 ///
 /// `surface_w/h` は decoded frame の raw pixel サイズ (= swap chain backbuffer)。
-/// `win_w/h` はウィンドウサイズ。`sar_num/sar_den` は sample aspect ratio
-/// (= pixel aspect ratio)、1/1 で従来の isotropic 表示。`compact` は VST3 panel 表示時の
-/// 1/4 領域モード。
+/// `win_w/h` はウィンドウサイズ。SAR は raw X 軸へ、orientation はその後の表示軸へ
+/// 適用する。`compact` は VST3 panel 表示時の 1/4 領域モード。
 ///
-/// 戻り値は `(M11, M22, M31, M32)`。`M12 = M21 = 0` (= 回転 / shear なし)。
-/// SAR != 1:1 の場合は M11 != M22 の anisotropic scale になる
-/// (= 横方向だけ伸ばして表示比を補正する、SAR>1 の anamorphic 動画)。
+/// 戻り値は `(M11, M12, M21, M22, M31, M32)`。orientation=0 では旧 SAR 実装と
+/// 完全に同じ値を返す。90/270 度では fit 対象の表示幅・高さを転置する。
 fn compute_video_visual_transform(
     surface_w: u32,
     surface_h: u32,
@@ -8518,16 +8551,23 @@ fn compute_video_visual_transform(
     win_h: u32,
     sar_num: u32,
     sar_den: u32,
+    orientation: VideoOrientation,
     compact: bool,
-) -> (f32, f32, f32, f32) {
+) -> (f32, f32, f32, f32, f32, f32) {
     let surface_w = surface_w.max(1) as f32;
     let surface_h = surface_h.max(1) as f32;
     let win_w = win_w.max(1) as f32;
     let win_h = win_h.max(1) as f32;
     let sar = (sar_num.max(1) as f32) / (sar_den.max(1) as f32);
-    // 表示寸法 = raw pixel × SAR (横だけ)。SAR>1 で widen、SAR<1 で narrow。
-    let display_w = surface_w * sar;
-    let display_h = surface_h;
+    let corrected_w = surface_w * sar;
+    let corrected_h = surface_h;
+    let (o11, o12, o21, o22) = orientation.matrix_2x2();
+    let o11 = f32::from(o11);
+    let o12 = f32::from(o12);
+    let o21 = f32::from(o21);
+    let o22 = f32::from(o22);
+    let display_w = o11.abs() * corrected_w + o21.abs() * corrected_h;
+    let display_h = o12.abs() * corrected_w + o22.abs() * corrected_h;
     let (target_x, target_y, target_w, target_h) = if compact {
         (win_w * 0.5, 0.0, win_w * 0.5, win_h * 0.5)
     } else {
@@ -8535,13 +8575,23 @@ fn compute_video_visual_transform(
     };
     // `display_w × display_h` を `target_w × target_h` に letterbox fit する scale。
     let scale = (target_w / display_w).min(target_h / display_h);
-    // M11 は raw surface 幅から最終表示幅への係数なので、scale × sar が掛かる。
-    // M22 は高さなので scale だけ。SAR=1:1 なら M11 == M22 で従来挙動と同一。
-    let m11 = scale * sar;
-    let m22 = scale;
-    let offset_x = target_x + (target_w - display_w * scale) * 0.5;
-    let offset_y = target_y + (target_h - display_h * scale) * 0.5;
-    (m11, m22, offset_x, offset_y)
+    // SAR は raw X 軸にだけ掛け、その後に orientation を合成する。
+    let m11 = scale * sar * o11;
+    let m12 = scale * sar * o12;
+    let m21 = scale * o21;
+    let m22 = scale * o22;
+
+    // 回転・反転後の bounding box を target 内で中央寄せする。負方向へ伸びる
+    // quarter-turn/反転はここで原点へ戻す。
+    let x_w = surface_w * m11;
+    let x_h = surface_h * m21;
+    let y_w = surface_w * m12;
+    let y_h = surface_h * m22;
+    let min_x = 0.0_f32.min(x_w).min(x_h).min(x_w + x_h);
+    let min_y = 0.0_f32.min(y_w).min(y_h).min(y_w + y_h);
+    let offset_x = target_x + (target_w - display_w * scale) * 0.5 - min_x;
+    let offset_y = target_y + (target_h - display_h * scale) * 0.5 - min_y;
+    (m11, m12, m21, m22, offset_x, offset_y)
 }
 
 fn copy_cpu_rgba_to_swapchain_bgra(
@@ -8668,8 +8718,8 @@ mod tests {
     use super::{
         NativeEguiOverlay, NativeJumpPanelVisibilityInputs, NativeOverlayInputRouting,
         NativePixelSample, NativeRightPanelVisibilityInputs, NativeTouchPanelHandleInputs,
-        compare_pixel_probe, compute_video_visual_transform, configure_overlay_style,
-        copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity,
+        VideoOrientation, compare_pixel_probe, compute_video_visual_transform,
+        configure_overlay_style, copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity,
         effective_overlay_pixels_per_point, egui_key_from_virtual_key, metadata_clean_text,
         native_jump_panel_visible_from_inputs, native_panel_callout_hud_rects,
         native_right_panel_visible_from_inputs, native_touch_owned_panel_sides,
@@ -9389,8 +9439,17 @@ mod tests {
     /// 1:1 SAR では従来の isotropic transform と一致 (regression-safe を保証)。
     #[test]
     fn compute_video_visual_transform_sar_1_1_is_isotropic() {
-        let (m11, m22, ox, oy) =
-            compute_video_visual_transform(1920, 1080, 3840, 2160, 1, 1, false);
+        let (m11, m12, m21, m22, ox, oy) = compute_video_visual_transform(
+            1920,
+            1080,
+            3840,
+            2160,
+            1,
+            1,
+            VideoOrientation::IDENTITY,
+            false,
+        );
+        assert_eq!((m12, m21), (0.0, 0.0));
         assert!(
             (m11 - m22).abs() < 1e-6,
             "M11 ({m11}) should equal M22 ({m22})"
@@ -9400,13 +9459,93 @@ mod tests {
         assert!(oy.abs() < 1e-3, "centered vertically");
     }
 
+    /// orientation=0 は回転対応前の SAR transform と完全に同じ値を返す。
+    #[test]
+    fn compute_video_visual_transform_rotation_zero_preserves_legacy_values() {
+        assert_eq!(
+            compute_video_visual_transform(
+                640,
+                480,
+                1920,
+                1080,
+                1,
+                1,
+                VideoOrientation::IDENTITY,
+                false,
+            ),
+            (2.25, 0.0, 0.0, 2.25, 240.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn compute_video_visual_transform_quarter_turns_transpose_fit() {
+        let turn_90 = compute_video_visual_transform(
+            1280,
+            720,
+            1920,
+            1080,
+            1,
+            1,
+            VideoOrientation::new(90, false),
+            false,
+        );
+        assert_eq!(turn_90, (0.0, 0.84375, -0.84375, 0.0, 1263.75, 0.0));
+
+        let turn_180 = compute_video_visual_transform(
+            1280,
+            720,
+            1920,
+            1080,
+            1,
+            1,
+            VideoOrientation::new(180, false),
+            false,
+        );
+        assert_eq!(turn_180, (-1.5, 0.0, 0.0, -1.5, 1920.0, 1080.0));
+
+        let turn_270 = compute_video_visual_transform(
+            1280,
+            720,
+            1920,
+            1080,
+            1,
+            1,
+            VideoOrientation::new(270, false),
+            false,
+        );
+        assert_eq!(turn_270, (0.0, -0.84375, 0.84375, 0.0, 656.25, 1080.0));
+    }
+
+    #[test]
+    fn compute_video_visual_transform_preserves_reflection() {
+        let reflected = compute_video_visual_transform(
+            640,
+            480,
+            1920,
+            1080,
+            1,
+            1,
+            VideoOrientation::new(180, true),
+            false,
+        );
+        assert_eq!(reflected, (-2.25, 0.0, 0.0, 2.25, 1680.0, 0.0));
+    }
+
     /// SAR 97/80 (= 1.2125、本件動画) で 720x480 を 1920x1080 に letterbox fit。
     /// 表示寸法 = 720*1.2125 × 480 = 873x480、aspect 1.819:1 なので window 16:9 に
     /// 横いっぱい (1920 幅) 入るはず。M11/M22 比は SAR と一致する。
     #[test]
     fn compute_video_visual_transform_anamorphic_97_80() {
-        let (m11, m22, ox, oy) =
-            compute_video_visual_transform(720, 480, 1920, 1080, 97, 80, false);
+        let (m11, _, _, m22, ox, oy) = compute_video_visual_transform(
+            720,
+            480,
+            1920,
+            1080,
+            97,
+            80,
+            VideoOrientation::IDENTITY,
+            false,
+        );
         let ratio = m11 / m22;
         assert!(
             (ratio - 1.2125).abs() < 1e-4,
@@ -9424,19 +9563,55 @@ mod tests {
     /// SAR 0/0 (未指定)・0/1・1/0 はすべて 1:1 として扱う (= max(1) で正規化)。
     #[test]
     fn compute_video_visual_transform_zero_sar_normalizes_to_one() {
-        let baseline = compute_video_visual_transform(720, 480, 1920, 1080, 1, 1, false);
+        let baseline = compute_video_visual_transform(
+            720,
+            480,
+            1920,
+            1080,
+            1,
+            1,
+            VideoOrientation::IDENTITY,
+            false,
+        );
         assert_eq!(
-            compute_video_visual_transform(720, 480, 1920, 1080, 0, 0, false),
+            compute_video_visual_transform(
+                720,
+                480,
+                1920,
+                1080,
+                0,
+                0,
+                VideoOrientation::IDENTITY,
+                false,
+            ),
             baseline,
             "0/0 must equal 1/1"
         );
         assert_eq!(
-            compute_video_visual_transform(720, 480, 1920, 1080, 0, 1, false),
+            compute_video_visual_transform(
+                720,
+                480,
+                1920,
+                1080,
+                0,
+                1,
+                VideoOrientation::IDENTITY,
+                false,
+            ),
             baseline,
             "0/1 must equal 1/1"
         );
         assert_eq!(
-            compute_video_visual_transform(720, 480, 1920, 1080, 1, 0, false),
+            compute_video_visual_transform(
+                720,
+                480,
+                1920,
+                1080,
+                1,
+                0,
+                VideoOrientation::IDENTITY,
+                false,
+            ),
             baseline,
             "1/0 must equal 1/1"
         );
@@ -9445,8 +9620,16 @@ mod tests {
     /// SAR < 1 (縦アナモフィック、稀) でも letterbox が成立する。
     #[test]
     fn compute_video_visual_transform_vertical_anamorphic() {
-        let (m11, m22, _ox, _oy) =
-            compute_video_visual_transform(960, 540, 1920, 1080, 1, 2, false);
+        let (m11, _, _, m22, _ox, _oy) = compute_video_visual_transform(
+            960,
+            540,
+            1920,
+            1080,
+            1,
+            2,
+            VideoOrientation::IDENTITY,
+            false,
+        );
         // SAR=0.5 → display_w=480, display_h=540, ratio M11/M22 = 0.5
         let ratio = m11 / m22;
         assert!((ratio - 0.5).abs() < 1e-4);
@@ -9455,10 +9638,26 @@ mod tests {
     /// Compact mode (VST3 panel 表示時の 1/4 領域) でも SAR 補正が正しく適用される。
     #[test]
     fn compute_video_visual_transform_compact_mode_respects_sar() {
-        let (m11_normal, m22_normal, _, _) =
-            compute_video_visual_transform(720, 480, 1920, 1080, 97, 80, false);
-        let (m11_compact, m22_compact, ox, oy) =
-            compute_video_visual_transform(720, 480, 1920, 1080, 97, 80, true);
+        let (m11_normal, _, _, m22_normal, _, _) = compute_video_visual_transform(
+            720,
+            480,
+            1920,
+            1080,
+            97,
+            80,
+            VideoOrientation::IDENTITY,
+            false,
+        );
+        let (m11_compact, _, _, m22_compact, ox, oy) = compute_video_visual_transform(
+            720,
+            480,
+            1920,
+            1080,
+            97,
+            80,
+            VideoOrientation::IDENTITY,
+            true,
+        );
         // compact = 1/4 領域なので scale も半分。M11/M22 比は SAR で同じ。
         let ratio_normal = m11_normal / m22_normal;
         let ratio_compact = m11_compact / m22_compact;
@@ -9473,9 +9672,21 @@ mod tests {
     #[test]
     fn compute_video_visual_transform_handles_zero_dims() {
         // surface 0/0 → max(1) 正規化、計算が NaN/inf にならず数値で返ること
-        let (m11, m22, ox, oy) = compute_video_visual_transform(0, 0, 1920, 1080, 1, 1, false);
+        let (m11, m12, m21, m22, ox, oy) = compute_video_visual_transform(
+            0,
+            0,
+            1920,
+            1080,
+            1,
+            1,
+            VideoOrientation::IDENTITY,
+            false,
+        );
+        assert!(m12.is_finite() && m21.is_finite());
         assert!(m11.is_finite() && m22.is_finite() && ox.is_finite() && oy.is_finite());
-        let (m11, m22, ox, oy) = compute_video_visual_transform(720, 480, 0, 0, 1, 1, false);
+        let (m11, m12, m21, m22, ox, oy) =
+            compute_video_visual_transform(720, 480, 0, 0, 1, 1, VideoOrientation::IDENTITY, false);
+        assert!(m12.is_finite() && m21.is_finite());
         assert!(m11.is_finite() && m22.is_finite() && ox.is_finite() && oy.is_finite());
     }
 

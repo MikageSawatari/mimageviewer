@@ -37,6 +37,7 @@ pub fn capture_frame(path: &Path, target_secs: f64) -> Result<CapturedVideoFrame
     let time_base = video_stream.time_base();
     let tb_num = time_base.numerator() as f64;
     let tb_den = time_base.denominator() as f64;
+    let orientation = crate::video::display_metadata::orientation_from_stream(&video_stream);
     let timestamp_epsilon_secs = timestamp_epsilon_secs(tb_num, tb_den);
     let params = video_stream.parameters();
 
@@ -166,11 +167,14 @@ pub fn capture_frame(path: &Path, target_secs: f64) -> Result<CapturedVideoFrame
         out
     };
 
+    let (width, height, rgba) =
+        crate::video::display_metadata::orient_rgba(src_w, src_h, &buf, orientation)?;
+
     Ok(CapturedVideoFrame {
         target_secs: decoded_pts_secs,
-        width: src_w,
-        height: src_h,
-        rgba: buf,
+        width,
+        height,
+        rgba,
     })
 }
 

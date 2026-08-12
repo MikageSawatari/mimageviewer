@@ -6243,7 +6243,15 @@ fn fs_cache_entry_page_dims(entry: &FsCacheEntry) -> Option<(u32, u32)> {
         FsCacheEntry::Animated { frames, .. } => {
             frames.first().and_then(|(tex, _)| from_usize(tex.size()))
         }
-        FsCacheEntry::Video { player, .. } => player.info().map(|info| (info.width, info.height)),
+        FsCacheEntry::Video { player, .. } => player.info().map(|info| {
+            crate::video::display_metadata::display_pixel_dimensions(
+                info.width,
+                info.height,
+                info.sar_num,
+                info.sar_den,
+                info.orientation,
+            )
+        }),
         FsCacheEntry::Failed => None,
     }
 }

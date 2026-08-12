@@ -111,8 +111,15 @@ impl App {
         // anamorphic 動画 (NTSC DVD 等) では encoded `width/height` (= 1.5:1) と
         // 表示比 (= 1.819:1 など) が異なるため、SAR を掛けないとタイルセル比が
         // ずれてサムネが letterbox 表示される。
-        let aspect = if info.height > 0 && info.sar_den > 0 {
-            (info.width as f64 * info.sar_num as f64) / (info.height as f64 * info.sar_den as f64)
+        let aspect = if info.width > 0 && info.height > 0 {
+            let (display_w, display_h) = crate::video::display_metadata::display_dimensions(
+                info.width,
+                info.height,
+                info.sar_num,
+                info.sar_den,
+                info.orientation,
+            );
+            display_w / display_h
         } else {
             16.0 / 9.0
         };

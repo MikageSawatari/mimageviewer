@@ -31,6 +31,7 @@ pub mod audio_stretch;
 pub mod avio_progress;
 pub mod clock;
 pub mod decoder;
+pub mod display_metadata;
 #[cfg(windows)]
 pub mod dsp;
 pub mod engine;
@@ -768,9 +769,10 @@ enum NativeVideoOutputCommand {
     SetVideoCompact {
         compact: bool,
     },
-    SetVideoSar {
+    SetVideoGeometry {
         num: u32,
         den: u32,
+        orientation: display_metadata::VideoOrientation,
     },
     SetVst3Panel {
         panel: Option<native_presenter::NativeOverlayVst3Panel>,
@@ -1002,7 +1004,7 @@ fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usiz
         NativeVideoOutputCommand::SetTextContrast { .. } => Some(12),
         NativeVideoOutputCommand::SetChecked { .. } => Some(13),
         NativeVideoOutputCommand::SetVideoCompact { .. } => Some(14),
-        NativeVideoOutputCommand::SetVideoSar { .. } => Some(15),
+        NativeVideoOutputCommand::SetVideoGeometry { .. } => Some(15),
         NativeVideoOutputCommand::SetVst3Panel { .. } => Some(16),
         NativeVideoOutputCommand::SetPlaybackStatus { .. } => Some(17),
         NativeVideoOutputCommand::SetTileOverlay { .. } => Some(18),
@@ -1592,10 +1594,19 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::SetVideoCompact { compact });
     }
 
-    fn set_video_sar(&self, num: u32, den: u32) {
+    fn set_video_geometry(
+        &self,
+        num: u32,
+        den: u32,
+        orientation: display_metadata::VideoOrientation,
+    ) {
         let _ = self
             .command_tx
-            .send(NativeVideoOutputCommand::SetVideoSar { num, den });
+            .send(NativeVideoOutputCommand::SetVideoGeometry {
+                num,
+                den,
+                orientation,
+            });
     }
 
     fn set_vst3_panel(&self, panel: Option<native_presenter::NativeOverlayVst3Panel>) {
@@ -2701,8 +2712,8 @@ fn run_native_video_output(
     //     (`SetChecked` / `SetVst3Available` / `SetTextContrast` は `NativeVideoOutput` 側で
     //     dedup されるため、再構築後の新 presenter には command が来ない可能性がある
     //     → ここから直接再適用する)。
-    //   - `cur_sar`: anamorphic 補正の SAR。`SetVideoSar` は info 到着時に 1 度だけ
-    //     送られるので、再構築後は新 presenter へ手動で再適用する必要がある。
+    //   - `cur_video_geometry`: SAR + display matrix。info 到着時に 1 度だけ送られるので、
+    //     再構築後は新 presenter へ手動で再適用する必要がある。
     let mut cur_placement = config.placement;
     let mut cur_owner_hwnd = config.owner_hwnd;
     let mut cur_checked = config.checked;
@@ -2710,7 +2721,7 @@ fn run_native_video_output(
     let mut cur_text_contrast = config.text_contrast;
     let cur_ui_scale = crate::settings::normalize_ui_scale_factor(config.ui_scale);
     let mut cur_hud_dimmed = false;
-    let mut cur_sar: Option<(u32, u32)> = None;
+    let mut cur_video_geometry: Option<(u32, u32, display_metadata::VideoOrientation)> = None;
     // **review #12 対応**: SwitchPlacement で presenter を作り直したとき再適用が
     // 漏れていた現行値。App 側は loop / continuous / compact を「ユーザー操作時のみ
     // push」するため、これらを presenter 側で覚えておかないと SwitchPlacement 後の
@@ -3130,11 +3141,15 @@ fn run_native_video_output(
                         ));
                     }
                 }
-                NativeVideoOutputCommand::SetVideoSar { num, den } => {
-                    cur_sar = Some((num, den));
-                    if let Err(err) = presenter.set_video_sar(num, den) {
+                NativeVideoOutputCommand::SetVideoGeometry {
+                    num,
+                    den,
+                    orientation,
+                } => {
+                    cur_video_geometry = Some((num, den, orientation));
+                    if let Err(err) = presenter.set_video_geometry(num, den, orientation) {
                         crate::logger::log(format!(
-                            "[native-video] set sar transform failed: {err}"
+                            "[native-video] set display geometry failed: {err}"
                         ));
                     }
                 }
@@ -3518,8 +3533,8 @@ fn run_native_video_output(
                         new_presenter.set_overlay_checked(cur_checked);
                         new_presenter
                             .set_overlay_fallback_file_name(cur_fallback_file_name.clone());
-                        if let Some((num, den)) = cur_sar {
-                            new_presenter.set_video_sar(num, den)?;
+                        if let Some((num, den, orientation)) = cur_video_geometry {
+                            new_presenter.set_video_geometry(num, den, orientation)?;
                         }
                         if let Some(enabled) = cur_loop_enabled {
                             new_presenter.set_overlay_loop_enabled(enabled);
@@ -6603,9 +6618,14 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
-    pub fn set_native_video_sar(&self, num: u32, den: u32) {
+    pub fn set_native_video_geometry(
+        &self,
+        num: u32,
+        den: u32,
+        orientation: display_metadata::VideoOrientation,
+    ) {
         if let Some(output) = self.native_output.as_ref() {
-            output.set_video_sar(num, den);
+            output.set_video_geometry(num, den, orientation);
         }
     }
 
@@ -6707,7 +6727,11 @@ impl VideoPlayer {
                         // anamorphic 動画 (NTSC DVD など) で表示比を補正するために
                         // 1 度だけ送る。SAR=1:1 の動画では従来通りの isotropic 表示。
                         #[cfg(windows)]
-                        self.set_native_video_sar(info.sar_num, info.sar_den);
+                        self.set_native_video_geometry(
+                            info.sar_num,
+                            info.sar_den,
+                            info.orientation,
+                        );
                         // Phase 3c: engine にも InfoReceived event を流す。
                         // resume_secs は **AvClock 経由の旧経路** で処理し続け、
                         // engine 側でも resume_secs を OpenOptions で受領済みなので

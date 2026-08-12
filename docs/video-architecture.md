@@ -1582,20 +1582,23 @@ seek 時の target 前 keyframe / preroll frame は decoder 側で drop され�
 DAR ≈ 1.819:1 (= 16:9) で表示すべきで、square pixel で扱うと縦長になる。
 
 mIV は **decoder で SAR を読み取り → 各 `VideoFrame` に同梱 → native presenter の visual
-transform で anisotropic scale として適用する**:
+transform で anisotropic scale として適用する**。回転・反転も同じ display geometry の
+所有境界に置く:
 
 - `decoder.rs` の `normalize_sar(num, den) -> (u32, u32)` で `AVCodecParameters.sample_aspect_ratio`
   を正規化 (0/0・0/1・負値はすべて 1/1 に倒す)。値は `VideoInfo { sar_num, sar_den }` で UI 層へ
   伝搬すると同時に、**`VideoFrame { sar_num, sar_den }` として各フレームにも載せる**。
-- presenter は `present()` で受け取ったフレーム自身の SAR を `ensure_video_geometry()` に渡す。
+- presenter は `present()` で受け取ったフレーム自身の SAR を現在の display geometry と比較し、
+  必要なら visual transform をその場で更新する。
   これにより SAR は decoder → `video_tx` → presenter thread の **速い経路**で届き、ソース切替
   (fast-swap) 直後の最初のフレームから正しい SAR で描かれる。`VideoPlayer::tick` 経由の
-  `set_native_video_sar(num, den)` コマンド (= decoder → `info_rx` → UI tick → command channel
+  `set_native_video_geometry(num, den, orientation)` コマンド
+  (= decoder → `info_rx` → UI tick → command channel
   の遅い経路) は残してあるが、frame 同梱 SAR が先に反映されるため通常は no-op の safety net。
   mid-stream の SAR 変化は frame 同梱なので自然に追従する (bwdif フィルタも frame.aspect_ratio()
   で keying)。
 - `NativeRenderCore::update_video_visual_transform()` は `compute_video_visual_transform()`
-  helper (純粋関数、unit test 6 件あり) で transform 行列を計算する:
+  helper (純粋関数、unit test あり) で transform 行列を計算する:
   ```
   display_w = surface_w * sar_num / sar_den
   scale     = min(target_w / display_w, target_h / surface_h)
@@ -1607,13 +1610,46 @@ transform で anisotropic scale として適用する**:
   (= 余計な GPU/CPU 仕事ゼロ、stretch は DComp 側で 1 度だけ走る)。
 - タイルモードのセル比率 (`ui_video_tile.rs`) も同じ SAR を反映する。
 
+## 表示行列 (回転・反転) 補正
+
+MOV / MP4 などは decoded pixel を横向きのまま格納し、stream side data の
+`AV_PKT_DATA_DISPLAYMATRIX` で表示方向を指定することがある。mIV は
+`display_metadata.rs` で 3x3 行列の線形部分を読み、16.16 固定小数の
+`atan2(m[1], m[0])` を 0 / 90 / 180 / 270 度へ正規化する。2x2 部分の行が直交しない、
+quarter-turn に一致しない、または退化した行列は identity に倒す。行列式が負なら
+reflection を保持するため、4 回転と反転の全 8 orientation を表現できる。
+
+- 正規化値 `VideoOrientation` は SAR と同じく `VideoInfo` と各 `VideoFrame` の両方に載せる。
+  frame 同梱値を `present()` が直接読むため、fast-swap 後の最初のフレームから新 source の
+  SAR と orientation が一組で適用される。`SetVideoGeometry` は presenter 再構築時の再適用を
+  含む低速側 safety net である。
+- decoded surface / swap chain は encoded サイズ・向きのまま保つ。
+  `compute_video_visual_transform()` が SAR 補正後に orientation を合成し、完全な
+  `M11 / M12 / M21 / M22 / M31 / M32` を返す。90 / 270 度では表示 bounding box の
+  幅・高さを転置してから viewport へ fit し、負方向へ伸びる回転・反転は offset で
+  原点へ戻す。identity の計算値は従来の SAR-only transform と完全に同じ。
+- タイルセル比率と見開きの縦横判定は、共通の
+  `display_dimensions()` / `display_pixel_dimensions()` で SAR + orientation 適用後の
+  寸法を使う。native HUD の配置は viewport 基準であり source aspect を持たない。
+  HUD に表示する「解像度」の数値自体は従来どおり encoded サイズを保つ。
+- seek preview (`thumbnail.rs`) と動画タイル (`tile_thumbnails.rs`) は FFmpeg decode 後の
+  RGBA pixel を回転・反転し、SAR 込みの表示比で縮小する。永続 WebP cache は
+  `render_version` で回転導入前の行を stale 扱いにして再生成する。
+- 静止画キャプチャ (`screenshot.rs`) は DComp transform を通らないため、返却する RGBA pixel
+  自体を同じ orientation で回転・反転する。
+- Windows Shell API (`IShellItemImageFactory`) が生成する通常の動画サムネイルには
+  **この補正を重ねない**。Shell が既に display matrix を反映しており、追加すると二重回転になる。
+- detached viewer は共通 `VideoPlayer` / native presenter を使うので同じ geometry が効く。
+  detached 固有の predicate / viewport state は持たない。動画→音声モードは visual を表示しないが、
+  同じ `VideoInfo` / `VideoFrame` の所有モデルを変えない。
+
 ### ジオメトリ更新 — swap chain の原子的差し替え
 
-`present()` は毎フレームの先頭でフレーム実寸・SAR を見て分岐する:
+`present()` は毎フレームの先頭でフレーム実寸・SAR・orientation を見て分岐する:
 
 - **解像度不変** (`present_reusing_surface`): 既存の `swap_chain` / `backbuffer` をそのまま
-  再利用。SAR だけ変わった場合は `update_video_visual_transform` で transform を作り直す
-  (swap chain content は正しいので中間状態は生じない)。
+  再利用。SAR / orientation だけ変わった場合は `update_video_visual_transform` で transform を
+  作り直す (swap chain content は正しいので中間状態は生じない)。
 - **解像度変更** (`present_with_surface_swap`): **新しい video swap chain を別途生成し、
   原子的に差し替える**。手順:
   1. `create_video_swap_chain` で新 swap chain + backbuffer を生成 (まだ visual には繋がない)。
@@ -1643,7 +1679,8 @@ swap chain `Present` は compositor に原子的にラッチされないため�
 しうるため、旧 swap chain を即 drop せず `retired_video_surfaces` に数世代分残す。
 `RetiredVideoSurface` の Drop が swap chain + frame-latency waitable を解放する。
 
-`video_surface_swap` perf イベントに `surface_width/height` / `sar` / `geom_ms` /
+`video_surface_swap` perf イベントに `surface_width/height` / `sar` /
+`rotation_degrees` / `reflected` / `geom_ms` /
 `commit_sync_ms` / `retired_len` を記録する。
 
 動画→動画 source swap では native presenter HWND / DComp tree を維持するため、
