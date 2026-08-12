@@ -366,7 +366,11 @@ DFS 実行中の同種入力は `start_folder_nav` の単一受付口で
 移動先ページの編集矩形を旧ビューの上に重ねないよう、編集オーバーレイより後に描く。
 
 `--perf-log` 診断では `fs.paint` に `source` / `idx` / `items_generation` /
-`texture_id` を記録する。表示済みの同じ idx が解決不能へ落ちた遷移は
+`texture_id` に加え、実描画 transform の `x` / `y` / `w` / `h`、texture 寸法、
+`scale_x` / `scale_y` を記録する。重複抑止署名は texture identity だけでなくページごとの
+描画矩形と軸別 scale も含み、同じ texture のまま幾何だけが変わる frame も記録する。
+浮動小数点の揺れでログを増やさないため、矩形は 0.25 point、scale は 0.001 を超える差だけを
+変化とする。表示済みの同じ idx が解決不能へ落ちた遷移は
 `fs.texture_choice` (`source=none_after_paint`) として 1 回だけ記録し、nav holdover /
 continuous transition が実際に選ばれた場合も同イベントへ `branch` と source を残す。
 
@@ -994,8 +998,13 @@ pan を決めた後の `DisplayedImageTransform` を描画と上記 consumer が
 `hit_test(pos)` は 3 モード共通でページと transform を返す。ページ間 gap はどのページにも
 属さず、gap が 0 の共有境界は先に描いたページへ決定論的に割り当てる。ルーペはここで得た
 page idx の processed texture をページ単位で解決し、範囲キャプチャも同じ hit-test を使う。
-見開き / 連結読みのページ配置計算は引き続き `ui_fullscreen.rs` が担当し、その結果を
-`DisplayedImageTransform::from_resolved_rect` で共通レイアウトへ登録する。
+見開き / 連結読みのページ配置計算は引き続き `ui_fullscreen.rs` が担当する。ただし配置側が
+確定した page rect と、最終的に選ばれた texture の比率は progressive load / PDF 再 raster /
+加工済み texture の差し替え中に異なり得るため、live paint は
+`resolve_fs_transform_in_layout_rect` で両者を同時に束縛してから共通レイアウトへ登録する。
+page rect は包含枠として保持し、実 texture はその内側へ contain する。これにより source/layout
+比と texture 比が異なる frame でも `scale_x == scale_y` を保ち、矩形をそのまま別比率の raster
+へ渡して横または縦だけを伸縮させない。
 
 フルスクリーンのナビゲータも、このフレームで描画済みの `FullscreenPageLayout` を正本にする。
 単ページ / 見開きの各 `DisplayedImageTransform` を同じ比率で縮小した座標空間へ写し、

@@ -3142,13 +3142,23 @@ fn fs_texture_content_rect(
     page_rect: egui::Rect,
     texture_size: egui::Vec2,
     rotation: crate::rotation_db::Rotation,
-    preserve_texture_aspect: bool,
 ) -> egui::Rect {
-    if preserve_texture_aspect {
-        fit_display_size_in_rect(page_rect, rotated_display_size(texture_size, rotation))
-    } else {
-        page_rect
-    }
+    fit_display_size_in_rect(page_rect, rotated_display_size(texture_size, rotation))
+}
+
+/// Bind a layout-owned page rectangle to the texture that will actually be painted.
+///
+/// Page/source geometry and the selected raster can be resolved at different times
+/// (progressive thumbnails, PDF rerenders, processed continuous-reading textures).
+/// The layout rectangle is therefore only a containing frame. Re-resolve the final
+/// image rectangle from the actual texture at this ownership boundary so no caller
+/// can publish a non-uniform pixel scale when those aspects differ transiently.
+fn resolve_fs_transform_in_layout_rect(
+    input: DisplayedImageTransformInput,
+    page_rect: egui::Rect,
+) -> Option<DisplayedImageTransform> {
+    let texture_rect = fs_texture_content_rect(page_rect, input.texture_size, input.rotation);
+    DisplayedImageTransform::from_resolved_rect(input, texture_rect)
 }
 
 /// Resolve the page rectangle from canonical dimensions, optionally fitting the
@@ -3157,11 +3167,11 @@ fn fs_texture_content_rect(
 /// The canonical rectangle keeps the page frame stable. Pass-through thumbnails
 /// are integer-rounded independently, so painting them across that whole rectangle
 /// would introduce a small non-uniform stretch. They instead use a centered contain
-/// rectangle; final textures continue to fill the canonical page rectangle.
+/// rectangle. Final textures normally have the canonical aspect and therefore fill
+/// it too; a transiently different raster is contained instead of being stretched.
 fn resolve_fs_image_transform(
     input: DisplayedImageTransformInput,
     layout_source_size: Option<egui::Vec2>,
-    preserve_texture_aspect: bool,
 ) -> Option<DisplayedImageTransform> {
     let Some(layout_source_size) = layout_source_size else {
         return DisplayedImageTransform::resolve(input);
@@ -3176,13 +3186,7 @@ fn resolve_fs_image_transform(
         texture_size: layout_size,
         ..input
     })?;
-    let paint_rect = fs_texture_content_rect(
-        layout.full_image_rect,
-        input.texture_size,
-        input.rotation,
-        preserve_texture_aspect,
-    );
-    DisplayedImageTransform::from_resolved_rect(input, paint_rect)
+    resolve_fs_transform_in_layout_rect(input, layout.full_image_rect)
 }
 
 fn normalized_sub_rect(rect: egui::Rect, uv: egui::Rect) -> egui::Rect {
@@ -6555,26 +6559,106 @@ struct FsDisplayUnitTracePage {
     source: &'static str,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+const FS_PAINT_GEOMETRY_POINT_EPSILON: f32 = 0.25;
+const FS_PAINT_GEOMETRY_SCALE_EPSILON: f32 = 0.001;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FsPaintGeometrySignature {
+    draw_rect: Option<[f32; 4]>,
+    scale_x: Option<f32>,
+    scale_y: Option<f32>,
+}
+
+impl FsPaintGeometrySignature {
+    fn from_transform(transform: Option<DisplayedImageTransform>) -> Self {
+        let display_size = transform
+            .map(|transform| rotated_display_size(transform.texture_size, transform.rotation));
+        Self {
+            draw_rect: transform.map(|transform| {
+                [
+                    transform.paint_rect.min.x,
+                    transform.paint_rect.min.y,
+                    transform.paint_rect.width(),
+                    transform.paint_rect.height(),
+                ]
+            }),
+            scale_x: transform
+                .zip(display_size)
+                .map(|(transform, display_size)| {
+                    transform.full_image_rect.width() / display_size.x.max(1.0)
+                }),
+            scale_y: transform
+                .zip(display_size)
+                .map(|(transform, display_size)| {
+                    transform.full_image_rect.height() / display_size.y.max(1.0)
+                }),
+        }
+    }
+
+    fn differs_from(self, previous: Self) -> bool {
+        fn optional_scalar_differs(
+            current: Option<f32>,
+            previous: Option<f32>,
+            epsilon: f32,
+        ) -> bool {
+            match (current, previous) {
+                (Some(current), Some(previous)) => (current - previous).abs() > epsilon,
+                (None, None) => false,
+                _ => true,
+            }
+        }
+
+        let rect_differs = match (self.draw_rect, previous.draw_rect) {
+            (Some(current), Some(previous)) => {
+                current
+                    .into_iter()
+                    .zip(previous)
+                    .any(|(current, previous)| {
+                        (current - previous).abs() > FS_PAINT_GEOMETRY_POINT_EPSILON
+                    })
+            }
+            (None, None) => false,
+            _ => true,
+        };
+        rect_differs
+            || optional_scalar_differs(
+                self.scale_x,
+                previous.scale_x,
+                FS_PAINT_GEOMETRY_SCALE_EPSILON,
+            )
+            || optional_scalar_differs(
+                self.scale_y,
+                previous.scale_y,
+                FS_PAINT_GEOMETRY_SCALE_EPSILON,
+            )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FsPaintPageSignature {
+    idx: usize,
+    texture_id: egui::TextureId,
+    geometry: FsPaintGeometrySignature,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct FsPaintDisplayUnitSignature {
     items_generation: u64,
-    pages: Vec<(usize, egui::TextureId)>,
+    pages: Vec<FsPaintPageSignature>,
 }
 
 fn fs_paint_page_changed_from_previous(
     previous: Option<&FsPaintDisplayUnitSignature>,
     items_generation: u64,
-    idx: usize,
-    texture_id: egui::TextureId,
+    current: FsPaintPageSignature,
 ) -> bool {
     previous.map_or(true, |previous| {
         previous.items_generation != items_generation
-            || !previous
+            || previous
                 .pages
                 .iter()
-                .any(|(previous_idx, previous_texture_id)| {
-                    *previous_idx == idx && *previous_texture_id == texture_id
-                })
+                .find(|page| page.idx == current.idx && page.texture_id == current.texture_id)
+                .is_none_or(|previous| current.geometry.differs_from(previous.geometry))
     })
 }
 
@@ -13188,12 +13272,23 @@ impl App {
         let changed_pages = trace_pages
             .iter()
             .copied()
-            .filter(|page| {
+            .map(|page| {
+                let transform = self
+                    .fullscreen_page_layout
+                    .page_by_idx(page.idx)
+                    .map(|displayed| displayed.transform);
+                let signature = FsPaintPageSignature {
+                    idx: page.idx,
+                    texture_id: page.texture_id,
+                    geometry: FsPaintGeometrySignature::from_transform(transform),
+                };
+                (page, signature)
+            })
+            .filter(|(_, signature)| {
                 fs_paint_page_changed_from_previous(
                     previous.as_ref(),
                     self.items_generation,
-                    page.idx,
-                    page.texture_id,
+                    *signature,
                 )
             })
             .collect::<Vec<_>>();
@@ -13201,12 +13296,22 @@ impl App {
             items_generation: self.items_generation,
             pages: trace_pages
                 .iter()
-                .map(|page| (page.idx, page.texture_id))
+                .map(|page| {
+                    let transform = self
+                        .fullscreen_page_layout
+                        .page_by_idx(page.idx)
+                        .map(|displayed| displayed.transform);
+                    FsPaintPageSignature {
+                        idx: page.idx,
+                        texture_id: page.texture_id,
+                        geometry: FsPaintGeometrySignature::from_transform(transform),
+                    }
+                })
                 .collect(),
         };
         ctx.data_mut(|data| data.insert_temp(cache_id, current));
 
-        for page in changed_pages {
+        for (page, signature) in changed_pages {
             let entry_seq = if matches!(decision.paint_source(), FsPageTurnPaintSource::PassThrough)
             {
                 self.input_seq
@@ -13223,18 +13328,6 @@ impl App {
             let draw_rect = transform.map(|transform| transform.paint_rect);
             let display_size = transform
                 .map(|transform| rotated_display_size(transform.texture_size, transform.rotation));
-            let scale_x = transform.map(|transform| {
-                transform.full_image_rect.width()
-                    / rotated_display_size(transform.texture_size, transform.rotation)
-                        .x
-                        .max(1.0)
-            });
-            let scale_y = transform.map(|transform| {
-                transform.full_image_rect.height()
-                    / rotated_display_size(transform.texture_size, transform.rotation)
-                        .y
-                        .max(1.0)
-            });
             crate::perf::event(
                 "fs",
                 "paint",
@@ -13290,13 +13383,17 @@ impl App {
                     ),
                     (
                         "scale_x",
-                        scale_x
+                        signature
+                            .geometry
+                            .scale_x
                             .map(serde_json::Value::from)
                             .unwrap_or(serde_json::Value::Null),
                     ),
                     (
                         "scale_y",
-                        scale_y
+                        signature
+                            .geometry
+                            .scale_y
                             .map(serde_json::Value::from)
                             .unwrap_or(serde_json::Value::Null),
                     ),
@@ -20746,25 +20843,28 @@ impl App {
                 .then(|| self.fs_page_layout_source_size(page_idx))
                 .flatten();
             let fit_bbox = fs_image_fit_bbox(rotation, free_rotation_rad, content_bbox);
-            let Some(transform) = resolved_transform.or_else(|| {
-                resolve_fs_image_transform(
-                    DisplayedImageTransformInput {
-                        page_idx,
-                        viewport_rect: full_rect,
-                        source_size: source_size.unwrap_or(tex_size),
-                        texture_size: tex_size,
-                        rotation,
-                        free_rotation_rad,
-                        content_bbox,
-                        fit_mode,
-                        fit_scale_limits,
-                        pixels_per_point: ui.ctx().pixels_per_point(),
-                        placement: ResolvedDisplayPlacement::Normal { zoom_pan },
-                    },
-                    layout_source_size,
-                    preserve_texture_aspect,
-                )
-            }) else {
+            let transform_input = DisplayedImageTransformInput {
+                page_idx,
+                viewport_rect: full_rect,
+                source_size: source_size.unwrap_or(tex_size),
+                texture_size: tex_size,
+                rotation,
+                free_rotation_rad,
+                content_bbox,
+                fit_mode,
+                fit_scale_limits,
+                pixels_per_point: ui.ctx().pixels_per_point(),
+                placement: resolved_transform
+                    .map(|transform| transform.placement)
+                    .unwrap_or(ResolvedDisplayPlacement::Normal { zoom_pan }),
+            };
+            let transform = match resolved_transform {
+                Some(layout) => {
+                    resolve_fs_transform_in_layout_rect(transform_input, layout.full_image_rect)
+                }
+                None => resolve_fs_image_transform(transform_input, layout_source_size),
+            };
+            let Some(transform) = transform else {
                 return None;
             };
             let img_rect = transform.full_image_rect;
@@ -24959,9 +25059,7 @@ impl App {
                 _ => layout_size,
             };
             let page_rect = fit_display_size_in_rect(rect, display_size);
-            let img_rect =
-                fs_texture_content_rect(page_rect, tex_size, rotation, preserve_texture_aspect);
-            let transform = DisplayedImageTransform::from_resolved_rect(
+            let transform = resolve_fs_transform_in_layout_rect(
                 DisplayedImageTransformInput {
                     page_idx: idx,
                     viewport_rect,
@@ -24978,7 +25076,7 @@ impl App {
                     pixels_per_point,
                     placement,
                 },
-                img_rect,
+                page_rect,
             )?;
             // 回転中は bbox のズレを避けて背景を適用しない
             if rotation.is_none() {
@@ -30845,14 +30943,11 @@ mod tests {
             placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
         };
 
-        let pass = resolve_fs_image_transform(
-            make_input(egui::vec2(300.0, 450.0)),
-            Some(source_size),
-            true,
-        )
-        .expect("pass-through transform");
-        let final_image = resolve_fs_image_transform(make_input(source_size), None, false)
-            .expect("final transform");
+        let pass =
+            resolve_fs_image_transform(make_input(egui::vec2(300.0, 450.0)), Some(source_size))
+                .expect("pass-through transform");
+        let final_image =
+            resolve_fs_image_transform(make_input(source_size), None).expect("final transform");
 
         assert!(
             final_image
@@ -30873,6 +30968,42 @@ mod tests {
         let scale_x = pass.full_image_rect.width() / 300.0;
         let scale_y = pass.full_image_rect.height() / 450.0;
         assert!((scale_x - scale_y).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn layout_source_and_texture_aspect_mismatch_keeps_texture_scale_uniform() {
+        let viewport_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        // The reported transient ratio was about 409/512 while the page texture
+        // itself was about 336/512. A layout frame may use either ratio, but the
+        // raster's square pixels must never receive different X/Y scales.
+        let texture_size = egui::vec2(336.0, 512.0);
+        let layout_source_size = egui::vec2(409.0, 512.0);
+        let transform = resolve_fs_image_transform(
+            DisplayedImageTransformInput {
+                page_idx: 0,
+                viewport_rect,
+                source_size: texture_size,
+                texture_size,
+                rotation: crate::rotation_db::Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point: 1.0,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            },
+            Some(layout_source_size),
+        )
+        .expect("mismatched layout/texture transform");
+
+        let paint_ratio = transform.full_image_rect.width() / transform.full_image_rect.height();
+        let texture_ratio = texture_size.x / texture_size.y;
+        let scale_x = transform.full_image_rect.width() / texture_size.x;
+        let scale_y = transform.full_image_rect.height() / texture_size.y;
+        assert!((paint_ratio - texture_ratio).abs() < 1.0e-4);
+        assert!((scale_x - scale_y).abs() < 1.0e-4);
+        assert!((transform.full_image_rect.center().x - viewport_rect.center().x).abs() < 1.0e-4);
+        assert!((transform.full_image_rect.center().y - viewport_rect.center().y).abs() < 1.0e-4);
     }
 
     #[test]
@@ -30897,13 +31028,11 @@ mod tests {
         let pass = resolve_fs_image_transform(
             make_input(egui::vec2(327.0, 473.0), egui::vec2(327.0, 473.0)),
             Some(page_box_layout),
-            true,
         )
         .expect("PDF pass-through transform");
         let final_image = resolve_fs_image_transform(
             make_input(egui::vec2(1643.0, 2375.0), egui::vec2(1643.0, 2375.0)),
             Some(page_box_layout),
-            false,
         )
         .expect("PDF final transform");
 
@@ -31016,34 +31145,88 @@ mod tests {
                 egui::TextureOptions::LINEAR,
             )
             .id();
+        let geometry = FsPaintGeometrySignature {
+            draw_rect: Some([52.0, 70.0, 158.0, 243.0]),
+            scale_x: Some(0.5),
+            scale_y: Some(0.5),
+        };
         let previous = FsPaintDisplayUnitSignature {
             items_generation: 7,
-            pages: vec![(2, texture_a), (3, texture_b)],
+            pages: vec![
+                FsPaintPageSignature {
+                    idx: 2,
+                    texture_id: texture_a,
+                    geometry,
+                },
+                FsPaintPageSignature {
+                    idx: 3,
+                    texture_id: texture_b,
+                    geometry,
+                },
+            ],
         };
 
         assert!(!fs_paint_page_changed_from_previous(
             Some(&previous),
             7,
-            3,
-            texture_b,
+            FsPaintPageSignature {
+                idx: 3,
+                texture_id: texture_b,
+                geometry,
+            },
         ));
         assert!(fs_paint_page_changed_from_previous(
             Some(&previous),
             7,
-            4,
-            texture_a,
+            FsPaintPageSignature {
+                idx: 4,
+                texture_id: texture_a,
+                geometry,
+            },
         ));
         assert!(fs_paint_page_changed_from_previous(
             Some(&previous),
             7,
-            2,
-            texture_b,
+            FsPaintPageSignature {
+                idx: 2,
+                texture_id: texture_b,
+                geometry,
+            },
         ));
         assert!(fs_paint_page_changed_from_previous(
             Some(&previous),
             8,
-            2,
-            texture_a,
+            FsPaintPageSignature {
+                idx: 2,
+                texture_id: texture_a,
+                geometry,
+            },
+        ));
+        assert!(fs_paint_page_changed_from_previous(
+            Some(&previous),
+            7,
+            FsPaintPageSignature {
+                idx: 2,
+                texture_id: texture_a,
+                geometry: FsPaintGeometrySignature {
+                    draw_rect: Some([34.0, 70.0, 194.0, 243.0]),
+                    scale_x: Some(0.6127),
+                    scale_y: Some(0.5),
+                },
+            },
+        ));
+        assert!(!fs_paint_page_changed_from_previous(
+            Some(&previous),
+            7,
+            FsPaintPageSignature {
+                idx: 2,
+                texture_id: texture_a,
+                geometry: FsPaintGeometrySignature {
+                    draw_rect: Some([52.1, 69.9, 158.1, 242.9]),
+                    scale_x: Some(0.5005),
+                    scale_y: Some(0.4995),
+                },
+            },
         ));
     }
 
