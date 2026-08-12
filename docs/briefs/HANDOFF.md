@@ -26,26 +26,64 @@
 (基準 commit `883d48ed`)。**計測・高速化は実機が使えるタイミングまで中断**し、こちらを先に進める。
 レビュー指摘の大半は実機確認なしで完了できるため。
 
-### 実機なしで進められる (この順で)
+### 進捗
 
-1. **RR-06** iframe 対策 — 全応答へ `frame-ancestors 'none'` / `X-Frame-Options: DENY`。
-   **応答の最終化を 1 箇所に集約**するのが本体 (early return がヘッダを通っていない)
-2. **RR-01** PIN 欄が数字キーボードを要求する — `inputMode` を外し、placeholder を「6文字以上」へ。
-   本体 validator (printable ASCII) は変えない
-3. **RR-02** Serve サブパスを「設定済み」と誤判定 — handler path が `/` のときだけ `Configured`。
-   非 root は「未対応」と区別する。**既存テストが今の誤挙動を固定している**ので直す
-4. **RR-05** logout / 全端末失効 — `/api/auth/logout` と本体側の secret rotate。
-   stateless token に revocation を装わない
-5. **RR-07〜10** マニュアル 4 件 — 到達性の説明、検索範囲、補正 subset、動画の検証環境
+- ✅ **RR-01** `e6a5c488` PIN 欄が数字キーボードを要求しない
+- ✅ **RR-06** `a0860c00` 応答の最終化を `handle()` の 1 箇所へ集約 + anti-framing 2 header。
+  early return (query parse error / session 未取得) も同じ最終化を通る
+- ✅ **RR-02** `5cd4fba0` 自分の proxy が `/` のときだけ `Configured`。非 root は
+  `tailscale_serve_unsupported_path` として運び、設定ボタンは有効なまま残す。protocol v47
+- ⏳ **RR-03 / RR-05** brief B を Codex へ (`codex-remote-release-review-b-brief.md`)
+- ⏳ **RR-07〜10** マニュアル 4 件 — 到達性の説明、検索範囲、補正 subset、動画の検証環境。
+  brief B もマニュアルを触るので、**B の完了後に着手する** (同じファイルを同時に編集しない)
 
-### 利用者の判断待ち (実装自体は実機不要)
+**利用者の判断は取得済み**: RR-03 は「生の `\\server\share` だけ拒否 (ドライブ割り当ては残す)」。
+RR-04 は「いったん制限でよいが、緩められないか検討したい」。
 
-- **RR-03 (UNC)** — レビューの 3 案に加えて **4 案目**がある。**割り当て済みネットワーク
-  ドライブ (`Z:\`) は UNC ではない**ので、生の `\\server\share` だけ拒否すれば、
-  ネットワーク上のファイルを見る用途はドライブ割り当てで残る。**変更も損失も小さいのでこれを推奨。**
-  案 2 (capability 化) が構造的には最善だが address の生涯全体に及ぶため v3.0.0 には大きい
-- **RR-04 (1000 件上限)** — v3.0.0 は**明示的な制限として文書化**を推奨。ページングは独立した機能。
-  ただしスキャン漫画のフォルダが 1000 件を超えるなら実害があるので、利用者の実情次第
+### Codex を worktree で動かすときの 2 つの罠 (2026-08-13 に両方踏んだ)
+
+1. **`-o <file>` の出力先を worktree の外に置くと、Codex は 1 バイトも書けない**。
+   `windows unelevated restricted-token sandbox cannot enforce split writable root sets` で
+   apply_patch が全部失敗する。scratchpad ではなく `target/codex/` のように**作業ツリーの中**へ出す。
+2. **worktree では `.git` の実体が親リポジトリ側 (`C:\home\mimageviewer\.git\worktrees\...`) にある**
+   ため、Codex は commit できない (`index.lock: Permission denied`)。実装させて、
+   **コミットはこちらで行う**。brief にもその旨を書いておくと、Codex が変更を残したまま報告してくれる。
+
+### RR-04: 1000 件上限は何を守っているのか (2026-08-13 実測)
+
+**結論: 上限が守っているものは「無圧縮の転送量」だけで、他に壁は無い。**
+
+| 層 | 件数に対する費用 | 出所 |
+|---|---|---|
+| クライアント DOM | **なし** — `VirtualGrid` が可視セルだけ materialize する | `app.js` の `VirtualGrid` |
+| サムネイル | **なし** — セルが materialize された時だけ 1 枚要求する | `bindThumbnail` (`app.js:6745`) |
+| コンテナ列挙 (フォルダ / ZIP / PDF) | **ほぼなし** — 本体が一覧用にどのみち作る listing から `.take(1000)` するだけ。PDF はページ番号から住所を組むだけ | `container.rs:3297`, `:3404`, `:3495` |
+| コレクション列挙 (検索 / タグ / レーティング / 履歴) | **1 件ごとに `canonicalize`**。実測 warm 30〜40 µs、cold 125 µs (この PC、6757 件と 4963 件で測定) | `collections.rs:894` |
+| wire JSON | **250 B/件** (実測) | 下表 |
+| HTTP 圧縮 | **無い** (`Content-Encoding` の実装が remote-web に存在しない) | — |
+| named pipe | 1.36 GB/s なので無視できる | 既存計測 |
+
+転送量の実測 (実フォルダの listing 形状で生成):
+
+| 件数 | 無圧縮 | gzip | 比 |
+|---:|---:|---:|---:|
+| 1,000 | 245 KiB | 16 KiB | 15.6x |
+| 5,000 | 1.24 MiB | 68 KiB | 18.6x |
+| 6,757 | 1.70 MiB | 94 KiB | 18.2x |
+
+パスは前方一致が多いので 15〜20 倍縮む。**gzip を入れれば 1 万件でも 140 KiB 程度**になる。
+`flate2` は `zip` 経由で既に `Cargo.lock` にあるので依存は増えない。
+
+**上限の実害は「一覧が切れる」だけではない**: `page_groups` も同じ 1000 件から作られるので
+(`container.rs:3313`)、**1000 ページを超える PDF / 画像フォルダはリモートで 1001 ページ目以降を
+開く手段が無い**。ビューアは `state.pageGroups` を辿ってページを送るため。
+
+なお本体自身の上限は検索 5000 (`SEARCH_RESULT_LIMIT`)、タグ 10000 (`TAG_VIEW_RESULT_LIMIT`) で、
+**リモートの 1000 は本体より厳しい**側に振られている。
+
+推奨: ① JSON 応答に gzip → ② 上限を本体に揃える (検索 5000 / タグ 10000、コンテナ 10000 程度)。
+gzip 後は転送側にプログレス表示は要らない。必要になるとすればコレクション側の canonicalize
+(1 万件で最大 1.2 秒) の方。
 
 ## 次にやること
 
