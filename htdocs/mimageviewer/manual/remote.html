@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>リモート閲覧 — mImageViewer マニュアル</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="自宅 PC のライブラリを外出先の端末のブラウザから開く機能のリファレンス。有効にする手順、接続ダイアログの表示、端末ごとの設定、できること・できないこと、うまくいかないときの確認先。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/remote.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/remote.html">
+  <meta property="og:title" content="リモート閲覧｜mImageViewer">
+  <meta property="og:description" content="自宅 PC のライブラリを外出先の端末のブラウザから開く機能のリファレンス。有効にする手順、接続ダイアログの表示、端末ごとの設定、できること・できないこと、うまくいかないときの確認先。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="リモート閲覧｜mImageViewer">
+  <meta name="twitter:description" content="自宅 PC のライブラリを外出先の端末のブラウザから開く機能のリファレンス。有効にする手順、接続ダイアログの表示、端末ごとの設定、できること・できないこと、うまくいかないときの確認先。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>リモート閲覧</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="tutorial.html">チュートリアル</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="stack.html">スタック表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="music.html">音楽再生</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="annotation.html">テキスト注釈</a>
+        <a href="export.html">エクスポート</a>
+        <a href="metadata-transfer.html">メタ情報の移行</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="books.html">製本・本棚</a>
+        <a href="search.html">検索機能</a>
+        <a href="remote.html" class="active">リモート閲覧</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="gamepad.html">ゲームパッド操作</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+        <a href="known-issues.html">既知の問題</a>
+        <a href="changelog.html">更新履歴</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">リモート閲覧</h1>
+    <p class="page-desc">自宅の PC で mImageViewer を起動したままにしておくと、外出先の
+    スマートフォン・タブレット・ノート PC のブラウザから同じライブラリを開けます。
+    本ページは機能のリファレンスです。はじめて設定する場合は
+    <a href="tut-remote.html">チュートリアル「外出先からリモートで見る」</a>から読んでください。</p>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        <strong>この機能は既定でオフです。</strong>有効にすると、<strong>すべてのドライブについて、
+        mImageViewer で表示できるファイルが閲覧できるようになります。</strong>この PC の Tailscale
+        アドレスへ接続でき、PIN を知っている人から見えます。
+      </div>
+    </div>
+
+    <h2 id="requirements">必要なもの</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>もの</th><th>役割</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><a href="https://tailscale.com/">Tailscale</a></td><td>自宅 PC と手元の端末を、同じアカウントでサインインするだけで安全につなぐソフトです。自宅 PC と外出先で使う端末の両方に必要です</td></tr>
+          <tr><td>PIN</td><td>接続時に入力します。自宅 PC の接続ダイアログで決めます</td></tr>
+          <tr><td>起動したままの自宅 PC</td><td>画像の読み込みも変換も自宅 PC が行います。スリープすると接続できません</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      mImageViewer 自体はインターネットに直接出ません。自宅 PC の中だけで待ち受け、外への公開は
+      Tailscale に任せます。Tailscale に参加していない端末からは、URL を知っていても届きません。
+    </p>
+
+    <h2 id="dialog">接続ダイアログ</h2>
+    <p>
+      メニューの<strong>設定 → リモート接続…</strong>で開きます。このウィンドウでの操作は
+      その場で反映されます（OK / キャンセルはありません）。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>表示</th><th>意味</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>PIN</td><td><strong>設定済み</strong> / <strong>未設定</strong>。未設定のうちは有効にできません</td></tr>
+          <tr><td>状態</td><td>待ち受けの状況。有効にした直後は準備中になり、接続先が決まると受付中になります</td></tr>
+          <tr><td>利用状況</td><td>いま接続している端末があるかどうか（台数は表示しません）</td></tr>
+          <tr><td>tailscale serve</td><td><strong>設定済み</strong> / <strong>未設定</strong> / <strong>確認できません</strong>。未設定のときは、実行する内容とコマンドを示したうえで設定ボタンが出ます</td></tr>
+          <tr><td>接続キーの有効期限</td><td>期限がある場合だけ表示します。期限が近い、または切れている場合は強調表示します</td></tr>
+          <tr><td>QR コード / URL</td><td>接続先です。QR コードに含まれるのは接続先だけで、PIN は含まれません</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>PIN</h3>
+    <p>
+      6 文字以上で、<strong>半角の英数字と記号</strong>が使えます。日本語や空白は使えません。
+      入力欄は伏字になるため、正しく入力できたかを目で確かめられない文字を使えないようにしています。
+    </p>
+    <p>
+      変更すると、<strong>接続中の端末では PIN の再入力が必要になります</strong>。
+      有効なリモート接続は自動的に再起動します。
+    </p>
+
+    <h3>tailscale serve</h3>
+    <p>
+      外出先のブラウザから HTTPS で開けるようにする設定です。mImageViewer が代わりに実行します。
+      <strong>ボタンを押すまでは何も変更しません。</strong>すでに別のものを公開している場合は、
+      置き換わることを表示します。解除したいときは Tailscale 側で行います。
+    </p>
+
+    <h2 id="connect">接続する</h2>
+    <p>
+      QR コードを手元の端末で読み取るか、URL を開いて PIN を入力します。ブラウザのメニューから
+      「ホーム画面に追加」しておくと、次回からアプリのように起動できます。
+    </p>
+    <p>
+      何度も PIN を間違えると、しばらく受け付けなくなります。
+    </p>
+
+    <h2 id="operations">画面の操作</h2>
+    <p>スマートフォンでの操作を前提にした画面です。初回に操作の説明が表示され、
+    あとからメニューの<strong>「操作方法を見る」</strong>でも読み直せます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>左右をタップ</td><td>ページ送り</td></tr>
+          <tr><td>中央をタップ</td><td>上下バーの表示 / 非表示</td></tr>
+          <tr><td>左右にスワイプ</td><td>ページ送り</td></tr>
+          <tr><td>上へスワイプ</td><td>メニュー</td></tr>
+          <tr><td>下へスワイプ</td><td>一覧へ戻る</td></tr>
+          <tr><td>ピンチ</td><td>拡大・縮小</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="can">できること</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>できること</th><th>内容</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>一覧を見る</td><td>お気に入り / スマートフォルダ / 場所（読書履歴・レーティング・本棚・ブックマーク）</td></tr>
+          <tr><td>探す</td><td>フォルダ・ZIP・PDF を名前で検索、タグから探す</td></tr>
+          <tr><td>画像を見る</td><td>全体フィット / 幅フィット / 原寸、拡大とパン</td></tr>
+          <tr><td>漫画を読む</td><td>見開き表示（右綴じ / 左綴じ、表紙あり）、ページ位置の指定</td></tr>
+          <tr><td>動画を見る</td><td>自宅 PC 側で変換しながら配信します。画質を選べます</td></tr>
+          <tr><td>音声を聴く</td><td>動画と同じく、自宅 PC 側から配信します</td></tr>
+          <tr><td>アーカイブを開く</td><td>ZIP / PDF に加えて RAR / 7z / LZH。変換が要るものは確認してから変換します</td></tr>
+          <tr><td>印を付ける</td><td>レーティング（★）、ブックマーク</td></tr>
+          <tr><td>見え方を調整する</td><td>画像補正、表示トリム</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>読んだ位置や★は自宅 PC に記録されるので、帰宅後は続きから読めます。</p>
+
+    <h2 id="cannot">できないこと</h2>
+    <ul>
+      <li><strong>ファイルの操作：</strong>コピー・移動・削除・名前の変更はできません。
+      リモートからファイルが消えたり増えたりすることはありません。</li>
+      <li><strong>タグの付け外し：</strong>付いているタグから探すことはできますが、
+      リモートで付けたり外したりはできません。</li>
+      <li><strong>パスワード付きの 7z / LZH：</strong>開けません。パスワード付きの RAR は、
+      リモートでパスワードを入力すれば開けます。</li>
+      <li><strong>アニメーションの再生：</strong>アニメーション GIF・APNG・アニメーション WebP は、
+      動かずに 1 コマの静止画として表示されます。動画ファイルは再生できます。</li>
+      <li><strong>複数の端末で同時に操作すること：</strong>操作できるのは常に 1 台です。
+      2 台目から操作すると、そちらへ操作が移ります。</li>
+    </ul>
+
+    <h2 id="local-settings">端末の設定</h2>
+    <p>
+      メニューの<strong>「端末の設定」</strong>にある項目は、<strong>その端末のブラウザだけに
+      保存されます</strong>。端末ごとに変えられます。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>設定</th><th>内容</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>縦長画面では見開きを解除する</td><td>OFF にすると縦持ちでも見開きを維持します</td></tr>
+          <tr><td>画像の画質</td><td>高品質 / 標準 / 軽量 / 最軽量。1 ページあたりの大きさが変わります。実測した平均時間を各選択肢に表示します</td></tr>
+          <tr><td>先読み枚数（進む方向 / 戻る方向）</td><td>先に読み込んでおくページ数です。素早くめくって待たされる場合は増やします</td></tr>
+          <tr><td>詳細記録を有効にする</td><td>画面上部に読み込み状況を表示します</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <strong>先読み枚数を大きくしすぎると、ブラウザが落ちることがあります。</strong>
+        その場合は枚数を下げて開き直してください。落ちた直後に開き直したときは、
+        <strong>最初のページ送りまで先読みを控えめにします</strong>ので、その間に設定を変えられます。
+        それでも落ちる場合は、同じ設定画面で<strong>画像の画質</strong>も下げてください。
+      </div>
+    </div>
+
+    <h2 id="host">リモート接続中の自宅 PC</h2>
+    <p>
+      リモートから操作している間、自宅 PC の mImageViewer には「リモート接続中」の表示が出て、
+      その PC 側での通常の操作は受け付けなくなります。同じライブラリを 2 か所から同時に動かして
+      食い違うのを防ぐためです。
+    </p>
+    <p>
+      自宅 PC 側の<strong>「切断する」</strong>を押せば、その場で操作を取り戻せます。
+      そのあとリモート側で何か操作すると、また向こうへ移ります。
+      しばらく操作がないと接続は自動的に切れます（再生中は切れません）。
+    </p>
+    <p>
+      機能そのものを止めたいときは、接続ダイアログで<strong>「リモート接続を無効にする」</strong>を
+      押します。押した時点で待ち受けをやめるので、以降は PIN を知っていても接続できなくなります。
+    </p>
+
+    <h2 id="tailnet">Tailscale 側の設定</h2>
+    <p>
+      次の 2 つは Tailscale の管理画面での設定です。mImageViewer からは変更できないので、
+      足りない場合は接続ダイアログに案内が出ます。
+    </p>
+    <ul>
+      <li><strong>HTTPS の証明書。</strong>有効になっていないと
+      <strong>「tailscale serve を設定する」</strong>を押せません。</li>
+      <li><strong>接続キーの有効期限。</strong>切れるとその PC が Tailscale ネットワークから外れ、
+      <strong>外出先から接続できなくなります</strong>。気付くのはたいてい外出先なので、
+      期限が表示されているうちに管理画面で期限をなくしておくと安心です。</li>
+    </ul>
+
+    <h2 id="trouble">うまくいかないとき</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>症状</th><th>確認すること</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>有効にできない</td><td>PIN が未設定です。先に PIN を決めてください</td></tr>
+          <tr><td>URL を開いても表示されない</td><td>手元の端末が Tailscale にサインインしているか。自宅 PC がスリープしていないか</td></tr>
+          <tr><td>外出先から急につながらなくなった</td><td>接続キーの有効期限が切れていないか（自宅に戻ってから確認します）</td></tr>
+          <tr><td>tailscale serve を設定できない</td><td>Tailscale の管理画面で HTTPS の証明書が有効か</td></tr>
+          <tr><td>ページの表示が遅い</td><td>端末の設定で画質を下げる、先読み枚数を増やす</td></tr>
+          <tr><td>読んでいる途中でアプリが再読み込みされる</td><td>先読み枚数を下げる。それでも起きるなら画質を下げる</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="laptop">ノート PC から見たいとき</h2>
+    <p>
+      この機能はスマートフォン・タブレットでの閲覧を主眼に作っています。ノート PC からなら
+      <strong>リモートデスクトップ</strong>が向いています。自宅 PC の画面をそのまま操作するので、
+      全機能が使えて、タグ・★・読んだ位置も自宅 PC のものがそのまま続きます。
+    </p>
+    <p>
+      自宅 PC のフォルダを<strong>ネットワークドライブ</strong>として割り当てる方法もありますが、
+      共有されるのは<strong>ファイルだけ</strong>です。タグ・★・読んだ位置・本棚は、それぞれの PC の
+      mImageViewer が自分で覚えているものなので引き継がれません。
+    </p>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>
