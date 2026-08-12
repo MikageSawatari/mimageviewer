@@ -23102,7 +23102,7 @@ impl App {
         let Some(db) = self.archive_cache_db.clone() else {
             return;
         };
-        let inputs: Vec<(PathBuf, i64, i64)> = self
+        let direct_inputs: Vec<(PathBuf, i64, i64)> = self
             .items
             .iter()
             .enumerate()
@@ -23124,9 +23124,21 @@ impl App {
                 Some((path.clone(), mtime, file_size))
             })
             .collect();
-        if inputs.is_empty() {
+        // Folder タイル自身の pin が指す変換対象アーカイブは current items に現れない。
+        // container root だけを snapshot し、DB lookup + cascade + metadata は worker 側で行う。
+        let pin_roots: Vec<PathBuf> = self
+            .items
+            .iter()
+            .filter_map(|item| {
+                self.folder_pin_lookup_target_for_item(item)
+                    .map(|target| target.path)
+            })
+            .collect();
+        let pin_db = self.folder_thumb_pin_db.clone();
+        if direct_inputs.is_empty() && (pin_roots.is_empty() || pin_db.is_none()) {
             return;
         }
+        let max_cascade_depth = self.settings.folder_thumb_depth as usize;
 
         let generation = self.items_generation;
         let input_seq = self.input_seq;
@@ -23140,7 +23152,40 @@ impl App {
                 let mut paths = std::collections::HashMap::new();
                 let mut peeked = 0usize;
                 let mut hits = 0usize;
-                for (path, mtime, file_size) in inputs {
+                let mut candidates: std::collections::HashMap<String, (PathBuf, i64, i64)> =
+                    std::collections::HashMap::new();
+                for (path, mtime, file_size) in direct_inputs {
+                    candidates.insert(
+                        crate::path_key::normalize_keep_drive(&path),
+                        (path, mtime, file_size),
+                    );
+                }
+                if let Some(pin_db) = pin_db.as_deref() {
+                    for root in pin_roots {
+                        if worker_cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let Some(source) = pin_db.lookup(&root) else {
+                            continue;
+                        };
+                        let Some(resolved) =
+                            crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+                                &root,
+                                &source,
+                                |path| pin_db.lookup(path),
+                                max_cascade_depth,
+                            )
+                        else {
+                            continue;
+                        };
+                        if crate::folder_tree::is_convertible_archive_path(&resolved.abs_path) {
+                            candidates
+                                .entry(crate::path_key::normalize_keep_drive(&resolved.abs_path))
+                                .or_insert((resolved.abs_path, resolved.mtime, resolved.file_size));
+                        }
+                    }
+                }
+                for (_, (path, mtime, file_size)) in candidates {
                     if worker_cancel.load(Ordering::Relaxed) {
                         return;
                     }
@@ -23271,7 +23316,7 @@ impl App {
     /// fallback も seed に入れたが、UI スレッドで重く動画 pin 付きフォルダ複数 + Shell
     /// 遅延でフォルダ移動が固まったため撤去した。動画を folder pin したいユーザーは
     /// 先にフルスクリーンで `P` キー / HUD でフレームを保存する
-    /// (set 側で `try_set_folder_thumb_pin_with_video_guard` がガード)。
+    /// (set 側で `try_set_folder_thumb_pin_with_guard` がガード)。
     fn seed_folder_video_pin_thumbs(
         &self,
         cache_map: &Arc<
@@ -23345,7 +23390,7 @@ impl App {
             // UI スレッドで重く、動画 pin 付きフォルダが複数あると `start_loading_items`
             // (= フォルダ移動) がブロックする。sidecar / Shell fallback は撤去し、
             // 「動画を folder pin するには先にフルスクリーンでフレームを保存する」
-            // 仕様にした (set 側で `try_set_folder_thumb_pin_with_video_guard` がガード)。
+            // 仕様にした (set 側で `try_set_folder_thumb_pin_with_guard` がガード)。
             // ここに来る時点で video_pins WebP は必ず存在する想定だが、レース
             // (フルスクリーンで unpin した直後など) で空になっていることもあるので
             // `.filter(non-empty)` は残し、空なら下の purge_stale 経路に落とす。
@@ -23497,6 +23542,20 @@ impl App {
                         let item = GridItem::PdfFile(container.join(rel));
                         let key = container_cache_base_key(&item, use_full_path_key, None, 0)
                             .unwrap_or_else(|| format!("{}{}", CACHE_KEY_PDF, fname));
+                        cat.load_one(&key).ok().flatten()
+                    }
+                    FileKind::ConvertibleArchive => {
+                        let cat = self.get_or_open_catalog(container)?;
+                        let archive_path = container.join(rel);
+                        let format = archive_path
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .and_then(crate::archive_converter::ArchiveFormat::from_extension)?;
+                        let key = convertible_archive_cache_base_key(
+                            &archive_path,
+                            format,
+                            use_full_path_key,
+                        )?;
                         cat.load_one(&key).ok().flatten()
                     }
                     FileKind::Folder => {
@@ -23923,7 +23982,12 @@ impl App {
             .and_then(|i| self.folder_pin_selected_source(i));
 
         let selected_item = self.selected.and_then(|i| self.items.get(i));
-        let is_convertible = matches!(selected_item, Some(GridItem::ConvertibleArchive { .. }));
+        let convertible_unavailable = matches!(
+            selected_item,
+            Some(GridItem::ConvertibleArchive { path, .. })
+                if !self.converted_archive_cache_paths
+                    .contains_key(&crate::path_key::normalize_keep_drive(path))
+        );
 
         let matches_current_pin = match (&existing_pin, &selected_source) {
             (Some(a), Some(b)) => a == b,
@@ -23931,10 +23995,10 @@ impl App {
         };
 
         // 描画 + tooltip の決定
-        // 1) ConvertibleArchive 選択中: 「変換後に設定可能」で disabled
+        // 1) 未変換 ConvertibleArchive 選択中: 「変換後に設定可能」で disabled
         // 2) 選択無し / pin 不可: 「項目を選択してください」で disabled
         // 3) 通常: enabled。matches_current_pin で tooltip を分岐
-        let (enabled, tooltip) = if is_convertible {
+        let (enabled, tooltip) = if convertible_unavailable {
             (
                 false,
                 "代表サムネ固定: 変換後に設定可能 (アーカイブを ZIP に変換すると指定できます)"
@@ -23987,7 +24051,7 @@ impl App {
     /// - Ctrl+G アグリゲートビュー (`items_are_global_search_view`)
     /// - Ctrl+T タグビュー (`items_are_tag_view`)
     /// - RAR/7z/LZH 変換キャッシュ ZIP の drill-down だが `zip_nav` が無い中途半端な状態
-    /// - 選択無し / 選択アイテムが pin 不能 (ConvertibleArchive / SearchContainer、
+    /// - 選択無し / 選択アイテムが pin 不能 (SearchContainer、
     ///   または container を指す `rel=""` ケース)
     ///
     /// **Video pin の set ガード**: pin 対象が動画でかつ `video_pins` DB に有効な WebP
@@ -24047,7 +24111,7 @@ impl App {
             self.remove_folder_thumb_pin(&container);
             return;
         }
-        self.try_set_folder_thumb_pin_with_video_guard(&container, source);
+        self.try_set_folder_thumb_pin_with_guard(&container, source);
     }
 
     /// アドレスバー 📌 ボタンの左クリック (toggle) / グリッド P キーショートカットのハンドラ。
@@ -24058,9 +24122,9 @@ impl App {
         self.toggle_folder_pin_for_idx(idx);
     }
 
-    /// `set_folder_thumb_pin` の薄いラッパで、**動画 source の場合は video_pins DB に
-    /// 有効な WebP が無ければ拒否**する。worker が auto-pick fallback で「親フォルダ自身の
-    /// 代表画」を pinned_key に保存してしまう dead pin を防ぐ。
+    /// `set_folder_thumb_pin` の薄いラッパで、代表サムネ source 固有の前提を set 時に
+    /// 一括検証する。動画は `video_pins.db` の WebP、変換対象アーカイブは有効な変換済み
+    /// 読込元が無ければ拒否し、効果のない dead pin を作らない。
     ///
     /// 戻り値: 実際に pin が設定できれば `true`。拒否時はトーストを出して `false`。
     /// 拒否は **set** にのみ適用される (= remove は別経路から直接呼ぶ)。
@@ -24072,7 +24136,7 @@ impl App {
     /// フレームを保存済み) 場合のみ** folder pin を許可する。seed は軽い DB→DB
     /// コピーだけになり UI ヒッチが完全に消える。フレーム未保存の動画に 📌 すると
     /// トーストで「フルスクリーンでフレームを保存してください」と案内する。
-    fn try_set_folder_thumb_pin_with_video_guard(
+    fn try_set_folder_thumb_pin_with_guard(
         &mut self,
         container: &std::path::Path,
         source: crate::folder_thumb_pins::FolderPinSource,
@@ -24100,6 +24164,46 @@ impl App {
                 );
                 crate::logger::log(format!(
                     "folder_thumb_pin: video pin rejected (no WebP) for {}",
+                    abs.display()
+                ));
+                return false;
+            }
+        }
+        if let crate::folder_thumb_pins::FolderPinSource::File {
+            kind: crate::folder_thumb_pins::FileKind::ConvertibleArchive,
+            ..
+        } = &source
+        {
+            let abs = container.join(source.rel());
+            let metadata = std::fs::metadata(&abs).ok();
+            let has_cached_zip = metadata.as_ref().is_some_and(|metadata| {
+                self.archive_cache_db.as_ref().is_some_and(|db| {
+                    db.lookup(
+                        &abs,
+                        crate::ui_helpers::mtime_secs(metadata),
+                        metadata.len() as i64,
+                    )
+                    .is_some()
+                })
+            });
+            // 非ソリッド RAR の直接閲覧は archive_cache.db 行を持たない。非同期 map が
+            // 解決した読込元も RAR の場合だけ、存在確認を guard の代替にする。
+            let has_direct_rar = self
+                .converted_archive_cache_paths
+                .get(&crate::path_key::normalize_keep_drive(&abs))
+                .is_some_and(|load_path| {
+                    crate::rar_loader::is_rar_path(load_path)
+                        && load_path.try_exists().unwrap_or(false)
+                });
+            if !has_cached_zip && !has_direct_rar {
+                self.show_feedback_toast_with_duration(
+                    "まだ変換されていないため代表サムネに固定できません\n\
+                     一度開くか、選択してバッチ変換してください"
+                        .to_string(),
+                    5.0,
+                );
+                crate::logger::log(format!(
+                    "folder_thumb_pin: archive pin rejected (no valid converted source) for {}",
                     abs.display()
                 ));
                 return false;
@@ -24349,8 +24453,13 @@ impl App {
         if matches!(item, GridItem::SearchContainer { .. }) {
             return false;
         }
-        // ConvertibleArchive: disabled + tooltip (描画 OK だが返値は常に false)
-        if matches!(item, GridItem::ConvertibleArchive { .. }) {
+        // 未変換 ConvertibleArchive: disabled + tooltip (描画 OK だが返値は常に false)
+        if matches!(
+            item,
+            GridItem::ConvertibleArchive { path, .. }
+                if !self.converted_archive_cache_paths
+                    .contains_key(&crate::path_key::normalize_keep_drive(path))
+        ) {
             ui.separator();
             ui.add_enabled(false, egui::Button::new("📌 代表サムネに固定"))
                 .on_hover_text("変換後に設定可能 (アーカイブを ZIP に変換すると指定できます)");
@@ -24412,7 +24521,7 @@ impl App {
             if is_current {
                 self.remove_folder_thumb_pin(&pin_container);
             } else {
-                self.try_set_folder_thumb_pin_with_video_guard(&pin_container, source);
+                self.try_set_folder_thumb_pin_with_guard(&pin_container, source);
             }
             // 本の中では対象セルが親階層にあり現ビューに無いので、再 materialize (scroll
             // リセット) は不要。dirty を消して読書位置を保つ (親へ戻れば refresh が拾う)。
@@ -64769,31 +64878,19 @@ fn convertible_archive_cache_base_key(
     ))
 }
 
-fn pin_source_id_with_container_identity(
-    source: &crate::folder_thumb_pins::FolderPinSource,
-    mtime: i64,
-    file_size: i64,
-) -> String {
-    format!(
-        "{}{}|{}",
-        pin_source_id_cache_prefix(source),
-        mtime,
-        file_size
-    )
-}
-
-fn convertible_archive_pinned_cache_key(
-    base_key: &str,
-    source: &crate::folder_thumb_pins::FolderPinSource,
-    mtime: i64,
-    file_size: i64,
-) -> String {
-    format!(
-        "{}{}{}",
-        base_key,
-        crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
-        pin_source_id_with_container_identity(source, mtime, file_size)
-    )
+/// folder-thumb pin の最終 target が変換対象アーカイブ由来なら、worker が実際に
+/// 読める変換キャッシュ ZIP (直接閲覧 RAR の場合は解決済み RAR) へ置き換える。
+/// 非アーカイブ target は元の path をそのまま返す。
+fn folder_pin_load_path(
+    resolved_path: &std::path::Path,
+    converted_archive_cache_paths: &std::collections::HashMap<String, PathBuf>,
+) -> Option<PathBuf> {
+    if !crate::folder_tree::is_convertible_archive_path(resolved_path) {
+        return Some(resolved_path.to_path_buf());
+    }
+    converted_archive_cache_paths
+        .get(&crate::path_key::normalize_keep_drive(resolved_path))
+        .cloned()
 }
 
 impl App {
@@ -65261,6 +65358,7 @@ fn pinned_edit_preview_target(
         ResolvedKind::Video
         | ResolvedKind::Folder
         | ResolvedKind::ZipFirstImage
+        | ResolvedKind::ArchiveFirstImage
         | ResolvedKind::ZipDirRepresentative => (None, false),
     }
 }
@@ -65453,83 +65551,25 @@ fn make_load_request(
             let archive_key = crate::path_key::normalize_keep_drive(path);
             let cached_zip = converted_archive_cache_paths.get(&archive_key)?;
             let base_key = convertible_archive_cache_base_key(path, *format, use_full_path_keys)?;
-            if let Some(
-                source @ crate::folder_thumb_pins::FolderPinSource::ZipEntry { zip_rel, entry },
-            ) = pin_map.get(&archive_key)
-                && zip_rel.is_empty()
-                && !entry.is_empty()
-            {
-                return Some(LoadRequest {
-                    path: cached_zip.clone(),
-                    zip_entry: Some(entry.clone()),
-                    edit_preview_key: Some(crate::adjustment_db::zip_entry_key(cached_zip, entry)),
-                    edit_preview_validate_container: true,
-                    pinned_page_adjustment_key: Some(crate::adjustment_db::zip_entry_key(
-                        cached_zip, entry,
-                    )),
-                    cache_key_override: Some(convertible_archive_pinned_cache_key(
-                        &base_key, source, mtime, file_size,
-                    )),
-                    ..base
-                });
-            }
-            if let Some(source @ crate::folder_thumb_pins::FolderPinSource::ZipDir { zip_rel, .. }) =
-                pin_map.get(&archive_key)
-                && zip_rel.is_empty()
-                && let Some(resolved) =
-                    resolve_pin_target_cascaded(path, source, pin_db, folder_thumb_depth as usize)
-            {
-                let cache_key = format!(
-                    "{}{}{}",
-                    base_key,
-                    crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
-                    resolved.source_id,
-                );
-                match resolved.kind {
-                    crate::folder_thumb_pins::ResolvedKind::ZipEntry => {
-                        let (edit_preview_key, edit_preview_validate_container) =
-                            pinned_edit_preview_target(
-                                resolved.kind,
-                                cached_zip,
-                                resolved.zip_entry.as_deref(),
-                                resolved.pdf_page,
-                            );
-                        return Some(LoadRequest {
-                            path: cached_zip.clone(),
-                            zip_entry: resolved.zip_entry,
-                            pinned_page_adjustment_key: edit_preview_key.clone(),
-                            edit_preview_key,
-                            edit_preview_validate_container,
-                            cache_key_override: Some(cache_key),
-                            mtime: resolved.mtime,
-                            file_size: resolved.file_size,
-                            ..base
-                        });
-                    }
-                    crate::folder_thumb_pins::ResolvedKind::ZipDirRepresentative => {
-                        return Some(LoadRequest {
-                            path: cached_zip.clone(),
-                            zip_dir_prefix: resolved.zip_dir_prefix,
-                            cache_key_override: Some(cache_key),
-                            resolve_override: Some(
-                                crate::thumb_loader::ResolveStrategy::ZipDirRepresentative,
-                            ),
-                            folder_thumb_sort,
-                            folder_thumb_depth,
-                            mtime: resolved.mtime,
-                            file_size: resolved.file_size,
-                            ..base
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            Some(LoadRequest {
+            let req = LoadRequest {
                 path: cached_zip.clone(),
-                cache_key_override: Some(base_key),
+                cache_key_override: Some(base_key.clone()),
                 resolve_override: Some(crate::thumb_loader::ResolveStrategy::ZipFirstImage),
+                folder_thumb_sort,
+                folder_thumb_depth,
                 ..base
-            })
+            };
+            Some(apply_folder_thumb_pin(
+                req,
+                path,
+                &base_key,
+                ContainerKindForPin::ConvertibleArchive,
+                pin_map,
+                converted_archive_cache_paths,
+                pin_db,
+                video_pin_db,
+                pdf_password,
+            ))
         }
         GridItem::ZipFile(p) => {
             // zip_entry は None のままにしておき、ワーカー側でキャッシュミス時に
@@ -65554,6 +65594,7 @@ fn make_load_request(
                 &base_key,
                 ContainerKindForPin::ZipFile,
                 pin_map,
+                converted_archive_cache_paths,
                 pin_db,
                 video_pin_db,
                 pdf_password,
@@ -65581,6 +65622,7 @@ fn make_load_request(
                 &base_key,
                 ContainerKindForPin::PdfFile,
                 pin_map,
+                converted_archive_cache_paths,
                 pin_db,
                 video_pin_db,
                 pdf_password,
@@ -65606,6 +65648,7 @@ fn make_load_request(
                 &base_key,
                 ContainerKindForPin::Folder,
                 pin_map,
+                converted_archive_cache_paths,
                 pin_db,
                 video_pin_db,
                 pdf_password,
@@ -65685,25 +65728,14 @@ fn folder_thumb_existing_keys_for(
         };
         let mut keys = vec![base_key.clone()];
         let container_key = crate::path_key::normalize_keep_drive(container_path);
-        if let (Some((mtime, file_size)), Some(source)) = (item_meta, pin_map.get(&container_key))
-            && matches!(
-                source,
-                crate::folder_thumb_pins::FolderPinSource::ZipEntry { zip_rel, entry }
-                    if zip_rel.is_empty() && !entry.is_empty()
-            )
-        {
-            keys.push(convertible_archive_pinned_cache_key(
-                &base_key, source, mtime, file_size,
-            ));
-        }
-        if let Some(source @ crate::folder_thumb_pins::FolderPinSource::ZipDir { zip_rel, .. }) =
-            pin_map.get(&container_key)
-            && zip_rel.is_empty()
-            && let Some(resolved) = resolve_pin_target_cascaded(
+        if let (Some(root_metadata), Some(source)) = (item_meta, pin_map.get(&container_key))
+            && pin_source_compatible_with_container(ContainerKindForPin::ConvertibleArchive, source)
+            && let Some(resolved) = resolve_pin_target_cascaded_with_root_metadata(
                 container_path,
                 source,
                 pin_db,
                 folder_thumb_depth as usize,
+                root_metadata,
             )
         {
             keys.push(format!(
@@ -65754,6 +65786,7 @@ enum ContainerKindForPin {
     Folder,
     ZipFile,
     PdfFile,
+    ConvertibleArchive,
 }
 
 /// container と source の組合せが妥当か検査する。
@@ -65761,7 +65794,8 @@ enum ContainerKindForPin {
 /// 妥当な組合せ:
 /// - **Folder**: 全 source 形を受け入れる (File/ZipEntry/ZipDir/PdfPage)。
 ///   - ただし ZipEntry / PdfPage は `*_rel` が **空でない** (= サブの ZIP/PDF を指す) ことを要求。
-/// - **ZipFile**: `ZipEntry { zip_rel: "" }` / `ZipDir { zip_rel: "" }` (= container 自身の中身)
+/// - **ZipFile / ConvertibleArchive**: `ZipEntry { zip_rel: "" }` /
+///   `ZipDir { zip_rel: "" }` (= container 自身の中身)
 /// - **PdfFile**: `PdfPage { pdf_rel: "" }` のみ
 fn pin_source_compatible_with_container(
     container: ContainerKindForPin,
@@ -65778,6 +65812,12 @@ fn pin_source_compatible_with_container(
         (ContainerKindForPin::ZipFile, S::ZipEntry { zip_rel, .. }) => zip_rel.is_empty(),
         (ContainerKindForPin::ZipFile, S::ZipDir { zip_rel, .. }) => zip_rel.is_empty(),
         (ContainerKindForPin::ZipFile, _) => false,
+        // 変換対象アーカイブも読込時は ZIP と同じ内側 source だけを受け入れる。
+        (ContainerKindForPin::ConvertibleArchive, S::ZipEntry { zip_rel, .. }) => {
+            zip_rel.is_empty()
+        }
+        (ContainerKindForPin::ConvertibleArchive, S::ZipDir { zip_rel, .. }) => zip_rel.is_empty(),
+        (ContainerKindForPin::ConvertibleArchive, _) => false,
         // PdfFile は内側 PdfPage のみ
         (ContainerKindForPin::PdfFile, S::PdfPage { pdf_rel, .. }) => pdf_rel.is_empty(),
         (ContainerKindForPin::PdfFile, _) => false,
@@ -65825,6 +65865,36 @@ fn resolve_pin_target_cascaded(
     )
 }
 
+/// 通常は stat した target metadata を使うが、現在一覧の container 自身については
+/// `GridItem` と一緒に取得済みの metadata を fallback にできる cascade resolver。
+/// 変換済みアーカイブ自身の内部 pin は、仮想/遅延パスでも従来どおり一覧 metadata から
+/// cache identity を構築する。
+fn resolve_pin_target_cascaded_with_root_metadata(
+    container: &std::path::Path,
+    immediate_source: &crate::folder_thumb_pins::FolderPinSource,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    max_depth: usize,
+    root_metadata: (i64, i64),
+) -> Option<crate::folder_thumb_pins::ResolvedPinTarget> {
+    crate::folder_thumb_pins::resolve_pin_target_cascaded_via_with_metadata(
+        container,
+        immediate_source,
+        |path| pin_db.and_then(|db| db.lookup(path)),
+        |path| {
+            std::fs::metadata(path)
+                .ok()
+                .map(|metadata| {
+                    (
+                        crate::ui_helpers::mtime_secs(&metadata),
+                        metadata.len() as i64,
+                    )
+                })
+                .or_else(|| crate::folder_tree::path_eq(path, container).then_some(root_metadata))
+        },
+        max_depth,
+    )
+}
+
 /// 親コンテナ用 `LoadRequest` (Folder/ZipFile/PdfFile) に対し、手動ピンがあれば
 /// target 種別のリクエストに書き換える。
 ///
@@ -65851,6 +65921,7 @@ fn apply_folder_thumb_pin(
     base_key: &str,
     container_kind: ContainerKindForPin,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    converted_archive_cache_paths: &std::collections::HashMap<String, PathBuf>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     // cascade resolve が Video kind に到達したとき、`video_pins.db` に有効な WebP が
     // あるか確認するために渡す。WebP が無い (= フルスクリーン pin 削除済み / 旧版の
@@ -65878,12 +65949,23 @@ fn apply_folder_thumb_pin(
     // cascade 解決: Folder / ZipFile / PdfFile / ZipDir の pin 連鎖を leaf まで辿る。
     // max_depth は base_req の folder_thumb_depth (= Settings.folder_thumb_depth) に揃える。
     // pin 無し時の `resolve_folder_thumb_image` のサブフォルダ探索上限と同じ仕様にする。
-    let Some(resolved) = resolve_pin_target_cascaded(
-        container,
-        source,
-        pin_db,
-        base_req.folder_thumb_depth as usize,
-    ) else {
+    let resolved = if matches!(container_kind, ContainerKindForPin::ConvertibleArchive) {
+        resolve_pin_target_cascaded_with_root_metadata(
+            container,
+            source,
+            pin_db,
+            base_req.folder_thumb_depth as usize,
+            (base_req.mtime, base_req.file_size),
+        )
+    } else {
+        resolve_pin_target_cascaded(
+            container,
+            source,
+            pin_db,
+            base_req.folder_thumb_depth as usize,
+        )
+    };
+    let Some(resolved) = resolved else {
         crate::logger::log(format!(
             "folder_thumb_pin: target unresolved for {} (source={:?}) — falling back to auto-select",
             container.display(),
@@ -65927,7 +66009,7 @@ fn apply_folder_thumb_pin(
         // 経路で folder auto-pick を pinned_key 下に保存 → 次回 seed が purge という
         // churn が毎ロード走る。base_req に戻せば worker は base_key を使い、
         // auto-pick は base_key 下に普通に保存され churn しない。
-        // WebP は通常 set 時に `try_set_folder_thumb_pin_with_video_guard` が存在を
+        // WebP は通常 set 時に `try_set_folder_thumb_pin_with_guard` が存在を
         // 保証するが、フルスクリーンで pin 削除 / 旧版の dead pin で欠落し得る。
         let has_webp = video_pin_db
             .and_then(|db| db.lookup(&resolved.abs_path))
@@ -65980,9 +66062,31 @@ fn apply_folder_thumb_pin(
         };
     }
 
+    // ArchiveFirstImage はもちろん、cascade 後に ZipEntry / ZipDirRepresentative へ
+    // 到達した場合も `resolved.abs_path` は元アーカイブを保持している。worker へ渡す
+    // 直前にだけ変換キャッシュ ZIP へ置き換え、source identity は元ファイル基準のままにする。
+    let request_path = if matches!(
+        resolved.kind,
+        ResolvedKind::ArchiveFirstImage
+            | ResolvedKind::ZipEntry
+            | ResolvedKind::ZipDirRepresentative
+    ) {
+        let Some(path) = folder_pin_load_path(&resolved.abs_path, converted_archive_cache_paths)
+        else {
+            crate::logger::log(format!(
+                "folder_thumb_pin: archive cache unavailable for {} — falling back to base_req",
+                resolved.abs_path.display()
+            ));
+            return base_req;
+        };
+        path
+    } else {
+        resolved.abs_path.clone()
+    };
+
     let (edit_preview_key, edit_preview_validate_container) = pinned_edit_preview_target(
         resolved.kind,
-        &resolved.abs_path,
+        &request_path,
         resolved.zip_entry.as_deref(),
         resolved.pdf_page,
     );
@@ -65998,6 +66102,7 @@ fn apply_folder_thumb_pin(
             None,
         ),
         ResolvedKind::ZipFirstImage => (Some(ResolveStrategy::ZipFirstImage), None, None, None),
+        ResolvedKind::ArchiveFirstImage => (Some(ResolveStrategy::ZipFirstImage), None, None, None),
         ResolvedKind::ZipDirRepresentative => (
             Some(ResolveStrategy::ZipDirRepresentative),
             None,
@@ -66012,7 +66117,7 @@ fn apply_folder_thumb_pin(
     };
 
     LoadRequest {
-        path: resolved.abs_path,
+        path: request_path,
         relative_page_provenance: None,
         zip_entry,
         zip_dir_prefix,

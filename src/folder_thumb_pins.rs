@@ -1,18 +1,18 @@
-//! 親コンテナ (フォルダ / ZIP / PDF) の代表サムネを手動で固定するためのピン DB。
+//! 親コンテナ (フォルダ / ZIP / PDF / 変換対象アーカイブ) の代表サムネを手動で固定するためのピン DB。
 //!
 //! `%APPDATA%/mimageviewer/folder_thumb_pins.db` に「ユーザーが選んだ代表アイテム」
 //! を保存する。代表サムネ生成の優先順位は次のとおり (Phase B 以降で配線):
 //!
 //! 1. 手動ピン (本 DB) — ★最優先
 //! 2. 自動選定 (`resolve_folder_thumb_image`)
-//! 3. フォルダ / ZIP / PDF アイコン fallback
+//! 3. フォルダ / ZIP / PDF / 変換対象アーカイブのアイコン fallback
 //!
 //! # スキーマ
 //!
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS folder_thumb_pins (
 //!     container_key TEXT PRIMARY KEY,  -- 親フォルダ / ZIP / PDF のパス、normalize_keep_drive 済み
-//!     source_kind   TEXT NOT NULL,     -- "image"/"video"/"folder"/"zipfile"/"pdffile"/"zipentry"/"zipdir"/"pdfpage"
+//!     source_kind   TEXT NOT NULL,     -- "image"/"video"/"folder"/"zipfile"/"pdffile"/"archive"/"zipentry"/"zipdir"/"pdfpage"
 //!     source_rel    TEXT NOT NULL,     -- container 相対パス (zipentry/pdfpage で container 自身を指すときは空)
 //!     source_entry  TEXT,              -- source_kind = "zipentry" のときの ZIP エントリ名 / "zipdir" のときの prefix
 //!     source_page   INTEGER            -- source_kind = "pdfpage" のときのページ番号 (0-indexed)
@@ -41,6 +41,7 @@ pub enum FileKind {
     Folder,
     ZipFile,
     PdfFile,
+    ConvertibleArchive,
 }
 
 impl FileKind {
@@ -51,6 +52,7 @@ impl FileKind {
             FileKind::Folder => "folder",
             FileKind::ZipFile => "zipfile",
             FileKind::PdfFile => "pdffile",
+            FileKind::ConvertibleArchive => "archive",
         }
     }
 
@@ -61,6 +63,7 @@ impl FileKind {
             "folder" => FileKind::Folder,
             "zipfile" => FileKind::ZipFile,
             "pdffile" => FileKind::PdfFile,
+            "archive" => FileKind::ConvertibleArchive,
             _ => return None,
         })
     }
@@ -125,8 +128,7 @@ impl FolderPinSource {
 ///
 /// 返り値:
 /// - `Some(source)`: ピン留め可能な item
-/// - `None`: ピン留め不可 (`ConvertibleArchive` / `SearchContainer`
-///   や relative path が取れないケース)
+/// - `None`: ピン留め不可 (`SearchContainer` や relative path が取れないケース)
 pub fn source_from_grid_item(
     container: &Path,
     item: &crate::grid_item::GridItem,
@@ -152,6 +154,10 @@ pub fn source_from_grid_item(
         GridItem::PdfFile(p) => Some(FolderPinSource::File {
             rel: relative_path_string(container, p)?,
             kind: FileKind::PdfFile,
+        }),
+        GridItem::ConvertibleArchive { path, .. } => Some(FolderPinSource::File {
+            rel: relative_path_string(container, path)?,
+            kind: FileKind::ConvertibleArchive,
         }),
         GridItem::ZipImage {
             zip_path,
@@ -187,10 +193,6 @@ pub fn source_from_grid_item(
                 page: *page_num,
             })
         }
-        // ConvertibleArchive: 親フォルダ上の未展開アイテム自体は中のエントリを
-        // 選択できないので UI 側で disabled + tooltip 表示する。変換キャッシュ ZIP の
-        // 内部で選んだ ZipImage は App 側の zip_nav 経路で ZipEntry source になる。
-        GridItem::ConvertibleArchive { .. } => None,
         // ピン対象として意味がないもの。
         // ZipDir はネスト ZIP ツリーの仮想コンテナで、pin source としては有効。ただし
         // 冗長ラッパー collapse 後の実効 prefix を保存する必要があるため、zip_nav を
@@ -502,6 +504,9 @@ pub enum ResolvedKind {
     ZipFirstImage,
     /// PDF ファイルの page 0
     PdfFirstPage,
+    /// 変換対象アーカイブの先頭画像。`abs_path` は元アーカイブのまま保持し、
+    /// 実際の読込パスへの変換は `App::apply_folder_thumb_pin` 側で行う。
+    ArchiveFirstImage,
     /// 既知 ZIP entry を直接 decode
     ZipEntry,
     /// ZIP 内サブコンテナの代表画像を worker 側で選んで decode
@@ -519,6 +524,20 @@ pub enum ResolvedKind {
 /// この関数は `std::fs::metadata` を 1 回呼ぶ (= cheap stat syscall)。
 /// UI スレッドからの呼び出しを想定。
 pub fn resolve_pin_target(container: &Path, source: &FolderPinSource) -> Option<ResolvedPinTarget> {
+    resolve_pin_target_via(container, source, &|path| {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((crate::ui_helpers::mtime_secs(&meta), meta.len() as i64))
+    })
+}
+
+fn resolve_pin_target_via<M>(
+    container: &Path,
+    source: &FolderPinSource,
+    metadata: &M,
+) -> Option<ResolvedPinTarget>
+where
+    M: Fn(&Path) -> Option<(i64, i64)>,
+{
     let (abs_path, zip_entry, zip_dir_prefix, pdf_page, kind) = match source {
         FolderPinSource::File { rel, kind } => {
             let abs = container.join(rel);
@@ -528,6 +547,7 @@ pub fn resolve_pin_target(container: &Path, source: &FolderPinSource) -> Option<
                 FileKind::Folder => (ResolvedKind::Folder, None),
                 FileKind::ZipFile => (ResolvedKind::ZipFirstImage, None),
                 FileKind::PdfFile => (ResolvedKind::PdfFirstPage, Some(0u32)),
+                FileKind::ConvertibleArchive => (ResolvedKind::ArchiveFirstImage, None),
             };
             (abs, None, None, page, rk)
         }
@@ -572,9 +592,7 @@ pub fn resolve_pin_target(container: &Path, source: &FolderPinSource) -> Option<
         }
     };
 
-    let meta = std::fs::metadata(&abs_path).ok()?;
-    let mtime = crate::ui_helpers::mtime_secs(&meta);
-    let file_size = meta.len() as i64;
+    let (mtime, file_size) = metadata(&abs_path)?;
     // 注: ZipEntry / PdfPage の場合、ここで取る mtime/file_size は **container 全体**
     // の値 (ZIP/PDF ファイル自身)。非ピン経路の ZipImage は entry の uncompressed size と
     // ZIP の mtime を使うのに対し、ピン経路は粒度が粗い (= container 全体が変わったとき
@@ -628,7 +646,7 @@ pub fn resolve_pin_target(container: &Path, source: &FolderPinSource) -> Option<
 /// (Arc 経由) ラップして渡す。
 ///
 /// 仕様: 解決結果が子コンテナ (`Folder` / `ZipFirstImage` /
-/// `PdfFirstPage` / `ZipDirRepresentative`) なら `lookup` でそのコンテナ自身の
+/// `PdfFirstPage` / `ArchiveFirstImage` / `ZipDirRepresentative`) なら `lookup` でそのコンテナ自身の
 /// pin を取り、見つかれば cascade 続行。非コンテナ kind に到達 / lookup 失敗 /
 /// サイクル / `max_depth` 超過のいずれかで停止し、最後の
 /// `ResolvedPinTarget` を返す。
@@ -644,6 +662,32 @@ pub fn resolve_pin_target_cascaded_via<F>(
 where
     F: Fn(&Path) -> Option<FolderPinSource>,
 {
+    resolve_pin_target_cascaded_via_with_metadata(
+        container,
+        immediate_source,
+        lookup,
+        |path| {
+            let meta = std::fs::metadata(path).ok()?;
+            Some((crate::ui_helpers::mtime_secs(&meta), meta.len() as i64))
+        },
+        max_depth,
+    )
+}
+
+/// `resolve_pin_target_cascaded_via` の metadata 取得差し替え版。
+/// 一覧が既に保持する container metadata を利用する経路でも、cascade と source identity の
+/// 組み立てを同じ所有者に保つために使う。
+pub(crate) fn resolve_pin_target_cascaded_via_with_metadata<F, M>(
+    container: &Path,
+    immediate_source: &FolderPinSource,
+    lookup: F,
+    metadata: M,
+    max_depth: usize,
+) -> Option<ResolvedPinTarget>
+where
+    F: Fn(&Path) -> Option<FolderPinSource>,
+    M: Fn(&Path) -> Option<(i64, i64)>,
+{
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     visited.insert(crate::path_key::normalize_keep_drive(container));
     let mut current_container: PathBuf = container.to_path_buf();
@@ -652,13 +696,14 @@ where
     let mut route_source_ids: Vec<String> = Vec::new();
     let mut followed_child_pin = false;
     loop {
-        let resolved = resolve_pin_target(&current_container, &current_source)?;
+        let resolved = resolve_pin_target_via(&current_container, &current_source, &metadata)?;
         route_source_ids.push(resolved.source_id.clone());
         if !matches!(
             resolved.kind,
             ResolvedKind::Folder
                 | ResolvedKind::ZipFirstImage
                 | ResolvedKind::PdfFirstPage
+                | ResolvedKind::ArchiveFirstImage
                 | ResolvedKind::ZipDirRepresentative
         ) {
             return Some(finalize_cascaded_source_id(
@@ -676,7 +721,9 @@ where
         }
         let next_container = match resolved.kind {
             ResolvedKind::Folder => resolved.abs_path.clone(),
-            ResolvedKind::ZipFirstImage | ResolvedKind::PdfFirstPage => resolved.abs_path.clone(),
+            ResolvedKind::ZipFirstImage
+            | ResolvedKind::PdfFirstPage
+            | ResolvedKind::ArchiveFirstImage => resolved.abs_path.clone(),
             ResolvedKind::ZipDirRepresentative => {
                 zip_dir_container_key(&resolved.abs_path, resolved.zip_dir_prefix.as_deref()?)
             }
@@ -726,6 +773,15 @@ where
                 zip_rel.is_empty()
             }
             (ResolvedKind::ZipFirstImage, _) => false,
+            // 変換対象アーカイブ自身の pin は、変換キャッシュ ZIP 内のページ / 仮想
+            // サブコンテナだけ。container key は元アーカイブパスのまま使う。
+            (ResolvedKind::ArchiveFirstImage, FolderPinSource::ZipEntry { zip_rel, .. }) => {
+                zip_rel.is_empty()
+            }
+            (ResolvedKind::ArchiveFirstImage, FolderPinSource::ZipDir { zip_rel, .. }) => {
+                zip_rel.is_empty()
+            }
+            (ResolvedKind::ArchiveFirstImage, _) => false,
             // PDF ファイル自身の pin は、その PDF 内のページだけ。
             (ResolvedKind::PdfFirstPage, FolderPinSource::PdfPage { pdf_rel, .. }) => {
                 pdf_rel.is_empty()
@@ -898,7 +954,7 @@ pub(crate) fn validate_source(source: &FolderPinSource) -> Result<(), FolderPinE
 }
 
 /// container 相対パスとして安全か検査する。
-fn validate_rel(rel: &str) -> Result<(), FolderPinError> {
+pub(crate) fn validate_rel(rel: &str) -> Result<(), FolderPinError> {
     let p = Path::new(rel);
     if p.is_absolute() {
         return Err(FolderPinError::AbsolutePath(rel.to_string()));
@@ -1668,6 +1724,66 @@ mod tests {
     }
 
     #[test]
+    fn cascade_convertible_archive_follows_its_own_page_pin() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!(
+            "miv_pin_cascade_convertible_archive_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let archive = tmp.join("book.7z");
+        std::fs::File::create(&archive)
+            .unwrap()
+            .write_all(b"7z dummy")
+            .unwrap();
+        let immediate = FolderPinSource::File {
+            rel: "book.7z".to_string(),
+            kind: FileKind::ConvertibleArchive,
+        };
+
+        let resolved = resolve_pin_target_cascaded_via(
+            &tmp,
+            &immediate,
+            |_| {
+                Some(FolderPinSource::ZipEntry {
+                    zip_rel: String::new(),
+                    entry: "chapter/page03.jpg".to_string(),
+                })
+            },
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.kind, ResolvedKind::ZipEntry);
+        assert_eq!(resolved.abs_path, archive);
+        assert_eq!(resolved.zip_entry.as_deref(), Some("chapter/page03.jpg"));
+        assert!(resolved.source_id.starts_with("cascade:"));
+        assert!(
+            resolved
+                .source_id
+                .contains(":zipentry||chapter/page03.jpg|-|")
+        );
+
+        let incompatible = resolve_pin_target_cascaded_via(
+            &tmp,
+            &immediate,
+            |_| {
+                Some(FolderPinSource::ZipEntry {
+                    zip_rel: "other.zip".to_string(),
+                    entry: "page.jpg".to_string(),
+                })
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(incompatible.kind, ResolvedKind::ArchiveFirstImage);
+        assert_eq!(incompatible.abs_path, archive);
+        assert!(incompatible.source_id.starts_with("archive|book.7z|"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn cascade_pdffile_follows_its_own_page_pin() {
         use std::io::Write;
         let tmp =
@@ -1784,14 +1900,20 @@ mod tests {
     }
 
     #[test]
-    fn source_from_grid_item_convertible_archive_returns_none() {
+    fn source_from_grid_item_convertible_archive_returns_archive_source() {
         use crate::grid_item::GridItem;
         let container = Path::new(r"C:\Downloads");
         let item = GridItem::ConvertibleArchive {
             path: container.join("scan.7z"),
             format: crate::archive_converter::ArchiveFormat::SevenZ,
         };
-        assert!(source_from_grid_item(container, &item).is_none());
+        assert_eq!(
+            source_from_grid_item(container, &item),
+            Some(FolderPinSource::File {
+                rel: "scan.7z".to_string(),
+                kind: FileKind::ConvertibleArchive,
+            })
+        );
     }
 
     #[test]
@@ -1835,6 +1957,7 @@ mod tests {
             FileKind::Folder,
             FileKind::ZipFile,
             FileKind::PdfFile,
+            FileKind::ConvertibleArchive,
         ] {
             assert_eq!(FileKind::from_db_str(k.as_db_str()), Some(k));
         }

@@ -59,6 +59,7 @@ pub enum NativeMivCommand {
 pub struct NativeMivMenuItem {
     pub command: NativeMivCommand,
     pub label: String,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -175,8 +176,8 @@ mod windows_impl {
         SHGetDesktopFolder, SHParseDisplayName, SetWindowSubclass,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, MF_SEPARATOR, MF_STRING,
-        SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_DRAWITEM,
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, MF_GRAYED, MF_SEPARATOR,
+        MF_STRING, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_DRAWITEM,
         WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
     };
     use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, Ref};
@@ -389,7 +390,7 @@ mod windows_impl {
                     reason: "too many mIV context menu commands".to_string(),
                 };
             };
-            if let Err(e) = append_menu_string(menu.handle(), id, &item.label) {
+            if let Err(e) = append_menu_string(menu.handle(), id, &item.label, item.enabled) {
                 return NativeContextMenuResult::Fallback {
                     reason: format!("AppendMenuW(mIV) failed: {e}"),
                 };
@@ -887,9 +888,19 @@ mod windows_impl {
         result
     }
 
-    fn append_menu_string(menu: HMENU, id: u32, label: &str) -> windows::core::Result<()> {
+    fn append_menu_string(
+        menu: HMENU,
+        id: u32,
+        label: &str,
+        enabled: bool,
+    ) -> windows::core::Result<()> {
         let wide = wide_null(label);
-        unsafe { AppendMenuW(menu, MF_STRING, id as usize, PCWSTR(wide.as_ptr())) }
+        let flags = if enabled {
+            MF_STRING
+        } else {
+            MF_STRING | MF_GRAYED
+        };
+        unsafe { AppendMenuW(menu, flags, id as usize, PCWSTR(wide.as_ptr())) }
     }
 
     fn invoke_canonical_verb(

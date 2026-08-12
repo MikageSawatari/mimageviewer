@@ -15701,6 +15701,79 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn converted_archive_cache_refresh_includes_archive_reached_through_folder_pin() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+        use std::io::Write;
+
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("shelf");
+        std::fs::create_dir_all(&folder).unwrap();
+        let src = folder.join("book.7z");
+        let cached = app.tmp.path().join("book.zip");
+        std::fs::File::create(&src)
+            .unwrap()
+            .write_all(b"archive")
+            .unwrap();
+        std::fs::File::create(&cached)
+            .unwrap()
+            .write_all(b"PK\x03\x04")
+            .unwrap();
+        let src_meta = std::fs::metadata(&src).unwrap();
+        let src_mtime = crate::ui_helpers::mtime_secs(&src_meta);
+        let src_size = src_meta.len() as i64;
+        let cached_size = std::fs::metadata(&cached).unwrap().len() as i64;
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &src,
+                src_mtime,
+                src_size,
+                crate::archive_converter::ArchiveFormat::SevenZ,
+                &cached,
+                cached_size,
+                1,
+                false,
+            )
+            .unwrap();
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &folder,
+                &FolderPinSource::File {
+                    rel: "book.7z".to_string(),
+                    kind: FileKind::ConvertibleArchive,
+                },
+            )
+            .unwrap();
+        let folder_meta = std::fs::metadata(&folder).unwrap();
+        app.install_new_items(
+            vec![GridItem::Folder(folder)],
+            vec![Some((
+                crate::ui_helpers::mtime_secs(&folder_meta),
+                folder_meta.len() as i64,
+            ))],
+        );
+
+        let ctx = egui::Context::default();
+        for _ in 0..50 {
+            app.poll_converted_archive_cache_paths(&ctx);
+            if app.converted_archive_cache_paths_pending.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(app.converted_archive_cache_paths_pending.is_none());
+        assert_eq!(
+            app.converted_archive_cache_paths
+                .get(&crate::path_key::normalize_keep_drive(&src)),
+            Some(&cached)
+        );
+    }
+
+    #[test]
     fn convertible_archive_pin_uses_cached_zip_entry_thumb_request() {
         use crate::folder_thumb_pins::FolderPinSource;
         use crate::grid_item::GridItem;
@@ -15740,7 +15813,11 @@ mod favorite_adjustment_defaults_tests {
         .expect("pinned converted archive should read the pinned entry from cache zip");
 
         let base = "archivethumb:rar:book.rar";
-        let expected_key = convertible_archive_pinned_cache_key(base, &source, 333, 444);
+        let expected_key = format!(
+            "{}{}zipentry||inner/p01.png|-|333|444",
+            base,
+            crate::thumb_loader::CACHE_KEY_PIN_SUFFIX
+        );
         assert_eq!(req.path, cache);
         assert_eq!(req.zip_entry.as_deref(), Some("inner/p01.png"));
         assert_eq!(req.resolve_override, None);
@@ -15796,6 +15873,166 @@ mod favorite_adjustment_defaults_tests {
             Some(crate::adjustment_db::zip_entry_key(&req.path, "chapter/page01.jpg").as_str())
         );
         assert!(req.edit_preview_validate_container);
+    }
+
+    #[test]
+    fn folder_pin_to_convertible_archive_uses_cached_zip_first_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("shelf");
+        std::fs::create_dir_all(&folder).unwrap();
+        let archive = folder.join("book.7z");
+        let cached = temp.path().join("book.zip");
+        std::fs::write(&archive, b"archive").unwrap();
+        std::fs::write(&cached, b"PK\x03\x04 test").unwrap();
+        let archive_meta = std::fs::metadata(&archive).unwrap();
+        let item = GridItem::Folder(folder.clone());
+        let mut pins = std::collections::HashMap::new();
+        pins.insert(
+            crate::path_key::normalize_keep_drive(&folder),
+            crate::folder_thumb_pins::FolderPinSource::File {
+                rel: "book.7z".to_string(),
+                kind: crate::folder_thumb_pins::FileKind::ConvertibleArchive,
+            },
+        );
+        let mut converted = std::collections::HashMap::new();
+        converted.insert(
+            crate::path_key::normalize_keep_drive(&archive),
+            cached.clone(),
+        );
+
+        let req = make_load_request(
+            &item,
+            0,
+            1,
+            2,
+            false,
+            None,
+            Some(crate::settings::SortOrder::FileName),
+            3,
+            &pins,
+            &converted,
+            None,
+            Some(&folder),
+            None,
+            None,
+            false,
+        )
+        .expect("folder pin should read the archive's first image from its cache ZIP");
+
+        assert_eq!(req.path, cached);
+        assert_eq!(
+            req.resolve_override,
+            Some(crate::thumb_loader::ResolveStrategy::ZipFirstImage)
+        );
+        assert_eq!(
+            req.mtime,
+            crate::ui_helpers::mtime_secs(&archive_meta),
+            "catalog identity must remain tied to the source archive"
+        );
+        assert_eq!(req.file_size, archive_meta.len() as i64);
+        assert!(
+            req.cache_key_override
+                .as_deref()
+                .is_some_and(|key| key.contains("#pin:archive|book.7z|"))
+        );
+
+        let fallback = make_load_request(
+            &item,
+            0,
+            1,
+            2,
+            false,
+            None,
+            Some(crate::settings::SortOrder::FileName),
+            3,
+            &pins,
+            &std::collections::HashMap::new(),
+            None,
+            Some(&folder),
+            None,
+            None,
+            false,
+        )
+        .expect("missing archive cache should keep the folder auto-pick request");
+        assert_eq!(fallback.path, folder);
+        assert_eq!(fallback.resolve_override, None);
+        assert!(!fallback.cache_key_override.unwrap().contains("#pin:"));
+    }
+
+    #[test]
+    fn folder_pin_to_convertible_archive_cascades_to_cached_zip_entry() {
+        let app = setup_app();
+        let folder = app.tmp.path().join("shelf");
+        std::fs::create_dir_all(&folder).unwrap();
+        let archive = folder.join("book.7z");
+        let cached = app.tmp.path().join("book.zip");
+        std::fs::write(&archive, b"archive").unwrap();
+        std::fs::write(&cached, b"PK\x03\x04 test").unwrap();
+        let item = GridItem::Folder(folder.clone());
+        let mut pins = std::collections::HashMap::new();
+        pins.insert(
+            crate::path_key::normalize_keep_drive(&folder),
+            crate::folder_thumb_pins::FolderPinSource::File {
+                rel: "book.7z".to_string(),
+                kind: crate::folder_thumb_pins::FileKind::ConvertibleArchive,
+            },
+        );
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &archive,
+                &crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                    zip_rel: String::new(),
+                    entry: "chapter/page03.jpg".to_string(),
+                },
+            )
+            .unwrap();
+        let mut converted = std::collections::HashMap::new();
+        converted.insert(
+            crate::path_key::normalize_keep_drive(&archive),
+            cached.clone(),
+        );
+
+        let req = make_load_request(
+            &item,
+            0,
+            1,
+            2,
+            false,
+            None,
+            Some(crate::settings::SortOrder::FileName),
+            3,
+            &pins,
+            &converted,
+            None,
+            Some(&folder),
+            app.folder_thumb_pin_db.as_deref(),
+            app.video_pin_db.as_ref(),
+            false,
+        )
+        .expect("folder pin should follow the archive's own representative pin");
+
+        assert_eq!(req.path, cached);
+        assert_eq!(req.zip_entry.as_deref(), Some("chapter/page03.jpg"));
+        assert_eq!(req.resolve_override, None);
+        assert_eq!(
+            req.edit_preview_key.as_deref(),
+            Some(crate::adjustment_db::zip_entry_key(&cached, "chapter/page03.jpg").as_str())
+        );
+        let pinned_key = req.cache_key_override.clone().unwrap();
+        assert!(pinned_key.contains("#pin:cascade:"), "{pinned_key}");
+
+        let existing_keys = folder_thumb_existing_keys_for(
+            &item,
+            Some((1, 2)),
+            &pins,
+            app.folder_thumb_pin_db.as_deref(),
+            Some(crate::settings::SortOrder::FileName),
+            3,
+            false,
+        );
+        assert!(existing_keys.contains(&pinned_key));
     }
 
     #[test]
@@ -16148,6 +16385,65 @@ mod favorite_adjustment_defaults_tests {
             .expect("converted archive zip_nav should show the pin button");
         assert!(state.enabled);
         assert!(state.matches_current_pin);
+    }
+
+    #[test]
+    fn convertible_archive_folder_pin_ui_and_set_guard_require_valid_cache() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("shelf");
+        std::fs::create_dir_all(&folder).unwrap();
+        let archive = folder.join("book.7z");
+        let cached = app.tmp.path().join("book.zip");
+        std::fs::write(&archive, b"archive").unwrap();
+        std::fs::write(&cached, b"PK\x03\x04 test").unwrap();
+        let item = GridItem::ConvertibleArchive {
+            path: archive.clone(),
+            format: crate::archive_converter::ArchiveFormat::SevenZ,
+        };
+        app.current_folder = Some(folder.clone());
+        app.items = vec![item];
+        app.image_metas = vec![Some((1, 2))];
+        app.selected = Some(0);
+        app.settings.show_address_bar_folder_pin = true;
+
+        let unavailable = app.compute_folder_pin_button_state().unwrap();
+        assert!(!unavailable.enabled);
+        assert!(unavailable.tooltip.contains("変換後に設定可能"));
+
+        app.converted_archive_cache_paths.insert(
+            crate::path_key::normalize_keep_drive(&archive),
+            cached.clone(),
+        );
+        let ready_in_memory = app.compute_folder_pin_button_state().unwrap();
+        assert!(ready_in_memory.enabled);
+
+        // 非同期 map だけが stale に残っていても set 時 guard が DB を再検証する。
+        app.toggle_folder_pin_for_idx(0);
+        assert!(app.folder_thumb_pin_for(&folder).is_none());
+
+        let archive_meta = std::fs::metadata(&archive).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &archive,
+                crate::ui_helpers::mtime_secs(&archive_meta),
+                archive_meta.len() as i64,
+                crate::archive_converter::ArchiveFormat::SevenZ,
+                &cached,
+                std::fs::metadata(&cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        app.toggle_folder_pin_for_idx(0);
+        assert_eq!(
+            app.folder_thumb_pin_for(&folder),
+            Some(&crate::folder_thumb_pins::FolderPinSource::File {
+                rel: "book.7z".to_string(),
+                kind: crate::folder_thumb_pins::FileKind::ConvertibleArchive,
+            })
+        );
     }
 
     #[test]

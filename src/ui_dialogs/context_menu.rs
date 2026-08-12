@@ -1372,19 +1372,23 @@ impl crate::app::App {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::CopyPath,
                 label: "選択項目のパスをコピー".to_string(),
+                enabled: true,
             });
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::RotateLeft,
                 label: "左に回転 (L)".to_string(),
+                enabled: true,
             });
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::RotateRight,
                 label: "右に回転 (R)".to_string(),
+                enabled: true,
             });
             if target.explorer_folder.is_some() {
                 items.push(NativeMivMenuItem {
                     command: NativeMivCommand::OpenFolderInExplorer,
                     label: "このフォルダをエクスプローラで開く".to_string(),
+                    enabled: true,
                 });
             }
             return items;
@@ -1400,10 +1404,12 @@ impl crate::app::App {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::NewFolder,
                 label: "新しいフォルダ...".to_string(),
+                enabled: true,
             });
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::Paste,
                 label: "貼り付け".to_string(),
+                enabled: true,
             });
         }
 
@@ -1411,6 +1417,7 @@ impl crate::app::App {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::Rename,
                 label: "名前の変更...".to_string(),
+                enabled: true,
             });
         }
 
@@ -1422,6 +1429,7 @@ impl crate::app::App {
         items.push(NativeMivMenuItem {
             command: NativeMivCommand::CopyPath,
             label: copy_path_label.to_string(),
+            enabled: true,
         });
         if !target.is_folder_context
             && target
@@ -1434,12 +1442,14 @@ impl crate::app::App {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::CopyFileName,
                 label: "ファイル名をコピー".to_string(),
+                enabled: true,
             });
         }
         if matches!(target.item, GridItem::Image(_)) {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::CopyImageToClipboard,
                 label: "画像をクリップボードにコピー".to_string(),
+                enabled: true,
             });
         }
         if matches!(
@@ -1449,11 +1459,13 @@ impl crate::app::App {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::CopyEditBundle,
                 label: "編集内容をコピー".to_string(),
+                enabled: true,
             });
             if self.has_page_edit_bundle_clipboard() {
                 items.push(NativeMivMenuItem {
                     command: NativeMivCommand::PasteEditBundle,
                     label: "編集内容を貼り付け".to_string(),
+                    enabled: true,
                 });
             }
         }
@@ -1467,16 +1479,19 @@ impl crate::app::App {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::OpenContainerAsPage,
                 label: "ページを開く".to_string(),
+                enabled: true,
             });
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::OpenContainerAsList,
                 label: "一覧を開く".to_string(),
+                enabled: true,
             });
         }
         if in_search && !target.is_folder_context {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::JumpToFolder,
                 label: "フォルダに移動".to_string(),
+                enabled: true,
             });
         }
         if matches!(target.item, GridItem::Image(_))
@@ -1485,36 +1500,41 @@ impl crate::app::App {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::RotateLeft,
                 label: "左に回転 (L)".to_string(),
+                enabled: true,
             });
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::RotateRight,
                 label: "右に回転 (R)".to_string(),
+                enabled: true,
             });
         }
         if fullscreen_video {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::SetCurrentVideoFrameThumbnail,
                 label: "📌 現在のフレームを動画サムネに設定".to_string(),
+                enabled: true,
             });
-        } else if let Some(label) = self.native_folder_pin_context_label(target) {
+        } else if let Some((label, enabled)) = self.native_folder_pin_context_state(target) {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::ToggleRepresentativeThumb,
                 label,
+                enabled,
             });
         }
         if target.explorer_folder.is_some() {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::OpenFolderInExplorer,
                 label: "このフォルダをエクスプローラで開く".to_string(),
+                enabled: true,
             });
         }
         items
     }
 
-    fn native_folder_pin_context_label(
+    fn native_folder_pin_context_state(
         &self,
         target: &NativeGridContextMenuTarget,
-    ) -> Option<String> {
+    ) -> Option<(String, bool)> {
         if target.is_folder_context
             || target.item_index.is_none()
             || self.items_are_global_search_view
@@ -1530,13 +1550,20 @@ impl crate::app::App {
             return None;
         }
         let source = crate::folder_thumb_pins::source_from_grid_item(container, &target.item)?;
+        if let GridItem::ConvertibleArchive { path, .. } = &target.item
+            && !self
+                .converted_archive_cache_paths
+                .contains_key(&crate::path_key::normalize_keep_drive(path))
+        {
+            return Some(("📌 代表サムネ固定: 変換後に設定可能".to_string(), false));
+        }
         let existing = self.folder_thumb_pin_for(container);
         let label = if existing == Some(&source) {
             "📌 代表サムネ固定を解除"
         } else {
             "📌 代表サムネに固定"
         };
-        Some(label.to_string())
+        Some((label.to_string(), true))
     }
 
     fn dispatch_native_grid_context_command(
