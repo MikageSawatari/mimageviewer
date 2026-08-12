@@ -6568,10 +6568,58 @@ struct FsPageTurnFrameDecision {
 enum FsPageTurnBurstState {
     #[default]
     Idle,
+    /// キーを押したまま 1 回だけ送った状態。**まだ通し描画にしない。**
+    ///
+    /// 1 回の押下でもナビ確定の瞬間はキーが物理的に押されているので、ここを `Active` に
+    /// すると、1 ページずつゆっくり読む操作でも毎回サムネ画質が一瞬見える (実機 FB
+    /// 2026-08-13)。連打かキーリピートで**同じ押下のまま 2 回目**が来て初めて `Active` にする。
+    /// キーを離せば `Idle` へ戻るので、ゆっくり押し直す限り常に元の画質で表示される。
+    Armed {
+        items_generation: u64,
+        current_idx: usize,
+    },
     Active {
         items_generation: u64,
         current_idx: usize,
     },
+}
+
+impl FsPageTurnBurstState {
+    /// この状態が指定の世代・ページを追跡しているか (= 押下が途切れていない同じ流れか)。
+    fn tracks(self, items_generation: u64, idx: usize) -> bool {
+        match self {
+            Self::Idle => false,
+            Self::Armed {
+                items_generation: generation,
+                current_idx,
+            }
+            | Self::Active {
+                items_generation: generation,
+                current_idx,
+            } => generation == items_generation && current_idx == idx,
+        }
+    }
+
+    fn is_active(self) -> bool {
+        matches!(self, Self::Active { .. })
+    }
+
+    /// 押下を保ったままの 1 回のページ送りを反映する。
+    ///
+    /// 同じ押下の続きなら `Active`、そうでなければ `Armed` から始める。
+    fn advance(self, items_generation: u64, from_idx: usize, to_idx: usize) -> Self {
+        if self.tracks(items_generation, from_idx) {
+            Self::Active {
+                items_generation,
+                current_idx: to_idx,
+            }
+        } else {
+            Self::Armed {
+                items_generation,
+                current_idx: to_idx,
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13175,25 +13223,13 @@ impl App {
             let mut burst_state = ctx
                 .data(|data| data.get_temp::<FsPageTurnBurstState>(burst_id))
                 .unwrap_or_default();
-            if !page_turn_input_held
-                || !matches!(
-                    burst_state,
-                    FsPageTurnBurstState::Active {
-                        items_generation,
-                        current_idx,
-                    } if items_generation == self.items_generation && current_idx == fs_idx
-                )
-            {
+            // 押下が途切れた時点で `Armed` も含めて捨てる。これが「ゆっくり押し直す限り
+            // 常に元の画質」を成り立たせている唯一の条件で、時間しきい値は使わない。
+            if !page_turn_input_held || !burst_state.tracks(self.items_generation, fs_idx) {
                 burst_state = FsPageTurnBurstState::Idle;
                 ctx.data_mut(|data| data.insert_temp(burst_id, burst_state));
             }
-            let page_turn_burst_active = matches!(
-                burst_state,
-                FsPageTurnBurstState::Active {
-                    items_generation,
-                    current_idx,
-                } if items_generation == self.items_generation && current_idx == fs_idx
-            );
+            let page_turn_burst_active = burst_state.is_active();
             let passthrough_rendition_ready = page_turn_burst_active
                 && self.fs_page_turn_passthrough_renditions_ready(ctx, fs_idx);
             let decision = page_turn_decision_for_inputs(
@@ -13241,15 +13277,20 @@ impl App {
         {
             let (held, blocker, viewport) = self.fs_page_turn_input_held(ctx, current_idx);
             let moved = target_idx.is_some_and(|target_idx| target_idx != current_idx);
+            let burst_id = egui::Id::new(("fs_page_turn_burst", viewport));
             let state = if held && blocker.is_none() && moved {
-                FsPageTurnBurstState::Active {
-                    items_generation: self.items_generation,
-                    current_idx: target_idx.expect("moved page turn has a target"),
-                }
+                // 同じ押下の続き (キーリピート / 連打) で初めて通し描画へ上げる。
+                // 1 回目は `Armed` に留めるので、単発のページ送りは元の画質のまま。
+                ctx.data(|data| data.get_temp::<FsPageTurnBurstState>(burst_id))
+                    .unwrap_or_default()
+                    .advance(
+                        self.items_generation,
+                        current_idx,
+                        target_idx.expect("moved page turn has a target"),
+                    )
             } else {
                 FsPageTurnBurstState::Idle
             };
-            let burst_id = egui::Id::new(("fs_page_turn_burst", viewport));
             let decision_id = egui::Id::new(("fs_page_turn_decision", viewport));
             ctx.data_mut(|data| {
                 data.insert_temp(burst_id, state);
@@ -30940,6 +30981,59 @@ mod tests {
                 passthrough_rendition_ready: true,
             }
         );
+    }
+
+    #[test]
+    fn a_single_page_turn_does_not_reach_the_pass_through_burst() {
+        // 実機 FB 2026-08-13: 1 ページずつゆっくり読むときも一瞬サムネ画質が見えていた。
+        // 1 回の押下でもナビ確定の瞬間はキーが押されているため、1 回目で Active にすると
+        // 押している間だけ通し描画になってしまう。
+        let first = FsPageTurnBurstState::default().advance(3, 10, 11);
+
+        assert_eq!(
+            first,
+            FsPageTurnBurstState::Armed {
+                items_generation: 3,
+                current_idx: 11,
+            }
+        );
+        assert!(!first.is_active(), "the first turn must stay full quality");
+
+        // 同じ押下のまま 2 回目 (キーリピート / 連打) で初めて通し描画へ上げる。
+        let second = first.advance(3, 11, 12);
+        assert!(second.is_active());
+        assert_eq!(
+            second,
+            FsPageTurnBurstState::Active {
+                items_generation: 3,
+                current_idx: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn releasing_the_key_disarms_the_burst_so_slow_paging_never_degrades() {
+        // 「押下が途切れたら捨てる」だけで、ゆっくり押し直す限り常に元の画質になる。
+        // 時間しきい値は使わない。
+        let armed = FsPageTurnBurstState::default().advance(3, 10, 11);
+        assert!(armed.tracks(3, 11));
+
+        // 離した後に押し直すと、追跡している流れが切れているので Armed からやり直す。
+        let after_release = FsPageTurnBurstState::Idle;
+        assert!(!after_release.tracks(3, 11));
+        assert_eq!(
+            after_release.advance(3, 11, 12),
+            FsPageTurnBurstState::Armed {
+                items_generation: 3,
+                current_idx: 12,
+            }
+        );
+
+        // 一覧が入れ替わった (世代が変わった) 場合も続きとは見なさない。
+        assert!(!armed.tracks(4, 11));
+        assert!(!armed.advance(4, 11, 12).is_active());
+        // 押下は続いていても別のページから送られたなら続きではない。
+        assert!(!armed.advance(3, 99, 100).is_active());
     }
 
     #[test]
