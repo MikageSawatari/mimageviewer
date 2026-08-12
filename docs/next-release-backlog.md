@@ -994,7 +994,7 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   ナビ対象が空になる) をまだ観測していない。**推測で guard を足さず、まず再現して
   どの経路が壊れているかを特定する**こと。
 - **再現できた (2026-08-13)**。手作業ではなくアプリ内蔵ハーネスで自動再現した。
-  再現データ `C:	mp\miv-continuous-video\` (画像 11 + 動画 1 + 画像 6)、
+  再現データ `C:\tmp\miv-continuous-video\` (画像 11 + 動画 1 + 画像 6)、
   スクリプト [continuous-video-nav.rhai](../scripts/page-turn/continuous-video-nav.rhai)。
   縦連結で `Right` を 11 回叩くと **`current_is_still_image` が false になり、動画へ入った**。
   横断キーが動画をスキップしないことは、これで観測として確定した。
