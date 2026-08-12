@@ -4203,6 +4203,10 @@ fn forwarded_source_ip(request: &Request) -> Option<std::net::IpAddr> {
         .ok()
 }
 
+/// Builds proxy metadata without retaining values that identify a Tailscale user.
+///
+/// The always-on diagnostic log records only sorted `Tailscale-User-*` header names,
+/// never their values, matching its policy of redacting identifying filesystem paths.
 fn request_proxy_details(request: &Request) -> Value {
     let forwarded_proto = header_value(request, "X-Forwarded-Proto").map(limit_log_value);
     let https_source = if request.secure() {
@@ -4212,24 +4216,22 @@ fn request_proxy_details(request: &Request) -> Value {
     } else {
         "plain_http"
     };
-    let mut tailscale_user_headers = serde_json::Map::new();
+    let mut tailscale_user_header_names = Vec::new();
     for header in request.headers() {
         let name = header.field.as_str().as_str();
         if name
             .get(..15)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Tailscale-User-"))
         {
-            tailscale_user_headers.insert(
-                name.to_owned(),
-                Value::String(limit_log_value(header.value.as_str())),
-            );
+            tailscale_user_header_names.push(name.to_owned());
         }
     }
+    tailscale_user_header_names.sort();
     json!({
         "remote_addr": request.remote_addr().map(ToString::to_string),
         "x_forwarded_for": header_value(request, "X-Forwarded-For").map(limit_log_value),
         "x_forwarded_proto": forwarded_proto,
-        "tailscale_user_headers": tailscale_user_headers,
+        "tailscale_user_header_names": tailscale_user_header_names,
         "https_detected": request_is_https(request),
         "https_source": https_source,
     })
@@ -5769,27 +5771,66 @@ mod tests {
     }
 
     #[test]
-    fn proxy_headers_and_remote_address_are_exposed_to_request_log_details() {
+    fn request_log_details_never_expose_tailscale_user_header_values() {
         let forwarded_for = Header::from_bytes("X-Forwarded-For", "100.64.0.42").unwrap();
         let forwarded_proto = Header::from_bytes("X-Forwarded-Proto", "https").unwrap();
-        let tailscale_user =
-            Header::from_bytes("Tailscale-User-Login", "alice@example.com").unwrap();
+        let tailscale_login =
+            Header::from_bytes("Tailscale-User-Login", "alice@example.invalid").unwrap();
+        let tailscale_name =
+            Header::from_bytes("Tailscale-User-Name", "=?utf-8?q?Alice_Example?=").unwrap();
+        let tailscale_profile_pic = Header::from_bytes(
+            "Tailscale-User-Profile-Pic",
+            "https://profiles.example.invalid/alice/private-photo",
+        )
+        .unwrap();
         let request: Request = TestRequest::new()
             .with_remote_addr("127.0.0.1:54321".parse().unwrap())
             .with_header(forwarded_for)
             .with_header(forwarded_proto)
-            .with_header(tailscale_user)
+            .with_header(tailscale_profile_pic)
+            .with_header(tailscale_login)
+            .with_header(tailscale_name)
             .into();
         let details = request_proxy_details(&request);
+        let serialized_details = serde_json::to_string(&details).unwrap();
+        for identifying_value in [
+            "alice@example.invalid",
+            "=?utf-8?q?Alice_Example?=",
+            "https://profiles.example.invalid/alice/private-photo",
+        ] {
+            assert!(
+                !serialized_details.contains(identifying_value),
+                "Tailscale identity value was logged: {identifying_value}"
+            );
+        }
+
         assert_eq!(details["remote_addr"], "127.0.0.1:54321");
         assert_eq!(details["x_forwarded_for"], "100.64.0.42");
         assert_eq!(details["x_forwarded_proto"], "https");
         assert_eq!(
-            details["tailscale_user_headers"]["Tailscale-User-Login"],
-            "alice@example.com"
+            details["tailscale_user_header_names"],
+            serde_json::to_value([
+                "Tailscale-User-Login",
+                "Tailscale-User-Name",
+                "Tailscale-User-Profile-Pic",
+            ])
+            .unwrap()
         );
         assert_eq!(details["https_detected"], true);
         assert_eq!(details["https_source"], "x_forwarded_proto");
+        assert!(
+            details.get("tailscale_user_headers").is_none(),
+            "legacy Tailscale header value field remains in the log"
+        );
+
+        let details_without_tailscale_headers = request_proxy_details(&TestRequest::new().into());
+        assert_eq!(
+            details_without_tailscale_headers["tailscale_user_header_names"]
+                .as_array()
+                .map(Vec::is_empty),
+            Some(true),
+            "missing Tailscale headers must produce an empty name list"
+        );
     }
 
     #[test]

@@ -2559,3 +2559,15 @@ object URL を revoke する。ready 要素も窓外では同様に解放する�
 `tap_to_display_ms`、保持中の decoded 単位数を残す。この増分の効果は仕様では保証されない。画面外の
 `<img>` の decode 結果をブラウザが維持するかを実機値で判断し、再利用できない、または再利用しても
 待ち時間が下がらない場合は、次の独立した選択肢として canvas 描画と `createImageBitmap` を検討する。
+
+### 14.20 診断ログから Tailscale アカウント値を除外 (2026-08-12)
+
+常時出力される診断ログは、`Tailscale-User-Login`、`Tailscale-User-Name`、
+`Tailscale-User-Profile-Pic` を含む `Tailscale-User-*` ヘッダの値を一切持たない。
+`details.proxy.tailscale_user_header_names` には、Tailscale が呼び出し元を識別したかを診断できるよう
+ヘッダ名だけをソート済み配列で残す。これはクライアント telemetry のファイルパスを伏せる契約と
+同じく、診断に不要な個人識別値を永続ログへ入れないための不変条件である。
+
+`x_forwarded_for` は値を維持する。tailnet 内の `100.x.x.x` アドレスは氏名、メールアドレス、
+プロフィール画像とは性質が異なり、どの利用者端末から要求されたかを切り分けるために必要である。
+`remote_addr`、HTTPS 判定とその根拠も従来どおりとし、認証でのヘッダ利用可否には影響させない。

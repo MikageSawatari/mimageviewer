@@ -119,7 +119,7 @@
       本アプリは利用者の PC 上でローカルに動作するデスクトップアプリケーションであり、
       <strong>開発者が利用者の個人情報を収集・送信・販売することは一切ありません。</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年7月11日</p>
+    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年8月12日</p>
   </section>
 
   <section>
@@ -138,11 +138,18 @@
       <li>サムネイルキャッシュ</li>
       <li>タグ・レーティング・回転情報・読み込み履歴</li>
       <li>PDF のパスワード（Windows の暗号化機能で暗号化して保存）</li>
+      <li>リモート閲覧の暗証番号（そのままではなく、元に戻せない形に変換して保存）</li>
+      <li>リモート閲覧の動作記録（表示にかかった時間などの数値と、開いたページの名前）</li>
     </ul>
     <div class="info-box">
       保存先は <code>%APPDATA%\mimageviewer</code>（インストーラ版・単体exe版）、
       またはポータブル版では実行ファイルと同じ場所の <code>data</code> フォルダです。
       アンインストール時に削除できます。
+    </div>
+    <div class="info-box">
+      不具合を調べるための<strong>動作記録を利用者が有効にした場合</strong>は、
+      開いたファイルの場所を含む記録が PC 内の <code>logs</code> フォルダに残ります。
+      これも外部へ送信されることはなく、不要になれば削除できます。
     </div>
   </section>
 
@@ -152,6 +159,11 @@
     <ul class="pink-list">
       <li><strong>更新確認</strong>: 新しいバージョンの有無を確認するため、配布元（GitHub）の公開リリース情報を取得します。通常の HTTP リクエストのみで、個人を特定する情報は送信しません。</li>
       <li><strong>任意コンポーネントのダウンロード</strong>: 利用者が自ら選択した場合に限り、AI 高速化用コンポーネント等を配布元から取得します。</li>
+      <li><strong>リモート閲覧（既定では無効）</strong>: 利用者が自ら有効にした場合に限り、
+        PC 内で待ち受けを始め、利用者自身のスマートフォンやタブレットのブラウザへ画像を送ります。
+        待ち受けは PC の内部に対して行うので、外部から直接つながることはありません。
+        外出先からつなぐには、別途インストールする Tailscale を利用者自身が設定します。
+        <strong>画像やライブラリの内容が、開発者やその他の第三者のサーバーへ送られることはありません。</strong></li>
     </ul>
     <p>
       これらの通信先（GitHub / mikage.to 等）は、各社のプライバシーポリシーに従って
@@ -172,14 +184,24 @@
   <section>
     <h2>解析・広告</h2>
     <p>
-      本アプリは、アクセス解析ツール・テレメトリ・広告を<strong>一切含みません</strong>。
+      本アプリは、アクセス解析ツール・広告を<strong>一切含みません</strong>。
       利用状況やクラッシュ情報を開発者へ自動送信することもありません。
+    </p>
+    <p>
+      動作記録は、利用者自身が不具合を調べるために PC 内へ保存されるものです。
+      <strong>開発者がそれを受け取ることはありません。</strong>
     </p>
   </section>
 
   <section>
     <h2>第三者への提供</h2>
     <p>本アプリは個人情報を収集しないため、第三者へ提供する情報はありません。</p>
+    <p>
+      リモート閲覧を外出先から使う場合に必要な Tailscale は、本アプリとは別の会社が提供する
+      ソフトウェアとサービスで、利用者自身が契約・設定します。その利用は
+      <a href="https://tailscale.com/privacy-policy" target="_blank" rel="noopener">Tailscale のプライバシーポリシー</a>
+      に従います。<strong>本アプリが Tailscale へ利用者の情報を渡すことはありません。</strong>
+    </p>
   </section>
 
   <section>
@@ -207,7 +229,7 @@
       runs locally on your PC. <strong>The developer does not collect, transmit, or sell any of
       your personal information.</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">Last updated: July 11, 2026</p>
+    <p style="font-size:0.85rem; color:#888;">Last updated: August 12, 2026</p>
   </section>
 
   <section>
@@ -227,11 +249,19 @@
       <li>Thumbnail cache</li>
       <li>Tags, ratings, rotation info, and reading history</li>
       <li>PDF passwords (encrypted using the Windows data-protection API)</li>
+      <li>The remote-viewing PIN (stored in a form that cannot be turned back into the PIN)</li>
+      <li>Remote-viewing operation records (timings and similar numbers, plus the names of the pages you opened)</li>
     </ul>
     <div class="info-box">
       Data is stored in <code>%APPDATA%\mimageviewer</code> (installer / single-exe editions),
       or in a <code>data</code> folder next to the executable (portable edition). It can be
       removed when you uninstall the App.
+    </div>
+    <div class="info-box">
+      <strong>If you turn on operation logging</strong> to investigate a problem, the records
+      kept in the <code>logs</code> folder on your PC include the locations of the files you
+      opened. These are not sent anywhere either, and you can delete them once you no longer
+      need them.
     </div>
   </section>
 
@@ -241,6 +271,12 @@
     <ul class="pink-list">
       <li><strong>Update check</strong>: to see whether a newer version exists, the App retrieves the public release information from the distribution source (GitHub). This is an ordinary HTTP request and includes no personally identifying information.</li>
       <li><strong>Optional component download</strong>: only when you choose to, the App downloads optional components (such as AI acceleration packs) from the distribution source.</li>
+      <li><strong>Remote viewing (off by default)</strong>: only when you turn it on, the App
+        starts listening inside your PC and sends images to a browser on your own phone or
+        tablet. It listens on the PC itself, so nothing can reach it directly from outside.
+        To connect while away from home you set up Tailscale yourself, which you install
+        separately. <strong>Your images and the contents of your library are never sent to the
+        developer or to any other third party's server.</strong></li>
     </ul>
     <p>
       These endpoints (GitHub / mikage.to, etc.) may record standard access logs (such as IP
@@ -261,14 +297,25 @@
   <section>
     <h2>Analytics and advertising</h2>
     <p>
-      The App contains <strong>no analytics tools, telemetry, or advertising</strong>, and does
+      The App contains <strong>no analytics tools and no advertising</strong>, and does
       not automatically send usage or crash data to the developer.
+    </p>
+    <p>
+      Operation records are kept on your PC so that you can investigate problems yourself.
+      <strong>The developer never receives them.</strong>
     </p>
   </section>
 
   <section>
     <h2>Sharing with third parties</h2>
     <p>Because the App collects no personal information, there is nothing to share with third parties.</p>
+    <p>
+      Tailscale, which you need in order to use remote viewing away from home, is software and
+      a service from a different company; you sign up for it and configure it yourself. Your use
+      of it is governed by
+      <a href="https://tailscale.com/privacy-policy" target="_blank" rel="noopener">Tailscale's privacy policy</a>.
+      <strong>The App does not pass any of your information to Tailscale.</strong>
+    </p>
   </section>
 
   <section>
