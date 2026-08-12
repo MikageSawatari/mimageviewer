@@ -2525,7 +2525,10 @@ PDF では `canonical_pdf_raster_dims`、すなわち canonical renderer が返�
 `StoredEditSpace` に入れ、target_px が 1024 / 4096 / 8192 のどれでも同じページ割合を切り出す。
 通常画像は従来どおり decode 後の元画素寸法を使う。安定した native pixel space がない vector PDF は、
 現在要求の raster へ黙ってフォールバックすると再び範囲が動くため、保存済み crop / コミック注釈が
-ある remote 描画を明示的に失敗させる。
+あってもその raster へ矩形を適用しない。一方、本体は vector かどうかで分岐せずページ表示自体を
+失敗させないため、remote もページ全体の描画を継続し、適用しなかった対象と理由を型付きログに残す。
+これにより誤った範囲を返さず、文書系 PDF の主流である vector ページを remote だけ閲覧不能にしない。
+vector ページにも解像度非依存の正準寸法を与える案は、本体側のページ枠まわりが落ち着いてから扱う。
 
 カタログ値を使う remote の残り 1 箇所は縦横比による見開き分類だけであり、絶対座標へは変換しない。
 `StoredEditSpace` は downstream でカタログ値との混同を防ぐだけでなく、constructor でも PDF に

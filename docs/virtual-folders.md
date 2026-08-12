@@ -430,7 +430,9 @@ catalog のこの生成経路を通らず、fullscreen も poster thumbnail へ�
 正準ラスタ寸法 (`canonical_pdf_raster_dims` / canonical renderer の `native_dims`) を基準にする。
 この基準は表示要求の 1024 / 4096 / 8192 などで変化してはならない。`CropSettings` は矩形だけを持ち
 基準寸法を保存しないため、安定した native pixel space を持たない vector PDF では現在の表示 raster へ
-黙ってフォールバックせず、remote の保存済み絶対編集を明示的な描画失敗にする。
+黙ってフォールバックしない。本体は vector かどうかでページ表示自体を失敗させないため、remote も
+保存済み crop / コミック注釈だけを適用せずページ全体を描画し、対象と理由を型付きログへ記録する。
+vector ページにも解像度非依存の正準寸法を与える案は、本体側のページ枠まわりが落ち着いてから扱う。
 
 この意味変更より前のリリース済み catalog は PDF 行に thumbnail 自身の寸法を持つ。元の page box は
 WebP から復元できないため、`pdf_layout_dims_version` の初回 migration で PDF 仮想 catalog のページ行と

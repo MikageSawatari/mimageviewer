@@ -197,6 +197,82 @@ struct StoredEditSpace {
     canonical_dims: [usize; 2],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoredEditSkipReason {
+    PdfVectorHasNoCanonicalRaster,
+    PdfCanonicalAnalysisFailed,
+    PdfCanonicalRasterUnavailable,
+}
+
+impl StoredEditSkipReason {
+    fn log_value(self) -> &'static str {
+        match self {
+            Self::PdfVectorHasNoCanonicalRaster => "pdf_vector_no_canonical_raster",
+            Self::PdfCanonicalAnalysisFailed => "pdf_canonical_analysis_failed",
+            Self::PdfCanonicalRasterUnavailable => "pdf_canonical_raster_unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoredEditPipeline {
+    Page,
+    FinalAi,
+}
+
+impl StoredEditPipeline {
+    fn log_value(self) -> &'static str {
+        match self {
+            Self::Page => "page",
+            Self::FinalAi => "final_ai",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SkippedStoredEdits {
+    pipeline: StoredEditPipeline,
+    page_number: u32,
+    reason: StoredEditSkipReason,
+    crop: bool,
+    comic_objects: usize,
+}
+
+impl SkippedStoredEdits {
+    fn log_line(self) -> String {
+        format!(
+            "remote_ipc: stored_edit outcome=skipped pipeline={} target=pdf_page page_number={} reason={} crop={} comic_objects={}",
+            self.pipeline.log_value(),
+            self.page_number,
+            self.reason.log_value(),
+            self.crop,
+            self.comic_objects,
+        )
+    }
+}
+
+fn record_skipped_stored_edits_with(skipped: SkippedStoredEdits, emit: impl FnOnce(String)) {
+    emit(skipped.log_line());
+}
+
+fn record_skipped_stored_edits(skipped: SkippedStoredEdits) {
+    record_skipped_stored_edits_with(skipped, crate::logger::log);
+}
+
+fn crop_with_stored_edit_space(
+    pixels: Arc<egui::ColorImage>,
+    crop: Option<crate::export_crop::CropSettings>,
+    stored_edit_space: Option<StoredEditSpace>,
+) -> Result<Arc<egui::ColorImage>, String> {
+    let (Some(crop), Some(stored_edit_space)) = (crop, stored_edit_space) else {
+        // An unavailable canonical space is a deliberate skip, not permission to reinterpret the
+        // saved rectangle in the current request raster. Return the full page unchanged.
+        return Ok(pixels);
+    };
+    let rect = stored_edit_space.crop_rect(crop, pixels.size);
+    crate::export_crop::crop_color_image(&pixels, rect).map(Arc::new)
+}
+
 impl StoredEditSpace {
     fn for_remote_source(
         subresource: &RemoteSubresource,
@@ -2289,9 +2365,15 @@ impl ContainerEngine {
                 pdf_canonical_raster_dims,
             );
             if requires_stored_edit_space && stored_edit_space.is_none() {
-                return Err(RemoteAiRunError::Failed(
-                    "PDF page has no request-independent pixel space for saved edits".to_owned(),
-                ));
+                if let RemoteSubresource::PdfPage { page_number } = &page.address.subresource {
+                    record_skipped_stored_edits(SkippedStoredEdits {
+                        pipeline: StoredEditPipeline::FinalAi,
+                        page_number: *page_number,
+                        reason: StoredEditSkipReason::PdfCanonicalRasterUnavailable,
+                        crop: prepared.edits.export_crop.is_some(),
+                        comic_objects: prepared.edits.comic.len(),
+                    });
+                }
             }
             check_remote_ai_cancel(cancel)?;
             let pre_ai_edit_fingerprint = prepared.edits.pre_ai_fingerprint;
@@ -2422,37 +2504,29 @@ impl ContainerEngine {
                     return Err(RemoteAiRunError::Failed("AI job was cancelled".to_owned()));
                 }
             };
-            if !materialized.comic.is_empty()
-                && let Some(fonts) = crate::comic_overlay::load_comic_fonts_for(&materialized.comic)
-            {
-                let stored_edit_space = stored_edit_space.ok_or_else(|| {
-                    RemoteAiRunError::Failed(
-                        "saved edit coordinate space is unavailable".to_owned(),
-                    )
-                })?;
-                pixels = stored_edit_space.comic_composite(
-                    &pixels,
-                    &materialized.comic,
-                    &fonts,
-                    &mut self
-                        .comic_stamp_cache
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner()),
-                    cancel,
-                );
+            if let Some(stored_edit_space) = stored_edit_space {
+                if !materialized.comic.is_empty()
+                    && let Some(fonts) =
+                        crate::comic_overlay::load_comic_fonts_for(&materialized.comic)
+                {
+                    pixels = stored_edit_space.comic_composite(
+                        &pixels,
+                        &materialized.comic,
+                        &fonts,
+                        &mut self
+                            .comic_stamp_cache
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner()),
+                        cancel,
+                    );
+                }
             }
-            if let Some(crop) = materialized.export_crop {
-                let stored_edit_space = stored_edit_space.ok_or_else(|| {
-                    RemoteAiRunError::Failed(
-                        "saved edit coordinate space is unavailable".to_owned(),
-                    )
-                })?;
-                let rect = stored_edit_space.crop_rect(crop, pixels.size);
-                pixels = Arc::new(
-                    crate::export_crop::crop_color_image(&pixels, rect)
-                        .map_err(|error| RemoteAiRunError::Failed(error.to_string()))?,
-                );
-            }
+            pixels = crop_with_stored_edit_space(
+                pixels,
+                materialized.export_crop,
+                stored_edit_space,
+            )
+            .map_err(RemoteAiRunError::Failed)?;
             let identity = super::path_guard::page_identity_from_resolved(
                 &resolved,
                 &page.address.subresource,
@@ -3595,32 +3669,40 @@ impl ContainerEngine {
         let requires_stored_edit_space = prepared_composite.as_ref().is_some_and(|prepared| {
             !prepared.edits.comic.is_empty() || prepared.edits.export_crop.is_some()
         });
-        let pdf_canonical_raster_dims = if requires_stored_edit_space {
-            match &address.subresource {
-                RemoteSubresource::PdfPage { page_number } => {
-                    let analysis = crate::pdf_loader::analyze_page_content_type(
-                        &resolved.canonical,
-                        *page_number,
-                        request.pdf_password.as_deref(),
-                        Some(Arc::clone(&cancel)),
-                    )
-                    .map_err(|error| {
-                        crate::logger::log(format!(
-                            "remote_ipc: PDF canonical edit space analysis failed: {error}"
-                        ));
-                        media_error(
-                            MediaErrorCode::RenderFailed,
-                            "PDF ページの保存済み編集座標を解決できませんでした",
-                        )
-                    })?;
-                    crate::pdf_loader::canonical_pdf_raster_dims(analysis.content_type)
-                        .map(|[width, height]| [width as usize, height as usize])
+        let (pdf_canonical_raster_dims, unavailable_edit_space_reason) =
+            if requires_stored_edit_space {
+                match &address.subresource {
+                    RemoteSubresource::PdfPage { page_number } => {
+                        match crate::pdf_loader::analyze_page_content_type(
+                            &resolved.canonical,
+                            *page_number,
+                            request.pdf_password.as_deref(),
+                            Some(Arc::clone(&cancel)),
+                        ) {
+                            Ok(analysis) => match crate::pdf_loader::canonical_pdf_raster_dims(
+                                analysis.content_type,
+                            ) {
+                                Some([width, height]) => {
+                                    (Some([width as usize, height as usize]), None)
+                                }
+                                None => (
+                                    None,
+                                    Some(StoredEditSkipReason::PdfVectorHasNoCanonicalRaster),
+                                ),
+                            },
+                            Err(error) => {
+                                crate::logger::log(format!(
+                                    "remote_ipc: PDF canonical edit space analysis failed: {error}"
+                                ));
+                                (None, Some(StoredEditSkipReason::PdfCanonicalAnalysisFailed))
+                            }
+                        }
+                    }
+                    _ => (None, None),
                 }
-                _ => None,
-            }
-        } else {
-            None
-        };
+            } else {
+                (None, None)
+            };
         let stored_edit_space = StoredEditSpace::for_remote_source(
             &address.subresource,
             color_image.size,
@@ -3628,12 +3710,19 @@ impl ContainerEngine {
             pdf_canonical_raster_dims,
         );
         if requires_stored_edit_space && stored_edit_space.is_none() {
-            // Vector PDF pages have no stable native pixel basis in CropSettings. Returning the
-            // current target raster here would make the crop change between 1024/4096/8192.
-            return Err(media_error(
-                MediaErrorCode::RenderFailed,
-                "この PDF ページには保存済み編集の正準ピクセル座標がありません",
-            ));
+            if let RemoteSubresource::PdfPage { page_number } = &address.subresource {
+                let prepared = prepared_composite
+                    .as_ref()
+                    .expect("stored edits require a prepared composite");
+                record_skipped_stored_edits(SkippedStoredEdits {
+                    pipeline: StoredEditPipeline::Page,
+                    page_number: *page_number,
+                    reason: unavailable_edit_space_reason
+                        .unwrap_or(StoredEditSkipReason::PdfCanonicalRasterUnavailable),
+                    crop: prepared.edits.export_crop.is_some(),
+                    comic_objects: prepared.edits.comic.len(),
+                });
+            }
         }
         let auto_trim_bbox = match cached_auto_trim_bbox {
             Some(bbox) => bbox,
@@ -3670,44 +3759,32 @@ impl ContainerEngine {
             ));
             let lut = self.resolve_remote_lut(prepared.lut_entry.as_ref())?;
             pixels = execute_remote_composite(pixels, &prepared.params, lut, &cancel)?;
-            if !materialized.comic.is_empty()
-                && let Some(fonts) = crate::comic_overlay::load_comic_fonts_for(&materialized.comic)
-            {
-                let stored_edit_space = stored_edit_space.ok_or_else(|| {
-                    media_error(
-                        MediaErrorCode::RenderFailed,
-                        "保存済み編集のピクセル座標を解決できませんでした",
-                    )
-                })?;
-                pixels = stored_edit_space.comic_composite(
-                    &pixels,
-                    &materialized.comic,
-                    &fonts,
-                    &mut self
-                        .comic_stamp_cache
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner()),
-                    &cancel,
-                );
+            if let Some(stored_edit_space) = stored_edit_space {
+                if !materialized.comic.is_empty()
+                    && let Some(fonts) =
+                        crate::comic_overlay::load_comic_fonts_for(&materialized.comic)
+                {
+                    pixels = stored_edit_space.comic_composite(
+                        &pixels,
+                        &materialized.comic,
+                        &fonts,
+                        &mut self
+                            .comic_stamp_cache
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner()),
+                        &cancel,
+                    );
+                }
             }
-            if let Some(crop) = materialized.export_crop {
-                let stored_edit_space = stored_edit_space.ok_or_else(|| {
-                    media_error(
-                        MediaErrorCode::RenderFailed,
-                        "保存済み編集のピクセル座標を解決できませんでした",
-                    )
-                })?;
-                let rect = stored_edit_space.crop_rect(crop, pixels.size);
-                pixels = Arc::new(crate::export_crop::crop_color_image(&pixels, rect).map_err(
-                    |error| {
+            pixels =
+                crop_with_stored_edit_space(pixels, materialized.export_crop, stored_edit_space)
+                    .map_err(|error| {
                         crate::logger::log(format!("remote_ipc: export crop failed: {error}"));
                         media_error(
                             MediaErrorCode::RenderFailed,
                             "ページの切り取り結果を作成できませんでした",
                         )
-                    },
-                )?);
-            }
+                    })?;
             self.page_composite_cache
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -4726,6 +4803,51 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn vector_pdf_keeps_the_full_page_skips_edits_and_emits_a_typed_record() {
+        let page = Arc::new(stored_edit_test_raster([70, 110]));
+        let stored_edit_space = StoredEditSpace::for_remote_source(
+            &RemoteSubresource::PdfPage { page_number: 4 },
+            page.size,
+            Some([468_600, 714_360]),
+            None,
+        );
+
+        assert!(
+            stored_edit_space.is_none(),
+            "vector PDF must not use target raster"
+        );
+        let output = crop_with_stored_edit_space(
+            Arc::clone(&page),
+            Some(stored_edit_test_crop()),
+            stored_edit_space,
+        )
+        .expect("missing canonical space skips the crop instead of failing the page");
+        assert!(Arc::ptr_eq(&output, &page));
+        assert_eq!(output.size, [70, 110]);
+        assert!(
+            stored_edit_space.is_none(),
+            "the same unavailable space also prevents comic composition"
+        );
+
+        let mut records = Vec::new();
+        record_skipped_stored_edits_with(
+            SkippedStoredEdits {
+                pipeline: StoredEditPipeline::Page,
+                page_number: 4,
+                reason: StoredEditSkipReason::PdfVectorHasNoCanonicalRaster,
+                crop: true,
+                comic_objects: 3,
+            },
+            |line| records.push(line),
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0],
+            "remote_ipc: stored_edit outcome=skipped pipeline=page target=pdf_page page_number=4 reason=pdf_vector_no_canonical_raster crop=true comic_objects=3"
+        );
     }
 
     #[test]
