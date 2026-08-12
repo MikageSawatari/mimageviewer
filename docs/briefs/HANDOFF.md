@@ -47,7 +47,29 @@
   **起動時にはローテーションしない** — PIN 変更 / serve 設定 / 全端末ログアウトで
   core が child を再起動するため、起動契機だと数回の操作で履歴が消える
 
-**残るレビュー項目は RR-04 だけ** (利用者の判断待ち)。
+**残るレビュー項目は RR-04 だけ**。
+
+### master を取り込んだ (2026-08-13、`841296e1`)
+
+merge-base は `d69ed731`。master 側 34 commit を取り込んだ。テキスト衝突 4 件のほかに、
+**自動マージが通ったのに壊れていた箇所が 3 つ**あった。
+
+1. `pages.rs` — master が動画設定を `anchored` scope に移したため、この branch が足した
+   リモート配信トグルが存在しない binding を参照してコンパイル不能。anchored + 検索索引へ登録した
+2. `export_crop.rs` の `get_checked` — master が足した `source_size` 列を読んでいなかった
+3. **crop の基準寸法が二重になった (要注意)** — master は保存済み crop に「描いたときのラスタ寸法」を
+   持たせ (`CropSettings.source_size`)、この branch は remote 側で基準を外から渡していた
+   (PDF の canonical raster)。merge 後は remote が記録済みの基準を無視するので、別解像度で描いた
+   crop がリモートだと違う位置に出る。**記録済みの基準を優先し、無い行 (v2.13.0 以前) だけ
+   呼び出し側の空間へフォールバック**する形に直した (`edit_source::export_crop_rect_for_pixels`)。
+   両方向のテストあり
+
+`cargo test -p mimageviewer --lib` は 5539 passed。1 度だけ
+`remote_auto_trim_page_responses_share_the_harmonized_spread_height` が
+「サムネイルカタログを開けませんでした」で落ちたが、単独実行と再実行では通る。
+このテストは `catalog::default_cache_dir()` = **実利用の APPDATA カタログ**を開くので、
+全並列実行や本体起動中は競合し得る。マージ由来ではない。テストが利用者データを触るのは
+別途直す価値がある。
 
 **利用者の判断は取得済み**: RR-03 は「生の `\\server\share` だけ拒否 (ドライブ割り当ては残す)」。
 RR-04 は「いったん制限でよいが、緩められないか検討したい」。
