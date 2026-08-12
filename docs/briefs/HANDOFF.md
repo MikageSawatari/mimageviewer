@@ -33,9 +33,21 @@
   early return (query parse error / session 未取得) も同じ最終化を通る
 - ✅ **RR-02** `5cd4fba0` 自分の proxy が `/` のときだけ `Configured`。非 root は
   `tailscale_serve_unsupported_path` として運び、設定ボタンは有効なまま残す。protocol v47
-- ⏳ **RR-03 / RR-05** brief B を Codex へ (`codex-remote-release-review-b-brief.md`)
-- ⏳ **RR-07〜10** マニュアル 4 件 — 到達性の説明、検索範囲、補正 subset、動画の検証環境。
-  brief B もマニュアルを触るので、**B の完了後に着手する** (同じファイルを同時に編集しない)
+- ✅ **RR-03 / RR-05** `71c5f8ef` UNC / device namespace を I/O 前に拒否 (理由付き)。
+  canonicalize がネットワークドライブに共有名を返す環境でも往復が壊れないよう、
+  公開住所は呼び出し元のドライブ文字を保つ (**この PC では検証不能なので両対応**)。
+  logout は「この端末」と「全端末 (署名鍵 rotate、PIN は変えない)」を別物として実装。
+  **1 コミットにまとめた** — 双方が同じ match へ variant を足すので、8 ファイルで
+  ハンクを仕分けても片方だけ revert はできない
+- ✅ **RR-07〜10** `2c19be8d` マニュアル 4 件
+- ✅ 番外 `5e65e23e` **JSON 応答の gzip** (下の RR-04 実測に基づく)。
+  finalizer 1 箇所で、JSON のみ・1 KiB 以上・`/api/auth/` と `/stream/` を除外。
+  `Vary` は圧縮しなかった応答にも付ける
+- ✅ 番外 `12f9ad6f` **診断ログのローテーション** (16 MiB × 5 世代)。
+  **起動時にはローテーションしない** — PIN 変更 / serve 設定 / 全端末ログアウトで
+  core が child を再起動するため、起動契機だと数回の操作で履歴が消える
+
+**残るレビュー項目は RR-04 だけ** (利用者の判断待ち)。
 
 **利用者の判断は取得済み**: RR-03 は「生の `\\server\share` だけ拒否 (ドライブ割り当ては残す)」。
 RR-04 は「いったん制限でよいが、緩められないか検討したい」。
@@ -84,6 +96,13 @@ RR-04 は「いったん制限でよいが、緩められないか検討した�
 推奨: ① JSON 応答に gzip → ② 上限を本体に揃える (検索 5000 / タグ 10000、コンテナ 10000 程度)。
 gzip 後は転送側にプログレス表示は要らない。必要になるとすればコレクション側の canonicalize
 (1 万件で最大 1.2 秒) の方。
+
+**① は `5e65e23e` で実装済み。② は上限を動かす判断なので未着手。**
+② をやるときに触る場所: `CONTAINER_ENTRY_LIMIT` (`src/remote_ipc/container.rs:24`) と
+`MAX_REMOTE_COLLECTION_ENTRIES` (`src/remote_ipc/collections.rs:17`)。
+`page_groups` も同じ上限から作られるので、コンテナ側を上げると 1000 ページ超の本も読めるようになる。
+コレクション側を上げるなら、1 件ごとの `canonicalize` (`collections.rs:894`) を
+親フォルダからの join で省けないかを先に見る価値がある。
 
 ## 次にやること
 
