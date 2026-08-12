@@ -1184,7 +1184,7 @@ async function waitForAdapterIdle(adapter) {
 }
 
 test("display leases are all registered before the first page fetch begins", () => {
-  const cache = new PageResourceCache(8, 1024 * 1024);
+  const cache = new PageResourceCache(8);
   let adapter;
   const protectedAtStart = [];
   adapter = new PageDemandAdapter({
@@ -1213,7 +1213,7 @@ test("display leases are all registered before the first page fetch begins", () 
 test("releasing one overlapping display does not cancel their shared page job", async () => {
   const started = [];
   const demandBodies = [];
-  const cache = new PageResourceCache(8, 1024 * 1024);
+  const cache = new PageResourceCache(8);
   const adapter = new PageDemandAdapter({
     cache,
     wirePrefix: "test",
@@ -1241,7 +1241,7 @@ test("releasing one overlapping display does not cancel their shared page job", 
 test("a planned prefetch promotes once and batches the display identity", async () => {
   const started = [];
   const demandBodies = [];
-  const cache = new PageResourceCache(8, 1024 * 1024);
+  const cache = new PageResourceCache(8);
   const adapter = new PageDemandAdapter({
     cache,
     wirePrefix: "test",
@@ -1270,7 +1270,7 @@ test("a planned prefetch promotes once and batches the display identity", async 
 test("only jobs whose final demand disappears are released in one tick", async () => {
   const started = [];
   const demandBodies = [];
-  const cache = new PageResourceCache(8, 1024 * 1024);
+  const cache = new PageResourceCache(8);
   const adapter = new PageDemandAdapter({
     cache,
     wirePrefix: "test",
@@ -1294,7 +1294,7 @@ test("only jobs whose final demand disappears are released in one tick", async (
 
 test("Cancelled 409 is terminal and never enters the busy retry loop", async () => {
   let attempts = 0;
-  const cache = new PageResourceCache(8, 1024 * 1024);
+  const cache = new PageResourceCache(8);
   const adapter = new PageDemandAdapter({
     cache,
     wirePrefix: "test",
@@ -1319,11 +1319,10 @@ test("Cancelled 409 is terminal and never enters the busy retry loop", async () 
   adapter.releaseDisplay("cancelled-display");
 });
 
-test("page byte retention stays bounded and protects coordinator-owned keys", () => {
+test("page count retention stays bounded and protects coordinator-owned keys", () => {
   const protectedKeys = new Set(["displayed"]);
   const cache = new PageResourceCache(
     2,
-    5,
     () => [...protectedKeys]
   );
   const resource = (name) => ({
@@ -1337,18 +1336,53 @@ test("page byte retention stays bounded and protects coordinator-owned keys", ()
 
   assert.equal(cache.hasBytes("displayed"), true);
   assert.equal(cache.hasBytes("old"), false);
-  assert.equal(cache.hasBytes("new"), false);
+  assert.equal(cache.hasBytes("new"), true);
   assert.ok(cache.ready.size <= 2);
-  assert.ok(cache.readyBytes <= 6);
+  assert.equal(cache.readyBytes, 6);
   cache.clear();
 });
 
-test("deep page prefetch stops at the byte budget and resumes after protection moves", async () => {
+test("every cache deletion reports its reason and retained byte accounting", () => {
+  const events = [];
+  const cache = new PageResourceCache(3, () => [], (event) => events.push(event));
+  const resource = (bytes) => ({
+    blob: new Blob([new Uint8Array(bytes)]),
+    requestId: `bytes-${bytes}`,
+    fetchMs: 1,
+  });
+  cache.remember("first", resource(7));
+  cache.remember("second", resource(11));
+  assert.equal(cache.prefetchAdmits("third"), true);
+  assert.equal(cache.readyBytes, 18, "bytes do not close count admission");
+
+  cache.clear();
+  assert.deepEqual(
+    events.filter(({ type }) => type === "evict"),
+    [
+      {
+        type: "evict",
+        key: "first",
+        reason: "clear",
+        retainedCount: 1,
+        retainedBytes: 11,
+      },
+      {
+        type: "evict",
+        key: "second",
+        reason: "clear",
+        retainedCount: 0,
+        retainedBytes: 0,
+      },
+    ]
+  );
+});
+
+test("deep page prefetch is limited by page count and not retained bytes", async () => {
   const started = [];
   const requests = Array.from({ length: 18 }, (_, index) =>
     adapterPageRequest(`page-${index}`)
   );
-  const cache = new PageResourceCache(18, 5);
+  const cache = new PageResourceCache(18);
   const adapter = new PageDemandAdapter({
     cache,
     prefetchConcurrency: 1,
@@ -1368,8 +1402,11 @@ test("deep page prefetch stops at the byte budget and resumes after protection m
 
   adapter.setPlan(requests.slice(0, 16));
   await waitForAdapterIdle(adapter);
-  assert.deepEqual(started.map(({ cacheKey }) => cacheKey), ["page-0", "page-1"]);
-  assert.equal(cache.readyBytes, 6);
+  assert.deepEqual(
+    started.map(({ cacheKey }) => cacheKey),
+    requests.slice(0, 16).map(({ cacheKey }) => cacheKey)
+  );
+  assert.equal(cache.readyBytes, 48);
 
   adapter.openDisplay({
     requestId: "display-page-1",
@@ -1381,12 +1418,11 @@ test("deep page prefetch stops at the byte budget and resumes after protection m
   adapter.setPlan(requests.slice(2, 18));
   await waitForAdapterIdle(adapter);
 
-  assert.deepEqual(started.map(({ cacheKey }) => cacheKey), [
-    "page-0",
-    "page-1",
-    "page-2",
-  ]);
-  assert.equal(cache.hasBytes("page-0"), false, "oldest unprotected page is evicted");
+  assert.deepEqual(
+    started.map(({ cacheKey }) => cacheKey),
+    requests.map(({ cacheKey }) => cacheKey)
+  );
+  assert.equal(cache.hasBytes("page-0"), true);
   assert.equal(cache.hasBytes("page-1"), true, "the displayed page stays protected");
   assert.equal(adapter.resourceForKey("page-1").requestId, "request-page-1");
   assert.equal(
@@ -1400,7 +1436,7 @@ test("deep page prefetch stops at the byte budget and resumes after protection m
   cache.clear();
 });
 
-test("full byte budget evicts a farther planned page before fetching a nearer one", async () => {
+test("full count limit evicts a farther planned page before fetching a nearer one", async () => {
   const started = [];
   const resource = (key) => ({
     blob: new Blob([new Uint8Array(3)]),
@@ -1408,7 +1444,7 @@ test("full byte budget evicts a farther planned page before fetching a nearer on
     fetchMs: 1,
     info: null,
   });
-  const cache = new PageResourceCache(18, 5);
+  const cache = new PageResourceCache(2);
   cache.ready.set("nearer", resource("nearer"));
   cache.ready.set("farther", resource("farther"));
   cache.readyBytes = 6;
@@ -1438,7 +1474,7 @@ test("full byte budget evicts a farther planned page before fetching a nearer on
   cache.clear();
 });
 
-test("full byte budget never evicts a nearer page to start a farther request", () => {
+test("full count limit never evicts a nearer page to start a farther request", () => {
   const resource = (key) => ({
     blob: new Blob([new Uint8Array(3)]),
     requestId: `request-${key}`,
@@ -1446,7 +1482,7 @@ test("full byte budget never evicts a nearer page to start a farther request", (
     info: null,
   });
   const started = [];
-  const cache = new PageResourceCache(18, 5);
+  const cache = new PageResourceCache(2);
   cache.ready.set("near-1", resource("near-1"));
   cache.ready.set("near-2", resource("near-2"));
   cache.readyBytes = 6;
@@ -1476,7 +1512,7 @@ test("full byte budget never evicts a nearer page to start a farther request", (
 });
 
 test("retained pages stay bounded even when the prefetch plan is empty", async () => {
-  const cache = new PageResourceCache(4, 10);
+  const cache = new PageResourceCache(4);
   const adapter = new PageDemandAdapter({
     cache,
     wirePrefix: "single",
@@ -1503,7 +1539,7 @@ test("retained pages stay bounded even when the prefetch plan is empty", async (
   }
 
   assert.ok(cache.ready.size <= 4, `retained ${cache.ready.size} entries`);
-  assert.ok(cache.readyBytes <= 14, `retained ${cache.readyBytes} bytes`);
+  assert.equal(cache.readyBytes, 16);
   assert.equal(cache.hasBytes("single-5"), true);
   adapter.releaseDisplay(finalRequestId);
   cache.clear();
@@ -1512,7 +1548,7 @@ test("retained pages stay bounded even when the prefetch plan is empty", async (
 test("a foreground admission retry stops when its own load is aborted", async () => {
   const firstAttempt = deferred();
   let attempts = 0;
-  const cache = new PageResourceCache(4, 1024);
+  const cache = new PageResourceCache(4);
   const adapter = new PageDemandAdapter({
     cache,
     wirePrefix: "abort-retry",
@@ -1548,7 +1584,6 @@ test("page demand adapter reports HUD states and refreshes on start settle cance
   const cacheEvents = [];
   const cache = new PageResourceCache(
     4,
-    1024,
     () => [],
     (event) => {
       cacheEvents.push(event);
@@ -1600,10 +1635,16 @@ test("page demand adapter reports HUD states and refreshes on start settle cance
   await waitForAdapterIdle(adapter);
 
   const beforeEvict = hudRefreshes;
-  assert.equal(cache.deleteReady("ready-page"), true);
+  assert.equal(cache.deleteReady("ready-page", "window_out"), true);
   assert.deepEqual(adapter.statusForKeys(["ready-page"]), ["missing"]);
   assert.ok(hudRefreshes > beforeEvict, "eviction refreshes the HUD");
-  assert.ok(cacheEvents.some((event) => event.type === "evict"));
+  assert.ok(cacheEvents.some((event) =>
+    event.type === "evict" &&
+    event.key === "ready-page" &&
+    event.reason === "window_out" &&
+    event.retainedCount === 0 &&
+    event.retainedBytes === 0
+  ));
   cache.clear();
 });
 test("remote adjustment normalization keeps valid local slider defaults and bounds", () => {
@@ -3118,7 +3159,7 @@ test("standalone reload is local and preserves the current hash", () => {
 
 test("a coordinated display retries momentary admission refusal with the same lease", async () => {
   let attempts = 0;
-  const cache = new PageResourceCache(4, 1024);
+  const cache = new PageResourceCache(4);
   const adapter = new PageDemandAdapter({
     cache,
     wirePrefix: "retry",

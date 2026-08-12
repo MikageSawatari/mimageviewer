@@ -56,13 +56,13 @@ import {
   nextFitMode,
   pagePrefetchFailurePlan,
   pageAdmissionRetryDelayMs,
-  pagePrefetchBudgetAllowsStart,
   pagePrefetchHudPlan,
   pagePrefetchIndicatorSummary,
   pagePrefetchPlan,
+  pagePrefetchWindow,
   pagePrefetchStartCount,
   pageResourceAdmissionPlan,
-  pageResourceCacheBudget,
+  pageResourceCacheLimit,
   pageResponseGenerationAttestation,
   pageResponseIdentityAttestation,
   planSpreadIntent,
@@ -2623,52 +2623,72 @@ test("prefetch HUD summary exposes ready active and missing counts", () => {
   );
 });
 
-test("page resource budget stays fixed when the maximum prefetch window grows", () => {
-  assert.deepEqual(pageResourceCacheBudget({
-    configuredBytes: 32 * 1024 * 1024,
-    measuredPageBytes: 8 * 1024 * 1024,
-    ahead: 12,
+test("page prefetch window narrows only until the first move in each book", () => {
+  const configured = { configuredAhead: 8, configuredBehind: 4 };
+  assert.deepEqual(pagePrefetchWindow({ ...configured, movedSinceOpen: false }), {
+    ahead: 4,
     behind: 4,
-    visiblePages: MAX_VIEWER_VISIBLE_PAGES,
-  }), { byteLimit: 32 * 1024 * 1024 });
+  });
+  assert.deepEqual(pagePrefetchWindow({
+    configuredAhead: 2,
+    configuredBehind: 1,
+    movedSinceOpen: false,
+  }), { ahead: 2, behind: 1 });
+  assert.deepEqual(pagePrefetchWindow({ ...configured, movedSinceOpen: true }), {
+    ahead: 8,
+    behind: 4,
+  });
+  // A different book starts with movedSinceOpen=false again.
+  assert.deepEqual(pagePrefetchWindow({
+    configuredAhead: 20,
+    configuredBehind: 12,
+    movedSinceOpen: false,
+  }), { ahead: 4, behind: 4 });
 });
 
-test("page prefetch byte admission closes at the budget boundary", () => {
-  assert.equal(pagePrefetchBudgetAllowsStart(63, 64), true);
-  assert.equal(pagePrefetchBudgetAllowsStart(64, 64), false);
-  assert.equal(pagePrefetchBudgetAllowsStart(65, 64), false);
+test("page planning and cache retention follow configured counts independently", () => {
+  assert.deepEqual(pagePrefetchPlan({
+    visibleIndexes: [10],
+    itemCount: 40,
+    direction: 1,
+    ahead: 5,
+    behind: 2,
+  }), [11, 12, 13, 14, 15, 9, 8]);
+  assert.equal(pageResourceCacheLimit({
+    visiblePages: MAX_VIEWER_VISIBLE_PAGES,
+    ahead: 5,
+    behind: 2,
+  }), 9);
 });
 
 test("page resource admission evicts oldest unprotected entries only", () => {
   assert.deepEqual(pageResourceAdmissionPlan({
     entries: [
-      { key: "old-protected", bytes: 3 },
-      { key: "old-unprotected", bytes: 3 },
-      { key: "new-unprotected", bytes: 3 },
+      { key: "old-protected", bytes: 3_000_000_000 },
+      { key: "old-unprotected", bytes: 3_000_000_000 },
+      { key: "new-unprotected", bytes: 3_000_000_000 },
     ],
     protectedKeys: ["old-protected"],
-    limit: 10,
-    byteLimit: 5,
+    limit: 3,
   }), {
-    evictKeys: ["old-unprotected", "new-unprotected"],
-    retainedBytes: 3,
-    retainedCount: 1,
+    evictKeys: ["old-unprotected"],
+    retainedBytes: 6_000_000_000,
+    retainedCount: 2,
     allowStart: true,
   });
 });
 
-test("page resource admission accepts protected-only budget overage", () => {
+test("page resource admission ignores bytes and closes only at a protected count limit", () => {
   assert.deepEqual(pageResourceAdmissionPlan({
     entries: [
-      { key: "visible", bytes: 4 },
-      { key: "nearest-prefetch", bytes: 4 },
+      { key: "visible", bytes: 4_000_000_000 },
+      { key: "nearest-prefetch", bytes: 4_000_000_000 },
     ],
     protectedKeys: ["visible", "nearest-prefetch"],
-    limit: 10,
-    byteLimit: 5,
+    limit: 2,
   }), {
     evictKeys: [],
-    retainedBytes: 8,
+    retainedBytes: 8_000_000_000,
     retainedCount: 2,
     allowStart: false,
   });

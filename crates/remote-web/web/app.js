@@ -38,10 +38,10 @@ import {
   pageRequestIsTransientlyBusy,
   pagePrefetchHudPlan,
   pagePrefetchIndicatorSummary,
-  pagePrefetchBudgetAllowsStart,
   pagePrefetchPlan,
+  pagePrefetchWindow,
   pageResourceAdmissionPlan,
-  pageResourceCacheBudget,
+  pageResourceCacheLimit,
   planSpreadIntent,
   reduceViewerTransform,
   remoteStateGenerationTransition,
@@ -103,6 +103,8 @@ import {
 } from "./command-core.mjs";
 import {
   ADJUSTMENT_PANEL_TABS,
+  PREFETCH_AHEAD_RANGE,
+  PREFETCH_BEHIND_RANGE,
   loadLocalSettings,
   saveLocalSettings,
 } from "./local-settings.mjs";
@@ -147,17 +149,7 @@ const PAGE_LOADING_INDICATOR_DELAY_MS = 225;
 const PAGE_BOUNDARY_MESSAGE_DURATION_MS = 2400;
 // history.go(-N) は範囲外だと何も起こさない。popstate が来ないことでそれを知る。
 const VIEWER_EXIT_HISTORY_TIMEOUT_MS = 250;
-// Safari では端末メモリを取得できないため、圧縮 JPEG Blob の固定 64 MiB を先読み開始の
-// 門にする。12/4 は窓の上限にすぎず、実際の深さは保持済みバイト数で決まる。
-const PAGE_PREFETCH_AHEAD = 12;
-const PAGE_PREFETCH_BEHIND = 4;
 const PAGE_PREFETCH_CONCURRENCY = 2;
-const PAGE_RESOURCE_CACHE_LIMIT =
-  MAX_VIEWER_VISIBLE_PAGES + PAGE_PREFETCH_AHEAD + PAGE_PREFETCH_BEHIND;
-const PAGE_RESOURCE_CACHE_CONFIGURED_BYTES = 64 * 1024 * 1024;
-const PAGE_RESOURCE_CACHE_MAX_BYTES = pageResourceCacheBudget({
-  configuredBytes: PAGE_RESOURCE_CACHE_CONFIGURED_BYTES,
-}).byteLimit;
 const CONTAINER_SPREAD_REFRESH_FAILURE_MESSAGE =
   "見開き表示を更新できませんでした。";
 export const ContainerSpreadRefreshExitReason = Object.freeze({
@@ -475,13 +467,11 @@ export class LatestPageLoadQueue {
 
 export class PageResourceCache {
   constructor(
-    limit = PAGE_RESOURCE_CACHE_LIMIT,
-    byteLimit = PAGE_RESOURCE_CACHE_MAX_BYTES,
+    limit = MAX_VIEWER_VISIBLE_PAGES,
     protectedKeyIds = () => [],
     onStatusChange = () => {}
   ) {
-    this.limit = Math.max(1, Number(limit) || 1);
-    this.byteLimit = Math.max(1, Number(byteLimit) || 1);
+    this.limit = Math.max(1, Math.floor(Number(limit) || 1));
     this.protectedKeyIds = protectedKeyIds;
     this.onStatusChange = onStatusChange;
     this.ready = new Map();
@@ -491,6 +481,10 @@ export class PageResourceCache {
   setProtectedKeyProvider(protectedKeyIds) {
     this.protectedKeyIds =
       typeof protectedKeyIds === "function" ? protectedKeyIds : () => [];
+  }
+
+  setLimit(limit) {
+    this.limit = Math.max(1, Math.floor(Number(limit) || 1));
   }
 
   hasBytes(key) {
@@ -506,10 +500,7 @@ export class PageResourceCache {
   }
 
   prefetchAdmits(candidateKeyId) {
-    if (
-      this.ready.size >= this.limit ||
-      !pagePrefetchBudgetAllowsStart(this.readyBytes, this.byteLimit)
-    ) {
+    if (this.ready.size >= this.limit) {
       const orderedProtected = this.protectedKeyIds();
       const candidateIndex = orderedProtected.indexOf(candidateKeyId);
       const admissionProtected = candidateIndex >= 0
@@ -522,10 +513,11 @@ export class PageResourceCache {
         })),
         protectedKeys: new Set(admissionProtected),
         limit: this.limit,
-        byteLimit: this.byteLimit,
         retainedBytes: this.readyBytes,
       });
-      for (const key of admission.evictKeys) this.deleteReady(key);
+      for (const key of admission.evictKeys) {
+        this.deleteReady(key, "window_out");
+      }
       return admission.allowStart;
     }
     return true;
@@ -537,20 +529,15 @@ export class PageResourceCache {
     this.ready.delete(key);
     this.ready.set(key, resource);
     this.readyBytes += resource.blob.size;
-    this.trimUnprotected();
+    this.trimUnprotected("limit_exceeded");
     this.notifyStatusChange("ready", key);
   }
 
-  /// 予算は「開始の門」だが、保持そのものは常に有界でなければならない。`pump()` は
+  /// 保持は常に枚数で有界でなければならない。`pump()` は
   /// 開始枠が無いと破棄まで到達しないので (1 ページだけのコンテナを順に開くと計画が
   /// 空で毎回そこで返る)、保持を増やした側でも保護集合の外を削る。
-  trimUnprotected() {
-    if (
-      this.ready.size <= this.limit &&
-      pagePrefetchBudgetAllowsStart(this.readyBytes, this.byteLimit)
-    ) {
-      return;
-    }
+  trimUnprotected(reason = "limit_exceeded") {
+    if (this.ready.size <= this.limit) return;
     const admission = pageResourceAdmissionPlan({
       entries: [...this.ready].map(([key, resource]) => ({
         key,
@@ -558,30 +545,33 @@ export class PageResourceCache {
       })),
       protectedKeys: new Set(this.protectedKeyIds()),
       limit: this.limit,
-      byteLimit: this.byteLimit,
       retainedBytes: this.readyBytes,
+      reserveForStart: false,
     });
-    for (const key of admission.evictKeys) this.deleteReady(key);
+    for (const key of admission.evictKeys) this.deleteReady(key, reason);
   }
 
-  deleteReady(key) {
+  deleteReady(key, reason = "clear") {
     const resource = this.ready.get(key);
     if (!resource) return false;
     this.ready.delete(key);
     this.readyBytes = Math.max(0, this.readyBytes - resource.blob.size);
-    this.notifyStatusChange("evict", key);
+    this.notifyStatusChange("evict", key, {
+      reason,
+      retainedCount: this.ready.size,
+      retainedBytes: this.readyBytes,
+    });
     return true;
   }
 
   clear() {
-    this.ready.clear();
-    this.readyBytes = 0;
+    for (const key of [...this.ready.keys()]) this.deleteReady(key, "clear");
     this.notifyStatusChange("clear");
   }
 
-  notifyStatusChange(type, key = "") {
+  notifyStatusChange(type, key = "", detail = {}) {
     try {
-      this.onStatusChange({ type, key });
+      this.onStatusChange({ type, key, ...detail });
     } catch {}
   }
 }
@@ -964,11 +954,27 @@ function delayWithAbort(delayMs, signal) {
 }
 
 const thumbnailRequestLimiter = new RequestLimiter(THUMBNAIL_MAX_CONCURRENCY);
+const initialPagePrefetchWindow = pagePrefetchWindow({
+  configuredAhead: LOCAL_SETTINGS_LOAD.settings.prefetchAhead,
+  configuredBehind: LOCAL_SETTINGS_LOAD.settings.prefetchBehind,
+  movedSinceOpen: false,
+});
 const pageResourceCache = new PageResourceCache(
-  PAGE_RESOURCE_CACHE_LIMIT,
-  PAGE_RESOURCE_CACHE_MAX_BYTES,
+  pageResourceCacheLimit({
+    visiblePages: MAX_VIEWER_VISIBLE_PAGES,
+    ...initialPagePrefetchWindow,
+  }),
   () => [],
-  ({ type }) => {
+  ({ type, key, reason, retainedCount, retainedBytes }) => {
+    if (type === "evict") {
+      enqueueTelemetry({
+        type: "page_resource_eviction",
+        key,
+        reason,
+        retained_count: retainedCount,
+        retained_bytes: retainedBytes,
+      });
+    }
     if (type === "clear") hudState.pagePrefetch = null;
     updateHud();
   }
@@ -1096,6 +1102,8 @@ const state = {
   pageGroups: [],
   seekPageGroups: [],
   pageGroupIndex: -1,
+  pagePrefetchContextIdentity: "",
+  pagePrefetchMovedSinceOpen: false,
   spreadMode: SpreadMode.SINGLE,
   effectiveSpreadMode: SpreadMode.SINGLE,
   readingDirection: ReadingDirection.LTR,
@@ -3728,6 +3736,11 @@ function containerForceSinglePage(options = {}) {
 
 function applyContainerData(address, data, forceSinglePage, options = {}) {
   const effectiveAddress = data.effective_address ?? address;
+  const nextPrefetchContextIdentity = addressIdentity(effectiveAddress);
+  if (state.pagePrefetchContextIdentity !== nextPrefetchContextIdentity) {
+    state.pagePrefetchContextIdentity = nextPrefetchContextIdentity;
+    state.pagePrefetchMovedSinceOpen = false;
+  }
   const rootReturnHash = rootOpenReturnHash({
     hasCollection: Boolean(state.collection),
     atFavoriteRoot: isFavoriteRoot(effectiveAddress.path),
@@ -4103,6 +4116,7 @@ function requestPageGroup(
     );
     return { ...transition, moved: false, reason, displayPromise: null };
   }
+  if (transition.moved) state.pagePrefetchMovedSinceOpen = true;
   if (transition.moved) {
     if (transition.history === "push") {
       const viewerDepth = (Number(history.state?.viewerDepth) || 0) + 1;
@@ -6075,7 +6089,7 @@ async function updateViewerImage(
   state.commandMenu?.refreshViewTrim();
   observeReadingProgress();
   if (group.entries.every((entry) => entry.address)) {
-    schedulePagePrefetch(viewer, pages).catch(() => {});
+    schedulePagePrefetch(viewer).catch(() => {});
     return VIEWER_GROUP_LOAD_APPLIED;
   }
   const nextEntry = state.images[state.imageIndex + 1];
@@ -6090,9 +6104,14 @@ async function updateViewerImage(
   return VIEWER_GROUP_LOAD_APPLIED;
 }
 
-async function schedulePagePrefetch(viewer, visiblePages = []) {
+async function schedulePagePrefetch(viewer) {
   const group = currentPageGroup();
   const currentIdentity = group?.entries.map(entryIdentity).join("\n") ?? "";
+  const effectiveWindow = pagePrefetchWindow({
+    configuredAhead: state.localSettings.prefetchAhead,
+    configuredBehind: state.localSettings.prefetchBehind,
+    movedSinceOpen: state.pagePrefetchMovedSinceOpen,
+  });
   hudState.pagePrefetch = null;
   updateHud();
   const visibleIndexes = (group?.entries ?? [])
@@ -6102,14 +6121,14 @@ async function schedulePagePrefetch(viewer, visiblePages = []) {
     visibleIndexes,
     itemCount: state.images.length,
     direction: state.pageDirection,
-    ahead: PAGE_PREFETCH_AHEAD,
-    behind: PAGE_PREFETCH_BEHIND,
+    ahead: effectiveWindow.ahead,
+    behind: effectiveWindow.behind,
   });
   const hudPlan = pagePrefetchHudPlan({
     visibleIndexes,
     itemCount: state.images.length,
-    ahead: PAGE_PREFETCH_AHEAD,
-    behind: PAGE_PREFETCH_BEHIND,
+    ahead: effectiveWindow.ahead,
+    behind: effectiveWindow.behind,
   });
   const requests = await Promise.all(
     indexes.map(async (index) => {
@@ -6136,9 +6155,16 @@ async function schedulePagePrefetch(viewer, visiblePages = []) {
       });
     })
   );
+  const latestEffectiveWindow = pagePrefetchWindow({
+    configuredAhead: state.localSettings.prefetchAhead,
+    configuredBehind: state.localSettings.prefetchBehind,
+    movedSinceOpen: state.pagePrefetchMovedSinceOpen,
+  });
   if (
     state.viewer !== viewer ||
-    currentPageGroup()?.entries.map(entryIdentity).join("\n") !== currentIdentity
+    currentPageGroup()?.entries.map(entryIdentity).join("\n") !== currentIdentity ||
+    latestEffectiveWindow.ahead !== effectiveWindow.ahead ||
+    latestEffectiveWindow.behind !== effectiveWindow.behind
   ) {
     return;
   }
@@ -6153,7 +6179,12 @@ async function schedulePagePrefetch(viewer, visiblePages = []) {
       .map((index) => requestsByIndex.get(index)?.cacheKey)
       .filter(Boolean),
   };
+  pageResourceCache.setLimit(pageResourceCacheLimit({
+    visiblePages: MAX_VIEWER_VISIBLE_PAGES,
+    ...effectiveWindow,
+  }));
   pageDemandAdapter.setPlan(requests.filter(Boolean));
+  pageResourceCache.trimUnprotected("window_out");
   updateHud();
 }
 
@@ -8834,7 +8865,7 @@ export class ViewerAdjustmentPanel {
       await state.viewer?.replacePageBlob(job.pageIndex, blob, job.entry.name);
     } finally {
       pageDemandAdapter.releaseDisplay(job.displayRequestId);
-      pageResourceCache.deleteReady(request.cacheKey);
+      pageResourceCache.deleteReady(request.cacheKey, "clear");
     }
   }
 
@@ -9920,6 +9951,26 @@ function setLocalImageQuality(quality) {
   return true;
 }
 
+function setLocalPrefetchDepth(field, value) {
+  if (field !== "prefetchAhead" && field !== "prefetchBehind") return null;
+  const previous = state.localSettings[field];
+  const saved = saveLocalSettings({
+    ...state.localSettings,
+    [field]: value,
+  });
+  state.localSettings = saved.settings;
+  state.localSettingsStorageAvailable = saved.saved;
+  if (
+    state.localSettings[field] !== previous &&
+    state.screenContext === "viewer" &&
+    state.viewer &&
+    !state.viewer.isVideoStreamViewer
+  ) {
+    schedulePagePrefetch(state.viewer).catch(() => {});
+  }
+  return state.localSettings[field];
+}
+
 class LocalSettingsDialog {
   constructor(host) {
     this.previousFocus = document.activeElement;
@@ -9984,6 +10035,54 @@ class LocalSettingsDialog {
       qualityGroup.append(qualityOption);
     }
 
+    const prefetchGroup = element("fieldset", "local-settings-group");
+    prefetchGroup.append(
+      textElement("legend", "先読み枚数", "local-settings-group-title")
+    );
+    const prefetchInputs = [
+      {
+        field: "prefetchAhead",
+        label: "進む方向",
+        range: PREFETCH_AHEAD_RANGE,
+      },
+      {
+        field: "prefetchBehind",
+        label: "戻る方向",
+        range: PREFETCH_BEHIND_RANGE,
+      },
+    ];
+    for (const definition of prefetchInputs) {
+      const prefetchOption = element(
+        "label",
+        "local-settings-prefetch-option"
+      );
+      const label = textElement("strong", definition.label);
+      const input = element("input", "local-settings-number-input");
+      input.type = "number";
+      input.min = String(definition.range.min);
+      input.max = String(definition.range.max);
+      input.step = "1";
+      input.inputMode = "numeric";
+      input.value = String(state.localSettings[definition.field]);
+      input.addEventListener("change", () => {
+        const normalized = setLocalPrefetchDepth(
+          definition.field,
+          input.valueAsNumber
+        );
+        if (normalized !== null) input.value = String(normalized);
+        this.updateStorageStatus();
+      });
+      prefetchOption.append(label, input);
+      prefetchGroup.append(prefetchOption);
+    }
+    prefetchGroup.append(
+      textElement(
+        "p",
+        "この端末だけに保存します。大きくすると素早くめくっても待たされにくくなります。大きすぎるとブラウザが落ちることがあります。その場合はこの値を下げて開き直してください。",
+        "local-settings-prefetch-note"
+      )
+    );
+
     const telemetryGroup = element("fieldset", "local-settings-group");
     telemetryGroup.append(
       textElement("legend", "診断記録", "local-settings-group-title")
@@ -10035,7 +10134,14 @@ class LocalSettingsDialog {
       this.updateStorageStatus();
     });
 
-    panel.append(header, option, qualityGroup, telemetryGroup, this.status);
+    panel.append(
+      header,
+      option,
+      qualityGroup,
+      prefetchGroup,
+      telemetryGroup,
+      this.status
+    );
     this.root.append(scrim, panel);
     this.root.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {

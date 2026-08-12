@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   ADJUSTMENT_PANEL_TABS,
+  LOCAL_SETTINGS_VERSION,
   LOCAL_SETTINGS_STORAGE_KEY,
   defaultLocalSettings,
   loadLocalSettings,
@@ -20,6 +21,8 @@ test("local settings use the current defaults when no value exists", () => {
     gestureHelpDismissed: false,
     gridColumnsPortrait: 0,
     gridColumnsLandscape: 0,
+    prefetchAhead: 8,
+    prefetchBehind: 4,
     telemetryDebugDetails: false,
     adjustmentTab: "color_tone",
   });
@@ -45,6 +48,8 @@ test("local settings serialize and restore as one versioned value", () => {
     gestureHelpDismissed: true,
     gridColumnsPortrait: 3,
     gridColumnsLandscape: 7,
+    prefetchAhead: 14,
+    prefetchBehind: 6,
     telemetryDebugDetails: true,
     adjustmentTab: "colorize",
   };
@@ -67,6 +72,8 @@ test("storage failures use in-memory defaults and never escape", () => {
     gestureHelpDismissed: true,
     gridColumnsPortrait: 4,
     gridColumnsLandscape: 6,
+    prefetchAhead: 12,
+    prefetchBehind: 5,
     telemetryDebugDetails: true,
     adjustmentTab: "ai",
   }, unavailable), {
@@ -77,6 +84,8 @@ test("storage failures use in-memory defaults and never escape", () => {
       gestureHelpDismissed: true,
       gridColumnsPortrait: 4,
       gridColumnsLandscape: 6,
+      prefetchAhead: 12,
+      prefetchBehind: 5,
       telemetryDebugDetails: true,
       adjustmentTab: "ai",
     },
@@ -116,6 +125,8 @@ test("older version-one values add the gesture help default", () => {
       gestureHelpDismissed: false,
       gridColumnsPortrait: 0,
       gridColumnsLandscape: 0,
+      prefetchAhead: 8,
+      prefetchBehind: 4,
       telemetryDebugDetails: false,
       adjustmentTab: "color_tone",
     }
@@ -138,6 +149,8 @@ test("grid column settings clamp per field without replacing existing values", (
       gestureHelpDismissed: true,
       gridColumnsPortrait: 2,
       gridColumnsLandscape: 8,
+      prefetchAhead: 8,
+      prefetchBehind: 4,
       telemetryDebugDetails: false,
       adjustmentTab: "color_tone",
     }
@@ -157,10 +170,51 @@ test("grid column settings clamp per field without replacing existing values", (
       gestureHelpDismissed: true,
       gridColumnsPortrait: 0,
       gridColumnsLandscape: 0,
+      prefetchAhead: 8,
+      prefetchBehind: 4,
       telemetryDebugDetails: false,
       adjustmentTab: "color_tone",
     }
   );
+});
+
+test("prefetch depth validates each field without changing version-one settings", () => {
+  assert.equal(LOCAL_SETTINGS_VERSION, 1);
+  const existing = parseLocalSettings(JSON.stringify({
+    version: 1,
+    imageQuality: "high",
+    portraitSinglePage: false,
+    gridColumnsPortrait: 5,
+  }));
+  assert.equal(existing.imageQuality, "high");
+  assert.equal(existing.portraitSinglePage, false);
+  assert.equal(existing.gridColumnsPortrait, 5);
+  assert.equal(existing.prefetchAhead, 8);
+  assert.equal(existing.prefetchBehind, 4);
+
+  const invalid = parseLocalSettings(JSON.stringify({
+    version: 1,
+    prefetchAhead: 33,
+    prefetchBehind: -1,
+  }));
+  assert.equal(invalid.prefetchAhead, 8);
+  assert.equal(invalid.prefetchBehind, 4);
+
+  const nonNumeric = parseLocalSettings(JSON.stringify({
+    version: 1,
+    prefetchAhead: "12",
+    prefetchBehind: null,
+  }));
+  assert.equal(nonNumeric.prefetchAhead, 8);
+  assert.equal(nonNumeric.prefetchBehind, 4);
+
+  const boundaries = parseLocalSettings(JSON.stringify({
+    version: 1,
+    prefetchAhead: 2,
+    prefetchBehind: 0,
+  }));
+  assert.equal(boundaries.prefetchAhead, 2);
+  assert.equal(boundaries.prefetchBehind, 0);
 });
 
 test("all image quality choices round-trip as device-local settings", () => {

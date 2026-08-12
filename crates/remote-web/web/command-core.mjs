@@ -2307,31 +2307,44 @@ export function thumbnailRetryDecision(
 
 export const MAX_VIEWER_VISIBLE_PAGES = 2;
 
-/// The byte budget is a fixed admission threshold, not a page-count-derived
-/// retention target. Increasing the maximum prefetch window must not inflate it.
-export function pageResourceCacheBudget({ configuredBytes } = {}) {
-  const configured = Math.max(1, Math.floor(Number(configuredBytes) || 1));
-  return { byteLimit: configured };
+/// Reloading returns to the same page, so the initial window must only narrow
+/// the configured values. The first deliberate page move releases that guard.
+export function pagePrefetchWindow({
+  configuredAhead,
+  configuredBehind,
+  movedSinceOpen,
+} = {}) {
+  const ahead = Math.max(0, Math.floor(Number(configuredAhead) || 0));
+  const behind = Math.max(0, Math.floor(Number(configuredBehind) || 0));
+  return {
+    ahead: movedSinceOpen ? ahead : Math.min(ahead, 4),
+    behind: movedSinceOpen ? behind : Math.min(behind, 4),
+  };
 }
 
-export function pagePrefetchBudgetAllowsStart(retainedBytes, byteLimit) {
-  const retained = Math.max(0, Math.floor(Number(retainedBytes) || 0));
-  const budget = Math.max(1, Math.floor(Number(byteLimit) || 1));
-  return retained < budget;
+export function pageResourceCacheLimit({
+  visiblePages = MAX_VIEWER_VISIBLE_PAGES,
+  ahead = 0,
+  behind = 0,
+} = {}) {
+  const visible = Math.max(0, Math.floor(Number(visiblePages) || 0));
+  const forward = Math.max(0, Math.floor(Number(ahead) || 0));
+  const backward = Math.max(0, Math.floor(Number(behind) || 0));
+  return Math.max(1, visible + forward + backward);
 }
 
 /// Plan the LRU removals needed before starting another prefetch. Entries are
 /// ordered oldest first. Protected entries are never selected; if they alone fill
-/// the budget, admission remains closed and the overage is retained.
+/// the count limit, admission remains closed and the overage is retained. Bytes
+/// remain in the result for telemetry only and never affect admission.
 export function pageResourceAdmissionPlan({
   entries = [],
   protectedKeys = [],
   limit = Number.MAX_SAFE_INTEGER,
-  byteLimit,
   retainedBytes: retainedBytesOverride = null,
+  reserveForStart = true,
 } = {}) {
   const maximum = Math.max(1, Math.floor(Number(limit) || 1));
-  const budget = Math.max(1, Math.floor(Number(byteLimit) || 1));
   const protectedSet = new Set(protectedKeys ?? []);
   const retained = (Array.isArray(entries) ? entries : [])
     .filter((entry) => entry?.key != null)
@@ -2343,10 +2356,8 @@ export function pageResourceAdmissionPlan({
     ? retained.reduce((sum, entry) => sum + entry.bytes, 0)
     : Math.max(0, Math.floor(Number(retainedBytesOverride) || 0));
   const evictKeys = [];
-  while (
-    retained.length >= maximum ||
-    !pagePrefetchBudgetAllowsStart(retainedBytes, budget)
-  ) {
+  const targetCount = reserveForStart ? maximum - 1 : maximum;
+  while (retained.length > targetCount) {
     const index = retained.findIndex((entry) => !protectedSet.has(entry.key));
     if (index < 0) break;
     const [evicted] = retained.splice(index, 1);
@@ -2357,9 +2368,7 @@ export function pageResourceAdmissionPlan({
     evictKeys,
     retainedBytes,
     retainedCount: retained.length,
-    allowStart:
-      retained.length < maximum &&
-      pagePrefetchBudgetAllowsStart(retainedBytes, budget),
+    allowStart: retained.length < maximum,
   };
 }
 

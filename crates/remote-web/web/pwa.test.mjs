@@ -329,6 +329,32 @@ test("critical telemetry is submitted before session-transition UI side effects"
   assert.match(app, /path === "\/api\/video\/state"\) return "video_poll"/);
 });
 
+test("prefetch retention is count-only and every eviction is queued as telemetry", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  const core = await readFile(new URL("command-core.mjs", here), "utf8");
+  const cacheBody = app.match(
+    /export class PageResourceCache[\s\S]*?export class PageDemandAdapter/
+  )?.[0] ?? "";
+  assert.doesNotMatch(core, /pagePrefetchBudgetAllowsStart|pageResourceCacheBudget/);
+  assert.doesNotMatch(cacheBody, /byteLimit|pagePrefetchBudgetAllowsStart/);
+  assert.match(cacheBody, /retainedBytes:\s*this\.readyBytes/);
+  assert.match(
+    app,
+    /configuredAhead:\s*state\.localSettings\.prefetchAhead[\s\S]*ahead:\s*effectiveWindow\.ahead[\s\S]*pageResourceCache\.setLimit\(pageResourceCacheLimit/
+  );
+  assert.match(
+    app,
+    /pagePrefetchContextIdentity !== nextPrefetchContextIdentity[\s\S]*pagePrefetchMovedSinceOpen = false/
+  );
+  assert.match(app, /if \(transition\.moved\) state\.pagePrefetchMovedSinceOpen = true/);
+  assert.match(
+    app,
+    /type === "evict"[\s\S]*enqueueTelemetry\(\{[\s\S]*type: "page_resource_eviction"[\s\S]*retained_count:[\s\S]*retained_bytes:/
+  );
+  assert.match(app, /"先読み枚数"/);
+  assert.match(app, /大きすぎるとブラウザが落ちることがあります/);
+});
+
 test("video health HUD and persistent debug-tier warning stay wired", async () => {
   const app = await readFile(new URL("app.js", here), "utf8");
   const css = await readFile(new URL("styles.css", here), "utf8");

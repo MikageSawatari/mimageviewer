@@ -2,6 +2,10 @@ import { imageQualityPreset } from "./command-core.mjs";
 
 export const LOCAL_SETTINGS_STORAGE_KEY = "miv-remote-local-settings";
 export const LOCAL_SETTINGS_VERSION = 1;
+export const DEFAULT_PREFETCH_AHEAD = 8;
+export const DEFAULT_PREFETCH_BEHIND = 4;
+export const PREFETCH_AHEAD_RANGE = Object.freeze({ min: 2, max: 32 });
+export const PREFETCH_BEHIND_RANGE = Object.freeze({ min: 0, max: 16 });
 export const ADJUSTMENT_PANEL_TABS = Object.freeze([
   Object.freeze({ id: "color_tone", label: "色調" }),
   Object.freeze({ id: "ai", label: "AI" }),
@@ -22,6 +26,8 @@ export function defaultLocalSettings() {
     gestureHelpDismissed: false,
     gridColumnsPortrait: 0,
     gridColumnsLandscape: 0,
+    prefetchAhead: DEFAULT_PREFETCH_AHEAD,
+    prefetchBehind: DEFAULT_PREFETCH_BEHIND,
     telemetryDebugDetails: false,
     adjustmentTab: ADJUSTMENT_PANEL_TABS[0].id,
   };
@@ -32,6 +38,15 @@ function normalizeGridColumns(value, fallback) {
   const columns = Math.round(value);
   if (columns === 0) return 0;
   return Math.min(8, Math.max(2, columns));
+}
+
+function normalizePrefetchDepth(value, fallback, range) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  const pages = Math.round(value);
+  // This range validates user input. It is not a safety limit: a valid large
+  // window can still exhaust a browser tab, and one huge page is not bounded here.
+  if (pages < range.min || pages > range.max) return fallback;
+  return pages;
 }
 
 export function normalizeLocalSettings(value) {
@@ -57,6 +72,16 @@ export function normalizeLocalSettings(value) {
     gridColumnsLandscape: normalizeGridColumns(
       value.gridColumnsLandscape,
       defaults.gridColumnsLandscape
+    ),
+    prefetchAhead: normalizePrefetchDepth(
+      value.prefetchAhead,
+      defaults.prefetchAhead,
+      PREFETCH_AHEAD_RANGE
+    ),
+    prefetchBehind: normalizePrefetchDepth(
+      value.prefetchBehind,
+      defaults.prefetchBehind,
+      PREFETCH_BEHIND_RANGE
     ),
     telemetryDebugDetails:
       typeof value.telemetryDebugDetails === "boolean"
