@@ -1917,11 +1917,12 @@ pending で表現しない」に反し、今回 3 周した誤りと同じ形で
 - 本体の旧アドレス近似 (`begin_page_render` の retain) を**無効化・撤去**
 - 補正プレビューも同じ coordinator を通す
 
-**3b — admission / heavy queue (保留)**
+**3b — admission / heavy queue (2026-08-11 完了)**
 
-- 段階 2 の `heavy_queue` へ `sync_channel` を差し替え、待機中 job の剪定と lane 昇格を配線する
+- 段階 2 の `heavy_queue` へ `sync_channel` を差し替え、待機中 job の剪定と lane 昇格を配線した
 - `try_acquire_prefetch` の入口拒否を撤去し、1 worker の実行不能な prefetch へ typed 応答を返す
 - remote-web の `IpcAdmission` は HTTP worker を守る別 owner として維持する
+- 実測は §14.12 末尾。目視では判断できなかったのでログで確かめた
 
 **3c — 位置 ownership (2026-08-12 完了)**
 
