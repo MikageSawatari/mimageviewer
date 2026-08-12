@@ -34897,6 +34897,26 @@ impl App {
         self.current_viewer_session_is_detached_or_switching()
     }
 
+    /// Whether hiding the main HWND must leave the UI heartbeat watchdog armed.
+    ///
+    /// Detached lifecycle, an active mounted media session, and the narrower tray-resident
+    /// playback wake projection all require `App::update` progress while the root window is
+    /// hidden. Keep this as the single policy boundary for both an explicit tray hide and an
+    /// externally observed `ShowWindow(SW_HIDE)` transition.
+    pub(crate) fn ui_heartbeat_should_stay_active_while_hidden(&self) -> bool {
+        let mounted_media_session = self.fullscreen_idx.is_some_and(|idx| {
+            matches!(
+                self.items.get(idx),
+                Some(GridItem::Video(_)) | Some(GridItem::Audio(_))
+            ) || self.video_audio_mode == Some(idx)
+                || matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Video { .. }))
+        });
+
+        self.viewer_session_is_detached_or_switching()
+            || mounted_media_session
+            || self.tray_resident_media_updates_needed()
+    }
+
     pub(crate) fn viewer_session_blocks_main_window(&self) -> bool {
         // The main-focus close consumer must use the same current-session lifecycle fact as tray
         // residency. During a switch to detached, `viewer_presentation` is still the old fullscreen
@@ -62644,12 +62664,12 @@ impl eframe::App for App {
                     );
                     self.sync_after_restore(ctx);
                 } else if !is_visible_now && self.window_visible {
-                    let keep_detached_viewer_alive = self.viewer_session_is_detached_or_switching();
                     self.window_visible = false;
+                    let keep_heartbeat_alive = self.ui_heartbeat_should_stay_active_while_hidden();
                     crate::set_ui_heartbeat_suspended(
-                        !keep_detached_viewer_alive,
-                        if keep_detached_viewer_alive {
-                            "App::update heartbeat kept alive for detached viewer after external window hide"
+                        !keep_heartbeat_alive,
+                        if keep_heartbeat_alive {
+                            "App::update heartbeat kept alive for active viewer session after external window hide"
                         } else {
                             "App::update heartbeat suspended after external window hide"
                         }

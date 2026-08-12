@@ -33250,6 +33250,35 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn hidden_main_window_heartbeat_follows_detached_and_media_session_transitions() {
+        let mut app = setup_app();
+        app.window_visible = false;
+
+        assert!(
+            !app.ui_heartbeat_should_stay_active_while_hidden(),
+            "an idle hidden app with neither detached nor media ownership should suspend"
+        );
+
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: ViewerContextBundle::empty(),
+        });
+        assert!(
+            app.ui_heartbeat_should_stay_active_while_hidden(),
+            "a live detached viewer must keep watchdog observation active"
+        );
+
+        app.active_detached_viewer_context = None;
+        let video = push_video(&mut app, r"C:\clips\watchdog-fullscreen.mp4");
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        assert!(
+            app.ui_heartbeat_should_stay_active_while_hidden(),
+            "native video fullscreen must remain observable while its main HWND is hidden"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn tray_residency_preserves_mounted_video_transport_and_session() {
         for (case, presentation) in [
             ("fullscreen", ViewerPresentation::Fullscreen),
