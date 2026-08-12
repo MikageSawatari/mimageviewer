@@ -128,7 +128,9 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
   iPad 等のブラウザで Unicode 正規化形が異なると同じ見た目でも hash が一致せず、伏字のため
   誤入力と区別できない認証失敗になることを避けるためである。
   `mimageviewer-remote` の `--set-pin` は撤去し、書き手を本体 1 つに限定する
-- ブラウザ側の PIN 入力画面は変更せず、唯一の設定入口である本体の共有 validator で上記制限を強制する
+- ブラウザ側の PIN 入力欄は数字キーボードを要求せず、英字・記号へ切り替えられる既定の
+  text キーボードを使う。自動大文字化とスペル補正は無効にし、唯一の設定入口である本体の共有
+  validator で上記制限を強制する
 - 認証ファイルは本体のデータディレクトリ直下の `remote-web-auth.json`
   (portable は `<exe_dir>/data/remote-web-auth.json`)。本体が temp file + rename で書き、
   remote-web は `--auth-file` で渡されたファイルを起動時に読むだけとする。

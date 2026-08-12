@@ -2163,6 +2163,20 @@ function sessionStatusFromResponse(sessionStatus, httpStatus) {
   return sessionStatusFromHttp(httpStatus);
 }
 
+export function createPinLoginInput() {
+  const pin = document.createElement("input");
+  pin.className = "pin-input";
+  pin.type = "password";
+  pin.autocomplete = "current-password";
+  pin.autocapitalize = "none";
+  pin.spellcheck = false;
+  pin.minLength = 6;
+  pin.required = true;
+  pin.placeholder = "6文字以上の PIN";
+  pin.setAttribute("aria-label", "PIN");
+  return pin;
+}
+
 function renderPinLogin(initialRemainingSeconds = 0) {
   cleanupScreen();
   applyRemoteSessionId("");
@@ -2182,15 +2196,7 @@ function renderPinLogin(initialRemainingSeconds = 0) {
   const card = element("div", "pin-card");
   const form = document.createElement("form");
   form.className = "pin-form";
-  const pin = document.createElement("input");
-  pin.className = "pin-input";
-  pin.type = "password";
-  pin.inputMode = "numeric";
-  pin.autocomplete = "current-password";
-  pin.minLength = 6;
-  pin.required = true;
-  pin.placeholder = "6桁以上の PIN";
-  pin.setAttribute("aria-label", "PIN");
+  const pin = createPinLoginInput();
 
   const forgetLabel = element("label", "pin-forget");
   const forget = document.createElement("input");

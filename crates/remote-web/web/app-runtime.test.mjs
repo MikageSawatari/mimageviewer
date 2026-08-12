@@ -134,6 +134,7 @@ const {
   createRemoteHomeDataRefreshCoordinator,
   createFavoriteSearchForm,
   createGridTile,
+  createPinLoginInput,
   filterRemoteTags,
   favoriteSearchEmptyMessage,
   favoriteSearchHash,
@@ -188,6 +189,16 @@ function deferred() {
   });
   return { promise, resolve, reject };
 }
+
+test("PIN login uses a text-capable mobile keyboard without text correction", () => {
+  const pin = createPinLoginInput();
+  assert.equal(pin.type, "password");
+  assert.equal(pin.autocomplete, "current-password");
+  assert.notEqual(pin.inputMode, "numeric");
+  assert.equal(pin.autocapitalize, "none");
+  assert.equal(pin.spellcheck, false);
+  assert.equal(pin.placeholder, "6文字以上の PIN");
+});
 
 const viewTrimState = () => ({
   apply_mode: "book",
