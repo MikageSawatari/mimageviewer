@@ -4,7 +4,11 @@
 //! 描画だけを担当する。ここではページ番号と時間の「切りの良い」刻み選択を一元化する。
 
 /// ページ目盛りに確保する最小の論理間隔。
-pub(crate) const SEEK_RULER_MIN_SPACING: f32 = 16.0;
+///
+/// 狭く取る。ページの目盛りは「つまみが止まる位置」を示すものなので、幅が足りる限り
+/// 1 ページ 1 本を保ちたい (利用者判断 2026-08-12)。ページ数がトラック幅を超えたときだけ
+/// 目盛りは間引かれた尺になる。
+pub(crate) const SEEK_RULER_MIN_SPACING: f32 = 4.0;
 /// 時間目盛りに確保する最小の論理間隔。
 ///
 /// ページより広く取る。1 ページは利用者にとって数えられる単位だが、1 秒はそうではなく、
@@ -266,6 +270,15 @@ mod tests {
         assert!(duration_ruler_ticks(0.0, 1000.0, 8.0).is_empty());
         assert!(page_ruler_ticks(10, 15.0, 8.0).is_empty());
         assert!(duration_ruler_ticks(60.0, 15.0, 8.0).is_empty());
+    }
+
+    #[test]
+    fn ordinary_books_keep_one_tick_per_page() {
+        // ページの目盛りはつまみが止まる位置を示す。幅が足りるうちは間引かない。
+        for page_count in [24usize, 120, 200, 300] {
+            let ticks = page_ruler_ticks(page_count, 1_200.0, SEEK_RULER_MIN_SPACING);
+            assert_eq!(ticks.len(), page_count, "page_count={page_count}");
+        }
     }
 
     #[test]
