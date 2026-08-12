@@ -7782,9 +7782,9 @@ fn open_in_explorer(path: &std::path::Path) {
 mod tests {
     use super::{
         AI_SIZE_LIMIT_OPTIONS, OperationAssignmentTab, OperationAssignmentTarget, PreferencesState,
-        apply_command_editor, close_assignment_editors, modifier_hold_editor_choice,
-        natural_operation_label_cmp, open_operation_assignment_editor,
-        ring_bindings_for_key_action,
+        apply_command_editor, close_assignment_editors, compact_key_action_label,
+        compact_operation_label, modifier_hold_editor_choice, natural_operation_label_cmp,
+        open_operation_assignment_editor, ring_bindings_for_key_action,
     };
     use crate::app::MAX_TEXTURE_DIM;
     use crate::keymap::{KeyAction, ModKind};
@@ -7829,6 +7829,66 @@ mod tests {
                 "サムネイル列数を10列に",
             ]
         );
+    }
+
+    #[test]
+    fn operation_labels_keep_drive_commands_contiguous_with_zip_pdf_commands() {
+        let mut rows: Vec<(KeyAction, String)> = KeyAction::all()
+            .iter()
+            .copied()
+            .filter(|action| {
+                action.drive_letter().is_some()
+                    || action.switch_drive_letter().is_some()
+                    || matches!(
+                        action,
+                        KeyAction::GridOpenSelectedAsPage | KeyAction::GridOpenSelectedAsList
+                    )
+            })
+            .map(|action| {
+                let label = compact_key_action_label(action);
+                assert_eq!(label, compact_operation_label(action.description()));
+                (action, label)
+            })
+            .collect();
+        rows.sort_by(|(_, a), (_, b)| natural_operation_label_cmp(a, b));
+
+        let drive_positions: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (action, _))| {
+                (action.drive_letter().is_some() || action.switch_drive_letter().is_some())
+                    .then_some(index)
+            })
+            .collect();
+        assert_eq!(drive_positions.len(), 48);
+        assert!(
+            drive_positions
+                .windows(2)
+                .all(|pair| pair[1] == pair[0] + 1)
+        );
+
+        let first = drive_positions[0];
+        let last = *drive_positions.last().unwrap();
+        let drive_rows = &rows[first..=last];
+        for (pair, expected_letter) in drive_rows.chunks_exact(2).zip('C'..='Z') {
+            assert!(
+                pair.iter()
+                    .any(|(action, _)| action.drive_letter() == Some(expected_letter))
+            );
+            assert!(
+                pair.iter()
+                    .any(|(action, _)| action.switch_drive_letter() == Some(expected_letter))
+            );
+        }
+
+        let non_drive_rows: Vec<KeyAction> = rows[..first]
+            .iter()
+            .chain(&rows[last + 1..])
+            .map(|(action, _)| *action)
+            .collect();
+        assert_eq!(non_drive_rows.len(), 2);
+        assert!(non_drive_rows.contains(&KeyAction::GridOpenSelectedAsPage));
+        assert!(non_drive_rows.contains(&KeyAction::GridOpenSelectedAsList));
     }
 
     #[test]
