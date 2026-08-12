@@ -1152,6 +1152,7 @@ pub fn run() -> eframe::Result {
             remote_ipc::RemoteServiceManager::start(
                 remote_data_dir,
                 log_dir,
+                mimageviewer_ipc::DEFAULT_REMOTE_PORT,
                 saved.remote_service_enabled,
                 remote_service_status.clone(),
             )

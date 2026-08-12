@@ -143,8 +143,10 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 - curl 等の診断用には起動時生成の 256bit `Authorization: Bearer <token>` も残す。Bearer は
   定数時間比較し、PIN・hash・セッション署名値・Bearer をログへ出さない。認証失敗本文に内部情報を出さない
 - 接続用 QR コードには URL だけを含め、PIN や Bearer は含めない。URL は `--url`、Tailscale の
-  `--json` 状態、bind 先の順で決める。remote-web は確定 URL と `tailscale serve` 状態だけを
-  protocol v44 の接続情報として本体へ通知する。PIN 設定状態は認証ファイルの所有者である本体が判定し、
+  `--json` 状態、bind 先の順で決める。remote-web は確定 URL、`tailscale serve` 状態、`/` を占める
+  既存 proxy 先を protocol v45 の接続情報として本体へ通知する。判定は `Web` の `.ts.net` キーだけでなく、
+  handler の `Proxy` が本体から渡された bind / port と一致するかまで見る。本体は JSON を独自解釈しない。
+  PIN 設定状態は認証ファイルの所有者である本体が判定し、
   設定メニューの「リモート接続…」に QR、URL、即時反映する opt-in、受付状態、active session の
   有無に基づく二値の利用状況を表示する。排他的 owner なので端末台数は表示しない。
   remote-web はブラウザ要求と独立した常駐 worker で IPC を維持し、250 ms から 5 秒上限の指数
@@ -164,6 +166,7 @@ core は認証ファイルを `<data_dir>/remote-web-auth.json` に固定する�
 隔離実行の `...\dev-runtime\data-remote`)。これにより remote-web の書き込みを data directory
 の外に保ちながら、`--data-dir` ごとの隔離と同時起動時のログ名前空間を維持する。
 兄弟名を導出できない filesystem root は別の既定領域へ逃がさず、明示エラーで service を開始しない。
+既定ポートは共有 crate の定数を正本とし、本体が所有して `--port` で子プロセスへ明示する。
 子プロセスには解決済みの認証ファイルとログファイルを `--auth-file` / `--log` で渡し、
 remote-web 側で保存場所を推測しない。PIN の hash 化とファイル書き込みも owner worker 上で行い、
 有効中の変更では所有 child を再起動する。新しい session 署名鍵になるため既存端末は再認証する。
@@ -309,10 +312,13 @@ remux と音声フォールバックはトランスコードの下位互換な�
 - **HTTPS が必要な理由は盗聴対策ではなく PWA と secure context**。Service Worker は
   HTTPS 必須であり、ホーム画面登録を成立させるために要る
 - `tailscale serve --bg <port>` は **非管理者権限で実行できることを実機確認済み** (2026-07-29)。
-  したがって mIV から通常権限の子プロセスとして設定できる。UAC 昇格は不要
+  したがって mIV から通常権限の子プロセスとして設定できる。UAC 昇格は不要。
+  接続ダイアログは実行するコマンドと、tailnet 内だけへ HTTPS で公開し TLS は Tailscale が処理する意味を
+  先に表示し、利用者が「tailscale serve を設定する」を押したときだけ本体の owner worker が代行する
 - `tailscale serve status --json` / `tailscale status --json` も **非管理者で読める**。
-  `Self.DNSName` と serve の `Web` キーから接続 URL を自動組み立てできることを実測で確認済み。
-  製品版の設定ウィザードはこの経路で「serve が設定済みか」まで自動判定できる
+  `Self.DNSName` と serve の `Web` handler / proxy 先から接続 URL を自動組み立てる。
+  外部ツールは、参照系 (`status --json` / `serve status --json`) は無条件で実行してよいが、設定を
+  変える系は実行内容と意味を説明したうえで利用者の明示ボタン操作を必要とし、mIV が代行する
 - 自前 TLS (`tailscale cert` で証明書ファイルを取得して mIV が終端する) は、プロキシのホップを
   減らせるが証明書更新の管理を抱える。**現時点では採用しない**。製品化フェーズの比較対象として残す
 
@@ -1817,8 +1823,9 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-PIN 設定状態の所有を本体へ移した 2026-08-12 時点の現行版は **v44**。
-v44 は `RemoteWebConnectionInfo.pin_configured` を削除する。v43 で `ContainerPayload` に追加した
+`tailscale serve` の proxy 衝突を本体へ通知する 2026-08-12 時点の現行版は **v45**。
+v45 は `RemoteWebConnectionInfo.tailscale_serve_conflict` を追加する。v44 で削除した
+`RemoteWebConnectionInfo.pin_configured` は戻さない。v43 で `ContainerPayload` に追加した
 本体 seek overlay と同じ画像・動画・その他の件数内訳は引き続き保持する。
 v42 の `PageRequest` job / optional display request ID、batched `PageDemand` の promote / release、
 typed な `Cancelled`、v37 以降の絶対 path + subresource、表示前照合、検索契約、長時間ジョブ契約も
@@ -2438,3 +2445,20 @@ data directory の外にする理由は「remote-web は本体 data directory �
 
 この機能は未リリースで旧 cwd 相対の `remote-web-auth.json` は利用者環境に存在しないため、
 移行コードは追加しない。開発機に残る旧ファイルは参照されなくなるだけとする。
+
+### 14.15 `tailscale serve` の検出と設定導線 (2026-08-12)
+
+従来は `serve status --json` の `Web` に `.ts.net` のキーがあるだけで設定済みと判定していたため、
+別サービスを配信中でも mIV 用と誤認していた。現在は各 handler の `Proxy` の host / port が、本体所有の
+`127.0.0.1:<port>` と一致するときだけ設定済みとし、接続 URL は該当 entry の host と handler path から
+組み立てる。`/` が別 proxy 先なら v45 の衝突情報として本体へ運び、上書きになることをボタン前に表示する。
+
+設定変更は接続ダイアログに `tailscale serve --bg <port>` そのものと意味を示し、利用者が押したときだけ
+owner worker が最大 8 秒の CLI 実行を行う。成功時は所有する remote-web child を再起動する。本体から
+remote-web へ状態再読込を要求する IPC は無く、再起動で `choose_connection_url` を走らせ直すことが
+再検出の手段だからである。JSON の解釈は引き続き remote-web だけが所有し、本体は独自検出しない。
+
+解除の代行は行わない。Tailscale 1.98 の documented な解除は対象限定を保証できず、`reset` は利用者の
+別用途の serve 設定まで消すためである。今回は Tailscale 側で解除する案内だけを出す。将来代行するなら
+`get-config` / `set-config` を往復し、mIV の handler だけを外して他の設定を保存する形を前提とする。
+`tailscale funnel` は使わず、bind も `127.0.0.1` のままとする。

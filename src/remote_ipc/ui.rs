@@ -46,6 +46,7 @@ pub(crate) struct RemoteSessionUiState {
 
 struct RemoteConnectionDialogState {
     pin_editor: RemotePinEditorState,
+    tailscale_serve_setup: RemoteTailscaleServeSetupState,
 }
 
 enum RemotePinEditorState {
@@ -60,6 +61,14 @@ enum RemotePinEditorState {
     },
 }
 
+enum RemoteTailscaleServeSetupState {
+    Idle,
+    Running {
+        receiver: super::service::RemoteTailscaleServeReceiver,
+    },
+    Finished(Result<(), String>),
+}
+
 impl RemoteConnectionDialogState {
     fn new(pin_configured: bool) -> Self {
         Self {
@@ -72,12 +81,47 @@ impl RemoteConnectionDialogState {
                     request_focus: true,
                 }
             },
+            tailscale_serve_setup: RemoteTailscaleServeSetupState::Idle,
         }
     }
 }
 
 fn remote_enable_action_allowed(pin_configured: bool) -> bool {
     pin_configured
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemoteTailscaleServeElements {
+    show_setup_button: bool,
+    show_conflict_warning: bool,
+    show_unknown_message: bool,
+    show_removal_note: bool,
+}
+
+fn remote_tailscale_serve_elements(
+    status: RemoteWebFeatureStatus,
+    has_conflict: bool,
+) -> RemoteTailscaleServeElements {
+    match status {
+        RemoteWebFeatureStatus::Configured => RemoteTailscaleServeElements {
+            show_setup_button: false,
+            show_conflict_warning: false,
+            show_unknown_message: false,
+            show_removal_note: true,
+        },
+        RemoteWebFeatureStatus::NotConfigured => RemoteTailscaleServeElements {
+            show_setup_button: true,
+            show_conflict_warning: has_conflict,
+            show_unknown_message: false,
+            show_removal_note: false,
+        },
+        RemoteWebFeatureStatus::Unknown => RemoteTailscaleServeElements {
+            show_setup_button: false,
+            show_conflict_warning: false,
+            show_unknown_message: true,
+            show_removal_note: false,
+        },
+    }
 }
 
 fn remote_connection_state_label(
@@ -2316,11 +2360,33 @@ impl crate::app::App {
                 },
             };
         }
+        let tailscale_serve_result = match &dialog.tailscale_serve_setup {
+            RemoteTailscaleServeSetupState::Running { receiver } => match receiver.try_recv() {
+                Ok(result) => Some(result.map_err(|error| error.user_message())),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(
+                    "tailscale serve の設定結果を受け取れませんでした".to_owned(),
+                )),
+            },
+            RemoteTailscaleServeSetupState::Idle | RemoteTailscaleServeSetupState::Finished(_) => {
+                None
+            }
+        };
+        if let Some(result) = tailscale_serve_result {
+            dialog.tailscale_serve_setup = RemoteTailscaleServeSetupState::Finished(result);
+        }
         let service_control = self.remote_session_ui.remote_service_control.clone();
         let pin_configured = service_control
             .as_ref()
             .is_some_and(super::RemoteServiceControl::pin_configured);
         let service_enabled = self.settings.remote_service_enabled;
+        // 案内するコマンドは、実際に子プロセスへ渡している待受ポートから組み立てる。
+        // 既定値を UI 側で持つと、表示と実行で出所が 2 つになる。
+        let serve_port = service_control
+            .as_ref()
+            .map_or(mimageviewer_ipc::DEFAULT_REMOTE_PORT, |control| {
+                control.port()
+            });
         if !pin_configured && matches!(&dialog.pin_editor, RemotePinEditorState::Hidden) {
             dialog.pin_editor = RemotePinEditorState::Editing {
                 input: String::new(),
@@ -2342,6 +2408,12 @@ impl crate::app::App {
         let info = snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.remote_web.clone());
+        if info
+            .as_ref()
+            .is_some_and(|info| info.tailscale_serve == RemoteWebFeatureStatus::Configured)
+        {
+            dialog.tailscale_serve_setup = RemoteTailscaleServeSetupState::Idle;
+        }
         let service_diagnostic = self
             .remote_session_ui
             .remote_service_status
@@ -2353,6 +2425,7 @@ impl crate::app::App {
         let mut open = true;
         let mut requested_enabled = None;
         let mut close_requested = false;
+        let mut begin_tailscale_serve_setup = false;
         egui::Window::new("リモート接続")
             .id(egui::Id::new("remote_connection_dialog"))
             .collapsible(false)
@@ -2535,16 +2608,101 @@ impl crate::app::App {
                         "tailscale serve: {}",
                         remote_feature_status_label(info.tailscale_serve)
                     ));
-                    ui.add_space(6.0);
-                    paint_qr(ui, &info.public_url);
-                    ui.add_space(6.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.monospace(&info.public_url);
-                        if ui.button("コピー").clicked() {
-                            ui.ctx().copy_text(info.public_url.clone());
+                    let elements = remote_tailscale_serve_elements(
+                        info.tailscale_serve,
+                        info.tailscale_serve_conflict.is_some(),
+                    );
+                    if elements.show_unknown_message {
+                        ui.label("Tailscale が見つからないか、状態を読み取れません。");
+                    }
+                    if elements.show_setup_button {
+                        ui.label(format!(
+                            "この PC の {serve_port} 番を、tailnet 内から HTTPS で開けるようにします。"
+                        ));
+                        ui.label("TLS は Tailscale が処理します。インターネットには公開されません。");
+                        ui.label("実行するコマンド:");
+                        ui.monospace(format!("tailscale serve --bg {serve_port}"));
+                        if elements.show_conflict_warning
+                            && let Some(conflict) = info.tailscale_serve_conflict.as_deref()
+                        {
+                            let error_color = ui.visuals().error_fg_color;
+                            ui.colored_label(
+                                error_color,
+                                format!(
+                                    "現在 {} は {} に割り当てられています。設定すると置き換わります。",
+                                    info.public_url, conflict
+                                ),
+                            );
                         }
-                    });
-                    ui.small("QR コードには接続先だけが含まれ、PIN などの認証情報は含まれません。");
+                        let running = matches!(
+                            &dialog.tailscale_serve_setup,
+                            RemoteTailscaleServeSetupState::Running { .. }
+                        );
+                        let awaiting_refresh = matches!(
+                            &dialog.tailscale_serve_setup,
+                            RemoteTailscaleServeSetupState::Finished(Ok(()))
+                        );
+                        if ui
+                            .add_enabled(
+                                !running && !awaiting_refresh,
+                                egui::Button::new("tailscale serve を設定する")
+                                    .min_size(egui::vec2(220.0, 34.0)),
+                            )
+                            .clicked()
+                        {
+                            begin_tailscale_serve_setup = true;
+                        }
+                        match &dialog.tailscale_serve_setup {
+                            RemoteTailscaleServeSetupState::Running { .. } => {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label("tailscale serve を設定しています...");
+                                });
+                            }
+                            RemoteTailscaleServeSetupState::Finished(Ok(())) => {
+                                ui.label("設定しました。接続状態を再確認しています...");
+                            }
+                            RemoteTailscaleServeSetupState::Finished(Err(error)) => {
+                                ui.colored_label(ui.visuals().error_fg_color, error);
+                            }
+                            RemoteTailscaleServeSetupState::Idle => {}
+                        }
+                    }
+                    if elements.show_removal_note {
+                        ui.small("解除は Tailscale 側で行ってください。");
+                    }
+                    if info.tailscale_serve == RemoteWebFeatureStatus::Configured {
+                        ui.add_space(6.0);
+                        paint_qr(ui, &info.public_url);
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.monospace(&info.public_url);
+                            if ui.button("コピー").clicked() {
+                                ui.ctx().copy_text(info.public_url.clone());
+                            }
+                        });
+                        ui.small("QR コードには接続先だけが含まれ、PIN などの認証情報は含まれません。");
+                    }
+                }
+                if info.is_none() {
+                    match &dialog.tailscale_serve_setup {
+                        RemoteTailscaleServeSetupState::Running { .. } => {
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("tailscale serve を設定しています...");
+                            });
+                        }
+                        RemoteTailscaleServeSetupState::Finished(Ok(())) => {
+                            ui.separator();
+                            ui.label("tailscale serve を設定しました。接続状態を再確認しています...");
+                        }
+                        RemoteTailscaleServeSetupState::Finished(Err(error)) => {
+                            ui.separator();
+                            ui.colored_label(ui.visuals().error_fg_color, error);
+                        }
+                        RemoteTailscaleServeSetupState::Idle => {}
+                    }
                 }
 
                 ui.separator();
@@ -2552,6 +2710,18 @@ impl crate::app::App {
                     close_requested = true;
                 }
             });
+
+        if begin_tailscale_serve_setup {
+            dialog.tailscale_serve_setup = match service_control
+                .as_ref()
+                .ok_or_else(|| "tailscale serve の設定を開始できませんでした".to_owned())
+                .and_then(super::RemoteServiceControl::configure_tailscale_serve)
+            {
+                Ok(receiver) => RemoteTailscaleServeSetupState::Running { receiver },
+                Err(error) => RemoteTailscaleServeSetupState::Finished(Err(error)),
+            };
+            ctx.request_repaint();
+        }
 
         if let Some(enabled) = requested_enabled {
             self.settings.remote_service_enabled = enabled;
@@ -2570,8 +2740,12 @@ impl crate::app::App {
             self.remote_session_ui.connection_dialog = None;
         } else {
             let pin_saving = matches!(&dialog.pin_editor, RemotePinEditorState::Saving { .. });
+            let tailscale_running = matches!(
+                &dialog.tailscale_serve_setup,
+                RemoteTailscaleServeSetupState::Running { .. }
+            );
             self.remote_session_ui.connection_dialog = Some(dialog);
-            ctx.request_repaint_after(if pin_saving {
+            ctx.request_repaint_after(if pin_saving || tailscale_running {
                 std::time::Duration::from_millis(50)
             } else {
                 std::time::Duration::from_secs(1)
@@ -3170,12 +3344,61 @@ mod tests {
     }
 
     #[test]
-    fn remote_connection_dialog_keeps_only_pin_editor_state() {
-        let RemoteConnectionDialogState { pin_editor } = RemoteConnectionDialogState::new(false);
+    fn remote_connection_dialog_has_no_pending_enabled_state() {
+        let RemoteConnectionDialogState {
+            pin_editor,
+            tailscale_serve_setup,
+        } = RemoteConnectionDialogState::new(false);
         assert!(matches!(pin_editor, RemotePinEditorState::Editing { .. }));
+        assert!(matches!(
+            tailscale_serve_setup,
+            RemoteTailscaleServeSetupState::Idle
+        ));
 
-        let RemoteConnectionDialogState { pin_editor } = RemoteConnectionDialogState::new(true);
+        let RemoteConnectionDialogState {
+            pin_editor,
+            tailscale_serve_setup,
+        } = RemoteConnectionDialogState::new(true);
         assert!(matches!(pin_editor, RemotePinEditorState::Hidden));
+        assert!(matches!(
+            tailscale_serve_setup,
+            RemoteTailscaleServeSetupState::Idle
+        ));
+    }
+
+    #[test]
+    fn tailscale_serve_dialog_elements_follow_status_and_conflict() {
+        assert_eq!(
+            remote_tailscale_serve_elements(RemoteWebFeatureStatus::Configured, false),
+            RemoteTailscaleServeElements {
+                show_setup_button: false,
+                show_conflict_warning: false,
+                show_unknown_message: false,
+                show_removal_note: true,
+            }
+        );
+        assert_eq!(
+            remote_tailscale_serve_elements(RemoteWebFeatureStatus::NotConfigured, false),
+            RemoteTailscaleServeElements {
+                show_setup_button: true,
+                show_conflict_warning: false,
+                show_unknown_message: false,
+                show_removal_note: false,
+            }
+        );
+        assert!(
+            remote_tailscale_serve_elements(RemoteWebFeatureStatus::NotConfigured, true)
+                .show_conflict_warning
+        );
+        assert_eq!(
+            remote_tailscale_serve_elements(RemoteWebFeatureStatus::Unknown, true),
+            RemoteTailscaleServeElements {
+                show_setup_button: false,
+                show_conflict_warning: false,
+                show_unknown_message: true,
+                show_removal_note: false,
+            }
+        );
     }
 
     #[test]

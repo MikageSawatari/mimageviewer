@@ -57,6 +57,7 @@ fn run() -> Result<(), String> {
     thumbnail_client.set_remote_web_connection_info(RemoteWebConnectionInfo {
         public_url: connection.base.clone(),
         tailscale_serve: connection.tailscale_serve,
+        tailscale_serve_conflict: connection.tailscale_serve_conflict,
     });
     let ipc_status = match thumbnail_client.probe() {
         Ok(()) => "接続済み".to_owned(),

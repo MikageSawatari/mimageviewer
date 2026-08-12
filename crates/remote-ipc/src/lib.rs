@@ -3,10 +3,15 @@
 //! GUI や Windows API には依存せず、型・版数・長さ付きフレームだけを共有する。
 
 mod auth;
+mod tailscale;
 
 pub use auth::{
     AUTH_FILE_VERSION, AuthRecord, MAX_PIN_CHARS, MIN_PIN_CHARS, load_pin_file, production_argon2,
     set_pin_file, validate_pin, validate_record,
+};
+pub use tailscale::{
+    DEFAULT_REMOTE_PORT, TAILSCALE_COMMAND_TIMEOUT, TailscaleCommandError, TailscaleCommandOutput,
+    run_tailscale, run_tailscale_at, tailscale_executable,
 };
 
 use std::fmt;
@@ -21,7 +26,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 44;
+pub const PROTOCOL_VERSION: u32 = 45;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -1284,6 +1289,7 @@ pub struct SessionPeerInfo {
 pub struct RemoteWebConnectionInfo {
     pub public_url: String,
     pub tailscale_serve: RemoteWebFeatureStatus,
+    pub tailscale_serve_conflict: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -2597,13 +2603,14 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v44_connection_info_round_trips_without_pin_state_or_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 44);
+    fn protocol_v45_connection_info_round_trips_with_serve_conflict_without_credentials() {
+        assert_eq!(PROTOCOL_VERSION, 45);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
                 public_url: "https://viewer.example.ts.net/".to_owned(),
-                tailscale_serve: RemoteWebFeatureStatus::Configured,
+                tailscale_serve: RemoteWebFeatureStatus::NotConfigured,
+                tailscale_serve_conflict: Some("http://127.0.0.1:3000".to_owned()),
             },
         };
         let mut bytes = Vec::new();
@@ -2768,8 +2775,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v44_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 44);
+    fn protocol_v45_remote_video_thumbnail_shape_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 45);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,

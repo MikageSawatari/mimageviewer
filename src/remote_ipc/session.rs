@@ -3521,6 +3521,7 @@ mod tests {
         let info = |url: &str| RemoteWebConnectionInfo {
             public_url: url.to_owned(),
             tailscale_serve: mimageviewer_ipc::RemoteWebFeatureStatus::Configured,
+            tailscale_serve_conflict: None,
         };
         handle.remote_web_connected(1);
         assert!(handle.snapshot().remote_web_connected);

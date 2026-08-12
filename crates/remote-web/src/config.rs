@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-pub const DEFAULT_PORT: u16 = 8787;
+pub const DEFAULT_PORT: u16 = mimageviewer_ipc::DEFAULT_REMOTE_PORT;
 
 #[derive(Debug)]
 pub struct Config {
