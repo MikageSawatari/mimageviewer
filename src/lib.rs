@@ -1146,12 +1146,16 @@ pub fn run() -> eframe::Result {
         .as_ref()
         .map(remote_ipc::RemoteIpcServer::session_handle);
     // server より後に所有し、逆順 Drop で service を先に止めてから pipe を閉じる。
+    let remote_data_dir = data_dir::get();
     let _remote_service_manager = if _remote_ipc_server.is_some() {
-        match remote_ipc::RemoteServiceManager::start(
-            data_dir::get(),
-            saved.remote_service_enabled,
-            remote_service_status.clone(),
-        ) {
+        match data_dir::remote_service_log_dir(&remote_data_dir).and_then(|log_dir| {
+            remote_ipc::RemoteServiceManager::start(
+                remote_data_dir,
+                log_dir,
+                saved.remote_service_enabled,
+                remote_service_status.clone(),
+            )
+        }) {
             Ok(manager) => Some(manager),
             Err(error) => {
                 logger::log(format!("remote_service: manager startup failed: {error}"));

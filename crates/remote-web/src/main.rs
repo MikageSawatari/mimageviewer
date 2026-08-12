@@ -16,16 +16,16 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 
-use auth::{AuthService, AuthToken, load_pin_file, set_pin_file};
+use auth::{AuthService, AuthToken};
 use config::{Config, default_data_dir};
 use connection_url::choose_connection_url;
-use diagnostics::DiagnosticsLogger;
+use diagnostics::{DiagnosticsLogger, resolve_file_path};
 use http::{
     AppState, HTTP_WORKER_COUNT, IpcAdmission, MAX_CONCURRENT_HEAVY_IPC, MAX_CONCURRENT_IPC,
     MAX_CONCURRENT_STREAM_IPC, SessionActivityNotifier, TelemetryLimiter,
 };
 use ipc_client::ThumbnailClient;
-use mimageviewer_ipc::RemoteWebConnectionInfo;
+use mimageviewer_ipc::{RemoteWebConnectionInfo, load_pin_file};
 use store::Library;
 use tiny_http::Server;
 
@@ -39,20 +39,14 @@ fn main() {
 fn run() -> Result<(), String> {
     let config = Config::parse()?;
     let protected_roots = [default_data_dir(), config.data_dir.clone()];
-    if let Some(pin) = config.set_pin.as_deref() {
-        let path = set_pin_file(&config.auth_path, &protected_roots, pin)?;
-        println!("PIN を設定しました: {}", path.display());
-        println!("PIN の平文は保存していません。次回は --set-pin なしで起動してください。");
-        return Ok(());
-    }
-
-    let loaded_auth = load_pin_file(&config.auth_path, &protected_roots)?;
+    let auth_path = resolve_file_path(&config.auth_path, "認証ファイル")?;
+    let auth_record = load_pin_file(&auth_path)?;
     let bearer =
         AuthToken::generate().map_err(|error| format!("認証トークンを生成できません: {error}"))?;
-    let auth = AuthService::new(loaded_auth.record, bearer)?;
+    let auth = AuthService::new(auth_record, bearer)?;
     let log_secrets = auth.permanent_log_secrets();
     let logger = DiagnosticsLogger::open(&config.log_path, &protected_roots, &log_secrets)?;
-    if logger.path() == loaded_auth.path {
+    if logger.path() == auth_path {
         return Err("--log と --auth-file には別のファイルを指定してください".to_owned());
     }
     let library = Library::load(&config.data_dir)
@@ -63,7 +57,6 @@ fn run() -> Result<(), String> {
     thumbnail_client.set_remote_web_connection_info(RemoteWebConnectionInfo {
         public_url: connection.base.clone(),
         tailscale_serve: connection.tailscale_serve,
-        pin_configured: true,
     });
     let ipc_status = match thumbnail_client.probe() {
         Ok(()) => "接続済み".to_owned(),
@@ -79,7 +72,7 @@ fn run() -> Result<(), String> {
 
     println!("mIV remote PoC bind: http://{address}");
     println!("計測ログ: {}", logger.path().display());
-    println!("認証ファイル: {}", loaded_auth.path.display());
+    println!("認証ファイル: {}", auth_path.display());
     println!("mIV サムネイル IPC: {ipc_status}");
     println!("デバッグ用 Bearer トークン: {}", auth.bearer_printable());
     println!("接続 URL の決定元: {}", connection.source.label());

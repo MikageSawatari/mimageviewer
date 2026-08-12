@@ -1,11 +1,31 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 const REMOTE_EXE_NAME: &str = "mimageviewer-remote.exe";
 const MANAGED_BY_CORE_ARG: &str = "--managed-by-core";
+const AUTH_FILE_NAME: &str = "remote-web-auth.json";
+const LOG_FILE_NAME: &str = "remote-web-log.jsonl";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteServicePaths {
+    data_dir: PathBuf,
+    auth_file: PathBuf,
+    log_file: PathBuf,
+}
+
+impl RemoteServicePaths {
+    fn new(data_dir: PathBuf, log_dir: PathBuf) -> Self {
+        Self {
+            auth_file: data_dir.join(AUTH_FILE_NAME),
+            data_dir,
+            log_file: log_dir.join(LOG_FILE_NAME),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RemoteServiceDiagnostic {
@@ -52,13 +72,20 @@ impl RemoteServiceStatus {
 
 enum RemoteServiceCommand {
     SetEnabled(bool),
+    SetPin {
+        pin: String,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
     Shutdown,
 }
+
+pub(crate) type RemotePinUpdateReceiver = mpsc::Receiver<Result<(), String>>;
 
 #[derive(Clone)]
 pub(crate) struct RemoteServiceControl {
     tx: mpsc::Sender<RemoteServiceCommand>,
     status: RemoteServiceStatus,
+    pin_configured: Arc<AtomicBool>,
 }
 
 impl RemoteServiceControl {
@@ -72,6 +99,19 @@ impl RemoteServiceControl {
                 .set_error("リモート接続の切り替えを開始できませんでした");
         }
     }
+
+    pub(crate) fn pin_configured(&self) -> bool {
+        self.pin_configured.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_pin(&self, pin: String) -> Result<RemotePinUpdateReceiver, String> {
+        mimageviewer_ipc::validate_pin(&pin)?;
+        let (reply, receiver) = mpsc::channel();
+        self.tx
+            .send(RemoteServiceCommand::SetPin { pin, reply })
+            .map_err(|_| "PIN の設定を開始できませんでした".to_owned())?;
+        Ok(receiver)
+    }
 }
 
 pub(crate) struct RemoteServiceManager {
@@ -82,17 +122,33 @@ pub(crate) struct RemoteServiceManager {
 impl RemoteServiceManager {
     pub(crate) fn start(
         data_dir: PathBuf,
+        log_dir: PathBuf,
         initially_enabled: bool,
         status: RemoteServiceStatus,
     ) -> Result<Self, String> {
+        let paths = RemoteServicePaths::new(data_dir, log_dir);
+        let pin_configured = Arc::new(AtomicBool::new(auth_file_is_configured(&paths.auth_file)));
         let (tx, rx) = mpsc::channel();
         let worker_status = status.clone();
+        let worker_pin_configured = Arc::clone(&pin_configured);
         let thread = std::thread::Builder::new()
             .name("remote-service-owner".to_owned())
-            .spawn(move || run_service_manager(rx, data_dir, initially_enabled, worker_status))
+            .spawn(move || {
+                run_service_manager(
+                    rx,
+                    paths,
+                    initially_enabled,
+                    worker_status,
+                    worker_pin_configured,
+                )
+            })
             .map_err(|error| format!("リモート接続の管理を開始できません: {error}"))?;
         Ok(Self {
-            control: RemoteServiceControl { tx, status },
+            control: RemoteServiceControl {
+                tx,
+                status,
+                pin_configured,
+            },
             thread: Some(thread),
         })
     }
@@ -100,6 +156,10 @@ impl RemoteServiceManager {
     pub(crate) fn control(&self) -> RemoteServiceControl {
         self.control.clone()
     }
+}
+
+fn auth_file_is_configured(path: &Path) -> bool {
+    mimageviewer_ipc::load_pin_file(path).is_ok()
 }
 
 impl Drop for RemoteServiceManager {
@@ -113,27 +173,49 @@ impl Drop for RemoteServiceManager {
 
 fn run_service_manager(
     rx: mpsc::Receiver<RemoteServiceCommand>,
-    data_dir: PathBuf,
+    paths: RemoteServicePaths,
     initially_enabled: bool,
     status: RemoteServiceStatus,
+    pin_configured: Arc<AtomicBool>,
 ) {
     let mut process = None;
-    if initially_enabled {
-        start_owned_process(&data_dir, &status, &mut process);
+    let mut enabled = initially_enabled && pin_configured.load(Ordering::Acquire);
+    if enabled {
+        start_owned_process(&paths, &status, &mut process);
     } else {
         status.set(RemoteServiceDiagnostic::Stopped);
     }
 
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(RemoteServiceCommand::SetEnabled(true)) => {
-                if process.is_none() {
-                    start_owned_process(&data_dir, &status, &mut process);
+            Ok(RemoteServiceCommand::SetEnabled(requested)) => {
+                enabled =
+                    accepted_enabled_request(requested, pin_configured.load(Ordering::Acquire));
+                if enabled {
+                    if process.is_none() {
+                        start_owned_process(&paths, &status, &mut process);
+                    }
+                } else {
+                    drop(process.take());
+                    if requested {
+                        status.set(RemoteServiceDiagnostic::Error(
+                            "PIN が未設定のためリモート接続を有効にできません".to_owned(),
+                        ));
+                    } else {
+                        status.set(RemoteServiceDiagnostic::Stopped);
+                    }
                 }
             }
-            Ok(RemoteServiceCommand::SetEnabled(false)) => {
-                drop(process.take());
-                status.set(RemoteServiceDiagnostic::Stopped);
+            Ok(RemoteServiceCommand::SetPin { pin, reply }) => {
+                let result = mimageviewer_ipc::set_pin_file(&paths.auth_file, &pin);
+                if result.is_ok() {
+                    pin_configured.store(true, Ordering::Release);
+                    if pin_update_plan(enabled) == PinUpdatePlan::Restart {
+                        drop(process.take());
+                        start_owned_process(&paths, &status, &mut process);
+                    }
+                }
+                let _ = reply.send(result);
             }
             Ok(RemoteServiceCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 break;
@@ -153,13 +235,31 @@ fn run_service_manager(
     drop(process);
 }
 
+fn accepted_enabled_request(requested: bool, pin_configured: bool) -> bool {
+    requested && pin_configured
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PinUpdatePlan {
+    KeepStopped,
+    Restart,
+}
+
+fn pin_update_plan(enabled: bool) -> PinUpdatePlan {
+    if enabled {
+        PinUpdatePlan::Restart
+    } else {
+        PinUpdatePlan::KeepStopped
+    }
+}
+
 fn start_owned_process(
-    data_dir: &Path,
+    paths: &RemoteServicePaths,
     status: &RemoteServiceStatus,
     process: &mut Option<RemoteServiceProcess>,
 ) {
     status.set(RemoteServiceDiagnostic::Starting);
-    match RemoteServiceProcess::start(data_dir, status.clone()) {
+    match RemoteServiceProcess::start(paths, status.clone()) {
         Ok(child) => *process = Some(child),
         Err(error) => {
             crate::logger::log(format!("remote_service: startup failed: {error}"));
@@ -174,11 +274,11 @@ pub(crate) struct RemoteServiceProcess {
 }
 
 impl RemoteServiceProcess {
-    pub(crate) fn start(data_dir: &Path, status: RemoteServiceStatus) -> Result<Self, String> {
+    fn start(paths: &RemoteServicePaths, status: RemoteServiceStatus) -> Result<Self, String> {
         let current_exe = std::env::current_exe()
             .map_err(|error| format!("本体の場所を確認できません: {error}"))?;
         let remote_exe = remote_executable_path(&current_exe)?;
-        start_command(data_dir, status, remote_exe)
+        start_command(paths, status, remote_exe)
     }
 
     fn has_exited(&mut self) -> bool {
@@ -194,7 +294,7 @@ impl RemoteServiceProcess {
 }
 
 fn start_command(
-    data_dir: &Path,
+    paths: &RemoteServicePaths,
     status: RemoteServiceStatus,
     remote_exe: PathBuf,
 ) -> Result<RemoteServiceProcess, String> {
@@ -204,15 +304,29 @@ fn start_command(
             remote_exe.display()
         ));
     }
-    let command = remote_command(&remote_exe, data_dir);
+    let log_dir = paths
+        .log_file
+        .parent()
+        .ok_or("診断ログの保存先を確認できません")?;
+    std::fs::create_dir_all(log_dir).map_err(|error| {
+        format!(
+            "診断ログの保存先を作成できません ({}): {error}",
+            log_dir.display()
+        )
+    })?;
+    let command = remote_command(&remote_exe, paths);
     spawn_process(command, remote_exe, status)
 }
 
-fn remote_command(remote_exe: &Path, data_dir: &Path) -> Command {
+fn remote_command(remote_exe: &Path, paths: &RemoteServicePaths) -> Command {
     let mut command = Command::new(remote_exe);
     command
         .arg("--data-dir")
-        .arg(data_dir)
+        .arg(&paths.data_dir)
+        .arg("--auth-file")
+        .arg(&paths.auth_file)
+        .arg("--log")
+        .arg(&paths.log_file)
         .arg(MANAGED_BY_CORE_ARG)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -323,6 +437,7 @@ mod tests {
         let control = RemoteServiceControl {
             tx,
             status: RemoteServiceStatus::stopped(),
+            pin_configured: Arc::new(AtomicBool::new(true)),
         };
         control.set_enabled(true);
         assert!(matches!(
@@ -357,13 +472,54 @@ mod tests {
 
     #[test]
     fn managed_remote_receives_the_core_data_directory() {
-        let command = remote_command(
-            Path::new(r"C:\miv\mimageviewer-remote.exe"),
-            Path::new(r"C:\isolated data"),
+        let paths = RemoteServicePaths::new(
+            PathBuf::from(r"C:\isolated data"),
+            PathBuf::from(r"C:\local\mimageviewer\remote"),
         );
+        let command = remote_command(Path::new(r"C:\miv\mimageviewer-remote.exe"), &paths);
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            ["--data-dir", r"C:\isolated data", MANAGED_BY_CORE_ARG]
+            [
+                "--data-dir",
+                r"C:\isolated data",
+                "--auth-file",
+                r"C:\isolated data\remote-web-auth.json",
+                "--log",
+                r"C:\local\mimageviewer\remote\remote-web-log.jsonl",
+                MANAGED_BY_CORE_ARG,
+            ]
         );
+    }
+
+    #[test]
+    fn pin_state_gates_enable_and_an_enabled_pin_update_restarts() {
+        assert!(!accepted_enabled_request(true, false));
+        assert!(!accepted_enabled_request(false, true));
+        assert!(accepted_enabled_request(true, true));
+        assert_eq!(pin_update_plan(false), PinUpdatePlan::KeepStopped);
+        assert_eq!(pin_update_plan(true), PinUpdatePlan::Restart);
+    }
+
+    #[test]
+    fn core_owns_auth_below_data_and_log_outside_it() {
+        let paths = RemoteServicePaths::new(
+            PathBuf::from(r"C:\Users\test\AppData\Roaming\mimageviewer"),
+            PathBuf::from(r"C:\Users\test\AppData\Local\mimageviewer\remote"),
+        );
+        assert!(paths.auth_file.starts_with(&paths.data_dir));
+        assert!(!paths.log_file.starts_with(&paths.data_dir));
+    }
+
+    #[test]
+    fn core_treats_missing_and_corrupt_auth_as_unconfigured() {
+        let temp = tempfile::tempdir().unwrap();
+        let auth_file = temp.path().join(AUTH_FILE_NAME);
+        assert!(!auth_file_is_configured(&auth_file));
+
+        std::fs::write(&auth_file, b"not valid JSON").unwrap();
+        assert!(!auth_file_is_configured(&auth_file));
+
+        mimageviewer_ipc::set_pin_file(&auth_file, "123456").unwrap();
+        assert!(auth_file_is_configured(&auth_file));
     }
 }

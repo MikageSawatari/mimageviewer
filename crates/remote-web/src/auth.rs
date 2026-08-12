@@ -1,24 +1,15 @@
-use std::fs::OpenOptions;
-use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::password_hash::{PasswordHash, PasswordVerifier};
 use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize};
+use mimageviewer_ipc::{AuthRecord, production_argon2, validate_record};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::diagnostics::resolve_external_file_path;
-
 pub const COOKIE_NAME: &str = "miv_remote_session";
-pub const MIN_PIN_CHARS: usize = 6;
-const MAX_PIN_CHARS: usize = 1024;
 const TOKEN_BYTES: usize = 32;
 const TOKEN_HEX_LEN: usize = TOKEN_BYTES * 2;
-const AUTH_FILE_VERSION: u32 = 1;
 const LOCKOUT_THRESHOLD: u32 = 5;
 const FIRST_LOCKOUT: Duration = Duration::from_secs(30);
 const MAX_LOCKOUT_EXPONENT: u32 = 10;
@@ -30,18 +21,6 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct AuthToken {
     printable: String,
     expected_ascii: [u8; TOKEN_HEX_LEN],
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AuthRecord {
-    version: u32,
-    pin_hash: String,
-    session_secret_hex: String,
-}
-
-pub struct LoadedAuth {
-    pub record: AuthRecord,
-    pub path: PathBuf,
 }
 
 pub struct AuthService {
@@ -102,100 +81,6 @@ struct LockoutState {
     locked_until: Option<Instant>,
 }
 
-pub fn set_pin_file(
-    requested_path: &Path,
-    protected_roots: &[PathBuf],
-    pin: &str,
-) -> Result<PathBuf, String> {
-    validate_pin(pin)?;
-    let path = resolve_external_file_path(requested_path, protected_roots, "認証ファイル")?;
-    let mut salt_bytes = [0_u8; 16];
-    let mut session_secret = [0_u8; TOKEN_BYTES];
-    getrandom::fill(&mut salt_bytes)
-        .map_err(|error| format!("PIN 用 salt を生成できません: {error}"))?;
-    getrandom::fill(&mut session_secret)
-        .map_err(|error| format!("セッション秘密値を生成できません: {error}"))?;
-    let salt = SaltString::encode_b64(&salt_bytes)
-        .map_err(|error| format!("PIN 用 salt を構成できません: {error}"))?;
-    let pin_hash = production_argon2()
-        .hash_password(pin.as_bytes(), &salt)
-        .map_err(|error| format!("PIN をハッシュ化できません: {error}"))?
-        .to_string();
-    let record = AuthRecord {
-        version: AUTH_FILE_VERSION,
-        pin_hash,
-        session_secret_hex: encode_hex(&session_secret),
-    };
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&path)
-        .map_err(|error| format!("認証ファイルを書き込めません ({}): {error}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut writer, &record)
-        .map_err(|error| format!("認証ファイルを JSON 化できません: {error}"))?;
-    writer
-        .write_all(b"\n")
-        .and_then(|()| writer.flush())
-        .map_err(|error| format!("認証ファイルを保存できません ({}): {error}", path.display()))?;
-    writer
-        .get_ref()
-        .sync_all()
-        .map_err(|error| format!("認証ファイルを同期できません ({}): {error}", path.display()))?;
-    Ok(path)
-}
-
-pub fn load_pin_file(
-    requested_path: &Path,
-    protected_roots: &[PathBuf],
-) -> Result<LoadedAuth, String> {
-    let path = resolve_external_file_path(requested_path, protected_roots, "認証ファイル")?;
-    if !path.is_file() {
-        return Err(format!(
-            "PIN が未設定です。先に --set-pin <6文字以上のPIN> を実行してください (認証ファイル: {})",
-            path.display()
-        ));
-    }
-    let bytes = std::fs::read(&path)
-        .map_err(|error| format!("認証ファイルを読み込めません ({}): {error}", path.display()))?;
-    let record: AuthRecord = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("認証ファイルが不正です ({}): {error}", path.display()))?;
-    validate_record(&record)?;
-    Ok(LoadedAuth { record, path })
-}
-
-fn validate_pin(pin: &str) -> Result<(), String> {
-    let length = pin.chars().count();
-    if length < MIN_PIN_CHARS {
-        return Err(format!("PIN は {MIN_PIN_CHARS} 文字以上にしてください"));
-    }
-    if length > MAX_PIN_CHARS {
-        return Err(format!("PIN は {MAX_PIN_CHARS} 文字以下にしてください"));
-    }
-    Ok(())
-}
-
-fn validate_record(record: &AuthRecord) -> Result<(), String> {
-    if record.version != AUTH_FILE_VERSION {
-        return Err(format!(
-            "未対応の認証ファイル version です: {}",
-            record.version
-        ));
-    }
-    let hash = PasswordHash::new(&record.pin_hash)
-        .map_err(|_| "認証ファイルの PIN hash が不正です".to_owned())?;
-    if hash.algorithm.as_str() != "argon2id" {
-        return Err("認証ファイルの PIN hash は Argon2id ではありません".to_owned());
-    }
-    decode_secret(&record.session_secret_hex)?;
-    Ok(())
-}
-
-fn production_argon2() -> Argon2<'static> {
-    Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default())
-}
-
 impl AuthToken {
     pub fn generate() -> Result<Self, getrandom::Error> {
         let mut raw = [0_u8; TOKEN_BYTES];
@@ -246,10 +131,11 @@ impl AuthToken {
 impl AuthService {
     pub fn new(record: AuthRecord, bearer: AuthToken) -> Result<Self, String> {
         validate_record(&record)?;
+        let session_secret = record.session_secret()?;
         Ok(Self {
             bearer,
-            pin_hash: record.pin_hash,
-            session_secret: decode_secret(&record.session_secret_hex)?,
+            pin_hash: record.pin_hash().to_owned(),
+            session_secret,
             lockout: Mutex::new(LockoutState::default()),
         })
     }
@@ -448,13 +334,6 @@ fn encode_hex(bytes: &[u8]) -> String {
     result
 }
 
-fn decode_secret(value: &str) -> Result<[u8; TOKEN_BYTES], String> {
-    let bytes = decode_hex(value).map_err(|_| "認証ファイルの session secret が不正です")?;
-    bytes
-        .try_into()
-        .map_err(|_| "認証ファイルの session secret 長が不正です".to_owned())
-}
-
 fn decode_hex(value: &str) -> Result<Vec<u8>, ()> {
     if !value.len().is_multiple_of(2) {
         return Err(());
@@ -488,44 +367,9 @@ mod tests {
     fn service(pin: &str) -> AuthService {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("auth.json");
-        set_pin_file(&path, &[], pin).unwrap();
-        let loaded = load_pin_file(&path, &[]).unwrap();
-        AuthService::new(
-            loaded.record,
-            AuthToken::from_printable_for_test(TEST_TOKEN),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn startup_auth_load_refuses_missing_pin_file_with_setup_hint() {
-        let temp = tempfile::tempdir().unwrap();
-        let error = load_pin_file(&temp.path().join("missing.json"), &[])
-            .err()
-            .unwrap();
-        assert!(error.contains("PIN が未設定"));
-        assert!(error.contains("--set-pin"));
-    }
-
-    #[test]
-    fn pin_shorter_than_six_characters_is_rejected() {
-        let temp = tempfile::tempdir().unwrap();
-        let error = set_pin_file(&temp.path().join("auth.json"), &[], "12345")
-            .err()
-            .unwrap();
-        assert!(error.contains("6 文字以上"));
-        assert!(!temp.path().join("auth.json").exists());
-    }
-
-    #[test]
-    fn auth_file_contains_argon2id_hash_but_not_plaintext_pin() {
-        let temp = tempfile::tempdir().unwrap();
-        let pin = "846291-long-passphrase";
-        let path = temp.path().join("auth.json");
-        set_pin_file(&path, &[], pin).unwrap();
-        let contents = std::fs::read_to_string(path).unwrap();
-        assert!(contents.contains("$argon2id$"));
-        assert!(!contents.contains(pin));
+        mimageviewer_ipc::set_pin_file(&path, pin).unwrap();
+        let record = mimageviewer_ipc::load_pin_file(&path).unwrap();
+        AuthService::new(record, AuthToken::from_printable_for_test(TEST_TOKEN)).unwrap()
     }
 
     #[test]

@@ -44,9 +44,38 @@ pub(crate) struct RemoteSessionUiState {
     acquire_barrier_diagnostics: RemoteAcquireBarrierDiagnostics,
 }
 
-#[derive(Clone, Copy)]
 struct RemoteConnectionDialogState {
     enabled: bool,
+    pin_editor: RemotePinEditorState,
+}
+
+enum RemotePinEditorState {
+    Hidden,
+    Editing {
+        input: String,
+        error: Option<String>,
+        request_focus: bool,
+    },
+    Saving {
+        receiver: super::service::RemotePinUpdateReceiver,
+    },
+}
+
+impl RemoteConnectionDialogState {
+    fn new(enabled: bool, pin_configured: bool) -> Self {
+        Self {
+            enabled: enabled && pin_configured,
+            pin_editor: if pin_configured {
+                RemotePinEditorState::Hidden
+            } else {
+                RemotePinEditorState::Editing {
+                    input: String::new(),
+                    error: None,
+                    request_focus: true,
+                }
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +98,10 @@ fn remote_connection_dialog_outcome(
     } else {
         RemoteConnectionDialogOutcome::Keep(enabled)
     }
+}
+
+fn remote_enabled_choice(enabled: bool, pin_configured: bool) -> bool {
+    enabled && pin_configured
 }
 
 fn remote_connection_state_label(
@@ -334,9 +367,15 @@ impl crate::app::App {
     }
 
     pub(crate) fn open_remote_connection_dialog(&mut self) {
-        self.remote_session_ui.connection_dialog = Some(RemoteConnectionDialogState {
-            enabled: self.settings.remote_service_enabled,
-        });
+        let pin_configured = self
+            .remote_session_ui
+            .remote_service_control
+            .as_ref()
+            .is_some_and(super::RemoteServiceControl::pin_configured);
+        self.remote_session_ui.connection_dialog = Some(RemoteConnectionDialogState::new(
+            self.settings.remote_service_enabled,
+            pin_configured,
+        ));
     }
 
     pub(crate) fn remote_connection_dialog_open(&self) -> bool {
@@ -2280,11 +2319,43 @@ impl crate::app::App {
     }
 
     pub(crate) fn show_remote_connection_dialog(&mut self, ctx: &egui::Context) {
-        let Some(dialog) = self.remote_session_ui.connection_dialog else {
+        let Some(mut dialog) = self.remote_session_ui.connection_dialog.take() else {
             return;
         };
         let mut enabled = dialog.enabled;
         let was_enabled = self.settings.remote_service_enabled;
+        let pin_update_result = match &dialog.pin_editor {
+            RemotePinEditorState::Saving { receiver } => match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("PIN の設定結果を受け取れませんでした".to_owned()))
+                }
+            },
+            RemotePinEditorState::Hidden | RemotePinEditorState::Editing { .. } => None,
+        };
+        if let Some(result) = pin_update_result {
+            dialog.pin_editor = match result {
+                Ok(()) => RemotePinEditorState::Hidden,
+                Err(error) => RemotePinEditorState::Editing {
+                    input: String::new(),
+                    error: Some(error),
+                    request_focus: true,
+                },
+            };
+        }
+        let service_control = self.remote_session_ui.remote_service_control.clone();
+        let pin_configured = service_control
+            .as_ref()
+            .is_some_and(super::RemoteServiceControl::pin_configured);
+        enabled = remote_enabled_choice(enabled, pin_configured);
+        if !pin_configured && matches!(&dialog.pin_editor, RemotePinEditorState::Hidden) {
+            dialog.pin_editor = RemotePinEditorState::Editing {
+                input: String::new(),
+                error: None,
+                request_focus: true,
+            };
+        }
         let snapshot = self
             .remote_session_ui
             .handle
@@ -2317,7 +2388,115 @@ impl crate::app::App {
             .default_width(560.0)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.checkbox(&mut enabled, "この端末からリモート接続を利用する");
+                let mut begin_pin_save = false;
+                ui.horizontal(|ui| {
+                    ui.label("PIN:");
+                    ui.strong(if pin_configured {
+                        "設定済み"
+                    } else {
+                        "未設定"
+                    });
+                    if pin_configured
+                        && matches!(&dialog.pin_editor, RemotePinEditorState::Hidden)
+                        && ui.button("PIN を変更").clicked()
+                    {
+                        dialog.pin_editor = RemotePinEditorState::Editing {
+                            input: String::new(),
+                            error: None,
+                            request_focus: true,
+                        };
+                    }
+                });
+                match &mut dialog.pin_editor {
+                    RemotePinEditorState::Hidden => {}
+                    RemotePinEditorState::Editing {
+                        input,
+                        error,
+                        request_focus,
+                    } => {
+                        ui.horizontal(|ui| {
+                            let response = crate::ime_focus::add_singleline_sensitive(
+                                ui,
+                                input,
+                                None,
+                                |edit| {
+                                    edit.password(true)
+                                        .desired_width(260.0)
+                                        .hint_text("6文字以上の PIN / パスフレーズ")
+                                        .id(egui::Id::new("remote_connection_pin"))
+                                },
+                            );
+                            if *request_focus {
+                                response.request_focus();
+                                *request_focus = false;
+                            }
+                            if ui.button("設定").clicked() {
+                                begin_pin_save = true;
+                            }
+                        });
+                        if let Some(error) = error {
+                            ui.colored_label(ui.visuals().error_fg_color, error);
+                        }
+                    }
+                    RemotePinEditorState::Saving { .. } => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("PIN を保存しています...");
+                        });
+                    }
+                }
+                if begin_pin_save {
+                    let pin = match &mut dialog.pin_editor {
+                        RemotePinEditorState::Editing { input, .. } => std::mem::take(input),
+                        RemotePinEditorState::Hidden | RemotePinEditorState::Saving { .. } => {
+                            String::new()
+                        }
+                    };
+                    match mimageviewer_ipc::validate_pin(&pin) {
+                        Err(error) => {
+                            dialog.pin_editor = RemotePinEditorState::Editing {
+                                input: pin,
+                                error: Some(error),
+                                request_focus: true,
+                            };
+                        }
+                        Ok(()) => {
+                            if let Some(control) = service_control.as_ref() {
+                                match control.set_pin(pin) {
+                                    Ok(receiver) => {
+                                        dialog.pin_editor =
+                                            RemotePinEditorState::Saving { receiver };
+                                    }
+                                    Err(error) => {
+                                        dialog.pin_editor = RemotePinEditorState::Editing {
+                                            input: String::new(),
+                                            error: Some(error),
+                                            request_focus: true,
+                                        };
+                                    }
+                                }
+                            } else {
+                                dialog.pin_editor = RemotePinEditorState::Editing {
+                                    input: pin,
+                                    error: Some("PIN の設定を開始できませんでした".to_owned()),
+                                    request_focus: true,
+                                };
+                            }
+                        }
+                    }
+                }
+                ui.small("PIN の設定・変更後、有効なリモート接続は自動的に再起動します。");
+                ui.small("署名鍵も更新されるため、接続中の端末では PIN の再入力が必要になります。");
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_enabled(
+                        pin_configured,
+                        egui::Checkbox::new(&mut enabled, "この端末からリモート接続を利用する"),
+                    );
+                    if !pin_configured {
+                        ui.small("PIN が未設定のため有効にできません。");
+                    }
+                });
                 if remote_enable_warning_visible(was_enabled, enabled) {
                     ui.add_space(6.0);
                     let error_color = ui.visuals().error_fg_color;
@@ -2370,14 +2549,6 @@ impl crate::app::App {
                         "tailscale serve: {}",
                         remote_feature_status_label(info.tailscale_serve)
                     ));
-                    ui.label(format!(
-                        "PIN: {}",
-                        if info.pin_configured {
-                            "設定済み"
-                        } else {
-                            "未設定"
-                        }
-                    ));
                     ui.add_space(6.0);
                     paint_qr(ui, &info.public_url);
                     ui.add_space(6.0);
@@ -2392,7 +2563,12 @@ impl crate::app::App {
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("  OK  ").clicked() {
+                    let pin_saving =
+                        matches!(&dialog.pin_editor, RemotePinEditorState::Saving { .. });
+                    if ui
+                        .add_enabled(!pin_saving, egui::Button::new("  OK  "))
+                        .clicked()
+                    {
                         apply = true;
                     }
                     if ui.button("キャンセル").clicked() {
@@ -2402,6 +2578,7 @@ impl crate::app::App {
             });
         match remote_connection_dialog_outcome(enabled, apply, cancel || escape_pressed, open) {
             RemoteConnectionDialogOutcome::Apply(enabled) => {
+                let enabled = remote_enabled_choice(enabled, pin_configured);
                 self.settings.remote_service_enabled = enabled;
                 self.settings.save();
                 if let Some(control) = self.remote_session_ui.remote_service_control.as_ref() {
@@ -2418,9 +2595,14 @@ impl crate::app::App {
                 self.remote_session_ui.connection_dialog = None;
             }
             RemoteConnectionDialogOutcome::Keep(enabled) => {
-                self.remote_session_ui.connection_dialog =
-                    Some(RemoteConnectionDialogState { enabled });
-                ctx.request_repaint_after(std::time::Duration::from_secs(1));
+                dialog.enabled = remote_enabled_choice(enabled, pin_configured);
+                let pin_saving = matches!(&dialog.pin_editor, RemotePinEditorState::Saving { .. });
+                self.remote_session_ui.connection_dialog = Some(dialog);
+                ctx.request_repaint_after(if pin_saving {
+                    std::time::Duration::from_millis(50)
+                } else {
+                    std::time::Duration::from_secs(1)
+                });
             }
         }
     }
@@ -3023,6 +3205,25 @@ mod tests {
             remote_connection_dialog_outcome(true, false, false, false),
             RemoteConnectionDialogOutcome::Discard
         );
+    }
+
+    #[test]
+    fn remote_connection_requires_a_core_owned_pin_before_enable() {
+        let unconfigured = RemoteConnectionDialogState::new(true, false);
+        assert!(!unconfigured.enabled);
+        assert!(matches!(
+            unconfigured.pin_editor,
+            RemotePinEditorState::Editing { .. }
+        ));
+        assert!(!remote_enabled_choice(true, false));
+
+        let configured = RemoteConnectionDialogState::new(true, true);
+        assert!(configured.enabled);
+        assert!(matches!(
+            configured.pin_editor,
+            RemotePinEditorState::Hidden
+        ));
+        assert!(remote_enabled_choice(true, true));
     }
 
     #[test]

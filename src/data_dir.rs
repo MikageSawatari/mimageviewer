@@ -183,6 +183,32 @@ pub(crate) fn flavor_default() -> PathBuf {
     }
 }
 
+/// Managed remote diagnostics use a sibling of the resolved core data directory.
+///
+/// Appending -remote to the data directory's final component preserves data-dir isolation while
+/// keeping server-owned writes outside the core-owned data root. A filesystem root has no sibling
+/// name to derive; fail explicitly instead of escaping to LOCALAPPDATA or another namespace.
+pub(crate) fn remote_service_log_dir(data_dir: &Path) -> Result<PathBuf, String> {
+    let directory_name = data_dir
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "リモート接続の診断ログ保存先をデータディレクトリから作成できません: {}",
+                data_dir.display()
+            )
+        })?;
+    let parent = data_dir.parent().ok_or_else(|| {
+        format!(
+            "リモート接続の診断ログ保存先をデータディレクトリから作成できません: {}",
+            data_dir.display()
+        )
+    })?;
+    let mut sibling_name = directory_name.to_os_string();
+    sibling_name.push("-remote");
+    Ok(parent.join(sibling_name))
+}
+
 /// portable: data_dir が実際に書き込み可能かを確認する。ACL を推測せず、ディレクトリ作成 +
 /// プローブファイルの write/remove を実際に試す (Windows の ACL は事前予測が不確実なため)。
 #[cfg(all(feature = "portable", not(test)))]
@@ -352,4 +378,38 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_remote_log_sibling(data_dir: &str, expected: &str) {
+        let data_dir = PathBuf::from(data_dir);
+        let log_dir = remote_service_log_dir(&data_dir).unwrap();
+        assert_eq!(log_dir, PathBuf::from(expected));
+        assert!(!log_dir.starts_with(&data_dir));
+    }
+
+    #[test]
+    fn remote_log_dir_is_a_sibling_for_normal_portable_and_isolated_data_dirs() {
+        assert_remote_log_sibling(
+            "C:/Users/Alice/AppData/Roaming/mimageviewer",
+            "C:/Users/Alice/AppData/Roaming/mimageviewer-remote",
+        );
+        assert_remote_log_sibling(
+            "D:/Apps/mimageviewer/data",
+            "D:/Apps/mimageviewer/data-remote",
+        );
+        assert_remote_log_sibling(
+            "C:/home/mimageviewer-web/target/dev-runtime/data",
+            "C:/home/mimageviewer-web/target/dev-runtime/data-remote",
+        );
+    }
+
+    #[test]
+    fn remote_log_dir_rejects_a_root_instead_of_escaping_the_data_namespace() {
+        let error = remote_service_log_dir(Path::new("/")).unwrap_err();
+        assert!(error.contains("診断ログ保存先をデータディレクトリから作成できません"));
+    }
 }

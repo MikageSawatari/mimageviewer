@@ -3999,8 +3999,11 @@ dependencies = [
 name = "mimageviewer-ipc"
 version = "2.13.0"
 dependencies = [
+ "argon2",
+ "getrandom 0.3.4",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

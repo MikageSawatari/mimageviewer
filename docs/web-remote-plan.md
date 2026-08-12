@@ -121,10 +121,14 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 ### 3.2 認証
 
 - ブラウザ認証にはユーザー設定の **6 文字以上の PIN / パスフレーズ**を使う。
-  `--set-pin <PIN>` で設定・更新し、Argon2id の salt 付き hash とランダムなセッション署名鍵だけを
-  認証ファイルへ永続化する。平文 PIN は保持しない
-- 認証ファイルの既定はカレントディレクトリの `remote-web-auth.json`。`--auth-file` で変更できるが、
-  `%APPDATA%\mimageviewer` および `--data-dir` 配下は拒否する。PIN 未設定時は fail-closed で起動を拒否する
+  本体の「リモート接続」ダイアログで設定・更新し、Argon2id の salt 付き hash とランダムな
+  セッション署名鍵だけを認証ファイルへ永続化する。平文 PIN は保持しない。
+  `mimageviewer-remote` の `--set-pin` は撤去し、書き手を本体 1 つに限定する
+- 認証ファイルは本体のデータディレクトリ直下の `remote-web-auth.json`
+  (portable は `<exe_dir>/data/remote-web-auth.json`)。本体が temp file + rename で書き、
+  remote-web は `--auth-file` で渡されたファイルを起動時に読むだけとする。
+  PIN 未設定または認証ファイル破損時は本体 UI で未設定として扱い、有効化できない。
+  remote-web も PIN 未設定時は従来どおり fail-closed で起動を拒否する
 - PIN 検証は Argon2id の定数時間検証を使う。失敗回数はプロキシ経由で送信元を識別できない場合も
   効くようサーバ全体で数え、5 回失敗で 30 秒、以後の失敗は解除後に 60 秒、120 秒……と
   指数バックオフする。失敗時刻・接続元・累積失敗回数を診断ログへ記録する
@@ -134,8 +138,8 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 - curl 等の診断用には起動時生成の 256bit `Authorization: Bearer <token>` も残す。Bearer は
   定数時間比較し、PIN・hash・セッション署名値・Bearer をログへ出さない。認証失敗本文に内部情報を出さない
 - 接続用 QR コードには URL だけを含め、PIN や Bearer は含めない。URL は `--url`、Tailscale の
-  `--json` 状態、bind 先の順で決める。remote-web は確定 URL、`tailscale serve` 状態、PIN 設定済み
-  bool だけを protocol v8 の接続情報として本体へ通知する。本体は独自検出せず、
+  `--json` 状態、bind 先の順で決める。remote-web は確定 URL と `tailscale serve` 状態だけを
+  protocol v44 の接続情報として本体へ通知する。PIN 設定状態は認証ファイルの所有者である本体が判定し、
   設定メニューの「リモート接続…」に QR、URL、即時反映する opt-in、受付状態、active session の
   有無に基づく二値の利用状況を表示する。排他的 owner なので端末台数は表示しない。
   remote-web はブラウザ要求と独立した常駐 worker で IPC を維持し、250 ms から 5 秒上限の指数
@@ -149,6 +153,15 @@ opt-in を確定し、専用 owner worker へ希望状態を送る。worker は�
 `mimageviewer-remote.exe` を起動し、初期化済みの `data_dir` を `--data-dir` で渡す。無効化時の
 kill / wait も worker 側で行い、UI thread を止めない。core が spawn した `Child` だけを終了対象とし、
 プロセス名や port から外部起動分の所有を推定しない。
+core は認証ファイルを `<data_dir>/remote-web-auth.json` に固定する。診断ログディレクトリは
+解決済み `<data_dir>` の末尾名へ `-remote` を足した兄弟とする
+(例: `%APPDATA%\mimageviewer-remote`、`<exe_dir>\data-remote`、
+隔離実行の `...\dev-runtime\data-remote`)。これにより remote-web の書き込みを data directory
+の外に保ちながら、`--data-dir` ごとの隔離と同時起動時のログ名前空間を維持する。
+兄弟名を導出できない filesystem root は別の既定領域へ逃がさず、明示エラーで service を開始しない。
+子プロセスには解決済みの認証ファイルとログファイルを `--auth-file` / `--log` で渡し、
+remote-web 側で保存場所を推測しない。PIN の hash 化とファイル書き込みも owner worker 上で行い、
+有効中の変更では所有 child を再起動する。新しい session 署名鍵になるため既存端末は再認証する。
 stdout は起動時 Bearer token を含むため収集せず、stderr の安全な診断だけを本体 UI へ渡す。
 管理用 marker を受けた remote は IPC を累積 15 秒復旧できなければ自ら終了し、core の強制終了でも
 画像を配信する孤児を残さない。手動起動には marker が無く、従来どおり無期限に再接続を待つ。
@@ -166,9 +179,9 @@ stdout は起動時 Bearer token を含むため収集せず、stderr の安全�
   バンドラ / TypeScript の採用可否は PoC 完了後に判断する
 - 新規コードは新規ファイルに置く。既存ファイルへの変更は最小のフック点に留める
   (master が 1 日 5,000 行ペースで動くため、衝突面積を構造的に減らす)
-- read-only 不変条件は remote-web が mIV の settings / catalog 等を変更しないことを指す。PoC の
-  診断ログと認証ファイルだけは `--log` / `--auth-file` で指定した
-  `%APPDATA%\mimageviewer` および `--data-dir` 配下ではない別パスへ出力する
+- read-only 不変条件は **remote-web が本体データディレクトリへ書き込まない**ことを指す。
+  本体が所有する認証ファイルの読み取りは許可する。remote-web が書く診断ログは `--log` で指定された
+  本体データディレクトリ外のパスだけを許可し、settings / catalog 等も従来どおり変更しない
 
 ## 4. PoC のスコープ (現在のフェーズ)
 
@@ -1799,8 +1812,9 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-混在フォルダ parity を配線した 2026-08-11 時点の現行版は **v43**。
-v43 は `ContainerPayload` に本体 seek overlay と同じ画像・動画・その他の件数内訳を追加する。
+PIN 設定状態の所有を本体へ移した 2026-08-12 時点の現行版は **v44**。
+v44 は `RemoteWebConnectionInfo.pin_configured` を削除する。v43 で `ContainerPayload` に追加した
+本体 seek overlay と同じ画像・動画・その他の件数内訳は引き続き保持する。
 v42 の `PageRequest` job / optional display request ID、batched `PageDemand` の promote / release、
 typed な `Cancelled`、v37 以降の絶対 path + subresource、表示前照合、検索契約、長時間ジョブ契約も
 引き続き両側が同じ版であることを前提とする。
@@ -2394,3 +2408,21 @@ depth を減らさない。このため rewind 後の back が 1 回同じペー
 **残るテストの負債**: 巻き戻し時に state / seek / title / URL が揃うことは `pwa.test.mjs` の
 構造 assertion 止まりである。`app.js` の `state` がテストから触れないため、実挙動テストには
 テスト用 seam が要る。純粋状態機械側の判定は総当たりで固定済み。
+
+### 14.14 リモート接続 PIN と保存先の所有権 (2026-08-12)
+
+PIN の永続化は本体だけが所有し、remote-web の `--set-pin` は撤去した。認証ファイルの形式、
+PIN 長検証、Argon2id パラメータ、salt / session 署名鍵生成、読み書きと record 検証は
+`mimageviewer-ipc` を正本とし、同じ hash 形式を両 executable へ重複実装しない。
+本体の service owner worker が `<data_dir>/remote-web-auth.json` を temp file + rename で更新し、
+有効中なら managed child を再起動する。UI は本体が検証した設定状態を表示し、未設定時の有効化を拒否する。
+
+保存場所は書き手で分ける。認証ファイルは本体が書くため data directory 内に置き、remote-web からの
+読み取りだけを許す。診断ログは remote-web が書くため、解決済み `<data_dir>` の末尾名へ
+`-remote` を足した兄弟に置き、本体が directory を作成して解決済み path を渡す。
+data directory の外にする理由は「remote-web は本体 data directory へ書き込まない」不変条件であり、
+同時に data directory から導出する理由は `--data-dir` の隔離と同時起動する名前空間を保つためである。
+兄弟を作れない filesystem root は別領域へ黙って fallback せず、service 起動を明示的に失敗させる。
+
+この機能は未リリースで旧 cwd 相対の `remote-web-auth.json` は利用者環境に存在しないため、
+移行コードは追加しない。開発機に残る旧ファイルは参照されなくなるだけとする。

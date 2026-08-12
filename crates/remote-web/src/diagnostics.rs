@@ -32,7 +32,7 @@ impl DiagnosticsLogger {
         permanent_secrets: &[String],
     ) -> Result<Self, String> {
         let resolved_path =
-            resolve_external_file_path(requested_path, protected_roots, "診断ログ")?;
+            resolve_external_write_file_path(requested_path, protected_roots, "診断ログ")?;
 
         let file = OpenOptions::new()
             .create(true)
@@ -122,11 +122,17 @@ fn request_path(raw_url: &str) -> &str {
     raw_url.split_once('?').map_or(raw_url, |(path, _)| path)
 }
 
-pub fn resolve_external_file_path(
+pub fn resolve_external_write_file_path(
     requested_path: &Path,
     protected_roots: &[PathBuf],
     purpose: &str,
 ) -> Result<PathBuf, String> {
+    let resolved = resolve_file_path(requested_path, purpose)?;
+    reject_protected_write_path(&resolved, protected_roots, purpose)?;
+    Ok(resolved)
+}
+
+pub fn resolve_file_path(requested_path: &Path, purpose: &str) -> Result<PathBuf, String> {
     let absolute = if requested_path.is_absolute() {
         requested_path.to_owned()
     } else {
@@ -146,7 +152,6 @@ pub fn resolve_external_file_path(
                 absolute.display()
             )
         })?;
-        reject_protected_path(&resolved, protected_roots, purpose)?;
         return Ok(resolved);
     }
 
@@ -162,12 +167,14 @@ pub fn resolve_external_file_path(
             parent.display()
         )
     })?;
-    let resolved = canonical_parent.join(filename);
-    reject_protected_path(&resolved, protected_roots, purpose)?;
-    Ok(resolved)
+    Ok(canonical_parent.join(filename))
 }
 
-fn reject_protected_path(
+/// Enforce the managed server's read-only boundary for files it opens for writing.
+///
+/// Reading the core-owned authentication file below the data directory is allowed; diagnostic
+/// logs and any other server-owned output must remain outside that directory.
+fn reject_protected_write_path(
     resolved_path: &Path,
     protected_roots: &[PathBuf],
     purpose: &str,
@@ -176,7 +183,7 @@ fn reject_protected_path(
         let protected = resolve_for_comparison(root)?;
         if path_starts_with(resolved_path, &protected) {
             return Err(format!(
-                "{purpose}は mIV データディレクトリ配下へ配置できません: {}",
+                "{purpose}の書き込み先は mIV データディレクトリ配下へ配置できません: {}",
                 resolved_path.display()
             ));
         }
@@ -319,13 +326,15 @@ mod tests {
     }
 
     #[test]
-    fn auth_file_path_beneath_miv_data_is_rejected() {
+    fn auth_file_beneath_miv_data_is_allowed_for_reading() {
         let temp = tempfile::tempdir().unwrap();
         let protected = temp.path().join("mimageviewer");
         std::fs::create_dir_all(&protected).unwrap();
-        assert!(
-            resolve_external_file_path(&protected.join("auth.json"), &[protected], "認証ファイル")
-                .is_err()
-        );
+        let auth_path = protected.join("auth.json");
+        mimageviewer_ipc::set_pin_file(&auth_path, "123456").unwrap();
+
+        let resolved = resolve_file_path(&auth_path, "認証ファイル").unwrap();
+        mimageviewer_ipc::load_pin_file(&resolved).unwrap();
+        assert!(resolve_external_write_file_path(&auth_path, &[protected], "診断ログ").is_err());
     }
 }

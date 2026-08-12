@@ -2374,8 +2374,8 @@ fn handle_connection(
             ClientMessage::RemoteWebConnectionInfo { id, info } => {
                 let accepted = session.announce_remote_web(connection_id, info.clone());
                 crate::logger::log(format!(
-                    "remote_ipc: connection_info connection_id={connection_id} accepted={accepted} tailscale_serve={:?} pin_configured={}",
-                    info.tailscale_serve, info.pin_configured
+                    "remote_ipc: connection_info connection_id={connection_id} accepted={accepted} tailscale_serve={:?}",
+                    info.tailscale_serve
                 ));
                 let message = if accepted {
                     "remote-web connection information accepted"

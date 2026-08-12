@@ -2,6 +2,13 @@
 //!
 //! GUI や Windows API には依存せず、型・版数・長さ付きフレームだけを共有する。
 
+mod auth;
+
+pub use auth::{
+    AUTH_FILE_VERSION, AuthRecord, MAX_PIN_CHARS, MIN_PIN_CHARS, load_pin_file, production_argon2,
+    set_pin_file, validate_pin, validate_record,
+};
+
 use std::fmt;
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -14,7 +21,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 43;
+pub const PROTOCOL_VERSION: u32 = 44;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -1277,7 +1284,6 @@ pub struct SessionPeerInfo {
 pub struct RemoteWebConnectionInfo {
     pub public_url: String,
     pub tailscale_serve: RemoteWebFeatureStatus,
-    pub pin_configured: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -2591,13 +2597,13 @@ mod tests {
     }
 
     #[test]
-    fn remote_web_connection_info_round_trips_without_credentials() {
+    fn protocol_v44_connection_info_round_trips_without_pin_state_or_credentials() {
+        assert_eq!(PROTOCOL_VERSION, 44);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
                 public_url: "https://viewer.example.ts.net/".to_owned(),
                 tailscale_serve: RemoteWebFeatureStatus::Configured,
-                pin_configured: true,
             },
         };
         let mut bytes = Vec::new();
@@ -2606,6 +2612,7 @@ mod tests {
             read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
         assert_eq!(actual, expected);
         let encoded = String::from_utf8(bytes[4..].to_vec()).unwrap();
+        assert!(!encoded.contains("pin_configured"));
         assert!(!encoded.contains("pin="));
         assert!(!encoded.contains("bearer"));
     }
@@ -2761,8 +2768,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v43_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 43);
+    fn protocol_v44_remote_video_thumbnail_shape_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 44);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,

@@ -4293,7 +4293,7 @@ fn query_value<'a>(query: &'a [(String, String)], key: &str) -> Result<Option<&'
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{AuthService, AuthToken, COOKIE_NAME, load_pin_file, set_pin_file};
+    use crate::auth::{AuthService, AuthToken, COOKIE_NAME};
     use tiny_http::TestRequest;
 
     const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -4302,13 +4302,10 @@ mod tests {
         let protected = temp.path().join("data");
         std::fs::create_dir_all(&protected).unwrap();
         let auth_path = temp.path().join("auth.json");
-        set_pin_file(&auth_path, &[protected.clone()], "123456").unwrap();
-        let loaded = load_pin_file(&auth_path, &[protected.clone()]).unwrap();
-        let auth = AuthService::new(
-            loaded.record,
-            AuthToken::from_printable_for_test(TEST_TOKEN),
-        )
-        .unwrap();
+        mimageviewer_ipc::set_pin_file(&auth_path, "123456").unwrap();
+        let record = mimageviewer_ipc::load_pin_file(&auth_path).unwrap();
+        let auth =
+            AuthService::new(record, AuthToken::from_printable_for_test(TEST_TOKEN)).unwrap();
         let log_secrets = auth.permanent_log_secrets();
         let thumbnail_client = Arc::new(ThumbnailClient::new());
         let session_activity =
