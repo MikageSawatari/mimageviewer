@@ -2120,8 +2120,6 @@ fn command_editor_source_chord_section(
     });
 
     ui.add_space(8.0);
-    let filter = state.command_filter.trim().to_string();
-    let key_filter = state.command_key_filter.trim().to_string();
     egui::Frame::group(ui.style()).show(ui, |ui| {
         let heading = match state.operation_assignment_keyboard_context {
             Some(context) => format!(
@@ -2132,6 +2130,10 @@ fn command_editor_source_chord_section(
         };
         ui.label(egui::RichText::new(heading).strong());
         ui.add_space(4.0);
+        command_filter_controls(ui, state);
+        ui.add_space(4.0);
+        let filter = state.command_filter.trim().to_string();
+        let key_filter = state.command_key_filter.trim().to_string();
         let candidate_height = ui.available_height().max(180.0);
         egui::ScrollArea::vertical()
             .id_salt(("command_editor_chord_assign_list", chord_label))
@@ -7782,9 +7784,10 @@ fn open_in_explorer(path: &std::path::Path) {
 mod tests {
     use super::{
         AI_SIZE_LIMIT_OPTIONS, OperationAssignmentTab, OperationAssignmentTarget, PreferencesState,
-        apply_command_editor, close_assignment_editors, compact_key_action_label,
-        compact_operation_label, modifier_hold_editor_choice, natural_operation_label_cmp,
-        open_operation_assignment_editor, ring_bindings_for_key_action,
+        apply_command_editor, close_assignment_editors, command_action_matches_filter,
+        command_key_labels_match_filter, compact_key_action_label, compact_operation_label,
+        modifier_hold_editor_choice, natural_operation_label_cmp, open_operation_assignment_editor,
+        ring_bindings_for_key_action,
     };
     use crate::app::MAX_TEXTURE_DIM;
     use crate::keymap::{KeyAction, ModKind};
@@ -7829,6 +7832,18 @@ mod tests {
                 "サムネイル列数を10列に",
             ]
         );
+    }
+
+    #[test]
+    fn source_chord_candidates_match_shared_operation_and_key_filters() {
+        let action = KeyAction::GridToggleStackMode;
+        let key_labels = vec!["F11".to_string(), "Ctrl+Alt+Numpad9".to_string()];
+
+        assert!(command_action_matches_filter(action, "スタック"));
+        assert!(!command_action_matches_filter(action, "動画のミュート"));
+        assert!(command_key_labels_match_filter(&key_labels, "f11"));
+        assert!(command_key_labels_match_filter(&key_labels, "numpad9"));
+        assert!(!command_key_labels_match_filter(&key_labels, "F12"));
     }
 
     #[test]
