@@ -2453,6 +2453,24 @@ export function pagePrefetchPlan({
   return result;
 }
 
+export const PAGE_DECODE_AHEAD_UNIT_RADIUS = 2;
+
+/// Decoded images are retained by display unit rather than page. A spread is
+/// therefore one slot in this fixed window even though it contains two images.
+export function pageDecodeAheadUnitIndexes({
+  currentIndex,
+  unitCount,
+  radius = PAGE_DECODE_AHEAD_UNIT_RADIUS,
+} = {}) {
+  const count = Math.max(0, Math.floor(Number(unitCount) || 0));
+  const current = Math.floor(Number(currentIndex));
+  if (!Number.isInteger(current) || current < 0 || current >= count) return [];
+  const distance = Math.max(0, Math.floor(Number(radius) || 0));
+  const first = Math.max(0, current - distance);
+  const last = Math.min(count - 1, current + distance);
+  return Array.from({ length: last - first + 1 }, (_, offset) => first + offset);
+}
+
 /// HUD の左右は最後に動いた方向ではなく、現在ページとの位置関係で固定する。
 /// 左側は現在より前の index を遠い順、右側は後の index を近い順に並べる。
 /// page group の index 自体が読書順なので、RTL でもこれから読む側は右に残る。

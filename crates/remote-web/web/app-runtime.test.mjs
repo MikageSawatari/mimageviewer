@@ -115,6 +115,7 @@ const {
   ADJUSTMENT_PANEL_TABS,
   ContainerSpreadRefreshExitReason,
   ImageViewer,
+  DecodedPageUnitCache,
   LatestOnlyTaskQueue,
   LatestPageLoadQueue,
   PageDemandAdapter,
@@ -2252,6 +2253,158 @@ test("viewer generation invalidation cancels fetch and rejects a late decode rep
   assert.equal(viewer.legacyFetchController, null);
   assert.equal(viewer.loadingTimer, 0);
   assert.equal(loadingIndicator.hidden, true);
+});
+
+test("decoded unit cancellation releases an out-of-window decode and never starts without bytes", async () => {
+  const releaseDecodes = [];
+  let createCalls = 0;
+  const revoked = [];
+  const cache = new DecodedPageUnitCache({
+    createImage: () => {
+      createCalls += 1;
+      const image = new FakeElement("img");
+      image.decode = () => new Promise((resolve) => { releaseDecodes.push(resolve); });
+      return image;
+    },
+    createObjectUrl: (_blob) => `blob:test-${createCalls}`,
+    revokeObjectUrl: (url) => revoked.push(url),
+  });
+  cache.setWindow(["pending"]);
+  const pending = cache.prepare({
+    unitKey: "pending",
+    pages: [
+      {
+        requestKey: "pending-left",
+        resource: { blob: new Blob(["left"]) },
+        alt: "left",
+      },
+      {
+        requestKey: "pending-right",
+        resource: { blob: new Blob(["right"]) },
+        alt: "right",
+      },
+    ],
+  });
+  await Promise.resolve();
+  assert.equal(createCalls, 2);
+
+  cache.setWindow(["other"]);
+  assert.deepEqual(revoked, ["blob:test-0", "blob:test-1"]);
+  releaseDecodes.forEach((release) => release());
+  assert.deepEqual(await pending, { started: true, reason: "window_out" });
+  assert.equal(cache.retainedUnitCount(), 0);
+
+  const skipped = await cache.prepare({
+    unitKey: "other",
+    pages: [{ requestKey: "missing-page", resource: null }],
+  });
+  assert.deepEqual(skipped, { started: false, reason: "bytes_missing" });
+  assert.equal(createCalls, 2, "missing bytes must not create or decode an image");
+  assert.equal(cache.tryAcquire("other", ["missing-page"]).reason, "bytes_missing");
+  cache.clear();
+});
+
+test("viewer reuses retained image elements and reports reuse and miss timings", async () => {
+  let predecodeCalls = 0;
+  let displayDecodeCalls = 0;
+  const reports = [];
+  const cache = new DecodedPageUnitCache({
+    createImage: () => {
+      const image = new FakeElement("img");
+      image.decode = async () => { predecodeCalls += 1; };
+      return image;
+    },
+    createObjectUrl: (blob) => URL.createObjectURL(blob),
+    revokeObjectUrl: (url) => URL.revokeObjectURL(url),
+  });
+  const retainedResource = {
+    blob: new Blob([new Uint8Array([1, 2, 3])]),
+    requestId: "decode-ahead-ready",
+    fetchMs: 5,
+    pageRenderMs: 3,
+    prefetchStatus: "prefetched",
+  };
+  cache.setWindow(["ready-unit"]);
+  await cache.prepare({
+    unitKey: "ready-unit",
+    pages: [{
+      requestKey: "ready-page",
+      resource: retainedResource,
+      alt: "ready",
+      info: { width: 1200, height: 1800 },
+    }],
+  });
+  const retainedImage = cache.units.get("ready-unit").pages[0].image;
+  const stage = new FakeElement("div");
+  const viewer = new ImageViewer({
+    root: new FakeElement("section"),
+    stage,
+    image: new FakeElement("img"),
+    title: new FakeElement("div"),
+    counter: new FakeElement("span"),
+    loadingIndicator: new FakeElement("div"),
+    decodedUnitCache: cache,
+    onDecodeAheadDisplay: (event) => reports.push(event),
+  });
+  const request = (cacheKey, url) => ({
+    url,
+    cacheKey,
+    remoteStateGeneration: "test-1",
+    remoteSessionId: TEST_SESSION_ID,
+    address: TEST_PAGE_ADDRESS,
+    width: 1800,
+    cssWidth: 430,
+    dpr: 2,
+    layout: { cssWidth: 430, cssHeight: 645 },
+    fitMode: "page",
+  });
+  FakeElement.decodeHook = () => { displayDecodeCalls += 1; };
+  try {
+    const reused = await viewer.load({
+      name: "Ready page",
+      request: request("ready-page", "/api/page?decode-ahead=ready"),
+      info: { width: 1200, height: 1800 },
+      fitMode: "page",
+      index: 0,
+      count: 2,
+      interactionStartedAt: performance.now(),
+      decodedUnitKey: "ready-unit",
+    });
+    assert.deepEqual(reused, { outcome: ViewerGroupLoadOutcome.APPLIED });
+    assert.equal(viewer.image, retainedImage);
+    assert.equal(predecodeCalls, 1);
+    assert.equal(displayDecodeCalls, 0, "a retained image must not be decoded again");
+    assert.equal(reports[0].reused, true);
+    assert.equal(reports[0].reason, "retained");
+    assert.equal(reports[0].retained_unit_count, 1);
+    assert.equal(typeof reports[0].tap_to_display_ms, "number");
+
+    cache.setWindow(["missing-unit"]);
+    await cache.prepare({
+      unitKey: "missing-unit",
+      pages: [{ requestKey: "missing-page", resource: null }],
+    });
+    const missed = await viewer.load({
+      name: "Missing page",
+      request: request("missing-page", "/api/page?decode-ahead=missing"),
+      info: { width: 1200, height: 1800 },
+      fitMode: "page",
+      index: 1,
+      count: 2,
+      interactionStartedAt: performance.now(),
+      decodedUnitKey: "missing-unit",
+    });
+    assert.deepEqual(missed, { outcome: ViewerGroupLoadOutcome.APPLIED });
+    assert.equal(displayDecodeCalls, 1);
+    assert.equal(reports[1].reused, false);
+    assert.equal(reports[1].reason, "bytes_missing");
+    assert.equal(typeof reports[1].tap_to_display_ms, "number");
+    assert.equal(reports[1].retained_unit_count, 1);
+  } finally {
+    FakeElement.decodeHook = null;
+    viewer.destroy();
+    cache.clear();
+  }
 });
 
 test("viewer load executes fetch, decode, layout and atomic replacement", async () => {

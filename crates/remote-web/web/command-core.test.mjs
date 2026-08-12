@@ -56,6 +56,7 @@ import {
   nextFitMode,
   pagePrefetchFailurePlan,
   pageAdmissionRetryDelayMs,
+  pageDecodeAheadUnitIndexes,
   pagePrefetchHudPlan,
   pagePrefetchIndicatorSummary,
   pagePrefetchPlan,
@@ -2568,6 +2569,25 @@ test("page prefetch follows reading direction and accepts a future spread", () =
     }),
     [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 9, 8, 7, 6]
   );
+});
+
+test("decode-ahead retains the current display unit and two units on each side", () => {
+  assert.deepEqual(pageDecodeAheadUnitIndexes({
+    currentIndex: 5,
+    unitCount: 12,
+  }), [3, 4, 5, 6, 7]);
+  assert.deepEqual(pageDecodeAheadUnitIndexes({
+    currentIndex: 0,
+    unitCount: 12,
+  }), [0, 1, 2]);
+  assert.deepEqual(pageDecodeAheadUnitIndexes({
+    currentIndex: 11,
+    unitCount: 12,
+  }), [9, 10, 11]);
+  assert.deepEqual(pageDecodeAheadUnitIndexes({
+    currentIndex: -1,
+    unitCount: 12,
+  }), []);
 });
 
 test("prefetch HUD splits around the current page regardless of last movement", () => {

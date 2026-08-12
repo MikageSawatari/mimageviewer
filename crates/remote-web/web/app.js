@@ -35,6 +35,7 @@ import {
   pageResponseIdentityAttestation,
   FOREGROUND_ADMISSION_RETRY_LIMIT,
   pageAdmissionRetryDelayMs,
+  pageDecodeAheadUnitIndexes,
   pageRequestIsTransientlyBusy,
   pagePrefetchHudPlan,
   pagePrefetchIndicatorSummary,
@@ -491,6 +492,10 @@ export class PageResourceCache {
     return this.ready.has(key);
   }
 
+  peek(key) {
+    return this.ready.get(key) ?? null;
+  }
+
   get(key) {
     const resource = this.ready.get(key);
     if (!resource) return null;
@@ -576,7 +581,253 @@ export class PageResourceCache {
   }
 }
 
+export class DecodedPageUnitCache {
+  constructor({
+    createImage = (alt) => {
+      const image = element("img", "viewer-image");
+      image.alt = alt;
+      image.draggable = false;
+      image.dataset.telemetryObserved = "true";
+      return image;
+    },
+    createObjectUrl = (blob) => URL.createObjectURL(blob),
+    revokeObjectUrl = (url) => URL.revokeObjectURL(url),
+    onStatusChange = () => {},
+  } = {}) {
+    this.createImage = createImage;
+    this.createObjectUrl = createObjectUrl;
+    this.revokeObjectUrl = revokeObjectUrl;
+    this.onStatusChange = onStatusChange;
+    this.desiredKeys = new Set();
+    this.units = new Map();
+    this.missReasons = new Map();
+  }
+
+  setWindow(unitKeys, reason = "window_out") {
+    const desired = new Set((unitKeys ?? []).map(String).filter(Boolean));
+    this.desiredKeys = desired;
+    for (const key of [...this.missReasons.keys()]) {
+      if (!desired.has(key)) this.missReasons.delete(key);
+    }
+    for (const [key, entry] of [...this.units]) {
+      if (!desired.has(key)) this.detachEntry(entry, reason);
+    }
+    for (const key of desired) {
+      if (!this.units.has(key) && !this.missReasons.has(key)) {
+        this.missReasons.set(key, "not_scheduled");
+      }
+    }
+    this.notify({ type: "window", retainedCount: this.retainedUnitCount() });
+  }
+
+  isDesired(unitKey) {
+    return this.desiredKeys.has(String(unitKey ?? ""));
+  }
+
+  retainedUnitCount() {
+    let count = 0;
+    for (const entry of this.units.values()) {
+      if (entry.state === "ready") count += 1;
+    }
+    return count;
+  }
+
+  requestKeysMatch(entry, requestKeys) {
+    const keys = (requestKeys ?? []).map(String);
+    return entry.requestKeys.length === keys.length &&
+      entry.requestKeys.every((key, index) => key === keys[index]);
+  }
+
+  hasReady(unitKey, requestKeys) {
+    const entry = this.units.get(String(unitKey ?? ""));
+    return Boolean(
+      entry?.state === "ready" && this.requestKeysMatch(entry, requestKeys)
+    );
+  }
+
+  markUnavailable(unitKey, reason) {
+    const key = String(unitKey ?? "");
+    if (!this.desiredKeys.has(key)) return;
+    const entry = this.units.get(key);
+    if (entry?.state === "ready") return;
+    this.missReasons.set(key, String(reason || "not_retained"));
+  }
+
+  tryAcquire(unitKey, requestKeys) {
+    const key = String(unitKey ?? "");
+    if (!key || !(requestKeys ?? []).length) {
+      return { reused: false, reason: "not_applicable", lease: null };
+    }
+    const entry = this.units.get(key);
+    if (!entry) {
+      return {
+        reused: false,
+        reason: this.missReasons.get(key) ?? "not_retained",
+        lease: null,
+      };
+    }
+    if (!this.requestKeysMatch(entry, requestKeys)) {
+      return { reused: false, reason: "request_mismatch", lease: null };
+    }
+    if (entry.state !== "ready") {
+      return { reused: false, reason: "decode_in_progress", lease: null };
+    }
+    entry.displayRefs += 1;
+    return {
+      reused: true,
+      reason: "retained",
+      lease: { entry, released: false, pages: entry.pages },
+    };
+  }
+
+  async prepare({ unitKey, pages = [] } = {}) {
+    const key = String(unitKey ?? "");
+    if (!this.desiredKeys.has(key)) {
+      return { started: false, reason: "window_out" };
+    }
+    if (!pages.length || pages.some((page) => !page?.resource?.blob)) {
+      this.markUnavailable(key, "bytes_missing");
+      return { started: false, reason: "bytes_missing" };
+    }
+    const requestKeys = pages.map((page) => String(page.requestKey ?? ""));
+    if (requestKeys.some((requestKey) => !requestKey)) {
+      this.markUnavailable(key, "request_key_missing");
+      return { started: false, reason: "request_key_missing" };
+    }
+    const existing = this.units.get(key);
+    if (existing && this.requestKeysMatch(existing, requestKeys)) {
+      return {
+        started: false,
+        reason: existing.state === "ready" ? "retained" : "decode_in_progress",
+      };
+    }
+    if (existing) this.detachEntry(existing, "request_mismatch");
+
+    const entry = {
+      key,
+      requestKeys,
+      pages: [],
+      state: "decoding",
+      retained: true,
+      cancelled: false,
+      disposed: false,
+      displayRefs: 0,
+    };
+    this.units.set(key, entry);
+    this.missReasons.set(key, "decode_in_progress");
+    try {
+      for (const page of pages) {
+        const objectUrl = this.createObjectUrl(page.resource.blob);
+        const image = this.createImage(page.alt ?? "");
+        image.src = objectUrl;
+        entry.pages.push({
+          image,
+          objectUrl,
+          resource: page.resource,
+          info: page.info ?? null,
+          decodeMs: 0,
+        });
+      }
+      await Promise.all(entry.pages.map(async (page) => {
+        const startedAt = performance.now();
+        await page.image.decode();
+        page.decodeMs = performance.now() - startedAt;
+        if (page.image.naturalWidth && page.image.naturalHeight) {
+          page.info = {
+            width: page.image.naturalWidth,
+            height: page.image.naturalHeight,
+          };
+        }
+      }));
+      if (
+        entry.cancelled ||
+        !this.desiredKeys.has(key) ||
+        this.units.get(key) !== entry
+      ) {
+        this.detachEntry(entry, "window_out");
+        return { started: true, reason: "window_out" };
+      }
+      entry.state = "ready";
+      this.missReasons.set(key, "retained");
+      this.notify({ type: "ready", key, retainedCount: this.retainedUnitCount() });
+      return { started: true, reason: "retained" };
+    } catch (_error) {
+      const cancelled = entry.cancelled || !this.desiredKeys.has(key);
+      this.detachEntry(entry, cancelled ? "window_out" : "decode_failed");
+      if (!cancelled && this.desiredKeys.has(key)) {
+        this.missReasons.set(key, "decode_failed");
+      }
+      return { started: true, reason: cancelled ? "window_out" : "decode_failed" };
+    }
+  }
+
+  adoptAndAcquire({ unitKey, pages = [] } = {}) {
+    const key = String(unitKey ?? "");
+    if (!this.desiredKeys.has(key) || !pages.length) return null;
+    const requestKeys = pages.map((page) => String(page.requestKey ?? ""));
+    if (requestKeys.some((requestKey) => !requestKey)) return null;
+    const existing = this.units.get(key);
+    if (existing) this.detachEntry(existing, "foreground_replaced");
+    const entry = {
+      key,
+      requestKeys,
+      pages: pages.map((page) => ({ ...page })),
+      state: "ready",
+      retained: true,
+      cancelled: false,
+      disposed: false,
+      displayRefs: 1,
+    };
+    this.units.set(key, entry);
+    this.missReasons.set(key, "retained");
+    this.notify({ type: "ready", key, retainedCount: this.retainedUnitCount() });
+    return { entry, released: false, pages: entry.pages };
+  }
+
+  release(lease) {
+    if (!lease?.entry || lease.released) return;
+    lease.released = true;
+    lease.entry.displayRefs = Math.max(0, lease.entry.displayRefs - 1);
+    this.disposeIfUnowned(lease.entry);
+  }
+
+  detachEntry(entry, reason) {
+    if (!entry) return;
+    if (this.units.get(entry.key) === entry) this.units.delete(entry.key);
+    entry.retained = false;
+    if (entry.state === "decoding") entry.cancelled = true;
+    this.disposeIfUnowned(entry);
+    this.notify({
+      type: entry.state === "decoding" ? "cancel" : "evict",
+      key: entry.key,
+      reason,
+      retainedCount: this.retainedUnitCount(),
+    });
+  }
+
+  disposeIfUnowned(entry) {
+    if (!entry || entry.disposed || entry.retained || entry.displayRefs > 0) return;
+    entry.disposed = true;
+    for (const page of entry.pages) {
+      try { page.image.src = ""; } catch {}
+      try { this.revokeObjectUrl(page.objectUrl); } catch {}
+    }
+    entry.pages = [];
+  }
+
+  clear(reason = "clear") {
+    this.desiredKeys = new Set();
+    this.missReasons.clear();
+    for (const entry of [...this.units.values()]) this.detachEntry(entry, reason);
+    this.notify({ type: "clear", retainedCount: 0 });
+  }
+
+  notify(event) {
+    try { this.onStatusChange(event); } catch {}
+  }
+}
 export class PageDemandAdapter {
+
   constructor({
     cache,
     fetchResource = fetchPageResource,
@@ -959,6 +1210,7 @@ const initialPagePrefetchWindow = pagePrefetchWindow({
   configuredBehind: LOCAL_SETTINGS_LOAD.settings.prefetchBehind,
   movedSinceOpen: false,
 });
+let pageDecodeAheadScheduleQueued = false;
 const pageResourceCache = new PageResourceCache(
   pageResourceCacheLimit({
     visiblePages: MAX_VIEWER_VISIBLE_PAGES,
@@ -977,8 +1229,12 @@ const pageResourceCache = new PageResourceCache(
     }
     if (type === "clear") hudState.pagePrefetch = null;
     updateHud();
+    if (type === "ready") queuePageDecodeAhead();
   }
 );
+const decodedPageUnitCache = new DecodedPageUnitCache({
+  onStatusChange: () => {},
+});
 const pageDemandAdapter = new PageDemandAdapter({
   cache: pageResourceCache,
   onStatusChange: () => updateHud(),
@@ -987,6 +1243,7 @@ const pageDemandAdapter = new PageDemandAdapter({
 function invalidatePageResources(cause = PageCancelCause.CONTEXT_RESET) {
   pageDemandAdapter.invalidate(cause);
   pageResourceCache.clear();
+  decodedPageUnitCache.clear(cause);
 }
 
 const countedPageTimingRequestIds = new Set();
@@ -5928,6 +6185,7 @@ async function updateViewerImage(
       "preflight"
     );
   }
+  updateDecodedPageUnitWindow(state.pageGroupIndex);
   const loadRequest = captureViewerPageGroupRequest(viewer, state.pageGroupIndex);
   const identity = group.entries.map(entryIdentity).join("\n");
   const remoteSessionIdSnapshot = state.remoteSessionId;
@@ -5979,7 +6237,8 @@ async function updateViewerImage(
         remoteSessionCacheEpoch: remoteSessionCacheEpochSnapshot,
       }),
     }));
-    if (pages.every(({ request }) => request.cacheKey)) {
+    const requestKeys = pages.map(({ request }) => request.cacheKey).filter(Boolean);
+    if (requestKeys.length === pages.length && !decodedPageUnitCache.hasReady(identity, requestKeys)) {
       displayRequestId = pageDemandAdapter.nextDisplayRequestId();
       pageDemandAdapter.openDisplay({
         requestId: displayRequestId,
@@ -6002,6 +6261,7 @@ async function updateViewerImage(
       interactionStartedAt,
       renderTrigger,
       displayRequestId,
+      decodedUnitKey: identity,
       positionSnapshot: loadRequest,
     });
     if (result?.outcome !== ViewerGroupLoadOutcome.APPLIED) {
@@ -6046,6 +6306,8 @@ async function updateViewerImage(
   }
   if (completion.action === ViewerGroupLoadCompletionAction.ROLLBACK) {
     commitViewerPositionRewind(viewer, completion);
+    updateDecodedPageUnitWindow(state.pageGroupIndex);
+    queuePageDecodeAhead();
     const displayedFailure = viewerImageFailureForDisplay(
       result,
       renderTrigger,
@@ -6090,6 +6352,7 @@ async function updateViewerImage(
   observeReadingProgress();
   if (group.entries.every((entry) => entry.address)) {
     schedulePagePrefetch(viewer).catch(() => {});
+    queuePageDecodeAhead();
     return VIEWER_GROUP_LOAD_APPLIED;
   }
   const nextEntry = state.images[state.imageIndex + 1];
@@ -6102,6 +6365,145 @@ async function updateViewerImage(
     }).catch(() => {});
   }
   return VIEWER_GROUP_LOAD_APPLIED;
+}
+
+function decodedPageUnitKey(group) {
+  return group?.entries?.map(entryIdentity).join("\n") ?? "";
+}
+function viewerHasCommittedDecodedUnit(viewer) {
+  const currentKey = decodedPageUnitKey(currentPageGroup());
+  return Boolean(currentKey && viewer?.decodedUnitLease?.entry?.key === currentKey);
+}
+
+
+function updateDecodedPageUnitWindow(currentIndex = state.pageGroupIndex) {
+  const indexes = pageDecodeAheadUnitIndexes({
+    currentIndex,
+    unitCount: state.pageGroups.length,
+  });
+  const units = indexes
+    .map((index) => ({ index, group: state.pageGroups[index] }))
+    .filter(({ group }) =>
+      group?.entries?.length && group.entries.every((entry) => entry.address)
+    )
+    .map(({ index, group }) => ({
+      index,
+      group,
+      key: decodedPageUnitKey(group),
+    }));
+  decodedPageUnitCache.setWindow(units.map(({ key }) => key));
+  return units;
+}
+
+function queuePageDecodeAhead() {
+  const viewer = state.viewer;
+  if (
+    pageDecodeAheadScheduleQueued ||
+    !viewer ||
+    viewer.isVideoStreamViewer ||
+    viewer.pageLoadBusy ||
+    !viewerHasCommittedDecodedUnit(viewer) ||
+    state.screenContext !== "viewer"
+  ) {
+    return;
+  }
+  pageDecodeAheadScheduleQueued = true;
+  queueMicrotask(() => {
+    pageDecodeAheadScheduleQueued = false;
+    const currentViewer = state.viewer;
+    if (
+      currentViewer !== viewer ||
+      currentViewer?.pageLoadBusy ||
+      !viewerHasCommittedDecodedUnit(currentViewer) ||
+      state.screenContext !== "viewer"
+    ) {
+      return;
+    }
+    schedulePageDecodeAhead(currentViewer).catch((error) => {
+      recordClientError("page_decode_ahead_error", error);
+    });
+  });
+}
+
+async function schedulePageDecodeAhead(viewer) {
+  if (
+    state.viewer !== viewer ||
+    viewer?.pageLoadBusy ||
+    !viewerHasCommittedDecodedUnit(viewer) ||
+    state.screenContext !== "viewer"
+  ) {
+    return;
+  }
+  const pageGroupsSnapshot = state.pageGroups;
+  const groupIndexSnapshot = state.pageGroupIndex;
+  const generationSnapshot = state.remoteStateGeneration;
+  const sessionSnapshot = state.remoteSessionId;
+  const cacheEpochSnapshot = state.remoteSessionCacheEpoch;
+  const fitModeSnapshot = state.fitMode;
+  const renderRevisionSnapshot = state.pageRenderRevision;
+  const units = updateDecodedPageUnitWindow(groupIndexSnapshot);
+  const plans = await Promise.all(units.map(async ({ group, key }) => {
+    const infos = await Promise.all(group.entries.map(imageInfo));
+    const layout = viewerSpreadLayout({
+      mode: fitModeSnapshot,
+      pages: infos,
+      viewportWidth: viewer.stage.clientWidth || window.innerWidth,
+      viewportHeight: viewer.stage.clientHeight || window.innerHeight,
+      devicePixelRatio: window.devicePixelRatio || 1,
+      gap: group.entries.length > 1 ? state.spreadPageGapPx : 0,
+    });
+    const pageGenerations = viewerPageGroupGenerationSnapshot(
+      generationSnapshot,
+      group.entries.length
+    );
+    return {
+      key,
+      pages: group.entries.map((entry, pageIndex) => ({
+        entry,
+        info: infos[pageIndex],
+        request: imageRequest(entry, infos[pageIndex], viewer.stage, {
+          prefetch: true,
+          layout: layout.pages[pageIndex],
+          previewRevision: renderRevisionSnapshot,
+          remoteStateGeneration: pageGenerations.pages[pageIndex],
+          remoteSessionId: sessionSnapshot,
+          remoteSessionCacheEpoch: cacheEpochSnapshot,
+        }),
+      })),
+    };
+  }));
+  if (
+    state.viewer !== viewer ||
+    viewer.pageLoadBusy ||
+    !viewerHasCommittedDecodedUnit(viewer) ||
+    state.pageGroups !== pageGroupsSnapshot ||
+    state.pageGroupIndex !== groupIndexSnapshot ||
+    state.remoteStateGeneration !== generationSnapshot ||
+    state.remoteSessionId !== sessionSnapshot ||
+    state.remoteSessionCacheEpoch !== cacheEpochSnapshot ||
+    state.fitMode !== fitModeSnapshot ||
+    state.pageRenderRevision !== renderRevisionSnapshot
+  ) {
+    return;
+  }
+  for (const plan of plans) {
+    const resources = plan.pages.map(({ request }) =>
+      pageResourceCache.peek(request.cacheKey)
+    );
+    if (resources.some((resource) => !resource)) {
+      decodedPageUnitCache.markUnavailable(plan.key, "bytes_missing");
+      continue;
+    }
+    decodedPageUnitCache.prepare({
+      unitKey: plan.key,
+      pages: plan.pages.map((page, index) => ({
+        requestKey: page.request.cacheKey,
+        resource: resources[index],
+        alt: page.entry.name,
+        info: page.info,
+      })),
+    }).catch(() => {});
+  }
 }
 
 async function schedulePagePrefetch(viewer) {
@@ -11107,6 +11509,8 @@ export class ImageViewer {
     next,
     loadingIndicator,
     boundaryMessage,
+    decodedUnitCache = decodedPageUnitCache,
+    onDecodeAheadDisplay = (event) => enqueueTelemetry(event),
   }) {
     this.root = root;
     this.stage = stage;
@@ -11143,6 +11547,9 @@ export class ImageViewer {
     this.legacyFetchController = null;
     this.objectUrl = null;
     this.objectUrls = [];
+    this.decodedUnitCache = decodedUnitCache;
+    this.onDecodeAheadDisplay = onDecodeAheadDisplay;
+    this.decodedUnitLease = null;
     this.loadingTimer = 0;
     this.boundaryMessageTimer = 0;
     this.destroyed = false;
@@ -11159,7 +11566,8 @@ export class ImageViewer {
           job.interactionStartedAt,
           job.presentation,
           job.renderTrigger,
-          job.displayRequestId
+          job.displayRequestId,
+          job.decodedUnitKey
         )
         : this.loadMeasuredImage(
           job.request,
@@ -11168,7 +11576,8 @@ export class ImageViewer {
           job.info,
           job.presentation,
           job.renderTrigger,
-          job.displayRequestId
+          job.displayRequestId,
+          job.decodedUnitKey
         ),
       (job) => {
         pageDemandAdapter.releaseDisplay(job?.displayRequestId);
@@ -11245,6 +11654,7 @@ export class ImageViewer {
     interactionStartedAt,
     renderTrigger,
     displayRequestId = null,
+    decodedUnitKey = null,
     positionSnapshot = null,
   }) {
     const resolvedSeekState = seekState ?? {
@@ -11272,6 +11682,7 @@ export class ImageViewer {
       presentation,
       renderTrigger,
       displayRequestId,
+      decodedUnitKey,
     });
   }
 
@@ -11303,6 +11714,7 @@ export class ImageViewer {
     interactionStartedAt,
     renderTrigger,
     displayRequestId = null,
+    decodedUnitKey = null,
     positionSnapshot = null,
   }) {
     if (pages.length === 1) {
@@ -11318,6 +11730,7 @@ export class ImageViewer {
         interactionStartedAt,
         renderTrigger,
         displayRequestId,
+        decodedUnitKey,
         positionSnapshot,
       });
     }
@@ -11346,6 +11759,7 @@ export class ImageViewer {
       presentation,
       renderTrigger,
       displayRequestId,
+      decodedUnitKey,
     });
   }
 
@@ -11633,10 +12047,17 @@ export class ImageViewer {
     info,
     presentation,
     renderTrigger,
-    displayRequestId
+    displayRequestId,
+    decodedUnitKey
   ) {
     const sequence = ++this.loadSequence;
-    const legacyController = displayRequestId ? null : new AbortController();
+    const requestKeys = request.cacheKey ? [request.cacheKey] : [];
+    const decodeAhead = this.decodedUnitCache.tryAcquire(
+      decodedUnitKey,
+      requestKeys
+    );
+    const legacyController = displayRequestId || decodeAhead.reused
+      ? null : new AbortController();
     if (legacyController) {
       this.legacyFetchController?.abort();
       this.legacyFetchController = legacyController;
@@ -11645,8 +12066,12 @@ export class ImageViewer {
     let pendingObjectUrl = null;
     let resource = null;
     let phase = "fetch";
+    let nextLease = decodeAhead.lease;
+    let leaseCommitted = false;
     try {
-      if (request.cacheKey && displayRequestId) {
+      if (decodeAhead.reused) {
+        resource = decodeAhead.lease.pages[0].resource;
+      } else if (request.cacheKey && displayRequestId) {
         await pageDemandAdapter.waitForDisplay(displayRequestId);
         resource = pageDemandAdapter.resourceForKey(request.cacheKey);
       } else {
@@ -11669,9 +12094,10 @@ export class ImageViewer {
         };
       }
       const blob = resource.blob;
-      const fetchMs = performance.now() - fetchStartedAt;
+      const fetchMs = decodeAhead.reused ? 0 : performance.now() - fetchStartedAt;
       const requestId = resource.requestId;
       if (sequence !== this.loadSequence) {
+        this.decodedUnitCache.release(decodeAhead.lease);
         this.recordPageDisplay(
           presentation,
           "not_applied",
@@ -11682,16 +12108,25 @@ export class ImageViewer {
       }
 
       phase = "decode";
-      pendingObjectUrl = URL.createObjectURL(blob);
-      const decodedImage = element("img", "viewer-image");
-      decodedImage.alt = name;
-      decodedImage.draggable = false;
-      decodedImage.dataset.telemetryObserved = "true";
-      decodedImage.src = pendingObjectUrl;
-      const decodeStartedAt = performance.now();
-      await decodedImage.decode();
-      const decodeMs = performance.now() - decodeStartedAt;
+      let decodedImage;
+      let decodeMs = 0;
       let resolvedInfo = info;
+      if (decodeAhead.reused) {
+        const retained = decodeAhead.lease.pages[0];
+        decodedImage = retained.image;
+        decodedImage.alt = name;
+        resolvedInfo = retained.info ?? info;
+      } else {
+        pendingObjectUrl = URL.createObjectURL(blob);
+        decodedImage = element("img", "viewer-image");
+        decodedImage.alt = name;
+        decodedImage.draggable = false;
+        decodedImage.dataset.telemetryObserved = "true";
+        decodedImage.src = pendingObjectUrl;
+        const decodeStartedAt = performance.now();
+        await decodedImage.decode();
+        decodeMs = performance.now() - decodeStartedAt;
+      }
       let resolvedLayout = request.layout;
       if (request.dynamicInfo && decodedImage.naturalWidth && decodedImage.naturalHeight) {
         const actualInfo = {
@@ -11712,8 +12147,9 @@ export class ImageViewer {
         rememberMediaImageInfo(request, actualInfo);
       }
       if (sequence !== this.loadSequence) {
-        URL.revokeObjectURL(pendingObjectUrl);
+        if (pendingObjectUrl) URL.revokeObjectURL(pendingObjectUrl);
         pendingObjectUrl = null;
+        this.decodedUnitCache.release(decodeAhead.lease);
         this.recordPageDisplay(
           presentation,
           "not_applied",
@@ -11729,7 +12165,22 @@ export class ImageViewer {
       const previousUrls = this.objectUrls.slice();
       this.pageLayer.replaceChildren(decodedImage);
       this.image = decodedImage;
+      if (!nextLease && pendingObjectUrl) {
+        nextLease = this.decodedUnitCache.adoptAndAcquire({
+          unitKey: decodedUnitKey,
+          pages: [{
+            requestKey: request.cacheKey,
+            resource,
+            image: decodedImage,
+            objectUrl: pendingObjectUrl,
+            info: resolvedInfo,
+            decodeMs,
+          }],
+        });
+        if (nextLease) pendingObjectUrl = null;
+      }
       this.images = [decodedImage];
+      const previousLease = this.decodedUnitLease;
       pageDemandAdapter.commitDisplay(displayRequestId);
       this.recordPageDisplay(
         presentation,
@@ -11739,14 +12190,18 @@ export class ImageViewer {
         [requestId]
       );
       this.commitPagePresentation(presentation);
+      this.decodedUnitLease = nextLease;
+      leaseCommitted = true;
       this.objectUrl = pendingObjectUrl;
-      this.objectUrls = [pendingObjectUrl];
+      this.objectUrls = pendingObjectUrl ? [pendingObjectUrl] : [];
       pendingObjectUrl = null;
-      previousUrls.forEach((url) => URL.revokeObjectURL(url));
+      this.decodedUnitCache.release(previousLease);
+      previousUrls.filter(Boolean).forEach((url) => URL.revokeObjectURL(url));
       await nextFrame();
       if (sequence !== this.loadSequence) return VIEWER_GROUP_LOAD_SUPERSEDED;
       recordSuccessfulPageTiming(request, resource, decodeMs);
 
+      const tapToDisplayMs = roundMs(performance.now() - interactionStartedAt);
       const event = {
         type: "image",
         request_id: requestId,
@@ -11754,7 +12209,7 @@ export class ImageViewer {
         fetch_ms: roundMs(fetchMs),
         bytes: blob.size,
         decode_ms: roundMs(decodeMs),
-        tap_to_display_ms: roundMs(performance.now() - interactionStartedAt),
+        tap_to_display_ms: tapToDisplayMs,
         requested_width: request.width,
         css_width: roundMs(request.cssWidth),
         css_height: roundMs(resolvedLayout.cssHeight),
@@ -11764,14 +12219,28 @@ export class ImageViewer {
         ...viewerTransformTelemetry(this.scale, currentVisualViewportScale()),
         ...this.layoutTelemetry(),
         prefetch_status: resource.prefetchStatus,
+        decode_ahead_reused: decodeAhead.reused,
+        decode_ahead_reason: decodeAhead.reason,
+        decoded_unit_count: this.decodedUnitCache.retainedUnitCount(),
       };
       enqueueTelemetry(event);
+      this.onDecodeAheadDisplay({
+        type: "page_decode_ahead_display",
+        reused: decodeAhead.reused,
+        reason: decodeAhead.reason,
+        tap_to_display_ms: tapToDisplayMs,
+        retained_unit_count: this.decodedUnitCache.retainedUnitCount(),
+        spread_pages: 1,
+      });
       hudState.lastImage = event;
       hudState.displayDurations.push(event.tap_to_display_ms);
       if (hudState.displayDurations.length > 20) hudState.displayDurations.shift();
       updateHud();
       return VIEWER_GROUP_LOAD_APPLIED;
     } catch (error) {
+      if (!leaseCommitted) {
+        this.decodedUnitCache.release(nextLease ?? decodeAhead.lease);
+      }
       if (pendingObjectUrl) URL.revokeObjectURL(pendingObjectUrl);
       if (sequence !== this.loadSequence) {
         this.recordPageDisplay(
@@ -11811,10 +12280,17 @@ export class ImageViewer {
     interactionStartedAt,
     presentation,
     renderTrigger,
-    displayRequestId
+    displayRequestId,
+    decodedUnitKey
   ) {
     const sequence = ++this.loadSequence;
-    const legacyController = displayRequestId ? null : new AbortController();
+    const requestKeys = pages.map(({ request }) => request.cacheKey).filter(Boolean);
+    const decodeAhead = this.decodedUnitCache.tryAcquire(
+      decodedUnitKey,
+      requestKeys
+    );
+    const legacyController = displayRequestId || decodeAhead.reused
+      ? null : new AbortController();
     if (legacyController) {
       this.legacyFetchController?.abort();
       this.legacyFetchController = legacyController;
@@ -11823,11 +12299,14 @@ export class ImageViewer {
     const pendingUrls = [];
     let resources = null;
     let phase = "fetch";
+    let nextLease = decodeAhead.lease;
+    let leaseCommitted = false;
     try {
-      if (displayRequestId) {
+      if (!decodeAhead.reused && displayRequestId) {
         await pageDemandAdapter.waitForDisplay(displayRequestId);
       }
-      resources = await Promise.all(pages.map(async ({ request }) => {
+      resources = decodeAhead.reused ? decodeAhead.lease.pages.map(({ resource }) => resource)
+        : await Promise.all(pages.map(async ({ request }) => {
         if (request.cacheKey && displayRequestId) {
           return pageDemandAdapter.resourceForKey(request.cacheKey);
         }
@@ -11852,6 +12331,7 @@ export class ImageViewer {
         };
       }));
       if (sequence !== this.loadSequence) {
+        this.decodedUnitCache.release(decodeAhead.lease);
         this.recordPageDisplay(
           presentation,
           "not_applied",
@@ -11862,7 +12342,16 @@ export class ImageViewer {
       }
 
       phase = "decode";
-      const decodedImages = await Promise.all(resources.map(async (resource, index) => {
+      const decodedImages = decodeAhead.reused
+        ? decodeAhead.lease.pages.map((retained, index) => {
+          retained.image.alt = pages[index].entry.name;
+          return {
+            image: retained.image,
+            decodeMs: 0,
+            info: retained.info ?? pages[index].info,
+          };
+        })
+        : await Promise.all(resources.map(async (resource, index) => {
         const decodedImage = element("img", "viewer-image");
         decodedImage.alt = pages[index].entry.name;
         decodedImage.draggable = false;
@@ -11882,6 +12371,7 @@ export class ImageViewer {
       }));
       if (sequence !== this.loadSequence) {
         pendingUrls.forEach((url) => URL.revokeObjectURL(url));
+        this.decodedUnitCache.release(decodeAhead.lease);
         this.recordPageDisplay(
           presentation,
           "not_applied",
@@ -11917,8 +12407,23 @@ export class ImageViewer {
         pages[index].request.cssWidth = layout.cssWidth;
         rememberMediaImageInfo(pages[index].request, decoded.info);
       });
+      const previousLease = this.decodedUnitLease;
       const previousUrls = this.objectUrls.slice();
       this.pageLayer.replaceChildren(...decodedImages.map((decoded) => decoded.image));
+      if (!nextLease && pendingUrls.length === pages.length) {
+        nextLease = this.decodedUnitCache.adoptAndAcquire({
+          unitKey: decodedUnitKey,
+          pages: decodedImages.map((decoded, index) => ({
+            requestKey: pages[index].request.cacheKey,
+            resource: resources[index],
+            image: decoded.image,
+            objectUrl: pendingUrls[index],
+            info: decoded.info,
+            decodeMs: decoded.decodeMs,
+          })),
+        });
+        if (nextLease) pendingUrls.length = 0;
+      }
       this.images = decodedImages.map((decoded) => decoded.image);
       this.image = this.images[0];
       pageDemandAdapter.commitDisplay(displayRequestId);
@@ -11932,13 +12437,17 @@ export class ImageViewer {
       // 中身を差し替えてから決める。差し替え前は内容がまだ DOM に入っていない。
       this.placeInitialStageScroll();
       this.commitPagePresentation(presentation);
-      this.objectUrls = pendingUrls.slice();
+      this.decodedUnitLease = nextLease;
+      leaseCommitted = true;
+      this.objectUrls = nextLease ? pages.map(() => null) : pendingUrls.slice();
       this.objectUrl = null;
-      previousUrls.forEach((url) => URL.revokeObjectURL(url));
+      this.decodedUnitCache.release(previousLease);
+      previousUrls.filter(Boolean).forEach((url) => URL.revokeObjectURL(url));
       this.applyTransform();
       await nextFrame();
       if (sequence !== this.loadSequence) return VIEWER_GROUP_LOAD_SUPERSEDED;
 
+      const tapToDisplayMs = roundMs(performance.now() - interactionStartedAt);
       decodedImages.forEach((decoded, index) => {
         const resource = resources[index];
         const request = pages[index].request;
@@ -11947,10 +12456,10 @@ export class ImageViewer {
           type: "image",
           request_id: resource.requestId,
           name: limitText(pages[index].entry.name, 240),
-          fetch_ms: roundMs(resource.fetchMs ?? performance.now() - startedAt),
+          fetch_ms: roundMs(decodeAhead.reused ? 0 : resource.fetchMs ?? performance.now() - startedAt),
           bytes: resource.blob.size,
           decode_ms: roundMs(decoded.decodeMs),
-          tap_to_display_ms: roundMs(performance.now() - interactionStartedAt),
+          tap_to_display_ms: tapToDisplayMs,
           requested_width: request.width,
           css_width: roundMs(request.cssWidth),
           css_height: roundMs(resolvedLayout.pages[index].cssHeight),
@@ -11961,15 +12470,29 @@ export class ImageViewer {
           ...this.layoutTelemetry(),
           prefetch_status: resource.prefetchStatus,
           spread_pages: pages.length,
+          decode_ahead_reused: decodeAhead.reused,
+          decode_ahead_reason: decodeAhead.reason,
+          decoded_unit_count: this.decodedUnitCache.retainedUnitCount(),
         };
         enqueueTelemetry(event);
         hudState.lastImage = event;
         hudState.displayDurations.push(event.tap_to_display_ms);
       });
+      this.onDecodeAheadDisplay({
+        type: "page_decode_ahead_display",
+        reused: decodeAhead.reused,
+        reason: decodeAhead.reason,
+        tap_to_display_ms: tapToDisplayMs,
+        retained_unit_count: this.decodedUnitCache.retainedUnitCount(),
+        spread_pages: pages.length,
+      });
       while (hudState.displayDurations.length > 20) hudState.displayDurations.shift();
       updateHud();
       return VIEWER_GROUP_LOAD_APPLIED;
     } catch (error) {
+      if (!leaseCommitted) {
+        this.decodedUnitCache.release(nextLease ?? decodeAhead.lease);
+      }
       pendingUrls.forEach((url) => URL.revokeObjectURL(url));
       const candidateImageIds = resources?.map((resource) => resource.requestId) ?? [];
       if (sequence !== this.loadSequence) {
@@ -12381,9 +12904,11 @@ export class ImageViewer {
     this.pageLoadQueue.clear();
     this.loadSequence += 1;
     this.legacyFetchController?.abort();
+    this.decodedUnitCache.release(this.decodedUnitLease);
+    this.decodedUnitLease = null;
     if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
     for (const objectUrl of this.objectUrls) {
-      if (objectUrl !== this.objectUrl) URL.revokeObjectURL(objectUrl);
+      if (objectUrl && objectUrl !== this.objectUrl) URL.revokeObjectURL(objectUrl);
     }
     this.objectUrl = null;
     this.objectUrls = [];

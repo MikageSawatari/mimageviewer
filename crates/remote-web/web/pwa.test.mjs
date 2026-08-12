@@ -355,6 +355,30 @@ test("prefetch retention is count-only and every eviction is queued as telemetry
   assert.match(app, /大きすぎるとブラウザが落ちることがあります/);
 });
 
+test("decode-ahead starts only after a committed display and records reuse", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  assert.match(
+    app,
+    /function queuePageDecodeAhead\(\)[\s\S]*viewer\.pageLoadBusy[\s\S]*viewerHasCommittedDecodedUnit\(viewer\)/
+  );
+  assert.match(
+    app,
+    /schedulePagePrefetch\(viewer\)\.catch[\s\S]*queuePageDecodeAhead\(\)[\s\S]*return VIEWER_GROUP_LOAD_APPLIED/
+  );
+  assert.match(
+    app,
+    /pageResourceCache\.peek\(request\.cacheKey\)[\s\S]*markUnavailable\(plan\.key, "bytes_missing"\)/
+  );
+  assert.match(
+    app,
+    /tryAcquire\([\s\S]*decode_ahead_reused:[\s\S]*decode_ahead_reason:[\s\S]*decoded_unit_count:/
+  );
+  assert.match(
+    app,
+    /type: "page_decode_ahead_display"[\s\S]*tap_to_display_ms:[\s\S]*retained_unit_count:/
+  );
+});
+
 test("video health HUD and persistent debug-tier warning stay wired", async () => {
   const app = await readFile(new URL("app.js", here), "utf8");
   const css = await readFile(new URL("styles.css", here), "utf8");
