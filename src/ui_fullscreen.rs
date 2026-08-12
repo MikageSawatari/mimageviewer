@@ -2486,27 +2486,6 @@ pub(crate) fn ctrl_held_via_os() -> bool {
     false
 }
 
-/// 物理的な**左** Ctrl 押下を OS から直接読む。
-///
-/// 押している間だけ効くキャンバス修飾を新しく足すときは、既定の元画像表示が RightCtrl
-/// ([keymap.rs](keymap.rs) の `FsOriginalPreviewHold`) であることに注意する。
-/// `ctrl_held_via_os` は VK_CONTROL (左右どちら) なので、そのまま使うと元画像表示と
-/// 物理的に重なる。左右を分けたい修飾はこちらを使う。
-#[cfg(windows)]
-fn left_ctrl_held_via_os() -> bool {
-    use windows::Win32::UI::Input::KeyboardAndMouse::VK_LCONTROL;
-
-    crate::key_input::physical_key_down(crate::key_input::PhysicalKeySlot::new(
-        VK_LCONTROL.0.into(),
-        false,
-    ))
-}
-
-#[cfg(not(windows))]
-fn left_ctrl_held_via_os() -> bool {
-    false
-}
-
 #[cfg(windows)]
 fn shift_held_via_os() -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT;
@@ -4264,6 +4243,18 @@ impl App {
     /// 持っている間、メイン ctx の modifier event は届かない
     /// (= `i.modifiers.shift` が常に false)。元画像表示の修飾キー検出と同じ理由。
     fn original_preview_active(&self, ctx: &egui::Context, idx: usize) -> bool {
+        // 比較表示中は元画像表示を無効にする (利用者判断 2026-08-13、§1.79)。
+        //
+        // 比較は加工済みピクセルから合成した対を描くので、元画像表示はもともと画面に効かない。
+        // それでいて有効なままにすると、比較用 source が確定していない扱いになって
+        // 「比較表示を準備中」トーストが出たり、組み上がった対が捨てられたりする。
+        // 見た目が変わらないのに副作用だけ起きる状態なので、ここで断つ。
+        //
+        // 「ワイプを保ったまま両側を元画像にする」形にするなら §1.79 を実装する。
+        // その場合はこの早期 return を外し、元画像版の対を用意する経路へ差し替える。
+        if !matches!(self.compare_view_mode, crate::app::CompareViewMode::Off) {
+            return false;
+        }
         if !self.fs_prev_focused {
             return false;
         }
@@ -17973,8 +17964,7 @@ impl App {
         }
         // Fullscreen canvas modifier events can be stale; keep navigator and main compare paint
         // on the same OS-level Ctrl fact used by other transient canvas modifiers.
-        // 左 Ctrl 限定なのは、既定の元画像表示が RightCtrl だから (`left_ctrl_held_via_os` 参照)。
-        let ctrl_held = left_ctrl_held_via_os();
+        let ctrl_held = ctrl_held_via_os();
 
         let shader_shape =
             self.compare_preparation
@@ -24066,8 +24056,7 @@ impl App {
         }
         // Do not read `ctx.input().modifiers` here: the fullscreen viewport can retain a stale
         // modifier snapshot while the physical Ctrl state changes during the same drag.
-        // 左 Ctrl 限定なのは、既定の元画像表示が RightCtrl だから (`left_ctrl_held_via_os` 参照)。
-        let ctrl_held = left_ctrl_held_via_os();
+        let ctrl_held = ctrl_held_via_os();
 
         let shader_shape = self
             .compare_preparation
