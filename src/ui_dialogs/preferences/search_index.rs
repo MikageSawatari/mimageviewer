@@ -38,13 +38,26 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "general/ai-processing",
         General,
         "表示時の AI 処理 (アップスケール / ノイズ除去)",
-        ["人工知能", "高画質", "軽量", "upscale", "denoise"]
+        [
+            "人工知能",
+            "高画質",
+            "軽量",
+            "upscale",
+            "denoise",
+            "デノイズ"
+        ]
     ),
     entry!(
         "general/viewer-mode",
         General,
         "ビューワモード",
-        ["viewer", "別ウィンドウ", "複数ウィンドウ", "F12"]
+        [
+            "viewer",
+            "ビューア",
+            "別ウィンドウ",
+            "複数ウィンドウ",
+            "F12"
+        ]
     ),
     entry!(
         "general/book-display",
@@ -62,7 +75,13 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "general/media-window",
         General,
         "動画・音声は別ウィンドウで再生",
-        ["メディアウィンドウ", "video", "audio"]
+        [
+            "メディアウィンドウ",
+            "video",
+            "audio",
+            "ビューワ",
+            "ビューア"
+        ]
     ),
     entry!(
         "font/ui-font",
@@ -218,7 +237,13 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "prefetch/ai",
         Prefetch,
         "AI・カラー化の先読み",
-        ["アップスケール", "ノイズ除去", "colorize"]
+        [
+            "アップスケール",
+            "ノイズ除去",
+            "デノイズ",
+            "denoise",
+            "colorize"
+        ]
     ),
     entry!(
         "prefetch/retained-ai-count",
@@ -236,7 +261,15 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "prefetch/ai-size-limit",
         Prefetch,
         "AI 処理のサイズ上限",
-        ["長辺", "短辺", "アップスケール", "ノイズ除去", "pixel"]
+        [
+            "長辺",
+            "短辺",
+            "アップスケール",
+            "ノイズ除去",
+            "デノイズ",
+            "denoise",
+            "pixel"
+        ]
     ),
     entry!(
         "gpu-memory/limit",
@@ -248,7 +281,17 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "ai-backend/backend",
         AiBackend,
         "バックエンド:",
-        ["DirectML", "TensorRT", "NVIDIA", "GPU", "AI"]
+        [
+            "DirectML",
+            "TensorRT",
+            "NVIDIA",
+            "GPU",
+            "AI",
+            "アップスケール",
+            "ノイズ除去",
+            "デノイズ",
+            "denoise"
+        ]
     ),
     entry!(
         "ai-backend/tensorrt-pack",
