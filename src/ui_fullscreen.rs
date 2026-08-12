@@ -5703,18 +5703,7 @@ pub(crate) fn navigable_delta_between(
 }
 
 fn build_image_reading_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
-    visible_indices
-        .iter()
-        .copied()
-        .filter(|&i| {
-            matches!(
-                items.get(i),
-                Some(GridItem::Image(_))
-                    | Some(GridItem::ZipImage { .. })
-                    | Some(GridItem::PdfPage { .. })
-            )
-        })
-        .collect()
+    crate::ui_helpers::still_image_display_indices(items, visible_indices)
 }
 
 fn count_seek_overlay_non_image_items(items: &[GridItem], nav_indices: &[usize]) -> (usize, usize) {
@@ -14551,7 +14540,11 @@ impl App {
             Some(i) => i,
             None => return FsPageNav::Delta(base_delta),
         };
-        let nav = self.get_nav_indices();
+        let nav = if self.continuous_reading_active_for_idx(fs_idx) {
+            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order())
+        } else {
+            self.get_nav_indices()
+        };
         self.spread_page_nav_for_indices(&nav, fs_idx, base_delta)
     }
 
@@ -14599,7 +14592,11 @@ impl App {
         fs_idx: usize,
         dir: i32,
     ) -> Option<(usize, usize)> {
-        let nav = self.get_nav_indices();
+        let nav = if self.continuous_reading_active_for_idx(fs_idx) {
+            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order())
+        } else {
+            self.get_nav_indices()
+        };
         let units = build_spread_display_units(
             &nav,
             &self.items,
@@ -20143,8 +20140,13 @@ impl App {
         at_end: bool,
     ) -> Option<usize> {
         let display_order = self.current_grid_order().to_vec();
-        let target =
-            crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, at_end)?;
+        let continuous_reading = self.continuous_reading_active_for_idx(fs_idx);
+        let target = crate::ui_helpers::boundary_page_navigation_idx(
+            &self.items,
+            &display_order,
+            at_end,
+            continuous_reading,
+        )?;
         if target != fs_idx {
             Some(target)
         } else {
@@ -20643,11 +20645,7 @@ impl App {
             // close (Esc) / close_to_page_list (BS) は終端アクション。閉じた後に同フレームの
             // wheel 由来のページ移動等で別項目を開き直さないようガードする。
             if let Some(new_idx) = jump_to {
-                self.open_fullscreen_from_fs_navigation(
-                    ctx,
-                    new_idx,
-                    crate::app::HistoryTrigger::UserChosen,
-                );
+                self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
             } else if let FsPageNav::Target(new_idx) = page_nav {
                 let display_order = self.current_grid_order().to_vec();
                 let current_is_media = matches!(
@@ -20703,11 +20701,12 @@ impl App {
                         "media_window_manual",
                         crate::app::ManualMediaNavigationLanding::Fullscreen,
                     );
-                } else if let Some(new_idx) = crate::ui_helpers::adjacent_navigable_idx(
+                } else if let Some(new_idx) = crate::ui_helpers::adjacent_page_navigation_idx(
                     &self.items,
                     &display_order,
                     fs_idx,
                     nav_delta,
+                    self.continuous_reading_active_for_idx(fs_idx),
                 ) {
                     self.update_fs_page_turn_burst_after_navigation(
                         ctx,
@@ -32646,6 +32645,63 @@ mod tests {
         assert_eq!(app.selected, Some(2));
         assert_eq!(app.fs_vertical_scroll, 0.0);
         assert_eq!(app.fs_zoom, 1.5);
+    }
+
+    #[test]
+    fn continuous_spread_target_skips_media_units_while_paged_keeps_video() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(PathBuf::new()),
+            GridItem::Image(PathBuf::new()),
+            GridItem::Video(PathBuf::new()),
+            GridItem::Audio(PathBuf::new()),
+            GridItem::Image(PathBuf::new()),
+            GridItem::Image(PathBuf::new()),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.visible_indices = (0..app.items.len()).collect();
+        app.open_fullscreen(0, crate::app::HistoryTrigger::UserChosen);
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+
+        app.reading_flow = ReadingFlow::Vertical;
+        assert_eq!(app.spread_page_nav(1), FsPageNav::Target(4));
+
+        app.reading_flow = ReadingFlow::Paged;
+        assert_eq!(app.spread_page_nav(1), FsPageNav::Target(2));
+    }
+
+    #[test]
+    fn continuous_navigation_without_a_still_target_stays_put_and_shows_edge() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(PathBuf::new()),
+            GridItem::Video(PathBuf::new()),
+            GridItem::Audio(PathBuf::new()),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.visible_indices = (0..app.items.len()).collect();
+        app.open_fullscreen(0, crate::app::HistoryTrigger::UserChosen);
+        app.reading_flow = ReadingFlow::Vertical;
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        let ctx = egui::Context::default();
+
+        app.handle_fs_navigation(
+            &ctx,
+            false,
+            false,
+            None,
+            None,
+            None,
+            FsPageNav::Delta(1),
+            None,
+            0,
+        );
+
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(matches!(
+            app.fs_boundary_hint,
+            Some(FsBoundaryHint::Edge { at_end: true, .. })
+        ));
     }
 
     #[test]

@@ -1144,8 +1144,48 @@ pub fn draw_format_rows(ui: &mut egui::Ui, rows: &[(&str, u64, f64)]) {
 // アイテムナビゲーション
 // -----------------------------------------------------------------------
 
+/// `display_order` の中から、連結読み・ページジャンプ・スライドショーで使う
+/// 静止画ページ (通常画像 + ZIP 画像 + PDF ページ) の item index を返す。
+///
+/// 呼び出し側で raw item index 順を組み直さず、フィルタ・詳細ソート適用後の
+/// `display_order` をそのまま共有すること。
+pub fn still_image_display_indices(items: &[GridItem], display_order: &[usize]) -> Vec<usize> {
+    display_order
+        .iter()
+        .copied()
+        .filter(|&i| {
+            matches!(
+                items.get(i),
+                Some(GridItem::Image(_))
+                    | Some(GridItem::ZipImage { .. })
+                    | Some(GridItem::PdfPage { .. })
+            )
+        })
+        .collect()
+}
+
+fn adjacent_idx_in_order(nav_indices: &[usize], current: usize, delta: i32) -> Option<usize> {
+    if nav_indices.is_empty() {
+        return None;
+    }
+    if let Some(pos) = nav_indices.iter().position(|&i| i == current) {
+        let new_pos = (pos as i32 + delta).clamp(0, nav_indices.len() as i32 - 1) as usize;
+        if new_pos == pos {
+            None
+        } else {
+            Some(nav_indices[new_pos])
+        }
+    } else if delta > 0 {
+        nav_indices.iter().copied().filter(|&i| i > current).min()
+    } else if delta < 0 {
+        nav_indices.iter().copied().filter(|&i| i < current).max()
+    } else {
+        None
+    }
+}
+
 /// items の中で current から delta 分（±1）移動した「表示可能」アイテム
-/// (画像 + 動画 + ZIP 画像 + ZIP セパレータ) の item index を返す。
+/// (画像 + 動画 + 音声 + ZIP 画像 + PDF ページ) の item index を返す。
 /// 境界では None を返す（ラップアラウンドなし）。
 /// `display_order` (フィルタ適用済み・詳細ソート適用済み) の中からナビゲーション可能な
 /// 前後のアイテムインデックスを返す。
@@ -1174,38 +1214,30 @@ pub fn adjacent_navigable_idx(
             )
         })
         .collect();
-    if nav_indices.is_empty() {
-        return None;
-    }
-    if let Some(pos) = nav_indices.iter().position(|&i| i == current) {
-        let new_pos = (pos as i32 + delta).clamp(0, nav_indices.len() as i32 - 1) as usize;
-        if new_pos == pos {
-            None
-        } else {
-            Some(nav_indices[new_pos])
-        }
-    } else if delta > 0 {
-        nav_indices.iter().copied().filter(|&i| i > current).min()
-    } else if delta < 0 {
-        nav_indices.iter().copied().filter(|&i| i < current).max()
+    adjacent_idx_in_order(&nav_indices, current, delta)
+}
+
+/// フルスクリーンのページ移動で使う隣接探索。
+///
+/// ページ単位表示では動画・音声を含む従来の item 移動を保つ。連結読みは静止画だけを
+/// 仮想配置するため、横断方向の item 移動も同じ静止画表示順を使う。
+pub fn adjacent_page_navigation_idx(
+    items: &[GridItem],
+    display_order: &[usize],
+    current: usize,
+    delta: i32,
+    continuous_reading: bool,
+) -> Option<usize> {
+    if continuous_reading {
+        let image_indices = still_image_display_indices(items, display_order);
+        adjacent_idx_in_order(&image_indices, current, delta)
     } else {
-        None
+        adjacent_navigable_idx(items, display_order, current, delta)
     }
 }
 
 fn page_jump_nav_indices(items: &[GridItem], display_order: &[usize]) -> Vec<usize> {
-    display_order
-        .iter()
-        .copied()
-        .filter(|&i| {
-            matches!(
-                items.get(i),
-                Some(GridItem::Image(_))
-                    | Some(GridItem::ZipImage { .. })
-                    | Some(GridItem::PdfPage { .. })
-            )
-        })
-        .collect()
+    still_image_display_indices(items, display_order)
 }
 
 fn jump_page_idx_from_nav_indices(
@@ -1290,35 +1322,8 @@ pub fn adjacent_slideshow_idx(
     current: usize,
     delta: i32,
 ) -> Option<usize> {
-    let nav_indices: Vec<usize> = display_order
-        .iter()
-        .copied()
-        .filter(|&i| {
-            matches!(
-                items.get(i),
-                Some(GridItem::Image(_))
-                    | Some(GridItem::ZipImage { .. })
-                    | Some(GridItem::PdfPage { .. })
-            )
-        })
-        .collect();
-    if nav_indices.is_empty() {
-        return None;
-    }
-    if let Some(pos) = nav_indices.iter().position(|&i| i == current) {
-        let new_pos = (pos as i32 + delta).clamp(0, nav_indices.len() as i32 - 1) as usize;
-        if new_pos == pos {
-            None
-        } else {
-            Some(nav_indices[new_pos])
-        }
-    } else if delta > 0 {
-        nav_indices.iter().copied().filter(|&i| i > current).min()
-    } else if delta < 0 {
-        nav_indices.iter().copied().filter(|&i| i < current).max()
-    } else {
-        None
-    }
+    let nav_indices = still_image_display_indices(items, display_order);
+    adjacent_idx_in_order(&nav_indices, current, delta)
 }
 
 /// スライドショーの折り返し / 先頭着地用に、`display_order` の中で先頭の
@@ -1352,6 +1357,26 @@ pub fn boundary_navigable_idx(
         )
     });
     if last { iter.last() } else { iter.next() }
+}
+
+/// Home / End によるフルスクリーン内の端ジャンプ先を返す。
+/// 連結読みでは実際の連結ページ列の端、ページ単位表示では従来の混合メディア列の端を使う。
+pub fn boundary_page_navigation_idx(
+    items: &[GridItem],
+    display_order: &[usize],
+    last: bool,
+    continuous_reading: bool,
+) -> Option<usize> {
+    if continuous_reading {
+        let image_indices = still_image_display_indices(items, display_order);
+        if last {
+            image_indices.last().copied()
+        } else {
+            image_indices.first().copied()
+        }
+    } else {
+        boundary_navigable_idx(items, display_order, last)
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -1897,6 +1922,68 @@ mod tests {
         let vi: Vec<usize> = Vec::new();
         assert_eq!(adjacent_navigable_idx(&items, &vi, 1, 1), None);
         assert_eq!(adjacent_navigable_idx(&items, &vi, 1, -1), None);
+    }
+
+    #[test]
+    fn continuous_page_navigation_skips_video_between_images() {
+        let items = vec![
+            GridItem::Image(std::path::PathBuf::new()),
+            GridItem::Video(std::path::PathBuf::new()),
+            GridItem::Image(std::path::PathBuf::new()),
+        ];
+        let order = vec![0, 1, 2];
+        assert_eq!(
+            adjacent_page_navigation_idx(&items, &order, 0, 1, true),
+            Some(2)
+        );
+        assert_eq!(
+            adjacent_page_navigation_idx(&items, &order, 2, -1, true),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn paged_navigation_still_enters_video_between_images() {
+        let items = vec![
+            GridItem::Image(std::path::PathBuf::new()),
+            GridItem::Video(std::path::PathBuf::new()),
+            GridItem::Image(std::path::PathBuf::new()),
+        ];
+        let order = vec![0, 1, 2];
+        assert_eq!(
+            adjacent_page_navigation_idx(&items, &order, 0, 1, false),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn continuous_page_navigation_skips_consecutive_video_and_audio_items() {
+        let items = vec![
+            GridItem::Image(std::path::PathBuf::new()),
+            GridItem::Video(std::path::PathBuf::new()),
+            GridItem::Audio(std::path::PathBuf::new()),
+            GridItem::Video(std::path::PathBuf::new()),
+            GridItem::Image(std::path::PathBuf::new()),
+        ];
+        let order = vec![0, 1, 2, 3, 4];
+        assert_eq!(
+            adjacent_page_navigation_idx(&items, &order, 0, 1, true),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn continuous_page_navigation_returns_none_without_a_still_target() {
+        let items = vec![
+            GridItem::Image(std::path::PathBuf::new()),
+            GridItem::Video(std::path::PathBuf::new()),
+            GridItem::Audio(std::path::PathBuf::new()),
+        ];
+        let order = vec![0, 1, 2];
+        assert_eq!(
+            adjacent_page_navigation_idx(&items, &order, 0, 1, true),
+            None
+        );
     }
 
     #[test]

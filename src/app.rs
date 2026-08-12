@@ -49083,18 +49083,7 @@ impl App {
     }
 
     fn collect_image_indices_from(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
-        visible_indices
-            .iter()
-            .copied()
-            .filter(|&i| {
-                matches!(
-                    items.get(i),
-                    Some(GridItem::Image(_))
-                        | Some(GridItem::ZipImage { .. })
-                        | Some(GridItem::PdfPage { .. })
-                )
-            })
-            .collect()
+        crate::ui_helpers::still_image_display_indices(items, visible_indices)
     }
 
     /// フルスクリーンの「閉じる」要求 (Esc / Enter / 右クリック / ビューポート close) の共通処理。
