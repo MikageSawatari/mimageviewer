@@ -4243,13 +4243,7 @@ impl App {
     /// 持っている間、メイン ctx の modifier event は届かない
     /// (= `i.modifiers.shift` が常に false)。元画像表示の修飾キー検出と同じ理由。
     fn original_preview_active(&self, ctx: &egui::Context, idx: usize) -> bool {
-        // Wipe owns Ctrl as a transient drag modifier. Prepared compare paint does not have an
-        // original-preview variant, so allowing the hold action here would only show a misleading
-        // indicator (and briefly alter the ordinary fallback while preparation settles).
-        if matches!(
-            self.compare_view_mode,
-            crate::app::CompareViewMode::Wipe { .. }
-        ) {
+        if compare_wipe_claims_ctrl(self.compare_view_mode, self.compare_wipe_dragging) {
             return false;
         }
         if !self.fs_prev_focused {
@@ -5566,6 +5560,17 @@ fn fullscreen_seek_knob_x(track_rect: egui::Rect, fraction: f32, rtl: bool) -> f
 /// A fraction of 0 is the rect's left edge and 1 is its right edge.
 fn compare_wipe_screen_x(draw_rect: egui::Rect, fraction: f32) -> f32 {
     draw_rect.left() + draw_rect.width() * fraction.clamp(0.0, 1.0)
+}
+
+/// ワイプの境界線ドラッグが Ctrl を一時修飾として占有しているか。
+///
+/// 既定の元画像表示は RightCtrl で、`ctrl_held_via_os` は VK_CONTROL (左右どちら) を読む。
+/// そのため境界線をドラッグしながら Ctrl を押すと、線を消す操作と元画像表示が同時に成立する。
+///
+/// 占有は**ドラッグ中に限る**。ワイプ表示というだけで元画像表示を止めると、元画像表示を
+/// 別のキーへ割り当てている利用者からも、競合していない場面の機能を奪うことになる。
+fn compare_wipe_claims_ctrl(mode: crate::app::CompareViewMode, dragging: bool) -> bool {
+    dragging && matches!(mode, crate::app::CompareViewMode::Wipe { .. })
 }
 
 fn compare_wipe_line_visible(
@@ -37427,6 +37432,29 @@ mod tests {
                 fraction,
             ));
         }
+    }
+
+    #[test]
+    fn compare_wipe_claims_ctrl_only_while_dragging_the_line() {
+        use crate::app::CompareViewMode;
+
+        // 元画像表示の既定は RightCtrl。ワイプ表示中でもドラッグしていなければ、そちらが
+        // 従来どおり成立しなければならない。
+        assert!(!compare_wipe_claims_ctrl(
+            CompareViewMode::Wipe { fraction: 0.5 },
+            false
+        ));
+        assert!(compare_wipe_claims_ctrl(
+            CompareViewMode::Wipe { fraction: 0.5 },
+            true
+        ));
+        // 他の比較モードは境界線を持たないので、ドラッグ中でも Ctrl を占有しない。
+        assert!(!compare_wipe_claims_ctrl(CompareViewMode::Diff, true));
+        assert!(!compare_wipe_claims_ctrl(
+            CompareViewMode::PinnedNormal,
+            true
+        ));
+        assert!(!compare_wipe_claims_ctrl(CompareViewMode::Off, true));
     }
 
     #[test]
