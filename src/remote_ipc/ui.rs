@@ -27,6 +27,9 @@ const REMOTE_ENABLE_WARNING_EMPHASIS: &str = "すべてのドライブについ�
 const REMOTE_ENABLE_WARNING_SUFFIX: &str =
     "が、この PC の Tailscale アドレスへ接続でき、PIN を知っている人から見えるようになります。";
 const REMOTE_MANUAL_URL: &str = "https://mikage.to/mimageviewer/manual/tut-remote.html";
+const REMOTE_TAILSCALE_DNS_URL: &str = "https://console.tailscale.com/admin/dns";
+const REMOTE_TAILSCALE_MACHINES_URL: &str = "https://console.tailscale.com/admin/machines";
+const REMOTE_KEY_EXPIRY_WARNING_DAYS: i64 = 30;
 
 #[derive(Default)]
 pub(crate) struct RemoteSessionUiState {
@@ -93,34 +96,66 @@ fn remote_enable_action_allowed(pin_configured: bool) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RemoteTailscaleServeElements {
     show_setup_button: bool,
+    setup_button_enabled: bool,
     show_conflict_warning: bool,
     show_unknown_message: bool,
     show_removal_note: bool,
 }
 
 fn remote_tailscale_serve_elements(
-    status: RemoteWebFeatureStatus,
+    serve_status: RemoteWebFeatureStatus,
+    https_certificate: RemoteWebFeatureStatus,
     has_conflict: bool,
 ) -> RemoteTailscaleServeElements {
-    match status {
+    match serve_status {
         RemoteWebFeatureStatus::Configured => RemoteTailscaleServeElements {
             show_setup_button: false,
+            setup_button_enabled: false,
             show_conflict_warning: false,
             show_unknown_message: false,
             show_removal_note: true,
         },
         RemoteWebFeatureStatus::NotConfigured => RemoteTailscaleServeElements {
             show_setup_button: true,
+            setup_button_enabled: https_certificate != RemoteWebFeatureStatus::NotConfigured,
             show_conflict_warning: has_conflict,
             show_unknown_message: false,
             show_removal_note: false,
         },
         RemoteWebFeatureStatus::Unknown => RemoteTailscaleServeElements {
             show_setup_button: false,
+            setup_button_enabled: false,
             show_conflict_warning: false,
             show_unknown_message: true,
             show_removal_note: false,
         },
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteKeyExpiryDisplay {
+    Unavailable,
+    Normal { remaining_days: i64 },
+    Warning { remaining_days: i64 },
+    Expired,
+}
+
+fn remote_key_expiry_display(
+    expiry_unix_seconds: Option<i64>,
+    now_unix_seconds: i64,
+) -> RemoteKeyExpiryDisplay {
+    let Some(expiry_unix_seconds) = expiry_unix_seconds else {
+        return RemoteKeyExpiryDisplay::Unavailable;
+    };
+    if expiry_unix_seconds <= now_unix_seconds {
+        return RemoteKeyExpiryDisplay::Expired;
+    }
+    let remaining_seconds = expiry_unix_seconds.saturating_sub(now_unix_seconds);
+    let remaining_days = remaining_seconds.saturating_add(86_399) / 86_400;
+    if remaining_days <= REMOTE_KEY_EXPIRY_WARNING_DAYS {
+        RemoteKeyExpiryDisplay::Warning { remaining_days }
+    } else {
+        RemoteKeyExpiryDisplay::Normal { remaining_days }
     }
 }
 
@@ -2421,6 +2456,11 @@ impl crate::app::App {
             .map(super::RemoteServiceStatus::snapshot)
             .unwrap_or(super::service::RemoteServiceDiagnostic::Stopped);
         let accepting = remote_web_connected && info.is_some();
+        let key_expiry_display = remote_key_expiry_display(
+            info.as_ref()
+                .and_then(|info| info.tailscale_key_expiry_unix_seconds),
+            current_unix_seconds(),
+        );
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let mut open = true;
         let mut requested_enabled = None;
@@ -2605,11 +2645,36 @@ impl crate::app::App {
                 if accepting && let Some(info) = info.as_ref() {
                     ui.separator();
                     ui.label(format!(
+                        "HTTPS 証明書: {}",
+                        remote_https_certificate_status_label(info.tailscale_https_certificate)
+                    ));
+                    if info.tailscale_https_certificate
+                        == RemoteWebFeatureStatus::NotConfigured
+                    {
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            "tailnet で HTTPS 証明書が有効になっていないため、tailscale serve を設定できません。",
+                        );
+                        ui.label(
+                            "Tailscale 管理コンソールの DNS ページで HTTPS 証明書を有効にしてください。",
+                        );
+                        ui.hyperlink_to(
+                            "Tailscale の DNS 設定を開く",
+                            REMOTE_TAILSCALE_DNS_URL,
+                        );
+                    }
+                    show_remote_key_expiry(
+                        ui,
+                        info.tailscale_key_expiry_unix_seconds,
+                        key_expiry_display,
+                    );
+                    ui.label(format!(
                         "tailscale serve: {}",
                         remote_feature_status_label(info.tailscale_serve)
                     ));
                     let elements = remote_tailscale_serve_elements(
                         info.tailscale_serve,
+                        info.tailscale_https_certificate,
                         info.tailscale_serve_conflict.is_some(),
                     );
                     if elements.show_unknown_message {
@@ -2644,7 +2709,7 @@ impl crate::app::App {
                         );
                         if ui
                             .add_enabled(
-                                !running && !awaiting_refresh,
+                                elements.setup_button_enabled && !running && !awaiting_refresh,
                                 egui::Button::new("tailscale serve を設定する")
                                     .min_size(egui::vec2(220.0, 34.0)),
                             )
@@ -3203,6 +3268,111 @@ fn remote_feature_status_label(status: RemoteWebFeatureStatus) -> &'static str {
     }
 }
 
+fn remote_https_certificate_status_label(status: RemoteWebFeatureStatus) -> &'static str {
+    match status {
+        RemoteWebFeatureStatus::Configured => "有効",
+        RemoteWebFeatureStatus::NotConfigured => "無効",
+        RemoteWebFeatureStatus::Unknown => "読み取れません",
+    }
+}
+
+fn current_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(0)
+}
+
+fn show_remote_key_expiry(
+    ui: &mut egui::Ui,
+    expiry_unix_seconds: Option<i64>,
+    display: RemoteKeyExpiryDisplay,
+) {
+    let Some(line) = remote_key_expiry_line(expiry_unix_seconds, display) else {
+        return;
+    };
+    match display {
+        RemoteKeyExpiryDisplay::Unavailable => {}
+        RemoteKeyExpiryDisplay::Normal { .. } => {
+            ui.label(line);
+        }
+        RemoteKeyExpiryDisplay::Warning { .. } => {
+            ui.colored_label(ui.visuals().warn_fg_color, line);
+            ui.label(
+                "期限切れになる前に、Tailscale のデバイス設定でこの PC のキーを無期限にできます。",
+            );
+            ui.hyperlink_to(
+                "Tailscale のデバイス一覧を開く",
+                REMOTE_TAILSCALE_MACHINES_URL,
+            );
+        }
+        RemoteKeyExpiryDisplay::Expired => {
+            ui.colored_label(ui.visuals().warn_fg_color, line);
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "この PC は tailnet から外れているため、外出先から接続できません。",
+            );
+            ui.label(
+                "Tailscale 管理コンソールのデバイス設定で、この PC のキーを無期限にできます。",
+            );
+            ui.hyperlink_to(
+                "Tailscale のデバイス一覧を開く",
+                REMOTE_TAILSCALE_MACHINES_URL,
+            );
+        }
+    }
+}
+
+fn remote_key_expiry_line(
+    expiry_unix_seconds: Option<i64>,
+    display: RemoteKeyExpiryDisplay,
+) -> Option<String> {
+    let date = format_local_unix_seconds_date(expiry_unix_seconds?);
+    match display {
+        RemoteKeyExpiryDisplay::Unavailable => None,
+        RemoteKeyExpiryDisplay::Normal { remaining_days }
+        | RemoteKeyExpiryDisplay::Warning { remaining_days } => Some(format!(
+            "接続キーの有効期限: {date} (あと {remaining_days} 日)"
+        )),
+        RemoteKeyExpiryDisplay::Expired => Some(format!("接続キーの有効期限: {date} (期限切れ)")),
+    }
+}
+
+fn format_local_unix_seconds_date(unix_seconds: i64) -> String {
+    format_local_unix_seconds_date_with(unix_seconds, format_local_unix_ms)
+}
+
+fn format_local_unix_seconds_date_with(
+    unix_seconds: i64,
+    format_local: impl FnOnce(u64) -> String,
+) -> String {
+    const DATE_FORMAT_FAILURE: &str = "取得できません";
+    let Some(unix_ms) = u64::try_from(unix_seconds)
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000))
+    else {
+        return DATE_FORMAT_FAILURE.to_owned();
+    };
+    // 管理コンソールの地方時表示と突き合わせる値なので、UTC の civil date は再計算せず、
+    // 既存の Win32 地方時変換が返す timestamp から日付部分だけを取り出す。
+    let local = format_local(unix_ms);
+    let Some(date) = local.get(..10) else {
+        return DATE_FORMAT_FAILURE.to_owned();
+    };
+    let bytes = date.as_bytes();
+    if bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| !matches!(index, 4 | 7) && !byte.is_ascii_digit())
+    {
+        return DATE_FORMAT_FAILURE.to_owned();
+    }
+    date.to_owned()
+}
+
 fn paint_qr(ui: &mut egui::Ui, url: &str) {
     let Ok(code) = QrCode::new(url.as_bytes()) else {
         ui.colored_label(egui::Color32::RED, "QR コードを生成できませんでした");
@@ -3369,35 +3539,150 @@ mod tests {
     #[test]
     fn tailscale_serve_dialog_elements_follow_status_and_conflict() {
         assert_eq!(
-            remote_tailscale_serve_elements(RemoteWebFeatureStatus::Configured, false),
+            remote_tailscale_serve_elements(
+                RemoteWebFeatureStatus::Configured,
+                RemoteWebFeatureStatus::Configured,
+                false,
+            ),
             RemoteTailscaleServeElements {
                 show_setup_button: false,
+                setup_button_enabled: false,
                 show_conflict_warning: false,
                 show_unknown_message: false,
                 show_removal_note: true,
             }
         );
         assert_eq!(
-            remote_tailscale_serve_elements(RemoteWebFeatureStatus::NotConfigured, false),
+            remote_tailscale_serve_elements(
+                RemoteWebFeatureStatus::NotConfigured,
+                RemoteWebFeatureStatus::Configured,
+                false,
+            ),
             RemoteTailscaleServeElements {
                 show_setup_button: true,
+                setup_button_enabled: true,
                 show_conflict_warning: false,
                 show_unknown_message: false,
                 show_removal_note: false,
             }
         );
         assert!(
-            remote_tailscale_serve_elements(RemoteWebFeatureStatus::NotConfigured, true)
-                .show_conflict_warning
+            remote_tailscale_serve_elements(
+                RemoteWebFeatureStatus::NotConfigured,
+                RemoteWebFeatureStatus::Configured,
+                true,
+            )
+            .show_conflict_warning
         );
         assert_eq!(
-            remote_tailscale_serve_elements(RemoteWebFeatureStatus::Unknown, true),
+            remote_tailscale_serve_elements(
+                RemoteWebFeatureStatus::Unknown,
+                RemoteWebFeatureStatus::Unknown,
+                true,
+            ),
             RemoteTailscaleServeElements {
                 show_setup_button: false,
+                setup_button_enabled: false,
                 show_conflict_warning: false,
                 show_unknown_message: true,
                 show_removal_note: false,
             }
+        );
+    }
+
+    #[test]
+    fn https_certificate_state_controls_only_the_serve_setup_button() {
+        let invalid = remote_tailscale_serve_elements(
+            RemoteWebFeatureStatus::NotConfigured,
+            RemoteWebFeatureStatus::NotConfigured,
+            false,
+        );
+        assert!(invalid.show_setup_button);
+        assert!(!invalid.setup_button_enabled);
+
+        let unknown = remote_tailscale_serve_elements(
+            RemoteWebFeatureStatus::NotConfigured,
+            RemoteWebFeatureStatus::Unknown,
+            false,
+        );
+        assert!(unknown.show_setup_button);
+        assert!(unknown.setup_button_enabled);
+        assert!(remote_enable_action_allowed(true));
+    }
+
+    #[test]
+    fn key_expiry_display_covers_warning_boundaries_without_inventing_unlimited_state() {
+        const DAY: i64 = 86_400;
+        let now = 1_700_000_000;
+        assert_eq!(
+            remote_key_expiry_display(None, now),
+            RemoteKeyExpiryDisplay::Unavailable
+        );
+        assert_eq!(
+            remote_key_expiry_line(None, RemoteKeyExpiryDisplay::Unavailable),
+            None,
+            "期限情報が無いダイアログには期限の行を出さない"
+        );
+        assert_eq!(
+            remote_key_expiry_display(Some(now + 179 * DAY), now),
+            RemoteKeyExpiryDisplay::Normal {
+                remaining_days: 179
+            }
+        );
+        assert_eq!(
+            remote_key_expiry_display(Some(now + 30 * DAY), now),
+            RemoteKeyExpiryDisplay::Warning { remaining_days: 30 }
+        );
+        assert_eq!(
+            remote_key_expiry_display(Some(now + DAY), now),
+            RemoteKeyExpiryDisplay::Warning { remaining_days: 1 }
+        );
+        assert_eq!(
+            remote_key_expiry_display(Some(now), now),
+            RemoteKeyExpiryDisplay::Expired
+        );
+        assert_eq!(
+            remote_key_expiry_display(Some(now - 1), now),
+            RemoteKeyExpiryDisplay::Expired
+        );
+    }
+
+    #[test]
+    fn tailnet_prerequisite_links_and_expiry_date_are_stable() {
+        assert_eq!(
+            REMOTE_TAILSCALE_DNS_URL,
+            "https://console.tailscale.com/admin/dns"
+        );
+        assert_eq!(
+            REMOTE_TAILSCALE_MACHINES_URL,
+            "https://console.tailscale.com/admin/machines"
+        );
+        assert_eq!(
+            format_local_unix_seconds_date_with(1_770_508_800, |unix_ms| {
+                assert_eq!(unix_ms, 1_770_508_800_000);
+                "2026-02-09 00:00:00".to_owned()
+            }),
+            "2026-02-09",
+            "管理コンソールと同じ地方時の日付部分を表示する"
+        );
+        assert_eq!(
+            format_local_unix_seconds_date_with(-1, |_| unreachable!()),
+            "取得できません"
+        );
+        assert_eq!(
+            remote_key_expiry_line(Some(-1), RemoteKeyExpiryDisplay::Expired).as_deref(),
+            Some("接続キーの有効期限: 取得できません (期限切れ)"),
+            "地方時変換に失敗しても期限切れ分類は変えない"
+        );
+        assert_eq!(
+            format_local_unix_seconds_date_with(i64::MAX, |_| unreachable!()),
+            "取得できません"
+        );
+        assert_eq!(
+            format_local_unix_seconds_date_with(1_770_508_800, |_| {
+                "取得できません".to_owned()
+            }),
+            "取得できません"
         );
     }
 

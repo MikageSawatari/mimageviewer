@@ -58,6 +58,8 @@ fn run() -> Result<(), String> {
         public_url: connection.base.clone(),
         tailscale_serve: connection.tailscale_serve,
         tailscale_serve_conflict: connection.tailscale_serve_conflict,
+        tailscale_https_certificate: connection.tailscale_https_certificate,
+        tailscale_key_expiry_unix_seconds: connection.tailscale_key_expiry_unix_seconds,
     });
     let ipc_status = match thumbnail_client.probe() {
         Ok(()) => "接続済み".to_owned(),

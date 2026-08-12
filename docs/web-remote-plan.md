@@ -144,8 +144,10 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
   定数時間比較し、PIN・hash・セッション署名値・Bearer をログへ出さない。認証失敗本文に内部情報を出さない
 - 接続用 QR コードには URL だけを含め、PIN や Bearer は含めない。URL は `--url`、Tailscale の
   `--json` 状態、bind 先の順で決める。remote-web は確定 URL、`tailscale serve` 状態、`/` を占める
-  既存 proxy 先を protocol v45 の接続情報として本体へ通知する。判定は `Web` の `.ts.net` キーだけでなく、
-  handler の `Proxy` が本体から渡された bind / port と一致するかまで見る。本体は JSON を独自解釈しない。
+  既存 proxy 先、tailnet の HTTPS 証明書状態、接続キーの有効期限を protocol v46 の接続情報として
+  本体へ通知する。判定は `Web` の `.ts.net` キーだけでなく、handler の `Proxy` が本体から渡された
+  bind / port と一致するかまで見る。HTTPS 証明書と期限も remote-web が `tailscale status --json` を
+  解釈し、本体は JSON を独自解釈しない。
   PIN 設定状態は認証ファイルの所有者である本体が判定し、
   設定メニューの「リモート接続…」に QR、URL、即時反映する opt-in、受付状態、active session の
   有無に基づく二値の利用状況を表示する。排他的 owner なので端末台数は表示しない。
@@ -317,8 +319,11 @@ remux と音声フォールバックはトランスコードの下位互換な�
   先に表示し、利用者が「tailscale serve を設定する」を押したときだけ本体の owner worker が代行する
 - `tailscale serve status --json` / `tailscale status --json` も **非管理者で読める**。
   `Self.DNSName` と serve の `Web` handler / proxy 先から接続 URL を自動組み立てる。
-  外部ツールは、参照系 (`status --json` / `serve status --json`) は無条件で実行してよいが、設定を
-  変える系は実行内容と意味を説明したうえで利用者の明示ボタン操作を必要とし、mIV が代行する
+  外部ツールは、参照系 (`status --json` / `serve status --json`) は無条件で実行してよい。
+  ローカル CLI で代行できる変更系は、実行内容と意味を説明したうえで利用者の明示ボタン操作を必要とする。
+  一方、tailnet 全体の HTTPS 証明書とデバイス単位の接続キー有効期限は管理コンソールまたは
+  管理者トークン付き API の設定であり、mIV は変更を代行せず、参照結果と管理コンソールへの案内だけを出す。
+  これを外部ツール方針の第 3 区分とし、そもそもローカルで代行できない設定を変更操作に見せない
 - 自前 TLS (`tailscale cert` で証明書ファイルを取得して mIV が終端する) は、プロキシのホップを
   減らせるが証明書更新の管理を抱える。**現時点では採用しない**。製品化フェーズの比較対象として残す
 
@@ -1823,8 +1828,10 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-`tailscale serve` の proxy 衝突を本体へ通知する 2026-08-12 時点の現行版は **v45**。
-v45 は `RemoteWebConnectionInfo.tailscale_serve_conflict` を追加する。v44 で削除した
+tailnet の HTTPS 証明書状態と接続キー有効期限を本体へ通知する 2026-08-12 時点の現行版は **v46**。
+v46 は `RemoteWebConnectionInfo.tailscale_https_certificate` と
+`tailscale_key_expiry_unix_seconds` を追加する。v45 で追加した
+`RemoteWebConnectionInfo.tailscale_serve_conflict` も保持する。v44 で削除した
 `RemoteWebConnectionInfo.pin_configured` は戻さない。v43 で `ContainerPayload` に追加した
 本体 seek overlay と同じ画像・動画・その他の件数内訳は引き続き保持する。
 v42 の `PageRequest` job / optional display request ID、batched `PageDemand` の promote / release、
@@ -2451,7 +2458,7 @@ data directory の外にする理由は「remote-web は本体 data directory �
 従来は `serve status --json` の `Web` に `.ts.net` のキーがあるだけで設定済みと判定していたため、
 別サービスを配信中でも mIV 用と誤認していた。現在は各 handler の `Proxy` の host / port が、本体所有の
 `127.0.0.1:<port>` と一致するときだけ設定済みとし、接続 URL は該当 entry の host と handler path から
-組み立てる。`/` が別 proxy 先なら v45 の衝突情報として本体へ運び、上書きになることをボタン前に表示する。
+組み立てる。`/` が別 proxy 先なら v46 でも保持する衝突情報として本体へ運び、上書きになることをボタン前に表示する。
 
 設定変更は接続ダイアログに `tailscale serve --bg <port>` そのものと意味を示し、利用者が押したときだけ
 owner worker が最大 8 秒の CLI 実行を行う。成功時は所有する remote-web child を再起動する。本体から
@@ -2462,3 +2469,22 @@ remote-web へ状態再読込を要求する IPC は無く、再起動で `choos
 別用途の serve 設定まで消すためである。今回は Tailscale 側で解除する案内だけを出す。将来代行するなら
 `get-config` / `set-config` を往復し、mIV の handler だけを外して他の設定を保存する形を前提とする。
 `tailscale funnel` は使わず、bind も `127.0.0.1` のままとする。
+
+### 14.16 tailnet 前提条件の検出と案内 (2026-08-12)
+
+`tailscale status --json` は接続 URL の組み立て時に remote-web が既に読むため、同じ JSON の
+top-level `CertDomains` と `Self.KeyExpiry` から前提条件も検出する。`CertDomains` が 1 件以上なら
+HTTPS 証明書を有効、空または欠落なら無効とし、CLI の不在・実行失敗・JSON 不正は不明にする。
+`Self.KeyExpiry` は解釈できる RFC3339 文字列だけを unix 秒へ変換し、null・欠落・解釈不能は
+情報なしとして運ぶ。JSON の解釈は引き続き remote-web が所有し、本体は v46 の型付き結果だけを表示する。
+
+HTTPS 証明書が無効なら `tailscale serve` は証明書を取得できず必ず失敗するため、接続ダイアログは
+serve 設定ボタンだけを無効にし、Tailscale 管理コンソールの DNS ページへ案内する。不明時は従来どおり
+状態を読み取れない旨を示し、serve ボタンの可否は変えない。リモート接続自体の有効化は PIN だけで決め、
+証明書や期限では止めない。ローカルの `http://127.0.0.1` 確認経路を残すためである。
+
+期限が得られた場合は日付と残り日数を表示し、30 日以内と期限切れを警告色にする。期限切れでは
+PC が tailnet から外れて外出先から接続できないことを明示し、デバイス一覧へ案内する。情報なしでは
+期限の行を出さず、無期限とは断定しない。開発機では `KeyExpiry: null` だけが観測され、期限が入る JSON の
+実機形を確認できていないためである。この 2 設定は tailnet / デバイスの管理設定でローカル CLI から
+変更できないので、mIV は検出と案内に留め、変更を代行しない。

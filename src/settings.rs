@@ -945,6 +945,8 @@ impl FacetCalendarDate {
 
     fn ordinal(self) -> i64 {
         // Howard Hinnant の days_from_civil。日付同士の比較だけに使うため epoch は任意。
+        // 同じアルゴリズムの写しは crates/remote-web/src/connection_url.rs の
+        // days_from_civil にもある (crate 境界のため現時点では共有しない)。
         let mut year = self.year as i64;
         let month = self.month as i64;
         let day = self.day as i64;
