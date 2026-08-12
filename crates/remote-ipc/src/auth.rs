@@ -36,6 +36,11 @@ pub fn validate_pin(pin: &str) -> Result<(), String> {
     if length > MAX_PIN_CHARS {
         return Err(format!("PIN は {MAX_PIN_CHARS} 文字以下にしてください"));
     }
+    if !pin.chars().all(|character| matches!(character, '!'..='~')) {
+        return Err(
+            "PIN は空白を含まない印字可能な半角英数字・記号だけを使用してください".to_owned(),
+        );
+    }
     Ok(())
 }
 
@@ -242,6 +247,31 @@ mod tests {
         assert!(validate_pin(&"x".repeat(MIN_PIN_CHARS)).is_ok());
         assert!(validate_pin(&"x".repeat(MAX_PIN_CHARS)).is_ok());
         assert!(validate_pin(&"x".repeat(MAX_PIN_CHARS + 1)).is_err());
+    }
+
+    #[test]
+    fn pin_accepts_only_printable_ascii_without_spaces() {
+        let every_printable_ascii: String = (b'!'..=b'~').map(char::from).collect();
+        assert!(validate_pin(&every_printable_ascii).is_ok());
+
+        for rejected in [
+            "日本語の秘密",
+            "１２３４５６",
+            "123 456",
+            "12345\t6",
+            "12345\n6",
+            "12345\u{7f}",
+        ] {
+            assert!(validate_pin(rejected).is_err(), "accepted {rejected:?}");
+        }
+    }
+
+    #[test]
+    fn rejected_pin_is_not_included_in_the_validation_error() {
+        let rejected = "秘密の番号です";
+        let error = validate_pin(rejected).unwrap_err();
+        assert!(!error.contains(rejected));
+        assert!(error.contains("空白を含まない印字可能な半角英数字・記号"));
     }
 
     #[test]

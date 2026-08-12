@@ -45,7 +45,6 @@ pub(crate) struct RemoteSessionUiState {
 }
 
 struct RemoteConnectionDialogState {
-    enabled: bool,
     pin_editor: RemotePinEditorState,
 }
 
@@ -62,9 +61,8 @@ enum RemotePinEditorState {
 }
 
 impl RemoteConnectionDialogState {
-    fn new(enabled: bool, pin_configured: bool) -> Self {
+    fn new(pin_configured: bool) -> Self {
         Self {
-            enabled: enabled && pin_configured,
             pin_editor: if pin_configured {
                 RemotePinEditorState::Hidden
             } else {
@@ -78,30 +76,8 @@ impl RemoteConnectionDialogState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RemoteConnectionDialogOutcome {
-    Apply(bool),
-    Discard,
-    Keep(bool),
-}
-
-fn remote_connection_dialog_outcome(
-    enabled: bool,
-    apply: bool,
-    cancel: bool,
-    open: bool,
-) -> RemoteConnectionDialogOutcome {
-    if apply {
-        RemoteConnectionDialogOutcome::Apply(enabled)
-    } else if cancel || !open {
-        RemoteConnectionDialogOutcome::Discard
-    } else {
-        RemoteConnectionDialogOutcome::Keep(enabled)
-    }
-}
-
-fn remote_enabled_choice(enabled: bool, pin_configured: bool) -> bool {
-    enabled && pin_configured
+fn remote_enable_action_allowed(pin_configured: bool) -> bool {
+    pin_configured
 }
 
 fn remote_connection_state_label(
@@ -372,10 +348,8 @@ impl crate::app::App {
             .remote_service_control
             .as_ref()
             .is_some_and(super::RemoteServiceControl::pin_configured);
-        self.remote_session_ui.connection_dialog = Some(RemoteConnectionDialogState::new(
-            self.settings.remote_service_enabled,
-            pin_configured,
-        ));
+        self.remote_session_ui.connection_dialog =
+            Some(RemoteConnectionDialogState::new(pin_configured));
     }
 
     pub(crate) fn remote_connection_dialog_open(&self) -> bool {
@@ -2322,8 +2296,6 @@ impl crate::app::App {
         let Some(mut dialog) = self.remote_session_ui.connection_dialog.take() else {
             return;
         };
-        let mut enabled = dialog.enabled;
-        let was_enabled = self.settings.remote_service_enabled;
         let pin_update_result = match &dialog.pin_editor {
             RemotePinEditorState::Saving { receiver } => match receiver.try_recv() {
                 Ok(result) => Some(result),
@@ -2348,7 +2320,7 @@ impl crate::app::App {
         let pin_configured = service_control
             .as_ref()
             .is_some_and(super::RemoteServiceControl::pin_configured);
-        enabled = remote_enabled_choice(enabled, pin_configured);
+        let service_enabled = self.settings.remote_service_enabled;
         if !pin_configured && matches!(&dialog.pin_editor, RemotePinEditorState::Hidden) {
             dialog.pin_editor = RemotePinEditorState::Editing {
                 input: String::new(),
@@ -2379,8 +2351,8 @@ impl crate::app::App {
         let accepting = remote_web_connected && info.is_some();
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let mut open = true;
-        let mut apply = false;
-        let mut cancel = false;
+        let mut requested_enabled = None;
+        let mut close_requested = false;
         egui::Window::new("リモート接続")
             .id(egui::Id::new("remote_connection_dialog"))
             .collapsible(false)
@@ -2422,7 +2394,7 @@ impl crate::app::App {
                                 |edit| {
                                     edit.password(true)
                                         .desired_width(260.0)
-                                        .hint_text("6文字以上の PIN / パスフレーズ")
+                                        .hint_text("6文字以上（半角英数字・記号、空白なし）")
                                         .id(egui::Id::new("remote_connection_pin"))
                                 },
                             );
@@ -2488,17 +2460,7 @@ impl crate::app::App {
                 ui.small("PIN の設定・変更後、有効なリモート接続は自動的に再起動します。");
                 ui.small("署名鍵も更新されるため、接続中の端末では PIN の再入力が必要になります。");
                 ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.add_enabled(
-                        pin_configured,
-                        egui::Checkbox::new(&mut enabled, "この端末からリモート接続を利用する"),
-                    );
-                    if !pin_configured {
-                        ui.small("PIN が未設定のため有効にできません。");
-                    }
-                });
-                if remote_enable_warning_visible(was_enabled, enabled) {
-                    ui.add_space(6.0);
+                if remote_enable_warning_visible(service_enabled) {
                     let error_color = ui.visuals().error_fg_color;
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -2515,6 +2477,30 @@ impl crate::app::App {
                         );
                     });
                     ui.hyperlink_to("詳しい説明を既定のブラウザで開く", REMOTE_MANUAL_URL);
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add_enabled(
+                                remote_enable_action_allowed(pin_configured),
+                                egui::Button::new("リモート接続を有効にする")
+                                    .min_size(egui::vec2(220.0, 34.0)),
+                            )
+                            .clicked()
+                        {
+                            requested_enabled = Some(true);
+                        }
+                        if !pin_configured {
+                            ui.small("PIN が未設定のため有効にできません。");
+                        }
+                    });
+                } else if ui
+                    .add(
+                        egui::Button::new("リモート接続を無効にする")
+                            .min_size(egui::vec2(220.0, 34.0)),
+                    )
+                    .clicked()
+                {
+                    requested_enabled = Some(false);
                 }
                 ui.separator();
                 let state_label = remote_connection_state_label(accepting, &service_diagnostic);
@@ -2562,48 +2548,34 @@ impl crate::app::App {
                 }
 
                 ui.separator();
-                ui.horizontal(|ui| {
-                    let pin_saving =
-                        matches!(&dialog.pin_editor, RemotePinEditorState::Saving { .. });
-                    if ui
-                        .add_enabled(!pin_saving, egui::Button::new("  OK  "))
-                        .clicked()
-                    {
-                        apply = true;
-                    }
-                    if ui.button("キャンセル").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
-        match remote_connection_dialog_outcome(enabled, apply, cancel || escape_pressed, open) {
-            RemoteConnectionDialogOutcome::Apply(enabled) => {
-                let enabled = remote_enabled_choice(enabled, pin_configured);
-                self.settings.remote_service_enabled = enabled;
-                self.settings.save();
-                if let Some(control) = self.remote_session_ui.remote_service_control.as_ref() {
-                    control.set_enabled(enabled);
-                } else if enabled
-                    && let Some(status) = self.remote_session_ui.remote_service_status.as_ref()
-                {
-                    status.set_error("リモート接続を開始できませんでした");
+                if ui.button("閉じる").clicked() {
+                    close_requested = true;
                 }
-                self.remote_session_ui.connection_dialog = None;
-                ctx.request_repaint();
+            });
+
+        if let Some(enabled) = requested_enabled {
+            self.settings.remote_service_enabled = enabled;
+            self.settings.save();
+            if let Some(control) = service_control.as_ref() {
+                control.set_enabled(enabled);
+            } else if enabled
+                && let Some(status) = self.remote_session_ui.remote_service_status.as_ref()
+            {
+                status.set_error("リモート接続を開始できませんでした");
             }
-            RemoteConnectionDialogOutcome::Discard => {
-                self.remote_session_ui.connection_dialog = None;
-            }
-            RemoteConnectionDialogOutcome::Keep(enabled) => {
-                dialog.enabled = remote_enabled_choice(enabled, pin_configured);
-                let pin_saving = matches!(&dialog.pin_editor, RemotePinEditorState::Saving { .. });
-                self.remote_session_ui.connection_dialog = Some(dialog);
-                ctx.request_repaint_after(if pin_saving {
-                    std::time::Duration::from_millis(50)
-                } else {
-                    std::time::Duration::from_secs(1)
-                });
-            }
+            ctx.request_repaint();
+        }
+
+        if close_requested || escape_pressed || !open {
+            self.remote_session_ui.connection_dialog = None;
+        } else {
+            let pin_saving = matches!(&dialog.pin_editor, RemotePinEditorState::Saving { .. });
+            self.remote_session_ui.connection_dialog = Some(dialog);
+            ctx.request_repaint_after(if pin_saving {
+                std::time::Duration::from_millis(50)
+            } else {
+                std::time::Duration::from_secs(1)
+            });
         }
     }
 
@@ -3013,8 +2985,8 @@ fn remote_logical_path(
         })
 }
 
-fn remote_enable_warning_visible(was_enabled: bool, enabled: bool) -> bool {
-    !was_enabled && enabled
+fn remote_enable_warning_visible(enabled: bool) -> bool {
+    !enabled
 }
 
 fn core_spread_mode(mode: RemoteSpreadMode) -> crate::settings::SpreadMode {
@@ -3192,46 +3164,24 @@ mod tests {
     }
 
     #[test]
-    fn remote_connection_dialog_applies_only_ok_and_discards_cancel() {
-        assert_eq!(
-            remote_connection_dialog_outcome(true, true, false, true),
-            RemoteConnectionDialogOutcome::Apply(true)
-        );
-        assert_eq!(
-            remote_connection_dialog_outcome(true, false, true, true),
-            RemoteConnectionDialogOutcome::Discard
-        );
-        assert_eq!(
-            remote_connection_dialog_outcome(true, false, false, false),
-            RemoteConnectionDialogOutcome::Discard
-        );
-    }
-
-    #[test]
     fn remote_connection_requires_a_core_owned_pin_before_enable() {
-        let unconfigured = RemoteConnectionDialogState::new(true, false);
-        assert!(!unconfigured.enabled);
-        assert!(matches!(
-            unconfigured.pin_editor,
-            RemotePinEditorState::Editing { .. }
-        ));
-        assert!(!remote_enabled_choice(true, false));
-
-        let configured = RemoteConnectionDialogState::new(true, true);
-        assert!(configured.enabled);
-        assert!(matches!(
-            configured.pin_editor,
-            RemotePinEditorState::Hidden
-        ));
-        assert!(remote_enabled_choice(true, true));
+        assert!(!remote_enable_action_allowed(false));
+        assert!(remote_enable_action_allowed(true));
     }
 
     #[test]
-    fn remote_access_warning_is_shown_only_while_enabling() {
-        assert!(remote_enable_warning_visible(false, true));
-        assert!(!remote_enable_warning_visible(false, false));
-        assert!(!remote_enable_warning_visible(true, false));
-        assert!(!remote_enable_warning_visible(true, true));
+    fn remote_connection_dialog_keeps_only_pin_editor_state() {
+        let RemoteConnectionDialogState { pin_editor } = RemoteConnectionDialogState::new(false);
+        assert!(matches!(pin_editor, RemotePinEditorState::Editing { .. }));
+
+        let RemoteConnectionDialogState { pin_editor } = RemoteConnectionDialogState::new(true);
+        assert!(matches!(pin_editor, RemotePinEditorState::Hidden));
+    }
+
+    #[test]
+    fn remote_access_warning_is_shown_while_disabled_before_the_one_click_enable() {
+        assert!(remote_enable_warning_visible(false));
+        assert!(!remote_enable_warning_visible(true));
         assert_eq!(
             REMOTE_ENABLE_WARNING_FIRST,
             "リモート閲覧を有効にすると、すべてのドライブについて、mIV で表示できるファイルが、この PC の Tailscale アドレスへ接続でき、PIN を知っている人から見えるようになります。"

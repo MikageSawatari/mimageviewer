@@ -120,10 +120,15 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 
 ### 3.2 認証
 
-- ブラウザ認証にはユーザー設定の **6 文字以上の PIN / パスフレーズ**を使う。
+- ブラウザ認証にはユーザー設定の **6〜1024 文字の PIN / パスフレーズ**を使い、文字種は
+  **U+0021〜U+007E の印字可能 ASCII だけ**に限定する。U+0020 の空白も許可しない。
   本体の「リモート接続」ダイアログで設定・更新し、Argon2id の salt 付き hash とランダムな
   セッション署名鍵だけを認証ファイルへ永続化する。平文 PIN は保持しない。
+  この制限は、伏字の入力欄では IME 変換が意図どおり確定したか確認できないことと、Windows 本体と
+  iPad 等のブラウザで Unicode 正規化形が異なると同じ見た目でも hash が一致せず、伏字のため
+  誤入力と区別できない認証失敗になることを避けるためである。
   `mimageviewer-remote` の `--set-pin` は撤去し、書き手を本体 1 つに限定する
+- ブラウザ側の PIN 入力画面は変更せず、唯一の設定入口である本体の共有 validator で上記制限を強制する
 - 認証ファイルは本体のデータディレクトリ直下の `remote-web-auth.json`
   (portable は `<exe_dir>/data/remote-web-auth.json`)。本体が temp file + rename で書き、
   remote-web は `--auth-file` で渡されたファイルを起動時に読むだけとする。
@@ -148,8 +153,8 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 
 ### 3.2.1 core 所有の service lifecycle
 
-core は local-only / current-user-only の named pipe を常設する。設定ダイアログの OK で保存済み
-opt-in を確定し、専用 owner worker へ希望状態を送る。worker は有効時に同じディレクトリの
+core は local-only / current-user-only の named pipe を常設する。設定ダイアログの有効化 / 無効化
+ボタンを押したフレームで opt-in を保存し、専用 owner worker へ希望状態を送る。worker は有効時に同じディレクトリの
 `mimageviewer-remote.exe` を起動し、初期化済みの `data_dir` を `--data-dir` で渡す。無効化時の
 kill / wait も worker 側で行い、UI thread を止めない。core が spawn した `Child` だけを終了対象とし、
 プロセス名や port から外部起動分の所有を推定しない。
@@ -2416,6 +2421,13 @@ PIN 長検証、Argon2id パラメータ、salt / session 署名鍵生成、読�
 `mimageviewer-ipc` を正本とし、同じ hash 形式を両 executable へ重複実装しない。
 本体の service owner worker が `<data_dir>/remote-web-auth.json` を temp file + rename で更新し、
 有効中なら managed child を再起動する。UI は本体が検証した設定状態を表示し、未設定時の有効化を拒否する。
+
+接続ダイアログは checkbox と OK / キャンセルによる保留を廃止し、有効化 / 無効化ボタンの 1 クリックで
+設定保存と service 制御まで即時反映する。閉じるボタン、×、Esc はダイアログを閉じるだけである。
+無効時は PIN 未設定なら有効化ボタンを disabled にして理由を隣へ示す。有効化が 1 クリックで確定するため、
+対象範囲の警告は無効状態のあいだ有効化ボタンの直上へ常時表示し、利用者が押す前に認識できるようにする。
+有効状態では警告を表示しない。状態、利用状況、`tailscale serve`、PIN、QR、URL は同じダイアログ内で
+更新し続け、有効化後の準備中から接続情報受信まで開き直しを必要としない。
 
 保存場所は書き手で分ける。認証ファイルは本体が書くため data directory 内に置き、remote-web からの
 読み取りだけを許す。診断ログは remote-web が書くため、解決済み `<data_dir>` の末尾名へ
